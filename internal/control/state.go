@@ -56,6 +56,7 @@ type UnderlayState struct {
 	ID       uint32 `json:"id"`
 	Name     string `json:"name"`
 	Type     string `json:"type"`
+	Parser   string `json:"parser"`
 	IfName   string `json:"ifname,omitempty"`
 	IfIndex  int    `json:"ifindex,omitempty"`
 	LinkType string `json:"link_type,omitempty"`
@@ -144,9 +145,10 @@ func buildUnderlayStates(ctx context.Context, cfg *config.Config, resolver under
 	seenIfIndex := make(map[int]string)
 	for i, u := range cfg.Underlays {
 		state := UnderlayState{
-			ID:   uint32(i + 1),
-			Name: u.Name,
-			Type: u.Type,
+			ID:     uint32(i + 1),
+			Name:   u.Name,
+			Type:   u.Type,
+			Parser: normalizeParser(u.Parser),
 		}
 		if !opts.Offline {
 			resolved, err := resolver.Resolve(ctx, u)
@@ -158,6 +160,9 @@ func buildUnderlayStates(ctx context.Context, cfg *config.Config, resolver under
 			state.LinkType = resolved.LinkType
 			state.Role = resolved.Role
 			state.Resolved = true
+			if u.Parser == "" || u.Parser == "auto" {
+				state.Parser = inferParser(resolved)
+			}
 			if state.IfIndex != 0 {
 				if other, ok := seenIfIndex[state.IfIndex]; ok && cfg.UnderlayOverlapPolicy == "reject" {
 					return nil, fmt.Errorf("underlay %q overlaps with %q on ifindex %d", u.Name, other, state.IfIndex)
@@ -168,6 +173,31 @@ func buildUnderlayStates(ctx context.Context, cfg *config.Config, resolver under
 		out = append(out, state)
 	}
 	return out, nil
+}
+
+func normalizeParser(parser string) string {
+	if parser == "" {
+		return "auto"
+	}
+	return parser
+}
+
+func inferParser(resolved *underlay.Resolved) string {
+	switch resolved.LinkType {
+	case "ppp", "tun", "ipip", "sit", "gre", "ip6gre", "xfrm":
+		return "l3"
+	case "ethernet", "device", "veth", "bridge", "vlan", "macvlan", "macvtap", "bond", "team", "dummy":
+		return "ethernet"
+	default:
+		if resolved.IfName != "" && (hasPrefix(resolved.IfName, "ppp") || hasPrefix(resolved.IfName, "pppoe-")) {
+			return "l3"
+		}
+		return "auto"
+	}
+}
+
+func hasPrefix(value string, prefix string) bool {
+	return len(value) >= len(prefix) && value[:len(prefix)] == prefix
 }
 
 func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.WireGuard, wgID uint32, profileID uint32, rt runtime.Provider, loadWG WGConfigLoader, opts BuildOptions) (*WireGuardState, error) {

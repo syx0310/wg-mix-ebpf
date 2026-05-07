@@ -585,3 +585,35 @@ Release candidate：
 native wireguard-mix negative
 performance report
 ```
+
+## 15. 接口启动方式矩阵
+
+后续外部 Linux/OpenWrt 测试必须覆盖三种 WireGuard 接口启动方式，避免只验证 raw `wg set` 路径。
+
+```text
+raw:
+  使用 ip link add + wg set + ip addr/route。
+  用于隔离 dataplane 问题，作为最低依赖 smoke。
+
+wg-quick:
+  使用官方 wg-quick up/down。
+  配置中允许 [Interface] FwMark，也必须覆盖 Table = off。
+  需要验证 wg-quick strip 会保留 FwMark，runtime wg show fwmark 与 config 期望一致。
+
+wg-quick-op:
+  使用 wg-quick-op v0.4.1 up/down/service 路径。
+  因 v0.4.1 不接受 [Interface] FwMark，测试配置应使用未注释 PostUp：
+    PostUp = wg set %i fwmark <mark>
+  agent 必须能从该 PostUp 推导 expected fwmark，并校验 runtime FirewallMark。
+```
+
+每种启动方式都至少覆盖：
+
+```text
+IPv4 outer
+Table = off
+同网段 /31 或 peer /32 地址配置
+3.3/OpenWrt NAT 侧主动发起握手
+router 侧 pcap 验证 mixed type_word 且无 standard type_word 泄漏
+测试结束后 down/detach/清理临时文件
+```

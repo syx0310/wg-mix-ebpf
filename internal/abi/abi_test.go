@@ -15,6 +15,8 @@ func TestStructSizesAreStable(t *testing.T) {
 	}{
 		{"ControlValue", unsafe.Sizeof(ControlValue{}), 16},
 		{"ProfileValue", unsafe.Sizeof(ProfileValue{}), 48},
+		{"UnderlayConfigKey", unsafe.Sizeof(UnderlayConfigKey{}), 4},
+		{"UnderlayConfigValue", unsafe.Sizeof(UnderlayConfigValue{}), 16},
 		{"ManagedFwmarkKey", unsafe.Sizeof(ManagedFwmarkKey{}), 8},
 		{"ManagedFwmarkValue", unsafe.Sizeof(ManagedFwmarkValue{}), 16},
 		{"EgressRuleKey", unsafe.Sizeof(EgressRuleKey{}), 12},
@@ -40,6 +42,9 @@ func TestFromState(t *testing.T) {
 				MixedToStandard: [4]uint32{1, 2, 3, 4},
 			},
 		},
+		Underlays: []control.UnderlayState{
+			{IfIndex: 2, Parser: "ethernet", Role: "transform", Resolved: true},
+		},
 		ManagedFwmarks: []control.ManagedFwmarkRule{
 			{Generation: 7, FwMark: 0x10000001, UnderlayIfIndex: 2, ActionOnMiss: "drop"},
 		},
@@ -56,6 +61,9 @@ func TestFromState(t *testing.T) {
 	}
 	if snapshot.Control[ControlKeyGlobal].ActiveGeneration != 7 {
 		t.Fatalf("generation = %d", snapshot.Control[ControlKeyGlobal].ActiveGeneration)
+	}
+	if snapshot.Underlays[UnderlayConfigKey{UnderlayIndex: 2}].ParserMode != ParserEthernet {
+		t.Fatal("missing underlay parser mode")
 	}
 	if snapshot.EgressRules[EgressRuleKey{FwMark: 0x10000001, UnderlayIndex: 2, SourcePort: 31001, Family: FamilyIPv4}].Action != ActionRewrite {
 		t.Fatal("missing egress rewrite rule")

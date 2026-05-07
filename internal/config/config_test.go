@@ -96,3 +96,42 @@ fwmark_policy:
 		t.Fatal("expected reserved fwmark policy error")
 	}
 }
+
+func TestRejectUnsupportedUnderlayParser(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+    parser: pppoe
+wireguards:
+  - name: wg0
+    profile: mix-default
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err == nil {
+		t.Fatal("expected unsupported parser error")
+	}
+}
+
+func TestRejectPolicyNotImplementedByDataplane(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+policy:
+  ingress_managed_ipv6_ext_header: pass
+`))
+	if err == nil {
+		t.Fatal("expected unsupported policy error")
+	}
+}

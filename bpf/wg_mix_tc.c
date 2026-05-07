@@ -11,7 +11,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-#define ABI_VERSION 1
+#define ABI_VERSION 2
 
 #define FAMILY_ANY  0
 #define FAMILY_IPV4 4
@@ -23,6 +23,10 @@
 
 #define CONTROL_KEY_GLOBAL 0
 #define UNDERLAY_WILDCARD 0
+
+#define PARSER_AUTO     0
+#define PARSER_ETHERNET 1
+#define PARSER_L3       2
 
 #ifndef IP_MF
 #define IP_MF 0x2000
@@ -109,6 +113,16 @@ struct managed_fwmark_key {
 	__u32 underlay_index;
 };
 
+struct underlay_config_key {
+	__u32 underlay_index;
+};
+
+struct underlay_config_value {
+	__u64 generation;
+	__u8 parser_mode;
+	__u8 pad[7];
+};
+
 struct managed_fwmark_value {
 	__u64 generation;
 	__u8 action_on_miss;
@@ -191,6 +205,13 @@ struct {
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 256);
+	__type(key, struct underlay_config_key);
+	__type(value, struct underlay_config_value);
+} underlay_config_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 256);
 	__type(key, struct managed_fwmark_key);
 	__type(value, struct managed_fwmark_value);
 } managed_fwmark_map SEC(".maps");
@@ -240,11 +261,39 @@ static __always_inline int same_generation(__u64 generation)
 	return generation == control->active_generation;
 }
 
-static __always_inline int parse_link(struct __sk_buff *skb, void *data, void *data_end,
-				      __u64 *off, __u16 *proto)
+static __always_inline __u8 lookup_parser_mode(__u32 ifindex)
+{
+	struct underlay_config_key key = {
+		.underlay_index = ifindex,
+	};
+	struct underlay_config_value *value;
+
+	value = bpf_map_lookup_elem(&underlay_config_map, &key);
+	if (value && same_generation(value->generation))
+		return value->parser_mode;
+	key.underlay_index = UNDERLAY_WILDCARD;
+	value = bpf_map_lookup_elem(&underlay_config_map, &key);
+	if (value && same_generation(value->generation))
+		return value->parser_mode;
+	return PARSER_AUTO;
+}
+
+static __always_inline int parse_l3_link(struct __sk_buff *skb, __u64 *off, __u16 *proto)
+{
+	__u16 skb_proto = skb->protocol;
+
+	if (skb_proto == bpf_htons(ETH_P_IP) || skb_proto == bpf_htons(ETH_P_IPV6)) {
+		*off = 0;
+		*proto = skb_proto;
+		return PARSE_OK;
+	}
+	return PARSE_NOT_UDP;
+}
+
+static __always_inline int parse_ethernet_link(void *data, void *data_end, __u64 *off,
+					       __u16 *proto)
 {
 	struct ethhdr *eth = data;
-	__u16 skb_proto = skb->protocol;
 
 	if ((void *)(eth + 1) <= data_end) {
 		*off = sizeof(*eth);
@@ -268,13 +317,24 @@ static __always_inline int parse_link(struct __sk_buff *skb, void *data, void *d
 			return PARSE_OK;
 		}
 	}
-
-	if (skb_proto == bpf_htons(ETH_P_IP) || skb_proto == bpf_htons(ETH_P_IPV6)) {
-		*off = 0;
-		*proto = skb_proto;
-		return PARSE_OK;
-	}
 	return PARSE_NOT_UDP;
+}
+
+static __always_inline int parse_link(struct __sk_buff *skb, void *data, void *data_end,
+				      __u64 *off, __u16 *proto)
+{
+	__u8 parser_mode = lookup_parser_mode(skb->ifindex);
+	int rc;
+
+	if (parser_mode == PARSER_L3)
+		return parse_l3_link(skb, off, proto);
+	if (parser_mode == PARSER_ETHERNET)
+		return parse_ethernet_link(data, data_end, off, proto);
+
+	rc = parse_ethernet_link(data, data_end, off, proto);
+	if (rc == PARSE_OK)
+		return rc;
+	return parse_l3_link(skb, off, proto);
 }
 
 static __always_inline int parse_udp_at(void *data, void *data_end, struct packet_info *info,
@@ -590,8 +650,10 @@ int wg_mix_egress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 	profile = bpf_map_lookup_elem(&profile_map, &rule->profile_id);
-	if (!profile || !same_generation(profile->generation))
-		return managed_miss_action(STAT_EGRESS_RULE_MISS, managed);
+	if (!profile || !same_generation(profile->generation)) {
+		inc_stat(STAT_EGRESS_RULE_MISS);
+		return TC_ACT_SHOT;
+	}
 	new_wire = wg_cpu_to_le32(profile->standard_to_mixed[kind]);
 	if (update_type_word(skb, &info, old_wire, new_wire) < 0) {
 		inc_stat(STAT_CHECKSUM_ERROR);
@@ -645,7 +707,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	profile = bpf_map_lookup_elem(&profile_map, &listener->profile_id);
 	if (!profile || !same_generation(profile->generation)) {
 		inc_stat(STAT_INGRESS_RULE_MISS);
-		return TC_ACT_OK;
+		return TC_ACT_SHOT;
 	}
 	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0)
 		return TC_ACT_SHOT;

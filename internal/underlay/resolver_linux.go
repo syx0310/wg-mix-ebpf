@@ -6,10 +6,10 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net"
 	"os/exec"
 
 	"github.com/siyixuan/wg-mix-ebpf/internal/config"
+	"github.com/vishvananda/netlink"
 )
 
 type SystemResolver struct{}
@@ -34,15 +34,18 @@ func (SystemResolver) Resolve(ctx context.Context, u config.Underlay) (*Resolved
 }
 
 func resolveNetdev(name string, typ string, ifname string, linkType string) (*Resolved, error) {
-	iface, err := net.InterfaceByName(ifname)
+	link, err := netlink.LinkByName(ifname)
 	if err != nil {
 		return nil, err
+	}
+	if linkType == "" || linkType == "netdev" || linkType == "openwrt-interface" {
+		linkType = link.Type()
 	}
 	return &Resolved{
 		Name:     name,
 		Type:     typ,
-		IfName:   iface.Name,
-		IfIndex:  iface.Index,
+		IfName:   link.Attrs().Name,
+		IfIndex:  link.Attrs().Index,
 		LinkType: linkType,
 		Role:     "transform",
 	}, nil

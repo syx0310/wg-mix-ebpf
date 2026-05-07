@@ -134,6 +134,9 @@ func populateMaps(coll *ebpf.Collection, snapshot *abi.Snapshot) error {
 	if err := updateMap(coll, "profile_map", snapshot.Profiles); err != nil {
 		return err
 	}
+	if err := updateMap(coll, "underlay_config_map", snapshot.Underlays); err != nil {
+		return err
+	}
 	if err := updateMap(coll, "managed_fwmark_map", snapshot.ManagedFwmarks); err != nil {
 		return err
 	}

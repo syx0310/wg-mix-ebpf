@@ -28,8 +28,9 @@ type Config struct {
 }
 
 type Underlay struct {
-	Name string `yaml:"name"`
-	Type string `yaml:"type"`
+	Name   string `yaml:"name"`
+	Type   string `yaml:"type"`
+	Parser string `yaml:"parser"`
 }
 
 type WireGuard struct {
@@ -225,7 +226,7 @@ func (p *Policy) applyDefaults() {
 	defaultString(&p.ManagedIngressMapMiss, "pass")
 	defaultString(&p.ManagedIngressBadType, "drop")
 	defaultString(&p.ManagedIngressBadLength, "drop")
-	defaultString(&p.IngressManagedIPv6ExtHeader, "pass")
+	defaultString(&p.IngressManagedIPv6ExtHeader, "drop")
 	defaultString(&p.IPv4FirstFragment, "drop")
 	defaultString(&p.IPv4NonFirstFragment.Ingress, "pass")
 	defaultString(&p.IPv4NonFirstFragment.EgressIfManagedFwmark, "drop")
@@ -265,6 +266,14 @@ func (c *Config) ValidateStatic() error {
 	if err := validateUniqueUnderlays(c.Underlays); err != nil {
 		return err
 	}
+	if err := validatePolicy(c.Policy); err != nil {
+		return err
+	}
+	switch c.StartupGuard.Mode {
+	case "nft-temporary-drop", "none":
+	default:
+		return fmt.Errorf("startup_guard.mode %q is unsupported", c.StartupGuard.Mode)
+	}
 	for i, wg := range c.WireGuards {
 		if wg.Name == "" {
 			return fmt.Errorf("wireguards[%d].name is required", i)
@@ -293,10 +302,55 @@ func validateUniqueUnderlays(underlays []Underlay) error {
 		default:
 			return fmt.Errorf("underlays[%d].type %q is unsupported", i, u.Type)
 		}
+		switch u.Parser {
+		case "", "auto", "ethernet", "l3":
+		default:
+			return fmt.Errorf("underlays[%d].parser %q is unsupported", i, u.Parser)
+		}
 		if _, exists := seen[u.Name]; exists {
 			return fmt.Errorf("duplicate underlay %q", u.Name)
 		}
 		seen[u.Name] = struct{}{}
 	}
 	return nil
+}
+
+func validatePolicy(p Policy) error {
+	checks := []struct {
+		name  string
+		value string
+		allow map[string]struct{}
+	}{
+		{"policy.non_managed_udp", p.NonManagedUDP, set("pass")},
+		{"policy.managed_egress_map_miss", p.ManagedEgressMapMiss, set("pass", "drop")},
+		{"policy.managed_egress_bad_type", p.ManagedEgressBadType, set("drop")},
+		{"policy.managed_egress_bad_length", p.ManagedEgressBadLength, set("drop")},
+		{"policy.egress_managed_ipv6_ext_header", p.EgressManagedIPv6ExtHeader, set("drop")},
+		{"policy.managed_ingress_map_miss", p.ManagedIngressMapMiss, set("pass")},
+		{"policy.managed_ingress_bad_type", p.ManagedIngressBadType, set("drop")},
+		{"policy.managed_ingress_bad_length", p.ManagedIngressBadLength, set("drop")},
+		{"policy.ingress_managed_ipv6_ext_header", p.IngressManagedIPv6ExtHeader, set("drop")},
+		{"policy.ipv4_first_fragment", p.IPv4FirstFragment, set("drop")},
+		{"policy.ipv4_non_first_fragment.ingress", p.IPv4NonFirstFragment.Ingress, set("pass")},
+		{"policy.ipv4_non_first_fragment.egress_if_managed_fwmark", p.IPv4NonFirstFragment.EgressIfManagedFwmark, set("drop")},
+		{"policy.ipv6_fragment", p.IPv6Fragment, set("drop")},
+		{"policy.startup_fail_mode", p.StartupFailMode, set("fail_closed_for_managed_flows", "best_effort")},
+	}
+	for _, check := range checks {
+		if _, ok := check.allow[check.value]; !ok {
+			return fmt.Errorf("%s=%q is not implemented by the MVP dataplane", check.name, check.value)
+		}
+	}
+	if p.IPv4NonFirstFragment.OptionalDropAllOnUnderlay {
+		return errors.New("policy.ipv4_non_first_fragment.optional_drop_all_on_underlay is not implemented by the MVP dataplane")
+	}
+	return nil
+}
+
+func set(values ...string) map[string]struct{} {
+	out := make(map[string]struct{}, len(values))
+	for _, value := range values {
+		out[value] = struct{}{}
+	}
+	return out
 }

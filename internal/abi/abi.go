@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	Version uint32 = 1
+	Version uint32 = 2
 
 	FamilyAny  uint8 = 0
 	FamilyIPv4 uint8 = 4
@@ -19,6 +19,10 @@ const (
 	ActionRewrite uint8 = 3
 
 	UnderlayWildcard uint32 = 0
+
+	ParserAuto     uint8 = 0
+	ParserEthernet uint8 = 1
+	ParserL3       uint8 = 2
 )
 
 type ControlKey uint32
@@ -46,6 +50,16 @@ type ProfileValue struct {
 type ManagedFwmarkKey struct {
 	FwMark        uint32
 	UnderlayIndex uint32
+}
+
+type UnderlayConfigKey struct {
+	UnderlayIndex uint32
+}
+
+type UnderlayConfigValue struct {
+	Generation uint64
+	ParserMode uint8
+	_          [7]byte
 }
 
 type ManagedFwmarkValue struct {
@@ -88,6 +102,7 @@ type IngressListenerValue struct {
 type Snapshot struct {
 	Control          map[ControlKey]ControlValue
 	Profiles         map[ProfileKey]ProfileValue
+	Underlays        map[UnderlayConfigKey]UnderlayConfigValue
 	ManagedFwmarks   map[ManagedFwmarkKey]ManagedFwmarkValue
 	EgressRules      map[EgressRuleKey]EgressRuleValue
 	IngressListeners map[IngressListenerKey]IngressListenerValue
@@ -102,6 +117,7 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 	type view struct {
 		Control          []MapEntry[ControlKey, ControlValue]                 `json:"control"`
 		Profiles         []MapEntry[ProfileKey, ProfileValue]                 `json:"profiles"`
+		Underlays        []MapEntry[UnderlayConfigKey, UnderlayConfigValue]   `json:"underlays"`
 		ManagedFwmarks   []MapEntry[ManagedFwmarkKey, ManagedFwmarkValue]     `json:"managed_fwmarks"`
 		EgressRules      []MapEntry[EgressRuleKey, EgressRuleValue]           `json:"egress_rules"`
 		IngressListeners []MapEntry[IngressListenerKey, IngressListenerValue] `json:"ingress_listeners"`
@@ -109,6 +125,7 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 	return json.Marshal(view{
 		Control:          mapEntries(s.Control),
 		Profiles:         mapEntries(s.Profiles),
+		Underlays:        mapEntries(s.Underlays),
 		ManagedFwmarks:   mapEntries(s.ManagedFwmarks),
 		EgressRules:      mapEntries(s.EgressRules),
 		IngressListeners: mapEntries(s.IngressListeners),
@@ -132,6 +149,7 @@ func FromState(state *control.State) (*Snapshot, error) {
 			},
 		},
 		Profiles:         make(map[ProfileKey]ProfileValue, len(state.Profiles)),
+		Underlays:        make(map[UnderlayConfigKey]UnderlayConfigValue, len(state.Underlays)),
 		ManagedFwmarks:   make(map[ManagedFwmarkKey]ManagedFwmarkValue, len(state.ManagedFwmarks)),
 		EgressRules:      make(map[EgressRuleKey]EgressRuleValue, len(state.EgressRules)),
 		IngressListeners: make(map[IngressListenerKey]IngressListenerValue, len(state.IngressListeners)),
@@ -141,6 +159,19 @@ func FromState(state *control.State) (*Snapshot, error) {
 			Generation:      state.Generation,
 			StandardToMixed: p.StandardToMixed,
 			MixedToStandard: p.MixedToStandard,
+		}
+	}
+	for _, u := range state.Underlays {
+		if !u.Resolved || u.IfIndex == 0 || u.Role == "parse_only" || u.Role == "disabled" {
+			continue
+		}
+		parser, err := parseParser(u.Parser)
+		if err != nil {
+			return nil, err
+		}
+		out.Underlays[UnderlayConfigKey{UnderlayIndex: uint32(u.IfIndex)}] = UnderlayConfigValue{
+			Generation: state.Generation,
+			ParserMode: parser,
 		}
 	}
 	for _, r := range state.ManagedFwmarks {
@@ -210,6 +241,19 @@ func parseFamily(family string) (uint8, error) {
 		return FamilyIPv6, nil
 	default:
 		return 0, fmt.Errorf("unsupported family %q", family)
+	}
+}
+
+func parseParser(parser string) (uint8, error) {
+	switch parser {
+	case "", "auto":
+		return ParserAuto, nil
+	case "ethernet":
+		return ParserEthernet, nil
+	case "l3":
+		return ParserL3, nil
+	default:
+		return 0, fmt.Errorf("unsupported underlay parser %q", parser)
 	}
 }
 

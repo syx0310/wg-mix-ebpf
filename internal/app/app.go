@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -94,6 +95,24 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 	case "validate":
 		fmt.Fprintln(stdout, "ok")
 	case "status", "dump":
+		if cmd == "status" {
+			view := struct {
+				Desired        *control.State          `json:"desired"`
+				Dataplane      *dataplane.KernelStatus `json:"dataplane,omitempty"`
+				DataplaneError string                  `json:"dataplane_error,omitempty"`
+			}{Desired: state}
+			if kernelStatus, err := dataplane.Inspect(ctx, state); err == nil {
+				view.Dataplane = kernelStatus
+			} else if !errors.Is(err, dataplane.ErrUnsupported) {
+				view.DataplaneError = err.Error()
+			}
+			data, err := json.MarshalIndent(view, "", "  ")
+			if err != nil {
+				return err
+			}
+			fmt.Fprintln(stdout, string(data))
+			return nil
+		}
 		data, err := state.JSON()
 		if err != nil {
 			return err
@@ -114,8 +133,21 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 			fmt.Fprintln(stdout, "reload plan validated")
 			return nil
 		}
+		guardApplied := false
+		if shouldApplyStartupGuard(cfg) {
+			plan := guard.BuildNftPlan(state)
+			if err := guard.NewCommandExecutor().Apply(ctx, plan); err != nil {
+				return fmt.Errorf("apply startup guard: %w", err)
+			}
+			guardApplied = true
+		}
 		if err := dataplane.NewLoader().Apply(ctx, state); err != nil {
 			return err
+		}
+		if guardApplied {
+			if err := guard.NewCommandExecutor().Cleanup(ctx); err != nil {
+				return fmt.Errorf("cleanup startup guard after reload: %w", err)
+			}
 		}
 		fmt.Fprintln(stdout, "dataplane reloaded")
 	case "detach":
@@ -151,6 +183,11 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 		fmt.Fprintln(stdout, "startup guard removed")
 	}
 	return nil
+}
+
+func shouldApplyStartupGuard(cfg *config.Config) bool {
+	return cfg.StartupGuard.Mode == "nft-temporary-drop" &&
+		cfg.Policy.StartupFailMode == "fail_closed_for_managed_flows"
 }
 
 func printUsage(w io.Writer) {
