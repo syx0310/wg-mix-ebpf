@@ -132,6 +132,9 @@ func BuildState(ctx context.Context, cfg *config.Config, rt runtime.Provider, re
 	}
 	if !opts.Offline {
 		state.buildRules(cfg)
+		if err := state.validateRuleUniqueness(); err != nil {
+			return nil, err
+		}
 	}
 	return state, nil
 }
@@ -255,6 +258,51 @@ func (s *State) buildRules(cfg *config.Config) {
 			}
 		}
 	}
+}
+
+func (s *State) validateRuleUniqueness() error {
+	type egressKey struct {
+		family     string
+		fwmark     uint32
+		sourcePort uint16
+		underlay   int
+	}
+	egressSeen := make(map[egressKey]EgressRule, len(s.EgressRules))
+	for _, r := range s.EgressRules {
+		key := egressKey{family: r.Family, fwmark: r.FwMark, sourcePort: r.SourcePort, underlay: r.UnderlayIfIndex}
+		if existing, ok := egressSeen[key]; ok {
+			return fmt.Errorf("duplicate egress rule for family=%s fwmark=0x%08x source_port=%d underlay_ifindex=%d between wg_id=%d and wg_id=%d", r.Family, r.FwMark, r.SourcePort, r.UnderlayIfIndex, existing.WGID, r.WGID)
+		}
+		egressSeen[key] = r
+	}
+
+	type ingressKey struct {
+		family   string
+		port     uint16
+		underlay int
+	}
+	ingressSeen := make(map[ingressKey]IngressListener, len(s.IngressListeners))
+	for _, r := range s.IngressListeners {
+		key := ingressKey{family: r.Family, port: r.DestinationPort, underlay: r.UnderlayIfIndex}
+		if existing, ok := ingressSeen[key]; ok {
+			return fmt.Errorf("duplicate ingress listener for family=%s destination_port=%d underlay_ifindex=%d between wg_id=%d and wg_id=%d", r.Family, r.DestinationPort, r.UnderlayIfIndex, existing.WGID, r.WGID)
+		}
+		ingressSeen[key] = r
+	}
+
+	type fwmarkKey struct {
+		fwmark   uint32
+		underlay int
+	}
+	managedSeen := make(map[fwmarkKey]ManagedFwmarkRule, len(s.ManagedFwmarks))
+	for _, r := range s.ManagedFwmarks {
+		key := fwmarkKey{fwmark: r.FwMark, underlay: r.UnderlayIfIndex}
+		if existing, ok := managedSeen[key]; ok && existing.ActionOnMiss != r.ActionOnMiss {
+			return fmt.Errorf("conflicting managed fwmark rule for fwmark=0x%08x underlay_ifindex=%d", r.FwMark, r.UnderlayIfIndex)
+		}
+		managedSeen[key] = r
+	}
+	return nil
 }
 
 func assignProfileIDs(profiles map[string]profile.Compiled) map[string]uint32 {

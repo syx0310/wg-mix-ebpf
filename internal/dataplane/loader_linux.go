@@ -194,7 +194,6 @@ func ensureClsact(link netlink.Link) error {
 }
 
 func replaceBpfFilter(link netlink.Link, parent uint32, handle uint32, name string, fd int) error {
-	_ = deleteNamedFilter(link, parent, name)
 	filter := &netlink.BpfFilter{
 		FilterAttrs: netlink.FilterAttrs{
 			LinkIndex: link.Attrs().Index,
@@ -207,7 +206,10 @@ func replaceBpfFilter(link netlink.Link, parent uint32, handle uint32, name stri
 		Name:         name,
 		DirectAction: true,
 	}
-	return netlink.FilterAdd(filter)
+	if err := netlink.FilterReplace(filter); err != nil {
+		return err
+	}
+	return deleteDuplicateNamedFilters(link, parent, name, handle)
 }
 
 func detachPrograms(ifindex int) error {
@@ -230,6 +232,24 @@ func deleteNamedFilter(link netlink.Link, parent uint32, name string) error {
 	for _, f := range filters {
 		bpfFilter, ok := f.(*netlink.BpfFilter)
 		if !ok || bpfFilter.Name != name {
+			continue
+		}
+		if err := netlink.FilterDel(f); err != nil && !isNotFound(err) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func deleteDuplicateNamedFilters(link netlink.Link, parent uint32, name string, keepHandle uint32) error {
+	filters, err := netlink.FilterList(link, parent)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, f := range filters {
+		bpfFilter, ok := f.(*netlink.BpfFilter)
+		if !ok || bpfFilter.Name != name || bpfFilter.Attrs().Handle == keepHandle {
 			continue
 		}
 		if err := netlink.FilterDel(f); err != nil && !isNotFound(err) {

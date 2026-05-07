@@ -66,6 +66,27 @@ type Runtime struct {
 	RequireNonzeroFwmark    bool     `yaml:"require_nonzero_fwmark"`
 	StrictRuntimeFwmark     bool     `yaml:"strict_runtime_fwmark"`
 	AllowZeroFwmarkFallback bool     `yaml:"allow_zero_fwmark_fallback"`
+
+	requireNonzeroFwmarkSet bool
+	strictRuntimeFwmarkSet  bool
+}
+
+func (r *Runtime) UnmarshalYAML(value *yaml.Node) error {
+	type runtime Runtime
+	var out runtime
+	if err := value.Decode(&out); err != nil {
+		return err
+	}
+	for i := 0; i+1 < len(value.Content); i += 2 {
+		switch value.Content[i].Value {
+		case "require_nonzero_fwmark":
+			out.requireNonzeroFwmarkSet = true
+		case "strict_runtime_fwmark":
+			out.strictRuntimeFwmarkSet = true
+		}
+	}
+	*r = Runtime(out)
+	return nil
 }
 
 type StartupGuard struct {
@@ -163,10 +184,10 @@ func (c *Config) ApplyDefaults() {
 	if c.Runtime.PollInterval.Duration == 0 {
 		c.Runtime.PollInterval.Duration = 5 * time.Second
 	}
-	if !c.Runtime.AllowZeroFwmarkFallback {
+	if !c.Runtime.AllowZeroFwmarkFallback && !c.Runtime.requireNonzeroFwmarkSet {
 		c.Runtime.RequireNonzeroFwmark = true
 	}
-	if !c.Runtime.StrictRuntimeFwmark {
+	if !c.Runtime.strictRuntimeFwmarkSet {
 		c.Runtime.StrictRuntimeFwmark = true
 	}
 	if c.StartupGuard.Mode == "" {
@@ -233,6 +254,13 @@ func (c *Config) ValidateStatic() error {
 	}
 	if len(c.Profiles) == 0 {
 		return errors.New("at least one profile is required")
+	}
+	switch c.FwmarkPolicy.Mode {
+	case "config-required":
+	case "runtime-accepted", "openwrt-uci":
+		return fmt.Errorf("fwmark_policy.mode %q is reserved but not implemented in MVP", c.FwmarkPolicy.Mode)
+	default:
+		return fmt.Errorf("fwmark_policy.mode %q is unsupported", c.FwmarkPolicy.Mode)
 	}
 	if err := validateUniqueUnderlays(c.Underlays); err != nil {
 		return err

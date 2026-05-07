@@ -134,3 +134,53 @@ func TestBuildStateRuntimeFwMarkMismatch(t *testing.T) {
 		t.Fatal("expected runtime fwmark mismatch")
 	}
 }
+
+func TestBuildStateRejectsDuplicateIngressListener(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    config: /tmp/wg0.conf
+    profile: mix-default
+  - name: wg1
+    config: /tmp/wg1.conf
+    profile: mix-default
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mark0 := uint32(0x10000002)
+	mark1 := uint32(0x10000003)
+	_, err = BuildState(
+		context.Background(),
+		cfg,
+		runtime.StaticProvider{Devices: map[string]*runtime.Device{
+			"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: mark0, Up: true},
+			"wg1": {Name: "wg1", ListenPort: 31001, FirewallMark: mark1, Up: true},
+		}},
+		underlay.StaticResolver{Underlays: map[string]*underlay.Resolved{
+			"eth0": {IfName: "eth0", IfIndex: 2, Role: "transform"},
+		}},
+		func(path string) (*wgconfig.Interface, error) {
+			switch path {
+			case "/tmp/wg0.conf":
+				return &wgconfig.Interface{FwMark: &mark0}, nil
+			case "/tmp/wg1.conf":
+				return &wgconfig.Interface{FwMark: &mark1}, nil
+			default:
+				t.Fatalf("unexpected path %s", path)
+				return nil, nil
+			}
+		},
+		BuildOptions{},
+	)
+	if err == nil {
+		t.Fatal("expected duplicate ingress listener error")
+	}
+}

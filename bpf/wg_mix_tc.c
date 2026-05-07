@@ -36,6 +36,22 @@
 #define NEXTHDR_FRAGMENT 44
 #endif
 
+#ifndef NEXTHDR_HOP
+#define NEXTHDR_HOP 0
+#endif
+
+#ifndef NEXTHDR_ROUTING
+#define NEXTHDR_ROUTING 43
+#endif
+
+#ifndef NEXTHDR_DEST
+#define NEXTHDR_DEST 60
+#endif
+
+#ifndef NEXTHDR_NONE
+#define NEXTHDR_NONE 59
+#endif
+
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
 #define wg_le32_to_cpu(x) (x)
 #define wg_cpu_to_le32(x) (x)
@@ -49,10 +65,29 @@
 #define PARSE_NOT_UDP 2
 #define PARSE_FRAGMENT 3
 #define PARSE_IPV6_EXT 4
+#define PARSE_IPV4_FIRST_FRAGMENT 5
+#define PARSE_IPV4_NON_FIRST_FRAGMENT 6
+#define PARSE_IPV6_EXT_UDP 7
+#define PARSE_IPV6_FRAGMENT_FIRST 8
+#define PARSE_IPV6_FRAGMENT_NON_FIRST 9
+#define PARSE_BAD_CSUM 10
+#define PARSE_IPV6_EXT_TOO_DEEP 11
 
 struct wg_vlan_hdr {
 	__be16 h_vlan_TCI;
 	__be16 h_vlan_encapsulated_proto;
+};
+
+struct wg_ipv6_opt_hdr {
+	__u8 nexthdr;
+	__u8 hdrlen;
+};
+
+struct wg_ipv6_frag_hdr {
+	__u8 nexthdr;
+	__u8 reserved;
+	__be16 frag_off;
+	__be32 identification;
 };
 
 struct control_value {
@@ -205,45 +240,73 @@ static __always_inline int same_generation(__u64 generation)
 	return generation == control->active_generation;
 }
 
-static __always_inline int parse_eth_or_l3(void *data, void *data_end, __u64 *off, __u16 *proto)
+static __always_inline int parse_link(struct __sk_buff *skb, void *data, void *data_end,
+				      __u64 *off, __u16 *proto)
 {
 	struct ethhdr *eth = data;
-	__u8 first;
+	__u16 skb_proto = skb->protocol;
 
-	if (data + 1 > data_end)
-		return PARSE_SHORT;
+	if ((void *)(eth + 1) <= data_end) {
+		*off = sizeof(*eth);
+		*proto = eth->h_proto;
 
-	first = *(__u8 *)data;
-	if ((first >> 4) == 4) {
-		*off = 0;
-		*proto = bpf_htons(ETH_P_IP);
-		return PARSE_OK;
-	}
-	if ((first >> 4) == 6) {
-		*off = 0;
-		*proto = bpf_htons(ETH_P_IPV6);
-		return PARSE_OK;
-	}
-
-	if ((void *)(eth + 1) > data_end)
-		return PARSE_SHORT;
-
-	*off = sizeof(*eth);
-	*proto = eth->h_proto;
-
+		if (*proto == bpf_htons(ETH_P_IP) || *proto == bpf_htons(ETH_P_IPV6) ||
+		    *proto == bpf_htons(ETH_P_8021Q) || *proto == bpf_htons(ETH_P_8021AD)) {
 #pragma unroll
-	for (int i = 0; i < 2; i++) {
-		struct wg_vlan_hdr *vh;
+			for (int i = 0; i < 2; i++) {
+				struct wg_vlan_hdr *vh;
 
-		if (*proto != bpf_htons(ETH_P_8021Q) && *proto != bpf_htons(ETH_P_8021AD))
-			break;
-		vh = data + *off;
-		if ((void *)(vh + 1) > data_end)
-			return PARSE_SHORT;
-		*proto = vh->h_vlan_encapsulated_proto;
-		*off += sizeof(*vh);
+				if (*proto != bpf_htons(ETH_P_8021Q) &&
+				    *proto != bpf_htons(ETH_P_8021AD))
+					break;
+				vh = data + *off;
+				if ((void *)(vh + 1) > data_end)
+					return PARSE_SHORT;
+				*proto = vh->h_vlan_encapsulated_proto;
+				*off += sizeof(*vh);
+			}
+			return PARSE_OK;
+		}
 	}
+
+	if (skb_proto == bpf_htons(ETH_P_IP) || skb_proto == bpf_htons(ETH_P_IPV6)) {
+		*off = 0;
+		*proto = skb_proto;
+		return PARSE_OK;
+	}
+	return PARSE_NOT_UDP;
+}
+
+static __always_inline int parse_udp_at(void *data, void *data_end, struct packet_info *info,
+					__u32 family, __u32 ip_off, __u32 udp_off,
+					int require_payload_word)
+{
+	struct udphdr *udp = data + udp_off;
+	__u16 udp_len;
+
+	if ((void *)(udp + 1) > data_end)
+		return PARSE_SHORT;
+	udp_len = bpf_ntohs(udp->len);
+	if (udp_len < sizeof(*udp))
+		return PARSE_SHORT;
+	info->family = family;
+	info->ip_off = ip_off;
+	info->udp_off = udp_off;
+	info->payload_off = udp_off + sizeof(*udp);
+	info->payload_len = udp_len - sizeof(*udp);
+	info->src_port = bpf_ntohs(udp->source);
+	info->dst_port = bpf_ntohs(udp->dest);
+	info->ipv4_udp_csum_zero = family == FAMILY_IPV4 && udp->check == 0;
+	if (family == FAMILY_IPV6 && udp->check == 0)
+		return PARSE_BAD_CSUM;
+	if (require_payload_word && data + info->payload_off + 4 > data_end)
+		return PARSE_SHORT;
 	return PARSE_OK;
+}
+
+static __always_inline int is_ipv6_option_header(__u8 nexthdr)
+{
+	return nexthdr == NEXTHDR_HOP || nexthdr == NEXTHDR_ROUTING || nexthdr == NEXTHDR_DEST;
 }
 
 static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_info *info)
@@ -255,7 +318,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 	int rc;
 
 	__builtin_memset(info, 0, sizeof(*info));
-	rc = parse_eth_or_l3(data, data_end, &off, &proto);
+	rc = parse_link(skb, data, data_end, &off, &proto);
 	if (rc != PARSE_OK)
 		return rc;
 
@@ -263,67 +326,86 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 		struct iphdr *iph = data + off;
 		__u32 ihl;
 		__u16 frag;
-		struct udphdr *udp;
-		__u16 udp_len;
+		__u16 frag_off;
 
 		if ((void *)(iph + 1) > data_end)
 			return PARSE_SHORT;
 		ihl = iph->ihl * 4;
 		if (ihl < sizeof(*iph) || data + off + ihl > data_end)
 			return PARSE_SHORT;
-		frag = bpf_ntohs(iph->frag_off);
-		if (frag & (IP_MF | IP_OFFSET))
-			return PARSE_FRAGMENT;
 		if (iph->protocol != IPPROTO_UDP)
 			return PARSE_NOT_UDP;
-		udp = data + off + ihl;
-		if ((void *)(udp + 1) > data_end)
-			return PARSE_SHORT;
-		udp_len = bpf_ntohs(udp->len);
-		if (udp_len < sizeof(*udp))
-			return PARSE_SHORT;
-		info->family = FAMILY_IPV4;
-		info->ip_off = off;
-		info->udp_off = off + ihl;
-		info->payload_off = info->udp_off + sizeof(*udp);
-		info->payload_len = udp_len - sizeof(*udp);
-		info->src_port = bpf_ntohs(udp->source);
-		info->dst_port = bpf_ntohs(udp->dest);
-		info->ipv4_udp_csum_zero = udp->check == 0;
-		if (data + info->payload_off + 4 > data_end)
-			return PARSE_SHORT;
-		return PARSE_OK;
+		frag = bpf_ntohs(iph->frag_off);
+		frag_off = frag & IP_OFFSET;
+		if (frag_off != 0)
+			return PARSE_IPV4_NON_FIRST_FRAGMENT;
+		rc = parse_udp_at(data, data_end, info, FAMILY_IPV4, off, off + ihl, !(frag & IP_MF));
+		if (rc != PARSE_OK)
+			return rc;
+		if (frag & IP_MF)
+			return PARSE_IPV4_FIRST_FRAGMENT;
+		return rc;
 	}
 
 	if (proto == bpf_htons(ETH_P_IPV6)) {
 		struct ipv6hdr *ip6h = data + off;
-		struct udphdr *udp;
-		__u16 udp_len;
+		__u32 hdr_off = off + sizeof(*ip6h);
+		__u8 nexthdr;
+		__u8 saw_ext = 0;
+		__u8 saw_frag = 0;
 
 		if ((void *)(ip6h + 1) > data_end)
 			return PARSE_SHORT;
-		if (ip6h->nexthdr == NEXTHDR_FRAGMENT)
-			return PARSE_FRAGMENT;
-		if (ip6h->nexthdr != IPPROTO_UDP)
+		nexthdr = ip6h->nexthdr;
+
+#pragma unroll
+		for (int i = 0; i < 8; i++) {
+			if (nexthdr == IPPROTO_UDP) {
+				rc = parse_udp_at(data, data_end, info, FAMILY_IPV6, off, hdr_off,
+						  !(saw_ext || saw_frag));
+				if (rc != PARSE_OK)
+					return rc;
+				if (saw_frag)
+					return PARSE_IPV6_FRAGMENT_FIRST;
+				if (saw_ext)
+					return PARSE_IPV6_EXT_UDP;
+				return PARSE_OK;
+			}
+			if (nexthdr == NEXTHDR_FRAGMENT) {
+				struct wg_ipv6_frag_hdr *fh = data + hdr_off;
+				__u16 frag;
+
+				if ((void *)(fh + 1) > data_end)
+					return PARSE_SHORT;
+				frag = bpf_ntohs(fh->frag_off);
+				if (frag & 0xfff8)
+					return PARSE_IPV6_FRAGMENT_NON_FIRST;
+				saw_frag = 1;
+				nexthdr = fh->nexthdr;
+				hdr_off += sizeof(*fh);
+				continue;
+			}
+			if (is_ipv6_option_header(nexthdr)) {
+				struct wg_ipv6_opt_hdr *oh = data + hdr_off;
+				__u32 len;
+
+				if ((void *)(oh + 1) > data_end)
+					return PARSE_SHORT;
+				len = ((__u32)oh->hdrlen + 1) * 8;
+				if (len < 8 || hdr_off + len < hdr_off)
+					return PARSE_IPV6_EXT_TOO_DEEP;
+				saw_ext = 1;
+				nexthdr = oh->nexthdr;
+				hdr_off += len;
+				if (hdr_off > off + sizeof(*ip6h) + 512)
+					return PARSE_IPV6_EXT_TOO_DEEP;
+				continue;
+			}
+			if (nexthdr == NEXTHDR_NONE)
+				return PARSE_NOT_UDP;
 			return PARSE_IPV6_EXT;
-		udp = data + off + sizeof(*ip6h);
-		if ((void *)(udp + 1) > data_end)
-			return PARSE_SHORT;
-		udp_len = bpf_ntohs(udp->len);
-		if (udp_len < sizeof(*udp))
-			return PARSE_SHORT;
-		if (udp->check == 0)
-			return PARSE_SHORT;
-		info->family = FAMILY_IPV6;
-		info->ip_off = off;
-		info->udp_off = off + sizeof(*ip6h);
-		info->payload_off = info->udp_off + sizeof(*udp);
-		info->payload_len = udp_len - sizeof(*udp);
-		info->src_port = bpf_ntohs(udp->source);
-		info->dst_port = bpf_ntohs(udp->dest);
-		if (data + info->payload_off + 4 > data_end)
-			return PARSE_SHORT;
-		return PARSE_OK;
+		}
+		return PARSE_IPV6_EXT_TOO_DEEP;
 	}
 
 	return PARSE_NOT_UDP;
@@ -406,6 +488,47 @@ static __always_inline int managed_miss_action(__u32 stat, struct managed_fwmark
 	return TC_ACT_OK;
 }
 
+static __always_inline int parse_result_is_fragment(int rc)
+{
+	return rc == PARSE_FRAGMENT || rc == PARSE_IPV4_FIRST_FRAGMENT ||
+	       rc == PARSE_IPV4_NON_FIRST_FRAGMENT || rc == PARSE_IPV6_FRAGMENT_FIRST ||
+	       rc == PARSE_IPV6_FRAGMENT_NON_FIRST;
+}
+
+static __always_inline int parse_result_is_ipv6_ext(int rc)
+{
+	return rc == PARSE_IPV6_EXT || rc == PARSE_IPV6_EXT_UDP ||
+	       rc == PARSE_IPV6_EXT_TOO_DEEP;
+}
+
+static __always_inline int parse_result_has_ingress_port(int rc)
+{
+	return rc == PARSE_OK || rc == PARSE_IPV4_FIRST_FRAGMENT ||
+	       rc == PARSE_IPV6_EXT_UDP || rc == PARSE_IPV6_FRAGMENT_FIRST ||
+	       rc == PARSE_BAD_CSUM;
+}
+
+static __always_inline struct ingress_listener_value *lookup_ingress_listener(__u32 ifindex,
+									      __u16 dst_port,
+									      __u8 family)
+{
+	struct ingress_listener_key key = {
+		.underlay_index = ifindex,
+		.destination_port = dst_port,
+		.family = family,
+	};
+	struct ingress_listener_value *listener;
+
+	listener = bpf_map_lookup_elem(&ingress_listener_map, &key);
+	if (listener && same_generation(listener->generation))
+		return listener;
+	key.underlay_index = UNDERLAY_WILDCARD;
+	listener = bpf_map_lookup_elem(&ingress_listener_map, &key);
+	if (listener && same_generation(listener->generation))
+		return listener;
+	return 0;
+}
+
 SEC("tc/egress")
 int wg_mix_egress(struct __sk_buff *skb)
 {
@@ -421,14 +544,14 @@ int wg_mix_egress(struct __sk_buff *skb)
 
 	rc = parse_packet(skb, &info);
 	managed = lookup_managed_fwmark(skb->mark, skb->ifindex);
-	if (rc == PARSE_FRAGMENT) {
+	if (parse_result_is_fragment(rc)) {
 		if (managed) {
 			inc_stat(STAT_EGRESS_FRAGMENT);
 			return TC_ACT_SHOT;
 		}
 		return TC_ACT_OK;
 	}
-	if (rc == PARSE_IPV6_EXT) {
+	if (parse_result_is_ipv6_ext(rc)) {
 		if (managed) {
 			inc_stat(STAT_EGRESS_IPV6_EXT);
 			return TC_ACT_SHOT;
@@ -482,7 +605,6 @@ SEC("tc/ingress")
 int wg_mix_ingress(struct __sk_buff *skb)
 {
 	struct packet_info info;
-	struct ingress_listener_key key = {};
 	struct ingress_listener_value *listener;
 	struct profile_value *profile;
 	__u32 old_wire = 0;
@@ -491,29 +613,30 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	int rc, kind = -1;
 
 	rc = parse_packet(skb, &info);
-	if (rc == PARSE_FRAGMENT) {
-		inc_stat(STAT_INGRESS_FRAGMENT);
+	if (!parse_result_has_ingress_port(rc)) {
+		if (parse_result_is_fragment(rc))
+			inc_stat(STAT_INGRESS_FRAGMENT);
+		if (parse_result_is_ipv6_ext(rc))
+			inc_stat(STAT_INGRESS_IPV6_EXT);
 		return TC_ACT_OK;
 	}
-	if (rc == PARSE_IPV6_EXT) {
-		inc_stat(STAT_INGRESS_IPV6_EXT);
+
+	listener = lookup_ingress_listener(skb->ifindex, info.dst_port, info.family);
+	if (!listener) {
+		inc_stat(STAT_INGRESS_RULE_MISS);
 		return TC_ACT_OK;
+	}
+	if (parse_result_is_fragment(rc)) {
+		inc_stat(STAT_INGRESS_FRAGMENT);
+		return TC_ACT_SHOT;
+	}
+	if (parse_result_is_ipv6_ext(rc) || rc == PARSE_BAD_CSUM) {
+		inc_stat(STAT_INGRESS_IPV6_EXT);
+		return TC_ACT_SHOT;
 	}
 	if (rc != PARSE_OK)
 		return TC_ACT_OK;
 
-	key.underlay_index = skb->ifindex;
-	key.destination_port = info.dst_port;
-	key.family = info.family;
-	listener = bpf_map_lookup_elem(&ingress_listener_map, &key);
-	if (!listener || !same_generation(listener->generation)) {
-		key.underlay_index = UNDERLAY_WILDCARD;
-		listener = bpf_map_lookup_elem(&ingress_listener_map, &key);
-	}
-	if (!listener || !same_generation(listener->generation)) {
-		inc_stat(STAT_INGRESS_RULE_MISS);
-		return TC_ACT_OK;
-	}
 	if (listener->action == ACTION_DROP)
 		return TC_ACT_SHOT;
 	if (listener->action != ACTION_REWRITE)

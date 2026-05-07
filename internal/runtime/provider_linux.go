@@ -5,6 +5,7 @@ package runtime
 import (
 	"context"
 	"fmt"
+	"net"
 
 	"golang.zx2c4.com/wireguard/wgctrl"
 )
@@ -31,6 +32,9 @@ func (SystemProvider) Device(_ context.Context, name string) (*Device, error) {
 		ListenPort:   uint16(dev.ListenPort),
 		FirewallMark: uint32(dev.FirewallMark),
 		Up:           true,
+	}
+	if iface, err := net.InterfaceByName(dev.Name); err == nil {
+		out.IfIndex = iface.Index
 	}
 	for _, peer := range dev.Peers {
 		p := Peer{
