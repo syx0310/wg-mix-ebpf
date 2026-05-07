@@ -75,3 +75,48 @@ func TestFromState(t *testing.T) {
 		t.Fatal("missing ingress rewrite rule")
 	}
 }
+
+func TestFromStateWithGenerationOverridesRuleGeneration(t *testing.T) {
+	state := &control.State{
+		Generation: 7,
+		Profiles: []control.ProfileState{
+			{
+				ID:              1,
+				Name:            "default",
+				StandardToMixed: [4]uint32{10, 11, 12, 13},
+				MixedToStandard: [4]uint32{1, 2, 3, 4},
+			},
+		},
+		Underlays: []control.UnderlayState{
+			{IfIndex: 2, Parser: "ethernet", Role: "transform", Resolved: true},
+		},
+		ManagedFwmarks: []control.ManagedFwmarkRule{
+			{Generation: 7, FwMark: 0x10000001, UnderlayIfIndex: 2, ActionOnMiss: "drop"},
+		},
+		EgressRules: []control.EgressRule{
+			{Generation: 7, Family: "ipv4", FwMark: 0x10000001, SourcePort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "rewrite"},
+		},
+		IngressListeners: []control.IngressListener{
+			{Generation: 7, Family: "ipv4", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "rewrite"},
+		},
+	}
+	snapshot, err := FromStateWithGeneration(state, 42)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := snapshot.Control[ControlKeyGlobal].ActiveGeneration; got != 42 {
+		t.Fatalf("control generation = %d, want 42", got)
+	}
+	if got := snapshot.Profiles[ProfileKey(1)].Generation; got != 42 {
+		t.Fatalf("profile generation = %d, want 42", got)
+	}
+	if got := snapshot.ManagedFwmarks[ManagedFwmarkKey{FwMark: 0x10000001, UnderlayIndex: 2}].Generation; got != 42 {
+		t.Fatalf("managed fwmark generation = %d, want 42", got)
+	}
+	if got := snapshot.EgressRules[EgressRuleKey{FwMark: 0x10000001, UnderlayIndex: 2, SourcePort: 31001, Family: FamilyIPv4}].Generation; got != 42 {
+		t.Fatalf("egress generation = %d, want 42", got)
+	}
+	if got := snapshot.IngressListeners[IngressListenerKey{UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv4}].Generation; got != 42 {
+		t.Fatalf("ingress generation = %d, want 42", got)
+	}
+}

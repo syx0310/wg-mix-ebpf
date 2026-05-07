@@ -63,7 +63,7 @@ func runBPFLoadTest(ctx context.Context, args []string, stdout io.Writer) error 
 	}
 	path := *objectPath
 	if path == "" {
-		path = dataplane.DefaultObjectPath
+		path = dataplane.DisplayObjectPath("")
 	}
 	fmt.Fprintf(stdout, "BPF object loaded successfully: %s\n", path)
 	return nil

@@ -141,10 +141,14 @@ func mapEntries[K comparable, V any](m map[K]V) []MapEntry[K, V] {
 }
 
 func FromState(state *control.State) (*Snapshot, error) {
+	return FromStateWithGeneration(state, state.Generation)
+}
+
+func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot, error) {
 	out := &Snapshot{
 		Control: map[ControlKey]ControlValue{
 			ControlKeyGlobal: {
-				ActiveGeneration: state.Generation,
+				ActiveGeneration: generation,
 				ABIVersion:       Version,
 			},
 		},
@@ -156,7 +160,7 @@ func FromState(state *control.State) (*Snapshot, error) {
 	}
 	for _, p := range state.Profiles {
 		out.Profiles[ProfileKey(p.ID)] = ProfileValue{
-			Generation:      state.Generation,
+			Generation:      generation,
 			StandardToMixed: p.StandardToMixed,
 			MixedToStandard: p.MixedToStandard,
 		}
@@ -170,7 +174,7 @@ func FromState(state *control.State) (*Snapshot, error) {
 			return nil, err
 		}
 		out.Underlays[UnderlayConfigKey{UnderlayIndex: uint32(u.IfIndex)}] = UnderlayConfigValue{
-			Generation: state.Generation,
+			Generation: generation,
 			ParserMode: parser,
 		}
 	}
@@ -183,7 +187,7 @@ func FromState(state *control.State) (*Snapshot, error) {
 			FwMark:        r.FwMark,
 			UnderlayIndex: uint32(r.UnderlayIfIndex),
 		}] = ManagedFwmarkValue{
-			Generation:   r.Generation,
+			Generation:   generation,
 			ActionOnMiss: action,
 		}
 	}
@@ -202,7 +206,7 @@ func FromState(state *control.State) (*Snapshot, error) {
 			SourcePort:    r.SourcePort,
 			Family:        family,
 		}] = EgressRuleValue{
-			Generation: r.Generation,
+			Generation: generation,
 			ProfileID:  r.ProfileID,
 			WGID:       r.WGID,
 			Action:     action,
@@ -222,7 +226,7 @@ func FromState(state *control.State) (*Snapshot, error) {
 			DestinationPort: r.DestinationPort,
 			Family:          family,
 		}] = IngressListenerValue{
-			Generation: r.Generation,
+			Generation: generation,
 			ProfileID:  r.ProfileID,
 			WGID:       r.WGID,
 			Action:     action,

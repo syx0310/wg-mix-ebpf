@@ -8,7 +8,6 @@ fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ROOT}/bin/wg-mix-ebpf"
-BPF_OBJECT="${ROOT}/build/wg_mix_tc.o"
 
 for cmd in ip wg ping tcpdump python3 timeout; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
@@ -21,25 +20,46 @@ if [[ ! -x "${BIN}" ]]; then
   echo "error: missing binary: ${BIN}" >&2
   exit 1
 fi
-if [[ ! -f "${BPF_OBJECT}" ]]; then
-  echo "error: missing BPF object: ${BPF_OBJECT}" >&2
-  exit 1
-fi
 
 RUN_ID="${RUN_ID:-$(printf '%x' "$$")}"
 NSA="wme${RUN_ID}a"
 NSR="wme${RUN_ID}r"
 NSB="wme${RUN_ID}b"
 TMPDIR="$(mktemp -d /tmp/wg-mix-ebpf-smoke.XXXXXX)"
+PIN_MOUNT="/run/wg-mix-ebpf-bpf-${RUN_ID}"
+PINA="${PIN_MOUNT}/wg-mix-ebpf-${NSA}"
+PINB="${PIN_MOUNT}/wg-mix-ebpf-${NSB}"
 umask 077
+
+ensure_bpffs_in_netns() {
+	local ns="$1"
+	ip netns exec "${ns}" sh -c 'mountpoint="$1"; mkdir -p "${mountpoint}" && awk -v mp="${mountpoint}" '"'"'$2 == mp && $3 == "bpf" { found = 1 } END { exit !found }'"'"' /proc/mounts || mount -t bpf bpf "${mountpoint}"' sh "${PIN_MOUNT}"
+}
+
+run_agent_in_netns() {
+  local ns="$1"
+  local pin="$2"
+  shift 2
+  ip netns exec "${ns}" sh -c '
+    pin="$1"
+    bin="$2"
+    shift 2
+    mountpoint="$(dirname "${pin}")"
+    mkdir -p "${mountpoint}"
+    mount -t bpf bpf "${mountpoint}" 2>/dev/null || true
+    WG_MIX_EBPF_PIN_PATH="${pin}" exec "${bin}" "$@"
+  ' sh "${pin}" "${BIN}" "$@"
+}
 
 cleanup() {
   set +e
   if ip netns list | awk '{print $1}' | grep -qx "${NSA}"; then
-    ip netns exec "${NSA}" env WG_MIX_EBPF_OBJECT="${BPF_OBJECT}" "${BIN}" detach --config "${TMPDIR}/agent-a.yaml" >/dev/null 2>&1
+    run_agent_in_netns "${NSA}" "${PINA}" detach --config "${TMPDIR}/agent-a.yaml" >/dev/null 2>&1
+    ip netns exec "${NSA}" umount "${PIN_MOUNT}" >/dev/null 2>&1 || true
   fi
   if ip netns list | awk '{print $1}' | grep -qx "${NSB}"; then
-    ip netns exec "${NSB}" env WG_MIX_EBPF_OBJECT="${BPF_OBJECT}" "${BIN}" detach --config "${TMPDIR}/agent-b.yaml" >/dev/null 2>&1
+    run_agent_in_netns "${NSB}" "${PINB}" detach --config "${TMPDIR}/agent-b.yaml" >/dev/null 2>&1
+    ip netns exec "${NSB}" umount "${PIN_MOUNT}" >/dev/null 2>&1 || true
   fi
   ip netns delete "${NSA}" >/dev/null 2>&1
   ip netns delete "${NSR}" >/dev/null 2>&1
@@ -156,8 +176,8 @@ make_wg_config_stub "${TMPDIR}/wg-b.conf" 31002 0x10000002
 make_agent_config "${TMPDIR}/agent-a.yaml" under0 "${TMPDIR}/wg-a.conf"
 make_agent_config "${TMPDIR}/agent-b.yaml" under0 "${TMPDIR}/wg-b.conf"
 
-ip netns exec "${NSA}" env WG_MIX_EBPF_OBJECT="${BPF_OBJECT}" "${BIN}" reload --config "${TMPDIR}/agent-a.yaml"
-ip netns exec "${NSB}" env WG_MIX_EBPF_OBJECT="${BPF_OBJECT}" "${BIN}" reload --config "${TMPDIR}/agent-b.yaml"
+run_agent_in_netns "${NSA}" "${PINA}" reload --config "${TMPDIR}/agent-a.yaml"
+run_agent_in_netns "${NSB}" "${PINB}" reload --config "${TMPDIR}/agent-b.yaml"
 
 timeout -s INT 12 ip netns exec "${NSR}" tcpdump -i ra0 -w "${TMPDIR}/ra.pcap" udp >/dev/null 2>"${TMPDIR}/tcpdump-ra.log" &
 TCPDUMP_RA=$!

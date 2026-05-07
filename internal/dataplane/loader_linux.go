@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/cilium/ebpf"
@@ -27,27 +28,30 @@ const (
 
 type LinuxLoader struct {
 	ObjectPath string
+	PinPath    string
 }
 
 func NewLoader() Loader {
-	return LinuxLoader{ObjectPath: objectPathFromEnv("")}
+	return LinuxLoader{
+		ObjectPath: objectPathFromEnv(""),
+		PinPath:    pinPathFromEnv(""),
+	}
 }
 
 func LoadObjectTest(ctx context.Context, objectPath string) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	path := objectPathFromEnv(objectPath)
-	spec, err := ebpf.LoadCollectionSpec(path)
+	spec, source, err := loadCollectionSpec(objectPath)
 	if err != nil {
-		return fmt.Errorf("load BPF object %s: %w", path, err)
+		return err
 	}
 	if err := removeMemlockLimit(); err != nil {
 		return err
 	}
 	coll, err := ebpf.NewCollection(spec)
 	if err != nil {
-		return fmt.Errorf("create BPF collection: %w", err)
+		return fmt.Errorf("create BPF collection from %s: %w", source, err)
 	}
 	coll.Close()
 	return nil
@@ -57,24 +61,42 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	spec, err := ebpf.LoadCollectionSpec(l.ObjectPath)
+	spec, source, err := loadCollectionSpec(l.ObjectPath)
 	if err != nil {
-		return fmt.Errorf("load BPF object %s: %w", l.ObjectPath, err)
+		return err
 	}
+	setPinnedMaps(spec)
 	if err := removeMemlockLimit(); err != nil {
 		return err
 	}
-	coll, err := ebpf.NewCollection(spec)
+	pinPath := pinPathFromEnv(l.PinPath)
+	if err := os.MkdirAll(pinPath, 0o700); err != nil {
+		return fmt.Errorf("create BPF pin path %s: %w", pinPath, err)
+	}
+	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
+		Maps: ebpf.MapOptions{PinPath: pinPath},
+	})
 	if err != nil {
-		return fmt.Errorf("create BPF collection: %w", err)
+		if errors.Is(err, ebpf.ErrMapIncompatible) {
+			return fmt.Errorf("create BPF collection from %s with pinned maps under %s: %w; run detach or remove stale pinned maps after stopping the agent", source, pinPath, err)
+		}
+		return fmt.Errorf("create BPF collection from %s: %w", source, err)
 	}
 	defer coll.Close()
 
-	snapshot, err := abi.FromState(state)
+	active, err := activeGeneration(coll)
 	if err != nil {
 		return err
 	}
-	if err := populateMaps(coll, snapshot); err != nil {
+	next := active + 1
+	if next == 0 {
+		next = 1
+	}
+	snapshot, err := abi.FromStateWithGeneration(state, next)
+	if err != nil {
+		return err
+	}
+	if err := populateDataMaps(coll, snapshot); err != nil {
 		return err
 	}
 	ingress := coll.Programs[ingressFilterName]
@@ -94,6 +116,12 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
 			return fmt.Errorf("attach underlay %s(%d): %w", u.Name, u.IfIndex, err)
 		}
 	}
+	if err := commitControl(coll, snapshot.Control[abi.ControlKeyGlobal]); err != nil {
+		return err
+	}
+	if err := deleteStaleMapEntries(coll, snapshot); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -110,17 +138,20 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 			errs = append(errs, fmt.Errorf("detach underlay %s(%d): %w", u.Name, u.IfIndex, err))
 		}
 	}
+	if err := cleanupPinnedMaps(pinPathFromEnv(l.PinPath)); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
 
-func objectPathFromEnv(explicit string) string {
+func pinPathFromEnv(explicit string) string {
 	if explicit != "" {
 		return explicit
 	}
-	if path := os.Getenv(EnvObjectPath); path != "" {
+	if path := os.Getenv(EnvPinPath); path != "" {
 		return path
 	}
-	return DefaultObjectPath
+	return DefaultPinPath
 }
 
 func removeMemlockLimit() error {
@@ -130,7 +161,45 @@ func removeMemlockLimit() error {
 	return nil
 }
 
-func populateMaps(coll *ebpf.Collection, snapshot *abi.Snapshot) error {
+func setPinnedMaps(spec *ebpf.CollectionSpec) {
+	for _, name := range pinnedMapNames() {
+		if m := spec.Maps[name]; m != nil {
+			m.Pinning = ebpf.PinByName
+		}
+	}
+}
+
+func pinnedMapNames() []string {
+	return []string{
+		"control_map",
+		"profile_map",
+		"underlay_config_map",
+		"managed_fwmark_map",
+		"egress_rule_map",
+		"ingress_listener_map",
+		"stats_map",
+	}
+}
+
+func activeGeneration(coll *ebpf.Collection) (uint64, error) {
+	m := coll.Maps["control_map"]
+	if m == nil {
+		return 0, fmt.Errorf("BPF object missing map %q", "control_map")
+	}
+	var value abi.ControlValue
+	if err := m.Lookup(abi.ControlKeyGlobal, &value); err != nil {
+		if errors.Is(err, ebpf.ErrKeyNotExist) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("lookup active generation: %w", err)
+	}
+	if value.ABIVersion != 0 && value.ABIVersion != abi.Version {
+		return 0, fmt.Errorf("pinned control_map ABI version = %d, want %d", value.ABIVersion, abi.Version)
+	}
+	return value.ActiveGeneration, nil
+}
+
+func populateDataMaps(coll *ebpf.Collection, snapshot *abi.Snapshot) error {
 	if err := updateMap(coll, "profile_map", snapshot.Profiles); err != nil {
 		return err
 	}
@@ -146,8 +215,16 @@ func populateMaps(coll *ebpf.Collection, snapshot *abi.Snapshot) error {
 	if err := updateMap(coll, "ingress_listener_map", snapshot.IngressListeners); err != nil {
 		return err
 	}
-	if err := updateMap(coll, "control_map", snapshot.Control); err != nil {
-		return err
+	return nil
+}
+
+func commitControl(coll *ebpf.Collection, value abi.ControlValue) error {
+	m := coll.Maps["control_map"]
+	if m == nil {
+		return fmt.Errorf("BPF object missing map %q", "control_map")
+	}
+	if err := m.Update(abi.ControlKeyGlobal, value, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("commit control map: %w", err)
 	}
 	return nil
 }
@@ -163,6 +240,57 @@ func updateMap[K comparable, V any](coll *ebpf.Collection, name string, entries 
 		}
 	}
 	return nil
+}
+
+func deleteStaleMapEntries(coll *ebpf.Collection, snapshot *abi.Snapshot) error {
+	return errors.Join(
+		deleteStaleEntries(coll, "profile_map", snapshot.Profiles),
+		deleteStaleEntries(coll, "underlay_config_map", snapshot.Underlays),
+		deleteStaleEntries(coll, "managed_fwmark_map", snapshot.ManagedFwmarks),
+		deleteStaleEntries(coll, "egress_rule_map", snapshot.EgressRules),
+		deleteStaleEntries(coll, "ingress_listener_map", snapshot.IngressListeners),
+	)
+}
+
+func deleteStaleEntries[K comparable, V any](coll *ebpf.Collection, name string, desired map[K]V) error {
+	m := coll.Maps[name]
+	if m == nil {
+		return fmt.Errorf("BPF object missing map %q", name)
+	}
+	var (
+		key   K
+		value V
+		errs  []error
+	)
+	iter := m.Iterate()
+	for iter.Next(&key, &value) {
+		if _, ok := desired[key]; ok {
+			continue
+		}
+		if err := m.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			errs = append(errs, fmt.Errorf("delete stale entry from %s: %w", name, err))
+		}
+	}
+	if err := iter.Err(); err != nil {
+		errs = append(errs, fmt.Errorf("iterate map %s: %w", name, err))
+	}
+	return errors.Join(errs...)
+}
+
+func cleanupPinnedMaps(pinPath string) error {
+	var errs []error
+	for _, name := range pinnedMapNames() {
+		path := filepath.Join(pinPath, name)
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("remove pinned map %s: %w", path, err))
+		}
+	}
+	if err := os.Remove(pinPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+		if !strings.Contains(strings.ToLower(err.Error()), "directory not empty") {
+			errs = append(errs, fmt.Errorf("remove BPF pin path %s: %w", pinPath, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 func attachPrograms(ifindex int, ingress *ebpf.Program, egress *ebpf.Program) error {

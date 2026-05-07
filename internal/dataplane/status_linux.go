@@ -4,8 +4,13 @@ package dataplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 
+	"github.com/cilium/ebpf"
+	"github.com/siyixuan/wg-mix-ebpf/internal/abi"
 	"github.com/siyixuan/wg-mix-ebpf/internal/control"
 	"github.com/vishvananda/netlink"
 )
@@ -14,7 +19,10 @@ func inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	status := &KernelStatus{}
+	status := &KernelStatus{PinPath: pinPathFromEnv("")}
+	if err := inspectPinnedMaps(status); err != nil {
+		status.MapError = err.Error()
+	}
 	for _, u := range state.Underlays {
 		if !u.Resolved || u.IfIndex == 0 || u.Role == "disabled" {
 			continue
@@ -57,6 +65,69 @@ func inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
 		status.Underlays = append(status.Underlays, entry)
 	}
 	return status, nil
+}
+
+func inspectPinnedMaps(status *KernelStatus) error {
+	control, err := ebpf.LoadPinnedMap(filepath.Join(status.PinPath, "control_map"), nil)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("load pinned control_map: %w", err)
+	}
+	defer control.Close()
+
+	var controlValue abi.ControlValue
+	if err := control.Lookup(abi.ControlKeyGlobal, &controlValue); err != nil {
+		if !errors.Is(err, ebpf.ErrKeyNotExist) {
+			return fmt.Errorf("lookup control_map: %w", err)
+		}
+	} else {
+		status.ActiveGeneration = controlValue.ActiveGeneration
+		status.ABIVersion = controlValue.ABIVersion
+	}
+
+	stats, err := ebpf.LoadPinnedMap(filepath.Join(status.PinPath, "stats_map"), nil)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("load pinned stats_map: %w", err)
+	}
+	defer stats.Close()
+
+	status.Stats = make(map[string]uint64, len(statNames))
+	for key, name := range statNames {
+		var values []uint64
+		if err := stats.Lookup(uint32(key), &values); err != nil {
+			if errors.Is(err, ebpf.ErrKeyNotExist) {
+				continue
+			}
+			return fmt.Errorf("lookup stats_map[%s]: %w", name, err)
+		}
+		var total uint64
+		for _, value := range values {
+			total += value
+		}
+		status.Stats[name] = total
+	}
+	return nil
+}
+
+var statNames = []string{
+	"egress_rewrite_ok",
+	"egress_rule_miss",
+	"egress_bad_type",
+	"egress_bad_length",
+	"egress_fragment",
+	"egress_ipv6_ext",
+	"ingress_rewrite_ok",
+	"ingress_rule_miss",
+	"ingress_bad_type",
+	"ingress_bad_length",
+	"ingress_fragment",
+	"ingress_ipv6_ext",
+	"checksum_error",
 }
 
 func filterStatuses(link netlink.Link, parent uint32, direction string) ([]FilterStatus, error) {

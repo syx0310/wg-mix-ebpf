@@ -7,7 +7,12 @@ import (
 )
 
 type KernelStatus struct {
-	Underlays []UnderlayKernelStatus `json:"underlays"`
+	PinPath          string                 `json:"pin_path,omitempty"`
+	ActiveGeneration uint64                 `json:"active_generation,omitempty"`
+	ABIVersion       uint32                 `json:"abi_version,omitempty"`
+	Stats            map[string]uint64      `json:"stats,omitempty"`
+	MapError         string                 `json:"map_error,omitempty"`
+	Underlays        []UnderlayKernelStatus `json:"underlays"`
 }
 
 type UnderlayKernelStatus struct {
