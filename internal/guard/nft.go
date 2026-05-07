@@ -3,6 +3,7 @@ package guard
 import (
 	"fmt"
 	"sort"
+	"strings"
 
 	"github.com/siyixuan/wg-mix-ebpf/internal/control"
 )
@@ -14,12 +15,27 @@ type NftPlan struct {
 	Rules []string `json:"rules"`
 }
 
+func (p NftPlan) Script() string {
+	lines := []string{
+		"flush table inet " + p.Table,
+		"add table inet " + p.Table,
+		"add chain inet " + p.Table + " output { type filter hook output priority -300; policy accept; }",
+		"add chain inet " + p.Table + " input { type filter hook input priority -300; policy accept; }",
+	}
+	lines = append(lines, p.Rules...)
+	return strings.Join(lines, "\n") + "\n"
+}
+
+func CleanupScript() string {
+	return "delete table inet " + TableName + "\n"
+}
+
 func BuildNftPlan(state *control.State) NftPlan {
 	plan := NftPlan{Table: TableName}
 	fwmarks := uniqueFwmarks(state.WireGuards)
 	for _, mark := range fwmarks {
 		plan.Rules = append(plan.Rules,
-			fmt.Sprintf("add rule inet %s output udp meta mark 0x%08x counter drop comment \"wg-mix-ebpf startup egress guard\"", TableName, mark),
+			fmt.Sprintf("add rule inet %s output meta l4proto udp meta mark 0x%08x counter drop comment \"wg-mix-ebpf startup egress guard\"", TableName, mark),
 		)
 	}
 	for _, wg := range state.WireGuards {
