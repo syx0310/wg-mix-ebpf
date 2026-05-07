@@ -24,11 +24,36 @@
 #define CONTROL_KEY_GLOBAL 0
 #define UNDERLAY_WILDCARD 0
 
+#ifndef IP_MF
+#define IP_MF 0x2000
+#endif
+
+#ifndef IP_OFFSET
+#define IP_OFFSET 0x1fff
+#endif
+
+#ifndef NEXTHDR_FRAGMENT
+#define NEXTHDR_FRAGMENT 44
+#endif
+
+#if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__
+#define wg_le32_to_cpu(x) (x)
+#define wg_cpu_to_le32(x) (x)
+#else
+#define wg_le32_to_cpu(x) __builtin_bswap32(x)
+#define wg_cpu_to_le32(x) __builtin_bswap32(x)
+#endif
+
 #define PARSE_OK 0
 #define PARSE_SHORT 1
 #define PARSE_NOT_UDP 2
 #define PARSE_FRAGMENT 3
 #define PARSE_IPV6_EXT 4
+
+struct wg_vlan_hdr {
+	__be16 h_vlan_TCI;
+	__be16 h_vlan_encapsulated_proto;
+};
 
 struct control_value {
 	__u64 active_generation;
@@ -208,7 +233,7 @@ static __always_inline int parse_eth_or_l3(void *data, void *data_end, __u64 *of
 
 #pragma unroll
 	for (int i = 0; i < 2; i++) {
-		struct vlan_hdr *vh;
+		struct wg_vlan_hdr *vh;
 
 		if (*proto != bpf_htons(ETH_P_8021Q) && *proto != bpf_htons(ETH_P_8021AD))
 			break;
@@ -431,7 +456,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 
 	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0)
 		return TC_ACT_SHOT;
-	old_type = bpf_le32_to_cpu(old_wire);
+	old_type = wg_le32_to_cpu(old_wire);
 	kind = kind_from_standard(old_type);
 	if (kind < 0) {
 		inc_stat(STAT_EGRESS_BAD_TYPE);
@@ -444,7 +469,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 	profile = bpf_map_lookup_elem(&profile_map, &rule->profile_id);
 	if (!profile || !same_generation(profile->generation))
 		return managed_miss_action(STAT_EGRESS_RULE_MISS, managed);
-	new_wire = bpf_cpu_to_le32(profile->standard_to_mixed[kind]);
+	new_wire = wg_cpu_to_le32(profile->standard_to_mixed[kind]);
 	if (update_type_word(skb, &info, old_wire, new_wire) < 0) {
 		inc_stat(STAT_CHECKSUM_ERROR);
 		return TC_ACT_SHOT;
@@ -501,7 +526,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	}
 	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0)
 		return TC_ACT_SHOT;
-	old_type = bpf_le32_to_cpu(old_wire);
+	old_type = wg_le32_to_cpu(old_wire);
 
 #pragma unroll
 	for (int i = 0; i < 4; i++) {
@@ -518,7 +543,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		inc_stat(STAT_INGRESS_BAD_LENGTH);
 		return TC_ACT_SHOT;
 	}
-	new_wire = bpf_cpu_to_le32(profile->mixed_to_standard[kind]);
+	new_wire = wg_cpu_to_le32(profile->mixed_to_standard[kind]);
 	if (update_type_word(skb, &info, old_wire, new_wire) < 0) {
 		inc_stat(STAT_CHECKSUM_ERROR);
 		return TC_ACT_SHOT;
