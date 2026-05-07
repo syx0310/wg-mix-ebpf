@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -13,6 +14,8 @@ type Interface struct {
 	FwMark     *uint32
 	ListenPort *uint16
 }
+
+var hookFwMarkPattern = regexp.MustCompile(`(?:^|[;&|]\s*)(?:\S*/)?wg\s+set\s+(?:%i|[^\s;&|]+)\s+fwmark\s+([^\s;&|]+)`)
 
 func ParseFile(path string) (*Interface, error) {
 	f, err := os.Open(path)
@@ -60,12 +63,44 @@ func Parse(r io.Reader) (*Interface, error) {
 				return nil, fmt.Errorf("line %d: parse ListenPort: %w", lineNo, err)
 			}
 			cfg.ListenPort = &port
+		case "PostUp":
+			mark, ok, err := parseHookFwMark(value)
+			if err != nil {
+				return nil, fmt.Errorf("line %d: parse PostUp fwmark: %w", lineNo, err)
+			}
+			if !ok || cfg.FwMark != nil {
+				continue
+			}
+			cfg.FwMark = &mark
 		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, err
 	}
 	return cfg, nil
+}
+
+func parseHookFwMark(command string) (uint32, bool, error) {
+	match := hookFwMarkPattern.FindStringSubmatch(command)
+	if match == nil {
+		return 0, false, nil
+	}
+	mark, err := ParseFwMark(unquoteShellWord(match[1]))
+	if err != nil {
+		return 0, false, err
+	}
+	return mark, true, nil
+}
+
+func unquoteShellWord(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) >= 2 {
+		if (value[0] == '\'' && value[len(value)-1] == '\'') ||
+			(value[0] == '"' && value[len(value)-1] == '"') {
+			return value[1 : len(value)-1]
+		}
+	}
+	return value
 }
 
 func cleanLine(line string) string {
