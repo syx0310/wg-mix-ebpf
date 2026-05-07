@@ -35,6 +35,7 @@ The Go binary does not require cgo. The TC/eBPF program is built separately on L
 ```bash
 make build-bpf
 make build-linux-amd64
+sudo ./bin/wg-mix-ebpf bpf-load-test --object build/wg_mix_tc.o
 ```
 
 At runtime the loader reads the BPF object from:
@@ -50,6 +51,8 @@ WG_MIX_EBPF_OBJECT=/path/to/wg_mix_tc.o
 ```
 
 Do not run BPF load, TC attach, netns, OpenWrt, offload, or performance tests on non-Linux development machines.
+
+`bpf-load-test` only loads and closes the BPF collection. It does not read WireGuard runtime state, attach TC filters, create network namespaces, or send tunnel traffic.
 
 External Linux/OpenWrt/BPF/TC tests are tracked in:
 

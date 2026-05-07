@@ -34,3 +34,5 @@ coverage.html
 # Runtime state
 *.pid
 *.sock
+
+credientials/

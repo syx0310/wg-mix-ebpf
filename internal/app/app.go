@@ -40,12 +40,32 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		}
 		fmt.Fprintln(stdout, string(data))
 		return nil
+	case "bpf-load-test":
+		return runBPFLoadTest(ctx, args[1:], stdout)
 	case "validate", "status", "dump", "dump-abi", "reload", "detach", "guard-plan", "guard-apply", "guard-cleanup":
 		return runStateCommand(ctx, cmd, args[1:], stdout)
 	default:
 		printUsage(stderr)
 		return fmt.Errorf("unknown command %q", cmd)
 	}
+}
+
+func runBPFLoadTest(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("bpf-load-test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	objectPath := fs.String("object", "", "path to TC/eBPF object")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if err := dataplane.LoadObjectTest(ctx, *objectPath); err != nil {
+		return err
+	}
+	path := *objectPath
+	if path == "" {
+		path = dataplane.DefaultObjectPath
+	}
+	fmt.Fprintf(stdout, "BPF object loaded successfully: %s\n", path)
+	return nil
 }
 
 func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.Writer) error {
@@ -147,6 +167,7 @@ Commands:
   guard-plan print nft startup guard script
   guard-apply apply nft startup guard
   guard-cleanup remove nft startup guard table
+  bpf-load-test load BPF object and exit without TC attach or WireGuard reads
   features   print local feature probe
   version    print version
 

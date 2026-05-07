@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/rlimit"
 	"github.com/siyixuan/wg-mix-ebpf/internal/abi"
 	"github.com/siyixuan/wg-mix-ebpf/internal/control"
 	"github.com/vishvananda/netlink"
@@ -17,9 +18,6 @@ import (
 )
 
 const (
-	defaultObjectPath = "build/wg_mix_tc.o"
-	EnvObjectPath     = "WG_MIX_EBPF_OBJECT"
-
 	ingressFilterName = "wg_mix_ingress"
 	egressFilterName  = "wg_mix_egress"
 	filterPriority    = 49152
@@ -32,11 +30,27 @@ type LinuxLoader struct {
 }
 
 func NewLoader() Loader {
-	path := os.Getenv(EnvObjectPath)
-	if path == "" {
-		path = defaultObjectPath
+	return LinuxLoader{ObjectPath: objectPathFromEnv("")}
+}
+
+func LoadObjectTest(ctx context.Context, objectPath string) error {
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return LinuxLoader{ObjectPath: path}
+	path := objectPathFromEnv(objectPath)
+	spec, err := ebpf.LoadCollectionSpec(path)
+	if err != nil {
+		return fmt.Errorf("load BPF object %s: %w", path, err)
+	}
+	if err := removeMemlockLimit(); err != nil {
+		return err
+	}
+	coll, err := ebpf.NewCollection(spec)
+	if err != nil {
+		return fmt.Errorf("create BPF collection: %w", err)
+	}
+	coll.Close()
+	return nil
 }
 
 func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
@@ -46,6 +60,9 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
 	spec, err := ebpf.LoadCollectionSpec(l.ObjectPath)
 	if err != nil {
 		return fmt.Errorf("load BPF object %s: %w", l.ObjectPath, err)
+	}
+	if err := removeMemlockLimit(); err != nil {
+		return err
 	}
 	coll, err := ebpf.NewCollection(spec)
 	if err != nil {
@@ -94,6 +111,23 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func objectPathFromEnv(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	if path := os.Getenv(EnvObjectPath); path != "" {
+		return path
+	}
+	return DefaultObjectPath
+}
+
+func removeMemlockLimit() error {
+	if err := rlimit.RemoveMemlock(); err != nil {
+		return fmt.Errorf("remove memlock rlimit: %w", err)
+	}
+	return nil
 }
 
 func populateMaps(coll *ebpf.Collection, snapshot *abi.Snapshot) error {
