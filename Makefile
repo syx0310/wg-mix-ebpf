@@ -7,7 +7,7 @@ BPF_MULTIARCH ?= $(shell gcc -print-multiarch 2>/dev/null)
 BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/include/$(BPF_MULTIARCH),)
 BPF_OBJECT ?= build/wg_mix_tc.o
 
-.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-bpf-pkt test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-bpf-pkt test-netns-smoke test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-bpf bpf-load-test
 
 build:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -24,6 +24,9 @@ build-bpf:
 
 bpf-load-test: build build-bpf
 	./$(BINARY) bpf-load-test --object $(BPF_OBJECT)
+
+test-netns-smoke: build build-bpf
+	scripts/smoke-netns-wg.sh
 
 test-unit:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./...
@@ -50,7 +53,7 @@ test-bpf-pkt:
 	@echo "skip: requires external Linux root VM with BPF/TC support"
 
 test-netns:
-	@echo "skip: requires external Linux root VM with network namespace, WireGuard, and tc"
+	@echo "run as root on an external Linux VM: make test-netns-smoke"
 
 test-netns-full:
 	@echo "skip: requires external Linux root VM with full netns matrix"
