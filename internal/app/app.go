@@ -11,6 +11,7 @@ import (
 	"github.com/siyixuan/wg-mix-ebpf/internal/abi"
 	"github.com/siyixuan/wg-mix-ebpf/internal/config"
 	"github.com/siyixuan/wg-mix-ebpf/internal/control"
+	"github.com/siyixuan/wg-mix-ebpf/internal/dataplane"
 	"github.com/siyixuan/wg-mix-ebpf/internal/feature"
 	"github.com/siyixuan/wg-mix-ebpf/internal/guard"
 	"github.com/siyixuan/wg-mix-ebpf/internal/runtime"
@@ -89,9 +90,23 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 		}
 		fmt.Fprintln(stdout, string(data))
 	case "reload":
-		fmt.Fprintln(stdout, "reload plan validated")
+		if *dryRun {
+			fmt.Fprintln(stdout, "reload plan validated")
+			return nil
+		}
+		if err := dataplane.NewLoader().Apply(ctx, state); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "dataplane reloaded")
 	case "detach":
-		fmt.Fprintln(stdout, "detach plan validated")
+		if *dryRun {
+			fmt.Fprintln(stdout, "detach plan validated")
+			return nil
+		}
+		if err := dataplane.NewLoader().Detach(ctx, state); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "dataplane detached")
 	case "guard-plan":
 		plan := guard.BuildNftPlan(state)
 		fmt.Fprint(stdout, plan.Script())

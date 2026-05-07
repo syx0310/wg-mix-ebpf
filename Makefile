@@ -2,8 +2,11 @@ CGO_ENABLED ?= 0
 GO ?= go
 GOFLAGS ?= -trimpath
 BINARY ?= bin/wg-mix-ebpf
+CLANG ?= clang
+BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf
+BPF_OBJECT ?= build/wg_mix_tc.o
 
-.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-bpf-pkt test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64
+.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-bpf-pkt test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-bpf
 
 build:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -13,6 +16,10 @@ build-linux-amd64:
 
 build-linux-arm64:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -o bin/wg-mix-ebpf-linux-arm64 ./cmd/wg-mix-ebpf
+
+build-bpf:
+	@mkdir -p $(dir $(BPF_OBJECT))
+	$(CLANG) $(BPF_CFLAGS) -c bpf/wg_mix_tc.c -o $(BPF_OBJECT)
 
 test-unit:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./...

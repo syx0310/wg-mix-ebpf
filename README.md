@@ -2,7 +2,7 @@
 
 Transparent WireGuard `type_word` transform using eBPF.
 
-Current status: control-plane foundation and unit-testable logic are implemented. Linux TC/eBPF dataplane integration is planned in `docs/plans`.
+Current status: control-plane foundation, fixed map ABI, startup guard tooling, and Linux-only TC/eBPF loader source are implemented. BPF object build/load/TC attach tests must run on external Linux machines.
 
 ## Commands
 
@@ -27,6 +27,29 @@ CGO_ENABLED=0 go build -o /tmp/wg-mix-ebpf ./cmd/wg-mix-ebpf
 ```
 
 The default Makefile build and test targets use `CGO_ENABLED=0` for reproducible cross-platform builds.
+
+## Linux Dataplane
+
+The Go binary does not require cgo. The TC/eBPF program is built separately on Linux:
+
+```bash
+make build-bpf
+make build-linux-amd64
+```
+
+At runtime the loader reads the BPF object from:
+
+```text
+build/wg_mix_tc.o
+```
+
+or from:
+
+```text
+WG_MIX_EBPF_OBJECT=/path/to/wg_mix_tc.o
+```
+
+Do not run BPF load, TC attach, netns, OpenWrt, offload, or performance tests on non-Linux development machines.
 
 External Linux/OpenWrt/BPF/TC tests are tracked in:
 
