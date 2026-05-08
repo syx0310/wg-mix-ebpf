@@ -4,7 +4,7 @@ import (
 	"testing"
 	"unsafe"
 
-	"github.com/siyixuan/wg-mix-ebpf/internal/control"
+	"github.com/syx0310/wg-mix-ebpf/internal/control"
 )
 
 func TestStructSizesAreStable(t *testing.T) {

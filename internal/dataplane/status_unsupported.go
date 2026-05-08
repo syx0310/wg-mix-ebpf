@@ -5,7 +5,7 @@ package dataplane
 import (
 	"context"
 
-	"github.com/siyixuan/wg-mix-ebpf/internal/control"
+	"github.com/syx0310/wg-mix-ebpf/internal/control"
 )
 
 func inspect(context.Context, *control.State) (*KernelStatus, error) {

@@ -3,7 +3,7 @@ package dataplane
 import (
 	"context"
 
-	"github.com/siyixuan/wg-mix-ebpf/internal/control"
+	"github.com/syx0310/wg-mix-ebpf/internal/control"
 )
 
 type KernelStatus struct {

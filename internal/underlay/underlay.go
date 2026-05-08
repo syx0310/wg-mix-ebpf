@@ -5,7 +5,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/siyixuan/wg-mix-ebpf/internal/config"
+	"github.com/syx0310/wg-mix-ebpf/internal/config"
 )
 
 var ErrUnsupported = errors.New("underlay resolver is unsupported on this platform")

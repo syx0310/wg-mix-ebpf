@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/siyixuan/wg-mix-ebpf/internal/app"
+	"github.com/syx0310/wg-mix-ebpf/internal/app"
 )
 
 func main() {

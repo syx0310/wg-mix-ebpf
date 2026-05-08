@@ -1,4 +1,4 @@
-module github.com/siyixuan/wg-mix-ebpf
+module github.com/syx0310/wg-mix-ebpf
 
 go 1.24.0
 

@@ -5,7 +5,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/siyixuan/wg-mix-ebpf/internal/control"
+	"github.com/syx0310/wg-mix-ebpf/internal/control"
 )
 
 const TableName = "wg_mix_ebpf_guard"

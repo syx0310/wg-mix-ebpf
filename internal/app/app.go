@@ -9,14 +9,14 @@ import (
 	"io"
 	"strings"
 
-	"github.com/siyixuan/wg-mix-ebpf/internal/abi"
-	"github.com/siyixuan/wg-mix-ebpf/internal/config"
-	"github.com/siyixuan/wg-mix-ebpf/internal/control"
-	"github.com/siyixuan/wg-mix-ebpf/internal/dataplane"
-	"github.com/siyixuan/wg-mix-ebpf/internal/feature"
-	"github.com/siyixuan/wg-mix-ebpf/internal/guard"
-	"github.com/siyixuan/wg-mix-ebpf/internal/runtime"
-	"github.com/siyixuan/wg-mix-ebpf/internal/underlay"
+	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+	"github.com/syx0310/wg-mix-ebpf/internal/config"
+	"github.com/syx0310/wg-mix-ebpf/internal/control"
+	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
+	"github.com/syx0310/wg-mix-ebpf/internal/feature"
+	"github.com/syx0310/wg-mix-ebpf/internal/guard"
+	"github.com/syx0310/wg-mix-ebpf/internal/runtime"
+	"github.com/syx0310/wg-mix-ebpf/internal/underlay"
 )
 
 const Version = "dev"

@@ -4,10 +4,10 @@ import (
 	"context"
 	"testing"
 
-	"github.com/siyixuan/wg-mix-ebpf/internal/config"
-	"github.com/siyixuan/wg-mix-ebpf/internal/runtime"
-	"github.com/siyixuan/wg-mix-ebpf/internal/underlay"
-	"github.com/siyixuan/wg-mix-ebpf/internal/wgconfig"
+	"github.com/syx0310/wg-mix-ebpf/internal/config"
+	"github.com/syx0310/wg-mix-ebpf/internal/runtime"
+	"github.com/syx0310/wg-mix-ebpf/internal/underlay"
+	"github.com/syx0310/wg-mix-ebpf/internal/wgconfig"
 )
 
 func testConfig(t *testing.T) *config.Config {

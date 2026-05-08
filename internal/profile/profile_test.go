@@ -4,7 +4,7 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/siyixuan/wg-mix-ebpf/internal/config"
+	"github.com/syx0310/wg-mix-ebpf/internal/config"
 )
 
 func TestCompilePreset(t *testing.T) {

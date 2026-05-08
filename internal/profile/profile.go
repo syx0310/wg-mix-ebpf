@@ -3,7 +3,7 @@ package profile
 import (
 	"fmt"
 
-	"github.com/siyixuan/wg-mix-ebpf/internal/config"
+	"github.com/syx0310/wg-mix-ebpf/internal/config"
 )
 
 const (
