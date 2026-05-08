@@ -128,6 +128,9 @@ var statNames = []string{
 	"ingress_fragment",
 	"ingress_ipv6_ext",
 	"checksum_error",
+	"skb_load_error",
+	"skb_store_error",
+	"gso_seen",
 }
 
 func filterStatuses(link netlink.Link, parent uint32, direction string) ([]FilterStatus, error) {

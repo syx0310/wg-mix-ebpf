@@ -196,6 +196,9 @@ enum stat_id {
 	STAT_INGRESS_FRAGMENT,
 	STAT_INGRESS_IPV6_EXT,
 	STAT_CHECKSUM_ERROR,
+	STAT_SKB_LOAD_ERROR,
+	STAT_SKB_STORE_ERROR,
+	STAT_GSO_SEEN,
 	STAT_MAX,
 };
 
@@ -372,7 +375,7 @@ static __always_inline int parse_udp_at(void *data, void *data_end, struct packe
 	info->ipv4_udp_csum_zero = family == FAMILY_IPV4 && udp->check == 0;
 	if (family == FAMILY_IPV6 && udp->check == 0)
 		return PARSE_BAD_CSUM;
-	if (require_payload_word && data + info->payload_off + 4 > data_end)
+	if (require_payload_word && info->payload_len < 4)
 		return PARSE_SHORT;
 	return PARSE_OK;
 }
@@ -515,21 +518,29 @@ static __always_inline int validate_len(int kind, __u32 payload_len)
 }
 
 static __always_inline int update_type_word(struct __sk_buff *skb, struct packet_info *info,
-					    __u32 old_wire, __u32 new_wire)
+					    __u32 old_wire, __u32 new_wire,
+					    int recompute_checksum)
 {
+	__u64 flags = BPF_F_INVALIDATE_HASH;
 	__u32 csum_off = info->udp_off + offsetof(struct udphdr, check);
 	__s64 diff;
 
-	if (!(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero)) {
+	if (recompute_checksum) {
+		if (!(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero))
+			flags |= BPF_F_RECOMPUTE_CSUM;
+	} else if (!(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero)) {
 		diff = bpf_csum_diff((__be32 *)&old_wire, sizeof(old_wire),
 				     (__be32 *)&new_wire, sizeof(new_wire), 0);
 		if (diff < 0)
 			return -1;
-		if (bpf_l4_csum_replace(skb, csum_off, 0, diff, 0) < 0)
+		if (info->family == FAMILY_IPV6)
+			flags |= BPF_F_IPV6;
+		if (bpf_l4_csum_replace(skb, csum_off, 0, diff, flags & BPF_F_IPV6) < 0)
 			return -1;
 	}
-	if (bpf_skb_store_bytes(skb, info->payload_off, &new_wire, sizeof(new_wire), 0) < 0)
-		return -1;
+	if (bpf_skb_store_bytes(skb, info->payload_off, &new_wire, sizeof(new_wire),
+				flags) < 0)
+		return -2;
 	return 0;
 }
 
@@ -624,6 +635,8 @@ int wg_mix_egress(struct __sk_buff *skb)
 
 	if (!active_generation(&generation))
 		return TC_ACT_OK;
+	if (skb->gso_segs || skb->gso_size)
+		inc_stat(STAT_GSO_SEEN);
 
 	rc = parse_packet(skb, &info, generation);
 	managed = lookup_managed_fwmark(skb->mark, skb->ifindex, generation);
@@ -661,8 +674,10 @@ int wg_mix_egress(struct __sk_buff *skb)
 	if (rule->action != ACTION_REWRITE)
 		return TC_ACT_OK;
 
-	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0)
+	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0) {
+		inc_stat(STAT_SKB_LOAD_ERROR);
 		return TC_ACT_SHOT;
+	}
 	old_type = wg_le32_to_cpu(old_wire);
 	kind = kind_from_standard(old_type);
 	if (kind < 0) {
@@ -681,8 +696,12 @@ int wg_mix_egress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 	new_wire = wg_cpu_to_le32(profile->standard_to_mixed[kind]);
-	if (update_type_word(skb, &info, old_wire, new_wire) < 0) {
-		inc_stat(STAT_CHECKSUM_ERROR);
+	rc = update_type_word(skb, &info, old_wire, new_wire, 1);
+	if (rc < 0) {
+		if (rc == -2)
+			inc_stat(STAT_SKB_STORE_ERROR);
+		else
+			inc_stat(STAT_CHECKSUM_ERROR);
 		return TC_ACT_SHOT;
 	}
 	inc_stat(STAT_EGRESS_REWRITE_OK);
@@ -704,6 +723,8 @@ int wg_mix_ingress(struct __sk_buff *skb)
 
 	if (!active_generation(&generation))
 		return TC_ACT_OK;
+	if (skb->gso_segs || skb->gso_size)
+		inc_stat(STAT_GSO_SEEN);
 
 	rc = parse_packet(skb, &info, generation);
 	if (!parse_result_has_ingress_port(rc)) {
@@ -742,8 +763,10 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		inc_stat(STAT_INGRESS_RULE_MISS);
 		return TC_ACT_SHOT;
 	}
-	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0)
+	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0) {
+		inc_stat(STAT_SKB_LOAD_ERROR);
 		return TC_ACT_SHOT;
+	}
 	old_type = wg_le32_to_cpu(old_wire);
 
 #pragma unroll
@@ -762,8 +785,12 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 	new_wire = wg_cpu_to_le32(profile->mixed_to_standard[kind]);
-	if (update_type_word(skb, &info, old_wire, new_wire) < 0) {
-		inc_stat(STAT_CHECKSUM_ERROR);
+	rc = update_type_word(skb, &info, old_wire, new_wire, 0);
+	if (rc < 0) {
+		if (rc == -2)
+			inc_stat(STAT_SKB_STORE_ERROR);
+		else
+			inc_stat(STAT_CHECKSUM_ERROR);
 		return TC_ACT_SHOT;
 	}
 	inc_stat(STAT_INGRESS_REWRITE_OK);
