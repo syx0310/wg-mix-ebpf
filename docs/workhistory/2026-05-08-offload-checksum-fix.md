@@ -17,7 +17,7 @@ Changed BPF dataplane behavior:
 
 - Removed the requirement that the WireGuard payload type word must be in the direct-access linear skb area.
 - Kept `bpf_skb_load_bytes()` / `bpf_skb_store_bytes()` for the type-word read/write path so non-linear skb layouts can be handled by helpers.
-- Added stats counters for `skb_load_error`, `skb_store_error`, and `gso_seen`.
+- Added stats counters for `skb_load_error`, `skb_store_error`, and initial GSO/offload visibility.
 - Added `BPF_F_INVALIDATE_HASH` for payload writes.
 - Split checksum update strategy:
   - egress uses `bpf_skb_store_bytes(..., BPF_F_RECOMPUTE_CSUM)` to handle TX checksum offload / CHECKSUM_PARTIAL safely.
@@ -42,7 +42,7 @@ sudo ./bin/wg-mix-ebpf-linux-amd64 bpf-load-test passed
 
 ## Public Internet Validation
 
-Baseline standard WireGuard without eBPF still failed, matching earlier observations:
+In the first public/NAT environment pass, baseline standard WireGuard without eBPF failed, matching earlier observations:
 
 ```text
 NAT -> public: 5/5 lost
@@ -89,6 +89,8 @@ public:
 ```
 
 The non-zero `gso_seen` counters confirm the run covered GSO/offload-shaped skbs.
+
+Later follow-up work split `gso_seen` into direction/stage-specific counters and showed the standard WireGuard baseline is environment-dependent on this host pair. Treat the baseline as a reference observation, not a hard implementation gate.
 
 ### eBPF, offload off regression
 

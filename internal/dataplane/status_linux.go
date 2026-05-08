@@ -130,7 +130,12 @@ var statNames = []string{
 	"checksum_error",
 	"skb_load_error",
 	"skb_store_error",
-	"gso_seen",
+	"egress_gso_seen",
+	"egress_gso_managed_seen",
+	"egress_gso_rewrite_ok",
+	"ingress_gso_seen",
+	"ingress_gso_listener_hit",
+	"ingress_gso_rewrite_ok",
 }
 
 func filterStatuses(link netlink.Link, parent uint32, direction string) ([]FilterStatus, error) {

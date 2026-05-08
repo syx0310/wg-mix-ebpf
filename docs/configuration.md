@@ -189,6 +189,16 @@ ListenPort = 52000
 
 If WireGuard chooses a random listen port, run `wg-mix-ebpf reload` after the interface is up so the agent can read the runtime value.
 
+For NAT-side peers, configure WireGuard persistent keepalive in the WireGuard config or with your WireGuard management tool. `wg-mix-ebpf` does not modify peer settings, but a NAT-side peer normally needs keepalive to keep its endpoint reachable:
+
+```ini
+[Peer]
+Endpoint = public.example.net:52000
+PersistentKeepalive = 25
+```
+
+For short-lived tests, a lower keepalive such as `5` seconds can make endpoint learning deterministic. Production deployments should use the normal WireGuard value appropriate for the NAT path.
+
 ## `profiles`
 
 Recommended profile:
@@ -333,6 +343,20 @@ The MVP only implements the shown values. Other values are rejected by static va
 Egress is fail-closed for managed WireGuard packets. Ingress only drops packets that match a managed listener or a managed fragment policy.
 
 Outer IP fragmentation is not supported. Configure WireGuard MTU and underlay MTU to avoid outer UDP fragmentation.
+
+## Baseline And NAT Notes
+
+Standard WireGuard connectivity is useful as an environment reference, but it is not a hard validation gate for this transparent transform. On a public/NAT pair, standard WireGuard may fail to handshake if the public side has not learned the NAT-side endpoint yet, even when the same pair works after keepalive or after traffic from the NAT side.
+
+Validate `wg-mix-ebpf` by checking:
+
+```text
+both endpoints run the transparent transform
+inner WireGuard ping succeeds in both directions
+pcap shows mixed initiation/response/transport type words
+pcap shows zero standard type words on managed egress
+status shows checksum_error=0, skb_load_error=0, skb_store_error=0
+```
 
 ## Useful Commands
 

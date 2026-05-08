@@ -4,7 +4,10 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
+
+	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 )
 
 func TestValidateOffline(t *testing.T) {
@@ -79,7 +82,8 @@ func TestDumpABIOffline(t *testing.T) {
 	if err := Run(t.Context(), []string{"dump-abi", "--config", cfgPath, "--offline"}, &stdout, &stderr); err != nil {
 		t.Fatalf("Run returned error: %v stderr=%s", err, stderr.String())
 	}
-	if !bytes.Contains(stdout.Bytes(), []byte(`"ABIVersion": 3`)) {
+	want := []byte(`"ABIVersion": ` + strconv.FormatUint(uint64(abi.Version), 10))
+	if !bytes.Contains(stdout.Bytes(), want) {
 		t.Fatalf("dump-abi missing ABI version: %s", stdout.String())
 	}
 }
