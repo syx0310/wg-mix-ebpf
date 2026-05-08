@@ -11,7 +11,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-#define ABI_VERSION 3
+#define ABI_VERSION 4
 
 #define FAMILY_ANY  0
 #define FAMILY_IPV4 4
@@ -198,7 +198,12 @@ enum stat_id {
 	STAT_CHECKSUM_ERROR,
 	STAT_SKB_LOAD_ERROR,
 	STAT_SKB_STORE_ERROR,
-	STAT_GSO_SEEN,
+	STAT_EGRESS_GSO_SEEN,
+	STAT_EGRESS_GSO_MANAGED_SEEN,
+	STAT_EGRESS_GSO_REWRITE_OK,
+	STAT_INGRESS_GSO_SEEN,
+	STAT_INGRESS_GSO_LISTENER_HIT,
+	STAT_INGRESS_GSO_REWRITE_OK,
 	STAT_MAX,
 };
 
@@ -521,25 +526,23 @@ static __always_inline int update_type_word(struct __sk_buff *skb, struct packet
 					    __u32 old_wire, __u32 new_wire,
 					    int recompute_checksum)
 {
-	__u64 flags = BPF_F_INVALIDATE_HASH;
+	__u64 store_flags = BPF_F_INVALIDATE_HASH;
 	__u32 csum_off = info->udp_off + offsetof(struct udphdr, check);
 	__s64 diff;
 
 	if (recompute_checksum) {
 		if (!(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero))
-			flags |= BPF_F_RECOMPUTE_CSUM;
+			store_flags |= BPF_F_RECOMPUTE_CSUM;
 	} else if (!(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero)) {
 		diff = bpf_csum_diff((__be32 *)&old_wire, sizeof(old_wire),
 				     (__be32 *)&new_wire, sizeof(new_wire), 0);
 		if (diff < 0)
 			return -1;
-		if (info->family == FAMILY_IPV6)
-			flags |= BPF_F_IPV6;
-		if (bpf_l4_csum_replace(skb, csum_off, 0, diff, flags & BPF_F_IPV6) < 0)
+		if (bpf_l4_csum_replace(skb, csum_off, 0, diff, 0) < 0)
 			return -1;
 	}
 	if (bpf_skb_store_bytes(skb, info->payload_off, &new_wire, sizeof(new_wire),
-				flags) < 0)
+				store_flags) < 0)
 		return -2;
 	return 0;
 }
@@ -631,15 +634,20 @@ int wg_mix_egress(struct __sk_buff *skb)
 	__u32 old_wire = 0;
 	__u32 old_type = 0;
 	__u32 new_wire = 0;
+	__u8 gso_seen = 0;
 	int rc, kind;
 
 	if (!active_generation(&generation))
 		return TC_ACT_OK;
-	if (skb->gso_segs || skb->gso_size)
-		inc_stat(STAT_GSO_SEEN);
+	if (skb->gso_segs || skb->gso_size) {
+		gso_seen = 1;
+		inc_stat(STAT_EGRESS_GSO_SEEN);
+	}
 
 	rc = parse_packet(skb, &info, generation);
 	managed = lookup_managed_fwmark(skb->mark, skb->ifindex, generation);
+	if (gso_seen && managed)
+		inc_stat(STAT_EGRESS_GSO_MANAGED_SEEN);
 	if (parse_result_is_fragment(rc)) {
 		if (managed) {
 			inc_stat(STAT_EGRESS_FRAGMENT);
@@ -705,6 +713,8 @@ int wg_mix_egress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 	inc_stat(STAT_EGRESS_REWRITE_OK);
+	if (gso_seen)
+		inc_stat(STAT_EGRESS_GSO_REWRITE_OK);
 	return TC_ACT_OK;
 }
 
@@ -719,12 +729,15 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	__u32 old_wire = 0;
 	__u32 old_type = 0;
 	__u32 new_wire = 0;
+	__u8 gso_seen = 0;
 	int rc, kind = -1;
 
 	if (!active_generation(&generation))
 		return TC_ACT_OK;
-	if (skb->gso_segs || skb->gso_size)
-		inc_stat(STAT_GSO_SEEN);
+	if (skb->gso_segs || skb->gso_size) {
+		gso_seen = 1;
+		inc_stat(STAT_INGRESS_GSO_SEEN);
+	}
 
 	rc = parse_packet(skb, &info, generation);
 	if (!parse_result_has_ingress_port(rc)) {
@@ -740,6 +753,8 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		inc_stat(STAT_INGRESS_RULE_MISS);
 		return TC_ACT_OK;
 	}
+	if (gso_seen)
+		inc_stat(STAT_INGRESS_GSO_LISTENER_HIT);
 	if (parse_result_is_fragment(rc)) {
 		inc_stat(STAT_INGRESS_FRAGMENT);
 		return TC_ACT_SHOT;
@@ -794,6 +809,8 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 	inc_stat(STAT_INGRESS_REWRITE_OK);
+	if (gso_seen)
+		inc_stat(STAT_INGRESS_GSO_REWRITE_OK);
 	return TC_ACT_OK;
 }
 

@@ -108,6 +108,39 @@ network receives mixed UDP packet
 
 Peer endpoint changes, NAT source-port changes, and DDNS changes do not alter BPF maps because endpoints are not part of dataplane matching.
 
+## Checksums And Offload
+
+The dataplane reads and writes the WireGuard type word with skb helpers rather than requiring the UDP payload to be in the direct-access linear skb area. This is required on hosts where TX checksum offload, GSO, or GRO changes skb layout.
+
+Checksum handling is direction-specific:
+
+```text
+egress:
+  bpf_skb_store_bytes(..., BPF_F_RECOMPUTE_CSUM)
+
+ingress:
+  bpf_l4_csum_replace(...)
+  bpf_skb_store_bytes(..., BPF_F_INVALIDATE_HASH)
+```
+
+Status exposes load/store/checksum errors and direction-specific GSO counters:
+
+```text
+skb_load_error
+skb_store_error
+checksum_error
+egress_gso_seen
+egress_gso_managed_seen
+egress_gso_rewrite_ok
+ingress_gso_seen
+ingress_gso_listener_hit
+ingress_gso_rewrite_ok
+```
+
+TX-side tcpdump captures may show invalid UDP checksums when checksum offload is enabled. Receiver-side captures and dataplane error counters are the useful evidence for checksum correctness.
+
+IPv6 outer UDP is supported by the parser and netns smoke tests, but real multi-host IPv6 underlay validation is still required for release-level confidence.
+
 ## BPF Maps
 
 The MVP dataplane uses pinned maps so reloads and status commands can share kernel state.
