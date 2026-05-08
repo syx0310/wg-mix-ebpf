@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux-amd64:
+    name: Linux amd64
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends clang llvm gcc linux-libc-dev libbpf-dev
+
+      - name: Unit tests
+        run: make test-unit
+
+      - name: Race tests
+        run: CGO_ENABLED=1 make test-unit-race
+
+      - name: Build Linux amd64 package binary
+        run: make build-linux-amd64
+
+      - name: Offline config validation
+        run: |
+          ./bin/wg-mix-ebpf-linux-amd64 validate --config configs/example.yaml --offline
+          ./bin/wg-mix-ebpf-linux-amd64 dump-abi --config configs/example.yaml --offline >/tmp/wg-mix-ebpf-abi.json
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist/wg-mix-ebpf_linux_amd64
+          cp bin/wg-mix-ebpf-linux-amd64 dist/wg-mix-ebpf_linux_amd64/wg-mix-ebpf
+          cp README.md dist/wg-mix-ebpf_linux_amd64/
+          cp -R configs dist/wg-mix-ebpf_linux_amd64/
+          tar -C dist -czf dist/wg-mix-ebpf_linux_amd64.tar.gz wg-mix-ebpf_linux_amd64
+          sha256sum dist/wg-mix-ebpf_linux_amd64.tar.gz > dist/checksums.txt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v5
+        with:
+          name: wg-mix-ebpf_linux_amd64
+          path: |
+            dist/wg-mix-ebpf_linux_amd64.tar.gz
+            dist/checksums.txt
