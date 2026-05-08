@@ -1,0 +1,39 @@
+# OS/editor files
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Logs and local environment
+*.log
+.env
+.env.*
+!.env.example
+/refs/
+
+# Go build/test artifacts
+/bin/
+/dist/
+/build/
+/wg-mix-ebpf
+*.test
+*.out
+coverage.out
+coverage.html
+
+# eBPF generated/build artifacts
+*.o
+*.elf
+*.ll
+*.bc
+*_bpfel.go
+*_bpfeb.go
+
+# Runtime state
+*.pid
+*.sock
+
+credientials/

@@ -1,0 +1,54 @@
+version: 1
+mode: transparent-typeword
+
+underlays:
+  - name: eth0
+    type: netdev
+
+wireguards:
+  - name: wg0
+    config: configs/wg0.example.conf
+    profile: mix-default
+
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+    index:
+      mode: none
+
+fwmark_policy:
+  mode: config-required
+
+runtime:
+  poll_interval: 5s
+  require_nonzero_fwmark: true
+  strict_runtime_fwmark: true
+  allow_zero_fwmark_fallback: false
+
+startup_guard:
+  mode: nft-temporary-drop
+  egress:
+    match: fwmark
+  ingress:
+    match: config-listen-port-if-present
+    random_listen_port_behavior: best-effort
+
+underlay_overlap_policy: reject
+
+policy:
+  non_managed_udp: pass
+  managed_egress_map_miss: drop
+  managed_egress_bad_type: drop
+  managed_egress_bad_length: drop
+  egress_managed_ipv6_ext_header: drop
+  managed_ingress_map_miss: pass
+  managed_ingress_bad_type: drop
+  managed_ingress_bad_length: drop
+  ingress_managed_ipv6_ext_header: drop
+  ipv4_first_fragment: drop
+  ipv4_non_first_fragment:
+    ingress: pass
+    egress_if_managed_fwmark: drop
+    optional_drop_all_on_underlay: false
+  ipv6_fragment: drop
+  startup_fail_mode: fail_closed_for_managed_flows
