@@ -191,90 +191,9 @@ ip netns exec "${NSB}" ping -c 3 -W 2 10.77.0.1 >/dev/null
 wait "${TCPDUMP_RA}" || true
 wait "${TCPDUMP_RB}" || true
 
-python3 - "${TMPDIR}/ra.pcap" "${TMPDIR}/rb.pcap" <<'PY'
-import struct
-import sys
-
-STANDARD = {
-    b"\x01\x00\x00\x00",
-    b"\x02\x00\x00\x00",
-    b"\x03\x00\x00\x00",
-    b"\x04\x00\x00\x00",
-}
-MIXED = {
-    b"\xe6\xc2\x58\xf6",
-    b"\xd0\xb1\x86\x06",
-    b"\xe0\xe5\x5a\x07",
-    b"\x6b\xf0\xdf\x13",
-}
-
-def parse_pcap(path):
-    data = open(path, "rb").read()
-    if len(data) < 24:
-        return []
-    magic = data[:4]
-    if magic in (b"\xd4\xc3\xb2\xa1", b"\x4d\x3c\xb2\xa1"):
-        endian = "<"
-    elif magic in (b"\xa1\xb2\xc3\xd4", b"\xa1\xb2\x3c\x4d"):
-        endian = ">"
-    else:
-        raise SystemExit(f"unsupported pcap magic in {path}: {magic!r}")
-    linktype = struct.unpack(endian + "I", data[20:24])[0] & 0xffff
-    if linktype != 1:
-        raise SystemExit(f"unsupported linktype in {path}: {linktype}")
-    off = 24
-    words = []
-    while off + 16 <= len(data):
-        _sec, _usec, incl_len, _orig_len = struct.unpack(endian + "IIII", data[off:off + 16])
-        off += 16
-        pkt = data[off:off + incl_len]
-        off += incl_len
-        word = first_udp_payload_word(pkt)
-        if word is not None:
-            words.append(word)
-    return words
-
-def first_udp_payload_word(pkt):
-    if len(pkt) < 14:
-        return None
-    eth_type = int.from_bytes(pkt[12:14], "big")
-    off = 14
-    for _ in range(2):
-        if eth_type not in (0x8100, 0x88a8):
-            break
-        if len(pkt) < off + 4:
-            return None
-        eth_type = int.from_bytes(pkt[off + 2:off + 4], "big")
-        off += 4
-    if eth_type == 0x0800:
-        if len(pkt) < off + 20:
-            return None
-        ihl = (pkt[off] & 0x0f) * 4
-        if len(pkt) < off + ihl + 12 or pkt[off + 9] != 17:
-            return None
-        udp = off + ihl
-    elif eth_type == 0x86DD:
-        if len(pkt) < off + 40 or pkt[off + 6] != 17:
-            return None
-        udp = off + 40
-    else:
-        return None
-    payload = udp + 8
-    if len(pkt) < payload + 4:
-        return None
-    return pkt[payload:payload + 4]
-
-words = []
-for path in sys.argv[1:]:
-    words.extend(parse_pcap(path))
-
-standard = sum(1 for w in words if w in STANDARD)
-mixed = sum(1 for w in words if w in MIXED)
-print(f"pcap_udp_payload_words={len(words)} mixed_type_words={mixed} standard_type_words={standard}")
-if mixed == 0:
-    raise SystemExit("no mixed WireGuard type_word observed in router pcap")
-if standard != 0:
-    raise SystemExit("standard WireGuard type_word leaked in router pcap")
-PY
+python3 "${ROOT}/scripts/check-wg-pcap.py" \
+  --forbid-standard \
+  --require-mixed initiation,response,transport \
+  "${TMPDIR}/ra.pcap" "${TMPDIR}/rb.pcap"
 
 echo "netns WireGuard + eBPF smoke passed"
