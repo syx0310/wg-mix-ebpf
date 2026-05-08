@@ -11,7 +11,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-#define ABI_VERSION 2
+#define ABI_VERSION 3
 
 #define FAMILY_ANY  0
 #define FAMILY_IPV4 4
@@ -108,13 +108,22 @@ struct profile_value {
 	__u32 pad;
 };
 
+struct profile_key {
+	__u64 generation;
+	__u32 profile_id;
+	__u32 pad;
+};
+
 struct managed_fwmark_key {
+	__u64 generation;
 	__u32 fwmark;
 	__u32 underlay_index;
 };
 
 struct underlay_config_key {
+	__u64 generation;
 	__u32 underlay_index;
+	__u32 pad;
 };
 
 struct underlay_config_value {
@@ -130,11 +139,12 @@ struct managed_fwmark_value {
 };
 
 struct egress_rule_key {
+	__u64 generation;
 	__u32 fwmark;
 	__u32 underlay_index;
 	__u16 source_port;
 	__u8 family;
-	__u8 pad;
+	__u8 pad[5];
 };
 
 struct egress_rule_value {
@@ -146,6 +156,7 @@ struct egress_rule_value {
 };
 
 struct ingress_listener_key {
+	__u64 generation;
 	__u32 underlay_index;
 	__u16 destination_port;
 	__u8 family;
@@ -197,35 +208,35 @@ struct {
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 64);
-	__type(key, __u32);
+	__uint(max_entries, 128);
+	__type(key, struct profile_key);
 	__type(value, struct profile_value);
 } profile_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 256);
+	__uint(max_entries, 512);
 	__type(key, struct underlay_config_key);
 	__type(value, struct underlay_config_value);
 } underlay_config_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 256);
+	__uint(max_entries, 512);
 	__type(key, struct managed_fwmark_key);
 	__type(value, struct managed_fwmark_value);
 } managed_fwmark_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(max_entries, 2048);
 	__type(key, struct egress_rule_key);
 	__type(value, struct egress_rule_value);
 } egress_rule_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(max_entries, 2048);
 	__type(key, struct ingress_listener_key);
 	__type(value, struct ingress_listener_value);
 } ingress_listener_map SEC(".maps");
@@ -252,28 +263,30 @@ static __always_inline struct control_value *active_control(void)
 	return bpf_map_lookup_elem(&control_map, &key);
 }
 
-static __always_inline int same_generation(__u64 generation)
+static __always_inline int active_generation(__u64 *generation)
 {
 	struct control_value *control = active_control();
 
-	if (!control || control->abi_version != ABI_VERSION)
+	if (!control || control->abi_version != ABI_VERSION || control->active_generation == 0)
 		return 0;
-	return generation == control->active_generation;
+	*generation = control->active_generation;
+	return 1;
 }
 
-static __always_inline __u8 lookup_parser_mode(__u32 ifindex)
+static __always_inline __u8 lookup_parser_mode(__u32 ifindex, __u64 generation)
 {
 	struct underlay_config_key key = {
+		.generation = generation,
 		.underlay_index = ifindex,
 	};
 	struct underlay_config_value *value;
 
 	value = bpf_map_lookup_elem(&underlay_config_map, &key);
-	if (value && same_generation(value->generation))
+	if (value && value->generation == generation)
 		return value->parser_mode;
 	key.underlay_index = UNDERLAY_WILDCARD;
 	value = bpf_map_lookup_elem(&underlay_config_map, &key);
-	if (value && same_generation(value->generation))
+	if (value && value->generation == generation)
 		return value->parser_mode;
 	return PARSER_AUTO;
 }
@@ -321,9 +334,9 @@ static __always_inline int parse_ethernet_link(void *data, void *data_end, __u64
 }
 
 static __always_inline int parse_link(struct __sk_buff *skb, void *data, void *data_end,
-				      __u64 *off, __u16 *proto)
+				      __u64 *off, __u16 *proto, __u64 generation)
 {
-	__u8 parser_mode = lookup_parser_mode(skb->ifindex);
+	__u8 parser_mode = lookup_parser_mode(skb->ifindex, generation);
 	int rc;
 
 	if (parser_mode == PARSER_L3)
@@ -369,7 +382,8 @@ static __always_inline int is_ipv6_option_header(__u8 nexthdr)
 	return nexthdr == NEXTHDR_HOP || nexthdr == NEXTHDR_ROUTING || nexthdr == NEXTHDR_DEST;
 }
 
-static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_info *info)
+static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_info *info,
+					__u64 generation)
 {
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
@@ -378,7 +392,7 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 	int rc;
 
 	__builtin_memset(info, 0, sizeof(*info));
-	rc = parse_link(skb, data, data_end, &off, &proto);
+	rc = parse_link(skb, data, data_end, &off, &proto, generation);
 	if (rc != PARSE_OK)
 		return rc;
 
@@ -519,21 +533,23 @@ static __always_inline int update_type_word(struct __sk_buff *skb, struct packet
 	return 0;
 }
 
-static __always_inline struct managed_fwmark_value *lookup_managed_fwmark(__u32 mark, __u32 ifindex)
+static __always_inline struct managed_fwmark_value *lookup_managed_fwmark(__u32 mark, __u32 ifindex,
+									  __u64 generation)
 {
 	struct managed_fwmark_key key = {
+		.generation = generation,
 		.fwmark = mark,
 		.underlay_index = ifindex,
 	};
 	struct managed_fwmark_value *value;
 
 	value = bpf_map_lookup_elem(&managed_fwmark_map, &key);
-	if (value && same_generation(value->generation))
+	if (value && value->generation == generation)
 		return value;
 
 	key.underlay_index = UNDERLAY_WILDCARD;
 	value = bpf_map_lookup_elem(&managed_fwmark_map, &key);
-	if (value && same_generation(value->generation))
+	if (value && value->generation == generation)
 		return value;
 	return 0;
 }
@@ -570,9 +586,11 @@ static __always_inline int parse_result_has_ingress_port(int rc)
 
 static __always_inline struct ingress_listener_value *lookup_ingress_listener(__u32 ifindex,
 									      __u16 dst_port,
-									      __u8 family)
+									      __u8 family,
+									      __u64 generation)
 {
 	struct ingress_listener_key key = {
+		.generation = generation,
 		.underlay_index = ifindex,
 		.destination_port = dst_port,
 		.family = family,
@@ -580,11 +598,11 @@ static __always_inline struct ingress_listener_value *lookup_ingress_listener(__
 	struct ingress_listener_value *listener;
 
 	listener = bpf_map_lookup_elem(&ingress_listener_map, &key);
-	if (listener && same_generation(listener->generation))
+	if (listener && listener->generation == generation)
 		return listener;
 	key.underlay_index = UNDERLAY_WILDCARD;
 	listener = bpf_map_lookup_elem(&ingress_listener_map, &key);
-	if (listener && same_generation(listener->generation))
+	if (listener && listener->generation == generation)
 		return listener;
 	return 0;
 }
@@ -596,14 +614,19 @@ int wg_mix_egress(struct __sk_buff *skb)
 	struct egress_rule_key key = {};
 	struct egress_rule_value *rule;
 	struct managed_fwmark_value *managed;
+	struct profile_key profile_key = {};
 	struct profile_value *profile;
+	__u64 generation = 0;
 	__u32 old_wire = 0;
 	__u32 old_type = 0;
 	__u32 new_wire = 0;
 	int rc, kind;
 
-	rc = parse_packet(skb, &info);
-	managed = lookup_managed_fwmark(skb->mark, skb->ifindex);
+	if (!active_generation(&generation))
+		return TC_ACT_OK;
+
+	rc = parse_packet(skb, &info, generation);
+	managed = lookup_managed_fwmark(skb->mark, skb->ifindex, generation);
 	if (parse_result_is_fragment(rc)) {
 		if (managed) {
 			inc_stat(STAT_EGRESS_FRAGMENT);
@@ -621,16 +644,17 @@ int wg_mix_egress(struct __sk_buff *skb)
 	if (rc != PARSE_OK)
 		return managed_miss_action(STAT_EGRESS_RULE_MISS, managed);
 
+	key.generation = generation;
 	key.fwmark = skb->mark;
 	key.underlay_index = skb->ifindex;
 	key.source_port = info.src_port;
 	key.family = info.family;
 	rule = bpf_map_lookup_elem(&egress_rule_map, &key);
-	if (!rule || !same_generation(rule->generation)) {
+	if (!rule || rule->generation != generation) {
 		key.underlay_index = UNDERLAY_WILDCARD;
 		rule = bpf_map_lookup_elem(&egress_rule_map, &key);
 	}
-	if (!rule || !same_generation(rule->generation))
+	if (!rule || rule->generation != generation)
 		return managed_miss_action(STAT_EGRESS_RULE_MISS, managed);
 	if (rule->action == ACTION_DROP)
 		return TC_ACT_SHOT;
@@ -649,8 +673,10 @@ int wg_mix_egress(struct __sk_buff *skb)
 		inc_stat(STAT_EGRESS_BAD_LENGTH);
 		return TC_ACT_SHOT;
 	}
-	profile = bpf_map_lookup_elem(&profile_map, &rule->profile_id);
-	if (!profile || !same_generation(profile->generation)) {
+	profile_key.generation = generation;
+	profile_key.profile_id = rule->profile_id;
+	profile = bpf_map_lookup_elem(&profile_map, &profile_key);
+	if (!profile || profile->generation != generation) {
 		inc_stat(STAT_EGRESS_RULE_MISS);
 		return TC_ACT_SHOT;
 	}
@@ -668,13 +694,18 @@ int wg_mix_ingress(struct __sk_buff *skb)
 {
 	struct packet_info info;
 	struct ingress_listener_value *listener;
+	struct profile_key profile_key = {};
 	struct profile_value *profile;
+	__u64 generation = 0;
 	__u32 old_wire = 0;
 	__u32 old_type = 0;
 	__u32 new_wire = 0;
 	int rc, kind = -1;
 
-	rc = parse_packet(skb, &info);
+	if (!active_generation(&generation))
+		return TC_ACT_OK;
+
+	rc = parse_packet(skb, &info, generation);
 	if (!parse_result_has_ingress_port(rc)) {
 		if (parse_result_is_fragment(rc))
 			inc_stat(STAT_INGRESS_FRAGMENT);
@@ -683,7 +714,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		return TC_ACT_OK;
 	}
 
-	listener = lookup_ingress_listener(skb->ifindex, info.dst_port, info.family);
+	listener = lookup_ingress_listener(skb->ifindex, info.dst_port, info.family, generation);
 	if (!listener) {
 		inc_stat(STAT_INGRESS_RULE_MISS);
 		return TC_ACT_OK;
@@ -704,8 +735,10 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	if (listener->action != ACTION_REWRITE)
 		return TC_ACT_OK;
 
-	profile = bpf_map_lookup_elem(&profile_map, &listener->profile_id);
-	if (!profile || !same_generation(profile->generation)) {
+	profile_key.generation = generation;
+	profile_key.profile_id = listener->profile_id;
+	profile = bpf_map_lookup_elem(&profile_map, &profile_key);
+	if (!profile || profile->generation != generation) {
 		inc_stat(STAT_INGRESS_RULE_MISS);
 		return TC_ACT_SHOT;
 	}

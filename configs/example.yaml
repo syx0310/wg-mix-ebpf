@@ -44,7 +44,7 @@ policy:
   managed_ingress_map_miss: pass
   managed_ingress_bad_type: drop
   managed_ingress_bad_length: drop
-  ingress_managed_ipv6_ext_header: pass
+  ingress_managed_ipv6_ext_header: drop
   ipv4_first_fragment: drop
   ipv4_non_first_fragment:
     ingress: pass

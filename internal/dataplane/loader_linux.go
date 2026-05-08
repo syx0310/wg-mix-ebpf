@@ -96,6 +96,9 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
 	if err != nil {
 		return err
 	}
+	if err := deleteGenerationMapEntries(coll, next); err != nil {
+		return err
+	}
 	if err := populateDataMaps(coll, snapshot); err != nil {
 		return err
 	}
@@ -250,6 +253,41 @@ func deleteStaleMapEntries(coll *ebpf.Collection, snapshot *abi.Snapshot) error 
 		deleteStaleEntries(coll, "egress_rule_map", snapshot.EgressRules),
 		deleteStaleEntries(coll, "ingress_listener_map", snapshot.IngressListeners),
 	)
+}
+
+func deleteGenerationMapEntries(coll *ebpf.Collection, generation uint64) error {
+	return errors.Join(
+		deleteEntriesByGeneration[abi.ProfileKey, abi.ProfileValue](coll, "profile_map", generation),
+		deleteEntriesByGeneration[abi.UnderlayConfigKey, abi.UnderlayConfigValue](coll, "underlay_config_map", generation),
+		deleteEntriesByGeneration[abi.ManagedFwmarkKey, abi.ManagedFwmarkValue](coll, "managed_fwmark_map", generation),
+		deleteEntriesByGeneration[abi.EgressRuleKey, abi.EgressRuleValue](coll, "egress_rule_map", generation),
+		deleteEntriesByGeneration[abi.IngressListenerKey, abi.IngressListenerValue](coll, "ingress_listener_map", generation),
+	)
+}
+
+func deleteEntriesByGeneration[K comparable, V interface{ MapGeneration() uint64 }](coll *ebpf.Collection, name string, generation uint64) error {
+	m := coll.Maps[name]
+	if m == nil {
+		return fmt.Errorf("BPF object missing map %q", name)
+	}
+	var (
+		key   K
+		value V
+		errs  []error
+	)
+	iter := m.Iterate()
+	for iter.Next(&key, &value) {
+		if value.MapGeneration() != generation {
+			continue
+		}
+		if err := m.Delete(key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
+			errs = append(errs, fmt.Errorf("delete generation %d entry from %s: %w", generation, name, err))
+		}
+	}
+	if err := iter.Err(); err != nil {
+		errs = append(errs, fmt.Errorf("iterate map %s: %w", name, err))
+	}
+	return errors.Join(errs...)
 }
 
 func deleteStaleEntries[K comparable, V any](coll *ebpf.Collection, name string, desired map[K]V) error {

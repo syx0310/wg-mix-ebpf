@@ -97,6 +97,26 @@ fwmark_policy:
 	}
 }
 
+func TestRejectZeroFwmarkFallback(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+runtime:
+  allow_zero_fwmark_fallback: true
+`))
+	if err == nil {
+		t.Fatal("expected zero fwmark fallback error")
+	}
+}
+
 func TestRejectUnsupportedUnderlayParser(t *testing.T) {
 	_, err := Load([]byte(`
 version: 1

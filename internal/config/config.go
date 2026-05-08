@@ -263,6 +263,9 @@ func (c *Config) ValidateStatic() error {
 	default:
 		return fmt.Errorf("fwmark_policy.mode %q is unsupported", c.FwmarkPolicy.Mode)
 	}
+	if c.Runtime.AllowZeroFwmarkFallback {
+		return errors.New("runtime.allow_zero_fwmark_fallback is reserved but not implemented in MVP")
+	}
 	if err := validateUniqueUnderlays(c.Underlays); err != nil {
 		return err
 	}

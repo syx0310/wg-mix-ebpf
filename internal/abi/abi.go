@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	Version uint32 = 2
+	Version uint32 = 3
 
 	FamilyAny  uint8 = 0
 	FamilyIPv4 uint8 = 4
@@ -37,7 +37,11 @@ type ControlValue struct {
 	Flags            uint32
 }
 
-type ProfileKey uint32
+type ProfileKey struct {
+	Generation uint64
+	ProfileID  uint32
+	_          uint32
+}
 
 type ProfileValue struct {
 	Generation      uint64
@@ -47,13 +51,18 @@ type ProfileValue struct {
 	_               uint32
 }
 
+func (v ProfileValue) MapGeneration() uint64 { return v.Generation }
+
 type ManagedFwmarkKey struct {
+	Generation    uint64
 	FwMark        uint32
 	UnderlayIndex uint32
 }
 
 type UnderlayConfigKey struct {
+	Generation    uint64
 	UnderlayIndex uint32
+	_             uint32
 }
 
 type UnderlayConfigValue struct {
@@ -62,18 +71,23 @@ type UnderlayConfigValue struct {
 	_          [7]byte
 }
 
+func (v UnderlayConfigValue) MapGeneration() uint64 { return v.Generation }
+
 type ManagedFwmarkValue struct {
 	Generation   uint64
 	ActionOnMiss uint8
 	_            [7]byte
 }
 
+func (v ManagedFwmarkValue) MapGeneration() uint64 { return v.Generation }
+
 type EgressRuleKey struct {
+	Generation    uint64
 	FwMark        uint32
 	UnderlayIndex uint32
 	SourcePort    uint16
 	Family        uint8
-	_             uint8
+	_             [5]byte
 }
 
 type EgressRuleValue struct {
@@ -84,7 +98,10 @@ type EgressRuleValue struct {
 	_          [7]byte
 }
 
+func (v EgressRuleValue) MapGeneration() uint64 { return v.Generation }
+
 type IngressListenerKey struct {
+	Generation      uint64
 	UnderlayIndex   uint32
 	DestinationPort uint16
 	Family          uint8
@@ -98,6 +115,8 @@ type IngressListenerValue struct {
 	Action     uint8
 	_          [7]byte
 }
+
+func (v IngressListenerValue) MapGeneration() uint64 { return v.Generation }
 
 type Snapshot struct {
 	Control          map[ControlKey]ControlValue
@@ -159,7 +178,7 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 		IngressListeners: make(map[IngressListenerKey]IngressListenerValue, len(state.IngressListeners)),
 	}
 	for _, p := range state.Profiles {
-		out.Profiles[ProfileKey(p.ID)] = ProfileValue{
+		out.Profiles[ProfileKey{Generation: generation, ProfileID: p.ID}] = ProfileValue{
 			Generation:      generation,
 			StandardToMixed: p.StandardToMixed,
 			MixedToStandard: p.MixedToStandard,
@@ -173,7 +192,10 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 		if err != nil {
 			return nil, err
 		}
-		out.Underlays[UnderlayConfigKey{UnderlayIndex: uint32(u.IfIndex)}] = UnderlayConfigValue{
+		out.Underlays[UnderlayConfigKey{
+			Generation:    generation,
+			UnderlayIndex: uint32(u.IfIndex),
+		}] = UnderlayConfigValue{
 			Generation: generation,
 			ParserMode: parser,
 		}
@@ -184,6 +206,7 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 			return nil, err
 		}
 		out.ManagedFwmarks[ManagedFwmarkKey{
+			Generation:    generation,
 			FwMark:        r.FwMark,
 			UnderlayIndex: uint32(r.UnderlayIfIndex),
 		}] = ManagedFwmarkValue{
@@ -201,6 +224,7 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 			return nil, err
 		}
 		out.EgressRules[EgressRuleKey{
+			Generation:    generation,
 			FwMark:        r.FwMark,
 			UnderlayIndex: uint32(r.UnderlayIfIndex),
 			SourcePort:    r.SourcePort,
@@ -222,6 +246,7 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 			return nil, err
 		}
 		out.IngressListeners[IngressListenerKey{
+			Generation:      generation,
 			UnderlayIndex:   uint32(r.UnderlayIfIndex),
 			DestinationPort: r.DestinationPort,
 			Family:          family,

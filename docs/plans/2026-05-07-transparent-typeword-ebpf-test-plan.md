@@ -127,15 +127,15 @@ native wireguard-mix 负向互通。
 
 | ID | 测试项 | 期望 |
 | --- | --- | --- |
-| U-MAP-001 | egress rule key | 包含 family、fwmark、src_port、underlay_ifindex |
-| U-MAP-002 | ingress listener key | 包含 family、dst_port、underlay_ifindex |
+| U-MAP-001 | egress rule key | 包含 generation、family、fwmark、src_port、underlay_ifindex |
+| U-MAP-002 | ingress listener key | 包含 generation、family、dst_port、underlay_ifindex |
 | U-MAP-003 | exact underlay 优先 | exact 命中优先于 wildcard |
 | U-MAP-004 | wildcard fallback | exact miss 后命中 wildcard |
 | U-MAP-005 | exact/wildcard 冲突 | validate reject 或按固定优先级无歧义 |
 | U-MAP-006 | managed_fwmark_map | egress rule miss 时可识别 managed mark |
 | U-MAP-007 | same fwmark group | 同 FwMark + 不同 src_port 可区分不同 wg |
 | U-MAP-008 | 多 wg / 多 profile | 生成无歧义 entries |
-| U-MAP-009 | generation tag | 所有 map value 写入新 generation |
+| U-MAP-009 | generation tag | 所有 dataplane key 和 value 都写入新 generation，旧 generation key 在 commit 前不被覆盖 |
 | U-MAP-010 | active_generation commit | commit 前失败不影响旧 active |
 | U-MAP-011 | managed miss action | managed mark + rule miss 生成 drop policy |
 

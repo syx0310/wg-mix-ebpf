@@ -111,7 +111,7 @@ policy:
   managed_ingress_map_miss: pass
   managed_ingress_bad_type: drop
   managed_ingress_bad_length: drop
-  ingress_managed_ipv6_ext_header: pass
+  ingress_managed_ipv6_ext_header: drop
 
   ipv4_first_fragment: drop
   ipv4_non_first_fragment:
@@ -256,26 +256,31 @@ control_map
   flags
 
 profile_map
-  profile_id ->
+  generation + profile_id ->
     generation
     standard_to_mixed[4]
     mixed_to_standard[4]
     policy_flags
 
+underlay_config_map
+  generation + underlay_ifindex/wildcard ->
+    generation
+    parser_mode
+
 managed_fwmark_map
-  fwmark + underlay_ifindex/wildcard ->
+  generation + fwmark + underlay_ifindex/wildcard ->
     generation
     action_on_rule_miss
 
 egress_rule_map
-  family/wildcard + fwmark + src_port + underlay_ifindex/wildcard ->
+  generation + family/wildcard + fwmark + src_port + underlay_ifindex/wildcard ->
     generation
     profile_id
     wg_if_id
     action
 
 ingress_listener_map
-  family + dst_port + underlay_ifindex/wildcard ->
+  generation + family + dst_port + underlay_ifindex/wildcard ->
     generation
     profile_id
     wg_if_id
@@ -493,12 +498,14 @@ commit 后失败：进入 degraded 状态，不能半切。
 Generation 流程：
 
 ```text
-写新 generation profile entries。
-写新 generation managed_fwmark/egress/ingress entries。
+写新 generation profile/underlay entries，key 中包含 generation。
+写新 generation managed_fwmark/egress/ingress entries，key 中包含 generation。
+旧 active_generation 的 entries 在 commit 前保持原样，不被覆盖。
 确认 attach state。
 更新 active_generation。
-BPF 校验 entry.generation == active_generation。
-清理旧 generation。
+BPF 先读取 active_generation，再用 active_generation 作为 key 的一部分查表。
+BPF 仍校验 entry.generation == active_generation，作为 ABI/数据一致性防线。
+commit 后清理旧 generation。
 ```
 
 Profile 变更策略：
