@@ -17,7 +17,6 @@ type NftPlan struct {
 
 func (p NftPlan) Script() string {
 	lines := []string{
-		"destroy table inet " + p.Table,
 		"add table inet " + p.Table,
 		"add chain inet " + p.Table + " output { type filter hook output priority -300; policy accept; }",
 		"add chain inet " + p.Table + " input { type filter hook input priority -300; policy accept; }",
@@ -27,7 +26,7 @@ func (p NftPlan) Script() string {
 }
 
 func CleanupScript() string {
-	return "destroy table inet " + TableName + "\n"
+	return "delete table inet " + TableName + "\n"
 }
 
 func BuildNftPlan(state *control.State) NftPlan {

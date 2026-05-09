@@ -1,7 +1,11 @@
 package profile
 
 import (
+	"crypto/rand"
+	"encoding/base64"
+	"encoding/json"
 	"fmt"
+	"hash/crc32"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 )
@@ -26,6 +30,8 @@ var WireguardMixWireValuesV1 = [4]uint32{
 	0x075ae5e0,
 	0x13dff06b,
 }
+
+const TokenPrefix = "wgmix1"
 
 type Compiled struct {
 	Name            string
@@ -119,4 +125,146 @@ func isStandard(v uint32) bool {
 		}
 	}
 	return false
+}
+
+func Preset(name string) (config.Profile, error) {
+	switch name {
+	case "wireguard-mix-wire-values-v1":
+		return config.Profile{
+			Preset: name,
+			Index:  config.IndexProfile{Mode: "none"},
+		}, nil
+	default:
+		return config.Profile{}, fmt.Errorf("unsupported preset %q", name)
+	}
+}
+
+func GenerateRandom() (config.Profile, error) {
+	var values [4]uint32
+	seen := make(map[uint32]struct{}, len(values))
+	for i := range values {
+		for {
+			v, err := randomUint32()
+			if err != nil {
+				return config.Profile{}, err
+			}
+			if v == 0 || isStandard(v) {
+				continue
+			}
+			if _, exists := seen[v]; exists {
+				continue
+			}
+			seen[v] = struct{}{}
+			values[i] = v
+			break
+		}
+	}
+	cfg := config.Profile{
+		TypeWord: config.TypeWordProfile{
+			Initiation:    values[0],
+			Response:      values[1],
+			CookieReply:   values[2],
+			TransportData: values[3],
+		},
+		Index: config.IndexProfile{Mode: "none"},
+	}
+	if _, err := Compile("generated", cfg); err != nil {
+		return config.Profile{}, err
+	}
+	return cfg, nil
+}
+
+func EncodeToken(cfg config.Profile) (string, error) {
+	if _, err := Compile("token", cfg); err != nil {
+		return "", err
+	}
+	values, err := mixedValues(cfg)
+	if err != nil {
+		return "", err
+	}
+	payload := tokenPayload{
+		Version:       1,
+		Initiation:    values[0],
+		Response:      values[1],
+		CookieReply:   values[2],
+		TransportData: values[3],
+		IndexMode:     "none",
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return "", err
+	}
+	sum := crc32.ChecksumIEEE(data)
+	return fmt.Sprintf("%s.%s.%08x", TokenPrefix, base64.RawURLEncoding.EncodeToString(data), sum), nil
+}
+
+func DecodeToken(token string) (config.Profile, error) {
+	parts := splitToken(token)
+	if len(parts) != 3 || parts[0] != TokenPrefix {
+		return config.Profile{}, fmt.Errorf("invalid profile token format")
+	}
+	return decodeTokenParts(parts[1], parts[2])
+}
+
+func decodeTokenParts(encoded string, checksum string) (config.Profile, error) {
+	data, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil {
+		return config.Profile{}, fmt.Errorf("decode token payload: %w", err)
+	}
+	want := fmt.Sprintf("%08x", crc32.ChecksumIEEE(data))
+	if checksum != want {
+		return config.Profile{}, fmt.Errorf("token checksum mismatch")
+	}
+	var payload tokenPayload
+	if err := json.Unmarshal(data, &payload); err != nil {
+		return config.Profile{}, fmt.Errorf("parse token payload: %w", err)
+	}
+	if payload.Version != 1 {
+		return config.Profile{}, fmt.Errorf("unsupported token version %d", payload.Version)
+	}
+	if payload.IndexMode == "" {
+		payload.IndexMode = "none"
+	}
+	cfg := config.Profile{
+		TypeWord: config.TypeWordProfile{
+			Initiation:    payload.Initiation,
+			Response:      payload.Response,
+			CookieReply:   payload.CookieReply,
+			TransportData: payload.TransportData,
+		},
+		Index: config.IndexProfile{Mode: payload.IndexMode},
+	}
+	if _, err := Compile("token", cfg); err != nil {
+		return config.Profile{}, err
+	}
+	return cfg, nil
+}
+
+type tokenPayload struct {
+	Version       int    `json:"v"`
+	Initiation    uint32 `json:"i"`
+	Response      uint32 `json:"r"`
+	CookieReply   uint32 `json:"c"`
+	TransportData uint32 `json:"t"`
+	IndexMode     string `json:"x"`
+}
+
+func randomUint32() (uint32, error) {
+	var buf [4]byte
+	if _, err := rand.Read(buf[:]); err != nil {
+		return 0, fmt.Errorf("generate random type_word: %w", err)
+	}
+	return uint32(buf[0]) | uint32(buf[1])<<8 | uint32(buf[2])<<16 | uint32(buf[3])<<24, nil
+}
+
+func splitToken(token string) []string {
+	var out []string
+	start := 0
+	for i := 0; i <= len(token); i++ {
+		if i == len(token) || token[i] == '.' {
+			out = append(out, token[start:i])
+			start = i + 1
+		}
+	}
+	return out
 }

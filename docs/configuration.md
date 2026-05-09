@@ -8,6 +8,22 @@ The default config path is:
 
 The config format version is currently `1`.
 
+An installed but uninitialized config may be an idle template:
+
+```yaml
+version: 1
+mode: transparent-typeword
+underlays: []
+wireguards: []
+profiles:
+  default:
+    preset: wireguard-mix-wire-values-v1
+    index:
+      mode: none
+```
+
+This template is valid and has no network effect because it manages no WireGuard interface.
+
 ## Complete Example
 
 ```yaml
@@ -211,6 +227,25 @@ profiles:
       mode: none
 ```
 
+Profiles can be managed with the CLI:
+
+```bash
+wg-mix-ebpf profile list
+wg-mix-ebpf profile add home
+wg-mix-ebpf profile add home --preset wireguard-mix-wire-values-v1
+wg-mix-ebpf profile add home --token 'wgmix1....'
+wg-mix-ebpf profile token home
+wg-mix-ebpf profile check 'wgmix1....'
+wg-mix-ebpf profile remove home
+wg-mix-ebpf profile remove home --force
+```
+
+`profile add <name>` without `--preset` or `--token` creates a random fixed-size type-word profile.
+
+Profile tokens are only an anti-typo transport format. They are not encrypted and not signed. Use the same token on both endpoints when creating a matching profile.
+
+If a profile is still referenced by a WireGuard entry, `profile remove` refuses by default. With `--force`, the profile is removed and the referencing WireGuard entries are removed from the agent config, so the agent no longer manages those interfaces. The WireGuard config and interface are not modified.
+
 `index.mode: none` means sender and receiver indexes are not modified.
 
 Explicit type-word profile:
@@ -271,7 +306,7 @@ runtime:
   allow_zero_fwmark_fallback: false
 ```
 
-`poll_interval` is reserved for future long-running reconcile behavior. The current CLI commands rebuild state when invoked.
+`poll_interval` controls the daemon's low-frequency runtime reconcile loop. Manual commands still rebuild state when invoked.
 
 `require_nonzero_fwmark: true` rejects managed interfaces with runtime `FirewallMark = 0`.
 
@@ -302,7 +337,9 @@ none
 
 `nft-temporary-drop` installs temporary nft rules before dataplane reload and removes them after successful reload. If reload fails after the guard is applied, the guard remains in place.
 
-`none` disables startup guard and is intended for development or controlled tests.
+The nft cleanup step is best effort and runs separately from rule creation. Missing guard tables are ignored so older nftables versions do not abort startup guard creation before dataplane attach.
+
+`none` disables startup guard and is intended for development, controlled tests, or minimal systems without nft. In this mode, egress fail-closed behavior only starts after the TC/eBPF dataplane is attached and maps are populated.
 
 ## `underlay_overlap_policy`
 

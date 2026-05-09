@@ -31,7 +31,7 @@ bpf-load-test: build
 	./$(BINARY) bpf-load-test
 
 test-netns-smoke: build
-	@echo "skip: netns smoke requires the private lab harness or an external Linux root VM"
+	scripts/smoke-netns-wg.sh
 
 test-unit:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./...

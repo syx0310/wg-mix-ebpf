@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -160,6 +161,14 @@ func LoadFile(path string) (*Config, error) {
 	return cfg, nil
 }
 
+func LoadFileLenient(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	return LoadLenient(data)
+}
+
 func Load(data []byte) (*Config, error) {
 	var cfg Config
 	if err := yaml.Unmarshal(data, &cfg); err != nil {
@@ -170,6 +179,62 @@ func Load(data []byte) (*Config, error) {
 		return nil, err
 	}
 	return &cfg, nil
+}
+
+func LoadLenient(data []byte) (*Config, error) {
+	var cfg Config
+	if err := yaml.Unmarshal(data, &cfg); err != nil {
+		return nil, err
+	}
+	cfg.ApplyDefaults()
+	return &cfg, nil
+}
+
+func SaveFile(path string, cfg *Config) error {
+	cfg.ApplyDefaults()
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create config directory: %w", err)
+	}
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return fmt.Errorf("marshal config: %w", err)
+	}
+	return os.WriteFile(path, data, 0o600)
+}
+
+func SafeTemplate() *Config {
+	cfg := &Config{
+		Version: 1,
+		Mode:    "transparent-typeword",
+		Profiles: map[string]Profile{
+			"default": {
+				Preset: "wireguard-mix-wire-values-v1",
+				Index:  IndexProfile{Mode: "none"},
+			},
+		},
+		FwmarkPolicy: FwmarkPolicy{Mode: "config-required"},
+		Runtime: Runtime{
+			PollInterval:            Duration{Duration: 5 * time.Second},
+			RequireNonzeroFwmark:    true,
+			StrictRuntimeFwmark:     true,
+			AllowZeroFwmarkFallback: false,
+			requireNonzeroFwmarkSet: true,
+			strictRuntimeFwmarkSet:  true,
+		},
+		StartupGuard: StartupGuard{
+			Mode: "nft-temporary-drop",
+			Egress: GuardEgress{
+				Match: "fwmark",
+			},
+			Ingress: GuardIngress{
+				Match:                    "config-listen-port-if-present",
+				RandomListenPortBehavior: "best-effort",
+			},
+		},
+		UnderlayOverlapPolicy: "reject",
+	}
+	cfg.Policy.applyDefaults()
+	return cfg
 }
 
 func (c *Config) ApplyDefaults() {
@@ -247,14 +312,11 @@ func (c *Config) ValidateStatic() error {
 	if c.Mode != "transparent-typeword" {
 		return fmt.Errorf("unsupported mode %q", c.Mode)
 	}
-	if len(c.Underlays) == 0 {
-		return errors.New("at least one underlay is required")
+	if len(c.WireGuards) > 0 && len(c.Underlays) == 0 {
+		return errors.New("at least one underlay is required when wireguard interfaces are configured")
 	}
-	if len(c.WireGuards) == 0 {
-		return errors.New("at least one wireguard interface is required")
-	}
-	if len(c.Profiles) == 0 {
-		return errors.New("at least one profile is required")
+	if len(c.WireGuards) > 0 && len(c.Profiles) == 0 {
+		return errors.New("at least one profile is required when wireguard interfaces are configured")
 	}
 	switch c.FwmarkPolicy.Mode {
 	case "config-required":

@@ -33,7 +33,6 @@ func TestNftScript(t *testing.T) {
 	}
 	script := plan.Script()
 	for _, want := range []string{
-		"destroy table inet wg_mix_ebpf_guard",
 		"add table inet wg_mix_ebpf_guard",
 		"add chain inet wg_mix_ebpf_guard output",
 		"add chain inet wg_mix_ebpf_guard input",

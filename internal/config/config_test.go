@@ -155,3 +155,10 @@ policy:
 		t.Fatal("expected unsupported policy error")
 	}
 }
+
+func TestSafeTemplateValidatesAsIdleConfig(t *testing.T) {
+	cfg := SafeTemplate()
+	if err := cfg.ValidateStatic(); err != nil {
+		t.Fatalf("safe template should validate: %v", err)
+	}
+}
