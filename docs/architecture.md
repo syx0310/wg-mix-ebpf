@@ -71,7 +71,7 @@ internal/reconcile
   Shared validate/status/reload/detach workflow used by CLI and daemon.
 
 internal/daemon
-  Runtime reconcile loop, status file writer, and reload-request handling.
+  Runtime reconcile loop, status file writer, reload-request handling, and stop-request handling.
 
 internal/install
   Systemd/OpenWrt install and uninstall helpers.
@@ -84,6 +84,9 @@ internal/dataplane
 
 internal/guard
   nft startup guard generation and execution.
+
+internal/lockfile
+  Process-wide file lock used to serialize reload, detach, daemon stop, and uninstall cleanup.
 
 bpf/wg_mix_tc.c
   TC ingress and egress dataplane program.
@@ -197,6 +200,8 @@ If dataplane reload fails after the guard is applied, the guard is intentionally
 
 For nftables compatibility, guard cleanup is executed separately from guard creation. Cleanup uses `delete table` as a best-effort operation and ignores missing-table errors before applying the add-table rules. This avoids aborting startup guard creation on older nftables versions that reject `destroy table` or fail a combined script when the table does not already exist.
 
+The startup guard is generated from config-only state before runtime WireGuard state is required. That allows egress fwmark guard rules to be installed even when the WireGuard interface has not appeared yet.
+
 ## Service And Reconcile Model
 
 The user-facing commands are intentionally small:
@@ -226,6 +231,7 @@ startup reconcile
 low-frequency poll reconcile
 manual reload request handling
 OpenWrt hotplug reload request handling
+manual stop request handling
 status file updates under /run/wg-mix-ebpf
 ```
 
@@ -242,7 +248,13 @@ update dataplane maps when only peer endpoint/handshake/counters change
 
 `systemctl stop wg-mix-ebpf` or OpenWrt service stop detaches this agent's TC filters. If WireGuard keeps running after that, it may send standard WireGuard type words.
 
+Service stop is routed through `wg-mix-ebpf stop`. If the daemon is running, the command asks the daemon to acquire the shared lock, stop polling/reloading, detach dataplane, write stopped status, and exit. If the daemon is not running, it performs one-shot detach.
+
 `uninstall` stops the service, detaches this agent's dataplane, removes BPF pins, removes the nft guard table, and removes runtime/state/service files. It keeps `/etc/wg-mix-ebpf/config.yaml` by default; `--purge` removes the config directory. It does not delete the binary or WireGuard configuration.
+
+`uninstall --purge` only removes the owned config directory. It refuses to purge arbitrary parent directories from custom `--config` paths.
+
+Poll no-op optimization checks desired state and dataplane health. If pinned maps or expected TC filters are missing, the daemon forces reconcile instead of reporting active from desired state alone.
 
 ## Build Model
 

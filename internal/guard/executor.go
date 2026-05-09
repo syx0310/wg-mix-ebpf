@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"strings"
 )
 
 type Executor interface {
@@ -26,7 +27,13 @@ func (e CommandExecutor) Apply(ctx context.Context, plan NftPlan) error {
 }
 
 func (e CommandExecutor) Cleanup(ctx context.Context) error {
-	return e.run(ctx, CleanupScript())
+	if err := e.run(ctx, CleanupScript()); err != nil {
+		if isMissingGuardTable(err) {
+			return nil
+		}
+		return err
+	}
+	return nil
 }
 
 func (e CommandExecutor) run(ctx context.Context, script string) error {
@@ -41,6 +48,17 @@ func (e CommandExecutor) run(ctx context.Context, script string) error {
 		return fmt.Errorf("%s -f - failed: %w: %s", binary, err, string(out))
 	}
 	return nil
+}
+
+func isMissingGuardTable(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return strings.Contains(lower, TableName) &&
+		(strings.Contains(lower, "no such file") ||
+			strings.Contains(lower, "does not exist") ||
+			strings.Contains(lower, "not found"))
 }
 
 type DryRunExecutor struct {

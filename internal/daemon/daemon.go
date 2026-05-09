@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -14,6 +15,8 @@ import (
 	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
+	"github.com/syx0310/wg-mix-ebpf/internal/control"
+	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
 	"github.com/syx0310/wg-mix-ebpf/internal/reconcile"
 )
 
@@ -43,6 +46,9 @@ type Status struct {
 }
 
 func Run(ctx context.Context, opts Options) error {
+	ctx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
+	defer stopSignals()
+
 	runDir := runDir(opts.RunDir)
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return fmt.Errorf("create run dir: %w", err)
@@ -72,6 +78,9 @@ func Run(ctx context.Context, opts Options) error {
 			if err == nil {
 				fp := stateFingerprint(result)
 				if fp == lastFingerprint {
+					if !opts.Offline && !opts.DryRun && !dataplaneHealthy(ctx, result.State) {
+						goto forceReload
+					}
 					status.PID = os.Getpid()
 					status.ConfigPath = configPath(opts.ConfigPath)
 					status.State = "active"
@@ -83,7 +92,8 @@ func Run(ctx context.Context, opts Options) error {
 				}
 			}
 		}
-		result, err := reconcile.Reload(ctx, reconcile.Options{ConfigPath: opts.ConfigPath, Offline: opts.Offline, DryRun: opts.DryRun})
+	forceReload:
+		result, err := reconcile.Reload(ctx, reconcile.Options{ConfigPath: opts.ConfigPath, RunDir: runDir, Offline: opts.Offline, DryRun: opts.DryRun})
 		status.PID = os.Getpid()
 		status.ConfigPath = configPath(opts.ConfigPath)
 		status.LastReason = reason
@@ -110,33 +120,105 @@ func Run(ctx context.Context, opts Options) error {
 	}
 
 	ticker := time.NewTicker(interval)
+	requestTicker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
+	defer requestTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
-			status.State = "stopped"
+			status.LastReason = "signal"
+			if !opts.DryRun {
+				if result, err := detachForStop(context.Background(), opts, runDir); err != nil {
+					status.State = "degraded"
+					status.LastError = err.Error()
+					status.LastErrorTime = time.Now()
+				} else {
+					status.State = "stopped"
+					status.LastError = ""
+					status.LastSuccess = time.Now()
+					status.LastResult = result
+				}
+			} else {
+				status.State = "stopped"
+			}
 			_ = writeStatus(runDir, status)
-			return ctx.Err()
-		case <-ticker.C:
+			return nil
+		case <-requestTicker.C:
 			stamp := requestStamp(runDir)
 			if stamp != lastRequest {
 				lastRequest = stamp
+				if strings.HasPrefix(stamp, "stop:") {
+					status.LastReason = "stop-request"
+					if result, err := detachForStop(context.Background(), opts, runDir); err != nil {
+						status.State = "degraded"
+						status.LastError = err.Error()
+						status.LastErrorTime = time.Now()
+						_ = writeStatus(runDir, status)
+						return err
+					} else {
+						status.State = "stopped"
+						status.LastError = ""
+						status.LastSuccess = time.Now()
+						status.LastResult = result
+						_ = writeStatus(runDir, status)
+						return nil
+					}
+				}
 				runOnce("reload-request")
-				continue
 			}
+		case <-ticker.C:
 			runOnce("poll")
 		}
 	}
 }
 
+func dataplaneHealthy(ctx context.Context, state *control.State) bool {
+	if state == nil {
+		return false
+	}
+	status, err := dataplane.Inspect(ctx, state)
+	if err != nil || status == nil || status.MapError != "" || status.ActiveGeneration == 0 {
+		return false
+	}
+	byIndex := make(map[int]dataplane.UnderlayKernelStatus, len(status.Underlays))
+	for _, u := range status.Underlays {
+		byIndex[u.IfIndex] = u
+	}
+	for _, desired := range state.Underlays {
+		if !desired.Resolved || desired.Role == "parse_only" || desired.Role == "disabled" {
+			continue
+		}
+		actual, ok := byIndex[desired.IfIndex]
+		if !ok || actual.Error != "" || !actual.IngressAttached || !actual.EgressAttached {
+			return false
+		}
+	}
+	return true
+}
+
 func RequestReload(ctx context.Context, runDir string, timeout time.Duration) (*Status, error) {
+	return writeRequestAndWait(ctx, runDir, "reload", timeout)
+}
+
+func RequestStop(ctx context.Context, runDir string, timeout time.Duration) (*Status, error) {
+	status, err := writeRequestAndWait(ctx, runDir, "stop", timeout)
+	if err != nil {
+		return status, err
+	}
+	if status.State != "stopped" {
+		return status, fmt.Errorf("daemon stop request ended in state %q", status.State)
+	}
+	return status, nil
+}
+
+func writeRequestAndWait(ctx context.Context, runDir string, kind string, timeout time.Duration) (*Status, error) {
 	dir := runDirOrDefault(runDir)
 	before, _ := ReadStatus(dir)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create run dir: %w", err)
 	}
 	requestPath := filepath.Join(dir, "reload.request")
-	if err := os.WriteFile(requestPath, []byte(strconv.FormatInt(time.Now().UnixNano(), 10)+"\n"), 0o644); err != nil {
+	if err := os.WriteFile(requestPath, []byte(kind+":"+strconv.FormatInt(time.Now().UnixNano(), 10)+"\n"), 0o644); err != nil {
 		return nil, fmt.Errorf("write reload request: %w", err)
 	}
 	if timeout == 0 {
@@ -165,6 +247,10 @@ func RequestReload(ctx context.Context, runDir string, timeout time.Duration) (*
 			}
 		}
 	}
+}
+
+func detachForStop(ctx context.Context, opts Options, runDir string) (*reconcile.Result, error) {
+	return reconcile.Detach(ctx, reconcile.Options{ConfigPath: opts.ConfigPath, RunDir: runDir, Offline: opts.Offline, DryRun: opts.DryRun})
 }
 
 func ReadStatus(runDir string) (*Status, error) {

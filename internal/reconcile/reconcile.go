@@ -10,12 +10,14 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
 	"github.com/syx0310/wg-mix-ebpf/internal/guard"
+	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/runtime"
 	"github.com/syx0310/wg-mix-ebpf/internal/underlay"
 )
 
 type Options struct {
 	ConfigPath string
+	RunDir     string
 	Offline    bool
 	DryRun     bool
 }
@@ -36,22 +38,50 @@ type Result struct {
 }
 
 func BuildState(ctx context.Context, opts Options) (*config.Config, *control.State, error) {
+	cfg, err := loadConfig(opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	state, err := buildStateFromConfig(ctx, cfg, opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	return cfg, state, nil
+}
+
+func BuildGuardState(ctx context.Context, opts Options) (*config.Config, *control.State, error) {
+	cfg, err := loadConfig(opts)
+	if err != nil {
+		return nil, nil, err
+	}
+	state, err := control.BuildState(ctx, cfg, runtime.NewSystemProvider(), underlay.NewSystemResolver(), nil, control.BuildOptions{Offline: true})
+	if err != nil {
+		return nil, nil, err
+	}
+	return cfg, state, nil
+}
+
+func loadConfig(opts Options) (*config.Config, error) {
 	path := opts.ConfigPath
 	if path == "" {
 		path = config.DefaultConfigPath
 	}
 	cfg, err := config.LoadFile(path)
 	if err != nil {
-		return nil, nil, fmt.Errorf("load config %s: %w", path, err)
+		return nil, fmt.Errorf("load config %s: %w", path, err)
 	}
+	return cfg, nil
+}
+
+func buildStateFromConfig(ctx context.Context, cfg *config.Config, opts Options) (*control.State, error) {
 	state, err := control.BuildState(ctx, cfg, runtime.NewSystemProvider(), underlay.NewSystemResolver(), nil, control.BuildOptions{Offline: opts.Offline})
 	if err != nil {
 		if control.IsUnsupportedRuntime(err) && !opts.Offline {
-			return nil, nil, fmt.Errorf("%w (use --offline for static validation on this platform)", err)
+			return nil, fmt.Errorf("%w (use --offline for static validation on this platform)", err)
 		}
-		return nil, nil, err
+		return nil, err
 	}
-	return cfg, state, nil
+	return state, nil
 }
 
 func Validate(ctx context.Context, opts Options) (*Result, error) {
@@ -77,26 +107,43 @@ func Status(ctx context.Context, opts Options) (*Result, error) {
 }
 
 func Reload(ctx context.Context, opts Options) (*Result, error) {
-	cfg, state, err := BuildState(ctx, opts)
+	if opts.RunDir != "" && !opts.DryRun {
+		var result *Result
+		err := lockfile.WithLock(ctx, opts.RunDir, func() error {
+			var err error
+			result, err = reloadUnlocked(ctx, opts)
+			return err
+		})
+		return result, err
+	}
+	return reloadUnlocked(ctx, opts)
+}
+
+func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
+	cfg, guardState, err := BuildGuardState(ctx, opts)
+	if err != nil {
+		return nil, err
+	}
+	guardApplied := false
+	if !opts.DryRun && shouldApplyStartupGuard(cfg) {
+		plan := guard.BuildNftPlan(guardState)
+		if err := guard.NewCommandExecutor().Apply(ctx, plan); err != nil {
+			return nil, fmt.Errorf("apply startup guard: %w", err)
+		}
+		guardApplied = true
+	}
+	_, state, err := BuildState(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
 	result := &Result{ConfigPath: configPath(opts), Time: time.Now(), Action: "reload", State: state, DryRun: opts.DryRun}
 	if opts.DryRun {
 		if shouldApplyStartupGuard(cfg) {
-			result.GuardScript = guard.BuildNftPlan(state).Script()
+			result.GuardScript = guard.BuildNftPlan(guardState).Script()
 		}
 		return result, nil
 	}
-	guardApplied := false
-	if shouldApplyStartupGuard(cfg) {
-		plan := guard.BuildNftPlan(state)
-		if err := guard.NewCommandExecutor().Apply(ctx, plan); err != nil {
-			return nil, fmt.Errorf("apply startup guard: %w", err)
-		}
-		guardApplied = true
-		result.GuardApplied = true
-	}
+	result.GuardApplied = guardApplied
 	if err := dataplane.NewLoader().Apply(ctx, state); err != nil {
 		return nil, err
 	}
@@ -110,6 +157,19 @@ func Reload(ctx context.Context, opts Options) (*Result, error) {
 }
 
 func Detach(ctx context.Context, opts Options) (*Result, error) {
+	if opts.RunDir != "" && !opts.DryRun {
+		var result *Result
+		err := lockfile.WithLock(ctx, opts.RunDir, func() error {
+			var err error
+			result, err = detachUnlocked(ctx, opts)
+			return err
+		})
+		return result, err
+	}
+	return detachUnlocked(ctx, opts)
+}
+
+func detachUnlocked(ctx context.Context, opts Options) (*Result, error) {
 	_, state, err := BuildState(ctx, opts)
 	if err != nil {
 		return nil, err
@@ -125,7 +185,7 @@ func Detach(ctx context.Context, opts Options) (*Result, error) {
 }
 
 func GuardPlan(ctx context.Context, opts Options) (*Result, error) {
-	_, state, err := BuildState(ctx, opts)
+	_, state, err := BuildGuardState(ctx, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -140,7 +200,7 @@ func GuardPlan(ctx context.Context, opts Options) (*Result, error) {
 }
 
 func GuardApply(ctx context.Context, opts Options) (*Result, error) {
-	_, state, err := BuildState(ctx, opts)
+	_, state, err := BuildGuardState(ctx, opts)
 	if err != nil {
 		return nil, err
 	}

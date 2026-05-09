@@ -13,6 +13,7 @@ init
 profile
 reload
 status
+stop
 uninstall
 ```
 
@@ -101,6 +102,8 @@ If the daemon is running, `reload` writes a reload request and waits for daemon 
 
 Reload uses generation-scoped maps. New entries are prepared under a new generation, then `active_generation` is committed, and stale generations are cleaned afterward.
 
+Reload and detach operations are serialized with a file lock under the runtime directory. This prevents daemon reconcile, manual reload, manual detach, service stop, and uninstall cleanup from racing with each other.
+
 ## Status
 
 `status` reports config, runtime, attach, generation, and stats state:
@@ -138,6 +141,14 @@ OpenWrt:
 
 If WireGuard continues running after service stop, it may send standard WireGuard type words because the transparent transform is no longer attached.
 
+Service stop calls:
+
+```bash
+wg-mix-ebpf stop --config /etc/wg-mix-ebpf/config.yaml
+```
+
+When the daemon is alive, `stop` requests the daemon to stop polling, detach dataplane under the shared lock, write stopped status, and exit. If the daemon is not alive, `stop` falls back to one-shot detach.
+
 ## Uninstall
 
 Default uninstall removes network-impacting state but keeps configuration:
@@ -155,3 +166,7 @@ sudo wg-mix-ebpf uninstall --purge
 ```
 
 The binary and WireGuard configuration are not deleted by either form.
+
+`--purge` refuses custom config paths whose parent directory is not the owned config directory. For example, `--config /etc/wg-mix-ebpf.yaml --purge` is rejected rather than deleting `/etc`.
+
+If the binary was installed manually, remove it manually after uninstall. If it was installed by a package manager, remove it with that package manager.

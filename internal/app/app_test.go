@@ -100,6 +100,20 @@ func TestGuardCleanupDryRun(t *testing.T) {
 	}
 }
 
+func TestStopFallbackDetachDryRunOffline(t *testing.T) {
+	cfgPath := writeTestConfig(t, "[Interface]\nFwMark = 0x10000002\n")
+	runDir := filepath.Join(t.TempDir(), "run")
+	var stdout, stderr bytes.Buffer
+	if err := Run(t.Context(), []string{"stop", "--config", cfgPath, "--run-dir", runDir}, &stdout, &stderr); err == nil {
+		t.Fatal("stop fallback without --offline should fail on non-Linux or missing runtime")
+	}
+	stdout.Reset()
+	stderr.Reset()
+	if err := Run(t.Context(), []string{"detach", "--config", cfgPath, "--offline", "--dry-run", "--run-dir", runDir}, &stdout, &stderr); err != nil {
+		t.Fatalf("detach dry-run offline failed: %v stderr=%s", err, stderr.String())
+	}
+}
+
 func writeTestConfig(t *testing.T, wgConfig string) string {
 	t.Helper()
 	dir := t.TempDir()
