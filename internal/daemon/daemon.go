@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,6 +29,7 @@ const (
 type Options struct {
 	ConfigPath   string
 	RunDir       string
+	StateDir     string
 	PollInterval time.Duration
 	Once         bool
 	Offline      bool
@@ -43,6 +45,7 @@ type Status struct {
 	LastErrorTime time.Time         `json:"last_error_time,omitempty"`
 	LastError     string            `json:"last_error,omitempty"`
 	LastResult    *reconcile.Result `json:"last_result,omitempty"`
+	NeedReload    bool              `json:"need_reload,omitempty"`
 }
 
 func Run(ctx context.Context, opts Options) error {
@@ -72,9 +75,22 @@ func Run(ctx context.Context, opts Options) error {
 
 	lastRequest := requestStamp(runDir)
 	lastFingerprint := ""
+	lastConfigHash := ""
 	runOnce := func(reason string) {
+		currentConfigHash := fileHash(configPath(opts.ConfigPath))
+		if (reason == "poll" || reason == "runtime-event") && lastConfigHash != "" && currentConfigHash != "" && currentConfigHash != lastConfigHash {
+			status.PID = os.Getpid()
+			status.ConfigPath = configPath(opts.ConfigPath)
+			status.State = "config_changed"
+			status.NeedReload = true
+			status.LastReason = reason
+			status.LastError = "config file changed; run wg-mix-ebpf reload or systemctl reload wg-mix-ebpf to apply"
+			status.LastErrorTime = time.Now()
+			_ = writeStatus(runDir, status)
+			return
+		}
 		if reason == "poll" && lastFingerprint != "" {
-			result, err := reconcile.Validate(ctx, reconcile.Options{ConfigPath: opts.ConfigPath, Offline: opts.Offline})
+			result, err := reconcile.Validate(ctx, reconcile.Options{ConfigPath: opts.ConfigPath, RunDir: runDir, StateDir: opts.StateDir, Offline: opts.Offline})
 			if err == nil {
 				fp := stateFingerprint(result)
 				if fp == lastFingerprint {
@@ -86,6 +102,7 @@ func Run(ctx context.Context, opts Options) error {
 					status.State = "active"
 					status.LastReason = "poll-noop"
 					status.LastError = ""
+					status.NeedReload = false
 					status.LastResult = result
 					_ = writeStatus(runDir, status)
 					return
@@ -93,7 +110,7 @@ func Run(ctx context.Context, opts Options) error {
 			}
 		}
 	forceReload:
-		result, err := reconcile.Reload(ctx, reconcile.Options{ConfigPath: opts.ConfigPath, RunDir: runDir, Offline: opts.Offline, DryRun: opts.DryRun})
+		result, err := reconcile.Reload(ctx, reconcile.Options{ConfigPath: opts.ConfigPath, RunDir: runDir, StateDir: opts.StateDir, Offline: opts.Offline, DryRun: opts.DryRun})
 		status.PID = os.Getpid()
 		status.ConfigPath = configPath(opts.ConfigPath)
 		status.LastReason = reason
@@ -104,9 +121,11 @@ func Run(ctx context.Context, opts Options) error {
 		} else {
 			status.State = "active"
 			status.LastError = ""
+			status.NeedReload = false
 			status.LastSuccess = time.Now()
 			status.LastResult = result
 			lastFingerprint = stateFingerprint(result)
+			lastConfigHash = currentConfigHash
 		}
 		_ = writeStatus(runDir, status)
 	}
@@ -164,7 +183,11 @@ func Run(ctx context.Context, opts Options) error {
 						return nil
 					}
 				}
-				runOnce("reload-request")
+				if strings.HasPrefix(stamp, "reload:") {
+					runOnce("reload-request")
+				} else {
+					runOnce("runtime-event")
+				}
 			}
 		case <-ticker.C:
 			runOnce("poll")
@@ -196,12 +219,12 @@ func dataplaneHealthy(ctx context.Context, state *control.State) bool {
 	return true
 }
 
-func RequestReload(ctx context.Context, runDir string, timeout time.Duration) (*Status, error) {
-	return writeRequestAndWait(ctx, runDir, "reload", timeout)
+func RequestReload(ctx context.Context, runDir string, expectedConfigPath string, timeout time.Duration) (*Status, error) {
+	return writeRequestAndWait(ctx, runDir, "reload", expectedConfigPath, timeout)
 }
 
-func RequestStop(ctx context.Context, runDir string, timeout time.Duration) (*Status, error) {
-	status, err := writeRequestAndWait(ctx, runDir, "stop", timeout)
+func RequestStop(ctx context.Context, runDir string, expectedConfigPath string, timeout time.Duration) (*Status, error) {
+	status, err := writeRequestAndWait(ctx, runDir, "stop", expectedConfigPath, timeout)
 	if err != nil {
 		return status, err
 	}
@@ -211,9 +234,12 @@ func RequestStop(ctx context.Context, runDir string, timeout time.Duration) (*St
 	return status, nil
 }
 
-func writeRequestAndWait(ctx context.Context, runDir string, kind string, timeout time.Duration) (*Status, error) {
+func writeRequestAndWait(ctx context.Context, runDir string, kind string, expectedConfigPath string, timeout time.Duration) (*Status, error) {
 	dir := runDirOrDefault(runDir)
 	before, _ := ReadStatus(dir)
+	if err := ValidateConfigPathForRequest(before, expectedConfigPath, kind); err != nil {
+		return before, err
+	}
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return nil, fmt.Errorf("create run dir: %w", err)
 	}
@@ -249,8 +275,18 @@ func writeRequestAndWait(ctx context.Context, runDir string, kind string, timeou
 	}
 }
 
+func ValidateConfigPathForRequest(status *Status, expectedConfigPath string, kind string) error {
+	if status == nil || expectedConfigPath == "" {
+		return nil
+	}
+	if filepath.Clean(status.ConfigPath) != filepath.Clean(configPath(expectedConfigPath)) {
+		return fmt.Errorf("daemon is running with config %s, refusing %s request for %s", status.ConfigPath, kind, configPath(expectedConfigPath))
+	}
+	return nil
+}
+
 func detachForStop(ctx context.Context, opts Options, runDir string) (*reconcile.Result, error) {
-	return reconcile.Detach(ctx, reconcile.Options{ConfigPath: opts.ConfigPath, RunDir: runDir, Offline: opts.Offline, DryRun: opts.DryRun})
+	return reconcile.Stop(ctx, reconcile.Options{ConfigPath: opts.ConfigPath, RunDir: runDir, StateDir: opts.StateDir, Offline: opts.Offline, DryRun: opts.DryRun})
 }
 
 func ReadStatus(runDir string) (*Status, error) {
@@ -308,6 +344,15 @@ func stateFingerprint(result *reconcile.Result) string {
 		return ""
 	}
 	return string(data)
+}
+
+func fileHash(path string) string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return ""
+	}
+	sum := sha256.Sum256(data)
+	return fmt.Sprintf("%x", sum[:])
 }
 
 func pollIntervalFromConfig(path string) time.Duration {

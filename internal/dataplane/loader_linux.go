@@ -128,6 +128,42 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
 	return nil
 }
 
+func (l LinuxLoader) DetachStale(ctx context.Context, previous *control.State, current *control.State) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if previous == nil {
+		return nil
+	}
+	currentIfindexes := make(map[int]struct{})
+	if current != nil {
+		for _, u := range current.Underlays {
+			if !u.Resolved || u.IfIndex == 0 || u.Role == "disabled" {
+				continue
+			}
+			currentIfindexes[u.IfIndex] = struct{}{}
+		}
+	}
+	var errs []error
+	seen := make(map[int]struct{})
+	for _, u := range previous.Underlays {
+		if !u.Resolved || u.IfIndex == 0 {
+			continue
+		}
+		if _, ok := currentIfindexes[u.IfIndex]; ok {
+			continue
+		}
+		if _, ok := seen[u.IfIndex]; ok {
+			continue
+		}
+		seen[u.IfIndex] = struct{}{}
+		if err := detachPrograms(u.IfIndex); err != nil {
+			errs = append(errs, fmt.Errorf("detach stale underlay %s(%d): %w", u.Name, u.IfIndex, err))
+		}
+	}
+	return errors.Join(errs...)
+}
+
 func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 	if err := ctx.Err(); err != nil {
 		return err
@@ -384,6 +420,9 @@ func replaceBpfFilter(link netlink.Link, parent uint32, handle uint32, name stri
 func detachPrograms(ifindex int) error {
 	link, err := netlink.LinkByIndex(ifindex)
 	if err != nil {
+		if isNotFound(err) {
+			return nil
+		}
 		return err
 	}
 	return errors.Join(

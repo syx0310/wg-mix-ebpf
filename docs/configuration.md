@@ -308,6 +308,8 @@ runtime:
 
 `poll_interval` controls the daemon's low-frequency runtime reconcile loop. Manual commands still rebuild state when invoked.
 
+The daemon does not automatically apply config file content changes observed by the poll loop. It marks status as `config_changed` / `need_reload` and waits for explicit `wg-mix-ebpf reload` or service reload. Local runtime changes such as WireGuard ListenPort, FirewallMark, and underlay ifindex remain automatically reconciled.
+
 `require_nonzero_fwmark: true` rejects managed interfaces with config or runtime `FwMark = 0/off`.
 
 `require_nonzero_fwmark: false` is reserved but not implemented by the MVP. Managed WireGuard interfaces must use nonzero marks so egress fail-closed logic does not treat ordinary `mark=0` UDP traffic as managed WireGuard traffic.
@@ -338,6 +340,8 @@ none
 ```
 
 `nft-temporary-drop` installs temporary nft rules before dataplane reload and removes them after successful reload. If reload fails after the guard is applied, the guard remains in place.
+
+`wg-mix-ebpf stop`, service stop, and uninstall remove the nft guard table as part of network-impact cleanup. `guard-cleanup` can be used to remove a leftover guard explicitly.
 
 The nft cleanup step is best effort and runs separately from rule creation. Missing guard tables are ignored so older nftables versions do not abort startup guard creation before dataplane attach.
 

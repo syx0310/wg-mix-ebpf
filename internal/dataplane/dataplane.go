@@ -20,3 +20,8 @@ type Loader interface {
 	Apply(ctx context.Context, state *control.State) error
 	Detach(ctx context.Context, state *control.State) error
 }
+
+type AttachStateLoader interface {
+	Loader
+	DetachStale(ctx context.Context, previous *control.State, current *control.State) error
+}

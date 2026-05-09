@@ -22,6 +22,10 @@ func (UnsupportedLoader) Detach(context.Context, *control.State) error {
 	return ErrUnsupported
 }
 
+func (UnsupportedLoader) DetachStale(context.Context, *control.State, *control.State) error {
+	return ErrUnsupported
+}
+
 func LoadObjectTest(context.Context, string) error {
 	return ErrUnsupported
 }

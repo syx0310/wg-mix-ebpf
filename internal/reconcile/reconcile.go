@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"time"
 
+	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
@@ -18,6 +20,7 @@ import (
 type Options struct {
 	ConfigPath string
 	RunDir     string
+	StateDir   string
 	Offline    bool
 	DryRun     bool
 }
@@ -29,6 +32,7 @@ type Result struct {
 	State           *control.State          `json:"state,omitempty"`
 	Dataplane       *dataplane.KernelStatus `json:"dataplane,omitempty"`
 	DataplaneError  string                  `json:"dataplane_error,omitempty"`
+	AttachStatePath string                  `json:"attach_state_path,omitempty"`
 	GuardApplied    bool                    `json:"guard_applied,omitempty"`
 	GuardCleaned    bool                    `json:"guard_cleaned,omitempty"`
 	GuardScript     string                  `json:"guard_script,omitempty"`
@@ -136,7 +140,7 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	result := &Result{ConfigPath: configPath(opts), Time: time.Now(), Action: "reload", State: state, DryRun: opts.DryRun}
+	result := &Result{ConfigPath: configPath(opts), Time: time.Now(), Action: "reload", State: state, DryRun: opts.DryRun, AttachStatePath: attachstate.Path(opts.StateDir)}
 	if opts.DryRun {
 		if shouldApplyStartupGuard(cfg) {
 			result.GuardScript = guard.BuildNftPlan(guardState).Script()
@@ -145,6 +149,18 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 	}
 	result.GuardApplied = guardApplied
 	if err := dataplane.NewLoader().Apply(ctx, state); err != nil {
+		return nil, err
+	}
+	if previous, err := attachstate.Load(opts.StateDir); err == nil {
+		if staleLoader, ok := dataplane.NewLoader().(dataplane.AttachStateLoader); ok {
+			if err := staleLoader.DetachStale(ctx, attachstate.ToControlState(previous), state); err != nil {
+				return nil, fmt.Errorf("detach stale underlays: %w", err)
+			}
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	if err := attachstate.Save(opts.StateDir, attachstate.FromControlState(configPath(opts), state)); err != nil {
 		return nil, err
 	}
 	if guardApplied {
@@ -170,19 +186,85 @@ func Detach(ctx context.Context, opts Options) (*Result, error) {
 }
 
 func detachUnlocked(ctx context.Context, opts Options) (*Result, error) {
-	_, state, err := BuildState(ctx, opts)
-	if err != nil {
-		return nil, err
+	state, stateErr := detachState(ctx, opts)
+	if stateErr != nil {
+		if opts.DryRun && errors.Is(stateErr, errNoDetachUnderlays) {
+			state = &control.State{}
+		} else {
+			return nil, stateErr
+		}
 	}
-	result := &Result{ConfigPath: configPath(opts), Time: time.Now(), Action: "detach", State: state, DryRun: opts.DryRun}
+	result := &Result{ConfigPath: configPath(opts), Time: time.Now(), Action: "detach", State: state, DryRun: opts.DryRun, AttachStatePath: attachstate.Path(opts.StateDir)}
 	if opts.DryRun {
 		return result, nil
 	}
 	if err := dataplane.NewLoader().Detach(ctx, state); err != nil {
 		return nil, err
 	}
+	if err := attachstate.Remove(opts.StateDir); err != nil {
+		return nil, err
+	}
 	return result, nil
 }
+
+func Stop(ctx context.Context, opts Options) (*Result, error) {
+	if opts.RunDir != "" && !opts.DryRun {
+		var result *Result
+		err := lockfile.WithLock(ctx, opts.RunDir, func() error {
+			var err error
+			result, err = stopUnlocked(ctx, opts)
+			return err
+		})
+		return result, err
+	}
+	return stopUnlocked(ctx, opts)
+}
+
+func stopUnlocked(ctx context.Context, opts Options) (*Result, error) {
+	result, err := detachUnlocked(ctx, opts)
+	if err != nil && !errors.Is(err, errNoDetachUnderlays) {
+		return nil, err
+	}
+	if result == nil {
+		result = &Result{ConfigPath: configPath(opts), Time: time.Now(), State: &control.State{}, DryRun: opts.DryRun, AttachStatePath: attachstate.Path(opts.StateDir)}
+	}
+	result.Action = "stop"
+	if opts.DryRun {
+		result.GuardCleanup = guard.CleanupScript()
+		return result, nil
+	}
+	if err := guard.NewCommandExecutor().Cleanup(ctx); err != nil {
+		return nil, fmt.Errorf("cleanup startup guard during stop: %w", err)
+	}
+	result.GuardCleaned = true
+	return result, nil
+}
+
+func detachState(ctx context.Context, opts Options) (*control.State, error) {
+	var states []*control.State
+	if saved, err := attachstate.Load(opts.StateDir); err == nil {
+		states = append(states, attachstate.ToControlState(saved))
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return nil, err
+	}
+	_, current, err := BuildState(ctx, opts)
+	if err == nil {
+		states = append(states, current)
+	} else if len(states) == 0 {
+		_, offline, offlineErr := BuildGuardState(ctx, opts)
+		if offlineErr != nil {
+			return nil, fmt.Errorf("build detach state failed: runtime=%v offline=%v", err, offlineErr)
+		}
+		states = append(states, offline)
+	}
+	merged := attachstate.MergeControlStates(states...)
+	if len(merged.Underlays) == 0 {
+		return nil, errNoDetachUnderlays
+	}
+	return merged, nil
+}
+
+var errNoDetachUnderlays = errors.New("no underlays available for detach")
 
 func GuardPlan(ctx context.Context, opts Options) (*Result, error) {
 	_, state, err := BuildGuardState(ctx, opts)
