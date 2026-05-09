@@ -88,6 +88,14 @@ OpenWrt hotplug reload request
 manual reload request
 ```
 
+Config file changes are not applied automatically by the low-frequency poll loop. When the daemon notices a config content change during poll/runtime handling, it reports `config_changed` and `need_reload` in status. Apply config changes explicitly:
+
+```bash
+sudo wg-mix-ebpf reload
+```
+
+This keeps runtime changes automatic while making profile and underlay edits operator-controlled.
+
 It does not update dataplane maps for peer endpoint, handshake time, transfer counter, or DDNS changes.
 
 ## Reload
@@ -147,7 +155,9 @@ Service stop calls:
 wg-mix-ebpf stop --config /etc/wg-mix-ebpf/config.yaml
 ```
 
-When the daemon is alive, `stop` requests the daemon to stop polling, detach dataplane under the shared lock, write stopped status, and exit. If the daemon is not alive, `stop` falls back to one-shot detach.
+When the daemon is alive, `stop` requests the daemon to stop polling, detach dataplane under the shared lock, remove the nft startup guard table, write stopped status, and exit. If the daemon is not alive, `stop` falls back to one-shot stop cleanup.
+
+Dataplane cleanup uses `/var/lib/wg-mix-ebpf/attach-state.json` when available. This lets `stop`, `detach`, and `uninstall` remove TC filters even if the WireGuard interface was already stopped or deleted.
 
 ## Uninstall
 
@@ -157,7 +167,7 @@ Default uninstall removes network-impacting state but keeps configuration:
 sudo wg-mix-ebpf uninstall
 ```
 
-It stops the service, detaches this agent's TC filters, removes BPF pins, removes the nft guard table, removes runtime/state/service files, and leaves `/etc/wg-mix-ebpf/config.yaml` in place.
+It stops the service, detaches this agent's TC filters using attach-state when available, removes BPF pins, removes the nft guard table, removes runtime/state/service files, and leaves `/etc/wg-mix-ebpf/config.yaml` in place.
 
 To remove the config directory too:
 

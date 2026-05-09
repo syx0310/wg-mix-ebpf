@@ -100,7 +100,9 @@ func Install(ctx context.Context, opts Options) (*Plan, error) {
 		if err := os.WriteFile(filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"), []byte(systemdUnit(paths.ConfigPath, paths.BinaryPath)), 0o644); err != nil {
 			return nil, err
 		}
-		_ = runCommand(ctx, "systemctl", "daemon-reload")
+		if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+			return nil, err
+		}
 		if opts.Enable {
 			if err := runCommand(ctx, "systemctl", "enable", "wg-mix-ebpf.service"); err != nil {
 				return nil, err
@@ -137,7 +139,7 @@ func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
 	plan := &Plan{System: system, ConfigPath: paths.ConfigPath, BinaryPath: paths.BinaryPath}
 	add := func(format string, args ...any) { plan.Actions = append(plan.Actions, fmt.Sprintf(format, args...)) }
 	add("stop wg-mix-ebpf service if present")
-	add("detach dataplane for configured underlays if config is valid")
+	add("detach dataplane using attach-state when available, with config fallback")
 	add("remove BPF pins under %s", paths.PinPath)
 	add("remove nft startup guard table")
 	add("remove runtime dir %s", paths.RunDir)
@@ -182,7 +184,7 @@ func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
 	}
 	if err := lockfile.WithLock(ctx, paths.RunDir, func() error {
 		if exists(paths.ConfigPath) {
-			if _, err := reconcile.Detach(ctx, reconcile.Options{ConfigPath: paths.ConfigPath}); err != nil {
+			if _, err := reconcile.Stop(ctx, reconcile.Options{ConfigPath: paths.ConfigPath, RunDir: paths.RunDir, StateDir: paths.VarLibDir}); err != nil {
 				return fmt.Errorf("detach dataplane: %w", err)
 			}
 		}

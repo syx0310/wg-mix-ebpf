@@ -237,6 +237,8 @@ status file updates under /run/wg-mix-ebpf
 
 Poll reconcile intentionally ignores peer endpoint, handshake, and transfer counter changes. Those values are status-only metadata and do not enter dataplane maps.
 
+Poll reconcile also treats config file changes as operator-controlled changes. If the daemon notices that the config file content changed during a poll/runtime event, it records `config_changed` / `need_reload` in daemon status and waits for explicit `wg-mix-ebpf reload` or service reload. This avoids accidentally applying profile or underlay changes while the operator is still editing the file.
+
 The daemon does not:
 
 ```text
@@ -248,13 +250,17 @@ update dataplane maps when only peer endpoint/handshake/counters change
 
 `systemctl stop wg-mix-ebpf` or OpenWrt service stop detaches this agent's TC filters. If WireGuard keeps running after that, it may send standard WireGuard type words.
 
-Service stop is routed through `wg-mix-ebpf stop`. If the daemon is running, the command asks the daemon to acquire the shared lock, stop polling/reloading, detach dataplane, write stopped status, and exit. If the daemon is not running, it performs one-shot detach.
+Service stop is routed through `wg-mix-ebpf stop`. If the daemon is running, the command asks the daemon to acquire the shared lock, stop polling/reloading, detach dataplane, remove the nft startup guard table, write stopped status, and exit. If the daemon is not running, it performs one-shot stop cleanup.
 
-`uninstall` stops the service, detaches this agent's dataplane, removes BPF pins, removes the nft guard table, and removes runtime/state/service files. It keeps `/etc/wg-mix-ebpf/config.yaml` by default; `--purge` removes the config directory. It does not delete the binary or WireGuard configuration.
+Successful dataplane reload writes persistent attach metadata to `/var/lib/wg-mix-ebpf/attach-state.json`. Stop, detach, and uninstall use this file first, so cleanup does not depend on the WireGuard interface still existing. Reload also compares the previous attach state with the current desired state and detaches stale underlay ifindexes that disappeared from config or changed after reconnect.
+
+`uninstall` stops the service, detaches this agent's dataplane using attach-state when available, removes BPF pins, removes the nft guard table, and removes runtime/state/service files. It keeps `/etc/wg-mix-ebpf/config.yaml` by default; `--purge` removes the config directory. It does not delete the binary or WireGuard configuration.
 
 `uninstall --purge` only removes the owned config directory. It refuses to purge arbitrary parent directories from custom `--config` paths.
 
 Poll no-op optimization checks desired state and dataplane health. If pinned maps or expected TC filters are missing, the daemon forces reconcile instead of reporting active from desired state alone.
+
+Manual reload and stop requests sent to a running daemon must target the daemon's active config path. If a user passes `--config` for a different file, the request is rejected instead of silently reloading the daemon's original config.
 
 ## Build Model
 
