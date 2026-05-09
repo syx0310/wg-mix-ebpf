@@ -308,7 +308,9 @@ runtime:
 
 `poll_interval` controls the daemon's low-frequency runtime reconcile loop. Manual commands still rebuild state when invoked.
 
-`require_nonzero_fwmark: true` rejects managed interfaces with runtime `FirewallMark = 0`.
+`require_nonzero_fwmark: true` rejects managed interfaces with config or runtime `FwMark = 0/off`.
+
+`require_nonzero_fwmark: false` is reserved but not implemented by the MVP. Managed WireGuard interfaces must use nonzero marks so egress fail-closed logic does not treat ordinary `mark=0` UDP traffic as managed WireGuard traffic.
 
 `strict_runtime_fwmark: true` requires the WireGuard config mark and runtime mark to match.
 

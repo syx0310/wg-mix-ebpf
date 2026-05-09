@@ -328,6 +328,9 @@ func (c *Config) ValidateStatic() error {
 	if c.Runtime.AllowZeroFwmarkFallback {
 		return errors.New("runtime.allow_zero_fwmark_fallback is reserved but not implemented in MVP")
 	}
+	if !c.Runtime.RequireNonzeroFwmark {
+		return errors.New("runtime.require_nonzero_fwmark=false is reserved but not implemented in MVP")
+	}
 	if err := validateUniqueUnderlays(c.Underlays); err != nil {
 		return err
 	}

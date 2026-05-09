@@ -527,6 +527,7 @@ static __always_inline int update_type_word(struct __sk_buff *skb, struct packet
 					    int recompute_checksum)
 {
 	__u64 store_flags = BPF_F_INVALIDATE_HASH;
+	__u64 csum_flags = 0;
 	__u32 csum_off = info->udp_off + offsetof(struct udphdr, check);
 	__s64 diff;
 
@@ -538,7 +539,9 @@ static __always_inline int update_type_word(struct __sk_buff *skb, struct packet
 				     (__be32 *)&new_wire, sizeof(new_wire), 0);
 		if (diff < 0)
 			return -1;
-		if (bpf_l4_csum_replace(skb, csum_off, 0, diff, 0) < 0)
+		if (info->family == FAMILY_IPV6)
+			csum_flags |= BPF_F_IPV6;
+		if (bpf_l4_csum_replace(skb, csum_off, 0, diff, csum_flags) < 0)
 			return -1;
 	}
 	if (bpf_skb_store_bytes(skb, info->payload_off, &new_wire, sizeof(new_wire),

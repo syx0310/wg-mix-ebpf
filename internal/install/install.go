@@ -14,6 +14,7 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/daemon"
 	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
 	"github.com/syx0310/wg-mix-ebpf/internal/guard"
+	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/reconcile"
 	"github.com/syx0310/wg-mix-ebpf/internal/runtime"
 )
@@ -148,11 +149,15 @@ func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
 		add("remove OpenWrt init/hotplug scripts")
 	}
 	if opts.Purge {
-		add("purge config dir %s", filepath.Dir(paths.ConfigPath))
+		if err := validatePurgeDir(paths); err != nil {
+			return nil, err
+		}
+		add("purge owned config dir %s", filepath.Dir(paths.ConfigPath))
 	} else {
 		add("keep config %s", paths.ConfigPath)
 	}
 	add("keep binary %s", paths.BinaryPath)
+	add("binary removal hint: remove %s manually or with the package manager that installed it", paths.BinaryPath)
 	if opts.DryRun {
 		return plan, nil
 	}
@@ -161,28 +166,62 @@ func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
 	}
 	switch system {
 	case "systemd":
-		_ = runCommand(ctx, "systemctl", "stop", "wg-mix-ebpf.service")
+		unitPath := filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service")
+		if exists(unitPath) {
+			if err := runCommand(ctx, "systemctl", "stop", "wg-mix-ebpf.service"); err != nil {
+				return nil, err
+			}
+		}
 	case "openwrt":
-		_ = runCommand(ctx, filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf"), "stop")
+		initPath := filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf")
+		if exists(initPath) {
+			if err := runCommand(ctx, initPath, "stop"); err != nil {
+				return nil, err
+			}
+		}
 	}
-	if _, err := reconcile.Detach(ctx, reconcile.Options{ConfigPath: paths.ConfigPath}); err != nil {
-		// Config may already be gone or invalid; continue with ownership-scoped cleanup.
-		plan.Actions = append(plan.Actions, "detach skipped: "+err.Error())
+	if err := lockfile.WithLock(ctx, paths.RunDir, func() error {
+		if exists(paths.ConfigPath) {
+			if _, err := reconcile.Detach(ctx, reconcile.Options{ConfigPath: paths.ConfigPath}); err != nil {
+				return fmt.Errorf("detach dataplane: %w", err)
+			}
+		}
+		if err := guard.NewCommandExecutor().Cleanup(ctx); err != nil {
+			return fmt.Errorf("cleanup startup guard: %w", err)
+		}
+		if err := os.RemoveAll(paths.PinPath); err != nil {
+			return fmt.Errorf("remove BPF pins %s: %w", paths.PinPath, err)
+		}
+		if err := os.RemoveAll(paths.VarLibDir); err != nil {
+			return fmt.Errorf("remove state dir %s: %w", paths.VarLibDir, err)
+		}
+		switch system {
+		case "systemd":
+			if err := removeIfExists(filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service")); err != nil {
+				return err
+			}
+			if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+				return err
+			}
+		case "openwrt":
+			if err := removeIfExists(filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf")); err != nil {
+				return err
+			}
+			if err := removeIfExists(filepath.Join(paths.OpenWrtHotplugDir, "90-wg-mix-ebpf")); err != nil {
+				return err
+			}
+		}
+		if opts.Purge {
+			if err := os.RemoveAll(filepath.Dir(paths.ConfigPath)); err != nil {
+				return fmt.Errorf("purge config dir %s: %w", filepath.Dir(paths.ConfigPath), err)
+			}
+		}
+		return nil
+	}); err != nil {
+		return nil, err
 	}
-	_ = guard.NewCommandExecutor().Cleanup(ctx)
-	_ = os.RemoveAll(paths.PinPath)
-	_ = os.RemoveAll(paths.RunDir)
-	_ = os.RemoveAll(paths.VarLibDir)
-	switch system {
-	case "systemd":
-		_ = os.Remove(filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"))
-		_ = runCommand(ctx, "systemctl", "daemon-reload")
-	case "openwrt":
-		_ = os.Remove(filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf"))
-		_ = os.Remove(filepath.Join(paths.OpenWrtHotplugDir, "90-wg-mix-ebpf"))
-	}
-	if opts.Purge {
-		_ = os.RemoveAll(filepath.Dir(paths.ConfigPath))
+	if err := os.RemoveAll(paths.RunDir); err != nil {
+		return nil, fmt.Errorf("remove runtime dir %s: %w", paths.RunDir, err)
 	}
 	return plan, nil
 }
@@ -258,6 +297,34 @@ func wireGuardAppearsRunning(ctx context.Context, configPath string) bool {
 	return false
 }
 
+func validatePurgeDir(paths paths) error {
+	configDir := filepath.Clean(filepath.Dir(paths.ConfigPath))
+	ownedDir := filepath.Clean(envOr(EnvEtcDir, "/etc/wg-mix-ebpf"))
+	if configDir != ownedDir {
+		return fmt.Errorf("refuse to purge non-owned config directory %s; only %s is managed by uninstall --purge", configDir, ownedDir)
+	}
+	switch configDir {
+	case "/", "/etc", "/tmp", "/var", "/usr", "/usr/sbin", "/run", "/var/lib":
+		return fmt.Errorf("refuse to purge unsafe config directory %s", configDir)
+	}
+	if configDir == "." || configDir == "" {
+		return fmt.Errorf("refuse to purge invalid config directory %q", configDir)
+	}
+	return nil
+}
+
+func exists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
+func removeIfExists(path string) error {
+	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("remove %s: %w", path, err)
+	}
+	return nil
+}
+
 func detectSystem(explicit string) string {
 	if explicit != "" {
 		return explicit
@@ -300,7 +367,7 @@ Wants=network-online.target
 Type=simple
 ExecStart=%s run --config %s
 ExecReload=%s reload --config %s
-ExecStop=%s detach --config %s --reason service-stop
+ExecStop=%s stop --config %s
 Restart=on-failure
 RestartSec=3s
 
@@ -332,7 +399,7 @@ reload_service() {
 }
 
 stop_service() {
-    %s detach --config "$CONF" --reason service-stop
+    %s stop --config "$CONF"
 }
 `, configPath, binaryPath, binaryPath, binaryPath)
 }
@@ -342,6 +409,12 @@ func openWrtHotplug() string {
 
 [ "$ACTION" = "ifup" ] || [ "$ACTION" = "ifupdate" ] || [ "$ACTION" = "ifdown" ] || exit 0
 mkdir -p /run/wg-mix-ebpf
-date +%s%N > /run/wg-mix-ebpf/reload.request
+{
+    cat /proc/uptime 2>/dev/null
+    echo "$$"
+    echo "$ACTION"
+    echo "$INTERFACE"
+    echo "$DEVICE"
+} > /run/wg-mix-ebpf/reload.request
 `
 }

@@ -211,7 +211,7 @@ func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.Wire
 		}
 		return nil, fmt.Errorf("wg %s fwmark policy %q is unsupported in MVP", wg.Name, cfg.FwmarkPolicy.Mode)
 	}
-	if *parsed.FwMark == 0 && cfg.Runtime.RequireNonzeroFwmark {
+	if *parsed.FwMark == 0 {
 		return nil, fmt.Errorf("wg %s config FwMark is zero/off", wg.Name)
 	}
 
@@ -238,7 +238,7 @@ func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.Wire
 	state.RuntimeFirewallMark = dev.FirewallMark
 	state.RuntimeListenPort = dev.ListenPort
 	state.RuntimeIfIndex = dev.IfIndex
-	if dev.FirewallMark == 0 && cfg.Runtime.RequireNonzeroFwmark {
+	if dev.FirewallMark == 0 {
 		return nil, fmt.Errorf("wg %s runtime FirewallMark is zero/off", wg.Name)
 	}
 	if cfg.Runtime.StrictRuntimeFwmark && dev.FirewallMark != *parsed.FwMark {

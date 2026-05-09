@@ -65,6 +65,8 @@ func RunWithIO(ctx context.Context, args []string, stdin io.Reader, stdout io.Wr
 		return runProfile(args[1:], stdout)
 	case "run":
 		return runDaemon(ctx, args[1:])
+	case "stop":
+		return runStop(ctx, args[1:], stdout)
 	case "bpf-load-test":
 		return runBPFLoadTest(ctx, args[1:], stdout)
 	case "validate", "status", "dump", "dump-abi", "reload", "detach", "guard-plan", "guard-apply", "guard-cleanup":
@@ -565,6 +567,29 @@ func runDaemon(ctx context.Context, args []string) error {
 	return daemon.Run(ctx, daemon.Options{ConfigPath: *configPath, RunDir: *runDir, Once: *once, Offline: *offline, DryRun: *dryRun})
 }
 
+func runStop(ctx context.Context, args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("stop", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	configPath := fs.String("config", config.DefaultConfigPath, "path to wg-mix-ebpf config")
+	runDir := fs.String("run-dir", "", "daemon runtime directory")
+	timeout := fs.Duration("timeout", 10*time.Second, "stop request timeout")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if status, err := daemon.ReadStatus(*runDir); err == nil && daemon.IsRunning(status) {
+		if _, err := daemon.RequestStop(ctx, *runDir, *timeout); err != nil {
+			return err
+		}
+		fmt.Fprintln(stdout, "daemon stopped and dataplane detached")
+		return nil
+	}
+	if _, err := reconcile.Detach(ctx, reconcile.Options{ConfigPath: *configPath, RunDir: daemonRunDir(*runDir)}); err != nil {
+		return err
+	}
+	fmt.Fprintln(stdout, "dataplane detached")
+	return nil
+}
+
 func runBPFLoadTest(ctx context.Context, args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("bpf-load-test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
@@ -595,7 +620,7 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	opts := reconcile.Options{ConfigPath: *configPath, Offline: *offline, DryRun: *dryRun}
+	opts := reconcile.Options{ConfigPath: *configPath, RunDir: daemonRunDir(*runDir), Offline: *offline, DryRun: *dryRun}
 
 	switch cmd {
 	case "validate":
@@ -605,19 +630,29 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 		fmt.Fprintln(stdout, "ok")
 	case "status", "dump":
 		if cmd == "status" {
-			result, err := reconcile.Status(ctx, opts)
-			if err != nil {
-				return err
-			}
 			view := struct {
-				Daemon    *daemon.Status `json:"daemon,omitempty"`
-				Desired   *control.State `json:"desired"`
-				Dataplane any            `json:"dataplane,omitempty"`
-				Error     string         `json:"dataplane_error,omitempty"`
-			}{Desired: result.State, Dataplane: result.Dataplane, Error: result.DataplaneError}
+				Daemon        *daemon.Status `json:"daemon,omitempty"`
+				Desired       *control.State `json:"desired,omitempty"`
+				Dataplane     any            `json:"dataplane,omitempty"`
+				Error         string         `json:"dataplane_error,omitempty"`
+				DesiredError  string         `json:"desired_error,omitempty"`
+				DataplaneNote string         `json:"dataplane_note,omitempty"`
+			}{}
 			if status, err := daemon.ReadStatus(*runDir); err == nil {
 				view.Daemon = status
 			}
+			result, err := reconcile.Status(ctx, opts)
+			if err != nil {
+				if view.Daemon == nil {
+					return err
+				}
+				view.DesiredError = err.Error()
+				view.DataplaneNote = "desired state unavailable; showing daemon status only"
+				return writeJSON(stdout, view)
+			}
+			view.Desired = result.State
+			view.Dataplane = result.Dataplane
+			view.Error = result.DataplaneError
 			return writeJSON(stdout, view)
 		}
 		result, err := reconcile.Validate(ctx, opts)
@@ -694,6 +729,16 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 		}
 	}
 	return nil
+}
+
+func daemonRunDir(path string) string {
+	if path != "" {
+		return path
+	}
+	if env := os.Getenv(daemon.EnvRunDir); env != "" {
+		return env
+	}
+	return daemon.DefaultRunDir
 }
 
 func loadOrTemplate(path string) (*config.Config, error) {
@@ -779,6 +824,7 @@ Commands:
   init        initialize config and profiles
   profile     manage transform profiles
   run         internal daemon reconcile loop
+  stop        ask daemon to detach dataplane and exit, or one-shot detach
   validate    validate config and desired state
   status      print desired/runtime/dataplane state as JSON
   dump        print desired map state as JSON
