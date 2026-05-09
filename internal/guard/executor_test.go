@@ -23,7 +23,7 @@ func TestDryRunExecutor(t *testing.T) {
 	if err := exec.Cleanup(t.Context()); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(exec.CleanupScript, "destroy table inet wg_mix_ebpf_guard") {
+	if !strings.Contains(exec.CleanupScript, "delete table inet wg_mix_ebpf_guard") {
 		t.Fatalf("missing cleanup script: %s", exec.CleanupScript)
 	}
 }

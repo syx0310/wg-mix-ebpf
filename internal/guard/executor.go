@@ -21,6 +21,7 @@ func NewCommandExecutor() CommandExecutor {
 }
 
 func (e CommandExecutor) Apply(ctx context.Context, plan NftPlan) error {
+	_ = e.Cleanup(ctx)
 	return e.run(ctx, plan.Script())
 }
 
