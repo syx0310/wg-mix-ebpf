@@ -2,6 +2,7 @@ package guard
 
 import (
 	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -33,5 +34,12 @@ func TestMissingGuardTableErrorIsIdempotent(t *testing.T) {
 	err := errors.New("nft -f - failed: Error: Could not process rule: No such file or directory; delete table inet wg_mix_ebpf_guard")
 	if !isMissingGuardTable(err) {
 		t.Fatal("expected missing guard table error to be treated as idempotent")
+	}
+}
+
+func TestMissingNftBinaryCleanupIsIdempotent(t *testing.T) {
+	exec := CommandExecutor{Binary: filepath.Join(t.TempDir(), "missing-nft")}
+	if err := exec.Cleanup(t.Context()); err != nil {
+		t.Fatalf("missing nft binary should be treated as no guard to clean: %v", err)
 	}
 }

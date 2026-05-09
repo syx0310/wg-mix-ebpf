@@ -177,10 +177,13 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 			errs = append(errs, fmt.Errorf("detach underlay %s(%d): %w", u.Name, u.IfIndex, err))
 		}
 	}
-	if err := cleanupPinnedMaps(pinPathFromEnv(l.PinPath)); err != nil {
-		errs = append(errs, err)
+	if err := errors.Join(errs...); err != nil {
+		return err
 	}
-	return errors.Join(errs...)
+	if err := cleanupPinnedMaps(pinPathFromEnv(l.PinPath)); err != nil {
+		return err
+	}
+	return nil
 }
 
 func pinPathFromEnv(explicit string) string {
@@ -426,12 +429,12 @@ func detachPrograms(ifindex int) error {
 		return err
 	}
 	return errors.Join(
-		deleteNamedFilter(link, netlink.HANDLE_MIN_INGRESS, ingressFilterName),
-		deleteNamedFilter(link, netlink.HANDLE_MIN_EGRESS, egressFilterName),
+		deleteAgentFilter(link, netlink.HANDLE_MIN_INGRESS, ingressFilterName, ingressHandle),
+		deleteAgentFilter(link, netlink.HANDLE_MIN_EGRESS, egressFilterName, egressHandle),
 	)
 }
 
-func deleteNamedFilter(link netlink.Link, parent uint32, name string) error {
+func deleteAgentFilter(link netlink.Link, parent uint32, name string, handle uint32) error {
 	filters, err := netlink.FilterList(link, parent)
 	if err != nil {
 		return err
@@ -439,7 +442,8 @@ func deleteNamedFilter(link netlink.Link, parent uint32, name string) error {
 	var errs []error
 	for _, f := range filters {
 		bpfFilter, ok := f.(*netlink.BpfFilter)
-		if !ok || bpfFilter.Name != name {
+		attrs := f.Attrs()
+		if !ok || bpfFilter.Name != name || attrs.Handle != handle || attrs.Priority != filterPriority {
 			continue
 		}
 		if err := netlink.FilterDel(f); err != nil && !isNotFound(err) {
@@ -457,7 +461,8 @@ func deleteDuplicateNamedFilters(link netlink.Link, parent uint32, name string, 
 	var errs []error
 	for _, f := range filters {
 		bpfFilter, ok := f.(*netlink.BpfFilter)
-		if !ok || bpfFilter.Name != name || bpfFilter.Attrs().Handle == keepHandle {
+		attrs := f.Attrs()
+		if !ok || bpfFilter.Name != name || attrs.Priority != filterPriority || attrs.Handle == keepHandle {
 			continue
 		}
 		if err := netlink.FilterDel(f); err != nil && !isNotFound(err) {

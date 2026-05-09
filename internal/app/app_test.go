@@ -102,14 +102,24 @@ func TestGuardCleanupDryRun(t *testing.T) {
 
 func TestStopFallbackDetachDryRunOffline(t *testing.T) {
 	cfgPath := writeTestConfig(t, "[Interface]\nFwMark = 0x10000002\n")
-	runDir := filepath.Join(t.TempDir(), "run")
+	dir := t.TempDir()
+	fakeBin := filepath.Join(dir, "bin")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	runDir := filepath.Join(dir, "run")
+	stateDir := filepath.Join(dir, "state")
 	var stdout, stderr bytes.Buffer
-	if err := Run(t.Context(), []string{"stop", "--config", cfgPath, "--run-dir", runDir}, &stdout, &stderr); err == nil {
-		t.Fatal("stop fallback without --offline should fail on non-Linux or missing runtime")
+	if err := Run(t.Context(), []string{"stop", "--config", cfgPath, "--run-dir", runDir, "--state-dir", stateDir}, &stdout, &stderr); err != nil {
+		t.Fatalf("stop fallback should tolerate missing runtime when there is no attach-state to detach: %v stderr=%s", err, stderr.String())
 	}
 	stdout.Reset()
 	stderr.Reset()
-	if err := Run(t.Context(), []string{"detach", "--config", cfgPath, "--offline", "--dry-run", "--run-dir", runDir}, &stdout, &stderr); err != nil {
+	if err := Run(t.Context(), []string{"detach", "--config", cfgPath, "--offline", "--dry-run", "--run-dir", runDir, "--state-dir", stateDir}, &stdout, &stderr); err != nil {
 		t.Fatalf("detach dry-run offline failed: %v stderr=%s", err, stderr.String())
 	}
 }

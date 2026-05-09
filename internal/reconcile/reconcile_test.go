@@ -5,6 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+
+	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
+	"github.com/syx0310/wg-mix-ebpf/internal/control"
 )
 
 func TestStopDryRunSucceedsWithoutRuntimeState(t *testing.T) {
@@ -71,5 +74,27 @@ func TestDetachStateReportsNoUnderlays(t *testing.T) {
 	})
 	if !errors.Is(err, errNoDetachUnderlays) {
 		t.Fatalf("expected errNoDetachUnderlays, got %v", err)
+	}
+}
+
+func TestDetachDryRunUsesAttachStateWithoutConfig(t *testing.T) {
+	stateDir := t.TempDir()
+	if err := attachstate.Save(stateDir, attachstate.FromControlState("/missing/config.yaml", &control.State{
+		Underlays: []control.UnderlayState{
+			{Name: "wan", IfName: "eth0", IfIndex: 123, Resolved: true, Role: "transform"},
+		},
+	})); err != nil {
+		t.Fatal(err)
+	}
+	result, err := Detach(t.Context(), Options{
+		ConfigPath: filepath.Join(t.TempDir(), "missing.yaml"),
+		StateDir:   stateDir,
+		DryRun:     true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(result.State.Underlays) != 1 || result.State.Underlays[0].IfIndex != 123 {
+		t.Fatalf("detach dry-run should use attach-state underlay, got %#v", result.State.Underlays)
 	}
 }
