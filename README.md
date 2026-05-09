@@ -2,7 +2,7 @@
 
 Transparent WireGuard `type_word` transform using eBPF.
 
-Current status: control-plane foundation, daemon reconcile loop, profile management, fixed map ABI, startup guard tooling, embedded BPF packaging, and Linux TC/eBPF dataplane loading are implemented. Live BPF load, TC attach, WireGuard, offload, and OpenWrt tests must run on controlled external Linux machines.
+Current status: control-plane foundation, daemon reconcile loop, profile management, generation-scoped map ABI, startup guard tooling, attach-state cleanup, embedded BPF packaging, and Linux TC/eBPF dataplane loading are implemented. Live BPF load, TC attach, WireGuard, offload, OpenWrt, and public-network tests must run on controlled external Linux machines.
 
 ## Commands
 
@@ -40,6 +40,10 @@ wg-mix-ebpf uninstall --dry-run --yes
 Operational behavior is documented in:
 
 ```text
+docs/architecture.md
+docs/build.md
+docs/compatibility.md
+docs/configuration.md
 docs/operations.md
 ```
 
@@ -74,14 +78,4 @@ Do not run BPF load, TC attach, netns, OpenWrt, offload, or performance tests on
 
 `bpf-load-test` only loads and closes the BPF collection. It does not read WireGuard runtime state, attach TC filters, create network namespaces, or send tunnel traffic.
 
-External Linux/OpenWrt/BPF/TC tests are tracked in:
-
-```text
-docs/plans/2026-05-07-transparent-typeword-ebpf-test-plan.md
-```
-
-Recent controlled-host validation is recorded in:
-
-```text
-docs/workhistory/2026-05-09-real-host-op-public-nat-smoke.md
-```
+External Linux/OpenWrt/BPF/TC tests require controlled machines. Do not run those tests on laptops or unrelated shared hosts.
