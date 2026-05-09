@@ -128,10 +128,11 @@ runtime ListenPort
 runtime FirewallMark
 underlay ifindex/link type/parser
 TC ingress/egress attach state
-startup guard status
 dataplane counters
 last reconcile result
 ```
+
+`status` reads desired state and pinned dataplane state. It does not currently inspect the nft startup guard table directly; if a guard table is suspected to be left behind, run `guard-cleanup` or inspect nftables manually.
 
 ## Stop And Detach
 
