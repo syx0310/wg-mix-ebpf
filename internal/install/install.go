@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/daemon"
 	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
@@ -182,12 +183,12 @@ func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
 			}
 		}
 	}
-	if err := lockfile.WithLock(ctx, paths.RunDir, func() error {
-		if exists(paths.ConfigPath) {
-			if _, err := reconcile.Stop(ctx, reconcile.Options{ConfigPath: paths.ConfigPath, RunDir: paths.RunDir, StateDir: paths.VarLibDir}); err != nil {
-				return fmt.Errorf("detach dataplane: %w", err)
-			}
+	if shouldStopForUninstall(paths) {
+		if _, err := reconcile.Stop(ctx, reconcile.Options{ConfigPath: paths.ConfigPath, RunDir: paths.RunDir, StateDir: paths.VarLibDir}); err != nil {
+			return nil, fmt.Errorf("detach dataplane: %w", err)
 		}
+	}
+	if err := lockfile.WithLock(ctx, paths.RunDir, func() error {
 		if err := guard.NewCommandExecutor().Cleanup(ctx); err != nil {
 			return fmt.Errorf("cleanup startup guard: %w", err)
 		}
@@ -226,6 +227,10 @@ func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
 		return nil, fmt.Errorf("remove runtime dir %s: %w", paths.RunDir, err)
 	}
 	return plan, nil
+}
+
+func shouldStopForUninstall(paths paths) bool {
+	return exists(paths.ConfigPath) || exists(attachstate.Path(paths.VarLibDir))
 }
 
 type paths struct {

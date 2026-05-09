@@ -3,7 +3,9 @@ package guard
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -28,7 +30,7 @@ func (e CommandExecutor) Apply(ctx context.Context, plan NftPlan) error {
 
 func (e CommandExecutor) Cleanup(ctx context.Context) error {
 	if err := e.run(ctx, CleanupScript()); err != nil {
-		if isMissingGuardTable(err) {
+		if isMissingGuardTable(err) || isMissingNftBinary(err) {
 			return nil
 		}
 		return err
@@ -59,6 +61,12 @@ func isMissingGuardTable(err error) bool {
 		(strings.Contains(lower, "no such file") ||
 			strings.Contains(lower, "does not exist") ||
 			strings.Contains(lower, "not found"))
+}
+
+func isMissingNftBinary(err error) bool {
+	return errors.Is(err, exec.ErrNotFound) ||
+		errors.Is(err, os.ErrNotExist) ||
+		strings.Contains(strings.ToLower(err.Error()), "executable file not found")
 }
 
 type DryRunExecutor struct {
