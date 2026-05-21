@@ -24,6 +24,8 @@ func TestStructSizesAreStable(t *testing.T) {
 		{"EgressRuleValue", unsafe.Sizeof(EgressRuleValue{}), 24},
 		{"IngressListenerKey", unsafe.Sizeof(IngressListenerKey{}), 16},
 		{"IngressListenerValue", unsafe.Sizeof(IngressListenerValue{}), 24},
+		{"ICMPListenerKey", unsafe.Sizeof(ICMPListenerKey{}), 16},
+		{"ICMPListenerValue", unsafe.Sizeof(ICMPListenerValue{}), 24},
 	}
 	for _, check := range checks {
 		if check.got != check.want {
@@ -50,10 +52,13 @@ func TestFromState(t *testing.T) {
 			{Generation: 7, FwMark: 0x10000001, UnderlayIfIndex: 2, ActionOnMiss: "drop"},
 		},
 		EgressRules: []control.EgressRule{
-			{Generation: 7, Family: "ipv4", FwMark: 0x10000001, SourcePort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "rewrite"},
+			{Generation: 7, Family: "ipv4", FwMark: 0x10000001, SourcePort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "rewrite", TransportMode: "icmp", ICMPRole: "client", ICMPID: 0x5303},
 		},
 		IngressListeners: []control.IngressListener{
 			{Generation: 7, Family: "ipv6", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "rewrite"},
+		},
+		ICMPListeners: []control.ICMPListener{
+			{Generation: 7, Family: "ipv4", UnderlayIfIndex: 2, ICMPType: 0, ICMPID: 0x5303, ListenPort: 31001, ProfileID: 1, WGID: 1, Action: "rewrite", Role: "client"},
 		},
 	}
 	snapshot, err := FromState(state)
@@ -66,7 +71,8 @@ func TestFromState(t *testing.T) {
 	if snapshot.Underlays[UnderlayConfigKey{Generation: 7, UnderlayIndex: 2}].ParserMode != ParserEthernet {
 		t.Fatal("missing underlay parser mode")
 	}
-	if snapshot.EgressRules[EgressRuleKey{Generation: 7, FwMark: 0x10000001, UnderlayIndex: 2, SourcePort: 31001, Family: FamilyIPv4}].Action != ActionRewrite {
+	egress := snapshot.EgressRules[EgressRuleKey{Generation: 7, FwMark: 0x10000001, UnderlayIndex: 2, SourcePort: 31001, Family: FamilyIPv4}]
+	if egress.Action != ActionRewrite || egress.TransportMode != TransportICMP || egress.ICMPRole != ICMPRoleClient || egress.ICMPID != 0x5303 {
 		t.Fatal("missing egress rewrite rule")
 	}
 	if snapshot.ManagedFwmarks[ManagedFwmarkKey{Generation: 7, FwMark: 0x10000001, UnderlayIndex: 2}].ActionOnMiss != ActionDrop {
@@ -74,6 +80,10 @@ func TestFromState(t *testing.T) {
 	}
 	if snapshot.IngressListeners[IngressListenerKey{Generation: 7, UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv6}].Action != ActionRewrite {
 		t.Fatal("missing ingress rewrite rule")
+	}
+	icmp := snapshot.ICMPListeners[ICMPListenerKey{Generation: 7, UnderlayIndex: 2, ICMPID: 0x5303, Family: FamilyIPv4, ICMPType: 0}]
+	if icmp.Action != ActionRewrite || icmp.ListenPort != 31001 || icmp.Role != ICMPRoleClient {
+		t.Fatal("missing icmp listener")
 	}
 }
 
@@ -145,6 +155,9 @@ func TestGenerationIsPartOfDataplaneKeys(t *testing.T) {
 		IngressListeners: []control.IngressListener{
 			{Family: "ipv4", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "rewrite"},
 		},
+		ICMPListeners: []control.ICMPListener{
+			{Family: "ipv4", UnderlayIfIndex: 2, ICMPType: 0, ICMPID: 0x5303, ListenPort: 31001, ProfileID: 1, WGID: 1, Action: "rewrite", Role: "client"},
+		},
 	}
 	oldSnapshot, err := FromStateWithGeneration(state, 1)
 	if err != nil {
@@ -168,5 +181,11 @@ func TestGenerationIsPartOfDataplaneKeys(t *testing.T) {
 	}
 	if _, ok := newSnapshot.ManagedFwmarks[ManagedFwmarkKey{Generation: 2, FwMark: 0x10000001, UnderlayIndex: 2}]; !ok {
 		t.Fatal("missing new generation managed fwmark")
+	}
+	if _, ok := oldSnapshot.ICMPListeners[ICMPListenerKey{Generation: 1, UnderlayIndex: 2, ICMPID: 0x5303, Family: FamilyIPv4, ICMPType: 0}]; !ok {
+		t.Fatal("missing old generation icmp listener")
+	}
+	if _, ok := newSnapshot.ICMPListeners[ICMPListenerKey{Generation: 2, UnderlayIndex: 2, ICMPID: 0x5303, Family: FamilyIPv4, ICMPType: 0}]; !ok {
+		t.Fatal("missing new generation icmp listener")
 	}
 }

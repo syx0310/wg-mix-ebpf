@@ -133,6 +133,74 @@ runtime:
 	}
 }
 
+func TestAcceptICMPClientTransport(t *testing.T) {
+	cfg, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: icmp
+      icmp:
+        role: client
+        id: 0x5303
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WireGuards[0].Transport.Mode != "icmp" {
+		t.Fatalf("transport mode = %q", cfg.WireGuards[0].Transport.Mode)
+	}
+}
+
+func TestRejectICMPClientWithoutID(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: icmp
+      icmp:
+        role: client
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err == nil {
+		t.Fatal("expected missing icmp id error")
+	}
+}
+
+func TestRejectFakeTCPTransport(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: faketcp
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err == nil {
+		t.Fatal("expected faketcp to be rejected")
+	}
+}
+
 func TestRejectUnsupportedUnderlayParser(t *testing.T) {
 	_, err := Load([]byte(`
 version: 1

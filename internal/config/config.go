@@ -35,10 +35,11 @@ type Underlay struct {
 }
 
 type WireGuard struct {
-	Name    string `yaml:"name"`
-	Config  string `yaml:"config"`
-	Profile string `yaml:"profile"`
-	NetNS   string `yaml:"netns"`
+	Name      string    `yaml:"name"`
+	Config    string    `yaml:"config"`
+	Profile   string    `yaml:"profile"`
+	NetNS     string    `yaml:"netns"`
+	Transport Transport `yaml:"transport"`
 }
 
 type Profile struct {
@@ -57,6 +58,16 @@ type TypeWordProfile struct {
 
 type IndexProfile struct {
 	Mode string `yaml:"mode"`
+}
+
+type Transport struct {
+	Mode string        `yaml:"mode"`
+	ICMP ICMPTransport `yaml:"icmp"`
+}
+
+type ICMPTransport struct {
+	Role string `yaml:"role"`
+	ID   uint16 `yaml:"id"`
 }
 
 type FwmarkPolicy struct {
@@ -279,6 +290,9 @@ func (c *Config) ApplyDefaults() {
 		if c.WireGuards[i].NetNS == "" {
 			c.WireGuards[i].NetNS = "root"
 		}
+		if c.WireGuards[i].Transport.Mode == "" {
+			c.WireGuards[i].Transport.Mode = "udp"
+		}
 	}
 }
 
@@ -351,6 +365,23 @@ func (c *Config) ValidateStatic() error {
 		}
 		if _, ok := c.Profiles[wg.Profile]; !ok {
 			return fmt.Errorf("wireguards[%d].profile %q is not defined", i, wg.Profile)
+		}
+		switch wg.Transport.Mode {
+		case "", "udp":
+		case "icmp":
+			switch wg.Transport.ICMP.Role {
+			case "client":
+				if wg.Transport.ICMP.ID == 0 {
+					return fmt.Errorf("wireguards[%d].transport.icmp.id is required for client role", i)
+				}
+			case "server":
+			default:
+				return fmt.Errorf("wireguards[%d].transport.icmp.role must be client or server", i)
+			}
+		case "faketcp", "faketcp-lite":
+			return fmt.Errorf("wireguards[%d].transport.mode %q is reserved but not implemented", i, wg.Transport.Mode)
+		default:
+			return fmt.Errorf("wireguards[%d].transport.mode %q is unsupported", i, wg.Transport.Mode)
 		}
 	}
 	return nil

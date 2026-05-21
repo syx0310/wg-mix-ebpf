@@ -136,6 +136,9 @@ var statNames = []string{
 	"ingress_gso_seen",
 	"ingress_gso_listener_hit",
 	"ingress_gso_rewrite_ok",
+	"icmp_egress_rewrite_ok",
+	"icmp_ingress_rewrite_ok",
+	"icmp_checksum_error",
 }
 
 func filterStatuses(link netlink.Link, parent uint32, direction string) ([]FilterStatus, error) {

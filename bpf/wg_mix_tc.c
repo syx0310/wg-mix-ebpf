@@ -11,7 +11,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-#define ABI_VERSION 4
+#define ABI_VERSION 5
 
 #define FAMILY_ANY  0
 #define FAMILY_IPV4 4
@@ -27,6 +27,17 @@
 #define PARSER_AUTO     0
 #define PARSER_ETHERNET 1
 #define PARSER_L3       2
+
+#define TRANSPORT_UDP  0
+#define TRANSPORT_ICMP 1
+
+#define ICMP_ROLE_NONE   0
+#define ICMP_ROLE_CLIENT 1
+#define ICMP_ROLE_SERVER 2
+
+#define ICMP_ECHOREPLY 0
+#define ICMP_ECHO      8
+#define MAX_ICMP_CSUM_BYTES 256
 
 #ifndef IP_MF
 #define IP_MF 0x2000
@@ -151,8 +162,11 @@ struct egress_rule_value {
 	__u64 generation;
 	__u32 profile_id;
 	__u32 wg_id;
+	__u16 icmp_id;
 	__u8 action;
-	__u8 pad[7];
+	__u8 transport_mode;
+	__u8 icmp_role;
+	__u8 pad[3];
 };
 
 struct ingress_listener_key {
@@ -171,6 +185,36 @@ struct ingress_listener_value {
 	__u8 pad[7];
 };
 
+struct icmp_listener_key {
+	__u64 generation;
+	__u32 underlay_index;
+	__u16 icmp_id;
+	__u8 family;
+	__u8 icmp_type;
+};
+
+struct icmp_listener_value {
+	__u64 generation;
+	__u32 profile_id;
+	__u32 wg_id;
+	__u16 listen_port;
+	__u8 action;
+	__u8 role;
+	__u8 pad[4];
+};
+
+struct icmp_seq_key {
+	__u32 remote_ipv4;
+	__u16 icmp_id;
+	__u16 pad;
+};
+
+struct icmp_seq_value {
+	__u64 generation;
+	__u16 sequence;
+	__u16 pad[3];
+};
+
 struct packet_info {
 	__u32 family;
 	__u32 ip_off;
@@ -180,6 +224,27 @@ struct packet_info {
 	__u16 src_port;
 	__u16 dst_port;
 	__u8 ipv4_udp_csum_zero;
+};
+
+struct icmp_packet_info {
+	__u32 family;
+	__u32 ip_off;
+	__u32 icmp_off;
+	__u32 payload_off;
+	__u32 payload_len;
+	__u32 src_ipv4;
+	__u16 id;
+	__u16 sequence;
+	__u8 type;
+	__u8 code;
+};
+
+struct wg_icmphdr {
+	__u8 type;
+	__u8 code;
+	__be16 checksum;
+	__be16 id;
+	__be16 sequence;
 };
 
 enum stat_id {
@@ -204,6 +269,9 @@ enum stat_id {
 	STAT_INGRESS_GSO_SEEN,
 	STAT_INGRESS_GSO_LISTENER_HIT,
 	STAT_INGRESS_GSO_REWRITE_OK,
+	STAT_ICMP_EGRESS_REWRITE_OK,
+	STAT_ICMP_INGRESS_REWRITE_OK,
+	STAT_ICMP_CHECKSUM_ERROR,
 	STAT_MAX,
 };
 
@@ -248,6 +316,20 @@ struct {
 	__type(key, struct ingress_listener_key);
 	__type(value, struct ingress_listener_value);
 } ingress_listener_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 2048);
+	__type(key, struct icmp_listener_key);
+	__type(value, struct icmp_listener_value);
+} icmp_listener_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 2048);
+	__type(key, struct icmp_seq_key);
+	__type(value, struct icmp_seq_value);
+} icmp_seq_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
@@ -493,6 +575,211 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 	return PARSE_NOT_UDP;
 }
 
+static __always_inline int parse_icmp_packet(struct __sk_buff *skb,
+					     struct icmp_packet_info *info,
+					     __u64 generation)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	__u64 off = 0;
+	__u16 proto = 0;
+	struct iphdr *iph;
+	struct wg_icmphdr *icmp;
+	__u32 ihl;
+	__u16 frag;
+	__u16 frag_off;
+	__u16 total_len;
+	int rc;
+
+	__builtin_memset(info, 0, sizeof(*info));
+	rc = parse_link(skb, data, data_end, &off, &proto, generation);
+	if (rc != PARSE_OK)
+		return rc;
+	if (proto != bpf_htons(ETH_P_IP))
+		return PARSE_NOT_UDP;
+	iph = data + off;
+	if ((void *)(iph + 1) > data_end)
+		return PARSE_SHORT;
+	ihl = iph->ihl * 4;
+	if (ihl < sizeof(*iph) || data + off + ihl > data_end)
+		return PARSE_SHORT;
+	if (iph->protocol != IPPROTO_ICMP)
+		return PARSE_NOT_UDP;
+	frag = bpf_ntohs(iph->frag_off);
+	frag_off = frag & IP_OFFSET;
+	if (frag_off != 0)
+		return PARSE_IPV4_NON_FIRST_FRAGMENT;
+	if (frag & IP_MF)
+		return PARSE_IPV4_FIRST_FRAGMENT;
+	total_len = bpf_ntohs(iph->tot_len);
+	if (total_len < ihl + sizeof(*icmp))
+		return PARSE_SHORT;
+	icmp = data + off + ihl;
+	if ((void *)(icmp + 1) > data_end)
+		return PARSE_SHORT;
+	info->family = FAMILY_IPV4;
+	info->ip_off = off;
+	info->icmp_off = off + ihl;
+	info->payload_off = info->icmp_off + sizeof(*icmp);
+	info->payload_len = total_len - ihl - sizeof(*icmp);
+	info->src_ipv4 = iph->saddr;
+	info->type = icmp->type;
+	info->code = icmp->code;
+	info->id = bpf_ntohs(icmp->id);
+	info->sequence = bpf_ntohs(icmp->sequence);
+	if (info->payload_len < 4)
+		return PARSE_SHORT;
+	return PARSE_OK;
+}
+
+static __always_inline __u16 fold_csum(__u64 sum)
+{
+#pragma unroll
+	for (int i = 0; i < 4; i++)
+		sum = (sum & 0xffff) + (sum >> 16);
+	return ~((__u16)sum);
+}
+
+static __always_inline void csum_add_word(__u64 *sum, __u16 word)
+{
+	*sum += word;
+}
+
+static __always_inline void csum_sub_word(__u64 *sum, __u16 word)
+{
+	*sum += (~word) & 0xffff;
+}
+
+static __always_inline void csum_sub_ipv4(__u64 *sum, __be32 addr)
+{
+	__u32 host = bpf_ntohl(addr);
+
+	csum_sub_word(sum, host >> 16);
+	csum_sub_word(sum, host & 0xffff);
+}
+
+static __always_inline void csum_add_type_word(__u64 *sum, __u32 wire)
+{
+	__u32 host = bpf_ntohl(wire);
+
+	csum_add_word(sum, host >> 16);
+	csum_add_word(sum, host & 0xffff);
+}
+
+static __always_inline void csum_sub_type_word(__u64 *sum, __u32 wire)
+{
+	__u32 host = bpf_ntohl(wire);
+
+	csum_sub_word(sum, host >> 16);
+	csum_sub_word(sum, host & 0xffff);
+}
+
+static __always_inline int compute_icmp_checksum_small(struct __sk_buff *skb,
+						       __u32 off,
+						       __u32 len,
+						       __u16 *out)
+{
+	__u64 sum = 0;
+
+	if (len == 0 || len > MAX_ICMP_CSUM_BYTES || (len & 1))
+		return -1;
+
+#pragma unroll
+	for (int i = 0; i < MAX_ICMP_CSUM_BYTES / 2; i++) {
+		__u32 pos = i * 2;
+		__u16 word = 0;
+
+		if (pos + 2 > len)
+			break;
+		if (bpf_skb_load_bytes(skb, off + pos, &word, sizeof(word)) < 0)
+			return -1;
+		csum_add_word(&sum, bpf_ntohs(word));
+	}
+
+	*out = bpf_htons(fold_csum(sum));
+	return 0;
+}
+
+static __always_inline int derive_icmp_checksum_from_udp(struct __sk_buff *skb,
+							 struct packet_info *info,
+							 __u8 icmp_type,
+							 __u16 icmp_id,
+							 __u16 icmp_sequence,
+							 __u32 old_wire,
+							 __u32 new_wire,
+							 __u16 *out)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct iphdr *iph = data + info->ip_off;
+	struct udphdr *udp = data + info->udp_off;
+	__u16 udp_check;
+	__u16 udp_len;
+	__u64 sum;
+
+	if ((void *)(iph + 1) > data_end || (void *)(udp + 1) > data_end)
+		return -1;
+	udp_check = bpf_ntohs(udp->check);
+	if (udp_check == 0)
+		return -1;
+	udp_len = bpf_ntohs(udp->len);
+	sum = (~udp_check) & 0xffff;
+
+	csum_sub_ipv4(&sum, iph->saddr);
+	csum_sub_ipv4(&sum, iph->daddr);
+	csum_sub_word(&sum, IPPROTO_UDP);
+	csum_sub_word(&sum, udp_len);
+	csum_sub_word(&sum, info->src_port);
+	csum_sub_word(&sum, info->dst_port);
+	csum_sub_word(&sum, udp_len);
+	csum_sub_type_word(&sum, old_wire);
+
+	csum_add_word(&sum, ((__u16)icmp_type) << 8);
+	csum_add_word(&sum, icmp_id);
+	csum_add_word(&sum, icmp_sequence);
+	csum_add_type_word(&sum, new_wire);
+
+	*out = bpf_htons(fold_csum(sum));
+	return 0;
+}
+
+static __always_inline __u16 lookup_icmp_sequence(struct __sk_buff *skb,
+						  struct packet_info *info,
+						  __u64 generation,
+						  __u16 icmp_id)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct iphdr *iph = data + info->ip_off;
+	struct icmp_seq_key key = {
+		.icmp_id = icmp_id,
+	};
+	struct icmp_seq_value *value;
+
+	if ((void *)(iph + 1) > data_end)
+		return 0;
+	key.remote_ipv4 = iph->daddr;
+	value = bpf_map_lookup_elem(&icmp_seq_map, &key);
+	if (!value || value->generation != generation)
+		return 0;
+	return value->sequence;
+}
+
+static __always_inline void remember_icmp_sequence(struct icmp_packet_info *info,
+						   __u64 generation)
+{
+	struct icmp_seq_key key = {
+		.remote_ipv4 = info->src_ipv4,
+		.icmp_id = info->id,
+	};
+	struct icmp_seq_value value = {
+		.generation = generation,
+		.sequence = info->sequence,
+	};
+
+	bpf_map_update_elem(&icmp_seq_map, &key, &value, BPF_ANY);
+}
+
 static __always_inline int kind_from_standard(__u32 type_word)
 {
 	switch (type_word) {
@@ -547,6 +834,108 @@ static __always_inline int update_type_word(struct __sk_buff *skb, struct packet
 	if (bpf_skb_store_bytes(skb, info->payload_off, &new_wire, sizeof(new_wire),
 				store_flags) < 0)
 		return -2;
+	return 0;
+}
+
+static __always_inline int update_ipv4_protocol(struct __sk_buff *skb, __u32 ip_off,
+						__u8 old_proto, __u8 new_proto)
+{
+	__u8 proto = new_proto;
+	__u32 csum_off = ip_off + offsetof(struct iphdr, check);
+	__u32 proto_off = ip_off + offsetof(struct iphdr, protocol);
+
+	if (bpf_l3_csum_replace(skb, csum_off, bpf_htons(old_proto),
+				bpf_htons(new_proto), 2) < 0)
+		return -1;
+	if (bpf_skb_store_bytes(skb, proto_off, &proto, sizeof(proto),
+				BPF_F_INVALIDATE_HASH) < 0)
+		return -2;
+	return 0;
+}
+
+static __always_inline int rewrite_udp_to_icmp(struct __sk_buff *skb,
+					       struct packet_info *info,
+					       struct egress_rule_value *rule,
+					       __u32 old_wire,
+					       __u32 new_wire)
+{
+	struct wg_icmphdr icmp = {};
+	__u16 checksum = 0;
+	__u16 icmp_id = rule->icmp_id;
+	__u32 icmp_len = info->payload_len + sizeof(icmp);
+	__u16 icmp_sequence = 0;
+	__u8 icmp_type = ICMP_ECHO;
+	int rc;
+	int small_checksum = icmp_len <= MAX_ICMP_CSUM_BYTES;
+
+	if (info->family != FAMILY_IPV4)
+		return -1;
+	if (rule->icmp_role == ICMP_ROLE_SERVER) {
+		icmp_type = ICMP_ECHOREPLY;
+		if (info->dst_port != 0)
+			icmp_id = info->dst_port;
+		icmp_sequence = lookup_icmp_sequence(skb, info, rule->generation, icmp_id);
+	}
+	icmp.type = icmp_type;
+	icmp.code = 0;
+	icmp.checksum = 0;
+	icmp.id = bpf_htons(icmp_id);
+	icmp.sequence = bpf_htons(icmp_sequence);
+
+	if (!small_checksum) {
+		if (derive_icmp_checksum_from_udp(skb, info, icmp_type, icmp_id,
+						  icmp_sequence, old_wire, new_wire,
+						  &checksum) < 0)
+			return -3;
+		icmp.checksum = checksum;
+	}
+	if (bpf_skb_store_bytes(skb, info->payload_off, &new_wire, sizeof(new_wire),
+				BPF_F_INVALIDATE_HASH) < 0)
+		return -2;
+	if (bpf_skb_store_bytes(skb, info->udp_off, &icmp, sizeof(icmp),
+				BPF_F_INVALIDATE_HASH) < 0)
+		return -2;
+	rc = update_ipv4_protocol(skb, info->ip_off, IPPROTO_UDP, IPPROTO_ICMP);
+	if (rc < 0)
+		return rc;
+	if (small_checksum) {
+		if (compute_icmp_checksum_small(skb, info->udp_off, icmp_len, &checksum) < 0)
+			return -3;
+		if (bpf_skb_store_bytes(skb,
+					info->udp_off + offsetof(struct wg_icmphdr, checksum),
+					&checksum, sizeof(checksum), BPF_F_INVALIDATE_HASH) < 0)
+			return -2;
+	}
+	return 0;
+}
+
+static __always_inline int rewrite_icmp_to_udp(struct __sk_buff *skb,
+					       struct icmp_packet_info *info,
+					       struct icmp_listener_value *listener,
+					       __u32 new_wire)
+{
+	struct udphdr udp = {};
+	__u16 source_port = info->id;
+	int rc;
+
+	if (source_port == 0)
+		source_port = 1;
+	udp.source = bpf_htons(source_port);
+	udp.dest = bpf_htons(listener->listen_port);
+	udp.len = bpf_htons(info->payload_len + sizeof(udp));
+	udp.check = 0;
+
+	if (listener->role == ICMP_ROLE_SERVER && info->type == ICMP_ECHO)
+		remember_icmp_sequence(info, listener->generation);
+	if (bpf_skb_store_bytes(skb, info->payload_off, &new_wire, sizeof(new_wire),
+				BPF_F_INVALIDATE_HASH) < 0)
+		return -2;
+	if (bpf_skb_store_bytes(skb, info->icmp_off, &udp, sizeof(udp),
+				BPF_F_INVALIDATE_HASH) < 0)
+		return -2;
+	rc = update_ipv4_protocol(skb, info->ip_off, IPPROTO_ICMP, IPPROTO_UDP);
+	if (rc < 0)
+		return rc;
 	return 0;
 }
 
@@ -619,6 +1008,40 @@ static __always_inline struct ingress_listener_value *lookup_ingress_listener(__
 		return listener;
 	key.underlay_index = UNDERLAY_WILDCARD;
 	listener = bpf_map_lookup_elem(&ingress_listener_map, &key);
+	if (listener && listener->generation == generation)
+		return listener;
+	return 0;
+}
+
+static __always_inline struct icmp_listener_value *lookup_icmp_listener(__u32 ifindex,
+									__u16 icmp_id,
+									__u8 icmp_type,
+									__u8 family,
+									__u64 generation)
+{
+	struct icmp_listener_key key = {
+		.generation = generation,
+		.underlay_index = ifindex,
+		.icmp_id = icmp_id,
+		.family = family,
+		.icmp_type = icmp_type,
+	};
+	struct icmp_listener_value *listener;
+
+	listener = bpf_map_lookup_elem(&icmp_listener_map, &key);
+	if (listener && listener->generation == generation)
+		return listener;
+	key.icmp_id = 0;
+	listener = bpf_map_lookup_elem(&icmp_listener_map, &key);
+	if (listener && listener->generation == generation)
+		return listener;
+	key.underlay_index = UNDERLAY_WILDCARD;
+	key.icmp_id = icmp_id;
+	listener = bpf_map_lookup_elem(&icmp_listener_map, &key);
+	if (listener && listener->generation == generation)
+		return listener;
+	key.icmp_id = 0;
+	listener = bpf_map_lookup_elem(&icmp_listener_map, &key);
 	if (listener && listener->generation == generation)
 		return listener;
 	return 0;
@@ -707,15 +1130,22 @@ int wg_mix_egress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 	new_wire = wg_cpu_to_le32(profile->standard_to_mixed[kind]);
-	rc = update_type_word(skb, &info, old_wire, new_wire, 1);
+	if (rule->transport_mode == TRANSPORT_ICMP)
+		rc = rewrite_udp_to_icmp(skb, &info, rule, old_wire, new_wire);
+	else
+		rc = update_type_word(skb, &info, old_wire, new_wire, 1);
 	if (rc < 0) {
 		if (rc == -2)
 			inc_stat(STAT_SKB_STORE_ERROR);
+		else if (rc == -3)
+			inc_stat(STAT_ICMP_CHECKSUM_ERROR);
 		else
 			inc_stat(STAT_CHECKSUM_ERROR);
 		return TC_ACT_SHOT;
 	}
 	inc_stat(STAT_EGRESS_REWRITE_OK);
+	if (rule->transport_mode == TRANSPORT_ICMP)
+		inc_stat(STAT_ICMP_EGRESS_REWRITE_OK);
 	if (gso_seen)
 		inc_stat(STAT_EGRESS_GSO_REWRITE_OK);
 	return TC_ACT_OK;
@@ -725,7 +1155,9 @@ SEC("tc/ingress")
 int wg_mix_ingress(struct __sk_buff *skb)
 {
 	struct packet_info info;
+	struct icmp_packet_info icmp_info;
 	struct ingress_listener_value *listener;
+	struct icmp_listener_value *icmp_listener;
 	struct profile_key profile_key = {};
 	struct profile_value *profile;
 	__u64 generation = 0;
@@ -740,6 +1172,65 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	if (skb->gso_segs || skb->gso_size) {
 		gso_seen = 1;
 		inc_stat(STAT_INGRESS_GSO_SEEN);
+	}
+
+	rc = parse_icmp_packet(skb, &icmp_info, generation);
+	if (rc == PARSE_OK && icmp_info.code == 0 &&
+	    (icmp_info.type == ICMP_ECHO || icmp_info.type == ICMP_ECHOREPLY)) {
+		icmp_listener = lookup_icmp_listener(skb->ifindex, icmp_info.id, icmp_info.type,
+						     icmp_info.family, generation);
+		if (!icmp_listener)
+			return TC_ACT_OK;
+		if (gso_seen)
+			inc_stat(STAT_INGRESS_GSO_LISTENER_HIT);
+		if (icmp_listener->action == ACTION_DROP)
+			return TC_ACT_SHOT;
+		if (icmp_listener->action != ACTION_REWRITE)
+			return TC_ACT_OK;
+
+		profile_key.generation = generation;
+		profile_key.profile_id = icmp_listener->profile_id;
+		profile = bpf_map_lookup_elem(&profile_map, &profile_key);
+		if (!profile || profile->generation != generation) {
+			inc_stat(STAT_INGRESS_RULE_MISS);
+			return TC_ACT_SHOT;
+		}
+		if (bpf_skb_load_bytes(skb, icmp_info.payload_off, &old_wire,
+				       sizeof(old_wire)) < 0) {
+			inc_stat(STAT_SKB_LOAD_ERROR);
+			return TC_ACT_SHOT;
+		}
+		old_type = wg_le32_to_cpu(old_wire);
+		kind = -1;
+#pragma unroll
+		for (int i = 0; i < 4; i++) {
+			if (profile->standard_to_mixed[i] == old_type) {
+				kind = i;
+				break;
+			}
+		}
+		if (kind < 0) {
+			inc_stat(STAT_INGRESS_BAD_TYPE);
+			return TC_ACT_SHOT;
+		}
+		if (!validate_len(kind, icmp_info.payload_len)) {
+			inc_stat(STAT_INGRESS_BAD_LENGTH);
+			return TC_ACT_SHOT;
+		}
+		new_wire = wg_cpu_to_le32(profile->mixed_to_standard[kind]);
+		rc = rewrite_icmp_to_udp(skb, &icmp_info, icmp_listener, new_wire);
+		if (rc < 0) {
+			if (rc == -2)
+				inc_stat(STAT_SKB_STORE_ERROR);
+			else
+				inc_stat(STAT_CHECKSUM_ERROR);
+			return TC_ACT_SHOT;
+		}
+		inc_stat(STAT_INGRESS_REWRITE_OK);
+		inc_stat(STAT_ICMP_INGRESS_REWRITE_OK);
+		if (gso_seen)
+			inc_stat(STAT_INGRESS_GSO_REWRITE_OK);
+		return TC_ACT_OK;
 	}
 
 	rc = parse_packet(skb, &info, generation);

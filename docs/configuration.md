@@ -38,6 +38,8 @@ wireguards:
   - name: wg0
     config: /etc/wireguard/wg0.conf
     profile: mix-default
+    transport:
+      mode: udp
 
 profiles:
   mix-default:
@@ -175,6 +177,55 @@ wireguards:
 ```
 
 Cross-netns and moved WireGuard socket setups are not supported by the MVP.
+
+### `transport`
+
+Each WireGuard entry can select an outer transport. The default is the original UDP type-word transform:
+
+```yaml
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: udp
+```
+
+Experimental IPv4 ICMP mode:
+
+```yaml
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: icmp
+      icmp:
+        role: client
+        id: 0x5301
+```
+
+Public/server side:
+
+```yaml
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: icmp
+      icmp:
+        role: server
+```
+
+ICMP mode notes:
+
+```text
+client emits Echo Request and accepts Echo Reply
+server accepts Echo Request and emits Echo Reply
+client id must be nonzero and should be unique per client/profile
+server uses wildcard Echo id by default to tolerate NAT ICMP id rewriting
+server preserves NAT-rewritten Echo sequence values with runtime kernel state
+ICMP mode is IPv4 only in the MVP
+fakeTCP is intentionally not implemented
+```
 
 ## WireGuard Config Requirements
 

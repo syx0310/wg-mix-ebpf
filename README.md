@@ -2,7 +2,7 @@
 
 Transparent WireGuard `type_word` transform using eBPF.
 
-Current status: control-plane foundation, daemon reconcile loop, profile management, generation-scoped map ABI, startup guard tooling, attach-state cleanup, embedded BPF packaging, and Linux TC/eBPF dataplane loading are implemented. Live BPF load, TC attach, WireGuard, offload, OpenWrt, and public-network tests must run on controlled external Linux machines.
+Current status: control-plane foundation, daemon reconcile loop, profile management, generation-scoped map ABI, startup guard tooling, attach-state cleanup, embedded BPF packaging, Linux TC/eBPF dataplane loading, UDP type-word mode, and experimental IPv4 ICMP mode are implemented. Live BPF load, TC attach, WireGuard, offload, OpenWrt, and public-network tests must run on controlled external Linux machines.
 
 ## Commands
 
@@ -36,6 +36,13 @@ wg-mix-ebpf uninstall --dry-run --yes
 `run` is the internal daemon entrypoint used by service managers. It performs startup reconcile, periodic runtime reconcile, and reload-request handling. Manual `reload` notifies the daemon when it is running; otherwise it performs a one-shot reconcile.
 
 `profile remove <name> --force` removes the profile and stops managing WireGuard entries that reference it. It does not change WireGuard configuration or interfaces.
+
+Supported transport modes:
+
+```text
+udp    original transparent UDP type-word transform
+icmp   experimental IPv4 ICMP Echo transport, no fakeTCP
+```
 
 Operational behavior is documented in:
 

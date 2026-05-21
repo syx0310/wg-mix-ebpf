@@ -28,6 +28,7 @@ type State struct {
 	ManagedFwmarks   []ManagedFwmarkRule `json:"managed_fwmarks"`
 	EgressRules      []EgressRule        `json:"egress_rules"`
 	IngressListeners []IngressListener   `json:"ingress_listeners"`
+	ICMPListeners    []ICMPListener      `json:"icmp_listeners,omitempty"`
 	Warnings         []string            `json:"warnings,omitempty"`
 }
 
@@ -50,6 +51,9 @@ type WireGuardState struct {
 	RuntimeListenPort     uint16 `json:"runtime_listen_port,omitempty"`
 	RuntimeIfIndex        int    `json:"runtime_ifindex,omitempty"`
 	RuntimeStateAvailable bool   `json:"runtime_state_available"`
+	TransportMode         string `json:"transport_mode"`
+	ICMPRole              string `json:"icmp_role,omitempty"`
+	ICMPID                uint16 `json:"icmp_id,omitempty"`
 }
 
 type UnderlayState struct {
@@ -80,6 +84,9 @@ type EgressRule struct {
 	ProfileID       uint32 `json:"profile_id"`
 	WGID            uint32 `json:"wg_id"`
 	Action          string `json:"action"`
+	TransportMode   string `json:"transport_mode,omitempty"`
+	ICMPRole        string `json:"icmp_role,omitempty"`
+	ICMPID          uint16 `json:"icmp_id,omitempty"`
 }
 
 type IngressListener struct {
@@ -90,6 +97,19 @@ type IngressListener struct {
 	ProfileID       uint32 `json:"profile_id"`
 	WGID            uint32 `json:"wg_id"`
 	Action          string `json:"action"`
+}
+
+type ICMPListener struct {
+	Generation      uint64 `json:"generation"`
+	Family          string `json:"family"`
+	UnderlayIfIndex int    `json:"underlay_ifindex"`
+	ICMPType        uint8  `json:"icmp_type"`
+	ICMPID          uint16 `json:"icmp_id"`
+	ListenPort      uint16 `json:"listen_port"`
+	ProfileID       uint32 `json:"profile_id"`
+	WGID            uint32 `json:"wg_id"`
+	Action          string `json:"action"`
+	Role            string `json:"role"`
 }
 
 func (s *State) JSON() ([]byte, error) {
@@ -216,12 +236,15 @@ func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.Wire
 	}
 
 	state := &WireGuardState{
-		ID:           wgID,
-		Name:         wg.Name,
-		ConfigPath:   wg.Config,
-		Profile:      wg.Profile,
-		ProfileID:    profileID,
-		ConfigFwMark: *parsed.FwMark,
+		ID:            wgID,
+		Name:          wg.Name,
+		ConfigPath:    wg.Config,
+		Profile:       wg.Profile,
+		ProfileID:     profileID,
+		ConfigFwMark:  *parsed.FwMark,
+		TransportMode: wg.Transport.Mode,
+		ICMPRole:      wg.Transport.ICMP.Role,
+		ICMPID:        wg.Transport.ICMP.ID,
 	}
 	if parsed.ListenPort != nil {
 		state.ConfigListenPort = *parsed.ListenPort
@@ -266,6 +289,9 @@ func (s *State) buildRules(cfg *config.Config) {
 				ActionOnMiss:    cfg.Policy.ManagedEgressMapMiss,
 			})
 			for _, family := range []string{"ipv4", "ipv6"} {
+				if wg.TransportMode == "icmp" && family == "ipv6" {
+					continue
+				}
 				s.EgressRules = append(s.EgressRules, EgressRule{
 					Generation:      s.Generation,
 					Family:          family,
@@ -275,7 +301,33 @@ func (s *State) buildRules(cfg *config.Config) {
 					ProfileID:       wg.ProfileID,
 					WGID:            wg.ID,
 					Action:          "rewrite",
+					TransportMode:   wg.TransportMode,
+					ICMPRole:        wg.ICMPRole,
+					ICMPID:          wg.ICMPID,
 				})
+				if wg.TransportMode == "icmp" {
+					icmpType := uint8(8)
+					icmpID := wg.ICMPID
+					if wg.ICMPRole == "client" {
+						icmpType = 0
+					}
+					if wg.ICMPRole == "server" {
+						icmpID = 0
+					}
+					s.ICMPListeners = append(s.ICMPListeners, ICMPListener{
+						Generation:      s.Generation,
+						Family:          family,
+						UnderlayIfIndex: u.IfIndex,
+						ICMPType:        icmpType,
+						ICMPID:          icmpID,
+						ListenPort:      wg.RuntimeListenPort,
+						ProfileID:       wg.ProfileID,
+						WGID:            wg.ID,
+						Action:          "rewrite",
+						Role:            wg.ICMPRole,
+					})
+					continue
+				}
 				s.IngressListeners = append(s.IngressListeners, IngressListener{
 					Generation:      s.Generation,
 					Family:          family,
@@ -318,6 +370,21 @@ func (s *State) validateRuleUniqueness() error {
 			return fmt.Errorf("duplicate ingress listener for family=%s destination_port=%d underlay_ifindex=%d between wg_id=%d and wg_id=%d", r.Family, r.DestinationPort, r.UnderlayIfIndex, existing.WGID, r.WGID)
 		}
 		ingressSeen[key] = r
+	}
+
+	type icmpKey struct {
+		family   string
+		underlay int
+		icmpType uint8
+		icmpID   uint16
+	}
+	icmpSeen := make(map[icmpKey]ICMPListener, len(s.ICMPListeners))
+	for _, r := range s.ICMPListeners {
+		key := icmpKey{family: r.Family, underlay: r.UnderlayIfIndex, icmpType: r.ICMPType, icmpID: r.ICMPID}
+		if existing, ok := icmpSeen[key]; ok {
+			return fmt.Errorf("duplicate icmp listener for family=%s type=%d id=%d underlay_ifindex=%d between wg_id=%d and wg_id=%d", r.Family, r.ICMPType, r.ICMPID, r.UnderlayIfIndex, existing.WGID, r.WGID)
+		}
+		icmpSeen[key] = r
 	}
 
 	type fwmarkKey struct {
