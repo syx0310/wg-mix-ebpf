@@ -8,7 +8,7 @@ BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/incl
 BPF_OBJECT ?= build/wg_mix_tc.o
 EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 
-.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-bpf-pkt test-netns-smoke test-netns-icmp-smoke test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-bpf prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-icmp-smoke test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-bpf prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -32,6 +32,9 @@ bpf-load-test: build
 
 test-netns-smoke: build
 	scripts/smoke-netns-wg.sh
+
+test-netns-xor-smoke: build
+	XOR_PASSWORD=wg-mix-ebpf-xor-smoke scripts/smoke-netns-wg.sh
 
 test-netns-icmp-smoke: build
 	scripts/smoke-netns-icmp.sh

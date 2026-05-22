@@ -16,12 +16,14 @@ func TestStructSizesAreStable(t *testing.T) {
 		{"ControlValue", unsafe.Sizeof(ControlValue{}), 16},
 		{"ProfileKey", unsafe.Sizeof(ProfileKey{}), 16},
 		{"ProfileValue", unsafe.Sizeof(ProfileValue{}), 48},
+		{"CipherKey", unsafe.Sizeof(CipherKey{}), 16},
+		{"CipherValue", unsafe.Sizeof(CipherValue{}), 288},
 		{"UnderlayConfigKey", unsafe.Sizeof(UnderlayConfigKey{}), 16},
 		{"UnderlayConfigValue", unsafe.Sizeof(UnderlayConfigValue{}), 16},
 		{"ManagedFwmarkKey", unsafe.Sizeof(ManagedFwmarkKey{}), 16},
 		{"ManagedFwmarkValue", unsafe.Sizeof(ManagedFwmarkValue{}), 16},
 		{"EgressRuleKey", unsafe.Sizeof(EgressRuleKey{}), 24},
-		{"EgressRuleValue", unsafe.Sizeof(EgressRuleValue{}), 24},
+		{"EgressRuleValue", unsafe.Sizeof(EgressRuleValue{}), 32},
 		{"IngressListenerKey", unsafe.Sizeof(IngressListenerKey{}), 16},
 		{"IngressListenerValue", unsafe.Sizeof(IngressListenerValue{}), 24},
 		{"ICMPListenerKey", unsafe.Sizeof(ICMPListenerKey{}), 16},
@@ -34,6 +36,9 @@ func TestStructSizesAreStable(t *testing.T) {
 	}
 	if got, want := unsafe.Offsetof(ICMPListenerValue{}.Flags), uintptr(20); got != want {
 		t.Fatalf("ICMPListenerValue.Flags offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(CipherValue{}.Mode), uintptr(280); got != want {
+		t.Fatalf("CipherValue.Mode offset = %d, want %d", got, want)
 	}
 }
 
@@ -48,6 +53,20 @@ func TestFromState(t *testing.T) {
 				MixedToStandard: [4]uint32{1, 2, 3, 4},
 			},
 		},
+		Ciphers: []control.CipherState{
+			{
+				ID:            1,
+				Name:          "xor",
+				Mode:          "xor",
+				Auth:          "none",
+				Scope:         "wg-payload-full",
+				KeyDerivation: "wgmx-hkdf256-v1",
+				KeyLen:        16,
+				KeyMask:       15,
+				MaxBytes:      2048,
+				Key:           [256]byte{1, 2, 3, 4},
+			},
+		},
 		Underlays: []control.UnderlayState{
 			{IfIndex: 2, Parser: "ethernet", Role: "transform", Resolved: true},
 		},
@@ -55,11 +74,11 @@ func TestFromState(t *testing.T) {
 			{Generation: 7, FwMark: 0x10000001, UnderlayIfIndex: 2, ActionOnMiss: "drop"},
 		},
 		EgressRules: []control.EgressRule{
-			{Generation: 7, Family: "ipv4", FwMark: 0x10000001, SourcePort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "rewrite", TransportMode: "icmp", ICMPRole: "client", ICMPID: 0x5303},
+			{Generation: 7, Family: "ipv4", FwMark: 0x10000001, SourcePort: 31001, UnderlayIfIndex: 2, ProfileID: 1, CipherID: 1, WGID: 1, Action: "rewrite", TransportMode: "icmp", ICMPRole: "client", ICMPID: 0x5303},
 		},
 		IngressListeners: []control.IngressListener{
 			{Generation: 7, Family: "ipv4", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "drop"},
-			{Generation: 7, Family: "ipv6", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "rewrite"},
+			{Generation: 7, Family: "ipv6", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, CipherID: 1, WGID: 1, Action: "rewrite"},
 		},
 		ICMPListeners: []control.ICMPListener{
 			{Generation: 7, Family: "ipv4", UnderlayIfIndex: 2, ICMPType: 0, ICMPID: 0x5303, ListenPort: 31001, ProfileID: 1, WGID: 1, Action: "rewrite", Role: "client"},
@@ -76,8 +95,12 @@ func TestFromState(t *testing.T) {
 	if snapshot.Underlays[UnderlayConfigKey{Generation: 7, UnderlayIndex: 2}].ParserMode != ParserEthernet {
 		t.Fatal("missing underlay parser mode")
 	}
+	cipher := snapshot.Ciphers[CipherKey{Generation: 7, CipherID: 1}]
+	if cipher.Mode != CipherModeXOR || cipher.KeyLen != 16 || cipher.Key[0] != 1 {
+		t.Fatal("missing xor cipher")
+	}
 	egress := snapshot.EgressRules[EgressRuleKey{Generation: 7, FwMark: 0x10000001, UnderlayIndex: 2, SourcePort: 31001, Family: FamilyIPv4}]
-	if egress.Action != ActionRewrite || egress.TransportMode != TransportICMP || egress.ICMPRole != ICMPRoleClient || egress.ICMPID != 0x5303 {
+	if egress.Action != ActionRewrite || egress.TransportMode != TransportICMP || egress.ICMPRole != ICMPRoleClient || egress.ICMPID != 0x5303 || egress.CipherID != 1 {
 		t.Fatal("missing egress rewrite rule")
 	}
 	if snapshot.ManagedFwmarks[ManagedFwmarkKey{Generation: 7, FwMark: 0x10000001, UnderlayIndex: 2}].ActionOnMiss != ActionDrop {
@@ -86,7 +109,7 @@ func TestFromState(t *testing.T) {
 	if snapshot.IngressListeners[IngressListenerKey{Generation: 7, UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv4}].Action != ActionDrop {
 		t.Fatal("missing ingress drop rule")
 	}
-	if snapshot.IngressListeners[IngressListenerKey{Generation: 7, UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv6}].Action != ActionRewrite {
+	if ingress := snapshot.IngressListeners[IngressListenerKey{Generation: 7, UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv6}]; ingress.Action != ActionRewrite || ingress.CipherID != 1 {
 		t.Fatal("missing ingress rewrite rule")
 	}
 	icmp := snapshot.ICMPListeners[ICMPListenerKey{Generation: 7, UnderlayIndex: 2, ICMPID: 0x5303, Family: FamilyIPv4, ICMPType: 0}]

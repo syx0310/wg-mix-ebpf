@@ -2,16 +2,23 @@ package control
 
 import (
 	"context"
+	"crypto/md5"
+	"crypto/sha256"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"os"
 	"sort"
+	"strings"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/profile"
 	"github.com/syx0310/wg-mix-ebpf/internal/runtime"
 	"github.com/syx0310/wg-mix-ebpf/internal/underlay"
 	"github.com/syx0310/wg-mix-ebpf/internal/wgconfig"
+	"golang.org/x/crypto/hkdf"
 )
 
 type BuildOptions struct {
@@ -23,6 +30,7 @@ type WGConfigLoader func(path string) (*wgconfig.Interface, error)
 type State struct {
 	Generation       uint64              `json:"generation"`
 	Profiles         []ProfileState      `json:"profiles"`
+	Ciphers          []CipherState       `json:"ciphers,omitempty"`
 	WireGuards       []WireGuardState    `json:"wireguards"`
 	Underlays        []UnderlayState     `json:"underlays"`
 	ManagedFwmarks   []ManagedFwmarkRule `json:"managed_fwmarks"`
@@ -39,12 +47,28 @@ type ProfileState struct {
 	MixedToStandard [4]uint32 `json:"mixed_to_standard"`
 }
 
+type CipherState struct {
+	ID            uint32    `json:"id"`
+	Name          string    `json:"name"`
+	Mode          string    `json:"mode"`
+	Auth          string    `json:"auth"`
+	Scope         string    `json:"scope"`
+	KeyDerivation string    `json:"key_derivation"`
+	KeyLen        uint32    `json:"key_len"`
+	KeyMask       uint32    `json:"key_mask"`
+	MaxBytes      uint32    `json:"max_bytes"`
+	Flags         uint32    `json:"flags"`
+	Key           [256]byte `json:"-"`
+}
+
 type WireGuardState struct {
 	ID                    uint32 `json:"id"`
 	Name                  string `json:"name"`
 	ConfigPath            string `json:"config_path"`
 	Profile               string `json:"profile"`
 	ProfileID             uint32 `json:"profile_id"`
+	Cipher                string `json:"cipher,omitempty"`
+	CipherID              uint32 `json:"cipher_id,omitempty"`
 	ConfigFwMark          uint32 `json:"config_fwmark"`
 	ConfigListenPort      uint16 `json:"config_listen_port,omitempty"`
 	RuntimeFirewallMark   uint32 `json:"runtime_firewall_mark,omitempty"`
@@ -82,6 +106,7 @@ type EgressRule struct {
 	SourcePort      uint16 `json:"source_port"`
 	UnderlayIfIndex int    `json:"underlay_ifindex"`
 	ProfileID       uint32 `json:"profile_id"`
+	CipherID        uint32 `json:"cipher_id,omitempty"`
 	WGID            uint32 `json:"wg_id"`
 	Action          string `json:"action"`
 	TransportMode   string `json:"transport_mode,omitempty"`
@@ -95,6 +120,7 @@ type IngressListener struct {
 	DestinationPort uint16 `json:"destination_port"`
 	UnderlayIfIndex int    `json:"underlay_ifindex"`
 	ProfileID       uint32 `json:"profile_id"`
+	CipherID        uint32 `json:"cipher_id,omitempty"`
 	WGID            uint32 `json:"wg_id"`
 	Action          string `json:"action"`
 }
@@ -115,6 +141,7 @@ type ICMPListener struct {
 
 const (
 	ICMPListenerFlagWildcardID uint32 = 1 << 0
+	CipherFlagPrefix           uint32 = 1 << 0
 )
 
 func (s *State) JSON() ([]byte, error) {
@@ -141,6 +168,16 @@ func BuildState(ctx context.Context, cfg *config.Config, rt runtime.Provider, re
 			MixedToStandard: compiled.MixedToStandard,
 		})
 	}
+	compiledCiphers, err := compileCiphers(cfg.Ciphers)
+	if err != nil {
+		return nil, err
+	}
+	cipherIDs := assignCipherIDs(compiledCiphers)
+	for _, name := range sortedCipherNames(compiledCiphers) {
+		compiled := compiledCiphers[name]
+		compiled.ID = cipherIDs[name]
+		state.Ciphers = append(state.Ciphers, compiled)
+	}
 
 	underlayStates, err := buildUnderlayStates(ctx, cfg, resolver, opts)
 	if err != nil {
@@ -150,7 +187,7 @@ func BuildState(ctx context.Context, cfg *config.Config, rt runtime.Provider, re
 
 	for i, wg := range cfg.WireGuards {
 		wgID := uint32(i + 1)
-		wgState, err := buildWireGuardState(ctx, cfg, wg, wgID, profileIDs[wg.Profile], rt, loadWG, opts)
+		wgState, err := buildWireGuardState(ctx, cfg, wg, wgID, profileIDs[wg.Profile], cipherIDs[wg.Cipher], rt, loadWG, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -225,7 +262,7 @@ func hasPrefix(value string, prefix string) bool {
 	return len(value) >= len(prefix) && value[:len(prefix)] == prefix
 }
 
-func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.WireGuard, wgID uint32, profileID uint32, rt runtime.Provider, loadWG WGConfigLoader, opts BuildOptions) (*WireGuardState, error) {
+func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.WireGuard, wgID uint32, profileID uint32, cipherID uint32, rt runtime.Provider, loadWG WGConfigLoader, opts BuildOptions) (*WireGuardState, error) {
 	parsed, err := loadWG(wg.Config)
 	if err != nil {
 		return nil, fmt.Errorf("read wg config for %s: %w", wg.Name, err)
@@ -246,6 +283,8 @@ func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.Wire
 		ConfigPath:    wg.Config,
 		Profile:       wg.Profile,
 		ProfileID:     profileID,
+		Cipher:        wg.Cipher,
+		CipherID:      cipherID,
 		ConfigFwMark:  *parsed.FwMark,
 		TransportMode: wg.Transport.Mode,
 		ICMPRole:      wg.Transport.ICMP.Role,
@@ -301,6 +340,7 @@ func (s *State) buildRules(cfg *config.Config) {
 						DestinationPort: wg.RuntimeListenPort,
 						UnderlayIfIndex: u.IfIndex,
 						ProfileID:       wg.ProfileID,
+						CipherID:        wg.CipherID,
 						WGID:            wg.ID,
 						Action:          "drop",
 					})
@@ -314,6 +354,7 @@ func (s *State) buildRules(cfg *config.Config) {
 						SourcePort:      wg.RuntimeListenPort,
 						UnderlayIfIndex: u.IfIndex,
 						ProfileID:       wg.ProfileID,
+						CipherID:        wg.CipherID,
 						WGID:            wg.ID,
 						Action:          "rewrite",
 						TransportMode:   wg.TransportMode,
@@ -352,6 +393,7 @@ func (s *State) buildRules(cfg *config.Config) {
 					SourcePort:      wg.RuntimeListenPort,
 					UnderlayIfIndex: u.IfIndex,
 					ProfileID:       wg.ProfileID,
+					CipherID:        wg.CipherID,
 					WGID:            wg.ID,
 					Action:          "rewrite",
 					TransportMode:   wg.TransportMode,
@@ -364,11 +406,82 @@ func (s *State) buildRules(cfg *config.Config) {
 					DestinationPort: wg.RuntimeListenPort,
 					UnderlayIfIndex: u.IfIndex,
 					ProfileID:       wg.ProfileID,
+					CipherID:        wg.CipherID,
 					WGID:            wg.ID,
 					Action:          "rewrite",
 				})
 			}
 		}
+	}
+}
+
+func compileCiphers(ciphers map[string]config.Cipher) (map[string]CipherState, error) {
+	out := make(map[string]CipherState, len(ciphers))
+	for name, cipher := range ciphers {
+		key, err := deriveCipherKey(name, cipher)
+		if err != nil {
+			return nil, err
+		}
+		flags := uint32(0)
+		if cipher.Scope == "wg-payload-prefix" {
+			flags |= CipherFlagPrefix
+		}
+		out[name] = CipherState{
+			Name:          name,
+			Mode:          cipher.Mode,
+			Auth:          cipher.Auth,
+			Scope:         cipher.Scope,
+			KeyDerivation: cipher.KeyDerivation,
+			KeyLen:        cipher.KeyLen,
+			KeyMask:       cipher.KeyLen - 1,
+			MaxBytes:      cipher.MaxBytes,
+			Flags:         flags,
+			Key:           key,
+		}
+	}
+	return out, nil
+}
+
+func deriveCipherKey(name string, cipher config.Cipher) ([256]byte, error) {
+	var out [256]byte
+	secret, err := cipherSecretBytes(cipher)
+	if err != nil {
+		return out, fmt.Errorf("derive cipher %q: %w", name, err)
+	}
+	switch cipher.KeyDerivation {
+	case "wgmx-hkdf256-v1":
+		reader := hkdf.New(sha256.New, secret, nil, []byte("wg-mix-ebpf xor symmetric v1"))
+		if _, err := io.ReadFull(reader, out[:cipher.KeyLen]); err != nil {
+			return out, err
+		}
+	case "udp2raw-md5-key1":
+		sum := md5.Sum(append(secret, []byte("key1")...))
+		for i := uint32(0); i < cipher.KeyLen; i++ {
+			out[i] = sum[i%uint32(len(sum))]
+		}
+	default:
+		return out, fmt.Errorf("unsupported key_derivation %q", cipher.KeyDerivation)
+	}
+	return out, nil
+}
+
+func cipherSecretBytes(cipher config.Cipher) ([]byte, error) {
+	switch {
+	case cipher.SecretFile != "":
+		data, err := os.ReadFile(cipher.SecretFile)
+		if err != nil {
+			return nil, err
+		}
+		return []byte(strings.TrimSpace(string(data))), nil
+	case cipher.Secret != "":
+		if strings.HasPrefix(cipher.Secret, "base64:") {
+			return base64.StdEncoding.DecodeString(strings.TrimPrefix(cipher.Secret, "base64:"))
+		}
+		return []byte(cipher.Secret), nil
+	case cipher.Password != "":
+		return []byte(cipher.Password), nil
+	default:
+		return nil, errors.New("missing secret material")
 	}
 }
 
@@ -441,9 +554,27 @@ func assignProfileIDs(profiles map[string]profile.Compiled) map[string]uint32 {
 	return ids
 }
 
+func assignCipherIDs(ciphers map[string]CipherState) map[string]uint32 {
+	names := sortedCipherNames(ciphers)
+	ids := make(map[string]uint32, len(names))
+	for i, name := range names {
+		ids[name] = uint32(i + 1)
+	}
+	return ids
+}
+
 func sortedProfileNames(profiles map[string]profile.Compiled) []string {
 	names := make([]string, 0, len(profiles))
 	for name := range profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
+}
+
+func sortedCipherNames(ciphers map[string]CipherState) []string {
+	names := make([]string, 0, len(ciphers))
+	for name := range ciphers {
 		names = append(names, name)
 	}
 	sort.Strings(names)
