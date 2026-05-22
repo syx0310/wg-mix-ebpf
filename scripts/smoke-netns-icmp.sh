@@ -182,6 +182,12 @@ run_negative_checks() {
     failures+=("ordinary underlay ping was dropped by ICMP server wildcard listener")
   fi
 
+  if ip netns exec "${NSC}" ping -c 1 -W 2 -e 0 "${SERVER_UNDER}" >/dev/null; then
+    echo "ordinary underlay ping with ICMP id 0 passed"
+  else
+    failures+=("ordinary underlay ping with ICMP id 0 was dropped by ICMP server wildcard listener")
+  fi
+
   rx_before="$(wg_rx_bytes)"
   run_agent_in_netns "${NSC}" "${PINC}" detach --config "${TMPDIR}/agent-client.yaml" >/dev/null
   ip netns exec "${NSC}" wg set wg0 peer "${SERVER_PUB}" endpoint "${SERVER_ENDPOINT}"
@@ -193,6 +199,18 @@ run_negative_checks() {
     failures+=("raw UDP WireGuard reached ICMP-managed ListenPort: server_rx ${rx_before}->${rx_after}")
   else
     echo "raw UDP WireGuard did not increase server receive bytes"
+  fi
+
+  rx_before="$(wg_rx_bytes)"
+  ip netns exec "${NSC}" wg set wg0 peer "${SERVER_PUB}" endpoint "[${SERVER_UNDER6}]:31002"
+  ip netns exec "${NSC}" ping -c 3 -W 1 10.78.0.2 >/dev/null 2>&1 || true
+  sleep 1
+  rx_after="$(wg_rx_bytes)"
+
+  if ((rx_after > rx_before)); then
+    failures+=("raw IPv6 UDP WireGuard reached ICMP-managed ListenPort: server_rx ${rx_before}->${rx_after}")
+  else
+    echo "raw IPv6 UDP WireGuard did not increase server receive bytes"
   fi
 
   if ((${#failures[@]} == 0)); then
@@ -231,20 +249,31 @@ CLIENT_UNDER="192.0.2.1"
 CLIENT_GW="192.0.2.254"
 SERVER_UNDER="198.51.100.1"
 SERVER_GW="198.51.100.254"
+CLIENT_UNDER6="2001:db8:78:1::1"
+CLIENT_GW6="2001:db8:78:1::ffff"
+SERVER_UNDER6="2001:db8:78:2::1"
+SERVER_GW6="2001:db8:78:2::ffff"
 SERVER_ENDPOINT="${SERVER_UNDER}:31002"
 
 ip -n "${NSC}" addr add "${CLIENT_UNDER}/24" dev under0
 ip -n "${NSR}" addr add "${CLIENT_GW}/24" dev rc0
 ip -n "${NSS}" addr add "${SERVER_UNDER}/24" dev under0
 ip -n "${NSR}" addr add "${SERVER_GW}/24" dev rs0
+ip -n "${NSC}" addr add "${CLIENT_UNDER6}/64" dev under0
+ip -n "${NSR}" addr add "${CLIENT_GW6}/64" dev rc0
+ip -n "${NSS}" addr add "${SERVER_UNDER6}/64" dev under0
+ip -n "${NSR}" addr add "${SERVER_GW6}/64" dev rs0
 ip -n "${NSC}" link set under0 up
 ip -n "${NSR}" link set rc0 up
 ip -n "${NSS}" link set under0 up
 ip -n "${NSR}" link set rs0 up
 
 ip netns exec "${NSR}" sysctl -qw net.ipv4.ip_forward=1
+ip netns exec "${NSR}" sysctl -qw net.ipv6.conf.all.forwarding=1
 ip -n "${NSC}" route add default via "${CLIENT_GW}" dev under0
 ip -n "${NSS}" route add default via "${SERVER_GW}" dev under0
+ip -n "${NSC}" -6 route add default via "${CLIENT_GW6}" dev under0
+ip -n "${NSS}" -6 route add default via "${SERVER_GW6}" dev under0
 
 wg genkey >"${TMPDIR}/client.key"
 wg pubkey <"${TMPDIR}/client.key" >"${TMPDIR}/client.pub"

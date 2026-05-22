@@ -172,13 +172,14 @@ profiles:
 	if state.EgressRules[0].ICMPRole != "client" || state.EgressRules[0].ICMPID != 0x5303 {
 		t.Fatalf("icmp egress = role %q id %d", state.EgressRules[0].ICMPRole, state.EgressRules[0].ICMPID)
 	}
-	if len(state.IngressListeners) != 1 {
+	if len(state.IngressListeners) != 2 {
 		t.Fatalf("udp ingress listeners = %d", len(state.IngressListeners))
 	}
 	udpDrop := requireIngressListener(t, state, "ipv4", 31001, "drop")
 	if udpDrop.UnderlayIfIndex != 2 {
 		t.Fatalf("udp drop underlay = %d", udpDrop.UnderlayIfIndex)
 	}
+	requireIngressListener(t, state, "ipv6", 31001, "drop")
 	if len(state.ICMPListeners) != 1 {
 		t.Fatalf("icmp listeners = %d", len(state.ICMPListeners))
 	}
@@ -236,10 +237,11 @@ profiles:
 	if state.ICMPListeners[0].ICMPType != 8 || state.ICMPListeners[0].ICMPID != 0 {
 		t.Fatalf("server icmp listener = type %d id %d", state.ICMPListeners[0].ICMPType, state.ICMPListeners[0].ICMPID)
 	}
-	if len(state.IngressListeners) != 1 {
+	if len(state.IngressListeners) != 2 {
 		t.Fatalf("udp ingress listeners = %d", len(state.IngressListeners))
 	}
 	requireIngressListener(t, state, "ipv4", 52000, "drop")
+	requireIngressListener(t, state, "ipv6", 52000, "drop")
 	if state.ICMPListeners[0].Flags&ICMPListenerFlagWildcardID == 0 {
 		t.Fatalf("server icmp listener flags = 0x%x, missing wildcard-id flag", state.ICMPListeners[0].Flags)
 	}

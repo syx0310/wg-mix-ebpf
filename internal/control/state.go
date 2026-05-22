@@ -294,23 +294,32 @@ func (s *State) buildRules(cfg *config.Config) {
 				ActionOnMiss:    cfg.Policy.ManagedEgressMapMiss,
 			})
 			for _, family := range []string{"ipv4", "ipv6"} {
-				if wg.TransportMode == "icmp" && family == "ipv6" {
-					continue
-				}
-				s.EgressRules = append(s.EgressRules, EgressRule{
-					Generation:      s.Generation,
-					Family:          family,
-					FwMark:          wg.RuntimeFirewallMark,
-					SourcePort:      wg.RuntimeListenPort,
-					UnderlayIfIndex: u.IfIndex,
-					ProfileID:       wg.ProfileID,
-					WGID:            wg.ID,
-					Action:          "rewrite",
-					TransportMode:   wg.TransportMode,
-					ICMPRole:        wg.ICMPRole,
-					ICMPID:          wg.ICMPID,
-				})
 				if wg.TransportMode == "icmp" {
+					s.IngressListeners = append(s.IngressListeners, IngressListener{
+						Generation:      s.Generation,
+						Family:          family,
+						DestinationPort: wg.RuntimeListenPort,
+						UnderlayIfIndex: u.IfIndex,
+						ProfileID:       wg.ProfileID,
+						WGID:            wg.ID,
+						Action:          "drop",
+					})
+					if family == "ipv6" {
+						continue
+					}
+					s.EgressRules = append(s.EgressRules, EgressRule{
+						Generation:      s.Generation,
+						Family:          family,
+						FwMark:          wg.RuntimeFirewallMark,
+						SourcePort:      wg.RuntimeListenPort,
+						UnderlayIfIndex: u.IfIndex,
+						ProfileID:       wg.ProfileID,
+						WGID:            wg.ID,
+						Action:          "rewrite",
+						TransportMode:   wg.TransportMode,
+						ICMPRole:        wg.ICMPRole,
+						ICMPID:          wg.ICMPID,
+					})
 					icmpType := uint8(8)
 					icmpID := wg.ICMPID
 					icmpFlags := uint32(0)
@@ -334,17 +343,21 @@ func (s *State) buildRules(cfg *config.Config) {
 						Role:            wg.ICMPRole,
 						Flags:           icmpFlags,
 					})
-					s.IngressListeners = append(s.IngressListeners, IngressListener{
-						Generation:      s.Generation,
-						Family:          family,
-						DestinationPort: wg.RuntimeListenPort,
-						UnderlayIfIndex: u.IfIndex,
-						ProfileID:       wg.ProfileID,
-						WGID:            wg.ID,
-						Action:          "drop",
-					})
 					continue
 				}
+				s.EgressRules = append(s.EgressRules, EgressRule{
+					Generation:      s.Generation,
+					Family:          family,
+					FwMark:          wg.RuntimeFirewallMark,
+					SourcePort:      wg.RuntimeListenPort,
+					UnderlayIfIndex: u.IfIndex,
+					ProfileID:       wg.ProfileID,
+					WGID:            wg.ID,
+					Action:          "rewrite",
+					TransportMode:   wg.TransportMode,
+					ICMPRole:        wg.ICMPRole,
+					ICMPID:          wg.ICMPID,
+				})
 				s.IngressListeners = append(s.IngressListeners, IngressListener{
 					Generation:      s.Generation,
 					Family:          family,
