@@ -31,6 +31,49 @@ standard type_word <-> mixed type_word
 
 It does not rewrite IP addresses, UDP ports, WireGuard indexes, counters, MACs, ciphertext, peer endpoints, routes, DNS, or DDNS state.
 
+## Transport Modes
+
+Supported transport modes:
+
+```text
+udp
+icmp
+```
+
+`udp` is the default and is the original transparent type-word mode.
+
+`icmp` is an experimental IPv4-only raw transport mode. It changes the outer IPv4 protocol from UDP to ICMP and replaces the 8-byte UDP header with an 8-byte ICMP Echo header. The WireGuard payload is still protected by WireGuard and still uses the same mixed type-word profile.
+
+ICMP mode roles:
+
+```text
+client:
+  emits Echo Request
+  accepts Echo Reply
+  requires a nonzero 16-bit icmp.id
+
+server:
+  accepts Echo Request
+  emits Echo Reply
+  uses wildcard ingress id by default to tolerate NAT ICMP id rewriting
+  preserves NAT-rewritten Echo sequence values with runtime kernel state
+```
+
+MVP ICMP limitations:
+
+```text
+IPv4 only
+single client profile per server listener unless ids are made unique
+no fakeTCP
+no udp2raw wire compatibility
+no extra encryption/auth/anti-replay beyond WireGuard itself
+no ICMPv6
+no outer fragmentation support
+performance depends on packet size and checksum/offload shape; small WG packets use bounded full ICMP checksum, larger packets use a UDP-checksum-derived fast path
+```
+
+`faketcp` and `faketcp-lite` are reserved names and are rejected by config validation in this version.
+
 ## Linux Platform Support
 
 Tier 1 for the MVP:
@@ -106,6 +149,8 @@ TX-side packet captures can show invalid UDP checksums when hardware or virtio c
 
 The parser supports ordinary IPv6 UDP and has netns-level validation. Production use with IPv6 underlay should still be validated on the target network path, especially when extension headers or fragments are possible.
 
+ICMP transport does not support IPv6/ICMPv6 in the MVP.
+
 MVP behavior:
 
 ```text
@@ -133,4 +178,3 @@ PostUp = wg set %i fwmark 0x...
 ```
 
 The live WireGuard runtime `FirewallMark` must match the expected config value by default. `require_nonzero_fwmark=false` and zero-mark fallback are reserved and intentionally rejected by the MVP.
-

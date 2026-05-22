@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	Version uint32 = 4
+	Version uint32 = 5
 
 	FamilyAny  uint8 = 0
 	FamilyIPv4 uint8 = 4
@@ -23,6 +23,13 @@ const (
 	ParserAuto     uint8 = 0
 	ParserEthernet uint8 = 1
 	ParserL3       uint8 = 2
+
+	TransportUDP  uint8 = 0
+	TransportICMP uint8 = 1
+
+	ICMPRoleNone   uint8 = 0
+	ICMPRoleClient uint8 = 1
+	ICMPRoleServer uint8 = 2
 )
 
 type ControlKey uint32
@@ -91,11 +98,14 @@ type EgressRuleKey struct {
 }
 
 type EgressRuleValue struct {
-	Generation uint64
-	ProfileID  uint32
-	WGID       uint32
-	Action     uint8
-	_          [7]byte
+	Generation    uint64
+	ProfileID     uint32
+	WGID          uint32
+	ICMPID        uint16
+	Action        uint8
+	TransportMode uint8
+	ICMPRole      uint8
+	_             [3]byte
 }
 
 func (v EgressRuleValue) MapGeneration() uint64 { return v.Generation }
@@ -118,6 +128,26 @@ type IngressListenerValue struct {
 
 func (v IngressListenerValue) MapGeneration() uint64 { return v.Generation }
 
+type ICMPListenerKey struct {
+	Generation    uint64
+	UnderlayIndex uint32
+	ICMPID        uint16
+	Family        uint8
+	ICMPType      uint8
+}
+
+type ICMPListenerValue struct {
+	Generation uint64
+	ProfileID  uint32
+	WGID       uint32
+	ListenPort uint16
+	Action     uint8
+	Role       uint8
+	_          [4]byte
+}
+
+func (v ICMPListenerValue) MapGeneration() uint64 { return v.Generation }
+
 type Snapshot struct {
 	Control          map[ControlKey]ControlValue
 	Profiles         map[ProfileKey]ProfileValue
@@ -125,6 +155,7 @@ type Snapshot struct {
 	ManagedFwmarks   map[ManagedFwmarkKey]ManagedFwmarkValue
 	EgressRules      map[EgressRuleKey]EgressRuleValue
 	IngressListeners map[IngressListenerKey]IngressListenerValue
+	ICMPListeners    map[ICMPListenerKey]ICMPListenerValue
 }
 
 type MapEntry[K comparable, V any] struct {
@@ -140,6 +171,7 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 		ManagedFwmarks   []MapEntry[ManagedFwmarkKey, ManagedFwmarkValue]     `json:"managed_fwmarks"`
 		EgressRules      []MapEntry[EgressRuleKey, EgressRuleValue]           `json:"egress_rules"`
 		IngressListeners []MapEntry[IngressListenerKey, IngressListenerValue] `json:"ingress_listeners"`
+		ICMPListeners    []MapEntry[ICMPListenerKey, ICMPListenerValue]       `json:"icmp_listeners"`
 	}
 	return json.Marshal(view{
 		Control:          mapEntries(s.Control),
@@ -148,6 +180,7 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 		ManagedFwmarks:   mapEntries(s.ManagedFwmarks),
 		EgressRules:      mapEntries(s.EgressRules),
 		IngressListeners: mapEntries(s.IngressListeners),
+		ICMPListeners:    mapEntries(s.ICMPListeners),
 	})
 }
 
@@ -176,6 +209,7 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 		ManagedFwmarks:   make(map[ManagedFwmarkKey]ManagedFwmarkValue, len(state.ManagedFwmarks)),
 		EgressRules:      make(map[EgressRuleKey]EgressRuleValue, len(state.EgressRules)),
 		IngressListeners: make(map[IngressListenerKey]IngressListenerValue, len(state.IngressListeners)),
+		ICMPListeners:    make(map[ICMPListenerKey]ICMPListenerValue, len(state.ICMPListeners)),
 	}
 	for _, p := range state.Profiles {
 		out.Profiles[ProfileKey{Generation: generation, ProfileID: p.ID}] = ProfileValue{
@@ -223,6 +257,14 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 		if err != nil {
 			return nil, err
 		}
+		transport, err := parseTransport(r.TransportMode)
+		if err != nil {
+			return nil, err
+		}
+		role, err := parseICMPRole(r.ICMPRole)
+		if err != nil {
+			return nil, err
+		}
 		out.EgressRules[EgressRuleKey{
 			Generation:    generation,
 			FwMark:        r.FwMark,
@@ -230,10 +272,13 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 			SourcePort:    r.SourcePort,
 			Family:        family,
 		}] = EgressRuleValue{
-			Generation: generation,
-			ProfileID:  r.ProfileID,
-			WGID:       r.WGID,
-			Action:     action,
+			Generation:    generation,
+			ProfileID:     r.ProfileID,
+			WGID:          r.WGID,
+			ICMPID:        r.ICMPID,
+			Action:        action,
+			TransportMode: transport,
+			ICMPRole:      role,
 		}
 	}
 	for _, r := range state.IngressListeners {
@@ -255,6 +300,34 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 			ProfileID:  r.ProfileID,
 			WGID:       r.WGID,
 			Action:     action,
+		}
+	}
+	for _, r := range state.ICMPListeners {
+		family, err := parseFamily(r.Family)
+		if err != nil {
+			return nil, err
+		}
+		action, err := parseAction(r.Action)
+		if err != nil {
+			return nil, err
+		}
+		role, err := parseICMPRole(r.Role)
+		if err != nil {
+			return nil, err
+		}
+		out.ICMPListeners[ICMPListenerKey{
+			Generation:    generation,
+			UnderlayIndex: uint32(r.UnderlayIfIndex),
+			ICMPID:        r.ICMPID,
+			Family:        family,
+			ICMPType:      r.ICMPType,
+		}] = ICMPListenerValue{
+			Generation: generation,
+			ProfileID:  r.ProfileID,
+			WGID:       r.WGID,
+			ListenPort: r.ListenPort,
+			Action:     action,
+			Role:       role,
 		}
 	}
 	return out, nil
@@ -296,5 +369,29 @@ func parseAction(action string) (uint8, error) {
 		return ActionRewrite, nil
 	default:
 		return 0, fmt.Errorf("unsupported action %q", action)
+	}
+}
+
+func parseTransport(value string) (uint8, error) {
+	switch value {
+	case "", "udp":
+		return TransportUDP, nil
+	case "icmp":
+		return TransportICMP, nil
+	default:
+		return 0, fmt.Errorf("unsupported transport mode %q", value)
+	}
+}
+
+func parseICMPRole(value string) (uint8, error) {
+	switch value {
+	case "":
+		return ICMPRoleNone, nil
+	case "client":
+		return ICMPRoleClient, nil
+	case "server":
+		return ICMPRoleServer, nil
+	default:
+		return 0, fmt.Errorf("unsupported icmp role %q", value)
 	}
 }

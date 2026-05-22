@@ -219,6 +219,7 @@ func pinnedMapNames() []string {
 		"managed_fwmark_map",
 		"egress_rule_map",
 		"ingress_listener_map",
+		"icmp_listener_map",
 		"stats_map",
 	}
 }
@@ -257,6 +258,9 @@ func populateDataMaps(coll *ebpf.Collection, snapshot *abi.Snapshot) error {
 	if err := updateMap(coll, "ingress_listener_map", snapshot.IngressListeners); err != nil {
 		return err
 	}
+	if err := updateMap(coll, "icmp_listener_map", snapshot.ICMPListeners); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -291,6 +295,7 @@ func deleteStaleMapEntries(coll *ebpf.Collection, snapshot *abi.Snapshot) error 
 		deleteStaleEntries(coll, "managed_fwmark_map", snapshot.ManagedFwmarks),
 		deleteStaleEntries(coll, "egress_rule_map", snapshot.EgressRules),
 		deleteStaleEntries(coll, "ingress_listener_map", snapshot.IngressListeners),
+		deleteStaleEntries(coll, "icmp_listener_map", snapshot.ICMPListeners),
 	)
 }
 
@@ -301,6 +306,7 @@ func deleteGenerationMapEntries(coll *ebpf.Collection, generation uint64) error 
 		deleteEntriesByGeneration[abi.ManagedFwmarkKey, abi.ManagedFwmarkValue](coll, "managed_fwmark_map", generation),
 		deleteEntriesByGeneration[abi.EgressRuleKey, abi.EgressRuleValue](coll, "egress_rule_map", generation),
 		deleteEntriesByGeneration[abi.IngressListenerKey, abi.IngressListenerValue](coll, "ingress_listener_map", generation),
+		deleteEntriesByGeneration[abi.ICMPListenerKey, abi.ICMPListenerValue](coll, "icmp_listener_map", generation),
 	)
 }
 

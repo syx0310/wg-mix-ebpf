@@ -9,6 +9,8 @@ wireguards:
   - name: wg0
     config: configs/wg0.example.conf
     profile: mix-default
+    transport:
+      mode: udp
 
 profiles:
   mix-default:

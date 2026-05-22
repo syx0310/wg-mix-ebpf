@@ -110,6 +110,114 @@ func TestBuildStateRuntimeRules(t *testing.T) {
 	}
 }
 
+func TestBuildStateICMPTransportRules(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    config: /tmp/wg0.conf
+    profile: mix-default
+    transport:
+      mode: icmp
+      icmp:
+        role: client
+        id: 0x5303
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mark := uint32(0x10000002)
+	state, err := BuildState(
+		context.Background(),
+		cfg,
+		runtime.StaticProvider{Devices: map[string]*runtime.Device{
+			"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: mark, Up: true},
+		}},
+		underlay.StaticResolver{Underlays: map[string]*underlay.Resolved{
+			"eth0": {IfName: "eth0", IfIndex: 2, LinkType: "ethernet", Role: "transform"},
+		}},
+		func(string) (*wgconfig.Interface, error) {
+			return &wgconfig.Interface{FwMark: &mark}, nil
+		},
+		BuildOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.EgressRules) != 1 {
+		t.Fatalf("icmp egress rules = %d", len(state.EgressRules))
+	}
+	if got := state.EgressRules[0].TransportMode; got != "icmp" {
+		t.Fatalf("transport mode = %q", got)
+	}
+	if state.EgressRules[0].ICMPRole != "client" || state.EgressRules[0].ICMPID != 0x5303 {
+		t.Fatalf("icmp egress = role %q id %d", state.EgressRules[0].ICMPRole, state.EgressRules[0].ICMPID)
+	}
+	if len(state.IngressListeners) != 0 {
+		t.Fatalf("udp ingress listeners = %d", len(state.IngressListeners))
+	}
+	if len(state.ICMPListeners) != 1 {
+		t.Fatalf("icmp listeners = %d", len(state.ICMPListeners))
+	}
+	listener := state.ICMPListeners[0]
+	if listener.ICMPType != 0 || listener.ICMPID != 0x5303 || listener.ListenPort != 31001 {
+		t.Fatalf("icmp listener = type %d id %d listen %d", listener.ICMPType, listener.ICMPID, listener.ListenPort)
+	}
+}
+
+func TestBuildStateICMPServerUsesWildcardRequestID(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    config: /tmp/wg0.conf
+    profile: mix-default
+    transport:
+      mode: icmp
+      icmp:
+        role: server
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mark := uint32(0x10000002)
+	state, err := BuildState(
+		context.Background(),
+		cfg,
+		runtime.StaticProvider{Devices: map[string]*runtime.Device{
+			"wg0": {Name: "wg0", ListenPort: 52000, FirewallMark: mark, Up: true},
+		}},
+		underlay.StaticResolver{Underlays: map[string]*underlay.Resolved{
+			"eth0": {IfName: "eth0", IfIndex: 2, LinkType: "ethernet", Role: "transform"},
+		}},
+		func(string) (*wgconfig.Interface, error) {
+			return &wgconfig.Interface{FwMark: &mark}, nil
+		},
+		BuildOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.ICMPListeners) != 1 {
+		t.Fatalf("icmp listeners = %d", len(state.ICMPListeners))
+	}
+	if state.ICMPListeners[0].ICMPType != 8 || state.ICMPListeners[0].ICMPID != 0 {
+		t.Fatalf("server icmp listener = type %d id %d", state.ICMPListeners[0].ICMPType, state.ICMPListeners[0].ICMPID)
+	}
+}
+
 func TestBuildStateHonorsConfiguredUnderlayParser(t *testing.T) {
 	cfg, err := config.Load([]byte(`
 version: 1

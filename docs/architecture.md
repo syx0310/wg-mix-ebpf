@@ -4,7 +4,7 @@
 
 ## Boundary
 
-The dataplane only rewrites the first four bytes of the WireGuard UDP payload:
+The default UDP transport only rewrites the first four bytes of the WireGuard UDP payload:
 
 ```text
 egress: standard type_word -> mixed type_word
@@ -24,6 +24,8 @@ peer endpoints
 routes
 DNS or DDNS records
 ```
+
+The experimental ICMP transport keeps the same WireGuard payload transform, but also replaces the fixed-size outer UDP header with an ICMP Echo header on IPv4. UDP and ICMP Echo headers are both 8 bytes, so packet length is unchanged.
 
 Both WireGuard endpoints must run standard kernel WireGuard plus this transparent transform layer.
 
@@ -120,6 +122,36 @@ network receives mixed UDP packet
 
 Peer endpoint changes, NAT source-port changes, and DDNS changes do not alter BPF maps because endpoints are not part of dataplane matching.
 
+ICMP transport egress:
+
+```text
+WireGuard sends standard UDP packet
+  -> TC egress on underlay
+  -> match runtime FirewallMark + runtime ListenPort + underlay ifindex
+  -> validate WireGuard packet shape
+  -> rewrite type_word to mixed value
+  -> IPv4 protocol UDP -> ICMP
+  -> UDP header -> ICMP Echo Request/Reply header
+  -> recompute IPv4 header checksum and ICMP checksum
+```
+
+ICMP transport ingress:
+
+```text
+network receives ICMP Echo packet
+  -> TC ingress on underlay
+  -> match ICMP role/type/id rule
+  -> validate mixed WireGuard payload shape
+  -> rewrite type_word to standard value
+  -> IPv4 protocol ICMP -> UDP
+  -> ICMP Echo header -> UDP header with local runtime ListenPort
+  -> standard kernel WireGuard receives packet
+```
+
+For ICMP server mode, ingress uses the observed Echo `id` as the synthetic UDP source port. WireGuard then naturally carries that value in the return packet destination port, allowing egress to emit an Echo Reply with the same `id`.
+
+Some NAT devices rewrite the ICMP Echo `sequence` field while keeping the Echo `id`. ICMP server ingress records the observed `remote IPv4 + Echo id -> sequence` in a small kernel LRU map. Server egress uses that value when emitting Echo Replies, so the return packet matches the NAT-created ICMP state.
+
 ## Checksums And Offload
 
 The dataplane reads and writes the WireGuard type word with skb helpers rather than requiring the UDP payload to be in the direct-access linear skb area. This is required on hosts where TX checksum offload, GSO, or GRO changes skb layout.
@@ -133,6 +165,13 @@ egress:
 ingress:
   bpf_l4_csum_replace(...)
   bpf_skb_store_bytes(..., BPF_F_INVALIDATE_HASH)
+
+ICMP egress:
+  bounded full ICMP checksum for small WG packets
+  UDP-checksum-derived ICMP checksum for larger WG packets
+
+ICMP ingress:
+  IPv4 UDP checksum 0 after ICMP -> UDP conversion
 ```
 
 Status exposes load/store/checksum errors and direction-specific GSO counters:
@@ -171,6 +210,12 @@ egress_rule_map
 
 ingress_listener_map
   Generation-scoped ingress listener rules.
+
+icmp_listener_map
+  Generation-scoped ICMP Echo listener rules for IPv4 ICMP transport.
+
+icmp_seq_map
+  Runtime LRU state for ICMP server replies when an upstream NAT rewrites Echo sequence.
 
 managed_fwmark_map
   Egress fail-closed guard for managed marks.
