@@ -42,6 +42,17 @@ icmp
 
 `udp` is the default and is the original transparent type-word mode.
 
+UDP transport can optionally enable the experimental XOR cipher layer. XOR runs after type-word mixing on egress and before type-word unmixing on ingress. It obfuscates the WireGuard UDP payload but does not add authentication, replay protection, length hiding, or udp2raw wire compatibility.
+
+XOR compatibility requirements:
+
+```text
+both endpoints must enable the same cipher definition
+the same XOR key material must be configured on both endpoints
+only UDP transport is supported in the MVP
+ICMP + XOR and fakeTCP + XOR are rejected
+```
+
 `icmp` is an experimental IPv4-only raw transport mode. It changes the outer IPv4 protocol from UDP to ICMP and replaces the 8-byte UDP header with an 8-byte ICMP Echo header. The WireGuard payload is still protected by WireGuard and still uses the same mixed type-word profile.
 
 ICMP mode roles:
@@ -85,6 +96,7 @@ Netns regression entry points:
 
 ```bash
 sudo make test-netns-smoke
+sudo make test-netns-xor-smoke
 sudo make test-netns-icmp-smoke
 sudo NEGATIVE_CHECKS=xfail scripts/smoke-netns-icmp.sh
 sudo NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
@@ -162,6 +174,10 @@ OpenWrt bridge and WAN paths
 ```
 
 For ICMP mode, the TX checksum offload, GSO, and NIC matrix still needs target-specific validation, especially for large packets that use the UDP-checksum-derived ICMP checksum fast path.
+
+For XOR mode, the dataplane rewrites the managed UDP payload in bounded chunks and updates the UDP checksum for each chunk. Production validation should include at least one receiver-side pcap check with `scripts/check-wg-pcap.py --xor-udp2raw-password ... --require-xor-mixed ... --forbid-plain-standard --forbid-plain-mixed`.
+
+The current XOR smoke target validates IPv4 UDP underlay. IPv6 UDP parsing remains part of the dataplane, but XOR over IPv6 underlay should be validated on the target path before production use.
 
 TX-side packet captures can show invalid UDP checksums when hardware or virtio checksum offload is enabled. Receiver-side captures and dataplane counters are more useful for checksum validation.
 

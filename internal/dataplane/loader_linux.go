@@ -215,6 +215,7 @@ func pinnedMapNames() []string {
 	return []string{
 		"control_map",
 		"profile_map",
+		"cipher_map",
 		"underlay_config_map",
 		"managed_fwmark_map",
 		"egress_rule_map",
@@ -244,6 +245,9 @@ func activeGeneration(coll *ebpf.Collection) (uint64, error) {
 
 func populateDataMaps(coll *ebpf.Collection, snapshot *abi.Snapshot) error {
 	if err := updateMap(coll, "profile_map", snapshot.Profiles); err != nil {
+		return err
+	}
+	if err := updateMap(coll, "cipher_map", snapshot.Ciphers); err != nil {
 		return err
 	}
 	if err := updateMap(coll, "underlay_config_map", snapshot.Underlays); err != nil {
@@ -291,6 +295,7 @@ func updateMap[K comparable, V any](coll *ebpf.Collection, name string, entries 
 func deleteStaleMapEntries(coll *ebpf.Collection, snapshot *abi.Snapshot) error {
 	return errors.Join(
 		deleteStaleEntries(coll, "profile_map", snapshot.Profiles),
+		deleteStaleEntries(coll, "cipher_map", snapshot.Ciphers),
 		deleteStaleEntries(coll, "underlay_config_map", snapshot.Underlays),
 		deleteStaleEntries(coll, "managed_fwmark_map", snapshot.ManagedFwmarks),
 		deleteStaleEntries(coll, "egress_rule_map", snapshot.EgressRules),
@@ -302,6 +307,7 @@ func deleteStaleMapEntries(coll *ebpf.Collection, snapshot *abi.Snapshot) error 
 func deleteGenerationMapEntries(coll *ebpf.Collection, generation uint64) error {
 	return errors.Join(
 		deleteEntriesByGeneration[abi.ProfileKey, abi.ProfileValue](coll, "profile_map", generation),
+		deleteEntriesByGeneration[abi.CipherKey, abi.CipherValue](coll, "cipher_map", generation),
 		deleteEntriesByGeneration[abi.UnderlayConfigKey, abi.UnderlayConfigValue](coll, "underlay_config_map", generation),
 		deleteEntriesByGeneration[abi.ManagedFwmarkKey, abi.ManagedFwmarkValue](coll, "managed_fwmark_map", generation),
 		deleteEntriesByGeneration[abi.EgressRuleKey, abi.EgressRuleValue](coll, "egress_rule_map", generation),

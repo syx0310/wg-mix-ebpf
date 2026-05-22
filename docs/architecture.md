@@ -11,6 +11,13 @@ egress: standard type_word -> mixed type_word
 ingress: mixed type_word -> standard type_word
 ```
 
+With optional UDP XOR enabled, the UDP payload pipeline is:
+
+```text
+egress: standard type_word -> mixed type_word -> XOR WireGuard payload
+ingress: XOR WireGuard payload -> mixed type_word -> standard type_word
+```
+
 It does not rewrite:
 
 ```text
@@ -68,6 +75,7 @@ internal/underlay
 
 internal/control
   Desired state builder that combines config, wg config, runtime state, and underlay state.
+  It derives configured XOR cipher keys and redacts key bytes from status JSON.
 
 internal/reconcile
   Shared validate/status/reload/detach workflow used by CLI and daemon.
@@ -104,6 +112,7 @@ WireGuard sends standard UDP packet
   -> match runtime FirewallMark + runtime ListenPort + underlay ifindex
   -> validate WireGuard packet shape
   -> rewrite type_word to mixed value
+  -> optionally XOR the WireGuard payload for UDP cipher mode
   -> update UDP checksum
   -> pass packet unchanged otherwise
 ```
@@ -115,6 +124,7 @@ network receives mixed UDP packet
   -> TC ingress on underlay
   -> match runtime ListenPort + underlay ifindex
   -> validate WireGuard packet shape
+  -> optionally undo UDP XOR cipher mode
   -> rewrite type_word to standard value
   -> update UDP checksum
   -> standard kernel WireGuard receives packet
@@ -174,6 +184,11 @@ ICMP egress:
 
 ICMP ingress:
   IPv4 UDP checksum 0 after ICMP -> UDP conversion
+
+UDP XOR cipher:
+  chunked skb load/store of managed WireGuard UDP payload
+  egress uses the offload-friendly recompute checksum path
+  ingress updates UDP checksum from chunk diffs before writing payload bytes
 ```
 
 Status exposes load/store/checksum errors and direction-specific GSO counters:
@@ -183,6 +198,14 @@ skb_load_error
 skb_store_error
 checksum_error
 icmp_checksum_error
+xor_egress_ok
+xor_ingress_ok
+xor_key_missing
+xor_len_overflow
+xor_bad_type_after_decrypt
+xor_load_error
+xor_store_error
+xor_csum_error
 egress_gso_seen
 egress_gso_managed_seen
 egress_gso_rewrite_ok
@@ -193,7 +216,7 @@ ingress_gso_rewrite_ok
 
 TX-side tcpdump captures may show invalid UDP checksums when checksum offload is enabled. Receiver-side captures and dataplane error counters are the useful evidence for checksum correctness.
 
-IPv6 outer UDP is supported by the parser and netns smoke tests, but real multi-host IPv6 underlay validation is still required for release-level confidence.
+IPv6 outer UDP is supported by the parser, but real IPv6 underlay validation is still required for release-level confidence, especially when optional payload ciphers are enabled.
 
 ## BPF Maps
 
@@ -207,6 +230,9 @@ control_map
 
 profile_map
   Generation-scoped type_word mappings.
+
+cipher_map
+  Generation-scoped XOR cipher keys and limits. Raw key bytes are not emitted in status JSON.
 
 egress_rule_map
   Generation-scoped egress match rules.

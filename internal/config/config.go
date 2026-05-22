@@ -21,6 +21,7 @@ type Config struct {
 	Underlays             []Underlay         `yaml:"underlays"`
 	WireGuards            []WireGuard        `yaml:"wireguards"`
 	Profiles              map[string]Profile `yaml:"profiles"`
+	Ciphers               map[string]Cipher  `yaml:"ciphers"`
 	FwmarkPolicy          FwmarkPolicy       `yaml:"fwmark_policy"`
 	Runtime               Runtime            `yaml:"runtime"`
 	StartupGuard          StartupGuard       `yaml:"startup_guard"`
@@ -38,6 +39,7 @@ type WireGuard struct {
 	Name      string    `yaml:"name"`
 	Config    string    `yaml:"config"`
 	Profile   string    `yaml:"profile"`
+	Cipher    string    `yaml:"cipher"`
 	NetNS     string    `yaml:"netns"`
 	Transport Transport `yaml:"transport"`
 }
@@ -68,6 +70,18 @@ type Transport struct {
 type ICMPTransport struct {
 	Role string `yaml:"role"`
 	ID   uint16 `yaml:"id"`
+}
+
+type Cipher struct {
+	Mode          string `yaml:"mode"`
+	Auth          string `yaml:"auth"`
+	Scope         string `yaml:"scope"`
+	KeyDerivation string `yaml:"key_derivation"`
+	Secret        string `yaml:"secret"`
+	SecretFile    string `yaml:"secret_file"`
+	Password      string `yaml:"password"`
+	KeyLen        uint32 `yaml:"key_len"`
+	MaxBytes      uint32 `yaml:"max_bytes"`
 }
 
 type FwmarkPolicy struct {
@@ -294,6 +308,31 @@ func (c *Config) ApplyDefaults() {
 			c.WireGuards[i].Transport.Mode = "udp"
 		}
 	}
+	for name, cipher := range c.Ciphers {
+		if cipher.Mode == "" {
+			cipher.Mode = "xor"
+		}
+		if cipher.Auth == "" {
+			cipher.Auth = "none"
+		}
+		if cipher.Scope == "" {
+			cipher.Scope = "wg-payload-full"
+		}
+		if cipher.KeyDerivation == "" {
+			cipher.KeyDerivation = "wgmx-hkdf256-v1"
+		}
+		if cipher.KeyLen == 0 {
+			if cipher.KeyDerivation == "udp2raw-md5-key1" {
+				cipher.KeyLen = 16
+			} else {
+				cipher.KeyLen = 256
+			}
+		}
+		if cipher.MaxBytes == 0 {
+			cipher.MaxBytes = 2048
+		}
+		c.Ciphers[name] = cipher
+	}
 }
 
 func (p *Policy) applyDefaults() {
@@ -366,6 +405,18 @@ func (c *Config) ValidateStatic() error {
 		if _, ok := c.Profiles[wg.Profile]; !ok {
 			return fmt.Errorf("wireguards[%d].profile %q is not defined", i, wg.Profile)
 		}
+		if wg.Cipher != "" {
+			cipher, ok := c.Ciphers[wg.Cipher]
+			if !ok {
+				return fmt.Errorf("wireguards[%d].cipher %q is not defined", i, wg.Cipher)
+			}
+			if wg.Transport.Mode != "" && wg.Transport.Mode != "udp" {
+				return fmt.Errorf("wireguards[%d].cipher is only implemented for udp transport in MVP", i)
+			}
+			if err := validateCipher(fmt.Sprintf("ciphers.%s", wg.Cipher), cipher); err != nil {
+				return err
+			}
+		}
 		switch wg.Transport.Mode {
 		case "", "udp":
 		case "icmp":
@@ -383,6 +434,48 @@ func (c *Config) ValidateStatic() error {
 		default:
 			return fmt.Errorf("wireguards[%d].transport.mode %q is unsupported", i, wg.Transport.Mode)
 		}
+	}
+	return nil
+}
+
+func validateCipher(prefix string, c Cipher) error {
+	switch c.Mode {
+	case "xor":
+	default:
+		return fmt.Errorf("%s.mode %q is unsupported", prefix, c.Mode)
+	}
+	switch c.Auth {
+	case "", "none":
+	default:
+		return fmt.Errorf("%s.auth %q is unsupported; only auth=none is implemented", prefix, c.Auth)
+	}
+	switch c.Scope {
+	case "wg-payload-full", "wg-payload-prefix":
+	default:
+		return fmt.Errorf("%s.scope %q is unsupported", prefix, c.Scope)
+	}
+	switch c.KeyDerivation {
+	case "wgmx-hkdf256-v1":
+		if c.Secret == "" && c.SecretFile == "" {
+			return fmt.Errorf("%s requires secret or secret_file", prefix)
+		}
+		if c.Password != "" {
+			return fmt.Errorf("%s.password is only valid with key_derivation=udp2raw-md5-key1", prefix)
+		}
+	case "udp2raw-md5-key1":
+		if c.Password == "" && c.Secret == "" && c.SecretFile == "" {
+			return fmt.Errorf("%s requires password, secret, or secret_file", prefix)
+		}
+	default:
+		return fmt.Errorf("%s.key_derivation %q is unsupported", prefix, c.KeyDerivation)
+	}
+	switch c.KeyLen {
+	case 16, 32, 64, 256:
+	default:
+		return fmt.Errorf("%s.key_len must be one of 16, 32, 64, 256", prefix)
+	}
+	if c.MaxBytes == 0 || c.MaxBytes > 2048 || c.MaxBytes%4 != 0 {
+		return fmt.Errorf("%s.max_bytes must be a non-zero multiple of 4 up to 2048", prefix)
 	}
 	return nil
 }

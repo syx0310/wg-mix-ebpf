@@ -9,6 +9,8 @@ wireguards:
   - name: wg0
     config: configs/wg0.example.conf
     profile: mix-default
+    # Optional UDP-only payload obfuscation.
+    # cipher: xor-home
     transport:
       mode: udp
 
@@ -17,6 +19,16 @@ profiles:
     preset: wireguard-mix-wire-values-v1
     index:
       mode: none
+
+# Optional. If enabled from wireguards[].cipher, both peers must share this key.
+# ciphers:
+#   xor-home:
+#     mode: xor
+#     auth: none
+#     scope: wg-payload-full
+#     key_derivation: udp2raw-md5-key1
+#     password: "change-me"
+#     max_bytes: 2048
 
 fwmark_policy:
   mode: config-required

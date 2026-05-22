@@ -159,6 +159,91 @@ profiles:
 	}
 }
 
+func TestAcceptUDPXORCipher(t *testing.T) {
+	cfg, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    cipher: xor-home
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+ciphers:
+  xor-home:
+    mode: xor
+    auth: none
+    scope: wg-payload-full
+    key_derivation: wgmx-hkdf256-v1
+    secret: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WireGuards[0].Cipher != "xor-home" {
+		t.Fatalf("cipher = %q", cfg.WireGuards[0].Cipher)
+	}
+	if cfg.Ciphers["xor-home"].KeyLen != 256 {
+		t.Fatalf("default key_len = %d", cfg.Ciphers["xor-home"].KeyLen)
+	}
+	if cfg.Ciphers["xor-home"].MaxBytes != 2048 {
+		t.Fatalf("default max_bytes = %d", cfg.Ciphers["xor-home"].MaxBytes)
+	}
+}
+
+func TestRejectCipherWithICMPTransport(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    cipher: xor-home
+    transport:
+      mode: icmp
+      icmp:
+        role: client
+        id: 0x5303
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+ciphers:
+  xor-home:
+    mode: xor
+    secret: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+`))
+	if err == nil {
+		t.Fatal("expected cipher with icmp transport to be rejected")
+	}
+}
+
+func TestRejectXORCipherWithoutSecret(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    cipher: xor-home
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+ciphers:
+  xor-home:
+    mode: xor
+`))
+	if err == nil {
+		t.Fatal("expected missing XOR secret to be rejected")
+	}
+}
+
 func TestRejectICMPClientWithoutID(t *testing.T) {
 	_, err := Load([]byte(`
 version: 1

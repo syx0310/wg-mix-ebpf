@@ -9,6 +9,7 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ROOT}/bin/wg-mix-ebpf"
 OUTER_FAMILY="${OUTER_FAMILY:-ipv4}"
+XOR_PASSWORD="${XOR_PASSWORD:-}"
 
 if [[ "${OUTER_FAMILY}" != "ipv4" && "${OUTER_FAMILY}" != "ipv6" ]]; then
   echo "error: OUTER_FAMILY must be ipv4 or ipv6" >&2
@@ -90,6 +91,21 @@ make_agent_config() {
   local path="$1"
   local underlay="$2"
   local wg_config="$3"
+  local cipher_ref=""
+  local cipher_block=""
+  if [[ -n "${XOR_PASSWORD}" ]]; then
+    cipher_ref="    cipher: xor-home"
+    cipher_block="
+ciphers:
+  xor-home:
+    mode: xor
+    auth: none
+    scope: wg-payload-full
+    key_derivation: udp2raw-md5-key1
+    password: \"${XOR_PASSWORD}\"
+    max_bytes: 2048
+"
+  fi
   cat >"${path}" <<EOF_CONFIG
 version: 1
 mode: transparent-typeword
@@ -102,12 +118,14 @@ wireguards:
   - name: wg0
     config: ${wg_config}
     profile: mix-default
+${cipher_ref}
 
 profiles:
   mix-default:
     preset: wireguard-mix-wire-values-v1
     index:
       mode: none
+${cipher_block}
 
 fwmark_policy:
   mode: config-required
@@ -245,10 +263,19 @@ wait_ping "${NSB}" 10.77.0.1
 wait "${TCPDUMP_RA}" || true
 wait "${TCPDUMP_RB}" || true
 
-python3 "${ROOT}/scripts/check-wg-pcap.py" \
-  --forbid-standard \
-  --require-mixed initiation,response,transport \
-  "${TMPDIR}/ra.pcap" "${TMPDIR}/rb.pcap"
+if [[ -n "${XOR_PASSWORD}" ]]; then
+  python3 "${ROOT}/scripts/check-wg-pcap.py" \
+    --forbid-plain-standard \
+    --forbid-plain-mixed \
+    --xor-udp2raw-password "${XOR_PASSWORD}" \
+    --require-xor-mixed initiation,response,transport \
+    "${TMPDIR}/ra.pcap" "${TMPDIR}/rb.pcap"
+else
+  python3 "${ROOT}/scripts/check-wg-pcap.py" \
+    --forbid-standard \
+    --require-mixed initiation,response,transport \
+    "${TMPDIR}/ra.pcap" "${TMPDIR}/rb.pcap"
+fi
 
 run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" >"${TMPDIR}/status-a-after.json"
 run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" >"${TMPDIR}/status-b-after.json"
@@ -258,7 +285,10 @@ import json
 import sys
 
 required_zero = ("checksum_error", "skb_load_error", "skb_store_error")
-required_positive = ("egress_rewrite_ok", "ingress_rewrite_ok")
+xor_enabled = bool(__import__("os").environ.get("XOR_PASSWORD"))
+required_positive = ["egress_rewrite_ok", "ingress_rewrite_ok"]
+if xor_enabled:
+    required_positive.extend(["xor_egress_ok", "xor_ingress_ok"])
 for path in sys.argv[1:]:
     with open(path, "r", encoding="utf-8") as fh:
         doc = json.load(fh)
@@ -278,4 +308,8 @@ for path in sys.argv[1:]:
             raise SystemExit(f"{path}: {key}={stats.get(key)}")
 PY
 
-echo "netns WireGuard + eBPF ${OUTER_FAMILY} smoke passed"
+if [[ -n "${XOR_PASSWORD}" ]]; then
+  echo "netns WireGuard + eBPF ${OUTER_FAMILY} xor smoke passed"
+else
+  echo "netns WireGuard + eBPF ${OUTER_FAMILY} smoke passed"
+fi

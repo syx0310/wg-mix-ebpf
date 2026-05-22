@@ -2,7 +2,7 @@
 
 Transparent WireGuard `type_word` transform using eBPF.
 
-Current status: control-plane foundation, daemon reconcile loop, profile management, generation-scoped map ABI, startup guard tooling, attach-state cleanup, embedded BPF packaging, Linux TC/eBPF dataplane loading, UDP type-word mode, and experimental IPv4 ICMP mode are implemented. Live BPF load, TC attach, WireGuard, offload, OpenWrt, and public-network tests must run on controlled external Linux machines.
+Current status: control-plane foundation, daemon reconcile loop, profile management, generation-scoped map ABI, startup guard tooling, attach-state cleanup, embedded BPF packaging, Linux TC/eBPF dataplane loading, UDP type-word mode, optional UDP XOR payload obfuscation, and experimental IPv4 ICMP mode are implemented. Live BPF load, TC attach, WireGuard, offload, OpenWrt, and public-network tests must run on controlled external Linux machines.
 
 ## Commands
 
@@ -42,6 +42,12 @@ Supported transport modes:
 ```text
 udp    original transparent UDP type-word transform
 icmp   experimental IPv4 ICMP Echo transport, no fakeTCP
+```
+
+Optional cipher mode:
+
+```text
+xor    UDP-only WireGuard payload XOR obfuscation, auth=none
 ```
 
 Operational behavior is documented in:

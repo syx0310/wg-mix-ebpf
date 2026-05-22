@@ -10,6 +10,8 @@ tests.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import ipaddress
 import json
 import struct
@@ -70,6 +72,10 @@ class PacketRecord:
     word_class: str
     kind: str | None
     length_valid: bool | None
+    xor_type_word: int | None
+    xor_word_class: str
+    xor_kind: str | None
+    xor_length_valid: bool | None
     ipv4_header_checksum: str
     udp_checksum: str
     icmp_checksum: str
@@ -278,6 +284,10 @@ def parse_udp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) -
         word_class=word_class,
         kind=kind,
         length_valid=length_valid,
+        xor_type_word=None,
+        xor_word_class="none",
+        xor_kind=None,
+        xor_length_valid=None,
         ipv4_header_checksum=ipv4_header_checksum,
         udp_checksum=udp_checksum,
         icmp_checksum="n/a",
@@ -347,6 +357,10 @@ def parse_icmp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) 
         word_class=word_class,
         kind=kind,
         length_valid=length_valid,
+        xor_type_word=None,
+        xor_word_class="none",
+        xor_kind=None,
+        xor_length_valid=None,
         ipv4_header_checksum="valid" if ones_complement_checksum(ip_header) == 0 else "invalid",
         udp_checksum="n/a",
         icmp_checksum=checksum,
@@ -392,9 +406,40 @@ def icmp_type_name(icmp_type: int | None) -> str:
     return "other"
 
 
+def parse_xor_key(value: str | None, udp2raw_password: str | None) -> bytes | None:
+    if udp2raw_password is not None:
+        return hashlib.md5((udp2raw_password + "key1").encode()).digest()
+    if value is None:
+        return None
+    if value.startswith("base64:"):
+        return base64.b64decode(value.removeprefix("base64:"))
+    if value.startswith("hex:"):
+        return bytes.fromhex(value.removeprefix("hex:"))
+    return value.encode()
+
+
+def apply_xor_decode(records: list[PacketRecord], key: bytes) -> None:
+    if len(key) < 4:
+        raise SystemExit("xor key must contain at least 4 bytes")
+    key4 = key[:4]
+    for record in records:
+        if record.type_word is None:
+            continue
+        raw = record.type_word.to_bytes(4, "little")
+        decoded = bytes(raw[i] ^ key4[i] for i in range(4))
+        word = int.from_bytes(decoded, "little")
+        word_class, kind = classify_type_word(word)
+        record.xor_type_word = word
+        record.xor_word_class = word_class
+        record.xor_kind = kind
+        record.xor_length_valid = valid_wireguard_length(kind, record.payload_len) if kind else None
+
+
 def summarize(records: list[PacketRecord], max_examples: int) -> dict:
     mixed_by_kind = {kind: 0 for kind in KINDS}
     standard_by_kind = {kind: 0 for kind in KINDS}
+    xor_mixed_by_kind = {kind: 0 for kind in KINDS}
+    xor_standard_by_kind = {kind: 0 for kind in KINDS}
     icmp_by_type = {"request": 0, "reply": 0, "other": 0}
     unknown = 0
     invalid_lengths = 0
@@ -419,8 +464,12 @@ def summarize(records: list[PacketRecord], max_examples: int) -> dict:
             standard_by_kind[record.kind] += 1
         elif record.word_class == "unknown":
             unknown += 1
+        if record.xor_word_class == "mixed" and record.xor_kind:
+            xor_mixed_by_kind[record.xor_kind] += 1
+        elif record.xor_word_class == "standard" and record.xor_kind:
+            xor_standard_by_kind[record.xor_kind] += 1
 
-        if record.length_valid is False:
+        if record.length_valid is False or record.xor_length_valid is False:
             invalid_lengths += 1
 
         if record.ipv4_header_checksum == "valid":
@@ -465,9 +514,36 @@ def summarize(records: list[PacketRecord], max_examples: int) -> dict:
                     "checksum": checksum_label,
                 }
             )
+        elif len(examples) < max_examples and record.xor_word_class in {"mixed", "standard"}:
+            if record.protocol == "udp":
+                flow = f"{record.src}:{record.sport}->{record.dst}:{record.dport}"
+                checksum_label = record.udp_checksum
+            else:
+                flow = (
+                    f"{record.src}->{record.dst} "
+                    f"icmp={icmp_type_name(record.icmp_type)} id={record.icmp_id} seq={record.icmp_sequence}"
+                )
+                checksum_label = record.icmp_checksum
+            examples.append(
+                {
+                    "file": record.file,
+                    "packet_index": record.packet_index,
+                    "protocol": record.protocol,
+                    "family": record.family,
+                    "flow": flow,
+                    "payload_len": record.payload_len,
+                    "type_word": f"0x{record.xor_type_word:08x}" if record.xor_type_word is not None else None,
+                    "class": "xor-" + record.xor_word_class,
+                    "kind": record.xor_kind,
+                    "length_valid": record.xor_length_valid,
+                    "checksum": checksum_label,
+                }
+            )
 
     mixed_total = sum(mixed_by_kind.values())
     standard_total = sum(standard_by_kind.values())
+    xor_mixed_total = sum(xor_mixed_by_kind.values())
+    xor_standard_total = sum(xor_standard_by_kind.values())
     udp_packets = sum(1 for record in records if record.protocol == "udp")
     icmp_packets = sum(1 for record in records if record.protocol == "icmp")
     return {
@@ -482,9 +558,13 @@ def summarize(records: list[PacketRecord], max_examples: int) -> dict:
         ),
         "mixed_type_words": mixed_total,
         "standard_type_words": standard_total,
+        "xor_mixed_type_words": xor_mixed_total,
+        "xor_standard_type_words": xor_standard_total,
         "unknown_type_words": unknown,
         "mixed_by_kind": mixed_by_kind,
         "standard_by_kind": standard_by_kind,
+        "xor_mixed_by_kind": xor_mixed_by_kind,
+        "xor_standard_by_kind": xor_standard_by_kind,
         "icmp_by_type": icmp_by_type,
         "invalid_wireguard_lengths": invalid_lengths,
         "checksums": checksum,
@@ -506,7 +586,12 @@ def main() -> int:
     parser.add_argument("--sport", action="append", type=int, help="Only include packets with this UDP source port")
     parser.add_argument("--dport", action="append", type=int, help="Only include packets with this UDP destination port")
     parser.add_argument("--forbid-standard", action="store_true")
+    parser.add_argument("--forbid-plain-mixed", action="store_true")
+    parser.add_argument("--forbid-plain-standard", action="store_true")
     parser.add_argument("--require-mixed", action="append", help="Comma-separated WG kinds to require")
+    parser.add_argument("--require-xor-mixed", action="append", help="Comma-separated WG kinds to require after XOR decoding first 4 bytes")
+    parser.add_argument("--xor-key", help="XOR key as base64:<key>, hex:<key>, or raw text")
+    parser.add_argument("--xor-udp2raw-password", help="Derive a 16-byte udp2raw-style XOR key as MD5(password + 'key1')")
     parser.add_argument("--require-icmp-types", action="append", help="Comma-separated ICMP Echo types: request,reply")
     parser.add_argument("--require-valid-udp-checksum", action="store_true")
     parser.add_argument("--require-valid-icmp-checksum", action="store_true")
@@ -537,18 +622,27 @@ def main() -> int:
     if args.dport:
         allowed = set(args.dport)
         records = [record for record in records if record.dport in allowed]
+    xor_key = parse_xor_key(args.xor_key, args.xor_udp2raw_password)
+    if xor_key:
+        apply_xor_decode(records, xor_key)
 
     summary = summarize(records, args.max_examples)
     required_mixed = parse_required_kinds(args.require_mixed)
+    required_xor_mixed = parse_required_kinds(args.require_xor_mixed)
     required_icmp_types = parse_required_icmp_types(args.require_icmp_types)
     failures = []
 
-    if args.forbid_standard and summary["standard_type_words"]:
+    if (args.forbid_standard or args.forbid_plain_standard) and summary["standard_type_words"]:
         failures.append(f"standard WireGuard type_word leaked: {summary['standard_type_words']}")
+    if args.forbid_plain_mixed and summary["mixed_type_words"]:
+        failures.append(f"plain mixed WireGuard type_word leaked: {summary['mixed_type_words']}")
 
     missing = sorted(kind for kind in required_mixed if summary["mixed_by_kind"][kind] == 0)
     if missing:
         failures.append("missing required mixed kinds: " + ",".join(missing))
+    missing_xor = sorted(kind for kind in required_xor_mixed if summary["xor_mixed_by_kind"][kind] == 0)
+    if missing_xor:
+        failures.append("missing required XOR-decoded mixed kinds: " + ",".join(missing_xor))
 
     missing_icmp = sorted(kind for kind in required_icmp_types if summary["icmp_by_type"][kind] == 0)
     if missing_icmp:
@@ -577,6 +671,7 @@ def main() -> int:
             print(
                 "udp_packets={udp_packets} pcap_udp_payload_words={pcap_udp_payload_words} "
                 "mixed_type_words={mixed_type_words} standard_type_words={standard_type_words} "
+                "xor_mixed_type_words={xor_mixed_type_words} xor_standard_type_words={xor_standard_type_words} "
                 "unknown_type_words={unknown_type_words}".format(**summary)
             )
         if args.protocol in ("icmp", "any") or summary["icmp_packets"]:
@@ -596,6 +691,17 @@ def main() -> int:
                 **summary["standard_by_kind"]
             )
         )
+        if xor_key:
+            print(
+                "xor_mixed initiation={initiation} response={response} cookie={cookie} transport={transport}".format(
+                    **summary["xor_mixed_by_kind"]
+                )
+            )
+            print(
+                "xor_standard initiation={initiation} response={response} cookie={cookie} transport={transport}".format(
+                    **summary["xor_standard_by_kind"]
+                )
+            )
         if args.protocol in ("udp", "any") or summary["udp_packets"]:
             print(
                 "udp_checksum_valid={udp_valid} udp_checksum_invalid={udp_invalid} udp_checksum_zero={udp_zero}".format(

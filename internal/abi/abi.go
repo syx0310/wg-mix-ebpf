@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	Version uint32 = 6
+	Version uint32 = 7
 
 	FamilyAny  uint8 = 0
 	FamilyIPv4 uint8 = 4
@@ -32,6 +32,9 @@ const (
 	ICMPRoleServer uint8 = 2
 
 	ICMPListenerFWildcardID uint32 = 1 << 0
+
+	CipherModeNone uint8 = 0
+	CipherModeXOR  uint8 = 1
 )
 
 type ControlKey uint32
@@ -61,6 +64,25 @@ type ProfileValue struct {
 }
 
 func (v ProfileValue) MapGeneration() uint64 { return v.Generation }
+
+type CipherKey struct {
+	Generation uint64
+	CipherID   uint32
+	_          uint32
+}
+
+type CipherValue struct {
+	Generation uint64
+	Key        [256]byte
+	KeyLen     uint32
+	KeyMask    uint32
+	MaxBytes   uint32
+	Flags      uint32
+	Mode       uint8
+	_          [7]byte
+}
+
+func (v CipherValue) MapGeneration() uint64 { return v.Generation }
 
 type ManagedFwmarkKey struct {
 	Generation    uint64
@@ -103,11 +125,12 @@ type EgressRuleValue struct {
 	Generation    uint64
 	ProfileID     uint32
 	WGID          uint32
+	CipherID      uint32
 	ICMPID        uint16
 	Action        uint8
 	TransportMode uint8
 	ICMPRole      uint8
-	_             [3]byte
+	_             [7]byte
 }
 
 func (v EgressRuleValue) MapGeneration() uint64 { return v.Generation }
@@ -124,8 +147,9 @@ type IngressListenerValue struct {
 	Generation uint64
 	ProfileID  uint32
 	WGID       uint32
+	CipherID   uint32
 	Action     uint8
-	_          [7]byte
+	_          [3]byte
 }
 
 func (v IngressListenerValue) MapGeneration() uint64 { return v.Generation }
@@ -153,6 +177,7 @@ func (v ICMPListenerValue) MapGeneration() uint64 { return v.Generation }
 type Snapshot struct {
 	Control          map[ControlKey]ControlValue
 	Profiles         map[ProfileKey]ProfileValue
+	Ciphers          map[CipherKey]CipherValue
 	Underlays        map[UnderlayConfigKey]UnderlayConfigValue
 	ManagedFwmarks   map[ManagedFwmarkKey]ManagedFwmarkValue
 	EgressRules      map[EgressRuleKey]EgressRuleValue
@@ -169,6 +194,7 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 	type view struct {
 		Control          []MapEntry[ControlKey, ControlValue]                 `json:"control"`
 		Profiles         []MapEntry[ProfileKey, ProfileValue]                 `json:"profiles"`
+		Ciphers          []MapEntry[CipherKey, CipherValue]                   `json:"ciphers"`
 		Underlays        []MapEntry[UnderlayConfigKey, UnderlayConfigValue]   `json:"underlays"`
 		ManagedFwmarks   []MapEntry[ManagedFwmarkKey, ManagedFwmarkValue]     `json:"managed_fwmarks"`
 		EgressRules      []MapEntry[EgressRuleKey, EgressRuleValue]           `json:"egress_rules"`
@@ -178,6 +204,7 @@ func (s Snapshot) MarshalJSON() ([]byte, error) {
 	return json.Marshal(view{
 		Control:          mapEntries(s.Control),
 		Profiles:         mapEntries(s.Profiles),
+		Ciphers:          mapEntries(s.Ciphers),
 		Underlays:        mapEntries(s.Underlays),
 		ManagedFwmarks:   mapEntries(s.ManagedFwmarks),
 		EgressRules:      mapEntries(s.EgressRules),
@@ -207,6 +234,7 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 			},
 		},
 		Profiles:         make(map[ProfileKey]ProfileValue, len(state.Profiles)),
+		Ciphers:          make(map[CipherKey]CipherValue, len(state.Ciphers)),
 		Underlays:        make(map[UnderlayConfigKey]UnderlayConfigValue, len(state.Underlays)),
 		ManagedFwmarks:   make(map[ManagedFwmarkKey]ManagedFwmarkValue, len(state.ManagedFwmarks)),
 		EgressRules:      make(map[EgressRuleKey]EgressRuleValue, len(state.EgressRules)),
@@ -218,6 +246,21 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 			Generation:      generation,
 			StandardToMixed: p.StandardToMixed,
 			MixedToStandard: p.MixedToStandard,
+		}
+	}
+	for _, c := range state.Ciphers {
+		mode, err := parseCipherMode(c.Mode)
+		if err != nil {
+			return nil, err
+		}
+		out.Ciphers[CipherKey{Generation: generation, CipherID: c.ID}] = CipherValue{
+			Generation: generation,
+			Key:        c.Key,
+			KeyLen:     c.KeyLen,
+			KeyMask:    c.KeyMask,
+			MaxBytes:   c.MaxBytes,
+			Flags:      c.Flags,
+			Mode:       mode,
 		}
 	}
 	for _, u := range state.Underlays {
@@ -277,6 +320,7 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 			Generation:    generation,
 			ProfileID:     r.ProfileID,
 			WGID:          r.WGID,
+			CipherID:      r.CipherID,
 			ICMPID:        r.ICMPID,
 			Action:        action,
 			TransportMode: transport,
@@ -301,6 +345,7 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 			Generation: generation,
 			ProfileID:  r.ProfileID,
 			WGID:       r.WGID,
+			CipherID:   r.CipherID,
 			Action:     action,
 		}
 	}
@@ -334,6 +379,17 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 		}
 	}
 	return out, nil
+}
+
+func parseCipherMode(value string) (uint8, error) {
+	switch value {
+	case "":
+		return CipherModeNone, nil
+	case "xor":
+		return CipherModeXOR, nil
+	default:
+		return 0, fmt.Errorf("unsupported cipher mode %q", value)
+	}
 }
 
 func parseFamily(family string) (uint8, error) {
