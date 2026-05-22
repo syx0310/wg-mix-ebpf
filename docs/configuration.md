@@ -218,14 +218,30 @@ wireguards:
 ICMP mode notes:
 
 ```text
+ICMP mode is experimental
+IPv4 only; ICMPv6 is not implemented
 client emits Echo Request and accepts Echo Reply
 server accepts Echo Request and emits Echo Reply
 client id must be nonzero and should be unique per client/profile
-server uses wildcard Echo id by default to tolerate NAT ICMP id rewriting
+server uses wildcard Echo id by default; leave server icmp.id unset
+server wildcard matching is intended for mixed WireGuard Echo payloads, not ordinary ping traffic
+server wildcard-id listener passes only bad type-word or bad length misses; valid managed ICMP WireGuard packets are still rewritten
 server preserves NAT-rewritten Echo sequence values with runtime kernel state
-ICMP mode is IPv4 only in the MVP
+raw UDP WireGuard packets to an ICMP-managed ListenPort are not a fallback path and should be dropped
 fakeTCP is intentionally not implemented
+outer IP fragmentation is unsupported; keep WireGuard MTU below the underlay fragmentation threshold
+large-packet ICMP checksum handling depends on the current skb checksum/offload shape and needs target validation
 ```
+
+Regression entry points:
+
+```bash
+sudo make test-netns-icmp-smoke
+sudo NEGATIVE_CHECKS=xfail scripts/smoke-netns-icmp.sh
+sudo NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
+```
+
+`test-netns-icmp-smoke` validates the positive ICMP client/server path and requires ICMP Echo Request/Reply pcaps with mixed initiation, response, and transport type words and zero standard type-word leaks. `NEGATIVE_CHECKS=xfail` exercises the negative hooks without failing the run on branches that do not yet include the core pass/drop logic; `NEGATIVE_CHECKS=enforce` makes ordinary ping pass-through and raw UDP bypass protection mandatory.
 
 ## WireGuard Config Requirements
 
@@ -436,7 +452,7 @@ The MVP only implements the shown values. Other values are rejected by static va
 
 Egress is fail-closed for managed WireGuard packets. Ingress only drops packets that match a managed listener or a managed fragment policy.
 
-Outer IP fragmentation is not supported. Configure WireGuard MTU and underlay MTU to avoid outer UDP fragmentation.
+Outer IP fragmentation is not supported. Configure WireGuard MTU and underlay MTU to avoid outer UDP or ICMP fragmentation.
 
 ## Baseline And NAT Notes
 
@@ -449,6 +465,7 @@ both endpoints run the transparent transform
 inner WireGuard ping succeeds in both directions
 pcap shows mixed initiation/response/transport type words
 pcap shows zero standard type words on managed egress
+ICMP mode pcap shows Echo Request and Echo Reply with mixed payload type words
 status shows checksum_error=0, skb_load_error=0, skb_store_error=0
 ```
 

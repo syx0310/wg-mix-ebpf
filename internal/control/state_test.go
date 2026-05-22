@@ -31,6 +31,17 @@ profiles:
 	return cfg
 }
 
+func requireIngressListener(t *testing.T, state *State, family string, port uint16, action string) IngressListener {
+	t.Helper()
+	for _, listener := range state.IngressListeners {
+		if listener.Family == family && listener.DestinationPort == port && listener.Action == action {
+			return listener
+		}
+	}
+	t.Fatalf("missing ingress listener family=%s port=%d action=%s", family, port, action)
+	return IngressListener{}
+}
+
 func TestBuildStateOfflineParsesConfigFwMark(t *testing.T) {
 	cfg := testConfig(t)
 	state, err := BuildState(context.Background(), cfg, runtime.StaticProvider{}, underlay.StaticResolver{}, func(string) (*wgconfig.Interface, error) {
@@ -102,6 +113,8 @@ func TestBuildStateRuntimeRules(t *testing.T) {
 	if len(state.IngressListeners) != 2 {
 		t.Fatalf("ingress listeners = %d", len(state.IngressListeners))
 	}
+	requireIngressListener(t, state, "ipv4", 31001, "rewrite")
+	requireIngressListener(t, state, "ipv6", 31001, "rewrite")
 	if state.EgressRules[0].SourcePort != 31001 {
 		t.Fatalf("egress source port = %d", state.EgressRules[0].SourcePort)
 	}
@@ -159,8 +172,12 @@ profiles:
 	if state.EgressRules[0].ICMPRole != "client" || state.EgressRules[0].ICMPID != 0x5303 {
 		t.Fatalf("icmp egress = role %q id %d", state.EgressRules[0].ICMPRole, state.EgressRules[0].ICMPID)
 	}
-	if len(state.IngressListeners) != 0 {
+	if len(state.IngressListeners) != 1 {
 		t.Fatalf("udp ingress listeners = %d", len(state.IngressListeners))
+	}
+	udpDrop := requireIngressListener(t, state, "ipv4", 31001, "drop")
+	if udpDrop.UnderlayIfIndex != 2 {
+		t.Fatalf("udp drop underlay = %d", udpDrop.UnderlayIfIndex)
 	}
 	if len(state.ICMPListeners) != 1 {
 		t.Fatalf("icmp listeners = %d", len(state.ICMPListeners))
@@ -168,6 +185,9 @@ profiles:
 	listener := state.ICMPListeners[0]
 	if listener.ICMPType != 0 || listener.ICMPID != 0x5303 || listener.ListenPort != 31001 {
 		t.Fatalf("icmp listener = type %d id %d listen %d", listener.ICMPType, listener.ICMPID, listener.ListenPort)
+	}
+	if listener.Flags != 0 {
+		t.Fatalf("client icmp listener flags = 0x%x", listener.Flags)
 	}
 }
 
@@ -215,6 +235,13 @@ profiles:
 	}
 	if state.ICMPListeners[0].ICMPType != 8 || state.ICMPListeners[0].ICMPID != 0 {
 		t.Fatalf("server icmp listener = type %d id %d", state.ICMPListeners[0].ICMPType, state.ICMPListeners[0].ICMPID)
+	}
+	if len(state.IngressListeners) != 1 {
+		t.Fatalf("udp ingress listeners = %d", len(state.IngressListeners))
+	}
+	requireIngressListener(t, state, "ipv4", 52000, "drop")
+	if state.ICMPListeners[0].Flags&ICMPListenerFlagWildcardID == 0 {
+		t.Fatalf("server icmp listener flags = 0x%x, missing wildcard-id flag", state.ICMPListeners[0].Flags)
 	}
 }
 

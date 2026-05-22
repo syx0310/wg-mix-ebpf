@@ -2,8 +2,9 @@
 """Validate WireGuard type_word transforms in pcap files.
 
 The checker is intentionally dependency-free so it can run on small test hosts
-and CI runners without scapy/tshark. It understands Ethernet, Linux cooked, and
-raw IPv4/IPv6 pcaps well enough for the project smoke tests.
+and CI runners without scapy/tshark. It understands Ethernet, Linux cooked,
+raw IPv4/IPv6 UDP, and IPv4 ICMP Echo pcaps well enough for the project smoke
+tests.
 """
 
 from __future__ import annotations
@@ -38,7 +39,11 @@ ETH_P_IP = 0x0800
 ETH_P_IPV6 = 0x86DD
 ETH_P_8021Q = 0x8100
 ETH_P_8021AD = 0x88A8
+IPPROTO_ICMP = 1
 IPPROTO_UDP = 17
+
+ICMP_ECHOREPLY = 0
+ICMP_ECHO = 8
 
 DLT_EN10MB = 1
 DLT_RAW = 101
@@ -47,14 +52,19 @@ DLT_LINUX_SLL2 = 276
 
 
 @dataclass
-class UdpRecord:
+class PacketRecord:
     file: str
     packet_index: int
+    protocol: str
     family: int
     src: str
     dst: str
-    sport: int
-    dport: int
+    sport: int | None
+    dport: int | None
+    icmp_type: int | None
+    icmp_code: int | None
+    icmp_id: int | None
+    icmp_sequence: int | None
     payload_len: int
     type_word: int | None
     word_class: str
@@ -62,6 +72,7 @@ class UdpRecord:
     length_valid: bool | None
     ipv4_header_checksum: str
     udp_checksum: str
+    icmp_checksum: str
 
 
 def ones_complement_checksum(data: bytes) -> int:
@@ -164,7 +175,7 @@ def classify_type_word(word: int | None) -> tuple[str, str | None]:
     return "unknown", None
 
 
-def parse_udp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) -> UdpRecord | None:
+def parse_udp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) -> PacketRecord | None:
     link = parse_link(pkt, linktype)
     if link is None:
         return None
@@ -249,14 +260,19 @@ def parse_udp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) -
     word_class, kind = classify_type_word(word)
     length_valid = valid_wireguard_length(kind, len(payload)) if kind else None
 
-    return UdpRecord(
+    return PacketRecord(
         file=str(path),
         packet_index=packet_index,
+        protocol="udp",
         family=family,
         src=src,
         dst=dst,
         sport=sport,
         dport=dport,
+        icmp_type=None,
+        icmp_code=None,
+        icmp_id=None,
+        icmp_sequence=None,
         payload_len=len(payload),
         type_word=word,
         word_class=word_class,
@@ -264,6 +280,76 @@ def parse_udp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) -
         length_valid=length_valid,
         ipv4_header_checksum=ipv4_header_checksum,
         udp_checksum=udp_checksum,
+        icmp_checksum="n/a",
+    )
+
+
+def parse_icmp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) -> PacketRecord | None:
+    link = parse_link(pkt, linktype)
+    if link is None:
+        return None
+    proto, ip_offset = link
+    if proto != ETH_P_IP:
+        return None
+    if len(pkt) < ip_offset + 20:
+        return None
+    first = pkt[ip_offset]
+    if first >> 4 != 4:
+        return None
+    ihl = (first & 0x0F) * 4
+    if ihl < 20 or len(pkt) < ip_offset + ihl:
+        return None
+    ip_header = pkt[ip_offset : ip_offset + ihl]
+    total_len = int.from_bytes(pkt[ip_offset + 2 : ip_offset + 4], "big")
+    if total_len < ihl or len(pkt) < ip_offset + total_len:
+        return None
+    if pkt[ip_offset + 9] != IPPROTO_ICMP:
+        return None
+    frag = int.from_bytes(pkt[ip_offset + 6 : ip_offset + 8], "big")
+    if frag & 0x3FFF:
+        return None
+
+    icmp_offset = ip_offset + ihl
+    icmp_limit = ip_offset + total_len
+    if icmp_limit < icmp_offset + 8:
+        return None
+    icmp_segment = pkt[icmp_offset:icmp_limit]
+    icmp_type = icmp_segment[0]
+    icmp_code = icmp_segment[1]
+    if icmp_type not in (ICMP_ECHO, ICMP_ECHOREPLY) or icmp_code != 0:
+        return None
+
+    src_raw = pkt[ip_offset + 12 : ip_offset + 16]
+    dst_raw = pkt[ip_offset + 16 : ip_offset + 20]
+    src = str(ipaddress.IPv4Address(src_raw))
+    dst = str(ipaddress.IPv4Address(dst_raw))
+    payload = icmp_segment[8:]
+    word = int.from_bytes(payload[:4], "little") if len(payload) >= 4 else None
+    word_class, kind = classify_type_word(word)
+    length_valid = valid_wireguard_length(kind, len(payload)) if kind else None
+    checksum = "valid" if ones_complement_checksum(icmp_segment) == 0 else "invalid"
+
+    return PacketRecord(
+        file=str(path),
+        packet_index=packet_index,
+        protocol="icmp",
+        family=4,
+        src=src,
+        dst=dst,
+        sport=None,
+        dport=None,
+        icmp_type=icmp_type,
+        icmp_code=icmp_code,
+        icmp_id=int.from_bytes(icmp_segment[4:6], "big"),
+        icmp_sequence=int.from_bytes(icmp_segment[6:8], "big"),
+        payload_len=len(payload),
+        type_word=word,
+        word_class=word_class,
+        kind=kind,
+        length_valid=length_valid,
+        ipv4_header_checksum="valid" if ones_complement_checksum(ip_header) == 0 else "invalid",
+        udp_checksum="n/a",
+        icmp_checksum=checksum,
     )
 
 
@@ -282,9 +368,34 @@ def parse_required_kinds(values: list[str] | None) -> set[str]:
     return result
 
 
-def summarize(records: list[UdpRecord], max_examples: int) -> dict:
+def parse_required_icmp_types(values: list[str] | None) -> set[str]:
+    allowed = {"request", "reply"}
+    result: set[str] = set()
+    if not values:
+        return result
+    for value in values:
+        for item in value.split(","):
+            item = item.strip()
+            if not item:
+                continue
+            if item not in allowed:
+                raise SystemExit(f"unsupported type in --require-icmp-types: {item}")
+            result.add(item)
+    return result
+
+
+def icmp_type_name(icmp_type: int | None) -> str:
+    if icmp_type == ICMP_ECHO:
+        return "request"
+    if icmp_type == ICMP_ECHOREPLY:
+        return "reply"
+    return "other"
+
+
+def summarize(records: list[PacketRecord], max_examples: int) -> dict:
     mixed_by_kind = {kind: 0 for kind in KINDS}
     standard_by_kind = {kind: 0 for kind in KINDS}
+    icmp_by_type = {"request": 0, "reply": 0, "other": 0}
     unknown = 0
     invalid_lengths = 0
     checksum = {
@@ -293,10 +404,15 @@ def summarize(records: list[UdpRecord], max_examples: int) -> dict:
         "udp_valid": 0,
         "udp_invalid": 0,
         "udp_zero": 0,
+        "icmp_valid": 0,
+        "icmp_invalid": 0,
     }
     examples = []
 
     for record in records:
+        if record.protocol == "icmp":
+            icmp_by_type[icmp_type_name(record.icmp_type)] += 1
+
         if record.word_class == "mixed" and record.kind:
             mixed_by_kind[record.kind] += 1
         elif record.word_class == "standard" and record.kind:
@@ -319,32 +435,57 @@ def summarize(records: list[UdpRecord], max_examples: int) -> dict:
         elif record.udp_checksum == "zero":
             checksum["udp_zero"] += 1
 
+        if record.icmp_checksum == "valid":
+            checksum["icmp_valid"] += 1
+        elif record.icmp_checksum == "invalid":
+            checksum["icmp_invalid"] += 1
+
         if len(examples) < max_examples and record.word_class in {"mixed", "standard"}:
+            if record.protocol == "udp":
+                flow = f"{record.src}:{record.sport}->{record.dst}:{record.dport}"
+                checksum_label = record.udp_checksum
+            else:
+                flow = (
+                    f"{record.src}->{record.dst} "
+                    f"icmp={icmp_type_name(record.icmp_type)} id={record.icmp_id} seq={record.icmp_sequence}"
+                )
+                checksum_label = record.icmp_checksum
             examples.append(
                 {
                     "file": record.file,
                     "packet_index": record.packet_index,
+                    "protocol": record.protocol,
                     "family": record.family,
-                    "tuple": f"{record.src}:{record.sport}->{record.dst}:{record.dport}",
+                    "flow": flow,
                     "payload_len": record.payload_len,
                     "type_word": f"0x{record.type_word:08x}" if record.type_word is not None else None,
                     "class": record.word_class,
                     "kind": record.kind,
                     "length_valid": record.length_valid,
-                    "udp_checksum": record.udp_checksum,
+                    "checksum": checksum_label,
                 }
             )
 
     mixed_total = sum(mixed_by_kind.values())
     standard_total = sum(standard_by_kind.values())
+    udp_packets = sum(1 for record in records if record.protocol == "udp")
+    icmp_packets = sum(1 for record in records if record.protocol == "icmp")
     return {
-        "udp_packets": len(records),
-        "pcap_udp_payload_words": sum(1 for record in records if record.type_word is not None),
+        "packets": len(records),
+        "udp_packets": udp_packets,
+        "pcap_udp_payload_words": sum(
+            1 for record in records if record.protocol == "udp" and record.type_word is not None
+        ),
+        "icmp_packets": icmp_packets,
+        "pcap_icmp_payload_words": sum(
+            1 for record in records if record.protocol == "icmp" and record.type_word is not None
+        ),
         "mixed_type_words": mixed_total,
         "standard_type_words": standard_total,
         "unknown_type_words": unknown,
         "mixed_by_kind": mixed_by_kind,
         "standard_by_kind": standard_by_kind,
+        "icmp_by_type": icmp_by_type,
         "invalid_wireguard_lengths": invalid_lengths,
         "checksums": checksum,
         "examples": examples,
@@ -354,23 +495,36 @@ def summarize(records: list[UdpRecord], max_examples: int) -> dict:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("pcaps", nargs="+", type=Path)
+    parser.add_argument(
+        "--protocol",
+        choices=("udp", "icmp", "any"),
+        default="udp",
+        help="Transport records to inspect; default keeps the historical UDP-only behavior",
+    )
     parser.add_argument("--src", action="append", help="Only include packets with this source IP")
     parser.add_argument("--dst", action="append", help="Only include packets with this destination IP")
     parser.add_argument("--sport", action="append", type=int, help="Only include packets with this UDP source port")
     parser.add_argument("--dport", action="append", type=int, help="Only include packets with this UDP destination port")
     parser.add_argument("--forbid-standard", action="store_true")
     parser.add_argument("--require-mixed", action="append", help="Comma-separated WG kinds to require")
+    parser.add_argument("--require-icmp-types", action="append", help="Comma-separated ICMP Echo types: request,reply")
     parser.add_argument("--require-valid-udp-checksum", action="store_true")
+    parser.add_argument("--require-valid-icmp-checksum", action="store_true")
     parser.add_argument("--json", action="store_true", help="Print JSON only")
     parser.add_argument("--max-examples", type=int, default=12)
     args = parser.parse_args()
 
-    records: list[UdpRecord] = []
+    records: list[PacketRecord] = []
     for path in args.pcaps:
         for packet_index, linktype, pkt in parse_pcap(path):
-            record = parse_udp_record(path, packet_index, linktype, pkt)
-            if record is not None:
-                records.append(record)
+            if args.protocol in ("udp", "any"):
+                record = parse_udp_record(path, packet_index, linktype, pkt)
+                if record is not None:
+                    records.append(record)
+            if args.protocol in ("icmp", "any"):
+                record = parse_icmp_record(path, packet_index, linktype, pkt)
+                if record is not None:
+                    records.append(record)
     if args.src:
         allowed = set(args.src)
         records = [record for record in records if record.src in allowed]
@@ -386,6 +540,7 @@ def main() -> int:
 
     summary = summarize(records, args.max_examples)
     required_mixed = parse_required_kinds(args.require_mixed)
+    required_icmp_types = parse_required_icmp_types(args.require_icmp_types)
     failures = []
 
     if args.forbid_standard and summary["standard_type_words"]:
@@ -395,11 +550,18 @@ def main() -> int:
     if missing:
         failures.append("missing required mixed kinds: " + ",".join(missing))
 
+    missing_icmp = sorted(kind for kind in required_icmp_types if summary["icmp_by_type"][kind] == 0)
+    if missing_icmp:
+        failures.append("missing required ICMP Echo types: " + ",".join(missing_icmp))
+
     if summary["invalid_wireguard_lengths"]:
         failures.append(f"invalid WireGuard-like payload lengths: {summary['invalid_wireguard_lengths']}")
 
     if args.require_valid_udp_checksum and summary["checksums"]["udp_invalid"]:
         failures.append(f"invalid UDP checksums: {summary['checksums']['udp_invalid']}")
+
+    if args.require_valid_icmp_checksum and summary["checksums"]["icmp_invalid"]:
+        failures.append(f"invalid ICMP checksums: {summary['checksums']['icmp_invalid']}")
 
     result = {
         "files": [str(path) for path in args.pcaps],
@@ -411,11 +573,19 @@ def main() -> int:
         print(json.dumps(result, indent=2, sort_keys=True))
     else:
         print(f"pcap_files={len(args.pcaps)}")
-        print(
-            "udp_packets={udp_packets} pcap_udp_payload_words={pcap_udp_payload_words} "
-            "mixed_type_words={mixed_type_words} standard_type_words={standard_type_words} "
-            "unknown_type_words={unknown_type_words}".format(**summary)
-        )
+        if args.protocol in ("udp", "any") or summary["udp_packets"]:
+            print(
+                "udp_packets={udp_packets} pcap_udp_payload_words={pcap_udp_payload_words} "
+                "mixed_type_words={mixed_type_words} standard_type_words={standard_type_words} "
+                "unknown_type_words={unknown_type_words}".format(**summary)
+            )
+        if args.protocol in ("icmp", "any") or summary["icmp_packets"]:
+            print(
+                "icmp_packets={icmp_packets} pcap_icmp_payload_words={pcap_icmp_payload_words} "
+                "icmp_request={request} icmp_reply={reply}".format(
+                    **summary, **summary["icmp_by_type"]
+                )
+            )
         print(
             "mixed initiation={initiation} response={response} cookie={cookie} transport={transport}".format(
                 **summary["mixed_by_kind"]
@@ -426,11 +596,18 @@ def main() -> int:
                 **summary["standard_by_kind"]
             )
         )
-        print(
-            "udp_checksum_valid={udp_valid} udp_checksum_invalid={udp_invalid} udp_checksum_zero={udp_zero}".format(
-                **summary["checksums"]
+        if args.protocol in ("udp", "any") or summary["udp_packets"]:
+            print(
+                "udp_checksum_valid={udp_valid} udp_checksum_invalid={udp_invalid} udp_checksum_zero={udp_zero}".format(
+                    **summary["checksums"]
+                )
             )
-        )
+        if args.protocol in ("icmp", "any") or summary["icmp_packets"]:
+            print(
+                "icmp_checksum_valid={icmp_valid} icmp_checksum_invalid={icmp_invalid}".format(
+                    **summary["checksums"]
+                )
+            )
         print(
             "ipv4_header_checksum_valid={ipv4_header_valid} ipv4_header_checksum_invalid={ipv4_header_invalid}".format(
                 **summary["checksums"]
@@ -439,11 +616,18 @@ def main() -> int:
         if summary["examples"]:
             print("examples:")
             for example in summary["examples"]:
-                print(
-                    "  {class} {kind} {type_word} len={payload_len} checksum={udp_checksum} {tuple} file={file}#{packet_index}".format(
-                        **example
+                if example["protocol"] == "udp":
+                    print(
+                        "  {class} {kind} {type_word} len={payload_len} checksum={checksum} {flow} file={file}#{packet_index}".format(
+                            **example
+                        )
                     )
-                )
+                else:
+                    print(
+                        "  {protocol} {class} {kind} {type_word} len={payload_len} checksum={checksum} {flow} file={file}#{packet_index}".format(
+                            **example
+                        )
+                    )
         if failures:
             for failure in failures:
                 print(f"failure: {failure}", file=sys.stderr)
