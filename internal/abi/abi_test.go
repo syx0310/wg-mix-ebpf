@@ -32,6 +32,9 @@ func TestStructSizesAreStable(t *testing.T) {
 			t.Fatalf("%s size = %d, want %d", check.name, check.got, check.want)
 		}
 	}
+	if got, want := unsafe.Offsetof(ICMPListenerValue{}.Flags), uintptr(20); got != want {
+		t.Fatalf("ICMPListenerValue.Flags offset = %d, want %d", got, want)
+	}
 }
 
 func TestFromState(t *testing.T) {
@@ -55,10 +58,12 @@ func TestFromState(t *testing.T) {
 			{Generation: 7, Family: "ipv4", FwMark: 0x10000001, SourcePort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "rewrite", TransportMode: "icmp", ICMPRole: "client", ICMPID: 0x5303},
 		},
 		IngressListeners: []control.IngressListener{
+			{Generation: 7, Family: "ipv4", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "drop"},
 			{Generation: 7, Family: "ipv6", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "rewrite"},
 		},
 		ICMPListeners: []control.ICMPListener{
 			{Generation: 7, Family: "ipv4", UnderlayIfIndex: 2, ICMPType: 0, ICMPID: 0x5303, ListenPort: 31001, ProfileID: 1, WGID: 1, Action: "rewrite", Role: "client"},
+			{Generation: 7, Family: "ipv4", UnderlayIfIndex: 2, ICMPType: 8, ICMPID: 0, ListenPort: 31001, ProfileID: 1, WGID: 1, Action: "rewrite", Role: "server", Flags: control.ICMPListenerFlagWildcardID},
 		},
 	}
 	snapshot, err := FromState(state)
@@ -78,12 +83,19 @@ func TestFromState(t *testing.T) {
 	if snapshot.ManagedFwmarks[ManagedFwmarkKey{Generation: 7, FwMark: 0x10000001, UnderlayIndex: 2}].ActionOnMiss != ActionDrop {
 		t.Fatal("missing managed fwmark drop rule")
 	}
+	if snapshot.IngressListeners[IngressListenerKey{Generation: 7, UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv4}].Action != ActionDrop {
+		t.Fatal("missing ingress drop rule")
+	}
 	if snapshot.IngressListeners[IngressListenerKey{Generation: 7, UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv6}].Action != ActionRewrite {
 		t.Fatal("missing ingress rewrite rule")
 	}
 	icmp := snapshot.ICMPListeners[ICMPListenerKey{Generation: 7, UnderlayIndex: 2, ICMPID: 0x5303, Family: FamilyIPv4, ICMPType: 0}]
-	if icmp.Action != ActionRewrite || icmp.ListenPort != 31001 || icmp.Role != ICMPRoleClient {
+	if icmp.Action != ActionRewrite || icmp.ListenPort != 31001 || icmp.Role != ICMPRoleClient || icmp.Flags != 0 {
 		t.Fatal("missing icmp listener")
+	}
+	wildcard := snapshot.ICMPListeners[ICMPListenerKey{Generation: 7, UnderlayIndex: 2, ICMPID: 0, Family: FamilyIPv4, ICMPType: 8}]
+	if wildcard.Action != ActionRewrite || wildcard.ListenPort != 31001 || wildcard.Role != ICMPRoleServer || wildcard.Flags != ICMPListenerFWildcardID {
+		t.Fatal("missing icmp wildcard listener")
 	}
 }
 

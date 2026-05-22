@@ -18,6 +18,7 @@ Thumbs.db
 /bin/
 /dist/
 /build/
+/.worktree/
 /wg-mix-ebpf
 *.test
 *.out

@@ -56,12 +56,17 @@ server:
   accepts Echo Request
   emits Echo Reply
   uses wildcard ingress id by default to tolerate NAT ICMP id rewriting
+  wildcard id is intended for mixed WireGuard Echo payloads, not ordinary ping traffic
+  passes wildcard-id Echo Requests that fail only mixed type-word or WireGuard length checks
   preserves NAT-rewritten Echo sequence values with runtime kernel state
 ```
+
+Ordinary ICMP Echo traffic with a non-WireGuard payload should pass through a server wildcard listener. Raw UDP WireGuard packets sent directly to an ICMP-managed `ListenPort` are not a compatibility fallback and should be dropped so they cannot bypass ICMP mode.
 
 MVP ICMP limitations:
 
 ```text
+experimental
 IPv4 only
 single client profile per server listener unless ids are made unique
 no fakeTCP
@@ -69,10 +74,23 @@ no udp2raw wire compatibility
 no extra encryption/auth/anti-replay beyond WireGuard itself
 no ICMPv6
 no outer fragmentation support
-performance depends on packet size and checksum/offload shape; small WG packets use bounded full ICMP checksum, larger packets use a UDP-checksum-derived fast path
+checksum and offload behavior requires target validation; small WG packets use bounded full ICMP checksum, larger packets use a UDP-checksum-derived fast path
 ```
 
+Large ICMP packets use the UDP-checksum-derived fast path instead of a verifier-bounded full ICMP checksum recompute. This path depends on the original UDP checksum; an IPv4 UDP packet with checksum zero causes large ICMP checksum derivation to fail and is reported through `icmp_checksum_error`.
+
 `faketcp` and `faketcp-lite` are reserved names and are rejected by config validation in this version.
+
+Netns regression entry points:
+
+```bash
+sudo make test-netns-smoke
+sudo make test-netns-icmp-smoke
+sudo NEGATIVE_CHECKS=xfail scripts/smoke-netns-icmp.sh
+sudo NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
+```
+
+The ICMP smoke test is IPv4-only. Its pcap check requires ICMP Echo Request and Reply records, mixed initiation/response/transport payload type words, and zero standard type-word leaks. The negative hooks are optional by default because ordinary ping pass-through and raw UDP bypass protection can be developed on separate core dataplane branches.
 
 ## Linux Platform Support
 
@@ -143,7 +161,11 @@ veth / virtio / physical NIC
 OpenWrt bridge and WAN paths
 ```
 
+For ICMP mode, the TX checksum offload, GSO, and NIC matrix still needs target-specific validation, especially for large packets that use the UDP-checksum-derived ICMP checksum fast path.
+
 TX-side packet captures can show invalid UDP checksums when hardware or virtio checksum offload is enabled. Receiver-side captures and dataplane counters are more useful for checksum validation.
+
+ICMP mode has a narrower validation surface in the MVP: ICMP checksum handling is implemented for the current skb shapes, but large packets and offload/GSO/GRO combinations still require target-specific testing. Keep ICMP-mode WireGuard MTU conservative until the target path has been validated.
 
 ## IPv6
 
@@ -162,7 +184,7 @@ unsupported IPv6 extension on ingress: targeted policy/counter behavior
 
 ## Fragmentation
 
-Outer WireGuard UDP fragmentation is not supported as a transform path. Configure WireGuard MTU and underlay MTU so outer packets are not fragmented.
+Outer WireGuard UDP or ICMP fragmentation is not supported as a transform path. Configure WireGuard MTU and underlay MTU so outer packets are not fragmented.
 
 MVP behavior is fail-closed when the packet can be identified as managed, and conservative pass/counter behavior when a non-first fragment cannot be tied to a managed listener without risking unrelated traffic.
 

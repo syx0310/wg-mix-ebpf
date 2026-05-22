@@ -11,7 +11,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-#define ABI_VERSION 5
+#define ABI_VERSION 6
 
 #define FAMILY_ANY  0
 #define FAMILY_IPV4 4
@@ -34,6 +34,8 @@
 #define ICMP_ROLE_NONE   0
 #define ICMP_ROLE_CLIENT 1
 #define ICMP_ROLE_SERVER 2
+
+#define ICMP_LISTENER_F_WILDCARD_ID (1U << 0)
 
 #define ICMP_ECHOREPLY 0
 #define ICMP_ECHO      8
@@ -200,11 +202,14 @@ struct icmp_listener_value {
 	__u16 listen_port;
 	__u8 action;
 	__u8 role;
-	__u8 pad[4];
+	__u32 flags;
 };
 
 struct icmp_seq_key {
+	__u64 generation;
 	__u32 remote_ipv4;
+	__u32 underlay_index;
+	__u32 wg_id;
 	__u16 icmp_id;
 	__u16 pad;
 };
@@ -627,8 +632,6 @@ static __always_inline int parse_icmp_packet(struct __sk_buff *skb,
 	info->code = icmp->code;
 	info->id = bpf_ntohs(icmp->id);
 	info->sequence = bpf_ntohs(icmp->sequence);
-	if (info->payload_len < 4)
-		return PARSE_SHORT;
 	return PARSE_OK;
 }
 
@@ -745,13 +748,16 @@ static __always_inline int derive_icmp_checksum_from_udp(struct __sk_buff *skb,
 
 static __always_inline __u16 lookup_icmp_sequence(struct __sk_buff *skb,
 						  struct packet_info *info,
-						  __u64 generation,
+						  struct egress_rule_value *rule,
 						  __u16 icmp_id)
 {
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 	struct iphdr *iph = data + info->ip_off;
 	struct icmp_seq_key key = {
+		.generation = rule->generation,
+		.underlay_index = skb->ifindex,
+		.wg_id = rule->wg_id,
 		.icmp_id = icmp_id,
 	};
 	struct icmp_seq_value *value;
@@ -760,20 +766,24 @@ static __always_inline __u16 lookup_icmp_sequence(struct __sk_buff *skb,
 		return 0;
 	key.remote_ipv4 = iph->daddr;
 	value = bpf_map_lookup_elem(&icmp_seq_map, &key);
-	if (!value || value->generation != generation)
+	if (!value || value->generation != rule->generation)
 		return 0;
 	return value->sequence;
 }
 
-static __always_inline void remember_icmp_sequence(struct icmp_packet_info *info,
-						   __u64 generation)
+static __always_inline void remember_icmp_sequence(struct __sk_buff *skb,
+						   struct icmp_packet_info *info,
+						   struct icmp_listener_value *listener)
 {
 	struct icmp_seq_key key = {
+		.generation = listener->generation,
 		.remote_ipv4 = info->src_ipv4,
+		.underlay_index = skb->ifindex,
+		.wg_id = listener->wg_id,
 		.icmp_id = info->id,
 	};
 	struct icmp_seq_value value = {
-		.generation = generation,
+		.generation = listener->generation,
 		.sequence = info->sequence,
 	};
 
@@ -874,7 +884,7 @@ static __always_inline int rewrite_udp_to_icmp(struct __sk_buff *skb,
 		icmp_type = ICMP_ECHOREPLY;
 		if (info->dst_port != 0)
 			icmp_id = info->dst_port;
-		icmp_sequence = lookup_icmp_sequence(skb, info, rule->generation, icmp_id);
+		icmp_sequence = lookup_icmp_sequence(skb, info, rule, icmp_id);
 	}
 	icmp.type = icmp_type;
 	icmp.code = 0;
@@ -897,7 +907,7 @@ static __always_inline int rewrite_udp_to_icmp(struct __sk_buff *skb,
 		return -2;
 	rc = update_ipv4_protocol(skb, info->ip_off, IPPROTO_UDP, IPPROTO_ICMP);
 	if (rc < 0)
-		return rc;
+		return rc == -1 ? -3 : rc;
 	if (small_checksum) {
 		if (compute_icmp_checksum_small(skb, info->udp_off, icmp_len, &checksum) < 0)
 			return -3;
@@ -926,7 +936,7 @@ static __always_inline int rewrite_icmp_to_udp(struct __sk_buff *skb,
 	udp.check = 0;
 
 	if (listener->role == ICMP_ROLE_SERVER && info->type == ICMP_ECHO)
-		remember_icmp_sequence(info, listener->generation);
+		remember_icmp_sequence(skb, info, listener);
 	if (bpf_skb_store_bytes(skb, info->payload_off, &new_wire, sizeof(new_wire),
 				BPF_F_INVALIDATE_HASH) < 0)
 		return -2;
@@ -935,7 +945,7 @@ static __always_inline int rewrite_icmp_to_udp(struct __sk_buff *skb,
 		return -2;
 	rc = update_ipv4_protocol(skb, info->ip_off, IPPROTO_ICMP, IPPROTO_UDP);
 	if (rc < 0)
-		return rc;
+		return rc == -1 ? -3 : rc;
 	return 0;
 }
 
@@ -1017,7 +1027,8 @@ static __always_inline struct icmp_listener_value *lookup_icmp_listener(__u32 if
 									__u16 icmp_id,
 									__u8 icmp_type,
 									__u8 family,
-									__u64 generation)
+									__u64 generation,
+									__u8 *wildcard_id)
 {
 	struct icmp_listener_key key = {
 		.generation = generation,
@@ -1028,23 +1039,40 @@ static __always_inline struct icmp_listener_value *lookup_icmp_listener(__u32 if
 	};
 	struct icmp_listener_value *listener;
 
-	listener = bpf_map_lookup_elem(&icmp_listener_map, &key);
-	if (listener && listener->generation == generation)
-		return listener;
-	key.icmp_id = 0;
+	*wildcard_id = 0;
 	listener = bpf_map_lookup_elem(&icmp_listener_map, &key);
 	if (listener && listener->generation == generation)
 		return listener;
 	key.underlay_index = UNDERLAY_WILDCARD;
-	key.icmp_id = icmp_id;
 	listener = bpf_map_lookup_elem(&icmp_listener_map, &key);
 	if (listener && listener->generation == generation)
 		return listener;
-	key.icmp_id = 0;
-	listener = bpf_map_lookup_elem(&icmp_listener_map, &key);
-	if (listener && listener->generation == generation)
-		return listener;
+	if (icmp_id != 0) {
+		key.underlay_index = ifindex;
+		key.icmp_id = 0;
+		listener = bpf_map_lookup_elem(&icmp_listener_map, &key);
+		if (listener && listener->generation == generation &&
+		    (listener->flags & ICMP_LISTENER_F_WILDCARD_ID)) {
+			*wildcard_id = 1;
+			return listener;
+		}
+		key.underlay_index = UNDERLAY_WILDCARD;
+		listener = bpf_map_lookup_elem(&icmp_listener_map, &key);
+		if (listener && listener->generation == generation &&
+		    (listener->flags & ICMP_LISTENER_F_WILDCARD_ID)) {
+			*wildcard_id = 1;
+			return listener;
+		}
+	}
 	return 0;
+}
+
+static __always_inline int icmp_bad_ingress_action(__u32 stat, __u8 wildcard_id)
+{
+	inc_stat(stat);
+	if (wildcard_id)
+		return TC_ACT_OK;
+	return TC_ACT_SHOT;
 }
 
 SEC("tc/egress")
@@ -1165,6 +1193,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	__u32 old_type = 0;
 	__u32 new_wire = 0;
 	__u8 gso_seen = 0;
+	__u8 icmp_wildcard_id = 0;
 	int rc, kind = -1;
 
 	if (!active_generation(&generation))
@@ -1178,7 +1207,8 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	if (rc == PARSE_OK && icmp_info.code == 0 &&
 	    (icmp_info.type == ICMP_ECHO || icmp_info.type == ICMP_ECHOREPLY)) {
 		icmp_listener = lookup_icmp_listener(skb->ifindex, icmp_info.id, icmp_info.type,
-						     icmp_info.family, generation);
+						     icmp_info.family, generation,
+						     &icmp_wildcard_id);
 		if (!icmp_listener)
 			return TC_ACT_OK;
 		if (gso_seen)
@@ -1195,6 +1225,9 @@ int wg_mix_ingress(struct __sk_buff *skb)
 			inc_stat(STAT_INGRESS_RULE_MISS);
 			return TC_ACT_SHOT;
 		}
+		if (icmp_info.payload_len < sizeof(old_wire))
+			return icmp_bad_ingress_action(STAT_INGRESS_BAD_LENGTH,
+						       icmp_wildcard_id);
 		if (bpf_skb_load_bytes(skb, icmp_info.payload_off, &old_wire,
 				       sizeof(old_wire)) < 0) {
 			inc_stat(STAT_SKB_LOAD_ERROR);
@@ -1210,18 +1243,20 @@ int wg_mix_ingress(struct __sk_buff *skb)
 			}
 		}
 		if (kind < 0) {
-			inc_stat(STAT_INGRESS_BAD_TYPE);
-			return TC_ACT_SHOT;
+			return icmp_bad_ingress_action(STAT_INGRESS_BAD_TYPE,
+						       icmp_wildcard_id);
 		}
 		if (!validate_len(kind, icmp_info.payload_len)) {
-			inc_stat(STAT_INGRESS_BAD_LENGTH);
-			return TC_ACT_SHOT;
+			return icmp_bad_ingress_action(STAT_INGRESS_BAD_LENGTH,
+						       icmp_wildcard_id);
 		}
 		new_wire = wg_cpu_to_le32(profile->mixed_to_standard[kind]);
 		rc = rewrite_icmp_to_udp(skb, &icmp_info, icmp_listener, new_wire);
 		if (rc < 0) {
 			if (rc == -2)
 				inc_stat(STAT_SKB_STORE_ERROR);
+			else if (rc == -3)
+				inc_stat(STAT_ICMP_CHECKSUM_ERROR);
 			else
 				inc_stat(STAT_CHECKSUM_ERROR);
 			return TC_ACT_SHOT;

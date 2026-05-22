@@ -148,9 +148,11 @@ network receives ICMP Echo packet
   -> standard kernel WireGuard receives packet
 ```
 
+ICMP server listeners use an explicit wildcard-id flag for the `id=0` fallback entry. Exact-id listener hits still fail closed on bad mixed type words or invalid WireGuard lengths. Wildcard-id fallback hits pass packets that fail only the mixed type-word or WireGuard length checks, while still incrementing the ingress bad-type or bad-length counter, so ordinary Echo Request traffic is not dropped merely because its payload is not a managed WireGuard packet. Profile misses and generation mismatches still drop.
+
 For ICMP server mode, ingress uses the observed Echo `id` as the synthetic UDP source port. WireGuard then naturally carries that value in the return packet destination port, allowing egress to emit an Echo Reply with the same `id`.
 
-Some NAT devices rewrite the ICMP Echo `sequence` field while keeping the Echo `id`. ICMP server ingress records the observed `remote IPv4 + Echo id -> sequence` in a small kernel LRU map. Server egress uses that value when emitting Echo Replies, so the return packet matches the NAT-created ICMP state.
+Some NAT devices rewrite the ICMP Echo `sequence` field while keeping the Echo `id`. ICMP server ingress records the observed `generation + underlay ifindex + wg_id + remote IPv4 + Echo id -> sequence` in a small kernel LRU map. Server egress uses that value when emitting Echo Replies, so the return packet matches the NAT-created ICMP state without sharing sequence state across reloads, underlays, or WireGuard interfaces.
 
 ## Checksums And Offload
 
@@ -180,6 +182,7 @@ Status exposes load/store/checksum errors and direction-specific GSO counters:
 skb_load_error
 skb_store_error
 checksum_error
+icmp_checksum_error
 egress_gso_seen
 egress_gso_managed_seen
 egress_gso_rewrite_ok
@@ -215,7 +218,7 @@ icmp_listener_map
   Generation-scoped ICMP Echo listener rules for IPv4 ICMP transport.
 
 icmp_seq_map
-  Runtime LRU state for ICMP server replies when an upstream NAT rewrites Echo sequence.
+  Runtime LRU state keyed by generation, underlay ifindex, wg_id, remote IPv4, and Echo id for ICMP server replies when an upstream NAT rewrites Echo sequence.
 
 managed_fwmark_map
   Egress fail-closed guard for managed marks.

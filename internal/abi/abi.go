@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	Version uint32 = 5
+	Version uint32 = 6
 
 	FamilyAny  uint8 = 0
 	FamilyIPv4 uint8 = 4
@@ -30,6 +30,8 @@ const (
 	ICMPRoleNone   uint8 = 0
 	ICMPRoleClient uint8 = 1
 	ICMPRoleServer uint8 = 2
+
+	ICMPListenerFWildcardID uint32 = 1 << 0
 )
 
 type ControlKey uint32
@@ -143,7 +145,7 @@ type ICMPListenerValue struct {
 	ListenPort uint16
 	Action     uint8
 	Role       uint8
-	_          [4]byte
+	Flags      uint32
 }
 
 func (v ICMPListenerValue) MapGeneration() uint64 { return v.Generation }
@@ -328,6 +330,7 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 			ListenPort: r.ListenPort,
 			Action:     action,
 			Role:       role,
+			Flags:      r.Flags,
 		}
 	}
 	return out, nil

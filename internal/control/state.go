@@ -110,7 +110,12 @@ type ICMPListener struct {
 	WGID            uint32 `json:"wg_id"`
 	Action          string `json:"action"`
 	Role            string `json:"role"`
+	Flags           uint32 `json:"flags,omitempty"`
 }
+
+const (
+	ICMPListenerFlagWildcardID uint32 = 1 << 0
+)
 
 func (s *State) JSON() ([]byte, error) {
 	return json.MarshalIndent(s, "", "  ")
@@ -308,11 +313,13 @@ func (s *State) buildRules(cfg *config.Config) {
 				if wg.TransportMode == "icmp" {
 					icmpType := uint8(8)
 					icmpID := wg.ICMPID
+					icmpFlags := uint32(0)
 					if wg.ICMPRole == "client" {
 						icmpType = 0
 					}
 					if wg.ICMPRole == "server" {
 						icmpID = 0
+						icmpFlags = ICMPListenerFlagWildcardID
 					}
 					s.ICMPListeners = append(s.ICMPListeners, ICMPListener{
 						Generation:      s.Generation,
@@ -325,6 +332,16 @@ func (s *State) buildRules(cfg *config.Config) {
 						WGID:            wg.ID,
 						Action:          "rewrite",
 						Role:            wg.ICMPRole,
+						Flags:           icmpFlags,
+					})
+					s.IngressListeners = append(s.IngressListeners, IngressListener{
+						Generation:      s.Generation,
+						Family:          family,
+						DestinationPort: wg.RuntimeListenPort,
+						UnderlayIfIndex: u.IfIndex,
+						ProfileID:       wg.ProfileID,
+						WGID:            wg.ID,
+						Action:          "drop",
 					})
 					continue
 				}
