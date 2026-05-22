@@ -11,7 +11,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-#define ABI_VERSION 7
+#define ABI_VERSION 8
 
 #define FAMILY_ANY  0
 #define FAMILY_IPV4 4
@@ -311,6 +311,8 @@ enum stat_id {
 	STAT_XOR_LOAD_ERROR,
 	STAT_XOR_STORE_ERROR,
 	STAT_XOR_CSUM_ERROR,
+	STAT_INGRESS_BAD_CHECKSUM,
+	STAT_EGRESS_BAD_CHECKSUM,
 	STAT_MAX,
 };
 
@@ -869,7 +871,7 @@ static __always_inline int update_type_word(struct __sk_buff *skb, struct packet
 	__u32 csum_off = info->udp_off + offsetof(struct udphdr, check);
 	__s64 diff;
 
-	if (recompute_checksum) {
+	if (recompute_checksum && info->family != FAMILY_IPV6) {
 		if (!(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero))
 			store_flags |= BPF_F_RECOMPUTE_CSUM;
 	} else if (!(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero)) {
@@ -877,8 +879,6 @@ static __always_inline int update_type_word(struct __sk_buff *skb, struct packet
 				     (__be32 *)&new_wire, sizeof(new_wire), 0);
 		if (diff < 0)
 			return -1;
-		if (info->family == FAMILY_IPV6)
-			csum_flags |= BPF_F_IPV6;
 		if (bpf_l4_csum_replace(skb, csum_off, 0, diff, csum_flags) < 0)
 			return -1;
 	}
@@ -927,28 +927,24 @@ static __always_inline __u32 xor_type_word_copy(__u32 wire, struct cipher_value 
 	return wire;
 }
 
-static __always_inline int xor_update_checksum(struct __sk_buff *skb,
-					       struct packet_info *info,
-					       void *old_buf,
-					       void *new_buf,
-					       __u32 size,
-					       int recompute_checksum)
+static __always_inline int xor_update_checksum_diff(struct packet_info *info,
+						    void *old_buf,
+						    void *new_buf,
+						    __u32 size,
+						    int recompute_checksum,
+						    __s64 *seed)
 {
-	__u32 csum_off = info->udp_off + offsetof(struct udphdr, check);
-	__u64 csum_flags = 0;
 	__s64 diff;
 
-	if (recompute_checksum)
+	if (recompute_checksum && info->family != FAMILY_IPV6)
 		return 0;
 	if (info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero)
 		return 0;
-	diff = bpf_csum_diff((__be32 *)old_buf, size, (__be32 *)new_buf, size, 0);
+	diff = bpf_csum_diff((__be32 *)old_buf, size, (__be32 *)new_buf, size,
+			     (__wsum)*seed);
 	if (diff < 0)
 		return -1;
-	if (info->family == FAMILY_IPV6)
-		csum_flags |= BPF_F_IPV6;
-	if (bpf_l4_csum_replace(skb, csum_off, 0, diff, csum_flags) < 0)
-		return -1;
+	*seed = diff;
 	return 0;
 }
 
@@ -958,13 +954,16 @@ static __always_inline int xor_store_chunk(struct __sk_buff *skb,
 					   void *old_buf,
 					   void *new_buf,
 					   __u32 size,
-					   int recompute_checksum)
+					   int recompute_checksum,
+					   __s64 *csum_diff)
 {
 	__u64 store_flags = BPF_F_INVALIDATE_HASH;
 
-	if (xor_update_checksum(skb, info, old_buf, new_buf, size, recompute_checksum) < 0)
+	if (xor_update_checksum_diff(info, old_buf, new_buf, size, recompute_checksum,
+				     csum_diff) < 0)
 		return -3;
-	if (recompute_checksum && !(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero))
+	if (recompute_checksum && info->family != FAMILY_IPV6 &&
+	    !(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero))
 		store_flags |= BPF_F_RECOMPUTE_CSUM;
 	if (bpf_skb_store_bytes(skb, info->payload_off + off, new_buf, size, store_flags) < 0)
 		return -2;
@@ -982,6 +981,7 @@ static __always_inline int xor_payload(struct __sk_buff *skb,
 	__u8 new_chunk[XOR_CHUNK_SIZE] = {};
 	__u32 old_word = 0;
 	__u32 new_word = 0;
+	__s64 csum_diff = 0;
 	int rc;
 
 	if (!cipher || cipher->mode != CIPHER_MODE_XOR)
@@ -1011,14 +1011,14 @@ static __always_inline int xor_payload(struct __sk_buff *skb,
 		for (int j = 0; j < XOR_CHUNK_SIZE; j++)
 			new_chunk[j] = old_chunk[j] ^ xor_key_byte(cipher, processed + j);
 		rc = xor_store_chunk(skb, info, processed, old_chunk, new_chunk,
-				     XOR_CHUNK_SIZE, recompute_checksum);
+				     XOR_CHUNK_SIZE, recompute_checksum, &csum_diff);
 		if (rc < 0)
 			return rc;
 		processed += XOR_CHUNK_SIZE;
 	}
 
 #pragma unroll
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < (XOR_CHUNK_SIZE / 4) - 1; i++) {
 		__u8 *old_bytes = (__u8 *)&old_word;
 		__u8 *new_bytes = (__u8 *)&new_word;
 
@@ -1032,13 +1032,18 @@ static __always_inline int xor_payload(struct __sk_buff *skb,
 		for (int j = 0; j < 4; j++)
 			new_bytes[j] = old_bytes[j] ^ xor_key_byte(cipher, processed + j);
 		rc = xor_store_chunk(skb, info, processed, &old_word, &new_word,
-				     sizeof(new_word), recompute_checksum);
+				     sizeof(new_word), recompute_checksum, &csum_diff);
 		if (rc < 0)
 			return rc;
 		processed += 4;
 	}
 	if (processed != target)
 		return -4;
+	if (!(recompute_checksum && info->family != FAMILY_IPV6) &&
+	    !(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero) &&
+	    bpf_l4_csum_replace(skb, info->udp_off + offsetof(struct udphdr, check),
+				0, csum_diff, 0) < 0)
+		return -3;
 	return 0;
 }
 
@@ -1318,6 +1323,8 @@ int wg_mix_egress(struct __sk_buff *skb)
 		}
 		return TC_ACT_OK;
 	}
+	if (rc == PARSE_BAD_CSUM)
+		return managed_miss_action(STAT_EGRESS_BAD_CHECKSUM, managed);
 	if (rc != PARSE_OK)
 		return managed_miss_action(STAT_EGRESS_RULE_MISS, managed);
 
@@ -1513,7 +1520,11 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		inc_stat(STAT_INGRESS_FRAGMENT);
 		return TC_ACT_SHOT;
 	}
-	if (parse_result_is_ipv6_ext(rc) || rc == PARSE_BAD_CSUM) {
+	if (rc == PARSE_BAD_CSUM) {
+		inc_stat(STAT_INGRESS_BAD_CHECKSUM);
+		return TC_ACT_SHOT;
+	}
+	if (parse_result_is_ipv6_ext(rc)) {
 		inc_stat(STAT_INGRESS_IPV6_EXT);
 		return TC_ACT_SHOT;
 	}

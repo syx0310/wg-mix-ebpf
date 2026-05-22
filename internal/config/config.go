@@ -316,7 +316,7 @@ func (c *Config) ApplyDefaults() {
 			cipher.Auth = "none"
 		}
 		if cipher.Scope == "" {
-			cipher.Scope = "wg-payload-full"
+			cipher.Scope = "wg-payload-prefix"
 		}
 		if cipher.KeyDerivation == "" {
 			cipher.KeyDerivation = "wgmx-hkdf256-v1"
@@ -329,7 +329,7 @@ func (c *Config) ApplyDefaults() {
 			}
 		}
 		if cipher.MaxBytes == 0 {
-			cipher.MaxBytes = 2048
+			cipher.MaxBytes = 128
 		}
 		c.Ciphers[name] = cipher
 	}
@@ -426,6 +426,9 @@ func (c *Config) ValidateStatic() error {
 					return fmt.Errorf("wireguards[%d].transport.icmp.id is required for client role", i)
 				}
 			case "server":
+				if wg.Transport.ICMP.ID != 0 {
+					return fmt.Errorf("wireguards[%d].transport.icmp.id must be omitted or zero for server role", i)
+				}
 			default:
 				return fmt.Errorf("wireguards[%d].transport.icmp.role must be client or server", i)
 			}

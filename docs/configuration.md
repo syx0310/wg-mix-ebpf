@@ -52,10 +52,10 @@ ciphers:
   xor-home:
     mode: xor
     auth: none
-    scope: wg-payload-full
+    scope: wg-payload-prefix
     key_derivation: udp2raw-md5-key1
     password: "change-me"
-    max_bytes: 2048
+    max_bytes: 128
 
 fwmark_policy:
   mode: config-required
@@ -248,7 +248,8 @@ IPv4 only; ICMPv6 is not implemented
 client emits Echo Request and accepts Echo Reply
 server accepts Echo Request and emits Echo Reply
 client id must be nonzero and should be unique per client/profile
-server uses wildcard Echo id by default; leave server icmp.id unset
+server uses wildcard Echo id; leave server icmp.id unset or zero
+server config with a nonzero transport.icmp.id is rejected
 server wildcard matching is intended for mixed WireGuard Echo payloads, not ordinary ping traffic
 server wildcard-id listener passes only bad type-word or bad length misses; valid managed ICMP WireGuard packets are still rewritten
 server preserves NAT-rewritten Echo sequence values with runtime kernel state
@@ -277,10 +278,10 @@ ciphers:
   xor-home:
     mode: xor
     auth: none
-    scope: wg-payload-full
+    scope: wg-payload-prefix
     key_derivation: udp2raw-md5-key1
     password: "example-passphrase"
-    max_bytes: 2048
+    max_bytes: 128
 ```
 
 MVP UDP processing order:
@@ -292,6 +293,12 @@ egress:
 ingress:
   XOR WireGuard payload -> mixed type_word -> standard type_word
 ```
+
+Current XOR is not multiplexing. It does not combine multiple WireGuard
+interfaces or flows into one outer flow, and it does not implement udp2raw
+framing. It is a UDP-only payload transform layered on top of the type-word
+rewrite. Config validation rejects ICMP + XOR and any future fakeTCP + XOR
+combination in the MVP.
 
 Supported fields:
 
@@ -317,7 +324,19 @@ max_bytes:
   non-zero multiple of 4 up to 2048
 ```
 
+Default values:
+
+```text
+scope: wg-payload-prefix
+max_bytes: 128
+auth: none
+key_derivation: wgmx-hkdf256-v1
+key_len: 256
+```
+
 `wg-payload-full` XORs the whole WireGuard UDP payload and drops managed packets larger than `max_bytes`. `wg-payload-prefix` XORs only the first `max_bytes` bytes.
+
+`wg-payload-prefix` is the recommended default for performance-sensitive UDP mode. The dataplane processes XOR in bounded chunks, so CPU cost scales with the number of bytes XORed. A prefix of `4` only hides the mixed type word; `64` or `128` hides more of the WireGuard header and early ciphertext while keeping helper calls low. Use `wg-payload-full` only when full payload XOR is required and the target path has been benchmarked.
 
 `udp2raw-md5-key1` derives the XOR key as `MD5(password + "key1")`. This only reuses udp2raw's lightweight XOR key style; it is not udp2raw wire-compatible and does not implement udp2raw framing, auth, anti-replay, or raw modes.
 
@@ -328,11 +347,11 @@ ciphers:
   xor-home:
     mode: xor
     auth: none
-    scope: wg-payload-full
+    scope: wg-payload-prefix
     key_derivation: wgmx-hkdf256-v1
     secret_file: /etc/wg-mix-ebpf/xor-home.key
     key_len: 256
-    max_bytes: 2048
+    max_bytes: 128
 ```
 
 Secret material is derived in userspace and written to the BPF cipher map as fixed key bytes. `status` hides the actual key.

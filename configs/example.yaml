@@ -25,10 +25,10 @@ profiles:
 #   xor-home:
 #     mode: xor
 #     auth: none
-#     scope: wg-payload-full
+#     scope: wg-payload-prefix
 #     key_derivation: udp2raw-md5-key1
 #     password: "change-me"
-#     max_bytes: 2048
+#     max_bytes: 128
 
 fwmark_policy:
   mode: config-required

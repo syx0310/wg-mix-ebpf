@@ -172,7 +172,9 @@ Checksum handling is direction-specific:
 
 ```text
 egress:
-  bpf_skb_store_bytes(..., BPF_F_RECOMPUTE_CSUM)
+  IPv4: bpf_skb_store_bytes(..., BPF_F_RECOMPUTE_CSUM)
+  IPv6: bpf_csum_diff(...) + bpf_l4_csum_replace(...)
+        then bpf_skb_store_bytes(..., BPF_F_INVALIDATE_HASH)
 
 ingress:
   bpf_l4_csum_replace(...)
@@ -187,9 +189,25 @@ ICMP ingress:
 
 UDP XOR cipher:
   chunked skb load/store of managed WireGuard UDP payload
-  egress uses the offload-friendly recompute checksum path
-  ingress updates UDP checksum from chunk diffs before writing payload bytes
+  IPv4 egress uses the offload-friendly recompute checksum path
+  IPv6 egress updates UDP checksum from chunk diffs before writing payload bytes
+  ingress accumulates chunk checksum diffs and updates UDP checksum once
 ```
+
+For payload-only UDP checksum updates, the L4 checksum helper is used in diff
+mode with no additional L4 checksum flags. Passing `BPF_F_IPV6` in this
+payload-only diff path caused TC egress helper failures in the IPv6 netns
+regression.
+
+XOR cost scales with `max_bytes`. `wg-payload-prefix` with a small bounded prefix
+is the preferred performance mode; `wg-payload-full` is available for stronger
+payload obfuscation but costs one chunked load/store and checksum-diff sequence
+per processed chunk.
+
+The current XOR layer is not a mux/multiplex implementation. It does not merge
+multiple WireGuard interfaces or peer flows, does not change the outer UDP
+tuple, and is only valid with UDP transport. Config validation rejects
+ICMP+XOR and fakeTCP+XOR in the MVP.
 
 Status exposes load/store/checksum errors and direction-specific GSO counters:
 

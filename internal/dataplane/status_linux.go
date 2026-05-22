@@ -147,6 +147,8 @@ var statNames = []string{
 	"xor_load_error",
 	"xor_store_error",
 	"xor_csum_error",
+	"ingress_bad_checksum",
+	"egress_bad_checksum",
 }
 
 func filterStatuses(link netlink.Link, parent uint32, direction string) ([]FilterStatus, error) {

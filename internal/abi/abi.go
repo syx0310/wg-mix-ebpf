@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	Version uint32 = 7
+	Version uint32 = 8
 
 	FamilyAny  uint8 = 0
 	FamilyIPv4 uint8 = 4

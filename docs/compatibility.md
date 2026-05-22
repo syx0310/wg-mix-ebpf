@@ -51,6 +51,7 @@ both endpoints must enable the same cipher definition
 the same XOR key material must be configured on both endpoints
 only UDP transport is supported in the MVP
 ICMP + XOR and fakeTCP + XOR are rejected
+current XOR is not mux/multiplex and does not merge multiple flows
 ```
 
 `icmp` is an experimental IPv4-only raw transport mode. It changes the outer IPv4 protocol from UDP to ICMP and replaces the 8-byte UDP header with an 8-byte ICMP Echo header. The WireGuard payload is still protected by WireGuard and still uses the same mixed type-word profile.
@@ -66,7 +67,8 @@ client:
 server:
   accepts Echo Request
   emits Echo Reply
-  uses wildcard ingress id by default to tolerate NAT ICMP id rewriting
+  requires transport.icmp.id to be omitted or zero in config
+  uses wildcard ingress id to tolerate NAT ICMP id rewriting
   wildcard id is intended for mixed WireGuard Echo payloads, not ordinary ping traffic
   passes wildcard-id Echo Requests that fail only mixed type-word or WireGuard length checks
   preserves NAT-rewritten Echo sequence values with runtime kernel state
@@ -175,9 +177,9 @@ OpenWrt bridge and WAN paths
 
 For ICMP mode, the TX checksum offload, GSO, and NIC matrix still needs target-specific validation, especially for large packets that use the UDP-checksum-derived ICMP checksum fast path.
 
-For XOR mode, the dataplane rewrites the managed UDP payload in bounded chunks and updates the UDP checksum for each chunk. Production validation should include at least one receiver-side pcap check with `scripts/check-wg-pcap.py --xor-udp2raw-password ... --require-xor-mixed ... --forbid-plain-standard --forbid-plain-mixed`.
+For XOR mode, the dataplane rewrites the managed UDP payload in bounded chunks and updates the UDP checksum from the accumulated payload diff. The netns smoke target validates both IPv4 and IPv6 UDP underlay. Production validation should include at least one receiver-side pcap check with `scripts/check-wg-pcap.py --xor-udp2raw-password ... --require-xor-mixed ... --forbid-plain-standard --forbid-plain-mixed`.
 
-The current XOR smoke target validates IPv4 UDP underlay. IPv6 UDP parsing remains part of the dataplane, but XOR over IPv6 underlay should be validated on the target path before production use.
+The default XOR scope is `wg-payload-prefix` with `max_bytes: 128`. For performance-sensitive deployments, keep that default or lower it to `64` after validating the target path. Larger values scale linearly with the number of processed chunks; full-payload XOR should be benchmarked on the target path before use.
 
 TX-side packet captures can show invalid UDP checksums when hardware or virtio checksum offload is enabled. Receiver-side captures and dataplane counters are more useful for checksum validation.
 

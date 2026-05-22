@@ -176,7 +176,6 @@ ciphers:
   xor-home:
     mode: xor
     auth: none
-    scope: wg-payload-full
     key_derivation: wgmx-hkdf256-v1
     secret: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
 `))
@@ -189,7 +188,10 @@ ciphers:
 	if cfg.Ciphers["xor-home"].KeyLen != 256 {
 		t.Fatalf("default key_len = %d", cfg.Ciphers["xor-home"].KeyLen)
 	}
-	if cfg.Ciphers["xor-home"].MaxBytes != 2048 {
+	if cfg.Ciphers["xor-home"].Scope != "wg-payload-prefix" {
+		t.Fatalf("default scope = %q", cfg.Ciphers["xor-home"].Scope)
+	}
+	if cfg.Ciphers["xor-home"].MaxBytes != 128 {
 		t.Fatalf("default max_bytes = %d", cfg.Ciphers["xor-home"].MaxBytes)
 	}
 }
@@ -263,6 +265,29 @@ profiles:
 `))
 	if err == nil {
 		t.Fatal("expected missing icmp id error")
+	}
+}
+
+func TestRejectICMPServerWithID(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: icmp
+      icmp:
+        role: server
+        id: 0x5303
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err == nil {
+		t.Fatal("expected server icmp id error")
 	}
 }
 
