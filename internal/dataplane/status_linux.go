@@ -139,6 +139,16 @@ var statNames = []string{
 	"icmp_egress_rewrite_ok",
 	"icmp_ingress_rewrite_ok",
 	"icmp_checksum_error",
+	"xor_egress_ok",
+	"xor_ingress_ok",
+	"xor_key_missing",
+	"xor_len_overflow",
+	"xor_bad_type_after_decrypt",
+	"xor_load_error",
+	"xor_store_error",
+	"xor_csum_error",
+	"ingress_bad_checksum",
+	"egress_bad_checksum",
 }
 
 func filterStatuses(link netlink.Link, parent uint32, direction string) ([]FilterStatus, error) {

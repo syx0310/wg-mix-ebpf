@@ -11,7 +11,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-#define ABI_VERSION 6
+#define ABI_VERSION 8
 
 #define FAMILY_ANY  0
 #define FAMILY_IPV4 4
@@ -36,6 +36,13 @@
 #define ICMP_ROLE_SERVER 2
 
 #define ICMP_LISTENER_F_WILDCARD_ID (1U << 0)
+
+#define CIPHER_MODE_NONE 0
+#define CIPHER_MODE_XOR  1
+#define CIPHER_F_PREFIX  (1U << 0)
+
+#define MAX_XOR_BYTES 2048
+#define XOR_CHUNK_SIZE 16
 
 #define ICMP_ECHOREPLY 0
 #define ICMP_ECHO      8
@@ -127,6 +134,23 @@ struct profile_key {
 	__u32 pad;
 };
 
+struct cipher_key {
+	__u64 generation;
+	__u32 cipher_id;
+	__u32 pad;
+};
+
+struct cipher_value {
+	__u64 generation;
+	__u8 key[256];
+	__u32 key_len;
+	__u32 key_mask;
+	__u32 max_bytes;
+	__u32 flags;
+	__u8 mode;
+	__u8 pad[7];
+};
+
 struct managed_fwmark_key {
 	__u64 generation;
 	__u32 fwmark;
@@ -164,11 +188,12 @@ struct egress_rule_value {
 	__u64 generation;
 	__u32 profile_id;
 	__u32 wg_id;
+	__u32 cipher_id;
 	__u16 icmp_id;
 	__u8 action;
 	__u8 transport_mode;
 	__u8 icmp_role;
-	__u8 pad[3];
+	__u8 pad[7];
 };
 
 struct ingress_listener_key {
@@ -183,8 +208,9 @@ struct ingress_listener_value {
 	__u64 generation;
 	__u32 profile_id;
 	__u32 wg_id;
+	__u32 cipher_id;
 	__u8 action;
-	__u8 pad[7];
+	__u8 pad[3];
 };
 
 struct icmp_listener_key {
@@ -277,6 +303,16 @@ enum stat_id {
 	STAT_ICMP_EGRESS_REWRITE_OK,
 	STAT_ICMP_INGRESS_REWRITE_OK,
 	STAT_ICMP_CHECKSUM_ERROR,
+	STAT_XOR_EGRESS_OK,
+	STAT_XOR_INGRESS_OK,
+	STAT_XOR_KEY_MISSING,
+	STAT_XOR_LEN_OVERFLOW,
+	STAT_XOR_BAD_TYPE_AFTER_DECRYPT,
+	STAT_XOR_LOAD_ERROR,
+	STAT_XOR_STORE_ERROR,
+	STAT_XOR_CSUM_ERROR,
+	STAT_INGRESS_BAD_CHECKSUM,
+	STAT_EGRESS_BAD_CHECKSUM,
 	STAT_MAX,
 };
 
@@ -293,6 +329,13 @@ struct {
 	__type(key, struct profile_key);
 	__type(value, struct profile_value);
 } profile_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 128);
+	__type(key, struct cipher_key);
+	__type(value, struct cipher_value);
+} cipher_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -828,7 +871,7 @@ static __always_inline int update_type_word(struct __sk_buff *skb, struct packet
 	__u32 csum_off = info->udp_off + offsetof(struct udphdr, check);
 	__s64 diff;
 
-	if (recompute_checksum) {
+	if (recompute_checksum && info->family != FAMILY_IPV6) {
 		if (!(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero))
 			store_flags |= BPF_F_RECOMPUTE_CSUM;
 	} else if (!(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero)) {
@@ -836,14 +879,171 @@ static __always_inline int update_type_word(struct __sk_buff *skb, struct packet
 				     (__be32 *)&new_wire, sizeof(new_wire), 0);
 		if (diff < 0)
 			return -1;
-		if (info->family == FAMILY_IPV6)
-			csum_flags |= BPF_F_IPV6;
 		if (bpf_l4_csum_replace(skb, csum_off, 0, diff, csum_flags) < 0)
 			return -1;
 	}
 	if (bpf_skb_store_bytes(skb, info->payload_off, &new_wire, sizeof(new_wire),
 				store_flags) < 0)
 		return -2;
+	return 0;
+}
+
+static __always_inline struct cipher_value *lookup_cipher(__u32 cipher_id, __u64 generation)
+{
+	struct cipher_key key = {
+		.generation = generation,
+		.cipher_id = cipher_id,
+	};
+	struct cipher_value *cipher;
+
+	if (cipher_id == 0)
+		return 0;
+	cipher = bpf_map_lookup_elem(&cipher_map, &key);
+	if (cipher && cipher->generation == generation && cipher->mode == CIPHER_MODE_XOR)
+		return cipher;
+	return 0;
+}
+
+static __always_inline __u8 xor_key_byte(struct cipher_value *cipher, __u32 off)
+{
+	if (cipher->key_len == 16)
+		return cipher->key[off & 15];
+	if (cipher->key_len == 32)
+		return cipher->key[off & 31];
+	if (cipher->key_len == 64)
+		return cipher->key[off & 63];
+	if (cipher->key_len == 256)
+		return cipher->key[off & 255];
+	return 0;
+}
+
+static __always_inline __u32 xor_type_word_copy(__u32 wire, struct cipher_value *cipher)
+{
+	__u8 *bytes = (__u8 *)&wire;
+
+#pragma unroll
+	for (int i = 0; i < 4; i++)
+		bytes[i] ^= xor_key_byte(cipher, i);
+	return wire;
+}
+
+static __always_inline int xor_update_checksum_diff(struct packet_info *info,
+						    void *old_buf,
+						    void *new_buf,
+						    __u32 size,
+						    int recompute_checksum,
+						    __s64 *seed)
+{
+	__s64 diff;
+
+	if (recompute_checksum && info->family != FAMILY_IPV6)
+		return 0;
+	if (info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero)
+		return 0;
+	diff = bpf_csum_diff((__be32 *)old_buf, size, (__be32 *)new_buf, size,
+			     (__wsum)*seed);
+	if (diff < 0)
+		return -1;
+	*seed = diff;
+	return 0;
+}
+
+static __always_inline int xor_store_chunk(struct __sk_buff *skb,
+					   struct packet_info *info,
+					   __u32 off,
+					   void *old_buf,
+					   void *new_buf,
+					   __u32 size,
+					   int recompute_checksum,
+					   __s64 *csum_diff)
+{
+	__u64 store_flags = BPF_F_INVALIDATE_HASH;
+
+	if (xor_update_checksum_diff(info, old_buf, new_buf, size, recompute_checksum,
+				     csum_diff) < 0)
+		return -3;
+	if (recompute_checksum && info->family != FAMILY_IPV6 &&
+	    !(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero))
+		store_flags |= BPF_F_RECOMPUTE_CSUM;
+	if (bpf_skb_store_bytes(skb, info->payload_off + off, new_buf, size, store_flags) < 0)
+		return -2;
+	return 0;
+}
+
+static __always_inline int xor_payload(struct __sk_buff *skb,
+				       struct packet_info *info,
+				       struct cipher_value *cipher,
+				       int recompute_checksum)
+{
+	__u32 target = info->payload_len;
+	__u32 processed = 0;
+	__u8 old_chunk[XOR_CHUNK_SIZE] = {};
+	__u8 new_chunk[XOR_CHUNK_SIZE] = {};
+	__u32 old_word = 0;
+	__u32 new_word = 0;
+	__s64 csum_diff = 0;
+	int rc;
+
+	if (!cipher || cipher->mode != CIPHER_MODE_XOR)
+		return -1;
+	if (cipher->key_len != 16 && cipher->key_len != 32 &&
+	    cipher->key_len != 64 && cipher->key_len != 256)
+		return -1;
+	if (cipher->max_bytes == 0 || cipher->max_bytes > MAX_XOR_BYTES)
+		return -4;
+	if (target > cipher->max_bytes) {
+		if (cipher->flags & CIPHER_F_PREFIX)
+			target = cipher->max_bytes;
+		else
+			return -4;
+	}
+	if (target == 0 || target > MAX_XOR_BYTES || (target & 3))
+		return -4;
+
+#pragma unroll
+	for (int i = 0; i < MAX_XOR_BYTES / XOR_CHUNK_SIZE; i++) {
+		if (processed + XOR_CHUNK_SIZE > target)
+			break;
+		if (bpf_skb_load_bytes(skb, info->payload_off + processed, old_chunk,
+				       sizeof(old_chunk)) < 0)
+			return -5;
+#pragma unroll
+		for (int j = 0; j < XOR_CHUNK_SIZE; j++)
+			new_chunk[j] = old_chunk[j] ^ xor_key_byte(cipher, processed + j);
+		rc = xor_store_chunk(skb, info, processed, old_chunk, new_chunk,
+				     XOR_CHUNK_SIZE, recompute_checksum, &csum_diff);
+		if (rc < 0)
+			return rc;
+		processed += XOR_CHUNK_SIZE;
+	}
+
+#pragma unroll
+	for (int i = 0; i < (XOR_CHUNK_SIZE / 4) - 1; i++) {
+		__u8 *old_bytes = (__u8 *)&old_word;
+		__u8 *new_bytes = (__u8 *)&new_word;
+
+		if (processed + 4 > target)
+			break;
+		if (bpf_skb_load_bytes(skb, info->payload_off + processed, &old_word,
+				       sizeof(old_word)) < 0)
+			return -5;
+		new_word = old_word;
+#pragma unroll
+		for (int j = 0; j < 4; j++)
+			new_bytes[j] = old_bytes[j] ^ xor_key_byte(cipher, processed + j);
+		rc = xor_store_chunk(skb, info, processed, &old_word, &new_word,
+				     sizeof(new_word), recompute_checksum, &csum_diff);
+		if (rc < 0)
+			return rc;
+		processed += 4;
+	}
+	if (processed != target)
+		return -4;
+	if (!(recompute_checksum && info->family != FAMILY_IPV6) &&
+	    !(info->family == FAMILY_IPV4 && info->ipv4_udp_csum_zero) &&
+	    bpf_l4_csum_replace(skb, info->udp_off + offsetof(struct udphdr, check),
+				0, csum_diff, 0) < 0)
+		return -3;
 	return 0;
 }
 
@@ -1090,6 +1290,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 	struct managed_fwmark_value *managed;
 	struct profile_key profile_key = {};
 	struct profile_value *profile;
+	struct cipher_value *cipher = 0;
 	__u64 generation = 0;
 	__u32 old_wire = 0;
 	__u32 old_type = 0;
@@ -1122,6 +1323,8 @@ int wg_mix_egress(struct __sk_buff *skb)
 		}
 		return TC_ACT_OK;
 	}
+	if (rc == PARSE_BAD_CSUM)
+		return managed_miss_action(STAT_EGRESS_BAD_CHECKSUM, managed);
 	if (rc != PARSE_OK)
 		return managed_miss_action(STAT_EGRESS_RULE_MISS, managed);
 
@@ -1163,21 +1366,43 @@ int wg_mix_egress(struct __sk_buff *skb)
 		inc_stat(STAT_EGRESS_RULE_MISS);
 		return TC_ACT_SHOT;
 	}
+	if (rule->cipher_id != 0) {
+		cipher = lookup_cipher(rule->cipher_id, generation);
+		if (!cipher) {
+			inc_stat(STAT_XOR_KEY_MISSING);
+			return TC_ACT_SHOT;
+		}
+		if (rule->transport_mode != TRANSPORT_UDP) {
+			inc_stat(STAT_XOR_KEY_MISSING);
+			return TC_ACT_SHOT;
+		}
+	}
 	new_wire = wg_cpu_to_le32(profile->standard_to_mixed[kind]);
-	if (rule->transport_mode == TRANSPORT_ICMP)
+	if (rule->transport_mode == TRANSPORT_ICMP) {
 		rc = rewrite_udp_to_icmp(skb, &info, rule, old_wire, new_wire);
-	else
+	} else if (cipher) {
 		rc = update_type_word(skb, &info, old_wire, new_wire, 1);
+		if (rc == 0)
+			rc = xor_payload(skb, &info, cipher, 1);
+	} else {
+		rc = update_type_word(skb, &info, old_wire, new_wire, 1);
+	}
 	if (rc < 0) {
 		if (rc == -2)
-			inc_stat(STAT_SKB_STORE_ERROR);
+			inc_stat(cipher ? STAT_XOR_STORE_ERROR : STAT_SKB_STORE_ERROR);
 		else if (rc == -3)
-			inc_stat(STAT_ICMP_CHECKSUM_ERROR);
+			inc_stat(cipher ? STAT_XOR_CSUM_ERROR : STAT_ICMP_CHECKSUM_ERROR);
+		else if (rc == -4)
+			inc_stat(STAT_XOR_LEN_OVERFLOW);
+		else if (rc == -5)
+			inc_stat(STAT_XOR_LOAD_ERROR);
 		else
 			inc_stat(STAT_CHECKSUM_ERROR);
 		return TC_ACT_SHOT;
 	}
 	inc_stat(STAT_EGRESS_REWRITE_OK);
+	if (cipher)
+		inc_stat(STAT_XOR_EGRESS_OK);
 	if (rule->transport_mode == TRANSPORT_ICMP)
 		inc_stat(STAT_ICMP_EGRESS_REWRITE_OK);
 	if (gso_seen)
@@ -1194,6 +1419,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	struct icmp_listener_value *icmp_listener;
 	struct profile_key profile_key = {};
 	struct profile_value *profile;
+	struct cipher_value *cipher = 0;
 	__u64 generation = 0;
 	__u32 old_wire = 0;
 	__u32 old_type = 0;
@@ -1294,7 +1520,11 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		inc_stat(STAT_INGRESS_FRAGMENT);
 		return TC_ACT_SHOT;
 	}
-	if (parse_result_is_ipv6_ext(rc) || rc == PARSE_BAD_CSUM) {
+	if (rc == PARSE_BAD_CSUM) {
+		inc_stat(STAT_INGRESS_BAD_CHECKSUM);
+		return TC_ACT_SHOT;
+	}
+	if (parse_result_is_ipv6_ext(rc)) {
 		inc_stat(STAT_INGRESS_IPV6_EXT);
 		return TC_ACT_SHOT;
 	}
@@ -1313,10 +1543,19 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		inc_stat(STAT_INGRESS_RULE_MISS);
 		return TC_ACT_SHOT;
 	}
+	if (listener->cipher_id != 0) {
+		cipher = lookup_cipher(listener->cipher_id, generation);
+		if (!cipher) {
+			inc_stat(STAT_XOR_KEY_MISSING);
+			return TC_ACT_SHOT;
+		}
+	}
 	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0) {
 		inc_stat(STAT_SKB_LOAD_ERROR);
 		return TC_ACT_SHOT;
 	}
+	if (cipher)
+		old_wire = xor_type_word_copy(old_wire, cipher);
 	old_type = wg_le32_to_cpu(old_wire);
 
 #pragma unroll
@@ -1327,7 +1566,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		}
 	}
 	if (kind < 0) {
-		inc_stat(STAT_INGRESS_BAD_TYPE);
+		inc_stat(cipher ? STAT_XOR_BAD_TYPE_AFTER_DECRYPT : STAT_INGRESS_BAD_TYPE);
 		return TC_ACT_SHOT;
 	}
 	if (!validate_len(kind, info.payload_len)) {
@@ -1335,15 +1574,29 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 	new_wire = wg_cpu_to_le32(profile->mixed_to_standard[kind]);
-	rc = update_type_word(skb, &info, old_wire, new_wire, 0);
+	if (cipher) {
+		rc = xor_payload(skb, &info, cipher, 0);
+		if (rc == 0)
+			rc = update_type_word(skb, &info, old_wire, new_wire, 0);
+	} else {
+		rc = update_type_word(skb, &info, old_wire, new_wire, 0);
+	}
 	if (rc < 0) {
 		if (rc == -2)
-			inc_stat(STAT_SKB_STORE_ERROR);
+			inc_stat(cipher ? STAT_XOR_STORE_ERROR : STAT_SKB_STORE_ERROR);
+		else if (rc == -3)
+			inc_stat(STAT_XOR_CSUM_ERROR);
+		else if (rc == -4)
+			inc_stat(STAT_XOR_LEN_OVERFLOW);
+		else if (rc == -5)
+			inc_stat(STAT_XOR_LOAD_ERROR);
 		else
 			inc_stat(STAT_CHECKSUM_ERROR);
 		return TC_ACT_SHOT;
 	}
 	inc_stat(STAT_INGRESS_REWRITE_OK);
+	if (cipher)
+		inc_stat(STAT_XOR_INGRESS_OK);
 	if (gso_seen)
 		inc_stat(STAT_INGRESS_GSO_REWRITE_OK);
 	return TC_ACT_OK;

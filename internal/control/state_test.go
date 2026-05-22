@@ -123,6 +123,71 @@ func TestBuildStateRuntimeRules(t *testing.T) {
 	}
 }
 
+func TestBuildStateUDPXORCipherRules(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    config: /tmp/wg0.conf
+    profile: mix-default
+    cipher: xor-home
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+ciphers:
+  xor-home:
+    mode: xor
+    auth: none
+    scope: wg-payload-full
+    key_derivation: udp2raw-md5-key1
+    password: test-pass
+    max_bytes: 256
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mark := uint32(0x10000002)
+	state, err := BuildState(
+		context.Background(),
+		cfg,
+		runtime.StaticProvider{Devices: map[string]*runtime.Device{
+			"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: mark, Up: true},
+		}},
+		underlay.StaticResolver{Underlays: map[string]*underlay.Resolved{
+			"eth0": {IfName: "eth0", IfIndex: 2, LinkType: "ethernet", Role: "transform"},
+		}},
+		func(string) (*wgconfig.Interface, error) {
+			return &wgconfig.Interface{FwMark: &mark}, nil
+		},
+		BuildOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Ciphers) != 1 {
+		t.Fatalf("ciphers = %d", len(state.Ciphers))
+	}
+	if state.Ciphers[0].KeyLen != 16 || state.Ciphers[0].MaxBytes != 256 {
+		t.Fatalf("cipher state = key_len %d max_bytes %d", state.Ciphers[0].KeyLen, state.Ciphers[0].MaxBytes)
+	}
+	if state.WireGuards[0].CipherID == 0 {
+		t.Fatal("wireguard missing cipher id")
+	}
+	for _, rule := range state.EgressRules {
+		if rule.CipherID != state.WireGuards[0].CipherID {
+			t.Fatalf("egress cipher id = %d want %d", rule.CipherID, state.WireGuards[0].CipherID)
+		}
+	}
+	for _, listener := range state.IngressListeners {
+		if listener.CipherID != state.WireGuards[0].CipherID {
+			t.Fatalf("ingress cipher id = %d want %d", listener.CipherID, state.WireGuards[0].CipherID)
+		}
+	}
+}
+
 func TestBuildStateICMPTransportRules(t *testing.T) {
 	cfg, err := config.Load([]byte(`
 version: 1
