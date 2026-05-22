@@ -1041,12 +1041,18 @@ static __always_inline struct icmp_listener_value *lookup_icmp_listener(__u32 if
 
 	*wildcard_id = 0;
 	listener = bpf_map_lookup_elem(&icmp_listener_map, &key);
-	if (listener && listener->generation == generation)
+	if (listener && listener->generation == generation) {
+		if (listener->flags & ICMP_LISTENER_F_WILDCARD_ID)
+			*wildcard_id = 1;
 		return listener;
+	}
 	key.underlay_index = UNDERLAY_WILDCARD;
 	listener = bpf_map_lookup_elem(&icmp_listener_map, &key);
-	if (listener && listener->generation == generation)
+	if (listener && listener->generation == generation) {
+		if (listener->flags & ICMP_LISTENER_F_WILDCARD_ID)
+			*wildcard_id = 1;
 		return listener;
+	}
 	if (icmp_id != 0) {
 		key.underlay_index = ifindex;
 		key.icmp_id = 0;
