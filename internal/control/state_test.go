@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
@@ -29,6 +30,27 @@ profiles:
 		t.Fatal(err)
 	}
 	return cfg
+}
+
+func TestBuildStateRejectsEmptyDecodedCipherSecret(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+version: 1
+underlays: []
+wireguards: []
+profiles: {}
+ciphers:
+  xor:
+    mode: xor
+    key_derivation: wgmx-hkdf256-v1
+    secret: "base64:"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = BuildState(t.Context(), cfg, runtime.StaticProvider{}, underlay.StaticResolver{}, nil, BuildOptions{Offline: true})
+	if err == nil || !strings.Contains(err.Error(), "secret material is empty") {
+		t.Fatalf("expected empty secret rejection, got %v", err)
+	}
 }
 
 func requireIngressListener(t *testing.T, state *State, family string, port uint16, action string) IngressListener {

@@ -4,11 +4,39 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 )
+
+func TestReloadRejectsOfflineApply(t *testing.T) {
+	_, err := Reload(t.Context(), Options{Offline: true})
+	if err == nil || !strings.Contains(err.Error(), "requires --dry-run") {
+		t.Fatalf("expected offline apply rejection, got %v", err)
+	}
+}
+
+func TestStopSkipsNftOnlyWhenGuardIsDisabled(t *testing.T) {
+	cfgPath := writeReconcileConfig(t, "[Interface]\nFwMark = 0x10000002\n")
+	data, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	data = append(data, []byte("\nstartup_guard:\n  mode: none\n")...)
+	if err := os.WriteFile(cfgPath, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir())
+	result, err := Stop(t.Context(), Options{ConfigPath: cfgPath, RunDir: t.TempDir(), StateDir: t.TempDir()})
+	if err != nil {
+		t.Fatalf("disabled guard should not require nft: %v", err)
+	}
+	if !result.GuardCleaned {
+		t.Fatal("disabled guard should be reported as clean")
+	}
+}
 
 func TestStopDryRunSucceedsWithoutRuntimeState(t *testing.T) {
 	result, err := Stop(t.Context(), Options{

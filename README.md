@@ -17,7 +17,7 @@ wg-mix-ebpf profile token home
 wg-mix-ebpf profile check 'wgmix1....'
 wg-mix-ebpf profile remove home --force
 wg-mix-ebpf run --once --offline --dry-run
-wg-mix-ebpf reload --config configs/example.yaml --offline
+wg-mix-ebpf reload --config configs/example.yaml --offline --dry-run
 wg-mix-ebpf validate --config configs/example.yaml --offline
 wg-mix-ebpf status --config configs/example.yaml --offline
 wg-mix-ebpf dump --config configs/example.yaml --offline
@@ -29,7 +29,7 @@ wg-mix-ebpf features
 wg-mix-ebpf uninstall --dry-run --yes
 ```
 
-`--offline` skips runtime WireGuard and underlay reads. It is intended for local static validation and unit-test environments.
+`--offline` skips runtime WireGuard and underlay reads. It is intended for local static validation and unit-test environments. Applying a reload or running the daemon with `--offline` requires `--dry-run`; the agent refuses to replace live maps with an empty runtime-derived state.
 
 `install` only installs files and registers service/init scripts. It does not start, enable, reload, attach TC, or modify WireGuard. Use `install --enable` if service enablement is desired, then start the service explicitly with systemd or OpenWrt init.
 

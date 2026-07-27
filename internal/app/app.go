@@ -255,13 +255,22 @@ func runInit(ctx context.Context, args []string, stdin io.Reader, stdout io.Writ
 	}
 	fmt.Fprintf(stdout, "config initialized: %s\n", *configPath)
 	if *reload {
-		_, err := reconcile.Reload(ctx, reconcile.Options{ConfigPath: *configPath})
-		if err != nil {
+		if err := reloadAfterConfigWrite(ctx, *configPath); err != nil {
 			return err
 		}
 		fmt.Fprintln(stdout, "dataplane reloaded")
 	}
 	return nil
+}
+
+func reloadAfterConfigWrite(ctx context.Context, configPath string) error {
+	runDir := daemonRunDir("")
+	if status, err := daemon.ReadStatus(runDir); err == nil && daemon.IsRunning(status) {
+		_, err := daemon.RequestReload(ctx, runDir, configPath, 10*time.Second)
+		return err
+	}
+	_, err := reconcile.Reload(ctx, reconcile.Options{ConfigPath: configPath, RunDir: runDir})
+	return err
 }
 
 func profileForInit(random bool, token string, preset string, reader *bufio.Reader, stdout io.Writer) (config.Profile, error) {
@@ -768,7 +777,12 @@ func parseUnderlaySpec(raw string) (config.Underlay, error) {
 func upsertUnderlay(cfg *config.Config, underlay config.Underlay) {
 	for i := range cfg.Underlays {
 		if cfg.Underlays[i].Name == underlay.Name {
-			cfg.Underlays[i] = underlay
+			if underlay.Type != "" {
+				cfg.Underlays[i].Type = underlay.Type
+			}
+			if underlay.Parser != "" {
+				cfg.Underlays[i].Parser = underlay.Parser
+			}
 			return
 		}
 	}
@@ -778,7 +792,21 @@ func upsertUnderlay(cfg *config.Config, underlay config.Underlay) {
 func upsertWireGuard(cfg *config.Config, wg config.WireGuard) {
 	for i := range cfg.WireGuards {
 		if cfg.WireGuards[i].Name == wg.Name {
-			cfg.WireGuards[i] = wg
+			if wg.Config != "" {
+				cfg.WireGuards[i].Config = wg.Config
+			}
+			if wg.Profile != "" {
+				cfg.WireGuards[i].Profile = wg.Profile
+			}
+			if wg.Cipher != "" {
+				cfg.WireGuards[i].Cipher = wg.Cipher
+			}
+			if wg.NetNS != "" {
+				cfg.WireGuards[i].NetNS = wg.NetNS
+			}
+			if wg.Transport.Mode != "" {
+				cfg.WireGuards[i].Transport = wg.Transport
+			}
 			return
 		}
 	}

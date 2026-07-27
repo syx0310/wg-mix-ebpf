@@ -111,6 +111,9 @@ func Status(ctx context.Context, opts Options) (*Result, error) {
 }
 
 func Reload(ctx context.Context, opts Options) (*Result, error) {
+	if opts.Offline && !opts.DryRun {
+		return nil, errors.New("offline reload requires --dry-run; refusing to apply an empty runtime-derived dataplane")
+	}
 	if opts.RunDir != "" && !opts.DryRun {
 		var result *Result
 		err := lockfile.WithLock(ctx, opts.RunDir, func() error {
@@ -233,11 +236,18 @@ func stopUnlocked(ctx context.Context, opts Options) (*Result, error) {
 		result.GuardCleanup = guard.CleanupScript()
 		return result, nil
 	}
-	if err := guard.NewCommandExecutor().Cleanup(ctx); err != nil {
+	if err := cleanupGuardForStop(ctx, opts); err != nil {
 		return nil, fmt.Errorf("cleanup startup guard during stop: %w", err)
 	}
 	result.GuardCleaned = true
 	return result, nil
+}
+
+func cleanupGuardForStop(ctx context.Context, opts Options) error {
+	if cfg, err := loadConfig(opts); err == nil && cfg.StartupGuard.Mode == "none" {
+		return nil
+	}
+	return guard.NewCommandExecutor().Cleanup(ctx)
 }
 
 func detachState(ctx context.Context, opts Options) (*control.State, error) {

@@ -466,23 +466,33 @@ func deriveCipherKey(name string, cipher config.Cipher) ([256]byte, error) {
 }
 
 func cipherSecretBytes(cipher config.Cipher) ([]byte, error) {
+	var secret []byte
+	var err error
 	switch {
 	case cipher.SecretFile != "":
-		data, err := os.ReadFile(cipher.SecretFile)
+		secret, err = os.ReadFile(cipher.SecretFile)
 		if err != nil {
 			return nil, err
 		}
-		return []byte(strings.TrimSpace(string(data))), nil
+		secret = []byte(strings.TrimSpace(string(secret)))
 	case cipher.Secret != "":
 		if strings.HasPrefix(cipher.Secret, "base64:") {
-			return base64.StdEncoding.DecodeString(strings.TrimPrefix(cipher.Secret, "base64:"))
+			secret, err = base64.StdEncoding.DecodeString(strings.TrimPrefix(cipher.Secret, "base64:"))
+			if err != nil {
+				return nil, err
+			}
+		} else {
+			secret = []byte(cipher.Secret)
 		}
-		return []byte(cipher.Secret), nil
 	case cipher.Password != "":
-		return []byte(cipher.Password), nil
+		secret = []byte(cipher.Password)
 	default:
 		return nil, errors.New("missing secret material")
 	}
+	if len(secret) == 0 {
+		return nil, errors.New("secret material is empty")
+	}
+	return secret, nil
 }
 
 func (s *State) validateRuleUniqueness() error {

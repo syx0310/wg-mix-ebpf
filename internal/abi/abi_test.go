@@ -1,11 +1,27 @@
 package abi
 
 import (
+	"bytes"
+	"encoding/json"
 	"testing"
 	"unsafe"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 )
+
+func TestCipherValueJSONRedactsKey(t *testing.T) {
+	value := CipherValue{Generation: 3, Key: [256]byte{0xde, 0xad, 0xbe, 0xef}, KeyLen: 16, KeyMask: 15, Mode: CipherModeXOR}
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(`"Key":`)) || bytes.Contains(data, []byte("222,173,190,239")) {
+		t.Fatalf("cipher key leaked in JSON: %s", data)
+	}
+	if !bytes.Contains(data, []byte(`"KeyRedacted":true`)) {
+		t.Fatalf("redaction marker missing: %s", data)
+	}
+}
 
 func TestStructSizesAreStable(t *testing.T) {
 	checks := []struct {
