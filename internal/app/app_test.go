@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+	"github.com/syx0310/wg-mix-ebpf/internal/config"
 )
 
 func TestValidateOffline(t *testing.T) {
@@ -245,6 +246,100 @@ func TestRunOnceDryOfflineWritesStatus(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(runDir, "status.json")); err != nil {
 		t.Fatalf("status not written: %v", err)
+	}
+}
+
+func TestRunOfflineWithoutDryRunIsRejected(t *testing.T) {
+	cfgPath := writeTestConfig(t, "[Interface]\nFwMark = 0x10000002\n")
+	var stdout, stderr bytes.Buffer
+	err := Run(t.Context(), []string{"run", "--config", cfgPath, "--offline", "--once"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "requires --dry-run") {
+		t.Fatalf("expected offline daemon rejection, got %v", err)
+	}
+}
+
+func TestReloadOfflineWithoutDryRunIsRejected(t *testing.T) {
+	cfgPath := writeTestConfig(t, "[Interface]\nFwMark = 0x10000002\n")
+	var stdout, stderr bytes.Buffer
+	err := Run(t.Context(), []string{"reload", "--config", cfgPath, "--offline"}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "requires --dry-run") {
+		t.Fatalf("expected offline reload rejection, got %v", err)
+	}
+}
+
+func TestInitPreservesExistingTransportCipherAndParser(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	wgPath := filepath.Join(dir, "wg0.conf")
+	if err := os.WriteFile(wgPath, []byte("[Interface]\nFwMark = 0x10000002\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(cfgPath, []byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+    parser: l3
+wireguards:
+  - name: wg0
+    config: `+wgPath+`
+    profile: home
+    cipher: xor-home
+    transport:
+      mode: udp
+profiles:
+  home:
+    preset: wireguard-mix-wire-values-v1
+ciphers:
+  xor-home:
+    mode: xor
+    key_derivation: udp2raw-md5-key1
+    password: test-password
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	args := []string{"init", "--config", cfgPath, "--wg", "wg0", "--wg-config", wgPath, "--underlay", "eth0:netdev", "--profile", "home"}
+	if err := Run(t.Context(), args, &stdout, &stderr); err != nil {
+		t.Fatalf("init failed: %v stderr=%s", err, stderr.String())
+	}
+	cfg, err := config.LoadFile(cfgPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Underlays[0].Parser; got != "l3" {
+		t.Fatalf("underlay parser was overwritten: %q", got)
+	}
+	if got := cfg.WireGuards[0].Cipher; got != "xor-home" {
+		t.Fatalf("cipher was overwritten: %q", got)
+	}
+	if got := cfg.WireGuards[0].Transport.Mode; got != "udp" {
+		t.Fatalf("transport was overwritten: %q", got)
+	}
+}
+
+func TestDumpABIRedactsCipherKey(t *testing.T) {
+	dir := t.TempDir()
+	cfgPath := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(cfgPath, []byte(`
+version: 1
+underlays: []
+wireguards: []
+profiles: {}
+ciphers:
+  xor:
+    mode: xor
+    key_derivation: udp2raw-md5-key1
+    password: highly-sensitive
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	if err := Run(t.Context(), []string{"dump-abi", "--config", cfgPath, "--offline"}, &stdout, &stderr); err != nil {
+		t.Fatalf("dump-abi failed: %v", err)
+	}
+	if strings.Contains(stdout.String(), `"Key":`) || !strings.Contains(stdout.String(), `"KeyRedacted": true`) {
+		t.Fatalf("dump-abi did not redact cipher key: %s", stdout.String())
 	}
 }
 

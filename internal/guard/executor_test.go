@@ -37,9 +37,9 @@ func TestMissingGuardTableErrorIsIdempotent(t *testing.T) {
 	}
 }
 
-func TestMissingNftBinaryCleanupIsIdempotent(t *testing.T) {
+func TestMissingNftBinaryCleanupFails(t *testing.T) {
 	exec := CommandExecutor{Binary: filepath.Join(t.TempDir(), "missing-nft")}
-	if err := exec.Cleanup(t.Context()); err != nil {
-		t.Fatalf("missing nft binary should be treated as no guard to clean: %v", err)
+	if err := exec.Cleanup(t.Context()); err == nil {
+		t.Fatal("missing nft binary must not report successful guard cleanup")
 	}
 }

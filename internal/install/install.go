@@ -137,6 +137,9 @@ func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
 	}
 	system := detectSystem(opts.System)
 	paths := resolvedPaths(opts.ConfigPath)
+	if err := validateCleanupPaths(paths); err != nil {
+		return nil, err
+	}
 	plan := &Plan{System: system, ConfigPath: paths.ConfigPath, BinaryPath: paths.BinaryPath}
 	add := func(format string, args ...any) { plan.Actions = append(plan.Actions, fmt.Sprintf(format, args...)) }
 	add("stop wg-mix-ebpf service if present")
@@ -183,14 +186,18 @@ func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
 			}
 		}
 	}
+	stopped := false
 	if shouldStopForUninstall(paths) {
 		if _, err := reconcile.Stop(ctx, reconcile.Options{ConfigPath: paths.ConfigPath, RunDir: paths.RunDir, StateDir: paths.VarLibDir}); err != nil {
 			return nil, fmt.Errorf("detach dataplane: %w", err)
 		}
+		stopped = true
 	}
 	if err := lockfile.WithLock(ctx, paths.RunDir, func() error {
-		if err := guard.NewCommandExecutor().Cleanup(ctx); err != nil {
-			return fmt.Errorf("cleanup startup guard: %w", err)
+		if !stopped {
+			if err := guard.NewCommandExecutor().Cleanup(ctx); err != nil {
+				return fmt.Errorf("cleanup startup guard: %w", err)
+			}
 		}
 		if err := os.RemoveAll(paths.PinPath); err != nil {
 			return fmt.Errorf("remove BPF pins %s: %w", paths.PinPath, err)
@@ -279,15 +286,31 @@ func installBinary(target string) error {
 		return err
 	}
 	defer in.Close()
-	out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	out, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+".tmp-")
 	if err != nil {
+		return err
+	}
+	tmpPath := out.Name()
+	defer os.Remove(tmpPath)
+	if err := out.Chmod(0o755); err != nil {
+		_ = out.Close()
 		return err
 	}
 	if _, err := io.Copy(out, in); err != nil {
 		_ = out.Close()
 		return err
 	}
-	return out.Close()
+	if err := out.Sync(); err != nil {
+		_ = out.Close()
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpPath, target); err != nil {
+		return err
+	}
+	return nil
 }
 
 func wireGuardAppearsRunning(ctx context.Context, configPath string) bool {
@@ -318,6 +341,70 @@ func validatePurgeDir(paths paths) error {
 		return fmt.Errorf("refuse to purge invalid config directory %q", configDir)
 	}
 	return nil
+}
+
+func validateCleanupPaths(paths paths) error {
+	cleanup := []struct {
+		name string
+		path string
+	}{
+		{name: "runtime dir", path: paths.RunDir},
+		{name: "state dir", path: paths.VarLibDir},
+		{name: "BPF pin path", path: paths.PinPath},
+	}
+	protected := map[string]struct{}{
+		"/": {}, "/bin": {}, "/boot": {}, "/dev": {}, "/etc": {}, "/home": {},
+		"/lib": {}, "/lib64": {}, "/opt": {}, "/proc": {}, "/root": {}, "/run": {},
+		"/sbin": {}, "/srv": {}, "/sys": {}, "/sys/fs": {}, "/sys/fs/bpf": {},
+		"/tmp": {}, "/usr": {}, "/var": {}, "/var/lib": {},
+		"/Library": {}, "/System": {}, "/Users": {}, "/private": {},
+		"/private/tmp": {}, "/private/var": {},
+	}
+	configDir := filepath.Clean(filepath.Dir(paths.ConfigPath))
+	allowedRoots := map[string][]string{
+		"runtime dir":  {"/run", "/var/run", os.TempDir()},
+		"state dir":    {"/var/lib", os.TempDir()},
+		"BPF pin path": {"/sys/fs/bpf", os.TempDir()},
+	}
+	for i := range cleanup {
+		cleanup[i].path = filepath.Clean(cleanup[i].path)
+		if !filepath.IsAbs(cleanup[i].path) {
+			return fmt.Errorf("refuse unsafe relative %s %q", cleanup[i].name, cleanup[i].path)
+		}
+		if _, denied := protected[cleanup[i].path]; denied {
+			return fmt.Errorf("refuse unsafe %s %s", cleanup[i].name, cleanup[i].path)
+		}
+		allowed := false
+		for _, root := range allowedRoots[cleanup[i].name] {
+			root = filepath.Clean(root)
+			if cleanup[i].path != root && pathContains(root, cleanup[i].path) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return fmt.Errorf("refuse %s outside its managed roots: %s", cleanup[i].name, cleanup[i].path)
+		}
+		if pathContains(cleanup[i].path, configDir) {
+			return fmt.Errorf("refuse %s %s because it contains config directory %s", cleanup[i].name, cleanup[i].path, configDir)
+		}
+	}
+	for i := 0; i < len(cleanup); i++ {
+		for j := i + 1; j < len(cleanup); j++ {
+			if pathContains(cleanup[i].path, cleanup[j].path) || pathContains(cleanup[j].path, cleanup[i].path) {
+				return fmt.Errorf("refuse overlapping cleanup paths %s and %s", cleanup[i].path, cleanup[j].path)
+			}
+		}
+	}
+	return nil
+}
+
+func pathContains(parent string, child string) bool {
+	rel, err := filepath.Rel(parent, child)
+	if err != nil {
+		return false
+	}
+	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(os.PathSeparator)))
 }
 
 func exists(path string) bool {

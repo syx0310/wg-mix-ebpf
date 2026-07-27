@@ -1,6 +1,12 @@
 package config
 
-import "testing"
+import (
+	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+)
 
 func TestLoadAppliesDefaults(t *testing.T) {
 	cfg, err := Load([]byte(`
@@ -354,5 +360,152 @@ func TestSafeTemplateValidatesAsIdleConfig(t *testing.T) {
 	cfg := SafeTemplate()
 	if err := cfg.ValidateStatic(); err != nil {
 		t.Fatalf("safe template should validate: %v", err)
+	}
+}
+
+func TestRejectUnknownConfigField(t *testing.T) {
+	for location, data := range map[string][]byte{
+		"top-level": []byte("version: 1\nunderlays: []\nwireguards: []\nprofiles: {}\npoll_intervl: 1s\n"),
+		"runtime":   []byte("version: 1\nunderlays: []\nwireguards: []\nprofiles: {}\nruntime:\n  poll_intervl: 1s\n"),
+	} {
+		for mode, load := range map[string]func([]byte) (*Config, error){
+			"strict":  Load,
+			"lenient": LoadLenient,
+		} {
+			t.Run(location+"/"+mode, func(t *testing.T) {
+				if _, err := load(data); err == nil || !strings.Contains(err.Error(), "poll_intervl") {
+					t.Fatalf("expected unknown field error, got %v", err)
+				}
+			})
+		}
+	}
+}
+
+func TestRejectMultipleYAMLDocuments(t *testing.T) {
+	_, err := Load([]byte("version: 1\n---\nversion: 1\n"))
+	if err == nil {
+		t.Fatal("expected multiple YAML documents to be rejected")
+	}
+}
+
+func TestRejectUnsafePollIntervals(t *testing.T) {
+	for _, interval := range []string{"-1s", "1ns"} {
+		t.Run(interval, func(t *testing.T) {
+			_, err := Load([]byte("version: 1\nunderlays: []\nwireguards: []\nprofiles: {}\nruntime:\n  poll_interval: " + interval + "\n"))
+			if err == nil || !strings.Contains(err.Error(), "poll_interval") {
+				t.Fatalf("expected poll interval error, got %v", err)
+			}
+		})
+	}
+}
+
+func TestRejectDuplicateWireGuardNames(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: p
+  - name: wg0
+    profile: p
+profiles:
+  p:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err == nil || !strings.Contains(err.Error(), "duplicate wireguard") {
+		t.Fatalf("expected duplicate wireguard error, got %v", err)
+	}
+}
+
+func TestRejectNonRootNetNS(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    netns: testns
+    profile: p
+profiles:
+  p:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err == nil || !strings.Contains(err.Error(), "only root is supported") {
+		t.Fatalf("expected netns error, got %v", err)
+	}
+}
+
+func TestRejectIgnoredSafetySelectors(t *testing.T) {
+	tests := map[string]string{
+		"overlap": "underlay_overlap_policy: allow\n",
+		"egress":  "startup_guard:\n  egress:\n    match: anything\n",
+		"ingress": "startup_guard:\n  ingress:\n    match: anything\n",
+	}
+	for name, extra := range tests {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load([]byte("version: 1\nunderlays: []\nwireguards: []\nprofiles: {}\n" + extra))
+			if err == nil {
+				t.Fatal("expected ignored safety selector to be rejected")
+			}
+		})
+	}
+}
+
+func TestRejectAmbiguousCipherSecretSources(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays: []
+wireguards: []
+profiles: {}
+ciphers:
+  xor:
+    mode: xor
+    key_derivation: udp2raw-md5-key1
+    secret: one
+    password: two
+`))
+	if err == nil || !strings.Contains(err.Error(), "exactly one") {
+		t.Fatalf("expected ambiguous secret error, got %v", err)
+	}
+}
+
+func TestRejectConfigBeyondGenerationCapacity(t *testing.T) {
+	cfg := SafeTemplate()
+	for i := len(cfg.Profiles); i < MaxProfilesPerGeneration+1; i++ {
+		cfg.Profiles[fmt.Sprintf("profile-%03d", i)] = Profile{Preset: "wireguard-mix-wire-values-v1"}
+	}
+	if err := cfg.ValidateStatic(); err == nil || !strings.Contains(err.Error(), "stage two generations") {
+		t.Fatalf("expected generation capacity error, got %v", err)
+	}
+}
+
+func TestSaveFileUsesAtomicPrivateReplacement(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := SaveFile(path, SafeTemplate()); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o600 {
+		t.Fatalf("config mode = %o, want 600", got)
+	}
+	if _, err := LoadFile(path); err != nil {
+		t.Fatalf("replacement config is invalid: %v", err)
+	}
+	leftovers, err := filepath.Glob(filepath.Join(dir, ".config.yaml.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 0 {
+		t.Fatalf("temporary configs left behind: %v", leftovers)
 	}
 }

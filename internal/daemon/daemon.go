@@ -49,6 +49,12 @@ type Status struct {
 }
 
 func Run(ctx context.Context, opts Options) error {
+	if opts.Offline && !opts.DryRun {
+		return errors.New("offline daemon mode requires --dry-run")
+	}
+	if opts.PollInterval < 0 {
+		return errors.New("poll interval must not be negative")
+	}
 	ctx, stopSignals := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()
 
@@ -71,6 +77,9 @@ func Run(ctx context.Context, opts Options) error {
 	}
 	if interval == 0 {
 		interval = 5 * time.Second
+	}
+	if interval < config.MinimumPollInterval {
+		return fmt.Errorf("poll interval must be at least %s", config.MinimumPollInterval)
 	}
 
 	lastRequest := requestStamp(runDir)

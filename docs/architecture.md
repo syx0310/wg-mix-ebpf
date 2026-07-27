@@ -75,7 +75,7 @@ internal/underlay
 
 internal/control
   Desired state builder that combines config, wg config, runtime state, and underlay state.
-  It derives configured XOR cipher keys and redacts key bytes from status JSON.
+  It derives configured XOR cipher keys and redacts key bytes from status and ABI JSON.
 
 internal/reconcile
   Shared validate/status/reload/detach workflow used by CLI and daemon.
@@ -250,7 +250,7 @@ profile_map
   Generation-scoped type_word mappings.
 
 cipher_map
-  Generation-scoped XOR cipher keys and limits. Raw key bytes are not emitted in status JSON.
+  Generation-scoped XOR cipher keys and limits. Raw key bytes are not emitted in status or `dump-abi` JSON.
 
 egress_rule_map
   Generation-scoped egress match rules.
