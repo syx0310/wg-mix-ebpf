@@ -1,8 +1,10 @@
 package config
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -11,8 +13,17 @@ import (
 )
 
 const (
-	DefaultConfigPath = "/etc/wg-mix-ebpf/config.yaml"
-	DefaultWGDir      = "/etc/wireguard"
+	DefaultConfigPath   = "/etc/wg-mix-ebpf/config.yaml"
+	DefaultWGDir        = "/etc/wireguard"
+	MinimumPollInterval = 100 * time.Millisecond
+
+	// Reload stages a second generation before deleting the active one. These
+	// limits are therefore half of the corresponding BPF map capacities.
+	MaxProfilesPerGeneration         = 64
+	MaxCiphersPerGeneration          = 64
+	MaxUnderlaysPerGeneration        = 256
+	MaxManagedRulesPerGeneration     = 256
+	MaxDirectionalRulesPerGeneration = 1024
 )
 
 type Config struct {
@@ -110,6 +121,9 @@ func (r *Runtime) UnmarshalYAML(value *yaml.Node) error {
 			out.requireNonzeroFwmarkSet = true
 		case "strict_runtime_fwmark":
 			out.strictRuntimeFwmarkSet = true
+		case "poll_interval", "allow_zero_fwmark_fallback":
+		default:
+			return fmt.Errorf("field %q not found in type config.Runtime", value.Content[i].Value)
 		}
 	}
 	*r = Runtime(out)
@@ -195,36 +209,78 @@ func LoadFileLenient(path string) (*Config, error) {
 }
 
 func Load(data []byte) (*Config, error) {
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	cfg, err := decode(data)
+	if err != nil {
 		return nil, err
 	}
 	cfg.ApplyDefaults()
 	if err := cfg.ValidateStatic(); err != nil {
 		return nil, err
 	}
-	return &cfg, nil
+	return cfg, nil
 }
 
 func LoadLenient(data []byte) (*Config, error) {
-	var cfg Config
-	if err := yaml.Unmarshal(data, &cfg); err != nil {
+	cfg, err := decode(data)
+	if err != nil {
 		return nil, err
 	}
 	cfg.ApplyDefaults()
+	return cfg, nil
+}
+
+func decode(data []byte) (*Config, error) {
+	var cfg Config
+	decoder := yaml.NewDecoder(bytes.NewReader(data))
+	decoder.KnownFields(true)
+	if err := decoder.Decode(&cfg); err != nil {
+		return nil, err
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return nil, errors.New("config must contain exactly one YAML document")
+		}
+		return nil, err
+	}
 	return &cfg, nil
 }
 
 func SaveFile(path string, cfg *Config) error {
 	cfg.ApplyDefaults()
-	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create config directory: %w", err)
 	}
 	data, err := yaml.Marshal(cfg)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	return os.WriteFile(path, data, 0o600)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
+	if err != nil {
+		return fmt.Errorf("create temporary config: %w", err)
+	}
+	tmpPath := tmp.Name()
+	defer os.Remove(tmpPath)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("set temporary config permissions: %w", err)
+	}
+	if _, err := tmp.Write(data); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("write temporary config: %w", err)
+	}
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		return fmt.Errorf("sync temporary config: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return fmt.Errorf("close temporary config: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
+		return fmt.Errorf("replace config %s: %w", path, err)
+	}
+	return nil
 }
 
 func SafeTemplate() *Config {
@@ -384,8 +440,14 @@ func (c *Config) ValidateStatic() error {
 	if !c.Runtime.RequireNonzeroFwmark {
 		return errors.New("runtime.require_nonzero_fwmark=false is reserved but not implemented in MVP")
 	}
+	if c.Runtime.PollInterval.Duration < MinimumPollInterval {
+		return fmt.Errorf("runtime.poll_interval must be at least %s", MinimumPollInterval)
+	}
 	if err := validateUniqueUnderlays(c.Underlays); err != nil {
 		return err
+	}
+	if c.UnderlayOverlapPolicy != "reject" {
+		return fmt.Errorf("underlay_overlap_policy %q is reserved but not implemented", c.UnderlayOverlapPolicy)
 	}
 	if err := validatePolicy(c.Policy); err != nil {
 		return err
@@ -395,9 +457,34 @@ func (c *Config) ValidateStatic() error {
 	default:
 		return fmt.Errorf("startup_guard.mode %q is unsupported", c.StartupGuard.Mode)
 	}
+	if c.StartupGuard.Egress.Match != "fwmark" {
+		return fmt.Errorf("startup_guard.egress.match %q is unsupported", c.StartupGuard.Egress.Match)
+	}
+	if c.StartupGuard.Ingress.Match != "config-listen-port-if-present" {
+		return fmt.Errorf("startup_guard.ingress.match %q is unsupported", c.StartupGuard.Ingress.Match)
+	}
+	if c.StartupGuard.Ingress.RandomListenPortBehavior != "best-effort" {
+		return fmt.Errorf("startup_guard.ingress.random_listen_port_behavior %q is unsupported", c.StartupGuard.Ingress.RandomListenPortBehavior)
+	}
+	for name, cipher := range c.Ciphers {
+		if name == "" {
+			return errors.New("cipher name is required")
+		}
+		if err := validateCipher(fmt.Sprintf("ciphers.%s", name), cipher); err != nil {
+			return err
+		}
+	}
+	seenWireGuards := make(map[string]struct{}, len(c.WireGuards))
 	for i, wg := range c.WireGuards {
 		if wg.Name == "" {
 			return fmt.Errorf("wireguards[%d].name is required", i)
+		}
+		if _, exists := seenWireGuards[wg.Name]; exists {
+			return fmt.Errorf("duplicate wireguard %q", wg.Name)
+		}
+		seenWireGuards[wg.Name] = struct{}{}
+		if wg.NetNS != "root" {
+			return fmt.Errorf("wireguards[%d].netns %q is reserved but not implemented; only root is supported", i, wg.NetNS)
 		}
 		if wg.Profile == "" {
 			return fmt.Errorf("wireguards[%d].profile is required", i)
@@ -406,15 +493,12 @@ func (c *Config) ValidateStatic() error {
 			return fmt.Errorf("wireguards[%d].profile %q is not defined", i, wg.Profile)
 		}
 		if wg.Cipher != "" {
-			cipher, ok := c.Ciphers[wg.Cipher]
+			_, ok := c.Ciphers[wg.Cipher]
 			if !ok {
 				return fmt.Errorf("wireguards[%d].cipher %q is not defined", i, wg.Cipher)
 			}
 			if wg.Transport.Mode != "" && wg.Transport.Mode != "udp" {
 				return fmt.Errorf("wireguards[%d].cipher is only implemented for udp transport in MVP", i)
-			}
-			if err := validateCipher(fmt.Sprintf("ciphers.%s", wg.Cipher), cipher); err != nil {
-				return err
 			}
 		}
 		switch wg.Transport.Mode {
@@ -438,7 +522,7 @@ func (c *Config) ValidateStatic() error {
 			return fmt.Errorf("wireguards[%d].transport.mode %q is unsupported", i, wg.Transport.Mode)
 		}
 	}
-	return nil
+	return validateDataplaneCapacity(c)
 }
 
 func validateCipher(prefix string, c Cipher) error {
@@ -456,6 +540,15 @@ func validateCipher(prefix string, c Cipher) error {
 	case "wg-payload-full", "wg-payload-prefix":
 	default:
 		return fmt.Errorf("%s.scope %q is unsupported", prefix, c.Scope)
+	}
+	secretSources := 0
+	for _, present := range []bool{c.Secret != "", c.SecretFile != "", c.Password != ""} {
+		if present {
+			secretSources++
+		}
+	}
+	if secretSources != 1 {
+		return fmt.Errorf("%s must configure exactly one of secret, secret_file, or password", prefix)
 	}
 	switch c.KeyDerivation {
 	case "wgmx-hkdf256-v1":
@@ -479,6 +572,44 @@ func validateCipher(prefix string, c Cipher) error {
 	}
 	if c.MaxBytes == 0 || c.MaxBytes > 2048 || c.MaxBytes%4 != 0 {
 		return fmt.Errorf("%s.max_bytes must be a non-zero multiple of 4 up to 2048", prefix)
+	}
+	return nil
+}
+
+func validateDataplaneCapacity(c *Config) error {
+	if len(c.Profiles) > MaxProfilesPerGeneration {
+		return fmt.Errorf("profiles has %d entries, maximum is %d so reload can stage two generations", len(c.Profiles), MaxProfilesPerGeneration)
+	}
+	if len(c.Ciphers) > MaxCiphersPerGeneration {
+		return fmt.Errorf("ciphers has %d entries, maximum is %d so reload can stage two generations", len(c.Ciphers), MaxCiphersPerGeneration)
+	}
+	if len(c.Underlays) > MaxUnderlaysPerGeneration {
+		return fmt.Errorf("underlays has %d entries, maximum is %d so reload can stage two generations", len(c.Underlays), MaxUnderlaysPerGeneration)
+	}
+	underlays := uint64(len(c.Underlays))
+	wireguards := uint64(len(c.WireGuards))
+	if managed := underlays * wireguards; managed > MaxManagedRulesPerGeneration {
+		return fmt.Errorf("configuration may create %d managed fwmark rules, maximum is %d per generation", managed, MaxManagedRulesPerGeneration)
+	}
+	ingress := underlays * wireguards * 2
+	if ingress > MaxDirectionalRulesPerGeneration {
+		return fmt.Errorf("configuration may create %d ingress rules, maximum is %d per generation", ingress, MaxDirectionalRulesPerGeneration)
+	}
+	var egressPerUnderlay uint64
+	var icmpWireGuards uint64
+	for _, wg := range c.WireGuards {
+		if wg.Transport.Mode == "icmp" {
+			egressPerUnderlay++
+			icmpWireGuards++
+		} else {
+			egressPerUnderlay += 2
+		}
+	}
+	if egress := underlays * egressPerUnderlay; egress > MaxDirectionalRulesPerGeneration {
+		return fmt.Errorf("configuration may create %d egress rules, maximum is %d per generation", egress, MaxDirectionalRulesPerGeneration)
+	}
+	if icmp := underlays * icmpWireGuards; icmp > MaxDirectionalRulesPerGeneration {
+		return fmt.Errorf("configuration may create %d ICMP listeners, maximum is %d per generation", icmp, MaxDirectionalRulesPerGeneration)
 	}
 	return nil
 }

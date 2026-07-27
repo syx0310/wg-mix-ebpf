@@ -67,7 +67,7 @@ sudo wg-mix-ebpf profile check 'wgmix1....'
 sudo wg-mix-ebpf init --wg wg0 --underlay eth0:netdev --profile-token 'wgmix1....'
 ```
 
-`init` reads the expected `FwMark` from the WireGuard config or supported `PostUp = wg set %i fwmark ...` command. It does not add or change `FwMark`, `ListenPort`, peers, routes, or addresses.
+`init` reads the expected `FwMark` from the WireGuard config or supported `PostUp = wg set %i fwmark ...` command. It does not add or change `FwMark`, `ListenPort`, peers, routes, or addresses. Re-running `init` for an existing entry preserves its cipher, transport, and underlay parser settings. `init --reload` requests the running daemon when present and otherwise uses the shared reconcile lock.
 
 ## Daemon Reconcile
 
@@ -104,6 +104,12 @@ Manual reload uses the same reconcile path as the daemon:
 
 ```bash
 sudo wg-mix-ebpf reload
+```
+
+Offline reload is validation-only and must be a dry run:
+
+```bash
+wg-mix-ebpf reload --config configs/example.yaml --offline --dry-run
 ```
 
 If the daemon is running, `reload` writes a reload request and waits for daemon reconcile. If the daemon is not running, it performs a one-shot reconcile.
@@ -168,7 +174,7 @@ Default uninstall removes network-impacting state but keeps configuration:
 sudo wg-mix-ebpf uninstall
 ```
 
-It stops the service, detaches this agent's TC filters using attach-state when available, removes BPF pins, removes the nft guard table, removes runtime/state/service files, and leaves `/etc/wg-mix-ebpf/config.yaml` in place.
+It stops the service, detaches this agent's TC filters using attach-state when available, removes BPF pins, removes the nft guard table, removes runtime/state/service files, and leaves `/etc/wg-mix-ebpf/config.yaml` in place. Destructive cleanup paths are restricted to managed descendants of `/run`, `/var/lib`, `/sys/fs/bpf`, or the system temporary directory; broad or overlapping paths are rejected even for a dry run.
 
 To remove the config directory too:
 

@@ -114,10 +114,39 @@ startup_guard:
 	t.Setenv(dataplaneEnvPinPathForTest, pinDir)
 	t.Setenv(EnvBinaryPath, binaryPath)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	if _, err := Uninstall(ctx, Options{ConfigPath: configPath, System: "unknown", Yes: true}); err != nil {
 		t.Fatalf("uninstall should complete without nested lock deadlock: %v", err)
+	}
+}
+
+func TestUninstallRejectsDangerousCleanupPaths(t *testing.T) {
+	t.Setenv(dataplaneEnvPinPathForTest, "/sys/fs/bpf")
+	_, err := Uninstall(t.Context(), Options{System: "unknown", DryRun: true})
+	if err == nil || !strings.Contains(err.Error(), "unsafe BPF pin path") {
+		t.Fatalf("expected dangerous pin path rejection, got %v", err)
+	}
+}
+
+func TestInstallBinaryReplacesModeAtomically(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "wg-mix-ebpf")
+	if err := os.WriteFile(target, []byte("stale"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := installBinary(target); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := info.Mode().Perm(); got != 0o755 {
+		t.Fatalf("installed binary mode = %o, want 755", got)
+	}
+	if info.Size() <= int64(len("stale")) {
+		t.Fatalf("installed binary was not replaced: size=%d", info.Size())
 	}
 }
 

@@ -84,6 +84,27 @@ type CipherValue struct {
 
 func (v CipherValue) MapGeneration() uint64 { return v.Generation }
 
+func (v CipherValue) MarshalJSON() ([]byte, error) {
+	type redactedCipherValue struct {
+		Generation  uint64
+		KeyLen      uint32
+		KeyMask     uint32
+		MaxBytes    uint32
+		Flags       uint32
+		Mode        uint8
+		KeyRedacted bool
+	}
+	return json.Marshal(redactedCipherValue{
+		Generation:  v.Generation,
+		KeyLen:      v.KeyLen,
+		KeyMask:     v.KeyMask,
+		MaxBytes:    v.MaxBytes,
+		Flags:       v.Flags,
+		Mode:        v.Mode,
+		KeyRedacted: true,
+	})
+}
+
 type ManagedFwmarkKey struct {
 	Generation    uint64
 	FwMark        uint32
