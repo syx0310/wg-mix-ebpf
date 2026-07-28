@@ -2,6 +2,7 @@ package install
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -9,6 +10,7 @@ import (
 	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
+	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
 
 func TestUninstallPurgeRejectsNonOwnedConfigDir(t *testing.T) {
@@ -60,6 +62,78 @@ func TestOpenWrtHotplugDoesNotUseNanosecondDate(t *testing.T) {
 	}
 	if !strings.Contains(script, "/proc/uptime") {
 		t.Fatalf("hotplug script should use portable changing content:\n%s", script)
+	}
+	if !strings.Contains(script, "/run/wg-mix-ebpf/runtime.request") || strings.Contains(script, "/run/wg-mix-ebpf/reload.request") {
+		t.Fatalf("hotplug must not overwrite acknowledged CLI request files:\n%s", script)
+	}
+}
+
+func TestInstallRejectsHeldGlobalLifecycleLeaseBeforeWrites(t *testing.T) {
+	dir := t.TempDir()
+	etcDir := filepath.Join(dir, "etc", "wg-mix-ebpf")
+	runDir := filepath.Join(dir, "run")
+	binaryPath := filepath.Join(dir, "sbin", "wg-mix-ebpf")
+	t.Setenv(EnvEtcDir, etcDir)
+	t.Setenv(EnvBinaryPath, binaryPath)
+	t.Setenv(EnvVarLibDir, filepath.Join(dir, "state"))
+	t.Setenv(daemonEnvRunDirForTest, runDir)
+
+	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(dir, "daemon.lease"))
+	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
+		PID:    os.Getpid(),
+		Action: "daemon",
+		RunDir: "/run/real-daemon",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+
+	_, err = Install(ctx, Options{System: "unknown"})
+	if !errors.Is(err, lockfile.ErrLifecycleLeaseHeld) {
+		t.Fatalf("install error = %v, want held lifecycle lease", err)
+	}
+	for _, path := range []string{filepath.Join(etcDir, "config.yaml"), binaryPath, runDir} {
+		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("install wrote %s before acquiring lifecycle ownership: %v", path, statErr)
+		}
+	}
+}
+
+func TestUninstallRejectsHeldGlobalLifecycleLeaseBeforeCleanup(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run")
+	stateDir := filepath.Join(dir, "state")
+	marker := filepath.Join(stateDir, "keep")
+	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(EnvEtcDir, filepath.Join(dir, "etc", "wg-mix-ebpf"))
+	t.Setenv(EnvBinaryPath, filepath.Join(dir, "sbin", "wg-mix-ebpf"))
+	t.Setenv(EnvVarLibDir, stateDir)
+	t.Setenv(daemonEnvRunDirForTest, runDir)
+	t.Setenv(dataplaneEnvPinPathForTest, filepath.Join(dir, "pins"))
+
+	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(dir, "daemon.lease"))
+	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
+		PID:    os.Getpid(),
+		Action: "daemon",
+		RunDir: "/run/real-daemon",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+
+	_, err = Uninstall(ctx, Options{System: "unknown", Yes: true})
+	if !errors.Is(err, lockfile.ErrLifecycleLeaseHeld) {
+		t.Fatalf("uninstall error = %v, want held lifecycle lease", err)
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("uninstall cleaned state before acquiring lifecycle ownership: %v", err)
 	}
 }
 
@@ -116,6 +190,7 @@ startup_guard:
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
+	ctx = lockfile.WithLifecyclePathForTest(ctx, filepath.Join(dir, "daemon.lease"))
 	if _, err := Uninstall(ctx, Options{ConfigPath: configPath, System: "unknown", Yes: true}); err != nil {
 		t.Fatalf("uninstall should complete without nested lock deadlock: %v", err)
 	}
@@ -159,6 +234,32 @@ func TestUninstallStopsWhenOnlyAttachStateExists(t *testing.T) {
 	p := paths{ConfigPath: filepath.Join(dir, "missing.yaml"), VarLibDir: stateDir}
 	if !shouldStopForUninstall(p) {
 		t.Fatal("uninstall should run stop cleanup when attach-state exists even if config is missing")
+	}
+}
+
+func TestCleanupRuntimeDirPreservesLifecycleInode(t *testing.T) {
+	runDir := t.TempDir()
+	leasePath := filepath.Join(runDir, "daemon.lease")
+	if err := os.WriteFile(leasePath, []byte("owner\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "status.json"), []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(runDir, "requests"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := cleanupRuntimeDir(runDir, leasePath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(leasePath); err != nil {
+		t.Fatalf("lifecycle lease inode was removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "status.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runtime status was not removed: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(runDir, "requests")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("runtime request directory was not removed: %v", err)
 	}
 }
 
