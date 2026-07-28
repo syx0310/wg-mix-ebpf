@@ -53,12 +53,12 @@ func inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
 		entry.Filters = append(entry.Filters, ingress...)
 		entry.Filters = append(entry.Filters, egress...)
 		for _, filter := range ingress {
-			if filter.Name == ingressFilterName {
+			if filter.Name == ingressFilterName && filter.Handle == ingressHandle && filter.Priority == filterPriority {
 				entry.IngressAttached = true
 			}
 		}
 		for _, filter := range egress {
-			if filter.Name == egressFilterName {
+			if filter.Name == egressFilterName && filter.Handle == egressHandle && filter.Priority == filterPriority {
 				entry.EgressAttached = true
 			}
 		}
@@ -85,6 +85,9 @@ func inspectPinnedMaps(status *KernelStatus) error {
 	} else {
 		status.ActiveGeneration = controlValue.ActiveGeneration
 		status.ABIVersion = controlValue.ABIVersion
+		if controlValue.ABIVersion != abi.Version {
+			return fmt.Errorf("control_map ABI version = %d, want %d", controlValue.ABIVersion, abi.Version)
+		}
 	}
 
 	stats, err := ebpf.LoadPinnedMap(filepath.Join(status.PinPath, "stats_map"), nil)
@@ -149,6 +152,8 @@ var statNames = []string{
 	"xor_csum_error",
 	"ingress_bad_checksum",
 	"egress_bad_checksum",
+	"xor_egress_dispatch_error",
+	"xor_ingress_dispatch_error",
 }
 
 func filterStatuses(link netlink.Link, parent uint32, direction string) ([]FilterStatus, error) {

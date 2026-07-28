@@ -75,13 +75,15 @@ internal/underlay
 
 internal/control
   Desired state builder that combines config, wg config, runtime state, and underlay state.
-  It derives configured XOR cipher keys and redacts key bytes from status JSON.
+  It derives configured XOR cipher keys and redacts key bytes from status and ABI JSON.
 
 internal/reconcile
   Shared validate/status/reload/detach workflow used by CLI and daemon.
 
 internal/daemon
-  Runtime reconcile loop, status file writer, reload-request handling, and stop-request handling.
+  Runtime reconcile loop, global daemon lifecycle lease, status file writer,
+  durable instance-bound request acknowledgements, hardened control-file
+  reads, and bounded stop handling.
 
 internal/install
   Systemd/OpenWrt install and uninstall helpers.
@@ -96,7 +98,8 @@ internal/guard
   nft startup guard generation and execution.
 
 internal/lockfile
-  Process-wide file lock used to serialize reload, detach, daemon stop, and uninstall cleanup.
+  Global lifecycle lease plus the separate short-lived operation lock used to
+  serialize reload, detach, daemon stop, and uninstall cleanup.
 
 bpf/wg_mix_tc.c
   TC ingress and egress dataplane program.
@@ -191,13 +194,14 @@ UDP XOR cipher:
   chunked skb load/store of managed WireGuard UDP payload
   IPv4 egress uses the offload-friendly recompute checksum path
   IPv6 egress updates UDP checksum from chunk diffs before writing payload bytes
-  ingress accumulates chunk checksum diffs and updates UDP checksum once
+  ingress accumulates chunk checksum diffs and updates UDP checksum once per
+  tail-call segment
 ```
 
 For payload-only UDP checksum updates, the L4 checksum helper is used in diff
-mode with no additional L4 checksum flags. Passing `BPF_F_IPV6` in this
-payload-only diff path caused TC egress helper failures in the IPv6 netns
-regression.
+mode with `BPF_F_MARK_MANGLED_0`, preserving an enabled UDP checksum when the
+updated value is zero. Passing `BPF_F_IPV6` in this payload-only diff path
+caused TC egress helper failures in the IPv6 netns regression.
 
 XOR cost scales with `max_bytes`. `wg-payload-prefix` with a small bounded prefix
 is the preferred performance mode; `wg-payload-full` is available for stronger
@@ -224,6 +228,8 @@ xor_bad_type_after_decrypt
 xor_load_error
 xor_store_error
 xor_csum_error
+xor_egress_dispatch_error
+xor_ingress_dispatch_error
 egress_gso_seen
 egress_gso_managed_seen
 egress_gso_rewrite_ok
@@ -250,7 +256,13 @@ profile_map
   Generation-scoped type_word mappings.
 
 cipher_map
-  Generation-scoped XOR cipher keys and limits. Raw key bytes are not emitted in status JSON.
+  Generation-scoped XOR cipher keys and limits. ABI version 10 repeats shorter key periods across the fixed 256-byte key storage so the dataplane can use one verifier-bounded index. Raw key bytes are not emitted in status or `dump-abi` JSON.
+
+xor_egress_programs / xor_ingress_programs
+  Pinned ProgramArray maps for the verifier-safe 8 x 256-byte XOR tail-call
+  chain. Each map has two generation-parity banks. Reload populates the next
+  bank before committing the generation; a missing segment fails closed and
+  increments the matching dispatch-error counter.
 
 egress_rule_map
   Generation-scoped egress match rules.
@@ -290,9 +302,9 @@ random ListenPort ingress: best-effort only
 
 If dataplane reload fails after the guard is applied, the guard is intentionally left in place for fail-closed behavior.
 
-For nftables compatibility, guard cleanup is executed separately from guard creation. Cleanup uses `delete table` as a best-effort operation and ignores missing-table errors before applying the add-table rules. This avoids aborting startup guard creation on older nftables versions that reject `destroy table` or fail a combined script when the table does not already exist.
+Replacing an existing guard uses one nft batch containing `delete table` followed by the complete replacement table. nft commits the batch atomically; a validation or rule-creation failure therefore rolls back the delete and preserves the old guard. A missing-table error is the only condition that triggers a second, create-only batch.
 
-The startup guard is generated from config-only state before runtime WireGuard state is required. That allows egress fwmark guard rules to be installed even when the WireGuard interface has not appeared yet.
+Each reload reads the main configuration once and memoizes each parsed WireGuard configuration for both guard and runtime state construction. The startup guard is first generated from this config-only snapshot, which allows it to be installed before the WireGuard interface appears. Reload then samples every configured runtime device, atomically expands the guard to cover the union of configured and observed runtime fwmarks, and uses that same runtime snapshot for full state validation. A strict fwmark mismatch on any interface therefore leaves all marks observed during the reload guarded while reload returns an error.
 
 ## Service And Reconcile Model
 
@@ -327,6 +339,26 @@ manual stop request handling
 status file updates under /run/wg-mix-ebpf
 ```
 
+Before it reconciles a mutating dataplane, the daemon acquires
+`/run/wg-mix-ebpf/daemon.lease` and holds it through final shutdown status
+persistence. The lease location is not derived from `--run-dir`, so alternate
+status/request directories cannot create multiple owners of the process-global
+BPF pins, TC filters, nftables guard table, or attach state. The lease and the
+runtime-directory operation lock have separate file descriptions and purposes:
+the lifecycle lease establishes one owner, while the operation lock serializes
+individual mutations.
+
+All non-dry-run reconcile mutation entrypoints acquire the same lifecycle lease
+when the caller does not supply a valid already-held lease token. The daemon
+passes its unforgeable held token into reload and stop, avoiding recursive
+acquisition while keeping one-shot CLI and uninstall paths on the same ownership
+boundary. Both lifecycle and operation lock opens use no-follow semantics and
+reject files with multiple hard links.
+
+Non-dry-run install follows the same global-then-runtime lock ordering before
+replacing files. Uninstall first asks the service manager to stop the owner,
+then acquires both locks for detach and artifact cleanup.
+
 Poll reconcile intentionally ignores peer endpoint, handshake, and transfer counter changes. Those values are status-only metadata and do not enter dataplane maps.
 
 Poll reconcile also treats config file changes as operator-controlled changes. If the daemon notices that the config file content changed during a poll/runtime event, it records `config_changed` / `need_reload` in daemon status and waits for explicit `wg-mix-ebpf reload` or service reload. This avoids accidentally applying profile or underlay changes while the operator is still editing the file.
@@ -342,11 +374,44 @@ update dataplane maps when only peer endpoint/handshake/counters change
 
 `systemctl stop wg-mix-ebpf` or OpenWrt service stop detaches this agent's TC filters. If WireGuard keeps running after that, it may send standard WireGuard type words.
 
-Service stop is routed through `wg-mix-ebpf stop`. If the daemon is running, the command asks the daemon to acquire the shared lock, stop polling/reloading, detach dataplane, remove the nft startup guard table, write stopped status, and exit. If the daemon is not running, it performs one-shot stop cleanup.
+Service stop is routed through `wg-mix-ebpf stop`. CLI stop/reload requests use
+per-request JSON files and matching per-request ack files rather than inferring
+completion from status timestamps. Requests carry the random daemon instance ID
+from status; a later daemon acknowledges but never executes a request targeting
+an exited instance. The daemon scans queued requests immediately after startup
+and on its request interval; a stop in the current batch supersedes reloads in
+that batch, with an ack for every request ID.
+Admission uses a dedicated queue lock and a bounded request count. Consumed acks
+are removed only after their requests disappear; retained acks are capped by
+pruning the oldest entries that are no longer needed for crash deduplication.
+Request and ack reads use no-follow opens and reject non-regular or
+multiply-linked control files.
+The legacy `reload.request` compatibility path accepts reload notifications but
+never stop notifications, which lack an instance ID. Legacy reload/runtime
+files use the same bounded safe reader; invalid inputs are persisted as an
+ignored-notification status error while the reconcile loop continues.
+
+If the daemon is running, stop asks it to acquire the shared operation lock,
+stop polling/reloading, detach dataplane, remove the nft startup guard table,
+write stopped status, and exit. Cleanup has a 10-second deadline by default plus
+a fixed 25-millisecond completion-arbitration window. It runs with a duplicated
+lifecycle lease descriptor so a timed-out, context-ignoring cleanup worker
+retains global ownership after the main daemon loop returns. Cleanup, concurrent
+deadline, and final status-write failures are joined and returned as a non-zero
+daemon exit. The first termination signal also restores default signal handling
+so a second signal can force termination. If the daemon is not running, `stop`
+performs one-shot cleanup after acquiring the global lease.
 
 Successful dataplane reload writes persistent attach metadata to `/var/lib/wg-mix-ebpf/attach-state.json`. Stop, detach, and uninstall use this file first, so cleanup does not depend on the WireGuard interface still existing. Reload also compares the previous attach state with the current desired state and detaches stale underlay ifindexes that disappeared from config or changed after reconnect.
 
-`uninstall` stops the service, detaches this agent's dataplane using attach-state when available, removes BPF pins, removes the nft guard table, and removes runtime/state/service files. It keeps `/etc/wg-mix-ebpf/config.yaml` by default; `--purge` removes the config directory. It does not delete the binary or WireGuard configuration.
+Guard cleanup targets the fixed owned table independently of the current configuration mode. This prevents a newer `startup_guard.mode: none` configuration, or a missing configuration with valid attach-state, from falsely reporting that a table left by an earlier reload was removed.
+
+`uninstall` stops the service, acquires the global lifecycle lease, detaches this
+agent's dataplane using attach-state when available, and removes BPF pins, the
+nft guard table, and runtime/state/service artifacts. It preserves the global
+lease inode and parent directory to avoid an unlink/recreate ownership race. It
+keeps `/etc/wg-mix-ebpf/config.yaml` by default; `--purge` removes the config
+directory. It does not delete the binary or WireGuard configuration.
 
 `uninstall --purge` only removes the owned config directory. It refuses to purge arbitrary parent directories from custom `--config` paths.
 

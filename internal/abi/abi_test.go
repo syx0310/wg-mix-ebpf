@@ -1,11 +1,33 @@
 package abi
 
 import (
+	"bytes"
+	"encoding/json"
 	"testing"
 	"unsafe"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 )
+
+func TestABIVersion(t *testing.T) {
+	if Version != 10 {
+		t.Fatalf("ABI version = %d, want 10", Version)
+	}
+}
+
+func TestCipherValueJSONRedactsKey(t *testing.T) {
+	value := CipherValue{Generation: 3, Key: [256]byte{0xde, 0xad, 0xbe, 0xef}, KeyLen: 16, KeyMask: 15, Mode: CipherModeXOR}
+	data, err := json.Marshal(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(data, []byte(`"Key":`)) || bytes.Contains(data, []byte("222,173,190,239")) {
+		t.Fatalf("cipher key leaked in JSON: %s", data)
+	}
+	if !bytes.Contains(data, []byte(`"KeyRedacted":true`)) {
+		t.Fatalf("redaction marker missing: %s", data)
+	}
+}
 
 func TestStructSizesAreStable(t *testing.T) {
 	checks := []struct {
@@ -99,6 +121,10 @@ func TestFromState(t *testing.T) {
 	if cipher.Mode != CipherModeXOR || cipher.KeyLen != 16 || cipher.Key[0] != 1 {
 		t.Fatal("missing xor cipher")
 	}
+	if cipher.Key[16] != 1 || cipher.Key[17] != 2 ||
+		cipher.Key[18] != 3 || cipher.Key[19] != 4 {
+		t.Fatalf("cipher key period was not expanded: %v", cipher.Key[16:20])
+	}
 	egress := snapshot.EgressRules[EgressRuleKey{Generation: 7, FwMark: 0x10000001, UnderlayIndex: 2, SourcePort: 31001, Family: FamilyIPv4}]
 	if egress.Action != ActionRewrite || egress.TransportMode != TransportICMP || egress.ICMPRole != ICMPRoleClient || egress.ICMPID != 0x5303 || egress.CipherID != 1 {
 		t.Fatal("missing egress rewrite rule")
@@ -119,6 +145,35 @@ func TestFromState(t *testing.T) {
 	wildcard := snapshot.ICMPListeners[ICMPListenerKey{Generation: 7, UnderlayIndex: 2, ICMPID: 0, Family: FamilyIPv4, ICMPType: 8}]
 	if wildcard.Action != ActionRewrite || wildcard.ListenPort != 31001 || wildcard.Role != ICMPRoleServer || wildcard.Flags != ICMPListenerFWildcardID {
 		t.Fatal("missing icmp wildcard listener")
+	}
+}
+
+func TestFromStateRejectsInvalidCipherLayout(t *testing.T) {
+	tests := []struct {
+		name    string
+		keyLen  uint32
+		keyMask uint32
+		want    string
+	}{
+		{name: "length", keyLen: 8, keyMask: 7, want: "unsupported key length 8"},
+		{name: "mask", keyLen: 16, keyMask: 31, want: "key mask 31, want 15"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			_, err := FromState(&control.State{
+				Generation: 1,
+				Ciphers: []control.CipherState{{
+					ID:      1,
+					Name:    "xor",
+					Mode:    "xor",
+					KeyLen:  test.keyLen,
+					KeyMask: test.keyMask,
+				}},
+			})
+			if err == nil || !bytes.Contains([]byte(err.Error()), []byte(test.want)) {
+				t.Fatalf("expected %q, got %v", test.want, err)
+			}
+		})
 	}
 }
 

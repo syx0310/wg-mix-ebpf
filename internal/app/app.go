@@ -11,7 +11,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -255,13 +254,25 @@ func runInit(ctx context.Context, args []string, stdin io.Reader, stdout io.Writ
 	}
 	fmt.Fprintf(stdout, "config initialized: %s\n", *configPath)
 	if *reload {
-		_, err := reconcile.Reload(ctx, reconcile.Options{ConfigPath: *configPath})
-		if err != nil {
+		if err := reloadAfterConfigWrite(ctx, *configPath); err != nil {
 			return err
 		}
 		fmt.Fprintln(stdout, "dataplane reloaded")
 	}
 	return nil
+}
+
+func reloadAfterConfigWrite(ctx context.Context, configPath string) error {
+	runDir := daemonRunDir("")
+	if status, err := daemon.ReadStatus(runDir); err == nil && daemon.IsRunning(status) {
+		if _, err := daemon.RequestReload(ctx, runDir, configPath, daemon.DefaultRequestTimeout); err == nil {
+			return nil
+		} else if !errors.Is(err, daemon.ErrDaemonNotRunning) {
+			return err
+		}
+	}
+	_, err := reconcile.Reload(ctx, reconcile.Options{ConfigPath: configPath, RunDir: runDir})
+	return err
 }
 
 func profileForInit(random bool, token string, preset string, reader *bufio.Reader, stdout io.Writer) (config.Profile, error) {
@@ -557,6 +568,7 @@ func runDaemon(ctx context.Context, args []string) error {
 	configPath := fs.String("config", config.DefaultConfigPath, "path to wg-mix-ebpf config")
 	runDir := fs.String("run-dir", "", "runtime status/request directory")
 	stateDir := fs.String("state-dir", "", "persistent attach-state directory")
+	shutdownTimeout := fs.Duration("shutdown-timeout", daemon.DefaultShutdownTimeout, "maximum time for signal/stop cleanup")
 	once := fs.Bool("once", false, "run one reconcile and exit")
 	offline := fs.Bool("offline", false, "skip runtime and underlay reads")
 	dryRun := fs.Bool("dry-run", false, "validate/reconcile without applying dataplane")
@@ -565,7 +577,15 @@ func runDaemon(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	return daemon.Run(ctx, daemon.Options{ConfigPath: *configPath, RunDir: *runDir, StateDir: *stateDir, Once: *once, Offline: *offline, DryRun: *dryRun})
+	return daemon.Run(ctx, daemon.Options{
+		ConfigPath:      *configPath,
+		RunDir:          *runDir,
+		StateDir:        *stateDir,
+		ShutdownTimeout: *shutdownTimeout,
+		Once:            *once,
+		Offline:         *offline,
+		DryRun:          *dryRun,
+	})
 }
 
 func runStop(ctx context.Context, args []string, stdout io.Writer) error {
@@ -574,16 +594,17 @@ func runStop(ctx context.Context, args []string, stdout io.Writer) error {
 	configPath := fs.String("config", config.DefaultConfigPath, "path to wg-mix-ebpf config")
 	runDir := fs.String("run-dir", "", "daemon runtime directory")
 	stateDir := fs.String("state-dir", "", "persistent attach-state directory")
-	timeout := fs.Duration("timeout", 10*time.Second, "stop request timeout")
+	timeout := fs.Duration("timeout", daemon.DefaultRequestTimeout, "stop request timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if status, err := daemon.ReadStatus(*runDir); err == nil && daemon.IsRunning(status) {
-		if _, err := daemon.RequestStop(ctx, *runDir, *configPath, *timeout); err != nil {
+		if _, err := daemon.RequestStop(ctx, *runDir, *configPath, *timeout); err == nil {
+			fmt.Fprintln(stdout, "daemon stopped and dataplane detached")
+			return nil
+		} else if !errors.Is(err, daemon.ErrDaemonNotRunning) {
 			return err
 		}
-		fmt.Fprintln(stdout, "daemon stopped and dataplane detached")
-		return nil
 	}
 	if _, err := reconcile.Stop(ctx, reconcile.Options{ConfigPath: *configPath, RunDir: daemonRunDir(*runDir), StateDir: *stateDir}); err != nil {
 		return err
@@ -680,11 +701,12 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 	case "reload":
 		if !*dryRun && !*offline {
 			if status, err := daemon.ReadStatus(*runDir); err == nil && daemon.IsRunning(status) {
-				if _, err := daemon.RequestReload(ctx, *runDir, *configPath, 10*time.Second); err != nil {
+				if _, err := daemon.RequestReload(ctx, *runDir, *configPath, daemon.DefaultRequestTimeout); err == nil {
+					fmt.Fprintln(stdout, "daemon reload requested")
+					return nil
+				} else if !errors.Is(err, daemon.ErrDaemonNotRunning) {
 					return err
 				}
-				fmt.Fprintln(stdout, "daemon reload requested")
-				return nil
 			}
 		}
 		if _, err := reconcile.Reload(ctx, opts); err != nil {
@@ -768,7 +790,12 @@ func parseUnderlaySpec(raw string) (config.Underlay, error) {
 func upsertUnderlay(cfg *config.Config, underlay config.Underlay) {
 	for i := range cfg.Underlays {
 		if cfg.Underlays[i].Name == underlay.Name {
-			cfg.Underlays[i] = underlay
+			if underlay.Type != "" {
+				cfg.Underlays[i].Type = underlay.Type
+			}
+			if underlay.Parser != "" {
+				cfg.Underlays[i].Parser = underlay.Parser
+			}
 			return
 		}
 	}
@@ -778,7 +805,21 @@ func upsertUnderlay(cfg *config.Config, underlay config.Underlay) {
 func upsertWireGuard(cfg *config.Config, wg config.WireGuard) {
 	for i := range cfg.WireGuards {
 		if cfg.WireGuards[i].Name == wg.Name {
-			cfg.WireGuards[i] = wg
+			if wg.Config != "" {
+				cfg.WireGuards[i].Config = wg.Config
+			}
+			if wg.Profile != "" {
+				cfg.WireGuards[i].Profile = wg.Profile
+			}
+			if wg.Cipher != "" {
+				cfg.WireGuards[i].Cipher = wg.Cipher
+			}
+			if wg.NetNS != "" {
+				cfg.WireGuards[i].NetNS = wg.NetNS
+			}
+			if wg.Transport.Mode != "" {
+				cfg.WireGuards[i].Transport = wg.Transport
+			}
 			return
 		}
 	}

@@ -2,6 +2,8 @@ package control
 
 import (
 	"context"
+	"errors"
+	"strings"
 	"testing"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
@@ -29,6 +31,77 @@ profiles:
 		t.Fatal(err)
 	}
 	return cfg
+}
+
+func TestBuildStateRejectsEmptyDecodedCipherSecret(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+version: 1
+underlays: []
+wireguards: []
+profiles: {}
+ciphers:
+  xor:
+    mode: xor
+    key_derivation: wgmx-hkdf256-v1
+    secret: "base64:"
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = BuildState(t.Context(), cfg, runtime.StaticProvider{}, underlay.StaticResolver{}, nil, BuildOptions{Offline: true})
+	if err == nil || !strings.Contains(err.Error(), "secret material is empty") {
+		t.Fatalf("expected empty secret rejection, got %v", err)
+	}
+}
+
+func TestDeriveCipherKeyExpandsConfiguredPeriod(t *testing.T) {
+	derivations := []config.Cipher{
+		{
+			KeyDerivation: "wgmx-hkdf256-v1",
+			Secret:        "test-secret",
+		},
+		{
+			KeyDerivation: "udp2raw-md5-key1",
+			Password:      "test-password",
+		},
+	}
+	for _, derivation := range derivations {
+		for _, keyLen := range []uint32{16, 32, 64, 256} {
+			cipher := derivation
+			cipher.KeyLen = keyLen
+			key, err := deriveCipherKey("test", cipher)
+			if err != nil {
+				t.Fatalf("derive %s key_len=%d: %v",
+					cipher.KeyDerivation, keyLen, err)
+			}
+			for i := keyLen; i < uint32(len(key)); i++ {
+				if key[i] != key[i%keyLen] {
+					t.Fatalf("%s key_len=%d byte %d = %d, want period byte %d",
+						cipher.KeyDerivation, keyLen, i, key[i],
+						key[i%keyLen])
+				}
+			}
+			for offset := uint32(0); offset < 2048; offset++ {
+				oldIndex := offset & (keyLen - 1)
+				newIndex := offset & 255
+				if key[oldIndex] != key[newIndex] {
+					t.Fatalf("%s key_len=%d offset %d changed keystream",
+						cipher.KeyDerivation, keyLen, offset)
+				}
+			}
+		}
+	}
+}
+
+func TestDeriveCipherKeyRejectsUnsupportedLength(t *testing.T) {
+	_, err := deriveCipherKey("test", config.Cipher{
+		KeyDerivation: "wgmx-hkdf256-v1",
+		Secret:        "test-secret",
+		KeyLen:        8,
+	})
+	if err == nil || !strings.Contains(err.Error(), "unsupported key_len 8") {
+		t.Fatalf("expected key length error, got %v", err)
+	}
 }
 
 func requireIngressListener(t *testing.T, state *State, family string, port uint16, action string) IngressListener {
@@ -378,6 +451,13 @@ func TestBuildStateRuntimeFwMarkMismatch(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("expected runtime fwmark mismatch")
+	}
+	var mismatch *FwmarkMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("expected typed mismatch error, got %T: %v", err, err)
+	}
+	if mismatch.WireGuard != "wg0" || mismatch.ConfigFwMark != configMark || mismatch.RuntimeMark != runtimeMark {
+		t.Fatalf("unexpected mismatch details: %#v", mismatch)
 	}
 }
 

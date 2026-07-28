@@ -99,12 +99,25 @@ Netns regression entry points:
 ```bash
 sudo make test-netns-smoke
 sudo make test-netns-xor-smoke
+sudo make test-netns-xor-full-smoke
 sudo make test-netns-icmp-smoke
+sudo make test-netns-full
 sudo NEGATIVE_CHECKS=xfail scripts/smoke-netns-icmp.sh
 sudo NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
 ```
 
-The ICMP smoke test is IPv4-only. Its pcap check requires ICMP Echo Request and Reply records, mixed initiation/response/transport payload type words, and zero standard type-word leaks. The negative hooks are optional by default because ordinary ping pass-through and raw UDP bypass protection can be developed on separate core dataplane branches.
+The default XOR smoke exercises the recommended `wg-payload-prefix` scope with
+`max_bytes: 128`; the explicit full smoke covers `wg-payload-full` with
+`max_bytes: 2048`. `test-netns-full` covers UDP IPv4/IPv6, XOR prefix
+IPv4/IPv6, XOR full IPv4/IPv6 (including multi-segment parity-bank
+coverage), IPv6 computed-zero UDP checksum mangling in native and full-XOR
+paths, and ICMP IPv4.
+
+The ICMP smoke test is IPv4-only. Its pcap check requires ICMP Echo Request and
+Reply records, valid ICMP checksums, mixed initiation/response/transport payload
+type words, and zero standard type-word leaks. The Make target enforces ordinary
+ping pass-through and raw IPv4/IPv6 UDP bypass protection; direct script callers
+may still select `skip` or `xfail` while developing a dataplane change.
 
 ## Linux Platform Support
 
@@ -140,10 +153,10 @@ TC clsact / sched_cls support
 bpffs mounted at /sys/fs/bpf
 wg command for runtime WireGuard state
 tc command for attach/status inspection
-nft command when startup_guard.mode is nft-temporary-drop
+nft command for startup-guard application and fixed-table cleanup
 ```
 
-If `startup_guard.mode: none` is used, missing `nft` is tolerated for stop/uninstall guard cleanup because there is no guard table to remove.
+`startup_guard.mode: none` disables guard application, but stop/uninstall still use `nft` to check and remove the fixed owned table in case an earlier configuration left it behind.
 
 ## OpenWrt
 
@@ -159,7 +172,12 @@ Known OpenWrt limitations:
 ```text
 Do not configure both an OpenWrt logical interface and its lower carrier netdev as transform underlays.
 PPPoE/VLAN/bridge paths require target-specific validation.
-Hotplug integration writes reload requests; the daemon still performs a poll fallback.
+Hotplug integration writes a separate `runtime.request` event so it cannot
+overwrite acknowledged CLI stop/reload requests; the daemon still performs a
+poll fallback.
+Legacy `reload.request` reload notifications remain accepted, but legacy
+`stop:` notifications are intentionally ignored because they cannot target a
+specific daemon instance.
 ```
 
 ## Offload, GSO, And GRO

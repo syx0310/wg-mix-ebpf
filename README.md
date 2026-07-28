@@ -17,7 +17,7 @@ wg-mix-ebpf profile token home
 wg-mix-ebpf profile check 'wgmix1....'
 wg-mix-ebpf profile remove home --force
 wg-mix-ebpf run --once --offline --dry-run
-wg-mix-ebpf reload --config configs/example.yaml --offline
+wg-mix-ebpf reload --config configs/example.yaml --offline --dry-run
 wg-mix-ebpf validate --config configs/example.yaml --offline
 wg-mix-ebpf status --config configs/example.yaml --offline
 wg-mix-ebpf dump --config configs/example.yaml --offline
@@ -29,7 +29,7 @@ wg-mix-ebpf features
 wg-mix-ebpf uninstall --dry-run --yes
 ```
 
-`--offline` skips runtime WireGuard and underlay reads. It is intended for local static validation and unit-test environments.
+`--offline` skips runtime WireGuard and underlay reads. It is intended for local static validation and unit-test environments. Applying a reload or running the daemon with `--offline` requires `--dry-run`; the agent refuses to replace live maps with an empty runtime-derived state.
 
 `install` only installs files and registers service/init scripts. It does not start, enable, reload, attach TC, or modify WireGuard. Use `install --enable` if service enablement is desired, then start the service explicitly with systemd or OpenWrt init.
 
@@ -92,3 +92,13 @@ Do not run BPF load, TC attach, netns, OpenWrt, offload, or performance tests on
 `bpf-load-test` only loads and closes the BPF collection. It does not read WireGuard runtime state, attach TC filters, create network namespaces, or send tunnel traffic.
 
 External Linux/OpenWrt/BPF/TC tests require controlled machines. Do not run those tests on laptops or unrelated shared hosts.
+
+On a controlled Linux test host, the full isolated namespace gate is:
+
+```bash
+sudo make test-netns-full
+```
+
+Run `bpf-load-test` on every supported kernel baseline as well as the build
+kernel; verifier acceptance can differ even when the embedded object is
+identical.

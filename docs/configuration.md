@@ -8,6 +8,8 @@ The default config path is:
 
 The config format version is currently `1`.
 
+Configuration parsing is strict. Unknown fields, duplicate mapping keys, and multiple YAML documents are rejected so misspelled safety options cannot be silently ignored.
+
 An installed but uninitialized config may be an idle template:
 
 ```yaml
@@ -354,13 +356,19 @@ ciphers:
     max_bytes: 128
 ```
 
-Secret material is derived in userspace and written to the BPF cipher map as fixed key bytes. `status` hides the actual key.
+Secret material is derived in userspace and written to the BPF cipher map as fixed key bytes. For key lengths shorter than 256 bytes, userspace repeats the configured key period across the map's 256-byte key storage; the ABI snapshot rejects inconsistent `key_len`/`key_mask` values before map population, and the dataplane uses a fixed 8-bit index. This representation is part of BPF ABI version 10. Configure exactly one of `secret`, `secret_file`, or `password`; empty decoded/file content is rejected. `status` and `dump-abi` hide the actual key.
 
 Regression entry point:
 
 ```bash
 sudo make test-netns-xor-smoke
+sudo make test-netns-xor-full-smoke
 ```
+
+The full-payload target sends a 1900-byte no-fragment probe through segment 7,
+exercises both ProgramArray parity banks across generations, removes one active
+egress and ingress segment to verify fail-closed dispatch counters, and reloads
+to confirm recovery.
 
 ## WireGuard Config Requirements
 
@@ -492,7 +500,7 @@ runtime:
   allow_zero_fwmark_fallback: false
 ```
 
-`poll_interval` controls the daemon's low-frequency runtime reconcile loop. Manual commands still rebuild state when invoked.
+`poll_interval` controls the daemon's low-frequency runtime reconcile loop and must be at least `100ms`. Manual commands still rebuild state when invoked.
 
 The daemon does not automatically apply config file content changes observed by the poll loop. It marks status as `config_changed` / `need_reload` and waits for explicit `wg-mix-ebpf reload` or service reload. Local runtime changes such as WireGuard ListenPort, FirewallMark, and underlay ifindex remain automatically reconciled.
 
@@ -503,6 +511,22 @@ The daemon does not automatically apply config file content changes observed by 
 `strict_runtime_fwmark: true` requires the WireGuard config mark and runtime mark to match.
 
 `allow_zero_fwmark_fallback: true` is reserved but not implemented by the MVP.
+
+## Capacity Limits
+
+Reload keeps the active generation while staging the next one, so the supported per-generation limits are half of the fixed BPF map capacities:
+
+```text
+profiles: 64
+ciphers: 64
+underlays: 256
+managed fwmark rules: 256
+egress rules: 1024
+ingress listeners: 1024
+ICMP listeners: 1024
+```
+
+Static validation rejects configurations that could exceed these limits during a later reload instead of allowing the first load to succeed and the next generation to fail.
 
 ## `startup_guard`
 
@@ -529,7 +553,11 @@ none
 
 `wg-mix-ebpf stop`, service stop, and uninstall remove the nft guard table as part of network-impact cleanup. `guard-cleanup` can be used to remove a leftover guard explicitly.
 
-The nft cleanup step is best effort and runs separately from rule creation. Missing guard tables are ignored so older nftables versions do not abort startup guard creation before dataplane attach.
+When a guard table already exists, reload submits its deletion and the complete replacement table in one nft batch. nft validates and commits that batch atomically, so an invalid replacement leaves the previous guard in place. If the batch reports that the old table is absent, reload retries with a create-only script. Other replacement errors do not trigger that fallback.
+
+The first guard plan uses the configured fwmarks, before runtime state is required. Reload then samples every configured WireGuard runtime device and atomically expands the plan to the union of configured and observed runtime fwmarks before full state validation or dataplane apply. The same runtime snapshot is used for validation. If strict fwmark validation rejects a mismatch, all runtime marks observed during that reload remain guarded.
+
+Stop cleanup always attempts to delete the fixed `inet wg_mix_ebpf_guard` table, even when the current config says `startup_guard.mode: none` or the config file is unavailable but attach-state exists. A missing table is idempotent; a missing `nft` binary or any other cleanup error is reported, and cleanup is not reported as successful.
 
 `none` disables startup guard and is intended for development, controlled tests, or minimal systems without nft. In this mode, egress fail-closed behavior only starts after the TC/eBPF dataplane is attached and maps are populated.
 

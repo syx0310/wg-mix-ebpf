@@ -89,8 +89,10 @@ GitHub Actions currently runs a single native Linux amd64 job. It performs:
 
 ```text
 go test ./...
+gofmt, go vet, Bash syntax, and Python syntax checks
 go test -race ./...
 make build-linux-amd64
+make build-linux-arm64
 offline config validation
 amd64 tar.gz artifact packaging
 ```
@@ -98,6 +100,10 @@ amd64 tar.gz artifact packaging
 The normal build and release binary use `CGO_ENABLED=0`. The race-test step explicitly sets `CGO_ENABLED=1` because Go's race detector requires cgo on Linux; this is a CI-only test setting and does not affect the packaged binary.
 
 The public CI intentionally does not run live TC attach, WireGuard, OpenWrt, PPPoE, VLAN, or public-internet tests. Those tests require controlled external machines and should be run in a private lab.
+
+Every supported kernel baseline must run `bpf-load-test`; compiling the object
+does not prove that an older verifier will accept all program paths. The
+controlled kernel matrix currently needs at least Linux 5.15 and 6.8.
 
 ## Release Packaging
 
