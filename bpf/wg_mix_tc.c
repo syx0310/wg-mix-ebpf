@@ -920,7 +920,7 @@ static __always_inline int validate_len(int kind, __u32 payload_len)
 	if (kind == 2)
 		return payload_len == 64;
 	if (kind == 3)
-		return payload_len >= 32 && ((payload_len - 32) & 15) == 0;
+		return payload_len >= 32;
 	return 0;
 }
 
