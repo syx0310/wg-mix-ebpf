@@ -11,7 +11,6 @@ import (
 	"os"
 	"sort"
 	"strings"
-	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -266,8 +265,11 @@ func runInit(ctx context.Context, args []string, stdin io.Reader, stdout io.Writ
 func reloadAfterConfigWrite(ctx context.Context, configPath string) error {
 	runDir := daemonRunDir("")
 	if status, err := daemon.ReadStatus(runDir); err == nil && daemon.IsRunning(status) {
-		_, err := daemon.RequestReload(ctx, runDir, configPath, 10*time.Second)
-		return err
+		if _, err := daemon.RequestReload(ctx, runDir, configPath, daemon.DefaultRequestTimeout); err == nil {
+			return nil
+		} else if !errors.Is(err, daemon.ErrDaemonNotRunning) {
+			return err
+		}
 	}
 	_, err := reconcile.Reload(ctx, reconcile.Options{ConfigPath: configPath, RunDir: runDir})
 	return err
@@ -566,6 +568,7 @@ func runDaemon(ctx context.Context, args []string) error {
 	configPath := fs.String("config", config.DefaultConfigPath, "path to wg-mix-ebpf config")
 	runDir := fs.String("run-dir", "", "runtime status/request directory")
 	stateDir := fs.String("state-dir", "", "persistent attach-state directory")
+	shutdownTimeout := fs.Duration("shutdown-timeout", daemon.DefaultShutdownTimeout, "maximum time for signal/stop cleanup")
 	once := fs.Bool("once", false, "run one reconcile and exit")
 	offline := fs.Bool("offline", false, "skip runtime and underlay reads")
 	dryRun := fs.Bool("dry-run", false, "validate/reconcile without applying dataplane")
@@ -574,7 +577,15 @@ func runDaemon(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	return daemon.Run(ctx, daemon.Options{ConfigPath: *configPath, RunDir: *runDir, StateDir: *stateDir, Once: *once, Offline: *offline, DryRun: *dryRun})
+	return daemon.Run(ctx, daemon.Options{
+		ConfigPath:      *configPath,
+		RunDir:          *runDir,
+		StateDir:        *stateDir,
+		ShutdownTimeout: *shutdownTimeout,
+		Once:            *once,
+		Offline:         *offline,
+		DryRun:          *dryRun,
+	})
 }
 
 func runStop(ctx context.Context, args []string, stdout io.Writer) error {
@@ -583,16 +594,17 @@ func runStop(ctx context.Context, args []string, stdout io.Writer) error {
 	configPath := fs.String("config", config.DefaultConfigPath, "path to wg-mix-ebpf config")
 	runDir := fs.String("run-dir", "", "daemon runtime directory")
 	stateDir := fs.String("state-dir", "", "persistent attach-state directory")
-	timeout := fs.Duration("timeout", 10*time.Second, "stop request timeout")
+	timeout := fs.Duration("timeout", daemon.DefaultRequestTimeout, "stop request timeout")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	if status, err := daemon.ReadStatus(*runDir); err == nil && daemon.IsRunning(status) {
-		if _, err := daemon.RequestStop(ctx, *runDir, *configPath, *timeout); err != nil {
+		if _, err := daemon.RequestStop(ctx, *runDir, *configPath, *timeout); err == nil {
+			fmt.Fprintln(stdout, "daemon stopped and dataplane detached")
+			return nil
+		} else if !errors.Is(err, daemon.ErrDaemonNotRunning) {
 			return err
 		}
-		fmt.Fprintln(stdout, "daemon stopped and dataplane detached")
-		return nil
 	}
 	if _, err := reconcile.Stop(ctx, reconcile.Options{ConfigPath: *configPath, RunDir: daemonRunDir(*runDir), StateDir: *stateDir}); err != nil {
 		return err
@@ -689,11 +701,12 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 	case "reload":
 		if !*dryRun && !*offline {
 			if status, err := daemon.ReadStatus(*runDir); err == nil && daemon.IsRunning(status) {
-				if _, err := daemon.RequestReload(ctx, *runDir, *configPath, 10*time.Second); err != nil {
+				if _, err := daemon.RequestReload(ctx, *runDir, *configPath, daemon.DefaultRequestTimeout); err == nil {
+					fmt.Fprintln(stdout, "daemon reload requested")
+					return nil
+				} else if !errors.Is(err, daemon.ErrDaemonNotRunning) {
 					return err
 				}
-				fmt.Fprintln(stdout, "daemon reload requested")
-				return nil
 			}
 		}
 		if _, err := reconcile.Reload(ctx, opts); err != nil {

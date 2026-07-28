@@ -19,11 +19,15 @@ func WithLock(ctx context.Context, runDir string, fn func() error) error {
 	if err := os.MkdirAll(runDir, 0o755); err != nil {
 		return fmt.Errorf("create lock dir %s: %w", runDir, err)
 	}
-	file, err := os.OpenFile(filepath.Join(runDir, FileName), os.O_CREATE|os.O_RDWR, 0o600)
+	lockPath := filepath.Join(runDir, FileName)
+	file, err := openRegularSingleLinkLock(lockPath)
 	if err != nil {
-		return fmt.Errorf("open lock file: %w", err)
+		return fmt.Errorf("open operation lock file %s: %w", lockPath, err)
 	}
 	defer file.Close()
+	if err := file.Chmod(0o600); err != nil {
+		return fmt.Errorf("secure operation lock file %s: %w", lockPath, err)
+	}
 	ticker := time.NewTicker(25 * time.Millisecond)
 	defer ticker.Stop()
 	for {
