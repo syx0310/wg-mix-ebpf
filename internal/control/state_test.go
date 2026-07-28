@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -400,6 +401,13 @@ func TestBuildStateRuntimeFwMarkMismatch(t *testing.T) {
 	)
 	if err == nil {
 		t.Fatal("expected runtime fwmark mismatch")
+	}
+	var mismatch *FwmarkMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("expected typed mismatch error, got %T: %v", err, err)
+	}
+	if mismatch.WireGuard != "wg0" || mismatch.ConfigFwMark != configMark || mismatch.RuntimeMark != runtimeMark {
+		t.Fatalf("unexpected mismatch details: %#v", mismatch)
 	}
 }
 

@@ -80,6 +80,21 @@ type WireGuardState struct {
 	ICMPID                uint16 `json:"icmp_id,omitempty"`
 }
 
+type FwmarkMismatchError struct {
+	WireGuard    string
+	ConfigFwMark uint32
+	RuntimeMark  uint32
+}
+
+func (e *FwmarkMismatchError) Error() string {
+	return fmt.Sprintf(
+		"wg %s config FwMark 0x%08x does not match runtime FirewallMark 0x%08x",
+		e.WireGuard,
+		e.ConfigFwMark,
+		e.RuntimeMark,
+	)
+}
+
 type UnderlayState struct {
 	ID       uint32 `json:"id"`
 	Name     string `json:"name"`
@@ -309,7 +324,11 @@ func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.Wire
 		return nil, fmt.Errorf("wg %s runtime FirewallMark is zero/off", wg.Name)
 	}
 	if cfg.Runtime.StrictRuntimeFwmark && dev.FirewallMark != *parsed.FwMark {
-		return nil, fmt.Errorf("wg %s config FwMark 0x%08x does not match runtime FirewallMark 0x%08x", wg.Name, *parsed.FwMark, dev.FirewallMark)
+		return nil, &FwmarkMismatchError{
+			WireGuard:    wg.Name,
+			ConfigFwMark: *parsed.FwMark,
+			RuntimeMark:  dev.FirewallMark,
+		}
 	}
 	if dev.ListenPort == 0 {
 		return nil, fmt.Errorf("wg %s runtime ListenPort is zero", wg.Name)
