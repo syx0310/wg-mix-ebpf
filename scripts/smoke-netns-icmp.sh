@@ -32,9 +32,17 @@ if [[ ! -x "${BIN}" ]]; then
 fi
 
 RUN_ID="${RUN_ID:-$(printf '%x' "$$")}"
+if [[ ! "${RUN_ID}" =~ ^[[:alnum:]]{1,8}$ ]]; then
+  echo "error: RUN_ID must contain 1-8 alphanumeric characters" >&2
+  exit 1
+fi
 NSC="wmi${RUN_ID}c"
 NSR="wmi${RUN_ID}r"
 NSS="wmi${RUN_ID}s"
+VETH_C="wmc${RUN_ID}0"
+VETH_RC="wmr${RUN_ID}c"
+VETH_S="wms${RUN_ID}0"
+VETH_RS="wmr${RUN_ID}s"
 TMPDIR="$(mktemp -d /tmp/wg-mix-ebpf-icmp-smoke.XXXXXX)"
 PIN_ROOT="${PIN_ROOT:-/sys/fs/bpf}"
 PIN_BASE="${PIN_ROOT}/wg-mix-ebpf-icmp-smoke-${RUN_ID}"
@@ -68,10 +76,8 @@ run_agent_in_netns() {
 cleanup() {
   local status=$?
   set +e
-  if [[ "${KEEP_TMP_ON_FAIL:-0}" == "1" && "${status}" -ne 0 ]]; then
-    echo "keeping smoke temp dir after failure: ${TMPDIR}" >&2
-    return "${status}"
-  fi
+  local keep_tmp=0
+  [[ "${KEEP_TMP_ON_FAIL:-0}" == "1" && "${status}" -ne 0 ]] && keep_tmp=1
   if ip netns list | awk '{print $1}' | grep -qx "${NSC}"; then
     run_agent_in_netns "${NSC}" "${PINC}" detach --config "${TMPDIR}/agent-client.yaml" >/dev/null 2>&1
   fi
@@ -81,8 +87,15 @@ cleanup() {
   ip netns delete "${NSC}" >/dev/null 2>&1
   ip netns delete "${NSR}" >/dev/null 2>&1
   ip netns delete "${NSS}" >/dev/null 2>&1
+  ip link delete "${VETH_C}" >/dev/null 2>&1
+  ip link delete "${VETH_S}" >/dev/null 2>&1
   rm -rf "${PIN_BASE}"
-  rm -rf "${TMPDIR}"
+  if ((keep_tmp)); then
+    echo "kept ICMP smoke evidence after failure: ${TMPDIR}" >&2
+  else
+    rm -rf "${TMPDIR}"
+  fi
+  return "${status}"
 }
 trap cleanup EXIT INT TERM
 
@@ -230,20 +243,20 @@ ip netns add "${NSC}"
 ip netns add "${NSR}"
 ip netns add "${NSS}"
 
-ip link add wmic0 type veth peer name wmir0
-ip link add wmis0 type veth peer name wmir1
-ip link set wmic0 netns "${NSC}"
-ip link set wmir0 netns "${NSR}"
-ip link set wmis0 netns "${NSS}"
-ip link set wmir1 netns "${NSR}"
+ip link add "${VETH_C}" type veth peer name "${VETH_RC}"
+ip link add "${VETH_S}" type veth peer name "${VETH_RS}"
+ip link set "${VETH_C}" netns "${NSC}"
+ip link set "${VETH_RC}" netns "${NSR}"
+ip link set "${VETH_S}" netns "${NSS}"
+ip link set "${VETH_RS}" netns "${NSR}"
 
 ip -n "${NSC}" link set lo up
 ip -n "${NSR}" link set lo up
 ip -n "${NSS}" link set lo up
-ip -n "${NSC}" link set wmic0 name under0
-ip -n "${NSS}" link set wmis0 name under0
-ip -n "${NSR}" link set wmir0 name rc0
-ip -n "${NSR}" link set wmir1 name rs0
+ip -n "${NSC}" link set "${VETH_C}" name under0
+ip -n "${NSS}" link set "${VETH_S}" name under0
+ip -n "${NSR}" link set "${VETH_RC}" name rc0
+ip -n "${NSR}" link set "${VETH_RS}" name rs0
 
 CLIENT_UNDER="192.0.2.1"
 CLIENT_GW="192.0.2.254"
@@ -322,6 +335,7 @@ python3 "${ROOT}/scripts/check-wg-pcap.py" \
   --forbid-standard \
   --require-mixed initiation,response,transport \
   --require-icmp-types request,reply \
+  --require-valid-icmp-checksum \
   "${TMPDIR}/rc.pcap" "${TMPDIR}/rs.pcap"
 
 run_agent_in_netns "${NSC}" "${PINC}" status --config "${TMPDIR}/agent-client.yaml" >"${TMPDIR}/status-client-after.json"
@@ -331,7 +345,20 @@ python3 - "$TMPDIR/status-client-after.json" "$TMPDIR/status-server-after.json" 
 import json
 import sys
 
-required_zero = ("checksum_error", "icmp_checksum_error", "skb_load_error", "skb_store_error")
+required_zero = (
+    "checksum_error",
+    "icmp_checksum_error",
+    "skb_load_error",
+    "skb_store_error",
+    "xor_key_missing",
+    "xor_len_overflow",
+    "xor_bad_type_after_decrypt",
+    "xor_load_error",
+    "xor_store_error",
+    "xor_csum_error",
+    "ingress_bad_checksum",
+    "egress_bad_checksum",
+)
 required_positive = (
     "egress_rewrite_ok",
     "ingress_rewrite_ok",

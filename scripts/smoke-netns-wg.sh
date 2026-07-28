@@ -10,9 +10,20 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ROOT}/bin/wg-mix-ebpf"
 OUTER_FAMILY="${OUTER_FAMILY:-ipv4}"
 XOR_PASSWORD="${XOR_PASSWORD:-}"
+XOR_SCOPE="${XOR_SCOPE:-wg-payload-full}"
+XOR_MAX_BYTES="${XOR_MAX_BYTES:-2048}"
 
 if [[ "${OUTER_FAMILY}" != "ipv4" && "${OUTER_FAMILY}" != "ipv6" ]]; then
   echo "error: OUTER_FAMILY must be ipv4 or ipv6" >&2
+  exit 1
+fi
+if [[ "${XOR_SCOPE}" != "wg-payload-prefix" && "${XOR_SCOPE}" != "wg-payload-full" ]]; then
+  echo "error: XOR_SCOPE must be wg-payload-prefix or wg-payload-full" >&2
+  exit 1
+fi
+if [[ ! "${XOR_MAX_BYTES}" =~ ^[0-9]+$ ]] ||
+  ((XOR_MAX_BYTES < 4 || XOR_MAX_BYTES > 2048 || XOR_MAX_BYTES % 4 != 0)); then
+  echo "error: XOR_MAX_BYTES must be a multiple of 4 in [4, 2048]" >&2
   exit 1
 fi
 
@@ -29,9 +40,17 @@ if [[ ! -x "${BIN}" ]]; then
 fi
 
 RUN_ID="${RUN_ID:-$(printf '%x' "$$")}"
+if [[ ! "${RUN_ID}" =~ ^[[:alnum:]]{1,8}$ ]]; then
+  echo "error: RUN_ID must contain 1-8 alphanumeric characters" >&2
+  exit 1
+fi
 NSA="wme${RUN_ID}a"
 NSR="wme${RUN_ID}r"
 NSB="wme${RUN_ID}b"
+VETH_A="wma${RUN_ID}0"
+VETH_RA="wmr${RUN_ID}a"
+VETH_B="wmb${RUN_ID}0"
+VETH_RB="wmr${RUN_ID}b"
 TMPDIR="$(mktemp -d /tmp/wg-mix-ebpf-smoke.XXXXXX)"
 PIN_ROOT="${PIN_ROOT:-/sys/fs/bpf}"
 PIN_BASE="${PIN_ROOT}/wg-mix-ebpf-smoke-${RUN_ID}"
@@ -65,10 +84,8 @@ run_agent_in_netns() {
 cleanup() {
   local status=$?
   set +e
-  if [[ "${KEEP_TMP_ON_FAIL:-0}" == "1" && "${status}" -ne 0 ]]; then
-    echo "keeping smoke temp dir after failure: ${TMPDIR}" >&2
-    return "${status}"
-  fi
+  local keep_tmp=0
+  [[ "${KEEP_TMP_ON_FAIL:-0}" == "1" && "${status}" -ne 0 ]] && keep_tmp=1
   if ip netns list | awk '{print $1}' | grep -qx "${NSA}"; then
     run_agent_in_netns "${NSA}" "${PINA}" detach --config "${TMPDIR}/agent-a.yaml" >/dev/null 2>&1
   fi
@@ -78,8 +95,15 @@ cleanup() {
   ip netns delete "${NSA}" >/dev/null 2>&1
   ip netns delete "${NSR}" >/dev/null 2>&1
   ip netns delete "${NSB}" >/dev/null 2>&1
+  ip link delete "${VETH_A}" >/dev/null 2>&1
+  ip link delete "${VETH_B}" >/dev/null 2>&1
   rm -rf "${PIN_BASE}"
-  rm -rf "${TMPDIR}"
+  if ((keep_tmp)); then
+    echo "kept smoke evidence after failure: ${TMPDIR}" >&2
+  else
+    rm -rf "${TMPDIR}"
+  fi
+  return "${status}"
 }
 trap cleanup EXIT INT TERM
 
@@ -100,10 +124,10 @@ ciphers:
   xor-home:
     mode: xor
     auth: none
-    scope: wg-payload-full
+    scope: ${XOR_SCOPE}
     key_derivation: udp2raw-md5-key1
     password: \"${XOR_PASSWORD}\"
-    max_bytes: 2048
+    max_bytes: ${XOR_MAX_BYTES}
 "
   fi
   cat >"${path}" <<EOF_CONFIG
@@ -168,20 +192,20 @@ ip netns add "${NSA}"
 ip netns add "${NSR}"
 ip netns add "${NSB}"
 
-ip link add wmea0 type veth peer name wmera0
-ip link add wmeb0 type veth peer name wmerb0
-ip link set wmea0 netns "${NSA}"
-ip link set wmera0 netns "${NSR}"
-ip link set wmeb0 netns "${NSB}"
-ip link set wmerb0 netns "${NSR}"
+ip link add "${VETH_A}" type veth peer name "${VETH_RA}"
+ip link add "${VETH_B}" type veth peer name "${VETH_RB}"
+ip link set "${VETH_A}" netns "${NSA}"
+ip link set "${VETH_RA}" netns "${NSR}"
+ip link set "${VETH_B}" netns "${NSB}"
+ip link set "${VETH_RB}" netns "${NSR}"
 
 ip -n "${NSA}" link set lo up
 ip -n "${NSR}" link set lo up
 ip -n "${NSB}" link set lo up
-ip -n "${NSA}" link set wmea0 name under0
-ip -n "${NSB}" link set wmeb0 name under0
-ip -n "${NSR}" link set wmera0 name ra0
-ip -n "${NSR}" link set wmerb0 name rb0
+ip -n "${NSA}" link set "${VETH_A}" name under0
+ip -n "${NSB}" link set "${VETH_B}" name under0
+ip -n "${NSR}" link set "${VETH_RA}" name ra0
+ip -n "${NSR}" link set "${VETH_RB}" name rb0
 
 if [[ "${OUTER_FAMILY}" == "ipv4" ]]; then
   A_UNDER="192.0.2.1"
@@ -284,7 +308,20 @@ python3 - "$TMPDIR/status-a-after.json" "$TMPDIR/status-b-after.json" <<'PY'
 import json
 import sys
 
-required_zero = ("checksum_error", "skb_load_error", "skb_store_error")
+required_zero = (
+    "checksum_error",
+    "skb_load_error",
+    "skb_store_error",
+    "icmp_checksum_error",
+    "xor_key_missing",
+    "xor_len_overflow",
+    "xor_bad_type_after_decrypt",
+    "xor_load_error",
+    "xor_store_error",
+    "xor_csum_error",
+    "ingress_bad_checksum",
+    "egress_bad_checksum",
+)
 xor_enabled = bool(__import__("os").environ.get("XOR_PASSWORD"))
 required_positive = ["egress_rewrite_ok", "ingress_rewrite_ok"]
 if xor_enabled:
@@ -309,7 +346,7 @@ for path in sys.argv[1:]:
 PY
 
 if [[ -n "${XOR_PASSWORD}" ]]; then
-  echo "netns WireGuard + eBPF ${OUTER_FAMILY} xor smoke passed"
+  echo "netns WireGuard + eBPF ${OUTER_FAMILY} xor smoke passed (${XOR_SCOPE}, max_bytes=${XOR_MAX_BYTES})"
 else
   echo "netns WireGuard + eBPF ${OUTER_FAMILY} smoke passed"
 fi
