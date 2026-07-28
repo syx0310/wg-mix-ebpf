@@ -9,7 +9,7 @@ BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/incl
 BPF_OBJECT ?= build/wg_mix_tc.o
 EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 
-.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-bpf prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-bpf prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -42,6 +42,17 @@ test-netns-xor-full-smoke: build
 
 test-netns-icmp-smoke: build
 	NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
+
+test-netns-tcp-native: build
+	RUN_ID=tcpnat4 TCP_CHECKS=enforce scripts/smoke-netns-wg.sh
+
+test-netns-tcp-xor-prefix: build
+	RUN_ID=tcppfx4 TCP_CHECKS=enforce XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
+
+test-netns-tcp-xor-full: build
+	RUN_ID=tcpfull4 TCP_CHECKS=enforce XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 scripts/smoke-netns-wg.sh
+
+test-netns-tcp: test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full
 
 test-unit: test-pcap-helper
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./...
@@ -86,6 +97,7 @@ test-netns-full: build
 	RUN_ID=fullx4f XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce XOR_DISPATCH_FAILURE_CHECKS=enforce scripts/smoke-netns-wg.sh
 	RUN_ID=fullx6f OUTER_FAMILY=ipv6 XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce UDP_ZERO_CHECKSUM_CHECKS=enforce scripts/smoke-netns-wg.sh
 	RUN_ID=fulli4 NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
+	$(MAKE) test-netns-tcp
 
 test-vm:
 	@echo "skip: requires external VM matrix"

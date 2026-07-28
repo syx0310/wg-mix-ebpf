@@ -99,6 +99,16 @@ On a controlled Linux test host, the full isolated namespace gate is:
 sudo make test-netns-full
 ```
 
+To run only the TCP single-flow, multi-flow, and WireGuard MTU boundary
+matrix (type-word-only, XOR prefix, and XOR full), use:
+
+```bash
+sudo make test-netns-tcp
+```
+
+The TCP matrix requires `iperf3`; the default lightweight namespace smoke
+targets do not.
+
 Run `bpf-load-test` on every supported kernel baseline as well as the build
 kernel; verifier acceptance can differ even when the embedded object is
 identical.
