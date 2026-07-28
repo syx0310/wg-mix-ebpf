@@ -83,9 +83,6 @@ func ValidatePayloadLength(kind MessageKind, payloadLen int) error {
 		if payloadLen < 32 {
 			return fmt.Errorf("transport payload length %d is below 32", payloadLen)
 		}
-		if (payloadLen-32)%16 != 0 {
-			return fmt.Errorf("transport payload length %d is not 16-byte padded", payloadLen)
-		}
 	default:
 		return fmt.Errorf("unknown message kind")
 	}
