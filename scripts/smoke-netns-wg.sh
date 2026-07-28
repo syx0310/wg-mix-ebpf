@@ -309,13 +309,25 @@ import sys
 
 with open(sys.argv[1], "r", encoding="utf-8") as fh:
     doc = json.load(fh)
-stats = (
-    doc.get("dataplane", {}).get("stats")
-    or doc.get("kernel", {}).get("stats")
-    or doc.get("stats")
-    or {}
-)
-print(int(stats.get(sys.argv[2], 0)))
+stats = None
+for container_name in ("dataplane", "kernel"):
+    container = doc.get(container_name)
+    if isinstance(container, dict) and "stats" in container:
+        stats = container["stats"]
+        break
+if stats is None and "stats" in doc:
+    stats = doc["stats"]
+if not isinstance(stats, dict):
+    raise SystemExit(f"{sys.argv[1]}: missing stats map")
+stat = sys.argv[2]
+if stat not in stats:
+    raise SystemExit(f"{sys.argv[1]}: missing stat: {stat}")
+try:
+    print(int(stats[stat]))
+except (TypeError, ValueError) as exc:
+    raise SystemExit(
+        f"{sys.argv[1]}: invalid stat value for {stat}: {stats[stat]!r}"
+    ) from exc
 PY
 }
 
@@ -452,9 +464,11 @@ if doc.get("error"):
 end = doc.get("end") or {}
 summary = end.get("sum_received") or {}
 received = int(summary.get("bytes", 0))
-if received < minimum_bytes:
+required_total = minimum_bytes * expected_streams
+if received < required_total:
     raise SystemExit(
-        f"{path}: received {received} bytes, require at least {minimum_bytes}"
+        f"{path}: received {received} bytes, require at least {required_total} "
+        f"for {expected_streams} streams"
     )
 streams = end.get("streams") or []
 receivers = [stream.get("receiver") or {} for stream in streams]
@@ -462,9 +476,15 @@ if len(receivers) != expected_streams:
     raise SystemExit(
         f"{path}: receiver stream count={len(receivers)}, want {expected_streams}"
     )
-empty = [index for index, stream in enumerate(receivers) if int(stream.get("bytes", 0)) <= 0]
-if empty:
-    raise SystemExit(f"{path}: receiver streams without throughput: {empty}")
+under_minimum = [
+    (index, int(stream.get("bytes", 0)))
+    for index, stream in enumerate(receivers)
+    if int(stream.get("bytes", 0)) < minimum_bytes
+]
+if under_minimum:
+    raise SystemExit(
+        f"{path}: receiver streams below {minimum_bytes} bytes: {under_minimum}"
+    )
 seconds = float(summary.get("seconds", 0.0))
 mbps = received * 8 / seconds / 1_000_000 if seconds > 0 else 0.0
 retransmits = int((end.get("sum_sent") or {}).get("retransmits") or 0)
@@ -505,9 +525,10 @@ exercise_tcp_matrix() {
       before_path="${TMPDIR}/status-${side}-tcp-${mtu}-before.json"
       after_path="${TMPDIR}/status-${side}-tcp-${mtu}-after.json"
       for stat in \
+        egress_bad_type ingress_bad_type \
         egress_bad_length ingress_bad_length \
         checksum_error skb_load_error skb_store_error \
-        xor_len_overflow xor_bad_type_after_decrypt \
+        xor_key_missing xor_len_overflow xor_bad_type_after_decrypt \
         xor_load_error xor_store_error xor_csum_error \
         xor_egress_dispatch_error xor_ingress_dispatch_error \
         ingress_bad_checksum egress_bad_checksum; do

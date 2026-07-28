@@ -117,11 +117,11 @@ paths, ICMP IPv4, and the TCP MTU matrix.
 The TCP matrix is opt-in so the lightweight smoke targets do not require
 `iperf3`. `test-netns-tcp` runs type-word-only UDP, XOR prefix, and XOR full
 modes. In each mode it runs a single TCP flow and four parallel flows at
-WireGuard MTUs 1419, 1420, and 1421. Every flow must transfer at least 1 MiB,
-every requested parallel stream must carry data, and dataplane length,
-checksum, load/store, and XOR error counters must remain unchanged. The TCP
-load starts only after packet-capture validation finishes, avoiding
-high-volume pcap artifacts.
+WireGuard MTUs 1419, 1420, and 1421. Every receiver stream must transfer at
+least 1 MiB, and the aggregate receive count must be at least 1 MiB multiplied
+by the requested stream count. Dataplane type, length, checksum, load/store,
+and XOR error counters must remain unchanged. The TCP load starts only after
+packet-capture validation finishes, avoiding high-volume pcap artifacts.
 
 Direct script callers can select the same gate and tune it for slower test
 hosts:
@@ -135,10 +135,11 @@ sudo TCP_CHECKS=enforce \
   scripts/smoke-netns-wg.sh
 ```
 
-`TCP_CHECKS=off` is the default. The 1420 case covers the normal
-full-sized TCP boundary, while 1419 and 1421 force non-four-byte-aligned
-full-payload XOR targets. `iperf3` is checked as a dependency only when the
-TCP gate is enabled.
+`TCP_MIN_BYTES` is a per-receiver-stream threshold; the aggregate threshold is
+`TCP_MIN_BYTES * stream_count`. `TCP_CHECKS=off` is the default. The 1420 case
+covers the normal full-sized TCP boundary, while 1419 and 1421 force
+non-four-byte-aligned full-payload XOR targets. `iperf3` is checked as a
+dependency only when the TCP gate is enabled.
 
 The ICMP smoke test is IPv4-only. Its pcap check requires ICMP Echo Request and
 Reply records, valid ICMP checksums, mixed initiation/response/transport payload
