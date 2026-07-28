@@ -196,6 +196,8 @@ UDP XOR cipher:
   IPv6 egress updates UDP checksum from chunk diffs before writing payload bytes
   ingress accumulates chunk checksum diffs and updates UDP checksum once per
   tail-call segment
+  a final 1-3 byte tail is loaded and stored at its exact length and is
+  zero-padded only while calculating the four-byte checksum diff
 ```
 
 For payload-only UDP checksum updates, the L4 checksum helper is used in diff
