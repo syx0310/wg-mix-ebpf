@@ -170,7 +170,12 @@ Known OpenWrt limitations:
 ```text
 Do not configure both an OpenWrt logical interface and its lower carrier netdev as transform underlays.
 PPPoE/VLAN/bridge paths require target-specific validation.
-Hotplug integration writes reload requests; the daemon still performs a poll fallback.
+Hotplug integration writes a separate `runtime.request` event so it cannot
+overwrite acknowledged CLI stop/reload requests; the daemon still performs a
+poll fallback.
+Legacy `reload.request` reload notifications remain accepted, but legacy
+`stop:` notifications are intentionally ignored because they cannot target a
+specific daemon instance.
 ```
 
 ## Offload, GSO, And GRO

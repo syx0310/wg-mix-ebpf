@@ -13,6 +13,7 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/guard"
+	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/runtime"
 	"github.com/syx0310/wg-mix-ebpf/internal/underlay"
 	"github.com/syx0310/wg-mix-ebpf/internal/wgconfig"
@@ -37,11 +38,18 @@ func TestStopCleansFixedGuardTableWhenCurrentConfigDisablesGuard(t *testing.T) {
 	}
 	guardExec := &recordingGuardExecutor{}
 	configLoads := 0
-	result, err := Stop(t.Context(), Options{
-		ConfigPath: cfgPath,
-		RunDir:     t.TempDir(),
-		StateDir:   t.TempDir(),
-		Offline:    true,
+	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(t.TempDir(), "daemon.lease"))
+	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{PID: os.Getpid(), Action: "daemon"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+	result, err := Stop(ctx, Options{
+		ConfigPath:     cfgPath,
+		RunDir:         t.TempDir(),
+		StateDir:       t.TempDir(),
+		Offline:        true,
+		LifecycleLease: lease,
 		deps: &dependencies{
 			loadConfigFile: func(path string) (*config.Config, error) {
 				configLoads++
@@ -61,6 +69,46 @@ func TestStopCleansFixedGuardTableWhenCurrentConfigDisablesGuard(t *testing.T) {
 	}
 	if configLoads != 1 {
 		t.Fatalf("main config loads = %d, want 1", configLoads)
+	}
+}
+
+func TestOneShotMutationsRejectHeldGlobalLifecycleLease(t *testing.T) {
+	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
+	ctx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
+		PID:        os.Getpid(),
+		Action:     "daemon",
+		ConfigPath: "/etc/wg-mix-ebpf/config.yaml",
+		RunDir:     "/run/real-daemon",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+
+	for name, mutate := range map[string]func() error{
+		"reload": func() error {
+			_, err := Reload(ctx, Options{ConfigPath: "/missing/config.yaml", RunDir: t.TempDir()})
+			return err
+		},
+		"detach": func() error {
+			_, err := Detach(ctx, Options{ConfigPath: "/missing/config.yaml", RunDir: t.TempDir()})
+			return err
+		},
+		"stop": func() error {
+			_, err := Stop(ctx, Options{ConfigPath: "/missing/config.yaml", RunDir: t.TempDir()})
+			return err
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			err := mutate()
+			if !errors.Is(err, lockfile.ErrLifecycleLeaseHeld) {
+				t.Fatalf("%s error = %v, want held lifecycle lease", name, err)
+			}
+			if !strings.Contains(err.Error(), "/run/real-daemon") {
+				t.Fatalf("%s error lacks owner run-dir: %v", name, err)
+			}
+		})
 	}
 }
 
@@ -168,7 +216,8 @@ func TestReloadUsesSingleConfigSnapshotAndExpandsGuardForRuntimeMark(t *testing.
 	runtimeProvider := &countingRuntimeProvider{upstream: runtime.StaticProvider{Devices: map[string]*runtime.Device{
 		"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: runtimeMark, Up: true},
 	}}}
-	result, err := Reload(t.Context(), Options{
+	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(t.TempDir(), "daemon.lease"))
+	result, err := Reload(ctx, Options{
 		ConfigPath: cfgPath,
 		StateDir:   t.TempDir(),
 		deps: &dependencies{
@@ -232,7 +281,8 @@ func TestReloadKeepsRuntimeMarkGuardedOnStrictMismatch(t *testing.T) {
 		"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: runtimeMark0, Up: true},
 		"wg1": {Name: "wg1", ListenPort: 31002, FirewallMark: runtimeMark1, Up: true},
 	}}}
-	_, err := Reload(t.Context(), Options{
+	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(t.TempDir(), "daemon.lease"))
+	_, err := Reload(ctx, Options{
 		ConfigPath: cfgPath,
 		StateDir:   t.TempDir(),
 		deps: &dependencies{
@@ -275,7 +325,8 @@ func TestStopUsesAttachStateAndCleansGuardWhenConfigIsMissing(t *testing.T) {
 	}
 	guardExec := &recordingGuardExecutor{}
 	loader := &recordingDataplaneLoader{}
-	result, err := Stop(t.Context(), Options{
+	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(t.TempDir(), "daemon.lease"))
+	result, err := Stop(ctx, Options{
 		ConfigPath: filepath.Join(t.TempDir(), "missing.yaml"),
 		StateDir:   stateDir,
 		deps: &dependencies{
