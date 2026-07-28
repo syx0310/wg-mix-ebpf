@@ -8,7 +8,7 @@ BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/incl
 BPF_OBJECT ?= build/wg_mix_tc.o
 EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 
-.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-icmp-smoke test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-bpf prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-bpf prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -34,10 +34,13 @@ test-netns-smoke: build
 	scripts/smoke-netns-wg.sh
 
 test-netns-xor-smoke: build
-	XOR_PASSWORD=wg-mix-ebpf-xor-smoke scripts/smoke-netns-wg.sh
+	XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
+
+test-netns-xor-full-smoke: build
+	XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 scripts/smoke-netns-wg.sh
 
 test-netns-icmp-smoke: build
-	scripts/smoke-netns-icmp.sh
+	NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
 
 test-unit:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./...
@@ -46,7 +49,11 @@ test-unit-race:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test -race ./...
 
 test-lint:
-	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./...
+	@test -z "$$(gofmt -l $$(find cmd internal -name '*.go' -type f))" || \
+		{ echo "gofmt required for:"; gofmt -l $$(find cmd internal -name '*.go' -type f); exit 1; }
+	CGO_ENABLED=$(CGO_ENABLED) $(GO) vet ./...
+	bash -n scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh
+	python3 -c 'from pathlib import Path; compile(Path("scripts/check-wg-pcap.py").read_text(), "scripts/check-wg-pcap.py", "exec")'
 
 test-config:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./internal/config ./internal/wgconfig
@@ -66,8 +73,13 @@ test-bpf-pkt:
 test-netns:
 	@echo "run as root on an external Linux VM: make test-netns-smoke"
 
-test-netns-full:
-	@echo "skip: requires external Linux root VM with full netns matrix"
+test-netns-full: build
+	RUN_ID=fullu4 scripts/smoke-netns-wg.sh
+	RUN_ID=fullu6 OUTER_FAMILY=ipv6 scripts/smoke-netns-wg.sh
+	RUN_ID=fullx4p XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
+	RUN_ID=fullx6p OUTER_FAMILY=ipv6 XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
+	RUN_ID=fullx4f XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 scripts/smoke-netns-wg.sh
+	RUN_ID=fulli4 NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
 
 test-vm:
 	@echo "skip: requires external VM matrix"
