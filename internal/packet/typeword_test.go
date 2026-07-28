@@ -19,27 +19,36 @@ func TestWireRoundTrip(t *testing.T) {
 
 func TestValidatePayloadLength(t *testing.T) {
 	cases := []struct {
+		name string
 		kind MessageKind
 		size int
 		ok   bool
 	}{
-		{MessageInitiation, 148, true},
-		{MessageInitiation, 147, false},
-		{MessageResponse, 92, true},
-		{MessageCookieReply, 64, true},
-		{MessageTransportData, 32, true},
-		{MessageTransportData, 48, true},
-		{MessageTransportData, 33, false},
-		{MessageTransportData, 31, false},
+		{"initiation exact", MessageInitiation, 148, true},
+		{"initiation below", MessageInitiation, 147, false},
+		{"initiation above", MessageInitiation, 149, false},
+		{"response exact", MessageResponse, 92, true},
+		{"response below", MessageResponse, 91, false},
+		{"response above", MessageResponse, 93, false},
+		{"cookie exact", MessageCookieReply, 64, true},
+		{"cookie below", MessageCookieReply, 63, false},
+		{"cookie above", MessageCookieReply, 65, false},
+		{"transport below minimum", MessageTransportData, 31, false},
+		{"transport minimum", MessageTransportData, 32, true},
+		{"transport non padded", MessageTransportData, 33, true},
+		{"transport mtu edge odd", MessageTransportData, 1451, true},
+		{"transport mtu edge even", MessageTransportData, 1452, true},
 	}
 	for _, tc := range cases {
-		err := ValidatePayloadLength(tc.kind, tc.size)
-		if tc.ok && err != nil {
-			t.Fatalf("%s/%d expected ok: %v", tc.kind, tc.size, err)
-		}
-		if !tc.ok && err == nil {
-			t.Fatalf("%s/%d expected error", tc.kind, tc.size)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidatePayloadLength(tc.kind, tc.size)
+			if tc.ok && err != nil {
+				t.Fatalf("%s/%d expected ok: %v", tc.kind, tc.size, err)
+			}
+			if !tc.ok && err == nil {
+				t.Fatalf("%s/%d expected error", tc.kind, tc.size)
+			}
+		})
 	}
 }
 

@@ -101,7 +101,7 @@ def valid_wireguard_length(kind: str, payload_len: int) -> bool:
     if kind == "cookie":
         return payload_len == 64
     if kind == "transport":
-        return payload_len >= 32 and (payload_len - 32) % 16 == 0
+        return payload_len >= 32
     return False
 
 
