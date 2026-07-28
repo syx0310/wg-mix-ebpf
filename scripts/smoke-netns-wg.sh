@@ -15,6 +15,12 @@ XOR_MAX_BYTES="${XOR_MAX_BYTES:-2048}"
 XOR_GENERATION_CHECKS="${XOR_GENERATION_CHECKS:-off}"
 XOR_DISPATCH_FAILURE_CHECKS="${XOR_DISPATCH_FAILURE_CHECKS:-off}"
 UDP_ZERO_CHECKSUM_CHECKS="${UDP_ZERO_CHECKSUM_CHECKS:-off}"
+TCP_CHECKS="${TCP_CHECKS:-off}"
+TCP_MTUS="${TCP_MTUS:-1420 1419 1421}"
+TCP_DURATION="${TCP_DURATION:-2}"
+TCP_PARALLEL_STREAMS="${TCP_PARALLEL_STREAMS:-4}"
+TCP_MIN_BYTES="${TCP_MIN_BYTES:-1048576}"
+TCP_PORT="${TCP_PORT:-5201}"
 UNDERLAY_MTU="${UNDERLAY_MTU:-2200}"
 WG_MTU="${WG_MTU:-2000}"
 
@@ -32,9 +38,9 @@ if [[ ! "${XOR_MAX_BYTES}" =~ ^[0-9]+$ ]] ||
   exit 1
 fi
 for check_mode in "${XOR_GENERATION_CHECKS}" "${XOR_DISPATCH_FAILURE_CHECKS}" \
-  "${UDP_ZERO_CHECKSUM_CHECKS}"; do
+  "${UDP_ZERO_CHECKSUM_CHECKS}" "${TCP_CHECKS}"; do
   if [[ "${check_mode}" != "off" && "${check_mode}" != "enforce" ]]; then
-    echo "error: generation/dispatch/UDP zero-checksum checks must be off or enforce" >&2
+    echo "error: optional checks must be off or enforce" >&2
     exit 1
   fi
 done
@@ -54,6 +60,39 @@ if [[ "${UDP_ZERO_CHECKSUM_CHECKS}" == "enforce" ]]; then
     exit 1
   fi
 fi
+TCP_MTU_VALUES=()
+if [[ "${TCP_CHECKS}" == "enforce" ]]; then
+  read -r -a TCP_MTU_VALUES <<<"${TCP_MTUS}"
+  if ((${#TCP_MTU_VALUES[@]} == 0)); then
+    echo "error: TCP_MTUS must contain at least one MTU" >&2
+    exit 1
+  fi
+  for tcp_mtu in "${TCP_MTU_VALUES[@]}"; do
+    if [[ ! "${tcp_mtu}" =~ ^[0-9]+$ ]] || ((tcp_mtu < 576 || tcp_mtu > 65535)); then
+      echo "error: TCP_MTUS values must be integers in [576, 65535]" >&2
+      exit 1
+    fi
+  done
+  if [[ ! "${TCP_DURATION}" =~ ^[0-9]+$ ]] ||
+    ((TCP_DURATION < 1 || TCP_DURATION > 60)); then
+    echo "error: TCP_DURATION must be an integer in [1, 60]" >&2
+    exit 1
+  fi
+  if [[ ! "${TCP_PARALLEL_STREAMS}" =~ ^[0-9]+$ ]] ||
+    ((TCP_PARALLEL_STREAMS < 2 || TCP_PARALLEL_STREAMS > 32)); then
+    echo "error: TCP_PARALLEL_STREAMS must be an integer in [2, 32]" >&2
+    exit 1
+  fi
+  if [[ ! "${TCP_MIN_BYTES}" =~ ^[0-9]+$ ]] || ((TCP_MIN_BYTES < 1)); then
+    echo "error: TCP_MIN_BYTES must be a positive integer" >&2
+    exit 1
+  fi
+  if [[ ! "${TCP_PORT}" =~ ^[0-9]+$ ]] ||
+    ((TCP_PORT < 1024 || TCP_PORT > 65535)); then
+    echo "error: TCP_PORT must be an integer in [1024, 65535]" >&2
+    exit 1
+  fi
+fi
 
 for cmd in ip wg ping tcpdump python3 timeout grep; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
@@ -63,6 +102,10 @@ for cmd in ip wg ping tcpdump python3 timeout grep; do
 done
 if [[ -n "${XOR_PASSWORD}" ]] && ! command -v bpftool >/dev/null 2>&1; then
   echo "error: missing command: bpftool" >&2
+  exit 1
+fi
+if [[ "${TCP_CHECKS}" == "enforce" ]] && ! command -v iperf3 >/dev/null 2>&1; then
+  echo "error: missing command: iperf3 (required when TCP_CHECKS=enforce)" >&2
   exit 1
 fi
 
@@ -89,6 +132,7 @@ PIN_BASE="${PIN_ROOT}/wg-mix-ebpf-smoke-${RUN_ID}"
 PINA="${PIN_BASE}/wg-mix-ebpf-${NSA}"
 PINB="${PIN_BASE}/wg-mix-ebpf-${NSB}"
 UDP_ZERO_CHECKSUM_RECEIVER_PID=""
+TCP_SERVER_PID=""
 umask 077
 
 run_agent_in_netns() {
@@ -122,6 +166,10 @@ cleanup() {
   if [[ -n "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" ]]; then
     kill "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" >/dev/null 2>&1
     wait "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" >/dev/null 2>&1
+  fi
+  if [[ -n "${TCP_SERVER_PID}" ]]; then
+    kill "${TCP_SERVER_PID}" >/dev/null 2>&1
+    wait "${TCP_SERVER_PID}" >/dev/null 2>&1
   fi
   if ip netns list | awk '{print $1}' | grep -qx "${NSA}"; then
     run_agent_in_netns "${NSA}" "${PINA}" detach --config "${TMPDIR}/agent-a.yaml" >/dev/null 2>&1
@@ -299,6 +347,180 @@ assert_stat_unchanged() {
     echo "error: ${stat} changed (${before} -> ${after})" >&2
     return 1
   fi
+}
+
+tcp_server_listening() {
+  ip netns exec "${NSB}" python3 - "${TCP_PORT}" <<'PY'
+import pathlib
+import sys
+
+port = f"{int(sys.argv[1]):04X}"
+for path in (pathlib.Path("/proc/net/tcp"), pathlib.Path("/proc/net/tcp6")):
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()[1:]
+    except FileNotFoundError:
+        continue
+    for line in lines:
+        fields = line.split()
+        if len(fields) >= 4 and fields[1].rsplit(":", 1)[-1].upper() == port:
+            if fields[3] == "0A":
+                raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+exercise_tcp_run() {
+  local mtu="$1"
+  local streams="$2"
+  local label="tcp-mtu${mtu}-p${streams}"
+  local client_path="${TMPDIR}/${label}-client.json"
+  local client_log="${TMPDIR}/${label}-client.log"
+  local server_path="${TMPDIR}/${label}-server.json"
+  local server_log="${TMPDIR}/${label}-server.log"
+  local server_status=0
+  local client_status=0
+  local ready=0
+  local attempt
+
+  timeout -s TERM -k 2 "$((TCP_DURATION + 15))" \
+    ip netns exec "${NSB}" iperf3 -s -1 -p "${TCP_PORT}" -J \
+    >"${server_path}" 2>"${server_log}" &
+  TCP_SERVER_PID=$!
+
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    if tcp_server_listening; then
+      ready=1
+      break
+    fi
+    if ! kill -0 "${TCP_SERVER_PID}" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.1
+  done
+  if ((ready == 0)); then
+    echo "error: iperf3 server did not listen for ${label}" >&2
+    kill "${TCP_SERVER_PID}" >/dev/null 2>&1 || true
+    wait "${TCP_SERVER_PID}" >/dev/null 2>&1 || true
+    TCP_SERVER_PID=""
+    cat "${server_log}" >&2
+    return 1
+  fi
+
+  if timeout -s TERM -k 2 "$((TCP_DURATION + 15))" \
+    ip netns exec "${NSA}" iperf3 -c 10.77.0.2 -p "${TCP_PORT}" \
+    -t "${TCP_DURATION}" -P "${streams}" -J \
+    >"${client_path}" 2>"${client_log}"; then
+    client_status=0
+  else
+    client_status=$?
+  fi
+
+  if ((client_status != 0)); then
+    echo "error: iperf3 client failed for ${label} (${client_status})" >&2
+    kill "${TCP_SERVER_PID}" >/dev/null 2>&1 || true
+    wait "${TCP_SERVER_PID}" >/dev/null 2>&1 || true
+    TCP_SERVER_PID=""
+    cat "${client_log}" >&2
+    [[ ! -s "${client_path}" ]] || cat "${client_path}" >&2
+    return "${client_status}"
+  fi
+
+  if wait "${TCP_SERVER_PID}"; then
+    server_status=0
+  else
+    server_status=$?
+  fi
+  TCP_SERVER_PID=""
+  if ((server_status != 0)); then
+    echo "error: iperf3 server failed for ${label} (${server_status})" >&2
+    cat "${server_log}" >&2
+    [[ ! -s "${server_path}" ]] || cat "${server_path}" >&2
+    return "${server_status}"
+  fi
+
+  python3 - "${client_path}" "${streams}" "${TCP_MIN_BYTES}" "${mtu}" <<'PY'
+import json
+import sys
+
+path, expected_streams, minimum_bytes, mtu = sys.argv[1:]
+expected_streams = int(expected_streams)
+minimum_bytes = int(minimum_bytes)
+with open(path, "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+if doc.get("error"):
+    raise SystemExit(f"{path}: iperf3 error: {doc['error']}")
+end = doc.get("end") or {}
+summary = end.get("sum_received") or {}
+received = int(summary.get("bytes", 0))
+if received < minimum_bytes:
+    raise SystemExit(
+        f"{path}: received {received} bytes, require at least {minimum_bytes}"
+    )
+streams = end.get("streams") or []
+receivers = [stream.get("receiver") or {} for stream in streams]
+if len(receivers) != expected_streams:
+    raise SystemExit(
+        f"{path}: receiver stream count={len(receivers)}, want {expected_streams}"
+    )
+empty = [index for index, stream in enumerate(receivers) if int(stream.get("bytes", 0)) <= 0]
+if empty:
+    raise SystemExit(f"{path}: receiver streams without throughput: {empty}")
+seconds = float(summary.get("seconds", 0.0))
+mbps = received * 8 / seconds / 1_000_000 if seconds > 0 else 0.0
+retransmits = int((end.get("sum_sent") or {}).get("retransmits") or 0)
+print(
+    f"tcp mtu={mtu} streams={expected_streams} received={received} "
+    f"throughput={mbps:.2f}Mbps retransmits={retransmits}"
+)
+PY
+}
+
+exercise_tcp_matrix() {
+  local mtu
+  local side
+  local stat
+  local before_path
+  local after_path
+
+  for mtu in "${TCP_MTU_VALUES[@]}"; do
+    ip -n "${NSA}" link set wg0 mtu "${mtu}"
+    ip -n "${NSB}" link set wg0 mtu "${mtu}"
+    wait_ping "${NSA}" 10.77.0.2
+    wait_ping "${NSB}" 10.77.0.1
+
+    run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" \
+      >"${TMPDIR}/status-a-tcp-${mtu}-before.json"
+    run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" \
+      >"${TMPDIR}/status-b-tcp-${mtu}-before.json"
+
+    exercise_tcp_run "${mtu}" 1
+    exercise_tcp_run "${mtu}" "${TCP_PARALLEL_STREAMS}"
+
+    run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" \
+      >"${TMPDIR}/status-a-tcp-${mtu}-after.json"
+    run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" \
+      >"${TMPDIR}/status-b-tcp-${mtu}-after.json"
+
+    for side in a b; do
+      before_path="${TMPDIR}/status-${side}-tcp-${mtu}-before.json"
+      after_path="${TMPDIR}/status-${side}-tcp-${mtu}-after.json"
+      for stat in \
+        egress_bad_length ingress_bad_length \
+        checksum_error skb_load_error skb_store_error \
+        xor_len_overflow xor_bad_type_after_decrypt \
+        xor_load_error xor_store_error xor_csum_error \
+        xor_egress_dispatch_error xor_ingress_dispatch_error \
+        ingress_bad_checksum egress_bad_checksum; do
+        assert_stat_unchanged "${before_path}" "${after_path}" "${stat}"
+      done
+      assert_stat_increased "${before_path}" "${after_path}" egress_rewrite_ok
+      assert_stat_increased "${before_path}" "${after_path}" ingress_rewrite_ok
+      if [[ -n "${XOR_PASSWORD}" ]]; then
+        assert_stat_increased "${before_path}" "${after_path}" xor_egress_ok
+        assert_stat_increased "${before_path}" "${after_path}" xor_ingress_ok
+      fi
+    done
+  done
 }
 
 exercise_udp_zero_checksum() {
@@ -743,6 +965,10 @@ if [[ "${XOR_DISPATCH_FAILURE_CHECKS}" == "enforce" ]]; then
   run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" >"${TMPDIR}/status-b-repaired.json"
   assert_tail_bank "${PINB}" "${TMPDIR}/status-b-repaired.json"
   large_ping "${NSA}" 10.77.0.2
+fi
+
+if [[ "${TCP_CHECKS}" == "enforce" ]]; then
+  exercise_tcp_matrix
 fi
 
 if [[ -n "${XOR_PASSWORD}" ]]; then
