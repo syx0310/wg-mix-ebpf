@@ -35,11 +35,17 @@ jobs:
       - name: Unit tests
         run: make test-unit
 
+      - name: Static checks
+        run: make test-lint
+
       - name: Race tests
         run: CGO_ENABLED=1 make test-unit-race
 
       - name: Build Linux amd64 package binary
         run: make build-linux-amd64
+
+      - name: Build Linux arm64 package binary
+        run: make build-linux-arm64
 
       - name: Offline config validation
         run: |
