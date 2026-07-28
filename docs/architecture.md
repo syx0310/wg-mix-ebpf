@@ -292,7 +292,7 @@ If dataplane reload fails after the guard is applied, the guard is intentionally
 
 Replacing an existing guard uses one nft batch containing `delete table` followed by the complete replacement table. nft commits the batch atomically; a validation or rule-creation failure therefore rolls back the delete and preserves the old guard. A missing-table error is the only condition that triggers a second, create-only batch.
 
-Each reload reads the main configuration once and memoizes each parsed WireGuard configuration for both guard and runtime state construction. The startup guard is first generated from this config-only snapshot, which allows it to be installed before the WireGuard interface appears. After runtime state is available, the guard is atomically expanded to cover the union of configured and runtime fwmarks before dataplane apply. An observed strict fwmark mismatch leaves that union guard installed while reload returns an error.
+Each reload reads the main configuration once and memoizes each parsed WireGuard configuration for both guard and runtime state construction. The startup guard is first generated from this config-only snapshot, which allows it to be installed before the WireGuard interface appears. Reload then samples every configured runtime device, atomically expands the guard to cover the union of configured and observed runtime fwmarks, and uses that same runtime snapshot for full state validation. A strict fwmark mismatch on any interface therefore leaves all marks observed during the reload guarded while reload returns an error.
 
 ## Service And Reconcile Model
 
