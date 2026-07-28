@@ -199,9 +199,9 @@ UDP XOR cipher:
 ```
 
 For payload-only UDP checksum updates, the L4 checksum helper is used in diff
-mode with no additional L4 checksum flags. Passing `BPF_F_IPV6` in this
-payload-only diff path caused TC egress helper failures in the IPv6 netns
-regression.
+mode with `BPF_F_MARK_MANGLED_0`, preserving an enabled UDP checksum when the
+updated value is zero. Passing `BPF_F_IPV6` in this payload-only diff path
+caused TC egress helper failures in the IPv6 netns regression.
 
 XOR cost scales with `max_bytes`. `wg-payload-prefix` with a small bounded prefix
 is the preferred performance mode; `wg-payload-full` is available for stronger

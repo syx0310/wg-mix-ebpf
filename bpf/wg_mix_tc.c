@@ -929,7 +929,7 @@ static __always_inline int update_type_word(struct __sk_buff *skb, struct packet
 					    int recompute_checksum)
 {
 	__u64 store_flags = BPF_F_INVALIDATE_HASH;
-	__u64 csum_flags = 0;
+	__u64 csum_flags = BPF_F_MARK_MANGLED_0;
 	__u32 csum_off = info->udp_off + offsetof(struct udphdr, check);
 	__s64 diff;
 
@@ -1172,7 +1172,7 @@ static __always_inline int xor_segment_manual_diff(struct __sk_buff *skb,
 		return -4;
 	if (bpf_l4_csum_replace(skb, payload_off - sizeof(struct udphdr) +
 				offsetof(struct udphdr, check),
-				0, csum_diff, 0) < 0)
+				0, csum_diff, BPF_F_MARK_MANGLED_0) < 0)
 		return -3;
 	return has_more ? 1 : 0;
 }
