@@ -166,6 +166,8 @@ When the daemon is alive, `stop` requests the daemon to stop polling, detach dat
 
 Dataplane cleanup uses `/var/lib/wg-mix-ebpf/attach-state.json` when available. This lets `stop`, `detach`, and `uninstall` remove TC filters even if the WireGuard interface was already stopped or deleted.
 
+Stop always checks and removes the fixed `inet wg_mix_ebpf_guard` table. It does not skip this check when the current config uses `startup_guard.mode: none`, because the table may have been installed by an earlier config generation. Consequently, `nft` must remain available for stop/uninstall cleanup; cleanup errors are reported instead of being marked successful.
+
 ## Uninstall
 
 Default uninstall removes network-impacting state but keeps configuration:

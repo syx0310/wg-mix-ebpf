@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
@@ -15,6 +16,7 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/runtime"
 	"github.com/syx0310/wg-mix-ebpf/internal/underlay"
+	"github.com/syx0310/wg-mix-ebpf/internal/wgconfig"
 )
 
 type Options struct {
@@ -23,6 +25,17 @@ type Options struct {
 	StateDir   string
 	Offline    bool
 	DryRun     bool
+
+	deps *dependencies
+}
+
+type dependencies struct {
+	loadConfigFile   func(string) (*config.Config, error)
+	loadWGConfig     control.WGConfigLoader
+	runtimeProvider  runtime.Provider
+	underlayResolver underlay.Resolver
+	guardExecutor    guard.Executor
+	dataplaneLoader  dataplane.Loader
 }
 
 type Result struct {
@@ -58,7 +71,7 @@ func BuildGuardState(ctx context.Context, opts Options) (*config.Config, *contro
 	if err != nil {
 		return nil, nil, err
 	}
-	state, err := control.BuildState(ctx, cfg, runtime.NewSystemProvider(), underlay.NewSystemResolver(), nil, control.BuildOptions{Offline: true})
+	state, err := buildGuardStateFromConfig(ctx, cfg, opts, configuredWGConfigLoader(opts))
 	if err != nil {
 		return nil, nil, err
 	}
@@ -70,7 +83,11 @@ func loadConfig(opts Options) (*config.Config, error) {
 	if path == "" {
 		path = config.DefaultConfigPath
 	}
-	cfg, err := config.LoadFile(path)
+	loader := config.LoadFile
+	if opts.deps != nil && opts.deps.loadConfigFile != nil {
+		loader = opts.deps.loadConfigFile
+	}
+	cfg, err := loader(path)
 	if err != nil {
 		return nil, fmt.Errorf("load config %s: %w", path, err)
 	}
@@ -78,14 +95,172 @@ func loadConfig(opts Options) (*config.Config, error) {
 }
 
 func buildStateFromConfig(ctx context.Context, cfg *config.Config, opts Options) (*control.State, error) {
-	state, err := control.BuildState(ctx, cfg, runtime.NewSystemProvider(), underlay.NewSystemResolver(), nil, control.BuildOptions{Offline: opts.Offline})
+	return buildStateFromConfigWithLoader(ctx, cfg, opts, configuredWGConfigLoader(opts), opts.Offline)
+}
+
+func buildGuardStateFromConfig(ctx context.Context, cfg *config.Config, opts Options, loadWG control.WGConfigLoader) (*control.State, error) {
+	return buildStateFromConfigWithLoader(ctx, cfg, opts, loadWG, true)
+}
+
+func buildStateFromConfigWithLoader(ctx context.Context, cfg *config.Config, opts Options, loadWG control.WGConfigLoader, offline bool) (*control.State, error) {
+	return buildStateFromConfigWithSources(
+		ctx,
+		cfg,
+		loadWG,
+		configuredRuntimeProvider(opts),
+		configuredUnderlayResolver(opts),
+		offline,
+	)
+}
+
+func buildStateFromConfigWithSources(
+	ctx context.Context,
+	cfg *config.Config,
+	loadWG control.WGConfigLoader,
+	runtimeProvider runtime.Provider,
+	underlayResolver underlay.Resolver,
+	offline bool,
+) (*control.State, error) {
+	state, err := control.BuildState(
+		ctx,
+		cfg,
+		runtimeProvider,
+		underlayResolver,
+		loadWG,
+		control.BuildOptions{Offline: offline},
+	)
 	if err != nil {
-		if control.IsUnsupportedRuntime(err) && !opts.Offline {
+		if control.IsUnsupportedRuntime(err) && !offline {
 			return nil, fmt.Errorf("%w (use --offline for static validation on this platform)", err)
 		}
 		return nil, err
 	}
 	return state, nil
+}
+
+func configuredWGConfigLoader(opts Options) control.WGConfigLoader {
+	if opts.deps != nil && opts.deps.loadWGConfig != nil {
+		return opts.deps.loadWGConfig
+	}
+	return wgconfig.ParseFile
+}
+
+func configuredRuntimeProvider(opts Options) runtime.Provider {
+	if opts.deps != nil && opts.deps.runtimeProvider != nil {
+		return opts.deps.runtimeProvider
+	}
+	return runtime.NewSystemProvider()
+}
+
+func configuredUnderlayResolver(opts Options) underlay.Resolver {
+	if opts.deps != nil && opts.deps.underlayResolver != nil {
+		return opts.deps.underlayResolver
+	}
+	return underlay.NewSystemResolver()
+}
+
+func configuredGuardExecutor(opts Options) guard.Executor {
+	if opts.deps != nil && opts.deps.guardExecutor != nil {
+		return opts.deps.guardExecutor
+	}
+	return guard.NewCommandExecutor()
+}
+
+func configuredDataplaneLoader(opts Options) dataplane.Loader {
+	if opts.deps != nil && opts.deps.dataplaneLoader != nil {
+		return opts.deps.dataplaneLoader
+	}
+	return dataplane.NewLoader()
+}
+
+type wgConfigSnapshotEntry struct {
+	value *wgconfig.Interface
+	err   error
+}
+
+// snapshotWGConfigLoader keeps guard construction and runtime state
+// construction on the same immutable view of every WireGuard config file.
+func snapshotWGConfigLoader(load control.WGConfigLoader) control.WGConfigLoader {
+	var mu sync.Mutex
+	cache := make(map[string]wgConfigSnapshotEntry)
+	return func(path string) (*wgconfig.Interface, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if cached, ok := cache[path]; ok {
+			return cloneWGConfig(cached.value), cached.err
+		}
+		value, err := load(path)
+		cache[path] = wgConfigSnapshotEntry{value: cloneWGConfig(value), err: err}
+		return cloneWGConfig(value), err
+	}
+}
+
+func cloneWGConfig(value *wgconfig.Interface) *wgconfig.Interface {
+	if value == nil {
+		return nil
+	}
+	out := *value
+	if value.FwMark != nil {
+		mark := *value.FwMark
+		out.FwMark = &mark
+	}
+	if value.ListenPort != nil {
+		port := *value.ListenPort
+		out.ListenPort = &port
+	}
+	return &out
+}
+
+type runtimeSnapshotEntry struct {
+	value *runtime.Device
+	err   error
+}
+
+type runtimeSnapshotProvider struct {
+	mu       sync.Mutex
+	upstream runtime.Provider
+	cache    map[string]runtimeSnapshotEntry
+}
+
+func snapshotRuntimeProvider(upstream runtime.Provider) runtime.Provider {
+	return &runtimeSnapshotProvider{
+		upstream: upstream,
+		cache:    make(map[string]runtimeSnapshotEntry),
+	}
+}
+
+func (p *runtimeSnapshotProvider) Device(ctx context.Context, name string) (*runtime.Device, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if cached, ok := p.cache[name]; ok {
+		return cloneRuntimeDevice(cached.value), cached.err
+	}
+	value, err := p.upstream.Device(ctx, name)
+	p.cache[name] = runtimeSnapshotEntry{value: cloneRuntimeDevice(value), err: err}
+	return cloneRuntimeDevice(value), err
+}
+
+func cloneRuntimeDevice(value *runtime.Device) *runtime.Device {
+	if value == nil {
+		return nil
+	}
+	out := *value
+	out.Peers = append([]runtime.Peer(nil), value.Peers...)
+	return &out
+}
+
+func observedRuntimeFwmarks(ctx context.Context, cfg *config.Config, provider runtime.Provider) []uint32 {
+	var marks []uint32
+	for _, wg := range cfg.WireGuards {
+		if ctx.Err() != nil {
+			break
+		}
+		device, err := provider.Device(ctx, wg.Name)
+		if err == nil && device.FirewallMark != 0 {
+			marks = append(marks, device.FirewallMark)
+		}
+	}
+	return marks
 }
 
 func Validate(ctx context.Context, opts Options) (*Result, error) {
@@ -127,35 +302,74 @@ func Reload(ctx context.Context, opts Options) (*Result, error) {
 }
 
 func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
-	cfg, guardState, err := BuildGuardState(ctx, opts)
+	cfg, err := loadConfig(opts)
 	if err != nil {
 		return nil, err
 	}
+	loadWG := snapshotWGConfigLoader(configuredWGConfigLoader(opts))
+	guardState, err := buildGuardStateFromConfig(ctx, cfg, opts, loadWG)
+	if err != nil {
+		return nil, err
+	}
+	guardExecutor := configuredGuardExecutor(opts)
+	initialGuardPlan := guard.BuildNftPlan(guardState)
+	activeGuardPlan := initialGuardPlan
 	guardApplied := false
 	if !opts.DryRun && shouldApplyStartupGuard(cfg) {
-		plan := guard.BuildNftPlan(guardState)
-		if err := guard.NewCommandExecutor().Apply(ctx, plan); err != nil {
+		if err := guardExecutor.Apply(ctx, initialGuardPlan); err != nil {
 			return nil, fmt.Errorf("apply startup guard: %w", err)
 		}
 		guardApplied = true
 	}
-	_, state, err := BuildState(ctx, opts)
+
+	runtimeProvider := configuredRuntimeProvider(opts)
+	if !opts.Offline {
+		runtimeProvider = snapshotRuntimeProvider(runtimeProvider)
+	}
+	if guardApplied && !opts.Offline {
+		observedMarks := observedRuntimeFwmarks(ctx, cfg, runtimeProvider)
+		expandedPlan := guard.BuildNftPlan(guardState, observedMarks...)
+		if !sameNftPlan(activeGuardPlan, expandedPlan) {
+			if err := guardExecutor.Apply(ctx, expandedPlan); err != nil {
+				return nil, fmt.Errorf("expand startup guard for observed runtime fwmarks: %w", err)
+			}
+			activeGuardPlan = expandedPlan
+		}
+	}
+
+	state, err := buildStateFromConfigWithSources(
+		ctx,
+		cfg,
+		loadWG,
+		runtimeProvider,
+		configuredUnderlayResolver(opts),
+		opts.Offline,
+	)
 	if err != nil {
 		return nil, err
 	}
 	result := &Result{ConfigPath: configPath(opts), Time: time.Now(), Action: "reload", State: state, DryRun: opts.DryRun, AttachStatePath: attachstate.Path(opts.StateDir)}
 	if opts.DryRun {
 		if shouldApplyStartupGuard(cfg) {
-			result.GuardScript = guard.BuildNftPlan(guardState).Script()
+			result.GuardScript = guard.BuildNftPlan(state).Script()
 		}
 		return result, nil
 	}
 	result.GuardApplied = guardApplied
-	if err := dataplane.NewLoader().Apply(ctx, state); err != nil {
+	if guardApplied {
+		runtimeGuardPlan := guard.BuildNftPlan(state)
+		if !sameNftPlan(activeGuardPlan, runtimeGuardPlan) {
+			if err := guardExecutor.Apply(ctx, runtimeGuardPlan); err != nil {
+				return nil, fmt.Errorf("expand startup guard for runtime fwmarks: %w", err)
+			}
+		}
+	}
+	loader := configuredDataplaneLoader(opts)
+	if err := loader.Apply(ctx, state); err != nil {
 		return nil, err
 	}
 	if previous, err := attachstate.Load(opts.StateDir); err == nil {
-		if staleLoader, ok := dataplane.NewLoader().(dataplane.AttachStateLoader); ok {
+		if staleLoader, ok := loader.(dataplane.AttachStateLoader); ok {
 			if err := staleLoader.DetachStale(ctx, attachstate.ToControlState(previous), state); err != nil {
 				return nil, fmt.Errorf("detach stale underlays: %w", err)
 			}
@@ -167,12 +381,24 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 	if guardApplied {
-		if err := guard.NewCommandExecutor().Cleanup(ctx); err != nil {
+		if err := guardExecutor.Cleanup(ctx); err != nil {
 			return nil, fmt.Errorf("cleanup startup guard after reload: %w", err)
 		}
 		result.GuardCleaned = true
 	}
 	return result, nil
+}
+
+func sameNftPlan(left, right guard.NftPlan) bool {
+	if left.Table != right.Table || len(left.Rules) != len(right.Rules) {
+		return false
+	}
+	for i := range left.Rules {
+		if left.Rules[i] != right.Rules[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func Detach(ctx context.Context, opts Options) (*Result, error) {
@@ -201,7 +427,7 @@ func detachUnlocked(ctx context.Context, opts Options) (*Result, error) {
 	if opts.DryRun {
 		return result, nil
 	}
-	if err := dataplane.NewLoader().Detach(ctx, state); err != nil {
+	if err := configuredDataplaneLoader(opts).Detach(ctx, state); err != nil {
 		return nil, err
 	}
 	if err := attachstate.Remove(opts.StateDir); err != nil {
@@ -244,10 +470,9 @@ func stopUnlocked(ctx context.Context, opts Options) (*Result, error) {
 }
 
 func cleanupGuardForStop(ctx context.Context, opts Options) error {
-	if cfg, err := loadConfig(opts); err == nil && cfg.StartupGuard.Mode == "none" {
-		return nil
-	}
-	return guard.NewCommandExecutor().Cleanup(ctx)
+	// The guard table name is fixed and may have been left by an earlier config
+	// generation. The current config mode therefore cannot prove it is absent.
+	return configuredGuardExecutor(opts).Cleanup(ctx)
 }
 
 func detachState(ctx context.Context, opts Options) (*control.State, error) {
@@ -257,15 +482,22 @@ func detachState(ctx context.Context, opts Options) (*control.State, error) {
 	} else if !errors.Is(err, os.ErrNotExist) {
 		return nil, err
 	}
-	_, current, err := BuildState(ctx, opts)
-	if err == nil {
-		states = append(states, current)
-	} else if len(states) == 0 {
-		_, offline, offlineErr := BuildGuardState(ctx, opts)
-		if offlineErr != nil {
-			return nil, fmt.Errorf("build detach state failed: runtime=%v offline=%v", err, offlineErr)
+
+	cfg, configErr := loadConfig(opts)
+	if configErr == nil {
+		loadWG := snapshotWGConfigLoader(configuredWGConfigLoader(opts))
+		current, runtimeErr := buildStateFromConfigWithLoader(ctx, cfg, opts, loadWG, opts.Offline)
+		if runtimeErr == nil {
+			states = append(states, current)
+		} else if len(states) == 0 {
+			offline, offlineErr := buildGuardStateFromConfig(ctx, cfg, opts, loadWG)
+			if offlineErr != nil {
+				return nil, fmt.Errorf("build detach state failed: runtime=%v offline=%v", runtimeErr, offlineErr)
+			}
+			states = append(states, offline)
 		}
-		states = append(states, offline)
+	} else if len(states) == 0 {
+		return nil, fmt.Errorf("build detach state failed: runtime=%v offline=%v", configErr, configErr)
 	}
 	merged := attachstate.MergeControlStates(states...)
 	if len(merged.Underlays) == 0 {
@@ -301,7 +533,7 @@ func GuardApply(ctx context.Context, opts Options) (*Result, error) {
 	if opts.DryRun {
 		return result, nil
 	}
-	if err := guard.NewCommandExecutor().Apply(ctx, plan); err != nil {
+	if err := configuredGuardExecutor(opts).Apply(ctx, plan); err != nil {
 		return nil, err
 	}
 	result.GuardApplied = true
@@ -313,7 +545,7 @@ func GuardCleanup(ctx context.Context, opts Options) (*Result, error) {
 	if opts.DryRun {
 		return result, nil
 	}
-	if err := guard.NewCommandExecutor().Cleanup(ctx); err != nil {
+	if err := configuredGuardExecutor(opts).Cleanup(ctx); err != nil {
 		return nil, err
 	}
 	result.GuardCleaned = true

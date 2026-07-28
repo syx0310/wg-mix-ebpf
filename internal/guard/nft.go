@@ -25,13 +25,24 @@ func (p NftPlan) Script() string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
-func CleanupScript() string {
-	return "delete table inet " + TableName + "\n"
+// ReplacementScript replaces an existing guard table in one nft transaction.
+// nft applies a script passed with -f atomically, so a failure while validating
+// or creating the new rules leaves the old table in place.
+func (p NftPlan) ReplacementScript() string {
+	return cleanupScript(p.Table) + p.Script()
 }
 
-func BuildNftPlan(state *control.State) NftPlan {
+func CleanupScript() string {
+	return cleanupScript(TableName)
+}
+
+func cleanupScript(table string) string {
+	return "delete table inet " + table + "\n"
+}
+
+func BuildNftPlan(state *control.State, additionalFwmarks ...uint32) NftPlan {
 	plan := NftPlan{Table: TableName}
-	fwmarks := uniqueFwmarks(state.WireGuards)
+	fwmarks := uniqueFwmarks(state.WireGuards, additionalFwmarks)
 	for _, mark := range fwmarks {
 		plan.Rules = append(plan.Rules,
 			fmt.Sprintf("add rule inet %s output meta l4proto udp meta mark 0x%08x counter drop comment \"wg-mix-ebpf startup egress guard\"", TableName, mark),
@@ -42,18 +53,26 @@ func BuildNftPlan(state *control.State) NftPlan {
 			continue
 		}
 		plan.Rules = append(plan.Rules,
-			fmt.Sprintf("add rule inet %s input udp dport %d counter drop comment \"wg-mix-ebpf startup ingress guard %s\"", TableName, wg.ConfigListenPort, wg.Name),
+			fmt.Sprintf("add rule inet %s input udp dport %d counter drop comment \"wg-mix-ebpf startup ingress guard\"", TableName, wg.ConfigListenPort),
 		)
 	}
 	sort.Strings(plan.Rules)
 	return plan
 }
 
-func uniqueFwmarks(wgs []control.WireGuardState) []uint32 {
+func uniqueFwmarks(wgs []control.WireGuardState, additional []uint32) []uint32 {
 	set := make(map[uint32]struct{})
 	for _, wg := range wgs {
 		if wg.ConfigFwMark != 0 {
 			set[wg.ConfigFwMark] = struct{}{}
+		}
+		if wg.RuntimeFirewallMark != 0 {
+			set[wg.RuntimeFirewallMark] = struct{}{}
+		}
+	}
+	for _, mark := range additional {
+		if mark != 0 {
+			set[mark] = struct{}{}
 		}
 	}
 	out := make([]uint32, 0, len(set))
