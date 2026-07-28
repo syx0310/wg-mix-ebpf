@@ -14,7 +14,8 @@ type Executor interface {
 }
 
 type CommandExecutor struct {
-	Binary string
+	Binary    string
+	runScript func(context.Context, string) error
 }
 
 func NewCommandExecutor() CommandExecutor {
@@ -22,10 +23,15 @@ func NewCommandExecutor() CommandExecutor {
 }
 
 func (e CommandExecutor) Apply(ctx context.Context, plan NftPlan) error {
-	if err := e.Cleanup(ctx); err != nil {
-		return fmt.Errorf("cleanup existing guard before apply: %w", err)
+	if err := e.run(ctx, plan.ReplacementScript()); err != nil {
+		if !isMissingGuardTable(err) {
+			return fmt.Errorf("replace startup guard atomically: %w", err)
+		}
+		if err := e.run(ctx, plan.Script()); err != nil {
+			return fmt.Errorf("create startup guard after missing-table fallback: %w", err)
+		}
 	}
-	return e.run(ctx, plan.Script())
+	return nil
 }
 
 func (e CommandExecutor) Cleanup(ctx context.Context) error {
@@ -39,6 +45,9 @@ func (e CommandExecutor) Cleanup(ctx context.Context) error {
 }
 
 func (e CommandExecutor) run(ctx context.Context, script string) error {
+	if e.runScript != nil {
+		return e.runScript(ctx, script)
+	}
 	binary := e.Binary
 	if binary == "" {
 		binary = "nft"
@@ -64,12 +73,14 @@ func isMissingGuardTable(err error) bool {
 }
 
 type DryRunExecutor struct {
-	AppliedScript string
-	CleanupScript string
+	AppliedScript  string
+	FallbackScript string
+	CleanupScript  string
 }
 
 func (e *DryRunExecutor) Apply(_ context.Context, plan NftPlan) error {
-	e.AppliedScript = plan.Script()
+	e.AppliedScript = plan.ReplacementScript()
+	e.FallbackScript = plan.Script()
 	return nil
 }
 

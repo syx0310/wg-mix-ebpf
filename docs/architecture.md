@@ -290,9 +290,9 @@ random ListenPort ingress: best-effort only
 
 If dataplane reload fails after the guard is applied, the guard is intentionally left in place for fail-closed behavior.
 
-For nftables compatibility, guard cleanup is executed separately from guard creation. Cleanup uses `delete table` as a best-effort operation and ignores missing-table errors before applying the add-table rules. This avoids aborting startup guard creation on older nftables versions that reject `destroy table` or fail a combined script when the table does not already exist.
+Replacing an existing guard uses one nft batch containing `delete table` followed by the complete replacement table. nft commits the batch atomically; a validation or rule-creation failure therefore rolls back the delete and preserves the old guard. A missing-table error is the only condition that triggers a second, create-only batch.
 
-The startup guard is generated from config-only state before runtime WireGuard state is required. That allows egress fwmark guard rules to be installed even when the WireGuard interface has not appeared yet.
+Each reload reads the main configuration once and memoizes each parsed WireGuard configuration for both guard and runtime state construction. The startup guard is first generated from this config-only snapshot, which allows it to be installed before the WireGuard interface appears. Reload then samples every configured runtime device, atomically expands the guard to cover the union of configured and observed runtime fwmarks, and uses that same runtime snapshot for full state validation. A strict fwmark mismatch on any interface therefore leaves all marks observed during the reload guarded while reload returns an error.
 
 ## Service And Reconcile Model
 
@@ -345,6 +345,8 @@ update dataplane maps when only peer endpoint/handshake/counters change
 Service stop is routed through `wg-mix-ebpf stop`. If the daemon is running, the command asks the daemon to acquire the shared lock, stop polling/reloading, detach dataplane, remove the nft startup guard table, write stopped status, and exit. If the daemon is not running, it performs one-shot stop cleanup.
 
 Successful dataplane reload writes persistent attach metadata to `/var/lib/wg-mix-ebpf/attach-state.json`. Stop, detach, and uninstall use this file first, so cleanup does not depend on the WireGuard interface still existing. Reload also compares the previous attach state with the current desired state and detaches stale underlay ifindexes that disappeared from config or changed after reconnect.
+
+Guard cleanup targets the fixed owned table independently of the current configuration mode. This prevents a newer `startup_guard.mode: none` configuration, or a missing configuration with valid attach-state, from falsely reporting that a table left by an earlier reload was removed.
 
 `uninstall` stops the service, detaches this agent's dataplane using attach-state when available, removes BPF pins, removes the nft guard table, and removes runtime/state/service files. It keeps `/etc/wg-mix-ebpf/config.yaml` by default; `--purge` removes the config directory. It does not delete the binary or WireGuard configuration.
 

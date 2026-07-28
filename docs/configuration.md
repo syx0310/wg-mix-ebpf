@@ -547,7 +547,11 @@ none
 
 `wg-mix-ebpf stop`, service stop, and uninstall remove the nft guard table as part of network-impact cleanup. `guard-cleanup` can be used to remove a leftover guard explicitly.
 
-The nft cleanup step runs separately from rule creation. Missing guard tables are idempotent, while other failures are reported. A missing `nft` binary is tolerated only when the loaded config explicitly sets `startup_guard.mode: none`; otherwise cleanup cannot safely claim that no blocking table remains.
+When a guard table already exists, reload submits its deletion and the complete replacement table in one nft batch. nft validates and commits that batch atomically, so an invalid replacement leaves the previous guard in place. If the batch reports that the old table is absent, reload retries with a create-only script. Other replacement errors do not trigger that fallback.
+
+The first guard plan uses the configured fwmarks, before runtime state is required. Reload then samples every configured WireGuard runtime device and atomically expands the plan to the union of configured and observed runtime fwmarks before full state validation or dataplane apply. The same runtime snapshot is used for validation. If strict fwmark validation rejects a mismatch, all runtime marks observed during that reload remain guarded.
+
+Stop cleanup always attempts to delete the fixed `inet wg_mix_ebpf_guard` table, even when the current config says `startup_guard.mode: none` or the config file is unavailable but attach-state exists. A missing table is idempotent; a missing `nft` binary or any other cleanup error is reported, and cleanup is not reported as successful.
 
 `none` disables startup guard and is intended for development, controlled tests, or minimal systems without nft. In this mode, egress fail-closed behavior only starts after the TC/eBPF dataplane is attached and maps are populated.
 
