@@ -165,6 +165,9 @@ func TestReloadUsesSingleConfigSnapshotAndExpandsGuardForRuntimeMark(t *testing.
 	loader := &recordingDataplaneLoader{}
 	configLoads := 0
 	wgConfigLoads := 0
+	runtimeProvider := &countingRuntimeProvider{upstream: runtime.StaticProvider{Devices: map[string]*runtime.Device{
+		"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: runtimeMark, Up: true},
+	}}}
 	result, err := Reload(t.Context(), Options{
 		ConfigPath: cfgPath,
 		StateDir:   t.TempDir(),
@@ -177,9 +180,7 @@ func TestReloadUsesSingleConfigSnapshotAndExpandsGuardForRuntimeMark(t *testing.
 				wgConfigLoads++
 				return wgconfig.ParseFile(path)
 			},
-			runtimeProvider: runtime.StaticProvider{Devices: map[string]*runtime.Device{
-				"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: runtimeMark, Up: true},
-			}},
+			runtimeProvider: runtimeProvider,
 			underlayResolver: underlay.StaticResolver{Underlays: map[string]*underlay.Resolved{
 				"eth0": {Name: "eth0", IfName: "eth0", IfIndex: 2, LinkType: "ethernet", Role: "transform"},
 			}},
@@ -192,6 +193,9 @@ func TestReloadUsesSingleConfigSnapshotAndExpandsGuardForRuntimeMark(t *testing.
 	}
 	if configLoads != 1 || wgConfigLoads != 1 {
 		t.Fatalf("snapshot loads: main=%d wg=%d, want main=1 wg=1", configLoads, wgConfigLoads)
+	}
+	if runtimeProvider.calls["wg0"] != 1 {
+		t.Fatalf("runtime device loads = %d, want 1", runtimeProvider.calls["wg0"])
 	}
 	if len(guardExec.plans) != 2 {
 		t.Fatalf("guard apply calls = %d, want config plan plus runtime-union plan", len(guardExec.plans))
@@ -212,19 +216,27 @@ func TestReloadUsesSingleConfigSnapshotAndExpandsGuardForRuntimeMark(t *testing.
 
 func TestReloadKeepsRuntimeMarkGuardedOnStrictMismatch(t *testing.T) {
 	const (
-		configMark  = uint32(0x10000002)
-		runtimeMark = uint32(0x10000003)
+		configMark0  = uint32(0x10000002)
+		runtimeMark0 = uint32(0x10000003)
+		configMark1  = uint32(0x10000004)
+		runtimeMark1 = uint32(0x10000005)
 	)
-	cfgPath := writeReconcileConfig(t, "[Interface]\nListenPort = 31001\nFwMark = 0x10000002\n")
+	cfgPath := writeTwoWireGuardReconcileConfig(
+		t,
+		"[Interface]\nListenPort = 31001\nFwMark = 0x10000002\n",
+		"[Interface]\nListenPort = 31002\nFwMark = 0x10000004\n",
+	)
 	guardExec := &recordingGuardExecutor{}
 	loader := &recordingDataplaneLoader{}
+	runtimeProvider := &countingRuntimeProvider{upstream: runtime.StaticProvider{Devices: map[string]*runtime.Device{
+		"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: runtimeMark0, Up: true},
+		"wg1": {Name: "wg1", ListenPort: 31002, FirewallMark: runtimeMark1, Up: true},
+	}}}
 	_, err := Reload(t.Context(), Options{
 		ConfigPath: cfgPath,
 		StateDir:   t.TempDir(),
 		deps: &dependencies{
-			runtimeProvider: runtime.StaticProvider{Devices: map[string]*runtime.Device{
-				"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: runtimeMark, Up: true},
-			}},
+			runtimeProvider: runtimeProvider,
 			underlayResolver: underlay.StaticResolver{Underlays: map[string]*underlay.Resolved{
 				"eth0": {Name: "eth0", IfName: "eth0", IfIndex: 2, LinkType: "ethernet", Role: "transform"},
 			}},
@@ -239,8 +251,13 @@ func TestReloadKeepsRuntimeMarkGuardedOnStrictMismatch(t *testing.T) {
 	if len(guardExec.plans) != 2 {
 		t.Fatalf("guard apply calls = %d, want initial plus fail-closed expansion", len(guardExec.plans))
 	}
-	if !planHasMark(guardExec.plans[1], configMark) || !planHasMark(guardExec.plans[1], runtimeMark) {
-		t.Fatalf("failed reload must leave both marks guarded: %#v", guardExec.plans[1].Rules)
+	if runtimeProvider.calls["wg0"] != 1 || runtimeProvider.calls["wg1"] != 1 {
+		t.Fatalf("runtime snapshot loads = %#v, want one per WireGuard", runtimeProvider.calls)
+	}
+	for _, mark := range []uint32{configMark0, runtimeMark0, configMark1, runtimeMark1} {
+		if !planHasMark(guardExec.plans[1], mark) {
+			t.Fatalf("failed reload must leave every configured/observed mark guarded; missing=0x%08x rules=%#v", mark, guardExec.plans[1].Rules)
+		}
 	}
 	if loader.applyCalls != 0 || guardExec.cleanupCalls != 0 {
 		t.Fatalf("failed reload should not apply dataplane or clean guard: loader=%d cleanup=%d", loader.applyCalls, guardExec.cleanupCalls)
@@ -308,6 +325,19 @@ func (l *recordingDataplaneLoader) Detach(context.Context, *control.State) error
 	return nil
 }
 
+type countingRuntimeProvider struct {
+	upstream runtime.Provider
+	calls    map[string]int
+}
+
+func (p *countingRuntimeProvider) Device(ctx context.Context, name string) (*runtime.Device, error) {
+	if p.calls == nil {
+		p.calls = make(map[string]int)
+	}
+	p.calls[name]++
+	return p.upstream.Device(ctx, name)
+}
+
 func appendConfig(t *testing.T, path, extra string) {
 	t.Helper()
 	data, err := os.ReadFile(path)
@@ -318,6 +348,40 @@ func appendConfig(t *testing.T, path, extra string) {
 	if err := os.WriteFile(path, data, 0o600); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func writeTwoWireGuardReconcileConfig(t *testing.T, wg0Config, wg1Config string) string {
+	t.Helper()
+	dir := t.TempDir()
+	wg0Path := filepath.Join(dir, "wg0.conf")
+	wg1Path := filepath.Join(dir, "wg1.conf")
+	if err := os.WriteFile(wg0Path, []byte(wg0Config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(wg1Path, []byte(wg1Config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfgPath := filepath.Join(dir, "config.yaml")
+	data := fmt.Sprintf(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    config: %s
+    profile: mix-default
+  - name: wg1
+    config: %s
+    profile: mix-default
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`, wg0Path, wg1Path)
+	if err := os.WriteFile(cfgPath, []byte(data), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return cfgPath
 }
 
 func planHasMark(plan guard.NftPlan, mark uint32) bool {

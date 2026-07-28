@@ -549,7 +549,7 @@ none
 
 When a guard table already exists, reload submits its deletion and the complete replacement table in one nft batch. nft validates and commits that batch atomically, so an invalid replacement leaves the previous guard in place. If the batch reports that the old table is absent, reload retries with a create-only script. Other replacement errors do not trigger that fallback.
 
-The first guard plan uses the configured fwmarks, before runtime state is required. After runtime state is read, reload atomically expands the plan to the union of configured and runtime fwmarks before applying the dataplane. If strict fwmark validation rejects an observed mismatch, that observed runtime mark is added to the guard and the guard remains installed.
+The first guard plan uses the configured fwmarks, before runtime state is required. Reload then samples every configured WireGuard runtime device and atomically expands the plan to the union of configured and observed runtime fwmarks before full state validation or dataplane apply. The same runtime snapshot is used for validation. If strict fwmark validation rejects a mismatch, all runtime marks observed during that reload remain guarded.
 
 Stop cleanup always attempts to delete the fixed `inet wg_mix_ebpf_guard` table, even when the current config says `startup_guard.mode: none` or the config file is unavailable but attach-state exists. A missing table is idempotent; a missing `nft` binary or any other cleanup error is reported, and cleanup is not reported as successful.
 

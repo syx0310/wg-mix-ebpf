@@ -103,11 +103,29 @@ func buildGuardStateFromConfig(ctx context.Context, cfg *config.Config, opts Opt
 }
 
 func buildStateFromConfigWithLoader(ctx context.Context, cfg *config.Config, opts Options, loadWG control.WGConfigLoader, offline bool) (*control.State, error) {
+	return buildStateFromConfigWithSources(
+		ctx,
+		cfg,
+		loadWG,
+		configuredRuntimeProvider(opts),
+		configuredUnderlayResolver(opts),
+		offline,
+	)
+}
+
+func buildStateFromConfigWithSources(
+	ctx context.Context,
+	cfg *config.Config,
+	loadWG control.WGConfigLoader,
+	runtimeProvider runtime.Provider,
+	underlayResolver underlay.Resolver,
+	offline bool,
+) (*control.State, error) {
 	state, err := control.BuildState(
 		ctx,
 		cfg,
-		configuredRuntimeProvider(opts),
-		configuredUnderlayResolver(opts),
+		runtimeProvider,
+		underlayResolver,
 		loadWG,
 		control.BuildOptions{Offline: offline},
 	)
@@ -193,6 +211,58 @@ func cloneWGConfig(value *wgconfig.Interface) *wgconfig.Interface {
 	return &out
 }
 
+type runtimeSnapshotEntry struct {
+	value *runtime.Device
+	err   error
+}
+
+type runtimeSnapshotProvider struct {
+	mu       sync.Mutex
+	upstream runtime.Provider
+	cache    map[string]runtimeSnapshotEntry
+}
+
+func snapshotRuntimeProvider(upstream runtime.Provider) runtime.Provider {
+	return &runtimeSnapshotProvider{
+		upstream: upstream,
+		cache:    make(map[string]runtimeSnapshotEntry),
+	}
+}
+
+func (p *runtimeSnapshotProvider) Device(ctx context.Context, name string) (*runtime.Device, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if cached, ok := p.cache[name]; ok {
+		return cloneRuntimeDevice(cached.value), cached.err
+	}
+	value, err := p.upstream.Device(ctx, name)
+	p.cache[name] = runtimeSnapshotEntry{value: cloneRuntimeDevice(value), err: err}
+	return cloneRuntimeDevice(value), err
+}
+
+func cloneRuntimeDevice(value *runtime.Device) *runtime.Device {
+	if value == nil {
+		return nil
+	}
+	out := *value
+	out.Peers = append([]runtime.Peer(nil), value.Peers...)
+	return &out
+}
+
+func observedRuntimeFwmarks(ctx context.Context, cfg *config.Config, provider runtime.Provider) []uint32 {
+	var marks []uint32
+	for _, wg := range cfg.WireGuards {
+		if ctx.Err() != nil {
+			break
+		}
+		device, err := provider.Device(ctx, wg.Name)
+		if err == nil && device.FirewallMark != 0 {
+			marks = append(marks, device.FirewallMark)
+		}
+	}
+	return marks
+}
+
 func Validate(ctx context.Context, opts Options) (*Result, error) {
 	_, state, err := BuildState(ctx, opts)
 	if err != nil {
@@ -243,6 +313,7 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 	}
 	guardExecutor := configuredGuardExecutor(opts)
 	initialGuardPlan := guard.BuildNftPlan(guardState)
+	activeGuardPlan := initialGuardPlan
 	guardApplied := false
 	if !opts.DryRun && shouldApplyStartupGuard(cfg) {
 		if err := guardExecutor.Apply(ctx, initialGuardPlan); err != nil {
@@ -250,17 +321,31 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 		}
 		guardApplied = true
 	}
-	state, err := buildStateFromConfigWithLoader(ctx, cfg, opts, loadWG, opts.Offline)
-	if err != nil {
-		if guardApplied {
-			var mismatch *control.FwmarkMismatchError
-			if errors.As(err, &mismatch) {
-				expandedPlan := guard.BuildNftPlan(guardState, mismatch.RuntimeMark)
-				if guardErr := guardExecutor.Apply(ctx, expandedPlan); guardErr != nil {
-					return nil, errors.Join(err, fmt.Errorf("expand startup guard for runtime fwmark: %w", guardErr))
-				}
+
+	runtimeProvider := configuredRuntimeProvider(opts)
+	if !opts.Offline {
+		runtimeProvider = snapshotRuntimeProvider(runtimeProvider)
+	}
+	if guardApplied && !opts.Offline {
+		observedMarks := observedRuntimeFwmarks(ctx, cfg, runtimeProvider)
+		expandedPlan := guard.BuildNftPlan(guardState, observedMarks...)
+		if !sameNftPlan(activeGuardPlan, expandedPlan) {
+			if err := guardExecutor.Apply(ctx, expandedPlan); err != nil {
+				return nil, fmt.Errorf("expand startup guard for observed runtime fwmarks: %w", err)
 			}
+			activeGuardPlan = expandedPlan
 		}
+	}
+
+	state, err := buildStateFromConfigWithSources(
+		ctx,
+		cfg,
+		loadWG,
+		runtimeProvider,
+		configuredUnderlayResolver(opts),
+		opts.Offline,
+	)
+	if err != nil {
 		return nil, err
 	}
 	result := &Result{ConfigPath: configPath(opts), Time: time.Now(), Action: "reload", State: state, DryRun: opts.DryRun, AttachStatePath: attachstate.Path(opts.StateDir)}
@@ -273,7 +358,7 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 	result.GuardApplied = guardApplied
 	if guardApplied {
 		runtimeGuardPlan := guard.BuildNftPlan(state)
-		if !sameNftPlan(initialGuardPlan, runtimeGuardPlan) {
+		if !sameNftPlan(activeGuardPlan, runtimeGuardPlan) {
 			if err := guardExecutor.Apply(ctx, runtimeGuardPlan); err != nil {
 				return nil, fmt.Errorf("expand startup guard for runtime fwmarks: %w", err)
 			}
