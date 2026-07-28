@@ -140,10 +140,10 @@ TC clsact / sched_cls support
 bpffs mounted at /sys/fs/bpf
 wg command for runtime WireGuard state
 tc command for attach/status inspection
-nft command when startup_guard.mode is nft-temporary-drop
+nft command for startup-guard application and fixed-table cleanup
 ```
 
-If `startup_guard.mode: none` is used, missing `nft` is tolerated for stop/uninstall guard cleanup because there is no guard table to remove.
+`startup_guard.mode: none` disables guard application, but stop/uninstall still use `nft` to check and remove the fixed owned table in case an earlier configuration left it behind.
 
 ## OpenWrt
 
