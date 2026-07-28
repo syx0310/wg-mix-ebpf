@@ -194,13 +194,14 @@ UDP XOR cipher:
   chunked skb load/store of managed WireGuard UDP payload
   IPv4 egress uses the offload-friendly recompute checksum path
   IPv6 egress updates UDP checksum from chunk diffs before writing payload bytes
-  ingress accumulates chunk checksum diffs and updates UDP checksum once
+  ingress accumulates chunk checksum diffs and updates UDP checksum once per
+  tail-call segment
 ```
 
 For payload-only UDP checksum updates, the L4 checksum helper is used in diff
-mode with no additional L4 checksum flags. Passing `BPF_F_IPV6` in this
-payload-only diff path caused TC egress helper failures in the IPv6 netns
-regression.
+mode with `BPF_F_MARK_MANGLED_0`, preserving an enabled UDP checksum when the
+updated value is zero. Passing `BPF_F_IPV6` in this payload-only diff path
+caused TC egress helper failures in the IPv6 netns regression.
 
 XOR cost scales with `max_bytes`. `wg-payload-prefix` with a small bounded prefix
 is the preferred performance mode; `wg-payload-full` is available for stronger
@@ -227,6 +228,8 @@ xor_bad_type_after_decrypt
 xor_load_error
 xor_store_error
 xor_csum_error
+xor_egress_dispatch_error
+xor_ingress_dispatch_error
 egress_gso_seen
 egress_gso_managed_seen
 egress_gso_rewrite_ok
@@ -253,7 +256,13 @@ profile_map
   Generation-scoped type_word mappings.
 
 cipher_map
-  Generation-scoped XOR cipher keys and limits. Raw key bytes are not emitted in status or `dump-abi` JSON.
+  Generation-scoped XOR cipher keys and limits. ABI version 10 repeats shorter key periods across the fixed 256-byte key storage so the dataplane can use one verifier-bounded index. Raw key bytes are not emitted in status or `dump-abi` JSON.
+
+xor_egress_programs / xor_ingress_programs
+  Pinned ProgramArray maps for the verifier-safe 8 x 256-byte XOR tail-call
+  chain. Each map has two generation-parity banks. Reload populates the next
+  bank before committing the generation; a missing segment fails closed and
+  increments the matching dispatch-error counter.
 
 egress_rule_map
   Generation-scoped egress match rules.

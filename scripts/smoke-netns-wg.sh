@@ -12,6 +12,11 @@ OUTER_FAMILY="${OUTER_FAMILY:-ipv4}"
 XOR_PASSWORD="${XOR_PASSWORD:-}"
 XOR_SCOPE="${XOR_SCOPE:-wg-payload-full}"
 XOR_MAX_BYTES="${XOR_MAX_BYTES:-2048}"
+XOR_GENERATION_CHECKS="${XOR_GENERATION_CHECKS:-off}"
+XOR_DISPATCH_FAILURE_CHECKS="${XOR_DISPATCH_FAILURE_CHECKS:-off}"
+UDP_ZERO_CHECKSUM_CHECKS="${UDP_ZERO_CHECKSUM_CHECKS:-off}"
+UNDERLAY_MTU="${UNDERLAY_MTU:-2200}"
+WG_MTU="${WG_MTU:-2000}"
 
 if [[ "${OUTER_FAMILY}" != "ipv4" && "${OUTER_FAMILY}" != "ipv6" ]]; then
   echo "error: OUTER_FAMILY must be ipv4 or ipv6" >&2
@@ -26,6 +31,29 @@ if [[ ! "${XOR_MAX_BYTES}" =~ ^[0-9]+$ ]] ||
   echo "error: XOR_MAX_BYTES must be a multiple of 4 in [4, 2048]" >&2
   exit 1
 fi
+for check_mode in "${XOR_GENERATION_CHECKS}" "${XOR_DISPATCH_FAILURE_CHECKS}" \
+  "${UDP_ZERO_CHECKSUM_CHECKS}"; do
+  if [[ "${check_mode}" != "off" && "${check_mode}" != "enforce" ]]; then
+    echo "error: generation/dispatch/UDP zero-checksum checks must be off or enforce" >&2
+    exit 1
+  fi
+done
+if [[ "${XOR_DISPATCH_FAILURE_CHECKS}" == "enforce" &&
+  ( -z "${XOR_PASSWORD}" || "${XOR_SCOPE}" != "wg-payload-full" || XOR_MAX_BYTES -lt 2048 ) ]]; then
+  echo "error: dispatch failure checks require full-payload XOR with max_bytes=2048" >&2
+  exit 1
+fi
+if [[ "${UDP_ZERO_CHECKSUM_CHECKS}" == "enforce" ]]; then
+  if [[ "${OUTER_FAMILY}" != "ipv6" ]]; then
+    echo "error: UDP zero-checksum checks require an IPv6 underlay" >&2
+    exit 1
+  fi
+  if [[ -n "${XOR_PASSWORD}" &&
+    ( "${XOR_SCOPE}" != "wg-payload-full" || XOR_MAX_BYTES -lt 1968 ) ]]; then
+    echo "error: XOR UDP zero-checksum checks require full-payload XOR with max_bytes>=1968" >&2
+    exit 1
+  fi
+fi
 
 for cmd in ip wg ping tcpdump python3 timeout grep; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
@@ -33,6 +61,10 @@ for cmd in ip wg ping tcpdump python3 timeout grep; do
     exit 1
   fi
 done
+if [[ -n "${XOR_PASSWORD}" ]] && ! command -v bpftool >/dev/null 2>&1; then
+  echo "error: missing command: bpftool" >&2
+  exit 1
+fi
 
 if [[ ! -x "${BIN}" ]]; then
   echo "error: missing binary: ${BIN}" >&2
@@ -56,6 +88,7 @@ PIN_ROOT="${PIN_ROOT:-/sys/fs/bpf}"
 PIN_BASE="${PIN_ROOT}/wg-mix-ebpf-smoke-${RUN_ID}"
 PINA="${PIN_BASE}/wg-mix-ebpf-${NSA}"
 PINB="${PIN_BASE}/wg-mix-ebpf-${NSB}"
+UDP_ZERO_CHECKSUM_RECEIVER_PID=""
 umask 077
 
 run_agent_in_netns() {
@@ -86,6 +119,10 @@ cleanup() {
   set +e
   local keep_tmp=0
   [[ "${KEEP_TMP_ON_FAIL:-0}" == "1" && "${status}" -ne 0 ]] && keep_tmp=1
+  if [[ -n "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" ]]; then
+    kill "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" >/dev/null 2>&1
+    wait "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" >/dev/null 2>&1
+  fi
   if ip netns list | awk '{print $1}' | grep -qx "${NSA}"; then
     run_agent_in_netns "${NSA}" "${PINA}" detach --config "${TMPDIR}/agent-a.yaml" >/dev/null 2>&1
   fi
@@ -188,6 +225,297 @@ wait_ping() {
   return 1
 }
 
+large_ping() {
+  local ns="$1"
+  local target="$2"
+
+  ip netns exec "${ns}" ping -c 2 -W 2 -M do -s 1900 "${target}" >/dev/null
+}
+
+exercise_tunnel() {
+  wait_ping "${NSA}" 10.77.0.2
+  wait_ping "${NSB}" 10.77.0.1
+  if [[ -n "${XOR_PASSWORD}" && "${XOR_SCOPE}" == "wg-payload-full" &&
+    "${XOR_MAX_BYTES}" -ge 2048 ]]; then
+    large_ping "${NSA}" 10.77.0.2
+    large_ping "${NSB}" 10.77.0.1
+  fi
+}
+
+active_generation() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+dataplane = doc.get("dataplane") or doc.get("kernel") or doc
+print(int(dataplane.get("active_generation", 0)))
+PY
+}
+
+stat_value() {
+  python3 - "$1" "$2" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as fh:
+    doc = json.load(fh)
+stats = (
+    doc.get("dataplane", {}).get("stats")
+    or doc.get("kernel", {}).get("stats")
+    or doc.get("stats")
+    or {}
+)
+print(int(stats.get(sys.argv[2], 0)))
+PY
+}
+
+assert_stat_increased() {
+  local before_path="$1"
+  local after_path="$2"
+  local stat="$3"
+  local before
+  local after
+
+  before="$(stat_value "${before_path}" "${stat}")"
+  after="$(stat_value "${after_path}" "${stat}")"
+  if ((after <= before)); then
+    echo "error: ${stat} did not increase (${before} -> ${after})" >&2
+    return 1
+  fi
+}
+
+assert_stat_unchanged() {
+  local before_path="$1"
+  local after_path="$2"
+  local stat="$3"
+  local before
+  local after
+
+  before="$(stat_value "${before_path}" "${stat}")"
+  after="$(stat_value "${after_path}" "${stat}")"
+  if ((after != before)); then
+    echo "error: ${stat} changed (${before} -> ${after})" >&2
+    return 1
+  fi
+}
+
+exercise_udp_zero_checksum() {
+  local ready_path="${TMPDIR}/udp-zero-checksum.ready"
+  local receiver_log="${TMPDIR}/udp-zero-checksum-receiver.log"
+  local attempt
+  local gateway_mac
+  local receiver_status=0
+
+  run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" \
+    >"${TMPDIR}/status-a-zero-before.json"
+  run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" \
+    >"${TMPDIR}/status-b-zero-before.json"
+
+  # Free the configured WireGuard ports while retaining the already-loaded rules.
+  ip netns exec "${NSA}" wg set wg0 listen-port 0
+  ip netns exec "${NSB}" wg set wg0 listen-port 0
+
+  gateway_mac="$(ip netns exec "${NSR}" cat /sys/class/net/ra0/address)"
+  if [[ -z "${gateway_mac}" ]]; then
+    echo "error: could not resolve IPv6 gateway MAC for UDP zero-checksum check" >&2
+    return 1
+  fi
+
+  timeout -s TERM 10 ip netns exec "${NSB}" python3 - \
+    "${A_UNDER}" "${B_UNDER}" "${ready_path}" >"${TMPDIR}/udp-zero-checksum-receiver.out" \
+    2>"${receiver_log}" <<'PY' &
+import socket
+import struct
+import sys
+import time
+
+source, destination, ready_path = sys.argv[1:]
+source_port = 31001
+destination_port = 31002
+payload = bytearray(1968)
+payload[:4] = b"\x04\x00\x00\x00"
+payload[-2:] = struct.pack("!H", 0x9DD3)
+
+sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM)
+sock.bind((destination, destination_port))
+with open(ready_path, "x", encoding="ascii"):
+    pass
+deadline = time.monotonic() + 6
+while True:
+    sock.settimeout(max(0.01, deadline - time.monotonic()))
+    data, peer = sock.recvfrom(4096)
+    if peer[0] == source and peer[1] == source_port and data == payload:
+        break
+    if time.monotonic() >= deadline:
+        raise SystemExit(
+            f"did not receive expected vector; last peer={peer[:2]} length={len(data)}"
+        )
+PY
+  UDP_ZERO_CHECKSUM_RECEIVER_PID=$!
+
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    if [[ -e "${ready_path}" ]]; then
+      break
+    fi
+    if ! kill -0 "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" >/dev/null 2>&1; then
+      break
+    fi
+    sleep 0.1
+  done
+  if [[ ! -e "${ready_path}" ]]; then
+    echo "error: UDP zero-checksum receiver did not become ready" >&2
+    wait "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" || true
+    UDP_ZERO_CHECKSUM_RECEIVER_PID=""
+    cat "${receiver_log}" >&2
+    return 1
+  fi
+
+  timeout -s TERM 5 ip netns exec "${NSA}" python3 - \
+    "${A_UNDER}" "${B_UNDER}" "${gateway_mac}" <<'PY'
+import ipaddress
+import socket
+import struct
+import sys
+
+source, destination, gateway_mac = sys.argv[1:]
+source_port = 31001
+destination_port = 31002
+payload = bytearray(1968)
+payload[:4] = b"\x04\x00\x00\x00"
+payload[-2:] = struct.pack("!H", 0x9DD3)
+udp_length = 8 + len(payload)
+udp = struct.pack("!HHHH", source_port, destination_port, udp_length, 0)
+pseudoheader = (
+    ipaddress.IPv6Address(source).packed
+    + ipaddress.IPv6Address(destination).packed
+    + struct.pack("!I3xB", udp_length, socket.IPPROTO_UDP)
+)
+checksum_input = pseudoheader + udp + payload
+words = struct.unpack(f"!{len(checksum_input) // 2}H", checksum_input)
+folded_sum = sum(words)
+while folded_sum >> 16:
+    folded_sum = (folded_sum & 0xFFFF) + (folded_sum >> 16)
+assert folded_sum == 0xFFFF, f"folded checksum sum={folded_sum:#06x}"
+# RFC 8200 requires the computed zero checksum to be encoded as 0xffff.
+computed_checksum = (~folded_sum) & 0xFFFF
+wire_checksum = computed_checksum or 0xFFFF
+assert wire_checksum == 0xFFFF
+
+sock = socket.socket(socket.AF_PACKET, socket.SOCK_RAW, socket.htons(0x86DD))
+sock.setsockopt(socket.SOL_SOCKET, getattr(socket, "SO_MARK", 36), 0x10000001)
+sock.bind(("under0", 0))
+source_mac = sock.getsockname()[4]
+destination_mac = bytes.fromhex(gateway_mac.replace(":", ""))
+ethernet = destination_mac + source_mac + struct.pack("!H", 0x86DD)
+ipv6 = struct.pack(
+    "!IHBB16s16s",
+    6 << 28,
+    udp_length,
+    socket.IPPROTO_UDP,
+    64,
+    ipaddress.IPv6Address(source).packed,
+    ipaddress.IPv6Address(destination).packed,
+)
+udp = struct.pack(
+    "!HHHH", source_port, destination_port, udp_length, wire_checksum
+)
+frame = ethernet + ipv6 + udp + payload
+sent = sock.send(frame)
+assert sent == len(frame), f"short Ethernet send: {sent}/{len(frame)}"
+PY
+
+  if wait "${UDP_ZERO_CHECKSUM_RECEIVER_PID}"; then
+    receiver_status=0
+  else
+    receiver_status=$?
+  fi
+  UDP_ZERO_CHECKSUM_RECEIVER_PID=""
+  if ((receiver_status != 0)); then
+    echo "error: UDP zero-checksum receiver failed (${receiver_status})" >&2
+    cat "${receiver_log}" >&2
+    return "${receiver_status}"
+  fi
+
+  ip netns exec "${NSA}" wg set wg0 listen-port 31001
+  ip netns exec "${NSB}" wg set wg0 listen-port 31002
+
+  run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" \
+    >"${TMPDIR}/status-a-zero-after.json"
+  run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" \
+    >"${TMPDIR}/status-b-zero-after.json"
+  assert_stat_increased "${TMPDIR}/status-a-zero-before.json" \
+    "${TMPDIR}/status-a-zero-after.json" egress_rewrite_ok
+  assert_stat_increased "${TMPDIR}/status-b-zero-before.json" \
+    "${TMPDIR}/status-b-zero-after.json" ingress_rewrite_ok
+  if [[ -n "${XOR_PASSWORD}" ]]; then
+    assert_stat_increased "${TMPDIR}/status-a-zero-before.json" \
+      "${TMPDIR}/status-a-zero-after.json" xor_egress_ok
+    assert_stat_increased "${TMPDIR}/status-b-zero-before.json" \
+      "${TMPDIR}/status-b-zero-after.json" xor_ingress_ok
+  fi
+  for stat in checksum_error xor_csum_error ingress_bad_checksum; do
+    assert_stat_unchanged "${TMPDIR}/status-a-zero-before.json" \
+      "${TMPDIR}/status-a-zero-after.json" "${stat}"
+    assert_stat_unchanged "${TMPDIR}/status-b-zero-before.json" \
+      "${TMPDIR}/status-b-zero-after.json" "${stat}"
+  done
+}
+
+assert_generation() {
+  local path="$1"
+  local expected="$2"
+  local actual
+
+  actual="$(active_generation "${path}")"
+  if [[ "${actual}" -ne "${expected}" ]]; then
+    echo "error: ${path} active generation=${actual}, want ${expected}" >&2
+    return 1
+  fi
+}
+
+tail_slot_key() {
+  local index="$1"
+
+  printf '%02x 00 00 00' "${index}"
+}
+
+assert_tail_bank() {
+  local pin="$1"
+  local status_path="$2"
+  local generation
+  local bank_start
+  local map
+  local segment
+  local index
+  local key
+
+  generation="$(active_generation "${status_path}")"
+  bank_start=$(((generation & 1) * 8))
+  for map in xor_egress_programs xor_ingress_programs; do
+    for segment in 0 1 2 3 4 5 6 7; do
+      index=$((bank_start + segment))
+      key="$(tail_slot_key "${index}")"
+      # shellcheck disable=SC2086
+      bpftool map lookup pinned "${pin}/${map}" key hex ${key} >/dev/null
+    done
+  done
+}
+
+delete_tail_slot() {
+  local pin="$1"
+  local map="$2"
+  local generation="$3"
+  local segment="$4"
+  local index=$((((generation & 1) * 8) + segment))
+  local key
+
+  key="$(tail_slot_key "${index}")"
+  # shellcheck disable=SC2086
+  bpftool map delete pinned "${pin}/${map}" key hex ${key}
+}
+
 ip netns add "${NSA}"
 ip netns add "${NSR}"
 ip netns add "${NSB}"
@@ -206,6 +534,10 @@ ip -n "${NSA}" link set "${VETH_A}" name under0
 ip -n "${NSB}" link set "${VETH_B}" name under0
 ip -n "${NSR}" link set "${VETH_RA}" name ra0
 ip -n "${NSR}" link set "${VETH_RB}" name rb0
+ip -n "${NSA}" link set under0 mtu "${UNDERLAY_MTU}"
+ip -n "${NSB}" link set under0 mtu "${UNDERLAY_MTU}"
+ip -n "${NSR}" link set ra0 mtu "${UNDERLAY_MTU}"
+ip -n "${NSR}" link set rb0 mtu "${UNDERLAY_MTU}"
 
 if [[ "${OUTER_FAMILY}" == "ipv4" ]]; then
   A_UNDER="192.0.2.1"
@@ -256,6 +588,8 @@ B_PUB="$(cat "${TMPDIR}/b.pub")"
 
 ip -n "${NSA}" link add wg0 type wireguard
 ip -n "${NSB}" link add wg0 type wireguard
+ip -n "${NSA}" link set wg0 mtu "${WG_MTU}"
+ip -n "${NSB}" link set wg0 mtu "${WG_MTU}"
 ip netns exec "${NSA}" wg set wg0 private-key "${TMPDIR}/a.key" listen-port 31001 fwmark 0x10000001 peer "${B_PUB}" allowed-ips 10.77.0.2/32 endpoint "${B_ENDPOINT}"
 ip netns exec "${NSB}" wg set wg0 private-key "${TMPDIR}/b.key" listen-port 31002 fwmark 0x10000002 peer "${A_PUB}" allowed-ips 10.77.0.1/32 endpoint "${A_ENDPOINT}"
 ip -n "${NSA}" addr add 10.77.0.1/24 dev wg0
@@ -274,15 +608,34 @@ run_agent_in_netns "${NSA}" "${PINA}" reload --config "${TMPDIR}/agent-a.yaml"
 run_agent_in_netns "${NSB}" "${PINB}" reload --config "${TMPDIR}/agent-b.yaml"
 run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" >"${TMPDIR}/status-a-before.json"
 run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" >"${TMPDIR}/status-b-before.json"
+assert_generation "${TMPDIR}/status-a-before.json" 1
+assert_generation "${TMPDIR}/status-b-before.json" 1
+if [[ -n "${XOR_PASSWORD}" ]]; then
+  assert_tail_bank "${PINA}" "${TMPDIR}/status-a-before.json"
+  assert_tail_bank "${PINB}" "${TMPDIR}/status-b-before.json"
+fi
 
-timeout -s INT 12 ip netns exec "${NSR}" tcpdump -i ra0 -w "${TMPDIR}/ra.pcap" udp >/dev/null 2>"${TMPDIR}/tcpdump-ra.log" &
+timeout -s INT 30 ip netns exec "${NSR}" tcpdump -i ra0 -w "${TMPDIR}/ra.pcap" udp >/dev/null 2>"${TMPDIR}/tcpdump-ra.log" &
 TCPDUMP_RA=$!
-timeout -s INT 12 ip netns exec "${NSR}" tcpdump -i rb0 -w "${TMPDIR}/rb.pcap" udp >/dev/null 2>"${TMPDIR}/tcpdump-rb.log" &
+timeout -s INT 30 ip netns exec "${NSR}" tcpdump -i rb0 -w "${TMPDIR}/rb.pcap" udp >/dev/null 2>"${TMPDIR}/tcpdump-rb.log" &
 TCPDUMP_RB=$!
 sleep 1
 
-wait_ping "${NSA}" 10.77.0.2
-wait_ping "${NSB}" 10.77.0.1
+exercise_tunnel
+
+if [[ -n "${XOR_PASSWORD}" && "${XOR_GENERATION_CHECKS}" == "enforce" ]]; then
+  for expected_generation in 2 3; do
+    run_agent_in_netns "${NSA}" "${PINA}" reload --config "${TMPDIR}/agent-a.yaml"
+    run_agent_in_netns "${NSB}" "${PINB}" reload --config "${TMPDIR}/agent-b.yaml"
+    run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" >"${TMPDIR}/status-a-gen${expected_generation}.json"
+    run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" >"${TMPDIR}/status-b-gen${expected_generation}.json"
+    assert_generation "${TMPDIR}/status-a-gen${expected_generation}.json" "${expected_generation}"
+    assert_generation "${TMPDIR}/status-b-gen${expected_generation}.json" "${expected_generation}"
+    assert_tail_bank "${PINA}" "${TMPDIR}/status-a-gen${expected_generation}.json"
+    assert_tail_bank "${PINB}" "${TMPDIR}/status-b-gen${expected_generation}.json"
+    exercise_tunnel
+  done
+fi
 
 wait "${TCPDUMP_RA}" || true
 wait "${TCPDUMP_RB}" || true
@@ -299,6 +652,10 @@ else
     --forbid-standard \
     --require-mixed initiation,response,transport \
     "${TMPDIR}/ra.pcap" "${TMPDIR}/rb.pcap"
+fi
+
+if [[ "${UDP_ZERO_CHECKSUM_CHECKS}" == "enforce" ]]; then
+  exercise_udp_zero_checksum
 fi
 
 run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" >"${TMPDIR}/status-a-after.json"
@@ -319,6 +676,8 @@ required_zero = (
     "xor_load_error",
     "xor_store_error",
     "xor_csum_error",
+    "xor_egress_dispatch_error",
+    "xor_ingress_dispatch_error",
     "ingress_bad_checksum",
     "egress_bad_checksum",
 )
@@ -344,6 +703,47 @@ for path in sys.argv[1:]:
         if int(stats.get(key, 0)) <= 0:
             raise SystemExit(f"{path}: {key}={stats.get(key)}")
 PY
+
+if [[ "${XOR_DISPATCH_FAILURE_CHECKS}" == "enforce" ]]; then
+  status_a="${TMPDIR}/status-a-after.json"
+  status_b="${TMPDIR}/status-b-after.json"
+  generation_a="$(active_generation "${status_a}")"
+  generation_b="$(active_generation "${status_b}")"
+  egress_before="$(stat_value "${status_a}" xor_egress_dispatch_error)"
+  ingress_before="$(stat_value "${status_b}" xor_ingress_dispatch_error)"
+
+  delete_tail_slot "${PINA}" xor_egress_programs "${generation_a}" 7
+  if large_ping "${NSA}" 10.77.0.2; then
+    echo "error: large XOR packet passed with missing egress segment 7" >&2
+    exit 1
+  fi
+  run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" >"${TMPDIR}/status-a-egress-miss.json"
+  egress_after="$(stat_value "${TMPDIR}/status-a-egress-miss.json" xor_egress_dispatch_error)"
+  if ((egress_after <= egress_before)); then
+    echo "error: egress dispatch counter did not increase (${egress_before} -> ${egress_after})" >&2
+    exit 1
+  fi
+  run_agent_in_netns "${NSA}" "${PINA}" reload --config "${TMPDIR}/agent-a.yaml"
+  run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" >"${TMPDIR}/status-a-repaired.json"
+  assert_tail_bank "${PINA}" "${TMPDIR}/status-a-repaired.json"
+  large_ping "${NSA}" 10.77.0.2
+
+  delete_tail_slot "${PINB}" xor_ingress_programs "${generation_b}" 7
+  if large_ping "${NSA}" 10.77.0.2; then
+    echo "error: large XOR packet passed with missing ingress segment 7" >&2
+    exit 1
+  fi
+  run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" >"${TMPDIR}/status-b-ingress-miss.json"
+  ingress_after="$(stat_value "${TMPDIR}/status-b-ingress-miss.json" xor_ingress_dispatch_error)"
+  if ((ingress_after <= ingress_before)); then
+    echo "error: ingress dispatch counter did not increase (${ingress_before} -> ${ingress_after})" >&2
+    exit 1
+  fi
+  run_agent_in_netns "${NSB}" "${PINB}" reload --config "${TMPDIR}/agent-b.yaml"
+  run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" >"${TMPDIR}/status-b-repaired.json"
+  assert_tail_bank "${PINB}" "${TMPDIR}/status-b-repaired.json"
+  large_ping "${NSA}" 10.77.0.2
+fi
 
 if [[ -n "${XOR_PASSWORD}" ]]; then
   echo "netns WireGuard + eBPF ${OUTER_FAMILY} xor smoke passed (${XOR_SCOPE}, max_bytes=${XOR_MAX_BYTES})"

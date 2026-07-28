@@ -463,6 +463,12 @@ func compileCiphers(ciphers map[string]config.Cipher) (map[string]CipherState, e
 
 func deriveCipherKey(name string, cipher config.Cipher) ([256]byte, error) {
 	var out [256]byte
+	switch cipher.KeyLen {
+	case 16, 32, 64, 256:
+	default:
+		return out, fmt.Errorf("derive cipher %q: unsupported key_len %d", name,
+			cipher.KeyLen)
+	}
 	secret, err := cipherSecretBytes(cipher)
 	if err != nil {
 		return out, fmt.Errorf("derive cipher %q: %w", name, err)
@@ -480,6 +486,9 @@ func deriveCipherKey(name string, cipher config.Cipher) ([256]byte, error) {
 		}
 	default:
 		return out, fmt.Errorf("unsupported key_derivation %q", cipher.KeyDerivation)
+	}
+	for i := cipher.KeyLen; i < uint32(len(out)); i++ {
+		out[i] = out[i%cipher.KeyLen]
 	}
 	return out, nil
 }

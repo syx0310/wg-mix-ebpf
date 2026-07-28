@@ -24,7 +24,40 @@ const (
 	filterPriority    = 49152
 	ingressHandle     = 0x10001
 	egressHandle      = 0x10002
+	xorSegmentCount   = 8
 )
+
+var xorTailCallBindings = []struct {
+	mapName      string
+	programNames [xorSegmentCount]string
+}{
+	{
+		mapName: "xor_egress_programs",
+		programNames: [xorSegmentCount]string{
+			"wg_xor_eg_0",
+			"wg_xor_eg_1",
+			"wg_xor_eg_2",
+			"wg_xor_eg_3",
+			"wg_xor_eg_4",
+			"wg_xor_eg_5",
+			"wg_xor_eg_6",
+			"wg_xor_eg_7",
+		},
+	},
+	{
+		mapName: "xor_ingress_programs",
+		programNames: [xorSegmentCount]string{
+			"wg_xor_in_0",
+			"wg_xor_in_1",
+			"wg_xor_in_2",
+			"wg_xor_in_3",
+			"wg_xor_in_4",
+			"wg_xor_in_5",
+			"wg_xor_in_6",
+			"wg_xor_in_7",
+		},
+	},
+}
 
 type LinuxLoader struct {
 	ObjectPath string
@@ -53,8 +86,8 @@ func LoadObjectTest(ctx context.Context, objectPath string) error {
 	if err != nil {
 		return fmt.Errorf("create BPF collection from %s: %w", source, err)
 	}
-	coll.Close()
-	return nil
+	defer coll.Close()
+	return populateXORTailCalls(coll, 0)
 }
 
 func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
@@ -100,6 +133,9 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
 		return err
 	}
 	if err := populateDataMaps(coll, snapshot); err != nil {
+		return err
+	}
+	if err := populateXORTailCalls(coll, next); err != nil {
 		return err
 	}
 	ingress := coll.Programs[ingressFilterName]
@@ -222,7 +258,36 @@ func pinnedMapNames() []string {
 		"ingress_listener_map",
 		"icmp_listener_map",
 		"stats_map",
+		"xor_egress_programs",
+		"xor_ingress_programs",
 	}
+}
+
+func populateXORTailCalls(coll *ebpf.Collection, generation uint64) error {
+	bankStart := xorTailCallBankStart(generation)
+	for _, binding := range xorTailCallBindings {
+		m := coll.Maps[binding.mapName]
+		if m == nil {
+			return fmt.Errorf("BPF object missing map %q", binding.mapName)
+		}
+		for segment, programName := range binding.programNames {
+			program := coll.Programs[programName]
+			if program == nil {
+				return fmt.Errorf("BPF object missing program %q", programName)
+			}
+			index := bankStart + uint32(segment)
+			fd := uint32(program.FD())
+			if err := m.Update(index, fd, ebpf.UpdateAny); err != nil {
+				return fmt.Errorf("populate %s[%d] with %s: %w",
+					binding.mapName, index, programName, err)
+			}
+		}
+	}
+	return nil
+}
+
+func xorTailCallBankStart(generation uint64) uint32 {
+	return uint32(generation&1) * xorSegmentCount
 }
 
 func activeGeneration(coll *ebpf.Collection) (uint64, error) {

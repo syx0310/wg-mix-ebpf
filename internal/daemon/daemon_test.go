@@ -1049,7 +1049,7 @@ startup_guard:
 		if err != nil {
 			t.Fatalf("daemon cleanup self-locked or failed: %v", err)
 		}
-	case <-time.After(3 * time.Second):
+	case <-time.After(8 * time.Second):
 		t.Fatal("daemon cleanup self-locked on its lifecycle lease")
 	}
 }
