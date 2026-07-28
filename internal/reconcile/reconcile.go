@@ -20,11 +20,12 @@ import (
 )
 
 type Options struct {
-	ConfigPath string
-	RunDir     string
-	StateDir   string
-	Offline    bool
-	DryRun     bool
+	ConfigPath     string
+	RunDir         string
+	StateDir       string
+	Offline        bool
+	DryRun         bool
+	LifecycleLease *lockfile.LifecycleLease
 
 	deps *dependencies
 }
@@ -289,16 +290,16 @@ func Reload(ctx context.Context, opts Options) (*Result, error) {
 	if opts.Offline && !opts.DryRun {
 		return nil, errors.New("offline reload requires --dry-run; refusing to apply an empty runtime-derived dataplane")
 	}
-	if opts.RunDir != "" && !opts.DryRun {
-		var result *Result
-		err := lockfile.WithLock(ctx, opts.RunDir, func() error {
-			var err error
-			result, err = reloadUnlocked(ctx, opts)
-			return err
-		})
-		return result, err
+	if opts.DryRun {
+		return reloadUnlocked(ctx, opts)
 	}
-	return reloadUnlocked(ctx, opts)
+	var result *Result
+	err := withMutationOwnership(ctx, opts, "reload", func() error {
+		var err error
+		result, err = reloadUnlocked(ctx, opts)
+		return err
+	})
+	return result, err
 }
 
 func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
@@ -402,16 +403,16 @@ func sameNftPlan(left, right guard.NftPlan) bool {
 }
 
 func Detach(ctx context.Context, opts Options) (*Result, error) {
-	if opts.RunDir != "" && !opts.DryRun {
-		var result *Result
-		err := lockfile.WithLock(ctx, opts.RunDir, func() error {
-			var err error
-			result, err = detachUnlocked(ctx, opts)
-			return err
-		})
-		return result, err
+	if opts.DryRun {
+		return detachUnlocked(ctx, opts)
 	}
-	return detachUnlocked(ctx, opts)
+	var result *Result
+	err := withMutationOwnership(ctx, opts, "detach", func() error {
+		var err error
+		result, err = detachUnlocked(ctx, opts)
+		return err
+	})
+	return result, err
 }
 
 func detachUnlocked(ctx context.Context, opts Options) (*Result, error) {
@@ -437,16 +438,16 @@ func detachUnlocked(ctx context.Context, opts Options) (*Result, error) {
 }
 
 func Stop(ctx context.Context, opts Options) (*Result, error) {
-	if opts.RunDir != "" && !opts.DryRun {
-		var result *Result
-		err := lockfile.WithLock(ctx, opts.RunDir, func() error {
-			var err error
-			result, err = stopUnlocked(ctx, opts)
-			return err
-		})
-		return result, err
+	if opts.DryRun {
+		return stopUnlocked(ctx, opts)
 	}
-	return stopUnlocked(ctx, opts)
+	var result *Result
+	err := withMutationOwnership(ctx, opts, "stop", func() error {
+		var err error
+		result, err = stopUnlocked(ctx, opts)
+		return err
+	})
+	return result, err
 }
 
 func stopUnlocked(ctx context.Context, opts Options) (*Result, error) {
@@ -533,7 +534,9 @@ func GuardApply(ctx context.Context, opts Options) (*Result, error) {
 	if opts.DryRun {
 		return result, nil
 	}
-	if err := configuredGuardExecutor(opts).Apply(ctx, plan); err != nil {
+	if err := withMutationOwnership(ctx, opts, "guard-apply", func() error {
+		return configuredGuardExecutor(opts).Apply(ctx, plan)
+	}); err != nil {
 		return nil, err
 	}
 	result.GuardApplied = true
@@ -545,7 +548,9 @@ func GuardCleanup(ctx context.Context, opts Options) (*Result, error) {
 	if opts.DryRun {
 		return result, nil
 	}
-	if err := configuredGuardExecutor(opts).Cleanup(ctx); err != nil {
+	if err := withMutationOwnership(ctx, opts, "guard-cleanup", func() error {
+		return configuredGuardExecutor(opts).Cleanup(ctx)
+	}); err != nil {
 		return nil, err
 	}
 	result.GuardCleaned = true
@@ -562,4 +567,19 @@ func configPath(opts Options) string {
 		return opts.ConfigPath
 	}
 	return config.DefaultConfigPath
+}
+
+func withMutationOwnership(ctx context.Context, opts Options, action string, fn func() error) error {
+	owner := lockfile.LifecycleOwner{
+		PID:        os.Getpid(),
+		Action:     action,
+		ConfigPath: configPath(opts),
+		RunDir:     opts.RunDir,
+	}
+	return lockfile.WithLifecycle(ctx, opts.LifecycleLease, owner, func(*lockfile.LifecycleLease) error {
+		if opts.RunDir == "" {
+			return fn()
+		}
+		return lockfile.WithLock(ctx, opts.RunDir, fn)
+	})
 }

@@ -2,14 +2,19 @@ package app
 
 import (
 	"bytes"
+	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
+	"github.com/syx0310/wg-mix-ebpf/internal/daemon"
+	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
 
 func TestValidateOffline(t *testing.T) {
@@ -114,14 +119,126 @@ func TestStopFallbackDetachDryRunOffline(t *testing.T) {
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runDir := filepath.Join(dir, "run")
 	stateDir := filepath.Join(dir, "state")
+	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(dir, "daemon.lease"))
 	var stdout, stderr bytes.Buffer
-	if err := Run(t.Context(), []string{"stop", "--config", cfgPath, "--run-dir", runDir, "--state-dir", stateDir}, &stdout, &stderr); err != nil {
+	if err := Run(ctx, []string{"stop", "--config", cfgPath, "--run-dir", runDir, "--state-dir", stateDir}, &stdout, &stderr); err != nil {
 		t.Fatalf("stop fallback should tolerate missing runtime when there is no attach-state to detach: %v stderr=%s", err, stderr.String())
 	}
 	stdout.Reset()
 	stderr.Reset()
 	if err := Run(t.Context(), []string{"detach", "--config", cfgPath, "--offline", "--dry-run", "--run-dir", runDir, "--state-dir", stateDir}, &stdout, &stderr); err != nil {
 		t.Fatalf("detach dry-run offline failed: %v stderr=%s", err, stderr.String())
+	}
+}
+
+func TestWrongRunDirOneShotStopCannotRaceDaemon(t *testing.T) {
+	dir := t.TempDir()
+	leasePath := filepath.Join(dir, "daemon.lease")
+	ctx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
+		PID:        os.Getpid(),
+		Action:     "daemon",
+		ConfigPath: "/etc/wg-mix-ebpf/config.yaml",
+		RunDir:     "/run/real-daemon",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+
+	var stdout, stderr bytes.Buffer
+	err = Run(ctx, []string{
+		"stop",
+		"--config", filepath.Join(dir, "wrong.yaml"),
+		"--run-dir", filepath.Join(dir, "wrong-run-dir"),
+		"--state-dir", filepath.Join(dir, "wrong-state-dir"),
+	}, &stdout, &stderr)
+	if !errors.Is(err, lockfile.ErrLifecycleLeaseHeld) {
+		t.Fatalf("wrong-run-dir stop error = %v, want held lifecycle lease", err)
+	}
+	if !strings.Contains(err.Error(), "/run/real-daemon") {
+		t.Fatalf("wrong-run-dir stop error lacks real owner: %v", err)
+	}
+}
+
+func TestStopExitRaceFallsBackThroughGlobalLifecycleLease(t *testing.T) {
+	dir := t.TempDir()
+	runDir := filepath.Join(dir, "run")
+	if err := os.MkdirAll(runDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(dir, "config.yaml")
+	status := daemon.Status{
+		PID:             os.Getpid(),
+		ConfigPath:      configPath,
+		State:           "active",
+		RequestProtocol: 1,
+		InstanceID:      "0123456789abcdef0123456789abcdef",
+	}
+	writeStatus := func(status daemon.Status) error {
+		data, err := json.Marshal(status)
+		if err != nil {
+			return err
+		}
+		tmp := filepath.Join(runDir, "status.json.next")
+		if err := os.WriteFile(tmp, data, 0o644); err != nil {
+			return err
+		}
+		return os.Rename(tmp, filepath.Join(runDir, "status.json"))
+	}
+	if err := writeStatus(status); err != nil {
+		t.Fatal(err)
+	}
+
+	leasePath := filepath.Join(dir, "daemon.lease")
+	ctx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
+		PID:        os.Getpid(),
+		Action:     "daemon-cleanup",
+		ConfigPath: configPath,
+		RunDir:     runDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+
+	statusUpdated := make(chan error, 1)
+	go func() {
+		deadline := time.Now().Add(time.Second)
+		requestDir := filepath.Join(runDir, "requests")
+		for time.Now().Before(deadline) {
+			entries, err := os.ReadDir(requestDir)
+			if err == nil {
+				for _, entry := range entries {
+					if strings.HasSuffix(entry.Name(), ".json") {
+						status.PID = 1 << 30
+						statusUpdated <- writeStatus(status)
+						return
+					}
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+		statusUpdated <- errors.New("stop request was not enqueued")
+	}()
+
+	var stdout, stderr bytes.Buffer
+	err = Run(ctx, []string{
+		"stop",
+		"--config", configPath,
+		"--run-dir", runDir,
+		"--state-dir", filepath.Join(dir, "state"),
+		"--timeout", "1s",
+	}, &stdout, &stderr)
+	if updateErr := <-statusUpdated; updateErr != nil {
+		t.Fatal(updateErr)
+	}
+	if !errors.Is(err, lockfile.ErrLifecycleLeaseHeld) {
+		t.Fatalf("exit-race fallback error = %v, want global lifecycle ownership rejection", err)
+	}
+	if errors.Is(err, daemon.ErrDaemonNotRunning) {
+		t.Fatalf("CLI returned request race instead of using safe one-shot fallback: %v", err)
 	}
 }
 
@@ -255,6 +372,23 @@ func TestRunOfflineWithoutDryRunIsRejected(t *testing.T) {
 	err := Run(t.Context(), []string{"run", "--config", cfgPath, "--offline", "--once"}, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "requires --dry-run") {
 		t.Fatalf("expected offline daemon rejection, got %v", err)
+	}
+}
+
+func TestRunRejectsNegativeShutdownTimeout(t *testing.T) {
+	cfgPath := writeTestConfig(t, "[Interface]\nFwMark = 0x10000002\n")
+	var stdout, stderr bytes.Buffer
+	err := Run(t.Context(), []string{
+		"run",
+		"--config", cfgPath,
+		"--run-dir", t.TempDir(),
+		"--offline",
+		"--dry-run",
+		"--once",
+		"--shutdown-timeout=-1s",
+	}, &stdout, &stderr)
+	if err == nil || !strings.Contains(err.Error(), "shutdown timeout must not be negative") {
+		t.Fatalf("expected shutdown timeout rejection, got %v", err)
 	}
 }
 
