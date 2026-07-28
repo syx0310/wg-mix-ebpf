@@ -110,7 +110,8 @@ The default XOR smoke exercises the recommended `wg-payload-prefix` scope with
 `max_bytes: 128`; the explicit full smoke covers `wg-payload-full` with
 `max_bytes: 2048`. `test-netns-full` covers UDP IPv4/IPv6, XOR prefix
 IPv4/IPv6, XOR full IPv4/IPv6 (including multi-segment parity-bank
-coverage), and ICMP IPv4.
+coverage), IPv6 computed-zero UDP checksum mangling in native and full-XOR
+paths, and ICMP IPv4.
 
 The ICMP smoke test is IPv4-only. Its pcap check requires ICMP Echo Request and
 Reply records, valid ICMP checksums, mixed initiation/response/transport payload
