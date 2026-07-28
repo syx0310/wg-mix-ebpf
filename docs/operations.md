@@ -172,6 +172,8 @@ under the runtime directory. The daemon keeps its lifecycle lease while
 acquiring this short-lived operation lock; the two lock files are distinct, so
 stop cleanup does not self-deadlock.
 
+Dataplane map semantics are versioned even when a map's byte size is unchanged. A binary that finds pinned maps from a different ABI refuses to activate them. During an upgrade, stop the old service cleanly so it detaches filters and removes its pins, then start the new version; do not reuse or copy pinned maps across ABI versions. The startup guard remains the fail-closed boundary while a reload is being attempted.
+
 ## Status
 
 `status` reports config, runtime, attach, generation, and stats state:
