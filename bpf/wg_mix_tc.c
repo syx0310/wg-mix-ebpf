@@ -997,7 +997,7 @@ static __always_inline int xor_payload_target(struct packet_info *info,
 		else
 			return -4;
 	}
-	if (value == 0 || value > MAX_XOR_BYTES || (value & 3))
+	if (value == 0 || value > MAX_XOR_BYTES)
 		return -4;
 	*target = value;
 	return 0;
@@ -1032,6 +1032,52 @@ static __always_inline int xor_segment_bounds(__u32 target,
 	return 0;
 }
 
+static __always_inline int xor_load_partial_word(struct __sk_buff *skb,
+						  __u32 off,
+						  __u32 len,
+						  __u32 *word)
+{
+	if (len == 1)
+		return bpf_skb_load_bytes(skb, off, word, 1) < 0 ? -5 : 0;
+	if (len == 2)
+		return bpf_skb_load_bytes(skb, off, word, 2) < 0 ? -5 : 0;
+	if (len == 3)
+		return bpf_skb_load_bytes(skb, off, word, 3) < 0 ? -5 : 0;
+	return -4;
+}
+
+static __always_inline int xor_store_partial_word(struct __sk_buff *skb,
+						   __u32 off,
+						   __u32 len,
+						   __u32 *word,
+						   __u64 flags)
+{
+	if (len == 1)
+		return bpf_skb_store_bytes(skb, off, word, 1, flags) < 0 ? -2 : 0;
+	if (len == 2)
+		return bpf_skb_store_bytes(skb, off, word, 2, flags) < 0 ? -2 : 0;
+	if (len == 3)
+		return bpf_skb_store_bytes(skb, off, word, 3, flags) < 0 ? -2 : 0;
+	return -4;
+}
+
+static __always_inline void xor_partial_word(struct cipher_value *cipher,
+					      __u32 processed,
+					      __u32 len,
+					      __u32 old_word,
+					      __u32 *new_word)
+{
+	__u8 *old_bytes = (__u8 *)&old_word;
+	__u8 *new_bytes = (__u8 *)new_word;
+
+	*new_word = 0;
+	new_bytes[0] = old_bytes[0] ^ xor_key_byte(cipher, processed);
+	if (len > 1)
+		new_bytes[1] = old_bytes[1] ^ xor_key_byte(cipher, processed + 1);
+	if (len > 2)
+		new_bytes[2] = old_bytes[2] ^ xor_key_byte(cipher, processed + 2);
+}
+
 static __always_inline int xor_segment_store_only(struct __sk_buff *skb,
 						  struct cipher_value *cipher,
 						  __u32 payload_off,
@@ -1047,6 +1093,7 @@ static __always_inline int xor_segment_store_only(struct __sk_buff *skb,
 	__u8 new_chunk[XOR_STORE_CHUNK_SIZE] = {};
 	__u32 old_word = 0;
 	__u32 new_word = 0;
+	__u32 tail_len;
 	int rc;
 
 	rc = xor_segment_bounds(target, segment, start_offset, &processed,
@@ -1091,6 +1138,20 @@ static __always_inline int xor_segment_store_only(struct __sk_buff *skb,
 			return -2;
 		processed += 4;
 	}
+	if (processed < segment_target) {
+		tail_len = segment_target - processed;
+		old_word = 0;
+		rc = xor_load_partial_word(skb, payload_off + processed, tail_len,
+					   &old_word);
+		if (rc < 0)
+			return rc;
+		xor_partial_word(cipher, processed, tail_len, old_word, &new_word);
+		rc = xor_store_partial_word(skb, payload_off + processed, tail_len,
+					    &new_word, store_flags);
+		if (rc < 0)
+			return rc;
+		processed += tail_len;
+	}
 	if (processed != segment_target)
 		return -4;
 	return has_more ? 1 : 0;
@@ -1110,6 +1171,7 @@ static __always_inline int xor_segment_manual_diff(struct __sk_buff *skb,
 	__u8 new_chunk[XOR_DIFF_CHUNK_SIZE] = {};
 	__u32 old_word = 0;
 	__u32 new_word = 0;
+	__u32 tail_len;
 	__s64 csum_diff = 0;
 	__s64 diff;
 	int rc;
@@ -1167,6 +1229,32 @@ static __always_inline int xor_segment_manual_diff(struct __sk_buff *skb,
 					sizeof(new_word), BPF_F_INVALIDATE_HASH) < 0)
 			return -2;
 		processed += 4;
+	}
+	if (processed < segment_target) {
+		tail_len = segment_target - processed;
+		old_word = 0;
+		rc = xor_load_partial_word(skb, payload_off + processed, tail_len,
+					   &old_word);
+		if (rc < 0)
+			return rc;
+		xor_partial_word(cipher, processed, tail_len, old_word, &new_word);
+		/*
+		 * The UDP payload starts on a four-byte checksum boundary and all
+		 * preceding chunks are multiples of four. Zero-padding this final
+		 * word therefore matches Internet-checksum padding while avoiding
+		 * any read or write beyond the UDP payload.
+		 */
+		diff = bpf_csum_diff((__be32 *)&old_word, sizeof(old_word),
+				     (__be32 *)&new_word, sizeof(new_word),
+				     (__wsum)csum_diff);
+		if (diff < 0)
+			return -3;
+		csum_diff = diff;
+		rc = xor_store_partial_word(skb, payload_off + processed, tail_len,
+					    &new_word, BPF_F_INVALIDATE_HASH);
+		if (rc < 0)
+			return rc;
+		processed += tail_len;
 	}
 	if (processed != segment_target)
 		return -4;
@@ -1485,7 +1573,7 @@ static __always_inline int load_xor_context(struct __sk_buff *skb,
 	    context->payload_off < sizeof(struct udphdr) ||
 	    context->payload_off + context->target < context->payload_off ||
 	    context->target < 4 || context->target > MAX_XOR_BYTES ||
-	    (context->target & 3) || context->checksum_mode > XOR_CSUM_MANUAL)
+	    context->checksum_mode > XOR_CSUM_MANUAL)
 		return -1;
 	return 0;
 }
