@@ -194,7 +194,8 @@ UDP XOR cipher:
   chunked skb load/store of managed WireGuard UDP payload
   IPv4 egress uses the offload-friendly recompute checksum path
   IPv6 egress updates UDP checksum from chunk diffs before writing payload bytes
-  ingress accumulates chunk checksum diffs and updates UDP checksum once
+  ingress accumulates chunk checksum diffs and updates UDP checksum once per
+  tail-call segment
 ```
 
 For payload-only UDP checksum updates, the L4 checksum helper is used in diff
