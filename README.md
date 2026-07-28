@@ -92,3 +92,13 @@ Do not run BPF load, TC attach, netns, OpenWrt, offload, or performance tests on
 `bpf-load-test` only loads and closes the BPF collection. It does not read WireGuard runtime state, attach TC filters, create network namespaces, or send tunnel traffic.
 
 External Linux/OpenWrt/BPF/TC tests require controlled machines. Do not run those tests on laptops or unrelated shared hosts.
+
+On a controlled Linux test host, the full isolated namespace gate is:
+
+```bash
+sudo make test-netns-full
+```
+
+Run `bpf-load-test` on every supported kernel baseline as well as the build
+kernel; verifier acceptance can differ even when the embedded object is
+identical.

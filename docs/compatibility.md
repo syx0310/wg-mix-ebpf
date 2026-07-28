@@ -99,12 +99,23 @@ Netns regression entry points:
 ```bash
 sudo make test-netns-smoke
 sudo make test-netns-xor-smoke
+sudo make test-netns-xor-full-smoke
 sudo make test-netns-icmp-smoke
+sudo make test-netns-full
 sudo NEGATIVE_CHECKS=xfail scripts/smoke-netns-icmp.sh
 sudo NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
 ```
 
-The ICMP smoke test is IPv4-only. Its pcap check requires ICMP Echo Request and Reply records, mixed initiation/response/transport payload type words, and zero standard type-word leaks. The negative hooks are optional by default because ordinary ping pass-through and raw UDP bypass protection can be developed on separate core dataplane branches.
+The default XOR smoke exercises the recommended `wg-payload-prefix` scope with
+`max_bytes: 128`; the explicit full smoke covers `wg-payload-full` with
+`max_bytes: 2048`. `test-netns-full` covers UDP IPv4/IPv6, XOR prefix
+IPv4/IPv6, XOR full IPv4, and ICMP IPv4.
+
+The ICMP smoke test is IPv4-only. Its pcap check requires ICMP Echo Request and
+Reply records, valid ICMP checksums, mixed initiation/response/transport payload
+type words, and zero standard type-word leaks. The Make target enforces ordinary
+ping pass-through and raw IPv4/IPv6 UDP bypass protection; direct script callers
+may still select `skip` or `xfail` while developing a dataplane change.
 
 ## Linux Platform Support
 
