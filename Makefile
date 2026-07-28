@@ -1,5 +1,6 @@
 CGO_ENABLED ?= 0
 GO ?= go
+GOFMT ?= gofmt
 GOFLAGS ?= -trimpath
 BINARY ?= bin/wg-mix-ebpf
 CLANG ?= clang
@@ -49,8 +50,9 @@ test-unit-race:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test -race ./...
 
 test-lint:
-	@test -z "$$(gofmt -l $$(find cmd internal -name '*.go' -type f))" || \
-		{ echo "gofmt required for:"; gofmt -l $$(find cmd internal -name '*.go' -type f); exit 1; }
+	@command -v $(GOFMT) >/dev/null || { echo "missing gofmt: $(GOFMT)"; exit 1; }
+	@test -z "$$($(GOFMT) -l $$(find cmd internal -name '*.go' -type f))" || \
+		{ echo "gofmt required for:"; $(GOFMT) -l $$(find cmd internal -name '*.go' -type f); exit 1; }
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) vet ./...
 	bash -n scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh
 	python3 -c 'from pathlib import Path; compile(Path("scripts/check-wg-pcap.py").read_text(), "scripts/check-wg-pcap.py", "exec")'
