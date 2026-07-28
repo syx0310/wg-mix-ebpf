@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	Version uint32 = 8
+	Version uint32 = 10
 
 	FamilyAny  uint8 = 0
 	FamilyIPv4 uint8 = 4
@@ -274,9 +274,21 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 		if err != nil {
 			return nil, err
 		}
+		if c.KeyLen != 16 && c.KeyLen != 32 && c.KeyLen != 64 && c.KeyLen != 256 {
+			return nil, fmt.Errorf("cipher %q has unsupported key length %d", c.Name,
+				c.KeyLen)
+		}
+		if c.KeyMask != c.KeyLen-1 {
+			return nil, fmt.Errorf("cipher %q has key mask %d, want %d", c.Name,
+				c.KeyMask, c.KeyLen-1)
+		}
+		key := c.Key
+		for i := c.KeyLen; i < uint32(len(key)); i++ {
+			key[i] = key[i%c.KeyLen]
+		}
 		out.Ciphers[CipherKey{Generation: generation, CipherID: c.ID}] = CipherValue{
 			Generation: generation,
-			Key:        c.Key,
+			Key:        key,
 			KeyLen:     c.KeyLen,
 			KeyMask:    c.KeyMask,
 			MaxBytes:   c.MaxBytes,

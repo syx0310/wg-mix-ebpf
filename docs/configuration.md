@@ -356,13 +356,19 @@ ciphers:
     max_bytes: 128
 ```
 
-Secret material is derived in userspace and written to the BPF cipher map as fixed key bytes. Configure exactly one of `secret`, `secret_file`, or `password`; empty decoded/file content is rejected. `status` and `dump-abi` hide the actual key.
+Secret material is derived in userspace and written to the BPF cipher map as fixed key bytes. For key lengths shorter than 256 bytes, userspace repeats the configured key period across the map's 256-byte key storage; the ABI snapshot rejects inconsistent `key_len`/`key_mask` values before map population, and the dataplane uses a fixed 8-bit index. This representation is part of BPF ABI version 10. Configure exactly one of `secret`, `secret_file`, or `password`; empty decoded/file content is rejected. `status` and `dump-abi` hide the actual key.
 
 Regression entry point:
 
 ```bash
 sudo make test-netns-xor-smoke
+sudo make test-netns-xor-full-smoke
 ```
+
+The full-payload target sends a 1900-byte no-fragment probe through segment 7,
+exercises both ProgramArray parity banks across generations, removes one active
+egress and ingress segment to verify fail-closed dispatch counters, and reloads
+to confirm recovery.
 
 ## WireGuard Config Requirements
 
