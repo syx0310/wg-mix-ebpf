@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/syx0310/wg-mix-ebpf/internal/buildinfo"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
@@ -50,6 +51,7 @@ type Status struct {
 	PID             int               `json:"pid"`
 	ConfigPath      string            `json:"config_path"`
 	State           string            `json:"state"`
+	Build           *buildinfo.Info   `json:"build,omitempty"`
 	LastReason      string            `json:"last_reason,omitempty"`
 	LastSuccess     time.Time         `json:"last_success,omitempty"`
 	LastErrorTime   time.Time         `json:"last_error_time,omitempty"`
@@ -63,14 +65,15 @@ type Status struct {
 }
 
 type runHooks struct {
-	lifecycleLeasePath string
-	instanceID         string
-	acquireLease       func(string, leaseOwner) (*lifecycleLeaseHandle, error)
-	reload             func(context.Context, reconcile.Options) (*reconcile.Result, error)
-	validate           func(context.Context, reconcile.Options) (*reconcile.Result, error)
-	healthy            func(context.Context, *control.State) bool
-	stop               func(context.Context, Options, string) (*reconcile.Result, error)
-	writeStatus        func(string, Status) error
+	lifecycleLeasePath       string
+	lifecycleMaintenancePath string
+	instanceID               string
+	acquireLease             func(string, string, leaseOwner) (*lifecycleLeaseHandle, error)
+	reload                   func(context.Context, reconcile.Options) (*reconcile.Result, error)
+	validate                 func(context.Context, reconcile.Options) (*reconcile.Result, error)
+	healthy                  func(context.Context, *control.State) bool
+	stop                     func(context.Context, Options, string) (*reconcile.Result, error)
+	writeStatus              func(string, Status) error
 }
 
 func Run(parentCtx context.Context, opts Options) (retErr error) {
@@ -90,7 +93,12 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 	runDir := runDir(opts.RunDir)
 	hooks := hooksFor(opts)
 	leasePath := lifecycleLeasePath(opts, runDir, hooks.lifecycleLeasePath)
-	lease, err := hooks.acquireLease(leasePath, leaseOwner{
+	maintenancePath := lifecycleMaintenancePath(
+		opts,
+		runDir,
+		hooks.lifecycleMaintenancePath,
+	)
+	lease, err := hooks.acquireLease(leasePath, maintenancePath, leaseOwner{
 		PID:        os.Getpid(),
 		Action:     "daemon",
 		ConfigPath: configPath(opts.ConfigPath),
@@ -130,10 +138,12 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 		return fmt.Errorf("invalid daemon instance id %q", instanceID)
 	}
 	lastLegacyRequest := requestStamp(runDir)
+	identity := buildinfo.Current()
 	status := Status{
 		PID:             os.Getpid(),
 		ConfigPath:      configPath(opts.ConfigPath),
 		State:           "starting",
+		Build:           &identity,
 		RequestProtocol: requestProtocolVersion,
 		InstanceID:      instanceID,
 	}
@@ -652,6 +662,9 @@ func hooksFor(opts Options) runHooks {
 	if opts.hooks.lifecycleLeasePath != "" {
 		hooks.lifecycleLeasePath = opts.hooks.lifecycleLeasePath
 	}
+	if opts.hooks.lifecycleMaintenancePath != "" {
+		hooks.lifecycleMaintenancePath = opts.hooks.lifecycleMaintenancePath
+	}
 	if opts.hooks.instanceID != "" {
 		hooks.instanceID = opts.hooks.instanceID
 	}
@@ -684,6 +697,16 @@ func lifecycleLeasePath(opts Options, runDir string, override string) string {
 		return filepath.Join(runDir, "daemon.lease")
 	}
 	return DefaultLifecycleLeasePath
+}
+
+func lifecycleMaintenancePath(opts Options, runDir string, override string) string {
+	if override != "" {
+		return override
+	}
+	if opts.DryRun {
+		return filepath.Join(runDir, ".daemon-maintenance.gate")
+	}
+	return DefaultLifecycleMaintenancePath
 }
 
 func ReadStatus(runDir string) (*Status, error) {

@@ -11,6 +11,10 @@ import (
 type UnsupportedLoader struct{}
 
 func NewLoader() Loader {
+	return NewLoaderWithOptions(LoaderOptions{})
+}
+
+func NewLoaderWithOptions(LoaderOptions) Loader {
 	return UnsupportedLoader{}
 }
 
@@ -28,4 +32,8 @@ func (UnsupportedLoader) DetachStale(context.Context, *control.State, *control.S
 
 func LoadObjectTest(context.Context, string) error {
 	return ErrUnsupported
+}
+
+func LoadObjectTestIdentity(context.Context, string) (ObjectIdentity, error) {
+	return ObjectIdentity{}, ErrUnsupported
 }

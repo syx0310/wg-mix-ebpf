@@ -1,16 +1,21 @@
 package install
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
+	"github.com/syx0310/wg-mix-ebpf/internal/testutil"
 )
 
 func TestUninstallPurgeRejectsNonOwnedConfigDir(t *testing.T) {
@@ -55,6 +60,96 @@ func TestRenderedServicesUseStopCommand(t *testing.T) {
 	}
 }
 
+func TestApplyInstallPreservesRequestedServiceModes(t *testing.T) {
+	t.Run("systemd", func(t *testing.T) {
+		root := t.TempDir()
+		fakeBin := filepath.Join(root, "test-bin")
+		if err := os.Mkdir(fakeBin, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		systemctl := filepath.Join(fakeBin, "systemctl")
+		if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", fakeBin)
+
+		installPaths := serviceModeTestPaths(root)
+		if err := applyInstall(t.Context(), Options{}, "systemd", installPaths); err != nil {
+			t.Fatalf("apply systemd install: %v", err)
+		}
+
+		for _, dir := range []string{
+			filepath.Dir(installPaths.ConfigPath),
+			filepath.Dir(installPaths.BinaryPath),
+			installPaths.VarLibDir,
+			installPaths.RunDir,
+			installPaths.SystemdDir,
+		} {
+			requireInstallMode(t, dir, 0o755)
+		}
+		requireInstallMode(t, installPaths.BinaryPath, 0o755)
+		requireInstallMode(
+			t,
+			filepath.Join(installPaths.SystemdDir, "wg-mix-ebpf.service"),
+			0o644,
+		)
+	})
+
+	t.Run("openwrt", func(t *testing.T) {
+		root := t.TempDir()
+		installPaths := serviceModeTestPaths(root)
+		if err := applyInstall(t.Context(), Options{}, "openwrt", installPaths); err != nil {
+			t.Fatalf("apply OpenWrt install: %v", err)
+		}
+
+		for _, dir := range []string{
+			filepath.Dir(installPaths.ConfigPath),
+			filepath.Dir(installPaths.BinaryPath),
+			installPaths.VarLibDir,
+			installPaths.RunDir,
+			installPaths.OpenWrtInitDir,
+			installPaths.OpenWrtHotplugDir,
+		} {
+			requireInstallMode(t, dir, 0o755)
+		}
+		requireInstallMode(t, installPaths.BinaryPath, 0o755)
+		requireInstallMode(
+			t,
+			filepath.Join(installPaths.OpenWrtInitDir, "wg-mix-ebpf"),
+			0o755,
+		)
+		requireInstallMode(
+			t,
+			filepath.Join(installPaths.OpenWrtHotplugDir, "90-wg-mix-ebpf"),
+			0o755,
+		)
+	})
+}
+
+func serviceModeTestPaths(root string) paths {
+	return paths{
+		ConfigPath:        filepath.Join(root, "etc", "wg-mix-ebpf", "config.yaml"),
+		BinaryPath:        filepath.Join(root, "usr", "sbin", "wg-mix-ebpf"),
+		VarLibDir:         filepath.Join(root, "var", "lib", "wg-mix-ebpf"),
+		RunDir:            filepath.Join(root, "run", "wg-mix-ebpf"),
+		SystemdDir:        filepath.Join(root, "etc", "systemd", "system"),
+		OpenWrtInitDir:    filepath.Join(root, "etc", "init.d"),
+		OpenWrtHotplugDir: filepath.Join(root, "etc", "hotplug.d", "iface"),
+		PinPath:           filepath.Join(root, "sys", "fs", "bpf", "wg-mix-ebpf"),
+	}
+}
+
+func requireInstallMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("inspect mode for %s: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("mode for %s = %#o, want %#o", path, got, want)
+	}
+}
+
 func TestOpenWrtHotplugDoesNotUseNanosecondDate(t *testing.T) {
 	script := openWrtHotplug()
 	if strings.Contains(script, "%N") {
@@ -78,7 +173,11 @@ func TestInstallRejectsHeldGlobalLifecycleLeaseBeforeWrites(t *testing.T) {
 	t.Setenv(EnvVarLibDir, filepath.Join(dir, "state"))
 	t.Setenv(daemonEnvRunDirForTest, runDir)
 
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(dir, "daemon.lease"))
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(dir, "daemon.lease"),
+		filepath.Join(dir, "maintenance.gate"),
+	)
 	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
 		PID:    os.Getpid(),
 		Action: "daemon",
@@ -117,7 +216,11 @@ func TestUninstallRejectsHeldGlobalLifecycleLeaseBeforeCleanup(t *testing.T) {
 	t.Setenv(daemonEnvRunDirForTest, runDir)
 	t.Setenv(dataplaneEnvPinPathForTest, filepath.Join(dir, "pins"))
 
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(dir, "daemon.lease"))
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(dir, "daemon.lease"),
+		filepath.Join(dir, "maintenance.gate"),
+	)
 	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
 		PID:    os.Getpid(),
 		Action: "daemon",
@@ -152,14 +255,58 @@ func TestUninstallKeepsBinaryHint(t *testing.T) {
 
 func TestUninstallDoesNotDeadlockWhenConfigExists(t *testing.T) {
 	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("TMPDIR", dir)
 	fakeBin := filepath.Join(dir, "bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	readyPath := filepath.Join(dir, "nft-ready")
+	releasePath := filepath.Join(dir, "nft-release")
+	for _, path := range []string{readyPath, releasePath} {
+		if err := syscall.Mkfifo(path, 0o600); err != nil {
+			t.Fatalf("create fake nft control FIFO %s: %v", path, err)
+		}
+	}
+	readyFIFO, err := os.OpenFile(readyPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open fake nft readiness FIFO: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := readyFIFO.Close(); err != nil {
+			t.Errorf("close fake nft readiness FIFO: %v", err)
+		}
+	})
+	releaseFIFO, err := os.OpenFile(releasePath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open fake nft release FIFO: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := releaseFIFO.Close(); err != nil {
+			t.Errorf("close fake nft release FIFO: %v", err)
+		}
+	})
+	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte(
+		"#!/bin/sh\n"+
+			"set -eu\n"+
+			"if [ \"$*\" = '-j list tables' ]; then\n"+
+			"  printf '%s\\n' '{\"nftables\":[{\"metainfo\":{\"json_schema_version\":1}}]}'\n"+
+			"  exit 0\n"+
+			"fi\n"+
+			"printf '%s\\000' \"$#\" \"$@\" >\"$WG_MIX_EBPF_TEST_NFT_READY_FIFO\"\n"+
+			"IFS= read -r control <\"$WG_MIX_EBPF_TEST_NFT_RELEASE_FIFO\"\n"+
+			"[ \"$control\" = continue ] || exit 70\n"+
+			"printf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\n"+
+			"exit 1\n",
+	), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("WG_MIX_EBPF_TEST_NFT_READY_FIFO", readyPath)
+	t.Setenv("WG_MIX_EBPF_TEST_NFT_RELEASE_FIFO", releasePath)
 	etcDir := filepath.Join(dir, "etc", "wg-mix-ebpf")
 	runDir := filepath.Join(dir, "run")
 	stateDir := filepath.Join(dir, "state")
@@ -188,11 +335,109 @@ startup_guard:
 	t.Setenv(dataplaneEnvPinPathForTest, pinDir)
 	t.Setenv(EnvBinaryPath, binaryPath)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	ctx = lockfile.WithLifecyclePathForTest(ctx, filepath.Join(dir, "daemon.lease"))
-	if _, err := Uninstall(ctx, Options{ConfigPath: configPath, System: "unknown", Yes: true}); err != nil {
-		t.Fatalf("uninstall should complete without nested lock deadlock: %v", err)
+	ctx = lockfile.WithLifecyclePathsForTest(
+		ctx,
+		filepath.Join(dir, "daemon.lease"),
+		filepath.Join(dir, "maintenance.gate"),
+	)
+
+	uninstallDone := make(chan error, 1)
+	go func() {
+		_, err := Uninstall(ctx, Options{ConfigPath: configPath, System: "unknown", Yes: true})
+		uninstallDone <- err
+	}()
+
+	wantArgs := []string{"-j", "-a", "list", "table", "inet", "wg_mix_ebpf_guard"}
+	type readyResult struct {
+		args []string
+		err  error
+	}
+	nftReady := make(chan readyResult, 1)
+	go func() {
+		const (
+			maxNftArgs     = 16
+			maxNftArgBytes = 256
+		)
+		reader := bufio.NewReaderSize(readyFIFO, maxNftArgBytes+1)
+		readField := func() (string, error) {
+			field, err := reader.ReadSlice(0)
+			if errors.Is(err, bufio.ErrBufferFull) {
+				return "", fmt.Errorf("fake nft protocol field exceeds %d bytes", maxNftArgBytes)
+			}
+			if err != nil {
+				return "", fmt.Errorf("read fake nft protocol field: %w", err)
+			}
+			field = field[:len(field)-1]
+			if len(field) > maxNftArgBytes {
+				return "", fmt.Errorf("fake nft protocol field is %d bytes, maximum is %d", len(field), maxNftArgBytes)
+			}
+			return string(field), nil
+		}
+
+		argcField, err := readField()
+		if err != nil {
+			nftReady <- readyResult{err: err}
+			return
+		}
+		argc, err := strconv.Atoi(argcField)
+		if err != nil || argc < 0 || argc > maxNftArgs {
+			nftReady <- readyResult{err: fmt.Errorf("fake nft argc %q is outside 0..%d", argcField, maxNftArgs)}
+			return
+		}
+		if argc != len(wantArgs) {
+			nftReady <- readyResult{err: fmt.Errorf("fake nft argc = %d, want %d", argc, len(wantArgs))}
+			return
+		}
+		args := make([]string, argc)
+		for i := range args {
+			args[i], err = readField()
+			if err != nil {
+				nftReady <- readyResult{err: fmt.Errorf("read fake nft argv[%d]: %w", i, err)}
+				return
+			}
+		}
+		nftReady <- readyResult{args: args}
+	}()
+
+	// Keep the watchdog outside ctx: a deadline on ctx also kills the fake nft
+	// subprocess and turns slow process scheduling into a false deadlock result.
+	// The FIFO handshake proves that uninstall crossed the nested-lock boundary.
+	const deadlockWatchdog = 30 * time.Second
+	readyWatchdog := time.NewTimer(deadlockWatchdog)
+	select {
+	case result := <-nftReady:
+		readyWatchdog.Stop()
+		if result.err != nil {
+			t.Fatalf("read fake nft readiness: %v", result.err)
+		}
+		for i := range wantArgs {
+			if result.args[i] != wantArgs[i] {
+				t.Fatalf("fake nft argv[%d] = %q, want %q", i, result.args[i], wantArgs[i])
+			}
+		}
+	case err := <-uninstallDone:
+		readyWatchdog.Stop()
+		t.Fatalf("uninstall returned before fake nft inspection: %v", err)
+	case <-readyWatchdog.C:
+		cancel()
+		t.Fatal("uninstall did not reach fake nft inspection; possible nested lock deadlock")
+	}
+
+	if _, err := releaseFIFO.WriteString("continue\n"); err != nil {
+		t.Fatalf("release fake nft inspection: %v", err)
+	}
+	completionWatchdog := time.NewTimer(deadlockWatchdog)
+	select {
+	case err := <-uninstallDone:
+		completionWatchdog.Stop()
+		if err != nil {
+			t.Fatalf("uninstall should complete without nested lock deadlock: %v", err)
+		}
+	case <-completionWatchdog.C:
+		cancel()
+		t.Fatal("uninstall did not complete after fake nft inspection was released")
 	}
 }
 
@@ -209,6 +454,16 @@ func TestInstallBinaryReplacesModeAtomically(t *testing.T) {
 	target := filepath.Join(dir, "wg-mix-ebpf")
 	if err := os.WriteFile(target, []byte("stale"), 0o777); err != nil {
 		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	initialInfo, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := initialInfo.Mode().Perm(); got != 0o777 {
+		t.Fatalf("initial binary mode = %o, want 777", got)
 	}
 	if err := installBinary(target); err != nil {
 		t.Fatal(err)
@@ -278,5 +533,5 @@ const (
 )
 
 func TestMain(m *testing.M) {
-	os.Exit(m.Run())
+	os.Exit(testutil.RunWithStandardUmask(m.Run))
 }

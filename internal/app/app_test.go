@@ -12,10 +12,116 @@ import (
 	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+	"github.com/syx0310/wg-mix-ebpf/internal/buildinfo"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/daemon"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
+
+func TestVersionOutputIsBackwardCompatible(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := Run(t.Context(), []string{"version"}, &stdout, &stderr); err != nil {
+		t.Fatalf("version failed: %v stderr=%s", err, stderr.String())
+	}
+	if got, want := stdout.String(), Version+"\n"; got != want {
+		t.Fatalf("version output = %q, want %q", got, want)
+	}
+}
+
+func TestVersionJSONReportsDeterministicBuildIdentity(t *testing.T) {
+	var first, second, stderr bytes.Buffer
+	if err := Run(t.Context(), []string{"version", "--json"}, &first, &stderr); err != nil {
+		t.Fatalf("version --json failed: %v stderr=%s", err, stderr.String())
+	}
+	if err := Run(t.Context(), []string{"version", "--json"}, &second, &stderr); err != nil {
+		t.Fatalf("second version --json failed: %v stderr=%s", err, stderr.String())
+	}
+	if first.String() != second.String() {
+		t.Fatalf("version JSON changed between calls:\nfirst=%s\nsecond=%s", first.String(), second.String())
+	}
+	var got buildinfo.Info
+	if err := json.Unmarshal(first.Bytes(), &got); err != nil {
+		t.Fatalf("decode version JSON: %v\n%s", err, first.String())
+	}
+	if want := buildinfo.Current(); got != want {
+		t.Fatalf("version identity = %#v, want %#v", got, want)
+	}
+}
+
+func TestStatusReportsClientBuildIdentity(t *testing.T) {
+	cfgPath := writeTestConfig(t, "[Interface]\nFwMark = 0x10000002\nListenPort = 31001\n")
+	var stdout, stderr bytes.Buffer
+	if err := Run(
+		t.Context(),
+		[]string{"status", "--config", cfgPath, "--offline"},
+		&stdout,
+		&stderr,
+	); err != nil {
+		t.Fatalf("status failed: %v stderr=%s", err, stderr.String())
+	}
+	var got struct {
+		ClientBuild buildinfo.Info `json:"client_build"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode status JSON: %v\n%s", err, stdout.String())
+	}
+	if want := buildinfo.Current(); got.ClientBuild != want {
+		t.Fatalf("status client build identity = %#v, want %#v", got.ClientBuild, want)
+	}
+}
+
+func TestStatusDistinguishesClientAndDaemonBuilds(t *testing.T) {
+	cfgPath := writeTestConfig(t, "[Interface]\nFwMark = 0x10000002\nListenPort = 31001\n")
+	runDir := t.TempDir()
+	daemonBuild := buildinfo.Info{
+		Version:                 "previous",
+		SourceCommit:            "1111111111111111111111111111111111111111",
+		EmbeddedBPFObjectSHA256: "2222222222222222222222222222222222222222222222222222222222222222",
+		BPFABIVersion:           abi.Version,
+	}
+	statusData, err := json.Marshal(daemon.Status{
+		PID:             os.Getpid(),
+		ConfigPath:      cfgPath,
+		State:           "active",
+		Build:           &daemonBuild,
+		RequestProtocol: 1,
+		InstanceID:      "0123456789abcdef0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "status.json"), statusData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := Run(
+		t.Context(),
+		[]string{
+			"status",
+			"--config", cfgPath,
+			"--run-dir", runDir,
+			"--offline",
+		},
+		&stdout,
+		&stderr,
+	); err != nil {
+		t.Fatalf("status failed: %v stderr=%s", err, stderr.String())
+	}
+	var got struct {
+		ClientBuild buildinfo.Info `json:"client_build"`
+		Daemon      *daemon.Status `json:"daemon"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode status JSON: %v\n%s", err, stdout.String())
+	}
+	if got.ClientBuild != buildinfo.Current() {
+		t.Fatalf("client build = %#v, want %#v", got.ClientBuild, buildinfo.Current())
+	}
+	if got.Daemon == nil || got.Daemon.Build == nil || *got.Daemon.Build != daemonBuild {
+		t.Fatalf("daemon build = %#v, want %#v", got.Daemon, daemonBuild)
+	}
+}
 
 func TestValidateOffline(t *testing.T) {
 	dir := t.TempDir()
@@ -101,25 +207,42 @@ func TestGuardCleanupDryRun(t *testing.T) {
 	if err := Run(t.Context(), []string{"guard-cleanup", "--config", cfgPath, "--offline", "--dry-run"}, &stdout, &stderr); err != nil {
 		t.Fatalf("Run returned error: %v stderr=%s", err, stderr.String())
 	}
-	if !bytes.Contains(stdout.Bytes(), []byte("delete table inet wg_mix_ebpf_guard")) {
-		t.Fatalf("guard cleanup dry-run missing cleanup script: %s", stdout.String())
+	if !bytes.Contains(stdout.Bytes(), []byte("delete table inet handle <validated-handle>")) ||
+		bytes.Contains(stdout.Bytes(), []byte("delete table inet wg_mix_ebpf_guard")) {
+		t.Fatalf("guard cleanup dry-run must require validated ownership: %s", stdout.String())
 	}
 }
 
 func TestStopFallbackDetachDryRunOffline(t *testing.T) {
 	cfgPath := writeTestConfig(t, "[Interface]\nFwMark = 0x10000002\n")
 	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fakeBin := filepath.Join(dir, "bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte(
+		"#!/bin/sh\n"+
+			"if [ \"$*\" = '-j list tables' ]; then\n"+
+			"  printf '%s\\n' '{\"nftables\":[{\"metainfo\":{\"json_schema_version\":1}}]}'\n"+
+			"  exit 0\n"+
+			"fi\n"+
+			"printf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\n"+
+			"exit 1\n",
+	), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runDir := filepath.Join(dir, "run")
 	stateDir := filepath.Join(dir, "state")
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(dir, "daemon.lease"))
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(dir, "daemon.lease"),
+		filepath.Join(dir, "maintenance.gate"),
+	)
 	var stdout, stderr bytes.Buffer
 	if err := Run(ctx, []string{"stop", "--config", cfgPath, "--run-dir", runDir, "--state-dir", stateDir}, &stdout, &stderr); err != nil {
 		t.Fatalf("stop fallback should tolerate missing runtime when there is no attach-state to detach: %v stderr=%s", err, stderr.String())
@@ -134,7 +257,12 @@ func TestStopFallbackDetachDryRunOffline(t *testing.T) {
 func TestWrongRunDirOneShotStopCannotRaceDaemon(t *testing.T) {
 	dir := t.TempDir()
 	leasePath := filepath.Join(dir, "daemon.lease")
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+	maintenancePath := filepath.Join(dir, "maintenance.gate")
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		leasePath,
+		maintenancePath,
+	)
 	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
 		PID:        os.Getpid(),
 		Action:     "daemon",
@@ -191,7 +319,12 @@ func TestStopExitRaceFallsBackThroughGlobalLifecycleLease(t *testing.T) {
 	}
 
 	leasePath := filepath.Join(dir, "daemon.lease")
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+	maintenancePath := filepath.Join(dir, "maintenance.gate")
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		leasePath,
+		maintenancePath,
+	)
 	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
 		PID:        os.Getpid(),
 		Action:     "daemon-cleanup",
@@ -364,6 +497,13 @@ func TestRunOnceDryOfflineWritesStatus(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(runDir, "status.json")); err != nil {
 		t.Fatalf("status not written: %v", err)
 	}
+	status, err := daemon.ReadStatus(runDir)
+	if err != nil {
+		t.Fatalf("read daemon status: %v", err)
+	}
+	if status.Build == nil || *status.Build != buildinfo.Current() {
+		t.Fatalf("daemon build identity = %#v, want %#v", status.Build, buildinfo.Current())
+	}
 }
 
 func TestRunOfflineWithoutDryRunIsRejected(t *testing.T) {
@@ -398,6 +538,56 @@ func TestReloadOfflineWithoutDryRunIsRejected(t *testing.T) {
 	err := Run(t.Context(), []string{"reload", "--config", cfgPath, "--offline"}, &stdout, &stderr)
 	if err == nil || !strings.Contains(err.Error(), "requires --dry-run") {
 		t.Fatalf("expected offline reload rejection, got %v", err)
+	}
+}
+
+func TestAdoptLegacyPinsIsReloadOnly(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := Run(
+		t.Context(),
+		[]string{"status", "--adopt-legacy-pins"},
+		&stdout,
+		&stderr,
+	)
+	if err == nil || !strings.Contains(err.Error(), "only valid with reload") {
+		t.Fatalf("status legacy-adoption error = %v", err)
+	}
+}
+
+func TestAdoptLegacyPinsRejectsRunningDaemon(t *testing.T) {
+	runDir := t.TempDir()
+	status := daemon.Status{
+		PID:             os.Getpid(),
+		ConfigPath:      "/etc/wg-mix-ebpf/config.yaml",
+		State:           "active",
+		RequestProtocol: 1,
+		InstanceID:      "0123456789abcdef0123456789abcdef",
+	}
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(runDir, "status.json"),
+		data,
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	err = Run(
+		t.Context(),
+		[]string{
+			"reload",
+			"--adopt-legacy-pins",
+			"--run-dir", runDir,
+		},
+		&stdout,
+		&stderr,
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "while the daemon is stopped") {
+		t.Fatalf("running-daemon legacy-adoption error = %v", err)
 	}
 }
 

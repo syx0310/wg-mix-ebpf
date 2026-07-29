@@ -224,7 +224,7 @@ func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
 		}
 		if err := lockfile.WithLock(ctx, paths.RunDir, func() error {
 			if !stopped {
-				if err := guard.NewCommandExecutor().Cleanup(ctx); err != nil {
+				if err := guard.NewCommandExecutor(paths.VarLibDir).Cleanup(ctx); err != nil {
 					return fmt.Errorf("cleanup startup guard: %w", err)
 				}
 			}

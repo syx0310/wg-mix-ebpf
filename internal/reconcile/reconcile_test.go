@@ -38,7 +38,12 @@ func TestStopCleansFixedGuardTableWhenCurrentConfigDisablesGuard(t *testing.T) {
 	}
 	guardExec := &recordingGuardExecutor{}
 	configLoads := 0
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(t.TempDir(), "daemon.lease"))
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
 	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{PID: os.Getpid(), Action: "daemon"})
 	if err != nil {
 		t.Fatal(err)
@@ -74,7 +79,12 @@ func TestStopCleansFixedGuardTableWhenCurrentConfigDisablesGuard(t *testing.T) {
 
 func TestOneShotMutationsRejectHeldGlobalLifecycleLease(t *testing.T) {
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		leasePath,
+		maintenancePath,
+	)
 	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
 		PID:        os.Getpid(),
 		Action:     "daemon",
@@ -216,7 +226,12 @@ func TestReloadUsesSingleConfigSnapshotAndExpandsGuardForRuntimeMark(t *testing.
 	runtimeProvider := &countingRuntimeProvider{upstream: runtime.StaticProvider{Devices: map[string]*runtime.Device{
 		"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: runtimeMark, Up: true},
 	}}}
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(t.TempDir(), "daemon.lease"))
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
 	result, err := Reload(ctx, Options{
 		ConfigPath: cfgPath,
 		StateDir:   t.TempDir(),
@@ -281,7 +296,12 @@ func TestReloadKeepsRuntimeMarkGuardedOnStrictMismatch(t *testing.T) {
 		"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: runtimeMark0, Up: true},
 		"wg1": {Name: "wg1", ListenPort: 31002, FirewallMark: runtimeMark1, Up: true},
 	}}}
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(t.TempDir(), "daemon.lease"))
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
 	_, err := Reload(ctx, Options{
 		ConfigPath: cfgPath,
 		StateDir:   t.TempDir(),
@@ -325,7 +345,12 @@ func TestStopUsesAttachStateAndCleansGuardWhenConfigIsMissing(t *testing.T) {
 	}
 	guardExec := &recordingGuardExecutor{}
 	loader := &recordingDataplaneLoader{}
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(t.TempDir(), "daemon.lease"))
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
 	result, err := Stop(ctx, Options{
 		ConfigPath: filepath.Join(t.TempDir(), "missing.yaml"),
 		StateDir:   stateDir,

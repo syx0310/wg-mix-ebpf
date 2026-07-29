@@ -136,6 +136,13 @@ struct control_value {
 	__u32 flags;
 };
 
+struct owner_value {
+	__u32 version;
+	__u32 flags;
+	__u8 resource_digest[32];
+	__u8 token[32];
+};
+
 struct profile_value {
 	__u64 generation;
 	__u32 standard_to_mixed[4];
@@ -353,6 +360,13 @@ struct {
 	__type(key, __u32);
 	__type(value, struct control_value);
 } control_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct owner_value);
+} owner_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
