@@ -224,19 +224,44 @@ func decodeCleanupManifest(data []byte) (*cleanupManifest, error) {
 	return &manifest, nil
 }
 
-func writeCleanupManifest(
+type cleanupManifestPublication struct {
+	paths            paths
+	system           string
+	configDir        *managedCleanupDir
+	stateDir         *managedCleanupDir
+	desired          cleanupManifest
+	alreadyPublished bool
+}
+
+func (publication *cleanupManifestPublication) close() error {
+	if publication == nil || publication.configDir == nil {
+		return nil
+	}
+	err := publication.configDir.close()
+	publication.configDir = nil
+	return err
+}
+
+func prepareCleanupManifestPublication(
 	paths paths,
 	system string,
 	options cleanupManifestWriteOptions,
-) (retErr error) {
+) (_ *cleanupManifestPublication, retErr error) {
 	configDir, exists, err := openManagedCleanupDir(configCleanupPath(filepath.Dir(paths.ConfigPath)))
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if !exists {
-		return fmt.Errorf("write cleanup ownership manifest: config directory %s does not exist", filepath.Dir(paths.ConfigPath))
+		return nil, fmt.Errorf(
+			"prepare cleanup ownership manifest: config directory %s does not exist",
+			filepath.Dir(paths.ConfigPath),
+		)
 	}
-	defer configDir.close()
+	defer func() {
+		if configDir != nil {
+			retErr = errors.Join(retErr, configDir.close())
+		}
+	}()
 
 	installationID := ""
 	var freshStateDir *managedCleanupDir
@@ -244,21 +269,31 @@ func writeCleanupManifest(
 	switch {
 	case err == nil:
 		if err := manifest.validateAgainst(paths, system); err != nil {
-			return err
+			return nil, err
 		}
-		// An exact existing marker already records the desired ownership.
-		// Avoid replacing its inode or opening an overwrite race on reinstall.
-		return nil
+		publication := &cleanupManifestPublication{
+			paths:            paths,
+			system:           system,
+			alreadyPublished: true,
+		}
+		if err := configDir.close(); err != nil {
+			return nil, fmt.Errorf(
+				"close existing cleanup ownership directory: %w",
+				err,
+			)
+		}
+		configDir = nil
+		return publication, nil
 	case cleanupIsNotExist(err):
 		if !options.Fresh && !options.AdoptExisting {
-			return errors.New(
+			return nil, errors.New(
 				"refuse to create cleanup ownership marker for unmarked resources " +
 					"without explicit adoption authorization",
 			)
 		}
 		installationID, err = newCleanupInstallationID()
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if options.Fresh {
 			if err := validateFreshCleanupManifestBootstrap(
@@ -268,29 +303,83 @@ func writeCleanupManifest(
 				installationID,
 				options.LifecyclePath,
 			); err != nil {
-				return err
+				return nil, err
 			}
 			if options.createState == nil {
-				return errors.New("fresh ownership bootstrap requires descriptor-anchored state creation")
+				return nil, errors.New(
+					"fresh ownership bootstrap requires descriptor-anchored state creation",
+				)
 			}
 			freshStateDir, err = options.createState()
 			if err != nil {
-				return fmt.Errorf("create fresh state dir before ownership publication: %w", err)
+				return nil, fmt.Errorf(
+					"create fresh state dir before ownership publication: %w",
+					err,
+				)
 			}
 			if err := revalidateManagedCleanupDir(freshStateDir); err != nil {
-				return fmt.Errorf("revalidate fresh state dir before ownership publication: %w", err)
+				return nil, fmt.Errorf(
+					"revalidate fresh state dir before ownership publication: %w",
+					err,
+				)
 			}
 		} else {
 			if err := validateCleanupManifestBootstrap(configDir, paths, system, installationID); err != nil {
-				return err
+				return nil, err
 			}
 		}
 	default:
-		return err
+		return nil, err
 	}
 
-	desired := expectedCleanupManifest(paths, system, installationID)
-	data, err := json.MarshalIndent(desired, "", "  ")
+	publication := &cleanupManifestPublication{
+		paths:     paths,
+		system:    system,
+		configDir: configDir,
+		stateDir:  freshStateDir,
+		desired:   expectedCleanupManifest(paths, system, installationID),
+	}
+	configDir = nil
+	return publication, nil
+}
+
+func (publication *cleanupManifestPublication) publish() (retErr error) {
+	if publication == nil {
+		return errors.New("cannot publish a nil cleanup ownership manifest")
+	}
+	if publication.alreadyPublished {
+		return nil
+	}
+	if publication.configDir == nil {
+		return errors.New("cleanup ownership publication has no held config directory")
+	}
+	if err := revalidateManagedCleanupDir(publication.configDir); err != nil {
+		return fmt.Errorf(
+			"revalidate config directory before cleanup ownership publication: %w",
+			err,
+		)
+	}
+	if err := validateCleanupManifestBootstrap(
+		publication.configDir,
+		publication.paths,
+		publication.system,
+		publication.desired.InstallationID,
+	); err != nil {
+		return fmt.Errorf(
+			"validate completed install before cleanup ownership publication: %w",
+			err,
+		)
+	}
+	if publication.stateDir != nil {
+		if err := revalidateManagedCleanupDir(publication.stateDir); err != nil {
+			return fmt.Errorf(
+				"revalidate state directory before cleanup ownership publication: %w",
+				err,
+			)
+		}
+	}
+
+	data, err := json.MarshalIndent(publication.desired, "", "  ")
 	if err != nil {
 		return fmt.Errorf("marshal cleanup ownership manifest: %w", err)
 	}
@@ -301,14 +390,18 @@ func writeCleanupManifest(
 		return err
 	}
 	tempName := "." + cleanupManifestName + ".tmp-" + randomSuffix
-	file, err := cleanupCreateFileAt(configDir.dir, tempName, 0o600)
+	file, err := cleanupCreateFileAt(publication.configDir.dir, tempName, 0o600)
 	if err != nil {
 		return fmt.Errorf("create temporary cleanup ownership manifest: %w", err)
 	}
 	tempPresent := true
 	defer func() {
 		if tempPresent {
-			if err := cleanupUnlinkAt(configDir.dir, tempName, false); err != nil &&
+			if err := cleanupUnlinkAt(
+				publication.configDir.dir,
+				tempName,
+				false,
+			); err != nil &&
 				!cleanupIsNotExist(err) {
 				retErr = errors.Join(
 					retErr,
@@ -328,17 +421,37 @@ func writeCleanupManifest(
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close temporary cleanup ownership manifest: %w", err)
 	}
-	if err := cleanupRenameNoReplaceAt(configDir.dir, tempName, cleanupManifestName); err != nil {
+	if err := cleanupRenameNoReplaceAt(
+		publication.configDir.dir,
+		tempName,
+		cleanupManifestName,
+	); err != nil {
 		return fmt.Errorf("install cleanup ownership manifest: %w", err)
 	}
 	tempPresent = false
-	if err := configDir.dir.file.Sync(); err != nil {
+	if err := publication.configDir.dir.file.Sync(); err != nil {
 		return fmt.Errorf("sync cleanup ownership directory: %w", err)
 	}
-	if freshStateDir != nil {
-		if err := revalidateManagedCleanupDir(freshStateDir); err != nil {
+	if publication.stateDir != nil {
+		if err := revalidateManagedCleanupDir(publication.stateDir); err != nil {
 			return fmt.Errorf("revalidate fresh state dir after ownership publication: %w", err)
 		}
 	}
+	publication.alreadyPublished = true
 	return nil
+}
+
+func writeCleanupManifest(
+	paths paths,
+	system string,
+	options cleanupManifestWriteOptions,
+) (retErr error) {
+	publication, err := prepareCleanupManifestPublication(paths, system, options)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, publication.close())
+	}()
+	return publication.publish()
 }

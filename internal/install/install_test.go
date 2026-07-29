@@ -917,6 +917,68 @@ func TestInstallWritesCleanupOwnershipManifest(t *testing.T) {
 	}
 }
 
+func TestInstallPublishesOwnershipOnlyAfterServiceCommit(t *testing.T) {
+	root := t.TempDir()
+	layout := cleanupTestPaths(root, "manifest-last")
+	setCleanupTestEnvironment(t, layout)
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "daemon-reload")
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(root, "daemon.lease"),
+		filepath.Join(root, "maintenance.gate"),
+	)
+
+	_, err := Install(ctx, Options{System: "systemd"})
+	if err == nil || !strings.Contains(err.Error(), "daemon-reload") {
+		t.Fatalf("install error = %v, want service commit failure", err)
+	}
+	if _, statErr := os.Lstat(cleanupManifestPath(layout)); !errors.Is(
+		statErr,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("failed install published cleanup ownership: %v", statErr)
+	}
+	unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+	if _, statErr := os.Stat(unitPath); statErr != nil {
+		t.Fatalf("failed install did not retain its exact partial artifact: %v", statErr)
+	}
+
+	_, err = Install(ctx, Options{System: "systemd"})
+	if err == nil || !strings.Contains(err.Error(), "--adopt-existing") {
+		t.Fatalf("retry error = %v, want explicit partial-install adoption", err)
+	}
+	if _, statErr := os.Lstat(cleanupManifestPath(layout)); !errors.Is(
+		statErr,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("rejected retry published cleanup ownership: %v", statErr)
+	}
+
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL", "")
+	plan, err := Install(ctx, Options{
+		System:        "systemd",
+		AdoptExisting: true,
+	})
+	if err != nil {
+		t.Fatalf("explicit partial-install adoption failed: %v", err)
+	}
+	if !containsAction(plan.Actions, "adopt strictly validated existing resources") {
+		t.Fatalf("adoption plan omitted ownership transition: %#v", plan.Actions)
+	}
+	data, err := os.ReadFile(cleanupManifestPath(layout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest cleanupManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manifest.validateAgainst(layout, "systemd"); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestInstallRequiresExplicitAdoptionBeforeWrites(t *testing.T) {
 	layout := newUnmarkedCleanupTestLayout(t, "adoption-required", "unknown")
 	setCleanupTestEnvironment(t, layout)

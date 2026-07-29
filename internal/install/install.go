@@ -48,7 +48,6 @@ type Plan struct {
 }
 
 type installAfterInspectHookContextKey struct{}
-type installAfterManifestHookContextKey struct{}
 
 func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if err := ctx.Err(); err != nil {
@@ -161,23 +160,26 @@ func applyInstall(
 			retErr = errors.Join(retErr, stateDir.close())
 		}
 	}()
-	if err := writeCleanupManifest(paths, system, cleanupManifestWriteOptions{
-		Fresh:         ownership == cleanupOwnershipAbsent,
-		AdoptExisting: ownership == cleanupOwnershipUnmarked && opts.AdoptExisting,
-		LifecyclePath: lockfile.LifecycleLeasePath(ctx),
-		createState: func() (*managedCleanupDir, error) {
-			var err error
-			stateDir, err = createFreshManagedCleanupDir(stateCleanupPath(paths.VarLibDir))
-			return stateDir, err
+	publication, err := prepareCleanupManifestPublication(
+		paths,
+		system,
+		cleanupManifestWriteOptions{
+			Fresh:         ownership == cleanupOwnershipAbsent,
+			AdoptExisting: ownership == cleanupOwnershipUnmarked && opts.AdoptExisting,
+			LifecyclePath: lockfile.LifecycleLeasePath(ctx),
+			createState: func() (*managedCleanupDir, error) {
+				var err error
+				stateDir, err = createFreshManagedCleanupDir(stateCleanupPath(paths.VarLibDir))
+				return stateDir, err
+			},
 		},
-	}); err != nil {
+	)
+	if err != nil {
 		return err
 	}
-	if hook, ok := ctx.Value(installAfterManifestHookContextKey{}).(func() error); ok && hook != nil {
-		if err := hook(); err != nil {
-			return fmt.Errorf("run install post-manifest hook: %w", err)
-		}
-	}
+	defer func() {
+		retErr = errors.Join(retErr, publication.close())
+	}()
 	if stateDir == nil {
 		var exists bool
 		var err error
@@ -238,6 +240,9 @@ func applyInstall(
 				return err
 			}
 		}
+	}
+	if err := publication.publish(); err != nil {
+		return fmt.Errorf("commit cleanup ownership after completed install: %w", err)
 	}
 	return nil
 }
