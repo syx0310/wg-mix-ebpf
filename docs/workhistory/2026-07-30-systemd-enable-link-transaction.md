@@ -19,12 +19,28 @@ sequence. Ordinary mount transitions such as a separate `/usr` or `/etc` are
 allowed while walking to `systemRoot`, but every resulting mount identity is
 held and compared; the artifact-relative subtree may not cross another mount.
 Revalidation requires the declared alias to keep resolving to that same
-canonical root. At each return and commit boundary the code
-revalidates every held FD and every edge. Commit performs a second complete
-walk and compares every component with the original chain before and after
-validating the exact symlink inode, owner, and target. This rejects persistent
-higher-ancestor replacement, `systemRoot` replacement after it was opened, and
-a tree replacement performed inside the second walk.
+canonical root. The walk also records each directory's change generation
+separately from its stable inode identity. Hooks are followed immediately by a
+full held-prefix identity, generation, and edge check. Commit performs a second
+complete walk and compares every component and generation with the original
+chain before and after validating the exact symlink inode, owner, and target.
+Only a narrowly identified directory generation is refreshed after a
+transaction-owned mutation: creation of the final directory, object-bound
+publication in the final parent, or creation plus snapshot and sync of the
+enable link. This rejects persistent replacements and transient
+replace-then-reattach attacks against higher ancestors, `systemRoot`, and the
+wants subtree.
+
+Non-declared managed directories, including the held config/manifest parent,
+separately pin both their held parent generation and their own directory
+generation. Constructors record these baselines only after any exclusive
+`mkdirat` and parent sync. Revalidation compares the parent FD, directory FD,
+and named edge. A successful object publication may refresh only the directory
+generation; state-directory creation or authorized recreation may refresh a
+held sibling's parent generation only after proving both objects hold the same
+post-creation parent.
+Binary and service artifact parent directories are prepared before ownership
+baselining, while the systemd wants directory remains strictly pre-existing.
 
 Failure after enablement is non-destructive. The transaction does not rename,
 unlink, restore, or remove any link or directory. Its error reports the original
@@ -34,15 +50,36 @@ inode, so automatic uninstall cleanup of a present enable link is blocked.
 Operators must inspect and manually remove or retain that exact link before
 retrying validated uninstall.
 
-The adjacent install paths were also audited for mutable-name cleanup. Failed
-temporary service-unit, binary, config, and ownership-manifest publications now
-retain their unique temporary names with an exact-path error instead of
-unlinking by name. Fresh config creation uses a held directory descriptor and a
-no-replace rename, so a concurrently appearing config is preserved and causes a
-fail-closed error. Each writer checks for an earlier retained temporary prefix
-before creating another file, so repeated retries stop for manual resolution
-instead of accumulating additional temporaries. Successful commits clear the
-temporary state after rename and leave no temporary name.
+Fresh service-unit, install-config, and ownership-manifest files no longer use a
+named staging file. Linux creates an `O_TMPFILE` object under the held parent,
+validates its exact bytes, content hash, descriptor identity, mode, size, and
+zero link count, then publishes that held object directly at the absent final
+name with `linkat`. `AT_EMPTY_PATH` is preferred; a `/proc/self/fd` fallback is
+accepted only after proving that the proc descriptor resolves to the same held
+object. The linked descriptor, final descriptor, bytes, hash, and one-link
+identity are checked again. Unsupported filesystems fail closed. Darwin
+production also fails closed because it lacks the required primitive; Darwin
+unit tests explicitly inject an exclusive, non-replacing test backend.
+
+After the link and parent sync, publication refreshes only its own final-parent
+generation before invoking the post-link hook. It then performs an
+unexceptioned parent identity/generation revalidation before rechecking the held
+FD, final pathname, bytes, hash, and link count. Consequently a hook cannot hide
+a final-name away/back cycle or a sibling create/remove cycle inside the
+publisher's allowed generation refresh. Fresh-file inputs also require one
+clean basename and an exact clean display path under the held parent; declared
+artifact paths reject non-clean raw path and default-path inputs before
+canonicalization. Install and uninstall validate the active init system's raw
+service-directory inputs before manifest path construction. When no explicit
+config path is supplied, they also validate the raw default config directory
+before `filepath.Join`, so path construction cannot silently normalize these
+inputs.
+
+No named stage exists to swap, restore, delete, or accumulate. Failure before
+linking reports only the held identity. Failure after linking reports that the
+final object was published and explicitly forbids automatic unlink or rollback.
+The general config replacement API and binary replacement path remain unchanged
+from their pre-change behavior and are outside this fix.
 
 Local regression coverage includes:
 
@@ -50,11 +87,25 @@ Local regression coverage includes:
 - fresh and marked link swaps with successful and failing post-link hooks;
 - wants-directory and persistent higher-ancestor replacement;
 - deterministic replacement inside the second descriptor walk;
+- transient higher-ancestor replacement followed by reattachment of the
+  original inode, plus reattachment of the old wants subtree;
 - replacement of `systemRoot` after opening its component and replacement of a
   canonical root alias;
+- object-bound publication with a hook-inserted foreign final or foreign named
+  object, unsafe name/display-path rejection, simultaneous post-link hook and
+  content-mutation rejection, failure auditing, and an in-place install retry
+  with no temporary-name accumulation;
+- install and uninstall dry runs rejecting non-clean raw systemd, OpenWrt, and
+  default config directory inputs before any normalized path is used;
+- declared and ordinary managed-parent publication tests that reject a
+  post-link final-name away/back cycle and sibling create/remove cycle while
+  retaining the published final and foreign evidence;
+- ordinary managed-directory parent-entry away/back rejection and successful
+  publication with both generation-baseline representations;
 - check-to-unlink and quarantine-name swaps with both owned and foreign links
   preserved;
-- the generic concurrent `mkdirat` `EEXIST` path remaining non-owned;
+- the generic concurrent `mkdirat` `EEXIST` path remaining non-owned and now
+  failing closed on the unowned generation change;
 - automatic uninstall refusal when no durable enable-link inode is recorded,
   followed by successful uninstall after manual link resolution.
 
@@ -68,3 +119,4 @@ namespace operations:
   `go test -exec /usr/bin/true`
 - Linux `amd64` and `arm64` `go vet ./internal/install`
 - Linux `amd64` and `arm64` `go build -trimpath ./cmd/wg-mix-ebpf`
+- Darwin `arm64` production build and install-test compilation

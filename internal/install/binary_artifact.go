@@ -150,19 +150,11 @@ func installBinary(target string) (retErr error) {
 		return fmt.Errorf("inspect existing install binary %s: %w", target, openErr)
 	}
 
-	tempPrefix := "." + name + ".tmp-"
-	if err := refuseRetainedInstallTemporary(
-		parent.dir,
-		tempPrefix,
-		"install binary",
-	); err != nil {
-		return err
-	}
 	randomSuffix, err := newCleanupInstallationID()
 	if err != nil {
 		return err
 	}
-	tempName := tempPrefix + randomSuffix
+	tempName := "." + name + ".tmp-" + randomSuffix
 	out, err := cleanupCreateFileAt(parent.dir, tempName, 0o755)
 	if err != nil {
 		return fmt.Errorf("create temporary install binary: %w", err)
@@ -172,14 +164,13 @@ func installBinary(target string) (retErr error) {
 		if !tempPresent {
 			return
 		}
-		retErr = errors.Join(
-			retErr,
-			fmt.Errorf(
-				"temporary install binary retained without name-based cleanup at %s; "+
-					"manually inspect its identity before removal",
-				filepath.Join(parent.spec.path, tempName),
-			),
-		)
+		if err := cleanupUnlinkAt(parent.dir, tempName, false); err != nil &&
+			!cleanupIsNotExist(err) {
+			retErr = errors.Join(
+				retErr,
+				fmt.Errorf("remove temporary install binary %s: %w", tempName, err),
+			)
+		}
 	}()
 	if err := out.Chmod(0o755); err != nil {
 		_ = out.Close()

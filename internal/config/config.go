@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -247,7 +246,7 @@ func decode(data []byte) (*Config, error) {
 	return &cfg, nil
 }
 
-func SaveFile(path string, cfg *Config) (retErr error) {
+func SaveFile(path string, cfg *Config) error {
 	cfg.ApplyDefaults()
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -257,38 +256,12 @@ func SaveFile(path string, cfg *Config) (retErr error) {
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
-	tempPrefix := "." + filepath.Base(path) + ".tmp-"
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return fmt.Errorf("inspect config directory for retained temporary names: %w", err)
-	}
-	for _, entry := range entries {
-		if strings.HasPrefix(entry.Name(), tempPrefix) {
-			return fmt.Errorf(
-				"refuse to create another temporary config while retained name %s "+
-					"awaits manual identity inspection",
-				filepath.Join(dir, entry.Name()),
-			)
-		}
-	}
-	tmp, err := os.CreateTemp(dir, tempPrefix)
+	tmp, err := os.CreateTemp(dir, "."+filepath.Base(path)+".tmp-")
 	if err != nil {
 		return fmt.Errorf("create temporary config: %w", err)
 	}
 	tmpPath := tmp.Name()
-	tempPresent := true
-	defer func() {
-		if tempPresent {
-			retErr = errors.Join(
-				retErr,
-				fmt.Errorf(
-					"temporary config retained without name-based cleanup at %s; "+
-						"manually inspect its identity before removal",
-					tmpPath,
-				),
-			)
-		}
-	}()
+	defer os.Remove(tmpPath)
 	if err := tmp.Chmod(0o600); err != nil {
 		_ = tmp.Close()
 		return fmt.Errorf("set temporary config permissions: %w", err)
@@ -307,7 +280,6 @@ func SaveFile(path string, cfg *Config) (retErr error) {
 	if err := os.Rename(tmpPath, path); err != nil {
 		return fmt.Errorf("replace config %s: %w", path, err)
 	}
-	tempPresent = false
 	return nil
 }
 

@@ -16,13 +16,17 @@ import (
 )
 
 type serviceArtifactInstallSpec struct {
-	artifact      cleanupManifestArtifact
-	content       []byte
-	mode          os.FileMode
-	defaultParent string
+	artifact           cleanupManifestArtifact
+	content            []byte
+	mode               os.FileMode
+	defaultParent      string
+	beforeFreshPublish func(objectBoundFreshFileHookState) error
 }
 
 func serviceArtifactInstallSpecs(paths paths, system string) ([]serviceArtifactInstallSpec, error) {
+	if err := validateRawServiceArtifactParentPaths(paths, system); err != nil {
+		return nil, err
+	}
 	manifest := expectedCleanupManifest(paths, system, strings.Repeat("0", 32))
 	specs := make([]serviceArtifactInstallSpec, 0, len(manifest.Artifacts))
 	for _, artifact := range manifest.Artifacts {
@@ -66,12 +70,14 @@ func installServiceArtifacts(
 	paths paths,
 	system string,
 	revalidateInstallMetadata func() error,
+	beforeFreshPublish func(objectBoundFreshFileHookState) error,
 ) error {
 	specs, err := serviceArtifactInstallSpecs(paths, system)
 	if err != nil {
 		return err
 	}
 	for _, spec := range specs {
+		spec.beforeFreshPublish = beforeFreshPublish
 		if revalidateInstallMetadata != nil {
 			if err := revalidateInstallMetadata(); err != nil {
 				return fmt.Errorf(
@@ -130,74 +136,40 @@ func installServiceArtifact(spec serviceArtifactInstallSpec) (retErr error) {
 		)
 	}
 
-	tempPrefix := "." + name + ".tmp-"
-	if err := refuseRetainedInstallTemporary(
-		parent.dir,
-		tempPrefix,
-		"service artifact",
-	); err != nil {
-		return err
-	}
-	randomSuffix, err := newCleanupInstallationID()
+	result, err := publishObjectBoundFreshFile(objectBoundFreshFileSpec{
+		parent:        parent,
+		name:          name,
+		path:          spec.artifact.Path,
+		kind:          "service artifact",
+		mode:          spec.mode,
+		content:       spec.content,
+		beforePublish: spec.beforeFreshPublish,
+	})
 	if err != nil {
 		return err
 	}
-	tempName := tempPrefix + randomSuffix
-	temp, err := cleanupCreateFileAt(parent.dir, tempName, uint32(spec.mode.Perm()))
-	if err != nil {
-		return fmt.Errorf("create temporary service artifact %s: %w", spec.artifact.Path, err)
-	}
-	tempPresent := true
 	defer func() {
-		if !tempPresent {
-			return
+		closeErr := result.file.Close()
+		if retErr != nil || closeErr != nil {
+			retErr = errors.Join(
+				retErr,
+				closeErr,
+				objectBoundPublishedFinalAudit(
+					"service artifact",
+					spec.artifact.Path,
+					result.identity,
+				),
+			)
 		}
-		retErr = errors.Join(
-			retErr,
-			fmt.Errorf(
-				"temporary service artifact retained without name-based cleanup at %s; "+
-					"manually inspect its identity before removal",
-				filepath.Join(parent.spec.path, tempName),
-			),
-		)
 	}()
-	if err := temp.Chmod(spec.mode.Perm()); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("set temporary service artifact mode: %w", err)
+	if _, err := result.file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind published service artifact %s: %w", spec.artifact.Path, err)
 	}
-	if _, err := temp.Write(spec.content); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("write temporary service artifact: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("sync temporary service artifact: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("close temporary service artifact: %w", err)
-	}
-	if err := cleanupRenameNoReplaceAt(parent.dir, tempName, name); err != nil {
-		return fmt.Errorf(
-			"atomically install service artifact %s without replacement: %w",
-			spec.artifact.Path,
-			err,
-		)
-	}
-	tempPresent = false
-	if err := parent.dir.file.Sync(); err != nil {
-		return fmt.Errorf("sync service artifact directory %s: %w", parent.spec.path, err)
-	}
-
-	file, identity, err = cleanupOpenFileAt(parent.dir, name)
-	if err != nil {
-		return fmt.Errorf("open installed service artifact %s: %w", spec.artifact.Path, err)
-	}
-	defer file.Close()
 	if _, err := validateServiceArtifactFile(
 		parent.dir,
 		name,
-		file,
-		identity,
+		result.file,
+		result.identity,
 		spec,
 		false,
 	); err != nil {

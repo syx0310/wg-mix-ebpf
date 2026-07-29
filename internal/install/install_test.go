@@ -126,6 +126,117 @@ func TestValidateCleanupPathsRejectsServiceTemplateInjection(t *testing.T) {
 	}
 }
 
+func TestInstallAndUninstallRejectNonCleanServiceDirectoryInputs(t *testing.T) {
+	tests := []struct {
+		name       string
+		system     string
+		env        string
+		selectPath func(paths) string
+	}{
+		{
+			name:       "systemd",
+			system:     "systemd",
+			env:        EnvSystemdDir,
+			selectPath: func(layout paths) string { return layout.SystemdDir },
+		},
+		{
+			name:       "OpenWrt init",
+			system:     "openwrt",
+			env:        EnvOpenWrtInit,
+			selectPath: func(layout paths) string { return layout.OpenWrtInitDir },
+		},
+		{
+			name:       "OpenWrt hotplug",
+			system:     "openwrt",
+			env:        EnvOpenWrtHotplug,
+			selectPath: func(layout paths) string { return layout.OpenWrtHotplugDir },
+		},
+	}
+	for _, test := range tests {
+		for _, operation := range []struct {
+			name string
+			run  func(context.Context, Options) (*Plan, error)
+		}{
+			{name: "install", run: Install},
+			{name: "uninstall", run: Uninstall},
+		} {
+			t.Run(test.name+"/"+operation.name, func(t *testing.T) {
+				root := t.TempDir()
+				layout := cleanupTestPaths(root, "non-clean-service-dir")
+				setCleanupTestEnvironment(t, layout)
+				cleanPath := test.selectPath(layout)
+				rawPath := filepath.Join(filepath.Dir(cleanPath), "detour") +
+					string(os.PathSeparator) + ".." +
+					string(os.PathSeparator) + filepath.Base(cleanPath)
+				t.Setenv(test.env, rawPath)
+
+				_, err := operation.run(t.Context(), Options{
+					System: test.system,
+					DryRun: true,
+				})
+				if err == nil ||
+					!strings.Contains(err.Error(), "non-clean declared artifact path") {
+					t.Fatalf(
+						"%s error = %v, want raw non-clean path rejection",
+						operation.name,
+						err,
+					)
+				}
+				if _, statErr := os.Lstat(cleanPath); !errors.Is(statErr, os.ErrNotExist) {
+					t.Fatalf(
+						"rejected %s created normalized directory %s: %v",
+						operation.name,
+						cleanPath,
+						statErr,
+					)
+				}
+			})
+		}
+	}
+}
+
+func TestInstallAndUninstallRejectNonCleanDefaultConfigDirectory(t *testing.T) {
+	for _, operation := range []struct {
+		name string
+		run  func(context.Context, Options) (*Plan, error)
+	}{
+		{name: "install", run: Install},
+		{name: "uninstall", run: Uninstall},
+	} {
+		t.Run(operation.name, func(t *testing.T) {
+			root := t.TempDir()
+			layout := cleanupTestPaths(root, "non-clean-default-config")
+			setCleanupTestEnvironment(t, layout)
+			cleanEtcDir := filepath.Dir(layout.ConfigPath)
+			rawEtcDir := filepath.Join(filepath.Dir(cleanEtcDir), "detour") +
+				string(os.PathSeparator) + ".." +
+				string(os.PathSeparator) + filepath.Base(cleanEtcDir)
+			t.Setenv(EnvEtcDir, rawEtcDir)
+
+			_, err := operation.run(t.Context(), Options{
+				System: "unknown",
+				DryRun: true,
+			})
+			if err == nil ||
+				!strings.Contains(err.Error(), "non-clean default config directory") {
+				t.Fatalf(
+					"%s error = %v, want raw default config directory rejection",
+					operation.name,
+					err,
+				)
+			}
+			if _, statErr := os.Lstat(cleanEtcDir); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf(
+					"rejected %s created normalized config directory %s: %v",
+					operation.name,
+					cleanEtcDir,
+					statErr,
+				)
+			}
+		})
+	}
+}
+
 func TestOpenWrtHotplugDoesNotUseNanosecondDate(t *testing.T) {
 	script := openWrtHotplug()
 	if strings.Contains(script, "%N") {
@@ -2015,6 +2126,43 @@ func TestInstallExplicitlyAdoptsValidatedResources(t *testing.T) {
 	}
 }
 
+func TestInstallAdoptionRecreatesMissingStateSiblingAfterConfigBaseline(
+	t *testing.T,
+) {
+	layout := cleanupTestPaths(t.TempDir(), "adoption-missing-state")
+	if err := os.MkdirAll(filepath.Dir(layout.ConfigPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveFile(layout.ConfigPath, config.SafeTemplate()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(layout.RunDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(layout.RunDir, "lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setCleanupTestEnvironment(t, layout)
+	lifecycleRoot := t.TempDir()
+
+	if _, err := Install(
+		lockfile.WithLifecyclePathsForTest(
+			t.Context(),
+			filepath.Join(lifecycleRoot, "daemon.lease"),
+			filepath.Join(lifecycleRoot, "maintenance.gate"),
+		),
+		Options{System: "unknown", AdoptExisting: true},
+	); err != nil {
+		t.Fatalf("adopt install with missing state sibling: %v", err)
+	}
+	if info, err := os.Stat(layout.VarLibDir); err != nil || !info.IsDir() {
+		t.Fatalf("recreated state directory info=%v err=%v", info, err)
+	}
+	if _, err := os.Stat(cleanupManifestPath(layout)); err != nil {
+		t.Fatalf("adoption did not publish ownership manifest: %v", err)
+	}
+}
+
 func TestInstallDryRunValidatesExplicitAdoptionWithoutWrites(t *testing.T) {
 	layout := newUnmarkedCleanupTestLayout(t, "adoption-dry-run", "unknown")
 	setCleanupTestEnvironment(t, layout)
@@ -2201,7 +2349,8 @@ func TestMarkedReinstallRetainsConfigDescriptorIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := publication.publish(); err == nil ||
-		!strings.Contains(err.Error(), "marked install config") {
+		(!strings.Contains(err.Error(), "marked install config") &&
+			!strings.Contains(err.Error(), "directory generation changed")) {
 		t.Fatalf("publication error = %v, want held config identity rejection", err)
 	}
 	if _, statErr := os.Stat(originalConfig); statErr != nil {
@@ -2958,7 +3107,7 @@ func TestInstalledServiceArtifactRejectsParentPathSwap(t *testing.T) {
 		"install-artifact-parent-swap",
 		"systemd",
 	)
-	if err := installServiceArtifacts(layout, "systemd", nil); err != nil {
+	if err := installServiceArtifacts(layout, "systemd", nil, nil); err != nil {
 		t.Fatal(err)
 	}
 	artifact, err := openInstalledServiceArtifact(
@@ -3442,5 +3591,69 @@ const (
 )
 
 func TestMain(m *testing.M) {
-	os.Exit(m.Run())
+	const testTempPrefix = ".wg-mix-ebpf-install-tests-"
+	workingDir, err := os.Getwd()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "resolve install package test directory: %v\n", err)
+		os.Exit(1)
+	}
+	workingDir = filepath.Clean(workingDir)
+	testTempRoot, err := os.MkdirTemp(
+		workingDir,
+		testTempPrefix,
+	)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "create isolated install test root: %v\n", err)
+		os.Exit(1)
+	}
+	removeTestTempRoot := func() error {
+		if testTempRoot == "" ||
+			!filepath.IsAbs(testTempRoot) ||
+			filepath.Clean(testTempRoot) != testTempRoot ||
+			filepath.Dir(testTempRoot) != workingDir ||
+			!strings.HasPrefix(filepath.Base(testTempRoot), testTempPrefix) {
+			return fmt.Errorf(
+				"refuse unsafe isolated install test root cleanup %q",
+				testTempRoot,
+			)
+		}
+		entries, err := os.ReadDir(testTempRoot)
+		if err != nil {
+			return err
+		}
+		if len(entries) != 0 {
+			return fmt.Errorf(
+				"isolated install test root %s retained %d entries",
+				testTempRoot,
+				len(entries),
+			)
+		}
+		return os.Remove(testTempRoot)
+	}
+	if err := os.Setenv("TMPDIR", testTempRoot); err != nil {
+		fmt.Fprintf(os.Stderr, "set isolated install test root: %v\n", err)
+		if removeErr := removeTestTempRoot(); removeErr != nil {
+			fmt.Fprintf(
+				os.Stderr,
+				"remove isolated install test root %s: %v\n",
+				testTempRoot,
+				removeErr,
+			)
+		}
+		os.Exit(1)
+	}
+
+	code := m.Run()
+	if err := removeTestTempRoot(); err != nil {
+		fmt.Fprintf(
+			os.Stderr,
+			"remove isolated install test root %s: %v\n",
+			testTempRoot,
+			err,
+		)
+		if code == 0 {
+			code = 1
+		}
+	}
+	os.Exit(code)
 }

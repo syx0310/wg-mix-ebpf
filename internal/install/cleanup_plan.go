@@ -26,11 +26,34 @@ type managedCleanupDir struct {
 	dir                   *cleanupDirFD
 	name                  string
 	identity              cleanupIdentity
+	parentGeneration      cleanupDirectoryGeneration
+	dirGeneration         cleanupDirectoryGeneration
+	managedGenerationSet  bool
 	declaredChain         []*cleanupDirFD
 	declaredEdges         []string
+	declaredGenerations   []cleanupDirectoryGeneration
 	declaredCanonicalRoot string
 	declaredCanonicalPath string
 	declaredRootDepth     int
+}
+
+type cleanupDirectoryGeneration struct {
+	changeSec  int64
+	changeNsec int64
+}
+
+func directoryGeneration(identity cleanupIdentity) cleanupDirectoryGeneration {
+	return cleanupDirectoryGeneration{
+		changeSec:  identity.ChangeSec,
+		changeNsec: identity.ChangeNsec,
+	}
+}
+
+func (generation cleanupDirectoryGeneration) same(
+	other cleanupDirectoryGeneration,
+) bool {
+	return generation.changeSec == other.changeSec &&
+		generation.changeNsec == other.changeNsec
 }
 
 func (dir *managedCleanupDir) close() error {
@@ -41,14 +64,18 @@ func (dir *managedCleanupDir) close() error {
 		err := closeCleanupDirFDChain(dir.declaredChain)
 		dir.declaredChain = nil
 		dir.declaredEdges = nil
+		dir.declaredGenerations = nil
 		dir.declaredCanonicalRoot = ""
 		dir.declaredCanonicalPath = ""
 		dir.declaredRootDepth = 0
 		dir.parent = nil
 		dir.dir = nil
+		dir.managedGenerationSet = false
 		return err
 	}
-	return errors.Join(dir.dir.close(), dir.parent.close())
+	err := errors.Join(dir.dir.close(), dir.parent.close())
+	dir.managedGenerationSet = false
+	return err
 }
 
 func closeCleanupDirFDChain(chain []*cleanupDirFD) error {
@@ -138,13 +165,17 @@ func createFreshManagedCleanupDir(spec cleanupPathSpec) (*managedCleanupDir, err
 			return nil, err
 		}
 		if final {
-			return &managedCleanupDir{
+			dir := &managedCleanupDir{
 				spec:     spec,
 				parent:   current,
 				dir:      child,
 				name:     component,
 				identity: child.identity,
-			}, nil
+			}
+			if err := initializeManagedCleanupDirGenerations(dir); err != nil {
+				return nil, errors.Join(err, dir.close())
+			}
+			return dir, nil
 		}
 		_ = current.close()
 		current = child
@@ -160,26 +191,118 @@ func revalidateManagedCleanupDir(dir *managedCleanupDir) error {
 	if len(dir.declaredChain) != 0 {
 		return revalidateDeclaredDirectoryChain(dir)
 	}
-	heldIdentity, err := cleanupIdentityForFD(int(dir.dir.file.Fd()))
-	if err != nil {
-		return fmt.Errorf("inspect held %s %s: %w", dir.spec.name, dir.spec.path, err)
-	}
-	if !dir.identity.sameDirectory(heldIdentity) {
-		return fmt.Errorf("refuse %s %s: held directory identity changed", dir.spec.name, dir.spec.path)
-	}
-	namedIdentity, err := cleanupIdentityAt(dir.parent, dir.name)
-	if err != nil {
-		return fmt.Errorf("revalidate %s pathname %s: %w", dir.spec.name, dir.spec.path, err)
-	}
-	if !heldIdentity.sameDirectory(namedIdentity) {
-		return fmt.Errorf("refuse %s %s: pathname no longer names the held directory", dir.spec.name, dir.spec.path)
-	}
-	return nil
+	_, err := revalidateNonDeclaredManagedCleanupDir(dir, false)
+	return err
 }
 
-func revalidateDeclaredDirectoryChain(dir *managedCleanupDir) (retErr error) {
+func initializeManagedCleanupDirGenerations(dir *managedCleanupDir) error {
+	parentIdentity, heldIdentity, _, err := inspectNonDeclaredManagedCleanupDir(dir)
+	if err != nil {
+		return err
+	}
+	dir.parentGeneration = directoryGeneration(parentIdentity)
+	dir.dirGeneration = directoryGeneration(heldIdentity)
+	dir.managedGenerationSet = true
+	return revalidateManagedCleanupDir(dir)
+}
+
+func revalidateNonDeclaredManagedCleanupDir(
+	dir *managedCleanupDir,
+	allowDirGenerationChange bool,
+) (cleanupDirectoryGeneration, error) {
+	if dir == nil || len(dir.declaredChain) != 0 {
+		return cleanupDirectoryGeneration{}, errors.New(
+			"cannot revalidate generations for a declared or nil managed directory",
+		)
+	}
+	if !dir.managedGenerationSet {
+		return cleanupDirectoryGeneration{}, errors.New(
+			"cannot revalidate a managed directory without generation baselines",
+		)
+	}
+	parentIdentity, heldIdentity, _, err := inspectNonDeclaredManagedCleanupDir(dir)
+	if err != nil {
+		return cleanupDirectoryGeneration{}, err
+	}
+	if !dir.parentGeneration.same(directoryGeneration(parentIdentity)) {
+		return cleanupDirectoryGeneration{}, fmt.Errorf(
+			"refuse %s %s: held parent generation changed",
+			dir.spec.name,
+			dir.spec.path,
+		)
+	}
+	heldGeneration := directoryGeneration(heldIdentity)
+	if !allowDirGenerationChange && !dir.dirGeneration.same(heldGeneration) {
+		return cleanupDirectoryGeneration{}, fmt.Errorf(
+			"refuse %s %s: directory generation changed",
+			dir.spec.name,
+			dir.spec.path,
+		)
+	}
+	return heldGeneration, nil
+}
+
+func inspectNonDeclaredManagedCleanupDir(
+	dir *managedCleanupDir,
+) (
+	parentIdentity cleanupIdentity,
+	heldIdentity cleanupIdentity,
+	namedIdentity cleanupIdentity,
+	retErr error,
+) {
+	if dir == nil || dir.parent == nil || dir.parent.file == nil ||
+		dir.dir == nil || dir.dir.file == nil || dir.name == "" {
+		return cleanupIdentity{}, cleanupIdentity{}, cleanupIdentity{},
+			errors.New("cannot inspect an unheld managed directory")
+	}
+	parentIdentity, err := cleanupIdentityForFD(int(dir.parent.file.Fd()))
+	if err != nil {
+		return cleanupIdentity{}, cleanupIdentity{}, cleanupIdentity{},
+			fmt.Errorf("inspect held parent for %s %s: %w", dir.spec.name, dir.spec.path, err)
+	}
+	if !dir.parent.identity.sameDirectory(parentIdentity) {
+		return cleanupIdentity{}, cleanupIdentity{}, cleanupIdentity{},
+			fmt.Errorf(
+				"refuse %s %s: held parent directory identity changed",
+				dir.spec.name,
+				dir.spec.path,
+			)
+	}
+	heldIdentity, err = cleanupIdentityForFD(int(dir.dir.file.Fd()))
+	if err != nil {
+		return cleanupIdentity{}, cleanupIdentity{}, cleanupIdentity{},
+			fmt.Errorf("inspect held %s %s: %w", dir.spec.name, dir.spec.path, err)
+	}
+	if !dir.identity.sameDirectory(heldIdentity) {
+		return cleanupIdentity{}, cleanupIdentity{}, cleanupIdentity{},
+			fmt.Errorf(
+				"refuse %s %s: held directory identity changed",
+				dir.spec.name,
+				dir.spec.path,
+			)
+	}
+	namedIdentity, err = cleanupIdentityAt(dir.parent, dir.name)
+	if err != nil {
+		return cleanupIdentity{}, cleanupIdentity{}, cleanupIdentity{},
+			fmt.Errorf("revalidate %s pathname %s: %w", dir.spec.name, dir.spec.path, err)
+	}
+	if !heldIdentity.sameDirectory(namedIdentity) ||
+		!directoryGeneration(heldIdentity).same(directoryGeneration(namedIdentity)) {
+		return cleanupIdentity{}, cleanupIdentity{}, cleanupIdentity{},
+			fmt.Errorf(
+				"refuse %s %s: pathname no longer names the held directory "+
+					"with its current generation",
+				dir.spec.name,
+				dir.spec.path,
+			)
+	}
+	return parentIdentity, heldIdentity, namedIdentity, nil
+}
+
+func revalidateDeclaredDirectoryChain(dir *managedCleanupDir) error {
 	if dir == nil || len(dir.declaredChain) < 2 ||
 		len(dir.declaredEdges)+1 != len(dir.declaredChain) ||
+		len(dir.declaredGenerations) != len(dir.declaredChain) ||
 		dir.declaredRootDepth < 0 ||
 		dir.declaredRootDepth > len(dir.declaredEdges) ||
 		dir.declaredCanonicalRoot == "" ||
@@ -195,13 +318,43 @@ func revalidateDeclaredDirectoryChain(dir *managedCleanupDir) (retErr error) {
 	if err := revalidateDeclaredCanonicalRoot(dir); err != nil {
 		return err
 	}
+	if err := revalidateDeclaredDirectoryPrefix(
+		dir.spec.path,
+		dir.declaredChain,
+		dir.declaredEdges,
+		dir.declaredGenerations,
+		dir.declaredRootDepth,
+		-1,
+	); err != nil {
+		return err
+	}
+	if err := revalidateDeclaredCanonicalRoot(dir); err != nil {
+		return err
+	}
+	return nil
+}
 
+func revalidateDeclaredDirectoryPrefix(
+	declaredPath string,
+	chain []*cleanupDirFD,
+	edges []string,
+	generations []cleanupDirectoryGeneration,
+	rootDepth int,
+	allowedGenerationIndex int,
+) (retErr error) {
+	if len(chain) == 0 ||
+		len(edges)+1 != len(chain) ||
+		len(generations) != len(chain) ||
+		rootDepth < 0 ||
+		allowedGenerationIndex >= len(chain) {
+		return errors.New("cannot revalidate an incomplete declared directory prefix")
+	}
 	kernelRoot := string(os.PathSeparator)
 	reopenedAnchor, err := cleanupOpenAnchor(kernelRoot)
 	if err != nil {
 		return fmt.Errorf(
 			"reopen kernel root for declared directory %s: %w",
-			dir.spec.path,
+			declaredPath,
 			err,
 		)
 	}
@@ -209,22 +362,16 @@ func revalidateDeclaredDirectoryChain(dir *managedCleanupDir) (retErr error) {
 		if err := reopenedAnchor.close(); err != nil {
 			retErr = errors.Join(
 				retErr,
-				fmt.Errorf("close reopened kernel root for %s: %w", dir.spec.path, err),
+				fmt.Errorf("close reopened kernel root for %s: %w", declaredPath, err),
 			)
 		}
 	}()
-	if !dir.declaredChain[0].identity.sameDirectory(reopenedAnchor.identity) {
-		return fmt.Errorf(
-			"refuse declared directory %s: kernel root identity changed",
-			dir.spec.path,
-		)
-	}
 
-	for index, held := range dir.declaredChain {
+	for index, held := range chain {
 		if held == nil || held.file == nil {
 			return fmt.Errorf(
 				"refuse declared directory %s: component %d is no longer held",
-				dir.spec.path,
+				declaredPath,
 				index,
 			)
 		}
@@ -239,14 +386,37 @@ func revalidateDeclaredDirectoryChain(dir *managedCleanupDir) (retErr error) {
 		if !held.identity.sameDirectory(heldIdentity) {
 			return fmt.Errorf(
 				"refuse declared directory %s: held component identity changed at %s",
-				dir.spec.path,
+				declaredPath,
+				held.path,
+			)
+		}
+		if index != allowedGenerationIndex &&
+			!generations[index].same(directoryGeneration(heldIdentity)) {
+			return fmt.Errorf(
+				"refuse declared directory %s: component generation changed at %s",
+				declaredPath,
 				held.path,
 			)
 		}
 		if index == 0 {
+			if !heldIdentity.sameDirectory(reopenedAnchor.identity) ||
+				(index != allowedGenerationIndex &&
+					!directoryGeneration(heldIdentity).same(
+						directoryGeneration(reopenedAnchor.identity),
+					)) {
+				return fmt.Errorf(
+					"refuse declared directory %s: kernel root identity or generation changed",
+					declaredPath,
+				)
+			}
 			continue
 		}
-		namedIdentity, err := declaredDirectoryEdgeIdentity(dir, index-1)
+		namedIdentity, err := declaredDirectoryEdgeIdentityForPrefix(
+			chain,
+			edges,
+			rootDepth,
+			index-1,
+		)
 		if err != nil {
 			return fmt.Errorf(
 				"revalidate declared directory edge %s: %w",
@@ -254,16 +424,18 @@ func revalidateDeclaredDirectoryChain(dir *managedCleanupDir) (retErr error) {
 				err,
 			)
 		}
-		if !heldIdentity.sameDirectory(namedIdentity) {
+		if !heldIdentity.sameDirectory(namedIdentity) ||
+			(index != allowedGenerationIndex &&
+				!directoryGeneration(heldIdentity).same(
+					directoryGeneration(namedIdentity),
+				)) {
 			return fmt.Errorf(
-				"refuse declared directory %s: parent edge no longer names held component %s",
-				dir.spec.path,
+				"refuse declared directory %s: parent edge no longer names held component %s "+
+					"with its recorded generation",
+				declaredPath,
 				held.path,
 			)
 		}
-	}
-	if err := revalidateDeclaredCanonicalRoot(dir); err != nil {
-		return err
 	}
 	return nil
 }
@@ -272,9 +444,23 @@ func declaredDirectoryEdgeIdentity(
 	dir *managedCleanupDir,
 	edgeIndex int,
 ) (cleanupIdentity, error) {
-	parent := dir.declaredChain[edgeIndex]
-	name := dir.declaredEdges[edgeIndex]
-	if !declaredDirectoryEdgeMayCrossMount(edgeIndex, dir.declaredRootDepth) {
+	return declaredDirectoryEdgeIdentityForPrefix(
+		dir.declaredChain,
+		dir.declaredEdges,
+		dir.declaredRootDepth,
+		edgeIndex,
+	)
+}
+
+func declaredDirectoryEdgeIdentityForPrefix(
+	chain []*cleanupDirFD,
+	edges []string,
+	rootDepth int,
+	edgeIndex int,
+) (cleanupIdentity, error) {
+	parent := chain[edgeIndex]
+	name := edges[edgeIndex]
+	if !declaredDirectoryEdgeMayCrossMount(edgeIndex, rootDepth) {
 		return cleanupIdentityAt(parent, name)
 	}
 	child, err := cleanupOpenDirAtAllowMount(parent, name)
@@ -294,6 +480,169 @@ func declaredDirectoryEdgeMayCrossMount(edgeIndex int, rootDepth int) bool {
 	// Once systemRoot is reached, the artifact-relative subtree remains on
 	// that fixed mount.
 	return edgeIndex >= 0 && edgeIndex < rootDepth
+}
+
+func refreshDeclaredDirectoryGenerationAfterOwnedMutation(
+	dir *managedCleanupDir,
+	componentIndex int,
+) error {
+	if dir == nil {
+		return errors.New("cannot refresh a nil managed directory")
+	}
+	if len(dir.declaredChain) == 0 {
+		return revalidateManagedCleanupDir(dir)
+	}
+	if err := refreshDeclaredDirectoryPrefixGeneration(
+		dir.spec.path,
+		dir.declaredChain,
+		dir.declaredEdges,
+		dir.declaredGenerations,
+		dir.declaredRootDepth,
+		componentIndex,
+	); err != nil {
+		return err
+	}
+	return revalidateDeclaredDirectoryChain(dir)
+}
+
+func refreshManagedFinalDirectoryGenerationAfterOwnedMutation(
+	dir *managedCleanupDir,
+) error {
+	if dir == nil {
+		return errors.New("cannot refresh a nil managed directory")
+	}
+	if len(dir.declaredChain) == 0 {
+		generation, err := revalidateNonDeclaredManagedCleanupDir(dir, true)
+		if err != nil {
+			return fmt.Errorf(
+				"revalidate managed directory before owned generation refresh: %w",
+				err,
+			)
+		}
+		dir.dirGeneration = generation
+		if err := revalidateManagedCleanupDir(dir); err != nil {
+			return fmt.Errorf(
+				"revalidate managed directory after owned generation refresh: %w",
+				err,
+			)
+		}
+		return nil
+	}
+	return refreshDeclaredDirectoryGenerationAfterOwnedMutation(
+		dir,
+		len(dir.declaredChain)-1,
+	)
+}
+
+func refreshManagedParentGenerationAfterOwnedChildCreation(
+	dir *managedCleanupDir,
+	created *managedCleanupDir,
+) error {
+	if dir == nil || created == nil ||
+		len(dir.declaredChain) != 0 ||
+		len(created.declaredChain) != 0 {
+		return errors.New(
+			"managed parent generation refresh requires two non-declared held directories",
+		)
+	}
+	if err := revalidateManagedCleanupDir(created); err != nil {
+		return fmt.Errorf(
+			"revalidate transaction-created managed directory before parent refresh: %w",
+			err,
+		)
+	}
+	dirParent, dirHeld, _, err := inspectNonDeclaredManagedCleanupDir(dir)
+	if err != nil {
+		return err
+	}
+	if !dir.dirGeneration.same(directoryGeneration(dirHeld)) {
+		return fmt.Errorf(
+			"refuse %s %s parent refresh: managed directory generation also changed",
+			dir.spec.name,
+			dir.spec.path,
+		)
+	}
+	createdParent, _, _, err := inspectNonDeclaredManagedCleanupDir(created)
+	if err != nil {
+		return err
+	}
+	if !dirParent.sameDirectory(createdParent) {
+		return revalidateManagedCleanupDir(dir)
+	}
+	currentParentGeneration := directoryGeneration(dirParent)
+	if !created.parentGeneration.same(currentParentGeneration) {
+		return errors.New(
+			"refuse managed parent refresh: transaction-created directory does not hold " +
+				"the same post-creation parent generation",
+		)
+	}
+	dir.parentGeneration = currentParentGeneration
+	if err := revalidateManagedCleanupDir(dir); err != nil {
+		return fmt.Errorf(
+			"revalidate managed directory after owned child-creation parent refresh: %w",
+			err,
+		)
+	}
+	return nil
+}
+
+func refreshDeclaredDirectoryPrefixGeneration(
+	declaredPath string,
+	chain []*cleanupDirFD,
+	edges []string,
+	generations []cleanupDirectoryGeneration,
+	rootDepth int,
+	componentIndex int,
+) error {
+	if componentIndex < 0 || componentIndex >= len(chain) {
+		return fmt.Errorf(
+			"refuse to refresh undeclared directory generation index %d for %s",
+			componentIndex,
+			declaredPath,
+		)
+	}
+	if err := revalidateDeclaredDirectoryPrefix(
+		declaredPath,
+		chain,
+		edges,
+		generations,
+		rootDepth,
+		componentIndex,
+	); err != nil {
+		return fmt.Errorf(
+			"revalidate declared directory before owned generation refresh: %w",
+			err,
+		)
+	}
+	identity, err := cleanupIdentityForFD(int(chain[componentIndex].file.Fd()))
+	if err != nil {
+		return fmt.Errorf(
+			"inspect owned-mutated declared directory %s: %w",
+			chain[componentIndex].path,
+			err,
+		)
+	}
+	if !chain[componentIndex].identity.sameDirectory(identity) {
+		return fmt.Errorf(
+			"refuse owned generation refresh for changed directory identity %s",
+			chain[componentIndex].path,
+		)
+	}
+	generations[componentIndex] = directoryGeneration(identity)
+	if err := revalidateDeclaredDirectoryPrefix(
+		declaredPath,
+		chain,
+		edges,
+		generations,
+		rootDepth,
+		-1,
+	); err != nil {
+		return fmt.Errorf(
+			"revalidate declared directory after owned generation refresh: %w",
+			err,
+		)
+	}
+	return nil
 }
 
 func revalidateDeclaredCanonicalRoot(dir *managedCleanupDir) error {
@@ -335,7 +684,9 @@ func compareDeclaredDirectoryChains(
 	if held == nil || reopened == nil ||
 		len(held.declaredChain) == 0 ||
 		len(held.declaredChain) != len(reopened.declaredChain) ||
-		len(held.declaredEdges) != len(reopened.declaredEdges) {
+		len(held.declaredEdges) != len(reopened.declaredEdges) ||
+		len(held.declaredGenerations) != len(held.declaredChain) ||
+		len(reopened.declaredGenerations) != len(reopened.declaredChain) {
 		return errors.New("declared directory walks produced different chain lengths")
 	}
 	if held.spec.path != reopened.spec.path ||
@@ -344,6 +695,12 @@ func compareDeclaredDirectoryChains(
 		held.declaredCanonicalPath != reopened.declaredCanonicalPath ||
 		held.declaredRootDepth != reopened.declaredRootDepth {
 		return errors.New("declared directory walks used different roots")
+	}
+	if err := revalidateDeclaredDirectoryChain(held); err != nil {
+		return fmt.Errorf("revalidate original declared chain before comparison: %w", err)
+	}
+	if err := revalidateDeclaredDirectoryChain(reopened); err != nil {
+		return fmt.Errorf("revalidate reopened declared chain before comparison: %w", err)
 	}
 	for index := range held.declaredChain {
 		if index > 0 &&
@@ -375,12 +732,28 @@ func compareDeclaredDirectoryChains(
 		}
 		if !held.declaredChain[index].identity.sameDirectory(heldIdentity) ||
 			!reopened.declaredChain[index].identity.sameDirectory(reopenedIdentity) ||
-			!heldIdentity.sameDirectory(reopenedIdentity) {
+			!heldIdentity.sameDirectory(reopenedIdentity) ||
+			!held.declaredGenerations[index].same(
+				directoryGeneration(heldIdentity),
+			) ||
+			!reopened.declaredGenerations[index].same(
+				directoryGeneration(reopenedIdentity),
+			) ||
+			!directoryGeneration(heldIdentity).same(
+				directoryGeneration(reopenedIdentity),
+			) {
 			return fmt.Errorf(
-				"declared path no longer reaches the held component %s",
+				"declared path no longer reaches the held component %s "+
+					"with its recorded generation",
 				held.declaredChain[index].path,
 			)
 		}
+	}
+	if err := revalidateDeclaredDirectoryChain(held); err != nil {
+		return fmt.Errorf("revalidate original declared chain after comparison: %w", err)
+	}
+	if err := revalidateDeclaredDirectoryChain(reopened); err != nil {
+		return fmt.Errorf("revalidate reopened declared chain after comparison: %w", err)
 	}
 	return nil
 }
@@ -441,13 +814,17 @@ func openManagedCleanupDirWithOptions(
 			return nil, false, err
 		}
 		if index == len(components)-1 {
-			return &managedCleanupDir{
+			dir := &managedCleanupDir{
 				spec:     spec,
 				parent:   current,
 				dir:      child,
 				name:     component,
 				identity: child.identity,
-			}, true, nil
+			}
+			if err := initializeManagedCleanupDirGenerations(dir); err != nil {
+				return nil, false, errors.Join(err, dir.close())
+			}
+			return dir, true, nil
 		}
 		_ = current.close()
 		current = child
@@ -1444,7 +1821,23 @@ func openOrCreateDeclaredArtifactParent(
 }
 
 func declaredArtifactPathSpec(path string, defaultPath string) (cleanupPathSpec, error) {
-	path = filepath.Clean(path)
+	for _, input := range []struct {
+		name  string
+		value string
+	}{
+		{name: "path", value: path},
+		{name: "default path", value: defaultPath},
+	} {
+		if input.value == "" ||
+			!filepath.IsAbs(input.value) ||
+			filepath.Clean(input.value) != input.value {
+			return cleanupPathSpec{}, fmt.Errorf(
+				"refuse empty, relative, or non-clean declared artifact %s %q",
+				input.name,
+				input.value,
+			)
+		}
+	}
 	tempRoot := filepath.Clean(os.TempDir())
 	physicalTempRoot, _ := filepath.EvalSymlinks(tempRoot)
 	physicalTempRoot = filepath.Clean(physicalTempRoot)
@@ -1454,8 +1847,8 @@ func declaredArtifactPathSpec(path string, defaultPath string) (cleanupPathSpec,
 		defaultPath: defaultPath,
 	}
 	switch {
-	case path == filepath.Clean(defaultPath):
-		spec.systemRoot = filepath.Dir(filepath.Clean(defaultPath))
+	case path == defaultPath:
+		spec.systemRoot = filepath.Dir(defaultPath)
 		spec.defaultPath = path
 		spec.path = path
 		return spec, nil
@@ -1520,6 +1913,10 @@ func openExactDeclaredDirectoryWithOptions(
 		)
 	}
 	chain := []*cleanupDirFD{anchor}
+	openedEdges := make([]string, 0, len(components))
+	generations := []cleanupDirectoryGeneration{
+		directoryGeneration(anchor.identity),
+	}
 	current := anchor
 	owner := uint32(os.Geteuid())
 	canonicalTempRoot, err := filepath.EvalSymlinks(os.TempDir())
@@ -1564,6 +1961,21 @@ func openExactDeclaredDirectoryWithOptions(
 						err,
 					)
 				}
+				if err := refreshDeclaredDirectoryPrefixGeneration(
+					spec.path,
+					chain,
+					openedEdges,
+					generations,
+					len(rootComponents),
+					len(chain)-1,
+				); err != nil {
+					_ = closeCleanupDirFDChain(chain)
+					return nil, false, false, fmt.Errorf(
+						"refresh declared parent generation after creating %s: %w",
+						spec.path,
+						err,
+					)
+				}
 			case errors.Is(createErr, os.ErrExist):
 				// A concurrent creator won the exclusive mkdirat. Open its
 				// directory, but never report it as transaction-created.
@@ -1603,14 +2015,48 @@ func openExactDeclaredDirectoryWithOptions(
 			return nil, false, false, validateErr
 		}
 		chain = append(chain, child)
+		openedEdges = append(openedEdges, component)
+		generations = append(generations, directoryGeneration(child.identity))
 		if options.afterOpen != nil {
+			var hookErr error
 			if err := options.afterOpen(child.path); err != nil {
-				_ = closeCleanupDirFDChain(chain)
-				return nil, false, false, fmt.Errorf(
+				hookErr = fmt.Errorf(
 					"run declared directory post-open hook for %s: %w",
 					child.path,
 					err,
 				)
+			}
+			var prefixErr error
+			if err := revalidateDeclaredDirectoryPrefix(
+				spec.path,
+				chain,
+				openedEdges,
+				generations,
+				len(rootComponents),
+				-1,
+			); err != nil {
+				prefixErr = fmt.Errorf(
+					"revalidate declared directory immediately after post-open hook at %s: %w",
+					child.path,
+					err,
+				)
+			}
+			partial := &managedCleanupDir{
+				spec:                  spec,
+				declaredCanonicalRoot: canonicalRoot,
+				declaredCanonicalPath: canonicalPath,
+			}
+			var canonicalErr error
+			if err := revalidateDeclaredCanonicalRoot(partial); err != nil {
+				canonicalErr = fmt.Errorf(
+					"revalidate canonical declared root immediately after post-open hook at %s: %w",
+					child.path,
+					err,
+				)
+			}
+			if err := errors.Join(hookErr, prefixErr, canonicalErr); err != nil {
+				_ = closeCleanupDirFDChain(chain)
+				return nil, false, false, err
 			}
 		}
 		if final {
@@ -1621,7 +2067,8 @@ func openExactDeclaredDirectoryWithOptions(
 				name:                  component,
 				identity:              child.identity,
 				declaredChain:         chain,
-				declaredEdges:         append([]string(nil), components...),
+				declaredEdges:         openedEdges,
+				declaredGenerations:   generations,
 				declaredCanonicalRoot: canonicalRoot,
 				declaredCanonicalPath: canonicalPath,
 				declaredRootDepth:     len(rootComponents),

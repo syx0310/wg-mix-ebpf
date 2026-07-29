@@ -128,6 +128,12 @@ func beginSystemdEnableLinkTransaction(
 	if err := parent.dir.file.Sync(); err != nil {
 		return nil, fmt.Errorf("sync systemd enable link directory %s: %w", parent.spec.path, err)
 	}
+	if err := refreshManagedFinalDirectoryGenerationAfterOwnedMutation(parent); err != nil {
+		return nil, fmt.Errorf(
+			"refresh declared wants-directory generation after publishing exact enable link: %w",
+			err,
+		)
+	}
 	if err := revalidateManagedCleanupDir(parent); err != nil {
 		return nil, err
 	}

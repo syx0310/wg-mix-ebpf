@@ -53,14 +53,18 @@ type installAfterLifecycleHookContextKey struct{}
 type installAfterSystemdEnableLinkHookContextKey struct{}
 type installAfterSystemdEnableCommitWalkOpenHookContextKey struct{}
 type installAfterSystemdEnableRetentionCheckHookContextKey struct{}
+type installBeforeObjectBoundFreshPublishHookContextKey struct{}
 
 func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := validateRawDefaultConfigDirectory(opts.ConfigPath); err != nil {
+		return nil, err
+	}
 	system := detectSystem(opts.System)
 	paths := resolvedPaths(opts.ConfigPath)
-	if err := validateInstallOwnershipPaths(paths); err != nil {
+	if err := validateInstallOwnershipPaths(paths, system); err != nil {
 		return nil, err
 	}
 	ownership, err := inspectInstallCleanupOwnership(paths, system)
@@ -165,6 +169,9 @@ func applyInstall(
 	paths paths,
 	ownership cleanupOwnershipState,
 ) (retErr error) {
+	freshPublishHook, _ := ctx.Value(
+		installBeforeObjectBoundFreshPublishHookContextKey{},
+	).(func(objectBoundFreshFileHookState) error)
 	configDir := filepath.Dir(paths.ConfigPath)
 	if ownership == cleanupOwnershipAbsent {
 		freshConfig, err := createFreshManagedCleanupDir(configCleanupPath(configDir))
@@ -177,6 +184,9 @@ func applyInstall(
 	} else if err := os.MkdirAll(configDir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", configDir, err)
 	}
+	if err := ensureInstallArtifactParentDirectories(paths, system); err != nil {
+		return err
+	}
 	var stateDir *managedCleanupDir
 	defer func() {
 		if stateDir != nil {
@@ -187,9 +197,10 @@ func applyInstall(
 		paths,
 		system,
 		cleanupManifestWriteOptions{
-			Fresh:         ownership == cleanupOwnershipAbsent,
-			AdoptExisting: ownership == cleanupOwnershipUnmarked && opts.AdoptExisting,
-			LifecyclePath: lockfile.LifecycleLeasePath(ctx),
+			Fresh:              ownership == cleanupOwnershipAbsent,
+			AdoptExisting:      ownership == cleanupOwnershipUnmarked && opts.AdoptExisting,
+			LifecyclePath:      lockfile.LifecycleLeasePath(ctx),
+			beforeFreshPublish: freshPublishHook,
 			createState: func() (*managedCleanupDir, error) {
 				var err error
 				stateDir, err = createFreshManagedCleanupDir(stateCleanupPath(paths.VarLibDir))
@@ -209,6 +220,7 @@ func applyInstall(
 	if stateDir == nil {
 		var exists bool
 		var err error
+		stateCreated := false
 		stateDir, exists, err = openManagedCleanupDir(stateCleanupPath(paths.VarLibDir))
 		if err != nil {
 			return err
@@ -217,6 +229,18 @@ func applyInstall(
 			stateDir, err = createFreshManagedCleanupDir(stateCleanupPath(paths.VarLibDir))
 			if err != nil {
 				return err
+			}
+			stateCreated = true
+		}
+		if stateCreated {
+			if err := refreshManagedParentGenerationAfterOwnedChildCreation(
+				publication.configDir,
+				stateDir,
+			); err != nil {
+				return fmt.Errorf(
+					"refresh config-directory parent after recreating state dir: %w",
+					err,
+				)
 			}
 		}
 	}
@@ -244,6 +268,7 @@ func applyInstall(
 		paths,
 		system,
 		publication.revalidateOwnedInstallMetadata,
+		freshPublishHook,
 	); err != nil {
 		return err
 	}
@@ -261,6 +286,7 @@ func applyInstall(
 		publication.configDir,
 		paths.ConfigPath,
 		ownership != cleanupOwnershipAbsent,
+		freshPublishHook,
 	); err != nil {
 		return err
 	}
@@ -306,12 +332,67 @@ func applyInstall(
 	return nil
 }
 
+func ensureInstallArtifactParentDirectories(paths paths, system string) error {
+	type parentSpec struct {
+		path        string
+		defaultPath string
+	}
+	parents := []parentSpec{{
+		path:        filepath.Dir(paths.BinaryPath),
+		defaultPath: defaultBinaryParent,
+	}}
+	serviceSpecs, err := serviceArtifactInstallSpecs(paths, system)
+	if err != nil {
+		return err
+	}
+	for _, spec := range serviceSpecs {
+		parents = append(parents, parentSpec{
+			path:        filepath.Dir(spec.artifact.Path),
+			defaultPath: spec.defaultParent,
+		})
+	}
+	seen := make(map[string]struct{}, len(parents))
+	for _, spec := range parents {
+		key := filepath.Clean(spec.path) + "\x00" + filepath.Clean(spec.defaultPath)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		parent, _, err := openOrCreateDeclaredArtifactParent(
+			spec.path,
+			spec.defaultPath,
+			nil,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"prepare install artifact parent %s before ownership baselining: %w",
+				spec.path,
+				err,
+			)
+		}
+		if err := parent.close(); err != nil {
+			return fmt.Errorf(
+				"close prepared install artifact parent %s: %w",
+				spec.path,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
 func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := validateRawDefaultConfigDirectory(opts.ConfigPath); err != nil {
+		return nil, err
+	}
 	system := detectSystem(opts.System)
 	paths := resolvedPaths(opts.ConfigPath)
+	if err := validateRawServiceArtifactParentPaths(paths, system); err != nil {
+		return nil, err
+	}
 	if err := validateCleanupPaths(paths); err != nil {
 		return nil, err
 	}
@@ -625,7 +706,10 @@ func wireGuardAppearsRunning(ctx context.Context, configPath string) bool {
 	return false
 }
 
-func validateInstallOwnershipPaths(paths paths) error {
+func validateInstallOwnershipPaths(paths paths, system string) error {
+	if err := validateRawServiceArtifactParentPaths(paths, system); err != nil {
+		return err
+	}
 	if err := validateCleanupPaths(paths); err != nil {
 		return err
 	}
@@ -654,6 +738,60 @@ func validateInstallOwnershipPaths(paths paths) error {
 				return fmt.Errorf("close validated install ownership path: %w", err)
 			}
 		}
+	}
+	return nil
+}
+
+func validateRawServiceArtifactParentPaths(paths paths, system string) error {
+	type parentSpec struct {
+		kind        string
+		path        string
+		defaultPath string
+	}
+	var parents []parentSpec
+	switch system {
+	case "systemd":
+		parents = []parentSpec{{
+			kind:        "systemd",
+			path:        paths.SystemdDir,
+			defaultPath: "/etc/systemd/system",
+		}}
+	case "openwrt":
+		parents = []parentSpec{
+			{
+				kind:        "OpenWrt init",
+				path:        paths.OpenWrtInitDir,
+				defaultPath: "/etc/init.d",
+			},
+			{
+				kind:        "OpenWrt hotplug",
+				path:        paths.OpenWrtHotplugDir,
+				defaultPath: "/etc/hotplug.d/iface",
+			},
+		}
+	}
+	for _, parent := range parents {
+		if _, err := declaredArtifactPathSpec(parent.path, parent.defaultPath); err != nil {
+			return fmt.Errorf(
+				"validate raw %s service artifact directory: %w",
+				parent.kind,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+func validateRawDefaultConfigDirectory(configPath string) error {
+	if configPath != "" {
+		return nil
+	}
+	etcDir := envOr(EnvEtcDir, "/etc/wg-mix-ebpf")
+	if !filepath.IsAbs(etcDir) || filepath.Clean(etcDir) != etcDir {
+		return fmt.Errorf(
+			"refuse relative or non-clean default config directory %q",
+			etcDir,
+		)
 	}
 	return nil
 }

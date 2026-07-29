@@ -170,10 +170,10 @@ func TestInstallRejectsSystemdWantsDirectoryPathReplacementAtCommit(t *testing.T
 	)
 
 	_, err := Install(ctx, Options{System: "systemd", Enable: true})
-	if err == nil || !strings.Contains(
+	if err == nil || (!strings.Contains(
 		err.Error(),
 		"revalidate held systemd wants directory from declared root at commit",
-	) {
+	) && !strings.Contains(err.Error(), "component generation changed")) {
 		t.Fatalf("install error = %v, want wants-directory edge rejection", err)
 	}
 	assertNonDestructiveRetentionError(t, err, linkPath)
@@ -223,7 +223,10 @@ func TestInstallRejectsPersistentHighAncestorSystemdTreeReplacementAtCommit(
 	)
 
 	_, err := Install(ctx, Options{System: "systemd", Enable: true})
-	if err == nil || !strings.Contains(err.Error(), "parent edge no longer names held component") {
+	if err == nil || (!strings.Contains(
+		err.Error(),
+		"parent edge no longer names held component",
+	) && !strings.Contains(err.Error(), "component generation changed")) {
 		t.Fatalf("install error = %v, want high-ancestor edge rejection", err)
 	}
 	assertNonDestructiveRetentionError(t, err, linkPath)
@@ -292,7 +295,10 @@ func TestInstallRejectsHighAncestorSwapInsideSecondDeclaredWalk(t *testing.T) {
 			canonicalServiceTree,
 		)
 	}
-	if err == nil || !strings.Contains(err.Error(), "parent edge no longer names held component") {
+	if err == nil || (!strings.Contains(
+		err.Error(),
+		"parent edge no longer names held component",
+	) && !strings.Contains(err.Error(), "component generation changed")) {
 		t.Fatalf("install error = %v, want complete edge-chain rejection", err)
 	}
 	assertNonDestructiveRetentionError(t, err, linkPath)
@@ -306,6 +312,164 @@ func TestInstallRejectsHighAncestorSwapInsideSecondDeclaredWalk(t *testing.T) {
 			filepath.Base(linkPath),
 		),
 		systemdEnableLinkTarget,
+	)
+}
+
+func TestInstallRejectsTransientHighAncestorReplacementInsideSecondWalk(
+	t *testing.T,
+) {
+	root := t.TempDir()
+	layout := cleanupTestPaths(root, "enable-second-walk-transient-swap")
+	serviceTree := filepath.Join(root, "service-tree")
+	layout.SystemdDir = filepath.Join(serviceTree, "systemd")
+	linkPath := prepareSystemdWantsDirectory(t, layout)
+	canonicalServiceTree, err := filepath.EvalSymlinks(serviceTree)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setCleanupTestEnvironment(t, layout)
+	installFakeSystemctl(t, filepath.Join(t.TempDir(), "systemctl.log"), "")
+
+	displacedTree := serviceTree + ".held-during-swap"
+	replacementEvidence := serviceTree + ".foreign-evidence"
+	foreignTarget := "../foreign.service"
+	var heldLinkIdentity os.FileInfo
+	var foreignLinkIdentity os.FileInfo
+	injected := errors.New("stop after transient second-walk replacement")
+	hookRan := false
+	ctx := context.WithValue(
+		systemdEnableTestContext(t),
+		installAfterSystemdEnableCommitWalkOpenHookContextKey{},
+		func(openedPath string) error {
+			if hookRan || filepath.Clean(openedPath) != filepath.Clean(canonicalServiceTree) {
+				return nil
+			}
+			hookRan = true
+			var err error
+			heldLinkIdentity, err = os.Lstat(linkPath)
+			if err != nil {
+				return err
+			}
+			if err := os.Rename(serviceTree, displacedTree); err != nil {
+				return err
+			}
+			if err := os.MkdirAll(filepath.Dir(linkPath), 0o700); err != nil {
+				return err
+			}
+			if err := os.Symlink(foreignTarget, linkPath); err != nil {
+				return err
+			}
+			foreignLinkIdentity, err = os.Lstat(linkPath)
+			if err != nil {
+				return err
+			}
+			if err := os.Rename(serviceTree, replacementEvidence); err != nil {
+				return err
+			}
+			if err := os.Rename(displacedTree, serviceTree); err != nil {
+				return err
+			}
+			return injected
+		},
+	)
+
+	_, err = Install(ctx, Options{System: "systemd", Enable: true})
+	if !hookRan {
+		t.Fatalf("transient second-walk replacement hook did not run: %v", err)
+	}
+	if !errors.Is(err, injected) ||
+		!strings.Contains(err.Error(), "component generation changed") {
+		t.Fatalf("install error = %v, want transient generation rejection", err)
+	}
+	assertNonDestructiveRetentionError(t, err, linkPath)
+	assertSameSymlink(
+		t,
+		linkPath,
+		systemdEnableLinkTarget,
+		heldLinkIdentity,
+		"reattached transaction-owned link",
+	)
+	assertSameSymlink(
+		t,
+		filepath.Join(
+			replacementEvidence,
+			"systemd",
+			"multi-user.target.wants",
+			filepath.Base(linkPath),
+		),
+		foreignTarget,
+		foreignLinkIdentity,
+		"displaced foreign replacement",
+	)
+}
+
+func TestInstallRejectsReattachedOldWantsSubtreeBeforeCommit(t *testing.T) {
+	layout := cleanupTestPaths(t.TempDir(), "enable-reattached-old-wants")
+	linkPath := prepareSystemdWantsDirectory(t, layout)
+	setCleanupTestEnvironment(t, layout)
+	installFakeSystemctl(t, filepath.Join(t.TempDir(), "systemctl.log"), "")
+
+	wantsDir := filepath.Dir(linkPath)
+	displacedWants := wantsDir + ".held-during-swap"
+	replacementEvidence := wantsDir + ".foreign-evidence"
+	foreignTarget := "../foreign.service"
+	var heldLinkIdentity os.FileInfo
+	var foreignLinkIdentity os.FileInfo
+	hookRan := false
+	ctx := context.WithValue(
+		systemdEnableTestContext(t),
+		installAfterSystemdEnableLinkHookContextKey{},
+		func(path string) error {
+			if path != linkPath || hookRan {
+				return nil
+			}
+			hookRan = true
+			var err error
+			heldLinkIdentity, err = os.Lstat(linkPath)
+			if err != nil {
+				return err
+			}
+			if err := os.Rename(wantsDir, displacedWants); err != nil {
+				return err
+			}
+			if err := os.Mkdir(wantsDir, 0o700); err != nil {
+				return err
+			}
+			if err := os.Symlink(foreignTarget, linkPath); err != nil {
+				return err
+			}
+			foreignLinkIdentity, err = os.Lstat(linkPath)
+			if err != nil {
+				return err
+			}
+			if err := os.Rename(wantsDir, replacementEvidence); err != nil {
+				return err
+			}
+			return os.Rename(displacedWants, wantsDir)
+		},
+	)
+
+	_, err := Install(ctx, Options{System: "systemd", Enable: true})
+	if !hookRan {
+		t.Fatalf("reattached-wants hook did not run: %v", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "component generation changed") {
+		t.Fatalf("install error = %v, want reattached-subtree generation rejection", err)
+	}
+	assertNonDestructiveRetentionError(t, err, linkPath)
+	assertSameSymlink(
+		t,
+		linkPath,
+		systemdEnableLinkTarget,
+		heldLinkIdentity,
+		"reattached wants link",
+	)
+	assertSameSymlink(
+		t,
+		filepath.Join(replacementEvidence, filepath.Base(linkPath)),
+		foreignTarget,
+		foreignLinkIdentity,
+		"foreign wants replacement",
 	)
 }
 
@@ -411,7 +575,7 @@ func TestSystemdEnableFailureRetentionHasNoCheckThenUnlinkOrBlindRestore(
 	}
 }
 
-func TestOpenOrCreateDeclaredArtifactParentConcurrentEEXISTIsNotOwned(
+func TestOpenOrCreateDeclaredArtifactParentConcurrentEEXISTFailsClosedAndIsNotOwned(
 	t *testing.T,
 ) {
 	parentPath := filepath.Join(t.TempDir(), "artifact-parent")
@@ -435,12 +599,15 @@ func TestOpenOrCreateDeclaredArtifactParentConcurrentEEXISTIsNotOwned(
 			return err
 		},
 	)
-	if err != nil {
-		t.Fatal(err)
+	if parent != nil {
+		_ = parent.close()
+		t.Fatal("concurrent EEXIST returned a managed parent")
 	}
-	defer parent.close()
 	if created {
 		t.Fatal("concurrent EEXIST directory was reported transaction-created")
+	}
+	if err == nil || !strings.Contains(err.Error(), "component generation changed") {
+		t.Fatalf("concurrent EEXIST error = %v, want generation rejection", err)
 	}
 	finalIdentity, err := os.Stat(parentPath)
 	if err != nil {
@@ -451,9 +618,6 @@ func TestOpenOrCreateDeclaredArtifactParentConcurrentEEXISTIsNotOwned(
 	}
 	if data, err := os.ReadFile(foreignPath); err != nil || string(data) != "foreign\n" {
 		t.Fatalf("foreign content=%q err=%v", data, err)
-	}
-	if err := revalidateManagedCleanupDir(parent); err != nil {
-		t.Fatalf("revalidate concurrent directory chain: %v", err)
 	}
 }
 
@@ -499,7 +663,10 @@ func TestDeclaredWalkRejectsSystemRootSwapAfterOpeningIt(t *testing.T) {
 	if !hookRan {
 		t.Fatal("declared walk did not expose systemRoot after-open boundary")
 	}
-	if err == nil || !strings.Contains(err.Error(), "parent edge no longer names held component") {
+	if err == nil || (!strings.Contains(
+		err.Error(),
+		"parent edge no longer names held component",
+	) && !strings.Contains(err.Error(), "component generation changed")) {
 		t.Fatalf("declared walk error = %v, want systemRoot parent-edge rejection", err)
 	}
 	for _, path := range []string{
@@ -560,7 +727,10 @@ func TestDeclaredWalkBindsCanonicalSystemRootAlias(t *testing.T) {
 	if !hookRan {
 		t.Fatal("declared walk did not open the canonical root component")
 	}
-	if err == nil || !strings.Contains(err.Error(), "canonical root changed") {
+	if err == nil || (!strings.Contains(
+		err.Error(),
+		"canonical root changed",
+	) && !strings.Contains(err.Error(), "component generation changed")) {
 		t.Fatalf("declared walk error = %v, want canonical-root rejection", err)
 	}
 	for path, want := range map[string]string{
@@ -593,6 +763,36 @@ func TestDeclaredRootWalkAllowsPinnedMountTransitionsThroughSystemRoot(t *testin
 	}
 	if declaredDirectoryEdgeMayCrossMount(rootDepth, rootDepth) {
 		t.Fatal("artifact-relative edge unexpectedly permits a mount transition")
+	}
+}
+
+func TestDeclaredArtifactPathSpecRejectsNonCleanInputs(t *testing.T) {
+	root := t.TempDir()
+	cleanPath := filepath.Join(root, "artifact-parent")
+	for _, test := range []struct {
+		name        string
+		path        string
+		defaultPath string
+	}{
+		{
+			name:        "non-clean path",
+			path:        root + string(os.PathSeparator) + "nested/../artifact-parent",
+			defaultPath: cleanPath,
+		},
+		{
+			name:        "non-clean default path",
+			path:        cleanPath,
+			defaultPath: root + string(os.PathSeparator) + "nested/../artifact-parent",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := declaredArtifactPathSpec(
+				test.path,
+				test.defaultPath,
+			); err == nil || !strings.Contains(err.Error(), "non-clean") {
+				t.Fatalf("declared artifact path error = %v, want non-clean rejection", err)
+			}
+		})
 	}
 }
 

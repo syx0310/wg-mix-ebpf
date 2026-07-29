@@ -15,6 +15,7 @@ func ensureInstallConfigArtifact(
 	configDir *managedCleanupDir,
 	path string,
 	allowExisting bool,
+	beforeFreshPublish func(objectBoundFreshFileHookState) error,
 ) (retErr error) {
 	if configDir == nil || configDir.dir == nil || configDir.dir.file == nil {
 		return errors.New("install config requires a held config directory")
@@ -52,96 +53,41 @@ func ensureInstallConfigArtifact(
 	if err != nil {
 		return fmt.Errorf("marshal safe install config template: %w", err)
 	}
-	tempPrefix := "." + name + ".tmp-"
-	if err := refuseRetainedInstallTemporary(
-		configDir.dir,
-		tempPrefix,
-		"install config",
-	); err != nil {
-		return err
-	}
-	randomSuffix, err := newCleanupInstallationID()
+	result, err := publishObjectBoundFreshFile(objectBoundFreshFileSpec{
+		parent:        configDir,
+		name:          name,
+		path:          path,
+		kind:          "install config",
+		mode:          0o600,
+		content:       data,
+		beforePublish: beforeFreshPublish,
+	})
 	if err != nil {
 		return err
 	}
-	tempName := tempPrefix + randomSuffix
-	tempPath := filepath.Join(configDir.spec.path, tempName)
-	temp, err := cleanupCreateFileAt(configDir.dir, tempName, 0o600)
-	if err != nil {
-		return fmt.Errorf("create temporary install config %s: %w", tempPath, err)
-	}
-	tempPresent := true
 	defer func() {
-		if !tempPresent {
-			return
+		closeErr := result.file.Close()
+		if retErr != nil || closeErr != nil {
+			retErr = errors.Join(
+				retErr,
+				closeErr,
+				objectBoundPublishedFinalAudit(
+					"install config",
+					path,
+					result.identity,
+				),
+			)
 		}
-		retErr = errors.Join(
-			retErr,
-			fmt.Errorf(
-				"temporary install config retained without name-based cleanup at %s; "+
-					"manually inspect its identity before removal",
-				tempPath,
-			),
-		)
 	}()
-	if err := temp.Chmod(0o600); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("set temporary install config permissions: %w", err)
-	}
-	if _, err := temp.Write(data); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("write temporary install config: %w", err)
-	}
-	if err := temp.Sync(); err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("sync temporary install config: %w", err)
-	}
-	tempIdentity, err := cleanupIdentityForFD(int(temp.Fd()))
-	if err != nil {
-		_ = temp.Close()
-		return fmt.Errorf("inspect temporary install config: %w", err)
-	}
-	if err := temp.Close(); err != nil {
-		return fmt.Errorf("close temporary install config: %w", err)
-	}
-	if err := revalidateManagedCleanupDir(configDir); err != nil {
-		return fmt.Errorf("revalidate install config directory before commit: %w", err)
-	}
-	if _, err := cleanupIdentityAt(configDir.dir, name); !cleanupIsNotExist(err) {
-		if err == nil {
-			return fmt.Errorf("refuse install config %s that appeared before commit", path)
-		}
-		return fmt.Errorf("recheck absent install config %s: %w", path, err)
-	}
-	if err := cleanupRenameNoReplaceAt(configDir.dir, tempName, name); err != nil {
-		return fmt.Errorf(
-			"atomically install config %s without replacement: %w",
-			path,
-			err,
-		)
-	}
-	tempPresent = false
-	if err := configDir.dir.file.Sync(); err != nil {
-		return fmt.Errorf("sync install config directory %s: %w", configDir.spec.path, err)
-	}
-
-	installed, installedIdentity, err := cleanupOpenFileAt(configDir.dir, name)
-	if err != nil {
-		return fmt.Errorf("open installed config %s: %w", path, err)
-	}
-	defer installed.Close()
-	if !tempIdentity.sameRegularFileObject(installedIdentity) {
-		return fmt.Errorf(
-			"installed config %s does not match the published temporary inode",
-			path,
-		)
+	if _, err := result.file.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind published install config %s: %w", path, err)
 	}
 	return validateExistingInstallConfig(
 		configDir,
 		name,
 		path,
-		installed,
-		installedIdentity,
+		result.file,
+		result.identity,
 	)
 }
 
