@@ -3,6 +3,7 @@ package lockfile
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -170,5 +171,95 @@ func TestIsolatedLifecyclePathIsContextLocal(t *testing.T) {
 	}
 	if got := LifecycleLeasePath(t.Context()); got != DefaultLifecycleLeasePath {
 		t.Fatalf("default lifecycle path changed to %q", got)
+	}
+}
+
+func TestIsolatedLifecycleValidationRunsAfterLeaseAcquisition(t *testing.T) {
+	leasePath := filepath.Join(t.TempDir(), "lifecycle.lease")
+	validationCalls := 0
+	ctx := WithIsolatedNetNSTestLifecycleValidation(
+		t.Context(),
+		leasePath,
+		func() error {
+			validationCalls++
+			contender, err := AcquireLifecycleAt(
+				leasePath,
+				LifecycleOwner{PID: os.Getpid(), Action: "contender"},
+			)
+			if err == nil {
+				_ = contender.Close()
+				return errors.New("lifecycle validator ran without the lease held")
+			}
+			if !errors.Is(err, ErrLifecycleLeaseHeld) {
+				return fmt.Errorf("probe held lifecycle lease: %w", err)
+			}
+			return nil
+		},
+	)
+	callbackCalls := 0
+	err := WithLifecycle(
+		ctx,
+		nil,
+		LifecycleOwner{PID: os.Getpid(), Action: "mutation"},
+		func(*LifecycleLease) error {
+			callbackCalls++
+			return nil
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validationCalls != 1 || callbackCalls != 1 {
+		t.Fatalf(
+			"validation calls=%d callback calls=%d, want 1 each",
+			validationCalls,
+			callbackCalls,
+		)
+	}
+}
+
+func TestIsolatedLifecycleValidationRejectsStaleContract(t *testing.T) {
+	root := t.TempDir()
+	leasePath := filepath.Join(root, "lifecycle.lease")
+	contractMarker := filepath.Join(root, "contract.marker")
+	if err := os.WriteFile(contractMarker, []byte("owned\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithIsolatedNetNSTestLifecycleValidation(
+		t.Context(),
+		leasePath,
+		func() error {
+			data, err := os.ReadFile(contractMarker)
+			if err != nil {
+				return err
+			}
+			if string(data) != "owned\n" {
+				return errors.New("contract marker changed")
+			}
+			return nil
+		},
+	)
+
+	// Model a process paused after its initial validation while teardown makes
+	// the contract unusable. The mutation must revalidate after acquiring the
+	// lease and may not execute with the stale result.
+	if err := os.Rename(contractMarker, contractMarker+".unavailable"); err != nil {
+		t.Fatal(err)
+	}
+	callbackCalled := false
+	err := WithLifecycle(
+		ctx,
+		nil,
+		LifecycleOwner{PID: os.Getpid(), Action: "stale-mutation"},
+		func(*LifecycleLease) error {
+			callbackCalled = true
+			return nil
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "revalidate lifecycle contract") {
+		t.Fatalf("stale contract error = %v", err)
+	}
+	if callbackCalled {
+		t.Fatal("stale mutation callback unexpectedly ran")
 	}
 }

@@ -658,19 +658,16 @@ func validatePrivateBPFFSMountInfo(
 	pinMountID *uint64,
 ) error {
 	var target *mountInfoEntry
-	var production []*mountInfoEntry
+	var otherBPFFSMounts []*mountInfoEntry
 	for index := range entries {
 		entry := &entries[index]
-		switch entry.mountPath {
-		case layout.bpffsDir:
+		if entry.mountPath == layout.bpffsDir {
 			if target != nil {
 				return fmt.Errorf("multiple mounts are stacked on isolated bpffs %s", layout.bpffsDir)
 			}
 			target = entry
-		case "/sys/fs/bpf":
-			if entry.fsType == "bpf" {
-				production = append(production, entry)
-			}
+		} else if entry.fsType == "bpf" {
+			otherBPFFSMounts = append(otherBPFFSMounts, entry)
 		}
 		if strings.HasPrefix(entry.mountPath, layout.bpffsDir+string(filepath.Separator)) {
 			return fmt.Errorf(
@@ -719,13 +716,13 @@ func validatePrivateBPFFSMountInfo(
 			manifestMountID,
 		)
 	}
-	for _, productionMount := range production {
-		if target.mountID == productionMount.mountID ||
-			(target.device == productionMount.device &&
-				target.root == productionMount.root) {
+	for _, otherMount := range otherBPFFSMounts {
+		if target.mountID == otherMount.mountID ||
+			(target.device == otherMount.device &&
+				target.root == otherMount.root) {
 			return fmt.Errorf(
-				"isolated bpffs is a bind or alias of production mount %s",
-				productionMount.mountPath,
+				"isolated bpffs is a bind or alias of another bpf mount %s",
+				otherMount.mountPath,
 			)
 		}
 	}
