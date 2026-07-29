@@ -147,6 +147,123 @@ func TestUninstallRejectsHeldGlobalLifecycleLeaseBeforeCleanup(t *testing.T) {
 	}
 }
 
+func TestUninstallDisablesSystemdBeforeRemovingOwnedUnit(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(t, "systemd-disable", "systemd")
+	setCleanupTestEnvironment(t, layout)
+	installFakeNft(t, "")
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "")
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+
+	plan, err := Uninstall(ctx, Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "systemd",
+		Yes:        true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, action := range []string{"disable systemd service", "reload systemd manager"} {
+		if !containsAction(plan.Actions, action) {
+			t.Fatalf("uninstall plan omitted %q: %#v", action, plan.Actions)
+		}
+	}
+	logData, err := os.ReadFile(commandLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "stop wg-mix-ebpf.service\ndisable wg-mix-ebpf.service\ndaemon-reload\n"
+	if string(logData) != want {
+		t.Fatalf("systemctl log = %q, want %q", logData, want)
+	}
+	if _, err := os.Stat(filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uninstall retained disabled systemd unit: %v", err)
+	}
+	if _, err := os.Stat(cleanupManifestPath(layout)); err != nil {
+		t.Fatalf("non-purge uninstall removed ownership marker: %v", err)
+	}
+}
+
+func TestUninstallDisablesSystemdWhenOwnedUnitIsAlreadyAbsent(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(t, "systemd-disable-absent", "systemd")
+	unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+	if err := os.Rename(unitPath, unitPath+".already-absent"); err != nil {
+		t.Fatal(err)
+	}
+	setCleanupTestEnvironment(t, layout)
+	installFakeNft(t, "")
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "")
+
+	lifecycleRoot := t.TempDir()
+	if _, err := Uninstall(
+		lockfile.WithLifecyclePathsForTest(
+			t.Context(),
+			filepath.Join(lifecycleRoot, "daemon.lease"),
+			filepath.Join(lifecycleRoot, "maintenance.gate"),
+		),
+		Options{
+			ConfigPath: layout.ConfigPath,
+			System:     "systemd",
+			Yes:        true,
+		},
+	); err != nil {
+		t.Fatal(err)
+	}
+	logData, err := os.ReadFile(commandLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "disable wg-mix-ebpf.service\ndaemon-reload\n"
+	if string(logData) != want {
+		t.Fatalf("systemctl log = %q, want absent-unit disable and reload %q", logData, want)
+	}
+}
+
+func TestUninstallOwnedResourceAbsenceHasAlignedDryRunAndRealNoOpPlans(t *testing.T) {
+	layout := cleanupTestPaths(t.TempDir(), "uninstall-noop")
+	setCleanupTestEnvironment(t, layout)
+	opts := Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "unknown",
+	}
+	dryOpts := opts
+	dryOpts.DryRun = true
+	dryPlan, err := Uninstall(t.Context(), dryOpts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realPlan, err := Uninstall(t.Context(), opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(dryPlan.Actions, "\n") != strings.Join(realPlan.Actions, "\n") {
+		t.Fatalf("dry-run actions %#v differ from real no-op %#v", dryPlan.Actions, realPlan.Actions)
+	}
+	if !containsAction(dryPlan.Actions, "no owned installation resources found; no changes") {
+		t.Fatalf("no-op plan missing ownership result: %#v", dryPlan.Actions)
+	}
+	for _, mutation := range []string{
+		"stop wg-mix-ebpf",
+		"disable systemd",
+		"disable OpenWrt",
+		"remove BPF",
+		"remove nft",
+		"remove runtime",
+		"remove state",
+		"detach dataplane",
+	} {
+		if containsAction(dryPlan.Actions, mutation) {
+			t.Fatalf("no-op plan claims mutation %q: %#v", mutation, dryPlan.Actions)
+		}
+	}
+}
+
 func TestUninstallKeepsBinaryHint(t *testing.T) {
 	root := t.TempDir()
 	layout := cleanupTestPaths(root, "hint")
@@ -379,7 +496,11 @@ func TestUninstallPurgeIsIdempotentWithRetainedLifecycleLease(t *testing.T) {
 	setCleanupTestEnvironment(t, layout)
 	installFakeNft(t, "")
 	lifecyclePath := filepath.Join(layout.RunDir, "daemon.lease")
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), lifecyclePath)
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		lifecyclePath,
+		filepath.Join(t.TempDir(), "maintenance.gate"),
+	)
 	opts := Options{
 		ConfigPath: layout.ConfigPath,
 		System:     "unknown",
@@ -423,9 +544,11 @@ func TestUninstallPurgeRetainsOwnershipUntilDaemonReloadSucceeds(t *testing.T) {
 	installFakeNft(t, "")
 	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
 	installFakeSystemctl(t, commandLog, "daemon-reload")
-	ctx := lockfile.WithLifecyclePathForTest(
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
 		t.Context(),
-		filepath.Join(t.TempDir(), "daemon.lease"),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
 	)
 	opts := Options{
 		ConfigPath: layout.ConfigPath,
@@ -1679,7 +1802,7 @@ func TestOpenWrtServiceActionRejectsFinalPathSwapWithoutExecutingForeign(t *test
 			0o700,
 		)
 	}
-	err = runOpenWrtServiceAction(t.Context(), plan, "stop")
+	err = runOpenWrtServiceActions(t.Context(), plan, "stop")
 	if err == nil || !strings.Contains(err.Error(), "service artifact execution") {
 		t.Fatalf("OpenWrt service action error = %v, want final identity rejection", err)
 	}

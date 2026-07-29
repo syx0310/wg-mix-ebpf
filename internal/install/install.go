@@ -218,8 +218,11 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	add("remove state dir %s", paths.VarLibDir)
 	switch system {
 	case "systemd":
+		add("disable systemd service wg-mix-ebpf.service to remove derived enablement links")
 		add("remove systemd unit %s", filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"))
+		add("reload systemd manager after removing the owned unit")
 	case "openwrt":
+		add("disable OpenWrt service to remove derived rc.d links")
 		add("remove OpenWrt init/hotplug scripts")
 	}
 	if opts.Purge {
@@ -248,21 +251,41 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 		}
 	}()
 	ownsResources := initialCleanup.manifest.Product == cleanupManifestProduct
-	if opts.DryRun {
-		return plan, nil
-	}
 	if !ownsResources {
+		plan.Actions = []string{
+			"no owned installation resources found; no changes",
+		}
+		if opts.Purge {
+			plan.Actions = append(
+				plan.Actions,
+				fmt.Sprintf(
+					"purge owned config dir %s: already absent; no-op",
+					filepath.Dir(paths.ConfigPath),
+				),
+			)
+		}
+		plan.Actions = append(
+			plan.Actions,
+			fmt.Sprintf("keep binary %s", paths.BinaryPath),
+			fmt.Sprintf(
+				"binary removal hint: remove %s manually or with the package manager that installed it",
+				paths.BinaryPath,
+			),
+		)
 		return plan, nil
 	}
 	if !opts.Yes && wireGuardAppearsRunning(ctx, paths.ConfigPath) {
 		return nil, errors.New("managed WireGuard runtime appears active; rerun uninstall with --yes to detach transform and continue")
+	}
+	if opts.DryRun {
+		return plan, nil
 	}
 	if err := initialCleanup.revalidate(); err != nil {
 		return nil, fmt.Errorf("revalidate all uninstall targets before service stop: %w", err)
 	}
 	switch system {
 	case "systemd":
-		_, _, unitExists, err := initialCleanup.serviceArtifactEntry("systemd-unit")
+		unit, _, unitExists, err := initialCleanup.serviceArtifactEntry("systemd-unit")
 		if err != nil {
 			return nil, err
 		}
@@ -271,8 +294,13 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 				return nil, err
 			}
 		}
+		if unit != nil {
+			if err := runCommand(ctx, "systemctl", "disable", "wg-mix-ebpf.service"); err != nil {
+				return nil, err
+			}
+		}
 	case "openwrt":
-		if err := runOpenWrtServiceAction(ctx, initialCleanup, "stop"); err != nil {
+		if err := runOpenWrtServiceActions(ctx, initialCleanup, "stop", "disable"); err != nil {
 			return nil, err
 		}
 	}

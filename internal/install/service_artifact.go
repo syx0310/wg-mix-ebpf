@@ -414,10 +414,10 @@ func (plan *uninstallCleanupPlan) openServiceArtifactForExecution(
 	return &verifiedServiceArtifact{file: file, entry: entry}, true, nil
 }
 
-func runOpenWrtServiceAction(
+func runOpenWrtServiceActions(
 	ctx context.Context,
 	plan *uninstallCleanupPlan,
-	action string,
+	actions ...string,
 ) (retErr error) {
 	if err := plan.revalidate(); err != nil {
 		return err
@@ -431,15 +431,25 @@ func runOpenWrtServiceAction(
 			retErr = errors.Join(retErr, fmt.Errorf("close verified OpenWrt init script: %w", err))
 		}
 	}()
-	if plan.beforeServiceExec != nil {
-		if err := plan.beforeServiceExec(artifact.entry.path); err != nil {
+	for _, action := range actions {
+		switch action {
+		case "stop", "disable":
+		default:
+			return fmt.Errorf("refuse unsupported OpenWrt uninstall action %q", action)
+		}
+		if plan.beforeServiceExec != nil {
+			if err := plan.beforeServiceExec(artifact.entry.path); err != nil {
+				return err
+			}
+		}
+		if err := artifact.revalidateForExecution(); err != nil {
+			return err
+		}
+		if err := runCommandFromVerifiedFile(ctx, artifact.file, action); err != nil {
 			return err
 		}
 	}
-	if err := artifact.revalidateForExecution(); err != nil {
-		return err
-	}
-	return runCommandFromVerifiedFile(ctx, artifact.file, action)
+	return nil
 }
 
 func runInstalledOpenWrtServiceAction(
