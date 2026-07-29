@@ -1,0 +1,255 @@
+#!/usr/bin/env python3
+import hashlib
+import pathlib
+import unittest
+
+
+SCRIPT_PATH = pathlib.Path(__file__).with_name("smoke-netns-wg.sh")
+HOLDER_PATH = pathlib.Path(__file__).with_name(
+    "hold-isolated-lifecycle-lease.py"
+)
+
+
+class SmokeNetNSWGStaticTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.source = SCRIPT_PATH.read_text(encoding="utf-8")
+        cls.lines = cls.source.splitlines()
+        cls.holder_source = HOLDER_PATH.read_text(encoding="utf-8")
+
+    def test_password_is_unexported_before_first_child_process(self) -> None:
+        capture = self.source.index('XOR_SECRET="${XOR_PASSWORD-}"')
+        unset = self.source.index("unset XOR_PASSWORD")
+        first_command_substitution = self.source.index('ROOT="$(cd ')
+        self.assertLess(capture, unset)
+        self.assertLess(unset, first_command_substitution)
+        self.assertNotIn("export XOR_PASSWORD", self.source)
+
+        for number, line in enumerate(self.lines, start=1):
+            if number <= self.source[:unset].count("\n") + 1:
+                continue
+            if "XOR_PASSWORD" not in line:
+                continue
+            allowed = (
+                "env -u XOR_PASSWORD",
+                'startswith(b"XOR_PASSWORD=")',
+                "inherited XOR_PASSWORD",
+                "error: XOR_PASSWORD",
+            )
+            self.assertTrue(
+                any(fragment in line for fragment in allowed),
+                f"line {number} reads or propagates XOR_PASSWORD: {line}",
+            )
+
+    def test_plaintext_shell_variable_is_dropped_after_secret_file_write(self) -> None:
+        write = self.source.index(
+            'printf \'%s\\n\' "${XOR_SECRET}" >"${SECRET_DIR}/xor-password"'
+        )
+        unset = self.source.index("unset XOR_SECRET")
+        self.assertLess(write, unset)
+        self.assertNotIn("XOR_SECRET", self.source[unset + len("unset XOR_SECRET") :])
+        self.assertIn(
+            '--xor-udp2raw-password-file "${SECRET_DIR}/xor-password"',
+            self.source,
+        )
+        self.assertNotIn("--xor-udp2raw-password ", self.source)
+
+    def test_target_processes_are_sanitized_and_audited(self) -> None:
+        required_labels = (
+            '"agent-${ns}"',
+            '"tcpdump-ra"',
+            '"tcpdump-rb"',
+            '"iperf3-server-${label}"',
+            '"iperf3-client-${label}"',
+            '"pcap-checker"',
+            '"udp-zero-checksum-receiver"',
+        )
+        for label in required_labels:
+            self.assertIn(
+                f"assert_process_environment_secret_free",
+                self.source,
+            )
+            self.assertIn(label, self.source)
+        self.assertIn('pathlib.Path("/proc") / str(pid)', self.source)
+        self.assertIn("descendants.add(pid)", self.source)
+        self.assertIn(
+            "no actual descendant observed within the environment-audit window",
+            self.source,
+        )
+        self.assertGreaterEqual(
+            self.source.count('sh -c \'sleep 0.2; exec "$@"\' sh'),
+            7,
+        )
+        self.assertGreaterEqual(self.source.count("env -u XOR_PASSWORD"), 12)
+
+    def test_failure_traps_report_only_and_never_mutate_resources(self) -> None:
+        failure_report = self.source[
+            self.source.index("failure_report() {") :
+            self.source.index("\non_exit() {")
+        ]
+        exit_trap = self.source[
+            self.source.index("on_exit() {") :
+            self.source.index("\non_signal() {")
+        ]
+        signal_trap = self.source[
+            self.source.index("on_signal() {") :
+            self.source.index("\ntrap on_exit EXIT")
+        ]
+        self.assertIn(
+            "the failure trap performed no detach, delete, unmount, kill, or file cleanup",
+            failure_report,
+        )
+        for body in (failure_report, exit_trap, signal_trap):
+            for forbidden in (
+                "explicit_teardown",
+                "remove_owned_file",
+                "release_lifecycle_hold",
+                "teardown_step",
+                "rm --",
+                "rmdir --",
+                "kill -",
+            ):
+                self.assertNotIn(forbidden, body)
+        for line in failure_report.splitlines():
+            stripped = line.strip()
+            if any(
+                command in stripped
+                for command in (
+                    'ip netns delete "${',
+                    'umount "${BPFFS_DIR}"',
+                )
+            ):
+                self.assertTrue(
+                    stripped.startswith("print_command "),
+                    f"failure report executes instead of printing: {stripped}",
+                )
+        search_from = 0
+        while True:
+            detach = failure_report.find('"${BIN}" detach', search_from)
+            if detach < 0:
+                break
+            self.assertIn(
+                "print_command ip netns exec",
+                failure_report[max(0, detach - 160) : detach],
+            )
+            search_from = detach + 1
+
+    def test_manifest_seals_shared_lifecycle_and_pin_resource_contract(self) -> None:
+        for field in (
+            "format=wg-mix-ebpf-test-manifest-v2",
+            "bpffs_source=%s",
+            "bpffs_mount_id=%s",
+            "pin_parent_dev=%s",
+            "pin_parent_ino=%s",
+            "pin_resource_key_a=%s",
+            "pin_resource_key_b=%s",
+            "pin_lock_root=%s",
+            "pin_lock_a=%s",
+            "pin_lock_b=%s",
+            "pin_owner_root=%s",
+            "pin_owner_a=%s",
+            "pin_owner_b=%s",
+            "netns_a_dev=%s",
+            "netns_a_ino=%s",
+            "config_a=%s",
+            "underlay_a=under0",
+            "lifecycle_lease=%s",
+        ):
+            self.assertIn(field, self.source)
+        self.assertNotIn("lease_a=", self.source)
+        self.assertNotIn("lease_b=", self.source)
+        self.assertIn('BPFFS_SOURCE="bpf"', self.source)
+        self.assertNotIn('BPFFS_SOURCE="wg-mix-ebpf-', self.source)
+        self.assertIn("$5 != target", self.source)
+        self.assertIn("other_bpf_count++", self.source)
+        self.assertNotIn('-v production="/sys/fs/bpf"', self.source)
+        self.assertIn(
+            'f"wg-mix-ebpf-pin-v1:{parent_device}:{parent_inode}:{basename}"',
+            self.source,
+        )
+        canonical = "wg-mix-ebpf-pin-v1:42:99:wg-mix-ebpf-a"
+        self.assertEqual(
+            hashlib.sha256(canonical.encode("ascii")).hexdigest(),
+            "0587a9fb34e37f032795767bfd901660a37e065b3faecd363ba302147f6bcbc3",
+        )
+        self.assertNotIn(
+            "hashlib.sha256(sys.argv[1].encode()).hexdigest()",
+            self.source,
+        )
+        seal = self.source.index('(set -o noclobber; manifest_payload >"${MANIFEST}")')
+        first_reload = self.source.index(
+            'run_agent_in_netns "${NSA}" "${PINA}" reload'
+        )
+        lock_marker = self.source.index(
+            'write_marker "${PIN_LOCK_ROOT}" pin-locks'
+        )
+        owner_marker = self.source.index(
+            'write_marker "${PIN_OWNER_ROOT}" pin-owners'
+        )
+        self.assertLess(lock_marker, seal)
+        self.assertLess(owner_marker, seal)
+        self.assertLess(seal, first_reload)
+
+    def test_pin_resources_are_validated_after_detach_before_exact_removal(self) -> None:
+        detach_b = self.source.index('teardown_step "detach agent B pin=${PINB}"')
+        owner_absent_a = self.source.index(
+            'validate_pin_owner_absent "${PIN_OWNER_A}" "${PIN_RESOURCE_KEY_A}"'
+        )
+        validate_a = self.source.index(
+            '"${PIN_LOCK_A}" "${PINA}" "${PIN_RESOURCE_KEY_A}"'
+        )
+        remove_a = self.source.index('remove_owned_file "${PIN_LOCK_A}"')
+        remove_lock_root = self.source.index(
+            'rmdir -- "${PIN_LOCK_ROOT}"'
+        )
+        remove_owner_root = self.source.index(
+            'rmdir -- "${PIN_OWNER_ROOT}"'
+        )
+        self.assertLess(detach_b, owner_absent_a)
+        self.assertLess(owner_absent_a, validate_a)
+        self.assertLess(validate_a, remove_a)
+        self.assertLess(remove_a, remove_lock_root)
+        self.assertLess(remove_lock_root, remove_owner_root)
+        self.assertIn("fcntl.LOCK_EX | fcntl.LOCK_NB", self.source)
+        self.assertIn('owner["version"] != 2', self.source)
+        for field in (
+            '"resource_key"',
+            '"parent_device"',
+            '"parent_inode"',
+            '"pin_basename"',
+            '"pin_path"',
+        ):
+            self.assertIn(field, self.source)
+
+    def test_success_teardown_holds_shared_lifecycle_until_contract_is_gone(
+        self,
+    ) -> None:
+        detach_b = self.source.index('teardown_step "detach agent B pin=${PINB}"')
+        acquire = self.source.index("start_lifecycle_hold || return 1")
+        first_cleanup = self.source.index(
+            'remove_owned_file "${PIN_LOCK_A}"'
+        )
+        lease_unlink = self.source.index(
+            'remove_owned_file "${LIFECYCLE_LEASE}"'
+        )
+        final_contract_dir = self.source.index(
+            'rmdir -- "${STATE_DIR_B}"'
+        )
+        release = self.source.index("release_lifecycle_hold || return 1")
+        self.assertLess(detach_b, acquire)
+        self.assertLess(acquire, first_cleanup)
+        self.assertLess(first_cleanup, lease_unlink)
+        self.assertLess(lease_unlink, final_contract_dir)
+        self.assertLess(final_contract_dir, release)
+        self.assertIn("fcntl.LOCK_EX | fcntl.LOCK_NB", self.holder_source)
+        self.assertIn("def recheck_verified_file(", self.holder_source)
+        self.assertIn("pathname identity changed", self.holder_source)
+        self.assertGreaterEqual(
+            self.holder_source.count("recheck_verified_file("),
+            5,
+        )
+        self.assertIn("manifest changed while acquiring lifecycle lease", self.holder_source)
+
+
+if __name__ == "__main__":
+    unittest.main()

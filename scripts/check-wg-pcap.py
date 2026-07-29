@@ -406,7 +406,24 @@ def icmp_type_name(icmp_type: int | None) -> str:
     return "other"
 
 
-def parse_xor_key(value: str | None, udp2raw_password: str | None) -> bytes | None:
+def parse_xor_key(
+    value: str | None,
+    udp2raw_password: str | None,
+    udp2raw_password_file: Path | None,
+) -> bytes | None:
+    configured_sources = sum(
+        source is not None
+        for source in (value, udp2raw_password, udp2raw_password_file)
+    )
+    if configured_sources > 1:
+        raise SystemExit(
+            "configure only one of --xor-key, --xor-udp2raw-password, "
+            "or --xor-udp2raw-password-file"
+        )
+    if udp2raw_password_file is not None:
+        udp2raw_password = udp2raw_password_file.read_text(encoding="utf-8").strip()
+        if not udp2raw_password:
+            raise SystemExit("xor udp2raw password file is empty")
     if udp2raw_password is not None:
         return hashlib.md5((udp2raw_password + "key1").encode()).digest()
     if value is None:
@@ -592,6 +609,11 @@ def main() -> int:
     parser.add_argument("--require-xor-mixed", action="append", help="Comma-separated WG kinds to require after XOR decoding first 4 bytes")
     parser.add_argument("--xor-key", help="XOR key as base64:<key>, hex:<key>, or raw text")
     parser.add_argument("--xor-udp2raw-password", help="Derive a 16-byte udp2raw-style XOR key as MD5(password + 'key1')")
+    parser.add_argument(
+        "--xor-udp2raw-password-file",
+        type=Path,
+        help="Read the udp2raw-style XOR password from a file instead of argv",
+    )
     parser.add_argument("--require-icmp-types", action="append", help="Comma-separated ICMP Echo types: request,reply")
     parser.add_argument("--require-valid-udp-checksum", action="store_true")
     parser.add_argument("--require-valid-icmp-checksum", action="store_true")
@@ -622,7 +644,11 @@ def main() -> int:
     if args.dport:
         allowed = set(args.dport)
         records = [record for record in records if record.dport in allowed]
-    xor_key = parse_xor_key(args.xor_key, args.xor_udp2raw_password)
+    xor_key = parse_xor_key(
+        args.xor_key,
+        args.xor_udp2raw_password,
+        args.xor_udp2raw_password_file,
+    )
     if xor_key:
         apply_xor_decode(records, xor_key)
 
