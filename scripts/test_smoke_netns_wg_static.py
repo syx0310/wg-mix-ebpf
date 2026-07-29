@@ -9,9 +9,7 @@ MAKEFILE_PATH = SCRIPT_PATH.parent.parent / "Makefile"
 HOLDER_PATH = pathlib.Path(__file__).with_name(
     "hold-isolated-lifecycle-lease.py"
 )
-DELETE_HELPER_PATH = pathlib.Path(__file__).with_name(
-    "delete-owned-netns.py"
-)
+ANCHOR_PACKAGE = SCRIPT_PATH.parent.parent / "internal" / "netnsanchor"
 
 
 class SmokeNetNSWGStaticTests(unittest.TestCase):
@@ -21,7 +19,12 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         cls.lines = cls.source.splitlines()
         cls.makefile_source = MAKEFILE_PATH.read_text(encoding="utf-8")
         cls.holder_source = HOLDER_PATH.read_text(encoding="utf-8")
-        cls.delete_helper_source = DELETE_HELPER_PATH.read_text(
+        cls.anchor_linux_source = (ANCHOR_PACKAGE / "run_linux.go").read_text(
+            encoding="utf-8"
+        )
+        cls.anchor_protocol_source = (
+            ANCHOR_PACKAGE / "protocol.go"
+        ).read_text(
             encoding="utf-8"
         )
 
@@ -93,27 +96,21 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.source.index("\nmove_link_to_owned_netns() {")
         ]
         self.assertLess(
-            bounded.index("validate_named_netns_identity"),
-            bounded.index('ip netns exec "${ns}"'),
+            bounded.index("set_netns_client_args"),
+            bounded.index('"${NETNS_ANCHOR_EXEC}" exec'),
         )
         self.assertLess(
             bounded.index("sleep 0.2"),
-            bounded.index("validate_named_netns_identity"),
+            bounded.index("set_netns_client_args"),
         )
         self.assertIn("env -u XOR_PASSWORD", bounded)
         self.assertNotIn("sh -c", bounded)
-
-        direct_execs = [
-            line.strip()
-            for line in self.lines
-            if 'ip netns exec "${' in line
-            and not line.strip().startswith("print_command ")
-        ]
-        self.assertEqual(2, len(direct_execs))
-        self.assertTrue(
-            all('"${ns}"' in line for line in direct_execs),
-            direct_execs,
+        self.assertGreaterEqual(
+            self.source.count('"${NETNS_ANCHOR_EXEC}" exec'),
+            2,
         )
+        self.assertNotIn("ip netns", self.source)
+        self.assertNotIn("/run/netns", self.source)
 
     def test_failure_traps_report_only_and_never_mutate_resources(self) -> None:
         failure_report = self.source[
@@ -255,23 +252,16 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         ):
             self.assertIn(field, self.source)
 
-    def test_netns_identity_is_revalidated_before_use_and_delete(self) -> None:
+    def test_netns_identity_is_fd_bound_before_use_and_stop(self) -> None:
         validator = self.source[
             self.source.index("validate_netns_identity() {") :
             self.source.index("\nvalidate_all_netns_identities() {")
         ]
-        self.assertIn("netns_exists", validator)
-        self.assertIn("stat -Lc '%d %i'", validator)
-        self.assertIn('[[ ! -e "/run/netns/${ns}"', validator)
-        self.assertIn('-L "/run/netns/${ns}"', validator)
-        self.assertIn(
-            '"${observed_device}" != "${expected_device}"',
-            validator,
-        )
-        self.assertIn(
-            '"${observed_inode}" != "${expected_inode}"',
-            validator,
-        )
+        self.assertIn("set_netns_client_args", validator)
+        self.assertIn('"${NETNS_ANCHOR_EXEC}" probe', validator)
+        self.assertIn('"${NETNS_CLIENT_ARGS[@]}"', validator)
+        self.assertNotIn("stat ", validator)
+        self.assertNotIn("/run/", validator)
 
         runner = self.source[
             self.source.index("run_agent_in_netns() {") :
@@ -293,42 +283,95 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             first_exec,
         )
 
-        delete = self.source[
-            self.source.index("delete_owned_netns() {") :
+        stop = self.source[
+            self.source.index("stop_owned_netns() {") :
             self.source.index("\nvalidate_released_pin_lock() {")
         ]
         self.assertLess(
-            delete.index("validate_manifest"),
-            delete.index('"${NETNS_DELETE_HELPER}"'),
+            stop.index("validate_manifest"),
+            stop.index('"${NETNS_ANCHOR_EXEC}" stop'),
         )
-        self.assertNotIn("validate_netns_identity", delete)
-        self.assertNotIn('ip netns delete "${ns}"', delete)
-        self.assertIn("--expected-device", delete)
-        self.assertIn("--expected-inode", delete)
-        self.assertIn("--role", delete)
-        self.assertIn("open_verified_target(", self.delete_helper_source)
-        self.assertIn("recheck_verified_target(", self.delete_helper_source)
-        self.assertLess(
-            self.delete_helper_source.index("recheck_verified_target("),
-            self.delete_helper_source.index("status = delete_runner(name)"),
+        self.assertIn("validate_netns_identity", stop)
+        self.assertIn('wait "${anchor_pid}"', stop)
+        self.assertNotIn("kill -", stop)
+        self.assertNotIn("delete", stop)
+
+        for required in (
+            "unix.CLONE_NEWNET",
+            "command.ExtraFiles",
+            "unix.UnixRights(namespaceFD)",
+            "unix.MSG_CMSG_CLOEXEC",
+            "unix.NS_GET_NSTYPE",
+            "unix.Setns(descriptor, unix.CLONE_NEWNET)",
+            "netlink.LinkSetNsFd(link, descriptor)",
+            "unix.SO_PEERCRED",
+            '"@"+flags.socket',
+            "PR_SET_PDEATHSIG",
+            '"/proc/self/fd/3"',
+            '"/proc/self/exe"',
+            "validateWorkerImage(",
+            "unix.PidfdOpen(",
+            "waitForAnchorExit(",
+            "network namespace worker did not exit before the bounded deadline",
+        ):
+            self.assertIn(required, self.anchor_linux_source)
+        self.assertNotIn("os.Executable()", self.anchor_linux_source)
+        self.assertIn("consumeBootstrapImageFD()", self.anchor_linux_source)
+        self.assertIn(
+            "subtle.ConstantTimeCompare",
+            self.anchor_protocol_source,
         )
-        final_boundary = self.delete_helper_source[
-            self.delete_helper_source.index(
-                "recheck_verified_target(",
-                self.delete_helper_source.index("def delete_owned_netns("),
-            ) :
-            self.delete_helper_source.index("status = delete_runner(name)")
+        self.assertNotIn("/run/netns", self.anchor_linux_source)
+        self.assertNotIn("ip netns", self.anchor_linux_source)
+        exec_helper = self.anchor_linux_source[
+            self.anchor_linux_source.index("func runExecCommand(") :
+            self.anchor_linux_source.index("\nfunc runMoveLinkCommand(")
         ]
-        self.assertNotIn("print(", final_boundary)
-        self.assertNotIn("subprocess", final_boundary)
+        self.assertLess(
+            exec_helper.index("acquireNamespace(flags,"),
+            exec_helper.index("unix.Setns(descriptor, unix.CLONE_NEWNET)"),
+        )
 
         teardown = self.source[
             self.source.index("explicit_teardown() {") :
             self.source.index("\nmake_agent_config() {")
         ]
         self.assertIn("validate_all_netns_identities || return 1", teardown)
-        self.assertEqual(teardown.count("delete_owned_netns "), 3)
-        self.assertNotIn('teardown_step "delete netns', teardown)
+        self.assertEqual(teardown.count("stop_owned_netns "), 3)
+        self.assertLess(
+            teardown.index("stop_owned_netns "),
+            teardown.index('"${NETNS_AUTH_TOKEN_FILE}"'),
+        )
+        self.assertNotIn("delete_owned_netns", teardown)
+        operational = self.source[
+            self.source.index("NETNS_CLIENT_ARGS=()") :
+        ]
+        self.assertNotIn('"${NETNS_ANCHOR_HELPER}"', operational)
+        self.assertGreaterEqual(
+            operational.count(
+                '"WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD='
+                '${NETNS_ANCHOR_IMAGE_FD}"'
+            ),
+            8,
+        )
+
+        source_check = self.source.index(
+            'NETNS_HELPER_SOURCE_COMMIT="$('
+        )
+        create_root = self.source.index('PHASE="create-owned-run-root"')
+        self.assertLess(source_check, create_root)
+        self.assertIn(
+            '"${NETNS_HELPER_SOURCE_COMMIT}" != "${EXPECTED_SOURCE_COMMIT}"',
+            self.source,
+        )
+        anchor_build = self.makefile_source[
+            self.makefile_source.index("build-netns-anchor:") :
+            self.makefile_source.index("\n\nbuild-linux-amd64:")
+        ]
+        self.assertIn(
+            "-ldflags=$(NETNS_ANCHOR_IDENTITY_LDFLAG)",
+            anchor_build,
+        )
 
     def test_tcp_matrix_covers_flow_count_direction_and_error_gates(self) -> None:
         self.assertIn('TCP_STREAMS="${TCP_STREAMS:-1 4 16}"', self.source)

@@ -15,9 +15,10 @@ fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ROOT}/bin/wg-mix-ebpf"
+NETNS_ANCHOR_HELPER="${ROOT}/bin/wg-mix-ebpf-netns-anchor"
+SOURCE_COMMIT_HELPER="${ROOT}/scripts/source-commit.sh"
 LIFECYCLE_HOLDER_HELPER="${ROOT}/scripts/hold-isolated-lifecycle-lease.py"
 IPERF_CHECKER_HELPER="${ROOT}/scripts/check-iperf3-tcp.py"
-NETNS_DELETE_HELPER="${ROOT}/scripts/delete-owned-netns.py"
 OUTER_FAMILY="${OUTER_FAMILY:-ipv4}"
 XOR_SCOPE="${XOR_SCOPE:-wg-payload-full}"
 XOR_MAX_BYTES="${XOR_MAX_BYTES:-2048}"
@@ -37,6 +38,7 @@ TCP_CAPTURE_PACKETS="${TCP_CAPTURE_PACKETS:-4096}"
 TCP_PORT="${TCP_PORT:-5201}"
 UNDERLAY_MTU="${UNDERLAY_MTU:-2200}"
 WG_MTU="${WG_MTU:-2000}"
+NETNS_ANCHOR_TTL_SECONDS="${NETNS_ANCHOR_TTL_SECONDS:-28800}"
 
 if [[ "${OUTER_FAMILY}" != "ipv4" && "${OUTER_FAMILY}" != "ipv6" ]]; then
   echo "error: OUTER_FAMILY must be ipv4 or ipv6" >&2
@@ -67,6 +69,11 @@ done
 if [[ "${TCP_GSO_CHECKS}" != "off" && "${TCP_GSO_CHECKS}" != "report" &&
   "${TCP_GSO_CHECKS}" != "enforce" ]]; then
   echo "error: TCP_GSO_CHECKS must be off, report, or enforce" >&2
+  exit 1
+fi
+if [[ ! "${NETNS_ANCHOR_TTL_SECONDS}" =~ ^[0-9]+$ ]] ||
+  ((NETNS_ANCHOR_TTL_SECONDS < 60 || NETNS_ANCHOR_TTL_SECONDS > 86400)); then
+  echo "error: NETNS_ANCHOR_TTL_SECONDS must be an integer in [60, 86400]" >&2
   exit 1
 fi
 if [[ "${XOR_DISPATCH_FAILURE_CHECKS}" == "enforce" &&
@@ -200,16 +207,65 @@ if [[ ! -f "${IPERF_CHECKER_HELPER}" || -L "${IPERF_CHECKER_HELPER}" ]]; then
   echo "error: missing iperf checker helper: ${IPERF_CHECKER_HELPER}" >&2
   exit 1
 fi
-if [[ ! -f "${NETNS_DELETE_HELPER}" || -L "${NETNS_DELETE_HELPER}" ]]; then
-  echo "error: missing netns delete helper: ${NETNS_DELETE_HELPER}" >&2
+if [[ ! -x "${NETNS_ANCHOR_HELPER}" || -L "${NETNS_ANCHOR_HELPER}" ]]; then
+  echo "error: missing anonymous netns anchor helper: ${NETNS_ANCHOR_HELPER}" >&2
   exit 1
 fi
-IP_BIN="$(command -v ip)"
-if [[ "${IP_BIN}" != /* ]]; then
-  echo "error: ip command did not resolve to an absolute path" >&2
+exec {NETNS_ANCHOR_IMAGE_FD}<"${NETNS_ANCHOR_HELPER}"
+NETNS_ANCHOR_EXEC="/proc/self/fd/${NETNS_ANCHOR_IMAGE_FD}"
+read -r \
+  NETNS_ANCHOR_HELPER_DEV \
+  NETNS_ANCHOR_HELPER_INO \
+  NETNS_ANCHOR_HELPER_UID \
+  NETNS_ANCHOR_HELPER_MODE \
+  NETNS_ANCHOR_HELPER_NLINK < <(
+  stat -Lc '%d %i %u %a %h' -- "${NETNS_ANCHOR_EXEC}"
+)
+read -r NETNS_ANCHOR_PATH_DEV NETNS_ANCHOR_PATH_INO < <(
+  stat -Lc '%d %i' -- "${NETNS_ANCHOR_HELPER}"
+)
+if [[ ! "${NETNS_ANCHOR_IMAGE_FD}" =~ ^[1-9][0-9]*$ ||
+  ! "${NETNS_ANCHOR_HELPER_DEV}" =~ ^[1-9][0-9]*$ ||
+  ! "${NETNS_ANCHOR_HELPER_INO}" =~ ^[1-9][0-9]*$ ||
+  "${NETNS_ANCHOR_HELPER_UID}" != "${EUID}" ||
+  ! "${NETNS_ANCHOR_HELPER_MODE}" =~ ^[0-7]{3,4}$ ||
+  ! "${NETNS_ANCHOR_HELPER_NLINK}" =~ ^1$ ||
+  ! -f "${NETNS_ANCHOR_EXEC}" ||
+  "${NETNS_ANCHOR_PATH_DEV}" != "${NETNS_ANCHOR_HELPER_DEV}" ||
+  "${NETNS_ANCHOR_PATH_INO}" != "${NETNS_ANCHOR_HELPER_INO}" ]] ||
+  (((8#${NETNS_ANCHOR_HELPER_MODE} & 8#22) != 0)) ||
+  (((8#${NETNS_ANCHOR_HELPER_MODE} & 8#111) == 0)); then
+  echo "error: anonymous netns anchor helper file identity or mode is unsafe" >&2
   exit 1
 fi
-IP_BIN="$(realpath -e -- "${IP_BIN}")"
+if [[ ! -x "${SOURCE_COMMIT_HELPER}" || -L "${SOURCE_COMMIT_HELPER}" ]]; then
+  echo "error: missing fixed source commit helper: ${SOURCE_COMMIT_HELPER}" >&2
+  exit 1
+fi
+EXPECTED_SOURCE_COMMIT="$("${SOURCE_COMMIT_HELPER}")"
+MAIN_SOURCE_COMMIT="$(
+  env -u XOR_PASSWORD "${BIN}" version --json |
+    python3 -c 'import json, sys; print(json.load(sys.stdin).get("source_commit", ""))'
+)"
+NETNS_HELPER_SOURCE_COMMIT="$(
+  env -u XOR_PASSWORD \
+    "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
+    "${NETNS_ANCHOR_EXEC}" identity
+)"
+for source_commit in \
+  "${EXPECTED_SOURCE_COMMIT}" \
+  "${MAIN_SOURCE_COMMIT}" \
+  "${NETNS_HELPER_SOURCE_COMMIT}"; do
+  if [[ ! "${source_commit}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "error: unsealed build source commit: ${source_commit}" >&2
+    exit 1
+  fi
+done
+if [[ "${MAIN_SOURCE_COMMIT}" != "${EXPECTED_SOURCE_COMMIT}" ||
+  "${NETNS_HELPER_SOURCE_COMMIT}" != "${EXPECTED_SOURCE_COMMIT}" ]]; then
+  echo "error: test binaries do not match the clean source commit: source=${EXPECTED_SOURCE_COMMIT} main=${MAIN_SOURCE_COMMIT} anchor=${NETNS_HELPER_SOURCE_COMMIT}" >&2
+  exit 1
+fi
 
 if [[ -n "${RUN_ID+x}" ]]; then
   echo "error: externally supplied RUN_ID is forbidden; each run uses a fresh random ID" >&2
@@ -263,6 +319,18 @@ import secrets
 print(secrets.token_hex(16))
 PY
 )"
+NETNS_SOCKET_A="wme-netns-${RUN_ID}-a-${OWNER_TOKEN}"
+NETNS_SOCKET_R="wme-netns-${RUN_ID}-r-${OWNER_TOKEN}"
+NETNS_SOCKET_B="wme-netns-${RUN_ID}-b-${OWNER_TOKEN}"
+NETNS_AUTH_TOKEN="$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(32))
+PY
+)"
+NETNS_AUTH_TOKEN_FILE="${SECRET_DIR}/netns-anchor-token"
+NETNS_READY_A="${TMPDIR}/netns-anchor-a.ready"
+NETNS_READY_R="${TMPDIR}/netns-anchor-r.ready"
+NETNS_READY_B="${TMPDIR}/netns-anchor-b.ready"
 LIFECYCLE_HOLDER_STATUS="${TMPDIR}/lifecycle-holder-${OWNER_TOKEN}.status"
 BOOT_ID="$(< /proc/sys/kernel/random/boot_id)"
 HOST_ID="$(hostname)"
@@ -280,6 +348,13 @@ NETNS_R_DEV=""
 NETNS_R_INO=""
 NETNS_B_DEV=""
 NETNS_B_INO=""
+NETNS_ANCHOR_PID_A=""
+NETNS_ANCHOR_PID_R=""
+NETNS_ANCHOR_PID_B=""
+VETH_A_IFINDEX=""
+VETH_RA_IFINDEX=""
+VETH_B_IFINDEX=""
+VETH_RB_IFINDEX=""
 RUN_BASE_CREATED=0
 TEARDOWN_COMPLETE=0
 PHASE="preflight"
@@ -305,10 +380,17 @@ failure_report() {
     printf 'sensitive recovery material (never copy as evidence): %s\n' \
       "${SECRET_DIR}" >&2
     printf 'review the marker, manifest, exact paths, and bounded inventory before recovery\n' >&2
-    printf 'sealed netns identities: a=%s:%s:%s router=%s:%s:%s b=%s:%s:%s\n' \
-      "${NSA}" "${NETNS_A_DEV:-unsealed}" "${NETNS_A_INO:-unsealed}" \
-      "${NSR}" "${NETNS_R_DEV:-unsealed}" "${NETNS_R_INO:-unsealed}" \
-      "${NSB}" "${NETNS_B_DEV:-unsealed}" "${NETNS_B_INO:-unsealed}" >&2
+    printf 'held anonymous netns helper image: fd=%s identity=%s:%s source_commit=%s\n' \
+      "${NETNS_ANCHOR_IMAGE_FD}" \
+      "${NETNS_ANCHOR_HELPER_DEV}" "${NETNS_ANCHOR_HELPER_INO}" \
+      "${NETNS_HELPER_SOURCE_COMMIT}" >&2
+    printf 'sealed anonymous netns anchors: a=%s:%s pid=%s socket=%s router=%s:%s pid=%s socket=%s b=%s:%s pid=%s socket=%s\n' \
+      "${NETNS_A_DEV:-unsealed}" "${NETNS_A_INO:-unsealed}" \
+      "${NETNS_ANCHOR_PID_A:-unsealed}" "${NETNS_SOCKET_A}" \
+      "${NETNS_R_DEV:-unsealed}" "${NETNS_R_INO:-unsealed}" \
+      "${NETNS_ANCHOR_PID_R:-unsealed}" "${NETNS_SOCKET_R}" \
+      "${NETNS_B_DEV:-unsealed}" "${NETNS_B_INO:-unsealed}" \
+      "${NETNS_ANCHOR_PID_B:-unsealed}" "${NETNS_SOCKET_B}" >&2
     printf 'no recovery mutation command is generated; use a separately committed and reviewed recovery script only after revalidating these identities\n' >&2
     printf 'do not remove files until every path is revalidated under %s/%s\n' \
       "${TEST_ROOT}" "${RUN_ID}" >&2
@@ -317,6 +399,9 @@ failure_report() {
     "tcpdump-ra:${TCPDUMP_RA}" "tcpdump-rb:${TCPDUMP_RB}" \
     "agent:${AGENT_PID}" "pcap-checker:${PCAP_CHECKER_PID}" \
     "lifecycle-holder:${LIFECYCLE_HOLDER_PID}" \
+    "netns-anchor-a:${NETNS_ANCHOR_PID_A}" \
+    "netns-anchor-r:${NETNS_ANCHOR_PID_R}" \
+    "netns-anchor-b:${NETNS_ANCHOR_PID_B}" \
     "udp-receiver:${UDP_ZERO_CHECKSUM_RECEIVER_PID}" \
     "tcp-server:${TCP_SERVER_PID}" "tcp-client:${TCP_CLIENT_PID}"; do
     [[ "${pid_record#*:}" == "" ]] ||
@@ -673,10 +758,59 @@ if not descendants:
 PY
 }
 
-netns_exists() {
-  local ns="$1"
+NETNS_CLIENT_ARGS=()
 
-  ip netns list | awk -v wanted="${ns}" '$1 == wanted { found = 1 } END { exit !found }'
+set_netns_client_args() {
+  local ns="$1"
+  local role
+  local socket_name
+  local expected_device
+  local expected_inode
+  local anchor_pid
+
+  case "${ns}" in
+    "${NSA}")
+      role=a
+      socket_name="${NETNS_SOCKET_A}"
+      expected_device="${NETNS_A_DEV}"
+      expected_inode="${NETNS_A_INO}"
+      anchor_pid="${NETNS_ANCHOR_PID_A}"
+      ;;
+    "${NSR}")
+      role=r
+      socket_name="${NETNS_SOCKET_R}"
+      expected_device="${NETNS_R_DEV}"
+      expected_inode="${NETNS_R_INO}"
+      anchor_pid="${NETNS_ANCHOR_PID_R}"
+      ;;
+    "${NSB}")
+      role=b
+      socket_name="${NETNS_SOCKET_B}"
+      expected_device="${NETNS_B_DEV}"
+      expected_inode="${NETNS_B_INO}"
+      anchor_pid="${NETNS_ANCHOR_PID_B}"
+      ;;
+    *)
+      echo "error: command requested unknown anonymous network namespace role: ${ns}" >&2
+      return 1
+      ;;
+  esac
+  if [[ ! "${expected_device}" =~ ^[1-9][0-9]*$ ||
+    ! "${expected_inode}" =~ ^[1-9][0-9]*$ ||
+    ! "${anchor_pid}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: anonymous network namespace contract is unsealed: ${ns}" >&2
+    return 1
+  fi
+  NETNS_CLIENT_ARGS=(
+    --socket "${socket_name}"
+    --token-file "${NETNS_AUTH_TOKEN_FILE}"
+    --run-id "${RUN_ID}"
+    --role "${role}"
+    --expected-device "${expected_device}"
+    --expected-inode "${expected_inode}"
+    --expected-anchor-pid "${anchor_pid}"
+    --expected-anchor-uid "${EUID}"
+  )
 }
 
 validate_netns_identity() {
@@ -684,8 +818,6 @@ validate_netns_identity() {
   local expected_device="$2"
   local expected_inode="$3"
   local expected_role="$4"
-  local observed_device
-  local observed_inode
 
   case "${expected_role}:${ns}:${expected_device}:${expected_inode}" in
     "a:${NSA}:${NETNS_A_DEV}:${NETNS_A_INO}" | \
@@ -701,47 +833,17 @@ validate_netns_identity() {
     echo "error: unsealed network namespace identity for ${ns}" >&2
     return 1
   fi
-  if ! netns_exists "${ns}" || [[ ! -e "/run/netns/${ns}" || -L "/run/netns/${ns}" ]]; then
-    echo "error: expected owned network namespace is missing or replaceable: ${ns}" >&2
-    return 1
-  fi
-  read -r observed_device observed_inode < <(
-    stat -Lc '%d %i' -- "/run/netns/${ns}"
-  )
-  if [[ "${observed_device}" != "${expected_device}" ||
-    "${observed_inode}" != "${expected_inode}" ]]; then
-    echo "error: network namespace identity changed for ${ns}: expected=${expected_device}:${expected_inode} observed=${observed_device}:${observed_inode}" >&2
-    return 1
-  fi
+  set_netns_client_args "${ns}" || return 1
+  env -u XOR_PASSWORD \
+    "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
+    "${NETNS_ANCHOR_EXEC}" probe \
+    "${NETNS_CLIENT_ARGS[@]}"
 }
 
 validate_all_netns_identities() {
   validate_netns_identity "${NSA}" "${NETNS_A_DEV}" "${NETNS_A_INO}" a &&
     validate_netns_identity "${NSR}" "${NETNS_R_DEV}" "${NETNS_R_INO}" r &&
     validate_netns_identity "${NSB}" "${NETNS_B_DEV}" "${NETNS_B_INO}" b
-}
-
-validate_named_netns_identity() {
-  local ns="$1"
-
-  case "${ns}" in
-    "${NSA}")
-      validate_netns_identity \
-        "${NSA}" "${NETNS_A_DEV}" "${NETNS_A_INO}" a
-      ;;
-    "${NSR}")
-      validate_netns_identity \
-        "${NSR}" "${NETNS_R_DEV}" "${NETNS_R_INO}" r
-      ;;
-    "${NSB}")
-      validate_netns_identity \
-        "${NSB}" "${NETNS_B_DEV}" "${NETNS_B_INO}" b
-      ;;
-    *)
-      echo "error: command requested unknown network namespace: ${ns}" >&2
-      return 1
-      ;;
-  esac
 }
 
 run_in_owned_netns() {
@@ -752,8 +854,11 @@ run_in_owned_netns() {
     echo "error: empty command requested for network namespace ${ns}" >&2
     return 1
   fi
-  validate_named_netns_identity "${ns}" || return 1
-  env -u XOR_PASSWORD ip netns exec "${ns}" env -u XOR_PASSWORD "$@"
+  set_netns_client_args "${ns}" || return 1
+  env -u XOR_PASSWORD \
+    "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
+    "${NETNS_ANCHOR_EXEC}" exec \
+    "${NETNS_CLIENT_ARGS[@]}" -- env -u XOR_PASSWORD "$@"
 }
 
 run_bounded_in_owned_netns() {
@@ -768,35 +873,134 @@ run_bounded_in_owned_netns() {
     return 1
   fi
   # Keep the auditable wrapper process observable before resolving the
-  # namespace pathname. Identity validation then immediately precedes exec.
+  # exact namespace FD. The helper validates the authenticated anchor peer,
+  # response identity, namespace type, and received descriptor before setns.
   sleep 0.2
-  validate_named_netns_identity "${ns}" || return 1
+  set_netns_client_args "${ns}" || return 1
   env -u XOR_PASSWORD timeout -s "${signal}" -k 2 "${duration}" \
-    ip netns exec "${ns}" env -u XOR_PASSWORD "$@"
+    env -u XOR_PASSWORD \
+    "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
+    "${NETNS_ANCHOR_EXEC}" exec "${NETNS_CLIENT_ARGS[@]}" -- \
+    env -u XOR_PASSWORD "$@"
 }
 
 move_link_to_owned_netns() {
   local link="$1"
   local ns="$2"
+  local expected_ifindex
 
   case "${link}:${ns}" in
-    "${VETH_A}:${NSA}" | "${VETH_RA}:${NSR}" | \
-      "${VETH_B}:${NSB}" | "${VETH_RB}:${NSR}") ;;
+    "${VETH_A}:${NSA}") expected_ifindex="${VETH_A_IFINDEX}" ;;
+    "${VETH_RA}:${NSR}") expected_ifindex="${VETH_RA_IFINDEX}" ;;
+    "${VETH_B}:${NSB}") expected_ifindex="${VETH_B_IFINDEX}" ;;
+    "${VETH_RB}:${NSR}") expected_ifindex="${VETH_RB_IFINDEX}" ;;
     *)
       echo "error: invalid link-to-netns move request: link=${link} netns=${ns}" >&2
       return 1
       ;;
   esac
-  validate_named_netns_identity "${ns}" || return 1
-  ip link set "${link}" netns "${ns}"
+  if [[ ! "${expected_ifindex}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: unsealed host link identity for ${link}" >&2
+    return 1
+  fi
+  set_netns_client_args "${ns}" || return 1
+  env -u XOR_PASSWORD \
+    "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
+    "${NETNS_ANCHOR_EXEC}" move-link \
+    "${NETNS_CLIENT_ARGS[@]}" \
+    --link "${link}" \
+    --expected-ifindex "${expected_ifindex}"
 }
 
-for ns in "${NSA}" "${NSR}" "${NSB}"; do
-  if netns_exists "${ns}"; then
-    echo "error: random RUN_ID collision with existing netns ${ns}; refusing cleanup or retry" >&2
-    exit 1
+start_netns_anchor() {
+  local ns="$1"
+  local role="$2"
+  local socket_name="$3"
+  local ready_file="$4"
+  local anchor_pid
+  local observed_device
+  local observed_inode
+  local anchor_status
+
+  validate_owned_path "${ready_file}" || return 1
+  if [[ -e "${ready_file}" || -L "${ready_file}" ]]; then
+    echo "error: anonymous netns ready file already exists: ${ready_file}" >&2
+    return 1
   fi
-done
+  env -u XOR_PASSWORD \
+    "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
+    "${NETNS_ANCHOR_EXEC}" anchor \
+    --socket "${socket_name}" \
+    --token-file "${NETNS_AUTH_TOKEN_FILE}" \
+    --run-id "${RUN_ID}" \
+    --role "${role}" \
+    --ready-file "${ready_file}" \
+    --ttl-seconds "${NETNS_ANCHOR_TTL_SECONDS}" \
+    --parent-pid "$$" \
+    --expected-client-uid "${EUID}" &
+  anchor_pid=$!
+  case "${role}" in
+    a) NETNS_ANCHOR_PID_A="${anchor_pid}" ;;
+    r) NETNS_ANCHOR_PID_R="${anchor_pid}" ;;
+    b) NETNS_ANCHOR_PID_B="${anchor_pid}" ;;
+    *)
+      echo "error: invalid anonymous netns anchor role: ${role}" >&2
+      return 1
+      ;;
+  esac
+  for _ in {1..100}; do
+    if [[ -f "${ready_file}" && ! -L "${ready_file}" ]]; then
+      if read -r observed_device observed_inode < <(
+        env -u XOR_PASSWORD \
+          "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
+          "${NETNS_ANCHOR_EXEC}" inspect-ready \
+          --ready-file "${ready_file}" \
+          --run-id "${RUN_ID}" \
+          --role "${role}" \
+          --socket "${socket_name}" \
+          --expected-anchor-pid "${anchor_pid}" \
+          --expected-anchor-uid "${EUID}" \
+          --expected-parent-pid "$$"
+      ); then
+        break
+      fi
+      echo "error: anonymous netns readiness contract is invalid: ${ready_file}" >&2
+      return 1
+    fi
+    if ! kill -0 "${anchor_pid}" >/dev/null 2>&1; then
+      if wait "${anchor_pid}"; then
+        anchor_status=0
+      else
+        anchor_status=$?
+      fi
+      echo "error: anonymous netns anchor exited before readiness: role=${role} status=${anchor_status}" >&2
+      return 1
+    fi
+    sleep 0.05
+  done
+  if [[ ! "${observed_device}" =~ ^[1-9][0-9]*$ ||
+    ! "${observed_inode}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: anonymous netns anchor readiness timed out: role=${role}" >&2
+    return 1
+  fi
+  case "${role}" in
+    a)
+      NETNS_A_DEV="${observed_device}"
+      NETNS_A_INO="${observed_inode}"
+      ;;
+    r)
+      NETNS_R_DEV="${observed_device}"
+      NETNS_R_INO="${observed_inode}"
+      ;;
+    b)
+      NETNS_B_DEV="${observed_device}"
+      NETNS_B_INO="${observed_inode}"
+      ;;
+  esac
+  validate_netns_identity \
+    "${ns}" "${observed_device}" "${observed_inode}" "${role}"
+}
+
 for link in "${VETH_A}" "${VETH_RA}" "${VETH_B}" "${VETH_RB}"; do
   if ip -o link show dev "${link}" >/dev/null 2>&1; then
     echo "error: random RUN_ID collision with existing link ${link}; refusing cleanup or retry" >&2
@@ -840,6 +1044,13 @@ write_marker "${TMPDIR}" evidence
 write_marker "${SECRET_DIR}" secrets
 write_marker "${PIN_LOCK_ROOT}" pin-locks
 write_marker "${PIN_OWNER_ROOT}" pin-owners
+if [[ ! "${NETNS_AUTH_TOKEN}" =~ ^[0-9a-f]{64}$ ]]; then
+  echo "error: failed to generate a canonical anonymous netns authentication token" >&2
+  exit 1
+fi
+(set -o noclobber; printf '%s\n' "${NETNS_AUTH_TOKEN}" >"${NETNS_AUTH_TOKEN_FILE}")
+chmod 0600 "${NETNS_AUTH_TOKEN_FILE}"
+unset NETNS_AUTH_TOKEN
 if ((XOR_ENABLED)); then
   (set -o noclobber; printf '%s\n' "${XOR_SECRET}" >"${SECRET_DIR}/xor-password")
   chmod 0600 "${SECRET_DIR}/xor-password"
@@ -1005,40 +1216,67 @@ remove_owned_file() {
   teardown_step "remove exact file ${path}" rm -- "${path}"
 }
 
-delete_owned_netns() {
+stop_owned_netns() {
   local ns="$1"
   local expected_device="$2"
   local expected_inode="$3"
   local expected_role="$4"
+  local anchor_pid
   local status
+  local wait_status
 
   validate_marker "${RUN_BASE}" root || return 1
   validate_manifest || return 1
-  printf 'teardown start: timestamp=%s action=delete owned netns %s identity=%s:%s role=%s\n' \
+  validate_netns_identity \
+    "${ns}" "${expected_device}" "${expected_inode}" "${expected_role}" ||
+    return 1
+  set_netns_client_args "${ns}" || return 1
+  case "${expected_role}" in
+    a) anchor_pid="${NETNS_ANCHOR_PID_A}" ;;
+    r) anchor_pid="${NETNS_ANCHOR_PID_R}" ;;
+    b) anchor_pid="${NETNS_ANCHOR_PID_B}" ;;
+    *)
+      echo "error: invalid anonymous netns stop role: ${expected_role}" >&2
+      return 1
+      ;;
+  esac
+  printf 'teardown start: timestamp=%s action=stop anonymous netns anchor identity=%s:%s role=%s pid=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    "${ns}" "${expected_device}" "${expected_inode}" "${expected_role}"
+    "${expected_device}" "${expected_inode}" "${expected_role}" "${anchor_pid}"
   printf 'teardown argv:\n'
-  print_command env -u XOR_PASSWORD python3 "${NETNS_DELETE_HELPER}" \
-    --name "${ns}" \
-    --run-id "${RUN_ID}" \
-    --role "${expected_role}" \
-    --expected-device "${expected_device}" \
-    --expected-inode "${expected_inode}" \
-    --ip-bin "${IP_BIN}"
-  if env -u XOR_PASSWORD python3 "${NETNS_DELETE_HELPER}" \
-    --name "${ns}" \
-    --run-id "${RUN_ID}" \
-    --role "${expected_role}" \
-    --expected-device "${expected_device}" \
-    --expected-inode "${expected_inode}" \
-    --ip-bin "${IP_BIN}"; then
+  print_command env -u XOR_PASSWORD \
+    "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
+    "${NETNS_ANCHOR_EXEC}" stop \
+    "${NETNS_CLIENT_ARGS[@]}"
+  if env -u XOR_PASSWORD \
+    "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
+    "${NETNS_ANCHOR_EXEC}" stop \
+    "${NETNS_CLIENT_ARGS[@]}"; then
     status=0
   else
     status=$?
   fi
-  printf 'teardown finish: timestamp=%s action=delete owned netns %s exit=%s\n' \
-    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${ns}" "${status}"
-  return "${status}"
+  if ((status != 0)); then
+    printf 'teardown finish: timestamp=%s action=stop anonymous netns anchor role=%s client_exit=%s\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${expected_role}" "${status}"
+    return "${status}"
+  fi
+  if wait "${anchor_pid}"; then
+    wait_status=0
+  else
+    wait_status=$?
+  fi
+  if ((wait_status == 0)); then
+    case "${expected_role}" in
+      a) NETNS_ANCHOR_PID_A="" ;;
+      r) NETNS_ANCHOR_PID_R="" ;;
+      b) NETNS_ANCHOR_PID_B="" ;;
+    esac
+  fi
+  printf 'teardown finish: timestamp=%s action=stop anonymous netns anchor role=%s client_exit=%s anchor_exit=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "${expected_role}" "${status}" "${wait_status}"
+  return "${wait_status}"
 }
 
 validate_released_pin_lock() {
@@ -1335,11 +1573,16 @@ explicit_teardown() {
     return 1
   fi
 
+  stop_owned_netns "${NSA}" "${NETNS_A_DEV}" "${NETNS_A_INO}" a || return 1
+  stop_owned_netns "${NSR}" "${NETNS_R_DEV}" "${NETNS_R_INO}" r || return 1
+  stop_owned_netns "${NSB}" "${NETNS_B_DEV}" "${NETNS_B_INO}" b || return 1
+
   for secret_file in \
     "${SECRET_DIR}/a.key" "${SECRET_DIR}/a.pub" \
     "${SECRET_DIR}/b.key" "${SECRET_DIR}/b.pub" \
     "${SECRET_DIR}/wg-a.conf" "${SECRET_DIR}/wg-b.conf" \
-    "${SECRET_DIR}/agent-a.yaml" "${SECRET_DIR}/agent-b.yaml"; do
+    "${SECRET_DIR}/agent-a.yaml" "${SECRET_DIR}/agent-b.yaml" \
+    "${NETNS_AUTH_TOKEN_FILE}"; do
     remove_owned_file "${secret_file}" || return 1
   done
   if ((XOR_ENABLED)); then
@@ -1349,9 +1592,6 @@ explicit_teardown() {
   teardown_step "remove empty sensitive directory ${SECRET_DIR}" \
     rmdir -- "${SECRET_DIR}" || return 1
 
-  delete_owned_netns "${NSA}" "${NETNS_A_DEV}" "${NETNS_A_INO}" a || return 1
-  delete_owned_netns "${NSR}" "${NETNS_R_DEV}" "${NETNS_R_INO}" r || return 1
-  delete_owned_netns "${NSB}" "${NETNS_B_DEV}" "${NETNS_B_INO}" b || return 1
   validate_private_bpffs_mount || return 1
   teardown_step "unmount exact bpffs ${BPFFS_DIR}" \
     umount -- "${BPFFS_DIR}" || return 1
@@ -2299,12 +2539,9 @@ delete_tail_slot() {
 }
 
 PHASE="network-test-setup"
-ip netns add "${NSA}"
-ip netns add "${NSR}"
-ip netns add "${NSB}"
-read -r NETNS_A_DEV NETNS_A_INO < <(stat -Lc '%d %i' -- "/run/netns/${NSA}")
-read -r NETNS_R_DEV NETNS_R_INO < <(stat -Lc '%d %i' -- "/run/netns/${NSR}")
-read -r NETNS_B_DEV NETNS_B_INO < <(stat -Lc '%d %i' -- "/run/netns/${NSB}")
+start_netns_anchor "${NSA}" a "${NETNS_SOCKET_A}" "${NETNS_READY_A}"
+start_netns_anchor "${NSR}" r "${NETNS_SOCKET_R}" "${NETNS_READY_R}"
+start_netns_anchor "${NSB}" b "${NETNS_SOCKET_B}" "${NETNS_READY_B}"
 for identity_part in \
   "${NETNS_A_DEV}" "${NETNS_A_INO}" \
   "${NETNS_R_DEV}" "${NETNS_R_INO}" \
@@ -2324,6 +2561,18 @@ validate_all_netns_identities
 
 ip link add "${VETH_A}" type veth peer name "${VETH_RA}"
 ip link add "${VETH_B}" type veth peer name "${VETH_RB}"
+VETH_A_IFINDEX="$(<"/sys/class/net/${VETH_A}/ifindex")"
+VETH_RA_IFINDEX="$(<"/sys/class/net/${VETH_RA}/ifindex")"
+VETH_B_IFINDEX="$(<"/sys/class/net/${VETH_B}/ifindex")"
+VETH_RB_IFINDEX="$(<"/sys/class/net/${VETH_RB}/ifindex")"
+for ifindex in \
+  "${VETH_A_IFINDEX}" "${VETH_RA_IFINDEX}" \
+  "${VETH_B_IFINDEX}" "${VETH_RB_IFINDEX}"; do
+  if [[ ! "${ifindex}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: invalid sealed veth ifindex: ${ifindex}" >&2
+    exit 1
+  fi
+done
 move_link_to_owned_netns "${VETH_A}" "${NSA}"
 move_link_to_owned_netns "${VETH_RA}" "${NSR}"
 move_link_to_owned_netns "${VETH_B}" "${NSB}"
