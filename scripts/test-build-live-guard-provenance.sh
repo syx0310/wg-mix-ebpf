@@ -65,6 +65,7 @@ readonly embedded_probe_root="${fixture_root}/embedded-probes"
 readonly tree_probe_parent="${embedded_probe_root}/tree-inventory"
 readonly blob_limit_probe_parent="${embedded_probe_root}/blob-limiter"
 readonly blob_batch_probe_parent="${embedded_probe_root}/blob-batch"
+readonly stat_regular_probe_parent="${embedded_probe_root}/stat-regular"
 readonly seal_probe_parent="${embedded_probe_root}/snapshot-seal"
 readonly seal_probe_snapshot="${seal_probe_parent}/source-snapshot"
 readonly seal_mode_probe_parent="${embedded_probe_root}/snapshot-seal-mode"
@@ -107,6 +108,7 @@ for directory in \
   "${tree_probe_parent}" \
   "${blob_limit_probe_parent}" \
   "${blob_batch_probe_parent}" \
+  "${stat_regular_probe_parent}" \
   "${seal_probe_snapshot}" \
   "${seal_mode_probe_snapshot}" \
   "${seal_content_probe_snapshot}" \
@@ -413,6 +415,28 @@ run_gate_with_poisoned_environment() {
     "${fixture_gate}" "$@"
 }
 
+# Compare the type bits from stat %f; descriptive file-type text varies by
+# coreutils version (an empty regular file may be "regular empty file").
+stat_mode_matches_kind() {
+  local raw_mode="$1"
+  local expected_kind="$2"
+  local expected_type
+
+  [[ "${raw_mode}" =~ ^[[:xdigit:]]+$ ]] || return 1
+  case "${expected_kind}" in
+    "regular file")
+      expected_type=$((0100000))
+      ;;
+    "directory")
+      expected_type=$((0040000))
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+  (( (16#${raw_mode} & 0170000) == expected_type ))
+}
+
 assert_snapshot_entry() {
   local path="$1"
   local expected_mode="$2"
@@ -421,23 +445,23 @@ assert_snapshot_entry() {
   local actual_uid
   local actual_mode
   local actual_links
-  local actual_kind
+  local actual_raw_mode
 
   [[ ! -L "${path}" ]] || {
     printf 'error: sealed snapshot entry is a symlink: %s\n' "${path}" >&2
     return 1
   }
-  read -r actual_uid actual_mode actual_links actual_kind < <(
-    "${STAT_BIN}" -c '%u %a %h %F' -- "${path}"
+  read -r actual_uid actual_mode actual_links actual_raw_mode < <(
+    "${STAT_BIN}" -c '%u %a %h %f' -- "${path}"
   )
-  [[ "${actual_uid}" == "${EUID}" &&
-    "${actual_mode}" == "${expected_mode}" &&
-    "${actual_kind}" == "${expected_kind}" ]] || {
-    printf 'error: sealed snapshot entry metadata mismatch: path=%s uid=%s mode=%s links=%s type=%s\n' \
+  if ! [[ "${actual_uid}" == "${EUID}" &&
+    "${actual_mode}" == "${expected_mode}" ]] ||
+    ! stat_mode_matches_kind "${actual_raw_mode}" "${expected_kind}"; then
+    printf 'error: sealed snapshot entry metadata mismatch: path=%s uid=%s mode=%s links=%s raw_mode=%s expected_type=%s\n' \
       "${path}" "${actual_uid}" "${actual_mode}" "${actual_links}" \
-      "${actual_kind}" >&2
+      "${actual_raw_mode}" "${expected_kind}" >&2
     return 1
-  }
+  fi
   if [[ -n "${expected_links}" &&
     "${actual_links}" != "${expected_links}" ]]; then
     printf 'error: sealed snapshot entry link count mismatch: path=%s links=%s\n' \
@@ -454,27 +478,27 @@ assert_evidence_file() {
   local actual_mode
   local actual_links
   local actual_size
-  local actual_kind
+  local actual_raw_mode
 
   [[ -f "${path}" && ! -L "${path}" ]] || {
     printf 'error: provenance evidence is missing or not regular: %s\n' \
       "${path}" >&2
     return 1
   }
-  read -r actual_uid actual_mode actual_links actual_size actual_kind < <(
-    "${STAT_BIN}" -c '%u %a %h %s %F' -- "${path}"
+  read -r actual_uid actual_mode actual_links actual_size actual_raw_mode < <(
+    "${STAT_BIN}" -c '%u %a %h %s %f' -- "${path}"
   )
-  [[ "${actual_uid}" == "${EUID}" &&
+  if ! [[ "${actual_uid}" == "${EUID}" &&
     "${actual_mode}" == "${expected_mode}" &&
     "${actual_links}" == "1" &&
     "${actual_size}" -gt 0 &&
-    "${actual_size}" -le "${byte_limit}" &&
-    "${actual_kind}" == "regular file" ]] || {
-    printf 'error: provenance evidence metadata is unsafe: path=%s uid=%s mode=%s links=%s size=%s type=%s\n' \
+    "${actual_size}" -le "${byte_limit}" ]] ||
+    ! stat_mode_matches_kind "${actual_raw_mode}" "regular file"; then
+    printf 'error: provenance evidence metadata is unsafe: path=%s uid=%s mode=%s links=%s size=%s raw_mode=%s\n' \
       "${path}" "${actual_uid}" "${actual_mode}" "${actual_links}" \
-      "${actual_size}" "${actual_kind}" >&2
+      "${actual_size}" "${actual_raw_mode}" >&2
     return 1
-  }
+  fi
 }
 
 assert_isolated_attributes_absent() {
@@ -788,28 +812,39 @@ assert_partial_evidence_file() {
   local actual_mode
   local actual_links
   local actual_size
-  local actual_kind
+  local actual_raw_mode
 
   [[ -f "${path}" && ! -L "${path}" ]] || {
     printf 'error: partial provenance evidence is missing or not regular: %s\n' \
       "${path}" >&2
     return 1
   }
-  read -r actual_uid actual_mode actual_links actual_size actual_kind < <(
-    "${STAT_BIN}" -c '%u %a %h %s %F' -- "${path}"
+  read -r actual_uid actual_mode actual_links actual_size actual_raw_mode < <(
+    "${STAT_BIN}" -c '%u %a %h %s %f' -- "${path}"
   )
-  [[ "${actual_uid}" == "${EUID}" &&
+  if ! [[ "${actual_uid}" == "${EUID}" &&
     "${actual_mode}" == "${expected_mode}" &&
     "${actual_links}" == "${expected_links}" &&
     "${actual_size}" -ge "${minimum_size}" &&
-    "${actual_size}" -le "${maximum_size}" &&
-    "${actual_kind}" == "regular file" ]] || {
-    printf 'error: partial provenance evidence metadata mismatch: path=%s uid=%s mode=%s links=%s size=%s type=%s\n' \
+    "${actual_size}" -le "${maximum_size}" ]] ||
+    ! stat_mode_matches_kind "${actual_raw_mode}" "regular file"; then
+    printf 'error: partial provenance evidence metadata mismatch: path=%s uid=%s mode=%s links=%s size=%s raw_mode=%s\n' \
       "${path}" "${actual_uid}" "${actual_mode}" "${actual_links}" \
-      "${actual_size}" "${actual_kind}" >&2
+      "${actual_size}" "${actual_raw_mode}" >&2
     return 1
-  }
+  fi
 }
+
+readonly stat_empty_regular_probe="${stat_regular_probe_parent}/empty.raw"
+readonly stat_nonempty_regular_probe="${stat_regular_probe_parent}/nonempty.raw"
+"${TOUCH_BIN}" -- "${stat_empty_regular_probe}"
+printf 'x' >"${stat_nonempty_regular_probe}"
+"${CHMOD_BIN}" 0600 -- \
+  "${stat_empty_regular_probe}" \
+  "${stat_nonempty_regular_probe}"
+assert_partial_evidence_file "${stat_empty_regular_probe}" "600" 0 0 1
+assert_partial_evidence_file "${stat_nonempty_regular_probe}" "600" 1 1 1
+printf 'provenance_probe_passed probe=stat-regular-empty-and-nonempty\n'
 
 readonly EMBEDDED_LITERAL_EXTRACT_PYTHON='import hashlib
 import os
@@ -1936,14 +1971,14 @@ expect_gate_failure \
 readonly oversized_source="${fixture_repo}/zz-oversized.bin"
 "${TRUNCATE_BIN}" --size="${OVERSIZED_CHUNK_BYTES}" -- \
   "${oversized_source}"
-read -r oversized_source_size oversized_source_kind < <(
-  "${STAT_BIN}" -c '%s %F' -- "${oversized_source}"
+read -r oversized_source_size oversized_source_raw_mode < <(
+  "${STAT_BIN}" -c '%s %f' -- "${oversized_source}"
 )
-[[ "${oversized_source_size}" -eq "${OVERSIZED_CHUNK_BYTES}" &&
-  "${oversized_source_kind}" == "regular file" ]] || {
+if ! [[ "${oversized_source_size}" -eq "${OVERSIZED_CHUNK_BYTES}" ]] ||
+  ! stat_mode_matches_kind "${oversized_source_raw_mode}" "regular file"; then
   echo "error: repeated-blob archive fixture is invalid" >&2
   exit 1
-}
+fi
 oversized_blob_oid="$(fixture_git hash-object -w -- "${oversized_source}")"
 readonly oversized_blob_oid
 [[ "${oversized_blob_oid}" =~ ^[0-9a-f]{40}$ ]] || {
@@ -1986,16 +2021,16 @@ readonly partial_archive="${oversized_output_parent}/candidate.tar"
   echo "error: oversized archive failure did not retain a partial archive" >&2
   exit 1
 }
-read -r partial_archive_size partial_archive_links partial_archive_kind < <(
-  "${STAT_BIN}" -c '%s %h %F' -- "${partial_archive}"
+read -r partial_archive_size partial_archive_links partial_archive_raw_mode < <(
+  "${STAT_BIN}" -c '%s %h %f' -- "${partial_archive}"
 )
-[[ "${partial_archive_size}" -gt 0 &&
+if ! [[ "${partial_archive_size}" -gt 0 &&
   "${partial_archive_size}" -le "${ARCHIVE_LIMIT_BYTES}" &&
-  "${partial_archive_links}" == "1" &&
-  "${partial_archive_kind}" == "regular file" ]] || {
+  "${partial_archive_links}" == "1" ]] ||
+  ! stat_mode_matches_kind "${partial_archive_raw_mode}" "regular file"; then
   echo "error: oversized archive limiter wrote beyond its hard bound" >&2
   exit 1
-}
+fi
 assert_evidence_file \
   "${oversized_output_parent}/candidate-tree.raw" \
   "400" "${TREE_INVENTORY_LIMIT_BYTES}"
