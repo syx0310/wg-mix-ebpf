@@ -15,6 +15,7 @@ import (
 
 	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
+	"github.com/syx0310/wg-mix-ebpf/internal/testutil"
 )
 
 func TestUninstallPurgeRejectsNonOwnedConfigDir(t *testing.T) {
@@ -56,6 +57,96 @@ func TestRenderedServicesUseStopCommand(t *testing.T) {
 	init := openWrtInit("/etc/wg-mix-ebpf/config.yaml", "/usr/sbin/wg-mix-ebpf")
 	if !strings.Contains(init, "/usr/sbin/wg-mix-ebpf stop --config \"$CONF\"") {
 		t.Fatalf("OpenWrt init should stop via daemon stop command:\n%s", init)
+	}
+}
+
+func TestApplyInstallPreservesRequestedServiceModes(t *testing.T) {
+	t.Run("systemd", func(t *testing.T) {
+		root := t.TempDir()
+		fakeBin := filepath.Join(root, "test-bin")
+		if err := os.Mkdir(fakeBin, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		systemctl := filepath.Join(fakeBin, "systemctl")
+		if err := os.WriteFile(systemctl, []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("PATH", fakeBin)
+
+		installPaths := serviceModeTestPaths(root)
+		if err := applyInstall(t.Context(), Options{}, "systemd", installPaths); err != nil {
+			t.Fatalf("apply systemd install: %v", err)
+		}
+
+		for _, dir := range []string{
+			filepath.Dir(installPaths.ConfigPath),
+			filepath.Dir(installPaths.BinaryPath),
+			installPaths.VarLibDir,
+			installPaths.RunDir,
+			installPaths.SystemdDir,
+		} {
+			requireInstallMode(t, dir, 0o755)
+		}
+		requireInstallMode(t, installPaths.BinaryPath, 0o755)
+		requireInstallMode(
+			t,
+			filepath.Join(installPaths.SystemdDir, "wg-mix-ebpf.service"),
+			0o644,
+		)
+	})
+
+	t.Run("openwrt", func(t *testing.T) {
+		root := t.TempDir()
+		installPaths := serviceModeTestPaths(root)
+		if err := applyInstall(t.Context(), Options{}, "openwrt", installPaths); err != nil {
+			t.Fatalf("apply OpenWrt install: %v", err)
+		}
+
+		for _, dir := range []string{
+			filepath.Dir(installPaths.ConfigPath),
+			filepath.Dir(installPaths.BinaryPath),
+			installPaths.VarLibDir,
+			installPaths.RunDir,
+			installPaths.OpenWrtInitDir,
+			installPaths.OpenWrtHotplugDir,
+		} {
+			requireInstallMode(t, dir, 0o755)
+		}
+		requireInstallMode(t, installPaths.BinaryPath, 0o755)
+		requireInstallMode(
+			t,
+			filepath.Join(installPaths.OpenWrtInitDir, "wg-mix-ebpf"),
+			0o755,
+		)
+		requireInstallMode(
+			t,
+			filepath.Join(installPaths.OpenWrtHotplugDir, "90-wg-mix-ebpf"),
+			0o755,
+		)
+	})
+}
+
+func serviceModeTestPaths(root string) paths {
+	return paths{
+		ConfigPath:        filepath.Join(root, "etc", "wg-mix-ebpf", "config.yaml"),
+		BinaryPath:        filepath.Join(root, "usr", "sbin", "wg-mix-ebpf"),
+		VarLibDir:         filepath.Join(root, "var", "lib", "wg-mix-ebpf"),
+		RunDir:            filepath.Join(root, "run", "wg-mix-ebpf"),
+		SystemdDir:        filepath.Join(root, "etc", "systemd", "system"),
+		OpenWrtInitDir:    filepath.Join(root, "etc", "init.d"),
+		OpenWrtHotplugDir: filepath.Join(root, "etc", "hotplug.d", "iface"),
+		PinPath:           filepath.Join(root, "sys", "fs", "bpf", "wg-mix-ebpf"),
+	}
+}
+
+func requireInstallMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("inspect mode for %s: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("mode for %s = %#o, want %#o", path, got, want)
 	}
 }
 
@@ -442,5 +533,5 @@ const (
 )
 
 func TestMain(m *testing.M) {
-	os.Exit(m.Run())
+	os.Exit(testutil.RunWithStandardUmask(m.Run))
 }
