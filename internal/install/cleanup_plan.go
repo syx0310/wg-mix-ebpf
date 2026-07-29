@@ -433,6 +433,13 @@ func cleanupResourcesExist(paths paths, system string) bool {
 	return runtimeCleanupResourcesExist(paths.RunDir)
 }
 
+func installOwnershipResourcesExist(paths paths, system string) bool {
+	if _, err := os.Lstat(paths.BinaryPath); err == nil || !cleanupIsNotExist(err) {
+		return true
+	}
+	return cleanupResourcesExist(paths, system)
+}
+
 func runtimeCleanupResourcesExist(runDir string) bool {
 	if _, err := os.Lstat(runDir); cleanupIsNotExist(err) {
 		return false
@@ -525,6 +532,9 @@ func validateCleanupManifestBootstrap(
 	installationID string,
 ) error {
 	manifest := expectedCleanupManifest(paths, system, installationID)
+	if _, err := validateInstallBinaryTarget(paths.BinaryPath, false); err != nil {
+		return fmt.Errorf("refuse install binary ownership: %w", err)
+	}
 	if configRoot != nil {
 		entries, err := cleanupReadDir(configRoot.dir)
 		if err != nil {
@@ -715,6 +725,11 @@ func validateFreshCleanupManifestBootstrap(
 	lifecyclePath string,
 ) error {
 	manifest := expectedCleanupManifest(paths, system, installationID)
+	if exists, err := validateInstallBinaryTarget(paths.BinaryPath, false); err != nil {
+		return fmt.Errorf("validate fresh install binary target: %w", err)
+	} else if exists {
+		return fmt.Errorf("fresh install binary %s already exists", paths.BinaryPath)
+	}
 	if configRoot != nil {
 		entries, err := cleanupReadDir(configRoot.dir)
 		if err != nil {

@@ -153,7 +153,7 @@ func inspectInstallCleanupOwnership(
 		return cleanupOwnershipAbsent, err
 	}
 	if !exists {
-		if cleanupResourcesExist(paths, system) {
+		if installOwnershipResourcesExist(paths, system) {
 			return cleanupOwnershipUnmarked, nil
 		}
 		return cleanupOwnershipAbsent, nil

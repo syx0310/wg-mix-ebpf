@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -556,51 +555,6 @@ func resolvedPaths(configPath string) paths {
 	}
 }
 
-func installBinary(target string) error {
-	src, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("resolve current executable: %w", err)
-	}
-	srcAbs, _ := filepath.Abs(src)
-	dstAbs, _ := filepath.Abs(target)
-	if srcAbs == dstAbs {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return err
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+".tmp-")
-	if err != nil {
-		return err
-	}
-	tmpPath := out.Name()
-	defer os.Remove(tmpPath)
-	if err := out.Chmod(0o755); err != nil {
-		_ = out.Close()
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return err
-	}
-	if err := out.Sync(); err != nil {
-		_ = out.Close()
-		return err
-	}
-	if err := out.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, target); err != nil {
-		return err
-	}
-	return nil
-}
-
 func wireGuardAppearsRunning(ctx context.Context, configPath string) bool {
 	cfg, err := config.LoadFileLenient(configPath)
 	if err != nil {
@@ -617,6 +571,9 @@ func wireGuardAppearsRunning(ctx context.Context, configPath string) bool {
 
 func validateInstallOwnershipPaths(paths paths) error {
 	if err := validateCleanupPaths(paths); err != nil {
+		return err
+	}
+	if err := validateInstallBinaryPath(paths.BinaryPath); err != nil {
 		return err
 	}
 	if paths.ConfigPath == "" || !filepath.IsAbs(paths.ConfigPath) ||

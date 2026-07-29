@@ -48,3 +48,7 @@ func cleanupMkdirAt(*cleanupDirFD, string, uint32) error {
 func cleanupRenameNoReplaceAt(*cleanupDirFD, string, string) error {
 	return errSecureCleanupUnsupported
 }
+
+func cleanupRenameReplaceAt(*cleanupDirFD, string, string) error {
+	return errSecureCleanupUnsupported
+}

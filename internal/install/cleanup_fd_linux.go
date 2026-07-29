@@ -199,3 +199,12 @@ func cleanupRenameNoReplaceAt(parent *cleanupDirFD, oldName string, newName stri
 		unix.RENAME_NOREPLACE,
 	)
 }
+
+func cleanupRenameReplaceAt(parent *cleanupDirFD, oldName string, newName string) error {
+	return unix.Renameat(
+		int(parent.file.Fd()),
+		oldName,
+		int(parent.file.Fd()),
+		newName,
+	)
+}

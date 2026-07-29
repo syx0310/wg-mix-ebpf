@@ -844,20 +844,14 @@ func TestOpenManagedCleanupDirRejectsMountIdentityChange(t *testing.T) {
 	}
 }
 
-func TestInstallBinaryReplacesModeAtomically(t *testing.T) {
+func TestInstallBinaryReplacesValidatedTargetAtomically(t *testing.T) {
 	target := filepath.Join(t.TempDir(), "wg-mix-ebpf")
-	if err := os.WriteFile(target, []byte("stale"), 0o777); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(target, 0o777); err != nil {
+	if err := os.WriteFile(target, []byte("stale"), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	initialInfo, err := os.Stat(target)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if got := initialInfo.Mode().Perm(); got != 0o777 {
-		t.Fatalf("initial binary mode = %o, want 777", got)
 	}
 	if err := installBinary(target); err != nil {
 		t.Fatal(err)
@@ -871,6 +865,37 @@ func TestInstallBinaryReplacesModeAtomically(t *testing.T) {
 	}
 	if info.Size() <= int64(len("stale")) {
 		t.Fatalf("installed binary was not replaced: size=%d", info.Size())
+	}
+	if os.SameFile(initialInfo, info) {
+		t.Fatal("installed binary reused the stale target inode")
+	}
+}
+
+func TestInstallBinaryRejectsWritableTargetWithoutMutation(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "wg-mix-ebpf")
+	if err := os.WriteFile(target, []byte("foreign"), 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(target, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = installBinary(target)
+	if err == nil || !strings.Contains(err.Error(), "group/other writable") {
+		t.Fatalf("install binary error = %v, want writable-target rejection", err)
+	}
+	after, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("rejected binary install replaced the foreign inode")
+	}
+	if data, err := os.ReadFile(target); err != nil || string(data) != "foreign" {
+		t.Fatalf("rejected binary install changed target: data=%q err=%v", data, err)
 	}
 }
 
@@ -1022,6 +1047,52 @@ func TestInstallRequiresExplicitAdoptionBeforeWrites(t *testing.T) {
 	}
 	if !os.SameFile(lockBefore, lockAfter) {
 		t.Fatal("rejected adoption replaced the existing runtime lock")
+	}
+}
+
+func TestInstallTreatsStandaloneBinaryAsUnmarkedResource(t *testing.T) {
+	root := t.TempDir()
+	layout := cleanupTestPaths(root, "binary-only")
+	if err := os.MkdirAll(filepath.Dir(layout.BinaryPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(layout.BinaryPath, []byte("foreign"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.Stat(layout.BinaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setCleanupTestEnvironment(t, layout)
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(root, "daemon.lease"),
+		filepath.Join(root, "maintenance.gate"),
+	)
+
+	_, err = Install(ctx, Options{System: "unknown"})
+	if err == nil || !strings.Contains(err.Error(), "--adopt-existing") {
+		t.Fatalf("install error = %v, want standalone-binary adoption rejection", err)
+	}
+	after, err := os.Stat(layout.BinaryPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("rejected install replaced the standalone binary")
+	}
+	if data, err := os.ReadFile(layout.BinaryPath); err != nil ||
+		string(data) != "foreign" {
+		t.Fatalf("rejected install changed standalone binary: data=%q err=%v", data, err)
+	}
+	for _, path := range []string{
+		filepath.Dir(layout.ConfigPath),
+		layout.RunDir,
+		layout.VarLibDir,
+	} {
+		if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("rejected standalone-binary adoption created %s: %v", path, statErr)
+		}
 	}
 }
 
