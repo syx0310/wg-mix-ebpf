@@ -36,10 +36,10 @@ type isolatedNetNSTestContractSnapshot struct {
 }
 
 type isolatedNetNSTestBPFFSSnapshot struct {
-	mountInfo mountInfoEntry
-	mountID   uint64
-	device    uint64
-	inode     uint64
+	mountChain []mountInfoEntry
+	mountID    uint64
+	device     uint64
+	inode      uint64
 }
 
 func isolatedNetNSTestContext(
@@ -349,6 +349,7 @@ func snapshotIsolatedNetNSTestContract(
 		manifest.values["config_b"]:    1024 * 1024,
 		manifest.values["wg_config_a"]: 256 * 1024,
 		manifest.values["wg_config_b"]: 256 * 1024,
+		layout.ledger:                  64 * 1024,
 		filepath.Join(
 			layout.runBase,
 			isolatedNetNSOwnerMarker,
@@ -403,12 +404,24 @@ func snapshotIsolatedNetNSTestContract(
 		}
 		snapshot.files[path] = file
 	}
+	ledgerFile, ok := snapshot.files[layout.ledger]
+	if !ok {
+		return isolatedNetNSTestContractSnapshot{}, fmt.Errorf(
+			"isolated test contract does not snapshot bpffs creation ledger %s",
+			layout.ledger,
+		)
+	}
+	ledger, err := parseIsolatedNetNSTestBPFFSLedger(ledgerFile.data)
+	if err != nil {
+		return isolatedNetNSTestContractSnapshot{}, err
+	}
 	endpoint, err := manifestEndpointForRole(manifest, layout.role)
 	if err != nil {
 		return isolatedNetNSTestContractSnapshot{}, err
 	}
 	bpffs, err := snapshotIsolatedNetNSTestBPFFS(
 		manifest,
+		ledger,
 		layout,
 		manifest.values["pin_"+endpoint],
 	)
@@ -421,6 +434,7 @@ func snapshotIsolatedNetNSTestContract(
 
 func snapshotIsolatedNetNSTestBPFFS(
 	manifest isolatedNetNSTestManifest,
+	ledger isolatedNetNSTestBPFFSLedger,
 	layout isolatedNetNSTestLayout,
 	pinPath string,
 ) (isolatedNetNSTestBPFFSSnapshot, error) {
@@ -529,40 +543,36 @@ func snapshotIsolatedNetNSTestBPFFS(
 	); err != nil {
 		return isolatedNetNSTestBPFFSSnapshot{}, err
 	}
-	var target *mountInfoEntry
-	for index := range mountInfo {
-		if mountInfo[index].mountPath == layout.bpffsDir {
-			target = &mountInfo[index]
-			break
-		}
+	mountChain, err := privateBPFFSMountChain(mountInfo, layout)
+	if err != nil {
+		return isolatedNetNSTestBPFFSSnapshot{}, err
 	}
-	if target == nil {
+	target := mountChain[0]
+	statDevice := fmt.Sprintf("%d:%d", unix.Major(device), unix.Minor(device))
+	if target.device != statDevice {
 		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
-			"isolated bpffs %s disappeared after validation",
-			layout.bpffsDir,
-		)
-	}
-	deviceParts := strings.Split(target.device, ":")
-	major, majorErr := parseCanonicalUint(deviceParts[0], "device major")
-	minor, minorErr := parseCanonicalUint(deviceParts[1], "device minor")
-	if majorErr != nil || minorErr != nil {
-		return isolatedNetNSTestBPFFSSnapshot{}, errors.Join(majorErr, minorErr)
-	}
-	if major != uint64(unix.Major(device)) ||
-		minor != uint64(unix.Minor(device)) {
-		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
-			"isolated bpffs mountinfo device=%s does not match stat dev=%d (%d:%d)",
+			"isolated bpffs mountinfo device=%s does not match stat dev=%d (%s)",
 			target.device,
 			device,
-			unix.Major(device),
-			unix.Minor(device),
+			statDevice,
 		)
 	}
+	if err := validateIsolatedNetNSTestBPFFSLedger(
+		ledger,
+		mountInfo,
+		mountChain,
+		layout,
+		manifest,
+		statDevice,
+		bpffsStat.Ino,
+	); err != nil {
+		return isolatedNetNSTestBPFFSSnapshot{}, err
+	}
 	return isolatedNetNSTestBPFFSSnapshot{
-		mountInfo: *target,
-		mountID:   bpffsMountID,
-		device:    device,
-		inode:     bpffsStat.Ino,
+		mountChain: mountChain,
+		mountID:    bpffsMountID,
+		device:     device,
+		inode:      bpffsStat.Ino,
 	}, nil
 }
 
@@ -657,7 +667,7 @@ func revalidateIsolatedNetNSTestSnapshot(
 	if current.bpffs.mountID != expected.bpffs.mountID ||
 		current.bpffs.device != expected.bpffs.device ||
 		current.bpffs.inode != expected.bpffs.inode ||
-		!sameMountInfoEntry(current.bpffs.mountInfo, expected.bpffs.mountInfo) {
+		!sameMountInfoChain(current.bpffs.mountChain, expected.bpffs.mountChain) {
 		return fmt.Errorf(
 			"isolated bpffs mount identity, topology, or options changed after validation",
 		)

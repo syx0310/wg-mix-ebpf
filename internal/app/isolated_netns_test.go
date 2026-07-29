@@ -3,11 +3,14 @@ package app
 import (
 	"fmt"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/pinidentity"
 )
+
+const isolatedFixtureOwnerToken = "0123456789abcdef0123456789abcdef"
 
 func TestIsolatedNetNSTestPaths(t *testing.T) {
 	base := filepath.Join(isolatedNetNSTestRoot, "0123456789abcdef")
@@ -29,6 +32,9 @@ func TestIsolatedNetNSTestPaths(t *testing.T) {
 	}
 	if layout.lease != filepath.Join(base, isolatedNetNSLifecycleLeaseName) {
 		t.Fatalf("lease = %q", layout.lease)
+	}
+	if layout.ledger != filepath.Join(base, isolatedNetNSBPFFSLedgerName) {
+		t.Fatalf("bpffs creation ledger = %q", layout.ledger)
 	}
 }
 
@@ -664,6 +670,7 @@ func TestPrivateBPFFSMountRejectsPropagationAndAliasForms(t *testing.T) {
 		t.Fatal("same-superblock bind subtree unexpectedly accepted")
 	}
 
+	source := isolatedNetNSTestBPFFSSource(layout.runID, isolatedFixtureOwnerToken)
 	topologyFixtures := map[string]string{
 		"missing parent": strings.Replace(
 			isolatedMountInfoFixture(layout, "0:42", "/", "bpf", ""),
@@ -674,15 +681,48 @@ func TestPrivateBPFFSMountRejectsPropagationAndAliasForms(t *testing.T) {
 		"bpf parent": fmt.Sprintf(
 			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
 				"41 21 0:41 / %s rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n"+
-				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n",
+				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
 			layout.runBase,
 			layout.bpffsDir,
+			source,
 		),
 		"unrelated parent": fmt.Sprintf(
 			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
 				"41 21 8:2 / /unrelated rw,relatime - ext4 /dev/other rw\n"+
-				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n",
+				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
 			layout.bpffsDir,
+			source,
+		),
+		"shared root ancestor": strings.Replace(
+			isolatedMountInfoFixture(layout, "0:42", "/", "bpf", ""),
+			"21 1 8:1 / / rw,relatime -",
+			"21 1 8:1 / / rw,relatime shared:7 -",
+			1,
+		),
+		"master intermediate ancestor": fmt.Sprintf(
+			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+				"41 21 0:41 / %s rw,relatime master:8 - tmpfs tmpfs rw\n"+
+				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
+			layout.runBase,
+			layout.bpffsDir,
+			source,
+		),
+		"bpf ancestor separated by tmpfs": fmt.Sprintf(
+			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+				"31 21 0:31 / /run rw,nosuid,nodev,noexec,relatime - bpf prior rw\n"+
+				"41 31 0:41 / %s rw,relatime - tmpfs tmpfs rw\n"+
+				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
+			layout.runBase,
+			layout.bpffsDir,
+			source,
+		),
+		"ancestor cycle": fmt.Sprintf(
+			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+				"41 42 0:41 / %s rw,relatime - tmpfs tmpfs rw\n"+
+				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
+			layout.runBase,
+			layout.bpffsDir,
+			source,
 		),
 	}
 	for name, fixture := range topologyFixtures {
@@ -786,6 +826,332 @@ func TestPrivateBPFFSMountSnapshotDetectsRemountOptionDrift(t *testing.T) {
 	}
 }
 
+func TestPrivateBPFFSMountSnapshotDetectsAncestorDrift(t *testing.T) {
+	layout, _, _, _, _ := isolatedFixtureLayout(t, "a")
+	source := isolatedNetNSTestBPFFSSource(layout.runID, isolatedFixtureOwnerToken)
+	fixture := func(ancestorDevice string, ancestorOptions string) string {
+		return fmt.Sprintf(
+			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+				"41 21 %s / %s %s - tmpfs tmpfs rw\n"+
+				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
+			ancestorDevice,
+			layout.runBase,
+			ancestorOptions,
+			layout.bpffsDir,
+			source,
+		)
+	}
+	beforeEntries, err := parseMountInfo([]byte(fixture("0:41", "rw,relatime")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := privateBPFFSMountChain(beforeEntries, layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reorderedEntries, err := parseMountInfo([]byte(
+		fixture("0:41", "relatime,rw"),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reordered, err := privateBPFFSMountChain(reorderedEntries, layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !sameMountInfoChain(before, reordered) {
+		t.Fatal("equivalent reordered ancestor options changed normalized chain snapshot")
+	}
+	driftedEntries, err := parseMountInfo([]byte(fixture("0:99", "rw,relatime")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	drifted, err := privateBPFFSMountChain(driftedEntries, layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sameMountInfoChain(before, drifted) {
+		t.Fatal("ancestor identity drift was not detected by full-chain snapshot")
+	}
+}
+
+func TestParseAndValidateIsolatedBPFFSCreationLedger(t *testing.T) {
+	layout, _, _, _, _ := isolatedFixtureLayout(t, "a")
+	manifest, err := parseIsolatedNetNSTestManifest(isolatedFixtureManifest(layout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := parseMountInfo([]byte(
+		isolatedMountInfoFixture(layout, "0:42", "/", "bpf", ""),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateBPFFSMountInfo(
+		entries,
+		layout,
+		manifest,
+		42,
+		nil,
+	); err != nil {
+		t.Fatalf("validate mount fixture: %v", err)
+	}
+	chain, err := privateBPFFSMountChain(entries, layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	validData := isolatedBPFFSLedgerFixture(
+		layout,
+		"21",
+		"8:1",
+		"100",
+		"30@0:30",
+		"42",
+		"0:42",
+		"201",
+	)
+	ledger, err := parseIsolatedNetNSTestBPFFSLedger(validData)
+	if err != nil {
+		t.Fatalf("parse valid creation ledger: %v", err)
+	}
+	if err := validateIsolatedNetNSTestBPFFSLedger(
+		ledger,
+		entries,
+		chain,
+		layout,
+		manifest,
+		"0:42",
+		201,
+	); err != nil {
+		t.Fatalf("validate creation ledger: %v", err)
+	}
+
+	type ledgerMutation struct {
+		old string
+		new string
+	}
+	tests := map[string]ledgerMutation{
+		"run id mismatch": {
+			old: "run_id=" + layout.runID,
+			new: "run_id=ffffffffffffffff",
+		},
+		"owner token mismatch": {
+			old: "owner_token=" + isolatedFixtureOwnerToken,
+			new: "owner_token=ffffffffffffffffffffffffffffffff",
+		},
+		"target mismatch": {
+			old: "target=" + layout.bpffsDir,
+			new: "target=" + filepath.Join(layout.runBase, "other-bpffs"),
+		},
+		"source mismatch": {
+			old: "source=" + isolatedNetNSTestBPFFSSource(
+				layout.runID,
+				isolatedFixtureOwnerToken,
+			),
+			new: "source=wg-mix-ebpf-foreign",
+		},
+		"pre target mount mismatch": {
+			old: "pre_target_mount_id=21",
+			new: "pre_target_mount_id=20",
+		},
+		"pre target device mismatch": {
+			old: "pre_target_dev=8:1",
+			new: "pre_target_dev=8:2",
+		},
+		"post mount mismatch": {
+			old: "post_mount_id=42",
+			new: "post_mount_id=43",
+		},
+		"post device mismatch": {
+			old: "post_dev=0:42",
+			new: "post_dev=0:43",
+		},
+		"post inode mismatch": {
+			old: "post_ino=201",
+			new: "post_ino=202",
+		},
+		"missing visible baseline mount": {
+			old: "pre_bpf_mounts=30@0:30",
+			new: "pre_bpf_mounts=none",
+		},
+		"post mount id in baseline": {
+			old: "pre_bpf_mounts=30@0:30",
+			new: "pre_bpf_mounts=30@0:30,42@0:99",
+		},
+		"post device in baseline": {
+			old: "pre_bpf_mounts=30@0:30",
+			new: "pre_bpf_mounts=30@0:30,41@0:42",
+		},
+	}
+	for name, mutation := range tests {
+		t.Run(name, func(t *testing.T) {
+			mutated := strings.Replace(string(validData), mutation.old, mutation.new, 1)
+			if mutated == string(validData) {
+				t.Fatalf("mutation source %q was absent", mutation.old)
+			}
+			candidate, err := parseIsolatedNetNSTestBPFFSLedger([]byte(mutated))
+			if err != nil {
+				t.Fatalf("parse structurally valid negative ledger: %v", err)
+			}
+			if err := validateIsolatedNetNSTestBPFFSLedger(
+				candidate,
+				entries,
+				chain,
+				layout,
+				manifest,
+				"0:42",
+				201,
+			); err == nil {
+				t.Fatal("mismatched creation ledger unexpectedly accepted")
+			}
+		})
+	}
+
+	t.Run("manifest mount mismatch", func(t *testing.T) {
+		candidateManifest, err := parseIsolatedNetNSTestManifest(
+			isolatedFixtureManifest(layout),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		candidateManifest.values["bpffs_mount_id"] = "43"
+		if err := validateIsolatedNetNSTestBPFFSLedger(
+			ledger,
+			entries,
+			chain,
+			layout,
+			candidateManifest,
+			"0:42",
+			201,
+		); err == nil {
+			t.Fatal("ledger post mount ID differing from manifest unexpectedly accepted")
+		}
+	})
+}
+
+func TestIsolatedBPFFSCreationLedgerRejectsHistoricalAliases(t *testing.T) {
+	layout, _, _, _, _ := isolatedFixtureLayout(t, "a")
+	source := isolatedNetNSTestBPFFSSource(layout.runID, isolatedFixtureOwnerToken)
+	tests := []struct {
+		name        string
+		mountID     string
+		device      string
+		baseline    string
+		manifestID  string
+		postMountID string
+	}{
+		{
+			name:        "moved pre-existing mount",
+			mountID:     "30",
+			device:      "0:30",
+			baseline:    "30@0:30",
+			manifestID:  "30",
+			postMountID: "30",
+		},
+		{
+			name:        "hidden bind source",
+			mountID:     "42",
+			device:      "0:30",
+			baseline:    "30@0:30",
+			manifestID:  "42",
+			postMountID: "42",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			manifest, err := parseIsolatedNetNSTestManifest(
+				isolatedFixtureManifest(layout),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			manifest.values["bpffs_mount_id"] = tt.manifestID
+			fixture := fmt.Sprintf(
+				"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+					"%s 21 %s / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
+				tt.mountID,
+				tt.device,
+				layout.bpffsDir,
+				source,
+			)
+			entries, err := parseMountInfo([]byte(fixture))
+			if err != nil {
+				t.Fatal(err)
+			}
+			mountID, err := parseCanonicalPositiveUint(tt.mountID, "fixture mount ID")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validatePrivateBPFFSMountInfo(
+				entries,
+				layout,
+				manifest,
+				mountID,
+				nil,
+			); err != nil {
+				t.Fatalf("current-only mount validation did not expose historical case: %v", err)
+			}
+			chain, err := privateBPFFSMountChain(entries, layout)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ledger, err := parseIsolatedNetNSTestBPFFSLedger(
+				isolatedBPFFSLedgerFixture(
+					layout,
+					"21",
+					"8:1",
+					"100",
+					tt.baseline,
+					tt.postMountID,
+					tt.device,
+					"201",
+				),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validateIsolatedNetNSTestBPFFSLedger(
+				ledger,
+				entries,
+				chain,
+				layout,
+				manifest,
+				tt.device,
+				201,
+			); err == nil {
+				t.Fatal("historical BPF mount alias unexpectedly accepted")
+			}
+		})
+	}
+}
+
+func TestParseIsolatedBPFFSCreationLedgerRejectsMalformedBaseline(t *testing.T) {
+	for name, baseline := range map[string]string{
+		"empty":            "",
+		"noncanonical id":  "030@0:30",
+		"noncanonical dev": "30@00:30",
+		"duplicate id":     "30@0:30,30@0:31",
+		"unsorted":         "31@0:31,30@0:30",
+		"invalid record":   "30:0:30",
+		"none mixed":       "none,30@0:30",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseIsolatedNetNSTestBPFMountBaseline(baseline); err == nil {
+				t.Fatal("malformed BPF mount baseline unexpectedly accepted")
+			}
+		})
+	}
+	records := make([]string, 1025)
+	for index := range records {
+		records[index] = strconv.Itoa(index+1) + "@0:1"
+	}
+	if _, err := parseIsolatedNetNSTestBPFMountBaseline(
+		strings.Join(records, ","),
+	); err == nil {
+		t.Fatal("oversized BPF mount baseline unexpectedly accepted")
+	}
+}
+
 func TestParseMountInfoRejectsInvalidFixtures(t *testing.T) {
 	tests := []string{
 		"",
@@ -849,12 +1215,12 @@ func isolatedFixtureManifestForRoles(
 	return []byte(fmt.Sprintf(
 		`format=%s
 run_id=%s
-owner_token=0123456789abcdef0123456789abcdef
+owner_token=%s
 boot_id=01234567-89ab-cdef-0123-456789abcdef
 host=test-host
 run_base=%s
 bpffs=%s
-bpffs_source=bpf
+bpffs_source=%s
 bpffs_mount_id=42
 pin_parent_dev=200
 pin_parent_ino=201
@@ -895,8 +1261,13 @@ secrets=%s
 `,
 		isolatedNetNSManifestFormat,
 		layout.runID,
+		isolatedFixtureOwnerToken,
 		base,
 		layout.bpffsDir,
+		isolatedNetNSTestBPFFSSource(
+			layout.runID,
+			isolatedFixtureOwnerToken,
+		),
 		keyA,
 		keyB,
 		pinLockRoot,
@@ -933,6 +1304,12 @@ func isolatedMountInfoFixture(
 	source string,
 	extra string,
 ) string {
+	if source == "bpf" {
+		source = isolatedNetNSTestBPFFSSource(
+			layout.runID,
+			isolatedFixtureOwnerToken,
+		)
+	}
 	return fmt.Sprintf(
 		"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
 			"30 21 0:30 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n"+
@@ -957,10 +1334,53 @@ func isolatedMountInfoFixtureWithTargetOptions(
 	return fmt.Sprintf(
 		"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
 			"30 21 0:30 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n"+
-			"42 21 0:42 / %s %s%s - bpf bpf %s\n",
+			"42 21 0:42 / %s %s%s - bpf %s %s\n",
 		layout.bpffsDir,
 		mountOptions,
 		optionalFields,
+		isolatedNetNSTestBPFFSSource(
+			layout.runID,
+			isolatedFixtureOwnerToken,
+		),
 		superOptions,
 	)
+}
+
+func isolatedBPFFSLedgerFixture(
+	layout isolatedNetNSTestLayout,
+	preTargetMountID string,
+	preTargetDevice string,
+	preTargetInode string,
+	preBPFMounts string,
+	postMountID string,
+	postDevice string,
+	postInode string,
+) []byte {
+	return []byte(fmt.Sprintf(
+		`format=%s
+run_id=%s
+owner_token=%s
+target=%s
+source=%s
+pre_target_mount_id=%s
+pre_target_dev=%s
+pre_target_ino=%s
+pre_bpf_mounts=%s
+post_mount_id=%s
+post_dev=%s
+post_ino=%s
+`,
+		isolatedNetNSBPFFSLedgerFormat,
+		layout.runID,
+		isolatedFixtureOwnerToken,
+		layout.bpffsDir,
+		isolatedNetNSTestBPFFSSource(layout.runID, isolatedFixtureOwnerToken),
+		preTargetMountID,
+		preTargetDevice,
+		preTargetInode,
+		preBPFMounts,
+		postMountID,
+		postDevice,
+		postInode,
+	))
 }

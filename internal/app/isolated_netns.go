@@ -18,6 +18,8 @@ const (
 	isolatedNetNSOwnerMarker        = ".wg-mix-ebpf-test-owner"
 	isolatedNetNSOwnerFormat        = "wg-mix-ebpf-test-owner-v1"
 	isolatedNetNSManifestFormat     = "wg-mix-ebpf-test-manifest-v2"
+	isolatedNetNSBPFFSLedgerFormat  = "wg-mix-ebpf-bpffs-creation-v1"
+	isolatedNetNSBPFFSLedgerName    = "bpffs.creation.v1"
 	isolatedNetNSLifecycleLeaseName = "lifecycle.lease"
 	isolatedPinOwnershipCommand     = "isolated-pin-ownership"
 )
@@ -38,11 +40,31 @@ type isolatedNetNSTestLayout struct {
 	role     string
 	bpffsDir string
 	manifest string
+	ledger   string
 	lease    string
 }
 
 type isolatedNetNSTestManifest struct {
 	values map[string]string
+}
+
+type isolatedNetNSTestBPFMountIdentity struct {
+	mountID uint64
+	device  string
+}
+
+type isolatedNetNSTestBPFFSLedger struct {
+	runID            string
+	ownerToken       string
+	target           string
+	source           string
+	preTargetMountID uint64
+	preTargetDevice  string
+	preTargetInode   uint64
+	preBPFMounts     []isolatedNetNSTestBPFMountIdentity
+	postMountID      uint64
+	postDevice       string
+	postInode        uint64
 }
 
 type mountInfoEntry struct {
@@ -140,6 +162,7 @@ func isolatedNetNSTestPaths(
 		role:     role,
 		bpffsDir: bpffsDir,
 		manifest: filepath.Join(runBase, "manifest"),
+		ledger:   filepath.Join(runBase, isolatedNetNSBPFFSLedgerName),
 		// Both roles intentionally share one lease. Per-role leases would let
 		// callers relabel a pin or underlay and bypass lifecycle serialization.
 		lease: filepath.Join(runBase, isolatedNetNSLifecycleLeaseName),
@@ -244,10 +267,13 @@ func validateIsolatedNetNSTestManifestLayout(
 	pinLockRoot := filepath.Join(layout.runBase, "pin-locks")
 	pinOwnerRoot := filepath.Join(layout.runBase, "pin-owners")
 	expected := map[string]string{
-		"run_id":          layout.runID,
-		"run_base":        layout.runBase,
-		"bpffs":           layout.bpffsDir,
-		"bpffs_source":    "bpf",
+		"run_id":   layout.runID,
+		"run_base": layout.runBase,
+		"bpffs":    layout.bpffsDir,
+		"bpffs_source": isolatedNetNSTestBPFFSSource(
+			layout.runID,
+			values["owner_token"],
+		),
 		"pin_lock_root":   pinLockRoot,
 		"pin_owner_root":  pinOwnerRoot,
 		"lifecycle_lease": layout.lease,
@@ -386,6 +412,208 @@ func validateIsolatedNetNSTestManifestLayout(
 		}
 	}
 	return nil
+}
+
+func isolatedNetNSTestBPFFSSource(runID string, ownerToken string) string {
+	return "wg-mix-ebpf-" + runID + "-" + ownerToken
+}
+
+func parseIsolatedNetNSTestBPFFSLedger(
+	data []byte,
+) (isolatedNetNSTestBPFFSLedger, error) {
+	const (
+		formatKey           = "format"
+		runIDKey            = "run_id"
+		ownerTokenKey       = "owner_token"
+		targetKey           = "target"
+		sourceKey           = "source"
+		preTargetMountIDKey = "pre_target_mount_id"
+		preTargetDeviceKey  = "pre_target_dev"
+		preTargetInodeKey   = "pre_target_ino"
+		preBPFMountsKey     = "pre_bpf_mounts"
+		postMountIDKey      = "post_mount_id"
+		postDeviceKey       = "post_dev"
+		postInodeKey        = "post_ino"
+	)
+	values, err := parseStrictKeyValueDocument(data, []string{
+		formatKey,
+		runIDKey,
+		ownerTokenKey,
+		targetKey,
+		sourceKey,
+		preTargetMountIDKey,
+		preTargetDeviceKey,
+		preTargetInodeKey,
+		preBPFMountsKey,
+		postMountIDKey,
+		postDeviceKey,
+		postInodeKey,
+	})
+	if err != nil {
+		return isolatedNetNSTestBPFFSLedger{}, fmt.Errorf(
+			"parse isolated bpffs creation ledger: %w",
+			err,
+		)
+	}
+	if values[formatKey] != isolatedNetNSBPFFSLedgerFormat {
+		return isolatedNetNSTestBPFFSLedger{}, fmt.Errorf(
+			"unsupported isolated bpffs creation ledger format %q",
+			values[formatKey],
+		)
+	}
+	if !isolatedNetNSTestRunID.MatchString(values[runIDKey]) {
+		return isolatedNetNSTestBPFFSLedger{}, fmt.Errorf(
+			"isolated bpffs creation ledger run_id is not canonical lowercase hex",
+		)
+	}
+	if !isolatedNetNSTestOwnerToken.MatchString(values[ownerTokenKey]) {
+		return isolatedNetNSTestBPFFSLedger{}, fmt.Errorf(
+			"isolated bpffs creation ledger owner_token must be 32 lowercase hex characters",
+		)
+	}
+	if values[targetKey] == "" ||
+		!filepath.IsAbs(values[targetKey]) ||
+		filepath.Clean(values[targetKey]) != values[targetKey] {
+		return isolatedNetNSTestBPFFSLedger{}, fmt.Errorf(
+			"isolated bpffs creation ledger target is not a canonical absolute path",
+		)
+	}
+	preTargetMountID, err := parseCanonicalPositiveUint(
+		values[preTargetMountIDKey],
+		preTargetMountIDKey,
+	)
+	if err != nil {
+		return isolatedNetNSTestBPFFSLedger{}, err
+	}
+	preTargetDevice, err := parseCanonicalMountInfoDevice(
+		values[preTargetDeviceKey],
+		preTargetDeviceKey,
+	)
+	if err != nil {
+		return isolatedNetNSTestBPFFSLedger{}, err
+	}
+	preTargetInode, err := parseCanonicalPositiveUint(
+		values[preTargetInodeKey],
+		preTargetInodeKey,
+	)
+	if err != nil {
+		return isolatedNetNSTestBPFFSLedger{}, err
+	}
+	preBPFMounts, err := parseIsolatedNetNSTestBPFMountBaseline(
+		values[preBPFMountsKey],
+	)
+	if err != nil {
+		return isolatedNetNSTestBPFFSLedger{}, err
+	}
+	postMountID, err := parseCanonicalPositiveUint(
+		values[postMountIDKey],
+		postMountIDKey,
+	)
+	if err != nil {
+		return isolatedNetNSTestBPFFSLedger{}, err
+	}
+	postDevice, err := parseCanonicalMountInfoDevice(
+		values[postDeviceKey],
+		postDeviceKey,
+	)
+	if err != nil {
+		return isolatedNetNSTestBPFFSLedger{}, err
+	}
+	postInode, err := parseCanonicalPositiveUint(
+		values[postInodeKey],
+		postInodeKey,
+	)
+	if err != nil {
+		return isolatedNetNSTestBPFFSLedger{}, err
+	}
+	return isolatedNetNSTestBPFFSLedger{
+		runID:            values[runIDKey],
+		ownerToken:       values[ownerTokenKey],
+		target:           values[targetKey],
+		source:           values[sourceKey],
+		preTargetMountID: preTargetMountID,
+		preTargetDevice:  preTargetDevice,
+		preTargetInode:   preTargetInode,
+		preBPFMounts:     preBPFMounts,
+		postMountID:      postMountID,
+		postDevice:       postDevice,
+		postInode:        postInode,
+	}, nil
+}
+
+func parseIsolatedNetNSTestBPFMountBaseline(
+	value string,
+) ([]isolatedNetNSTestBPFMountIdentity, error) {
+	const maximumBPFMountBaselineEntries = 1024
+
+	if value == "none" {
+		return nil, nil
+	}
+	records := strings.Split(value, ",")
+	if len(records) > maximumBPFMountBaselineEntries {
+		return nil, fmt.Errorf(
+			"pre_bpf_mounts exceeds %d entries",
+			maximumBPFMountBaselineEntries,
+		)
+	}
+	result := make([]isolatedNetNSTestBPFMountIdentity, 0, len(records))
+	seenMountIDs := make(map[uint64]struct{}, len(records))
+	var previousMountID uint64
+	for _, record := range records {
+		mountIDValue, deviceValue, found := strings.Cut(record, "@")
+		if !found || mountIDValue == "" || deviceValue == "" {
+			return nil, fmt.Errorf(
+				"pre_bpf_mounts entry %q must be mount-id@major:minor",
+				record,
+			)
+		}
+		mountID, err := parseCanonicalPositiveUint(
+			mountIDValue,
+			"pre_bpf_mounts mount id",
+		)
+		if err != nil {
+			return nil, err
+		}
+		device, err := parseCanonicalMountInfoDevice(
+			deviceValue,
+			"pre_bpf_mounts device",
+		)
+		if err != nil {
+			return nil, err
+		}
+		if _, duplicate := seenMountIDs[mountID]; duplicate {
+			return nil, fmt.Errorf("pre_bpf_mounts duplicates mount ID %d", mountID)
+		}
+		seenMountIDs[mountID] = struct{}{}
+		if previousMountID != 0 && mountID <= previousMountID {
+			return nil, fmt.Errorf(
+				"pre_bpf_mounts entries must be unique and sorted by mount ID",
+			)
+		}
+		previousMountID = mountID
+		result = append(result, isolatedNetNSTestBPFMountIdentity{
+			mountID: mountID,
+			device:  device,
+		})
+	}
+	return result, nil
+}
+
+func parseCanonicalMountInfoDevice(value string, field string) (string, error) {
+	majorValue, minorValue, found := strings.Cut(value, ":")
+	if !found || majorValue == "" || minorValue == "" ||
+		strings.Contains(minorValue, ":") {
+		return "", fmt.Errorf("%s must be a canonical major:minor device", field)
+	}
+	major, err := parseCanonicalUint(majorValue, field+" major")
+	if err != nil {
+		return "", err
+	}
+	minor, err := parseCanonicalUint(minorValue, field+" minor")
+	if err != nil {
+		return "", err
+	}
+	return strconv.FormatUint(major, 10) + ":" + strconv.FormatUint(minor, 10), nil
 }
 
 func manifestEndpointForRole(
@@ -791,54 +1019,17 @@ func validatePrivateBPFFSMountInfo(
 	statxMountID uint64,
 	pinMountID *uint64,
 ) error {
-	var target *mountInfoEntry
-	byMountID := make(map[uint64]*mountInfoEntry, len(entries))
+	chain, err := privateBPFFSMountChain(entries, layout)
+	if err != nil {
+		return err
+	}
+	target := chain[0]
 	var otherBPFFSMounts []*mountInfoEntry
 	for index := range entries {
 		entry := &entries[index]
-		byMountID[entry.mountID] = entry
-		if entry.mountPath == layout.bpffsDir {
-			if target != nil {
-				return fmt.Errorf("multiple mounts are stacked on isolated bpffs %s", layout.bpffsDir)
-			}
-			target = entry
-		} else if entry.fsType == "bpf" {
+		if entry.mountPath != layout.bpffsDir && entry.fsType == "bpf" {
 			otherBPFFSMounts = append(otherBPFFSMounts, entry)
 		}
-		if strings.HasPrefix(entry.mountPath, layout.bpffsDir+string(filepath.Separator)) {
-			return fmt.Errorf(
-				"nested mount %s exists below isolated bpffs %s",
-				entry.mountPath,
-				layout.bpffsDir,
-			)
-		}
-	}
-	if target == nil {
-		return fmt.Errorf("isolated bpffs %s is not an exact mount point", layout.bpffsDir)
-	}
-	parent := byMountID[target.parentID]
-	if parent == nil {
-		return fmt.Errorf(
-			"isolated bpffs parent mount ID %d is absent from mountinfo",
-			target.parentID,
-		)
-	}
-	if parent.mountPath != "/" &&
-		!strings.HasPrefix(
-			layout.bpffsDir,
-			parent.mountPath+string(filepath.Separator),
-		) {
-		return fmt.Errorf(
-			"isolated bpffs parent mount %s is not an ancestor of %s",
-			parent.mountPath,
-			layout.bpffsDir,
-		)
-	}
-	if parent.fsType == "bpf" {
-		return fmt.Errorf(
-			"isolated bpffs is nested below bpf mount %s",
-			parent.mountPath,
-		)
 	}
 	if target.fsType != "bpf" || target.root != "/" {
 		return fmt.Errorf(
@@ -847,14 +1038,20 @@ func validatePrivateBPFFSMountInfo(
 			target.root,
 		)
 	}
-	if err := validatePrivateBPFFSMountOptions(*target); err != nil {
+	if err := validatePrivateBPFFSMountOptions(target); err != nil {
 		return err
 	}
-	if target.source != "bpf" || manifest.values["bpffs_source"] != "bpf" {
+	expectedSource := isolatedNetNSTestBPFFSSource(
+		layout.runID,
+		manifest.values["owner_token"],
+	)
+	if target.source != expectedSource ||
+		manifest.values["bpffs_source"] != expectedSource {
 		return fmt.Errorf(
-			"isolated bpffs source=%q and manifest source=%q must both be the kernel bpf source",
+			"isolated bpffs source=%q and manifest source=%q must both equal run-bound source %q",
 			target.source,
 			manifest.values["bpffs_source"],
+			expectedSource,
 		)
 	}
 	manifestMountID, err := parseCanonicalPositiveUint(
@@ -887,6 +1084,215 @@ func validatePrivateBPFFSMountInfo(
 				otherMount.mountPath,
 			)
 		}
+	}
+	return nil
+}
+
+func privateBPFFSMountChain(
+	entries []mountInfoEntry,
+	layout isolatedNetNSTestLayout,
+) ([]mountInfoEntry, error) {
+	var target *mountInfoEntry
+	byMountID := make(map[uint64]*mountInfoEntry, len(entries))
+	for index := range entries {
+		entry := &entries[index]
+		byMountID[entry.mountID] = entry
+		if entry.mountPath == layout.bpffsDir {
+			if target != nil {
+				return nil, fmt.Errorf(
+					"multiple mounts are stacked on isolated bpffs %s",
+					layout.bpffsDir,
+				)
+			}
+			target = entry
+		}
+		if strings.HasPrefix(
+			entry.mountPath,
+			layout.bpffsDir+string(filepath.Separator),
+		) {
+			return nil, fmt.Errorf(
+				"nested mount %s exists below isolated bpffs %s",
+				entry.mountPath,
+				layout.bpffsDir,
+			)
+		}
+	}
+	if target == nil {
+		return nil, fmt.Errorf(
+			"isolated bpffs %s is not an exact mount point",
+			layout.bpffsDir,
+		)
+	}
+
+	chain := make([]mountInfoEntry, 0, 8)
+	seen := make(map[uint64]struct{}, 8)
+	current := target
+	for {
+		if _, duplicate := seen[current.mountID]; duplicate {
+			return nil, fmt.Errorf(
+				"isolated bpffs mount ancestry contains a cycle at mount ID %d",
+				current.mountID,
+			)
+		}
+		seen[current.mountID] = struct{}{}
+		if current.mountPath == "" ||
+			!filepath.IsAbs(current.mountPath) ||
+			filepath.Clean(current.mountPath) != current.mountPath {
+			return nil, fmt.Errorf(
+				"isolated bpffs mount ancestor %d has noncanonical path %q",
+				current.mountID,
+				current.mountPath,
+			)
+		}
+		if len(current.optionalFields) != 0 {
+			return nil, fmt.Errorf(
+				"isolated bpffs mount ancestor %s has propagation fields: %s",
+				current.mountPath,
+				strings.Join(current.optionalFields, ","),
+			)
+		}
+		if len(chain) != 0 && current.fsType == "bpf" {
+			return nil, fmt.Errorf(
+				"isolated bpffs is nested below bpf mount %s",
+				current.mountPath,
+			)
+		}
+		chain = append(chain, *current)
+		if current.mountPath == "/" {
+			return chain, nil
+		}
+		parent := byMountID[current.parentID]
+		if parent == nil {
+			return nil, fmt.Errorf(
+				"isolated bpffs mount ancestry breaks at absent parent mount ID %d",
+				current.parentID,
+			)
+		}
+		if _, cycle := seen[parent.mountID]; cycle {
+			return nil, fmt.Errorf(
+				"isolated bpffs mount ancestry contains a cycle at mount ID %d",
+				parent.mountID,
+			)
+		}
+		if parent.mountPath != "/" &&
+			!strings.HasPrefix(
+				current.mountPath,
+				parent.mountPath+string(filepath.Separator),
+			) {
+			return nil, fmt.Errorf(
+				"mount %s (ID %d) is not a strict descendant of parent mount %s (ID %d)",
+				current.mountPath,
+				current.mountID,
+				parent.mountPath,
+				parent.mountID,
+			)
+		}
+		if parent.mountPath == "/" && current.mountPath == "/" {
+			return nil, fmt.Errorf(
+				"mount %d and parent %d both claim namespace root",
+				current.mountID,
+				parent.mountID,
+			)
+		}
+		current = parent
+	}
+}
+
+func validateIsolatedNetNSTestBPFFSLedger(
+	ledger isolatedNetNSTestBPFFSLedger,
+	entries []mountInfoEntry,
+	chain []mountInfoEntry,
+	layout isolatedNetNSTestLayout,
+	manifest isolatedNetNSTestManifest,
+	currentDevice string,
+	currentInode uint64,
+) error {
+	if len(chain) < 2 {
+		return fmt.Errorf("isolated bpffs mount ancestry does not include a parent mount")
+	}
+	expectedSource := isolatedNetNSTestBPFFSSource(
+		layout.runID,
+		manifest.values["owner_token"],
+	)
+	if ledger.runID != layout.runID ||
+		ledger.runID != manifest.values["run_id"] ||
+		ledger.ownerToken != manifest.values["owner_token"] ||
+		ledger.target != layout.bpffsDir ||
+		ledger.source != expectedSource ||
+		manifest.values["bpffs_source"] != expectedSource ||
+		chain[0].source != expectedSource {
+		return fmt.Errorf(
+			"isolated bpffs creation ledger is not bound to the manifest, run, target, and mount source",
+		)
+	}
+	if ledger.preTargetMountID != chain[1].mountID ||
+		ledger.preTargetDevice != chain[1].device {
+		return fmt.Errorf(
+			"isolated bpffs pre-mount target identity does not match its current parent mount",
+		)
+	}
+	manifestMountID, err := parseCanonicalPositiveUint(
+		manifest.values["bpffs_mount_id"],
+		"bpffs_mount_id",
+	)
+	if err != nil {
+		return err
+	}
+	if ledger.postMountID != chain[0].mountID ||
+		ledger.postMountID != manifestMountID ||
+		ledger.postDevice != chain[0].device ||
+		ledger.postDevice != currentDevice ||
+		ledger.postInode != currentInode {
+		return fmt.Errorf(
+			"isolated bpffs post-mount identity does not match the current mount",
+		)
+	}
+	if ledger.preTargetMountID == ledger.postMountID ||
+		ledger.preTargetDevice == ledger.postDevice ||
+		(ledger.preTargetDevice == ledger.postDevice &&
+			ledger.preTargetInode == ledger.postInode) {
+		return fmt.Errorf(
+			"isolated bpffs pre-mount and post-mount identities are not independent",
+		)
+	}
+
+	baselineByMountID := make(map[uint64]string, len(ledger.preBPFMounts))
+	baselineDevices := make(map[string]struct{}, len(ledger.preBPFMounts))
+	for _, identity := range ledger.preBPFMounts {
+		if identity.mountID == ledger.postMountID ||
+			identity.device == ledger.postDevice {
+			return fmt.Errorf(
+				"isolated bpffs post-mount identity existed in the pre-creation BPF baseline",
+			)
+		}
+		baselineByMountID[identity.mountID] = identity.device
+		baselineDevices[identity.device] = struct{}{}
+	}
+	currentBPFMounts := make(map[uint64]string)
+	for _, entry := range entries {
+		if entry.fsType != "bpf" || entry.mountID == chain[0].mountID {
+			continue
+		}
+		currentBPFMounts[entry.mountID] = entry.device
+	}
+	if len(currentBPFMounts) != len(baselineByMountID) {
+		return fmt.Errorf(
+			"visible BPF mount set changed from the pre-creation baseline",
+		)
+	}
+	for mountID, device := range baselineByMountID {
+		if currentBPFMounts[mountID] != device {
+			return fmt.Errorf(
+				"visible BPF mount ID %d changed from pre-creation device %s",
+				mountID,
+				device,
+			)
+		}
+	}
+	if _, existed := baselineDevices[ledger.postDevice]; existed {
+		return fmt.Errorf(
+			"isolated bpffs post-mount device existed in the pre-creation BPF baseline",
+		)
 	}
 	return nil
 }
@@ -989,4 +1395,16 @@ func sameMountInfoEntry(left mountInfoEntry, right mountInfoEntry) bool {
 		left.fsType == right.fsType &&
 		left.source == right.source &&
 		strings.Join(left.superOptions, ",") == strings.Join(right.superOptions, ",")
+}
+
+func sameMountInfoChain(left []mountInfoEntry, right []mountInfoEntry) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if !sameMountInfoEntry(left[index], right[index]) {
+			return false
+		}
+	}
+	return true
 }
