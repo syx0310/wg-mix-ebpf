@@ -126,3 +126,60 @@ func TestOwnerRecordRejectsHardLink(t *testing.T) {
 		t.Fatalf("hard-linked owner record should fail closed, got %v", err)
 	}
 }
+
+func TestOwnerRecordRejectsFinalStateDirectorySymlink(t *testing.T) {
+	parent := t.TempDir()
+	realStateDir := filepath.Join(parent, "real-state")
+	if err := os.Mkdir(realStateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(parent, "state-alias")
+	if err := os.Symlink(realStateDir, alias); err != nil {
+		t.Fatal(err)
+	}
+	exec := CommandExecutor{StateDir: alias}
+	if _, _, err := exec.loadOrCreateOwner(); err == nil {
+		t.Fatal("a final state-directory symlink must be rejected")
+	}
+	if _, err := os.Stat(filepath.Join(realStateDir, OwnerRecordFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("symlink target received an owner record: %v", err)
+	}
+}
+
+func TestOwnerRecordRejectsAncestorStateDirectorySymlink(t *testing.T) {
+	parent := t.TempDir()
+	realParent := filepath.Join(parent, "real-parent")
+	realStateDir := filepath.Join(realParent, "state")
+	if err := os.MkdirAll(realStateDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	aliasParent := filepath.Join(parent, "parent-alias")
+	if err := os.Symlink(realParent, aliasParent); err != nil {
+		t.Fatal(err)
+	}
+	exec := CommandExecutor{StateDir: filepath.Join(aliasParent, "state")}
+	if _, _, err := exec.loadOrCreateOwner(); err == nil {
+		t.Fatal("an ancestor state-directory symlink must be rejected")
+	}
+	if _, err := os.Stat(filepath.Join(realStateDir, OwnerRecordFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ancestor symlink target received an owner record: %v", err)
+	}
+}
+
+func TestOwnerRecordRecoversPartialPendingPublish(t *testing.T) {
+	stateDir := t.TempDir()
+	const pendingName = ".guard-owner.v2.pending"
+	pendingPath := filepath.Join(stateDir, pendingName)
+	if err := os.WriteFile(pendingPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	exec := CommandExecutor{StateDir: stateDir}
+	if _, fresh, err := exec.loadOrCreateOwner(); err != nil {
+		t.Fatal(err)
+	} else if !fresh {
+		t.Fatal("recovering a partial pending publication should create the final owner record")
+	}
+	if _, err := os.Stat(pendingPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("pending publication still has a directory entry: %v", err)
+	}
+}

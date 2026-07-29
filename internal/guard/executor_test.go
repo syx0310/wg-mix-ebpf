@@ -47,6 +47,13 @@ func TestMissingGuardTableErrorIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestMissingTableClassifierRejectsWrapperOnlyTableName(t *testing.T) {
+	err := errors.New("nft -j -a list table inet wg_mix_ebpf_guard failed: exit status 1: libnftables.so: No such file or directory")
+	if isMissingTable(err, TableName) {
+		t.Fatal("an unrelated runtime failure must not be classified as an absent table")
+	}
+}
+
 func TestParseTableIdentityJSONRequiresHandleAndComment(t *testing.T) {
 	const table = "wg_mix_ebpf_guard_0123456789abcdef"
 	identity, err := parseTableIdentityJSON([]byte(`{
@@ -252,6 +259,12 @@ func TestCleanupWithoutOwnerRecordIsZeroWrite(t *testing.T) {
 	var scripts []string
 	exec := CommandExecutor{
 		StateDir: stateDir,
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			if table != TableName {
+				t.Fatalf("unexpected inspection of %q", table)
+			}
+			return tableIdentity{}, nil
+		},
 		runScript: func(_ context.Context, script string) error {
 			scripts = append(scripts, script)
 			return nil
@@ -262,6 +275,31 @@ func TestCleanupWithoutOwnerRecordIsZeroWrite(t *testing.T) {
 	}
 	if len(scripts) != 0 {
 		t.Fatalf("cleanup without ownership issued nft writes: %#v", scripts)
+	}
+}
+
+func TestCleanupWithoutOwnerRejectsLegacyTableWithZeroWrite(t *testing.T) {
+	stateDir := t.TempDir()
+	var scripts []string
+	exec := CommandExecutor{
+		StateDir: stateDir,
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			if table != TableName {
+				t.Fatalf("unexpected inspection of %q", table)
+			}
+			return tableIdentity{Exists: true, Handle: 19, Comment: "legacy"}, nil
+		},
+		runScript: func(_ context.Context, script string) error {
+			scripts = append(scripts, script)
+			return nil
+		},
+	}
+	err := exec.Cleanup(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "manual migration") {
+		t.Fatalf("legacy table without an owner record must fail explicitly, got %v", err)
+	}
+	if len(scripts) != 0 {
+		t.Fatalf("legacy table rejection issued nft writes: %#v", scripts)
 	}
 }
 
