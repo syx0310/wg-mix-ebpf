@@ -1344,15 +1344,45 @@ func writeCanonicalMockPins(t *testing.T, pinPath string) *fakePinnedMapStore {
 			flags:      descriptor.flags,
 			kernelName: kernelName,
 		}
+		name := descriptor.name
+		observation.pin = func(path string) error {
+			file, err := os.OpenFile(
+				path,
+				os.O_CREATE|os.O_EXCL|os.O_WRONLY,
+				0o600,
+			)
+			if err != nil {
+				return err
+			}
+			if _, err := file.WriteString("mock BPF pin: " + name); err != nil {
+				_ = file.Close()
+				return err
+			}
+			return file.Close()
+		}
 		if descriptor.name == "control_map" {
 			observation.controlSeen = true
 			observation.control = abi.ControlValue{
 				ActiveGeneration: 1,
 				ABIVersion:       abi.Version,
 			}
+			observation.updateControl = func(value abi.ControlValue) error {
+				current := store.observations[name]
+				current.control = value
+				current.controlSeen = true
+				store.observations[name] = current
+				return nil
+			}
 		}
 		if descriptor.name == "owner_map" {
 			observation.ownerSeen = true
+			observation.updateOwner = func(value pinOwnerSentinel) error {
+				current := store.observations[name]
+				current.owner = value
+				current.ownerSeen = true
+				store.observations[name] = current
+				return nil
+			}
 		}
 		store.observations[descriptor.name] = observation
 	}

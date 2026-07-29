@@ -83,8 +83,8 @@ type pinPathRuntime struct {
 	pinProgram           func(uint32, string) error
 	loadPinnedProgram    func(string) (*pinnedProgramObservation, error)
 	beforeOwnerExchange  func()
-	beforePinQuarantine  func(string)
-	beforePinUnlink      func(string)
+	beforePinQuarantine  func(string) error
+	beforePinUnlink      func(string) error
 }
 
 type pinnedProgramObservation struct {
@@ -126,6 +126,7 @@ type pinnedMapObservation struct {
 	ownerSeen     bool
 	pin           func(string) error
 	updateControl func(abi.ControlValue) error
+	updateOwner   func(pinOwnerSentinel) error
 	close         func() error
 }
 
@@ -390,14 +391,8 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if err != nil {
 		return fmt.Errorf("load persistent BPF pin owner: %w", err)
 	}
-	if ownerExists {
+	if ownerExists && ownerRecord.BootID == bootID {
 		rollbackFreshPins = false
-		if ownerRecord.BootID != bootID {
-			return fmt.Errorf(
-				"BPF pin owner was created on boot %s but current boot is %s; refusing unindexed reboot recovery",
-				ownerRecord.BootID, bootID,
-			)
-		}
 		recovered, err := recoverPinOwnerTransaction(
 			handle,
 			store,
@@ -418,6 +413,112 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	directoryState, err := classifyCanonicalPinDirectory(handle)
 	if err != nil {
 		return err
+	}
+	var rebootSource *pinOwnerIndexEntry
+	if ownerExists && ownerRecord.BootID != bootID {
+		if directoryState != canonicalPinsEmpty &&
+			directoryState != canonicalPinsOwned {
+			return errors.New(
+				"prior-boot owner can only be archived with an empty or exact owned canonical pin set",
+			)
+		}
+		indexed, err := activeIndexedOwnerForRecord(
+			indexStoreFromOwner(store),
+			ownerRecord,
+		)
+		if err != nil {
+			return fmt.Errorf("index prior-boot BPF owner: %w", err)
+		}
+		archiveNow, err := ownerRuntimeNow(runtime)
+		if err != nil {
+			return err
+		}
+		rebootSource, err = indexStoreFromOwner(store).archivePriorBootOwner(
+			*indexed,
+			ownerRecord,
+			directoryState == canonicalPinsOwned,
+			archiveNow,
+		)
+		if err != nil {
+			return fmt.Errorf("archive prior-boot BPF owner: %w", err)
+		}
+		ownerRecord = nil
+		ownerExists = false
+	}
+	if !ownerExists {
+		indexed, err := indexedOwnerEntryForRekey(store, handle)
+		if err != nil {
+			return err
+		}
+		if indexed != nil {
+			if indexed.BootID == bootID {
+				return fmt.Errorf(
+					"same-boot BPF pin identity changed or lost its owner record at %s/%s",
+					indexed.BPFFSRootPath,
+					indexed.PinBaseName,
+				)
+			}
+			switch indexed.Status {
+			case pinOwnerIndexActive:
+				if directoryState != canonicalPinsEmpty &&
+					directoryState != canonicalPinsOwned {
+					return errors.New(
+						"indexed prior-boot owner can only be archived with an empty or exact owned canonical pin set",
+					)
+				}
+				priorRecord, err := loadIndexedPriorBootOwner(
+					indexStoreFromOwner(store),
+					*indexed,
+				)
+				if err != nil {
+					return err
+				}
+				archiveNow, err := ownerRuntimeNow(runtime)
+				if err != nil {
+					return err
+				}
+				rebootSource, err = indexStoreFromOwner(store).archivePriorBootOwner(
+					*indexed,
+					priorRecord,
+					directoryState == canonicalPinsOwned,
+					archiveNow,
+				)
+				if err != nil {
+					return err
+				}
+			case pinOwnerIndexRekeySource:
+				source := *indexed
+				source.BPFFSMountIDs = slices.Clone(indexed.BPFFSMountIDs)
+				rebootSource = &source
+			default:
+				return fmt.Errorf(
+					"indexed BPF owner has non-recoverable status %q",
+					indexed.Status,
+				)
+			}
+		}
+	}
+	if !ownerExists &&
+		directoryState == canonicalPinsOwned &&
+		rebootSource != nil {
+		rekeyNow, err := ownerRuntimeNow(runtime)
+		if err != nil {
+			return err
+		}
+		ownerRecord, err = rekeyRebootedPinOwner(
+			handle,
+			parent,
+			store,
+			rebootSource,
+			bootID,
+			rekeyNow,
+			liveTCRuntime,
+		)
+		if err != nil {
+			return fmt.Errorf("rekey rebooted BPF owner: %w", err)
+		}
+		ownerExists = true
+		rollbackFreshPins = false
 	}
 	legacyAdoption := false
 	if ownerExists {
@@ -611,6 +712,18 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if err != nil {
 		return err
 	}
+	if ownerRecord == nil && rebootSource != nil {
+		applying.RetiredFromResourceKey = rebootSource.ResourceKey
+		applying.RetiredFromBootID = rebootSource.BootID
+		normalizePinOwnerRecord(applying)
+		if err := validatePinOwnerRecord(
+			applying,
+			handle.resource,
+			handle.mountID,
+		); err != nil {
+			return err
+		}
+	}
 	if err := store.Persist(
 		applying,
 		ownerRecord,
@@ -764,7 +877,10 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 		return err
 	}
 	if handle == nil {
-		return nil
+		return ensureMissingPinDirectoryHasNoActiveOwnership(
+			runtime,
+			parent,
+		)
 	}
 	defer handle.Close()
 	store, err := openPinOwnerStore(runtime, handle.resource, false)
@@ -1681,7 +1797,12 @@ func loadPinnedMapObservation(path string, name string) (*pinnedMapObservation, 
 		}
 		observation.controlSeen = true
 		observation.updateControl = func(value abi.ControlValue) error {
-			return pinnedMap.Update(abi.ControlKeyGlobal, value, ebpf.UpdateAny)
+			return updatePinnedMapValue(
+				path,
+				uint32(mapID),
+				abi.ControlKeyGlobal,
+				value,
+			)
 		}
 	}
 	if name == "owner_map" {
@@ -1690,9 +1811,52 @@ func loadPinnedMapObservation(path string, name string) (*pinnedMapObservation, 
 			return nil, fmt.Errorf("lookup owner sentinel: %w", err)
 		}
 		observation.ownerSeen = true
+		observation.updateOwner = func(value pinOwnerSentinel) error {
+			return updatePinnedMapValue(
+				path,
+				uint32(mapID),
+				uint32(0),
+				value,
+			)
+		}
 	}
 	observation.pin = pinnedMap.Pin
 	return observation, nil
+}
+
+func updatePinnedMapValue(
+	path string,
+	expectedID uint32,
+	key any,
+	value any,
+) (returnErr error) {
+	if expectedID == 0 {
+		return errors.New("writable pinned-map reopen requires a non-zero map ID")
+	}
+	writable, err := ebpf.LoadPinnedMap(path, nil)
+	if err != nil {
+		return fmt.Errorf("reopen pinned map read-write: %w", err)
+	}
+	defer func() {
+		returnErr = errors.Join(returnErr, writable.Close())
+	}()
+	info, err := writable.Info()
+	if err != nil {
+		return fmt.Errorf("inspect writable pinned map: %w", err)
+	}
+	mapID, ok := info.ID()
+	if !ok || mapID == 0 || uint32(mapID) != expectedID {
+		return fmt.Errorf(
+			"writable pinned map ID = %d (reported=%t), want %d",
+			mapID,
+			ok,
+			expectedID,
+		)
+	}
+	if err := writable.Update(key, value, ebpf.UpdateAny); err != nil {
+		return fmt.Errorf("update writable pinned map ID %d: %w", expectedID, err)
+	}
+	return nil
 }
 
 func (observation *pinnedMapObservation) Close() error {

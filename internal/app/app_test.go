@@ -401,6 +401,56 @@ func TestReloadOfflineWithoutDryRunIsRejected(t *testing.T) {
 	}
 }
 
+func TestAdoptLegacyPinsIsReloadOnly(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	err := Run(
+		t.Context(),
+		[]string{"status", "--adopt-legacy-pins"},
+		&stdout,
+		&stderr,
+	)
+	if err == nil || !strings.Contains(err.Error(), "only valid with reload") {
+		t.Fatalf("status legacy-adoption error = %v", err)
+	}
+}
+
+func TestAdoptLegacyPinsRejectsRunningDaemon(t *testing.T) {
+	runDir := t.TempDir()
+	status := daemon.Status{
+		PID:             os.Getpid(),
+		ConfigPath:      "/etc/wg-mix-ebpf/config.yaml",
+		State:           "active",
+		RequestProtocol: 1,
+		InstanceID:      "0123456789abcdef0123456789abcdef",
+	}
+	data, err := json.Marshal(status)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(runDir, "status.json"),
+		data,
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var stdout, stderr bytes.Buffer
+	err = Run(
+		t.Context(),
+		[]string{
+			"reload",
+			"--adopt-legacy-pins",
+			"--run-dir", runDir,
+		},
+		&stdout,
+		&stderr,
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "while the daemon is stopped") {
+		t.Fatalf("running-daemon legacy-adoption error = %v", err)
+	}
+}
+
 func TestInitPreservesExistingTransportCipherAndParser(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := filepath.Join(dir, "config.yaml")

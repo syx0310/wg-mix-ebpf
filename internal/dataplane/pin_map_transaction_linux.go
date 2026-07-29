@@ -538,7 +538,9 @@ func removeCanonicalOwnerMaps(
 			return err
 		}
 		if handle.runtime.beforePinQuarantine != nil {
-			handle.runtime.beforePinQuarantine(stage.Name)
+			if err := handle.runtime.beforePinQuarantine(stage.Name); err != nil {
+				return fmt.Errorf("canonical map quarantine hook %s: %w", stage.Name, err)
+			}
 		}
 		pin, err = validatePinnedMapAt(
 			handle,
@@ -592,7 +594,9 @@ func unlinkValidatedOwnerMap(
 		return err
 	}
 	if handle.runtime.beforePinUnlink != nil {
-		handle.runtime.beforePinUnlink(fileName)
+		if err := handle.runtime.beforePinUnlink(fileName); err != nil {
+			return fmt.Errorf("map pin unlink hook %s: %w", fileName, err)
+		}
 	}
 	pin, err = validatePinnedMapAt(handle, descriptor, fileName, mapID)
 	if err != nil {
@@ -767,7 +771,9 @@ func removeOwnerMapStages(
 			return err
 		}
 		if handle.runtime.beforePinQuarantine != nil {
-			handle.runtime.beforePinQuarantine(stage.FileName)
+			if err := handle.runtime.beforePinQuarantine(stage.FileName); err != nil {
+				return fmt.Errorf("map stage quarantine hook %s: %w", stage.FileName, err)
+			}
 		}
 		pin, err = validatePinnedMapAt(
 			handle,

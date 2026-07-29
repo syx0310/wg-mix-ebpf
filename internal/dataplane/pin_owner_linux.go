@@ -25,7 +25,7 @@ import (
 
 const (
 	pinOwnerSentinelVersion = 1
-	pinOwnerRecordVersion   = 2
+	pinOwnerRecordVersion   = 3
 	pinOwnerRecordMaxBytes  = 256 * 1024
 
 	pinOwnerPhaseActive    = "active"
@@ -88,6 +88,7 @@ type pinOwnerRecord struct {
 	ProgramStages          []pinOwnerProgramStage `json:"program_stages"`
 	MapStages              []pinOwnerMapStage     `json:"map_stages"`
 	RetiredFromResourceKey string                 `json:"retired_from_resource_key"`
+	RetiredFromBootID      string                 `json:"retired_from_boot_id"`
 }
 
 type pinOwnerStore struct {
@@ -98,6 +99,7 @@ type pinOwnerStore struct {
 	nextName            string
 	retiredName         string
 	beforeOwnerExchange func()
+	now                 func() time.Time
 }
 
 type canonicalPinDirectoryState int
@@ -495,6 +497,8 @@ func newApplyingPinOwnerRecord(
 	}
 	if previous != nil {
 		record.BPFFSMountIDs = slices.Clone(previous.BPFFSMountIDs)
+		record.RetiredFromResourceKey = previous.RetiredFromResourceKey
+		record.RetiredFromBootID = previous.RetiredFromBootID
 		if !slices.Contains(record.BPFFSMountIDs, parent.mountID) {
 			record.BPFFSMountIDs = append(record.BPFFSMountIDs, parent.mountID)
 		}
@@ -875,10 +879,16 @@ func validatePinOwnerRecord(
 	// ID; loading the descriptor must not turn such an alias into a separate
 	// ownership domain.
 	_ = currentMountID
-	if record.RetiredFromResourceKey != "" &&
-		(!pinidentity.ValidKey(record.RetiredFromResourceKey) ||
-			record.RetiredFromResourceKey == record.ResourceKey) {
-		return errors.New("pin owner retired_from_resource_key is invalid")
+	if (record.RetiredFromResourceKey == "") !=
+		(record.RetiredFromBootID == "") {
+		return errors.New("pin owner reboot lineage must include both resource key and boot ID")
+	}
+	if record.RetiredFromResourceKey != "" {
+		if !pinidentity.ValidKey(record.RetiredFromResourceKey) ||
+			!bootIDPattern.MatchString(record.RetiredFromBootID) ||
+			record.RetiredFromBootID == record.BootID {
+			return errors.New("pin owner reboot lineage is invalid")
+		}
 	}
 	if err := validateOwnerMaps(record.Maps); err != nil {
 		return err
@@ -1301,7 +1311,9 @@ func removeOwnerProgramStages(
 				return err
 			}
 			if handle.runtime.beforePinUnlink != nil {
-				handle.runtime.beforePinUnlink(retiredName)
+				if err := handle.runtime.beforePinUnlink(retiredName); err != nil {
+					return fmt.Errorf("program stage unlink hook %s: %w", retiredName, err)
+				}
 			}
 			if err := validatePinnedProgramAt(
 				handle,
@@ -1338,7 +1350,9 @@ func removeOwnerProgramStages(
 			return err
 		}
 		if handle.runtime.beforePinQuarantine != nil {
-			handle.runtime.beforePinQuarantine(stage.FileName)
+			if err := handle.runtime.beforePinQuarantine(stage.FileName); err != nil {
+				return fmt.Errorf("program stage quarantine hook %s: %w", stage.FileName, err)
+			}
 		}
 		if err := handle.recheckTargetEntry(); err != nil {
 			return err
@@ -1375,7 +1389,9 @@ func removeOwnerProgramStages(
 			return fmt.Errorf("validate retired program stage %s: %w", retiredName, err)
 		}
 		if handle.runtime.beforePinUnlink != nil {
-			handle.runtime.beforePinUnlink(retiredName)
+			if err := handle.runtime.beforePinUnlink(retiredName); err != nil {
+				return fmt.Errorf("program stage unlink hook %s: %w", retiredName, err)
+			}
 		}
 		if err := validatePinnedProgramAt(
 			handle,
@@ -1555,9 +1571,20 @@ func openPinOwnerStoreWithPolicy(
 		nextName:            resource.key + ".owner.next",
 		retiredName:         resource.key + ".owner.retired",
 		beforeOwnerExchange: runtime.beforeOwnerExchange,
+		now:                 runtime.now,
 	}
 	if recoverDescriptors {
 		if err := store.recoverDescriptorTransaction(); err != nil {
+			_ = root.Close()
+			return nil, err
+		}
+		if err := indexStoreFromOwner(store).recoverOwnerArchive(
+			resource,
+		); err != nil {
+			_ = root.Close()
+			return nil, err
+		}
+		if err := store.repairIndexForCurrentResource(); err != nil {
 			_ = root.Close()
 			return nil, err
 		}
@@ -1686,7 +1713,9 @@ func (store *pinOwnerStore) Persist(
 		}
 		if record.Token != expected.Token ||
 			record.CreatedAt != expected.CreatedAt ||
-			record.BootID != expected.BootID {
+			record.BootID != expected.BootID ||
+			record.RetiredFromResourceKey != expected.RetiredFromResourceKey ||
+			record.RetiredFromBootID != expected.RetiredFromBootID {
 			return errors.New("pin owner immutable fields changed during update")
 		}
 	}
@@ -1781,7 +1810,10 @@ func (store *pinOwnerStore) Persist(
 			store.expectedUID,
 			&nextIdentity,
 		)
-		return err
+		if err != nil {
+			return err
+		}
+		return store.syncIndexRecord(record, false)
 	}
 	if targetErr != nil {
 		return targetErr
@@ -1869,13 +1901,19 @@ func (store *pinOwnerStore) Persist(
 	); err != nil {
 		return fmt.Errorf("verify quarantined old pin owner record: %w", err)
 	}
-	return unlinkAnchoredRegularFile(
+	if err := store.syncIndexRecord(record, false); err != nil {
+		return err
+	}
+	if err := unlinkAnchoredRegularFile(
 		store.root,
 		store.nextName,
 		int(targetFile.Fd()),
 		targetIdentity,
 		store.expectedUID,
-	)
+	); err != nil {
+		return err
+	}
+	return nil
 }
 
 func writeAndSyncAnchoredFile(
@@ -2001,7 +2039,10 @@ func (store *pinOwnerStore) recoverDescriptorTransaction() error {
 		); err != nil {
 			return fmt.Errorf("recover initial pin owner descriptor: %w", err)
 		}
-		return unix.Fsync(store.root.FD())
+		if err := unix.Fsync(store.root.FD()); err != nil {
+			return err
+		}
+		return store.syncIndexRecord(nextRecord, false)
 	}
 	if targetErr != nil {
 		return targetErr
@@ -2016,8 +2057,8 @@ func (store *pinOwnerStore) recoverDescriptorTransaction() error {
 	}
 	switch {
 	case nextRecord.Sequence == targetRecord.Sequence+1:
-		if nextRecord.Token != targetRecord.Token {
-			return errors.New("pending pin owner descriptor token mismatch")
+		if !samePinOwnerImmutableFields(nextRecord, targetRecord) {
+			return errors.New("pending pin owner descriptor immutable fields mismatch")
 		}
 		if err := unix.Renameat2(
 			store.root.FD(),
@@ -2031,6 +2072,9 @@ func (store *pinOwnerStore) recoverDescriptorTransaction() error {
 		if err := unix.Fsync(store.root.FD()); err != nil {
 			return err
 		}
+		if err := store.syncIndexRecord(nextRecord, false); err != nil {
+			return err
+		}
 		return unlinkAnchoredRegularFile(
 			store.root,
 			store.nextName,
@@ -2039,8 +2083,11 @@ func (store *pinOwnerStore) recoverDescriptorTransaction() error {
 			store.expectedUID,
 		)
 	case targetRecord.Sequence == nextRecord.Sequence+1:
-		if nextRecord.Token != targetRecord.Token {
-			return errors.New("quarantined pin owner descriptor token mismatch")
+		if !samePinOwnerImmutableFields(targetRecord, nextRecord) {
+			return errors.New("quarantined pin owner descriptor immutable fields mismatch")
+		}
+		if err := store.syncIndexRecord(targetRecord, false); err != nil {
+			return err
 		}
 		return unlinkAnchoredRegularFile(
 			store.root,
@@ -2055,6 +2102,17 @@ func (store *pinOwnerStore) recoverDescriptorTransaction() error {
 			targetRecord.Sequence, nextRecord.Sequence,
 		)
 	}
+}
+
+func samePinOwnerImmutableFields(left, right *pinOwnerRecord) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return left.Token == right.Token &&
+		left.CreatedAt == right.CreatedAt &&
+		left.BootID == right.BootID &&
+		left.RetiredFromResourceKey == right.RetiredFromResourceKey &&
+		left.RetiredFromBootID == right.RetiredFromBootID
 }
 
 func (store *pinOwnerStore) Remove(expected *pinOwnerRecord) error {
@@ -2129,6 +2187,9 @@ func (store *pinOwnerStore) Remove(expected *pinOwnerRecord) error {
 	); err != nil {
 		return err
 	}
+	if err := store.syncIndexRecord(expected, true); err != nil {
+		return err
+	}
 	return unlinkAnchoredRegularFile(
 		store.root,
 		store.retiredName,
@@ -2156,6 +2217,9 @@ func (store *pinOwnerStore) recoverRetiredRecord() error {
 	if err != nil {
 		return err
 	}
+	if err := validatePinOwnerRecord(record, store.resource, 0); err != nil {
+		return err
+	}
 	if record.ResourceKey != store.resource.key ||
 		record.Phase != pinOwnerPhaseDetaching ||
 		record.Step != pinOwnerStepCleanupStages {
@@ -2170,6 +2234,9 @@ func (store *pinOwnerStore) recoverRetiredRecord() error {
 	); err == nil {
 		return errors.New("both active and retired pin owner records exist")
 	} else if !errors.Is(err, unix.ENOENT) {
+		return err
+	}
+	if err := store.syncIndexRecord(record, true); err != nil {
 		return err
 	}
 	return unlinkAnchoredRegularFile(

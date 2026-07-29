@@ -588,3 +588,82 @@ func TestTCAttachTransactionIncludesOwnedStaleDeletesAndRollback(t *testing.T) {
 		})
 	}
 }
+
+func TestTCAttachFailureAtEveryFilterWriteRestoresAllOwnedSlots(t *testing.T) {
+	const mutationWrites = 6 // four replacements plus two stale deletes
+	for failAt := 1; failAt <= mutationWrites; failAt++ {
+		t.Run(fmt.Sprintf("write-%02d", failAt), func(t *testing.T) {
+			kernel := newFakeTCKernel(11, 12, 13)
+			for id, fd := range map[uint32]int{
+				21: 201,
+				22: 202,
+				31: 301,
+				32: 302,
+			} {
+				kernel.addProgram(id, fd)
+			}
+			var active []tcFilterBinding
+			for _, ifindex := range []int{11, 12, 13} {
+				kernel.addClsact(ifindex)
+				kernel.addManagedFilter(ifindex, canonicalTCFilterSlots()[0], 21)
+				kernel.addManagedFilter(ifindex, canonicalTCFilterSlots()[1], 22)
+				active = append(active,
+					tcFilterBinding{
+						IfIndex:   ifindex,
+						Direction: "ingress",
+						Parent:    netlink.HANDLE_MIN_INGRESS,
+						Handle:    ingressHandle,
+						Priority:  filterPriority,
+						ProgramID: 21,
+					},
+					tcFilterBinding{
+						IfIndex:   ifindex,
+						Direction: "egress",
+						Parent:    netlink.HANDLE_MIN_EGRESS,
+						Handle:    egressHandle,
+						Priority:  filterPriority,
+						ProgramID: 22,
+					},
+				)
+			}
+			sortTCFilterBindings(active)
+			plan, err := prepareTCAttachPlan(
+				testTCState(11, 12),
+				tcProgramIdentity{fd: 301, id: 31},
+				tcProgramIdentity{fd: 302, id: 32},
+				kernel.runtime(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer plan.Close()
+			if err := plan.ValidatePreviousBindings(active, false); err != nil {
+				t.Fatal(err)
+			}
+			if err := plan.AddOwnedStaleRemovals(active); err != nil {
+				t.Fatal(err)
+			}
+			kernel.failWrite = failAt
+			err = plan.Execute(func() error { return nil })
+			if err == nil || !strings.Contains(err.Error(), "injected") {
+				t.Fatalf("write %d error = %v", failAt, err)
+			}
+			for _, ifindex := range []int{11, 12, 13} {
+				if got := kernel.managedProgramID(
+					t,
+					ifindex,
+					canonicalTCFilterSlots()[0],
+				); got != 21 {
+					t.Fatalf("write %d ifindex %d ingress = %d, want 21", failAt, ifindex, got)
+				}
+				if got := kernel.managedProgramID(
+					t,
+					ifindex,
+					canonicalTCFilterSlots()[1],
+				); got != 22 {
+					t.Fatalf("write %d ifindex %d egress = %d, want 22", failAt, ifindex, got)
+				}
+			}
+		})
+	}
+}
