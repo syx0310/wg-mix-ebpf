@@ -161,3 +161,14 @@ func TestRetainedLifecycleLeasePreventsReacquire(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestIsolatedLifecyclePathIsContextLocal(t *testing.T) {
+	isolatedPath := filepath.Join(t.TempDir(), "lifecycle.lease")
+	isolatedContext := WithIsolatedNetNSTestLifecyclePath(t.Context(), isolatedPath)
+	if got := LifecycleLeasePath(isolatedContext); got != isolatedPath {
+		t.Fatalf("isolated lifecycle path = %q, want %q", got, isolatedPath)
+	}
+	if got := LifecycleLeasePath(t.Context()); got != DefaultLifecycleLeasePath {
+		t.Fatalf("default lifecycle path changed to %q", got)
+	}
+}
