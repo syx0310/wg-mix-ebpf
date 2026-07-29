@@ -44,6 +44,13 @@ func WithLifecyclePathForTest(ctx context.Context, path string) context.Context 
 	return context.WithValue(ctx, lifecyclePathContextKey{}, path)
 }
 
+// WithIsolatedNetNSTestLifecyclePath redirects the lifecycle lease for the
+// explicitly gated, non-initial-network-namespace smoke-test path. Callers
+// must validate the complete run-owned layout before using this helper.
+func WithIsolatedNetNSTestLifecyclePath(ctx context.Context, path string) context.Context {
+	return context.WithValue(ctx, lifecyclePathContextKey{}, path)
+}
+
 func LifecycleLeasePath(ctx context.Context) string {
 	if ctx != nil {
 		if path, ok := ctx.Value(lifecyclePathContextKey{}).(string); ok && path != "" {
