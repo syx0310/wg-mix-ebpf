@@ -640,9 +640,28 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 	runDir := fs.String("run-dir", "", "daemon runtime directory")
 	stateDir := fs.String("state-dir", "", "persistent attach-state directory")
 	reason := fs.String("reason", "manual", "operation reason")
+	isolatedNetNSTest := fs.Bool(
+		"isolated-netns-test",
+		false,
+		"use a run-owned lifecycle lease for a strictly isolated network-namespace smoke test",
+	)
 	_ = reason
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if *isolatedNetNSTest {
+		var err error
+		ctx, err = isolatedNetNSTestContext(
+			ctx,
+			cmd,
+			*configPath,
+			*runDir,
+			*stateDir,
+			os.Getenv("WG_MIX_EBPF_PIN_PATH"),
+		)
+		if err != nil {
+			return err
+		}
 	}
 	opts := reconcile.Options{ConfigPath: *configPath, RunDir: daemonRunDir(*runDir), StateDir: *stateDir, Offline: *offline, DryRun: *dryRun}
 
