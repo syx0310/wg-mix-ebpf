@@ -106,7 +106,9 @@ test-lint:
 		echo "skip: shellcheck is unavailable"; \
 	fi
 	python3 -c 'from pathlib import Path; compile(Path("scripts/check-wg-pcap.py").read_text(), "scripts/check-wg-pcap.py", "exec")'
+	python3 -c 'from pathlib import Path; compile(Path("scripts/check-iperf3-tcp.py").read_text(), "scripts/check-iperf3-tcp.py", "exec")'
 	python3 -c 'from pathlib import Path; compile(Path("scripts/hold-isolated-lifecycle-lease.py").read_text(), "scripts/hold-isolated-lifecycle-lease.py", "exec")'
+	python3 -c 'from pathlib import Path; compile(Path("scripts/test_check_iperf3_tcp.py").read_text(), "scripts/test_check_iperf3_tcp.py", "exec")'
 	python3 -c 'from pathlib import Path; compile(Path("scripts/test_hold_isolated_lifecycle_lease.py").read_text(), "scripts/test_hold_isolated_lifecycle_lease.py", "exec")'
 	python3 -c 'from pathlib import Path; compile(Path("scripts/test_smoke_netns_wg_static.py").read_text(), "scripts/test_smoke_netns_wg_static.py", "exec")'
 
@@ -124,6 +126,7 @@ test-packet-helper:
 
 test-pcap-helper:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_wg_pcap.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_iperf3_tcp.py
 
 test-smoke-script-helper:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_smoke_netns_wg_static.py
