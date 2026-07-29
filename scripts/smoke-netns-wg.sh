@@ -17,6 +17,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ROOT}/bin/wg-mix-ebpf"
 LIFECYCLE_HOLDER_HELPER="${ROOT}/scripts/hold-isolated-lifecycle-lease.py"
 IPERF_CHECKER_HELPER="${ROOT}/scripts/check-iperf3-tcp.py"
+NETNS_DELETE_HELPER="${ROOT}/scripts/delete-owned-netns.py"
 OUTER_FAMILY="${OUTER_FAMILY:-ipv4}"
 XOR_SCOPE="${XOR_SCOPE:-wg-payload-full}"
 XOR_MAX_BYTES="${XOR_MAX_BYTES:-2048}"
@@ -199,6 +200,16 @@ if [[ ! -f "${IPERF_CHECKER_HELPER}" || -L "${IPERF_CHECKER_HELPER}" ]]; then
   echo "error: missing iperf checker helper: ${IPERF_CHECKER_HELPER}" >&2
   exit 1
 fi
+if [[ ! -f "${NETNS_DELETE_HELPER}" || -L "${NETNS_DELETE_HELPER}" ]]; then
+  echo "error: missing netns delete helper: ${NETNS_DELETE_HELPER}" >&2
+  exit 1
+fi
+IP_BIN="$(command -v ip)"
+if [[ "${IP_BIN}" != /* ]]; then
+  echo "error: ip command did not resolve to an absolute path" >&2
+  exit 1
+fi
+IP_BIN="$(realpath -e -- "${IP_BIN}")"
 
 if [[ -n "${RUN_ID+x}" ]]; then
   echo "error: externally supplied RUN_ID is forbidden; each run uses a fresh random ID" >&2
@@ -999,12 +1010,35 @@ delete_owned_netns() {
   local expected_device="$2"
   local expected_inode="$3"
   local expected_role="$4"
+  local status
 
-  validate_netns_identity \
-    "${ns}" "${expected_device}" "${expected_inode}" "${expected_role}" ||
-    return 1
-  teardown_step "delete owned netns ${ns} identity=${expected_device}:${expected_inode}" \
-    ip netns delete "${ns}"
+  validate_marker "${RUN_BASE}" root || return 1
+  validate_manifest || return 1
+  printf 'teardown start: timestamp=%s action=delete owned netns %s identity=%s:%s role=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "${ns}" "${expected_device}" "${expected_inode}" "${expected_role}"
+  printf 'teardown argv:\n'
+  print_command env -u XOR_PASSWORD python3 "${NETNS_DELETE_HELPER}" \
+    --name "${ns}" \
+    --run-id "${RUN_ID}" \
+    --role "${expected_role}" \
+    --expected-device "${expected_device}" \
+    --expected-inode "${expected_inode}" \
+    --ip-bin "${IP_BIN}"
+  if env -u XOR_PASSWORD python3 "${NETNS_DELETE_HELPER}" \
+    --name "${ns}" \
+    --run-id "${RUN_ID}" \
+    --role "${expected_role}" \
+    --expected-device "${expected_device}" \
+    --expected-inode "${expected_inode}" \
+    --ip-bin "${IP_BIN}"; then
+    status=0
+  else
+    status=$?
+  fi
+  printf 'teardown finish: timestamp=%s action=delete owned netns %s exit=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${ns}" "${status}"
+  return "${status}"
 }
 
 validate_released_pin_lock() {

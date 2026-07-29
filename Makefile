@@ -111,6 +111,8 @@ test-lint:
 	python3 -c 'from pathlib import Path; compile(Path("scripts/test_check_iperf3_tcp.py").read_text(), "scripts/test_check_iperf3_tcp.py", "exec")'
 	python3 -c 'from pathlib import Path; compile(Path("scripts/test_hold_isolated_lifecycle_lease.py").read_text(), "scripts/test_hold_isolated_lifecycle_lease.py", "exec")'
 	python3 -c 'from pathlib import Path; compile(Path("scripts/test_smoke_netns_wg_static.py").read_text(), "scripts/test_smoke_netns_wg_static.py", "exec")'
+	python3 -c 'from pathlib import Path; compile(Path("scripts/delete-owned-netns.py").read_text(), "scripts/delete-owned-netns.py", "exec")'
+	python3 -c 'from pathlib import Path; compile(Path("scripts/test_delete_owned_netns.py").read_text(), "scripts/test_delete_owned_netns.py", "exec")'
 
 test-config:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./internal/config ./internal/wgconfig
@@ -131,6 +133,7 @@ test-pcap-helper:
 test-smoke-script-helper:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_smoke_netns_wg_static.py
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_hold_isolated_lifecycle_lease.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_delete_owned_netns.py
 
 test-bpf-pkt:
 	@echo "skip: requires external Linux root VM with BPF/TC support"

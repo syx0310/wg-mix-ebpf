@@ -8,6 +8,9 @@ SCRIPT_PATH = pathlib.Path(__file__).with_name("smoke-netns-wg.sh")
 HOLDER_PATH = pathlib.Path(__file__).with_name(
     "hold-isolated-lifecycle-lease.py"
 )
+DELETE_HELPER_PATH = pathlib.Path(__file__).with_name(
+    "delete-owned-netns.py"
+)
 
 
 class SmokeNetNSWGStaticTests(unittest.TestCase):
@@ -16,6 +19,9 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         cls.source = SCRIPT_PATH.read_text(encoding="utf-8")
         cls.lines = cls.source.splitlines()
         cls.holder_source = HOLDER_PATH.read_text(encoding="utf-8")
+        cls.delete_helper_source = DELETE_HELPER_PATH.read_text(
+            encoding="utf-8"
+        )
 
     def test_password_is_unexported_before_first_child_process(self) -> None:
         capture = self.source.index('XOR_SECRET="${XOR_PASSWORD-}"')
@@ -290,9 +296,29 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.source.index("\nvalidate_released_pin_lock() {")
         ]
         self.assertLess(
-            delete.index("validate_netns_identity"),
-            delete.index('ip netns delete "${ns}"'),
+            delete.index("validate_manifest"),
+            delete.index('"${NETNS_DELETE_HELPER}"'),
         )
+        self.assertNotIn("validate_netns_identity", delete)
+        self.assertNotIn('ip netns delete "${ns}"', delete)
+        self.assertIn("--expected-device", delete)
+        self.assertIn("--expected-inode", delete)
+        self.assertIn("--role", delete)
+        self.assertIn("open_verified_target(", self.delete_helper_source)
+        self.assertIn("recheck_verified_target(", self.delete_helper_source)
+        self.assertLess(
+            self.delete_helper_source.index("recheck_verified_target("),
+            self.delete_helper_source.index("status = delete_runner(name)"),
+        )
+        final_boundary = self.delete_helper_source[
+            self.delete_helper_source.index(
+                "recheck_verified_target(",
+                self.delete_helper_source.index("def delete_owned_netns("),
+            ) :
+            self.delete_helper_source.index("status = delete_runner(name)")
+        ]
+        self.assertNotIn("print(", final_boundary)
+        self.assertNotIn("subprocess", final_boundary)
 
         teardown = self.source[
             self.source.index("explicit_teardown() {") :
