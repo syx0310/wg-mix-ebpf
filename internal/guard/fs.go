@@ -51,6 +51,15 @@ func openSecureStateDirectory(configured string, create bool) (*secureStateDirec
 			_ = chain[index].Close()
 		}
 	}
+	rootInfo, err := root.Stat()
+	if err != nil {
+		closeChain()
+		return nil, fmt.Errorf("inspect filesystem root for guard state traversal: %w", err)
+	}
+	if err := validateGuardAncestorDirectory(string(filepath.Separator), rootInfo); err != nil {
+		closeChain()
+		return nil, err
+	}
 	currentPath := string(filepath.Separator)
 	for index, component := range components {
 		if component == "" {
@@ -59,6 +68,13 @@ func openSecureStateDirectory(configured string, create bool) (*secureStateDirec
 		}
 		parent := chain[len(chain)-1]
 		next, openErr := guardOpenDirectoryAt(parent, component)
+		if errors.Is(openErr, os.ErrNotExist) && index != len(components)-1 {
+			closeChain()
+			return nil, fmt.Errorf(
+				"guard state intermediate component %s is missing; ownership absence cannot be proven",
+				filepath.Join(currentPath, component),
+			)
+		}
 		if errors.Is(openErr, os.ErrNotExist) && create && index == len(components)-1 {
 			if mkdirErr := guardMkdirDirectoryAt(parent, component, 0o755); mkdirErr != nil &&
 				!errors.Is(mkdirErr, os.ErrExist) {
@@ -74,6 +90,23 @@ func openSecureStateDirectory(configured string, create bool) (*secureStateDirec
 				filepath.Join(currentPath, component),
 				openErr,
 			)
+		}
+		if index != len(components)-1 {
+			info, statErr := next.Stat()
+			if statErr != nil {
+				_ = next.Close()
+				closeChain()
+				return nil, fmt.Errorf(
+					"inspect guard state ancestor %s: %w",
+					filepath.Join(currentPath, component),
+					statErr,
+				)
+			}
+			if err := validateGuardAncestorDirectory(filepath.Join(currentPath, component), info); err != nil {
+				_ = next.Close()
+				closeChain()
+				return nil, err
+			}
 		}
 		chain = append(chain, next)
 		currentPath = filepath.Join(currentPath, component)
@@ -131,9 +164,43 @@ func validateGuardStateDirectory(path string, info os.FileInfo) error {
 	return nil
 }
 
+func validateGuardAncestorDirectory(path string, info os.FileInfo) error {
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("guard state ancestor %s is not a real directory", path)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("read guard state ancestor ownership for %s", path)
+	}
+	owner := int(stat.Uid)
+	if owner != 0 && owner != os.Geteuid() {
+		return fmt.Errorf(
+			"guard state ancestor %s uid %d is neither root nor effective uid %d",
+			path,
+			stat.Uid,
+			os.Geteuid(),
+		)
+	}
+	if info.Mode().Perm()&0o022 != 0 && info.Mode()&os.ModeSticky == 0 {
+		return fmt.Errorf(
+			"guard state ancestor %s mode %04o is writable without sticky rename protection",
+			path,
+			info.Mode().Perm(),
+		)
+	}
+	return nil
+}
+
 func (d *secureStateDirectory) validatePath() error {
 	if d == nil || d.file == nil || len(d.chain) != len(d.components)+1 {
 		return errors.New("guard state directory is closed or incomplete")
+	}
+	rootInfo, err := d.chain[0].Stat()
+	if err != nil {
+		return fmt.Errorf("inspect anchored filesystem root: %w", err)
+	}
+	if err := validateGuardAncestorDirectory(string(filepath.Separator), rootInfo); err != nil {
+		return err
 	}
 	for index, component := range d.components {
 		current, err := guardOpenDirectoryAt(d.chain[index], component)
@@ -151,6 +218,11 @@ func (d *secureStateDirectory) validatePath() error {
 		}
 		if !os.SameFile(currentInfo, expectedInfo) {
 			return fmt.Errorf("guard state component %s changed after descriptor anchoring", component)
+		}
+		if index+1 != len(d.chain)-1 {
+			if err := validateGuardAncestorDirectory(component, expectedInfo); err != nil {
+				return err
+			}
 		}
 		if closeErr != nil {
 			return fmt.Errorf("close revalidated guard state component %s: %w", component, closeErr)

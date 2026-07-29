@@ -349,6 +349,38 @@ func TestCleanupRejectsMissingIntermediateStateDirectory(t *testing.T) {
 	}
 }
 
+func TestCleanupRejectsOwnerHiddenThroughNewlyWritableAncestor(t *testing.T) {
+	parent := guardTestStateDir(t)
+	stateDir := filepath.Join(parent, "state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	seedOwnerRecord(t, stateDir)
+	if err := os.Rename(stateDir, filepath.Join(parent, "state-hidden")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(parent, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	exec := CommandExecutor{
+		StateDir: stateDir,
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			if table != TableName {
+				t.Fatalf("unexpected inspection of %q", table)
+			}
+			return tableIdentity{}, nil
+		},
+		runScript: func(context.Context, string) error {
+			t.Fatal("hidden owner record issued an nft write")
+			return nil
+		},
+	}
+	err := exec.Cleanup(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "ancestor") {
+		t.Fatalf("cleanup must not treat a hidden owner record as absent, got %v", err)
+	}
+}
+
 func TestCleanupRejectsLegacyV1OwnerRecordWithZeroWrite(t *testing.T) {
 	stateDir := guardTestStateDir(t)
 	writeLegacyV1OwnerRecord(t, stateDir)
