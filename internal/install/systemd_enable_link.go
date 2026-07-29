@@ -124,10 +124,42 @@ func beginSystemdEnableLinkTransaction(
 	return transaction, nil
 }
 
-func (transaction *systemdEnableLinkTransaction) commit() {
-	if transaction != nil {
-		transaction.committed = true
+func (transaction *systemdEnableLinkTransaction) commit() error {
+	if transaction == nil || transaction.parent == nil || transaction.entry == nil {
+		return errors.New(
+			"cannot commit systemd enable link without held directory and link identities",
+		)
 	}
+	if transaction.committed {
+		return errors.New("systemd enable link transaction is already committed")
+	}
+	if transaction.entry.path != transaction.artifact.Path ||
+		transaction.entry.symlinkTarget != transaction.artifact.Target ||
+		!transaction.entry.symlink {
+		return errors.New(
+			"systemd enable link transaction lost its declared link identity",
+		)
+	}
+	if err := revalidateManagedCleanupDir(transaction.parent); err != nil {
+		return fmt.Errorf(
+			"revalidate held systemd wants directory at commit: %w",
+			err,
+		)
+	}
+	if err := transaction.entry.revalidate(); err != nil {
+		return fmt.Errorf(
+			"revalidate exact systemd enable link inode, UID, and target at commit: %w",
+			err,
+		)
+	}
+	if err := revalidateManagedCleanupDir(transaction.parent); err != nil {
+		return fmt.Errorf(
+			"revalidate held systemd wants directory after exact link inspection: %w",
+			err,
+		)
+	}
+	transaction.committed = true
+	return nil
 }
 
 func (transaction *systemdEnableLinkTransaction) rollback() error {
@@ -144,9 +176,12 @@ func (transaction *systemdEnableLinkTransaction) rollback() error {
 				transaction.artifact.Path,
 			))
 		default:
-			if err := revalidateManagedCleanupDir(transaction.parent); err != nil {
-				errs = append(errs, err)
-			} else if err := transaction.entry.unlink(nil); err != nil {
+			// The entry plan is bound to the held wants-directory descriptor.
+			// Do not resolve the wants pathname again before rolling back the
+			// exact link: a replaced pathname must neither redirect cleanup to
+			// a foreign directory nor prevent descriptor-bound cleanup of the
+			// transaction-owned link in a displaced directory.
+			if err := transaction.entry.unlink(nil); err != nil {
 				errs = append(errs, fmt.Errorf(
 					"roll back exact systemd enable link %s: %w",
 					transaction.artifact.Path,
@@ -165,46 +200,42 @@ func (transaction *systemdEnableLinkTransaction) rollback() error {
 		}
 	}
 	if transaction.parentCreated && !transaction.created {
-		entries, err := cleanupReadDir(transaction.parent.dir)
-		switch {
-		case err != nil:
+		directory := &cleanupDirectoryPlan{
+			root:          transaction.parent,
+			strictEntries: true,
+			removeRoot:    true,
+		}
+		if err := directory.remove(nil); err != nil {
 			errs = append(errs, fmt.Errorf(
-				"inspect created systemd enable directory before rollback: %w",
+				"roll back exact created systemd enable directory %s: %w",
+				transaction.parent.spec.path,
 				err,
 			))
-		case len(entries) != 0:
-			errs = append(errs, fmt.Errorf(
-				"refuse to remove created systemd enable directory %s: directory is no longer empty",
-				transaction.parent.spec.path,
-			))
-		default:
-			if err := revalidateManagedCleanupDir(transaction.parent); err != nil {
-				errs = append(errs, fmt.Errorf(
-					"refuse to remove created systemd enable directory %s: %w",
-					transaction.parent.spec.path,
-					err,
-				))
-			} else if err := cleanupUnlinkAt(
-				transaction.parent.parent,
-				transaction.parent.name,
-				true,
-			); err != nil {
-				errs = append(errs, fmt.Errorf(
-					"remove empty created systemd enable directory %s: %w",
-					transaction.parent.spec.path,
-					err,
-				))
-			} else if err := transaction.parent.parent.file.Sync(); err != nil {
+		} else {
+			transaction.parentCreated = false
+			if err := transaction.parent.parent.file.Sync(); err != nil {
 				errs = append(errs, fmt.Errorf(
 					"sync parent after systemd enable directory rollback: %w",
 					err,
 				))
-			} else {
-				transaction.parentCreated = false
 			}
 		}
 	}
-	return errors.Join(errs...)
+	rollbackErr := errors.Join(errs...)
+	if rollbackErr == nil {
+		return nil
+	}
+	return errors.Join(
+		rollbackErr,
+		fmt.Errorf(
+			"systemd enable rollback is incomplete; the published ownership "+
+				"manifest retains path %s and target %q, and any object that "+
+				"could not be restored from cleanup quarantine remains at the "+
+				"exact quarantine path reported above",
+			transaction.artifact.Path,
+			transaction.artifact.Target,
+		),
+	)
 }
 
 func (transaction *systemdEnableLinkTransaction) close() error {

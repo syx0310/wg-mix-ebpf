@@ -8,15 +8,22 @@ that exact relative symlink through held directory descriptors.
 Before creating the link, installation reloads and verifies the systemd manager,
 publishes the cleanup ownership manifest, and reopens the manifest and config as
 held descriptors. The link is then validated by inode, owner, target, and parent
-directory identity. A later unit/manifest validation failure removes only the
-link created by that transaction through the existing quarantine protocol. If
+directory identity. Immediately before committing the transaction, installation
+revalidates both the pathname identity of the held wants directory and the exact
+link inode, UID, and target. A later validation failure removes only the link
+created by that transaction through the held directory descriptor and existing
+quarantine protocol. A foreign replacement is never deleted or overwritten. If
 an exact rollback cannot be completed, the already-published manifest retains
-the precise link path and target for recovery.
+the precise link path and target for recovery; a failed no-replace quarantine
+restore retains the owned object at the exact quarantine path reported in the
+error.
 
 Uninstall no longer calls broad `systemctl disable`. Its cleanup plan validates
 and removes the declared enable link before removing the owned unit. A
 pre-existing link with another target is rejected and preserved.
 
 Local validation covered successful enablement, unit and manifest swaps during
-the enable window, failure after link creation with rollback and retry, and
+the enable window, fresh and marked ownership with both successful and failing
+post-link hooks, wants-directory pathname replacement, failure after link
+creation with rollback and retry, exact quarantine preservation, and
 foreign-link preservation on install and uninstall.

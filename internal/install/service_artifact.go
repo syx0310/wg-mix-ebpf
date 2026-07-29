@@ -729,7 +729,9 @@ func runInstalledSystemdServiceCommit(
 	if err := revalidateMetadata("after enable link creation"); err != nil {
 		return err
 	}
-	transaction.commit()
+	if err := transaction.commit(); err != nil {
+		return fmt.Errorf("commit exact systemd enable link: %w", err)
+	}
 	return nil
 }
 
