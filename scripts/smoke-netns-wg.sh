@@ -6,10 +6,17 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
+XOR_SECRET="${XOR_PASSWORD-}"
+unset XOR_PASSWORD
+XOR_ENABLED=0
+if [[ -n "${XOR_SECRET}" ]]; then
+  XOR_ENABLED=1
+fi
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ROOT}/bin/wg-mix-ebpf"
+LIFECYCLE_HOLDER_HELPER="${ROOT}/scripts/hold-isolated-lifecycle-lease.py"
 OUTER_FAMILY="${OUTER_FAMILY:-ipv4}"
-XOR_PASSWORD="${XOR_PASSWORD:-}"
 XOR_SCOPE="${XOR_SCOPE:-wg-payload-full}"
 XOR_MAX_BYTES="${XOR_MAX_BYTES:-2048}"
 XOR_GENERATION_CHECKS="${XOR_GENERATION_CHECKS:-off}"
@@ -32,10 +39,11 @@ if [[ "${XOR_SCOPE}" != "wg-payload-prefix" && "${XOR_SCOPE}" != "wg-payload-ful
   echo "error: XOR_SCOPE must be wg-payload-prefix or wg-payload-full" >&2
   exit 1
 fi
-if [[ -n "${XOR_PASSWORD}" &&
-  ( ${#XOR_PASSWORD} -gt 256 || "${XOR_PASSWORD}" =~ [[:space:]] ) ]]; then
-  echo "error: XOR_PASSWORD must contain 1-256 non-whitespace characters" >&2
-  exit 1
+if ((XOR_ENABLED)); then
+  if ((${#XOR_SECRET} > 256)) || [[ "${XOR_SECRET}" =~ [[:space:]] ]]; then
+    echo "error: XOR_PASSWORD must contain 1-256 non-whitespace characters" >&2
+    exit 1
+  fi
 fi
 if [[ ! "${XOR_MAX_BYTES}" =~ ^[0-9]+$ ]] ||
   ((XOR_MAX_BYTES < 4 || XOR_MAX_BYTES > 2048 || XOR_MAX_BYTES % 4 != 0)); then
@@ -50,7 +58,7 @@ for check_mode in "${XOR_GENERATION_CHECKS}" "${XOR_DISPATCH_FAILURE_CHECKS}" \
   fi
 done
 if [[ "${XOR_DISPATCH_FAILURE_CHECKS}" == "enforce" &&
-  ( -z "${XOR_PASSWORD}" || "${XOR_SCOPE}" != "wg-payload-full" || XOR_MAX_BYTES -lt 2048 ) ]]; then
+  ( "${XOR_ENABLED}" -eq 0 || "${XOR_SCOPE}" != "wg-payload-full" || XOR_MAX_BYTES -lt 2048 ) ]]; then
   echo "error: dispatch failure checks require full-payload XOR with max_bytes=2048" >&2
   exit 1
 fi
@@ -59,7 +67,7 @@ if [[ "${UDP_ZERO_CHECKSUM_CHECKS}" == "enforce" ]]; then
     echo "error: UDP zero-checksum checks require an IPv6 underlay" >&2
     exit 1
   fi
-  if [[ -n "${XOR_PASSWORD}" &&
+  if [[ "${XOR_ENABLED}" -eq 1 &&
     ( "${XOR_SCOPE}" != "wg-payload-full" || XOR_MAX_BYTES -lt 1968 ) ]]; then
     echo "error: XOR UDP zero-checksum checks require full-payload XOR with max_bytes>=1968" >&2
     exit 1
@@ -100,14 +108,14 @@ if [[ "${TCP_CHECKS}" == "enforce" ]]; then
 fi
 
 for cmd in \
-  awk cat chmod date dirname env find grep hostname ip mkdir mount mountpoint ping python3 \
-  realpath rm rmdir sed sleep stat sysctl tcpdump timeout umount wg; do
+  awk cat chmod date dirname env find grep hostname ip kill mkdir mount mountpoint ping python3 \
+  realpath rm rmdir sed sh sleep stat sysctl tcpdump timeout umount wg; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
     echo "error: missing command: ${cmd}" >&2
     exit 1
   fi
 done
-if [[ -n "${XOR_PASSWORD}" ]] && ! command -v bpftool >/dev/null 2>&1; then
+if ((XOR_ENABLED)) && ! command -v bpftool >/dev/null 2>&1; then
   echo "error: missing command: bpftool" >&2
   exit 1
 fi
@@ -118,6 +126,10 @@ fi
 
 if [[ ! -x "${BIN}" ]]; then
   echo "error: missing binary: ${BIN}" >&2
+  exit 1
+fi
+if [[ ! -f "${LIFECYCLE_HOLDER_HELPER}" || -L "${LIFECYCLE_HOLDER_HELPER}" ]]; then
+  echo "error: missing lifecycle holder helper: ${LIFECYCLE_HOLDER_HELPER}" >&2
   exit 1
 fi
 
@@ -144,14 +156,28 @@ VETH_RB="wmr${RUN_ID}b"
 TEST_ROOT="/run/wg-mix-ebpf-tests"
 RUN_BASE="${TEST_ROOT}/${RUN_ID}"
 BPFFS_DIR="${RUN_BASE}/bpffs"
+BPFFS_SOURCE="bpf"
+BPFFS_MOUNT_ID=""
+BPFFS_PARENT_DEV=""
+BPFFS_PARENT_INO=""
+PREEXISTING_MOUNT_IDS=""
 PINA="${BPFFS_DIR}/wg-mix-ebpf-a"
 PINB="${BPFFS_DIR}/wg-mix-ebpf-b"
+PIN_RESOURCE_KEY_A=""
+PIN_RESOURCE_KEY_B=""
+PIN_LOCK_ROOT="${RUN_BASE}/pin-locks"
+PIN_LOCK_A=""
+PIN_LOCK_B=""
+PIN_OWNER_ROOT="${RUN_BASE}/pin-owners"
+PIN_OWNER_A=""
+PIN_OWNER_B=""
 RUN_DIR_A="${RUN_BASE}/run-a"
 RUN_DIR_B="${RUN_BASE}/run-b"
 STATE_DIR_A="${RUN_BASE}/state-a"
 STATE_DIR_B="${RUN_BASE}/state-b"
 TMPDIR="${RUN_BASE}/evidence"
 SECRET_DIR="${RUN_BASE}/secrets"
+LIFECYCLE_LEASE="${RUN_BASE}/lifecycle.lease"
 OWNER_MARKER=".wg-mix-ebpf-test-owner"
 MANIFEST="${RUN_BASE}/manifest"
 OWNER_TOKEN="$(python3 - <<'PY'
@@ -159,12 +185,23 @@ import secrets
 print(secrets.token_hex(16))
 PY
 )"
+LIFECYCLE_HOLDER_STATUS="${TMPDIR}/lifecycle-holder-${OWNER_TOKEN}.status"
 BOOT_ID="$(< /proc/sys/kernel/random/boot_id)"
 HOST_ID="$(hostname)"
 UDP_ZERO_CHECKSUM_RECEIVER_PID=""
+AGENT_PID=""
 TCP_SERVER_PID=""
+TCP_CLIENT_PID=""
+PCAP_CHECKER_PID=""
+LIFECYCLE_HOLDER_PID=""
 TCPDUMP_RA=""
 TCPDUMP_RB=""
+NETNS_A_DEV=""
+NETNS_A_INO=""
+NETNS_R_DEV=""
+NETNS_R_INO=""
+NETNS_B_DEV=""
+NETNS_B_INO=""
 RUN_BASE_CREATED=0
 TEARDOWN_COMPLETE=0
 PHASE="preflight"
@@ -208,8 +245,10 @@ failure_report() {
   fi
   for pid_record in \
     "tcpdump-ra:${TCPDUMP_RA}" "tcpdump-rb:${TCPDUMP_RB}" \
+    "agent:${AGENT_PID}" "pcap-checker:${PCAP_CHECKER_PID}" \
+    "lifecycle-holder:${LIFECYCLE_HOLDER_PID}" \
     "udp-receiver:${UDP_ZERO_CHECKSUM_RECEIVER_PID}" \
-    "tcp-server:${TCP_SERVER_PID}"; do
+    "tcp-server:${TCP_SERVER_PID}" "tcp-client:${TCP_CLIENT_PID}"; do
     [[ "${pid_record#*:}" == "" ]] ||
       printf 'bounded background process left for timeout: %s\n' "${pid_record}" >&2
   done
@@ -270,16 +309,33 @@ marker_payload() {
 }
 
 manifest_payload() {
-  printf 'format=wg-mix-ebpf-test-manifest-v1\n'
+  printf 'format=wg-mix-ebpf-test-manifest-v2\n'
   printf 'run_id=%s\nowner_token=%s\nboot_id=%s\nhost=%s\n' \
     "${RUN_ID}" "${OWNER_TOKEN}" "${BOOT_ID}" "${HOST_ID}"
-  printf 'run_base=%s\nbpffs=%s\npin_a=%s\npin_b=%s\n' \
-    "${RUN_BASE}" "${BPFFS_DIR}" "${PINA}" "${PINB}"
-  printf 'netns_a=%s\nnetns_r=%s\nnetns_b=%s\n' "${NSA}" "${NSR}" "${NSB}"
-  printf 'run_dir_a=%s\nstate_dir_a=%s\nlease_a=%s\n' \
-    "${RUN_DIR_A}" "${STATE_DIR_A}" "${RUN_DIR_A}/daemon.lease"
-  printf 'run_dir_b=%s\nstate_dir_b=%s\nlease_b=%s\n' \
-    "${RUN_DIR_B}" "${STATE_DIR_B}" "${RUN_DIR_B}/daemon.lease"
+  printf 'run_base=%s\nbpffs=%s\nbpffs_source=%s\nbpffs_mount_id=%s\n' \
+    "${RUN_BASE}" "${BPFFS_DIR}" "${BPFFS_SOURCE}" "${BPFFS_MOUNT_ID}"
+  printf 'pin_parent_dev=%s\npin_parent_ino=%s\n' \
+    "${BPFFS_PARENT_DEV}" "${BPFFS_PARENT_INO}"
+  printf 'pin_resource_key_a=%s\npin_resource_key_b=%s\n' \
+    "${PIN_RESOURCE_KEY_A}" "${PIN_RESOURCE_KEY_B}"
+  printf 'pin_lock_root=%s\npin_lock_a=%s\npin_lock_b=%s\n' \
+    "${PIN_LOCK_ROOT}" "${PIN_LOCK_A}" "${PIN_LOCK_B}"
+  printf 'pin_owner_root=%s\npin_owner_a=%s\npin_owner_b=%s\n' \
+    "${PIN_OWNER_ROOT}" "${PIN_OWNER_A}" "${PIN_OWNER_B}"
+  printf 'role_a=a\npin_a=%s\nrole_b=b\npin_b=%s\n' "${PINA}" "${PINB}"
+  printf 'netns_a=%s\nnetns_a_dev=%s\nnetns_a_ino=%s\n' \
+    "${NSA}" "${NETNS_A_DEV}" "${NETNS_A_INO}"
+  printf 'netns_r=%s\nnetns_r_dev=%s\nnetns_r_ino=%s\n' \
+    "${NSR}" "${NETNS_R_DEV}" "${NETNS_R_INO}"
+  printf 'netns_b=%s\nnetns_b_dev=%s\nnetns_b_ino=%s\n' \
+    "${NSB}" "${NETNS_B_DEV}" "${NETNS_B_INO}"
+  printf 'run_dir_a=%s\nstate_dir_a=%s\nconfig_a=%s\nwg_config_a=%s\nunderlay_a=under0\n' \
+    "${RUN_DIR_A}" "${STATE_DIR_A}" "${SECRET_DIR}/agent-a.yaml" \
+    "${SECRET_DIR}/wg-a.conf"
+  printf 'run_dir_b=%s\nstate_dir_b=%s\nconfig_b=%s\nwg_config_b=%s\nunderlay_b=under0\n' \
+    "${RUN_DIR_B}" "${STATE_DIR_B}" "${SECRET_DIR}/agent-b.yaml" \
+    "${SECRET_DIR}/wg-b.conf"
+  printf 'lifecycle_lease=%s\n' "${LIFECYCLE_LEASE}"
   printf 'evidence=%s\nsecrets=%s\n' "${TMPDIR}" "${SECRET_DIR}"
 }
 
@@ -342,21 +398,209 @@ validate_manifest() {
   fi
 }
 
-validate_private_bpffs_mount() {
-  if ! mountpoint -q -- "${BPFFS_DIR}" ||
-    ! awk -v target="${BPFFS_DIR}" '
-      $5 == target {
-        for (i = 6; i <= NF; i++) {
-          if ($i == "-" && $(i + 1) == "bpf") {
-            found = 1
-          }
-        }
-      }
-      END { exit !found }
-    ' /proc/self/mountinfo; then
-    echo "error: expected private bpffs mount is missing or has the wrong type: ${BPFFS_DIR}" >&2
+inspect_private_bpffs_mount_id() {
+  local observed
+
+  if ! mountpoint -q -- "${BPFFS_DIR}"; then
+    echo "error: expected private bpffs mount is missing: ${BPFFS_DIR}" >&2
     return 1
   fi
+  if ! observed="$(awk \
+    -v target="${BPFFS_DIR}" \
+    -v expected_source="${BPFFS_SOURCE}" '
+      function separator_index(   index) {
+        for (index = 6; index <= NF; index++) {
+          if ($index == "-") {
+            return index
+          }
+        }
+        return 0
+      }
+      $5 == target {
+        target_count++
+        separator = separator_index()
+        if (separator == 0 || $4 != "/" ||
+            $(separator + 1) != "bpf" ||
+            $(separator + 2) != expected_source) {
+          invalid = 1
+        }
+        target_id = $1
+        target_device = $3
+        target_root = $4
+        target_source = $(separator + 2)
+      }
+      $5 != target {
+        separator = separator_index()
+        if (separator != 0 && $(separator + 1) == "bpf") {
+          other_bpf_count++
+          other_bpf_id[other_bpf_count] = $1
+          other_bpf_device[other_bpf_count] = $3
+          other_bpf_root[other_bpf_count] = $4
+        }
+      }
+      index($5, target "/") == 1 {
+        nested = 1
+      }
+      END {
+        if (target_count != 1 || invalid || nested) {
+          exit 1
+        }
+        for (index = 1; index <= other_bpf_count; index++) {
+          if (target_id == other_bpf_id[index] ||
+              (target_device == other_bpf_device[index] &&
+               target_root == other_bpf_root[index])) {
+            exit 1
+          }
+        }
+        print target_id
+      }
+    ' /proc/self/mountinfo)"; then
+    echo "error: private bpffs is not an independent exact bpf mount root: ${BPFFS_DIR}" >&2
+    return 1
+  fi
+  if [[ ! "${observed}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: invalid private bpffs mount ID: ${observed}" >&2
+    return 1
+  fi
+  if [[ " ${PREEXISTING_MOUNT_IDS} " == *" ${observed} "* ]]; then
+    echo "error: private bpffs mount ID was present before this run mounted bpffs: ${observed}" >&2
+    return 1
+  fi
+  printf '%s\n' "${observed}"
+}
+
+validate_private_bpffs_mount() {
+  local observed
+  local observed_device
+  local observed_inode
+
+  observed="$(inspect_private_bpffs_mount_id)" || return 1
+  if [[ -z "${BPFFS_MOUNT_ID}" || "${observed}" != "${BPFFS_MOUNT_ID}" ]]; then
+    echo "error: private bpffs mount ID changed: expected=${BPFFS_MOUNT_ID} observed=${observed}" >&2
+    return 1
+  fi
+  read -r observed_device observed_inode < <(
+    stat -Lc '%d %i' -- "${BPFFS_DIR}"
+  )
+  if [[ ! "${observed_device}" =~ ^[1-9][0-9]*$ ||
+    ! "${observed_inode}" =~ ^[1-9][0-9]*$ ||
+    "${observed_device}" != "${BPFFS_PARENT_DEV}" ||
+    "${observed_inode}" != "${BPFFS_PARENT_INO}" ]]; then
+    echo "error: private bpffs dev:ino changed: expected=${BPFFS_PARENT_DEV}:${BPFFS_PARENT_INO} observed=${observed_device}:${observed_inode}" >&2
+    return 1
+  fi
+}
+
+pin_resource_key() {
+  local parent_device="$1"
+  local parent_inode="$2"
+  local pin_path="$3"
+
+  env -u XOR_PASSWORD python3 - \
+    "${parent_device}" "${parent_inode}" "${pin_path}" <<'PY'
+import hashlib
+import pathlib
+import re
+import sys
+
+parent_device, parent_inode, pin_path = sys.argv[1:]
+for label, value in (
+    ("parent device", parent_device),
+    ("parent inode", parent_inode),
+):
+    if not re.fullmatch(r"[1-9][0-9]*", value):
+        raise SystemExit(f"invalid canonical {label}: {value!r}")
+basename = pathlib.PurePosixPath(pin_path).name
+if (
+    basename in ("", ".", "..")
+    or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,254}", basename)
+):
+    raise SystemExit(f"invalid pin basename: {basename!r}")
+canonical = (
+    f"wg-mix-ebpf-pin-v1:{parent_device}:{parent_inode}:{basename}"
+)
+print(hashlib.sha256(canonical.encode("ascii")).hexdigest())
+PY
+}
+
+assert_process_environment_secret_free() {
+  local pid="$1"
+  local label="$2"
+  local secret_path=""
+
+  if ((XOR_ENABLED)); then
+    secret_path="${SECRET_DIR}/xor-password"
+  fi
+  env -u XOR_PASSWORD python3 - "${pid}" "${label}" "${secret_path}" <<'PY'
+import pathlib
+import sys
+import time
+
+root_pid = int(sys.argv[1])
+label = sys.argv[2]
+secret_path = sys.argv[3]
+secret = b""
+if secret_path:
+    secret = pathlib.Path(secret_path).read_bytes().rstrip(b"\n")
+    if not secret:
+        raise SystemExit(f"{label}: XOR secret file is empty")
+
+deadline = time.monotonic() + 2.0
+descendants = set()
+while time.monotonic() < deadline and not descendants:
+    pending = [root_pid]
+    pass_seen = set()
+    root_alive = False
+    while pending:
+        pid = pending.pop()
+        if pid in pass_seen:
+            continue
+        pass_seen.add(pid)
+        proc = pathlib.Path("/proc") / str(pid)
+        try:
+            environ = (proc / "environ").read_bytes()
+        except FileNotFoundError:
+            continue
+        if pid == root_pid:
+            root_alive = True
+        else:
+            descendants.add(pid)
+        entries = environ.split(b"\0")
+        if any(entry.startswith(b"XOR_PASSWORD=") for entry in entries):
+            raise SystemExit(f"{label}: pid {pid} inherited XOR_PASSWORD")
+        values = [
+            entry.partition(b"=")[2]
+            for entry in entries
+            if b"=" in entry
+        ]
+        if secret and any(
+            value == secret or (len(secret) >= 16 and secret in value)
+            for value in values
+        ):
+            raise SystemExit(
+                f"{label}: pid {pid} inherited the XOR secret in its environment"
+            )
+        try:
+            children = (proc / "task" / str(pid) / "children").read_text(
+                encoding="ascii"
+            )
+        except FileNotFoundError:
+            continue
+        child_pids = [int(child) for child in children.split()]
+        pending.extend(child_pids)
+    if descendants:
+        break
+    if not root_alive:
+        raise SystemExit(
+            f"{label}: process {root_pid} exited before a descendant was audited"
+        )
+    time.sleep(0.01)
+
+if not descendants:
+    raise SystemExit(
+        f"{label}: no actual descendant observed within the environment-audit window"
+    )
+PY
 }
 
 netns_exists() {
@@ -400,7 +644,8 @@ fi
 mkdir -m 0700 -- "${RUN_BASE}"
 RUN_BASE_CREATED=1
 for dir in "${RUN_DIR_A}" "${RUN_DIR_B}" "${STATE_DIR_A}" "${STATE_DIR_B}" \
-  "${TMPDIR}" "${SECRET_DIR}" "${BPFFS_DIR}"; do
+  "${TMPDIR}" "${SECRET_DIR}" "${BPFFS_DIR}" "${PIN_LOCK_ROOT}" \
+  "${PIN_OWNER_ROOT}"; do
   validate_owned_path "${dir}"
   mkdir -m 0700 -- "${dir}"
 done
@@ -411,15 +656,65 @@ write_marker "${STATE_DIR_A}" state-a
 write_marker "${STATE_DIR_B}" state-b
 write_marker "${TMPDIR}" evidence
 write_marker "${SECRET_DIR}" secrets
-(set -o noclobber; manifest_payload >"${MANIFEST}")
-chmod 0600 "${MANIFEST}"
+write_marker "${PIN_LOCK_ROOT}" pin-locks
+write_marker "${PIN_OWNER_ROOT}" pin-owners
+if ((XOR_ENABLED)); then
+  (set -o noclobber; printf '%s\n' "${XOR_SECRET}" >"${SECRET_DIR}/xor-password")
+  chmod 0600 "${SECRET_DIR}/xor-password"
+fi
+unset XOR_SECRET
 
 PHASE="mount-private-bpffs"
 if mountpoint -q -- "${BPFFS_DIR}"; then
   echo "error: unexpected mount already exists at ${BPFFS_DIR}" >&2
   exit 1
 fi
-mount -t bpf -o nosuid,nodev,noexec,mode=0700 "wg-mix-ebpf-${RUN_ID}" "${BPFFS_DIR}"
+PREEXISTING_MOUNT_IDS="$(awk '
+  {
+    if ($1 !~ /^[1-9][0-9]*$/) {
+      exit 1
+    }
+    printf "%s%s", separator, $1
+    separator = " "
+  }
+  END {
+    print ""
+  }
+' /proc/self/mountinfo)"
+mount -t bpf -o nosuid,nodev,noexec,mode=0700 "${BPFFS_SOURCE}" "${BPFFS_DIR}"
+BPFFS_MOUNT_ID="$(inspect_private_bpffs_mount_id)"
+read -r BPFFS_PARENT_DEV BPFFS_PARENT_INO < <(
+  stat -Lc '%d %i' -- "${BPFFS_DIR}"
+)
+for identity_part in "${BPFFS_PARENT_DEV}" "${BPFFS_PARENT_INO}"; do
+  if [[ ! "${identity_part}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: invalid private bpffs identity component: ${identity_part}" >&2
+    exit 1
+  fi
+done
+PIN_RESOURCE_KEY_A="$(
+  pin_resource_key "${BPFFS_PARENT_DEV}" "${BPFFS_PARENT_INO}" "${PINA}"
+)"
+PIN_RESOURCE_KEY_B="$(
+  pin_resource_key "${BPFFS_PARENT_DEV}" "${BPFFS_PARENT_INO}" "${PINB}"
+)"
+for resource_key in "${PIN_RESOURCE_KEY_A}" "${PIN_RESOURCE_KEY_B}"; do
+  if [[ ! "${resource_key}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "error: invalid pin resource key: ${resource_key}" >&2
+    exit 1
+  fi
+done
+if [[ "${PIN_RESOURCE_KEY_A}" == "${PIN_RESOURCE_KEY_B}" ]]; then
+  echo "error: isolated pins unexpectedly share a resource key" >&2
+  exit 1
+fi
+PIN_LOCK_A="${PIN_LOCK_ROOT}/${PIN_RESOURCE_KEY_A}.lock"
+PIN_LOCK_B="${PIN_LOCK_ROOT}/${PIN_RESOURCE_KEY_B}.lock"
+PIN_OWNER_A="${PIN_OWNER_ROOT}/${PIN_RESOURCE_KEY_A}.owner.json"
+PIN_OWNER_B="${PIN_OWNER_ROOT}/${PIN_RESOURCE_KEY_B}.owner.json"
+for owned_path in "${PIN_LOCK_A}" "${PIN_LOCK_B}" "${PIN_OWNER_A}" "${PIN_OWNER_B}"; do
+  validate_owned_path "${owned_path}"
+done
 validate_private_bpffs_mount
 
 run_agent_in_netns() {
@@ -455,6 +750,9 @@ run_agent_in_netns() {
   validate_owned_path "${pin}" || return 1
   validate_marker "${run_dir}" "run-${ns: -1}" || return 1
   validate_marker "${state_dir}" "state-${ns: -1}" || return 1
+  validate_marker "${PIN_LOCK_ROOT}" pin-locks || return 1
+  validate_marker "${PIN_OWNER_ROOT}" pin-owners || return 1
+  validate_manifest || return 1
   validate_private_bpffs_mount || return 1
   case "${1:-}" in
     reload | detach) isolated_args=(--isolated-netns-test) ;;
@@ -464,13 +762,19 @@ run_agent_in_netns() {
   printf '%q ' "${BIN}" "$@" "${isolated_args[@]}" \
     --run-dir "${run_dir}" --state-dir "${state_dir}" >&2
   printf '\n' >&2
-  if ip netns exec "${ns}" env "WG_MIX_EBPF_PIN_PATH=${pin}" \
+  env -u XOR_PASSWORD timeout -s TERM -k 2 60 \
+    sh -c 'sleep 0.2; exec "$@"' sh \
+    ip netns exec "${ns}" env -u XOR_PASSWORD "WG_MIX_EBPF_PIN_PATH=${pin}" \
     "${BIN}" "$@" "${isolated_args[@]}" \
-    --run-dir "${run_dir}" --state-dir "${state_dir}"; then
+    --run-dir "${run_dir}" --state-dir "${state_dir}" &
+  AGENT_PID=$!
+  assert_process_environment_secret_free "${AGENT_PID}" "agent-${ns}" || return 1
+  if wait "${AGENT_PID}"; then
     status=0
   else
     status=$?
   fi
+  AGENT_PID=""
   printf 'agent finish: timestamp=%s netns=%s exit=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${ns}" "${status}" >&2
   return "${status}"
@@ -516,6 +820,233 @@ remove_owned_file() {
   teardown_step "remove exact file ${path}" rm -- "${path}"
 }
 
+validate_released_pin_lock() {
+  local path="$1"
+  local pin="$2"
+  local resource_key="$3"
+
+  validate_owned_path "${PIN_LOCK_ROOT}" || return 1
+  validate_owned_path "${path}" || return 1
+  if [[ "$(dirname "${path}")" != "${PIN_LOCK_ROOT}" ||
+    "${path}" != "${PIN_LOCK_ROOT}/${resource_key}.lock" ||
+    ! "${resource_key}" =~ ^[0-9a-f]{64}$ ||
+    ! -d "${PIN_LOCK_ROOT}" || -L "${PIN_LOCK_ROOT}" ||
+    "$(stat -c '%u' -- "${PIN_LOCK_ROOT}")" != "${EUID}" ||
+    "$(stat -c '%a' -- "${PIN_LOCK_ROOT}")" != "700" ||
+    ! -f "${path}" || -L "${path}" ||
+    "$(stat -c '%u' -- "${path}")" != "${EUID}" ||
+    "$(stat -c '%a' -- "${path}")" != "600" ||
+    "$(stat -c '%h' -- "${path}")" != "1" ]]; then
+    echo "error: invalid isolated pin lock path: ${path}" >&2
+    return 1
+  fi
+  env -u XOR_PASSWORD python3 - \
+    "${path}" "${pin}" "${resource_key}" \
+    "${BPFFS_PARENT_DEV}" "${BPFFS_PARENT_INO}" <<'PY'
+import errno
+import fcntl
+import json
+import os
+import pathlib
+import re
+import stat
+import sys
+
+path, expected_pin, expected_key, expected_device, expected_inode = sys.argv[1:]
+fd = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+try:
+    metadata = os.fstat(fd)
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+        or metadata.st_nlink != 1
+        or metadata.st_size <= 0
+        or metadata.st_size > 64 * 1024
+    ):
+        raise SystemExit(f"{path}: unsafe pin-lock metadata")
+    raw = os.read(fd, metadata.st_size + 1)
+    if len(raw) != metadata.st_size:
+        raise SystemExit(f"{path}: short pin-lock owner read")
+    if (
+        not raw.endswith(b"\n")
+        or raw.count(b"\n") != 1
+        or b"\0" in raw
+        or b"\r" in raw
+    ):
+        raise SystemExit(f"{path}: pin-lock owner is not one JSON line plus LF")
+    owner = json.loads(raw[:-1].decode("utf-8"))
+    if set(owner) != {
+        "version",
+        "pid",
+        "action",
+        "resource_key",
+        "parent_device",
+        "parent_inode",
+        "pin_basename",
+        "pin_path",
+    }:
+        raise SystemExit(f"{path}: unexpected pin-lock owner keys")
+    if (
+        type(owner["version"]) is not int
+        or owner["version"] != 2
+        or type(owner["pid"]) is not int
+        or owner["pid"] <= 0
+        or owner["action"] != "detach"
+        or not re.fullmatch(r"[0-9a-f]{64}", owner["resource_key"])
+        or owner["resource_key"] != expected_key
+        or type(owner["parent_device"]) is not int
+        or owner["parent_device"] != int(expected_device)
+        or type(owner["parent_inode"]) is not int
+        or owner["parent_inode"] != int(expected_inode)
+        or owner["pin_basename"] != pathlib.PurePosixPath(expected_pin).name
+        or owner["pin_path"] != expected_pin
+    ):
+        raise SystemExit(f"{path}: pin-lock owner mismatch: {owner!r}")
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        if exc.errno in (errno.EACCES, errno.EAGAIN):
+            raise SystemExit(f"{path}: pin lock is still held") from exc
+        raise
+    fcntl.flock(fd, fcntl.LOCK_UN)
+finally:
+    os.close(fd)
+PY
+}
+
+validate_pin_owner_absent() {
+  local path="$1"
+  local resource_key="$2"
+
+  validate_owned_path "${PIN_OWNER_ROOT}" || return 1
+  validate_owned_path "${path}" || return 1
+  validate_marker "${PIN_OWNER_ROOT}" pin-owners || return 1
+  if [[ "$(dirname "${path}")" != "${PIN_OWNER_ROOT}" ||
+    "${path}" != "${PIN_OWNER_ROOT}/${resource_key}.owner.json" ||
+    ! "${resource_key}" =~ ^[0-9a-f]{64}$ ]]; then
+    echo "error: invalid isolated pin owner path: ${path}" >&2
+    return 1
+  fi
+  if [[ -e "${path}" || -L "${path}" ]]; then
+    echo "error: pin owner record remains after successful detach: ${path}" >&2
+    return 1
+  fi
+}
+
+validate_directory_only_has_owner_marker() {
+  local path="$1"
+  local role="$2"
+  local unexpected
+
+  validate_marker "${path}" "${role}" || return 1
+  if ! unexpected="$(
+    find "${path}" -xdev -mindepth 1 -maxdepth 1 \
+      ! -path "${path}/${OWNER_MARKER}" -print -quit
+  )"; then
+    echo "error: could not inspect isolated resource root: ${path}" >&2
+    return 1
+  fi
+  if [[ -n "${unexpected}" ]]; then
+    echo "error: unexpected entry remains in isolated resource root: ${unexpected}" >&2
+    return 1
+  fi
+}
+
+validate_lifecycle_holder_status() {
+  local state="$1"
+  local expected
+  local actual
+
+  validate_owned_path "${LIFECYCLE_HOLDER_STATUS}" || return 1
+  if [[ -z "${LIFECYCLE_HOLDER_PID}" ||
+    "$(dirname "${LIFECYCLE_HOLDER_STATUS}")" != "${TMPDIR}" ||
+    ! -f "${LIFECYCLE_HOLDER_STATUS}" || -L "${LIFECYCLE_HOLDER_STATUS}" ||
+    "$(stat -c '%u' -- "${LIFECYCLE_HOLDER_STATUS}")" != "${EUID}" ||
+    "$(stat -c '%a' -- "${LIFECYCLE_HOLDER_STATUS}")" != "600" ||
+    "$(stat -c '%h' -- "${LIFECYCLE_HOLDER_STATUS}")" != "1" ]]; then
+    echo "error: invalid lifecycle holder status file" >&2
+    return 1
+  fi
+  expected="${state} ${LIFECYCLE_HOLDER_PID} ${OWNER_TOKEN}"
+  actual="$(<"${LIFECYCLE_HOLDER_STATUS}")"
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "error: lifecycle holder status mismatch: ${actual}" >&2
+    return 1
+  fi
+}
+
+start_lifecycle_hold() {
+  local attempt
+  local holder_status=0
+
+  if [[ -n "${LIFECYCLE_HOLDER_PID}" ||
+    -e "${LIFECYCLE_HOLDER_STATUS}" ||
+    -L "${LIFECYCLE_HOLDER_STATUS}" ]]; then
+    echo "error: lifecycle holder is already tracked" >&2
+    return 1
+  fi
+  validate_marker "${RUN_BASE}" root || return 1
+  validate_marker "${TMPDIR}" evidence || return 1
+  validate_manifest || return 1
+  env -u XOR_PASSWORD python3 "${LIFECYCLE_HOLDER_HELPER}" \
+    --lease "${LIFECYCLE_LEASE}" \
+    --manifest "${MANIFEST}" \
+    --run-base "${RUN_BASE}" \
+    --run-id "${RUN_ID}" \
+    --owner-token "${OWNER_TOKEN}" \
+    --boot-id "${BOOT_ID}" \
+    --expected-config "${SECRET_DIR}/agent-b.yaml" \
+    --expected-run-dir "${RUN_DIR_B}" \
+    --expected-uid "${EUID}" \
+    --status-path "${LIFECYCLE_HOLDER_STATUS}" \
+    --parent-pid "$$" &
+  LIFECYCLE_HOLDER_PID=$!
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    if [[ -e "${LIFECYCLE_HOLDER_STATUS}" ]]; then
+      validate_lifecycle_holder_status READY || return 1
+      printf 'lifecycle teardown hold acquired: pid=%s lease=%s\n' \
+        "${LIFECYCLE_HOLDER_PID}" "${LIFECYCLE_LEASE}"
+      return 0
+    fi
+    if ! kill -0 "${LIFECYCLE_HOLDER_PID}" >/dev/null 2>&1; then
+      if wait "${LIFECYCLE_HOLDER_PID}"; then
+        holder_status=0
+      else
+        holder_status=$?
+      fi
+      echo "error: lifecycle holder exited before readiness (${holder_status}); cleanup is forbidden" >&2
+      return 1
+    fi
+    sleep 0.1
+  done
+  echo "error: lifecycle holder did not become ready; cleanup is forbidden" >&2
+  return 1
+}
+
+release_lifecycle_hold() {
+  local holder_status=0
+
+  validate_lifecycle_holder_status READY || return 1
+  if ! kill -USR1 "${LIFECYCLE_HOLDER_PID}"; then
+    echo "error: could not authorize lifecycle holder release" >&2
+    return 1
+  fi
+  if wait "${LIFECYCLE_HOLDER_PID}"; then
+    holder_status=0
+  else
+    holder_status=$?
+  fi
+  if ((holder_status != 0)); then
+    echo "error: lifecycle holder exited with status ${holder_status}" >&2
+    return "${holder_status}"
+  fi
+  validate_lifecycle_holder_status RELEASED || return 1
+  printf 'lifecycle teardown hold released: lease=%s\n' "${LIFECYCLE_LEASE}"
+  remove_owned_file "${LIFECYCLE_HOLDER_STATUS}" || return 1
+  LIFECYCLE_HOLDER_PID=""
+}
+
 explicit_teardown() {
   local entry
 
@@ -527,10 +1058,15 @@ explicit_teardown() {
   validate_marker "${STATE_DIR_B}" state-b || return 1
   validate_marker "${TMPDIR}" evidence || return 1
   validate_marker "${SECRET_DIR}" secrets || return 1
+  validate_marker "${PIN_LOCK_ROOT}" pin-locks || return 1
+  validate_marker "${PIN_OWNER_ROOT}" pin-owners || return 1
   validate_manifest || return 1
   validate_private_bpffs_mount || return 1
-  if [[ -n "${TCPDUMP_RA}" || -n "${TCPDUMP_RB}" ||
-    -n "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" || -n "${TCP_SERVER_PID}" ]]; then
+  if [[ -n "${AGENT_PID}" || -n "${PCAP_CHECKER_PID}" ||
+    -n "${LIFECYCLE_HOLDER_PID}" ||
+    -n "${TCPDUMP_RA}" || -n "${TCPDUMP_RB}" ||
+    -n "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" || -n "${TCP_SERVER_PID}" ||
+    -n "${TCP_CLIENT_PID}" ]]; then
     echo "error: refusing teardown while a bounded background process is still tracked" >&2
     return 1
   fi
@@ -550,6 +1086,23 @@ explicit_teardown() {
   teardown_step "detach agent B pin=${PINB}" \
     run_agent_in_netns "${NSB}" "${PINB}" detach \
     --config "${SECRET_DIR}/agent-b.yaml" || return 1
+  start_lifecycle_hold || return 1
+  validate_pin_owner_absent "${PIN_OWNER_A}" "${PIN_RESOURCE_KEY_A}" || return 1
+  validate_pin_owner_absent "${PIN_OWNER_B}" "${PIN_RESOURCE_KEY_B}" || return 1
+  validate_released_pin_lock \
+    "${PIN_LOCK_A}" "${PINA}" "${PIN_RESOURCE_KEY_A}" || return 1
+  validate_released_pin_lock \
+    "${PIN_LOCK_B}" "${PINB}" "${PIN_RESOURCE_KEY_B}" || return 1
+  remove_owned_file "${PIN_LOCK_A}" || return 1
+  remove_owned_file "${PIN_LOCK_B}" || return 1
+  validate_directory_only_has_owner_marker "${PIN_LOCK_ROOT}" pin-locks || return 1
+  remove_owned_file "${PIN_LOCK_ROOT}/${OWNER_MARKER}" || return 1
+  teardown_step "remove empty isolated pin lock root ${PIN_LOCK_ROOT}" \
+    rmdir -- "${PIN_LOCK_ROOT}" || return 1
+  validate_directory_only_has_owner_marker "${PIN_OWNER_ROOT}" pin-owners || return 1
+  remove_owned_file "${PIN_OWNER_ROOT}/${OWNER_MARKER}" || return 1
+  teardown_step "remove empty isolated pin owner root ${PIN_OWNER_ROOT}" \
+    rmdir -- "${PIN_OWNER_ROOT}" || return 1
 
   if ! entry="$(find "${BPFFS_DIR}" -xdev -mindepth 1 -print -quit)"; then
     echo "error: could not inspect private bpffs before unmount" >&2
@@ -567,7 +1120,7 @@ explicit_teardown() {
     "${SECRET_DIR}/agent-a.yaml" "${SECRET_DIR}/agent-b.yaml"; do
     remove_owned_file "${secret_file}" || return 1
   done
-  if [[ -n "${XOR_PASSWORD}" ]]; then
+  if ((XOR_ENABLED)); then
     remove_owned_file "${SECRET_DIR}/xor-password" || return 1
   fi
   remove_owned_file "${SECRET_DIR}/${OWNER_MARKER}" || return 1
@@ -585,8 +1138,7 @@ explicit_teardown() {
 
   remove_owned_file "${RUN_DIR_A}/lock" || return 1
   remove_owned_file "${RUN_DIR_B}/lock" || return 1
-  remove_owned_file "${RUN_DIR_A}/daemon.lease" || return 1
-  remove_owned_file "${RUN_DIR_B}/daemon.lease" || return 1
+  remove_owned_file "${LIFECYCLE_LEASE}" || return 1
   remove_owned_file "${RUN_DIR_A}/${OWNER_MARKER}" || return 1
   remove_owned_file "${RUN_DIR_B}/${OWNER_MARKER}" || return 1
   remove_owned_file "${STATE_DIR_A}/${OWNER_MARKER}" || return 1
@@ -600,6 +1152,7 @@ explicit_teardown() {
   teardown_step "remove empty state dir B ${STATE_DIR_B}" \
     rmdir -- "${STATE_DIR_B}" || return 1
 
+  release_lifecycle_hold || return 1
   printf 'test evidence intentionally retained at %s\n' "${TMPDIR}"
   printf 'manifest intentionally retained at %s\n' "${MANIFEST}"
   printf 'sensitive recovery material removed from %s\n' "${SECRET_DIR}"
@@ -612,7 +1165,7 @@ make_agent_config() {
   local wg_config="$3"
   local cipher_ref=""
   local cipher_block=""
-  if [[ -n "${XOR_PASSWORD}" ]]; then
+  if ((XOR_ENABLED)); then
     cipher_ref="    cipher: xor-home"
     cipher_block="
 ciphers:
@@ -696,7 +1249,7 @@ large_ping() {
 exercise_tunnel() {
   wait_ping "${NSA}" 10.77.0.2
   wait_ping "${NSB}" 10.77.0.1
-  if [[ -n "${XOR_PASSWORD}" && "${XOR_SCOPE}" == "wg-payload-full" &&
+  if [[ "${XOR_ENABLED}" -eq 1 && "${XOR_SCOPE}" == "wg-payload-full" &&
     "${XOR_MAX_BYTES}" -ge 2048 ]]; then
     large_ping "${NSA}" 10.77.0.2
     large_ping "${NSB}" 10.77.0.1
@@ -775,7 +1328,8 @@ assert_stat_unchanged() {
 }
 
 tcp_server_listening() {
-  ip netns exec "${NSB}" python3 - "${TCP_PORT}" <<'PY'
+  env -u XOR_PASSWORD ip netns exec "${NSB}" env -u XOR_PASSWORD \
+    python3 - "${TCP_PORT}" <<'PY'
 import pathlib
 import sys
 
@@ -807,10 +1361,13 @@ exercise_tcp_run() {
   local ready=0
   local attempt
 
-  timeout -s TERM -k 2 "$((TCP_DURATION + 15))" \
-    ip netns exec "${NSB}" iperf3 -s -1 -p "${TCP_PORT}" -J \
+  env -u XOR_PASSWORD timeout -s TERM -k 2 "$((TCP_DURATION + 15))" \
+    sh -c 'sleep 0.2; exec "$@"' sh \
+    ip netns exec "${NSB}" env -u XOR_PASSWORD \
+    iperf3 -s -1 -p "${TCP_PORT}" -J \
     >"${server_path}" 2>"${server_log}" &
   TCP_SERVER_PID=$!
+  assert_process_environment_secret_free "${TCP_SERVER_PID}" "iperf3-server-${label}"
 
   for ((attempt = 0; attempt < 50; attempt++)); do
     if tcp_server_listening; then
@@ -829,14 +1386,20 @@ exercise_tcp_run() {
     return 1
   fi
 
-  if timeout -s TERM -k 2 "$((TCP_DURATION + 15))" \
-    ip netns exec "${NSA}" iperf3 -c 10.77.0.2 -p "${TCP_PORT}" \
+  env -u XOR_PASSWORD timeout -s TERM -k 2 "$((TCP_DURATION + 15))" \
+    sh -c 'sleep 0.2; exec "$@"' sh \
+    ip netns exec "${NSA}" env -u XOR_PASSWORD \
+    iperf3 -c 10.77.0.2 -p "${TCP_PORT}" \
     -t "${TCP_DURATION}" -P "${streams}" -J \
-    >"${client_path}" 2>"${client_log}"; then
+    >"${client_path}" 2>"${client_log}" &
+  TCP_CLIENT_PID=$!
+  assert_process_environment_secret_free "${TCP_CLIENT_PID}" "iperf3-client-${label}"
+  if wait "${TCP_CLIENT_PID}"; then
     client_status=0
   else
     client_status=$?
   fi
+  TCP_CLIENT_PID=""
 
   if ((client_status != 0)); then
     echo "error: iperf3 client failed for ${label} (${client_status})" >&2
@@ -859,7 +1422,8 @@ exercise_tcp_run() {
     return "${server_status}"
   fi
 
-  python3 - "${client_path}" "${streams}" "${TCP_MIN_BYTES}" "${mtu}" <<'PY'
+  env -u XOR_PASSWORD python3 - \
+    "${client_path}" "${streams}" "${TCP_MIN_BYTES}" "${mtu}" <<'PY'
 import json
 import sys
 
@@ -945,7 +1509,7 @@ exercise_tcp_matrix() {
       done
       assert_stat_increased "${before_path}" "${after_path}" egress_rewrite_ok
       assert_stat_increased "${before_path}" "${after_path}" ingress_rewrite_ok
-      if [[ -n "${XOR_PASSWORD}" ]]; then
+      if ((XOR_ENABLED)); then
         assert_stat_increased "${before_path}" "${after_path}" xor_egress_ok
         assert_stat_increased "${before_path}" "${after_path}" xor_ingress_ok
       fi
@@ -975,7 +1539,9 @@ exercise_udp_zero_checksum() {
     return 1
   fi
 
-  timeout -s TERM -k 2 10 ip netns exec "${NSB}" python3 - \
+  env -u XOR_PASSWORD timeout -s TERM -k 2 10 \
+    sh -c 'sleep 0.2; exec "$@"' sh \
+    ip netns exec "${NSB}" env -u XOR_PASSWORD python3 - \
     "${A_UNDER}" "${B_UNDER}" "${ready_path}" >"${TMPDIR}/udp-zero-checksum-receiver.out" \
     2>"${receiver_log}" <<'PY' &
 import socket
@@ -1006,6 +1572,8 @@ while True:
         )
 PY
   UDP_ZERO_CHECKSUM_RECEIVER_PID=$!
+  assert_process_environment_secret_free \
+    "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" "udp-zero-checksum-receiver"
 
   for ((attempt = 0; attempt < 50; attempt++)); do
     if [[ -e "${ready_path}" ]]; then
@@ -1023,7 +1591,8 @@ PY
     return 1
   fi
 
-  timeout -s TERM -k 2 5 ip netns exec "${NSA}" python3 - \
+  env -u XOR_PASSWORD timeout -s TERM -k 2 5 \
+    ip netns exec "${NSA}" env -u XOR_PASSWORD python3 - \
     "${A_UNDER}" "${B_UNDER}" "${gateway_mac}" <<'PY'
 import ipaddress
 import socket
@@ -1100,7 +1669,7 @@ PY
     "${TMPDIR}/status-a-zero-after.json" egress_rewrite_ok
   assert_stat_increased "${TMPDIR}/status-b-zero-before.json" \
     "${TMPDIR}/status-b-zero-after.json" ingress_rewrite_ok
-  if [[ -n "${XOR_PASSWORD}" ]]; then
+  if ((XOR_ENABLED)); then
     assert_stat_increased "${TMPDIR}/status-a-zero-before.json" \
       "${TMPDIR}/status-a-zero-after.json" xor_egress_ok
     assert_stat_increased "${TMPDIR}/status-b-zero-before.json" \
@@ -1171,6 +1740,24 @@ PHASE="network-test-setup"
 ip netns add "${NSA}"
 ip netns add "${NSR}"
 ip netns add "${NSB}"
+read -r NETNS_A_DEV NETNS_A_INO < <(stat -Lc '%d %i' -- "/run/netns/${NSA}")
+read -r NETNS_R_DEV NETNS_R_INO < <(stat -Lc '%d %i' -- "/run/netns/${NSR}")
+read -r NETNS_B_DEV NETNS_B_INO < <(stat -Lc '%d %i' -- "/run/netns/${NSB}")
+for identity_part in \
+  "${NETNS_A_DEV}" "${NETNS_A_INO}" \
+  "${NETNS_R_DEV}" "${NETNS_R_INO}" \
+  "${NETNS_B_DEV}" "${NETNS_B_INO}"; do
+  if [[ ! "${identity_part}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: invalid network namespace identity component: ${identity_part}" >&2
+    exit 1
+  fi
+done
+if [[ "${NETNS_A_DEV}:${NETNS_A_INO}" == "${NETNS_R_DEV}:${NETNS_R_INO}" ||
+  "${NETNS_A_DEV}:${NETNS_A_INO}" == "${NETNS_B_DEV}:${NETNS_B_INO}" ||
+  "${NETNS_R_DEV}:${NETNS_R_INO}" == "${NETNS_B_DEV}:${NETNS_B_INO}" ]]; then
+  echo "error: network namespace identities are not unique" >&2
+  exit 1
+fi
 
 ip link add "${VETH_A}" type veth peer name "${VETH_RA}"
 ip link add "${VETH_B}" type veth peer name "${VETH_RB}"
@@ -1234,10 +1821,6 @@ wg pubkey <"${SECRET_DIR}/a.key" >"${SECRET_DIR}/a.pub"
 wg genkey >"${SECRET_DIR}/b.key"
 wg pubkey <"${SECRET_DIR}/b.key" >"${SECRET_DIR}/b.pub"
 chmod 0600 "${SECRET_DIR}/a.key" "${SECRET_DIR}/b.key"
-if [[ -n "${XOR_PASSWORD}" ]]; then
-  printf '%s\n' "${XOR_PASSWORD}" >"${SECRET_DIR}/xor-password"
-  chmod 0600 "${SECRET_DIR}/xor-password"
-fi
 
 A_PUB="$(cat "${SECRET_DIR}/a.pub")"
 B_PUB="$(cat "${SECRET_DIR}/b.pub")"
@@ -1260,6 +1843,15 @@ make_wg_config_stub "${SECRET_DIR}/wg-b.conf" 31002 0x10000002
 make_agent_config "${SECRET_DIR}/agent-a.yaml" under0 "${SECRET_DIR}/wg-a.conf"
 make_agent_config "${SECRET_DIR}/agent-b.yaml" under0 "${SECRET_DIR}/wg-b.conf"
 
+PHASE="seal-run-contract"
+(set -o noclobber; manifest_payload >"${MANIFEST}")
+chmod 0600 "${MANIFEST}"
+validate_marker "${RUN_BASE}" root
+validate_marker "${PIN_LOCK_ROOT}" pin-locks
+validate_marker "${PIN_OWNER_ROOT}" pin-owners
+validate_manifest
+validate_private_bpffs_mount
+
 PHASE="test-execution"
 run_agent_in_netns "${NSA}" "${PINA}" reload --config "${SECRET_DIR}/agent-a.yaml"
 run_agent_in_netns "${NSB}" "${PINB}" reload --config "${SECRET_DIR}/agent-b.yaml"
@@ -1267,20 +1859,30 @@ run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yam
 run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" >"${TMPDIR}/status-b-before.json"
 assert_generation "${TMPDIR}/status-a-before.json" 1
 assert_generation "${TMPDIR}/status-b-before.json" 1
-if [[ -n "${XOR_PASSWORD}" ]]; then
+if ((XOR_ENABLED)); then
   assert_tail_bank "${PINA}" "${TMPDIR}/status-a-before.json"
   assert_tail_bank "${PINB}" "${TMPDIR}/status-b-before.json"
 fi
 
-timeout -s INT -k 2 30 ip netns exec "${NSR}" tcpdump -i ra0 -w "${TMPDIR}/ra.pcap" udp >/dev/null 2>"${TMPDIR}/tcpdump-ra.log" &
+env -u XOR_PASSWORD timeout -s INT -k 2 30 \
+  sh -c 'sleep 0.2; exec "$@"' sh \
+  ip netns exec "${NSR}" env -u XOR_PASSWORD \
+  tcpdump -i ra0 -w "${TMPDIR}/ra.pcap" udp \
+  >/dev/null 2>"${TMPDIR}/tcpdump-ra.log" &
 TCPDUMP_RA=$!
-timeout -s INT -k 2 30 ip netns exec "${NSR}" tcpdump -i rb0 -w "${TMPDIR}/rb.pcap" udp >/dev/null 2>"${TMPDIR}/tcpdump-rb.log" &
+assert_process_environment_secret_free "${TCPDUMP_RA}" "tcpdump-ra"
+env -u XOR_PASSWORD timeout -s INT -k 2 30 \
+  sh -c 'sleep 0.2; exec "$@"' sh \
+  ip netns exec "${NSR}" env -u XOR_PASSWORD \
+  tcpdump -i rb0 -w "${TMPDIR}/rb.pcap" udp \
+  >/dev/null 2>"${TMPDIR}/tcpdump-rb.log" &
 TCPDUMP_RB=$!
+assert_process_environment_secret_free "${TCPDUMP_RB}" "tcpdump-rb"
 sleep 1
 
 exercise_tunnel
 
-if [[ -n "${XOR_PASSWORD}" && "${XOR_GENERATION_CHECKS}" == "enforce" ]]; then
+if [[ "${XOR_ENABLED}" -eq 1 && "${XOR_GENERATION_CHECKS}" == "enforce" ]]; then
   for expected_generation in 2 3; do
     run_agent_in_netns "${NSA}" "${PINA}" reload --config "${SECRET_DIR}/agent-a.yaml"
     run_agent_in_netns "${NSB}" "${PINB}" reload --config "${SECRET_DIR}/agent-b.yaml"
@@ -1318,18 +1920,35 @@ if ((tcpdump_rb_status != 0 && tcpdump_rb_status != 124)); then
   exit "${tcpdump_rb_status}"
 fi
 
-if [[ -n "${XOR_PASSWORD}" ]]; then
-  python3 "${ROOT}/scripts/check-wg-pcap.py" \
-    --forbid-plain-standard \
-    --forbid-plain-mixed \
-    --xor-udp2raw-password-file "${SECRET_DIR}/xor-password" \
-    --require-xor-mixed initiation,response,transport \
-    "${TMPDIR}/ra.pcap" "${TMPDIR}/rb.pcap"
+if ((XOR_ENABLED)); then
+  PCAP_CHECKER_ARGS=(
+    --forbid-plain-standard
+    --forbid-plain-mixed
+    --xor-udp2raw-password-file "${SECRET_DIR}/xor-password"
+    --require-xor-mixed initiation,response,transport
+  )
 else
+  PCAP_CHECKER_ARGS=(
+    --forbid-standard
+    --require-mixed initiation,response,transport
+  )
+fi
+env -u XOR_PASSWORD timeout -s TERM -k 2 30 \
+  sh -c 'sleep 0.2; exec "$@"' sh \
   python3 "${ROOT}/scripts/check-wg-pcap.py" \
-    --forbid-standard \
-    --require-mixed initiation,response,transport \
-    "${TMPDIR}/ra.pcap" "${TMPDIR}/rb.pcap"
+  "${PCAP_CHECKER_ARGS[@]}" \
+  "${TMPDIR}/ra.pcap" "${TMPDIR}/rb.pcap" &
+PCAP_CHECKER_PID=$!
+assert_process_environment_secret_free "${PCAP_CHECKER_PID}" "pcap-checker"
+if wait "${PCAP_CHECKER_PID}"; then
+  pcap_checker_status=0
+else
+  pcap_checker_status=$?
+fi
+PCAP_CHECKER_PID=""
+if ((pcap_checker_status != 0)); then
+  echo "error: pcap checker failed (${pcap_checker_status})" >&2
+  exit "${pcap_checker_status}"
 fi
 
 if [[ "${UDP_ZERO_CHECKSUM_CHECKS}" == "enforce" ]]; then
@@ -1339,7 +1958,9 @@ fi
 run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" >"${TMPDIR}/status-a-after.json"
 run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" >"${TMPDIR}/status-b-after.json"
 
-python3 - "$TMPDIR/status-a-after.json" "$TMPDIR/status-b-after.json" <<'PY'
+env -u XOR_PASSWORD python3 - \
+  "$TMPDIR/status-a-after.json" "$TMPDIR/status-b-after.json" \
+  "${XOR_ENABLED}" <<'PY'
 import json
 import sys
 
@@ -1359,11 +1980,11 @@ required_zero = (
     "ingress_bad_checksum",
     "egress_bad_checksum",
 )
-xor_enabled = bool(__import__("os").environ.get("XOR_PASSWORD"))
+xor_enabled = sys.argv[3] == "1"
 required_positive = ["egress_rewrite_ok", "ingress_rewrite_ok"]
 if xor_enabled:
     required_positive.extend(["xor_egress_ok", "xor_ingress_ok"])
-for path in sys.argv[1:]:
+for path in sys.argv[1:3]:
     with open(path, "r", encoding="utf-8") as fh:
         doc = json.load(fh)
     stats = (
@@ -1429,7 +2050,7 @@ fi
 
 explicit_teardown
 
-if [[ -n "${XOR_PASSWORD}" ]]; then
+if ((XOR_ENABLED)); then
   echo "netns WireGuard + eBPF ${OUTER_FAMILY} xor smoke passed (${XOR_SCOPE}, max_bytes=${XOR_MAX_BYTES})"
 else
   echo "netns WireGuard + eBPF ${OUTER_FAMILY} smoke passed"

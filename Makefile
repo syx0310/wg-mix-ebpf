@@ -9,7 +9,7 @@ BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/incl
 BPF_OBJECT ?= build/wg_mix_tc.o
 EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 
-.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-bpf prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-smoke-script-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-bpf prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -54,7 +54,7 @@ test-netns-tcp-xor-full: build
 
 test-netns-tcp: test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full
 
-test-unit: test-pcap-helper
+test-unit: test-pcap-helper test-smoke-script-helper
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./...
 
 test-unit-race:
@@ -67,6 +67,9 @@ test-lint:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) vet ./...
 	bash -n scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh
 	python3 -c 'from pathlib import Path; compile(Path("scripts/check-wg-pcap.py").read_text(), "scripts/check-wg-pcap.py", "exec")'
+	python3 -c 'from pathlib import Path; compile(Path("scripts/hold-isolated-lifecycle-lease.py").read_text(), "scripts/hold-isolated-lifecycle-lease.py", "exec")'
+	python3 -c 'from pathlib import Path; compile(Path("scripts/test_hold_isolated_lifecycle_lease.py").read_text(), "scripts/test_hold_isolated_lifecycle_lease.py", "exec")'
+	python3 -c 'from pathlib import Path; compile(Path("scripts/test_smoke_netns_wg_static.py").read_text(), "scripts/test_smoke_netns_wg_static.py", "exec")'
 
 test-config:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./internal/config ./internal/wgconfig
@@ -82,6 +85,10 @@ test-packet-helper:
 
 test-pcap-helper:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_wg_pcap.py
+
+test-smoke-script-helper:
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_smoke_netns_wg_static.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_hold_isolated_lifecycle_lease.py
 
 test-bpf-pkt:
 	@echo "skip: requires external Linux root VM with BPF/TC support"
