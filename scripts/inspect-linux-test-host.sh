@@ -73,7 +73,7 @@ done
   exit 1
 }
 
-for command in bpftool ethtool find findmnt ip nft stat tc wg; do
+for command in bpftool ethtool find findmnt ip nft ss stat tc wg; do
   if ! command -v "${command}" >/dev/null; then
     printf 'required_command_missing=%s\n' "${command}"
   fi
@@ -137,6 +137,7 @@ run_optional "IPv4 routes" ip -4 route show table all
 run_optional "IPv6 routes" ip -6 route show table all
 run_optional "policy rules" ip rule show
 run_optional "network namespaces" ip netns list
+run_optional "UDP listeners" ss -H -lunp
 run_optional "qdisc" tc -details -statistics qdisc show dev "${INTERFACE}"
 run_optional "ingress filters" tc -details -statistics filter show dev "${INTERFACE}" ingress
 run_optional "egress filters" tc -details -statistics filter show dev "${INTERFACE}" egress
