@@ -4,16 +4,22 @@ package dataplane
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/rlimit"
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
+	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -25,7 +31,122 @@ const (
 	ingressHandle     = 0x10001
 	egressHandle      = 0x10002
 	xorSegmentCount   = 8
+	pinPathPrefix     = "wg-mix-ebpf"
+	maxPinPathSuffix  = 64
+	pinPathLockRoot   = "/run/wg-mix-ebpf/pin-locks"
+	pinPathOwnerV1    = 1
 )
+
+type pinPathFilesystem struct {
+	fsType int64
+}
+
+type pinPathValidator struct {
+	bpffsMagic int64
+	statFS     func(string) (pinPathFilesystem, error)
+	mountID    func(string) (uint64, error)
+}
+
+type validatedPinPath struct {
+	exists         bool
+	bpffsRoot      string
+	mountID        uint64
+	parentInode    pinPathInodeIdentity
+	targetInode    pinPathInodeIdentity
+	targetHasInode bool
+}
+
+type pinPathInodeIdentity struct {
+	device uint64
+	inode  uint64
+	mode   uint32
+}
+
+type pinPathRuntime struct {
+	validator     pinPathValidator
+	lockRoot      string
+	mountIDAt     func(int, string, int) (uint64, error)
+	loadPinnedMap func(string, string) (*pinnedMapObservation, error)
+}
+
+type pinnedMapDescriptor struct {
+	name       string
+	mapType    ebpf.MapType
+	keySize    uint32
+	valueSize  uint32
+	maxEntries uint32
+	flags      uint32
+}
+
+type pinnedMapObservation struct {
+	id          uint32
+	mapType     ebpf.MapType
+	keySize     uint32
+	valueSize   uint32
+	maxEntries  uint32
+	flags       uint32
+	kernelName  string
+	mapExtra    uint64
+	frozen      bool
+	control     abi.ControlValue
+	controlSeen bool
+	close       func() error
+}
+
+type pinnedMapPin struct {
+	descriptor  pinnedMapDescriptor
+	inode       pinPathInodeIdentity
+	observation *pinnedMapObservation
+}
+
+type pinnedMapCleanupPlan struct {
+	handle *pinPathHandle
+	pins   []pinnedMapPin
+}
+
+type pinPathOwner struct {
+	Version int    `json:"version"`
+	PID     int    `json:"pid"`
+	Action  string `json:"action"`
+	PinPath string `json:"pin_path"`
+}
+
+type pinPathLock struct {
+	path   string
+	file   *os.File
+	rootFD int
+}
+
+type pinPathHandle struct {
+	pinPath     string
+	base        string
+	parentFD    int
+	targetFD    int
+	mountID     uint64
+	targetInode pinPathInodeIdentity
+	runtime     pinPathRuntime
+}
+
+var livePinPathValidator = pinPathValidator{
+	bpffsMagic: int64(unix.BPF_FS_MAGIC),
+	statFS: func(path string) (pinPathFilesystem, error) {
+		var stat unix.Statfs_t
+		if err := unix.Statfs(path, &stat); err != nil {
+			return pinPathFilesystem{}, err
+		}
+		return pinPathFilesystem{
+			fsType: int64(stat.Type),
+		}, nil
+	},
+	mountID: linuxMountID,
+}
+
+var livePinPathRuntime = pinPathRuntime{
+	validator:     livePinPathValidator,
+	lockRoot:      pinPathLockRoot,
+	mountIDAt:     linuxMountIDAt,
+	loadPinnedMap: loadPinnedMapObservation,
+}
 
 var xorTailCallBindings = []struct {
 	mapName      string
@@ -62,6 +183,7 @@ var xorTailCallBindings = []struct {
 type LinuxLoader struct {
 	ObjectPath string
 	PinPath    string
+	runtime    *pinPathRuntime
 }
 
 func NewLoader() Loader {
@@ -90,24 +212,97 @@ func LoadObjectTest(ctx context.Context, objectPath string) error {
 	return populateXORTailCalls(coll, 0)
 }
 
-func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
+func preflightUnpinnedCollection(spec *ebpf.CollectionSpec, source string) error {
+	// Verify every map, program, relocation, and deferred map population before
+	// PinByName can make a failed load persistent.
+	preflightSpec := spec.Copy()
+	for _, descriptor := range pinnedMapDescriptors() {
+		preflightSpec.Maps[descriptor.name].Pinning = ebpf.PinNone
+	}
+	collection, err := ebpf.NewCollection(preflightSpec)
+	if err != nil {
+		return fmt.Errorf("preflight BPF collection from %s without persistent pins: %w", source, err)
+	}
+	defer collection.Close()
+	if err := populateXORTailCalls(collection, 0); err != nil {
+		return fmt.Errorf("preflight BPF tail calls from %s: %w", source, err)
+	}
+	if collection.Programs[ingressFilterName] == nil {
+		return fmt.Errorf("BPF object %s missing program %q", source, ingressFilterName)
+	}
+	if collection.Programs[egressFilterName] == nil {
+		return fmt.Errorf("BPF object %s missing program %q", source, egressFilterName)
+	}
+	return nil
+}
+
+func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr error) {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	runtime := l.pinRuntime(ctx)
+	pinPath := pinPathFromEnv(l.PinPath)
+	if _, err := validatePinPath(pinPath, runtime.validator); err != nil {
 		return err
 	}
 	spec, source, err := loadCollectionSpec(l.ObjectPath)
 	if err != nil {
 		return err
 	}
-	setPinnedMaps(spec)
+	if err := validateAndSetPinnedMaps(spec); err != nil {
+		return fmt.Errorf("validate BPF object %s: %w", source, err)
+	}
 	if err := removeMemlockLimit(); err != nil {
 		return err
 	}
-	pinPath := pinPathFromEnv(l.PinPath)
-	if err := os.MkdirAll(pinPath, 0o700); err != nil {
-		return fmt.Errorf("create BPF pin path %s: %w", pinPath, err)
+	if err := preflightUnpinnedCollection(spec, source); err != nil {
+		return err
 	}
+
+	lock, err := acquirePinPathLock(ctx, pinPath, "apply", runtime)
+	if err != nil {
+		return fmt.Errorf("serialize BPF pin path %s: %w", pinPath, err)
+	}
+	defer lock.Close()
+
+	validated, err := validatePinPath(pinPath, runtime.validator)
+	if err != nil {
+		return err
+	}
+	handle, created, err := openPinPathHandle(pinPath, validated, true, runtime)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+	rollbackFreshPins := created
+	// The lock and anchored directory make pins that were absent at preflight
+	// attributable to this Apply attempt. Until control_map is committed, an
+	// error removes only that zero-control set (including a partial load).
+	defer func() {
+		if returnErr == nil || !rollbackFreshPins {
+			return
+		}
+		if err := rollbackFreshPinnedMaps(handle, created); err != nil {
+			returnErr = errors.Join(
+				returnErr,
+				fmt.Errorf("rollback fresh pinned maps under %s: %w", pinPath, err),
+			)
+		}
+	}()
+	if err := handle.recheckTargetEntry(); err != nil {
+		return err
+	}
+
+	preexistingPins, err := inspectPinnedMapSet(handle, true)
+	if err != nil {
+		return fmt.Errorf("preflight existing pinned maps under %s: %w", pinPath, err)
+	}
+	defer closePinnedMapPins(preexistingPins)
+	freshPins := len(preexistingPins) == 0
+	rollbackFreshPins = freshPins
+
 	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
-		Maps: ebpf.MapOptions{PinPath: pinPath},
+		Maps: ebpf.MapOptions{PinPath: handle.procPath()},
 	})
 	if err != nil {
 		if errors.Is(err, ebpf.ErrMapIncompatible) {
@@ -116,6 +311,22 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
 		return fmt.Errorf("create BPF collection from %s: %w", source, err)
 	}
 	defer coll.Close()
+	if err := handle.recheckTargetEntry(); err != nil {
+		return err
+	}
+	if len(preexistingPins) != 0 {
+		if err := validateCollectionMapIDs(coll, preexistingPins); err != nil {
+			return fmt.Errorf("existing pinned maps changed while loading %s: %w", source, err)
+		}
+	}
+	if freshPins {
+		err = validateFreshCollectionPinnedMaps(handle, coll)
+	} else {
+		err = validateCollectionPinnedMaps(handle, coll, true)
+	}
+	if err != nil {
+		return fmt.Errorf("validate collection pins under %s: %w", pinPath, err)
+	}
 
 	active, err := activeGeneration(coll)
 	if err != nil {
@@ -146,6 +357,33 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
 	if egress == nil {
 		return fmt.Errorf("BPF object missing program %q", egressFilterName)
 	}
+	if freshPins {
+		err = validateFreshCollectionPinnedMaps(handle, coll)
+	} else {
+		err = validateCollectionPinnedMaps(handle, coll, true)
+	}
+	if err != nil {
+		return fmt.Errorf("recheck collection pins before attach under %s: %w", pinPath, err)
+	}
+	if err := handle.recheckTargetEntry(); err != nil {
+		return err
+	}
+
+	if freshPins {
+		// A first deployment has no older attached program observing the
+		// generation switch. Commit ownership before TC writes so an attach
+		// failure remains recoverable through the normal Detach path.
+		if err := commitControl(coll, snapshot.Control[abi.ControlKeyGlobal]); err != nil {
+			return err
+		}
+		rollbackFreshPins = false
+		if err := deleteStaleMapEntries(coll, snapshot); err != nil {
+			return err
+		}
+		if err := validateCollectionPinnedMaps(handle, coll, true); err != nil {
+			return fmt.Errorf("validate committed collection pins under %s: %w", pinPath, err)
+		}
+	}
 
 	for _, u := range state.Underlays {
 		if !u.Resolved || u.Role == "parse_only" || u.Role == "disabled" {
@@ -155,11 +393,16 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
 			return fmt.Errorf("attach underlay %s(%d): %w", u.Name, u.IfIndex, err)
 		}
 	}
-	if err := commitControl(coll, snapshot.Control[abi.ControlKeyGlobal]); err != nil {
-		return err
-	}
-	if err := deleteStaleMapEntries(coll, snapshot); err != nil {
-		return err
+	if !freshPins {
+		if err := commitControl(coll, snapshot.Control[abi.ControlKeyGlobal]); err != nil {
+			return err
+		}
+		if err := deleteStaleMapEntries(coll, snapshot); err != nil {
+			return err
+		}
+		if err := validateCollectionPinnedMaps(handle, coll, true); err != nil {
+			return fmt.Errorf("validate committed collection pins under %s: %w", pinPath, err)
+		}
 	}
 	return nil
 }
@@ -204,6 +447,27 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	runtime := l.pinRuntime(ctx)
+	pinPath := pinPathFromEnv(l.PinPath)
+	if _, err := validatePinPath(pinPath, runtime.validator); err != nil {
+		return err
+	}
+
+	lock, err := acquirePinPathLock(ctx, pinPath, "detach", runtime)
+	if err != nil {
+		return fmt.Errorf("serialize BPF pin path %s: %w", pinPath, err)
+	}
+	defer lock.Close()
+
+	if _, err := validatePinPath(pinPath, runtime.validator); err != nil {
+		return err
+	}
+	cleanupPlan, err := preparePinnedMapCleanup(pinPath, runtime)
+	if err != nil {
+		return fmt.Errorf("preflight pinned-map cleanup under %s: %w", pinPath, err)
+	}
+	defer cleanupPlan.Close()
+
 	var errs []error
 	for _, u := range state.Underlays {
 		if !u.Resolved || u.IfIndex == 0 {
@@ -216,7 +480,7 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 	if err := errors.Join(errs...); err != nil {
 		return err
 	}
-	if err := cleanupPinnedMaps(pinPathFromEnv(l.PinPath)); err != nil {
+	if err := cleanupPlan.Execute(); err != nil {
 		return err
 	}
 	return nil
@@ -232,6 +496,544 @@ func pinPathFromEnv(explicit string) string {
 	return DefaultPinPath
 }
 
+func validatePinPath(pinPath string, validator pinPathValidator) (validatedPinPath, error) {
+	if pinPath == "" {
+		return validatedPinPath{}, fmt.Errorf("validate BPF pin path: path is empty")
+	}
+	if !filepath.IsAbs(pinPath) {
+		return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: path must be absolute", pinPath)
+	}
+	if cleaned := filepath.Clean(pinPath); cleaned != pinPath {
+		return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: path must be clean (canonical spelling %q)", pinPath, cleaned)
+	}
+	if validator.statFS == nil || validator.mountID == nil {
+		return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: filesystem or mount validator is unavailable", pinPath)
+	}
+
+	nearest, exists, err := nearestExistingPinPathAncestor(pinPath)
+	if err != nil {
+		return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: %w", pinPath, err)
+	}
+	parent := filepath.Dir(pinPath)
+	if !exists && nearest != parent {
+		return validatedPinPath{}, fmt.Errorf(
+			"validate BPF pin path %q: direct parent %s must already exist",
+			pinPath, parent,
+		)
+	}
+	parentFilesystem, err := validator.statFS(parent)
+	if err != nil {
+		return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: statfs parent %s: %w", pinPath, parent, err)
+	}
+	parentMountID, err := validator.mountID(parent)
+	if err != nil {
+		return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: inspect parent mount %s: %w", pinPath, parent, err)
+	}
+	if parentFilesystem.fsType != validator.bpffsMagic {
+		if exists {
+			targetFilesystem, targetFSErr := validator.statFS(pinPath)
+			targetMountID, targetMountErr := validator.mountID(pinPath)
+			if targetFSErr == nil && targetMountErr == nil &&
+				targetFilesystem.fsType == validator.bpffsMagic && targetMountID != parentMountID {
+				return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: path must not be the bpffs top level", pinPath)
+			}
+		}
+		return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: direct parent %s is not a bpffs mount root", pinPath, parent)
+	}
+	parentParent := filepath.Dir(parent)
+	if parentParent == parent {
+		return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: cannot use filesystem root as the bpffs mount root", pinPath)
+	}
+	parentParentMountID, err := validator.mountID(parentParent)
+	if err != nil {
+		return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: inspect mount above %s: %w", pinPath, parent, err)
+	}
+	if parentMountID == parentParentMountID {
+		return validatedPinPath{}, fmt.Errorf(
+			"validate BPF pin path %q: direct parent %s is inside bpffs but is not its mount root",
+			pinPath, parent,
+		)
+	}
+	if exists {
+		targetMountID, err := validator.mountID(pinPath)
+		if err != nil {
+			return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: inspect target mount: %w", pinPath, err)
+		}
+		if targetMountID != parentMountID {
+			return validatedPinPath{}, fmt.Errorf(
+				"validate BPF pin path %q: target is a nested mount instead of a directory on bpffs mount %s",
+				pinPath, parent,
+			)
+		}
+	}
+	parentInode, err := lstatPinPathInode(parent)
+	if err != nil {
+		return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: inspect parent identity: %w", pinPath, err)
+	}
+	var targetInode pinPathInodeIdentity
+	if exists {
+		targetInode, err = lstatPinPathInode(pinPath)
+		if err != nil {
+			return validatedPinPath{}, fmt.Errorf("validate BPF pin path %q: inspect target identity: %w", pinPath, err)
+		}
+	}
+	if !validPinPathBase(filepath.Base(pinPath)) {
+		return validatedPinPath{}, fmt.Errorf(
+			"validate BPF pin path %q: directory name must be %q or %q plus a 1-%d byte ASCII alphanumeric suffix with optional internal hyphens",
+			pinPath, pinPathPrefix, pinPathPrefix+"-",
+			maxPinPathSuffix,
+		)
+	}
+	return validatedPinPath{
+		exists:         exists,
+		bpffsRoot:      parent,
+		mountID:        parentMountID,
+		parentInode:    parentInode,
+		targetInode:    targetInode,
+		targetHasInode: exists,
+	}, nil
+}
+
+func linuxMountID(path string) (uint64, error) {
+	return linuxMountIDAt(unix.AT_FDCWD, path, unix.AT_NO_AUTOMOUNT|unix.AT_SYMLINK_NOFOLLOW)
+}
+
+func linuxMountIDAt(dirFD int, path string, flags int) (uint64, error) {
+	var stat unix.Statx_t
+	if err := unix.Statx(
+		dirFD,
+		path,
+		flags,
+		unix.STATX_MNT_ID,
+		&stat,
+	); err != nil {
+		return 0, err
+	}
+	if stat.Mask&unix.STATX_MNT_ID == 0 || stat.Mnt_id == 0 {
+		return 0, errors.New("kernel did not report a statx mount ID")
+	}
+	return stat.Mnt_id, nil
+}
+
+func lstatPinPathInode(path string) (pinPathInodeIdentity, error) {
+	var stat unix.Stat_t
+	if err := unix.Lstat(path, &stat); err != nil {
+		return pinPathInodeIdentity{}, err
+	}
+	return pinPathInodeFromStat(&stat), nil
+}
+
+func pinPathInodeFromStat(stat *unix.Stat_t) pinPathInodeIdentity {
+	return pinPathInodeIdentity{
+		device: uint64(stat.Dev),
+		inode:  stat.Ino,
+		mode:   stat.Mode,
+	}
+}
+
+func samePinPathInode(left, right pinPathInodeIdentity) bool {
+	return left.device == right.device &&
+		left.inode == right.inode &&
+		left.mode&unix.S_IFMT == right.mode&unix.S_IFMT
+}
+
+func (l LinuxLoader) pinRuntime(ctx context.Context) pinPathRuntime {
+	if l.runtime != nil {
+		return *l.runtime
+	}
+	runtime := livePinPathRuntime
+	lifecycleLease := lockfile.LifecycleLeasePath(ctx)
+	if lifecycleLease != lockfile.DefaultLifecycleLeasePath {
+		// The isolated netns entrypoint validates that its lifecycle lease is
+		// inside a run-owned run-<role> directory. Keep the persistent pin-lock
+		// owner in that same teardown/manifest scope.
+		runtime.lockRoot = filepath.Join(filepath.Dir(lifecycleLease), "pin-locks")
+	}
+	return runtime
+}
+
+func acquirePinPathLock(
+	ctx context.Context,
+	pinPath string,
+	action string,
+	runtime pinPathRuntime,
+) (*pinPathLock, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if runtime.lockRoot == "" || !filepath.IsAbs(runtime.lockRoot) ||
+		filepath.Clean(runtime.lockRoot) != runtime.lockRoot ||
+		runtime.lockRoot == string(filepath.Separator) {
+		return nil, fmt.Errorf("invalid pin-path lock root %q", runtime.lockRoot)
+	}
+	rootFD, err := openOrCreateDirectoryPath(runtime.lockRoot, 0o700)
+	if err != nil {
+		return nil, fmt.Errorf("open pin-path lock root %s: %w", runtime.lockRoot, err)
+	}
+	closeRootOnError := func() {
+		_ = unix.Close(rootFD)
+	}
+	if err := unix.Fchmod(rootFD, 0o700); err != nil {
+		closeRootOnError()
+		return nil, fmt.Errorf("secure pin-path lock root %s: %w", runtime.lockRoot, err)
+	}
+
+	name := pinPathLockFileName(pinPath)
+	lockPath := filepath.Join(runtime.lockRoot, name)
+	fd, err := unix.Openat(rootFD, name, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		closeRootOnError()
+		return nil, fmt.Errorf("open pin-path lock %s: %w", lockPath, err)
+	}
+	file := os.NewFile(uintptr(fd), lockPath)
+	closeAllOnError := func() {
+		_ = file.Close()
+		closeRootOnError()
+	}
+	var heldStat unix.Stat_t
+	if err := unix.Fstat(fd, &heldStat); err != nil {
+		closeAllOnError()
+		return nil, fmt.Errorf("inspect pin-path lock %s: %w", lockPath, err)
+	}
+	if heldStat.Mode&unix.S_IFMT != unix.S_IFREG || heldStat.Nlink != 1 {
+		closeAllOnError()
+		return nil, fmt.Errorf("refuse unsafe pin-path lock %s: mode=%#o links=%d", lockPath, heldStat.Mode, heldStat.Nlink)
+	}
+
+	ticker := time.NewTicker(25 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		err = unix.Flock(fd, unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, unix.EWOULDBLOCK) && !errors.Is(err, unix.EAGAIN) {
+			closeAllOnError()
+			return nil, fmt.Errorf("acquire pin-path lock %s: %w", lockPath, err)
+		}
+		select {
+		case <-ctx.Done():
+			closeAllOnError()
+			return nil, ctx.Err()
+		case <-ticker.C:
+		}
+	}
+
+	var pathStat unix.Stat_t
+	if err := unix.Fstatat(rootFD, name, &pathStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		closeAllOnError()
+		return nil, fmt.Errorf("recheck pin-path lock %s: %w", lockPath, err)
+	}
+	if !samePinPathInode(pinPathInodeFromStat(&heldStat), pinPathInodeFromStat(&pathStat)) {
+		closeAllOnError()
+		return nil, fmt.Errorf("pin-path lock %s changed while acquiring ownership", lockPath)
+	}
+
+	owner, err := json.Marshal(pinPathOwner{
+		Version: pinPathOwnerV1,
+		PID:     os.Getpid(),
+		Action:  action,
+		PinPath: pinPath,
+	})
+	if err == nil {
+		err = file.Truncate(0)
+	}
+	if err == nil {
+		_, err = file.Seek(0, 0)
+	}
+	if err == nil {
+		_, err = file.Write(append(owner, '\n'))
+	}
+	if err == nil {
+		err = file.Sync()
+	}
+	if err != nil {
+		closeAllOnError()
+		return nil, fmt.Errorf("record pin-path lock owner in %s: %w", lockPath, err)
+	}
+	return &pinPathLock{path: lockPath, file: file, rootFD: rootFD}, nil
+}
+
+func pinPathLockFileName(pinPath string) string {
+	sum := sha256.Sum256([]byte(pinPath))
+	return fmt.Sprintf("%x.lock", sum)
+}
+
+func openOrCreateDirectoryPath(path string, mode uint32) (int, error) {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path ||
+		path == string(filepath.Separator) {
+		return -1, fmt.Errorf("directory path %q must be absolute, clean, and below the filesystem root", path)
+	}
+	currentFD, err := unix.Open(
+		string(filepath.Separator),
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return -1, err
+	}
+	components := strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator))
+	for _, component := range components {
+		if component == "" {
+			continue
+		}
+		nextFD, openErr := unix.Openat(
+			currentFD,
+			component,
+			unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+			0,
+		)
+		if errors.Is(openErr, unix.ENOENT) {
+			if err := unix.Mkdirat(currentFD, component, mode); err != nil && !errors.Is(err, unix.EEXIST) {
+				_ = unix.Close(currentFD)
+				return -1, err
+			}
+			nextFD, openErr = unix.Openat(
+				currentFD,
+				component,
+				unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+				0,
+			)
+		}
+		if openErr != nil {
+			_ = unix.Close(currentFD)
+			return -1, openErr
+		}
+		if err := unix.Close(currentFD); err != nil {
+			_ = unix.Close(nextFD)
+			return -1, err
+		}
+		currentFD = nextFD
+	}
+	return currentFD, nil
+}
+
+func (l *pinPathLock) Close() error {
+	if l == nil {
+		return nil
+	}
+	var errs []error
+	if l.file != nil {
+		if err := l.file.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close pin-path lock %s: %w", l.path, err))
+		}
+		l.file = nil
+	}
+	if l.rootFD >= 0 {
+		if err := unix.Close(l.rootFD); err != nil {
+			errs = append(errs, fmt.Errorf("close pin-path lock root for %s: %w", l.path, err))
+		}
+		l.rootFD = -1
+	}
+	return errors.Join(errs...)
+}
+
+func openPinPathHandle(
+	pinPath string,
+	validated validatedPinPath,
+	create bool,
+	runtime pinPathRuntime,
+) (*pinPathHandle, bool, error) {
+	if runtime.mountIDAt == nil {
+		return nil, false, errors.New("pin-path mount-ID-at validator is unavailable")
+	}
+	parentFD, err := unix.Open(
+		validated.bpffsRoot,
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return nil, false, fmt.Errorf("open bpffs mount root %s: %w", validated.bpffsRoot, err)
+	}
+	closeParentOnError := func() {
+		_ = unix.Close(parentFD)
+	}
+	var parentStat unix.Stat_t
+	if err := unix.Fstat(parentFD, &parentStat); err != nil {
+		closeParentOnError()
+		return nil, false, fmt.Errorf("inspect opened bpffs mount root: %w", err)
+	}
+	if !samePinPathInode(pinPathInodeFromStat(&parentStat), validated.parentInode) {
+		closeParentOnError()
+		return nil, false, fmt.Errorf("bpffs mount root %s changed after validation", validated.bpffsRoot)
+	}
+	parentMountID, err := runtime.mountIDAt(parentFD, "", unix.AT_EMPTY_PATH|unix.AT_NO_AUTOMOUNT)
+	if err != nil {
+		closeParentOnError()
+		return nil, false, fmt.Errorf("inspect opened bpffs mount ID: %w", err)
+	}
+	if parentMountID != validated.mountID {
+		closeParentOnError()
+		return nil, false, fmt.Errorf("bpffs mount root %s changed mount identity after validation", validated.bpffsRoot)
+	}
+
+	base := filepath.Base(pinPath)
+	created := false
+	if create && !validated.exists {
+		if err := unix.Mkdirat(parentFD, base, 0o700); err != nil {
+			if !errors.Is(err, unix.EEXIST) {
+				closeParentOnError()
+				return nil, false, fmt.Errorf("create BPF pin directory %s: %w", pinPath, err)
+			}
+		} else {
+			created = true
+		}
+	}
+	if !create && !validated.exists {
+		closeParentOnError()
+		return nil, false, nil
+	}
+	targetFD, err := unix.Openat(
+		parentFD,
+		base,
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		closeParentOnError()
+		return nil, false, fmt.Errorf("open BPF pin directory %s: %w", pinPath, err)
+	}
+	closeAllOnError := func() {
+		_ = unix.Close(targetFD)
+		closeParentOnError()
+	}
+	var targetStat unix.Stat_t
+	if err := unix.Fstat(targetFD, &targetStat); err != nil {
+		closeAllOnError()
+		return nil, false, fmt.Errorf("inspect opened BPF pin directory %s: %w", pinPath, err)
+	}
+	targetInode := pinPathInodeFromStat(&targetStat)
+	if targetInode.mode&unix.S_IFMT != unix.S_IFDIR {
+		closeAllOnError()
+		return nil, false, fmt.Errorf("opened BPF pin target %s is not a directory", pinPath)
+	}
+	if validated.targetHasInode && !samePinPathInode(targetInode, validated.targetInode) {
+		closeAllOnError()
+		return nil, false, fmt.Errorf("BPF pin directory %s changed after validation", pinPath)
+	}
+	targetMountID, err := runtime.mountIDAt(targetFD, "", unix.AT_EMPTY_PATH|unix.AT_NO_AUTOMOUNT)
+	if err != nil {
+		closeAllOnError()
+		return nil, false, fmt.Errorf("inspect opened BPF pin directory mount ID: %w", err)
+	}
+	if targetMountID != validated.mountID {
+		closeAllOnError()
+		return nil, false, fmt.Errorf("BPF pin directory %s is a nested mount", pinPath)
+	}
+	return &pinPathHandle{
+		pinPath:     pinPath,
+		base:        base,
+		parentFD:    parentFD,
+		targetFD:    targetFD,
+		mountID:     targetMountID,
+		targetInode: targetInode,
+		runtime:     runtime,
+	}, created, nil
+}
+
+func (h *pinPathHandle) recheckTargetEntry() error {
+	if h == nil {
+		return nil
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstatat(h.parentFD, h.base, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return fmt.Errorf("recheck BPF pin directory %s: %w", h.pinPath, err)
+	}
+	if !samePinPathInode(pinPathInodeFromStat(&stat), h.targetInode) {
+		return fmt.Errorf("BPF pin directory %s changed after it was opened", h.pinPath)
+	}
+	mountID, err := h.runtime.mountIDAt(
+		h.parentFD,
+		h.base,
+		unix.AT_NO_AUTOMOUNT|unix.AT_SYMLINK_NOFOLLOW,
+	)
+	if err != nil {
+		return fmt.Errorf("recheck BPF pin directory mount ID %s: %w", h.pinPath, err)
+	}
+	if mountID != h.mountID {
+		return fmt.Errorf("BPF pin directory %s changed mount identity", h.pinPath)
+	}
+	return nil
+}
+
+func (h *pinPathHandle) procPath() string {
+	return fmt.Sprintf("/proc/self/fd/%d", h.targetFD)
+}
+
+func (h *pinPathHandle) Close() error {
+	if h == nil {
+		return nil
+	}
+	var errs []error
+	if h.targetFD >= 0 {
+		if err := unix.Close(h.targetFD); err != nil {
+			errs = append(errs, fmt.Errorf("close BPF pin directory %s: %w", h.pinPath, err))
+		}
+		h.targetFD = -1
+	}
+	if h.parentFD >= 0 {
+		if err := unix.Close(h.parentFD); err != nil {
+			errs = append(errs, fmt.Errorf("close bpffs mount root for %s: %w", h.pinPath, err))
+		}
+		h.parentFD = -1
+	}
+	return errors.Join(errs...)
+}
+
+func validPinPathBase(base string) bool {
+	if base == pinPathPrefix {
+		return true
+	}
+	prefix := pinPathPrefix + "-"
+	if !strings.HasPrefix(base, prefix) {
+		return false
+	}
+	suffix := strings.TrimPrefix(base, prefix)
+	if len(suffix) == 0 || len(suffix) > maxPinPathSuffix {
+		return false
+	}
+	for index := range len(suffix) {
+		character := suffix[index]
+		isAlphaNumeric := character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9'
+		if isAlphaNumeric {
+			continue
+		}
+		if character != '-' || index == 0 || index == len(suffix)-1 {
+			return false
+		}
+	}
+	return true
+}
+
+func nearestExistingPinPathAncestor(pinPath string) (string, bool, error) {
+	current := string(filepath.Separator)
+	relative := strings.TrimPrefix(pinPath, current)
+	components := strings.Split(relative, string(filepath.Separator))
+	for index, component := range components {
+		next := filepath.Join(current, component)
+		info, err := os.Lstat(next)
+		if errors.Is(err, os.ErrNotExist) {
+			return current, false, nil
+		}
+		if err != nil {
+			return "", false, fmt.Errorf("inspect path component %s: %w", next, err)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return "", false, fmt.Errorf("path component %s is a symbolic link", next)
+		}
+		if !info.IsDir() {
+			if index == len(components)-1 {
+				return "", false, fmt.Errorf("pin path target %s is not a directory", next)
+			}
+			return "", false, fmt.Errorf("path ancestor %s is not a directory", next)
+		}
+		current = next
+	}
+	return current, true, nil
+}
+
 func removeMemlockLimit() error {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		return fmt.Errorf("remove memlock rlimit: %w", err)
@@ -239,28 +1041,218 @@ func removeMemlockLimit() error {
 	return nil
 }
 
-func setPinnedMaps(spec *ebpf.CollectionSpec) {
-	for _, name := range pinnedMapNames() {
-		if m := spec.Maps[name]; m != nil {
-			m.Pinning = ebpf.PinByName
-		}
+func pinnedMapDescriptors() []pinnedMapDescriptor {
+	return []pinnedMapDescriptor{
+		{name: "control_map", mapType: ebpf.Array, keySize: 4, valueSize: 16, maxEntries: 1},
+		{name: "profile_map", mapType: ebpf.Hash, keySize: 16, valueSize: 48, maxEntries: 128},
+		{name: "cipher_map", mapType: ebpf.Hash, keySize: 16, valueSize: 288, maxEntries: 128},
+		{name: "underlay_config_map", mapType: ebpf.Hash, keySize: 16, valueSize: 16, maxEntries: 512},
+		{name: "managed_fwmark_map", mapType: ebpf.Hash, keySize: 16, valueSize: 16, maxEntries: 512},
+		{name: "egress_rule_map", mapType: ebpf.Hash, keySize: 24, valueSize: 32, maxEntries: 2048},
+		{name: "ingress_listener_map", mapType: ebpf.Hash, keySize: 16, valueSize: 24, maxEntries: 2048},
+		{name: "icmp_listener_map", mapType: ebpf.Hash, keySize: 16, valueSize: 24, maxEntries: 2048},
+		{name: "stats_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 36},
+		{name: "xor_egress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: 16},
+		{name: "xor_ingress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: 16},
 	}
 }
 
 func pinnedMapNames() []string {
-	return []string{
-		"control_map",
-		"profile_map",
-		"cipher_map",
-		"underlay_config_map",
-		"managed_fwmark_map",
-		"egress_rule_map",
-		"ingress_listener_map",
-		"icmp_listener_map",
-		"stats_map",
-		"xor_egress_programs",
-		"xor_ingress_programs",
+	descriptors := pinnedMapDescriptors()
+	names := make([]string, 0, len(descriptors))
+	for _, descriptor := range descriptors {
+		names = append(names, descriptor.name)
 	}
+	return names
+}
+
+func validateAndSetPinnedMaps(spec *ebpf.CollectionSpec) error {
+	if spec == nil {
+		return errors.New("validate BPF collection maps: collection spec is nil")
+	}
+	descriptors := pinnedMapDescriptors()
+	known := make(map[string]struct{}, len(descriptors))
+	for _, descriptor := range descriptors {
+		known[descriptor.name] = struct{}{}
+		mapSpec := spec.Maps[descriptor.name]
+		if mapSpec == nil {
+			return fmt.Errorf("BPF object missing required pinned map %q", descriptor.name)
+		}
+		if err := validatePinnedMapSpec(descriptor, mapSpec); err != nil {
+			return err
+		}
+	}
+
+	var unexpectedPinned []string
+	for name, mapSpec := range spec.Maps {
+		if mapSpec == nil {
+			return fmt.Errorf("BPF object map %q has a nil spec", name)
+		}
+		if _, ok := known[name]; !ok && mapSpec.Pinning != ebpf.PinNone {
+			unexpectedPinned = append(unexpectedPinned, name)
+		}
+	}
+	if len(unexpectedPinned) != 0 {
+		sort.Strings(unexpectedPinned)
+		return fmt.Errorf("BPF object requests unexpected pinned maps: %s", strings.Join(unexpectedPinned, ", "))
+	}
+	for _, descriptor := range descriptors {
+		spec.Maps[descriptor.name].Pinning = ebpf.PinByName
+	}
+	return nil
+}
+
+func validatePinnedMapSpec(descriptor pinnedMapDescriptor, spec *ebpf.MapSpec) error {
+	if spec.Name != descriptor.name {
+		return fmt.Errorf(
+			"BPF map %q has kernel name %q, want %q",
+			descriptor.name, spec.Name, descriptor.name,
+		)
+	}
+	if spec.Type != descriptor.mapType ||
+		spec.KeySize != descriptor.keySize ||
+		spec.ValueSize != descriptor.valueSize ||
+		spec.MaxEntries != descriptor.maxEntries ||
+		spec.Flags != descriptor.flags {
+		return fmt.Errorf(
+			"BPF map %q schema is %s key=%d value=%d max=%d flags=%#x, want %s key=%d value=%d max=%d flags=%#x",
+			descriptor.name,
+			spec.Type, spec.KeySize, spec.ValueSize, spec.MaxEntries, spec.Flags,
+			descriptor.mapType, descriptor.keySize, descriptor.valueSize, descriptor.maxEntries, descriptor.flags,
+		)
+	}
+	if spec.NumaNode != 0 || spec.InnerMap != nil || spec.MapExtra != 0 ||
+		(spec.Extra != nil && spec.Extra.Len() != 0) || len(spec.Contents) != 0 {
+		return fmt.Errorf(
+			"BPF map %q has unsupported creation metadata (numa=%d inner=%t extra=%d trailing=%t contents=%d)",
+			descriptor.name,
+			spec.NumaNode, spec.InnerMap != nil, spec.MapExtra,
+			spec.Extra != nil && spec.Extra.Len() != 0, len(spec.Contents),
+		)
+	}
+	if spec.Pinning != ebpf.PinNone && spec.Pinning != ebpf.PinByName {
+		return fmt.Errorf(
+			"BPF map %q has unsupported pinning mode %d",
+			descriptor.name, spec.Pinning,
+		)
+	}
+	return nil
+}
+
+func loadPinnedMapObservation(path string, name string) (*pinnedMapObservation, error) {
+	pinnedMap, err := ebpf.LoadPinnedMap(path, &ebpf.LoadPinOptions{ReadOnly: true})
+	if err != nil {
+		return nil, err
+	}
+	closeOnError := func() {
+		_ = pinnedMap.Close()
+	}
+	info, err := pinnedMap.Info()
+	if err != nil {
+		closeOnError()
+		return nil, fmt.Errorf("inspect pinned map info: %w", err)
+	}
+	mapID, ok := info.ID()
+	if !ok || mapID == 0 {
+		closeOnError()
+		return nil, errors.New("kernel did not report a pinned map ID")
+	}
+	mapExtra, _ := info.MapExtra()
+	observation := &pinnedMapObservation{
+		id:         uint32(mapID),
+		mapType:    info.Type,
+		keySize:    info.KeySize,
+		valueSize:  info.ValueSize,
+		maxEntries: info.MaxEntries,
+		flags:      info.Flags,
+		kernelName: info.Name,
+		mapExtra:   mapExtra,
+		frozen:     info.Frozen(),
+		close:      pinnedMap.Close,
+	}
+	if name == "control_map" {
+		if err := pinnedMap.Lookup(abi.ControlKeyGlobal, &observation.control); err != nil {
+			closeOnError()
+			return nil, fmt.Errorf("lookup control identity: %w", err)
+		}
+		observation.controlSeen = true
+	}
+	return observation, nil
+}
+
+func (observation *pinnedMapObservation) Close() error {
+	if observation == nil || observation.close == nil {
+		return nil
+	}
+	closeMap := observation.close
+	observation.close = nil
+	return closeMap()
+}
+
+func validatePinnedMapObservation(
+	descriptor pinnedMapDescriptor,
+	observation *pinnedMapObservation,
+	requireCommittedControl bool,
+) error {
+	if observation == nil {
+		return fmt.Errorf("pinned map %q observation is nil", descriptor.name)
+	}
+	if observation.id == 0 {
+		return fmt.Errorf("pinned map %q has no stable map ID", descriptor.name)
+	}
+	if observation.mapType != descriptor.mapType ||
+		observation.keySize != descriptor.keySize ||
+		observation.valueSize != descriptor.valueSize ||
+		observation.maxEntries != descriptor.maxEntries ||
+		observation.flags != descriptor.flags {
+		return fmt.Errorf(
+			"pinned map %q schema is %s key=%d value=%d max=%d flags=%#x, want %s key=%d value=%d max=%d flags=%#x",
+			descriptor.name,
+			observation.mapType, observation.keySize, observation.valueSize,
+			observation.maxEntries, observation.flags,
+			descriptor.mapType, descriptor.keySize, descriptor.valueSize,
+			descriptor.maxEntries, descriptor.flags,
+		)
+	}
+	if observation.mapExtra != 0 {
+		return fmt.Errorf("pinned map %q has unsupported map_extra=%d", descriptor.name, observation.mapExtra)
+	}
+	if observation.frozen {
+		return fmt.Errorf("pinned map %q is frozen", descriptor.name)
+	}
+	expectedName := descriptor.name
+	if len(expectedName) > 15 {
+		expectedName = expectedName[:15]
+	}
+	if observation.kernelName != expectedName {
+		return fmt.Errorf(
+			"pinned map %q reports kernel name %q, want %q",
+			descriptor.name, observation.kernelName, expectedName,
+		)
+	}
+	if descriptor.name != "control_map" {
+		return nil
+	}
+	if !observation.controlSeen {
+		return errors.New("pinned control_map identity value is unavailable")
+	}
+	control := observation.control
+	if !requireCommittedControl && control == (abi.ControlValue{}) {
+		return nil
+	}
+	if control.ABIVersion != abi.Version {
+		return fmt.Errorf(
+			"pinned control_map ABI version = %d, want %d",
+			control.ABIVersion, abi.Version,
+		)
+	}
+	if control.Flags != 0 {
+		return fmt.Errorf("pinned control_map flags = %#x, want 0", control.Flags)
+	}
+	if requireCommittedControl && control.ActiveGeneration == 0 {
+		return errors.New("pinned control_map has no committed generation")
+	}
+	return nil
 }
 
 func populateXORTailCalls(coll *ebpf.Collection, generation uint64) error {
@@ -431,20 +1423,481 @@ func deleteStaleEntries[K comparable, V any](coll *ebpf.Collection, name string,
 	return errors.Join(errs...)
 }
 
-func cleanupPinnedMaps(pinPath string) error {
-	var errs []error
-	for _, name := range pinnedMapNames() {
-		path := filepath.Join(pinPath, name)
-		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-			errs = append(errs, fmt.Errorf("remove pinned map %s: %w", path, err))
+func preparePinnedMapCleanup(pinPath string, runtime pinPathRuntime) (*pinnedMapCleanupPlan, error) {
+	validated, err := validatePinPath(pinPath, runtime.validator)
+	if err != nil {
+		return nil, err
+	}
+	if !validated.exists {
+		return &pinnedMapCleanupPlan{}, nil
+	}
+	handle, _, err := openPinPathHandle(pinPath, validated, false, runtime)
+	if err != nil {
+		return nil, err
+	}
+	pins, err := inspectPinnedMapSet(handle, true)
+	if err != nil {
+		_ = handle.Close()
+		return nil, err
+	}
+	return &pinnedMapCleanupPlan{
+		handle: handle,
+		pins:   pins,
+	}, nil
+}
+
+func rollbackFreshPinnedMaps(handle *pinPathHandle, removeEmptyDirectory bool) error {
+	pins, err := inspectFreshUncommittedPins(handle)
+	if err != nil {
+		return err
+	}
+	defer closePinnedMapPins(pins)
+	plan := &pinnedMapCleanupPlan{
+		handle: handle,
+		pins:   pins,
+	}
+	return plan.execute(false, true, removeEmptyDirectory)
+}
+
+func inspectPinnedMapSet(
+	handle *pinPathHandle,
+	requireCommittedControl bool,
+) ([]pinnedMapPin, error) {
+	return inspectPinnedMapSetWithPolicy(handle, true, requireCommittedControl, false)
+}
+
+func inspectFreshUncommittedPins(handle *pinPathHandle) ([]pinnedMapPin, error) {
+	return inspectPinnedMapSetWithPolicy(handle, false, false, true)
+}
+
+func inspectPinnedMapSetWithPolicy(
+	handle *pinPathHandle,
+	requireComplete bool,
+	requireCommittedControl bool,
+	requireZeroControl bool,
+) ([]pinnedMapPin, error) {
+	if handle == nil {
+		return nil, nil
+	}
+	if handle.runtime.loadPinnedMap == nil {
+		return nil, errors.New("pinned-map loader is unavailable")
+	}
+	if err := handle.recheckTargetEntry(); err != nil {
+		return nil, err
+	}
+
+	descriptors := pinnedMapDescriptors()
+	pins := make([]pinnedMapPin, 0, len(descriptors))
+	for _, descriptor := range descriptors {
+		var stat unix.Stat_t
+		err := unix.Fstatat(
+			handle.targetFD,
+			descriptor.name,
+			&stat,
+			unix.AT_SYMLINK_NOFOLLOW,
+		)
+		if errors.Is(err, unix.ENOENT) {
+			continue
+		}
+		if err != nil {
+			return nil, fmt.Errorf("inspect pinned map %s/%s: %w", handle.pinPath, descriptor.name, err)
+		}
+		if stat.Mode&unix.S_IFMT != unix.S_IFREG {
+			return nil, fmt.Errorf(
+				"refuse pinned object %s/%s: mode %#o is not a regular map pin",
+				handle.pinPath, descriptor.name, stat.Mode,
+			)
+		}
+		if stat.Nlink != 1 {
+			return nil, fmt.Errorf(
+				"refuse pinned object %s/%s: link count is %d, want 1",
+				handle.pinPath, descriptor.name, stat.Nlink,
+			)
+		}
+		mountID, err := handle.runtime.mountIDAt(
+			handle.targetFD,
+			descriptor.name,
+			unix.AT_NO_AUTOMOUNT|unix.AT_SYMLINK_NOFOLLOW,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("inspect pinned map mount %s/%s: %w", handle.pinPath, descriptor.name, err)
+		}
+		if mountID != handle.mountID {
+			return nil, fmt.Errorf(
+				"refuse pinned object %s/%s: mount ID %d differs from validated bpffs mount ID %d",
+				handle.pinPath, descriptor.name, mountID, handle.mountID,
+			)
+		}
+		pins = append(pins, pinnedMapPin{
+			descriptor: descriptor,
+			inode:      pinPathInodeFromStat(&stat),
+		})
+	}
+	if len(pins) == 0 {
+		return nil, nil
+	}
+	if requireComplete && len(pins) != len(descriptors) {
+		return nil, fmt.Errorf(
+			"found an incomplete pinned-map set (%d of %d known pins); refusing any deletion",
+			len(pins), len(descriptors),
+		)
+	}
+
+	seenIDs := make(map[uint32]string, len(pins))
+	closeOnError := func() {
+		_ = closePinnedMapPins(pins)
+	}
+	for index := range pins {
+		pin := &pins[index]
+		path := filepath.Join(handle.procPath(), pin.descriptor.name)
+		observation, err := handle.runtime.loadPinnedMap(path, pin.descriptor.name)
+		if err != nil {
+			closeOnError()
+			return nil, fmt.Errorf("load pinned map %s/%s: %w", handle.pinPath, pin.descriptor.name, err)
+		}
+		pin.observation = observation
+		if err := validatePinnedMapObservation(
+			pin.descriptor,
+			observation,
+			requireCommittedControl,
+		); err != nil {
+			closeOnError()
+			return nil, err
+		}
+		if requireZeroControl && pin.descriptor.name == "control_map" &&
+			observation.control != (abi.ControlValue{}) {
+			closeOnError()
+			return nil, fmt.Errorf(
+				"freshly created control_map is already initialized; refusing rollback",
+			)
+		}
+		if previous, ok := seenIDs[observation.id]; ok {
+			closeOnError()
+			return nil, fmt.Errorf(
+				"pinned maps %q and %q unexpectedly share map ID %d",
+				previous, pin.descriptor.name, observation.id,
+			)
+		}
+		seenIDs[observation.id] = pin.descriptor.name
+	}
+	for _, pin := range pins {
+		if err := recheckPinnedMapEntry(handle, pin, "map identity preflight"); err != nil {
+			closeOnError()
+			return nil, err
 		}
 	}
-	if err := os.Remove(pinPath); err != nil && !errors.Is(err, os.ErrNotExist) {
-		if !strings.Contains(strings.ToLower(err.Error()), "directory not empty") {
-			errs = append(errs, fmt.Errorf("remove BPF pin path %s: %w", pinPath, err))
+	if err := handle.recheckTargetEntry(); err != nil {
+		closeOnError()
+		return nil, err
+	}
+	return pins, nil
+}
+
+func recheckPinnedMapEntry(
+	handle *pinPathHandle,
+	pin pinnedMapPin,
+	stage string,
+) error {
+	var stat unix.Stat_t
+	if err := unix.Fstatat(
+		handle.targetFD,
+		pin.descriptor.name,
+		&stat,
+		unix.AT_SYMLINK_NOFOLLOW,
+	); err != nil {
+		return fmt.Errorf(
+			"%s for %s/%s: %w",
+			stage, handle.pinPath, pin.descriptor.name, err,
+		)
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 ||
+		!samePinPathInode(pinPathInodeFromStat(&stat), pin.inode) {
+		return fmt.Errorf(
+			"%s for %s/%s: pin changed (mode=%#o links=%d)",
+			stage, handle.pinPath, pin.descriptor.name, stat.Mode, stat.Nlink,
+		)
+	}
+	mountID, err := handle.runtime.mountIDAt(
+		handle.targetFD,
+		pin.descriptor.name,
+		unix.AT_NO_AUTOMOUNT|unix.AT_SYMLINK_NOFOLLOW,
+	)
+	if err != nil {
+		return fmt.Errorf(
+			"%s mount for %s/%s: %w",
+			stage, handle.pinPath, pin.descriptor.name, err,
+		)
+	}
+	if mountID != handle.mountID {
+		return fmt.Errorf(
+			"%s for %s/%s: mount ID changed from %d to %d",
+			stage, handle.pinPath, pin.descriptor.name, handle.mountID, mountID,
+		)
+	}
+	return nil
+}
+
+func closePinnedMapPins(pins []pinnedMapPin) error {
+	var errs []error
+	for index := range pins {
+		if err := pins[index].observation.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close pinned map %s: %w", pins[index].descriptor.name, err))
 		}
 	}
 	return errors.Join(errs...)
+}
+
+func validateCollectionPinnedMaps(
+	handle *pinPathHandle,
+	collection *ebpf.Collection,
+	requireCommittedControl bool,
+) error {
+	return validateCollectionPinnedMapsWithPolicy(
+		handle,
+		collection,
+		requireCommittedControl,
+		false,
+	)
+}
+
+func validateFreshCollectionPinnedMaps(
+	handle *pinPathHandle,
+	collection *ebpf.Collection,
+) error {
+	return validateCollectionPinnedMapsWithPolicy(handle, collection, false, true)
+}
+
+func validateCollectionPinnedMapsWithPolicy(
+	handle *pinPathHandle,
+	collection *ebpf.Collection,
+	requireCommittedControl bool,
+	requireZeroControl bool,
+) error {
+	pins, err := inspectPinnedMapSetWithPolicy(
+		handle,
+		true,
+		requireCommittedControl,
+		requireZeroControl,
+	)
+	if err != nil {
+		return err
+	}
+	defer closePinnedMapPins(pins)
+	if len(pins) != len(pinnedMapDescriptors()) {
+		return fmt.Errorf(
+			"collection pin directory contains %d known maps, want %d",
+			len(pins), len(pinnedMapDescriptors()),
+		)
+	}
+	return validateCollectionMapIDs(collection, pins)
+}
+
+func validateCollectionMapIDs(collection *ebpf.Collection, pins []pinnedMapPin) error {
+	if collection == nil {
+		return errors.New("BPF collection is nil")
+	}
+	for _, pin := range pins {
+		collectionMap := collection.Maps[pin.descriptor.name]
+		if collectionMap == nil {
+			return fmt.Errorf("BPF collection missing map %q", pin.descriptor.name)
+		}
+		info, err := collectionMap.Info()
+		if err != nil {
+			return fmt.Errorf("inspect collection map %q: %w", pin.descriptor.name, err)
+		}
+		mapID, ok := info.ID()
+		if !ok || mapID == 0 {
+			return fmt.Errorf("collection map %q has no stable map ID", pin.descriptor.name)
+		}
+		if uint32(mapID) != pin.observation.id {
+			return fmt.Errorf(
+				"collection map %q has ID %d, pinned path has ID %d",
+				pin.descriptor.name, mapID, pin.observation.id,
+			)
+		}
+	}
+	return nil
+}
+
+func (plan *pinnedMapCleanupPlan) Execute() error {
+	return plan.execute(true, false, true)
+}
+
+func (plan *pinnedMapCleanupPlan) execute(
+	requireCommittedControl bool,
+	requireZeroControl bool,
+	removeEmptyDirectory bool,
+) error {
+	if plan == nil || plan.handle == nil {
+		return nil
+	}
+	handle := plan.handle
+	if err := handle.recheckTargetEntry(); err != nil {
+		return err
+	}
+
+	reopened := make([]pinnedMapPin, 0, len(plan.pins))
+	closeReopened := func() {
+		_ = closePinnedMapPins(reopened)
+	}
+	for _, original := range plan.pins {
+		var stat unix.Stat_t
+		if err := unix.Fstatat(
+			handle.targetFD,
+			original.descriptor.name,
+			&stat,
+			unix.AT_SYMLINK_NOFOLLOW,
+		); err != nil {
+			closeReopened()
+			return fmt.Errorf(
+				"recheck pinned map %s/%s before cleanup: %w",
+				handle.pinPath, original.descriptor.name, err,
+			)
+		}
+		if !samePinPathInode(pinPathInodeFromStat(&stat), original.inode) {
+			closeReopened()
+			return fmt.Errorf(
+				"pinned map %s/%s changed after cleanup preflight",
+				handle.pinPath, original.descriptor.name,
+			)
+		}
+		mountID, err := handle.runtime.mountIDAt(
+			handle.targetFD,
+			original.descriptor.name,
+			unix.AT_NO_AUTOMOUNT|unix.AT_SYMLINK_NOFOLLOW,
+		)
+		if err != nil {
+			closeReopened()
+			return fmt.Errorf(
+				"recheck pinned map mount %s/%s: %w",
+				handle.pinPath, original.descriptor.name, err,
+			)
+		}
+		if mountID != handle.mountID {
+			closeReopened()
+			return fmt.Errorf(
+				"pinned map %s/%s changed mount identity after cleanup preflight",
+				handle.pinPath, original.descriptor.name,
+			)
+		}
+
+		path := filepath.Join(handle.procPath(), original.descriptor.name)
+		observation, err := handle.runtime.loadPinnedMap(path, original.descriptor.name)
+		if err != nil {
+			closeReopened()
+			return fmt.Errorf(
+				"reload pinned map %s/%s before cleanup: %w",
+				handle.pinPath, original.descriptor.name, err,
+			)
+		}
+		current := pinnedMapPin{
+			descriptor:  original.descriptor,
+			inode:       pinPathInodeFromStat(&stat),
+			observation: observation,
+		}
+		reopened = append(reopened, current)
+		if err := validatePinnedMapObservation(
+			original.descriptor,
+			observation,
+			requireCommittedControl,
+		); err != nil {
+			closeReopened()
+			return err
+		}
+		if requireZeroControl && original.descriptor.name == "control_map" &&
+			observation.control != (abi.ControlValue{}) {
+			closeReopened()
+			return errors.New("freshly created control_map changed before rollback")
+		}
+		if observation.id != original.observation.id {
+			closeReopened()
+			return fmt.Errorf(
+				"pinned map %s/%s changed ID from %d to %d after cleanup preflight",
+				handle.pinPath, original.descriptor.name,
+				original.observation.id, observation.id,
+			)
+		}
+		if original.descriptor.name == "control_map" &&
+			observation.control != original.observation.control {
+			closeReopened()
+			return fmt.Errorf("pinned control_map identity changed after cleanup preflight")
+		}
+	}
+	for _, pin := range reopened {
+		if err := recheckPinnedMapEntry(handle, pin, "final map cleanup preflight"); err != nil {
+			closeReopened()
+			return err
+		}
+	}
+	if err := handle.recheckTargetEntry(); err != nil {
+		closeReopened()
+		return err
+	}
+
+	for _, pin := range reopened {
+		if err := unix.Unlinkat(handle.targetFD, pin.descriptor.name, 0); err != nil {
+			closeReopened()
+			return fmt.Errorf(
+				"remove pinned map %s/%s: %w",
+				handle.pinPath, pin.descriptor.name, err,
+			)
+		}
+	}
+	closeReopened()
+
+	if !removeEmptyDirectory {
+		return nil
+	}
+	empty, err := pinDirectoryIsEmpty(handle.targetFD, handle.pinPath)
+	if err != nil {
+		return err
+	}
+	if !empty {
+		return nil
+	}
+	if err := handle.recheckTargetEntry(); err != nil {
+		return err
+	}
+	if err := unix.Unlinkat(handle.parentFD, handle.base, unix.AT_REMOVEDIR); err != nil {
+		if errors.Is(err, unix.ENOTEMPTY) {
+			return nil
+		}
+		return fmt.Errorf("remove empty BPF pin path %s: %w", handle.pinPath, err)
+	}
+	return nil
+}
+
+func pinDirectoryIsEmpty(targetFD int, pinPath string) (bool, error) {
+	directoryFD, err := unix.Openat(
+		targetFD,
+		".",
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return false, fmt.Errorf("open BPF pin path %s for listing: %w", pinPath, err)
+	}
+	directory := os.NewFile(uintptr(directoryFD), pinPath)
+	entries, readErr := directory.ReadDir(1)
+	closeErr := directory.Close()
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return false, fmt.Errorf("inspect BPF pin path %s before removal: %w", pinPath, readErr)
+	}
+	if closeErr != nil {
+		return false, fmt.Errorf("close BPF pin path listing %s: %w", pinPath, closeErr)
+	}
+	return len(entries) == 0, nil
+}
+
+func (plan *pinnedMapCleanupPlan) Close() error {
+	if plan == nil {
+		return nil
+	}
+	pinErr := closePinnedMapPins(plan.pins)
+	plan.pins = nil
+	handleErr := plan.handle.Close()
+	plan.handle = nil
+	return errors.Join(pinErr, handleErr)
 }
 
 func attachPrograms(ifindex int, ingress *ebpf.Program, egress *ebpf.Program) error {

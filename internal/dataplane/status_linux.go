@@ -68,7 +68,20 @@ func inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
 }
 
 func inspectPinnedMaps(status *KernelStatus) error {
-	control, err := ebpf.LoadPinnedMap(filepath.Join(status.PinPath, "control_map"), nil)
+	validated, err := validatePinPath(status.PinPath, livePinPathValidator)
+	if err != nil {
+		return err
+	}
+	if !validated.exists {
+		return nil
+	}
+	handle, _, err := openPinPathHandle(status.PinPath, validated, false, livePinPathRuntime)
+	if err != nil {
+		return err
+	}
+	defer handle.Close()
+
+	control, err := ebpf.LoadPinnedMap(filepath.Join(handle.procPath(), "control_map"), nil)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -90,7 +103,7 @@ func inspectPinnedMaps(status *KernelStatus) error {
 		}
 	}
 
-	stats, err := ebpf.LoadPinnedMap(filepath.Join(status.PinPath, "stats_map"), nil)
+	stats, err := ebpf.LoadPinnedMap(filepath.Join(handle.procPath(), "stats_map"), nil)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
