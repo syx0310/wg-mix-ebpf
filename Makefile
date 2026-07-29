@@ -9,7 +9,7 @@ BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/incl
 BPF_OBJECT ?= build/wg_mix_tc.o
 EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 
-.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-bpf prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-lint test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-live-guard-test build-bpf prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -19,6 +19,16 @@ build-linux-amd64: prepare-embedded-bpf
 
 build-linux-arm64: prepare-embedded-bpf
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -o bin/wg-mix-ebpf-linux-arm64 ./cmd/wg-mix-ebpf
+
+# This convenience target is unprivileged. The fixed-tool, clean-tree checks in
+# the invoked script define the artifact gate; Make variables are not a sudo
+# or privileged execution boundary.
+build-live-guard-test:
+	@test -n "$$LIVE_GUARD_COMMIT" || { echo "LIVE_GUARD_COMMIT is required"; exit 2; }
+	@test -n "$$LIVE_GUARD_TEST_BINARY" || { echo "LIVE_GUARD_TEST_BINARY is required"; exit 2; }
+	scripts/build-live-guard-test.sh \
+		--candidate-commit "$$LIVE_GUARD_COMMIT" \
+		--output "$$LIVE_GUARD_TEST_BINARY"
 
 build-bpf:
 	@mkdir -p $(dir $(BPF_OBJECT))
@@ -65,10 +75,17 @@ test-lint:
 	@test -z "$$($(GOFMT) -l $$(find cmd internal -name '*.go' -type f))" || \
 		{ echo "gofmt required for:"; $(GOFMT) -l $$(find cmd internal -name '*.go' -type f); exit 1; }
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) vet ./...
-	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/test-live-guard-ownership.sh
+	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-live-guard-ownership.sh
 	scripts/inspect-linux-test-host.sh --self-test-nft-table-gate
 	scripts/provision-ubuntu-test-host.sh --self-test-apt-gate
+	scripts/build-live-guard-test.sh --self-test-safety-gate
 	scripts/test-live-guard-ownership.sh --self-test-safety-gate
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet -tags realhosttest ./internal/guard
+	@if command -v shellcheck >/dev/null 2>&1; then \
+		shellcheck scripts/build-live-guard-test.sh scripts/test-live-guard-ownership.sh; \
+	else \
+		echo "skip: shellcheck is unavailable"; \
+	fi
 	python3 -c 'from pathlib import Path; compile(Path("scripts/check-wg-pcap.py").read_text(), "scripts/check-wg-pcap.py", "exec")'
 
 test-config:

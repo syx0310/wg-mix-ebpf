@@ -3,7 +3,6 @@ package guard
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"os/exec"
@@ -205,21 +204,27 @@ func (e CommandExecutor) projectTables(ctx context.Context) ([]string, error) {
 }
 
 func parseProjectTableInventoryJSON(data []byte) ([]string, error) {
-	var document struct {
-		Nftables []map[string]json.RawMessage `json:"nftables"`
-	}
-	if err := json.Unmarshal(data, &document); err != nil {
+	items, err := parseNftJSONItems(data)
+	if err != nil {
 		return nil, fmt.Errorf("parse nft table inventory JSON: %w", err)
 	}
 	seen := make(map[string]struct{})
 	var tables []string
-	for index, item := range document.Nftables {
+	metainfoCount := 0
+	for index, item := range items {
 		if len(item) != 1 {
 			return nil, fmt.Errorf("nft table inventory item %d has %d object keys, want 1", index, len(item))
 		}
 		raw, isTable := item["table"]
 		if !isTable {
-			if _, isMetadata := item["metainfo"]; isMetadata {
+			if metainfo, isMetadata := item["metainfo"]; isMetadata {
+				metainfoCount++
+				if metainfoCount != 1 {
+					return nil, errors.New("nft table inventory contains duplicate metainfo")
+				}
+				if err := validateNftJSONMetainfo(metainfo); err != nil {
+					return nil, err
+				}
 				continue
 			}
 			for objectType := range item {
@@ -232,10 +237,13 @@ func parseProjectTableInventoryJSON(data []byte) ([]string, error) {
 			continue
 		}
 		var table struct {
-			Family string `json:"family"`
-			Name   string `json:"name"`
+			Family  string   `json:"family"`
+			Name    string   `json:"name"`
+			Handle  *uint64  `json:"handle"`
+			Comment *string  `json:"comment"`
+			Flags   []string `json:"flags"`
 		}
-		if err := json.Unmarshal(raw, &table); err != nil {
+		if err := decodeStrictJSON(raw, &table); err != nil {
 			return nil, fmt.Errorf("parse nft table inventory entry: %w", err)
 		}
 		if table.Family == "" || table.Name == "" {
@@ -249,6 +257,12 @@ func parseProjectTableInventoryJSON(data []byte) ([]string, error) {
 		}
 		seen[table.Name] = struct{}{}
 		tables = append(tables, table.Name)
+	}
+	if metainfoCount != 1 {
+		return nil, fmt.Errorf(
+			"nft table inventory metainfo entries = %d, want 1",
+			metainfoCount,
+		)
 	}
 	sort.Strings(tables)
 	return tables, nil
@@ -315,25 +329,42 @@ func (e CommandExecutor) inspect(ctx context.Context, table string) (tableIdenti
 }
 
 func parseTableIdentityJSON(data []byte, table string) (tableIdentity, error) {
-	var document struct {
-		Nftables []map[string]json.RawMessage `json:"nftables"`
-	}
-	if err := json.Unmarshal(data, &document); err != nil {
+	items, err := parseNftJSONItems(data)
+	if err != nil {
 		return tableIdentity{}, fmt.Errorf("parse nft JSON for table %s: %w", table, err)
 	}
 	var found []tableIdentity
-	for _, item := range document.Nftables {
+	metainfoCount := 0
+	for index, item := range items {
+		if len(item) != 1 {
+			return tableIdentity{}, fmt.Errorf(
+				"nft table inspection item %d has %d object keys, want 1",
+				index,
+				len(item),
+			)
+		}
+		if metainfo, ok := item["metainfo"]; ok {
+			metainfoCount++
+			if metainfoCount != 1 {
+				return tableIdentity{}, errors.New("nft table inspection contains duplicate metainfo")
+			}
+			if err := validateNftJSONMetainfo(metainfo); err != nil {
+				return tableIdentity{}, err
+			}
+			continue
+		}
 		raw, ok := item["table"]
 		if !ok {
 			continue
 		}
 		var listed struct {
-			Family  string `json:"family"`
-			Name    string `json:"name"`
-			Handle  uint64 `json:"handle"`
-			Comment string `json:"comment"`
+			Family  string   `json:"family"`
+			Name    string   `json:"name"`
+			Handle  uint64   `json:"handle"`
+			Comment string   `json:"comment"`
+			Flags   []string `json:"flags"`
 		}
-		if err := json.Unmarshal(raw, &listed); err != nil {
+		if err := decodeStrictJSON(raw, &listed); err != nil {
 			return tableIdentity{}, fmt.Errorf("parse nft table metadata for %s: %w", table, err)
 		}
 		if listed.Family == "inet" && listed.Name == table {
@@ -343,6 +374,12 @@ func parseTableIdentityJSON(data []byte, table string) (tableIdentity, error) {
 				Comment: listed.Comment,
 			})
 		}
+	}
+	if metainfoCount != 1 {
+		return tableIdentity{}, fmt.Errorf(
+			"nft table inspection metainfo entries = %d, want 1",
+			metainfoCount,
+		)
 	}
 	if len(found) != 1 {
 		return tableIdentity{}, fmt.Errorf("nft JSON contains %d metadata entries for inet table %s, want 1", len(found), table)

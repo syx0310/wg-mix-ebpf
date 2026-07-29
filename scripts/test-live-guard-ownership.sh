@@ -1,9 +1,13 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -euo pipefail
 
 readonly RUN_PREFIX="/var/lib/wg-mix-ebpf-test-runs"
 readonly PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 readonly LC_ALL="C"
+readonly ENV_BIN="/usr/bin/env"
+readonly PYTHON3_BIN="/usr/bin/python3"
+readonly SHA256_BIN="/usr/bin/sha256sum"
+readonly TIMEOUT_BIN="/usr/bin/timeout"
 export PATH LC_ALL
 umask 077
 
@@ -12,7 +16,21 @@ usage() {
 usage:
   scripts/test-live-guard-ownership.sh --self-test-safety-gate
 
-  sudo scripts/test-live-guard-ownership.sh \
+Privileged mode MUST NOT execute the user-owned repository script. For a
+reviewed run-id, first use separately approved fixed argv to install the exact
+reviewed script into:
+
+  /var/lib/wg-mix-ebpf-test-runs/<run-id>.gate/test-live-guard-ownership.sh
+
+The staging directory and script must be root-owned mode 0700, and the staged
+script SHA-256 must match the reviewed blob. Then invoke exactly:
+
+  sudo /usr/bin/env -i \
+    PATH=/usr/sbin:/usr/bin:/sbin:/bin \
+    LC_ALL=C \
+    /bin/bash \
+    /var/lib/wg-mix-ebpf-test-runs/g20260729t120000z-012345abcdef.gate/test-live-guard-ownership.sh \
+    --approved-script-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
     --expected-address 192.168.10.82 \
     --interface ens33 \
     --expected-hostname ubuntu-2604-test \
@@ -23,11 +41,10 @@ usage:
     --test-binary /absolute/path/guard-live.test \
     --test-binary-sha256 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 
-The normal mode is a privileged, mutating Linux gate. Its filesystem write
-set is the fixed project prefix (when it does not already exist) and one
-unique child:
+The outer, separately reviewed staging argv may create the fixed project
+prefix and the root-owned <run-id>.gate directory. This script requires those
+objects to exist and writes only one new unique child:
 
-  /var/lib/wg-mix-ebpf-test-runs
   /var/lib/wg-mix-ebpf-test-runs/<run-id>
 
 It temporarily creates one empty, instance-owned inet nftables guard table.
@@ -48,6 +65,7 @@ valid_sha256() {
 validate_secure_directory() {
   local path="$1"
   local expected_uid="$2"
+  local expected_mode="${3:-}"
   local resolved
   local uid
   local mode
@@ -74,6 +92,96 @@ validate_secure_directory() {
       "${path}" "${mode}" >&2
     return 1
   }
+  if [[ -n "${expected_mode}" && "${mode}" != "${expected_mode}" ]]; then
+    printf 'error: directory mode mismatch: path=%s mode=%s expected=%s\n' \
+      "${path}" "${mode}" "${expected_mode}" >&2
+    return 1
+  fi
+}
+
+run_isolated_python() {
+  local isolated_home="$1"
+  local isolated_tmp="$2"
+  shift 2
+
+  "${ENV_BIN}" -i \
+    "PATH=${PATH}" \
+    "LC_ALL=${LC_ALL}" \
+    "HOME=${isolated_home}" \
+    "TMPDIR=${isolated_tmp}" \
+    "${PYTHON3_BIN}" -I -B "$@"
+}
+
+validate_locked_script() {
+  local run_id="$1"
+  local expected_sha256="$2"
+  local gate_dir="${RUN_PREFIX}/${run_id}.gate"
+  local expected_path="${gate_dir}/test-live-guard-ownership.sh"
+  local configured_path="${BASH_SOURCE[0]}"
+  local resolved_path
+  local before_identity
+  local after_identity
+  local descriptor_path
+  local descriptor_identity
+  local script_shell_pid
+  local uid
+  local mode
+  local links
+  local kind
+  local actual_sha256
+
+  validate_secure_directory "${gate_dir}" 0 700
+  [[ "${configured_path}" == /* && -f "${configured_path}" && ! -L "${configured_path}" ]] || {
+    printf 'error: privileged gate script path is not absolute, regular, and non-symlink: %s\n' \
+      "${configured_path}" >&2
+    return 1
+  }
+  resolved_path="$(readlink -e -- "${configured_path}")"
+  [[ "${resolved_path}" == "${expected_path}" ]] || {
+    printf 'error: privileged gate script path mismatch: resolved=%s expected=%s\n' \
+      "${resolved_path}" "${expected_path}" >&2
+    return 1
+  }
+  read -r before_identity uid mode links kind < <(
+    stat -c '%d:%i %u %a %h %F' -- "${resolved_path}"
+  )
+  [[ "${uid}" == "0" && "${mode}" == "700" &&
+    "${links}" == "1" && "${kind}" == "regular file" ]] || {
+    printf 'error: staged gate script metadata is unsafe: uid=%s mode=%s links=%s type=%s\n' \
+      "${uid}" "${mode}" "${links}" "${kind}" >&2
+    return 1
+  }
+  script_shell_pid="${BASHPID}"
+  descriptor_path="/proc/${script_shell_pid}/fd/255"
+  [[ -r "${descriptor_path}" ]] || {
+    echo "error: Bash script descriptor 255 is unavailable" >&2
+    return 1
+  }
+  descriptor_identity="$(stat -Lc '%d:%i' -- "${descriptor_path}")"
+  [[ "${descriptor_identity}" == "${before_identity}" ]] || {
+    printf 'error: executing script descriptor identity %s does not match staged path %s\n' \
+      "${descriptor_identity}" "${before_identity}" >&2
+    return 1
+  }
+  actual_sha256="$("${SHA256_BIN}" -- "${descriptor_path}")"
+  actual_sha256="${actual_sha256%% *}"
+  [[ "${actual_sha256}" == "${expected_sha256}" ]] || {
+    printf 'error: staged gate script SHA-256 mismatch: got=%s want=%s\n' \
+      "${actual_sha256}" "${expected_sha256}" >&2
+    return 1
+  }
+  after_identity="$(stat -c '%d:%i' -- "${resolved_path}")"
+  [[ "${after_identity}" == "${before_identity}" ]] || {
+    echo "error: staged gate script identity changed while hashing" >&2
+    return 1
+  }
+}
+
+valid_live_test_list() {
+  local exit_code="$1"
+  local output="$2"
+
+  [[ "${exit_code}" == "0" && "${output}" == "TestLiveGuardOwnership" ]]
 }
 
 self_test_safety_gate() {
@@ -96,13 +204,29 @@ self_test_safety_gate() {
     echo "error: unsafe SHA-256 fixture was accepted" >&2
     return 1
   fi
+  valid_live_test_list 0 "TestLiveGuardOwnership" || {
+    echo "error: exact live test-list fixture was rejected" >&2
+    return 1
+  }
+  if valid_live_test_list 0 "" ||
+    valid_live_test_list 0 "PASS" ||
+    valid_live_test_list 0 $'TestLiveGuardOwnership\nTestOther' ||
+    valid_live_test_list 1 "TestLiveGuardOwnership"; then
+    echo "error: missing, ambiguous, or failed live test-list fixture was accepted" >&2
+    return 1
+  fi
   local fixture_run_id="g20260729t120000z-012345abcdef"
   [[ "${RUN_PREFIX}/${fixture_run_id}" == \
     "/var/lib/wg-mix-ebpf-test-runs/g20260729t120000z-012345abcdef" ]] || {
     echo "error: run directory derivation escaped its fixed prefix" >&2
     return 1
   }
-  PYTHONPATH="${PWD}" python3 - <<'PY'
+  [[ "${RUN_PREFIX}/${fixture_run_id}.gate/test-live-guard-ownership.sh" == \
+    "/var/lib/wg-mix-ebpf-test-runs/g20260729t120000z-012345abcdef.gate/test-live-guard-ownership.sh" ]] || {
+    echo "error: staged script derivation escaped its fixed prefix" >&2
+    return 1
+  }
+  PYTHONPATH="${PWD}" run_isolated_python "${PWD}" "/tmp" - <<'PY'
 import os
 import sys
 
@@ -128,12 +252,21 @@ CANDIDATE_COMMIT=""
 RUN_ID=""
 TEST_BINARY=""
 TEST_BINARY_SHA256=""
+APPROVED_SCRIPT_SHA256=""
 
 while (($# > 0)); do
   case "$1" in
   --self-test-safety-gate)
     SELF_TEST=1
     shift
+    ;;
+  --approved-script-sha256)
+    (($# >= 2)) || {
+      echo "error: --approved-script-sha256 requires a value" >&2
+      exit 2
+    }
+    APPROVED_SCRIPT_SHA256="$2"
+    shift 2
     ;;
   --expected-address)
     (($# >= 2)) || {
@@ -224,7 +357,7 @@ if ((SELF_TEST)); then
     -z "${EXPECTED_HOSTNAME}" && -z "${EXPECTED_KERNEL}" &&
     -z "${EXPECTED_MACHINE_ID}" && -z "${CANDIDATE_COMMIT}" &&
     -z "${RUN_ID}" && -z "${TEST_BINARY}" &&
-    -z "${TEST_BINARY_SHA256}" ]] || {
+    -z "${TEST_BINARY_SHA256}" && -z "${APPROVED_SCRIPT_SHA256}" ]] || {
     echo "error: --self-test-safety-gate does not accept host arguments" >&2
     exit 2
   }
@@ -268,6 +401,10 @@ valid_sha256 "${TEST_BINARY_SHA256}" || {
   echo "error: invalid --test-binary-sha256" >&2
   exit 2
 }
+valid_sha256 "${APPROVED_SCRIPT_SHA256}" || {
+  echo "error: invalid --approved-script-sha256" >&2
+  exit 2
+}
 [[ "${TEST_BINARY}" == /* && -f "${TEST_BINARY}" && ! -L "${TEST_BINARY}" ]] || {
   echo "error: --test-binary must name an absolute, regular, non-symlink file" >&2
   exit 2
@@ -277,7 +414,12 @@ valid_sha256 "${TEST_BINARY_SHA256}" || {
   exit 1
 }
 
-for command in awk date env hostname ip mkdir nft python3 readlink stat tee timeout uname; do
+[[ -x "${ENV_BIN}" && -x "${PYTHON3_BIN}" && -x "${SHA256_BIN}" &&
+  -x "${TIMEOUT_BIN}" ]] || {
+  echo "error: fixed system env/python3/sha256sum/timeout tools are unavailable" >&2
+  exit 1
+}
+for command in awk date grep hostname ip mkdir nft readlink stat tee uname; do
   command -v "${command}" >/dev/null || {
     printf 'error: required command is missing: %s\n' "${command}" >&2
     exit 1
@@ -310,21 +452,17 @@ fi
   exit 1
 }
 
-# shellcheck source=/dev/null
-. /etc/os-release
-[[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "26.04" ]] || {
-  printf 'error: expected Ubuntu 26.04, got %s %s\n' \
-    "${ID:-unknown}" "${VERSION_ID:-unknown}" >&2
+grep -qx 'ID=ubuntu' /etc/os-release &&
+  grep -qx 'VERSION_ID="26.04"' /etc/os-release || {
+  echo "error: /etc/os-release does not exactly identify Ubuntu 26.04" >&2
   exit 1
 }
 
 validate_secure_directory "/" 0
 validate_secure_directory "/var" 0
 validate_secure_directory "/var/lib" 0
-if [[ ! -e "${RUN_PREFIX}" ]]; then
-  mkdir --mode=0755 -- "${RUN_PREFIX}"
-fi
-validate_secure_directory "${RUN_PREFIX}" 0
+validate_secure_directory "${RUN_PREFIX}" 0 700
+validate_locked_script "${RUN_ID}" "${APPROVED_SCRIPT_SHA256}"
 
 readonly RUN_DIR="${RUN_PREFIX}/${RUN_ID}"
 [[ ! -e "${RUN_DIR}" && ! -L "${RUN_DIR}" ]] || {
@@ -332,20 +470,48 @@ readonly RUN_DIR="${RUN_PREFIX}/${RUN_ID}"
   exit 1
 }
 mkdir --mode=0700 -- "${RUN_DIR}"
-validate_secure_directory "${RUN_DIR}" 0
+validate_secure_directory "${RUN_DIR}" 0 700
 
 readonly STATE_DIR="${RUN_DIR}/state"
 readonly EVIDENCE_DIR="${RUN_DIR}/evidence"
 readonly TMP_DIR="${RUN_DIR}/tmp"
 readonly LOCKED_TEST_BINARY="${RUN_DIR}/guard-live.test"
 readonly OWNER_MARKER="${RUN_DIR}/run.owner"
+readonly EVIDENCE_LOG="${EVIDENCE_DIR}/guard-live.log"
+readonly RESULT_FILE="${EVIDENCE_DIR}/guard-live.result.json"
 
 mkdir --mode=0700 -- "${STATE_DIR}"
 mkdir --mode=0700 -- "${EVIDENCE_DIR}"
 mkdir --mode=0700 -- "${TMP_DIR}"
-validate_secure_directory "${STATE_DIR}" 0
-validate_secure_directory "${EVIDENCE_DIR}" 0
-validate_secure_directory "${TMP_DIR}" 0
+validate_secure_directory "${STATE_DIR}" 0 700
+validate_secure_directory "${EVIDENCE_DIR}" 0 700
+validate_secure_directory "${TMP_DIR}" 0 700
+cd -- "${RUN_DIR}"
+
+(
+  set -o noclobber
+  : >"${EVIDENCE_LOG}"
+)
+OUTER_ARGV=(
+  /bin/bash
+  "${BASH_SOURCE[0]}"
+  --approved-script-sha256 "${APPROVED_SCRIPT_SHA256}"
+  --expected-address "${EXPECTED_ADDRESS}"
+  --interface "${INTERFACE}"
+  --expected-hostname "${EXPECTED_HOSTNAME}"
+  --expected-kernel "${EXPECTED_KERNEL}"
+  --expected-machine-id "${EXPECTED_MACHINE_ID}"
+  --candidate-commit "${CANDIDATE_COMMIT}"
+  --run-id "${RUN_ID}"
+  --test-binary "${TEST_BINARY}"
+  --test-binary-sha256 "${TEST_BINARY_SHA256}"
+)
+readonly -a OUTER_ARGV
+printf 'gate_start timestamp=%s target_host=%s address=%s interface=%s run_dir=%s argv=' \
+  "$(date --iso-8601=seconds)" "${EXPECTED_HOSTNAME}" "${EXPECTED_ADDRESS}" \
+  "${INTERFACE}" "${RUN_DIR}" | tee -a "${EVIDENCE_LOG}"
+printf ' %q' "${OUTER_ARGV[@]}" | tee -a "${EVIDENCE_LOG}"
+printf '\n' | tee -a "${EVIDENCE_LOG}"
 
 (
   set -o noclobber
@@ -353,14 +519,44 @@ validate_secure_directory "${TMP_DIR}" 0
   {
     printf 'run_id=%s\n' "${RUN_ID}"
     printf 'candidate_commit=%s\n' "${CANDIDATE_COMMIT}"
+    printf 'approved_script_sha256=%s\n' "${APPROVED_SCRIPT_SHA256}"
     printf 'test_binary_sha256=%s\n' "${TEST_BINARY_SHA256}"
     printf 'machine_id=%s\n' "${EXPECTED_MACHINE_ID}"
     printf 'created_at=%s\n' "$(date --iso-8601=seconds)"
   } >"${OWNER_MARKER}"
 )
+[[ ! -e "${RESULT_FILE}" && ! -L "${RESULT_FILE}" ]] || {
+  echo "error: live result file unexpectedly exists before the test" >&2
+  exit 1
+}
 
-copied_sha="$(
-  python3 - "${TEST_BINARY}" "${LOCKED_TEST_BINARY}" <<'PY'
+COPY_ARGV=(
+  "${TIMEOUT_BIN}"
+  --signal=TERM
+  --kill-after=5s
+  30s
+  "${ENV_BIN}"
+  -i
+  "PATH=${PATH}"
+  "LC_ALL=${LC_ALL}"
+  "HOME=${RUN_DIR}"
+  "TMPDIR=${TMP_DIR}"
+  "${PYTHON3_BIN}"
+  -I
+  -B
+  -
+  "${TEST_BINARY}"
+  "${LOCKED_TEST_BINARY}"
+)
+readonly -a COPY_ARGV
+printf 'copy_start timestamp=%s argv=' "$(date --iso-8601=seconds)" |
+  tee -a "${EVIDENCE_LOG}"
+printf ' %q' "${COPY_ARGV[@]}" | tee -a "${EVIDENCE_LOG}"
+printf '\n' | tee -a "${EVIDENCE_LOG}"
+
+set +e
+copy_output="$(
+  "${COPY_ARGV[@]}" 2>&1 <<'PY'
 import hashlib
 import os
 import stat
@@ -380,18 +576,26 @@ try:
     )
     destination_fd = os.open(destination, destination_flags, 0o700)
     digest = hashlib.sha256()
+    remaining = source_stat.st_size
+    copied = 0
     try:
-        while True:
-            chunk = os.read(source_fd, 1024 * 1024)
+        while remaining:
+            chunk = os.read(source_fd, min(1024 * 1024, remaining))
             if not chunk:
-                break
+                raise RuntimeError("source test binary ended before its initial size")
             digest.update(chunk)
+            copied += len(chunk)
+            remaining -= len(chunk)
+            if copied > 128 * 1024 * 1024:
+                raise RuntimeError("source test binary exceeded the hard copy limit")
             view = memoryview(chunk)
             while view:
                 written = os.write(destination_fd, view)
                 if written <= 0:
                     raise RuntimeError("short write while locking test binary")
                 view = view[written:]
+        if os.read(source_fd, 1):
+            raise RuntimeError("source test binary grew while it was copied")
         os.fchmod(destination_fd, 0o700)
         os.fsync(destination_fd)
     finally:
@@ -409,6 +613,16 @@ finally:
     os.close(source_fd)
 PY
 )"
+copy_exit_code=$?
+set -e
+printf '%s\n' "${copy_output}" | tee -a "${EVIDENCE_LOG}"
+printf 'copy_finish timestamp=%s exit=%d\n' \
+  "$(date --iso-8601=seconds)" "${copy_exit_code}" | tee -a "${EVIDENCE_LOG}"
+if ((copy_exit_code != 0)); then
+  echo "error: bounded test-binary copy failed; run evidence was retained" >&2
+  exit "${copy_exit_code}"
+fi
+copied_sha="${copy_output}"
 [[ "${copied_sha}" == "${TEST_BINARY_SHA256}" ]] || {
   printf 'error: copied test binary SHA-256 mismatch: got=%s want=%s\n' \
     "${copied_sha}" "${TEST_BINARY_SHA256}" >&2
@@ -425,13 +639,44 @@ read -r locked_uid locked_mode locked_links locked_kind < <(
   exit 1
 }
 
-readonly EVIDENCE_LOG="${EVIDENCE_DIR}/guard-live.log"
+LIST_ARGV=(
+  "${TIMEOUT_BIN}"
+  --signal=TERM
+  --kill-after=2s
+  10s
+  "${ENV_BIN}"
+  -i
+  "PATH=${PATH}"
+  "LC_ALL=${LC_ALL}"
+  "HOME=${RUN_DIR}"
+  "TMPDIR=${TMP_DIR}"
+  "${LOCKED_TEST_BINARY}"
+  -test.list
+  '^TestLiveGuardOwnership$'
+)
+readonly -a LIST_ARGV
+printf 'list_start timestamp=%s argv=' "$(date --iso-8601=seconds)" |
+  tee -a "${EVIDENCE_LOG}"
+printf ' %q' "${LIST_ARGV[@]}" | tee -a "${EVIDENCE_LOG}"
+printf '\n' | tee -a "${EVIDENCE_LOG}"
+set +e
+list_output="$("${LIST_ARGV[@]}" 2>&1)"
+list_exit_code=$?
+set -e
+printf '%s\n' "${list_output}" | tee -a "${EVIDENCE_LOG}"
+printf 'list_finish timestamp=%s exit=%d\n' \
+  "$(date --iso-8601=seconds)" "${list_exit_code}" | tee -a "${EVIDENCE_LOG}"
+if ! valid_live_test_list "${list_exit_code}" "${list_output}"; then
+  echo "error: locked test binary does not contain exactly the reviewed live test" >&2
+  exit 1
+fi
+
 TEST_ARGV=(
-  timeout
+  "${TIMEOUT_BIN}"
   --signal=TERM
   --kill-after=5s
   60s
-  env
+  "${ENV_BIN}"
   -i
   "PATH=${PATH}"
   "LC_ALL=${LC_ALL}"
@@ -444,6 +689,7 @@ TEST_ARGV=(
   "WG_MIX_EBPF_LIVE_GUARD_EXPECTED_KERNEL=${EXPECTED_KERNEL}"
   "WG_MIX_EBPF_LIVE_GUARD_EXPECTED_MACHINE_ID=${EXPECTED_MACHINE_ID}"
   "WG_MIX_EBPF_LIVE_GUARD_CANDIDATE_COMMIT=${CANDIDATE_COMMIT}"
+  "WG_MIX_EBPF_LIVE_GUARD_RESULT_FILE=${RESULT_FILE}"
   "${LOCKED_TEST_BINARY}"
   -test.run
   '^TestLiveGuardOwnership$'
@@ -456,22 +702,123 @@ readonly -a TEST_ARGV
 printf 'write_start timestamp=%s target_host=%s run_dir=%s candidate=%s binary_sha256=%s argv=' \
   "$(date --iso-8601=seconds)" "${EXPECTED_HOSTNAME}" "${RUN_DIR}" \
   "${CANDIDATE_COMMIT}" "${TEST_BINARY_SHA256}" |
-  tee "${EVIDENCE_LOG}"
+  tee -a "${EVIDENCE_LOG}"
 printf ' %q' "${TEST_ARGV[@]}" | tee -a "${EVIDENCE_LOG}"
 printf '\n' | tee -a "${EVIDENCE_LOG}"
 
-cd -- "${RUN_DIR}"
 set +e
 "${TEST_ARGV[@]}" 2>&1 | tee -a "${EVIDENCE_LOG}"
-test_status=${PIPESTATUS[0]}
+pipeline_exit_codes=("${PIPESTATUS[@]}")
+test_exit_code=${pipeline_exit_codes[0]}
+tee_exit_code=${pipeline_exit_codes[1]}
 set -e
 
-printf 'write_finish timestamp=%s exit=%d evidence=%s\n' \
-  "$(date --iso-8601=seconds)" "${test_status}" "${EVIDENCE_LOG}" |
+printf 'write_finish timestamp=%s test_exit=%d tee_exit=%d evidence=%s\n' \
+  "$(date --iso-8601=seconds)" "${test_exit_code}" "${tee_exit_code}" "${EVIDENCE_LOG}" |
   tee -a "${EVIDENCE_LOG}"
-if ((test_status != 0)); then
+if ((test_exit_code != 0 || tee_exit_code != 0)); then
   echo "error: live guard gate failed; evidence and any owned nft table were retained" >&2
-  exit "${test_status}"
+  if ((test_exit_code != 0)); then
+    exit "${test_exit_code}"
+  fi
+  exit 1
 fi
 
+run_isolated_python "${RUN_DIR}" "${TMP_DIR}" - \
+  "${RESULT_FILE}" "${RUN_ID}" "${CANDIDATE_COMMIT}" <<'PY' 2>&1 |
+  tee -a "${EVIDENCE_LOG}"
+import hashlib
+import json
+import os
+import re
+import stat
+import sys
+
+path, expected_run_id, expected_commit = sys.argv[1:4]
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+result_fd = os.open(path, flags)
+try:
+    result_stat = os.fstat(result_fd)
+    if not stat.S_ISREG(result_stat.st_mode):
+        raise RuntimeError("live result is not a regular file")
+    if stat.S_IMODE(result_stat.st_mode) != 0o600:
+        raise RuntimeError("live result mode is not 0600")
+    if result_stat.st_uid != 0 or result_stat.st_nlink != 1:
+        raise RuntimeError("live result ownership or link count is unsafe")
+    if result_stat.st_size <= 0 or result_stat.st_size > 4096:
+        raise RuntimeError("live result size is outside the 1..4096 byte gate")
+    data = bytearray()
+    while len(data) <= 4096:
+        chunk = os.read(result_fd, 4097 - len(data))
+        if not chunk:
+            break
+        data.extend(chunk)
+    if len(data) != result_stat.st_size or len(data) > 4096:
+        raise RuntimeError("live result size changed while reading")
+    named_stat = os.stat(path, follow_symlinks=False)
+    if (named_stat.st_dev, named_stat.st_ino) != (result_stat.st_dev, result_stat.st_ino):
+        raise RuntimeError("live result name does not match the opened descriptor")
+finally:
+    os.close(result_fd)
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+document = json.loads(data, object_pairs_hook=unique_object)
+expected_keys = {
+    "version",
+    "run_id",
+    "candidate_commit",
+    "table",
+    "marker",
+    "first_handle",
+    "second_handle",
+    "owner_sha256",
+    "cleanup_verified",
+}
+if not isinstance(document, dict) or set(document) != expected_keys:
+    raise RuntimeError(f"live result keys are invalid: {sorted(document)}")
+if document["version"] != 1:
+    raise RuntimeError("live result version is not 1")
+if document["run_id"] != expected_run_id:
+    raise RuntimeError("live result run_id mismatch")
+if document["candidate_commit"] != expected_commit:
+    raise RuntimeError("live result candidate_commit mismatch")
+installation_id = document["marker"].removeprefix("wg-mix-ebpf-guard-v2:")
+if not re.fullmatch(r"[0-9a-f]{64}", installation_id):
+    raise RuntimeError("live result marker is invalid")
+if document["table"] != f"wg_mix_ebpf_guard_{installation_id[:32]}":
+    raise RuntimeError("live result table does not match its marker")
+first_handle = document["first_handle"]
+second_handle = document["second_handle"]
+if (
+    not isinstance(first_handle, int)
+    or isinstance(first_handle, bool)
+    or not isinstance(second_handle, int)
+    or isinstance(second_handle, bool)
+    or first_handle <= 0
+    or second_handle <= 0
+    or first_handle == second_handle
+):
+    raise RuntimeError("live result handles do not prove replacement")
+if not re.fullmatch(r"[0-9a-f]{64}", document["owner_sha256"]):
+    raise RuntimeError("live result owner_sha256 is invalid")
+if document["cleanup_verified"] is not True:
+    raise RuntimeError("live result does not prove cleanup")
+print(
+    "result_verified"
+    f" sha256={hashlib.sha256(data).hexdigest()}"
+    f" table={document['table']}"
+    f" first_handle={first_handle}"
+    f" second_handle={second_handle}"
+)
+PY
+
+printf 'gate_finish timestamp=%s result=%s\n' \
+  "$(date --iso-8601=seconds)" "${RESULT_FILE}" | tee -a "${EVIDENCE_LOG}"
 echo "live guard ownership gate passed; run-owned evidence was retained"

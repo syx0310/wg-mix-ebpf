@@ -120,8 +120,8 @@ func TestParseProjectTableInventoryJSONRejectsDuplicateMetadata(t *testing.T) {
 
 func TestParseProjectTableInventoryJSONRejectsUnknownObjects(t *testing.T) {
 	for _, document := range []string{
-		`{"nftables": [{"chain": {"family": "inet", "table": "unrelated", "name": "input"}}]}`,
-		`{"nftables": [{"table": {"family": "inet"}}]}`,
+		`{"nftables": [{"metainfo": {"json_schema_version": 1}}, {"chain": {"family": "inet", "table": "unrelated", "name": "input"}}]}`,
+		`{"nftables": [{"metainfo": {"json_schema_version": 1}}, {"table": {"family": "inet"}}]}`,
 		`{"nftables": [{}]}`,
 	} {
 		if _, err := parseProjectTableInventoryJSON([]byte(document)); err == nil {
@@ -134,6 +134,7 @@ func TestParseTableIdentityJSONRejectsMissingHandle(t *testing.T) {
 	const table = "wg_mix_ebpf_guard_0123456789abcdef"
 	_, err := parseTableIdentityJSON([]byte(`{
 		"nftables": [
+			{"metainfo": {"json_schema_version": 1}},
 			{"table": {
 				"family": "inet",
 				"name": "wg_mix_ebpf_guard_0123456789abcdef",
@@ -143,6 +144,27 @@ func TestParseTableIdentityJSONRejectsMissingHandle(t *testing.T) {
 	}`), table)
 	if err == nil || !strings.Contains(err.Error(), "non-zero handle") {
 		t.Fatalf("missing table handle should fail closed, got %v", err)
+	}
+}
+
+func TestParseProjectTableInventoryJSONFailsClosedOnDocumentDrift(t *testing.T) {
+	documents := map[string]string{
+		"missing-array":       `{}`,
+		"null-array":          `{"nftables": null}`,
+		"unknown-root":        `{"nftables": [], "unexpected": true}`,
+		"missing-metainfo":    `{"nftables": []}`,
+		"duplicate-metainfo":  `{"nftables": [{"metainfo": {"json_schema_version": 1}}, {"metainfo": {"json_schema_version": 1}}]}`,
+		"unknown-table-field": `{"nftables": [{"metainfo": {"json_schema_version": 1}}, {"table": {"family": "inet", "name": "clean", "unexpected": true}}]}`,
+		"unsupported-schema":  `{"nftables": [{"metainfo": {"json_schema_version": 2}}]}`,
+		"duplicate-root-key":  `{"nftables": [], "nftables": []}`,
+		"duplicate-table-key": `{"nftables": [{"metainfo": {"json_schema_version": 1}}, {"table": {"family": "inet", "family": "ip", "name": "clean"}}]}`,
+	}
+	for name, document := range documents {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseProjectTableInventoryJSON([]byte(document)); err == nil {
+				t.Fatalf("drifted nft inventory was accepted: %s", document)
+			}
+		})
 	}
 }
 

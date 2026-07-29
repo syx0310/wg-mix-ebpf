@@ -13,7 +13,6 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -32,6 +31,18 @@ var liveGuardRunIDPattern = regexp.MustCompile(`^g[0-9]{8}t[0-9]{6}z-[0-9a-f]{12
 // test binary. The runtime harness compares it with its reviewed candidate.
 var liveGuardBuiltCommit = "unset"
 
+type liveGuardResult struct {
+	Version         int    `json:"version"`
+	RunID           string `json:"run_id"`
+	CandidateCommit string `json:"candidate_commit"`
+	Table           string `json:"table"`
+	Marker          string `json:"marker"`
+	FirstHandle     uint64 `json:"first_handle"`
+	SecondHandle    uint64 `json:"second_handle"`
+	OwnerSHA256     string `json:"owner_sha256"`
+	CleanupVerified bool   `json:"cleanup_verified"`
+}
+
 func TestLiveGuardOwnership(t *testing.T) {
 	if os.Getenv(liveGuardEnabled) != "1" {
 		t.Skip("live guard mutation requires the locked realhost harness")
@@ -48,6 +59,16 @@ func TestLiveGuardOwnership(t *testing.T) {
 	wantStateDir := filepath.Join(liveGuardRunPrefix, runID, "state")
 	if stateDir != wantStateDir || filepath.Clean(stateDir) != stateDir {
 		t.Fatalf("live guard state directory = %q, want %q", stateDir, wantStateDir)
+	}
+	resultFile := requiredLiveGuardEnv(t, "WG_MIX_EBPF_LIVE_GUARD_RESULT_FILE")
+	wantResultFile := filepath.Join(
+		liveGuardRunPrefix,
+		runID,
+		"evidence",
+		"guard-live.result.json",
+	)
+	if resultFile != wantResultFile || filepath.Clean(resultFile) != resultFile {
+		t.Fatalf("live guard result file = %q, want %q", resultFile, wantResultFile)
 	}
 	commit := requiredLiveGuardEnv(t, "WG_MIX_EBPF_LIVE_GUARD_CANDIDATE_COMMIT")
 	if matched, _ := regexp.MatchString(`^[0-9a-f]{40}$`, commit); !matched {
@@ -72,7 +93,21 @@ func TestLiveGuardOwnership(t *testing.T) {
 	if len(plan.Rules) != 0 {
 		t.Fatalf("live guard plan must be empty, got rules %v", plan.Rules)
 	}
-	executor := NewCommandExecutor(stateDir)
+	realExecutor := NewCommandExecutor(stateDir)
+	executor := realExecutor
+	nftWrites := 0
+	executor.runScript = func(ctx context.Context, script string) error {
+		nftWrites++
+		digest := sha256.Sum256([]byte(script))
+		t.Logf(
+			"nft_write=%d argv=%q script_sha256=%x script=%q",
+			nftWrites,
+			[]string{"nft", "-f", "-"},
+			digest,
+			script,
+		)
+		return realExecutor.run(ctx, script)
+	}
 
 	t.Logf("candidate=%s phase=create state_dir=%s", commit, stateDir)
 	if err := executor.Apply(ctx, plan); err != nil {
@@ -131,6 +166,12 @@ func TestLiveGuardOwnership(t *testing.T) {
 	if err := requireOwnedTable(secondOwner, secondIdentity); err != nil {
 		t.Fatalf("replaced table ownership: %v", err)
 	}
+	if secondIdentity.Handle == firstIdentity.Handle {
+		t.Fatalf(
+			"replacement retained table handle %d; replacement was not proven",
+			firstIdentity.Handle,
+		)
+	}
 	inspectLiveGuardTableShape(t, ctx, secondOwner, secondIdentity.Handle)
 	requireNoPendingOwnerPublication(t, stateDir)
 	t.Logf("phase=replace table=%s handle=%d", secondOwner.Table, secondIdentity.Handle)
@@ -157,6 +198,20 @@ func TestLiveGuardOwnership(t *testing.T) {
 	if finalOwnerData := readLiveOwnerRecord(t, stateDir); string(finalOwnerData) != string(firstOwnerData) {
 		t.Fatal("cleanup changed the durable owner record")
 	}
+	if nftWrites != 3 {
+		t.Fatalf("live guard nft write transactions = %d, want create/replace/delete", nftWrites)
+	}
+	writeLiveGuardResult(t, resultFile, liveGuardResult{
+		Version:         1,
+		RunID:           runID,
+		CandidateCommit: commit,
+		Table:           firstOwner.Table,
+		Marker:          firstOwner.Marker,
+		FirstHandle:     firstIdentity.Handle,
+		SecondHandle:    secondIdentity.Handle,
+		OwnerSHA256:     hex.EncodeToString(firstOwnerDigest[:]),
+		CleanupVerified: true,
+	})
 	t.Log("live guard ownership create/replace/handle-cleanup gate passed")
 }
 
@@ -219,22 +274,15 @@ func requireNoPendingOwnerPublication(t *testing.T, stateDir string) {
 
 func listProjectGuardTables(t *testing.T, ctx context.Context) []string {
 	t.Helper()
-	command := exec.CommandContext(ctx, "nft", "list", "tables")
+	command := exec.CommandContext(ctx, "nft", "-j", "list", "tables")
 	output, err := command.CombinedOutput()
 	if err != nil {
-		t.Fatalf("list nftables tables: %v: %s", err, output)
+		t.Fatalf("list nftables tables as JSON: %v: %s", err, output)
 	}
-	var tables []string
-	for _, line := range strings.Split(string(output), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) != 3 || fields[0] != "table" || fields[1] != "inet" {
-			continue
-		}
-		if fields[2] == TableName || strings.HasPrefix(fields[2], TableName+"_") {
-			tables = append(tables, fields[2])
-		}
+	tables, err := parseProjectTableInventoryJSON(output)
+	if err != nil {
+		t.Fatalf("validate nftables project table inventory: %v", err)
 	}
-	sort.Strings(tables)
 	return tables
 }
 
@@ -250,59 +298,55 @@ func inspectLiveGuardTableShape(
 	if err != nil {
 		t.Fatalf("list live guard table JSON: %v: %s", err, output)
 	}
-	var document struct {
-		Nftables []map[string]json.RawMessage `json:"nftables"`
+	if err := validateLiveGuardTableShapeJSON(output, owner, expectedHandle); err != nil {
+		t.Fatalf("validate live guard table shape: %v", err)
 	}
-	if err := json.Unmarshal(output, &document); err != nil {
-		t.Fatalf("parse live guard table JSON: %v", err)
+}
+
+func writeLiveGuardResult(t *testing.T, path string, result liveGuardResult) {
+	t.Helper()
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		t.Fatal(err)
 	}
-	tableCount := 0
-	ruleCount := 0
-	chains := make(map[string]string)
-	for _, item := range document.Nftables {
-		if raw, ok := item["table"]; ok {
-			var table struct {
-				Family  string `json:"family"`
-				Name    string `json:"name"`
-				Comment string `json:"comment"`
-				Handle  uint64 `json:"handle"`
-			}
-			if err := json.Unmarshal(raw, &table); err != nil {
-				t.Fatal(err)
-			}
-			if table.Family == "inet" && table.Name == owner.Table {
-				tableCount++
-				if table.Comment != owner.Marker || table.Handle != expectedHandle {
-					t.Fatalf("live table identity mismatch: %#v", table)
-				}
-			}
+	data = append(data, '\n')
+	if len(data) > 4096 {
+		t.Fatalf("live guard result is too large: %d bytes", len(data))
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		t.Fatalf("create live guard result: %v", err)
+	}
+	written := 0
+	for written < len(data) {
+		count, writeErr := file.Write(data[written:])
+		if writeErr != nil {
+			_ = file.Close()
+			t.Fatalf("write live guard result: %v", writeErr)
 		}
-		if raw, ok := item["chain"]; ok {
-			var chain struct {
-				Family string `json:"family"`
-				Table  string `json:"table"`
-				Name   string `json:"name"`
-				Policy string `json:"policy"`
-			}
-			if err := json.Unmarshal(raw, &chain); err != nil {
-				t.Fatal(err)
-			}
-			if chain.Family == "inet" && chain.Table == owner.Table {
-				chains[chain.Name] = chain.Policy
-			}
+		if count == 0 {
+			_ = file.Close()
+			t.Fatal("write live guard result: zero-byte write")
 		}
-		if _, ok := item["rule"]; ok {
-			ruleCount++
-		}
+		written += count
 	}
-	if tableCount != 1 {
-		t.Fatalf("live guard table metadata entries = %d, want 1", tableCount)
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		t.Fatalf("sync live guard result: %v", err)
 	}
-	if ruleCount != 0 {
-		t.Fatalf("empty live guard unexpectedly has %d rules", ruleCount)
+	if err := file.Close(); err != nil {
+		t.Fatalf("close live guard result: %v", err)
 	}
-	if len(chains) != 2 || chains["input"] != "accept" || chains["output"] != "accept" {
-		t.Fatalf("live guard chains = %v, want input/output accept", chains)
+	directory, err := os.Open(filepath.Dir(path))
+	if err != nil {
+		t.Fatalf("open live guard evidence directory: %v", err)
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		t.Fatalf("sync live guard evidence directory: %v", err)
+	}
+	if err := directory.Close(); err != nil {
+		t.Fatalf("close live guard evidence directory: %v", err)
 	}
 }
 
