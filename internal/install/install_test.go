@@ -2401,8 +2401,11 @@ func TestRunCommandFromVerifiedFile(t *testing.T) {
 }
 
 func TestVerifiedOpenWrtInitRestoresInstalledServiceIdentity(t *testing.T) {
-	if runtime.GOOS != "linux" {
-		t.Skip("verified OpenWrt descriptor sourcing is Linux-specific")
+	descriptorPath := "/proc/self/fd/3"
+	if runtime.GOOS == "darwin" {
+		descriptorPath = "/dev/fd/3"
+	} else if runtime.GOOS != "linux" {
+		t.Skip("verified OpenWrt descriptor sourcing requires a procfs or devfs FD path")
 	}
 	initPath := "/etc/init.d/wg-mix-ebpf"
 	configPath := "/etc/wg-mix-ebpf/config.yaml"
@@ -2439,7 +2442,7 @@ printf '%s\n%s\n%s\n%s\n' \
 		t.Context(),
 		"/bin/sh",
 		harnessPath,
-		"/proc/self/fd/3",
+		descriptorPath,
 		resultPath,
 	)
 	cmd.ExtraFiles = []*os.File{file}
@@ -2450,7 +2453,7 @@ printf '%s\n%s\n%s\n%s\n' \
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "/proc/self/fd/3\n" +
+	want := descriptorPath + "\n" +
 		initPath + "\n" +
 		"wg-mix-ebpf\n" +
 		configPath + "\n"
