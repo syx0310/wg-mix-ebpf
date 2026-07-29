@@ -357,6 +357,14 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if egress == nil {
 		return fmt.Errorf("BPF object missing program %q", egressFilterName)
 	}
+	ingressIdentity, err := tcProgramIdentityFromProgram(ingress)
+	if err != nil {
+		return fmt.Errorf("inspect ingress TC program: %w", err)
+	}
+	egressIdentity, err := tcProgramIdentityFromProgram(egress)
+	if err != nil {
+		return fmt.Errorf("inspect egress TC program: %w", err)
+	}
 	if freshPins {
 		err = validateFreshCollectionPinnedMaps(handle, coll)
 	} else {
@@ -369,40 +377,27 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 
-	if freshPins {
-		// A first deployment has no older attached program observing the
-		// generation switch. Commit ownership before TC writes so an attach
-		// failure remains recoverable through the normal Detach path.
-		if err := commitControl(coll, snapshot.Control[abi.ControlKeyGlobal]); err != nil {
-			return err
-		}
-		rollbackFreshPins = false
-		if err := deleteStaleMapEntries(coll, snapshot); err != nil {
-			return err
-		}
-		if err := validateCollectionPinnedMaps(handle, coll, true); err != nil {
-			return fmt.Errorf("validate committed collection pins under %s: %w", pinPath, err)
-		}
+	attachPlan, err := prepareTCAttachPlan(
+		state,
+		ingressIdentity,
+		egressIdentity,
+		liveTCRuntime,
+	)
+	if err != nil {
+		return fmt.Errorf("preflight TC attachment transaction: %w", err)
 	}
-
-	for _, u := range state.Underlays {
-		if !u.Resolved || u.Role == "parse_only" || u.Role == "disabled" {
-			continue
-		}
-		if err := attachPrograms(u.IfIndex, ingress, egress); err != nil {
-			return fmt.Errorf("attach underlay %s(%d): %w", u.Name, u.IfIndex, err)
-		}
+	defer attachPlan.Close()
+	if err := attachPlan.Execute(func() error {
+		return commitControl(coll, snapshot.Control[abi.ControlKeyGlobal])
+	}); err != nil {
+		return err
 	}
-	if !freshPins {
-		if err := commitControl(coll, snapshot.Control[abi.ControlKeyGlobal]); err != nil {
-			return err
-		}
-		if err := deleteStaleMapEntries(coll, snapshot); err != nil {
-			return err
-		}
-		if err := validateCollectionPinnedMaps(handle, coll, true); err != nil {
-			return fmt.Errorf("validate committed collection pins under %s: %w", pinPath, err)
-		}
+	rollbackFreshPins = false
+	if err := deleteStaleMapEntries(coll, snapshot); err != nil {
+		return err
+	}
+	if err := validateCollectionPinnedMaps(handle, coll, true); err != nil {
+		return fmt.Errorf("validate committed collection pins under %s: %w", pinPath, err)
 	}
 	return nil
 }
@@ -1900,56 +1895,6 @@ func (plan *pinnedMapCleanupPlan) Close() error {
 	return errors.Join(pinErr, handleErr)
 }
 
-func attachPrograms(ifindex int, ingress *ebpf.Program, egress *ebpf.Program) error {
-	link, err := netlink.LinkByIndex(ifindex)
-	if err != nil {
-		return err
-	}
-	if err := ensureClsact(link); err != nil {
-		return err
-	}
-	if err := replaceBpfFilter(link, netlink.HANDLE_MIN_INGRESS, ingressHandle, ingressFilterName, ingress.FD()); err != nil {
-		return err
-	}
-	if err := replaceBpfFilter(link, netlink.HANDLE_MIN_EGRESS, egressHandle, egressFilterName, egress.FD()); err != nil {
-		return err
-	}
-	return nil
-}
-
-func ensureClsact(link netlink.Link) error {
-	qdisc := &netlink.Clsact{
-		QdiscAttrs: netlink.QdiscAttrs{
-			LinkIndex: link.Attrs().Index,
-			Handle:    netlink.MakeHandle(0xffff, 0),
-			Parent:    netlink.HANDLE_CLSACT,
-		},
-	}
-	if err := netlink.QdiscAdd(qdisc); err != nil && !isExists(err) {
-		return err
-	}
-	return nil
-}
-
-func replaceBpfFilter(link netlink.Link, parent uint32, handle uint32, name string, fd int) error {
-	filter := &netlink.BpfFilter{
-		FilterAttrs: netlink.FilterAttrs{
-			LinkIndex: link.Attrs().Index,
-			Parent:    parent,
-			Handle:    handle,
-			Protocol:  unix.ETH_P_ALL,
-			Priority:  filterPriority,
-		},
-		Fd:           fd,
-		Name:         name,
-		DirectAction: true,
-	}
-	if err := netlink.FilterReplace(filter); err != nil {
-		return err
-	}
-	return deleteDuplicateNamedFilters(link, parent, name, handle)
-}
-
 func detachPrograms(ifindex int) error {
 	link, err := netlink.LinkByIndex(ifindex)
 	if err != nil {
@@ -1981,29 +1926,6 @@ func deleteAgentFilter(link netlink.Link, parent uint32, name string, handle uin
 		}
 	}
 	return errors.Join(errs...)
-}
-
-func deleteDuplicateNamedFilters(link netlink.Link, parent uint32, name string, keepHandle uint32) error {
-	filters, err := netlink.FilterList(link, parent)
-	if err != nil {
-		return err
-	}
-	var errs []error
-	for _, f := range filters {
-		bpfFilter, ok := f.(*netlink.BpfFilter)
-		attrs := f.Attrs()
-		if !ok || bpfFilter.Name != name || attrs.Priority != filterPriority || attrs.Handle == keepHandle {
-			continue
-		}
-		if err := netlink.FilterDel(f); err != nil && !isNotFound(err) {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
-}
-
-func isExists(err error) bool {
-	return errors.Is(err, os.ErrExist) || strings.Contains(strings.ToLower(err.Error()), "file exists")
 }
 
 func isNotFound(err error) bool {
