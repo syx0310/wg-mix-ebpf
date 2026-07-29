@@ -10,5 +10,5 @@ import (
 )
 
 func TestMain(m *testing.M) {
-	os.Exit(testutil.RunWithPrivateUmask(m))
+	os.Exit(testutil.RunWithStandardUmask(m.Run))
 }
