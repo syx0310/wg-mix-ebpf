@@ -453,7 +453,7 @@ tmpdir_gate_shell_self_test() {
   [[ "${environment_probe}" == "${expected_environment}" ]] || return 1
   option_environment_probe="$(
     run_isolated_environment \
-      "/controlled/tmp" 1 "-i" "${ENV_BIN}"
+      "/controlled/tmp" 1 "--" "${ENV_BIN}"
   )"
   [[ "${option_environment_probe}" == "${expected_environment}" ]] || return 1
 }
