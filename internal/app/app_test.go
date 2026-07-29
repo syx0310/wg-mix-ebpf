@@ -101,19 +101,26 @@ func TestGuardCleanupDryRun(t *testing.T) {
 	if err := Run(t.Context(), []string{"guard-cleanup", "--config", cfgPath, "--offline", "--dry-run"}, &stdout, &stderr); err != nil {
 		t.Fatalf("Run returned error: %v stderr=%s", err, stderr.String())
 	}
-	if !bytes.Contains(stdout.Bytes(), []byte("delete table inet wg_mix_ebpf_guard")) {
-		t.Fatalf("guard cleanup dry-run missing cleanup script: %s", stdout.String())
+	if !bytes.Contains(stdout.Bytes(), []byte("delete table inet handle <validated-handle>")) ||
+		bytes.Contains(stdout.Bytes(), []byte("delete table inet wg_mix_ebpf_guard")) {
+		t.Fatalf("guard cleanup dry-run must require validated ownership: %s", stdout.String())
 	}
 }
 
 func TestStopFallbackDetachDryRunOffline(t *testing.T) {
 	cfgPath := writeTestConfig(t, "[Interface]\nFwMark = 0x10000002\n")
 	dir := t.TempDir()
+	dir, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
 	fakeBin := filepath.Join(dir, "bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte(
+		"#!/bin/sh\nprintf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\nexit 1\n",
+	), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
