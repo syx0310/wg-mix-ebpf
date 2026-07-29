@@ -34,6 +34,11 @@ type LifecycleLease struct {
 
 type lifecyclePathContextKey struct{}
 
+type lifecycleContext struct {
+	path              string
+	validateAfterLock func() error
+}
+
 // WithLifecyclePathForTest redirects the global lifecycle lease for a test
 // context. Production entrypoints never expose this through flags or
 // environment variables.
@@ -41,13 +46,35 @@ func WithLifecyclePathForTest(ctx context.Context, path string) context.Context 
 	if flag.Lookup("test.v") == nil {
 		panic("WithLifecyclePathForTest is only available in Go test binaries")
 	}
-	return context.WithValue(ctx, lifecyclePathContextKey{}, path)
+	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{path: path})
+}
+
+// WithIsolatedNetNSTestLifecyclePath redirects the lifecycle lease for the
+// explicitly gated, non-initial-network-namespace smoke-test path. Callers
+// must validate the complete run-owned layout before using this helper.
+func WithIsolatedNetNSTestLifecyclePath(ctx context.Context, path string) context.Context {
+	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{path: path})
+}
+
+// WithIsolatedNetNSTestLifecycleValidation redirects the lifecycle lease and
+// revalidates the isolated test contract after the lease is held. This closes
+// the gap between an initial path check and a delayed mutation.
+func WithIsolatedNetNSTestLifecycleValidation(
+	ctx context.Context,
+	path string,
+	validateAfterLock func() error,
+) context.Context {
+	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{
+		path:              path,
+		validateAfterLock: validateAfterLock,
+	})
 }
 
 func LifecycleLeasePath(ctx context.Context) string {
 	if ctx != nil {
-		if path, ok := ctx.Value(lifecyclePathContextKey{}).(string); ok && path != "" {
-			return path
+		if lifecycle, ok := ctx.Value(lifecyclePathContextKey{}).(lifecycleContext); ok &&
+			lifecycle.path != "" {
+			return lifecycle.path
 		}
 	}
 	return DefaultLifecycleLeasePath
@@ -127,6 +154,9 @@ func WithLifecycle(
 		if !held.HeldAt(path) {
 			return fmt.Errorf("provided lifecycle lease does not own %s", path)
 		}
+		if err := validateLifecycleContextAfterLock(ctx); err != nil {
+			return err
+		}
 		return fn(held)
 	}
 	lease, err := AcquireLifecycleAt(path, owner)
@@ -136,7 +166,24 @@ func WithLifecycle(
 	defer func() {
 		retErr = errors.Join(retErr, lease.Close())
 	}()
+	if err := validateLifecycleContextAfterLock(ctx); err != nil {
+		return err
+	}
 	return fn(lease)
+}
+
+func validateLifecycleContextAfterLock(ctx context.Context) error {
+	if ctx == nil {
+		return nil
+	}
+	lifecycle, ok := ctx.Value(lifecyclePathContextKey{}).(lifecycleContext)
+	if !ok || lifecycle.validateAfterLock == nil {
+		return nil
+	}
+	if err := lifecycle.validateAfterLock(); err != nil {
+		return fmt.Errorf("revalidate lifecycle contract after acquiring lease: %w", err)
+	}
+	return nil
 }
 
 func (l *LifecycleLease) HeldAt(path string) bool {
