@@ -25,6 +25,10 @@ func cleanupIdentityAt(*cleanupDirFD, string) (cleanupIdentity, error) {
 	return cleanupIdentity{}, errSecureCleanupUnsupported
 }
 
+func cleanupSymlinkIdentityAt(*cleanupDirFD, string) (cleanupIdentity, error) {
+	return cleanupIdentity{}, errSecureCleanupUnsupported
+}
+
 func cleanupOpenFileAt(*cleanupDirFD, string) (*os.File, cleanupIdentity, error) {
 	return nil, cleanupIdentity{}, errSecureCleanupUnsupported
 }
@@ -34,6 +38,14 @@ func cleanupReadDir(*cleanupDirFD) ([]os.DirEntry, error) {
 }
 
 func cleanupUnlinkAt(*cleanupDirFD, string, bool) error {
+	return errSecureCleanupUnsupported
+}
+
+func cleanupReadlinkAt(*cleanupDirFD, string) (string, error) {
+	return "", errSecureCleanupUnsupported
+}
+
+func cleanupSymlinkAt(*cleanupDirFD, string, string) error {
 	return errSecureCleanupUnsupported
 }
 

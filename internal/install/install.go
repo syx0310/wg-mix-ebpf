@@ -50,6 +50,7 @@ type Plan struct {
 
 type installAfterInspectHookContextKey struct{}
 type installAfterLifecycleHookContextKey struct{}
+type installAfterSystemdEnableLinkHookContextKey struct{}
 
 func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if err := ctx.Err(); err != nil {
@@ -270,12 +271,20 @@ func applyInstall(
 			ctx,
 			paths,
 			opts.Enable,
+			ownership != cleanupOwnershipAbsent,
 			publication.revalidateOwnedInstallMetadata,
+			publication.publish,
 		); err != nil {
 			return err
 		}
 	case "openwrt":
 		if opts.Enable {
+			if err := publication.publish(); err != nil {
+				return fmt.Errorf(
+					"commit cleanup ownership before OpenWrt enable: %w",
+					err,
+				)
+			}
 			if err := runInstalledOpenWrtServiceAction(
 				ctx,
 				paths,
@@ -284,10 +293,13 @@ func applyInstall(
 			); err != nil {
 				return err
 			}
+		} else if err := publication.publish(); err != nil {
+			return fmt.Errorf("commit cleanup ownership after completed install: %w", err)
 		}
-	}
-	if err := publication.publish(); err != nil {
-		return fmt.Errorf("commit cleanup ownership after completed install: %w", err)
+	default:
+		if err := publication.publish(); err != nil {
+			return fmt.Errorf("commit cleanup ownership after completed install: %w", err)
+		}
 	}
 	return nil
 }
@@ -311,7 +323,7 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	add("remove state dir %s", paths.VarLibDir)
 	switch system {
 	case "systemd":
-		add("disable systemd service wg-mix-ebpf.service to remove derived enablement links")
+		add("remove the exact owned systemd enable link if present")
 		add("remove systemd unit %s", filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"))
 		add("reload systemd manager after removing the owned unit")
 	case "openwrt":
@@ -433,7 +445,6 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 			paths,
 			serviceStopPlan,
 			"stop",
-			"disable",
 		); err != nil {
 			return nil, err
 		}

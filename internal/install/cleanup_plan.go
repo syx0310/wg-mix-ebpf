@@ -256,17 +256,19 @@ func managedCleanupAnchor(spec cleanupPathSpec) (string, error) {
 }
 
 type cleanupEntryPlan struct {
-	parent       *cleanupDirFD
-	dir          *cleanupDirFD
-	path         string
-	name         string
-	identity     cleanupIdentity
-	directory    bool
-	digest       [sha256.Size]byte
-	digestKnown  bool
-	mayDisappear bool
-	remove       bool
-	children     []*cleanupEntryPlan
+	parent        *cleanupDirFD
+	dir           *cleanupDirFD
+	path          string
+	name          string
+	identity      cleanupIdentity
+	directory     bool
+	symlink       bool
+	symlinkTarget string
+	digest        [sha256.Size]byte
+	digestKnown   bool
+	mayDisappear  bool
+	remove        bool
+	children      []*cleanupEntryPlan
 }
 
 func (entry *cleanupEntryPlan) close() error {
@@ -426,7 +428,11 @@ func cleanupResourcesExist(paths paths, system string) bool {
 	}
 	switch system {
 	case "systemd":
-		candidates = append(candidates, filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"))
+		candidates = append(
+			candidates,
+			filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"),
+			systemdEnableLinkPath(paths),
+		)
 	case "openwrt":
 		candidates = append(
 			candidates,
@@ -874,6 +880,8 @@ func validateFreshServiceArtifactsAbsent(manifest cleanupManifest) (retErr error
 		switch artifact.Kind {
 		case "systemd-unit":
 			defaultParent = "/etc/systemd/system"
+		case systemdEnableLinkKind:
+			defaultParent = "/etc/systemd/system/multi-user.target.wants"
 		case "openwrt-init":
 			defaultParent = "/etc/init.d"
 		case "openwrt-hotplug":
@@ -1076,12 +1084,15 @@ func preparePinDirectoryPlan(pinPath string) (*cleanupDirectoryPlan, error) {
 }
 
 func prepareArtifactPlans(manifest cleanupManifest) ([]*cleanupDirectoryPlan, error) {
-	var plans []*cleanupDirectoryPlan
+	var linkPlans []*cleanupDirectoryPlan
+	var filePlans []*cleanupDirectoryPlan
 	for _, artifact := range manifest.Artifacts {
 		defaultParent := ""
 		switch artifact.Kind {
 		case "systemd-unit":
 			defaultParent = "/etc/systemd/system"
+		case systemdEnableLinkKind:
+			defaultParent = "/etc/systemd/system/multi-user.target.wants"
 		case "openwrt-init":
 			defaultParent = "/etc/init.d"
 		case "openwrt-hotplug":
@@ -1091,31 +1102,54 @@ func prepareArtifactPlans(manifest cleanupManifest) ([]*cleanupDirectoryPlan, er
 		}
 		parent, exists, err := openDeclaredArtifactParent(filepath.Dir(artifact.Path), defaultParent)
 		if err != nil {
-			closeCleanupDirectoryPlans(plans)
+			closeCleanupDirectoryPlans(linkPlans)
+			closeCleanupDirectoryPlans(filePlans)
 			return nil, err
 		}
 		if !exists {
 			continue
 		}
-		node, err := snapshotManagedFile(parent.dir, filepath.Base(artifact.Path), false, false, validateDigest(artifact.SHA256))
+		var node *cleanupEntryPlan
+		if artifact.Kind == systemdEnableLinkKind {
+			node, err = snapshotManagedSymlink(
+				parent.dir,
+				filepath.Base(artifact.Path),
+				false,
+				artifact.Target,
+			)
+		} else {
+			node, err = snapshotManagedFile(
+				parent.dir,
+				filepath.Base(artifact.Path),
+				false,
+				false,
+				validateDigest(artifact.SHA256),
+			)
+		}
 		if cleanupIsNotExist(err) {
 			_ = parent.close()
 			continue
 		}
 		if err != nil {
 			_ = parent.close()
-			closeCleanupDirectoryPlans(plans)
+			closeCleanupDirectoryPlans(linkPlans)
+			closeCleanupDirectoryPlans(filePlans)
 			return nil, err
 		}
 		node.remove = true
-		plans = append(plans, &cleanupDirectoryPlan{
+		plan := &cleanupDirectoryPlan{
 			root:          parent,
 			entries:       []*cleanupEntryPlan{node},
 			strictEntries: false,
 			removeRoot:    false,
-		})
+		}
+		if artifact.Kind == systemdEnableLinkKind {
+			linkPlans = append(linkPlans, plan)
+		} else {
+			filePlans = append(filePlans, plan)
+		}
 	}
-	return plans, nil
+	return append(linkPlans, filePlans...), nil
 }
 
 func openDeclaredArtifactParent(path string, defaultPath string) (*managedCleanupDir, bool, error) {
@@ -1371,6 +1405,53 @@ func snapshotManagedFile(
 	return node, nil
 }
 
+func snapshotManagedSymlink(
+	parent *cleanupDirFD,
+	name string,
+	mayDisappear bool,
+	expectedTarget string,
+) (*cleanupEntryPlan, error) {
+	path := filepath.Join(parent.path, name)
+	identity, err := cleanupSymlinkIdentityAt(parent, name)
+	if err != nil {
+		return nil, err
+	}
+	if !identity.sameMount(parent.identity) {
+		return nil, fmt.Errorf("refuse managed symlink %s: path crosses a mount boundary", path)
+	}
+	if err := identity.validateSymlink(path, uint32(os.Geteuid())); err != nil {
+		return nil, err
+	}
+	target, err := cleanupReadlinkAt(parent, name)
+	if err != nil {
+		return nil, fmt.Errorf("read managed symlink %s: %w", path, err)
+	}
+	if target != expectedTarget {
+		return nil, fmt.Errorf(
+			"refuse managed symlink %s: target %q does not match owned target %q",
+			path,
+			target,
+			expectedTarget,
+		)
+	}
+	finalIdentity, err := cleanupSymlinkIdentityAt(parent, name)
+	if err != nil {
+		return nil, fmt.Errorf("recheck managed symlink %s after reading: %w", path, err)
+	}
+	if !identity.sameSymlink(finalIdentity) {
+		return nil, fmt.Errorf("refuse managed symlink %s: identity changed while reading", path)
+	}
+	return &cleanupEntryPlan{
+		parent:        parent,
+		path:          path,
+		name:          name,
+		identity:      finalIdentity,
+		symlink:       true,
+		symlinkTarget: expectedTarget,
+		mayDisappear:  mayDisappear,
+	}, nil
+}
+
 func (plan *uninstallCleanupPlan) execute() error {
 	if plan == nil {
 		return nil
@@ -1488,7 +1569,13 @@ func (entry *cleanupEntryPlan) revalidate() error {
 }
 
 func (entry *cleanupEntryPlan) revalidateName(name string, allowDisappear bool) error {
-	identity, err := cleanupIdentityAt(entry.parent, name)
+	var identity cleanupIdentity
+	var err error
+	if entry.symlink {
+		identity, err = cleanupSymlinkIdentityAt(entry.parent, name)
+	} else {
+		identity, err = cleanupIdentityAt(entry.parent, name)
+	}
 	if cleanupIsNotExist(err) && entry.mayDisappear && allowDisappear {
 		return nil
 	}
@@ -1498,6 +1585,8 @@ func (entry *cleanupEntryPlan) revalidateName(name string, allowDisappear bool) 
 	sameIdentity := entry.identity.sameRegularFile(identity)
 	if entry.directory {
 		sameIdentity = entry.identity.sameDirectory(identity)
+	} else if entry.symlink {
+		sameIdentity = entry.identity.sameSymlink(identity)
 	}
 	if !sameIdentity {
 		return fmt.Errorf("refuse managed entry %s: inode or mount identity changed", entry.path)
@@ -1510,6 +1599,30 @@ func (entry *cleanupEntryPlan) revalidateName(name string, allowDisappear bool) 
 			if err := child.revalidate(); err != nil {
 				return err
 			}
+		}
+		return nil
+	}
+	if entry.symlink {
+		target, err := cleanupReadlinkAt(entry.parent, name)
+		if err != nil {
+			return fmt.Errorf("read managed symlink %s during revalidation: %w", entry.path, err)
+		}
+		if target != entry.symlinkTarget {
+			return fmt.Errorf(
+				"refuse managed symlink %s: target changed to %q",
+				entry.path,
+				target,
+			)
+		}
+		finalIdentity, err := cleanupSymlinkIdentityAt(entry.parent, name)
+		if err != nil {
+			return fmt.Errorf("recheck managed symlink %s: %w", entry.path, err)
+		}
+		if !entry.identity.sameSymlink(finalIdentity) {
+			return fmt.Errorf(
+				"refuse managed symlink %s: identity changed while re-reading",
+				entry.path,
+			)
 		}
 		return nil
 	}
@@ -1689,13 +1802,20 @@ func (entry *cleanupEntryPlan) unlink(beforeQuarantine func(string) error) error
 		}
 	}
 
-	identity, err := cleanupIdentityAt(entry.parent, quarantineName)
+	var identity cleanupIdentity
+	if entry.symlink {
+		identity, err = cleanupSymlinkIdentityAt(entry.parent, quarantineName)
+	} else {
+		identity, err = cleanupIdentityAt(entry.parent, quarantineName)
+	}
 	if err != nil {
 		return restoreEntry(err)
 	}
 	sameIdentity := entry.identity.sameRegularFile(identity)
 	if entry.directory {
 		sameIdentity = entry.identity.sameDirectory(identity)
+	} else if entry.symlink {
+		sameIdentity = entry.identity.sameSymlink(identity)
 	}
 	if !sameIdentity {
 		return restoreEntry(fmt.Errorf(
@@ -1732,7 +1852,12 @@ func (entry *cleanupEntryPlan) moveToQuarantine(
 			err,
 		)
 	}
-	movedIdentity, err := cleanupIdentityAt(entry.parent, quarantineName)
+	var movedIdentity cleanupIdentity
+	if entry.symlink {
+		movedIdentity, err = cleanupSymlinkIdentityAt(entry.parent, quarantineName)
+	} else {
+		movedIdentity, err = cleanupIdentityAt(entry.parent, quarantineName)
+	}
 	if err != nil {
 		return "", false, errors.Join(
 			fmt.Errorf("inspect quarantined managed entry %s: %w", entry.path, err),
@@ -1747,6 +1872,8 @@ func (entry *cleanupEntryPlan) moveToQuarantine(
 	sameMovedObject := entry.identity.sameRegularFileObject(movedIdentity)
 	if entry.directory {
 		sameMovedObject = entry.identity.sameDirectory(movedIdentity)
+	} else if entry.symlink {
+		sameMovedObject = entry.identity.sameSymlinkObject(movedIdentity)
 	}
 	if !sameMovedObject {
 		return "", false, errors.Join(

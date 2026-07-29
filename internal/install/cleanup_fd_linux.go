@@ -111,6 +111,10 @@ func cleanupIdentityAt(parent *cleanupDirFD, name string) (cleanupIdentity, erro
 	}, nil
 }
 
+func cleanupSymlinkIdentityAt(parent *cleanupDirFD, name string) (cleanupIdentity, error) {
+	return cleanupIdentityAt(parent, name)
+}
+
 func cleanupStatx(dirFD int, path string, flags int, stat *unix.Statx_t) error {
 	mask := unix.STATX_BASIC_STATS | unix.STATX_MNT_ID | unix.STATX_MNT_ID_UNIQUE
 	err := unix.Statx(dirFD, path, flags, mask, stat)
@@ -171,6 +175,22 @@ func cleanupUnlinkAt(parent *cleanupDirFD, name string, directory bool) error {
 		flags = unix.AT_REMOVEDIR
 	}
 	return unix.Unlinkat(int(parent.file.Fd()), name, flags)
+}
+
+func cleanupReadlinkAt(parent *cleanupDirFD, name string) (string, error) {
+	buffer := make([]byte, 4096)
+	n, err := unix.Readlinkat(int(parent.file.Fd()), name, buffer)
+	if err != nil {
+		return "", err
+	}
+	if n == len(buffer) {
+		return "", errors.New("managed symlink target exceeds the size limit")
+	}
+	return string(buffer[:n]), nil
+}
+
+func cleanupSymlinkAt(parent *cleanupDirFD, target string, name string) error {
+	return unix.Symlinkat(target, int(parent.file.Fd()), name)
 }
 
 func cleanupCreateFileAt(parent *cleanupDirFD, name string, mode uint32) (*os.File, error) {

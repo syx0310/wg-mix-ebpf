@@ -36,7 +36,8 @@ type cleanupManifest struct {
 type cleanupManifestArtifact struct {
 	Kind   string `json:"kind"`
 	Path   string `json:"path"`
-	SHA256 string `json:"sha256"`
+	SHA256 string `json:"sha256,omitempty"`
+	Target string `json:"target,omitempty"`
 }
 
 type cleanupOwnershipState uint8
@@ -74,12 +75,24 @@ func expectedCleanupManifest(paths paths, system string, installationID string) 
 			SHA256: hex.EncodeToString(sum[:]),
 		})
 	}
+	addSymlink := func(kind string, path string, target string) {
+		manifest.Artifacts = append(manifest.Artifacts, cleanupManifestArtifact{
+			Kind:   kind,
+			Path:   path,
+			Target: target,
+		})
+	}
 	switch system {
 	case "systemd":
 		addArtifact(
 			"systemd-unit",
 			filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"),
 			systemdUnit(paths.ConfigPath, paths.BinaryPath),
+		)
+		addSymlink(
+			systemdEnableLinkKind,
+			systemdEnableLinkPath(paths),
+			systemdEnableLinkTarget,
 		)
 	case "openwrt":
 		addArtifact(
@@ -524,7 +537,45 @@ func (publication *cleanupManifestPublication) publish() (retErr error) {
 			return fmt.Errorf("revalidate fresh state dir after ownership publication: %w", err)
 		}
 	}
+	if err := publication.holdNewlyPublishedInstallMetadata(); err != nil {
+		return err
+	}
 	publication.alreadyPublished = true
+	return nil
+}
+
+func (publication *cleanupManifestPublication) holdNewlyPublishedInstallMetadata() error {
+	if publication == nil || publication.configDir == nil {
+		return errors.New("cannot hold published install metadata without its config directory")
+	}
+	if publication.manifestFile != nil || publication.configFile != nil {
+		return errors.New("new ownership publication unexpectedly already holds install metadata")
+	}
+	manifest, manifestFile, manifestIdentity, manifestDigest, err :=
+		openCleanupManifestFromDir(publication.configDir.dir)
+	if err != nil {
+		return fmt.Errorf("open newly published cleanup ownership manifest: %w", err)
+	}
+	if err := manifest.validateAgainst(publication.paths, publication.system); err != nil {
+		return errors.Join(
+			fmt.Errorf("validate newly published cleanup ownership manifest: %w", err),
+			manifestFile.Close(),
+		)
+	}
+	configFile, configIdentity, err := openOwnedConfigForReinstall(
+		publication.configDir,
+		publication.paths.ConfigPath,
+	)
+	if err != nil {
+		return errors.Join(err, manifestFile.Close())
+	}
+	publication.manifestFile = manifestFile
+	publication.manifestIdentity = manifestIdentity
+	publication.manifestDigest = manifestDigest
+	publication.manifestName = cleanupManifestName
+	publication.configFile = configFile
+	publication.configIdentity = configIdentity
+	publication.configName = filepath.Base(publication.paths.ConfigPath)
 	return nil
 }
 

@@ -89,6 +89,36 @@ func cleanupIdentityAt(parent *cleanupDirFD, name string) (cleanupIdentity, erro
 	return identity, nil
 }
 
+func cleanupSymlinkIdentityAt(parent *cleanupDirFD, name string) (cleanupIdentity, error) {
+	var stat unix.Stat_t
+	if err := unix.Fstatat(int(parent.file.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+		return cleanupIdentity{}, err
+	}
+	device := uint64(uint32(stat.Dev))
+	if device != parent.identity.Device {
+		return cleanupIdentity{}, fmt.Errorf(
+			"refuse managed symlink %s/%s: path crosses a mount boundary",
+			parent.path,
+			name,
+		)
+	}
+	return cleanupIdentity{
+		Device:     device,
+		Inode:      stat.Ino,
+		MountID:    parent.identity.MountID,
+		MountKnown: parent.identity.MountKnown,
+		Mode:       uint32(stat.Mode),
+		Links:      uint64(stat.Nlink),
+		UID:        stat.Uid,
+		GID:        stat.Gid,
+		Size:       uint64(stat.Size),
+		ChangeSec:  stat.Ctim.Sec,
+		ChangeNsec: stat.Ctim.Nsec,
+		ModifySec:  stat.Mtim.Sec,
+		ModifyNsec: stat.Mtim.Nsec,
+	}, nil
+}
+
 func cleanupOpenFileAt(parent *cleanupDirFD, name string) (*os.File, cleanupIdentity, error) {
 	fd, err := unix.Openat(
 		int(parent.file.Fd()),
@@ -133,6 +163,22 @@ func cleanupUnlinkAt(parent *cleanupDirFD, name string, directory bool) error {
 		flags = unix.AT_REMOVEDIR
 	}
 	return unix.Unlinkat(int(parent.file.Fd()), name, flags)
+}
+
+func cleanupReadlinkAt(parent *cleanupDirFD, name string) (string, error) {
+	buffer := make([]byte, 4096)
+	n, err := unix.Readlinkat(int(parent.file.Fd()), name, buffer)
+	if err != nil {
+		return "", err
+	}
+	if n == len(buffer) {
+		return "", fmt.Errorf("managed symlink target exceeds the size limit")
+	}
+	return string(buffer[:n]), nil
+}
+
+func cleanupSymlinkAt(parent *cleanupDirFD, target string, name string) error {
+	return unix.Symlinkat(target, int(parent.file.Fd()), name)
 }
 
 func cleanupCreateFileAt(parent *cleanupDirFD, name string, mode uint32) (*os.File, error) {

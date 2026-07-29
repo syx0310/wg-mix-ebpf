@@ -513,7 +513,7 @@ func TestSystemdServiceActionRejectsFinalPathSwapBeforeManagerReload(t *testing.
 		}
 		return os.WriteFile(unitPath, []byte("[Service]\nExecStart=/bin/false\n"), 0o644)
 	}
-	err = runSystemdServiceActions(t.Context(), layout, plan, "stop", "disable")
+	err = runSystemdServiceActions(t.Context(), layout, plan, "stop")
 	if err == nil || !strings.Contains(err.Error(), "service artifact execution") {
 		t.Fatalf("systemd service action error = %v, want final identity rejection", err)
 	}
@@ -533,8 +533,15 @@ func TestSystemdServiceActionRejectsFinalPathSwapBeforeManagerReload(t *testing.
 	}
 }
 
-func TestUninstallDisablesSystemdBeforeRemovingOwnedUnit(t *testing.T) {
+func TestUninstallRemovesExactSystemdEnableLinkBeforeOwnedUnit(t *testing.T) {
 	layout := newCleanupTestLayoutForSystem(t, "systemd-disable", "systemd")
+	enableLink := systemdEnableLinkPath(layout)
+	if err := os.MkdirAll(filepath.Dir(enableLink), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../wg-mix-ebpf.service", enableLink); err != nil {
+		t.Fatal(err)
+	}
 	setCleanupTestEnvironment(t, layout)
 	installFakeNft(t, "")
 	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
@@ -554,7 +561,7 @@ func TestUninstallDisablesSystemdBeforeRemovingOwnedUnit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, action := range []string{"disable systemd service", "reload systemd manager"} {
+	for _, action := range []string{"exact owned systemd enable link", "reload systemd manager"} {
 		if !containsAction(plan.Actions, action) {
 			t.Fatalf("uninstall plan omitted %q: %#v", action, plan.Actions)
 		}
@@ -563,15 +570,118 @@ func TestUninstallDisablesSystemdBeforeRemovingOwnedUnit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "daemon-reload\nstop wg-mix-ebpf.service\ndisable wg-mix-ebpf.service\ndaemon-reload\n"
+	want := "daemon-reload\nstop wg-mix-ebpf.service\ndaemon-reload\n"
 	if string(logData) != want {
 		t.Fatalf("systemctl log = %q, want %q", logData, want)
 	}
 	if _, err := os.Stat(filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("uninstall retained disabled systemd unit: %v", err)
 	}
+	if _, err := os.Lstat(enableLink); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uninstall retained exact owned systemd enable link: %v", err)
+	}
 	if _, err := os.Stat(cleanupManifestPath(layout)); err != nil {
 		t.Fatalf("non-purge uninstall removed ownership marker: %v", err)
+	}
+}
+
+func TestUninstallPreservesForeignSystemdEnableLink(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"systemd-foreign-enable-uninstall",
+		"systemd",
+	)
+	enableLink := systemdEnableLinkPath(layout)
+	if err := os.MkdirAll(filepath.Dir(enableLink), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../foreign.service", enableLink); err != nil {
+		t.Fatal(err)
+	}
+	setCleanupTestEnvironment(t, layout)
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "")
+	lifecycleRoot := t.TempDir()
+
+	_, err := Uninstall(
+		lockfile.WithLifecyclePathsForTest(
+			t.Context(),
+			filepath.Join(lifecycleRoot, "daemon.lease"),
+			filepath.Join(lifecycleRoot, "maintenance.gate"),
+		),
+		Options{
+			ConfigPath: layout.ConfigPath,
+			System:     "systemd",
+			Yes:        true,
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "target") {
+		t.Fatalf("uninstall error = %v, want foreign enable link rejection", err)
+	}
+	if target, readErr := os.Readlink(enableLink); readErr != nil ||
+		target != "../foreign.service" {
+		t.Fatalf("foreign enable link target = %q err=%v", target, readErr)
+	}
+	if _, statErr := os.Stat(
+		filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service"),
+	); statErr != nil {
+		t.Fatalf("foreign link rejection changed owned unit: %v", statErr)
+	}
+	if _, statErr := os.Stat(commandLog); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("foreign link rejection invoked systemctl: %v", statErr)
+	}
+}
+
+func TestUninstallRejectsSystemdEnableLinkSwapAtQuarantine(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"systemd-enable-link-swap-uninstall",
+		"systemd",
+	)
+	enableLink := systemdEnableLinkPath(layout)
+	if err := os.MkdirAll(filepath.Dir(enableLink), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(systemdEnableLinkTarget, enableLink); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"systemd",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+	ownedBackup := enableLink + ".owned-original"
+	plan.beforeQuarantine = func(path string) error {
+		if path != enableLink {
+			return fmt.Errorf("unexpected first quarantine path %s", path)
+		}
+		if err := os.Rename(enableLink, ownedBackup); err != nil {
+			return err
+		}
+		return os.Symlink("../foreign.service", enableLink)
+	}
+
+	err = plan.executeServiceArtifacts()
+	if err == nil || !strings.Contains(err.Error(), "identity") {
+		t.Fatalf("service artifact cleanup error = %v, want link identity rejection", err)
+	}
+	if target, readErr := os.Readlink(enableLink); readErr != nil ||
+		target != "../foreign.service" {
+		t.Fatalf("foreign replacement target = %q err=%v", target, readErr)
+	}
+	if target, readErr := os.Readlink(ownedBackup); readErr != nil ||
+		target != systemdEnableLinkTarget {
+		t.Fatalf("held original target = %q err=%v", target, readErr)
+	}
+	if _, statErr := os.Stat(
+		filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service"),
+	); statErr != nil {
+		t.Fatalf("link race rejection changed owned unit: %v", statErr)
 	}
 }
 
@@ -1529,6 +1639,250 @@ func TestMarkedInstallRejectsManifestSamePathSwapBeforeEnable(t *testing.T) {
 			data,
 			readErr,
 		)
+	}
+}
+
+func TestInstallCreatesExactSystemdEnableLinkWithoutSystemctlEnable(t *testing.T) {
+	layout := cleanupTestPaths(t.TempDir(), "systemd-exact-enable")
+	setCleanupTestEnvironment(t, layout)
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "")
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+
+	if _, err := Install(ctx, Options{System: "systemd", Enable: true}); err != nil {
+		t.Fatal(err)
+	}
+	linkPath := systemdEnableLinkPath(layout)
+	target, err := os.Readlink(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if target != "../wg-mix-ebpf.service" {
+		t.Fatalf("systemd enable link target = %q", target)
+	}
+	entries, err := os.ReadDir(filepath.Dir(linkPath))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "wg-mix-ebpf.service" {
+		t.Fatalf("enable transaction created unexpected Wants/Alias entries: %#v", entries)
+	}
+	logData, err := os.ReadFile(commandLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(logData) != "daemon-reload\n" {
+		t.Fatalf("systemctl log = %q, want only descriptor-verified manager reload", logData)
+	}
+	manifestData, err := os.ReadFile(cleanupManifestPath(layout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest cleanupManifest
+	if err := json.Unmarshal(manifestData, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manifest.validateAgainst(layout, "systemd"); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestInstallRollsBackCreatedSystemdEnableLinkAfterPartialFailure(t *testing.T) {
+	layout := cleanupTestPaths(t.TempDir(), "systemd-enable-partial")
+	setCleanupTestEnvironment(t, layout)
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "")
+	lifecycleRoot := t.TempDir()
+	baseContext := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+	injected := errors.New("injected failure after exact enable link creation")
+	hookRan := false
+	ctx := context.WithValue(
+		baseContext,
+		installAfterSystemdEnableLinkHookContextKey{},
+		func(path string) error {
+			hookRan = true
+			if path != systemdEnableLinkPath(layout) {
+				return fmt.Errorf("unexpected enable link hook path %s", path)
+			}
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			if target != "../wg-mix-ebpf.service" {
+				return fmt.Errorf("unexpected enable link target %q", target)
+			}
+			return injected
+		},
+	)
+
+	_, err := Install(ctx, Options{System: "systemd", Enable: true})
+	if !errors.Is(err, injected) {
+		t.Fatalf("install error = %v, want injected post-create failure", err)
+	}
+	if !hookRan {
+		t.Fatal("post-systemd-enable-link hook did not run")
+	}
+	if _, statErr := os.Lstat(systemdEnableLinkPath(layout)); !errors.Is(
+		statErr,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("failed enable transaction retained its link: %v", statErr)
+	}
+	if _, statErr := os.Stat(
+		filepath.Dir(systemdEnableLinkPath(layout)),
+	); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("failed enable transaction retained its created wants directory: %v", statErr)
+	}
+	if _, statErr := os.Stat(cleanupManifestPath(layout)); statErr != nil {
+		t.Fatalf("failed enable transaction lost recoverable ownership: %v", statErr)
+	}
+
+	if _, err := Install(baseContext, Options{System: "systemd", Enable: true}); err != nil {
+		t.Fatalf("retry through published ownership failed: %v", err)
+	}
+	if target, err := os.Readlink(systemdEnableLinkPath(layout)); err != nil ||
+		target != "../wg-mix-ebpf.service" {
+		t.Fatalf("retry enable link target = %q err=%v", target, err)
+	}
+}
+
+func TestInstallRollsBackSystemdEnableLinkOnDuringEnableIdentitySwap(t *testing.T) {
+	tests := []struct {
+		name      string
+		swap      func(t *testing.T, layout paths)
+		wantError string
+	}{
+		{
+			name: "unit",
+			swap: func(t *testing.T, layout paths) {
+				t.Helper()
+				unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+				if err := os.Rename(unitPath, unitPath+".owned-original"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(
+					unitPath,
+					[]byte("[Service]\nExecStart=/bin/false\n"),
+					0o644,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: "revalidate installed systemd unit",
+		},
+		{
+			name: "ownership manifest",
+			swap: func(t *testing.T, layout paths) {
+				t.Helper()
+				markerPath := cleanupManifestPath(layout)
+				data, err := os.ReadFile(markerPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Rename(markerPath, markerPath+".owned-original"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(markerPath, data, 0o600); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantError: "marked install manifest",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			layout := cleanupTestPaths(
+				t.TempDir(),
+				"during-enable-"+strings.ReplaceAll(test.name, " ", "-"),
+			)
+			setCleanupTestEnvironment(t, layout)
+			commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+			installFakeSystemctl(t, commandLog, "")
+			lifecycleRoot := t.TempDir()
+			ctx := lockfile.WithLifecyclePathsForTest(
+				t.Context(),
+				filepath.Join(lifecycleRoot, "daemon.lease"),
+				filepath.Join(lifecycleRoot, "maintenance.gate"),
+			)
+			ctx = context.WithValue(
+				ctx,
+				installAfterSystemdEnableLinkHookContextKey{},
+				func(path string) error {
+					if target, err := os.Readlink(path); err != nil ||
+						target != "../wg-mix-ebpf.service" {
+						return fmt.Errorf(
+							"enable link was not committed before race injection: target=%q err=%v",
+							target,
+							err,
+						)
+					}
+					test.swap(t, layout)
+					return nil
+				},
+			)
+
+			_, err := Install(ctx, Options{System: "systemd", Enable: true})
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("install error = %v, want %q", err, test.wantError)
+			}
+			if _, statErr := os.Lstat(systemdEnableLinkPath(layout)); !errors.Is(
+				statErr,
+				os.ErrNotExist,
+			) {
+				t.Fatalf("identity rejection retained enable link: %v", statErr)
+			}
+			logData, readErr := os.ReadFile(commandLog)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if strings.Contains(string(logData), "enable ") {
+				t.Fatalf("identity race invoked name-based systemctl enable: %q", logData)
+			}
+		})
+	}
+}
+
+func TestMarkedInstallPreservesForeignExistingSystemdEnableLink(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"systemd-foreign-enable-link",
+		"systemd",
+	)
+	linkPath := systemdEnableLinkPath(layout)
+	if err := os.MkdirAll(filepath.Dir(linkPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("../foreign.service", linkPath); err != nil {
+		t.Fatal(err)
+	}
+	setCleanupTestEnvironment(t, layout)
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "")
+	lifecycleRoot := t.TempDir()
+
+	_, err := Install(
+		lockfile.WithLifecyclePathsForTest(
+			t.Context(),
+			filepath.Join(lifecycleRoot, "daemon.lease"),
+			filepath.Join(lifecycleRoot, "maintenance.gate"),
+		),
+		Options{System: "systemd", Enable: true},
+	)
+	if err == nil || !strings.Contains(err.Error(), "target") {
+		t.Fatalf("install error = %v, want foreign enable link rejection", err)
+	}
+	if target, readErr := os.Readlink(linkPath); readErr != nil ||
+		target != "../foreign.service" {
+		t.Fatalf("foreign enable link target = %q err=%v", target, readErr)
 	}
 }
 

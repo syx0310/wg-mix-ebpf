@@ -26,6 +26,9 @@ func serviceArtifactInstallSpecs(paths paths, system string) ([]serviceArtifactI
 	manifest := expectedCleanupManifest(paths, system, strings.Repeat("0", 32))
 	specs := make([]serviceArtifactInstallSpec, 0, len(manifest.Artifacts))
 	for _, artifact := range manifest.Artifacts {
+		if artifact.Kind == systemdEnableLinkKind {
+			continue
+		}
 		spec := serviceArtifactInstallSpec{artifact: artifact}
 		switch artifact.Kind {
 		case "systemd-unit":
@@ -486,7 +489,7 @@ func runSystemdServiceActions(
 ) (retErr error) {
 	for _, action := range actions {
 		switch action {
-		case "stop", "disable":
+		case "stop":
 		default:
 			return fmt.Errorf("refuse unsupported systemd uninstall action %q", action)
 		}
@@ -617,7 +620,9 @@ func runInstalledSystemdServiceCommit(
 	ctx context.Context,
 	paths paths,
 	enable bool,
+	allowExistingEnableLink bool,
 	revalidateInstallMetadata func() error,
+	publishInstallOwnership func() error,
 ) (retErr error) {
 	artifact, err := openInstalledServiceArtifact(
 		paths,
@@ -679,6 +684,18 @@ func runInstalledSystemdServiceCommit(
 	if err := revalidateMetadata("after manager inspection"); err != nil {
 		return err
 	}
+	if publishInstallOwnership == nil {
+		return errors.New("systemd service commit requires an ownership publication callback")
+	}
+	if err := publishInstallOwnership(); err != nil {
+		return fmt.Errorf("commit cleanup ownership before systemd enablement: %w", err)
+	}
+	if err := revalidate("after ownership publication"); err != nil {
+		return err
+	}
+	if err := revalidateMetadata("after ownership publication"); err != nil {
+		return err
+	}
 	if !enable {
 		return nil
 	}
@@ -688,13 +705,32 @@ func runInstalledSystemdServiceCommit(
 	if err := revalidateMetadata("before enable"); err != nil {
 		return err
 	}
-	if err := runCommand(ctx, "systemctl", "enable", "wg-mix-ebpf.service"); err != nil {
+	transaction, err := beginSystemdEnableLinkTransaction(
+		paths,
+		allowExistingEnableLink,
+	)
+	if err != nil {
 		return err
 	}
-	if err := revalidate("after enable"); err != nil {
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, transaction.rollback())
+		}
+		retErr = errors.Join(retErr, transaction.close())
+	}()
+	if hook, ok := ctx.Value(installAfterSystemdEnableLinkHookContextKey{}).(func(string) error); ok && hook != nil {
+		if err := hook(transaction.artifact.Path); err != nil {
+			return fmt.Errorf("run post-systemd-enable-link hook: %w", err)
+		}
+	}
+	if err := revalidate("after enable link creation"); err != nil {
 		return err
 	}
-	return revalidateMetadata("after enable")
+	if err := revalidateMetadata("after enable link creation"); err != nil {
+		return err
+	}
+	transaction.commit()
+	return nil
 }
 
 func runInstalledOpenWrtServiceAction(
