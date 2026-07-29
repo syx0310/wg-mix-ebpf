@@ -85,7 +85,11 @@ func expectedCleanupManifest(paths paths, system string, installationID string) 
 		addArtifact(
 			"openwrt-init",
 			filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf"),
-			openWrtInit(paths.ConfigPath, paths.BinaryPath),
+			openWrtInit(
+				paths.ConfigPath,
+				paths.BinaryPath,
+				filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf"),
+			),
 		)
 		addArtifact(
 			"openwrt-hotplug",

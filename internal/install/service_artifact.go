@@ -33,7 +33,11 @@ func serviceArtifactInstallSpecs(paths paths, system string) ([]serviceArtifactI
 			spec.mode = 0o644
 			spec.defaultParent = "/etc/systemd/system"
 		case "openwrt-init":
-			spec.content = []byte(openWrtInit(paths.ConfigPath, paths.BinaryPath))
+			spec.content = []byte(openWrtInit(
+				paths.ConfigPath,
+				paths.BinaryPath,
+				artifact.Path,
+			))
 			spec.mode = 0o755
 			spec.defaultParent = "/etc/init.d"
 		case "openwrt-hotplug":

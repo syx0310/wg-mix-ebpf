@@ -883,13 +883,17 @@ WantedBy=multi-user.target
 	)
 }
 
-func openWrtInit(configPath string, binaryPath string) string {
+func openWrtInit(configPath string, binaryPath string, initPath string) string {
 	return fmt.Sprintf(`#!/bin/sh /etc/rc.common
 
 USE_PROCD=1
 START=99
 STOP=10
 
+# rc.common sources this script through the verified descriptor path used by
+# the installer. Restore the installed pathname before rc.common derives the
+# procd service name or creates/removes rc.d links.
+initscript=%s
 CONF=%s
 
 start_service() {
@@ -909,6 +913,7 @@ stop_service() {
     %s stop --config "$CONF"
 }
 `,
+		shellSingleQuote(initPath),
 		shellSingleQuote(configPath),
 		shellSingleQuote(binaryPath),
 		shellSingleQuote(binaryPath),

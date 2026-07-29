@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -60,7 +61,11 @@ func TestRenderedServicesUseStopCommand(t *testing.T) {
 	) {
 		t.Fatalf("systemd unit should stop via daemon stop command:\n%s", unit)
 	}
-	init := openWrtInit("/etc/wg-mix-ebpf/config.yaml", "/usr/sbin/wg-mix-ebpf")
+	init := openWrtInit(
+		"/etc/wg-mix-ebpf/config.yaml",
+		"/usr/sbin/wg-mix-ebpf",
+		"/etc/init.d/wg-mix-ebpf",
+	)
 	if !strings.Contains(init, `'/usr/sbin/wg-mix-ebpf' stop --config "$CONF"`) {
 		t.Fatalf("OpenWrt init should stop via daemon stop command:\n%s", init)
 	}
@@ -81,7 +86,7 @@ func TestRenderedServicesEncodeTemplateArguments(t *testing.T) {
 		}
 	}
 
-	init := openWrtInit(configPath, binaryPath)
+	init := openWrtInit(configPath, binaryPath, "/etc/init.d/wg-mix-ebpf")
 	for _, want := range []string{
 		`CONF='/etc/wg-mix-ebpf/config "quoted" '"'"'single'"'"'.yaml'`,
 		`'/opt/wg mix/"bin"/wg-mix-ebpf' run --config "$CONF" --openwrt`,
@@ -2232,6 +2237,65 @@ func TestRunCommandFromVerifiedFile(t *testing.T) {
 	}
 }
 
+func TestVerifiedOpenWrtInitRestoresInstalledServiceIdentity(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("verified OpenWrt descriptor sourcing is Linux-specific")
+	}
+	initPath := "/etc/init.d/wg-mix-ebpf"
+	configPath := "/etc/wg-mix-ebpf/config.yaml"
+	scriptPath := filepath.Join(t.TempDir(), "held-init")
+	if err := os.WriteFile(
+		scriptPath,
+		[]byte(openWrtInit(configPath, "/usr/sbin/wg-mix-ebpf", initPath)),
+		0o700,
+	); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+
+	resultPath := filepath.Join(t.TempDir(), "identity.log")
+	harnessPath := filepath.Join(t.TempDir(), "rc.common-harness")
+	harness := `#!/bin/sh
+initscript=$1
+verified_source=$1
+. "$initscript"
+printf '%s\n%s\n%s\n%s\n' \
+    "$verified_source" \
+    "$initscript" \
+    "${initscript##*/}" \
+    "$CONF" > "$2"
+`
+	if err := os.WriteFile(harnessPath, []byte(harness), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.CommandContext(
+		t.Context(),
+		"/bin/sh",
+		harnessPath,
+		"/proc/self/fd/3",
+		resultPath,
+	)
+	cmd.ExtraFiles = []*os.File{file}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("source verified OpenWrt init through descriptor: %v: %s", err, out)
+	}
+	data, err := os.ReadFile(resultPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := "/proc/self/fd/3\n" +
+		initPath + "\n" +
+		"wg-mix-ebpf\n" +
+		configPath + "\n"
+	if string(data) != want {
+		t.Fatalf("rc.common identity result = %q, want %q", data, want)
+	}
+}
+
 func TestOpenWrtServiceActionRejectsFinalPathSwapWithoutExecutingForeign(t *testing.T) {
 	layout := newCleanupTestLayoutForSystem(t, "openwrt-final-exec-swap", "openwrt")
 	initPath := filepath.Join(layout.OpenWrtInitDir, "wg-mix-ebpf")
@@ -2279,7 +2343,7 @@ func TestOpenWrtServiceActionRejectsFinalPathSwapWithoutExecutingForeign(t *test
 		t.Fatalf("foreign replacement changed unexpectedly: data=%q err=%v", data, err)
 	}
 	if data, err := os.ReadFile(originalPath); err != nil ||
-		string(data) != openWrtInit(layout.ConfigPath, layout.BinaryPath) {
+		string(data) != openWrtInit(layout.ConfigPath, layout.BinaryPath, initPath) {
 		t.Fatalf("held owned init script changed: data=%q err=%v", data, err)
 	}
 }
@@ -2410,7 +2474,11 @@ func populateUnmarkedCleanupTestLayout(layout paths, system string) error {
 		}
 		if err := os.WriteFile(
 			filepath.Join(layout.OpenWrtInitDir, "wg-mix-ebpf"),
-			[]byte(openWrtInit(layout.ConfigPath, layout.BinaryPath)),
+			[]byte(openWrtInit(
+				layout.ConfigPath,
+				layout.BinaryPath,
+				filepath.Join(layout.OpenWrtInitDir, "wg-mix-ebpf"),
+			)),
 			0o700,
 		); err != nil {
 			return err
