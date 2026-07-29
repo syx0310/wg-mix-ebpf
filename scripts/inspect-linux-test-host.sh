@@ -7,7 +7,11 @@ usage:
   sudo scripts/inspect-linux-test-host.sh \
     --expected-address 192.168.10.82 \
     --interface ens33 \
-    --peer-address 47.116.202.155
+    --peer-address 47.116.202.155 \
+    --expected-hostname ubuntu-2604-test \
+    --expected-kernel 7.0.0-28-generic \
+    --expected-machine-id 0123456789abcdef0123456789abcdef \
+    [--allow-missing-bpftool]
 
 This script is read-only. It records host, interface, TC, BPF, WireGuard,
 offload, routing, and project-specific nftables state.
@@ -17,6 +21,10 @@ EOF
 EXPECTED_ADDRESS=""
 INTERFACE=""
 PEER_ADDRESS=""
+EXPECTED_HOSTNAME=""
+EXPECTED_KERNEL=""
+EXPECTED_MACHINE_ID=""
+ALLOW_MISSING_BPFTOOL=0
 
 while (($# > 0)); do
   case "$1" in
@@ -44,6 +52,34 @@ while (($# > 0)); do
     PEER_ADDRESS="$2"
     shift 2
     ;;
+  --expected-hostname)
+    (($# >= 2)) || {
+      echo "error: --expected-hostname requires a value" >&2
+      exit 2
+    }
+    EXPECTED_HOSTNAME="$2"
+    shift 2
+    ;;
+  --expected-kernel)
+    (($# >= 2)) || {
+      echo "error: --expected-kernel requires a value" >&2
+      exit 2
+    }
+    EXPECTED_KERNEL="$2"
+    shift 2
+    ;;
+  --expected-machine-id)
+    (($# >= 2)) || {
+      echo "error: --expected-machine-id requires a value" >&2
+      exit 2
+    }
+    EXPECTED_MACHINE_ID="$2"
+    shift 2
+    ;;
+  --allow-missing-bpftool)
+    ALLOW_MISSING_BPFTOOL=1
+    shift
+    ;;
   -h | --help)
     usage
     exit 0
@@ -68,16 +104,37 @@ done
   echo "error: invalid interface name" >&2
   exit 2
 }
+[[ "${EXPECTED_HOSTNAME}" =~ ^[[:alnum:].-]{1,253}$ ]] || {
+  echo "error: a literal --expected-hostname is required" >&2
+  exit 2
+}
+[[ "${EXPECTED_KERNEL}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-[[:alnum:].+-]+$ ]] || {
+  echo "error: a literal --expected-kernel is required" >&2
+  exit 2
+}
+[[ "${EXPECTED_MACHINE_ID}" =~ ^[0-9a-f]{32}$ ]] || {
+  echo "error: --expected-machine-id must be exactly 32 lowercase hex characters" >&2
+  exit 2
+}
 [[ "${EUID}" -eq 0 ]] || {
   echo "error: inspection must run as root through an explicitly reviewed sudo command" >&2
   exit 1
 }
 
-for command in bpftool ethtool find findmnt ip nft ss stat tc wg; do
-  if ! command -v "${command}" >/dev/null; then
-    printf 'required_command_missing=%s\n' "${command}"
-  fi
+for command in ethtool find findmnt grep ip nft ss stat tc wg; do
+  command -v "${command}" >/dev/null || {
+    printf 'error: required command is missing: %s\n' "${command}" >&2
+    exit 1
+  }
 done
+if ! command -v bpftool >/dev/null; then
+  if ((ALLOW_MISSING_BPFTOOL)); then
+    echo "unsupported_missing_command=bpftool"
+  else
+    echo "error: required command is missing: bpftool" >&2
+    exit 1
+  fi
+fi
 
 if ! ip -o -4 address show dev "${INTERFACE}" |
   awk -v expected="${EXPECTED_ADDRESS}" '
@@ -93,6 +150,21 @@ if ! ip -o -4 address show dev "${INTERFACE}" |
   exit 1
 fi
 
+[[ "$(hostname)" == "${EXPECTED_HOSTNAME}" ]] || {
+  echo "error: hostname identity mismatch" >&2
+  exit 1
+}
+[[ "$(uname -r)" == "${EXPECTED_KERNEL}" ]] || {
+  echo "error: kernel identity mismatch" >&2
+  exit 1
+}
+[[ "$(< /etc/machine-id)" == "${EXPECTED_MACHINE_ID}" ]] || {
+  echo "error: machine-id identity mismatch" >&2
+  exit 1
+}
+
+declare -a INSPECTION_FAILURES=()
+
 run_optional() {
   local label="$1"
   local rc
@@ -103,6 +175,7 @@ run_optional() {
   printf '\n'
   if ! command -v "$1" >/dev/null; then
     printf 'exit=127 missing_command=%q\n' "$1"
+    INSPECTION_FAILURES+=("${label}:missing-command")
     return 0
   fi
 
@@ -111,6 +184,9 @@ run_optional() {
   rc=$?
   set -e
   printf 'exit=%d\n' "${rc}"
+  if ((rc != 0)); then
+    INSPECTION_FAILURES+=("${label}:exit-${rc}")
+  fi
 }
 
 printf 'timestamp=%s\n' "$(date --iso-8601=seconds)"
@@ -121,6 +197,7 @@ printf 'expected_address=%s\n' "${EXPECTED_ADDRESS}"
 printf 'interface=%s\n' "${INTERFACE}"
 printf 'peer_address=%s\n' "${PEER_ADDRESS}"
 printf 'kernel=%s\n' "$(uname -r)"
+printf 'allow_missing_bpftool=%s\n' "${ALLOW_MISSING_BPFTOOL}"
 printf 'machine_id=%s\n' "$(< /etc/machine-id)"
 printf 'boot_id=%s\n' "$(< /proc/sys/kernel/random/boot_id)"
 
@@ -147,10 +224,24 @@ run_optional "bpffs top-level entries" \
   find /sys/fs/bpf -xdev -mindepth 1 -maxdepth 1 -printf '%y %p\n'
 run_optional "project BPF entries" \
   find /sys/fs/bpf -xdev -mindepth 1 -maxdepth 4 -name '*wg-mix-ebpf*' -printf '%y %p\n'
-run_optional "BPF programs" bpftool -j prog show
-run_optional "BPF maps" bpftool -j map show
-run_optional "BPF links" bpftool -j link show
+if command -v bpftool >/dev/null; then
+  run_optional "BPF programs" bpftool -j prog show
+  run_optional "BPF maps" bpftool -j map show
+  run_optional "BPF links" bpftool -j link show
+fi
 run_optional "WireGuard status" wg show
-run_optional "project nftables table" nft list table inet wg_mix_ebpf_guard
+run_optional "nftables tables" nft list tables
 
-echo "inspection completed"
+nft_tables="$(nft list tables)"
+if grep -Fxq 'table inet wg_mix_ebpf_guard' <<<"${nft_tables}"; then
+  INSPECTION_FAILURES+=("unexpected-project-nftables-table")
+fi
+
+if ((${#INSPECTION_FAILURES[@]} > 0)); then
+  printf 'inspection_failed=' >&2
+  printf ' %q' "${INSPECTION_FAILURES[@]}" >&2
+  printf '\n' >&2
+  exit 1
+fi
+
+echo "inspection completed: all required sections passed"
