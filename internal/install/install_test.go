@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -191,7 +193,7 @@ func TestUninstallDoesNotDeadlockWhenConfigExists(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte(
 		"#!/bin/sh\n"+
 			"set -eu\n"+
-			"printf '%s\\n' \"$*\" >\"$WG_MIX_EBPF_TEST_NFT_READY_FIFO\"\n"+
+			"printf '%s\\000' \"$#\" \"$@\" >\"$WG_MIX_EBPF_TEST_NFT_READY_FIFO\"\n"+
 			"IFS= read -r control <\"$WG_MIX_EBPF_TEST_NFT_RELEASE_FIFO\"\n"+
 			"[ \"$control\" = continue ] || exit 70\n"+
 			"printf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\n"+
@@ -240,14 +242,56 @@ startup_guard:
 		uninstallDone <- err
 	}()
 
+	wantArgs := []string{"-j", "-a", "list", "table", "inet", "wg_mix_ebpf_guard"}
 	type readyResult struct {
-		line string
+		args []string
 		err  error
 	}
 	nftReady := make(chan readyResult, 1)
 	go func() {
-		line, err := bufio.NewReader(readyFIFO).ReadString('\n')
-		nftReady <- readyResult{line: strings.TrimSpace(line), err: err}
+		const (
+			maxNftArgs     = 16
+			maxNftArgBytes = 256
+		)
+		reader := bufio.NewReaderSize(readyFIFO, maxNftArgBytes+1)
+		readField := func() (string, error) {
+			field, err := reader.ReadSlice(0)
+			if errors.Is(err, bufio.ErrBufferFull) {
+				return "", fmt.Errorf("fake nft protocol field exceeds %d bytes", maxNftArgBytes)
+			}
+			if err != nil {
+				return "", fmt.Errorf("read fake nft protocol field: %w", err)
+			}
+			field = field[:len(field)-1]
+			if len(field) > maxNftArgBytes {
+				return "", fmt.Errorf("fake nft protocol field is %d bytes, maximum is %d", len(field), maxNftArgBytes)
+			}
+			return string(field), nil
+		}
+
+		argcField, err := readField()
+		if err != nil {
+			nftReady <- readyResult{err: err}
+			return
+		}
+		argc, err := strconv.Atoi(argcField)
+		if err != nil || argc < 0 || argc > maxNftArgs {
+			nftReady <- readyResult{err: fmt.Errorf("fake nft argc %q is outside 0..%d", argcField, maxNftArgs)}
+			return
+		}
+		if argc != len(wantArgs) {
+			nftReady <- readyResult{err: fmt.Errorf("fake nft argc = %d, want %d", argc, len(wantArgs))}
+			return
+		}
+		args := make([]string, argc)
+		for i := range args {
+			args[i], err = readField()
+			if err != nil {
+				nftReady <- readyResult{err: fmt.Errorf("read fake nft argv[%d]: %w", i, err)}
+				return
+			}
+		}
+		nftReady <- readyResult{args: args}
 	}()
 
 	// Keep the watchdog outside ctx: a deadline on ctx also kills the fake nft
@@ -261,9 +305,10 @@ startup_guard:
 		if result.err != nil {
 			t.Fatalf("read fake nft readiness: %v", result.err)
 		}
-		const wantArgs = "-j -a list table inet wg_mix_ebpf_guard"
-		if result.line != wantArgs {
-			t.Fatalf("fake nft invocation = %q, want %q", result.line, wantArgs)
+		for i := range wantArgs {
+			if result.args[i] != wantArgs[i] {
+				t.Fatalf("fake nft argv[%d] = %q, want %q", i, result.args[i], wantArgs[i])
+			}
 		}
 	case err := <-uninstallDone:
 		readyWatchdog.Stop()
