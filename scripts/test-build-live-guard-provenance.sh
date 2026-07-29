@@ -67,6 +67,10 @@ readonly blob_limit_probe_parent="${embedded_probe_root}/blob-limiter"
 readonly blob_batch_probe_parent="${embedded_probe_root}/blob-batch"
 readonly seal_probe_parent="${embedded_probe_root}/snapshot-seal"
 readonly seal_probe_snapshot="${seal_probe_parent}/source-snapshot"
+readonly seal_mode_probe_parent="${embedded_probe_root}/snapshot-seal-mode"
+readonly seal_mode_probe_snapshot="${seal_mode_probe_parent}/source-snapshot"
+readonly seal_content_probe_parent="${embedded_probe_root}/snapshot-seal-content"
+readonly seal_content_probe_snapshot="${seal_content_probe_parent}/source-snapshot"
 readonly absolute_outside_module="${fixture_root}/absolute-outside-module"
 readonly relative_outside_module="${relative_replace_output_parent}/outside-module"
 readonly tar_options_control_output="${fixture_root}/tar-options-control-output"
@@ -104,6 +108,8 @@ for directory in \
   "${blob_limit_probe_parent}" \
   "${blob_batch_probe_parent}" \
   "${seal_probe_snapshot}" \
+  "${seal_mode_probe_snapshot}" \
+  "${seal_content_probe_snapshot}" \
   "${absolute_outside_module}" \
   "${tar_options_control_output}"; do
   "${MKDIR_BIN}" --mode=0700 --parents -- "${directory}"
@@ -698,6 +704,40 @@ assert_stages_absent() {
   done
 }
 
+assert_runtime_error_after_argv() {
+  local label="$1"
+  local output="$2"
+  local bare_message="$3"
+  local runtime_line="RuntimeError: ${bare_message}"
+  local last_line="${output##*$'\n'}"
+  local line
+  local argv_lines=0
+  local runtime_lines=0
+
+  while IFS= read -r line; do
+    if [[ "${line}" == candidate_blob_oracle_validate\ argv=* ]]; then
+      ((argv_lines += 1))
+      [[ "${line}" == *"${bare_message}"* &&
+        "${line}" != "${runtime_line}" ]] || {
+        printf 'error: runtime-error source control is invalid: case=%s\n' \
+          "${label}" >&2
+        return 1
+      }
+    fi
+    if [[ "${line}" == "${runtime_line}" ]]; then
+      ((runtime_lines += 1))
+    fi
+  done <<<"${output}"
+
+  [[ "${argv_lines}" == "1" &&
+    "${runtime_lines}" == "1" &&
+    "${last_line}" == "${runtime_line}" ]] || {
+    printf 'error: provenance runtime error is not uniquely anchored after argv: case=%s argv_lines=%s runtime_lines=%s last=%q\n' \
+      "${label}" "${argv_lines}" "${runtime_lines}" "${last_line}" >&2
+    return 1
+  }
+}
+
 assert_go_phase_not_reached() {
   local label="$1"
   local output_parent="$2"
@@ -1063,6 +1103,7 @@ readonly blob_batch_bad_header="${blob_batch_probe_parent}/bad-header.raw"
 readonly blob_batch_bad_type="${blob_batch_probe_parent}/bad-type.raw"
 readonly blob_batch_bad_size="${blob_batch_probe_parent}/bad-size.raw"
 readonly blob_batch_bad_framing="${blob_batch_probe_parent}/bad-framing.raw"
+readonly blob_batch_bad_content="${blob_batch_probe_parent}/bad-content.raw"
 "${PYTHON3_BIN}" -I -B - \
   "${blob_probe_oid}" \
   "${blob_batch_inventory}" \
@@ -1071,7 +1112,8 @@ readonly blob_batch_bad_framing="${blob_batch_probe_parent}/bad-framing.raw"
   "${blob_batch_bad_header}" \
   "${blob_batch_bad_type}" \
   "${blob_batch_bad_size}" \
-  "${blob_batch_bad_framing}" <<'PY'
+  "${blob_batch_bad_framing}" \
+  "${blob_batch_bad_content}" <<'PY'
 import os
 import sys
 
@@ -1105,6 +1147,7 @@ write_read_only(sys.argv[5], object_id + b" blob 1 extra\nx\n")
 write_read_only(sys.argv[6], object_id + b" tree 1\nx\n")
 write_read_only(sys.argv[7], object_id + b" blob 01\nx\n")
 write_read_only(sys.argv[8], object_id + b" blob 2\nx\n")
+write_read_only(sys.argv[9], object_id + b" blob 1\ny\n")
 PY
 assert_evidence_file "${blob_batch_inventory}" "400" 4096
 for blob_batch_evidence in \
@@ -1113,7 +1156,8 @@ for blob_batch_evidence in \
   "${blob_batch_bad_header}" \
   "${blob_batch_bad_type}" \
   "${blob_batch_bad_size}" \
-  "${blob_batch_bad_framing}"; do
+  "${blob_batch_bad_framing}" \
+  "${blob_batch_bad_content}"; do
   assert_evidence_file "${blob_batch_evidence}" "400" 4096
 done
 run_embedded_python_success \
@@ -1152,6 +1196,12 @@ run_embedded_python_failure \
   /dev/null \
   "candidate blob oracle batch framing is invalid" \
   "${blob_batch_inventory}" "${blob_batch_bad_framing}" 4096 8 4096
+run_embedded_python_failure \
+  "blob-batch-content-hash" \
+  "${blob_validator_probe_python}" \
+  /dev/null \
+  "candidate blob oracle content hash is invalid" \
+  "${blob_batch_inventory}" "${blob_batch_bad_content}" 4096 8 4096
 assert_evidence_file "${blob_batch_inventory}" "400" 4096
 for blob_batch_evidence in \
   "${blob_batch_valid}" \
@@ -1159,7 +1209,8 @@ for blob_batch_evidence in \
   "${blob_batch_bad_header}" \
   "${blob_batch_bad_type}" \
   "${blob_batch_bad_size}" \
-  "${blob_batch_bad_framing}"; do
+  "${blob_batch_bad_framing}" \
+  "${blob_batch_bad_content}"; do
   assert_evidence_file "${blob_batch_evidence}" "400" 4096
 done
 
@@ -1222,6 +1273,117 @@ run_embedded_python_failure \
 assert_snapshot_entry "${seal_probe_snapshot}" "700" "directory"
 assert_snapshot_entry "${seal_probe_file}" "600" "regular file" "2"
 assert_snapshot_entry "${seal_probe_outside_link}" "600" "regular file" "2"
+assert_evidence_file "${seal_probe_inventory}" "400" 4096
+assert_evidence_file "${seal_probe_blob_oracle}" "400" 4096
+
+readonly SEAL_PROBE_FIXTURE_PYTHON='import os
+import sys
+
+
+def write_exact(path, payload, mode):
+    descriptor = os.open(
+        path,
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+        0o600,
+    )
+    try:
+        view = memoryview(payload)
+        while view:
+            written = os.write(descriptor, view)
+            if written <= 0:
+                raise RuntimeError("short fixture write")
+            view = view[written:]
+        os.fsync(descriptor)
+        os.fchmod(descriptor, mode)
+    finally:
+        os.close(descriptor)
+
+
+object_id = sys.argv[1].encode("ascii")
+oracle_mode = sys.argv[2].encode("ascii")
+snapshot_body = bytes.fromhex(sys.argv[3])
+write_exact(
+    sys.argv[4],
+    oracle_mode + b" blob " + object_id + b"\tprobe.bin\0",
+    0o400,
+)
+write_exact(sys.argv[5], object_id + b" blob 1\nx\n", 0o400)
+write_exact(sys.argv[6], snapshot_body, 0o600)
+'
+
+readonly seal_mode_probe_inventory="${seal_mode_probe_parent}/tree.raw"
+readonly seal_mode_probe_blob_oracle="${seal_mode_probe_parent}/blobs.raw"
+readonly seal_mode_probe_file="${seal_mode_probe_snapshot}/probe.bin"
+"${PYTHON3_BIN}" \
+  -I \
+  -B \
+  -c "${SEAL_PROBE_FIXTURE_PYTHON}" \
+  "${blob_probe_oid}" \
+  100755 \
+  78 \
+  "${seal_mode_probe_inventory}" \
+  "${seal_mode_probe_blob_oracle}" \
+  "${seal_mode_probe_file}"
+assert_snapshot_entry "${seal_mode_probe_snapshot}" "700" "directory"
+assert_snapshot_entry "${seal_mode_probe_file}" "600" "regular file" "1"
+assert_evidence_file "${seal_mode_probe_inventory}" "400" 4096
+assert_evidence_file "${seal_mode_probe_blob_oracle}" "400" 4096
+run_embedded_python_failure \
+  "snapshot-seal-executable-mode-mismatch" \
+  "${snapshot_seal_probe_python}" \
+  /dev/null \
+  "candidate snapshot executable mode differs from Git tree" \
+  "${seal_mode_probe_snapshot}" \
+  "${seal_mode_probe_inventory}" \
+  "${seal_mode_probe_blob_oracle}" \
+  4096 8 4096
+assert_snapshot_entry "${seal_mode_probe_snapshot}" "700" "directory"
+assert_snapshot_entry "${seal_mode_probe_file}" "600" "regular file" "1"
+assert_evidence_file "${seal_mode_probe_inventory}" "400" 4096
+assert_evidence_file "${seal_mode_probe_blob_oracle}" "400" 4096
+
+readonly seal_content_probe_inventory="${seal_content_probe_parent}/tree.raw"
+readonly seal_content_probe_blob_oracle="${seal_content_probe_parent}/blobs.raw"
+readonly seal_content_probe_file="${seal_content_probe_snapshot}/probe.bin"
+"${PYTHON3_BIN}" \
+  -I \
+  -B \
+  -c "${SEAL_PROBE_FIXTURE_PYTHON}" \
+  "${blob_probe_oid}" \
+  100644 \
+  79 \
+  "${seal_content_probe_inventory}" \
+  "${seal_content_probe_blob_oracle}" \
+  "${seal_content_probe_file}"
+seal_content_before_sha="$("${SHA256_BIN}" -- \
+  "${seal_content_probe_file}")"
+seal_content_before_sha="${seal_content_before_sha%% *}"
+readonly seal_content_before_sha
+assert_snapshot_entry "${seal_content_probe_snapshot}" "700" "directory"
+assert_snapshot_entry "${seal_content_probe_file}" "600" "regular file" "1"
+assert_evidence_file "${seal_content_probe_inventory}" "400" 4096
+assert_evidence_file "${seal_content_probe_blob_oracle}" "400" 4096
+run_embedded_python_failure \
+  "snapshot-seal-content-mismatch" \
+  "${snapshot_seal_probe_python}" \
+  /dev/null \
+  "candidate snapshot blob content differs from raw Git blob" \
+  "${seal_content_probe_snapshot}" \
+  "${seal_content_probe_inventory}" \
+  "${seal_content_probe_blob_oracle}" \
+  4096 8 4096
+seal_content_after_sha="$("${SHA256_BIN}" -- \
+  "${seal_content_probe_file}")"
+seal_content_after_sha="${seal_content_after_sha%% *}"
+readonly seal_content_after_sha
+[[ "${seal_content_after_sha}" == "${seal_content_before_sha}" ]] || {
+  echo "error: content-mismatch snapshot evidence changed after rejection" >&2
+  exit 1
+}
+assert_snapshot_entry "${seal_content_probe_snapshot}" "700" "directory"
+assert_snapshot_entry "${seal_content_probe_file}" "600" "regular file" "1"
+assert_evidence_file "${seal_content_probe_inventory}" "400" 4096
+assert_evidence_file "${seal_content_probe_blob_oracle}" "400" 4096
 
 readonly gitlink_index="${fixture_root}/gitlink.index"
 fixture_index_git "${gitlink_index}" read-tree "${candidate_commit}"
@@ -1384,6 +1546,10 @@ expect_gate_failure \
   "regular-mode-references-tree-object" \
   "${malformed_tree_commit}" \
   "${malformed_tree_output_parent}" \
+  "RuntimeError: candidate blob oracle batch identity is invalid"
+assert_runtime_error_after_argv \
+  "regular-mode-references-tree-object" \
+  "${LAST_GATE_OUTPUT}" \
   "candidate blob oracle batch identity is invalid"
 assert_stage_sequence \
   "regular-mode-references-tree-object" \
@@ -1393,7 +1559,7 @@ assert_stage_sequence \
   "candidate_blob_query_start" \
   "candidate_blob_oracle_written" \
   "candidate_blob_oracle_validate" \
-  "candidate blob oracle batch identity is invalid"
+  "RuntimeError: candidate blob oracle batch identity is invalid"
 assert_stages_absent \
   "regular-mode-references-tree-object" \
   "${LAST_GATE_OUTPUT}" \
