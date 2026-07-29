@@ -89,7 +89,7 @@ func validateRequest(got request, expected contract) error {
 		return fmt.Errorf("unsupported protocol version %d", got.Version)
 	}
 	switch got.Action {
-	case "probe", "exec", "move-link", "stop":
+	case "probe", "exec", "create-veth-pair", "stop":
 	default:
 		return fmt.Errorf("unsupported action %q", got.Action)
 	}

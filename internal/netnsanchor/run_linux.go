@@ -68,7 +68,7 @@ type fileIdentity struct {
 func Run(arguments []string) error {
 	if len(arguments) == 0 {
 		return errors.New(
-			"expected identity, anchor, inspect-ready, probe, exec, move-link, or stop",
+			"expected identity, anchor, inspect-ready, probe, exec, create-veth-pair, or stop",
 		)
 	}
 	if arguments[0] != "__worker" {
@@ -87,8 +87,8 @@ func Run(arguments []string) error {
 		return runProbeCommand(arguments[1:])
 	case "exec":
 		return runExecCommand(arguments[1:])
-	case "move-link":
-		return runMoveLinkCommand(arguments[1:])
+	case "create-veth-pair":
+		return runCreateVethPairCommand(arguments[1:])
 	case "stop":
 		return runStopCommand(arguments[1:])
 	case "__worker":
@@ -480,44 +480,100 @@ func runExecCommand(arguments []string) error {
 	return unix.Exec(path, command, os.Environ())
 }
 
-func runMoveLinkCommand(arguments []string) error {
-	flags := flag.NewFlagSet("move-link", flag.ContinueOnError)
+func runCreateVethPairCommand(arguments []string) error {
+	flags := flag.NewFlagSet("create-veth-pair", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
-	common := addClientFlags(flags)
-	linkName := flags.String("link", "", "host link name")
-	expectedIfindex := flags.Int("expected-ifindex", 0, "sealed host link index")
+	left := addPrefixedClientFlags(flags, "left-")
+	right := addPrefixedClientFlags(flags, "right-")
+	leftLink := flags.String("left-link", "", "left network namespace link name")
+	rightLink := flags.String("right-link", "", "right network namespace link name")
 	if err := flags.Parse(arguments); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *linkName == "" || *expectedIfindex <= 0 {
-		return errors.New("move-link requires a link name and positive expected ifindex")
+	if flags.NArg() != 0 {
+		return errors.New("create-veth-pair does not accept positional arguments")
 	}
-	if err := common.validate(); err != nil {
+	if err := validateVethPairContract(*left, *right, *leftLink, *rightLink); err != nil {
 		return err
 	}
-	descriptor, err := acquireNamespace(*common, "move-link")
+	leftFD, err := acquireNamespace(*left, "create-veth-pair")
 	if err != nil {
-		return err
+		return fmt.Errorf("acquire left network namespace: %w", err)
 	}
-	defer unix.Close(descriptor)
-	link, err := netlink.LinkByName(*linkName)
+	defer unix.Close(leftFD)
+	rightFD, err := acquireNamespace(*right, "create-veth-pair")
 	if err != nil {
-		return fmt.Errorf("resolve host link %q: %w", *linkName, err)
+		return fmt.Errorf("acquire right network namespace: %w", err)
 	}
-	observedIfindex := -1
-	if link.Attrs() != nil {
-		observedIfindex = link.Attrs().Index
+	defer unix.Close(rightFD)
+	return createVethPair(*leftLink, *rightLink, leftFD, rightFD, netlink.LinkAdd)
+}
+
+func validateVethPairContract(
+	left clientFlags,
+	right clientFlags,
+	leftLink string,
+	rightLink string,
+) error {
+	if err := left.validate(); err != nil {
+		return fmt.Errorf("invalid left namespace contract: %w", err)
 	}
-	if observedIfindex != *expectedIfindex {
+	if err := right.validate(); err != nil {
+		return fmt.Errorf("invalid right namespace contract: %w", err)
+	}
+	if left.runID != right.runID ||
+		left.tokenFile != right.tokenFile ||
+		left.expectedAnchorUID != right.expectedAnchorUID {
+		return errors.New("veth namespace contracts do not share one run identity")
+	}
+	if right.role != "r" || (left.role != "a" && left.role != "b") {
+		return errors.New("veth pair must connect endpoint role a or b to router role r")
+	}
+	if left.socket == right.socket ||
+		left.expectedAnchorPID == right.expectedAnchorPID ||
+		(left.expectedDevice == right.expectedDevice &&
+			left.expectedInode == right.expectedInode) {
+		return errors.New("veth pair requires two distinct anonymous network namespaces")
+	}
+	expectedLeft := "wm" + left.role + left.runID + "0"
+	expectedRight := "wmr" + left.runID + left.role
+	if leftLink != expectedLeft || rightLink != expectedRight {
 		return fmt.Errorf(
-			"host link identity mismatch for %q: expected ifindex=%d observed=%d",
-			*linkName,
-			*expectedIfindex,
-			observedIfindex,
+			"veth names do not match the sealed run contract: expected=%s,%s observed=%s,%s",
+			expectedLeft,
+			expectedRight,
+			leftLink,
+			rightLink,
 		)
 	}
-	if err := netlink.LinkSetNsFd(link, descriptor); err != nil {
-		return fmt.Errorf("move sealed link to exact network namespace FD: %w", err)
+	return nil
+}
+
+func createVethPair(
+	leftLink string,
+	rightLink string,
+	leftFD int,
+	rightFD int,
+	addLink func(netlink.Link) error,
+) error {
+	if leftFD < 0 || rightFD < 0 || leftFD == rightFD || addLink == nil {
+		return errors.New("veth creation descriptor contract is invalid")
+	}
+	link := &netlink.Veth{
+		LinkAttrs: netlink.LinkAttrs{
+			Name:      leftLink,
+			Namespace: netlink.NsFd(leftFD),
+		},
+		PeerName:      rightLink,
+		PeerNamespace: netlink.NsFd(rightFD),
+	}
+	if err := addLink(link); err != nil {
+		return fmt.Errorf(
+			"atomically create veth pair %s/%s in exact namespace FDs: %w",
+			leftLink,
+			rightLink,
+			err,
+		)
 	}
 	return nil
 }
@@ -658,32 +714,46 @@ func parseExecFlags(arguments []string) (clientFlags, []string, error) {
 }
 
 func addClientFlags(flags *flag.FlagSet) *clientFlags {
+	return addPrefixedClientFlags(flags, "")
+}
+
+func addPrefixedClientFlags(flags *flag.FlagSet, prefix string) *clientFlags {
 	value := &clientFlags{}
-	flags.StringVar(&value.socket, "socket", "", "abstract unixpacket socket name")
-	flags.StringVar(&value.tokenFile, "token-file", "", "authentication token file")
-	flags.StringVar(&value.runID, "run-id", "", "run identity")
-	flags.StringVar(&value.role, "role", "", "network namespace role")
+	flags.StringVar(
+		&value.socket,
+		prefix+"socket",
+		"",
+		"abstract unixpacket socket name",
+	)
+	flags.StringVar(
+		&value.tokenFile,
+		prefix+"token-file",
+		"",
+		"authentication token file",
+	)
+	flags.StringVar(&value.runID, prefix+"run-id", "", "run identity")
+	flags.StringVar(&value.role, prefix+"role", "", "network namespace role")
 	flags.Uint64Var(
 		&value.expectedDevice,
-		"expected-device",
+		prefix+"expected-device",
 		0,
 		"sealed namespace device",
 	)
 	flags.Uint64Var(
 		&value.expectedInode,
-		"expected-inode",
+		prefix+"expected-inode",
 		0,
 		"sealed namespace inode",
 	)
 	flags.IntVar(
 		&value.expectedAnchorPID,
-		"expected-anchor-pid",
+		prefix+"expected-anchor-pid",
 		0,
 		"sealed anchor process",
 	)
 	flags.UintVar(
 		&value.expectedAnchorUID,
-		"expected-anchor-uid",
+		prefix+"expected-anchor-uid",
 		0,
 		"sealed anchor UID",
 	)
@@ -960,6 +1030,25 @@ func createAnonymousNamespace() (int, Identity, error) {
 		_ = unix.Close(parentFD)
 		return -1, Identity{}, fmt.Errorf("start network namespace worker: %w", err)
 	}
+	workerPIDFD, err := unix.PidfdOpen(command.Process.Pid, 0)
+	if err != nil {
+		_ = unix.Close(parentFD)
+		_ = childFile.Close()
+		_ = image.close()
+		reapErr := terminateAndReapDirectChild(command, ioTimeout)
+		if reapErr != nil {
+			return -1, Identity{}, fmt.Errorf(
+				"pin exact network namespace worker: %v; direct-child reap failed: %w",
+				err,
+				reapErr,
+			)
+		}
+		return -1, Identity{}, fmt.Errorf(
+			"pin exact network namespace worker: %w",
+			err,
+		)
+	}
+	defer unix.Close(workerPIDFD)
 	closeChildErr := childFile.Close()
 	closeImageErr := image.close()
 	workerWait := make(chan error, 1)
@@ -982,8 +1071,19 @@ func createAnonymousNamespace() (int, Identity, error) {
 		if namespaceFD >= 0 {
 			_ = unix.Close(namespaceFD)
 		}
+		reapErr := terminateAndReapWorker(
+			workerPIDFD,
+			workerWait,
+			ioTimeout,
+		)
+		if reapErr != nil {
+			return -1, Identity{}, fmt.Errorf(
+				"network namespace worker did not exit before the bounded deadline; exact-child reap failed: %w",
+				reapErr,
+			)
+		}
 		return -1, Identity{}, errors.New(
-			"network namespace worker did not exit before the bounded deadline",
+			"network namespace worker did not exit before the bounded deadline and was reaped through its pidfd",
 		)
 	}
 	if receiveErr != nil {
@@ -1031,6 +1131,63 @@ func createAnonymousNamespace() (int, Identity, error) {
 		return -1, Identity{}, errors.New("worker did not create a distinct network namespace")
 	}
 	return namespaceFD, identity, nil
+}
+
+func terminateAndReapDirectChild(command *exec.Cmd, timeout time.Duration) error {
+	if command == nil || command.Process == nil ||
+		timeout <= 0 || timeout > ioTimeout {
+		return errors.New("direct-child process contract is invalid")
+	}
+	killErr := command.Process.Kill()
+	workerWait := make(chan error, 1)
+	go func() {
+		workerWait <- command.Wait()
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case waitErr := <-workerWait:
+		if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+			return fmt.Errorf("terminate unpinned direct child: %w", killErr)
+		}
+		var exitErr *exec.ExitError
+		if waitErr != nil && !errors.As(waitErr, &exitErr) {
+			return fmt.Errorf("reap unpinned direct child: %w", waitErr)
+		}
+		return nil
+	case <-timer.C:
+		return errors.New(
+			"unpinned direct child was not reaped before the bounded deadline",
+		)
+	}
+}
+
+func terminateAndReapWorker(
+	pidfd int,
+	workerWait <-chan error,
+	timeout time.Duration,
+) error {
+	if pidfd < 0 || workerWait == nil || timeout <= 0 || timeout > ioTimeout {
+		return errors.New("worker pidfd reap contract is invalid")
+	}
+	signalErr := unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0)
+	if signalErr != nil && !errors.Is(signalErr, unix.ESRCH) {
+		return fmt.Errorf("terminate exact network namespace worker: %w", signalErr)
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case waitErr := <-workerWait:
+		var exitErr *exec.ExitError
+		if waitErr != nil && !errors.As(waitErr, &exitErr) {
+			return fmt.Errorf("reap exact network namespace worker: %w", waitErr)
+		}
+		return nil
+	case <-timer.C:
+		return errors.New(
+			"exact network namespace worker was not reaped before the bounded deadline",
+		)
+	}
 }
 
 func runWorkerCommand(arguments []string) error {
@@ -1104,10 +1261,6 @@ func receiveWorkerNamespaceFD(socketFD int) (int, error) {
 	if err != nil {
 		return -1, fmt.Errorf("receive worker network namespace FD: %w", err)
 	}
-	if flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 ||
-		string(payload[:count]) != "wg-mix-ebpf-netns-fd-v1" {
-		return -1, errors.New("invalid worker namespace transfer message")
-	}
 	messages, err := unix.ParseSocketControlMessage(control[:controlCount])
 	if err != nil {
 		return -1, fmt.Errorf("parse worker control message: %w", err)
@@ -1120,6 +1273,11 @@ func receiveWorkerNamespaceFD(socketFD int) (int, error) {
 			return -1, fmt.Errorf("parse worker descriptor rights: %w", rightsErr)
 		}
 		descriptors = append(descriptors, rights...)
+	}
+	if flags&(unix.MSG_TRUNC|unix.MSG_CTRUNC) != 0 ||
+		string(payload[:count]) != "wg-mix-ebpf-netns-fd-v1" {
+		closeDescriptors(descriptors)
+		return -1, errors.New("invalid worker namespace transfer message")
 	}
 	if len(descriptors) != 1 {
 		closeDescriptors(descriptors)

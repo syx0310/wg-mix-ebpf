@@ -93,7 +93,7 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         )
         bounded = self.source[
             self.source.index("run_bounded_in_owned_netns() {") :
-            self.source.index("\nmove_link_to_owned_netns() {")
+            self.source.index("\ncreate_veth_pair() {")
         ]
         self.assertLess(
             bounded.index("set_netns_client_args"),
@@ -303,7 +303,9 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             "unix.MSG_CMSG_CLOEXEC",
             "unix.NS_GET_NSTYPE",
             "unix.Setns(descriptor, unix.CLONE_NEWNET)",
-            "netlink.LinkSetNsFd(link, descriptor)",
+            "Namespace: netlink.NsFd(leftFD)",
+            "PeerNamespace: netlink.NsFd(rightFD)",
+            "netlink.LinkAdd",
             "unix.SO_PEERCRED",
             '"@"+flags.socket',
             "PR_SET_PDEATHSIG",
@@ -311,11 +313,14 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             '"/proc/self/exe"',
             "validateWorkerImage(",
             "unix.PidfdOpen(",
+            "unix.PidfdSendSignal(",
             "waitForAnchorExit(",
-            "network namespace worker did not exit before the bounded deadline",
+            "terminateAndReapWorker(",
         ):
             self.assertIn(required, self.anchor_linux_source)
         self.assertNotIn("os.Executable()", self.anchor_linux_source)
+        self.assertNotIn("netlink.LinkByName(", self.anchor_linux_source)
+        self.assertNotIn("netlink.LinkSetNsFd(", self.anchor_linux_source)
         self.assertIn("consumeBootstrapImageFD()", self.anchor_linux_source)
         self.assertIn(
             "subtle.ConstantTimeCompare",
@@ -325,12 +330,49 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertNotIn("ip netns", self.anchor_linux_source)
         exec_helper = self.anchor_linux_source[
             self.anchor_linux_source.index("func runExecCommand(") :
-            self.anchor_linux_source.index("\nfunc runMoveLinkCommand(")
+            self.anchor_linux_source.index("\nfunc runCreateVethPairCommand(")
         ]
         self.assertLess(
             exec_helper.index("acquireNamespace(flags,"),
             exec_helper.index("unix.Setns(descriptor, unix.CLONE_NEWNET)"),
         )
+        create_veth = self.anchor_linux_source[
+            self.anchor_linux_source.index("func runCreateVethPairCommand(") :
+            self.anchor_linux_source.index("\nfunc runStopCommand(")
+        ]
+        self.assertEqual(2, create_veth.count("acquireNamespace("))
+        self.assertEqual(1, create_veth.count("netlink.LinkAdd"))
+        self.assertLess(
+            create_veth.index("acquireNamespace(*left,"),
+            create_veth.index("acquireNamespace(*right,"),
+        )
+        self.assertLess(
+            create_veth.index("acquireNamespace(*right,"),
+            create_veth.index("netlink.LinkAdd"),
+        )
+        self.assertNotIn("ifindex", create_veth.lower())
+        self.assertNotIn("LinkByName", create_veth)
+
+        shell_veth = self.source[
+            self.source.index("create_veth_pair() {") :
+            self.source.index("\nstart_netns_anchor() {")
+        ]
+        self.assertIn('"${NETNS_ANCHOR_EXEC}" create-veth-pair', shell_veth)
+        self.assertIn('"left-"', shell_veth)
+        self.assertIn('"right-"', shell_veth)
+        self.assertNotIn("ifindex", shell_veth.lower())
+        self.assertNotIn('ip link add "${VETH_', self.source)
+
+        anchor_start = self.source[
+            self.source.index("start_netns_anchor() {") :
+            self.source.index('\nPHASE="create-owned-run-root"')
+        ]
+        inspect = anchor_start.index('"${NETNS_ANCHOR_EXEC}" inspect-ready')
+        liveness = anchor_start.index('kill -0 "${anchor_pid}"')
+        self.assertLess(inspect, liveness)
+        self.assertIn('ready_identity="$(', anchor_start)
+        self.assertNotIn("readiness contract is invalid", anchor_start)
+        self.assertIn("sleep 0.05", anchor_start)
 
         teardown = self.source[
             self.source.index("explicit_teardown() {") :

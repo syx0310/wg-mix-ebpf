@@ -162,3 +162,48 @@ func TestWaitForAnchorExitUsesBoundedPidfd(t *testing.T) {
 		}
 	})
 }
+
+func TestTerminateAndReapWorkerUsesExactPidfd(t *testing.T) {
+	command := exec.Command("/bin/sleep", "30")
+	if err := command.Start(); err != nil {
+		t.Fatalf("start blocking direct child: %v", err)
+	}
+	pidfd, err := unix.PidfdOpen(command.Process.Pid, 0)
+	if errors.Is(err, unix.ENOSYS) {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Skip("pidfd_open is unavailable")
+	}
+	if err != nil {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("open exact direct-child pidfd: %v", err)
+	}
+	defer unix.Close(pidfd)
+	workerWait := make(chan error, 1)
+	go func() {
+		workerWait <- command.Wait()
+	}()
+	reaped := false
+	defer func() {
+		if reaped {
+			return
+		}
+		_ = unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0)
+		select {
+		case <-workerWait:
+		case <-time.After(time.Second):
+		}
+	}()
+	started := time.Now()
+	if err := terminateAndReapWorker(pidfd, workerWait, time.Second); err != nil {
+		t.Fatalf("terminate and reap exact direct child: %v", err)
+	}
+	reaped = true
+	if elapsed := time.Since(started); elapsed >= 2*time.Second {
+		t.Fatalf("pidfd reap took %s, want less than two seconds", elapsed)
+	}
+	if command.ProcessState == nil {
+		t.Fatal("direct child was not reaped into a process state")
+	}
+}

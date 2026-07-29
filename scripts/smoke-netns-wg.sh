@@ -351,10 +351,6 @@ NETNS_B_INO=""
 NETNS_ANCHOR_PID_A=""
 NETNS_ANCHOR_PID_R=""
 NETNS_ANCHOR_PID_B=""
-VETH_A_IFINDEX=""
-VETH_RA_IFINDEX=""
-VETH_B_IFINDEX=""
-VETH_RB_IFINDEX=""
 RUN_BASE_CREATED=0
 TEARDOWN_COMPLETE=0
 PHASE="preflight"
@@ -762,12 +758,20 @@ NETNS_CLIENT_ARGS=()
 
 set_netns_client_args() {
   local ns="$1"
+  local prefix="${2:-}"
   local role
   local socket_name
   local expected_device
   local expected_inode
   local anchor_pid
 
+  case "${prefix}" in
+    "" | "left-" | "right-") ;;
+    *)
+      echo "error: invalid anonymous network namespace flag prefix: ${prefix}" >&2
+      return 1
+      ;;
+  esac
   case "${ns}" in
     "${NSA}")
       role=a
@@ -802,14 +806,14 @@ set_netns_client_args() {
     return 1
   fi
   NETNS_CLIENT_ARGS=(
-    --socket "${socket_name}"
-    --token-file "${NETNS_AUTH_TOKEN_FILE}"
-    --run-id "${RUN_ID}"
-    --role "${role}"
-    --expected-device "${expected_device}"
-    --expected-inode "${expected_inode}"
-    --expected-anchor-pid "${anchor_pid}"
-    --expected-anchor-uid "${EUID}"
+    "--${prefix}socket" "${socket_name}"
+    "--${prefix}token-file" "${NETNS_AUTH_TOKEN_FILE}"
+    "--${prefix}run-id" "${RUN_ID}"
+    "--${prefix}role" "${role}"
+    "--${prefix}expected-device" "${expected_device}"
+    "--${prefix}expected-inode" "${expected_inode}"
+    "--${prefix}expected-anchor-pid" "${anchor_pid}"
+    "--${prefix}expected-anchor-uid" "${EUID}"
   )
 }
 
@@ -884,32 +888,33 @@ run_bounded_in_owned_netns() {
     env -u XOR_PASSWORD "$@"
 }
 
-move_link_to_owned_netns() {
-  local link="$1"
-  local ns="$2"
-  local expected_ifindex
+create_veth_pair() {
+  local left_link="$1"
+  local left_ns="$2"
+  local right_link="$3"
+  local right_ns="$4"
+  local left_args=()
+  local right_args=()
 
-  case "${link}:${ns}" in
-    "${VETH_A}:${NSA}") expected_ifindex="${VETH_A_IFINDEX}" ;;
-    "${VETH_RA}:${NSR}") expected_ifindex="${VETH_RA_IFINDEX}" ;;
-    "${VETH_B}:${NSB}") expected_ifindex="${VETH_B_IFINDEX}" ;;
-    "${VETH_RB}:${NSR}") expected_ifindex="${VETH_RB_IFINDEX}" ;;
+  case "${left_link}:${left_ns}:${right_link}:${right_ns}" in
+    "${VETH_A}:${NSA}:${VETH_RA}:${NSR}" | \
+      "${VETH_B}:${NSB}:${VETH_RB}:${NSR}") ;;
     *)
-      echo "error: invalid link-to-netns move request: link=${link} netns=${ns}" >&2
+      echo "error: invalid atomic veth pair request: left=${left_link}:${left_ns} right=${right_link}:${right_ns}" >&2
       return 1
       ;;
   esac
-  if [[ ! "${expected_ifindex}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "error: unsealed host link identity for ${link}" >&2
-    return 1
-  fi
-  set_netns_client_args "${ns}" || return 1
+  set_netns_client_args "${left_ns}" "left-" || return 1
+  left_args=("${NETNS_CLIENT_ARGS[@]}")
+  set_netns_client_args "${right_ns}" "right-" || return 1
+  right_args=("${NETNS_CLIENT_ARGS[@]}")
   env -u XOR_PASSWORD \
     "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
-    "${NETNS_ANCHOR_EXEC}" move-link \
-    "${NETNS_CLIENT_ARGS[@]}" \
-    --link "${link}" \
-    --expected-ifindex "${expected_ifindex}"
+    "${NETNS_ANCHOR_EXEC}" create-veth-pair \
+    "${left_args[@]}" \
+    "${right_args[@]}" \
+    --left-link "${left_link}" \
+    --right-link "${right_link}"
 }
 
 start_netns_anchor() {
@@ -920,6 +925,8 @@ start_netns_anchor() {
   local anchor_pid
   local observed_device
   local observed_inode
+  local observed_extra
+  local ready_identity
   local anchor_status
 
   validate_owned_path "${ready_file}" || return 1
@@ -950,7 +957,11 @@ start_netns_anchor() {
   esac
   for _ in {1..100}; do
     if [[ -f "${ready_file}" && ! -L "${ready_file}" ]]; then
-      if read -r observed_device observed_inode < <(
+      observed_device=""
+      observed_inode=""
+      observed_extra=""
+      ready_identity=""
+      if ready_identity="$(
         env -u XOR_PASSWORD \
           "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
           "${NETNS_ANCHOR_EXEC}" inspect-ready \
@@ -961,11 +972,16 @@ start_netns_anchor() {
           --expected-anchor-pid "${anchor_pid}" \
           --expected-anchor-uid "${EUID}" \
           --expected-parent-pid "$$"
-      ); then
+      )"; then
+        read -r observed_device observed_inode observed_extra <<<"${ready_identity}"
+        if [[ ! "${observed_device}" =~ ^[1-9][0-9]*$ ||
+          ! "${observed_inode}" =~ ^[1-9][0-9]*$ ||
+          -n "${observed_extra}" ]]; then
+          echo "error: anonymous netns inspector returned malformed identity: role=${role}" >&2
+          return 1
+        fi
         break
       fi
-      echo "error: anonymous netns readiness contract is invalid: ${ready_file}" >&2
-      return 1
     fi
     if ! kill -0 "${anchor_pid}" >/dev/null 2>&1; then
       if wait "${anchor_pid}"; then
@@ -1000,13 +1016,6 @@ start_netns_anchor() {
   validate_netns_identity \
     "${ns}" "${observed_device}" "${observed_inode}" "${role}"
 }
-
-for link in "${VETH_A}" "${VETH_RA}" "${VETH_B}" "${VETH_RB}"; do
-  if ip -o link show dev "${link}" >/dev/null 2>&1; then
-    echo "error: random RUN_ID collision with existing link ${link}; refusing cleanup or retry" >&2
-    exit 1
-  fi
-done
 
 PHASE="create-owned-run-root"
 if [[ -L "${TEST_ROOT}" ]]; then
@@ -2559,24 +2568,8 @@ if [[ "${NETNS_A_DEV}:${NETNS_A_INO}" == "${NETNS_R_DEV}:${NETNS_R_INO}" ||
 fi
 validate_all_netns_identities
 
-ip link add "${VETH_A}" type veth peer name "${VETH_RA}"
-ip link add "${VETH_B}" type veth peer name "${VETH_RB}"
-VETH_A_IFINDEX="$(<"/sys/class/net/${VETH_A}/ifindex")"
-VETH_RA_IFINDEX="$(<"/sys/class/net/${VETH_RA}/ifindex")"
-VETH_B_IFINDEX="$(<"/sys/class/net/${VETH_B}/ifindex")"
-VETH_RB_IFINDEX="$(<"/sys/class/net/${VETH_RB}/ifindex")"
-for ifindex in \
-  "${VETH_A_IFINDEX}" "${VETH_RA_IFINDEX}" \
-  "${VETH_B_IFINDEX}" "${VETH_RB_IFINDEX}"; do
-  if [[ ! "${ifindex}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "error: invalid sealed veth ifindex: ${ifindex}" >&2
-    exit 1
-  fi
-done
-move_link_to_owned_netns "${VETH_A}" "${NSA}"
-move_link_to_owned_netns "${VETH_RA}" "${NSR}"
-move_link_to_owned_netns "${VETH_B}" "${NSB}"
-move_link_to_owned_netns "${VETH_RB}" "${NSR}"
+create_veth_pair "${VETH_A}" "${NSA}" "${VETH_RA}" "${NSR}"
+create_veth_pair "${VETH_B}" "${NSB}" "${VETH_RB}" "${NSR}"
 
 run_in_owned_netns "${NSA}" ip link set lo up
 run_in_owned_netns "${NSR}" ip link set lo up

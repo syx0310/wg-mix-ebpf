@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
-"""Unprivileged tests for the final network namespace delete boundary."""
+"""Unprivileged regression tests for the fail-closed named-netns shim."""
 
 from __future__ import annotations
 
 import importlib.util
-import os
 import pathlib
+import subprocess
 import sys
-import tempfile
 import unittest
 
 
@@ -24,68 +23,62 @@ sys.modules[SPEC.name] = HELPER
 SPEC.loader.exec_module(HELPER)
 
 
-class DeleteOwnedNetNSTests(unittest.TestCase):
-    def setUp(self) -> None:
-        self.temporary = tempfile.TemporaryDirectory(
-            prefix="wg-mix-ebpf-netns-delete."
-        )
-        self.addCleanup(self.temporary.cleanup)
-        self.netns_root = pathlib.Path(self.temporary.name).resolve()
-        self.name = "wme01234567a"
-        self.target = self.netns_root / self.name
-        self.target.write_bytes(b"original")
-        metadata = self.target.stat()
-        self.expected_device = metadata.st_dev
-        self.expected_inode = metadata.st_ino
+class DeleteOwnedNetNSFailClosedTests(unittest.TestCase):
+    def test_legacy_api_rejects_before_invoking_any_mutation_hook(self) -> None:
+        mutation_calls: list[str] = []
 
-    def invoke(
-        self,
-        *,
-        delete_runner,
-        before_final_recheck=None,
-    ) -> None:
-        HELPER.delete_owned_netns(
-            netns_root=self.netns_root,
-            name=self.name,
-            run_id="01234567",
-            role="a",
-            expected_device=self.expected_device,
-            expected_inode=self.expected_inode,
-            delete_runner=delete_runner,
-            before_final_recheck=before_final_recheck,
-        )
-
-    def test_same_name_swap_before_final_recheck_fails_without_delete(
-        self,
-    ) -> None:
-        delete_calls: list[str] = []
-
-        def replace_target() -> None:
-            os.unlink(self.target)
-            self.target.write_bytes(b"replacement")
+        def forbidden_runner(name: str) -> int:
+            mutation_calls.append(name)
+            return 0
 
         with self.assertRaisesRegex(
             HELPER.ContractError,
-            "pathname identity changed before delete",
+            "permanently disabled",
         ):
-            self.invoke(
-                delete_runner=lambda name: delete_calls.append(name) or 0,
-                before_final_recheck=replace_target,
+            HELPER.delete_owned_netns(
+                netns_root=object(),
+                name="wme01234567a",
+                run_id="01234567",
+                role="a",
+                expected_device=1,
+                expected_inode=1,
+                delete_runner=forbidden_runner,
             )
-        self.assertEqual([], delete_calls)
-        self.assertEqual(b"replacement", self.target.read_bytes())
+        self.assertEqual([], mutation_calls)
 
-    def test_exact_target_delete_and_absence_check_succeed(self) -> None:
-        delete_calls: list[str] = []
+    def test_cli_is_nonzero_and_reports_no_mutation(self) -> None:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                str(HELPER_PATH),
+                "--name",
+                "wme01234567a",
+                "--ip-bin",
+                "/usr/bin/ip",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(78, completed.returncode)
+        self.assertEqual("", completed.stdout)
+        self.assertIn("permanently disabled", completed.stderr)
+        self.assertIn("performs no filesystem", completed.stderr)
 
-        def delete_target(name: str) -> int:
-            delete_calls.append(name)
-            os.unlink(self.target)
-            return 0
-
-        self.invoke(delete_runner=delete_target)
-        self.assertEqual([self.name], delete_calls)
-        self.assertFalse(self.target.exists())
+    def test_shim_contains_no_mutation_implementation(self) -> None:
+        source = HELPER_PATH.read_text(encoding="utf-8")
+        for forbidden in (
+            "import os",
+            "import pathlib",
+            "import subprocess",
+            "subprocess.run",
+            "os.unlink",
+            "os.remove",
+            "os.rmdir",
+            'pathlib.Path("/run/netns")',
+            '["ip", "netns", "delete"',
+        ):
+            self.assertNotIn(forbidden, source)
 
 
 if __name__ == "__main__":

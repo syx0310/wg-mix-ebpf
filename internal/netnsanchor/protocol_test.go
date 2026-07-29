@@ -36,6 +36,16 @@ func TestValidateRequestBindsIdentityActionAndToken(t *testing.T) {
 	if err := validateRequest(base, expected); err != nil {
 		t.Fatalf("valid request was rejected: %v", err)
 	}
+	createVeth := base
+	createVeth.Action = "create-veth-pair"
+	if err := validateRequest(createVeth, expected); err != nil {
+		t.Fatalf("atomic veth request was rejected: %v", err)
+	}
+	legacyMove := base
+	legacyMove.Action = "move-link"
+	if err := validateRequest(legacyMove, expected); err == nil {
+		t.Fatal("legacy host-link move action was accepted")
+	}
 
 	tests := []struct {
 		name   string
