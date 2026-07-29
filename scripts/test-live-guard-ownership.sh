@@ -63,6 +63,10 @@ objects to exist and writes only one new unique child:
 
   /var/lib/wg-mix-ebpf-test-runs/<run-id>
 
+It persists run.owner, fsyncs that file, the run directory, and RUN_PREFIX in
+that order before creating state, evidence, tmp, or the evidence log. Any
+failure stops the sequence and retains the exact run.owner already recorded.
+
 It temporarily creates one empty, instance-owned inet nftables guard table.
 The test validates its marker and handle, replaces it, deletes it by validated
 handle, and verifies an idempotent second cleanup. A failed run keeps all
@@ -76,6 +80,13 @@ valid_run_id() {
 
 valid_sha256() {
   [[ "$1" =~ ^[0-9a-f]{64}$ ]]
+}
+
+mode_has_no_group_or_other_write() {
+  local mode="$1"
+
+  [[ "${mode}" =~ ^[0-7]{3,4}$ ]] || return 1
+  (((8#${mode} & 8#022) == 0))
 }
 
 validate_secure_directory() {
@@ -103,7 +114,7 @@ validate_secure_directory() {
       "${path}" "${uid}" "${kind}" >&2
     return 1
   }
-  ((8#${mode} & 8#022 == 0)) || {
+  mode_has_no_group_or_other_write "${mode}" || {
     printf 'error: directory is group/other writable: path=%s mode=%s\n' \
       "${path}" "${mode}" >&2
     return 1
@@ -246,31 +257,37 @@ print(hashlib.sha256(data).hexdigest())
 PY
 }
 
-create_run_bootstrap() {
-  local run_dir="$1"
-  local manifest_path="$2"
-  local expected_uid="$3"
-  local run_id="$4"
-  local candidate_commit="$5"
-  local expected_hostname="$6"
-  local expected_kernel="$7"
-  local expected_machine_id="$8"
-  local expected_address="$9"
-  local interface="${10}"
-  local approved_script_sha256="${11}"
-  local gate_manifest_path="${12}"
-  local gate_manifest_sha256="${13}"
-  local staged_script_path="${14}"
-  local test_binary_path="${15}"
-  local test_binary_sha256="${16}"
-  local state_dir="${17}"
-  local evidence_dir="${18}"
-  local tmp_dir="${19}"
+initialize_run_layout() {
+  local run_prefix="$1"
+  local run_dir="$2"
+  local manifest_path="$3"
+  local evidence_log="$4"
+  local expected_uid="$5"
+  local failure_point="$6"
+  local run_id="$7"
+  local candidate_commit="$8"
+  local expected_hostname="$9"
+  local expected_kernel="${10}"
+  local expected_machine_id="${11}"
+  local expected_address="${12}"
+  local interface="${13}"
+  local approved_script_sha256="${14}"
+  local gate_manifest_path="${15}"
+  local gate_manifest_sha256="${16}"
+  local staged_script_path="${17}"
+  local test_binary_path="${18}"
+  local test_binary_sha256="${19}"
+  local state_dir="${20}"
+  local evidence_dir="${21}"
+  local tmp_dir="${22}"
 
   run_isolated_python "${run_dir}" "${run_dir}" - \
+    "${run_prefix}" \
     "${run_dir}" \
     "${manifest_path}" \
+    "${evidence_log}" \
     "${expected_uid}" \
+    "${failure_point}" \
     "${run_id}" \
     "${candidate_commit}" \
     "${expected_hostname}" \
@@ -296,9 +313,12 @@ import stat
 import sys
 
 (
+    run_prefix,
     run_dir,
     manifest_path,
+    evidence_log,
     expected_uid_text,
+    failure_point,
     run_id,
     candidate_commit,
     expected_hostname,
@@ -317,6 +337,9 @@ import sys
     tmp_dir,
 ) = sys.argv[1:]
 expected_uid = int(expected_uid_text)
+allowed_failures = {"", "prefix_fsync", "state", "evidence", "tmp", "log"}
+if failure_point not in allowed_failures:
+    raise RuntimeError(f"unknown run-layout failure point: {failure_point}")
 marker = f"wg-mix-ebpf-live-guard-run-v1:{run_id}"
 if not re.fullmatch(
     r"wg-mix-ebpf-live-guard-run-v1:g[0-9]{8}t[0-9]{6}z-[0-9a-f]{12}",
@@ -324,14 +347,39 @@ if not re.fullmatch(
 ):
     raise RuntimeError("run marker is invalid")
 
-if manifest_path != run_dir + "/run.owner":
-    raise RuntimeError("run ownership manifest path is not the exact run child")
-run_fd = os.open(
-    run_dir,
+if (
+    run_dir != run_prefix + "/" + run_id
+    or manifest_path != run_dir + "/run.owner"
+    or state_dir != run_dir + "/state"
+    or evidence_dir != run_dir + "/evidence"
+    or tmp_dir != run_dir + "/tmp"
+    or evidence_log != evidence_dir + "/guard-live.log"
+):
+    raise RuntimeError("run-layout paths are not exact children of the fixed prefix")
+if os.path.realpath(run_prefix) != run_prefix:
+    raise RuntimeError("run prefix is not canonical")
+prefix_fd = os.open(
+    run_prefix,
     os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
 )
+prefix_stat = os.fstat(prefix_fd)
+named_prefix = os.stat(run_prefix, follow_symlinks=False)
+if (
+    not stat.S_ISDIR(prefix_stat.st_mode)
+    or stat.S_IMODE(prefix_stat.st_mode) != 0o700
+    or prefix_stat.st_uid != expected_uid
+    or (named_prefix.st_dev, named_prefix.st_ino)
+    != (prefix_stat.st_dev, prefix_stat.st_ino)
+):
+    os.close(prefix_fd)
+    raise RuntimeError("run prefix identity is unsafe")
+run_fd = os.open(
+    run_id,
+    os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+    dir_fd=prefix_fd,
+)
 run_stat = os.fstat(run_fd)
-named_run = os.stat(run_dir, follow_symlinks=False)
+named_run = os.stat(run_id, dir_fd=prefix_fd, follow_symlinks=False)
 if (
     not stat.S_ISDIR(run_stat.st_mode)
     or stat.S_IMODE(run_stat.st_mode) != 0o700
@@ -340,6 +388,7 @@ if (
     or (named_run.st_dev, named_run.st_ino) != (run_stat.st_dev, run_stat.st_ino)
 ):
     os.close(run_fd)
+    os.close(prefix_fd)
     raise RuntimeError("run directory identity is unsafe")
 
 created_at = datetime.now(timezone.utc).isoformat()
@@ -347,6 +396,7 @@ document = {
     "version": 1,
     "marker": marker,
     "run_id": run_id,
+    "run_prefix": run_prefix,
     "run_dir": run_dir,
     "candidate_commit": candidate_commit,
     "expected_hostname": expected_hostname,
@@ -403,6 +453,69 @@ def create_and_sync(data):
         os.close(fd)
     os.fsync(run_fd)
 
+def inject_failure(point):
+    if failure_point == point:
+        raise RuntimeError(f"injected run-layout failure: {point}")
+
+def create_run_directory(name, point):
+    inject_failure(point)
+    os.mkdir(name, 0o700, dir_fd=run_fd)
+    child_fd = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=run_fd,
+    )
+    try:
+        opened = os.fstat(child_fd)
+        named = os.stat(name, dir_fd=run_fd, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or stat.S_IMODE(opened.st_mode) != 0o700
+            or opened.st_uid != expected_uid
+            or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+        ):
+            raise RuntimeError(f"new run directory metadata is unsafe: {name}")
+        os.fsync(child_fd)
+    finally:
+        os.close(child_fd)
+    os.fsync(run_fd)
+
+def create_evidence_log():
+    inject_failure("log")
+    evidence_fd = os.open(
+        "evidence",
+        os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW,
+        dir_fd=run_fd,
+    )
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+        log_fd = os.open("guard-live.log", flags, 0o600, dir_fd=evidence_fd)
+        try:
+            os.fchmod(log_fd, 0o600)
+            os.fsync(log_fd)
+            opened = os.fstat(log_fd)
+            named = os.stat(
+                "guard-live.log",
+                dir_fd=evidence_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or stat.S_IMODE(opened.st_mode) != 0o600
+                or opened.st_uid != expected_uid
+                or opened.st_nlink != 1
+                or opened.st_size != 0
+                or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
+            ):
+                raise RuntimeError("new evidence log metadata is unsafe")
+        finally:
+            os.close(log_fd)
+        os.fsync(evidence_fd)
+    finally:
+        os.close(evidence_fd)
+
+manifest_sha256 = hashlib.sha256(payload).hexdigest()
+manifest_persisted = False
 try:
     create_and_sync(payload)
 
@@ -423,10 +536,12 @@ try:
             or (named.st_dev, named.st_ino) != (opened.st_dev, opened.st_ino)
         ):
             raise RuntimeError("durable run ownership manifest validation failed")
+        manifest_stat = opened
     finally:
         os.close(read_fd)
+    manifest_persisted = True
     after_run = os.fstat(run_fd)
-    named_run = os.stat(run_dir, follow_symlinks=False)
+    named_run = os.stat(run_id, dir_fd=prefix_fd, follow_symlinks=False)
     if (
         (after_run.st_dev, after_run.st_ino) != (run_stat.st_dev, run_stat.st_ino)
         or (named_run.st_dev, named_run.st_ino)
@@ -435,9 +550,44 @@ try:
         or after_run.st_uid != expected_uid
     ):
         raise RuntimeError("run directory changed while persisting ownership")
+    inject_failure("prefix_fsync")
+    os.fsync(prefix_fd)
+    after_prefix = os.fstat(prefix_fd)
+    named_prefix = os.stat(run_prefix, follow_symlinks=False)
+    if (
+        (after_prefix.st_dev, after_prefix.st_ino)
+        != (prefix_stat.st_dev, prefix_stat.st_ino)
+        or (named_prefix.st_dev, named_prefix.st_ino)
+        != (prefix_stat.st_dev, prefix_stat.st_ino)
+        or stat.S_IMODE(after_prefix.st_mode) != 0o700
+        or after_prefix.st_uid != expected_uid
+    ):
+        raise RuntimeError("run prefix changed while persisting ownership")
+
+    create_run_directory("state", "state")
+    create_run_directory("evidence", "evidence")
+    create_run_directory("tmp", "tmp")
+    create_evidence_log()
+except Exception:
+    if manifest_persisted:
+        print(
+            "run_manifest_retained"
+            f" path={manifest_path}"
+            f" sha256={manifest_sha256}"
+            f" device={manifest_stat.st_dev}"
+            f" inode={manifest_stat.st_ino}"
+            f" uid={manifest_stat.st_uid}"
+            f" mode={stat.S_IMODE(manifest_stat.st_mode):04o}"
+            f" nlink={manifest_stat.st_nlink}"
+            f" size={manifest_stat.st_size}"
+            f" failure_point={failure_point or 'system'}",
+            file=sys.stderr,
+            flush=True,
+        )
+    raise
 finally:
     os.close(run_fd)
-manifest_sha256 = hashlib.sha256(payload).hexdigest()
+    os.close(prefix_fd)
 print(manifest_sha256)
 PY
 }
@@ -516,9 +666,25 @@ valid_live_test_list() {
 
 self_test_run_evidence_failures() {
   local fixture_root
-  local mkdir_run
-  local log_run
   local fixture_sha
+  local failure_point
+  local run_id
+  local run_dir
+  local output
+  local exit_code
+  local index
+  local success_run_id
+  local success_run_dir
+  local success_sha256
+  local -a failure_points=(prefix_fsync state evidence tmp log)
+  local -a run_ids=(
+    g20260729t120001z-012345abcdef
+    g20260729t120002z-012345abcdef
+    g20260729t120003z-012345abcdef
+    g20260729t120004z-012345abcdef
+    g20260729t120005z-012345abcdef
+  )
+
   fixture_root="$(
     run_isolated_python "${PWD}" "/tmp" - <<'PY'
 import os
@@ -529,137 +695,299 @@ os.chmod(root, 0o700)
 print(os.path.realpath(root))
 PY
   )"
-  mkdir_run="${fixture_root}/g20260729t120001z-012345abcdef"
-  log_run="${fixture_root}/g20260729t120002z-012345abcdef"
   fixture_sha="0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 
-  run_isolated_python "${fixture_root}" "${fixture_root}" - \
-    "${mkdir_run}" "${log_run}" <<'PY'
+  for ((index = 0; index < ${#failure_points[@]}; index++)); do
+    failure_point="${failure_points[index]}"
+    run_id="${run_ids[index]}"
+    run_dir="${fixture_root}/${run_id}"
+    run_isolated_python "${fixture_root}" "${fixture_root}" - "${run_dir}" <<'PY'
 import os
 import sys
 
-for path in sys.argv[1:]:
-    os.mkdir(path, 0o700)
-    os.chmod(path, 0o700)
+os.mkdir(sys.argv[1], 0o700)
+os.chmod(sys.argv[1], 0o700)
 PY
 
-  create_run_bootstrap \
-    "${mkdir_run}" "${mkdir_run}/run.owner" "${EUID}" \
-    "g20260729t120001z-012345abcdef" \
-    "0123456789abcdef0123456789abcdef01234567" \
-    "fixture-host" "7.0.0-28-generic" "0123456789abcdef0123456789abcdef" \
-    "192.0.2.1" "fixture0" "${fixture_sha}" \
-    "${mkdir_run}.gate/run.manifest" "${fixture_sha}" \
-    "${mkdir_run}.gate/test-live-guard-ownership.sh" \
-    "${fixture_root}/guard-live.test" "${fixture_sha}" \
-    "${mkdir_run}/state" "${mkdir_run}/evidence" "${mkdir_run}/tmp" >/dev/null
+    set +e
+    output="$(
+      initialize_run_layout \
+        "${fixture_root}" \
+        "${run_dir}" \
+        "${run_dir}/run.owner" \
+        "${run_dir}/evidence/guard-live.log" \
+        "${EUID}" \
+        "${failure_point}" \
+        "${run_id}" \
+        "0123456789abcdef0123456789abcdef01234567" \
+        "fixture-host" \
+        "7.0.0-28-generic" \
+        "0123456789abcdef0123456789abcdef" \
+        "192.0.2.1" \
+        "fixture0" \
+        "${fixture_sha}" \
+        "${fixture_root}/${run_id}.gate/run.manifest" \
+        "${fixture_sha}" \
+        "${fixture_root}/${run_id}.gate/test-live-guard-ownership.sh" \
+        "${fixture_root}/guard-live.test" \
+        "${fixture_sha}" \
+        "${run_dir}/state" \
+        "${run_dir}/evidence" \
+        "${run_dir}/tmp" 2>&1
+    )"
+    exit_code=$?
+    set -e
+    ((exit_code != 0)) || {
+      printf 'error: injected run-layout failure unexpectedly succeeded: %s\n' \
+        "${failure_point}" >&2
+      return 1
+    }
 
-  create_run_bootstrap \
-    "${log_run}" "${log_run}/run.owner" "${EUID}" \
-    "g20260729t120002z-012345abcdef" \
-    "0123456789abcdef0123456789abcdef01234567" \
-    "fixture-host" "7.0.0-28-generic" "0123456789abcdef0123456789abcdef" \
-    "192.0.2.1" "fixture0" "${fixture_sha}" \
-    "${log_run}.gate/run.manifest" "${fixture_sha}" \
-    "${log_run}.gate/test-live-guard-ownership.sh" \
-    "${fixture_root}/guard-live.test" "${fixture_sha}" \
-    "${log_run}/state" "${log_run}/evidence" "${log_run}/tmp" >/dev/null
-
-  run_isolated_python "${fixture_root}" "${fixture_root}" - \
-    "${mkdir_run}" "${log_run}" <<'PY'
+    run_isolated_python "${fixture_root}" "${fixture_root}" - \
+      "${fixture_root}" \
+      "${run_dir}" \
+      "${run_id}" \
+      "${failure_point}" \
+      "${exit_code}" \
+      "${output}" \
+      "${fixture_sha}" <<'PY'
+import hashlib
 import json
+import os
+import re
+import stat
+import sys
+
+(
+    run_prefix,
+    run_dir,
+    run_id,
+    failure_point,
+    exit_code_text,
+    output,
+    fixture_sha,
+) = sys.argv[1:]
+if int(exit_code_text) == 0:
+    raise RuntimeError("injected production run-layout path returned zero")
+
+retained = re.search(
+    r"run_manifest_retained"
+    r" path=(?P<path>\S+)"
+    r" sha256=(?P<sha>[0-9a-f]{64})"
+    r" device=(?P<device>[0-9]+)"
+    r" inode=(?P<inode>[0-9]+)"
+    r" uid=(?P<uid>[0-9]+)"
+    r" mode=(?P<mode>[0-7]{4})"
+    r" nlink=(?P<nlink>[0-9]+)"
+    r" size=(?P<size>[0-9]+)"
+    r" failure_point=(?P<failure>[a-z_]+)",
+    output,
+)
+if retained is None or retained.group("failure") != failure_point:
+    raise RuntimeError("injected failure lacks exact retained-manifest evidence")
+path = retained.group("path")
+if path != run_dir + "/run.owner":
+    raise RuntimeError("retained-manifest evidence path mismatch")
+
+flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+fd = os.open(path, flags)
+try:
+    before = os.fstat(fd)
+    data = bytearray()
+    while len(data) <= 4096:
+        chunk = os.read(fd, 4097 - len(data))
+        if not chunk:
+            break
+        data.extend(chunk)
+    after = os.fstat(fd)
+    named = os.stat(path, follow_symlinks=False)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or stat.S_IMODE(before.st_mode) != 0o600
+        or before.st_uid != os.geteuid()
+        or before.st_nlink != 1
+        or before.st_size <= 0
+        or before.st_size > 4096
+        or len(data) != before.st_size
+        or (after.st_dev, after.st_ino, after.st_size)
+        != (before.st_dev, before.st_ino, before.st_size)
+        or (named.st_dev, named.st_ino) != (before.st_dev, before.st_ino)
+    ):
+        raise RuntimeError("retained run ownership manifest is unsafe or changed")
+finally:
+    os.close(fd)
+
+if (
+    retained.group("sha") != hashlib.sha256(data).hexdigest()
+    or int(retained.group("device")) != before.st_dev
+    or int(retained.group("inode")) != before.st_ino
+    or int(retained.group("uid")) != before.st_uid
+    or retained.group("mode") != f"{stat.S_IMODE(before.st_mode):04o}"
+    or int(retained.group("nlink")) != before.st_nlink
+    or int(retained.group("size")) != before.st_size
+):
+    raise RuntimeError("retained run.owner content, SHA, or identity changed")
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key}")
+        result[key] = value
+    return result
+
+document = json.loads(data, object_pairs_hook=unique_object)
+expected_keys = {
+    "version",
+    "marker",
+    "run_id",
+    "run_prefix",
+    "run_dir",
+    "candidate_commit",
+    "expected_hostname",
+    "expected_kernel",
+    "expected_machine_id",
+    "expected_address",
+    "interface",
+    "approved_script_sha256",
+    "gate_manifest_path",
+    "gate_manifest_sha256",
+    "staged_script_path",
+    "test_binary_path",
+    "test_binary_sha256",
+    "state_dir",
+    "evidence_dir",
+    "tmp_dir",
+    "created_at",
+}
+if not isinstance(document, dict) or set(document) != expected_keys:
+    raise RuntimeError("retained run ownership manifest schema is invalid")
+if type(document["version"]) is not int or document["version"] != 1:
+    raise RuntimeError("retained run ownership manifest version is invalid")
+if (
+    document["marker"] != f"wg-mix-ebpf-live-guard-run-v1:{run_id}"
+    or document["run_id"] != run_id
+    or document["run_prefix"] != run_prefix
+    or document["run_dir"] != run_dir
+    or document["candidate_commit"]
+    != "0123456789abcdef0123456789abcdef01234567"
+    or document["gate_manifest_sha256"] != fixture_sha
+    or document["test_binary_sha256"] != fixture_sha
+    or document["state_dir"] != run_dir + "/state"
+    or document["evidence_dir"] != run_dir + "/evidence"
+    or document["tmp_dir"] != run_dir + "/tmp"
+):
+    raise RuntimeError("retained run ownership manifest bindings are invalid")
+
+expected_entries = {
+    "prefix_fsync": ["run.owner"],
+    "state": ["run.owner"],
+    "evidence": ["run.owner", "state"],
+    "tmp": ["evidence", "run.owner", "state"],
+    "log": ["evidence", "run.owner", "state", "tmp"],
+}
+if sorted(os.listdir(run_dir)) != expected_entries[failure_point]:
+    raise RuntimeError("run-layout failure did not stop at its exact injected point")
+for name in {"state", "evidence", "tmp"}.intersection(os.listdir(run_dir)):
+    info = os.stat(run_dir + "/" + name, follow_symlinks=False)
+    if (
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or info.st_uid != os.geteuid()
+    ):
+        raise RuntimeError(f"retained run directory is unsafe: {name}")
+if os.path.lexists(run_dir + "/evidence/guard-live.log"):
+    raise RuntimeError("evidence log exists after an injected pre-log failure")
+PY
+  done
+  success_run_id="g20260729t120006z-012345abcdef"
+  success_run_dir="${fixture_root}/${success_run_id}"
+  run_isolated_python "${fixture_root}" "${fixture_root}" - "${success_run_dir}" <<'PY'
+import os
+import sys
+
+os.mkdir(sys.argv[1], 0o700)
+os.chmod(sys.argv[1], 0o700)
+PY
+  success_sha256="$(
+    initialize_run_layout \
+      "${fixture_root}" \
+      "${success_run_dir}" \
+      "${success_run_dir}/run.owner" \
+      "${success_run_dir}/evidence/guard-live.log" \
+      "${EUID}" \
+      "" \
+      "${success_run_id}" \
+      "0123456789abcdef0123456789abcdef01234567" \
+      "fixture-host" \
+      "7.0.0-28-generic" \
+      "0123456789abcdef0123456789abcdef" \
+      "192.0.2.1" \
+      "fixture0" \
+      "${fixture_sha}" \
+      "${fixture_root}/${success_run_id}.gate/run.manifest" \
+      "${fixture_sha}" \
+      "${fixture_root}/${success_run_id}.gate/test-live-guard-ownership.sh" \
+      "${fixture_root}/guard-live.test" \
+      "${fixture_sha}" \
+      "${success_run_dir}/state" \
+      "${success_run_dir}/evidence" \
+      "${success_run_dir}/tmp"
+  )"
+  valid_sha256 "${success_sha256}" || {
+    echo "error: successful production run-layout self-test returned an invalid SHA-256" >&2
+    return 1
+  }
+  run_isolated_python "${fixture_root}" "${fixture_root}" - \
+    "${success_run_dir}" "${success_sha256}" <<'PY'
+import hashlib
 import os
 import stat
 import sys
 
-mkdir_run, log_run = sys.argv[1:]
-
-def read_manifest(run_dir, run_id):
-    path = run_dir + "/run.owner"
-    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
-    fd = os.open(path, flags)
-    try:
-        info = os.fstat(fd)
-        data = os.read(fd, 4097)
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or stat.S_IMODE(info.st_mode) != 0o600
-            or info.st_uid != os.geteuid()
-            or info.st_nlink != 1
-            or info.st_size <= 0
-            or info.st_size > 4096
-            or len(data) != info.st_size
-        ):
-            raise RuntimeError("retained run ownership manifest metadata is unsafe")
-        named = os.stat(path, follow_symlinks=False)
-        if (named.st_dev, named.st_ino) != (info.st_dev, info.st_ino):
-            raise RuntimeError("retained run ownership manifest name changed")
-    finally:
-        os.close(fd)
-    document = json.loads(data)
-    marker = f"wg-mix-ebpf-live-guard-run-v1:{run_id}"
-    if type(document.get("version")) is not int or document.get("version") != 1:
-        raise RuntimeError("retained run ownership manifest version is invalid")
+run_dir, expected_sha256 = sys.argv[1:]
+if sorted(os.listdir(run_dir)) != ["evidence", "run.owner", "state", "tmp"]:
+    raise RuntimeError("successful run layout has unexpected children")
+for name in ("state", "evidence", "tmp"):
+    info = os.stat(run_dir + "/" + name, follow_symlinks=False)
     if (
-        document.get("run_id") != run_id
-        or document.get("run_dir") != run_dir
-        or document.get("marker") != marker
-        or document.get("state_dir") != run_dir + "/state"
-        or document.get("evidence_dir") != run_dir + "/evidence"
-        or document.get("tmp_dir") != run_dir + "/tmp"
-        or document.get("candidate_commit")
-        != "0123456789abcdef0123456789abcdef01234567"
-        or document.get("gate_manifest_sha256")
-        != "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        not stat.S_ISDIR(info.st_mode)
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or info.st_uid != os.geteuid()
     ):
-        raise RuntimeError("retained run ownership manifest identity fields are invalid")
-    return data
-
-mkdir_before = read_manifest(mkdir_run, "g20260729t120001z-012345abcdef")
-state_path = mkdir_run + "/state"
-fd = os.open(
-    state_path,
-    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-    0o600,
-)
-os.close(fd)
-try:
-    os.mkdir(state_path, 0o700)
-except FileExistsError:
-    pass
-else:
-    raise RuntimeError("intentional state mkdir failure unexpectedly succeeded")
-if read_manifest(mkdir_run, "g20260729t120001z-012345abcdef") != mkdir_before:
-    raise RuntimeError("state mkdir failure changed the durable run manifest")
-
-log_before = read_manifest(log_run, "g20260729t120002z-012345abcdef")
-evidence_dir = log_run + "/evidence"
-os.mkdir(evidence_dir, 0o700)
-log_path = evidence_dir + "/guard-live.log"
-fd = os.open(
-    log_path,
-    os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-    0o600,
-)
-os.close(fd)
-try:
-    os.open(
-        log_path,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
-        0o600,
-    )
-except FileExistsError:
-    pass
-else:
-    raise RuntimeError("intentional evidence-log failure unexpectedly succeeded")
-if read_manifest(log_run, "g20260729t120002z-012345abcdef") != log_before:
-    raise RuntimeError("evidence-log failure changed the durable run manifest")
+        raise RuntimeError(f"successful run directory is unsafe: {name}")
+log_info = os.stat(run_dir + "/evidence/guard-live.log", follow_symlinks=False)
+if (
+    not stat.S_ISREG(log_info.st_mode)
+    or stat.S_IMODE(log_info.st_mode) != 0o600
+    or log_info.st_uid != os.geteuid()
+    or log_info.st_nlink != 1
+    or log_info.st_size != 0
+):
+    raise RuntimeError("successful evidence log metadata is unsafe")
+with open(run_dir + "/run.owner", "rb") as stream:
+    if hashlib.sha256(stream.read()).hexdigest() != expected_sha256:
+        raise RuntimeError("successful run.owner SHA-256 mismatch")
 PY
-  printf 'live guard run-evidence failure self-test passed; fixtures retained at %s\n' \
-    "${fixture_root}"
+  printf 'live guard run-evidence failure self-test passed (%d points); fixtures retained at %s\n' \
+    "${#failure_points[@]}" "${fixture_root}"
 }
 
 self_test_safety_gate() {
+  local mode
+
+  for mode in 0700 0755; do
+    mode_has_no_group_or_other_write "${mode}" || {
+      printf 'error: safe directory mode fixture was rejected: %s\n' "${mode}" >&2
+      return 1
+    }
+  done
+  for mode in 0720 0702 0722; do
+    if mode_has_no_group_or_other_write "${mode}"; then
+      printf 'error: writable directory mode fixture was accepted: %s\n' "${mode}" >&2
+      return 1
+    fi
+  done
   valid_run_id "g20260729t120000z-012345abcdef" || {
     echo "error: valid run-id fixture was rejected" >&2
     return 1
@@ -981,10 +1309,13 @@ mkdir --mode=0700 -- "${RUN_DIR}"
 validate_secure_directory "${RUN_DIR}" 0 700
 
 RUN_MANIFEST_SHA256="$(
-  create_run_bootstrap \
+  initialize_run_layout \
+    "${RUN_PREFIX}" \
     "${RUN_DIR}" \
     "${RUN_MANIFEST}" \
+    "${EVIDENCE_LOG}" \
     0 \
+    "" \
     "${RUN_ID}" \
     "${CANDIDATE_COMMIT}" \
     "${EXPECTED_HOSTNAME}" \
@@ -1010,18 +1341,7 @@ readonly RUN_MANIFEST_SHA256
 printf 'run_manifest_persisted run_dir=%s path=%s sha256=%s gate_manifest_sha256=%s\n' \
   "${RUN_DIR}" "${RUN_MANIFEST}" "${RUN_MANIFEST_SHA256}" "${GATE_MANIFEST_SHA256}"
 
-mkdir --mode=0700 -- "${STATE_DIR}"
-mkdir --mode=0700 -- "${EVIDENCE_DIR}"
-mkdir --mode=0700 -- "${TMP_DIR}"
-validate_secure_directory "${STATE_DIR}" 0 700
-validate_secure_directory "${EVIDENCE_DIR}" 0 700
-validate_secure_directory "${TMP_DIR}" 0 700
 cd -- "${RUN_DIR}"
-
-(
-  set -o noclobber
-  : >"${EVIDENCE_LOG}"
-)
 
 INNER_ARGV=(
   /bin/bash
