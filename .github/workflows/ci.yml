@@ -49,6 +49,7 @@ jobs:
 
       - name: Offline config validation
         run: |
+          ./bin/wg-mix-ebpf-linux-amd64 version --json >/tmp/wg-mix-ebpf-version.json
           ./bin/wg-mix-ebpf-linux-amd64 validate --config configs/example.yaml --offline
           ./bin/wg-mix-ebpf-linux-amd64 dump-abi --config configs/example.yaml --offline >/tmp/wg-mix-ebpf-abi.json
 
