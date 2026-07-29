@@ -122,15 +122,17 @@ simultaneous bidirectional directions at WireGuard MTUs 1419, 1420, 1421, and
 The iperf summary must match the per-stream records, retransmits must remain
 zero, and multi-flow Jain fairness must be at least 0.90. Dataplane
 type, length, fragment, IPv6 extension, checksum, load/store, rule-miss, and
-XOR error counters must remain unchanged. GSO counters are reported by
-default; `TCP_GSO_CHECKS=enforce` additionally requires managed/listener hits
-and successful rewrites in both directions. The TCP load starts only after
-the initial packet-capture validation finishes. Every MTU, stream-count, and
-direction cell has separate router-side captures for `ra0` and `rb0`. Each
-capture is limited to 4096 packets with a 192-byte snap length and a timeout
-derived from that cell's duration. The checker validates each interface file
-independently, so one interface or an earlier cell cannot satisfy another
-cell's transport type-word requirement.
+XOR error counters must remain unchanged. Direct script calls report GSO
+counters by default. All three official TCP Make targets set
+`TCP_GSO_CHECKS=enforce`, which first requires the WireGuard and veth
+segmentation prerequisites to be enabled and then requires managed/listener
+GSO hits and successful rewrites in both directions. The TCP load starts only
+after the initial packet-capture validation finishes. Every MTU, stream-count,
+and direction cell has separate router-side captures for `ra0` and `rb0`.
+Each capture is limited to 4096 packets with a 192-byte snap length and a
+timeout derived from that cell's duration. The checker validates each
+interface file independently, so one interface or an earlier cell cannot
+satisfy another cell's transport type-word requirement.
 
 Direct script callers can select the same gate and tune it for slower test
 hosts:
@@ -144,7 +146,7 @@ sudo TCP_CHECKS=enforce \
   TCP_MIN_BYTES=1048576 \
   TCP_MAX_RETRANSMITS=0 \
   TCP_MIN_FAIRNESS=0.90 \
-  TCP_GSO_CHECKS=report \
+  TCP_GSO_CHECKS=enforce \
   TCP_CAPTURE_PACKETS=4096 \
   scripts/smoke-netns-wg.sh
 ```
@@ -152,7 +154,12 @@ sudo TCP_CHECKS=enforce \
 `TCP_MIN_BYTES` is a per-receiver-stream and per-direction threshold.
 `TCP_CHECKS=off` is the default. MTUs 1419 through 1422 cover four adjacent
 full-sized TCP boundaries and exercise all XOR byte-tail alignments.
-`iperf3` is checked as a dependency only when the TCP gate is enabled.
+`iperf3` is checked as a dependency only when the TCP gate is enabled. In
+enforced GSO mode, the preflight requires TX checksum, scatter-gather, TCP
+segmentation, and generic segmentation on both `wg0` devices, and TX checksum,
+scatter-gather, generic segmentation, and UDP segmentation on both endpoint
+`under0` links and router `ra0`/`rb0` links. Missing or disabled features fail
+before the TCP matrix starts.
 
 The ICMP smoke test is IPv4-only. Its pcap check requires ICMP Echo Request and
 Reply records, valid ICMP checksums, mixed initiation/response/transport payload

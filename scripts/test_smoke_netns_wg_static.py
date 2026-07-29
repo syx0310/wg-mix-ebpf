@@ -5,6 +5,7 @@ import unittest
 
 
 SCRIPT_PATH = pathlib.Path(__file__).with_name("smoke-netns-wg.sh")
+MAKEFILE_PATH = SCRIPT_PATH.parent.parent / "Makefile"
 HOLDER_PATH = pathlib.Path(__file__).with_name(
     "hold-isolated-lifecycle-lease.py"
 )
@@ -18,6 +19,7 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.source = SCRIPT_PATH.read_text(encoding="utf-8")
         cls.lines = cls.source.splitlines()
+        cls.makefile_source = MAKEFILE_PATH.read_text(encoding="utf-8")
         cls.holder_source = HOLDER_PATH.read_text(encoding="utf-8")
         cls.delete_helper_source = DELETE_HELPER_PATH.read_text(
             encoding="utf-8"
@@ -367,6 +369,10 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.source.index("exercise_tcp_matrix() {") :
             self.source.index("\nexercise_udp_zero_checksum() {")
         ]
+        self.assertLess(
+            matrix.index("assert_tcp_gso_offload_state"),
+            matrix.index("capture_tcp_netns_evidence before"),
+        )
         self.assertIn(
             'for streams in "${TCP_STREAM_VALUES[@]}"; do',
             matrix,
@@ -396,6 +402,21 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.source.index("capture_tcp_link_evidence() {") :
             self.source.index("\ntcp_server_listening() {")
         ]
+        gso_preflight = self.source[
+            self.source.index("assert_tcp_gso_link_features() {") :
+            self.source.index("\ncapture_tcp_netns_evidence() {")
+        ]
+        for link in ("wg0", "under0", "ra0", "rb0"):
+            self.assertIn(link, gso_preflight)
+        for feature in (
+            "tx-checksumming",
+            "scatter-gather",
+            "tcp-segmentation-offload",
+            "generic-segmentation-offload",
+            "tx-udp-segmentation",
+        ):
+            self.assertIn(feature, gso_preflight)
+        self.assertIn('fields[1] == "on"', gso_preflight)
         for command in (
             "ip -details -statistics link show",
             "ethtool -k",
@@ -438,6 +459,21 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             matrix.index("capture_tcp_netns_evidence failure"),
             matrix.index('return "${run_status}"'),
         )
+
+        for target in (
+            "test-netns-tcp-native",
+            "test-netns-tcp-xor-prefix",
+            "test-netns-tcp-xor-full",
+        ):
+            recipe = self.makefile_source[
+                self.makefile_source.index(f"{target}:") :
+                self.makefile_source.index(
+                    "\n\n",
+                    self.makefile_source.index(f"{target}:"),
+                )
+            ]
+            self.assertIn("TCP_CHECKS=enforce", recipe)
+            self.assertIn("TCP_GSO_CHECKS=enforce", recipe)
 
     def test_success_teardown_holds_shared_lifecycle_until_contract_is_gone(
         self,

@@ -59,13 +59,13 @@ test-netns-icmp-smoke: build
 	NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
 
 test-netns-tcp-native: build
-	TCP_CHECKS=enforce scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce TCP_GSO_CHECKS=enforce scripts/smoke-netns-wg.sh
 
 test-netns-tcp-xor-prefix: build
-	TCP_CHECKS=enforce XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce TCP_GSO_CHECKS=enforce XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
 
 test-netns-tcp-xor-full: build
-	TCP_CHECKS=enforce XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce TCP_GSO_CHECKS=enforce XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 scripts/smoke-netns-wg.sh
 
 test-netns-tcp: test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full
 

@@ -1578,6 +1578,70 @@ capture_tcp_link_evidence() {
     ethtool -k "${link}" >"${prefix}-offloads.txt"
 }
 
+assert_tcp_gso_link_features() {
+  local label="$1"
+  local ns="$2"
+  local link="$3"
+  local evidence="${TMPDIR}/tcp-gso-preflight-${label}-offloads.txt"
+  local feature
+
+  shift 3
+  if (($# == 0)); then
+    echo "error: no TCP GSO features requested for ${label}/${link}" >&2
+    return 1
+  fi
+  run_in_owned_netns "${ns}" ethtool -k "${link}" >"${evidence}"
+  for feature in "$@"; do
+    if ! awk -F ':' -v wanted="${feature}" '
+      {
+        key = $1
+        sub(/^[[:space:]]+/, "", key)
+        sub(/[[:space:]]+$/, "", key)
+      }
+      key == wanted {
+        value = $2
+        sub(/^[[:space:]]+/, "", value)
+        split(value, fields, /[[:space:]]+/)
+        found = 1
+        enabled = fields[1] == "on"
+      }
+      END {
+        exit !(found && enabled)
+      }
+    ' "${evidence}"; then
+      echo "error: required TCP GSO offload is absent or disabled: label=${label} link=${link} feature=${feature} evidence=${evidence}" >&2
+      return 1
+    fi
+    printf 'tcp gso offload verified: label=%s link=%s feature=%s state=on\n' \
+      "${label}" "${link}" "${feature}"
+  done
+}
+
+assert_tcp_gso_offload_state() {
+  if [[ "${TCP_GSO_CHECKS}" != "enforce" ]]; then
+    return 0
+  fi
+
+  assert_tcp_gso_link_features a-wg "${NSA}" wg0 \
+    tx-checksumming scatter-gather \
+    tcp-segmentation-offload generic-segmentation-offload
+  assert_tcp_gso_link_features b-wg "${NSB}" wg0 \
+    tx-checksumming scatter-gather \
+    tcp-segmentation-offload generic-segmentation-offload
+  assert_tcp_gso_link_features a-underlay "${NSA}" under0 \
+    tx-checksumming scatter-gather \
+    generic-segmentation-offload tx-udp-segmentation
+  assert_tcp_gso_link_features b-underlay "${NSB}" under0 \
+    tx-checksumming scatter-gather \
+    generic-segmentation-offload tx-udp-segmentation
+  assert_tcp_gso_link_features router-a "${NSR}" ra0 \
+    tx-checksumming scatter-gather \
+    generic-segmentation-offload tx-udp-segmentation
+  assert_tcp_gso_link_features router-b "${NSR}" rb0 \
+    tx-checksumming scatter-gather \
+    generic-segmentation-offload tx-udp-segmentation
+}
+
 capture_tcp_netns_evidence() {
   local phase="$1"
   local side
@@ -1592,6 +1656,8 @@ capture_tcp_netns_evidence() {
   esac
   capture_tcp_link_evidence "${phase}" a "${NSA}" under0
   capture_tcp_link_evidence "${phase}" b "${NSB}" under0
+  capture_tcp_link_evidence "${phase}" a-wg "${NSA}" wg0
+  capture_tcp_link_evidence "${phase}" b-wg "${NSB}" wg0
   capture_tcp_link_evidence "${phase}" router-a "${NSR}" ra0
   capture_tcp_link_evidence "${phase}" router-b "${NSR}" rb0
   run_in_owned_netns "${NSA}" wg show wg0 \
@@ -1919,6 +1985,7 @@ exercise_tcp_matrix() {
   local run_status
   local evidence_status
 
+  assert_tcp_gso_offload_state
   capture_tcp_netns_evidence before
   for mtu in "${TCP_MTU_VALUES[@]}"; do
     validate_all_netns_identities
