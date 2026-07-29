@@ -12,8 +12,7 @@ import (
 )
 
 func TestDefaultLifecycleMaintenancePathIsOutsideRuntimeDirectory(t *testing.T) {
-	if got := LifecycleMaintenancePath(DefaultLifecycleLeasePath); got !=
-		DefaultLifecycleMaintenancePath {
+	if got := LifecycleMaintenancePath(t.Context()); got != DefaultLifecycleMaintenancePath {
 		t.Fatalf("default maintenance path = %q, want %q", got, DefaultLifecycleMaintenancePath)
 	}
 	if filepath.Dir(DefaultLifecycleMaintenancePath) ==
@@ -26,10 +25,48 @@ func TestDefaultLifecycleMaintenancePathIsOutsideRuntimeDirectory(t *testing.T) 
 	}
 }
 
+func TestDefaultLifecyclePathsRequireFixedPair(t *testing.T) {
+	root := t.TempDir()
+	customLease := filepath.Join(root, "daemon.lease")
+	customGate := filepath.Join(root, "maintenance.gate")
+	for _, test := range []struct {
+		name  string
+		lease string
+		gate  string
+	}{
+		{
+			name:  "default lease with custom gate",
+			lease: DefaultLifecycleLeasePath,
+			gate:  customGate,
+		},
+		{
+			name:  "custom lease with default gate",
+			lease: customLease,
+			gate:  DefaultLifecycleMaintenancePath,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			maintenance, err := BeginLifecycleMaintenanceAt(
+				test.lease,
+				test.gate,
+				LifecycleOwner{PID: os.Getpid(), Action: "maintenance"},
+			)
+			if maintenance != nil {
+				_ = maintenance.Close()
+				t.Fatal("mismatched default lifecycle pair unexpectedly acquired")
+			}
+			if err == nil || !strings.Contains(err.Error(), "fixed pair") {
+				t.Fatalf("mismatched default lifecycle pair error = %v", err)
+			}
+		})
+	}
+}
+
 func TestLifecycleMaintenanceProvidesConcurrentLeaseHandoff(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "run", "daemon.lease")
+	leasePath, gatePath := newTestLifecyclePaths(t, "daemon.lease")
 	running, err := AcquireLifecycleAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "daemon"},
 	)
 	if err != nil {
@@ -39,13 +76,13 @@ func TestLifecycleMaintenanceProvidesConcurrentLeaseHandoff(t *testing.T) {
 
 	maintenance, err := BeginLifecycleMaintenanceAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "uninstall-maintenance"},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer maintenance.Close()
-	gatePath := LifecycleMaintenancePath(leasePath)
 	if filepath.Dir(gatePath) == filepath.Dir(leasePath) {
 		t.Fatalf(
 			"maintenance gate %s must be outside lifecycle directory %s",
@@ -55,8 +92,10 @@ func TestLifecycleMaintenanceProvidesConcurrentLeaseHandoff(t *testing.T) {
 	}
 	if _, err := AcquireLifecycleAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "racing-daemon"},
-	); !errors.Is(err, ErrLifecycleMaintenanceHeld) {
+	); !errors.Is(err, ErrLifecycleMaintenanceHeld) ||
+		!errors.Is(err, ErrLifecycleLeaseHeld) {
 		t.Fatalf("racing daemon was not blocked by maintenance gate: %v", err)
 	}
 	if _, err := maintenance.TryAcquireLifecycle(
@@ -105,8 +144,10 @@ func TestLifecycleMaintenanceProvidesConcurrentLeaseHandoff(t *testing.T) {
 	}
 	if _, err := AcquireLifecycleAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "late-daemon"},
-	); !errors.Is(err, ErrLifecycleMaintenanceHeld) {
+	); !errors.Is(err, ErrLifecycleMaintenanceHeld) ||
+		!errors.Is(err, ErrLifecycleLeaseHeld) {
 		t.Fatalf("maintenance gate did not preserve handoff exclusivity: %v", err)
 	}
 	if err := uninstallLease.Close(); err != nil {
@@ -124,6 +165,7 @@ func TestLifecycleMaintenanceProvidesConcurrentLeaseHandoff(t *testing.T) {
 	}
 	reacquired, err := AcquireLifecycleAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "post-maintenance-daemon"},
 	)
 	if err != nil {
@@ -134,10 +176,89 @@ func TestLifecycleMaintenanceProvidesConcurrentLeaseHandoff(t *testing.T) {
 	}
 }
 
+func TestNormalAcquirePreservesLeaseHeldCompatibilityDuringMaintenance(t *testing.T) {
+	leasePath, gatePath := newTestLifecyclePaths(t, "daemon.lease")
+	maintenance, err := BeginLifecycleMaintenanceAt(
+		leasePath,
+		gatePath,
+		LifecycleOwner{PID: os.Getpid(), Action: "maintenance"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer maintenance.Close()
+
+	const contenders = 32
+	results := make(chan error, contenders)
+	for range contenders {
+		go func() {
+			lease, acquireErr := AcquireLifecycleAt(
+				leasePath,
+				gatePath,
+				LifecycleOwner{PID: os.Getpid(), Action: "daemon-contender"},
+			)
+			if lease != nil {
+				_ = lease.Close()
+			}
+			results <- acquireErr
+		}()
+	}
+	for range contenders {
+		err := <-results
+		if !errors.Is(err, ErrLifecycleLeaseHeld) ||
+			!errors.Is(err, ErrLifecycleMaintenanceHeld) {
+			t.Fatalf("normal maintenance contention error = %v", err)
+		}
+	}
+
+	secondMaintenance, err := BeginLifecycleMaintenanceAt(
+		leasePath,
+		gatePath,
+		LifecycleOwner{PID: os.Getpid(), Action: "second-maintenance"},
+	)
+	if secondMaintenance != nil {
+		_ = secondMaintenance.Close()
+		t.Fatal("second maintenance unexpectedly acquired the gate")
+	}
+	if !errors.Is(err, ErrLifecycleMaintenanceHeld) ||
+		errors.Is(err, ErrLifecycleLeaseHeld) {
+		t.Fatalf("explicit maintenance contention error = %v", err)
+	}
+}
+
+func TestExplicitMaintenancePathsAvoidFormerBasenameCollision(t *testing.T) {
+	root := t.TempDir()
+	firstLease := filepath.Join(root, "a-b", "c")
+	secondLease := filepath.Join(root, "a", "b-c")
+	firstGate := filepath.Join(root, "gates", "first.gate")
+	secondGate := filepath.Join(root, "gates", "second.gate")
+
+	first, err := BeginLifecycleMaintenanceAt(
+		firstLease,
+		firstGate,
+		LifecycleOwner{PID: os.Getpid(), Action: "first-maintenance"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := AcquireLifecycleAt(
+		secondLease,
+		secondGate,
+		LifecycleOwner{PID: os.Getpid(), Action: "second-daemon"},
+	)
+	if err != nil {
+		t.Fatalf("explicit non-colliding gate was blocked: %v", err)
+	}
+	if err := second.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestLifecycleMaintenanceRejectsSymbolicLinkGate(t *testing.T) {
 	root := t.TempDir()
 	leasePath := filepath.Join(root, "run", "daemon.lease")
-	gatePath := LifecycleMaintenancePath(leasePath)
+	gatePath := filepath.Join(root, "maintenance.gate")
 	target := filepath.Join(root, "target")
 	if err := os.WriteFile(target, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -147,6 +268,7 @@ func TestLifecycleMaintenanceRejectsSymbolicLinkGate(t *testing.T) {
 	}
 	_, err := BeginLifecycleMaintenanceAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "maintenance"},
 	)
 	if err == nil || !strings.Contains(err.Error(), "symbolic-link") {
@@ -157,7 +279,7 @@ func TestLifecycleMaintenanceRejectsSymbolicLinkGate(t *testing.T) {
 func TestLifecycleMaintenanceRejectsHardLinkedGate(t *testing.T) {
 	root := t.TempDir()
 	leasePath := filepath.Join(root, "run", "daemon.lease")
-	gatePath := LifecycleMaintenancePath(leasePath)
+	gatePath := filepath.Join(root, "maintenance.gate")
 	target := filepath.Join(root, "target")
 	if err := os.WriteFile(target, nil, 0o600); err != nil {
 		t.Fatal(err)
@@ -167,6 +289,7 @@ func TestLifecycleMaintenanceRejectsHardLinkedGate(t *testing.T) {
 	}
 	_, err := BeginLifecycleMaintenanceAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "maintenance"},
 	)
 	if err == nil || !strings.Contains(err.Error(), "links") {
@@ -175,15 +298,15 @@ func TestLifecycleMaintenanceRejectsHardLinkedGate(t *testing.T) {
 }
 
 func TestLifecycleMaintenanceDetectsGateUnlinkAndRecreate(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "run", "daemon.lease")
+	leasePath, gatePath := newTestLifecyclePaths(t, "daemon.lease")
 	maintenance, err := BeginLifecycleMaintenanceAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "maintenance"},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	gatePath := LifecycleMaintenancePath(leasePath)
 	if err := os.Rename(gatePath, gatePath+".detached"); err != nil {
 		t.Fatal(err)
 	}
@@ -202,15 +325,15 @@ func TestLifecycleMaintenanceDetectsGateUnlinkAndRecreate(t *testing.T) {
 }
 
 func TestLifecycleMaintenanceDetectsAddedHardLink(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "run", "daemon.lease")
+	leasePath, gatePath := newTestLifecyclePaths(t, "daemon.lease")
 	maintenance, err := BeginLifecycleMaintenanceAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "maintenance"},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	gatePath := LifecycleMaintenancePath(leasePath)
 	if err := os.Link(gatePath, gatePath+".alias"); err != nil {
 		t.Fatal(err)
 	}
@@ -226,9 +349,10 @@ func TestLifecycleMaintenanceDetectsAddedHardLink(t *testing.T) {
 }
 
 func TestLifecycleLeaseDetectsAtomicNameSwap(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "run", "daemon.lease")
+	leasePath, gatePath := newTestLifecyclePaths(t, "daemon.lease")
 	lease, err := AcquireLifecycleAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "daemon"},
 	)
 	if err != nil {
@@ -260,8 +384,10 @@ func TestLifecycleMaintenanceDetectsParentReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	leasePath := filepath.Join(anchor, "run", "daemon.lease")
+	gatePath := filepath.Join(anchor, "maintenance.gate")
 	maintenance, err := BeginLifecycleMaintenanceAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "maintenance"},
 	)
 	if err != nil {
@@ -285,15 +411,16 @@ func TestLifecycleMaintenanceDetectsParentReplacement(t *testing.T) {
 }
 
 func TestLifecycleMaintenanceDetectsModeChange(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "run", "daemon.lease")
+	leasePath, gatePath := newTestLifecyclePaths(t, "daemon.lease")
 	maintenance, err := BeginLifecycleMaintenanceAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "maintenance"},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.Chmod(LifecycleMaintenancePath(leasePath), 0o640); err != nil {
+	if err := os.Chmod(gatePath, 0o640); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := maintenance.TryAcquireLifecycle(
@@ -308,10 +435,11 @@ func TestLifecycleMaintenanceDetectsModeChange(t *testing.T) {
 }
 
 func TestLifecycleMaintenanceCancellationDoesNotLeakDescriptors(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "run", "daemon.lease")
-	ctx := WithLifecyclePathForTest(t.Context(), leasePath)
+	leasePath, gatePath := newTestLifecyclePaths(t, "daemon.lease")
+	ctx := WithLifecyclePathsForTest(t.Context(), leasePath, gatePath)
 	maintenance, err := BeginLifecycleMaintenanceAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "held-maintenance"},
 	)
 	if err != nil {
@@ -331,6 +459,9 @@ func TestLifecycleMaintenanceCancellationDoesNotLeakDescriptors(t *testing.T) {
 			!errors.Is(err, ErrLifecycleMaintenanceHeld) {
 			t.Fatalf("canceled maintenance wait error = %v", err)
 		}
+		if errors.Is(err, ErrLifecycleLeaseHeld) {
+			t.Fatalf("explicit maintenance wait reported lifecycle lease held: %v", err)
+		}
 	}
 	after := openDescriptorCount(t)
 	if after != before {
@@ -339,9 +470,10 @@ func TestLifecycleMaintenanceCancellationDoesNotLeakDescriptors(t *testing.T) {
 }
 
 func TestLifecycleWaitCancellationDoesNotLeakDescriptors(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "run", "daemon.lease")
+	leasePath, gatePath := newTestLifecyclePaths(t, "daemon.lease")
 	running, err := AcquireLifecycleAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "daemon"},
 	)
 	if err != nil {
@@ -350,6 +482,7 @@ func TestLifecycleWaitCancellationDoesNotLeakDescriptors(t *testing.T) {
 	defer running.Close()
 	maintenance, err := BeginLifecycleMaintenanceAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "maintenance"},
 	)
 	if err != nil {
@@ -377,19 +510,28 @@ func TestLifecycleWaitCancellationDoesNotLeakDescriptors(t *testing.T) {
 }
 
 func TestIsolatedLifecycleValidationRunsAfterMaintenanceHandoff(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "run", "lifecycle.lease")
-	var held *LifecycleLease
-	order := make([]string, 0, 2)
+	leasePath, gatePath := newTestLifecyclePaths(t, "lifecycle.lease")
+	order := make([]string, 0, 3)
 	ctx := WithIsolatedNetNSTestLifecycleValidation(
 		t.Context(),
 		leasePath,
+		gatePath,
 		func() error {
 			order = append(order, "validate")
-			if held == nil || !held.HeldAt(leasePath) {
+			contender, err := acquireLifecycleWithoutMaintenance(
+				leasePath,
+				LifecycleOwner{PID: os.Getpid(), Action: "inner-contender"},
+			)
+			if err == nil {
+				_ = contender.Close()
 				return errors.New("isolated validation ran before lifecycle acquisition")
 			}
-			contender, err := AcquireLifecycleAt(
+			if !errors.Is(err, ErrLifecycleLeaseHeld) {
+				return fmt.Errorf("probe held lifecycle lease: %w", err)
+			}
+			contender, err = AcquireLifecycleAt(
 				leasePath,
+				gatePath,
 				LifecycleOwner{PID: os.Getpid(), Action: "contender"},
 			)
 			if err == nil {
@@ -404,13 +546,14 @@ func TestIsolatedLifecycleValidationRunsAfterMaintenanceHandoff(t *testing.T) {
 	)
 	maintenance, err := BeginLifecycleMaintenanceAt(
 		leasePath,
+		gatePath,
 		LifecycleOwner{PID: os.Getpid(), Action: "maintenance"},
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer maintenance.Close()
-	held, err = maintenance.WaitAcquireLifecycle(
+	held, err := maintenance.WaitAcquireLifecycle(
 		ctx,
 		LifecycleOwner{PID: os.Getpid(), Action: "uninstall"},
 	)
@@ -430,9 +573,79 @@ func TestIsolatedLifecycleValidationRunsAfterMaintenanceHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := strings.Join(order, ","); got != "validate,callback" {
+	if got := strings.Join(order, ","); got != "validate,validate,callback" {
 		t.Fatalf("isolated lifecycle order = %q", got)
 	}
+}
+
+func TestLifecycleWaitRejectsStaleContractBeforeReturningLease(t *testing.T) {
+	root := t.TempDir()
+	leasePath := filepath.Join(root, "run", "lifecycle.lease")
+	gatePath := filepath.Join(root, "maintenance.gate")
+	contractMarker := filepath.Join(root, "contract.marker")
+	if err := os.WriteFile(contractMarker, []byte("owned\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx := WithIsolatedNetNSTestLifecycleValidation(
+		t.Context(),
+		leasePath,
+		gatePath,
+		func() error {
+			data, err := os.ReadFile(contractMarker)
+			if err != nil {
+				return err
+			}
+			if string(data) != "owned\n" {
+				return errors.New("contract marker changed")
+			}
+			return nil
+		},
+	)
+	maintenance, err := BeginLifecycleMaintenanceAt(
+		leasePath,
+		gatePath,
+		LifecycleOwner{PID: os.Getpid(), Action: "maintenance"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer maintenance.Close()
+	if err := os.Rename(contractMarker, contractMarker+".stale"); err != nil {
+		t.Fatal(err)
+	}
+
+	before := openDescriptorCount(t)
+	lease, err := maintenance.WaitAcquireLifecycle(
+		ctx,
+		LifecycleOwner{PID: os.Getpid(), Action: "uninstall"},
+	)
+	if lease != nil {
+		_ = lease.Close()
+		t.Fatal("stale lifecycle contract returned a lease")
+	}
+	if err == nil || !strings.Contains(err.Error(), "revalidate lifecycle contract") {
+		t.Fatalf("stale maintenance wait error = %v", err)
+	}
+	after := openDescriptorCount(t)
+	if after != before {
+		t.Fatalf("stale maintenance wait leaked descriptors: before=%d after=%d", before, after)
+	}
+	probe, err := acquireLifecycleWithoutMaintenance(
+		leasePath,
+		LifecycleOwner{PID: os.Getpid(), Action: "post-stale-probe"},
+	)
+	if err != nil {
+		t.Fatalf("stale maintenance wait retained lifecycle lease: %v", err)
+	}
+	if err := probe.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func newTestLifecyclePaths(t *testing.T, leaseName string) (string, string) {
+	t.Helper()
+	root := t.TempDir()
+	return filepath.Join(root, "run", leaseName), filepath.Join(root, "maintenance.gate")
 }
 
 func openDescriptorCount(t *testing.T) int {

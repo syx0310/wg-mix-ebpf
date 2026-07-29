@@ -78,7 +78,11 @@ func TestInstallRejectsHeldGlobalLifecycleLeaseBeforeWrites(t *testing.T) {
 	t.Setenv(EnvVarLibDir, filepath.Join(dir, "state"))
 	t.Setenv(daemonEnvRunDirForTest, runDir)
 
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(dir, "daemon.lease"))
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(dir, "daemon.lease"),
+		filepath.Join(dir, "maintenance.gate"),
+	)
 	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
 		PID:    os.Getpid(),
 		Action: "daemon",
@@ -117,7 +121,11 @@ func TestUninstallRejectsHeldGlobalLifecycleLeaseBeforeCleanup(t *testing.T) {
 	t.Setenv(daemonEnvRunDirForTest, runDir)
 	t.Setenv(dataplaneEnvPinPathForTest, filepath.Join(dir, "pins"))
 
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(dir, "daemon.lease"))
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(dir, "daemon.lease"),
+		filepath.Join(dir, "maintenance.gate"),
+	)
 	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
 		PID:    os.Getpid(),
 		Action: "daemon",
@@ -197,7 +205,11 @@ startup_guard:
 
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
-	ctx = lockfile.WithLifecyclePathForTest(ctx, filepath.Join(dir, "daemon.lease"))
+	ctx = lockfile.WithLifecyclePathsForTest(
+		ctx,
+		filepath.Join(dir, "daemon.lease"),
+		filepath.Join(dir, "maintenance.gate"),
+	)
 	if _, err := Uninstall(ctx, Options{ConfigPath: configPath, System: "unknown", Yes: true}); err != nil {
 		t.Fatalf("uninstall should complete without nested lock deadlock: %v", err)
 	}

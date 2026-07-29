@@ -126,7 +126,11 @@ func TestStopFallbackDetachDryRunOffline(t *testing.T) {
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	runDir := filepath.Join(dir, "run")
 	stateDir := filepath.Join(dir, "state")
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), filepath.Join(dir, "daemon.lease"))
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(dir, "daemon.lease"),
+		filepath.Join(dir, "maintenance.gate"),
+	)
 	var stdout, stderr bytes.Buffer
 	if err := Run(ctx, []string{"stop", "--config", cfgPath, "--run-dir", runDir, "--state-dir", stateDir}, &stdout, &stderr); err != nil {
 		t.Fatalf("stop fallback should tolerate missing runtime when there is no attach-state to detach: %v stderr=%s", err, stderr.String())
@@ -141,7 +145,12 @@ func TestStopFallbackDetachDryRunOffline(t *testing.T) {
 func TestWrongRunDirOneShotStopCannotRaceDaemon(t *testing.T) {
 	dir := t.TempDir()
 	leasePath := filepath.Join(dir, "daemon.lease")
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+	maintenancePath := filepath.Join(dir, "maintenance.gate")
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		leasePath,
+		maintenancePath,
+	)
 	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
 		PID:        os.Getpid(),
 		Action:     "daemon",
@@ -198,7 +207,12 @@ func TestStopExitRaceFallsBackThroughGlobalLifecycleLease(t *testing.T) {
 	}
 
 	leasePath := filepath.Join(dir, "daemon.lease")
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+	maintenancePath := filepath.Join(dir, "maintenance.gate")
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		leasePath,
+		maintenancePath,
+	)
 	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
 		PID:        os.Getpid(),
 		Action:     "daemon-cleanup",

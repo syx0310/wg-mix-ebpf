@@ -992,10 +992,12 @@ func TestPinRuntimeDerivesLockRootFromIsolatedLifecycleContext(t *testing.T) {
 		t.Fatalf("default pin lock root = %q, want %q", got, pinPathLockRoot)
 	}
 
-	runDir := filepath.Join(t.TempDir(), "run-a")
-	ctx := lockfile.WithLifecyclePathForTest(
+	root := t.TempDir()
+	runDir := filepath.Join(root, "run-a")
+	ctx := lockfile.WithLifecyclePathsForTest(
 		context.Background(),
 		filepath.Join(runDir, "daemon.lease"),
+		filepath.Join(root, "maintenance.gate"),
 	)
 	want := filepath.Join(runDir, "pin-locks")
 	if got := loader.pinRuntime(ctx).lockRoot; got != want {

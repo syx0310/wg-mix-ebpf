@@ -18,6 +18,8 @@ const (
 	isolatedNetNSOwnerFormat        = "wg-mix-ebpf-test-owner-v1"
 	isolatedNetNSManifestFormat     = "wg-mix-ebpf-test-manifest-v2"
 	isolatedNetNSLifecycleLeaseName = "lifecycle.lease"
+	isolatedNetNSLifecycleGateName  = ".lifecycle.maintenance"
+	isolatedNetNSLifecycleGatePath  = isolatedNetNSTestRoot + "/" + isolatedNetNSLifecycleGateName
 )
 
 var (
@@ -37,6 +39,7 @@ type isolatedNetNSTestLayout struct {
 	bpffsDir string
 	manifest string
 	lease    string
+	gate     string
 }
 
 type isolatedNetNSTestManifest struct {
@@ -85,6 +88,13 @@ func isolatedNetNSTestPaths(
 		!isolatedNetNSTestRunID.MatchString(runID) {
 		return isolatedNetNSTestLayout{}, fmt.Errorf(
 			"--isolated-netns-test run-dir must be below %s/<hex-run-id>",
+			isolatedNetNSTestRoot,
+		)
+	}
+	if filepath.Dir(isolatedNetNSLifecycleGatePath) != isolatedNetNSTestRoot ||
+		filepath.Base(isolatedNetNSLifecycleGatePath) != isolatedNetNSLifecycleGateName {
+		return isolatedNetNSTestLayout{}, fmt.Errorf(
+			"internal isolated lifecycle gate must be a direct child of %s",
 			isolatedNetNSTestRoot,
 		)
 	}
@@ -138,6 +148,9 @@ func isolatedNetNSTestPaths(
 		// Both roles intentionally share one lease. Per-role leases would let
 		// callers relabel a pin or underlay and bypass lifecycle serialization.
 		lease: filepath.Join(runBase, isolatedNetNSLifecycleLeaseName),
+		// All isolated runs share one fixed gate under the already validated
+		// test root. A per-run permanent gate would accumulate after each run.
+		gate: isolatedNetNSLifecycleGatePath,
 	}, nil
 }
 

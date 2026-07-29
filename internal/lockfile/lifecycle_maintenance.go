@@ -31,21 +31,6 @@ type LifecycleMaintenance struct {
 	lock          *anchoredLifecycleLock
 }
 
-// LifecycleMaintenancePath returns the permanent gate path for a lifecycle
-// lease. The gate is a sibling of the lifecycle directory, so removing that
-// directory cannot remove or replace the held gate.
-func LifecycleMaintenancePath(lifecyclePath string) string {
-	cleanPath := filepath.Clean(lifecyclePath)
-	parent := filepath.Dir(cleanPath)
-	if cleanPath == filepath.Clean(DefaultLifecycleLeasePath) {
-		return DefaultLifecycleMaintenancePath
-	}
-	return filepath.Join(
-		filepath.Dir(parent),
-		"."+filepath.Base(parent)+"-"+filepath.Base(cleanPath)+".maintenance",
-	)
-}
-
 // BeginLifecycleMaintenance waits a bounded amount of time for the outer gate.
 // The returned gate remains held until Close; callers may stop the daemon and
 // then use WaitAcquireLifecycle without opening a race for a new daemon.
@@ -59,11 +44,16 @@ func BeginLifecycleMaintenance(
 		return nil, err
 	}
 	lifecyclePath := LifecycleLeasePath(ctx)
+	maintenancePath := LifecycleMaintenancePath(ctx)
 	for {
 		if err := waitCtx.Err(); err != nil {
 			return nil, err
 		}
-		maintenance, err := tryBeginLifecycleMaintenanceAt(lifecyclePath, owner)
+		maintenance, err := tryBeginLifecycleMaintenanceAt(
+			lifecyclePath,
+			maintenancePath,
+			owner,
+		)
 		if err == nil {
 			if waitErr := waitCtx.Err(); waitErr != nil {
 				return nil, errors.Join(waitErr, maintenance.Close())
@@ -83,35 +73,26 @@ func BeginLifecycleMaintenance(
 // production callers should use BeginLifecycleMaintenance for bounded waiting.
 func BeginLifecycleMaintenanceAt(
 	lifecyclePath string,
+	maintenancePath string,
 	owner LifecycleOwner,
 ) (*LifecycleMaintenance, error) {
-	return tryBeginLifecycleMaintenanceAt(lifecyclePath, owner)
+	return tryBeginLifecycleMaintenanceAt(lifecyclePath, maintenancePath, owner)
 }
 
 func tryBeginLifecycleMaintenanceAt(
 	lifecyclePath string,
+	maintenancePath string,
 	owner LifecycleOwner,
 ) (*LifecycleMaintenance, error) {
-	if lifecyclePath == "" {
-		return nil, errors.New("global lifecycle lease path is empty")
-	}
-	cleanPath := filepath.Clean(lifecyclePath)
-	if cleanPath != lifecyclePath || !filepath.IsAbs(cleanPath) {
-		return nil, fmt.Errorf(
-			"global lifecycle lease path must be a clean absolute path: %q",
-			lifecyclePath,
-		)
-	}
-	parent := filepath.Dir(cleanPath)
-	if parent == string(os.PathSeparator) {
-		return nil, fmt.Errorf(
-			"global lifecycle lease parent may not be the filesystem root: %s",
-			cleanPath,
-		)
-	}
-	maintenancePath := LifecycleMaintenancePath(cleanPath)
-	lock, err := acquireAnchoredLifecycleLock(
+	cleanPath, cleanMaintenancePath, err := validateLifecyclePathPair(
+		lifecyclePath,
 		maintenancePath,
+	)
+	if err != nil {
+		return nil, err
+	}
+	lock, err := acquireAnchoredLifecycleLock(
+		cleanMaintenancePath,
 		owner,
 		ErrLifecycleMaintenanceHeld,
 		"lifecycle maintenance gate",
@@ -121,7 +102,7 @@ func tryBeginLifecycleMaintenanceAt(
 	}
 	return &LifecycleMaintenance{
 		lifecyclePath: cleanPath,
-		path:          maintenancePath,
+		path:          cleanMaintenancePath,
 		lock:          lock,
 	}, nil
 }
@@ -136,6 +117,12 @@ func (maintenance *LifecycleMaintenance) TryAcquireLifecycle(
 	}
 	maintenance.mu.Lock()
 	defer maintenance.mu.Unlock()
+	return maintenance.tryAcquireLifecycleLocked(owner)
+}
+
+func (maintenance *LifecycleMaintenance) tryAcquireLifecycleLocked(
+	owner LifecycleOwner,
+) (*LifecycleLease, error) {
 	if maintenance.lock == nil {
 		return nil, errors.New("cannot acquire lifecycle through closed maintenance gate")
 	}
@@ -173,15 +160,19 @@ func (maintenance *LifecycleMaintenance) WaitAcquireLifecycle(
 	if err := waitCtx.Err(); err != nil {
 		return nil, err
 	}
+	if maintenance == nil {
+		return nil, errors.New("cannot acquire lifecycle through nil maintenance gate")
+	}
 	for {
 		if err := waitCtx.Err(); err != nil {
 			return nil, err
 		}
-		lease, err := maintenance.TryAcquireLifecycle(owner)
+		lease, err := maintenance.tryAcquireValidatedLifecycle(
+			waitCtx,
+			ctx,
+			owner,
+		)
 		if err == nil {
-			if waitErr := waitCtx.Err(); waitErr != nil {
-				return nil, errors.Join(waitErr, lease.Close())
-			}
 			return lease, nil
 		}
 		if !errors.Is(err, ErrLifecycleLeaseHeld) {
@@ -193,12 +184,40 @@ func (maintenance *LifecycleMaintenance) WaitAcquireLifecycle(
 	}
 }
 
+func (maintenance *LifecycleMaintenance) tryAcquireValidatedLifecycle(
+	waitCtx context.Context,
+	validationCtx context.Context,
+	owner LifecycleOwner,
+) (*LifecycleLease, error) {
+	maintenance.mu.Lock()
+	defer maintenance.mu.Unlock()
+	lease, err := maintenance.tryAcquireLifecycleLocked(owner)
+	if err != nil {
+		return nil, err
+	}
+	if waitErr := waitCtx.Err(); waitErr != nil {
+		return nil, errors.Join(waitErr, lease.Close())
+	}
+	if validateErr := validateLifecycleContextAfterLock(validationCtx); validateErr != nil {
+		return nil, errors.Join(validateErr, lease.Close())
+	}
+	if waitErr := waitCtx.Err(); waitErr != nil {
+		return nil, errors.Join(waitErr, lease.Close())
+	}
+	return lease, nil
+}
+
 func (maintenance *LifecycleMaintenance) validateLocked() error {
 	if maintenance.lock == nil {
 		return errors.New("lifecycle maintenance gate is closed")
 	}
-	if maintenance.path != LifecycleMaintenancePath(maintenance.lifecyclePath) ||
-		maintenance.lock.path != maintenance.path {
+	if _, _, err := validateLifecyclePathPair(
+		maintenance.lifecyclePath,
+		maintenance.path,
+	); err != nil {
+		return err
+	}
+	if maintenance.lock.path != maintenance.path {
 		return fmt.Errorf(
 			"lifecycle maintenance gate path changed for %s",
 			maintenance.lifecyclePath,
@@ -212,6 +231,63 @@ func (maintenance *LifecycleMaintenance) validateLocked() error {
 		)
 	}
 	return nil
+}
+
+func validateLifecyclePathPair(
+	lifecyclePath string,
+	maintenancePath string,
+) (string, string, error) {
+	cleanLifecyclePath, err := validateLifecycleLockPath(
+		"global lifecycle lease",
+		lifecyclePath,
+	)
+	if err != nil {
+		return "", "", err
+	}
+	cleanMaintenancePath, err := validateLifecycleLockPath(
+		"lifecycle maintenance gate",
+		maintenancePath,
+	)
+	if err != nil {
+		return "", "", err
+	}
+	if cleanLifecyclePath == cleanMaintenancePath {
+		return "", "", errors.New(
+			"global lifecycle lease and maintenance gate paths must differ",
+		)
+	}
+	defaultLease := cleanLifecyclePath == DefaultLifecycleLeasePath
+	defaultMaintenance := cleanMaintenancePath == DefaultLifecycleMaintenancePath
+	if defaultLease != defaultMaintenance {
+		return "", "", fmt.Errorf(
+			"default lifecycle paths must use the fixed pair %s and %s",
+			DefaultLifecycleLeasePath,
+			DefaultLifecycleMaintenancePath,
+		)
+	}
+	return cleanLifecyclePath, cleanMaintenancePath, nil
+}
+
+func validateLifecycleLockPath(description string, path string) (string, error) {
+	if path == "" {
+		return "", fmt.Errorf("%s path is empty", description)
+	}
+	cleanPath := filepath.Clean(path)
+	if cleanPath != path || !filepath.IsAbs(cleanPath) {
+		return "", fmt.Errorf(
+			"%s path must be a clean absolute path: %q",
+			description,
+			path,
+		)
+	}
+	if filepath.Dir(cleanPath) == string(os.PathSeparator) {
+		return "", fmt.Errorf(
+			"%s parent may not be the filesystem root: %s",
+			description,
+			cleanPath,
+		)
+	}
+	return cleanPath, nil
 }
 
 func (maintenance *LifecycleMaintenance) Close() error {

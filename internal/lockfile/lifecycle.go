@@ -36,24 +36,40 @@ type lifecyclePathContextKey struct{}
 
 type lifecycleContext struct {
 	path              string
+	maintenancePath   string
 	validateAfterLock func() error
 }
 
-// WithLifecyclePathForTest redirects the global lifecycle lease for a test
-// context. Production entrypoints never expose this through flags or
-// environment variables.
-func WithLifecyclePathForTest(ctx context.Context, path string) context.Context {
+// WithLifecyclePathsForTest redirects the global lifecycle lease and
+// maintenance gate for a test context. Production entrypoints never expose
+// these paths through flags or environment variables.
+func WithLifecyclePathsForTest(
+	ctx context.Context,
+	path string,
+	maintenancePath string,
+) context.Context {
 	if flag.Lookup("test.v") == nil {
-		panic("WithLifecyclePathForTest is only available in Go test binaries")
+		panic("WithLifecyclePathsForTest is only available in Go test binaries")
 	}
-	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{path: path})
+	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{
+		path:            path,
+		maintenancePath: maintenancePath,
+	})
 }
 
-// WithIsolatedNetNSTestLifecyclePath redirects the lifecycle lease for the
-// explicitly gated, non-initial-network-namespace smoke-test path. Callers
-// must validate the complete run-owned layout before using this helper.
-func WithIsolatedNetNSTestLifecyclePath(ctx context.Context, path string) context.Context {
-	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{path: path})
+// WithIsolatedNetNSTestLifecyclePaths redirects the lifecycle lease and its
+// shared maintenance gate for the explicitly gated, non-initial-network-
+// namespace smoke-test path. Callers must validate the complete run-owned
+// layout and the fixed gate root before using this helper.
+func WithIsolatedNetNSTestLifecyclePaths(
+	ctx context.Context,
+	path string,
+	maintenancePath string,
+) context.Context {
+	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{
+		path:            path,
+		maintenancePath: maintenancePath,
+	})
 }
 
 // WithIsolatedNetNSTestLifecycleValidation redirects the lifecycle lease and
@@ -62,10 +78,12 @@ func WithIsolatedNetNSTestLifecyclePath(ctx context.Context, path string) contex
 func WithIsolatedNetNSTestLifecycleValidation(
 	ctx context.Context,
 	path string,
+	maintenancePath string,
 	validateAfterLock func() error,
 ) context.Context {
 	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{
 		path:              path,
+		maintenancePath:   maintenancePath,
 		validateAfterLock: validateAfterLock,
 	})
 }
@@ -80,18 +98,39 @@ func LifecycleLeasePath(ctx context.Context) string {
 	return DefaultLifecycleLeasePath
 }
 
+func LifecycleMaintenancePath(ctx context.Context) string {
+	if ctx != nil {
+		if lifecycle, ok := ctx.Value(lifecyclePathContextKey{}).(lifecycleContext); ok &&
+			lifecycle.maintenancePath != "" {
+			return lifecycle.maintenancePath
+		}
+	}
+	return DefaultLifecycleMaintenancePath
+}
+
 func AcquireLifecycle(ctx context.Context, owner LifecycleOwner) (*LifecycleLease, error) {
 	if ctx != nil {
 		if err := ctx.Err(); err != nil {
 			return nil, err
 		}
 	}
-	return AcquireLifecycleAt(LifecycleLeasePath(ctx), owner)
+	return AcquireLifecycleAt(
+		LifecycleLeasePath(ctx),
+		LifecycleMaintenancePath(ctx),
+		owner,
+	)
 }
 
-func AcquireLifecycleAt(path string, owner LifecycleOwner) (*LifecycleLease, error) {
-	maintenance, err := tryBeginLifecycleMaintenanceAt(path, owner)
+func AcquireLifecycleAt(
+	path string,
+	maintenancePath string,
+	owner LifecycleOwner,
+) (*LifecycleLease, error) {
+	maintenance, err := tryBeginLifecycleMaintenanceAt(path, maintenancePath, owner)
 	if err != nil {
+		if errors.Is(err, ErrLifecycleMaintenanceHeld) {
+			return nil, errors.Join(ErrLifecycleLeaseHeld, err)
+		}
 		return nil, err
 	}
 	lease, acquireErr := maintenance.TryAcquireLifecycle(owner)
@@ -225,7 +264,7 @@ func WithLifecycle(
 		}
 		return fn(held)
 	}
-	lease, err := AcquireLifecycleAt(path, owner)
+	lease, err := AcquireLifecycleAt(path, LifecycleMaintenancePath(ctx), owner)
 	if err != nil {
 		return err
 	}
