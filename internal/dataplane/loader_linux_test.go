@@ -1078,9 +1078,10 @@ func TestPinPathLockRejectsUnsafeMetadataAndEntrySwap(t *testing.T) {
 
 	t.Run("root mode", func(t *testing.T) {
 		lockRoot := filepath.Join(t.TempDir(), "pin-locks")
-		if err := os.Mkdir(lockRoot, 0o755); err != nil {
+		if err := os.Mkdir(lockRoot, 0o700); err != nil {
 			t.Fatal(err)
 		}
+		setExactTestPermissions(t, lockRoot, 0o755)
 		runtime := newTestPinLockRuntime(t, lockRoot)
 		if _, err := acquirePinPathLock(
 			context.Background(),
@@ -1100,6 +1101,7 @@ func TestPinPathLockRejectsUnsafeMetadataAndEntrySwap(t *testing.T) {
 		if err := os.WriteFile(filepath.Join(lockRoot, lockName), []byte("keep"), 0o644); err != nil {
 			t.Fatal(err)
 		}
+		setExactTestPermissions(t, filepath.Join(lockRoot, lockName), 0o644)
 		runtime := newTestPinLockRuntime(t, lockRoot)
 		if _, err := acquirePinPathLock(
 			context.Background(),

@@ -488,6 +488,16 @@ func TestSaveFileUsesAtomicPrivateReplacement(t *testing.T) {
 	if err := os.WriteFile(path, []byte("old"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(path, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	initialInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := initialInfo.Mode().Perm(); got != 0o644 {
+		t.Fatalf("initial config mode = %o, want 644", got)
+	}
 	if err := SaveFile(path, SafeTemplate()); err != nil {
 		t.Fatal(err)
 	}

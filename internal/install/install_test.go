@@ -217,6 +217,16 @@ func TestInstallBinaryReplacesModeAtomically(t *testing.T) {
 	if err := os.WriteFile(target, []byte("stale"), 0o777); err != nil {
 		t.Fatal(err)
 	}
+	if err := os.Chmod(target, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	initialInfo, err := os.Stat(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := initialInfo.Mode().Perm(); got != 0o777 {
+		t.Fatalf("initial binary mode = %o, want 777", got)
+	}
 	if err := installBinary(target); err != nil {
 		t.Fatal(err)
 	}
