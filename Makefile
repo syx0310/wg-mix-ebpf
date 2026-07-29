@@ -20,9 +20,9 @@ build-linux-amd64: prepare-embedded-bpf
 build-linux-arm64: prepare-embedded-bpf
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -o bin/wg-mix-ebpf-linux-arm64 ./cmd/wg-mix-ebpf
 
-# This convenience target is unprivileged. The fixed-tool, clean-tree checks in
-# the invoked script define the artifact gate; Make variables are not a sudo
-# or privileged execution boundary.
+# This convenience target is unprivileged. The fixed-tool and immutable
+# candidate-snapshot checks in the invoked script define the artifact gate;
+# Make variables are not a sudo or privileged execution boundary.
 build-live-guard-test:
 	@test -n "$$LIVE_GUARD_COMMIT" || { echo "LIVE_GUARD_COMMIT is required"; exit 2; }
 	@test -n "$$LIVE_GUARD_TEST_BINARY" || { echo "LIVE_GUARD_TEST_BINARY is required"; exit 2; }

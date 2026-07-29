@@ -10,13 +10,20 @@ readonly FIND_BIN="/usr/bin/find"
 readonly GO_BIN="/usr/bin/go"
 readonly GIT_BIN="/usr/bin/git"
 readonly MKDIR_BIN="/usr/bin/mkdir"
+readonly PYTHON3_BIN="/usr/bin/python3"
 readonly READLINK_BIN="/usr/bin/readlink"
 readonly SHA256_BIN="/usr/bin/sha256sum"
 readonly STAT_BIN="/usr/bin/stat"
 readonly TAR_BIN="/usr/bin/tar"
 readonly TIMEOUT_BIN="/usr/bin/timeout"
+readonly ARCHIVE_LIMIT_BYTES=268435456
 export PATH LC_ALL
 umask 077
+
+[[ "${EUID}" -ne 0 ]] || {
+  echo "error: live guard build gate must run as an unprivileged user" >&2
+  exit 1
+}
 
 usage() {
   cat <<'EOF'
@@ -54,6 +61,13 @@ valid_live_test_list() {
   local output="$2"
 
   [[ "${exit_code}" == "0" && "${output}" == "TestLiveGuardOwnership" ]]
+}
+
+valid_parent_mode() {
+  local mode="$1"
+
+  [[ "${mode}" =~ ^[0-7]{3,4}$ ]] || return 1
+  (( (8#${mode} & 8#022) == 0 ))
 }
 
 print_argv() {
@@ -163,6 +177,22 @@ self_test_safety_gate() {
     echo "error: missing, ambiguous, or failed live test-list fixture was accepted" >&2
     return 1
   fi
+  if ! valid_parent_mode "0700" ||
+    ! valid_parent_mode "0755" ||
+    ! valid_parent_mode "700" ||
+    ! valid_parent_mode "755"; then
+    echo "error: safe parent mode fixture was rejected" >&2
+    return 1
+  fi
+  if valid_parent_mode "0020" ||
+    valid_parent_mode "0002" ||
+    valid_parent_mode "20" ||
+    valid_parent_mode "2" ||
+    valid_parent_mode "0777" ||
+    valid_parent_mode "08"; then
+    echo "error: unsafe parent mode fixture was accepted" >&2
+    return 1
+  fi
   echo "live guard build safety gate self-test passed"
 }
 
@@ -237,10 +267,6 @@ if [[ -n "${SELF_TEST_REJECT_BINARY}" ]]; then
   exit 0
 fi
 
-[[ "${EUID}" -ne 0 ]] || {
-  echo "error: live guard test binary must be built as an unprivileged user" >&2
-  exit 1
-}
 valid_commit "${CANDIDATE_COMMIT}" || {
   echo "error: --candidate-commit must be exactly 40 lowercase hex characters" >&2
   exit 2
@@ -251,7 +277,8 @@ valid_output_path "${OUTPUT}" || {
 }
 [[ -x "${CHMOD_BIN}" && -x "${DIRNAME_BIN}" && -x "${ENV_BIN}" &&
   -x "${FIND_BIN}" && -x "${GO_BIN}" && -x "${GIT_BIN}" && -x "${MKDIR_BIN}" &&
-  -x "${READLINK_BIN}" && -x "${SHA256_BIN}" && -x "${STAT_BIN}" &&
+  -x "${PYTHON3_BIN}" && -x "${READLINK_BIN}" && -x "${SHA256_BIN}" &&
+  -x "${STAT_BIN}" &&
   -x "${TAR_BIN}" && -x "${TIMEOUT_BIN}" ]] || {
   echo "error: fixed system build tools are unavailable" >&2
   exit 1
@@ -271,7 +298,7 @@ read -r parent_uid parent_mode parent_kind < <(
   echo "error: output parent is not an EUID-owned directory" >&2
   exit 1
 }
-((8#${parent_mode} & 8#022 == 0)) || {
+valid_parent_mode "${parent_mode}" || {
   echo "error: output parent is group/other writable" >&2
   exit 1
 }
@@ -410,6 +437,51 @@ resolved_candidate="$("${ISOLATED_GIT_ENV[@]}" rev-parse --verify \
   exit 1
 }
 
+readonly ARCHIVE_LIMIT_PYTHON='import os
+import sys
+
+destination = sys.argv[1]
+limit = int(sys.argv[2], 10)
+if limit <= 0:
+    print("error: candidate archive hard limit must be positive", file=sys.stderr)
+    raise SystemExit(1)
+
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+try:
+    destination_fd = os.open(destination, flags, 0o600)
+except OSError as error:
+    print(f"error: cannot create candidate archive: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+total = 0
+failed = False
+try:
+    while True:
+        chunk = sys.stdin.buffer.read(min(1024 * 1024, limit - total + 1))
+        if not chunk:
+            break
+        if total + len(chunk) > limit:
+            raise RuntimeError(
+                f"candidate archive exceeds {limit} byte hard limit"
+            )
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination_fd, view)
+            if written <= 0:
+                raise RuntimeError("short write while creating candidate archive")
+            view = view[written:]
+        total += len(chunk)
+    os.fsync(destination_fd)
+except (OSError, RuntimeError) as error:
+    print(f"error: {error}", file=sys.stderr)
+    failed = True
+finally:
+    os.close(destination_fd)
+
+if failed:
+    raise SystemExit(1)
+'
+
 ARCHIVE_ARGV=(
   "${TIMEOUT_BIN}"
   --signal=TERM
@@ -421,17 +493,46 @@ ARCHIVE_ARGV=(
   "${CANDIDATE_COMMIT}"
 )
 readonly -a ARCHIVE_ARGV
-print_argv "candidate_archive_start" "${ARCHIVE_ARGV[@]}"
-(
-  set -o noclobber
-  "${ARCHIVE_ARGV[@]}" >"${CANDIDATE_ARCHIVE}"
+ARCHIVE_LIMIT_ARGV=(
+  "${TIMEOUT_BIN}"
+  --signal=TERM
+  --kill-after=5s
+  2m
+  "${ENV_BIN}"
+  -i
+  "PATH=${PATH}"
+  "LC_ALL=${LC_ALL}"
+  "HOME=${BUILD_HOME}"
+  "TMPDIR=${BUILD_TMP}"
+  "${PYTHON3_BIN}"
+  -I
+  -B
+  -c
+  "${ARCHIVE_LIMIT_PYTHON}"
+  "${CANDIDATE_ARCHIVE}"
+  "${ARCHIVE_LIMIT_BYTES}"
 )
+readonly -a ARCHIVE_LIMIT_ARGV
+print_argv "candidate_archive_start" "${ARCHIVE_ARGV[@]}"
+print_argv "candidate_archive_limit" "${ARCHIVE_LIMIT_ARGV[@]}"
+set +e
+"${ARCHIVE_ARGV[@]}" | "${ARCHIVE_LIMIT_ARGV[@]}"
+archive_pipeline_status=("${PIPESTATUS[@]}")
+set -e
+if ((${#archive_pipeline_status[@]} != 2)) ||
+  [[ "${archive_pipeline_status[0]}" != "0" ||
+    "${archive_pipeline_status[1]}" != "0" ]]; then
+  printf 'error: candidate archive pipeline failed: producer=%s limiter=%s\n' \
+    "${archive_pipeline_status[0]:-missing}" \
+    "${archive_pipeline_status[1]:-missing}" >&2
+  exit 1
+fi
 read -r archive_uid archive_mode archive_links archive_size archive_kind < <(
   "${STAT_BIN}" -c '%u %a %h %s %F' -- "${CANDIDATE_ARCHIVE}"
 )
 [[ "${archive_uid}" == "${EUID}" && "${archive_mode}" == "600" &&
   "${archive_links}" == "1" && "${archive_size}" -gt 0 &&
-  "${archive_size}" -le 268435456 &&
+  "${archive_size}" -le "${ARCHIVE_LIMIT_BYTES}" &&
   "${archive_kind}" == "regular file" ]] || {
   echo "error: candidate archive metadata is unsafe" >&2
   exit 1
@@ -449,6 +550,12 @@ EXTRACT_ARGV=(
   --signal=TERM
   --kill-after=5s
   2m
+  "${ENV_BIN}"
+  -i
+  "PATH=${PATH}"
+  "LC_ALL=${LC_ALL}"
+  "HOME=${BUILD_HOME}"
+  "TMPDIR=${BUILD_TMP}"
   "${TAR_BIN}"
   --extract
   "--file=${CANDIDATE_ARCHIVE}"
@@ -528,6 +635,141 @@ candidate_builder_sha="${candidate_builder_sha%% *}"
   echo "error: running build gate path changed while it was hashed" >&2
   exit 1
 }
+
+readonly GO_MOD_JSON="${BUILD_TMP}/go-mod-edit.json"
+[[ ! -e "${GO_MOD_JSON}" && ! -L "${GO_MOD_JSON}" ]] || {
+  echo "error: Go module metadata path already exists" >&2
+  exit 1
+}
+GO_MOD_EDIT_ARGV=(
+  "${TIMEOUT_BIN}"
+  --signal=TERM
+  --kill-after=5s
+  30s
+  "${ENV_BIN}"
+  -i
+  "--chdir=${SOURCE_SNAPSHOT}"
+  "PATH=${PATH}"
+  "LC_ALL=${LC_ALL}"
+  "HOME=${BUILD_HOME}"
+  "TMPDIR=${BUILD_TMP}"
+  "GOTMPDIR=${BUILD_TMP}"
+  "GOCACHE=${BUILD_CACHE}"
+  "GOMODCACHE=${MODULE_CACHE}"
+  "CGO_ENABLED=0"
+  "GOENV=off"
+  "GOTOOLCHAIN=local"
+  "GOWORK=off"
+  "${GO_BIN}"
+  mod
+  edit
+  -json
+)
+readonly -a GO_MOD_EDIT_ARGV
+print_argv "go_mod_edit_start" "${GO_MOD_EDIT_ARGV[@]}"
+(
+  set -o noclobber
+  "${GO_MOD_EDIT_ARGV[@]}" >"${GO_MOD_JSON}"
+)
+read -r go_mod_uid go_mod_mode go_mod_links go_mod_size go_mod_kind < <(
+  "${STAT_BIN}" -c '%u %a %h %s %F' -- "${GO_MOD_JSON}"
+)
+[[ "${go_mod_uid}" == "${EUID}" && "${go_mod_mode}" == "600" &&
+  "${go_mod_links}" == "1" && "${go_mod_size}" -gt 0 &&
+  "${go_mod_size}" -le 1048576 &&
+  "${go_mod_kind}" == "regular file" ]] || {
+  echo "error: Go module metadata is unsafe" >&2
+  exit 1
+}
+"${CHMOD_BIN}" 0400 -- "${GO_MOD_JSON}"
+
+readonly GO_MOD_POLICY_PYTHON='import json
+import sys
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key {key!r}")
+        result[key] = value
+    return result
+
+try:
+    with open(sys.argv[1], "r", encoding="utf-8") as metadata_file:
+        document = json.load(metadata_file, object_pairs_hook=unique_object)
+except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as error:
+    print(f"error: invalid go mod edit JSON: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+if not isinstance(document, dict) or "Replace" not in document:
+    print("error: go mod edit JSON has no Replace field", file=sys.stderr)
+    raise SystemExit(1)
+
+replacements = document["Replace"]
+if replacements is None:
+    replacements = []
+if not isinstance(replacements, list):
+    print("error: go mod edit Replace field is not a list", file=sys.stderr)
+    raise SystemExit(1)
+
+for index, replacement in enumerate(replacements):
+    if not isinstance(replacement, dict) or set(replacement) != {"Old", "New"}:
+        print(
+            f"error: go mod edit Replace[{index}] has an invalid shape",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+    old = replacement["Old"]
+    new = replacement["New"]
+    for endpoint_name, endpoint in (("Old", old), ("New", new)):
+        if (
+            not isinstance(endpoint, dict)
+            or not isinstance(endpoint.get("Path"), str)
+            or not endpoint["Path"]
+            or not set(endpoint).issubset({"Path", "Version"})
+            or (
+                "Version" in endpoint
+                and not isinstance(endpoint["Version"], str)
+            )
+        ):
+            print(
+                f"error: go mod edit Replace[{index}].{endpoint_name} "
+                "has an invalid shape",
+                file=sys.stderr,
+            )
+            raise SystemExit(1)
+    if new.get("Version", "") == "":
+        print(
+            "error: candidate go.mod contains a forbidden local replacement "
+            f"at Replace[{index}]",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+print(f"go_mod_policy replacements={len(replacements)} local=0")
+'
+GO_MOD_POLICY_ARGV=(
+  "${TIMEOUT_BIN}"
+  --signal=TERM
+  --kill-after=5s
+  30s
+  "${ENV_BIN}"
+  -i
+  "PATH=${PATH}"
+  "LC_ALL=${LC_ALL}"
+  "HOME=${BUILD_HOME}"
+  "TMPDIR=${BUILD_TMP}"
+  "${PYTHON3_BIN}"
+  -I
+  -B
+  -c
+  "${GO_MOD_POLICY_PYTHON}"
+  "${GO_MOD_JSON}"
+)
+readonly -a GO_MOD_POLICY_ARGV
+print_argv "go_mod_policy_start" "${GO_MOD_POLICY_ARGV[@]}"
+"${GO_MOD_POLICY_ARGV[@]}"
+
 printf 'candidate_snapshot commit=%s archive=%s sha256=%s source=%s\n' \
   "${CANDIDATE_COMMIT}" "${CANDIDATE_ARCHIVE}" "${archive_sha256}" \
   "${SOURCE_SNAPSHOT}"
