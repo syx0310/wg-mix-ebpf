@@ -43,6 +43,104 @@ func openManagedCleanupDir(spec cleanupPathSpec) (*managedCleanupDir, bool, erro
 	return openManagedCleanupDirWithOptions(spec, managedDirOpenOptions{})
 }
 
+func createFreshManagedCleanupDir(spec cleanupPathSpec) (*managedCleanupDir, error) {
+	anchor, err := managedCleanupAnchor(spec)
+	if err != nil {
+		return nil, err
+	}
+	relative, err := filepath.Rel(anchor, spec.path)
+	if err != nil || relative == "." || relative == ".." ||
+		strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return nil, fmt.Errorf("refuse %s %s outside managed root %s", spec.name, spec.path, anchor)
+	}
+	components := strings.Split(relative, string(os.PathSeparator))
+	current, err := cleanupOpenAnchor(anchor)
+	if err != nil {
+		return nil, fmt.Errorf("open managed root %s for fresh %s: %w", anchor, spec.name, err)
+	}
+	anchorIdentity := current.identity
+	owner := uint32(os.Geteuid())
+	if filepath.Clean(anchor) != filepath.Clean(os.TempDir()) {
+		if err := anchorIdentity.validateDirectory(anchor, owner); err != nil {
+			_ = current.close()
+			return nil, err
+		}
+	}
+
+	for index, component := range components {
+		final := index == len(components)-1
+		child, openErr := cleanupOpenDirAt(current, component)
+		if final && openErr == nil {
+			_ = child.close()
+			_ = current.close()
+			return nil, fmt.Errorf("refuse pre-existing fresh %s %s", spec.name, spec.path)
+		}
+		if final && cleanupIsNotExist(openErr) {
+			if err := cleanupMkdirAt(current, component, 0o755); err != nil {
+				_ = current.close()
+				return nil, fmt.Errorf("exclusively create fresh %s %s: %w", spec.name, spec.path, err)
+			}
+			child, openErr = cleanupOpenDirAt(current, component)
+		}
+		if openErr != nil {
+			_ = current.close()
+			if final {
+				return nil, fmt.Errorf("refuse pre-existing or unsafe fresh %s %s: %w", spec.name, spec.path, openErr)
+			}
+			return nil, fmt.Errorf("open fresh %s component %s: %w", spec.name, component, openErr)
+		}
+		if !child.identity.sameMount(anchorIdentity) {
+			_ = child.close()
+			_ = current.close()
+			return nil, fmt.Errorf(
+				"refuse fresh %s %s: component %s crosses a mount boundary",
+				spec.name,
+				spec.path,
+				child.path,
+			)
+		}
+		if err := child.identity.validateDirectory(child.path, owner); err != nil {
+			_ = child.close()
+			_ = current.close()
+			return nil, err
+		}
+		if final {
+			return &managedCleanupDir{
+				spec:     spec,
+				parent:   current,
+				dir:      child,
+				name:     component,
+				identity: child.identity,
+			}, nil
+		}
+		_ = current.close()
+		current = child
+	}
+	_ = current.close()
+	return nil, fmt.Errorf("refuse empty relative path for fresh %s %s", spec.name, spec.path)
+}
+
+func revalidateManagedCleanupDir(dir *managedCleanupDir) error {
+	if dir == nil || dir.parent == nil || dir.dir == nil || dir.dir.file == nil {
+		return errors.New("cannot revalidate an unheld managed directory")
+	}
+	heldIdentity, err := cleanupIdentityForFD(int(dir.dir.file.Fd()))
+	if err != nil {
+		return fmt.Errorf("inspect held %s %s: %w", dir.spec.name, dir.spec.path, err)
+	}
+	if !dir.identity.sameDirectory(heldIdentity) {
+		return fmt.Errorf("refuse %s %s: held directory identity changed", dir.spec.name, dir.spec.path)
+	}
+	namedIdentity, err := cleanupIdentityAt(dir.parent, dir.name)
+	if err != nil {
+		return fmt.Errorf("revalidate %s pathname %s: %w", dir.spec.name, dir.spec.path, err)
+	}
+	if !heldIdentity.sameDirectory(namedIdentity) {
+		return fmt.Errorf("refuse %s %s: pathname no longer names the held directory", dir.spec.name, dir.spec.path)
+	}
+	return nil
+}
+
 func openManagedCleanupDirWithOptions(
 	spec cleanupPathSpec,
 	options managedDirOpenOptions,

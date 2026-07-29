@@ -51,6 +51,7 @@ type cleanupManifestWriteOptions struct {
 	Fresh         bool
 	AdoptExisting bool
 	LifecyclePath string
+	createState   func() (*managedCleanupDir, error)
 }
 
 func expectedCleanupManifest(paths paths, system string, installationID string) cleanupManifest {
@@ -238,6 +239,7 @@ func writeCleanupManifest(
 	defer configDir.close()
 
 	installationID := ""
+	var freshStateDir *managedCleanupDir
 	manifest, _, err := readCleanupManifestFromDir(configDir.dir)
 	switch {
 	case err == nil:
@@ -267,6 +269,16 @@ func writeCleanupManifest(
 				options.LifecyclePath,
 			); err != nil {
 				return err
+			}
+			if options.createState == nil {
+				return errors.New("fresh ownership bootstrap requires descriptor-anchored state creation")
+			}
+			freshStateDir, err = options.createState()
+			if err != nil {
+				return fmt.Errorf("create fresh state dir before ownership publication: %w", err)
+			}
+			if err := revalidateManagedCleanupDir(freshStateDir); err != nil {
+				return fmt.Errorf("revalidate fresh state dir before ownership publication: %w", err)
 			}
 		} else {
 			if err := validateCleanupManifestBootstrap(configDir, paths, system, installationID); err != nil {
@@ -320,5 +332,13 @@ func writeCleanupManifest(
 		return fmt.Errorf("install cleanup ownership manifest: %w", err)
 	}
 	tempPresent = false
+	if err := configDir.dir.file.Sync(); err != nil {
+		return fmt.Errorf("sync cleanup ownership directory: %w", err)
+	}
+	if freshStateDir != nil {
+		if err := revalidateManagedCleanupDir(freshStateDir); err != nil {
+			return fmt.Errorf("revalidate fresh state dir after ownership publication: %w", err)
+		}
+	}
 	return nil
 }

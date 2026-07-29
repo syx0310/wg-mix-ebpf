@@ -48,6 +48,7 @@ type Plan struct {
 }
 
 type installAfterInspectHookContextKey struct{}
+type installAfterManifestHookContextKey struct{}
 
 func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if err := ctx.Err(); err != nil {
@@ -141,30 +142,72 @@ func applyInstall(
 	system string,
 	paths paths,
 	ownership cleanupOwnershipState,
-) error {
+) (retErr error) {
 	configDir := filepath.Dir(paths.ConfigPath)
 	if ownership == cleanupOwnershipAbsent {
-		if err := os.Mkdir(configDir, 0o755); err != nil {
-			return fmt.Errorf(
-				"exclusively create fresh config directory %s: %w",
-				configDir,
-				err,
-			)
+		freshConfig, err := createFreshManagedCleanupDir(configCleanupPath(configDir))
+		if err != nil {
+			return err
+		}
+		if err := freshConfig.close(); err != nil {
+			return fmt.Errorf("close fresh config directory handles: %w", err)
 		}
 	} else if err := os.MkdirAll(configDir, 0o755); err != nil {
 		return fmt.Errorf("create %s: %w", configDir, err)
 	}
+	var stateDir *managedCleanupDir
+	defer func() {
+		if stateDir != nil {
+			retErr = errors.Join(retErr, stateDir.close())
+		}
+	}()
 	if err := writeCleanupManifest(paths, system, cleanupManifestWriteOptions{
 		Fresh:         ownership == cleanupOwnershipAbsent,
 		AdoptExisting: ownership == cleanupOwnershipUnmarked && opts.AdoptExisting,
 		LifecyclePath: lockfile.LifecycleLeasePath(ctx),
+		createState: func() (*managedCleanupDir, error) {
+			var err error
+			stateDir, err = createFreshManagedCleanupDir(stateCleanupPath(paths.VarLibDir))
+			return stateDir, err
+		},
 	}); err != nil {
 		return err
 	}
-	for _, dir := range []string{paths.VarLibDir, paths.RunDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("create %s: %w", dir, err)
+	if hook, ok := ctx.Value(installAfterManifestHookContextKey{}).(func() error); ok && hook != nil {
+		if err := hook(); err != nil {
+			return fmt.Errorf("run install post-manifest hook: %w", err)
 		}
+	}
+	if stateDir == nil {
+		var exists bool
+		var err error
+		stateDir, exists, err = openManagedCleanupDir(stateCleanupPath(paths.VarLibDir))
+		if err != nil {
+			return err
+		}
+		if !exists {
+			stateDir, err = createFreshManagedCleanupDir(stateCleanupPath(paths.VarLibDir))
+			if err != nil {
+				return err
+			}
+		}
+	}
+	if err := revalidateManagedCleanupDir(stateDir); err != nil {
+		return err
+	}
+	runDir, exists, err := openManagedCleanupDir(runtimeCleanupPath(paths.RunDir))
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("runtime dir %s disappeared while holding its operation lock", paths.RunDir)
+	}
+	if err := revalidateManagedCleanupDir(runDir); err != nil {
+		_ = runDir.close()
+		return err
+	}
+	if err := runDir.close(); err != nil {
+		return fmt.Errorf("close runtime directory handles: %w", err)
 	}
 	if err := installServiceArtifacts(paths, system); err != nil {
 		return err
