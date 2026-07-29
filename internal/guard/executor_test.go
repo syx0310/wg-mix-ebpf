@@ -308,6 +308,47 @@ func TestCleanupWithoutOwnerRecordIsZeroWrite(t *testing.T) {
 	}
 }
 
+func TestCleanupAllowsMissingFinalStateDirectoryUnderTrustedParent(t *testing.T) {
+	stateDir := filepath.Join(guardTestStateDir(t), "missing-final")
+	exec := CommandExecutor{
+		StateDir: stateDir,
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			if table != TableName {
+				t.Fatalf("unexpected inspection of %q", table)
+			}
+			return tableIdentity{}, nil
+		},
+		runScript: func(context.Context, string) error {
+			t.Fatal("cleanup with no owner issued an nft write")
+			return nil
+		},
+	}
+	if err := exec.Cleanup(t.Context()); err != nil {
+		t.Fatalf("trusted missing final state directory should be an idempotent no-op: %v", err)
+	}
+}
+
+func TestCleanupRejectsMissingIntermediateStateDirectory(t *testing.T) {
+	stateDir := filepath.Join(guardTestStateDir(t), "missing-parent", "state")
+	exec := CommandExecutor{
+		StateDir: stateDir,
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			if table != TableName {
+				t.Fatalf("unexpected inspection of %q", table)
+			}
+			return tableIdentity{}, nil
+		},
+		runScript: func(context.Context, string) error {
+			t.Fatal("ambiguous missing ancestry issued an nft write")
+			return nil
+		},
+	}
+	err := exec.Cleanup(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "intermediate") {
+		t.Fatalf("missing intermediate ancestry must fail closed, got %v", err)
+	}
+}
+
 func TestCleanupRejectsLegacyV1OwnerRecordWithZeroWrite(t *testing.T) {
 	stateDir := guardTestStateDir(t)
 	writeLegacyV1OwnerRecord(t, stateDir)

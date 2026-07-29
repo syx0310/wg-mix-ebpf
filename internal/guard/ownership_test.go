@@ -148,6 +148,41 @@ func TestOwnerRecordRejectsGroupWritableStateDirectory(t *testing.T) {
 	}
 }
 
+func TestOwnerRecordRejectsWritableNonStickyAncestor(t *testing.T) {
+	parent := guardTestStateDir(t)
+	if err := os.Chmod(parent, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(parent, "state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	exec := CommandExecutor{StateDir: stateDir}
+	if _, _, err := exec.loadOrCreateOwner(); err == nil || !strings.Contains(err.Error(), "ancestor") {
+		t.Fatalf("writable non-sticky ancestor must fail closed, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, OwnerRecordFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unsafe ancestry received an owner record: %v", err)
+	}
+}
+
+func TestOwnerRecordAllowsOwnedStickyAncestor(t *testing.T) {
+	parent := guardTestStateDir(t)
+	if err := os.Chmod(parent, os.ModeSticky|0o777); err != nil {
+		t.Fatal(err)
+	}
+	stateDir := filepath.Join(parent, "state")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	exec := CommandExecutor{StateDir: stateDir}
+	if _, fresh, err := exec.loadOrCreateOwner(); err != nil {
+		t.Fatalf("owned sticky ancestor should protect the state entry: %v", err)
+	} else if !fresh {
+		t.Fatal("owner record unexpectedly existed")
+	}
+}
+
 func TestOwnerRecordRejectsHardLink(t *testing.T) {
 	stateDir := guardTestStateDir(t)
 	exec := CommandExecutor{StateDir: stateDir}
