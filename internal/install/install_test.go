@@ -2671,7 +2671,11 @@ func TestCleanupPlanRejectsSameInodeContentReplacement(t *testing.T) {
 
 func TestCleanupQuarantineRestoresForeignFileSwappedAtFinalHook(t *testing.T) {
 	layout := cleanupTestPaths(t.TempDir(), "final-file-swap")
-	for _, dir := range []string{filepath.Dir(layout.ConfigPath), layout.SystemdDir} {
+	for _, dir := range []string{
+		filepath.Dir(layout.ConfigPath),
+		layout.SystemdDir,
+		filepath.Dir(systemdEnableLinkPath(layout)),
+	} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
@@ -3438,8 +3442,13 @@ func populateUnmarkedCleanupTestLayout(layout paths, system string) error {
 	}
 	switch system {
 	case "systemd":
-		if err := os.MkdirAll(layout.SystemdDir, 0o700); err != nil {
-			return err
+		for _, dir := range []string{
+			layout.SystemdDir,
+			filepath.Dir(systemdEnableLinkPath(layout)),
+		} {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				return err
+			}
 		}
 		if err := os.WriteFile(
 			filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service"),

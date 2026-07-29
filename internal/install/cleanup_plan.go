@@ -1641,7 +1641,7 @@ func validateCleanupManifestBootstrap(
 	if pinPlan != nil {
 		plans = append(plans, pinPlan)
 	}
-	artifactPlans, err := prepareArtifactPlans(manifest)
+	artifactPlans, err := prepareArtifactPlansForValidation(manifest, false)
 	if err != nil {
 		return fmt.Errorf("refuse to adopt unmarked service artifact: %w", err)
 	}
@@ -2118,6 +2118,13 @@ func preparePinDirectoryPlan(pinPath string) (*cleanupDirectoryPlan, error) {
 }
 
 func prepareArtifactPlans(manifest cleanupManifest) ([]*cleanupDirectoryPlan, error) {
+	return prepareArtifactPlansForValidation(manifest, true)
+}
+
+func prepareArtifactPlansForValidation(
+	manifest cleanupManifest,
+	requireDeclaredParents bool,
+) ([]*cleanupDirectoryPlan, error) {
 	var plans []*cleanupDirectoryPlan
 	for _, artifact := range manifest.Artifacts {
 		defaultParent := ""
@@ -2139,7 +2146,15 @@ func prepareArtifactPlans(manifest cleanupManifest) ([]*cleanupDirectoryPlan, er
 			return nil, err
 		}
 		if !exists {
-			continue
+			if !requireDeclaredParents {
+				continue
+			}
+			closeCleanupDirectoryPlans(plans)
+			return nil, fmt.Errorf(
+				"declared service artifact parent %s is missing for %s",
+				filepath.Dir(artifact.Path),
+				artifact.Path,
+			)
 		}
 		var node *cleanupEntryPlan
 		if artifact.Kind == systemdEnableLinkKind {

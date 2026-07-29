@@ -365,6 +365,74 @@ func (artifact *verifiedServiceArtifact) close() error {
 	return errors.Join(errs...)
 }
 
+func (artifact *verifiedServiceArtifact) revalidateObjectForExecution() error {
+	if artifact == nil || artifact.file == nil || artifact.entry == nil {
+		return errors.New("cannot revalidate an unheld service artifact object")
+	}
+	entry := artifact.entry
+	if entry.directory || entry.symlink || !entry.digestKnown {
+		return fmt.Errorf(
+			"service artifact %s lacks an exact regular-file content snapshot",
+			entry.path,
+		)
+	}
+	beforeRead, err := cleanupIdentityForFD(int(artifact.file.Fd()))
+	if err != nil {
+		return err
+	}
+	if !entry.identity.sameRegularFile(beforeRead) {
+		return fmt.Errorf(
+			"refuse service artifact execution: held identity changed for %s",
+			entry.path,
+		)
+	}
+	if _, err := artifact.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	data, err := io.ReadAll(io.LimitReader(artifact.file, maxManagedCleanupFileSize+1))
+	if err != nil {
+		return err
+	}
+	if len(data) > maxManagedCleanupFileSize || sha256.Sum256(data) != entry.digest {
+		return fmt.Errorf("refuse service artifact execution: content changed for %s", entry.path)
+	}
+	afterRead, err := cleanupIdentityForFD(int(artifact.file.Fd()))
+	if err != nil {
+		return err
+	}
+	if !entry.identity.sameRegularFile(afterRead) ||
+		!beforeRead.sameRegularFile(afterRead) {
+		return fmt.Errorf(
+			"refuse service artifact execution: held identity changed while reading %s",
+			entry.path,
+		)
+	}
+	namedIdentity, err := cleanupIdentityAt(entry.parent, entry.name)
+	if err != nil {
+		return fmt.Errorf("revalidate service artifact execution name %s: %w", entry.path, err)
+	}
+	if !entry.identity.sameRegularFile(namedIdentity) ||
+		!afterRead.sameRegularFile(namedIdentity) {
+		return fmt.Errorf("refuse service artifact execution: pathname changed for %s", entry.path)
+	}
+	afterName, err := cleanupIdentityForFD(int(artifact.file.Fd()))
+	if err != nil {
+		return err
+	}
+	if !entry.identity.sameRegularFile(afterName) ||
+		!afterRead.sameRegularFile(afterName) ||
+		!namedIdentity.sameRegularFile(afterName) {
+		return fmt.Errorf(
+			"refuse service artifact execution: held identity changed during name binding for %s",
+			entry.path,
+		)
+	}
+	if _, err := artifact.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	return nil
+}
+
 func (artifact *verifiedServiceArtifact) revalidateForExecution() error {
 	if artifact == nil || artifact.file == nil || artifact.entry == nil {
 		return errors.New("cannot execute an unverified service artifact")
@@ -384,58 +452,40 @@ func (artifact *verifiedServiceArtifact) revalidateForExecution() error {
 			artifact.entry.path,
 		)
 	}
-	if err := revalidateManagedCleanupDir(parent); err != nil {
-		return fmt.Errorf(
-			"refuse service artifact execution: parent identity changed for %s: %w",
-			artifact.entry.path,
-			err,
-		)
+	revalidateParent := func(stage string) error {
+		if err := revalidateManagedCleanupDir(parent); err != nil {
+			return fmt.Errorf(
+				"refuse service artifact execution: parent identity changed %s for %s: %w",
+				stage,
+				artifact.entry.path,
+				err,
+			)
+		}
+		return nil
 	}
-	entry := artifact.entry
-	if _, err := artifact.file.Seek(0, io.SeekStart); err != nil {
+	if err := revalidateParent("before object inspection"); err != nil {
 		return err
 	}
-	data, err := io.ReadAll(io.LimitReader(artifact.file, maxManagedCleanupFileSize+1))
-	if err != nil {
+	if err := artifact.revalidateObjectForExecution(); err != nil {
 		return err
 	}
-	if len(data) > maxManagedCleanupFileSize || sha256.Sum256(data) != entry.digest {
-		return fmt.Errorf("refuse service artifact execution: content changed for %s", entry.path)
-	}
-	fdIdentity, err := cleanupIdentityForFD(int(artifact.file.Fd()))
-	if err != nil {
+	if err := revalidateParent("after object inspection"); err != nil {
 		return err
 	}
-	if !entry.identity.sameRegularFile(fdIdentity) {
-		return fmt.Errorf("refuse service artifact execution: held identity changed for %s", entry.path)
-	}
-	namedIdentity, err := cleanupIdentityAt(entry.parent, entry.name)
-	if err != nil {
-		return fmt.Errorf("revalidate service artifact execution name %s: %w", entry.path, err)
-	}
-	if !fdIdentity.sameRegularFile(namedIdentity) {
-		return fmt.Errorf("refuse service artifact execution: pathname changed for %s", entry.path)
-	}
-	if _, err := artifact.file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
+
+	var hookErr error
 	if artifact.beforeFinalParentRevalidate != nil {
 		if err := artifact.beforeFinalParentRevalidate(); err != nil {
-			return fmt.Errorf(
+			hookErr = fmt.Errorf(
 				"run service artifact pre-final-chain test hook: %w",
 				err,
 			)
 		}
 	}
-	if err := revalidateManagedCleanupDir(parent); err != nil {
-		return fmt.Errorf(
-			"refuse service artifact execution: parent identity changed "+
-				"after file and name inspection for %s: %w",
-			artifact.entry.path,
-			err,
-		)
-	}
-	return nil
+	beforeObjectErr := revalidateParent("after final hook and before final object inspection")
+	objectErr := artifact.revalidateObjectForExecution()
+	afterObjectErr := revalidateParent("after final hook and final object inspection")
+	return errors.Join(hookErr, beforeObjectErr, objectErr, afterObjectErr)
 }
 
 func (plan *uninstallCleanupPlan) serviceArtifactEntry(
@@ -610,15 +660,35 @@ func runSystemdManagerReloadAfterServiceArtifactRemoval(
 }
 
 func revalidateServiceArtifactBoundary(
+	plan *uninstallCleanupPlan,
 	artifact *verifiedServiceArtifact,
 	boundary string,
 ) error {
-	if err := artifact.revalidateForExecution(); err != nil {
+	beforeSetErr := plan.revalidateDeclaredServiceArtifactSet()
+	artifactErr := artifact.revalidateForExecution()
+	afterSetErr := plan.revalidateDeclaredServiceArtifactSet()
+	if err := errors.Join(beforeSetErr, artifactErr, afterSetErr); err != nil {
 		return fmt.Errorf(
-			"revalidate verified service artifact %s: %w",
+			"revalidate declared service artifact set %s: %w",
 			boundary,
 			err,
 		)
+	}
+	return nil
+}
+
+func (plan *uninstallCleanupPlan) revalidateDeclaredServiceArtifactSet() error {
+	if plan == nil {
+		return errors.New("cannot revalidate service artifacts without a cleanup plan")
+	}
+	for _, directory := range plan.directories {
+		if directory == nil || directory.root == nil ||
+			directory.root.spec.name != "service artifact directory" {
+			continue
+		}
+		if err := directory.revalidate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -646,15 +716,18 @@ func runOpenWrtServiceActions(
 		default:
 			return fmt.Errorf("refuse unsupported OpenWrt uninstall action %q", action)
 		}
+		var hookErr error
 		if plan.beforeServiceExec != nil {
 			if err := plan.beforeServiceExec(artifact.entry.path); err != nil {
-				return err
+				hookErr = err
 			}
 		}
-		if err := revalidateServiceArtifactBoundary(
+		postHookErr := revalidateServiceArtifactBoundary(
+			plan,
 			artifact,
 			fmt.Sprintf("after test hook and before OpenWrt %s", action),
-		); err != nil {
+		)
+		if err := errors.Join(hookErr, postHookErr); err != nil {
 			return err
 		}
 		var execErr error
@@ -663,13 +736,12 @@ func runOpenWrtServiceActions(
 		} else {
 			execErr = runCommandFromVerifiedFile(ctx, artifact.file, action)
 		}
-		if execErr != nil {
-			return execErr
-		}
-		if err := revalidateServiceArtifactBoundary(
+		postExecErr := revalidateServiceArtifactBoundary(
+			plan,
 			artifact,
 			fmt.Sprintf("after OpenWrt %s", action),
-		); err != nil {
+		)
+		if err := errors.Join(execErr, postExecErr); err != nil {
 			return err
 		}
 	}
@@ -702,65 +774,74 @@ func runSystemdServiceActions(
 		}
 	}()
 	for index, action := range actions {
+		var hookErr error
 		if plan.beforeServiceExec != nil {
 			if err := plan.beforeServiceExec(artifact.entry.path); err != nil {
-				return err
+				hookErr = err
 			}
 		}
-		if err := revalidateServiceArtifactBoundary(
+		postHookErr := revalidateServiceArtifactBoundary(
+			plan,
 			artifact,
 			fmt.Sprintf("after test hook for systemd %s", action),
-		); err != nil {
+		)
+		if err := errors.Join(hookErr, postHookErr); err != nil {
 			return err
 		}
 		if index == 0 {
 			if err := revalidateServiceArtifactBoundary(
+				plan,
 				artifact,
 				"before systemd manager reload",
 			); err != nil {
 				return err
 			}
-			if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
-				return fmt.Errorf(
+			reloadErr := runCommand(ctx, "systemctl", "daemon-reload")
+			if reloadErr != nil {
+				reloadErr = fmt.Errorf(
 					"synchronize systemd manager with verified owned unit: %w",
-					err,
+					reloadErr,
 				)
 			}
-			if err := revalidateServiceArtifactBoundary(
+			postReloadErr := revalidateServiceArtifactBoundary(
+				plan,
 				artifact,
 				"after systemd manager reload",
-			); err != nil {
+			)
+			if err := errors.Join(reloadErr, postReloadErr); err != nil {
 				return err
 			}
 		}
 		if err := revalidateServiceArtifactBoundary(
+			plan,
 			artifact,
 			"before systemd manager inspection",
 		); err != nil {
 			return err
 		}
-		if err := verifySystemdServiceFragment(ctx, paths); err != nil {
-			return err
-		}
-		if err := revalidateServiceArtifactBoundary(
+		inspectionErr := verifySystemdServiceFragment(ctx, paths)
+		postInspectionErr := revalidateServiceArtifactBoundary(
+			plan,
 			artifact,
 			"after systemd manager inspection",
-		); err != nil {
+		)
+		if err := errors.Join(inspectionErr, postInspectionErr); err != nil {
 			return err
 		}
 		if err := revalidateServiceArtifactBoundary(
+			plan,
 			artifact,
 			fmt.Sprintf("before systemd %s", action),
 		); err != nil {
 			return err
 		}
-		if err := runCommand(ctx, "systemctl", action, "wg-mix-ebpf.service"); err != nil {
-			return err
-		}
-		if err := revalidateServiceArtifactBoundary(
+		actionErr := runCommand(ctx, "systemctl", action, "wg-mix-ebpf.service")
+		postActionErr := revalidateServiceArtifactBoundary(
+			plan,
 			artifact,
 			fmt.Sprintf("after systemd %s", action),
-		); err != nil {
+		)
+		if err := errors.Join(actionErr, postActionErr); err != nil {
 			return err
 		}
 	}
