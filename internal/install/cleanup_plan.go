@@ -198,10 +198,11 @@ func (directory *cleanupDirectoryPlan) close() error {
 }
 
 type uninstallCleanupPlan struct {
-	directories      []*cleanupDirectoryPlan
-	manifest         cleanupManifest
-	beforeExecute    func() error
-	beforeQuarantine func(string) error
+	directories       []*cleanupDirectoryPlan
+	manifest          cleanupManifest
+	beforeExecute     func() error
+	beforeQuarantine  func(string) error
+	beforeServiceExec func(string) error
 }
 
 func (plan *uninstallCleanupPlan) close() error {
@@ -960,6 +961,32 @@ func prepareArtifactPlans(manifest cleanupManifest) ([]*cleanupDirectoryPlan, er
 }
 
 func openDeclaredArtifactParent(path string, defaultPath string) (*managedCleanupDir, bool, error) {
+	spec, err := declaredArtifactPathSpec(path, defaultPath)
+	if err != nil {
+		return nil, false, err
+	}
+	return openExactDeclaredDirectory(spec)
+}
+
+func openOrCreateDeclaredArtifactParent(
+	path string,
+	defaultPath string,
+) (*managedCleanupDir, error) {
+	spec, err := declaredArtifactPathSpec(path, defaultPath)
+	if err != nil {
+		return nil, err
+	}
+	dir, exists, err := openExactDeclaredDirectoryWithOptions(spec, true)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, fmt.Errorf("service artifact directory %s could not be created", path)
+	}
+	return dir, nil
+}
+
+func declaredArtifactPathSpec(path string, defaultPath string) (cleanupPathSpec, error) {
 	path = filepath.Clean(path)
 	tempRoot := filepath.Clean(os.TempDir())
 	physicalTempRoot, _ := filepath.EvalSymlinks(tempRoot)
@@ -974,31 +1001,39 @@ func openDeclaredArtifactParent(path string, defaultPath string) (*managedCleanu
 		spec.systemRoot = filepath.Dir(filepath.Clean(defaultPath))
 		spec.defaultPath = path
 		spec.path = path
-		// Artifact directories are shared and therefore do not use the
-		// project basename rule. Open their parent and final component directly.
-		return openExactDeclaredDirectory(spec)
+		return spec, nil
 	case path != tempRoot && pathContains(tempRoot, path):
-		return openExactDeclaredDirectory(cleanupPathSpec{
+		return cleanupPathSpec{
 			name:        spec.name,
 			path:        path,
 			defaultPath: path,
 			systemRoot:  tempRoot,
-		})
+		}, nil
 	case physicalTempRoot != "." &&
 		path != physicalTempRoot &&
 		pathContains(physicalTempRoot, path):
-		return openExactDeclaredDirectory(cleanupPathSpec{
+		return cleanupPathSpec{
 			name:        spec.name,
 			path:        path,
 			defaultPath: path,
 			systemRoot:  physicalTempRoot,
-		})
+		}, nil
 	default:
-		return nil, false, fmt.Errorf("refuse service artifact directory outside its declared roots: %s", path)
+		return cleanupPathSpec{}, fmt.Errorf(
+			"refuse service artifact directory outside its declared roots: %s",
+			path,
+		)
 	}
 }
 
 func openExactDeclaredDirectory(spec cleanupPathSpec) (*managedCleanupDir, bool, error) {
+	return openExactDeclaredDirectoryWithOptions(spec, false)
+}
+
+func openExactDeclaredDirectoryWithOptions(
+	spec cleanupPathSpec,
+	createFinal bool,
+) (*managedCleanupDir, bool, error) {
 	relative, err := filepath.Rel(spec.systemRoot, spec.path)
 	if err != nil || relative == "." || strings.HasPrefix(relative, "..") {
 		return nil, false, fmt.Errorf("refuse declared directory %s", spec.path)
@@ -1018,6 +1053,19 @@ func openExactDeclaredDirectory(spec cleanupPathSpec) (*managedCleanupDir, bool,
 	components := strings.Split(relative, string(os.PathSeparator))
 	for index, component := range components {
 		child, err := cleanupOpenDirAt(current, component)
+		if cleanupIsNotExist(err) {
+			if createFinal && index == len(components)-1 {
+				if err := cleanupMkdirAt(current, component, 0o755); err != nil {
+					_ = current.close()
+					return nil, false, fmt.Errorf(
+						"create service artifact directory %s: %w",
+						spec.path,
+						err,
+					)
+				}
+				child, err = cleanupOpenDirAt(current, component)
+			}
+		}
 		if cleanupIsNotExist(err) {
 			_ = current.close()
 			return nil, false, nil

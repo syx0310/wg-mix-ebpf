@@ -41,6 +41,10 @@ func cleanupCreateFileAt(*cleanupDirFD, string, uint32) (*os.File, error) {
 	return nil, errSecureCleanupUnsupported
 }
 
+func cleanupMkdirAt(*cleanupDirFD, string, uint32) error {
+	return errSecureCleanupUnsupported
+}
+
 func cleanupRenameNoReplaceAt(*cleanupDirFD, string, string) error {
 	return errSecureCleanupUnsupported
 }

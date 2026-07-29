@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"syscall"
@@ -706,10 +707,12 @@ func TestInstallFreshRecheckRejectsUnmarkedLayoutInjectedAfterPreflight(t *testi
 		lockIdentity, err = os.Stat(filepath.Join(layout.RunDir, "lock"))
 		return err
 	}
+	lifecycleRoot := t.TempDir()
 	ctx := context.WithValue(
-		lockfile.WithLifecyclePathForTest(
+		lockfile.WithLifecyclePathsForTest(
 			t.Context(),
-			filepath.Join(t.TempDir(), "daemon.lease"),
+			filepath.Join(lifecycleRoot, "daemon.lease"),
+			filepath.Join(lifecycleRoot, "maintenance.gate"),
 		),
 		installAfterInspectHookContextKey{},
 		hook,
@@ -1340,6 +1343,259 @@ func TestPrepareCleanupRejectsChangedDeclaredServiceArtifact(t *testing.T) {
 	}
 }
 
+func TestInstallServiceArtifactsRejectSymlinksWithoutChangingVictims(t *testing.T) {
+	tests := []struct {
+		name   string
+		system string
+		path   func(paths) string
+	}{
+		{
+			name:   "systemd-unit",
+			system: "systemd",
+			path: func(layout paths) string {
+				return filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+			},
+		},
+		{
+			name:   "openwrt-init",
+			system: "openwrt",
+			path: func(layout paths) string {
+				return filepath.Join(layout.OpenWrtInitDir, "wg-mix-ebpf")
+			},
+		},
+		{
+			name:   "openwrt-hotplug",
+			system: "openwrt",
+			path: func(layout paths) string {
+				return filepath.Join(layout.OpenWrtHotplugDir, "90-wg-mix-ebpf")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			layout := newCleanupTestLayoutForSystem(
+				t,
+				"install-artifact-symlink-"+test.name,
+				test.system,
+			)
+			setCleanupTestEnvironment(t, layout)
+			artifactPath := test.path(layout)
+			ownedBackup := artifactPath + ".owned-backup"
+			if err := os.Rename(artifactPath, ownedBackup); err != nil {
+				t.Fatal(err)
+			}
+			victimPath := filepath.Join(t.TempDir(), "victim")
+			if err := os.WriteFile(victimPath, []byte("victim\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			victimBefore, err := os.Stat(victimPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(victimPath, artifactPath); err != nil {
+				t.Fatal(err)
+			}
+			commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+			if test.system == "systemd" {
+				installFakeSystemctl(t, commandLog, "")
+			}
+
+			lifecycleRoot := t.TempDir()
+			_, err = Install(
+				lockfile.WithLifecyclePathsForTest(
+					t.Context(),
+					filepath.Join(lifecycleRoot, "daemon.lease"),
+					filepath.Join(lifecycleRoot, "maintenance.gate"),
+				),
+				Options{System: test.system},
+			)
+			if err == nil || !strings.Contains(err.Error(), "service artifact") {
+				t.Fatalf("install error = %v, want symlink artifact rejection", err)
+			}
+			victimAfter, err := os.Stat(victimPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !os.SameFile(victimBefore, victimAfter) {
+				t.Fatal("service artifact install replaced the symlink victim")
+			}
+			if data, err := os.ReadFile(victimPath); err != nil || string(data) != "victim\n" {
+				t.Fatalf("service artifact install changed victim: data=%q err=%v", data, err)
+			}
+			linkInfo, err := os.Lstat(artifactPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if linkInfo.Mode()&os.ModeSymlink == 0 {
+				t.Fatal("service artifact install replaced the foreign symlink")
+			}
+			if _, err := os.Stat(layout.BinaryPath); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("service artifact rejection installed binary first: %v", err)
+			}
+			if test.system == "systemd" {
+				if _, err := os.Stat(commandLog); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("service artifact rejection invoked systemctl: %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestInstallServiceArtifactReusesValidatedInode(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(t, "install-artifact-idempotent", "systemd")
+	setCleanupTestEnvironment(t, layout)
+	unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+	before, err := os.Stat(unitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "")
+
+	lifecycleRoot := t.TempDir()
+	if _, err := Install(
+		lockfile.WithLifecyclePathsForTest(
+			t.Context(),
+			filepath.Join(lifecycleRoot, "daemon.lease"),
+			filepath.Join(lifecycleRoot, "maintenance.gate"),
+		),
+		Options{System: "systemd"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(unitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("reinstall replaced the validated systemd unit inode")
+	}
+	if after.Mode().Perm() != 0o644 {
+		t.Fatalf("reinstalled systemd unit mode = %#o, want 0644", after.Mode().Perm())
+	}
+	if data, err := os.ReadFile(unitPath); err != nil ||
+		string(data) != systemdUnit(layout.ConfigPath, layout.BinaryPath) {
+		t.Fatalf("reinstalled systemd unit changed: data=%q err=%v", data, err)
+	}
+}
+
+func TestInstallCreatesServiceArtifactThroughDeclaredDirectory(t *testing.T) {
+	root := t.TempDir()
+	layout := cleanupTestPaths(root, "install-artifact-fresh")
+	setCleanupTestEnvironment(t, layout)
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "")
+
+	lifecycleRoot := t.TempDir()
+	if _, err := Install(
+		lockfile.WithLifecyclePathsForTest(
+			t.Context(),
+			filepath.Join(lifecycleRoot, "daemon.lease"),
+			filepath.Join(lifecycleRoot, "maintenance.gate"),
+		),
+		Options{System: "systemd"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+	info, err := os.Lstat(unitPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o644 {
+		t.Fatalf("installed systemd unit mode = %v, want regular 0644", info.Mode())
+	}
+	if data, err := os.ReadFile(unitPath); err != nil ||
+		string(data) != systemdUnit(layout.ConfigPath, layout.BinaryPath) {
+		t.Fatalf("installed systemd unit data=%q err=%v", data, err)
+	}
+	entries, err := os.ReadDir(layout.SystemdDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".tmp-") {
+			t.Fatalf("atomic service artifact install left temporary entry %s", entry.Name())
+		}
+	}
+}
+
+func TestRunCommandFromVerifiedFile(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("verified OpenWrt file execution is Linux-specific")
+	}
+	scriptPath := filepath.Join(t.TempDir(), "verified-script")
+	outputPath := filepath.Join(t.TempDir(), "verified-script.log")
+	t.Setenv("WG_MIX_EBPF_TEST_VERIFIED_SCRIPT_LOG", outputPath)
+	script := "#!/bin/sh\nprintf '%s' \"$1\" > \"$WG_MIX_EBPF_TEST_VERIFIED_SCRIPT_LOG\"\n"
+	if err := os.WriteFile(scriptPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(scriptPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	if err := runCommandFromVerifiedFile(t.Context(), file, "verified"); err != nil {
+		t.Fatal(err)
+	}
+	if data, err := os.ReadFile(outputPath); err != nil || string(data) != "verified" {
+		t.Fatalf("verified FD execution output = %q err=%v", data, err)
+	}
+}
+
+func TestOpenWrtServiceActionRejectsFinalPathSwapWithoutExecutingForeign(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(t, "openwrt-final-exec-swap", "openwrt")
+	initPath := filepath.Join(layout.OpenWrtInitDir, "wg-mix-ebpf")
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"openwrt",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+
+	originalPath := initPath + ".owned-original"
+	foreignLog := filepath.Join(t.TempDir(), "foreign-executed")
+	t.Setenv("WG_MIX_EBPF_TEST_FOREIGN_INIT_LOG", foreignLog)
+	hookRan := false
+	plan.beforeServiceExec = func(path string) error {
+		if path != initPath {
+			return fmt.Errorf("unexpected service exec hook path %s", path)
+		}
+		hookRan = true
+		if err := os.Rename(initPath, originalPath); err != nil {
+			return err
+		}
+		return os.WriteFile(
+			initPath,
+			[]byte("#!/bin/sh\nprintf foreign > \"$WG_MIX_EBPF_TEST_FOREIGN_INIT_LOG\"\n"),
+			0o700,
+		)
+	}
+	err = runOpenWrtServiceAction(t.Context(), plan, "stop")
+	if err == nil || !strings.Contains(err.Error(), "service artifact execution") {
+		t.Fatalf("OpenWrt service action error = %v, want final identity rejection", err)
+	}
+	if !hookRan {
+		t.Fatal("OpenWrt final service exec hook did not run")
+	}
+	if _, err := os.Stat(foreignLog); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("foreign OpenWrt script executed: %v", err)
+	}
+	if data, err := os.ReadFile(initPath); err != nil ||
+		!strings.Contains(string(data), "WG_MIX_EBPF_TEST_FOREIGN_INIT_LOG") {
+		t.Fatalf("foreign replacement changed unexpectedly: data=%q err=%v", data, err)
+	}
+	if data, err := os.ReadFile(originalPath); err != nil ||
+		string(data) != openWrtInit(layout.ConfigPath, layout.BinaryPath) {
+		t.Fatalf("held owned init script changed: data=%q err=%v", data, err)
+	}
+}
+
 func TestCleanupPlanRejectsHardLinkedKnownFile(t *testing.T) {
 	layout := newCleanupTestLayout(t, "hardlink")
 	externalPath := filepath.Join(t.TempDir(), "external")
@@ -1538,6 +1794,28 @@ func installFakeNft(t *testing.T, commandLog string) {
 			"exit 1\n"
 	}
 	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func installFakeSystemctl(t *testing.T, commandLog string, failAction string) {
+	t.Helper()
+	fakeBin := filepath.Join(t.TempDir(), "bin")
+	if err := os.Mkdir(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_LOG", commandLog)
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL", failAction)
+	script := `#!/bin/sh
+printf '%s\n' "$*" >> "$WG_MIX_EBPF_TEST_SYSTEMCTL_LOG"
+[ "$1" != "$WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL" ]
+`
+	if err := os.WriteFile(
+		filepath.Join(fakeBin, "systemctl"),
+		[]byte(script),
+		0o755,
+	); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))

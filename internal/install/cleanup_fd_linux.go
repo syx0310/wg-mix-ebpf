@@ -186,6 +186,10 @@ func cleanupCreateFileAt(parent *cleanupDirFD, name string, mode uint32) (*os.Fi
 	return os.NewFile(uintptr(fd), name), nil
 }
 
+func cleanupMkdirAt(parent *cleanupDirFD, name string, mode uint32) error {
+	return unix.Mkdirat(int(parent.file.Fd()), name, mode)
+}
+
 func cleanupRenameNoReplaceAt(parent *cleanupDirFD, oldName string, newName string) error {
 	return unix.Renameat2(
 		int(parent.file.Fd()),

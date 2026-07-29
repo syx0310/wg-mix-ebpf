@@ -166,6 +166,9 @@ func applyInstall(
 			return fmt.Errorf("create %s: %w", dir, err)
 		}
 	}
+	if err := installServiceArtifacts(paths, system); err != nil {
+		return err
+	}
 	if err := installBinary(paths.BinaryPath); err != nil {
 		return err
 	}
@@ -178,12 +181,6 @@ func applyInstall(
 	}
 	switch system {
 	case "systemd":
-		if err := os.MkdirAll(paths.SystemdDir, 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"), []byte(systemdUnit(paths.ConfigPath, paths.BinaryPath)), 0o644); err != nil {
-			return err
-		}
 		if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
 			return err
 		}
@@ -193,20 +190,8 @@ func applyInstall(
 			}
 		}
 	case "openwrt":
-		if err := os.MkdirAll(paths.OpenWrtInitDir, 0o755); err != nil {
-			return err
-		}
-		if err := os.MkdirAll(paths.OpenWrtHotplugDir, 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf"), []byte(openWrtInit(paths.ConfigPath, paths.BinaryPath)), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(paths.OpenWrtHotplugDir, "90-wg-mix-ebpf"), []byte(openWrtHotplug()), 0o755); err != nil {
-			return err
-		}
 		if opts.Enable {
-			if err := runCommand(ctx, filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf"), "enable"); err != nil {
+			if err := runInstalledOpenWrtServiceAction(ctx, paths, "enable"); err != nil {
 				return err
 			}
 		}
@@ -277,18 +262,18 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	}
 	switch system {
 	case "systemd":
-		unitPath := filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service")
-		if exists(unitPath) {
+		_, _, unitExists, err := initialCleanup.serviceArtifactEntry("systemd-unit")
+		if err != nil {
+			return nil, err
+		}
+		if unitExists {
 			if err := runCommand(ctx, "systemctl", "stop", "wg-mix-ebpf.service"); err != nil {
 				return nil, err
 			}
 		}
 	case "openwrt":
-		initPath := filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf")
-		if exists(initPath) {
-			if err := runCommand(ctx, initPath, "stop"); err != nil {
-				return nil, err
-			}
+		if err := runOpenWrtServiceAction(ctx, initialCleanup, "stop"); err != nil {
+			return nil, err
 		}
 	}
 	owner := lockfile.LifecycleOwner{
