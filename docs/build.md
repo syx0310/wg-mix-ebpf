@@ -78,7 +78,9 @@ wg-mix-ebpf version --json
 
 The JSON contains the userspace version, source commit, BPF ABI version, and
 SHA-256 of the exact `wg_mix_tc.o` bytes embedded in that executable. `status`
-includes the same object under `build`.
+reports the querying executable under `client_build`. A running daemon records
+its own immutable startup identity under `daemon.build`, so replacing the
+on-disk CLI cannot make an older daemon appear to run the newer artifact.
 
 `make build` and both `build-linux-*` targets inject `HEAD` only when the
 worktree is clean and Git returns a canonical 40-character lowercase commit.

@@ -722,7 +722,7 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 	case "status", "dump":
 		if cmd == "status" {
 			view := struct {
-				Build         buildinfo.Info `json:"build"`
+				ClientBuild   buildinfo.Info `json:"client_build"`
 				Daemon        *daemon.Status `json:"daemon,omitempty"`
 				Desired       *control.State `json:"desired,omitempty"`
 				Dataplane     any            `json:"dataplane,omitempty"`
@@ -730,7 +730,7 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 				DesiredError  string         `json:"desired_error,omitempty"`
 				DataplaneNote string         `json:"dataplane_note,omitempty"`
 			}{
-				Build: buildinfo.Current(),
+				ClientBuild: buildinfo.Current(),
 			}
 			if status, err := daemon.ReadStatus(*runDir); err == nil {
 				view.Daemon = status
