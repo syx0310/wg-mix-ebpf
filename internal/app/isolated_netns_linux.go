@@ -4,6 +4,7 @@ package app
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -17,6 +18,21 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
+
+type isolatedNetNSRevalidationKey struct{}
+
+type isolatedNetNSTestFileSnapshot struct {
+	path   string
+	device uint64
+	inode  uint64
+	size   int64
+	digest [sha256.Size]byte
+	data   []byte
+}
+
+type isolatedNetNSTestContractSnapshot struct {
+	files map[string]isolatedNetNSTestFileSnapshot
+}
 
 func isolatedNetNSTestContext(
 	ctx context.Context,
@@ -67,11 +83,11 @@ func isolatedNetNSTestContext(
 		return nil, err
 	}
 
-	manifestData, err := readRootOwnedPrivateFile(layout.manifest, 64*1024)
+	manifestFile, err := snapshotRootOwnedPrivateFile(layout.manifest, 64*1024)
 	if err != nil {
 		return nil, err
 	}
-	manifest, err := parseIsolatedNetNSTestManifest(manifestData)
+	manifest, err := parseIsolatedNetNSTestManifest(manifestFile.data)
 	if err != nil {
 		return nil, err
 	}
@@ -84,6 +100,17 @@ func isolatedNetNSTestContext(
 		pinPath,
 	); err != nil {
 		return nil, err
+	}
+	for _, dir := range []string{
+		manifest.values["run_dir_a"],
+		manifest.values["run_dir_b"],
+		manifest.values["state_dir_a"],
+		manifest.values["state_dir_b"],
+		manifest.values["evidence"],
+	} {
+		if err := requireRootOwnedPrivateDirectory(dir); err != nil {
+			return nil, err
+		}
 	}
 	endpoint, err := manifestEndpointForRole(manifest, layout.role)
 	if err != nil {
@@ -125,9 +152,11 @@ func isolatedNetNSTestContext(
 		role string
 	}{
 		{filepath.Join(layout.runBase, isolatedNetNSOwnerMarker), "root"},
-		{filepath.Join(runDir, isolatedNetNSOwnerMarker), "run-" + layout.role},
-		{filepath.Join(stateDir, isolatedNetNSOwnerMarker), "state-" + layout.role},
 		{filepath.Join(filepath.Dir(configPath), isolatedNetNSOwnerMarker), "secrets"},
+		{
+			filepath.Join(manifest.values["evidence"], isolatedNetNSOwnerMarker),
+			"evidence",
+		},
 		{
 			filepath.Join(layout.runBase, "pin-locks", isolatedNetNSOwnerMarker),
 			"pin-locks",
@@ -136,6 +165,31 @@ func isolatedNetNSTestContext(
 			filepath.Join(layout.runBase, "pin-owners", isolatedNetNSOwnerMarker),
 			"pin-owners",
 		},
+	}
+	for _, endpoint := range []string{"a", "b"} {
+		role := manifest.values["role_"+endpoint]
+		markers = append(markers,
+			struct {
+				path string
+				role string
+			}{
+				filepath.Join(
+					manifest.values["run_dir_"+endpoint],
+					isolatedNetNSOwnerMarker,
+				),
+				"run-" + role,
+			},
+			struct {
+				path string
+				role string
+			}{
+				filepath.Join(
+					manifest.values["state_dir_"+endpoint],
+					isolatedNetNSOwnerMarker,
+				),
+				"state-" + role,
+			},
+		)
 	}
 	for _, marker := range markers {
 		data, err := readRootOwnedPrivateFile(marker.path, 16*1024)
@@ -147,8 +201,21 @@ func isolatedNetNSTestContext(
 		}
 	}
 
+	contractSnapshot, err := snapshotIsolatedNetNSTestContract(
+		manifest,
+		layout,
+		manifestFile,
+	)
+	if err != nil {
+		return nil, err
+	}
+	configFile, ok := contractSnapshot.files[configPath]
+	if !ok {
+		return nil, fmt.Errorf("isolated test contract does not snapshot config %s", configPath)
+	}
 	if err := validateIsolatedNetNSTestConfig(
 		configPath,
+		configFile.data,
 		manifest,
 		layout.role,
 		endpoint,
@@ -219,16 +286,52 @@ func isolatedNetNSTestContext(
 		return nil, err
 	}
 
-	return lockfile.WithIsolatedNetNSTestLifecyclePath(ctx, layout.lease), nil
+	if revalidating, _ := ctx.Value(isolatedNetNSRevalidationKey{}).(bool); revalidating {
+		return lockfile.WithIsolatedNetNSTestLifecyclePath(ctx, layout.lease), nil
+	}
+	return lockfile.WithIsolatedNetNSTestLifecycleValidation(
+		ctx,
+		layout.lease,
+		func() error {
+			if err := revalidateIsolatedNetNSTestSnapshot(
+				contractSnapshot,
+				manifest,
+				layout,
+			); err != nil {
+				return err
+			}
+			revalidationContext := context.WithValue(
+				context.Background(),
+				isolatedNetNSRevalidationKey{},
+				true,
+			)
+			if _, err := isolatedNetNSTestContext(
+				revalidationContext,
+				cmd,
+				configPath,
+				runDir,
+				stateDir,
+				pinPath,
+			); err != nil {
+				return err
+			}
+			return revalidateIsolatedNetNSTestSnapshot(
+				contractSnapshot,
+				manifest,
+				layout,
+			)
+		},
+	), nil
 }
 
 func validateIsolatedNetNSTestConfig(
 	configPath string,
+	configData []byte,
 	manifest isolatedNetNSTestManifest,
 	role string,
 	endpoint string,
 ) error {
-	cfg, err := config.LoadFile(configPath)
+	cfg, err := config.Load(configData)
 	if err != nil {
 		return fmt.Errorf("load isolated test config %s: %w", configPath, err)
 	}
@@ -270,6 +373,169 @@ func validateIsolatedNetNSTestConfig(
 		}
 		if err := requireRootOwnedPrivateFile(cipher.SecretFile); err != nil {
 			return err
+		}
+	}
+	return nil
+}
+
+func snapshotIsolatedNetNSTestContract(
+	manifest isolatedNetNSTestManifest,
+	layout isolatedNetNSTestLayout,
+	manifestFile isolatedNetNSTestFileSnapshot,
+) (isolatedNetNSTestContractSnapshot, error) {
+	snapshot := isolatedNetNSTestContractSnapshot{
+		files: map[string]isolatedNetNSTestFileSnapshot{
+			manifestFile.path: manifestFile,
+		},
+	}
+	files := map[string]int64{
+		manifest.values["config_a"]:    1024 * 1024,
+		manifest.values["config_b"]:    1024 * 1024,
+		manifest.values["wg_config_a"]: 256 * 1024,
+		manifest.values["wg_config_b"]: 256 * 1024,
+		filepath.Join(
+			layout.runBase,
+			isolatedNetNSOwnerMarker,
+		): 16 * 1024,
+		filepath.Join(
+			manifest.values["run_dir_a"],
+			isolatedNetNSOwnerMarker,
+		): 16 * 1024,
+		filepath.Join(
+			manifest.values["run_dir_b"],
+			isolatedNetNSOwnerMarker,
+		): 16 * 1024,
+		filepath.Join(
+			manifest.values["state_dir_a"],
+			isolatedNetNSOwnerMarker,
+		): 16 * 1024,
+		filepath.Join(
+			manifest.values["state_dir_b"],
+			isolatedNetNSOwnerMarker,
+		): 16 * 1024,
+		filepath.Join(
+			manifest.values["secrets"],
+			isolatedNetNSOwnerMarker,
+		): 16 * 1024,
+		filepath.Join(
+			manifest.values["evidence"],
+			isolatedNetNSOwnerMarker,
+		): 16 * 1024,
+		filepath.Join(
+			manifest.values["pin_lock_root"],
+			isolatedNetNSOwnerMarker,
+		): 16 * 1024,
+		filepath.Join(
+			manifest.values["pin_owner_root"],
+			isolatedNetNSOwnerMarker,
+		): 16 * 1024,
+	}
+	xorSecret := filepath.Join(manifest.values["secrets"], "xor-password")
+	if _, err := os.Lstat(xorSecret); err == nil {
+		files[xorSecret] = 4 * 1024
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return isolatedNetNSTestContractSnapshot{}, fmt.Errorf(
+			"inspect isolated XOR secret %s: %w",
+			xorSecret,
+			err,
+		)
+	}
+	for path, maximum := range files {
+		file, err := snapshotRootOwnedPrivateFile(path, maximum)
+		if err != nil {
+			return isolatedNetNSTestContractSnapshot{}, err
+		}
+		snapshot.files[path] = file
+	}
+	return snapshot, nil
+}
+
+func snapshotRootOwnedPrivateFile(
+	path string,
+	maximum int64,
+) (isolatedNetNSTestFileSnapshot, error) {
+	file, err := openRootOwnedPrivateFile(path)
+	if err != nil {
+		return isolatedNetNSTestFileSnapshot{}, err
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return isolatedNetNSTestFileSnapshot{}, fmt.Errorf(
+			"inspect isolated test file %s: %w",
+			path,
+			err,
+		)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return isolatedNetNSTestFileSnapshot{}, fmt.Errorf(
+			"inspect isolated test file %s: unsupported stat data",
+			path,
+		)
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maximum+1))
+	if err != nil {
+		return isolatedNetNSTestFileSnapshot{}, fmt.Errorf(
+			"read isolated test file %s: %w",
+			path,
+			err,
+		)
+	}
+	if int64(len(data)) > maximum {
+		return isolatedNetNSTestFileSnapshot{}, fmt.Errorf(
+			"isolated test file exceeds %d bytes: %s",
+			maximum,
+			path,
+		)
+	}
+	return isolatedNetNSTestFileSnapshot{
+		path:   path,
+		device: uint64(stat.Dev),
+		inode:  stat.Ino,
+		size:   int64(len(data)),
+		digest: sha256.Sum256(data),
+		data:   data,
+	}, nil
+}
+
+func revalidateIsolatedNetNSTestSnapshot(
+	expected isolatedNetNSTestContractSnapshot,
+	manifest isolatedNetNSTestManifest,
+	layout isolatedNetNSTestLayout,
+) error {
+	manifestFile, err := snapshotRootOwnedPrivateFile(layout.manifest, 64*1024)
+	if err != nil {
+		return err
+	}
+	current, err := snapshotIsolatedNetNSTestContract(
+		manifest,
+		layout,
+		manifestFile,
+	)
+	if err != nil {
+		return err
+	}
+	if len(current.files) != len(expected.files) {
+		return fmt.Errorf(
+			"isolated test contract file set changed: current=%d expected=%d",
+			len(current.files),
+			len(expected.files),
+		)
+	}
+	for path, expectedFile := range expected.files {
+		currentFile, ok := current.files[path]
+		if !ok {
+			return fmt.Errorf("isolated test contract file disappeared: %s", path)
+		}
+		if currentFile.device != expectedFile.device ||
+			currentFile.inode != expectedFile.inode ||
+			currentFile.size != expectedFile.size ||
+			currentFile.digest != expectedFile.digest {
+			return fmt.Errorf(
+				"isolated test contract file identity or digest changed: %s",
+				path,
+			)
 		}
 	}
 	return nil

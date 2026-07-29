@@ -334,6 +334,26 @@ func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 	if err := validatePrivateBPFFSMountInfo(entries, layout, manifest, 42, &pinMountID); err != nil {
 		t.Fatalf("validate private bpffs: %v", err)
 	}
+	independentFixture := isolatedMountInfoFixture(
+		layout,
+		"0:42",
+		"/",
+		"bpf",
+		"43 21 0:77 / /run/wg-mix-ebpf-tests/independent/bpffs rw,nosuid,nodev,noexec - bpf bpf rw\n",
+	)
+	independentEntries, err := parseMountInfo([]byte(independentFixture))
+	if err != nil {
+		t.Fatalf("parse independent mount fixture: %v", err)
+	}
+	if err := validatePrivateBPFFSMountInfo(
+		independentEntries,
+		layout,
+		manifest,
+		42,
+		&pinMountID,
+	); err != nil {
+		t.Fatalf("independent bpf mount unexpectedly rejected: %v", err)
+	}
 
 	tests := []struct {
 		name         string
@@ -398,6 +418,18 @@ func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 				"/",
 				"bpf",
 				"",
+			),
+			statxMountID: 42,
+			pinMountID:   42,
+		},
+		{
+			name: "other test bind alias",
+			fixture: isolatedMountInfoFixture(
+				layout,
+				"0:42",
+				"/",
+				"bpf",
+				"43 21 0:42 / /run/wg-mix-ebpf-tests/ffffffff/bpffs rw,nosuid,nodev,noexec - bpf bpf rw\n",
 			),
 			statxMountID: 42,
 			pinMountID:   42,
