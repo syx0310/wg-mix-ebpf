@@ -4,8 +4,12 @@ package netnsanchor
 
 import (
 	"errors"
+	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -22,6 +26,11 @@ func (handle *recordingVethLinkHandle) LinkAdd(link netlink.Link) error {
 
 func (handle *recordingVethLinkHandle) Close() {
 	handle.close()
+}
+
+type vethThreadObservation struct {
+	stage string
+	tid   int
 }
 
 func testVethClient(role string) clientFlags {
@@ -253,5 +262,143 @@ func TestCreateVethPairRejectsCurrentNamespaceIdentityMismatch(t *testing.T) {
 	}
 	if handleCalls != 0 {
 		t.Fatalf("identity mismatch opened %d netlink handles", handleCalls)
+	}
+}
+
+func TestCreateVethPairDedicatedThreadTerminatesWithoutChangingCaller(
+	t *testing.T,
+) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+
+	callerTID := unix.Gettid()
+	callerIdentityBefore, err := currentThreadNetworkNamespaceIdentity()
+	if err != nil {
+		t.Fatalf("inspect caller network namespace before wrapper: %v", err)
+	}
+
+	var observations []vethThreadObservation
+	record := func(stage string) {
+		observations = append(observations, vethThreadObservation{
+			stage: stage,
+			tid:   unix.Gettid(),
+		})
+	}
+	setDescriptor := -1
+	setNamespaceType := -1
+	handle := &recordingVethLinkHandle{
+		add: func(netlink.Link) error {
+			record("link-add")
+			return nil
+		},
+		close: func() {},
+	}
+	err = createVethPairOnDedicatedThread(
+		"wma012345670",
+		"wmr01234567a",
+		41,
+		42,
+		callerIdentityBefore,
+		vethPairThreadOperations{
+			setNamespace: func(descriptor int, namespaceType int) error {
+				setDescriptor = descriptor
+				setNamespaceType = namespaceType
+				record("setns")
+				return nil
+			},
+			currentNamespaceIdentity: func() (Identity, error) {
+				record("identity")
+				return callerIdentityBefore, nil
+			},
+			newLinkHandle: func() (vethLinkHandle, error) {
+				record("new-handle")
+				return handle, nil
+			},
+		},
+	)
+	if err != nil {
+		t.Fatalf("run dedicated-thread veth wrapper: %v", err)
+	}
+	if setDescriptor != 41 || setNamespaceType != unix.CLONE_NEWNET {
+		t.Fatalf(
+			"setns arguments = (%d, %#x), want (41, %#x)",
+			setDescriptor,
+			setNamespaceType,
+			unix.CLONE_NEWNET,
+		)
+	}
+	wantStages := []string{"setns", "identity", "new-handle", "link-add"}
+	if len(observations) != len(wantStages) {
+		t.Fatalf(
+			"dedicated-thread observations = %+v, want stages %v",
+			observations,
+			wantStages,
+		)
+	}
+	workerTID := observations[0].tid
+	if workerTID <= 0 || workerTID == callerTID {
+		t.Fatalf(
+			"dedicated worker TID = %d, caller TID = %d",
+			workerTID,
+			callerTID,
+		)
+	}
+	for index, observation := range observations {
+		if observation.stage != wantStages[index] ||
+			observation.tid != workerTID {
+			t.Fatalf(
+				"observation[%d] = %+v, want stage %q on TID %d",
+				index,
+				observation,
+				wantStages[index],
+				workerTID,
+			)
+		}
+	}
+
+	if currentTID := unix.Gettid(); currentTID != callerTID {
+		t.Fatalf(
+			"caller migrated across wrapper: before=%d after=%d",
+			callerTID,
+			currentTID,
+		)
+	}
+	callerIdentityAfter, err := currentThreadNetworkNamespaceIdentity()
+	if err != nil {
+		t.Fatalf("inspect caller network namespace after wrapper: %v", err)
+	}
+	if callerIdentityAfter != callerIdentityBefore {
+		t.Fatalf(
+			"caller network namespace changed: before=%+v after=%+v",
+			callerIdentityBefore,
+			callerIdentityAfter,
+		)
+	}
+	waitForThreadTaskExit(t, workerTID, 2*time.Second)
+}
+
+func waitForThreadTaskExit(t *testing.T, tid int, timeout time.Duration) {
+	t.Helper()
+	if tid <= 0 || timeout <= 0 {
+		t.Fatalf("invalid thread exit wait contract: tid=%d timeout=%s", tid, timeout)
+	}
+	taskPath := "/proc/self/task/" + strconv.Itoa(tid)
+	deadline := time.Now().Add(timeout)
+	for {
+		_, err := os.Stat(taskPath)
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		if err != nil {
+			t.Fatalf("inspect dedicated thread task %s: %v", taskPath, err)
+		}
+		if !time.Now().Before(deadline) {
+			t.Fatalf(
+				"dedicated locked thread %d still exists after %s",
+				tid,
+				timeout,
+			)
+		}
+		runtime.Gosched()
 	}
 }
