@@ -247,6 +247,9 @@ func applyInstall(
 		if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
 			return err
 		}
+		if err := verifySystemdServiceFragment(ctx, paths); err != nil {
+			return err
+		}
 		if opts.Enable {
 			if err := runCommand(ctx, "systemctl", "enable", "wg-mix-ebpf.service"); err != nil {
 				return err

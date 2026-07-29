@@ -1048,6 +1048,41 @@ func TestInstallPublishesOwnershipOnlyAfterServiceCommit(t *testing.T) {
 	}
 }
 
+func TestInstallRejectsForeignSystemdFragmentBeforeEnable(t *testing.T) {
+	root := t.TempDir()
+	layout := cleanupTestPaths(root, "install-fragment-mismatch")
+	setCleanupTestEnvironment(t, layout)
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "")
+	t.Setenv(
+		"WG_MIX_EBPF_TEST_SYSTEMCTL_FRAGMENT",
+		filepath.Join(t.TempDir(), "foreign.service"),
+	)
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(root, "daemon.lease"),
+		filepath.Join(root, "maintenance.gate"),
+	)
+
+	_, err := Install(ctx, Options{System: "systemd", Enable: true})
+	if err == nil || !strings.Contains(err.Error(), "FragmentPath") {
+		t.Fatalf("install error = %v, want FragmentPath rejection", err)
+	}
+	logData, readErr := os.ReadFile(commandLog)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(logData), "enable wg-mix-ebpf.service") {
+		t.Fatalf("fragment mismatch enabled foreign service: %q", logData)
+	}
+	if _, statErr := os.Lstat(cleanupManifestPath(layout)); !errors.Is(
+		statErr,
+		os.ErrNotExist,
+	) {
+		t.Fatalf("fragment mismatch published cleanup ownership: %v", statErr)
+	}
+}
+
 func TestInstallRequiresExplicitAdoptionBeforeWrites(t *testing.T) {
 	layout := newUnmarkedCleanupTestLayout(t, "adoption-required", "unknown")
 	setCleanupTestEnvironment(t, layout)
