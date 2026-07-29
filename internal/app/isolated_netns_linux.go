@@ -128,6 +128,14 @@ func isolatedNetNSTestContext(
 		{filepath.Join(runDir, isolatedNetNSOwnerMarker), "run-" + layout.role},
 		{filepath.Join(stateDir, isolatedNetNSOwnerMarker), "state-" + layout.role},
 		{filepath.Join(filepath.Dir(configPath), isolatedNetNSOwnerMarker), "secrets"},
+		{
+			filepath.Join(layout.runBase, "pin-locks", isolatedNetNSOwnerMarker),
+			"pin-locks",
+		},
+		{
+			filepath.Join(layout.runBase, "pin-owners", isolatedNetNSOwnerMarker),
+			"pin-owners",
+		},
 	}
 	for _, marker := range markers {
 		data, err := readRootOwnedPrivateFile(marker.path, 16*1024)
