@@ -32,6 +32,14 @@ type isolatedNetNSTestFileSnapshot struct {
 
 type isolatedNetNSTestContractSnapshot struct {
 	files map[string]isolatedNetNSTestFileSnapshot
+	bpffs isolatedNetNSTestBPFFSSnapshot
+}
+
+type isolatedNetNSTestBPFFSSnapshot struct {
+	mountInfo mountInfoEntry
+	mountID   uint64
+	device    uint64
+	inode     uint64
 }
 
 func isolatedNetNSTestContext(
@@ -223,103 +231,51 @@ func isolatedNetNSTestContext(
 		return nil, err
 	}
 
-	var fs unix.Statfs_t
-	if err := unix.Statfs(layout.bpffsDir, &fs); err != nil {
-		return nil, fmt.Errorf("inspect isolated bpffs %s: %w", layout.bpffsDir, err)
-	}
-	if uint64(fs.Type) != uint64(unix.BPF_FS_MAGIC) {
-		return nil, fmt.Errorf(
-			"--isolated-netns-test bpffs path is not on bpf filesystem: %s",
-			layout.bpffsDir,
-		)
-	}
-	bpffsInfo, err := os.Lstat(layout.bpffsDir)
-	if err != nil {
-		return nil, fmt.Errorf("inspect isolated bpffs identity: %w", err)
-	}
-	bpffsStat, ok := bpffsInfo.Sys().(*syscall.Stat_t)
-	if !ok {
-		return nil, errors.New("inspect isolated bpffs identity: unsupported stat data")
-	}
-	if err := validateBPFFSParentIdentity(
-		manifest,
-		uint64(bpffsStat.Dev),
-		bpffsStat.Ino,
-	); err != nil {
-		return nil, err
-	}
-	mountInfoData, err := os.ReadFile("/proc/self/mountinfo")
-	if err != nil {
-		return nil, fmt.Errorf("read mountinfo for isolated bpffs: %w", err)
-	}
-	mountInfo, err := parseMountInfo(mountInfoData)
-	if err != nil {
-		return nil, fmt.Errorf("parse mountinfo for isolated bpffs: %w", err)
-	}
-	bpffsMountID, err := statxMountID(layout.bpffsDir)
-	if err != nil {
-		return nil, fmt.Errorf("inspect isolated bpffs mount ID: %w", err)
-	}
-	var pinMountID *uint64
-	pinInfo, err := os.Lstat(pinPath)
-	switch {
-	case err == nil:
-		if !pinInfo.IsDir() || pinInfo.Mode()&os.ModeSymlink != 0 {
-			return nil, fmt.Errorf("isolated pin target is not a real directory: %s", pinPath)
-		}
-		id, statErr := statxMountID(pinPath)
-		if statErr != nil {
-			return nil, fmt.Errorf("inspect isolated pin target mount ID: %w", statErr)
-		}
-		pinMountID = &id
-	case errors.Is(err, os.ErrNotExist):
-	default:
-		return nil, fmt.Errorf("inspect isolated pin target %s: %w", pinPath, err)
-	}
-	if err := validatePrivateBPFFSMountInfo(
-		mountInfo,
-		layout,
-		manifest,
-		bpffsMountID,
-		pinMountID,
-	); err != nil {
-		return nil, err
-	}
-
 	if revalidating, _ := ctx.Value(isolatedNetNSRevalidationKey{}).(bool); revalidating {
 		return lockfile.WithIsolatedNetNSTestLifecyclePath(ctx, layout.lease), nil
 	}
-	return lockfile.WithIsolatedNetNSTestLifecycleValidation(
+	revalidate := func() error {
+		if err := revalidateIsolatedNetNSTestSnapshot(
+			contractSnapshot,
+			manifest,
+			layout,
+		); err != nil {
+			return err
+		}
+		revalidationContext := context.WithValue(
+			context.Background(),
+			isolatedNetNSRevalidationKey{},
+			true,
+		)
+		if _, err := isolatedNetNSTestContext(
+			revalidationContext,
+			cmd,
+			configPath,
+			runDir,
+			stateDir,
+			pinPath,
+		); err != nil {
+			return err
+		}
+		return revalidateIsolatedNetNSTestSnapshot(
+			contractSnapshot,
+			manifest,
+			layout,
+		)
+	}
+	validatedContext := lockfile.WithIsolatedNetNSTestLifecycleValidation(
 		ctx,
 		layout.lease,
-		func() error {
-			if err := revalidateIsolatedNetNSTestSnapshot(
-				contractSnapshot,
-				manifest,
-				layout,
-			); err != nil {
-				return err
-			}
-			revalidationContext := context.WithValue(
-				context.Background(),
-				isolatedNetNSRevalidationKey{},
-				true,
-			)
-			if _, err := isolatedNetNSTestContext(
-				revalidationContext,
-				cmd,
-				configPath,
-				runDir,
-				stateDir,
-				pinPath,
-			); err != nil {
-				return err
-			}
-			return revalidateIsolatedNetNSTestSnapshot(
-				contractSnapshot,
-				manifest,
-				layout,
-			)
+		revalidate,
+	)
+	return withIsolatedOwnershipContract(
+		validatedContext,
+		isolatedOwnershipContract{
+			layout:     layout,
+			manifest:   manifest,
+			endpoint:   endpoint,
+			pinPath:    pinPath,
+			revalidate: revalidate,
 		},
 	), nil
 }
@@ -447,7 +403,167 @@ func snapshotIsolatedNetNSTestContract(
 		}
 		snapshot.files[path] = file
 	}
+	endpoint, err := manifestEndpointForRole(manifest, layout.role)
+	if err != nil {
+		return isolatedNetNSTestContractSnapshot{}, err
+	}
+	bpffs, err := snapshotIsolatedNetNSTestBPFFS(
+		manifest,
+		layout,
+		manifest.values["pin_"+endpoint],
+	)
+	if err != nil {
+		return isolatedNetNSTestContractSnapshot{}, err
+	}
+	snapshot.bpffs = bpffs
 	return snapshot, nil
+}
+
+func snapshotIsolatedNetNSTestBPFFS(
+	manifest isolatedNetNSTestManifest,
+	layout isolatedNetNSTestLayout,
+	pinPath string,
+) (isolatedNetNSTestBPFFSSnapshot, error) {
+	var fs unix.Statfs_t
+	if err := unix.Statfs(layout.bpffsDir, &fs); err != nil {
+		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+			"inspect isolated bpffs %s: %w",
+			layout.bpffsDir,
+			err,
+		)
+	}
+	if uint64(fs.Type) != uint64(unix.BPF_FS_MAGIC) {
+		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+			"--isolated-netns-test bpffs path is not on bpf filesystem: %s",
+			layout.bpffsDir,
+		)
+	}
+	bpffsInfo, err := os.Lstat(layout.bpffsDir)
+	if err != nil {
+		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+			"inspect isolated bpffs identity: %w",
+			err,
+		)
+	}
+	if !bpffsInfo.IsDir() || bpffsInfo.Mode()&os.ModeSymlink != 0 {
+		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+			"isolated bpffs is not a real directory: %s",
+			layout.bpffsDir,
+		)
+	}
+	bpffsStat, ok := bpffsInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return isolatedNetNSTestBPFFSSnapshot{}, errors.New(
+			"inspect isolated bpffs identity: unsupported stat data",
+		)
+	}
+	if bpffsStat.Uid != 0 ||
+		bpffsInfo.Mode().Perm() != 0o700 ||
+		bpffsStat.Nlink == 0 {
+		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+			"isolated bpffs must remain root-owned mode 0700 with a live directory link: %s",
+			layout.bpffsDir,
+		)
+	}
+	device := uint64(bpffsStat.Dev)
+	if err := validateBPFFSParentIdentity(
+		manifest,
+		device,
+		bpffsStat.Ino,
+	); err != nil {
+		return isolatedNetNSTestBPFFSSnapshot{}, err
+	}
+	mountInfoData, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+			"read mountinfo for isolated bpffs: %w",
+			err,
+		)
+	}
+	mountInfo, err := parseMountInfo(mountInfoData)
+	if err != nil {
+		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+			"parse mountinfo for isolated bpffs: %w",
+			err,
+		)
+	}
+	bpffsMountID, err := statxMountID(layout.bpffsDir)
+	if err != nil {
+		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+			"inspect isolated bpffs mount ID: %w",
+			err,
+		)
+	}
+	var pinMountID *uint64
+	pinInfo, err := os.Lstat(pinPath)
+	switch {
+	case err == nil:
+		if !pinInfo.IsDir() || pinInfo.Mode()&os.ModeSymlink != 0 {
+			return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+				"isolated pin target is not a real directory: %s",
+				pinPath,
+			)
+		}
+		id, statErr := statxMountID(pinPath)
+		if statErr != nil {
+			return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+				"inspect isolated pin target mount ID: %w",
+				statErr,
+			)
+		}
+		pinMountID = &id
+	case errors.Is(err, os.ErrNotExist):
+	default:
+		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+			"inspect isolated pin target %s: %w",
+			pinPath,
+			err,
+		)
+	}
+	if err := validatePrivateBPFFSMountInfo(
+		mountInfo,
+		layout,
+		manifest,
+		bpffsMountID,
+		pinMountID,
+	); err != nil {
+		return isolatedNetNSTestBPFFSSnapshot{}, err
+	}
+	var target *mountInfoEntry
+	for index := range mountInfo {
+		if mountInfo[index].mountPath == layout.bpffsDir {
+			target = &mountInfo[index]
+			break
+		}
+	}
+	if target == nil {
+		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+			"isolated bpffs %s disappeared after validation",
+			layout.bpffsDir,
+		)
+	}
+	deviceParts := strings.Split(target.device, ":")
+	major, majorErr := parseCanonicalUint(deviceParts[0], "device major")
+	minor, minorErr := parseCanonicalUint(deviceParts[1], "device minor")
+	if majorErr != nil || minorErr != nil {
+		return isolatedNetNSTestBPFFSSnapshot{}, errors.Join(majorErr, minorErr)
+	}
+	if major != uint64(unix.Major(device)) ||
+		minor != uint64(unix.Minor(device)) {
+		return isolatedNetNSTestBPFFSSnapshot{}, fmt.Errorf(
+			"isolated bpffs mountinfo device=%s does not match stat dev=%d (%d:%d)",
+			target.device,
+			device,
+			unix.Major(device),
+			unix.Minor(device),
+		)
+	}
+	return isolatedNetNSTestBPFFSSnapshot{
+		mountInfo: *target,
+		mountID:   bpffsMountID,
+		device:    device,
+		inode:     bpffsStat.Ino,
+	}, nil
 }
 
 func snapshotRootOwnedPrivateFile(
@@ -537,6 +653,14 @@ func revalidateIsolatedNetNSTestSnapshot(
 				path,
 			)
 		}
+	}
+	if current.bpffs.mountID != expected.bpffs.mountID ||
+		current.bpffs.device != expected.bpffs.device ||
+		current.bpffs.inode != expected.bpffs.inode ||
+		!sameMountInfoEntry(current.bpffs.mountInfo, expected.bpffs.mountInfo) {
+		return fmt.Errorf(
+			"isolated bpffs mount identity, topology, or options changed after validation",
+		)
 	}
 	return nil
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -18,6 +19,7 @@ const (
 	isolatedNetNSOwnerFormat        = "wg-mix-ebpf-test-owner-v1"
 	isolatedNetNSManifestFormat     = "wg-mix-ebpf-test-manifest-v2"
 	isolatedNetNSLifecycleLeaseName = "lifecycle.lease"
+	isolatedPinOwnershipCommand     = "isolated-pin-ownership"
 )
 
 var (
@@ -44,13 +46,16 @@ type isolatedNetNSTestManifest struct {
 }
 
 type mountInfoEntry struct {
-	mountID   uint64
-	parentID  uint64
-	device    string
-	root      string
-	mountPath string
-	fsType    string
-	source    string
+	mountID        uint64
+	parentID       uint64
+	device         string
+	root           string
+	mountPath      string
+	mountOptions   []string
+	optionalFields []string
+	fsType         string
+	source         string
+	superOptions   []string
 }
 
 func isolatedNetNSTestPaths(
@@ -60,9 +65,9 @@ func isolatedNetNSTestPaths(
 	stateDir string,
 	pinPath string,
 ) (isolatedNetNSTestLayout, error) {
-	if cmd != "reload" && cmd != "detach" {
+	if cmd != "reload" && cmd != "detach" && cmd != isolatedPinOwnershipCommand {
 		return isolatedNetNSTestLayout{}, fmt.Errorf(
-			"--isolated-netns-test is only valid for reload and detach",
+			"--isolated-netns-test is only valid for reload, detach, and the isolated ownership bridge",
 		)
 	}
 	for name, path := range map[string]string{
@@ -560,6 +565,14 @@ func parseCanonicalPositiveUint(value string, field string) (uint64, error) {
 	return parsed, nil
 }
 
+func parseCanonicalUint(value string, field string) (uint64, error) {
+	parsed, err := strconv.ParseUint(value, 10, 64)
+	if err != nil || strconv.FormatUint(parsed, 10) != value {
+		return 0, fmt.Errorf("%s must be a canonical decimal integer", field)
+	}
+	return parsed, nil
+}
+
 func parseMountInfo(data []byte) ([]mountInfoEntry, error) {
 	var entries []mountInfoEntry
 	seenIDs := make(map[uint64]struct{})
@@ -576,7 +589,7 @@ func parseMountInfo(data []byte) ([]mountInfoEntry, error) {
 				break
 			}
 		}
-		if separator < 6 || separator+3 >= len(fields) {
+		if separator < 6 || separator+4 != len(fields) {
 			return nil, fmt.Errorf("mountinfo line %d has an invalid field layout", lineNumber)
 		}
 		mountID, err := parseCanonicalPositiveUint(fields[0], "mount id")
@@ -591,6 +604,16 @@ func parseMountInfo(data []byte) ([]mountInfoEntry, error) {
 			return nil, fmt.Errorf("mountinfo line %d duplicates mount id %d", lineNumber, mountID)
 		}
 		seenIDs[mountID] = struct{}{}
+		deviceParts := strings.Split(fields[2], ":")
+		if len(deviceParts) != 2 {
+			return nil, fmt.Errorf("mountinfo line %d has an invalid device number", lineNumber)
+		}
+		if _, err := parseCanonicalUint(deviceParts[0], "device major"); err != nil {
+			return nil, fmt.Errorf("mountinfo line %d: %w", lineNumber, err)
+		}
+		if _, err := parseCanonicalUint(deviceParts[1], "device minor"); err != nil {
+			return nil, fmt.Errorf("mountinfo line %d: %w", lineNumber, err)
+		}
 		root, err := unescapeMountInfoField(fields[3])
 		if err != nil {
 			return nil, fmt.Errorf("mountinfo line %d root: %w", lineNumber, err)
@@ -603,14 +626,38 @@ func parseMountInfo(data []byte) ([]mountInfoEntry, error) {
 		if err != nil {
 			return nil, fmt.Errorf("mountinfo line %d source: %w", lineNumber, err)
 		}
+		mountOptions, err := parseMountInfoOptionList(
+			fields[5],
+			fmt.Sprintf("mountinfo line %d mount options", lineNumber),
+		)
+		if err != nil {
+			return nil, err
+		}
+		optionalFields, err := parseMountInfoOptionalFields(
+			fields[6:separator],
+			lineNumber,
+		)
+		if err != nil {
+			return nil, err
+		}
+		superOptions, err := parseMountInfoOptionList(
+			fields[separator+3],
+			fmt.Sprintf("mountinfo line %d super options", lineNumber),
+		)
+		if err != nil {
+			return nil, err
+		}
 		entries = append(entries, mountInfoEntry{
-			mountID:   mountID,
-			parentID:  parentID,
-			device:    fields[2],
-			root:      root,
-			mountPath: mountPath,
-			fsType:    fields[separator+1],
-			source:    source,
+			mountID:        mountID,
+			parentID:       parentID,
+			device:         fields[2],
+			root:           root,
+			mountPath:      mountPath,
+			mountOptions:   mountOptions,
+			optionalFields: optionalFields,
+			fsType:         fields[separator+1],
+			source:         source,
+			superOptions:   superOptions,
 		})
 	}
 	if err := scanner.Err(); err != nil {
@@ -620,6 +667,93 @@ func parseMountInfo(data []byte) ([]mountInfoEntry, error) {
 		return nil, fmt.Errorf("mountinfo is empty")
 	}
 	return entries, nil
+}
+
+func parseMountInfoOptionList(raw string, field string) ([]string, error) {
+	if raw == "" {
+		return nil, fmt.Errorf("%s is empty", field)
+	}
+	options := strings.Split(raw, ",")
+	seen := make(map[string]struct{}, len(options))
+	for _, option := range options {
+		if option == "" || strings.ContainsAny(option, " \t\r\n\x00") {
+			return nil, fmt.Errorf("%s contains an invalid option %q", field, option)
+		}
+		if _, duplicate := seen[option]; duplicate {
+			return nil, fmt.Errorf("%s duplicates option %q", field, option)
+		}
+		seen[option] = struct{}{}
+	}
+	sort.Strings(options)
+	return options, nil
+}
+
+func parseMountInfoOptionalFields(fields []string, lineNumber int) ([]string, error) {
+	seen := make(map[string]struct{}, len(fields))
+	seenKinds := make(map[string]struct{}, 4)
+	for _, field := range fields {
+		if field == "" || strings.ContainsAny(field, " \t\r\n\x00") {
+			return nil, fmt.Errorf(
+				"mountinfo line %d contains an invalid optional field %q",
+				lineNumber,
+				field,
+			)
+		}
+		if _, duplicate := seen[field]; duplicate {
+			return nil, fmt.Errorf(
+				"mountinfo line %d duplicates optional field %q",
+				lineNumber,
+				field,
+			)
+		}
+		seen[field] = struct{}{}
+		kind := ""
+		switch {
+		case field == "unbindable":
+			kind = "unbindable"
+		case strings.HasPrefix(field, "shared:"):
+			kind = "shared"
+			if _, err := parseCanonicalPositiveUint(
+				strings.TrimPrefix(field, "shared:"),
+				"shared peer group",
+			); err != nil {
+				return nil, fmt.Errorf("mountinfo line %d: %w", lineNumber, err)
+			}
+		case strings.HasPrefix(field, "master:"):
+			kind = "master"
+			if _, err := parseCanonicalPositiveUint(
+				strings.TrimPrefix(field, "master:"),
+				"master peer group",
+			); err != nil {
+				return nil, fmt.Errorf("mountinfo line %d: %w", lineNumber, err)
+			}
+		case strings.HasPrefix(field, "propagate_from:"):
+			kind = "propagate_from"
+			if _, err := parseCanonicalPositiveUint(
+				strings.TrimPrefix(field, "propagate_from:"),
+				"propagation source peer group",
+			); err != nil {
+				return nil, fmt.Errorf("mountinfo line %d: %w", lineNumber, err)
+			}
+		default:
+			// The kernel may add optional fields in future mountinfo versions.
+			// Preserve them during parsing so an unrelated mount does not make
+			// the whole namespace unreadable. The isolated target validator
+			// rejects every optional field, including unknown ones.
+		}
+		if kind != "" {
+			if _, duplicate := seenKinds[kind]; duplicate {
+				return nil, fmt.Errorf(
+					"mountinfo line %d repeats optional field kind %q",
+					lineNumber,
+					kind,
+				)
+			}
+			seenKinds[kind] = struct{}{}
+		}
+	}
+	sort.Strings(fields)
+	return fields, nil
 }
 
 func unescapeMountInfoField(value string) (string, error) {
@@ -658,9 +792,11 @@ func validatePrivateBPFFSMountInfo(
 	pinMountID *uint64,
 ) error {
 	var target *mountInfoEntry
+	byMountID := make(map[uint64]*mountInfoEntry, len(entries))
 	var otherBPFFSMounts []*mountInfoEntry
 	for index := range entries {
 		entry := &entries[index]
+		byMountID[entry.mountID] = entry
 		if entry.mountPath == layout.bpffsDir {
 			if target != nil {
 				return fmt.Errorf("multiple mounts are stacked on isolated bpffs %s", layout.bpffsDir)
@@ -680,12 +816,39 @@ func validatePrivateBPFFSMountInfo(
 	if target == nil {
 		return fmt.Errorf("isolated bpffs %s is not an exact mount point", layout.bpffsDir)
 	}
+	parent := byMountID[target.parentID]
+	if parent == nil {
+		return fmt.Errorf(
+			"isolated bpffs parent mount ID %d is absent from mountinfo",
+			target.parentID,
+		)
+	}
+	if parent.mountPath != "/" &&
+		!strings.HasPrefix(
+			layout.bpffsDir,
+			parent.mountPath+string(filepath.Separator),
+		) {
+		return fmt.Errorf(
+			"isolated bpffs parent mount %s is not an ancestor of %s",
+			parent.mountPath,
+			layout.bpffsDir,
+		)
+	}
+	if parent.fsType == "bpf" {
+		return fmt.Errorf(
+			"isolated bpffs is nested below bpf mount %s",
+			parent.mountPath,
+		)
+	}
 	if target.fsType != "bpf" || target.root != "/" {
 		return fmt.Errorf(
 			"isolated bpffs must be a bpf mount rooted at /: type=%q root=%q",
 			target.fsType,
 			target.root,
 		)
+	}
+	if err := validatePrivateBPFFSMountOptions(*target); err != nil {
+		return err
 	}
 	if target.source != "bpf" || manifest.values["bpffs_source"] != "bpf" {
 		return fmt.Errorf(
@@ -718,8 +881,7 @@ func validatePrivateBPFFSMountInfo(
 	}
 	for _, otherMount := range otherBPFFSMounts {
 		if target.mountID == otherMount.mountID ||
-			(target.device == otherMount.device &&
-				target.root == otherMount.root) {
+			target.device == otherMount.device {
 			return fmt.Errorf(
 				"isolated bpffs is a bind or alias of another bpf mount %s",
 				otherMount.mountPath,
@@ -727,4 +889,104 @@ func validatePrivateBPFFSMountInfo(
 		}
 	}
 	return nil
+}
+
+func validatePrivateBPFFSMountOptions(entry mountInfoEntry) error {
+	if len(entry.optionalFields) != 0 {
+		return fmt.Errorf(
+			"isolated bpffs has shared, slave, unbindable, or unknown propagation fields: %s",
+			strings.Join(entry.optionalFields, ","),
+		)
+	}
+	mountOptions := make(map[string]struct{}, len(entry.mountOptions))
+	for _, option := range entry.mountOptions {
+		mountOptions[option] = struct{}{}
+	}
+	required := []string{"rw", "nosuid", "nodev", "noexec"}
+	for _, option := range required {
+		if _, ok := mountOptions[option]; !ok {
+			return fmt.Errorf("isolated bpffs mount options are missing %s", option)
+		}
+	}
+	for _, unsafe := range []string{"ro", "suid", "dev", "exec"} {
+		if _, ok := mountOptions[unsafe]; ok {
+			return fmt.Errorf("isolated bpffs mount options contain conflicting %s", unsafe)
+		}
+	}
+	atimePolicies := 0
+	for _, option := range []string{"relatime", "noatime", "strictatime"} {
+		if _, ok := mountOptions[option]; ok {
+			atimePolicies++
+		}
+	}
+	if atimePolicies != 1 {
+		return fmt.Errorf(
+			"isolated bpffs must have exactly one atime policy: relatime, noatime, or strictatime",
+		)
+	}
+	allowedMountOptions := map[string]struct{}{
+		"rw":          {},
+		"nosuid":      {},
+		"nodev":       {},
+		"noexec":      {},
+		"relatime":    {},
+		"noatime":     {},
+		"strictatime": {},
+	}
+	for _, option := range entry.mountOptions {
+		if _, ok := allowedMountOptions[option]; !ok {
+			return fmt.Errorf("isolated bpffs has unsupported mount option %q", option)
+		}
+	}
+
+	if len(entry.superOptions) == 0 {
+		return fmt.Errorf("isolated bpffs super options are empty")
+	}
+	seenRW := false
+	seenMode := false
+	for _, option := range entry.superOptions {
+		switch {
+		case option == "rw":
+			seenRW = true
+		case option == "ro":
+			return fmt.Errorf("isolated bpffs super options are read-only")
+		case strings.HasPrefix(option, "mode="):
+			// The directory metadata is independently required to be 0700.
+			// Kernels may omit the bpf mode from mountinfo or render it as
+			// either 700 or 0700; no other filesystem-specific option is
+			// accepted.
+			if seenMode {
+				return fmt.Errorf("isolated bpffs super options repeat mode")
+			}
+			mode := strings.TrimPrefix(option, "mode=")
+			parsed, err := strconv.ParseUint(mode, 8, 32)
+			if err != nil || parsed != 0o700 ||
+				(mode != "700" && mode != "0700") {
+				return fmt.Errorf(
+					"isolated bpffs super option mode=%q must be 700",
+					mode,
+				)
+			}
+			seenMode = true
+		default:
+			return fmt.Errorf("isolated bpffs has unsupported super option %q", option)
+		}
+	}
+	if !seenRW {
+		return fmt.Errorf("isolated bpffs super options are missing rw")
+	}
+	return nil
+}
+
+func sameMountInfoEntry(left mountInfoEntry, right mountInfoEntry) bool {
+	return left.mountID == right.mountID &&
+		left.parentID == right.parentID &&
+		left.device == right.device &&
+		left.root == right.root &&
+		left.mountPath == right.mountPath &&
+		strings.Join(left.mountOptions, ",") == strings.Join(right.mountOptions, ",") &&
+		strings.Join(left.optionalFields, ",") == strings.Join(right.optionalFields, ",") &&
+		left.fsType == right.fsType &&
+		left.source == right.source &&
+		strings.Join(left.superOptions, ",") == strings.Join(right.superOptions, ",")
 }

@@ -339,7 +339,7 @@ func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 		"0:42",
 		"/",
 		"bpf",
-		"43 21 0:77 / /run/wg-mix-ebpf-tests/independent/bpffs rw,nosuid,nodev,noexec - bpf bpf rw\n",
+		"43 21 0:77 / /run/wg-mix-ebpf-tests/independent/bpffs rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n",
 	)
 	independentEntries, err := parseMountInfo([]byte(independentFixture))
 	if err != nil {
@@ -394,7 +394,7 @@ func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 				"/",
 				"bpf",
 				fmt.Sprintf(
-					"43 42 0:43 / %s rw,nosuid,nodev,noexec - tmpfs nested rw\n",
+					"43 42 0:43 / %s rw,nosuid,nodev,noexec,relatime - tmpfs nested rw\n",
 					filepath.Join(layout.bpffsDir, "wg-mix-ebpf-a"),
 				),
 			),
@@ -404,7 +404,7 @@ func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 		{
 			name: "stacked target mount",
 			fixture: validFixture + fmt.Sprintf(
-				"44 21 0:44 / %s rw,nosuid,nodev,noexec - bpf other rw\n",
+				"44 21 0:44 / %s rw,nosuid,nodev,noexec,relatime - bpf other rw\n",
 				layout.bpffsDir,
 			),
 			statxMountID: 42,
@@ -429,7 +429,7 @@ func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 				"0:42",
 				"/",
 				"bpf",
-				"43 21 0:42 / /run/wg-mix-ebpf-tests/ffffffff/bpffs rw,nosuid,nodev,noexec - bpf bpf rw\n",
+				"43 21 0:42 / /run/wg-mix-ebpf-tests/ffffffff/bpffs rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n",
 			),
 			statxMountID: 42,
 			pinMountID:   42,
@@ -470,6 +470,319 @@ func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 				t.Fatal("private bpffs validation unexpectedly succeeded")
 			}
 		})
+	}
+}
+
+func TestPrivateBPFFSMountOptionsAreOrderIndependentAndFailClosed(t *testing.T) {
+	layout, _, _, _, _ := isolatedFixtureLayout(t, "a")
+	manifest, err := parseIsolatedNetNSTestManifest(isolatedFixtureManifest(layout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	validOptions := []string{
+		"rw,nosuid,nodev,noexec,relatime",
+		"noexec,nodev,strictatime,nosuid,rw",
+		"noatime,rw,noexec,nosuid,nodev",
+	}
+	for _, options := range validOptions {
+		t.Run(options, func(t *testing.T) {
+			fixture := isolatedMountInfoFixtureWithTargetOptions(
+				layout,
+				options,
+				"",
+				"mode=700,rw",
+			)
+			entries, err := parseMountInfo([]byte(fixture))
+			if err != nil {
+				t.Fatalf("parse mountinfo: %v", err)
+			}
+			if err := validatePrivateBPFFSMountInfo(
+				entries,
+				layout,
+				manifest,
+				42,
+				nil,
+			); err != nil {
+				t.Fatalf("validate reordered safe options: %v", err)
+			}
+		})
+	}
+	for _, superOptions := range []string{
+		"rw",
+		"rw,mode=700",
+		"mode=700,rw",
+		"rw,mode=0700",
+	} {
+		t.Run("super "+superOptions, func(t *testing.T) {
+			fixture := isolatedMountInfoFixtureWithTargetOptions(
+				layout,
+				"rw,nosuid,nodev,noexec,relatime",
+				"",
+				superOptions,
+			)
+			entries, err := parseMountInfo([]byte(fixture))
+			if err != nil {
+				t.Fatalf("parse safe super options: %v", err)
+			}
+			if err := validatePrivateBPFFSMountInfo(
+				entries,
+				layout,
+				manifest,
+				42,
+				nil,
+			); err != nil {
+				t.Fatalf("validate safe super options: %v", err)
+			}
+		})
+	}
+
+	invalidOptions := map[string]string{
+		"missing rw":        "nosuid,nodev,noexec,relatime",
+		"missing nosuid":    "rw,nodev,noexec,relatime",
+		"missing nodev":     "rw,nosuid,noexec,relatime",
+		"missing noexec":    "rw,nosuid,nodev,relatime",
+		"missing atime":     "rw,nosuid,nodev,noexec",
+		"conflicting rw":    "rw,ro,nosuid,nodev,noexec,relatime",
+		"conflicting exec":  "rw,nosuid,nodev,noexec,exec,relatime",
+		"multiple atime":    "rw,nosuid,nodev,noexec,relatime,noatime",
+		"unknown mount opt": "rw,nosuid,nodev,noexec,relatime,lazytime",
+	}
+	for name, options := range invalidOptions {
+		t.Run(name, func(t *testing.T) {
+			fixture := isolatedMountInfoFixtureWithTargetOptions(
+				layout,
+				options,
+				"",
+				"rw",
+			)
+			entries, err := parseMountInfo([]byte(fixture))
+			if err != nil {
+				t.Fatalf("parse invalid semantic fixture: %v", err)
+			}
+			if err := validatePrivateBPFFSMountInfo(
+				entries,
+				layout,
+				manifest,
+				42,
+				nil,
+			); err == nil {
+				t.Fatal("unsafe or ambiguous mount options unexpectedly accepted")
+			}
+		})
+	}
+
+	invalidSuperOptions := map[string]string{
+		"read only":        "ro",
+		"missing rw":       "mode=700",
+		"unsafe mode":      "rw,mode=755",
+		"noncanonical":     "rw,mode=00700",
+		"unknown":          "rw,uid=0",
+		"duplicate mode":   "rw,mode=700,mode=0700",
+		"conflicting mode": "rw,mode=700,mode=755",
+	}
+	for name, options := range invalidSuperOptions {
+		t.Run("super "+name, func(t *testing.T) {
+			fixture := isolatedMountInfoFixtureWithTargetOptions(
+				layout,
+				"rw,nosuid,nodev,noexec,relatime",
+				"",
+				options,
+			)
+			entries, err := parseMountInfo([]byte(fixture))
+			if err != nil {
+				t.Fatalf("parse invalid super option fixture: %v", err)
+			}
+			if err := validatePrivateBPFFSMountInfo(
+				entries,
+				layout,
+				manifest,
+				42,
+				nil,
+			); err == nil {
+				t.Fatal("unsafe or ambiguous super options unexpectedly accepted")
+			}
+		})
+	}
+}
+
+func TestPrivateBPFFSMountRejectsPropagationAndAliasForms(t *testing.T) {
+	layout, _, _, _, _ := isolatedFixtureLayout(t, "a")
+	manifest, err := parseIsolatedNetNSTestManifest(isolatedFixtureManifest(layout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	optionalFields := []string{
+		"shared:7",
+		"master:8",
+		"propagate_from:9",
+		"unbindable",
+		"future_optional:10",
+		"shared:7 master:8",
+	}
+	for _, optional := range optionalFields {
+		t.Run(optional, func(t *testing.T) {
+			fixture := isolatedMountInfoFixtureWithTargetOptions(
+				layout,
+				"rw,nosuid,nodev,noexec,relatime",
+				optional,
+				"rw",
+			)
+			entries, err := parseMountInfo([]byte(fixture))
+			if err != nil {
+				t.Fatalf("parse propagation fixture: %v", err)
+			}
+			if err := validatePrivateBPFFSMountInfo(
+				entries,
+				layout,
+				manifest,
+				42,
+				nil,
+			); err == nil {
+				t.Fatal("propagating or unknown target mount unexpectedly accepted")
+			}
+		})
+	}
+
+	bindSubtree := isolatedMountInfoFixture(
+		layout,
+		"0:42",
+		"/",
+		"bpf",
+		"43 21 0:42 /subtree /run/wg-mix-ebpf-tests/ffffffff/bpffs rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n",
+	)
+	entries, err := parseMountInfo([]byte(bindSubtree))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateBPFFSMountInfo(
+		entries,
+		layout,
+		manifest,
+		42,
+		nil,
+	); err == nil {
+		t.Fatal("same-superblock bind subtree unexpectedly accepted")
+	}
+
+	topologyFixtures := map[string]string{
+		"missing parent": strings.Replace(
+			isolatedMountInfoFixture(layout, "0:42", "/", "bpf", ""),
+			"42 21 0:42",
+			"42 99 0:42",
+			1,
+		),
+		"bpf parent": fmt.Sprintf(
+			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+				"41 21 0:41 / %s rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n"+
+				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n",
+			layout.runBase,
+			layout.bpffsDir,
+		),
+		"unrelated parent": fmt.Sprintf(
+			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+				"41 21 8:2 / /unrelated rw,relatime - ext4 /dev/other rw\n"+
+				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n",
+			layout.bpffsDir,
+		),
+	}
+	for name, fixture := range topologyFixtures {
+		t.Run(name, func(t *testing.T) {
+			entries, err := parseMountInfo([]byte(fixture))
+			if err != nil {
+				t.Fatalf("parse topology fixture: %v", err)
+			}
+			if err := validatePrivateBPFFSMountInfo(
+				entries,
+				layout,
+				manifest,
+				42,
+				nil,
+			); err == nil {
+				t.Fatal("invalid bpffs parent topology unexpectedly accepted")
+			}
+		})
+	}
+}
+
+func TestMountInfoEscapesAndStructuralConflicts(t *testing.T) {
+	escaped, err := parseMountInfo([]byte(
+		"42 21 0:42 /root\\040dir /target\\040dir rw,nosuid,nodev,noexec,relatime - bpf source\\134name rw\n",
+	))
+	if err != nil {
+		t.Fatalf("parse escaped mountinfo: %v", err)
+	}
+	if len(escaped) != 1 ||
+		escaped[0].root != "/root dir" ||
+		escaped[0].mountPath != "/target dir" ||
+		escaped[0].source != "source\\name" {
+		t.Fatalf("unexpected escaped mountinfo: %#v", escaped)
+	}
+
+	invalid := []string{
+		"42 21 0:42 / /target rw,rw - bpf bpf rw\n",
+		"42 21 0:42 / /target rw shared:7 shared:7 - bpf bpf rw\n",
+		"42 21 0:42 / /target rw shared:7 shared:8 - bpf bpf rw\n",
+		"42 21 00:42 / /target rw - bpf bpf rw\n",
+		"42 21 0:042 / /target rw - bpf bpf rw\n",
+		"42 21 0:42 / /target rw - bpf bpf rw unexpected\n",
+		"42 21 0:42 / /target rw - bpf bpf\n",
+	}
+	for _, fixture := range invalid {
+		if _, err := parseMountInfo([]byte(fixture)); err == nil {
+			t.Fatalf("conflicting mountinfo unexpectedly accepted: %q", fixture)
+		}
+	}
+}
+
+func TestPrivateBPFFSMountSnapshotDetectsRemountOptionDrift(t *testing.T) {
+	layout, _, _, _, _ := isolatedFixtureLayout(t, "a")
+	before, err := parseMountInfo([]byte(
+		isolatedMountInfoFixture(layout, "0:42", "/", "bpf", ""),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reorderedFixture := isolatedMountInfoFixtureWithTargetOptions(
+		layout,
+		"noexec,relatime,nodev,rw,nosuid",
+		"",
+		"rw",
+	)
+	reordered, err := parseMountInfo([]byte(reorderedFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterFixture := isolatedMountInfoFixtureWithTargetOptions(
+		layout,
+		"rw,nosuid,nodev,noexec,noatime",
+		"",
+		"rw",
+	)
+	after, err := parseMountInfo([]byte(afterFixture))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var beforeTarget, reorderedTarget, afterTarget mountInfoEntry
+	for _, entry := range before {
+		if entry.mountPath == layout.bpffsDir {
+			beforeTarget = entry
+		}
+	}
+	for _, entry := range reordered {
+		if entry.mountPath == layout.bpffsDir {
+			reorderedTarget = entry
+		}
+	}
+	for _, entry := range after {
+		if entry.mountPath == layout.bpffsDir {
+			afterTarget = entry
+		}
+	}
+	if !sameMountInfoEntry(beforeTarget, reorderedTarget) {
+		t.Fatal("equivalent reordered mount options changed the normalized snapshot")
+	}
+	if sameMountInfoEntry(beforeTarget, afterTarget) {
+		t.Fatal("remount option drift was not detected")
 	}
 }
 
@@ -622,12 +935,32 @@ func isolatedMountInfoFixture(
 ) string {
 	return fmt.Sprintf(
 		"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
-			"30 21 0:30 / /sys/fs/bpf rw,nosuid,nodev,noexec - bpf bpf rw\n"+
-			"42 21 %s %s %s rw,nosuid,nodev,noexec - bpf %s rw\n%s",
+			"30 21 0:30 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n"+
+			"42 21 %s %s %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n%s",
 		device,
 		root,
 		layout.bpffsDir,
 		source,
 		extra,
+	)
+}
+
+func isolatedMountInfoFixtureWithTargetOptions(
+	layout isolatedNetNSTestLayout,
+	mountOptions string,
+	optionalFields string,
+	superOptions string,
+) string {
+	if optionalFields != "" {
+		optionalFields = " " + optionalFields
+	}
+	return fmt.Sprintf(
+		"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+			"30 21 0:30 / /sys/fs/bpf rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n"+
+			"42 21 0:42 / %s %s%s - bpf bpf %s\n",
+		layout.bpffsDir,
+		mountOptions,
+		optionalFields,
+		superOptions,
 	)
 }
