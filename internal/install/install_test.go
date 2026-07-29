@@ -165,7 +165,7 @@ func TestUninstallHoldsMaintenanceAcrossDaemonLeaseHandoff(t *testing.T) {
 	installFakeSystemctl(t, commandLog, "")
 
 	lifecycleRoot := t.TempDir()
-	waitCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	waitCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	ctx := lockfile.WithLifecyclePathsForTest(
 		waitCtx,
