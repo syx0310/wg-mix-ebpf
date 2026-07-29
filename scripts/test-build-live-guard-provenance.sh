@@ -289,7 +289,6 @@ run_tmpdir_gate() {
 }
 
 set_fixture_parent_selection() {
-  [[ "$#" -eq 0 ]] || return 1
   if [[ "${TMPDIR+x}" == "x" ]]; then
     fixture_parent_policy="controlled"
     fixture_parent_candidate="${TMPDIR}"
