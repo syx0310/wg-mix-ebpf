@@ -89,9 +89,10 @@ func installServiceArtifacts(
 }
 
 func installServiceArtifact(spec serviceArtifactInstallSpec) (retErr error) {
-	parent, err := openOrCreateDeclaredArtifactParent(
+	parent, _, err := openOrCreateDeclaredArtifactParent(
 		filepath.Dir(spec.artifact.Path),
 		spec.defaultParent,
+		nil,
 	)
 	if err != nil {
 		return err
@@ -705,9 +706,21 @@ func runInstalledSystemdServiceCommit(
 	if err := revalidateMetadata("before enable"); err != nil {
 		return err
 	}
+	transactionHooks := systemdEnableLinkTransactionHooks{}
+	if hook, ok := ctx.Value(
+		installBeforeSystemdEnableParentCreateHookContextKey{},
+	).(func(string) error); ok && hook != nil {
+		transactionHooks.beforeParentCreate = hook
+	}
+	if hook, ok := ctx.Value(
+		installAfterSystemdEnableRollbackQuarantineHookContextKey{},
+	).(func(string, string) error); ok && hook != nil {
+		transactionHooks.afterRollbackQuarantine = hook
+	}
 	transaction, err := beginSystemdEnableLinkTransaction(
 		paths,
 		allowExistingEnableLink,
+		transactionHooks,
 	)
 	if err != nil {
 		return err

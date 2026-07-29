@@ -51,6 +51,8 @@ type Plan struct {
 type installAfterInspectHookContextKey struct{}
 type installAfterLifecycleHookContextKey struct{}
 type installAfterSystemdEnableLinkHookContextKey struct{}
+type installBeforeSystemdEnableParentCreateHookContextKey struct{}
+type installAfterSystemdEnableRollbackQuarantineHookContextKey struct{}
 
 func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if err := ctx.Err(); err != nil {

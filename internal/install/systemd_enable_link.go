@@ -8,17 +8,24 @@ import (
 )
 
 const (
-	systemdEnableLinkKind   = "systemd-enable-link"
-	systemdEnableLinkTarget = "../wg-mix-ebpf.service"
+	systemdEnableLinkKind          = "systemd-enable-link"
+	systemdEnableLinkTarget        = "../wg-mix-ebpf.service"
+	systemdEnableLinkDefaultParent = "/etc/systemd/system/multi-user.target.wants"
 )
 
+type systemdEnableLinkTransactionHooks struct {
+	beforeParentCreate      func(string) error
+	afterRollbackQuarantine func(string, string) error
+}
+
 type systemdEnableLinkTransaction struct {
-	artifact      cleanupManifestArtifact
-	parent        *managedCleanupDir
-	entry         *cleanupEntryPlan
-	created       bool
-	parentCreated bool
-	committed     bool
+	artifact                cleanupManifestArtifact
+	parent                  *managedCleanupDir
+	entry                   *cleanupEntryPlan
+	afterRollbackQuarantine func(string, string) error
+	created                 bool
+	parentCreated           bool
+	committed               bool
 }
 
 func declaredSystemdEnableLink(paths paths) (cleanupManifestArtifact, error) {
@@ -46,34 +53,25 @@ func declaredSystemdEnableLink(paths paths) (cleanupManifestArtifact, error) {
 func beginSystemdEnableLinkTransaction(
 	paths paths,
 	allowExisting bool,
+	hooks systemdEnableLinkTransactionHooks,
 ) (_ *systemdEnableLinkTransaction, retErr error) {
 	artifact, err := declaredSystemdEnableLink(paths)
 	if err != nil {
 		return nil, err
 	}
-	defaultParent := "/etc/systemd/system/multi-user.target.wants"
-	parent, exists, err := openDeclaredArtifactParent(
+	parent, parentCreated, err := openOrCreateDeclaredArtifactParent(
 		filepath.Dir(artifact.Path),
-		defaultParent,
+		systemdEnableLinkDefaultParent,
+		hooks.beforeParentCreate,
 	)
-	parentCreated := false
 	if err != nil {
 		return nil, err
 	}
-	if !exists {
-		parent, err = openOrCreateDeclaredArtifactParent(
-			filepath.Dir(artifact.Path),
-			defaultParent,
-		)
-		if err != nil {
-			return nil, err
-		}
-		parentCreated = true
-	}
 	transaction := &systemdEnableLinkTransaction{
-		artifact:      artifact,
-		parent:        parent,
-		parentCreated: parentCreated,
+		artifact:                artifact,
+		parent:                  parent,
+		afterRollbackQuarantine: hooks.afterRollbackQuarantine,
+		parentCreated:           parentCreated,
 	}
 	defer func() {
 		if retErr == nil {
@@ -140,9 +138,11 @@ func (transaction *systemdEnableLinkTransaction) commit() error {
 			"systemd enable link transaction lost its declared link identity",
 		)
 	}
-	if err := revalidateManagedCleanupDir(transaction.parent); err != nil {
+	if err := transaction.revalidateParentFromDeclaredRoot(
+		"before exact link inspection",
+	); err != nil {
 		return fmt.Errorf(
-			"revalidate held systemd wants directory at commit: %w",
+			"revalidate held systemd wants directory from declared root at commit: %w",
 			err,
 		)
 	}
@@ -152,13 +152,88 @@ func (transaction *systemdEnableLinkTransaction) commit() error {
 			err,
 		)
 	}
-	if err := revalidateManagedCleanupDir(transaction.parent); err != nil {
+	if err := transaction.revalidateParentFromDeclaredRoot(
+		"after exact link inspection",
+	); err != nil {
 		return fmt.Errorf(
-			"revalidate held systemd wants directory after exact link inspection: %w",
+			"revalidate held systemd wants directory from declared root at commit: %w",
 			err,
 		)
 	}
 	transaction.committed = true
+	return nil
+}
+
+func (transaction *systemdEnableLinkTransaction) revalidateParentFromDeclaredRoot(
+	boundary string,
+) (retErr error) {
+	if transaction == nil || transaction.parent == nil ||
+		transaction.parent.dir == nil || transaction.parent.dir.file == nil {
+		return errors.New("cannot revalidate an unheld systemd wants directory")
+	}
+	if err := revalidateManagedCleanupDir(transaction.parent); err != nil {
+		return fmt.Errorf("%s: %w", boundary, err)
+	}
+	reopened, exists, err := openDeclaredArtifactParent(
+		filepath.Dir(transaction.artifact.Path),
+		systemdEnableLinkDefaultParent,
+	)
+	if err != nil {
+		return fmt.Errorf("%s: reopen declared systemd wants directory: %w", boundary, err)
+	}
+	if !exists {
+		return fmt.Errorf(
+			"%s: declared systemd wants directory disappeared",
+			boundary,
+		)
+	}
+	defer func() {
+		if err := reopened.close(); err != nil {
+			retErr = errors.Join(
+				retErr,
+				fmt.Errorf(
+					"%s: close reopened systemd wants directory: %w",
+					boundary,
+					err,
+				),
+			)
+		}
+	}()
+	if transaction.parent.spec.path != reopened.spec.path ||
+		transaction.parent.spec.systemRoot != reopened.spec.systemRoot {
+		return fmt.Errorf(
+			"%s: reopened systemd wants directory used a different declared root",
+			boundary,
+		)
+	}
+	if err := revalidateManagedCleanupDir(reopened); err != nil {
+		return fmt.Errorf(
+			"%s: revalidate reopened systemd wants directory: %w",
+			boundary,
+			err,
+		)
+	}
+	heldIdentity, err := cleanupIdentityForFD(
+		int(transaction.parent.dir.file.Fd()),
+	)
+	if err != nil {
+		return fmt.Errorf("%s: inspect held systemd wants directory: %w", boundary, err)
+	}
+	reopenedIdentity, err := cleanupIdentityForFD(int(reopened.dir.file.Fd()))
+	if err != nil {
+		return fmt.Errorf(
+			"%s: inspect reopened systemd wants directory: %w",
+			boundary,
+			err,
+		)
+	}
+	if !transaction.parent.identity.sameDirectory(heldIdentity) ||
+		!heldIdentity.sameDirectory(reopenedIdentity) {
+		return fmt.Errorf(
+			"%s: declared path no longer reaches the held systemd wants directory",
+			boundary,
+		)
+	}
 	return nil
 }
 
@@ -181,7 +256,11 @@ func (transaction *systemdEnableLinkTransaction) rollback() error {
 			// exact link: a replaced pathname must neither redirect cleanup to
 			// a foreign directory nor prevent descriptor-bound cleanup of the
 			// transaction-owned link in a displaced directory.
-			if err := transaction.entry.unlink(nil); err != nil {
+			if err := transaction.entry.unlinkWithQuarantineHooks(
+				cleanupEntryQuarantineHooks{
+					afterMove: transaction.afterRollbackQuarantine,
+				},
+			); err != nil {
 				errs = append(errs, fmt.Errorf(
 					"roll back exact systemd enable link %s: %w",
 					transaction.artifact.Path,

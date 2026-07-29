@@ -106,9 +106,10 @@ func installBinary(target string) (retErr error) {
 		return fmt.Errorf("current executable %s is not a regular file", src)
 	}
 
-	parent, err := openOrCreateDeclaredArtifactParent(
+	parent, _, err := openOrCreateDeclaredArtifactParent(
 		filepath.Dir(target),
 		defaultBinaryParent,
+		nil,
 	)
 	if err != nil {
 		return fmt.Errorf("open install binary parent: %w", err)

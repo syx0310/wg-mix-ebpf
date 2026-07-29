@@ -1163,19 +1163,29 @@ func openDeclaredArtifactParent(path string, defaultPath string) (*managedCleanu
 func openOrCreateDeclaredArtifactParent(
 	path string,
 	defaultPath string,
-) (*managedCleanupDir, error) {
+	beforeFinalCreate func(string) error,
+) (*managedCleanupDir, bool, error) {
 	spec, err := declaredArtifactPathSpec(path, defaultPath)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
-	dir, exists, err := openExactDeclaredDirectoryWithOptions(spec, true)
+	dir, exists, created, err := openExactDeclaredDirectoryWithOptions(
+		spec,
+		exactDeclaredDirectoryOpenOptions{
+			createFinal:       true,
+			beforeFinalCreate: beforeFinalCreate,
+		},
+	)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !exists {
-		return nil, fmt.Errorf("service artifact directory %s could not be created", path)
+		return nil, false, fmt.Errorf(
+			"service artifact directory %s could not be created",
+			path,
+		)
 	}
-	return dir, nil
+	return dir, created, nil
 }
 
 func declaredArtifactPathSpec(path string, defaultPath string) (cleanupPathSpec, error) {
@@ -1219,79 +1229,107 @@ func declaredArtifactPathSpec(path string, defaultPath string) (cleanupPathSpec,
 }
 
 func openExactDeclaredDirectory(spec cleanupPathSpec) (*managedCleanupDir, bool, error) {
-	return openExactDeclaredDirectoryWithOptions(spec, false)
+	dir, exists, _, err := openExactDeclaredDirectoryWithOptions(
+		spec,
+		exactDeclaredDirectoryOpenOptions{},
+	)
+	return dir, exists, err
+}
+
+type exactDeclaredDirectoryOpenOptions struct {
+	createFinal       bool
+	beforeFinalCreate func(string) error
 }
 
 func openExactDeclaredDirectoryWithOptions(
 	spec cleanupPathSpec,
-	createFinal bool,
-) (*managedCleanupDir, bool, error) {
+	options exactDeclaredDirectoryOpenOptions,
+) (*managedCleanupDir, bool, bool, error) {
 	relative, err := filepath.Rel(spec.systemRoot, spec.path)
 	if err != nil || relative == "." || strings.HasPrefix(relative, "..") {
-		return nil, false, fmt.Errorf("refuse declared directory %s", spec.path)
+		return nil, false, false, fmt.Errorf(
+			"refuse declared directory %s",
+			spec.path,
+		)
 	}
 	anchor, err := cleanupOpenAnchor(spec.systemRoot)
 	if err != nil {
-		return nil, false, err
+		return nil, false, false, err
 	}
 	current := anchor
 	owner := uint32(os.Geteuid())
 	if filepath.Clean(spec.systemRoot) != filepath.Clean(os.TempDir()) {
 		if err := anchor.identity.validateDirectory(spec.systemRoot, owner); err != nil {
 			_ = anchor.close()
-			return nil, false, err
+			return nil, false, false, err
 		}
 	}
 	components := strings.Split(relative, string(os.PathSeparator))
 	for index, component := range components {
-		child, err := cleanupOpenDirAt(current, component)
-		if cleanupIsNotExist(err) {
-			if createFinal && index == len(components)-1 {
-				if err := cleanupMkdirAt(current, component, 0o755); err != nil {
+		final := index == len(components)-1
+		child, openErr := cleanupOpenDirAt(current, component)
+		created := false
+		if cleanupIsNotExist(openErr) && options.createFinal && final {
+			if options.beforeFinalCreate != nil {
+				if err := options.beforeFinalCreate(spec.path); err != nil {
 					_ = current.close()
-					return nil, false, fmt.Errorf(
-						"create service artifact directory %s: %w",
-						spec.path,
+					return nil, false, false, fmt.Errorf(
+						"run service artifact directory pre-create hook: %w",
 						err,
 					)
 				}
+			}
+			createErr := cleanupMkdirAt(current, component, 0o755)
+			switch {
+			case createErr == nil:
+				created = true
 				if err := current.file.Sync(); err != nil {
 					_ = current.close()
-					return nil, false, fmt.Errorf(
+					return nil, false, false, fmt.Errorf(
 						"sync parent after creating declared artifact directory %s: %w",
 						spec.path,
 						err,
 					)
 				}
-				child, err = cleanupOpenDirAt(current, component)
+			case errors.Is(createErr, os.ErrExist):
+				// A concurrent creator won the exclusive mkdirat. Open its
+				// directory, but never report it as transaction-created.
+			default:
+				_ = current.close()
+				return nil, false, false, fmt.Errorf(
+					"create service artifact directory %s: %w",
+					spec.path,
+					createErr,
+				)
 			}
+			child, openErr = cleanupOpenDirAt(current, component)
 		}
-		if cleanupIsNotExist(err) {
+		if cleanupIsNotExist(openErr) {
 			_ = current.close()
-			return nil, false, nil
+			return nil, false, false, nil
 		}
-		if err != nil {
+		if openErr != nil {
 			_ = current.close()
-			return nil, false, err
+			return nil, false, false, openErr
 		}
 		if err := child.identity.validateDirectory(child.path, owner); err != nil {
 			_ = child.close()
 			_ = current.close()
-			return nil, false, err
+			return nil, false, false, err
 		}
-		if index == len(components)-1 {
+		if final {
 			return &managedCleanupDir{
 				spec:     spec,
 				parent:   current,
 				dir:      child,
 				name:     component,
 				identity: child.identity,
-			}, true, nil
+			}, true, created, nil
 		}
 		_ = current.close()
 		current = child
 	}
-	return nil, false, errors.New("empty declared directory path")
+	return nil, false, false, errors.New("empty declared directory path")
 }
 
 func snapshotRuntimeQueue(parent *cleanupDirFD, name string) (*cleanupEntryPlan, error) {
@@ -1766,11 +1804,24 @@ func (directory *cleanupDirectoryPlan) moveRootToQuarantine(
 	return quarantineName, true, nil
 }
 
+type cleanupEntryQuarantineHooks struct {
+	beforeMove func(string) error
+	afterMove  func(string, string) error
+}
+
 func (entry *cleanupEntryPlan) unlink(beforeQuarantine func(string) error) error {
+	return entry.unlinkWithQuarantineHooks(cleanupEntryQuarantineHooks{
+		beforeMove: beforeQuarantine,
+	})
+}
+
+func (entry *cleanupEntryPlan) unlinkWithQuarantineHooks(
+	hooks cleanupEntryQuarantineHooks,
+) error {
 	if !entry.remove {
 		return nil
 	}
-	quarantineName, moved, err := entry.moveToQuarantine(beforeQuarantine)
+	quarantineName, moved, err := entry.moveToQuarantine(hooks.beforeMove)
 	if err != nil || !moved {
 		return err
 	}
@@ -1787,9 +1838,20 @@ func (entry *cleanupEntryPlan) unlink(beforeQuarantine func(string) error) error
 		)
 	}
 
+	if hooks.afterMove != nil {
+		quarantinePath := filepath.Join(entry.parent.path, quarantineName)
+		if err := hooks.afterMove(entry.path, quarantinePath); err != nil {
+			return restoreEntry(fmt.Errorf(
+				"run managed entry post-quarantine hook for %s: %w",
+				entry.path,
+				err,
+			))
+		}
+	}
+
 	if entry.directory {
 		for _, child := range entry.children {
-			if err := child.unlink(beforeQuarantine); err != nil {
+			if err := child.unlink(hooks.beforeMove); err != nil {
 				return restoreEntry(err)
 			}
 		}
