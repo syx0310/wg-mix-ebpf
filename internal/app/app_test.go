@@ -12,10 +12,63 @@ import (
 	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+	"github.com/syx0310/wg-mix-ebpf/internal/buildinfo"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/daemon"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
+
+func TestVersionOutputIsBackwardCompatible(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := Run(t.Context(), []string{"version"}, &stdout, &stderr); err != nil {
+		t.Fatalf("version failed: %v stderr=%s", err, stderr.String())
+	}
+	if got, want := stdout.String(), Version+"\n"; got != want {
+		t.Fatalf("version output = %q, want %q", got, want)
+	}
+}
+
+func TestVersionJSONReportsDeterministicBuildIdentity(t *testing.T) {
+	var first, second, stderr bytes.Buffer
+	if err := Run(t.Context(), []string{"version", "--json"}, &first, &stderr); err != nil {
+		t.Fatalf("version --json failed: %v stderr=%s", err, stderr.String())
+	}
+	if err := Run(t.Context(), []string{"version", "--json"}, &second, &stderr); err != nil {
+		t.Fatalf("second version --json failed: %v stderr=%s", err, stderr.String())
+	}
+	if first.String() != second.String() {
+		t.Fatalf("version JSON changed between calls:\nfirst=%s\nsecond=%s", first.String(), second.String())
+	}
+	var got buildinfo.Info
+	if err := json.Unmarshal(first.Bytes(), &got); err != nil {
+		t.Fatalf("decode version JSON: %v\n%s", err, first.String())
+	}
+	if want := buildinfo.Current(); got != want {
+		t.Fatalf("version identity = %#v, want %#v", got, want)
+	}
+}
+
+func TestStatusReportsBuildIdentity(t *testing.T) {
+	cfgPath := writeTestConfig(t, "[Interface]\nFwMark = 0x10000002\nListenPort = 31001\n")
+	var stdout, stderr bytes.Buffer
+	if err := Run(
+		t.Context(),
+		[]string{"status", "--config", cfgPath, "--offline"},
+		&stdout,
+		&stderr,
+	); err != nil {
+		t.Fatalf("status failed: %v stderr=%s", err, stderr.String())
+	}
+	var got struct {
+		Build buildinfo.Info `json:"build"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode status JSON: %v\n%s", err, stdout.String())
+	}
+	if want := buildinfo.Current(); got.Build != want {
+		t.Fatalf("status build identity = %#v, want %#v", got.Build, want)
+	}
+}
 
 func TestValidateOffline(t *testing.T) {
 	dir := t.TempDir()

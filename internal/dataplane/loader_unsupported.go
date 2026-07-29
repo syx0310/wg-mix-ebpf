@@ -33,3 +33,7 @@ func (UnsupportedLoader) DetachStale(context.Context, *control.State, *control.S
 func LoadObjectTest(context.Context, string) error {
 	return ErrUnsupported
 }
+
+func LoadObjectTestIdentity(context.Context, string) (ObjectIdentity, error) {
+	return ObjectIdentity{}, ErrUnsupported
+}

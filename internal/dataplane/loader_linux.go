@@ -266,22 +266,37 @@ func NewLoaderWithOptions(options LoaderOptions) Loader {
 }
 
 func LoadObjectTest(ctx context.Context, objectPath string) error {
+	_, err := LoadObjectTestIdentity(ctx, objectPath)
+	return err
+}
+
+func LoadObjectTestIdentity(
+	ctx context.Context,
+	objectPath string,
+) (ObjectIdentity, error) {
 	if err := ctx.Err(); err != nil {
-		return err
+		return ObjectIdentity{}, err
 	}
-	spec, source, err := loadCollectionSpec(objectPath)
+	spec, identity, err := loadCollectionSpec(objectPath)
 	if err != nil {
-		return err
+		return ObjectIdentity{}, err
 	}
 	if err := removeMemlockLimit(); err != nil {
-		return err
+		return ObjectIdentity{}, err
 	}
 	coll, err := ebpf.NewCollection(spec)
 	if err != nil {
-		return fmt.Errorf("create BPF collection from %s: %w", source, err)
+		return ObjectIdentity{}, fmt.Errorf(
+			"create BPF collection from %s: %w",
+			identity.Source,
+			err,
+		)
 	}
 	defer coll.Close()
-	return populateXORTailCalls(coll, 0)
+	if err := populateXORTailCalls(coll, 0); err != nil {
+		return ObjectIdentity{}, err
+	}
+	return identity, nil
 }
 
 func preflightUnpinnedCollection(spec *ebpf.CollectionSpec, source string) error {
@@ -323,10 +338,11 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 	defer parent.Close()
-	spec, source, err := loadCollectionSpec(l.ObjectPath)
+	spec, identity, err := loadCollectionSpec(l.ObjectPath)
 	if err != nil {
 		return err
 	}
+	source := identity.Source
 	if err := validateAndSetPinnedMaps(spec); err != nil {
 		return fmt.Errorf("validate BPF object %s: %w", source, err)
 	}
