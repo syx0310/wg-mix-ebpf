@@ -66,7 +66,7 @@ record_retained_fixture() {
 trap 'record_retained_fixture "$?"' EXIT
 
 for directory in \
-  "${fixture_repo}/internal/guard" \
+  "${fixture_repo}/internal/guard/nested/deeper" \
   "${fixture_repo}/scripts" \
   "${fixture_home}" \
   "${poisoned_home}" \
@@ -125,6 +125,15 @@ func TestLiveGuardOwnership(t *testing.T) {
 	}
 }
 EOF
+cat >"${fixture_repo}/internal/guard/nested/deeper/payload.txt" <<'EOF'
+nested snapshot payload
+EOF
+cat >"${fixture_repo}/internal/guard/nested/deeper/runner.sh" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+"${CHMOD_BIN}" 0700 -- \
+  "${fixture_repo}/internal/guard/nested/deeper/runner.sh"
 "${CP_BIN}" -- "${BUILD_GATE}" \
   "${fixture_repo}/scripts/build-live-guard-test.sh"
 readonly fixture_gate="${fixture_repo}/scripts/build-live-guard-test.sh"
@@ -165,6 +174,8 @@ fixture_git() {
   -c core.hooksPath=/dev/null \
   init --initial-branch=main "${fixture_repo}"
 fixture_git add -- .gitignore go.mod internal/guard scripts/build-live-guard-test.sh
+fixture_git update-index --chmod=+x -- \
+  internal/guard/nested/deeper/runner.sh
 fixture_git \
   -c user.name=guard-provenance-fixture \
   -c user.email=guard-provenance-fixture.invalid \
@@ -173,6 +184,13 @@ candidate_commit="$(fixture_git rev-parse HEAD)"
 readonly candidate_commit
 [[ "${candidate_commit}" =~ ^[0-9a-f]{40}$ ]] || {
   echo "error: fixture did not create a SHA-1 candidate commit" >&2
+  exit 1
+}
+nested_exec_entry="$(fixture_git ls-files -s -- \
+  internal/guard/nested/deeper/runner.sh)"
+[[ "${nested_exec_entry}" == \
+  100755\ *$'\t'internal/guard/nested/deeper/runner.sh ]] || {
+  echo "error: nested executable fixture is not stored with Git mode 100755" >&2
   exit 1
 }
 readonly expected_archive="${fixture_root}/expected-candidate.tar"
@@ -296,6 +314,7 @@ printf 'provenance_case_start case=tar-options-effective-control\n'
 [[ -f "${tar_options_control_marker}" &&
   ! -L "${tar_options_control_marker}" &&
   -f "${tar_options_control_output}/guard/guard.go" &&
+  -f "${tar_options_control_output}/guard/nested/deeper/payload.txt" &&
   ! -e "${tar_options_control_output}/internal/guard/guard.go" &&
   ! -L "${tar_options_control_output}/internal/guard/guard.go" ]] || {
   echo "error: TAR_OPTIONS effective control did not execute and alter extraction" >&2
@@ -327,6 +346,60 @@ run_gate_with_poisoned_environment() {
     "${fixture_gate}" "$@"
 }
 
+assert_snapshot_entry() {
+  local path="$1"
+  local expected_mode="$2"
+  local expected_kind="$3"
+  local expected_links="${4:-}"
+  local actual_uid
+  local actual_mode
+  local actual_links
+  local actual_kind
+
+  [[ ! -L "${path}" ]] || {
+    printf 'error: sealed snapshot entry is a symlink: %s\n' "${path}" >&2
+    return 1
+  }
+  read -r actual_uid actual_mode actual_links actual_kind < <(
+    "${STAT_BIN}" -c '%u %a %h %F' -- "${path}"
+  )
+  [[ "${actual_uid}" == "${EUID}" &&
+    "${actual_mode}" == "${expected_mode}" &&
+    "${actual_kind}" == "${expected_kind}" ]] || {
+    printf 'error: sealed snapshot entry metadata mismatch: path=%s uid=%s mode=%s links=%s type=%s\n' \
+      "${path}" "${actual_uid}" "${actual_mode}" "${actual_links}" \
+      "${actual_kind}" >&2
+    return 1
+  }
+  if [[ -n "${expected_links}" &&
+    "${actual_links}" != "${expected_links}" ]]; then
+    printf 'error: sealed snapshot entry link count mismatch: path=%s links=%s\n' \
+      "${path}" "${actual_links}" >&2
+    return 1
+  fi
+}
+
+assert_sealed_snapshot() {
+  local snapshot="$1"
+
+  assert_snapshot_entry "${snapshot}" "500" "directory"
+  assert_snapshot_entry "${snapshot}/internal" "500" "directory"
+  assert_snapshot_entry "${snapshot}/internal/guard" "500" "directory"
+  assert_snapshot_entry \
+    "${snapshot}/internal/guard/nested" "500" "directory"
+  assert_snapshot_entry \
+    "${snapshot}/internal/guard/nested/deeper" "500" "directory"
+  assert_snapshot_entry \
+    "${snapshot}/internal/guard/nested/deeper/payload.txt" \
+    "400" "regular file" "1"
+  assert_snapshot_entry \
+    "${snapshot}/internal/guard/nested/deeper/runner.sh" \
+    "500" "regular file" "1"
+  assert_snapshot_entry \
+    "${snapshot}/scripts/build-live-guard-test.sh" \
+    "500" "regular file" "1"
+}
+
 printf 'provenance_case_start case=ignored-assume-skip-index commit=%s\n' \
   "${candidate_commit}"
 (
@@ -344,6 +417,7 @@ printf 'provenance_case_start case=ignored-assume-skip-index commit=%s\n' \
   echo "error: index-pollution provenance build result is unsafe" >&2
   exit 1
 }
+assert_sealed_snapshot "${first_output_parent}/source-snapshot"
 
 printf 'provenance_case_start case=all-tool-environment-pollution commit=%s\n' \
   "${candidate_commit}"
@@ -361,6 +435,7 @@ printf 'provenance_case_start case=all-tool-environment-pollution commit=%s\n' \
   echo "error: malicious TAR_OPTIONS executed during snapshot extraction" >&2
   exit 1
 }
+assert_sealed_snapshot "${second_output_parent}/source-snapshot"
 
 first_archive_sha="$("${SHA256_BIN}" -- \
   "${first_output_parent}/candidate.tar")"

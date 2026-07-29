@@ -6,7 +6,6 @@ readonly LC_ALL="C"
 readonly CHMOD_BIN="/usr/bin/chmod"
 readonly DIRNAME_BIN="/usr/bin/dirname"
 readonly ENV_BIN="/usr/bin/env"
-readonly FIND_BIN="/usr/bin/find"
 readonly GO_BIN="/usr/bin/go"
 readonly GIT_BIN="/usr/bin/git"
 readonly MKDIR_BIN="/usr/bin/mkdir"
@@ -276,7 +275,7 @@ valid_output_path "${OUTPUT}" || {
   exit 2
 }
 [[ -x "${CHMOD_BIN}" && -x "${DIRNAME_BIN}" && -x "${ENV_BIN}" &&
-  -x "${FIND_BIN}" && -x "${GO_BIN}" && -x "${GIT_BIN}" && -x "${MKDIR_BIN}" &&
+  -x "${GO_BIN}" && -x "${GIT_BIN}" && -x "${MKDIR_BIN}" &&
   -x "${PYTHON3_BIN}" && -x "${READLINK_BIN}" && -x "${SHA256_BIN}" &&
   -x "${STAT_BIN}" &&
   -x "${TAR_BIN}" && -x "${TIMEOUT_BIN}" ]] || {
@@ -566,32 +565,320 @@ EXTRACT_ARGV=(
 readonly -a EXTRACT_ARGV
 print_argv "candidate_extract_start" "${EXTRACT_ARGV[@]}"
 (
-  # Git tree modes contain no group/other write bit. Mask every write bit
-  # during extraction so the snapshot is read-only without recursive chmod.
-  umask 0222
+  # GNU tar must retain owner-write while it creates and fills nested
+  # directories. The descriptor-anchored seal below removes write bits only
+  # after extraction has completed.
+  umask 0077
   "${EXTRACT_ARGV[@]}"
 )
-"${CHMOD_BIN}" 0500 -- "${SOURCE_SNAPSHOT}"
+
+readonly SNAPSHOT_SEAL_PYTHON='import os
+import stat
+import sys
+
+snapshot_path = sys.argv[1]
+expected_uid = os.geteuid()
+
+for required_flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"):
+    if not hasattr(os, required_flag):
+        raise RuntimeError(f"required descriptor flag is unavailable: {required_flag}")
+
+directory_flags = (
+    os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW
+)
+file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+class SealError(RuntimeError):
+    pass
+
+
+def display(key):
+    if not key:
+        return "."
+    return repr("/".join(key))
+
+
+def identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_nlink,
+        stat.S_IFMT(metadata.st_mode),
+    )
+
+
+def exact_metadata(metadata):
+    return identity(metadata) + (stat.S_IMODE(metadata.st_mode),)
+
+
+def require_open_identity(before, opened, key):
+    if identity(before) != identity(opened):
+        raise SealError(f"entry identity changed while opening {display(key)}")
+
+
+def require_exact(metadata, expected, key):
+    if exact_metadata(metadata) != expected:
+        raise SealError(f"sealed entry metadata changed at {display(key)}")
+
+
+def list_names(directory_fd, key):
+    with os.scandir(directory_fd) as entries:
+        names = [entry.name for entry in entries]
+    if any(name in ("", ".", "..") or "/" in name for name in names):
+        raise SealError(f"invalid directory entry below {display(key)}")
+    names.sort()
+    return names
+
+
+sealed = {}
+snapshot_device = None
+
+
+def require_private_entry(metadata, key, expected_kind):
+    kind = stat.S_IFMT(metadata.st_mode)
+    mode = stat.S_IMODE(metadata.st_mode)
+    if kind != expected_kind:
+        raise SealError(f"unexpected entry type at {display(key)}")
+    if metadata.st_dev != snapshot_device:
+        raise SealError(f"entry crosses the snapshot filesystem at {display(key)}")
+    if metadata.st_uid != expected_uid:
+        raise SealError(f"entry is not EUID-owned at {display(key)}")
+    if mode & 0o077:
+        raise SealError(f"entry escaped the private extraction mask at {display(key)}")
+    if expected_kind == stat.S_IFDIR and mode != 0o700:
+        raise SealError(f"directory was not privately extracted at {display(key)}")
+    if expected_kind == stat.S_IFREG:
+        if metadata.st_nlink != 1:
+            raise SealError(f"regular file has multiple links at {display(key)}")
+        if mode not in (0o600, 0o700):
+            raise SealError(f"regular file has an unsafe extracted mode at {display(key)}")
+
+
+def seal_regular(parent_fd, name, key, before):
+    require_private_entry(before, key, stat.S_IFREG)
+    file_fd = os.open(name, file_flags, dir_fd=parent_fd)
+    try:
+        opened = os.fstat(file_fd)
+        require_open_identity(before, opened, key)
+        require_private_entry(opened, key, stat.S_IFREG)
+        target_mode = 0o500 if stat.S_IMODE(opened.st_mode) == 0o700 else 0o400
+        os.fchmod(file_fd, target_mode)
+        sealed_metadata = os.fstat(file_fd)
+        require_open_identity(opened, sealed_metadata, key)
+        if stat.S_IMODE(sealed_metadata.st_mode) != target_mode:
+            raise SealError(f"regular file did not seal at {display(key)}")
+        sealed[key] = exact_metadata(sealed_metadata)
+    finally:
+        os.close(file_fd)
+    require_exact(
+        os.stat(name, dir_fd=parent_fd, follow_symlinks=False),
+        sealed[key],
+        key,
+    )
+
+
+def seal_directory(directory_fd, key, opened):
+    require_private_entry(opened, key, stat.S_IFDIR)
+    for name in list_names(directory_fd, key):
+        child_key = key + (name,)
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        kind = stat.S_IFMT(before.st_mode)
+        if kind == stat.S_IFREG:
+            seal_regular(directory_fd, name, child_key, before)
+            continue
+        if kind != stat.S_IFDIR:
+            raise SealError(
+                f"symlink or special file is forbidden at {display(child_key)}"
+            )
+        require_private_entry(before, child_key, stat.S_IFDIR)
+        child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+        try:
+            child_opened = os.fstat(child_fd)
+            require_open_identity(before, child_opened, child_key)
+            seal_directory(child_fd, child_key, child_opened)
+        finally:
+            os.close(child_fd)
+        require_exact(
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False),
+            sealed[child_key],
+            child_key,
+        )
+
+    os.fchmod(directory_fd, 0o500)
+    sealed_metadata = os.fstat(directory_fd)
+    require_open_identity(opened, sealed_metadata, key)
+    if stat.S_IMODE(sealed_metadata.st_mode) != 0o500:
+        raise SealError(f"directory did not seal at {display(key)}")
+    sealed[key] = exact_metadata(sealed_metadata)
+
+
+def verify_directory(directory_fd, key, seen):
+    expected = sealed.get(key)
+    if expected is None:
+        raise SealError(f"unrecorded directory appeared at {display(key)}")
+    opened = os.fstat(directory_fd)
+    require_exact(opened, expected, key)
+    if (
+        stat.S_IFMT(opened.st_mode) != stat.S_IFDIR
+        or stat.S_IMODE(opened.st_mode) != 0o500
+        or opened.st_uid != expected_uid
+        or opened.st_dev != snapshot_device
+    ):
+        raise SealError(f"directory failed sealed-tree verification at {display(key)}")
+    seen.add(key)
+
+    for name in list_names(directory_fd, key):
+        child_key = key + (name,)
+        child_expected = sealed.get(child_key)
+        if child_expected is None:
+            raise SealError(f"new entry appeared at {display(child_key)}")
+        before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        require_exact(before, child_expected, child_key)
+        kind = stat.S_IFMT(before.st_mode)
+        if kind == stat.S_IFDIR:
+            child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+            try:
+                require_exact(os.fstat(child_fd), child_expected, child_key)
+                verify_directory(child_fd, child_key, seen)
+            finally:
+                os.close(child_fd)
+        elif kind == stat.S_IFREG:
+            file_fd = os.open(name, file_flags, dir_fd=directory_fd)
+            try:
+                reopened = os.fstat(file_fd)
+                require_exact(reopened, child_expected, child_key)
+                if (
+                    reopened.st_nlink != 1
+                    or stat.S_IMODE(reopened.st_mode) not in (0o400, 0o500)
+                    or stat.S_IMODE(reopened.st_mode) & 0o222
+                    or reopened.st_uid != expected_uid
+                    or reopened.st_dev != snapshot_device
+                ):
+                    raise SealError(
+                        f"regular file failed sealed-tree verification at "
+                        f"{display(child_key)}"
+                    )
+            finally:
+                os.close(file_fd)
+            seen.add(child_key)
+        else:
+            raise SealError(
+                f"symlink or special file appeared at {display(child_key)}"
+            )
+        require_exact(
+            os.stat(name, dir_fd=directory_fd, follow_symlinks=False),
+            child_expected,
+            child_key,
+        )
+
+
+def seal_snapshot():
+    global snapshot_device
+
+    parent_path, snapshot_name = os.path.split(snapshot_path)
+    if (
+        not parent_path
+        or snapshot_name in ("", ".", "..")
+        or not os.path.isabs(snapshot_path)
+    ):
+        raise SealError("snapshot path is not a canonical-looking absolute child")
+
+    parent_fd = os.open(parent_path, directory_flags)
+    try:
+        parent_metadata = os.fstat(parent_fd)
+        if (
+            stat.S_IFMT(parent_metadata.st_mode) != stat.S_IFDIR
+            or parent_metadata.st_uid != expected_uid
+            or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+        ):
+            raise SealError("snapshot parent descriptor is unsafe")
+
+        before = os.stat(
+            snapshot_name,
+            dir_fd=parent_fd,
+            follow_symlinks=False,
+        )
+        snapshot_fd = os.open(
+            snapshot_name,
+            directory_flags,
+            dir_fd=parent_fd,
+        )
+        try:
+            opened = os.fstat(snapshot_fd)
+            require_open_identity(before, opened, ())
+            if opened.st_dev != parent_metadata.st_dev:
+                raise SealError("snapshot root crosses the parent filesystem")
+            snapshot_device = opened.st_dev
+            seal_directory(snapshot_fd, (), opened)
+        finally:
+            os.close(snapshot_fd)
+
+        require_exact(
+            os.stat(
+                snapshot_name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            ),
+            sealed[()],
+            (),
+        )
+        reopened_fd = os.open(
+            snapshot_name,
+            directory_flags,
+            dir_fd=parent_fd,
+        )
+        try:
+            require_exact(os.fstat(reopened_fd), sealed[()], ())
+            seen = set()
+            verify_directory(reopened_fd, (), seen)
+        finally:
+            os.close(reopened_fd)
+    finally:
+        os.close(parent_fd)
+
+    if seen != set(sealed):
+        raise SealError("sealed-tree verification did not cover every entry")
+    return len(sealed)
+
+
+try:
+    sealed_count = seal_snapshot()
+except (OSError, RuntimeError, ValueError) as error:
+    print(f"error: cannot seal candidate snapshot: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+print(f"candidate_snapshot_sealed entries={sealed_count}")
+'
+SNAPSHOT_SEAL_ARGV=(
+  "${TIMEOUT_BIN}"
+  --signal=TERM
+  --kill-after=5s
+  2m
+  "${ENV_BIN}"
+  -i
+  "PATH=${PATH}"
+  "LC_ALL=${LC_ALL}"
+  "HOME=${BUILD_HOME}"
+  "TMPDIR=${BUILD_TMP}"
+  "${PYTHON3_BIN}"
+  -I
+  -B
+  -c
+  "${SNAPSHOT_SEAL_PYTHON}"
+  "${SOURCE_SNAPSHOT}"
+)
+readonly -a SNAPSHOT_SEAL_ARGV
+print_argv "candidate_snapshot_seal_start" "${SNAPSHOT_SEAL_ARGV[@]}"
+"${SNAPSHOT_SEAL_ARGV[@]}"
+
 read -r snapshot_uid snapshot_mode snapshot_kind < <(
   "${STAT_BIN}" -c '%u %a %F' -- "${SOURCE_SNAPSHOT}"
 )
 [[ "${snapshot_uid}" == "${EUID}" && "${snapshot_mode}" == "500" &&
   "${snapshot_kind}" == "directory" ]] || {
   echo "error: source snapshot metadata is unsafe" >&2
-  exit 1
-}
-writable_snapshot_entry="$("${FIND_BIN}" "${SOURCE_SNAPSHOT}" -xdev \
-  -perm /0222 -print -quit)"
-[[ -z "${writable_snapshot_entry}" ]] || {
-  printf 'error: source snapshot contains a writable entry: %s\n' \
-    "${writable_snapshot_entry}" >&2
-  exit 1
-}
-symlink_snapshot_entry="$("${FIND_BIN}" "${SOURCE_SNAPSHOT}" -xdev \
-  -type l -print -quit)"
-[[ -z "${symlink_snapshot_entry}" ]] || {
-  printf 'error: source snapshot contains a symlink: %s\n' \
-    "${symlink_snapshot_entry}" >&2
   exit 1
 }
 [[ -f "${SOURCE_SNAPSHOT}/go.mod" &&
