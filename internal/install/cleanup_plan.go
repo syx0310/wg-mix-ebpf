@@ -185,14 +185,47 @@ func createFreshManagedCleanupDir(spec cleanupPathSpec) (*managedCleanupDir, err
 }
 
 func revalidateManagedCleanupDir(dir *managedCleanupDir) error {
+	return revalidateManagedCleanupDirAtName(dir, "")
+}
+
+func revalidateManagedCleanupDirAtName(
+	dir *managedCleanupDir,
+	finalName string,
+) error {
 	if dir == nil || dir.parent == nil || dir.dir == nil || dir.dir.file == nil {
 		return errors.New("cannot revalidate an unheld managed directory")
 	}
-	if len(dir.declaredChain) != 0 {
-		return revalidateDeclaredDirectoryChain(dir)
+	if finalName == "" {
+		finalName = dir.name
 	}
-	_, err := revalidateNonDeclaredManagedCleanupDir(dir, false)
-	return err
+	if len(dir.declaredChain) != 0 {
+		return revalidateDeclaredDirectoryChainAtName(dir, finalName)
+	}
+	parentIdentity, heldIdentity, _, err :=
+		inspectNonDeclaredManagedCleanupDirAtName(dir, finalName)
+	if err != nil {
+		return err
+	}
+	if !dir.managedGenerationSet {
+		return errors.New(
+			"cannot revalidate a managed directory without generation baselines",
+		)
+	}
+	if !dir.parentGeneration.same(directoryGeneration(parentIdentity)) {
+		return fmt.Errorf(
+			"refuse %s %s: held parent generation changed",
+			dir.spec.name,
+			dir.spec.path,
+		)
+	}
+	if !dir.dirGeneration.same(directoryGeneration(heldIdentity)) {
+		return fmt.Errorf(
+			"refuse %s %s: directory generation changed",
+			dir.spec.name,
+			dir.spec.path,
+		)
+	}
+	return nil
 }
 
 func initializeManagedCleanupDirGenerations(dir *managedCleanupDir) error {
@@ -250,8 +283,24 @@ func inspectNonDeclaredManagedCleanupDir(
 	namedIdentity cleanupIdentity,
 	retErr error,
 ) {
+	if dir == nil {
+		return cleanupIdentity{}, cleanupIdentity{}, cleanupIdentity{},
+			errors.New("cannot inspect a nil managed directory")
+	}
+	return inspectNonDeclaredManagedCleanupDirAtName(dir, dir.name)
+}
+
+func inspectNonDeclaredManagedCleanupDirAtName(
+	dir *managedCleanupDir,
+	finalName string,
+) (
+	parentIdentity cleanupIdentity,
+	heldIdentity cleanupIdentity,
+	namedIdentity cleanupIdentity,
+	retErr error,
+) {
 	if dir == nil || dir.parent == nil || dir.parent.file == nil ||
-		dir.dir == nil || dir.dir.file == nil || dir.name == "" {
+		dir.dir == nil || dir.dir.file == nil || finalName == "" {
 		return cleanupIdentity{}, cleanupIdentity{}, cleanupIdentity{},
 			errors.New("cannot inspect an unheld managed directory")
 	}
@@ -281,7 +330,7 @@ func inspectNonDeclaredManagedCleanupDir(
 				dir.spec.path,
 			)
 	}
-	namedIdentity, err = cleanupIdentityAt(dir.parent, dir.name)
+	namedIdentity, err = cleanupIdentityAt(dir.parent, finalName)
 	if err != nil {
 		return cleanupIdentity{}, cleanupIdentity{}, cleanupIdentity{},
 			fmt.Errorf("revalidate %s pathname %s: %w", dir.spec.name, dir.spec.path, err)
@@ -300,13 +349,21 @@ func inspectNonDeclaredManagedCleanupDir(
 }
 
 func revalidateDeclaredDirectoryChain(dir *managedCleanupDir) error {
+	return revalidateDeclaredDirectoryChainAtName(dir, dir.name)
+}
+
+func revalidateDeclaredDirectoryChainAtName(
+	dir *managedCleanupDir,
+	finalName string,
+) error {
 	if dir == nil || len(dir.declaredChain) < 2 ||
 		len(dir.declaredEdges)+1 != len(dir.declaredChain) ||
 		len(dir.declaredGenerations) != len(dir.declaredChain) ||
 		dir.declaredRootDepth < 0 ||
 		dir.declaredRootDepth > len(dir.declaredEdges) ||
 		dir.declaredCanonicalRoot == "" ||
-		dir.declaredCanonicalPath == "" {
+		dir.declaredCanonicalPath == "" ||
+		finalName == "" {
 		return errors.New("cannot revalidate an incomplete declared directory chain")
 	}
 	last := len(dir.declaredChain) - 1
@@ -318,13 +375,14 @@ func revalidateDeclaredDirectoryChain(dir *managedCleanupDir) error {
 	if err := revalidateDeclaredCanonicalRoot(dir); err != nil {
 		return err
 	}
-	if err := revalidateDeclaredDirectoryPrefix(
+	if err := revalidateDeclaredDirectoryPrefixAtFinalName(
 		dir.spec.path,
 		dir.declaredChain,
 		dir.declaredEdges,
 		dir.declaredGenerations,
 		dir.declaredRootDepth,
-		-1,
+		nil,
+		finalName,
 	); err != nil {
 		return err
 	}
@@ -342,12 +400,44 @@ func revalidateDeclaredDirectoryPrefix(
 	rootDepth int,
 	allowedGenerationIndex int,
 ) (retErr error) {
+	allowedGenerationIndexes := map[int]struct{}{}
+	if allowedGenerationIndex >= 0 {
+		allowedGenerationIndexes[allowedGenerationIndex] = struct{}{}
+	}
+	return revalidateDeclaredDirectoryPrefixAtFinalName(
+		declaredPath,
+		chain,
+		edges,
+		generations,
+		rootDepth,
+		allowedGenerationIndexes,
+		"",
+	)
+}
+
+func revalidateDeclaredDirectoryPrefixAtFinalName(
+	declaredPath string,
+	chain []*cleanupDirFD,
+	edges []string,
+	generations []cleanupDirectoryGeneration,
+	rootDepth int,
+	allowedGenerationIndexes map[int]struct{},
+	finalName string,
+) (retErr error) {
 	if len(chain) == 0 ||
 		len(edges)+1 != len(chain) ||
 		len(generations) != len(chain) ||
-		rootDepth < 0 ||
-		allowedGenerationIndex >= len(chain) {
+		rootDepth < 0 {
 		return errors.New("cannot revalidate an incomplete declared directory prefix")
+	}
+	for index := range allowedGenerationIndexes {
+		if index < 0 || index >= len(chain) {
+			return errors.New("cannot revalidate a declared directory prefix with an invalid generation exception")
+		}
+	}
+	generationChangeAllowed := func(index int) bool {
+		_, ok := allowedGenerationIndexes[index]
+		return ok
 	}
 	kernelRoot := string(os.PathSeparator)
 	reopenedAnchor, err := cleanupOpenAnchor(kernelRoot)
@@ -390,7 +480,7 @@ func revalidateDeclaredDirectoryPrefix(
 				held.path,
 			)
 		}
-		if index != allowedGenerationIndex &&
+		if !generationChangeAllowed(index) &&
 			!generations[index].same(directoryGeneration(heldIdentity)) {
 			return fmt.Errorf(
 				"refuse declared directory %s: component generation changed at %s",
@@ -400,7 +490,7 @@ func revalidateDeclaredDirectoryPrefix(
 		}
 		if index == 0 {
 			if !heldIdentity.sameDirectory(reopenedAnchor.identity) ||
-				(index != allowedGenerationIndex &&
+				(!generationChangeAllowed(index) &&
 					!directoryGeneration(heldIdentity).same(
 						directoryGeneration(reopenedAnchor.identity),
 					)) {
@@ -411,12 +501,22 @@ func revalidateDeclaredDirectoryPrefix(
 			}
 			continue
 		}
-		namedIdentity, err := declaredDirectoryEdgeIdentityForPrefix(
-			chain,
-			edges,
-			rootDepth,
-			index-1,
-		)
+		var namedIdentity cleanupIdentity
+		if finalName != "" && index == len(chain)-1 {
+			namedIdentity, err = declaredDirectoryNamedEdgeIdentityForPrefix(
+				chain,
+				rootDepth,
+				index-1,
+				finalName,
+			)
+		} else {
+			namedIdentity, err = declaredDirectoryEdgeIdentityForPrefix(
+				chain,
+				edges,
+				rootDepth,
+				index-1,
+			)
+		}
 		if err != nil {
 			return fmt.Errorf(
 				"revalidate declared directory edge %s: %w",
@@ -425,7 +525,7 @@ func revalidateDeclaredDirectoryPrefix(
 			)
 		}
 		if !heldIdentity.sameDirectory(namedIdentity) ||
-			(index != allowedGenerationIndex &&
+			(!generationChangeAllowed(index) &&
 				!directoryGeneration(heldIdentity).same(
 					directoryGeneration(namedIdentity),
 				)) {
@@ -438,6 +538,27 @@ func revalidateDeclaredDirectoryPrefix(
 		}
 	}
 	return nil
+}
+
+func declaredDirectoryNamedEdgeIdentityForPrefix(
+	chain []*cleanupDirFD,
+	rootDepth int,
+	edgeIndex int,
+	name string,
+) (cleanupIdentity, error) {
+	parent := chain[edgeIndex]
+	if !declaredDirectoryEdgeMayCrossMount(edgeIndex, rootDepth) {
+		return cleanupIdentityAt(parent, name)
+	}
+	child, err := cleanupOpenDirAtAllowMount(parent, name)
+	if err != nil {
+		return cleanupIdentity{}, err
+	}
+	identity := child.identity
+	if err := child.close(); err != nil {
+		return cleanupIdentity{}, err
+	}
+	return identity, nil
 }
 
 func declaredDirectoryEdgeIdentity(
@@ -532,6 +653,304 @@ func refreshManagedFinalDirectoryGenerationAfterOwnedMutation(
 		dir,
 		len(dir.declaredChain)-1,
 	)
+}
+
+type cleanupDirectoryMutationProof struct {
+	before cleanupIdentity
+	after  cleanupIdentity
+}
+
+func performCleanupDirectoryMutation(
+	parent *cleanupDirFD,
+	mutate func() error,
+) (cleanupDirectoryMutationProof, error) {
+	if parent == nil || parent.file == nil || mutate == nil {
+		return cleanupDirectoryMutationProof{}, errors.New(
+			"cannot perform an owned mutation without a held parent directory",
+		)
+	}
+	before, err := cleanupIdentityForFD(int(parent.file.Fd()))
+	if err != nil {
+		return cleanupDirectoryMutationProof{}, fmt.Errorf(
+			"inspect held cleanup parent before owned mutation: %w",
+			err,
+		)
+	}
+	if !parent.identity.sameDirectory(before) {
+		return cleanupDirectoryMutationProof{}, fmt.Errorf(
+			"refuse owned mutation through changed cleanup parent %s",
+			parent.path,
+		)
+	}
+	if err := mutate(); err != nil {
+		return cleanupDirectoryMutationProof{}, err
+	}
+	after, err := cleanupIdentityForFD(int(parent.file.Fd()))
+	if err != nil {
+		return cleanupDirectoryMutationProof{}, fmt.Errorf(
+			"inspect held cleanup parent after owned mutation: %w",
+			err,
+		)
+	}
+	if !before.sameDirectory(after) || !parent.identity.sameDirectory(after) {
+		return cleanupDirectoryMutationProof{}, fmt.Errorf(
+			"refuse owned mutation through changed cleanup parent %s",
+			parent.path,
+		)
+	}
+	return cleanupDirectoryMutationProof{before: before, after: after}, nil
+}
+
+func managedCleanupDirContainsHeldDirectory(
+	dir *managedCleanupDir,
+	target *cleanupDirFD,
+) bool {
+	if dir == nil || target == nil {
+		return false
+	}
+	if len(dir.declaredChain) != 0 {
+		for _, component := range dir.declaredChain {
+			if component != nil &&
+				component.identity.sameDirectory(target.identity) {
+				return true
+			}
+		}
+		return false
+	}
+	return dir.parent != nil &&
+		dir.parent.identity.sameDirectory(target.identity) ||
+		dir.dir != nil &&
+			dir.dir.identity.sameDirectory(target.identity)
+}
+
+func refreshManagedCleanupDirGenerationAfterOwnedMutationAtName(
+	dir *managedCleanupDir,
+	finalName string,
+	proof cleanupDirectoryMutationProof,
+) (bool, error) {
+	if dir == nil || finalName == "" ||
+		!proof.before.sameDirectory(proof.after) {
+		return false, errors.New("cannot refresh a managed directory from an invalid mutation proof")
+	}
+	if len(dir.declaredChain) != 0 {
+		matchedIndex := -1
+		for index, component := range dir.declaredChain {
+			if component == nil ||
+				!component.identity.sameDirectory(proof.before) {
+				continue
+			}
+			if matchedIndex >= 0 {
+				return false, fmt.Errorf(
+					"held mutation parent occurs multiple times in declared chain for %s",
+					dir.spec.path,
+				)
+			}
+			matchedIndex = index
+		}
+		if matchedIndex < 0 {
+			return false, nil
+		}
+		if !dir.declaredGenerations[matchedIndex].same(
+			directoryGeneration(proof.before),
+		) {
+			return false, fmt.Errorf(
+				"refuse declared generation refresh for %s: mutation pre-generation "+
+					"does not match component %s",
+				dir.spec.path,
+				dir.declaredChain[matchedIndex].path,
+			)
+		}
+		current, err := cleanupIdentityForFD(
+			int(dir.declaredChain[matchedIndex].file.Fd()),
+		)
+		if err != nil {
+			return false, err
+		}
+		if !proof.after.sameDirectory(current) ||
+			!directoryGeneration(proof.after).same(directoryGeneration(current)) {
+			return false, fmt.Errorf(
+				"refuse declared generation refresh for %s: component %s "+
+					"does not have the exact mutation post-generation",
+				dir.spec.path,
+				dir.declaredChain[matchedIndex].path,
+			)
+		}
+		if err := revalidateDeclaredCanonicalRoot(dir); err != nil {
+			return false, err
+		}
+		if err := revalidateDeclaredDirectoryPrefixAtFinalName(
+			dir.spec.path,
+			dir.declaredChain,
+			dir.declaredEdges,
+			dir.declaredGenerations,
+			dir.declaredRootDepth,
+			map[int]struct{}{matchedIndex: {}},
+			finalName,
+		); err != nil {
+			return false, fmt.Errorf(
+				"revalidate declared directory before exact owned generation refresh: %w",
+				err,
+			)
+		}
+		dir.declaredGenerations[matchedIndex] =
+			directoryGeneration(proof.after)
+		if err := revalidateManagedCleanupDirAtName(dir, finalName); err != nil {
+			return false, fmt.Errorf(
+				"revalidate declared directory after exact owned generation refresh: %w",
+				err,
+			)
+		}
+		return true, nil
+	}
+
+	parentIdentity, heldIdentity, _, err :=
+		inspectNonDeclaredManagedCleanupDirAtName(dir, finalName)
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case dir.parent.identity.sameDirectory(proof.before):
+		if !dir.parentGeneration.same(directoryGeneration(proof.before)) ||
+			!dir.dirGeneration.same(directoryGeneration(heldIdentity)) ||
+			!proof.after.sameDirectory(parentIdentity) ||
+			!directoryGeneration(proof.after).same(
+				directoryGeneration(parentIdentity),
+			) {
+			return false, fmt.Errorf(
+				"refuse exact held-parent generation refresh for %s",
+				dir.spec.path,
+			)
+		}
+		dir.parentGeneration = directoryGeneration(proof.after)
+	case dir.dir.identity.sameDirectory(proof.before):
+		if !dir.dirGeneration.same(directoryGeneration(proof.before)) ||
+			!dir.parentGeneration.same(directoryGeneration(parentIdentity)) ||
+			!proof.after.sameDirectory(heldIdentity) ||
+			!directoryGeneration(proof.after).same(
+				directoryGeneration(heldIdentity),
+			) {
+			return false, fmt.Errorf(
+				"refuse exact held-directory generation refresh for %s",
+				dir.spec.path,
+			)
+		}
+		dir.dirGeneration = directoryGeneration(proof.after)
+	default:
+		return false, nil
+	}
+	if err := revalidateManagedCleanupDirAtName(dir, finalName); err != nil {
+		return false, fmt.Errorf(
+			"revalidate managed directory after exact owned generation refresh: %w",
+			err,
+		)
+	}
+	return true, nil
+}
+
+func adoptManagedCleanupDirAfterOwnedRootRename(
+	dir *managedCleanupDir,
+	finalName string,
+	parentProof cleanupDirectoryMutationProof,
+	rootBefore cleanupIdentity,
+	rootAfter cleanupIdentity,
+) error {
+	if dir == nil || finalName == "" ||
+		!parentProof.before.sameDirectory(parentProof.after) ||
+		!rootBefore.sameDirectory(rootAfter) ||
+		!dir.identity.sameDirectory(rootBefore) {
+		return errors.New("cannot adopt an invalid owned cleanup root rename")
+	}
+	if len(dir.declaredChain) != 0 {
+		last := len(dir.declaredChain) - 1
+		parentIndex := last - 1
+		if !dir.declaredChain[parentIndex].identity.sameDirectory(
+			parentProof.before,
+		) ||
+			!dir.declaredGenerations[parentIndex].same(
+				directoryGeneration(parentProof.before),
+			) ||
+			!dir.declaredGenerations[last].same(
+				directoryGeneration(rootBefore),
+			) {
+			return errors.New(
+				"owned cleanup root rename does not start from recorded declared generations",
+			)
+		}
+		currentParent, err := cleanupIdentityForFD(
+			int(dir.declaredChain[parentIndex].file.Fd()),
+		)
+		if err != nil {
+			return err
+		}
+		currentRoot, err := cleanupIdentityForFD(
+			int(dir.declaredChain[last].file.Fd()),
+		)
+		if err != nil {
+			return err
+		}
+		if !parentProof.after.sameDirectory(currentParent) ||
+			!directoryGeneration(parentProof.after).same(
+				directoryGeneration(currentParent),
+			) ||
+			!rootAfter.sameDirectory(currentRoot) ||
+			!directoryGeneration(rootAfter).same(
+				directoryGeneration(currentRoot),
+			) {
+			return errors.New(
+				"owned cleanup root rename lost its exact post-mutation generations",
+			)
+		}
+		if err := revalidateDeclaredCanonicalRoot(dir); err != nil {
+			return err
+		}
+		if err := revalidateDeclaredDirectoryPrefixAtFinalName(
+			dir.spec.path,
+			dir.declaredChain,
+			dir.declaredEdges,
+			dir.declaredGenerations,
+			dir.declaredRootDepth,
+			map[int]struct{}{parentIndex: {}, last: {}},
+			finalName,
+		); err != nil {
+			return fmt.Errorf(
+				"revalidate quarantined declared cleanup root before generation adoption: %w",
+				err,
+			)
+		}
+		dir.declaredGenerations[parentIndex] =
+			directoryGeneration(parentProof.after)
+		dir.declaredGenerations[last] = directoryGeneration(rootAfter)
+		dir.identity = rootAfter
+		return revalidateManagedCleanupDirAtName(dir, finalName)
+	}
+
+	if !dir.parentGeneration.same(directoryGeneration(parentProof.before)) ||
+		!dir.dirGeneration.same(directoryGeneration(rootBefore)) {
+		return errors.New(
+			"owned cleanup root rename does not start from recorded managed generations",
+		)
+	}
+	parentIdentity, heldIdentity, namedIdentity, err :=
+		inspectNonDeclaredManagedCleanupDirAtName(dir, finalName)
+	if err != nil {
+		return err
+	}
+	if !parentProof.after.sameDirectory(parentIdentity) ||
+		!directoryGeneration(parentProof.after).same(
+			directoryGeneration(parentIdentity),
+		) ||
+		!rootAfter.sameDirectory(heldIdentity) ||
+		!directoryGeneration(rootAfter).same(directoryGeneration(heldIdentity)) ||
+		!rootAfter.sameDirectory(namedIdentity) ||
+		!directoryGeneration(rootAfter).same(directoryGeneration(namedIdentity)) {
+		return errors.New(
+			"owned cleanup root rename lost its exact managed post-mutation generations",
+		)
+	}
+	dir.parentGeneration = directoryGeneration(parentProof.after)
+	dir.dirGeneration = directoryGeneration(rootAfter)
+	dir.identity = rootAfter
+	return revalidateManagedCleanupDirAtName(dir, finalName)
 }
 
 func refreshManagedParentGenerationAfterOwnedChildCreation(
@@ -899,11 +1318,12 @@ func (entry *cleanupEntryPlan) close() error {
 }
 
 type cleanupDirectoryPlan struct {
-	root             *managedCleanupDir
-	entries          []*cleanupEntryPlan
-	strictEntries    bool
-	removeRoot       bool
-	rootMayDisappear bool
+	root                      *managedCleanupDir
+	entries                   []*cleanupEntryPlan
+	absentServiceArtifactPath string
+	strictEntries             bool
+	removeRoot                bool
+	rootMayDisappear          bool
 }
 
 func (directory *cleanupDirectoryPlan) close() error {
@@ -919,11 +1339,13 @@ func (directory *cleanupDirectoryPlan) close() error {
 }
 
 type uninstallCleanupPlan struct {
-	directories       []*cleanupDirectoryPlan
-	manifest          cleanupManifest
-	beforeExecute     func() error
-	beforeQuarantine  func(string) error
-	beforeServiceExec func(string) error
+	directories                  []*cleanupDirectoryPlan
+	manifest                     cleanupManifest
+	beforeExecute                func() error
+	beforeQuarantine             func(string) error
+	beforeServiceExec            func(string) error
+	serviceActionExec            func(*os.File, string) error
+	beforeServiceFinalChainCheck func() error
 }
 
 func (plan *uninstallCleanupPlan) close() error {
@@ -1737,7 +2159,10 @@ func prepareArtifactPlans(manifest cleanupManifest) ([]*cleanupDirectoryPlan, er
 			)
 		}
 		if cleanupIsNotExist(err) {
-			_ = parent.close()
+			plans = append(plans, &cleanupDirectoryPlan{
+				root:                      parent,
+				absentServiceArtifactPath: artifact.Path,
+			})
 			continue
 		}
 		if err != nil {
@@ -2353,8 +2778,11 @@ func (plan *uninstallCleanupPlan) execute() error {
 	if err := plan.revalidate(); err != nil {
 		return err
 	}
-	for _, directory := range plan.directories {
-		if err := directory.remove(plan.beforeQuarantine); err != nil {
+	for index, directory := range plan.directories {
+		coordinator := cleanupDirectoryMutationCoordinator{
+			peers: plan.directories[index+1:],
+		}
+		if err := directory.remove(plan.beforeQuarantine, &coordinator); err != nil {
 			return err
 		}
 	}
@@ -2373,11 +2801,18 @@ func (plan *uninstallCleanupPlan) executeServiceArtifacts() error {
 	if err := plan.revalidate(); err != nil {
 		return err
 	}
+	var serviceDirectories []*cleanupDirectoryPlan
 	for _, directory := range plan.directories {
 		if directory.root.spec.name != "service artifact directory" {
 			continue
 		}
-		if err := directory.remove(plan.beforeQuarantine); err != nil {
+		serviceDirectories = append(serviceDirectories, directory)
+	}
+	for index, directory := range serviceDirectories {
+		coordinator := cleanupDirectoryMutationCoordinator{
+			peers: serviceDirectories[index+1:],
+		}
+		if err := directory.remove(plan.beforeQuarantine, &coordinator); err != nil {
 			return err
 		}
 	}
@@ -2394,7 +2829,161 @@ func (plan *uninstallCleanupPlan) revalidate() error {
 }
 
 func (directory *cleanupDirectoryPlan) revalidate() error {
-	return directory.revalidateRootName(directory.root.name, true)
+	if directory == nil || directory.root == nil {
+		return errors.New("cannot revalidate an incomplete cleanup directory plan")
+	}
+	if err := revalidateManagedCleanupDir(directory.root); err != nil {
+		if directory.rootMayDisappear && cleanupIsNotExist(err) {
+			return nil
+		}
+		return fmt.Errorf(
+			"revalidate held cleanup directory chain for %s: %w",
+			directory.root.spec.path,
+			err,
+		)
+	}
+	if err := directory.revalidateRootName(directory.root.name, true); err != nil {
+		return err
+	}
+	return directory.revalidateAbsentServiceArtifact()
+}
+
+func (directory *cleanupDirectoryPlan) revalidateAbsentServiceArtifact() error {
+	path := directory.absentServiceArtifactPath
+	if path == "" {
+		return nil
+	}
+	if len(directory.entries) != 0 ||
+		filepath.Clean(filepath.Dir(path)) !=
+			filepath.Clean(directory.root.spec.path) {
+		return fmt.Errorf(
+			"cleanup plan retained an invalid service artifact absence %s",
+			path,
+		)
+	}
+	name := filepath.Base(path)
+	if name == "" || name == "." || name == ".." {
+		return fmt.Errorf(
+			"cleanup plan retained an unsafe service artifact absence %s",
+			path,
+		)
+	}
+	if _, err := cleanupIdentityAt(directory.root.dir, name); !cleanupIsNotExist(err) {
+		if err == nil {
+			return fmt.Errorf(
+				"planned-absent service artifact reappeared at %s",
+				path,
+			)
+		}
+		return fmt.Errorf(
+			"inspect planned-absent service artifact %s: %w",
+			path,
+			err,
+		)
+	}
+	if err := revalidateManagedCleanupDir(directory.root); err != nil {
+		return fmt.Errorf(
+			"revalidate service artifact absence parent chain after name inspection for %s: %w",
+			path,
+			err,
+		)
+	}
+	return nil
+}
+
+type cleanupDirectoryMutationCoordinator struct {
+	peers            []*cleanupDirectoryPlan
+	prepared         []*managedCleanupDir
+	preparedParent   *cleanupDirFD
+	preparedIdentity cleanupIdentity
+}
+
+func (coordinator *cleanupDirectoryMutationCoordinator) prepare(
+	parent *cleanupDirFD,
+) error {
+	if coordinator == nil {
+		return nil
+	}
+	if len(coordinator.prepared) != 0 || coordinator.preparedParent != nil {
+		return errors.New("cleanup mutation coordinator already has a prepared mutation")
+	}
+	if parent == nil || parent.file == nil {
+		return errors.New("cleanup mutation coordinator requires a held parent")
+	}
+	identity, err := cleanupIdentityForFD(int(parent.file.Fd()))
+	if err != nil {
+		return err
+	}
+	if !parent.identity.sameDirectory(identity) {
+		return fmt.Errorf("cleanup mutation parent identity changed at %s", parent.path)
+	}
+	coordinator.preparedParent = parent
+	coordinator.preparedIdentity = identity
+	for _, peer := range coordinator.peers {
+		if peer == nil || peer.root == nil ||
+			!managedCleanupDirContainsHeldDirectory(peer.root, parent) {
+			continue
+		}
+		if err := revalidateManagedCleanupDir(peer.root); err != nil {
+			if peer.rootMayDisappear && cleanupIsNotExist(err) {
+				continue
+			}
+			coordinator.reset()
+			return fmt.Errorf(
+				"revalidate peer cleanup chain before shared held-directory mutation: %w",
+				err,
+			)
+		}
+		coordinator.prepared = append(coordinator.prepared, peer.root)
+	}
+	return nil
+}
+
+func (coordinator *cleanupDirectoryMutationCoordinator) refresh(
+	proof cleanupDirectoryMutationProof,
+) error {
+	if coordinator == nil {
+		return nil
+	}
+	defer coordinator.reset()
+	if coordinator.preparedParent == nil ||
+		!coordinator.preparedParent.identity.sameDirectory(proof.before) ||
+		!coordinator.preparedIdentity.sameDirectory(proof.before) ||
+		!directoryGeneration(coordinator.preparedIdentity).same(
+			directoryGeneration(proof.before),
+		) {
+		return errors.New(
+			"cleanup mutation proof does not match the prepared held parent generation",
+		)
+	}
+	for _, root := range coordinator.prepared {
+		matched, err := refreshManagedCleanupDirGenerationAfterOwnedMutationAtName(
+			root,
+			root.name,
+			proof,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"refresh peer cleanup chain after shared held-directory mutation: %w",
+				err,
+			)
+		}
+		if !matched {
+			return errors.New(
+				"prepared peer cleanup chain lost its shared held-directory component",
+			)
+		}
+	}
+	return nil
+}
+
+func (coordinator *cleanupDirectoryMutationCoordinator) reset() {
+	if coordinator == nil {
+		return
+	}
+	coordinator.prepared = nil
+	coordinator.preparedParent = nil
+	coordinator.preparedIdentity = cleanupIdentity{}
 }
 
 func (directory *cleanupDirectoryPlan) revalidateRootName(
@@ -2543,7 +3132,44 @@ func (entry *cleanupEntryPlan) revalidateName(name string, allowDisappear bool) 
 	return nil
 }
 
-func (directory *cleanupDirectoryPlan) remove(beforeQuarantine func(string) error) error {
+func (directory *cleanupDirectoryPlan) prepareOwnedCleanupMutation(
+	rootName string,
+	parent *cleanupDirFD,
+	coordinator *cleanupDirectoryMutationCoordinator,
+) error {
+	if err := revalidateManagedCleanupDirAtName(directory.root, rootName); err != nil {
+		return fmt.Errorf(
+			"revalidate cleanup chain before owned directory mutation: %w",
+			err,
+		)
+	}
+	if err := coordinator.prepare(parent); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (directory *cleanupDirectoryPlan) refreshAfterOwnedCleanupMutation(
+	rootName string,
+	proof cleanupDirectoryMutationProof,
+	coordinator *cleanupDirectoryMutationCoordinator,
+) error {
+	_, err := refreshManagedCleanupDirGenerationAfterOwnedMutationAtName(
+		directory.root,
+		rootName,
+		proof,
+	)
+	if err != nil {
+		coordinator.reset()
+		return err
+	}
+	return coordinator.refresh(proof)
+}
+
+func (directory *cleanupDirectoryPlan) remove(
+	beforeQuarantine func(string) error,
+	coordinator *cleanupDirectoryMutationCoordinator,
+) error {
 	if err := directory.revalidate(); err != nil {
 		return err
 	}
@@ -2551,7 +3177,10 @@ func (directory *cleanupDirectoryPlan) remove(beforeQuarantine func(string) erro
 	rootName := directory.root.name
 	rootMoved := false
 	if directory.removeRoot {
-		quarantineName, moved, err := directory.moveRootToQuarantine(beforeQuarantine)
+		quarantineName, moved, err := directory.moveRootToQuarantine(
+			beforeQuarantine,
+			coordinator,
+		)
 		if err != nil {
 			return err
 		}
@@ -2579,7 +3208,12 @@ func (directory *cleanupDirectoryPlan) remove(beforeQuarantine func(string) erro
 	}
 
 	for _, entry := range directory.entries {
-		if err := entry.unlink(beforeQuarantine); err != nil {
+		if err := entry.unlink(
+			beforeQuarantine,
+			directory,
+			rootName,
+			coordinator,
+		); err != nil {
 			return restoreRoot(err)
 		}
 	}
@@ -2591,7 +3225,16 @@ func (directory *cleanupDirectoryPlan) remove(beforeQuarantine func(string) erro
 		return restoreRoot(err)
 	}
 	if len(entries) != 0 {
-		return restoreRoot(fmt.Errorf("refuse to remove non-empty managed directory %s", directory.root.spec.path))
+		return restoreRoot(fmt.Errorf(
+			"refuse to remove non-empty managed directory %s",
+			directory.root.spec.path,
+		))
+	}
+	if err := revalidateManagedCleanupDirAtName(directory.root, rootName); err != nil {
+		return restoreRoot(fmt.Errorf(
+			"revalidate quarantined cleanup root before unlinkat: %w",
+			err,
+		))
 	}
 	identity, err := cleanupIdentityAt(directory.root.parent, rootName)
 	if err != nil {
@@ -2603,15 +3246,37 @@ func (directory *cleanupDirectoryPlan) remove(beforeQuarantine func(string) erro
 			directory.root.spec.path,
 		))
 	}
-	if err := cleanupUnlinkAt(directory.root.parent, rootName, true); err != nil {
-		return restoreRoot(fmt.Errorf("remove empty managed directory %s: %w", directory.root.spec.path, err))
+	if err := coordinator.prepare(directory.root.parent); err != nil {
+		return restoreRoot(err)
+	}
+	parentProof, err := performCleanupDirectoryMutation(
+		directory.root.parent,
+		func() error {
+			return cleanupUnlinkAt(directory.root.parent, rootName, true)
+		},
+	)
+	if err != nil {
+		coordinator.reset()
+		return restoreRoot(fmt.Errorf(
+			"remove empty managed directory %s: %w",
+			directory.root.spec.path,
+			err,
+		))
 	}
 	rootMoved = false
+	if err := coordinator.refresh(parentProof); err != nil {
+		return fmt.Errorf(
+			"refresh shared cleanup chains after removing empty managed directory %s: %w",
+			directory.root.spec.path,
+			err,
+		)
+	}
 	return nil
 }
 
 func (directory *cleanupDirectoryPlan) moveRootToQuarantine(
 	beforeQuarantine func(string) error,
+	coordinator *cleanupDirectoryMutationCoordinator,
 ) (string, bool, error) {
 	quarantineName, err := newCleanupQuarantineName()
 	if err != nil {
@@ -2622,15 +3287,36 @@ func (directory *cleanupDirectoryPlan) moveRootToQuarantine(
 			return "", false, err
 		}
 	}
-	err = cleanupRenameNoReplaceAt(
+	if err := directory.revalidate(); err != nil {
+		return "", false, fmt.Errorf(
+			"revalidate cleanup root after quarantine hook: %w",
+			err,
+		)
+	}
+	if err := coordinator.prepare(directory.root.parent); err != nil {
+		return "", false, err
+	}
+	rootBefore, err := cleanupIdentityForFD(int(directory.root.dir.file.Fd()))
+	if err != nil {
+		coordinator.reset()
+		return "", false, err
+	}
+	parentProof, err := performCleanupDirectoryMutation(
 		directory.root.parent,
-		directory.root.name,
-		quarantineName,
+		func() error {
+			return cleanupRenameNoReplaceAt(
+				directory.root.parent,
+				directory.root.name,
+				quarantineName,
+			)
+		},
 	)
 	if cleanupIsNotExist(err) && directory.rootMayDisappear {
+		coordinator.reset()
 		return "", false, nil
 	}
 	if err != nil {
+		coordinator.reset()
 		return "", false, fmt.Errorf(
 			"move cleanup directory %s to unique quarantine: %w",
 			directory.root.spec.path,
@@ -2638,6 +3324,7 @@ func (directory *cleanupDirectoryPlan) moveRootToQuarantine(
 		)
 	}
 	if err := directory.revalidateRootName(quarantineName, false); err != nil {
+		coordinator.reset()
 		return "", false, errors.Join(
 			fmt.Errorf(
 				"refuse quarantined cleanup directory %s: %w",
@@ -2652,14 +3339,78 @@ func (directory *cleanupDirectoryPlan) moveRootToQuarantine(
 			),
 		)
 	}
+	rootAfter, err := cleanupIdentityForFD(int(directory.root.dir.file.Fd()))
+	if err != nil {
+		coordinator.reset()
+		return "", false, errors.Join(
+			fmt.Errorf(
+				"inspect quarantined cleanup root %s: %w",
+				directory.root.spec.path,
+				err,
+			),
+			restoreCleanupQuarantine(
+				directory.root.parent,
+				quarantineName,
+				directory.root.name,
+				directory.root.spec.path,
+			),
+		)
+	}
+	if err := adoptManagedCleanupDirAfterOwnedRootRename(
+		directory.root,
+		quarantineName,
+		parentProof,
+		rootBefore,
+		rootAfter,
+	); err != nil {
+		coordinator.reset()
+		return "", false, errors.Join(
+			fmt.Errorf(
+				"adopt exact quarantined cleanup root generations for %s: %w",
+				directory.root.spec.path,
+				err,
+			),
+			restoreCleanupQuarantine(
+				directory.root.parent,
+				quarantineName,
+				directory.root.name,
+				directory.root.spec.path,
+			),
+		)
+	}
+	if err := coordinator.refresh(parentProof); err != nil {
+		return "", false, errors.Join(
+			fmt.Errorf(
+				"refresh shared cleanup chains after quarantining %s: %w",
+				directory.root.spec.path,
+				err,
+			),
+			restoreCleanupQuarantine(
+				directory.root.parent,
+				quarantineName,
+				directory.root.name,
+				directory.root.spec.path,
+			),
+		)
+	}
 	return quarantineName, true, nil
 }
 
-func (entry *cleanupEntryPlan) unlink(beforeQuarantine func(string) error) error {
+func (entry *cleanupEntryPlan) unlink(
+	beforeQuarantine func(string) error,
+	directory *cleanupDirectoryPlan,
+	rootName string,
+	coordinator *cleanupDirectoryMutationCoordinator,
+) error {
 	if !entry.remove {
 		return nil
 	}
-	quarantineName, moved, err := entry.moveToQuarantine(beforeQuarantine)
+	quarantineName, moved, err := entry.moveToQuarantine(
+		beforeQuarantine,
+		directory,
+		rootName,
+		coordinator,
+	)
 	if err != nil || !moved {
 		return err
 	}
@@ -2678,7 +3429,12 @@ func (entry *cleanupEntryPlan) unlink(beforeQuarantine func(string) error) error
 
 	if entry.directory {
 		for _, child := range entry.children {
-			if err := child.unlink(beforeQuarantine); err != nil {
+			if err := child.unlink(
+				beforeQuarantine,
+				directory,
+				rootName,
+				coordinator,
+			); err != nil {
 				return restoreEntry(err)
 			}
 		}
@@ -2687,7 +3443,10 @@ func (entry *cleanupEntryPlan) unlink(beforeQuarantine func(string) error) error
 			return restoreEntry(err)
 		}
 		if len(entries) != 0 {
-			return restoreEntry(fmt.Errorf("refuse to remove non-empty managed directory %s", entry.path))
+			return restoreEntry(fmt.Errorf(
+				"refuse to remove non-empty managed directory %s",
+				entry.path,
+			))
 		}
 	}
 
@@ -2712,14 +3471,46 @@ func (entry *cleanupEntryPlan) unlink(beforeQuarantine func(string) error) error
 			entry.path,
 		))
 	}
-	if err := cleanupUnlinkAt(entry.parent, quarantineName, entry.directory); err != nil {
-		return restoreEntry(fmt.Errorf("remove quarantined managed entry %s: %w", entry.path, err))
+	if err := directory.prepareOwnedCleanupMutation(
+		rootName,
+		entry.parent,
+		coordinator,
+	); err != nil {
+		return restoreEntry(err)
+	}
+	parentProof, err := performCleanupDirectoryMutation(
+		entry.parent,
+		func() error {
+			return cleanupUnlinkAt(entry.parent, quarantineName, entry.directory)
+		},
+	)
+	if err != nil {
+		coordinator.reset()
+		return restoreEntry(fmt.Errorf(
+			"remove quarantined managed entry %s: %w",
+			entry.path,
+			err,
+		))
+	}
+	if err := directory.refreshAfterOwnedCleanupMutation(
+		rootName,
+		parentProof,
+		coordinator,
+	); err != nil {
+		return fmt.Errorf(
+			"refresh cleanup chains after removing quarantined managed entry %s: %w",
+			entry.path,
+			err,
+		)
 	}
 	return nil
 }
 
 func (entry *cleanupEntryPlan) moveToQuarantine(
 	beforeQuarantine func(string) error,
+	directory *cleanupDirectoryPlan,
+	rootName string,
+	coordinator *cleanupDirectoryMutationCoordinator,
 ) (string, bool, error) {
 	quarantineName, err := newCleanupQuarantineName()
 	if err != nil {
@@ -2730,15 +3521,52 @@ func (entry *cleanupEntryPlan) moveToQuarantine(
 			return "", false, err
 		}
 	}
-	err = cleanupRenameNoReplaceAt(entry.parent, entry.name, quarantineName)
+	if err := directory.prepareOwnedCleanupMutation(
+		rootName,
+		entry.parent,
+		coordinator,
+	); err != nil {
+		return "", false, err
+	}
+	parentProof, err := performCleanupDirectoryMutation(
+		entry.parent,
+		func() error {
+			return cleanupRenameNoReplaceAt(
+				entry.parent,
+				entry.name,
+				quarantineName,
+			)
+		},
+	)
 	if cleanupIsNotExist(err) && entry.mayDisappear {
+		coordinator.reset()
 		return "", false, nil
 	}
 	if err != nil {
+		coordinator.reset()
 		return "", false, fmt.Errorf(
 			"move managed entry %s to unique quarantine: %w",
 			entry.path,
 			err,
+		)
+	}
+	if err := directory.refreshAfterOwnedCleanupMutation(
+		rootName,
+		parentProof,
+		coordinator,
+	); err != nil {
+		return "", false, errors.Join(
+			fmt.Errorf(
+				"refresh cleanup chains after quarantining managed entry %s: %w",
+				entry.path,
+				err,
+			),
+			restoreCleanupQuarantine(
+				entry.parent,
+				quarantineName,
+				entry.name,
+				entry.path,
+			),
 		)
 	}
 	var movedIdentity cleanupIdentity

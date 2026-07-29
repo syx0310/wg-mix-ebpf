@@ -598,19 +598,20 @@ func TestParseSystemdUnitPropertiesRejectsAmbiguousOutput(t *testing.T) {
 func TestSystemdServiceActionRejectsFinalPathSwapBeforeManagerReload(t *testing.T) {
 	layout := newCleanupTestLayoutForSystem(t, "systemd-final-exec-swap", "systemd")
 	unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	lifecyclePath := filepath.Join(t.TempDir(), "daemon.lease")
+	setCleanupTestEnvironment(t, layout)
+	installFakeSystemctl(t, commandLog, "")
 	plan, err := prepareUninstallCleanup(
 		layout,
 		"systemd",
 		false,
-		filepath.Join(t.TempDir(), "daemon.lease"),
+		lifecyclePath,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer plan.close()
-	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
-	setCleanupTestEnvironment(t, layout)
-	installFakeSystemctl(t, commandLog, "")
 
 	originalPath := unitPath + ".owned-original"
 	hookRan := false
@@ -2594,6 +2595,7 @@ func TestCleanupPlanRejectsManagedDirectoryReplacement(t *testing.T) {
 func TestCleanupPlanRejectsFileInodeReplacement(t *testing.T) {
 	layout := newCleanupTestLayout(t, "file-swap")
 	statusPath := writeCleanupTestStatus(t, layout)
+	originalStatus := filepath.Join(t.TempDir(), "status.original")
 	plan, err := prepareUninstallCleanup(
 		layout,
 		"unknown",
@@ -2604,7 +2606,6 @@ func TestCleanupPlanRejectsFileInodeReplacement(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer plan.close()
-	originalStatus := filepath.Join(t.TempDir(), "status.original")
 	plan.beforeExecute = func() error {
 		if err := os.Rename(statusPath, originalStatus); err != nil {
 			return err
@@ -2612,7 +2613,9 @@ func TestCleanupPlanRejectsFileInodeReplacement(t *testing.T) {
 		return os.WriteFile(statusPath, []byte("{}\n"), 0o600)
 	}
 	err = plan.execute()
-	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+	if err == nil ||
+		(!strings.Contains(err.Error(), "identity changed") &&
+			!strings.Contains(err.Error(), "directory generation changed")) {
 		t.Fatalf("execute error = %v, want inode replacement rejection", err)
 	}
 	for _, path := range []string{statusPath, originalStatus} {
@@ -2688,6 +2691,7 @@ func TestCleanupQuarantineRestoresForeignFileSwappedAtFinalHook(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	originalUnit := filepath.Join(t.TempDir(), "unit.original")
 	plan, err := prepareUninstallCleanup(
 		layout,
 		"systemd",
@@ -2699,7 +2703,6 @@ func TestCleanupQuarantineRestoresForeignFileSwappedAtFinalHook(t *testing.T) {
 	}
 	defer plan.close()
 
-	originalUnit := filepath.Join(t.TempDir(), "unit.original")
 	hookRan := false
 	plan.beforeQuarantine = func(path string) error {
 		if path != unitPath || hookRan {
@@ -2712,7 +2715,9 @@ func TestCleanupQuarantineRestoresForeignFileSwappedAtFinalHook(t *testing.T) {
 		return os.WriteFile(unitPath, []byte("foreign unit\n"), 0o600)
 	}
 	err = plan.execute()
-	if err == nil || !strings.Contains(err.Error(), "moved object identity") {
+	if err == nil ||
+		(!strings.Contains(err.Error(), "moved object identity") &&
+			!strings.Contains(err.Error(), "component generation changed")) {
 		t.Fatalf("execute error = %v, want quarantined identity rejection", err)
 	}
 	if !hookRan {
@@ -2746,6 +2751,15 @@ func TestCleanupQuarantineRestoresForeignRootSwappedAtFinalHook(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	originalStateDir := layout.VarLibDir + "-original"
+	foreignStateDir := filepath.Join(filepath.Dir(layout.VarLibDir), "foreign-state")
+	if err := os.Mkdir(foreignStateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	foreignMarker := filepath.Join(foreignStateDir, "keep")
+	if err := os.WriteFile(foreignMarker, []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	plan, err := prepareUninstallCleanup(
 		layout,
 		"unknown",
@@ -2757,15 +2771,6 @@ func TestCleanupQuarantineRestoresForeignRootSwappedAtFinalHook(t *testing.T) {
 	}
 	defer plan.close()
 
-	originalStateDir := layout.VarLibDir + "-original"
-	foreignStateDir := filepath.Join(filepath.Dir(layout.VarLibDir), "foreign-state")
-	if err := os.Mkdir(foreignStateDir, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	foreignMarker := filepath.Join(foreignStateDir, "keep")
-	if err := os.WriteFile(foreignMarker, []byte("keep\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	hookRan := false
 	plan.beforeQuarantine = func(path string) error {
 		if path != layout.VarLibDir || hookRan {
@@ -2778,7 +2783,10 @@ func TestCleanupQuarantineRestoresForeignRootSwappedAtFinalHook(t *testing.T) {
 		return os.Rename(foreignStateDir, layout.VarLibDir)
 	}
 	err = plan.execute()
-	if err == nil || !strings.Contains(err.Error(), "directory identity changed") {
+	if err == nil ||
+		(!strings.Contains(err.Error(), "directory identity changed") &&
+			!strings.Contains(err.Error(), "held parent generation changed") &&
+			!strings.Contains(err.Error(), "pathname no longer names")) {
 		t.Fatalf("execute error = %v, want quarantined root rejection", err)
 	}
 	if !hookRan {
@@ -2813,7 +2821,9 @@ func TestCleanupPlanRevalidatesAllTargetsBeforeFirstUnlink(t *testing.T) {
 		return os.WriteFile(lateUnknown, []byte("keep\n"), 0o600)
 	}
 	err = plan.execute()
-	if err == nil || !strings.Contains(err.Error(), "unplanned entries") {
+	if err == nil ||
+		(!strings.Contains(err.Error(), "unplanned entries") &&
+			!strings.Contains(err.Error(), "directory generation changed")) {
 		t.Fatalf("execute error = %v, want late-target rejection", err)
 	}
 	for _, path := range []string{statusPath, lateUnknown} {
@@ -3270,11 +3280,13 @@ printf '%s\n%s\n%s\n%s\n' \
 func TestOpenWrtServiceActionRejectsFinalPathSwapWithoutExecutingForeign(t *testing.T) {
 	layout := newCleanupTestLayoutForSystem(t, "openwrt-final-exec-swap", "openwrt")
 	initPath := filepath.Join(layout.OpenWrtInitDir, "wg-mix-ebpf")
+	lifecyclePath := filepath.Join(t.TempDir(), "daemon.lease")
+	foreignLog := filepath.Join(t.TempDir(), "foreign-executed")
 	plan, err := prepareUninstallCleanup(
 		layout,
 		"openwrt",
 		false,
-		filepath.Join(t.TempDir(), "daemon.lease"),
+		lifecyclePath,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -3282,7 +3294,6 @@ func TestOpenWrtServiceActionRejectsFinalPathSwapWithoutExecutingForeign(t *test
 	defer plan.close()
 
 	originalPath := initPath + ".owned-original"
-	foreignLog := filepath.Join(t.TempDir(), "foreign-executed")
 	t.Setenv("WG_MIX_EBPF_TEST_FOREIGN_INIT_LOG", foreignLog)
 	hookRan := false
 	plan.beforeServiceExec = func(path string) error {
@@ -3546,7 +3557,16 @@ func installFakeSystemctl(t *testing.T, commandLog string, failAction string) {
 	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_ACTION", "")
 	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_PATH", "")
 	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_CONTENT", "")
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_CHAIN_MUTATE_ACTION", "")
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_CHAIN_MUTATE_PATH", "")
 	script := `#!/bin/sh
+if [ -n "$WG_MIX_EBPF_TEST_SYSTEMCTL_CHAIN_MUTATE_ACTION" ] &&
+	[ "$1" = "$WG_MIX_EBPF_TEST_SYSTEMCTL_CHAIN_MUTATE_ACTION" ]; then
+	mv "$WG_MIX_EBPF_TEST_SYSTEMCTL_CHAIN_MUTATE_PATH" \
+		"$WG_MIX_EBPF_TEST_SYSTEMCTL_CHAIN_MUTATE_PATH.chain-away" || exit
+	mv "$WG_MIX_EBPF_TEST_SYSTEMCTL_CHAIN_MUTATE_PATH.chain-away" \
+		"$WG_MIX_EBPF_TEST_SYSTEMCTL_CHAIN_MUTATE_PATH" || exit
+fi
 if [ -n "$WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_ACTION" ] &&
 	[ "$1" = "$WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_ACTION" ]; then
 	mv "$WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_PATH" \

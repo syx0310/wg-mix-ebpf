@@ -628,15 +628,18 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 		if err := cleanupPlan.executeServiceArtifacts(); err != nil {
 			return fmt.Errorf("remove descriptor-anchored service artifacts: %w", err)
 		}
+		if system == "systemd" {
+			if err := runSystemdManagerReloadAfterServiceArtifactRemoval(
+				ctx,
+				cleanupPlan,
+			); err != nil {
+				return err
+			}
+		}
 		if err := cleanupPlan.close(); err != nil {
 			return fmt.Errorf("close service-artifact cleanup handles: %w", err)
 		}
 		cleanupPlan = nil
-		if system == "systemd" {
-			if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
-				return err
-			}
-		}
 
 		cleanupPlan, err = prepareUninstallCleanup(
 			paths,

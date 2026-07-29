@@ -289,9 +289,61 @@ func validateServiceArtifactFile(
 }
 
 type verifiedServiceArtifact struct {
-	file        *os.File
-	entry       *cleanupEntryPlan
-	ownedParent *managedCleanupDir
+	file                        *os.File
+	entry                       *cleanupEntryPlan
+	ownedParent                 *managedCleanupDir
+	borrowedParent              *managedCleanupDir
+	beforeFinalParentRevalidate func() error
+}
+
+type verifiedServiceArtifactAbsence struct {
+	parent *managedCleanupDir
+	path   string
+	name   string
+}
+
+func (absence *verifiedServiceArtifactAbsence) close() error {
+	if absence == nil {
+		return nil
+	}
+	// The cleanup plan owns the retained parent chain. Absence verification
+	// borrows it across the manager boundary and must not close it.
+	absence.parent = nil
+	return nil
+}
+
+func (absence *verifiedServiceArtifactAbsence) revalidate() error {
+	if absence == nil || absence.parent == nil || absence.name == "" {
+		return errors.New("cannot revalidate an unheld service artifact absence")
+	}
+	if err := revalidateManagedCleanupDir(absence.parent); err != nil {
+		return fmt.Errorf(
+			"revalidate service artifact absence parent chain for %s: %w",
+			absence.path,
+			err,
+		)
+	}
+	if _, err := cleanupIdentityAt(absence.parent.dir, absence.name); !cleanupIsNotExist(err) {
+		if err == nil {
+			return fmt.Errorf(
+				"refuse systemd manager reload: service artifact reappeared at %s",
+				absence.path,
+			)
+		}
+		return fmt.Errorf(
+			"inspect removed service artifact %s: %w",
+			absence.path,
+			err,
+		)
+	}
+	if err := revalidateManagedCleanupDir(absence.parent); err != nil {
+		return fmt.Errorf(
+			"revalidate service artifact absence parent chain after name inspection for %s: %w",
+			absence.path,
+			err,
+		)
+	}
+	return nil
 }
 
 func (artifact *verifiedServiceArtifact) close() error {
@@ -307,6 +359,9 @@ func (artifact *verifiedServiceArtifact) close() error {
 		errs = append(errs, artifact.ownedParent.close())
 		artifact.ownedParent = nil
 	}
+	// borrowedParent belongs to the uninstall cleanup plan. The artifact only
+	// borrows it for execution-boundary revalidation and must never close it.
+	artifact.borrowedParent = nil
 	return errors.Join(errs...)
 }
 
@@ -314,14 +369,27 @@ func (artifact *verifiedServiceArtifact) revalidateForExecution() error {
 	if artifact == nil || artifact.file == nil || artifact.entry == nil {
 		return errors.New("cannot execute an unverified service artifact")
 	}
-	if artifact.ownedParent != nil {
-		if err := revalidateManagedCleanupDir(artifact.ownedParent); err != nil {
-			return fmt.Errorf(
-				"refuse service artifact execution: parent identity changed for %s: %w",
-				artifact.entry.path,
-				err,
-			)
-		}
+	if (artifact.ownedParent == nil) == (artifact.borrowedParent == nil) {
+		return errors.New(
+			"service artifact must hold exactly one owned or borrowed parent chain",
+		)
+	}
+	parent := artifact.ownedParent
+	if parent == nil {
+		parent = artifact.borrowedParent
+	}
+	if artifact.entry.parent != parent.dir {
+		return fmt.Errorf(
+			"service artifact entry parent is not the held final directory for %s",
+			artifact.entry.path,
+		)
+	}
+	if err := revalidateManagedCleanupDir(parent); err != nil {
+		return fmt.Errorf(
+			"refuse service artifact execution: parent identity changed for %s: %w",
+			artifact.entry.path,
+			err,
+		)
 	}
 	entry := artifact.entry
 	if _, err := artifact.file.Seek(0, io.SeekStart); err != nil {
@@ -348,15 +416,33 @@ func (artifact *verifiedServiceArtifact) revalidateForExecution() error {
 	if !fdIdentity.sameRegularFile(namedIdentity) {
 		return fmt.Errorf("refuse service artifact execution: pathname changed for %s", entry.path)
 	}
-	_, err = artifact.file.Seek(0, io.SeekStart)
-	return err
+	if _, err := artifact.file.Seek(0, io.SeekStart); err != nil {
+		return err
+	}
+	if artifact.beforeFinalParentRevalidate != nil {
+		if err := artifact.beforeFinalParentRevalidate(); err != nil {
+			return fmt.Errorf(
+				"run service artifact pre-final-chain test hook: %w",
+				err,
+			)
+		}
+	}
+	if err := revalidateManagedCleanupDir(parent); err != nil {
+		return fmt.Errorf(
+			"refuse service artifact execution: parent identity changed "+
+				"after file and name inspection for %s: %w",
+			artifact.entry.path,
+			err,
+		)
+	}
+	return nil
 }
 
 func (plan *uninstallCleanupPlan) serviceArtifactEntry(
 	kind string,
-) (*cleanupManifestArtifact, *cleanupEntryPlan, bool, error) {
+) (*cleanupManifestArtifact, *cleanupDirectoryPlan, *cleanupEntryPlan, bool, error) {
 	if plan == nil {
-		return nil, nil, false, nil
+		return nil, nil, nil, false, nil
 	}
 	var declared *cleanupManifestArtifact
 	for index := range plan.manifest.Artifacts {
@@ -365,44 +451,75 @@ func (plan *uninstallCleanupPlan) serviceArtifactEntry(
 			continue
 		}
 		if declared != nil {
-			return nil, nil, false, fmt.Errorf("duplicate service artifact kind %q", kind)
+			return nil, nil, nil, false, fmt.Errorf(
+				"duplicate service artifact kind %q",
+				kind,
+			)
 		}
 		declared = artifact
 	}
 	if declared == nil {
-		return nil, nil, false, nil
+		return nil, nil, nil, false, nil
 	}
+	var matchedDirectory *cleanupDirectoryPlan
+	var absenceDirectory *cleanupDirectoryPlan
 	var matched *cleanupEntryPlan
 	for _, directory := range plan.directories {
+		if directory == nil {
+			continue
+		}
+		if directory.absentServiceArtifactPath == declared.Path {
+			if absenceDirectory != nil {
+				return nil, nil, nil, false, fmt.Errorf(
+					"duplicate held absence for service artifact %s",
+					declared.Path,
+				)
+			}
+			absenceDirectory = directory
+		}
 		for _, entry := range directory.entries {
 			if filepath.Clean(entry.path) != filepath.Clean(declared.Path) {
 				continue
 			}
 			if matched != nil {
-				return nil, nil, false, fmt.Errorf(
+				return nil, nil, nil, false, fmt.Errorf(
 					"duplicate planned service artifact %s",
 					declared.Path,
 				)
 			}
+			matchedDirectory = directory
 			matched = entry
 		}
 	}
 	if matched == nil {
-		return declared, nil, false, nil
+		return declared, absenceDirectory, nil, false, nil
+	}
+	if absenceDirectory != nil {
+		return nil, nil, nil, false, fmt.Errorf(
+			"service artifact %s is both present and held absent",
+			declared.Path,
+		)
 	}
 	if !matched.digestKnown || hex.EncodeToString(matched.digest[:]) != declared.SHA256 {
-		return nil, nil, false, fmt.Errorf(
+		return nil, nil, nil, false, fmt.Errorf(
 			"planned service artifact %s lacks its declared digest",
 			declared.Path,
 		)
 	}
-	return declared, matched, true, nil
+	if matchedDirectory == nil || matchedDirectory.root == nil ||
+		matched.parent != matchedDirectory.root.dir {
+		return nil, nil, nil, false, fmt.Errorf(
+			"planned service artifact %s lost its held parent directory",
+			declared.Path,
+		)
+	}
+	return declared, matchedDirectory, matched, true, nil
 }
 
 func (plan *uninstallCleanupPlan) openServiceArtifactForExecution(
 	kind string,
 ) (*verifiedServiceArtifact, bool, error) {
-	_, entry, exists, err := plan.serviceArtifactEntry(kind)
+	_, directory, entry, exists, err := plan.serviceArtifactEntry(kind)
 	if err != nil || !exists {
 		return nil, exists, err
 	}
@@ -417,7 +534,93 @@ func (plan *uninstallCleanupPlan) openServiceArtifactForExecution(
 			entry.path,
 		)
 	}
-	return &verifiedServiceArtifact{file: file, entry: entry}, true, nil
+	return &verifiedServiceArtifact{
+		file:                        file,
+		entry:                       entry,
+		borrowedParent:              directory.root,
+		beforeFinalParentRevalidate: plan.beforeServiceFinalChainCheck,
+	}, true, nil
+}
+
+func (plan *uninstallCleanupPlan) openServiceArtifactAbsence(
+	kind string,
+) (*verifiedServiceArtifactAbsence, error) {
+	declared, directory, _, exists, err := plan.serviceArtifactEntry(kind)
+	if err != nil {
+		return nil, err
+	}
+	if declared == nil {
+		return nil, nil
+	}
+	absence := &verifiedServiceArtifactAbsence{
+		path: declared.Path,
+		name: filepath.Base(declared.Path),
+	}
+	if directory == nil || directory.root == nil {
+		return nil, fmt.Errorf(
+			"cleanup plan did not retain the parent chain for service artifact %s",
+			declared.Path,
+		)
+	}
+	if exists || directory.absentServiceArtifactPath == declared.Path {
+		absence.parent = directory.root
+		return absence, nil
+	}
+	return nil, fmt.Errorf(
+		"cleanup plan retained an inconsistent absence for service artifact %s",
+		declared.Path,
+	)
+}
+
+func runSystemdManagerReloadAfterServiceArtifactRemoval(
+	ctx context.Context,
+	plan *uninstallCleanupPlan,
+) (retErr error) {
+	absence, err := plan.openServiceArtifactAbsence("systemd-unit")
+	if err != nil {
+		return err
+	}
+	if absence == nil {
+		return nil
+	}
+	defer func() {
+		if err := absence.close(); err != nil {
+			retErr = errors.Join(
+				retErr,
+				fmt.Errorf("close verified systemd unit absence handles: %w", err),
+			)
+		}
+	}()
+	if err := absence.revalidate(); err != nil {
+		return fmt.Errorf(
+			"revalidate removed systemd unit before manager reload: %w",
+			err,
+		)
+	}
+	if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+		return err
+	}
+	if err := absence.revalidate(); err != nil {
+		return fmt.Errorf(
+			"revalidate removed systemd unit after manager reload: %w",
+			err,
+		)
+	}
+	return nil
+}
+
+func revalidateServiceArtifactBoundary(
+	artifact *verifiedServiceArtifact,
+	boundary string,
+) error {
+	if err := artifact.revalidateForExecution(); err != nil {
+		return fmt.Errorf(
+			"revalidate verified service artifact %s: %w",
+			boundary,
+			err,
+		)
+	}
+	return nil
 }
 
 func runOpenWrtServiceActions(
@@ -448,10 +651,25 @@ func runOpenWrtServiceActions(
 				return err
 			}
 		}
-		if err := artifact.revalidateForExecution(); err != nil {
+		if err := revalidateServiceArtifactBoundary(
+			artifact,
+			fmt.Sprintf("after test hook and before OpenWrt %s", action),
+		); err != nil {
 			return err
 		}
-		if err := runCommandFromVerifiedFile(ctx, artifact.file, action); err != nil {
+		var execErr error
+		if plan.serviceActionExec != nil {
+			execErr = plan.serviceActionExec(artifact.file, action)
+		} else {
+			execErr = runCommandFromVerifiedFile(ctx, artifact.file, action)
+		}
+		if execErr != nil {
+			return execErr
+		}
+		if err := revalidateServiceArtifactBoundary(
+			artifact,
+			fmt.Sprintf("after OpenWrt %s", action),
+		); err != nil {
 			return err
 		}
 	}
@@ -489,33 +707,60 @@ func runSystemdServiceActions(
 				return err
 			}
 		}
-		if err := artifact.revalidateForExecution(); err != nil {
+		if err := revalidateServiceArtifactBoundary(
+			artifact,
+			fmt.Sprintf("after test hook for systemd %s", action),
+		); err != nil {
 			return err
 		}
 		if index == 0 {
+			if err := revalidateServiceArtifactBoundary(
+				artifact,
+				"before systemd manager reload",
+			); err != nil {
+				return err
+			}
 			if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
 				return fmt.Errorf(
 					"synchronize systemd manager with verified owned unit: %w",
 					err,
 				)
 			}
-			if err := artifact.revalidateForExecution(); err != nil {
-				return fmt.Errorf(
-					"revalidate owned systemd unit after manager reload: %w",
-					err,
-				)
+			if err := revalidateServiceArtifactBoundary(
+				artifact,
+				"after systemd manager reload",
+			); err != nil {
+				return err
 			}
+		}
+		if err := revalidateServiceArtifactBoundary(
+			artifact,
+			"before systemd manager inspection",
+		); err != nil {
+			return err
 		}
 		if err := verifySystemdServiceFragment(ctx, paths); err != nil {
 			return err
 		}
-		if err := artifact.revalidateForExecution(); err != nil {
-			return fmt.Errorf(
-				"revalidate owned systemd unit after manager inspection: %w",
-				err,
-			)
+		if err := revalidateServiceArtifactBoundary(
+			artifact,
+			"after systemd manager inspection",
+		); err != nil {
+			return err
+		}
+		if err := revalidateServiceArtifactBoundary(
+			artifact,
+			fmt.Sprintf("before systemd %s", action),
+		); err != nil {
+			return err
 		}
 		if err := runCommand(ctx, "systemctl", action, "wg-mix-ebpf.service"); err != nil {
+			return err
+		}
+		if err := revalidateServiceArtifactBoundary(
+			artifact,
+			fmt.Sprintf("after systemd %s", action),
+		); err != nil {
 			return err
 		}
 	}
@@ -643,6 +888,9 @@ func runInstalledSystemdServiceCommit(
 	if err := revalidateMetadata("before manager reload"); err != nil {
 		return err
 	}
+	if err := revalidate("immediately before manager reload"); err != nil {
+		return err
+	}
 	if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
 		return err
 	}
@@ -650,6 +898,9 @@ func runInstalledSystemdServiceCommit(
 		return err
 	}
 	if err := revalidateMetadata("after manager reload"); err != nil {
+		return err
+	}
+	if err := revalidate("before manager inspection"); err != nil {
 		return err
 	}
 	if err := verifySystemdServiceFragment(ctx, paths); err != nil {
@@ -680,6 +931,9 @@ func runInstalledSystemdServiceCommit(
 		return err
 	}
 	if err := revalidateMetadata("before enable"); err != nil {
+		return err
+	}
+	if err := revalidate("immediately before enable link transaction"); err != nil {
 		return err
 	}
 	transactionHooks := systemdEnableLinkTransactionHooks{}
@@ -718,6 +972,9 @@ func runInstalledSystemdServiceCommit(
 	if err := revalidateMetadata("after enable link creation"); err != nil {
 		return err
 	}
+	if err := revalidate("immediately before enable link commit"); err != nil {
+		return err
+	}
 	if err := transaction.commit(); err != nil {
 		return fmt.Errorf("commit exact systemd enable link: %w", err)
 	}
@@ -754,6 +1011,13 @@ func runInstalledOpenWrtServiceAction(
 				err,
 			)
 		}
+	}
+	if err := artifact.revalidateForExecution(); err != nil {
+		return fmt.Errorf(
+			"revalidate installed OpenWrt service immediately before %s: %w",
+			action,
+			err,
+		)
 	}
 	if err := runCommandFromVerifiedFile(ctx, artifact.file, action); err != nil {
 		return err
