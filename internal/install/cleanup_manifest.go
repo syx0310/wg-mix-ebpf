@@ -50,6 +50,7 @@ const (
 type cleanupManifestWriteOptions struct {
 	Fresh         bool
 	AdoptExisting bool
+	LifecyclePath string
 }
 
 func expectedCleanupManifest(paths paths, system string, installationID string) cleanupManifest {
@@ -257,8 +258,20 @@ func writeCleanupManifest(
 		if err != nil {
 			return err
 		}
-		if err := validateCleanupManifestBootstrap(configDir, paths, system, installationID); err != nil {
-			return err
+		if options.Fresh {
+			if err := validateFreshCleanupManifestBootstrap(
+				configDir,
+				paths,
+				system,
+				installationID,
+				options.LifecyclePath,
+			); err != nil {
+				return err
+			}
+		} else {
+			if err := validateCleanupManifestBootstrap(configDir, paths, system, installationID); err != nil {
+				return err
+			}
 		}
 	default:
 		return err

@@ -47,6 +47,8 @@ type Plan struct {
 	BinaryPath string   `json:"binary_path"`
 }
 
+type installAfterInspectHookContextKey struct{}
+
 func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -100,6 +102,11 @@ func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if opts.DryRun {
 		return plan, nil
 	}
+	if hook, ok := ctx.Value(installAfterInspectHookContextKey{}).(func() error); ok && hook != nil {
+		if err := hook(); err != nil {
+			return nil, fmt.Errorf("run install post-inspection hook: %w", err)
+		}
+	}
 
 	owner := lockfile.LifecycleOwner{
 		PID:        os.Getpid(),
@@ -107,9 +114,20 @@ func Install(ctx context.Context, opts Options) (*Plan, error) {
 		ConfigPath: paths.ConfigPath,
 		RunDir:     paths.RunDir,
 	}
-	if err := lockfile.WithLifecycle(ctx, nil, owner, func(*lockfile.LifecycleLease) error {
+	if err := lockfile.WithLifecycle(ctx, nil, owner, func(lease *lockfile.LifecycleLease) error {
 		return lockfile.WithLock(ctx, paths.RunDir, func() error {
-			return applyInstall(ctx, opts, system, paths, ownership)
+			lockedOwnership, err := inspectLockedInstallOwnership(
+				paths,
+				system,
+				ownership,
+				opts.AdoptExisting,
+				lockfile.LifecycleLeasePath(ctx),
+				lease,
+			)
+			if err != nil {
+				return err
+			}
+			return applyInstall(ctx, opts, system, paths, lockedOwnership)
 		})
 	}); err != nil {
 		return nil, err
@@ -124,16 +142,29 @@ func applyInstall(
 	paths paths,
 	ownership cleanupOwnershipState,
 ) error {
-	for _, dir := range []string{filepath.Dir(paths.ConfigPath), paths.VarLibDir, paths.RunDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("create %s: %w", dir, err)
+	configDir := filepath.Dir(paths.ConfigPath)
+	if ownership == cleanupOwnershipAbsent {
+		if err := os.Mkdir(configDir, 0o755); err != nil {
+			return fmt.Errorf(
+				"exclusively create fresh config directory %s: %w",
+				configDir,
+				err,
+			)
 		}
+	} else if err := os.MkdirAll(configDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", configDir, err)
 	}
 	if err := writeCleanupManifest(paths, system, cleanupManifestWriteOptions{
 		Fresh:         ownership == cleanupOwnershipAbsent,
 		AdoptExisting: ownership == cleanupOwnershipUnmarked && opts.AdoptExisting,
+		LifecyclePath: lockfile.LifecycleLeasePath(ctx),
 	}); err != nil {
 		return err
+	}
+	for _, dir := range []string{paths.VarLibDir, paths.RunDir} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			return fmt.Errorf("create %s: %w", dir, err)
+		}
 	}
 	if err := installBinary(paths.BinaryPath); err != nil {
 		return err

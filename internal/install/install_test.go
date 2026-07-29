@@ -682,6 +682,79 @@ func TestInstallDryRunValidatesExplicitAdoptionWithoutWrites(t *testing.T) {
 	}
 }
 
+func TestInstallFreshRecheckRejectsUnmarkedLayoutInjectedAfterPreflight(t *testing.T) {
+	layout := cleanupTestPaths(t.TempDir(), "fresh-recheck-race")
+	setCleanupTestEnvironment(t, layout)
+	var configBefore []byte
+	var configIdentity os.FileInfo
+	var lockIdentity os.FileInfo
+	hookRan := false
+	hook := func() error {
+		hookRan = true
+		if err := populateUnmarkedCleanupTestLayout(layout, "unknown"); err != nil {
+			return err
+		}
+		var err error
+		configBefore, err = os.ReadFile(layout.ConfigPath)
+		if err != nil {
+			return err
+		}
+		configIdentity, err = os.Stat(layout.ConfigPath)
+		if err != nil {
+			return err
+		}
+		lockIdentity, err = os.Stat(filepath.Join(layout.RunDir, "lock"))
+		return err
+	}
+	ctx := context.WithValue(
+		lockfile.WithLifecyclePathForTest(
+			t.Context(),
+			filepath.Join(t.TempDir(), "daemon.lease"),
+		),
+		installAfterInspectHookContextKey{},
+		hook,
+	)
+
+	_, err := Install(ctx, Options{System: "unknown"})
+	if err == nil || !strings.Contains(err.Error(), "resources appeared") {
+		t.Fatalf("install error = %v, want locked fresh-resource rejection", err)
+	}
+	if !hookRan {
+		t.Fatal("post-inspection injection hook did not run")
+	}
+	for _, path := range []string{cleanupManifestPath(layout), layout.BinaryPath} {
+		if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("fresh-race rejection wrote %s: %v", path, statErr)
+		}
+	}
+	configAfter, err := os.ReadFile(layout.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(configAfter) != string(configBefore) {
+		t.Fatal("fresh-race rejection changed the injected config")
+	}
+	configAfterIdentity, err := os.Stat(layout.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(configIdentity, configAfterIdentity) {
+		t.Fatal("fresh-race rejection replaced the injected config")
+	}
+	lockAfterIdentity, err := os.Stat(filepath.Join(layout.RunDir, "lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(lockIdentity, lockAfterIdentity) {
+		t.Fatal("fresh-race rejection replaced the injected operation lock")
+	}
+	for _, path := range []string{layout.VarLibDir, layout.PinPath} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("fresh-race rejection changed injected directory %s: %v", path, err)
+		}
+	}
+}
+
 func TestWriteCleanupManifestPreservesValidatedMarkerIdentity(t *testing.T) {
 	layout := newCleanupTestLayout(t, "marker-idempotent")
 	markerPath := cleanupManifestPath(layout)
@@ -1350,6 +1423,13 @@ func newCleanupTestLayoutForSystem(t *testing.T, suffix string, system string) p
 func newUnmarkedCleanupTestLayout(t *testing.T, suffix string, system string) paths {
 	t.Helper()
 	layout := cleanupTestPaths(t.TempDir(), suffix)
+	if err := populateUnmarkedCleanupTestLayout(layout, system); err != nil {
+		t.Fatal(err)
+	}
+	return layout
+}
+
+func populateUnmarkedCleanupTestLayout(layout paths, system string) error {
 	for _, dir := range []string{
 		filepath.Dir(layout.ConfigPath),
 		layout.RunDir,
@@ -1357,31 +1437,31 @@ func newUnmarkedCleanupTestLayout(t *testing.T, suffix string, system string) pa
 		layout.PinPath,
 	} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
-			t.Fatal(err)
+			return err
 		}
 	}
 	if err := config.SaveFile(layout.ConfigPath, config.SafeTemplate()); err != nil {
-		t.Fatal(err)
+		return err
 	}
 	if err := os.WriteFile(filepath.Join(layout.RunDir, "lock"), nil, 0o600); err != nil {
-		t.Fatal(err)
+		return err
 	}
 	switch system {
 	case "systemd":
 		if err := os.MkdirAll(layout.SystemdDir, 0o700); err != nil {
-			t.Fatal(err)
+			return err
 		}
 		if err := os.WriteFile(
 			filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service"),
 			[]byte(systemdUnit(layout.ConfigPath, layout.BinaryPath)),
 			0o600,
 		); err != nil {
-			t.Fatal(err)
+			return err
 		}
 	case "openwrt":
 		for _, dir := range []string{layout.OpenWrtInitDir, layout.OpenWrtHotplugDir} {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
-				t.Fatal(err)
+				return err
 			}
 		}
 		if err := os.WriteFile(
@@ -1389,17 +1469,17 @@ func newUnmarkedCleanupTestLayout(t *testing.T, suffix string, system string) pa
 			[]byte(openWrtInit(layout.ConfigPath, layout.BinaryPath)),
 			0o700,
 		); err != nil {
-			t.Fatal(err)
+			return err
 		}
 		if err := os.WriteFile(
 			filepath.Join(layout.OpenWrtHotplugDir, "90-wg-mix-ebpf"),
 			[]byte(openWrtHotplug()),
 			0o700,
 		); err != nil {
-			t.Fatal(err)
+			return err
 		}
 	}
-	return layout
+	return nil
 }
 
 func setCleanupTestEnvironment(t *testing.T, layout paths) {

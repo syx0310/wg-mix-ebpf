@@ -479,6 +479,285 @@ func validateUnmarkedCleanupResources(paths paths, system string) (retErr error)
 	)
 }
 
+func inspectLockedInstallOwnership(
+	paths paths,
+	system string,
+	initial cleanupOwnershipState,
+	adoptExisting bool,
+	lifecyclePath string,
+	lease *lockfile.LifecycleLease,
+) (cleanupOwnershipState, error) {
+	if lease == nil || !lease.HeldAt(lifecyclePath) {
+		return cleanupOwnershipAbsent, errors.New(
+			"refuse install ownership decision without the held global lifecycle lease",
+		)
+	}
+	current, err := inspectInstallCleanupOwnership(paths, system)
+	if err != nil {
+		return cleanupOwnershipAbsent, err
+	}
+	switch initial {
+	case cleanupOwnershipAbsent:
+		if err := validateFreshLockedInstallResources(
+			paths,
+			system,
+			lifecyclePath,
+		); err != nil {
+			return cleanupOwnershipAbsent, fmt.Errorf(
+				"refuse fresh install after resources appeared between preflight and lifecycle lock: %w",
+				err,
+			)
+		}
+		return cleanupOwnershipAbsent, nil
+	case cleanupOwnershipMarked:
+		if current != cleanupOwnershipMarked {
+			return cleanupOwnershipAbsent, errors.New(
+				"refuse install because cleanup ownership changed after lifecycle preflight",
+			)
+		}
+		return cleanupOwnershipMarked, nil
+	case cleanupOwnershipUnmarked:
+		if !adoptExisting {
+			return cleanupOwnershipAbsent, errors.New(
+				"refuse to adopt unmarked installation resources without explicit authorization",
+			)
+		}
+		if current != cleanupOwnershipUnmarked {
+			return cleanupOwnershipAbsent, errors.New(
+				"refuse adoption because cleanup ownership changed after lifecycle preflight",
+			)
+		}
+		if err := validateUnmarkedCleanupResources(paths, system); err != nil {
+			return cleanupOwnershipAbsent, fmt.Errorf(
+				"revalidate explicitly adopted installation resources under lifecycle lock: %w",
+				err,
+			)
+		}
+		return cleanupOwnershipUnmarked, nil
+	default:
+		return cleanupOwnershipAbsent, fmt.Errorf(
+			"refuse unknown install ownership state %d",
+			initial,
+		)
+	}
+}
+
+func validateFreshLockedInstallResources(
+	paths paths,
+	system string,
+	lifecyclePath string,
+) error {
+	configRoot, exists, err := openManagedCleanupDir(
+		configCleanupPath(filepath.Dir(paths.ConfigPath)),
+	)
+	if err != nil {
+		return err
+	}
+	if exists {
+		closeErr := configRoot.close()
+		return errors.Join(
+			fmt.Errorf(
+				"config directory %s already exists",
+				filepath.Dir(paths.ConfigPath),
+			),
+			closeErr,
+		)
+	}
+	return validateFreshCleanupManifestBootstrap(
+		nil,
+		paths,
+		system,
+		strings.Repeat("0", 32),
+		lifecyclePath,
+	)
+}
+
+func validateFreshCleanupManifestBootstrap(
+	configRoot *managedCleanupDir,
+	paths paths,
+	system string,
+	installationID string,
+	lifecyclePath string,
+) error {
+	manifest := expectedCleanupManifest(paths, system, installationID)
+	if configRoot != nil {
+		entries, err := cleanupReadDir(configRoot.dir)
+		if err != nil {
+			return fmt.Errorf("read fresh config directory before ownership creation: %w", err)
+		}
+		if len(entries) != 0 {
+			return fmt.Errorf(
+				"fresh config directory %s is not empty",
+				configRoot.spec.path,
+			)
+		}
+	}
+	for _, spec := range []cleanupPathSpec{
+		stateCleanupPath(paths.VarLibDir),
+		bpfPinCleanupPath(paths.PinPath),
+	} {
+		root, exists, err := openManagedCleanupDir(spec)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		closeErr := root.close()
+		return errors.Join(
+			fmt.Errorf("fresh %s %s already exists", spec.name, spec.path),
+			closeErr,
+		)
+	}
+	if err := validateFreshRuntimeDirectory(paths.RunDir, manifest, lifecyclePath); err != nil {
+		return err
+	}
+	if err := validateFreshServiceArtifactsAbsent(manifest); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateFreshRuntimeDirectory(
+	runDir string,
+	manifest cleanupManifest,
+	lifecyclePath string,
+) (retErr error) {
+	root, exists, err := openManagedCleanupDir(runtimeCleanupPath(runDir))
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("fresh runtime directory %s is missing its held operation lock", runDir)
+	}
+	defer func() {
+		if err := root.close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close fresh runtime validation handles: %w", err))
+		}
+	}()
+
+	entries, err := cleanupReadDir(root.dir)
+	if err != nil {
+		return err
+	}
+	expectedLifecyclePath := filepath.Join(runDir, "daemon.lease")
+	lifecycleInRunDir := filepath.Clean(lifecyclePath) == filepath.Clean(expectedLifecyclePath)
+	sawLock := false
+	sawLifecycle := false
+	for _, entry := range entries {
+		switch entry.Name() {
+		case "lock":
+			if sawLock {
+				return errors.New("fresh runtime directory contains a duplicate lock entry")
+			}
+			sawLock = true
+			node, err := snapshotManagedFile(
+				root.dir,
+				entry.Name(),
+				false,
+				false,
+				func(data []byte) error {
+					if len(data) != 0 {
+						return errors.New("fresh operation lock is not empty")
+					}
+					return nil
+				},
+			)
+			if err != nil {
+				return fmt.Errorf("validate fresh operation lock: %w", err)
+			}
+			if err := node.close(); err != nil {
+				return err
+			}
+		case "daemon.lease":
+			if !lifecycleInRunDir {
+				return fmt.Errorf(
+					"fresh runtime directory contains an unexpected lifecycle lease %s",
+					filepath.Join(runDir, entry.Name()),
+				)
+			}
+			if sawLifecycle {
+				return errors.New("fresh runtime directory contains a duplicate lifecycle lease entry")
+			}
+			sawLifecycle = true
+			node, err := snapshotManagedFile(
+				root.dir,
+				entry.Name(),
+				false,
+				false,
+				validateLifecycleLeaseBytes(manifest),
+			)
+			if err != nil {
+				return fmt.Errorf("validate fresh lifecycle lease: %w", err)
+			}
+			if err := node.close(); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf(
+				"fresh runtime directory contains pre-existing entry %s",
+				filepath.Join(runDir, entry.Name()),
+			)
+		}
+	}
+	if !sawLock {
+		return errors.New("fresh runtime directory is missing the held operation lock")
+	}
+	if lifecycleInRunDir && !sawLifecycle {
+		return errors.New("fresh runtime directory is missing the held lifecycle lease")
+	}
+	return nil
+}
+
+func validateFreshServiceArtifactsAbsent(manifest cleanupManifest) (retErr error) {
+	for _, artifact := range manifest.Artifacts {
+		defaultParent := ""
+		switch artifact.Kind {
+		case "systemd-unit":
+			defaultParent = "/etc/systemd/system"
+		case "openwrt-init":
+			defaultParent = "/etc/init.d"
+		case "openwrt-hotplug":
+			defaultParent = "/etc/hotplug.d/iface"
+		default:
+			return fmt.Errorf("unknown cleanup manifest artifact kind %q", artifact.Kind)
+		}
+		parent, exists, err := openDeclaredArtifactParent(
+			filepath.Dir(artifact.Path),
+			defaultParent,
+		)
+		if err != nil {
+			return err
+		}
+		if !exists {
+			continue
+		}
+		_, identityErr := cleanupIdentityAt(parent.dir, filepath.Base(artifact.Path))
+		closeErr := parent.close()
+		switch {
+		case cleanupIsNotExist(identityErr):
+			if closeErr != nil {
+				return closeErr
+			}
+		case identityErr != nil:
+			return errors.Join(
+				fmt.Errorf(
+					"inspect fresh service artifact %s: %w",
+					artifact.Path,
+					identityErr,
+				),
+				closeErr,
+			)
+		default:
+			return errors.Join(
+				fmt.Errorf("fresh service artifact %s already exists", artifact.Path),
+				closeErr,
+			)
+		}
+	}
+	return nil
+}
+
 func prepareRuntimeDirectoryPlan(
 	runDir string,
 	manifest cleanupManifest,
