@@ -32,6 +32,11 @@ if [[ "${XOR_SCOPE}" != "wg-payload-prefix" && "${XOR_SCOPE}" != "wg-payload-ful
   echo "error: XOR_SCOPE must be wg-payload-prefix or wg-payload-full" >&2
   exit 1
 fi
+if [[ -n "${XOR_PASSWORD}" &&
+  ( ${#XOR_PASSWORD} -gt 256 || "${XOR_PASSWORD}" =~ [[:space:]] ) ]]; then
+  echo "error: XOR_PASSWORD must contain 1-256 non-whitespace characters" >&2
+  exit 1
+fi
 if [[ ! "${XOR_MAX_BYTES}" =~ ^[0-9]+$ ]] ||
   ((XOR_MAX_BYTES < 4 || XOR_MAX_BYTES > 2048 || XOR_MAX_BYTES % 4 != 0)); then
   echo "error: XOR_MAX_BYTES must be a multiple of 4 in [4, 2048]" >&2
@@ -188,9 +193,11 @@ failure_report() {
     printf 'suggested recovery commands (run one at a time only after review):\n' >&2
     print_command ip netns exec "${NSA}" env "WG_MIX_EBPF_PIN_PATH=${PINA}" \
       "${BIN}" detach --config "${SECRET_DIR}/agent-a.yaml" \
+      --isolated-netns-test \
       --run-dir "${RUN_DIR_A}" --state-dir "${STATE_DIR_A}" >&2
     print_command ip netns exec "${NSB}" env "WG_MIX_EBPF_PIN_PATH=${PINB}" \
       "${BIN}" detach --config "${SECRET_DIR}/agent-b.yaml" \
+      --isolated-netns-test \
       --run-dir "${RUN_DIR_B}" --state-dir "${STATE_DIR_B}" >&2
     print_command ip netns delete "${NSA}" >&2
     print_command ip netns delete "${NSR}" >&2
@@ -269,8 +276,10 @@ manifest_payload() {
   printf 'run_base=%s\nbpffs=%s\npin_a=%s\npin_b=%s\n' \
     "${RUN_BASE}" "${BPFFS_DIR}" "${PINA}" "${PINB}"
   printf 'netns_a=%s\nnetns_r=%s\nnetns_b=%s\n' "${NSA}" "${NSR}" "${NSB}"
-  printf 'run_dir_a=%s\nstate_dir_a=%s\nrun_dir_b=%s\nstate_dir_b=%s\n' \
-    "${RUN_DIR_A}" "${STATE_DIR_A}" "${RUN_DIR_B}" "${STATE_DIR_B}"
+  printf 'run_dir_a=%s\nstate_dir_a=%s\nlease_a=%s\n' \
+    "${RUN_DIR_A}" "${STATE_DIR_A}" "${RUN_DIR_A}/daemon.lease"
+  printf 'run_dir_b=%s\nstate_dir_b=%s\nlease_b=%s\n' \
+    "${RUN_DIR_B}" "${STATE_DIR_B}" "${RUN_DIR_B}/daemon.lease"
   printf 'evidence=%s\nsecrets=%s\n' "${TMPDIR}" "${SECRET_DIR}"
 }
 
@@ -410,7 +419,7 @@ if mountpoint -q -- "${BPFFS_DIR}"; then
   echo "error: unexpected mount already exists at ${BPFFS_DIR}" >&2
   exit 1
 fi
-mount -t bpf -o nosuid,nodev,noexec "wg-mix-ebpf-${RUN_ID}" "${BPFFS_DIR}"
+mount -t bpf -o nosuid,nodev,noexec,mode=0700 "wg-mix-ebpf-${RUN_ID}" "${BPFFS_DIR}"
 validate_private_bpffs_mount
 
 run_agent_in_netns() {
@@ -420,6 +429,7 @@ run_agent_in_netns() {
   local run_dir
   local state_dir
   local status
+  local isolated_args=()
   shift 2
 
   case "${ns}" in
@@ -446,12 +456,17 @@ run_agent_in_netns() {
   validate_marker "${run_dir}" "run-${ns: -1}" || return 1
   validate_marker "${state_dir}" "state-${ns: -1}" || return 1
   validate_private_bpffs_mount || return 1
+  case "${1:-}" in
+    reload | detach) isolated_args=(--isolated-netns-test) ;;
+  esac
   printf 'agent command: timestamp=%s netns=%s pin=%s run_dir=%s state_dir=%s argv=' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${ns}" "${pin}" "${run_dir}" "${state_dir}" >&2
-  printf '%q ' "${BIN}" "$@" --run-dir "${run_dir}" --state-dir "${state_dir}" >&2
+  printf '%q ' "${BIN}" "$@" "${isolated_args[@]}" \
+    --run-dir "${run_dir}" --state-dir "${state_dir}" >&2
   printf '\n' >&2
   if ip netns exec "${ns}" env "WG_MIX_EBPF_PIN_PATH=${pin}" \
-    "${BIN}" "$@" --run-dir "${run_dir}" --state-dir "${state_dir}"; then
+    "${BIN}" "$@" "${isolated_args[@]}" \
+    --run-dir "${run_dir}" --state-dir "${state_dir}"; then
     status=0
   else
     status=$?
@@ -552,6 +567,9 @@ explicit_teardown() {
     "${SECRET_DIR}/agent-a.yaml" "${SECRET_DIR}/agent-b.yaml"; do
     remove_owned_file "${secret_file}" || return 1
   done
+  if [[ -n "${XOR_PASSWORD}" ]]; then
+    remove_owned_file "${SECRET_DIR}/xor-password" || return 1
+  fi
   remove_owned_file "${SECRET_DIR}/${OWNER_MARKER}" || return 1
   teardown_step "remove empty sensitive directory ${SECRET_DIR}" \
     rmdir -- "${SECRET_DIR}" || return 1
@@ -567,6 +585,8 @@ explicit_teardown() {
 
   remove_owned_file "${RUN_DIR_A}/lock" || return 1
   remove_owned_file "${RUN_DIR_B}/lock" || return 1
+  remove_owned_file "${RUN_DIR_A}/daemon.lease" || return 1
+  remove_owned_file "${RUN_DIR_B}/daemon.lease" || return 1
   remove_owned_file "${RUN_DIR_A}/${OWNER_MARKER}" || return 1
   remove_owned_file "${RUN_DIR_B}/${OWNER_MARKER}" || return 1
   remove_owned_file "${STATE_DIR_A}/${OWNER_MARKER}" || return 1
@@ -601,7 +621,7 @@ ciphers:
     auth: none
     scope: ${XOR_SCOPE}
     key_derivation: udp2raw-md5-key1
-    password: \"${XOR_PASSWORD}\"
+    secret_file: ${SECRET_DIR}/xor-password
     max_bytes: ${XOR_MAX_BYTES}
 "
   fi
@@ -955,7 +975,7 @@ exercise_udp_zero_checksum() {
     return 1
   fi
 
-  timeout -s TERM 10 ip netns exec "${NSB}" python3 - \
+  timeout -s TERM -k 2 10 ip netns exec "${NSB}" python3 - \
     "${A_UNDER}" "${B_UNDER}" "${ready_path}" >"${TMPDIR}/udp-zero-checksum-receiver.out" \
     2>"${receiver_log}" <<'PY' &
 import socket
@@ -1003,7 +1023,7 @@ PY
     return 1
   fi
 
-  timeout -s TERM 5 ip netns exec "${NSA}" python3 - \
+  timeout -s TERM -k 2 5 ip netns exec "${NSA}" python3 - \
     "${A_UNDER}" "${B_UNDER}" "${gateway_mac}" <<'PY'
 import ipaddress
 import socket
@@ -1214,6 +1234,10 @@ wg pubkey <"${SECRET_DIR}/a.key" >"${SECRET_DIR}/a.pub"
 wg genkey >"${SECRET_DIR}/b.key"
 wg pubkey <"${SECRET_DIR}/b.key" >"${SECRET_DIR}/b.pub"
 chmod 0600 "${SECRET_DIR}/a.key" "${SECRET_DIR}/b.key"
+if [[ -n "${XOR_PASSWORD}" ]]; then
+  printf '%s\n' "${XOR_PASSWORD}" >"${SECRET_DIR}/xor-password"
+  chmod 0600 "${SECRET_DIR}/xor-password"
+fi
 
 A_PUB="$(cat "${SECRET_DIR}/a.pub")"
 B_PUB="$(cat "${SECRET_DIR}/b.pub")"
@@ -1248,9 +1272,9 @@ if [[ -n "${XOR_PASSWORD}" ]]; then
   assert_tail_bank "${PINB}" "${TMPDIR}/status-b-before.json"
 fi
 
-timeout -s INT 30 ip netns exec "${NSR}" tcpdump -i ra0 -w "${TMPDIR}/ra.pcap" udp >/dev/null 2>"${TMPDIR}/tcpdump-ra.log" &
+timeout -s INT -k 2 30 ip netns exec "${NSR}" tcpdump -i ra0 -w "${TMPDIR}/ra.pcap" udp >/dev/null 2>"${TMPDIR}/tcpdump-ra.log" &
 TCPDUMP_RA=$!
-timeout -s INT 30 ip netns exec "${NSR}" tcpdump -i rb0 -w "${TMPDIR}/rb.pcap" udp >/dev/null 2>"${TMPDIR}/tcpdump-rb.log" &
+timeout -s INT -k 2 30 ip netns exec "${NSR}" tcpdump -i rb0 -w "${TMPDIR}/rb.pcap" udp >/dev/null 2>"${TMPDIR}/tcpdump-rb.log" &
 TCPDUMP_RB=$!
 sleep 1
 
@@ -1298,7 +1322,7 @@ if [[ -n "${XOR_PASSWORD}" ]]; then
   python3 "${ROOT}/scripts/check-wg-pcap.py" \
     --forbid-plain-standard \
     --forbid-plain-mixed \
-    --xor-udp2raw-password "${XOR_PASSWORD}" \
+    --xor-udp2raw-password-file "${SECRET_DIR}/xor-password" \
     --require-xor-mixed initiation,response,transport \
     "${TMPDIR}/ra.pcap" "${TMPDIR}/rb.pcap"
 else

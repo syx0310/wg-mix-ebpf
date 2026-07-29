@@ -3,8 +3,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -49,6 +51,27 @@ class WireGuardLengthTest(unittest.TestCase):
 
     def test_unknown_kind_is_invalid(self) -> None:
         self.assertFalse(CHECKER.valid_wireguard_length("unknown", 148))
+
+
+class XORKeyInputTest(unittest.TestCase):
+    def test_udp2raw_password_file_matches_password_derivation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            password_file = Path(temp_dir, "password")
+            password_file.write_text("test-password\n", encoding="utf-8")
+            actual = CHECKER.parse_xor_key(None, None, password_file)
+        expected = hashlib.md5(b"test-passwordkey1").digest()
+        self.assertEqual(actual, expected)
+
+    def test_xor_key_sources_are_mutually_exclusive(self) -> None:
+        with self.assertRaises(SystemExit):
+            CHECKER.parse_xor_key("raw-key", "password", None)
+
+    def test_empty_udp2raw_password_file_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            password_file = Path(temp_dir, "password")
+            password_file.write_text("\n", encoding="utf-8")
+            with self.assertRaises(SystemExit):
+                CHECKER.parse_xor_key(None, None, password_file)
 
 
 if __name__ == "__main__":

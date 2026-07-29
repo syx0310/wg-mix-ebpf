@@ -81,7 +81,7 @@ test-packet-helper:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./internal/packet
 
 test-pcap-helper:
-	python3 scripts/test_check_wg_pcap.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_check_wg_pcap.py
 
 test-bpf-pkt:
 	@echo "skip: requires external Linux root VM with BPF/TC support"
