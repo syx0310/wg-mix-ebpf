@@ -9,6 +9,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
@@ -643,6 +645,9 @@ func validatePurgeDir(paths paths) error {
 }
 
 func validateCleanupPaths(paths paths) error {
+	if err := validateServiceTemplatePath("config path", paths.ConfigPath); err != nil {
+		return err
+	}
 	cleanup := []cleanupPathSpec{
 		runtimeCleanupPath(paths.RunDir),
 		stateCleanupPath(paths.VarLibDir),
@@ -663,6 +668,32 @@ func validateCleanupPaths(paths paths) error {
 				return fmt.Errorf("refuse overlapping cleanup paths %s and %s", cleanup[i].path, cleanup[j].path)
 			}
 		}
+	}
+	return nil
+}
+
+func validateServiceTemplatePath(name string, path string) error {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("refuse unsafe %s %q: path must be absolute and clean", name, path)
+	}
+	if !utf8.ValidString(path) {
+		return fmt.Errorf("refuse unsafe %s %q: path is not valid UTF-8", name, path)
+	}
+	for _, character := range path {
+		if unicode.IsControl(character) {
+			return fmt.Errorf(
+				"refuse unsafe %s %q: path contains a control character",
+				name,
+				path,
+			)
+		}
+	}
+	if strings.ContainsAny(path, "%$") {
+		return fmt.Errorf(
+			"refuse unsafe %s %q: path contains a service-template expansion character",
+			name,
+			path,
+		)
 	}
 	return nil
 }
@@ -835,7 +866,14 @@ RestartSec=3s
 
 [Install]
 WantedBy=multi-user.target
-`, binaryPath, configPath, binaryPath, configPath, binaryPath, configPath)
+`,
+		systemdExecArgument(binaryPath),
+		systemdExecArgument(configPath),
+		systemdExecArgument(binaryPath),
+		systemdExecArgument(configPath),
+		systemdExecArgument(binaryPath),
+		systemdExecArgument(configPath),
+	)
 }
 
 func openWrtInit(configPath string, binaryPath string) string {
@@ -845,7 +883,7 @@ USE_PROCD=1
 START=99
 STOP=10
 
-CONF="%s"
+CONF=%s
 
 start_service() {
     procd_open_instance
@@ -863,7 +901,26 @@ reload_service() {
 stop_service() {
     %s stop --config "$CONF"
 }
-`, configPath, binaryPath, binaryPath, binaryPath)
+`,
+		shellSingleQuote(configPath),
+		shellSingleQuote(binaryPath),
+		shellSingleQuote(binaryPath),
+		shellSingleQuote(binaryPath),
+	)
+}
+
+func systemdExecArgument(value string) string {
+	replacer := strings.NewReplacer(
+		`\`, `\\`,
+		`"`, `\"`,
+		`%`, `%%`,
+		`$`, `$$`,
+	)
+	return `"` + replacer.Replace(value) + `"`
+}
+
+func shellSingleQuote(value string) string {
+	return `'` + strings.ReplaceAll(value, `'`, `'"'"'`) + `'`
 }
 
 func openWrtHotplug() string {

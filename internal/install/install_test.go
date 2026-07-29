@@ -54,12 +54,70 @@ func TestUninstallPurgeAllowsOwnedEmptyConfigDir(t *testing.T) {
 
 func TestRenderedServicesUseStopCommand(t *testing.T) {
 	unit := systemdUnit("/etc/wg-mix-ebpf/config.yaml", "/usr/sbin/wg-mix-ebpf")
-	if !strings.Contains(unit, "ExecStop=/usr/sbin/wg-mix-ebpf stop --config /etc/wg-mix-ebpf/config.yaml") {
+	if !strings.Contains(
+		unit,
+		`ExecStop="/usr/sbin/wg-mix-ebpf" stop --config "/etc/wg-mix-ebpf/config.yaml"`,
+	) {
 		t.Fatalf("systemd unit should stop via daemon stop command:\n%s", unit)
 	}
 	init := openWrtInit("/etc/wg-mix-ebpf/config.yaml", "/usr/sbin/wg-mix-ebpf")
-	if !strings.Contains(init, "/usr/sbin/wg-mix-ebpf stop --config \"$CONF\"") {
+	if !strings.Contains(init, `'/usr/sbin/wg-mix-ebpf' stop --config "$CONF"`) {
 		t.Fatalf("OpenWrt init should stop via daemon stop command:\n%s", init)
+	}
+}
+
+func TestRenderedServicesEncodeTemplateArguments(t *testing.T) {
+	configPath := `/etc/wg-mix-ebpf/config "quoted" 'single'.yaml`
+	binaryPath := `/opt/wg mix/"bin"/wg-mix-ebpf`
+
+	unit := systemdUnit(configPath, binaryPath)
+	for _, want := range []string{
+		`ExecStart="/opt/wg mix/\"bin\"/wg-mix-ebpf" run --config "/etc/wg-mix-ebpf/config \"quoted\" 'single'.yaml"`,
+		`ExecReload="/opt/wg mix/\"bin\"/wg-mix-ebpf" reload --config "/etc/wg-mix-ebpf/config \"quoted\" 'single'.yaml"`,
+		`ExecStop="/opt/wg mix/\"bin\"/wg-mix-ebpf" stop --config "/etc/wg-mix-ebpf/config \"quoted\" 'single'.yaml"`,
+	} {
+		if !strings.Contains(unit, want) {
+			t.Fatalf("systemd unit omitted encoded argument %q:\n%s", want, unit)
+		}
+	}
+
+	init := openWrtInit(configPath, binaryPath)
+	for _, want := range []string{
+		`CONF='/etc/wg-mix-ebpf/config "quoted" '"'"'single'"'"'.yaml'`,
+		`'/opt/wg mix/"bin"/wg-mix-ebpf' run --config "$CONF" --openwrt`,
+		`'/opt/wg mix/"bin"/wg-mix-ebpf' reload --config "$CONF"`,
+		`'/opt/wg mix/"bin"/wg-mix-ebpf' stop --config "$CONF"`,
+	} {
+		if !strings.Contains(init, want) {
+			t.Fatalf("OpenWrt init omitted encoded argument %q:\n%s", want, init)
+		}
+	}
+}
+
+func TestValidateCleanupPathsRejectsServiceTemplateInjection(t *testing.T) {
+	safe := cleanupTestPaths(t.TempDir(), "template-path")
+	tests := []struct {
+		name   string
+		suffix string
+	}{
+		{name: "newline", suffix: "\nExecStart=/bin/false"},
+		{name: "carriage return", suffix: "\rExecStart=/bin/false"},
+		{name: "escape", suffix: "\x1b[Service]"},
+		{name: "systemd specifier", suffix: "%N"},
+		{name: "systemd variable", suffix: "${PATH}"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := safe
+			candidate.ConfigPath = filepath.Join(
+				filepath.Dir(safe.ConfigPath),
+				"config"+test.suffix+".yaml",
+			)
+			err := validateCleanupPaths(candidate)
+			if err == nil || !strings.Contains(err.Error(), "unsafe config path") {
+				t.Fatalf("validateCleanupPaths error = %v, want unsafe config path", err)
+			}
+		})
 	}
 }
 

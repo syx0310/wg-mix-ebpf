@@ -14,6 +14,9 @@ func validateInstallBinaryPath(path string) error {
 	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return fmt.Errorf("refuse non-clean install binary path %q", path)
 	}
+	if err := validateServiceTemplatePath("install binary path", path); err != nil {
+		return err
+	}
 	if filepath.Base(path) != "wg-mix-ebpf" {
 		return fmt.Errorf(
 			"refuse install binary path %s: basename must be wg-mix-ebpf",
