@@ -23,9 +23,10 @@ func TestAnchoredBPFFSRootAcceptsSafeObservedModeAndRejectsWritableMode(t *testi
 		t.Run(tt.name, func(t *testing.T) {
 			parent := t.TempDir()
 			path := filepath.Join(parent, "bpffs")
-			if err := os.Mkdir(path, tt.mode); err != nil {
+			if err := os.Mkdir(path, 0o700); err != nil {
 				t.Fatal(err)
 			}
+			setExactTestPermissions(t, path, tt.mode)
 			anchor, _, err := openAnchoredDirectoryPath(
 				path,
 				false,
@@ -49,6 +50,20 @@ func TestAnchoredBPFFSRootAcceptsSafeObservedModeAndRejectsWritableMode(t *testi
 				t.Fatalf("mode %#o error = %v, want %q", tt.mode, err, tt.wantErr)
 			}
 		})
+	}
+}
+
+func setExactTestPermissions(t *testing.T, path string, mode os.FileMode) {
+	t.Helper()
+	if err := os.Chmod(path, mode); err != nil {
+		t.Fatalf("set exact permissions on %s: %v", path, err)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		t.Fatalf("inspect exact permissions on %s: %v", path, err)
+	}
+	if got, want := info.Mode().Perm(), mode.Perm(); got != want {
+		t.Fatalf("permissions on %s = %#o, want %#o", path, got, want)
 	}
 }
 
