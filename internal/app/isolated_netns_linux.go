@@ -287,11 +287,16 @@ func isolatedNetNSTestContext(
 	}
 
 	if revalidating, _ := ctx.Value(isolatedNetNSRevalidationKey{}).(bool); revalidating {
-		return lockfile.WithIsolatedNetNSTestLifecyclePath(ctx, layout.lease), nil
+		return lockfile.WithIsolatedNetNSTestLifecyclePaths(
+			ctx,
+			layout.lease,
+			layout.gate,
+		), nil
 	}
 	return lockfile.WithIsolatedNetNSTestLifecycleValidation(
 		ctx,
 		layout.lease,
+		layout.gate,
 		func() error {
 			if err := revalidateIsolatedNetNSTestSnapshot(
 				contractSnapshot,

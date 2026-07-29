@@ -63,14 +63,15 @@ type Status struct {
 }
 
 type runHooks struct {
-	lifecycleLeasePath string
-	instanceID         string
-	acquireLease       func(string, leaseOwner) (*lifecycleLeaseHandle, error)
-	reload             func(context.Context, reconcile.Options) (*reconcile.Result, error)
-	validate           func(context.Context, reconcile.Options) (*reconcile.Result, error)
-	healthy            func(context.Context, *control.State) bool
-	stop               func(context.Context, Options, string) (*reconcile.Result, error)
-	writeStatus        func(string, Status) error
+	lifecycleLeasePath       string
+	lifecycleMaintenancePath string
+	instanceID               string
+	acquireLease             func(string, string, leaseOwner) (*lifecycleLeaseHandle, error)
+	reload                   func(context.Context, reconcile.Options) (*reconcile.Result, error)
+	validate                 func(context.Context, reconcile.Options) (*reconcile.Result, error)
+	healthy                  func(context.Context, *control.State) bool
+	stop                     func(context.Context, Options, string) (*reconcile.Result, error)
+	writeStatus              func(string, Status) error
 }
 
 func Run(parentCtx context.Context, opts Options) (retErr error) {
@@ -90,7 +91,12 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 	runDir := runDir(opts.RunDir)
 	hooks := hooksFor(opts)
 	leasePath := lifecycleLeasePath(opts, runDir, hooks.lifecycleLeasePath)
-	lease, err := hooks.acquireLease(leasePath, leaseOwner{
+	maintenancePath := lifecycleMaintenancePath(
+		opts,
+		runDir,
+		hooks.lifecycleMaintenancePath,
+	)
+	lease, err := hooks.acquireLease(leasePath, maintenancePath, leaseOwner{
 		PID:        os.Getpid(),
 		Action:     "daemon",
 		ConfigPath: configPath(opts.ConfigPath),
@@ -652,6 +658,9 @@ func hooksFor(opts Options) runHooks {
 	if opts.hooks.lifecycleLeasePath != "" {
 		hooks.lifecycleLeasePath = opts.hooks.lifecycleLeasePath
 	}
+	if opts.hooks.lifecycleMaintenancePath != "" {
+		hooks.lifecycleMaintenancePath = opts.hooks.lifecycleMaintenancePath
+	}
 	if opts.hooks.instanceID != "" {
 		hooks.instanceID = opts.hooks.instanceID
 	}
@@ -684,6 +693,16 @@ func lifecycleLeasePath(opts Options, runDir string, override string) string {
 		return filepath.Join(runDir, "daemon.lease")
 	}
 	return DefaultLifecycleLeasePath
+}
+
+func lifecycleMaintenancePath(opts Options, runDir string, override string) string {
+	if override != "" {
+		return override
+	}
+	if opts.DryRun {
+		return filepath.Join(runDir, ".daemon-maintenance.gate")
+	}
+	return DefaultLifecycleMaintenancePath
 }
 
 func ReadStatus(runDir string) (*Status, error) {

@@ -30,6 +30,12 @@ func TestIsolatedNetNSTestPaths(t *testing.T) {
 	if layout.lease != filepath.Join(base, isolatedNetNSLifecycleLeaseName) {
 		t.Fatalf("lease = %q", layout.lease)
 	}
+	if layout.gate != isolatedNetNSLifecycleGatePath {
+		t.Fatalf("maintenance gate = %q, want %q", layout.gate, isolatedNetNSLifecycleGatePath)
+	}
+	if filepath.Dir(layout.gate) != isolatedNetNSTestRoot {
+		t.Fatalf("maintenance gate is outside fixed test root: %q", layout.gate)
+	}
 }
 
 func TestIsolatedNetNSTestRolesShareLifecycleLease(t *testing.T) {
@@ -51,9 +57,37 @@ func TestIsolatedNetNSTestRolesShareLifecycleLease(t *testing.T) {
 	if layouts[0].lease != layouts[1].lease {
 		t.Fatalf("role leases differ: a=%q b=%q", layouts[0].lease, layouts[1].lease)
 	}
+	if layouts[0].gate != layouts[1].gate ||
+		layouts[0].gate != isolatedNetNSLifecycleGatePath {
+		t.Fatalf("role maintenance gates differ: %#v", layouts)
+	}
 	if strings.Contains(layouts[0].lease, "run-client") ||
 		strings.Contains(layouts[1].lease, "run-server") {
 		t.Fatalf("role-specific lease permits serialization bypass: %#v", layouts)
+	}
+}
+
+func TestIsolatedNetNSTestRunsShareFixedRootMaintenanceGate(t *testing.T) {
+	var gates []string
+	for _, runID := range []string{"0123456789abcdef", "fedcba9876543210"} {
+		base := filepath.Join(isolatedNetNSTestRoot, runID)
+		layout, err := isolatedNetNSTestPaths(
+			"reload",
+			filepath.Join(base, "secrets", "agent-a.yaml"),
+			filepath.Join(base, "run-a"),
+			filepath.Join(base, "state-a"),
+			filepath.Join(base, "bpffs", "wg-mix-ebpf-a"),
+		)
+		if err != nil {
+			t.Fatalf("run %s paths: %v", runID, err)
+		}
+		gates = append(gates, layout.gate)
+		if strings.Contains(layout.gate, runID) {
+			t.Fatalf("run-specific permanent maintenance gate = %q", layout.gate)
+		}
+	}
+	if gates[0] != gates[1] || gates[0] != isolatedNetNSLifecycleGatePath {
+		t.Fatalf("isolated runs do not share the fixed gate: %q", gates)
 	}
 }
 

@@ -70,7 +70,12 @@ func TestWithLockRejectsSymbolicLink(t *testing.T) {
 func TestWithLockRejectsLifecycleLeaseHardLink(t *testing.T) {
 	root := t.TempDir()
 	leasePath := filepath.Join(root, "daemon.lease")
-	lease, err := AcquireLifecycleAt(leasePath, LifecycleOwner{PID: os.Getpid(), Action: "daemon"})
+	maintenancePath := filepath.Join(root, "maintenance.gate")
+	lease, err := AcquireLifecycleAt(
+		leasePath,
+		maintenancePath,
+		LifecycleOwner{PID: os.Getpid(), Action: "daemon"},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,10 +104,15 @@ func TestAcquireLifecycleRejectsSymbolicLink(t *testing.T) {
 		t.Fatal(err)
 	}
 	leasePath := filepath.Join(root, "daemon.lease")
+	maintenancePath := filepath.Join(root, "maintenance.gate")
 	if err := os.Symlink(target, leasePath); err != nil {
 		t.Fatal(err)
 	}
-	_, err := AcquireLifecycleAt(leasePath, LifecycleOwner{PID: os.Getpid()})
+	_, err := AcquireLifecycleAt(
+		leasePath,
+		maintenancePath,
+		LifecycleOwner{PID: os.Getpid()},
+	)
 	if err == nil || !strings.Contains(err.Error(), "symbolic-link") {
 		t.Fatalf("symbolic-link lifecycle error = %v", err)
 	}
@@ -115,29 +125,46 @@ func TestAcquireLifecycleRejectsHardLink(t *testing.T) {
 		t.Fatal(err)
 	}
 	leasePath := filepath.Join(root, "daemon.lease")
+	maintenancePath := filepath.Join(root, "maintenance.gate")
 	if err := os.Link(target, leasePath); err != nil {
 		t.Fatal(err)
 	}
-	_, err := AcquireLifecycleAt(leasePath, LifecycleOwner{PID: os.Getpid()})
+	_, err := AcquireLifecycleAt(
+		leasePath,
+		maintenancePath,
+		LifecycleOwner{PID: os.Getpid()},
+	)
 	if err == nil || !strings.Contains(err.Error(), "links") {
 		t.Fatalf("hard-linked lifecycle error = %v", err)
 	}
 }
 
 func TestAcquireLifecycleRejectsNonRegularFile(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
+	root := t.TempDir()
+	leasePath := filepath.Join(root, "daemon.lease")
+	maintenancePath := filepath.Join(root, "maintenance.gate")
 	if err := syscall.Mkfifo(leasePath, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	_, err := AcquireLifecycleAt(leasePath, LifecycleOwner{PID: os.Getpid()})
+	_, err := AcquireLifecycleAt(
+		leasePath,
+		maintenancePath,
+		LifecycleOwner{PID: os.Getpid()},
+	)
 	if err == nil || !strings.Contains(err.Error(), "not a regular file") {
 		t.Fatalf("non-regular lifecycle error = %v", err)
 	}
 }
 
 func TestRetainedLifecycleLeasePreventsReacquire(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	lease, err := AcquireLifecycleAt(leasePath, LifecycleOwner{PID: os.Getpid(), Action: "daemon"})
+	root := t.TempDir()
+	leasePath := filepath.Join(root, "daemon.lease")
+	maintenancePath := filepath.Join(root, "maintenance.gate")
+	lease, err := AcquireLifecycleAt(
+		leasePath,
+		maintenancePath,
+		LifecycleOwner{PID: os.Getpid(), Action: "daemon"},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,13 +175,21 @@ func TestRetainedLifecycleLeasePreventsReacquire(t *testing.T) {
 	if err := lease.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := AcquireLifecycleAt(leasePath, LifecycleOwner{PID: os.Getpid(), Action: "second"}); !errors.Is(err, ErrLifecycleLeaseHeld) {
+	if _, err := AcquireLifecycleAt(
+		leasePath,
+		maintenancePath,
+		LifecycleOwner{PID: os.Getpid(), Action: "second"},
+	); !errors.Is(err, ErrLifecycleLeaseHeld) {
 		t.Fatalf("retained lease did not block reacquire: %v", err)
 	}
 	if err := retained.Close(); err != nil {
 		t.Fatal(err)
 	}
-	reacquired, err := AcquireLifecycleAt(leasePath, LifecycleOwner{PID: os.Getpid(), Action: "second"})
+	reacquired, err := AcquireLifecycleAt(
+		leasePath,
+		maintenancePath,
+		LifecycleOwner{PID: os.Getpid(), Action: "second"},
+	)
 	if err != nil {
 		t.Fatalf("lease was not released after all descriptors closed: %v", err)
 	}
@@ -164,26 +199,42 @@ func TestRetainedLifecycleLeasePreventsReacquire(t *testing.T) {
 }
 
 func TestIsolatedLifecyclePathIsContextLocal(t *testing.T) {
-	isolatedPath := filepath.Join(t.TempDir(), "lifecycle.lease")
-	isolatedContext := WithIsolatedNetNSTestLifecyclePath(t.Context(), isolatedPath)
+	root := t.TempDir()
+	isolatedPath := filepath.Join(root, "lifecycle.lease")
+	maintenancePath := filepath.Join(root, "maintenance.gate")
+	isolatedContext := WithIsolatedNetNSTestLifecyclePaths(
+		t.Context(),
+		isolatedPath,
+		maintenancePath,
+	)
 	if got := LifecycleLeasePath(isolatedContext); got != isolatedPath {
 		t.Fatalf("isolated lifecycle path = %q, want %q", got, isolatedPath)
 	}
 	if got := LifecycleLeasePath(t.Context()); got != DefaultLifecycleLeasePath {
 		t.Fatalf("default lifecycle path changed to %q", got)
 	}
+	if got := LifecycleMaintenancePath(isolatedContext); got != maintenancePath {
+		t.Fatalf("isolated maintenance path = %q, want %q", got, maintenancePath)
+	}
+	if got := LifecycleMaintenancePath(t.Context()); got != DefaultLifecycleMaintenancePath {
+		t.Fatalf("default maintenance path changed to %q", got)
+	}
 }
 
 func TestIsolatedLifecycleValidationRunsAfterLeaseAcquisition(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "lifecycle.lease")
+	root := t.TempDir()
+	leasePath := filepath.Join(root, "lifecycle.lease")
+	maintenancePath := filepath.Join(root, "maintenance.gate")
 	validationCalls := 0
 	ctx := WithIsolatedNetNSTestLifecycleValidation(
 		t.Context(),
 		leasePath,
+		maintenancePath,
 		func() error {
 			validationCalls++
 			contender, err := AcquireLifecycleAt(
 				leasePath,
+				maintenancePath,
 				LifecycleOwner{PID: os.Getpid(), Action: "contender"},
 			)
 			if err == nil {
@@ -221,6 +272,7 @@ func TestIsolatedLifecycleValidationRunsAfterLeaseAcquisition(t *testing.T) {
 func TestIsolatedLifecycleValidationRejectsStaleContract(t *testing.T) {
 	root := t.TempDir()
 	leasePath := filepath.Join(root, "lifecycle.lease")
+	maintenancePath := filepath.Join(root, "maintenance.gate")
 	contractMarker := filepath.Join(root, "contract.marker")
 	if err := os.WriteFile(contractMarker, []byte("owned\n"), 0o600); err != nil {
 		t.Fatal(err)
@@ -228,6 +280,7 @@ func TestIsolatedLifecycleValidationRejectsStaleContract(t *testing.T) {
 	ctx := WithIsolatedNetNSTestLifecycleValidation(
 		t.Context(),
 		leasePath,
+		maintenancePath,
 		func() error {
 			data, err := os.ReadFile(contractMarker)
 			if err != nil {

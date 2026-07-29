@@ -29,31 +29,47 @@ type LifecycleOwner struct {
 type LifecycleLease struct {
 	mu   sync.Mutex
 	path string
-	file *os.File
+	lock *anchoredLifecycleLock
 }
 
 type lifecyclePathContextKey struct{}
 
 type lifecycleContext struct {
 	path              string
+	maintenancePath   string
 	validateAfterLock func() error
 }
 
-// WithLifecyclePathForTest redirects the global lifecycle lease for a test
-// context. Production entrypoints never expose this through flags or
-// environment variables.
-func WithLifecyclePathForTest(ctx context.Context, path string) context.Context {
+// WithLifecyclePathsForTest redirects the global lifecycle lease and
+// maintenance gate for a test context. Production entrypoints never expose
+// these paths through flags or environment variables.
+func WithLifecyclePathsForTest(
+	ctx context.Context,
+	path string,
+	maintenancePath string,
+) context.Context {
 	if flag.Lookup("test.v") == nil {
-		panic("WithLifecyclePathForTest is only available in Go test binaries")
+		panic("WithLifecyclePathsForTest is only available in Go test binaries")
 	}
-	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{path: path})
+	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{
+		path:            path,
+		maintenancePath: maintenancePath,
+	})
 }
 
-// WithIsolatedNetNSTestLifecyclePath redirects the lifecycle lease for the
-// explicitly gated, non-initial-network-namespace smoke-test path. Callers
-// must validate the complete run-owned layout before using this helper.
-func WithIsolatedNetNSTestLifecyclePath(ctx context.Context, path string) context.Context {
-	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{path: path})
+// WithIsolatedNetNSTestLifecyclePaths redirects the lifecycle lease and its
+// shared maintenance gate for the explicitly gated, non-initial-network-
+// namespace smoke-test path. Callers must validate the complete run-owned
+// layout and the fixed gate root before using this helper.
+func WithIsolatedNetNSTestLifecyclePaths(
+	ctx context.Context,
+	path string,
+	maintenancePath string,
+) context.Context {
+	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{
+		path:            path,
+		maintenancePath: maintenancePath,
+	})
 }
 
 // WithIsolatedNetNSTestLifecycleValidation redirects the lifecycle lease and
@@ -62,10 +78,12 @@ func WithIsolatedNetNSTestLifecyclePath(ctx context.Context, path string) contex
 func WithIsolatedNetNSTestLifecycleValidation(
 	ctx context.Context,
 	path string,
+	maintenancePath string,
 	validateAfterLock func() error,
 ) context.Context {
 	return context.WithValue(ctx, lifecyclePathContextKey{}, lifecycleContext{
 		path:              path,
+		maintenancePath:   maintenancePath,
 		validateAfterLock: validateAfterLock,
 	})
 }
@@ -80,45 +98,135 @@ func LifecycleLeasePath(ctx context.Context) string {
 	return DefaultLifecycleLeasePath
 }
 
-func AcquireLifecycle(ctx context.Context, owner LifecycleOwner) (*LifecycleLease, error) {
-	if err := ctx.Err(); err != nil {
-		return nil, err
+func LifecycleMaintenancePath(ctx context.Context) string {
+	if ctx != nil {
+		if lifecycle, ok := ctx.Value(lifecyclePathContextKey{}).(lifecycleContext); ok &&
+			lifecycle.maintenancePath != "" {
+			return lifecycle.maintenancePath
+		}
 	}
-	return AcquireLifecycleAt(LifecycleLeasePath(ctx), owner)
+	return DefaultLifecycleMaintenancePath
 }
 
-func AcquireLifecycleAt(path string, owner LifecycleOwner) (*LifecycleLease, error) {
+func AcquireLifecycle(ctx context.Context, owner LifecycleOwner) (*LifecycleLease, error) {
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
+	return AcquireLifecycleAt(
+		LifecycleLeasePath(ctx),
+		LifecycleMaintenancePath(ctx),
+		owner,
+	)
+}
+
+func AcquireLifecycleAt(
+	path string,
+	maintenancePath string,
+	owner LifecycleOwner,
+) (*LifecycleLease, error) {
+	maintenance, err := tryBeginLifecycleMaintenanceAt(path, maintenancePath, owner)
+	if err != nil {
+		if errors.Is(err, ErrLifecycleMaintenanceHeld) {
+			return nil, errors.Join(ErrLifecycleLeaseHeld, err)
+		}
+		return nil, err
+	}
+	lease, acquireErr := maintenance.TryAcquireLifecycle(owner)
+	closeErr := maintenance.Close()
+	if acquireErr != nil {
+		return nil, errors.Join(acquireErr, closeErr)
+	}
+	if closeErr != nil {
+		return nil, errors.Join(closeErr, lease.Close())
+	}
+	return lease, nil
+}
+
+func acquireLifecycleWithoutMaintenance(path string, owner LifecycleOwner) (*LifecycleLease, error) {
 	if path == "" {
 		return nil, errors.New("global lifecycle lease path is empty")
 	}
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
-		return nil, fmt.Errorf("create global lifecycle lease directory: %w", err)
+	cleanPath := filepath.Clean(path)
+	if cleanPath != path || !filepath.IsAbs(cleanPath) {
+		return nil, fmt.Errorf("global lifecycle lease path must be a clean absolute path: %q", path)
 	}
-	file, err := openRegularSingleLinkLock(path)
+	lock, err := acquireAnchoredLifecycleLock(
+		cleanPath,
+		owner,
+		ErrLifecycleLeaseHeld,
+		"global lifecycle lease",
+	)
 	if err != nil {
-		return nil, fmt.Errorf("open global lifecycle lease %s: %w", path, err)
+		return nil, err
 	}
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		return nil, fmt.Errorf("secure global lifecycle lease %s: %w", path, err)
+	return &LifecycleLease{path: cleanPath, lock: lock}, nil
+}
+
+func acquireAnchoredLifecycleLock(
+	path string,
+	owner LifecycleOwner,
+	heldError error,
+	description string,
+) (*anchoredLifecycleLock, error) {
+	lock, err := openAnchoredLifecycleLock(path)
+	if err != nil {
+		return nil, fmt.Errorf("open %s %s: %w", description, path, err)
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := syscall.Flock(
+		int(lock.file.Fd()),
+		syscall.LOCK_EX|syscall.LOCK_NB,
+	); err != nil {
 		detail := ""
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			data := make([]byte, 4096)
-			if n, readErr := file.ReadAt(data, 0); readErr == nil || n > 0 {
+			if n, readErr := lock.file.ReadAt(data, 0); readErr == nil || n > 0 {
 				detail = strings.TrimSpace(string(data[:n]))
 			}
-			_ = file.Close()
+			closeErr := lock.close()
+			heldErr := fmt.Errorf("%w at %s", heldError, path)
 			if detail != "" {
-				return nil, fmt.Errorf("%w at %s; owner=%s", ErrLifecycleLeaseHeld, path, detail)
+				heldErr = fmt.Errorf("%w; owner=%s", heldErr, detail)
 			}
-			return nil, fmt.Errorf("%w at %s", ErrLifecycleLeaseHeld, path)
+			return nil, errors.Join(heldErr, closeErr)
 		}
-		_ = file.Close()
-		return nil, fmt.Errorf("acquire global lifecycle lease %s: %w", path, err)
+		return nil, errors.Join(
+			fmt.Errorf("acquire %s %s: %w", description, path, err),
+			lock.close(),
+		)
 	}
+	if err := lock.validate(); err != nil {
+		return nil, releaseAnchoredLifecycleLock(
+			lock,
+			fmt.Errorf("validate acquired %s %s: %w", description, path, err),
+		)
+	}
+	if err := recordLifecycleOwner(lock.file, owner); err != nil {
+		return nil, releaseAnchoredLifecycleLock(
+			lock,
+			fmt.Errorf("record %s owner in %s: %w", description, path, err),
+		)
+	}
+	if err := lock.validate(); err != nil {
+		return nil, releaseAnchoredLifecycleLock(
+			lock,
+			fmt.Errorf("revalidate acquired %s %s: %w", description, path, err),
+		)
+	}
+	return lock, nil
+}
 
+func releaseAnchoredLifecycleLock(lock *anchoredLifecycleLock, cause error) error {
+	if lock == nil {
+		return cause
+	}
+	unlockErr := syscall.Flock(int(lock.file.Fd()), syscall.LOCK_UN)
+	closeErr := lock.close()
+	return errors.Join(cause, unlockErr, closeErr)
+}
+
+func recordLifecycleOwner(file *os.File, owner LifecycleOwner) error {
 	data, err := json.Marshal(owner)
 	if err == nil {
 		err = file.Truncate(0)
@@ -132,12 +240,7 @@ func AcquireLifecycleAt(path string, owner LifecycleOwner) (*LifecycleLease, err
 	if err == nil {
 		err = file.Sync()
 	}
-	if err != nil {
-		_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
-		_ = file.Close()
-		return nil, fmt.Errorf("record global lifecycle lease owner in %s: %w", path, err)
-	}
-	return &LifecycleLease{path: filepath.Clean(path), file: file}, nil
+	return err
 }
 
 func WithLifecycle(
@@ -146,8 +249,10 @@ func WithLifecycle(
 	owner LifecycleOwner,
 	fn func(*LifecycleLease) error,
 ) (retErr error) {
-	if err := ctx.Err(); err != nil {
-		return err
+	if ctx != nil {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 	}
 	path := LifecycleLeasePath(ctx)
 	if held != nil {
@@ -159,7 +264,7 @@ func WithLifecycle(
 		}
 		return fn(held)
 	}
-	lease, err := AcquireLifecycleAt(path, owner)
+	lease, err := AcquireLifecycleAt(path, LifecycleMaintenancePath(ctx), owner)
 	if err != nil {
 		return err
 	}
@@ -192,18 +297,13 @@ func (l *LifecycleLease) HeldAt(path string) bool {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.file == nil || filepath.Clean(path) != l.path {
+	if l.lock == nil ||
+		!filepath.IsAbs(path) ||
+		filepath.Clean(path) != path ||
+		path != l.path {
 		return false
 	}
-	heldInfo, err := l.file.Stat()
-	if err != nil {
-		return false
-	}
-	pathInfo, err := os.Lstat(path)
-	if err != nil || pathInfo.Mode()&os.ModeSymlink != 0 {
-		return false
-	}
-	return os.SameFile(heldInfo, pathInfo)
+	return l.lock.validate() == nil
 }
 
 // Retain duplicates the lease file description. Closing the original lease
@@ -214,16 +314,16 @@ func (l *LifecycleLease) Retain() (*LifecycleLease, error) {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.file == nil {
+	if l.lock == nil {
 		return nil, errors.New("cannot retain closed lifecycle lease")
 	}
-	fd, err := unix.FcntlInt(l.file.Fd(), unix.F_DUPFD_CLOEXEC, 0)
+	duplicate, err := l.lock.duplicate()
 	if err != nil {
 		return nil, fmt.Errorf("retain global lifecycle lease %s: %w", l.path, err)
 	}
 	return &LifecycleLease{
 		path: l.path,
-		file: os.NewFile(uintptr(fd), l.path),
+		lock: duplicate,
 	}, nil
 }
 
@@ -233,11 +333,11 @@ func (l *LifecycleLease) Close() error {
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	if l.file == nil {
+	if l.lock == nil {
 		return nil
 	}
-	err := l.file.Close()
-	l.file = nil
+	err := l.lock.close()
+	l.lock = nil
 	if err != nil {
 		return fmt.Errorf("close global lifecycle lease %s: %w", l.path, err)
 	}

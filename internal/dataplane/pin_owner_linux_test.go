@@ -2701,8 +2701,14 @@ func TestSameResourcePathAliasRetryRetiresExactRekeySource(t *testing.T) {
 }
 
 func TestPinOwnershipMutationAPIsRequireMatchingLifecycleLease(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+	root := t.TempDir()
+	leasePath := filepath.Join(root, "daemon.lease")
+	maintenancePath := filepath.Join(root, "maintenance.gate")
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		leasePath,
+		maintenancePath,
+	)
 	if _, err := RecoverPinOwnership(
 		ctx,
 		"relative",
@@ -2743,9 +2749,11 @@ func TestPinOwnershipMutationAPIsRequireMatchingLifecycleLease(t *testing.T) {
 		!strings.Contains(err.Error(), "path must be absolute") {
 		t.Fatalf("detach with lifecycle lease error = %v", err)
 	}
-	mismatchedCtx := lockfile.WithLifecyclePathForTest(
+	mismatchedRoot := t.TempDir()
+	mismatchedCtx := lockfile.WithLifecyclePathsForTest(
 		t.Context(),
-		filepath.Join(t.TempDir(), "other-daemon.lease"),
+		filepath.Join(mismatchedRoot, "other-daemon.lease"),
+		filepath.Join(mismatchedRoot, "maintenance.gate"),
 	)
 	if _, err := RecoverPinOwnership(
 		mismatchedCtx,
@@ -2765,8 +2773,13 @@ func TestPinOwnershipMutationAPIsRequireMatchingLifecycleLease(t *testing.T) {
 
 func TestPinOwnershipMutationRejectsClosedAndReplacedLifecycleLease(t *testing.T) {
 	t.Run("closed", func(t *testing.T) {
-		leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-		ctx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+		root := t.TempDir()
+		leasePath := filepath.Join(root, "daemon.lease")
+		ctx := lockfile.WithLifecyclePathsForTest(
+			t.Context(),
+			leasePath,
+			filepath.Join(root, "maintenance.gate"),
+		)
 		lease, err := lockfile.AcquireLifecycle(
 			ctx,
 			lockfile.LifecycleOwner{PID: os.Getpid(), Action: "test"},
@@ -2786,8 +2799,13 @@ func TestPinOwnershipMutationRejectsClosedAndReplacedLifecycleLease(t *testing.T
 		}
 	})
 	t.Run("replaced-path-entry", func(t *testing.T) {
-		leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-		ctx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+		root := t.TempDir()
+		leasePath := filepath.Join(root, "daemon.lease")
+		ctx := lockfile.WithLifecyclePathsForTest(
+			t.Context(),
+			leasePath,
+			filepath.Join(root, "maintenance.gate"),
+		)
 		lease, err := lockfile.AcquireLifecycle(
 			ctx,
 			lockfile.LifecycleOwner{PID: os.Getpid(), Action: "test"},
@@ -2817,8 +2835,13 @@ func TestPinOwnershipMutationRejectsClosedAndReplacedLifecycleLease(t *testing.T
 }
 
 func TestPinOwnershipRetainedLeaseSurvivesCallerClose(t *testing.T) {
-	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	ctx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+	root := t.TempDir()
+	leasePath := filepath.Join(root, "daemon.lease")
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		leasePath,
+		filepath.Join(root, "maintenance.gate"),
+	)
 	lease, err := lockfile.AcquireLifecycle(
 		ctx,
 		lockfile.LifecycleOwner{PID: os.Getpid(), Action: "test"},
