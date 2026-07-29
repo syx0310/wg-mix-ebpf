@@ -80,6 +80,15 @@ func createFreshManagedCleanupDir(spec cleanupPathSpec) (*managedCleanupDir, err
 				_ = current.close()
 				return nil, fmt.Errorf("exclusively create fresh %s %s: %w", spec.name, spec.path, err)
 			}
+			if err := current.file.Sync(); err != nil {
+				_ = current.close()
+				return nil, fmt.Errorf(
+					"sync parent after creating fresh %s %s: %w",
+					spec.name,
+					spec.path,
+					err,
+				)
+			}
 			child, openErr = cleanupOpenDirAt(current, component)
 		}
 		if openErr != nil {
@@ -1208,6 +1217,14 @@ func openExactDeclaredDirectoryWithOptions(
 					_ = current.close()
 					return nil, false, fmt.Errorf(
 						"create service artifact directory %s: %w",
+						spec.path,
+						err,
+					)
+				}
+				if err := current.file.Sync(); err != nil {
+					_ = current.close()
+					return nil, false, fmt.Errorf(
+						"sync parent after creating declared artifact directory %s: %w",
 						spec.path,
 						err,
 					)
