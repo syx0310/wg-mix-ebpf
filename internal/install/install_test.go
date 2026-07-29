@@ -107,6 +107,50 @@ func TestInstallRejectsHeldGlobalLifecycleLeaseBeforeWrites(t *testing.T) {
 	}
 }
 
+func TestInstallRetainsMaintenanceGateWithLifecycleLease(t *testing.T) {
+	root := t.TempDir()
+	layout := cleanupTestPaths(root, "install-gate-held")
+	setCleanupTestEnvironment(t, layout)
+	lifecyclePath := filepath.Join(root, "daemon.lease")
+	maintenancePath := filepath.Join(root, "maintenance.gate")
+	hookRan := false
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		lifecyclePath,
+		maintenancePath,
+	)
+	ctx = context.WithValue(
+		ctx,
+		installAfterLifecycleHookContextKey{},
+		func() error {
+			hookRan = true
+			other, err := lockfile.BeginLifecycleMaintenanceAt(
+				lifecyclePath,
+				maintenancePath,
+				lockfile.LifecycleOwner{
+					PID:    os.Getpid(),
+					Action: "concurrent-maintenance",
+				},
+			)
+			if err == nil {
+				_ = other.Close()
+				return errors.New("concurrent maintenance acquired install gate")
+			}
+			if !errors.Is(err, lockfile.ErrLifecycleMaintenanceHeld) {
+				return fmt.Errorf("concurrent maintenance error = %w", err)
+			}
+			return nil
+		},
+	)
+
+	if _, err := Install(ctx, Options{System: "unknown"}); err != nil {
+		t.Fatal(err)
+	}
+	if !hookRan {
+		t.Fatal("install lifecycle hook did not run")
+	}
+}
+
 func TestUninstallRejectsHeldMaintenanceGateBeforeCleanup(t *testing.T) {
 	layout := newCleanupTestLayout(t, "uninstall-held")
 	attachStatePath := attachstate.Path(layout.VarLibDir)

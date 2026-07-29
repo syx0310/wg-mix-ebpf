@@ -47,6 +47,7 @@ type Plan struct {
 }
 
 type installAfterInspectHookContextKey struct{}
+type installAfterLifecycleHookContextKey struct{}
 
 func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if err := ctx.Err(); err != nil {
@@ -113,7 +114,23 @@ func Install(ctx context.Context, opts Options) (*Plan, error) {
 		ConfigPath: paths.ConfigPath,
 		RunDir:     paths.RunDir,
 	}
-	if err := lockfile.WithLifecycle(ctx, nil, owner, func(lease *lockfile.LifecycleLease) error {
+	maintenance, err := lockfile.BeginLifecycleMaintenance(ctx, owner)
+	if err != nil {
+		return nil, err
+	}
+	lease, err := maintenance.TryAcquireLifecycle(owner)
+	if err != nil {
+		return nil, errors.Join(err, maintenance.Close())
+	}
+	installErr := lockfile.WithLifecycle(ctx, lease, owner, func(
+		lease *lockfile.LifecycleLease,
+	) error {
+		if hook, ok := ctx.Value(installAfterLifecycleHookContextKey{}).(func() error); ok &&
+			hook != nil {
+			if err := hook(); err != nil {
+				return fmt.Errorf("run install lifecycle hook: %w", err)
+			}
+		}
 		return lockfile.WithLock(ctx, paths.RunDir, func() error {
 			lockedOwnership, err := inspectLockedInstallOwnership(
 				paths,
@@ -128,7 +145,9 @@ func Install(ctx context.Context, opts Options) (*Plan, error) {
 			}
 			return applyInstall(ctx, opts, system, paths, lockedOwnership)
 		})
-	}); err != nil {
+	})
+	closeErr := errors.Join(lease.Close(), maintenance.Close())
+	if err := errors.Join(installErr, closeErr); err != nil {
 		return nil, err
 	}
 	return plan, nil
