@@ -1,14 +1,20 @@
 package app
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/pinidentity"
 )
@@ -18,7 +24,141 @@ const isolatedFixtureOwnerToken = "0123456789abcdef0123456789abcdef"
 const (
 	isolatedPrivilegedMountTestGate   = "WG_MIX_EBPF_RUN_PRIVILEGED_MOUNT_TESTS"
 	isolatedPrivilegedMountTestHelper = "WG_MIX_EBPF_PRIVILEGED_MOUNT_HELPER"
+	isolatedPrivilegedMountHelperFD   = "WG_MIX_EBPF_PRIVILEGED_MOUNT_HELPER_FD"
+	isolatedPrivilegedLaunchFormat    = "wg-mix-ebpf-privileged-mount-launch-v1"
+	isolatedPrivilegedAuditFormat     = "wg-mix-ebpf-privileged-command-audit-v1"
+	isolatedReviewedUnsharePath       = "/usr/bin/unshare"
+	isolatedReviewedMountPath         = "/usr/bin/mount"
+	isolatedReviewedUmountPath        = "/usr/bin/umount"
+	isolatedPrivilegedLaunchFD        = 3
+	isolatedPrivilegedExecutableFD    = 4
+	isolatedPrivilegedTestPrefix      = "/tmp/wg-mix-ebpf-privileged-mount-tests"
+	isolatedPrivilegedOwnerMarker     = ".wg-mix-ebpf-owner"
+	isolatedPrivilegedOwnerFormat     = "wg-mix-ebpf-privileged-test-owner-v1"
+	isolatedPrivilegedWriteFormat     = "wg-mix-ebpf-privileged-write-v1"
+	isolatedPrivilegedCleanupFormat   = "wg-mix-ebpf-privileged-cleanup-v1"
 )
+
+type isolatedMountNamespaceIdentity struct {
+	device uint64
+	inode  uint64
+}
+
+type isolatedPrivilegedLaunchRecord struct {
+	Format          string `json:"format"`
+	OuterPID        int    `json:"outer_pid"`
+	OuterMountDev   uint64 `json:"outer_mount_dev"`
+	OuterMountInode uint64 `json:"outer_mount_inode"`
+	ExecutableDev   uint64 `json:"executable_dev"`
+	ExecutableInode uint64 `json:"executable_inode"`
+}
+
+type isolatedReviewedToolMetadata struct {
+	mode  os.FileMode
+	uid   uint32
+	nlink uint64
+}
+
+type isolatedPrivilegedCommandAudit struct {
+	Format     string   `json:"format"`
+	StartedAt  string   `json:"started_at"`
+	FinishedAt string   `json:"finished_at"`
+	Tool       string   `json:"tool"`
+	Argv       []string `json:"argv"`
+	Target     string   `json:"target"`
+	ExitCode   int      `json:"exit_code"`
+}
+
+type isolatedReviewedCommandSpec struct {
+	tool       string
+	args       []string
+	target     string
+	env        []string
+	extraFiles []*os.File
+	timeout    time.Duration
+}
+
+type isolatedReviewedMountTargetSnapshot struct {
+	target string
+	device uint64
+	inode  uint64
+	chain  []mountInfoEntry
+}
+
+type isolatedReviewedMountedTarget struct {
+	target         string
+	before         isolatedReviewedMountTargetSnapshot
+	mounted        mountInfoEntry
+	operations     isolatedReviewedMountLifecycleOperations
+	unmountIssued  bool
+	cleanupBlocked bool
+	active         bool
+}
+
+type isolatedReviewedMountLifecycleOperations struct {
+	snapshotTarget     func() (isolatedReviewedMountTargetSnapshot, error)
+	readMountInfo      func() ([]mountInfoEntry, error)
+	readTargetIdentity func() (isolatedMountNamespaceIdentity, error)
+	runMount           func() error
+	runUnmount         func() error
+}
+
+type isolatedReviewedMountLifecycleFixture struct {
+	target          string
+	before          isolatedReviewedMountTargetSnapshot
+	restoredEntries []mountInfoEntry
+	mountedEntries  []mountInfoEntry
+	stateEntries    []mountInfoEntry
+	beforeIdentity  isolatedMountNamespaceIdentity
+	mountedIdentity isolatedMountNamespaceIdentity
+	mountCommits    bool
+	unmountCommits  bool
+	mountErr        error
+	unmountErr      error
+	readErrors      []error
+	snapshotErrors  []error
+	mountCalls      int
+	unmountCalls    int
+	readCalls       int
+	snapshotCalls   int
+	identityCalls   int
+	currentIdentity isolatedMountNamespaceIdentity
+}
+
+type isolatedReviewedOwnedPath struct {
+	path   string
+	device uint64
+	inode  uint64
+	uid    uint32
+	mode   os.FileMode
+}
+
+type isolatedReviewedPrivilegedResources struct {
+	root          string
+	runID         string
+	markerContent string
+	owned         []isolatedReviewedOwnedPath
+	cleaned       bool
+}
+
+type isolatedReviewedCleanupAudit struct {
+	Format    string   `json:"format"`
+	Timestamp string   `json:"timestamp"`
+	Host      string   `json:"host"`
+	Argv      []string `json:"argv"`
+	Target    string   `json:"target"`
+	Device    uint64   `json:"device"`
+	Inode     uint64   `json:"inode"`
+	ExitCode  int      `json:"exit_code"`
+}
+
+type isolatedReviewedFilesystemWriteAudit struct {
+	Format    string `json:"format"`
+	Timestamp string `json:"timestamp"`
+	Operation string `json:"operation"`
+	Target    string `json:"target"`
+	ExitCode  int    `json:"exit_code"`
+}
 
 func TestIsolatedNetNSTestPaths(t *testing.T) {
 	base := filepath.Join(isolatedNetNSTestRoot, "0123456789abcdef")
@@ -765,6 +905,19 @@ func TestPrivateBPFFSMountRejectsPropagationAndAliasForms(t *testing.T) {
 			layout.bpffsDir,
 			source,
 		),
+		"direct namespace root whole-root alias": fmt.Sprintf(
+			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+				"31 21 8:1 / /host rw,relatime - ext4 /dev/root rw\n"+
+				"42 21 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
+			layout.bpffsDir,
+			source,
+		),
+		"namespace root subtree": fmt.Sprintf(
+			"21 1 8:1 /host-root / rw,relatime - ext4 /dev/root rw\n"+
+				"42 21 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
+			layout.bpffsDir,
+			source,
+		),
 		"isolated root mount": fmt.Sprintf(
 			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
 				"41 21 0:41 / %s rw,relatime - tmpfs tmpfs rw\n"+
@@ -795,7 +948,9 @@ func TestPrivateBPFFSMountRejectsPropagationAndAliasForms(t *testing.T) {
 
 func TestPrivateBPFFSMountRejectsRealLinuxRunSubtreeBinds(t *testing.T) {
 	if os.Getenv(isolatedPrivilegedMountTestHelper) == "1" {
-		runIsolatedPrivilegedMountHelper(t)
+		if err := runIsolatedPrivilegedMountHelper(t); err != nil {
+			t.Fatal(err)
+		}
 		return
 	}
 	if runtime.GOOS != "linux" {
@@ -809,20 +964,61 @@ func TestPrivateBPFFSMountRejectsRealLinuxRunSubtreeBinds(t *testing.T) {
 	if os.Geteuid() != 0 {
 		t.Skip("reviewed mount integration requires root inside an isolated mount namespace")
 	}
-	command := exec.Command(
-		"unshare",
-		"--mount",
-		"--propagation",
-		"private",
-		os.Args[0],
-		"-test.run=^TestPrivateBPFFSMountRejectsRealLinuxRunSubtreeBinds$",
-		"-test.count=1",
-	)
-	command.Env = append(
-		os.Environ(),
-		isolatedPrivilegedMountTestHelper+"=1",
-	)
-	output, err := command.CombinedOutput()
+	if err := validateReviewedPrivilegedTools(); err != nil {
+		t.Fatalf("validate reviewed privileged tools: %v", err)
+	}
+	outerNamespace, err := readMountNamespaceIdentity("/proc/self/ns/mnt")
+	if err != nil {
+		t.Fatalf("read outer mount namespace identity: %v", err)
+	}
+	runningExecutable, executableIdentity, err := openReviewedRunningExecutable()
+	if err != nil {
+		t.Fatalf("bind reviewed child executable to current process image: %v", err)
+	}
+	defer runningExecutable.Close()
+	recordData, err := json.Marshal(isolatedPrivilegedLaunchRecord{
+		Format:          isolatedPrivilegedLaunchFormat,
+		OuterPID:        os.Getpid(),
+		OuterMountDev:   outerNamespace.device,
+		OuterMountInode: outerNamespace.inode,
+		ExecutableDev:   executableIdentity.device,
+		ExecutableInode: executableIdentity.inode,
+	})
+	if err != nil {
+		t.Fatalf("encode privileged launch record: %v", err)
+	}
+	recordReader, recordWriter, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("create privileged launch pipe: %v", err)
+	}
+	defer recordReader.Close()
+	if _, err := recordWriter.Write(append(recordData, '\n')); err != nil {
+		_ = recordWriter.Close()
+		t.Fatalf("write privileged launch record: %v", err)
+	}
+	if err := recordWriter.Close(); err != nil {
+		t.Fatalf("close privileged launch record writer: %v", err)
+	}
+	output, _, err := runReviewedPrivilegedCommand(t, isolatedReviewedCommandSpec{
+		tool: isolatedReviewedUnsharePath,
+		args: []string{
+			"--mount",
+			"--propagation",
+			"private",
+			fmt.Sprintf("/proc/self/fd/%d", isolatedPrivilegedExecutableFD),
+			"-test.run=^TestPrivateBPFFSMountRejectsRealLinuxRunSubtreeBinds$",
+			"-test.count=1",
+		},
+		target: "new-private-mount-namespace",
+		env: []string{
+			isolatedPrivilegedMountTestGate + "=1",
+			isolatedPrivilegedMountTestHelper + "=1",
+			isolatedPrivilegedMountHelperFD + "=" +
+				strconv.Itoa(isolatedPrivilegedLaunchFD),
+		},
+		extraFiles: []*os.File{recordReader, runningExecutable},
+		timeout:    60 * time.Second,
+	})
 	if err != nil {
 		t.Fatalf(
 			"run reviewed private mount namespace integration: %v\n%s",
@@ -832,20 +1028,88 @@ func TestPrivateBPFFSMountRejectsRealLinuxRunSubtreeBinds(t *testing.T) {
 	}
 }
 
-func runIsolatedPrivilegedMountHelper(t *testing.T) {
-	if runtime.GOOS != "linux" ||
-		os.Getenv(isolatedPrivilegedMountTestGate) != "1" ||
-		os.Geteuid() != 0 {
-		t.Fatal("privileged mount helper ran without its explicit Linux root gate")
+func runIsolatedPrivilegedMountHelper(t *testing.T) error {
+	t.Helper()
+	launchFD, err := validatePrivilegedMountHelperEnvironment(os.Environ())
+	if err != nil {
+		return fmt.Errorf("validate privileged helper environment: %w", err)
 	}
-	root := t.TempDir()
-	source := filepath.Join(root, "source")
-	runBase := filepath.Join(root, "run")
-	if err := os.Mkdir(source, 0o700); err != nil {
-		t.Fatal(err)
+	if err := validatePrivilegedMountHelperArguments(os.Args); err != nil {
+		return fmt.Errorf("validate privileged helper arguments: %w", err)
 	}
-	if err := os.Mkdir(runBase, 0o700); err != nil {
-		t.Fatal(err)
+	if runtime.GOOS != "linux" {
+		return fmt.Errorf("privileged mount helper requires Linux")
+	}
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("privileged mount helper requires effective uid 0")
+	}
+	if err := validateReviewedPrivilegedTools(); err != nil {
+		return fmt.Errorf("validate reviewed privileged tools: %w", err)
+	}
+	record, err := readPrivilegedLaunchRecord(launchFD)
+	if err != nil {
+		return fmt.Errorf("read privileged launch record: %w", err)
+	}
+	currentNamespace, err := readMountNamespaceIdentity("/proc/self/ns/mnt")
+	if err != nil {
+		return fmt.Errorf("read helper mount namespace: %w", err)
+	}
+	initialNamespace, err := readMountNamespaceIdentity("/proc/1/ns/mnt")
+	if err != nil {
+		return fmt.Errorf("read initial mount namespace: %w", err)
+	}
+	parentPID := os.Getppid()
+	parentNamespace, err := readMountNamespaceIdentity(
+		fmt.Sprintf("/proc/%d/ns/mnt", parentPID),
+	)
+	if err != nil {
+		return fmt.Errorf("read outer parent mount namespace: %w", err)
+	}
+	if err := validatePrivilegedLaunchContext(
+		record,
+		parentPID,
+		currentNamespace,
+		initialNamespace,
+		parentNamespace,
+	); err != nil {
+		return fmt.Errorf("validate privileged launch context: %w", err)
+	}
+	openedExecutable, err := readFileIdentity(
+		fmt.Sprintf("/proc/self/fd/%d", isolatedPrivilegedExecutableFD),
+	)
+	if err != nil {
+		return fmt.Errorf("read opened child executable identity: %w", err)
+	}
+	currentExecutable, err := readFileIdentity("/proc/self/exe")
+	if err != nil {
+		return fmt.Errorf("read current child executable identity: %w", err)
+	}
+	if err := validatePrivilegedExecutableContext(
+		record,
+		openedExecutable,
+		currentExecutable,
+	); err != nil {
+		return fmt.Errorf("validate privileged executable context: %w", err)
+	}
+	if err := validateCurrentPrivateMountPaths("/"); err != nil {
+		return fmt.Errorf("validate helper mount namespace root propagation: %w", err)
+	}
+
+	resources, err := newReviewedPrivilegedResources(t, "run-subtree")
+	if err != nil {
+		return fmt.Errorf("create reviewed privileged resources: %w", err)
+	}
+	root := resources.root
+	source, err := resources.createDirectory(t, "source")
+	if err != nil {
+		return fmt.Errorf("create reviewed bind source: %w", err)
+	}
+	runBase, err := resources.createDirectory(t, "run")
+	if err != nil {
+		return fmt.Errorf("create reviewed run target: %w", err)
+	}
+	if err := validateCurrentPrivateMountPaths("/", root, source, runBase); err != nil {
+		return fmt.Errorf("validate reviewed target propagation before mounts: %w", err)
 	}
 	layout := isolatedNetNSTestLayout{
 		runBase:  runBase,
@@ -855,114 +1119,136 @@ func runIsolatedPrivilegedMountHelper(t *testing.T) {
 		runBase,
 		filepath.Join(runBase, "state-a"),
 	} {
-		t.Run(filepath.Base(target), func(t *testing.T) {
+		if !t.Run(filepath.Base(target), func(t *testing.T) {
 			if target != runBase {
-				if err := os.Mkdir(target, 0o700); err != nil {
+				created, err := resources.createDirectory(
+					t,
+					filepath.Join("run", filepath.Base(target)),
+				)
+				if err != nil {
 					t.Fatal(err)
 				}
-			}
-			mount := exec.Command("mount", "--bind", source, target)
-			if output, err := mount.CombinedOutput(); err != nil {
-				t.Fatalf("bind reviewed test target %s: %v\n%s", target, err, output)
-			}
-			mounted := true
-			defer func() {
-				if !mounted {
-					return
+				if created != target {
+					t.Fatalf("created target %s, want %s", created, target)
 				}
-				output, err := exec.Command("umount", "--", target).CombinedOutput()
-				if err != nil {
-					t.Errorf("unmount reviewed test target %s: %v\n%s", target, err, output)
-				}
-			}()
-			data, err := os.ReadFile("/proc/self/mountinfo")
+			}
+			mounted, err := mountReviewedTarget(
+				t,
+				[]string{"--bind", "--", source, target},
+				target,
+			)
 			if err != nil {
-				t.Fatal(err)
+				t.Fatalf("bind reviewed test target %s: %v", target, err)
 			}
-			entries, err := parseMountInfo(data)
+			defer mounted.deferredUnmount(t)
+			entries, err := readCurrentMountInfo()
 			if err != nil {
 				t.Fatal(err)
 			}
 			if err := validateProtectedRunSubtreeMounts(entries, layout); err == nil {
 				t.Fatalf("real bind mount at %s unexpectedly accepted", target)
 			}
-			output, err := exec.Command("umount", "--", target).CombinedOutput()
-			if err != nil {
-				t.Fatalf("unmount reviewed test target %s: %v\n%s", target, err, output)
+			if err := mounted.unmountAndVerify(t); err != nil {
+				t.Fatalf("unmount reviewed test target %s: %v", target, err)
 			}
-			mounted = false
-		})
+		}) {
+			return fmt.Errorf("reviewed bind rejection subtest failed for %s", target)
+		}
 	}
-	runIsolatedPrivilegedAncestorBindHelper(t)
+	if err := runIsolatedPrivilegedAncestorBindHelper(t); err != nil {
+		return err
+	}
+	if err := resources.cleanup(t); err != nil {
+		return fmt.Errorf("cleanup reviewed privileged resources: %w", err)
+	}
+	return nil
 }
 
-func runIsolatedPrivilegedAncestorBindHelper(t *testing.T) {
+func runIsolatedPrivilegedAncestorBindHelper(t *testing.T) error {
+	t.Helper()
 	for _, mode := range []string{"subtree", "whole-root"} {
-		t.Run("ancestor-"+mode, func(t *testing.T) {
-			root := t.TempDir()
-			source := filepath.Join(root, "source")
-			ancestor := filepath.Join(root, "ancestor")
-			if err := os.Mkdir(source, 0o700); err != nil {
+		if !t.Run("ancestor-"+mode, func(t *testing.T) {
+			resources, err := newReviewedPrivilegedResources(
+				t,
+				"ancestor-"+mode,
+			)
+			if err != nil {
 				t.Fatal(err)
 			}
-			if err := os.Mkdir(ancestor, 0o700); err != nil {
+			root := resources.root
+			source, err := resources.createDirectory(t, "source")
+			if err != nil {
 				t.Fatal(err)
 			}
-			sourceMounted := false
-			defer func() {
-				if !sourceMounted {
-					return
-				}
-				output, err := exec.Command("umount", "--", source).CombinedOutput()
-				if err != nil {
-					t.Errorf("unmount reviewed source %s: %v\n%s", source, err, output)
-				}
-			}()
+			ancestor, err := resources.createDirectory(t, "ancestor")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validateCurrentPrivateMountPaths(
+				"/",
+				root,
+				source,
+				ancestor,
+			); err != nil {
+				t.Fatalf("validate ancestor targets before mounts: %v", err)
+			}
+			var sourceMounted *isolatedReviewedMountedTarget
 			if mode == "whole-root" {
-				output, err := exec.Command(
-					"mount",
-					"-t",
-					"tmpfs",
-					"-o",
-					"mode=0700,size=1m",
-					"wg-mix-ebpf-ancestor-test",
+				var err error
+				sourceMounted, err = mountReviewedTarget(
+					t,
+					[]string{
+						"-t",
+						"tmpfs",
+						"-o",
+						"mode=0700,size=1m",
+						"wg-mix-ebpf-ancestor-test",
+						source,
+					},
 					source,
-				).CombinedOutput()
+				)
 				if err != nil {
-					t.Fatalf("mount reviewed tmpfs source %s: %v\n%s", source, err, output)
+					t.Fatalf("mount reviewed tmpfs source %s: %v", source, err)
 				}
-				sourceMounted = true
+				defer sourceMounted.deferredUnmount(t)
 			}
 			protectedRoot := filepath.Join(ancestor, "isolated-root")
 			sourceProtectedRoot := filepath.Join(source, "isolated-root")
-			if err := os.Mkdir(sourceProtectedRoot, 0o700); err != nil {
-				t.Fatal(err)
-			}
-			bindMounted := false
-			defer func() {
-				if !bindMounted {
-					return
+			if mode == "whole-root" {
+				if err := reviewedMkdir(
+					t,
+					"create-ephemeral-mounted-directory",
+					sourceProtectedRoot,
+					0o700,
+				); err != nil {
+					t.Fatal(err)
 				}
-				output, err := exec.Command("umount", "--", ancestor).CombinedOutput()
+			} else {
+				created, err := resources.createDirectory(
+					t,
+					filepath.Join("source", "isolated-root"),
+				)
 				if err != nil {
-					t.Errorf("unmount reviewed ancestor %s: %v\n%s", ancestor, err, output)
+					t.Fatal(err)
 				}
-			}()
-			output, err := exec.Command(
-				"mount",
-				"--bind",
-				source,
+				if created != sourceProtectedRoot {
+					t.Fatalf(
+						"created protected source %s, want %s",
+						created,
+						sourceProtectedRoot,
+					)
+				}
+			}
+			bindMounted, err := mountReviewedTarget(
+				t,
+				[]string{"--bind", "--", source, ancestor},
 				ancestor,
-			).CombinedOutput()
+			)
 			if err != nil {
-				t.Fatalf("bind reviewed ancestor %s: %v\n%s", ancestor, err, output)
+				t.Fatalf("bind reviewed ancestor %s: %v", ancestor, err)
 			}
-			bindMounted = true
-			data, err := os.ReadFile("/proc/self/mountinfo")
-			if err != nil {
-				t.Fatal(err)
-			}
-			entries, err := parseMountInfo(data)
+			defer bindMounted.deferredUnmount(t)
+			entries, err := readCurrentMountInfo()
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -989,20 +1275,22 @@ func runIsolatedPrivilegedAncestorBindHelper(t *testing.T) {
 			if !strings.Contains(err.Error(), want) {
 				t.Fatalf("real %s ancestor bind error = %v, want %q", mode, err, want)
 			}
-			output, err = exec.Command("umount", "--", ancestor).CombinedOutput()
-			if err != nil {
-				t.Fatalf("unmount reviewed ancestor %s: %v\n%s", ancestor, err, output)
+			if err := bindMounted.unmountAndVerify(t); err != nil {
+				t.Fatalf("unmount reviewed ancestor %s: %v", ancestor, err)
 			}
-			bindMounted = false
-			if sourceMounted {
-				output, err = exec.Command("umount", "--", source).CombinedOutput()
-				if err != nil {
-					t.Fatalf("unmount reviewed source %s: %v\n%s", source, err, output)
+			if sourceMounted != nil {
+				if err := sourceMounted.unmountAndVerify(t); err != nil {
+					t.Fatalf("unmount reviewed source %s: %v", source, err)
 				}
-				sourceMounted = false
 			}
-		})
+			if err := resources.cleanup(t); err != nil {
+				t.Fatalf("cleanup reviewed ancestor resources: %v", err)
+			}
+		}) {
+			return fmt.Errorf("reviewed ancestor rejection subtest failed for %s", mode)
+		}
 	}
+	return nil
 }
 
 func isolatedAncestorChainForTest(
@@ -1055,6 +1343,2945 @@ func isolatedAncestorChainForTest(
 			return nil, fmt.Errorf("ancestor test chain misses parent %d", current.parentID)
 		}
 		current = parent
+	}
+}
+
+func reviewedMkdir(
+	t *testing.T,
+	operation string,
+	target string,
+	mode os.FileMode,
+) error {
+	t.Helper()
+	if err := validateReviewedFilesystemWrite(
+		operation,
+		target,
+	); err != nil {
+		return err
+	}
+	operationErr := os.Mkdir(target, mode)
+	return recordReviewedFilesystemWrite(
+		t,
+		operation,
+		target,
+		operationErr,
+	)
+}
+
+func reviewedMkdirTemp(
+	t *testing.T,
+	parent string,
+	pattern string,
+) (string, error) {
+	t.Helper()
+	if parent != isolatedPrivilegedTestPrefix ||
+		pattern == "" ||
+		strings.ContainsAny(pattern, `/\`+"\x00\r\n") {
+		return "", fmt.Errorf(
+			"reviewed unique directory request is outside its fixed prefix",
+		)
+	}
+	root, operationErr := os.MkdirTemp(parent, pattern)
+	auditTarget := root
+	if auditTarget == "" {
+		auditTarget = parent
+	}
+	auditErr := recordReviewedFilesystemWrite(
+		t,
+		"create-unique-test-root",
+		auditTarget,
+		operationErr,
+	)
+	if operationErr != nil || auditErr != nil {
+		return root, auditErr
+	}
+	return root, nil
+}
+
+func createReviewedOwnerMarker(
+	t *testing.T,
+	target string,
+	content string,
+) error {
+	t.Helper()
+	if err := validateReviewedFilesystemWrite(
+		"create-owner-marker",
+		target,
+	); err != nil {
+		return err
+	}
+	file, openErr := os.OpenFile(
+		target,
+		os.O_WRONLY|os.O_CREATE|os.O_EXCL|syscall.O_NOFOLLOW,
+		0o600,
+	)
+	if openErr != nil {
+		return recordReviewedFilesystemWrite(
+			t,
+			"create-owner-marker",
+			target,
+			openErr,
+		)
+	}
+	_, writeErr := io.WriteString(file, content)
+	syncErr := file.Sync()
+	closeErr := file.Close()
+	operationErr := errors.Join(writeErr, syncErr, closeErr)
+	return recordReviewedFilesystemWrite(
+		t,
+		"create-owner-marker",
+		target,
+		operationErr,
+	)
+}
+
+func validateReviewedFilesystemWrite(
+	operation string,
+	target string,
+) error {
+	switch operation {
+	case "create-dedicated-prefix",
+		"create-unique-test-root",
+		"create-owner-marker",
+		"create-owned-directory",
+		"create-ephemeral-mounted-directory":
+	default:
+		return fmt.Errorf(
+			"reviewed filesystem write operation %q is not allowed",
+			operation,
+		)
+	}
+	if target == "" ||
+		!filepath.IsAbs(target) ||
+		filepath.Clean(target) != target ||
+		target == "/" ||
+		(target != isolatedPrivilegedTestPrefix &&
+			!mountPathStrictAncestor(
+				isolatedPrivilegedTestPrefix,
+				target,
+			)) {
+		return fmt.Errorf(
+			"reviewed filesystem write target %q is outside its dedicated prefix",
+			target,
+		)
+	}
+	return nil
+}
+
+func recordReviewedFilesystemWrite(
+	t *testing.T,
+	operation string,
+	target string,
+	operationErr error,
+) error {
+	t.Helper()
+	exitCode := 0
+	if operationErr != nil {
+		exitCode = 1
+	}
+	audit := isolatedReviewedFilesystemWriteAudit{
+		Format:    isolatedPrivilegedWriteFormat,
+		Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+		Operation: operation,
+		Target:    target,
+		ExitCode:  exitCode,
+	}
+	if err := validateReviewedFilesystemWriteAudit(
+		audit,
+		operation,
+		target,
+		exitCode,
+	); err != nil {
+		return errors.Join(operationErr, err)
+	}
+	auditData, auditErr := json.Marshal(audit)
+	if auditErr != nil {
+		return errors.Join(
+			operationErr,
+			fmt.Errorf("encode reviewed filesystem write audit: %w", auditErr),
+		)
+	}
+	t.Logf("reviewed privileged filesystem write audit: %s", auditData)
+	return operationErr
+}
+
+func validateReviewedFilesystemWriteAudit(
+	audit isolatedReviewedFilesystemWriteAudit,
+	operation string,
+	target string,
+	expectedExitCode int,
+) error {
+	if audit.Format != isolatedPrivilegedWriteFormat {
+		return fmt.Errorf("reviewed filesystem write audit format is invalid")
+	}
+	if _, err := time.Parse(time.RFC3339Nano, audit.Timestamp); err != nil {
+		return fmt.Errorf(
+			"reviewed filesystem write audit timestamp is invalid",
+		)
+	}
+	if audit.Operation != operation {
+		return fmt.Errorf(
+			"reviewed filesystem write audit operation differs from write",
+		)
+	}
+	if audit.Target != target {
+		return fmt.Errorf(
+			"reviewed filesystem write audit target differs from write",
+		)
+	}
+	if audit.ExitCode != expectedExitCode {
+		return fmt.Errorf(
+			"reviewed filesystem write audit exit code differs from write",
+		)
+	}
+	return nil
+}
+
+func newReviewedPrivilegedResources(
+	t *testing.T,
+	purpose string,
+) (*isolatedReviewedPrivilegedResources, error) {
+	t.Helper()
+	switch purpose {
+	case "run-subtree", "ancestor-subtree", "ancestor-whole-root":
+	default:
+		return nil, fmt.Errorf(
+			"reviewed privileged resource purpose %q is not allowed",
+			purpose,
+		)
+	}
+	if err := ensureReviewedPrivilegedTestPrefix(t); err != nil {
+		return nil, err
+	}
+	root, err := reviewedMkdirTemp(
+		t,
+		isolatedPrivilegedTestPrefix,
+		purpose+"-",
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create reviewed unique test root: %w", err)
+	}
+	root = filepath.Clean(root)
+	rootOwned, err := readReviewedOwnedPath(root)
+	if err != nil {
+		return nil, fmt.Errorf("record reviewed unique test root: %w", err)
+	}
+	if !rootOwned.mode.IsDir() ||
+		rootOwned.mode.Perm() != 0o700 ||
+		rootOwned.uid != 0 {
+		return nil, fmt.Errorf(
+			"reviewed unique test root %s is not a root-owned 0700 directory",
+			root,
+		)
+	}
+	runID := filepath.Base(root)
+	if len(runID) < len(purpose)+7 ||
+		!strings.HasPrefix(runID, purpose+"-") {
+		return nil, fmt.Errorf(
+			"reviewed unique test root %s has invalid run id %q",
+			root,
+			runID,
+		)
+	}
+	markerContent := fmt.Sprintf(
+		"format=%s\nrun_id=%s\nroot=%s\npid=%d\n",
+		isolatedPrivilegedOwnerFormat,
+		runID,
+		root,
+		os.Getpid(),
+	)
+	markerPath := filepath.Join(root, isolatedPrivilegedOwnerMarker)
+	if err := createReviewedOwnerMarker(
+		t,
+		markerPath,
+		markerContent,
+	); err != nil {
+		return nil, err
+	}
+	markerOwned, err := readReviewedOwnedPath(markerPath)
+	if err != nil {
+		return nil, fmt.Errorf("record reviewed owner marker: %w", err)
+	}
+	if !markerOwned.mode.IsRegular() ||
+		markerOwned.mode.Perm() != 0o600 ||
+		markerOwned.uid != 0 ||
+		markerOwned.device != rootOwned.device {
+		return nil, fmt.Errorf(
+			"reviewed owner marker %s has unsafe metadata",
+			markerPath,
+		)
+	}
+	resources := &isolatedReviewedPrivilegedResources{
+		root:          root,
+		runID:         runID,
+		markerContent: markerContent,
+		owned:         []isolatedReviewedOwnedPath{rootOwned, markerOwned},
+	}
+	t.Logf(
+		"reviewed privileged resource creation: timestamp=%s root=%q run_id=%q marker=%q",
+		time.Now().UTC().Format(time.RFC3339Nano),
+		root,
+		runID,
+		markerPath,
+	)
+	return resources, nil
+}
+
+func ensureReviewedPrivilegedTestPrefix(t *testing.T) error {
+	t.Helper()
+	if isolatedPrivilegedTestPrefix == "" ||
+		!filepath.IsAbs(isolatedPrivilegedTestPrefix) ||
+		filepath.Clean(isolatedPrivilegedTestPrefix) !=
+			isolatedPrivilegedTestPrefix {
+		return fmt.Errorf("reviewed privileged test prefix is not canonical")
+	}
+	err := reviewedMkdir(
+		t,
+		"create-dedicated-prefix",
+		isolatedPrivilegedTestPrefix,
+		0o700,
+	)
+	if err != nil && !errors.Is(err, os.ErrExist) {
+		return fmt.Errorf("create reviewed privileged test prefix: %w", err)
+	}
+	info, err := os.Lstat(isolatedPrivilegedTestPrefix)
+	if err != nil {
+		return fmt.Errorf("lstat reviewed privileged test prefix: %w", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf(
+			"reviewed privileged test prefix lacks stat metadata",
+		)
+	}
+	if !info.IsDir() ||
+		info.Mode()&os.ModeSymlink != 0 ||
+		info.Mode().Perm() != 0o700 ||
+		stat.Uid != 0 {
+		return fmt.Errorf(
+			"reviewed privileged test prefix %s must be a root-owned real 0700 directory",
+			isolatedPrivilegedTestPrefix,
+		)
+	}
+	resolved, err := filepath.EvalSymlinks(isolatedPrivilegedTestPrefix)
+	if err != nil {
+		return fmt.Errorf("resolve reviewed privileged test prefix: %w", err)
+	}
+	if resolved != isolatedPrivilegedTestPrefix {
+		return fmt.Errorf(
+			"reviewed privileged test prefix resolves to %s",
+			resolved,
+		)
+	}
+	return nil
+}
+
+func (resources *isolatedReviewedPrivilegedResources) createDirectory(
+	t *testing.T,
+	relative string,
+) (string, error) {
+	t.Helper()
+	if resources == nil || resources.cleaned {
+		return "", fmt.Errorf("reviewed privileged resources are unavailable")
+	}
+	if relative == "" ||
+		filepath.IsAbs(relative) ||
+		filepath.Clean(relative) != relative ||
+		relative == "." ||
+		relative == ".." ||
+		strings.HasPrefix(
+			relative,
+			".."+string(filepath.Separator),
+		) {
+		return "", fmt.Errorf(
+			"reviewed resource path %q is not a canonical relative path",
+			relative,
+		)
+	}
+	target := filepath.Join(resources.root, relative)
+	if !mountPathStrictAncestor(resources.root, target) {
+		return "", fmt.Errorf(
+			"reviewed resource target %s escapes root %s",
+			target,
+			resources.root,
+		)
+	}
+	parent := filepath.Dir(target)
+	parentOwned := false
+	for _, owned := range resources.owned {
+		if owned.path == parent && owned.mode.IsDir() {
+			parentOwned = true
+			break
+		}
+	}
+	if !parentOwned {
+		return "", fmt.Errorf(
+			"reviewed resource parent %s was not created by this run",
+			parent,
+		)
+	}
+	if err := reviewedMkdir(
+		t,
+		"create-owned-directory",
+		target,
+		0o700,
+	); err != nil {
+		return "", fmt.Errorf("create reviewed directory %s: %w", target, err)
+	}
+	owned, err := readReviewedOwnedPath(target)
+	if err != nil {
+		return "", err
+	}
+	if !owned.mode.IsDir() ||
+		owned.mode.Perm() != 0o700 ||
+		owned.uid != 0 ||
+		owned.device != resources.owned[0].device {
+		return "", fmt.Errorf(
+			"reviewed directory %s has unsafe metadata",
+			target,
+		)
+	}
+	resources.owned = append(resources.owned, owned)
+	return target, nil
+}
+
+func readReviewedOwnedPath(path string) (isolatedReviewedOwnedPath, error) {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return isolatedReviewedOwnedPath{}, fmt.Errorf(
+			"reviewed owned path %q is not canonical and absolute",
+			path,
+		)
+	}
+	info, err := os.Lstat(path)
+	if err != nil {
+		return isolatedReviewedOwnedPath{}, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return isolatedReviewedOwnedPath{}, fmt.Errorf(
+			"reviewed owned path %s is a symlink",
+			path,
+		)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Ino == 0 {
+		return isolatedReviewedOwnedPath{}, fmt.Errorf(
+			"reviewed owned path %s lacks stable stat identity",
+			path,
+		)
+	}
+	return isolatedReviewedOwnedPath{
+		path:   path,
+		device: uint64(stat.Dev),
+		inode:  uint64(stat.Ino),
+		uid:    stat.Uid,
+		mode:   info.Mode(),
+	}, nil
+}
+
+func (resources *isolatedReviewedPrivilegedResources) cleanup(
+	t *testing.T,
+) error {
+	t.Helper()
+	if resources == nil {
+		return fmt.Errorf("reviewed privileged resources are nil")
+	}
+	if resources.cleaned {
+		return fmt.Errorf(
+			"reviewed privileged resources %s were already cleaned",
+			resources.root,
+		)
+	}
+	resolved, err := filepath.EvalSymlinks(resources.root)
+	if err != nil {
+		return fmt.Errorf("resolve reviewed cleanup root: %w", err)
+	}
+	if resolved != resources.root {
+		return fmt.Errorf(
+			"reviewed cleanup root %s resolves to %s",
+			resources.root,
+			resolved,
+		)
+	}
+	markerPath := filepath.Join(
+		resources.root,
+		isolatedPrivilegedOwnerMarker,
+	)
+	if len(resources.owned) < 2 {
+		return fmt.Errorf("reviewed cleanup owner marker identity is absent")
+	}
+	currentMarker, err := readReviewedOwnedPath(markerPath)
+	if err != nil {
+		return fmt.Errorf("revalidate reviewed owner marker: %w", err)
+	}
+	if !sameReviewedOwnedPath(currentMarker, resources.owned[1]) {
+		return fmt.Errorf(
+			"reviewed cleanup owner marker %s changed from creation",
+			markerPath,
+		)
+	}
+	markerContent, err := readReviewedOwnerMarker(markerPath)
+	if err != nil {
+		return err
+	}
+	if markerContent != resources.markerContent {
+		return fmt.Errorf(
+			"reviewed cleanup owner marker %s does not match this run",
+			markerPath,
+		)
+	}
+	entries, err := readCurrentMountInfo()
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if mountPathContainsPath(resources.root, entry.mountPath) {
+			return fmt.Errorf(
+				"reviewed cleanup root %s still contains mount %s",
+				resources.root,
+				entry.mountPath,
+			)
+		}
+	}
+	observed := make([]isolatedReviewedOwnedPath, 0, len(resources.owned))
+	err = filepath.Walk(
+		resources.root,
+		func(path string, _ os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if len(observed) >= 64 {
+				return fmt.Errorf(
+					"reviewed cleanup tree exceeds 64 entries",
+				)
+			}
+			owned, err := readReviewedOwnedPath(path)
+			if err != nil {
+				return err
+			}
+			observed = append(observed, owned)
+			return nil
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("list reviewed cleanup tree: %w", err)
+	}
+	if err := validateReviewedCleanupPlan(resources, observed); err != nil {
+		return err
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		return fmt.Errorf("read cleanup host identity: %w", err)
+	}
+	for _, observedPath := range observed {
+		t.Logf(
+			"reviewed cleanup read-only listing: host=%q target=%q device=%d inode=%d mode=%s",
+			host,
+			observedPath.path,
+			observedPath.device,
+			observedPath.inode,
+			observedPath.mode,
+		)
+	}
+	for index := len(resources.owned) - 1; index >= 0; index-- {
+		expected := resources.owned[index]
+		current, err := readReviewedOwnedPath(expected.path)
+		if err != nil {
+			return fmt.Errorf(
+				"revalidate reviewed cleanup target %s: %w",
+				expected.path,
+				err,
+			)
+		}
+		if !sameReviewedOwnedPath(current, expected) {
+			return fmt.Errorf(
+				"reviewed cleanup target %s changed before removal",
+				expected.path,
+			)
+		}
+		removeErr := os.Remove(expected.path)
+		exitCode := 0
+		if removeErr != nil {
+			exitCode = 1
+		}
+		audit := isolatedReviewedCleanupAudit{
+			Format:    isolatedPrivilegedCleanupFormat,
+			Timestamp: time.Now().UTC().Format(time.RFC3339Nano),
+			Host:      host,
+			Argv:      []string{"os.Remove", "--", expected.path},
+			Target:    expected.path,
+			Device:    expected.device,
+			Inode:     expected.inode,
+			ExitCode:  exitCode,
+		}
+		auditData, auditErr := json.Marshal(audit)
+		if auditErr != nil {
+			return fmt.Errorf("encode reviewed cleanup audit: %w", auditErr)
+		}
+		t.Logf("reviewed privileged cleanup audit: %s", auditData)
+		if removeErr != nil {
+			return fmt.Errorf(
+				"remove exact reviewed cleanup target %s: %w",
+				expected.path,
+				removeErr,
+			)
+		}
+		if _, err := os.Lstat(expected.path); !errors.Is(err, os.ErrNotExist) {
+			if err == nil {
+				return fmt.Errorf(
+					"reviewed cleanup target %s still exists after removal",
+					expected.path,
+				)
+			}
+			return fmt.Errorf(
+				"verify reviewed cleanup target %s removal: %w",
+				expected.path,
+				err,
+			)
+		}
+	}
+	resources.cleaned = true
+	return nil
+}
+
+func readReviewedOwnerMarker(path string) (string, error) {
+	file, err := os.OpenFile(
+		path,
+		os.O_RDONLY|syscall.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return "", fmt.Errorf("open reviewed owner marker: %w", err)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil {
+		return "", fmt.Errorf("read reviewed owner marker: %w", err)
+	}
+	if len(data) == 0 || len(data) > 4096 {
+		return "", fmt.Errorf(
+			"reviewed owner marker must contain 1..4096 bytes",
+		)
+	}
+	return string(data), nil
+}
+
+func validateReviewedCleanupPlan(
+	resources *isolatedReviewedPrivilegedResources,
+	observed []isolatedReviewedOwnedPath,
+) error {
+	if resources == nil ||
+		resources.root == "" ||
+		resources.runID == "" ||
+		resources.root != filepath.Join(
+			isolatedPrivilegedTestPrefix,
+			resources.runID,
+		) ||
+		!mountPathStrictAncestor(
+			isolatedPrivilegedTestPrefix,
+			resources.root,
+		) {
+		return fmt.Errorf("reviewed cleanup root is outside its dedicated prefix")
+	}
+	if len(resources.owned) < 2 ||
+		resources.owned[0].path != resources.root ||
+		resources.owned[1].path != filepath.Join(
+			resources.root,
+			isolatedPrivilegedOwnerMarker,
+		) {
+		return fmt.Errorf(
+			"reviewed cleanup plan does not start with root and owner marker",
+		)
+	}
+	if len(observed) != len(resources.owned) {
+		return fmt.Errorf(
+			"reviewed cleanup listing has %d entries, want exactly %d",
+			len(observed),
+			len(resources.owned),
+		)
+	}
+	rootDevice := resources.owned[0].device
+	expectedByPath := make(
+		map[string]isolatedReviewedOwnedPath,
+		len(resources.owned),
+	)
+	expectedIndex := make(map[string]int, len(resources.owned))
+	for index, expected := range resources.owned {
+		if expected.path == "" ||
+			!filepath.IsAbs(expected.path) ||
+			filepath.Clean(expected.path) != expected.path ||
+			(expected.path != resources.root &&
+				!mountPathStrictAncestor(resources.root, expected.path)) ||
+			expected.device != rootDevice ||
+			expected.uid != 0 ||
+			expected.mode&os.ModeSymlink != 0 {
+			return fmt.Errorf(
+				"reviewed cleanup target %q has unsafe ownership or scope",
+				expected.path,
+			)
+		}
+		if _, duplicate := expectedByPath[expected.path]; duplicate {
+			return fmt.Errorf(
+				"reviewed cleanup target %s is duplicated",
+				expected.path,
+			)
+		}
+		if expected.mode.IsDir() {
+			if expected.mode.Perm() != 0o700 {
+				return fmt.Errorf(
+					"reviewed cleanup directory %s is not mode 0700",
+					expected.path,
+				)
+			}
+		} else if expected.path ==
+			filepath.Join(resources.root, isolatedPrivilegedOwnerMarker) {
+			if !expected.mode.IsRegular() ||
+				expected.mode.Perm() != 0o600 {
+				return fmt.Errorf(
+					"reviewed cleanup owner marker metadata is unsafe",
+				)
+			}
+		} else {
+			return fmt.Errorf(
+				"reviewed cleanup target %s is not an allowed directory or marker",
+				expected.path,
+			)
+		}
+		if expected.path != resources.root {
+			parentIndex, parentOwned := expectedIndex[filepath.Dir(expected.path)]
+			if !parentOwned || parentIndex >= index {
+				return fmt.Errorf(
+					"reviewed cleanup target %s lacks an earlier owned parent",
+					expected.path,
+				)
+			}
+		}
+		expectedByPath[expected.path] = expected
+		expectedIndex[expected.path] = index
+	}
+	observedPaths := make(map[string]struct{}, len(observed))
+	for _, current := range observed {
+		expected, ok := expectedByPath[current.path]
+		if !ok || !sameReviewedOwnedPath(current, expected) {
+			return fmt.Errorf(
+				"reviewed cleanup observed unexpected or changed path %s",
+				current.path,
+			)
+		}
+		if _, duplicate := observedPaths[current.path]; duplicate {
+			return fmt.Errorf(
+				"reviewed cleanup listing duplicates %s",
+				current.path,
+			)
+		}
+		observedPaths[current.path] = struct{}{}
+	}
+	return nil
+}
+
+func sameReviewedOwnedPath(
+	left isolatedReviewedOwnedPath,
+	right isolatedReviewedOwnedPath,
+) bool {
+	return left.path == right.path &&
+		left.device == right.device &&
+		left.inode == right.inode &&
+		left.uid == right.uid &&
+		left.mode == right.mode
+}
+
+func validatePrivilegedMountHelperEnvironment(environ []string) (int, error) {
+	expected := map[string]string{
+		isolatedPrivilegedMountTestGate:   "1",
+		isolatedPrivilegedMountTestHelper: "1",
+		isolatedPrivilegedMountHelperFD:   strconv.Itoa(isolatedPrivilegedLaunchFD),
+	}
+	seen := make(map[string]string, len(environ))
+	for _, item := range environ {
+		key, value, ok := strings.Cut(item, "=")
+		if !ok || key == "" {
+			return 0, fmt.Errorf("privileged helper environment contains an invalid entry")
+		}
+		if _, duplicate := seen[key]; duplicate {
+			return 0, fmt.Errorf(
+				"privileged helper environment duplicates %s",
+				key,
+			)
+		}
+		if _, allowed := expected[key]; !allowed {
+			return 0, fmt.Errorf(
+				"privileged helper environment contains unexpected key %s",
+				key,
+			)
+		}
+		seen[key] = value
+	}
+	if len(seen) != len(expected) {
+		return 0, fmt.Errorf(
+			"privileged helper environment must contain exactly %d entries",
+			len(expected),
+		)
+	}
+	for key, value := range expected {
+		if seen[key] != value {
+			return 0, fmt.Errorf(
+				"privileged helper environment has invalid value for %s",
+				key,
+			)
+		}
+	}
+	return isolatedPrivilegedLaunchFD, nil
+}
+
+func validatePrivilegedMountHelperArguments(arguments []string) error {
+	expected := []string{
+		fmt.Sprintf("/proc/self/fd/%d", isolatedPrivilegedExecutableFD),
+		"-test.run=^TestPrivateBPFFSMountRejectsRealLinuxRunSubtreeBinds$",
+		"-test.count=1",
+	}
+	if !sameStrings(arguments, expected) {
+		return fmt.Errorf(
+			"privileged helper arguments are not the fixed reviewed invocation",
+		)
+	}
+	return nil
+}
+
+func readPrivilegedLaunchRecord(fd int) (isolatedPrivilegedLaunchRecord, error) {
+	if fd != isolatedPrivilegedLaunchFD {
+		return isolatedPrivilegedLaunchRecord{}, fmt.Errorf(
+			"privileged launch record fd %d is not reviewed fd %d",
+			fd,
+			isolatedPrivilegedLaunchFD,
+		)
+	}
+	file := os.NewFile(uintptr(fd), "reviewed-privileged-launch-record")
+	if file == nil {
+		return isolatedPrivilegedLaunchRecord{}, fmt.Errorf(
+			"privileged launch record fd %d is invalid",
+			fd,
+		)
+	}
+	defer file.Close()
+	data, err := io.ReadAll(io.LimitReader(file, 4097))
+	if err != nil {
+		return isolatedPrivilegedLaunchRecord{}, fmt.Errorf(
+			"read privileged launch record fd: %w",
+			err,
+		)
+	}
+	if len(data) == 0 || len(data) > 4096 {
+		return isolatedPrivilegedLaunchRecord{}, fmt.Errorf(
+			"privileged launch record must contain 1..4096 bytes",
+		)
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(data)))
+	decoder.DisallowUnknownFields()
+	var record isolatedPrivilegedLaunchRecord
+	if err := decoder.Decode(&record); err != nil {
+		return isolatedPrivilegedLaunchRecord{}, fmt.Errorf(
+			"decode privileged launch record: %w",
+			err,
+		)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return isolatedPrivilegedLaunchRecord{}, fmt.Errorf(
+				"privileged launch record contains trailing JSON",
+			)
+		}
+		return isolatedPrivilegedLaunchRecord{}, fmt.Errorf(
+			"decode privileged launch record trailer: %w",
+			err,
+		)
+	}
+	return record, nil
+}
+
+func readMountNamespaceIdentity(path string) (isolatedMountNamespaceIdentity, error) {
+	return readFileIdentity(path)
+}
+
+func readFileIdentity(path string) (isolatedMountNamespaceIdentity, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return isolatedMountNamespaceIdentity{}, err
+	}
+	return fileInfoIdentity(info)
+}
+
+func fileInfoIdentity(info os.FileInfo) (isolatedMountNamespaceIdentity, error) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return isolatedMountNamespaceIdentity{}, fmt.Errorf(
+			"file metadata does not expose stat identity",
+		)
+	}
+	if stat.Ino == 0 {
+		return isolatedMountNamespaceIdentity{}, fmt.Errorf(
+			"file identity has zero inode",
+		)
+	}
+	return isolatedMountNamespaceIdentity{
+		device: uint64(stat.Dev),
+		inode:  uint64(stat.Ino),
+	}, nil
+}
+
+func openReviewedRunningExecutable() (
+	*os.File,
+	isolatedMountNamespaceIdentity,
+	error,
+) {
+	file, err := os.Open("/proc/self/exe")
+	if err != nil {
+		return nil, isolatedMountNamespaceIdentity{}, err
+	}
+	info, err := file.Stat()
+	if err != nil {
+		_ = file.Close()
+		return nil, isolatedMountNamespaceIdentity{}, err
+	}
+	if !info.Mode().IsRegular() {
+		_ = file.Close()
+		return nil, isolatedMountNamespaceIdentity{}, fmt.Errorf(
+			"/proc/self/exe does not resolve to a regular file",
+		)
+	}
+	identity, err := fileInfoIdentity(info)
+	if err != nil {
+		_ = file.Close()
+		return nil, isolatedMountNamespaceIdentity{}, err
+	}
+	current, err := readFileIdentity("/proc/self/exe")
+	if err != nil {
+		_ = file.Close()
+		return nil, isolatedMountNamespaceIdentity{}, err
+	}
+	if identity != current {
+		_ = file.Close()
+		return nil, isolatedMountNamespaceIdentity{}, fmt.Errorf(
+			"opened test executable identity changed during binding",
+		)
+	}
+	return file, identity, nil
+}
+
+func validatePrivilegedLaunchContext(
+	record isolatedPrivilegedLaunchRecord,
+	parentPID int,
+	current isolatedMountNamespaceIdentity,
+	initial isolatedMountNamespaceIdentity,
+	parent isolatedMountNamespaceIdentity,
+) error {
+	if record.Format != isolatedPrivilegedLaunchFormat {
+		return fmt.Errorf("privileged launch record format is invalid")
+	}
+	if record.OuterPID <= 1 || parentPID != record.OuterPID {
+		return fmt.Errorf(
+			"helper parent pid %d does not match recorded outer pid %d",
+			parentPID,
+			record.OuterPID,
+		)
+	}
+	recordedParent := isolatedMountNamespaceIdentity{
+		device: record.OuterMountDev,
+		inode:  record.OuterMountInode,
+	}
+	if recordedParent.device == 0 && recordedParent.inode == 0 {
+		return fmt.Errorf("recorded outer mount namespace identity is empty")
+	}
+	if parent != recordedParent {
+		return fmt.Errorf(
+			"outer parent mount namespace does not match launch record",
+		)
+	}
+	if current == parent {
+		return fmt.Errorf(
+			"helper still runs in the outer parent mount namespace",
+		)
+	}
+	if current == initial {
+		return fmt.Errorf(
+			"helper runs in the initial process mount namespace",
+		)
+	}
+	return nil
+}
+
+func validatePrivilegedExecutableContext(
+	record isolatedPrivilegedLaunchRecord,
+	opened isolatedMountNamespaceIdentity,
+	current isolatedMountNamespaceIdentity,
+) error {
+	recorded := isolatedMountNamespaceIdentity{
+		device: record.ExecutableDev,
+		inode:  record.ExecutableInode,
+	}
+	if recorded.inode == 0 {
+		return fmt.Errorf("recorded executable identity is empty")
+	}
+	if opened != recorded {
+		return fmt.Errorf(
+			"inherited executable fd does not match launch record",
+		)
+	}
+	if current != recorded {
+		return fmt.Errorf(
+			"current executable does not match inherited executable fd",
+		)
+	}
+	return nil
+}
+
+func validateReviewedPrivilegedTools() error {
+	for _, path := range []string{
+		isolatedReviewedUnsharePath,
+		isolatedReviewedMountPath,
+		isolatedReviewedUmountPath,
+	} {
+		if err := validateReviewedToolPath(path); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateReviewedToolPath(path string) error {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("lstat reviewed tool %s: %w", path, err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("reviewed tool %s does not expose stat metadata", path)
+	}
+	return validateReviewedToolMetadata(path, isolatedReviewedToolMetadata{
+		mode:  info.Mode(),
+		uid:   stat.Uid,
+		nlink: uint64(stat.Nlink),
+	})
+}
+
+func validateReviewedToolMetadata(
+	path string,
+	metadata isolatedReviewedToolMetadata,
+) error {
+	switch path {
+	case isolatedReviewedUnsharePath,
+		isolatedReviewedMountPath,
+		isolatedReviewedUmountPath:
+	default:
+		return fmt.Errorf("tool path %q is not in the reviewed allowlist", path)
+	}
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("reviewed tool path %q is not canonical and absolute", path)
+	}
+	if !metadata.mode.IsRegular() {
+		return fmt.Errorf("reviewed tool %s is not a regular file", path)
+	}
+	if metadata.uid != 0 {
+		return fmt.Errorf("reviewed tool %s is not root-owned", path)
+	}
+	if metadata.nlink == 0 {
+		return fmt.Errorf("reviewed tool %s has zero links", path)
+	}
+	if metadata.mode.Perm()&0o111 == 0 {
+		return fmt.Errorf("reviewed tool %s is not executable", path)
+	}
+	if metadata.mode.Perm()&0o022 != 0 {
+		return fmt.Errorf(
+			"reviewed tool %s is writable by group or other",
+			path,
+		)
+	}
+	return nil
+}
+
+func validateReviewedCommandSpec(spec isolatedReviewedCommandSpec) error {
+	if spec.timeout <= 0 || spec.timeout > 2*time.Minute {
+		return fmt.Errorf("reviewed command timeout is outside 1ns..2m")
+	}
+	if spec.env == nil {
+		return fmt.Errorf("reviewed command environment must be explicit")
+	}
+	if spec.target == "" || strings.ContainsAny(spec.target, "\x00\r\n") {
+		return fmt.Errorf("reviewed command target is invalid")
+	}
+	for _, arg := range spec.args {
+		if arg == "" || strings.ContainsRune(arg, '\x00') {
+			return fmt.Errorf("reviewed command contains an invalid argument")
+		}
+	}
+	switch spec.tool {
+	case isolatedReviewedUnsharePath:
+		if spec.target != "new-private-mount-namespace" {
+			return fmt.Errorf("reviewed unshare target is invalid")
+		}
+		expectedArgs := []string{
+			"--mount",
+			"--propagation",
+			"private",
+			fmt.Sprintf("/proc/self/fd/%d", isolatedPrivilegedExecutableFD),
+			"-test.run=^TestPrivateBPFFSMountRejectsRealLinuxRunSubtreeBinds$",
+			"-test.count=1",
+		}
+		if !sameStrings(spec.args, expectedArgs) {
+			return fmt.Errorf("reviewed unshare argv is not the fixed helper launch")
+		}
+		if _, err := validatePrivilegedMountHelperEnvironment(spec.env); err != nil {
+			return fmt.Errorf("reviewed unshare environment: %w", err)
+		}
+		if len(spec.extraFiles) != 2 ||
+			spec.extraFiles[0] == nil ||
+			spec.extraFiles[1] == nil {
+			return fmt.Errorf(
+				"reviewed unshare requires launch-record and executable fds",
+			)
+		}
+	case isolatedReviewedMountPath:
+		if len(spec.env) != 0 || len(spec.extraFiles) != 0 {
+			return fmt.Errorf(
+				"reviewed mount requires empty environment and no inherited files",
+			)
+		}
+		if err := validateReviewedMountArgv(spec.args, spec.target); err != nil {
+			return err
+		}
+	case isolatedReviewedUmountPath:
+		if len(spec.env) != 0 || len(spec.extraFiles) != 0 {
+			return fmt.Errorf(
+				"reviewed umount requires empty environment and no inherited files",
+			)
+		}
+		if !sameStrings(spec.args, []string{"--", spec.target}) {
+			return fmt.Errorf("reviewed umount argv is not exact")
+		}
+		if err := validateCanonicalReviewedPath(spec.target); err != nil {
+			return err
+		}
+	default:
+		return fmt.Errorf("reviewed command tool %q is not allowed", spec.tool)
+	}
+	return nil
+}
+
+func validateReviewedMountArgv(args []string, target string) error {
+	if err := validateCanonicalReviewedPath(target); err != nil {
+		return err
+	}
+	if len(args) == 4 &&
+		args[0] == "--bind" &&
+		args[1] == "--" &&
+		args[3] == target {
+		if err := validateCanonicalReviewedPath(args[2]); err != nil {
+			return fmt.Errorf("reviewed bind source: %w", err)
+		}
+		return nil
+	}
+	expectedTmpfs := []string{
+		"-t",
+		"tmpfs",
+		"-o",
+		"mode=0700,size=1m",
+		"wg-mix-ebpf-ancestor-test",
+		target,
+	}
+	if sameStrings(args, expectedTmpfs) {
+		return nil
+	}
+	return fmt.Errorf("reviewed mount argv is not an allowed exact form")
+}
+
+func validateCanonicalReviewedPath(path string) error {
+	if path == "" ||
+		!filepath.IsAbs(path) ||
+		filepath.Clean(path) != path ||
+		path == "/" {
+		return fmt.Errorf(
+			"reviewed path %q must be canonical, absolute, and non-root",
+			path,
+		)
+	}
+	return nil
+}
+
+func runReviewedPrivilegedCommand(
+	t *testing.T,
+	spec isolatedReviewedCommandSpec,
+) (string, isolatedPrivilegedCommandAudit, error) {
+	t.Helper()
+	if err := validateReviewedCommandSpec(spec); err != nil {
+		return "", isolatedPrivilegedCommandAudit{}, err
+	}
+	if err := validateReviewedToolPath(spec.tool); err != nil {
+		return "", isolatedPrivilegedCommandAudit{}, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), spec.timeout)
+	defer cancel()
+	command := exec.CommandContext(ctx, spec.tool, spec.args...)
+	command.Env = make([]string, len(spec.env))
+	copy(command.Env, spec.env)
+	command.ExtraFiles = append([]*os.File(nil), spec.extraFiles...)
+	started := time.Now().UTC()
+	output, commandErr := command.CombinedOutput()
+	finished := time.Now().UTC()
+	exitCode := 0
+	if commandErr != nil {
+		exitCode = -1
+		var exitError *exec.ExitError
+		if errors.As(commandErr, &exitError) {
+			exitCode = exitError.ExitCode()
+		}
+	}
+	audit := isolatedPrivilegedCommandAudit{
+		Format:     isolatedPrivilegedAuditFormat,
+		StartedAt:  started.Format(time.RFC3339Nano),
+		FinishedAt: finished.Format(time.RFC3339Nano),
+		Tool:       spec.tool,
+		Argv:       append([]string{spec.tool}, spec.args...),
+		Target:     spec.target,
+		ExitCode:   exitCode,
+	}
+	auditData, auditErr := json.Marshal(audit)
+	if auditErr != nil {
+		return string(output), audit, fmt.Errorf(
+			"encode reviewed command audit: %w",
+			auditErr,
+		)
+	}
+	t.Logf("reviewed privileged command audit: %s", auditData)
+	if err := validatePrivilegedCommandAudit(audit, spec, exitCode); err != nil {
+		return string(output), audit, fmt.Errorf(
+			"validate reviewed command audit: %w",
+			err,
+		)
+	}
+	if ctx.Err() != nil {
+		return string(output), audit, fmt.Errorf(
+			"reviewed command %s timed out after %s: %w",
+			spec.tool,
+			spec.timeout,
+			ctx.Err(),
+		)
+	}
+	if commandErr != nil {
+		return string(output), audit, fmt.Errorf(
+			"reviewed command %s failed with rc=%d: %w; output=%q",
+			spec.tool,
+			exitCode,
+			commandErr,
+			string(output),
+		)
+	}
+	return string(output), audit, nil
+}
+
+func validatePrivilegedCommandAudit(
+	audit isolatedPrivilegedCommandAudit,
+	spec isolatedReviewedCommandSpec,
+	expectedExitCode int,
+) error {
+	if audit.Format != isolatedPrivilegedAuditFormat {
+		return fmt.Errorf("reviewed command audit format is invalid")
+	}
+	started, err := time.Parse(time.RFC3339Nano, audit.StartedAt)
+	if err != nil {
+		return fmt.Errorf("reviewed command start timestamp is invalid")
+	}
+	finished, err := time.Parse(time.RFC3339Nano, audit.FinishedAt)
+	if err != nil {
+		return fmt.Errorf("reviewed command finish timestamp is invalid")
+	}
+	if finished.Before(started) {
+		return fmt.Errorf("reviewed command finish precedes start")
+	}
+	if audit.Tool != spec.tool {
+		return fmt.Errorf("reviewed command audit tool differs from command")
+	}
+	if !sameStrings(audit.Argv, append([]string{spec.tool}, spec.args...)) {
+		return fmt.Errorf("reviewed command audit argv differs from command")
+	}
+	if audit.Target != spec.target {
+		return fmt.Errorf("reviewed command audit target differs from command")
+	}
+	if audit.ExitCode != expectedExitCode {
+		return fmt.Errorf("reviewed command audit exit code differs from command")
+	}
+	return nil
+}
+
+func sameStrings(left []string, right []string) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	for index := range left {
+		if left[index] != right[index] {
+			return false
+		}
+	}
+	return true
+}
+
+func readCurrentMountInfo() ([]mountInfoEntry, error) {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		return nil, fmt.Errorf("read current mountinfo: %w", err)
+	}
+	entries, err := parseMountInfo(data)
+	if err != nil {
+		return nil, fmt.Errorf("parse current mountinfo: %w", err)
+	}
+	return entries, nil
+}
+
+func mountPathContainsPath(root string, path string) bool {
+	if root == "/" {
+		return filepath.IsAbs(path)
+	}
+	return path == root ||
+		strings.HasPrefix(path, root+string(filepath.Separator))
+}
+
+func containingMountInfoChain(
+	entries []mountInfoEntry,
+	path string,
+) ([]mountInfoEntry, error) {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return nil, fmt.Errorf("mount lookup path %q is not canonical and absolute", path)
+	}
+	byMountID := make(map[uint64]mountInfoEntry, len(entries))
+	var containing *mountInfoEntry
+	for index := range entries {
+		entry := entries[index]
+		if entry.mountPath == "" ||
+			!filepath.IsAbs(entry.mountPath) ||
+			filepath.Clean(entry.mountPath) != entry.mountPath {
+			return nil, fmt.Errorf(
+				"mount %d has noncanonical path %q",
+				entry.mountID,
+				entry.mountPath,
+			)
+		}
+		byMountID[entry.mountID] = entry
+		if !mountPathContainsPath(entry.mountPath, path) {
+			continue
+		}
+		if containing == nil || len(entry.mountPath) > len(containing.mountPath) {
+			copy := entry
+			containing = &copy
+			continue
+		}
+		if len(entry.mountPath) == len(containing.mountPath) {
+			return nil, fmt.Errorf(
+				"mount lookup path %s has stacked containing mounts at %s",
+				path,
+				entry.mountPath,
+			)
+		}
+	}
+	if containing == nil {
+		return nil, fmt.Errorf("mount lookup path %s has no containing mount", path)
+	}
+	chain := make([]mountInfoEntry, 0, 8)
+	seen := make(map[uint64]struct{}, 8)
+	current := *containing
+	for {
+		if _, duplicate := seen[current.mountID]; duplicate {
+			return nil, fmt.Errorf(
+				"mount lookup path %s has an ancestry cycle at %d",
+				path,
+				current.mountID,
+			)
+		}
+		seen[current.mountID] = struct{}{}
+		chain = append(chain, current)
+		if current.mountPath == "/" {
+			return chain, nil
+		}
+		parent, ok := byMountID[current.parentID]
+		if !ok {
+			return nil, fmt.Errorf(
+				"mount lookup path %s misses parent mount %d",
+				path,
+				current.parentID,
+			)
+		}
+		if !mountPathStrictAncestor(parent.mountPath, current.mountPath) {
+			return nil, fmt.Errorf(
+				"mount parent %s is not a strict ancestor of %s",
+				parent.mountPath,
+				current.mountPath,
+			)
+		}
+		current = parent
+	}
+}
+
+func validatePrivateMountInfoForPaths(
+	entries []mountInfoEntry,
+	paths ...string,
+) error {
+	if len(paths) == 0 {
+		return fmt.Errorf("private mount validation requires at least one path")
+	}
+	for _, path := range paths {
+		chain, err := containingMountInfoChain(entries, path)
+		if err != nil {
+			return err
+		}
+		for _, entry := range chain {
+			if len(entry.optionalFields) != 0 {
+				return fmt.Errorf(
+					"mount chain for %s has propagation fields at %s: %s",
+					path,
+					entry.mountPath,
+					strings.Join(entry.optionalFields, ","),
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func validateCurrentPrivateMountPaths(paths ...string) error {
+	entries, err := readCurrentMountInfo()
+	if err != nil {
+		return err
+	}
+	return validatePrivateMountInfoForPaths(entries, paths...)
+}
+
+func snapshotReviewedMountTarget(
+	t *testing.T,
+	target string,
+) (isolatedReviewedMountTargetSnapshot, error) {
+	t.Helper()
+	if err := validateCanonicalReviewedPath(target); err != nil {
+		return isolatedReviewedMountTargetSnapshot{}, err
+	}
+	resolved, err := filepath.EvalSymlinks(target)
+	if err != nil {
+		return isolatedReviewedMountTargetSnapshot{}, fmt.Errorf(
+			"resolve reviewed mount target %s: %w",
+			target,
+			err,
+		)
+	}
+	if resolved != target {
+		return isolatedReviewedMountTargetSnapshot{}, fmt.Errorf(
+			"reviewed mount target %s resolves through symlinks to %s",
+			target,
+			resolved,
+		)
+	}
+	info, err := os.Lstat(target)
+	if err != nil {
+		return isolatedReviewedMountTargetSnapshot{}, fmt.Errorf(
+			"lstat reviewed mount target %s: %w",
+			target,
+			err,
+		)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return isolatedReviewedMountTargetSnapshot{}, fmt.Errorf(
+			"reviewed mount target %s is not a real directory",
+			target,
+		)
+	}
+	identity, err := fileInfoIdentity(info)
+	if err != nil {
+		return isolatedReviewedMountTargetSnapshot{}, err
+	}
+	entries, err := readCurrentMountInfo()
+	if err != nil {
+		return isolatedReviewedMountTargetSnapshot{}, err
+	}
+	for _, entry := range entries {
+		if mountPathContainsPath(target, entry.mountPath) {
+			return isolatedReviewedMountTargetSnapshot{}, fmt.Errorf(
+				"reviewed mount target %s already contains mount %s",
+				target,
+				entry.mountPath,
+			)
+		}
+	}
+	if err := validatePrivateMountInfoForPaths(entries, "/", target); err != nil {
+		return isolatedReviewedMountTargetSnapshot{}, err
+	}
+	chain, err := containingMountInfoChain(entries, target)
+	if err != nil {
+		return isolatedReviewedMountTargetSnapshot{}, err
+	}
+	snapshot := isolatedReviewedMountTargetSnapshot{
+		target: target,
+		device: identity.device,
+		inode:  identity.inode,
+		chain:  append([]mountInfoEntry(nil), chain...),
+	}
+	t.Logf(
+		"reviewed mount target identity: timestamp=%s target=%q device=%d inode=%d containing_mount_id=%d",
+		time.Now().UTC().Format(time.RFC3339Nano),
+		target,
+		snapshot.device,
+		snapshot.inode,
+		snapshot.chain[0].mountID,
+	)
+	return snapshot, nil
+}
+
+func mountReviewedTarget(
+	t *testing.T,
+	args []string,
+	target string,
+) (*isolatedReviewedMountedTarget, error) {
+	t.Helper()
+	operations := isolatedReviewedMountLifecycleOperations{
+		snapshotTarget: func() (isolatedReviewedMountTargetSnapshot, error) {
+			return snapshotReviewedMountTarget(t, target)
+		},
+		readMountInfo: readCurrentMountInfo,
+		readTargetIdentity: func() (isolatedMountNamespaceIdentity, error) {
+			return readReviewedTargetIdentity(target)
+		},
+		runMount: func() error {
+			output, _, err := runReviewedPrivilegedCommand(
+				t,
+				isolatedReviewedCommandSpec{
+					tool:    isolatedReviewedMountPath,
+					args:    append([]string(nil), args...),
+					target:  target,
+					env:     make([]string, 0),
+					timeout: 10 * time.Second,
+				},
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"mount reviewed target %s: %w; output=%q",
+					target,
+					err,
+					output,
+				)
+			}
+			return nil
+		},
+		runUnmount: func() error {
+			output, _, err := runReviewedPrivilegedCommand(
+				t,
+				isolatedReviewedCommandSpec{
+					tool:    isolatedReviewedUmountPath,
+					args:    []string{"--", target},
+					target:  target,
+					env:     make([]string, 0),
+					timeout: 10 * time.Second,
+				},
+			)
+			if err != nil {
+				return fmt.Errorf(
+					"exact unmount of %s: %w; output=%q",
+					target,
+					err,
+					output,
+				)
+			}
+			return nil
+		},
+	}
+	return mountReviewedTargetWithOperations(target, operations)
+}
+
+func mountReviewedTargetWithOperations(
+	target string,
+	operations isolatedReviewedMountLifecycleOperations,
+) (*isolatedReviewedMountedTarget, error) {
+	if err := validateReviewedMountLifecycleOperations(operations); err != nil {
+		return nil, err
+	}
+	before, err := operations.snapshotTarget()
+	if err != nil {
+		return nil, fmt.Errorf("snapshot reviewed target before mount: %w", err)
+	}
+	if before.target != target {
+		return nil, fmt.Errorf(
+			"reviewed target snapshot path %s differs from mount target %s",
+			before.target,
+			target,
+		)
+	}
+	mounted := &isolatedReviewedMountedTarget{
+		target:     target,
+		before:     before,
+		operations: operations,
+	}
+	mountErr := operations.runMount()
+	entries, mountInfoErr := operations.readMountInfo()
+	if mountInfoErr != nil {
+		cleanupErr := mounted.unmountAmbiguousMountAndVerify()
+		return nil, joinReviewedLifecycleErrors(
+			"reconcile ambiguous reviewed mount result",
+			mountErr,
+			fmt.Errorf("read mountinfo after mount command: %w", mountInfoErr),
+			cleanupErr,
+		)
+	}
+	mountedEntry, present, stateErr := reviewedMountAtTarget(entries, target)
+	if stateErr != nil {
+		mounted.cleanupBlocked = true
+		return nil, joinReviewedLifecycleErrors(
+			"reconcile reviewed mount result",
+			mountErr,
+			stateErr,
+		)
+	}
+	if !present {
+		after, snapshotErr := operations.snapshotTarget()
+		restorationErr := validateRestoredSnapshotIfAvailable(
+			before,
+			after,
+			snapshotErr,
+		)
+		if mountErr != nil {
+			return nil, joinReviewedLifecycleErrors(
+				"mount command failed without a committed target mount",
+				mountErr,
+				restorationErr,
+			)
+		}
+		return nil, joinReviewedLifecycleErrors(
+			"mount command reported success without a committed target mount",
+			fmt.Errorf("reviewed target %s is not an exact mount", target),
+			restorationErr,
+		)
+	}
+	mounted.mounted = mountedEntry
+	mounted.active = true
+	validationErr := validatePrivateMountInfoForPaths(entries, "/", target)
+	if validationErr == nil {
+		var identity isolatedMountNamespaceIdentity
+		identity, validationErr = operations.readTargetIdentity()
+		if validationErr == nil &&
+			identity.device == before.device &&
+			identity.inode == before.inode {
+			validationErr = fmt.Errorf(
+				"reviewed mount target %s identity did not change after mount",
+				target,
+			)
+		}
+	}
+	if mountErr != nil || validationErr != nil {
+		cleanupErr := mounted.cleanupFailedMountAttempt()
+		return nil, joinReviewedLifecycleErrors(
+			"reviewed mount attempt did not complete cleanly",
+			mountErr,
+			validationErr,
+			cleanupErr,
+		)
+	}
+	return mounted, nil
+}
+
+func (mounted *isolatedReviewedMountedTarget) cleanupFailedMountAttempt() error {
+	cleanupErr := mounted.unmountAndVerifyWithOperations()
+	if mounted.active && !mounted.unmountIssued && !mounted.cleanupBlocked {
+		fallbackErr := mounted.unmountAmbiguousMountAndVerify()
+		return errors.Join(cleanupErr, fallbackErr)
+	}
+	return cleanupErr
+}
+
+func reviewedMountAtTarget(
+	entries []mountInfoEntry,
+	target string,
+) (mountInfoEntry, bool, error) {
+	var found *mountInfoEntry
+	for index := range entries {
+		entry := entries[index]
+		if !mountPathContainsPath(target, entry.mountPath) {
+			continue
+		}
+		if entry.mountPath != target {
+			return mountInfoEntry{}, false, fmt.Errorf(
+				"reviewed target %s contains unexpected mount %s",
+				target,
+				entry.mountPath,
+			)
+		}
+		if found != nil {
+			return mountInfoEntry{}, false, fmt.Errorf(
+				"multiple mounts are stacked at reviewed target %s",
+				target,
+			)
+		}
+		copy := entry
+		found = &copy
+	}
+	if found == nil {
+		return mountInfoEntry{}, false, nil
+	}
+	return *found, true, nil
+}
+
+func readReviewedTargetIdentity(
+	target string,
+) (isolatedMountNamespaceIdentity, error) {
+	info, err := os.Lstat(target)
+	if err != nil {
+		return isolatedMountNamespaceIdentity{}, fmt.Errorf(
+			"lstat reviewed target %s: %w",
+			target,
+			err,
+		)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return isolatedMountNamespaceIdentity{}, fmt.Errorf(
+			"reviewed target %s is not a real directory",
+			target,
+		)
+	}
+	return fileInfoIdentity(info)
+}
+
+func validateReviewedMountLifecycleOperations(
+	operations isolatedReviewedMountLifecycleOperations,
+) error {
+	if operations.snapshotTarget == nil ||
+		operations.readMountInfo == nil ||
+		operations.readTargetIdentity == nil ||
+		operations.runMount == nil ||
+		operations.runUnmount == nil {
+		return fmt.Errorf("reviewed mount lifecycle operations are incomplete")
+	}
+	return nil
+}
+
+func joinReviewedLifecycleErrors(message string, values ...error) error {
+	joined := errors.Join(values...)
+	if joined == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", message, joined)
+}
+
+func validateRestoredSnapshotIfAvailable(
+	before isolatedReviewedMountTargetSnapshot,
+	after isolatedReviewedMountTargetSnapshot,
+	snapshotErr error,
+) error {
+	if snapshotErr != nil {
+		return fmt.Errorf("snapshot restored target: %w", snapshotErr)
+	}
+	return validateReviewedMountTargetRestored(before, after)
+}
+
+func (mounted *isolatedReviewedMountedTarget) deferredUnmount(t *testing.T) {
+	t.Helper()
+	if mounted == nil ||
+		!mounted.active ||
+		mounted.unmountIssued ||
+		mounted.cleanupBlocked {
+		return
+	}
+	if err := mounted.unmountAndVerifyWithOperations(); err != nil {
+		t.Errorf(
+			"deferred exact unmount and restoration failed for %s: %v",
+			mounted.target,
+			err,
+		)
+	}
+}
+
+func (mounted *isolatedReviewedMountedTarget) unmountAndVerify(
+	t *testing.T,
+) error {
+	t.Helper()
+	return mounted.unmountAndVerifyWithOperations()
+}
+
+func (mounted *isolatedReviewedMountedTarget) unmountAndVerifyWithOperations() error {
+	if mounted == nil {
+		return fmt.Errorf("reviewed mounted target is nil")
+	}
+	if !mounted.active {
+		return fmt.Errorf("reviewed mounted target %s is not active", mounted.target)
+	}
+	if mounted.cleanupBlocked {
+		return fmt.Errorf(
+			"reviewed mounted target %s cleanup is blocked by ambiguous state",
+			mounted.target,
+		)
+	}
+	if mounted.unmountIssued {
+		return fmt.Errorf(
+			"reviewed mounted target %s already had its single unmount attempt",
+			mounted.target,
+		)
+	}
+	if err := validateReviewedMountLifecycleOperations(mounted.operations); err != nil {
+		return err
+	}
+	entries, err := mounted.operations.readMountInfo()
+	if err != nil {
+		return fmt.Errorf("read mountinfo before exact unmount: %w", err)
+	}
+	current, present, err := reviewedMountAtTarget(entries, mounted.target)
+	if err != nil {
+		mounted.cleanupBlocked = true
+		return err
+	}
+	if !present {
+		after, snapshotErr := mounted.operations.snapshotTarget()
+		restorationErr := validateRestoredSnapshotIfAvailable(
+			mounted.before,
+			after,
+			snapshotErr,
+		)
+		if restorationErr == nil {
+			mounted.active = false
+		}
+		return restorationErr
+	}
+	if !sameMountInfoEntry(current, mounted.mounted) {
+		mounted.cleanupBlocked = true
+		return fmt.Errorf(
+			"reviewed mount identity at %s changed before unmount",
+			mounted.target,
+		)
+	}
+	mounted.unmountIssued = true
+	commandErr := mounted.operations.runUnmount()
+	reconciliationErr := mounted.reconcileAfterUnmount()
+	return joinReviewedLifecycleErrors(
+		"exact unmount and restoration",
+		commandErr,
+		reconciliationErr,
+	)
+}
+
+func (mounted *isolatedReviewedMountedTarget) unmountAmbiguousMountAndVerify() error {
+	if mounted == nil {
+		return fmt.Errorf("reviewed ambiguous mounted target is nil")
+	}
+	if mounted.unmountIssued {
+		return fmt.Errorf(
+			"reviewed target %s already had its single unmount attempt",
+			mounted.target,
+		)
+	}
+	mounted.unmountIssued = true
+	commandErr := mounted.operations.runUnmount()
+	after, snapshotErr := mounted.operations.snapshotTarget()
+	restorationErr := validateRestoredSnapshotIfAvailable(
+		mounted.before,
+		after,
+		snapshotErr,
+	)
+	if restorationErr == nil {
+		mounted.active = false
+	} else {
+		mounted.cleanupBlocked = true
+	}
+	return joinReviewedLifecycleErrors(
+		"ambiguous mount result exact unmount and restoration",
+		commandErr,
+		restorationErr,
+	)
+}
+
+func (mounted *isolatedReviewedMountedTarget) reconcileAfterUnmount() error {
+	entries, err := mounted.operations.readMountInfo()
+	if err != nil {
+		after, snapshotErr := mounted.operations.snapshotTarget()
+		restorationErr := validateRestoredSnapshotIfAvailable(
+			mounted.before,
+			after,
+			snapshotErr,
+		)
+		if restorationErr == nil {
+			mounted.active = false
+		} else {
+			mounted.cleanupBlocked = true
+		}
+		return joinReviewedLifecycleErrors(
+			"reconcile exact unmount after mountinfo read failure",
+			fmt.Errorf("read mountinfo after exact unmount: %w", err),
+			restorationErr,
+		)
+	}
+	current, present, stateErr := reviewedMountAtTarget(entries, mounted.target)
+	if stateErr != nil {
+		mounted.cleanupBlocked = true
+		return stateErr
+	}
+	if present {
+		if !sameMountInfoEntry(current, mounted.mounted) {
+			mounted.cleanupBlocked = true
+			return fmt.Errorf(
+				"reviewed target %s changed to a different mount after unmount",
+				mounted.target,
+			)
+		}
+		return fmt.Errorf(
+			"reviewed target %s remains mounted after its single unmount attempt",
+			mounted.target,
+		)
+	}
+	mounted.active = false
+	after, snapshotErr := mounted.operations.snapshotTarget()
+	return validateRestoredSnapshotIfAvailable(
+		mounted.before,
+		after,
+		snapshotErr,
+	)
+}
+
+func validateReviewedMountTargetRestored(
+	before isolatedReviewedMountTargetSnapshot,
+	after isolatedReviewedMountTargetSnapshot,
+) error {
+	if before.target == "" || before.target != after.target {
+		return fmt.Errorf("reviewed mount target path was not restored")
+	}
+	if before.device != after.device || before.inode != after.inode {
+		return fmt.Errorf(
+			"reviewed mount target %s filesystem identity was not restored",
+			before.target,
+		)
+	}
+	if len(before.chain) != len(after.chain) {
+		return fmt.Errorf(
+			"reviewed mount target %s ancestry length was not restored",
+			before.target,
+		)
+	}
+	for index := range before.chain {
+		if !sameMountInfoEntry(before.chain[index], after.chain[index]) {
+			return fmt.Errorf(
+				"reviewed mount target %s ancestry changed at index %d",
+				before.target,
+				index,
+			)
+		}
+	}
+	return nil
+}
+
+func (fixture *isolatedReviewedMountLifecycleFixture) operations() isolatedReviewedMountLifecycleOperations {
+	return isolatedReviewedMountLifecycleOperations{
+		snapshotTarget: func() (isolatedReviewedMountTargetSnapshot, error) {
+			fixture.snapshotCalls++
+			if len(fixture.snapshotErrors) != 0 {
+				err := fixture.snapshotErrors[0]
+				fixture.snapshotErrors = fixture.snapshotErrors[1:]
+				if err != nil {
+					return isolatedReviewedMountTargetSnapshot{}, err
+				}
+			}
+			_, present, err := reviewedMountAtTarget(
+				fixture.stateEntries,
+				fixture.target,
+			)
+			if err != nil {
+				return isolatedReviewedMountTargetSnapshot{}, err
+			}
+			if present {
+				return isolatedReviewedMountTargetSnapshot{}, fmt.Errorf(
+					"fixture target remains mounted",
+				)
+			}
+			after := fixture.before
+			after.chain = append([]mountInfoEntry(nil), fixture.before.chain...)
+			return after, nil
+		},
+		readMountInfo: func() ([]mountInfoEntry, error) {
+			fixture.readCalls++
+			if len(fixture.readErrors) != 0 {
+				err := fixture.readErrors[0]
+				fixture.readErrors = fixture.readErrors[1:]
+				if err != nil {
+					return nil, err
+				}
+			}
+			return append([]mountInfoEntry(nil), fixture.stateEntries...), nil
+		},
+		readTargetIdentity: func() (isolatedMountNamespaceIdentity, error) {
+			fixture.identityCalls++
+			return fixture.currentIdentity, nil
+		},
+		runMount: func() error {
+			fixture.mountCalls++
+			if fixture.mountCommits {
+				fixture.stateEntries = append(
+					[]mountInfoEntry(nil),
+					fixture.mountedEntries...,
+				)
+				fixture.currentIdentity = fixture.mountedIdentity
+			}
+			return fixture.mountErr
+		},
+		runUnmount: func() error {
+			fixture.unmountCalls++
+			if fixture.unmountCommits {
+				fixture.stateEntries = append(
+					[]mountInfoEntry(nil),
+					fixture.restoredEntries...,
+				)
+				fixture.currentIdentity = fixture.beforeIdentity
+			}
+			return fixture.unmountErr
+		},
+	}
+}
+
+func newReviewedMountLifecycleFixture() *isolatedReviewedMountLifecycleFixture {
+	target := "/tmp/reviewed-target"
+	rootEntry := mountInfoEntry{
+		mountID:        21,
+		parentID:       1,
+		device:         "8:1",
+		root:           "/",
+		mountPath:      "/",
+		mountOptions:   []string{"relatime", "rw"},
+		optionalFields: nil,
+		fsType:         "ext4",
+		source:         "/dev/root",
+		superOptions:   []string{"rw"},
+	}
+	mountedEntry := mountInfoEntry{
+		mountID:        42,
+		parentID:       rootEntry.mountID,
+		device:         "8:1",
+		root:           "/tmp/reviewed-source",
+		mountPath:      target,
+		mountOptions:   []string{"relatime", "rw"},
+		optionalFields: nil,
+		fsType:         "ext4",
+		source:         "/dev/root",
+		superOptions:   []string{"rw"},
+	}
+	beforeIdentity := isolatedMountNamespaceIdentity{device: 10, inode: 20}
+	return &isolatedReviewedMountLifecycleFixture{
+		target: target,
+		before: isolatedReviewedMountTargetSnapshot{
+			target: target,
+			device: beforeIdentity.device,
+			inode:  beforeIdentity.inode,
+			chain:  []mountInfoEntry{rootEntry},
+		},
+		restoredEntries: []mountInfoEntry{rootEntry},
+		mountedEntries:  []mountInfoEntry{rootEntry, mountedEntry},
+		stateEntries:    []mountInfoEntry{rootEntry},
+		beforeIdentity:  beforeIdentity,
+		mountedIdentity: isolatedMountNamespaceIdentity{device: 10, inode: 30},
+		mountCommits:    true,
+		unmountCommits:  true,
+		currentIdentity: beforeIdentity,
+	}
+}
+
+func TestPrivilegedMountLifecycleReconcilesAmbiguousResults(t *testing.T) {
+	t.Run("mount error after commit is reconciled and unmounted once", func(t *testing.T) {
+		fixture := newReviewedMountLifecycleFixture()
+		fixture.mountErr = context.DeadlineExceeded
+		mounted, err := mountReviewedTargetWithOperations(
+			fixture.target,
+			fixture.operations(),
+		)
+		if err == nil {
+			t.Fatal("committed mount with command error unexpectedly succeeded")
+		}
+		if mounted != nil {
+			t.Fatal("failed mount attempt unexpectedly returned an active guard")
+		}
+		if fixture.unmountCalls != 1 {
+			t.Fatalf("unmount calls = %d, want 1", fixture.unmountCalls)
+		}
+		if _, present, stateErr := reviewedMountAtTarget(
+			fixture.stateEntries,
+			fixture.target,
+		); stateErr != nil || present {
+			t.Fatalf(
+				"mount error cleanup state = present %t error %v",
+				present,
+				stateErr,
+			)
+		}
+	})
+
+	t.Run("post-mount read failure uses one exact fallback unmount", func(t *testing.T) {
+		fixture := newReviewedMountLifecycleFixture()
+		fixture.readErrors = []error{errors.New("injected post-mount read failure")}
+		mounted, err := mountReviewedTargetWithOperations(
+			fixture.target,
+			fixture.operations(),
+		)
+		if err == nil {
+			t.Fatal("post-mount read failure unexpectedly succeeded")
+		}
+		if mounted != nil {
+			t.Fatal("ambiguous mount attempt unexpectedly returned an active guard")
+		}
+		if fixture.unmountCalls != 1 {
+			t.Fatalf("unmount calls = %d, want 1", fixture.unmountCalls)
+		}
+		if fixture.snapshotCalls != 2 {
+			t.Fatalf("snapshot calls = %d, want 2", fixture.snapshotCalls)
+		}
+	})
+
+	t.Run("failed mount without commit restores without umount", func(t *testing.T) {
+		fixture := newReviewedMountLifecycleFixture()
+		fixture.mountCommits = false
+		fixture.mountErr = errors.New("injected mount rejection")
+		if mounted, err := mountReviewedTargetWithOperations(
+			fixture.target,
+			fixture.operations(),
+		); err == nil || mounted != nil {
+			t.Fatalf("failed uncommitted mount = guard %#v error %v", mounted, err)
+		}
+		if fixture.unmountCalls != 0 {
+			t.Fatalf("unmount calls = %d, want 0", fixture.unmountCalls)
+		}
+		if fixture.snapshotCalls != 2 {
+			t.Fatalf("snapshot calls = %d, want 2", fixture.snapshotCalls)
+		}
+	})
+
+	t.Run("pre-unmount read failure does not consume command allowance", func(t *testing.T) {
+		fixture := newReviewedMountLifecycleFixture()
+		mounted, err := mountReviewedTargetWithOperations(
+			fixture.target,
+			fixture.operations(),
+		)
+		if err != nil {
+			t.Fatalf("create reviewed mounted fixture: %v", err)
+		}
+		fixture.readErrors = []error{errors.New("injected pre-unmount read failure")}
+		if err := mounted.unmountAndVerifyWithOperations(); err == nil {
+			t.Fatal("pre-unmount read failure unexpectedly succeeded")
+		}
+		if mounted.unmountIssued {
+			t.Fatal("preflight read failure consumed the unmount command allowance")
+		}
+		if fixture.unmountCalls != 0 {
+			t.Fatalf("unmount calls = %d, want 0", fixture.unmountCalls)
+		}
+		if err := mounted.unmountAndVerifyWithOperations(); err != nil {
+			t.Fatalf("retry preflight and exact unmount: %v", err)
+		}
+		if fixture.unmountCalls != 1 {
+			t.Fatalf("unmount calls after recovery = %d, want 1", fixture.unmountCalls)
+		}
+	})
+
+	t.Run("umount error after commit still verifies restoration", func(t *testing.T) {
+		fixture := newReviewedMountLifecycleFixture()
+		mounted, err := mountReviewedTargetWithOperations(
+			fixture.target,
+			fixture.operations(),
+		)
+		if err != nil {
+			t.Fatalf("create reviewed mounted fixture: %v", err)
+		}
+		fixture.unmountErr = context.DeadlineExceeded
+		if err := mounted.unmountAndVerifyWithOperations(); err == nil {
+			t.Fatal("umount command error unexpectedly disappeared")
+		}
+		if mounted.active {
+			t.Fatal("restored target remained marked active")
+		}
+		if fixture.unmountCalls != 1 || fixture.snapshotCalls != 2 {
+			t.Fatalf(
+				"umount calls = %d snapshots = %d, want 1 and 2",
+				fixture.unmountCalls,
+				fixture.snapshotCalls,
+			)
+		}
+	})
+
+	t.Run("umount error without commit is not retried", func(t *testing.T) {
+		fixture := newReviewedMountLifecycleFixture()
+		mounted, err := mountReviewedTargetWithOperations(
+			fixture.target,
+			fixture.operations(),
+		)
+		if err != nil {
+			t.Fatalf("create reviewed mounted fixture: %v", err)
+		}
+		fixture.unmountCommits = false
+		fixture.unmountErr = context.DeadlineExceeded
+		if err := mounted.unmountAndVerifyWithOperations(); err == nil {
+			t.Fatal("uncommitted umount error unexpectedly succeeded")
+		}
+		if !mounted.active || !mounted.unmountIssued {
+			t.Fatalf(
+				"uncommitted umount state = active %t issued %t",
+				mounted.active,
+				mounted.unmountIssued,
+			)
+		}
+		if err := mounted.unmountAndVerifyWithOperations(); err == nil {
+			t.Fatal("second umount attempt unexpectedly accepted")
+		}
+		if fixture.unmountCalls != 1 {
+			t.Fatalf("unmount calls = %d, want exactly 1", fixture.unmountCalls)
+		}
+	})
+
+	t.Run("post-umount read failure is reported without retry", func(t *testing.T) {
+		fixture := newReviewedMountLifecycleFixture()
+		mounted, err := mountReviewedTargetWithOperations(
+			fixture.target,
+			fixture.operations(),
+		)
+		if err != nil {
+			t.Fatalf("create reviewed mounted fixture: %v", err)
+		}
+		fixture.readErrors = []error{
+			nil,
+			errors.New("injected post-umount read failure"),
+		}
+		if err := mounted.unmountAndVerifyWithOperations(); err == nil {
+			t.Fatal("post-umount read failure unexpectedly succeeded")
+		}
+		if fixture.unmountCalls != 1 || !mounted.unmountIssued {
+			t.Fatalf(
+				"post-read failure unmount calls = %d issued = %t",
+				fixture.unmountCalls,
+				mounted.unmountIssued,
+			)
+		}
+		if mounted.active {
+			t.Fatal("fallback restored snapshot did not clear active mount state")
+		}
+		if fixture.snapshotCalls != 2 {
+			t.Fatalf("snapshot calls = %d, want 2", fixture.snapshotCalls)
+		}
+		if err := mounted.unmountAndVerifyWithOperations(); err == nil {
+			t.Fatal("post-read failure permitted a second umount")
+		}
+		if fixture.unmountCalls != 1 {
+			t.Fatalf("unmount calls after retry = %d, want 1", fixture.unmountCalls)
+		}
+	})
+
+	t.Run("post-umount snapshot failure is reported", func(t *testing.T) {
+		fixture := newReviewedMountLifecycleFixture()
+		mounted, err := mountReviewedTargetWithOperations(
+			fixture.target,
+			fixture.operations(),
+		)
+		if err != nil {
+			t.Fatalf("create reviewed mounted fixture: %v", err)
+		}
+		fixture.snapshotErrors = []error{
+			errors.New("injected restored snapshot failure"),
+		}
+		if err := mounted.unmountAndVerifyWithOperations(); err == nil {
+			t.Fatal("restored snapshot failure unexpectedly succeeded")
+		}
+		if mounted.active {
+			t.Fatal("absent mount remained marked active after snapshot failure")
+		}
+		if fixture.unmountCalls != 1 {
+			t.Fatalf("unmount calls = %d, want 1", fixture.unmountCalls)
+		}
+	})
+}
+
+func TestReviewedPrivilegedCleanupPlanFailsClosed(t *testing.T) {
+	runID := "run-subtree-0123456789"
+	root := filepath.Join(isolatedPrivilegedTestPrefix, runID)
+	owned := []isolatedReviewedOwnedPath{
+		{
+			path:   root,
+			device: 10,
+			inode:  20,
+			uid:    0,
+			mode:   os.ModeDir | 0o700,
+		},
+		{
+			path: filepath.Join(
+				root,
+				isolatedPrivilegedOwnerMarker,
+			),
+			device: 10,
+			inode:  21,
+			uid:    0,
+			mode:   0o600,
+		},
+		{
+			path:   filepath.Join(root, "source"),
+			device: 10,
+			inode:  22,
+			uid:    0,
+			mode:   os.ModeDir | 0o700,
+		},
+		{
+			path:   filepath.Join(root, "source", "isolated-root"),
+			device: 10,
+			inode:  23,
+			uid:    0,
+			mode:   os.ModeDir | 0o700,
+		},
+	}
+	resources := &isolatedReviewedPrivilegedResources{
+		root:  root,
+		runID: runID,
+		owned: append([]isolatedReviewedOwnedPath(nil), owned...),
+	}
+	observed := append([]isolatedReviewedOwnedPath(nil), owned...)
+	if err := validateReviewedCleanupPlan(resources, observed); err != nil {
+		t.Fatalf("valid reviewed cleanup plan: %v", err)
+	}
+
+	t.Run("root outside prefix", func(t *testing.T) {
+		copy := *resources
+		copy.root = "/tmp/unreviewed"
+		if err := validateReviewedCleanupPlan(&copy, observed); err == nil {
+			t.Fatal("cleanup root outside dedicated prefix unexpectedly accepted")
+		}
+	})
+	t.Run("changed inode", func(t *testing.T) {
+		copy := append([]isolatedReviewedOwnedPath(nil), observed...)
+		copy[len(copy)-1].inode++
+		if err := validateReviewedCleanupPlan(resources, copy); err == nil {
+			t.Fatal("changed cleanup target identity unexpectedly accepted")
+		}
+	})
+	t.Run("cross filesystem", func(t *testing.T) {
+		copy := *resources
+		copy.owned = append([]isolatedReviewedOwnedPath(nil), resources.owned...)
+		copy.owned[len(copy.owned)-1].device++
+		if err := validateReviewedCleanupPlan(&copy, observed); err == nil {
+			t.Fatal("cross-filesystem cleanup target unexpectedly accepted")
+		}
+	})
+	t.Run("non-root owner", func(t *testing.T) {
+		copy := *resources
+		copy.owned = append([]isolatedReviewedOwnedPath(nil), resources.owned...)
+		copy.owned[len(copy.owned)-1].uid = 1
+		if err := validateReviewedCleanupPlan(&copy, observed); err == nil {
+			t.Fatal("non-root-owned cleanup target unexpectedly accepted")
+		}
+	})
+	t.Run("unknown observed path", func(t *testing.T) {
+		copy := append([]isolatedReviewedOwnedPath(nil), observed...)
+		copy[len(copy)-1].path = filepath.Join(root, "unknown")
+		if err := validateReviewedCleanupPlan(resources, copy); err == nil {
+			t.Fatal("unknown cleanup path unexpectedly accepted")
+		}
+	})
+	t.Run("missing marker", func(t *testing.T) {
+		copy := *resources
+		copy.owned = append(
+			[]isolatedReviewedOwnedPath{resources.owned[0]},
+			resources.owned[2:]...,
+		)
+		if err := validateReviewedCleanupPlan(&copy, copy.owned); err == nil {
+			t.Fatal("cleanup plan without owner marker unexpectedly accepted")
+		}
+	})
+	t.Run("parent recorded after child", func(t *testing.T) {
+		copy := *resources
+		copy.owned = []isolatedReviewedOwnedPath{
+			owned[0],
+			owned[1],
+			owned[3],
+			owned[2],
+		}
+		if err := validateReviewedCleanupPlan(&copy, copy.owned); err == nil {
+			t.Fatal("unsafe cleanup order unexpectedly accepted")
+		}
+	})
+}
+
+func TestReviewedFilesystemWriteAuditFailsClosed(t *testing.T) {
+	target := filepath.Join(
+		isolatedPrivilegedTestPrefix,
+		"run-subtree-0123456789",
+	)
+	if err := validateReviewedFilesystemWrite(
+		"create-unique-test-root",
+		target,
+	); err != nil {
+		t.Fatalf("valid reviewed filesystem write: %v", err)
+	}
+	for name, testCase := range map[string]struct {
+		operation string
+		target    string
+	}{
+		"unknown operation": {
+			operation: "remove-recursively",
+			target:    target,
+		},
+		"relative target": {
+			operation: "create-owned-directory",
+			target:    "relative",
+		},
+		"root target": {
+			operation: "create-owned-directory",
+			target:    "/",
+		},
+		"outside prefix": {
+			operation: "create-owned-directory",
+			target:    "/tmp/unreviewed",
+		},
+		"noncanonical": {
+			operation: "create-owned-directory",
+			target: filepath.Join(
+				isolatedPrivilegedTestPrefix,
+				"run",
+			) + "/../other",
+		},
+	} {
+		t.Run("write "+name, func(t *testing.T) {
+			if err := validateReviewedFilesystemWrite(
+				testCase.operation,
+				testCase.target,
+			); err == nil {
+				t.Fatal("unsafe reviewed filesystem write unexpectedly accepted")
+			}
+		})
+	}
+
+	timestamp := time.Date(2026, 7, 29, 2, 3, 4, 5, time.UTC)
+	validAudit := isolatedReviewedFilesystemWriteAudit{
+		Format:    isolatedPrivilegedWriteFormat,
+		Timestamp: timestamp.Format(time.RFC3339Nano),
+		Operation: "create-owned-directory",
+		Target:    target,
+		ExitCode:  0,
+	}
+	if err := validateReviewedFilesystemWriteAudit(
+		validAudit,
+		validAudit.Operation,
+		validAudit.Target,
+		0,
+	); err != nil {
+		t.Fatalf("valid reviewed filesystem write audit: %v", err)
+	}
+	mutations := map[string]func(
+		isolatedReviewedFilesystemWriteAudit,
+	) isolatedReviewedFilesystemWriteAudit{
+		"format": func(
+			copy isolatedReviewedFilesystemWriteAudit,
+		) isolatedReviewedFilesystemWriteAudit {
+			copy.Format = "wrong"
+			return copy
+		},
+		"timestamp": func(
+			copy isolatedReviewedFilesystemWriteAudit,
+		) isolatedReviewedFilesystemWriteAudit {
+			copy.Timestamp = "invalid"
+			return copy
+		},
+		"operation": func(
+			copy isolatedReviewedFilesystemWriteAudit,
+		) isolatedReviewedFilesystemWriteAudit {
+			copy.Operation = "create-owner-marker"
+			return copy
+		},
+		"target": func(
+			copy isolatedReviewedFilesystemWriteAudit,
+		) isolatedReviewedFilesystemWriteAudit {
+			copy.Target = filepath.Join(target, "other")
+			return copy
+		},
+		"exit code": func(
+			copy isolatedReviewedFilesystemWriteAudit,
+		) isolatedReviewedFilesystemWriteAudit {
+			copy.ExitCode = 1
+			return copy
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run("audit "+name, func(t *testing.T) {
+			if err := validateReviewedFilesystemWriteAudit(
+				mutate(validAudit),
+				validAudit.Operation,
+				validAudit.Target,
+				0,
+			); err == nil {
+				t.Fatal("inexact filesystem write audit unexpectedly accepted")
+			}
+		})
+	}
+}
+
+func TestPrivilegedMountHarnessValidationFailsClosed(t *testing.T) {
+	validEnvironment := []string{
+		isolatedPrivilegedMountTestGate + "=1",
+		isolatedPrivilegedMountTestHelper + "=1",
+		isolatedPrivilegedMountHelperFD + "=" +
+			strconv.Itoa(isolatedPrivilegedLaunchFD),
+	}
+	if fd, err := validatePrivilegedMountHelperEnvironment(validEnvironment); err != nil {
+		t.Fatalf("valid privileged helper environment: %v", err)
+	} else if fd != isolatedPrivilegedLaunchFD {
+		t.Fatalf("validated launch fd = %d, want %d", fd, isolatedPrivilegedLaunchFD)
+	}
+	invalidEnvironments := map[string][]string{
+		"old two-variable gate": {
+			isolatedPrivilegedMountTestGate + "=1",
+			isolatedPrivilegedMountTestHelper + "=1",
+		},
+		"inherited PATH": append(
+			append([]string(nil), validEnvironment...),
+			"PATH=/usr/bin",
+		),
+		"duplicate gate": append(
+			append([]string(nil), validEnvironment...),
+			isolatedPrivilegedMountTestGate+"=1",
+		),
+		"wrong launch fd": {
+			isolatedPrivilegedMountTestGate + "=1",
+			isolatedPrivilegedMountTestHelper + "=1",
+			isolatedPrivilegedMountHelperFD + "=9",
+		},
+		"unknown key": {
+			isolatedPrivilegedMountTestGate + "=1",
+			isolatedPrivilegedMountTestHelper + "=1",
+			"UNREVIEWED=1",
+		},
+		"malformed": {"not-an-assignment"},
+	}
+	for name, environment := range invalidEnvironments {
+		t.Run("environment "+name, func(t *testing.T) {
+			if _, err := validatePrivilegedMountHelperEnvironment(environment); err == nil {
+				t.Fatal("unsafe privileged helper environment unexpectedly accepted")
+			}
+		})
+	}
+	validArguments := []string{
+		fmt.Sprintf("/proc/self/fd/%d", isolatedPrivilegedExecutableFD),
+		"-test.run=^TestPrivateBPFFSMountRejectsRealLinuxRunSubtreeBinds$",
+		"-test.count=1",
+	}
+	if err := validatePrivilegedMountHelperArguments(validArguments); err != nil {
+		t.Fatalf("valid privileged helper arguments: %v", err)
+	}
+	for name, arguments := range map[string][]string{
+		"relative executable": {
+			"isolated_netns.test",
+			validArguments[1],
+			validArguments[2],
+		},
+		"extra argument": append(
+			append([]string(nil), validArguments...),
+			"-test.v",
+		),
+		"wrong test": {
+			validArguments[0],
+			"-test.run=.",
+			validArguments[2],
+		},
+	} {
+		t.Run("arguments "+name, func(t *testing.T) {
+			if err := validatePrivilegedMountHelperArguments(arguments); err == nil {
+				t.Fatal("unsafe privileged helper arguments unexpectedly accepted")
+			}
+		})
+	}
+
+	record := isolatedPrivilegedLaunchRecord{
+		Format:          isolatedPrivilegedLaunchFormat,
+		OuterPID:        4242,
+		OuterMountDev:   10,
+		OuterMountInode: 20,
+		ExecutableDev:   30,
+		ExecutableInode: 40,
+	}
+	currentNamespace := isolatedMountNamespaceIdentity{device: 10, inode: 30}
+	initialNamespace := isolatedMountNamespaceIdentity{device: 10, inode: 10}
+	parentNamespace := isolatedMountNamespaceIdentity{device: 10, inode: 20}
+	if err := validatePrivilegedLaunchContext(
+		record,
+		4242,
+		currentNamespace,
+		initialNamespace,
+		parentNamespace,
+	); err != nil {
+		t.Fatalf("valid privileged launch context: %v", err)
+	}
+	namespaceCases := []struct {
+		name    string
+		record  isolatedPrivilegedLaunchRecord
+		pid     int
+		current isolatedMountNamespaceIdentity
+		initial isolatedMountNamespaceIdentity
+		parent  isolatedMountNamespaceIdentity
+	}{
+		{
+			name: "wrong format",
+			record: func() isolatedPrivilegedLaunchRecord {
+				copy := record
+				copy.Format = "wrong"
+				return copy
+			}(),
+			pid:     4242,
+			current: currentNamespace,
+			initial: initialNamespace,
+			parent:  parentNamespace,
+		},
+		{
+			name:    "wrong parent pid",
+			record:  record,
+			pid:     4243,
+			current: currentNamespace,
+			initial: initialNamespace,
+			parent:  parentNamespace,
+		},
+		{
+			name:    "outer namespace mismatch",
+			record:  record,
+			pid:     4242,
+			current: currentNamespace,
+			initial: initialNamespace,
+			parent:  isolatedMountNamespaceIdentity{device: 10, inode: 21},
+		},
+		{
+			name:    "same as parent namespace",
+			record:  record,
+			pid:     4242,
+			current: parentNamespace,
+			initial: initialNamespace,
+			parent:  parentNamespace,
+		},
+		{
+			name:    "same as initial namespace",
+			record:  record,
+			pid:     4242,
+			current: initialNamespace,
+			initial: initialNamespace,
+			parent:  parentNamespace,
+		},
+	}
+	for _, testCase := range namespaceCases {
+		t.Run("namespace "+testCase.name, func(t *testing.T) {
+			if err := validatePrivilegedLaunchContext(
+				testCase.record,
+				testCase.pid,
+				testCase.current,
+				testCase.initial,
+				testCase.parent,
+			); err == nil {
+				t.Fatal("unsafe privileged launch context unexpectedly accepted")
+			}
+		})
+	}
+
+	executableIdentity := isolatedMountNamespaceIdentity{device: 30, inode: 40}
+	if err := validatePrivilegedExecutableContext(
+		record,
+		executableIdentity,
+		executableIdentity,
+	); err != nil {
+		t.Fatalf("valid privileged executable identity: %v", err)
+	}
+	for name, identities := range map[string][2]isolatedMountNamespaceIdentity{
+		"opened fd mismatch": {
+			{device: 30, inode: 41},
+			executableIdentity,
+		},
+		"current executable mismatch": {
+			executableIdentity,
+			{device: 30, inode: 41},
+		},
+	} {
+		t.Run("executable "+name, func(t *testing.T) {
+			if err := validatePrivilegedExecutableContext(
+				record,
+				identities[0],
+				identities[1],
+			); err == nil {
+				t.Fatal("mismatched executable identity unexpectedly accepted")
+			}
+		})
+	}
+
+	validToolMetadata := isolatedReviewedToolMetadata{
+		mode:  0o755,
+		uid:   0,
+		nlink: 1,
+	}
+	if err := validateReviewedToolMetadata(
+		isolatedReviewedMountPath,
+		validToolMetadata,
+	); err != nil {
+		t.Fatalf("valid reviewed tool metadata: %v", err)
+	}
+	toolCases := []struct {
+		name     string
+		path     string
+		metadata isolatedReviewedToolMetadata
+	}{
+		{name: "relative", path: "usr/bin/mount", metadata: validToolMetadata},
+		{name: "unapproved", path: "/bin/echo", metadata: validToolMetadata},
+		{
+			name: "symlink",
+			path: isolatedReviewedMountPath,
+			metadata: isolatedReviewedToolMetadata{
+				mode: os.ModeSymlink | 0o777, uid: 0, nlink: 1,
+			},
+		},
+		{
+			name: "directory",
+			path: isolatedReviewedMountPath,
+			metadata: isolatedReviewedToolMetadata{
+				mode: os.ModeDir | 0o755, uid: 0, nlink: 1,
+			},
+		},
+		{
+			name: "group writable",
+			path: isolatedReviewedMountPath,
+			metadata: isolatedReviewedToolMetadata{
+				mode: 0o775, uid: 0, nlink: 1,
+			},
+		},
+		{
+			name: "non-root owner",
+			path: isolatedReviewedMountPath,
+			metadata: isolatedReviewedToolMetadata{
+				mode: 0o755, uid: 1, nlink: 1,
+			},
+		},
+		{
+			name: "non-executable",
+			path: isolatedReviewedMountPath,
+			metadata: isolatedReviewedToolMetadata{
+				mode: 0o644, uid: 0, nlink: 1,
+			},
+		},
+		{
+			name: "zero links",
+			path: isolatedReviewedMountPath,
+			metadata: isolatedReviewedToolMetadata{
+				mode: 0o755, uid: 0, nlink: 0,
+			},
+		},
+	}
+	for _, testCase := range toolCases {
+		t.Run("tool "+testCase.name, func(t *testing.T) {
+			if err := validateReviewedToolMetadata(
+				testCase.path,
+				testCase.metadata,
+			); err == nil {
+				t.Fatal("unsafe reviewed tool metadata unexpectedly accepted")
+			}
+		})
+	}
+
+	privateFixture := "" +
+		"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n" +
+		"31 21 0:31 / /tmp rw,relatime - tmpfs tmpfs rw\n"
+	privateEntries, err := parseMountInfo([]byte(privateFixture))
+	if err != nil {
+		t.Fatalf("parse private propagation fixture: %v", err)
+	}
+	if err := validatePrivateMountInfoForPaths(
+		privateEntries,
+		"/",
+		"/tmp/reviewed",
+	); err != nil {
+		t.Fatalf("valid private mount chains: %v", err)
+	}
+	if !mountPathContainsPath("/", "/tmp/reviewed") {
+		t.Fatal("namespace root did not contain an absolute path")
+	}
+	propagationFixtures := map[string]string{
+		"shared root": strings.Replace(
+			privateFixture,
+			"/ / rw,relatime -",
+			"/ / rw,relatime shared:7 -",
+			1,
+		),
+		"master intermediate": strings.Replace(
+			privateFixture,
+			"/ /tmp rw,relatime -",
+			"/ /tmp rw,relatime master:8 -",
+			1,
+		),
+		"propagate-from intermediate": strings.Replace(
+			privateFixture,
+			"/ /tmp rw,relatime -",
+			"/ /tmp rw,relatime propagate_from:9 -",
+			1,
+		),
+	}
+	for name, fixture := range propagationFixtures {
+		t.Run("propagation "+name, func(t *testing.T) {
+			entries, err := parseMountInfo([]byte(fixture))
+			if err != nil {
+				t.Fatalf("parse propagation fixture: %v", err)
+			}
+			if err := validatePrivateMountInfoForPaths(
+				entries,
+				"/",
+				"/tmp/reviewed",
+			); err == nil {
+				t.Fatal("propagating mount chain unexpectedly accepted")
+			}
+		})
+	}
+
+	mountSpec := isolatedReviewedCommandSpec{
+		tool: isolatedReviewedMountPath,
+		args: []string{
+			"--bind",
+			"--",
+			"/tmp/reviewed-source",
+			"/tmp/reviewed-target",
+		},
+		target:  "/tmp/reviewed-target",
+		env:     make([]string, 0),
+		timeout: 10 * time.Second,
+	}
+	if err := validateReviewedCommandSpec(mountSpec); err != nil {
+		t.Fatalf("valid reviewed mount spec: %v", err)
+	}
+	inheritedEnvironmentSpec := mountSpec
+	inheritedEnvironmentSpec.env = []string{"PATH=/usr/bin"}
+	if err := validateReviewedCommandSpec(inheritedEnvironmentSpec); err == nil {
+		t.Fatal("reviewed mount spec with inherited environment unexpectedly accepted")
+	}
+	nilEnvironmentSpec := mountSpec
+	nilEnvironmentSpec.env = nil
+	if err := validateReviewedCommandSpec(nilEnvironmentSpec); err == nil {
+		t.Fatal("reviewed mount spec with nil environment unexpectedly accepted")
+	}
+	unshareSpec := isolatedReviewedCommandSpec{
+		tool: isolatedReviewedUnsharePath,
+		args: []string{
+			"--mount",
+			"--propagation",
+			"private",
+			fmt.Sprintf("/proc/self/fd/%d", isolatedPrivilegedExecutableFD),
+			"-test.run=^TestPrivateBPFFSMountRejectsRealLinuxRunSubtreeBinds$",
+			"-test.count=1",
+		},
+		target:     "new-private-mount-namespace",
+		env:        append([]string(nil), validEnvironment...),
+		extraFiles: []*os.File{new(os.File), new(os.File)},
+		timeout:    60 * time.Second,
+	}
+	if err := validateReviewedCommandSpec(unshareSpec); err != nil {
+		t.Fatalf("valid reviewed unshare spec: %v", err)
+	}
+
+	auditSpec := isolatedReviewedCommandSpec{
+		tool:    isolatedReviewedUmountPath,
+		args:    []string{"--", "/tmp/reviewed-target"},
+		target:  "/tmp/reviewed-target",
+		env:     make([]string, 0),
+		timeout: 10 * time.Second,
+	}
+	started := time.Date(2026, 7, 29, 1, 2, 3, 4, time.UTC)
+	validAudit := isolatedPrivilegedCommandAudit{
+		Format:     isolatedPrivilegedAuditFormat,
+		StartedAt:  started.Format(time.RFC3339Nano),
+		FinishedAt: started.Add(time.Second).Format(time.RFC3339Nano),
+		Tool:       auditSpec.tool,
+		Argv:       append([]string{auditSpec.tool}, auditSpec.args...),
+		Target:     auditSpec.target,
+		ExitCode:   0,
+	}
+	if err := validatePrivilegedCommandAudit(validAudit, auditSpec, 0); err != nil {
+		t.Fatalf("valid reviewed command audit: %v", err)
+	}
+	auditMutations := map[string]func(isolatedPrivilegedCommandAudit) isolatedPrivilegedCommandAudit{
+		"format": func(copy isolatedPrivilegedCommandAudit) isolatedPrivilegedCommandAudit {
+			copy.Format = "wrong"
+			return copy
+		},
+		"start timestamp": func(copy isolatedPrivilegedCommandAudit) isolatedPrivilegedCommandAudit {
+			copy.StartedAt = "not-a-timestamp"
+			return copy
+		},
+		"timestamp order": func(copy isolatedPrivilegedCommandAudit) isolatedPrivilegedCommandAudit {
+			copy.FinishedAt = started.Add(-time.Second).Format(time.RFC3339Nano)
+			return copy
+		},
+		"tool": func(copy isolatedPrivilegedCommandAudit) isolatedPrivilegedCommandAudit {
+			copy.Tool = isolatedReviewedMountPath
+			return copy
+		},
+		"argv": func(copy isolatedPrivilegedCommandAudit) isolatedPrivilegedCommandAudit {
+			copy.Argv = append([]string(nil), copy.Argv...)
+			copy.Argv[len(copy.Argv)-1] = "/tmp/other"
+			return copy
+		},
+		"target": func(copy isolatedPrivilegedCommandAudit) isolatedPrivilegedCommandAudit {
+			copy.Target = "/tmp/other"
+			return copy
+		},
+		"exit code": func(copy isolatedPrivilegedCommandAudit) isolatedPrivilegedCommandAudit {
+			copy.ExitCode = 1
+			return copy
+		},
+	}
+	for name, mutate := range auditMutations {
+		t.Run("audit "+name, func(t *testing.T) {
+			if err := validatePrivilegedCommandAudit(
+				mutate(validAudit),
+				auditSpec,
+				0,
+			); err == nil {
+				t.Fatal("inexact reviewed command audit unexpectedly accepted")
+			}
+		})
+	}
+
+	rootEntry := mountInfoEntry{
+		mountID:        21,
+		parentID:       1,
+		device:         "8:1",
+		root:           "/",
+		mountPath:      "/",
+		mountOptions:   []string{"relatime", "rw"},
+		optionalFields: nil,
+		fsType:         "ext4",
+		source:         "/dev/root",
+		superOptions:   []string{"rw"},
+	}
+	before := isolatedReviewedMountTargetSnapshot{
+		target: "/tmp/reviewed-target",
+		device: 10,
+		inode:  20,
+		chain:  []mountInfoEntry{rootEntry},
+	}
+	after := before
+	after.chain = append([]mountInfoEntry(nil), before.chain...)
+	if err := validateReviewedMountTargetRestored(before, after); err != nil {
+		t.Fatalf("valid restored target snapshot: %v", err)
+	}
+	restorationMutations := map[string]func(isolatedReviewedMountTargetSnapshot) isolatedReviewedMountTargetSnapshot{
+		"inode": func(copy isolatedReviewedMountTargetSnapshot) isolatedReviewedMountTargetSnapshot {
+			copy.inode++
+			return copy
+		},
+		"target": func(copy isolatedReviewedMountTargetSnapshot) isolatedReviewedMountTargetSnapshot {
+			copy.target = "/tmp/other"
+			return copy
+		},
+		"chain length": func(copy isolatedReviewedMountTargetSnapshot) isolatedReviewedMountTargetSnapshot {
+			copy.chain = append(copy.chain, rootEntry)
+			return copy
+		},
+		"propagation": func(copy isolatedReviewedMountTargetSnapshot) isolatedReviewedMountTargetSnapshot {
+			copy.chain = append([]mountInfoEntry(nil), copy.chain...)
+			copy.chain[0].optionalFields = []string{"shared:7"}
+			return copy
+		},
+	}
+	for name, mutate := range restorationMutations {
+		t.Run("restoration "+name, func(t *testing.T) {
+			if err := validateReviewedMountTargetRestored(
+				before,
+				mutate(after),
+			); err == nil {
+				t.Fatal("changed restored target snapshot unexpectedly accepted")
+			}
+		})
 	}
 }
 

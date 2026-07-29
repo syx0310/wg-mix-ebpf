@@ -1219,11 +1219,11 @@ func validatePrivateBPFFSMountAncestors(
 			protectedRoot,
 		)
 	}
-	for chainIndex := 1; chainIndex < len(chain)-1; chainIndex++ {
+	for chainIndex := 1; chainIndex < len(chain); chainIndex++ {
 		ancestor := chain[chainIndex]
 		if ancestor.root != "/" {
 			return fmt.Errorf(
-				"isolated bpffs non-root ancestor %s is a subtree bind rooted at %s",
+				"isolated bpffs ancestor %s is a subtree bind rooted at %s",
 				ancestor.mountPath,
 				ancestor.root,
 			)
