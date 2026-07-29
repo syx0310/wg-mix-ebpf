@@ -371,6 +371,168 @@ func TestUninstallRejectsSystemdFragmentMismatchBeforeStop(t *testing.T) {
 	}
 }
 
+func TestUninstallRejectsUnverifiedSystemdManagerStateBeforeStop(t *testing.T) {
+	tests := []struct {
+		name  string
+		env   string
+		value string
+		want  string
+	}{
+		{
+			name:  "drop-in",
+			env:   "WG_MIX_EBPF_TEST_SYSTEMCTL_DROP_INS",
+			value: "/etc/systemd/system/wg-mix-ebpf.service.d/override.conf",
+			want:  "DropInPaths",
+		},
+		{
+			name:  "reload still needed",
+			env:   "WG_MIX_EBPF_TEST_SYSTEMCTL_NEEDS_RELOAD",
+			value: "yes",
+			want:  "NeedDaemonReload",
+		},
+		{
+			name:  "not loaded",
+			env:   "WG_MIX_EBPF_TEST_SYSTEMCTL_LOAD_STATE",
+			value: "not-found",
+			want:  "LoadState",
+		},
+		{
+			name:  "transient",
+			env:   "WG_MIX_EBPF_TEST_SYSTEMCTL_TRANSIENT",
+			value: "yes",
+			want:  "Transient",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			layout := newCleanupTestLayoutForSystem(
+				t,
+				"systemd-manager-"+strings.ReplaceAll(test.name, " ", "-"),
+				"systemd",
+			)
+			setCleanupTestEnvironment(t, layout)
+			installFakeNft(t, "")
+			commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+			installFakeSystemctl(t, commandLog, "")
+			t.Setenv(test.env, test.value)
+			lifecycleRoot := t.TempDir()
+
+			_, err := Uninstall(
+				lockfile.WithLifecyclePathsForTest(
+					t.Context(),
+					filepath.Join(lifecycleRoot, "daemon.lease"),
+					filepath.Join(lifecycleRoot, "maintenance.gate"),
+				),
+				Options{
+					ConfigPath: layout.ConfigPath,
+					System:     "systemd",
+					Yes:        true,
+				},
+			)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("uninstall error = %v, want %s rejection", err, test.want)
+			}
+			logData, readErr := os.ReadFile(commandLog)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if !strings.Contains(string(logData), "daemon-reload\n") {
+				t.Fatalf("manager state was not synchronized first: %q", logData)
+			}
+			if strings.Contains(string(logData), "stop wg-mix-ebpf.service") ||
+				strings.Contains(string(logData), "disable wg-mix-ebpf.service") {
+				t.Fatalf("unverified manager state mutated service: %q", logData)
+			}
+			if _, statErr := os.Stat(
+				filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service"),
+			); statErr != nil {
+				t.Fatalf("manager rejection changed owned unit: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestParseSystemdUnitPropertiesRejectsAmbiguousOutput(t *testing.T) {
+	valid := "" +
+		"FragmentPath=/etc/systemd/system/wg-mix-ebpf.service\n" +
+		"DropInPaths=\n" +
+		"NeedDaemonReload=no\n" +
+		"LoadState=loaded\n" +
+		"Transient=no\n"
+	tests := []struct {
+		name string
+		data string
+	}{
+		{name: "empty"},
+		{name: "missing", data: strings.Replace(valid, "Transient=no\n", "", 1)},
+		{name: "duplicate", data: valid + "Transient=no\n"},
+		{name: "unknown", data: strings.Replace(valid, "Transient=no", "Other=no", 1)},
+		{name: "malformed", data: strings.Replace(valid, "Transient=no", "Transient", 1)},
+		{name: "NUL", data: valid + "\x00"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if _, err := parseSystemdUnitProperties([]byte(test.data)); err == nil {
+				t.Fatalf("ambiguous manager output %q unexpectedly accepted", test.data)
+			}
+		})
+	}
+	if properties, err := parseSystemdUnitProperties([]byte(valid)); err != nil {
+		t.Fatal(err)
+	} else if properties["FragmentPath"] != "/etc/systemd/system/wg-mix-ebpf.service" {
+		t.Fatalf("parsed FragmentPath = %q", properties["FragmentPath"])
+	}
+}
+
+func TestSystemdServiceActionRejectsFinalPathSwapBeforeManagerReload(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(t, "systemd-final-exec-swap", "systemd")
+	unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"systemd",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	setCleanupTestEnvironment(t, layout)
+	installFakeSystemctl(t, commandLog, "")
+
+	originalPath := unitPath + ".owned-original"
+	hookRan := false
+	plan.beforeServiceExec = func(path string) error {
+		if path != unitPath {
+			return fmt.Errorf("unexpected service exec hook path %s", path)
+		}
+		hookRan = true
+		if err := os.Rename(unitPath, originalPath); err != nil {
+			return err
+		}
+		return os.WriteFile(unitPath, []byte("[Service]\nExecStart=/bin/false\n"), 0o644)
+	}
+	err = runSystemdServiceActions(t.Context(), layout, plan, "stop", "disable")
+	if err == nil || !strings.Contains(err.Error(), "service artifact execution") {
+		t.Fatalf("systemd service action error = %v, want final identity rejection", err)
+	}
+	if !hookRan {
+		t.Fatal("systemd final service hook did not run")
+	}
+	if _, readErr := os.ReadFile(commandLog); !errors.Is(readErr, os.ErrNotExist) {
+		t.Fatalf("unit swap invoked systemctl before rejection: %v", readErr)
+	}
+	if data, readErr := os.ReadFile(unitPath); readErr != nil ||
+		string(data) != "[Service]\nExecStart=/bin/false\n" {
+		t.Fatalf("foreign unit replacement changed: data=%q err=%v", data, readErr)
+	}
+	if data, readErr := os.ReadFile(originalPath); readErr != nil ||
+		string(data) != systemdUnit(layout.ConfigPath, layout.BinaryPath) {
+		t.Fatalf("held owned unit changed: data=%q err=%v", data, readErr)
+	}
+}
+
 func TestUninstallDisablesSystemdBeforeRemovingOwnedUnit(t *testing.T) {
 	layout := newCleanupTestLayoutForSystem(t, "systemd-disable", "systemd")
 	setCleanupTestEnvironment(t, layout)
@@ -401,7 +563,7 @@ func TestUninstallDisablesSystemdBeforeRemovingOwnedUnit(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "stop wg-mix-ebpf.service\ndisable wg-mix-ebpf.service\ndaemon-reload\n"
+	want := "daemon-reload\nstop wg-mix-ebpf.service\ndisable wg-mix-ebpf.service\ndaemon-reload\n"
 	if string(logData) != want {
 		t.Fatalf("systemctl log = %q, want %q", logData, want)
 	}
@@ -768,6 +930,7 @@ func TestUninstallPurgeRetainsOwnershipUntilDaemonReloadSucceeds(t *testing.T) {
 	installFakeNft(t, "")
 	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
 	installFakeSystemctl(t, commandLog, "daemon-reload")
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL_OCCURRENCE", "2")
 	lifecycleRoot := t.TempDir()
 	ctx := lockfile.WithLifecyclePathsForTest(
 		t.Context(),
@@ -819,8 +982,8 @@ func TestUninstallPurgeRetainsOwnershipUntilDaemonReloadSucceeds(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Count(string(logData), "daemon-reload\n") != 2 {
-		t.Fatalf("systemctl log = %q, want two daemon-reload attempts", logData)
+	if strings.Count(string(logData), "daemon-reload\n") != 3 {
+		t.Fatalf("systemctl log = %q, want three daemon-reload attempts", logData)
 	}
 }
 
@@ -2567,13 +2730,32 @@ func installFakeSystemctl(t *testing.T, commandLog string, failAction string) {
 	}
 	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_LOG", commandLog)
 	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL", failAction)
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL_OCCURRENCE", "1")
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_DROP_INS", "")
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_NEEDS_RELOAD", "no")
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_LOAD_STATE", "loaded")
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_TRANSIENT", "no")
 	script := `#!/bin/sh
 if [ "$1" = "show" ]; then
-	printf '%s\n' "$WG_MIX_EBPF_TEST_SYSTEMCTL_FRAGMENT"
+	printf 'FragmentPath=%s\n' "$WG_MIX_EBPF_TEST_SYSTEMCTL_FRAGMENT"
+	printf 'DropInPaths=%s\n' "$WG_MIX_EBPF_TEST_SYSTEMCTL_DROP_INS"
+	printf 'NeedDaemonReload=%s\n' "$WG_MIX_EBPF_TEST_SYSTEMCTL_NEEDS_RELOAD"
+	printf 'LoadState=%s\n' "$WG_MIX_EBPF_TEST_SYSTEMCTL_LOAD_STATE"
+	printf 'Transient=%s\n' "$WG_MIX_EBPF_TEST_SYSTEMCTL_TRANSIENT"
 	exit 0
 fi
 printf '%s\n' "$*" >> "$WG_MIX_EBPF_TEST_SYSTEMCTL_LOG"
-[ "$1" != "$WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL" ]
+if [ "$1" = "$WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL" ]; then
+	seen=0
+	while IFS= read -r logged; do
+		case "$logged" in
+			"$1"|"$1 "*) seen=$((seen + 1)) ;;
+		esac
+	done < "$WG_MIX_EBPF_TEST_SYSTEMCTL_LOG"
+	[ "$seen" -ne "$WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL_OCCURRENCE" ]
+	exit
+fi
+exit 0
 `
 	if err := os.WriteFile(
 		filepath.Join(fakeBin, "systemctl"),

@@ -456,6 +456,70 @@ func runOpenWrtServiceActions(
 	return nil
 }
 
+func runSystemdServiceActions(
+	ctx context.Context,
+	paths paths,
+	plan *uninstallCleanupPlan,
+	actions ...string,
+) (retErr error) {
+	for _, action := range actions {
+		switch action {
+		case "stop", "disable":
+		default:
+			return fmt.Errorf("refuse unsupported systemd uninstall action %q", action)
+		}
+	}
+	if err := plan.revalidate(); err != nil {
+		return err
+	}
+	artifact, exists, err := plan.openServiceArtifactForExecution("systemd-unit")
+	if err != nil || !exists {
+		return err
+	}
+	defer func() {
+		if err := artifact.close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close verified systemd unit: %w", err))
+		}
+	}()
+	for index, action := range actions {
+		if plan.beforeServiceExec != nil {
+			if err := plan.beforeServiceExec(artifact.entry.path); err != nil {
+				return err
+			}
+		}
+		if err := artifact.revalidateForExecution(); err != nil {
+			return err
+		}
+		if index == 0 {
+			if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+				return fmt.Errorf(
+					"synchronize systemd manager with verified owned unit: %w",
+					err,
+				)
+			}
+			if err := artifact.revalidateForExecution(); err != nil {
+				return fmt.Errorf(
+					"revalidate owned systemd unit after manager reload: %w",
+					err,
+				)
+			}
+		}
+		if err := verifySystemdServiceFragment(ctx, paths); err != nil {
+			return err
+		}
+		if err := artifact.revalidateForExecution(); err != nil {
+			return fmt.Errorf(
+				"revalidate owned systemd unit after manager inspection: %w",
+				err,
+			)
+		}
+		if err := runCommand(ctx, "systemctl", action, "wg-mix-ebpf.service"); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func runInstalledOpenWrtServiceAction(
 	ctx context.Context,
 	paths paths,

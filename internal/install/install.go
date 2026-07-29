@@ -413,20 +413,14 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	}
 	switch system {
 	case "systemd":
-		_, _, unitExists, err := serviceStopPlan.serviceArtifactEntry("systemd-unit")
-		if err != nil {
+		if err := runSystemdServiceActions(
+			ctx,
+			paths,
+			serviceStopPlan,
+			"stop",
+			"disable",
+		); err != nil {
 			return nil, err
-		}
-		if unitExists {
-			if err := verifySystemdServiceFragment(ctx, paths); err != nil {
-				return nil, err
-			}
-			if err := runCommand(ctx, "systemctl", "stop", "wg-mix-ebpf.service"); err != nil {
-				return nil, err
-			}
-			if err := runCommand(ctx, "systemctl", "disable", "wg-mix-ebpf.service"); err != nil {
-				return nil, err
-			}
 		}
 	case "openwrt":
 		if err := runOpenWrtServiceActions(
@@ -826,7 +820,10 @@ func verifySystemdServiceFragment(ctx context.Context, paths paths) error {
 	args := []string{
 		"show",
 		"--property=FragmentPath",
-		"--value",
+		"--property=DropInPaths",
+		"--property=NeedDaemonReload",
+		"--property=LoadState",
+		"--property=Transient",
 		"wg-mix-ebpf.service",
 	}
 	cmd := exec.CommandContext(ctx, "systemctl", args...)
@@ -839,15 +836,81 @@ func verifySystemdServiceFragment(ctx context.Context, paths paths) error {
 			string(out),
 		)
 	}
-	actual := strings.TrimSpace(string(out))
-	if actual != expected {
+	properties, err := parseSystemdUnitProperties(out)
+	if err != nil {
+		return fmt.Errorf("refuse systemd service with ambiguous manager state: %w", err)
+	}
+	if properties["FragmentPath"] != expected {
 		return fmt.Errorf(
-			"refuse to stop systemd service: FragmentPath %q does not match owned unit %q",
-			actual,
+			"refuse to operate systemd service: FragmentPath %q does not match owned unit %q",
+			properties["FragmentPath"],
 			expected,
 		)
 	}
+	if properties["DropInPaths"] != "" {
+		return fmt.Errorf(
+			"refuse to operate systemd service with unowned DropInPaths %q",
+			properties["DropInPaths"],
+		)
+	}
+	if properties["NeedDaemonReload"] != "no" {
+		return fmt.Errorf(
+			"refuse to operate systemd service with NeedDaemonReload=%q",
+			properties["NeedDaemonReload"],
+		)
+	}
+	if properties["LoadState"] != "loaded" {
+		return fmt.Errorf(
+			"refuse to operate systemd service with LoadState=%q",
+			properties["LoadState"],
+		)
+	}
+	if properties["Transient"] != "no" {
+		return fmt.Errorf(
+			"refuse to operate transient systemd service: Transient=%q",
+			properties["Transient"],
+		)
+	}
 	return nil
+}
+
+func parseSystemdUnitProperties(data []byte) (map[string]string, error) {
+	const expectedPropertyCount = 5
+	allowed := map[string]struct{}{
+		"FragmentPath":     {},
+		"DropInPaths":      {},
+		"NeedDaemonReload": {},
+		"LoadState":        {},
+		"Transient":        {},
+	}
+	if len(data) == 0 || strings.IndexByte(string(data), 0) >= 0 {
+		return nil, errors.New("systemctl returned empty or NUL-containing output")
+	}
+	properties := make(map[string]string, expectedPropertyCount)
+	for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+		if strings.HasSuffix(line, "\r") {
+			line = strings.TrimSuffix(line, "\r")
+		}
+		name, value, found := strings.Cut(line, "=")
+		if !found {
+			return nil, fmt.Errorf("systemctl returned malformed property line %q", line)
+		}
+		if _, ok := allowed[name]; !ok {
+			return nil, fmt.Errorf("systemctl returned unexpected property %q", name)
+		}
+		if _, duplicate := properties[name]; duplicate {
+			return nil, fmt.Errorf("systemctl returned duplicate property %q", name)
+		}
+		properties[name] = value
+	}
+	if len(properties) != expectedPropertyCount {
+		return nil, fmt.Errorf(
+			"systemctl returned %d service properties, want %d",
+			len(properties),
+			expectedPropertyCount,
+		)
+	}
+	return properties, nil
 }
 
 func envOr(name string, fallback string) string {
