@@ -254,6 +254,36 @@ func TestApplyRejectsLegacyTableBeforeAnyWrite(t *testing.T) {
 	}
 }
 
+func TestApplyRejectsLegacyV1OwnerRecordBeforeAnyWrite(t *testing.T) {
+	stateDir := guardTestStateDir(t)
+	writeLegacyV1OwnerRecord(t, stateDir)
+	var scripts []string
+	exec := CommandExecutor{
+		StateDir: stateDir,
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			if table != TableName {
+				t.Fatalf("unexpected inspection of %q", table)
+			}
+			return tableIdentity{}, nil
+		},
+		runScript: func(_ context.Context, script string) error {
+			scripts = append(scripts, script)
+			return nil
+		},
+	}
+	err := exec.Apply(t.Context(), BuildNftPlan(&control.State{}))
+	if err == nil || !strings.Contains(err.Error(), "guard-owner.v1.json") ||
+		!strings.Contains(err.Error(), "migration") {
+		t.Fatalf("v1 owner record should require explicit migration, got %v", err)
+	}
+	if len(scripts) != 0 {
+		t.Fatalf("v1 owner record rejection issued nft writes: %#v", scripts)
+	}
+	if _, statErr := os.Stat(filepath.Join(stateDir, OwnerRecordFileName)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("v1 rejection created a v2 owner record: %v", statErr)
+	}
+}
+
 func TestCleanupWithoutOwnerRecordIsZeroWrite(t *testing.T) {
 	stateDir := guardTestStateDir(t)
 	var scripts []string
@@ -275,6 +305,33 @@ func TestCleanupWithoutOwnerRecordIsZeroWrite(t *testing.T) {
 	}
 	if len(scripts) != 0 {
 		t.Fatalf("cleanup without ownership issued nft writes: %#v", scripts)
+	}
+}
+
+func TestCleanupRejectsLegacyV1OwnerRecordWithZeroWrite(t *testing.T) {
+	stateDir := guardTestStateDir(t)
+	writeLegacyV1OwnerRecord(t, stateDir)
+	var scripts []string
+	exec := CommandExecutor{
+		StateDir: stateDir,
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			if table != TableName {
+				t.Fatalf("unexpected inspection of %q", table)
+			}
+			return tableIdentity{}, nil
+		},
+		runScript: func(_ context.Context, script string) error {
+			scripts = append(scripts, script)
+			return nil
+		},
+	}
+	err := exec.Cleanup(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "guard-owner.v1.json") ||
+		!strings.Contains(err.Error(), "migration") {
+		t.Fatalf("v1 cleanup should fail closed, got %v", err)
+	}
+	if len(scripts) != 0 {
+		t.Fatalf("v1 cleanup rejection issued nft writes: %#v", scripts)
 	}
 }
 
@@ -405,4 +462,20 @@ func seedOwnerRecord(t *testing.T, stateDir string) ownerRecord {
 		t.Fatal("test owner record unexpectedly existed")
 	}
 	return record
+}
+
+func writeLegacyV1OwnerRecord(t *testing.T, stateDir string) {
+	t.Helper()
+	const installationID = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	data := []byte(`{
+  "version": 1,
+  "installation_id": "` + installationID + `",
+  "state_dir": "` + stateDir + `",
+  "table": "wg_mix_ebpf_guard_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "marker": "wg-mix-ebpf-guard-v1:` + installationID + `"
+}
+`)
+	if err := os.WriteFile(filepath.Join(stateDir, "guard-owner.v1.json"), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
 }

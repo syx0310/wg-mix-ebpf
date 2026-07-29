@@ -177,6 +177,29 @@ func TestOwnerRecordRejectsAncestorStateDirectorySymlink(t *testing.T) {
 	}
 }
 
+func TestOwnerRecordRejectsTrailingSlashStateDirectoryAlias(t *testing.T) {
+	stateDir := guardTestStateDir(t)
+	exec := CommandExecutor{StateDir: stateDir + string(filepath.Separator)}
+	if _, _, err := exec.loadOrCreateOwner(); err == nil {
+		t.Fatal("a trailing-slash state-directory alias must be rejected")
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, OwnerRecordFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("non-canonical state path received an owner record: %v", err)
+	}
+}
+
+func TestOwnerRecordRejectsRepeatedSeparatorStateDirectoryAlias(t *testing.T) {
+	stateDir := guardTestStateDir(t)
+	alias := filepath.Dir(stateDir) + string(filepath.Separator) + string(filepath.Separator) + filepath.Base(stateDir)
+	exec := CommandExecutor{StateDir: alias}
+	if _, _, err := exec.loadOrCreateOwner(); err == nil {
+		t.Fatal("a repeated-separator state-directory alias must be rejected")
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, OwnerRecordFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("non-canonical state path received an owner record: %v", err)
+	}
+}
+
 func TestOwnerRecordRecoversPartialPendingPublish(t *testing.T) {
 	stateDir := guardTestStateDir(t)
 	pendingPath := filepath.Join(stateDir, ownerRecordPendingFileName)
