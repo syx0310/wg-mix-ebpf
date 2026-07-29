@@ -1390,6 +1390,81 @@ func TestWriteCleanupManifestPreservesValidatedMarkerIdentity(t *testing.T) {
 	}
 }
 
+func TestMarkedReinstallRejectsSymlinkedConfigBeforeWrites(t *testing.T) {
+	layout := newCleanupTestLayout(t, "marked-config-link")
+	setCleanupTestEnvironment(t, layout)
+	foreignConfig := filepath.Join(t.TempDir(), "foreign-config.yaml")
+	if err := config.SaveFile(foreignConfig, config.SafeTemplate()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(layout.ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(foreignConfig, layout.ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	lifecycleRoot := t.TempDir()
+	_, err := Install(
+		lockfile.WithLifecyclePathsForTest(
+			t.Context(),
+			filepath.Join(lifecycleRoot, "daemon.lease"),
+			filepath.Join(lifecycleRoot, "maintenance.gate"),
+		),
+		Options{System: "unknown"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "marked install config") {
+		t.Fatalf("marked reinstall error = %v, want config ownership rejection", err)
+	}
+	if _, statErr := os.Lstat(layout.BinaryPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("config rejection installed binary first: %v", statErr)
+	}
+	if info, statErr := os.Lstat(layout.ConfigPath); statErr != nil ||
+		info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf(
+			"config rejection replaced the foreign symlink: info=%v err=%v",
+			info,
+			statErr,
+		)
+	}
+	if _, statErr := os.Stat(foreignConfig); statErr != nil {
+		t.Fatalf("config rejection changed the symlink target: %v", statErr)
+	}
+	if _, statErr := os.Stat(cleanupManifestPath(layout)); statErr != nil {
+		t.Fatalf("config rejection changed the ownership manifest: %v", statErr)
+	}
+}
+
+func TestMarkedReinstallRetainsConfigDescriptorIdentity(t *testing.T) {
+	layout := newCleanupTestLayout(t, "marked-config-identity")
+	publication, err := prepareCleanupManifestPublication(
+		layout,
+		"unknown",
+		cleanupManifestWriteOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publication.close()
+
+	originalConfig := layout.ConfigPath + ".original"
+	if err := os.Rename(layout.ConfigPath, originalConfig); err != nil {
+		t.Fatal(err)
+	}
+	if err := config.SaveFile(layout.ConfigPath, config.SafeTemplate()); err != nil {
+		t.Fatal(err)
+	}
+	if err := publication.publish(); err == nil ||
+		!strings.Contains(err.Error(), "marked install config") {
+		t.Fatalf("publication error = %v, want held config identity rejection", err)
+	}
+	if _, statErr := os.Stat(originalConfig); statErr != nil {
+		t.Fatalf("held original config changed: %v", statErr)
+	}
+	if _, statErr := os.Stat(layout.ConfigPath); statErr != nil {
+		t.Fatalf("foreign config replacement changed: %v", statErr)
+	}
+}
+
 func TestWriteCleanupManifestRefusesUnknownUnmarkedResource(t *testing.T) {
 	layout := cleanupTestPaths(t.TempDir(), "marker-bootstrap")
 	for _, dir := range []string{

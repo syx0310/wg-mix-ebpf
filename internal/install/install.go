@@ -231,13 +231,20 @@ func applyInstall(
 	if err := runDir.close(); err != nil {
 		return fmt.Errorf("close runtime directory handles: %w", err)
 	}
+	if err := publication.revalidateOwnedConfig(); err != nil {
+		return err
+	}
 	if err := installServiceArtifacts(paths, system); err != nil {
 		return err
 	}
 	if err := installBinary(paths.BinaryPath); err != nil {
 		return err
 	}
-	if _, err := os.Stat(paths.ConfigPath); errors.Is(err, os.ErrNotExist) {
+	if publication.configFile != nil {
+		if err := publication.revalidateOwnedConfig(); err != nil {
+			return err
+		}
+	} else if _, err := os.Stat(paths.ConfigPath); errors.Is(err, os.ErrNotExist) {
 		if err := config.SaveFile(paths.ConfigPath, config.SafeTemplate()); err != nil {
 			return err
 		}

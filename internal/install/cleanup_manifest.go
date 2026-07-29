@@ -228,18 +228,28 @@ type cleanupManifestPublication struct {
 	paths            paths
 	system           string
 	configDir        *managedCleanupDir
+	configFile       *os.File
+	configIdentity   cleanupIdentity
+	configName       string
 	stateDir         *managedCleanupDir
 	desired          cleanupManifest
 	alreadyPublished bool
 }
 
 func (publication *cleanupManifestPublication) close() error {
-	if publication == nil || publication.configDir == nil {
+	if publication == nil {
 		return nil
 	}
-	err := publication.configDir.close()
-	publication.configDir = nil
-	return err
+	var errs []error
+	if publication.configFile != nil {
+		errs = append(errs, publication.configFile.Close())
+		publication.configFile = nil
+	}
+	if publication.configDir != nil {
+		errs = append(errs, publication.configDir.close())
+		publication.configDir = nil
+	}
+	return errors.Join(errs...)
 }
 
 func prepareCleanupManifestPublication(
@@ -271,16 +281,21 @@ func prepareCleanupManifestPublication(
 		if err := manifest.validateAgainst(paths, system); err != nil {
 			return nil, err
 		}
+		configFile, configIdentity, err := openOwnedConfigForReinstall(
+			configDir,
+			paths.ConfigPath,
+		)
+		if err != nil {
+			return nil, err
+		}
 		publication := &cleanupManifestPublication{
 			paths:            paths,
 			system:           system,
+			configDir:        configDir,
+			configFile:       configFile,
+			configIdentity:   configIdentity,
+			configName:       filepath.Base(paths.ConfigPath),
 			alreadyPublished: true,
-		}
-		if err := configDir.close(); err != nil {
-			return nil, fmt.Errorf(
-				"close existing cleanup ownership directory: %w",
-				err,
-			)
 		}
 		configDir = nil
 		return publication, nil
@@ -348,7 +363,7 @@ func (publication *cleanupManifestPublication) publish() (retErr error) {
 		return errors.New("cannot publish a nil cleanup ownership manifest")
 	}
 	if publication.alreadyPublished {
-		return nil
+		return publication.revalidateOwnedConfig()
 	}
 	if publication.configDir == nil {
 		return errors.New("cleanup ownership publication has no held config directory")
@@ -438,6 +453,91 @@ func (publication *cleanupManifestPublication) publish() (retErr error) {
 		}
 	}
 	publication.alreadyPublished = true
+	return nil
+}
+
+func openOwnedConfigForReinstall(
+	configDir *managedCleanupDir,
+	path string,
+) (*os.File, cleanupIdentity, error) {
+	name := filepath.Base(path)
+	file, identity, err := cleanupOpenFileAt(configDir.dir, name)
+	if err != nil {
+		return nil, cleanupIdentity{}, fmt.Errorf(
+			"open marked install config %s without following links: %w",
+			path,
+			err,
+		)
+	}
+	if err := identity.validateRegularFile(path, uint32(os.Geteuid())); err != nil {
+		_ = file.Close()
+		return nil, cleanupIdentity{}, fmt.Errorf("validate marked install config: %w", err)
+	}
+	fdIdentity, err := cleanupIdentityForFD(int(file.Fd()))
+	if err != nil {
+		_ = file.Close()
+		return nil, cleanupIdentity{}, err
+	}
+	if !identity.sameRegularFile(fdIdentity) {
+		_ = file.Close()
+		return nil, cleanupIdentity{}, fmt.Errorf(
+			"refuse marked install config %s: held identity changed during validation",
+			path,
+		)
+	}
+	namedIdentity, err := cleanupIdentityAt(configDir.dir, name)
+	if err != nil {
+		_ = file.Close()
+		return nil, cleanupIdentity{}, fmt.Errorf(
+			"revalidate marked install config name %s: %w",
+			path,
+			err,
+		)
+	}
+	if !fdIdentity.sameRegularFile(namedIdentity) {
+		_ = file.Close()
+		return nil, cleanupIdentity{}, fmt.Errorf(
+			"refuse marked install config %s: pathname changed during validation",
+			path,
+		)
+	}
+	return file, fdIdentity, nil
+}
+
+func (publication *cleanupManifestPublication) revalidateOwnedConfig() error {
+	if publication == nil || publication.configFile == nil {
+		return nil
+	}
+	if publication.configDir == nil {
+		return errors.New("marked install config lost its held parent directory")
+	}
+	if err := revalidateManagedCleanupDir(publication.configDir); err != nil {
+		return fmt.Errorf("revalidate marked install config directory: %w", err)
+	}
+	fdIdentity, err := cleanupIdentityForFD(int(publication.configFile.Fd()))
+	if err != nil {
+		return fmt.Errorf("revalidate held marked install config: %w", err)
+	}
+	if !publication.configIdentity.sameRegularFile(fdIdentity) {
+		return fmt.Errorf(
+			"refuse marked install config %s: held identity changed",
+			publication.paths.ConfigPath,
+		)
+	}
+	namedIdentity, err := cleanupIdentityAt(publication.configDir.dir, publication.configName)
+	if err != nil {
+		return fmt.Errorf(
+			"revalidate marked install config name %s: %w",
+			publication.paths.ConfigPath,
+			err,
+		)
+	}
+	if !fdIdentity.sameRegularFile(namedIdentity) {
+		return fmt.Errorf(
+			"refuse marked install config %s: pathname changed",
+			publication.paths.ConfigPath,
+		)
+	}
 	return nil
 }
 
