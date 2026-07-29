@@ -201,6 +201,10 @@ func TestUninstallDoesNotDeadlockWhenConfigExists(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte(
 		"#!/bin/sh\n"+
 			"set -eu\n"+
+			"if [ \"$*\" = '-j list tables' ]; then\n"+
+			"  printf '%s\\n' '{\"nftables\":[{\"metainfo\":{\"json_schema_version\":1}}]}'\n"+
+			"  exit 0\n"+
+			"fi\n"+
 			"printf '%s\\000' \"$#\" \"$@\" >\"$WG_MIX_EBPF_TEST_NFT_READY_FIFO\"\n"+
 			"IFS= read -r control <\"$WG_MIX_EBPF_TEST_NFT_RELEASE_FIFO\"\n"+
 			"[ \"$control\" = continue ] || exit 70\n"+

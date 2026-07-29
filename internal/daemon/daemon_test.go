@@ -1083,7 +1083,13 @@ func TestDaemonCleanupReusesHeldLeaseWithoutSelfLock(t *testing.T) {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte(
-		"#!/bin/sh\nprintf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\nexit 1\n",
+		"#!/bin/sh\n"+
+			"if [ \"$*\" = '-j list tables' ]; then\n"+
+			"  printf '%s\\n' '{\"nftables\":[{\"metainfo\":{\"json_schema_version\":1}}]}'\n"+
+			"  exit 0\n"+
+			"fi\n"+
+			"printf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\n"+
+			"exit 1\n",
 	), 0o755); err != nil {
 		t.Fatal(err)
 	}

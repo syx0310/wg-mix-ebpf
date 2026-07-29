@@ -81,10 +81,60 @@ func TestParseTableIdentityJSONRequiresHandleAndComment(t *testing.T) {
 	}
 }
 
+func TestParseProjectTableInventoryJSON(t *testing.T) {
+	tables, err := parseProjectTableInventoryJSON([]byte(`{
+		"nftables": [
+			{"metainfo": {"json_schema_version": 1}},
+			{"table": {"family": "inet", "name": "unrelated"}},
+			{"table": {"family": "ip", "name": "wg_mix_ebpf_guard"}},
+			{"table": {"family": "inet", "name": "wg_mix_ebpf_guardrail"}},
+			{"table": {"family": "inet", "name": "wg_mix_ebpf_guard_damaged-owner"}},
+			{"table": {"family": "inet", "name": "wg_mix_ebpf_guard"}}
+		]
+	}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"wg_mix_ebpf_guard", "wg_mix_ebpf_guard_damaged-owner"}
+	if len(tables) != len(want) {
+		t.Fatalf("project tables = %v, want %v", tables, want)
+	}
+	for index := range want {
+		if tables[index] != want[index] {
+			t.Fatalf("project tables = %v, want %v", tables, want)
+		}
+	}
+}
+
+func TestParseProjectTableInventoryJSONRejectsDuplicateMetadata(t *testing.T) {
+	_, err := parseProjectTableInventoryJSON([]byte(`{
+		"nftables": [
+			{"table": {"family": "inet", "name": "wg_mix_ebpf_guard_orphan"}},
+			{"table": {"family": "inet", "name": "wg_mix_ebpf_guard_orphan"}}
+		]
+	}`))
+	if err == nil || !strings.Contains(err.Error(), "duplicate") {
+		t.Fatalf("duplicate project table metadata was accepted: %v", err)
+	}
+}
+
+func TestParseProjectTableInventoryJSONRejectsUnknownObjects(t *testing.T) {
+	for _, document := range []string{
+		`{"nftables": [{"metainfo": {"json_schema_version": 1}}, {"chain": {"family": "inet", "table": "unrelated", "name": "input"}}]}`,
+		`{"nftables": [{"metainfo": {"json_schema_version": 1}}, {"table": {"family": "inet"}}]}`,
+		`{"nftables": [{}]}`,
+	} {
+		if _, err := parseProjectTableInventoryJSON([]byte(document)); err == nil {
+			t.Fatalf("malformed nft table inventory was accepted: %s", document)
+		}
+	}
+}
+
 func TestParseTableIdentityJSONRejectsMissingHandle(t *testing.T) {
 	const table = "wg_mix_ebpf_guard_0123456789abcdef"
 	_, err := parseTableIdentityJSON([]byte(`{
 		"nftables": [
+			{"metainfo": {"json_schema_version": 1}},
 			{"table": {
 				"family": "inet",
 				"name": "wg_mix_ebpf_guard_0123456789abcdef",
@@ -94,6 +144,27 @@ func TestParseTableIdentityJSONRejectsMissingHandle(t *testing.T) {
 	}`), table)
 	if err == nil || !strings.Contains(err.Error(), "non-zero handle") {
 		t.Fatalf("missing table handle should fail closed, got %v", err)
+	}
+}
+
+func TestParseProjectTableInventoryJSONFailsClosedOnDocumentDrift(t *testing.T) {
+	documents := map[string]string{
+		"missing-array":       `{}`,
+		"null-array":          `{"nftables": null}`,
+		"unknown-root":        `{"nftables": [], "unexpected": true}`,
+		"missing-metainfo":    `{"nftables": []}`,
+		"duplicate-metainfo":  `{"nftables": [{"metainfo": {"json_schema_version": 1}}, {"metainfo": {"json_schema_version": 1}}]}`,
+		"unknown-table-field": `{"nftables": [{"metainfo": {"json_schema_version": 1}}, {"table": {"family": "inet", "name": "clean", "unexpected": true}}]}`,
+		"unsupported-schema":  `{"nftables": [{"metainfo": {"json_schema_version": 2}}]}`,
+		"duplicate-root-key":  `{"nftables": [], "nftables": []}`,
+		"duplicate-table-key": `{"nftables": [{"metainfo": {"json_schema_version": 1}}, {"table": {"family": "inet", "family": "ip", "name": "clean"}}]}`,
+	}
+	for name, document := range documents {
+		t.Run(name, func(t *testing.T) {
+			if _, err := parseProjectTableInventoryJSON([]byte(document)); err == nil {
+				t.Fatalf("drifted nft inventory was accepted: %s", document)
+			}
+		})
 	}
 }
 
@@ -114,8 +185,10 @@ func TestApplyReplacesExistingTableInSingleTransaction(t *testing.T) {
 	stateDir := guardTestStateDir(t)
 	owner := seedOwnerRecord(t, stateDir)
 	var scripts []string
+	ownedInspections := 0
 	exec := CommandExecutor{
-		StateDir: stateDir,
+		StateDir:   stateDir,
+		listTables: staticProjectTables(owner.Table),
 		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
 			if table == TableName {
 				return tableIdentity{}, nil
@@ -123,7 +196,12 @@ func TestApplyReplacesExistingTableInSingleTransaction(t *testing.T) {
 			if table != owner.Table {
 				t.Fatalf("inspected table %q, want %q", table, owner.Table)
 			}
-			return tableIdentity{Exists: true, Handle: 73, Comment: owner.Marker}, nil
+			ownedInspections++
+			handle := uint64(73)
+			if ownedInspections > 1 {
+				handle = 74
+			}
+			return tableIdentity{Exists: true, Handle: handle, Comment: owner.Marker}, nil
 		},
 		runScript: func(_ context.Context, script string) error {
 			scripts = append(scripts, script)
@@ -147,8 +225,15 @@ func TestApplyCreatesOnlyWhenOwnedTableIsMissing(t *testing.T) {
 	stateDir := guardTestStateDir(t)
 	owner := seedOwnerRecord(t, stateDir)
 	var scripts []string
+	created := false
 	exec := CommandExecutor{
 		StateDir: stateDir,
+		listTables: func(context.Context) ([]string, error) {
+			if created {
+				return []string{owner.Table}, nil
+			}
+			return nil, nil
+		},
 		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
 			if table == TableName {
 				return tableIdentity{}, nil
@@ -156,10 +241,14 @@ func TestApplyCreatesOnlyWhenOwnedTableIsMissing(t *testing.T) {
 			if table != owner.Table {
 				t.Fatalf("inspected table %q, want %q", table, owner.Table)
 			}
+			if created {
+				return tableIdentity{Exists: true, Handle: 75, Comment: owner.Marker}, nil
+			}
 			return tableIdentity{}, nil
 		},
 		runScript: func(_ context.Context, script string) error {
 			scripts = append(scripts, script)
+			created = true
 			return nil
 		},
 	}
@@ -181,7 +270,8 @@ func TestApplyDoesNotFallbackOnInvalidReplacement(t *testing.T) {
 	owner := seedOwnerRecord(t, stateDir)
 	var scripts []string
 	exec := CommandExecutor{
-		StateDir: stateDir,
+		StateDir:   stateDir,
+		listTables: staticProjectTables(owner.Table),
 		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
 			if table == TableName {
 				return tableIdentity{}, nil
@@ -202,17 +292,89 @@ func TestApplyDoesNotFallbackOnInvalidReplacement(t *testing.T) {
 	}
 }
 
+func TestApplyRequiresReplacementPostcondition(t *testing.T) {
+	stateDir := guardTestStateDir(t)
+	owner := seedOwnerRecord(t, stateDir)
+	exec := CommandExecutor{
+		StateDir:   stateDir,
+		listTables: staticProjectTables(owner.Table),
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			if table == TableName {
+				return tableIdentity{}, nil
+			}
+			return tableIdentity{Exists: true, Handle: 92, Comment: owner.Marker}, nil
+		},
+		runScript: func(context.Context, string) error {
+			return nil
+		},
+	}
+	err := exec.Apply(t.Context(), BuildNftPlan(&control.State{}))
+	if err == nil || !strings.Contains(err.Error(), "retained table handle 92") {
+		t.Fatalf("replacement without a new handle was accepted: %v", err)
+	}
+}
+
+func TestApplyRequiresCreatePostcondition(t *testing.T) {
+	stateDir := guardTestStateDir(t)
+	owner := seedOwnerRecord(t, stateDir)
+	exec := CommandExecutor{
+		StateDir:   stateDir,
+		listTables: staticProjectTables(),
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			if table == TableName {
+				return tableIdentity{}, nil
+			}
+			if table != owner.Table {
+				t.Fatalf("unexpected inspection of %q", table)
+			}
+			return tableIdentity{}, nil
+		},
+		runScript: func(context.Context, string) error {
+			return nil
+		},
+	}
+	err := exec.Apply(t.Context(), BuildNftPlan(&control.State{}))
+	if err == nil || !strings.Contains(err.Error(), "startup guard table is absent") {
+		t.Fatalf("create without a visible owned table was accepted: %v", err)
+	}
+}
+
 func TestApplyDoesNotDeleteUnownedLegacyFixedTable(t *testing.T) {
 	stateDir := guardTestStateDir(t)
 	plan := BuildNftPlan(&control.State{})
 	var scripts []string
+	created := false
 	exec := CommandExecutor{
 		StateDir: stateDir,
-		inspectTable: func(context.Context, string) (tableIdentity, error) {
-			return tableIdentity{}, nil
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			if table == TableName || !created {
+				return tableIdentity{}, nil
+			}
+			owner, present, err := (CommandExecutor{StateDir: stateDir}).loadOwnerIfPresent()
+			if err != nil {
+				return tableIdentity{}, err
+			}
+			if !present || table != owner.Table {
+				t.Fatalf("unexpected post-create inspection of %q with owner %#v", table, owner)
+			}
+			return tableIdentity{Exists: true, Handle: 76, Comment: owner.Marker}, nil
+		},
+		listTables: func(context.Context) ([]string, error) {
+			if created {
+				owner, present, err := (CommandExecutor{StateDir: stateDir}).loadOwnerIfPresent()
+				if err != nil {
+					return nil, err
+				}
+				if !present {
+					return nil, errors.New("owner record missing after create")
+				}
+				return []string{owner.Table}, nil
+			}
+			return nil, nil
 		},
 		runScript: func(_ context.Context, script string) error {
 			scripts = append(scripts, script)
+			created = true
 			return nil
 		},
 	}
@@ -266,6 +428,9 @@ func TestApplyRejectsLegacyV1OwnerRecordBeforeAnyWrite(t *testing.T) {
 			}
 			return tableIdentity{}, nil
 		},
+		listTables: func(context.Context) ([]string, error) {
+			return nil, nil
+		},
 		runScript: func(_ context.Context, script string) error {
 			scripts = append(scripts, script)
 			return nil
@@ -295,6 +460,9 @@ func TestCleanupWithoutOwnerRecordIsZeroWrite(t *testing.T) {
 			}
 			return tableIdentity{}, nil
 		},
+		listTables: func(context.Context) ([]string, error) {
+			return nil, nil
+		},
 		runScript: func(_ context.Context, script string) error {
 			scripts = append(scripts, script)
 			return nil
@@ -308,6 +476,311 @@ func TestCleanupWithoutOwnerRecordIsZeroWrite(t *testing.T) {
 	}
 }
 
+func TestOwnerlessProjectTableFailsClosedWithZeroWrite(t *testing.T) {
+	for _, operation := range []struct {
+		name string
+		run  func(context.Context, CommandExecutor) error
+	}{
+		{
+			name: "apply",
+			run: func(ctx context.Context, executor CommandExecutor) error {
+				return executor.Apply(ctx, BuildNftPlan(&control.State{}))
+			},
+		},
+		{
+			name: "cleanup",
+			run: func(ctx context.Context, executor CommandExecutor) error {
+				return executor.Cleanup(ctx)
+			},
+		},
+	} {
+		t.Run(operation.name, func(t *testing.T) {
+			stateDir := guardTestStateDir(t)
+			orphan := TableName + "_0123456789abcdef0123456789abcdef"
+			writes := 0
+			executor := CommandExecutor{
+				StateDir: stateDir,
+				inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+					if table != TableName {
+						t.Fatalf("unexpected exact-table inspection of %q", table)
+					}
+					return tableIdentity{}, nil
+				},
+				listTables: func(context.Context) ([]string, error) {
+					return []string{orphan}, nil
+				},
+				runScript: func(context.Context, string) error {
+					writes++
+					return nil
+				},
+			}
+			err := operation.run(t.Context(), executor)
+			if err == nil || !strings.Contains(err.Error(), orphan) ||
+				!strings.Contains(err.Error(), "without a v2 owner record") {
+				t.Fatalf("%s accepted an ownerless project table: %v", operation.name, err)
+			}
+			if writes != 0 {
+				t.Fatalf("%s issued %d writes for an ownerless project table", operation.name, writes)
+			}
+			if _, statErr := os.Lstat(filepath.Join(stateDir, OwnerRecordFileName)); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("%s created an owner record after orphan detection: %v", operation.name, statErr)
+			}
+		})
+	}
+}
+
+func TestOwnerRecordWithUnexpectedProjectTablesFailsClosedWithZeroWrite(t *testing.T) {
+	operations := []struct {
+		name string
+		run  func(context.Context, CommandExecutor) error
+	}{
+		{
+			name: "apply",
+			run: func(ctx context.Context, executor CommandExecutor) error {
+				return executor.Apply(ctx, BuildNftPlan(&control.State{}))
+			},
+		},
+		{
+			name: "cleanup",
+			run: func(ctx context.Context, executor CommandExecutor) error {
+				return executor.Cleanup(ctx)
+			},
+		},
+	}
+	for _, ownerTableListed := range []bool{false, true} {
+		listedState := "owner-table-missing"
+		if ownerTableListed {
+			listedState = "owner-table-present"
+		}
+		for _, operation := range operations {
+			t.Run(operation.name+"/"+listedState, func(t *testing.T) {
+				stateDir := guardTestStateDir(t)
+				owner := seedOwnerRecord(t, stateDir)
+				orphan := TableName + "_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+				tables := []string{orphan}
+				if ownerTableListed {
+					tables = []string{owner.Table, orphan}
+				}
+				inventoryCalls := 0
+				ownedInspections := 0
+				writes := 0
+				executor := CommandExecutor{
+					StateDir: stateDir,
+					inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+						if table == TableName {
+							return tableIdentity{}, nil
+						}
+						ownedInspections++
+						return tableIdentity{}, nil
+					},
+					listTables: func(context.Context) ([]string, error) {
+						inventoryCalls++
+						return append([]string(nil), tables...), nil
+					},
+					runScript: func(context.Context, string) error {
+						writes++
+						return nil
+					},
+				}
+
+				err := operation.run(t.Context(), executor)
+				if err == nil || !strings.Contains(err.Error(), orphan) ||
+					!strings.Contains(err.Error(), owner.Table) ||
+					!strings.Contains(err.Error(), "refusing mutation") {
+					t.Fatalf("%s accepted unexpected project tables %v: %v", operation.name, tables, err)
+				}
+				if inventoryCalls != 1 {
+					t.Fatalf("%s inventory calls = %d, want 1", operation.name, inventoryCalls)
+				}
+				if ownedInspections != 0 {
+					t.Fatalf("%s inspected the owned table %d times after inventory mismatch", operation.name, ownedInspections)
+				}
+				if writes != 0 {
+					t.Fatalf("%s issued %d writes for unexpected project tables", operation.name, writes)
+				}
+			})
+		}
+	}
+}
+
+func TestProjectTableInventoryErrorBeforeMutationIsZeroWrite(t *testing.T) {
+	inventoryErr := errors.New("simulated inventory failure")
+	operations := []struct {
+		name string
+		run  func(context.Context, CommandExecutor) error
+	}{
+		{
+			name: "apply",
+			run: func(ctx context.Context, executor CommandExecutor) error {
+				return executor.Apply(ctx, BuildNftPlan(&control.State{}))
+			},
+		},
+		{
+			name: "cleanup",
+			run: func(ctx context.Context, executor CommandExecutor) error {
+				return executor.Cleanup(ctx)
+			},
+		},
+	}
+	for _, ownerPresent := range []bool{false, true} {
+		ownerState := "owner-absent"
+		if ownerPresent {
+			ownerState = "owner-present"
+		}
+		for _, operation := range operations {
+			t.Run(operation.name+"/"+ownerState, func(t *testing.T) {
+				stateDir := guardTestStateDir(t)
+				if ownerPresent {
+					seedOwnerRecord(t, stateDir)
+				}
+				writes := 0
+				executor := CommandExecutor{
+					StateDir: stateDir,
+					inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+						if table != TableName {
+							t.Fatalf("unexpected owned-table inspection of %q", table)
+						}
+						return tableIdentity{}, nil
+					},
+					listTables: func(context.Context) ([]string, error) {
+						return nil, inventoryErr
+					},
+					runScript: func(context.Context, string) error {
+						writes++
+						return nil
+					},
+				}
+
+				err := operation.run(t.Context(), executor)
+				if !errors.Is(err, inventoryErr) ||
+					!strings.Contains(err.Error(), "before mutation") {
+					t.Fatalf("%s did not preserve the inventory error: %v", operation.name, err)
+				}
+				if writes != 0 {
+					t.Fatalf("%s issued %d writes after an inventory error", operation.name, writes)
+				}
+				if !ownerPresent {
+					if _, statErr := os.Lstat(filepath.Join(stateDir, OwnerRecordFileName)); !errors.Is(statErr, os.ErrNotExist) {
+						t.Fatalf("%s created an owner record after an inventory error: %v", operation.name, statErr)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestProjectTableInventoryPostconditionsFailClosed(t *testing.T) {
+	inventoryErr := errors.New("simulated postcondition inventory failure")
+	for _, operation := range []string{"apply", "cleanup"} {
+		for _, postcondition := range []string{"unexpected-table", "inventory-error"} {
+			t.Run(operation+"/"+postcondition, func(t *testing.T) {
+				stateDir := guardTestStateDir(t)
+				owner := seedOwnerRecord(t, stateDir)
+				orphan := TableName + "_cccccccccccccccccccccccccccccccc"
+				mutated := false
+				inventoryCalls := 0
+				writes := 0
+				executor := CommandExecutor{
+					StateDir: stateDir,
+					inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+						if table == TableName {
+							return tableIdentity{}, nil
+						}
+						if table != owner.Table {
+							t.Fatalf("inspected table %q, want %q", table, owner.Table)
+						}
+						if operation == "cleanup" && mutated {
+							return tableIdentity{}, nil
+						}
+						handle := uint64(81)
+						if mutated {
+							handle = 82
+						}
+						return tableIdentity{Exists: true, Handle: handle, Comment: owner.Marker}, nil
+					},
+					listTables: func(context.Context) ([]string, error) {
+						inventoryCalls++
+						if !mutated {
+							return []string{owner.Table}, nil
+						}
+						if postcondition == "inventory-error" {
+							return nil, inventoryErr
+						}
+						if operation == "apply" {
+							return []string{owner.Table, orphan}, nil
+						}
+						return []string{orphan}, nil
+					},
+					runScript: func(context.Context, string) error {
+						writes++
+						mutated = true
+						return nil
+					},
+				}
+
+				var err error
+				if operation == "apply" {
+					err = executor.Apply(t.Context(), BuildNftPlan(&control.State{}))
+				} else {
+					err = executor.Cleanup(t.Context())
+				}
+				if err == nil {
+					t.Fatalf("%s accepted failed %s postcondition", operation, postcondition)
+				}
+				if postcondition == "inventory-error" && !errors.Is(err, inventoryErr) {
+					t.Fatalf("%s did not preserve postcondition inventory error: %v", operation, err)
+				}
+				if postcondition == "unexpected-table" && !strings.Contains(err.Error(), orphan) {
+					t.Fatalf("%s did not report unexpected postcondition table: %v", operation, err)
+				}
+				if !strings.Contains(err.Error(), "verify") {
+					t.Fatalf("%s postcondition error lacks verification context: %v", operation, err)
+				}
+				if inventoryCalls != 2 {
+					t.Fatalf("%s inventory calls = %d, want 2", operation, inventoryCalls)
+				}
+				if writes != 1 {
+					t.Fatalf("%s writes = %d, want 1 completed transaction", operation, writes)
+				}
+			})
+		}
+	}
+}
+
+func TestOwnerlessCleanupRechecksEmptyPostcondition(t *testing.T) {
+	stateDir := guardTestStateDir(t)
+	orphan := TableName + "_dddddddddddddddddddddddddddddddd"
+	inventoryCalls := 0
+	executor := CommandExecutor{
+		StateDir: stateDir,
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			if table != TableName {
+				t.Fatalf("unexpected inspection of %q", table)
+			}
+			return tableIdentity{}, nil
+		},
+		listTables: func(context.Context) ([]string, error) {
+			inventoryCalls++
+			if inventoryCalls == 1 {
+				return nil, nil
+			}
+			return []string{orphan}, nil
+		},
+		runScript: func(context.Context, string) error {
+			t.Fatal("ownerless cleanup issued an nft write")
+			return nil
+		},
+	}
+	err := executor.Cleanup(t.Context())
+	if err == nil || !strings.Contains(err.Error(), orphan) ||
+		!strings.Contains(err.Error(), "verify ownerless") {
+		t.Fatalf("ownerless cleanup accepted a non-empty postcondition: %v", err)
+	}
+	if inventoryCalls != 2 {
+		t.Fatalf("ownerless cleanup inventory calls = %d, want 2", inventoryCalls)
+	}
+}
+
 func TestCleanupAllowsMissingFinalStateDirectoryUnderTrustedParent(t *testing.T) {
 	stateDir := filepath.Join(guardTestStateDir(t), "missing-final")
 	exec := CommandExecutor{
@@ -317,6 +790,9 @@ func TestCleanupAllowsMissingFinalStateDirectoryUnderTrustedParent(t *testing.T)
 				t.Fatalf("unexpected inspection of %q", table)
 			}
 			return tableIdentity{}, nil
+		},
+		listTables: func(context.Context) ([]string, error) {
+			return nil, nil
 		},
 		runScript: func(context.Context, string) error {
 			t.Fatal("cleanup with no owner issued an nft write")
@@ -438,7 +914,8 @@ func TestCleanupRejectsForeignMarkerWithZeroWrite(t *testing.T) {
 	owner := seedOwnerRecord(t, stateDir)
 	var scripts []string
 	exec := CommandExecutor{
-		StateDir: stateDir,
+		StateDir:   stateDir,
+		listTables: staticProjectTables(owner.Table),
 		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
 			if table == TableName {
 				return tableIdentity{}, nil
@@ -467,7 +944,8 @@ func TestApplyRejectsForeignMarkerWithZeroWrite(t *testing.T) {
 	owner := seedOwnerRecord(t, stateDir)
 	var scripts []string
 	exec := CommandExecutor{
-		StateDir: stateDir,
+		StateDir:   stateDir,
+		listTables: staticProjectTables(owner.Table),
 		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
 			if table == TableName {
 				return tableIdentity{}, nil
@@ -493,8 +971,15 @@ func TestCleanupDeletesMatchingTableByHandleAndVerifiesAbsence(t *testing.T) {
 	owner := seedOwnerRecord(t, stateDir)
 	inspections := 0
 	var scripts []string
+	deleted := false
 	exec := CommandExecutor{
 		StateDir: stateDir,
+		listTables: func(context.Context) ([]string, error) {
+			if deleted {
+				return nil, nil
+			}
+			return []string{owner.Table}, nil
+		},
 		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
 			inspections++
 			if inspections == 1 {
@@ -513,6 +998,7 @@ func TestCleanupDeletesMatchingTableByHandleAndVerifiesAbsence(t *testing.T) {
 		},
 		runScript: func(_ context.Context, script string) error {
 			scripts = append(scripts, script)
+			deleted = true
 			return nil
 		},
 	}
@@ -521,6 +1007,46 @@ func TestCleanupDeletesMatchingTableByHandleAndVerifiesAbsence(t *testing.T) {
 	}
 	if len(scripts) != 1 || scripts[0] != "delete table inet handle 52\n" {
 		t.Fatalf("cleanup scripts = %#v, want one handle-bound delete", scripts)
+	}
+}
+
+func TestCleanupReportsDeleteFailureWhenTableDisappears(t *testing.T) {
+	stateDir := guardTestStateDir(t)
+	owner := seedOwnerRecord(t, stateDir)
+	inspections := 0
+	exec := CommandExecutor{
+		StateDir:   stateDir,
+		listTables: staticProjectTables(owner.Table),
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			inspections++
+			switch inspections {
+			case 1:
+				if table != TableName {
+					t.Fatalf("first inspection = %q, want legacy table", table)
+				}
+				return tableIdentity{}, nil
+			case 2:
+				if table != owner.Table {
+					t.Fatalf("second inspection = %q, want owned table %q", table, owner.Table)
+				}
+				return tableIdentity{Exists: true, Handle: 61, Comment: owner.Marker}, nil
+			case 3:
+				if table != owner.Table {
+					t.Fatalf("third inspection = %q, want owned table %q", table, owner.Table)
+				}
+				return tableIdentity{}, nil
+			default:
+				t.Fatalf("unexpected inspection %d of %q", inspections, table)
+				return tableIdentity{}, nil
+			}
+		},
+		runScript: func(context.Context, string) error {
+			return errors.New("simulated nft transaction failure")
+		},
+	}
+	err := exec.Cleanup(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "simulated nft transaction failure") {
+		t.Fatalf("cleanup hid a failed nft transaction after the table disappeared: %v", err)
 	}
 }
 
@@ -535,6 +1061,12 @@ func seedOwnerRecord(t *testing.T, stateDir string) ownerRecord {
 		t.Fatal("test owner record unexpectedly existed")
 	}
 	return record
+}
+
+func staticProjectTables(tables ...string) func(context.Context) ([]string, error) {
+	return func(context.Context) ([]string, error) {
+		return append([]string(nil), tables...), nil
+	}
 }
 
 func writeLegacyV1OwnerRecord(t *testing.T, stateDir string) {
