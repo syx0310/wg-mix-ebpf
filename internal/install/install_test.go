@@ -15,6 +15,7 @@ import (
 
 	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
+	"github.com/syx0310/wg-mix-ebpf/internal/testutil"
 )
 
 func TestUninstallPurgeRejectsNonOwnedConfigDir(t *testing.T) {
@@ -442,5 +443,5 @@ const (
 )
 
 func TestMain(m *testing.M) {
-	os.Exit(m.Run())
+	os.Exit(testutil.RunWithPrivateUmask(m))
 }
