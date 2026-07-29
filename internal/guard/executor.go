@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"sort"
 	"strings"
 )
 
@@ -20,6 +21,7 @@ type CommandExecutor struct {
 	StateDir     string
 	runScript    func(context.Context, string) error
 	inspectTable func(context.Context, string) (tableIdentity, error)
+	listTables   func(context.Context) ([]string, error)
 }
 
 type tableIdentity struct {
@@ -43,9 +45,19 @@ func (e CommandExecutor) Apply(ctx context.Context, plan NftPlan) error {
 			TableName,
 		)
 	}
-	owner, fresh, err := e.loadOrCreateOwner()
+	owner, present, err := e.loadOwnerIfPresent()
 	if err != nil {
 		return fmt.Errorf("load guard ownership: %w", err)
+	}
+	fresh := false
+	if !present {
+		if err := e.rejectOwnerlessProjectTables(ctx); err != nil {
+			return err
+		}
+		owner, fresh, err = e.loadOrCreateOwner()
+		if err != nil {
+			return fmt.Errorf("create guard ownership: %w", err)
+		}
 	}
 	createScript, err := plan.ownedCreateScript(owner)
 	if err != nil {
@@ -55,7 +67,7 @@ func (e CommandExecutor) Apply(ctx context.Context, plan NftPlan) error {
 		if err := e.run(ctx, createScript); err != nil {
 			return fmt.Errorf("create startup guard for new installation identity: %w", err)
 		}
-		return nil
+		return e.verifyAppliedOwner(ctx, owner, 0)
 	}
 	identity, err := e.inspect(ctx, owner.Table)
 	if err != nil {
@@ -65,7 +77,7 @@ func (e CommandExecutor) Apply(ctx context.Context, plan NftPlan) error {
 		if err := e.run(ctx, createScript); err != nil {
 			return fmt.Errorf("create missing owned startup guard: %w", err)
 		}
-		return nil
+		return e.verifyAppliedOwner(ctx, owner, 0)
 	}
 	if err := requireOwnedTable(owner, identity); err != nil {
 		return err
@@ -76,6 +88,27 @@ func (e CommandExecutor) Apply(ctx context.Context, plan NftPlan) error {
 	}
 	if err := e.run(ctx, replacement); err != nil {
 		return fmt.Errorf("replace owned startup guard atomically by handle: %w", err)
+	}
+	return e.verifyAppliedOwner(ctx, owner, identity.Handle)
+}
+
+func (e CommandExecutor) verifyAppliedOwner(
+	ctx context.Context,
+	owner ownerRecord,
+	previousHandle uint64,
+) error {
+	identity, err := e.inspect(ctx, owner.Table)
+	if err != nil {
+		return fmt.Errorf("verify applied startup guard ownership: %w", err)
+	}
+	if err := requireOwnedTable(owner, identity); err != nil {
+		return fmt.Errorf("verify applied startup guard ownership: %w", err)
+	}
+	if previousHandle != 0 && identity.Handle == previousHandle {
+		return fmt.Errorf(
+			"startup guard replacement retained table handle %d; replacement postcondition was not proven",
+			previousHandle,
+		)
 	}
 	return nil
 }
@@ -96,6 +129,9 @@ func (e CommandExecutor) Cleanup(ctx context.Context) error {
 		return fmt.Errorf("load guard ownership for cleanup: %w", err)
 	}
 	if !ok {
+		if err := e.rejectOwnerlessProjectTables(ctx); err != nil {
+			return err
+		}
 		return nil
 	}
 	identity, err := e.inspect(ctx, owner.Table)
@@ -109,11 +145,21 @@ func (e CommandExecutor) Cleanup(ctx context.Context) error {
 		return err
 	}
 	if err := e.run(ctx, cleanupHandleScript(identity.Handle)); err != nil {
+		deleteErr := fmt.Errorf("delete owned startup guard by handle: %w", err)
 		after, inspectErr := e.inspect(ctx, owner.Table)
-		if inspectErr == nil && !after.Exists {
-			return nil
+		if inspectErr != nil {
+			return errors.Join(
+				deleteErr,
+				fmt.Errorf("inspect startup guard after failed cleanup: %w", inspectErr),
+			)
 		}
-		return fmt.Errorf("delete owned startup guard by handle: %w", err)
+		if !after.Exists {
+			return fmt.Errorf(
+				"startup guard table is absent after the failed cleanup command; preserving the command failure: %w",
+				deleteErr,
+			)
+		}
+		return deleteErr
 	}
 	after, err := e.inspect(ctx, owner.Table)
 	if err != nil {
@@ -123,6 +169,93 @@ func (e CommandExecutor) Cleanup(ctx context.Context) error {
 		return errors.New("startup guard table still exists after handle-based cleanup; refusing any name-based deletion")
 	}
 	return nil
+}
+
+func (e CommandExecutor) rejectOwnerlessProjectTables(ctx context.Context) error {
+	tables, err := e.projectTables(ctx)
+	if err != nil {
+		return fmt.Errorf("inventory ownerless startup guard tables: %w", err)
+	}
+	if len(tables) != 0 {
+		return fmt.Errorf(
+			"project startup guard tables %v exist without a v2 owner record; refusing mutation and requiring explicit ownership recovery",
+			tables,
+		)
+	}
+	return nil
+}
+
+func (e CommandExecutor) projectTables(ctx context.Context) ([]string, error) {
+	if e.listTables != nil {
+		return e.listTables(ctx)
+	}
+	if e.inspectTable != nil {
+		return nil, errors.New("table inventory hook is required with a custom table inspector")
+	}
+	binary := e.Binary
+	if binary == "" {
+		binary = "nft"
+	}
+	cmd := exec.CommandContext(ctx, binary, "-j", "list", "tables")
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return nil, fmt.Errorf("%s -j list tables failed: %w: %s", binary, err, string(out))
+	}
+	return parseProjectTableInventoryJSON(out)
+}
+
+func parseProjectTableInventoryJSON(data []byte) ([]string, error) {
+	var document struct {
+		Nftables []map[string]json.RawMessage `json:"nftables"`
+	}
+	if err := json.Unmarshal(data, &document); err != nil {
+		return nil, fmt.Errorf("parse nft table inventory JSON: %w", err)
+	}
+	seen := make(map[string]struct{})
+	var tables []string
+	for index, item := range document.Nftables {
+		if len(item) != 1 {
+			return nil, fmt.Errorf("nft table inventory item %d has %d object keys, want 1", index, len(item))
+		}
+		raw, isTable := item["table"]
+		if !isTable {
+			if _, isMetadata := item["metainfo"]; isMetadata {
+				continue
+			}
+			for objectType := range item {
+				return nil, fmt.Errorf(
+					"nft table inventory item %d has unexpected object type %q",
+					index,
+					objectType,
+				)
+			}
+			continue
+		}
+		var table struct {
+			Family string `json:"family"`
+			Name   string `json:"name"`
+		}
+		if err := json.Unmarshal(raw, &table); err != nil {
+			return nil, fmt.Errorf("parse nft table inventory entry: %w", err)
+		}
+		if table.Family == "" || table.Name == "" {
+			return nil, fmt.Errorf("nft table inventory item %d has an empty family or name", index)
+		}
+		if table.Family != "inet" || !isProjectTableName(table.Name) {
+			continue
+		}
+		if _, duplicate := seen[table.Name]; duplicate {
+			return nil, fmt.Errorf("nft table inventory contains duplicate inet table %s", table.Name)
+		}
+		seen[table.Name] = struct{}{}
+		tables = append(tables, table.Name)
+	}
+	sort.Strings(tables)
+	return tables, nil
+}
+
+func isProjectTableName(name string) bool {
+	return name == TableName || strings.HasPrefix(name, TableName+"_")
 }
 
 func requireOwnedTable(owner ownerRecord, identity tableIdentity) error {
