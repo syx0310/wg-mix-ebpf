@@ -294,19 +294,11 @@ failure_report() {
     printf 'sensitive recovery material (never copy as evidence): %s\n' \
       "${SECRET_DIR}" >&2
     printf 'review the marker, manifest, exact paths, and bounded inventory before recovery\n' >&2
-    printf 'suggested recovery commands (run one at a time only after review):\n' >&2
-    print_command ip netns exec "${NSA}" env "WG_MIX_EBPF_PIN_PATH=${PINA}" \
-      "${BIN}" detach --config "${SECRET_DIR}/agent-a.yaml" \
-      --isolated-netns-test \
-      --run-dir "${RUN_DIR_A}" --state-dir "${STATE_DIR_A}" >&2
-    print_command ip netns exec "${NSB}" env "WG_MIX_EBPF_PIN_PATH=${PINB}" \
-      "${BIN}" detach --config "${SECRET_DIR}/agent-b.yaml" \
-      --isolated-netns-test \
-      --run-dir "${RUN_DIR_B}" --state-dir "${STATE_DIR_B}" >&2
-    print_command ip netns delete "${NSA}" >&2
-    print_command ip netns delete "${NSR}" >&2
-    print_command ip netns delete "${NSB}" >&2
-    print_command umount "${BPFFS_DIR}" >&2
+    printf 'sealed netns identities: a=%s:%s:%s router=%s:%s:%s b=%s:%s:%s\n' \
+      "${NSA}" "${NETNS_A_DEV:-unsealed}" "${NETNS_A_INO:-unsealed}" \
+      "${NSR}" "${NETNS_R_DEV:-unsealed}" "${NETNS_R_INO:-unsealed}" \
+      "${NSB}" "${NETNS_B_DEV:-unsealed}" "${NETNS_B_INO:-unsealed}" >&2
+    printf 'no recovery mutation command is generated; use a separately committed and reviewed recovery script only after revalidating these identities\n' >&2
     printf 'do not remove files until every path is revalidated under %s/%s\n' \
       "${TEST_ROOT}" "${RUN_ID}" >&2
   fi

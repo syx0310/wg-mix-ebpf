@@ -135,6 +135,16 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
                 "kill -",
             ):
                 self.assertNotIn(forbidden, body)
+        self.assertIn(
+            "no recovery mutation command is generated",
+            failure_report,
+        )
+        for forbidden_recovery in (
+            "print_command ip netns exec",
+            "print_command ip netns delete",
+            'print_command umount "${BPFFS_DIR}"',
+        ):
+            self.assertNotIn(forbidden_recovery, failure_report)
         for line in failure_report.splitlines():
             stripped = line.strip()
             if any(
@@ -148,16 +158,7 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
                     stripped.startswith("print_command "),
                     f"failure report executes instead of printing: {stripped}",
                 )
-        search_from = 0
-        while True:
-            detach = failure_report.find('"${BIN}" detach', search_from)
-            if detach < 0:
-                break
-            self.assertIn(
-                "print_command ip netns exec",
-                failure_report[max(0, detach - 160) : detach],
-            )
-            search_from = detach + 1
+        self.assertNotIn('"${BIN}" detach', failure_report)
 
     def test_manifest_seals_shared_lifecycle_and_pin_resource_contract(self) -> None:
         for field in (
