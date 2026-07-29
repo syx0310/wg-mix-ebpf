@@ -48,11 +48,11 @@ func (e CommandExecutor) Apply(ctx context.Context, plan NftPlan) error {
 	if err != nil {
 		return fmt.Errorf("load guard ownership: %w", err)
 	}
+	if err := e.requireProjectTablePrestate(ctx, owner, present); err != nil {
+		return err
+	}
 	fresh := false
 	if !present {
-		if err := e.rejectOwnerlessProjectTables(ctx); err != nil {
-			return err
-		}
 		owner, fresh, err = e.loadOrCreateOwner()
 		if err != nil {
 			return fmt.Errorf("create guard ownership: %w", err)
@@ -109,7 +109,11 @@ func (e CommandExecutor) verifyAppliedOwner(
 			previousHandle,
 		)
 	}
-	return nil
+	return e.requireExactProjectTables(
+		ctx,
+		[]string{owner.Table},
+		"verify applied startup guard table inventory",
+	)
 }
 
 func (e CommandExecutor) Cleanup(ctx context.Context) error {
@@ -127,18 +131,26 @@ func (e CommandExecutor) Cleanup(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("load guard ownership for cleanup: %w", err)
 	}
+	if err := e.requireProjectTablePrestate(ctx, owner, ok); err != nil {
+		return err
+	}
 	if !ok {
-		if err := e.rejectOwnerlessProjectTables(ctx); err != nil {
-			return err
-		}
-		return nil
+		return e.requireExactProjectTables(
+			ctx,
+			nil,
+			"verify ownerless startup guard cleanup inventory",
+		)
 	}
 	identity, err := e.inspect(ctx, owner.Table)
 	if err != nil {
 		return fmt.Errorf("inspect startup guard ownership for cleanup: %w", err)
 	}
 	if !identity.Exists {
-		return nil
+		return e.requireExactProjectTables(
+			ctx,
+			nil,
+			"verify absent startup guard table inventory",
+		)
 	}
 	if err := requireOwnedTable(owner, identity); err != nil {
 		return err
@@ -167,21 +179,71 @@ func (e CommandExecutor) Cleanup(ctx context.Context) error {
 	if after.Exists {
 		return errors.New("startup guard table still exists after handle-based cleanup; refusing any name-based deletion")
 	}
-	return nil
+	return e.requireExactProjectTables(
+		ctx,
+		nil,
+		"verify startup guard cleanup inventory",
+	)
 }
 
-func (e CommandExecutor) rejectOwnerlessProjectTables(ctx context.Context) error {
+func (e CommandExecutor) requireProjectTablePrestate(
+	ctx context.Context,
+	owner ownerRecord,
+	ownerPresent bool,
+) error {
 	tables, err := e.projectTables(ctx)
 	if err != nil {
-		return fmt.Errorf("inventory ownerless startup guard tables: %w", err)
+		return fmt.Errorf("inventory startup guard tables before mutation: %w", err)
 	}
-	if len(tables) != 0 {
+	if !ownerPresent {
+		if len(tables) == 0 {
+			return nil
+		}
 		return fmt.Errorf(
 			"project startup guard tables %v exist without a v2 owner record; refusing mutation and requiring explicit ownership recovery",
 			tables,
 		)
 	}
-	return nil
+	if len(tables) == 0 || (len(tables) == 1 && tables[0] == owner.Table) {
+		return nil
+	}
+	return fmt.Errorf(
+		"project startup guard tables %v do not match v2 owner table %q; refusing mutation and requiring explicit ownership recovery",
+		tables,
+		owner.Table,
+	)
+}
+
+func (e CommandExecutor) requireExactProjectTables(
+	ctx context.Context,
+	want []string,
+	operation string,
+) error {
+	tables, err := e.projectTables(ctx)
+	if err != nil {
+		return fmt.Errorf("%s: %w", operation, err)
+	}
+	if equalStrings(tables, want) {
+		return nil
+	}
+	return fmt.Errorf(
+		"%s: project startup guard tables = %v, want %v",
+		operation,
+		tables,
+		want,
+	)
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func (e CommandExecutor) projectTables(ctx context.Context) ([]string, error) {
