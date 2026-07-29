@@ -289,8 +289,13 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 		return nil, err
 	}
 	defer func() {
-		if err := initialCleanup.close(); err != nil {
-			retErr = errors.Join(retErr, fmt.Errorf("close initial uninstall preflight handles: %w", err))
+		if initialCleanup != nil {
+			if err := initialCleanup.close(); err != nil {
+				retErr = errors.Join(
+					retErr,
+					fmt.Errorf("close initial uninstall preflight handles: %w", err),
+				)
+			}
 		}
 	}()
 	ownsResources := initialCleanup.manifest.Product == cleanupManifestProduct
@@ -323,37 +328,100 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	if opts.DryRun {
 		return plan, nil
 	}
-	if err := initialCleanup.revalidate(); err != nil {
-		return nil, fmt.Errorf("revalidate all uninstall targets before service stop: %w", err)
+	if err := initialCleanup.close(); err != nil {
+		return nil, fmt.Errorf("close initial uninstall preflight handles: %w", err)
 	}
-	switch system {
-	case "systemd":
-		unit, _, unitExists, err := initialCleanup.serviceArtifactEntry("systemd-unit")
-		if err != nil {
-			return nil, err
-		}
-		if unitExists {
-			if err := runCommand(ctx, "systemctl", "stop", "wg-mix-ebpf.service"); err != nil {
-				return nil, err
-			}
-		}
-		if unit != nil {
-			if err := runCommand(ctx, "systemctl", "disable", "wg-mix-ebpf.service"); err != nil {
-				return nil, err
-			}
-		}
-	case "openwrt":
-		if err := runOpenWrtServiceActions(ctx, initialCleanup, "stop", "disable"); err != nil {
-			return nil, err
-		}
-	}
+	initialCleanup = nil
 	owner := lockfile.LifecycleOwner{
 		PID:        os.Getpid(),
 		Action:     "uninstall",
 		ConfigPath: paths.ConfigPath,
 		RunDir:     paths.RunDir,
 	}
-	if err := lockfile.WithLifecycle(ctx, nil, owner, func(lease *lockfile.LifecycleLease) (retErr error) {
+	maintenance, err := lockfile.BeginLifecycleMaintenance(ctx, owner)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if maintenance != nil {
+			retErr = errors.Join(retErr, maintenance.Close())
+		}
+	}()
+
+	serviceStopPlan, err := prepareUninstallCleanup(
+		paths,
+		system,
+		opts.Purge,
+		lockfile.LifecycleLeasePath(ctx),
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"repeat uninstall preflight after maintenance acquisition: %w",
+			err,
+		)
+	}
+	defer func() {
+		if serviceStopPlan != nil {
+			if err := serviceStopPlan.close(); err != nil {
+				retErr = errors.Join(
+					retErr,
+					fmt.Errorf("close service-stop cleanup handles: %w", err),
+				)
+			}
+		}
+	}()
+	if err := serviceStopPlan.revalidate(); err != nil {
+		return nil, fmt.Errorf(
+			"revalidate all uninstall targets before service stop: %w",
+			err,
+		)
+	}
+	switch system {
+	case "systemd":
+		_, _, unitExists, err := serviceStopPlan.serviceArtifactEntry("systemd-unit")
+		if err != nil {
+			return nil, err
+		}
+		if unitExists {
+			if err := verifySystemdServiceFragment(ctx, paths); err != nil {
+				return nil, err
+			}
+			if err := runCommand(ctx, "systemctl", "stop", "wg-mix-ebpf.service"); err != nil {
+				return nil, err
+			}
+			if err := runCommand(ctx, "systemctl", "disable", "wg-mix-ebpf.service"); err != nil {
+				return nil, err
+			}
+		}
+	case "openwrt":
+		if err := runOpenWrtServiceActions(
+			ctx,
+			serviceStopPlan,
+			"stop",
+			"disable",
+		); err != nil {
+			return nil, err
+		}
+	}
+	if err := serviceStopPlan.close(); err != nil {
+		return nil, fmt.Errorf("close service-stop cleanup handles: %w", err)
+	}
+	serviceStopPlan = nil
+
+	lease, err := maintenance.WaitAcquireLifecycle(ctx, owner)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"wait for daemon lifecycle handoff after verified service stop: %w",
+			err,
+		)
+	}
+	defer func() {
+		if lease != nil {
+			retErr = errors.Join(retErr, lease.Close())
+		}
+	}()
+
+	if err := func() (retErr error) {
 		preStopPlan, err := prepareUninstallCleanup(
 			paths,
 			system,
@@ -445,7 +513,7 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 			return fmt.Errorf("execute descriptor-anchored uninstall cleanup: %w", err)
 		}
 		return nil
-	}); err != nil {
+	}(); err != nil {
 		return nil, err
 	}
 	return plan, nil
@@ -721,6 +789,41 @@ func runCommand(ctx context.Context, name string, args ...string) error {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("%s %s failed: %w: %s", name, strings.Join(args, " "), err, string(out))
+	}
+	return nil
+}
+
+func verifySystemdServiceFragment(ctx context.Context, paths paths) error {
+	expected := filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service")
+	if !filepath.IsAbs(expected) || filepath.Clean(expected) != expected {
+		return fmt.Errorf(
+			"refuse systemd service verification for non-clean unit path %q",
+			expected,
+		)
+	}
+	args := []string{
+		"show",
+		"--property=FragmentPath",
+		"--value",
+		"wg-mix-ebpf.service",
+	}
+	cmd := exec.CommandContext(ctx, "systemctl", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"systemctl %s failed while verifying owned service: %w: %s",
+			strings.Join(args, " "),
+			err,
+			string(out),
+		)
+	}
+	actual := strings.TrimSpace(string(out))
+	if actual != expected {
+		return fmt.Errorf(
+			"refuse to stop systemd service: FragmentPath %q does not match owned unit %q",
+			actual,
+			expected,
+		)
 	}
 	return nil
 }

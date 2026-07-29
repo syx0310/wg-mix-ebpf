@@ -107,7 +107,7 @@ func TestInstallRejectsHeldGlobalLifecycleLeaseBeforeWrites(t *testing.T) {
 	}
 }
 
-func TestUninstallRejectsHeldGlobalLifecycleLeaseBeforeCleanup(t *testing.T) {
+func TestUninstallRejectsHeldMaintenanceGateBeforeCleanup(t *testing.T) {
 	layout := newCleanupTestLayout(t, "uninstall-held")
 	attachStatePath := attachstate.Path(layout.VarLibDir)
 	if err := attachstate.Save(layout.VarLibDir, &attachstate.State{
@@ -119,31 +119,148 @@ func TestUninstallRejectsHeldGlobalLifecycleLeaseBeforeCleanup(t *testing.T) {
 	setCleanupTestEnvironment(t, layout)
 
 	lifecycleRoot := t.TempDir()
-	ctx := lockfile.WithLifecyclePathsForTest(
-		t.Context(),
-		filepath.Join(lifecycleRoot, "daemon.lease"),
-		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	lifecyclePath := filepath.Join(lifecycleRoot, "daemon.lease")
+	maintenancePath := filepath.Join(lifecycleRoot, "maintenance.gate")
+	held, err := lockfile.BeginLifecycleMaintenanceAt(
+		lifecyclePath,
+		maintenancePath,
+		lockfile.LifecycleOwner{PID: os.Getpid(), Action: "other-maintenance"},
 	)
-	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
-		PID:    os.Getpid(),
-		Action: "daemon",
-		RunDir: "/run/real-daemon",
-	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer lease.Close()
+	defer held.Close()
+	waitCtx, cancel := context.WithTimeout(t.Context(), 250*time.Millisecond)
+	defer cancel()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		waitCtx,
+		lifecyclePath,
+		maintenancePath,
+	)
 
 	_, err = Uninstall(ctx, Options{
 		ConfigPath: layout.ConfigPath,
 		System:     "unknown",
 		Yes:        true,
 	})
-	if !errors.Is(err, lockfile.ErrLifecycleLeaseHeld) {
-		t.Fatalf("uninstall error = %v, want held lifecycle lease", err)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("uninstall error = %v, want bounded maintenance wait", err)
 	}
 	if _, err := os.Stat(attachStatePath); err != nil {
 		t.Fatalf("uninstall cleaned state before acquiring lifecycle ownership: %v", err)
+	}
+}
+
+func TestUninstallHoldsMaintenanceAcrossDaemonLeaseHandoff(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(t, "uninstall-handoff", "systemd")
+	if err := attachstate.Save(layout.VarLibDir, &attachstate.State{
+		Version:    1,
+		ConfigPath: layout.ConfigPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	setCleanupTestEnvironment(t, layout)
+	installFakeNft(t, "")
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "")
+
+	lifecycleRoot := t.TempDir()
+	waitCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		waitCtx,
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
+		PID:    os.Getpid(),
+		Action: "daemon",
+		RunDir: layout.RunDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+
+	releaseDone := make(chan struct{})
+	go func() {
+		defer close(releaseDone)
+		ticker := time.NewTicker(5 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-waitCtx.Done():
+				return
+			case <-ticker.C:
+				data, readErr := os.ReadFile(commandLog)
+				if readErr == nil &&
+					strings.Contains(string(data), "stop wg-mix-ebpf.service") {
+					_ = lease.Close()
+					return
+				}
+			}
+		}
+	}()
+
+	_, err = Uninstall(ctx, Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "systemd",
+		Yes:        true,
+	})
+	<-releaseDone
+	if err != nil {
+		t.Fatalf("uninstall failed daemon lease handoff: %v", err)
+	}
+	if _, err := os.Stat(attachstate.Path(layout.VarLibDir)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uninstall retained attach state after handoff: %v", err)
+	}
+	if _, err := os.Stat(
+		filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service"),
+	); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uninstall retained service artifact after handoff: %v", err)
+	}
+}
+
+func TestUninstallRejectsSystemdFragmentMismatchBeforeStop(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"systemd-fragment-mismatch",
+		"systemd",
+	)
+	setCleanupTestEnvironment(t, layout)
+	installFakeNft(t, "")
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "")
+	t.Setenv(
+		"WG_MIX_EBPF_TEST_SYSTEMCTL_FRAGMENT",
+		filepath.Join(t.TempDir(), "foreign.service"),
+	)
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+
+	_, err := Uninstall(ctx, Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "systemd",
+		Yes:        true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "FragmentPath") {
+		t.Fatalf("uninstall error = %v, want FragmentPath rejection", err)
+	}
+	data, readErr := os.ReadFile(commandLog)
+	if readErr == nil && strings.Contains(string(data), "stop wg-mix-ebpf.service") {
+		t.Fatalf("fragment mismatch stopped foreign service: %q", data)
+	}
+	if readErr != nil && !errors.Is(readErr, os.ErrNotExist) {
+		t.Fatal(readErr)
+	}
+	if _, statErr := os.Stat(
+		filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service"),
+	); statErr != nil {
+		t.Fatalf("fragment rejection changed owned unit: %v", statErr)
 	}
 }
 
@@ -189,7 +306,7 @@ func TestUninstallDisablesSystemdBeforeRemovingOwnedUnit(t *testing.T) {
 	}
 }
 
-func TestUninstallDisablesSystemdWhenOwnedUnitIsAlreadyAbsent(t *testing.T) {
+func TestUninstallDoesNotMutateSystemdWhenOwnedUnitIsAlreadyAbsent(t *testing.T) {
 	layout := newCleanupTestLayoutForSystem(t, "systemd-disable-absent", "systemd")
 	unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
 	if err := os.Rename(unitPath, unitPath+".already-absent"); err != nil {
@@ -219,9 +336,9 @@ func TestUninstallDisablesSystemdWhenOwnedUnitIsAlreadyAbsent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "disable wg-mix-ebpf.service\ndaemon-reload\n"
+	want := "daemon-reload\n"
 	if string(logData) != want {
-		t.Fatalf("systemctl log = %q, want absent-unit disable and reload %q", logData, want)
+		t.Fatalf("systemctl log = %q, want only manager reload %q", logData, want)
 	}
 }
 
@@ -1974,6 +2091,10 @@ func setCleanupTestEnvironment(t *testing.T, layout paths) {
 	t.Setenv(EnvSystemdDir, layout.SystemdDir)
 	t.Setenv(EnvOpenWrtInit, layout.OpenWrtInitDir)
 	t.Setenv(EnvOpenWrtHotplug, layout.OpenWrtHotplugDir)
+	t.Setenv(
+		"WG_MIX_EBPF_TEST_SYSTEMCTL_FRAGMENT",
+		filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service"),
+	)
 }
 
 func writeCleanupTestStatus(t *testing.T, layout paths) string {
@@ -2034,6 +2155,10 @@ func installFakeSystemctl(t *testing.T, commandLog string, failAction string) {
 	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_LOG", commandLog)
 	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL", failAction)
 	script := `#!/bin/sh
+if [ "$1" = "show" ]; then
+	printf '%s\n' "$WG_MIX_EBPF_TEST_SYSTEMCTL_FRAGMENT"
+	exit 0
+fi
 printf '%s\n' "$*" >> "$WG_MIX_EBPF_TEST_SYSTEMCTL_LOG"
 [ "$1" != "$WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL" ]
 `
