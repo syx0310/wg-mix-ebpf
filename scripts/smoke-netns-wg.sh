@@ -1580,31 +1580,50 @@ capture_tcp_netns_evidence() {
 }
 
 start_tcp_capture() {
+  local label="$1"
+  local capture_timeout="$2"
+
+  if [[ ! "${label}" =~ ^tcp-mtu[0-9]+-p[0-9]+-(forward|reverse|bidir)$ ||
+    ! "${capture_timeout}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: invalid per-cell TCP capture identity: ${label} timeout=${capture_timeout}" >&2
+    return 1
+  fi
   if [[ -n "${TCPDUMP_RA}" || -n "${TCPDUMP_RB}" ]]; then
     echo "error: packet capture PID already active before TCP matrix" >&2
     return 1
   fi
-  run_bounded_in_owned_netns "${NSR}" INT 30 \
+  run_bounded_in_owned_netns "${NSR}" INT "${capture_timeout}" \
     tcpdump -s 192 -c "${TCP_CAPTURE_PACKETS}" \
-    -i ra0 -w "${TMPDIR}/tcp-ra.pcap" udp \
-    >/dev/null 2>"${TMPDIR}/tcpdump-tcp-ra.log" &
+    -i ra0 -w "${TMPDIR}/${label}-ra.pcap" udp \
+    >/dev/null 2>"${TMPDIR}/${label}-tcpdump-ra.log" &
   TCPDUMP_RA=$!
   assert_process_environment_secret_free \
-    "${TCPDUMP_RA}" "tcpdump-ra" || return 1
-  run_bounded_in_owned_netns "${NSR}" INT 30 \
+    "${TCPDUMP_RA}" "tcpdump-ra-${label}" || return 1
+  run_bounded_in_owned_netns "${NSR}" INT "${capture_timeout}" \
     tcpdump -s 192 -c "${TCP_CAPTURE_PACKETS}" \
-    -i rb0 -w "${TMPDIR}/tcp-rb.pcap" udp \
-    >/dev/null 2>"${TMPDIR}/tcpdump-tcp-rb.log" &
+    -i rb0 -w "${TMPDIR}/${label}-rb.pcap" udp \
+    >/dev/null 2>"${TMPDIR}/${label}-tcpdump-rb.log" &
   TCPDUMP_RB=$!
   assert_process_environment_secret_free \
-    "${TCPDUMP_RB}" "tcpdump-rb" || return 1
+    "${TCPDUMP_RB}" "tcpdump-rb-${label}" || return 1
+  sleep 1
+  if ! kill -0 "${TCPDUMP_RA}" >/dev/null 2>&1 ||
+    ! kill -0 "${TCPDUMP_RB}" >/dev/null 2>&1; then
+    echo "error: per-cell TCP capture exited before traffic: ${label}" >&2
+    return 1
+  fi
 }
 
 finish_tcp_capture() {
+  local label="$1"
   local ra_status=0
   local rb_status=0
   local result=0
 
+  if [[ ! "${label}" =~ ^tcp-mtu[0-9]+-p[0-9]+-(forward|reverse|bidir)$ ]]; then
+    echo "error: invalid per-cell TCP capture finish identity: ${label}" >&2
+    return 1
+  fi
   if [[ -z "${TCPDUMP_RA}" || -z "${TCPDUMP_RB}" ]]; then
     echo "error: TCP packet capture PID is missing" >&2
     return 1
@@ -1621,8 +1640,8 @@ finish_tcp_capture() {
     rb_status=$?
   fi
   TCPDUMP_RB=""
-  printf 'tcp capture finish: ra exit=%s rb exit=%s\n' \
-    "${ra_status}" "${rb_status}"
+  printf 'tcp capture finish: cell=%s ra exit=%s rb exit=%s\n' \
+    "${label}" "${ra_status}" "${rb_status}"
   if ((ra_status != 0 && ra_status != 124)); then
     echo "error: TCP ra0 capture failed unexpectedly: ${ra_status}" >&2
     result="${ra_status}"
@@ -1636,10 +1655,29 @@ finish_tcp_capture() {
   return "${result}"
 }
 
-check_tcp_capture() {
+check_tcp_capture_file() {
+  local label="$1"
+  local interface="$2"
+  local pcap_path
+  local output_path
+  local log_path
   local checker_status=0
   local checker_args=()
 
+  if [[ ! "${label}" =~ ^tcp-mtu[0-9]+-p[0-9]+-(forward|reverse|bidir)$ ]]; then
+    echo "error: invalid per-cell TCP pcap identity: ${label}" >&2
+    return 1
+  fi
+  case "${interface}" in
+    ra | rb) ;;
+    *)
+      echo "error: invalid TCP pcap interface label: ${interface}" >&2
+      return 1
+      ;;
+  esac
+  pcap_path="${TMPDIR}/${label}-${interface}.pcap"
+  output_path="${TMPDIR}/${label}-${interface}-pcap-check.out"
+  log_path="${TMPDIR}/${label}-${interface}-pcap-check.log"
   if ((XOR_ENABLED)); then
     checker_args=(
       --forbid-plain-standard
@@ -1657,12 +1695,12 @@ check_tcp_capture() {
     sh -c 'sleep 0.2; exec "$@"' sh \
     python3 "${ROOT}/scripts/check-wg-pcap.py" \
     "${checker_args[@]}" \
-    "${TMPDIR}/tcp-ra.pcap" "${TMPDIR}/tcp-rb.pcap" \
-    >"${TMPDIR}/tcp-pcap-check.out" \
-    2>"${TMPDIR}/tcp-pcap-check.log" &
+    "${pcap_path}" \
+    >"${output_path}" \
+    2>"${log_path}" &
   PCAP_CHECKER_PID=$!
   assert_process_environment_secret_free \
-    "${PCAP_CHECKER_PID}" "pcap-checker" || return 1
+    "${PCAP_CHECKER_PID}" "pcap-checker-${label}-${interface}" || return 1
   if wait "${PCAP_CHECKER_PID}"; then
     checker_status=0
   else
@@ -1670,12 +1708,31 @@ check_tcp_capture() {
   fi
   PCAP_CHECKER_PID=""
   if ((checker_status != 0)); then
-    echo "error: TCP pcap checker failed (${checker_status})" >&2
-    cat "${TMPDIR}/tcp-pcap-check.log" >&2
-    cat "${TMPDIR}/tcp-pcap-check.out" >&2
+    echo "error: TCP pcap checker failed for ${label}/${interface} (${checker_status})" >&2
+    cat "${log_path}" >&2
+    cat "${output_path}" >&2
     return "${checker_status}"
   fi
-  cat "${TMPDIR}/tcp-pcap-check.out"
+  cat "${output_path}"
+}
+
+check_tcp_capture() {
+  local label="$1"
+  local interface
+  local status
+  local result=0
+
+  for interface in ra rb; do
+    if check_tcp_capture_file "${label}" "${interface}"; then
+      :
+    else
+      status=$?
+      if ((result == 0)); then
+        result="${status}"
+      fi
+    fi
+  done
+  return "${result}"
 }
 
 tcp_server_listening() {
@@ -1710,6 +1767,9 @@ exercise_tcp_run() {
   local server_log="${TMPDIR}/${label}-server.log"
   local server_status=0
   local client_status=0
+  local capture_status=0
+  local pcap_status=0
+  local capture_timeout="$((TCP_DURATION + 5))"
   local ready=0
   local attempt
   local client_direction_args=()
@@ -1748,6 +1808,7 @@ exercise_tcp_run() {
     return 1
   fi
 
+  start_tcp_capture "${label}" "${capture_timeout}" || return 1
   run_bounded_in_owned_netns \
     "${NSA}" TERM "$((TCP_DURATION + 15))" \
     iperf3 -c 10.77.0.2 -p "${TCP_PORT}" \
@@ -1768,22 +1829,42 @@ exercise_tcp_run() {
     echo "bounded iperf3 server left for timeout: pid=${TCP_SERVER_PID}" >&2
     cat "${client_log}" >&2
     [[ ! -s "${client_path}" ]] || cat "${client_path}" >&2
+  else
+    if wait "${TCP_SERVER_PID}"; then
+      server_status=0
+    else
+      server_status=$?
+    fi
+    TCP_SERVER_PID=""
+    if ((server_status != 0)); then
+      echo "error: iperf3 server failed for ${label} (${server_status})" >&2
+      cat "${server_log}" >&2
+      [[ ! -s "${server_path}" ]] || cat "${server_path}" >&2
+    fi
+  fi
+
+  if finish_tcp_capture "${label}"; then
+    capture_status=0
+  else
+    capture_status=$?
+  fi
+  if check_tcp_capture "${label}"; then
+    pcap_status=0
+  else
+    pcap_status=$?
+  fi
+  if ((client_status != 0)); then
     return "${client_status}"
   fi
-
-  if wait "${TCP_SERVER_PID}"; then
-    server_status=0
-  else
-    server_status=$?
-  fi
-  TCP_SERVER_PID=""
   if ((server_status != 0)); then
-    echo "error: iperf3 server failed for ${label} (${server_status})" >&2
-    cat "${server_log}" >&2
-    [[ ! -s "${server_path}" ]] || cat "${server_path}" >&2
     return "${server_status}"
   fi
-
+  if ((capture_status != 0)); then
+    return "${capture_status}"
+  fi
+  if ((pcap_status != 0)); then
+    return "${pcap_status}"
+  fi
   env -u XOR_PASSWORD python3 "${IPERF_CHECKER_HELPER}" \
     "${client_path}" \
     --direction "${direction}" \
@@ -1803,11 +1884,8 @@ exercise_tcp_matrix() {
   local after_path
   local run_status
   local evidence_status
-  local capture_status
-  local pcap_status
 
   capture_tcp_netns_evidence before
-  start_tcp_capture
   for mtu in "${TCP_MTU_VALUES[@]}"; do
     validate_all_netns_identities
     run_in_owned_netns "${NSA}" ip link set wg0 mtu "${mtu}"
@@ -1886,33 +1964,17 @@ exercise_tcp_matrix() {
     done
     if ((run_status != 0)); then
       evidence_status=0
-      capture_status=0
-      pcap_status=0
       if capture_tcp_netns_evidence failure; then
         :
       else
         evidence_status=$?
         echo "error: TCP failure-state evidence capture also failed (${evidence_status})" >&2
       fi
-      if finish_tcp_capture; then
-        :
-      else
-        capture_status=$?
-        echo "error: TCP packet capture finalization also failed (${capture_status})" >&2
-      fi
-      if check_tcp_capture; then
-        :
-      else
-        pcap_status=$?
-        echo "error: TCP packet validation also failed (${pcap_status})" >&2
-      fi
-      echo "error: TCP matrix failed for mtu=${mtu}; retained client/server JSON, logs, and before/after status evidence under ${TMPDIR}" >&2
+      echo "error: TCP matrix failed for mtu=${mtu}; retained per-cell pcaps, client/server JSON, logs, and before/after status evidence under ${TMPDIR}" >&2
       return "${run_status}"
     fi
   done
   capture_tcp_netns_evidence after
-  finish_tcp_capture
-  check_tcp_capture
 }
 
 exercise_udp_zero_checksum() {

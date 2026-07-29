@@ -125,10 +125,12 @@ type, length, fragment, IPv6 extension, checksum, load/store, rule-miss, and
 XOR error counters must remain unchanged. GSO counters are reported by
 default; `TCP_GSO_CHECKS=enforce` additionally requires managed/listener hits
 and successful rewrites in both directions. The TCP load starts only after
-the initial packet-capture validation finishes. A separate TCP capture is
-limited to 4096 packets per router-side interface with a 192-byte snap length,
-so transport type-word evidence is retained without an unbounded
-high-volume pcap artifact.
+the initial packet-capture validation finishes. Every MTU, stream-count, and
+direction cell has separate router-side captures for `ra0` and `rb0`. Each
+capture is limited to 4096 packets with a 192-byte snap length and a timeout
+derived from that cell's duration. The checker validates each interface file
+independently, so one interface or an earlier cell cannot satisfy another
+cell's transport type-word requirement.
 
 Direct script callers can select the same gate and tune it for slower test
 hosts:

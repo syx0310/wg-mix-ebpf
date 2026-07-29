@@ -318,6 +318,16 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertIn("reverse) client_direction_args=(-R) ;;", run)
         self.assertIn("bidir) client_direction_args=(--bidir) ;;", run)
         self.assertIn('"${IPERF_CHECKER_HELPER}"', run)
+        self.assertIn(
+            'local capture_timeout="$((TCP_DURATION + 5))"',
+            run,
+        )
+        self.assertIn(
+            'start_tcp_capture "${label}" "${capture_timeout}"',
+            run,
+        )
+        self.assertIn('finish_tcp_capture "${label}"', run)
+        self.assertIn('check_tcp_capture "${label}"', run)
         for option in (
             "--direction",
             "--streams",
@@ -378,14 +388,24 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertIn('rb_status != 0 && rb_status != 124', evidence)
         self.assertIn("--require-xor-mixed transport", evidence)
         self.assertIn("--require-mixed transport", evidence)
-        self.assertIn('"${TMPDIR}/tcp-ra.pcap"', evidence)
-        self.assertIn('"${TMPDIR}/tcp-rb.pcap"', evidence)
+        self.assertIn('"${TMPDIR}/${label}-ra.pcap"', evidence)
+        self.assertIn('"${TMPDIR}/${label}-rb.pcap"', evidence)
+        self.assertIn('for interface in ra rb; do', evidence)
+        self.assertIn('"${pcap_path}"', evidence)
+        self.assertNotIn(
+            '"${TMPDIR}/${label}-ra.pcap" '
+            '"${TMPDIR}/${label}-rb.pcap"',
+            evidence,
+        )
+        self.assertIn(
+            'run_bounded_in_owned_netns "${NSR}" INT "${capture_timeout}"',
+            evidence,
+        )
+        self.assertNotIn("start_tcp_capture", matrix)
+        self.assertNotIn("finish_tcp_capture", matrix)
+        self.assertNotIn("check_tcp_capture", matrix)
         self.assertLess(
             matrix.index("capture_tcp_netns_evidence before"),
-            matrix.index("start_tcp_capture"),
-        )
-        self.assertLess(
-            matrix.index("start_tcp_capture"),
             matrix.index('for mtu in "${TCP_MTU_VALUES[@]}"; do'),
         )
         self.assertLess(
