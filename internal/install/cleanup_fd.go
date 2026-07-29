@@ -56,16 +56,20 @@ func (id cleanupIdentity) sameDirectory(other cleanupIdentity) bool {
 }
 
 func (id cleanupIdentity) sameRegularFile(other cleanupIdentity) bool {
+	return id.sameRegularFileObject(other) &&
+		id.ChangeSec == other.ChangeSec &&
+		id.ChangeNsec == other.ChangeNsec &&
+		id.ModifySec == other.ModifySec &&
+		id.ModifyNsec == other.ModifyNsec
+}
+
+func (id cleanupIdentity) sameRegularFileObject(other cleanupIdentity) bool {
 	return id.sameObject(other) &&
 		id.UID == other.UID &&
 		id.GID == other.GID &&
 		id.Mode&0o7777 == other.Mode&0o7777 &&
 		id.Links == other.Links &&
-		id.Size == other.Size &&
-		id.ChangeSec == other.ChangeSec &&
-		id.ChangeNsec == other.ChangeNsec &&
-		id.ModifySec == other.ModifySec &&
-		id.ModifyNsec == other.ModifyNsec
+		id.Size == other.Size
 }
 
 func (id cleanupIdentity) validateDirectory(path string, owner uint32) error {

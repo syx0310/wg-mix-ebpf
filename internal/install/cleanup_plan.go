@@ -198,9 +198,10 @@ func (directory *cleanupDirectoryPlan) close() error {
 }
 
 type uninstallCleanupPlan struct {
-	directories   []*cleanupDirectoryPlan
-	manifest      cleanupManifest
-	beforeExecute func() error
+	directories      []*cleanupDirectoryPlan
+	manifest         cleanupManifest
+	beforeExecute    func() error
+	beforeQuarantine func(string) error
 }
 
 func (plan *uninstallCleanupPlan) close() error {
@@ -864,7 +865,7 @@ func (plan *uninstallCleanupPlan) execute() error {
 		return err
 	}
 	for _, directory := range plan.directories {
-		if err := directory.remove(); err != nil {
+		if err := directory.remove(plan.beforeQuarantine); err != nil {
 			return err
 		}
 	}
@@ -881,8 +882,15 @@ func (plan *uninstallCleanupPlan) revalidate() error {
 }
 
 func (directory *cleanupDirectoryPlan) revalidate() error {
-	rootIdentity, err := cleanupIdentityAt(directory.root.parent, directory.root.name)
-	if cleanupIsNotExist(err) && directory.rootMayDisappear {
+	return directory.revalidateRootName(directory.root.name, true)
+}
+
+func (directory *cleanupDirectoryPlan) revalidateRootName(
+	rootName string,
+	allowDisappear bool,
+) error {
+	rootIdentity, err := cleanupIdentityAt(directory.root.parent, rootName)
+	if cleanupIsNotExist(err) && directory.rootMayDisappear && allowDisappear {
 		return nil
 	}
 	if err != nil {
@@ -934,8 +942,12 @@ func revalidateEntryNames(dir *cleanupDirFD, expected []*cleanupEntryPlan) error
 }
 
 func (entry *cleanupEntryPlan) revalidate() error {
-	identity, err := cleanupIdentityAt(entry.parent, entry.name)
-	if cleanupIsNotExist(err) && entry.mayDisappear {
+	return entry.revalidateName(entry.name, true)
+}
+
+func (entry *cleanupEntryPlan) revalidateName(name string, allowDisappear bool) error {
+	identity, err := cleanupIdentityAt(entry.parent, name)
+	if cleanupIsNotExist(err) && entry.mayDisappear && allowDisappear {
 		return nil
 	}
 	if err != nil {
@@ -962,7 +974,7 @@ func (entry *cleanupEntryPlan) revalidate() error {
 	if !entry.digestKnown {
 		return nil
 	}
-	file, openedIdentity, err := cleanupOpenFileAt(entry.parent, entry.name)
+	file, openedIdentity, err := cleanupOpenFileAt(entry.parent, name)
 	if err != nil {
 		return err
 	}
@@ -987,23 +999,44 @@ func (entry *cleanupEntryPlan) revalidate() error {
 	return nil
 }
 
-func (directory *cleanupDirectoryPlan) remove() error {
+func (directory *cleanupDirectoryPlan) remove(beforeQuarantine func(string) error) error {
 	if err := directory.revalidate(); err != nil {
 		return err
 	}
-	rootIdentity, err := cleanupIdentityAt(directory.root.parent, directory.root.name)
-	if cleanupIsNotExist(err) && directory.rootMayDisappear {
-		return nil
-	}
-	if err != nil {
-		return err
-	}
-	if !directory.root.identity.sameDirectory(rootIdentity) {
-		return fmt.Errorf("refuse cleanup directory %s: identity changed before removal", directory.root.spec.path)
-	}
-	for _, entry := range directory.entries {
-		if err := entry.unlink(); err != nil {
+
+	rootName := directory.root.name
+	rootMoved := false
+	if directory.removeRoot {
+		quarantineName, moved, err := directory.moveRootToQuarantine(beforeQuarantine)
+		if err != nil {
 			return err
+		}
+		if !moved {
+			return nil
+		}
+		rootName = quarantineName
+		rootMoved = true
+	}
+
+	restoreRoot := func(cause error) error {
+		if !rootMoved {
+			return cause
+		}
+		rootMoved = false
+		return errors.Join(
+			cause,
+			restoreCleanupQuarantine(
+				directory.root.parent,
+				rootName,
+				directory.root.name,
+				directory.root.spec.path,
+			),
+		)
+	}
+
+	for _, entry := range directory.entries {
+		if err := entry.unlink(beforeQuarantine); err != nil {
+			return restoreRoot(err)
 		}
 	}
 	if !directory.removeRoot {
@@ -1011,64 +1044,220 @@ func (directory *cleanupDirectoryPlan) remove() error {
 	}
 	entries, err := cleanupReadDir(directory.root.dir)
 	if err != nil {
-		return err
+		return restoreRoot(err)
 	}
 	if len(entries) != 0 {
-		return fmt.Errorf("refuse to remove non-empty managed directory %s", directory.root.spec.path)
+		return restoreRoot(fmt.Errorf("refuse to remove non-empty managed directory %s", directory.root.spec.path))
 	}
-	identity, err := cleanupIdentityAt(directory.root.parent, directory.root.name)
+	identity, err := cleanupIdentityAt(directory.root.parent, rootName)
 	if err != nil {
-		return err
+		return restoreRoot(err)
 	}
 	if !directory.root.identity.sameDirectory(identity) {
-		return fmt.Errorf("refuse cleanup directory %s: identity changed before unlinkat", directory.root.spec.path)
+		return restoreRoot(fmt.Errorf(
+			"refuse cleanup directory %s: quarantined identity changed before unlinkat",
+			directory.root.spec.path,
+		))
 	}
-	if err := cleanupUnlinkAt(directory.root.parent, directory.root.name, true); err != nil {
-		return fmt.Errorf("remove empty managed directory %s: %w", directory.root.spec.path, err)
+	if err := cleanupUnlinkAt(directory.root.parent, rootName, true); err != nil {
+		return restoreRoot(fmt.Errorf("remove empty managed directory %s: %w", directory.root.spec.path, err))
 	}
+	rootMoved = false
 	return nil
 }
 
-func (entry *cleanupEntryPlan) unlink() error {
+func (directory *cleanupDirectoryPlan) moveRootToQuarantine(
+	beforeQuarantine func(string) error,
+) (string, bool, error) {
+	quarantineName, err := newCleanupQuarantineName()
+	if err != nil {
+		return "", false, err
+	}
+	if beforeQuarantine != nil {
+		if err := beforeQuarantine(directory.root.spec.path); err != nil {
+			return "", false, err
+		}
+	}
+	err = cleanupRenameNoReplaceAt(
+		directory.root.parent,
+		directory.root.name,
+		quarantineName,
+	)
+	if cleanupIsNotExist(err) && directory.rootMayDisappear {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf(
+			"move cleanup directory %s to unique quarantine: %w",
+			directory.root.spec.path,
+			err,
+		)
+	}
+	if err := directory.revalidateRootName(quarantineName, false); err != nil {
+		return "", false, errors.Join(
+			fmt.Errorf(
+				"refuse quarantined cleanup directory %s: %w",
+				directory.root.spec.path,
+				err,
+			),
+			restoreCleanupQuarantine(
+				directory.root.parent,
+				quarantineName,
+				directory.root.name,
+				directory.root.spec.path,
+			),
+		)
+	}
+	return quarantineName, true, nil
+}
+
+func (entry *cleanupEntryPlan) unlink(beforeQuarantine func(string) error) error {
 	if !entry.remove {
 		return nil
 	}
-	// Re-read content and identity for this exact target immediately before
-	// unlinkat. The plan-wide pass above guarantees zero mutation on a late
-	// target failure; this per-entry pass narrows the final race window.
-	if err := entry.revalidate(); err != nil {
+	quarantineName, moved, err := entry.moveToQuarantine(beforeQuarantine)
+	if err != nil || !moved {
 		return err
 	}
-	identity, err := cleanupIdentityAt(entry.parent, entry.name)
-	if cleanupIsNotExist(err) && entry.mayDisappear {
-		return nil
+
+	restoreEntry := func(cause error) error {
+		return errors.Join(
+			cause,
+			restoreCleanupQuarantine(
+				entry.parent,
+				quarantineName,
+				entry.name,
+				entry.path,
+			),
+		)
 	}
+
+	if entry.directory {
+		for _, child := range entry.children {
+			if err := child.unlink(beforeQuarantine); err != nil {
+				return restoreEntry(err)
+			}
+		}
+		entries, err := cleanupReadDir(entry.dir)
+		if err != nil {
+			return restoreEntry(err)
+		}
+		if len(entries) != 0 {
+			return restoreEntry(fmt.Errorf("refuse to remove non-empty managed directory %s", entry.path))
+		}
+	}
+
+	identity, err := cleanupIdentityAt(entry.parent, quarantineName)
 	if err != nil {
-		return err
+		return restoreEntry(err)
 	}
 	sameIdentity := entry.identity.sameRegularFile(identity)
 	if entry.directory {
 		sameIdentity = entry.identity.sameDirectory(identity)
 	}
 	if !sameIdentity {
-		return fmt.Errorf("refuse managed entry %s: identity changed before unlinkat", entry.path)
+		return restoreEntry(fmt.Errorf(
+			"refuse managed entry %s: quarantined identity changed before unlinkat",
+			entry.path,
+		))
 	}
+	if err := cleanupUnlinkAt(entry.parent, quarantineName, entry.directory); err != nil {
+		return restoreEntry(fmt.Errorf("remove quarantined managed entry %s: %w", entry.path, err))
+	}
+	return nil
+}
+
+func (entry *cleanupEntryPlan) moveToQuarantine(
+	beforeQuarantine func(string) error,
+) (string, bool, error) {
+	quarantineName, err := newCleanupQuarantineName()
+	if err != nil {
+		return "", false, err
+	}
+	if beforeQuarantine != nil {
+		if err := beforeQuarantine(entry.path); err != nil {
+			return "", false, err
+		}
+	}
+	err = cleanupRenameNoReplaceAt(entry.parent, entry.name, quarantineName)
+	if cleanupIsNotExist(err) && entry.mayDisappear {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, fmt.Errorf(
+			"move managed entry %s to unique quarantine: %w",
+			entry.path,
+			err,
+		)
+	}
+	movedIdentity, err := cleanupIdentityAt(entry.parent, quarantineName)
+	if err != nil {
+		return "", false, errors.Join(
+			fmt.Errorf("inspect quarantined managed entry %s: %w", entry.path, err),
+			restoreCleanupQuarantine(
+				entry.parent,
+				quarantineName,
+				entry.name,
+				entry.path,
+			),
+		)
+	}
+	sameMovedObject := entry.identity.sameRegularFileObject(movedIdentity)
 	if entry.directory {
-		for _, child := range entry.children {
-			if err := child.unlink(); err != nil {
-				return err
-			}
-		}
-		entries, err := cleanupReadDir(entry.dir)
-		if err != nil {
-			return err
-		}
-		if len(entries) != 0 {
-			return fmt.Errorf("refuse to remove non-empty managed directory %s", entry.path)
-		}
+		sameMovedObject = entry.identity.sameDirectory(movedIdentity)
 	}
-	if err := cleanupUnlinkAt(entry.parent, entry.name, entry.directory); err != nil {
-		return fmt.Errorf("remove managed entry %s: %w", entry.path, err)
+	if !sameMovedObject {
+		return "", false, errors.Join(
+			fmt.Errorf(
+				"refuse quarantined managed entry %s: moved object identity does not match preflight",
+				entry.path,
+			),
+			restoreCleanupQuarantine(
+				entry.parent,
+				quarantineName,
+				entry.name,
+				entry.path,
+			),
+		)
+	}
+	// rename changes ctime on regular files. Adopt only the post-rename
+	// timestamp after stable inode/mount/owner/mode/link/size comparison.
+	entry.identity = movedIdentity
+	if err := entry.revalidateName(quarantineName, false); err != nil {
+		return "", false, errors.Join(
+			fmt.Errorf("refuse quarantined managed entry %s: %w", entry.path, err),
+			restoreCleanupQuarantine(
+				entry.parent,
+				quarantineName,
+				entry.name,
+				entry.path,
+			),
+		)
+	}
+	return quarantineName, true, nil
+}
+
+func newCleanupQuarantineName() (string, error) {
+	suffix, err := newCleanupInstallationID()
+	if err != nil {
+		return "", err
+	}
+	return ".wg-mix-ebpf-quarantine-" + suffix, nil
+}
+
+func restoreCleanupQuarantine(
+	parent *cleanupDirFD,
+	quarantineName string,
+	originalName string,
+	originalPath string,
+) error {
+	if err := cleanupRenameNoReplaceAt(parent, quarantineName, originalName); err != nil {
+		return fmt.Errorf(
+			"restore quarantined object for %s without overwriting; object retained at %s: %w",
+			originalPath,
+			filepath.Join(parent.path, quarantineName),
+			err,
+		)
 	}
 	return nil
 }

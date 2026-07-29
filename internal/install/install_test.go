@@ -855,6 +855,127 @@ func TestCleanupPlanRejectsSameInodeContentReplacement(t *testing.T) {
 	}
 }
 
+func TestCleanupQuarantineRestoresForeignFileSwappedAtFinalHook(t *testing.T) {
+	layout := cleanupTestPaths(t.TempDir(), "final-file-swap")
+	for _, dir := range []string{filepath.Dir(layout.ConfigPath), layout.SystemdDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := config.SaveFile(layout.ConfigPath, config.SafeTemplate()); err != nil {
+		t.Fatal(err)
+	}
+	unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+	expectedUnit := systemdUnit(layout.ConfigPath, layout.BinaryPath)
+	if err := os.WriteFile(unitPath, []byte(expectedUnit), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCleanupManifest(layout, "systemd"); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"systemd",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+
+	originalUnit := filepath.Join(t.TempDir(), "unit.original")
+	hookRan := false
+	plan.beforeQuarantine = func(path string) error {
+		if path != unitPath || hookRan {
+			return nil
+		}
+		hookRan = true
+		if err := os.Rename(unitPath, originalUnit); err != nil {
+			return err
+		}
+		return os.WriteFile(unitPath, []byte("foreign unit\n"), 0o600)
+	}
+	err = plan.execute()
+	if err == nil || !strings.Contains(err.Error(), "moved object identity") {
+		t.Fatalf("execute error = %v, want quarantined identity rejection", err)
+	}
+	if !hookRan {
+		t.Fatal("final quarantine hook did not run")
+	}
+	if data, readErr := os.ReadFile(unitPath); readErr != nil || string(data) != "foreign unit\n" {
+		t.Fatalf("foreign replacement was not restored: data=%q err=%v", data, readErr)
+	}
+	if data, readErr := os.ReadFile(originalUnit); readErr != nil || string(data) != expectedUnit {
+		t.Fatalf("original managed unit changed: data=%q err=%v", data, readErr)
+	}
+	if _, statErr := os.Stat(cleanupManifestPath(layout)); statErr != nil {
+		t.Fatalf("final swap removed ownership marker: %v", statErr)
+	}
+}
+
+func TestCleanupQuarantineRestoresForeignRootSwappedAtFinalHook(t *testing.T) {
+	layout := cleanupTestPaths(t.TempDir(), "final-root-swap")
+	for _, dir := range []string{filepath.Dir(layout.ConfigPath), layout.VarLibDir} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := config.SaveFile(layout.ConfigPath, config.SafeTemplate()); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCleanupManifest(layout, "unknown"); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"unknown",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+
+	originalStateDir := layout.VarLibDir + "-original"
+	foreignStateDir := filepath.Join(filepath.Dir(layout.VarLibDir), "foreign-state")
+	if err := os.Mkdir(foreignStateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	foreignMarker := filepath.Join(foreignStateDir, "keep")
+	if err := os.WriteFile(foreignMarker, []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hookRan := false
+	plan.beforeQuarantine = func(path string) error {
+		if path != layout.VarLibDir || hookRan {
+			return nil
+		}
+		hookRan = true
+		if err := os.Rename(layout.VarLibDir, originalStateDir); err != nil {
+			return err
+		}
+		return os.Rename(foreignStateDir, layout.VarLibDir)
+	}
+	err = plan.execute()
+	if err == nil || !strings.Contains(err.Error(), "directory identity changed") {
+		t.Fatalf("execute error = %v, want quarantined root rejection", err)
+	}
+	if !hookRan {
+		t.Fatal("final root quarantine hook did not run")
+	}
+	if data, readErr := os.ReadFile(filepath.Join(layout.VarLibDir, "keep")); readErr != nil || string(data) != "keep\n" {
+		t.Fatalf("foreign root was not restored: data=%q err=%v", data, readErr)
+	}
+	if _, statErr := os.Stat(originalStateDir); statErr != nil {
+		t.Fatalf("original managed root changed: %v", statErr)
+	}
+	if _, statErr := os.Stat(cleanupManifestPath(layout)); statErr != nil {
+		t.Fatalf("root swap removed ownership marker: %v", statErr)
+	}
+}
+
 func TestCleanupPlanRevalidatesAllTargetsBeforeFirstUnlink(t *testing.T) {
 	layout := newCleanupTestLayout(t, "late-swap")
 	statusPath := writeCleanupTestStatus(t, layout)
