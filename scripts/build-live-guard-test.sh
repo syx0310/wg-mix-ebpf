@@ -16,6 +16,9 @@ readonly STAT_BIN="/usr/bin/stat"
 readonly TAR_BIN="/usr/bin/tar"
 readonly TIMEOUT_BIN="/usr/bin/timeout"
 readonly ARCHIVE_LIMIT_BYTES=268435456
+readonly TREE_INVENTORY_LIMIT_BYTES=33554432
+readonly TREE_INVENTORY_MAX_ENTRIES=200000
+readonly BLOB_ORACLE_LIMIT_BYTES=268435456
 export PATH LC_ALL
 umask 077
 
@@ -312,6 +315,8 @@ readonly BUILD_CACHE="${output_parent}/build-cache"
 readonly MODULE_CACHE="${output_parent}/module-cache"
 readonly EMPTY_GIT_TEMPLATE="${output_parent}/empty-git-template"
 readonly ISOLATED_GIT_DIR="${output_parent}/candidate.git"
+readonly CANDIDATE_TREE_RAW="${output_parent}/candidate-tree.raw"
+readonly CANDIDATE_BLOBS_RAW="${output_parent}/candidate-blobs.raw"
 readonly CANDIDATE_ARCHIVE="${output_parent}/candidate.tar"
 readonly SOURCE_SNAPSHOT="${output_parent}/source-snapshot"
 for directory in \
@@ -338,8 +343,10 @@ for directory in \
 done
 
 [[ ! -e "${ISOLATED_GIT_DIR}" && ! -L "${ISOLATED_GIT_DIR}" &&
+  ! -e "${CANDIDATE_TREE_RAW}" && ! -L "${CANDIDATE_TREE_RAW}" &&
+  ! -e "${CANDIDATE_BLOBS_RAW}" && ! -L "${CANDIDATE_BLOBS_RAW}" &&
   ! -e "${CANDIDATE_ARCHIVE}" && ! -L "${CANDIDATE_ARCHIVE}" ]] || {
-  echo "error: isolated Git or candidate archive path already exists" >&2
+  echo "error: isolated Git, tree/blob oracle, or archive path already exists" >&2
   exit 1
 }
 
@@ -435,6 +442,643 @@ resolved_candidate="$("${ISOLATED_GIT_ENV[@]}" rev-parse --verify \
   echo "error: isolated Git did not resolve the exact candidate commit" >&2
   exit 1
 }
+[[ "$("${ISOLATED_GIT_ENV[@]}" rev-parse --show-object-format)" == "sha1" ]] || {
+  echo "error: live guard tree oracle requires the SHA-1 Git object format" >&2
+  exit 1
+}
+readonly ISOLATED_INFO_ATTRIBUTES="${ISOLATED_GIT_DIR}/info/attributes"
+[[ ! -e "${ISOLATED_INFO_ATTRIBUTES}" &&
+  ! -L "${ISOLATED_INFO_ATTRIBUTES}" ]] || {
+  echo "error: isolated Git info/attributes must not exist" >&2
+  exit 1
+}
+
+readonly TREE_INVENTORY_PYTHON='import os
+import sys
+
+destination = sys.argv[1]
+byte_limit = int(sys.argv[2], 10)
+entry_limit = int(sys.argv[3], 10)
+if byte_limit <= 0 or entry_limit <= 0:
+    print("error: raw Git tree inventory limits must be positive", file=sys.stderr)
+    raise SystemExit(1)
+
+flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+try:
+    destination_fd = os.open(destination, flags, 0o600)
+except OSError as error:
+    print(f"error: cannot create raw Git tree inventory: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+
+def parse_inventory(payload):
+    if not payload or payload[-1:] != b"\0":
+        raise RuntimeError("raw Git tree inventory is empty or not NUL-terminated")
+    records = payload[:-1].split(b"\0")
+    if not records or any(not record for record in records):
+        raise RuntimeError("raw Git tree inventory contains an empty record")
+    if len(records) > entry_limit:
+        raise RuntimeError(
+            f"raw Git tree inventory exceeds {entry_limit} entries"
+        )
+
+    entries = {}
+    tree_count = 0
+    blob_count = 0
+    for record in records:
+        try:
+            header, path = record.split(b"\t", 1)
+        except ValueError as error:
+            raise RuntimeError(
+                "raw Git tree inventory record has no path separator"
+            ) from error
+        fields = header.split(b" ")
+        if len(fields) != 3 or any(not field for field in fields):
+            raise RuntimeError("raw Git tree inventory header is malformed")
+        mode, object_type, object_id = fields
+        if (
+            len(object_id) != 40
+            or any(byte not in b"0123456789abcdef" for byte in object_id)
+        ):
+            raise RuntimeError("raw Git tree inventory object id is invalid")
+        components = path.split(b"/")
+        if (
+            not path
+            or path.startswith(b"/")
+            or len(path) > 4096
+            or any(
+                component in (b"", b".", b"..") or len(component) > 255
+                for component in components
+            )
+        ):
+            raise RuntimeError(f"unsafe raw Git tree path: {path!r}")
+        if path in entries:
+            raise RuntimeError(f"duplicate raw Git tree path: {path!r}")
+
+        if mode == b"040000" and object_type == b"tree":
+            tree_count += 1
+        elif mode in (b"100644", b"100755") and object_type == b"blob":
+            blob_count += 1
+        else:
+            mode_text = mode.decode("ascii", "replace")
+            object_type_text = object_type.decode("ascii", "replace")
+            raise RuntimeError(
+                f"forbidden Git tree entry mode={mode_text} "
+                f"type={object_type_text} path={path!r}"
+            )
+        entries[path] = (mode, object_type, object_id)
+
+    for path in entries:
+        components = path.split(b"/")
+        for component_count in range(1, len(components)):
+            parent = b"/".join(components[:component_count])
+            parent_entry = entries.get(parent)
+            if (
+                parent_entry is None
+                or parent_entry[0] != b"040000"
+                or parent_entry[1] != b"tree"
+            ):
+                raise RuntimeError(
+                    f"raw Git tree parent is missing or not a tree: {parent!r}"
+                )
+    return len(entries), tree_count, blob_count
+
+
+payload = bytearray()
+total = 0
+failed = False
+try:
+    while True:
+        chunk = sys.stdin.buffer.read(min(1024 * 1024, byte_limit - total + 1))
+        if not chunk:
+            break
+        if total + len(chunk) > byte_limit:
+            raise RuntimeError(
+                f"raw Git tree inventory exceeds {byte_limit} byte hard limit"
+            )
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination_fd, view)
+            if written <= 0:
+                raise RuntimeError(
+                    "short write while creating raw Git tree inventory"
+                )
+            view = view[written:]
+        payload.extend(chunk)
+        total += len(chunk)
+    os.fsync(destination_fd)
+    entry_count, tree_count, blob_count = parse_inventory(bytes(payload))
+except (OSError, RuntimeError, ValueError) as error:
+    print(f"error: {error}", file=sys.stderr)
+    failed = True
+finally:
+    os.close(destination_fd)
+
+if failed:
+    raise SystemExit(1)
+print(
+    f"candidate_tree_inventory entries={entry_count} "
+    f"trees={tree_count} blobs={blob_count} bytes={total}"
+)
+'
+
+TREE_INVENTORY_ARGV=(
+  "${TIMEOUT_BIN}"
+  --signal=TERM
+  --kill-after=5s
+  2m
+  "${ISOLATED_GIT_ENV[@]}"
+  ls-tree
+  -r
+  -t
+  -z
+  --full-tree
+  "${CANDIDATE_COMMIT}"
+)
+readonly -a TREE_INVENTORY_ARGV
+TREE_INVENTORY_VALIDATE_ARGV=(
+  "${TIMEOUT_BIN}"
+  --signal=TERM
+  --kill-after=5s
+  2m
+  "${ENV_BIN}"
+  -i
+  "PATH=${PATH}"
+  "LC_ALL=${LC_ALL}"
+  "HOME=${BUILD_HOME}"
+  "TMPDIR=${BUILD_TMP}"
+  "${PYTHON3_BIN}"
+  -I
+  -B
+  -c
+  "${TREE_INVENTORY_PYTHON}"
+  "${CANDIDATE_TREE_RAW}"
+  "${TREE_INVENTORY_LIMIT_BYTES}"
+  "${TREE_INVENTORY_MAX_ENTRIES}"
+)
+readonly -a TREE_INVENTORY_VALIDATE_ARGV
+print_argv "candidate_tree_inventory_start" "${TREE_INVENTORY_ARGV[@]}"
+print_argv \
+  "candidate_tree_inventory_validate" "${TREE_INVENTORY_VALIDATE_ARGV[@]}"
+set +e
+"${TREE_INVENTORY_ARGV[@]}" | "${TREE_INVENTORY_VALIDATE_ARGV[@]}"
+tree_inventory_pipeline_status=("${PIPESTATUS[@]}")
+set -e
+if ((${#tree_inventory_pipeline_status[@]} != 2)) ||
+  [[ "${tree_inventory_pipeline_status[0]}" != "0" ||
+    "${tree_inventory_pipeline_status[1]}" != "0" ]]; then
+  printf 'error: raw Git tree inventory pipeline failed: producer=%s validator=%s\n' \
+    "${tree_inventory_pipeline_status[0]:-missing}" \
+    "${tree_inventory_pipeline_status[1]:-missing}" >&2
+  exit 1
+fi
+read -r tree_uid tree_mode tree_links tree_size tree_kind < <(
+  "${STAT_BIN}" -c '%u %a %h %s %F' -- "${CANDIDATE_TREE_RAW}"
+)
+[[ "${tree_uid}" == "${EUID}" && "${tree_mode}" == "600" &&
+  "${tree_links}" == "1" && "${tree_size}" -gt 0 &&
+  "${tree_size}" -le "${TREE_INVENTORY_LIMIT_BYTES}" &&
+  "${tree_kind}" == "regular file" ]] || {
+  echo "error: raw Git tree inventory metadata is unsafe" >&2
+  exit 1
+}
+"${CHMOD_BIN}" 0400 -- "${CANDIDATE_TREE_RAW}"
+[[ "$("${STAT_BIN}" -c '%a' -- "${CANDIDATE_TREE_RAW}")" == "400" ]] || {
+  echo "error: raw Git tree inventory did not become read-only" >&2
+  exit 1
+}
+[[ ! -e "${ISOLATED_INFO_ATTRIBUTES}" &&
+  ! -L "${ISOLATED_INFO_ATTRIBUTES}" ]] || {
+  echo "error: isolated Git info/attributes appeared during tree inventory" >&2
+  exit 1
+}
+
+readonly BLOB_QUERY_PYTHON='import os
+import stat
+import sys
+
+inventory_path = sys.argv[1]
+byte_limit = int(sys.argv[2], 10)
+entry_limit = int(sys.argv[3], 10)
+expected_uid = os.geteuid()
+
+inventory_fd = os.open(
+    inventory_path,
+    os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+)
+try:
+    before = os.fstat(inventory_fd)
+    if (
+        stat.S_IFMT(before.st_mode) != stat.S_IFREG
+        or before.st_uid != expected_uid
+        or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) != 0o400
+        or before.st_size <= 0
+        or before.st_size > byte_limit
+    ):
+        raise RuntimeError("raw Git tree inventory metadata is unsafe")
+    payload = bytearray()
+    while True:
+        chunk = os.read(
+            inventory_fd,
+            min(1024 * 1024, byte_limit - len(payload) + 1),
+        )
+        if not chunk:
+            break
+        payload.extend(chunk)
+        if len(payload) > byte_limit:
+            raise RuntimeError("raw Git tree inventory exceeds its byte limit")
+    after = os.fstat(inventory_fd)
+    identity_before = (
+        before.st_dev,
+        before.st_ino,
+        before.st_uid,
+        before.st_nlink,
+        before.st_mode,
+        before.st_size,
+    )
+    identity_after = (
+        after.st_dev,
+        after.st_ino,
+        after.st_uid,
+        after.st_nlink,
+        after.st_mode,
+        after.st_size,
+    )
+    if identity_before != identity_after or len(payload) != before.st_size:
+        raise RuntimeError("raw Git tree inventory changed while reading")
+finally:
+    os.close(inventory_fd)
+
+if not payload or payload[-1:] != b"\0":
+    raise RuntimeError("raw Git tree inventory is not NUL-terminated")
+records = bytes(payload[:-1]).split(b"\0")
+if (
+    not records
+    or any(not record for record in records)
+    or len(records) > entry_limit
+):
+    raise RuntimeError("raw Git tree inventory record count is invalid")
+
+object_ids = set()
+for record in records:
+    header, path = record.split(b"\t", 1)
+    fields = header.split(b" ")
+    if len(fields) != 3:
+        raise RuntimeError("raw Git tree inventory header is malformed")
+    mode, object_type, object_id = fields
+    if (
+        len(object_id) != 40
+        or any(byte not in b"0123456789abcdef" for byte in object_id)
+    ):
+        raise RuntimeError("raw Git tree inventory object id is invalid")
+    if mode == b"040000" and object_type == b"tree":
+        continue
+    if mode not in (b"100644", b"100755") or object_type != b"blob":
+        raise RuntimeError(f"raw Git tree inventory type is forbidden at {path!r}")
+    object_ids.add(object_id)
+
+if not object_ids:
+    raise RuntimeError("raw Git tree inventory contains no blobs")
+for object_id in sorted(object_ids):
+    sys.stdout.buffer.write(object_id + b"\n")
+sys.stdout.buffer.flush()
+print(f"candidate_blob_queries unique={len(object_ids)}", file=sys.stderr)
+'
+
+readonly BLOB_ORACLE_LIMIT_PYTHON='import os
+import sys
+
+destination = sys.argv[1]
+limit = int(sys.argv[2], 10)
+if limit <= 0:
+    print("error: candidate blob oracle limit must be positive", file=sys.stderr)
+    raise SystemExit(1)
+
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW
+try:
+    destination_fd = os.open(destination, flags, 0o600)
+except OSError as error:
+    print(f"error: cannot create candidate blob oracle: {error}", file=sys.stderr)
+    raise SystemExit(1)
+
+total = 0
+failed = False
+try:
+    while True:
+        chunk = sys.stdin.buffer.read(min(1024 * 1024, limit - total + 1))
+        if not chunk:
+            break
+        if total + len(chunk) > limit:
+            raise RuntimeError(
+                f"candidate blob oracle exceeds {limit} byte hard limit"
+            )
+        view = memoryview(chunk)
+        while view:
+            written = os.write(destination_fd, view)
+            if written <= 0:
+                raise RuntimeError("short write while creating candidate blob oracle")
+            view = view[written:]
+        total += len(chunk)
+    os.fsync(destination_fd)
+except (OSError, RuntimeError) as error:
+    print(f"error: {error}", file=sys.stderr)
+    failed = True
+finally:
+    os.close(destination_fd)
+
+if failed:
+    raise SystemExit(1)
+print(f"candidate_blob_oracle_written bytes={total}")
+'
+
+BLOB_QUERY_ARGV=(
+  "${TIMEOUT_BIN}"
+  --signal=TERM
+  --kill-after=5s
+  2m
+  "${ENV_BIN}"
+  -i
+  "PATH=${PATH}"
+  "LC_ALL=${LC_ALL}"
+  "HOME=${BUILD_HOME}"
+  "TMPDIR=${BUILD_TMP}"
+  "${PYTHON3_BIN}"
+  -I
+  -B
+  -c
+  "${BLOB_QUERY_PYTHON}"
+  "${CANDIDATE_TREE_RAW}"
+  "${TREE_INVENTORY_LIMIT_BYTES}"
+  "${TREE_INVENTORY_MAX_ENTRIES}"
+)
+readonly -a BLOB_QUERY_ARGV
+BLOB_BATCH_ARGV=(
+  "${TIMEOUT_BIN}"
+  --signal=TERM
+  --kill-after=5s
+  2m
+  "${ISOLATED_GIT_ENV[@]}"
+  cat-file
+  --batch
+)
+readonly -a BLOB_BATCH_ARGV
+BLOB_ORACLE_LIMIT_ARGV=(
+  "${TIMEOUT_BIN}"
+  --signal=TERM
+  --kill-after=5s
+  2m
+  "${ENV_BIN}"
+  -i
+  "PATH=${PATH}"
+  "LC_ALL=${LC_ALL}"
+  "HOME=${BUILD_HOME}"
+  "TMPDIR=${BUILD_TMP}"
+  "${PYTHON3_BIN}"
+  -I
+  -B
+  -c
+  "${BLOB_ORACLE_LIMIT_PYTHON}"
+  "${CANDIDATE_BLOBS_RAW}"
+  "${BLOB_ORACLE_LIMIT_BYTES}"
+)
+readonly -a BLOB_ORACLE_LIMIT_ARGV
+print_argv "candidate_blob_query_start" "${BLOB_QUERY_ARGV[@]}"
+print_argv "candidate_blob_batch_start" "${BLOB_BATCH_ARGV[@]}"
+print_argv "candidate_blob_oracle_limit" "${BLOB_ORACLE_LIMIT_ARGV[@]}"
+set +e
+"${BLOB_QUERY_ARGV[@]}" |
+  "${BLOB_BATCH_ARGV[@]}" |
+  "${BLOB_ORACLE_LIMIT_ARGV[@]}"
+blob_oracle_pipeline_status=("${PIPESTATUS[@]}")
+set -e
+if ((${#blob_oracle_pipeline_status[@]} != 3)) ||
+  [[ "${blob_oracle_pipeline_status[0]}" != "0" ||
+    "${blob_oracle_pipeline_status[1]}" != "0" ||
+    "${blob_oracle_pipeline_status[2]}" != "0" ]]; then
+  printf 'error: candidate blob oracle pipeline failed: query=%s batch=%s limiter=%s\n' \
+    "${blob_oracle_pipeline_status[0]:-missing}" \
+    "${blob_oracle_pipeline_status[1]:-missing}" \
+    "${blob_oracle_pipeline_status[2]:-missing}" >&2
+  exit 1
+fi
+read -r blobs_uid blobs_mode blobs_links blobs_size blobs_kind < <(
+  "${STAT_BIN}" -c '%u %a %h %s %F' -- "${CANDIDATE_BLOBS_RAW}"
+)
+[[ "${blobs_uid}" == "${EUID}" && "${blobs_mode}" == "600" &&
+  "${blobs_links}" == "1" && "${blobs_size}" -gt 0 &&
+  "${blobs_size}" -le "${BLOB_ORACLE_LIMIT_BYTES}" &&
+  "${blobs_kind}" == "regular file" ]] || {
+  echo "error: candidate blob oracle metadata is unsafe" >&2
+  exit 1
+}
+"${CHMOD_BIN}" 0400 -- "${CANDIDATE_BLOBS_RAW}"
+[[ "$("${STAT_BIN}" -c '%a' -- "${CANDIDATE_BLOBS_RAW}")" == "400" ]] || {
+  echo "error: candidate blob oracle did not become read-only" >&2
+  exit 1
+}
+
+readonly BLOB_ORACLE_VALIDATE_PYTHON='import hashlib
+import mmap
+import os
+import stat
+import sys
+
+inventory_path = sys.argv[1]
+blob_oracle_path = sys.argv[2]
+inventory_limit = int(sys.argv[3], 10)
+entry_limit = int(sys.argv[4], 10)
+blob_limit = int(sys.argv[5], 10)
+expected_uid = os.geteuid()
+open_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+
+
+def exact(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_nlink,
+        metadata.st_mode,
+        metadata.st_size,
+    )
+
+
+def read_fixed_file(path, limit, label):
+    descriptor = os.open(path, open_flags)
+    try:
+        before = os.fstat(descriptor)
+        if (
+            stat.S_IFMT(before.st_mode) != stat.S_IFREG
+            or before.st_uid != expected_uid
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o400
+            or before.st_size <= 0
+            or before.st_size > limit
+        ):
+            raise RuntimeError(f"{label} metadata is unsafe")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(descriptor, min(1024 * 1024, limit - total + 1))
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > limit:
+                raise RuntimeError(f"{label} exceeds its byte limit")
+            chunks.append(chunk)
+        after = os.fstat(descriptor)
+        if exact(before) != exact(after) or total != before.st_size:
+            raise RuntimeError(f"{label} changed while reading")
+    finally:
+        os.close(descriptor)
+    return b"".join(chunks), after
+
+
+inventory, inventory_metadata = read_fixed_file(
+    inventory_path,
+    inventory_limit,
+    "raw Git tree inventory",
+)
+if not inventory or inventory[-1:] != b"\0":
+    raise RuntimeError("raw Git tree inventory is not NUL-terminated")
+records = inventory[:-1].split(b"\0")
+if (
+    not records
+    or any(not record for record in records)
+    or len(records) > entry_limit
+):
+    raise RuntimeError("raw Git tree inventory record count is invalid")
+
+expected_object_ids = set()
+for record in records:
+    header, path = record.split(b"\t", 1)
+    fields = header.split(b" ")
+    if len(fields) != 3:
+        raise RuntimeError("raw Git tree inventory header is malformed")
+    mode, object_type, object_id = fields
+    if (
+        len(object_id) != 40
+        or any(byte not in b"0123456789abcdef" for byte in object_id)
+    ):
+        raise RuntimeError("raw Git tree inventory object id is invalid")
+    if mode == b"040000" and object_type == b"tree":
+        continue
+    if mode not in (b"100644", b"100755") or object_type != b"blob":
+        raise RuntimeError(f"raw Git tree inventory type is forbidden at {path!r}")
+    expected_object_ids.add(object_id)
+if not expected_object_ids:
+    raise RuntimeError("raw Git tree inventory contains no blobs")
+
+blob_fd = os.open(blob_oracle_path, open_flags)
+blob_mapping = None
+try:
+    blob_before = os.fstat(blob_fd)
+    if (
+        stat.S_IFMT(blob_before.st_mode) != stat.S_IFREG
+        or blob_before.st_uid != expected_uid
+        or blob_before.st_nlink != 1
+        or stat.S_IMODE(blob_before.st_mode) != 0o400
+        or blob_before.st_size <= 0
+        or blob_before.st_size > blob_limit
+        or blob_before.st_dev != inventory_metadata.st_dev
+    ):
+        raise RuntimeError("candidate blob oracle metadata is unsafe")
+    blob_mapping = mmap.mmap(blob_fd, 0, access=mmap.ACCESS_READ)
+    blob_after = os.fstat(blob_fd)
+    if exact(blob_before) != exact(blob_after):
+        raise RuntimeError("candidate blob oracle changed while mapping")
+
+    position = 0
+    seen = set()
+    for expected_object_id in sorted(expected_object_ids):
+        line_end = blob_mapping.find(
+            b"\n",
+            position,
+            min(len(blob_mapping), position + 256),
+        )
+        if line_end < 0:
+            raise RuntimeError("candidate blob oracle batch header is missing")
+        header = bytes(blob_mapping[position:line_end])
+        fields = header.split(b" ")
+        if len(fields) != 3:
+            raise RuntimeError("candidate blob oracle batch header is malformed")
+        object_id, object_type, size_field = fields
+        if (
+            object_id != expected_object_id
+            or object_type != b"blob"
+            or not size_field
+            or any(byte not in b"0123456789" for byte in size_field)
+        ):
+            raise RuntimeError("candidate blob oracle batch identity is invalid")
+        size = int(size_field, 10)
+        if str(size).encode("ascii") != size_field or size > blob_limit:
+            raise RuntimeError("candidate blob oracle batch size is invalid")
+        content_start = line_end + 1
+        content_end = content_start + size
+        if (
+            content_end >= len(blob_mapping)
+            or blob_mapping[content_end] != 10
+        ):
+            raise RuntimeError("candidate blob oracle batch framing is invalid")
+
+        try:
+            digest = hashlib.sha1(usedforsecurity=False)
+        except TypeError:
+            digest = hashlib.sha1()
+        digest.update(b"blob " + size_field + b"\0")
+        offset = content_start
+        while offset < content_end:
+            next_offset = min(content_end, offset + 1024 * 1024)
+            digest.update(blob_mapping[offset:next_offset])
+            offset = next_offset
+        if digest.hexdigest().encode("ascii") != object_id:
+            raise RuntimeError("candidate blob oracle content hash is invalid")
+        seen.add(object_id)
+        position = content_end + 1
+
+    if position != len(blob_mapping) or seen != expected_object_ids:
+        raise RuntimeError("candidate blob oracle coverage is invalid")
+finally:
+    if blob_mapping is not None:
+        blob_mapping.close()
+    os.close(blob_fd)
+
+print(
+    f"candidate_blob_oracle_validated unique={len(expected_object_ids)} "
+    f"bytes={blob_before.st_size}"
+)
+'
+BLOB_ORACLE_VALIDATE_ARGV=(
+  "${TIMEOUT_BIN}"
+  --signal=TERM
+  --kill-after=5s
+  2m
+  "${ENV_BIN}"
+  -i
+  "PATH=${PATH}"
+  "LC_ALL=${LC_ALL}"
+  "HOME=${BUILD_HOME}"
+  "TMPDIR=${BUILD_TMP}"
+  "${PYTHON3_BIN}"
+  -I
+  -B
+  -c
+  "${BLOB_ORACLE_VALIDATE_PYTHON}"
+  "${CANDIDATE_TREE_RAW}"
+  "${CANDIDATE_BLOBS_RAW}"
+  "${TREE_INVENTORY_LIMIT_BYTES}"
+  "${TREE_INVENTORY_MAX_ENTRIES}"
+  "${BLOB_ORACLE_LIMIT_BYTES}"
+)
+readonly -a BLOB_ORACLE_VALIDATE_ARGV
+print_argv "candidate_blob_oracle_validate" "${BLOB_ORACLE_VALIDATE_ARGV[@]}"
+"${BLOB_ORACLE_VALIDATE_ARGV[@]}"
+[[ ! -e "${ISOLATED_INFO_ATTRIBUTES}" &&
+  ! -L "${ISOLATED_INFO_ATTRIBUTES}" ]] || {
+  echo "error: isolated Git info/attributes appeared during blob oracle creation" >&2
+  exit 1
+}
 
 readonly ARCHIVE_LIMIT_PYTHON='import os
 import sys
@@ -526,6 +1170,11 @@ if ((${#archive_pipeline_status[@]} != 2)) ||
     "${archive_pipeline_status[1]:-missing}" >&2
   exit 1
 fi
+[[ ! -e "${ISOLATED_INFO_ATTRIBUTES}" &&
+  ! -L "${ISOLATED_INFO_ATTRIBUTES}" ]] || {
+  echo "error: isolated Git info/attributes appeared during archive creation" >&2
+  exit 1
+}
 read -r archive_uid archive_mode archive_links archive_size archive_kind < <(
   "${STAT_BIN}" -c '%u %a %h %s %F' -- "${CANDIDATE_ARCHIVE}"
 )
@@ -572,11 +1221,17 @@ print_argv "candidate_extract_start" "${EXTRACT_ARGV[@]}"
   "${EXTRACT_ARGV[@]}"
 )
 
-readonly SNAPSHOT_SEAL_PYTHON='import os
+readonly SNAPSHOT_SEAL_PYTHON='import mmap
+import os
 import stat
 import sys
 
 snapshot_path = sys.argv[1]
+inventory_path = sys.argv[2]
+blob_oracle_path = sys.argv[3]
+inventory_byte_limit = int(sys.argv[4], 10)
+inventory_entry_limit = int(sys.argv[5], 10)
+blob_oracle_byte_limit = int(sys.argv[6], 10)
 expected_uid = os.geteuid()
 
 for required_flag in ("O_CLOEXEC", "O_DIRECTORY", "O_NOFOLLOW", "O_NONBLOCK"):
@@ -596,7 +1251,11 @@ class SealError(RuntimeError):
 def display(key):
     if not key:
         return "."
-    return repr("/".join(key))
+    return repr(raw_path(key))
+
+
+def raw_path(key):
+    return b"/".join(os.fsencode(component) for component in key)
 
 
 def identity(metadata):
@@ -606,6 +1265,7 @@ def identity(metadata):
         metadata.st_uid,
         metadata.st_nlink,
         stat.S_IFMT(metadata.st_mode),
+        metadata.st_size,
     )
 
 
@@ -626,12 +1286,247 @@ def require_exact(metadata, expected, key):
 def list_names(directory_fd, key):
     with os.scandir(directory_fd) as entries:
         names = [entry.name for entry in entries]
-    if any(name in ("", ".", "..") or "/" in name for name in names):
-        raise SealError(f"invalid directory entry below {display(key)}")
-    names.sort()
+    for name in names:
+        encoded = os.fsencode(name)
+        if (
+            name in ("", ".", "..")
+            or "/" in name
+            or encoded in (b"", b".", b"..")
+            or b"/" in encoded
+            or len(encoded) > 255
+            or os.fsdecode(encoded) != name
+        ):
+            raise SealError(f"invalid directory entry below {display(key)}")
+    names.sort(key=os.fsencode)
     return names
 
 
+def parse_oracle(payload):
+    if not payload or payload[-1:] != b"\0":
+        raise SealError("raw Git tree oracle is empty or not NUL-terminated")
+    records = payload[:-1].split(b"\0")
+    if (
+        not records
+        or any(not record for record in records)
+        or len(records) > inventory_entry_limit
+    ):
+        raise SealError("raw Git tree oracle record count is invalid")
+
+    entries = {}
+    for record in records:
+        try:
+            header, path = record.split(b"\t", 1)
+        except ValueError as error:
+            raise SealError("raw Git tree oracle record is malformed") from error
+        fields = header.split(b" ")
+        if len(fields) != 3 or any(not field for field in fields):
+            raise SealError("raw Git tree oracle header is malformed")
+        mode, object_type, object_id = fields
+        components = path.split(b"/")
+        if (
+            len(object_id) != 40
+            or any(byte not in b"0123456789abcdef" for byte in object_id)
+            or not path
+            or path.startswith(b"/")
+            or len(path) > 4096
+            or any(
+                component in (b"", b".", b"..") or len(component) > 255
+                for component in components
+            )
+            or path in entries
+        ):
+            raise SealError("raw Git tree oracle contains unsafe metadata")
+        if not (
+            (mode == b"040000" and object_type == b"tree")
+            or (mode in (b"100644", b"100755") and object_type == b"blob")
+        ):
+            raise SealError(f"raw Git tree oracle type is forbidden at {path!r}")
+        entries[path] = (mode, object_type, object_id)
+
+    for path in entries:
+        components = path.split(b"/")
+        for component_count in range(1, len(components)):
+            parent = b"/".join(components[:component_count])
+            parent_entry = entries.get(parent)
+            if (
+                parent_entry is None
+                or parent_entry[0] != b"040000"
+                or parent_entry[1] != b"tree"
+            ):
+                raise SealError(f"raw Git tree oracle parent is invalid: {parent!r}")
+    return entries
+
+
+def load_oracle():
+    if inventory_byte_limit <= 0 or inventory_entry_limit <= 0:
+        raise SealError("raw Git tree oracle limits must be positive")
+    inventory_fd = os.open(
+        inventory_path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
+    try:
+        before = os.fstat(inventory_fd)
+        if (
+            stat.S_IFMT(before.st_mode) != stat.S_IFREG
+            or before.st_uid != expected_uid
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o400
+            or before.st_size <= 0
+            or before.st_size > inventory_byte_limit
+        ):
+            raise SealError("raw Git tree oracle file metadata is unsafe")
+        chunks = []
+        total = 0
+        while True:
+            chunk = os.read(
+                inventory_fd,
+                min(1024 * 1024, inventory_byte_limit - total + 1),
+            )
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > inventory_byte_limit:
+                raise SealError("raw Git tree oracle exceeds its byte limit")
+            chunks.append(chunk)
+        after = os.fstat(inventory_fd)
+        if identity(before) != identity(after) or total != before.st_size:
+            raise SealError("raw Git tree oracle changed while it was read")
+    finally:
+        os.close(inventory_fd)
+    return parse_oracle(b"".join(chunks)), after
+
+
+def require_oracle_entry(key, expected_type):
+    path = raw_path(key)
+    entry = oracle.get(path)
+    if entry is None:
+        raise SealError(f"candidate snapshot contains an extra path: {path!r}")
+    mode, object_type, object_id = entry
+    if expected_type == stat.S_IFDIR:
+        if mode != b"040000" or object_type != b"tree":
+            raise SealError(f"candidate snapshot type differs from Git tree: {path!r}")
+    elif expected_type == stat.S_IFREG:
+        if mode not in (b"100644", b"100755") or object_type != b"blob":
+            raise SealError(f"candidate snapshot type differs from Git tree: {path!r}")
+    else:
+        raise SealError("internal oracle type request is invalid")
+    return mode, object_id
+
+
+oracle, oracle_file_metadata = load_oracle()
+
+
+def load_blob_oracle():
+    if blob_oracle_byte_limit <= 0:
+        raise SealError("candidate blob oracle limit must be positive")
+    expected_object_ids = {
+        entry[2] for entry in oracle.values() if entry[1] == b"blob"
+    }
+    if not expected_object_ids:
+        raise SealError("raw Git tree oracle contains no blob objects")
+
+    blob_fd = os.open(
+        blob_oracle_path,
+        os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+    )
+    blob_mapping = None
+    try:
+        before = os.fstat(blob_fd)
+        if (
+            stat.S_IFMT(before.st_mode) != stat.S_IFREG
+            or before.st_uid != expected_uid
+            or before.st_nlink != 1
+            or stat.S_IMODE(before.st_mode) != 0o400
+            or before.st_size <= 0
+            or before.st_size > blob_oracle_byte_limit
+            or before.st_dev != oracle_file_metadata.st_dev
+        ):
+            raise SealError("candidate blob oracle file metadata is unsafe")
+        blob_mapping = mmap.mmap(blob_fd, 0, access=mmap.ACCESS_READ)
+        after = os.fstat(blob_fd)
+        if exact_metadata(before) != exact_metadata(after):
+            raise SealError("candidate blob oracle changed while mapping")
+
+        position = 0
+        index = {}
+        for expected_object_id in sorted(expected_object_ids):
+            line_end = blob_mapping.find(
+                b"\n",
+                position,
+                min(len(blob_mapping), position + 256),
+            )
+            if line_end < 0:
+                raise SealError("candidate blob oracle batch header is missing")
+            fields = bytes(blob_mapping[position:line_end]).split(b" ")
+            if len(fields) != 3:
+                raise SealError("candidate blob oracle batch header is malformed")
+            object_id, object_type, size_field = fields
+            if (
+                object_id != expected_object_id
+                or object_type != b"blob"
+                or not size_field
+                or any(byte not in b"0123456789" for byte in size_field)
+            ):
+                raise SealError("candidate blob oracle batch identity is invalid")
+            size = int(size_field, 10)
+            if (
+                str(size).encode("ascii") != size_field
+                or size > blob_oracle_byte_limit
+            ):
+                raise SealError("candidate blob oracle batch size is invalid")
+            content_start = line_end + 1
+            content_end = content_start + size
+            if (
+                content_end >= len(blob_mapping)
+                or blob_mapping[content_end] != 10
+            ):
+                raise SealError("candidate blob oracle batch framing is invalid")
+            index[object_id] = (content_start, size)
+            position = content_end + 1
+        if position != len(blob_mapping) or set(index) != expected_object_ids:
+            raise SealError("candidate blob oracle coverage is invalid")
+    except BaseException:
+        if blob_mapping is not None:
+            blob_mapping.close()
+        os.close(blob_fd)
+        raise
+    return blob_fd, blob_mapping, index, after
+
+
+def compare_blob(file_fd, metadata, key, expected_object_id):
+    blob_entry = blob_index.get(expected_object_id)
+    if blob_entry is None:
+        raise SealError(f"blob oracle entry is missing for {display(key)}")
+    content_start, expected_size = blob_entry
+    if metadata.st_size != expected_size:
+        raise SealError(
+            f"candidate snapshot blob size differs from raw Git blob at "
+            f"{display(key)}"
+        )
+    os.lseek(file_fd, 0, os.SEEK_SET)
+    offset = 0
+    while offset < expected_size:
+        chunk = os.read(file_fd, min(1024 * 1024, expected_size - offset))
+        if not chunk:
+            raise SealError(f"candidate snapshot blob ended early at {display(key)}")
+        expected_chunk = blob_mapping[
+            content_start + offset:content_start + offset + len(chunk)
+        ]
+        if chunk != expected_chunk:
+            raise SealError(
+                f"candidate snapshot blob content differs from raw Git blob at "
+                f"{display(key)}"
+            )
+        offset += len(chunk)
+    if os.read(file_fd, 1):
+        raise SealError(f"candidate snapshot blob grew at {display(key)}")
+    after = os.fstat(file_fd)
+    require_open_identity(metadata, after, key)
+
+
+blob_oracle_fd, blob_mapping, blob_index, blob_oracle_file_metadata = (
+    load_blob_oracle()
+)
 sealed = {}
 snapshot_device = None
 
@@ -657,13 +1552,21 @@ def require_private_entry(metadata, key, expected_kind):
 
 
 def seal_regular(parent_fd, name, key, before):
+    oracle_mode, expected_object_id = require_oracle_entry(key, stat.S_IFREG)
     require_private_entry(before, key, stat.S_IFREG)
+    expected_private_mode = 0o700 if oracle_mode == b"100755" else 0o600
+    if stat.S_IMODE(before.st_mode) != expected_private_mode:
+        raise SealError(
+            f"candidate snapshot executable mode differs from Git tree at "
+            f"{display(key)}"
+        )
     file_fd = os.open(name, file_flags, dir_fd=parent_fd)
     try:
         opened = os.fstat(file_fd)
         require_open_identity(before, opened, key)
         require_private_entry(opened, key, stat.S_IFREG)
-        target_mode = 0o500 if stat.S_IMODE(opened.st_mode) == 0o700 else 0o400
+        compare_blob(file_fd, opened, key, expected_object_id)
+        target_mode = 0o500 if oracle_mode == b"100755" else 0o400
         os.fchmod(file_fd, target_mode)
         sealed_metadata = os.fstat(file_fd)
         require_open_identity(opened, sealed_metadata, key)
@@ -680,6 +1583,8 @@ def seal_regular(parent_fd, name, key, before):
 
 
 def seal_directory(directory_fd, key, opened):
+    if key:
+        require_oracle_entry(key, stat.S_IFDIR)
     require_private_entry(opened, key, stat.S_IFDIR)
     for name in list_names(directory_fd, key):
         child_key = key + (name,)
@@ -715,6 +1620,8 @@ def seal_directory(directory_fd, key, opened):
 
 
 def verify_directory(directory_fd, key, seen):
+    if key:
+        require_oracle_entry(key, stat.S_IFDIR)
     expected = sealed.get(key)
     if expected is None:
         raise SealError(f"unrecorded directory appeared at {display(key)}")
@@ -745,13 +1652,18 @@ def verify_directory(directory_fd, key, seen):
             finally:
                 os.close(child_fd)
         elif kind == stat.S_IFREG:
+            oracle_mode, expected_object_id = require_oracle_entry(
+                child_key,
+                stat.S_IFREG,
+            )
+            expected_mode = 0o500 if oracle_mode == b"100755" else 0o400
             file_fd = os.open(name, file_flags, dir_fd=directory_fd)
             try:
                 reopened = os.fstat(file_fd)
                 require_exact(reopened, child_expected, child_key)
                 if (
                     reopened.st_nlink != 1
-                    or stat.S_IMODE(reopened.st_mode) not in (0o400, 0o500)
+                    or stat.S_IMODE(reopened.st_mode) != expected_mode
                     or stat.S_IMODE(reopened.st_mode) & 0o222
                     or reopened.st_uid != expected_uid
                     or reopened.st_dev != snapshot_device
@@ -760,6 +1672,12 @@ def verify_directory(directory_fd, key, seen):
                         f"regular file failed sealed-tree verification at "
                         f"{display(child_key)}"
                     )
+                compare_blob(
+                    file_fd,
+                    reopened,
+                    child_key,
+                    expected_object_id,
+                )
             finally:
                 os.close(file_fd)
             seen.add(child_key)
@@ -792,6 +1710,8 @@ def seal_snapshot():
             stat.S_IFMT(parent_metadata.st_mode) != stat.S_IFDIR
             or parent_metadata.st_uid != expected_uid
             or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+            or oracle_file_metadata.st_dev != parent_metadata.st_dev
+            or blob_oracle_file_metadata.st_dev != parent_metadata.st_dev
         ):
             raise SealError("snapshot parent descriptor is unsafe")
 
@@ -812,6 +1732,14 @@ def seal_snapshot():
                 raise SealError("snapshot root crosses the parent filesystem")
             snapshot_device = opened.st_dev
             seal_directory(snapshot_fd, (), opened)
+            sealed_paths = {raw_path(key) for key in sealed if key}
+            oracle_paths = set(oracle)
+            if sealed_paths != oracle_paths:
+                raise SealError(
+                    "candidate snapshot path set differs from raw Git tree "
+                    f"inventory: missing={len(oracle_paths - sealed_paths)} "
+                    f"extra={len(sealed_paths - oracle_paths)}"
+                )
         finally:
             os.close(snapshot_fd)
 
@@ -840,16 +1768,22 @@ def seal_snapshot():
 
     if seen != set(sealed):
         raise SealError("sealed-tree verification did not cover every entry")
-    return len(sealed)
+    return len(sealed), len(oracle)
 
 
 try:
-    sealed_count = seal_snapshot()
+    sealed_count, oracle_count = seal_snapshot()
 except (OSError, RuntimeError, ValueError) as error:
     print(f"error: cannot seal candidate snapshot: {error}", file=sys.stderr)
     raise SystemExit(1)
+finally:
+    blob_mapping.close()
+    os.close(blob_oracle_fd)
 
-print(f"candidate_snapshot_sealed entries={sealed_count}")
+print(
+    f"candidate_snapshot_sealed entries={sealed_count} "
+    f"oracle_entries={oracle_count}"
+)
 '
 SNAPSHOT_SEAL_ARGV=(
   "${TIMEOUT_BIN}"
@@ -868,6 +1802,11 @@ SNAPSHOT_SEAL_ARGV=(
   -c
   "${SNAPSHOT_SEAL_PYTHON}"
   "${SOURCE_SNAPSHOT}"
+  "${CANDIDATE_TREE_RAW}"
+  "${CANDIDATE_BLOBS_RAW}"
+  "${TREE_INVENTORY_LIMIT_BYTES}"
+  "${TREE_INVENTORY_MAX_ENTRIES}"
+  "${BLOB_ORACLE_LIMIT_BYTES}"
 )
 readonly -a SNAPSHOT_SEAL_ARGV
 print_argv "candidate_snapshot_seal_start" "${SNAPSHOT_SEAL_ARGV[@]}"

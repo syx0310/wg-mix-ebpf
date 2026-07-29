@@ -9,6 +9,7 @@ readonly CP_BIN="/usr/bin/cp"
 readonly ENV_BIN="/usr/bin/env"
 readonly GIT_BIN="/usr/bin/git"
 readonly GO_BIN="/usr/bin/go"
+readonly LN_BIN="/usr/bin/ln"
 readonly MKDIR_BIN="/usr/bin/mkdir"
 readonly MKTEMP_BIN="/usr/bin/mktemp"
 readonly SHA256_BIN="/usr/bin/sha256sum"
@@ -18,6 +19,10 @@ readonly TIMEOUT_BIN="/usr/bin/timeout"
 readonly TOUCH_BIN="/usr/bin/touch"
 readonly TRUNCATE_BIN="/usr/bin/truncate"
 readonly ARCHIVE_LIMIT_BYTES=268435456
+readonly TREE_INVENTORY_LIMIT_BYTES=33554432
+readonly BLOB_ORACLE_LIMIT_BYTES=268435456
+readonly OVERSIZED_CHUNK_BYTES=1048576
+readonly OVERSIZED_CHUNK_COUNT=257
 export PATH LC_ALL
 umask 077
 
@@ -30,7 +35,7 @@ umask 077
   exit 2
 }
 [[ -x "${CHMOD_BIN}" && -x "${CP_BIN}" && -x "${ENV_BIN}" && -x "${GIT_BIN}" &&
-  -x "${GO_BIN}" && -x "${MKDIR_BIN}" && -x "${MKTEMP_BIN}" &&
+  -x "${GO_BIN}" && -x "${LN_BIN}" && -x "${MKDIR_BIN}" && -x "${MKTEMP_BIN}" &&
   -x "${SHA256_BIN}" && -x "${STAT_BIN}" && -x "${TAR_BIN}" &&
   -x "${TIMEOUT_BIN}" && -x "${TOUCH_BIN}" && -x "${TRUNCATE_BIN}" ]] || {
   echo "error: fixed provenance regression tools are unavailable" >&2
@@ -46,9 +51,12 @@ readonly poisoned_home="${fixture_root}/poisoned-home"
 readonly first_output_parent="${fixture_root}/index-pollution-output"
 readonly second_output_parent="${fixture_root}/git-env-pollution-output"
 readonly no_tag_parent="${fixture_root}/no-tag-output"
+readonly export_ignore_output_parent="${fixture_root}/export-ignore-output"
+readonly export_subst_output_parent="${fixture_root}/export-subst-output"
 readonly relative_replace_output_parent="${fixture_root}/relative-replace-output"
 readonly absolute_replace_output_parent="${fixture_root}/absolute-replace-output"
 readonly oversized_output_parent="${fixture_root}/oversized-archive-output"
+readonly symlink_output_parent="${fixture_root}/symlink-output"
 readonly absolute_outside_module="${fixture_root}/absolute-outside-module"
 readonly relative_outside_module="${relative_replace_output_parent}/outside-module"
 readonly tar_options_control_output="${fixture_root}/tar-options-control-output"
@@ -73,9 +81,12 @@ for directory in \
   "${first_output_parent}" \
   "${second_output_parent}" \
   "${no_tag_parent}" \
+  "${export_ignore_output_parent}" \
+  "${export_subst_output_parent}" \
   "${relative_outside_module}" \
   "${absolute_replace_output_parent}" \
   "${oversized_output_parent}" \
+  "${symlink_output_parent}" \
   "${absolute_outside_module}" \
   "${tar_options_control_output}"; do
   "${MKDIR_BIN}" --mode=0700 --parents -- "${directory}"
@@ -270,6 +281,9 @@ EOF
 cat >"${poisoned_home}/malicious.attributes" <<'EOF'
 * export-ignore
 EOF
+cat >"${fixture_repo}/.git/info/attributes" <<'EOF'
+* export-ignore
+EOF
 cat >"${tar_options_control_action}" <<EOF
 #!/bin/sh
 ${TOUCH_BIN} -- "${tar_options_control_marker}"
@@ -379,6 +393,48 @@ assert_snapshot_entry() {
   fi
 }
 
+assert_evidence_file() {
+  local path="$1"
+  local expected_mode="$2"
+  local byte_limit="$3"
+  local actual_uid
+  local actual_mode
+  local actual_links
+  local actual_size
+  local actual_kind
+
+  [[ -f "${path}" && ! -L "${path}" ]] || {
+    printf 'error: provenance evidence is missing or not regular: %s\n' \
+      "${path}" >&2
+    return 1
+  }
+  read -r actual_uid actual_mode actual_links actual_size actual_kind < <(
+    "${STAT_BIN}" -c '%u %a %h %s %F' -- "${path}"
+  )
+  [[ "${actual_uid}" == "${EUID}" &&
+    "${actual_mode}" == "${expected_mode}" &&
+    "${actual_links}" == "1" &&
+    "${actual_size}" -gt 0 &&
+    "${actual_size}" -le "${byte_limit}" &&
+    "${actual_kind}" == "regular file" ]] || {
+    printf 'error: provenance evidence metadata is unsafe: path=%s uid=%s mode=%s links=%s size=%s type=%s\n' \
+      "${path}" "${actual_uid}" "${actual_mode}" "${actual_links}" \
+      "${actual_size}" "${actual_kind}" >&2
+    return 1
+  }
+}
+
+assert_isolated_attributes_absent() {
+  local output_parent="$1"
+  local attributes_path="${output_parent}/candidate.git/info/attributes"
+
+  [[ ! -e "${attributes_path}" && ! -L "${attributes_path}" ]] || {
+    printf 'error: isolated Git info/attributes exists: %s\n' \
+      "${attributes_path}" >&2
+    return 1
+  }
+}
+
 assert_sealed_snapshot() {
   local snapshot="$1"
 
@@ -418,6 +474,16 @@ printf 'provenance_case_start case=ignored-assume-skip-index commit=%s\n' \
   exit 1
 }
 assert_sealed_snapshot "${first_output_parent}/source-snapshot"
+assert_evidence_file \
+  "${first_output_parent}/candidate-tree.raw" \
+  "400" "${TREE_INVENTORY_LIMIT_BYTES}"
+assert_evidence_file \
+  "${first_output_parent}/candidate-blobs.raw" \
+  "400" "${BLOB_ORACLE_LIMIT_BYTES}"
+assert_evidence_file \
+  "${first_output_parent}/candidate.tar" \
+  "400" "${ARCHIVE_LIMIT_BYTES}"
+assert_isolated_attributes_absent "${first_output_parent}"
 
 printf 'provenance_case_start case=all-tool-environment-pollution commit=%s\n' \
   "${candidate_commit}"
@@ -436,6 +502,16 @@ printf 'provenance_case_start case=all-tool-environment-pollution commit=%s\n' \
   exit 1
 }
 assert_sealed_snapshot "${second_output_parent}/source-snapshot"
+assert_evidence_file \
+  "${second_output_parent}/candidate-tree.raw" \
+  "400" "${TREE_INVENTORY_LIMIT_BYTES}"
+assert_evidence_file \
+  "${second_output_parent}/candidate-blobs.raw" \
+  "400" "${BLOB_ORACLE_LIMIT_BYTES}"
+assert_evidence_file \
+  "${second_output_parent}/candidate.tar" \
+  "400" "${ARCHIVE_LIMIT_BYTES}"
+assert_isolated_attributes_absent "${second_output_parent}"
 
 first_archive_sha="$("${SHA256_BIN}" -- \
   "${first_output_parent}/candidate.tar")"
@@ -541,6 +617,115 @@ expect_gate_failure() {
     "${label}" "${gate_exit}"
 }
 
+assert_go_phase_not_reached() {
+  local label="$1"
+  local output_parent="$2"
+
+  [[ ! -e "${output_parent}/build-tmp/go-mod-edit.json" &&
+    ! -L "${output_parent}/build-tmp/go-mod-edit.json" ]] || {
+    printf 'error: rejected provenance case reached Go metadata: case=%s\n' \
+      "${label}" >&2
+    return 1
+  }
+}
+
+assert_archive_phase_not_reached() {
+  local label="$1"
+  local output_parent="$2"
+
+  [[ ! -e "${output_parent}/candidate.tar" &&
+    ! -L "${output_parent}/candidate.tar" &&
+    ! -e "${output_parent}/source-snapshot/go.mod" &&
+    ! -L "${output_parent}/source-snapshot/go.mod" ]] || {
+    printf 'error: rejected raw tree case reached archive extraction: case=%s\n' \
+      "${label}" >&2
+    return 1
+  }
+  assert_go_phase_not_reached "${label}" "${output_parent}"
+}
+
+cat >"${fixture_repo}/.gitattributes" <<'EOF'
+internal/guard/unit_test.go export-ignore
+EOF
+fixture_git add -- .gitattributes
+fixture_git \
+  -c user.name=guard-provenance-fixture \
+  -c user.email=guard-provenance-fixture.invalid \
+  commit -m "fixture committed export-ignore"
+export_ignore_commit="$(fixture_git rev-parse HEAD)"
+readonly export_ignore_commit
+[[ "${export_ignore_commit}" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "error: export-ignore fixture commit is invalid" >&2
+  exit 1
+}
+expect_gate_failure \
+  "committed-export-ignore" \
+  "${export_ignore_commit}" \
+  "${export_ignore_output_parent}" \
+  "candidate snapshot path set differs from raw Git tree inventory"
+assert_go_phase_not_reached \
+  "committed-export-ignore" "${export_ignore_output_parent}"
+assert_evidence_file \
+  "${export_ignore_output_parent}/candidate-tree.raw" \
+  "400" "${TREE_INVENTORY_LIMIT_BYTES}"
+assert_evidence_file \
+  "${export_ignore_output_parent}/candidate-blobs.raw" \
+  "400" "${BLOB_ORACLE_LIMIT_BYTES}"
+assert_evidence_file \
+  "${export_ignore_output_parent}/candidate.tar" \
+  "400" "${ARCHIVE_LIMIT_BYTES}"
+assert_isolated_attributes_absent "${export_ignore_output_parent}"
+
+cat >"${fixture_repo}/.gitattributes" <<'EOF'
+internal/guard/archive-subst.txt export-subst
+EOF
+cat >"${fixture_repo}/internal/guard/archive-subst.txt" <<'EOF'
+candidate=$Format:%H$
+EOF
+fixture_git add -- .gitattributes internal/guard/archive-subst.txt
+fixture_git \
+  -c user.name=guard-provenance-fixture \
+  -c user.email=guard-provenance-fixture.invalid \
+  commit -m "fixture committed export-subst"
+export_subst_commit="$(fixture_git rev-parse HEAD)"
+readonly export_subst_commit
+[[ "${export_subst_commit}" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "error: export-subst fixture commit is invalid" >&2
+  exit 1
+}
+expect_gate_failure \
+  "committed-export-subst" \
+  "${export_subst_commit}" \
+  "${export_subst_output_parent}" \
+  "candidate snapshot blob size differs from raw Git blob"
+assert_go_phase_not_reached \
+  "committed-export-subst" "${export_subst_output_parent}"
+assert_evidence_file \
+  "${export_subst_output_parent}/candidate-tree.raw" \
+  "400" "${TREE_INVENTORY_LIMIT_BYTES}"
+assert_evidence_file \
+  "${export_subst_output_parent}/candidate-blobs.raw" \
+  "400" "${BLOB_ORACLE_LIMIT_BYTES}"
+assert_evidence_file \
+  "${export_subst_output_parent}/candidate.tar" \
+  "400" "${ARCHIVE_LIMIT_BYTES}"
+assert_isolated_attributes_absent "${export_subst_output_parent}"
+
+cat >"${fixture_repo}/.gitattributes" <<'EOF'
+# committed attributes intentionally inert after negative fixtures
+EOF
+fixture_git add -- .gitattributes
+fixture_git \
+  -c user.name=guard-provenance-fixture \
+  -c user.email=guard-provenance-fixture.invalid \
+  commit -m "fixture inert committed attributes"
+inert_attributes_commit="$(fixture_git rev-parse HEAD)"
+readonly inert_attributes_commit
+[[ "${inert_attributes_commit}" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "error: inert-attributes fixture commit is invalid" >&2
+  exit 1
+}
+
 cat >"${relative_outside_module}/go.mod" <<'EOF'
 module example.com/outside
 
@@ -616,21 +801,41 @@ expect_gate_failure \
   "error: candidate go.mod contains a forbidden local replacement at Replace[0]"
 
 readonly oversized_source="${fixture_repo}/zz-oversized.bin"
-"${TRUNCATE_BIN}" --size="$((ARCHIVE_LIMIT_BYTES + 1))" -- \
+"${TRUNCATE_BIN}" --size="${OVERSIZED_CHUNK_BYTES}" -- \
   "${oversized_source}"
 read -r oversized_source_size oversized_source_kind < <(
   "${STAT_BIN}" -c '%s %F' -- "${oversized_source}"
 )
-[[ "${oversized_source_size}" -eq "$((ARCHIVE_LIMIT_BYTES + 1))" &&
+[[ "${oversized_source_size}" -eq "${OVERSIZED_CHUNK_BYTES}" &&
   "${oversized_source_kind}" == "regular file" ]] || {
-  echo "error: oversized sparse archive fixture is invalid" >&2
+  echo "error: repeated-blob archive fixture is invalid" >&2
   exit 1
 }
-fixture_git add -- zz-oversized.bin
+oversized_blob_oid="$(fixture_git hash-object -w -- "${oversized_source}")"
+readonly oversized_blob_oid
+[[ "${oversized_blob_oid}" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "error: repeated-blob archive object id is invalid" >&2
+  exit 1
+}
+for ((chunk_index = 0; chunk_index < OVERSIZED_CHUNK_COUNT; chunk_index++)); do
+  printf -v chunk_path 'oversized/chunk-%03d.bin' "${chunk_index}"
+  fixture_git update-index \
+    --add \
+    --cacheinfo 100644 "${oversized_blob_oid}" "${chunk_path}"
+done
+first_chunk_entry="$(fixture_git ls-files -s -- oversized/chunk-000.bin)"
+last_chunk_entry="$(fixture_git ls-files -s -- oversized/chunk-256.bin)"
+[[ "${first_chunk_entry}" == \
+  100644\ "${oversized_blob_oid}"\ 0$'\t'oversized/chunk-000.bin &&
+  "${last_chunk_entry}" == \
+  100644\ "${oversized_blob_oid}"\ 0$'\t'oversized/chunk-256.bin ]] || {
+  echo "error: repeated-blob archive index entries are invalid" >&2
+  exit 1
+}
 fixture_git \
   -c user.name=guard-provenance-fixture \
   -c user.email=guard-provenance-fixture.invalid \
-  commit -m "fixture oversized candidate archive"
+  commit --quiet -m "fixture oversized repeated-blob archive"
 oversized_commit="$(fixture_git rev-parse HEAD)"
 readonly oversized_commit
 [[ "${oversized_commit}" =~ ^[0-9a-f]{40}$ ]] || {
@@ -658,11 +863,54 @@ read -r partial_archive_size partial_archive_links partial_archive_kind < <(
   echo "error: oversized archive limiter wrote beyond its hard bound" >&2
   exit 1
 }
+assert_evidence_file \
+  "${oversized_output_parent}/candidate-tree.raw" \
+  "400" "${TREE_INVENTORY_LIMIT_BYTES}"
+assert_evidence_file \
+  "${oversized_output_parent}/candidate-blobs.raw" \
+  "400" "${BLOB_ORACLE_LIMIT_BYTES}"
+assert_evidence_file \
+  "${partial_archive}" \
+  "600" "${ARCHIVE_LIMIT_BYTES}"
+assert_isolated_attributes_absent "${oversized_output_parent}"
 [[ ! -e "${oversized_output_parent}/source-snapshot/go.mod" &&
   ! -L "${oversized_output_parent}/source-snapshot/go.mod" ]] || {
   echo "error: oversized archive failure reached snapshot extraction" >&2
   exit 1
 }
+
+readonly committed_symlink="${fixture_repo}/internal/guard/committed-link"
+"${LN_BIN}" -s -- "nested/deeper/payload.txt" "${committed_symlink}"
+fixture_git add -- internal/guard/committed-link
+fixture_git \
+  -c user.name=guard-provenance-fixture \
+  -c user.email=guard-provenance-fixture.invalid \
+  commit -m "fixture committed symlink"
+symlink_commit="$(fixture_git rev-parse HEAD)"
+readonly symlink_commit
+[[ "${symlink_commit}" =~ ^[0-9a-f]{40}$ ]] || {
+  echo "error: symlink fixture commit is invalid" >&2
+  exit 1
+}
+symlink_index_entry="$(fixture_git ls-files -s -- \
+  internal/guard/committed-link)"
+[[ "${symlink_index_entry}" == \
+  120000\ *$'\t'internal/guard/committed-link ]] || {
+  echo "error: committed symlink fixture is not stored with Git mode 120000" >&2
+  exit 1
+}
+expect_gate_failure \
+  "committed-symlink" \
+  "${symlink_commit}" \
+  "${symlink_output_parent}" \
+  "forbidden Git tree entry mode=120000 type=blob"
+assert_archive_phase_not_reached \
+  "committed-symlink" "${symlink_output_parent}"
+readonly rejected_tree_inventory="${symlink_output_parent}/candidate-tree.raw"
+assert_evidence_file \
+  "${rejected_tree_inventory}" \
+  "600" "${TREE_INVENTORY_LIMIT_BYTES}"
+assert_isolated_attributes_absent "${symlink_output_parent}"
 
 printf 'live guard build provenance regression passed commit=%s archive_sha256=%s\n' \
   "${candidate_commit}" "${first_archive_sha}"
