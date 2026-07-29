@@ -15,6 +15,7 @@ import (
 
 const (
 	OwnerRecordFileName        = "guard-owner.v2.json"
+	legacyOwnerRecordFileName  = "guard-owner.v1.json"
 	ownerRecordPendingFileName = ".guard-owner.v2.pending"
 	ownerRecordVersion         = 2
 	ownerMarkerPrefix          = "wg-mix-ebpf-guard-v2:"
@@ -101,6 +102,9 @@ func (e CommandExecutor) loadOrCreateOwner() (record ownerRecord, fresh bool, er
 			err = fmt.Errorf("close guard state directory %s: %w", stateDir.path, closeErr)
 		}
 	}()
+	if err := rejectLegacyOwnerRecord(stateDir); err != nil {
+		return ownerRecord{}, false, err
+	}
 
 	record, err = loadOwnerRecord(stateDir)
 	if err == nil {
@@ -159,6 +163,9 @@ func (e CommandExecutor) loadOwnerIfPresent() (record ownerRecord, present bool,
 			err = fmt.Errorf("close guard state directory %s: %w", stateDir.path, closeErr)
 		}
 	}()
+	if err := rejectLegacyOwnerRecord(stateDir); err != nil {
+		return ownerRecord{}, false, err
+	}
 
 	record, err = loadOwnerRecord(stateDir)
 	if errors.Is(err, os.ErrNotExist) {
@@ -168,6 +175,46 @@ func (e CommandExecutor) loadOwnerIfPresent() (record ownerRecord, present bool,
 		return ownerRecord{}, false, err
 	}
 	return record, true, nil
+}
+
+func rejectLegacyOwnerRecord(stateDir *secureStateDirectory) error {
+	if err := stateDir.validatePath(); err != nil {
+		return err
+	}
+	path := filepath.Join(stateDir.path, legacyOwnerRecordFileName)
+	file, err := guardOpenReadFileAt(stateDir.file, legacyOwnerRecordFileName)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect legacy guard owner record %s: %w", path, err)
+	}
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("inspect open legacy guard owner record %s: %w", path, err)
+	}
+	if err := validateOwnerRecordFile(path, info); err != nil {
+		return err
+	}
+	matches, err := guardNamedFileMatches(stateDir.file, legacyOwnerRecordFileName, file)
+	if err != nil {
+		return fmt.Errorf("reopen legacy guard owner record %s: %w", path, err)
+	}
+	if !matches {
+		return fmt.Errorf("legacy guard owner record %s changed while opening", path)
+	}
+	if err := stateDir.validatePath(); err != nil {
+		return err
+	}
+	// A v1 record is the only durable link to its randomized v1 table name.
+	// Treat any securely opened v1 record as owned-but-unmigrated even when
+	// its JSON is damaged; ignoring it could make uninstall erase the last
+	// ownership evidence while leaving a packet-dropping table behind.
+	return fmt.Errorf(
+		"legacy guard owner record %s may own a v1 nftables table; explicit ownership migration is required",
+		path,
+	)
 }
 
 func loadOwnerRecord(stateDir *secureStateDirectory) (ownerRecord, error) {

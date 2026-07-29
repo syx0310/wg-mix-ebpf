@@ -86,6 +86,31 @@ func TestOwnerRecordRejectsSymlink(t *testing.T) {
 	}
 }
 
+func TestOwnerRecordRejectsLegacyV1SymlinkWithoutTouchingTarget(t *testing.T) {
+	stateDir := guardTestStateDir(t)
+	victim := filepath.Join(stateDir, "legacy-victim.json")
+	if err := os.WriteFile(victim, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(stateDir, legacyOwnerRecordFileName)); err != nil {
+		t.Fatal(err)
+	}
+	exec := CommandExecutor{StateDir: stateDir}
+	if _, _, err := exec.loadOrCreateOwner(); err == nil {
+		t.Fatal("a symlinked v1 owner record must fail closed")
+	}
+	data, err := os.ReadFile(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(data) != "{}\n" {
+		t.Fatalf("legacy owner symlink target changed: %q", data)
+	}
+	if _, err := os.Stat(filepath.Join(stateDir, OwnerRecordFileName)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("legacy owner symlink created a v2 record: %v", err)
+	}
+}
+
 func TestOwnerRecordRejectsCopyFromDifferentStateDirectory(t *testing.T) {
 	firstDir := guardTestStateDir(t)
 	firstExec := CommandExecutor{StateDir: firstDir}

@@ -31,7 +31,11 @@ func openSecureStateDirectory(configured string, create bool) (*secureStateDirec
 			return nil, fmt.Errorf("guard state directory has an unsafe component: %s", path)
 		}
 	}
-	path = filepath.Clean(path)
+	cleaned := filepath.Clean(path)
+	if cleaned != path {
+		return nil, fmt.Errorf("guard state directory must use its canonical lexical form: %s", path)
+	}
+	path = cleaned
 	if path == string(filepath.Separator) {
 		return nil, errors.New("guard state directory must not be the filesystem root")
 	}
