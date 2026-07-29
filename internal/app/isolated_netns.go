@@ -3,6 +3,7 @@ package app
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"path/filepath"
 	"regexp"
@@ -148,6 +149,9 @@ func parseIsolatedNetNSTestManifest(data []byte) (isolatedNetNSTestManifest, err
 		"bpffs",
 		"bpffs_source",
 		"bpffs_mount_id",
+		"pin_lock_root",
+		"pin_lock_a",
+		"pin_lock_b",
 		"role_a",
 		"pin_a",
 		"role_b",
@@ -221,13 +225,16 @@ func validateIsolatedNetNSTestManifestLayout(
 	values := manifest.values
 	role := layout.role
 	secretsDir := filepath.Join(layout.runBase, "secrets")
+	pinLockRoot := filepath.Join(layout.runBase, "pin-locks")
 	expected := map[string]string{
 		"run_id":            layout.runID,
 		"run_base":          layout.runBase,
 		"bpffs":             layout.bpffsDir,
 		"bpffs_source":      "wg-mix-ebpf-" + layout.runID,
+		"pin_lock_root":     pinLockRoot,
 		"role_" + role:      role,
 		"pin_" + role:       pinPath,
+		"pin_lock_" + role:  isolatedNetNSPinLockPath(pinLockRoot, pinPath),
 		"netns_" + role:     "wme" + layout.runID + role,
 		"run_dir_" + role:   runDir,
 		"state_dir_" + role: stateDir,
@@ -253,8 +260,12 @@ func validateIsolatedNetNSTestManifestLayout(
 	}
 	for _, otherRole := range []string{"a", "b"} {
 		rolePaths := map[string]string{
-			"role_" + otherRole:      otherRole,
-			"pin_" + otherRole:       filepath.Join(layout.bpffsDir, "wg-mix-ebpf-"+otherRole),
+			"role_" + otherRole: otherRole,
+			"pin_" + otherRole:  filepath.Join(layout.bpffsDir, "wg-mix-ebpf-"+otherRole),
+			"pin_lock_" + otherRole: isolatedNetNSPinLockPath(
+				pinLockRoot,
+				filepath.Join(layout.bpffsDir, "wg-mix-ebpf-"+otherRole),
+			),
 			"netns_" + otherRole:     "wme" + layout.runID + otherRole,
 			"run_dir_" + otherRole:   filepath.Join(layout.runBase, "run-"+otherRole),
 			"state_dir_" + otherRole: filepath.Join(layout.runBase, "state-"+otherRole),
@@ -279,6 +290,9 @@ func validateIsolatedNetNSTestManifestLayout(
 	for _, key := range []string{
 		"run_base",
 		"bpffs",
+		"pin_lock_root",
+		"pin_lock_a",
+		"pin_lock_b",
 		"pin_a",
 		"pin_b",
 		"run_dir_a",
@@ -302,6 +316,11 @@ func validateIsolatedNetNSTestManifestLayout(
 		}
 	}
 	return nil
+}
+
+func isolatedNetNSPinLockPath(root string, pinPath string) string {
+	sum := sha256.Sum256([]byte(pinPath))
+	return filepath.Join(root, fmt.Sprintf("%x.lock", sum))
 }
 
 func validateManifestNetworkNamespaces(
