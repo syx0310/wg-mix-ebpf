@@ -390,28 +390,30 @@ func validateCleanupManifestBootstrap(
 	installationID string,
 ) error {
 	manifest := expectedCleanupManifest(paths, system, installationID)
-	entries, err := cleanupReadDir(configRoot.dir)
-	if err != nil {
-		return fmt.Errorf("read unmarked config directory before ownership adoption: %w", err)
-	}
-	for _, entry := range entries {
-		if entry.Name() != filepath.Base(paths.ConfigPath) {
-			return fmt.Errorf(
-				"refuse to adopt unmarked config directory with unknown entry %s",
-				filepath.Join(configRoot.spec.path, entry.Name()),
-			)
-		}
-		node, err := snapshotManagedFile(
-			configRoot.dir,
-			entry.Name(),
-			false,
-			false,
-			validateConfigBytes,
-		)
+	if configRoot != nil {
+		entries, err := cleanupReadDir(configRoot.dir)
 		if err != nil {
-			return fmt.Errorf("refuse to adopt unmarked config file: %w", err)
+			return fmt.Errorf("read unmarked config directory before ownership adoption: %w", err)
 		}
-		_ = node.close()
+		for _, entry := range entries {
+			if entry.Name() != filepath.Base(paths.ConfigPath) {
+				return fmt.Errorf(
+					"refuse to adopt unmarked config directory with unknown entry %s",
+					filepath.Join(configRoot.spec.path, entry.Name()),
+				)
+			}
+			node, err := snapshotManagedFile(
+				configRoot.dir,
+				entry.Name(),
+				false,
+				false,
+				validateConfigBytes,
+			)
+			if err != nil {
+				return fmt.Errorf("refuse to adopt unmarked config file: %w", err)
+			}
+			_ = node.close()
+		}
 	}
 
 	var plans []*cleanupDirectoryPlan
@@ -451,6 +453,30 @@ func validateCleanupManifestBootstrap(
 	}
 	plans = append(plans, artifactPlans...)
 	return nil
+}
+
+func validateUnmarkedCleanupResources(paths paths, system string) (retErr error) {
+	configRoot, exists, err := openManagedCleanupDir(
+		configCleanupPath(filepath.Dir(paths.ConfigPath)),
+	)
+	if err != nil {
+		return err
+	}
+	if exists {
+		defer func() {
+			if err := configRoot.close(); err != nil {
+				retErr = errors.Join(retErr, fmt.Errorf("close unmarked config validation handles: %w", err))
+			}
+		}()
+	} else {
+		configRoot = nil
+	}
+	return validateCleanupManifestBootstrap(
+		configRoot,
+		paths,
+		system,
+		strings.Repeat("0", 32),
+	)
 }
 
 func prepareRuntimeDirectoryPlan(

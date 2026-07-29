@@ -14,6 +14,8 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/daemon"
+	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
+	"github.com/syx0310/wg-mix-ebpf/internal/install"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
 
@@ -372,6 +374,64 @@ func TestInstallDryRunUsesOverrides(t *testing.T) {
 	}
 	if !bytes.Contains(stdout.Bytes(), []byte("enable systemd service")) {
 		t.Fatalf("install dry-run missing enable action: %s", stdout.String())
+	}
+}
+
+func TestInstallDryRunRequiresAdoptExistingFlag(t *testing.T) {
+	root := t.TempDir()
+	configDir := filepath.Join(root, "wg-mix-ebpf-config-cli-adopt")
+	configPath := filepath.Join(configDir, "config.yaml")
+	binaryPath := filepath.Join(root, "sbin", "wg-mix-ebpf")
+	stateDir := filepath.Join(root, "wg-mix-ebpf-state-cli-adopt")
+	runDir := filepath.Join(root, "wg-mix-ebpf-run-cli-adopt")
+	pinPath := filepath.Join(root, "wg-mix-ebpf-pins-cli-adopt")
+	for _, dir := range []string{configDir, stateDir, runDir, pinPath} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := config.SaveFile(configPath, config.SafeTemplate()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(install.EnvEtcDir, configDir)
+	t.Setenv(install.EnvBinaryPath, binaryPath)
+	t.Setenv(install.EnvVarLibDir, stateDir)
+	t.Setenv(daemon.EnvRunDir, runDir)
+	t.Setenv(dataplane.EnvPinPath, pinPath)
+
+	var stdout, stderr bytes.Buffer
+	err := Run(
+		t.Context(),
+		[]string{"install", "--system", "unknown", "--dry-run"},
+		&stdout,
+		&stderr,
+	)
+	if err == nil || !strings.Contains(err.Error(), "--adopt-existing") {
+		t.Fatalf("install dry-run error = %v, want explicit-adoption rejection", err)
+	}
+	stdout.Reset()
+	err = Run(
+		t.Context(),
+		[]string{"install", "--system", "unknown", "--dry-run", "--adopt-existing"},
+		&stdout,
+		&stderr,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(stdout.String(), "adopt strictly validated existing resources") {
+		t.Fatalf("install dry-run omitted adoption action: %s", stdout.String())
+	}
+	for _, path := range []string{
+		filepath.Join(configDir, ".wg-mix-ebpf-cleanup.json"),
+		binaryPath,
+	} {
+		if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("install dry-run wrote %s: %v", path, statErr)
+		}
 	}
 }
 

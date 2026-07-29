@@ -573,6 +573,115 @@ func TestInstallWritesCleanupOwnershipManifest(t *testing.T) {
 	}
 }
 
+func TestInstallRequiresExplicitAdoptionBeforeWrites(t *testing.T) {
+	layout := newUnmarkedCleanupTestLayout(t, "adoption-required", "unknown")
+	setCleanupTestEnvironment(t, layout)
+	configBefore, err := os.ReadFile(layout.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(layout.RunDir, "lock")
+	lockBefore, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	lifecycleRoot := t.TempDir()
+	_, err = Install(
+		lockfile.WithLifecyclePathsForTest(
+			t.Context(),
+			filepath.Join(lifecycleRoot, "daemon.lease"),
+			filepath.Join(lifecycleRoot, "maintenance.gate"),
+		),
+		Options{System: "unknown"},
+	)
+	if err == nil || !strings.Contains(err.Error(), "--adopt-existing") {
+		t.Fatalf("install error = %v, want explicit-adoption rejection", err)
+	}
+	for _, path := range []string{cleanupManifestPath(layout), layout.BinaryPath} {
+		if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("install wrote %s before explicit adoption: %v", path, statErr)
+		}
+	}
+	configAfter, err := os.ReadFile(layout.ConfigPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(configAfter) != string(configBefore) {
+		t.Fatal("rejected adoption changed the existing config")
+	}
+	lockAfter, err := os.Stat(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(lockBefore, lockAfter) {
+		t.Fatal("rejected adoption replaced the existing runtime lock")
+	}
+}
+
+func TestInstallExplicitlyAdoptsValidatedResources(t *testing.T) {
+	layout := newUnmarkedCleanupTestLayout(t, "adoption-approved", "unknown")
+	setCleanupTestEnvironment(t, layout)
+
+	lifecycleRoot := t.TempDir()
+	plan, err := Install(
+		lockfile.WithLifecyclePathsForTest(
+			t.Context(),
+			filepath.Join(lifecycleRoot, "daemon.lease"),
+			filepath.Join(lifecycleRoot, "maintenance.gate"),
+		),
+		Options{System: "unknown", AdoptExisting: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsAction(plan.Actions, "adopt strictly validated existing resources") {
+		t.Fatalf("install plan omitted explicit adoption: %#v", plan.Actions)
+	}
+	data, err := os.ReadFile(cleanupManifestPath(layout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var manifest cleanupManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
+		t.Fatal(err)
+	}
+	if err := manifest.validateAgainst(layout, "unknown"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(layout.BinaryPath); err != nil {
+		t.Fatalf("explicit adoption did not finish installation: %v", err)
+	}
+}
+
+func TestInstallDryRunValidatesExplicitAdoptionWithoutWrites(t *testing.T) {
+	layout := newUnmarkedCleanupTestLayout(t, "adoption-dry-run", "unknown")
+	setCleanupTestEnvironment(t, layout)
+
+	if _, err := Install(t.Context(), Options{
+		System: "unknown",
+		DryRun: true,
+	}); err == nil || !strings.Contains(err.Error(), "--adopt-existing") {
+		t.Fatalf("dry-run error = %v, want explicit-adoption rejection", err)
+	}
+	plan, err := Install(t.Context(), Options{
+		System:        "unknown",
+		DryRun:        true,
+		AdoptExisting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !containsAction(plan.Actions, "adopt strictly validated existing resources") {
+		t.Fatalf("dry-run plan omitted explicit adoption: %#v", plan.Actions)
+	}
+	for _, path := range []string{cleanupManifestPath(layout), layout.BinaryPath} {
+		if _, statErr := os.Lstat(path); !errors.Is(statErr, os.ErrNotExist) {
+			t.Fatalf("dry-run adoption wrote %s: %v", path, statErr)
+		}
+	}
+}
+
 func TestWriteCleanupManifestPreservesValidatedMarkerIdentity(t *testing.T) {
 	layout := newCleanupTestLayout(t, "marker-idempotent")
 	markerPath := cleanupManifestPath(layout)
@@ -580,7 +689,7 @@ func TestWriteCleanupManifestPreservesValidatedMarkerIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := writeCleanupManifest(layout, "unknown"); err != nil {
+	if err := writeCleanupManifest(layout, "unknown", cleanupManifestWriteOptions{}); err != nil {
 		t.Fatal(err)
 	}
 	after, err := os.Stat(markerPath)
@@ -611,7 +720,11 @@ func TestWriteCleanupManifestRefusesUnknownUnmarkedResource(t *testing.T) {
 	if err := os.WriteFile(foreignPath, []byte("keep\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	err := writeCleanupManifest(layout, "unknown")
+	err := writeCleanupManifest(
+		layout,
+		"unknown",
+		cleanupManifestWriteOptions{AdoptExisting: true},
+	)
 	if err == nil || !strings.Contains(err.Error(), "unmarked runtime") {
 		t.Fatalf("manifest bootstrap error = %v, want foreign-resource rejection", err)
 	}
@@ -870,7 +983,11 @@ func TestCleanupQuarantineRestoresForeignFileSwappedAtFinalHook(t *testing.T) {
 	if err := os.WriteFile(unitPath, []byte(expectedUnit), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeCleanupManifest(layout, "systemd"); err != nil {
+	if err := writeCleanupManifest(
+		layout,
+		"systemd",
+		cleanupManifestWriteOptions{AdoptExisting: true},
+	); err != nil {
 		t.Fatal(err)
 	}
 	plan, err := prepareUninstallCleanup(
@@ -924,7 +1041,11 @@ func TestCleanupQuarantineRestoresForeignRootSwappedAtFinalHook(t *testing.T) {
 	if err := config.SaveFile(layout.ConfigPath, config.SafeTemplate()); err != nil {
 		t.Fatal(err)
 	}
-	if err := writeCleanupManifest(layout, "unknown"); err != nil {
+	if err := writeCleanupManifest(
+		layout,
+		"unknown",
+		cleanupManifestWriteOptions{AdoptExisting: true},
+	); err != nil {
 		t.Fatal(err)
 	}
 	plan, err := prepareUninstallCleanup(
@@ -1215,11 +1336,20 @@ func newCleanupTestLayout(t *testing.T, suffix string) paths {
 
 func newCleanupTestLayoutForSystem(t *testing.T, suffix string, system string) paths {
 	t.Helper()
-	root, err := filepath.EvalSymlinks(t.TempDir())
-	if err != nil {
+	layout := newUnmarkedCleanupTestLayout(t, suffix, system)
+	if err := writeCleanupManifest(
+		layout,
+		system,
+		cleanupManifestWriteOptions{AdoptExisting: true},
+	); err != nil {
 		t.Fatal(err)
 	}
-	layout := cleanupTestPaths(root, suffix)
+	return layout
+}
+
+func newUnmarkedCleanupTestLayout(t *testing.T, suffix string, system string) paths {
+	t.Helper()
+	layout := cleanupTestPaths(t.TempDir(), suffix)
 	for _, dir := range []string{
 		filepath.Dir(layout.ConfigPath),
 		layout.RunDir,
@@ -1268,9 +1398,6 @@ func newCleanupTestLayoutForSystem(t *testing.T, suffix string, system string) p
 		); err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := writeCleanupManifest(layout, system); err != nil {
-		t.Fatal(err)
 	}
 	return layout
 }

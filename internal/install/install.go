@@ -31,12 +31,13 @@ const (
 )
 
 type Options struct {
-	ConfigPath string
-	System     string
-	Enable     bool
-	DryRun     bool
-	Yes        bool
-	Purge      bool
+	ConfigPath    string
+	System        string
+	Enable        bool
+	DryRun        bool
+	Yes           bool
+	Purge         bool
+	AdoptExisting bool
 }
 
 type Plan struct {
@@ -55,6 +56,21 @@ func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if err := validateInstallOwnershipPaths(paths); err != nil {
 		return nil, err
 	}
+	ownership, err := inspectInstallCleanupOwnership(paths, system)
+	if err != nil {
+		return nil, err
+	}
+	if ownership == cleanupOwnershipUnmarked && !opts.AdoptExisting {
+		return nil, errors.New(
+			"refuse to adopt unmarked installation resources without explicit authorization; " +
+				"review the resolved paths and rerun install with --adopt-existing",
+		)
+	}
+	if ownership == cleanupOwnershipUnmarked {
+		if err := validateUnmarkedCleanupResources(paths, system); err != nil {
+			return nil, fmt.Errorf("validate explicitly adopted installation resources: %w", err)
+		}
+	}
 	plan := &Plan{System: system, ConfigPath: paths.ConfigPath, BinaryPath: paths.BinaryPath}
 	add := func(format string, args ...any) { plan.Actions = append(plan.Actions, fmt.Sprintf(format, args...)) }
 
@@ -63,6 +79,9 @@ func Install(ctx context.Context, opts Options) (*Plan, error) {
 	add("ensure directory %s", paths.RunDir)
 	add("install binary to %s", paths.BinaryPath)
 	add("write safe template if %s is missing", paths.ConfigPath)
+	if ownership == cleanupOwnershipUnmarked {
+		add("adopt strictly validated existing resources under installation ownership")
+	}
 	switch system {
 	case "systemd":
 		add("write systemd unit %s", filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"))
@@ -90,7 +109,7 @@ func Install(ctx context.Context, opts Options) (*Plan, error) {
 	}
 	if err := lockfile.WithLifecycle(ctx, nil, owner, func(*lockfile.LifecycleLease) error {
 		return lockfile.WithLock(ctx, paths.RunDir, func() error {
-			return applyInstall(ctx, opts, system, paths)
+			return applyInstall(ctx, opts, system, paths, ownership)
 		})
 	}); err != nil {
 		return nil, err
@@ -98,13 +117,22 @@ func Install(ctx context.Context, opts Options) (*Plan, error) {
 	return plan, nil
 }
 
-func applyInstall(ctx context.Context, opts Options, system string, paths paths) error {
+func applyInstall(
+	ctx context.Context,
+	opts Options,
+	system string,
+	paths paths,
+	ownership cleanupOwnershipState,
+) error {
 	for _, dir := range []string{filepath.Dir(paths.ConfigPath), paths.VarLibDir, paths.RunDir} {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			return fmt.Errorf("create %s: %w", dir, err)
 		}
 	}
-	if err := writeCleanupManifest(paths, system); err != nil {
+	if err := writeCleanupManifest(paths, system, cleanupManifestWriteOptions{
+		Fresh:         ownership == cleanupOwnershipAbsent,
+		AdoptExisting: ownership == cleanupOwnershipUnmarked && opts.AdoptExisting,
+	}); err != nil {
 		return err
 	}
 	if err := installBinary(paths.BinaryPath); err != nil {

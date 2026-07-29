@@ -39,6 +39,19 @@ type cleanupManifestArtifact struct {
 	SHA256 string `json:"sha256"`
 }
 
+type cleanupOwnershipState uint8
+
+const (
+	cleanupOwnershipAbsent cleanupOwnershipState = iota
+	cleanupOwnershipMarked
+	cleanupOwnershipUnmarked
+)
+
+type cleanupManifestWriteOptions struct {
+	Fresh         bool
+	AdoptExisting bool
+}
+
 func expectedCleanupManifest(paths paths, system string, installationID string) cleanupManifest {
 	manifest := cleanupManifest{
 		Version:        cleanupManifestVersion,
@@ -127,6 +140,41 @@ func cleanupManifestPath(paths paths) string {
 	return filepath.Join(filepath.Dir(paths.ConfigPath), cleanupManifestName)
 }
 
+func inspectInstallCleanupOwnership(
+	paths paths,
+	system string,
+) (state cleanupOwnershipState, retErr error) {
+	configDir, exists, err := openManagedCleanupDir(
+		configCleanupPath(filepath.Dir(paths.ConfigPath)),
+	)
+	if err != nil {
+		return cleanupOwnershipAbsent, err
+	}
+	if !exists {
+		if cleanupResourcesExist(paths, system) {
+			return cleanupOwnershipUnmarked, nil
+		}
+		return cleanupOwnershipAbsent, nil
+	}
+	defer func() {
+		if err := configDir.close(); err != nil {
+			retErr = errors.Join(retErr, fmt.Errorf("close cleanup ownership inspection handles: %w", err))
+		}
+	}()
+
+	manifest, _, err := readCleanupManifestFromDir(configDir.dir)
+	if cleanupIsNotExist(err) {
+		return cleanupOwnershipUnmarked, nil
+	}
+	if err != nil {
+		return cleanupOwnershipAbsent, err
+	}
+	if err := manifest.validateAgainst(paths, system); err != nil {
+		return cleanupOwnershipAbsent, err
+	}
+	return cleanupOwnershipMarked, nil
+}
+
 func readCleanupManifestFromDir(dir *cleanupDirFD) (*cleanupManifest, cleanupIdentity, error) {
 	file, identity, err := cleanupOpenFileAt(dir, cleanupManifestName)
 	if err != nil {
@@ -174,7 +222,11 @@ func decodeCleanupManifest(data []byte) (*cleanupManifest, error) {
 	return &manifest, nil
 }
 
-func writeCleanupManifest(paths paths, system string) (retErr error) {
+func writeCleanupManifest(
+	paths paths,
+	system string,
+	options cleanupManifestWriteOptions,
+) (retErr error) {
 	configDir, exists, err := openManagedCleanupDir(configCleanupPath(filepath.Dir(paths.ConfigPath)))
 	if err != nil {
 		return err
@@ -195,6 +247,12 @@ func writeCleanupManifest(paths paths, system string) (retErr error) {
 		// Avoid replacing its inode or opening an overwrite race on reinstall.
 		return nil
 	case cleanupIsNotExist(err):
+		if !options.Fresh && !options.AdoptExisting {
+			return errors.New(
+				"refuse to create cleanup ownership marker for unmarked resources " +
+					"without explicit adoption authorization",
+			)
+		}
 		installationID, err = newCleanupInstallationID()
 		if err != nil {
 			return err
