@@ -81,6 +81,16 @@ func (e CommandExecutor) Apply(ctx context.Context, plan NftPlan) error {
 }
 
 func (e CommandExecutor) Cleanup(ctx context.Context) error {
+	legacy, err := e.inspect(ctx, TableName)
+	if err != nil {
+		return fmt.Errorf("inspect legacy startup guard table for cleanup: %w", err)
+	}
+	if legacy.Exists {
+		return fmt.Errorf(
+			"legacy startup guard table %s exists without instance ownership; manual migration is required before cleanup",
+			TableName,
+		)
+	}
 	owner, ok, err := e.loadOwnerIfPresent()
 	if err != nil {
 		return fmt.Errorf("load guard ownership for cleanup: %w", err)
@@ -163,7 +173,7 @@ func (e CommandExecutor) inspect(ctx context.Context, table string) (tableIdenti
 	if err != nil {
 		wrapped := fmt.Errorf("%s -j -a list table inet %s failed: %w: %s", binary, table, err, string(out))
 		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) && isMissingTable(wrapped, table) {
+		if errors.As(err, &exitErr) && isMissingTableDiagnostic(out, table) {
 			return tableIdentity{}, nil
 		}
 		return tableIdentity{}, wrapped
@@ -210,19 +220,23 @@ func parseTableIdentityJSON(data []byte, table string) (tableIdentity, error) {
 	return found[0], nil
 }
 
-func isMissingGuardTable(err error) bool {
-	return isMissingTable(err, TableName)
-}
-
-func isMissingTable(err error, table string) bool {
-	if err == nil {
+func isMissingTableDiagnostic(output []byte, table string) bool {
+	if len(output) == 0 || table == "" {
 		return false
 	}
-	lower := strings.ToLower(err.Error())
-	return strings.Contains(lower, strings.ToLower(table)) &&
-		(strings.Contains(lower, "no such file") ||
-			strings.Contains(lower, "does not exist") ||
-			strings.Contains(lower, "not found"))
+	lower := strings.ToLower(string(output))
+	missing := strings.Contains(lower, "no such file or directory") ||
+		strings.Contains(lower, "does not exist")
+	if !missing {
+		return false
+	}
+	expectedRequest := "list table inet " + strings.ToLower(table)
+	for _, line := range strings.Split(lower, "\n") {
+		if strings.TrimSpace(line) == expectedRequest {
+			return true
+		}
+	}
+	return false
 }
 
 type DryRunExecutor struct {

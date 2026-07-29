@@ -1011,6 +1011,10 @@ func TestLifecycleLeaseDoesNotConflictWithOperationLock(t *testing.T) {
 
 func TestDaemonCleanupReusesHeldLeaseWithoutSelfLock(t *testing.T) {
 	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	runDir := filepath.Join(root, "run")
 	leasePath := filepath.Join(root, "daemon.lease")
 	configPath := filepath.Join(root, "config.yaml")
@@ -1018,7 +1022,9 @@ func TestDaemonCleanupReusesHeldLeaseWithoutSelfLock(t *testing.T) {
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte(
+		"#!/bin/sh\nprintf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\nexit 1\n",
+	), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))

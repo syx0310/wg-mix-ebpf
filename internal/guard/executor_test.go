@@ -41,15 +41,15 @@ func TestDryRunExecutor(t *testing.T) {
 }
 
 func TestMissingGuardTableErrorIsIdempotent(t *testing.T) {
-	err := errors.New("nft -f - failed: Error: Could not process rule: No such file or directory; delete table inet wg_mix_ebpf_guard")
-	if !isMissingGuardTable(err) {
+	diagnostic := []byte("Error: Could not process rule: No such file or directory\nlist table inet wg_mix_ebpf_guard\n^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n")
+	if !isMissingTableDiagnostic(diagnostic, TableName) {
 		t.Fatal("expected missing guard table error to be treated as idempotent")
 	}
 }
 
 func TestMissingTableClassifierRejectsWrapperOnlyTableName(t *testing.T) {
-	err := errors.New("nft -j -a list table inet wg_mix_ebpf_guard failed: exit status 1: libnftables.so: No such file or directory")
-	if isMissingTable(err, TableName) {
+	diagnostic := []byte("libnftables.so: No such file or directory")
+	if isMissingTableDiagnostic(diagnostic, TableName) {
 		t.Fatal("an unrelated runtime failure must not be classified as an absent table")
 	}
 }
@@ -63,7 +63,7 @@ func TestParseTableIdentityJSONRequiresHandleAndComment(t *testing.T) {
 				"family": "inet",
 				"name": "wg_mix_ebpf_guard_0123456789abcdef",
 				"handle": 42,
-				"comment": "wg-mix-ebpf-guard-v1:012345"
+				"comment": "wg-mix-ebpf-guard-v2:012345"
 			}},
 			{"chain": {
 				"family": "inet",
@@ -76,7 +76,7 @@ func TestParseTableIdentityJSONRequiresHandleAndComment(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !identity.Exists || identity.Handle != 42 || identity.Comment != "wg-mix-ebpf-guard-v1:012345" {
+	if !identity.Exists || identity.Handle != 42 || identity.Comment != "wg-mix-ebpf-guard-v2:012345" {
 		t.Fatalf("unexpected table identity: %#v", identity)
 	}
 }
@@ -98,7 +98,7 @@ func TestParseTableIdentityJSONRejectsMissingHandle(t *testing.T) {
 }
 
 func TestMissingNftBinaryCleanupFails(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := guardTestStateDir(t)
 	seedOwnerRecord(t, stateDir)
 	exec := CommandExecutor{
 		Binary:   filepath.Join(t.TempDir(), "missing-nft"),
@@ -111,7 +111,7 @@ func TestMissingNftBinaryCleanupFails(t *testing.T) {
 
 func TestApplyReplacesExistingTableInSingleTransaction(t *testing.T) {
 	plan := BuildNftPlan(&control.State{})
-	stateDir := t.TempDir()
+	stateDir := guardTestStateDir(t)
 	owner := seedOwnerRecord(t, stateDir)
 	var scripts []string
 	exec := CommandExecutor{
@@ -144,7 +144,7 @@ func TestApplyReplacesExistingTableInSingleTransaction(t *testing.T) {
 
 func TestApplyCreatesOnlyWhenOwnedTableIsMissing(t *testing.T) {
 	plan := BuildNftPlan(&control.State{})
-	stateDir := t.TempDir()
+	stateDir := guardTestStateDir(t)
 	owner := seedOwnerRecord(t, stateDir)
 	var scripts []string
 	exec := CommandExecutor{
@@ -177,7 +177,7 @@ func TestApplyCreatesOnlyWhenOwnedTableIsMissing(t *testing.T) {
 
 func TestApplyDoesNotFallbackOnInvalidReplacement(t *testing.T) {
 	plan := BuildNftPlan(&control.State{})
-	stateDir := t.TempDir()
+	stateDir := guardTestStateDir(t)
 	owner := seedOwnerRecord(t, stateDir)
 	var scripts []string
 	exec := CommandExecutor{
@@ -203,7 +203,7 @@ func TestApplyDoesNotFallbackOnInvalidReplacement(t *testing.T) {
 }
 
 func TestApplyDoesNotDeleteUnownedLegacyFixedTable(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := guardTestStateDir(t)
 	plan := BuildNftPlan(&control.State{})
 	var scripts []string
 	exec := CommandExecutor{
@@ -227,7 +227,7 @@ func TestApplyDoesNotDeleteUnownedLegacyFixedTable(t *testing.T) {
 }
 
 func TestApplyRejectsLegacyTableBeforeAnyWrite(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := guardTestStateDir(t)
 	var scripts []string
 	exec := CommandExecutor{
 		StateDir: stateDir,
@@ -255,7 +255,7 @@ func TestApplyRejectsLegacyTableBeforeAnyWrite(t *testing.T) {
 }
 
 func TestCleanupWithoutOwnerRecordIsZeroWrite(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := guardTestStateDir(t)
 	var scripts []string
 	exec := CommandExecutor{
 		StateDir: stateDir,
@@ -279,7 +279,7 @@ func TestCleanupWithoutOwnerRecordIsZeroWrite(t *testing.T) {
 }
 
 func TestCleanupWithoutOwnerRejectsLegacyTableWithZeroWrite(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := guardTestStateDir(t)
 	var scripts []string
 	exec := CommandExecutor{
 		StateDir: stateDir,
@@ -304,12 +304,18 @@ func TestCleanupWithoutOwnerRejectsLegacyTableWithZeroWrite(t *testing.T) {
 }
 
 func TestCleanupRejectsForeignMarkerWithZeroWrite(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := guardTestStateDir(t)
 	owner := seedOwnerRecord(t, stateDir)
 	var scripts []string
 	exec := CommandExecutor{
 		StateDir: stateDir,
-		inspectTable: func(context.Context, string) (tableIdentity, error) {
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			if table == TableName {
+				return tableIdentity{}, nil
+			}
+			if table != owner.Table {
+				t.Fatalf("unexpected inspection of %q", table)
+			}
 			return tableIdentity{Exists: true, Handle: 44, Comment: "foreign-owner"}, nil
 		},
 		runScript: func(_ context.Context, script string) error {
@@ -327,7 +333,7 @@ func TestCleanupRejectsForeignMarkerWithZeroWrite(t *testing.T) {
 }
 
 func TestApplyRejectsForeignMarkerWithZeroWrite(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := guardTestStateDir(t)
 	owner := seedOwnerRecord(t, stateDir)
 	var scripts []string
 	exec := CommandExecutor{
@@ -353,15 +359,24 @@ func TestApplyRejectsForeignMarkerWithZeroWrite(t *testing.T) {
 }
 
 func TestCleanupDeletesMatchingTableByHandleAndVerifiesAbsence(t *testing.T) {
-	stateDir := t.TempDir()
+	stateDir := guardTestStateDir(t)
 	owner := seedOwnerRecord(t, stateDir)
 	inspections := 0
 	var scripts []string
 	exec := CommandExecutor{
 		StateDir: stateDir,
-		inspectTable: func(context.Context, string) (tableIdentity, error) {
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
 			inspections++
 			if inspections == 1 {
+				if table != TableName {
+					t.Fatalf("first inspection = %q, want legacy table", table)
+				}
+				return tableIdentity{}, nil
+			}
+			if table != owner.Table {
+				t.Fatalf("owned inspection = %q, want %q", table, owner.Table)
+			}
+			if inspections == 2 {
 				return tableIdentity{Exists: true, Handle: 52, Comment: owner.Marker}, nil
 			}
 			return tableIdentity{}, nil

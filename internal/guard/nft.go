@@ -20,7 +20,7 @@ type NftPlan struct {
 
 func (p NftPlan) Script() string {
 	lines := []string{
-		"# template only: resolve the instance-owned table from guard-owner.v1.json",
+		"# template only: resolve the instance-owned table from " + OwnerRecordFileName,
 		"# the angle-bracket placeholder intentionally makes this template non-executable",
 		"create table inet " + planTablePlaceholder,
 		"add chain inet " + planTablePlaceholder + " output { type filter hook output priority -300; policy accept; }",
@@ -44,7 +44,7 @@ func (p NftPlan) ownedCreateScript(owner ownerRecord) (string, error) {
 	if p.Table != TableName {
 		return "", fmt.Errorf("guard plan table %q is not the logical table %q", p.Table, TableName)
 	}
-	if err := owner.validate(owner.StateDir); err != nil {
+	if err := owner.validateSelf(); err != nil {
 		return "", err
 	}
 	lines := []string{
@@ -74,7 +74,7 @@ func (p NftPlan) ownedReplacementScript(owner ownerRecord, handle uint64) (strin
 }
 
 func CleanupScript() string {
-	return "# cleanup requires guard-owner.v1.json and a matching kernel marker\n" +
+	return "# cleanup requires " + OwnerRecordFileName + " and a matching kernel marker\n" +
 		"# delete table inet handle <validated-handle>\n"
 }
 
