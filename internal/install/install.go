@@ -51,8 +51,8 @@ type Plan struct {
 type installAfterInspectHookContextKey struct{}
 type installAfterLifecycleHookContextKey struct{}
 type installAfterSystemdEnableLinkHookContextKey struct{}
-type installBeforeSystemdEnableParentCreateHookContextKey struct{}
-type installAfterSystemdEnableRollbackQuarantineHookContextKey struct{}
+type installAfterSystemdEnableCommitWalkOpenHookContextKey struct{}
+type installAfterSystemdEnableRetentionCheckHookContextKey struct{}
 
 func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if err := ctx.Err(); err != nil {
@@ -257,12 +257,12 @@ func applyInstall(
 		if err := publication.revalidateOwnedInstallMetadata(); err != nil {
 			return err
 		}
-	} else if _, err := os.Stat(paths.ConfigPath); errors.Is(err, os.ErrNotExist) {
-		if err := config.SaveFile(paths.ConfigPath, config.SafeTemplate()); err != nil {
-			return err
-		}
-	} else if err != nil {
-		return fmt.Errorf("stat config %s: %w", paths.ConfigPath, err)
+	} else if err := ensureInstallConfigArtifact(
+		publication.configDir,
+		paths.ConfigPath,
+		ownership != cleanupOwnershipAbsent,
+	); err != nil {
+		return err
 	}
 	if err := publication.revalidateOwnedInstallMetadata(); err != nil {
 		return err
@@ -325,7 +325,10 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	add("remove state dir %s", paths.VarLibDir)
 	switch system {
 	case "systemd":
-		add("remove the exact owned systemd enable link if present")
+		add(
+			"require manual resolution of the systemd enable link if present; " +
+				"automatic cleanup is blocked without a durable inode identity",
+		)
 		add("remove systemd unit %s", filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"))
 		add("reload systemd manager after removing the owned unit")
 	case "openwrt":

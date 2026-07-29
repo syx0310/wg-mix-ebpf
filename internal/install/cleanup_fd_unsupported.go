@@ -17,6 +17,10 @@ func cleanupOpenDirAt(*cleanupDirFD, string) (*cleanupDirFD, error) {
 	return nil, errSecureCleanupUnsupported
 }
 
+func cleanupOpenDirAtAllowMount(*cleanupDirFD, string) (*cleanupDirFD, error) {
+	return nil, errSecureCleanupUnsupported
+}
+
 func cleanupIdentityForFD(int) (cleanupIdentity, error) {
 	return cleanupIdentity{}, errSecureCleanupUnsupported
 }

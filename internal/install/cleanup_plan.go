@@ -21,18 +21,42 @@ import (
 const maxManagedCleanupFileSize = 4 << 20
 
 type managedCleanupDir struct {
-	spec     cleanupPathSpec
-	parent   *cleanupDirFD
-	dir      *cleanupDirFD
-	name     string
-	identity cleanupIdentity
+	spec                  cleanupPathSpec
+	parent                *cleanupDirFD
+	dir                   *cleanupDirFD
+	name                  string
+	identity              cleanupIdentity
+	declaredChain         []*cleanupDirFD
+	declaredEdges         []string
+	declaredCanonicalRoot string
+	declaredCanonicalPath string
+	declaredRootDepth     int
 }
 
 func (dir *managedCleanupDir) close() error {
 	if dir == nil {
 		return nil
 	}
+	if len(dir.declaredChain) != 0 {
+		err := closeCleanupDirFDChain(dir.declaredChain)
+		dir.declaredChain = nil
+		dir.declaredEdges = nil
+		dir.declaredCanonicalRoot = ""
+		dir.declaredCanonicalPath = ""
+		dir.declaredRootDepth = 0
+		dir.parent = nil
+		dir.dir = nil
+		return err
+	}
 	return errors.Join(dir.dir.close(), dir.parent.close())
+}
+
+func closeCleanupDirFDChain(chain []*cleanupDirFD) error {
+	var errs []error
+	for index := len(chain) - 1; index >= 0; index-- {
+		errs = append(errs, chain[index].close())
+	}
+	return errors.Join(errs...)
 }
 
 type managedDirOpenOptions struct {
@@ -133,6 +157,9 @@ func revalidateManagedCleanupDir(dir *managedCleanupDir) error {
 	if dir == nil || dir.parent == nil || dir.dir == nil || dir.dir.file == nil {
 		return errors.New("cannot revalidate an unheld managed directory")
 	}
+	if len(dir.declaredChain) != 0 {
+		return revalidateDeclaredDirectoryChain(dir)
+	}
 	heldIdentity, err := cleanupIdentityForFD(int(dir.dir.file.Fd()))
 	if err != nil {
 		return fmt.Errorf("inspect held %s %s: %w", dir.spec.name, dir.spec.path, err)
@@ -146,6 +173,214 @@ func revalidateManagedCleanupDir(dir *managedCleanupDir) error {
 	}
 	if !heldIdentity.sameDirectory(namedIdentity) {
 		return fmt.Errorf("refuse %s %s: pathname no longer names the held directory", dir.spec.name, dir.spec.path)
+	}
+	return nil
+}
+
+func revalidateDeclaredDirectoryChain(dir *managedCleanupDir) (retErr error) {
+	if dir == nil || len(dir.declaredChain) < 2 ||
+		len(dir.declaredEdges)+1 != len(dir.declaredChain) ||
+		dir.declaredRootDepth < 0 ||
+		dir.declaredRootDepth > len(dir.declaredEdges) ||
+		dir.declaredCanonicalRoot == "" ||
+		dir.declaredCanonicalPath == "" {
+		return errors.New("cannot revalidate an incomplete declared directory chain")
+	}
+	last := len(dir.declaredChain) - 1
+	if dir.parent != dir.declaredChain[last-1] ||
+		dir.dir != dir.declaredChain[last] ||
+		dir.name != dir.declaredEdges[last-1] {
+		return errors.New("declared directory chain lost its final parent edge")
+	}
+	if err := revalidateDeclaredCanonicalRoot(dir); err != nil {
+		return err
+	}
+
+	kernelRoot := string(os.PathSeparator)
+	reopenedAnchor, err := cleanupOpenAnchor(kernelRoot)
+	if err != nil {
+		return fmt.Errorf(
+			"reopen kernel root for declared directory %s: %w",
+			dir.spec.path,
+			err,
+		)
+	}
+	defer func() {
+		if err := reopenedAnchor.close(); err != nil {
+			retErr = errors.Join(
+				retErr,
+				fmt.Errorf("close reopened kernel root for %s: %w", dir.spec.path, err),
+			)
+		}
+	}()
+	if !dir.declaredChain[0].identity.sameDirectory(reopenedAnchor.identity) {
+		return fmt.Errorf(
+			"refuse declared directory %s: kernel root identity changed",
+			dir.spec.path,
+		)
+	}
+
+	for index, held := range dir.declaredChain {
+		if held == nil || held.file == nil {
+			return fmt.Errorf(
+				"refuse declared directory %s: component %d is no longer held",
+				dir.spec.path,
+				index,
+			)
+		}
+		heldIdentity, err := cleanupIdentityForFD(int(held.file.Fd()))
+		if err != nil {
+			return fmt.Errorf(
+				"inspect held declared directory component %s: %w",
+				held.path,
+				err,
+			)
+		}
+		if !held.identity.sameDirectory(heldIdentity) {
+			return fmt.Errorf(
+				"refuse declared directory %s: held component identity changed at %s",
+				dir.spec.path,
+				held.path,
+			)
+		}
+		if index == 0 {
+			continue
+		}
+		namedIdentity, err := declaredDirectoryEdgeIdentity(dir, index-1)
+		if err != nil {
+			return fmt.Errorf(
+				"revalidate declared directory edge %s: %w",
+				held.path,
+				err,
+			)
+		}
+		if !heldIdentity.sameDirectory(namedIdentity) {
+			return fmt.Errorf(
+				"refuse declared directory %s: parent edge no longer names held component %s",
+				dir.spec.path,
+				held.path,
+			)
+		}
+	}
+	if err := revalidateDeclaredCanonicalRoot(dir); err != nil {
+		return err
+	}
+	return nil
+}
+
+func declaredDirectoryEdgeIdentity(
+	dir *managedCleanupDir,
+	edgeIndex int,
+) (cleanupIdentity, error) {
+	parent := dir.declaredChain[edgeIndex]
+	name := dir.declaredEdges[edgeIndex]
+	if !declaredDirectoryEdgeMayCrossMount(edgeIndex, dir.declaredRootDepth) {
+		return cleanupIdentityAt(parent, name)
+	}
+	child, err := cleanupOpenDirAtAllowMount(parent, name)
+	if err != nil {
+		return cleanupIdentity{}, err
+	}
+	identity := child.identity
+	if err := child.close(); err != nil {
+		return cleanupIdentity{}, err
+	}
+	return identity, nil
+}
+
+func declaredDirectoryEdgeMayCrossMount(edgeIndex int, rootDepth int) bool {
+	// The canonical walk from the kernel root through systemRoot may contain
+	// ordinary system mount transitions such as a separate /usr or /etc.
+	// Once systemRoot is reached, the artifact-relative subtree remains on
+	// that fixed mount.
+	return edgeIndex >= 0 && edgeIndex < rootDepth
+}
+
+func revalidateDeclaredCanonicalRoot(dir *managedCleanupDir) error {
+	canonicalRoot, err := filepath.EvalSymlinks(dir.spec.systemRoot)
+	if err != nil {
+		return fmt.Errorf(
+			"resolve declared root %s during revalidation: %w",
+			dir.spec.systemRoot,
+			err,
+		)
+	}
+	canonicalRoot = filepath.Clean(canonicalRoot)
+	if canonicalRoot != dir.declaredCanonicalRoot {
+		return fmt.Errorf(
+			"refuse declared directory %s: canonical root changed from %s to %s",
+			dir.spec.path,
+			dir.declaredCanonicalRoot,
+			canonicalRoot,
+		)
+	}
+	relative, err := filepath.Rel(dir.spec.systemRoot, dir.spec.path)
+	if err != nil {
+		return fmt.Errorf("recompute declared path relative to canonical root: %w", err)
+	}
+	if filepath.Clean(filepath.Join(canonicalRoot, relative)) !=
+		dir.declaredCanonicalPath {
+		return fmt.Errorf(
+			"refuse declared directory %s: canonical target path changed",
+			dir.spec.path,
+		)
+	}
+	return nil
+}
+
+func compareDeclaredDirectoryChains(
+	held *managedCleanupDir,
+	reopened *managedCleanupDir,
+) error {
+	if held == nil || reopened == nil ||
+		len(held.declaredChain) == 0 ||
+		len(held.declaredChain) != len(reopened.declaredChain) ||
+		len(held.declaredEdges) != len(reopened.declaredEdges) {
+		return errors.New("declared directory walks produced different chain lengths")
+	}
+	if held.spec.path != reopened.spec.path ||
+		held.spec.systemRoot != reopened.spec.systemRoot ||
+		held.declaredCanonicalRoot != reopened.declaredCanonicalRoot ||
+		held.declaredCanonicalPath != reopened.declaredCanonicalPath ||
+		held.declaredRootDepth != reopened.declaredRootDepth {
+		return errors.New("declared directory walks used different roots")
+	}
+	for index := range held.declaredChain {
+		if index > 0 &&
+			held.declaredEdges[index-1] != reopened.declaredEdges[index-1] {
+			return fmt.Errorf(
+				"declared directory walks used different edge %d",
+				index,
+			)
+		}
+		heldIdentity, err := cleanupIdentityForFD(
+			int(held.declaredChain[index].file.Fd()),
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"inspect held declared chain component %s: %w",
+				held.declaredChain[index].path,
+				err,
+			)
+		}
+		reopenedIdentity, err := cleanupIdentityForFD(
+			int(reopened.declaredChain[index].file.Fd()),
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"inspect reopened declared chain component %s: %w",
+				reopened.declaredChain[index].path,
+				err,
+			)
+		}
+		if !held.declaredChain[index].identity.sameDirectory(heldIdentity) ||
+			!reopened.declaredChain[index].identity.sameDirectory(reopenedIdentity) ||
+			!heldIdentity.sameDirectory(reopenedIdentity) {
+			return fmt.Errorf(
+				"declared path no longer reaches the held component %s",
+				held.declaredChain[index].path,
+			)
+		}
 	}
 	return nil
 }
@@ -1084,8 +1319,7 @@ func preparePinDirectoryPlan(pinPath string) (*cleanupDirectoryPlan, error) {
 }
 
 func prepareArtifactPlans(manifest cleanupManifest) ([]*cleanupDirectoryPlan, error) {
-	var linkPlans []*cleanupDirectoryPlan
-	var filePlans []*cleanupDirectoryPlan
+	var plans []*cleanupDirectoryPlan
 	for _, artifact := range manifest.Artifacts {
 		defaultParent := ""
 		switch artifact.Kind {
@@ -1102,8 +1336,7 @@ func prepareArtifactPlans(manifest cleanupManifest) ([]*cleanupDirectoryPlan, er
 		}
 		parent, exists, err := openDeclaredArtifactParent(filepath.Dir(artifact.Path), defaultParent)
 		if err != nil {
-			closeCleanupDirectoryPlans(linkPlans)
-			closeCleanupDirectoryPlans(filePlans)
+			closeCleanupDirectoryPlans(plans)
 			return nil, err
 		}
 		if !exists {
@@ -1132,9 +1365,22 @@ func prepareArtifactPlans(manifest cleanupManifest) ([]*cleanupDirectoryPlan, er
 		}
 		if err != nil {
 			_ = parent.close()
-			closeCleanupDirectoryPlans(linkPlans)
-			closeCleanupDirectoryPlans(filePlans)
+			closeCleanupDirectoryPlans(plans)
 			return nil, err
+		}
+		if artifact.Kind == systemdEnableLinkKind {
+			closeErr := errors.Join(node.close(), parent.close())
+			closeCleanupDirectoryPlans(plans)
+			return nil, errors.Join(
+				fmt.Errorf(
+					"refuse automatic cleanup of systemd enable link %s: "+
+						"the published manifest records path and target but not a durable "+
+						"symlink inode identity; manually inspect and remove or retain the "+
+						"exact link, then retry validated uninstall",
+					artifact.Path,
+				),
+				closeErr,
+			)
 		}
 		node.remove = true
 		plan := &cleanupDirectoryPlan{
@@ -1143,21 +1389,30 @@ func prepareArtifactPlans(manifest cleanupManifest) ([]*cleanupDirectoryPlan, er
 			strictEntries: false,
 			removeRoot:    false,
 		}
-		if artifact.Kind == systemdEnableLinkKind {
-			linkPlans = append(linkPlans, plan)
-		} else {
-			filePlans = append(filePlans, plan)
-		}
+		plans = append(plans, plan)
 	}
-	return append(linkPlans, filePlans...), nil
+	return plans, nil
 }
 
 func openDeclaredArtifactParent(path string, defaultPath string) (*managedCleanupDir, bool, error) {
+	return openDeclaredArtifactParentWithOptions(
+		path,
+		defaultPath,
+		exactDeclaredDirectoryOpenOptions{},
+	)
+}
+
+func openDeclaredArtifactParentWithOptions(
+	path string,
+	defaultPath string,
+	options exactDeclaredDirectoryOpenOptions,
+) (*managedCleanupDir, bool, error) {
 	spec, err := declaredArtifactPathSpec(path, defaultPath)
 	if err != nil {
 		return nil, false, err
 	}
-	return openExactDeclaredDirectory(spec)
+	dir, exists, _, err := openExactDeclaredDirectoryWithOptions(spec, options)
+	return dir, exists, err
 }
 
 func openOrCreateDeclaredArtifactParent(
@@ -1239,40 +1494,58 @@ func openExactDeclaredDirectory(spec cleanupPathSpec) (*managedCleanupDir, bool,
 type exactDeclaredDirectoryOpenOptions struct {
 	createFinal       bool
 	beforeFinalCreate func(string) error
+	afterOpen         func(string) error
 }
 
 func openExactDeclaredDirectoryWithOptions(
 	spec cleanupPathSpec,
 	options exactDeclaredDirectoryOpenOptions,
 ) (*managedCleanupDir, bool, bool, error) {
-	relative, err := filepath.Rel(spec.systemRoot, spec.path)
-	if err != nil || relative == "." || strings.HasPrefix(relative, "..") {
-		return nil, false, false, fmt.Errorf(
-			"refuse declared directory %s",
-			spec.path,
-		)
-	}
-	anchor, err := cleanupOpenAnchor(spec.systemRoot)
+	canonicalRoot, canonicalPath, rootComponents, relativeComponents, err :=
+		canonicalDeclaredDirectoryComponents(spec)
 	if err != nil {
 		return nil, false, false, err
 	}
+	components := append(
+		append([]string(nil), rootComponents...),
+		relativeComponents...,
+	)
+	kernelRoot := string(os.PathSeparator)
+	anchor, err := cleanupOpenAnchor(kernelRoot)
+	if err != nil {
+		return nil, false, false, fmt.Errorf(
+			"open kernel root for declared directory %s: %w",
+			spec.path,
+			err,
+		)
+	}
+	chain := []*cleanupDirFD{anchor}
 	current := anchor
 	owner := uint32(os.Geteuid())
-	if filepath.Clean(spec.systemRoot) != filepath.Clean(os.TempDir()) {
-		if err := anchor.identity.validateDirectory(spec.systemRoot, owner); err != nil {
-			_ = anchor.close()
-			return nil, false, false, err
-		}
+	canonicalTempRoot, err := filepath.EvalSymlinks(os.TempDir())
+	if err != nil {
+		_ = closeCleanupDirFDChain(chain)
+		return nil, false, false, fmt.Errorf(
+			"resolve canonical temporary root for declared directory %s: %w",
+			spec.path,
+			err,
+		)
 	}
-	components := strings.Split(relative, string(os.PathSeparator))
+	canonicalTempRoot = filepath.Clean(canonicalTempRoot)
 	for index, component := range components {
 		final := index == len(components)-1
-		child, openErr := cleanupOpenDirAt(current, component)
+		var child *cleanupDirFD
+		var openErr error
+		if declaredDirectoryEdgeMayCrossMount(index, len(rootComponents)) {
+			child, openErr = cleanupOpenDirAtAllowMount(current, component)
+		} else {
+			child, openErr = cleanupOpenDirAt(current, component)
+		}
 		created := false
 		if cleanupIsNotExist(openErr) && options.createFinal && final {
 			if options.beforeFinalCreate != nil {
 				if err := options.beforeFinalCreate(spec.path); err != nil {
-					_ = current.close()
+					_ = closeCleanupDirFDChain(chain)
 					return nil, false, false, fmt.Errorf(
 						"run service artifact directory pre-create hook: %w",
 						err,
@@ -1284,7 +1557,7 @@ func openExactDeclaredDirectoryWithOptions(
 			case createErr == nil:
 				created = true
 				if err := current.file.Sync(); err != nil {
-					_ = current.close()
+					_ = closeCleanupDirFDChain(chain)
 					return nil, false, false, fmt.Errorf(
 						"sync parent after creating declared artifact directory %s: %w",
 						spec.path,
@@ -1295,7 +1568,7 @@ func openExactDeclaredDirectoryWithOptions(
 				// A concurrent creator won the exclusive mkdirat. Open its
 				// directory, but never report it as transaction-created.
 			default:
-				_ = current.close()
+				_ = closeCleanupDirFDChain(chain)
 				return nil, false, false, fmt.Errorf(
 					"create service artifact directory %s: %w",
 					spec.path,
@@ -1305,31 +1578,162 @@ func openExactDeclaredDirectoryWithOptions(
 			child, openErr = cleanupOpenDirAt(current, component)
 		}
 		if cleanupIsNotExist(openErr) {
-			_ = current.close()
+			_ = closeCleanupDirFDChain(chain)
 			return nil, false, false, nil
 		}
 		if openErr != nil {
-			_ = current.close()
+			_ = closeCleanupDirFDChain(chain)
 			return nil, false, false, openErr
 		}
-		if err := child.identity.validateDirectory(child.path, owner); err != nil {
+		child.path = filepath.Join(current.path, component)
+		var validateErr error
+		if declaredDirectoryEdgeMayCrossMount(index, len(rootComponents)) {
+			validateErr = validateDeclaredCanonicalPrefix(
+				child.identity,
+				child.path,
+				canonicalTempRoot,
+				owner,
+			)
+		} else {
+			validateErr = child.identity.validateDirectory(child.path, owner)
+		}
+		if validateErr != nil {
 			_ = child.close()
-			_ = current.close()
-			return nil, false, false, err
+			_ = closeCleanupDirFDChain(chain)
+			return nil, false, false, validateErr
+		}
+		chain = append(chain, child)
+		if options.afterOpen != nil {
+			if err := options.afterOpen(child.path); err != nil {
+				_ = closeCleanupDirFDChain(chain)
+				return nil, false, false, fmt.Errorf(
+					"run declared directory post-open hook for %s: %w",
+					child.path,
+					err,
+				)
+			}
 		}
 		if final {
-			return &managedCleanupDir{
-				spec:     spec,
-				parent:   current,
-				dir:      child,
-				name:     component,
-				identity: child.identity,
-			}, true, created, nil
+			dir := &managedCleanupDir{
+				spec:                  spec,
+				parent:                current,
+				dir:                   child,
+				name:                  component,
+				identity:              child.identity,
+				declaredChain:         chain,
+				declaredEdges:         append([]string(nil), components...),
+				declaredCanonicalRoot: canonicalRoot,
+				declaredCanonicalPath: canonicalPath,
+				declaredRootDepth:     len(rootComponents),
+			}
+			if err := revalidateManagedCleanupDir(dir); err != nil {
+				return nil, false, false, errors.Join(err, dir.close())
+			}
+			return dir, true, created, nil
 		}
-		_ = current.close()
 		current = child
 	}
+	_ = closeCleanupDirFDChain(chain)
 	return nil, false, false, errors.New("empty declared directory path")
+}
+
+func canonicalDeclaredDirectoryComponents(
+	spec cleanupPathSpec,
+) (
+	canonicalRoot string,
+	canonicalPath string,
+	rootComponents []string,
+	relativeComponents []string,
+	err error,
+) {
+	relative, err := filepath.Rel(spec.systemRoot, spec.path)
+	if err != nil || relative == "." || relative == ".." ||
+		strings.HasPrefix(relative, ".."+string(os.PathSeparator)) {
+		return "", "", nil, nil, fmt.Errorf(
+			"refuse declared directory %s outside root %s",
+			spec.path,
+			spec.systemRoot,
+		)
+	}
+	canonicalRoot, err = filepath.EvalSymlinks(spec.systemRoot)
+	if err != nil {
+		return "", "", nil, nil, fmt.Errorf(
+			"resolve declared root %s: %w",
+			spec.systemRoot,
+			err,
+		)
+	}
+	canonicalRoot = filepath.Clean(canonicalRoot)
+	if !filepath.IsAbs(canonicalRoot) {
+		return "", "", nil, nil, fmt.Errorf(
+			"refuse non-absolute canonical declared root %s",
+			canonicalRoot,
+		)
+	}
+	kernelRoot := string(os.PathSeparator)
+	rootRelative, err := filepath.Rel(kernelRoot, canonicalRoot)
+	if err != nil || rootRelative == ".." ||
+		strings.HasPrefix(rootRelative, ".."+string(os.PathSeparator)) {
+		return "", "", nil, nil, fmt.Errorf(
+			"refuse canonical declared root outside kernel root: %s",
+			canonicalRoot,
+		)
+	}
+	if rootRelative != "." {
+		rootComponents = strings.Split(rootRelative, string(os.PathSeparator))
+	}
+	relativeComponents = strings.Split(relative, string(os.PathSeparator))
+	for _, component := range append(
+		append([]string(nil), rootComponents...),
+		relativeComponents...,
+	) {
+		if component == "" || component == "." || component == ".." {
+			return "", "", nil, nil, fmt.Errorf(
+				"refuse unsafe declared directory component %q in %s",
+				component,
+				spec.path,
+			)
+		}
+	}
+	canonicalPath = filepath.Clean(filepath.Join(canonicalRoot, relative))
+	if canonicalPath == canonicalRoot || !pathContains(canonicalRoot, canonicalPath) {
+		return "", "", nil, nil, fmt.Errorf(
+			"refuse canonical declared directory %s outside root %s",
+			canonicalPath,
+			canonicalRoot,
+		)
+	}
+	return canonicalRoot, canonicalPath, rootComponents, relativeComponents, nil
+}
+
+func validateDeclaredCanonicalPrefix(
+	identity cleanupIdentity,
+	path string,
+	canonicalTempRoot string,
+	owner uint32,
+) error {
+	if identity.Mode&cleanupTypeMask != cleanupTypeDir {
+		return fmt.Errorf("refuse canonical declared prefix %s: not a directory", path)
+	}
+	if identity.UID != 0 && identity.UID != owner {
+		return fmt.Errorf(
+			"refuse canonical declared prefix %s: owner uid is %d, want root or %d",
+			path,
+			identity.UID,
+			owner,
+		)
+	}
+	if identity.Mode&0o022 == 0 {
+		return nil
+	}
+	if filepath.Clean(path) == canonicalTempRoot && identity.Mode&0o1000 != 0 {
+		return nil
+	}
+	return fmt.Errorf(
+		"refuse canonical declared prefix %s: group/other writable mode %#o",
+		path,
+		identity.Mode&0o7777,
+	)
 }
 
 func snapshotRuntimeQueue(parent *cleanupDirFD, name string) (*cleanupEntryPlan, error) {
@@ -1804,24 +2208,11 @@ func (directory *cleanupDirectoryPlan) moveRootToQuarantine(
 	return quarantineName, true, nil
 }
 
-type cleanupEntryQuarantineHooks struct {
-	beforeMove func(string) error
-	afterMove  func(string, string) error
-}
-
 func (entry *cleanupEntryPlan) unlink(beforeQuarantine func(string) error) error {
-	return entry.unlinkWithQuarantineHooks(cleanupEntryQuarantineHooks{
-		beforeMove: beforeQuarantine,
-	})
-}
-
-func (entry *cleanupEntryPlan) unlinkWithQuarantineHooks(
-	hooks cleanupEntryQuarantineHooks,
-) error {
 	if !entry.remove {
 		return nil
 	}
-	quarantineName, moved, err := entry.moveToQuarantine(hooks.beforeMove)
+	quarantineName, moved, err := entry.moveToQuarantine(beforeQuarantine)
 	if err != nil || !moved {
 		return err
 	}
@@ -1838,20 +2229,9 @@ func (entry *cleanupEntryPlan) unlinkWithQuarantineHooks(
 		)
 	}
 
-	if hooks.afterMove != nil {
-		quarantinePath := filepath.Join(entry.parent.path, quarantineName)
-		if err := hooks.afterMove(entry.path, quarantinePath); err != nil {
-			return restoreEntry(fmt.Errorf(
-				"run managed entry post-quarantine hook for %s: %w",
-				entry.path,
-				err,
-			))
-		}
-	}
-
 	if entry.directory {
 		for _, child := range entry.children {
-			if err := child.unlink(hooks.beforeMove); err != nil {
+			if err := child.unlink(beforeQuarantine); err != nil {
 				return restoreEntry(err)
 			}
 		}

@@ -485,11 +485,19 @@ func (publication *cleanupManifestPublication) publish() (retErr error) {
 	}
 	data = append(data, '\n')
 
+	tempPrefix := "." + cleanupManifestName + ".tmp-"
+	if err := refuseRetainedInstallTemporary(
+		publication.configDir.dir,
+		tempPrefix,
+		"cleanup ownership manifest",
+	); err != nil {
+		return err
+	}
 	randomSuffix, err := newCleanupInstallationID()
 	if err != nil {
 		return err
 	}
-	tempName := "." + cleanupManifestName + ".tmp-" + randomSuffix
+	tempName := tempPrefix + randomSuffix
 	file, err := cleanupCreateFileAt(publication.configDir.dir, tempName, 0o600)
 	if err != nil {
 		return fmt.Errorf("create temporary cleanup ownership manifest: %w", err)
@@ -497,17 +505,14 @@ func (publication *cleanupManifestPublication) publish() (retErr error) {
 	tempPresent := true
 	defer func() {
 		if tempPresent {
-			if err := cleanupUnlinkAt(
-				publication.configDir.dir,
-				tempName,
-				false,
-			); err != nil &&
-				!cleanupIsNotExist(err) {
-				retErr = errors.Join(
-					retErr,
-					fmt.Errorf("remove temporary cleanup ownership manifest %s: %w", tempName, err),
-				)
-			}
+			retErr = errors.Join(
+				retErr,
+				fmt.Errorf(
+					"temporary cleanup ownership manifest retained without name-based cleanup "+
+						"at %s; manually inspect its identity before removal",
+					filepath.Join(publication.configDir.spec.path, tempName),
+				),
+			)
 		}
 	}()
 	if _, err := file.Write(data); err != nil {

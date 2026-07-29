@@ -130,11 +130,19 @@ func installServiceArtifact(spec serviceArtifactInstallSpec) (retErr error) {
 		)
 	}
 
+	tempPrefix := "." + name + ".tmp-"
+	if err := refuseRetainedInstallTemporary(
+		parent.dir,
+		tempPrefix,
+		"service artifact",
+	); err != nil {
+		return err
+	}
 	randomSuffix, err := newCleanupInstallationID()
 	if err != nil {
 		return err
 	}
-	tempName := "." + name + ".tmp-" + randomSuffix
+	tempName := tempPrefix + randomSuffix
 	temp, err := cleanupCreateFileAt(parent.dir, tempName, uint32(spec.mode.Perm()))
 	if err != nil {
 		return fmt.Errorf("create temporary service artifact %s: %w", spec.artifact.Path, err)
@@ -144,18 +152,14 @@ func installServiceArtifact(spec serviceArtifactInstallSpec) (retErr error) {
 		if !tempPresent {
 			return
 		}
-		if err := cleanupUnlinkAt(parent.dir, tempName, false); err != nil &&
-			!cleanupIsNotExist(err) {
-			retErr = errors.Join(
-				retErr,
-				fmt.Errorf(
-					"remove temporary service artifact %s/%s: %w",
-					parent.spec.path,
-					tempName,
-					err,
-				),
-			)
-		}
+		retErr = errors.Join(
+			retErr,
+			fmt.Errorf(
+				"temporary service artifact retained without name-based cleanup at %s; "+
+					"manually inspect its identity before removal",
+				filepath.Join(parent.spec.path, tempName),
+			),
+		)
 	}()
 	if err := temp.Chmod(spec.mode.Perm()); err != nil {
 		_ = temp.Close()
@@ -708,14 +712,14 @@ func runInstalledSystemdServiceCommit(
 	}
 	transactionHooks := systemdEnableLinkTransactionHooks{}
 	if hook, ok := ctx.Value(
-		installBeforeSystemdEnableParentCreateHookContextKey{},
+		installAfterSystemdEnableCommitWalkOpenHookContextKey{},
 	).(func(string) error); ok && hook != nil {
-		transactionHooks.beforeParentCreate = hook
+		transactionHooks.afterCommitWalkOpen = hook
 	}
 	if hook, ok := ctx.Value(
-		installAfterSystemdEnableRollbackQuarantineHookContextKey{},
-	).(func(string, string) error); ok && hook != nil {
-		transactionHooks.afterRollbackQuarantine = hook
+		installAfterSystemdEnableRetentionCheckHookContextKey{},
+	).(func(string) error); ok && hook != nil {
+		transactionHooks.afterRetentionCheck = hook
 	}
 	transaction, err := beginSystemdEnableLinkTransaction(
 		paths,

@@ -519,3 +519,40 @@ func TestSaveFileUsesAtomicPrivateReplacement(t *testing.T) {
 		t.Fatalf("temporary configs left behind: %v", leftovers)
 	}
 }
+
+func TestSaveFileRetainedTemporaryBlocksFurtherAccumulation(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.Mkdir(path, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := SaveFile(path, SafeTemplate())
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"temporary config retained without name-based cleanup",
+	) {
+		t.Fatalf("first save error = %v, want retained temporary report", err)
+	}
+	leftovers, err := filepath.Glob(filepath.Join(dir, ".config.yaml.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leftovers) != 1 {
+		t.Fatalf("first failed save retained %d temporaries, want 1: %v", len(leftovers), leftovers)
+	}
+
+	err = SaveFile(path, SafeTemplate())
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"refuse to create another temporary config",
+	) {
+		t.Fatalf("second save error = %v, want retained-name preflight", err)
+	}
+	afterRetry, err := filepath.Glob(filepath.Join(dir, ".config.yaml.tmp-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(afterRetry) != 1 || afterRetry[0] != leftovers[0] {
+		t.Fatalf("retry accumulated temporary configs: before=%v after=%v", leftovers, afterRetry)
+	}
+}

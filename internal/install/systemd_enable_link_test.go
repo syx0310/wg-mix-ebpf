@@ -12,6 +12,28 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
 
+func TestInstallRejectsMissingSystemdWantsDirectoryWithoutCreatingIt(t *testing.T) {
+	layout := cleanupTestPaths(t.TempDir(), "enable-missing-wants")
+	setCleanupTestEnvironment(t, layout)
+	installFakeSystemctl(t, filepath.Join(t.TempDir(), "systemctl.log"), "")
+
+	wantsDir := filepath.Dir(systemdEnableLinkPath(layout))
+	_, err := Install(
+		systemdEnableTestContext(t),
+		Options{System: "systemd", Enable: true},
+	)
+	if err == nil || !strings.Contains(
+		err.Error(),
+		"declared wants directory",
+	) || !strings.Contains(err.Error(), "does not exist") {
+		t.Fatalf("install error = %v, want missing wants-directory rejection", err)
+	}
+	if _, statErr := os.Stat(wantsDir); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("enable transaction created missing wants directory: %v", statErr)
+	}
+	assertPublishedSystemdEnableOwnership(t, layout)
+}
+
 func TestInstallPreservesSwappedSystemdEnableLinkAcrossOwnershipAndHookResults(
 	t *testing.T,
 ) {
@@ -40,47 +62,32 @@ func TestInstallPreservesSwappedSystemdEnableLinkAcrossOwnershipAndHookResults(
 						"enable-final-"+ownershipCase.name+"-"+hookCase.name,
 						"systemd",
 					)
-					linkPath := systemdEnableLinkPath(layout)
-					if err := os.MkdirAll(filepath.Dir(linkPath), 0o700); err != nil {
-						t.Fatal(err)
-					}
-					if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
-						t.Fatal(err)
-					}
 				} else {
 					layout = cleanupTestPaths(
 						t.TempDir(),
 						"enable-final-"+ownershipCase.name+"-"+hookCase.name,
 					)
 				}
+				linkPath := prepareSystemdWantsDirectory(t, layout)
+				if ownershipCase.marked {
+					if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+						t.Fatal(err)
+					}
+				}
 				setCleanupTestEnvironment(t, layout)
 				commandLog := filepath.Join(t.TempDir(), "systemctl.log")
 				installFakeSystemctl(t, commandLog, "")
-				lifecycleRoot := t.TempDir()
-				baseContext := lockfile.WithLifecyclePathsForTest(
-					t.Context(),
-					filepath.Join(lifecycleRoot, "daemon.lease"),
-					filepath.Join(lifecycleRoot, "maintenance.gate"),
-				)
+
 				injected := errors.New("injected post-enable-link hook failure")
-				linkPath := systemdEnableLinkPath(layout)
 				ownedBackup := linkPath + ".owned-before-swap"
 				replacementTarget := "../foreign.service"
 				var replacementIdentity os.FileInfo
 				ctx := context.WithValue(
-					baseContext,
+					systemdEnableTestContext(t),
 					installAfterSystemdEnableLinkHookContextKey{},
 					func(path string) error {
 						if path != linkPath {
 							return fmt.Errorf("unexpected enable link hook path %s", path)
-						}
-						if target, err := os.Readlink(path); err != nil ||
-							target != systemdEnableLinkTarget {
-							return fmt.Errorf(
-								"pre-swap enable link target=%q err=%v",
-								target,
-								err,
-							)
 						}
 						if err := os.Rename(path, ownedBackup); err != nil {
 							return err
@@ -104,41 +111,18 @@ func TestInstallPreservesSwappedSystemdEnableLinkAcrossOwnershipAndHookResults(
 				if err == nil {
 					t.Fatal("install accepted a swapped systemd enable link")
 				}
-				if hookCase.returnError {
-					if !errors.Is(err, injected) {
-						t.Fatalf("install error = %v, want injected hook error", err)
-					}
-				} else if !strings.Contains(
-					err.Error(),
-					"revalidate exact systemd enable link inode, UID, and target at commit",
-				) {
-					t.Fatalf("install error = %v, want final link revalidation", err)
+				if hookCase.returnError && !errors.Is(err, injected) {
+					t.Fatalf("install error = %v, want injected hook error", err)
 				}
-
-				target, readErr := os.Readlink(linkPath)
-				if readErr != nil || target != replacementTarget {
-					t.Fatalf(
-						"foreign replacement target=%q err=%v",
-						target,
-						readErr,
-					)
-				}
-				finalReplacementIdentity, statErr := os.Lstat(linkPath)
-				if statErr != nil {
-					t.Fatal(statErr)
-				}
-				if replacementIdentity == nil ||
-					!os.SameFile(replacementIdentity, finalReplacementIdentity) {
-					t.Fatal("rollback deleted or overwrote the foreign replacement link")
-				}
-				if target, readErr := os.Readlink(ownedBackup); readErr != nil ||
-					target != systemdEnableLinkTarget {
-					t.Fatalf(
-						"displaced owned link target=%q err=%v",
-						target,
-						readErr,
-					)
-				}
+				assertNonDestructiveRetentionError(t, err, linkPath)
+				assertSameSymlink(
+					t,
+					linkPath,
+					replacementTarget,
+					replacementIdentity,
+					"foreign replacement",
+				)
+				assertSymlinkTarget(t, ownedBackup, systemdEnableLinkTarget)
 				assertPublishedSystemdEnableOwnership(t, layout)
 
 				logData, readErr := os.ReadFile(commandLog)
@@ -146,10 +130,7 @@ func TestInstallPreservesSwappedSystemdEnableLinkAcrossOwnershipAndHookResults(
 					t.Fatal(readErr)
 				}
 				if strings.Contains(string(logData), "enable ") {
-					t.Fatalf(
-						"link swap invoked name-based systemctl enable: %q",
-						logData,
-					)
+					t.Fatalf("link swap invoked name-based systemctl enable: %q", logData)
 				}
 			})
 		}
@@ -158,22 +139,16 @@ func TestInstallPreservesSwappedSystemdEnableLinkAcrossOwnershipAndHookResults(
 
 func TestInstallRejectsSystemdWantsDirectoryPathReplacementAtCommit(t *testing.T) {
 	layout := cleanupTestPaths(t.TempDir(), "enable-wants-path-swap")
+	linkPath := prepareSystemdWantsDirectory(t, layout)
 	setCleanupTestEnvironment(t, layout)
-	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
-	installFakeSystemctl(t, commandLog, "")
-	lifecycleRoot := t.TempDir()
-	baseContext := lockfile.WithLifecyclePathsForTest(
-		t.Context(),
-		filepath.Join(lifecycleRoot, "daemon.lease"),
-		filepath.Join(lifecycleRoot, "maintenance.gate"),
-	)
-	linkPath := systemdEnableLinkPath(layout)
+	installFakeSystemctl(t, filepath.Join(t.TempDir(), "systemctl.log"), "")
+
 	wantsDir := filepath.Dir(linkPath)
 	displacedWantsDir := wantsDir + ".owned-before-swap"
 	foreignTarget := "../foreign.service"
 	var replacementIdentity os.FileInfo
 	ctx := context.WithValue(
-		baseContext,
+		systemdEnableTestContext(t),
 		installAfterSystemdEnableLinkHookContextKey{},
 		func(path string) error {
 			if path != linkPath {
@@ -199,207 +174,34 @@ func TestInstallRejectsSystemdWantsDirectoryPathReplacementAtCommit(t *testing.T
 		err.Error(),
 		"revalidate held systemd wants directory from declared root at commit",
 	) {
-		t.Fatalf("install error = %v, want final wants-directory rejection", err)
+		t.Fatalf("install error = %v, want wants-directory edge rejection", err)
 	}
-	if !strings.Contains(err.Error(), "published ownership manifest retains path") {
-		t.Fatalf("install error lacks incomplete rollback audit record: %v", err)
-	}
-	target, readErr := os.Readlink(linkPath)
-	if readErr != nil || target != foreignTarget {
-		t.Fatalf("foreign replacement target=%q err=%v", target, readErr)
-	}
-	finalReplacementIdentity, statErr := os.Lstat(linkPath)
-	if statErr != nil {
-		t.Fatal(statErr)
-	}
-	if replacementIdentity == nil ||
-		!os.SameFile(replacementIdentity, finalReplacementIdentity) {
-		t.Fatal("rollback deleted or overwrote the foreign wants-directory link")
-	}
-	if _, statErr := os.Lstat(
+	assertNonDestructiveRetentionError(t, err, linkPath)
+	assertSameSymlink(t, linkPath, foreignTarget, replacementIdentity, "foreign replacement")
+	assertSymlinkTarget(
+		t,
 		filepath.Join(displacedWantsDir, filepath.Base(linkPath)),
-	); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("descriptor-bound rollback retained its exact created link: %v", statErr)
-	}
-	entries, readDirErr := os.ReadDir(displacedWantsDir)
-	if readDirErr != nil {
-		t.Fatal(readDirErr)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("displaced wants directory retained unexpected entries: %#v", entries)
-	}
+		systemdEnableLinkTarget,
+	)
 	assertPublishedSystemdEnableOwnership(t, layout)
 }
 
-func TestConcurrentEmptySystemdWantsDirectoryIsNotTransactionOwned(t *testing.T) {
-	layout := cleanupTestPaths(t.TempDir(), "enable-concurrent-empty-wants")
-	setCleanupTestEnvironment(t, layout)
-	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
-	installFakeSystemctl(t, commandLog, "")
-	lifecycleRoot := t.TempDir()
-	baseContext := lockfile.WithLifecyclePathsForTest(
-		t.Context(),
-		filepath.Join(lifecycleRoot, "daemon.lease"),
-		filepath.Join(lifecycleRoot, "maintenance.gate"),
-	)
-	linkPath := systemdEnableLinkPath(layout)
-	wantsDir := filepath.Dir(linkPath)
-	var wantsIdentity os.FileInfo
-	injected := errors.New("force rollback after concurrent empty wants creation")
-	ctx := context.WithValue(
-		baseContext,
-		installBeforeSystemdEnableParentCreateHookContextKey{},
-		func(path string) error {
-			if path != wantsDir {
-				return fmt.Errorf("unexpected wants pre-create path %s", path)
-			}
-			if err := os.Mkdir(path, 0o700); err != nil {
-				return err
-			}
-			var err error
-			wantsIdentity, err = os.Stat(path)
-			return err
-		},
-	)
-	ctx = context.WithValue(
-		ctx,
-		installAfterSystemdEnableLinkHookContextKey{},
-		func(path string) error {
-			if path != linkPath {
-				return fmt.Errorf("unexpected enable link hook path %s", path)
-			}
-			return injected
-		},
-	)
-
-	_, err := Install(ctx, Options{System: "systemd", Enable: true})
-	if !errors.Is(err, injected) {
-		t.Fatalf("install error = %v, want injected rollback", err)
-	}
-	finalWantsIdentity, statErr := os.Stat(wantsDir)
-	if statErr != nil {
-		t.Fatal(statErr)
-	}
-	if wantsIdentity == nil || !os.SameFile(wantsIdentity, finalWantsIdentity) {
-		t.Fatal("rollback deleted or replaced the concurrently created empty wants directory")
-	}
-	entries, readErr := os.ReadDir(wantsDir)
-	if readErr != nil {
-		t.Fatal(readErr)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("concurrent empty wants directory retained entries: %#v", entries)
-	}
-	assertPublishedSystemdEnableOwnership(t, layout)
-}
-
-func TestConcurrentSystemdWantsDirectoryContentIsPreserved(t *testing.T) {
-	layout := cleanupTestPaths(t.TempDir(), "enable-concurrent-wants-create")
-	setCleanupTestEnvironment(t, layout)
-	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
-	installFakeSystemctl(t, commandLog, "")
-	lifecycleRoot := t.TempDir()
-	baseContext := lockfile.WithLifecyclePathsForTest(
-		t.Context(),
-		filepath.Join(lifecycleRoot, "daemon.lease"),
-		filepath.Join(lifecycleRoot, "maintenance.gate"),
-	)
-	linkPath := systemdEnableLinkPath(layout)
-	wantsDir := filepath.Dir(linkPath)
-	foreignPath := filepath.Join(wantsDir, "foreign.keep")
-	foreignContent := []byte("concurrent owner content\n")
-	var wantsIdentity os.FileInfo
-	var foreignIdentity os.FileInfo
-	beforeCreateRan := false
-	injected := errors.New("force rollback after concurrent wants creation")
-	ctx := context.WithValue(
-		baseContext,
-		installBeforeSystemdEnableParentCreateHookContextKey{},
-		func(path string) error {
-			beforeCreateRan = true
-			if path != wantsDir {
-				return fmt.Errorf("unexpected wants pre-create path %s", path)
-			}
-			if err := os.Mkdir(path, 0o700); err != nil {
-				return err
-			}
-			if err := os.WriteFile(foreignPath, foreignContent, 0o600); err != nil {
-				return err
-			}
-			var err error
-			wantsIdentity, err = os.Stat(path)
-			if err != nil {
-				return err
-			}
-			foreignIdentity, err = os.Stat(foreignPath)
-			return err
-		},
-	)
-	ctx = context.WithValue(
-		ctx,
-		installAfterSystemdEnableLinkHookContextKey{},
-		func(path string) error {
-			if path != linkPath {
-				return fmt.Errorf("unexpected enable link hook path %s", path)
-			}
-			return injected
-		},
-	)
-
-	_, err := Install(ctx, Options{System: "systemd", Enable: true})
-	if !errors.Is(err, injected) {
-		t.Fatalf("install error = %v, want injected rollback", err)
-	}
-	if !beforeCreateRan {
-		t.Fatal("precise pre-mkdirat hook did not run")
-	}
-	finalWantsIdentity, statErr := os.Stat(wantsDir)
-	if statErr != nil {
-		t.Fatal(statErr)
-	}
-	if wantsIdentity == nil || !os.SameFile(wantsIdentity, finalWantsIdentity) {
-		t.Fatal("rollback deleted or replaced the concurrently created wants directory")
-	}
-	finalForeignIdentity, statErr := os.Stat(foreignPath)
-	if statErr != nil {
-		t.Fatal(statErr)
-	}
-	if foreignIdentity == nil || !os.SameFile(foreignIdentity, finalForeignIdentity) {
-		t.Fatal("rollback deleted or replaced concurrent foreign content")
-	}
-	if data, readErr := os.ReadFile(foreignPath); readErr != nil ||
-		string(data) != string(foreignContent) {
-		t.Fatalf("foreign content=%q err=%v", data, readErr)
-	}
-	if _, statErr := os.Lstat(linkPath); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("rollback retained its transaction-created enable link: %v", statErr)
-	}
-	assertPublishedSystemdEnableOwnership(t, layout)
-}
-
-func TestInstallRejectsHighAncestorSystemdTreeReplacementAtCommit(t *testing.T) {
+func TestInstallRejectsPersistentHighAncestorSystemdTreeReplacementAtCommit(
+	t *testing.T,
+) {
 	root := t.TempDir()
 	layout := cleanupTestPaths(root, "enable-high-ancestor-swap")
 	serviceTree := filepath.Join(root, "service-tree")
 	layout.SystemdDir = filepath.Join(serviceTree, "systemd")
-	if err := os.Mkdir(serviceTree, 0o700); err != nil {
-		t.Fatal(err)
-	}
+	linkPath := prepareSystemdWantsDirectory(t, layout)
 	setCleanupTestEnvironment(t, layout)
-	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
-	installFakeSystemctl(t, commandLog, "")
-	lifecycleRoot := t.TempDir()
-	baseContext := lockfile.WithLifecyclePathsForTest(
-		t.Context(),
-		filepath.Join(lifecycleRoot, "daemon.lease"),
-		filepath.Join(lifecycleRoot, "maintenance.gate"),
-	)
-	linkPath := systemdEnableLinkPath(layout)
+	installFakeSystemctl(t, filepath.Join(t.TempDir(), "systemctl.log"), "")
+
 	displacedTree := serviceTree + ".owned-before-swap"
 	foreignTarget := "../foreign.service"
 	var replacementIdentity os.FileInfo
 	ctx := context.WithValue(
-		baseContext,
+		systemdEnableTestContext(t),
 		installAfterSystemdEnableLinkHookContextKey{},
 		func(path string) error {
 			if path != linkPath {
@@ -421,124 +223,377 @@ func TestInstallRejectsHighAncestorSystemdTreeReplacementAtCommit(t *testing.T) 
 	)
 
 	_, err := Install(ctx, Options{System: "systemd", Enable: true})
-	if err == nil || !strings.Contains(
-		err.Error(),
-		"revalidate held systemd wants directory from declared root at commit",
-	) || !strings.Contains(
-		err.Error(),
-		"declared path no longer reaches the held systemd wants directory",
-	) {
-		t.Fatalf("install error = %v, want high-ancestor identity rejection", err)
+	if err == nil || !strings.Contains(err.Error(), "parent edge no longer names held component") {
+		t.Fatalf("install error = %v, want high-ancestor edge rejection", err)
 	}
-	target, readErr := os.Readlink(linkPath)
-	if readErr != nil || target != foreignTarget {
-		t.Fatalf("foreign replacement target=%q err=%v", target, readErr)
-	}
-	finalReplacementIdentity, statErr := os.Lstat(linkPath)
-	if statErr != nil {
-		t.Fatal(statErr)
-	}
-	if replacementIdentity == nil ||
-		!os.SameFile(replacementIdentity, finalReplacementIdentity) {
-		t.Fatal("rollback deleted or overwrote the foreign replacement tree link")
-	}
-	displacedLinkPath := filepath.Join(
-		displacedTree,
-		"systemd",
-		"multi-user.target.wants",
-		filepath.Base(linkPath),
+	assertNonDestructiveRetentionError(t, err, linkPath)
+	assertSameSymlink(t, linkPath, foreignTarget, replacementIdentity, "foreign replacement")
+	assertSymlinkTarget(
+		t,
+		filepath.Join(
+			displacedTree,
+			"systemd",
+			"multi-user.target.wants",
+			filepath.Base(linkPath),
+		),
+		systemdEnableLinkTarget,
 	)
-	if _, statErr := os.Lstat(displacedLinkPath); !errors.Is(
-		statErr,
-		os.ErrNotExist,
-	) {
-		t.Fatalf("descriptor rollback retained displaced owned link: %v", statErr)
-	}
 	assertPublishedSystemdEnableOwnership(t, layout)
 }
 
-func TestSystemdEnableTransactionQuarantineConflictIsAuditable(t *testing.T) {
-	layout := cleanupTestPaths(t.TempDir(), "enable-transaction-quarantine")
+func TestInstallRejectsHighAncestorSwapInsideSecondDeclaredWalk(t *testing.T) {
+	root := t.TempDir()
+	layout := cleanupTestPaths(root, "enable-second-walk-swap")
+	serviceTree := filepath.Join(root, "service-tree")
+	layout.SystemdDir = filepath.Join(serviceTree, "systemd")
+	linkPath := prepareSystemdWantsDirectory(t, layout)
+	canonicalServiceTree, err := filepath.EvalSymlinks(serviceTree)
+	if err != nil {
+		t.Fatal(err)
+	}
 	setCleanupTestEnvironment(t, layout)
-	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
-	installFakeSystemctl(t, commandLog, "")
-	lifecycleRoot := t.TempDir()
-	baseContext := lockfile.WithLifecyclePathsForTest(
-		t.Context(),
-		filepath.Join(lifecycleRoot, "daemon.lease"),
-		filepath.Join(lifecycleRoot, "maintenance.gate"),
-	)
-	linkPath := systemdEnableLinkPath(layout)
-	rollbackCause := errors.New("force transaction rollback")
-	restoreConflict := errors.New("force no-replace quarantine restore")
+	installFakeSystemctl(t, filepath.Join(t.TempDir(), "systemctl.log"), "")
+
+	displacedTree := serviceTree + ".opened-before-swap"
 	foreignTarget := "../foreign.service"
-	var quarantinePath string
 	var replacementIdentity os.FileInfo
+	hookRan := false
+	var openedPaths []string
 	ctx := context.WithValue(
-		baseContext,
-		installAfterSystemdEnableLinkHookContextKey{},
-		func(path string) error {
-			if path != linkPath {
-				return fmt.Errorf("unexpected enable link hook path %s", path)
+		systemdEnableTestContext(t),
+		installAfterSystemdEnableCommitWalkOpenHookContextKey{},
+		func(openedPath string) error {
+			openedPaths = append(openedPaths, openedPath)
+			if hookRan || filepath.Clean(openedPath) != filepath.Clean(canonicalServiceTree) {
+				return nil
 			}
-			return rollbackCause
-		},
-	)
-	ctx = context.WithValue(
-		ctx,
-		installAfterSystemdEnableRollbackQuarantineHookContextKey{},
-		func(originalPath string, retainedPath string) error {
-			if originalPath != linkPath {
-				return fmt.Errorf("unexpected rollback original path %s", originalPath)
+			hookRan = true
+			if err := os.Rename(serviceTree, displacedTree); err != nil {
+				return err
 			}
-			if target, err := os.Readlink(retainedPath); err != nil ||
-				target != systemdEnableLinkTarget {
-				return fmt.Errorf(
-					"quarantined transaction link target=%q err=%v",
-					target,
-					err,
-				)
+			if err := os.MkdirAll(filepath.Dir(linkPath), 0o700); err != nil {
+				return err
 			}
-			quarantinePath = retainedPath
-			if err := os.Symlink(foreignTarget, originalPath); err != nil {
+			if err := os.Symlink(foreignTarget, linkPath); err != nil {
 				return err
 			}
 			var err error
-			replacementIdentity, err = os.Lstat(originalPath)
-			if err != nil {
-				return err
-			}
-			return restoreConflict
+			replacementIdentity, err = os.Lstat(linkPath)
+			return err
 		},
 	)
 
-	_, err := Install(ctx, Options{System: "systemd", Enable: true})
-	if !errors.Is(err, rollbackCause) || !errors.Is(err, restoreConflict) {
+	_, err = Install(ctx, Options{System: "systemd", Enable: true})
+	if !hookRan {
 		t.Fatalf(
-			"install error = %v, want rollback and quarantine conflict causes",
+			"second declared walk did not expose the high-ancestor hook; err=%v opened=%v want=%s",
 			err,
+			openedPaths,
+			canonicalServiceTree,
 		)
 	}
-	if quarantinePath == "" || !strings.Contains(err.Error(), quarantinePath) {
-		t.Fatalf("install error lacks exact retained quarantine path: %v", err)
+	if err == nil || !strings.Contains(err.Error(), "parent edge no longer names held component") {
+		t.Fatalf("install error = %v, want complete edge-chain rejection", err)
 	}
-	target, readErr := os.Readlink(linkPath)
-	if readErr != nil || target != foreignTarget {
-		t.Fatalf("foreign replacement target=%q err=%v", target, readErr)
+	assertNonDestructiveRetentionError(t, err, linkPath)
+	assertSameSymlink(t, linkPath, foreignTarget, replacementIdentity, "foreign replacement")
+	assertSymlinkTarget(
+		t,
+		filepath.Join(
+			displacedTree,
+			"systemd",
+			"multi-user.target.wants",
+			filepath.Base(linkPath),
+		),
+		systemdEnableLinkTarget,
+	)
+}
+
+func TestSystemdEnableFailureRetentionHasNoCheckThenUnlinkOrBlindRestore(
+	t *testing.T,
+) {
+	tests := []struct {
+		name       string
+		ownedPath  func(string) string
+		errorLabel string
+	}{
+		{
+			name: "check-to-unlink-race",
+			ownedPath: func(linkPath string) string {
+				return linkPath + ".owned-after-check"
+			},
+			errorLabel: "check-to-unlink",
+		},
+		{
+			name: "quarantine-name-swap",
+			ownedPath: func(linkPath string) string {
+				return filepath.Join(
+					filepath.Dir(linkPath),
+					".wg-mix-ebpf-quarantine-retention-test",
+				)
+			},
+			errorLabel: "quarantine-name",
+		},
 	}
-	finalReplacementIdentity, statErr := os.Lstat(linkPath)
-	if statErr != nil {
-		t.Fatal(statErr)
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			layout := cleanupTestPaths(t.TempDir(), "enable-retain-"+test.name)
+			linkPath := prepareSystemdWantsDirectory(t, layout)
+			setCleanupTestEnvironment(t, layout)
+			installFakeSystemctl(t, filepath.Join(t.TempDir(), "systemctl.log"), "")
+
+			rollbackCause := errors.New("force non-destructive retention")
+			foreignTarget := "../foreign.service"
+			ownedPath := test.ownedPath(linkPath)
+			var ownedIdentity os.FileInfo
+			var foreignIdentity os.FileInfo
+			retentionHookRan := false
+			ctx := context.WithValue(
+				systemdEnableTestContext(t),
+				installAfterSystemdEnableLinkHookContextKey{},
+				func(path string) error {
+					if path != linkPath {
+						return fmt.Errorf("unexpected enable link hook path %s", path)
+					}
+					var err error
+					ownedIdentity, err = os.Lstat(path)
+					if err != nil {
+						return err
+					}
+					return rollbackCause
+				},
+			)
+			ctx = context.WithValue(
+				ctx,
+				installAfterSystemdEnableRetentionCheckHookContextKey{},
+				func(path string) error {
+					retentionHookRan = true
+					if path != linkPath {
+						return fmt.Errorf("unexpected retention hook path %s", path)
+					}
+					if err := os.Rename(path, ownedPath); err != nil {
+						return err
+					}
+					if err := os.Symlink(foreignTarget, path); err != nil {
+						return err
+					}
+					var err error
+					foreignIdentity, err = os.Lstat(path)
+					return err
+				},
+			)
+
+			_, err := Install(ctx, Options{System: "systemd", Enable: true})
+			if !errors.Is(err, rollbackCause) {
+				t.Fatalf("install error = %v, want retention cause", err)
+			}
+			if !retentionHookRan {
+				t.Fatalf("%s retention hook did not run", test.errorLabel)
+			}
+			assertNonDestructiveRetentionError(t, err, linkPath)
+			assertSameSymlink(
+				t,
+				linkPath,
+				foreignTarget,
+				foreignIdentity,
+				"foreign replacement",
+			)
+			assertSameSymlink(
+				t,
+				ownedPath,
+				systemdEnableLinkTarget,
+				ownedIdentity,
+				"transaction-owned retained link",
+			)
+			assertPublishedSystemdEnableOwnership(t, layout)
+		})
 	}
-	if replacementIdentity == nil ||
-		!os.SameFile(replacementIdentity, finalReplacementIdentity) {
-		t.Fatal("rollback deleted or overwrote quarantine-conflict foreign link")
+}
+
+func TestOpenOrCreateDeclaredArtifactParentConcurrentEEXISTIsNotOwned(
+	t *testing.T,
+) {
+	parentPath := filepath.Join(t.TempDir(), "artifact-parent")
+	foreignPath := filepath.Join(parentPath, "foreign.keep")
+	var parentIdentity os.FileInfo
+	parent, created, err := openOrCreateDeclaredArtifactParent(
+		parentPath,
+		parentPath,
+		func(path string) error {
+			if path != parentPath {
+				return fmt.Errorf("unexpected pre-create path %s", path)
+			}
+			if err := os.Mkdir(path, 0o700); err != nil {
+				return err
+			}
+			if err := os.WriteFile(foreignPath, []byte("foreign\n"), 0o600); err != nil {
+				return err
+			}
+			var err error
+			parentIdentity, err = os.Stat(path)
+			return err
+		},
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if target, readErr := os.Readlink(quarantinePath); readErr != nil ||
-		target != systemdEnableLinkTarget {
-		t.Fatalf("retained transaction quarantine target=%q err=%v", target, readErr)
+	defer parent.close()
+	if created {
+		t.Fatal("concurrent EEXIST directory was reported transaction-created")
 	}
-	assertPublishedSystemdEnableOwnership(t, layout)
+	finalIdentity, err := os.Stat(parentPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if parentIdentity == nil || !os.SameFile(parentIdentity, finalIdentity) {
+		t.Fatal("descriptor walk did not retain the concurrent directory")
+	}
+	if data, err := os.ReadFile(foreignPath); err != nil || string(data) != "foreign\n" {
+		t.Fatalf("foreign content=%q err=%v", data, err)
+	}
+	if err := revalidateManagedCleanupDir(parent); err != nil {
+		t.Fatalf("revalidate concurrent directory chain: %v", err)
+	}
+}
+
+func TestDeclaredWalkRejectsSystemRootSwapAfterOpeningIt(t *testing.T) {
+	outer := t.TempDir()
+	systemRoot := filepath.Join(outer, "declared-system-root")
+	artifactParent := filepath.Join(systemRoot, "artifact-parent")
+	if err := os.MkdirAll(artifactParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	canonicalRoot, err := filepath.EvalSymlinks(systemRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	displacedRoot := systemRoot + ".opened-before-swap"
+	hookRan := false
+	dir, exists, _, err := openExactDeclaredDirectoryWithOptions(
+		cleanupPathSpec{
+			name:        "service artifact directory",
+			path:        artifactParent,
+			defaultPath: artifactParent,
+			systemRoot:  systemRoot,
+		},
+		exactDeclaredDirectoryOpenOptions{
+			afterOpen: func(openedPath string) error {
+				if hookRan || filepath.Clean(openedPath) != filepath.Clean(canonicalRoot) {
+					return nil
+				}
+				hookRan = true
+				if err := os.Rename(systemRoot, displacedRoot); err != nil {
+					return err
+				}
+				return os.MkdirAll(artifactParent, 0o700)
+			},
+		},
+	)
+	if dir != nil {
+		_ = dir.close()
+	}
+	if exists {
+		t.Fatal("declared walk accepted a swapped systemRoot")
+	}
+	if !hookRan {
+		t.Fatal("declared walk did not expose systemRoot after-open boundary")
+	}
+	if err == nil || !strings.Contains(err.Error(), "parent edge no longer names held component") {
+		t.Fatalf("declared walk error = %v, want systemRoot parent-edge rejection", err)
+	}
+	for _, path := range []string{
+		filepath.Join(displacedRoot, "artifact-parent"),
+		artifactParent,
+	} {
+		if info, statErr := os.Stat(path); statErr != nil || !info.IsDir() {
+			t.Fatalf("systemRoot swap evidence missing at %s: %v", path, statErr)
+		}
+	}
+}
+
+func TestDeclaredWalkBindsCanonicalSystemRootAlias(t *testing.T) {
+	outer := t.TempDir()
+	realRoot := filepath.Join(outer, "real-root")
+	replacementRoot := filepath.Join(outer, "replacement-root")
+	for _, root := range []string{realRoot, replacementRoot} {
+		if err := os.MkdirAll(filepath.Join(root, "artifact-parent"), 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	canonicalRealRoot, err := filepath.EvalSymlinks(realRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aliasRoot := filepath.Join(outer, "declared-root-alias")
+	if err := os.Symlink(realRoot, aliasRoot); err != nil {
+		t.Fatal(err)
+	}
+	originalAlias := aliasRoot + ".opened-before-swap"
+	hookRan := false
+	dir, exists, _, err := openExactDeclaredDirectoryWithOptions(
+		cleanupPathSpec{
+			name:        "service artifact directory",
+			path:        filepath.Join(aliasRoot, "artifact-parent"),
+			defaultPath: filepath.Join(aliasRoot, "artifact-parent"),
+			systemRoot:  aliasRoot,
+		},
+		exactDeclaredDirectoryOpenOptions{
+			afterOpen: func(openedPath string) error {
+				if hookRan || filepath.Clean(openedPath) != filepath.Clean(canonicalRealRoot) {
+					return nil
+				}
+				hookRan = true
+				if err := os.Rename(aliasRoot, originalAlias); err != nil {
+					return err
+				}
+				return os.Symlink(replacementRoot, aliasRoot)
+			},
+		},
+	)
+	if dir != nil {
+		_ = dir.close()
+	}
+	if exists {
+		t.Fatal("declared walk accepted a replaced canonical root alias")
+	}
+	if !hookRan {
+		t.Fatal("declared walk did not open the canonical root component")
+	}
+	if err == nil || !strings.Contains(err.Error(), "canonical root changed") {
+		t.Fatalf("declared walk error = %v, want canonical-root rejection", err)
+	}
+	for path, want := range map[string]string{
+		aliasRoot:     replacementRoot,
+		originalAlias: realRoot,
+	} {
+		target, readErr := os.Readlink(path)
+		if readErr != nil || target != want {
+			t.Fatalf("alias %s target=%q err=%v, want %q", path, target, readErr, want)
+		}
+	}
+}
+
+func TestDeclaredRootWalkAllowsPinnedMountTransitionsThroughSystemRoot(t *testing.T) {
+	parentIdentity := cleanupIdentity{MountKnown: true, MountID: 101}
+	childIdentity := cleanupIdentity{MountKnown: true, MountID: 202}
+	if parentIdentity.sameMount(childIdentity) {
+		t.Fatal("test identities unexpectedly share a mount")
+	}
+
+	const rootDepth = 3
+	for edgeIndex := 0; edgeIndex < rootDepth; edgeIndex++ {
+		if !declaredDirectoryEdgeMayCrossMount(edgeIndex, rootDepth) {
+			t.Fatalf(
+				"canonical root edge %d/%d rejected an ordinary mount transition",
+				edgeIndex,
+				rootDepth,
+			)
+		}
+	}
+	if declaredDirectoryEdgeMayCrossMount(rootDepth, rootDepth) {
+		t.Fatal("artifact-relative edge unexpectedly permits a mount transition")
+	}
 }
 
 func TestSystemdEnableDefaultParentUsesDeclaredSystemRoot(t *testing.T) {
@@ -556,58 +611,64 @@ func TestSystemdEnableDefaultParentUsesDeclaredSystemRoot(t *testing.T) {
 	}
 }
 
-func TestSystemdEnableRollbackRestoreFailureRetainsForeignAndQuarantine(
-	t *testing.T,
-) {
-	layout := newCleanupTestLayoutForSystem(
-		t,
-		"enable-restore-quarantine",
-		"systemd",
+func systemdEnableTestContext(t *testing.T) context.Context {
+	t.Helper()
+	lifecycleRoot := t.TempDir()
+	return lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
 	)
+}
+
+func prepareSystemdWantsDirectory(t *testing.T, layout paths) string {
+	t.Helper()
 	linkPath := systemdEnableLinkPath(layout)
-	wantsDir := filepath.Dir(linkPath)
-	if err := os.MkdirAll(wantsDir, 0o700); err != nil {
+	if err := os.MkdirAll(filepath.Dir(linkPath), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	foreignTarget := "../foreign.service"
-	if err := os.Symlink(foreignTarget, linkPath); err != nil {
-		t.Fatal(err)
+	return linkPath
+}
+
+func assertNonDestructiveRetentionError(t *testing.T, err error, path string) {
+	t.Helper()
+	for _, want := range []string{
+		"retained evidence without rename, unlink, restore, or rmdir",
+		"original declared path " + path,
+		"current status",
+		"automatic cleanup is not authorized",
+		"manually inspect and resolve",
+	} {
+		if err == nil || !strings.Contains(err.Error(), want) {
+			t.Fatalf("retention error = %v, want %q", err, want)
+		}
 	}
-	quarantineName := ".wg-mix-ebpf-quarantine-auditable"
-	quarantinePath := filepath.Join(wantsDir, quarantineName)
-	if err := os.Symlink(systemdEnableLinkTarget, quarantinePath); err != nil {
-		t.Fatal(err)
+}
+
+func assertSymlinkTarget(t *testing.T, path string, want string) {
+	t.Helper()
+	target, err := os.Readlink(path)
+	if err != nil || target != want {
+		t.Fatalf("symlink %s target=%q err=%v, want %q", path, target, err, want)
 	}
-	parent, exists, err := openDeclaredArtifactParent(
-		wantsDir,
-		systemdEnableLinkDefaultParent,
-	)
+}
+
+func assertSameSymlink(
+	t *testing.T,
+	path string,
+	wantTarget string,
+	wantIdentity os.FileInfo,
+	label string,
+) {
+	t.Helper()
+	assertSymlinkTarget(t, path, wantTarget)
+	finalIdentity, err := os.Lstat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !exists {
-		t.Fatal("wants directory unexpectedly absent")
+	if wantIdentity == nil || !os.SameFile(wantIdentity, finalIdentity) {
+		t.Fatalf("%s identity changed", label)
 	}
-	defer parent.close()
-
-	err = restoreCleanupQuarantine(
-		parent.dir,
-		quarantineName,
-		filepath.Base(linkPath),
-		linkPath,
-	)
-	if err == nil || !strings.Contains(err.Error(), quarantinePath) {
-		t.Fatalf("restore error = %v, want exact retained quarantine path", err)
-	}
-	if target, readErr := os.Readlink(linkPath); readErr != nil ||
-		target != foreignTarget {
-		t.Fatalf("foreign link target=%q err=%v", target, readErr)
-	}
-	if target, readErr := os.Readlink(quarantinePath); readErr != nil ||
-		target != systemdEnableLinkTarget {
-		t.Fatalf("quarantined owned link target=%q err=%v", target, readErr)
-	}
-	assertPublishedSystemdEnableOwnership(t, layout)
 }
 
 func assertPublishedSystemdEnableOwnership(t *testing.T, layout paths) {

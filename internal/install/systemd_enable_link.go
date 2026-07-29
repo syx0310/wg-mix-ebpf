@@ -14,18 +14,18 @@ const (
 )
 
 type systemdEnableLinkTransactionHooks struct {
-	beforeParentCreate      func(string) error
-	afterRollbackQuarantine func(string, string) error
+	afterCommitWalkOpen func(string) error
+	afterRetentionCheck func(string) error
 }
 
 type systemdEnableLinkTransaction struct {
-	artifact                cleanupManifestArtifact
-	parent                  *managedCleanupDir
-	entry                   *cleanupEntryPlan
-	afterRollbackQuarantine func(string, string) error
-	created                 bool
-	parentCreated           bool
-	committed               bool
+	artifact            cleanupManifestArtifact
+	parent              *managedCleanupDir
+	entry               *cleanupEntryPlan
+	afterCommitWalkOpen func(string) error
+	afterRetentionCheck func(string) error
+	created             bool
+	committed           bool
 }
 
 func declaredSystemdEnableLink(paths paths) (cleanupManifestArtifact, error) {
@@ -59,19 +59,29 @@ func beginSystemdEnableLinkTransaction(
 	if err != nil {
 		return nil, err
 	}
-	parent, parentCreated, err := openOrCreateDeclaredArtifactParent(
+	parent, exists, err := openDeclaredArtifactParent(
 		filepath.Dir(artifact.Path),
 		systemdEnableLinkDefaultParent,
-		hooks.beforeParentCreate,
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf(
+			"open existing declared systemd wants directory %s: %w",
+			filepath.Dir(artifact.Path),
+			err,
+		)
+	}
+	if !exists {
+		return nil, fmt.Errorf(
+			"refuse systemd enablement: declared wants directory %s does not exist; "+
+				"create and validate it outside this transaction before retrying",
+			filepath.Dir(artifact.Path),
+		)
 	}
 	transaction := &systemdEnableLinkTransaction{
-		artifact:                artifact,
-		parent:                  parent,
-		afterRollbackQuarantine: hooks.afterRollbackQuarantine,
-		parentCreated:           parentCreated,
+		artifact:            artifact,
+		parent:              parent,
+		afterCommitWalkOpen: hooks.afterCommitWalkOpen,
+		afterRetentionCheck: hooks.afterRetentionCheck,
 	}
 	defer func() {
 		if retErr == nil {
@@ -98,6 +108,9 @@ func beginSystemdEnableLinkTransaction(
 			return nil, err
 		}
 		transaction.entry = entry
+		if err := revalidateManagedCleanupDir(parent); err != nil {
+			return nil, err
+		}
 		return transaction, nil
 	case !cleanupIsNotExist(err):
 		return nil, fmt.Errorf("inspect systemd enable link %s: %w", artifact.Path, err)
@@ -111,7 +124,6 @@ func beginSystemdEnableLinkTransaction(
 	if err != nil {
 		return nil, fmt.Errorf("validate newly created systemd enable link: %w", err)
 	}
-	entry.remove = true
 	transaction.entry = entry
 	if err := parent.dir.file.Sync(); err != nil {
 		return nil, fmt.Errorf("sync systemd enable link directory %s: %w", parent.spec.path, err)
@@ -131,7 +143,11 @@ func (transaction *systemdEnableLinkTransaction) commit() error {
 	if transaction.committed {
 		return errors.New("systemd enable link transaction is already committed")
 	}
-	if transaction.entry.path != transaction.artifact.Path ||
+	expectedHeldPath := filepath.Join(
+		transaction.parent.declaredCanonicalPath,
+		filepath.Base(transaction.artifact.Path),
+	)
+	if transaction.entry.path != expectedHeldPath ||
 		transaction.entry.symlinkTarget != transaction.artifact.Target ||
 		!transaction.entry.symlink {
 		return errors.New(
@@ -174,9 +190,12 @@ func (transaction *systemdEnableLinkTransaction) revalidateParentFromDeclaredRoo
 	if err := revalidateManagedCleanupDir(transaction.parent); err != nil {
 		return fmt.Errorf("%s: %w", boundary, err)
 	}
-	reopened, exists, err := openDeclaredArtifactParent(
+	reopened, exists, err := openDeclaredArtifactParentWithOptions(
 		filepath.Dir(transaction.artifact.Path),
 		systemdEnableLinkDefaultParent,
+		exactDeclaredDirectoryOpenOptions{
+			afterOpen: transaction.afterCommitWalkOpen,
+		},
 	)
 	if err != nil {
 		return fmt.Errorf("%s: reopen declared systemd wants directory: %w", boundary, err)
@@ -199,13 +218,6 @@ func (transaction *systemdEnableLinkTransaction) revalidateParentFromDeclaredRoo
 			)
 		}
 	}()
-	if transaction.parent.spec.path != reopened.spec.path ||
-		transaction.parent.spec.systemRoot != reopened.spec.systemRoot {
-		return fmt.Errorf(
-			"%s: reopened systemd wants directory used a different declared root",
-			boundary,
-		)
-	}
 	if err := revalidateManagedCleanupDir(reopened); err != nil {
 		return fmt.Errorf(
 			"%s: revalidate reopened systemd wants directory: %w",
@@ -213,26 +225,8 @@ func (transaction *systemdEnableLinkTransaction) revalidateParentFromDeclaredRoo
 			err,
 		)
 	}
-	heldIdentity, err := cleanupIdentityForFD(
-		int(transaction.parent.dir.file.Fd()),
-	)
-	if err != nil {
-		return fmt.Errorf("%s: inspect held systemd wants directory: %w", boundary, err)
-	}
-	reopenedIdentity, err := cleanupIdentityForFD(int(reopened.dir.file.Fd()))
-	if err != nil {
-		return fmt.Errorf(
-			"%s: inspect reopened systemd wants directory: %w",
-			boundary,
-			err,
-		)
-	}
-	if !transaction.parent.identity.sameDirectory(heldIdentity) ||
-		!heldIdentity.sameDirectory(reopenedIdentity) {
-		return fmt.Errorf(
-			"%s: declared path no longer reaches the held systemd wants directory",
-			boundary,
-		)
+	if err := compareDeclaredDirectoryChains(transaction.parent, reopened); err != nil {
+		return fmt.Errorf("%s: compare complete declared directory chains: %w", boundary, err)
 	}
 	return nil
 }
@@ -241,79 +235,95 @@ func (transaction *systemdEnableLinkTransaction) rollback() error {
 	if transaction == nil || transaction.committed {
 		return nil
 	}
-	var errs []error
-	if transaction.created {
-		switch {
-		case transaction.entry == nil:
-			errs = append(errs, fmt.Errorf(
-				"cannot safely roll back unverified systemd enable link %s; "+
-					"the published ownership manifest retains its exact path and target",
+
+	beforeStatus := transaction.retentionStatus()
+	var hookErr error
+	if transaction.afterRetentionCheck != nil {
+		if err := transaction.afterRetentionCheck(transaction.artifact.Path); err != nil {
+			hookErr = fmt.Errorf(
+				"run systemd enable retention post-check hook for %s: %w",
 				transaction.artifact.Path,
-			))
-		default:
-			// The entry plan is bound to the held wants-directory descriptor.
-			// Do not resolve the wants pathname again before rolling back the
-			// exact link: a replaced pathname must neither redirect cleanup to
-			// a foreign directory nor prevent descriptor-bound cleanup of the
-			// transaction-owned link in a displaced directory.
-			if err := transaction.entry.unlinkWithQuarantineHooks(
-				cleanupEntryQuarantineHooks{
-					afterMove: transaction.afterRollbackQuarantine,
-				},
-			); err != nil {
-				errs = append(errs, fmt.Errorf(
-					"roll back exact systemd enable link %s: %w",
-					transaction.artifact.Path,
-					err,
-				))
-			} else {
-				transaction.created = false
-				if err := transaction.parent.dir.file.Sync(); err != nil {
-					errs = append(errs, fmt.Errorf(
-						"sync systemd enable link rollback directory %s: %w",
-						transaction.parent.spec.path,
-						err,
-					))
-				}
-			}
-		}
-	}
-	if transaction.parentCreated && !transaction.created {
-		directory := &cleanupDirectoryPlan{
-			root:          transaction.parent,
-			strictEntries: true,
-			removeRoot:    true,
-		}
-		if err := directory.remove(nil); err != nil {
-			errs = append(errs, fmt.Errorf(
-				"roll back exact created systemd enable directory %s: %w",
-				transaction.parent.spec.path,
 				err,
-			))
-		} else {
-			transaction.parentCreated = false
-			if err := transaction.parent.parent.file.Sync(); err != nil {
-				errs = append(errs, fmt.Errorf(
-					"sync parent after systemd enable directory rollback: %w",
-					err,
-				))
-			}
+			)
 		}
 	}
-	rollbackErr := errors.Join(errs...)
-	if rollbackErr == nil {
-		return nil
+	afterStatus := transaction.retentionStatus()
+	heldIdentity := "unavailable"
+	if transaction.entry != nil {
+		heldIdentity = systemdEnableIdentitySummary(transaction.entry.identity)
 	}
-	return errors.Join(
-		rollbackErr,
-		fmt.Errorf(
-			"systemd enable rollback is incomplete; the published ownership "+
-				"manifest retains path %s and target %q, and any object that "+
-				"could not be restored from cleanup quarantine remains at the "+
-				"exact quarantine path reported above",
-			transaction.artifact.Path,
-			transaction.artifact.Target,
-		),
+
+	retentionErr := fmt.Errorf(
+		"systemd enable failure retained evidence without rename, unlink, restore, or rmdir: "+
+			"original declared path %s, declared target %q, created_by_transaction=%t, "+
+			"held identity [%s], status before final retention hook [%s], "+
+			"current status [%s]; ownership was published before enablement, but the "+
+			"manifest does not durably bind this symlink inode, so automatic cleanup "+
+			"is not authorized after this error; manually inspect and resolve the "+
+			"declared path before using validated uninstall",
+		transaction.artifact.Path,
+		transaction.artifact.Target,
+		transaction.created,
+		heldIdentity,
+		beforeStatus,
+		afterStatus,
+	)
+	return errors.Join(hookErr, retentionErr)
+}
+
+func (transaction *systemdEnableLinkTransaction) retentionStatus() string {
+	if transaction == nil || transaction.parent == nil ||
+		transaction.parent.dir == nil || transaction.parent.dir.file == nil {
+		return "held wants-directory descriptor unavailable"
+	}
+	chainStatus := "declared parent chain still reaches every held component"
+	if err := revalidateManagedCleanupDir(transaction.parent); err != nil {
+		chainStatus = "declared parent chain mismatch: " + err.Error()
+	}
+
+	name := filepath.Base(transaction.artifact.Path)
+	identity, err := cleanupSymlinkIdentityAt(transaction.parent.dir, name)
+	if cleanupIsNotExist(err) {
+		return chainStatus + "; held-directory entry is absent"
+	}
+	if err != nil {
+		return chainStatus + "; held-directory entry inspection failed: " + err.Error()
+	}
+	target, err := cleanupReadlinkAt(transaction.parent.dir, name)
+	if err != nil {
+		return chainStatus + "; held-directory entry target inspection failed: " + err.Error()
+	}
+	current := fmt.Sprintf(
+		"%s; held-directory entry identity [%s], target %q",
+		chainStatus,
+		systemdEnableIdentitySummary(identity),
+		target,
+	)
+	if transaction.entry == nil {
+		return current + "; no transaction-held link identity was established"
+	}
+	return fmt.Sprintf(
+		"%s; matches held identity=%t, matches declared target=%t",
+		current,
+		transaction.entry.identity.sameSymlink(identity),
+		target == transaction.artifact.Target,
+	)
+}
+
+func systemdEnableIdentitySummary(identity cleanupIdentity) string {
+	mount := "unknown"
+	if identity.MountKnown {
+		mount = fmt.Sprintf("%d", identity.MountID)
+	}
+	return fmt.Sprintf(
+		"device=%d inode=%d mount=%s uid=%d gid=%d mode=%#o links=%d",
+		identity.Device,
+		identity.Inode,
+		mount,
+		identity.UID,
+		identity.GID,
+		identity.Mode,
+		identity.Links,
 	)
 }
 

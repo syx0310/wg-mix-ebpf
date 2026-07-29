@@ -47,6 +47,25 @@ func cleanupOpenDirAt(parent *cleanupDirFD, name string) (*cleanupDirFD, error) 
 	return &cleanupDirFD{file: file, identity: identity, path: parent.path + "/" + name}, nil
 }
 
+func cleanupOpenDirAtAllowMount(parent *cleanupDirFD, name string) (*cleanupDirFD, error) {
+	how := &unix.OpenHow{
+		Flags: unix.O_RDONLY | unix.O_DIRECTORY | unix.O_CLOEXEC | unix.O_NOFOLLOW,
+		Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_MAGICLINKS |
+			unix.RESOLVE_NO_SYMLINKS,
+	}
+	fd, err := unix.Openat2(int(parent.file.Fd()), name, how)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(fd), name)
+	identity, err := cleanupIdentityForFD(fd)
+	if err != nil {
+		_ = file.Close()
+		return nil, err
+	}
+	return &cleanupDirFD{file: file, identity: identity, path: parent.path + "/" + name}, nil
+}
+
 func cleanupIdentityForFD(fd int) (cleanupIdentity, error) {
 	var stat unix.Statx_t
 	if err := cleanupStatx(
