@@ -67,6 +67,44 @@ internal/dataplane/embedded/wg_mix_tc.o
 
 The Go compiler embeds that object into the final binary. The runtime loader uses the embedded object unless an override is provided.
 
+## Artifact Identity
+
+Packaged builds expose their identity without reading Git or the build host at
+runtime:
+
+```bash
+wg-mix-ebpf version --json
+```
+
+The JSON contains the userspace version, source commit, BPF ABI version, and
+SHA-256 of the exact `wg_mix_tc.o` bytes embedded in that executable. `status`
+reports the querying executable under `client_build`. A running daemon records
+its own immutable startup identity under `daemon.build`, so replacing the
+on-disk CLI cannot make an older daemon appear to run the newer artifact.
+
+`make build` and both `build-linux-*` targets inject `HEAD` only when the
+worktree is clean and Git returns a canonical 40-character lowercase commit.
+A dirty worktree, missing Git metadata, or invalid output produces
+`"source_commit": "unknown"`; the default userspace version remains `"dev"`.
+The commit value is not accepted from the environment or Make command line,
+and identity discovery uses the fixed system Git with a minimal environment.
+The Go build clears inherited `GOFLAGS`, disables `GOENV` and `GOWORK`, uses
+the checked-in module in read-only mode, and disables ambient VCS stamping.
+The selected Go/Clang toolchain binaries and installed headers remain trusted
+build inputs; their versions should be recorded with release evidence.
+
+For a load-only verifier check, deterministic machine-readable output is also
+available:
+
+```bash
+wg-mix-ebpf bpf-load-test --json
+wg-mix-ebpf bpf-load-test --object /path/to/wg_mix_tc.o --json
+```
+
+The `object.sha256` value is calculated from the same byte slice passed to the
+ELF parser. For an override, it therefore identifies the exact object that was
+loaded rather than the object path alone.
+
 ## Object Override
 
 For development, override the embedded BPF object:

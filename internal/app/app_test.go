@@ -12,10 +12,116 @@ import (
 	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+	"github.com/syx0310/wg-mix-ebpf/internal/buildinfo"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/daemon"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
+
+func TestVersionOutputIsBackwardCompatible(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if err := Run(t.Context(), []string{"version"}, &stdout, &stderr); err != nil {
+		t.Fatalf("version failed: %v stderr=%s", err, stderr.String())
+	}
+	if got, want := stdout.String(), Version+"\n"; got != want {
+		t.Fatalf("version output = %q, want %q", got, want)
+	}
+}
+
+func TestVersionJSONReportsDeterministicBuildIdentity(t *testing.T) {
+	var first, second, stderr bytes.Buffer
+	if err := Run(t.Context(), []string{"version", "--json"}, &first, &stderr); err != nil {
+		t.Fatalf("version --json failed: %v stderr=%s", err, stderr.String())
+	}
+	if err := Run(t.Context(), []string{"version", "--json"}, &second, &stderr); err != nil {
+		t.Fatalf("second version --json failed: %v stderr=%s", err, stderr.String())
+	}
+	if first.String() != second.String() {
+		t.Fatalf("version JSON changed between calls:\nfirst=%s\nsecond=%s", first.String(), second.String())
+	}
+	var got buildinfo.Info
+	if err := json.Unmarshal(first.Bytes(), &got); err != nil {
+		t.Fatalf("decode version JSON: %v\n%s", err, first.String())
+	}
+	if want := buildinfo.Current(); got != want {
+		t.Fatalf("version identity = %#v, want %#v", got, want)
+	}
+}
+
+func TestStatusReportsClientBuildIdentity(t *testing.T) {
+	cfgPath := writeTestConfig(t, "[Interface]\nFwMark = 0x10000002\nListenPort = 31001\n")
+	var stdout, stderr bytes.Buffer
+	if err := Run(
+		t.Context(),
+		[]string{"status", "--config", cfgPath, "--offline"},
+		&stdout,
+		&stderr,
+	); err != nil {
+		t.Fatalf("status failed: %v stderr=%s", err, stderr.String())
+	}
+	var got struct {
+		ClientBuild buildinfo.Info `json:"client_build"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode status JSON: %v\n%s", err, stdout.String())
+	}
+	if want := buildinfo.Current(); got.ClientBuild != want {
+		t.Fatalf("status client build identity = %#v, want %#v", got.ClientBuild, want)
+	}
+}
+
+func TestStatusDistinguishesClientAndDaemonBuilds(t *testing.T) {
+	cfgPath := writeTestConfig(t, "[Interface]\nFwMark = 0x10000002\nListenPort = 31001\n")
+	runDir := t.TempDir()
+	daemonBuild := buildinfo.Info{
+		Version:                 "previous",
+		SourceCommit:            "1111111111111111111111111111111111111111",
+		EmbeddedBPFObjectSHA256: "2222222222222222222222222222222222222222222222222222222222222222",
+		BPFABIVersion:           abi.Version,
+	}
+	statusData, err := json.Marshal(daemon.Status{
+		PID:             os.Getpid(),
+		ConfigPath:      cfgPath,
+		State:           "active",
+		Build:           &daemonBuild,
+		RequestProtocol: 1,
+		InstanceID:      "0123456789abcdef0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(runDir, "status.json"), statusData, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var stdout, stderr bytes.Buffer
+	if err := Run(
+		t.Context(),
+		[]string{
+			"status",
+			"--config", cfgPath,
+			"--run-dir", runDir,
+			"--offline",
+		},
+		&stdout,
+		&stderr,
+	); err != nil {
+		t.Fatalf("status failed: %v stderr=%s", err, stderr.String())
+	}
+	var got struct {
+		ClientBuild buildinfo.Info `json:"client_build"`
+		Daemon      *daemon.Status `json:"daemon"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode status JSON: %v\n%s", err, stdout.String())
+	}
+	if got.ClientBuild != buildinfo.Current() {
+		t.Fatalf("client build = %#v, want %#v", got.ClientBuild, buildinfo.Current())
+	}
+	if got.Daemon == nil || got.Daemon.Build == nil || *got.Daemon.Build != daemonBuild {
+		t.Fatalf("daemon build = %#v, want %#v", got.Daemon, daemonBuild)
+	}
+}
 
 func TestValidateOffline(t *testing.T) {
 	dir := t.TempDir()
@@ -390,6 +496,13 @@ func TestRunOnceDryOfflineWritesStatus(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(runDir, "status.json")); err != nil {
 		t.Fatalf("status not written: %v", err)
+	}
+	status, err := daemon.ReadStatus(runDir)
+	if err != nil {
+		t.Fatalf("read daemon status: %v", err)
+	}
+	if status.Build == nil || *status.Build != buildinfo.Current() {
+		t.Fatalf("daemon build identity = %#v, want %#v", status.Build, buildinfo.Current())
 	}
 }
 

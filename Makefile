@@ -1,24 +1,25 @@
 CGO_ENABLED ?= 0
 GO ?= go
 GOFMT ?= gofmt
-GOFLAGS ?= -trimpath
 BINARY ?= bin/wg-mix-ebpf
 CLANG ?= clang
 BPF_MULTIARCH ?= $(shell gcc -print-multiarch 2>/dev/null)
 BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/include/$(BPF_MULTIARCH),)
 BPF_OBJECT ?= build/wg_mix_tc.o
 EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
+override BUILD_SOURCE_COMMIT := $(shell ./scripts/source-commit.sh)
+override BUILD_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/buildinfo.sourceCommit=$(BUILD_SOURCE_COMMIT)
 
 .PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-live-guard-test build-bpf prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
-	CGO_ENABLED=$(CGO_ENABLED) $(GO) build $(GOFLAGS) -o $(BINARY) ./cmd/wg-mix-ebpf
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=$(CGO_ENABLED) $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o $(BINARY) ./cmd/wg-mix-ebpf
 
 build-linux-amd64: prepare-embedded-bpf
-	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build $(GOFLAGS) -o bin/wg-mix-ebpf-linux-amd64 ./cmd/wg-mix-ebpf
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o bin/wg-mix-ebpf-linux-amd64 ./cmd/wg-mix-ebpf
 
 build-linux-arm64: prepare-embedded-bpf
-	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build $(GOFLAGS) -o bin/wg-mix-ebpf-linux-arm64 ./cmd/wg-mix-ebpf
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o bin/wg-mix-ebpf-linux-arm64 ./cmd/wg-mix-ebpf
 
 # This convenience target is unprivileged. The fixed-tool and immutable
 # candidate-snapshot checks in the invoked script define the artifact gate;
@@ -79,6 +80,7 @@ test-lint:
 	@test -z "$$($(GOFMT) -l $$(find cmd internal -name '*.go' -type f))" || \
 		{ echo "gofmt required for:"; $(GOFMT) -l $$(find cmd internal -name '*.go' -type f); exit 1; }
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) vet ./...
+	sh -n scripts/source-commit.sh
 	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh
 	scripts/inspect-linux-test-host.sh --self-test-nft-table-gate
 	scripts/provision-ubuntu-test-host.sh --self-test-apt-gate

@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/syx0310/wg-mix-ebpf/internal/buildinfo"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
@@ -50,6 +51,7 @@ type Status struct {
 	PID             int               `json:"pid"`
 	ConfigPath      string            `json:"config_path"`
 	State           string            `json:"state"`
+	Build           *buildinfo.Info   `json:"build,omitempty"`
 	LastReason      string            `json:"last_reason,omitempty"`
 	LastSuccess     time.Time         `json:"last_success,omitempty"`
 	LastErrorTime   time.Time         `json:"last_error_time,omitempty"`
@@ -136,10 +138,12 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 		return fmt.Errorf("invalid daemon instance id %q", instanceID)
 	}
 	lastLegacyRequest := requestStamp(runDir)
+	identity := buildinfo.Current()
 	status := Status{
 		PID:             os.Getpid(),
 		ConfigPath:      configPath(opts.ConfigPath),
 		State:           "starting",
+		Build:           &identity,
 		RequestProtocol: requestProtocolVersion,
 		InstanceID:      instanceID,
 	}

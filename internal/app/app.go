@@ -15,6 +15,7 @@ import (
 	"gopkg.in/yaml.v3"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+	"github.com/syx0310/wg-mix-ebpf/internal/buildinfo"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/daemon"
@@ -26,7 +27,7 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/wgconfig"
 )
 
-const Version = "dev"
+const Version = buildinfo.Version
 
 func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
 	return RunWithIO(ctx, args, os.Stdin, stdout, stderr)
@@ -43,8 +44,7 @@ func RunWithIO(ctx context.Context, args []string, stdin io.Reader, stdout io.Wr
 		printUsage(stdout)
 		return nil
 	case "version":
-		fmt.Fprintln(stdout, Version)
-		return nil
+		return runVersion(args[1:], stdout)
 	case "doctor":
 		return runDoctor(ctx, args[1:], stdout)
 	case "features":
@@ -76,6 +76,23 @@ func RunWithIO(ctx context.Context, args []string, stdin io.Reader, stdout io.Wr
 		printUsage(stderr)
 		return fmt.Errorf("unknown command %q", cmd)
 	}
+}
+
+func runVersion(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	jsonOut := fs.Bool("json", false, "print build identity as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("version does not accept positional arguments")
+	}
+	if *jsonOut {
+		return writeJSON(stdout, buildinfo.Current())
+	}
+	fmt.Fprintln(stdout, Version)
+	return nil
 }
 
 func runDoctor(ctx context.Context, args []string, stdout io.Writer) error {
@@ -619,17 +636,31 @@ func runBPFLoadTest(ctx context.Context, args []string, stdout io.Writer) error 
 	fs := flag.NewFlagSet("bpf-load-test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	objectPath := fs.String("object", "", "path to TC/eBPF object")
+	jsonOut := fs.Bool("json", false, "print load and artifact identity as JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if err := dataplane.LoadObjectTest(ctx, *objectPath); err != nil {
+	identity, err := dataplane.LoadObjectTestIdentity(ctx, *objectPath)
+	if err != nil {
 		return err
 	}
-	path := *objectPath
-	if path == "" {
-		path = dataplane.DisplayObjectPath("")
+	if *jsonOut {
+		return writeJSON(stdout, struct {
+			Status string                   `json:"status"`
+			Build  buildinfo.Info           `json:"build"`
+			Object dataplane.ObjectIdentity `json:"object"`
+		}{
+			Status: "loaded",
+			Build:  buildinfo.Current(),
+			Object: identity,
+		})
 	}
-	fmt.Fprintf(stdout, "BPF object loaded successfully: %s\n", path)
+	fmt.Fprintf(
+		stdout,
+		"BPF object loaded successfully: %s (sha256=%s)\n",
+		identity.Source,
+		identity.SHA256,
+	)
 	return nil
 }
 
@@ -691,13 +722,16 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 	case "status", "dump":
 		if cmd == "status" {
 			view := struct {
+				ClientBuild   buildinfo.Info `json:"client_build"`
 				Daemon        *daemon.Status `json:"daemon,omitempty"`
 				Desired       *control.State `json:"desired,omitempty"`
 				Dataplane     any            `json:"dataplane,omitempty"`
 				Error         string         `json:"dataplane_error,omitempty"`
 				DesiredError  string         `json:"desired_error,omitempty"`
 				DataplaneNote string         `json:"dataplane_note,omitempty"`
-			}{}
+			}{
+				ClientBuild: buildinfo.Current(),
+			}
 			if status, err := daemon.ReadStatus(*runDir); err == nil {
 				view.Daemon = status
 			}
@@ -920,9 +954,9 @@ Commands:
   guard-plan  print nft startup guard script
   guard-apply apply nft startup guard
   guard-cleanup remove nft startup guard table
-  bpf-load-test load BPF object and exit without TC attach or WireGuard reads
+  bpf-load-test load BPF object and report the exact loaded-object identity
   features    print raw local feature probe JSON
-  version     print version
+  version     print version; use --json for source/object/ABI identity
 
 Common flags:
   --config PATH   config path (default /etc/wg-mix-ebpf/config.yaml)
