@@ -56,6 +56,8 @@ func isolatedNetNSTestContext(
 		stateDir,
 		filepath.Dir(configPath),
 		layout.bpffsDir,
+		filepath.Join(layout.runBase, "pin-locks"),
+		filepath.Join(layout.runBase, "pin-owners"),
 	} {
 		if err := requireRootOwnedPrivateDirectory(dir); err != nil {
 			return nil, err
@@ -83,6 +85,10 @@ func isolatedNetNSTestContext(
 	); err != nil {
 		return nil, err
 	}
+	endpoint, err := manifestEndpointForRole(manifest, layout.role)
+	if err != nil {
+		return nil, err
+	}
 	bootIDData, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	if err != nil {
 		return nil, fmt.Errorf("read current boot ID: %w", err)
@@ -107,7 +113,7 @@ func isolatedNetNSTestContext(
 	}
 	if err := validateManifestNetworkNamespaces(
 		manifest,
-		layout.role,
+		endpoint,
 		uint64(currentNetNSStat.Dev),
 		currentNetNSStat.Ino,
 	); err != nil {
@@ -133,7 +139,12 @@ func isolatedNetNSTestContext(
 		}
 	}
 
-	if err := validateIsolatedNetNSTestConfig(configPath, manifest, layout.role); err != nil {
+	if err := validateIsolatedNetNSTestConfig(
+		configPath,
+		manifest,
+		layout.role,
+		endpoint,
+	); err != nil {
 		return nil, err
 	}
 
@@ -146,6 +157,21 @@ func isolatedNetNSTestContext(
 			"--isolated-netns-test bpffs path is not on bpf filesystem: %s",
 			layout.bpffsDir,
 		)
+	}
+	bpffsInfo, err := os.Lstat(layout.bpffsDir)
+	if err != nil {
+		return nil, fmt.Errorf("inspect isolated bpffs identity: %w", err)
+	}
+	bpffsStat, ok := bpffsInfo.Sys().(*syscall.Stat_t)
+	if !ok {
+		return nil, errors.New("inspect isolated bpffs identity: unsupported stat data")
+	}
+	if err := validateBPFFSParentIdentity(
+		manifest,
+		uint64(bpffsStat.Dev),
+		bpffsStat.Ino,
+	); err != nil {
+		return nil, err
 	}
 	mountInfoData, err := os.ReadFile("/proc/self/mountinfo")
 	if err != nil {
@@ -192,29 +218,30 @@ func validateIsolatedNetNSTestConfig(
 	configPath string,
 	manifest isolatedNetNSTestManifest,
 	role string,
+	endpoint string,
 ) error {
 	cfg, err := config.LoadFile(configPath)
 	if err != nil {
 		return fmt.Errorf("load isolated test config %s: %w", configPath, err)
 	}
 	if len(cfg.Underlays) != 1 ||
-		cfg.Underlays[0].Name != manifest.values["underlay_"+role] ||
+		cfg.Underlays[0].Name != manifest.values["underlay_"+endpoint] ||
 		cfg.Underlays[0].Type != "netdev" {
 		return fmt.Errorf(
 			"isolated test config must contain exactly the manifest netdev underlay %q",
-			manifest.values["underlay_"+role],
+			manifest.values["underlay_"+endpoint],
 		)
 	}
 	if len(cfg.WireGuards) != 1 ||
 		cfg.WireGuards[0].Name != "wg0" ||
-		cfg.WireGuards[0].Config != manifest.values["wg_config_"+role] {
+		cfg.WireGuards[0].Config != manifest.values["wg_config_"+endpoint] {
 		return fmt.Errorf(
 			"isolated test config must contain exactly wg0 with role %s config %s",
 			role,
-			manifest.values["wg_config_"+role],
+			manifest.values["wg_config_"+endpoint],
 		)
 	}
-	if err := requireRootOwnedPrivateFile(manifest.values["wg_config_"+role]); err != nil {
+	if err := requireRootOwnedPrivateFile(manifest.values["wg_config_"+endpoint]); err != nil {
 		return err
 	}
 	for name, cipher := range cfg.Ciphers {
