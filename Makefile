@@ -83,6 +83,11 @@ test-lint:
 	scripts/inspect-linux-test-host.sh --self-test-nft-table-gate
 	scripts/provision-ubuntu-test-host.sh --self-test-apt-gate
 	scripts/build-live-guard-test.sh --self-test-safety-gate
+	@if test -x /usr/bin/env && test -x /usr/bin/python3; then \
+		scripts/test-build-live-guard-provenance.sh --self-test-tmpdir-gate; \
+	else \
+		echo "skip: provenance TMPDIR gate self-test requires fixed env and python3"; \
+	fi
 	scripts/test-live-guard-ownership.sh --self-test-safety-gate
 	@if test "$$(/usr/bin/uname -s)" = Linux && \
 		test "$$(/usr/bin/id -u)" != 0 && \

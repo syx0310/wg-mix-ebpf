@@ -27,6 +27,454 @@ readonly OVERSIZED_CHUNK_COUNT=257
 export PATH LC_ALL
 umask 077
 
+readonly TMPDIR_GATE_PYTHON='import os
+import re
+import stat
+import sys
+
+SAFE_PATH = re.compile(r"/[A-Za-z0-9_./+@-]+")
+
+
+class GateError(RuntimeError):
+    pass
+
+
+def reject(message):
+    raise GateError(message)
+
+
+def require_path_text(path):
+    if (
+        not path
+        or not os.path.isabs(path)
+        or path == "/"
+        or path.startswith("//")
+        or os.path.normpath(path) != path
+        or SAFE_PATH.fullmatch(path) is None
+    ):
+        reject("path is not an absolute normalized safe path")
+
+
+def require_ancestor_metadata(kind, owner, permissions, expected_owner):
+    if kind != stat.S_IFDIR:
+        reject("path chain contains a non-directory or symlink")
+    if owner not in (0, expected_owner):
+        reject("path chain contains an untrusted owner")
+    if permissions & 0o022 and not permissions & stat.S_ISVTX:
+        reject("path chain contains an unsafe writable directory")
+
+
+def require_private_metadata(kind, owner, permissions, expected_owner):
+    if kind != stat.S_IFDIR:
+        reject("controlled temporary parent is not a real directory")
+    if owner != expected_owner:
+        reject("controlled temporary parent has the wrong owner")
+    if permissions != 0o700:
+        reject("controlled temporary parent mode is not 0700")
+
+
+def require_default_metadata(kind, owner, permissions, expected_owner):
+    if kind != stat.S_IFDIR:
+        reject("default temporary parent is not a real directory")
+    private_parent = owner == expected_owner and permissions == 0o700
+    system_parent = owner == 0 and permissions == 0o1777
+    if not private_parent and not system_parent:
+        reject("default temporary parent metadata is unsafe")
+
+
+def metadata_fields(metadata):
+    return (
+        stat.S_IFMT(metadata.st_mode),
+        metadata.st_uid,
+        stat.S_IMODE(metadata.st_mode),
+    )
+
+
+def require_safe_chain(path, expected_owner):
+    current = "/"
+    components = [current]
+    for component in path.split("/")[1:]:
+        current = os.path.join(current, component)
+        components.append(current)
+    for component in components:
+        metadata = os.lstat(component)
+        require_ancestor_metadata(
+            *metadata_fields(metadata),
+            expected_owner,
+        )
+
+
+def require_access(path):
+    if not os.access(path, os.W_OK | os.X_OK, effective_ids=True):
+        reject("temporary parent is not writable and searchable")
+
+
+def resolve_controlled(
+    path,
+    expected_owner,
+    realpath=os.path.realpath,
+    safe_chain=require_safe_chain,
+    lstat=os.lstat,
+    access=require_access,
+):
+    require_path_text(path)
+    if realpath(path) != path:
+        reject("controlled temporary parent is not canonical")
+    safe_chain(path, expected_owner)
+    metadata = lstat(path)
+    require_private_metadata(*metadata_fields(metadata), expected_owner)
+    access(path)
+    return path, metadata
+
+
+def resolve_default(path, expected_owner):
+    require_path_text(path)
+    source = os.lstat(path)
+    source_kind = stat.S_IFMT(source.st_mode)
+    if source_kind == stat.S_IFLNK:
+        if source.st_uid != 0:
+            reject("default temporary symlink is not root-owned")
+    elif source_kind != stat.S_IFDIR:
+        reject("default temporary path is neither a directory nor symlink")
+    canonical = os.path.realpath(path)
+    require_path_text(canonical)
+    require_safe_chain(canonical, expected_owner)
+    metadata = os.lstat(canonical)
+    require_default_metadata(*metadata_fields(metadata), expected_owner)
+    require_access(canonical)
+    return canonical, metadata
+
+
+def expect_rejected(function, *arguments):
+    try:
+        function(*arguments)
+    except GateError:
+        return
+    reject("TMPDIR gate self-test accepted an unsafe case")
+
+
+def synthetic_metadata(kind, owner, permissions):
+    return os.stat_result(
+        (kind | permissions, 1, 1, 1, owner, 0, 0, 0, 0, 0)
+    )
+
+
+def self_test():
+    owner = 1234
+    controlled_path = "/home/test/wg-runs/run-1/tmp"
+    require_path_text(controlled_path)
+    for path in (
+        "",
+        "tmp",
+        "/",
+        "//tmp",
+        "/tmp/",
+        "/tmp/../unsafe",
+        "/tmp/./unsafe",
+        "/tmp unsafe",
+        "/tmp\nunsafe",
+    ):
+        expect_rejected(require_path_text, path)
+
+    require_ancestor_metadata(stat.S_IFDIR, 0, 0o755, owner)
+    require_ancestor_metadata(stat.S_IFDIR, owner, 0o700, owner)
+    require_ancestor_metadata(stat.S_IFDIR, 0, 0o1777, owner)
+    require_private_metadata(stat.S_IFDIR, owner, 0o700, owner)
+    require_default_metadata(stat.S_IFDIR, 0, 0o1777, owner)
+    require_default_metadata(stat.S_IFDIR, owner, 0o700, owner)
+    unsafe_metadata_checks = (
+        (require_ancestor_metadata, (stat.S_IFLNK, 0, 0o777, owner)),
+        (require_ancestor_metadata, (stat.S_IFDIR, owner + 1, 0o755, owner)),
+        (require_ancestor_metadata, (stat.S_IFDIR, 0, 0o777, owner)),
+        (require_private_metadata, (stat.S_IFREG, owner, 0o700, owner)),
+        (require_private_metadata, (stat.S_IFDIR, 0, 0o700, owner)),
+        (require_private_metadata, (stat.S_IFDIR, owner, 0o750, owner)),
+        (require_default_metadata, (stat.S_IFDIR, 0, 0o777, owner)),
+        (require_default_metadata, (stat.S_IFDIR, owner + 1, 0o700, owner)),
+    )
+    for function, arguments in unsafe_metadata_checks:
+        expect_rejected(function, *arguments)
+
+    private = synthetic_metadata(stat.S_IFDIR, owner, 0o700)
+    unsafe_entries = (
+        synthetic_metadata(stat.S_IFDIR, owner + 1, 0o700),
+        synthetic_metadata(stat.S_IFDIR, owner, 0o750),
+        synthetic_metadata(stat.S_IFLNK, owner, 0o777),
+    )
+    calls = []
+
+    def check_chain(path, expected_owner):
+        calls.append(("chain", path, expected_owner))
+
+    def check_access(path):
+        calls.append(("access", path))
+
+    identity = lambda path: path
+    private_entry = lambda path: private
+    resolved, metadata = resolve_controlled(
+        controlled_path,
+        owner,
+        identity,
+        check_chain,
+        private_entry,
+        check_access,
+    )
+    if (
+        (resolved, metadata) != (controlled_path, private)
+        or calls
+        != [
+            ("chain", controlled_path, owner),
+            ("access", controlled_path),
+        ]
+    ):
+        reject("controlled TMPDIR success path did not enforce every gate")
+
+    controlled_prefix = (resolve_controlled, controlled_path, owner)
+    expect_rejected(
+        *controlled_prefix,
+        lambda path: "/different",
+        check_chain,
+        private_entry,
+        check_access,
+    )
+    expect_rejected(
+        *controlled_prefix,
+        identity,
+        lambda path, expected_owner: reject("synthetic unsafe ancestor"),
+        private_entry,
+        check_access,
+    )
+    for entry in unsafe_entries:
+        expect_rejected(
+            *controlled_prefix,
+            identity,
+            check_chain,
+            lambda path, value=entry: value,
+            check_access,
+        )
+    expect_rejected(
+        *controlled_prefix,
+        identity,
+        check_chain,
+        private_entry,
+        lambda path: reject("synthetic access failure"),
+    )
+    resolve_default("/tmp", os.geteuid())
+
+
+def main():
+    arguments = sys.argv[1:]
+    if arguments == ["--self-test"]:
+        self_test()
+        return
+    if len(arguments) != 2 or arguments[0] not in ("controlled", "default"):
+        reject("internal TMPDIR gate invocation is invalid")
+    policy, path = arguments
+    if policy == "controlled":
+        resolved, metadata = resolve_controlled(path, os.geteuid())
+    else:
+        resolved, metadata = resolve_default(path, os.geteuid())
+    print(f"{resolved} {metadata.st_dev} {metadata.st_ino}")
+
+
+try:
+    main()
+except (GateError, OSError) as error:
+    print(f"error: unsafe provenance temporary parent: {error}", file=sys.stderr)
+    raise SystemExit(1)
+'
+
+run_tmpdir_gate() {
+  "${PYTHON3_BIN}" -I -B -c "${TMPDIR_GATE_PYTHON}" "$@"
+}
+
+set_fixture_parent_selection() {
+  [[ "$#" -eq 0 ]] || return 1
+  if [[ "${TMPDIR+x}" == "x" ]]; then
+    fixture_parent_policy="controlled"
+    fixture_parent_candidate="${TMPDIR}"
+  else
+    fixture_parent_policy="default"
+    fixture_parent_candidate="/tmp"
+  fi
+}
+
+identity_record_is_valid() {
+  local record="$1"
+
+  [[ -n "${record}" &&
+    "${record}" != *$'\n'* &&
+    "${record}" =~ ^(/[[:alnum:]_./+@-]+)\ ([0-9]+)\ ([0-9]+)$ ]]
+}
+
+fixture_identity_record_matches() {
+  local record="$1"
+  local expected_path="$2"
+  local expected_parent="$3"
+
+  identity_record_is_valid "${record}" &&
+    [[ "${record%% *}" == "${expected_path}" &&
+      "${expected_path%/*}" == "${expected_parent}" ]]
+}
+
+identity_records_match() {
+  local before="$1"
+  local after="$2"
+
+  identity_record_is_valid "${before}" &&
+    identity_record_is_valid "${after}" &&
+    [[ "${after}" == "${before}" ]]
+}
+
+export_fixture_tmpdir() {
+  [[ "$#" -eq 1 && "$1" == /* ]] || return 1
+  TMPDIR="$1"
+  export TMPDIR
+}
+
+run_isolated_environment() {
+  local isolated_tmpdir="$1"
+  local option_count="$2"
+  local environment_option=""
+
+  shift 2
+  [[ "${isolated_tmpdir}" == /* &&
+    "${option_count}" =~ ^[01]$ ]] || return 1
+  if [[ "${option_count}" == "1" ]]; then
+    [[ "$#" -gt 0 ]] || return 1
+    environment_option="$1"
+    shift
+  fi
+  [[ "$#" -gt 0 ]] || return 1
+  if [[ "${option_count}" == "1" ]]; then
+    "${ENV_BIN}" -i \
+      "${environment_option}" \
+      "PATH=${PATH}" \
+      "LC_ALL=${LC_ALL}" \
+      "TMPDIR=${isolated_tmpdir}" \
+      "$@"
+  else
+    "${ENV_BIN}" -i \
+      "PATH=${PATH}" \
+      "LC_ALL=${LC_ALL}" \
+      "TMPDIR=${isolated_tmpdir}" \
+      "$@"
+  fi
+}
+
+tmpdir_gate_shell_self_test() {
+  local environment_probe
+  local option_environment_probe
+  local expected_environment
+  local exported_tmpdir_probe
+  local fixture_parent_candidate
+  local fixture_parent_policy
+  local unsafe_tmpdir
+
+  unset TMPDIR
+  set_fixture_parent_selection
+  [[ "${fixture_parent_policy}" == "default" &&
+    "${fixture_parent_candidate}" == "/tmp" ]] || return 1
+  TMPDIR=""
+  set_fixture_parent_selection
+  [[ "${fixture_parent_policy}" == "controlled" &&
+    -z "${fixture_parent_candidate}" ]] || return 1
+  if run_tmpdir_gate \
+    "${fixture_parent_policy}" "${fixture_parent_candidate}" \
+    >/dev/null 2>&1; then
+    return 1
+  fi
+  TMPDIR="/controlled/tmp"
+  set_fixture_parent_selection
+  [[ "${fixture_parent_policy}" == "controlled" &&
+    "${fixture_parent_candidate}" == "${TMPDIR}" ]] || return 1
+  for unsafe_tmpdir in \
+    $'/controlled/tmp\n' \
+    $'/controlled/tmp\r\n' \
+    $'/controlled/tmp\n\n'; do
+    TMPDIR="${unsafe_tmpdir}"
+    set_fixture_parent_selection
+    [[ "${fixture_parent_policy}" == "controlled" &&
+      "${fixture_parent_candidate}" == "${unsafe_tmpdir}" ]] || return 1
+    if run_tmpdir_gate \
+      "${fixture_parent_policy}" "${fixture_parent_candidate}" \
+      >/dev/null 2>&1; then
+      return 1
+    fi
+  done
+
+  identity_record_is_valid "/controlled/tmp 11 22" || return 1
+  if identity_record_is_valid $'/controlled/tmp 11 22\n/injected 33 44' ||
+    identity_record_is_valid "/controlled/tmp 11 22 extra" ||
+    identity_record_is_valid "/controlled/tmp device 22"; then
+    return 1
+  fi
+  fixture_identity_record_matches \
+    "/controlled/tmp/fixture 33 44" \
+    "/controlled/tmp/fixture" \
+    "/controlled/tmp" || return 1
+  if fixture_identity_record_matches \
+    "/outside/fixture 33 44" \
+    "/controlled/tmp/fixture" \
+    "/controlled/tmp"; then
+    return 1
+  fi
+  if fixture_identity_record_matches \
+    "/controlled/tmp/fixture 33 44" \
+    "/controlled/tmp/fixture" \
+    "/outside"; then
+    return 1
+  fi
+  identity_records_match \
+    "/controlled/tmp 11 22" \
+    "/controlled/tmp 11 22" || return 1
+  if identity_records_match \
+    "/controlled/tmp 11 22" \
+    "/controlled/tmp 11 23"; then
+    return 1
+  fi
+
+  exported_tmpdir_probe="$(
+    TMPDIR="/poisoned/tmp"
+    export_fixture_tmpdir "/controlled/tmp"
+    "${PYTHON3_BIN}" -I -B -c \
+      'import os; print(os.environ.get("TMPDIR", ""))'
+  )"
+  [[ "${exported_tmpdir_probe}" == "/controlled/tmp" ]] || return 1
+  environment_probe="$(
+    HOME="/poisoned/home" \
+      TMPDIR="/poisoned/tmp" \
+      run_isolated_environment \
+      "/controlled/tmp" 0 "${ENV_BIN}"
+  )"
+  expected_environment="$(
+    printf 'PATH=%s\nLC_ALL=%s\nTMPDIR=/controlled/tmp\n' \
+      "${PATH}" "${LC_ALL}"
+  )"
+  [[ "${environment_probe}" == "${expected_environment}" ]] || return 1
+  option_environment_probe="$(
+    run_isolated_environment \
+      "/controlled/tmp" 1 "-i" "${ENV_BIN}"
+  )"
+  [[ "${option_environment_probe}" == "${expected_environment}" ]] || return 1
+}
+
+if [[ "${BUILD_GATE}" == "--self-test-tmpdir-gate" ]]; then
+  [[ "$#" -eq 1 &&
+    -x "${ENV_BIN}" &&
+    -x "${PYTHON3_BIN}" ]] || {
+    echo "error: TMPDIR gate self-test prerequisites are unavailable" >&2
+    exit 1
+  }
+  run_tmpdir_gate --self-test
+  tmpdir_gate_shell_self_test || {
+    echo "error: provenance TMPDIR shell gate self-test failed" >&2
+    exit 1
+  }
+  echo "provenance TMPDIR gate self-test passed"
+  exit 0
+fi
+
 [[ "${EUID}" -ne 0 ]] || {
   echo "error: provenance regression must run as an unprivileged user" >&2
   exit 1
@@ -43,9 +491,50 @@ umask 077
   exit 1
 }
 
+set_fixture_parent_selection
+fixture_parent_record="$(
+  run_tmpdir_gate \
+    "${fixture_parent_policy}" \
+    "${fixture_parent_candidate}"
+)"
+identity_record_is_valid "${fixture_parent_record}" || {
+  echo "error: TMPDIR gate returned malformed parent identity" >&2
+  exit 1
+}
+fixture_parent="${fixture_parent_record%% *}"
+readonly fixture_parent_policy
+readonly fixture_parent
+readonly fixture_parent_record
+
 fixture_root="$("${MKTEMP_BIN}" -d \
-  "/tmp/wg-mix-ebpf-guard-provenance.XXXXXXXXXXXX")"
+  "${fixture_parent}/wg-mix-ebpf-guard-provenance.XXXXXXXXXXXX")"
+[[ "${fixture_root%/*}" == "${fixture_parent}" ]] || {
+  printf 'error: mktemp returned a fixture outside the validated parent: path=%s parent=%s\n' \
+    "${fixture_root}" "${fixture_parent}" >&2
+  exit 1
+}
+fixture_root_record="$(run_tmpdir_gate controlled "${fixture_root}")"
+fixture_identity_record_matches \
+  "${fixture_root_record}" \
+  "${fixture_root}" \
+  "${fixture_parent}" || {
+  printf 'error: created provenance fixture identity is unsafe: path=%s\n' \
+    "${fixture_root}" >&2
+  exit 1
+}
+fixture_parent_after_record="$(
+  run_tmpdir_gate "${fixture_parent_policy}" "${fixture_parent}"
+)"
+identity_records_match \
+  "${fixture_parent_record}" \
+  "${fixture_parent_after_record}" || {
+  printf 'error: validated temporary parent changed during fixture creation: parent=%s fixture=%s\n' \
+    "${fixture_parent}" "${fixture_root}" >&2
+  exit 1
+}
 readonly fixture_root
+export_fixture_tmpdir "${fixture_root}"
+readonly TMPDIR
 readonly fixture_repo="${fixture_root}/repo"
 readonly fixture_home="${fixture_root}/fixture-home"
 readonly poisoned_home="${fixture_root}/poisoned-home"
@@ -188,9 +677,7 @@ readonly build_gate_sha fixture_gate_sha
 }
 
 fixture_git() {
-  "${ENV_BIN}" -i \
-    "PATH=${PATH}" \
-    "LC_ALL=${LC_ALL}" \
+  run_isolated_environment "${fixture_root}" 0 \
     "HOME=${fixture_home}" \
     "XDG_CONFIG_HOME=${fixture_home}" \
     "GIT_ATTR_NOSYSTEM=1" \
@@ -208,9 +695,7 @@ fixture_index_git() {
   local index_path="$1"
   shift
 
-  "${ENV_BIN}" -i \
-    "PATH=${PATH}" \
-    "LC_ALL=${LC_ALL}" \
+  run_isolated_environment "${fixture_root}" 0 \
     "HOME=${fixture_home}" \
     "XDG_CONFIG_HOME=${fixture_home}" \
     "GIT_ATTR_NOSYSTEM=1" \
@@ -225,9 +710,7 @@ fixture_index_git() {
     -C "${fixture_repo}" "$@"
 }
 
-"${ENV_BIN}" -i \
-  "PATH=${PATH}" \
-  "LC_ALL=${LC_ALL}" \
+run_isolated_environment "${fixture_root}" 0 \
   "HOME=${fixture_home}" \
   "XDG_CONFIG_HOME=${fixture_home}" \
   "GIT_ATTR_NOSYSTEM=1" \
@@ -304,9 +787,7 @@ readonly alternate_index="${fixture_root}/alternate-index"
   exit 1
 }
 alternate_fixture_git() {
-  "${ENV_BIN}" -i \
-    "PATH=${PATH}" \
-    "LC_ALL=${LC_ALL}" \
+  run_isolated_environment "${fixture_root}" 0 \
     "HOME=${fixture_home}" \
     "XDG_CONFIG_HOME=${fixture_home}" \
     "GIT_ATTR_NOSYSTEM=1" \
@@ -623,12 +1104,9 @@ for directory in \
   "${MKDIR_BIN}" --mode=0700 -- "${directory}"
 done
 readonly no_tag_binary="${no_tag_parent}/guard-no-tag.test"
-"${ENV_BIN}" -i \
+run_isolated_environment "${no_tag_parent}/tmp" 1 \
   "--chdir=${first_output_parent}/source-snapshot" \
-  "PATH=${PATH}" \
-  "LC_ALL=${LC_ALL}" \
   "HOME=${no_tag_parent}/home" \
-  "TMPDIR=${no_tag_parent}/tmp" \
   "GOTMPDIR=${no_tag_parent}/tmp" \
   "GOCACHE=${no_tag_parent}/cache" \
   "GOMODCACHE=${no_tag_parent}/modcache" \
@@ -964,11 +1442,8 @@ for literal_index in "${!EMBEDDED_LITERAL_NAMES[@]}"; do
   literal_name="${EMBEDDED_LITERAL_NAMES[${literal_index}]}"
   literal_hash="${EMBEDDED_LITERAL_HASHES[${literal_index}]}"
   literal_path="${embedded_probe_root}/${literal_name}.py"
-  "${ENV_BIN}" -i \
-    "PATH=${PATH}" \
-    "LC_ALL=${LC_ALL}" \
+  run_isolated_environment "${embedded_probe_root}" 0 \
     "HOME=${fixture_home}" \
-    "TMPDIR=${embedded_probe_root}" \
     "${PYTHON3_BIN}" \
     -I \
     -B \
@@ -996,11 +1471,8 @@ run_embedded_python_failure() {
   printf 'provenance_probe_start probe=%s\n' "${label}"
   set +e
   probe_output="$(
-    "${ENV_BIN}" -i \
-      "PATH=${PATH}" \
-      "LC_ALL=${LC_ALL}" \
+    run_isolated_environment "${embedded_probe_root}" 0 \
       "HOME=${fixture_home}" \
-      "TMPDIR=${embedded_probe_root}" \
       "${PYTHON3_BIN}" \
       -I \
       -B \
@@ -1032,11 +1504,8 @@ run_embedded_python_success() {
   printf 'provenance_probe_start probe=%s\n' "${label}"
   set +e
   probe_output="$(
-    "${ENV_BIN}" -i \
-      "PATH=${PATH}" \
-      "LC_ALL=${LC_ALL}" \
+    run_isolated_environment "${embedded_probe_root}" 0 \
       "HOME=${fixture_home}" \
-      "TMPDIR=${embedded_probe_root}" \
       "${PYTHON3_BIN}" \
       -I \
       -B \
