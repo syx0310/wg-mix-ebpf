@@ -87,7 +87,11 @@ worktree is clean and Git returns a canonical 40-character lowercase commit.
 A dirty worktree, missing Git metadata, or invalid output produces
 `"source_commit": "unknown"`; the default userspace version remains `"dev"`.
 The commit value is not accepted from the environment or Make command line,
-and the explicit build disables Go's ambient VCS stamping.
+and identity discovery uses the fixed system Git with a minimal environment.
+The Go build clears inherited `GOFLAGS`, disables `GOENV` and `GOWORK`, uses
+the checked-in module in read-only mode, and disables ambient VCS stamping.
+The selected Go/Clang toolchain binaries and installed headers remain trusted
+build inputs; their versions should be recorded with release evidence.
 
 For a load-only verifier check, deterministic machine-readable output is also
 available:

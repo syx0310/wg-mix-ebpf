@@ -42,14 +42,37 @@ jobs:
         run: CGO_ENABLED=1 make test-unit-race
 
       - name: Build Linux amd64 package binary
-        run: make build-linux-amd64
+        run: |
+          make build-linux-amd64
+          ./bin/wg-mix-ebpf-linux-amd64 version --json >/tmp/wg-mix-ebpf-version.json
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import re
+          import subprocess
+          from pathlib import Path
+
+          identity = json.loads(Path("/tmp/wg-mix-ebpf-version.json").read_text())
+          head = subprocess.check_output(
+              ["/usr/bin/git", "rev-parse", "HEAD"],
+              text=True,
+          ).strip()
+          embedded = hashlib.sha256(
+              Path("internal/dataplane/embedded/wg_mix_tc.o").read_bytes()
+          ).hexdigest()
+          if identity["source_commit"] != head:
+              raise SystemExit(f"source commit {identity['source_commit']} != {head}")
+          if identity["embedded_bpf_object_sha256"] != embedded:
+              raise SystemExit("embedded BPF object SHA-256 mismatch")
+          if not re.fullmatch(r"[0-9a-f]{64}", embedded):
+              raise SystemExit(f"invalid BPF SHA-256 {embedded}")
+          PY
 
       - name: Build Linux arm64 package binary
         run: make build-linux-arm64
 
       - name: Offline config validation
         run: |
-          ./bin/wg-mix-ebpf-linux-amd64 version --json >/tmp/wg-mix-ebpf-version.json
           ./bin/wg-mix-ebpf-linux-amd64 validate --config configs/example.yaml --offline
           ./bin/wg-mix-ebpf-linux-amd64 dump-abi --config configs/example.yaml --offline >/tmp/wg-mix-ebpf-abi.json
 

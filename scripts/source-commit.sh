@@ -8,16 +8,21 @@ print_unknown() {
 	printf '%s\n' "${unknown}"
 }
 
-# Run Git with a deliberately minimal environment so repository-selection,
-# alternate-object, config-injection, and replacement variables cannot
-# redirect identity discovery away from the current worktree.
-git_path=${PATH:-/usr/bin:/bin}
+# Run a fixed system Git with a deliberately minimal environment so PATH,
+# repository-selection, alternate-object, config-injection, and replacement
+# variables cannot redirect identity discovery away from the current worktree.
+system_env=/usr/bin/env
+system_git=/usr/bin/git
+if [ ! -x "${system_env}" ] || [ ! -x "${system_git}" ]; then
+	print_unknown
+	exit 0
+fi
 clean_git() {
-	env -i \
-		PATH="${git_path}" \
+	"${system_env}" -i \
+		PATH=/usr/bin:/bin \
 		LC_ALL=C \
 		GIT_OPTIONAL_LOCKS=0 \
-		git "$@"
+		"${system_git}" "$@"
 }
 
 if ! commit=$(clean_git rev-parse --verify 'HEAD^{commit}' 2>/dev/null); then
