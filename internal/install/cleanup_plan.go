@@ -313,7 +313,6 @@ func prepareUninstallCleanup(
 
 func cleanupResourcesExist(paths paths, system string) bool {
 	candidates := []string{
-		paths.RunDir,
 		paths.VarLibDir,
 		paths.PinPath,
 		paths.ConfigPath,
@@ -329,11 +328,48 @@ func cleanupResourcesExist(paths paths, system string) bool {
 		)
 	}
 	for _, candidate := range candidates {
-		if _, err := os.Lstat(candidate); err == nil {
+		if _, err := os.Lstat(candidate); err == nil || !cleanupIsNotExist(err) {
 			return true
 		}
 	}
-	return false
+	return runtimeCleanupResourcesExist(paths.RunDir)
+}
+
+func runtimeCleanupResourcesExist(runDir string) bool {
+	if _, err := os.Lstat(runDir); cleanupIsNotExist(err) {
+		return false
+	} else if err != nil {
+		return true
+	}
+	root, exists, err := openManagedCleanupDir(runtimeCleanupPath(runDir))
+	if err != nil {
+		return true
+	}
+	if !exists {
+		return false
+	}
+	entries, err := cleanupReadDir(root.dir)
+	if err != nil || len(entries) != 1 || entries[0].Name() != "daemon.lease" {
+		_ = root.close()
+		return true
+	}
+	node, err := snapshotManagedFile(
+		root.dir,
+		"daemon.lease",
+		false,
+		false,
+		validateLifecycleLeaseBytes(cleanupManifest{RunDir: runDir}),
+	)
+	if err != nil {
+		_ = root.close()
+		return true
+	}
+	if node.identity.Mode&0o7777 != 0o600 {
+		_ = node.close()
+		_ = root.close()
+		return true
+	}
+	return errors.Join(node.close(), root.close()) != nil
 }
 
 func prepareConfigDirectoryPlan(
@@ -1218,6 +1254,29 @@ func (plan *uninstallCleanupPlan) execute() error {
 		return err
 	}
 	for _, directory := range plan.directories {
+		if err := directory.remove(plan.beforeQuarantine); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (plan *uninstallCleanupPlan) executeServiceArtifacts() error {
+	if plan == nil {
+		return nil
+	}
+	if plan.beforeExecute != nil {
+		if err := plan.beforeExecute(); err != nil {
+			return err
+		}
+	}
+	if err := plan.revalidate(); err != nil {
+		return err
+	}
+	for _, directory := range plan.directories {
+		if directory.root.spec.name != "service artifact directory" {
+			continue
+		}
 		if err := directory.remove(plan.beforeQuarantine); err != nil {
 			return err
 		}

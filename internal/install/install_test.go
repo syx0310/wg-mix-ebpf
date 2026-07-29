@@ -374,6 +374,109 @@ func TestUninstallPurgeRemovesOwnedConfigAndIsIdempotent(t *testing.T) {
 	}
 }
 
+func TestUninstallPurgeIsIdempotentWithRetainedLifecycleLease(t *testing.T) {
+	layout := newCleanupTestLayout(t, "purge-retained-lease")
+	setCleanupTestEnvironment(t, layout)
+	installFakeNft(t, "")
+	lifecyclePath := filepath.Join(layout.RunDir, "daemon.lease")
+	ctx := lockfile.WithLifecyclePathForTest(t.Context(), lifecyclePath)
+	opts := Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "unknown",
+		Yes:        true,
+		Purge:      true,
+	}
+
+	if _, err := Uninstall(ctx, opts); err != nil {
+		t.Fatal(err)
+	}
+	leaseBefore, err := os.Stat(lifecyclePath)
+	if err != nil {
+		t.Fatalf("purge removed retained lifecycle lease: %v", err)
+	}
+	entries, err := os.ReadDir(layout.RunDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "daemon.lease" {
+		t.Fatalf("purge retained unexpected runtime entries: %#v", entries)
+	}
+	if _, err := os.Stat(filepath.Dir(layout.ConfigPath)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("purge retained config ownership directory: %v", err)
+	}
+
+	if _, err := Uninstall(ctx, opts); err != nil {
+		t.Fatalf("second purge with retained lifecycle lease: %v", err)
+	}
+	leaseAfter, err := os.Stat(lifecyclePath)
+	if err != nil {
+		t.Fatalf("second purge changed retained lifecycle lease: %v", err)
+	}
+	if !os.SameFile(leaseBefore, leaseAfter) {
+		t.Fatal("second purge replaced the retained lifecycle lease")
+	}
+}
+
+func TestUninstallPurgeRetainsOwnershipUntilDaemonReloadSucceeds(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(t, "purge-reload-retry", "systemd")
+	setCleanupTestEnvironment(t, layout)
+	installFakeNft(t, "")
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "daemon-reload")
+	ctx := lockfile.WithLifecyclePathForTest(
+		t.Context(),
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	opts := Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "systemd",
+		Yes:        true,
+		Purge:      true,
+	}
+
+	_, err := Uninstall(ctx, opts)
+	if err == nil || !strings.Contains(err.Error(), "daemon-reload") {
+		t.Fatalf("first purge error = %v, want daemon-reload failure", err)
+	}
+	unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+	if _, err := os.Stat(unitPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("failed daemon-reload retained systemd unit: %v", err)
+	}
+	for _, path := range []string{
+		cleanupManifestPath(layout),
+		layout.ConfigPath,
+		layout.RunDir,
+		layout.VarLibDir,
+		layout.PinPath,
+	} {
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("failed daemon-reload removed retry ownership target %s: %v", path, err)
+		}
+	}
+
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL", "")
+	if _, err := Uninstall(ctx, opts); err != nil {
+		t.Fatalf("retry purge after daemon-reload recovery: %v", err)
+	}
+	for _, path := range []string{
+		filepath.Dir(layout.ConfigPath),
+		layout.RunDir,
+		layout.VarLibDir,
+		layout.PinPath,
+	} {
+		if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("retry purge retained %s: %v", path, err)
+		}
+	}
+	logData, err := os.ReadFile(commandLog)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Count(string(logData), "daemon-reload\n") != 2 {
+		t.Fatalf("systemctl log = %q, want two daemon-reload attempts", logData)
+	}
+}
+
 func TestUninstallRejectsDangerousCleanupPaths(t *testing.T) {
 	t.Setenv(dataplaneEnvPinPathForTest, "/sys/fs/bpf")
 	_, err := Uninstall(t.Context(), Options{System: "unknown", DryRun: true})

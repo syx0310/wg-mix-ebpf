@@ -345,16 +345,33 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 				return fmt.Errorf("cleanup startup guard: %w", err)
 			}
 		}
+		if err := cleanupPlan.executeServiceArtifacts(); err != nil {
+			return fmt.Errorf("remove descriptor-anchored service artifacts: %w", err)
+		}
+		if err := cleanupPlan.close(); err != nil {
+			return fmt.Errorf("close service-artifact cleanup handles: %w", err)
+		}
+		cleanupPlan = nil
+		if system == "systemd" {
+			if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+				return err
+			}
+		}
+
+		cleanupPlan, err = prepareUninstallCleanup(
+			paths,
+			system,
+			opts.Purge,
+			lockfile.LifecycleLeasePath(ctx),
+		)
+		if err != nil {
+			return fmt.Errorf("repeat uninstall preflight after service reload: %w", err)
+		}
 		// The global lifecycle lease serializes every mutating entrypoint. Do
 		// not acquire the per-run lock here: WithLock creates a lock file, which
 		// would mutate the fully preflighted target set before revalidation.
 		if err := cleanupPlan.execute(); err != nil {
 			return fmt.Errorf("execute descriptor-anchored uninstall cleanup: %w", err)
-		}
-		if system == "systemd" {
-			if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
-				return err
-			}
 		}
 		return nil
 	}); err != nil {
