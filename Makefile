@@ -44,13 +44,13 @@ test-netns-icmp-smoke: build
 	NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
 
 test-netns-tcp-native: build
-	RUN_ID=tcpnat4 TCP_CHECKS=enforce scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce scripts/smoke-netns-wg.sh
 
 test-netns-tcp-xor-prefix: build
-	RUN_ID=tcppfx4 TCP_CHECKS=enforce XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
 
 test-netns-tcp-xor-full: build
-	RUN_ID=tcpfull4 TCP_CHECKS=enforce XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 scripts/smoke-netns-wg.sh
 
 test-netns-tcp: test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full
 
@@ -90,13 +90,13 @@ test-netns:
 	@echo "run as root on an external Linux VM: make test-netns-smoke"
 
 test-netns-full: build
-	RUN_ID=fullu4 scripts/smoke-netns-wg.sh
-	RUN_ID=fullu6 OUTER_FAMILY=ipv6 UDP_ZERO_CHECKSUM_CHECKS=enforce scripts/smoke-netns-wg.sh
-	RUN_ID=fullx4p XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
-	RUN_ID=fullx6p OUTER_FAMILY=ipv6 XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
-	RUN_ID=fullx4f XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce XOR_DISPATCH_FAILURE_CHECKS=enforce scripts/smoke-netns-wg.sh
-	RUN_ID=fullx6f OUTER_FAMILY=ipv6 XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce UDP_ZERO_CHECKSUM_CHECKS=enforce scripts/smoke-netns-wg.sh
-	RUN_ID=fulli4 NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
+	scripts/smoke-netns-wg.sh
+	OUTER_FAMILY=ipv6 UDP_ZERO_CHECKSUM_CHECKS=enforce scripts/smoke-netns-wg.sh
+	XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
+	OUTER_FAMILY=ipv6 XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
+	XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce XOR_DISPATCH_FAILURE_CHECKS=enforce scripts/smoke-netns-wg.sh
+	OUTER_FAMILY=ipv6 XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce UDP_ZERO_CHECKSUM_CHECKS=enforce scripts/smoke-netns-wg.sh
+	NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
 	$(MAKE) test-netns-tcp
 
 test-vm:

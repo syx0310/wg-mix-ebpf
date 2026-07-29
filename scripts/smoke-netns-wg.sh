@@ -94,7 +94,9 @@ if [[ "${TCP_CHECKS}" == "enforce" ]]; then
   fi
 fi
 
-for cmd in ip wg ping tcpdump python3 timeout grep; do
+for cmd in \
+  awk cat chmod date dirname env find grep hostname ip mkdir mount mountpoint ping python3 \
+  realpath rm rmdir sed sleep stat sysctl tcpdump timeout umount wg; do
   if ! command -v "${cmd}" >/dev/null 2>&1; then
     echo "error: missing command: ${cmd}" >&2
     exit 1
@@ -114,9 +116,17 @@ if [[ ! -x "${BIN}" ]]; then
   exit 1
 fi
 
-RUN_ID="${RUN_ID:-$(printf '%x' "$$")}"
-if [[ ! "${RUN_ID}" =~ ^[[:alnum:]]{1,8}$ ]]; then
-  echo "error: RUN_ID must contain 1-8 alphanumeric characters" >&2
+if [[ -n "${RUN_ID+x}" ]]; then
+  echo "error: externally supplied RUN_ID is forbidden; each run uses a fresh random ID" >&2
+  exit 1
+fi
+RUN_ID="$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(4))
+PY
+)"
+if [[ ! "${RUN_ID}" =~ ^[0-9a-f]{8}$ ]]; then
+  echo "error: failed to generate an 8-character random RUN_ID" >&2
   exit 1
 fi
 NSA="wme${RUN_ID}a"
@@ -126,75 +136,455 @@ VETH_A="wma${RUN_ID}0"
 VETH_RA="wmr${RUN_ID}a"
 VETH_B="wmb${RUN_ID}0"
 VETH_RB="wmr${RUN_ID}b"
-TMPDIR="$(mktemp -d /tmp/wg-mix-ebpf-smoke.XXXXXX)"
-PIN_ROOT="${PIN_ROOT:-/sys/fs/bpf}"
-PIN_BASE="${PIN_ROOT}/wg-mix-ebpf-smoke-${RUN_ID}"
-PINA="${PIN_BASE}/wg-mix-ebpf-${NSA}"
-PINB="${PIN_BASE}/wg-mix-ebpf-${NSB}"
+TEST_ROOT="/run/wg-mix-ebpf-tests"
+RUN_BASE="${TEST_ROOT}/${RUN_ID}"
+BPFFS_DIR="${RUN_BASE}/bpffs"
+PINA="${BPFFS_DIR}/wg-mix-ebpf-a"
+PINB="${BPFFS_DIR}/wg-mix-ebpf-b"
+RUN_DIR_A="${RUN_BASE}/run-a"
+RUN_DIR_B="${RUN_BASE}/run-b"
+STATE_DIR_A="${RUN_BASE}/state-a"
+STATE_DIR_B="${RUN_BASE}/state-b"
+TMPDIR="${RUN_BASE}/evidence"
+SECRET_DIR="${RUN_BASE}/secrets"
+OWNER_MARKER=".wg-mix-ebpf-test-owner"
+MANIFEST="${RUN_BASE}/manifest"
+OWNER_TOKEN="$(python3 - <<'PY'
+import secrets
+print(secrets.token_hex(16))
+PY
+)"
+BOOT_ID="$(< /proc/sys/kernel/random/boot_id)"
+HOST_ID="$(hostname)"
 UDP_ZERO_CHECKSUM_RECEIVER_PID=""
 TCP_SERVER_PID=""
+TCPDUMP_RA=""
+TCPDUMP_RB=""
+RUN_BASE_CREATED=0
+TEARDOWN_COMPLETE=0
+PHASE="preflight"
 umask 077
+
+print_command() {
+  printf '  '
+  printf '%q ' "$@"
+  printf '\n'
+}
+
+failure_report() {
+  local status="$1"
+  local signal="${2:-none}"
+
+  printf 'smoke failure: timestamp=%s status=%s signal=%s phase=%s host=%s run_id=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${status}" "${signal}" \
+    "${PHASE}" "${HOST_ID}" "${RUN_ID}" >&2
+  printf 'the failure trap performed no detach, delete, unmount, kill, or file cleanup\n' >&2
+  if ((RUN_BASE_CREATED)); then
+    printf 'evidence root: %s\nownership marker: %s\nmanifest: %s\n' \
+      "${RUN_BASE}" "${RUN_BASE}/${OWNER_MARKER}" "${MANIFEST}" >&2
+    printf 'sensitive recovery material (never copy as evidence): %s\n' \
+      "${SECRET_DIR}" >&2
+    printf 'review the marker, manifest, exact paths, and bounded inventory before recovery\n' >&2
+    printf 'suggested recovery commands (run one at a time only after review):\n' >&2
+    print_command ip netns exec "${NSA}" env "WG_MIX_EBPF_PIN_PATH=${PINA}" \
+      "${BIN}" detach --config "${SECRET_DIR}/agent-a.yaml" \
+      --run-dir "${RUN_DIR_A}" --state-dir "${STATE_DIR_A}" >&2
+    print_command ip netns exec "${NSB}" env "WG_MIX_EBPF_PIN_PATH=${PINB}" \
+      "${BIN}" detach --config "${SECRET_DIR}/agent-b.yaml" \
+      --run-dir "${RUN_DIR_B}" --state-dir "${STATE_DIR_B}" >&2
+    print_command ip netns delete "${NSA}" >&2
+    print_command ip netns delete "${NSR}" >&2
+    print_command ip netns delete "${NSB}" >&2
+    print_command umount "${BPFFS_DIR}" >&2
+    printf 'do not remove files until every path is revalidated under %s/%s\n' \
+      "${TEST_ROOT}" "${RUN_ID}" >&2
+  fi
+  for pid_record in \
+    "tcpdump-ra:${TCPDUMP_RA}" "tcpdump-rb:${TCPDUMP_RB}" \
+    "udp-receiver:${UDP_ZERO_CHECKSUM_RECEIVER_PID}" \
+    "tcp-server:${TCP_SERVER_PID}"; do
+    [[ "${pid_record#*:}" == "" ]] ||
+      printf 'bounded background process left for timeout: %s\n' "${pid_record}" >&2
+  done
+}
+
+on_exit() {
+  local status=$?
+
+  trap - EXIT INT TERM
+  if ((status == 0)) && ((TEARDOWN_COMPLETE == 0)); then
+    status=1
+    printf 'error: refusing successful exit before explicit teardown completed\n' >&2
+  fi
+  if ((status != 0)); then
+    failure_report "${status}"
+  fi
+  exit "${status}"
+}
+
+on_signal() {
+  local signal="$1"
+  local status="$2"
+
+  trap - INT TERM
+  failure_report "${status}" "${signal}"
+  trap - EXIT
+  exit "${status}"
+}
+
+trap on_exit EXIT
+trap 'on_signal INT 130' INT
+trap 'on_signal TERM 143' TERM
+
+validate_owned_path() {
+  local path="$1"
+  local normalized
+
+  if [[ -z "${path}" || "${path}" != /* ]]; then
+    echo "error: owned path must be a non-empty absolute path: ${path}" >&2
+    return 1
+  fi
+  normalized="$(realpath -m -- "${path}")"
+  if [[ "${normalized}" != "${path}" ||
+    ( "${path}" != "${RUN_BASE}" && "${path}" != "${RUN_BASE}/"* ) ]]; then
+    echo "error: owned path escaped run root: ${path} -> ${normalized}" >&2
+    return 1
+  fi
+}
+
+marker_payload() {
+  local role="$1"
+
+  printf 'format=wg-mix-ebpf-test-owner-v1\n'
+  printf 'run_id=%s\n' "${RUN_ID}"
+  printf 'owner_token=%s\n' "${OWNER_TOKEN}"
+  printf 'boot_id=%s\n' "${BOOT_ID}"
+  printf 'role=%s\n' "${role}"
+}
+
+manifest_payload() {
+  printf 'format=wg-mix-ebpf-test-manifest-v1\n'
+  printf 'run_id=%s\nowner_token=%s\nboot_id=%s\nhost=%s\n' \
+    "${RUN_ID}" "${OWNER_TOKEN}" "${BOOT_ID}" "${HOST_ID}"
+  printf 'run_base=%s\nbpffs=%s\npin_a=%s\npin_b=%s\n' \
+    "${RUN_BASE}" "${BPFFS_DIR}" "${PINA}" "${PINB}"
+  printf 'netns_a=%s\nnetns_r=%s\nnetns_b=%s\n' "${NSA}" "${NSR}" "${NSB}"
+  printf 'run_dir_a=%s\nstate_dir_a=%s\nrun_dir_b=%s\nstate_dir_b=%s\n' \
+    "${RUN_DIR_A}" "${STATE_DIR_A}" "${RUN_DIR_B}" "${STATE_DIR_B}"
+  printf 'evidence=%s\nsecrets=%s\n' "${TMPDIR}" "${SECRET_DIR}"
+}
+
+write_marker() {
+  local dir="$1"
+  local role="$2"
+  local marker="${dir}/${OWNER_MARKER}"
+
+  validate_owned_path "${dir}" || return 1
+  if [[ ! -d "${dir}" || -L "${dir}" || -e "${marker}" || -L "${marker}" ]]; then
+    echo "error: unsafe marker target: ${marker}" >&2
+    return 1
+  fi
+  (set -o noclobber; marker_payload "${role}" >"${marker}")
+  chmod 0600 "${marker}"
+}
+
+validate_marker() {
+  local dir="$1"
+  local role="$2"
+  local marker="${dir}/${OWNER_MARKER}"
+  local expected
+  local actual
+
+  validate_owned_path "${dir}" || return 1
+  if [[ ! -d "${dir}" || -L "${dir}" || ! -f "${marker}" || -L "${marker}" ||
+    "$(stat -c '%u' -- "${dir}")" != "${EUID}" ||
+    "$(stat -c '%a' -- "${dir}")" != "700" ||
+    "$(stat -c '%u' -- "${marker}")" != "${EUID}" ||
+    "$(stat -c '%a' -- "${marker}")" != "600" ||
+    "$(stat -c '%h' -- "${marker}")" != "1" ]]; then
+    echo "error: invalid ownership marker: ${marker}" >&2
+    return 1
+  fi
+  expected="$(marker_payload "${role}")"
+  actual="$(<"${marker}")"
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "error: ownership marker content mismatch: ${marker}" >&2
+    return 1
+  fi
+}
+
+validate_manifest() {
+  local expected
+  local actual
+
+  validate_owned_path "${MANIFEST}" || return 1
+  if [[ ! -f "${MANIFEST}" || -L "${MANIFEST}" ||
+    "$(stat -c '%u' -- "${MANIFEST}")" != "${EUID}" ||
+    "$(stat -c '%a' -- "${MANIFEST}")" != "600" ||
+    "$(stat -c '%h' -- "${MANIFEST}")" != "1" ]]; then
+    echo "error: invalid manifest file: ${MANIFEST}" >&2
+    return 1
+  fi
+  expected="$(manifest_payload)"
+  actual="$(<"${MANIFEST}")"
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "error: manifest content mismatch: ${MANIFEST}" >&2
+    return 1
+  fi
+}
+
+validate_private_bpffs_mount() {
+  if ! mountpoint -q -- "${BPFFS_DIR}" ||
+    ! awk -v target="${BPFFS_DIR}" '
+      $5 == target {
+        for (i = 6; i <= NF; i++) {
+          if ($i == "-" && $(i + 1) == "bpf") {
+            found = 1
+          }
+        }
+      }
+      END { exit !found }
+    ' /proc/self/mountinfo; then
+    echo "error: expected private bpffs mount is missing or has the wrong type: ${BPFFS_DIR}" >&2
+    return 1
+  fi
+}
+
+netns_exists() {
+  local ns="$1"
+
+  ip netns list | awk -v wanted="${ns}" '$1 == wanted { found = 1 } END { exit !found }'
+}
+
+for ns in "${NSA}" "${NSR}" "${NSB}"; do
+  if netns_exists "${ns}"; then
+    echo "error: random RUN_ID collision with existing netns ${ns}; refusing cleanup or retry" >&2
+    exit 1
+  fi
+done
+for link in "${VETH_A}" "${VETH_RA}" "${VETH_B}" "${VETH_RB}"; do
+  if ip -o link show dev "${link}" >/dev/null 2>&1; then
+    echo "error: random RUN_ID collision with existing link ${link}; refusing cleanup or retry" >&2
+    exit 1
+  fi
+done
+
+PHASE="create-owned-run-root"
+if [[ -L "${TEST_ROOT}" ]]; then
+  echo "error: test root must not be a symlink: ${TEST_ROOT}" >&2
+  exit 1
+fi
+if [[ ! -e "${TEST_ROOT}" ]]; then
+  mkdir -m 0700 -- "${TEST_ROOT}"
+fi
+if [[ ! -d "${TEST_ROOT}" || -L "${TEST_ROOT}" ||
+  "$(realpath -e -- "${TEST_ROOT}")" != "${TEST_ROOT}" ||
+  "$(stat -c '%u' -- "${TEST_ROOT}")" != "${EUID}" ||
+  "$(stat -c '%a' -- "${TEST_ROOT}")" != "700" ]]; then
+  echo "error: unsafe test root: ${TEST_ROOT}" >&2
+  exit 1
+fi
+if [[ -e "${RUN_BASE}" || -L "${RUN_BASE}" ]]; then
+  echo "error: random RUN_ID collision at ${RUN_BASE}; refusing cleanup or retry" >&2
+  exit 1
+fi
+mkdir -m 0700 -- "${RUN_BASE}"
+RUN_BASE_CREATED=1
+for dir in "${RUN_DIR_A}" "${RUN_DIR_B}" "${STATE_DIR_A}" "${STATE_DIR_B}" \
+  "${TMPDIR}" "${SECRET_DIR}" "${BPFFS_DIR}"; do
+  validate_owned_path "${dir}"
+  mkdir -m 0700 -- "${dir}"
+done
+write_marker "${RUN_BASE}" root
+write_marker "${RUN_DIR_A}" run-a
+write_marker "${RUN_DIR_B}" run-b
+write_marker "${STATE_DIR_A}" state-a
+write_marker "${STATE_DIR_B}" state-b
+write_marker "${TMPDIR}" evidence
+write_marker "${SECRET_DIR}" secrets
+(set -o noclobber; manifest_payload >"${MANIFEST}")
+chmod 0600 "${MANIFEST}"
+
+PHASE="mount-private-bpffs"
+if mountpoint -q -- "${BPFFS_DIR}"; then
+  echo "error: unexpected mount already exists at ${BPFFS_DIR}" >&2
+  exit 1
+fi
+mount -t bpf -o nosuid,nodev,noexec "wg-mix-ebpf-${RUN_ID}" "${BPFFS_DIR}"
+validate_private_bpffs_mount
 
 run_agent_in_netns() {
   local ns="$1"
   local pin="$2"
+  local expected_pin
+  local run_dir
+  local state_dir
+  local status
   shift 2
-  local runner=(ip netns exec "${ns}")
-  if command -v nsenter >/dev/null 2>&1 && [[ -e "/run/netns/${ns}" ]]; then
-    runner=(nsenter "--net=/run/netns/${ns}" "--mount=/proc/1/ns/mnt")
-  fi
-  "${runner[@]}" sh -c '
-    pin="$1"
-    bin="$2"
-    shift 2
-    pin_root="$1"
-    shift
-    mkdir -p "${pin_root}"
-    if ! awk -v mp="${pin_root}" '"'"'$2 == mp && $3 == "bpf" { found = 1 } END { exit !found }'"'"' /proc/mounts; then
-      mount -t bpf bpf "${pin_root}"
-    fi
-    mkdir -p "$(dirname "${pin}")"
-    WG_MIX_EBPF_PIN_PATH="${pin}" exec "${bin}" "$@"
-  ' sh "${pin}" "${BIN}" "${PIN_ROOT}" "$@"
-}
 
-cleanup() {
-  local status=$?
-  set +e
-  local keep_tmp=0
-  [[ "${KEEP_TMP_ON_FAIL:-0}" == "1" && "${status}" -ne 0 ]] && keep_tmp=1
-  if [[ -n "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" ]]; then
-    kill "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" >/dev/null 2>&1
-    wait "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" >/dev/null 2>&1
+  case "${ns}" in
+    "${NSA}")
+      expected_pin="${PINA}"
+      run_dir="${RUN_DIR_A}"
+      state_dir="${STATE_DIR_A}"
+      ;;
+    "${NSB}")
+      expected_pin="${PINB}"
+      run_dir="${RUN_DIR_B}"
+      state_dir="${STATE_DIR_B}"
+      ;;
+    *)
+      echo "error: no isolated run/state directories for netns ${ns}" >&2
+      return 1
+      ;;
+  esac
+  if [[ "${pin}" != "${expected_pin}" ]]; then
+    echo "error: pin path mismatch for netns ${ns}: ${pin}" >&2
+    return 1
   fi
-  if [[ -n "${TCP_SERVER_PID}" ]]; then
-    kill "${TCP_SERVER_PID}" >/dev/null 2>&1
-    wait "${TCP_SERVER_PID}" >/dev/null 2>&1
-  fi
-  if ip netns list | awk '{print $1}' | grep -qx "${NSA}"; then
-    run_agent_in_netns "${NSA}" "${PINA}" detach --config "${TMPDIR}/agent-a.yaml" >/dev/null 2>&1
-  fi
-  if ip netns list | awk '{print $1}' | grep -qx "${NSB}"; then
-    run_agent_in_netns "${NSB}" "${PINB}" detach --config "${TMPDIR}/agent-b.yaml" >/dev/null 2>&1
-  fi
-  ip netns delete "${NSA}" >/dev/null 2>&1
-  ip netns delete "${NSR}" >/dev/null 2>&1
-  ip netns delete "${NSB}" >/dev/null 2>&1
-  ip link delete "${VETH_A}" >/dev/null 2>&1
-  ip link delete "${VETH_B}" >/dev/null 2>&1
-  rm -rf "${PIN_BASE}"
-  if ((keep_tmp)); then
-    echo "kept smoke evidence after failure: ${TMPDIR}" >&2
+  validate_owned_path "${pin}" || return 1
+  validate_marker "${run_dir}" "run-${ns: -1}" || return 1
+  validate_marker "${state_dir}" "state-${ns: -1}" || return 1
+  validate_private_bpffs_mount || return 1
+  printf 'agent command: timestamp=%s netns=%s pin=%s run_dir=%s state_dir=%s argv=' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${ns}" "${pin}" "${run_dir}" "${state_dir}" >&2
+  printf '%q ' "${BIN}" "$@" --run-dir "${run_dir}" --state-dir "${state_dir}" >&2
+  printf '\n' >&2
+  if ip netns exec "${ns}" env "WG_MIX_EBPF_PIN_PATH=${pin}" \
+    "${BIN}" "$@" --run-dir "${run_dir}" --state-dir "${state_dir}"; then
+    status=0
   else
-    rm -rf "${TMPDIR}"
+    status=$?
   fi
+  printf 'agent finish: timestamp=%s netns=%s exit=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${ns}" "${status}" >&2
   return "${status}"
 }
-trap cleanup EXIT INT TERM
 
-ip netns delete "${NSA}" >/dev/null 2>&1 || true
-ip netns delete "${NSR}" >/dev/null 2>&1 || true
-ip netns delete "${NSB}" >/dev/null 2>&1 || true
+teardown_step() {
+  local description="$1"
+  local status
+  shift
+
+  validate_marker "${RUN_BASE}" root || return 1
+  validate_manifest || return 1
+  printf 'teardown start: timestamp=%s action=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${description}"
+  printf 'teardown argv:\n'
+  print_command "$@"
+  if "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  printf 'teardown finish: timestamp=%s action=%s exit=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${description}" "${status}"
+  return "${status}"
+}
+
+remove_owned_file() {
+  local path="$1"
+
+  validate_owned_path "${path}" || return 1
+  if [[ ! -e "${path}" && ! -L "${path}" ]]; then
+    printf 'teardown file absent: %s exit=0\n' "${path}"
+    return 0
+  fi
+  if [[ ! -f "${path}" || -L "${path}" || "$(stat -c '%h' -- "${path}")" != "1" ]]; then
+    echo "error: refusing to remove non-regular, linked, or symlink file: ${path}" >&2
+    return 1
+  fi
+  if [[ "$(stat -c '%d' -- "$(dirname "${path}")")" != "$(stat -c '%d' -- "${RUN_BASE}")" ]]; then
+    echo "error: refusing cross-filesystem file removal: ${path}" >&2
+    return 1
+  fi
+  teardown_step "remove exact file ${path}" rm -- "${path}"
+}
+
+explicit_teardown() {
+  local entry
+
+  PHASE="explicit-teardown"
+  validate_marker "${RUN_BASE}" root || return 1
+  validate_marker "${RUN_DIR_A}" run-a || return 1
+  validate_marker "${RUN_DIR_B}" run-b || return 1
+  validate_marker "${STATE_DIR_A}" state-a || return 1
+  validate_marker "${STATE_DIR_B}" state-b || return 1
+  validate_marker "${TMPDIR}" evidence || return 1
+  validate_marker "${SECRET_DIR}" secrets || return 1
+  validate_manifest || return 1
+  validate_private_bpffs_mount || return 1
+  if [[ -n "${TCPDUMP_RA}" || -n "${TCPDUMP_RB}" ||
+    -n "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" || -n "${TCP_SERVER_PID}" ]]; then
+    echo "error: refusing teardown while a bounded background process is still tracked" >&2
+    return 1
+  fi
+
+  printf 'teardown host=%s boot_id=%s run_id=%s\n' "${HOST_ID}" "${BOOT_ID}" "${RUN_ID}"
+  printf 'teardown exact root=%s\n' "$(realpath -e -- "${RUN_BASE}")"
+  printf 'teardown bounded inventory (max depth 3):\n'
+  find "${RUN_BASE}" -xdev -mindepth 1 -maxdepth 3 -printf '%y %p\n' |
+    sed -n '1,200p' || return 1
+  printf 'teardown bounded private bpffs inventory (max depth 3):\n'
+  find "${BPFFS_DIR}" -xdev -mindepth 1 -maxdepth 3 -printf '%y %p\n' |
+    sed -n '1,200p' || return 1
+
+  teardown_step "detach agent A pin=${PINA}" \
+    run_agent_in_netns "${NSA}" "${PINA}" detach \
+    --config "${SECRET_DIR}/agent-a.yaml" || return 1
+  teardown_step "detach agent B pin=${PINB}" \
+    run_agent_in_netns "${NSB}" "${PINB}" detach \
+    --config "${SECRET_DIR}/agent-b.yaml" || return 1
+
+  if ! entry="$(find "${BPFFS_DIR}" -xdev -mindepth 1 -print -quit)"; then
+    echo "error: could not inspect private bpffs before unmount" >&2
+    return 1
+  fi
+  if [[ -n "${entry}" ]]; then
+    echo "error: bpffs is not empty after exact detach: ${entry}" >&2
+    return 1
+  fi
+
+  for secret_file in \
+    "${SECRET_DIR}/a.key" "${SECRET_DIR}/a.pub" \
+    "${SECRET_DIR}/b.key" "${SECRET_DIR}/b.pub" \
+    "${SECRET_DIR}/wg-a.conf" "${SECRET_DIR}/wg-b.conf" \
+    "${SECRET_DIR}/agent-a.yaml" "${SECRET_DIR}/agent-b.yaml"; do
+    remove_owned_file "${secret_file}" || return 1
+  done
+  remove_owned_file "${SECRET_DIR}/${OWNER_MARKER}" || return 1
+  teardown_step "remove empty sensitive directory ${SECRET_DIR}" \
+    rmdir -- "${SECRET_DIR}" || return 1
+
+  teardown_step "delete netns ${NSA}" ip netns delete "${NSA}" || return 1
+  teardown_step "delete netns ${NSR}" ip netns delete "${NSR}" || return 1
+  teardown_step "delete netns ${NSB}" ip netns delete "${NSB}" || return 1
+  validate_private_bpffs_mount || return 1
+  teardown_step "unmount exact bpffs ${BPFFS_DIR}" \
+    umount -- "${BPFFS_DIR}" || return 1
+  teardown_step "remove empty bpffs mountpoint ${BPFFS_DIR}" \
+    rmdir -- "${BPFFS_DIR}" || return 1
+
+  remove_owned_file "${RUN_DIR_A}/lock" || return 1
+  remove_owned_file "${RUN_DIR_B}/lock" || return 1
+  remove_owned_file "${RUN_DIR_A}/${OWNER_MARKER}" || return 1
+  remove_owned_file "${RUN_DIR_B}/${OWNER_MARKER}" || return 1
+  remove_owned_file "${STATE_DIR_A}/${OWNER_MARKER}" || return 1
+  remove_owned_file "${STATE_DIR_B}/${OWNER_MARKER}" || return 1
+  teardown_step "remove empty run dir A ${RUN_DIR_A}" \
+    rmdir -- "${RUN_DIR_A}" || return 1
+  teardown_step "remove empty run dir B ${RUN_DIR_B}" \
+    rmdir -- "${RUN_DIR_B}" || return 1
+  teardown_step "remove empty state dir A ${STATE_DIR_A}" \
+    rmdir -- "${STATE_DIR_A}" || return 1
+  teardown_step "remove empty state dir B ${STATE_DIR_B}" \
+    rmdir -- "${STATE_DIR_B}" || return 1
+
+  printf 'test evidence intentionally retained at %s\n' "${TMPDIR}"
+  printf 'manifest intentionally retained at %s\n' "${MANIFEST}"
+  printf 'sensitive recovery material removed from %s\n' "${SECRET_DIR}"
+  TEARDOWN_COMPLETE=1
+}
 
 make_agent_config() {
   local path="$1"
@@ -238,6 +628,9 @@ ${cipher_block}
 
 fwmark_policy:
   mode: config-required
+
+startup_guard:
+  mode: none
 
 runtime:
   require_nonzero_fwmark: true
@@ -411,9 +804,7 @@ exercise_tcp_run() {
   done
   if ((ready == 0)); then
     echo "error: iperf3 server did not listen for ${label}" >&2
-    kill "${TCP_SERVER_PID}" >/dev/null 2>&1 || true
-    wait "${TCP_SERVER_PID}" >/dev/null 2>&1 || true
-    TCP_SERVER_PID=""
+    echo "bounded iperf3 server left for timeout: pid=${TCP_SERVER_PID}" >&2
     cat "${server_log}" >&2
     return 1
   fi
@@ -429,9 +820,7 @@ exercise_tcp_run() {
 
   if ((client_status != 0)); then
     echo "error: iperf3 client failed for ${label} (${client_status})" >&2
-    kill "${TCP_SERVER_PID}" >/dev/null 2>&1 || true
-    wait "${TCP_SERVER_PID}" >/dev/null 2>&1 || true
-    TCP_SERVER_PID=""
+    echo "bounded iperf3 server left for timeout: pid=${TCP_SERVER_PID}" >&2
     cat "${client_log}" >&2
     [[ ! -s "${client_path}" ]] || cat "${client_path}" >&2
     return "${client_status}"
@@ -508,17 +897,17 @@ exercise_tcp_matrix() {
     wait_ping "${NSA}" 10.77.0.2
     wait_ping "${NSB}" 10.77.0.1
 
-    run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" \
+    run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" \
       >"${TMPDIR}/status-a-tcp-${mtu}-before.json"
-    run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" \
+    run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" \
       >"${TMPDIR}/status-b-tcp-${mtu}-before.json"
 
     exercise_tcp_run "${mtu}" 1
     exercise_tcp_run "${mtu}" "${TCP_PARALLEL_STREAMS}"
 
-    run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" \
+    run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" \
       >"${TMPDIR}/status-a-tcp-${mtu}-after.json"
-    run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" \
+    run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" \
       >"${TMPDIR}/status-b-tcp-${mtu}-after.json"
 
     for side in a b; do
@@ -551,9 +940,9 @@ exercise_udp_zero_checksum() {
   local gateway_mac
   local receiver_status=0
 
-  run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" \
+  run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" \
     >"${TMPDIR}/status-a-zero-before.json"
-  run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" \
+  run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" \
     >"${TMPDIR}/status-b-zero-before.json"
 
   # Free the configured WireGuard ports while retaining the already-loaded rules.
@@ -609,8 +998,7 @@ PY
   done
   if [[ ! -e "${ready_path}" ]]; then
     echo "error: UDP zero-checksum receiver did not become ready" >&2
-    wait "${UDP_ZERO_CHECKSUM_RECEIVER_PID}" || true
-    UDP_ZERO_CHECKSUM_RECEIVER_PID=""
+    echo "bounded UDP receiver left for timeout: pid=${UDP_ZERO_CHECKSUM_RECEIVER_PID}" >&2
     cat "${receiver_log}" >&2
     return 1
   fi
@@ -684,9 +1072,9 @@ PY
   ip netns exec "${NSA}" wg set wg0 listen-port 31001
   ip netns exec "${NSB}" wg set wg0 listen-port 31002
 
-  run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" \
+  run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" \
     >"${TMPDIR}/status-a-zero-after.json"
-  run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" \
+  run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" \
     >"${TMPDIR}/status-b-zero-after.json"
   assert_stat_increased "${TMPDIR}/status-a-zero-before.json" \
     "${TMPDIR}/status-a-zero-after.json" egress_rewrite_ok
@@ -759,6 +1147,7 @@ delete_tail_slot() {
   bpftool map delete pinned "${pin}/${map}" key hex ${key}
 }
 
+PHASE="network-test-setup"
 ip netns add "${NSA}"
 ip netns add "${NSR}"
 ip netns add "${NSB}"
@@ -820,21 +1209,21 @@ else
   ip -n "${NSB}" -6 route add default via "${B_GW}" dev under0
 fi
 
-wg genkey >"${TMPDIR}/a.key"
-wg pubkey <"${TMPDIR}/a.key" >"${TMPDIR}/a.pub"
-wg genkey >"${TMPDIR}/b.key"
-wg pubkey <"${TMPDIR}/b.key" >"${TMPDIR}/b.pub"
-chmod 0600 "${TMPDIR}/a.key" "${TMPDIR}/b.key"
+wg genkey >"${SECRET_DIR}/a.key"
+wg pubkey <"${SECRET_DIR}/a.key" >"${SECRET_DIR}/a.pub"
+wg genkey >"${SECRET_DIR}/b.key"
+wg pubkey <"${SECRET_DIR}/b.key" >"${SECRET_DIR}/b.pub"
+chmod 0600 "${SECRET_DIR}/a.key" "${SECRET_DIR}/b.key"
 
-A_PUB="$(cat "${TMPDIR}/a.pub")"
-B_PUB="$(cat "${TMPDIR}/b.pub")"
+A_PUB="$(cat "${SECRET_DIR}/a.pub")"
+B_PUB="$(cat "${SECRET_DIR}/b.pub")"
 
 ip -n "${NSA}" link add wg0 type wireguard
 ip -n "${NSB}" link add wg0 type wireguard
 ip -n "${NSA}" link set wg0 mtu "${WG_MTU}"
 ip -n "${NSB}" link set wg0 mtu "${WG_MTU}"
-ip netns exec "${NSA}" wg set wg0 private-key "${TMPDIR}/a.key" listen-port 31001 fwmark 0x10000001 peer "${B_PUB}" allowed-ips 10.77.0.2/32 endpoint "${B_ENDPOINT}"
-ip netns exec "${NSB}" wg set wg0 private-key "${TMPDIR}/b.key" listen-port 31002 fwmark 0x10000002 peer "${A_PUB}" allowed-ips 10.77.0.1/32 endpoint "${A_ENDPOINT}"
+ip netns exec "${NSA}" wg set wg0 private-key "${SECRET_DIR}/a.key" listen-port 31001 fwmark 0x10000001 peer "${B_PUB}" allowed-ips 10.77.0.2/32 endpoint "${B_ENDPOINT}"
+ip netns exec "${NSB}" wg set wg0 private-key "${SECRET_DIR}/b.key" listen-port 31002 fwmark 0x10000002 peer "${A_PUB}" allowed-ips 10.77.0.1/32 endpoint "${A_ENDPOINT}"
 ip -n "${NSA}" addr add 10.77.0.1/24 dev wg0
 ip -n "${NSB}" addr add 10.77.0.2/24 dev wg0
 ip -n "${NSA}" link set wg0 up
@@ -842,15 +1231,16 @@ ip -n "${NSB}" link set wg0 up
 ip -n "${NSA}" route add 10.77.0.2/32 dev wg0
 ip -n "${NSB}" route add 10.77.0.1/32 dev wg0
 
-make_wg_config_stub "${TMPDIR}/wg-a.conf" 31001 0x10000001
-make_wg_config_stub "${TMPDIR}/wg-b.conf" 31002 0x10000002
-make_agent_config "${TMPDIR}/agent-a.yaml" under0 "${TMPDIR}/wg-a.conf"
-make_agent_config "${TMPDIR}/agent-b.yaml" under0 "${TMPDIR}/wg-b.conf"
+make_wg_config_stub "${SECRET_DIR}/wg-a.conf" 31001 0x10000001
+make_wg_config_stub "${SECRET_DIR}/wg-b.conf" 31002 0x10000002
+make_agent_config "${SECRET_DIR}/agent-a.yaml" under0 "${SECRET_DIR}/wg-a.conf"
+make_agent_config "${SECRET_DIR}/agent-b.yaml" under0 "${SECRET_DIR}/wg-b.conf"
 
-run_agent_in_netns "${NSA}" "${PINA}" reload --config "${TMPDIR}/agent-a.yaml"
-run_agent_in_netns "${NSB}" "${PINB}" reload --config "${TMPDIR}/agent-b.yaml"
-run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" >"${TMPDIR}/status-a-before.json"
-run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" >"${TMPDIR}/status-b-before.json"
+PHASE="test-execution"
+run_agent_in_netns "${NSA}" "${PINA}" reload --config "${SECRET_DIR}/agent-a.yaml"
+run_agent_in_netns "${NSB}" "${PINB}" reload --config "${SECRET_DIR}/agent-b.yaml"
+run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" >"${TMPDIR}/status-a-before.json"
+run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" >"${TMPDIR}/status-b-before.json"
 assert_generation "${TMPDIR}/status-a-before.json" 1
 assert_generation "${TMPDIR}/status-b-before.json" 1
 if [[ -n "${XOR_PASSWORD}" ]]; then
@@ -868,10 +1258,10 @@ exercise_tunnel
 
 if [[ -n "${XOR_PASSWORD}" && "${XOR_GENERATION_CHECKS}" == "enforce" ]]; then
   for expected_generation in 2 3; do
-    run_agent_in_netns "${NSA}" "${PINA}" reload --config "${TMPDIR}/agent-a.yaml"
-    run_agent_in_netns "${NSB}" "${PINB}" reload --config "${TMPDIR}/agent-b.yaml"
-    run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" >"${TMPDIR}/status-a-gen${expected_generation}.json"
-    run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" >"${TMPDIR}/status-b-gen${expected_generation}.json"
+    run_agent_in_netns "${NSA}" "${PINA}" reload --config "${SECRET_DIR}/agent-a.yaml"
+    run_agent_in_netns "${NSB}" "${PINB}" reload --config "${SECRET_DIR}/agent-b.yaml"
+    run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" >"${TMPDIR}/status-a-gen${expected_generation}.json"
+    run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" >"${TMPDIR}/status-b-gen${expected_generation}.json"
     assert_generation "${TMPDIR}/status-a-gen${expected_generation}.json" "${expected_generation}"
     assert_generation "${TMPDIR}/status-b-gen${expected_generation}.json" "${expected_generation}"
     assert_tail_bank "${PINA}" "${TMPDIR}/status-a-gen${expected_generation}.json"
@@ -880,8 +1270,29 @@ if [[ -n "${XOR_PASSWORD}" && "${XOR_GENERATION_CHECKS}" == "enforce" ]]; then
   done
 fi
 
-wait "${TCPDUMP_RA}" || true
-wait "${TCPDUMP_RB}" || true
+if wait "${TCPDUMP_RA}"; then
+  tcpdump_ra_status=0
+else
+  tcpdump_ra_status=$?
+fi
+TCPDUMP_RA=""
+printf 'capture finish: ra exit=%s\n' "${tcpdump_ra_status}"
+if ((tcpdump_ra_status != 0 && tcpdump_ra_status != 124)); then
+  echo "error: ra tcpdump failed unexpectedly: ${tcpdump_ra_status}" >&2
+  exit "${tcpdump_ra_status}"
+fi
+
+if wait "${TCPDUMP_RB}"; then
+  tcpdump_rb_status=0
+else
+  tcpdump_rb_status=$?
+fi
+TCPDUMP_RB=""
+printf 'capture finish: rb exit=%s\n' "${tcpdump_rb_status}"
+if ((tcpdump_rb_status != 0 && tcpdump_rb_status != 124)); then
+  echo "error: rb tcpdump failed unexpectedly: ${tcpdump_rb_status}" >&2
+  exit "${tcpdump_rb_status}"
+fi
 
 if [[ -n "${XOR_PASSWORD}" ]]; then
   python3 "${ROOT}/scripts/check-wg-pcap.py" \
@@ -901,8 +1312,8 @@ if [[ "${UDP_ZERO_CHECKSUM_CHECKS}" == "enforce" ]]; then
   exercise_udp_zero_checksum
 fi
 
-run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" >"${TMPDIR}/status-a-after.json"
-run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" >"${TMPDIR}/status-b-after.json"
+run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" >"${TMPDIR}/status-a-after.json"
+run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" >"${TMPDIR}/status-b-after.json"
 
 python3 - "$TMPDIR/status-a-after.json" "$TMPDIR/status-b-after.json" <<'PY'
 import json
@@ -960,14 +1371,14 @@ if [[ "${XOR_DISPATCH_FAILURE_CHECKS}" == "enforce" ]]; then
     echo "error: large XOR packet passed with missing egress segment 7" >&2
     exit 1
   fi
-  run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" >"${TMPDIR}/status-a-egress-miss.json"
+  run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" >"${TMPDIR}/status-a-egress-miss.json"
   egress_after="$(stat_value "${TMPDIR}/status-a-egress-miss.json" xor_egress_dispatch_error)"
   if ((egress_after <= egress_before)); then
     echo "error: egress dispatch counter did not increase (${egress_before} -> ${egress_after})" >&2
     exit 1
   fi
-  run_agent_in_netns "${NSA}" "${PINA}" reload --config "${TMPDIR}/agent-a.yaml"
-  run_agent_in_netns "${NSA}" "${PINA}" status --config "${TMPDIR}/agent-a.yaml" >"${TMPDIR}/status-a-repaired.json"
+  run_agent_in_netns "${NSA}" "${PINA}" reload --config "${SECRET_DIR}/agent-a.yaml"
+  run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" >"${TMPDIR}/status-a-repaired.json"
   assert_tail_bank "${PINA}" "${TMPDIR}/status-a-repaired.json"
   large_ping "${NSA}" 10.77.0.2
 
@@ -976,14 +1387,14 @@ if [[ "${XOR_DISPATCH_FAILURE_CHECKS}" == "enforce" ]]; then
     echo "error: large XOR packet passed with missing ingress segment 7" >&2
     exit 1
   fi
-  run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" >"${TMPDIR}/status-b-ingress-miss.json"
+  run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" >"${TMPDIR}/status-b-ingress-miss.json"
   ingress_after="$(stat_value "${TMPDIR}/status-b-ingress-miss.json" xor_ingress_dispatch_error)"
   if ((ingress_after <= ingress_before)); then
     echo "error: ingress dispatch counter did not increase (${ingress_before} -> ${ingress_after})" >&2
     exit 1
   fi
-  run_agent_in_netns "${NSB}" "${PINB}" reload --config "${TMPDIR}/agent-b.yaml"
-  run_agent_in_netns "${NSB}" "${PINB}" status --config "${TMPDIR}/agent-b.yaml" >"${TMPDIR}/status-b-repaired.json"
+  run_agent_in_netns "${NSB}" "${PINB}" reload --config "${SECRET_DIR}/agent-b.yaml"
+  run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" >"${TMPDIR}/status-b-repaired.json"
   assert_tail_bank "${PINB}" "${TMPDIR}/status-b-repaired.json"
   large_ping "${NSA}" 10.77.0.2
 fi
@@ -991,6 +1402,8 @@ fi
 if [[ "${TCP_CHECKS}" == "enforce" ]]; then
   exercise_tcp_matrix
 fi
+
+explicit_teardown
 
 if [[ -n "${XOR_PASSWORD}" ]]; then
   echo "netns WireGuard + eBPF ${OUTER_FAMILY} xor smoke passed (${XOR_SCOPE}, max_bytes=${XOR_MAX_BYTES})"
