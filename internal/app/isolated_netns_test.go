@@ -2,7 +2,10 @@ package app
 
 import (
 	"fmt"
+	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -11,6 +14,11 @@ import (
 )
 
 const isolatedFixtureOwnerToken = "0123456789abcdef0123456789abcdef"
+
+const (
+	isolatedPrivilegedMountTestGate   = "WG_MIX_EBPF_RUN_PRIVILEGED_MOUNT_TESTS"
+	isolatedPrivilegedMountTestHelper = "WG_MIX_EBPF_PRIVILEGED_MOUNT_HELPER"
+)
 
 func TestIsolatedNetNSTestPaths(t *testing.T) {
 	base := filepath.Join(isolatedNetNSTestRoot, "0123456789abcdef")
@@ -682,7 +690,7 @@ func TestPrivateBPFFSMountRejectsPropagationAndAliasForms(t *testing.T) {
 			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
 				"41 21 0:41 / %s rw,nosuid,nodev,noexec,relatime - bpf bpf rw\n"+
 				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
-			layout.runBase,
+			isolatedNetNSTestRoot,
 			layout.bpffsDir,
 			source,
 		),
@@ -703,7 +711,7 @@ func TestPrivateBPFFSMountRejectsPropagationAndAliasForms(t *testing.T) {
 			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
 				"41 21 0:41 / %s rw,relatime master:8 - tmpfs tmpfs rw\n"+
 				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
-			layout.runBase,
+			"/run",
 			layout.bpffsDir,
 			source,
 		),
@@ -712,7 +720,7 @@ func TestPrivateBPFFSMountRejectsPropagationAndAliasForms(t *testing.T) {
 				"31 21 0:31 / /run rw,nosuid,nodev,noexec,relatime - bpf prior rw\n"+
 				"41 31 0:41 / %s rw,relatime - tmpfs tmpfs rw\n"+
 				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
-			layout.runBase,
+			isolatedNetNSTestRoot,
 			layout.bpffsDir,
 			source,
 		),
@@ -720,7 +728,48 @@ func TestPrivateBPFFSMountRejectsPropagationAndAliasForms(t *testing.T) {
 			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
 				"41 42 0:41 / %s rw,relatime - tmpfs tmpfs rw\n"+
 				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
+			isolatedNetNSTestRoot,
+			layout.bpffsDir,
+			source,
+		),
+		"runBase subtree bind": fmt.Sprintf(
+			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+				"41 21 8:2 /outside/run %s rw,relatime - ext4 /dev/other rw\n"+
+				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
 			layout.runBase,
+			layout.bpffsDir,
+			source,
+		),
+		"config child bind": isolatedMountInfoFixture(
+			layout,
+			"0:42",
+			"/",
+			"bpf",
+			fmt.Sprintf(
+				"50 21 8:2 /outside/config %s rw,relatime - ext4 /dev/other rw\n",
+				filepath.Join(layout.runBase, "secrets", "agent-a.yaml"),
+			),
+		),
+		"subtree bind ancestor": fmt.Sprintf(
+			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+				"41 21 0:41 /outside/run /run rw,relatime - tmpfs tmpfs rw\n"+
+				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
+			layout.bpffsDir,
+			source,
+		),
+		"whole-root bind ancestor": fmt.Sprintf(
+			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+				"31 21 0:41 / /mnt/source rw,relatime - tmpfs tmpfs rw\n"+
+				"41 21 0:41 / /run rw,relatime - tmpfs tmpfs rw\n"+
+				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
+			layout.bpffsDir,
+			source,
+		),
+		"isolated root mount": fmt.Sprintf(
+			"21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"+
+				"41 21 0:41 / %s rw,relatime - tmpfs tmpfs rw\n"+
+				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
+			isolatedNetNSTestRoot,
 			layout.bpffsDir,
 			source,
 		),
@@ -741,6 +790,271 @@ func TestPrivateBPFFSMountRejectsPropagationAndAliasForms(t *testing.T) {
 				t.Fatal("invalid bpffs parent topology unexpectedly accepted")
 			}
 		})
+	}
+}
+
+func TestPrivateBPFFSMountRejectsRealLinuxRunSubtreeBinds(t *testing.T) {
+	if os.Getenv(isolatedPrivilegedMountTestHelper) == "1" {
+		runIsolatedPrivilegedMountHelper(t)
+		return
+	}
+	if runtime.GOOS != "linux" {
+		t.Skip("Linux mount namespace integration test")
+	}
+	if os.Getenv(isolatedPrivilegedMountTestGate) != "1" {
+		t.Skip(
+			"set WG_MIX_EBPF_RUN_PRIVILEGED_MOUNT_TESTS=1 to run reviewed mount integration",
+		)
+	}
+	if os.Geteuid() != 0 {
+		t.Skip("reviewed mount integration requires root inside an isolated mount namespace")
+	}
+	command := exec.Command(
+		"unshare",
+		"--mount",
+		"--propagation",
+		"private",
+		os.Args[0],
+		"-test.run=^TestPrivateBPFFSMountRejectsRealLinuxRunSubtreeBinds$",
+		"-test.count=1",
+	)
+	command.Env = append(
+		os.Environ(),
+		isolatedPrivilegedMountTestHelper+"=1",
+	)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf(
+			"run reviewed private mount namespace integration: %v\n%s",
+			err,
+			output,
+		)
+	}
+}
+
+func runIsolatedPrivilegedMountHelper(t *testing.T) {
+	if runtime.GOOS != "linux" ||
+		os.Getenv(isolatedPrivilegedMountTestGate) != "1" ||
+		os.Geteuid() != 0 {
+		t.Fatal("privileged mount helper ran without its explicit Linux root gate")
+	}
+	root := t.TempDir()
+	source := filepath.Join(root, "source")
+	runBase := filepath.Join(root, "run")
+	if err := os.Mkdir(source, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(runBase, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	layout := isolatedNetNSTestLayout{
+		runBase:  runBase,
+		bpffsDir: filepath.Join(runBase, "bpffs"),
+	}
+	for _, target := range []string{
+		runBase,
+		filepath.Join(runBase, "state-a"),
+	} {
+		t.Run(filepath.Base(target), func(t *testing.T) {
+			if target != runBase {
+				if err := os.Mkdir(target, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			mount := exec.Command("mount", "--bind", source, target)
+			if output, err := mount.CombinedOutput(); err != nil {
+				t.Fatalf("bind reviewed test target %s: %v\n%s", target, err, output)
+			}
+			mounted := true
+			defer func() {
+				if !mounted {
+					return
+				}
+				output, err := exec.Command("umount", "--", target).CombinedOutput()
+				if err != nil {
+					t.Errorf("unmount reviewed test target %s: %v\n%s", target, err, output)
+				}
+			}()
+			data, err := os.ReadFile("/proc/self/mountinfo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries, err := parseMountInfo(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := validateProtectedRunSubtreeMounts(entries, layout); err == nil {
+				t.Fatalf("real bind mount at %s unexpectedly accepted", target)
+			}
+			output, err := exec.Command("umount", "--", target).CombinedOutput()
+			if err != nil {
+				t.Fatalf("unmount reviewed test target %s: %v\n%s", target, err, output)
+			}
+			mounted = false
+		})
+	}
+	runIsolatedPrivilegedAncestorBindHelper(t)
+}
+
+func runIsolatedPrivilegedAncestorBindHelper(t *testing.T) {
+	for _, mode := range []string{"subtree", "whole-root"} {
+		t.Run("ancestor-"+mode, func(t *testing.T) {
+			root := t.TempDir()
+			source := filepath.Join(root, "source")
+			ancestor := filepath.Join(root, "ancestor")
+			if err := os.Mkdir(source, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(ancestor, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			sourceMounted := false
+			defer func() {
+				if !sourceMounted {
+					return
+				}
+				output, err := exec.Command("umount", "--", source).CombinedOutput()
+				if err != nil {
+					t.Errorf("unmount reviewed source %s: %v\n%s", source, err, output)
+				}
+			}()
+			if mode == "whole-root" {
+				output, err := exec.Command(
+					"mount",
+					"-t",
+					"tmpfs",
+					"-o",
+					"mode=0700,size=1m",
+					"wg-mix-ebpf-ancestor-test",
+					source,
+				).CombinedOutput()
+				if err != nil {
+					t.Fatalf("mount reviewed tmpfs source %s: %v\n%s", source, err, output)
+				}
+				sourceMounted = true
+			}
+			protectedRoot := filepath.Join(ancestor, "isolated-root")
+			sourceProtectedRoot := filepath.Join(source, "isolated-root")
+			if err := os.Mkdir(sourceProtectedRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			bindMounted := false
+			defer func() {
+				if !bindMounted {
+					return
+				}
+				output, err := exec.Command("umount", "--", ancestor).CombinedOutput()
+				if err != nil {
+					t.Errorf("unmount reviewed ancestor %s: %v\n%s", ancestor, err, output)
+				}
+			}()
+			output, err := exec.Command(
+				"mount",
+				"--bind",
+				source,
+				ancestor,
+			).CombinedOutput()
+			if err != nil {
+				t.Fatalf("bind reviewed ancestor %s: %v\n%s", ancestor, err, output)
+			}
+			bindMounted = true
+			data, err := os.ReadFile("/proc/self/mountinfo")
+			if err != nil {
+				t.Fatal(err)
+			}
+			entries, err := parseMountInfo(data)
+			if err != nil {
+				t.Fatal(err)
+			}
+			chain, err := isolatedAncestorChainForTest(
+				entries,
+				ancestor,
+				filepath.Join(protectedRoot, "run", "bpffs"),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = validatePrivateBPFFSMountAncestors(
+				entries,
+				chain,
+				protectedRoot,
+			)
+			if err == nil {
+				t.Fatalf("real %s ancestor bind unexpectedly accepted", mode)
+			}
+			want := "subtree bind"
+			if mode == "whole-root" {
+				want = "aliases whole mount root"
+			}
+			if !strings.Contains(err.Error(), want) {
+				t.Fatalf("real %s ancestor bind error = %v, want %q", mode, err, want)
+			}
+			output, err = exec.Command("umount", "--", ancestor).CombinedOutput()
+			if err != nil {
+				t.Fatalf("unmount reviewed ancestor %s: %v\n%s", ancestor, err, output)
+			}
+			bindMounted = false
+			if sourceMounted {
+				output, err = exec.Command("umount", "--", source).CombinedOutput()
+				if err != nil {
+					t.Fatalf("unmount reviewed source %s: %v\n%s", source, err, output)
+				}
+				sourceMounted = false
+			}
+		})
+	}
+}
+
+func isolatedAncestorChainForTest(
+	entries []mountInfoEntry,
+	ancestorPath string,
+	targetPath string,
+) ([]mountInfoEntry, error) {
+	byMountID := make(map[uint64]mountInfoEntry, len(entries))
+	var ancestor *mountInfoEntry
+	var maximumMountID uint64
+	for index := range entries {
+		entry := entries[index]
+		byMountID[entry.mountID] = entry
+		if entry.mountID > maximumMountID {
+			maximumMountID = entry.mountID
+		}
+		if entry.mountPath == ancestorPath {
+			if ancestor != nil {
+				return nil, fmt.Errorf("multiple mounts found at ancestor %s", ancestorPath)
+			}
+			copy := entry
+			ancestor = &copy
+		}
+	}
+	if ancestor == nil {
+		return nil, fmt.Errorf("ancestor mount %s is absent", ancestorPath)
+	}
+	chain := []mountInfoEntry{{
+		mountID:   maximumMountID + 1,
+		parentID:  ancestor.mountID,
+		device:    "0:999999",
+		root:      "/",
+		mountPath: targetPath,
+		fsType:    "bpf",
+		source:    "reviewed-test-target",
+	}}
+	current := *ancestor
+	seen := make(map[uint64]struct{})
+	for {
+		if _, cycle := seen[current.mountID]; cycle {
+			return nil, fmt.Errorf("ancestor test chain cycles at %d", current.mountID)
+		}
+		seen[current.mountID] = struct{}{}
+		chain = append(chain, current)
+		if current.mountPath == "/" {
+			return chain, nil
+		}
+		parent, ok := byMountID[current.parentID]
+		if !ok {
+			return nil, fmt.Errorf("ancestor test chain misses parent %d", current.parentID)
+		}
+		current = parent
 	}
 }
 
@@ -835,7 +1149,7 @@ func TestPrivateBPFFSMountSnapshotDetectsAncestorDrift(t *testing.T) {
 				"41 21 %s / %s %s - tmpfs tmpfs rw\n"+
 				"42 41 0:42 / %s rw,nosuid,nodev,noexec,relatime - bpf %s rw\n",
 			ancestorDevice,
-			layout.runBase,
+			"/run",
 			ancestorOptions,
 			layout.bpffsDir,
 			source,
@@ -875,6 +1189,159 @@ func TestPrivateBPFFSMountSnapshotDetectsAncestorDrift(t *testing.T) {
 	}
 }
 
+func TestRelevantMountSnapshotDetectsSecurityDriftOnly(t *testing.T) {
+	layout, _, _, _, _ := isolatedFixtureLayout(t, "a")
+	beforeEntries, err := parseMountInfo([]byte(
+		isolatedMountInfoFixture(layout, "0:42", "/", "bpf", ""),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeChain, err := privateBPFFSMountChain(beforeEntries, layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := snapshotIsolatedNetNSTestRelevantMounts(
+		beforeEntries,
+		beforeChain,
+		layout,
+	)
+
+	unrelatedEntries, err := parseMountInfo([]byte(
+		isolatedMountInfoFixture(
+			layout,
+			"0:42",
+			"/",
+			"bpf",
+			"70 21 8:70 / /mnt/unrelated rw,relatime - ext4 /dev/unrelated rw\n",
+		),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelatedChain, err := privateBPFFSMountChain(unrelatedEntries, layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unrelated := snapshotIsolatedNetNSTestRelevantMounts(
+		unrelatedEntries,
+		unrelatedChain,
+		layout,
+	)
+	if !sameRelevantMountSnapshot(before, unrelated) {
+		t.Fatal("unrelated namespace mount drift changed security snapshot")
+	}
+
+	otherBPFDriftData := strings.Replace(
+		isolatedMountInfoFixture(layout, "0:42", "/", "bpf", ""),
+		"- bpf bpf rw\n",
+		"- bpf changed-source rw\n",
+		1,
+	)
+	otherBPFEntries, err := parseMountInfo([]byte(otherBPFDriftData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherBPFChain, err := privateBPFFSMountChain(otherBPFEntries, layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	otherBPFDrift := snapshotIsolatedNetNSTestRelevantMounts(
+		otherBPFEntries,
+		otherBPFChain,
+		layout,
+	)
+	if sameRelevantMountSnapshot(before, otherBPFDrift) {
+		t.Fatal("full-entry drift on another BPF mount was not detected")
+	}
+
+	childMountData := isolatedMountInfoFixture(
+		layout,
+		"0:42",
+		"/",
+		"bpf",
+		fmt.Sprintf(
+			"71 21 8:71 /outside/state %s rw,relatime - ext4 /dev/other rw\n",
+			filepath.Join(layout.runBase, "state-a"),
+		),
+	)
+	childMountEntries, err := parseMountInfo([]byte(childMountData))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := privateBPFFSMountChain(childMountEntries, layout); err == nil {
+		t.Fatal("post-lock protected child mount drift unexpectedly accepted")
+	}
+	childMountDrift := snapshotIsolatedNetNSTestRelevantMounts(
+		childMountEntries,
+		beforeChain,
+		layout,
+	)
+	if sameRelevantMountSnapshot(before, childMountDrift) {
+		t.Fatal("post-lock runBase mount drift was not detected")
+	}
+}
+
+func TestProtectedContractPathsUseTrustedContainingMount(t *testing.T) {
+	layout, _, _, _, _ := isolatedFixtureLayout(t, "a")
+	manifest, err := parseIsolatedNetNSTestManifest(isolatedFixtureManifest(layout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	paths := isolatedNetNSTestProtectedPaths(manifest, layout)
+	required := []string{
+		isolatedNetNSTestRoot,
+		layout.runBase,
+		layout.manifest,
+		layout.ledger,
+		layout.lease,
+		manifest.values["config_a"],
+		manifest.values["wg_config_b"],
+		manifest.values["run_dir_a"],
+		manifest.values["state_dir_b"],
+		manifest.values["evidence"],
+		manifest.values["secrets"],
+		manifest.values["pin_lock_root"],
+		manifest.values["pin_owner_root"],
+		filepath.Join(layout.runBase, isolatedNetNSOwnerMarker),
+	}
+	pathSet := make(map[string]struct{}, len(paths))
+	for _, path := range paths {
+		pathSet[path] = struct{}{}
+	}
+	for _, path := range required {
+		if _, ok := pathSet[path]; !ok {
+			t.Fatalf("protected contract path is absent: %s", path)
+		}
+	}
+	trustedParent := mountInfoEntry{mountID: 21, device: "8:1"}
+	mounts := make(map[string]isolatedNetNSTestMountIdentity, len(paths))
+	for _, path := range paths {
+		mounts[path] = isolatedNetNSTestMountIdentity{
+			mountID: trustedParent.mountID,
+			device:  trustedParent.device,
+		}
+	}
+	if err := validateIsolatedNetNSTestProtectedMounts(
+		mounts,
+		trustedParent,
+	); err != nil {
+		t.Fatalf("validate protected mount identities: %v", err)
+	}
+	for _, mismatch := range []isolatedNetNSTestMountIdentity{
+		{mountID: 22, device: trustedParent.device},
+		{mountID: trustedParent.mountID, device: "8:2"},
+	} {
+		mounts[manifest.values["config_a"]] = mismatch
+		if err := validateIsolatedNetNSTestProtectedMounts(
+			mounts,
+			trustedParent,
+		); err == nil {
+			t.Fatal("foreign protected path mount identity unexpectedly accepted")
+		}
+	}
+}
+
 func TestParseAndValidateIsolatedBPFFSCreationLedger(t *testing.T) {
 	layout, _, _, _, _ := isolatedFixtureLayout(t, "a")
 	manifest, err := parseIsolatedNetNSTestManifest(isolatedFixtureManifest(layout))
@@ -904,7 +1371,6 @@ func TestParseAndValidateIsolatedBPFFSCreationLedger(t *testing.T) {
 		layout,
 		"21",
 		"8:1",
-		"100",
 		"30@0:30",
 		"42",
 		"0:42",
@@ -924,6 +1390,22 @@ func TestParseAndValidateIsolatedBPFFSCreationLedger(t *testing.T) {
 		201,
 	); err != nil {
 		t.Fatalf("validate creation ledger: %v", err)
+	}
+	for _, removedInodeValue := range []string{"1", "999999999999"} {
+		withRemovedFieldRestored := strings.Replace(
+			string(validData),
+			"pre_bpf_mounts=",
+			"pre_target_ino="+removedInodeValue+"\npre_bpf_mounts=",
+			1,
+		)
+		if _, err := parseIsolatedNetNSTestBPFFSLedger(
+			[]byte(withRemovedFieldRestored),
+		); err == nil {
+			t.Fatalf(
+				"removed pre_target_ino field %q unexpectedly accepted",
+				removedInodeValue,
+			)
+		}
 	}
 
 	type ledgerMutation struct {
@@ -1100,7 +1582,6 @@ func TestIsolatedBPFFSCreationLedgerRejectsHistoricalAliases(t *testing.T) {
 					layout,
 					"21",
 					"8:1",
-					"100",
 					tt.baseline,
 					tt.postMountID,
 					tt.device,
@@ -1350,7 +1831,6 @@ func isolatedBPFFSLedgerFixture(
 	layout isolatedNetNSTestLayout,
 	preTargetMountID string,
 	preTargetDevice string,
-	preTargetInode string,
 	preBPFMounts string,
 	postMountID string,
 	postDevice string,
@@ -1364,7 +1844,6 @@ target=%s
 source=%s
 pre_target_mount_id=%s
 pre_target_dev=%s
-pre_target_ino=%s
 pre_bpf_mounts=%s
 post_mount_id=%s
 post_dev=%s
@@ -1377,7 +1856,6 @@ post_ino=%s
 		isolatedNetNSTestBPFFSSource(layout.runID, isolatedFixtureOwnerToken),
 		preTargetMountID,
 		preTargetDevice,
-		preTargetInode,
 		preBPFMounts,
 		postMountID,
 		postDevice,

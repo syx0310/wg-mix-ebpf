@@ -48,9 +48,9 @@ type isolatedNetNSTestManifest struct {
 	values map[string]string
 }
 
-type isolatedNetNSTestBPFMountIdentity struct {
+type isolatedNetNSTestMountIdentity struct {
 	mountID uint64
-	device  string
+	device  string // Canonical mountinfo major:minor, never raw stat st_dev.
 }
 
 type isolatedNetNSTestBPFFSLedger struct {
@@ -59,12 +59,17 @@ type isolatedNetNSTestBPFFSLedger struct {
 	target           string
 	source           string
 	preTargetMountID uint64
-	preTargetDevice  string
-	preTargetInode   uint64
-	preBPFMounts     []isolatedNetNSTestBPFMountIdentity
+	preTargetDevice  string // Canonical mountinfo major:minor.
+	preBPFMounts     []isolatedNetNSTestMountIdentity
 	postMountID      uint64
-	postDevice       string
+	postDevice       string // Canonical mountinfo major:minor.
 	postInode        uint64
+}
+
+type isolatedNetNSTestRelevantMountSnapshot struct {
+	targetChain    []mountInfoEntry
+	otherBPFMounts []mountInfoEntry
+	runBaseMounts  []mountInfoEntry
 }
 
 type mountInfoEntry struct {
@@ -429,7 +434,6 @@ func parseIsolatedNetNSTestBPFFSLedger(
 		sourceKey           = "source"
 		preTargetMountIDKey = "pre_target_mount_id"
 		preTargetDeviceKey  = "pre_target_dev"
-		preTargetInodeKey   = "pre_target_ino"
 		preBPFMountsKey     = "pre_bpf_mounts"
 		postMountIDKey      = "post_mount_id"
 		postDeviceKey       = "post_dev"
@@ -443,7 +447,6 @@ func parseIsolatedNetNSTestBPFFSLedger(
 		sourceKey,
 		preTargetMountIDKey,
 		preTargetDeviceKey,
-		preTargetInodeKey,
 		preBPFMountsKey,
 		postMountIDKey,
 		postDeviceKey,
@@ -492,13 +495,6 @@ func parseIsolatedNetNSTestBPFFSLedger(
 	if err != nil {
 		return isolatedNetNSTestBPFFSLedger{}, err
 	}
-	preTargetInode, err := parseCanonicalPositiveUint(
-		values[preTargetInodeKey],
-		preTargetInodeKey,
-	)
-	if err != nil {
-		return isolatedNetNSTestBPFFSLedger{}, err
-	}
 	preBPFMounts, err := parseIsolatedNetNSTestBPFMountBaseline(
 		values[preBPFMountsKey],
 	)
@@ -533,7 +529,6 @@ func parseIsolatedNetNSTestBPFFSLedger(
 		source:           values[sourceKey],
 		preTargetMountID: preTargetMountID,
 		preTargetDevice:  preTargetDevice,
-		preTargetInode:   preTargetInode,
 		preBPFMounts:     preBPFMounts,
 		postMountID:      postMountID,
 		postDevice:       postDevice,
@@ -543,7 +538,7 @@ func parseIsolatedNetNSTestBPFFSLedger(
 
 func parseIsolatedNetNSTestBPFMountBaseline(
 	value string,
-) ([]isolatedNetNSTestBPFMountIdentity, error) {
+) ([]isolatedNetNSTestMountIdentity, error) {
 	const maximumBPFMountBaselineEntries = 1024
 
 	if value == "none" {
@@ -556,7 +551,7 @@ func parseIsolatedNetNSTestBPFMountBaseline(
 			maximumBPFMountBaselineEntries,
 		)
 	}
-	result := make([]isolatedNetNSTestBPFMountIdentity, 0, len(records))
+	result := make([]isolatedNetNSTestMountIdentity, 0, len(records))
 	seenMountIDs := make(map[uint64]struct{}, len(records))
 	var previousMountID uint64
 	for _, record := range records {
@@ -591,7 +586,7 @@ func parseIsolatedNetNSTestBPFMountBaseline(
 			)
 		}
 		previousMountID = mountID
-		result = append(result, isolatedNetNSTestBPFMountIdentity{
+		result = append(result, isolatedNetNSTestMountIdentity{
 			mountID: mountID,
 			device:  device,
 		})
@@ -1092,6 +1087,9 @@ func privateBPFFSMountChain(
 	entries []mountInfoEntry,
 	layout isolatedNetNSTestLayout,
 ) ([]mountInfoEntry, error) {
+	if err := validateProtectedRunSubtreeMounts(entries, layout); err != nil {
+		return nil, err
+	}
 	var target *mountInfoEntry
 	byMountID := make(map[uint64]*mountInfoEntry, len(entries))
 	for index := range entries {
@@ -1105,16 +1103,6 @@ func privateBPFFSMountChain(
 				)
 			}
 			target = entry
-		}
-		if strings.HasPrefix(
-			entry.mountPath,
-			layout.bpffsDir+string(filepath.Separator),
-		) {
-			return nil, fmt.Errorf(
-				"nested mount %s exists below isolated bpffs %s",
-				entry.mountPath,
-				layout.bpffsDir,
-			)
 		}
 	}
 	if target == nil {
@@ -1159,6 +1147,13 @@ func privateBPFFSMountChain(
 		}
 		chain = append(chain, *current)
 		if current.mountPath == "/" {
+			if err := validatePrivateBPFFSMountAncestors(
+				entries,
+				chain,
+				isolatedNetNSTestRoot,
+			); err != nil {
+				return nil, err
+			}
 			return chain, nil
 		}
 		parent := byMountID[current.parentID]
@@ -1187,15 +1182,79 @@ func privateBPFFSMountChain(
 				parent.mountID,
 			)
 		}
-		if parent.mountPath == "/" && current.mountPath == "/" {
-			return nil, fmt.Errorf(
-				"mount %d and parent %d both claim namespace root",
-				current.mountID,
-				parent.mountID,
-			)
-		}
 		current = parent
 	}
+}
+
+func validateProtectedRunSubtreeMounts(
+	entries []mountInfoEntry,
+	layout isolatedNetNSTestLayout,
+) error {
+	for _, entry := range entries {
+		if mountPathAtOrBelow(entry.mountPath, layout.runBase) &&
+			entry.mountPath != layout.bpffsDir {
+			return fmt.Errorf(
+				"unexpected mount %s exists in protected run subtree %s",
+				entry.mountPath,
+				layout.runBase,
+			)
+		}
+	}
+	return nil
+}
+
+func validatePrivateBPFFSMountAncestors(
+	entries []mountInfoEntry,
+	chain []mountInfoEntry,
+	protectedRoot string,
+) error {
+	if len(chain) < 2 {
+		return fmt.Errorf("isolated bpffs mount ancestry does not include a parent mount")
+	}
+	parent := chain[1]
+	if !mountPathStrictAncestor(parent.mountPath, protectedRoot) {
+		return fmt.Errorf(
+			"isolated bpffs parent mount %s must be a strict ancestor of isolated root %s",
+			parent.mountPath,
+			protectedRoot,
+		)
+	}
+	for chainIndex := 1; chainIndex < len(chain)-1; chainIndex++ {
+		ancestor := chain[chainIndex]
+		if ancestor.root != "/" {
+			return fmt.Errorf(
+				"isolated bpffs non-root ancestor %s is a subtree bind rooted at %s",
+				ancestor.mountPath,
+				ancestor.root,
+			)
+		}
+		for _, entry := range entries {
+			if entry.mountID == ancestor.mountID {
+				continue
+			}
+			if entry.device == ancestor.device && entry.root == ancestor.root {
+				return fmt.Errorf(
+					"isolated bpffs ancestor %s aliases whole mount root at %s",
+					ancestor.mountPath,
+					entry.mountPath,
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func mountPathAtOrBelow(path string, root string) bool {
+	return path == root ||
+		strings.HasPrefix(path, root+string(filepath.Separator))
+}
+
+func mountPathStrictAncestor(parent string, child string) bool {
+	if parent == "/" {
+		return child != "/" && filepath.IsAbs(child)
+	}
+	return parent != child &&
+		strings.HasPrefix(child, parent+string(filepath.Separator))
 }
 
 func validateIsolatedNetNSTestBPFFSLedger(
@@ -1248,16 +1307,13 @@ func validateIsolatedNetNSTestBPFFSLedger(
 		)
 	}
 	if ledger.preTargetMountID == ledger.postMountID ||
-		ledger.preTargetDevice == ledger.postDevice ||
-		(ledger.preTargetDevice == ledger.postDevice &&
-			ledger.preTargetInode == ledger.postInode) {
+		ledger.preTargetDevice == ledger.postDevice {
 		return fmt.Errorf(
 			"isolated bpffs pre-mount and post-mount identities are not independent",
 		)
 	}
 
 	baselineByMountID := make(map[uint64]string, len(ledger.preBPFMounts))
-	baselineDevices := make(map[string]struct{}, len(ledger.preBPFMounts))
 	for _, identity := range ledger.preBPFMounts {
 		if identity.mountID == ledger.postMountID ||
 			identity.device == ledger.postDevice {
@@ -1266,7 +1322,6 @@ func validateIsolatedNetNSTestBPFFSLedger(
 			)
 		}
 		baselineByMountID[identity.mountID] = identity.device
-		baselineDevices[identity.device] = struct{}{}
 	}
 	currentBPFMounts := make(map[uint64]string)
 	for _, entry := range entries {
@@ -1288,11 +1343,6 @@ func validateIsolatedNetNSTestBPFFSLedger(
 				device,
 			)
 		}
-	}
-	if _, existed := baselineDevices[ledger.postDevice]; existed {
-		return fmt.Errorf(
-			"isolated bpffs post-mount device existed in the pre-creation BPF baseline",
-		)
 	}
 	return nil
 }
@@ -1397,6 +1447,46 @@ func sameMountInfoEntry(left mountInfoEntry, right mountInfoEntry) bool {
 		strings.Join(left.superOptions, ",") == strings.Join(right.superOptions, ",")
 }
 
+func snapshotIsolatedNetNSTestRelevantMounts(
+	entries []mountInfoEntry,
+	chain []mountInfoEntry,
+	layout isolatedNetNSTestLayout,
+) isolatedNetNSTestRelevantMountSnapshot {
+	snapshot := isolatedNetNSTestRelevantMountSnapshot{
+		targetChain: append([]mountInfoEntry(nil), chain...),
+	}
+	var targetMountID uint64
+	if len(chain) != 0 {
+		targetMountID = chain[0].mountID
+	}
+	for _, entry := range entries {
+		if entry.fsType == "bpf" && entry.mountID != targetMountID {
+			snapshot.otherBPFMounts = append(snapshot.otherBPFMounts, entry)
+		}
+		if mountPathAtOrBelow(entry.mountPath, layout.runBase) {
+			snapshot.runBaseMounts = append(snapshot.runBaseMounts, entry)
+		}
+	}
+	sortMountInfoEntries(snapshot.otherBPFMounts)
+	sortMountInfoEntries(snapshot.runBaseMounts)
+	return snapshot
+}
+
+func sortMountInfoEntries(entries []mountInfoEntry) {
+	sort.Slice(entries, func(left int, right int) bool {
+		return entries[left].mountID < entries[right].mountID
+	})
+}
+
+func sameRelevantMountSnapshot(
+	left isolatedNetNSTestRelevantMountSnapshot,
+	right isolatedNetNSTestRelevantMountSnapshot,
+) bool {
+	return sameMountInfoChain(left.targetChain, right.targetChain) &&
+		sameMountInfoChain(left.otherBPFMounts, right.otherBPFMounts) &&
+		sameMountInfoChain(left.runBaseMounts, right.runBaseMounts)
+}
+
 func sameMountInfoChain(left []mountInfoEntry, right []mountInfoEntry) bool {
 	if len(left) != len(right) {
 		return false
@@ -1407,4 +1497,81 @@ func sameMountInfoChain(left []mountInfoEntry, right []mountInfoEntry) bool {
 		}
 	}
 	return true
+}
+
+func isolatedNetNSTestProtectedPaths(
+	manifest isolatedNetNSTestManifest,
+	layout isolatedNetNSTestLayout,
+) []string {
+	values := manifest.values
+	paths := []string{
+		isolatedNetNSTestRoot,
+		layout.runBase,
+		layout.manifest,
+		layout.ledger,
+		layout.lease,
+		values["run_dir_a"],
+		values["run_dir_b"],
+		values["state_dir_a"],
+		values["state_dir_b"],
+		values["config_a"],
+		values["config_b"],
+		values["wg_config_a"],
+		values["wg_config_b"],
+		values["secrets"],
+		values["evidence"],
+		values["pin_lock_root"],
+		values["pin_lock_a"],
+		values["pin_lock_b"],
+		values["pin_owner_root"],
+		values["pin_owner_a"],
+		values["pin_owner_b"],
+	}
+	for _, directory := range []string{
+		layout.runBase,
+		values["run_dir_a"],
+		values["run_dir_b"],
+		values["state_dir_a"],
+		values["state_dir_b"],
+		values["secrets"],
+		values["evidence"],
+		values["pin_lock_root"],
+		values["pin_owner_root"],
+	} {
+		paths = append(paths, filepath.Join(directory, isolatedNetNSOwnerMarker))
+	}
+	seen := make(map[string]struct{}, len(paths))
+	result := make([]string, 0, len(paths))
+	for _, path := range paths {
+		if _, duplicate := seen[path]; duplicate {
+			continue
+		}
+		seen[path] = struct{}{}
+		result = append(result, path)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func validateIsolatedNetNSTestProtectedMounts(
+	mounts map[string]isolatedNetNSTestMountIdentity,
+	trustedParent mountInfoEntry,
+) error {
+	if len(mounts) == 0 {
+		return fmt.Errorf("protected isolated path mount snapshot is empty")
+	}
+	for path, identity := range mounts {
+		if identity.mountID != trustedParent.mountID ||
+			identity.device != trustedParent.device {
+			return fmt.Errorf(
+				"protected isolated path %s is on mount %d device %s, want trusted parent mount %d device %s",
+				path,
+				identity.mountID,
+				identity.device,
+				trustedParent.mountID,
+				trustedParent.device,
+			)
+		}
+	}
+	return nil
 }

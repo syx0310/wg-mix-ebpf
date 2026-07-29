@@ -31,15 +31,17 @@ type isolatedNetNSTestFileSnapshot struct {
 }
 
 type isolatedNetNSTestContractSnapshot struct {
-	files map[string]isolatedNetNSTestFileSnapshot
-	bpffs isolatedNetNSTestBPFFSSnapshot
+	files           map[string]isolatedNetNSTestFileSnapshot
+	lease           isolatedNetNSTestFileSnapshot
+	protectedMounts map[string]isolatedNetNSTestMountIdentity
+	bpffs           isolatedNetNSTestBPFFSSnapshot
 }
 
 type isolatedNetNSTestBPFFSSnapshot struct {
-	mountChain []mountInfoEntry
-	mountID    uint64
-	device     uint64
-	inode      uint64
+	mounts  isolatedNetNSTestRelevantMountSnapshot
+	mountID uint64
+	device  uint64
+	inode   uint64
 }
 
 func isolatedNetNSTestContext(
@@ -89,6 +91,9 @@ func isolatedNetNSTestContext(
 	}
 	if err := requireRootOwnedPrivateFile(configPath); err != nil {
 		return nil, err
+	}
+	if err := requireRootOwnedPrivateFile(layout.lease); err != nil {
+		return nil, fmt.Errorf("validate isolated lifecycle lease: %w", err)
 	}
 
 	manifestFile, err := snapshotRootOwnedPrivateFile(layout.manifest, 64*1024)
@@ -344,6 +349,11 @@ func snapshotIsolatedNetNSTestContract(
 			manifestFile.path: manifestFile,
 		},
 	}
+	leaseFile, err := snapshotRootOwnedPrivateFile(layout.lease, 16*1024)
+	if err != nil {
+		return isolatedNetNSTestContractSnapshot{}, err
+	}
+	snapshot.lease = leaseFile
 	files := map[string]int64{
 		manifest.values["config_a"]:    1024 * 1024,
 		manifest.values["config_b"]:    1024 * 1024,
@@ -429,6 +439,18 @@ func snapshotIsolatedNetNSTestContract(
 		return isolatedNetNSTestContractSnapshot{}, err
 	}
 	snapshot.bpffs = bpffs
+	protectedPaths := isolatedNetNSTestProtectedPaths(manifest, layout)
+	if _, hasXORSecret := snapshot.files[xorSecret]; hasXORSecret {
+		protectedPaths = append(protectedPaths, xorSecret)
+	}
+	protectedMounts, err := snapshotIsolatedNetNSTestProtectedMounts(
+		protectedPaths,
+		bpffs.mounts.targetChain[1],
+	)
+	if err != nil {
+		return isolatedNetNSTestContractSnapshot{}, err
+	}
+	snapshot.protectedMounts = protectedMounts
 	return snapshot, nil
 }
 
@@ -569,10 +591,85 @@ func snapshotIsolatedNetNSTestBPFFS(
 		return isolatedNetNSTestBPFFSSnapshot{}, err
 	}
 	return isolatedNetNSTestBPFFSSnapshot{
-		mountChain: mountChain,
-		mountID:    bpffsMountID,
-		device:     device,
-		inode:      bpffsStat.Ino,
+		mounts:  snapshotIsolatedNetNSTestRelevantMounts(mountInfo, mountChain, layout),
+		mountID: bpffsMountID,
+		device:  device,
+		inode:   bpffsStat.Ino,
+	}, nil
+}
+
+func snapshotIsolatedNetNSTestProtectedMounts(
+	paths []string,
+	trustedParent mountInfoEntry,
+) (map[string]isolatedNetNSTestMountIdentity, error) {
+	result := make(map[string]isolatedNetNSTestMountIdentity, len(paths))
+	for _, path := range paths {
+		identity, err := statxContainingMountIdentity(path)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"inspect protected isolated path mount identity %s: %w",
+				path,
+				err,
+			)
+		}
+		result[path] = identity
+	}
+	if err := validateIsolatedNetNSTestProtectedMounts(
+		result,
+		trustedParent,
+	); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+func statxContainingMountIdentity(
+	path string,
+) (isolatedNetNSTestMountIdentity, error) {
+	identity, err := statxPathMountIdentity(path)
+	if err == nil {
+		return identity, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return isolatedNetNSTestMountIdentity{}, err
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return isolatedNetNSTestMountIdentity{}, err
+	}
+	identity, parentErr := statxPathMountIdentity(parent)
+	if parentErr != nil {
+		return isolatedNetNSTestMountIdentity{}, fmt.Errorf(
+			"inspect containing directory %s for absent path %s: %w",
+			parent,
+			path,
+			parentErr,
+		)
+	}
+	return identity, nil
+}
+
+func statxPathMountIdentity(
+	path string,
+) (isolatedNetNSTestMountIdentity, error) {
+	var stat unix.Statx_t
+	if err := unix.Statx(
+		unix.AT_FDCWD,
+		path,
+		unix.AT_SYMLINK_NOFOLLOW,
+		unix.STATX_BASIC_STATS|unix.STATX_MNT_ID,
+		&stat,
+	); err != nil {
+		return isolatedNetNSTestMountIdentity{}, err
+	}
+	if stat.Mask&unix.STATX_MNT_ID == 0 || stat.Mnt_id == 0 {
+		return isolatedNetNSTestMountIdentity{}, errors.New(
+			"kernel did not return STATX_MNT_ID",
+		)
+	}
+	return isolatedNetNSTestMountIdentity{
+		mountID: stat.Mnt_id,
+		device:  fmt.Sprintf("%d:%d", stat.Dev_major, stat.Dev_minor),
 	}, nil
 }
 
@@ -664,10 +761,34 @@ func revalidateIsolatedNetNSTestSnapshot(
 			)
 		}
 	}
+	if current.lease.device != expected.lease.device ||
+		current.lease.inode != expected.lease.inode {
+		return fmt.Errorf(
+			"isolated lifecycle lease file identity changed after validation",
+		)
+	}
+	if len(current.protectedMounts) != len(expected.protectedMounts) {
+		return fmt.Errorf(
+			"protected isolated path mount set changed: current=%d expected=%d",
+			len(current.protectedMounts),
+			len(expected.protectedMounts),
+		)
+	}
+	for path, expectedMount := range expected.protectedMounts {
+		currentMount, ok := current.protectedMounts[path]
+		if !ok ||
+			currentMount.mountID != expectedMount.mountID ||
+			currentMount.device != expectedMount.device {
+			return fmt.Errorf(
+				"protected isolated path mount identity changed: %s",
+				path,
+			)
+		}
+	}
 	if current.bpffs.mountID != expected.bpffs.mountID ||
 		current.bpffs.device != expected.bpffs.device ||
 		current.bpffs.inode != expected.bpffs.inode ||
-		!sameMountInfoChain(current.bpffs.mountChain, expected.bpffs.mountChain) {
+		!sameRelevantMountSnapshot(current.bpffs.mounts, expected.bpffs.mounts) {
 		return fmt.Errorf(
 			"isolated bpffs mount identity, topology, or options changed after validation",
 		)
@@ -676,20 +797,11 @@ func revalidateIsolatedNetNSTestSnapshot(
 }
 
 func statxMountID(path string) (uint64, error) {
-	var stat unix.Statx_t
-	if err := unix.Statx(
-		unix.AT_FDCWD,
-		path,
-		unix.AT_SYMLINK_NOFOLLOW,
-		unix.STATX_TYPE|unix.STATX_MNT_ID,
-		&stat,
-	); err != nil {
+	identity, err := statxPathMountIdentity(path)
+	if err != nil {
 		return 0, err
 	}
-	if stat.Mask&unix.STATX_MNT_ID == 0 || stat.Mnt_id == 0 {
-		return 0, errors.New("kernel did not return STATX_MNT_ID")
-	}
-	return stat.Mnt_id, nil
+	return identity.mountID, nil
 }
 
 func requireRootOwnedPrivateDirectory(path string) error {
