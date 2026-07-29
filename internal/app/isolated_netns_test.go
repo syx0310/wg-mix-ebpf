@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/syx0310/wg-mix-ebpf/internal/pinidentity"
 )
 
 func TestIsolatedNetNSTestPaths(t *testing.T) {
@@ -33,7 +35,7 @@ func TestIsolatedNetNSTestPaths(t *testing.T) {
 func TestIsolatedNetNSTestRolesShareLifecycleLease(t *testing.T) {
 	base := filepath.Join(isolatedNetNSTestRoot, "0123456789abcdef")
 	layouts := make([]isolatedNetNSTestLayout, 0, 2)
-	for _, role := range []string{"a", "b"} {
+	for _, role := range []string{"client", "server"} {
 		layout, err := isolatedNetNSTestPaths(
 			"reload",
 			filepath.Join(base, "secrets", "agent-"+role+".yaml"),
@@ -49,8 +51,8 @@ func TestIsolatedNetNSTestRolesShareLifecycleLease(t *testing.T) {
 	if layouts[0].lease != layouts[1].lease {
 		t.Fatalf("role leases differ: a=%q b=%q", layouts[0].lease, layouts[1].lease)
 	}
-	if strings.Contains(layouts[0].lease, "run-a") ||
-		strings.Contains(layouts[1].lease, "run-b") {
+	if strings.Contains(layouts[0].lease, "run-client") ||
+		strings.Contains(layouts[1].lease, "run-server") {
 		t.Fatalf("role-specific lease permits serialization bypass: %#v", layouts)
 	}
 }
@@ -72,7 +74,7 @@ func TestIsolatedNetNSTestPathsRejectsEscapesAndMismatches(t *testing.T) {
 	}{
 		{name: "read-only command", cmd: "status", config: validConfig, run: validRun, state: validState, pin: validPin},
 		{name: "short run id", cmd: "reload", config: validConfig, run: filepath.Join(isolatedNetNSTestRoot, "1234", "run-a"), state: validState, pin: validPin},
-		{name: "unknown role", cmd: "reload", config: filepath.Join(base, "secrets", "agent-client.yaml"), run: filepath.Join(base, "run-client"), state: filepath.Join(base, "state-client"), pin: filepath.Join(base, "bpffs", "wg-mix-ebpf-client")},
+		{name: "invalid role", cmd: "reload", config: filepath.Join(base, "secrets", "agent-BAD.yaml"), run: filepath.Join(base, "run-BAD"), state: filepath.Join(base, "state-BAD"), pin: filepath.Join(base, "bpffs", "wg-mix-ebpf-BAD")},
 		{name: "state role mismatch", cmd: "reload", config: validConfig, run: validRun, state: filepath.Join(base, "state-b"), pin: validPin},
 		{name: "config role mismatch", cmd: "reload", config: filepath.Join(base, "secrets", "agent-b.yaml"), run: validRun, state: validState, pin: validPin},
 		{name: "config outside secrets", cmd: "reload", config: filepath.Join(base, "agent.yaml"), run: validRun, state: validState, pin: validPin},
@@ -122,6 +124,61 @@ func TestParseIsolatedNetNSTestManifestAndLayout(t *testing.T) {
 		pinPath,
 	); err == nil {
 		t.Fatal("production pin lock path unexpectedly accepted")
+	}
+
+	for name, mutate := range map[string]func(isolatedNetNSTestManifest){
+		"resource key mismatch": func(value isolatedNetNSTestManifest) {
+			value.values["pin_resource_key_a"] = strings.Repeat("0", 64)
+		},
+		"production owner path": func(value isolatedNetNSTestManifest) {
+			value.values["pin_owner_a"] = "/var/lib/wg-mix-ebpf/pin-owners/foreign.owner.json"
+		},
+		"duplicate endpoint role": func(value isolatedNetNSTestManifest) {
+			value.values["role_b"] = value.values["role_a"]
+		},
+		"namespace without run id": func(value isolatedNetNSTestManifest) {
+			value.values["netns_a"] = "foreign-a"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate, err := parseIsolatedNetNSTestManifest(isolatedFixtureManifest(layout))
+			if err != nil {
+				t.Fatal(err)
+			}
+			mutate(candidate)
+			if err := validateIsolatedNetNSTestManifestLayout(
+				candidate,
+				layout,
+				configPath,
+				runDir,
+				stateDir,
+				pinPath,
+			); err == nil {
+				t.Fatal("mutated manifest layout unexpectedly accepted")
+			}
+		})
+	}
+}
+
+func TestValidateIsolatedNetNSTestManifestLayoutSupportsNamedRoles(t *testing.T) {
+	for _, role := range []string{"client", "server"} {
+		layout, configPath, runDir, stateDir, pinPath := isolatedFixtureLayout(t, role)
+		manifest, err := parseIsolatedNetNSTestManifest(
+			isolatedFixtureManifestForRoles(layout, "client", "server"),
+		)
+		if err != nil {
+			t.Fatalf("parse %s manifest: %v", role, err)
+		}
+		if err := validateIsolatedNetNSTestManifestLayout(
+			manifest,
+			layout,
+			configPath,
+			runDir,
+			stateDir,
+			pinPath,
+		); err != nil {
+			t.Fatalf("validate %s manifest layout: %v", role, err)
+		}
 	}
 }
 
@@ -236,13 +293,39 @@ func TestValidateManifestNetworkNamespaces(t *testing.T) {
 	}
 }
 
+func TestValidateBPFFSParentIdentity(t *testing.T) {
+	layout, _, _, _, _ := isolatedFixtureLayout(t, "a")
+	manifest, err := parseIsolatedNetNSTestManifest(isolatedFixtureManifest(layout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateBPFFSParentIdentity(manifest, 200, 201); err != nil {
+		t.Fatalf("validate bpffs identity: %v", err)
+	}
+	for _, identity := range []struct {
+		device uint64
+		inode  uint64
+	}{
+		{device: 199, inode: 201},
+		{device: 200, inode: 202},
+	} {
+		if err := validateBPFFSParentIdentity(
+			manifest,
+			identity.device,
+			identity.inode,
+		); err == nil {
+			t.Fatalf("mismatched bpffs identity unexpectedly accepted: %#v", identity)
+		}
+	}
+}
+
 func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 	layout, _, _, _, _ := isolatedFixtureLayout(t, "a")
 	manifest, err := parseIsolatedNetNSTestManifest(isolatedFixtureManifest(layout))
 	if err != nil {
 		t.Fatal(err)
 	}
-	validFixture := isolatedMountInfoFixture(layout, "0:42", "/", "wg-mix-ebpf-"+layout.runID, "")
+	validFixture := isolatedMountInfoFixture(layout, "0:42", "/", "bpf", "")
 	entries, err := parseMountInfo([]byte(validFixture))
 	if err != nil {
 		t.Fatalf("parse valid mountinfo: %v", err)
@@ -273,13 +356,13 @@ func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 		},
 		{
 			name:         "not mount root",
-			fixture:      isolatedMountInfoFixture(layout, "0:42", "/production/subtree", "wg-mix-ebpf-"+layout.runID, ""),
+			fixture:      isolatedMountInfoFixture(layout, "0:42", "/production/subtree", "bpf", ""),
 			statxMountID: 42,
 			pinMountID:   42,
 		},
 		{
-			name:         "wrong source",
-			fixture:      isolatedMountInfoFixture(layout, "0:42", "/", "bpf", ""),
+			name:         "custom source label",
+			fixture:      isolatedMountInfoFixture(layout, "0:42", "/", "wg-mix-ebpf-"+layout.runID, ""),
 			statxMountID: 42,
 			pinMountID:   42,
 		},
@@ -289,7 +372,7 @@ func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 				layout,
 				"0:42",
 				"/",
-				"wg-mix-ebpf-"+layout.runID,
+				"bpf",
 				fmt.Sprintf(
 					"43 42 0:43 / %s rw,nosuid,nodev,noexec - tmpfs nested rw\n",
 					filepath.Join(layout.bpffsDir, "wg-mix-ebpf-a"),
@@ -318,8 +401,14 @@ func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 			),
 			statxMountID: 42,
 			pinMountID:   42,
+		},
+		{
+			name:         "manifest custom source label",
+			fixture:      validFixture,
+			statxMountID: 42,
+			pinMountID:   42,
 			mutate: func(value isolatedNetNSTestManifest) isolatedNetNSTestManifest {
-				value.values["bpffs_source"] = "bpf"
+				value.values["bpffs_source"] = "wg-mix-ebpf-" + layout.runID
 				return value
 			},
 		},
@@ -390,11 +479,28 @@ func isolatedFixtureLayout(
 }
 
 func isolatedFixtureManifest(layout isolatedNetNSTestLayout) []byte {
+	return isolatedFixtureManifestForRoles(layout, "a", "b")
+}
+
+func isolatedFixtureManifestForRoles(
+	layout isolatedNetNSTestLayout,
+	roleA string,
+	roleB string,
+) []byte {
 	base := layout.runBase
 	secrets := filepath.Join(base, "secrets")
 	pinLockRoot := filepath.Join(base, "pin-locks")
-	pinA := filepath.Join(layout.bpffsDir, "wg-mix-ebpf-a")
-	pinB := filepath.Join(layout.bpffsDir, "wg-mix-ebpf-b")
+	pinOwnerRoot := filepath.Join(base, "pin-owners")
+	pinA := filepath.Join(layout.bpffsDir, "wg-mix-ebpf-"+roleA)
+	pinB := filepath.Join(layout.bpffsDir, "wg-mix-ebpf-"+roleB)
+	keyA, err := pinidentity.Key(200, 201, filepath.Base(pinA))
+	if err != nil {
+		panic(err)
+	}
+	keyB, err := pinidentity.Key(200, 201, filepath.Base(pinB))
+	if err != nil {
+		panic(err)
+	}
 	return []byte(fmt.Sprintf(
 		`format=%s
 run_id=%s
@@ -403,14 +509,21 @@ boot_id=01234567-89ab-cdef-0123-456789abcdef
 host=test-host
 run_base=%s
 bpffs=%s
-bpffs_source=wg-mix-ebpf-%s
+bpffs_source=bpf
 bpffs_mount_id=42
+pin_parent_dev=200
+pin_parent_ino=201
+pin_resource_key_a=%s
+pin_resource_key_b=%s
 pin_lock_root=%s
 pin_lock_a=%s
 pin_lock_b=%s
-role_a=a
+pin_owner_root=%s
+pin_owner_a=%s
+pin_owner_b=%s
+role_a=%s
 pin_a=%s
-role_b=b
+role_b=%s
 pin_b=%s
 netns_a=wme%sa
 netns_a_dev=100
@@ -439,23 +552,29 @@ secrets=%s
 		layout.runID,
 		base,
 		layout.bpffsDir,
-		layout.runID,
+		keyA,
+		keyB,
 		pinLockRoot,
-		isolatedNetNSPinLockPath(pinLockRoot, pinA),
-		isolatedNetNSPinLockPath(pinLockRoot, pinB),
+		filepath.Join(pinLockRoot, keyA+".lock"),
+		filepath.Join(pinLockRoot, keyB+".lock"),
+		pinOwnerRoot,
+		filepath.Join(pinOwnerRoot, keyA+".owner.json"),
+		filepath.Join(pinOwnerRoot, keyB+".owner.json"),
+		roleA,
 		pinA,
+		roleB,
 		pinB,
 		layout.runID,
 		layout.runID,
 		layout.runID,
-		filepath.Join(base, "run-a"),
-		filepath.Join(base, "state-a"),
-		filepath.Join(secrets, "agent-a.yaml"),
-		filepath.Join(secrets, "wg-a.conf"),
-		filepath.Join(base, "run-b"),
-		filepath.Join(base, "state-b"),
-		filepath.Join(secrets, "agent-b.yaml"),
-		filepath.Join(secrets, "wg-b.conf"),
+		filepath.Join(base, "run-"+roleA),
+		filepath.Join(base, "state-"+roleA),
+		filepath.Join(secrets, "agent-"+roleA+".yaml"),
+		filepath.Join(secrets, "wg-"+roleA+".conf"),
+		filepath.Join(base, "run-"+roleB),
+		filepath.Join(base, "state-"+roleB),
+		filepath.Join(secrets, "agent-"+roleB+".yaml"),
+		filepath.Join(secrets, "wg-"+roleB+".conf"),
 		layout.lease,
 		filepath.Join(base, "evidence"),
 		secrets,

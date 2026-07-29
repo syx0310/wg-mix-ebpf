@@ -3,12 +3,13 @@ package app
 import (
 	"bufio"
 	"bytes"
-	"crypto/sha256"
 	"fmt"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/syx0310/wg-mix-ebpf/internal/pinidentity"
 )
 
 const (
@@ -25,6 +26,8 @@ var (
 	isolatedNetNSTestBootID     = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 	isolatedNetNSTestRole       = regexp.MustCompile(`^[a-z0-9][a-z0-9-]{0,31}$`)
 	isolatedNetNSTestKey        = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
+	isolatedNetNSTestNetNS      = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$`)
+	isolatedNetNSTestInterface  = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$`)
 )
 
 type isolatedNetNSTestLayout struct {
@@ -93,9 +96,9 @@ func isolatedNetNSTestPaths(
 		)
 	}
 	role := strings.TrimPrefix(runName, "run-")
-	if !isolatedNetNSTestRole.MatchString(role) || (role != "a" && role != "b") {
+	if !isolatedNetNSTestRole.MatchString(role) {
 		return isolatedNetNSTestLayout{}, fmt.Errorf(
-			"--isolated-netns-test role must be exactly a or b",
+			"--isolated-netns-test role is not a canonical lowercase identifier",
 		)
 	}
 	if stateDir != filepath.Join(runBase, "state-"+role) {
@@ -149,9 +152,16 @@ func parseIsolatedNetNSTestManifest(data []byte) (isolatedNetNSTestManifest, err
 		"bpffs",
 		"bpffs_source",
 		"bpffs_mount_id",
+		"pin_parent_dev",
+		"pin_parent_ino",
+		"pin_resource_key_a",
+		"pin_resource_key_b",
 		"pin_lock_root",
 		"pin_lock_a",
 		"pin_lock_b",
+		"pin_owner_root",
+		"pin_owner_a",
+		"pin_owner_b",
 		"role_a",
 		"pin_a",
 		"role_b",
@@ -200,6 +210,8 @@ func parseIsolatedNetNSTestManifest(data []byte) (isolatedNetNSTestManifest, err
 	}
 	for _, key := range []string{
 		"bpffs_mount_id",
+		"pin_parent_dev",
+		"pin_parent_ino",
 		"netns_a_dev",
 		"netns_a_ino",
 		"netns_r_dev",
@@ -223,30 +235,19 @@ func validateIsolatedNetNSTestManifestLayout(
 	pinPath string,
 ) error {
 	values := manifest.values
-	role := layout.role
 	secretsDir := filepath.Join(layout.runBase, "secrets")
 	pinLockRoot := filepath.Join(layout.runBase, "pin-locks")
+	pinOwnerRoot := filepath.Join(layout.runBase, "pin-owners")
 	expected := map[string]string{
-		"run_id":            layout.runID,
-		"run_base":          layout.runBase,
-		"bpffs":             layout.bpffsDir,
-		"bpffs_source":      "wg-mix-ebpf-" + layout.runID,
-		"pin_lock_root":     pinLockRoot,
-		"role_" + role:      role,
-		"pin_" + role:       pinPath,
-		"pin_lock_" + role:  isolatedNetNSPinLockPath(pinLockRoot, pinPath),
-		"netns_" + role:     "wme" + layout.runID + role,
-		"run_dir_" + role:   runDir,
-		"state_dir_" + role: stateDir,
-		"config_" + role:    configPath,
-		"wg_config_" + role: filepath.Join(
-			secretsDir,
-			"wg-"+role+".conf",
-		),
-		"underlay_" + role: "under0",
-		"lifecycle_lease":  layout.lease,
-		"evidence":         filepath.Join(layout.runBase, "evidence"),
-		"secrets":          secretsDir,
+		"run_id":          layout.runID,
+		"run_base":        layout.runBase,
+		"bpffs":           layout.bpffsDir,
+		"bpffs_source":    "bpf",
+		"pin_lock_root":   pinLockRoot,
+		"pin_owner_root":  pinOwnerRoot,
+		"lifecycle_lease": layout.lease,
+		"evidence":        filepath.Join(layout.runBase, "evidence"),
+		"secrets":         secretsDir,
 	}
 	for key, want := range expected {
 		if values[key] != want {
@@ -258,20 +259,50 @@ func validateIsolatedNetNSTestManifestLayout(
 			)
 		}
 	}
-	for _, otherRole := range []string{"a", "b"} {
+	parentDevice, err := parseCanonicalPositiveUint(values["pin_parent_dev"], "pin_parent_dev")
+	if err != nil {
+		return err
+	}
+	parentInode, err := parseCanonicalPositiveUint(values["pin_parent_ino"], "pin_parent_ino")
+	if err != nil {
+		return err
+	}
+	if values["role_a"] == values["role_b"] {
+		return fmt.Errorf("isolated test manifest endpoint roles must be distinct")
+	}
+	resourceKeys := make(map[string]string, 2)
+	for _, endpoint := range []string{"a", "b"} {
+		role := values["role_"+endpoint]
+		if !isolatedNetNSTestRole.MatchString(role) {
+			return fmt.Errorf("isolated test manifest role_%s=%q is invalid", endpoint, role)
+		}
+		endpointPin := filepath.Join(layout.bpffsDir, "wg-mix-ebpf-"+role)
+		resourceKey, err := pinidentity.Key(
+			parentDevice,
+			parentInode,
+			filepath.Base(endpointPin),
+		)
+		if err != nil {
+			return fmt.Errorf("derive isolated pin identity for role %s: %w", role, err)
+		}
+		if previousEndpoint, duplicate := resourceKeys[resourceKey]; duplicate {
+			return fmt.Errorf(
+				"isolated test endpoints %s and %s share pin resource key %s",
+				previousEndpoint,
+				endpoint,
+				resourceKey,
+			)
+		}
+		resourceKeys[resourceKey] = endpoint
 		rolePaths := map[string]string{
-			"role_" + otherRole: otherRole,
-			"pin_" + otherRole:  filepath.Join(layout.bpffsDir, "wg-mix-ebpf-"+otherRole),
-			"pin_lock_" + otherRole: isolatedNetNSPinLockPath(
-				pinLockRoot,
-				filepath.Join(layout.bpffsDir, "wg-mix-ebpf-"+otherRole),
-			),
-			"netns_" + otherRole:     "wme" + layout.runID + otherRole,
-			"run_dir_" + otherRole:   filepath.Join(layout.runBase, "run-"+otherRole),
-			"state_dir_" + otherRole: filepath.Join(layout.runBase, "state-"+otherRole),
-			"config_" + otherRole:    filepath.Join(secretsDir, "agent-"+otherRole+".yaml"),
-			"wg_config_" + otherRole: filepath.Join(secretsDir, "wg-"+otherRole+".conf"),
-			"underlay_" + otherRole:  "under0",
+			"pin_" + endpoint:              endpointPin,
+			"pin_resource_key_" + endpoint: resourceKey,
+			"pin_lock_" + endpoint:         filepath.Join(pinLockRoot, resourceKey+".lock"),
+			"pin_owner_" + endpoint:        filepath.Join(pinOwnerRoot, resourceKey+".owner.json"),
+			"run_dir_" + endpoint:          filepath.Join(layout.runBase, "run-"+role),
+			"state_dir_" + endpoint:        filepath.Join(layout.runBase, "state-"+role),
+			"config_" + endpoint:           filepath.Join(secretsDir, "agent-"+role+".yaml"),
+			"wg_config_" + endpoint:        filepath.Join(secretsDir, "wg-"+role+".conf"),
 		}
 		for key, want := range rolePaths {
 			if values[key] != want {
@@ -283,9 +314,40 @@ func validateIsolatedNetNSTestManifestLayout(
 				)
 			}
 		}
+		if !isolatedNetNSTestNetNS.MatchString(values["netns_"+endpoint]) ||
+			!strings.Contains(values["netns_"+endpoint], layout.runID) {
+			return fmt.Errorf(
+				"isolated test manifest netns_%s=%q is not tied to run_id",
+				endpoint,
+				values["netns_"+endpoint],
+			)
+		}
+		if !isolatedNetNSTestInterface.MatchString(values["underlay_"+endpoint]) {
+			return fmt.Errorf(
+				"isolated test manifest underlay_%s=%q is invalid",
+				endpoint,
+				values["underlay_"+endpoint],
+			)
+		}
 	}
-	if values["netns_r"] != "wme"+layout.runID+"r" {
-		return fmt.Errorf("isolated test manifest router namespace does not match run_id")
+	if !isolatedNetNSTestNetNS.MatchString(values["netns_r"]) ||
+		!strings.Contains(values["netns_r"], layout.runID) {
+		return fmt.Errorf("isolated test manifest router namespace is not tied to run_id")
+	}
+	endpoint, err := manifestEndpointForRole(manifest, layout.role)
+	if err != nil {
+		return err
+	}
+	currentExpected := map[string]string{
+		"pin_" + endpoint:       pinPath,
+		"run_dir_" + endpoint:   runDir,
+		"state_dir_" + endpoint: stateDir,
+		"config_" + endpoint:    configPath,
+	}
+	for key, want := range currentExpected {
+		if values[key] != want {
+			return fmt.Errorf("isolated test manifest %s=%q, want %q", key, values[key], want)
+		}
 	}
 	for _, key := range []string{
 		"run_base",
@@ -293,6 +355,9 @@ func validateIsolatedNetNSTestManifestLayout(
 		"pin_lock_root",
 		"pin_lock_a",
 		"pin_lock_b",
+		"pin_owner_root",
+		"pin_owner_a",
+		"pin_owner_b",
 		"pin_a",
 		"pin_b",
 		"run_dir_a",
@@ -318,14 +383,21 @@ func validateIsolatedNetNSTestManifestLayout(
 	return nil
 }
 
-func isolatedNetNSPinLockPath(root string, pinPath string) string {
-	sum := sha256.Sum256([]byte(pinPath))
-	return filepath.Join(root, fmt.Sprintf("%x.lock", sum))
+func manifestEndpointForRole(
+	manifest isolatedNetNSTestManifest,
+	role string,
+) (string, error) {
+	for _, endpoint := range []string{"a", "b"} {
+		if manifest.values["role_"+endpoint] == role {
+			return endpoint, nil
+		}
+	}
+	return "", fmt.Errorf("isolated test manifest has no endpoint for role %q", role)
 }
 
 func validateManifestNetworkNamespaces(
 	manifest isolatedNetNSTestManifest,
-	role string,
+	endpoint string,
 	currentDevice uint64,
 	currentInode uint64,
 ) error {
@@ -361,18 +433,49 @@ func validateManifestNetworkNamespaces(
 		seen[id] = manifestRole
 		identities[manifestRole] = id
 	}
-	current, ok := identities[role]
+	current, ok := identities[endpoint]
 	if !ok {
-		return fmt.Errorf("isolated test role %q has no manifest network namespace", role)
+		return fmt.Errorf("isolated test endpoint %q has no manifest network namespace", endpoint)
 	}
 	if current.device != currentDevice || current.inode != currentInode {
 		return fmt.Errorf(
 			"current network namespace dev:ino=%d:%d does not match manifest role %s dev:ino=%d:%d",
 			currentDevice,
 			currentInode,
-			role,
+			endpoint,
 			current.device,
 			current.inode,
+		)
+	}
+	return nil
+}
+
+func validateBPFFSParentIdentity(
+	manifest isolatedNetNSTestManifest,
+	device uint64,
+	inode uint64,
+) error {
+	parentDevice, err := parseCanonicalPositiveUint(
+		manifest.values["pin_parent_dev"],
+		"pin_parent_dev",
+	)
+	if err != nil {
+		return err
+	}
+	parentInode, err := parseCanonicalPositiveUint(
+		manifest.values["pin_parent_ino"],
+		"pin_parent_ino",
+	)
+	if err != nil {
+		return err
+	}
+	if device != parentDevice || inode != parentInode {
+		return fmt.Errorf(
+			"isolated bpffs dev:ino=%d:%d does not match manifest pin parent dev:ino=%d:%d",
+			device,
+			inode,
+			parentDevice,
+			parentInode,
 		)
 	}
 	return nil
@@ -555,7 +658,7 @@ func validatePrivateBPFFSMountInfo(
 	pinMountID *uint64,
 ) error {
 	var target *mountInfoEntry
-	var production *mountInfoEntry
+	var production []*mountInfoEntry
 	for index := range entries {
 		entry := &entries[index]
 		switch entry.mountPath {
@@ -566,7 +669,7 @@ func validatePrivateBPFFSMountInfo(
 			target = entry
 		case "/sys/fs/bpf":
 			if entry.fsType == "bpf" {
-				production = entry
+				production = append(production, entry)
 			}
 		}
 		if strings.HasPrefix(entry.mountPath, layout.bpffsDir+string(filepath.Separator)) {
@@ -587,9 +690,9 @@ func validatePrivateBPFFSMountInfo(
 			target.root,
 		)
 	}
-	if target.source != manifest.values["bpffs_source"] {
+	if target.source != "bpf" || manifest.values["bpffs_source"] != "bpf" {
 		return fmt.Errorf(
-			"isolated bpffs source=%q, want %q",
+			"isolated bpffs source=%q and manifest source=%q must both be the kernel bpf source",
 			target.source,
 			manifest.values["bpffs_source"],
 		)
@@ -616,14 +719,15 @@ func validatePrivateBPFFSMountInfo(
 			manifestMountID,
 		)
 	}
-	if production != nil &&
-		target.device == production.device &&
-		target.root == production.root &&
-		target.source == production.source {
-		return fmt.Errorf(
-			"isolated bpffs is a bind or alias of production mount %s",
-			production.mountPath,
-		)
+	for _, productionMount := range production {
+		if target.mountID == productionMount.mountID ||
+			(target.device == productionMount.device &&
+				target.root == productionMount.root) {
+			return fmt.Errorf(
+				"isolated bpffs is a bind or alias of production mount %s",
+				productionMount.mountPath,
+			)
+		}
 	}
 	return nil
 }
