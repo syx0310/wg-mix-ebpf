@@ -99,8 +99,8 @@ On a controlled Linux test host, the full isolated namespace gate is:
 sudo make test-netns-full
 ```
 
-To run only the TCP single-flow, multi-flow, and WireGuard MTU boundary
-matrix (type-word-only, XOR prefix, and XOR full), use:
+To run only the TCP 1/4/16-flow, forward/reverse/bidirectional, and WireGuard
+MTU 1419-1422 boundary matrix (type-word-only, XOR prefix, and XOR full), use:
 
 ```bash
 sudo make test-netns-tcp

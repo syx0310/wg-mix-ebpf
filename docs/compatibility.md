@@ -116,30 +116,41 @@ paths, ICMP IPv4, and the TCP MTU matrix.
 
 The TCP matrix is opt-in so the lightweight smoke targets do not require
 `iperf3`. `test-netns-tcp` runs type-word-only UDP, XOR prefix, and XOR full
-modes. In each mode it runs a single TCP flow and four parallel flows at
-WireGuard MTUs 1419, 1420, and 1421. Every receiver stream must transfer at
-least 1 MiB, and the aggregate receive count must be at least 1 MiB multiplied
-by the requested stream count. Dataplane type, length, checksum, load/store,
-and XOR error counters must remain unchanged. The TCP load starts only after
-packet-capture validation finishes, avoiding high-volume pcap artifacts.
+modes. In each mode it runs 1, 4, and 16 TCP flows in forward, reverse, and
+simultaneous bidirectional directions at WireGuard MTUs 1419, 1420, 1421, and
+1422. Every receiver stream in every direction must transfer at least 1 MiB.
+The iperf summary must match the per-stream records, retransmits must remain
+zero, and multi-flow Jain fairness must be at least 0.90. Dataplane
+type, length, fragment, IPv6 extension, checksum, load/store, rule-miss, and
+XOR error counters must remain unchanged. GSO counters are reported by
+default; `TCP_GSO_CHECKS=enforce` additionally requires managed/listener hits
+and successful rewrites in both directions. The TCP load starts only after
+the initial packet-capture validation finishes. A separate TCP capture is
+limited to 4096 packets per router-side interface with a 192-byte snap length,
+so transport type-word evidence is retained without an unbounded
+high-volume pcap artifact.
 
 Direct script callers can select the same gate and tune it for slower test
 hosts:
 
 ```bash
 sudo TCP_CHECKS=enforce \
-  TCP_MTUS="1420 1419 1421" \
+  TCP_MTUS="1419 1420 1421 1422" \
+  TCP_STREAMS="1 4 16" \
+  TCP_DIRECTIONS="forward reverse bidir" \
   TCP_DURATION=2 \
-  TCP_PARALLEL_STREAMS=4 \
   TCP_MIN_BYTES=1048576 \
+  TCP_MAX_RETRANSMITS=0 \
+  TCP_MIN_FAIRNESS=0.90 \
+  TCP_GSO_CHECKS=report \
+  TCP_CAPTURE_PACKETS=4096 \
   scripts/smoke-netns-wg.sh
 ```
 
-`TCP_MIN_BYTES` is a per-receiver-stream threshold; the aggregate threshold is
-`TCP_MIN_BYTES * stream_count`. `TCP_CHECKS=off` is the default. The 1420 case
-covers the normal full-sized TCP boundary, while 1419 and 1421 force
-non-four-byte-aligned full-payload XOR targets. `iperf3` is checked as a
-dependency only when the TCP gate is enabled.
+`TCP_MIN_BYTES` is a per-receiver-stream and per-direction threshold.
+`TCP_CHECKS=off` is the default. MTUs 1419 through 1422 cover four adjacent
+full-sized TCP boundaries and exercise all XOR byte-tail alignments.
+`iperf3` is checked as a dependency only when the TCP gate is enabled.
 
 The ICMP smoke test is IPv4-only. Its pcap check requires ICMP Echo Request and
 Reply records, valid ICMP checksums, mixed initiation/response/transport payload

@@ -16,6 +16,7 @@ fi
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN="${ROOT}/bin/wg-mix-ebpf"
 LIFECYCLE_HOLDER_HELPER="${ROOT}/scripts/hold-isolated-lifecycle-lease.py"
+IPERF_CHECKER_HELPER="${ROOT}/scripts/check-iperf3-tcp.py"
 OUTER_FAMILY="${OUTER_FAMILY:-ipv4}"
 XOR_SCOPE="${XOR_SCOPE:-wg-payload-full}"
 XOR_MAX_BYTES="${XOR_MAX_BYTES:-2048}"
@@ -23,10 +24,15 @@ XOR_GENERATION_CHECKS="${XOR_GENERATION_CHECKS:-off}"
 XOR_DISPATCH_FAILURE_CHECKS="${XOR_DISPATCH_FAILURE_CHECKS:-off}"
 UDP_ZERO_CHECKSUM_CHECKS="${UDP_ZERO_CHECKSUM_CHECKS:-off}"
 TCP_CHECKS="${TCP_CHECKS:-off}"
-TCP_MTUS="${TCP_MTUS:-1420 1419 1421}"
+TCP_MTUS="${TCP_MTUS:-1419 1420 1421 1422}"
+TCP_STREAMS="${TCP_STREAMS:-1 4 16}"
+TCP_DIRECTIONS="${TCP_DIRECTIONS:-forward reverse bidir}"
 TCP_DURATION="${TCP_DURATION:-2}"
-TCP_PARALLEL_STREAMS="${TCP_PARALLEL_STREAMS:-4}"
 TCP_MIN_BYTES="${TCP_MIN_BYTES:-1048576}"
+TCP_MAX_RETRANSMITS="${TCP_MAX_RETRANSMITS:-0}"
+TCP_MIN_FAIRNESS="${TCP_MIN_FAIRNESS:-0.90}"
+TCP_GSO_CHECKS="${TCP_GSO_CHECKS:-report}"
+TCP_CAPTURE_PACKETS="${TCP_CAPTURE_PACKETS:-4096}"
 TCP_PORT="${TCP_PORT:-5201}"
 UNDERLAY_MTU="${UNDERLAY_MTU:-2200}"
 WG_MTU="${WG_MTU:-2000}"
@@ -57,6 +63,11 @@ for check_mode in "${XOR_GENERATION_CHECKS}" "${XOR_DISPATCH_FAILURE_CHECKS}" \
     exit 1
   fi
 done
+if [[ "${TCP_GSO_CHECKS}" != "off" && "${TCP_GSO_CHECKS}" != "report" &&
+  "${TCP_GSO_CHECKS}" != "enforce" ]]; then
+  echo "error: TCP_GSO_CHECKS must be off, report, or enforce" >&2
+  exit 1
+fi
 if [[ "${XOR_DISPATCH_FAILURE_CHECKS}" == "enforce" &&
   ( "${XOR_ENABLED}" -eq 0 || "${XOR_SCOPE}" != "wg-payload-full" || XOR_MAX_BYTES -lt 2048 ) ]]; then
   echo "error: dispatch failure checks require full-payload XOR with max_bytes=2048" >&2
@@ -74,6 +85,8 @@ if [[ "${UDP_ZERO_CHECKSUM_CHECKS}" == "enforce" ]]; then
   fi
 fi
 TCP_MTU_VALUES=()
+TCP_STREAM_VALUES=()
+TCP_DIRECTION_VALUES=()
 if [[ "${TCP_CHECKS}" == "enforce" ]]; then
   read -r -a TCP_MTU_VALUES <<<"${TCP_MTUS}"
   if ((${#TCP_MTU_VALUES[@]} == 0)); then
@@ -86,18 +99,64 @@ if [[ "${TCP_CHECKS}" == "enforce" ]]; then
       exit 1
     fi
   done
-  if [[ ! "${TCP_DURATION}" =~ ^[0-9]+$ ]] ||
-    ((TCP_DURATION < 1 || TCP_DURATION > 60)); then
-    echo "error: TCP_DURATION must be an integer in [1, 60]" >&2
+  read -r -a TCP_STREAM_VALUES <<<"${TCP_STREAMS}"
+  if ((${#TCP_STREAM_VALUES[@]} == 0)); then
+    echo "error: TCP_STREAMS must contain at least one stream count" >&2
     exit 1
   fi
-  if [[ ! "${TCP_PARALLEL_STREAMS}" =~ ^[0-9]+$ ]] ||
-    ((TCP_PARALLEL_STREAMS < 2 || TCP_PARALLEL_STREAMS > 32)); then
-    echo "error: TCP_PARALLEL_STREAMS must be an integer in [2, 32]" >&2
+  seen_tcp_streams=" "
+  for tcp_streams in "${TCP_STREAM_VALUES[@]}"; do
+    if [[ ! "${tcp_streams}" =~ ^[0-9]+$ ]] ||
+      ((tcp_streams < 1 || tcp_streams > 32)); then
+      echo "error: TCP_STREAMS values must be integers in [1, 32]" >&2
+      exit 1
+    fi
+    if [[ "${seen_tcp_streams}" == *" ${tcp_streams} "* ]]; then
+      echo "error: TCP_STREAMS contains duplicate value: ${tcp_streams}" >&2
+      exit 1
+    fi
+    seen_tcp_streams+="${tcp_streams} "
+  done
+  read -r -a TCP_DIRECTION_VALUES <<<"${TCP_DIRECTIONS}"
+  if ((${#TCP_DIRECTION_VALUES[@]} == 0)); then
+    echo "error: TCP_DIRECTIONS must contain at least one direction" >&2
+    exit 1
+  fi
+  seen_tcp_directions=" "
+  for tcp_direction in "${TCP_DIRECTION_VALUES[@]}"; do
+    case "${tcp_direction}" in
+      forward | reverse | bidir) ;;
+      *)
+        echo "error: TCP_DIRECTIONS values must be forward, reverse, or bidir" >&2
+        exit 1
+        ;;
+    esac
+    if [[ "${seen_tcp_directions}" == *" ${tcp_direction} "* ]]; then
+      echo "error: TCP_DIRECTIONS contains duplicate value: ${tcp_direction}" >&2
+      exit 1
+    fi
+    seen_tcp_directions+="${tcp_direction} "
+  done
+  if [[ ! "${TCP_DURATION}" =~ ^[0-9]+$ ]] ||
+    ((TCP_DURATION < 1 || TCP_DURATION > 600)); then
+    echo "error: TCP_DURATION must be an integer in [1, 600]" >&2
     exit 1
   fi
   if [[ ! "${TCP_MIN_BYTES}" =~ ^[0-9]+$ ]] || ((TCP_MIN_BYTES < 1)); then
     echo "error: TCP_MIN_BYTES must be a positive integer" >&2
+    exit 1
+  fi
+  if [[ ! "${TCP_MAX_RETRANSMITS}" =~ ^[0-9]+$ ]]; then
+    echo "error: TCP_MAX_RETRANSMITS must be a non-negative integer" >&2
+    exit 1
+  fi
+  if [[ ! "${TCP_MIN_FAIRNESS}" =~ ^(0([.][0-9]+)?|1([.]0+)?)$ ]]; then
+    echo "error: TCP_MIN_FAIRNESS must be a decimal in [0, 1]" >&2
+    exit 1
+  fi
+  if [[ ! "${TCP_CAPTURE_PACKETS}" =~ ^[0-9]+$ ]] ||
+    ((TCP_CAPTURE_PACKETS < 128 || TCP_CAPTURE_PACKETS > 65536)); then
+    echo "error: TCP_CAPTURE_PACKETS must be an integer in [128, 65536]" >&2
     exit 1
   fi
   if [[ ! "${TCP_PORT}" =~ ^[0-9]+$ ]] ||
@@ -123,6 +182,10 @@ if [[ "${TCP_CHECKS}" == "enforce" ]] && ! command -v iperf3 >/dev/null 2>&1; th
   echo "error: missing command: iperf3 (required when TCP_CHECKS=enforce)" >&2
   exit 1
 fi
+if [[ "${TCP_CHECKS}" == "enforce" ]] && ! command -v ethtool >/dev/null 2>&1; then
+  echo "error: missing command: ethtool (required when TCP_CHECKS=enforce)" >&2
+  exit 1
+fi
 
 if [[ ! -x "${BIN}" ]]; then
   echo "error: missing binary: ${BIN}" >&2
@@ -130,6 +193,10 @@ if [[ ! -x "${BIN}" ]]; then
 fi
 if [[ ! -f "${LIFECYCLE_HOLDER_HELPER}" || -L "${LIFECYCLE_HOLDER_HELPER}" ]]; then
   echo "error: missing lifecycle holder helper: ${LIFECYCLE_HOLDER_HELPER}" >&2
+  exit 1
+fi
+if [[ ! -f "${IPERF_CHECKER_HELPER}" || -L "${IPERF_CHECKER_HELPER}" ]]; then
+  echo "error: missing iperf checker helper: ${IPERF_CHECKER_HELPER}" >&2
   exit 1
 fi
 
@@ -651,6 +718,76 @@ validate_all_netns_identities() {
     validate_netns_identity "${NSB}" "${NETNS_B_DEV}" "${NETNS_B_INO}" b
 }
 
+validate_named_netns_identity() {
+  local ns="$1"
+
+  case "${ns}" in
+    "${NSA}")
+      validate_netns_identity \
+        "${NSA}" "${NETNS_A_DEV}" "${NETNS_A_INO}" a
+      ;;
+    "${NSR}")
+      validate_netns_identity \
+        "${NSR}" "${NETNS_R_DEV}" "${NETNS_R_INO}" r
+      ;;
+    "${NSB}")
+      validate_netns_identity \
+        "${NSB}" "${NETNS_B_DEV}" "${NETNS_B_INO}" b
+      ;;
+    *)
+      echo "error: command requested unknown network namespace: ${ns}" >&2
+      return 1
+      ;;
+  esac
+}
+
+run_in_owned_netns() {
+  local ns="$1"
+  shift
+
+  if (($# == 0)); then
+    echo "error: empty command requested for network namespace ${ns}" >&2
+    return 1
+  fi
+  validate_named_netns_identity "${ns}" || return 1
+  env -u XOR_PASSWORD ip netns exec "${ns}" env -u XOR_PASSWORD "$@"
+}
+
+run_bounded_in_owned_netns() {
+  local ns="$1"
+  local signal="$2"
+  local duration="$3"
+  shift 3
+
+  if [[ ! "${signal}" =~ ^(TERM|INT)$ ||
+    ! "${duration}" =~ ^[1-9][0-9]*$ || $# -eq 0 ]]; then
+    echo "error: invalid bounded command for network namespace ${ns}" >&2
+    return 1
+  fi
+  # Keep the auditable wrapper process observable before resolving the
+  # namespace pathname. Identity validation then immediately precedes exec.
+  sleep 0.2
+  validate_named_netns_identity "${ns}" || return 1
+  env -u XOR_PASSWORD timeout -s "${signal}" -k 2 "${duration}" \
+    ip netns exec "${ns}" env -u XOR_PASSWORD "$@"
+}
+
+move_link_to_owned_netns() {
+  local link="$1"
+  local ns="$2"
+
+  case "${link}:${ns}" in
+    "${VETH_A}:${NSA}" | "${VETH_RA}:${NSR}" | \
+      "${VETH_B}:${NSB}" | "${VETH_RB}:${NSR}") ;;
+    *)
+      echo "error: invalid link-to-netns move request: link=${link} netns=${ns}" >&2
+      return 1
+      ;;
+  esac
+  validate_named_netns_identity "${ns}" || return 1
+  ip link set "${link}" netns "${ns}"
+}
+
 for ns in "${NSA}" "${NSR}" "${NSB}"; do
   if netns_exists "${ns}"; then
     echo "error: random RUN_ID collision with existing netns ${ns}; refusing cleanup or retry" >&2
@@ -808,9 +945,8 @@ run_agent_in_netns() {
   printf '%q ' "${BIN}" "$@" "${isolated_args[@]}" \
     --run-dir "${run_dir}" --state-dir "${state_dir}" >&2
   printf '\n' >&2
-  env -u XOR_PASSWORD timeout -s TERM -k 2 60 \
-    sh -c 'sleep 0.2; exec "$@"' sh \
-    ip netns exec "${ns}" env -u XOR_PASSWORD "WG_MIX_EBPF_PIN_PATH=${pin}" \
+  run_bounded_in_owned_netns "${ns}" TERM 60 \
+    env -u XOR_PASSWORD "WG_MIX_EBPF_PIN_PATH=${pin}" \
     "${BIN}" "$@" "${isolated_args[@]}" \
     --run-dir "${run_dir}" --state-dir "${state_dir}" &
   AGENT_PID=$!
@@ -1291,7 +1427,8 @@ wait_ping() {
   local target="$2"
 
   for _ in 1 2 3 4 5; do
-    if ip netns exec "${ns}" ping -c 1 -W 2 "${target}" >/dev/null; then
+    if run_in_owned_netns "${ns}" \
+      ping -c 1 -W 2 "${target}" >/dev/null; then
       return 0
     fi
     sleep 1
@@ -1303,7 +1440,8 @@ large_ping() {
   local ns="$1"
   local target="$2"
 
-  ip netns exec "${ns}" ping -c 2 -W 2 -M do -s 1900 "${target}" >/dev/null
+  run_in_owned_netns "${ns}" \
+    ping -c 2 -W 2 -M "do" -s 1900 "${target}" >/dev/null
 }
 
 exercise_tunnel() {
@@ -1387,8 +1525,169 @@ assert_stat_unchanged() {
   fi
 }
 
+print_stat_delta() {
+  local before_path="$1"
+  local after_path="$2"
+  local stat="$3"
+  local before
+  local after
+
+  before="$(stat_value "${before_path}" "${stat}")"
+  after="$(stat_value "${after_path}" "${stat}")"
+  printf 'tcp stat_delta=%s before=%s after=%s delta=%s\n' \
+    "${stat}" "${before}" "${after}" "$((after - before))"
+}
+
+capture_tcp_link_evidence() {
+  local phase="$1"
+  local label="$2"
+  local ns="$3"
+  local link="$4"
+  local prefix="${TMPDIR}/tcp-evidence-${phase}-${label}"
+
+  run_in_owned_netns "${ns}" \
+    ip -details -statistics link show dev "${link}" \
+    >"${prefix}-link.txt"
+  run_in_owned_netns "${ns}" \
+    ethtool -k "${link}" >"${prefix}-offloads.txt"
+}
+
+capture_tcp_netns_evidence() {
+  local phase="$1"
+  local side
+  local ns
+
+  case "${phase}" in
+    before | after | failure) ;;
+    *)
+      echo "error: invalid TCP evidence phase: ${phase}" >&2
+      return 1
+      ;;
+  esac
+  capture_tcp_link_evidence "${phase}" a "${NSA}" under0
+  capture_tcp_link_evidence "${phase}" b "${NSB}" under0
+  capture_tcp_link_evidence "${phase}" router-a "${NSR}" ra0
+  capture_tcp_link_evidence "${phase}" router-b "${NSR}" rb0
+  run_in_owned_netns "${NSA}" wg show wg0 \
+    >"${TMPDIR}/tcp-evidence-${phase}-a-wg.txt"
+  run_in_owned_netns "${NSB}" wg show wg0 \
+    >"${TMPDIR}/tcp-evidence-${phase}-b-wg.txt"
+  for side in a b router; do
+    case "${side}" in
+      a) ns="${NSA}" ;;
+      b) ns="${NSB}" ;;
+      router) ns="${NSR}" ;;
+    esac
+    run_in_owned_netns "${ns}" cat /proc/net/snmp \
+      >"${TMPDIR}/tcp-evidence-${phase}-${side}-snmp.txt"
+    run_in_owned_netns "${ns}" cat /proc/net/netstat \
+      >"${TMPDIR}/tcp-evidence-${phase}-${side}-netstat.txt"
+    run_in_owned_netns "${ns}" ip route show table all \
+      >"${TMPDIR}/tcp-evidence-${phase}-${side}-routes.txt"
+  done
+}
+
+start_tcp_capture() {
+  if [[ -n "${TCPDUMP_RA}" || -n "${TCPDUMP_RB}" ]]; then
+    echo "error: packet capture PID already active before TCP matrix" >&2
+    return 1
+  fi
+  run_bounded_in_owned_netns "${NSR}" INT 30 \
+    tcpdump -s 192 -c "${TCP_CAPTURE_PACKETS}" \
+    -i ra0 -w "${TMPDIR}/tcp-ra.pcap" udp \
+    >/dev/null 2>"${TMPDIR}/tcpdump-tcp-ra.log" &
+  TCPDUMP_RA=$!
+  assert_process_environment_secret_free \
+    "${TCPDUMP_RA}" "tcpdump-ra" || return 1
+  run_bounded_in_owned_netns "${NSR}" INT 30 \
+    tcpdump -s 192 -c "${TCP_CAPTURE_PACKETS}" \
+    -i rb0 -w "${TMPDIR}/tcp-rb.pcap" udp \
+    >/dev/null 2>"${TMPDIR}/tcpdump-tcp-rb.log" &
+  TCPDUMP_RB=$!
+  assert_process_environment_secret_free \
+    "${TCPDUMP_RB}" "tcpdump-rb" || return 1
+}
+
+finish_tcp_capture() {
+  local ra_status=0
+  local rb_status=0
+  local result=0
+
+  if [[ -z "${TCPDUMP_RA}" || -z "${TCPDUMP_RB}" ]]; then
+    echo "error: TCP packet capture PID is missing" >&2
+    return 1
+  fi
+  if wait "${TCPDUMP_RA}"; then
+    ra_status=0
+  else
+    ra_status=$?
+  fi
+  TCPDUMP_RA=""
+  if wait "${TCPDUMP_RB}"; then
+    rb_status=0
+  else
+    rb_status=$?
+  fi
+  TCPDUMP_RB=""
+  printf 'tcp capture finish: ra exit=%s rb exit=%s\n' \
+    "${ra_status}" "${rb_status}"
+  if ((ra_status != 0 && ra_status != 124)); then
+    echo "error: TCP ra0 capture failed unexpectedly: ${ra_status}" >&2
+    result="${ra_status}"
+  fi
+  if ((rb_status != 0 && rb_status != 124)); then
+    echo "error: TCP rb0 capture failed unexpectedly: ${rb_status}" >&2
+    if ((result == 0)); then
+      result="${rb_status}"
+    fi
+  fi
+  return "${result}"
+}
+
+check_tcp_capture() {
+  local checker_status=0
+  local checker_args=()
+
+  if ((XOR_ENABLED)); then
+    checker_args=(
+      --forbid-plain-standard
+      --forbid-plain-mixed
+      --xor-udp2raw-password-file "${SECRET_DIR}/xor-password"
+      --require-xor-mixed transport
+    )
+  else
+    checker_args=(
+      --forbid-standard
+      --require-mixed transport
+    )
+  fi
+  env -u XOR_PASSWORD timeout -s TERM -k 2 30 \
+    sh -c 'sleep 0.2; exec "$@"' sh \
+    python3 "${ROOT}/scripts/check-wg-pcap.py" \
+    "${checker_args[@]}" \
+    "${TMPDIR}/tcp-ra.pcap" "${TMPDIR}/tcp-rb.pcap" \
+    >"${TMPDIR}/tcp-pcap-check.out" \
+    2>"${TMPDIR}/tcp-pcap-check.log" &
+  PCAP_CHECKER_PID=$!
+  assert_process_environment_secret_free \
+    "${PCAP_CHECKER_PID}" "pcap-checker" || return 1
+  if wait "${PCAP_CHECKER_PID}"; then
+    checker_status=0
+  else
+    checker_status=$?
+  fi
+  PCAP_CHECKER_PID=""
+  if ((checker_status != 0)); then
+    echo "error: TCP pcap checker failed (${checker_status})" >&2
+    cat "${TMPDIR}/tcp-pcap-check.log" >&2
+    cat "${TMPDIR}/tcp-pcap-check.out" >&2
+    return "${checker_status}"
+  fi
+  cat "${TMPDIR}/tcp-pcap-check.out"
+}
+
 tcp_server_listening() {
-  env -u XOR_PASSWORD ip netns exec "${NSB}" env -u XOR_PASSWORD \
+  run_in_owned_netns "${NSB}" \
     python3 - "${TCP_PORT}" <<'PY'
 import pathlib
 import sys
@@ -1411,7 +1710,8 @@ PY
 exercise_tcp_run() {
   local mtu="$1"
   local streams="$2"
-  local label="tcp-mtu${mtu}-p${streams}"
+  local direction="$3"
+  local label="tcp-mtu${mtu}-p${streams}-${direction}"
   local client_path="${TMPDIR}/${label}-client.json"
   local client_log="${TMPDIR}/${label}-client.log"
   local server_path="${TMPDIR}/${label}-server.json"
@@ -1420,14 +1720,24 @@ exercise_tcp_run() {
   local client_status=0
   local ready=0
   local attempt
+  local client_direction_args=()
 
-  env -u XOR_PASSWORD timeout -s TERM -k 2 "$((TCP_DURATION + 15))" \
-    sh -c 'sleep 0.2; exec "$@"' sh \
-    ip netns exec "${NSB}" env -u XOR_PASSWORD \
+  case "${direction}" in
+    forward) ;;
+    reverse) client_direction_args=(-R) ;;
+    bidir) client_direction_args=(--bidir) ;;
+    *)
+      echo "error: unsupported TCP direction: ${direction}" >&2
+      return 1
+      ;;
+  esac
+  run_bounded_in_owned_netns \
+    "${NSB}" TERM "$((TCP_DURATION + 15))" \
     iperf3 -s -1 -p "${TCP_PORT}" -J \
     >"${server_path}" 2>"${server_log}" &
   TCP_SERVER_PID=$!
-  assert_process_environment_secret_free "${TCP_SERVER_PID}" "iperf3-server-${label}"
+  assert_process_environment_secret_free \
+    "${TCP_SERVER_PID}" "iperf3-server-${label}" || return 1
 
   for ((attempt = 0; attempt < 50; attempt++)); do
     if tcp_server_listening; then
@@ -1446,14 +1756,14 @@ exercise_tcp_run() {
     return 1
   fi
 
-  env -u XOR_PASSWORD timeout -s TERM -k 2 "$((TCP_DURATION + 15))" \
-    sh -c 'sleep 0.2; exec "$@"' sh \
-    ip netns exec "${NSA}" env -u XOR_PASSWORD \
+  run_bounded_in_owned_netns \
+    "${NSA}" TERM "$((TCP_DURATION + 15))" \
     iperf3 -c 10.77.0.2 -p "${TCP_PORT}" \
-    -t "${TCP_DURATION}" -P "${streams}" -J \
+    -t "${TCP_DURATION}" -P "${streams}" "${client_direction_args[@]}" -J \
     >"${client_path}" 2>"${client_log}" &
   TCP_CLIENT_PID=$!
-  assert_process_environment_secret_free "${TCP_CLIENT_PID}" "iperf3-client-${label}"
+  assert_process_environment_secret_free \
+    "${TCP_CLIENT_PID}" "iperf3-client-${label}" || return 1
   if wait "${TCP_CLIENT_PID}"; then
     client_status=0
   else
@@ -1482,62 +1792,34 @@ exercise_tcp_run() {
     return "${server_status}"
   fi
 
-  env -u XOR_PASSWORD python3 - \
-    "${client_path}" "${streams}" "${TCP_MIN_BYTES}" "${mtu}" <<'PY'
-import json
-import sys
-
-path, expected_streams, minimum_bytes, mtu = sys.argv[1:]
-expected_streams = int(expected_streams)
-minimum_bytes = int(minimum_bytes)
-with open(path, "r", encoding="utf-8") as fh:
-    doc = json.load(fh)
-if doc.get("error"):
-    raise SystemExit(f"{path}: iperf3 error: {doc['error']}")
-end = doc.get("end") or {}
-summary = end.get("sum_received") or {}
-received = int(summary.get("bytes", 0))
-required_total = minimum_bytes * expected_streams
-if received < required_total:
-    raise SystemExit(
-        f"{path}: received {received} bytes, require at least {required_total} "
-        f"for {expected_streams} streams"
-    )
-streams = end.get("streams") or []
-receivers = [stream.get("receiver") or {} for stream in streams]
-if len(receivers) != expected_streams:
-    raise SystemExit(
-        f"{path}: receiver stream count={len(receivers)}, want {expected_streams}"
-    )
-under_minimum = [
-    (index, int(stream.get("bytes", 0)))
-    for index, stream in enumerate(receivers)
-    if int(stream.get("bytes", 0)) < minimum_bytes
-]
-if under_minimum:
-    raise SystemExit(
-        f"{path}: receiver streams below {minimum_bytes} bytes: {under_minimum}"
-    )
-seconds = float(summary.get("seconds", 0.0))
-mbps = received * 8 / seconds / 1_000_000 if seconds > 0 else 0.0
-retransmits = int((end.get("sum_sent") or {}).get("retransmits") or 0)
-print(
-    f"tcp mtu={mtu} streams={expected_streams} received={received} "
-    f"throughput={mbps:.2f}Mbps retransmits={retransmits}"
-)
-PY
+  env -u XOR_PASSWORD python3 "${IPERF_CHECKER_HELPER}" \
+    "${client_path}" \
+    --direction "${direction}" \
+    --streams "${streams}" \
+    --minimum-bytes "${TCP_MIN_BYTES}" \
+    --maximum-retransmits "${TCP_MAX_RETRANSMITS}" \
+    --minimum-fairness "${TCP_MIN_FAIRNESS}"
 }
 
 exercise_tcp_matrix() {
   local mtu
+  local streams
+  local direction
   local side
   local stat
   local before_path
   local after_path
+  local run_status
+  local evidence_status
+  local capture_status
+  local pcap_status
 
+  capture_tcp_netns_evidence before
+  start_tcp_capture
   for mtu in "${TCP_MTU_VALUES[@]}"; do
-    ip -n "${NSA}" link set wg0 mtu "${mtu}"
-    ip -n "${NSB}" link set wg0 mtu "${mtu}"
+    validate_all_netns_identities
+    run_in_owned_netns "${NSA}" ip link set wg0 mtu "${mtu}"
+    run_in_owned_netns "${NSB}" ip link set wg0 mtu "${mtu}"
     wait_ping "${NSA}" 10.77.0.2
     wait_ping "${NSB}" 10.77.0.1
 
@@ -1546,8 +1828,17 @@ exercise_tcp_matrix() {
     run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" \
       >"${TMPDIR}/status-b-tcp-${mtu}-before.json"
 
-    exercise_tcp_run "${mtu}" 1
-    exercise_tcp_run "${mtu}" "${TCP_PARALLEL_STREAMS}"
+    run_status=0
+    for streams in "${TCP_STREAM_VALUES[@]}"; do
+      for direction in "${TCP_DIRECTION_VALUES[@]}"; do
+        if exercise_tcp_run "${mtu}" "${streams}" "${direction}"; then
+          :
+        else
+          run_status=$?
+          break 2
+        fi
+      done
+    done
 
     run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" \
       >"${TMPDIR}/status-a-tcp-${mtu}-after.json"
@@ -1560,21 +1851,76 @@ exercise_tcp_matrix() {
       for stat in \
         egress_bad_type ingress_bad_type \
         egress_bad_length ingress_bad_length \
+        egress_fragment ingress_fragment \
+        egress_ipv6_ext ingress_ipv6_ext \
+        egress_rule_miss ingress_rule_miss \
         checksum_error skb_load_error skb_store_error \
         xor_key_missing xor_len_overflow xor_bad_type_after_decrypt \
         xor_load_error xor_store_error xor_csum_error \
         xor_egress_dispatch_error xor_ingress_dispatch_error \
         ingress_bad_checksum egress_bad_checksum; do
-        assert_stat_unchanged "${before_path}" "${after_path}" "${stat}"
+        if ((run_status == 0)); then
+          assert_stat_unchanged "${before_path}" "${after_path}" "${stat}"
+        else
+          print_stat_delta "${before_path}" "${after_path}" "${stat}"
+        fi
       done
+      if ((run_status != 0)); then
+        continue
+      fi
       assert_stat_increased "${before_path}" "${after_path}" egress_rewrite_ok
       assert_stat_increased "${before_path}" "${after_path}" ingress_rewrite_ok
       if ((XOR_ENABLED)); then
         assert_stat_increased "${before_path}" "${after_path}" xor_egress_ok
         assert_stat_increased "${before_path}" "${after_path}" xor_ingress_ok
       fi
+      if [[ "${TCP_GSO_CHECKS}" != "off" ]]; then
+        for stat in \
+          egress_gso_seen egress_gso_managed_seen egress_gso_rewrite_ok \
+          ingress_gso_seen ingress_gso_listener_hit ingress_gso_rewrite_ok; do
+          print_stat_delta "${before_path}" "${after_path}" "${stat}"
+        done
+      fi
+      if [[ "${TCP_GSO_CHECKS}" == "enforce" ]]; then
+        assert_stat_increased \
+          "${before_path}" "${after_path}" egress_gso_managed_seen
+        assert_stat_increased \
+          "${before_path}" "${after_path}" egress_gso_rewrite_ok
+        assert_stat_increased \
+          "${before_path}" "${after_path}" ingress_gso_listener_hit
+        assert_stat_increased \
+          "${before_path}" "${after_path}" ingress_gso_rewrite_ok
+      fi
     done
+    if ((run_status != 0)); then
+      evidence_status=0
+      capture_status=0
+      pcap_status=0
+      if capture_tcp_netns_evidence failure; then
+        :
+      else
+        evidence_status=$?
+        echo "error: TCP failure-state evidence capture also failed (${evidence_status})" >&2
+      fi
+      if finish_tcp_capture; then
+        :
+      else
+        capture_status=$?
+        echo "error: TCP packet capture finalization also failed (${capture_status})" >&2
+      fi
+      if check_tcp_capture; then
+        :
+      else
+        pcap_status=$?
+        echo "error: TCP packet validation also failed (${pcap_status})" >&2
+      fi
+      echo "error: TCP matrix failed for mtu=${mtu}; retained client/server JSON, logs, and before/after status evidence under ${TMPDIR}" >&2
+      return "${run_status}"
+    fi
   done
+  capture_tcp_netns_evidence after
+  finish_tcp_capture
+  check_tcp_capture
 }
 
 exercise_udp_zero_checksum() {
@@ -1590,18 +1936,19 @@ exercise_udp_zero_checksum() {
     >"${TMPDIR}/status-b-zero-before.json"
 
   # Free the configured WireGuard ports while retaining the already-loaded rules.
-  ip netns exec "${NSA}" wg set wg0 listen-port 0
-  ip netns exec "${NSB}" wg set wg0 listen-port 0
+  run_in_owned_netns "${NSA}" wg set wg0 listen-port 0
+  run_in_owned_netns "${NSB}" wg set wg0 listen-port 0
 
-  gateway_mac="$(ip netns exec "${NSR}" cat /sys/class/net/ra0/address)"
+  gateway_mac="$(
+    run_in_owned_netns "${NSR}" cat /sys/class/net/ra0/address
+  )"
   if [[ -z "${gateway_mac}" ]]; then
     echo "error: could not resolve IPv6 gateway MAC for UDP zero-checksum check" >&2
     return 1
   fi
 
-  env -u XOR_PASSWORD timeout -s TERM -k 2 10 \
-    sh -c 'sleep 0.2; exec "$@"' sh \
-    ip netns exec "${NSB}" env -u XOR_PASSWORD python3 - \
+  run_bounded_in_owned_netns "${NSB}" TERM 10 \
+    python3 - \
     "${A_UNDER}" "${B_UNDER}" "${ready_path}" >"${TMPDIR}/udp-zero-checksum-receiver.out" \
     2>"${receiver_log}" <<'PY' &
 import socket
@@ -1651,8 +1998,8 @@ PY
     return 1
   fi
 
-  env -u XOR_PASSWORD timeout -s TERM -k 2 5 \
-    ip netns exec "${NSA}" env -u XOR_PASSWORD python3 - \
+  run_bounded_in_owned_netns "${NSA}" TERM 5 \
+    python3 - \
     "${A_UNDER}" "${B_UNDER}" "${gateway_mac}" <<'PY'
 import ipaddress
 import socket
@@ -1718,8 +2065,8 @@ PY
     return "${receiver_status}"
   fi
 
-  ip netns exec "${NSA}" wg set wg0 listen-port 31001
-  ip netns exec "${NSB}" wg set wg0 listen-port 31002
+  run_in_owned_netns "${NSA}" wg set wg0 listen-port 31001
+  run_in_owned_netns "${NSB}" wg set wg0 listen-port 31002
 
   run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" \
     >"${TMPDIR}/status-a-zero-after.json"
@@ -1822,22 +2169,22 @@ validate_all_netns_identities
 
 ip link add "${VETH_A}" type veth peer name "${VETH_RA}"
 ip link add "${VETH_B}" type veth peer name "${VETH_RB}"
-ip link set "${VETH_A}" netns "${NSA}"
-ip link set "${VETH_RA}" netns "${NSR}"
-ip link set "${VETH_B}" netns "${NSB}"
-ip link set "${VETH_RB}" netns "${NSR}"
+move_link_to_owned_netns "${VETH_A}" "${NSA}"
+move_link_to_owned_netns "${VETH_RA}" "${NSR}"
+move_link_to_owned_netns "${VETH_B}" "${NSB}"
+move_link_to_owned_netns "${VETH_RB}" "${NSR}"
 
-ip -n "${NSA}" link set lo up
-ip -n "${NSR}" link set lo up
-ip -n "${NSB}" link set lo up
-ip -n "${NSA}" link set "${VETH_A}" name under0
-ip -n "${NSB}" link set "${VETH_B}" name under0
-ip -n "${NSR}" link set "${VETH_RA}" name ra0
-ip -n "${NSR}" link set "${VETH_RB}" name rb0
-ip -n "${NSA}" link set under0 mtu "${UNDERLAY_MTU}"
-ip -n "${NSB}" link set under0 mtu "${UNDERLAY_MTU}"
-ip -n "${NSR}" link set ra0 mtu "${UNDERLAY_MTU}"
-ip -n "${NSR}" link set rb0 mtu "${UNDERLAY_MTU}"
+run_in_owned_netns "${NSA}" ip link set lo up
+run_in_owned_netns "${NSR}" ip link set lo up
+run_in_owned_netns "${NSB}" ip link set lo up
+run_in_owned_netns "${NSA}" ip link set "${VETH_A}" name under0
+run_in_owned_netns "${NSB}" ip link set "${VETH_B}" name under0
+run_in_owned_netns "${NSR}" ip link set "${VETH_RA}" name ra0
+run_in_owned_netns "${NSR}" ip link set "${VETH_RB}" name rb0
+run_in_owned_netns "${NSA}" ip link set under0 mtu "${UNDERLAY_MTU}"
+run_in_owned_netns "${NSB}" ip link set under0 mtu "${UNDERLAY_MTU}"
+run_in_owned_netns "${NSR}" ip link set ra0 mtu "${UNDERLAY_MTU}"
+run_in_owned_netns "${NSR}" ip link set rb0 mtu "${UNDERLAY_MTU}"
 
 if [[ "${OUTER_FAMILY}" == "ipv4" ]]; then
   A_UNDER="192.0.2.1"
@@ -1846,10 +2193,10 @@ if [[ "${OUTER_FAMILY}" == "ipv4" ]]; then
   B_GW="198.51.100.254"
   A_ENDPOINT="${A_UNDER}:31001"
   B_ENDPOINT="${B_UNDER}:31002"
-  ip -n "${NSA}" addr add "${A_UNDER}/24" dev under0
-  ip -n "${NSR}" addr add "${A_GW}/24" dev ra0
-  ip -n "${NSB}" addr add "${B_UNDER}/24" dev under0
-  ip -n "${NSR}" addr add "${B_GW}/24" dev rb0
+  run_in_owned_netns "${NSA}" ip addr add "${A_UNDER}/24" dev under0
+  run_in_owned_netns "${NSR}" ip addr add "${A_GW}/24" dev ra0
+  run_in_owned_netns "${NSB}" ip addr add "${B_UNDER}/24" dev under0
+  run_in_owned_netns "${NSR}" ip addr add "${B_GW}/24" dev rb0
 else
   A_UNDER="2001:db8:77:a::1"
   A_GW="2001:db8:77:a::ff"
@@ -1857,24 +2204,24 @@ else
   B_GW="2001:db8:77:b::ff"
   A_ENDPOINT="[${A_UNDER}]:31001"
   B_ENDPOINT="[${B_UNDER}]:31002"
-  ip -n "${NSA}" addr add "${A_UNDER}/64" dev under0
-  ip -n "${NSR}" addr add "${A_GW}/64" dev ra0
-  ip -n "${NSB}" addr add "${B_UNDER}/64" dev under0
-  ip -n "${NSR}" addr add "${B_GW}/64" dev rb0
+  run_in_owned_netns "${NSA}" ip addr add "${A_UNDER}/64" dev under0
+  run_in_owned_netns "${NSR}" ip addr add "${A_GW}/64" dev ra0
+  run_in_owned_netns "${NSB}" ip addr add "${B_UNDER}/64" dev under0
+  run_in_owned_netns "${NSR}" ip addr add "${B_GW}/64" dev rb0
 fi
-ip -n "${NSA}" link set under0 up
-ip -n "${NSR}" link set ra0 up
-ip -n "${NSB}" link set under0 up
-ip -n "${NSR}" link set rb0 up
+run_in_owned_netns "${NSA}" ip link set under0 up
+run_in_owned_netns "${NSR}" ip link set ra0 up
+run_in_owned_netns "${NSB}" ip link set under0 up
+run_in_owned_netns "${NSR}" ip link set rb0 up
 
 if [[ "${OUTER_FAMILY}" == "ipv4" ]]; then
-  ip netns exec "${NSR}" sysctl -qw net.ipv4.ip_forward=1
-  ip -n "${NSA}" route add default via "${A_GW}" dev under0
-  ip -n "${NSB}" route add default via "${B_GW}" dev under0
+  run_in_owned_netns "${NSR}" sysctl -qw net.ipv4.ip_forward=1
+  run_in_owned_netns "${NSA}" ip route add default via "${A_GW}" dev under0
+  run_in_owned_netns "${NSB}" ip route add default via "${B_GW}" dev under0
 else
-  ip netns exec "${NSR}" sysctl -qw net.ipv6.conf.all.forwarding=1
-  ip -n "${NSA}" -6 route add default via "${A_GW}" dev under0
-  ip -n "${NSB}" -6 route add default via "${B_GW}" dev under0
+  run_in_owned_netns "${NSR}" sysctl -qw net.ipv6.conf.all.forwarding=1
+  run_in_owned_netns "${NSA}" ip -6 route add default via "${A_GW}" dev under0
+  run_in_owned_netns "${NSB}" ip -6 route add default via "${B_GW}" dev under0
 fi
 
 wg genkey >"${SECRET_DIR}/a.key"
@@ -1886,18 +2233,24 @@ chmod 0600 "${SECRET_DIR}/a.key" "${SECRET_DIR}/b.key"
 A_PUB="$(cat "${SECRET_DIR}/a.pub")"
 B_PUB="$(cat "${SECRET_DIR}/b.pub")"
 
-ip -n "${NSA}" link add wg0 type wireguard
-ip -n "${NSB}" link add wg0 type wireguard
-ip -n "${NSA}" link set wg0 mtu "${WG_MTU}"
-ip -n "${NSB}" link set wg0 mtu "${WG_MTU}"
-ip netns exec "${NSA}" wg set wg0 private-key "${SECRET_DIR}/a.key" listen-port 31001 fwmark 0x10000001 peer "${B_PUB}" allowed-ips 10.77.0.2/32 endpoint "${B_ENDPOINT}"
-ip netns exec "${NSB}" wg set wg0 private-key "${SECRET_DIR}/b.key" listen-port 31002 fwmark 0x10000002 peer "${A_PUB}" allowed-ips 10.77.0.1/32 endpoint "${A_ENDPOINT}"
-ip -n "${NSA}" addr add 10.77.0.1/24 dev wg0
-ip -n "${NSB}" addr add 10.77.0.2/24 dev wg0
-ip -n "${NSA}" link set wg0 up
-ip -n "${NSB}" link set wg0 up
-ip -n "${NSA}" route add 10.77.0.2/32 dev wg0
-ip -n "${NSB}" route add 10.77.0.1/32 dev wg0
+run_in_owned_netns "${NSA}" ip link add wg0 type wireguard
+run_in_owned_netns "${NSB}" ip link add wg0 type wireguard
+run_in_owned_netns "${NSA}" ip link set wg0 mtu "${WG_MTU}"
+run_in_owned_netns "${NSB}" ip link set wg0 mtu "${WG_MTU}"
+run_in_owned_netns "${NSA}" \
+  wg set wg0 private-key "${SECRET_DIR}/a.key" listen-port 31001 \
+  fwmark 0x10000001 peer "${B_PUB}" allowed-ips 10.77.0.2/32 \
+  endpoint "${B_ENDPOINT}"
+run_in_owned_netns "${NSB}" \
+  wg set wg0 private-key "${SECRET_DIR}/b.key" listen-port 31002 \
+  fwmark 0x10000002 peer "${A_PUB}" allowed-ips 10.77.0.1/32 \
+  endpoint "${A_ENDPOINT}"
+run_in_owned_netns "${NSA}" ip addr add 10.77.0.1/24 dev wg0
+run_in_owned_netns "${NSB}" ip addr add 10.77.0.2/24 dev wg0
+run_in_owned_netns "${NSA}" ip link set wg0 up
+run_in_owned_netns "${NSB}" ip link set wg0 up
+run_in_owned_netns "${NSA}" ip route add 10.77.0.2/32 dev wg0
+run_in_owned_netns "${NSB}" ip route add 10.77.0.1/32 dev wg0
 
 make_wg_config_stub "${SECRET_DIR}/wg-a.conf" 31001 0x10000001
 make_wg_config_stub "${SECRET_DIR}/wg-b.conf" 31002 0x10000002
@@ -1925,16 +2278,12 @@ if ((XOR_ENABLED)); then
   assert_tail_bank "${PINB}" "${TMPDIR}/status-b-before.json"
 fi
 
-env -u XOR_PASSWORD timeout -s INT -k 2 30 \
-  sh -c 'sleep 0.2; exec "$@"' sh \
-  ip netns exec "${NSR}" env -u XOR_PASSWORD \
+run_bounded_in_owned_netns "${NSR}" INT 30 \
   tcpdump -i ra0 -w "${TMPDIR}/ra.pcap" udp \
   >/dev/null 2>"${TMPDIR}/tcpdump-ra.log" &
 TCPDUMP_RA=$!
 assert_process_environment_secret_free "${TCPDUMP_RA}" "tcpdump-ra"
-env -u XOR_PASSWORD timeout -s INT -k 2 30 \
-  sh -c 'sleep 0.2; exec "$@"' sh \
-  ip netns exec "${NSR}" env -u XOR_PASSWORD \
+run_bounded_in_owned_netns "${NSR}" INT 30 \
   tcpdump -i rb0 -w "${TMPDIR}/rb.pcap" udp \
   >/dev/null 2>"${TMPDIR}/tcpdump-rb.log" &
 TCPDUMP_RB=$!
@@ -1986,12 +2335,12 @@ if ((XOR_ENABLED)); then
     --forbid-plain-standard
     --forbid-plain-mixed
     --xor-udp2raw-password-file "${SECRET_DIR}/xor-password"
-    --require-xor-mixed initiation,response,transport
+    --require-xor-mixed "initiation,response,transport"
   )
 else
   PCAP_CHECKER_ARGS=(
     --forbid-standard
-    --require-mixed initiation,response,transport
+    --require-mixed "initiation,response,transport"
   )
 fi
 env -u XOR_PASSWORD timeout -s TERM -k 2 30 \

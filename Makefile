@@ -101,7 +101,7 @@ test-lint:
 	fi
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet -tags realhosttest ./internal/guard
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh; \
+		shellcheck scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/smoke-netns-wg.sh; \
 	else \
 		echo "skip: shellcheck is unavailable"; \
 	fi

@@ -77,10 +77,35 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.source,
         )
         self.assertGreaterEqual(
-            self.source.count('sh -c \'sleep 0.2; exec "$@"\' sh'),
+            self.source.count("run_bounded_in_owned_netns "),
             7,
         )
-        self.assertGreaterEqual(self.source.count("env -u XOR_PASSWORD"), 12)
+        bounded = self.source[
+            self.source.index("run_bounded_in_owned_netns() {") :
+            self.source.index("\nmove_link_to_owned_netns() {")
+        ]
+        self.assertLess(
+            bounded.index("validate_named_netns_identity"),
+            bounded.index('ip netns exec "${ns}"'),
+        )
+        self.assertLess(
+            bounded.index("sleep 0.2"),
+            bounded.index("validate_named_netns_identity"),
+        )
+        self.assertIn("env -u XOR_PASSWORD", bounded)
+        self.assertNotIn("sh -c", bounded)
+
+        direct_execs = [
+            line.strip()
+            for line in self.lines
+            if 'ip netns exec "${' in line
+            and not line.strip().startswith("print_command ")
+        ]
+        self.assertEqual(2, len(direct_execs))
+        self.assertTrue(
+            all('"${ns}"' in line for line in direct_execs),
+            direct_execs,
+        )
 
     def test_failure_traps_report_only_and_never_mutate_resources(self) -> None:
         failure_report = self.source[
@@ -243,7 +268,7 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.source.index("run_agent_in_netns() {") :
             self.source.index("\nteardown_step() {")
         ]
-        first_exec = runner.index("ip netns exec")
+        first_exec = runner.index("run_bounded_in_owned_netns")
         self.assertLess(
             runner.index(
                 'validate_netns_identity "${NSA}" '
@@ -275,6 +300,97 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertIn("validate_all_netns_identities || return 1", teardown)
         self.assertEqual(teardown.count("delete_owned_netns "), 3)
         self.assertNotIn('teardown_step "delete netns', teardown)
+
+    def test_tcp_matrix_covers_flow_count_direction_and_error_gates(self) -> None:
+        self.assertIn('TCP_STREAMS="${TCP_STREAMS:-1 4 16}"', self.source)
+        self.assertIn(
+            'TCP_DIRECTIONS="${TCP_DIRECTIONS:-forward reverse bidir}"',
+            self.source,
+        )
+        self.assertIn('TCP_MTUS="${TCP_MTUS:-1419 1420 1421 1422}"', self.source)
+
+        run = self.source[
+            self.source.index("exercise_tcp_run() {") :
+            self.source.index("\nexercise_tcp_matrix() {")
+        ]
+        self.assertIn("forward) ;;", run)
+        self.assertIn("reverse) client_direction_args=(-R) ;;", run)
+        self.assertIn("bidir) client_direction_args=(--bidir) ;;", run)
+        self.assertIn('"${IPERF_CHECKER_HELPER}"', run)
+        for option in (
+            "--direction",
+            "--streams",
+            "--minimum-bytes",
+            "--maximum-retransmits",
+            "--minimum-fairness",
+        ):
+            self.assertIn(option, run)
+
+        matrix = self.source[
+            self.source.index("exercise_tcp_matrix() {") :
+            self.source.index("\nexercise_udp_zero_checksum() {")
+        ]
+        self.assertIn(
+            'for streams in "${TCP_STREAM_VALUES[@]}"; do',
+            matrix,
+        )
+        self.assertIn(
+            'for direction in "${TCP_DIRECTION_VALUES[@]}"; do',
+            matrix,
+        )
+        failure = matrix.index("run_status=$?")
+        after_status = matrix.index('status-a-tcp-${mtu}-after.json')
+        failure_return = matrix.index('return "${run_status}"')
+        self.assertLess(failure, after_status)
+        self.assertLess(after_status, failure_return)
+        for stat in (
+            "egress_fragment",
+            "ingress_fragment",
+            "egress_ipv6_ext",
+            "ingress_ipv6_ext",
+            "egress_gso_managed_seen",
+            "egress_gso_rewrite_ok",
+            "ingress_gso_listener_hit",
+            "ingress_gso_rewrite_ok",
+        ):
+            self.assertIn(stat, matrix)
+
+        evidence = self.source[
+            self.source.index("capture_tcp_link_evidence() {") :
+            self.source.index("\ntcp_server_listening() {")
+        ]
+        for command in (
+            "ip -details -statistics link show",
+            "ethtool -k",
+            "wg show wg0",
+            "cat /proc/net/snmp",
+            "cat /proc/net/netstat",
+            "ip route show table all",
+        ):
+            self.assertIn(command, evidence)
+        self.assertIn('tcpdump -s 192 -c "${TCP_CAPTURE_PACKETS}"', evidence)
+        self.assertEqual(
+            2,
+            evidence.count('tcpdump -s 192 -c "${TCP_CAPTURE_PACKETS}"'),
+        )
+        self.assertIn('ra_status != 0 && ra_status != 124', evidence)
+        self.assertIn('rb_status != 0 && rb_status != 124', evidence)
+        self.assertIn("--require-xor-mixed transport", evidence)
+        self.assertIn("--require-mixed transport", evidence)
+        self.assertIn('"${TMPDIR}/tcp-ra.pcap"', evidence)
+        self.assertIn('"${TMPDIR}/tcp-rb.pcap"', evidence)
+        self.assertLess(
+            matrix.index("capture_tcp_netns_evidence before"),
+            matrix.index("start_tcp_capture"),
+        )
+        self.assertLess(
+            matrix.index("start_tcp_capture"),
+            matrix.index('for mtu in "${TCP_MTU_VALUES[@]}"; do'),
+        )
+        self.assertLess(
+            matrix.index("capture_tcp_netns_evidence failure"),
+            matrix.index('return "${run_status}"'),
+        )
 
     def test_success_teardown_holds_shared_lifecycle_until_contract_is_gone(
         self,
