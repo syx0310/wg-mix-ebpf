@@ -68,6 +68,8 @@ func RunWithIO(ctx context.Context, args []string, stdin io.Reader, stdout io.Wr
 		return runStop(ctx, args[1:], stdout)
 	case "bpf-load-test":
 		return runBPFLoadTest(ctx, args[1:], stdout)
+	case isolatedPinOwnershipCommand:
+		return runIsolatedPinOwnershipCommand(ctx, args[1:], stdout)
 	case "validate", "status", "dump", "dump-abi", "reload", "detach", "guard-plan", "guard-apply", "guard-cleanup":
 		return runStateCommand(ctx, cmd, args[1:], stdout)
 	default:
