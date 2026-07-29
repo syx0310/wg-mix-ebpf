@@ -237,7 +237,11 @@ func applyInstall(
 	if err := publication.revalidateOwnedInstallMetadata(); err != nil {
 		return err
 	}
-	if err := installServiceArtifacts(paths, system); err != nil {
+	if err := installServiceArtifacts(
+		paths,
+		system,
+		publication.revalidateOwnedInstallMetadata,
+	); err != nil {
 		return err
 	}
 	if err := publication.revalidateOwnedInstallMetadata(); err != nil {
@@ -262,20 +266,22 @@ func applyInstall(
 	}
 	switch system {
 	case "systemd":
-		if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+		if err := runInstalledSystemdServiceCommit(
+			ctx,
+			paths,
+			opts.Enable,
+			publication.revalidateOwnedInstallMetadata,
+		); err != nil {
 			return err
-		}
-		if err := verifySystemdServiceFragment(ctx, paths); err != nil {
-			return err
-		}
-		if opts.Enable {
-			if err := runCommand(ctx, "systemctl", "enable", "wg-mix-ebpf.service"); err != nil {
-				return err
-			}
 		}
 	case "openwrt":
 		if opts.Enable {
-			if err := runInstalledOpenWrtServiceAction(ctx, paths, "enable"); err != nil {
+			if err := runInstalledOpenWrtServiceAction(
+				ctx,
+				paths,
+				"enable",
+				publication.revalidateOwnedInstallMetadata,
+			); err != nil {
 				return err
 			}
 		}

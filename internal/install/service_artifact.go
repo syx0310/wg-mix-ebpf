@@ -59,12 +59,25 @@ func serviceArtifactInstallSpecs(paths paths, system string) ([]serviceArtifactI
 	return specs, nil
 }
 
-func installServiceArtifacts(paths paths, system string) error {
+func installServiceArtifacts(
+	paths paths,
+	system string,
+	revalidateInstallMetadata func() error,
+) error {
 	specs, err := serviceArtifactInstallSpecs(paths, system)
 	if err != nil {
 		return err
 	}
 	for _, spec := range specs {
+		if revalidateInstallMetadata != nil {
+			if err := revalidateInstallMetadata(); err != nil {
+				return fmt.Errorf(
+					"revalidate install ownership before service artifact %s: %w",
+					spec.artifact.Path,
+					err,
+				)
+			}
+		}
 		if err := installServiceArtifact(spec); err != nil {
 			return err
 		}
@@ -321,6 +334,15 @@ func (artifact *verifiedServiceArtifact) revalidateForExecution() error {
 	if artifact == nil || artifact.file == nil || artifact.entry == nil {
 		return errors.New("cannot execute an unverified service artifact")
 	}
+	if artifact.ownedParent != nil {
+		if err := revalidateManagedCleanupDir(artifact.ownedParent); err != nil {
+			return fmt.Errorf(
+				"refuse service artifact execution: parent identity changed for %s: %w",
+				artifact.entry.path,
+				err,
+			)
+		}
+	}
 	entry := artifact.entry
 	if _, err := artifact.file.Seek(0, io.SeekStart); err != nil {
 		return err
@@ -520,64 +542,174 @@ func runSystemdServiceActions(
 	return nil
 }
 
+func openInstalledServiceArtifact(
+	paths paths,
+	system string,
+	kind string,
+) (*verifiedServiceArtifact, error) {
+	specs, err := serviceArtifactInstallSpecs(paths, system)
+	if err != nil {
+		return nil, err
+	}
+	var selected *serviceArtifactInstallSpec
+	for index := range specs {
+		if specs[index].artifact.Kind == kind {
+			selected = &specs[index]
+			break
+		}
+	}
+	if selected == nil {
+		return nil, fmt.Errorf(
+			"%s install manifest does not declare service artifact kind %q",
+			system,
+			kind,
+		)
+	}
+	parent, exists, err := openDeclaredArtifactParent(
+		filepath.Dir(selected.artifact.Path),
+		selected.defaultParent,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, errors.Join(
+			fmt.Errorf(
+				"service artifact directory %s is missing",
+				filepath.Dir(selected.artifact.Path),
+			),
+			parent.close(),
+		)
+	}
+	file, identity, err := cleanupOpenFileAt(
+		parent.dir,
+		filepath.Base(selected.artifact.Path),
+	)
+	if err != nil {
+		return nil, errors.Join(err, parent.close())
+	}
+	finalIdentity, err := validateServiceArtifactFile(
+		parent.dir,
+		filepath.Base(selected.artifact.Path),
+		file,
+		identity,
+		*selected,
+		false,
+	)
+	if err != nil {
+		return nil, errors.Join(err, file.Close(), parent.close())
+	}
+	return &verifiedServiceArtifact{
+		file: file,
+		entry: &cleanupEntryPlan{
+			parent:      parent.dir,
+			path:        selected.artifact.Path,
+			name:        filepath.Base(selected.artifact.Path),
+			identity:    finalIdentity,
+			digest:      sha256.Sum256(selected.content),
+			digestKnown: true,
+		},
+		ownedParent: parent,
+	}, nil
+}
+
+func runInstalledSystemdServiceCommit(
+	ctx context.Context,
+	paths paths,
+	enable bool,
+	revalidateInstallMetadata func() error,
+) (retErr error) {
+	artifact, err := openInstalledServiceArtifact(
+		paths,
+		"systemd",
+		"systemd-unit",
+	)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err := artifact.close(); err != nil {
+			retErr = errors.Join(retErr, err)
+		}
+	}()
+	revalidate := func(boundary string) error {
+		if err := artifact.revalidateForExecution(); err != nil {
+			return fmt.Errorf(
+				"revalidate installed systemd unit %s: %w",
+				boundary,
+				err,
+			)
+		}
+		return nil
+	}
+	revalidateMetadata := func(boundary string) error {
+		if revalidateInstallMetadata == nil {
+			return nil
+		}
+		if err := revalidateInstallMetadata(); err != nil {
+			return fmt.Errorf(
+				"revalidate install ownership %s: %w",
+				boundary,
+				err,
+			)
+		}
+		return nil
+	}
+	if err := revalidate("before manager reload"); err != nil {
+		return err
+	}
+	if err := revalidateMetadata("before manager reload"); err != nil {
+		return err
+	}
+	if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+		return err
+	}
+	if err := revalidate("after manager reload"); err != nil {
+		return err
+	}
+	if err := revalidateMetadata("after manager reload"); err != nil {
+		return err
+	}
+	if err := verifySystemdServiceFragment(ctx, paths); err != nil {
+		return err
+	}
+	if err := revalidate("after manager inspection"); err != nil {
+		return err
+	}
+	if err := revalidateMetadata("after manager inspection"); err != nil {
+		return err
+	}
+	if !enable {
+		return nil
+	}
+	if err := revalidate("before enable"); err != nil {
+		return err
+	}
+	if err := revalidateMetadata("before enable"); err != nil {
+		return err
+	}
+	if err := runCommand(ctx, "systemctl", "enable", "wg-mix-ebpf.service"); err != nil {
+		return err
+	}
+	if err := revalidate("after enable"); err != nil {
+		return err
+	}
+	return revalidateMetadata("after enable")
+}
+
 func runInstalledOpenWrtServiceAction(
 	ctx context.Context,
 	paths paths,
 	action string,
+	revalidateInstallMetadata func() error,
 ) (retErr error) {
-	specs, err := serviceArtifactInstallSpecs(paths, "openwrt")
-	if err != nil {
-		return err
-	}
-	var initSpec *serviceArtifactInstallSpec
-	for index := range specs {
-		if specs[index].artifact.Kind == "openwrt-init" {
-			initSpec = &specs[index]
-			break
-		}
-	}
-	if initSpec == nil {
-		return errors.New("OpenWrt install manifest does not declare its init script")
-	}
-	parent, exists, err := openDeclaredArtifactParent(
-		filepath.Dir(initSpec.artifact.Path),
-		initSpec.defaultParent,
+	artifact, err := openInstalledServiceArtifact(
+		paths,
+		"openwrt",
+		"openwrt-init",
 	)
 	if err != nil {
 		return err
-	}
-	if !exists {
-		return fmt.Errorf("OpenWrt init script directory %s is missing", filepath.Dir(initSpec.artifact.Path))
-	}
-	file, identity, err := cleanupOpenFileAt(parent.dir, filepath.Base(initSpec.artifact.Path))
-	if err != nil {
-		_ = parent.close()
-		return err
-	}
-	finalIdentity, err := validateServiceArtifactFile(
-		parent.dir,
-		filepath.Base(initSpec.artifact.Path),
-		file,
-		identity,
-		*initSpec,
-		false,
-	)
-	if err != nil {
-		_ = file.Close()
-		_ = parent.close()
-		return err
-	}
-	artifact := &verifiedServiceArtifact{
-		file: file,
-		entry: &cleanupEntryPlan{
-			parent:      parent.dir,
-			path:        initSpec.artifact.Path,
-			name:        filepath.Base(initSpec.artifact.Path),
-			identity:    finalIdentity,
-			digest:      sha256.Sum256(initSpec.content),
-			digestKnown: true,
-		},
-		ownedParent: parent,
 	}
 	defer func() {
 		if err := artifact.close(); err != nil {
@@ -587,7 +719,35 @@ func runInstalledOpenWrtServiceAction(
 	if err := artifact.revalidateForExecution(); err != nil {
 		return err
 	}
-	return runCommandFromVerifiedFile(ctx, artifact.file, action)
+	if revalidateInstallMetadata != nil {
+		if err := revalidateInstallMetadata(); err != nil {
+			return fmt.Errorf(
+				"revalidate install ownership before OpenWrt %s: %w",
+				action,
+				err,
+			)
+		}
+	}
+	if err := runCommandFromVerifiedFile(ctx, artifact.file, action); err != nil {
+		return err
+	}
+	if err := artifact.revalidateForExecution(); err != nil {
+		return fmt.Errorf(
+			"revalidate installed OpenWrt service after %s: %w",
+			action,
+			err,
+		)
+	}
+	if revalidateInstallMetadata != nil {
+		if err := revalidateInstallMetadata(); err != nil {
+			return fmt.Errorf(
+				"revalidate install ownership after OpenWrt %s: %w",
+				action,
+				err,
+			)
+		}
+	}
+	return nil
 }
 
 func runCommandFromVerifiedFile(ctx context.Context, file *os.File, args ...string) error {

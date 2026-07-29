@@ -1309,6 +1309,229 @@ func TestInstallRejectsForeignSystemdFragmentBeforeEnable(t *testing.T) {
 	}
 }
 
+func TestInstallRejectsSystemdUnitSamePathSwapBeforeEnable(t *testing.T) {
+	tests := []struct {
+		name       string
+		marked     bool
+		swapAction string
+	}{
+		{
+			name:       "fresh during daemon reload",
+			swapAction: "daemon-reload",
+		},
+		{
+			name:       "marked during manager inspection",
+			marked:     true,
+			swapAction: "show",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			var layout paths
+			if test.marked {
+				layout = newCleanupTestLayoutForSystem(
+					t,
+					"systemd-swap-marked",
+					"systemd",
+				)
+			} else {
+				layout = cleanupTestPaths(t.TempDir(), "systemd-swap-fresh")
+			}
+			setCleanupTestEnvironment(t, layout)
+
+			markerPath := cleanupManifestPath(layout)
+			var markerData []byte
+			var markerInfo os.FileInfo
+			if test.marked {
+				var err error
+				markerData, err = os.ReadFile(markerPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+				markerInfo, err = os.Stat(markerPath)
+				if err != nil {
+					t.Fatal(err)
+				}
+			}
+
+			commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+			installFakeSystemctl(t, commandLog, "")
+			unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+			foreignContent := []byte(
+				"[Service]\nExecStart=/bin/false\nExecStop=/bin/false\n",
+			)
+			foreignSource := filepath.Join(t.TempDir(), "foreign.service")
+			if err := os.WriteFile(foreignSource, foreignContent, 0o644); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv(
+				"WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_ACTION",
+				test.swapAction,
+			)
+			t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_PATH", unitPath)
+			t.Setenv(
+				"WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_CONTENT",
+				foreignSource,
+			)
+
+			lifecycleRoot := t.TempDir()
+			_, err := Install(
+				lockfile.WithLifecyclePathsForTest(
+					t.Context(),
+					filepath.Join(lifecycleRoot, "daemon.lease"),
+					filepath.Join(lifecycleRoot, "maintenance.gate"),
+				),
+				Options{
+					System: "systemd",
+					Enable: true,
+				},
+			)
+			if err == nil ||
+				!strings.Contains(err.Error(), "revalidate installed systemd unit") {
+				t.Fatalf(
+					"install error = %v, want verified unit identity rejection",
+					err,
+				)
+			}
+			logData, readErr := os.ReadFile(commandLog)
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if strings.Contains(
+				string(logData),
+				"enable wg-mix-ebpf.service",
+			) {
+				t.Fatalf("same-path foreign unit was enabled: %q", logData)
+			}
+			if data, readErr := os.ReadFile(unitPath); readErr != nil ||
+				string(data) != string(foreignContent) {
+				t.Fatalf(
+					"foreign unit replacement changed: data=%q err=%v",
+					data,
+					readErr,
+				)
+			}
+			ownedPath := unitPath + ".owned-original"
+			if data, readErr := os.ReadFile(ownedPath); readErr != nil ||
+				string(data) != systemdUnit(layout.ConfigPath, layout.BinaryPath) {
+				t.Fatalf(
+					"held owned unit changed: data=%q err=%v",
+					data,
+					readErr,
+				)
+			}
+			if test.marked {
+				afterInfo, statErr := os.Stat(markerPath)
+				if statErr != nil {
+					t.Fatalf("marked reinstall lost ownership marker: %v", statErr)
+				}
+				if !os.SameFile(markerInfo, afterInfo) {
+					t.Fatal("marked reinstall replaced ownership marker")
+				}
+				if data, readErr := os.ReadFile(markerPath); readErr != nil ||
+					string(data) != string(markerData) {
+					t.Fatalf(
+						"marked reinstall changed ownership marker: data=%q err=%v",
+						data,
+						readErr,
+					)
+				}
+			} else if _, statErr := os.Lstat(markerPath); !errors.Is(
+				statErr,
+				os.ErrNotExist,
+			) {
+				t.Fatalf("fresh rejected install published ownership: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestMarkedInstallRejectsManifestSamePathSwapBeforeEnable(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"systemd-manifest-swap",
+		"systemd",
+	)
+	setCleanupTestEnvironment(t, layout)
+	markerPath := cleanupManifestPath(layout)
+	markerData, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	markerInfo, err := os.Stat(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacementSource := filepath.Join(t.TempDir(), "replacement-manifest.json")
+	if err := os.WriteFile(replacementSource, markerData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
+	installFakeSystemctl(t, commandLog, "")
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_ACTION", "show")
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_PATH", markerPath)
+	t.Setenv(
+		"WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_CONTENT",
+		replacementSource,
+	)
+
+	lifecycleRoot := t.TempDir()
+	_, err = Install(
+		lockfile.WithLifecyclePathsForTest(
+			t.Context(),
+			filepath.Join(lifecycleRoot, "daemon.lease"),
+			filepath.Join(lifecycleRoot, "maintenance.gate"),
+		),
+		Options{
+			System: "systemd",
+			Enable: true,
+		},
+	)
+	if err == nil ||
+		!strings.Contains(err.Error(), "marked install manifest") {
+		t.Fatalf("install error = %v, want held manifest rejection", err)
+	}
+	logData, readErr := os.ReadFile(commandLog)
+	if readErr != nil {
+		t.Fatal(readErr)
+	}
+	if strings.Contains(string(logData), "enable wg-mix-ebpf.service") {
+		t.Fatalf("manifest swap was authorized to enable service: %q", logData)
+	}
+	originalPath := markerPath + ".owned-original"
+	originalInfo, statErr := os.Stat(originalPath)
+	if statErr != nil {
+		t.Fatalf("held original ownership marker is missing: %v", statErr)
+	}
+	if !os.SameFile(markerInfo, originalInfo) {
+		t.Fatal("held original ownership marker identity changed")
+	}
+	if data, readErr := os.ReadFile(originalPath); readErr != nil ||
+		string(data) != string(markerData) {
+		t.Fatalf(
+			"held original ownership marker changed: data=%q err=%v",
+			data,
+			readErr,
+		)
+	}
+	replacementInfo, statErr := os.Stat(markerPath)
+	if statErr != nil {
+		t.Fatalf("foreign marker replacement is missing: %v", statErr)
+	}
+	if os.SameFile(markerInfo, replacementInfo) {
+		t.Fatal("foreign marker replacement unexpectedly reused held identity")
+	}
+	if data, readErr := os.ReadFile(markerPath); readErr != nil ||
+		string(data) != string(markerData) {
+		t.Fatalf(
+			"installer changed foreign marker replacement: data=%q err=%v",
+			data,
+			readErr,
+		)
+	}
+}
+
 func TestInstallRequiresExplicitAdoptionBeforeWrites(t *testing.T) {
 	layout := newUnmarkedCleanupTestLayout(t, "adoption-required", "unknown")
 	setCleanupTestEnvironment(t, layout)
@@ -2373,6 +2596,45 @@ func TestInstallServiceArtifactReusesValidatedInode(t *testing.T) {
 	}
 }
 
+func TestInstalledServiceArtifactRejectsParentPathSwap(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"install-artifact-parent-swap",
+		"systemd",
+	)
+	if err := installServiceArtifacts(layout, "systemd", nil); err != nil {
+		t.Fatal(err)
+	}
+	artifact, err := openInstalledServiceArtifact(
+		layout,
+		"systemd",
+		"systemd-unit",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer artifact.close()
+
+	originalDir := layout.SystemdDir + ".owned-original"
+	if err := os.Rename(layout.SystemdDir, originalDir); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(layout.SystemdDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service"),
+		[]byte(systemdUnit(layout.ConfigPath, layout.BinaryPath)),
+		0o644,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := artifact.revalidateForExecution(); err == nil ||
+		!strings.Contains(err.Error(), "parent identity changed") {
+		t.Fatalf("artifact revalidation error = %v, want parent rejection", err)
+	}
+}
+
 func TestInstallCreatesServiceArtifactThroughDeclaredDirectory(t *testing.T) {
 	root := t.TempDir()
 	layout := cleanupTestPaths(root, "install-artifact-fresh")
@@ -2776,7 +3038,17 @@ func installFakeSystemctl(t *testing.T, commandLog string, failAction string) {
 	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_NEEDS_RELOAD", "no")
 	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_LOAD_STATE", "loaded")
 	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_TRANSIENT", "no")
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_ACTION", "")
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_PATH", "")
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_CONTENT", "")
 	script := `#!/bin/sh
+if [ -n "$WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_ACTION" ] &&
+	[ "$1" = "$WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_ACTION" ]; then
+	mv "$WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_PATH" \
+		"$WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_PATH.owned-original" || exit
+	cp "$WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_CONTENT" \
+		"$WG_MIX_EBPF_TEST_SYSTEMCTL_SWAP_PATH" || exit
+fi
 if [ "$1" = "show" ]; then
 	printf 'FragmentPath=%s\n' "$WG_MIX_EBPF_TEST_SYSTEMCTL_FRAGMENT"
 	printf 'DropInPaths=%s\n' "$WG_MIX_EBPF_TEST_SYSTEMCTL_DROP_INS"
