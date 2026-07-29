@@ -524,6 +524,45 @@ func TestCleanupDeletesMatchingTableByHandleAndVerifiesAbsence(t *testing.T) {
 	}
 }
 
+func TestCleanupReportsDeleteFailureWhenTableDisappears(t *testing.T) {
+	stateDir := guardTestStateDir(t)
+	owner := seedOwnerRecord(t, stateDir)
+	inspections := 0
+	exec := CommandExecutor{
+		StateDir: stateDir,
+		inspectTable: func(_ context.Context, table string) (tableIdentity, error) {
+			inspections++
+			switch inspections {
+			case 1:
+				if table != TableName {
+					t.Fatalf("first inspection = %q, want legacy table", table)
+				}
+				return tableIdentity{}, nil
+			case 2:
+				if table != owner.Table {
+					t.Fatalf("second inspection = %q, want owned table %q", table, owner.Table)
+				}
+				return tableIdentity{Exists: true, Handle: 61, Comment: owner.Marker}, nil
+			case 3:
+				if table != owner.Table {
+					t.Fatalf("third inspection = %q, want owned table %q", table, owner.Table)
+				}
+				return tableIdentity{}, nil
+			default:
+				t.Fatalf("unexpected inspection %d of %q", inspections, table)
+				return tableIdentity{}, nil
+			}
+		},
+		runScript: func(context.Context, string) error {
+			return errors.New("simulated nft transaction failure")
+		},
+	}
+	err := exec.Cleanup(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "simulated nft transaction failure") {
+		t.Fatalf("cleanup hid a failed nft transaction after the table disappeared: %v", err)
+	}
+}
+
 func seedOwnerRecord(t *testing.T, stateDir string) ownerRecord {
 	t.Helper()
 	exec := CommandExecutor{StateDir: stateDir}
