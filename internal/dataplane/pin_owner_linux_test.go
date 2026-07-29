@@ -2983,12 +2983,15 @@ func TestInspectPinOwnershipDoesNotMutateOwnerIndexOrPins(t *testing.T) {
 	runtime.beforePinUnlink = func(name string) error {
 		return fmt.Errorf("read-only inspection attempted to unlink %s", name)
 	}
+	// The internal API still requires a complete TC dependency set. Since this
+	// owner has no filters, the fake runtime must remain entirely untouched.
+	tcKernel := newFakeTCKernel()
 	status, err := inspectPinOwnershipWithRuntime(
 		t.Context(),
 		pinPath,
 		false,
 		runtime,
-		tcRuntime{},
+		tcKernel.runtime(),
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -3014,6 +3017,16 @@ func TestInspectPinOwnershipDoesNotMutateOwnerIndexOrPins(t *testing.T) {
 			"pin files changed during inspection:\nbefore=%#v\nafter=%#v",
 			pinsBefore,
 			pinsAfter,
+		)
+	}
+	if len(tcKernel.filterLists) != 0 ||
+		len(tcKernel.writes) != 0 ||
+		len(tcKernel.retained) != 0 {
+		t.Fatalf(
+			"read-only inspection touched TC state: lists=%v writes=%v retained=%v",
+			tcKernel.filterLists,
+			tcKernel.writes,
+			tcKernel.retained,
 		)
 	}
 	lockEntries, err := os.ReadDir(runtime.lockRoot)
