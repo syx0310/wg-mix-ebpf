@@ -609,6 +609,48 @@ netns_exists() {
   ip netns list | awk -v wanted="${ns}" '$1 == wanted { found = 1 } END { exit !found }'
 }
 
+validate_netns_identity() {
+  local ns="$1"
+  local expected_device="$2"
+  local expected_inode="$3"
+  local expected_role="$4"
+  local observed_device
+  local observed_inode
+
+  case "${expected_role}:${ns}:${expected_device}:${expected_inode}" in
+    "a:${NSA}:${NETNS_A_DEV}:${NETNS_A_INO}" | \
+      "r:${NSR}:${NETNS_R_DEV}:${NETNS_R_INO}" | \
+      "b:${NSB}:${NETNS_B_DEV}:${NETNS_B_INO}") ;;
+    *)
+      echo "error: invalid network namespace identity request: role=${expected_role} netns=${ns}" >&2
+      return 1
+      ;;
+  esac
+  if [[ ! "${expected_device}" =~ ^[1-9][0-9]*$ ||
+    ! "${expected_inode}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "error: unsealed network namespace identity for ${ns}" >&2
+    return 1
+  fi
+  if ! netns_exists "${ns}" || [[ ! -e "/run/netns/${ns}" || -L "/run/netns/${ns}" ]]; then
+    echo "error: expected owned network namespace is missing or replaceable: ${ns}" >&2
+    return 1
+  fi
+  read -r observed_device observed_inode < <(
+    stat -Lc '%d %i' -- "/run/netns/${ns}"
+  )
+  if [[ "${observed_device}" != "${expected_device}" ||
+    "${observed_inode}" != "${expected_inode}" ]]; then
+    echo "error: network namespace identity changed for ${ns}: expected=${expected_device}:${expected_inode} observed=${observed_device}:${observed_inode}" >&2
+    return 1
+  fi
+}
+
+validate_all_netns_identities() {
+  validate_netns_identity "${NSA}" "${NETNS_A_DEV}" "${NETNS_A_INO}" a &&
+    validate_netns_identity "${NSR}" "${NETNS_R_DEV}" "${NETNS_R_INO}" r &&
+    validate_netns_identity "${NSB}" "${NETNS_B_DEV}" "${NETNS_B_INO}" b
+}
+
 for ns in "${NSA}" "${NSR}" "${NSB}"; do
   if netns_exists "${ns}"; then
     echo "error: random RUN_ID collision with existing netns ${ns}; refusing cleanup or retry" >&2
@@ -732,11 +774,15 @@ run_agent_in_netns() {
       expected_pin="${PINA}"
       run_dir="${RUN_DIR_A}"
       state_dir="${STATE_DIR_A}"
+      validate_netns_identity "${NSA}" "${NETNS_A_DEV}" "${NETNS_A_INO}" a ||
+        return 1
       ;;
     "${NSB}")
       expected_pin="${PINB}"
       run_dir="${RUN_DIR_B}"
       state_dir="${STATE_DIR_B}"
+      validate_netns_identity "${NSB}" "${NETNS_B_DEV}" "${NETNS_B_INO}" b ||
+        return 1
       ;;
     *)
       echo "error: no isolated run/state directories for netns ${ns}" >&2
@@ -818,6 +864,19 @@ remove_owned_file() {
     return 1
   fi
   teardown_step "remove exact file ${path}" rm -- "${path}"
+}
+
+delete_owned_netns() {
+  local ns="$1"
+  local expected_device="$2"
+  local expected_inode="$3"
+  local expected_role="$4"
+
+  validate_netns_identity \
+    "${ns}" "${expected_device}" "${expected_inode}" "${expected_role}" ||
+    return 1
+  teardown_step "delete owned netns ${ns} identity=${expected_device}:${expected_inode}" \
+    ip netns delete "${ns}"
 }
 
 validate_released_pin_lock() {
@@ -1062,6 +1121,7 @@ explicit_teardown() {
   validate_marker "${PIN_OWNER_ROOT}" pin-owners || return 1
   validate_manifest || return 1
   validate_private_bpffs_mount || return 1
+  validate_all_netns_identities || return 1
   if [[ -n "${AGENT_PID}" || -n "${PCAP_CHECKER_PID}" ||
     -n "${LIFECYCLE_HOLDER_PID}" ||
     -n "${TCPDUMP_RA}" || -n "${TCPDUMP_RB}" ||
@@ -1127,9 +1187,9 @@ explicit_teardown() {
   teardown_step "remove empty sensitive directory ${SECRET_DIR}" \
     rmdir -- "${SECRET_DIR}" || return 1
 
-  teardown_step "delete netns ${NSA}" ip netns delete "${NSA}" || return 1
-  teardown_step "delete netns ${NSR}" ip netns delete "${NSR}" || return 1
-  teardown_step "delete netns ${NSB}" ip netns delete "${NSB}" || return 1
+  delete_owned_netns "${NSA}" "${NETNS_A_DEV}" "${NETNS_A_INO}" a || return 1
+  delete_owned_netns "${NSR}" "${NETNS_R_DEV}" "${NETNS_R_INO}" r || return 1
+  delete_owned_netns "${NSB}" "${NETNS_B_DEV}" "${NETNS_B_INO}" b || return 1
   validate_private_bpffs_mount || return 1
   teardown_step "unmount exact bpffs ${BPFFS_DIR}" \
     umount -- "${BPFFS_DIR}" || return 1
@@ -1758,6 +1818,7 @@ if [[ "${NETNS_A_DEV}:${NETNS_A_INO}" == "${NETNS_R_DEV}:${NETNS_R_INO}" ||
   echo "error: network namespace identities are not unique" >&2
   exit 1
 fi
+validate_all_netns_identities
 
 ip link add "${VETH_A}" type veth peer name "${VETH_RA}"
 ip link add "${VETH_B}" type veth peer name "${VETH_RB}"

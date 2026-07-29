@@ -221,6 +221,61 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         ):
             self.assertIn(field, self.source)
 
+    def test_netns_identity_is_revalidated_before_use_and_delete(self) -> None:
+        validator = self.source[
+            self.source.index("validate_netns_identity() {") :
+            self.source.index("\nvalidate_all_netns_identities() {")
+        ]
+        self.assertIn("netns_exists", validator)
+        self.assertIn("stat -Lc '%d %i'", validator)
+        self.assertIn('[[ ! -e "/run/netns/${ns}"', validator)
+        self.assertIn('-L "/run/netns/${ns}"', validator)
+        self.assertIn(
+            '"${observed_device}" != "${expected_device}"',
+            validator,
+        )
+        self.assertIn(
+            '"${observed_inode}" != "${expected_inode}"',
+            validator,
+        )
+
+        runner = self.source[
+            self.source.index("run_agent_in_netns() {") :
+            self.source.index("\nteardown_step() {")
+        ]
+        first_exec = runner.index("ip netns exec")
+        self.assertLess(
+            runner.index(
+                'validate_netns_identity "${NSA}" '
+                '"${NETNS_A_DEV}" "${NETNS_A_INO}" a'
+            ),
+            first_exec,
+        )
+        self.assertLess(
+            runner.index(
+                'validate_netns_identity "${NSB}" '
+                '"${NETNS_B_DEV}" "${NETNS_B_INO}" b'
+            ),
+            first_exec,
+        )
+
+        delete = self.source[
+            self.source.index("delete_owned_netns() {") :
+            self.source.index("\nvalidate_released_pin_lock() {")
+        ]
+        self.assertLess(
+            delete.index("validate_netns_identity"),
+            delete.index('ip netns delete "${ns}"'),
+        )
+
+        teardown = self.source[
+            self.source.index("explicit_teardown() {") :
+            self.source.index("\nmake_agent_config() {")
+        ]
+        self.assertIn("validate_all_netns_identities || return 1", teardown)
+        self.assertEqual(teardown.count("delete_owned_netns "), 3)
+        self.assertNotIn('teardown_step "delete netns', teardown)
+
     def test_success_teardown_holds_shared_lifecycle_until_contract_is_gone(
         self,
     ) -> None:
