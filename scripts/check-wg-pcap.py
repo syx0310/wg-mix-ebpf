@@ -68,6 +68,8 @@ class PacketRecord:
     icmp_id: int | None
     icmp_sequence: int | None
     payload_len: int
+    captured_payload_len: int
+    capture_truncated: bool
     type_word: int | None
     word_class: str
     kind: str | None
@@ -198,7 +200,7 @@ def parse_udp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) -
             return None
         ip_header = pkt[ip_offset : ip_offset + ihl]
         total_len = int.from_bytes(pkt[ip_offset + 2 : ip_offset + 4], "big")
-        if total_len < ihl or len(pkt) < ip_offset + total_len:
+        if total_len < ihl:
             return None
         if pkt[ip_offset + 9] != IPPROTO_UDP:
             return None
@@ -207,7 +209,7 @@ def parse_udp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) -
             return None
         udp_offset = ip_offset + ihl
         udp_limit = ip_offset + total_len
-        if udp_limit < udp_offset + 8:
+        if udp_limit < udp_offset + 8 or len(pkt) < udp_offset + 8:
             return None
         family = 4
         src_raw = pkt[ip_offset + 12 : ip_offset + 16]
@@ -229,7 +231,7 @@ def parse_udp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) -
             return None
         udp_offset = ip_offset + 40
         udp_limit = udp_offset + payload_len
-        if udp_limit < udp_offset + 8 or len(pkt) < udp_limit:
+        if udp_limit < udp_offset + 8 or len(pkt) < udp_offset + 8:
             return None
         family = 6
         src_raw = pkt[ip_offset + 8 : ip_offset + 24]
@@ -243,15 +245,23 @@ def parse_udp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) -
         return None
 
     udp_len = int.from_bytes(pkt[udp_offset + 4 : udp_offset + 6], "big")
-    if udp_len < 8 or udp_offset + udp_len > udp_limit or udp_offset + udp_len > len(pkt):
+    if udp_len < 8 or udp_offset + udp_len > udp_limit:
         return None
-    udp_segment = pkt[udp_offset : udp_offset + udp_len]
+    declared_packet_end = udp_offset + udp_len
+    captured_packet_end = min(len(pkt), declared_packet_end)
+    udp_segment = pkt[udp_offset:captured_packet_end]
     payload = udp_segment[8:]
+    declared_payload_len = udp_len - 8
+    capture_truncated = (
+        len(pkt) < udp_limit or captured_packet_end < declared_packet_end
+    )
     sport = int.from_bytes(udp_segment[0:2], "big")
     dport = int.from_bytes(udp_segment[2:4], "big")
     checksum_field = int.from_bytes(udp_segment[6:8], "big")
 
-    if checksum_field == 0 and family == 4:
+    if capture_truncated:
+        udp_checksum = "unverified"
+    elif checksum_field == 0 and family == 4:
         udp_checksum = "zero"
     elif checksum_field == 0 and family == 6:
         udp_checksum = "invalid"
@@ -264,7 +274,9 @@ def parse_udp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) -
 
     word = int.from_bytes(payload[:4], "little") if len(payload) >= 4 else None
     word_class, kind = classify_type_word(word)
-    length_valid = valid_wireguard_length(kind, len(payload)) if kind else None
+    length_valid = (
+        valid_wireguard_length(kind, declared_payload_len) if kind else None
+    )
 
     return PacketRecord(
         file=str(path),
@@ -279,7 +291,9 @@ def parse_udp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) -
         icmp_code=None,
         icmp_id=None,
         icmp_sequence=None,
-        payload_len=len(payload),
+        payload_len=declared_payload_len,
+        captured_payload_len=len(payload),
+        capture_truncated=capture_truncated,
         type_word=word,
         word_class=word_class,
         kind=kind,
@@ -353,6 +367,8 @@ def parse_icmp_record(path: Path, packet_index: int, linktype: int, pkt: bytes) 
         icmp_id=int.from_bytes(icmp_segment[4:6], "big"),
         icmp_sequence=int.from_bytes(icmp_segment[6:8], "big"),
         payload_len=len(payload),
+        captured_payload_len=len(payload),
+        capture_truncated=False,
         type_word=word,
         word_class=word_class,
         kind=kind,
@@ -466,6 +482,7 @@ def summarize(records: list[PacketRecord], max_examples: int) -> dict:
         "udp_valid": 0,
         "udp_invalid": 0,
         "udp_zero": 0,
+        "udp_unverified": 0,
         "icmp_valid": 0,
         "icmp_invalid": 0,
     }
@@ -500,6 +517,8 @@ def summarize(records: list[PacketRecord], max_examples: int) -> dict:
             checksum["udp_invalid"] += 1
         elif record.udp_checksum == "zero":
             checksum["udp_zero"] += 1
+        elif record.udp_checksum == "unverified":
+            checksum["udp_unverified"] += 1
 
         if record.icmp_checksum == "valid":
             checksum["icmp_valid"] += 1
@@ -524,6 +543,8 @@ def summarize(records: list[PacketRecord], max_examples: int) -> dict:
                     "family": record.family,
                     "flow": flow,
                     "payload_len": record.payload_len,
+                    "captured_payload_len": record.captured_payload_len,
+                    "capture_truncated": record.capture_truncated,
                     "type_word": f"0x{record.type_word:08x}" if record.type_word is not None else None,
                     "class": record.word_class,
                     "kind": record.kind,
@@ -549,6 +570,8 @@ def summarize(records: list[PacketRecord], max_examples: int) -> dict:
                     "family": record.family,
                     "flow": flow,
                     "payload_len": record.payload_len,
+                    "captured_payload_len": record.captured_payload_len,
+                    "capture_truncated": record.capture_truncated,
                     "type_word": f"0x{record.xor_type_word:08x}" if record.xor_type_word is not None else None,
                     "class": "xor-" + record.xor_word_class,
                     "kind": record.xor_kind,
@@ -578,6 +601,9 @@ def summarize(records: list[PacketRecord], max_examples: int) -> dict:
         "xor_mixed_type_words": xor_mixed_total,
         "xor_standard_type_words": xor_standard_total,
         "unknown_type_words": unknown,
+        "truncated_packets": sum(
+            1 for record in records if record.capture_truncated
+        ),
         "mixed_by_kind": mixed_by_kind,
         "standard_by_kind": standard_by_kind,
         "xor_mixed_by_kind": xor_mixed_by_kind,
@@ -679,6 +705,14 @@ def main() -> int:
 
     if args.require_valid_udp_checksum and summary["checksums"]["udp_invalid"]:
         failures.append(f"invalid UDP checksums: {summary['checksums']['udp_invalid']}")
+    if (
+        args.require_valid_udp_checksum
+        and summary["checksums"]["udp_unverified"]
+    ):
+        failures.append(
+            "unverified UDP checksums: "
+            f"{summary['checksums']['udp_unverified']}"
+        )
 
     if args.require_valid_icmp_checksum and summary["checksums"]["icmp_invalid"]:
         failures.append(f"invalid ICMP checksums: {summary['checksums']['icmp_invalid']}")
@@ -698,7 +732,9 @@ def main() -> int:
                 "udp_packets={udp_packets} pcap_udp_payload_words={pcap_udp_payload_words} "
                 "mixed_type_words={mixed_type_words} standard_type_words={standard_type_words} "
                 "xor_mixed_type_words={xor_mixed_type_words} xor_standard_type_words={xor_standard_type_words} "
-                "unknown_type_words={unknown_type_words}".format(**summary)
+                "unknown_type_words={unknown_type_words} truncated_packets={truncated_packets}".format(
+                    **summary
+                )
             )
         if args.protocol in ("icmp", "any") or summary["icmp_packets"]:
             print(
@@ -730,7 +766,8 @@ def main() -> int:
             )
         if args.protocol in ("udp", "any") or summary["udp_packets"]:
             print(
-                "udp_checksum_valid={udp_valid} udp_checksum_invalid={udp_invalid} udp_checksum_zero={udp_zero}".format(
+                "udp_checksum_valid={udp_valid} udp_checksum_invalid={udp_invalid} "
+                "udp_checksum_zero={udp_zero} udp_checksum_unverified={udp_unverified}".format(
                     **summary["checksums"]
                 )
             )
