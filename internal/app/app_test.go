@@ -101,8 +101,9 @@ func TestGuardCleanupDryRun(t *testing.T) {
 	if err := Run(t.Context(), []string{"guard-cleanup", "--config", cfgPath, "--offline", "--dry-run"}, &stdout, &stderr); err != nil {
 		t.Fatalf("Run returned error: %v stderr=%s", err, stderr.String())
 	}
-	if !bytes.Contains(stdout.Bytes(), []byte("delete table inet wg_mix_ebpf_guard")) {
-		t.Fatalf("guard cleanup dry-run missing cleanup script: %s", stdout.String())
+	if !bytes.Contains(stdout.Bytes(), []byte("delete table inet handle <validated-handle>")) ||
+		bytes.Contains(stdout.Bytes(), []byte("delete table inet wg_mix_ebpf_guard")) {
+		t.Fatalf("guard cleanup dry-run must require validated ownership: %s", stdout.String())
 	}
 }
 

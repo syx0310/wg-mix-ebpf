@@ -164,7 +164,7 @@ func configuredGuardExecutor(opts Options) guard.Executor {
 	if opts.deps != nil && opts.deps.guardExecutor != nil {
 		return opts.deps.guardExecutor
 	}
-	return guard.NewCommandExecutor()
+	return guard.NewCommandExecutor(opts.StateDir)
 }
 
 func configuredDataplaneLoader(opts Options) dataplane.Loader {
