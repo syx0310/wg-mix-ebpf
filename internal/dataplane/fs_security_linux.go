@@ -331,6 +331,86 @@ func openAnchoredRegularFile(
 	return file, identity, created, nil
 }
 
+func openExistingAnchoredRegularFile(
+	root *anchoredDirectoryPath,
+	name string,
+	mode uint32,
+	expectedUID uint32,
+) (*os.File, pinPathInodeIdentity, error) {
+	if root == nil || root.FD() < 0 {
+		return nil, pinPathInodeIdentity{}, errors.New("regular-file root is unavailable")
+	}
+	if name == "" || filepath.Base(name) != name || name == "." || name == ".." {
+		return nil, pinPathInodeIdentity{}, fmt.Errorf("unsafe regular-file name %q", name)
+	}
+	if err := root.Recheck(); err != nil {
+		return nil, pinPathInodeIdentity{}, err
+	}
+	fd, err := unix.Openat(
+		root.FD(),
+		name,
+		unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return nil, pinPathInodeIdentity{}, err
+	}
+	file := os.NewFile(uintptr(fd), filepath.Join(root.path, name))
+	identity, err := validateAnchoredRegularFile(
+		root,
+		name,
+		fd,
+		mode,
+		expectedUID,
+		nil,
+	)
+	if err != nil {
+		_ = file.Close()
+		return nil, pinPathInodeIdentity{}, err
+	}
+	return file, identity, nil
+}
+
+func createAnchoredRegularFileExclusive(
+	root *anchoredDirectoryPath,
+	name string,
+	mode uint32,
+	expectedUID uint32,
+) (*os.File, pinPathInodeIdentity, error) {
+	if root == nil || root.FD() < 0 {
+		return nil, pinPathInodeIdentity{}, errors.New("regular-file root is unavailable")
+	}
+	if name == "" || filepath.Base(name) != name || name == "." || name == ".." {
+		return nil, pinPathInodeIdentity{}, fmt.Errorf("unsafe regular-file name %q", name)
+	}
+	if err := root.Recheck(); err != nil {
+		return nil, pinPathInodeIdentity{}, err
+	}
+	fd, err := unix.Openat(
+		root.FD(),
+		name,
+		unix.O_CREAT|unix.O_EXCL|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		mode,
+	)
+	if err != nil {
+		return nil, pinPathInodeIdentity{}, err
+	}
+	file := os.NewFile(uintptr(fd), filepath.Join(root.path, name))
+	identity, err := validateAnchoredRegularFile(
+		root,
+		name,
+		fd,
+		mode,
+		expectedUID,
+		nil,
+	)
+	if err != nil {
+		_ = file.Close()
+		return nil, pinPathInodeIdentity{}, err
+	}
+	return file, identity, nil
+}
+
 func validateAnchoredRegularFile(
 	root *anchoredDirectoryPath,
 	name string,

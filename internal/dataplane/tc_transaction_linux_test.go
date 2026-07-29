@@ -488,3 +488,103 @@ func TestTCAttachTransactionRefusesRollbackAfterFilterSwap(t *testing.T) {
 		t.Fatalf("foreign replacement program = %d, want preserved 99", got)
 	}
 }
+
+func TestTCAttachTransactionIncludesOwnedStaleDeletesAndRollback(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		failWrite  int
+		commitErr  error
+		wantOldIDs bool
+	}{
+		{
+			name:       "success",
+			wantOldIDs: false,
+		},
+		{
+			name:       "second delete failure",
+			failWrite:  2,
+			wantOldIDs: true,
+		},
+		{
+			name:       "commit failure",
+			commitErr:  errors.New("commit failed"),
+			wantOldIDs: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			kernel := newFakeTCKernel(11)
+			kernel.addProgram(21, 201)
+			kernel.addProgram(22, 202)
+			kernel.addProgram(31, 301)
+			kernel.addProgram(32, 302)
+			kernel.addClsact(11)
+			kernel.addManagedFilter(11, canonicalTCFilterSlots()[0], 21)
+			kernel.addManagedFilter(11, canonicalTCFilterSlots()[1], 22)
+
+			plan, err := prepareTCAttachPlan(
+				testTCState(),
+				tcProgramIdentity{fd: 301, id: 31},
+				tcProgramIdentity{fd: 302, id: 32},
+				kernel.runtime(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer plan.Close()
+			active := []tcFilterBinding{
+				{
+					IfIndex:   11,
+					Direction: "ingress",
+					Parent:    netlink.HANDLE_MIN_INGRESS,
+					Handle:    ingressHandle,
+					Priority:  filterPriority,
+					ProgramID: 21,
+				},
+				{
+					IfIndex:   11,
+					Direction: "egress",
+					Parent:    netlink.HANDLE_MIN_EGRESS,
+					Handle:    egressHandle,
+					Priority:  filterPriority,
+					ProgramID: 22,
+				},
+			}
+			if err := plan.ValidatePreviousBindings(active, false); err != nil {
+				t.Fatal(err)
+			}
+			if err := plan.AddOwnedStaleRemovals(active); err != nil {
+				t.Fatal(err)
+			}
+			kernel.failWrite = test.failWrite
+			err = plan.Execute(func() error { return test.commitErr })
+			if test.wantOldIDs {
+				if err == nil {
+					t.Fatal("stale-delete transaction unexpectedly succeeded")
+				}
+				if got := kernel.managedProgramID(
+					t,
+					11,
+					canonicalTCFilterSlots()[0],
+				); got != 21 {
+					t.Fatalf("restored ingress program = %d, want 21", got)
+				}
+				if got := kernel.managedProgramID(
+					t,
+					11,
+					canonicalTCFilterSlots()[1],
+				); got != 22 {
+					t.Fatalf("restored egress program = %d, want 22", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, slot := range canonicalTCFilterSlots() {
+				if got := kernel.managedProgramID(t, 11, slot); got != 0 {
+					t.Fatalf("stale %s program remains: %d", slot.name, got)
+				}
+			}
+		})
+	}
+}

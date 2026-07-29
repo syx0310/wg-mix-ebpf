@@ -10,7 +10,6 @@ import (
 	"path/filepath"
 
 	"github.com/cilium/ebpf"
-	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/vishvananda/netlink"
 )
@@ -20,7 +19,7 @@ func inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
 		return nil, err
 	}
 	status := &KernelStatus{PinPath: pinPathFromEnv("")}
-	if err := inspectPinnedMaps(status); err != nil {
+	if err := inspectPinnedMaps(ctx, status); err != nil {
 		status.MapError = err.Error()
 	}
 	for _, u := range state.Underlays {
@@ -67,41 +66,92 @@ func inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
 	return status, nil
 }
 
-func inspectPinnedMaps(status *KernelStatus) error {
-	validated, err := validatePinPath(status.PinPath, livePinPathValidator)
+func inspectPinnedMaps(ctx context.Context, status *KernelStatus) error {
+	runtime := LinuxLoader{}.pinRuntime(ctx)
+	validated, err := validatePinPath(status.PinPath, runtime.validator)
 	if err != nil {
 		return err
 	}
 	if !validated.exists {
 		return nil
 	}
-	handle, _, err := openPinPathHandle(status.PinPath, validated, false, livePinPathRuntime)
+	parent, err := openPinPathParent(status.PinPath, validated, runtime)
 	if err != nil {
 		return err
 	}
+	defer parent.Close()
+	lock, err := acquirePinPathLock(ctx, parent.resource, "status", runtime)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	validated, err = validatePinPath(status.PinPath, runtime.validator)
+	if err != nil {
+		return err
+	}
+	handle, _, err := openPinPathHandleFromParent(parent, validated, false)
+	if err != nil {
+		return err
+	}
+	if handle == nil {
+		return nil
+	}
 	defer handle.Close()
 
-	control, err := ebpf.LoadPinnedMap(filepath.Join(handle.procPath(), "control_map"), nil)
+	store, err := openPinOwnerStoreWithPolicy(
+		runtime,
+		handle.resource,
+		false,
+		false,
+	)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return nil
-		}
-		return fmt.Errorf("load pinned control_map: %w", err)
+		return fmt.Errorf("open persistent BPF pin owner: %w", err)
 	}
-	defer control.Close()
-
-	var controlValue abi.ControlValue
-	if err := control.Lookup(abi.ControlKeyGlobal, &controlValue); err != nil {
-		if !errors.Is(err, ebpf.ErrKeyNotExist) {
-			return fmt.Errorf("lookup control_map: %w", err)
-		}
-	} else {
-		status.ActiveGeneration = controlValue.ActiveGeneration
-		status.ABIVersion = controlValue.ABIVersion
-		if controlValue.ABIVersion != abi.Version {
-			return fmt.Errorf("control_map ABI version = %d, want %d", controlValue.ABIVersion, abi.Version)
-		}
+	defer store.Close()
+	record, exists, err := store.LoadOptional(handle.mountID)
+	if err != nil {
+		return err
 	}
+	if !exists {
+		return errors.New("BPF pins have no persistent owner record")
+	}
+	if record.Phase != pinOwnerPhaseActive ||
+		record.Step != pinOwnerStepReady {
+		return fmt.Errorf(
+			"BPF owner transaction is %s/%s at sequence %d; status is not steady",
+			record.Phase, record.Step, record.Sequence,
+		)
+	}
+	if err := validateOwnerDirectoryEntries(handle, record); err != nil {
+		return err
+	}
+	pins, err := inspectPinnedMapSet(handle, true)
+	if err != nil {
+		return err
+	}
+	defer closePinnedMapPins(pins)
+	if err := validateOwnerPins(handle, record, pins, true); err != nil {
+		return err
+	}
+	controlValue, err := ownerControlValue(pins)
+	if err != nil {
+		return err
+	}
+	if err := validateOwnerControlGeneration(
+		pins,
+		record.ActiveGeneration,
+	); err != nil {
+		return err
+	}
+	if err := validateOwnerTCExact(
+		record.ActiveFilters,
+		record.ActiveFilters,
+		liveTCRuntime,
+	); err != nil {
+		return err
+	}
+	status.ActiveGeneration = controlValue.ActiveGeneration
+	status.ABIVersion = controlValue.ABIVersion
 
 	stats, err := ebpf.LoadPinnedMap(filepath.Join(handle.procPath(), "stats_map"), nil)
 	if err != nil {

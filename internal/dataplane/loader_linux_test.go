@@ -1351,6 +1351,9 @@ func writeCanonicalMockPins(t *testing.T, pinPath string) *fakePinnedMapStore {
 				ABIVersion:       abi.Version,
 			}
 		}
+		if descriptor.name == "owner_map" {
+			observation.ownerSeen = true
+		}
 		store.observations[descriptor.name] = observation
 	}
 	return store

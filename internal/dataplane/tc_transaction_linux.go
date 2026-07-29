@@ -72,24 +72,31 @@ type tcLinkAttachPlan struct {
 type tcAttachPlan struct {
 	runtime tcRuntime
 	links   []tcLinkAttachPlan
+	stale   []tcOwnedStaleFilter
 	ingress tcProgramIdentity
 	egress  tcProgramIdentity
 	closed  bool
 }
 
 type tcFilterBinding struct {
-	IfIndex   int
-	Direction string
-	Parent    uint32
-	Handle    uint32
-	Priority  uint16
-	ProgramID uint32
+	IfIndex   int    `json:"ifindex"`
+	Direction string `json:"direction"`
+	Parent    uint32 `json:"parent"`
+	Handle    uint32 `json:"handle"`
+	Priority  uint16 `json:"priority"`
+	ProgramID uint32 `json:"program_id"`
 }
 
 type tcAppliedFilter struct {
 	link     netlink.Link
 	snapshot tcFilterSnapshot
 	program  tcProgramIdentity
+}
+
+type tcOwnedStaleFilter struct {
+	key      string
+	link     netlink.Link
+	snapshot tcFilterSnapshot
 }
 
 func tcProgramIdentityFromProgram(program *ebpf.Program) (tcProgramIdentity, error) {
@@ -348,6 +355,151 @@ func (plan *tcAttachPlan) Bindings() []tcFilterBinding {
 	return bindings
 }
 
+func (plan *tcAttachPlan) ObservedBindings() []tcFilterBinding {
+	if plan == nil {
+		return nil
+	}
+	var bindings []tcFilterBinding
+	for _, linkPlan := range plan.links {
+		for _, snapshot := range linkPlan.filters {
+			if !snapshot.existed {
+				continue
+			}
+			direction := "ingress"
+			if snapshot.slot.parent == netlink.HANDLE_MIN_EGRESS {
+				direction = "egress"
+			}
+			bindings = append(bindings, tcFilterBinding{
+				IfIndex:   linkPlan.ifindex,
+				Direction: direction,
+				Parent:    snapshot.slot.parent,
+				Handle:    snapshot.slot.handle,
+				Priority:  filterPriority,
+				ProgramID: snapshot.programID,
+			})
+		}
+	}
+	sortTCFilterBindings(bindings)
+	return bindings
+}
+
+func (plan *tcAttachPlan) ValidatePreviousBindings(
+	active []tcFilterBinding,
+	fresh bool,
+) error {
+	if plan == nil {
+		return errors.New("TC attach plan is nil")
+	}
+	bySlot := make(map[string]tcFilterBinding, len(active))
+	for _, binding := range active {
+		key := fmt.Sprintf("%d/%s", binding.IfIndex, binding.Direction)
+		if _, duplicate := bySlot[key]; duplicate {
+			return fmt.Errorf("owner record repeats active TC slot %s", key)
+		}
+		bySlot[key] = binding
+	}
+	for _, linkPlan := range plan.links {
+		for _, snapshot := range linkPlan.filters {
+			direction := "ingress"
+			if snapshot.slot.parent == netlink.HANDLE_MIN_EGRESS {
+				direction = "egress"
+			}
+			key := fmt.Sprintf("%d/%s", linkPlan.ifindex, direction)
+			binding, recorded := bySlot[key]
+			if fresh {
+				if snapshot.existed {
+					return fmt.Errorf(
+						"fresh BPF instance found a pre-existing managed-looking TC filter at %s; refusing ownership",
+						key,
+					)
+				}
+				continue
+			}
+			switch {
+			case snapshot.existed && !recorded:
+				return fmt.Errorf("TC filter at %s is not owned by the persistent record", key)
+			case !snapshot.existed && recorded:
+				return fmt.Errorf(
+					"owned TC filter at %s with program ID %d is missing",
+					key, binding.ProgramID,
+				)
+			case snapshot.existed && snapshot.programID != binding.ProgramID:
+				return fmt.Errorf(
+					"TC filter at %s has program ID %d, owner record requires %d",
+					key, snapshot.programID, binding.ProgramID,
+				)
+			}
+		}
+	}
+	return nil
+}
+
+func (plan *tcAttachPlan) AddOwnedStaleRemovals(
+	active []tcFilterBinding,
+) error {
+	if plan == nil || plan.closed {
+		return errors.New("TC attach plan is unavailable")
+	}
+	currentSlots := make(map[string]struct{}, len(plan.links)*2)
+	for _, linkPlan := range plan.links {
+		for _, snapshot := range linkPlan.filters {
+			direction := "ingress"
+			if snapshot.slot.parent == netlink.HANDLE_MIN_EGRESS {
+				direction = "egress"
+			}
+			currentSlots[fmt.Sprintf("%d/%s", linkPlan.ifindex, direction)] = struct{}{}
+		}
+	}
+	for _, binding := range active {
+		key := fmt.Sprintf("%d/%s", binding.IfIndex, binding.Direction)
+		if _, remains := currentSlots[key]; remains {
+			continue
+		}
+		slot, err := ownerFilterSlot(binding)
+		if err != nil {
+			return err
+		}
+		link, err := plan.runtime.linkByIndex(binding.IfIndex)
+		if err != nil {
+			return fmt.Errorf("preflight stale owner TC slot %s: %w", key, err)
+		}
+		if link == nil ||
+			link.Attrs() == nil ||
+			link.Attrs().Index != binding.IfIndex {
+			return fmt.Errorf("preflight stale owner TC slot %s returned a mismatched link", key)
+		}
+		clsact, err := inspectClsact(link, plan.runtime)
+		if err != nil {
+			return fmt.Errorf("preflight stale owner clsact %s: %w", key, err)
+		}
+		if !clsact {
+			return fmt.Errorf("owned stale TC slot %s has no clsact", key)
+		}
+		snapshot, err := inspectTCFilterSlot(link, slot, plan.runtime, true)
+		if err != nil {
+			return fmt.Errorf("preflight stale owner filter %s: %w", key, err)
+		}
+		if !snapshot.existed || snapshot.programID != binding.ProgramID {
+			if snapshot.oldProgram != nil {
+				_ = snapshot.oldProgram.Close()
+			}
+			return fmt.Errorf(
+				"stale owner TC slot %s has program ID %d/present=%t, want %d",
+				key, snapshot.programID, snapshot.existed, binding.ProgramID,
+			)
+		}
+		plan.stale = append(plan.stale, tcOwnedStaleFilter{
+			key:      key,
+			link:     link,
+			snapshot: snapshot,
+		})
+	}
+	sort.Slice(plan.stale, func(i, j int) bool {
+		return plan.stale[i].key < plan.stale[j].key
+	})
+	return nil
+}
+
 func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
 	if plan == nil {
 		return errors.New("TC attach plan is nil")
@@ -359,11 +511,12 @@ func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
 		return errors.New("TC activation callback is nil")
 	}
 	var applied []tcAppliedFilter
+	var deleted []tcOwnedStaleFilter
 	defer func() {
 		if returnErr == nil {
 			return
 		}
-		rollbackErr := plan.rollback(applied)
+		rollbackErr := plan.rollback(applied, deleted)
 		if rollbackErr != nil {
 			returnErr = errors.Join(returnErr, fmt.Errorf("rollback TC attachment transaction: %w", rollbackErr))
 		}
@@ -429,6 +582,44 @@ func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
 					snapshot.slot.name, linkPlan.ifindex, err,
 				)
 			}
+		}
+	}
+	for _, stale := range plan.stale {
+		if err := plan.recheckFilterSnapshot(
+			stale.link,
+			stale.snapshot,
+		); err != nil {
+			return fmt.Errorf(
+				"recheck stale owner TC slot %s before delete: %w",
+				stale.key, err,
+			)
+		}
+		filter := managedBpfFilter(
+			stale.link.Attrs().Index,
+			stale.snapshot.slot,
+			stale.snapshot.oldProgram.FD(),
+		).(*netlink.BpfFilter)
+		filter.FilterAttrs = stale.snapshot.attrs
+		filter.ClassId = stale.snapshot.classID
+		filter.Id = int(stale.snapshot.programID)
+		if err := plan.runtime.filterDelete(filter); err != nil {
+			return fmt.Errorf("delete stale owner TC slot %s: %w", stale.key, err)
+		}
+		deleted = append(deleted, stale)
+		after, err := inspectTCFilterSlot(
+			stale.link,
+			stale.snapshot.slot,
+			plan.runtime,
+			false,
+		)
+		if err != nil {
+			return err
+		}
+		if after.existed {
+			return fmt.Errorf(
+				"stale owner TC slot %s remains after delete",
+				stale.key,
+			)
 		}
 	}
 	if err := commit(); err != nil {
@@ -510,8 +701,55 @@ func (plan *tcAttachPlan) verifyManagedFilter(
 	return nil
 }
 
-func (plan *tcAttachPlan) rollback(applied []tcAppliedFilter) error {
+func (plan *tcAttachPlan) rollback(
+	applied []tcAppliedFilter,
+	deleted []tcOwnedStaleFilter,
+) error {
 	var errs []error
+	for index := len(deleted) - 1; index >= 0; index-- {
+		change := deleted[index]
+		current, err := inspectTCFilterSlot(
+			change.link,
+			change.snapshot.slot,
+			plan.runtime,
+			false,
+		)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if current.existed {
+			errs = append(errs, fmt.Errorf(
+				"refuse restore of stale owner TC slot %s because it was repopulated",
+				change.key,
+			))
+			continue
+		}
+		filter := managedBpfFilter(
+			change.link.Attrs().Index,
+			change.snapshot.slot,
+			change.snapshot.oldProgram.FD(),
+		).(*netlink.BpfFilter)
+		filter.FilterAttrs = change.snapshot.attrs
+		filter.ClassId = change.snapshot.classID
+		if err := plan.runtime.filterAdd(filter); err != nil {
+			errs = append(errs, fmt.Errorf(
+				"restore stale owner TC slot %s: %w",
+				change.key, err,
+			))
+			continue
+		}
+		if err := plan.verifyManagedFilter(
+			change.link,
+			change.snapshot.slot,
+			change.snapshot.programID,
+		); err != nil {
+			errs = append(errs, fmt.Errorf(
+				"verify restored stale owner TC slot %s: %w",
+				change.key, err,
+			))
+		}
+	}
 	for index := len(applied) - 1; index >= 0; index-- {
 		change := applied[index]
 		if err := plan.verifyManagedFilter(
@@ -610,6 +848,16 @@ func (plan *tcAttachPlan) Close() error {
 			}
 			plan.links[linkIndex].filters[filterIndex].oldProgram = nil
 		}
+	}
+	for index := range plan.stale {
+		program := plan.stale[index].snapshot.oldProgram
+		if program == nil {
+			continue
+		}
+		if err := program.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close retained stale TC program: %w", err))
+		}
+		plan.stale[index].snapshot.oldProgram = nil
 	}
 	return errors.Join(errs...)
 }

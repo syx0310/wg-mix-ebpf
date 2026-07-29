@@ -640,11 +640,26 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 	runDir := fs.String("run-dir", "", "daemon runtime directory")
 	stateDir := fs.String("state-dir", "", "persistent attach-state directory")
 	reason := fs.String("reason", "manual", "operation reason")
+	adoptLegacyPins := fs.Bool(
+		"adopt-legacy-pins",
+		false,
+		"explicitly adopt a validated pre-owner 11-map dataplane (reload only)",
+	)
 	_ = reason
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	opts := reconcile.Options{ConfigPath: *configPath, RunDir: daemonRunDir(*runDir), StateDir: *stateDir, Offline: *offline, DryRun: *dryRun}
+	if *adoptLegacyPins && cmd != "reload" {
+		return errors.New("--adopt-legacy-pins is only valid with reload")
+	}
+	opts := reconcile.Options{
+		ConfigPath:      *configPath,
+		RunDir:          daemonRunDir(*runDir),
+		StateDir:        *stateDir,
+		Offline:         *offline,
+		DryRun:          *dryRun,
+		AdoptLegacyPins: *adoptLegacyPins,
+	}
 
 	switch cmd {
 	case "validate":
@@ -701,6 +716,11 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 	case "reload":
 		if !*dryRun && !*offline {
 			if status, err := daemon.ReadStatus(*runDir); err == nil && daemon.IsRunning(status) {
+				if *adoptLegacyPins {
+					return errors.New(
+						"--adopt-legacy-pins requires a one-shot reload while the daemon is stopped",
+					)
+				}
 				if _, err := daemon.RequestReload(ctx, *runDir, *configPath, daemon.DefaultRequestTimeout); err == nil {
 					fmt.Fprintln(stdout, "daemon reload requested")
 					return nil
@@ -887,5 +907,7 @@ Common flags:
   --config PATH   config path (default /etc/wg-mix-ebpf/config.yaml)
   --offline       skip runtime and underlay reads where supported
   --dry-run       print external actions instead of applying them
+  --adopt-legacy-pins
+                  explicitly adopt validated pre-owner pins (reload only; daemon stopped)
 `))
 }

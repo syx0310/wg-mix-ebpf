@@ -4,12 +4,14 @@ package dataplane
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -20,7 +22,6 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/pinidentity"
-	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
@@ -76,6 +77,20 @@ type pinPathRuntime struct {
 	mountIDAt            func(int, string, int) (uint64, error)
 	loadPinnedMap        func(string, string) (*pinnedMapObservation, error)
 	beforeLockWrite      func(string)
+	random               io.Reader
+	now                  func() time.Time
+	bootID               func() (string, error)
+	pinProgram           func(uint32, string) error
+	loadPinnedProgram    func(string) (*pinnedProgramObservation, error)
+	beforeOwnerExchange  func()
+	beforePinQuarantine  func(string)
+	beforePinUnlink      func(string)
+}
+
+type pinnedProgramObservation struct {
+	fd    int
+	id    uint32
+	close func() error
 }
 
 type pinResourceIdentity struct {
@@ -96,18 +111,29 @@ type pinnedMapDescriptor struct {
 }
 
 type pinnedMapObservation struct {
-	id          uint32
-	mapType     ebpf.MapType
-	keySize     uint32
-	valueSize   uint32
-	maxEntries  uint32
-	flags       uint32
-	kernelName  string
-	mapExtra    uint64
-	frozen      bool
-	control     abi.ControlValue
-	controlSeen bool
-	close       func() error
+	id            uint32
+	mapType       ebpf.MapType
+	keySize       uint32
+	valueSize     uint32
+	maxEntries    uint32
+	flags         uint32
+	kernelName    string
+	mapExtra      uint64
+	frozen        bool
+	control       abi.ControlValue
+	controlSeen   bool
+	owner         pinOwnerSentinel
+	ownerSeen     bool
+	pin           func(string) error
+	updateControl func(abi.ControlValue) error
+	close         func() error
+}
+
+type pinOwnerSentinel struct {
+	Version        uint32
+	Flags          uint32
+	ResourceDigest [32]byte
+	Token          [32]byte
 }
 
 type pinnedMapPin struct {
@@ -155,6 +181,7 @@ type pinPathHandle struct {
 	targetFD    int
 	mountID     uint64
 	targetInode pinPathInodeIdentity
+	resource    pinResourceIdentity
 	runtime     pinPathRuntime
 }
 
@@ -173,12 +200,17 @@ var livePinPathValidator = pinPathValidator{
 }
 
 var livePinPathRuntime = pinPathRuntime{
-	validator:     livePinPathValidator,
-	lockRoot:      pinPathLockRoot,
-	ownerRoot:     pinOwnerRoot,
-	expectedUID:   0,
-	mountIDAt:     linuxMountIDAt,
-	loadPinnedMap: loadPinnedMapObservation,
+	validator:         livePinPathValidator,
+	lockRoot:          pinPathLockRoot,
+	ownerRoot:         pinOwnerRoot,
+	expectedUID:       0,
+	mountIDAt:         linuxMountIDAt,
+	loadPinnedMap:     loadPinnedMapObservation,
+	random:            rand.Reader,
+	now:               time.Now,
+	bootID:            readLinuxBootID,
+	pinProgram:        pinProgramByID,
+	loadPinnedProgram: loadPinnedProgramObservation,
 }
 
 var xorTailCallBindings = []struct {
@@ -214,15 +246,21 @@ var xorTailCallBindings = []struct {
 }
 
 type LinuxLoader struct {
-	ObjectPath string
-	PinPath    string
-	runtime    *pinPathRuntime
+	ObjectPath      string
+	PinPath         string
+	AdoptLegacyPins bool
+	runtime         *pinPathRuntime
 }
 
 func NewLoader() Loader {
+	return NewLoaderWithOptions(LoaderOptions{})
+}
+
+func NewLoaderWithOptions(options LoaderOptions) Loader {
 	return LinuxLoader{
-		ObjectPath: objectPathFromEnv(""),
-		PinPath:    pinPathFromEnv(""),
+		ObjectPath:      objectPathFromEnv(""),
+		PinPath:         pinPathFromEnv(""),
+		AdoptLegacyPins: options.AdoptLegacyPins,
 	}
 }
 
@@ -314,9 +352,10 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	}
 	defer handle.Close()
 	rollbackFreshPins := created
-	// The lock and anchored directory make pins that were absent at preflight
-	// attributable to this Apply attempt. Until control_map is committed, an
-	// error removes only that zero-control set (including a partial load).
+	// Before the initial owner descriptor is durable, a fresh attempt has not
+	// pinned any maps. Its only rollback is the exact empty directory created
+	// under this lock. Once the descriptor exists, recovery owns every later
+	// durable transition and this legacy fallback is disabled.
 	defer func() {
 		if returnErr == nil || !rollbackFreshPins {
 			return
@@ -332,15 +371,115 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 
-	preexistingPins, err := inspectPinnedMapSet(handle, true)
-	if err != nil {
-		return fmt.Errorf("preflight existing pinned maps under %s: %w", pinPath, err)
+	if runtime.random == nil ||
+		runtime.bootID == nil ||
+		runtime.pinProgram == nil ||
+		runtime.loadPinnedProgram == nil {
+		return errors.New("pin ownership runtime is incomplete")
 	}
-	defer closePinnedMapPins(preexistingPins)
-	freshPins := len(preexistingPins) == 0
-	rollbackFreshPins = freshPins
+	bootID, err := runtime.bootID()
+	if err != nil {
+		return err
+	}
+	store, err := openPinOwnerStore(runtime, handle.resource, true)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	ownerRecord, ownerExists, err := store.LoadOptional(handle.mountID)
+	if err != nil {
+		return fmt.Errorf("load persistent BPF pin owner: %w", err)
+	}
+	if ownerExists {
+		rollbackFreshPins = false
+		if ownerRecord.BootID != bootID {
+			return fmt.Errorf(
+				"BPF pin owner was created on boot %s but current boot is %s; refusing unindexed reboot recovery",
+				ownerRecord.BootID, bootID,
+			)
+		}
+		recovered, err := recoverPinOwnerTransaction(
+			handle,
+			store,
+			ownerRecord,
+			liveTCRuntime,
+		)
+		if err != nil {
+			return fmt.Errorf("recover persistent BPF pin owner: %w", err)
+		}
+		if recovered.directoryRemoved {
+			return errors.New(
+				"completed an interrupted BPF detach; retry apply against the newly empty pin path",
+			)
+		}
+		ownerRecord = recovered.record
+	}
 
-	coll, err := ebpf.NewCollectionWithOptions(spec, ebpf.CollectionOptions{
+	directoryState, err := classifyCanonicalPinDirectory(handle)
+	if err != nil {
+		return err
+	}
+	legacyAdoption := false
+	if ownerExists {
+		if directoryState != canonicalPinsOwned {
+			return errors.New("active BPF owner record does not have its exact 12-map canonical set")
+		}
+	} else {
+		switch directoryState {
+		case canonicalPinsEmpty:
+		case canonicalPinsLegacy:
+			if !l.AdoptLegacyPins {
+				return errors.New(
+					"found legacy 11-map BPF pins without owner_map; refusing implicit adoption (run reload --adopt-legacy-pins explicitly)",
+				)
+			}
+			legacyAdoption = true
+		case canonicalPinsOwned:
+			if !l.AdoptLegacyPins {
+				return errors.New(
+					"found owner_map pins without their root-owned persistent owner record; refusing name-only ownership",
+				)
+			}
+			// An explicitly requested adoption also recovers the narrow crash
+			// window after owner_map was added but before its first descriptor
+			// publish. Schema/control/TC identity are still fully preflighted.
+			legacyAdoption = true
+		}
+	}
+	freshPins := !ownerExists && directoryState == canonicalPinsEmpty
+
+	var preexistingPins []pinnedMapPin
+	if ownerExists || legacyAdoption {
+		preexistingPins, err = inspectPinnedMapSetWithPolicy(
+			handle,
+			!legacyAdoption || directoryState == canonicalPinsOwned,
+			true,
+			false,
+		)
+		if err != nil {
+			return fmt.Errorf("preflight existing pinned maps under %s: %w", pinPath, err)
+		}
+		defer closePinnedMapPins(preexistingPins)
+		if ownerExists {
+			if err := validateOwnerPins(
+				handle,
+				ownerRecord,
+				preexistingPins,
+				true,
+			); err != nil {
+				return err
+			}
+		}
+	}
+
+	loadSpec := spec
+	if freshPins {
+		loadSpec = spec.Copy()
+		for _, descriptor := range pinnedMapDescriptors() {
+			loadSpec.Maps[descriptor.name].Pinning = ebpf.PinNone
+		}
+	}
+	coll, err := ebpf.NewCollectionWithOptions(loadSpec, ebpf.CollectionOptions{
 		Maps: ebpf.MapOptions{PinPath: handle.procPath()},
 	})
 	if err != nil {
@@ -358,9 +497,7 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 			return fmt.Errorf("existing pinned maps changed while loading %s: %w", source, err)
 		}
 	}
-	if freshPins {
-		err = validateFreshCollectionPinnedMaps(handle, coll)
-	} else {
+	if ownerExists || legacyAdoption {
 		err = validateCollectionPinnedMaps(handle, coll, true)
 	}
 	if err != nil {
@@ -371,21 +508,22 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if err != nil {
 		return err
 	}
+	if freshPins {
+		if active != 0 {
+			return fmt.Errorf("fresh unpinned control generation = %d, want zero", active)
+		}
+	} else if ownerExists && active != ownerRecord.ActiveGeneration {
+		return fmt.Errorf(
+			"active control generation %d differs from owner record %d",
+			active, ownerRecord.ActiveGeneration,
+		)
+	}
 	next := active + 1
 	if next == 0 {
 		next = 1
 	}
 	snapshot, err := abi.FromStateWithGeneration(state, next)
 	if err != nil {
-		return err
-	}
-	if err := deleteGenerationMapEntries(coll, next); err != nil {
-		return err
-	}
-	if err := populateDataMaps(coll, snapshot); err != nil {
-		return err
-	}
-	if err := populateXORTailCalls(coll, next); err != nil {
 		return err
 	}
 	ingress := coll.Programs[ingressFilterName]
@@ -404,18 +542,6 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if err != nil {
 		return fmt.Errorf("inspect egress TC program: %w", err)
 	}
-	if freshPins {
-		err = validateFreshCollectionPinnedMaps(handle, coll)
-	} else {
-		err = validateCollectionPinnedMaps(handle, coll, true)
-	}
-	if err != nil {
-		return fmt.Errorf("recheck collection pins before attach under %s: %w", pinPath, err)
-	}
-	if err := handle.recheckTargetEntry(); err != nil {
-		return err
-	}
-
 	attachPlan, err := prepareTCAttachPlan(
 		state,
 		ingressIdentity,
@@ -426,17 +552,173 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return fmt.Errorf("preflight TC attachment transaction: %w", err)
 	}
 	defer attachPlan.Close()
+	activeFilters := []tcFilterBinding{}
+	var token [32]byte
+	var ownerMaps []pinOwnerMapIdentity
+	if freshPins || legacyAdoption {
+		token, err = newPinOwnerToken(runtime.random)
+		if err != nil {
+			return err
+		}
+		sentinel, err := pinOwnerSentinelFor(handle.resource, token)
+		if err != nil {
+			return err
+		}
+		if err := writeCollectionOwnerSentinel(coll, sentinel); err != nil {
+			return err
+		}
+		ownerMaps, err = ownerMapsFromCollection(coll)
+		if err != nil {
+			return err
+		}
+		if legacyAdoption {
+			activeFilters = attachPlan.ObservedBindings()
+		}
+	} else {
+		token, err = tokenFromOwnerRecord(ownerRecord)
+		if err != nil {
+			return err
+		}
+		ownerMaps = slices.Clone(ownerRecord.Maps)
+		activeFilters = slices.Clone(ownerRecord.ActiveFilters)
+	}
+	if err := attachPlan.ValidatePreviousBindings(
+		activeFilters,
+		freshPins,
+	); err != nil {
+		return err
+	}
+	if err := attachPlan.AddOwnedStaleRemovals(activeFilters); err != nil {
+		return err
+	}
+	desiredFilters := attachPlan.Bindings()
+	now, err := ownerRuntimeNow(runtime)
+	if err != nil {
+		return err
+	}
+	applying, err := newApplyingPinOwnerRecord(
+		parent,
+		token,
+		bootID,
+		now,
+		active,
+		next,
+		ownerMaps,
+		activeFilters,
+		desiredFilters,
+		ownerRecord,
+	)
+	if err != nil {
+		return err
+	}
+	if err := store.Persist(
+		applying,
+		ownerRecord,
+		handle.mountID,
+	); err != nil {
+		if _, exists, loadErr := store.LoadOptional(handle.mountID); loadErr == nil && exists {
+			rollbackFreshPins = false
+		}
+		return fmt.Errorf("persist applying BPF owner intent: %w", err)
+	}
+	rollbackFreshPins = false
+	if freshPins {
+		if err := pinFreshCollectionMaps(handle, applying, coll); err != nil {
+			return err
+		}
+	}
+	if err := validateCollectionPinnedMaps(handle, coll, false); err != nil {
+		return fmt.Errorf("validate journaled collection pins under %s: %w", pinPath, err)
+	}
+	journalPins, err := inspectPinnedMapSetWithPolicy(
+		handle,
+		true,
+		false,
+		false,
+	)
+	if err != nil {
+		return err
+	}
+	if err := validateOwnerPins(handle, applying, journalPins, true); err != nil {
+		_ = closePinnedMapPins(journalPins)
+		return err
+	}
+	if err := closePinnedMapPins(journalPins); err != nil {
+		return err
+	}
+	if err := deleteGenerationMapEntries(coll, next); err != nil {
+		return err
+	}
+	if err := populateDataMaps(coll, snapshot); err != nil {
+		return err
+	}
+	if err := populateXORTailCalls(coll, next); err != nil {
+		return err
+	}
+	if err := stageOwnerPrograms(handle, applying); err != nil {
+		return err
+	}
+	mutating := advancePinOwnerRecord(
+		applying,
+		now,
+		pinOwnerPhaseApplying,
+		pinOwnerStepMutating,
+	)
+	observeOwnerMount(mutating, handle.mountID)
+	if err := store.Persist(mutating, applying, handle.mountID); err != nil {
+		return err
+	}
 	if err := attachPlan.Execute(func() error {
 		return commitControl(coll, snapshot.Control[abi.ControlKeyGlobal])
 	}); err != nil {
+		abortErr := abortFailedOwnerApply(
+			handle,
+			store,
+			mutating,
+			liveTCRuntime,
+		)
+		if abortErr != nil {
+			return errors.Join(
+				err,
+				fmt.Errorf("owner-aware apply rollback: %w", abortErr),
+			)
+		}
 		return err
 	}
-	rollbackFreshPins = false
+	cleanup := advancePinOwnerRecord(
+		mutating,
+		now,
+		pinOwnerPhaseApplying,
+		pinOwnerStepCleanup,
+	)
+	observeOwnerMount(cleanup, handle.mountID)
+	if err := store.Persist(cleanup, mutating, handle.mountID); err != nil {
+		return err
+	}
+	recovered, err := recoverApplyingPinOwnerTransaction(
+		handle,
+		store,
+		cleanup,
+		now,
+		liveTCRuntime,
+	)
+	if err != nil {
+		return err
+	}
+	ownerRecord = recovered.record
 	if err := deleteStaleMapEntries(coll, snapshot); err != nil {
 		return err
 	}
 	if err := validateCollectionPinnedMaps(handle, coll, true); err != nil {
 		return fmt.Errorf("validate committed collection pins under %s: %w", pinPath, err)
+	}
+	finalPins, err := inspectPinnedMapSet(handle, true)
+	if err != nil {
+		return err
+	}
+	defer closePinnedMapPins(finalPins)
+	if err := validateOwnerPins(handle, ownerRecord, finalPins, true); err != nil {
+		return err
 	}
 	return nil
 }
@@ -445,36 +727,10 @@ func (l LinuxLoader) DetachStale(ctx context.Context, previous *control.State, c
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if previous == nil {
-		return nil
-	}
-	currentIfindexes := make(map[int]struct{})
-	if current != nil {
-		for _, u := range current.Underlays {
-			if !u.Resolved || u.IfIndex == 0 || u.Role == "disabled" {
-				continue
-			}
-			currentIfindexes[u.IfIndex] = struct{}{}
-		}
-	}
-	var errs []error
-	seen := make(map[int]struct{})
-	for _, u := range previous.Underlays {
-		if !u.Resolved || u.IfIndex == 0 {
-			continue
-		}
-		if _, ok := currentIfindexes[u.IfIndex]; ok {
-			continue
-		}
-		if _, ok := seen[u.IfIndex]; ok {
-			continue
-		}
-		seen[u.IfIndex] = struct{}{}
-		if err := detachPrograms(u.IfIndex); err != nil {
-			errs = append(errs, fmt.Errorf("detach stale underlay %s(%d): %w", u.Name, u.IfIndex, err))
-		}
-	}
-	return errors.Join(errs...)
+	// Apply now includes owner-recorded stale filters in the same global
+	// preflight, rollback, and journal transaction as replacements/additions.
+	// Keep this compatibility hook side-effect free for older reconcile callers.
+	return nil
 }
 
 func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
@@ -507,28 +763,76 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 	if err != nil {
 		return err
 	}
-	cleanupPlan, err := preparePinnedMapCleanupHandle(handle)
+	if handle == nil {
+		return nil
+	}
+	defer handle.Close()
+	store, err := openPinOwnerStore(runtime, handle.resource, false)
 	if err != nil {
-		return fmt.Errorf("preflight pinned-map cleanup under %s: %w", pinPath, err)
+		return fmt.Errorf("open persistent BPF pin owner: %w", err)
 	}
-	defer cleanupPlan.Close()
-
-	var errs []error
-	for _, u := range state.Underlays {
-		if !u.Resolved || u.IfIndex == 0 {
-			continue
-		}
-		if err := detachPrograms(u.IfIndex); err != nil {
-			errs = append(errs, fmt.Errorf("detach underlay %s(%d): %w", u.Name, u.IfIndex, err))
-		}
-	}
-	if err := errors.Join(errs...); err != nil {
+	defer store.Close()
+	record, exists, err := store.LoadOptional(handle.mountID)
+	if err != nil {
 		return err
 	}
-	if err := cleanupPlan.Execute(); err != nil {
+	if !exists {
+		directoryState, classifyErr := classifyCanonicalPinDirectory(handle)
+		if classifyErr != nil {
+			return classifyErr
+		}
+		if directoryState == canonicalPinsEmpty {
+			empty, err := pinDirectoryIsEmpty(handle.targetFD, handle.pinPath)
+			if err != nil {
+				return err
+			}
+			if !empty {
+				return errors.New("ownerless BPF pin path is not empty")
+			}
+			if err := handle.recheckTargetEntry(); err != nil {
+				return err
+			}
+			return unix.Unlinkat(handle.parentFD, handle.base, unix.AT_REMOVEDIR)
+		}
+		return errors.New(
+			"BPF pins have no persistent owner record; refusing state/name-based detach",
+		)
+	}
+	if runtime.bootID == nil {
+		return errors.New("pin owner boot ID runtime is unavailable")
+	}
+	bootID, err := runtime.bootID()
+	if err != nil {
 		return err
 	}
-	return nil
+	if record.BootID != bootID {
+		return fmt.Errorf(
+			"BPF pin owner was created on boot %s but current boot is %s; refusing unindexed reboot detach",
+			record.BootID, bootID,
+		)
+	}
+	recovered, err := recoverPinOwnerTransaction(
+		handle,
+		store,
+		record,
+		liveTCRuntime,
+	)
+	if err != nil {
+		return fmt.Errorf("recover BPF owner before detach: %w", err)
+	}
+	if recovered.directoryRemoved {
+		return nil
+	}
+	if recovered.record == nil ||
+		recovered.record.Phase != pinOwnerPhaseActive {
+		return errors.New("BPF owner recovery did not reach an active state")
+	}
+	return executeOwnerDetachTransaction(
+		handle,
+		store,
+		recovered.record,
+		liveTCRuntime,
+	)
 }
 
 func pinPathFromEnv(explicit string) string {
@@ -1059,6 +1363,7 @@ func openPinPathHandleFromParent(
 		targetFD:    targetFD,
 		mountID:     targetMountID,
 		targetInode: targetInode,
+		resource:    parent.resource,
 		runtime:     parent.runtime,
 	}, created, nil
 }
@@ -1242,6 +1547,7 @@ func removeMemlockLimit() error {
 func pinnedMapDescriptors() []pinnedMapDescriptor {
 	return []pinnedMapDescriptor{
 		{name: "control_map", mapType: ebpf.Array, keySize: 4, valueSize: 16, maxEntries: 1},
+		{name: "owner_map", mapType: ebpf.Array, keySize: 4, valueSize: 72, maxEntries: 1},
 		{name: "profile_map", mapType: ebpf.Hash, keySize: 16, valueSize: 48, maxEntries: 128},
 		{name: "cipher_map", mapType: ebpf.Hash, keySize: 16, valueSize: 288, maxEntries: 128},
 		{name: "underlay_config_map", mapType: ebpf.Hash, keySize: 16, valueSize: 16, maxEntries: 512},
@@ -1374,7 +1680,18 @@ func loadPinnedMapObservation(path string, name string) (*pinnedMapObservation, 
 			return nil, fmt.Errorf("lookup control identity: %w", err)
 		}
 		observation.controlSeen = true
+		observation.updateControl = func(value abi.ControlValue) error {
+			return pinnedMap.Update(abi.ControlKeyGlobal, value, ebpf.UpdateAny)
+		}
 	}
+	if name == "owner_map" {
+		if err := pinnedMap.Lookup(uint32(0), &observation.owner); err != nil {
+			closeOnError()
+			return nil, fmt.Errorf("lookup owner sentinel: %w", err)
+		}
+		observation.ownerSeen = true
+	}
+	observation.pin = pinnedMap.Pin
 	return observation, nil
 }
 
@@ -1429,6 +1746,9 @@ func validatePinnedMapObservation(
 		)
 	}
 	if descriptor.name != "control_map" {
+		if descriptor.name == "owner_map" && !observation.ownerSeen {
+			return errors.New("pinned owner_map sentinel value is unavailable")
+		}
 		return nil
 	}
 	if !observation.controlSeen {
@@ -2111,39 +2431,6 @@ func (plan *pinnedMapCleanupPlan) Close() error {
 	handleErr := plan.handle.Close()
 	plan.handle = nil
 	return errors.Join(pinErr, handleErr)
-}
-
-func detachPrograms(ifindex int) error {
-	link, err := netlink.LinkByIndex(ifindex)
-	if err != nil {
-		if isNotFound(err) {
-			return nil
-		}
-		return err
-	}
-	return errors.Join(
-		deleteAgentFilter(link, netlink.HANDLE_MIN_INGRESS, ingressFilterName, ingressHandle),
-		deleteAgentFilter(link, netlink.HANDLE_MIN_EGRESS, egressFilterName, egressHandle),
-	)
-}
-
-func deleteAgentFilter(link netlink.Link, parent uint32, name string, handle uint32) error {
-	filters, err := netlink.FilterList(link, parent)
-	if err != nil {
-		return err
-	}
-	var errs []error
-	for _, f := range filters {
-		bpfFilter, ok := f.(*netlink.BpfFilter)
-		attrs := f.Attrs()
-		if !ok || bpfFilter.Name != name || attrs.Handle != handle || attrs.Priority != filterPriority {
-			continue
-		}
-		if err := netlink.FilterDel(f); err != nil && !isNotFound(err) {
-			errs = append(errs, err)
-		}
-	}
-	return errors.Join(errs...)
 }
 
 func isNotFound(err error) bool {

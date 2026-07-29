@@ -25,3 +25,7 @@ type AttachStateLoader interface {
 	Loader
 	DetachStale(ctx context.Context, previous *control.State, current *control.State) error
 }
+
+type LoaderOptions struct {
+	AdoptLegacyPins bool
+}
