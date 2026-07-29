@@ -4,7 +4,6 @@ package dataplane
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -20,6 +19,7 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
+	"github.com/syx0310/wg-mix-ebpf/internal/pinidentity"
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
@@ -34,7 +34,8 @@ const (
 	pinPathPrefix     = "wg-mix-ebpf"
 	maxPinPathSuffix  = 64
 	pinPathLockRoot   = "/run/wg-mix-ebpf/pin-locks"
-	pinPathOwnerV1    = 1
+	pinOwnerRoot      = "/var/lib/wg-mix-ebpf/pin-owners"
+	pinPathOwnerV2    = 2
 )
 
 type pinPathFilesystem struct {
@@ -60,13 +61,29 @@ type pinPathInodeIdentity struct {
 	device uint64
 	inode  uint64
 	mode   uint32
+	uid    uint32
+	gid    uint32
+	nlink  uint64
 }
 
 type pinPathRuntime struct {
-	validator     pinPathValidator
-	lockRoot      string
-	mountIDAt     func(int, string, int) (uint64, error)
-	loadPinnedMap func(string, string) (*pinnedMapObservation, error)
+	validator            pinPathValidator
+	lockRoot             string
+	ownerRoot            string
+	expectedUID          uint32
+	bpffsRootMode        uint32
+	allowUnsafeAncestors bool
+	mountIDAt            func(int, string, int) (uint64, error)
+	loadPinnedMap        func(string, string) (*pinnedMapObservation, error)
+	beforeLockWrite      func(string)
+}
+
+type pinResourceIdentity struct {
+	key          string
+	parentDevice uint64
+	parentInode  uint64
+	base         string
+	pinPath      string
 }
 
 type pinnedMapDescriptor struct {
@@ -105,22 +122,36 @@ type pinnedMapCleanupPlan struct {
 }
 
 type pinPathOwner struct {
-	Version int    `json:"version"`
-	PID     int    `json:"pid"`
-	Action  string `json:"action"`
-	PinPath string `json:"pin_path"`
+	Version      int    `json:"version"`
+	PID          int    `json:"pid"`
+	Action       string `json:"action"`
+	ResourceKey  string `json:"resource_key"`
+	ParentDevice uint64 `json:"parent_device"`
+	ParentInode  uint64 `json:"parent_inode"`
+	PinBaseName  string `json:"pin_basename"`
+	PinPath      string `json:"pin_path"`
 }
 
 type pinPathLock struct {
-	path   string
-	file   *os.File
-	rootFD int
+	path string
+	file *os.File
+	root *anchoredDirectoryPath
+}
+
+type pinPathParent struct {
+	pinPath  string
+	base     string
+	path     *anchoredDirectoryPath
+	mountID  uint64
+	resource pinResourceIdentity
+	runtime  pinPathRuntime
 }
 
 type pinPathHandle struct {
 	pinPath     string
 	base        string
 	parentFD    int
+	parentPath  *anchoredDirectoryPath
 	targetFD    int
 	mountID     uint64
 	targetInode pinPathInodeIdentity
@@ -144,6 +175,8 @@ var livePinPathValidator = pinPathValidator{
 var livePinPathRuntime = pinPathRuntime{
 	validator:     livePinPathValidator,
 	lockRoot:      pinPathLockRoot,
+	ownerRoot:     pinOwnerRoot,
+	expectedUID:   0,
 	mountIDAt:     linuxMountIDAt,
 	loadPinnedMap: loadPinnedMapObservation,
 }
@@ -242,9 +275,15 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	}
 	runtime := l.pinRuntime(ctx)
 	pinPath := pinPathFromEnv(l.PinPath)
-	if _, err := validatePinPath(pinPath, runtime.validator); err != nil {
+	validated, err := validatePinPath(pinPath, runtime.validator)
+	if err != nil {
 		return err
 	}
+	parent, err := openPinPathParent(pinPath, validated, runtime)
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
 	spec, source, err := loadCollectionSpec(l.ObjectPath)
 	if err != nil {
 		return err
@@ -259,17 +298,17 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 
-	lock, err := acquirePinPathLock(ctx, pinPath, "apply", runtime)
+	lock, err := acquirePinPathLock(ctx, parent.resource, "apply", runtime)
 	if err != nil {
 		return fmt.Errorf("serialize BPF pin path %s: %w", pinPath, err)
 	}
 	defer lock.Close()
 
-	validated, err := validatePinPath(pinPath, runtime.validator)
+	validated, err = validatePinPath(pinPath, runtime.validator)
 	if err != nil {
 		return err
 	}
-	handle, created, err := openPinPathHandle(pinPath, validated, true, runtime)
+	handle, created, err := openPinPathHandleFromParent(parent, validated, true)
 	if err != nil {
 		return err
 	}
@@ -444,20 +483,31 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 	}
 	runtime := l.pinRuntime(ctx)
 	pinPath := pinPathFromEnv(l.PinPath)
-	if _, err := validatePinPath(pinPath, runtime.validator); err != nil {
+	validated, err := validatePinPath(pinPath, runtime.validator)
+	if err != nil {
 		return err
 	}
+	parent, err := openPinPathParent(pinPath, validated, runtime)
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
 
-	lock, err := acquirePinPathLock(ctx, pinPath, "detach", runtime)
+	lock, err := acquirePinPathLock(ctx, parent.resource, "detach", runtime)
 	if err != nil {
 		return fmt.Errorf("serialize BPF pin path %s: %w", pinPath, err)
 	}
 	defer lock.Close()
 
-	if _, err := validatePinPath(pinPath, runtime.validator); err != nil {
+	validated, err = validatePinPath(pinPath, runtime.validator)
+	if err != nil {
 		return err
 	}
-	cleanupPlan, err := preparePinnedMapCleanup(pinPath, runtime)
+	handle, _, err := openPinPathHandleFromParent(parent, validated, false)
+	if err != nil {
+		return err
+	}
+	cleanupPlan, err := preparePinnedMapCleanupHandle(handle)
 	if err != nil {
 		return fmt.Errorf("preflight pinned-map cleanup under %s: %w", pinPath, err)
 	}
@@ -623,6 +673,9 @@ func pinPathInodeFromStat(stat *unix.Stat_t) pinPathInodeIdentity {
 		device: uint64(stat.Dev),
 		inode:  stat.Ino,
 		mode:   stat.Mode,
+		uid:    stat.Uid,
+		gid:    stat.Gid,
+		nlink:  uint64(stat.Nlink),
 	}
 }
 
@@ -639,60 +692,68 @@ func (l LinuxLoader) pinRuntime(ctx context.Context) pinPathRuntime {
 	runtime := livePinPathRuntime
 	lifecycleLease := lockfile.LifecycleLeasePath(ctx)
 	if lifecycleLease != lockfile.DefaultLifecycleLeasePath {
-		// The isolated netns entrypoint validates that its lifecycle lease is
-		// inside a run-owned run-<role> directory. Keep the persistent pin-lock
-		// owner in that same teardown/manifest scope.
-		runtime.lockRoot = filepath.Join(filepath.Dir(lifecycleLease), "pin-locks")
+		// The isolated netns entrypoint binds its shared lifecycle lease to the
+		// run-owned root. Keep both resource serialization and persistent owner
+		// records in that same manifest and teardown scope.
+		runRoot := filepath.Dir(lifecycleLease)
+		runtime.lockRoot = filepath.Join(runRoot, "pin-locks")
+		runtime.ownerRoot = filepath.Join(runRoot, "pin-owners")
+		runtime.bpffsRootMode = 0o700
 	}
 	return runtime
 }
 
 func acquirePinPathLock(
 	ctx context.Context,
-	pinPath string,
+	resource pinResourceIdentity,
 	action string,
 	runtime pinPathRuntime,
 ) (*pinPathLock, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if runtime.lockRoot == "" || !filepath.IsAbs(runtime.lockRoot) ||
-		filepath.Clean(runtime.lockRoot) != runtime.lockRoot ||
-		runtime.lockRoot == string(filepath.Separator) {
-		return nil, fmt.Errorf("invalid pin-path lock root %q", runtime.lockRoot)
+	if !pinidentity.ValidKey(resource.key) {
+		return nil, fmt.Errorf("invalid BPF pin resource key %q", resource.key)
 	}
-	rootFD, err := openOrCreateDirectoryPath(runtime.lockRoot, 0o700)
+	name, err := pinidentity.LockFileName(
+		resource.parentDevice,
+		resource.parentInode,
+		resource.base,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("derive BPF pin lock name: %w", err)
+	}
+	if name != resource.key+".lock" {
+		return nil, errors.New("BPF pin lock identity helper returned an inconsistent name")
+	}
+	root, _, err := openAnchoredDirectoryPath(
+		runtime.lockRoot,
+		true,
+		0o700,
+		runtime.expectedUID,
+		runtime.allowUnsafeAncestors,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("open pin-path lock root %s: %w", runtime.lockRoot, err)
 	}
 	closeRootOnError := func() {
-		_ = unix.Close(rootFD)
+		_ = root.Close()
 	}
-	if err := unix.Fchmod(rootFD, 0o700); err != nil {
-		closeRootOnError()
-		return nil, fmt.Errorf("secure pin-path lock root %s: %w", runtime.lockRoot, err)
-	}
-
-	name := pinPathLockFileName(pinPath)
 	lockPath := filepath.Join(runtime.lockRoot, name)
-	fd, err := unix.Openat(rootFD, name, unix.O_CREAT|unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	file, fileIdentity, _, err := openAnchoredRegularFile(
+		root,
+		name,
+		0o600,
+		runtime.expectedUID,
+	)
 	if err != nil {
 		closeRootOnError()
 		return nil, fmt.Errorf("open pin-path lock %s: %w", lockPath, err)
 	}
-	file := os.NewFile(uintptr(fd), lockPath)
+	fd := int(file.Fd())
 	closeAllOnError := func() {
 		_ = file.Close()
 		closeRootOnError()
-	}
-	var heldStat unix.Stat_t
-	if err := unix.Fstat(fd, &heldStat); err != nil {
-		closeAllOnError()
-		return nil, fmt.Errorf("inspect pin-path lock %s: %w", lockPath, err)
-	}
-	if heldStat.Mode&unix.S_IFMT != unix.S_IFREG || heldStat.Nlink != 1 {
-		closeAllOnError()
-		return nil, fmt.Errorf("refuse unsafe pin-path lock %s: mode=%#o links=%d", lockPath, heldStat.Mode, heldStat.Nlink)
 	}
 
 	ticker := time.NewTicker(25 * time.Millisecond)
@@ -714,22 +775,41 @@ func acquirePinPathLock(
 		}
 	}
 
-	var pathStat unix.Stat_t
-	if err := unix.Fstatat(rootFD, name, &pathStat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+	if _, err := validateAnchoredRegularFile(
+		root,
+		name,
+		fd,
+		0o600,
+		runtime.expectedUID,
+		&fileIdentity,
+	); err != nil {
 		closeAllOnError()
 		return nil, fmt.Errorf("recheck pin-path lock %s: %w", lockPath, err)
 	}
-	if !samePinPathInode(pinPathInodeFromStat(&heldStat), pinPathInodeFromStat(&pathStat)) {
-		closeAllOnError()
-		return nil, fmt.Errorf("pin-path lock %s changed while acquiring ownership", lockPath)
+	if runtime.beforeLockWrite != nil {
+		runtime.beforeLockWrite(lockPath)
 	}
 
 	owner, err := json.Marshal(pinPathOwner{
-		Version: pinPathOwnerV1,
-		PID:     os.Getpid(),
-		Action:  action,
-		PinPath: pinPath,
+		Version:      pinPathOwnerV2,
+		PID:          os.Getpid(),
+		Action:       action,
+		ResourceKey:  resource.key,
+		ParentDevice: resource.parentDevice,
+		ParentInode:  resource.parentInode,
+		PinBaseName:  resource.base,
+		PinPath:      resource.pinPath,
 	})
+	if err == nil {
+		_, err = validateAnchoredRegularFile(
+			root,
+			name,
+			fd,
+			0o600,
+			runtime.expectedUID,
+			&fileIdentity,
+		)
+	}
 	if err == nil {
 		err = file.Truncate(0)
 	}
@@ -737,7 +817,11 @@ func acquirePinPathLock(
 		_, err = file.Seek(0, 0)
 	}
 	if err == nil {
-		_, err = file.Write(append(owner, '\n'))
+		var written int
+		written, err = file.Write(append(owner, '\n'))
+		if err == nil && written != len(owner)+1 {
+			err = io.ErrShortWrite
+		}
 	}
 	if err == nil {
 		err = file.Sync()
@@ -746,61 +830,18 @@ func acquirePinPathLock(
 		closeAllOnError()
 		return nil, fmt.Errorf("record pin-path lock owner in %s: %w", lockPath, err)
 	}
-	return &pinPathLock{path: lockPath, file: file, rootFD: rootFD}, nil
-}
-
-func pinPathLockFileName(pinPath string) string {
-	sum := sha256.Sum256([]byte(pinPath))
-	return fmt.Sprintf("%x.lock", sum)
-}
-
-func openOrCreateDirectoryPath(path string, mode uint32) (int, error) {
-	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path ||
-		path == string(filepath.Separator) {
-		return -1, fmt.Errorf("directory path %q must be absolute, clean, and below the filesystem root", path)
+	if _, err := validateAnchoredRegularFile(
+		root,
+		name,
+		fd,
+		0o600,
+		runtime.expectedUID,
+		&fileIdentity,
+	); err != nil {
+		closeAllOnError()
+		return nil, fmt.Errorf("verify pin-path lock owner in %s: %w", lockPath, err)
 	}
-	currentFD, err := unix.Open(
-		string(filepath.Separator),
-		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
-		0,
-	)
-	if err != nil {
-		return -1, err
-	}
-	components := strings.Split(strings.TrimPrefix(path, string(filepath.Separator)), string(filepath.Separator))
-	for _, component := range components {
-		if component == "" {
-			continue
-		}
-		nextFD, openErr := unix.Openat(
-			currentFD,
-			component,
-			unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
-			0,
-		)
-		if errors.Is(openErr, unix.ENOENT) {
-			if err := unix.Mkdirat(currentFD, component, mode); err != nil && !errors.Is(err, unix.EEXIST) {
-				_ = unix.Close(currentFD)
-				return -1, err
-			}
-			nextFD, openErr = unix.Openat(
-				currentFD,
-				component,
-				unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
-				0,
-			)
-		}
-		if openErr != nil {
-			_ = unix.Close(currentFD)
-			return -1, openErr
-		}
-		if err := unix.Close(currentFD); err != nil {
-			_ = unix.Close(nextFD)
-			return -1, err
-		}
-		currentFD = nextFD
-	}
-	return currentFD, nil
+	return &pinPathLock{path: lockPath, file: file, root: root}, nil
 }
 
 func (l *pinPathLock) Close() error {
@@ -814,11 +855,11 @@ func (l *pinPathLock) Close() error {
 		}
 		l.file = nil
 	}
-	if l.rootFD >= 0 {
-		if err := unix.Close(l.rootFD); err != nil {
+	if l.root != nil {
+		if err := l.root.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close pin-path lock root for %s: %w", l.path, err))
 		}
-		l.rootFD = -1
+		l.root = nil
 	}
 	return errors.Join(errs...)
 }
@@ -829,113 +870,274 @@ func openPinPathHandle(
 	create bool,
 	runtime pinPathRuntime,
 ) (*pinPathHandle, bool, error) {
-	if runtime.mountIDAt == nil {
-		return nil, false, errors.New("pin-path mount-ID-at validator is unavailable")
+	parent, err := openPinPathParent(pinPath, validated, runtime)
+	if err != nil {
+		return nil, false, err
 	}
-	parentFD, err := unix.Open(
+	handle, created, err := openPinPathHandleFromParent(parent, validated, create)
+	if err != nil || handle == nil {
+		_ = parent.Close()
+	}
+	return handle, created, err
+}
+
+func openPinPathParent(
+	pinPath string,
+	validated validatedPinPath,
+	runtime pinPathRuntime,
+) (*pinPathParent, error) {
+	if runtime.mountIDAt == nil {
+		return nil, errors.New("pin-path mount-ID-at validator is unavailable")
+	}
+	parentPath, _, err := openAnchoredDirectoryPath(
 		validated.bpffsRoot,
-		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
-		0,
+		false,
+		runtime.bpffsRootMode,
+		runtime.expectedUID,
+		runtime.allowUnsafeAncestors,
 	)
 	if err != nil {
-		return nil, false, fmt.Errorf("open bpffs mount root %s: %w", validated.bpffsRoot, err)
+		return nil, fmt.Errorf("open bpffs mount root %s: %w", validated.bpffsRoot, err)
 	}
-	closeParentOnError := func() {
-		_ = unix.Close(parentFD)
+	closeOnError := func() {
+		_ = parentPath.Close()
 	}
-	var parentStat unix.Stat_t
-	if err := unix.Fstat(parentFD, &parentStat); err != nil {
-		closeParentOnError()
-		return nil, false, fmt.Errorf("inspect opened bpffs mount root: %w", err)
+	parentIdentity := parentPath.Identity()
+	if !samePinPathInode(parentIdentity, validated.parentInode) {
+		closeOnError()
+		return nil, fmt.Errorf("bpffs mount root %s changed after validation", validated.bpffsRoot)
 	}
-	if !samePinPathInode(pinPathInodeFromStat(&parentStat), validated.parentInode) {
-		closeParentOnError()
-		return nil, false, fmt.Errorf("bpffs mount root %s changed after validation", validated.bpffsRoot)
-	}
-	parentMountID, err := runtime.mountIDAt(parentFD, "", unix.AT_EMPTY_PATH|unix.AT_NO_AUTOMOUNT)
+	parentMountID, err := runtime.mountIDAt(
+		parentPath.FD(),
+		"",
+		unix.AT_EMPTY_PATH|unix.AT_NO_AUTOMOUNT,
+	)
 	if err != nil {
-		closeParentOnError()
-		return nil, false, fmt.Errorf("inspect opened bpffs mount ID: %w", err)
+		closeOnError()
+		return nil, fmt.Errorf("inspect opened bpffs mount ID: %w", err)
 	}
 	if parentMountID != validated.mountID {
-		closeParentOnError()
-		return nil, false, fmt.Errorf("bpffs mount root %s changed mount identity after validation", validated.bpffsRoot)
+		closeOnError()
+		return nil, fmt.Errorf("bpffs mount root %s changed mount identity after validation", validated.bpffsRoot)
 	}
-
 	base := filepath.Base(pinPath)
+	resourceKey, err := pinidentity.Key(parentIdentity.device, parentIdentity.inode, base)
+	if err != nil {
+		closeOnError()
+		return nil, fmt.Errorf("derive BPF pin resource identity: %w", err)
+	}
+	return &pinPathParent{
+		pinPath: pinPath,
+		base:    base,
+		path:    parentPath,
+		mountID: parentMountID,
+		resource: pinResourceIdentity{
+			key:          resourceKey,
+			parentDevice: parentIdentity.device,
+			parentInode:  parentIdentity.inode,
+			base:         base,
+			pinPath:      pinPath,
+		},
+		runtime: runtime,
+	}, nil
+}
+
+func openPinPathHandleFromParent(
+	parent *pinPathParent,
+	validated validatedPinPath,
+	create bool,
+) (*pinPathHandle, bool, error) {
+	if parent == nil || parent.path == nil {
+		return nil, false, errors.New("bpffs parent anchor is unavailable")
+	}
+	if err := parent.Recheck(); err != nil {
+		return nil, false, err
+	}
+	if !samePinPathInode(parent.path.Identity(), validated.parentInode) ||
+		parent.mountID != validated.mountID {
+		return nil, false, fmt.Errorf("validated bpffs root changed for %s", parent.pinPath)
+	}
+	parentFD := parent.path.FD()
 	created := false
 	if create && !validated.exists {
-		if err := unix.Mkdirat(parentFD, base, 0o700); err != nil {
+		if err := parent.Recheck(); err != nil {
+			return nil, false, fmt.Errorf("recheck bpffs root before creating pin directory: %w", err)
+		}
+		if err := unix.Mkdirat(parentFD, parent.base, 0o700); err != nil {
 			if !errors.Is(err, unix.EEXIST) {
-				closeParentOnError()
-				return nil, false, fmt.Errorf("create BPF pin directory %s: %w", pinPath, err)
+				return nil, false, fmt.Errorf("create BPF pin directory %s: %w", parent.pinPath, err)
 			}
 		} else {
 			created = true
 		}
 	}
 	if !create && !validated.exists {
-		closeParentOnError()
+		var stat unix.Stat_t
+		err := unix.Fstatat(parentFD, parent.base, &stat, unix.AT_SYMLINK_NOFOLLOW)
+		if err == nil {
+			return nil, false, fmt.Errorf(
+				"BPF pin directory %s appeared after absence preflight",
+				parent.pinPath,
+			)
+		}
+		if !errors.Is(err, unix.ENOENT) {
+			return nil, false, fmt.Errorf(
+				"recheck absent BPF pin directory %s: %w",
+				parent.pinPath, err,
+			)
+		}
 		return nil, false, nil
 	}
 	targetFD, err := unix.Openat(
 		parentFD,
-		base,
+		parent.base,
 		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
 		0,
 	)
 	if err != nil {
-		closeParentOnError()
-		return nil, false, fmt.Errorf("open BPF pin directory %s: %w", pinPath, err)
+		return nil, false, fmt.Errorf("open BPF pin directory %s: %w", parent.pinPath, err)
 	}
-	closeAllOnError := func() {
+	closeTargetOnError := func() {
 		_ = unix.Close(targetFD)
-		closeParentOnError()
 	}
 	var targetStat unix.Stat_t
 	if err := unix.Fstat(targetFD, &targetStat); err != nil {
-		closeAllOnError()
-		return nil, false, fmt.Errorf("inspect opened BPF pin directory %s: %w", pinPath, err)
+		closeTargetOnError()
+		return nil, false, fmt.Errorf("inspect opened BPF pin directory %s: %w", parent.pinPath, err)
 	}
 	targetInode := pinPathInodeFromStat(&targetStat)
-	if targetInode.mode&unix.S_IFMT != unix.S_IFDIR {
-		closeAllOnError()
-		return nil, false, fmt.Errorf("opened BPF pin target %s is not a directory", pinPath)
+	if err := validateOwnedPinDirectory(
+		parent.pinPath,
+		targetInode,
+		parent.runtime.expectedUID,
+	); err != nil {
+		closeTargetOnError()
+		return nil, false, err
 	}
 	if validated.targetHasInode && !samePinPathInode(targetInode, validated.targetInode) {
-		closeAllOnError()
-		return nil, false, fmt.Errorf("BPF pin directory %s changed after validation", pinPath)
+		closeTargetOnError()
+		return nil, false, fmt.Errorf("BPF pin directory %s changed after validation", parent.pinPath)
 	}
-	targetMountID, err := runtime.mountIDAt(targetFD, "", unix.AT_EMPTY_PATH|unix.AT_NO_AUTOMOUNT)
+	targetMountID, err := parent.runtime.mountIDAt(
+		targetFD,
+		"",
+		unix.AT_EMPTY_PATH|unix.AT_NO_AUTOMOUNT,
+	)
 	if err != nil {
-		closeAllOnError()
+		closeTargetOnError()
 		return nil, false, fmt.Errorf("inspect opened BPF pin directory mount ID: %w", err)
 	}
-	if targetMountID != validated.mountID {
-		closeAllOnError()
-		return nil, false, fmt.Errorf("BPF pin directory %s is a nested mount", pinPath)
+	if targetMountID != parent.mountID {
+		closeTargetOnError()
+		return nil, false, fmt.Errorf("BPF pin directory %s is a nested mount", parent.pinPath)
 	}
+	var targetPathStat unix.Stat_t
+	if err := unix.Fstatat(
+		parentFD,
+		parent.base,
+		&targetPathStat,
+		unix.AT_SYMLINK_NOFOLLOW,
+	); err != nil {
+		closeTargetOnError()
+		return nil, false, fmt.Errorf("recheck opened BPF pin directory %s: %w", parent.pinPath, err)
+	}
+	targetAtPath := pinPathInodeFromStat(&targetPathStat)
+	if !samePinPathInode(targetAtPath, targetInode) ||
+		targetAtPath.uid != targetInode.uid ||
+		targetAtPath.mode&0o7777 != targetInode.mode&0o7777 ||
+		targetAtPath.nlink == 0 {
+		closeTargetOnError()
+		return nil, false, fmt.Errorf("BPF pin directory %s changed while opening", parent.pinPath)
+	}
+	parentPath := parent.path
+	parent.path = nil
 	return &pinPathHandle{
-		pinPath:     pinPath,
-		base:        base,
+		pinPath:     parent.pinPath,
+		base:        parent.base,
 		parentFD:    parentFD,
+		parentPath:  parentPath,
 		targetFD:    targetFD,
 		mountID:     targetMountID,
 		targetInode: targetInode,
-		runtime:     runtime,
+		runtime:     parent.runtime,
 	}, created, nil
+}
+
+func validateOwnedPinDirectory(
+	pinPath string,
+	identity pinPathInodeIdentity,
+	expectedUID uint32,
+) error {
+	if identity.mode&unix.S_IFMT != unix.S_IFDIR ||
+		identity.mode&0o7777 != 0o700 ||
+		identity.uid != expectedUID ||
+		identity.nlink == 0 {
+		return fmt.Errorf(
+			"refuse unsafe BPF pin directory %s: mode=%#o uid=%d links=%d; want directory 0700 uid=%d with non-zero links",
+			pinPath, identity.mode, identity.uid, identity.nlink, expectedUID,
+		)
+	}
+	return nil
+}
+
+func (parent *pinPathParent) Recheck() error {
+	if parent == nil || parent.path == nil {
+		return errors.New("bpffs parent anchor is unavailable")
+	}
+	if err := parent.path.Recheck(); err != nil {
+		return err
+	}
+	mountID, err := parent.runtime.mountIDAt(
+		parent.path.FD(),
+		"",
+		unix.AT_EMPTY_PATH|unix.AT_NO_AUTOMOUNT,
+	)
+	if err != nil {
+		return fmt.Errorf("recheck bpffs mount ID for %s: %w", parent.pinPath, err)
+	}
+	if mountID != parent.mountID {
+		return fmt.Errorf("bpffs mount identity changed for %s", parent.pinPath)
+	}
+	identity := parent.path.Identity()
+	if identity.device != parent.resource.parentDevice ||
+		identity.inode != parent.resource.parentInode {
+		return fmt.Errorf("bpffs resource identity changed for %s", parent.pinPath)
+	}
+	return nil
+}
+
+func (parent *pinPathParent) Close() error {
+	if parent == nil || parent.path == nil {
+		return nil
+	}
+	err := parent.path.Close()
+	parent.path = nil
+	return err
 }
 
 func (h *pinPathHandle) recheckTargetEntry() error {
 	if h == nil {
 		return nil
 	}
+	if h.parentPath == nil {
+		return fmt.Errorf("bpffs parent anchor for %s is unavailable", h.pinPath)
+	}
+	if err := h.parentPath.Recheck(); err != nil {
+		return fmt.Errorf("recheck bpffs boundary for %s: %w", h.pinPath, err)
+	}
 	var stat unix.Stat_t
 	if err := unix.Fstatat(h.parentFD, h.base, &stat, unix.AT_SYMLINK_NOFOLLOW); err != nil {
 		return fmt.Errorf("recheck BPF pin directory %s: %w", h.pinPath, err)
 	}
-	if !samePinPathInode(pinPathInodeFromStat(&stat), h.targetInode) {
+	current := pinPathInodeFromStat(&stat)
+	if !samePinPathInode(current, h.targetInode) ||
+		current.uid != h.targetInode.uid ||
+		current.mode&0o7777 != h.targetInode.mode&0o7777 ||
+		current.nlink == 0 {
 		return fmt.Errorf("BPF pin directory %s changed after it was opened", h.pinPath)
+	}
+	if err := validateOwnedPinDirectory(h.pinPath, current, h.runtime.expectedUID); err != nil {
+		return err
 	}
 	mountID, err := h.runtime.mountIDAt(
 		h.parentFD,
@@ -966,10 +1168,11 @@ func (h *pinPathHandle) Close() error {
 		}
 		h.targetFD = -1
 	}
-	if h.parentFD >= 0 {
-		if err := unix.Close(h.parentFD); err != nil {
+	if h.parentPath != nil {
+		if err := h.parentPath.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close bpffs mount root for %s: %w", h.pinPath, err))
 		}
+		h.parentPath = nil
 		h.parentFD = -1
 	}
 	return errors.Join(errs...)
@@ -1430,6 +1633,15 @@ func preparePinnedMapCleanup(pinPath string, runtime pinPathRuntime) (*pinnedMap
 	if err != nil {
 		return nil, err
 	}
+	return preparePinnedMapCleanupHandle(handle)
+}
+
+func preparePinnedMapCleanupHandle(
+	handle *pinPathHandle,
+) (*pinnedMapCleanupPlan, error) {
+	if handle == nil {
+		return &pinnedMapCleanupPlan{}, nil
+	}
 	pins, err := inspectPinnedMapSet(handle, true)
 	if err != nil {
 		_ = handle.Close()
@@ -1503,10 +1715,13 @@ func inspectPinnedMapSetWithPolicy(
 				handle.pinPath, descriptor.name, stat.Mode,
 			)
 		}
-		if stat.Nlink != 1 {
+		if stat.Mode&0o7777 != 0o600 ||
+			stat.Uid != handle.runtime.expectedUID ||
+			stat.Nlink != 1 {
 			return nil, fmt.Errorf(
-				"refuse pinned object %s/%s: link count is %d, want 1",
-				handle.pinPath, descriptor.name, stat.Nlink,
+				"refuse unsafe pinned object %s/%s: mode=%#o uid=%d links=%d; want 0600 uid=%d links=1",
+				handle.pinPath, descriptor.name,
+				stat.Mode, stat.Uid, stat.Nlink, handle.runtime.expectedUID,
 			)
 		}
 		mountID, err := handle.runtime.mountIDAt(
@@ -1605,7 +1820,10 @@ func recheckPinnedMapEntry(
 			stage, handle.pinPath, pin.descriptor.name, err,
 		)
 	}
-	if stat.Mode&unix.S_IFMT != unix.S_IFREG || stat.Nlink != 1 ||
+	if stat.Mode&unix.S_IFMT != unix.S_IFREG ||
+		stat.Mode&0o7777 != 0o600 ||
+		stat.Uid != handle.runtime.expectedUID ||
+		stat.Nlink != 1 ||
 		!samePinPathInode(pinPathInodeFromStat(&stat), pin.inode) {
 		return fmt.Errorf(
 			"%s for %s/%s: pin changed (mode=%#o links=%d)",

@@ -17,6 +17,7 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
+	"github.com/syx0310/wg-mix-ebpf/internal/pinidentity"
 )
 
 func TestXORTailCallBankStartAlternatesWithoutOverlap(t *testing.T) {
@@ -939,11 +940,10 @@ func TestFreshApplyRollbackRemovesDirectoryCreatedByAttempt(t *testing.T) {
 }
 
 func TestPinPathLockSerializesAndRecordsOwner(t *testing.T) {
-	runtime := pinPathRuntime{
-		lockRoot: filepath.Join(t.TempDir(), "pin-locks"),
-	}
+	runtime := newTestPinLockRuntime(t, filepath.Join(t.TempDir(), "pin-locks"))
 	pinPath := "/sys/fs/bpf/" + pinPathPrefix + "-lock-test"
-	first, err := acquirePinPathLock(context.Background(), pinPath, "apply", runtime)
+	resource := newTestPinResource(t, pinPath)
+	first, err := acquirePinPathLock(context.Background(), resource, "apply", runtime)
 	if err != nil {
 		t.Fatalf("acquire first lock: %v", err)
 	}
@@ -957,23 +957,27 @@ func TestPinPathLockSerializesAndRecordsOwner(t *testing.T) {
 	if err := json.Unmarshal(ownerBytes, &owner); err != nil {
 		t.Fatalf("decode lock owner: %v", err)
 	}
-	if owner.Version != pinPathOwnerV1 ||
+	if owner.Version != pinPathOwnerV2 ||
 		owner.PID != os.Getpid() ||
 		owner.Action != "apply" ||
+		owner.ResourceKey != resource.key ||
+		owner.ParentDevice != resource.parentDevice ||
+		owner.ParentInode != resource.parentInode ||
+		owner.PinBaseName != resource.base ||
 		owner.PinPath != pinPath {
 		t.Fatalf("lock owner = %+v", owner)
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
 	defer cancel()
-	if _, err := acquirePinPathLock(ctx, pinPath, "detach", runtime); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := acquirePinPathLock(ctx, resource, "detach", runtime); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("contended lock error = %v, want deadline exceeded", err)
 	}
 
 	if err := first.Close(); err != nil {
 		t.Fatalf("release first lock: %v", err)
 	}
-	second, err := acquirePinPathLock(context.Background(), pinPath, "detach", runtime)
+	second, err := acquirePinPathLock(context.Background(), resource, "detach", runtime)
 	if err != nil {
 		t.Fatalf("acquire released lock: %v", err)
 	}
@@ -997,6 +1001,12 @@ func TestPinRuntimeDerivesLockRootFromIsolatedLifecycleContext(t *testing.T) {
 	if got := loader.pinRuntime(ctx).lockRoot; got != want {
 		t.Fatalf("isolated pin lock root = %q, want %q", got, want)
 	}
+	if got, wantOwner := loader.pinRuntime(ctx).ownerRoot, filepath.Join(runDir, "pin-owners"); got != wantOwner {
+		t.Fatalf("isolated pin owner root = %q, want %q", got, wantOwner)
+	}
+	if got := loader.pinRuntime(ctx).bpffsRootMode; got != 0o700 {
+		t.Fatalf("isolated bpffs root mode = %#o, want 0700", got)
+	}
 	if got := loader.pinRuntime(ctx).lockRoot; strings.HasPrefix(got, "/run/wg-mix-ebpf/") {
 		t.Fatalf("isolated pin lock root escaped to production runtime: %q", got)
 	}
@@ -1004,7 +1014,15 @@ func TestPinRuntimeDerivesLockRootFromIsolatedLifecycleContext(t *testing.T) {
 
 func TestPinPathLockRejectsSymlinksAndHardlinks(t *testing.T) {
 	pinPath := "/sys/fs/bpf/" + pinPathPrefix + "-unsafe-lock"
-	lockName := pinPathLockFileName(pinPath)
+	resource := newTestPinResource(t, pinPath)
+	lockName, err := pinidentity.LockFileName(
+		resource.parentDevice,
+		resource.parentInode,
+		resource.base,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	t.Run("symlink", func(t *testing.T) {
 		lockRoot := filepath.Join(t.TempDir(), "pin-locks")
@@ -1018,8 +1036,8 @@ func TestPinPathLockRejectsSymlinksAndHardlinks(t *testing.T) {
 		if err := os.Symlink(target, filepath.Join(lockRoot, lockName)); err != nil {
 			t.Fatal(err)
 		}
-		runtime := pinPathRuntime{lockRoot: lockRoot}
-		if _, err := acquirePinPathLock(context.Background(), pinPath, "detach", runtime); err == nil {
+		runtime := newTestPinLockRuntime(t, lockRoot)
+		if _, err := acquirePinPathLock(context.Background(), resource, "detach", runtime); err == nil {
 			t.Fatal("symlink lock unexpectedly accepted")
 		}
 		assertFileContent(t, target, "keep")
@@ -1037,12 +1055,106 @@ func TestPinPathLockRejectsSymlinksAndHardlinks(t *testing.T) {
 		if err := os.Link(target, filepath.Join(lockRoot, lockName)); err != nil {
 			t.Fatal(err)
 		}
-		runtime := pinPathRuntime{lockRoot: lockRoot}
-		if _, err := acquirePinPathLock(context.Background(), pinPath, "detach", runtime); err == nil ||
+		runtime := newTestPinLockRuntime(t, lockRoot)
+		if _, err := acquirePinPathLock(context.Background(), resource, "detach", runtime); err == nil ||
 			!strings.Contains(err.Error(), "links=2") {
 			t.Fatalf("hardlink lock error = %v", err)
 		}
 		assertFileContent(t, target, "keep")
+	})
+}
+
+func TestPinPathLockRejectsUnsafeMetadataAndEntrySwap(t *testing.T) {
+	pinPath := "/sys/fs/bpf/" + pinPathPrefix + "-metadata-lock"
+	resource := newTestPinResource(t, pinPath)
+	lockName, err := pinidentity.LockFileName(
+		resource.parentDevice,
+		resource.parentInode,
+		resource.base,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("root mode", func(t *testing.T) {
+		lockRoot := filepath.Join(t.TempDir(), "pin-locks")
+		if err := os.Mkdir(lockRoot, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		runtime := newTestPinLockRuntime(t, lockRoot)
+		if _, err := acquirePinPathLock(
+			context.Background(),
+			resource,
+			"apply",
+			runtime,
+		); err == nil || !strings.Contains(err.Error(), "mode=") {
+			t.Fatalf("unsafe root mode error = %v", err)
+		}
+	})
+
+	t.Run("file mode", func(t *testing.T) {
+		lockRoot := filepath.Join(t.TempDir(), "pin-locks")
+		if err := os.Mkdir(lockRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(lockRoot, lockName), []byte("keep"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		runtime := newTestPinLockRuntime(t, lockRoot)
+		if _, err := acquirePinPathLock(
+			context.Background(),
+			resource,
+			"apply",
+			runtime,
+		); err == nil || !strings.Contains(err.Error(), "mode=") {
+			t.Fatalf("unsafe file mode error = %v", err)
+		}
+	})
+
+	t.Run("uid", func(t *testing.T) {
+		lockRoot := filepath.Join(t.TempDir(), "pin-locks")
+		if err := os.Mkdir(lockRoot, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		runtime := newTestPinLockRuntime(t, lockRoot)
+		runtime.expectedUID++
+		if _, err := acquirePinPathLock(
+			context.Background(),
+			resource,
+			"apply",
+			runtime,
+		); err == nil || !strings.Contains(err.Error(), "uid=") {
+			t.Fatalf("foreign uid error = %v", err)
+		}
+	})
+
+	t.Run("swap before write", func(t *testing.T) {
+		lockRoot := filepath.Join(t.TempDir(), "pin-locks")
+		runtime := newTestPinLockRuntime(t, lockRoot)
+		replacement := []byte("replacement\n")
+		runtime.beforeLockWrite = func(lockPath string) {
+			if err := os.Rename(lockPath, lockPath+".swapped"); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(lockPath, replacement, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if _, err := acquirePinPathLock(
+			context.Background(),
+			resource,
+			"apply",
+			runtime,
+		); err == nil || !strings.Contains(err.Error(), "changed") {
+			t.Fatalf("lock swap error = %v", err)
+		}
+		content, err := os.ReadFile(filepath.Join(lockRoot, lockName))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(content) != string(replacement) {
+			t.Fatalf("replacement lock was modified: %q", content)
+		}
 	})
 }
 
@@ -1251,12 +1363,45 @@ func newTestPinPathRuntime(
 ) pinPathRuntime {
 	t.Helper()
 	return pinPathRuntime{
-		validator: validator,
-		lockRoot:  filepath.Join(t.TempDir(), "pin-locks"),
+		validator:            validator,
+		lockRoot:             filepath.Join(t.TempDir(), "pin-locks"),
+		ownerRoot:            filepath.Join(t.TempDir(), "pin-owners"),
+		expectedUID:          uint32(os.Getuid()),
+		bpffsRootMode:        0o700,
+		allowUnsafeAncestors: true,
 		mountIDAt: func(int, string, int) (uint64, error) {
 			return 101, nil
 		},
 		loadPinnedMap: store.load,
+	}
+}
+
+func newTestPinLockRuntime(t *testing.T, lockRoot string) pinPathRuntime {
+	t.Helper()
+	return pinPathRuntime{
+		lockRoot:             lockRoot,
+		expectedUID:          uint32(os.Getuid()),
+		allowUnsafeAncestors: true,
+	}
+}
+
+func newTestPinResource(t *testing.T, pinPath string) pinResourceIdentity {
+	t.Helper()
+	const (
+		parentDevice = 42
+		parentInode  = 99
+	)
+	base := filepath.Base(pinPath)
+	key, err := pinidentity.Key(parentDevice, parentInode, base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pinResourceIdentity{
+		key:          key,
+		parentDevice: parentDevice,
+		parentInode:  parentInode,
+		base:         base,
+		pinPath:      pinPath,
 	}
 }
 
