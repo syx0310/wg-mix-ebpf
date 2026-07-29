@@ -200,6 +200,9 @@ func applyInstall(
 	defer func() {
 		retErr = errors.Join(retErr, publication.close())
 	}()
+	if err := publication.revalidateOwnedInstallMetadata(); err != nil {
+		return err
+	}
 	if stateDir == nil {
 		var exists bool
 		var err error
@@ -231,17 +234,20 @@ func applyInstall(
 	if err := runDir.close(); err != nil {
 		return fmt.Errorf("close runtime directory handles: %w", err)
 	}
-	if err := publication.revalidateOwnedConfig(); err != nil {
+	if err := publication.revalidateOwnedInstallMetadata(); err != nil {
 		return err
 	}
 	if err := installServiceArtifacts(paths, system); err != nil {
+		return err
+	}
+	if err := publication.revalidateOwnedInstallMetadata(); err != nil {
 		return err
 	}
 	if err := installBinary(paths.BinaryPath); err != nil {
 		return err
 	}
 	if publication.configFile != nil {
-		if err := publication.revalidateOwnedConfig(); err != nil {
+		if err := publication.revalidateOwnedInstallMetadata(); err != nil {
 			return err
 		}
 	} else if _, err := os.Stat(paths.ConfigPath); errors.Is(err, os.ErrNotExist) {
@@ -250,6 +256,9 @@ func applyInstall(
 		}
 	} else if err != nil {
 		return fmt.Errorf("stat config %s: %w", paths.ConfigPath, err)
+	}
+	if err := publication.revalidateOwnedInstallMetadata(); err != nil {
+		return err
 	}
 	switch system {
 	case "systemd":

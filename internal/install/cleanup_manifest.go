@@ -182,33 +182,88 @@ func inspectInstallCleanupOwnership(
 }
 
 func readCleanupManifestFromDir(dir *cleanupDirFD) (*cleanupManifest, cleanupIdentity, error) {
-	file, identity, err := cleanupOpenFileAt(dir, cleanupManifestName)
+	manifest, file, identity, _, err := openCleanupManifestFromDir(dir)
 	if err != nil {
 		return nil, cleanupIdentity{}, err
 	}
-	defer file.Close()
+	if err := file.Close(); err != nil {
+		return nil, cleanupIdentity{}, fmt.Errorf("close cleanup ownership manifest: %w", err)
+	}
+	return manifest, identity, nil
+}
+
+func openCleanupManifestFromDir(
+	dir *cleanupDirFD,
+) (
+	manifest *cleanupManifest,
+	file *os.File,
+	identity cleanupIdentity,
+	digest [sha256.Size]byte,
+	retErr error,
+) {
+	openedFile, identity, err := cleanupOpenFileAt(dir, cleanupManifestName)
+	if err != nil {
+		return nil, nil, cleanupIdentity{}, digest, err
+	}
+	defer func() {
+		if retErr != nil {
+			retErr = errors.Join(retErr, openedFile.Close())
+		}
+	}()
 	if err := identity.validateRegularFile(filepath.Join(dir.path, cleanupManifestName), uint32(os.Geteuid())); err != nil {
-		return nil, cleanupIdentity{}, err
+		return nil, nil, cleanupIdentity{}, digest, err
 	}
 	if identity.Mode&0o077 != 0 {
-		return nil, cleanupIdentity{}, fmt.Errorf(
+		return nil, nil, cleanupIdentity{}, digest, fmt.Errorf(
 			"refuse cleanup ownership manifest %s: mode %#o is not private",
 			filepath.Join(dir.path, cleanupManifestName),
 			identity.Mode&0o7777,
 		)
 	}
-	data, err := io.ReadAll(io.LimitReader(file, maxCleanupManifestSize+1))
+	data, err := io.ReadAll(io.LimitReader(openedFile, maxCleanupManifestSize+1))
 	if err != nil {
-		return nil, cleanupIdentity{}, fmt.Errorf("read cleanup ownership manifest: %w", err)
+		return nil, nil, cleanupIdentity{}, digest, fmt.Errorf(
+			"read cleanup ownership manifest: %w",
+			err,
+		)
 	}
 	if len(data) > maxCleanupManifestSize {
-		return nil, cleanupIdentity{}, errors.New("cleanup ownership manifest exceeds the size limit")
+		return nil, nil, cleanupIdentity{}, digest, errors.New(
+			"cleanup ownership manifest exceeds the size limit",
+		)
 	}
-	manifest, err := decodeCleanupManifest(data)
+	fdIdentity, err := cleanupIdentityForFD(int(openedFile.Fd()))
 	if err != nil {
-		return nil, cleanupIdentity{}, fmt.Errorf("parse cleanup ownership manifest: %w", err)
+		return nil, nil, cleanupIdentity{}, digest, fmt.Errorf(
+			"revalidate held cleanup ownership manifest: %w",
+			err,
+		)
 	}
-	return manifest, identity, nil
+	if !identity.sameRegularFile(fdIdentity) {
+		return nil, nil, cleanupIdentity{}, digest, errors.New(
+			"refuse cleanup ownership manifest: identity changed while reading",
+		)
+	}
+	namedIdentity, err := cleanupIdentityAt(dir, cleanupManifestName)
+	if err != nil {
+		return nil, nil, cleanupIdentity{}, digest, fmt.Errorf(
+			"revalidate cleanup ownership manifest name: %w",
+			err,
+		)
+	}
+	if !fdIdentity.sameRegularFile(namedIdentity) {
+		return nil, nil, cleanupIdentity{}, digest, errors.New(
+			"refuse cleanup ownership manifest: pathname changed while reading",
+		)
+	}
+	manifest, err = decodeCleanupManifest(data)
+	if err != nil {
+		return nil, nil, cleanupIdentity{}, digest, fmt.Errorf(
+			"parse cleanup ownership manifest: %w",
+			err,
+		)
+	}
+	return manifest, openedFile, fdIdentity, sha256.Sum256(data), nil
 }
 
 func decodeCleanupManifest(data []byte) (*cleanupManifest, error) {
@@ -235,6 +290,10 @@ type cleanupManifestPublication struct {
 	configFile       *os.File
 	configIdentity   cleanupIdentity
 	configName       string
+	manifestFile     *os.File
+	manifestIdentity cleanupIdentity
+	manifestDigest   [sha256.Size]byte
+	manifestName     string
 	stateDir         *managedCleanupDir
 	desired          cleanupManifest
 	alreadyPublished bool
@@ -248,6 +307,10 @@ func (publication *cleanupManifestPublication) close() error {
 	if publication.configFile != nil {
 		errs = append(errs, publication.configFile.Close())
 		publication.configFile = nil
+	}
+	if publication.manifestFile != nil {
+		errs = append(errs, publication.manifestFile.Close())
+		publication.manifestFile = nil
 	}
 	if publication.configDir != nil {
 		errs = append(errs, publication.configDir.close())
@@ -279,18 +342,19 @@ func prepareCleanupManifestPublication(
 
 	installationID := ""
 	var freshStateDir *managedCleanupDir
-	manifest, _, err := readCleanupManifestFromDir(configDir.dir)
+	manifest, manifestFile, manifestIdentity, manifestDigest, err :=
+		openCleanupManifestFromDir(configDir.dir)
 	switch {
 	case err == nil:
 		if err := manifest.validateAgainst(paths, system); err != nil {
-			return nil, err
+			return nil, errors.Join(err, manifestFile.Close())
 		}
 		configFile, configIdentity, err := openOwnedConfigForReinstall(
 			configDir,
 			paths.ConfigPath,
 		)
 		if err != nil {
-			return nil, err
+			return nil, errors.Join(err, manifestFile.Close())
 		}
 		publication := &cleanupManifestPublication{
 			paths:            paths,
@@ -299,6 +363,10 @@ func prepareCleanupManifestPublication(
 			configFile:       configFile,
 			configIdentity:   configIdentity,
 			configName:       filepath.Base(paths.ConfigPath),
+			manifestFile:     manifestFile,
+			manifestIdentity: manifestIdentity,
+			manifestDigest:   manifestDigest,
+			manifestName:     cleanupManifestName,
 			alreadyPublished: true,
 		}
 		configDir = nil
@@ -367,7 +435,7 @@ func (publication *cleanupManifestPublication) publish() (retErr error) {
 		return errors.New("cannot publish a nil cleanup ownership manifest")
 	}
 	if publication.alreadyPublished {
-		return publication.revalidateOwnedConfig()
+		return publication.revalidateOwnedInstallMetadata()
 	}
 	if publication.configDir == nil {
 		return errors.New("cleanup ownership publication has no held config directory")
@@ -543,6 +611,56 @@ func (publication *cleanupManifestPublication) revalidateOwnedConfig() error {
 		)
 	}
 	return nil
+}
+
+func (publication *cleanupManifestPublication) revalidateOwnedManifest() error {
+	if publication == nil || publication.manifestFile == nil {
+		return nil
+	}
+	if publication.configDir == nil {
+		return errors.New("marked install manifest lost its held parent directory")
+	}
+	if err := revalidateManagedCleanupDir(publication.configDir); err != nil {
+		return fmt.Errorf("revalidate marked install manifest directory: %w", err)
+	}
+	if _, err := publication.manifestFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("rewind held marked install manifest: %w", err)
+	}
+	data, err := io.ReadAll(
+		io.LimitReader(publication.manifestFile, maxCleanupManifestSize+1),
+	)
+	if err != nil {
+		return fmt.Errorf("re-read held marked install manifest: %w", err)
+	}
+	if len(data) > maxCleanupManifestSize ||
+		sha256.Sum256(data) != publication.manifestDigest {
+		return errors.New("refuse marked install manifest: content changed")
+	}
+	fdIdentity, err := cleanupIdentityForFD(int(publication.manifestFile.Fd()))
+	if err != nil {
+		return fmt.Errorf("revalidate held marked install manifest: %w", err)
+	}
+	if !publication.manifestIdentity.sameRegularFile(fdIdentity) {
+		return errors.New("refuse marked install manifest: held identity changed")
+	}
+	namedIdentity, err := cleanupIdentityAt(
+		publication.configDir.dir,
+		publication.manifestName,
+	)
+	if err != nil {
+		return fmt.Errorf("revalidate marked install manifest name: %w", err)
+	}
+	if !fdIdentity.sameRegularFile(namedIdentity) {
+		return errors.New("refuse marked install manifest: pathname changed")
+	}
+	return nil
+}
+
+func (publication *cleanupManifestPublication) revalidateOwnedInstallMetadata() error {
+	if err := publication.revalidateOwnedManifest(); err != nil {
+		return err
+	}
+	return publication.revalidateOwnedConfig()
 }
 
 func writeCleanupManifest(

@@ -1633,6 +1633,44 @@ func TestMarkedReinstallRetainsConfigDescriptorIdentity(t *testing.T) {
 	}
 }
 
+func TestMarkedReinstallRetainsManifestDescriptorIdentity(t *testing.T) {
+	layout := newCleanupTestLayout(t, "marked-manifest-identity")
+	publication, err := prepareCleanupManifestPublication(
+		layout,
+		"unknown",
+		cleanupManifestWriteOptions{},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer publication.close()
+
+	markerPath := cleanupManifestPath(layout)
+	markerData, err := os.ReadFile(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	originalMarker := markerPath + ".original"
+	if err := os.Rename(markerPath, originalMarker); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(markerPath, markerData, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := publication.publish(); err == nil ||
+		!strings.Contains(err.Error(), "marked install manifest") {
+		t.Fatalf("publication error = %v, want held manifest identity rejection", err)
+	}
+	if data, readErr := os.ReadFile(originalMarker); readErr != nil ||
+		string(data) != string(markerData) {
+		t.Fatalf("held original manifest changed: data=%q err=%v", data, readErr)
+	}
+	if data, readErr := os.ReadFile(markerPath); readErr != nil ||
+		string(data) != string(markerData) {
+		t.Fatalf("foreign manifest replacement changed: data=%q err=%v", data, readErr)
+	}
+}
+
 func TestWriteCleanupManifestRefusesUnknownUnmarkedResource(t *testing.T) {
 	layout := cleanupTestPaths(t.TempDir(), "marker-bootstrap")
 	for _, dir := range []string{
