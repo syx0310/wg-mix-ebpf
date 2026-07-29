@@ -112,6 +112,17 @@ func TestParseIsolatedNetNSTestManifestAndLayout(t *testing.T) {
 	); err != nil {
 		t.Fatalf("validate manifest layout: %v", err)
 	}
+	manifest.values["pin_lock_a"] = "/run/wg-mix-ebpf/pin-locks/foreign.lock"
+	if err := validateIsolatedNetNSTestManifestLayout(
+		manifest,
+		layout,
+		configPath,
+		runDir,
+		stateDir,
+		pinPath,
+	); err == nil {
+		t.Fatal("production pin lock path unexpectedly accepted")
+	}
 }
 
 func TestParseIsolatedNetNSTestManifestRejectsMalformedDocuments(t *testing.T) {
@@ -381,6 +392,9 @@ func isolatedFixtureLayout(
 func isolatedFixtureManifest(layout isolatedNetNSTestLayout) []byte {
 	base := layout.runBase
 	secrets := filepath.Join(base, "secrets")
+	pinLockRoot := filepath.Join(base, "pin-locks")
+	pinA := filepath.Join(layout.bpffsDir, "wg-mix-ebpf-a")
+	pinB := filepath.Join(layout.bpffsDir, "wg-mix-ebpf-b")
 	return []byte(fmt.Sprintf(
 		`format=%s
 run_id=%s
@@ -391,6 +405,9 @@ run_base=%s
 bpffs=%s
 bpffs_source=wg-mix-ebpf-%s
 bpffs_mount_id=42
+pin_lock_root=%s
+pin_lock_a=%s
+pin_lock_b=%s
 role_a=a
 pin_a=%s
 role_b=b
@@ -423,8 +440,11 @@ secrets=%s
 		base,
 		layout.bpffsDir,
 		layout.runID,
-		filepath.Join(layout.bpffsDir, "wg-mix-ebpf-a"),
-		filepath.Join(layout.bpffsDir, "wg-mix-ebpf-b"),
+		pinLockRoot,
+		isolatedNetNSPinLockPath(pinLockRoot, pinA),
+		isolatedNetNSPinLockPath(pinLockRoot, pinB),
+		pinA,
+		pinB,
 		layout.runID,
 		layout.runID,
 		layout.runID,
