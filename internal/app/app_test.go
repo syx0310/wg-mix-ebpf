@@ -360,10 +360,11 @@ func TestInitNonInteractiveCreatesConfig(t *testing.T) {
 
 func TestInstallDryRunUsesOverrides(t *testing.T) {
 	dir := t.TempDir()
-	t.Setenv("WG_MIX_EBPF_ETC_DIR", filepath.Join(dir, "etc"))
+	t.Setenv("WG_MIX_EBPF_ETC_DIR", filepath.Join(dir, "wg-mix-ebpf"))
 	t.Setenv("WG_MIX_EBPF_BINARY_PATH", filepath.Join(dir, "sbin", "wg-mix-ebpf"))
-	t.Setenv("WG_MIX_EBPF_VAR_LIB_DIR", filepath.Join(dir, "varlib"))
-	t.Setenv("WG_MIX_EBPF_RUN_DIR", filepath.Join(dir, "run"))
+	t.Setenv("WG_MIX_EBPF_VAR_LIB_DIR", filepath.Join(dir, "wg-mix-ebpf-state-test"))
+	t.Setenv("WG_MIX_EBPF_RUN_DIR", filepath.Join(dir, "wg-mix-ebpf-run-test"))
+	t.Setenv("WG_MIX_EBPF_PIN_PATH", filepath.Join(dir, "wg-mix-ebpf-pins-test"))
 	t.Setenv("WG_MIX_EBPF_SYSTEMD_DIR", filepath.Join(dir, "systemd"))
 	var stdout, stderr bytes.Buffer
 	if err := Run(t.Context(), []string{"install", "--system", "systemd", "--dry-run", "--enable"}, &stdout, &stderr); err != nil {

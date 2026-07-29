@@ -3,6 +3,7 @@ package install
 import (
 	"bufio"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -14,11 +15,13 @@ import (
 	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
+	"github.com/syx0310/wg-mix-ebpf/internal/config"
+	"github.com/syx0310/wg-mix-ebpf/internal/daemon"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
 
 func TestUninstallPurgeRejectsNonOwnedConfigDir(t *testing.T) {
-	t.Setenv(EnvEtcDir, filepath.Join(t.TempDir(), "etc", "wg-mix-ebpf"))
+	t.Setenv(EnvEtcDir, filepath.Join(t.TempDir(), "wg-mix-ebpf-owned"))
 	_, err := Uninstall(t.Context(), Options{
 		ConfigPath: filepath.Join(t.TempDir(), "config.yaml"),
 		System:     "unknown",
@@ -30,9 +33,9 @@ func TestUninstallPurgeRejectsNonOwnedConfigDir(t *testing.T) {
 	}
 }
 
-func TestUninstallPurgeAllowsOwnedConfigDir(t *testing.T) {
-	dir := t.TempDir()
-	etcDir := filepath.Join(dir, "etc", "wg-mix-ebpf")
+func TestUninstallPurgeAllowsOwnedEmptyConfigDir(t *testing.T) {
+	root := t.TempDir()
+	etcDir := filepath.Join(root, "wg-mix-ebpf-owned")
 	t.Setenv(EnvEtcDir, etcDir)
 	plan, err := Uninstall(t.Context(), Options{
 		ConfigPath: filepath.Join(etcDir, "config.yaml"),
@@ -41,7 +44,7 @@ func TestUninstallPurgeAllowsOwnedConfigDir(t *testing.T) {
 		Purge:      true,
 	})
 	if err != nil {
-		t.Fatalf("expected owned purge dry-run to pass: %v", err)
+		t.Fatalf("expected owned empty purge dry-run to pass: %v", err)
 	}
 	if !containsAction(plan.Actions, "purge owned config dir "+etcDir) {
 		t.Fatalf("missing owned purge action: %#v", plan.Actions)
@@ -67,25 +70,20 @@ func TestOpenWrtHotplugDoesNotUseNanosecondDate(t *testing.T) {
 	if !strings.Contains(script, "/proc/uptime") {
 		t.Fatalf("hotplug script should use portable changing content:\n%s", script)
 	}
-	if !strings.Contains(script, "/run/wg-mix-ebpf/runtime.request") || strings.Contains(script, "/run/wg-mix-ebpf/reload.request") {
+	if !strings.Contains(script, "/run/wg-mix-ebpf/runtime.request") ||
+		strings.Contains(script, "/run/wg-mix-ebpf/reload.request") {
 		t.Fatalf("hotplug must not overwrite acknowledged CLI request files:\n%s", script)
 	}
 }
 
 func TestInstallRejectsHeldGlobalLifecycleLeaseBeforeWrites(t *testing.T) {
-	dir := t.TempDir()
-	etcDir := filepath.Join(dir, "etc", "wg-mix-ebpf")
-	runDir := filepath.Join(dir, "run")
-	binaryPath := filepath.Join(dir, "sbin", "wg-mix-ebpf")
-	t.Setenv(EnvEtcDir, etcDir)
-	t.Setenv(EnvBinaryPath, binaryPath)
-	t.Setenv(EnvVarLibDir, filepath.Join(dir, "state"))
-	t.Setenv(daemonEnvRunDirForTest, runDir)
-
+	root := t.TempDir()
+	layout := cleanupTestPaths(root, "install-held")
+	setCleanupTestEnvironment(t, layout)
 	ctx := lockfile.WithLifecyclePathsForTest(
 		t.Context(),
-		filepath.Join(dir, "daemon.lease"),
-		filepath.Join(dir, "maintenance.gate"),
+		filepath.Join(root, "daemon.lease"),
+		filepath.Join(root, "maintenance.gate"),
 	)
 	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
 		PID:    os.Getpid(),
@@ -101,7 +99,7 @@ func TestInstallRejectsHeldGlobalLifecycleLeaseBeforeWrites(t *testing.T) {
 	if !errors.Is(err, lockfile.ErrLifecycleLeaseHeld) {
 		t.Fatalf("install error = %v, want held lifecycle lease", err)
 	}
-	for _, path := range []string{filepath.Join(etcDir, "config.yaml"), binaryPath, runDir} {
+	for _, path := range []string{layout.ConfigPath, layout.BinaryPath, layout.RunDir} {
 		if _, statErr := os.Stat(path); !errors.Is(statErr, os.ErrNotExist) {
 			t.Fatalf("install wrote %s before acquiring lifecycle ownership: %v", path, statErr)
 		}
@@ -109,26 +107,21 @@ func TestInstallRejectsHeldGlobalLifecycleLeaseBeforeWrites(t *testing.T) {
 }
 
 func TestUninstallRejectsHeldGlobalLifecycleLeaseBeforeCleanup(t *testing.T) {
-	dir := t.TempDir()
-	runDir := filepath.Join(dir, "run")
-	stateDir := filepath.Join(dir, "state")
-	marker := filepath.Join(stateDir, "keep")
-	if err := os.MkdirAll(stateDir, 0o755); err != nil {
+	layout := newCleanupTestLayout(t, "uninstall-held")
+	attachStatePath := attachstate.Path(layout.VarLibDir)
+	if err := attachstate.Save(layout.VarLibDir, &attachstate.State{
+		Version:    1,
+		ConfigPath: layout.ConfigPath,
+	}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(marker, []byte("keep"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv(EnvEtcDir, filepath.Join(dir, "etc", "wg-mix-ebpf"))
-	t.Setenv(EnvBinaryPath, filepath.Join(dir, "sbin", "wg-mix-ebpf"))
-	t.Setenv(EnvVarLibDir, stateDir)
-	t.Setenv(daemonEnvRunDirForTest, runDir)
-	t.Setenv(dataplaneEnvPinPathForTest, filepath.Join(dir, "pins"))
+	setCleanupTestEnvironment(t, layout)
 
+	lifecycleRoot := t.TempDir()
 	ctx := lockfile.WithLifecyclePathsForTest(
 		t.Context(),
-		filepath.Join(dir, "daemon.lease"),
-		filepath.Join(dir, "maintenance.gate"),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
 	)
 	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
 		PID:    os.Getpid(),
@@ -140,20 +133,28 @@ func TestUninstallRejectsHeldGlobalLifecycleLeaseBeforeCleanup(t *testing.T) {
 	}
 	defer lease.Close()
 
-	_, err = Uninstall(ctx, Options{System: "unknown", Yes: true})
+	_, err = Uninstall(ctx, Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "unknown",
+		Yes:        true,
+	})
 	if !errors.Is(err, lockfile.ErrLifecycleLeaseHeld) {
 		t.Fatalf("uninstall error = %v, want held lifecycle lease", err)
 	}
-	if _, err := os.Stat(marker); err != nil {
+	if _, err := os.Stat(attachStatePath); err != nil {
 		t.Fatalf("uninstall cleaned state before acquiring lifecycle ownership: %v", err)
 	}
 }
 
 func TestUninstallKeepsBinaryHint(t *testing.T) {
-	dir := t.TempDir()
-	t.Setenv(EnvEtcDir, filepath.Join(dir, "etc", "wg-mix-ebpf"))
-	t.Setenv(EnvBinaryPath, filepath.Join(dir, "sbin", "wg-mix-ebpf"))
-	plan, err := Uninstall(t.Context(), Options{System: "unknown", DryRun: true})
+	root := t.TempDir()
+	layout := cleanupTestPaths(root, "hint")
+	setCleanupTestEnvironment(t, layout)
+	plan, err := Uninstall(t.Context(), Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "unknown",
+		DryRun:     true,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,18 +164,15 @@ func TestUninstallKeepsBinaryHint(t *testing.T) {
 }
 
 func TestUninstallDoesNotDeadlockWhenConfigExists(t *testing.T) {
-	dir := t.TempDir()
-	dir, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("TMPDIR", dir)
-	fakeBin := filepath.Join(dir, "bin")
+	layout := newCleanupTestLayout(t, "deadlock")
+	setCleanupTestEnvironment(t, layout)
+	controlDir := t.TempDir()
+	fakeBin := filepath.Join(controlDir, "bin")
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	readyPath := filepath.Join(dir, "nft-ready")
-	releasePath := filepath.Join(dir, "nft-release")
+	readyPath := filepath.Join(controlDir, "nft-ready")
+	releasePath := filepath.Join(controlDir, "nft-release")
 	for _, path := range []string{readyPath, releasePath} {
 		if err := syscall.Mkfifo(path, 0o600); err != nil {
 			t.Fatalf("create fake nft control FIFO %s: %v", path, err)
@@ -212,45 +210,19 @@ func TestUninstallDoesNotDeadlockWhenConfigExists(t *testing.T) {
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	t.Setenv("WG_MIX_EBPF_TEST_NFT_READY_FIFO", readyPath)
 	t.Setenv("WG_MIX_EBPF_TEST_NFT_RELEASE_FIFO", releasePath)
-	etcDir := filepath.Join(dir, "etc", "wg-mix-ebpf")
-	runDir := filepath.Join(dir, "run")
-	stateDir := filepath.Join(dir, "state")
-	pinDir := filepath.Join(dir, "pins")
-	binaryPath := filepath.Join(dir, "sbin", "wg-mix-ebpf")
-	for _, d := range []string{etcDir, runDir, stateDir, pinDir, filepath.Dir(binaryPath)} {
-		if err := os.MkdirAll(d, 0o755); err != nil {
-			t.Fatal(err)
-		}
-	}
-	configPath := filepath.Join(etcDir, "config.yaml")
-	if err := os.WriteFile(configPath, []byte(`version: 1
-underlays: []
-wireguards: []
-profiles:
-  mix-default:
-    preset: wireguard-mix-wire-values-v1
-startup_guard:
-  mode: none
-`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv(EnvEtcDir, etcDir)
-	t.Setenv(daemonEnvRunDirForTest, runDir)
-	t.Setenv(EnvVarLibDir, stateDir)
-	t.Setenv(dataplaneEnvPinPathForTest, pinDir)
-	t.Setenv(EnvBinaryPath, binaryPath)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
+	lifecycleRoot := t.TempDir()
 	ctx = lockfile.WithLifecyclePathsForTest(
 		ctx,
-		filepath.Join(dir, "daemon.lease"),
-		filepath.Join(dir, "maintenance.gate"),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
 	)
 
 	uninstallDone := make(chan error, 1)
 	go func() {
-		_, err := Uninstall(ctx, Options{ConfigPath: configPath, System: "unknown", Yes: true})
+		_, err := Uninstall(ctx, Options{ConfigPath: layout.ConfigPath, System: "unknown", Yes: true})
 		uninstallDone <- err
 	}()
 
@@ -346,6 +318,61 @@ startup_guard:
 	}
 }
 
+func TestRepeatedUninstallDoesNotLeaveRecreatedRuntime(t *testing.T) {
+	layout := newCleanupTestLayout(t, "repeat")
+	setCleanupTestEnvironment(t, layout)
+	installFakeNft(t, "")
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if _, err := Uninstall(ctx, Options{
+			ConfigPath: layout.ConfigPath,
+			System:     "unknown",
+			Yes:        true,
+		}); err != nil {
+			t.Fatalf("uninstall attempt %d: %v", attempt, err)
+		}
+		if _, err := os.Stat(layout.RunDir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("uninstall attempt %d left or recreated runtime dir: %v", attempt, err)
+		}
+		if _, err := os.Stat(cleanupManifestPath(layout)); err != nil {
+			t.Fatalf("uninstall attempt %d removed retained ownership manifest: %v", attempt, err)
+		}
+	}
+}
+
+func TestUninstallPurgeRemovesOwnedConfigAndIsIdempotent(t *testing.T) {
+	layout := newCleanupTestLayout(t, "purge-success")
+	setCleanupTestEnvironment(t, layout)
+	installFakeNft(t, "")
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+	opts := Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "unknown",
+		Yes:        true,
+		Purge:      true,
+	}
+
+	for attempt := 1; attempt <= 2; attempt++ {
+		if _, err := Uninstall(ctx, opts); err != nil {
+			t.Fatalf("purge attempt %d: %v", attempt, err)
+		}
+		if _, err := os.Stat(filepath.Dir(layout.ConfigPath)); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("purge attempt %d retained owned config dir: %v", attempt, err)
+		}
+	}
+}
+
 func TestUninstallRejectsDangerousCleanupPaths(t *testing.T) {
 	t.Setenv(dataplaneEnvPinPathForTest, "/sys/fs/bpf")
 	_, err := Uninstall(t.Context(), Options{System: "unknown", DryRun: true})
@@ -354,9 +381,127 @@ func TestUninstallRejectsDangerousCleanupPaths(t *testing.T) {
 	}
 }
 
+func TestValidateCleanupPathsRejectsBroadAndNonProjectPaths(t *testing.T) {
+	root := t.TempDir()
+	safe := cleanupTestPaths(root, "safe")
+	tests := []struct {
+		name   string
+		mutate func(*paths)
+		want   string
+	}{
+		{
+			name:   "runtime service directory",
+			mutate: func(p *paths) { p.RunDir = "/run/systemd" },
+			want:   "unsafe runtime dir",
+		},
+		{
+			name:   "state service directory",
+			mutate: func(p *paths) { p.VarLibDir = "/var/lib/systemd" },
+			want:   "unsafe state dir",
+		},
+		{
+			name:   "unrelated BPF subtree",
+			mutate: func(p *paths) { p.PinPath = "/sys/fs/bpf/cilium" },
+			want:   "unsafe BPF pin path",
+		},
+		{
+			name:   "wide runtime root",
+			mutate: func(p *paths) { p.RunDir = "/run" },
+			want:   "unsafe runtime dir",
+		},
+		{
+			name:   "relative state path",
+			mutate: func(p *paths) { p.VarLibDir = "wg-mix-ebpf-state" },
+			want:   "unsafe state dir",
+		},
+		{
+			name:   "non-clean pin path",
+			mutate: func(p *paths) { p.PinPath = "/sys/fs/bpf/../bpf/wg-mix-ebpf-test" },
+			want:   "non-clean BPF pin path",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidate := safe
+			test.mutate(&candidate)
+			err := validateCleanupPaths(candidate)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("validateCleanupPaths error = %v, want substring %q", err, test.want)
+			}
+		})
+	}
+}
+
+func TestOpenManagedCleanupDirRejectsFileAndSymlinkTargets(t *testing.T) {
+	root := t.TempDir()
+	fileTarget := filepath.Join(root, "wg-mix-ebpf-run-file")
+	if err := os.WriteFile(fileTarget, []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := openManagedCleanupDir(runtimeCleanupPath(fileTarget)); err == nil {
+		t.Fatal("ordinary-file target should be rejected")
+	}
+	if data, err := os.ReadFile(fileTarget); err != nil || string(data) != "keep\n" {
+		t.Fatalf("ordinary-file target changed: data=%q err=%v", data, err)
+	}
+
+	realTarget := filepath.Join(t.TempDir(), "real")
+	if err := os.Mkdir(realTarget, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	marker := filepath.Join(realTarget, "keep")
+	if err := os.WriteFile(marker, []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	symlinkTarget := filepath.Join(root, "wg-mix-ebpf-run-link")
+	if err := os.Symlink(realTarget, symlinkTarget); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := openManagedCleanupDir(runtimeCleanupPath(symlinkTarget)); err == nil {
+		t.Fatal("symlink target should be rejected")
+	}
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatalf("symlink target contents changed: %v", err)
+	}
+}
+
+func TestOpenManagedCleanupDirRejectsSymlinkedParent(t *testing.T) {
+	root := t.TempDir()
+	realParent := filepath.Join(t.TempDir(), "real-parent")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	linkParent := filepath.Join(root, "parent")
+	if err := os.Symlink(realParent, linkParent); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(linkParent, "wg-mix-ebpf-run-parent-link")
+	if _, _, err := openManagedCleanupDir(runtimeCleanupPath(target)); err == nil {
+		t.Fatal("symlinked parent should be rejected")
+	}
+}
+
+func TestOpenManagedCleanupDirRejectsMountIdentityChange(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "wg-mix-ebpf-run-other-fs")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	_, _, err := openManagedCleanupDirWithOptions(
+		runtimeCleanupPath(target),
+		managedDirOpenOptions{identityHook: func(path string, identity *cleanupIdentity) {
+			if filepath.Clean(path) == filepath.Clean(target) {
+				identity.MountKnown = true
+				identity.MountID++
+			}
+		}},
+	)
+	if err == nil || !strings.Contains(err.Error(), "crosses a mount boundary") {
+		t.Fatalf("mount-boundary error = %v, want rejection", err)
+	}
+}
+
 func TestInstallBinaryReplacesModeAtomically(t *testing.T) {
-	dir := t.TempDir()
-	target := filepath.Join(dir, "wg-mix-ebpf")
+	target := filepath.Join(t.TempDir(), "wg-mix-ebpf")
 	if err := os.WriteFile(target, []byte("stale"), 0o777); err != nil {
 		t.Fatal(err)
 	}
@@ -386,41 +531,657 @@ func TestInstallBinaryReplacesModeAtomically(t *testing.T) {
 }
 
 func TestUninstallStopsWhenOnlyAttachStateExists(t *testing.T) {
-	dir := t.TempDir()
-	stateDir := filepath.Join(dir, "state")
+	stateDir := filepath.Join(t.TempDir(), "state")
 	if err := attachstate.Save(stateDir, &attachstate.State{Version: 1}); err != nil {
 		t.Fatal(err)
 	}
-	p := paths{ConfigPath: filepath.Join(dir, "missing.yaml"), VarLibDir: stateDir}
-	if !shouldStopForUninstall(p) {
+	candidate := paths{ConfigPath: filepath.Join(t.TempDir(), "missing.yaml"), VarLibDir: stateDir}
+	if !shouldStopForUninstall(candidate) {
 		t.Fatal("uninstall should run stop cleanup when attach-state exists even if config is missing")
 	}
 }
 
-func TestCleanupRuntimeDirPreservesLifecycleInode(t *testing.T) {
-	runDir := t.TempDir()
-	leasePath := filepath.Join(runDir, "daemon.lease")
-	if err := os.WriteFile(leasePath, []byte("owner\n"), 0o600); err != nil {
+func TestInstallWritesCleanupOwnershipManifest(t *testing.T) {
+	root := t.TempDir()
+	layout := cleanupTestPaths(root, "install")
+	setCleanupTestEnvironment(t, layout)
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(root, "daemon.lease"),
+		filepath.Join(root, "maintenance.gate"),
+	)
+	if _, err := Install(ctx, Options{System: "unknown"}); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(runDir, "status.json"), []byte("{}"), 0o600); err != nil {
+	data, err := os.ReadFile(cleanupManifestPath(layout))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := os.MkdirAll(filepath.Join(runDir, "requests"), 0o700); err != nil {
+	var manifest cleanupManifest
+	if err := json.Unmarshal(data, &manifest); err != nil {
 		t.Fatal(err)
 	}
-	if err := cleanupRuntimeDir(runDir, leasePath); err != nil {
+	if err := manifest.validateAgainst(layout, "unknown"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(cleanupManifestPath(layout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("manifest mode = %#o, want 0600", info.Mode().Perm())
+	}
+}
+
+func TestWriteCleanupManifestPreservesValidatedMarkerIdentity(t *testing.T) {
+	layout := newCleanupTestLayout(t, "marker-idempotent")
+	markerPath := cleanupManifestPath(layout)
+	before, err := os.Stat(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writeCleanupManifest(layout, "unknown"); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.Stat(markerPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("idempotent manifest write replaced the validated marker inode")
+	}
+}
+
+func TestWriteCleanupManifestRefusesUnknownUnmarkedResource(t *testing.T) {
+	layout := cleanupTestPaths(t.TempDir(), "marker-bootstrap")
+	for _, dir := range []string{
+		filepath.Dir(layout.ConfigPath),
+		layout.RunDir,
+		layout.VarLibDir,
+		layout.PinPath,
+	} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := config.SaveFile(layout.ConfigPath, config.SafeTemplate()); err != nil {
+		t.Fatal(err)
+	}
+	foreignPath := filepath.Join(layout.RunDir, "foreign")
+	if err := os.WriteFile(foreignPath, []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	err := writeCleanupManifest(layout, "unknown")
+	if err == nil || !strings.Contains(err.Error(), "unmarked runtime") {
+		t.Fatalf("manifest bootstrap error = %v, want foreign-resource rejection", err)
+	}
+	if _, statErr := os.Stat(cleanupManifestPath(layout)); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("failed bootstrap installed ownership marker: %v", statErr)
+	}
+	if data, readErr := os.ReadFile(foreignPath); readErr != nil || string(data) != "keep\n" {
+		t.Fatalf("failed bootstrap changed foreign resource: data=%q err=%v", data, readErr)
+	}
+}
+
+func TestPrepareCleanupRejectsForeignSameNameWithoutManifest(t *testing.T) {
+	layout := cleanupTestPaths(t.TempDir(), "foreign-no-marker")
+	for _, dir := range []string{
+		filepath.Dir(layout.ConfigPath),
+		layout.RunDir,
+		layout.VarLibDir,
+		layout.PinPath,
+	} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	statusPath := filepath.Join(layout.RunDir, "status.json")
+	if err := os.WriteFile(statusPath, []byte("foreign\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := prepareUninstallCleanup(
+		layout,
+		"unknown",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "ownership manifest") {
+		t.Fatalf("prepare error = %v, want ownership-manifest rejection", err)
+	}
+	if data, readErr := os.ReadFile(statusPath); readErr != nil || string(data) != "foreign\n" {
+		t.Fatalf("foreign same-name file changed: data=%q err=%v", data, readErr)
+	}
+}
+
+func TestPrepareCleanupRejectsForeignSameNameContent(t *testing.T) {
+	layout := newCleanupTestLayout(t, "foreign-content")
+	statusPath := filepath.Join(layout.RunDir, "status.json")
+	if err := os.WriteFile(statusPath, []byte("not project json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := prepareUninstallCleanup(
+		layout,
+		"unknown",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "validate managed file") {
+		t.Fatalf("prepare error = %v, want content-identity rejection", err)
+	}
+	if data, readErr := os.ReadFile(statusPath); readErr != nil || string(data) != "not project json\n" {
+		t.Fatalf("foreign same-name file changed: data=%q err=%v", data, readErr)
+	}
+}
+
+func TestPrepareCleanupRejectsSymlinkedRetainedConfig(t *testing.T) {
+	layout := newCleanupTestLayout(t, "config-link")
+	foreignConfig := filepath.Join(t.TempDir(), "config.yaml")
+	if err := config.SaveFile(foreignConfig, config.SafeTemplate()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(layout.ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(foreignConfig, layout.ConfigPath); err != nil {
+		t.Fatal(err)
+	}
+	_, err := prepareUninstallCleanup(
+		layout,
+		"unknown",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err == nil {
+		t.Fatal("retained config symlink should be rejected before stop")
+	}
+	if _, statErr := os.Stat(foreignConfig); statErr != nil {
+		t.Fatalf("foreign config behind symlink changed: %v", statErr)
+	}
+}
+
+func TestGlobalPreflightLateFailureLeavesEarlierTargetsUntouched(t *testing.T) {
+	layout := newCleanupTestLayout(t, "global-preflight")
+	statusPath := writeCleanupTestStatus(t, layout)
+	statePath := attachstate.Path(layout.VarLibDir)
+	if err := attachstate.Save(layout.VarLibDir, &attachstate.State{
+		Version:    1,
+		ConfigPath: layout.ConfigPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	unknownPath := filepath.Join(layout.VarLibDir, "foreign")
+	if err := os.WriteFile(unknownPath, []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	setCleanupTestEnvironment(t, layout)
+	commandLog := filepath.Join(t.TempDir(), "nft-invoked")
+	installFakeNft(t, commandLog)
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+	_, err := Uninstall(ctx, Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "unknown",
+		Yes:        true,
+	})
+	if err == nil || !strings.Contains(err.Error(), "unknown state entry") {
+		t.Fatalf("uninstall error = %v, want late state rejection", err)
+	}
+	for _, path := range []string{statusPath, statePath, unknownPath} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("global preflight removed %s: %v", path, statErr)
+		}
+	}
+	if _, statErr := os.Stat(commandLog); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("global preflight invoked reconcile/guard command before rejecting late target: %v", statErr)
+	}
+}
+
+func TestCleanupPlanRejectsManagedDirectoryReplacement(t *testing.T) {
+	layout := newCleanupTestLayout(t, "dir-swap")
+	statusPath := writeCleanupTestStatus(t, layout)
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"unknown",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+	originalRunDir := layout.RunDir + "-original"
+	foreignDir := filepath.Join(t.TempDir(), "foreign")
+	if err := os.Mkdir(foreignDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	foreignStatus := filepath.Join(foreignDir, "status.json")
+	if err := os.WriteFile(foreignStatus, []byte("foreign\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan.beforeExecute = func() error {
+		if err := os.Rename(layout.RunDir, originalRunDir); err != nil {
+			return err
+		}
+		return os.Symlink(foreignDir, layout.RunDir)
+	}
+	err = plan.execute()
+	if err == nil {
+		t.Fatal("directory replacement should be rejected")
+	}
+	if data, readErr := os.ReadFile(foreignStatus); readErr != nil || string(data) != "foreign\n" {
+		t.Fatalf("foreign target changed: data=%q err=%v", data, readErr)
+	}
+	if _, statErr := os.Stat(filepath.Join(originalRunDir, filepath.Base(statusPath))); statErr != nil {
+		t.Fatalf("original managed file was removed: %v", statErr)
+	}
+}
+
+func TestCleanupPlanRejectsFileInodeReplacement(t *testing.T) {
+	layout := newCleanupTestLayout(t, "file-swap")
+	statusPath := writeCleanupTestStatus(t, layout)
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"unknown",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+	originalStatus := filepath.Join(t.TempDir(), "status.original")
+	plan.beforeExecute = func() error {
+		if err := os.Rename(statusPath, originalStatus); err != nil {
+			return err
+		}
+		return os.WriteFile(statusPath, []byte("{}\n"), 0o600)
+	}
+	err = plan.execute()
+	if err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("execute error = %v, want inode replacement rejection", err)
+	}
+	for _, path := range []string{statusPath, originalStatus} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("replacement preflight removed %s: %v", path, statErr)
+		}
+	}
+}
+
+func TestCleanupPlanRejectsSameInodeContentReplacement(t *testing.T) {
+	layout := newCleanupTestLayout(t, "file-rewrite")
+	statusPath := writeCleanupTestStatus(t, layout)
+	before, err := os.Stat(statusPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"unknown",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+	plan.beforeExecute = func() error {
+		file, err := os.OpenFile(statusPath, os.O_WRONLY, 0)
+		if err != nil {
+			return err
+		}
+		if _, err := file.WriteAt([]byte{'['}, 0); err != nil {
+			_ = file.Close()
+			return err
+		}
+		return file.Close()
+	}
+	err = plan.execute()
+	if err == nil {
+		t.Fatal("same-inode content replacement should be rejected")
+	}
+	after, statErr := os.Stat(statusPath)
+	if statErr != nil {
+		t.Fatalf("rewritten managed file was removed: %v", statErr)
+	}
+	if !os.SameFile(before, after) {
+		t.Fatal("test did not preserve the managed file inode")
+	}
+	if _, statErr := os.Stat(filepath.Join(layout.RunDir, "lock")); statErr != nil {
+		t.Fatalf("content rejection mutated an earlier cleanup target: %v", statErr)
+	}
+}
+
+func TestCleanupPlanRevalidatesAllTargetsBeforeFirstUnlink(t *testing.T) {
+	layout := newCleanupTestLayout(t, "late-swap")
+	statusPath := writeCleanupTestStatus(t, layout)
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"unknown",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+	lateUnknown := filepath.Join(layout.VarLibDir, "late-foreign")
+	plan.beforeExecute = func() error {
+		return os.WriteFile(lateUnknown, []byte("keep\n"), 0o600)
+	}
+	err = plan.execute()
+	if err == nil || !strings.Contains(err.Error(), "unplanned entries") {
+		t.Fatalf("execute error = %v, want late-target rejection", err)
+	}
+	for _, path := range []string{statusPath, lateUnknown} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("global revalidation removed %s: %v", path, statErr)
+		}
+	}
+}
+
+func TestCleanupPlanPreservesLifecycleAndRemovesExactManifestEntries(t *testing.T) {
+	layout := newCleanupTestLayout(t, "success")
+	statusPath := writeCleanupTestStatus(t, layout)
+	leasePath := filepath.Join(layout.RunDir, "daemon.lease")
+	leaseData, err := json.Marshal(lockfile.LifecycleOwner{
+		PID:        os.Getpid(),
+		Action:     "uninstall",
+		ConfigPath: layout.ConfigPath,
+		RunDir:     layout.RunDir,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(leasePath, append(leaseData, '\n'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	requestID := strings.Repeat("a", 32)
+	for _, dir := range []string{
+		filepath.Join(layout.RunDir, "requests"),
+		filepath.Join(layout.RunDir, "acks"),
+	} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		payload, err := json.Marshal(map[string]any{"id": requestID})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, requestID+".json"), payload, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(layout.RunDir, "requests", "lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := attachstate.Save(layout.VarLibDir, &attachstate.State{
+		Version:    1,
+		ConfigPath: layout.ConfigPath,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(layout.PinPath, "control_map"), []byte("opaque pin\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := prepareUninstallCleanup(layout, "unknown", false, leasePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+	if err := plan.execute(); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(leasePath); err != nil {
-		t.Fatalf("lifecycle lease inode was removed: %v", err)
+		t.Fatalf("lifecycle lease was removed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(runDir, "status.json")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(statusPath); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("runtime status was not removed: %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(runDir, "requests")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("runtime request directory was not removed: %v", err)
+	for _, removedDir := range []string{layout.VarLibDir, layout.PinPath} {
+		if _, err := os.Stat(removedDir); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("managed directory %s was not removed: %v", removedDir, err)
+		}
 	}
+	if _, err := os.Stat(cleanupManifestPath(layout)); err != nil {
+		t.Fatalf("non-purge cleanup removed ownership manifest: %v", err)
+	}
+}
+
+func TestPrepareCleanupRejectsUnknownBPFPinBeforeMutation(t *testing.T) {
+	layout := newCleanupTestLayout(t, "unknown-pin")
+	statusPath := writeCleanupTestStatus(t, layout)
+	unknownPin := filepath.Join(layout.PinPath, "foreign_map")
+	if err := os.WriteFile(unknownPin, []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err := prepareUninstallCleanup(
+		layout,
+		"unknown",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "unknown BPF pin") {
+		t.Fatalf("prepare error = %v, want unknown-pin rejection", err)
+	}
+	for _, path := range []string{statusPath, unknownPin} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("unknown-pin preflight removed %s: %v", path, statErr)
+		}
+	}
+}
+
+func TestCleanupPlanRemovesOnlyExactDeclaredServiceArtifact(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(t, "artifact-success", "systemd")
+	unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+	foreignPath := filepath.Join(layout.SystemdDir, "foreign.service")
+	if err := os.WriteFile(foreignPath, []byte("keep\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"systemd",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+	if err := plan.execute(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(unitPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("declared service artifact was not removed: %v", err)
+	}
+	if data, err := os.ReadFile(foreignPath); err != nil || string(data) != "keep\n" {
+		t.Fatalf("foreign service artifact changed: data=%q err=%v", data, err)
+	}
+}
+
+func TestPrepareCleanupRejectsChangedDeclaredServiceArtifact(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(t, "artifact-changed", "systemd")
+	unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
+	if err := os.WriteFile(unitPath, []byte("foreign unit\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(layout.RunDir, "lock")
+	_, err := prepareUninstallCleanup(
+		layout,
+		"systemd",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "content hash") {
+		t.Fatalf("prepare error = %v, want service content rejection", err)
+	}
+	for _, path := range []string{unitPath, lockPath} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("artifact preflight removed %s: %v", path, statErr)
+		}
+	}
+}
+
+func TestCleanupPlanRejectsHardLinkedKnownFile(t *testing.T) {
+	layout := newCleanupTestLayout(t, "hardlink")
+	externalPath := filepath.Join(t.TempDir(), "external")
+	if err := os.WriteFile(externalPath, []byte("{}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	statusPath := filepath.Join(layout.RunDir, "status.json")
+	if err := os.Link(externalPath, statusPath); err != nil {
+		t.Fatal(err)
+	}
+	_, err := prepareUninstallCleanup(
+		layout,
+		"unknown",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "links") {
+		t.Fatalf("prepare error = %v, want hard-link rejection", err)
+	}
+	for _, path := range []string{externalPath, statusPath} {
+		if _, statErr := os.Stat(path); statErr != nil {
+			t.Fatalf("hard-link preflight removed %s: %v", path, statErr)
+		}
+	}
+}
+
+func TestCleanupPlanRejectsGroupWritableKnownFile(t *testing.T) {
+	layout := newCleanupTestLayout(t, "writable")
+	lockPath := filepath.Join(layout.RunDir, "lock")
+	if err := os.Chmod(lockPath, 0o660); err != nil {
+		t.Fatal(err)
+	}
+	_, err := prepareUninstallCleanup(
+		layout,
+		"unknown",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err == nil || !strings.Contains(err.Error(), "group/other writable") {
+		t.Fatalf("prepare error = %v, want writable-file rejection", err)
+	}
+	if _, statErr := os.Stat(lockPath); statErr != nil {
+		t.Fatalf("writable-file preflight removed target: %v", statErr)
+	}
+}
+
+func cleanupTestPaths(root string, suffix string) paths {
+	if physicalRoot, err := filepath.EvalSymlinks(root); err == nil {
+		root = physicalRoot
+	}
+	configDir := filepath.Join(root, "wg-mix-ebpf-config-"+suffix)
+	return paths{
+		ConfigPath:        filepath.Join(configDir, "config.yaml"),
+		BinaryPath:        filepath.Join(root, "sbin", "wg-mix-ebpf"),
+		VarLibDir:         filepath.Join(root, "wg-mix-ebpf-state-"+suffix),
+		RunDir:            filepath.Join(root, "wg-mix-ebpf-run-"+suffix),
+		PinPath:           filepath.Join(root, "wg-mix-ebpf-pins-"+suffix),
+		SystemdDir:        filepath.Join(root, "systemd"),
+		OpenWrtInitDir:    filepath.Join(root, "init.d"),
+		OpenWrtHotplugDir: filepath.Join(root, "hotplug"),
+	}
+}
+
+func newCleanupTestLayout(t *testing.T, suffix string) paths {
+	return newCleanupTestLayoutForSystem(t, suffix, "unknown")
+}
+
+func newCleanupTestLayoutForSystem(t *testing.T, suffix string, system string) paths {
+	t.Helper()
+	root, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	layout := cleanupTestPaths(root, suffix)
+	for _, dir := range []string{
+		filepath.Dir(layout.ConfigPath),
+		layout.RunDir,
+		layout.VarLibDir,
+		layout.PinPath,
+	} {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := config.SaveFile(layout.ConfigPath, config.SafeTemplate()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(layout.RunDir, "lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	switch system {
+	case "systemd":
+		if err := os.MkdirAll(layout.SystemdDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service"),
+			[]byte(systemdUnit(layout.ConfigPath, layout.BinaryPath)),
+			0o600,
+		); err != nil {
+			t.Fatal(err)
+		}
+	case "openwrt":
+		for _, dir := range []string{layout.OpenWrtInitDir, layout.OpenWrtHotplugDir} {
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(
+			filepath.Join(layout.OpenWrtInitDir, "wg-mix-ebpf"),
+			[]byte(openWrtInit(layout.ConfigPath, layout.BinaryPath)),
+			0o700,
+		); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(layout.OpenWrtHotplugDir, "90-wg-mix-ebpf"),
+			[]byte(openWrtHotplug()),
+			0o700,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := writeCleanupManifest(layout, system); err != nil {
+		t.Fatal(err)
+	}
+	return layout
+}
+
+func setCleanupTestEnvironment(t *testing.T, layout paths) {
+	t.Helper()
+	t.Setenv(EnvEtcDir, filepath.Dir(layout.ConfigPath))
+	t.Setenv(EnvBinaryPath, layout.BinaryPath)
+	t.Setenv(EnvVarLibDir, layout.VarLibDir)
+	t.Setenv(daemonEnvRunDirForTest, layout.RunDir)
+	t.Setenv(dataplaneEnvPinPathForTest, layout.PinPath)
+	t.Setenv(EnvSystemdDir, layout.SystemdDir)
+	t.Setenv(EnvOpenWrtInit, layout.OpenWrtInitDir)
+	t.Setenv(EnvOpenWrtHotplug, layout.OpenWrtHotplugDir)
+}
+
+func writeCleanupTestStatus(t *testing.T, layout paths) string {
+	t.Helper()
+	data, err := json.Marshal(daemon.Status{
+		PID:        os.Getpid(),
+		ConfigPath: layout.ConfigPath,
+		State:      "active",
+		InstanceID: "0123456789abcdef0123456789abcdef",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(layout.RunDir, "status.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
 }
 
 func containsAction(actions []string, substr string) bool {
@@ -430,6 +1191,28 @@ func containsAction(actions []string, substr string) bool {
 		}
 	}
 	return false
+}
+
+func installFakeNft(t *testing.T, commandLog string) {
+	t.Helper()
+	fakeBin := filepath.Join(t.TempDir(), "bin")
+	if err := os.Mkdir(fakeBin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	script := "#!/bin/sh\n" +
+		"printf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\n" +
+		"exit 1\n"
+	if commandLog != "" {
+		t.Setenv("WG_MIX_EBPF_TEST_NFT_LOG", commandLog)
+		script = "#!/bin/sh\n" +
+			"printf invoked > \"$WG_MIX_EBPF_TEST_NFT_LOG\"\n" +
+			"printf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\n" +
+			"exit 1\n"
+	}
+	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
 
 const (
