@@ -102,6 +102,19 @@ self_test_safety_gate() {
     echo "error: run directory derivation escaped its fixed prefix" >&2
     return 1
   }
+  PYTHONPATH="${PWD}" python3 - <<'PY'
+import os
+import sys
+
+cwd = os.path.realpath(os.getcwd())
+unsafe = [
+    entry
+    for entry in sys.path
+    if os.path.realpath(entry or cwd) == cwd
+]
+if unsafe:
+    raise SystemExit(f"root Python import path includes the caller directory: {unsafe!r}")
+PY
   echo "live guard safety gate self-test passed"
 }
 
