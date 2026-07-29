@@ -1,11 +1,13 @@
 package install
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -161,12 +163,45 @@ func TestUninstallDoesNotDeadlockWhenConfigExists(t *testing.T) {
 	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
+	readyPath := filepath.Join(dir, "nft-ready")
+	releasePath := filepath.Join(dir, "nft-release")
+	for _, path := range []string{readyPath, releasePath} {
+		if err := syscall.Mkfifo(path, 0o600); err != nil {
+			t.Fatalf("create fake nft control FIFO %s: %v", path, err)
+		}
+	}
+	readyFIFO, err := os.OpenFile(readyPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open fake nft readiness FIFO: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := readyFIFO.Close(); err != nil {
+			t.Errorf("close fake nft readiness FIFO: %v", err)
+		}
+	})
+	releaseFIFO, err := os.OpenFile(releasePath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatalf("open fake nft release FIFO: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := releaseFIFO.Close(); err != nil {
+			t.Errorf("close fake nft release FIFO: %v", err)
+		}
+	})
 	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte(
-		"#!/bin/sh\nprintf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\nexit 1\n",
+		"#!/bin/sh\n"+
+			"set -eu\n"+
+			"printf '%s\\n' \"$*\" >\"$WG_MIX_EBPF_TEST_NFT_READY_FIFO\"\n"+
+			"IFS= read -r control <\"$WG_MIX_EBPF_TEST_NFT_RELEASE_FIFO\"\n"+
+			"[ \"$control\" = continue ] || exit 70\n"+
+			"printf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\n"+
+			"exit 1\n",
 	), 0o755); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("WG_MIX_EBPF_TEST_NFT_READY_FIFO", readyPath)
+	t.Setenv("WG_MIX_EBPF_TEST_NFT_RELEASE_FIFO", releasePath)
 	etcDir := filepath.Join(dir, "etc", "wg-mix-ebpf")
 	runDir := filepath.Join(dir, "run")
 	stateDir := filepath.Join(dir, "state")
@@ -195,11 +230,62 @@ startup_guard:
 	t.Setenv(dataplaneEnvPinPathForTest, pinDir)
 	t.Setenv(EnvBinaryPath, binaryPath)
 
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	ctx = lockfile.WithLifecyclePathForTest(ctx, filepath.Join(dir, "daemon.lease"))
-	if _, err := Uninstall(ctx, Options{ConfigPath: configPath, System: "unknown", Yes: true}); err != nil {
-		t.Fatalf("uninstall should complete without nested lock deadlock: %v", err)
+
+	uninstallDone := make(chan error, 1)
+	go func() {
+		_, err := Uninstall(ctx, Options{ConfigPath: configPath, System: "unknown", Yes: true})
+		uninstallDone <- err
+	}()
+
+	type readyResult struct {
+		line string
+		err  error
+	}
+	nftReady := make(chan readyResult, 1)
+	go func() {
+		line, err := bufio.NewReader(readyFIFO).ReadString('\n')
+		nftReady <- readyResult{line: strings.TrimSpace(line), err: err}
+	}()
+
+	// Keep the watchdog outside ctx: a deadline on ctx also kills the fake nft
+	// subprocess and turns slow process scheduling into a false deadlock result.
+	// The FIFO handshake proves that uninstall crossed the nested-lock boundary.
+	const deadlockWatchdog = 30 * time.Second
+	readyWatchdog := time.NewTimer(deadlockWatchdog)
+	select {
+	case result := <-nftReady:
+		readyWatchdog.Stop()
+		if result.err != nil {
+			t.Fatalf("read fake nft readiness: %v", result.err)
+		}
+		const wantArgs = "-j -a list table inet wg_mix_ebpf_guard"
+		if result.line != wantArgs {
+			t.Fatalf("fake nft invocation = %q, want %q", result.line, wantArgs)
+		}
+	case err := <-uninstallDone:
+		readyWatchdog.Stop()
+		t.Fatalf("uninstall returned before fake nft inspection: %v", err)
+	case <-readyWatchdog.C:
+		cancel()
+		t.Fatal("uninstall did not reach fake nft inspection; possible nested lock deadlock")
+	}
+
+	if _, err := releaseFIFO.WriteString("continue\n"); err != nil {
+		t.Fatalf("release fake nft inspection: %v", err)
+	}
+	completionWatchdog := time.NewTimer(deadlockWatchdog)
+	select {
+	case err := <-uninstallDone:
+		completionWatchdog.Stop()
+		if err != nil {
+			t.Fatalf("uninstall should complete without nested lock deadlock: %v", err)
+		}
+	case <-completionWatchdog.C:
+		cancel()
+		t.Fatal("uninstall did not complete after fake nft inspection was released")
 	}
 }
 
