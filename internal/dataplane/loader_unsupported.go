@@ -11,6 +11,10 @@ import (
 type UnsupportedLoader struct{}
 
 func NewLoader() Loader {
+	return NewLoaderWithOptions(LoaderOptions{})
+}
+
+func NewLoaderWithOptions(LoaderOptions) Loader {
 	return UnsupportedLoader{}
 }
 

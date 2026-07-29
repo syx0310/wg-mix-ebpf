@@ -20,12 +20,13 @@ import (
 )
 
 type Options struct {
-	ConfigPath     string
-	RunDir         string
-	StateDir       string
-	Offline        bool
-	DryRun         bool
-	LifecycleLease *lockfile.LifecycleLease
+	ConfigPath      string
+	RunDir          string
+	StateDir        string
+	Offline         bool
+	DryRun          bool
+	AdoptLegacyPins bool
+	LifecycleLease  *lockfile.LifecycleLease
 
 	deps *dependencies
 }
@@ -171,7 +172,9 @@ func configuredDataplaneLoader(opts Options) dataplane.Loader {
 	if opts.deps != nil && opts.deps.dataplaneLoader != nil {
 		return opts.deps.dataplaneLoader
 	}
-	return dataplane.NewLoader()
+	return dataplane.NewLoaderWithOptions(dataplane.LoaderOptions{
+		AdoptLegacyPins: opts.AdoptLegacyPins,
+	})
 }
 
 type wgConfigSnapshotEntry struct {
