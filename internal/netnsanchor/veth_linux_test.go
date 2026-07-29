@@ -4,10 +4,25 @@ package netnsanchor
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/vishvananda/netlink"
+	"golang.org/x/sys/unix"
 )
+
+type recordingVethLinkHandle struct {
+	add   func(netlink.Link) error
+	close func()
+}
+
+func (handle *recordingVethLinkHandle) LinkAdd(link netlink.Link) error {
+	return handle.add(link)
+}
+
+func (handle *recordingVethLinkHandle) Close() {
+	handle.close()
+}
 
 func testVethClient(role string) clientFlags {
 	return clientFlags{
@@ -111,15 +126,12 @@ func TestValidateVethPairContractBindsBothAnonymousNamespaces(t *testing.T) {
 	}
 }
 
-func TestCreateVethPairUsesOneAtomicDualNamespaceLinkAdd(t *testing.T) {
-	calls := 0
-	err := createVethPair(
-		"wma012345670",
-		"wmr01234567a",
-		41,
-		42,
-		func(link netlink.Link) error {
-			calls++
+func TestCreateVethPairEntersExactLeftNamespaceBeforeLinkAdd(t *testing.T) {
+	expectedLeft := Identity{Device: 42, Inode: 141}
+	var calls []string
+	handle := &recordingVethLinkHandle{
+		add: func(link netlink.Link) error {
+			calls = append(calls, "link-add")
 			veth, ok := link.(*netlink.Veth)
 			if !ok {
 				t.Fatalf("link type = %T, want *netlink.Veth", link)
@@ -128,42 +140,118 @@ func TestCreateVethPairUsesOneAtomicDualNamespaceLinkAdd(t *testing.T) {
 				veth.PeerName != "wmr01234567a" {
 				t.Fatalf("unexpected veth names: %+v", veth)
 			}
-			leftFD, leftOK := veth.Namespace.(netlink.NsFd)
-			rightFD, rightOK := veth.PeerNamespace.(netlink.NsFd)
-			if !leftOK || !rightOK || leftFD != 41 || rightFD != 42 {
+			if veth.Namespace != nil {
 				t.Fatalf(
-					"veth namespace FDs = %T(%v), %T(%v), want NsFd(41), NsFd(42)",
+					"left namespace = %T(%v), want nil in current exact namespace",
 					veth.Namespace,
 					veth.Namespace,
+				)
+			}
+			rightFD, rightOK := veth.PeerNamespace.(netlink.NsFd)
+			if !rightOK || rightFD != 42 {
+				t.Fatalf(
+					"peer namespace FD = %T(%v), want NsFd(42)",
 					veth.PeerNamespace,
 					veth.PeerNamespace,
 				)
 			}
 			return nil
 		},
+		close: func() {
+			calls = append(calls, "close-handle")
+		},
+	}
+	err := createVethPairInExactLeftNamespace(
+		"wma012345670",
+		"wmr01234567a",
+		41,
+		42,
+		expectedLeft,
+		vethPairThreadOperations{
+			setNamespace: func(descriptor int, namespaceType int) error {
+				calls = append(calls, "setns")
+				if descriptor != 41 || namespaceType != unix.CLONE_NEWNET {
+					t.Fatalf(
+						"setns = (%d, %#x), want (41, %#x)",
+						descriptor,
+						namespaceType,
+						unix.CLONE_NEWNET,
+					)
+				}
+				return nil
+			},
+			currentNamespaceIdentity: func() (Identity, error) {
+				calls = append(calls, "identity")
+				return expectedLeft, nil
+			},
+			newLinkHandle: func() (vethLinkHandle, error) {
+				calls = append(calls, "new-handle")
+				return handle, nil
+			},
+		},
 	)
 	if err != nil {
 		t.Fatalf("create atomic veth pair: %v", err)
 	}
-	if calls != 1 {
-		t.Fatalf("link add calls = %d, want exactly one", calls)
+	wantCalls := "setns,identity,new-handle,link-add,close-handle"
+	if got := strings.Join(calls, ","); got != wantCalls {
+		t.Fatalf("veth operation order = %q, want %q", got, wantCalls)
 	}
 
-	calls = 0
-	err = createVethPair(
+	calls = nil
+	err = createVethPairInExactLeftNamespace(
 		"wma012345670",
 		"wmr01234567a",
 		41,
 		41,
-		func(netlink.Link) error {
-			calls++
-			return errors.New("must not be called")
+		expectedLeft,
+		vethPairThreadOperations{
+			setNamespace: func(int, int) error {
+				calls = append(calls, "unsafe-setns")
+				return errors.New("must not be called")
+			},
+			currentNamespaceIdentity: func() (Identity, error) {
+				return Identity{}, errors.New("must not be called")
+			},
+			newLinkHandle: func() (vethLinkHandle, error) {
+				return nil, errors.New("must not be called")
+			},
 		},
 	)
 	if err == nil {
 		t.Fatal("same namespace FD was accepted")
 	}
-	if calls != 0 {
-		t.Fatalf("invalid descriptor contract invoked link add %d times", calls)
+	if len(calls) != 0 {
+		t.Fatalf("invalid descriptor contract invoked operations %v", calls)
+	}
+}
+
+func TestCreateVethPairRejectsCurrentNamespaceIdentityMismatch(t *testing.T) {
+	expectedLeft := Identity{Device: 42, Inode: 141}
+	handleCalls := 0
+	err := createVethPairInExactLeftNamespace(
+		"wma012345670",
+		"wmr01234567a",
+		41,
+		42,
+		expectedLeft,
+		vethPairThreadOperations{
+			setNamespace: func(int, int) error {
+				return nil
+			},
+			currentNamespaceIdentity: func() (Identity, error) {
+				return Identity{Device: 42, Inode: 142}, nil
+			},
+			newLinkHandle: func() (vethLinkHandle, error) {
+				handleCalls++
+				return nil, errors.New("must not be called")
+			},
+		},
+	)
+	if err == nil || !strings.Contains(err.Error(), "identity mismatch") {
+		t.Fatalf("mismatched current namespace result = %v", err)
+	}
+	if handleCalls != 0 {
+		t.Fatalf("identity mismatch opened %d netlink handles", handleCalls)
 	}
 }

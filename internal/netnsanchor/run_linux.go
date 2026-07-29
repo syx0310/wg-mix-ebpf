@@ -64,6 +64,17 @@ type fileIdentity struct {
 	Inode  uint64
 }
 
+type vethLinkHandle interface {
+	LinkAdd(netlink.Link) error
+	Close()
+}
+
+type vethPairThreadOperations struct {
+	setNamespace             func(int, int) error
+	currentNamespaceIdentity func() (Identity, error)
+	newLinkHandle            func() (vethLinkHandle, error)
+}
+
 // Run dispatches the Linux-only anonymous network namespace helper.
 func Run(arguments []string) error {
 	if len(arguments) == 0 {
@@ -506,7 +517,21 @@ func runCreateVethPairCommand(arguments []string) error {
 		return fmt.Errorf("acquire right network namespace: %w", err)
 	}
 	defer unix.Close(rightFD)
-	return createVethPair(*leftLink, *rightLink, leftFD, rightFD, netlink.LinkAdd)
+	return createVethPairOnDedicatedThread(
+		*leftLink,
+		*rightLink,
+		leftFD,
+		rightFD,
+		Identity{
+			Device: left.expectedDevice,
+			Inode:  left.expectedInode,
+		},
+		vethPairThreadOperations{
+			setNamespace:             unix.Setns,
+			currentNamespaceIdentity: currentThreadNetworkNamespaceIdentity,
+			newLinkHandle:            newVethLinkHandle,
+		},
+	)
 }
 
 func validateVethPairContract(
@@ -549,25 +574,112 @@ func validateVethPairContract(
 	return nil
 }
 
-func createVethPair(
+func createVethPairOnDedicatedThread(
 	leftLink string,
 	rightLink string,
 	leftFD int,
 	rightFD int,
-	addLink func(netlink.Link) error,
+	expectedLeft Identity,
+	operations vethPairThreadOperations,
 ) error {
-	if leftFD < 0 || rightFD < 0 || leftFD == rightFD || addLink == nil {
+	if err := validateVethPairThreadContract(
+		leftLink,
+		rightLink,
+		leftFD,
+		rightFD,
+		expectedLeft,
+		operations,
+	); err != nil {
+		return err
+	}
+	result := make(chan error, 1)
+	go func() {
+		runtime.LockOSThread()
+		// Deliberately do not call runtime.UnlockOSThread. Once setns succeeds,
+		// this OS thread belongs to the isolated left namespace. The documented
+		// LockOSThread contract terminates a locked thread when its goroutine
+		// returns without unlocking it, so it can never re-enter the Go thread
+		// pool carrying that namespace.
+		result <- createVethPairInExactLeftNamespace(
+			leftLink,
+			rightLink,
+			leftFD,
+			rightFD,
+			expectedLeft,
+			operations,
+		)
+	}()
+	return <-result
+}
+
+func validateVethPairThreadContract(
+	leftLink string,
+	rightLink string,
+	leftFD int,
+	rightFD int,
+	expectedLeft Identity,
+	operations vethPairThreadOperations,
+) error {
+	if leftLink == "" || rightLink == "" || leftLink == rightLink ||
+		leftFD < 0 || rightFD < 0 || leftFD == rightFD ||
+		expectedLeft.Device == 0 || expectedLeft.Inode == 0 ||
+		operations.setNamespace == nil ||
+		operations.currentNamespaceIdentity == nil ||
+		operations.newLinkHandle == nil {
 		return errors.New("veth creation descriptor contract is invalid")
 	}
+	return nil
+}
+
+func createVethPairInExactLeftNamespace(
+	leftLink string,
+	rightLink string,
+	leftFD int,
+	rightFD int,
+	expectedLeft Identity,
+	operations vethPairThreadOperations,
+) error {
+	if err := validateVethPairThreadContract(
+		leftLink,
+		rightLink,
+		leftFD,
+		rightFD,
+		expectedLeft,
+		operations,
+	); err != nil {
+		return err
+	}
+	if err := operations.setNamespace(leftFD, unix.CLONE_NEWNET); err != nil {
+		return fmt.Errorf("enter exact left network namespace FD: %w", err)
+	}
+	currentIdentity, err := operations.currentNamespaceIdentity()
+	if err != nil {
+		return err
+	}
+	if err := verifyIdentity(currentIdentity, expectedLeft); err != nil {
+		return fmt.Errorf("current thread after left namespace setns: %w", err)
+	}
+	// github.com/vishvananda/netlink v1.3.1 Handle.LinkAdd calls
+	// Handle.ensureIndex (and therefore Handle.LinkByName) after RTM_NEWLINK.
+	// Open this route handle only after setns and identity revalidation so both
+	// link creation and that lookup execute in the exact isolated left namespace.
+	handle, err := operations.newLinkHandle()
+	if err != nil {
+		return fmt.Errorf("open netlink route handle in exact left namespace: %w", err)
+	}
+	if handle == nil {
+		return errors.New("open netlink route handle returned nil")
+	}
+	defer handle.Close()
 	link := &netlink.Veth{
 		LinkAttrs: netlink.LinkAttrs{
 			Name:      leftLink,
-			Namespace: netlink.NsFd(leftFD),
+			Namespace: nil,
 		},
 		PeerName:      rightLink,
 		PeerNamespace: netlink.NsFd(rightFD),
 	}
-	if err := addLink(link); err != nil {
+	if err := handle.LinkAdd(link); err != nil {
 		return fmt.Errorf(
 			"atomically create veth pair %s/%s in exact namespace FDs: %w",
 			leftLink,
@@ -576,6 +688,39 @@ func createVethPair(
 		)
 	}
 	return nil
+}
+
+func currentThreadNetworkNamespaceIdentity() (Identity, error) {
+	descriptor, err := unix.Open(
+		"/proc/thread-self/ns/net",
+		unix.O_RDONLY|unix.O_CLOEXEC,
+		0,
+	)
+	if err != nil {
+		return Identity{}, fmt.Errorf(
+			"open current thread network namespace after setns: %w",
+			err,
+		)
+	}
+	identity, identityErr := validateNetworkNamespaceFD(descriptor)
+	closeErr := unix.Close(descriptor)
+	if identityErr != nil {
+		return Identity{}, fmt.Errorf(
+			"validate current thread network namespace after setns: %w",
+			identityErr,
+		)
+	}
+	if closeErr != nil {
+		return Identity{}, fmt.Errorf(
+			"close current thread network namespace FD: %w",
+			closeErr,
+		)
+	}
+	return identity, nil
+}
+
+func newVethLinkHandle() (vethLinkHandle, error) {
+	return netlink.NewHandle(unix.NETLINK_ROUTE)
 }
 
 func runStopCommand(arguments []string) error {
@@ -1138,28 +1283,37 @@ func terminateAndReapDirectChild(command *exec.Cmd, timeout time.Duration) error
 		timeout <= 0 || timeout > ioTimeout {
 		return errors.New("direct-child process contract is invalid")
 	}
-	killErr := command.Process.Kill()
+	return terminateAndReapDirectChildWithKill(
+		command,
+		timeout,
+		command.Process.Kill,
+	)
+}
+
+func terminateAndReapDirectChildWithKill(
+	command *exec.Cmd,
+	timeout time.Duration,
+	kill func() error,
+) error {
+	if command == nil || command.Process == nil || kill == nil ||
+		timeout <= 0 || timeout > ioTimeout {
+		return errors.New("direct-child process contract is invalid")
+	}
+	killErr := kill()
 	workerWait := make(chan error, 1)
 	go func() {
 		workerWait <- command.Wait()
 	}()
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
-	select {
-	case waitErr := <-workerWait:
-		if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
-			return fmt.Errorf("terminate unpinned direct child: %w", killErr)
-		}
-		var exitErr *exec.ExitError
-		if waitErr != nil && !errors.As(waitErr, &exitErr) {
-			return fmt.Errorf("reap unpinned direct child: %w", waitErr)
-		}
-		return nil
-	case <-timer.C:
-		return errors.New(
-			"unpinned direct child was not reaped before the bounded deadline",
-		)
+	var signalErr error
+	if killErr != nil && !errors.Is(killErr, os.ErrProcessDone) {
+		signalErr = fmt.Errorf("terminate unpinned direct child: %w", killErr)
 	}
+	reapErr := waitForBoundedChildReap(
+		workerWait,
+		timeout,
+		"unpinned direct child",
+	)
+	return errors.Join(signalErr, reapErr)
 }
 
 func terminateAndReapWorker(
@@ -1167,25 +1321,67 @@ func terminateAndReapWorker(
 	workerWait <-chan error,
 	timeout time.Duration,
 ) error {
-	if pidfd < 0 || workerWait == nil || timeout <= 0 || timeout > ioTimeout {
+	return terminateAndReapWorkerWithSignal(
+		pidfd,
+		workerWait,
+		timeout,
+		func(descriptor int, signal unix.Signal) error {
+			return unix.PidfdSendSignal(descriptor, signal, nil, 0)
+		},
+	)
+}
+
+func terminateAndReapWorkerWithSignal(
+	pidfd int,
+	workerWait <-chan error,
+	timeout time.Duration,
+	sendSignal func(int, unix.Signal) error,
+) error {
+	if pidfd < 0 || workerWait == nil || sendSignal == nil ||
+		timeout <= 0 || timeout > ioTimeout {
 		return errors.New("worker pidfd reap contract is invalid")
 	}
-	signalErr := unix.PidfdSendSignal(pidfd, unix.SIGKILL, nil, 0)
-	if signalErr != nil && !errors.Is(signalErr, unix.ESRCH) {
-		return fmt.Errorf("terminate exact network namespace worker: %w", signalErr)
+	rawSignalErr := sendSignal(pidfd, unix.SIGKILL)
+	var signalErr error
+	if rawSignalErr != nil && !errors.Is(rawSignalErr, unix.ESRCH) {
+		signalErr = fmt.Errorf(
+			"terminate exact network namespace worker: %w",
+			rawSignalErr,
+		)
+	}
+	reapErr := waitForBoundedChildReap(
+		workerWait,
+		timeout,
+		"exact network namespace worker",
+	)
+	return errors.Join(signalErr, reapErr)
+}
+
+func waitForBoundedChildReap(
+	workerWait <-chan error,
+	timeout time.Duration,
+	subject string,
+) error {
+	if workerWait == nil || timeout <= 0 || timeout > ioTimeout ||
+		subject == "" {
+		return errors.New("bounded child reap contract is invalid")
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
-	case waitErr := <-workerWait:
+	case waitErr, ok := <-workerWait:
+		if !ok {
+			return fmt.Errorf("%s wait channel closed without a result", subject)
+		}
 		var exitErr *exec.ExitError
 		if waitErr != nil && !errors.As(waitErr, &exitErr) {
-			return fmt.Errorf("reap exact network namespace worker: %w", waitErr)
+			return fmt.Errorf("reap %s: %w", subject, waitErr)
 		}
 		return nil
 	case <-timer.C:
-		return errors.New(
-			"exact network namespace worker was not reaped before the bounded deadline",
+		return fmt.Errorf(
+			"%s was not reaped before the bounded deadline",
+			subject,
 		)
 	}
 }

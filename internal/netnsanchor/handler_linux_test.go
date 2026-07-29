@@ -207,3 +207,129 @@ func TestTerminateAndReapWorkerUsesExactPidfd(t *testing.T) {
 		t.Fatal("direct child was not reaped into a process state")
 	}
 }
+
+func TestTerminateAndReapWorkerWaitsAfterSignalFailure(t *testing.T) {
+	signalFailure := errors.New("injected pidfd signal failure")
+	workerWait := make(chan error)
+	signalCalled := make(chan struct{})
+	result := make(chan error, 1)
+	go func() {
+		result <- terminateAndReapWorkerWithSignal(
+			41,
+			workerWait,
+			time.Second,
+			func(pidfd int, signal unix.Signal) error {
+				if pidfd != 41 || signal != unix.SIGKILL {
+					t.Errorf(
+						"signal target = pidfd:%d signal:%d, want pidfd:41 SIGKILL",
+						pidfd,
+						signal,
+					)
+				}
+				close(signalCalled)
+				return signalFailure
+			},
+		)
+	}()
+	<-signalCalled
+
+	reaped := make(chan struct{})
+	go func() {
+		workerWait <- nil
+		close(reaped)
+	}()
+	select {
+	case <-reaped:
+	case earlyErr := <-result:
+		t.Fatalf("signal failure returned before child reap: %v", earlyErr)
+	case <-time.After(time.Second):
+		t.Fatal("worker reap did not receive the eventual wait result")
+	}
+	err := <-result
+	if !errors.Is(err, signalFailure) {
+		t.Fatalf("combined worker result = %v, want signal failure", err)
+	}
+}
+
+func TestTerminateAndReapWorkerConsumesAlreadyExitedWaitAfterSignalFailure(
+	t *testing.T,
+) {
+	signalFailure := errors.New("injected signal failure after exit")
+	workerWait := make(chan error, 1)
+	workerWait <- nil
+	err := terminateAndReapWorkerWithSignal(
+		42,
+		workerWait,
+		time.Second,
+		func(int, unix.Signal) error {
+			return signalFailure
+		},
+	)
+	if !errors.Is(err, signalFailure) {
+		t.Fatalf("combined already-exited result = %v, want signal failure", err)
+	}
+	if remaining := len(workerWait); remaining != 0 {
+		t.Fatalf("already-exited wait results remaining = %d, want zero", remaining)
+	}
+}
+
+func TestTerminateAndReapWorkerCombinesSignalAndWaitFailures(t *testing.T) {
+	signalFailure := errors.New("injected signal failure")
+	waitFailure := errors.New("injected wait failure")
+	workerWait := make(chan error, 1)
+	workerWait <- waitFailure
+	err := terminateAndReapWorkerWithSignal(
+		42,
+		workerWait,
+		time.Second,
+		func(int, unix.Signal) error {
+			return signalFailure
+		},
+	)
+	if !errors.Is(err, signalFailure) || !errors.Is(err, waitFailure) {
+		t.Fatalf(
+			"combined worker result = %v, want signal and wait failures",
+			err,
+		)
+	}
+}
+
+func TestTerminateAndReapWorkerCombinesSignalFailureWithBoundedTimeout(
+	t *testing.T,
+) {
+	signalFailure := errors.New("injected persistent signal failure")
+	workerWait := make(chan error)
+	err := terminateAndReapWorkerWithSignal(
+		43,
+		workerWait,
+		20*time.Millisecond,
+		func(int, unix.Signal) error {
+			return signalFailure
+		},
+	)
+	if !errors.Is(err, signalFailure) ||
+		!strings.Contains(err.Error(), "not reaped before the bounded deadline") {
+		t.Fatalf("combined timeout result = %v", err)
+	}
+}
+
+func TestTerminateAndReapDirectChildWaitsAfterKillFailure(t *testing.T) {
+	command := exec.Command("/bin/sh", "-c", "exit 0")
+	if err := command.Start(); err != nil {
+		t.Fatalf("start self-exiting direct child: %v", err)
+	}
+	killFailure := errors.New("injected direct-child kill failure")
+	err := terminateAndReapDirectChildWithKill(
+		command,
+		time.Second,
+		func() error {
+			return killFailure
+		},
+	)
+	if !errors.Is(err, killFailure) {
+		t.Fatalf("combined direct-child result = %v, want kill failure", err)
+	}
+	if command.ProcessState == nil {
+		t.Fatal("self-exiting direct child was not reaped after kill failure")
+	}
+}

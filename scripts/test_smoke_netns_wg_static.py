@@ -6,6 +6,8 @@ import unittest
 
 SCRIPT_PATH = pathlib.Path(__file__).with_name("smoke-netns-wg.sh")
 MAKEFILE_PATH = SCRIPT_PATH.parent.parent / "Makefile"
+GO_MOD_PATH = SCRIPT_PATH.parent.parent / "go.mod"
+GO_SUM_PATH = SCRIPT_PATH.parent.parent / "go.sum"
 HOLDER_PATH = pathlib.Path(__file__).with_name(
     "hold-isolated-lifecycle-lease.py"
 )
@@ -18,6 +20,8 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         cls.source = SCRIPT_PATH.read_text(encoding="utf-8")
         cls.lines = cls.source.splitlines()
         cls.makefile_source = MAKEFILE_PATH.read_text(encoding="utf-8")
+        cls.go_mod_source = GO_MOD_PATH.read_text(encoding="utf-8")
+        cls.go_sum_source = GO_SUM_PATH.read_text(encoding="utf-8")
         cls.holder_source = HOLDER_PATH.read_text(encoding="utf-8")
         cls.anchor_linux_source = (ANCHOR_PACKAGE / "run_linux.go").read_text(
             encoding="utf-8"
@@ -303,9 +307,13 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             "unix.MSG_CMSG_CLOEXEC",
             "unix.NS_GET_NSTYPE",
             "unix.Setns(descriptor, unix.CLONE_NEWNET)",
-            "Namespace: netlink.NsFd(leftFD)",
+            "operations.setNamespace(leftFD, unix.CLONE_NEWNET)",
+            '"/proc/thread-self/ns/net"',
+            "Namespace: nil",
             "PeerNamespace: netlink.NsFd(rightFD)",
-            "netlink.LinkAdd",
+            "netlink.NewHandle(unix.NETLINK_ROUTE)",
+            "handle.LinkAdd",
+            "runtime.LockOSThread()",
             "unix.SO_PEERCRED",
             '"@"+flags.socket',
             "PR_SET_PDEATHSIG",
@@ -341,17 +349,48 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.anchor_linux_source.index("\nfunc runStopCommand(")
         ]
         self.assertEqual(2, create_veth.count("acquireNamespace("))
-        self.assertEqual(1, create_veth.count("netlink.LinkAdd"))
+        self.assertEqual(1, create_veth.count("handle.LinkAdd"))
+        self.assertNotIn("netlink.LinkAdd", create_veth)
         self.assertLess(
             create_veth.index("acquireNamespace(*left,"),
             create_veth.index("acquireNamespace(*right,"),
         )
         self.assertLess(
             create_veth.index("acquireNamespace(*right,"),
-            create_veth.index("netlink.LinkAdd"),
+            create_veth.index("createVethPairOnDedicatedThread("),
+        )
+        dedicated_thread = create_veth[
+            create_veth.index("func createVethPairOnDedicatedThread(") :
+            create_veth.index("\nfunc validateVethPairThreadContract(")
+        ]
+        self.assertIn("runtime.LockOSThread()", dedicated_thread)
+        self.assertNotIn("runtime.UnlockOSThread()", dedicated_thread)
+        exact_create = create_veth[
+            create_veth.index("func createVethPairInExactLeftNamespace(") :
+            create_veth.index(
+                "\nfunc currentThreadNetworkNamespaceIdentity("
+            )
+        ]
+        setns = exact_create.index(
+            "operations.setNamespace(leftFD, unix.CLONE_NEWNET)"
+        )
+        identity = exact_create.index(
+            "currentIdentity, err := operations.currentNamespaceIdentity()"
+        )
+        new_handle = exact_create.index(
+            "handle, err := operations.newLinkHandle()"
+        )
+        link_add = exact_create.index("handle.LinkAdd(link)")
+        self.assertLess(setns, identity)
+        self.assertLess(identity, new_handle)
+        self.assertLess(new_handle, link_add)
+        self.assertIn("Namespace: nil", exact_create)
+        self.assertIn(
+            "PeerNamespace: netlink.NsFd(rightFD)",
+            exact_create,
         )
         self.assertNotIn("ifindex", create_veth.lower())
-        self.assertNotIn("LinkByName", create_veth)
+        self.assertNotIn("netlink.LinkByName(", create_veth)
 
         shell_veth = self.source[
             self.source.index("create_veth_pair() {") :
@@ -414,6 +453,66 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             "-ldflags=$(NETNS_ANCHOR_IDENTITY_LDFLAG)",
             anchor_build,
         )
+
+    def test_netlink_link_add_dependency_contract_is_review_pinned(
+        self,
+    ) -> None:
+        self.assertIn(
+            "github.com/vishvananda/netlink v1.3.1",
+            self.go_mod_source,
+        )
+        self.assertIn(
+            "github.com/vishvananda/netlink v1.3.1 "
+            "h1:3AEMt62VKqz90r0tmNhog0r/PpWKmrEShJU0wJW6bV0=",
+            self.go_sum_source,
+        )
+        self.assertIn(
+            "netlink v1.3.1 Handle.LinkAdd calls",
+            self.anchor_linux_source,
+        )
+        self.assertIn(
+            "Handle.ensureIndex (and therefore Handle.LinkByName)",
+            self.anchor_linux_source,
+        )
+
+    def test_worker_signal_failures_still_enter_one_bounded_reap(self) -> None:
+        worker = self.anchor_linux_source[
+            self.anchor_linux_source.index(
+                "func terminateAndReapWorkerWithSignal("
+            ) :
+            self.anchor_linux_source.index(
+                "\nfunc waitForBoundedChildReap("
+            )
+        ]
+        signal = worker.index("rawSignalErr := sendSignal(")
+        reap = worker.index("reapErr := waitForBoundedChildReap(")
+        self.assertLess(signal, reap)
+        self.assertNotIn("return ", worker[signal:reap])
+        self.assertIn("return errors.Join(signalErr, reapErr)", worker)
+
+        direct = self.anchor_linux_source[
+            self.anchor_linux_source.index(
+                "func terminateAndReapDirectChildWithKill("
+            ) :
+            self.anchor_linux_source.index(
+                "\nfunc terminateAndReapWorker("
+            )
+        ]
+        kill = direct.index("killErr := kill()")
+        direct_reap = direct.index("reapErr := waitForBoundedChildReap(")
+        self.assertLess(kill, direct_reap)
+        self.assertNotIn("return ", direct[kill:direct_reap])
+        self.assertIn("return errors.Join(signalErr, reapErr)", direct)
+
+        bounded = self.anchor_linux_source[
+            self.anchor_linux_source.index(
+                "func waitForBoundedChildReap("
+            ) :
+            self.anchor_linux_source.index("\nfunc runWorkerCommand(")
+        ]
+        self.assertIn("time.NewTimer(timeout)", bounded)
+        self.assertIn("case waitErr, ok := <-workerWait:", bounded)
+        self.assertIn("case <-timer.C:", bounded)
 
     def test_tcp_matrix_covers_flow_count_direction_and_error_gates(self) -> None:
         self.assertIn('TCP_STREAMS="${TCP_STREAMS:-1 4 16}"', self.source)
