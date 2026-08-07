@@ -784,13 +784,9 @@ func newReviewedToolFixture(t *testing.T) reviewedToolFixture {
 			t.Fatalf("create fixture directory %s: %v", directory, err)
 		}
 	}
-	rootInfo, err := os.Lstat(root)
-	if err != nil {
+	var rootStat unix.Stat_t
+	if err := unix.Lstat(root, &rootStat); err != nil {
 		t.Fatalf("stat fixture root: %v", err)
-	}
-	rootStat, ok := rootInfo.Sys().(*unix.Stat_t)
-	if !ok {
-		t.Fatal("fixture root did not expose Linux stat metadata")
 	}
 	target := filepath.Join(root, "lib", "cargo", "bin", "coreutils")
 	other := filepath.Join(root, "lib", "cargo", "bin", "other")
@@ -845,13 +841,9 @@ func newStagedLaunchFixture(t *testing.T) stagedLaunchFixture {
 			t.Fatalf("create staged fixture directory %s: %v", directory, err)
 		}
 	}
-	rootInfo, err := os.Lstat(root)
-	if err != nil {
+	var rootStat unix.Stat_t
+	if err := unix.Lstat(root, &rootStat); err != nil {
 		t.Fatalf("stat staged fixture root: %v", err)
-	}
-	rootStat, ok := rootInfo.Sys().(*unix.Stat_t)
-	if !ok {
-		t.Fatal("staged fixture root did not expose Linux stat metadata")
 	}
 	descriptors := make(map[string]int, 4)
 	for _, name := range []string{
