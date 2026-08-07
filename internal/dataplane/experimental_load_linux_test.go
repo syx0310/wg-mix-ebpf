@@ -14,13 +14,15 @@ import (
 )
 
 type fakeExperimentalCollection struct {
-	closed *bool
-	order  *[]string
+	closed   *bool
+	order    *[]string
+	closeErr error
 }
 
-func (collection *fakeExperimentalCollection) Close() {
+func (collection *fakeExperimentalCollection) Close() error {
 	*collection.closed = true
 	*collection.order = append(*collection.order, "close")
+	return collection.closeErr
 }
 
 func TestExperimentalVerifierLoadValidatesBeforeKernelLoadAndCloses(t *testing.T) {
@@ -60,6 +62,27 @@ func TestExperimentalVerifierLoadValidatesBeforeKernelLoadAndCloses(t *testing.T
 	}
 	if got, want := strings.Join(order, ","), "remove-memlock,new-collection,close"; got != want {
 		t.Fatalf("load order = %q, want %q", got, want)
+	}
+}
+
+func TestExperimentalVerifierLoadPreservesCollectionCloseFailure(t *testing.T) {
+	wantErr := errors.New("injected collection close failure")
+	err := loadExperimentalFakeTCPCollection(
+		canonicalExperimentalCollectionSpec(),
+		"/reviewed/experimental.o",
+		func() error { return nil },
+		func(*ebpf.CollectionSpec) (experimentalCollectionCloser, error) {
+			closed := false
+			order := []string{}
+			return &fakeExperimentalCollection{
+				closed:   &closed,
+				order:    &order,
+				closeErr: wantErr,
+			}, nil
+		},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("close error = %v, want %v", err, wantErr)
 	}
 }
 
