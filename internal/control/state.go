@@ -82,6 +82,11 @@ type WireGuardState struct {
 	FakeTCPChecksumMode             string `json:"faketcp_checksum_mode,omitempty"`
 	FakeTCPIngressMode              string `json:"faketcp_ingress_mode,omitempty"`
 	FakeTCPSessionCapacity          uint32 `json:"faketcp_session_capacity,omitempty"`
+	FakeTCPMaxHalfOpenSessions      uint32 `json:"faketcp_max_half_open_sessions,omitempty"`
+	FakeTCPMaxHalfOpenPerSource     uint32 `json:"faketcp_max_half_open_per_source,omitempty"`
+	FakeTCPSYNRateIntervalNanos     int64  `json:"faketcp_syn_rate_interval_nanos,omitempty"`
+	FakeTCPSYNBurst                 uint32 `json:"faketcp_syn_burst,omitempty"`
+	FakeTCPSYNBurstPerSource        uint32 `json:"faketcp_syn_burst_per_source,omitempty"`
 	FakeTCPMaxPendingFlows          uint32 `json:"faketcp_max_pending_flows,omitempty"`
 	FakeTCPMaxPendingPacketsPerFlow uint32 `json:"faketcp_max_pending_packets_per_flow,omitempty"`
 	FakeTCPMaxPendingBytes          uint32 `json:"faketcp_max_pending_bytes,omitempty"`
@@ -319,6 +324,11 @@ func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.Wire
 		FakeTCPChecksumMode:             wg.Transport.FakeTCP.ChecksumMode,
 		FakeTCPIngressMode:              wg.Transport.FakeTCP.IngressMode,
 		FakeTCPSessionCapacity:          wg.Transport.FakeTCP.SessionCapacity,
+		FakeTCPMaxHalfOpenSessions:      wg.Transport.FakeTCP.MaxHalfOpenSessions,
+		FakeTCPMaxHalfOpenPerSource:     wg.Transport.FakeTCP.MaxHalfOpenPerSource,
+		FakeTCPSYNRateIntervalNanos:     wg.Transport.FakeTCP.SYNRateInterval.Duration.Nanoseconds(),
+		FakeTCPSYNBurst:                 wg.Transport.FakeTCP.SYNBurst,
+		FakeTCPSYNBurstPerSource:        wg.Transport.FakeTCP.SYNBurstPerSource,
 		FakeTCPMaxPendingFlows:          wg.Transport.FakeTCP.MaxPendingFlows,
 		FakeTCPMaxPendingPacketsPerFlow: wg.Transport.FakeTCP.MaxPendingPacketsPerFlow,
 		FakeTCPMaxPendingBytes:          wg.Transport.FakeTCP.MaxPendingBytes,

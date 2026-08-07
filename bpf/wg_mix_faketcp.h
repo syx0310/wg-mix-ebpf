@@ -304,6 +304,9 @@ static __always_inline int faketcp_preflight_egress(struct __sk_buff *skb,
 	    session->state == FAKETCP_STATE_ESTABLISHED)
 		return 0;
 	if (skb->gso_segs || skb->gso_size) {
+		// Dropping is only a development fail-safe, not GSO support. The
+		// activation gate requires a verified per-segment transform and real
+		// offload acceptance before this object can be attached.
 		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
 		return -1;
 	}
@@ -335,8 +338,10 @@ static __always_inline __s64 faketcp_rotation_checksum(const __u8 head[FAKETCP_H
 }
 
 // This packet-level prototype accepts only a fully materialized UDP checksum.
-// CHECKSUM_PARTIAL is deliberately blocked by the loader gate: changing only
-// csum_offset would not turn its pseudo-header seed into a complete checksum.
+// Activation remains blocked until the kernel path can identify ip_summed,
+// materialize/complete every CHECKSUM_PARTIAL seed, and reset checksum offset
+// plus skb checksum metadata after the UDP-to-TCP header-size change. Merely
+// rewriting csum_offset is not a valid completion strategy.
 static __always_inline int faketcp_tcp_checksum_from_materialized_udp(
 						  struct udphdr old_udp,
 						  struct tcphdr *tcp,
@@ -478,9 +483,10 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		return TC_ACT_SHOT;
 	}
 
-	// Loading this path is gated until a reviewed kfunc can update
-	// CHECKSUM_PARTIAL csum_offset. Do not weaken that loader gate merely
-	// because fully materialized packet tests pass.
+	// Loading this path is gated until CHECKSUM_PARTIAL inspection,
+	// materialization/completion and checksum-metadata reset all pass the real
+	// NIC offload matrix. Do not weaken that gate merely because fully
+	// materialized packet tests pass.
 	inc_stat(STAT_EGRESS_REWRITE_OK);
 	inc_faketcp_stat(FAKETCP_STAT_EGRESS_OK);
 	return TC_ACT_OK;

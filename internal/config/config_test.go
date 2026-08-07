@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestLoadAppliesDefaults(t *testing.T) {
@@ -323,11 +324,39 @@ ciphers:
 		t.Fatal(err)
 	}
 	fake := cfg.WireGuards[0].Transport.FakeTCP
-	if fake.ChecksumMode != "kfunc-required" || fake.IngressMode != "xdp-required" {
+	if fake.ChecksumMode != FakeTCPChecksumModePartialCompleteReset || fake.IngressMode != "xdp-required" {
 		t.Fatalf("faketcp capability defaults = checksum %q ingress %q", fake.ChecksumMode, fake.IngressMode)
 	}
-	if fake.SessionCapacity != 4096 || fake.MaxPendingPacketsPerFlow != 1 {
-		t.Fatalf("faketcp bounds = sessions %d packets %d", fake.SessionCapacity, fake.MaxPendingPacketsPerFlow)
+	if fake.SessionCapacity != 4096 || fake.MaxHalfOpenSessions != 1024 ||
+		fake.MaxHalfOpenPerSource != 16 || fake.SYNRateInterval.Duration != 100*time.Millisecond ||
+		fake.SYNBurst != 256 || fake.SYNBurstPerSource != 8 ||
+		fake.MaxPendingPacketsPerFlow != 1 {
+		t.Fatalf("faketcp bounds = %#v", fake)
+	}
+}
+
+func TestRejectLegacyFakeTCPChecksumOffsetMode(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: faketcp
+      faketcp:
+        experimental: true
+        checksum_mode: kfunc-required
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err == nil || !strings.Contains(err.Error(), "ip_summed identification") ||
+		!strings.Contains(err.Error(), "materialize/complete") ||
+		!strings.Contains(err.Error(), "metadata reset") {
+		t.Fatalf("legacy checksum-offset mode error = %v", err)
 	}
 }
 
@@ -371,6 +400,30 @@ profiles:
 `))
 	if err == nil || !strings.Contains(err.Error(), "session_capacity") {
 		t.Fatalf("expected bounded session error, got %v", err)
+	}
+}
+
+func TestRejectFakeTCPHalfOpenCapacityThatCanFillEstablishedTable(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: faketcp
+      faketcp:
+        experimental: true
+        session_capacity: 64
+        max_half_open_sessions: 64
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err == nil || !strings.Contains(err.Error(), "max_half_open_sessions") {
+		t.Fatalf("expected established-capacity reservation error, got %v", err)
 	}
 }
 

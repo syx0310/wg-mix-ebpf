@@ -21,7 +21,17 @@ func TestFakeTCPKernelGateRejectsBeforeActivation(t *testing.T) {
 	if !errors.Is(err, ErrFakeTCPKernelGate) {
 		t.Fatalf("expected FakeTCP kernel gate, got %v", err)
 	}
-	for _, want := range []string{"XDP link ownership/rollback", "CHECKSUM_PARTIAL", "MTU-minus-12", "once-only reinjector", "before mutation"} {
+	for _, want := range []string{
+		"XDP link ownership/rollback and libxdp chaining",
+		"ip_summed/CHECKSUM_PARTIAL identification",
+		"CHECKSUM_PARTIAL materialize/complete",
+		"checksum offset and skb metadata reset",
+		"per-segment GSO transform",
+		"MTU-minus-12",
+		"once-only reinjector",
+		"real-NIC GSO/GRO/checksum-offload acceptance",
+		"before mutation",
+	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("gate error missing %q: %v", want, err)
 		}
@@ -31,6 +41,27 @@ func TestFakeTCPKernelGateRejectsBeforeActivation(t *testing.T) {
 	err = (LinuxLoader{PinPath: "relative-path-must-not-be-touched"}).Apply(context.Background(), state)
 	if !errors.Is(err, ErrFakeTCPKernelGate) {
 		t.Fatalf("Apply did not fail at the pre-mutation gate: %v", err)
+	}
+}
+
+func TestFakeTCPActivationCannotBeEnabledWithoutEveryAcceptanceCapability(t *testing.T) {
+	if fakeTCPActivationReady() {
+		t.Fatal("experimental FakeTCP object became attachable without the missing acceptance capabilities")
+	}
+	missing := strings.Join(missingFakeTCPCapabilities(), "\n")
+	for _, capability := range []string{
+		"XDP link ownership/rollback and libxdp chaining",
+		"atomic managed-interface/port policy population",
+		"ip_summed/CHECKSUM_PARTIAL identification",
+		"CHECKSUM_PARTIAL materialize/complete",
+		"checksum offset and skb metadata reset",
+		"per-segment GSO transform",
+		"established-state compare-delete backend",
+		"real-NIC GSO/GRO/checksum-offload acceptance",
+	} {
+		if !strings.Contains(missing, capability) {
+			t.Fatalf("hard gate no longer requires %q; missing=%q", capability, missing)
+		}
 	}
 }
 

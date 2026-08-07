@@ -19,15 +19,19 @@ const (
 
 	// Reload stages a second generation before deleting the active one. These
 	// limits are therefore half of the corresponding BPF map capacities.
-	MaxProfilesPerGeneration         = 64
-	MaxCiphersPerGeneration          = 64
-	MaxUnderlaysPerGeneration        = 256
-	MaxManagedRulesPerGeneration     = 256
-	MaxDirectionalRulesPerGeneration = 1024
-	MaxFakeTCPSessions               = 16384
-	MaxFakeTCPPendingFlows           = 4096
-	MaxFakeTCPPendingPacketsPerFlow  = 4
-	MaxFakeTCPPendingBytes           = 1 << 20
+	MaxProfilesPerGeneration                = 64
+	MaxCiphersPerGeneration                 = 64
+	MaxUnderlaysPerGeneration               = 256
+	MaxManagedRulesPerGeneration            = 256
+	MaxDirectionalRulesPerGeneration        = 1024
+	MaxFakeTCPSessions                      = 16384
+	MaxFakeTCPHalfOpenSessions              = 4096
+	MaxFakeTCPHalfOpenPerSource             = 256
+	MaxFakeTCPSYNBurst                      = 4096
+	MaxFakeTCPPendingFlows                  = 4096
+	MaxFakeTCPPendingPacketsPerFlow         = 4
+	MaxFakeTCPPendingBytes                  = 1 << 20
+	FakeTCPChecksumModePartialCompleteReset = "partial-complete-reset-required"
 )
 
 type Config struct {
@@ -96,6 +100,11 @@ type FakeTCPTransport struct {
 	ChecksumMode             string   `yaml:"checksum_mode"`
 	IngressMode              string   `yaml:"ingress_mode"`
 	SessionCapacity          uint32   `yaml:"session_capacity"`
+	MaxHalfOpenSessions      uint32   `yaml:"max_half_open_sessions"`
+	MaxHalfOpenPerSource     uint32   `yaml:"max_half_open_per_source"`
+	SYNRateInterval          Duration `yaml:"syn_rate_interval"`
+	SYNBurst                 uint32   `yaml:"syn_burst"`
+	SYNBurstPerSource        uint32   `yaml:"syn_burst_per_source"`
 	MaxPendingFlows          uint32   `yaml:"max_pending_flows"`
 	MaxPendingPacketsPerFlow uint32   `yaml:"max_pending_packets_per_flow"`
 	MaxPendingBytes          uint32   `yaml:"max_pending_bytes"`
@@ -386,13 +395,28 @@ func (c *Config) ApplyDefaults() {
 		}
 		if c.WireGuards[i].Transport.Mode == "faketcp" {
 			fake := &c.WireGuards[i].Transport.FakeTCP
-			defaultString(&fake.ChecksumMode, "kfunc-required")
+			defaultString(&fake.ChecksumMode, FakeTCPChecksumModePartialCompleteReset)
 			defaultString(&fake.IngressMode, "xdp-required")
 			if fake.SessionCapacity == 0 {
 				fake.SessionCapacity = 4096
 			}
+			if fake.MaxHalfOpenSessions == 0 {
+				fake.MaxHalfOpenSessions = max(1, fake.SessionCapacity/4)
+			}
+			if fake.MaxHalfOpenPerSource == 0 {
+				fake.MaxHalfOpenPerSource = min(16, fake.MaxHalfOpenSessions)
+			}
+			if fake.SYNRateInterval.Duration == 0 {
+				fake.SYNRateInterval.Duration = 100 * time.Millisecond
+			}
+			if fake.SYNBurst == 0 {
+				fake.SYNBurst = min(256, fake.MaxHalfOpenSessions)
+			}
+			if fake.SYNBurstPerSource == 0 {
+				fake.SYNBurstPerSource = min(8, fake.SYNBurst)
+			}
 			if fake.MaxPendingFlows == 0 {
-				fake.MaxPendingFlows = 1024
+				fake.MaxPendingFlows = min(1024, fake.MaxHalfOpenSessions)
 			}
 			if fake.MaxPendingPacketsPerFlow == 0 {
 				fake.MaxPendingPacketsPerFlow = 1
@@ -580,17 +604,34 @@ func validateFakeTCPTransport(prefix string, f FakeTCPTransport) error {
 	if !f.Experimental {
 		return fmt.Errorf("%s.experimental must be true to acknowledge the incomplete kernel compatibility matrix", prefix)
 	}
-	if f.ChecksumMode != "kfunc-required" {
-		return fmt.Errorf("%s.checksum_mode %q is unsupported; only kfunc-required is fail-closed for CHECKSUM_PARTIAL", prefix, f.ChecksumMode)
+	if f.ChecksumMode != FakeTCPChecksumModePartialCompleteReset {
+		return fmt.Errorf("%s.checksum_mode %q is unsupported; only %s requires ip_summed identification, CHECKSUM_PARTIAL materialize/complete, and checksum offset/metadata reset", prefix, f.ChecksumMode, FakeTCPChecksumModePartialCompleteReset)
 	}
 	if f.IngressMode != "xdp-required" {
 		return fmt.Errorf("%s.ingress_mode %q is unsupported; XDP is required before GRO", prefix, f.IngressMode)
 	}
-	if f.SessionCapacity == 0 || f.SessionCapacity > MaxFakeTCPSessions {
-		return fmt.Errorf("%s.session_capacity must be between 1 and %d", prefix, MaxFakeTCPSessions)
+	if f.SessionCapacity < 2 || f.SessionCapacity > MaxFakeTCPSessions {
+		return fmt.Errorf("%s.session_capacity must be between 2 and %d", prefix, MaxFakeTCPSessions)
 	}
-	if f.MaxPendingFlows == 0 || f.MaxPendingFlows > MaxFakeTCPPendingFlows || f.MaxPendingFlows > f.SessionCapacity {
-		return fmt.Errorf("%s.max_pending_flows must be between 1 and min(session_capacity, %d)", prefix, MaxFakeTCPPendingFlows)
+	if f.MaxHalfOpenSessions == 0 || f.MaxHalfOpenSessions >= f.SessionCapacity ||
+		f.MaxHalfOpenSessions > MaxFakeTCPHalfOpenSessions {
+		return fmt.Errorf("%s.max_half_open_sessions must be between 1 and min(session_capacity-1, %d)", prefix, MaxFakeTCPHalfOpenSessions)
+	}
+	if f.MaxHalfOpenPerSource == 0 || f.MaxHalfOpenPerSource > f.MaxHalfOpenSessions ||
+		f.MaxHalfOpenPerSource > MaxFakeTCPHalfOpenPerSource {
+		return fmt.Errorf("%s.max_half_open_per_source must be between 1 and min(max_half_open_sessions, %d)", prefix, MaxFakeTCPHalfOpenPerSource)
+	}
+	if f.SYNRateInterval.Duration < 10*time.Millisecond || f.SYNRateInterval.Duration > 10*time.Second {
+		return fmt.Errorf("%s.syn_rate_interval must be between 10ms and 10s", prefix)
+	}
+	if f.SYNBurst == 0 || f.SYNBurst > f.MaxHalfOpenSessions || f.SYNBurst > MaxFakeTCPSYNBurst {
+		return fmt.Errorf("%s.syn_burst must be between 1 and min(max_half_open_sessions, %d)", prefix, MaxFakeTCPSYNBurst)
+	}
+	if f.SYNBurstPerSource == 0 || f.SYNBurstPerSource > f.SYNBurst {
+		return fmt.Errorf("%s.syn_burst_per_source must be between 1 and syn_burst", prefix)
+	}
+	if f.MaxPendingFlows == 0 || f.MaxPendingFlows > MaxFakeTCPPendingFlows || f.MaxPendingFlows > f.MaxHalfOpenSessions {
+		return fmt.Errorf("%s.max_pending_flows must be between 1 and min(max_half_open_sessions, %d)", prefix, MaxFakeTCPPendingFlows)
 	}
 	if f.MaxPendingPacketsPerFlow == 0 || f.MaxPendingPacketsPerFlow > MaxFakeTCPPendingPacketsPerFlow {
 		return fmt.Errorf("%s.max_pending_packets_per_flow must be between 1 and %d", prefix, MaxFakeTCPPendingPacketsPerFlow)

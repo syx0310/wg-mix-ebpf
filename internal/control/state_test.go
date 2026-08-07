@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/runtime"
@@ -387,8 +388,11 @@ ciphers:
 		t.Fatalf("faketcp cipher IDs = egress %d ingress %d", egress.CipherID, ingress.CipherID)
 	}
 	wg := state.WireGuards[0]
-	if !wg.FakeTCPExperimental || wg.FakeTCPChecksumMode != "kfunc-required" ||
-		wg.FakeTCPIngressMode != "xdp-required" || wg.FakeTCPSessionCapacity != 4096 {
+	if !wg.FakeTCPExperimental || wg.FakeTCPChecksumMode != config.FakeTCPChecksumModePartialCompleteReset ||
+		wg.FakeTCPIngressMode != "xdp-required" || wg.FakeTCPSessionCapacity != 4096 ||
+		wg.FakeTCPMaxHalfOpenSessions != 1024 || wg.FakeTCPMaxHalfOpenPerSource != 16 ||
+		wg.FakeTCPSYNRateIntervalNanos != int64(100*time.Millisecond) ||
+		wg.FakeTCPSYNBurst != 256 || wg.FakeTCPSYNBurstPerSource != 8 {
 		t.Fatalf("faketcp state = %#v", wg)
 	}
 }
