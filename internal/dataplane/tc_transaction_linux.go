@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"sync"
 
 	"github.com/cilium/ebpf"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
@@ -70,12 +71,14 @@ type tcLinkAttachPlan struct {
 }
 
 type tcAttachPlan struct {
-	runtime tcRuntime
-	links   []tcLinkAttachPlan
-	stale   []tcOwnedStaleFilter
-	ingress tcProgramIdentity
-	egress  tcProgramIdentity
-	closed  bool
+	runtime  tcRuntime
+	links    []tcLinkAttachPlan
+	stale    []tcOwnedStaleFilter
+	ingress  tcProgramIdentity
+	egress   tcProgramIdentity
+	closed   bool
+	executed bool
+	stage    *tcAttachStage
 }
 
 type tcFilterBinding struct {
@@ -97,6 +100,20 @@ type tcOwnedStaleFilter struct {
 	key      string
 	link     netlink.Link
 	snapshot tcFilterSnapshot
+}
+
+// tcAttachStage retains the exact preflight snapshots and program references
+// needed to restore every filter changed by one successful attachment.  It is
+// used by unpinned experimental generations whose TC ownership ends with the
+// runtime, rather than being transferred to the persistent pin-owner journal.
+type tcAttachStage struct {
+	mu sync.Mutex
+
+	plan    *tcAttachPlan
+	applied []tcAppliedFilter
+	deleted []tcOwnedStaleFilter
+	done    bool
+	err     error
 }
 
 func tcProgramIdentityFromProgram(program *ebpf.Program) (tcProgramIdentity, error) {
@@ -501,15 +518,37 @@ func (plan *tcAttachPlan) AddOwnedStaleRemovals(
 }
 
 func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
+	stage, err := plan.ExecuteRetained(commit)
+	if err != nil {
+		return err
+	}
+	// Persistent loader callers transfer rollback responsibility to their
+	// owner journal in commit.  Disarm leaves retained program handles with the
+	// plan so its existing deferred Close keeps the post-commit path infallible.
+	stage.Disarm()
+	return nil
+}
+
+// ExecuteRetained performs the same preflight-fenced transaction as Execute,
+// but success returns rollback ownership instead of discarding it.  On
+// success callers must use only the returned stage; plan.Close refuses to
+// invalidate the retained program references until the stage is resolved.
+func (plan *tcAttachPlan) ExecuteRetained(
+	commit func() error,
+) (_ *tcAttachStage, returnErr error) {
 	if plan == nil {
-		return errors.New("TC attach plan is nil")
+		return nil, errors.New("TC attach plan is nil")
 	}
 	if plan.closed {
-		return errors.New("TC attach plan is closed")
+		return nil, errors.New("TC attach plan is closed")
+	}
+	if plan.executed {
+		return nil, errors.New("TC attach plan has already executed")
 	}
 	if commit == nil {
-		return errors.New("TC activation callback is nil")
+		return nil, errors.New("TC activation callback is nil")
 	}
+	plan.executed = true
 	var applied []tcAppliedFilter
 	var deleted []tcOwnedStaleFilter
 	defer func() {
@@ -526,28 +565,28 @@ func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
 		linkPlan := &plan.links[index]
 		currentClsact, err := inspectClsact(linkPlan.link, plan.runtime)
 		if err != nil {
-			return fmt.Errorf("recheck clsact on ifindex %d: %w", linkPlan.ifindex, err)
+			return nil, fmt.Errorf("recheck clsact on ifindex %d: %w", linkPlan.ifindex, err)
 		}
 		if currentClsact != linkPlan.clsactExists {
-			return fmt.Errorf("clsact state changed on ifindex %d after preflight", linkPlan.ifindex)
+			return nil, fmt.Errorf("clsact state changed on ifindex %d after preflight", linkPlan.ifindex)
 		}
 		if !linkPlan.clsactExists {
 			qdisc := canonicalClsact(linkPlan.ifindex)
 			if err := plan.runtime.qdiscAdd(qdisc); err != nil {
-				return fmt.Errorf("add clsact on ifindex %d: %w", linkPlan.ifindex, err)
+				return nil, fmt.Errorf("add clsact on ifindex %d: %w", linkPlan.ifindex, err)
 			}
 			present, err := inspectClsact(linkPlan.link, plan.runtime)
 			if err != nil {
-				return fmt.Errorf("verify clsact on ifindex %d: %w", linkPlan.ifindex, err)
+				return nil, fmt.Errorf("verify clsact on ifindex %d: %w", linkPlan.ifindex, err)
 			}
 			if !present {
-				return fmt.Errorf("clsact did not appear on ifindex %d", linkPlan.ifindex)
+				return nil, fmt.Errorf("clsact did not appear on ifindex %d", linkPlan.ifindex)
 			}
 		}
 
 		for _, snapshot := range linkPlan.filters {
 			if err := plan.recheckFilterSnapshot(linkPlan.link, snapshot); err != nil {
-				return fmt.Errorf(
+				return nil, fmt.Errorf(
 					"recheck %s on ifindex %d before mutation: %w",
 					snapshot.slot.name, linkPlan.ifindex, err,
 				)
@@ -556,13 +595,13 @@ func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
 			filter := managedBpfFilter(linkPlan.ifindex, snapshot.slot, program.fd)
 			if snapshot.existed {
 				if err := plan.runtime.filterReplace(filter); err != nil {
-					return fmt.Errorf(
+					return nil, fmt.Errorf(
 						"replace %s on ifindex %d: %w",
 						snapshot.slot.name, linkPlan.ifindex, err,
 					)
 				}
 			} else if err := plan.runtime.filterAdd(filter); err != nil {
-				return fmt.Errorf(
+				return nil, fmt.Errorf(
 					"add %s on ifindex %d: %w",
 					snapshot.slot.name, linkPlan.ifindex, err,
 				)
@@ -577,7 +616,7 @@ func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
 				snapshot.slot,
 				program.id,
 			); err != nil {
-				return fmt.Errorf(
+				return nil, fmt.Errorf(
 					"verify %s on ifindex %d after mutation: %w",
 					snapshot.slot.name, linkPlan.ifindex, err,
 				)
@@ -589,7 +628,7 @@ func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
 			stale.link,
 			stale.snapshot,
 		); err != nil {
-			return fmt.Errorf(
+			return nil, fmt.Errorf(
 				"recheck stale owner TC slot %s before delete: %w",
 				stale.key, err,
 			)
@@ -603,7 +642,7 @@ func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
 		filter.ClassId = stale.snapshot.classID
 		filter.Id = int(stale.snapshot.programID)
 		if err := plan.runtime.filterDelete(filter); err != nil {
-			return fmt.Errorf("delete stale owner TC slot %s: %w", stale.key, err)
+			return nil, fmt.Errorf("delete stale owner TC slot %s: %w", stale.key, err)
 		}
 		deleted = append(deleted, stale)
 		after, err := inspectTCFilterSlot(
@@ -613,19 +652,25 @@ func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
 			false,
 		)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if after.existed {
-			return fmt.Errorf(
+			return nil, fmt.Errorf(
 				"stale owner TC slot %s remains after delete",
 				stale.key,
 			)
 		}
 	}
 	if err := commit(); err != nil {
-		return fmt.Errorf("activate attached TC programs: %w", err)
+		return nil, fmt.Errorf("activate attached TC programs: %w", err)
 	}
-	return nil
+	stage := &tcAttachStage{
+		plan:    plan,
+		applied: applied,
+		deleted: deleted,
+	}
+	plan.stage = stage
+	return stage, nil
 }
 
 func canonicalClsact(ifindex int) netlink.Qdisc {
@@ -835,6 +880,16 @@ func (plan *tcAttachPlan) Close() error {
 	if plan == nil || plan.closed {
 		return nil
 	}
+	if plan.stage != nil {
+		return errors.New("TC attach plan is owned by a retained stage")
+	}
+	return plan.closeProgramReferences()
+}
+
+func (plan *tcAttachPlan) closeProgramReferences() error {
+	if plan == nil || plan.closed {
+		return nil
+	}
 	plan.closed = true
 	var errs []error
 	for linkIndex := range plan.links {
@@ -860,4 +915,55 @@ func (plan *tcAttachPlan) Close() error {
 		plan.stale[index].snapshot.oldProgram = nil
 	}
 	return errors.Join(errs...)
+}
+
+// Close restores the exact prior filter set in reverse mutation order and
+// then closes every retained prior-program reference.  A slot that no longer
+// contains this stage's program is preserved and reported instead of being
+// overwritten.
+func (stage *tcAttachStage) Close() error {
+	if stage == nil {
+		return nil
+	}
+	stage.mu.Lock()
+	defer stage.mu.Unlock()
+	if stage.done {
+		return stage.err
+	}
+	stage.done = true
+	if stage.plan == nil {
+		stage.err = errors.New("retained TC attach stage has no plan")
+		return stage.err
+	}
+	plan := stage.plan
+	plan.stage = nil
+	stage.err = errors.Join(
+		plan.rollback(stage.applied, stage.deleted),
+		plan.closeProgramReferences(),
+	)
+	stage.plan = nil
+	stage.applied = nil
+	stage.deleted = nil
+	return stage.err
+}
+
+// Disarm transfers rollback responsibility out of a retained stage.  It is
+// intentionally infallible and performs no close so a commit callback remains
+// the final fallible operation in the persistent loader transaction.
+func (stage *tcAttachStage) Disarm() {
+	if stage == nil {
+		return
+	}
+	stage.mu.Lock()
+	defer stage.mu.Unlock()
+	if stage.done {
+		return
+	}
+	stage.done = true
+	if stage.plan != nil && stage.plan.stage == stage {
+		stage.plan.stage = nil
+	}
+	stage.plan = nil
+	stage.applied = nil
+	stage.deleted = nil
 }

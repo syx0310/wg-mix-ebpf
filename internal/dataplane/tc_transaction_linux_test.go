@@ -290,6 +290,124 @@ func TestTCAttachTransactionCommitsAfterEveryDirection(t *testing.T) {
 	}
 }
 
+func TestTCAttachRetainedStageRestoresPriorFiltersOnClose(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	for id, fd := range map[uint32]int{
+		21: 201,
+		22: 202,
+		31: 301,
+		32: 302,
+	} {
+		kernel.addProgram(id, fd)
+	}
+	kernel.addClsact(11)
+	kernel.addManagedFilter(11, canonicalTCFilterSlots()[0], 21)
+	kernel.addManagedFilter(11, canonicalTCFilterSlots()[1], 22)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := plan.ExecuteRetained(func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := kernel.managedProgramID(t, 11, canonicalTCFilterSlots()[0]); got != 31 {
+		t.Fatalf("active ingress program = %d, want 31", got)
+	}
+	if got := kernel.managedProgramID(t, 11, canonicalTCFilterSlots()[1]); got != 32 {
+		t.Fatalf("active egress program = %d, want 32", got)
+	}
+	if err := plan.Close(); err == nil || !strings.Contains(err.Error(), "retained stage") {
+		t.Fatalf("plan Close while retained = %v", err)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatalf("stage Close: %v", err)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatalf("repeated stage Close: %v", err)
+	}
+	if got := kernel.managedProgramID(t, 11, canonicalTCFilterSlots()[0]); got != 21 {
+		t.Fatalf("restored ingress program = %d, want 21", got)
+	}
+	if got := kernel.managedProgramID(t, 11, canonicalTCFilterSlots()[1]); got != 22 {
+		t.Fatalf("restored egress program = %d, want 22", got)
+	}
+	for index, retained := range kernel.retained {
+		if !retained.closed {
+			t.Fatalf("retained prior program %d was not closed", index)
+		}
+	}
+}
+
+func TestTCAttachRetainedStageRemovesFreshFiltersOnClose(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	kernel.addProgram(31, 301)
+	kernel.addProgram(32, 302)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := plan.ExecuteRetained(func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, slot := range canonicalTCFilterSlots() {
+		if got := kernel.managedProgramID(t, 11, slot); got != 0 {
+			t.Fatalf("fresh %s program remains after stage Close: %d", slot.name, got)
+		}
+	}
+}
+
+func TestTCAttachRetainedStagePreservesForeignReplacement(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	for id, fd := range map[uint32]int{21: 201, 22: 202, 31: 301, 32: 302, 99: 909} {
+		kernel.addProgram(id, fd)
+	}
+	kernel.addClsact(11)
+	kernel.addManagedFilter(11, canonicalTCFilterSlots()[0], 21)
+	kernel.addManagedFilter(11, canonicalTCFilterSlots()[1], 22)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := plan.ExecuteRetained(func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	ingress := canonicalTCFilterSlots()[0]
+	key := fakeTCFilterKey{ifindex: 11, parent: ingress.parent}
+	foreign := managedBpfFilter(11, ingress, 909).(*netlink.BpfFilter)
+	foreign.Id = 99
+	kernel.filters[key] = []netlink.Filter{foreign}
+	if err := stage.Close(); err == nil || !strings.Contains(err.Error(), "refuse rollback") {
+		t.Fatalf("stage Close error = %v", err)
+	}
+	if got := kernel.managedProgramID(t, 11, ingress); got != 99 {
+		t.Fatalf("foreign replacement program = %d, want preserved 99", got)
+	}
+	if got := kernel.managedProgramID(t, 11, canonicalTCFilterSlots()[1]); got != 22 {
+		t.Fatalf("uncontended egress program = %d, want restored 22", got)
+	}
+}
+
 func TestTCAttachTransactionRollsBackPartialMultiUnderlayFailure(t *testing.T) {
 	kernel := newFakeTCKernel(11, 12)
 	for id, fd := range map[uint32]int{
