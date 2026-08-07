@@ -572,13 +572,13 @@ static __always_inline int faketcp_xdp_ipv6_policy(void *data, void *data_end,
 
 #pragma unroll
 	for (int depth = 0; depth < 4; depth++) {
-		if (next_header == IPPROTO_TCP) {
-			struct tcphdr *tcp = data + off;
+		if (next_header == IPPROTO_TCP || next_header == IPPROTO_UDP) {
+			struct udphdr *ports = data + off;
 
-			if ((void *)(tcp + 1) > data_end)
+			if ((void *)(ports + 1) > data_end)
 				return managed_interface ? XDP_DROP : XDP_PASS;
 			return faketcp_xdp_managed_port(ifindex,
-							 bpf_ntohs(tcp->dest),
+							 bpf_ntohs(ports->dest),
 							 generation) ? XDP_DROP : XDP_PASS;
 		}
 		if (next_header == NEXTHDR_FRAGMENT) {
@@ -607,7 +607,12 @@ static __always_inline int faketcp_xdp_ipv6_policy(void *data, void *data_end,
 			off += extension_length;
 			continue;
 		}
-		return XDP_PASS;
+		if (next_header == IPPROTO_ICMPV6 || next_header == NEXTHDR_NONE)
+			return XDP_PASS;
+		// AH, ESP and unknown extension/transport values cannot prove that
+		// a managed TCP/UDP destination is absent. Never leak them to the
+		// host stack on a managed interface.
+		return managed_interface ? XDP_DROP : XDP_PASS;
 	}
 	// An extension chain deeper than the verifier-bounded parser is
 	// ambiguous on a managed interface and must never reach the host stack.
@@ -644,6 +649,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	__be16 protocol;
 	struct iphdr *iph;
 	struct tcphdr *tcp;
+	struct udphdr *wire_ports;
 	struct faketcp_managed_port_value *listener = 0;
 	struct faketcp_session_key key = {};
 	struct faketcp_session_value *session;
@@ -691,7 +697,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	iph = data + off;
 	if ((void *)(iph + 1) > data_end || iph->version != 4 || iph->ihl < 5)
 		return managed_interface ? XDP_DROP : XDP_PASS;
-	if (iph->protocol != IPPROTO_TCP)
+	if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
 		return XDP_PASS;
 	fragment_offset = bpf_ntohs(iph->frag_off);
 	if (fragment_offset & IP_OFFSET)
@@ -699,13 +705,21 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	ipv4_header_length = (__u32)iph->ihl * 4;
 	if (data + off + ipv4_header_length > data_end)
 		return managed_interface ? XDP_DROP : XDP_PASS;
-	tcp = data + off + ipv4_header_length;
-	if ((void *)(tcp + 1) > data_end)
+	wire_ports = data + off + ipv4_header_length;
+	if ((void *)(wire_ports + 1) > data_end)
 		return managed_interface ? XDP_DROP : XDP_PASS;
 	listener = faketcp_xdp_managed_port(xdp->ingress_ifindex,
-						    bpf_ntohs(tcp->dest), generation);
+						    bpf_ntohs(wire_ports->dest), generation);
 	if (!listener)
 		return XDP_PASS;
+	// Native UDP to a FakeTCP port is a transport-bypass attempt. Decoded
+	// packets do not re-enter XDP, so this cannot catch the valid TCP-to-UDP
+	// result produced later by this program.
+	if (iph->protocol == IPPROTO_UDP)
+		return XDP_DROP;
+	tcp = (struct tcphdr *)wire_ports;
+	if ((void *)(tcp + 1) > data_end)
+		return XDP_DROP;
 	// The policy lookup deliberately precedes all unsupported-header checks.
 	// A managed packet can only PASS after successful FakeTCP decoding.
 	if ((fragment_offset & IP_MF) || iph->ihl != 5 || tcp->doff != 5)

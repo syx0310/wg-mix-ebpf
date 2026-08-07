@@ -228,6 +228,8 @@ func TestFakeTCPXDPManagedPortLookupPrecedesUnsupportedHeaderExit(t *testing.T) 
 		"faketcp_xdp_ipv6_policy",
 		"for (int vlan_depth = 0; vlan_depth < 2; vlan_depth++)",
 		"return managed_interface ? XDP_DROP : XDP_PASS",
+		"AH, ESP and unknown extension/transport values",
+		"next_header == IPPROTO_TCP || next_header == IPPROTO_UDP",
 		"A managed packet can only PASS after successful FakeTCP decoding",
 	} {
 		if !strings.Contains(text, want) {

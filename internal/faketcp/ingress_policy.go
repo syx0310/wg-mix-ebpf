@@ -36,6 +36,7 @@ func ClassifyManagedIngressFrame(frame []byte, policy ManagedIngressPolicy) Ingr
 		etherTypeVLAN        = 0x8100
 		etherTypeQinQ        = 0x88a8
 		protocolTCP          = 6
+		protocolUDP          = 17
 	)
 
 	failClosed := func() IngressDisposition {
@@ -69,7 +70,8 @@ func ClassifyManagedIngressFrame(frame []byte, policy ManagedIngressPolicy) Ingr
 		if headerLength < 20 || len(frame) < offset+headerLength {
 			return failClosed()
 		}
-		if frame[offset+9] != protocolTCP {
+		protocol := frame[offset+9]
+		if protocol != protocolTCP && protocol != protocolUDP {
 			return IngressPass
 		}
 		fragmentOffset := binary.BigEndian.Uint16(frame[offset+6 : offset+8])
@@ -77,12 +79,18 @@ func ClassifyManagedIngressFrame(frame []byte, policy ManagedIngressPolicy) Ingr
 			return failClosed()
 		}
 		tcpOffset := offset + headerLength
-		if len(frame) < tcpOffset+20 {
+		if len(frame) < tcpOffset+8 {
 			return failClosed()
 		}
 		destinationPort := binary.BigEndian.Uint16(frame[tcpOffset+2 : tcpOffset+4])
 		if !managedIngressPort(policy, destinationPort) {
 			return IngressPass
+		}
+		if protocol == protocolUDP {
+			return IngressDrop
+		}
+		if len(frame) < tcpOffset+20 {
+			return IngressDrop
 		}
 		tcpHeaderLength := int(frame[tcpOffset+12]>>4) * 4
 		if fragmentOffset&0x2000 != 0 || headerLength != 20 || tcpHeaderLength != 20 {
@@ -98,8 +106,8 @@ func ClassifyManagedIngressFrame(frame []byte, policy ManagedIngressPolicy) Ingr
 		offset += 40
 		for depth := 0; depth < 4; depth++ {
 			switch nextHeader {
-			case protocolTCP:
-				if len(frame) < offset+20 {
+			case protocolTCP, protocolUDP:
+				if len(frame) < offset+8 {
 					return failClosed()
 				}
 				port := binary.BigEndian.Uint16(frame[offset+2 : offset+4])
@@ -126,8 +134,10 @@ func ClassifyManagedIngressFrame(frame []byte, policy ManagedIngressPolicy) Ingr
 				}
 				nextHeader = frame[offset]
 				offset += extensionLength
-			default:
+			case 58, 59: // ICMPv6, no next header
 				return IngressPass
+			default:
+				return failClosed()
 			}
 		}
 		return failClosed()

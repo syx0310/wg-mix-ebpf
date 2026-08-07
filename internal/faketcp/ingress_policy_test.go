@@ -27,8 +27,19 @@ func TestClassifyManagedIngressFrameFailClosedMatrix(t *testing.T) {
 		{name: "IPv6 hop-by-hop", frame: testIPv6TCPFrame(0, []byte{0}, 443), want: IngressDrop},
 		{name: "IPv6 first fragment", frame: testIPv6FragmentTCPFrame(0, 0, 443), want: IngressDrop},
 		{name: "IPv6 non-initial fragment", frame: testIPv6FragmentTCPFrame(0, 8, 444), want: IngressDrop},
+		{name: "native IPv4 UDP bypass", frame: testIPv4UDPFrame(0, 0, 443), want: IngressDrop},
+		{name: "native IPv6 UDP bypass", frame: testIPv6TransportFrame(0, 17, 443), want: IngressDrop},
+		{name: "IPv6 AH is ambiguous", frame: testIPv6TCPFrame(0, []byte{51}, 444), want: IngressDrop},
+		{name: "IPv6 ESP is ambiguous", frame: testIPv6TCPFrame(0, []byte{50}, 444), want: IngressDrop},
+		{name: "IPv6 unknown next header", frame: testIPv6TransportFrame(0, 253, 444), want: IngressDrop},
+		{name: "IPv6 extension depth overflow", frame: testIPv6TCPFrame(0, []byte{0, 0, 0, 0, 0}, 444), want: IngressDrop},
+		{name: "IPv6 truncated extension", frame: testIPv6TCPFrame(0, []byte{0}, 444)[:55], want: IngressDrop},
+		{name: "IPv6 first fragment to UDP managed", frame: testIPv6FragmentFrame(0, 0, 17, 443), want: IngressDrop},
+		{name: "IPv6 first fragment to ICMPv6", frame: testIPv6FragmentFrame(0, 0, 58, 443), want: IngressPass},
 		{name: "unmanaged IPv4 port", frame: testIPv4TCPFrame(0, 5, 5, 0, 444), want: IngressPass},
 		{name: "unmanaged IPv6 port", frame: testIPv6TCPFrame(0, nil, 444), want: IngressPass},
+		{name: "unmanaged IPv4 UDP port", frame: testIPv4UDPFrame(0, 0, 444), want: IngressPass},
+		{name: "unmanaged IPv6 UDP port", frame: testIPv6TransportFrame(0, 17, 444), want: IngressPass},
 		{name: "triple VLAN is ambiguous", frame: testIPv4TCPFrame(3, 5, 5, 0, 444), want: IngressDrop},
 		{name: "truncated managed interface", frame: []byte{0, 1, 2}, want: IngressDrop},
 	}
@@ -88,6 +99,13 @@ func testIPv4TCPFrame(vlanDepth, ipWords, tcpWords int, fragment uint16, port ui
 	return frame
 }
 
+func testIPv4UDPFrame(vlanDepth int, fragment uint16, port uint16) []byte {
+	frame := testIPv4TCPFrame(vlanDepth, 5, 5, fragment, port)
+	ipOffset := 14 + vlanDepth*4
+	frame[ipOffset+9] = 17
+	return frame
+}
+
 func testIPv6TCPFrame(vlanDepth int, extensionHeaders []byte, port uint16) []byte {
 	frame := testEthernetPrefix(vlanDepth, 0x86dd)
 	ipOffset := len(frame)
@@ -116,6 +134,22 @@ func testIPv6TCPFrame(vlanDepth int, extensionHeaders []byte, port uint16) []byt
 }
 
 func testIPv6FragmentTCPFrame(vlanDepth int, fragmentOffset uint16, port uint16) []byte {
+	return testIPv6FragmentFrame(vlanDepth, fragmentOffset, 6, port)
+}
+
+func testIPv6TransportFrame(vlanDepth int, protocol byte, port uint16) []byte {
+	frame := testEthernetPrefix(vlanDepth, 0x86dd)
+	ipOffset := len(frame)
+	frame = append(frame, make([]byte, 40+20)...)
+	frame[ipOffset] = 0x60
+	binary.BigEndian.PutUint16(frame[ipOffset+4:ipOffset+6], 20)
+	frame[ipOffset+6] = protocol
+	transportOffset := ipOffset + 40
+	binary.BigEndian.PutUint16(frame[transportOffset+2:transportOffset+4], port)
+	return frame
+}
+
+func testIPv6FragmentFrame(vlanDepth int, fragmentOffset uint16, nextHeader byte, port uint16) []byte {
 	frame := testEthernetPrefix(vlanDepth, 0x86dd)
 	ipOffset := len(frame)
 	frame = append(frame, make([]byte, 40+8+20)...)
@@ -123,7 +157,7 @@ func testIPv6FragmentTCPFrame(vlanDepth int, fragmentOffset uint16, port uint16)
 	binary.BigEndian.PutUint16(frame[ipOffset+4:ipOffset+6], 28)
 	frame[ipOffset+6] = 44
 	fragmentOffsetIndex := ipOffset + 40
-	frame[fragmentOffsetIndex] = 6
+	frame[fragmentOffsetIndex] = nextHeader
 	binary.BigEndian.PutUint16(frame[fragmentOffsetIndex+2:fragmentOffsetIndex+4], fragmentOffset)
 	tcpOffset := fragmentOffsetIndex + 8
 	binary.BigEndian.PutUint16(frame[tcpOffset+2:tcpOffset+4], port)
