@@ -325,6 +325,11 @@ func NewOnceReinjector(writer RawIPv4Writer, maxAttempts int) (*OnceReinjector, 
 	if rawIPv4WriterIsNil(writer) {
 		return nil, errors.New("faketcp once-only reinjector writer is nil")
 	}
+	if ready, ok := writer.(interface{ rawIPv4WriterReady() error }); ok {
+		if err := ready.rawIPv4WriterReady(); err != nil {
+			return nil, fmt.Errorf("faketcp once-only reinjector writer is not ready: %w", err)
+		}
+	}
 	if maxAttempts <= 0 {
 		return nil, errors.New("faketcp once-only reinjector capacity must be positive")
 	}

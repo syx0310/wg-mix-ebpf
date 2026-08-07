@@ -23,6 +23,8 @@ type LinuxRawIPv4Writer struct {
 
 	fd          int
 	sendTimeout time.Duration
+	closeFD     func(int) error
+	owned       bool
 	closed      bool
 	closeErr    error
 }
@@ -30,10 +32,30 @@ type LinuxRawIPv4Writer struct {
 var _ RawIPv4Writer = (*LinuxRawIPv4Writer)(nil)
 
 func NewLinuxRawIPv4Writer(sendTimeout time.Duration) (*LinuxRawIPv4Writer, error) {
+	return newLinuxRawIPv4Writer(sendTimeout, linuxRawSocketOps{
+		socket: unix.Socket, setHeaderIncluded: func(fd int) error {
+			return unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_HDRINCL, 1)
+		}, close: unix.Close,
+	})
+}
+
+type linuxRawSocketOps struct {
+	socket            func(int, int, int) (int, error)
+	setHeaderIncluded func(int) error
+	close             func(int) error
+}
+
+func newLinuxRawIPv4Writer(
+	sendTimeout time.Duration,
+	ops linuxRawSocketOps,
+) (*LinuxRawIPv4Writer, error) {
 	if sendTimeout <= 0 {
 		return nil, errors.New("faketcp raw IPv4 send timeout must be positive")
 	}
-	fd, err := unix.Socket(
+	if ops.socket == nil || ops.setHeaderIncluded == nil || ops.close == nil {
+		return nil, errors.New("faketcp raw IPv4 socket operations are incomplete")
+	}
+	fd, err := ops.socket(
 		unix.AF_INET,
 		unix.SOCK_RAW|unix.SOCK_CLOEXEC|unix.SOCK_NONBLOCK,
 		unix.IPPROTO_RAW,
@@ -41,14 +63,19 @@ func NewLinuxRawIPv4Writer(sendTimeout time.Duration) (*LinuxRawIPv4Writer, erro
 	if err != nil {
 		return nil, fmt.Errorf("open send-only faketcp raw IPv4 socket: %w", err)
 	}
-	if err := unix.SetsockoptInt(fd, unix.IPPROTO_IP, unix.IP_HDRINCL, 1); err != nil {
-		closeErr := unix.Close(fd)
+	if fd < 0 {
+		return nil, fmt.Errorf("open send-only faketcp raw IPv4 socket returned invalid fd %d", fd)
+	}
+	if err := ops.setHeaderIncluded(fd); err != nil {
+		closeErr := ops.close(fd)
 		return nil, errors.Join(
 			fmt.Errorf("enable IP_HDRINCL on faketcp raw IPv4 socket: %w", err),
 			wrapRawSocketCloseError(closeErr),
 		)
 	}
-	return &LinuxRawIPv4Writer{fd: fd, sendTimeout: sendTimeout}, nil
+	return &LinuxRawIPv4Writer{
+		fd: fd, sendTimeout: sendTimeout, closeFD: ops.close, owned: true,
+	}, nil
 }
 
 func (writer *LinuxRawIPv4Writer) WriteIPv4(ctx context.Context, write RawIPv4Write) error {
@@ -61,17 +88,16 @@ func (writer *LinuxRawIPv4Writer) WriteIPv4(ctx context.Context, write RawIPv4Wr
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if !writer.initializedLocked() || writer.closed {
+		return ErrRawBackendClosed
+	}
 	if err := validateRawIPv4Write(write); err != nil {
 		return err
 	}
 	sendCtx, cancel := context.WithTimeout(ctx, writer.sendTimeout)
 	defer cancel()
-
-	writer.mu.Lock()
-	defer writer.mu.Unlock()
-	if writer.closed || writer.fd < 0 {
-		return ErrRawBackendClosed
-	}
 	if err := sendCtx.Err(); err != nil {
 		return err
 	}
@@ -160,16 +186,37 @@ func (writer *LinuxRawIPv4Writer) Close() error {
 	}
 	writer.mu.Lock()
 	defer writer.mu.Unlock()
+	if !writer.owned {
+		// fd is zero in a Go zero value, but it is not owned. In contrast, a
+		// successful constructor may legitimately own fd 0.
+		return nil
+	}
 	if writer.closed {
 		return writer.closeErr
 	}
 	writer.closed = true
 	fd := writer.fd
 	writer.fd = -1
-	if fd >= 0 {
-		writer.closeErr = wrapRawSocketCloseError(unix.Close(fd))
+	if fd >= 0 && writer.closeFD != nil {
+		writer.closeErr = wrapRawSocketCloseError(writer.closeFD(fd))
 	}
 	return writer.closeErr
+}
+
+func (writer *LinuxRawIPv4Writer) rawIPv4WriterReady() error {
+	if writer == nil {
+		return ErrRawBackendClosed
+	}
+	writer.mu.Lock()
+	defer writer.mu.Unlock()
+	if !writer.initializedLocked() || writer.closed {
+		return ErrRawBackendClosed
+	}
+	return nil
+}
+
+func (writer *LinuxRawIPv4Writer) initializedLocked() bool {
+	return writer.owned && writer.fd >= 0 && writer.sendTimeout > 0 && writer.closeFD != nil
 }
 
 func wrapRawSocketCloseError(err error) error {
