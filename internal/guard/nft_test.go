@@ -70,3 +70,20 @@ func TestBuildNftPlanDoesNotEmbedWireGuardNameInComment(t *testing.T) {
 		t.Fatalf("script contains untrusted WireGuard name:\n%s", plan.Script())
 	}
 }
+
+func TestBuildNftPlanFakeTCPBlocksTCPAndOriginalUDP(t *testing.T) {
+	plan := BuildNftPlan(&control.State{
+		WireGuards: []control.WireGuardState{{
+			Name:             "wg0",
+			ConfigFwMark:     0x10000002,
+			ConfigListenPort: 443,
+			TransportMode:    "faketcp",
+		}},
+	})
+	joined := strings.Join(plan.Rules, "\n")
+	for _, want := range []string{"input udp dport 443", "input tcp dport 443"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in FakeTCP guard:\n%s", want, joined)
+		}
+	}
+}

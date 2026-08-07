@@ -24,6 +24,10 @@ const (
 	MaxUnderlaysPerGeneration        = 256
 	MaxManagedRulesPerGeneration     = 256
 	MaxDirectionalRulesPerGeneration = 1024
+	MaxFakeTCPSessions               = 16384
+	MaxFakeTCPPendingFlows           = 4096
+	MaxFakeTCPPendingPacketsPerFlow  = 4
+	MaxFakeTCPPendingBytes           = 1 << 20
 )
 
 type Config struct {
@@ -74,13 +78,30 @@ type IndexProfile struct {
 }
 
 type Transport struct {
-	Mode string        `yaml:"mode"`
-	ICMP ICMPTransport `yaml:"icmp"`
+	Mode    string           `yaml:"mode"`
+	ICMP    ICMPTransport    `yaml:"icmp"`
+	FakeTCP FakeTCPTransport `yaml:"faketcp"`
 }
 
 type ICMPTransport struct {
 	Role string `yaml:"role"`
 	ID   uint16 `yaml:"id"`
+}
+
+// FakeTCPTransport is deliberately explicit while the transport is
+// experimental.  The data path preserves UDP/QUIC reliability semantics and
+// only presents a TCP-shaped wire image; it is not a TCP stream.
+type FakeTCPTransport struct {
+	Experimental             bool     `yaml:"experimental"`
+	ChecksumMode             string   `yaml:"checksum_mode"`
+	IngressMode              string   `yaml:"ingress_mode"`
+	SessionCapacity          uint32   `yaml:"session_capacity"`
+	MaxPendingFlows          uint32   `yaml:"max_pending_flows"`
+	MaxPendingPacketsPerFlow uint32   `yaml:"max_pending_packets_per_flow"`
+	MaxPendingBytes          uint32   `yaml:"max_pending_bytes"`
+	HandshakeTimeout         Duration `yaml:"handshake_timeout"`
+	KeepaliveInterval        Duration `yaml:"keepalive_interval"`
+	IdleTimeout              Duration `yaml:"idle_timeout"`
 }
 
 type Cipher struct {
@@ -363,6 +384,32 @@ func (c *Config) ApplyDefaults() {
 		if c.WireGuards[i].Transport.Mode == "" {
 			c.WireGuards[i].Transport.Mode = "udp"
 		}
+		if c.WireGuards[i].Transport.Mode == "faketcp" {
+			fake := &c.WireGuards[i].Transport.FakeTCP
+			defaultString(&fake.ChecksumMode, "kfunc-required")
+			defaultString(&fake.IngressMode, "xdp-required")
+			if fake.SessionCapacity == 0 {
+				fake.SessionCapacity = 4096
+			}
+			if fake.MaxPendingFlows == 0 {
+				fake.MaxPendingFlows = 1024
+			}
+			if fake.MaxPendingPacketsPerFlow == 0 {
+				fake.MaxPendingPacketsPerFlow = 1
+			}
+			if fake.MaxPendingBytes == 0 {
+				fake.MaxPendingBytes = 256 << 10
+			}
+			if fake.HandshakeTimeout.Duration == 0 {
+				fake.HandshakeTimeout.Duration = 5 * time.Second
+			}
+			if fake.KeepaliveInterval.Duration == 0 {
+				fake.KeepaliveInterval.Duration = 20 * time.Second
+			}
+			if fake.IdleTimeout.Duration == 0 {
+				fake.IdleTimeout.Duration = 2 * time.Minute
+			}
+		}
 	}
 	for name, cipher := range c.Ciphers {
 		if cipher.Mode == "" {
@@ -497,8 +544,8 @@ func (c *Config) ValidateStatic() error {
 			if !ok {
 				return fmt.Errorf("wireguards[%d].cipher %q is not defined", i, wg.Cipher)
 			}
-			if wg.Transport.Mode != "" && wg.Transport.Mode != "udp" {
-				return fmt.Errorf("wireguards[%d].cipher is only implemented for udp transport in MVP", i)
+			if wg.Transport.Mode != "" && wg.Transport.Mode != "udp" && wg.Transport.Mode != "faketcp" {
+				return fmt.Errorf("wireguards[%d].cipher is only implemented for udp and faketcp transports", i)
 			}
 		}
 		switch wg.Transport.Mode {
@@ -516,13 +563,51 @@ func (c *Config) ValidateStatic() error {
 			default:
 				return fmt.Errorf("wireguards[%d].transport.icmp.role must be client or server", i)
 			}
-		case "faketcp", "faketcp-lite":
-			return fmt.Errorf("wireguards[%d].transport.mode %q is reserved but not implemented", i, wg.Transport.Mode)
+		case "faketcp":
+			if err := validateFakeTCPTransport(fmt.Sprintf("wireguards[%d].transport.faketcp", i), wg.Transport.FakeTCP); err != nil {
+				return err
+			}
+		case "faketcp-lite":
+			return fmt.Errorf("wireguards[%d].transport.mode %q is unsupported; use experimental faketcp with its handshake state machine", i, wg.Transport.Mode)
 		default:
 			return fmt.Errorf("wireguards[%d].transport.mode %q is unsupported", i, wg.Transport.Mode)
 		}
 	}
 	return validateDataplaneCapacity(c)
+}
+
+func validateFakeTCPTransport(prefix string, f FakeTCPTransport) error {
+	if !f.Experimental {
+		return fmt.Errorf("%s.experimental must be true to acknowledge the incomplete kernel compatibility matrix", prefix)
+	}
+	if f.ChecksumMode != "kfunc-required" {
+		return fmt.Errorf("%s.checksum_mode %q is unsupported; only kfunc-required is fail-closed for CHECKSUM_PARTIAL", prefix, f.ChecksumMode)
+	}
+	if f.IngressMode != "xdp-required" {
+		return fmt.Errorf("%s.ingress_mode %q is unsupported; XDP is required before GRO", prefix, f.IngressMode)
+	}
+	if f.SessionCapacity == 0 || f.SessionCapacity > MaxFakeTCPSessions {
+		return fmt.Errorf("%s.session_capacity must be between 1 and %d", prefix, MaxFakeTCPSessions)
+	}
+	if f.MaxPendingFlows == 0 || f.MaxPendingFlows > MaxFakeTCPPendingFlows || f.MaxPendingFlows > f.SessionCapacity {
+		return fmt.Errorf("%s.max_pending_flows must be between 1 and min(session_capacity, %d)", prefix, MaxFakeTCPPendingFlows)
+	}
+	if f.MaxPendingPacketsPerFlow == 0 || f.MaxPendingPacketsPerFlow > MaxFakeTCPPendingPacketsPerFlow {
+		return fmt.Errorf("%s.max_pending_packets_per_flow must be between 1 and %d", prefix, MaxFakeTCPPendingPacketsPerFlow)
+	}
+	if f.MaxPendingBytes == 0 || f.MaxPendingBytes > MaxFakeTCPPendingBytes {
+		return fmt.Errorf("%s.max_pending_bytes must be between 1 and %d", prefix, MaxFakeTCPPendingBytes)
+	}
+	if f.HandshakeTimeout.Duration < 100*time.Millisecond || f.HandshakeTimeout.Duration > 30*time.Second {
+		return fmt.Errorf("%s.handshake_timeout must be between 100ms and 30s", prefix)
+	}
+	if f.KeepaliveInterval.Duration < time.Second || f.KeepaliveInterval.Duration > 10*time.Minute {
+		return fmt.Errorf("%s.keepalive_interval must be between 1s and 10m", prefix)
+	}
+	if f.IdleTimeout.Duration <= f.KeepaliveInterval.Duration || f.IdleTimeout.Duration > 24*time.Hour {
+		return fmt.Errorf("%s.idle_timeout must be greater than keepalive_interval and at most 24h", prefix)
+	}
+	return nil
 }
 
 func validateCipher(prefix string, c Cipher) error {

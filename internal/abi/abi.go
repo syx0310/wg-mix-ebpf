@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	Version uint32 = 10
+	Version uint32 = 11
 
 	FamilyAny  uint8 = 0
 	FamilyIPv4 uint8 = 4
@@ -24,8 +24,9 @@ const (
 	ParserEthernet uint8 = 1
 	ParserL3       uint8 = 2
 
-	TransportUDP  uint8 = 0
-	TransportICMP uint8 = 1
+	TransportUDP     uint8 = 0
+	TransportICMP    uint8 = 1
+	TransportFakeTCP uint8 = 2
 
 	ICMPRoleNone   uint8 = 0
 	ICMPRoleClient uint8 = 1
@@ -35,6 +36,19 @@ const (
 
 	CipherModeNone uint8 = 0
 	CipherModeXOR  uint8 = 1
+
+	FakeTCPStateIdle        uint8 = 0
+	FakeTCPStateSynSent     uint8 = 1
+	FakeTCPStateSynReceived uint8 = 2
+	FakeTCPStateEstablished uint8 = 3
+	FakeTCPStateClosing     uint8 = 4
+
+	FakeTCPEventNeedHandshake uint8 = 1
+	FakeTCPEventSYN           uint8 = 2
+	FakeTCPEventSYNACK        uint8 = 3
+	FakeTCPEventACK           uint8 = 4
+	FakeTCPEventRST           uint8 = 5
+	FakeTCPEventFIN           uint8 = 6
 )
 
 type ControlKey uint32
@@ -165,15 +179,54 @@ type IngressListenerKey struct {
 }
 
 type IngressListenerValue struct {
-	Generation uint64
-	ProfileID  uint32
-	WGID       uint32
-	CipherID   uint32
-	Action     uint8
-	_          [3]byte
+	Generation    uint64
+	ProfileID     uint32
+	WGID          uint32
+	CipherID      uint32
+	Action        uint8
+	TransportMode uint8
+	_             [2]byte
 }
 
 func (v IngressListenerValue) MapGeneration() uint64 { return v.Generation }
+
+// FakeTCPSessionKey is local-endpoint oriented in both directions: egress
+// fills Local from the IPv4 source, while XDP ingress fills Local from the
+// destination. This gives the daemon and both BPF hooks one stable flow key.
+type FakeTCPSessionKey struct {
+	Generation    uint64
+	LocalIPv4     uint32
+	RemoteIPv4    uint32
+	UnderlayIndex uint32
+	LocalPort     uint16
+	RemotePort    uint16
+}
+
+type FakeTCPSessionValue struct {
+	Generation    uint64
+	LastSeenNanos uint64
+	TXSequence    uint32
+	RXSequence    uint32
+	LocalISN      uint32
+	RemoteISN     uint32
+	Window        uint16
+	State         uint8
+	Flags         uint8
+	_             [4]byte
+}
+
+func (v FakeTCPSessionValue) MapGeneration() uint64 { return v.Generation }
+
+type FakeTCPEvent struct {
+	Key             FakeTCPSessionKey
+	TimestampNanos  uint64
+	Sequence        uint32
+	Acknowledgement uint32
+	PayloadLength   uint32
+	Type            uint8
+	TCPFlags        uint8
+	_               [2]byte
+}
 
 type ICMPListenerKey struct {
 	Generation    uint64
@@ -369,17 +422,22 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 		if err != nil {
 			return nil, err
 		}
+		transport, err := parseTransport(r.TransportMode)
+		if err != nil {
+			return nil, err
+		}
 		out.IngressListeners[IngressListenerKey{
 			Generation:      generation,
 			UnderlayIndex:   uint32(r.UnderlayIfIndex),
 			DestinationPort: r.DestinationPort,
 			Family:          family,
 		}] = IngressListenerValue{
-			Generation: generation,
-			ProfileID:  r.ProfileID,
-			WGID:       r.WGID,
-			CipherID:   r.CipherID,
-			Action:     action,
+			Generation:    generation,
+			ProfileID:     r.ProfileID,
+			WGID:          r.WGID,
+			CipherID:      r.CipherID,
+			Action:        action,
+			TransportMode: transport,
 		}
 	}
 	for _, r := range state.ICMPListeners {
@@ -470,6 +528,8 @@ func parseTransport(value string) (uint8, error) {
 		return TransportUDP, nil
 	case "icmp":
 		return TransportICMP, nil
+	case "faketcp":
+		return TransportFakeTCP, nil
 	default:
 		return 0, fmt.Errorf("unsupported transport mode %q", value)
 	}

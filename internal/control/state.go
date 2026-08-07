@@ -62,22 +62,32 @@ type CipherState struct {
 }
 
 type WireGuardState struct {
-	ID                    uint32 `json:"id"`
-	Name                  string `json:"name"`
-	ConfigPath            string `json:"config_path"`
-	Profile               string `json:"profile"`
-	ProfileID             uint32 `json:"profile_id"`
-	Cipher                string `json:"cipher,omitempty"`
-	CipherID              uint32 `json:"cipher_id,omitempty"`
-	ConfigFwMark          uint32 `json:"config_fwmark"`
-	ConfigListenPort      uint16 `json:"config_listen_port,omitempty"`
-	RuntimeFirewallMark   uint32 `json:"runtime_firewall_mark,omitempty"`
-	RuntimeListenPort     uint16 `json:"runtime_listen_port,omitempty"`
-	RuntimeIfIndex        int    `json:"runtime_ifindex,omitempty"`
-	RuntimeStateAvailable bool   `json:"runtime_state_available"`
-	TransportMode         string `json:"transport_mode"`
-	ICMPRole              string `json:"icmp_role,omitempty"`
-	ICMPID                uint16 `json:"icmp_id,omitempty"`
+	ID                              uint32 `json:"id"`
+	Name                            string `json:"name"`
+	ConfigPath                      string `json:"config_path"`
+	Profile                         string `json:"profile"`
+	ProfileID                       uint32 `json:"profile_id"`
+	Cipher                          string `json:"cipher,omitempty"`
+	CipherID                        uint32 `json:"cipher_id,omitempty"`
+	ConfigFwMark                    uint32 `json:"config_fwmark"`
+	ConfigListenPort                uint16 `json:"config_listen_port,omitempty"`
+	RuntimeFirewallMark             uint32 `json:"runtime_firewall_mark,omitempty"`
+	RuntimeListenPort               uint16 `json:"runtime_listen_port,omitempty"`
+	RuntimeIfIndex                  int    `json:"runtime_ifindex,omitempty"`
+	RuntimeStateAvailable           bool   `json:"runtime_state_available"`
+	TransportMode                   string `json:"transport_mode"`
+	ICMPRole                        string `json:"icmp_role,omitempty"`
+	ICMPID                          uint16 `json:"icmp_id,omitempty"`
+	FakeTCPExperimental             bool   `json:"faketcp_experimental,omitempty"`
+	FakeTCPChecksumMode             string `json:"faketcp_checksum_mode,omitempty"`
+	FakeTCPIngressMode              string `json:"faketcp_ingress_mode,omitempty"`
+	FakeTCPSessionCapacity          uint32 `json:"faketcp_session_capacity,omitempty"`
+	FakeTCPMaxPendingFlows          uint32 `json:"faketcp_max_pending_flows,omitempty"`
+	FakeTCPMaxPendingPacketsPerFlow uint32 `json:"faketcp_max_pending_packets_per_flow,omitempty"`
+	FakeTCPMaxPendingBytes          uint32 `json:"faketcp_max_pending_bytes,omitempty"`
+	FakeTCPHandshakeTimeoutNanos    int64  `json:"faketcp_handshake_timeout_nanos,omitempty"`
+	FakeTCPKeepaliveIntervalNanos   int64  `json:"faketcp_keepalive_interval_nanos,omitempty"`
+	FakeTCPIdleTimeoutNanos         int64  `json:"faketcp_idle_timeout_nanos,omitempty"`
 }
 
 type FwmarkMismatchError struct {
@@ -138,6 +148,7 @@ type IngressListener struct {
 	CipherID        uint32 `json:"cipher_id,omitempty"`
 	WGID            uint32 `json:"wg_id"`
 	Action          string `json:"action"`
+	TransportMode   string `json:"transport_mode,omitempty"`
 }
 
 type ICMPListener struct {
@@ -293,17 +304,27 @@ func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.Wire
 	}
 
 	state := &WireGuardState{
-		ID:            wgID,
-		Name:          wg.Name,
-		ConfigPath:    wg.Config,
-		Profile:       wg.Profile,
-		ProfileID:     profileID,
-		Cipher:        wg.Cipher,
-		CipherID:      cipherID,
-		ConfigFwMark:  *parsed.FwMark,
-		TransportMode: wg.Transport.Mode,
-		ICMPRole:      wg.Transport.ICMP.Role,
-		ICMPID:        wg.Transport.ICMP.ID,
+		ID:                              wgID,
+		Name:                            wg.Name,
+		ConfigPath:                      wg.Config,
+		Profile:                         wg.Profile,
+		ProfileID:                       profileID,
+		Cipher:                          wg.Cipher,
+		CipherID:                        cipherID,
+		ConfigFwMark:                    *parsed.FwMark,
+		TransportMode:                   wg.Transport.Mode,
+		ICMPRole:                        wg.Transport.ICMP.Role,
+		ICMPID:                          wg.Transport.ICMP.ID,
+		FakeTCPExperimental:             wg.Transport.FakeTCP.Experimental,
+		FakeTCPChecksumMode:             wg.Transport.FakeTCP.ChecksumMode,
+		FakeTCPIngressMode:              wg.Transport.FakeTCP.IngressMode,
+		FakeTCPSessionCapacity:          wg.Transport.FakeTCP.SessionCapacity,
+		FakeTCPMaxPendingFlows:          wg.Transport.FakeTCP.MaxPendingFlows,
+		FakeTCPMaxPendingPacketsPerFlow: wg.Transport.FakeTCP.MaxPendingPacketsPerFlow,
+		FakeTCPMaxPendingBytes:          wg.Transport.FakeTCP.MaxPendingBytes,
+		FakeTCPHandshakeTimeoutNanos:    wg.Transport.FakeTCP.HandshakeTimeout.Duration.Nanoseconds(),
+		FakeTCPKeepaliveIntervalNanos:   wg.Transport.FakeTCP.KeepaliveInterval.Duration.Nanoseconds(),
+		FakeTCPIdleTimeoutNanos:         wg.Transport.FakeTCP.IdleTimeout.Duration.Nanoseconds(),
 	}
 	if parsed.ListenPort != nil {
 		state.ConfigListenPort = *parsed.ListenPort
@@ -351,7 +372,14 @@ func (s *State) buildRules(cfg *config.Config) {
 				UnderlayIfIndex: u.IfIndex,
 				ActionOnMiss:    cfg.Policy.ManagedEgressMapMiss,
 			})
-			for _, family := range []string{"ipv4", "ipv6"} {
+			families := []string{"ipv4", "ipv6"}
+			if wg.TransportMode == "faketcp" {
+				// The first FakeTCP slice is deliberately IPv4-only. Managed
+				// IPv6 WireGuard packets still hit the fwmark miss policy and
+				// fail closed instead of leaking as UDP.
+				families = []string{"ipv4"}
+			}
+			for _, family := range families {
 				if wg.TransportMode == "icmp" {
 					s.IngressListeners = append(s.IngressListeners, IngressListener{
 						Generation:      s.Generation,
@@ -362,6 +390,7 @@ func (s *State) buildRules(cfg *config.Config) {
 						CipherID:        wg.CipherID,
 						WGID:            wg.ID,
 						Action:          "drop",
+						TransportMode:   wg.TransportMode,
 					})
 					if family == "ipv6" {
 						continue
@@ -428,6 +457,7 @@ func (s *State) buildRules(cfg *config.Config) {
 					CipherID:        wg.CipherID,
 					WGID:            wg.ID,
 					Action:          "rewrite",
+					TransportMode:   wg.TransportMode,
 				})
 			}
 		}

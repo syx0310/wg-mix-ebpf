@@ -10,8 +10,8 @@ import (
 )
 
 func TestABIVersion(t *testing.T) {
-	if Version != 10 {
-		t.Fatalf("ABI version = %d, want 10", Version)
+	if Version != 11 {
+		t.Fatalf("ABI version = %d, want 11", Version)
 	}
 }
 
@@ -50,6 +50,9 @@ func TestStructSizesAreStable(t *testing.T) {
 		{"IngressListenerValue", unsafe.Sizeof(IngressListenerValue{}), 24},
 		{"ICMPListenerKey", unsafe.Sizeof(ICMPListenerKey{}), 16},
 		{"ICMPListenerValue", unsafe.Sizeof(ICMPListenerValue{}), 24},
+		{"FakeTCPSessionKey", unsafe.Sizeof(FakeTCPSessionKey{}), 24},
+		{"FakeTCPSessionValue", unsafe.Sizeof(FakeTCPSessionValue{}), 40},
+		{"FakeTCPEvent", unsafe.Sizeof(FakeTCPEvent{}), 48},
 	}
 	for _, check := range checks {
 		if check.got != check.want {
@@ -100,7 +103,7 @@ func TestFromState(t *testing.T) {
 		},
 		IngressListeners: []control.IngressListener{
 			{Generation: 7, Family: "ipv4", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "drop"},
-			{Generation: 7, Family: "ipv6", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, CipherID: 1, WGID: 1, Action: "rewrite"},
+			{Generation: 7, Family: "ipv6", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, CipherID: 1, WGID: 1, Action: "rewrite", TransportMode: "faketcp"},
 		},
 		ICMPListeners: []control.ICMPListener{
 			{Generation: 7, Family: "ipv4", UnderlayIfIndex: 2, ICMPType: 0, ICMPID: 0x5303, ListenPort: 31001, ProfileID: 1, WGID: 1, Action: "rewrite", Role: "client"},
@@ -135,7 +138,7 @@ func TestFromState(t *testing.T) {
 	if snapshot.IngressListeners[IngressListenerKey{Generation: 7, UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv4}].Action != ActionDrop {
 		t.Fatal("missing ingress drop rule")
 	}
-	if ingress := snapshot.IngressListeners[IngressListenerKey{Generation: 7, UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv6}]; ingress.Action != ActionRewrite || ingress.CipherID != 1 {
+	if ingress := snapshot.IngressListeners[IngressListenerKey{Generation: 7, UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv6}]; ingress.Action != ActionRewrite || ingress.CipherID != 1 || ingress.TransportMode != TransportFakeTCP {
 		t.Fatal("missing ingress rewrite rule")
 	}
 	icmp := snapshot.ICMPListeners[ICMPListenerKey{Generation: 7, UnderlayIndex: 2, ICMPID: 0x5303, Family: FamilyIPv4, ICMPType: 0}]

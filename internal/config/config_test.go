@@ -297,7 +297,41 @@ profiles:
 	}
 }
 
-func TestRejectFakeTCPTransport(t *testing.T) {
+func TestAcceptExplicitExperimentalFakeTCPTransportWithXOR(t *testing.T) {
+	cfg, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    cipher: xor-home
+    transport:
+      mode: faketcp
+      faketcp:
+        experimental: true
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+ciphers:
+  xor-home:
+    mode: xor
+    secret: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := cfg.WireGuards[0].Transport.FakeTCP
+	if fake.ChecksumMode != "kfunc-required" || fake.IngressMode != "xdp-required" {
+		t.Fatalf("faketcp capability defaults = checksum %q ingress %q", fake.ChecksumMode, fake.IngressMode)
+	}
+	if fake.SessionCapacity != 4096 || fake.MaxPendingPacketsPerFlow != 1 {
+		t.Fatalf("faketcp bounds = sessions %d packets %d", fake.SessionCapacity, fake.MaxPendingPacketsPerFlow)
+	}
+}
+
+func TestRejectFakeTCPWithoutExperimentalAcknowledgement(t *testing.T) {
 	_, err := Load([]byte(`
 version: 1
 underlays:
@@ -312,8 +346,31 @@ profiles:
   mix-default:
     preset: wireguard-mix-wire-values-v1
 `))
-	if err == nil {
-		t.Fatal("expected faketcp to be rejected")
+	if err == nil || !strings.Contains(err.Error(), "experimental must be true") {
+		t.Fatalf("expected experimental gate error, got %v", err)
+	}
+}
+
+func TestRejectUnboundedFakeTCPSettings(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: faketcp
+      faketcp:
+        experimental: true
+        session_capacity: 16385
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err == nil || !strings.Contains(err.Error(), "session_capacity") {
+		t.Fatalf("expected bounded session error, got %v", err)
 	}
 }
 
