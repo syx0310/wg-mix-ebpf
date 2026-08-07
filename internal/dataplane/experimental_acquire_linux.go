@@ -112,9 +112,12 @@ func acquireExperimentalFakeTCPCollection(
 		)
 	}
 	if collection == nil {
-		return nil, fmt.Errorf(
-			"create experimental FakeTCP BPF collection from %s: loader returned nil collection",
-			source,
+		return nil, errors.Join(
+			fmt.Errorf(
+				"create experimental FakeTCP BPF collection from %s: loader returned nil collection",
+				source,
+			),
+			ctx.Err(),
 		)
 	}
 	if err := ctx.Err(); err != nil {
