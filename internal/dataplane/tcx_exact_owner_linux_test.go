@@ -1,0 +1,640 @@
+//go:build linux
+
+package dataplane
+
+import (
+	"errors"
+	"fmt"
+	"slices"
+	"testing"
+
+	"github.com/cilium/ebpf"
+	ciliumlink "github.com/cilium/ebpf/link"
+	"golang.org/x/sys/unix"
+)
+
+type fakeExactTCXSlot struct {
+	ifindex int
+	attach  ebpf.AttachType
+}
+
+type fakeExactTCXLinkState struct {
+	identity exactTCXLinkIdentity
+	attached bool
+	fdRefs   int
+	pins     int
+}
+
+type fakeExactTCXKernel struct {
+	nextID uint32
+	links  map[uint32]*fakeExactTCXLinkState
+	pins   map[string]uint32
+	revs   map[fakeExactTCXSlot]uint64
+	events []string
+
+	beforeAttach        func(*fakeExactTCXKernel, fakeExactTCXSlot)
+	beforeCompareUpdate func(*fakeExactTCXKernel, uint32)
+	queryErr            error
+	detachErrs          map[uint32][]error
+	unpinErrs           map[uint32][]error
+	closeErrs           map[uint32][]error
+}
+
+func newFakeExactTCXKernel() *fakeExactTCXKernel {
+	return &fakeExactTCXKernel{
+		nextID:     100,
+		links:      make(map[uint32]*fakeExactTCXLinkState),
+		pins:       make(map[string]uint32),
+		revs:       make(map[fakeExactTCXSlot]uint64),
+		detachErrs: make(map[uint32][]error),
+		unpinErrs:  make(map[uint32][]error),
+		closeErrs:  make(map[uint32][]error),
+	}
+}
+
+func (kernel *fakeExactTCXKernel) revision(slot fakeExactTCXSlot) uint64 {
+	if kernel.revs[slot] == 0 {
+		kernel.revs[slot] = 1
+	}
+	return kernel.revs[slot]
+}
+
+func (kernel *fakeExactTCXKernel) addLink(
+	ifindex int,
+	attach ebpf.AttachType,
+	programID uint32,
+) uint32 {
+	slot := fakeExactTCXSlot{ifindex: ifindex, attach: attach}
+	kernel.nextID++
+	id := kernel.nextID
+	kernel.links[id] = &fakeExactTCXLinkState{
+		identity: exactTCXLinkIdentity{
+			IfIndex: ifindex, Attach: attach, LinkID: id, ProgramID: programID,
+		},
+		attached: true,
+	}
+	kernel.revs[slot] = kernel.revision(slot) + 1
+	return id
+}
+
+func (kernel *fakeExactTCXKernel) runtime() exactTCXRuntime {
+	return exactTCXRuntime{
+		query: func(ifindex int, attach ebpf.AttachType) (exactTCXQuery, error) {
+			slot := fakeExactTCXSlot{ifindex: ifindex, attach: attach}
+			kernel.events = append(kernel.events, "query")
+			if kernel.queryErr != nil {
+				return exactTCXQuery{}, kernel.queryErr
+			}
+			query := exactTCXQuery{Revision: kernel.revision(slot)}
+			for _, state := range kernel.links {
+				if !state.attached ||
+					state.identity.IfIndex != ifindex ||
+					state.identity.Attach != attach {
+					continue
+				}
+				query.Programs = append(query.Programs, exactTCXQueryProgram{
+					LinkID: state.identity.LinkID, ProgramID: state.identity.ProgramID,
+				})
+			}
+			return query, nil
+		},
+		attach: func(
+			ifindex int,
+			attach ebpf.AttachType,
+			revision uint64,
+			program exactTCXProgram,
+		) (exactTCXKernelLink, error) {
+			slot := fakeExactTCXSlot{ifindex: ifindex, attach: attach}
+			kernel.events = append(kernel.events, "attach")
+			if kernel.beforeAttach != nil {
+				kernel.beforeAttach(kernel, slot)
+			}
+			if revision != kernel.revision(slot) {
+				return nil, unix.ESTALE
+			}
+			id := kernel.addLink(ifindex, attach, program.id)
+			kernel.links[id].fdRefs++
+			return &fakeExactTCXHandle{kernel: kernel, id: id}, nil
+		},
+		loadPinned: func(path string) (exactTCXKernelLink, error) {
+			kernel.events = append(kernel.events, "load")
+			id, ok := kernel.pins[path]
+			if !ok {
+				return nil, unix.ENOENT
+			}
+			state := kernel.links[id]
+			if state == nil {
+				return nil, errors.New("fake pin points to missing link")
+			}
+			state.fdRefs++
+			return &fakeExactTCXHandle{kernel: kernel, id: id, pinnedPath: path}, nil
+		},
+	}
+}
+
+type fakeExactTCXHandle struct {
+	kernel     *fakeExactTCXKernel
+	id         uint32
+	pinnedPath string
+	closed     bool
+}
+
+func (handle *fakeExactTCXHandle) state() (*fakeExactTCXLinkState, error) {
+	if handle == nil || handle.kernel == nil || handle.closed {
+		return nil, errors.New("fake TCX handle is closed")
+	}
+	state := handle.kernel.links[handle.id]
+	if state == nil {
+		return nil, errors.New("fake TCX link is missing")
+	}
+	return state, nil
+}
+
+func (handle *fakeExactTCXHandle) Identity() (exactTCXLinkIdentity, error) {
+	handle.kernel.events = append(handle.kernel.events, "identity")
+	state, err := handle.state()
+	if err != nil {
+		return exactTCXLinkIdentity{}, err
+	}
+	return state.identity, nil
+}
+
+func (handle *fakeExactTCXHandle) Pin(path string) error {
+	handle.kernel.events = append(handle.kernel.events, "pin")
+	state, err := handle.state()
+	if err != nil {
+		return err
+	}
+	if _, exists := handle.kernel.pins[path]; exists {
+		return unix.EEXIST
+	}
+	handle.kernel.pins[path] = handle.id
+	handle.pinnedPath = path
+	state.pins++
+	return nil
+}
+
+func (handle *fakeExactTCXHandle) CompareUpdate(next, previous exactTCXProgram) error {
+	handle.kernel.events = append(handle.kernel.events, "compare-update")
+	state, err := handle.state()
+	if err != nil {
+		return err
+	}
+	if handle.kernel.beforeCompareUpdate != nil {
+		handle.kernel.beforeCompareUpdate(handle.kernel, handle.id)
+	}
+	if state.identity.ProgramID != previous.id {
+		return unix.ESTALE
+	}
+	state.identity.ProgramID = next.id
+	return nil
+}
+
+func (handle *fakeExactTCXHandle) Detach() error {
+	handle.kernel.events = append(handle.kernel.events, fmt.Sprintf("detach:%d", handle.id))
+	state, err := handle.state()
+	if err != nil {
+		return err
+	}
+	if injected := popExactTCXError(handle.kernel.detachErrs, handle.id); injected != nil {
+		return injected
+	}
+	state.attached = false
+	return nil
+}
+
+func (handle *fakeExactTCXHandle) Unpin() error {
+	handle.kernel.events = append(handle.kernel.events, fmt.Sprintf("unpin:%d", handle.id))
+	state, err := handle.state()
+	if err != nil {
+		return err
+	}
+	if injected := popExactTCXError(handle.kernel.unpinErrs, handle.id); injected != nil {
+		return injected
+	}
+	if handle.pinnedPath == "" || handle.kernel.pins[handle.pinnedPath] != handle.id {
+		return unix.ENOENT
+	}
+	delete(handle.kernel.pins, handle.pinnedPath)
+	handle.pinnedPath = ""
+	state.pins--
+	return nil
+}
+
+func (handle *fakeExactTCXHandle) Close() error {
+	handle.kernel.events = append(handle.kernel.events, fmt.Sprintf("close:%d", handle.id))
+	if handle.closed {
+		return nil
+	}
+	state, err := handle.state()
+	if err != nil {
+		return err
+	}
+	if injected := popExactTCXError(handle.kernel.closeErrs, handle.id); injected != nil {
+		return injected
+	}
+	handle.closed = true
+	state.fdRefs--
+	if state.fdRefs == 0 && state.pins == 0 {
+		state.attached = false
+	}
+	return nil
+}
+
+func popExactTCXError(byID map[uint32][]error, id uint32) error {
+	errs := byID[id]
+	if len(errs) == 0 {
+		return nil
+	}
+	err := errs[0]
+	byID[id] = errs[1:]
+	return err
+}
+
+type fakeExactTCXJournal struct {
+	events           *[]string
+	intent           *exactTCXJournalIntent
+	active           *exactTCXBinding
+	persistIntentErr error
+	persistActiveErr error
+}
+
+func (journal *fakeExactTCXJournal) callbacks() exactTCXJournal {
+	return exactTCXJournal{
+		persistIntent: func(intent exactTCXJournalIntent) error {
+			*journal.events = append(*journal.events, "intent")
+			cloned := cloneExactTCXIntent(intent)
+			journal.intent = &cloned
+			return journal.persistIntentErr
+		},
+		persistActive: func(binding exactTCXBinding, _ exactTCXJournalIntent) error {
+			*journal.events = append(*journal.events, "active")
+			value := binding
+			journal.active = &value
+			return journal.persistActiveErr
+		},
+	}
+}
+
+func cloneExactTCXIntent(intent exactTCXJournalIntent) exactTCXJournalIntent {
+	cloned := intent
+	if intent.Active != nil {
+		active := *intent.Active
+		cloned.Active = &active
+	}
+	return cloned
+}
+
+func testExactTCXBinding(ifindex int, direction exactTCXDirection, programID uint32) exactTCXBinding {
+	return exactTCXBinding{
+		Backend: exactTCXBackend, IfIndex: ifindex, Direction: direction,
+		PinName: exactTCXPinName(ifindex, direction), ProgramID: programID,
+	}
+}
+
+func stageTestExactTCX(
+	t *testing.T,
+	kernel *fakeExactTCXKernel,
+	binding exactTCXBinding,
+	journal *fakeExactTCXJournal,
+) (*exactTCXAttachment, string) {
+	t.Helper()
+	pinPath := "/sys/fs/bpf/wg-mix-ebpf-test/" + binding.PinName
+	owner, err := stageExactTCXAttachment(
+		t.Context(), binding, pinPath, exactTCXProgram{id: binding.ProgramID},
+		journal.callbacks(), kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatalf("stage exact TCX: %v", err)
+	}
+	return owner, pinPath
+}
+
+func TestExactTCXStagePersistsIntentBeforeKernelMutation(t *testing.T) {
+	kernel := newFakeExactTCXKernel()
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+	binding := testExactTCXBinding(11, exactTCXIngress, 41)
+	owner, pinPath := stageTestExactTCX(t, kernel, binding, journal)
+
+	want := []string{"query", "intent", "attach", "identity", "pin", "active"}
+	if !slices.Equal(kernel.events, want) {
+		t.Fatalf("events=%v want=%v", kernel.events, want)
+	}
+	if journal.intent == nil || journal.intent.Desired.LinkID != 0 {
+		t.Fatalf("attach intent=%+v", journal.intent)
+	}
+	if journal.active == nil || journal.active.LinkID == 0 {
+		t.Fatalf("active binding=%+v", journal.active)
+	}
+	linkID := journal.active.LinkID
+	if kernel.pins[pinPath] != linkID || !kernel.links[linkID].attached {
+		t.Fatalf("pin=%d link=%+v", kernel.pins[pinPath], kernel.links[linkID])
+	}
+	if err := owner.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if !kernel.links[linkID].attached || kernel.links[linkID].fdRefs != 0 {
+		t.Fatalf("release broke persistent link: %+v", kernel.links[linkID])
+	}
+
+	restarted, err := loadExactTCXAttachment(*journal.active, pinPath, kernel.runtime())
+	if err != nil {
+		t.Fatalf("load after restart: %v", err)
+	}
+	if restarted.binding != *journal.active {
+		t.Fatalf("restarted binding=%+v want=%+v", restarted.binding, *journal.active)
+	}
+	if err := restarted.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExactTCXAttachRevisionFenceRejectsConcurrentForeignMutation(t *testing.T) {
+	kernel := newFakeExactTCXKernel()
+	kernel.beforeAttach = func(kernel *fakeExactTCXKernel, slot fakeExactTCXSlot) {
+		kernel.beforeAttach = nil
+		kernel.addLink(slot.ifindex, slot.attach, 999)
+	}
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+	binding := testExactTCXBinding(11, exactTCXEgress, 42)
+	owner, err := stageExactTCXAttachment(
+		t.Context(), binding,
+		"/sys/fs/bpf/wg-mix-ebpf-test/"+binding.PinName,
+		exactTCXProgram{id: 42}, journal.callbacks(), kernel.runtime(),
+	)
+	if owner != nil || !errors.Is(err, unix.ESTALE) {
+		t.Fatalf("owner=%#v error=%v", owner, err)
+	}
+	if journal.intent == nil || journal.active != nil {
+		t.Fatalf("intent=%+v active=%+v", journal.intent, journal.active)
+	}
+	if canFallbackFromExactTCX(err, true) {
+		t.Fatal("revision race must not open classic fallback")
+	}
+}
+
+func TestExactTCXRollbackPreservesConcurrentForeignLink(t *testing.T) {
+	kernel := newFakeExactTCXKernel()
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+	binding := testExactTCXBinding(12, exactTCXIngress, 51)
+	owner, _ := stageTestExactTCX(t, kernel, binding, journal)
+	ownedID := owner.binding.LinkID
+
+	// This is the race classic FilterDel cannot survive: another writer
+	// installs a different program in the same logical direction after the
+	// owner's last inspection. TCX gives each attachment a distinct link ID.
+	foreignID := kernel.addLink(12, ebpf.AttachTCXIngress, 999)
+	if err := owner.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if kernel.links[ownedID].attached {
+		t.Fatal("exact owned link remains attached")
+	}
+	if !kernel.links[foreignID].attached {
+		t.Fatal("exact rollback detached the concurrent foreign link")
+	}
+	if slices.Contains(kernel.events, "qdisc-delete") {
+		t.Fatal("TCX rollback must not touch clsact")
+	}
+}
+
+func TestExactTCXRollbackRetriesOnlyUnfinishedExactOperations(t *testing.T) {
+	kernel := newFakeExactTCXKernel()
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+	owner, _ := stageTestExactTCX(
+		t, kernel, testExactTCXBinding(13, exactTCXEgress, 61), journal,
+	)
+	id := owner.binding.LinkID
+	detachErr := errors.New("injected exact detach failure")
+	unpinErr := errors.New("injected exact unpin failure")
+	kernel.detachErrs[id] = []error{detachErr}
+	kernel.unpinErrs[id] = []error{unpinErr}
+
+	if err := owner.Rollback(); !errors.Is(err, detachErr) {
+		t.Fatalf("first rollback=%v", err)
+	}
+	if !owner.pinned || owner.detached || !kernel.links[id].attached {
+		t.Fatalf("owner after detach failure=%+v link=%+v", owner, kernel.links[id])
+	}
+	if err := owner.Rollback(); !errors.Is(err, unpinErr) {
+		t.Fatalf("second rollback=%v", err)
+	}
+	if !owner.pinned || !owner.detached || kernel.links[id].attached {
+		t.Fatalf("owner after unpin failure=%+v link=%+v", owner, kernel.links[id])
+	}
+	if err := owner.Rollback(); err != nil {
+		t.Fatalf("third rollback=%v", err)
+	}
+	wantTail := []string{
+		fmt.Sprintf("detach:%d", id),
+		fmt.Sprintf("detach:%d", id),
+		fmt.Sprintf("unpin:%d", id),
+		fmt.Sprintf("unpin:%d", id),
+		fmt.Sprintf("close:%d", id),
+	}
+	if !slices.Equal(kernel.events[len(kernel.events)-len(wantTail):], wantTail) {
+		t.Fatalf("event tail=%v want=%v", kernel.events, wantTail)
+	}
+}
+
+func TestExactTCXCompareUpdateUsesKernelOldProgramCAS(t *testing.T) {
+	kernel := newFakeExactTCXKernel()
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+	owner, _ := stageTestExactTCX(
+		t, kernel, testExactTCXBinding(14, exactTCXIngress, 71), journal,
+	)
+	id := owner.binding.LinkID
+	kernel.beforeCompareUpdate = func(kernel *fakeExactTCXKernel, linkID uint32) {
+		kernel.beforeCompareUpdate = nil
+		kernel.links[linkID].identity.ProgramID = 999
+	}
+
+	updateJournal := &fakeExactTCXJournal{events: &kernel.events}
+	err := owner.CompareUpdateWithOld(
+		exactTCXProgram{id: 71}, exactTCXProgram{id: 72}, updateJournal.callbacks(),
+	)
+	if !errors.Is(err, unix.ESTALE) {
+		t.Fatalf("compare update error=%v", err)
+	}
+	if kernel.links[id].identity.ProgramID != 999 {
+		t.Fatalf("CAS overwrote raced program: %+v", kernel.links[id].identity)
+	}
+	if updateJournal.intent == nil || updateJournal.active != nil {
+		t.Fatalf("intent=%+v active=%+v", updateJournal.intent, updateJournal.active)
+	}
+	observed := owner.binding
+	observed.ProgramID = 999
+	observation := exactTCXObservation{Binding: observed, Attached: true}
+	if action, err := classifyExactTCXRecovery(*updateJournal.intent, &observation); err == nil {
+		t.Fatalf("third-program recovery action=%q; want fail closed", action)
+	}
+}
+
+func TestExactTCXUpdateRecoveryPublishesKernelCompletedCAS(t *testing.T) {
+	kernel := newFakeExactTCXKernel()
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+	owner, pinPath := stageTestExactTCX(
+		t, kernel, testExactTCXBinding(15, exactTCXEgress, 81), journal,
+	)
+	updateJournal := &fakeExactTCXJournal{
+		events: &kernel.events, persistActiveErr: errors.New("injected owner persist failure"),
+	}
+	err := owner.CompareUpdateWithOld(
+		exactTCXProgram{id: 81}, exactTCXProgram{id: 82}, updateJournal.callbacks(),
+	)
+	if err == nil || updateJournal.intent == nil {
+		t.Fatalf("update error=%v intent=%+v", err, updateJournal.intent)
+	}
+	observed := owner.binding
+	observation := exactTCXObservation{Binding: observed, Attached: true}
+	if action, err := classifyExactTCXRecovery(*updateJournal.intent, &observation); err != nil || action != exactTCXRecoveryPublish {
+		t.Fatalf("recovery action=%q error=%v", action, err)
+	}
+	if owner.binding.ProgramID != 82 {
+		t.Fatalf("kernel-completed owner binding=%+v", owner.binding)
+	}
+	if err := owner.Release(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := loadExactTCXAttachment(observed, pinPath, kernel.runtime())
+	if err != nil {
+		t.Fatalf("load completed update: %v", err)
+	}
+	if err := restarted.Release(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExactTCXLoadRejectsReplacedPinWithoutMutatingForeignLink(t *testing.T) {
+	kernel := newFakeExactTCXKernel()
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+	owner, pinPath := stageTestExactTCX(
+		t, kernel, testExactTCXBinding(16, exactTCXIngress, 91), journal,
+	)
+	ownedBinding := owner.binding
+	if err := owner.Release(); err != nil {
+		t.Fatal(err)
+	}
+	foreignID := kernel.addLink(16, ebpf.AttachTCXIngress, 999)
+	oldID := kernel.pins[pinPath]
+	kernel.links[oldID].pins--
+	kernel.pins[pinPath] = foreignID
+	kernel.links[foreignID].pins++
+
+	loaded, err := loadExactTCXAttachment(ownedBinding, pinPath, kernel.runtime())
+	if loaded != nil || err == nil {
+		t.Fatalf("loaded=%#v error=%v", loaded, err)
+	}
+	if !kernel.links[foreignID].attached || kernel.pins[pinPath] != foreignID {
+		t.Fatalf("foreign link was mutated: link=%+v pin=%d", kernel.links[foreignID], kernel.pins[pinPath])
+	}
+}
+
+func TestClassifyExactTCXRecoveryBoundaries(t *testing.T) {
+	attachDesired := testExactTCXBinding(17, exactTCXIngress, 101)
+	attachIntent := exactTCXJournalIntent{Operation: exactTCXJournalAttach, Desired: attachDesired}
+	observedAttachBinding := attachDesired
+	observedAttachBinding.LinkID = 501
+	observedAttach := exactTCXObservation{Binding: observedAttachBinding, Attached: true}
+	detachedAttach := exactTCXObservation{Binding: observedAttachBinding, Attached: false}
+	active := observedAttachBinding
+	desired := active
+	desired.ProgramID = 102
+	updateIntent := exactTCXJournalIntent{
+		Operation: exactTCXJournalUpdate, Active: &active, Desired: desired,
+	}
+	observedOld := exactTCXObservation{Binding: active, Attached: true}
+	observedNew := exactTCXObservation{Binding: desired, Attached: true}
+	observedDetachedUpdate := exactTCXObservation{Binding: active, Attached: false}
+	observedOther := exactTCXObservation{Binding: desired, Attached: true}
+	observedOther.Binding.ProgramID = 999
+
+	tests := []struct {
+		name     string
+		intent   exactTCXJournalIntent
+		observed *exactTCXObservation
+		want     exactTCXRecoveryAction
+		wantErr  bool
+	}{
+		{"attach absent", attachIntent, nil, exactTCXRecoveryRetryAttach, false},
+		{"attach pinned", attachIntent, &observedAttach, exactTCXRecoveryPublish, false},
+		{"attach detached", attachIntent, &detachedAttach, exactTCXRecoveryDiscardPin, false},
+		{"update old", updateIntent, &observedOld, exactTCXRecoveryRetryUpdate, false},
+		{"update new", updateIntent, &observedNew, exactTCXRecoveryPublish, false},
+		{"update missing", updateIntent, nil, "", true},
+		{"update detached", updateIntent, &observedDetachedUpdate, "", true},
+		{"update third", updateIntent, &observedOther, "", true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			action, err := classifyExactTCXRecovery(test.intent, test.observed)
+			if (err != nil) != test.wantErr || action != test.want {
+				t.Fatalf("action=%q error=%v want=%q wantErr=%t", action, err, test.want, test.wantErr)
+			}
+		})
+	}
+}
+
+func TestExactTCXCapabilityGateIsNarrowAndPreIntentOnly(t *testing.T) {
+	tests := []struct {
+		name    string
+		err     error
+		intent  bool
+		allowed bool
+	}{
+		{"unsupported", ciliumlink.ErrNotSupported, false, true},
+		{"wrapped unsupported", fmt.Errorf("probe: %w", ciliumlink.ErrNotSupported), false, true},
+		{"unsupported after intent", ciliumlink.ErrNotSupported, true, false},
+		{"revision race", unix.ESTALE, false, false},
+		{"permission", unix.EPERM, false, false},
+		{"invalid", unix.EINVAL, false, false},
+		{"missing", unix.ENOENT, false, false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := canFallbackFromExactTCX(test.err, test.intent); got != test.allowed {
+				t.Fatalf("fallback=%t want=%t", got, test.allowed)
+			}
+		})
+	}
+}
+
+func TestExactTCXUnsupportedPreflightLeavesNoDurableIntent(t *testing.T) {
+	kernel := newFakeExactTCXKernel()
+	kernel.queryErr = ciliumlink.ErrNotSupported
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+	binding := testExactTCXBinding(19, exactTCXIngress, 121)
+	owner, err := stageExactTCXAttachment(
+		t.Context(), binding,
+		"/sys/fs/bpf/wg-mix-ebpf-test/"+binding.PinName,
+		exactTCXProgram{id: 121}, journal.callbacks(), kernel.runtime(),
+	)
+	if owner != nil || !errors.Is(err, ciliumlink.ErrNotSupported) {
+		t.Fatalf("owner=%#v error=%v", owner, err)
+	}
+	if journal.intent != nil || journal.active != nil || len(kernel.links) != 0 {
+		t.Fatalf("unsupported preflight wrote state: intent=%+v active=%+v links=%v", journal.intent, journal.active, kernel.links)
+	}
+	if !slices.Equal(kernel.events, []string{"query"}) {
+		t.Fatalf("events=%v", kernel.events)
+	}
+	if !canFallbackFromExactTCX(err, false) {
+		t.Fatal("proved pre-intent TCX unavailability should permit compatibility selection")
+	}
+}
+
+func TestExactTCXStageFailsBeforeKernelWriteWithoutDurableJournal(t *testing.T) {
+	kernel := newFakeExactTCXKernel()
+	binding := testExactTCXBinding(18, exactTCXIngress, 111)
+	owner, err := stageExactTCXAttachment(
+		t.Context(), binding,
+		"/sys/fs/bpf/wg-mix-ebpf-test/"+binding.PinName,
+		exactTCXProgram{id: 111}, exactTCXJournal{}, kernel.runtime(),
+	)
+	if owner != nil || err == nil {
+		t.Fatalf("owner=%#v error=%v", owner, err)
+	}
+	if len(kernel.events) != 0 || len(kernel.links) != 0 {
+		t.Fatalf("kernel changed before journal: events=%v links=%v", kernel.events, kernel.links)
+	}
+}
