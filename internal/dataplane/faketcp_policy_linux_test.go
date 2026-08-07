@@ -1039,12 +1039,20 @@ func newTestFakeTCPPolicyGenerationTransaction(
 
 type memoryFakeTCPPolicyTrace struct {
 	events            []string
+	externalEvents    *[]string
 	updateAttempts    []string
 	successfulUpdates []string
 	updateFlags       []ebpf.MapUpdateFlags
 	deletes           []string
 	deleteAttempts    []string
 	failUpdateAt      int
+}
+
+func (trace *memoryFakeTCPPolicyTrace) addEvent(event string) {
+	trace.events = append(trace.events, event)
+	if trace.externalEvents != nil {
+		*trace.externalEvents = append(*trace.externalEvents, "policy:"+event)
+	}
 }
 
 type memoryFakeTCPPolicyMap struct {
@@ -1059,7 +1067,7 @@ type memoryFakeTCPPolicyMap struct {
 }
 
 func (m *memoryFakeTCPPolicyMap) Lookup(key, valueOut any) error {
-	m.trace.events = append(m.trace.events, "lookup:"+m.name)
+	m.trace.addEvent("lookup:" + m.name)
 	if m.failNextLookup != nil {
 		err := m.failNextLookup
 		m.failNextLookup = nil
@@ -1077,7 +1085,7 @@ func (m *memoryFakeTCPPolicyMap) Lookup(key, valueOut any) error {
 }
 
 func (m *memoryFakeTCPPolicyMap) Update(key, value any, flags ebpf.MapUpdateFlags) error {
-	m.trace.events = append(m.trace.events, "update:"+m.name)
+	m.trace.addEvent("update:" + m.name)
 	m.trace.updateAttempts = append(m.trace.updateAttempts, m.name)
 	m.trace.updateFlags = append(m.trace.updateFlags, flags)
 	if m.trace.failUpdateAt != 0 && len(m.trace.updateAttempts) == m.trace.failUpdateAt {
@@ -1100,7 +1108,7 @@ func (m *memoryFakeTCPPolicyMap) Update(key, value any, flags ebpf.MapUpdateFlag
 }
 
 func (m *memoryFakeTCPPolicyMap) Delete(key any) error {
-	m.trace.events = append(m.trace.events, "delete:"+m.name)
+	m.trace.addEvent("delete:" + m.name)
 	m.trace.deleteAttempts = append(m.trace.deleteAttempts, m.name)
 	if m.failNextDelete != nil {
 		err := m.failNextDelete

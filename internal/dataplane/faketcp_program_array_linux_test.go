@@ -12,6 +12,7 @@ import (
 
 type memoryFakeTCPProgramArray struct {
 	entries         map[uint32]uint32
+	events          *[]string
 	insertErr       error
 	lookupErr       error
 	deleteErr       error
@@ -49,6 +50,9 @@ func (*flagCaptureProgramArrayMap) Delete(any) error { return nil }
 func (*flagCaptureProgramArrayMap) Close() error     { return nil }
 
 func (programs *memoryFakeTCPProgramArray) LookupProgramID(slot uint32) (uint32, error) {
+	if programs.events != nil {
+		*programs.events = append(*programs.events, "program-lookup")
+	}
 	if programs.lookupErr != nil {
 		err := programs.lookupErr
 		programs.lookupErr = nil
@@ -65,6 +69,9 @@ func (programs *memoryFakeTCPProgramArray) InsertProgram(
 	slot uint32,
 	program experimentalProgramResource,
 ) error {
+	if programs.events != nil {
+		*programs.events = append(*programs.events, "program-insert")
+	}
 	programs.inserts = append(programs.inserts, slot)
 	if programs.insertErr != nil {
 		return programs.insertErr
@@ -84,6 +91,9 @@ func (programs *memoryFakeTCPProgramArray) InsertProgram(
 }
 
 func (programs *memoryFakeTCPProgramArray) DeleteProgram(slot uint32) error {
+	if programs.events != nil {
+		*programs.events = append(*programs.events, "program-delete")
+	}
 	programs.deletes = append(programs.deletes, slot)
 	if programs.deleteErr != nil {
 		return programs.deleteErr

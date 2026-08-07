@@ -9,6 +9,7 @@ import (
 	"math"
 	"reflect"
 	"sync"
+	"sync/atomic"
 
 	"github.com/cilium/ebpf"
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
@@ -18,6 +19,8 @@ import (
 const (
 	fakeTCPSessionMapName    = "faketcp_session_map"
 	fakeTCPEventsMapName     = "faketcp_events"
+	fakeTCPRuntimeIDMapName  = "faketcp_rt_id"
+	fakeTCPCaptureSeqMapName = "faketcp_cap_seq"
 	fakeTCPEgressProgramName = "wg_faketcp_egress"
 	fakeTCPXDPProgramName    = "wg_mix_faketcp_ingress"
 )
@@ -36,6 +39,22 @@ type experimentalSessionStoreFactory func(
 	experimentalMapResource,
 	uint64,
 ) (ownedFakeTCPSessionStore, error)
+
+type experimentalSlowPath interface {
+	faketcp.RuntimeService
+	faketcp.RuntimeStopRequester
+}
+
+type experimentalSlowPathFactory func(
+	*faketcp.Engine,
+	*ebpf.Map,
+) (experimentalSlowPath, error)
+
+type experimentalLinuxGenerationCommit func(
+	*faketcp.Engine,
+	faketcp.LinuxFreshCollectionClaim,
+	func(faketcp.LinuxFreshCollectionRelease) error,
+) error
 
 type experimentalEventMapClone struct {
 	bpfMap *ebpf.Map
@@ -213,6 +232,19 @@ func ownedFakeTCPSessionStoreIsNil(store ownedFakeTCPSessionStore) bool {
 	}
 }
 
+func experimentalSlowPathIsNil(slowPath experimentalSlowPath) bool {
+	if slowPath == nil {
+		return true
+	}
+	value := reflect.ValueOf(slowPath)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
 func (store *generationFencedSessionStore) InsertEstablished(
 	key abi.FakeTCPSessionKey,
 	value abi.FakeTCPSessionValue,
@@ -296,12 +328,17 @@ func (store *generationFencedSessionStore) Close() error {
 // copies packet payloads per operation.
 type ExperimentalFakeTCPRuntimeHandles struct {
 	generation uint64
+	identity   faketcp.RuntimeIdentity
 	sessions   *generationFencedSessionStore
 	events     *generationFencedEventMap
 }
 
 func (handles ExperimentalFakeTCPRuntimeHandles) Generation() uint64 {
 	return handles.generation
+}
+
+func (handles ExperimentalFakeTCPRuntimeHandles) Identity() faketcp.RuntimeIdentity {
+	return handles.identity
 }
 
 func (handles ExperimentalFakeTCPRuntimeHandles) SessionStore() faketcp.SessionStore {
@@ -333,12 +370,20 @@ type ExperimentalFakeTCPRuntime struct {
 	state *experimentalFakeTCPRuntimeState
 }
 
+var (
+	_ faketcp.RuntimeService       = (*ExperimentalFakeTCPRuntime)(nil)
+	_ faketcp.RuntimeStopRequester = (*ExperimentalFakeTCPRuntime)(nil)
+)
+
 type experimentalFakeTCPRuntimeState struct {
 	mu sync.Mutex
 
 	generation uint64
+	identity   faketcp.RuntimeIdentity
+	engine     *faketcp.Engine
 	collection *experimentalCollectionOwner
 	xdp        *fakeTCPXDPStage
+	slowPath   experimentalSlowPath
 	handles    ExperimentalFakeTCPRuntimeHandles
 	closing    bool
 	closed     bool
@@ -346,15 +391,166 @@ type experimentalFakeTCPRuntimeState struct {
 	closeDone  chan struct{}
 }
 
+var errExperimentalFreshCollectionReleaseConsumed = errors.New(
+	"experimental FakeTCP fresh collection release capability is consumed",
+)
+
+// experimentalLinuxFreshCollectionClaim binds the userspace seed API to the
+// exact collection and retained lifecycle/runtime-build claim owned by one
+// builder. Copies share a single callback and release state. The callback is
+// synchronous and release performs the builder's final commit from inside
+// makeReachable; WithExclusiveFreshFakeTCPCollection does no work afterwards.
+type experimentalLinuxFreshCollectionClaim struct {
+	state *experimentalLinuxFreshCollectionClaimState
+}
+
+type experimentalLinuxFreshCollectionClaimState struct {
+	mu sync.Mutex
+
+	transaction      *fakeTCPPolicyRuntimeBuildClaim
+	claimCtx         context.Context
+	collection       *experimentalCollectionOwner
+	release          func() error
+	entered          bool
+	callbackReturned bool
+	releaseCalls     int
+	releaseStarted   bool
+	releaseCompleted bool
+	releaseDone      chan struct{}
+	releaseErr       error
+}
+
+var _ faketcp.LinuxFreshCollectionClaim = experimentalLinuxFreshCollectionClaim{}
+
+type experimentalLinuxMapProvider interface {
+	linuxMap() *ebpf.Map
+}
+
+func linuxMapFromExperimentalResource(resource experimentalMapResource) (*ebpf.Map, bool) {
+	switch resource := resource.(type) {
+	case *ebpf.Map:
+		return resource, resource != nil
+	case experimentalLinuxMapProvider:
+		bpfMap := resource.linuxMap()
+		return bpfMap, bpfMap != nil
+	default:
+		return nil, false
+	}
+}
+
+func (claim experimentalLinuxFreshCollectionClaim) WithExclusiveFreshFakeTCPCollection(
+	callback func(
+		identityMap, sequenceMap *ebpf.Map,
+		release faketcp.LinuxFreshCollectionRelease,
+	) error,
+) error {
+	state := claim.state
+	if state == nil {
+		return errors.New("experimental FakeTCP fresh collection claim is nil")
+	}
+	if callback == nil {
+		return errors.New("experimental FakeTCP fresh collection callback is nil")
+	}
+	state.mu.Lock()
+	if state.entered {
+		state.mu.Unlock()
+		return errors.New("experimental FakeTCP fresh collection claim is single-use")
+	}
+	if state.transaction == nil || state.claimCtx == nil ||
+		state.collection == nil || state.release == nil {
+		state.mu.Unlock()
+		return errors.New("experimental FakeTCP fresh collection claim is incomplete")
+	}
+	if err := state.transaction.assertHeld(state.claimCtx); err != nil {
+		state.mu.Unlock()
+		return fmt.Errorf("validate experimental FakeTCP fresh collection ownership: %w", err)
+	}
+	state.entered = true
+	collection := state.collection
+	state.mu.Unlock()
+
+	// Hold the exact collection owner across the complete callback. This
+	// prevents concurrent Close from invalidating either borrowed map while
+	// seed and all reachability mutations execute. Consumption is sticky even
+	// when map validation, seed, or reachability later fails.
+	collection.mu.Lock()
+	defer collection.mu.Unlock()
+	if collection.closing || collection.closed {
+		return errExperimentalCollectionClosed
+	}
+	if collection.freshRuntimeClaimConsumed {
+		return errors.New("experimental FakeTCP collection fresh claim is consumed")
+	}
+	collection.freshRuntimeClaimConsumed = true
+	identityMap, ok := linuxMapFromExperimentalResource(collection.maps[fakeTCPRuntimeIDMapName])
+	if !ok {
+		return errors.New("experimental FakeTCP runtime identity resource is not a live eBPF map")
+	}
+	sequenceMap, ok := linuxMapFromExperimentalResource(collection.maps[fakeTCPCaptureSeqMapName])
+	if !ok {
+		return errors.New("experimental FakeTCP capture sequence resource is not a live eBPF map")
+	}
+	callbackErr := callback(identityMap, sequenceMap, state.releaseOnceOnly)
+	state.finishCallback()
+	return callbackErr
+}
+
+func (state *experimentalLinuxFreshCollectionClaimState) releaseOnceOnly() error {
+	if state == nil {
+		return errors.New("experimental FakeTCP fresh collection release is nil")
+	}
+	state.mu.Lock()
+	state.releaseCalls++
+	if state.callbackReturned || state.releaseStarted {
+		err := state.releaseErr
+		state.mu.Unlock()
+		return errors.Join(errExperimentalFreshCollectionReleaseConsumed, err)
+	}
+	state.releaseStarted = true
+	state.releaseDone = make(chan struct{})
+	done := state.releaseDone
+	transaction := state.transaction
+	claimCtx := state.claimCtx
+	release := state.release
+	state.mu.Unlock()
+
+	var err error
+	if err = transaction.assertHeld(claimCtx); err != nil {
+		err = fmt.Errorf("validate experimental FakeTCP ownership before release: %w", err)
+	} else {
+		err = release()
+	}
+	state.mu.Lock()
+	state.releaseErr = err
+	state.releaseCompleted = true
+	close(done)
+	state.mu.Unlock()
+	return err
+}
+
+func (state *experimentalLinuxFreshCollectionClaimState) finishCallback() {
+	state.mu.Lock()
+	state.callbackReturned = true
+	done := state.releaseDone
+	wait := state.releaseStarted && !state.releaseCompleted
+	state.mu.Unlock()
+	if wait {
+		<-done
+	}
+}
+
 type experimentalFakeTCPRuntimeBuildOptions struct {
-	collection     *experimentalCollectionOwner
-	transaction    *fakeTCPPolicyGenerationTransaction
-	snapshot       *fakeTCPPolicySnapshot
-	xdpRequests    []fakeTCPXDPAttachRequest
-	xdpRuntime     fakeTCPXDPRuntime
-	sessionFactory experimentalSessionStoreFactory
-	eventSource    experimentalEventMapSource
-	programArray   fakeTCPProgramArray
+	collection       *experimentalCollectionOwner
+	transaction      *fakeTCPPolicyGenerationTransaction
+	snapshot         *fakeTCPPolicySnapshot
+	xdpRequests      []fakeTCPXDPAttachRequest
+	xdpRuntime       fakeTCPXDPRuntime
+	sessionFactory   experimentalSessionStoreFactory
+	eventSource      experimentalEventMapSource
+	programArray     fakeTCPProgramArray
+	engineOptions    faketcp.Options
+	slowPathFactory  experimentalSlowPathFactory
+	commitGeneration experimentalLinuxGenerationCommit
 }
 
 // buildExperimentalFakeTCPRuntime transfers ownership of both collection and
@@ -393,16 +589,23 @@ func buildExperimentalFakeTCPRuntime(
 	if err := build.prepare(); err != nil {
 		return nil, build.fail(err)
 	}
-	if err := build.commit(); err != nil {
+	if err := build.activate(); err != nil {
+		if build.committed.Load() {
+			return nil, build.failCommitted(err)
+		}
 		return nil, build.fail(err)
 	}
 	return &ExperimentalFakeTCPRuntime{
 		state: &experimentalFakeTCPRuntimeState{
 			generation: options.snapshot.Generation,
+			identity:   build.engine.Identity(),
+			engine:     build.engine,
 			collection: options.collection,
 			xdp:        build.xdpStage,
+			slowPath:   build.slowPath,
 			handles: ExperimentalFakeTCPRuntimeHandles{
 				generation: options.snapshot.Generation,
+				identity:   build.engine.Identity(),
 				sessions:   build.sessions,
 				events:     build.events,
 			},
@@ -417,11 +620,19 @@ type experimentalRuntimeBuild struct {
 	activeCtx  context.Context
 	cleanupCtx context.Context
 
-	sessions     *generationFencedSessionStore
-	events       *generationFencedEventMap
-	programStage *fakeTCPProgramArrayStage
-	xdpStage     *fakeTCPXDPStage
-	policyStage  *fakeTCPPolicyStage
+	sessions      *generationFencedSessionStore
+	events        *generationFencedEventMap
+	engine        *faketcp.Engine
+	slowPath      experimentalSlowPath
+	freshClaim    experimentalLinuxFreshCollectionClaim
+	policyMaps    fakeTCPPolicyMaps
+	programArray  fakeTCPProgramArray
+	egressProgram experimentalProgramResource
+	xdpProgram    experimentalProgramResource
+	programStage  *fakeTCPProgramArrayStage
+	xdpStage      *fakeTCPXDPStage
+	policyStage   *fakeTCPPolicyStage
+	committed     atomic.Bool
 }
 
 func (build *experimentalRuntimeBuild) prepare() error {
@@ -453,6 +664,22 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if options.xdpRuntime.probe == nil || options.xdpRuntime.attach == nil {
 		return errors.New("build experimental FakeTCP runtime: XDP probe and attach backends are required")
 	}
+	if options.engineOptions.Generation != options.snapshot.Generation {
+		return fmt.Errorf(
+			"build experimental FakeTCP runtime: Engine generation %d does not match snapshot generation %d",
+			options.engineOptions.Generation, options.snapshot.Generation,
+		)
+	}
+	if options.engineOptions.Store != nil {
+		return errors.New("build experimental FakeTCP runtime: Engine Store must come from the claimed collection")
+	}
+	if options.slowPathFactory == nil {
+		return errors.New("build experimental FakeTCP runtime: slow-path factory is nil")
+	}
+	if options.commitGeneration == nil {
+		options.commitGeneration = faketcp.CommitLinuxGenerationReachability
+	}
+	build.options.commitGeneration = options.commitGeneration
 	if options.sessionFactory == nil {
 		options.sessionFactory = newLiveExperimentalSessionStore
 	}
@@ -502,6 +729,12 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		}
 		return errors.Join(err, ownedStore.Close())
 	}
+	engineOptions := options.engineOptions
+	engineOptions.Store = build.sessions
+	build.engine, err = faketcp.New(engineOptions)
+	if err != nil {
+		return fmt.Errorf("build experimental FakeTCP runtime Engine: %w", err)
+	}
 	eventSource := options.eventSource
 	if eventSource == nil {
 		bpfMap, ok := eventsMap.(*ebpf.Map)
@@ -514,6 +747,25 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if err != nil {
 		return err
 	}
+	err = build.events.withMap(func(eventsMap *ebpf.Map) error {
+		constructed, constructErr := options.slowPathFactory(build.engine, eventsMap)
+		if constructErr != nil {
+			if !experimentalSlowPathIsNil(constructed) {
+				constructErr = errors.Join(constructErr, constructed.Close())
+			}
+			return constructErr
+		}
+		if experimentalSlowPathIsNil(constructed) {
+			return errors.New("experimental FakeTCP slow-path factory returned nil")
+		}
+		// Record ownership before WithMap closes its constructor clone. A clone
+		// close failure must still close the fully constructed slow path.
+		build.slowPath = constructed
+		return nil
+	})
+	if err != nil {
+		return fmt.Errorf("build experimental FakeTCP userspace slow path: %w", err)
+	}
 	if err := build.activeContextError(); err != nil {
 		return err
 	}
@@ -521,8 +773,52 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if programArray == nil {
 		programArray = liveFakeTCPProgramArray{resource: programArrayResource}
 	}
+	build.policyMaps = fakeTCPPolicyMaps{
+		ControlPolicies: controlPolicies, ManagedPorts: managedPorts,
+		ManagedInterfaces: managedInterfaces,
+	}
+	build.programArray = programArray
+	build.egressProgram = egressProgram
+	build.xdpProgram = xdpProgram
+	build.freshClaim = experimentalLinuxFreshCollectionClaim{
+		state: &experimentalLinuxFreshCollectionClaimState{
+			transaction: build.claim,
+			claimCtx:    build.cleanupCtx,
+			collection:  options.collection,
+			release:     build.commit,
+		},
+	}
+	return build.activeContextError()
+}
+
+func (build *experimentalRuntimeBuild) activate() error {
+	if build == nil || build.engine == nil || build.freshClaim.state == nil ||
+		build.options.commitGeneration == nil {
+		return errors.New("activate experimental FakeTCP runtime: build is incomplete")
+	}
+	err := build.options.commitGeneration(
+		build.engine,
+		build.freshClaim,
+		build.makeReachable,
+	)
+	if err == nil && !build.committed.Load() {
+		return errors.New("activate experimental FakeTCP runtime: generation commit returned without releasing ownership")
+	}
+	return err
+}
+
+func (build *experimentalRuntimeBuild) makeReachable(
+	release faketcp.LinuxFreshCollectionRelease,
+) error {
+	if release == nil {
+		return errors.New("activate experimental FakeTCP runtime: release capability is nil")
+	}
+	if err := build.activeContextError(); err != nil {
+		return err
+	}
+	var err error
 	build.programStage, err = stageFakeTCPEgressProgram(
-		build.activeCtx, build.claim, programArray, egressProgram,
+		build.activeCtx, build.claim, build.programArray, build.egressProgram,
 	)
 	if err != nil {
 		return build.prepareError(err)
@@ -531,7 +827,8 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		return err
 	}
 	build.xdpStage, err = stageFakeTCPXDPAttachments(
-		build.activeCtx, options.xdpRequests, xdpProgram, options.xdpRuntime,
+		build.activeCtx, build.options.xdpRequests, build.xdpProgram,
+		build.options.xdpRuntime,
 	)
 	if err != nil {
 		return build.prepareError(err)
@@ -541,24 +838,29 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	}
 	build.policyStage, err = build.claim.Stage(
 		build.activeCtx,
-		fakeTCPPolicyMaps{
-			ControlPolicies: controlPolicies, ManagedPorts: managedPorts,
-			ManagedInterfaces: managedInterfaces,
-		},
-		options.snapshot,
+		build.policyMaps,
+		build.options.snapshot,
 	)
 	if build.policyStage != nil {
 		bindErr := build.claim.bindStageCollectionOwner(
-			build.cleanupCtx, build.policyStage, options.collection,
+			build.cleanupCtx, build.policyStage, build.options.collection,
 		)
 		if bindErr != nil {
-			err = errors.Join(err, fmt.Errorf("bind FakeTCP policy stage to collection owner: %w", bindErr))
+			err = errors.Join(err, fmt.Errorf(
+				"bind FakeTCP policy stage to collection owner: %w", bindErr,
+			))
 		}
 	}
 	if err != nil {
 		return build.prepareError(err)
 	}
-	return build.activeContextError()
+	if err := build.activeContextError(); err != nil {
+		return err
+	}
+	// release is deliberately the final operation. It commits local rollback
+	// ownership and releases the retained lifecycle claim without leaving any
+	// fallible wrapper work after this callback succeeds.
+	return release()
 }
 
 func (build *experimentalRuntimeBuild) commit() error {
@@ -567,16 +869,15 @@ func (build *experimentalRuntimeBuild) commit() error {
 	// active caller, commit is deliberately uninterruptible: both disarms and
 	// lease release use cleanupCtx so cancellation cannot split ownership
 	// between the program-array and policy stages.
-	if err := build.activeContextError(); err != nil {
-		return err
+	committed, err := build.claim.commitRuntimeBuild(
+		build.cleanupCtx,
+		build.policyStage,
+		build.programStage,
+	)
+	if committed {
+		build.committed.Store(true)
 	}
-	if err := build.programStage.Disarm(); err != nil {
-		return fmt.Errorf("commit FakeTCP egress program stage: %w", err)
-	}
-	if err := build.claim.Disarm(build.cleanupCtx, build.policyStage); err != nil {
-		return fmt.Errorf("commit FakeTCP policy stage: %w", err)
-	}
-	if err := build.claim.Close(); err != nil {
+	if err != nil {
 		return fmt.Errorf("release FakeTCP generation transaction: %w", err)
 	}
 	return nil
@@ -596,6 +897,11 @@ func (build *experimentalRuntimeBuild) prepareError(err error) error {
 func (build *experimentalRuntimeBuild) fail(cause error) error {
 	var cleanupErrors []error
 	policyRollbackFailed := false
+	if !experimentalSlowPathIsNil(build.slowPath) {
+		if err := build.slowPath.Close(); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("close FakeTCP slow path: %w", err))
+		}
+	}
 	if build.policyStage != nil {
 		if err := build.claim.Rollback(build.cleanupCtx, build.policyStage); err != nil {
 			policyRollbackFailed = true
@@ -622,9 +928,13 @@ func (build *experimentalRuntimeBuild) fail(cause error) error {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("close FakeTCP event-map handle: %w", err))
 		}
 	}
-	proof, collectionErr := build.options.collection.closeAndReleaseProof()
-	if collectionErr != nil {
-		cleanupErrors = append(cleanupErrors, fmt.Errorf("close experimental FakeTCP collection: %w", collectionErr))
+	var proof *experimentalCollectionReleaseProof
+	if build.options.collection != nil {
+		var collectionErr error
+		proof, collectionErr = build.options.collection.closeAndReleaseProof()
+		if collectionErr != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("close experimental FakeTCP collection: %w", collectionErr))
+		}
 	}
 	if policyRollbackFailed && proof != nil {
 		if err := build.claim.releaseStageAfterCollectionClose(
@@ -639,6 +949,20 @@ func (build *experimentalRuntimeBuild) fail(cause error) error {
 		}
 	}
 	return errors.Join(append([]error{cause}, cleanupErrors...)...)
+}
+
+// failCommitted is the only error path after the combined transaction commit
+// consumed rollback ownership. It closes every live owner in dependency order
+// and deliberately never calls Rollback or Close through the spent claim.
+func (build *experimentalRuntimeBuild) failCommitted(cause error) error {
+	return errors.Join(
+		cause,
+		wrapExperimentalRuntimeClose("slow path", build.slowPath),
+		wrapExperimentalRuntimeClose("session handle", build.sessions),
+		wrapExperimentalRuntimeClose("event-map constructors", build.events),
+		wrapExperimentalRuntimeClose("XDP links", build.xdpStage),
+		wrapExperimentalRuntimeClose("collection", build.options.collection),
+	)
 }
 
 func validateFakeTCPXDPRequests(
@@ -704,6 +1028,43 @@ func (runtime *ExperimentalFakeTCPRuntime) Generation() uint64 {
 	return runtime.state.generation
 }
 
+func (runtime *ExperimentalFakeTCPRuntime) Identity() faketcp.RuntimeIdentity {
+	if runtime == nil || runtime.state == nil {
+		return faketcp.RuntimeIdentity{}
+	}
+	return runtime.state.identity
+}
+
+func (runtime *ExperimentalFakeTCPRuntime) Run(ctx context.Context) error {
+	if runtime == nil || runtime.state == nil {
+		return ErrExperimentalFakeTCPRuntimeClosed
+	}
+	state := runtime.state
+	state.mu.Lock()
+	if state.closing || state.closed || experimentalSlowPathIsNil(state.slowPath) {
+		state.mu.Unlock()
+		return ErrExperimentalFakeTCPRuntimeClosed
+	}
+	slowPath := state.slowPath
+	state.mu.Unlock()
+	return slowPath.Run(ctx)
+}
+
+func (runtime *ExperimentalFakeTCPRuntime) RequestStop() error {
+	if runtime == nil || runtime.state == nil {
+		return ErrExperimentalFakeTCPRuntimeClosed
+	}
+	state := runtime.state
+	state.mu.Lock()
+	if state.closing || state.closed || experimentalSlowPathIsNil(state.slowPath) {
+		state.mu.Unlock()
+		return ErrExperimentalFakeTCPRuntimeClosed
+	}
+	slowPath := state.slowPath
+	state.mu.Unlock()
+	return slowPath.RequestStop()
+}
+
 func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 	if runtime == nil || runtime.state == nil {
 		return nil
@@ -728,6 +1089,7 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 		state.closeDone = make(chan struct{})
 	}
 	state.closing = true
+	slowPath := state.slowPath
 	sessions := state.handles.sessions
 	events := state.handles.events
 	xdp := state.xdp
@@ -735,6 +1097,7 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 	state.mu.Unlock()
 
 	err := errors.Join(
+		wrapExperimentalRuntimeClose("slow path", slowPath),
 		wrapExperimentalRuntimeClose("session handle", sessions),
 		wrapExperimentalRuntimeClose("event-map constructors", events),
 		wrapExperimentalRuntimeClose("XDP links", xdp),
@@ -746,6 +1109,8 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 	state.closed = true
 	state.closing = false
 	state.handles = ExperimentalFakeTCPRuntimeHandles{}
+	state.engine = nil
+	state.slowPath = nil
 	state.xdp = nil
 	state.collection = nil
 	close(state.closeDone)

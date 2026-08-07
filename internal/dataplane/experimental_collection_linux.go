@@ -68,12 +68,13 @@ func (program *liveExperimentalProgram) kernelProgram() *ebpf.Program {
 type experimentalCollectionOwner struct {
 	mu sync.Mutex
 
-	maps      map[string]experimentalMapResource
-	programs  map[string]experimentalProgramResource
-	closing   bool
-	closed    bool
-	closeErr  error
-	closeDone chan struct{}
+	maps                      map[string]experimentalMapResource
+	programs                  map[string]experimentalProgramResource
+	closing                   bool
+	closed                    bool
+	freshRuntimeClaimConsumed bool
+	closeErr                  error
+	closeDone                 chan struct{}
 }
 
 type experimentalCollectionReleaseProof struct {

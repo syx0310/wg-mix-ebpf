@@ -42,11 +42,15 @@ type memoryFakeTCPXDPRuntime struct {
 	links       map[int]*fakeOwnedXDPLink
 	probeCalls  []int
 	attachCalls []fakeTCPXDPAttachRequest
+	events      *[]string
 }
 
 func (runtime *memoryFakeTCPXDPRuntime) backend() fakeTCPXDPRuntime {
 	return fakeTCPXDPRuntime{
 		probe: func(ifindex int) (fakeTCPXDPProbe, error) {
+			if runtime.events != nil {
+				*runtime.events = append(*runtime.events, "xdp-probe")
+			}
 			runtime.probeCalls = append(runtime.probeCalls, ifindex)
 			if err := runtime.probeErrs[ifindex]; err != nil {
 				return fakeTCPXDPProbe{}, err
@@ -61,6 +65,9 @@ func (runtime *memoryFakeTCPXDPRuntime) backend() fakeTCPXDPRuntime {
 			request fakeTCPXDPAttachRequest,
 			program experimentalProgramResource,
 		) (fakeTCPXDPLink, error) {
+			if runtime.events != nil {
+				*runtime.events = append(*runtime.events, "xdp-attach")
+			}
 			runtime.attachCalls = append(runtime.attachCalls, request)
 			if err := runtime.attachErrs[request.IfIndex]; err != nil {
 				return nil, err

@@ -62,15 +62,16 @@ type fakeTCPPolicyGenerationIdentity struct {
 // The transaction is intentionally single-use. A future owner integration
 // must either Rollback or Disarm its stage before Close can release the lease.
 type fakeTCPPolicyGenerationTransaction struct {
-	mu             sync.Mutex
-	generation     uint64
-	lifecyclePath  string
-	lifecycleLease *lockfile.LifecycleLease
-	isolation      fakeTCPPolicyGenerationIsolationBackend
-	identity       *fakeTCPPolicyGenerationIdentity
-	stage          *fakeTCPPolicyStage
-	runtimeClaim   *fakeTCPPolicyRuntimeBuildClaim
-	closed         bool
+	mu                  sync.Mutex
+	generation          uint64
+	lifecyclePath       string
+	lifecycleLease      *lockfile.LifecycleLease
+	closeLifecycleLease func(*lockfile.LifecycleLease) error
+	isolation           fakeTCPPolicyGenerationIsolationBackend
+	identity            *fakeTCPPolicyGenerationIdentity
+	stage               *fakeTCPPolicyStage
+	runtimeClaim        *fakeTCPPolicyRuntimeBuildClaim
+	closed              bool
 }
 
 // fakeTCPPolicyRuntimeBuildClaim is an exclusive, single-use ownership token
@@ -275,6 +276,66 @@ func (claim *fakeTCPPolicyRuntimeBuildClaim) Close() error {
 	return claim.transaction.closeForRuntimeClaim(claim)
 }
 
+// commitRuntimeBuild validates and transfers the program-array and policy
+// stages in one transaction-lock critical section. A validation error leaves
+// both stages rollback-owned. Once committed is true, the transaction and its
+// lease handle are irreversibly closed even if closing the underlying file
+// descriptor reports an error; callers must tear down the now-reachable
+// runtime instead of attempting rollback through a consumed claim.
+func (claim *fakeTCPPolicyRuntimeBuildClaim) commitRuntimeBuild(
+	ctx context.Context,
+	policyStage *fakeTCPPolicyStage,
+	programStage *fakeTCPProgramArrayStage,
+) (committed bool, returnErr error) {
+	if claim == nil || claim.transaction == nil {
+		return false, errFakeTCPPolicyGenerationLeaseRequired
+	}
+	transaction := claim.transaction
+	transaction.mu.Lock()
+	if err := transaction.assertAccessLocked(ctx, claim); err != nil {
+		transaction.mu.Unlock()
+		return false, err
+	}
+	if policyStage == nil || transaction.stage != policyStage ||
+		policyStage.owner != transaction.identity {
+		transaction.mu.Unlock()
+		return false, errors.New("commit FakeTCP runtime: policy stage is not owned by the generation transaction")
+	}
+	if policyStage.state != fakeTCPPolicyStageActive {
+		transaction.mu.Unlock()
+		return false, errors.New("commit FakeTCP runtime: policy stage is not rollback-owned")
+	}
+	if policyStage.collectionOwner == nil {
+		transaction.mu.Unlock()
+		return false, errors.New("commit FakeTCP runtime: policy stage has no collection owner")
+	}
+	if programStage == nil || programStage.state != fakeTCPProgramArrayStageActive {
+		transaction.mu.Unlock()
+		return false, errors.New("commit FakeTCP runtime: program-array stage is not rollback-owned")
+	}
+
+	policyStage.operations = nil
+	policyStage.state = fakeTCPPolicyStageDisarmed
+	programStage.state = fakeTCPProgramArrayStageDisarmed
+	transaction.closed = true
+	transaction.runtimeClaim = nil
+	lease := transaction.lifecycleLease
+	transaction.lifecycleLease = nil
+	closeLease := transaction.closeLifecycleLease
+	transaction.mu.Unlock()
+
+	if lease == nil {
+		return true, nil
+	}
+	if closeLease == nil {
+		closeLease = (*lockfile.LifecycleLease).Close
+	}
+	if err := closeLease(lease); err != nil {
+		return true, fmt.Errorf("close committed FakeTCP generation lifecycle lease: %w", err)
+	}
+	return true, nil
+}
+
 func (transaction *fakeTCPPolicyGenerationTransaction) closeForRuntimeClaim(
 	claim *fakeTCPPolicyRuntimeBuildClaim,
 ) error {
@@ -305,7 +366,11 @@ func (transaction *fakeTCPPolicyGenerationTransaction) closeForRuntimeClaim(
 	if lease == nil {
 		return nil
 	}
-	return lease.Close()
+	closeLease := transaction.closeLifecycleLease
+	if closeLease == nil {
+		closeLease = (*lockfile.LifecycleLease).Close
+	}
+	return closeLease(lease)
 }
 
 // Stage stages one previously absent generation while retaining the generation
