@@ -486,6 +486,50 @@ profiles:
 	}
 }
 
+func TestFakeTCPPolicyParametersAreOwnedPerWireGuard(t *testing.T) {
+	cfg, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: faketcp
+      faketcp:
+        experimental: true
+        syn_rate_interval: 100ms
+        syn_source_ledger_ttl: 1m
+        handshake_timeout: 2s
+  - name: wg1
+    profile: mix-default
+    transport:
+      mode: faketcp
+      faketcp:
+        experimental: true
+        syn_rate_interval: 250ms
+        syn_source_ledger_ttl: 2m
+        handshake_timeout: 3s
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := cfg.WireGuards[0].Transport.FakeTCP
+	second := cfg.WireGuards[1].Transport.FakeTCP
+	if first.SYNRateInterval.Duration != 100*time.Millisecond ||
+		first.SYNSourceLedgerTTL.Duration != time.Minute ||
+		first.HandshakeTimeout.Duration != 2*time.Second ||
+		second.SYNRateInterval.Duration != 250*time.Millisecond ||
+		second.SYNSourceLedgerTTL.Duration != 2*time.Minute ||
+		second.HandshakeTimeout.Duration != 3*time.Second {
+		t.Fatalf("per-WG FakeTCP policies collapsed: first=%#v second=%#v", first, second)
+	}
+}
+
 func TestRejectUnsupportedUnderlayParser(t *testing.T) {
 	_, err := Load([]byte(`
 version: 1

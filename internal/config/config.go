@@ -94,8 +94,12 @@ type ICMPTransport struct {
 }
 
 // FakeTCPTransport is deliberately explicit while the transport is
-// experimental.  The data path preserves UDP/QUIC reliability semantics and
-// only presents a TCP-shaped wire image; it is not a TCP stream.
+// experimental. The data path preserves UDP/QUIC reliability semantics and
+// only presents a TCP-shaped wire image; it is not a TCP stream. Each
+// WireGuard's controller/engine owns its complete FakeTCP policy independently
+// (timeouts, rate limits, source ledger and pending queues); no "first WG wins"
+// process-global parameter is permitted. Only shared BPF/daemon resource
+// ceilings are aggregated by validateDataplaneCapacity.
 type FakeTCPTransport struct {
 	Experimental             bool     `yaml:"experimental"`
 	ChecksumMode             string   `yaml:"checksum_mode"`
