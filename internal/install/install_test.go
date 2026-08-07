@@ -38,11 +38,11 @@ func TestUninstallPurgeRejectsNonOwnedConfigDir(t *testing.T) {
 }
 
 func TestUninstallPurgeAllowsOwnedEmptyConfigDir(t *testing.T) {
-	root := t.TempDir()
-	etcDir := filepath.Join(root, "wg-mix-ebpf-owned")
-	t.Setenv(EnvEtcDir, etcDir)
+	layout := cleanupTestPaths(t.TempDir(), "owned-empty")
+	setCleanupTestEnvironment(t, layout)
+	etcDir := filepath.Dir(layout.ConfigPath)
 	plan, err := Uninstall(t.Context(), Options{
-		ConfigPath: filepath.Join(etcDir, "config.yaml"),
+		ConfigPath: layout.ConfigPath,
 		System:     "unknown",
 		DryRun:     true,
 		Purge:      true,
