@@ -20,6 +20,14 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/pinidentity"
 )
 
+func TestApplyRefusesLegacyAdoptionBeforeRuntimeAccess(t *testing.T) {
+	loader := LinuxLoader{AdoptLegacyPins: true}
+	err := loader.Apply(context.Background(), &control.State{})
+	if err == nil || !strings.Contains(err.Error(), "detach with a trusted legacy build") {
+		t.Fatalf("legacy adoption error = %v", err)
+	}
+}
+
 func TestXORTailCallBankStartAlternatesWithoutOverlap(t *testing.T) {
 	tests := []struct {
 		generation uint64

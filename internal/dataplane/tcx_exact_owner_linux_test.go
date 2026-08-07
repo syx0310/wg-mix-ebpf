@@ -5,7 +5,9 @@ package dataplane
 import (
 	"errors"
 	"fmt"
+	"os"
 	"slices"
+	"strings"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -35,9 +37,11 @@ type fakeExactTCXKernel struct {
 	beforeAttach        func(*fakeExactTCXKernel, fakeExactTCXSlot)
 	beforeCompareUpdate func(*fakeExactTCXKernel, uint32)
 	queryErr            error
+	pinErr              error
 	detachErrs          map[uint32][]error
 	unpinErrs           map[uint32][]error
 	closeErrs           map[uint32][]error
+	materializePins     bool
 }
 
 func newFakeExactTCXKernel() *fakeExactTCXKernel {
@@ -168,6 +172,18 @@ func (handle *fakeExactTCXHandle) Pin(path string) error {
 	if _, exists := handle.kernel.pins[path]; exists {
 		return unix.EEXIST
 	}
+	if handle.kernel.pinErr != nil {
+		return handle.kernel.pinErr
+	}
+	if handle.kernel.materializePins {
+		file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return err
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+	}
 	handle.kernel.pins[path] = handle.id
 	handle.pinnedPath = path
 	state.pins++
@@ -187,6 +203,8 @@ func (handle *fakeExactTCXHandle) CompareUpdate(next, previous exactTCXProgram) 
 		return unix.ESTALE
 	}
 	state.identity.ProgramID = next.id
+	slot := fakeExactTCXSlot{ifindex: state.identity.IfIndex, attach: state.identity.Attach}
+	handle.kernel.revs[slot] = handle.kernel.revision(slot) + 1
 	return nil
 }
 
@@ -200,6 +218,8 @@ func (handle *fakeExactTCXHandle) Detach() error {
 		return injected
 	}
 	state.attached = false
+	slot := fakeExactTCXSlot{ifindex: state.identity.IfIndex, attach: state.identity.Attach}
+	handle.kernel.revs[slot] = handle.kernel.revision(slot) + 1
 	return nil
 }
 
@@ -214,6 +234,11 @@ func (handle *fakeExactTCXHandle) Unpin() error {
 	}
 	if handle.pinnedPath == "" || handle.kernel.pins[handle.pinnedPath] != handle.id {
 		return unix.ENOENT
+	}
+	if handle.kernel.materializePins {
+		if err := os.Remove(handle.pinnedPath); err != nil {
+			return err
+		}
 	}
 	delete(handle.kernel.pins, handle.pinnedPath)
 	handle.pinnedPath = ""
@@ -286,8 +311,12 @@ func cloneExactTCXIntent(intent exactTCXJournalIntent) exactTCXJournalIntent {
 }
 
 func testExactTCXBinding(ifindex int, direction exactTCXDirection, programID uint32) exactTCXBinding {
+	attach, err := exactTCXAttachType(direction)
+	if err != nil {
+		panic(err)
+	}
 	return exactTCXBinding{
-		Backend: exactTCXBackend, IfIndex: ifindex, Direction: direction,
+		Backend: exactTCXBackend, IfIndex: ifindex, Direction: direction, AttachType: uint32(attach),
 		PinName: exactTCXPinName(ifindex, direction), ProgramID: programID,
 	}
 }
@@ -373,6 +402,64 @@ func TestExactTCXAttachRevisionFenceRejectsConcurrentForeignMutation(t *testing.
 	}
 }
 
+func TestExactTCXAttachRejectsIncompleteQueryBeforeIntent(t *testing.T) {
+	kernel := newFakeExactTCXKernel()
+	runtime := kernel.runtime()
+	runtime.query = func(int, ebpf.AttachType) (exactTCXQuery, error) {
+		kernel.events = append(kernel.events, "query")
+		return exactTCXQuery{
+			Revision: 1,
+			Programs: []exactTCXQueryProgram{{LinkID: 0, ProgramID: 999}},
+		}, nil
+	}
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+	binding := testExactTCXBinding(11, exactTCXIngress, 43)
+	owner, err := stageExactTCXAttachment(
+		t.Context(), binding,
+		"/sys/fs/bpf/wg-mix-ebpf-test/"+binding.PinName,
+		exactTCXProgram{id: binding.ProgramID}, journal.callbacks(), runtime,
+	)
+	if owner != nil || err == nil || !strings.Contains(err.Error(), "incomplete exact identity") {
+		t.Fatalf("owner=%#v error=%v", owner, err)
+	}
+	if journal.intent != nil || journal.active != nil {
+		t.Fatalf("invalid query reached owner journal: intent=%+v active=%+v", journal.intent, journal.active)
+	}
+	if !slices.Equal(kernel.events, []string{"query"}) {
+		t.Fatalf("invalid query events=%v", kernel.events)
+	}
+}
+
+func TestExactTCXPinFailureDetachesUnrecoverableLink(t *testing.T) {
+	kernel := newFakeExactTCXKernel()
+	kernel.pinErr = errors.New("injected pin failure")
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+	binding := testExactTCXBinding(11, exactTCXEgress, 44)
+	owner, err := stageExactTCXAttachment(
+		t.Context(), binding,
+		"/sys/fs/bpf/wg-mix-ebpf-test/"+binding.PinName,
+		exactTCXProgram{id: binding.ProgramID}, journal.callbacks(), kernel.runtime(),
+	)
+	if owner != nil || !errors.Is(err, kernel.pinErr) {
+		t.Fatalf("owner=%#v error=%v", owner, err)
+	}
+	link := kernel.links[kernel.nextID]
+	if link == nil || link.attached || link.fdRefs != 0 || link.pins != 0 {
+		t.Fatalf("failed unpinned link was not closed exactly: %+v", link)
+	}
+	if journal.intent == nil || journal.active != nil {
+		t.Fatalf("pin failure journal intent=%+v active=%+v", journal.intent, journal.active)
+	}
+	wantTail := []string{
+		"pin",
+		fmt.Sprintf("detach:%d", kernel.nextID),
+		fmt.Sprintf("close:%d", kernel.nextID),
+	}
+	if !slices.Equal(kernel.events[len(kernel.events)-len(wantTail):], wantTail) {
+		t.Fatalf("pin failure events=%v want tail=%v", kernel.events, wantTail)
+	}
+}
+
 func TestExactTCXRollbackPreservesConcurrentForeignLink(t *testing.T) {
 	kernel := newFakeExactTCXKernel()
 	journal := &fakeExactTCXJournal{events: &kernel.events}
@@ -380,7 +467,7 @@ func TestExactTCXRollbackPreservesConcurrentForeignLink(t *testing.T) {
 	owner, _ := stageTestExactTCX(t, kernel, binding, journal)
 	ownedID := owner.binding.LinkID
 
-	// This is the race classic FilterDel cannot survive: another writer
+	// This is the race classic slot-addressed deletion cannot survive: another writer
 	// installs a different program in the same logical direction after the
 	// owner's last inspection. TCX gives each attachment a distinct link ID.
 	foreignID := kernel.addLink(12, ebpf.AttachTCXIngress, 999)

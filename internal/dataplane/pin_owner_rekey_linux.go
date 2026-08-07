@@ -21,7 +21,7 @@ func rekeyRebootedPinOwner(
 	entry *pinOwnerIndexEntry,
 	bootID string,
 	now time.Time,
-	tcRuntime tcRuntime,
+	_ exactTCXRuntime,
 ) (*pinOwnerRecord, error) {
 	if handle == nil || parent == nil || store == nil || entry == nil {
 		return nil, errors.New("reboot owner rekey requires anchored current and indexed old owners")
@@ -71,10 +71,7 @@ func rekeyRebootedPinOwner(
 	); err != nil {
 		return nil, err
 	}
-	if err := validateRebootedFiltersAbsent(
-		oldRecord.ActiveFilters,
-		tcRuntime,
-	); err != nil {
+	if err := validateRebootedExactTCXPinsAbsent(handle, oldRecord.ActiveLinks); err != nil {
 		return nil, err
 	}
 
@@ -198,6 +195,41 @@ func rekeyRebootedPinOwner(
 		return nil, fmt.Errorf("publish rekeyed reboot owner: %w", err)
 	}
 	return record, nil
+}
+
+func validateRebootedExactTCXPinsAbsent(
+	handle *pinPathHandle,
+	bindings []exactTCXBinding,
+) error {
+	if handle == nil {
+		return errors.New("prior-boot exact TCX pin validation has no anchored directory")
+	}
+	if err := handle.recheckTargetEntry(); err != nil {
+		return err
+	}
+	for _, binding := range bindings {
+		if err := validateExactTCXBinding(binding, true); err != nil {
+			return err
+		}
+		var stat unix.Stat_t
+		err := unix.Fstatat(
+			handle.targetFD,
+			binding.PinName,
+			&stat,
+			unix.AT_SYMLINK_NOFOLLOW,
+		)
+		if errors.Is(err, unix.ENOENT) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf(
+			"prior-boot exact TCX pin %s still exists; refusing cross-boot link ID trust",
+			binding.PinName,
+		)
+	}
+	return nil
 }
 
 func recheckIndexedOwnerForRekey(
