@@ -1,0 +1,10 @@
+version=1
+bootstrap_prefix=/run/wg-mix-ebpf-source-bootstrap
+launcher_file=stage-root-owned-test-source.sh
+launcher_mode=0500
+launcher_sha256=3a9f165249a80cc0d033497cbedd6bfc5cbf88022dd488d0a0c986c72bad4211
+helper_file=stage-root-owned-test-source.py
+helper_mode=0400
+helper_sha256=d447243bb2150a72ed39b320f03f50c144fcefe65b2feb4f34dffaab742490ca
+manifest_file=stage-root-owned-test-source.bootstrap
+manifest_mode=0400

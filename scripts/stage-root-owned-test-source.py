@@ -16,6 +16,7 @@ from typing import BinaryIO, TypeVar
 
 
 STAGE_PREFIX = "/run/wg-mix-ebpf-source-stages"
+BOOTSTRAP_PREFIX = "/run/wg-mix-ebpf-source-bootstrap"
 MAX_BUNDLE_BYTES = 1024 * 1024 * 1024
 FIXED_PATH = "/usr/bin:/bin"
 FIXED_TOOLS = {
@@ -538,7 +539,10 @@ def verify_root_owned_worktree(source: str) -> None:
                 raise StageError(f"source tree symlink is forbidden: {path}")
             if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
                 raise StageError(f"source tree contains a special file: {path}")
-            if stat.S_IMODE(metadata.st_mode) & 0o022:
+            permission_bits = stat.S_IMODE(metadata.st_mode)
+            if permission_bits & 0o6000:
+                raise StageError(f"source entry has setuid or setgid bits: {path}")
+            if permission_bits & 0o022:
                 raise StageError(f"source entry is group/other writable: {path}")
 
 
@@ -551,6 +555,7 @@ def open_hashed_file(
         or before.st_uid != expected_uid
         or before.st_gid != expected_gid
         or before.st_nlink != 1
+        or stat.S_IMODE(before.st_mode) & 0o6000
         or stat.S_IMODE(before.st_mode) & 0o022
     ):
         raise StageError(f"artifact metadata is unsafe: {path}")
@@ -574,16 +579,23 @@ def open_hashed_file(
 
 
 def anchored_file(
-    descriptor: int, path: str | None, expected_sha256: str
+    descriptor: int,
+    path: str | None,
+    expected_sha256: str,
+    expected_mode: int,
 ) -> tuple[str, os.stat_result]:
     require_sha256(expected_sha256, "anchored file SHA-256")
     metadata = os.fstat(descriptor)
     if (
         not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
         or metadata.st_nlink != 1
-        or stat.S_IMODE(metadata.st_mode) & 0o022
+        or stat.S_IMODE(metadata.st_mode) != expected_mode
     ):
-        raise StageError("anchored script descriptor is not a one-link regular file")
+        raise StageError(
+            "anchored script is not a strict-mode, one-link root:root regular file"
+        )
     hash_descriptor = os.dup(descriptor)
     try:
         actual = hash_open_fd(hash_descriptor)
@@ -594,11 +606,26 @@ def anchored_file(
     if path is not None:
         require_absolute_path(path, "launcher path")
         path_metadata = os.lstat(path)
-        if not stat.S_ISREG(path_metadata.st_mode) or identity_stat(
-            path_metadata
-        ) != identity_stat(metadata):
+        if (
+            not stat.S_ISREG(path_metadata.st_mode)
+            or exact_stat(path_metadata) != exact_stat(metadata)
+        ):
             raise StageError("launcher path does not identify its anchored descriptor")
     return actual, metadata
+
+
+def verify_bootstrap_path(launcher_path: str, run_id: str) -> None:
+    bootstrap_run_root = os.path.dirname(launcher_path)
+    if (
+        os.path.dirname(bootstrap_run_root) != BOOTSTRAP_PREFIX
+        or os.path.basename(bootstrap_run_root) != run_id
+        or os.path.basename(launcher_path) != "stage-root-owned-test-source.sh"
+    ):
+        raise StageError(
+            "launcher must run from the fixed root bootstrap path for --run-id"
+        )
+    validate_directory(BOOTSTRAP_PREFIX, 0, 0, 0o700)
+    validate_directory(bootstrap_run_root, 0, 0, 0o700)
 
 
 def require_fixed_tools() -> None:
@@ -625,6 +652,7 @@ def stage_source(
     require_run_id(run_id)
     if os.geteuid() != 0:
         raise StageError("production staging must run as root")
+    verify_bootstrap_path(launcher_path, run_id)
     require_fixed_tools()
     run_parent = os.path.dirname(STAGE_PREFIX)
     run_parent_metadata = os.lstat(run_parent)
@@ -768,9 +796,12 @@ def stage_source(
                 os.path.join(source, "internal", "dataplane", "embedded", "wg_mix_tc.o"),
                 os.path.join(source, "bin", "wg-mix-ebpf"),
                 os.path.join(source, "bin", "wg-mix-ebpf-netns-anchor"),
+                run_root,
+                source,
                 directories["go_cache"],
                 directories["go_mod_cache"],
                 directories["go_path"],
+                directories["go_tmp"],
             )
         )
         run_command(
@@ -781,7 +812,9 @@ def stage_source(
             build_environment,
             run_root,
         )
+        verify_root_owned_worktree(source)
         verify_clean_source(audit, source, commit, environment)
+        verify_root_owned_worktree(source)
 
         artifacts = (
             ("main", os.path.join(source, "bin", "wg-mix-ebpf")),
@@ -893,9 +926,11 @@ def main() -> int:
         if launcher_fd_text != "/proc/self/fd/8" or helper_fd_text != "/proc/self/fd/9":
             raise StageError("unexpected anchored descriptor path")
         launcher_sha, launcher_metadata = anchored_file(
-            8, launcher_path, launcher_expected_sha
+            8, launcher_path, launcher_expected_sha, 0o500
         )
-        helper_sha, helper_metadata = anchored_file(9, None, helper_expected_sha)
+        helper_sha, helper_metadata = anchored_file(
+            9, None, helper_expected_sha, 0o400
+        )
 
         if len(arguments) != 8 or arguments[0::2] != [
             "--bundle",
@@ -917,9 +952,11 @@ def main() -> int:
         )
 
         final_launcher_sha, final_launcher_metadata = anchored_file(
-            8, launcher_path, launcher_sha
+            8, launcher_path, launcher_sha, 0o500
         )
-        final_helper_sha, final_helper_metadata = anchored_file(9, None, helper_sha)
+        final_helper_sha, final_helper_metadata = anchored_file(
+            9, None, helper_sha, 0o400
+        )
         if (
             final_launcher_sha != launcher_sha
             or exact_stat(final_launcher_metadata) != exact_stat(launcher_metadata)
