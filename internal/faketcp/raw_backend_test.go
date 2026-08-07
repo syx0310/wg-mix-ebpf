@@ -21,6 +21,7 @@ type memoryRawIPv4Writer struct {
 	entered     chan struct{}
 	release     <-chan struct{}
 	enteredOnce sync.Once
+	writeHook   func()
 }
 
 func (writer *memoryRawIPv4Writer) WriteIPv4(ctx context.Context, write RawIPv4Write) error {
@@ -28,7 +29,11 @@ func (writer *memoryRawIPv4Writer) WriteIPv4(ctx context.Context, write RawIPv4W
 	copyWrite.Data = append([]byte(nil), write.Data...)
 	writer.mu.Lock()
 	writer.writes = append(writer.writes, copyWrite)
+	hook := writer.writeHook
 	writer.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
 	if writer.entered != nil {
 		writer.enteredOnce.Do(func() { close(writer.entered) })
 	}
@@ -254,6 +259,19 @@ func TestRawControllerBackendCloseWaitsForReinjectionAndClosesWriterOnce(t *test
 	}
 	closeDone := make(chan error, 1)
 	go func() { closeDone <- backend.Close() }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		backend.mu.Lock()
+		closing := backend.closing
+		backend.mu.Unlock()
+		if closing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("backend did not enter closing state")
+		}
+		time.Sleep(time.Millisecond)
+	}
 	select {
 	case err := <-closeDone:
 		t.Fatalf("Close returned before reinjection: %v", err)
@@ -275,6 +293,93 @@ func TestRawControllerBackendCloseWaitsForReinjectionAndClosesWriterOnce(t *test
 	}
 	if err := backend.Reinject(context.Background(), flow, testPendingPacket(t, flow, 124)); !errors.Is(err, ErrRawBackendClosed) {
 		t.Fatalf("post-close reinjection error=%v", err)
+	}
+}
+
+func TestRawControllerBackendExternalCallsRunOutsideStateLock(t *testing.T) {
+	writer := &memoryRawIPv4Writer{}
+	var backend *RawControllerBackend
+	assertUnlocked := func(stage string) {
+		t.Helper()
+		if !backend.mu.TryLock() {
+			t.Fatalf("backend state lock held during %s", stage)
+		}
+		backend.mu.Unlock()
+	}
+	writer.writeHook = func() { assertUnlocked("raw write") }
+	var err error
+	backend, err = NewRawControllerBackend(RawControllerBackendOptions{
+		Writer: writer,
+		ControlMarks: ControlMarkResolverFunc(func(context.Context, abi.FakeTCPSessionKey, uint32) (uint32, error) {
+			assertUnlocked("control mark resolution")
+			return 9, nil
+		}),
+		MaxRememberedReinjections: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.SendControl(context.Background(), testFlow(31001), 77, ControlPacket{Flags: FlagSYN}); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Reinject(context.Background(), testFlow(31001), testPendingPacket(t, testFlow(31001), 1)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRawControllerBackendCloseFencesAdmittedResolver(t *testing.T) {
+	resolverEntered := make(chan struct{})
+	resolverRelease := make(chan struct{})
+	backend, err := NewRawControllerBackend(RawControllerBackendOptions{
+		Writer: &memoryRawIPv4Writer{},
+		ControlMarks: ControlMarkResolverFunc(func(context.Context, abi.FakeTCPSessionKey, uint32) (uint32, error) {
+			close(resolverEntered)
+			<-resolverRelease
+			return 9, nil
+		}),
+		MaxRememberedReinjections: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- backend.SendControl(context.Background(), testFlow(31001), 77, ControlPacket{Flags: FlagSYN})
+	}()
+	select {
+	case <-resolverEntered:
+	case <-time.After(time.Second):
+		t.Fatal("control mark resolver did not start")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- backend.Close() }()
+	deadline := time.Now().Add(time.Second)
+	for {
+		backend.mu.Lock()
+		closing := backend.closing
+		backend.mu.Unlock()
+		if closing {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("backend did not enter closing state")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before resolver: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	if err := backend.SendControl(context.Background(), testFlow(31002), 77, ControlPacket{Flags: FlagSYN}); !errors.Is(err, ErrRawBackendClosed) {
+		t.Fatalf("operation admitted while closing: %v", err)
+	}
+	close(resolverRelease)
+	if err := <-sendDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
 	}
 }
 

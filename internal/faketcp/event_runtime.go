@@ -52,6 +52,14 @@ type RuntimeService interface {
 	Close() error
 }
 
+// RuntimeStopRequester is the non-blocking-shutdown boundary that callbacks
+// running on a RuntimeService goroutine may use. A callback must not invoke
+// RuntimeService.Close synchronously because Close is a completion fence over
+// Run; it requests a stop and lets the owner call Close after Run returns.
+type RuntimeStopRequester interface {
+	RequestStop() error
+}
+
 type EventRuntimeOptions struct {
 	// PollInterval bounds cancellation latency while Read is idle.
 	PollInterval time.Duration
@@ -72,14 +80,19 @@ type EventRuntime struct {
 	opts       EventRuntimeOptions
 	runDone    chan struct{}
 	closeDone  chan struct{}
+	readerDone chan struct{}
+	readerOnce sync.Once
 	runStarted bool
 	running    bool
+	stopAsked  bool
 	closing    bool
 	closed     bool
+	readerErr  error
 	closeErr   error
 }
 
 var _ RuntimeService = (*EventRuntime)(nil)
+var _ RuntimeStopRequester = (*EventRuntime)(nil)
 
 func NewEventRuntime(
 	reader EventReader,
@@ -104,6 +117,7 @@ func NewEventRuntime(
 		opts:       options,
 		runDone:    make(chan struct{}),
 		closeDone:  make(chan struct{}),
+		readerDone: make(chan struct{}),
 	}, nil
 }
 
@@ -156,7 +170,7 @@ func (runtime *EventRuntime) Run(ctx context.Context) error {
 			// Deadline wakeups exist only to service ctx and Tick below.
 		case errors.Is(err, os.ErrClosed):
 			runtime.mu.Lock()
-			closing := runtime.closing || runtime.closed
+			closing := runtime.stopAsked || runtime.closing || runtime.closed
 			runtime.mu.Unlock()
 			if closing {
 				return nil
@@ -164,6 +178,9 @@ func (runtime *EventRuntime) Run(ctx context.Context) error {
 			return fmt.Errorf("read faketcp event sample: %w", err)
 		default:
 			return fmt.Errorf("read faketcp event sample: %w", err)
+		}
+		if runtime.stopRequested() {
+			return nil
 		}
 
 		now = runtime.opts.Now()
@@ -174,6 +191,31 @@ func (runtime *EventRuntime) Run(ctx context.Context) error {
 			nextTick = now.Add(runtime.opts.TickInterval)
 		}
 	}
+}
+
+// RequestStop is safe from HandleSample and Tick callbacks. It interrupts the
+// reader exactly once but deliberately does not wait for Run or close the
+// controller. The generation owner must call Close after Run has returned.
+func (runtime *EventRuntime) RequestStop() error {
+	if runtime == nil {
+		return ErrEventRuntimeClosed
+	}
+	runtime.mu.Lock()
+	if runtime.closed {
+		err := runtime.readerErr
+		runtime.mu.Unlock()
+		return err
+	}
+	runtime.stopAsked = true
+	runtime.mu.Unlock()
+	return runtime.closeReader()
+}
+
+func (runtime *EventRuntime) stopRequested() bool {
+	runtime.mu.Lock()
+	requested := runtime.stopAsked || runtime.closing || runtime.closed
+	runtime.mu.Unlock()
+	return requested
 }
 
 func (runtime *EventRuntime) finishRun() {
@@ -210,11 +252,10 @@ func (runtime *EventRuntime) Close() error {
 	runtime.closing = true
 	running := runtime.running
 	runDone := runtime.runDone
-	reader := runtime.reader
 	controller := runtime.controller
 	runtime.mu.Unlock()
 
-	readerErr := reader.Close()
+	readerErr := runtime.closeReader()
 	if running {
 		<-runDone
 	}
@@ -231,6 +272,15 @@ func (runtime *EventRuntime) Close() error {
 	close(runtime.closeDone)
 	runtime.mu.Unlock()
 	return closeErr
+}
+
+func (runtime *EventRuntime) closeReader() error {
+	runtime.readerOnce.Do(func() {
+		runtime.readerErr = runtime.reader.Close()
+		close(runtime.readerDone)
+	})
+	<-runtime.readerDone
+	return runtime.readerErr
 }
 
 func wrapEventRuntimeCloseError(resource string, err error) error {

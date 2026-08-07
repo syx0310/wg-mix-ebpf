@@ -28,6 +28,8 @@ type RawIPv4Write struct {
 // RawIPv4Writer is the capability-bearing boundary around a raw IPv4 socket.
 // Implementations must send one complete datagram or return an error; partial
 // success is not allowed. Close must fence admitted writes and be idempotent.
+// WriteIPv4 must not synchronously call Close on an owning
+// RawControllerBackend; the owner waits for admitted calls before closing it.
 type RawIPv4Writer interface {
 	WriteIPv4(context.Context, RawIPv4Write) error
 	Close() error
@@ -84,6 +86,9 @@ func validateRawIPv4Write(write RawIPv4Write) error {
 // ControlMarkResolver binds one userspace handshake packet to the configured
 // routing mark for its WireGuard identity. It is intentionally explicit: a
 // backend must not guess a mark from WGID or reuse the captured data mark.
+// ControlMark must not synchronously call Close on its owning
+// RawControllerBackend. It is invoked without backend locks, but Close is a
+// synchronous fence over admitted calls.
 type ControlMarkResolver interface {
 	ControlMark(context.Context, abi.FakeTCPSessionKey, uint32) (uint32, error)
 }
@@ -110,11 +115,15 @@ type RawControllerBackendOptions struct {
 // type-word/XOR/FakeTCP egress pipeline. The same writer serialises SO_MARK and
 // interface selection for both paths.
 type RawControllerBackend struct {
-	mu sync.RWMutex
+	mu sync.Mutex
 
 	writer       RawIPv4Writer
 	controlMarks ControlMarkResolver
 	reinjector   *OnceReinjector
+	inflightDone *sync.Cond
+	closeDone    chan struct{}
+	inflight     uint64
+	closing      bool
 	closed       bool
 	closeErr     error
 }
@@ -132,11 +141,14 @@ func NewRawControllerBackend(options RawControllerBackendOptions) (*RawControlle
 	if err != nil {
 		return nil, err
 	}
-	return &RawControllerBackend{
+	backend := &RawControllerBackend{
 		writer:       options.Writer,
 		controlMarks: options.ControlMarks,
 		reinjector:   reinjector,
-	}, nil
+		closeDone:    make(chan struct{}),
+	}
+	backend.inflightDone = sync.NewCond(&backend.mu)
+	return backend, nil
 }
 
 func (backend *RawControllerBackend) SendControl(
@@ -151,15 +163,19 @@ func (backend *RawControllerBackend) SendControl(
 	if ctx == nil {
 		return errors.New("send faketcp control: context is nil")
 	}
-	backend.mu.RLock()
-	defer backend.mu.RUnlock()
-	if backend.closed {
-		return ErrRawBackendClosed
-	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	mark, err := backend.controlMarks.ControlMark(ctx, flow, wgID)
+	writer, controlMarks, _, err := backend.beginOperation()
+	if err != nil {
+		return err
+	}
+	defer backend.endOperation()
+
+	// Resolver and writer are deliberately invoked without holding backend.mu.
+	// They must not synchronously call Close on this backend: Close waits for
+	// admitted calls so ownership has a conventional, synchronous fence.
+	mark, err := controlMarks.ControlMark(ctx, flow, wgID)
 	if err != nil {
 		return fmt.Errorf("resolve faketcp control mark for wg id %d: %w", wgID, err)
 	}
@@ -167,7 +183,7 @@ func (backend *RawControllerBackend) SendControl(
 	if err != nil {
 		return err
 	}
-	if err := backend.writer.WriteIPv4(ctx, RawIPv4Write{
+	if err := writer.WriteIPv4(ctx, RawIPv4Write{
 		Data:          packet,
 		UnderlayIndex: flow.UnderlayIndex,
 		FWMark:        mark,
@@ -188,12 +204,15 @@ func (backend *RawControllerBackend) Reinject(
 	if ctx == nil {
 		return errors.New("reinject faketcp packet: context is nil")
 	}
-	backend.mu.RLock()
-	defer backend.mu.RUnlock()
-	if backend.closed {
-		return ErrRawBackendClosed
+	if err := ctx.Err(); err != nil {
+		return err
 	}
-	return backend.reinjector.Reinject(ctx, flow, packet)
+	_, _, reinjector, err := backend.beginOperation()
+	if err != nil {
+		return err
+	}
+	defer backend.endOperation()
+	return reinjector.Reinject(ctx, flow, packet)
 }
 
 func (backend *RawControllerBackend) Close() error {
@@ -201,16 +220,78 @@ func (backend *RawControllerBackend) Close() error {
 		return nil
 	}
 	backend.mu.Lock()
-	defer backend.mu.Unlock()
-	if backend.closed {
-		return backend.closeErr
+	if !backend.initializedLocked() {
+		backend.mu.Unlock()
+		return ErrRawBackendClosed
 	}
-	backend.closed = true
-	backend.closeErr = errors.Join(
-		backend.reinjector.Close(),
-		backend.writer.Close(),
+	if backend.closed {
+		closeErr := backend.closeErr
+		backend.mu.Unlock()
+		return closeErr
+	}
+	if backend.closing {
+		closeDone := backend.closeDone
+		backend.mu.Unlock()
+		<-closeDone
+		backend.mu.Lock()
+		closeErr := backend.closeErr
+		backend.mu.Unlock()
+		return closeErr
+	}
+	backend.closing = true
+	for backend.inflight != 0 {
+		backend.inflightDone.Wait()
+	}
+	reinjector := backend.reinjector
+	writer := backend.writer
+	backend.mu.Unlock()
+
+	closeErr := errors.Join(
+		reinjector.Close(),
+		writer.Close(),
 	)
-	return backend.closeErr
+
+	backend.mu.Lock()
+	backend.closeErr = closeErr
+	backend.closed = true
+	backend.closing = false
+	close(backend.closeDone)
+	backend.mu.Unlock()
+	return closeErr
+}
+
+func (backend *RawControllerBackend) beginOperation() (
+	RawIPv4Writer,
+	ControlMarkResolver,
+	*OnceReinjector,
+	error,
+) {
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if !backend.initializedLocked() || backend.closing || backend.closed {
+		return nil, nil, nil, ErrRawBackendClosed
+	}
+	backend.inflight++
+	return backend.writer, backend.controlMarks, backend.reinjector, nil
+}
+
+func (backend *RawControllerBackend) endOperation() {
+	backend.mu.Lock()
+	if backend.inflight > 0 {
+		backend.inflight--
+	}
+	if backend.inflight == 0 {
+		backend.inflightDone.Broadcast()
+	}
+	backend.mu.Unlock()
+}
+
+func (backend *RawControllerBackend) initializedLocked() bool {
+	return !rawIPv4WriterIsNil(backend.writer) &&
+		!controlMarkResolverIsNil(backend.controlMarks) &&
+		backend.reinjector != nil &&
+		backend.inflightDone != nil &&
+		backend.closeDone != nil
 }
 
 type reinjectIdentity struct {

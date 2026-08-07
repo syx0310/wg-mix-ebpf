@@ -277,6 +277,53 @@ func TestEventRuntimeCloseInterruptsRunThenClosesController(t *testing.T) {
 	}
 }
 
+func TestEventRuntimeCallbackRequestsStopThenOwnerCloses(t *testing.T) {
+	reader := &fakeEventReader{records: []EventRecord{{RawSample: []byte{1}}}}
+	controller := &fakeEventController{}
+	var runtime *EventRuntime
+	controller.handleHook = func() {
+		if err := runtime.RequestStop(); err != nil {
+			t.Errorf("RequestStop error = %v", err)
+		}
+	}
+	runtime = newTestEventRuntime(t, reader, controller, EventRuntimeOptions{})
+	runDone := make(chan error, 1)
+	go func() { runDone <- runtime.Run(context.Background()) }()
+	select {
+	case err := <-runDone:
+		if err != nil {
+			t.Fatalf("Run error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("callback stop request deadlocked Run")
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if reader.closeCalls != 1 || controller.closeCalls != 1 {
+		t.Fatalf("close calls reader=%d controller=%d", reader.closeCalls, controller.closeCalls)
+	}
+}
+
+func TestEventRuntimeRequestStopAndCloseShareReaderClose(t *testing.T) {
+	readerErr := errors.New("reader close failure")
+	reader := &fakeEventReader{closeErr: readerErr}
+	controller := &fakeEventController{}
+	runtime := newTestEventRuntime(t, reader, controller, EventRuntimeOptions{})
+	if err := runtime.RequestStop(); !errors.Is(err, readerErr) {
+		t.Fatalf("RequestStop error = %v", err)
+	}
+	if err := runtime.Run(context.Background()); err != nil {
+		t.Fatalf("Run after RequestStop error = %v", err)
+	}
+	if err := runtime.Close(); !errors.Is(err, readerErr) {
+		t.Fatalf("Close error = %v", err)
+	}
+	if reader.closeCalls != 1 || controller.closeCalls != 1 {
+		t.Fatalf("close calls reader=%d controller=%d", reader.closeCalls, controller.closeCalls)
+	}
+}
+
 func TestEventRuntimeConcurrentCloseIsOnceOnlyAndRetainsErrors(t *testing.T) {
 	readerErr := errors.New("reader close failure")
 	controllerErr := errors.New("controller close failure")
