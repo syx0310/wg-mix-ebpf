@@ -5,6 +5,7 @@ package dataplane
 import (
 	"errors"
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -55,7 +56,10 @@ type fakeTCPXDPLink interface {
 }
 
 type fakeTCPXDPRuntime struct {
-	probe  func(int) (fakeTCPXDPProbe, error)
+	probe func(int) (fakeTCPXDPProbe, error)
+	// attach must return the owning link whenever mutation succeeded. A nil
+	// link or an error must mean no attachment was created; this mirrors
+	// link.AttachXDP's atomic ownership contract.
 	attach func(fakeTCPXDPAttachRequest, experimentalProgramResource) (fakeTCPXDPLink, error)
 }
 
@@ -170,6 +174,7 @@ type fakeTCPXDPStage struct {
 	mu          sync.Mutex
 	attachments []fakeTCPXDPAttachment
 	closed      bool
+	closeErr    error
 }
 
 func stageFakeTCPXDPAttachments(
@@ -197,7 +202,7 @@ func stageFakeTCPXDPAttachments(
 	ordered := append([]fakeTCPXDPAttachRequest(nil), requests...)
 	sort.Slice(ordered, func(i, j int) bool { return ordered[i].IfIndex < ordered[j].IfIndex })
 	for index, request := range ordered {
-		if request.IfIndex <= 0 {
+		if request.IfIndex <= 0 || uint64(request.IfIndex) > math.MaxUint32 {
 			return nil, fmt.Errorf("stage FakeTCP XDP: invalid ifindex %d", request.IfIndex)
 		}
 		if index > 0 && ordered[index-1].IfIndex == request.IfIndex {
@@ -210,14 +215,19 @@ func stageFakeTCPXDPAttachments(
 	}
 
 	stage := &fakeTCPXDPStage{}
+	// Complete every read-only ownership/capability probe before the first
+	// attach. One invalid later interface must not cause a transient partial
+	// deployment on an earlier interface.
 	for _, request := range ordered {
 		probe, err := runtime.probe(request.IfIndex)
 		if err != nil {
-			return stageOrNil(stage), fmt.Errorf("stage FakeTCP XDP probe ifindex %d: %w", request.IfIndex, err)
+			return nil, fmt.Errorf("stage FakeTCP XDP probe ifindex %d: %w", request.IfIndex, err)
 		}
 		if err := validateFakeTCPXDPProbe(request, probe); err != nil {
-			return stageOrNil(stage), err
+			return nil, err
 		}
+	}
+	for _, request := range ordered {
 		ownedLink, err := runtime.attach(request, program)
 		if err != nil {
 			return stageOrNil(stage), fmt.Errorf(
@@ -281,9 +291,9 @@ func stageOrNil(stage *fakeTCPXDPStage) *fakeTCPXDPStage {
 	return stage
 }
 
-// Close rolls back or retires only links returned by this exact stage. Failed
-// closes remain owned and retryable; successful closes are removed so a retry
-// cannot detach twice.
+// Close rolls back or retires only links returned by this exact stage. Every
+// link handle is closed exactly once. The joined result is retained so later
+// and concurrent callers observe the failure without risking a double detach.
 func (stage *fakeTCPXDPStage) Close() error {
 	if stage == nil {
 		return nil
@@ -291,10 +301,9 @@ func (stage *fakeTCPXDPStage) Close() error {
 	stage.mu.Lock()
 	defer stage.mu.Unlock()
 	if stage.closed {
-		return nil
+		return stage.closeErr
 	}
 	var errs []error
-	remaining := make([]fakeTCPXDPAttachment, 0, len(stage.attachments))
 	for index := len(stage.attachments) - 1; index >= 0; index-- {
 		attachment := stage.attachments[index]
 		if err := attachment.link.Close(); err != nil {
@@ -302,15 +311,10 @@ func (stage *fakeTCPXDPStage) Close() error {
 				"close owned FakeTCP XDP link ifindex %d mode %s program %d: %w",
 				attachment.request.IfIndex, attachment.request.Mode, attachment.programID, err,
 			))
-			remaining = append(remaining, attachment)
 		}
 	}
-	for left, right := 0, len(remaining)-1; left < right; left, right = left+1, right-1 {
-		remaining[left], remaining[right] = remaining[right], remaining[left]
-	}
-	stage.attachments = remaining
-	if len(remaining) == 0 {
-		stage.closed = true
-	}
-	return errors.Join(errs...)
+	stage.attachments = nil
+	stage.closeErr = errors.Join(errs...)
+	stage.closed = true
+	return stage.closeErr
 }

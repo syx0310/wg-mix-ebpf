@@ -132,6 +132,24 @@ func TestFakeTCPXDPStageRefusesUnownedReplacementBeforeAttach(t *testing.T) {
 	}
 }
 
+func TestFakeTCPXDPStageCompletesAllProbesBeforeFirstAttach(t *testing.T) {
+	runtime := newMemoryFakeTCPXDPRuntime()
+	runtime.probes[11] = fakeTCPXDPProbe{IfIndex: 11, Attached: true, ProgramID: 7001}
+	stage, err := stageFakeTCPXDPAttachments(
+		[]fakeTCPXDPAttachRequest{
+			{IfIndex: 7, Mode: fakeTCPXDPAttachNative},
+			{IfIndex: 11, Mode: fakeTCPXDPAttachGeneric},
+		},
+		&fakeExperimentalOwnedProgram{id: 8001}, runtime.backend(),
+	)
+	if stage != nil || err == nil || !strings.Contains(err.Error(), "replacement is refused") {
+		t.Fatalf("stage=%#v error=%v", stage, err)
+	}
+	if !slices.Equal(runtime.probeCalls, []int{7, 11}) || len(runtime.attachCalls) != 0 {
+		t.Fatalf("probes=%v attaches=%v", runtime.probeCalls, runtime.attachCalls)
+	}
+}
+
 func TestFakeTCPXDPStageRequiresProvenLibXDPChaining(t *testing.T) {
 	for _, test := range []struct {
 		name      string
@@ -189,12 +207,12 @@ func TestFakeTCPXDPStageReturnsOwnedPrefixOnLaterFailure(t *testing.T) {
 	}
 }
 
-func TestFakeTCPXDPStageKeepsFailedCloseRetryableWithoutDoubleClose(t *testing.T) {
+func TestFakeTCPXDPStageRetainsCloseErrorWithoutDoubleClose(t *testing.T) {
 	runtime := newMemoryFakeTCPXDPRuntime()
 	var closeLog []int
 	wantErr := errors.New("injected XDP close failure")
 	runtime.links[7] = &fakeOwnedXDPLink{
-		ifindex: 7, programID: 8001, closeErrs: []error{wantErr, nil}, closeLog: &closeLog,
+		ifindex: 7, programID: 8001, closeErrs: []error{wantErr}, closeLog: &closeLog,
 	}
 	runtime.links[11] = &fakeOwnedXDPLink{ifindex: 11, programID: 8001, closeLog: &closeLog}
 	stage, err := stageFakeTCPXDPAttachments(
@@ -213,11 +231,13 @@ func TestFakeTCPXDPStageKeepsFailedCloseRetryableWithoutDoubleClose(t *testing.T
 	if !slices.Equal(closeLog, []int{11, 7}) {
 		t.Fatalf("first reverse close order = %v", closeLog)
 	}
-	if err := stage.Close(); err != nil {
-		t.Fatalf("retry close: %v", err)
+	if err := stage.Close(); !errors.Is(err, wantErr) {
+		t.Fatalf("retained close error: %v", err)
 	}
-	if !slices.Equal(closeLog, []int{11, 7, 7}) || runtime.links[11].closes != 1 {
-		t.Fatalf("retry close log=%v link11 closes=%d", closeLog, runtime.links[11].closes)
+	if !slices.Equal(closeLog, []int{11, 7}) || runtime.links[7].closes != 1 ||
+		runtime.links[11].closes != 1 {
+		t.Fatalf("retained close log=%v link7=%d link11=%d",
+			closeLog, runtime.links[7].closes, runtime.links[11].closes)
 	}
 }
 
