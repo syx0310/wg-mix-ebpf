@@ -192,7 +192,9 @@ func (v IngressListenerValue) MapGeneration() uint64 { return v.Generation }
 
 // FakeTCPSessionKey is local-endpoint oriented in both directions: egress
 // fills Local from the IPv4 source, while XDP ingress fills Local from the
-// destination. This gives the daemon and both BPF hooks one stable flow key.
+// destination. IPv4 fields are raw __be32 bytes represented as native Go
+// uint32 values; callers must use faketcp.RawIPv4BE32 rather than numeric
+// big-endian parsing. This gives the daemon and both BPF hooks one stable key.
 type FakeTCPSessionKey struct {
 	Generation    uint64
 	LocalIPv4     uint32

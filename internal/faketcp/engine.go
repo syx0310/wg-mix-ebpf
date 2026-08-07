@@ -105,6 +105,13 @@ type Engine struct {
 	pendingBytes int
 }
 
+type engineCheckpoint struct {
+	existed      bool
+	session      *session
+	pendingFlows int
+	pendingBytes int
+}
+
 func New(options Options) (*Engine, error) {
 	if options.Generation == 0 {
 		return nil, errors.New("faketcp generation must be non-zero")
@@ -140,10 +147,12 @@ func (e *Engine) Outbound(flow abi.FakeTCPSessionKey, packet []byte) ([]Action, 
 	}
 	now := e.opts.Now()
 	s := e.sessions[flow]
+	checkpoint := e.checkpoint(s)
 	if s != nil && s.state == abi.FakeTCPStateEstablished {
 		s.lastActivity = now
 		s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
 		if err := e.sync(flow, s); err != nil {
+			e.restore(flow, checkpoint)
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
 		}
 		return []Action{{Kind: ActionForward, Flow: flow}}, nil
@@ -167,6 +176,7 @@ func (e *Engine) Outbound(flow abi.FakeTCPSessionKey, packet []byte) ([]Action, 
 	}
 	queued := e.enqueue(s, packet)
 	if err := e.sync(flow, s); err != nil {
+		e.restore(flow, checkpoint)
 		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
 	}
 	actions := make([]Action, 0, 2)
@@ -187,12 +197,16 @@ func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, err
 	}
 	now := e.opts.Now()
 	s := e.sessions[flow]
+	checkpoint := e.checkpoint(s)
 	if seg.Flags&(FlagRST|FlagFIN) != 0 {
 		if s == nil {
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-close"}}, nil
 		}
+		if err := e.deleteStore(flow); err != nil {
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+		}
 		e.remove(flow, s)
-		return []Action{{Kind: ActionClose, Flow: flow, Reason: "peer-close"}}, e.deleteStore(flow)
+		return []Action{{Kind: ActionClose, Flow: flow, Reason: "peer-close"}}, nil
 	}
 	if s == nil {
 		if seg.Flags != FlagSYN {
@@ -216,6 +230,7 @@ func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, err
 		}
 		e.sessions[flow] = s
 		if err := e.sync(flow, s); err != nil {
+			e.restore(flow, checkpoint)
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
 		}
 		return []Action{e.control(flow, s, FlagSYN|FlagACK, s.localISN, s.rxSequence, "accept-syn")}, nil
@@ -265,7 +280,8 @@ func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, err
 		actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "invalid-state"})
 	}
 	if err := e.sync(flow, s); err != nil {
-		return append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}), err
+		e.restore(flow, checkpoint)
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
 	}
 	return actions, nil
 }
@@ -283,30 +299,50 @@ func (e *Engine) Tick() ([]Action, error) {
 				continue
 			}
 			if s.retries >= e.opts.HandshakeRetries {
+				if err := e.deleteStore(flow); err != nil {
+					errs = append(errs, err)
+					actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"})
+					continue
+				}
 				e.remove(flow, s)
 				actions = append(actions, Action{Kind: ActionClose, Flow: flow, Reason: "handshake-timeout"})
-				errs = append(errs, e.deleteStore(flow))
 				continue
 			}
+			checkpoint := e.checkpoint(s)
 			s.retries++
 			s.nextRetry = now.Add(e.opts.HandshakeTimeout)
 			flags, ack := uint8(FlagSYN), uint32(0)
 			if s.state == abi.FakeTCPStateSynReceived {
 				flags, ack = FlagSYN|FlagACK, s.rxSequence
 			}
+			if err := e.sync(flow, s); err != nil {
+				e.restore(flow, checkpoint)
+				errs = append(errs, err)
+				actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"})
+				continue
+			}
 			actions = append(actions, e.control(flow, s, flags, s.localISN, ack, "handshake-retry"))
-			errs = append(errs, e.sync(flow, s))
 		case abi.FakeTCPStateEstablished:
 			if now.Sub(s.lastActivity) >= e.opts.IdleTimeout {
+				if err := e.deleteStore(flow); err != nil {
+					errs = append(errs, err)
+					actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"})
+					continue
+				}
 				e.remove(flow, s)
 				actions = append(actions, Action{Kind: ActionClose, Flow: flow, Reason: "idle-timeout"})
-				errs = append(errs, e.deleteStore(flow))
 				continue
 			}
 			if !now.Before(s.nextKeepalive) {
-				actions = append(actions, e.control(flow, s, FlagACK, s.txSequence-1, s.rxSequence, "keepalive"))
+				checkpoint := e.checkpoint(s)
 				s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
-				errs = append(errs, e.sync(flow, s))
+				if err := e.sync(flow, s); err != nil {
+					e.restore(flow, checkpoint)
+					errs = append(errs, err)
+					actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"})
+					continue
+				}
+				actions = append(actions, e.control(flow, s, FlagACK, s.txSequence-1, s.rxSequence, "keepalive"))
 			}
 		}
 	}
@@ -326,11 +362,16 @@ func (e *Engine) AdvanceGeneration(generation uint64) ([]Action, error) {
 	actions := make([]Action, 0, len(e.sessions))
 	var errs []error
 	for flow, s := range e.sessions {
+		if err := e.deleteStore(flow); err != nil {
+			errs = append(errs, err)
+			continue
+		}
 		e.remove(flow, s)
 		actions = append(actions, Action{Kind: ActionClose, Flow: flow, Reason: "generation-drain-rehandshake"})
-		errs = append(errs, e.deleteStore(flow))
 	}
-	e.opts.Generation = generation
+	if len(e.sessions) == 0 {
+		e.opts.Generation = generation
+	}
 	return actions, errors.Join(errs...)
 }
 
@@ -357,6 +398,30 @@ func (e *Engine) validateFlow(flow abi.FakeTCPSessionKey) error {
 		return errors.New("faketcp flow must use the active generation and non-zero IPv4/port/underlay fields")
 	}
 	return nil
+}
+
+func (e *Engine) checkpoint(s *session) engineCheckpoint {
+	checkpoint := engineCheckpoint{
+		existed:      s != nil,
+		pendingFlows: e.pendingFlows,
+		pendingBytes: e.pendingBytes,
+	}
+	if s != nil {
+		copySession := *s
+		copySession.pending = append([][]byte(nil), s.pending...)
+		checkpoint.session = &copySession
+	}
+	return checkpoint
+}
+
+func (e *Engine) restore(flow abi.FakeTCPSessionKey, checkpoint engineCheckpoint) {
+	e.pendingFlows = checkpoint.pendingFlows
+	e.pendingBytes = checkpoint.pendingBytes
+	if !checkpoint.existed {
+		delete(e.sessions, flow)
+		return
+	}
+	e.sessions[flow] = checkpoint.session
 }
 
 func (e *Engine) enqueue(s *session, packet []byte) bool {
@@ -411,8 +476,11 @@ func (e *Engine) sync(flow abi.FakeTCPSessionKey, s *session) error {
 		return nil
 	}
 	return e.opts.Store.Upsert(flow, abi.FakeTCPSessionValue{
-		Generation:    flow.Generation,
-		LastSeenNanos: uint64(s.lastActivity.UnixNano()),
+		Generation: flow.Generation,
+		// BPF uses monotonic bpf_ktime_get_ns(). Userspace cannot safely
+		// synthesize that clock domain, so zero means "not yet observed by
+		// the fast path" and the first packet replaces it.
+		LastSeenNanos: 0,
 		TXSequence:    s.txSequence,
 		RXSequence:    s.rxSequence,
 		LocalISN:      s.localISN,

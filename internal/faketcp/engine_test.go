@@ -1,6 +1,9 @@
 package faketcp
 
 import (
+	"encoding/binary"
+	"errors"
+	"net/netip"
 	"testing"
 	"time"
 
@@ -13,12 +16,29 @@ func (c *fakeClock) Now() time.Time      { return c.now }
 func (c *fakeClock) Add(d time.Duration) { c.now = c.now.Add(d) }
 
 func testFlow(port uint16) abi.FakeTCPSessionKey {
-	// IPv4 fields use network byte order, matching the BPF map contract.
+	local, err := RawIPv4BE32(netip.MustParseAddr("10.0.0.1"))
+	if err != nil {
+		panic(err)
+	}
+	remote, err := RawIPv4BE32(netip.MustParseAddr("10.0.0.2"))
+	if err != nil {
+		panic(err)
+	}
 	return abi.FakeTCPSessionKey{
-		Generation: 1, LocalIPv4: 0x0a000001, RemoteIPv4: 0x0a000002,
+		Generation: 1, LocalIPv4: local, RemoteIPv4: remote,
 		UnderlayIndex: 2, LocalPort: port, RemotePort: 443,
 	}
 }
+
+type failingStore struct {
+	upsertErr error
+	deleteErr error
+}
+
+func (s failingStore) Upsert(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) error {
+	return s.upsertErr
+}
+func (s failingStore) Delete(abi.FakeTCPSessionKey) error { return s.deleteErr }
 
 func testEngine(t *testing.T, mutate func(*Options)) (*Engine, *fakeClock) {
 	t.Helper()
@@ -189,5 +209,31 @@ func TestGenerationAdvanceIsExplicitDrain(t *testing.T) {
 	flow.Generation = 2
 	if _, err := engine.Outbound(flow, []byte{2}); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestStoreFailureRollsBackNewSessionAndPendingPayload(t *testing.T) {
+	engine, _ := testEngine(t, func(o *Options) {
+		o.Store = failingStore{upsertErr: errors.New("map unavailable")}
+	})
+	flow := testFlow(31001)
+	actions, err := engine.Outbound(flow, []byte{1, 2, 3, 4})
+	if err == nil || len(actions) != 1 || actions[0].Reason != "session-store-unavailable" {
+		t.Fatalf("actions=%#v err=%v", actions, err)
+	}
+	if _, ok := engine.Snapshot(flow); ok {
+		t.Fatal("failed map update left an in-memory session or queued payload")
+	}
+}
+
+func TestRawIPv4BE32MatchesBPFMemoryLayout(t *testing.T) {
+	raw, err := RawIPv4BE32(netip.MustParseAddr("10.0.0.1"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bytes [4]byte
+	binary.NativeEndian.PutUint32(bytes[:], raw)
+	if bytes != [4]byte{10, 0, 0, 1} {
+		t.Fatalf("raw __be32 memory = %v", bytes)
 	}
 }
