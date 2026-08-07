@@ -29,8 +29,15 @@ func TestClassifyManagedIngressFrameFailClosedMatrix(t *testing.T) {
 		{name: "IPv6 non-initial fragment", frame: testIPv6FragmentTCPFrame(0, 8, 444), want: IngressDrop},
 		{name: "native IPv4 UDP bypass", frame: testIPv4UDPFrame(0, 0, 443), want: IngressDrop},
 		{name: "native IPv6 UDP bypass", frame: testIPv6TransportFrame(0, 17, 443), want: IngressDrop},
+		{name: "IPv4 AH is ambiguous", frame: testIPv4ProtocolFrame(51), want: IngressDrop},
+		{name: "IPv4 ESP is ambiguous", frame: testIPv4ProtocolFrame(50), want: IngressDrop},
+		{name: "IPv4 IP-in-IP is ambiguous", frame: testIPv4ProtocolFrame(4), want: IngressDrop},
+		{name: "IPv4 IPv6 encapsulation is ambiguous", frame: testIPv4ProtocolFrame(41), want: IngressDrop},
+		{name: "IPv4 unknown protocol", frame: testIPv4ProtocolFrame(253), want: IngressDrop},
 		{name: "IPv6 AH is ambiguous", frame: testIPv6TCPFrame(0, []byte{51}, 444), want: IngressDrop},
 		{name: "IPv6 ESP is ambiguous", frame: testIPv6TCPFrame(0, []byte{50}, 444), want: IngressDrop},
+		{name: "IPv6 IP-in-IP is ambiguous", frame: testIPv6TransportFrame(0, 4, 444), want: IngressDrop},
+		{name: "IPv6 nested IPv6 is ambiguous", frame: testIPv6TransportFrame(0, 41, 444), want: IngressDrop},
 		{name: "IPv6 unknown next header", frame: testIPv6TransportFrame(0, 253, 444), want: IngressDrop},
 		{name: "IPv6 extension depth overflow", frame: testIPv6TCPFrame(0, []byte{0, 0, 0, 0, 0}, 444), want: IngressDrop},
 		{name: "IPv6 truncated extension", frame: testIPv6TCPFrame(0, []byte{0}, 444)[:55], want: IngressDrop},
@@ -42,6 +49,8 @@ func TestClassifyManagedIngressFrameFailClosedMatrix(t *testing.T) {
 		{name: "unmanaged IPv6 UDP port", frame: testIPv6TransportFrame(0, 17, 444), want: IngressPass},
 		{name: "triple VLAN is ambiguous", frame: testIPv4TCPFrame(3, 5, 5, 0, 444), want: IngressDrop},
 		{name: "truncated managed interface", frame: []byte{0, 1, 2}, want: IngressDrop},
+		{name: "truncated IPv4", frame: append(testEthernetPrefix(0, 0x0800), make([]byte, 10)...), want: IngressDrop},
+		{name: "truncated IPv6", frame: append(testEthernetPrefix(0, 0x86dd), make([]byte, 20)...), want: IngressDrop},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -58,11 +67,19 @@ func TestClassifyManagedIngressFrameDoesNotFailClosedUnmanagedInterface(t *testi
 		{0, 1, 2},
 		testIPv4TCPFrame(0, 5, 5, 1, 444),
 		testIPv6FragmentTCPFrame(0, 8, 444),
+		testIPv4ProtocolFrame(4),
+		testIPv6TransportFrame(0, 41, 444),
 	} {
 		if got := ClassifyManagedIngressFrame(frame, policy); got != IngressPass {
 			t.Fatalf("unmanaged interface disposition = %d, want pass", got)
 		}
 	}
+}
+
+func testIPv4ProtocolFrame(protocol byte) []byte {
+	frame := testIPv4TCPFrame(0, 5, 5, 0, 444)
+	frame[14+9] = protocol
+	return frame
 }
 
 func testEthernetPrefix(vlanDepth int, etherType uint16) []byte {

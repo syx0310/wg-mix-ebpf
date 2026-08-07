@@ -72,7 +72,12 @@ func ClassifyManagedIngressFrame(frame []byte, policy ManagedIngressPolicy) Ingr
 		}
 		protocol := frame[offset+9]
 		if protocol != protocolTCP && protocol != protocolUDP {
-			return IngressPass
+			if protocol == 1 { // ICMP has no transport port to bypass.
+				return IngressPass
+			}
+			// AH, ESP, IP-in-IP, IPv6 encapsulation and unknown protocols
+			// cannot prove the absence of a managed inner destination.
+			return failClosed()
 		}
 		fragmentOffset := binary.BigEndian.Uint16(frame[offset+6 : offset+8])
 		if fragmentOffset&0x1fff != 0 {

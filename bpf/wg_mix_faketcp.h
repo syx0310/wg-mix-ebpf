@@ -706,8 +706,14 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	iph = data + off;
 	if ((void *)(iph + 1) > data_end || iph->version != 4 || iph->ihl < 5)
 		return managed_interface ? XDP_DROP : XDP_PASS;
-	if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP)
-		return XDP_PASS;
+	if (iph->protocol != IPPROTO_TCP && iph->protocol != IPPROTO_UDP) {
+		if (iph->protocol == IPPROTO_ICMP)
+			return XDP_PASS;
+		// AH, ESP, IP-in-IP, IPv6 encapsulation and unknown protocols can
+		// carry a managed inner destination that this bounded parser cannot
+		// classify. Match the IPv6 policy and fail closed on managed links.
+		return managed_interface ? XDP_DROP : XDP_PASS;
+	}
 	fragment_offset = bpf_ntohs(iph->frag_off);
 	if (fragment_offset & IP_OFFSET)
 		return managed_interface ? XDP_DROP : XDP_PASS;

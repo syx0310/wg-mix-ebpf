@@ -226,6 +226,9 @@ func BuildState(ctx context.Context, cfg *config.Config, rt runtime.Provider, re
 		}
 		state.WireGuards = append(state.WireGuards, *wgState)
 	}
+	if err := validateFakeTCPUnderlayParsers(state); err != nil {
+		return nil, err
+	}
 	if !opts.Offline {
 		state.buildRules(cfg)
 		if err := state.validateRuleUniqueness(); err != nil {
@@ -233,6 +236,31 @@ func BuildState(ctx context.Context, cfg *config.Config, rt runtime.Provider, re
 		}
 	}
 	return state, nil
+}
+
+func validateFakeTCPUnderlayParsers(state *State) error {
+	hasFakeTCP := false
+	for _, wg := range state.WireGuards {
+		if wg.TransportMode == "faketcp" {
+			hasFakeTCP = true
+			break
+		}
+	}
+	if !hasFakeTCP {
+		return nil
+	}
+	for _, candidate := range state.Underlays {
+		if candidate.Role == "parse_only" || candidate.Role == "disabled" {
+			continue
+		}
+		if candidate.Parser == "l3" {
+			return fmt.Errorf("faketcp cannot attach to underlay %q with parser:l3; only the ethernet parser is implemented", candidate.Name)
+		}
+		if candidate.Resolved && candidate.Parser != "ethernet" {
+			return fmt.Errorf("faketcp cannot attach to resolved underlay %q with parser %q; only the ethernet parser is implemented", candidate.Name, candidate.Parser)
+		}
+	}
+	return nil
 }
 
 func buildUnderlayStates(ctx context.Context, cfg *config.Config, resolver underlay.Resolver, opts BuildOptions) ([]UnderlayState, error) {

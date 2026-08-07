@@ -495,6 +495,48 @@ profiles:
 	}
 }
 
+func TestBuildStateRejectsFakeTCPOnL3ParserBeforeAttachment(t *testing.T) {
+	cfg, err := config.Load([]byte(`
+version: 1
+underlays:
+  - name: pppoe-wan
+    type: netdev
+    parser: l3
+wireguards:
+  - name: wg0
+    config: /tmp/wg0.conf
+    profile: mix-default
+    transport:
+      mode: faketcp
+      faketcp:
+        experimental: true
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mark := uint32(0x10000002)
+	_, err = BuildState(
+		context.Background(),
+		cfg,
+		runtime.StaticProvider{Devices: map[string]*runtime.Device{
+			"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: mark, Up: true},
+		}},
+		underlay.StaticResolver{Underlays: map[string]*underlay.Resolved{
+			"pppoe-wan": {IfName: "pppoe-wan", IfIndex: 7, LinkType: "device", Role: "transform"},
+		}},
+		func(string) (*wgconfig.Interface, error) {
+			return &wgconfig.Interface{FwMark: &mark}, nil
+		},
+		BuildOptions{},
+	)
+	if err == nil || !strings.Contains(err.Error(), "parser:l3") {
+		t.Fatalf("FakeTCP parser:l3 error = %v", err)
+	}
+}
+
 func TestBuildStateRuntimeFwMarkMismatch(t *testing.T) {
 	cfg := testConfig(t)
 	configMark := uint32(0x10000002)
