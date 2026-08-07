@@ -396,7 +396,7 @@ func TestGenerationFencedSessionStoreCloseWaitsForAdmittedOperation(t *testing.T
 	}
 }
 
-func TestExperimentalFakeTCPRuntimeConcurrentCloseIsOnceOnly(t *testing.T) {
+func TestExperimentalFakeTCPRuntimeCopiesShareExactlyOnceClose(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
 	wantErr := errors.New("injected session close failure")
 	fixture.sessionStore.closeErr = wantErr
@@ -404,16 +404,21 @@ func TestExperimentalFakeTCPRuntimeConcurrentCloseIsOnceOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	runtimeCopy := *runtime
 	const callers = 24
 	start := make(chan struct{})
 	errs := make(chan error, callers)
 	var wait sync.WaitGroup
-	for range callers {
+	for index := range callers {
+		target := runtime
+		if index%2 != 0 {
+			target = &runtimeCopy
+		}
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
 			<-start
-			errs <- runtime.Close()
+			errs <- target.Close()
 		}()
 	}
 	close(start)
@@ -424,6 +429,17 @@ func TestExperimentalFakeTCPRuntimeConcurrentCloseIsOnceOnly(t *testing.T) {
 			t.Fatalf("concurrent close error = %v", err)
 		}
 	}
+	for name, target := range map[string]*ExperimentalFakeTCPRuntime{
+		"original": runtime,
+		"copy":     &runtimeCopy,
+	} {
+		if err := target.Close(); !errors.Is(err, wantErr) {
+			t.Fatalf("sequential close through %s error = %v", name, err)
+		}
+		if _, err := target.Handles(); !errors.Is(err, ErrExperimentalFakeTCPRuntimeClosed) {
+			t.Fatalf("handles through closed %s error = %v", name, err)
+		}
+	}
 	if fixture.sessionStore.closes != 1 {
 		t.Fatalf("session close count = %d", fixture.sessionStore.closes)
 	}
@@ -431,6 +447,84 @@ func TestExperimentalFakeTCPRuntimeConcurrentCloseIsOnceOnly(t *testing.T) {
 		if resource.closes != 1 {
 			t.Fatalf("map %s close count = %d", name, resource.closes)
 		}
+	}
+}
+
+func TestExperimentalFakeTCPRuntimeZeroValueIsClosed(t *testing.T) {
+	var runtime ExperimentalFakeTCPRuntime
+	if runtime.Generation() != 0 {
+		t.Fatalf("zero runtime generation = %d", runtime.Generation())
+	}
+	handles, err := runtime.Handles()
+	if !errors.Is(err, ErrExperimentalFakeTCPRuntimeClosed) ||
+		handles.Generation() != 0 || handles.SessionStore() != nil {
+		t.Fatalf("zero runtime handles=%#v error=%v", handles, err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("zero runtime close: %v", err)
+	}
+	runtimeCopy := runtime
+	if err := runtimeCopy.Close(); err != nil {
+		t.Fatalf("zero runtime copy close: %v", err)
+	}
+}
+
+func TestExperimentalFakeTCPRuntimeCopySharesHandlesCloseFence(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	fixture.sessionStore.entered = make(chan struct{}, 1)
+	fixture.sessionStore.release = make(chan struct{})
+	runtime, handles, err := fixture.build(t, 91)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtimeCopy := *runtime
+	operationDone := make(chan error, 1)
+	go func() {
+		_, _, err := handles.SessionStore().LookupEstablished(sessionStoreTestKey(91))
+		operationDone <- err
+	}()
+	select {
+	case <-fixture.sessionStore.entered:
+	case <-time.After(time.Second):
+		t.Fatal("session operation did not enter backend")
+	}
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- runtimeCopy.Close() }()
+	deadline := time.After(time.Second)
+	for {
+		_, err := runtime.Handles()
+		if errors.Is(err, ErrExperimentalFakeTCPRuntimeClosed) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("unexpected handles fence error: %v", err)
+		}
+		select {
+		case <-deadline:
+			t.Fatal("runtime close did not fence handles")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if _, err := runtimeCopy.Handles(); !errors.Is(err, ErrExperimentalFakeTCPRuntimeClosed) {
+		t.Fatalf("copied runtime handles during close error = %v", err)
+	}
+	select {
+	case err := <-closeDone:
+		t.Fatalf("close returned before admitted operation: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(fixture.sessionStore.release)
+	if err := <-operationDone; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := handles.SessionStore().LookupEstablished(
+		sessionStoreTestKey(91),
+	); !errors.Is(err, ErrExperimentalFakeTCPRuntimeClosed) {
+		t.Fatalf("retained handles after copied close error = %v", err)
 	}
 }
 
@@ -744,15 +838,17 @@ func TestExperimentalFakeTCPRuntimeCommitBoundaryIgnoresLaterCancellation(t *tes
 			build.programStage.state, build.policyStage.state)
 	}
 	runtime := &ExperimentalFakeTCPRuntime{
-		generation: snapshot.Generation,
-		collection: fixture.collection,
-		xdp:        build.xdpStage,
-		handles: ExperimentalFakeTCPRuntimeHandles{
+		state: &experimentalFakeTCPRuntimeState{
 			generation: snapshot.Generation,
-			sessions:   build.sessions,
-			events:     build.events,
+			collection: fixture.collection,
+			xdp:        build.xdpStage,
+			handles: ExperimentalFakeTCPRuntimeHandles{
+				generation: snapshot.Generation,
+				sessions:   build.sessions,
+				events:     build.events,
+			},
+			closeDone: make(chan struct{}),
 		},
-		closeDone: make(chan struct{}),
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)

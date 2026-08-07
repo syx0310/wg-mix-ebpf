@@ -326,8 +326,14 @@ func (handles ExperimentalFakeTCPRuntimeHandles) WithEventsMap(
 }
 
 // ExperimentalFakeTCPRuntime owns one complete unpinned collection, its XDP
-// links, and the userspace session-map clone. It must not be copied.
+// links, and the userspace session-map clone. Runtime values may be copied:
+// every copy shares one close state and the same exactly-once resource owner.
+// The zero value is closed.
 type ExperimentalFakeTCPRuntime struct {
+	state *experimentalFakeTCPRuntimeState
+}
+
+type experimentalFakeTCPRuntimeState struct {
 	mu sync.Mutex
 
 	generation uint64
@@ -391,15 +397,17 @@ func buildExperimentalFakeTCPRuntime(
 		return nil, build.fail(err)
 	}
 	return &ExperimentalFakeTCPRuntime{
-		generation: options.snapshot.Generation,
-		collection: options.collection,
-		xdp:        build.xdpStage,
-		handles: ExperimentalFakeTCPRuntimeHandles{
+		state: &experimentalFakeTCPRuntimeState{
 			generation: options.snapshot.Generation,
-			sessions:   build.sessions,
-			events:     build.events,
+			collection: options.collection,
+			xdp:        build.xdpStage,
+			handles: ExperimentalFakeTCPRuntimeHandles{
+				generation: options.snapshot.Generation,
+				sessions:   build.sessions,
+				events:     build.events,
+			},
+			closeDone: make(chan struct{}),
 		},
-		closeDone: make(chan struct{}),
 	}, nil
 }
 
@@ -677,49 +685,54 @@ func validateFakeTCPXDPRequests(
 }
 
 func (runtime *ExperimentalFakeTCPRuntime) Handles() (ExperimentalFakeTCPRuntimeHandles, error) {
-	if runtime == nil {
+	if runtime == nil || runtime.state == nil {
 		return ExperimentalFakeTCPRuntimeHandles{}, ErrExperimentalFakeTCPRuntimeClosed
 	}
-	runtime.mu.Lock()
-	defer runtime.mu.Unlock()
-	if runtime.closing || runtime.closed {
+	state := runtime.state
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closing || state.closed {
 		return ExperimentalFakeTCPRuntimeHandles{}, ErrExperimentalFakeTCPRuntimeClosed
 	}
-	return runtime.handles, nil
+	return state.handles, nil
 }
 
 func (runtime *ExperimentalFakeTCPRuntime) Generation() uint64 {
-	if runtime == nil {
+	if runtime == nil || runtime.state == nil {
 		return 0
 	}
-	return runtime.generation
+	return runtime.state.generation
 }
 
 func (runtime *ExperimentalFakeTCPRuntime) Close() error {
-	if runtime == nil {
+	if runtime == nil || runtime.state == nil {
 		return nil
 	}
-	runtime.mu.Lock()
-	if runtime.closed {
-		err := runtime.closeErr
-		runtime.mu.Unlock()
+	state := runtime.state
+	state.mu.Lock()
+	if state.closed {
+		err := state.closeErr
+		state.mu.Unlock()
 		return err
 	}
-	if runtime.closing {
-		done := runtime.closeDone
-		runtime.mu.Unlock()
+	if state.closing {
+		done := state.closeDone
+		state.mu.Unlock()
 		<-done
-		runtime.mu.Lock()
-		err := runtime.closeErr
-		runtime.mu.Unlock()
+		state.mu.Lock()
+		err := state.closeErr
+		state.mu.Unlock()
 		return err
 	}
-	runtime.closing = true
-	sessions := runtime.handles.sessions
-	events := runtime.handles.events
-	xdp := runtime.xdp
-	collection := runtime.collection
-	runtime.mu.Unlock()
+	if state.closeDone == nil {
+		state.closeDone = make(chan struct{})
+	}
+	state.closing = true
+	sessions := state.handles.sessions
+	events := state.handles.events
+	xdp := state.xdp
+	collection := state.collection
+	state.mu.Unlock()
 
 	err := errors.Join(
 		wrapExperimentalRuntimeClose("session handle", sessions),
@@ -728,15 +741,15 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 		wrapExperimentalRuntimeClose("collection", collection),
 	)
 
-	runtime.mu.Lock()
-	runtime.closeErr = err
-	runtime.closed = true
-	runtime.closing = false
-	runtime.handles = ExperimentalFakeTCPRuntimeHandles{}
-	runtime.xdp = nil
-	runtime.collection = nil
-	close(runtime.closeDone)
-	runtime.mu.Unlock()
+	state.mu.Lock()
+	state.closeErr = err
+	state.closed = true
+	state.closing = false
+	state.handles = ExperimentalFakeTCPRuntimeHandles{}
+	state.xdp = nil
+	state.collection = nil
+	close(state.closeDone)
+	state.mu.Unlock()
 	return err
 }
 
