@@ -407,7 +407,9 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	switch system {
 	case "systemd":
 		add(
-			"atomically quarantine the exact validated systemd enable link if present; retain its unique hidden quarantine name as audit evidence",
+			"atomically quarantine the exact validated systemd enable link if present; "+
+				"retain its unique hidden quarantine name as audit evidence up to the hard limit of %d",
+			maxRetainedSystemdEnableLinkQuarantineEvidence,
 		)
 		add("remove systemd unit %s", filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"))
 		add("reload systemd manager after removing the owned unit")
@@ -469,6 +471,22 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 		)
 		return plan, nil
 	}
+	reportedQuarantineEvidence := make(map[string]struct{})
+	addQuarantineEvidenceActions := func(evidencePaths []string) {
+		for _, evidencePath := range evidencePaths {
+			if _, reported := reportedQuarantineEvidence[evidencePath]; reported {
+				continue
+			}
+			reportedQuarantineEvidence[evidencePath] = struct{}{}
+			add(
+				"retained systemd enable-link quarantine evidence %s; no pathname-based unlink was attempted",
+				evidencePath,
+			)
+		}
+	}
+	addQuarantineEvidenceActions(
+		initialCleanup.retainedQuarantineEvidencePaths(),
+	)
 	if !opts.Yes && wireGuardAppearsRunning(ctx, paths.ConfigPath) {
 		return nil, errors.New("managed WireGuard runtime appears active; rerun uninstall with --yes to detach transform and continue")
 	}
@@ -646,12 +664,7 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 			retainedServiceArtifactEvidence,
 			cleanupPlan.retainedQuarantineEvidencePaths()...,
 		)
-		for _, evidencePath := range retainedServiceArtifactEvidence {
-			add(
-				"retained systemd enable-link quarantine evidence %s; no pathname-based unlink was attempted",
-				evidencePath,
-			)
-		}
+		addQuarantineEvidenceActions(retainedServiceArtifactEvidence)
 		if system == "systemd" {
 			if err := runSystemdManagerReloadAfterServiceArtifactRemoval(
 				ctx,

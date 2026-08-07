@@ -1328,6 +1328,8 @@ type cleanupDirectoryPlan struct {
 	retainedQuarantineEvidence []string
 }
 
+const maxRetainedSystemdEnableLinkQuarantineEvidence = 8
+
 func (directory *cleanupDirectoryPlan) close() error {
 	if directory == nil {
 		return nil
@@ -1370,7 +1372,124 @@ func (plan *uninstallCleanupPlan) retainedQuarantineEvidencePaths() []string {
 	for _, directory := range plan.directories {
 		paths = append(paths, directory.retainedQuarantineEvidence...)
 	}
+	sort.Strings(paths)
 	return paths
+}
+
+func inspectRetainedSystemdQuarantineEvidence(
+	dir *managedCleanupDir,
+) ([]string, error) {
+	if dir == nil || dir.dir == nil || dir.dir.file == nil {
+		return nil, errors.New(
+			"cannot inspect retained quarantine evidence without a held directory",
+		)
+	}
+	if err := revalidateManagedCleanupDirAllowFinalGenerationChange(dir); err != nil {
+		return nil, fmt.Errorf(
+			"revalidate held quarantine evidence directory before enumeration: %w",
+			err,
+		)
+	}
+	before, err := cleanupIdentityForFD(int(dir.dir.file.Fd()))
+	if err != nil {
+		return nil, fmt.Errorf(
+			"inspect held quarantine evidence directory before enumeration: %w",
+			err,
+		)
+	}
+	entries, err := cleanupReadDir(dir.dir)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"enumerate held quarantine evidence directory %s: %w",
+			dir.spec.path,
+			err,
+		)
+	}
+	after, err := cleanupIdentityForFD(int(dir.dir.file.Fd()))
+	if err != nil {
+		return nil, fmt.Errorf(
+			"inspect held quarantine evidence directory after enumeration: %w",
+			err,
+		)
+	}
+	if !before.sameDirectory(after) ||
+		!directoryGeneration(before).same(directoryGeneration(after)) {
+		return nil, fmt.Errorf(
+			"refuse unstable retained quarantine evidence enumeration in %s",
+			dir.spec.path,
+		)
+	}
+	if err := revalidateManagedCleanupDirAllowFinalGenerationChange(dir); err != nil {
+		return nil, fmt.Errorf(
+			"revalidate held quarantine evidence directory after enumeration: %w",
+			err,
+		)
+	}
+
+	paths := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), cleanupQuarantineNamePrefix) {
+			continue
+		}
+		paths = append(paths, filepath.Join(dir.dir.path, entry.Name()))
+	}
+	sort.Strings(paths)
+	return paths, nil
+}
+
+func revalidateManagedCleanupDirAllowFinalGenerationChange(
+	dir *managedCleanupDir,
+) error {
+	if dir == nil {
+		return errors.New("cannot revalidate a nil managed directory")
+	}
+	if len(dir.declaredChain) == 0 {
+		_, err := revalidateNonDeclaredManagedCleanupDir(dir, true)
+		return err
+	}
+	if len(dir.declaredChain) < 2 ||
+		len(dir.declaredEdges)+1 != len(dir.declaredChain) ||
+		len(dir.declaredGenerations) != len(dir.declaredChain) ||
+		dir.parent != dir.declaredChain[len(dir.declaredChain)-2] ||
+		dir.dir != dir.declaredChain[len(dir.declaredChain)-1] ||
+		dir.name != dir.declaredEdges[len(dir.declaredEdges)-1] {
+		return errors.New(
+			"cannot revalidate an incomplete declared quarantine evidence directory",
+		)
+	}
+	if err := revalidateDeclaredCanonicalRoot(dir); err != nil {
+		return err
+	}
+	finalIndex := len(dir.declaredChain) - 1
+	if err := revalidateDeclaredDirectoryPrefixAtFinalName(
+		dir.spec.path,
+		dir.declaredChain,
+		dir.declaredEdges,
+		dir.declaredGenerations,
+		dir.declaredRootDepth,
+		map[int]struct{}{finalIndex: {}},
+		dir.name,
+	); err != nil {
+		return err
+	}
+	return revalidateDeclaredCanonicalRoot(dir)
+}
+
+func retainedSystemdQuarantineLimitError(
+	activePath string,
+	evidencePaths []string,
+) error {
+	quotedPaths := make([]string, 0, len(evidencePaths))
+	for _, evidencePath := range evidencePaths {
+		quotedPaths = append(quotedPaths, fmt.Sprintf("%q", evidencePath))
+	}
+	return fmt.Errorf(
+		"refuse to quarantine systemd enable link %s: retained evidence hard limit %d reached before rename; "+
+			"active link was not moved; exact evidence paths: %s",
+		activePath,
+		maxRetainedSystemdEnableLinkQuarantineEvidence,
+		strings.Join(quotedPaths, ", "),
+	)
 }
 
 func prepareUninstallCleanup(
@@ -2171,15 +2290,16 @@ func prepareArtifactPlansForValidation(
 			)
 		}
 		var node *cleanupEntryPlan
+		var snapshotErr error
 		if artifact.Kind == systemdEnableLinkKind {
-			node, err = snapshotManagedSymlink(
+			node, snapshotErr = snapshotManagedSymlink(
 				parent.dir,
 				filepath.Base(artifact.Path),
 				false,
 				artifact.Target,
 			)
 		} else {
-			node, err = snapshotManagedFile(
+			node, snapshotErr = snapshotManagedFile(
 				parent.dir,
 				filepath.Base(artifact.Path),
 				false,
@@ -2187,25 +2307,49 @@ func prepareArtifactPlansForValidation(
 				validateDigest(artifact.SHA256),
 			)
 		}
-		if cleanupIsNotExist(err) {
+		var retainedEvidence []string
+		if artifact.Kind == systemdEnableLinkKind {
+			retainedEvidence, err = inspectRetainedSystemdQuarantineEvidence(parent)
+			if err != nil {
+				_ = parent.close()
+				closeCleanupDirectoryPlans(plans)
+				return nil, fmt.Errorf(
+					"inspect retained systemd enable-link quarantine evidence for %s: %w",
+					artifact.Path,
+					err,
+				)
+			}
+		}
+		if cleanupIsNotExist(snapshotErr) {
 			plans = append(plans, &cleanupDirectoryPlan{
-				root:                      parent,
-				absentServiceArtifactPath: artifact.Path,
+				root:                       parent,
+				absentServiceArtifactPath:  artifact.Path,
+				retainedQuarantineEvidence: retainedEvidence,
 			})
 			continue
 		}
-		if err != nil {
+		if snapshotErr != nil {
 			_ = parent.close()
 			closeCleanupDirectoryPlans(plans)
-			return nil, err
+			return nil, snapshotErr
 		}
 		node.remove = true
 		node.retainAfterQuarantine = artifact.Kind == systemdEnableLinkKind
+		if node.retainAfterQuarantine &&
+			len(retainedEvidence) >= maxRetainedSystemdEnableLinkQuarantineEvidence {
+			_ = parent.close()
+			closeCleanupDirectoryPlans(plans)
+			return nil, retainedSystemdQuarantineLimitError(
+				artifact.Path,
+				retainedEvidence,
+			)
+		}
 		plan := &cleanupDirectoryPlan{
-			root:          parent,
-			entries:       []*cleanupEntryPlan{node},
-			strictEntries: false,
-			removeRoot:    false,
+			root:                       parent,
+			entries:                    []*cleanupEntryPlan{node},
+			strictEntries:              false,
+			removeRoot:                 false,
+			retainedQuarantineEvidence: retainedEvidence,
 		}
 		plans = append(plans, plan)
 	}
@@ -3514,6 +3658,7 @@ func (entry *cleanupEntryPlan) unlink(
 			directory.retainedQuarantineEvidence,
 			evidencePath,
 		)
+		sort.Strings(directory.retainedQuarantineEvidence)
 		var hookErr error
 		if afterFinalQuarantineCheck != nil {
 			if err := afterFinalQuarantineCheck(entry.path, evidencePath); err != nil {
@@ -3582,10 +3727,6 @@ func (entry *cleanupEntryPlan) moveToQuarantine(
 	rootName string,
 	coordinator *cleanupDirectoryMutationCoordinator,
 ) (string, bool, error) {
-	quarantineName, err := newCleanupQuarantineName()
-	if err != nil {
-		return "", false, err
-	}
 	if beforeQuarantine != nil {
 		if err := beforeQuarantine(entry.path); err != nil {
 			return "", false, err
@@ -3597,6 +3738,28 @@ func (entry *cleanupEntryPlan) moveToQuarantine(
 			entry.path,
 			err,
 		)
+	}
+	if entry.retainAfterQuarantine {
+		evidencePaths, err := inspectRetainedSystemdQuarantineEvidence(
+			directory.root,
+		)
+		if err != nil {
+			return "", false, fmt.Errorf(
+				"inspect retained systemd enable-link quarantine evidence before rename: %w",
+				err,
+			)
+		}
+		directory.retainedQuarantineEvidence = evidencePaths
+		if len(evidencePaths) >= maxRetainedSystemdEnableLinkQuarantineEvidence {
+			return "", false, retainedSystemdQuarantineLimitError(
+				entry.path,
+				evidencePaths,
+			)
+		}
+	}
+	quarantineName, err := newCleanupQuarantineName()
+	if err != nil {
+		return "", false, err
 	}
 	if err := directory.prepareOwnedCleanupMutation(
 		rootName,

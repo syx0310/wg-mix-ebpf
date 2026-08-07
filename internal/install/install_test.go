@@ -947,6 +947,343 @@ func TestSystemdEnableLinkReplacementAfterFinalQuarantineCheckIsNeverDeleted(
 	}
 }
 
+func TestSystemdEnableLinkQuarantineEvidenceBelowLimitIsRetainedAndReported(
+	t *testing.T,
+) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"systemd-quarantine-below-limit",
+		"systemd",
+	)
+	linkPath := systemdEnableLinkPath(layout)
+	if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	linkIdentity, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := createSystemdQuarantineEvidence(
+		t,
+		layout,
+		maxRetainedSystemdEnableLinkQuarantineEvidence-1,
+	)
+	existingIdentities := make(map[string]os.FileInfo, len(existing))
+	for _, path := range existing {
+		identity, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		existingIdentities[path] = identity
+	}
+
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"systemd",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+	linkDirectory := systemdEnableLinkCleanupDirectory(t, plan, linkPath)
+	if err := linkDirectory.remove(nil, nil, nil); err != nil {
+		t.Fatalf("remove enable link immediately below evidence limit: %v", err)
+	}
+	if _, err := os.Lstat(linkPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("enable link remained active below evidence limit: %v", err)
+	}
+
+	allEvidence := systemdQuarantineEvidencePaths(t, layout)
+	if len(allEvidence) != maxRetainedSystemdEnableLinkQuarantineEvidence {
+		t.Fatalf(
+			"retained evidence = %v, want hard limit %d",
+			allEvidence,
+			maxRetainedSystemdEnableLinkQuarantineEvidence,
+		)
+	}
+	if !slices.Equal(
+		linkDirectory.retainedQuarantineEvidence,
+		allEvidence,
+	) {
+		t.Fatalf(
+			"cleanup plan evidence = %v, want every exact path %v",
+			linkDirectory.retainedQuarantineEvidence,
+			allEvidence,
+		)
+	}
+	for _, path := range existing {
+		identity, err := os.Lstat(path)
+		if err != nil {
+			t.Fatalf("pre-existing evidence %s changed: %v", path, err)
+		}
+		if !os.SameFile(existingIdentities[path], identity) {
+			t.Fatalf("pre-existing evidence %s was replaced", path)
+		}
+	}
+	newEvidence := onlyNewEvidencePath(t, existing, allEvidence)
+	assertSameSymlink(
+		t,
+		newEvidence,
+		systemdEnableLinkTarget,
+		linkIdentity,
+		"new retained systemd enable-link evidence",
+	)
+}
+
+func TestSystemdEnableLinkQuarantineEvidenceLimitRejectsBeforeRename(
+	t *testing.T,
+) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"systemd-quarantine-at-limit",
+		"systemd",
+	)
+	linkPath := systemdEnableLinkPath(layout)
+	if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	linkIdentity, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidencePaths := createSystemdQuarantineEvidence(
+		t,
+		layout,
+		maxRetainedSystemdEnableLinkQuarantineEvidence,
+	)
+
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"systemd",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if plan != nil {
+		_ = plan.close()
+	}
+	if err == nil ||
+		!strings.Contains(err.Error(), "retained evidence hard limit") ||
+		!strings.Contains(err.Error(), "active link was not moved") {
+		t.Fatalf("prepare error = %v, want fail-closed evidence limit", err)
+	}
+	for _, evidencePath := range evidencePaths {
+		if !strings.Contains(err.Error(), evidencePath) {
+			t.Fatalf(
+				"limit error omitted exact evidence path %s: %v",
+				evidencePath,
+				err,
+			)
+		}
+	}
+	assertSameSymlink(
+		t,
+		linkPath,
+		systemdEnableLinkTarget,
+		linkIdentity,
+		"active enable link rejected at evidence limit",
+	)
+	if actual := systemdQuarantineEvidencePaths(t, layout); !slices.Equal(actual, evidencePaths) {
+		t.Fatalf("limit rejection changed evidence: got %v want %v", actual, evidencePaths)
+	}
+}
+
+func TestUninstallPlanListsExistingSystemdQuarantineEvidence(t *testing.T) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"systemd-quarantine-plan",
+		"systemd",
+	)
+	linkPath := systemdEnableLinkPath(layout)
+	if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	evidencePaths := createSystemdQuarantineEvidence(t, layout, 3)
+	setCleanupTestEnvironment(t, layout)
+
+	plan, err := Uninstall(t.Context(), Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "systemd",
+		DryRun:     true,
+		Yes:        true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, evidencePath := range evidencePaths {
+		if !containsAction(
+			plan.Actions,
+			"retained systemd enable-link quarantine evidence "+evidencePath,
+		) {
+			t.Fatalf(
+				"dry-run plan omitted exact evidence path %s: %#v",
+				evidencePath,
+				plan.Actions,
+			)
+		}
+	}
+	if actual := systemdQuarantineEvidencePaths(t, layout); !slices.Equal(actual, evidencePaths) {
+		t.Fatalf("dry-run changed evidence: got %v want %v", actual, evidencePaths)
+	}
+	if _, err := os.Lstat(linkPath); err != nil {
+		t.Fatalf("dry-run changed active enable link: %v", err)
+	}
+}
+
+func TestRepeatedSystemdEnableLinkQuarantineNeverExceedsEvidenceLimit(
+	t *testing.T,
+) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"systemd-quarantine-repeated",
+		"systemd",
+	)
+	linkPath := systemdEnableLinkPath(layout)
+	for cycle := 0; cycle < maxRetainedSystemdEnableLinkQuarantineEvidence; cycle++ {
+		if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+			t.Fatalf("cycle %d create active enable link: %v", cycle, err)
+		}
+		plan, err := prepareUninstallCleanup(
+			layout,
+			"systemd",
+			false,
+			filepath.Join(t.TempDir(), "daemon.lease"),
+		)
+		if err != nil {
+			t.Fatalf("cycle %d prepare cleanup: %v", cycle, err)
+		}
+		linkDirectory := systemdEnableLinkCleanupDirectory(t, plan, linkPath)
+		err = linkDirectory.remove(nil, nil, nil)
+		closeErr := plan.close()
+		if err != nil || closeErr != nil {
+			t.Fatalf(
+				"cycle %d quarantine: err=%v close=%v",
+				cycle,
+				err,
+				closeErr,
+			)
+		}
+		if evidence := systemdQuarantineEvidencePaths(t, layout); len(evidence) != cycle+1 ||
+			len(evidence) > maxRetainedSystemdEnableLinkQuarantineEvidence {
+			t.Fatalf("cycle %d retained evidence = %v", cycle, evidence)
+		}
+	}
+
+	if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	linkIdentity, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"systemd",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if plan != nil {
+		_ = plan.close()
+	}
+	if err == nil || !strings.Contains(err.Error(), "retained evidence hard limit") {
+		t.Fatalf("cycle at hard limit error = %v", err)
+	}
+	if evidence := systemdQuarantineEvidencePaths(t, layout); len(evidence) != maxRetainedSystemdEnableLinkQuarantineEvidence {
+		t.Fatalf("cycle at hard limit grew evidence: %v", evidence)
+	}
+	assertSameSymlink(
+		t,
+		linkPath,
+		systemdEnableLinkTarget,
+		linkIdentity,
+		"repeated-cycle active enable link",
+	)
+}
+
+func TestSystemdEnableLinkQuarantineLimitIsRecheckedAfterRaceHook(
+	t *testing.T,
+) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"systemd-quarantine-limit-race",
+		"systemd",
+	)
+	linkPath := systemdEnableLinkPath(layout)
+	if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	linkIdentity, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	evidencePaths := createSystemdQuarantineEvidence(
+		t,
+		layout,
+		maxRetainedSystemdEnableLinkQuarantineEvidence-1,
+	)
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"systemd",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+	linkDirectory := systemdEnableLinkCleanupDirectory(t, plan, linkPath)
+	lateEvidence := filepath.Join(
+		filepath.Dir(linkPath),
+		cleanupQuarantineNamePrefix+"late-race-evidence",
+	)
+	hookRan := false
+	err = linkDirectory.remove(
+		func(path string) error {
+			if path != linkPath || hookRan {
+				return fmt.Errorf("unexpected quarantine hook path %s", path)
+			}
+			hookRan = true
+			return os.Symlink("../late-race.service", lateEvidence)
+		},
+		nil,
+		nil,
+	)
+	if !hookRan {
+		t.Fatal("quarantine race hook did not run")
+	}
+	if err == nil || !strings.Contains(err.Error(), "retained evidence hard limit") {
+		t.Fatalf("race-hook error = %v, want evidence limit", err)
+	}
+	evidencePaths = append(evidencePaths, lateEvidence)
+	slices.Sort(evidencePaths)
+	for _, evidencePath := range evidencePaths {
+		if !strings.Contains(err.Error(), evidencePath) {
+			t.Fatalf("race-hook error omitted %s: %v", evidencePath, err)
+		}
+	}
+	if !slices.Equal(
+		linkDirectory.retainedQuarantineEvidence,
+		evidencePaths,
+	) {
+		t.Fatalf(
+			"race-hook plan evidence = %v, want %v",
+			linkDirectory.retainedQuarantineEvidence,
+			evidencePaths,
+		)
+	}
+	assertSameSymlink(
+		t,
+		linkPath,
+		systemdEnableLinkTarget,
+		linkIdentity,
+		"race-hook active enable link",
+	)
+	if actual := systemdQuarantineEvidencePaths(t, layout); !slices.Equal(actual, evidencePaths) {
+		t.Fatalf("race-hook evidence changed: got %v want %v", actual, evidencePaths)
+	}
+}
+
 func TestSystemdEnableLinkCleanupRejectsPostPreflightReplacement(t *testing.T) {
 	for _, test := range []struct {
 		name              string
@@ -3869,6 +4206,69 @@ func systemdQuarantineEvidencePaths(t *testing.T, layout paths) []string {
 	}
 	slices.Sort(paths)
 	return paths
+}
+
+func createSystemdQuarantineEvidence(
+	t *testing.T,
+	layout paths,
+	count int,
+) []string {
+	t.Helper()
+	wantsDir := filepath.Dir(systemdEnableLinkPath(layout))
+	paths := make([]string, 0, count)
+	for index := 0; index < count; index++ {
+		path := filepath.Join(
+			wantsDir,
+			fmt.Sprintf("%stest-evidence-%02d", cleanupQuarantineNamePrefix, index),
+		)
+		if err := os.Symlink(
+			fmt.Sprintf("../retained-evidence-%02d.service", index),
+			path,
+		); err != nil {
+			t.Fatalf("create retained quarantine evidence %s: %v", path, err)
+		}
+		paths = append(paths, path)
+	}
+	slices.Sort(paths)
+	return paths
+}
+
+func systemdEnableLinkCleanupDirectory(
+	t *testing.T,
+	plan *uninstallCleanupPlan,
+	linkPath string,
+) *cleanupDirectoryPlan {
+	t.Helper()
+	for _, directory := range plan.directories {
+		if len(directory.entries) == 1 &&
+			directory.entries[0].path == linkPath {
+			return directory
+		}
+	}
+	t.Fatalf("cleanup plan omitted systemd enable link %s", linkPath)
+	return nil
+}
+
+func onlyNewEvidencePath(
+	t *testing.T,
+	before []string,
+	after []string,
+) string {
+	t.Helper()
+	known := make(map[string]struct{}, len(before))
+	for _, path := range before {
+		known[path] = struct{}{}
+	}
+	var added []string
+	for _, path := range after {
+		if _, ok := known[path]; !ok {
+			added = append(added, path)
+		}
+	}
+	if len(added) != 1 {
+		t.Fatalf("evidence before=%v after=%v, want exactly one new path", before, after)
+	}
+	return added[0]
 }
 
 func installFakeNft(t *testing.T, commandLog string) {

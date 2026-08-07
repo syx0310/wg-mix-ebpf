@@ -52,6 +52,16 @@ that held inode through the existing quarantine and no-replace cleanup chain.
 An inode or target replacement after preflight fails closed while a normal
 enabled installation is removed in one uninstall operation.
 
+Retained enable-link evidence is bounded without deleting old evidence by
+pathname. Each artifact preflight and the final pre-rename boundary enumerate
+the project quarantine prefix through the held, revalidated wants-directory
+descriptor. Existing exact paths are surfaced in the uninstall plan. At the
+hard limit of eight retained names, cleanup fails before moving the active
+enable link and reports every exact evidence path for manual resolution. A
+directory change racing the earlier preflight is re-enumerated at the final
+boundary, so ordinary install/uninstall cycles cannot grow the evidence set
+beyond the limit.
+
 Fresh service-unit, install-config, and ownership-manifest files prefer a Linux
 `O_TMPFILE` object under the held parent. Filesystems without that primitive,
 and Darwin, use a portable same-directory fallback: a cryptographically random
@@ -108,6 +118,9 @@ Local regression coverage includes:
   publication with both generation-baseline representations;
 - check-to-unlink and quarantine-name swaps with both owned and foreign links
   preserved;
+- retained enable-link evidence below and at the hard limit, exact-path plan
+  and error reporting, repeated-cycle bounding, and a final-boundary race that
+  reaches the limit without moving the active link;
 - the generic concurrent `mkdirat` `EEXIST` path remaining non-owned and now
   failing closed on the unowned generation change;
 - one-step uninstall of a validated enable link, plus rejection of same-target
