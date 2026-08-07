@@ -2185,20 +2185,6 @@ func prepareArtifactPlansForValidation(
 			closeCleanupDirectoryPlans(plans)
 			return nil, err
 		}
-		if artifact.Kind == systemdEnableLinkKind {
-			closeErr := errors.Join(node.close(), parent.close())
-			closeCleanupDirectoryPlans(plans)
-			return nil, errors.Join(
-				fmt.Errorf(
-					"refuse automatic cleanup of systemd enable link %s: "+
-						"the published manifest records path and target but not a durable "+
-						"symlink inode identity; manually inspect and remove or retain the "+
-						"exact link, then retry validated uninstall",
-					artifact.Path,
-				),
-				closeErr,
-			)
-		}
 		node.remove = true
 		plan := &cleanupDirectoryPlan{
 			root:          parent,

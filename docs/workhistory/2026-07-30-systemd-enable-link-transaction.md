@@ -45,10 +45,12 @@ baselining, while the systemd wants directory remains strictly pre-existing.
 Failure after enablement is non-destructive. The transaction does not rename,
 unlink, restore, or remove any link or directory. Its error reports the original
 declared path, held symlink identity, current descriptor-relative status, and
-manual follow-up. The manifest records path and target but not a durable symlink
-inode, so automatic uninstall cleanup of a present enable link is blocked.
-Operators must inspect and manually remove or retain that exact link before
-retrying validated uninstall.
+manual follow-up. A later uninstall does not trust the manifest as an inode
+record: it snapshots the symlink currently at the one declared wants path,
+requires its UID and target to match the installation contract, and carries
+that held inode through the existing quarantine and no-replace cleanup chain.
+An inode or target replacement after preflight fails closed while a normal
+enabled installation is removed in one uninstall operation.
 
 Fresh service-unit, install-config, and ownership-manifest files prefer a Linux
 `O_TMPFILE` object under the held parent. Filesystems without that primitive,
@@ -108,8 +110,9 @@ Local regression coverage includes:
   preserved;
 - the generic concurrent `mkdirat` `EEXIST` path remaining non-owned and now
   failing closed on the unowned generation change;
-- automatic uninstall refusal when no durable enable-link inode is recorded,
-  followed by successful uninstall after manual link resolution.
+- one-step uninstall of a validated enable link, plus rejection of same-target
+  inode replacement, changed-target replacement, and a foreign link present at
+  preflight.
 
 Validation completed locally without SSH, root, real systemd, BPF, or network
 namespace operations:

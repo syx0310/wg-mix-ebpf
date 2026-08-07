@@ -762,7 +762,7 @@ func TestSystemdServiceActionRejectsFinalPathSwapBeforeManagerReload(t *testing.
 	}
 }
 
-func TestUninstallBlocksSystemdEnableLinkWithoutDurableIdentity(t *testing.T) {
+func TestUninstallRemovesValidatedSystemdEnableLink(t *testing.T) {
 	layout := newCleanupTestLayoutForSystem(t, "systemd-disable", "systemd")
 	enableLink := systemdEnableLinkPath(layout)
 	if err := os.MkdirAll(filepath.Dir(enableLink), 0o700); err != nil {
@@ -787,37 +787,80 @@ func TestUninstallBlocksSystemdEnableLinkWithoutDurableIdentity(t *testing.T) {
 		System:     "systemd",
 		Yes:        true,
 	})
-	if err == nil || !strings.Contains(
-		err.Error(),
-		"refuse automatic cleanup of systemd enable link",
-	) || !strings.Contains(err.Error(), "not a durable symlink inode identity") {
-		t.Fatalf("uninstall error = %v, want durable-identity cleanup block", err)
-	}
-	if _, statErr := os.Stat(commandLog); !errors.Is(statErr, os.ErrNotExist) {
-		t.Fatalf("blocked automatic cleanup invoked systemctl: %v", statErr)
-	}
-	if _, statErr := os.Stat(filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")); statErr != nil {
-		t.Fatalf("blocked automatic cleanup changed owned unit: %v", statErr)
-	}
-	assertSymlinkTarget(t, enableLink, systemdEnableLinkTarget)
-
-	manuallyRetained := enableLink + ".manually-retained"
-	if err := os.Rename(enableLink, manuallyRetained); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := Uninstall(ctx, Options{
-		ConfigPath: layout.ConfigPath,
-		System:     "systemd",
-		Yes:        true,
-	}); err != nil {
-		t.Fatalf("validated uninstall after manual link resolution: %v", err)
+	if err != nil {
+		t.Fatalf("uninstall enabled systemd installation: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("uninstall retained disabled systemd unit: %v", err)
+		t.Fatalf("uninstall retained systemd unit: %v", err)
 	}
-	assertSymlinkTarget(t, manuallyRetained, systemdEnableLinkTarget)
+	if _, err := os.Lstat(enableLink); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("uninstall retained validated systemd enable link: %v", err)
+	}
 	if _, err := os.Stat(cleanupManifestPath(layout)); err != nil {
 		t.Fatalf("non-purge uninstall removed ownership marker: %v", err)
+	}
+}
+
+func TestSystemdEnableLinkCleanupRejectsPostPreflightReplacement(t *testing.T) {
+	for _, test := range []struct {
+		name              string
+		replacementTarget string
+	}{
+		{name: "same target new inode", replacementTarget: systemdEnableLinkTarget},
+		{name: "different target", replacementTarget: "../foreign.service"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			layout := newCleanupTestLayoutForSystem(
+				t,
+				"systemd-link-replacement-"+strings.ReplaceAll(test.name, " ", "-"),
+				"systemd",
+			)
+			linkPath := systemdEnableLinkPath(layout)
+			if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+				t.Fatal(err)
+			}
+			plan, err := prepareUninstallCleanup(
+				layout,
+				"systemd",
+				false,
+				filepath.Join(t.TempDir(), "daemon.lease"),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer plan.close()
+
+			var linkDirectory *cleanupDirectoryPlan
+			for _, directory := range plan.directories {
+				if directory.root.spec.path == filepath.Dir(linkPath) {
+					linkDirectory = directory
+					break
+				}
+			}
+			if linkDirectory == nil {
+				t.Fatal("cleanup plan omitted the exact systemd wants directory")
+			}
+			ownedBackup := linkPath + ".owned-before-replacement"
+			hookRan := false
+			err = linkDirectory.remove(func(path string) error {
+				if path != linkPath || hookRan {
+					return nil
+				}
+				hookRan = true
+				if err := os.Rename(linkPath, ownedBackup); err != nil {
+					return err
+				}
+				return os.Symlink(test.replacementTarget, linkPath)
+			}, nil)
+			if err == nil {
+				t.Fatal("post-preflight systemd enable link replacement was removed")
+			}
+			if !hookRan {
+				t.Fatal("systemd enable link replacement hook did not run")
+			}
+			assertSymlinkTarget(t, linkPath, test.replacementTarget)
+			assertSymlinkTarget(t, ownedBackup, systemdEnableLinkTarget)
+		})
 	}
 }
 
@@ -893,9 +936,9 @@ func TestUninstallWithoutSystemdEnableLinkCompletes(t *testing.T) {
 	}
 	if !containsAction(
 		plan.Actions,
-		"automatic cleanup is blocked without a durable inode identity",
+		"remove the exact validated systemd enable link if present",
 	) {
-		t.Fatalf("uninstall plan omits enable-link manual-resolution policy: %#v", plan.Actions)
+		t.Fatalf("uninstall plan omits enable-link cleanup policy: %#v", plan.Actions)
 	}
 	if _, statErr := os.Stat(
 		filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service"),

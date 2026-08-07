@@ -407,8 +407,7 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	switch system {
 	case "systemd":
 		add(
-			"require manual resolution of the systemd enable link if present; " +
-				"automatic cleanup is blocked without a durable inode identity",
+			"remove the exact validated systemd enable link if present",
 		)
 		add("remove systemd unit %s", filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"))
 		add("reload systemd manager after removing the owned unit")
