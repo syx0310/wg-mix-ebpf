@@ -71,6 +71,11 @@ struct faketcp_session_value {
 	__u8 pad[4];
 };
 
+_Static_assert(sizeof(struct faketcp_session_key) == 24,
+	       "faketcp session key ABI drift");
+_Static_assert(sizeof(struct faketcp_session_value) == 40,
+	       "faketcp session value ABI drift");
+
 struct faketcp_event {
 	struct faketcp_session_key key;
 	__u64 timestamp_nanos;

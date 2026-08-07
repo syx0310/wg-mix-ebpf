@@ -77,6 +77,36 @@ func TestStructSizesAreStable(t *testing.T) {
 	if got, want := unsafe.Offsetof(FakeTCPManagedIfKey{}.UnderlayIndex), uintptr(8); got != want {
 		t.Fatalf("FakeTCPManagedIfKey.UnderlayIndex offset = %d, want %d", got, want)
 	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Generation), uintptr(0); got != want {
+		t.Fatalf("FakeTCPSessionValue.Generation offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.LastSeenNanos), uintptr(8); got != want {
+		t.Fatalf("FakeTCPSessionValue.LastSeenNanos offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.TXSequence), uintptr(16); got != want {
+		t.Fatalf("FakeTCPSessionValue.TXSequence offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.RXSequence), uintptr(20); got != want {
+		t.Fatalf("FakeTCPSessionValue.RXSequence offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.LocalISN), uintptr(24); got != want {
+		t.Fatalf("FakeTCPSessionValue.LocalISN offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.RemoteISN), uintptr(28); got != want {
+		t.Fatalf("FakeTCPSessionValue.RemoteISN offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Window), uintptr(32); got != want {
+		t.Fatalf("FakeTCPSessionValue.Window offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.State), uintptr(34); got != want {
+		t.Fatalf("FakeTCPSessionValue.State offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Flags), uintptr(35); got != want {
+		t.Fatalf("FakeTCPSessionValue.Flags offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Reserved), uintptr(36); got != want {
+		t.Fatalf("FakeTCPSessionValue.Reserved offset = %d, want %d", got, want)
+	}
 	if got, want := unsafe.Offsetof(FakeTCPManagedPortKey{}.DestinationPort), uintptr(12); got != want {
 		t.Fatalf("FakeTCPManagedPortKey.DestinationPort offset = %d, want %d", got, want)
 	}

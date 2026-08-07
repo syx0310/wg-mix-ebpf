@@ -218,7 +218,7 @@ type FakeTCPSessionValue struct {
 	Window        uint16
 	State         uint8
 	Flags         uint8
-	_             [4]byte
+	Reserved      [4]byte // Must stay zero; maps exactly to the C ABI pad bytes.
 }
 
 func (v FakeTCPSessionValue) MapGeneration() uint64 { return v.Generation }
