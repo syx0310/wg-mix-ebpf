@@ -26,7 +26,6 @@ type LinuxRawIPv4Writer struct {
 	closeFD     func(int) error
 	owned       bool
 	closed      bool
-	closeErr    error
 }
 
 var _ RawIPv4Writer = (*LinuxRawIPv4Writer)(nil)
@@ -192,15 +191,17 @@ func (writer *LinuxRawIPv4Writer) Close() error {
 		return nil
 	}
 	if writer.closed {
-		return writer.closeErr
+		return nil
 	}
 	writer.closed = true
 	fd := writer.fd
 	writer.fd = -1
 	if fd >= 0 && writer.closeFD != nil {
-		writer.closeErr = wrapRawSocketCloseError(writer.closeFD(fd))
+		// close(2) consumes the descriptor even when it reports an error. Never
+		// retry the numeric fd: it may already have been reused by the process.
+		return wrapRawSocketCloseError(writer.closeFD(fd))
 	}
-	return writer.closeErr
+	return nil
 }
 
 func (writer *LinuxRawIPv4Writer) rawIPv4WriterReady() error {

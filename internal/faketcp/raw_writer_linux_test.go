@@ -47,6 +47,31 @@ func TestLinuxRawIPv4WriterOwnsAndClosesFDZero(t *testing.T) {
 	}
 }
 
+func TestLinuxRawIPv4WriterCloseErrorConsumesFDWithoutNumericRetry(t *testing.T) {
+	wantErr := errors.New("close failed after consuming fd")
+	var closed []int
+	writer, err := newLinuxRawIPv4Writer(time.Second, linuxRawSocketOps{
+		socket:            func(int, int, int) (int, error) { return 17, nil },
+		setHeaderIncluded: func(int) error { return nil },
+		close: func(fd int) error {
+			closed = append(closed, fd)
+			return wantErr
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); !errors.Is(err, wantErr) {
+		t.Fatalf("first Close error=%v", err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("terminal Close retry error=%v", err)
+	}
+	if !slices.Equal(closed, []int{17}) {
+		t.Fatalf("closed fds=%v", closed)
+	}
+}
+
 func TestLinuxRawIPv4WriterZeroValueFailsClosedWithoutClosingFDZero(t *testing.T) {
 	writer := &LinuxRawIPv4Writer{}
 	if err := writer.Close(); err != nil {

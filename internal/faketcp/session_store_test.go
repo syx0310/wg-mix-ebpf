@@ -906,7 +906,7 @@ func TestLinuxSessionStoreCloseOwnsOnlyCloneAndFailsOperationsClosed(t *testing.
 		}
 	})
 
-	t.Run("close error is retained without retry", func(t *testing.T) {
+	t.Run("close error retains exact clone for retry", func(t *testing.T) {
 		backend := newMemorySessionMap()
 		backend.cloneCloseErr = errMemorySessionMapClose
 		store, err := newLinuxSessionStore(backend, 7, backend.identity)
@@ -914,17 +914,26 @@ func TestLinuxSessionStoreCloseOwnsOnlyCloneAndFailsOperationsClosed(t *testing.
 			t.Fatal(err)
 		}
 		firstErr := store.Close()
-		secondErr := store.Close()
-		if !errors.Is(firstErr, errMemorySessionMapClose) ||
-			!errors.Is(secondErr, errMemorySessionMapClose) {
-			t.Fatalf("close errors first=%v second=%v", firstErr, secondErr)
+		if !errors.Is(firstErr, errMemorySessionMapClose) {
+			t.Fatalf("first close error=%v", firstErr)
 		}
 		clone := backend.clonedHandle()
-		if clone == nil || clone.closeCalls != 1 {
-			t.Fatalf("close failure retried or lost clone: clone=%p", clone)
+		if clone == nil || clone.closeCalls != 1 || store.backend != clone {
+			t.Fatalf("close failure lost exact clone: clone=%p store backend=%p", clone, store.backend)
 		}
 		if _, _, err := store.LookupEstablished(sessionStoreTestKey(7)); !errors.Is(err, ErrSessionStoreClosed) {
 			t.Fatalf("store remained usable after close failure: %v", err)
+		}
+
+		clone.closeErr = nil
+		if err := store.Close(); err != nil {
+			t.Fatalf("retry close error=%v", err)
+		}
+		if clone.closeCalls != 2 || store.backend != nil {
+			t.Fatalf("retry close calls=%d store backend=%p", clone.closeCalls, store.backend)
+		}
+		if err := store.Close(); err != nil || clone.closeCalls != 2 {
+			t.Fatalf("converged close error=%v calls=%d", err, clone.closeCalls)
 		}
 	})
 

@@ -30,12 +30,17 @@ func (log *orderedCloseLog) snapshot() []string {
 }
 
 type orderedEventReader struct {
-	log       *orderedCloseLog
-	started   chan struct{}
-	release   chan struct{}
-	startOnce sync.Once
-	closeOnce sync.Once
-	closeErr  error
+	log              *orderedCloseLog
+	started          chan struct{}
+	release          chan struct{}
+	startOnce        sync.Once
+	closeOnce        sync.Once
+	mu               sync.Mutex
+	closeErr         error
+	closeCall        int
+	closeStarted     chan struct{}
+	closeRelease     <-chan struct{}
+	closeStartedOnce sync.Once
 }
 
 func (reader *orderedEventReader) Read() (EventRecord, error) {
@@ -47,10 +52,19 @@ func (reader *orderedEventReader) Read() (EventRecord, error) {
 func (*orderedEventReader) SetDeadline(time.Time) {}
 
 func (reader *orderedEventReader) Close() error {
+	reader.log.append("reader")
+	if reader.closeStarted != nil {
+		reader.closeStartedOnce.Do(func() { close(reader.closeStarted) })
+	}
+	if reader.closeRelease != nil {
+		<-reader.closeRelease
+	}
 	reader.closeOnce.Do(func() {
-		reader.log.append("reader")
 		close(reader.release)
 	})
+	reader.mu.Lock()
+	defer reader.mu.Unlock()
+	reader.closeCall++
 	return reader.closeErr
 }
 
@@ -141,15 +155,19 @@ func TestRuntimeStackClosesSlowPathBeforeGeneration(t *testing.T) {
 	}
 }
 
-func TestRuntimeStackConcurrentCloseIsOnceOnlyAndJoinsErrors(t *testing.T) {
+func TestRuntimeStackConcurrentCloseCoalescesAndRetriesInDependencyOrder(t *testing.T) {
 	log := &orderedCloseLog{}
 	readerErr := errors.New("reader close failed")
 	backendErr := errors.New("controller backend close failed")
 	generationErr := errors.New("generation close failed")
+	closeStarted := make(chan struct{})
+	closeRelease := make(chan struct{})
 	reader := &orderedEventReader{
 		log: log, started: make(chan struct{}), release: make(chan struct{}), closeErr: readerErr,
+		closeStarted: closeStarted, closeRelease: closeRelease,
 	}
-	events, err := NewEventRuntime(reader, newOrderedController(t, log, backendErr), EventRuntimeOptions{
+	controller := newOrderedController(t, log, backendErr)
+	events, err := NewEventRuntime(reader, controller, EventRuntimeOptions{
 		PollInterval: time.Millisecond, TickInterval: time.Second,
 	})
 	if err != nil {
@@ -180,24 +198,63 @@ func TestRuntimeStackConcurrentCloseIsOnceOnlyAndJoinsErrors(t *testing.T) {
 		}()
 	}
 	close(start)
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not reach event reader")
+	}
+	time.Sleep(10 * time.Millisecond)
+	close(closeRelease)
 	wait.Wait()
 	close(errs)
 	for err := range errs {
-		if !errors.Is(err, readerErr) || !errors.Is(err, backendErr) || !errors.Is(err, generationErr) {
+		if !errors.Is(err, readerErr) || !errors.Is(err, backendErr) || errors.Is(err, generationErr) {
 			t.Fatalf("Close error = %v", err)
 		}
 	}
 	if err := <-runDone; err != nil {
 		t.Fatalf("Run error = %v", err)
 	}
-	if got, want := log.snapshot(), []string{"reader", "controller", "backend", "generation"}; !slices.Equal(got, want) {
-		t.Fatalf("close order=%v want=%v", got, want)
+	if got, want := log.snapshot(), []string{"reader", "controller", "backend"}; !slices.Equal(got, want) {
+		t.Fatalf("first close order=%v want=%v", got, want)
 	}
 	generation.mu.Lock()
 	closeCalls := generation.closeCall
 	generation.mu.Unlock()
-	if closeCalls != 1 {
-		t.Fatalf("generation close calls=%d", closeCalls)
+	if closeCalls != 0 {
+		t.Fatalf("generation closed before slow path converged: calls=%d", closeCalls)
+	}
+
+	reader.mu.Lock()
+	reader.closeErr = nil
+	reader.mu.Unlock()
+	controller.Controller.stateMu.Lock()
+	backend := controller.Controller.backend.(*orderedControllerBackend)
+	backend.closeErr = nil
+	controller.Controller.stateMu.Unlock()
+	if err := stack.Close(); !errors.Is(err, generationErr) || errors.Is(err, readerErr) || errors.Is(err, backendErr) {
+		t.Fatalf("generation retry error=%v", err)
+	}
+	if got, want := log.snapshot(), []string{
+		"reader", "controller", "backend",
+		"reader", "controller", "backend", "generation",
+	}; !slices.Equal(got, want) {
+		t.Fatalf("retry close order=%v want=%v", got, want)
+	}
+	generation.mu.Lock()
+	generation.closeErr = nil
+	generation.mu.Unlock()
+	if err := stack.Close(); err != nil {
+		t.Fatalf("final generation retry error=%v", err)
+	}
+	if err := stack.Close(); err != nil {
+		t.Fatalf("converged Close error=%v", err)
+	}
+	generation.mu.Lock()
+	closeCalls = generation.closeCall
+	generation.mu.Unlock()
+	if closeCalls != 2 {
+		t.Fatalf("generation close calls=%d, want 2", closeCalls)
 	}
 }
 

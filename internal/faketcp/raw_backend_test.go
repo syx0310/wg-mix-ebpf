@@ -14,14 +14,17 @@ import (
 type memoryRawIPv4Writer struct {
 	mu sync.Mutex
 
-	writes      []RawIPv4Write
-	writeErr    error
-	closeErr    error
-	closeCalls  int
-	entered     chan struct{}
-	release     <-chan struct{}
-	enteredOnce sync.Once
-	writeHook   func()
+	writes           []RawIPv4Write
+	writeErr         error
+	closeErr         error
+	closeCalls       int
+	closeStarted     chan struct{}
+	closeRelease     <-chan struct{}
+	closeStartedOnce sync.Once
+	entered          chan struct{}
+	release          <-chan struct{}
+	enteredOnce      sync.Once
+	writeHook        func()
 }
 
 func (writer *memoryRawIPv4Writer) WriteIPv4(ctx context.Context, write RawIPv4Write) error {
@@ -49,9 +52,19 @@ func (writer *memoryRawIPv4Writer) WriteIPv4(ctx context.Context, write RawIPv4W
 
 func (writer *memoryRawIPv4Writer) Close() error {
 	writer.mu.Lock()
-	defer writer.mu.Unlock()
 	writer.closeCalls++
-	return writer.closeErr
+	if writer.closeStarted != nil {
+		writer.closeStartedOnce.Do(func() { close(writer.closeStarted) })
+	}
+	closeRelease := writer.closeRelease
+	writer.mu.Unlock()
+	if closeRelease != nil {
+		<-closeRelease
+	}
+	writer.mu.Lock()
+	err := writer.closeErr
+	writer.mu.Unlock()
+	return err
 }
 
 func (writer *memoryRawIPv4Writer) snapshot() ([]RawIPv4Write, int) {
@@ -464,9 +477,13 @@ func TestRawControllerBackendFailsBeforeWriterOnMarkError(t *testing.T) {
 	}
 }
 
-func TestRawControllerBackendConcurrentCloseRetainsWriterError(t *testing.T) {
+func TestRawControllerBackendConcurrentCloseCoalescesWriterErrorAndRetries(t *testing.T) {
 	wantErr := errors.New("raw writer close failed")
-	writer := &memoryRawIPv4Writer{closeErr: wantErr}
+	closeStarted := make(chan struct{})
+	closeRelease := make(chan struct{})
+	writer := &memoryRawIPv4Writer{
+		closeErr: wantErr, closeStarted: closeStarted, closeRelease: closeRelease,
+	}
 	backend, err := NewRawControllerBackend(RawControllerBackendOptions{
 		Writer: writer,
 		ControlMarks: ControlMarkResolverFunc(func(context.Context, abi.FakeTCPSessionKey, uint32) (uint32, error) {
@@ -490,6 +507,13 @@ func TestRawControllerBackendConcurrentCloseRetainsWriterError(t *testing.T) {
 		}()
 	}
 	close(start)
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not reach writer")
+	}
+	time.Sleep(10 * time.Millisecond)
+	close(closeRelease)
 	wait.Wait()
 	close(errs)
 	for err := range errs {
@@ -500,6 +524,23 @@ func TestRawControllerBackendConcurrentCloseRetainsWriterError(t *testing.T) {
 	_, closes := writer.snapshot()
 	if closes != 1 {
 		t.Fatalf("writer Close calls=%d", closes)
+	}
+	writer.mu.Lock()
+	writer.closeErr = nil
+	writer.mu.Unlock()
+	if err := backend.Close(); err != nil {
+		t.Fatalf("retry Close error=%v", err)
+	}
+	_, closes = writer.snapshot()
+	if closes != 2 {
+		t.Fatalf("writer retry Close calls=%d", closes)
+	}
+	if err := backend.Close(); err != nil {
+		t.Fatalf("converged Close error=%v", err)
+	}
+	_, closes = writer.snapshot()
+	if closes != 2 {
+		t.Fatalf("converged writer Close calls=%d", closes)
 	}
 }
 

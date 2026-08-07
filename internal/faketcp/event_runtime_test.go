@@ -12,14 +12,17 @@ import (
 type fakeEventReader struct {
 	mu sync.Mutex
 
-	records    []EventRecord
-	errors     []error
-	deadlines  []time.Time
-	readHook   func()
-	readCalls  int
-	closeCalls int
-	closeErr   error
-	closed     bool
+	records          []EventRecord
+	errors           []error
+	deadlines        []time.Time
+	readHook         func()
+	readCalls        int
+	closeCalls       int
+	closeErr         error
+	closed           bool
+	closeStarted     chan struct{}
+	closeRelease     <-chan struct{}
+	closeStartedOnce sync.Once
 }
 
 func (reader *fakeEventReader) Read() (EventRecord, error) {
@@ -63,10 +66,20 @@ func (reader *fakeEventReader) SetDeadline(deadline time.Time) {
 
 func (reader *fakeEventReader) Close() error {
 	reader.mu.Lock()
-	defer reader.mu.Unlock()
 	reader.closeCalls++
 	reader.closed = true
-	return reader.closeErr
+	if reader.closeStarted != nil {
+		reader.closeStartedOnce.Do(func() { close(reader.closeStarted) })
+	}
+	closeRelease := reader.closeRelease
+	reader.mu.Unlock()
+	if closeRelease != nil {
+		<-closeRelease
+	}
+	reader.mu.Lock()
+	err := reader.closeErr
+	reader.mu.Unlock()
+	return err
 }
 
 type blockingEventReader struct {
@@ -316,18 +329,25 @@ func TestEventRuntimeRequestStopAndCloseShareReaderClose(t *testing.T) {
 	if err := runtime.Run(context.Background()); err != nil {
 		t.Fatalf("Run after RequestStop error = %v", err)
 	}
-	if err := runtime.Close(); !errors.Is(err, readerErr) {
-		t.Fatalf("Close error = %v", err)
+	reader.mu.Lock()
+	reader.closeErr = nil
+	reader.mu.Unlock()
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("Close retry error = %v", err)
 	}
-	if reader.closeCalls != 1 || controller.closeCalls != 1 {
+	if reader.closeCalls != 2 || controller.closeCalls != 1 {
 		t.Fatalf("close calls reader=%d controller=%d", reader.closeCalls, controller.closeCalls)
 	}
 }
 
-func TestEventRuntimeConcurrentCloseIsOnceOnlyAndRetainsErrors(t *testing.T) {
+func TestEventRuntimeConcurrentCloseCoalescesErrorsAndLaterRetries(t *testing.T) {
 	readerErr := errors.New("reader close failure")
 	controllerErr := errors.New("controller close failure")
-	reader := &fakeEventReader{closeErr: readerErr}
+	closeStarted := make(chan struct{})
+	closeRelease := make(chan struct{})
+	reader := &fakeEventReader{
+		closeErr: readerErr, closeStarted: closeStarted, closeRelease: closeRelease,
+	}
 	controller := &fakeEventController{closeErr: controllerErr}
 	runtime := newTestEventRuntime(t, reader, controller, EventRuntimeOptions{})
 
@@ -344,6 +364,13 @@ func TestEventRuntimeConcurrentCloseIsOnceOnlyAndRetainsErrors(t *testing.T) {
 		}()
 	}
 	close(start)
+	select {
+	case <-closeStarted:
+	case <-time.After(time.Second):
+		t.Fatal("Close did not reach reader")
+	}
+	time.Sleep(10 * time.Millisecond)
+	close(closeRelease)
 	wait.Wait()
 	close(errs)
 	for err := range errs {
@@ -353,6 +380,24 @@ func TestEventRuntimeConcurrentCloseIsOnceOnlyAndRetainsErrors(t *testing.T) {
 	}
 	if reader.closeCalls != 1 || controller.closeCalls != 1 {
 		t.Fatalf("close calls reader=%d controller=%d", reader.closeCalls, controller.closeCalls)
+	}
+	reader.mu.Lock()
+	reader.closeErr = nil
+	reader.mu.Unlock()
+	controller.mu.Lock()
+	controller.closeErr = nil
+	controller.mu.Unlock()
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("retry Close error=%v", err)
+	}
+	if reader.closeCalls != 2 || controller.closeCalls != 2 {
+		t.Fatalf("retry close calls reader=%d controller=%d", reader.closeCalls, controller.closeCalls)
+	}
+	if err := runtime.Close(); err != nil || reader.closeCalls != 2 || controller.closeCalls != 2 {
+		t.Fatalf(
+			"converged Close error=%v reader calls=%d controller calls=%d",
+			err, reader.closeCalls, controller.closeCalls,
+		)
 	}
 }
 

@@ -75,20 +75,21 @@ type EventRuntimeOptions struct {
 type EventRuntime struct {
 	mu sync.Mutex
 
-	reader     EventReader
-	controller EventController
-	opts       EventRuntimeOptions
-	runDone    chan struct{}
-	closeDone  chan struct{}
-	readerDone chan struct{}
-	readerOnce sync.Once
-	runStarted bool
-	running    bool
-	stopAsked  bool
-	closing    bool
-	closed     bool
-	readerErr  error
-	closeErr   error
+	reader        EventReader
+	controller    EventController
+	opts          EventRuntimeOptions
+	runDone       chan struct{}
+	closeDone     chan struct{}
+	readerDone    chan struct{}
+	runStarted    bool
+	running       bool
+	stopAsked     bool
+	shutdown      bool
+	closing       bool
+	closed        bool
+	readerClosing bool
+	readerErr     error
+	closeErr      error
 }
 
 var _ RuntimeService = (*EventRuntime)(nil)
@@ -130,7 +131,7 @@ func (runtime *EventRuntime) Run(ctx context.Context) error {
 	}
 	runtime.mu.Lock()
 	switch {
-	case runtime.closing || runtime.closed:
+	case runtime.shutdown || runtime.closing || runtime.closed:
 		runtime.mu.Unlock()
 		return ErrEventRuntimeClosed
 	case runtime.runStarted:
@@ -139,56 +140,62 @@ func (runtime *EventRuntime) Run(ctx context.Context) error {
 	default:
 		runtime.runStarted = true
 		runtime.running = true
+		reader := runtime.reader
+		controller := runtime.controller
+		stopAsked := runtime.stopAsked
 		runtime.mu.Unlock()
-	}
-	defer runtime.finishRun()
-
-	nextTick := runtime.opts.Now().Add(runtime.opts.TickInterval)
-	for {
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		now := runtime.opts.Now()
-		deadline := now.Add(runtime.opts.PollInterval)
-		if nextTick.Before(deadline) {
-			deadline = nextTick
-		}
-		runtime.reader.SetDeadline(deadline)
-		record, err := runtime.reader.Read()
-		switch {
-		case err == nil:
-			if record.LostSamples != 0 {
-				return fmt.Errorf("%w: %d", ErrEventSamplesLost, record.LostSamples)
-			}
-			if len(record.RawSample) == 0 {
-				return errors.New("faketcp event reader returned an empty sample")
-			}
-			if _, err := runtime.controller.HandleSample(ctx, record.RawSample); err != nil {
-				return fmt.Errorf("handle faketcp event sample: %w", err)
-			}
-		case errors.Is(err, os.ErrDeadlineExceeded):
-			// Deadline wakeups exist only to service ctx and Tick below.
-		case errors.Is(err, os.ErrClosed):
-			runtime.mu.Lock()
-			closing := runtime.stopAsked || runtime.closing || runtime.closed
-			runtime.mu.Unlock()
-			if closing {
-				return nil
-			}
-			return fmt.Errorf("read faketcp event sample: %w", err)
-		default:
-			return fmt.Errorf("read faketcp event sample: %w", err)
-		}
-		if runtime.stopRequested() {
+		defer runtime.finishRun()
+		if stopAsked || eventReaderIsNil(reader) {
 			return nil
 		}
 
-		now = runtime.opts.Now()
-		if !now.Before(nextTick) {
-			if _, err := runtime.controller.Tick(ctx); err != nil {
-				return fmt.Errorf("tick faketcp controller: %w", err)
+		nextTick := runtime.opts.Now().Add(runtime.opts.TickInterval)
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
 			}
-			nextTick = now.Add(runtime.opts.TickInterval)
+			now := runtime.opts.Now()
+			deadline := now.Add(runtime.opts.PollInterval)
+			if nextTick.Before(deadline) {
+				deadline = nextTick
+			}
+			reader.SetDeadline(deadline)
+			record, err := reader.Read()
+			switch {
+			case err == nil:
+				if record.LostSamples != 0 {
+					return fmt.Errorf("%w: %d", ErrEventSamplesLost, record.LostSamples)
+				}
+				if len(record.RawSample) == 0 {
+					return errors.New("faketcp event reader returned an empty sample")
+				}
+				if _, err := controller.HandleSample(ctx, record.RawSample); err != nil {
+					return fmt.Errorf("handle faketcp event sample: %w", err)
+				}
+			case errors.Is(err, os.ErrDeadlineExceeded):
+				// Deadline wakeups exist only to service ctx and Tick below.
+			case errors.Is(err, os.ErrClosed):
+				runtime.mu.Lock()
+				closing := runtime.stopAsked || runtime.shutdown || runtime.closing || runtime.closed
+				runtime.mu.Unlock()
+				if closing {
+					return nil
+				}
+				return fmt.Errorf("read faketcp event sample: %w", err)
+			default:
+				return fmt.Errorf("read faketcp event sample: %w", err)
+			}
+			if runtime.stopRequested() {
+				return nil
+			}
+
+			now = runtime.opts.Now()
+			if !now.Before(nextTick) {
+				if _, err := controller.Tick(ctx); err != nil {
+					return fmt.Errorf("tick faketcp controller: %w", err)
+				}
+				nextTick = now.Add(runtime.opts.TickInterval)
+			}
 		}
 	}
 }
@@ -201,10 +208,9 @@ func (runtime *EventRuntime) RequestStop() error {
 		return ErrEventRuntimeClosed
 	}
 	runtime.mu.Lock()
-	if runtime.closed {
-		err := runtime.readerErr
+	if runtime.shutdown || runtime.closed {
 		runtime.mu.Unlock()
-		return err
+		return ErrEventRuntimeClosed
 	}
 	runtime.stopAsked = true
 	runtime.mu.Unlock()
@@ -213,7 +219,7 @@ func (runtime *EventRuntime) RequestStop() error {
 
 func (runtime *EventRuntime) stopRequested() bool {
 	runtime.mu.Lock()
-	requested := runtime.stopAsked || runtime.closing || runtime.closed
+	requested := runtime.stopAsked || runtime.shutdown || runtime.closing || runtime.closed
 	runtime.mu.Unlock()
 	return requested
 }
@@ -227,18 +233,18 @@ func (runtime *EventRuntime) finishRun() {
 	runtime.mu.Unlock()
 }
 
-// Close fences new Run calls, interrupts an admitted reader, waits for Run to
-// leave the controller, and then closes the controller. It never holds the
-// lifecycle mutex while invoking either owned resource.
+// Close permanently fences new work, interrupts an admitted reader, waits for
+// Run to leave the controller, and then closes the controller. Failed owners
+// are retained for a later Close attempt; successfully closed owners are
+// pruned so an outer lifecycle owner can eventually converge.
 func (runtime *EventRuntime) Close() error {
 	if runtime == nil {
 		return nil
 	}
 	runtime.mu.Lock()
 	if runtime.closed {
-		err := runtime.closeErr
 		runtime.mu.Unlock()
-		return err
+		return nil
 	}
 	if runtime.closing {
 		done := runtime.closeDone
@@ -249,7 +255,10 @@ func (runtime *EventRuntime) Close() error {
 		runtime.mu.Unlock()
 		return err
 	}
+	runtime.shutdown = true
+	runtime.stopAsked = true
 	runtime.closing = true
+	runtime.closeDone = make(chan struct{})
 	running := runtime.running
 	runDone := runtime.runDone
 	controller := runtime.controller
@@ -259,15 +268,21 @@ func (runtime *EventRuntime) Close() error {
 	if running {
 		<-runDone
 	}
-	controllerErr := controller.Close()
+	var controllerErr error
+	if !eventControllerIsNil(controller) {
+		controllerErr = controller.Close()
+	}
 	closeErr := errors.Join(
 		wrapEventRuntimeCloseError("reader", readerErr),
 		wrapEventRuntimeCloseError("controller", controllerErr),
 	)
 
 	runtime.mu.Lock()
+	if controllerErr == nil {
+		runtime.controller = nil
+	}
 	runtime.closeErr = closeErr
-	runtime.closed = true
+	runtime.closed = eventReaderIsNil(runtime.reader) && eventControllerIsNil(runtime.controller)
 	runtime.closing = false
 	close(runtime.closeDone)
 	runtime.mu.Unlock()
@@ -275,12 +290,36 @@ func (runtime *EventRuntime) Close() error {
 }
 
 func (runtime *EventRuntime) closeReader() error {
-	runtime.readerOnce.Do(func() {
-		runtime.readerErr = runtime.reader.Close()
-		close(runtime.readerDone)
-	})
-	<-runtime.readerDone
-	return runtime.readerErr
+	runtime.mu.Lock()
+	if eventReaderIsNil(runtime.reader) {
+		runtime.mu.Unlock()
+		return nil
+	}
+	if runtime.readerClosing {
+		done := runtime.readerDone
+		runtime.mu.Unlock()
+		<-done
+		runtime.mu.Lock()
+		err := runtime.readerErr
+		runtime.mu.Unlock()
+		return err
+	}
+	runtime.readerClosing = true
+	runtime.readerDone = make(chan struct{})
+	reader := runtime.reader
+	runtime.mu.Unlock()
+
+	err := reader.Close()
+
+	runtime.mu.Lock()
+	runtime.readerErr = err
+	if err == nil {
+		runtime.reader = nil
+	}
+	runtime.readerClosing = false
+	close(runtime.readerDone)
+	runtime.mu.Unlock()
+	return err
 }
 
 func wrapEventRuntimeCloseError(resource string, err error) error {

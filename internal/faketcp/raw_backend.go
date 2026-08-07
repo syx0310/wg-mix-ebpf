@@ -124,6 +124,7 @@ type RawControllerBackend struct {
 	inflightDone *sync.Cond
 	closeDone    chan struct{}
 	inflight     uint64
+	shutdown     bool
 	closing      bool
 	closed       bool
 	closeErr     error
@@ -221,14 +222,9 @@ func (backend *RawControllerBackend) Close() error {
 		return nil
 	}
 	backend.mu.Lock()
-	if !backend.initializedLocked() {
-		backend.mu.Unlock()
-		return ErrRawBackendClosed
-	}
 	if backend.closed {
-		closeErr := backend.closeErr
 		backend.mu.Unlock()
-		return closeErr
+		return nil
 	}
 	if backend.closing {
 		closeDone := backend.closeDone
@@ -239,7 +235,13 @@ func (backend *RawControllerBackend) Close() error {
 		backend.mu.Unlock()
 		return closeErr
 	}
+	if !backend.shutdown && !backend.initializedLocked() {
+		backend.mu.Unlock()
+		return ErrRawBackendClosed
+	}
+	backend.shutdown = true
 	backend.closing = true
+	backend.closeDone = make(chan struct{})
 	for backend.inflight != 0 {
 		backend.inflightDone.Wait()
 	}
@@ -247,14 +249,25 @@ func (backend *RawControllerBackend) Close() error {
 	writer := backend.writer
 	backend.mu.Unlock()
 
-	closeErr := errors.Join(
-		reinjector.Close(),
-		writer.Close(),
-	)
+	var reinjectorErr error
+	if reinjector != nil {
+		reinjectorErr = reinjector.Close()
+	}
+	var writerErr error
+	if !rawIPv4WriterIsNil(writer) {
+		writerErr = writer.Close()
+	}
+	closeErr := errors.Join(reinjectorErr, writerErr)
 
 	backend.mu.Lock()
+	if reinjectorErr == nil {
+		backend.reinjector = nil
+	}
+	if writerErr == nil {
+		backend.writer = nil
+	}
 	backend.closeErr = closeErr
-	backend.closed = true
+	backend.closed = backend.reinjector == nil && rawIPv4WriterIsNil(backend.writer)
 	backend.closing = false
 	close(backend.closeDone)
 	backend.mu.Unlock()
@@ -269,7 +282,7 @@ func (backend *RawControllerBackend) beginOperation() (
 ) {
 	backend.mu.Lock()
 	defer backend.mu.Unlock()
-	if !backend.initializedLocked() || backend.closing || backend.closed {
+	if !backend.initializedLocked() || backend.shutdown || backend.closing || backend.closed {
 		return nil, nil, nil, ErrRawBackendClosed
 	}
 	backend.inflight++

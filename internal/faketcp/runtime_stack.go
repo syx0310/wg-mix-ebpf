@@ -29,6 +29,7 @@ type RuntimeStack struct {
 	slowPath   RuntimeService
 	generation io.Closer
 	closeDone  chan struct{}
+	shutdown   bool
 	closing    bool
 	closed     bool
 	closeErr   error
@@ -54,7 +55,7 @@ func (stack *RuntimeStack) Run(ctx context.Context) error {
 		return ErrRuntimeStackClosed
 	}
 	stack.mu.Lock()
-	if stack.closing || stack.closed {
+	if stack.shutdown || stack.closing || stack.closed {
 		stack.mu.Unlock()
 		return ErrRuntimeStackClosed
 	}
@@ -68,7 +69,7 @@ func (stack *RuntimeStack) RequestStop() error {
 		return ErrRuntimeStackClosed
 	}
 	stack.mu.Lock()
-	if stack.closing || stack.closed {
+	if stack.shutdown || stack.closing || stack.closed {
 		stack.mu.Unlock()
 		return ErrRuntimeStackClosed
 	}
@@ -86,9 +87,8 @@ func (stack *RuntimeStack) Close() error {
 	}
 	stack.mu.Lock()
 	if stack.closed {
-		closeErr := stack.closeErr
 		stack.mu.Unlock()
-		return closeErr
+		return nil
 	}
 	if stack.closing {
 		closeDone := stack.closeDone
@@ -99,21 +99,35 @@ func (stack *RuntimeStack) Close() error {
 		stack.mu.Unlock()
 		return closeErr
 	}
+	stack.shutdown = true
 	stack.closing = true
+	stack.closeDone = make(chan struct{})
 	slowPath := stack.slowPath
 	generation := stack.generation
 	stack.mu.Unlock()
 
-	slowPathErr := slowPath.Close()
-	generationErr := generation.Close()
+	var slowPathErr error
+	if !interfaceValueIsNil(slowPath) {
+		slowPathErr = slowPath.Close()
+	}
+	var generationErr error
+	if slowPathErr == nil && !interfaceValueIsNil(generation) {
+		generationErr = generation.Close()
+	}
 	closeErr := errors.Join(
 		wrapRuntimeStackCloseError("slow path", slowPathErr),
 		wrapRuntimeStackCloseError("generation owner", generationErr),
 	)
 
 	stack.mu.Lock()
+	if slowPathErr == nil {
+		stack.slowPath = nil
+	}
+	if slowPathErr == nil && generationErr == nil {
+		stack.generation = nil
+	}
 	stack.closeErr = closeErr
-	stack.closed = true
+	stack.closed = interfaceValueIsNil(stack.slowPath) && interfaceValueIsNil(stack.generation)
 	stack.closing = false
 	close(stack.closeDone)
 	stack.mu.Unlock()

@@ -953,7 +953,7 @@ func TestControllerBackendCloseRunsOutsideLocksAndCallbackFailsClosed(t *testing
 	}
 }
 
-func TestControllerConcurrentCloseIsIdempotentAndRetainsFirstError(t *testing.T) {
+func TestControllerConcurrentCloseCoalescesFailureAndLaterRetries(t *testing.T) {
 	engine, _ := testEngine(t, nil)
 	closeFailure := errors.New("injected close failure")
 	closeStarted := make(chan struct{})
@@ -983,6 +983,7 @@ func TestControllerConcurrentCloseIsIdempotentAndRetainsFirstError(t *testing.T)
 	close(start)
 	awaitControllerSignal(t, closeStarted, "backend Close entry")
 	awaitControllerClosing(t, controller)
+	time.Sleep(10 * time.Millisecond)
 	close(closeRelease)
 	wait.Wait()
 
@@ -997,8 +998,15 @@ func TestControllerConcurrentCloseIsIdempotentAndRetainsFirstError(t *testing.T)
 			t.Fatalf("Close[%d] did not return the retained first error", index)
 		}
 	}
-	if err := controller.Close(); err != errs[0] {
-		t.Fatal("later Close did not return the retained first error")
+	backend.closeErr = nil
+	if err := controller.Close(); err != nil {
+		t.Fatalf("retry Close error=%v", err)
+	}
+	if backend.closeCalls != 2 {
+		t.Fatalf("backend retry Close calls=%d, want 2", backend.closeCalls)
+	}
+	if err := controller.Close(); err != nil || backend.closeCalls != 2 {
+		t.Fatalf("converged Close error=%v calls=%d", err, backend.closeCalls)
 	}
 	if _, err := controller.Tick(context.Background()); !errors.Is(err, ErrControllerClosed) {
 		t.Fatalf("operation after failed Close error=%v", err)

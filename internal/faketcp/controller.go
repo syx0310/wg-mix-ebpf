@@ -239,6 +239,7 @@ type Controller struct {
 	inflightDone *sync.Cond
 	closeDone    chan struct{}
 	inflight     uint64
+	shutdown     bool
 	closing      bool
 	closed       bool
 	failureErr   error
@@ -394,24 +395,19 @@ func (c *Controller) Recover(ctx context.Context) (RecoveryReport, error) {
 }
 
 // Close first rejects new operations, waits for admitted HandleSample and Tick
-// calls, and then closes the single owned backend exactly once without holding
-// stateMu or opMu. A first close error is retained and returned by every later
-// Close call. A nil or zero-value receiver fails closed with
-// ErrControllerClosed.
+// calls, and then closes the single owned backend without holding stateMu or
+// opMu. A failed close retains that exact backend for a later Close retry while
+// the first attempt permanently fences operations. A nil or zero-value
+// receiver fails closed with ErrControllerClosed.
 func (c *Controller) Close() error {
 	if c == nil {
 		return ErrControllerClosed
 	}
 
 	c.stateMu.Lock()
-	if !c.initializedLocked() {
-		c.stateMu.Unlock()
-		return ErrControllerClosed
-	}
 	if c.closed {
-		closeErr := c.closeErr
 		c.stateMu.Unlock()
-		return closeErr
+		return nil
 	}
 	if c.closing {
 		closeDone := c.closeDone
@@ -422,8 +418,14 @@ func (c *Controller) Close() error {
 		c.stateMu.Unlock()
 		return closeErr
 	}
+	if !c.initializedLocked() {
+		c.stateMu.Unlock()
+		return ErrControllerClosed
+	}
 
+	c.shutdown = true
 	c.closing = true
+	c.closeDone = make(chan struct{})
 	for c.inflight != 0 {
 		c.inflightDone.Wait()
 	}
@@ -436,8 +438,12 @@ func (c *Controller) Close() error {
 	}
 
 	c.stateMu.Lock()
+	if closeErr == nil {
+		c.backend = nil
+	}
 	c.closeErr = closeErr
-	c.closed = true
+	c.closed = controllerBackendIsNil(c.backend)
+	c.closing = false
 	close(c.closeDone)
 	c.inflightDone.Broadcast()
 	c.stateMu.Unlock()
@@ -450,7 +456,7 @@ func (c *Controller) beginSerializedOperation() error {
 	}
 
 	c.stateMu.Lock()
-	if !c.initializedLocked() || c.closing || c.closed {
+	if !c.initializedLocked() || c.shutdown || c.closing || c.closed {
 		c.stateMu.Unlock()
 		return ErrControllerClosed
 	}
@@ -496,7 +502,7 @@ func (c *Controller) beginRecoveryOperation() error {
 		return ErrControllerClosed
 	}
 	c.stateMu.Lock()
-	if !c.initializedLocked() || c.closing || c.closed {
+	if !c.initializedLocked() || c.shutdown || c.closing || c.closed {
 		c.stateMu.Unlock()
 		return ErrControllerClosed
 	}

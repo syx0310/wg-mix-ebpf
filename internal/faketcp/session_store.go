@@ -92,7 +92,6 @@ type LinuxSessionStore struct {
 	generation    uint64
 	identity      SessionMapIdentity
 	closed        bool
-	closeErr      error
 }
 
 var _ SessionStore = (*LinuxSessionStore)(nil)
@@ -341,27 +340,29 @@ func (store *LinuxSessionStore) DeleteEstablishedIfUnchanged(
 }
 
 // Close releases only the store-owned cloned map handle. It never closes the
-// caller's handle. Close serialises with every store operation and is
-// idempotent: a close failure is retained and returned by later Close calls,
-// but the store remains permanently closed either way.
+// caller's handle. The first call permanently fences store operations. A
+// failed backend close retains that exact handle for a later Close retry; a
+// successful retry releases the owner and later calls return nil.
 func (store *LinuxSessionStore) Close() error {
 	if store == nil {
 		return nil
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	if store.closed {
-		return store.closeErr
+	if sessionMapBackendIsNil(store.backend) {
+		if store.closed {
+			return nil
+		}
+		store.closed = true
+		return errors.New("close faketcp session store: owned backend is nil")
 	}
 	store.closed = true
-	if sessionMapBackendIsNil(store.backend) {
-		store.closeErr = errors.New("close faketcp session store: owned backend is nil")
-		return store.closeErr
-	}
 	if err := store.backend.Close(); err != nil {
-		store.closeErr = fmt.Errorf("close owned faketcp session map handle: %w", err)
+		return fmt.Errorf("close owned faketcp session map handle: %w", err)
 	}
-	return store.closeErr
+	store.backend = nil
+	store.compareDelete = nil
+	return nil
 }
 
 func (store *LinuxSessionStore) requireOpenLocked() error {
