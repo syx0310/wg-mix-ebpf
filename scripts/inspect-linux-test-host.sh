@@ -4,6 +4,8 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 usage:
+  scripts/inspect-linux-test-host.sh --self-test-nft-table-gate
+
   sudo scripts/inspect-linux-test-host.sh \
     --expected-address 192.168.10.82 \
     --interface ens33 \
@@ -25,9 +27,25 @@ EXPECTED_HOSTNAME=""
 EXPECTED_KERNEL=""
 EXPECTED_MACHINE_ID=""
 ALLOW_MISSING_BPFTOOL=0
+SELF_TEST_NFT_TABLE_GATE=0
+
+project_guard_table_lines() {
+  awk '
+    $1 == "table" &&
+    $2 == "inet" &&
+    ($3 == "wg_mix_ebpf_guard" ||
+      index($3, "wg_mix_ebpf_guard_") == 1) {
+      print
+    }
+  '
+}
 
 while (($# > 0)); do
   case "$1" in
+  --self-test-nft-table-gate)
+    SELF_TEST_NFT_TABLE_GATE=1
+    shift
+    ;;
   --expected-address)
     (($# >= 2)) || {
       echo "error: --expected-address requires a value" >&2
@@ -92,6 +110,39 @@ while (($# > 0)); do
   esac
 done
 
+if ((SELF_TEST_NFT_TABLE_GATE)); then
+  if [[ -n "${EXPECTED_ADDRESS}" || -n "${INTERFACE}" ||
+    -n "${PEER_ADDRESS}" || -n "${EXPECTED_HOSTNAME}" ||
+    -n "${EXPECTED_KERNEL}" || -n "${EXPECTED_MACHINE_ID}" ||
+    "${ALLOW_MISSING_BPFTOOL}" -ne 0 ]]; then
+    echo "error: --self-test-nft-table-gate does not accept host arguments" >&2
+    exit 2
+  fi
+  fixture="$(
+    printf '%s\n' \
+      'table inet unrelated' \
+      'table inet wg_mix_ebpf_guard' \
+      'table inet wg_mix_ebpf_guard_0123456789abcdef0123456789abcdef' \
+      'table inet wg_mix_ebpf_guard_damaged-owner-name' \
+      'table inet wg_mix_ebpf_guardrail' \
+      'table ip wg_mix_ebpf_guard'
+  )"
+  expected="$(
+    printf '%s\n' \
+      'table inet wg_mix_ebpf_guard' \
+      'table inet wg_mix_ebpf_guard_0123456789abcdef0123456789abcdef' \
+      'table inet wg_mix_ebpf_guard_damaged-owner-name'
+  )"
+  actual="$(project_guard_table_lines <<<"${fixture}")"
+  [[ "${actual}" == "${expected}" ]] || {
+    printf 'error: project nft table gate mismatch\nexpected:\n%s\nactual:\n%s\n' \
+      "${expected}" "${actual}" >&2
+    exit 1
+  }
+  echo "project nft table gate self-test passed"
+  exit 0
+fi
+
 [[ "${EXPECTED_ADDRESS}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || {
   echo "error: a literal IPv4 --expected-address is required" >&2
   exit 2
@@ -121,7 +172,7 @@ done
   exit 1
 }
 
-for command in ethtool find findmnt grep ip nft ss stat tc wg; do
+for command in awk ethtool find findmnt ip nft ss stat tc wg; do
   command -v "${command}" >/dev/null || {
     printf 'error: required command is missing: %s\n' "${command}" >&2
     exit 1
@@ -233,7 +284,9 @@ run_optional "WireGuard status" wg show
 run_optional "nftables tables" nft list tables
 
 nft_tables="$(nft list tables)"
-if grep -Fxq 'table inet wg_mix_ebpf_guard' <<<"${nft_tables}"; then
+project_nft_tables="$(project_guard_table_lines <<<"${nft_tables}")"
+if [[ -n "${project_nft_tables}" ]]; then
+  printf 'unexpected_project_nftables_tables:\n%s\n' "${project_nft_tables}" >&2
   INSPECTION_FAILURES+=("unexpected-project-nftables-table")
 fi
 

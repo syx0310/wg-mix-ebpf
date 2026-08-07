@@ -20,6 +20,7 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/daemon"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
+	"github.com/syx0310/wg-mix-ebpf/internal/testutil"
 )
 
 func TestUninstallPurgeRejectsNonOwnedConfigDir(t *testing.T) {
@@ -234,6 +235,122 @@ func TestInstallAndUninstallRejectNonCleanDefaultConfigDirectory(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestApplyInstallPreservesRequestedServiceModes(t *testing.T) {
+	t.Run("systemd", func(t *testing.T) {
+		root := t.TempDir()
+		prepareServiceModeTestAnchors(t, root, "systemd")
+		installPaths := serviceModeTestPaths(root)
+		setCleanupTestEnvironment(t, installPaths)
+		installFakeSystemctl(t, filepath.Join(t.TempDir(), "systemctl.log"), "")
+		if _, err := Install(
+			systemdEnableTestContext(t),
+			Options{System: "systemd"},
+		); err != nil {
+			t.Fatalf("apply systemd install: %v", err)
+		}
+
+		for _, dir := range []string{
+			filepath.Dir(installPaths.ConfigPath),
+			filepath.Dir(installPaths.BinaryPath),
+			installPaths.VarLibDir,
+			installPaths.RunDir,
+			installPaths.SystemdDir,
+		} {
+			requireInstallMode(t, dir, 0o755)
+		}
+		requireInstallMode(t, installPaths.BinaryPath, 0o755)
+		requireInstallMode(
+			t,
+			filepath.Join(installPaths.SystemdDir, "wg-mix-ebpf.service"),
+			0o644,
+		)
+	})
+
+	t.Run("openwrt", func(t *testing.T) {
+		root := t.TempDir()
+		prepareServiceModeTestAnchors(t, root, "openwrt")
+		installPaths := serviceModeTestPaths(root)
+		setCleanupTestEnvironment(t, installPaths)
+		if _, err := Install(
+			systemdEnableTestContext(t),
+			Options{System: "openwrt"},
+		); err != nil {
+			t.Fatalf("apply OpenWrt install: %v", err)
+		}
+
+		for _, dir := range []string{
+			filepath.Dir(installPaths.ConfigPath),
+			filepath.Dir(installPaths.BinaryPath),
+			installPaths.VarLibDir,
+			installPaths.RunDir,
+			installPaths.OpenWrtInitDir,
+			installPaths.OpenWrtHotplugDir,
+		} {
+			requireInstallMode(t, dir, 0o755)
+		}
+		requireInstallMode(t, installPaths.BinaryPath, 0o755)
+		requireInstallMode(
+			t,
+			filepath.Join(installPaths.OpenWrtInitDir, "wg-mix-ebpf"),
+			0o755,
+		)
+		requireInstallMode(
+			t,
+			filepath.Join(installPaths.OpenWrtHotplugDir, "90-wg-mix-ebpf"),
+			0o755,
+		)
+	})
+}
+
+func prepareServiceModeTestAnchors(t *testing.T, root string, system string) {
+	t.Helper()
+	directories := []string{
+		filepath.Join(root, "etc"),
+		filepath.Join(root, "usr"),
+		filepath.Join(root, "var", "lib"),
+		filepath.Join(root, "run"),
+	}
+	switch system {
+	case "systemd":
+		directories = append(directories, filepath.Join(root, "etc", "systemd"))
+	case "openwrt":
+		directories = append(
+			directories,
+			filepath.Join(root, "etc", "init.d"),
+			filepath.Join(root, "etc", "hotplug.d"),
+		)
+	}
+	for _, directory := range directories {
+		if err := os.MkdirAll(directory, 0o755); err != nil {
+			t.Fatalf("create service mode test anchor %s: %v", directory, err)
+		}
+	}
+}
+
+func serviceModeTestPaths(root string) paths {
+	return paths{
+		ConfigPath:        filepath.Join(root, "etc", "wg-mix-ebpf", "config.yaml"),
+		BinaryPath:        filepath.Join(root, "usr", "sbin", "wg-mix-ebpf"),
+		VarLibDir:         filepath.Join(root, "var", "lib", "wg-mix-ebpf"),
+		RunDir:            filepath.Join(root, "run", "wg-mix-ebpf"),
+		SystemdDir:        filepath.Join(root, "etc", "systemd", "system"),
+		OpenWrtInitDir:    filepath.Join(root, "etc", "init.d"),
+		OpenWrtHotplugDir: filepath.Join(root, "etc", "hotplug.d", "iface"),
+		PinPath:           filepath.Join(root, "sys", "fs", "bpf", "wg-mix-ebpf"),
+	}
+}
+
+func requireInstallMode(t *testing.T, path string, want os.FileMode) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("inspect mode for %s: %v", path, err)
+	}
+	if got := info.Mode().Perm(); got != want {
+		t.Fatalf("mode for %s = %#o, want %#o", path, got, want)
 	}
 }
 
@@ -923,6 +1040,10 @@ func TestUninstallDoesNotDeadlockWhenConfigExists(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte(
 		"#!/bin/sh\n"+
 			"set -eu\n"+
+			"if [ \"$*\" = '-j list tables' ]; then\n"+
+			"  printf '%s\\n' '{\"nftables\":[{\"metainfo\":{\"json_schema_version\":1}}]}'\n"+
+			"  exit 0\n"+
+			"fi\n"+
 			"printf '%s\\000' \"$#\" \"$@\" >\"$WG_MIX_EBPF_TEST_NFT_READY_FIFO\"\n"+
 			"IFS= read -r control <\"$WG_MIX_EBPF_TEST_NFT_RELEASE_FIFO\"\n"+
 			"[ \"$control\" = continue ] || exit 70\n"+
@@ -3534,16 +3655,19 @@ func installFakeNft(t *testing.T, commandLog string) {
 	if err := os.Mkdir(fakeBin, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	script := "#!/bin/sh\n" +
-		"printf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\n" +
-		"exit 1\n"
+	logCommand := ""
 	if commandLog != "" {
 		t.Setenv("WG_MIX_EBPF_TEST_NFT_LOG", commandLog)
-		script = "#!/bin/sh\n" +
-			"printf invoked > \"$WG_MIX_EBPF_TEST_NFT_LOG\"\n" +
-			"printf '%s\\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2\n" +
-			"exit 1\n"
+		logCommand = `printf '%s\n' "$*" >> "$WG_MIX_EBPF_TEST_NFT_LOG"` + "\n"
 	}
+	script := "#!/bin/sh\n" + logCommand + `if [ "$1" = "-j" ] &&
+	[ "$2" = "list" ] && [ "$3" = "tables" ]; then
+	printf '%s\n' '{"nftables":[{"metainfo":{"json_schema_version":1}}]}'
+	exit 0
+fi
+printf '%s\n' 'Error: No such file or directory' 'list table inet wg_mix_ebpf_guard' >&2
+exit 1
+`
 	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte(script), 0o755); err != nil {
 		t.Fatal(err)
 	}
@@ -3620,69 +3744,71 @@ const (
 )
 
 func TestMain(m *testing.M) {
-	const testTempPrefix = ".wg-mix-ebpf-install-tests-"
-	workingDir, err := os.Getwd()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "resolve install package test directory: %v\n", err)
-		os.Exit(1)
-	}
-	workingDir = filepath.Clean(workingDir)
-	testTempRoot, err := os.MkdirTemp(
-		workingDir,
-		testTempPrefix,
-	)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "create isolated install test root: %v\n", err)
-		os.Exit(1)
-	}
-	removeTestTempRoot := func() error {
-		if testTempRoot == "" ||
-			!filepath.IsAbs(testTempRoot) ||
-			filepath.Clean(testTempRoot) != testTempRoot ||
-			filepath.Dir(testTempRoot) != workingDir ||
-			!strings.HasPrefix(filepath.Base(testTempRoot), testTempPrefix) {
-			return fmt.Errorf(
-				"refuse unsafe isolated install test root cleanup %q",
-				testTempRoot,
-			)
-		}
-		entries, err := os.ReadDir(testTempRoot)
+	os.Exit(testutil.RunWithStandardUmask(func() int {
+		const testTempPrefix = ".wg-mix-ebpf-install-tests-"
+		workingDir, err := os.Getwd()
 		if err != nil {
-			return err
+			fmt.Fprintf(os.Stderr, "resolve install package test directory: %v\n", err)
+			return 1
 		}
-		if len(entries) != 0 {
-			return fmt.Errorf(
-				"isolated install test root %s retained %d entries",
-				testTempRoot,
-				len(entries),
-			)
+		workingDir = filepath.Clean(workingDir)
+		testTempRoot, err := os.MkdirTemp(
+			workingDir,
+			testTempPrefix,
+		)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create isolated install test root: %v\n", err)
+			return 1
 		}
-		return os.Remove(testTempRoot)
-	}
-	if err := os.Setenv("TMPDIR", testTempRoot); err != nil {
-		fmt.Fprintf(os.Stderr, "set isolated install test root: %v\n", err)
-		if removeErr := removeTestTempRoot(); removeErr != nil {
+		removeTestTempRoot := func() error {
+			if testTempRoot == "" ||
+				!filepath.IsAbs(testTempRoot) ||
+				filepath.Clean(testTempRoot) != testTempRoot ||
+				filepath.Dir(testTempRoot) != workingDir ||
+				!strings.HasPrefix(filepath.Base(testTempRoot), testTempPrefix) {
+				return fmt.Errorf(
+					"refuse unsafe isolated install test root cleanup %q",
+					testTempRoot,
+				)
+			}
+			entries, err := os.ReadDir(testTempRoot)
+			if err != nil {
+				return err
+			}
+			if len(entries) != 0 {
+				return fmt.Errorf(
+					"isolated install test root %s retained %d entries",
+					testTempRoot,
+					len(entries),
+				)
+			}
+			return os.Remove(testTempRoot)
+		}
+		if err := os.Setenv("TMPDIR", testTempRoot); err != nil {
+			fmt.Fprintf(os.Stderr, "set isolated install test root: %v\n", err)
+			if removeErr := removeTestTempRoot(); removeErr != nil {
+				fmt.Fprintf(
+					os.Stderr,
+					"remove isolated install test root %s: %v\n",
+					testTempRoot,
+					removeErr,
+				)
+			}
+			return 1
+		}
+
+		code := m.Run()
+		if err := removeTestTempRoot(); err != nil {
 			fmt.Fprintf(
 				os.Stderr,
 				"remove isolated install test root %s: %v\n",
 				testTempRoot,
-				removeErr,
+				err,
 			)
+			if code == 0 {
+				code = 1
+			}
 		}
-		os.Exit(1)
-	}
-
-	code := m.Run()
-	if err := removeTestTempRoot(); err != nil {
-		fmt.Fprintf(
-			os.Stderr,
-			"remove isolated install test root %s: %v\n",
-			testTempRoot,
-			err,
-		)
-		if code == 0 {
-			code = 1
-		}
-	}
-	os.Exit(code)
+		return code
+	}))
 }
