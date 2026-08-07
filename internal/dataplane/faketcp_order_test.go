@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestFakeTCPIncrementalTransportChecksumMatchesFullRecompute(t *testing.T) {
+func TestFakeTCPFullTransportChecksumAndIngressInverseMatch(t *testing.T) {
 	for _, payloadLen := range []int{12, 13, 32, 33, 1419, 1420, 1421, 1451, 1452} {
 		t.Run(strconv.Itoa(payloadLen), func(t *testing.T) {
 			payload := make([]byte, payloadLen)
@@ -40,13 +40,17 @@ func TestFakeTCPIncrementalTransportChecksumMatchesFullRecompute(t *testing.T) {
 			newWords[1] = 6
 			binary.BigEndian.PutUint16(newWords[2:4], uint16(len(tcp)+len(payload)))
 			copy(newWords[4:], tcp)
-			gotTCP := replaceChecksumFolded(udpChecksum, oldWords, newWords)
-			if payloadLen&1 != 0 {
-				gotTCP = replaceChecksumFolded(gotTCP, alignedRotationHead(payload[:12]), shiftedRotationHead(payload[:12]))
+			// The BPF encoder intentionally ignores the incoming UDP checksum:
+			// it may be a complete value, a CHECKSUM_PARTIAL pseudo-header seed,
+			// or IPv4 zero. All three states must produce the same materialized
+			// TCP checksum from pseudo-header + TCP header + complete payload.
+			for _, oldUDPChecksum := range []uint16{udpChecksum, 0x9a7b, 0} {
+				gotTCP := materializeFakeTCPTCPChecksumModel(oldUDPChecksum, tcp, wirePayload)
+				if gotTCP != wantTCP {
+					t.Fatalf("old UDP checksum %#04x: materialized TCP checksum = %#04x, want %#04x", oldUDPChecksum, gotTCP, wantTCP)
+				}
 			}
-			if gotTCP != wantTCP {
-				t.Fatalf("incremental TCP checksum = %#04x, full recompute = %#04x", gotTCP, wantTCP)
-			}
+			gotTCP := wantTCP
 
 			gotUDP := replaceChecksumFolded(gotTCP, newWords, oldWords)
 			if payloadLen&1 != 0 {
@@ -57,6 +61,44 @@ func TestFakeTCPIncrementalTransportChecksumMatchesFullRecompute(t *testing.T) {
 			}
 		})
 	}
+}
+
+func materializeFakeTCPTCPChecksumModel(_ uint16, tcp, wirePayload []byte) uint16 {
+	return testTransportChecksum(6, tcp, wirePayload)
+}
+
+func TestFakeTCPMTUMinusHeaderDeltaBoundary(t *testing.T) {
+	const underlayMTU = 1500
+	tests := []struct {
+		name       string
+		inputL3Len int
+		want       bool
+	}{
+		{name: "exact-minus-twelve", inputL3Len: 1488, want: true},
+		{name: "odd-payload-one-under", inputL3Len: 1487, want: true},
+		{name: "one-over-boundary", inputL3Len: 1489, want: false},
+		{name: "ordinary-wireguard", inputL3Len: 1420, want: true},
+		{name: "invalid-too-short", inputL3Len: 27, want: false},
+		{name: "prototype-frame-cap", inputL3Len: 2305, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := fakeTCPMTUAllowsGrowth(test.inputL3Len, underlayMTU)
+			if got != test.want {
+				t.Fatalf("input L3=%d mtu=%d allowed=%v, want %v", test.inputL3Len, underlayMTU, got, test.want)
+			}
+		})
+	}
+}
+
+func fakeTCPMTUAllowsGrowth(inputL3Len, underlayMTU int) bool {
+	const (
+		minimumIPv4UDP = 20 + 8
+		headerDelta    = 12
+		packetCap      = 2304
+	)
+	return inputL3Len >= minimumIPv4UDP && inputL3Len <= packetCap &&
+		underlayMTU >= headerDelta && inputL3Len <= underlayMTU-headerDelta
 }
 
 func testTransportChecksum(protocol byte, header, payload []byte) uint16 {
@@ -186,7 +228,9 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 		"!faketcp_metadata_valid(skb, generation)",
 		"faketcp_capture_first_packet(skb, info, rule, &key)",
 		"record_len = sizeof(record->event) + packet_len",
-		"faketcp_tcp_checksum_from_materialized_udp",
+		"faketcp_materialize_tcp_checksum",
+		"bpf_check_mtu(skb, 0, &mtu_len, FAKETCP_HEADER_DELTA, 0)",
+		"bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)",
 	} {
 		if !strings.Contains(tc, want) && !strings.Contains(fake, want) {
 			t.Fatalf("FakeTCP pipeline source missing %q", want)
@@ -214,6 +258,239 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 	typeWord := strings.Index(egress, "update_type_word(skb, &info, old_wire, new_wire, 1)")
 	if preflight < 0 || typeWord < 0 || preflight >= typeWord {
 		t.Fatal("FakeTCP first-packet capture must precede type-word and XOR mutation")
+	}
+}
+
+func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+
+	preflightStart := strings.Index(text, "static __always_inline int faketcp_preflight_egress")
+	checksumCommentStart := strings.Index(text, "// TC's public __sk_buff ABI")
+	checksumStart := strings.Index(text, "static __always_inline int faketcp_materialize_tcp_checksum")
+	encoderStart := strings.Index(text, "static __always_inline int faketcp_encode_established")
+	continuationStart := strings.Index(text, "static __always_inline int faketcp_continue_egress")
+	if preflightStart < 0 || checksumCommentStart < 0 || checksumStart < 0 || encoderStart < 0 || continuationStart < 0 ||
+		preflightStart >= checksumCommentStart || checksumCommentStart >= checksumStart ||
+		checksumStart >= encoderStart || encoderStart >= continuationStart {
+		t.Fatal("FakeTCP preflight/checksum/encoder sections are missing or malformed")
+	}
+
+	preflight := text[preflightStart:checksumCommentStart]
+	gsoReject := strings.Index(preflight, "if (skb->gso_segs || skb->gso_size)")
+	flowLookup := strings.Index(preflight, "faketcp_tc_key(skb, info, generation, &key)")
+	if gsoReject < 0 || flowLookup < 0 || gsoReject >= flowLookup {
+		t.Fatal("aggregate GSO must be rejected before flow lookup, capture, type-word and XOR mutation")
+	}
+	for _, want := range []string{
+		"One header insertion cannot provide",
+		"not an implementation of per-segment FakeTCP",
+		"FAKETCP_STAT_GSO_REJECT",
+	} {
+		if !strings.Contains(preflight, want) {
+			t.Fatalf("GSO hard-gate contract missing %q", want)
+		}
+	}
+
+	materialize := text[checksumCommentStart:encoderStart]
+	for _, want := range []string{
+		"does not expose ip_summed, csum_start or",
+		"The old UDP checksum is deliberately ignored",
+		"struct faketcp_ipv4_pseudo_header pseudo",
+		"for (int i = 0; i < FAKETCP_CHECKSUM_CHUNK_COUNT; i++)",
+		"bpf_skb_load_bytes(skb, payload_off + processed",
+		"__builtin_memset(chunk, 0, sizeof(chunk))",
+		"processed != payload_len",
+	} {
+		if !strings.Contains(materialize, want) {
+			t.Fatalf("full-checksum materialization contract missing %q", want)
+		}
+	}
+	if strings.Contains(materialize, "old_udp") {
+		t.Fatal("full TCP checksum materialization must not consume the old UDP checksum or seed")
+	}
+
+	encoder := text[encoderStart:continuationStart]
+	mtuCheck := strings.Index(encoder, "faketcp_mtu_allows_growth(skb, old_total_len)")
+	normalize := strings.Index(encoder, "bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)")
+	checksum := strings.Index(encoder, "faketcp_materialize_tcp_checksum(skb")
+	if mtuCheck < 0 || normalize < 0 || checksum < 0 || mtuCheck >= normalize || normalize >= checksum {
+		t.Fatal("MTU check, checksum-state normalization and full recompute are out of order")
+	}
+	for _, want := range []string{
+		"old_total_len != sizeof(*iph) + udp_len",
+		"old_total_len > FAKETCP_MAX_IPV4_TOTAL_LEN",
+		"old_total_len != skb->len - info->ip_off",
+	} {
+		if !strings.Contains(encoder, want) {
+			t.Fatalf("bounded checksum read precondition missing %q", want)
+		}
+	}
+}
+
+func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
+	moduleSource, err := os.ReadFile("../../kernel/faketcp_checksum/wg_mix_faketcp_checksum.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bpfSource, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeSource, err := os.ReadFile("../../Makefile")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	module := string(moduleSource)
+	for _, want := range []string{
+		"SPDX-License-Identifier: GPL-2.0-only",
+		"skb_is_gso(skb)",
+		"skb->protocol != htons(ETH_P_IP)",
+		"ip->protocol != IPPROTO_UDP",
+		"switch (skb->ip_summed)",
+		"case CHECKSUM_NONE:",
+		"case CHECKSUM_PARTIAL:",
+		"default:",
+		"skb_transport_header_was_set(skb)",
+		"skb_checksum_start_offset(skb) != transport_offset",
+		"skb->csum_offset != offsetof(struct udphdr, check)",
+		"skb_reset_csum_not_inet(skb)",
+		"register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS",
+		".owner = THIS_MODULE",
+	} {
+		if !strings.Contains(module, want) {
+			t.Fatalf("checksum kfunc hard-gate contract missing %q", want)
+		}
+	}
+	networkIdentity := strings.Index(module, "network_offset != actual_network_offset")
+	commonUDPBytes := strings.Index(module, "ntohs(udp->len) != udp_length")
+	noneCase := strings.Index(module, "case CHECKSUM_NONE:")
+	noneReturn := strings.Index(module, "return WG_MIX_FAKETCP_CSUM_MATERIALIZED;")
+	partialCase := strings.Index(module, "case CHECKSUM_PARTIAL:")
+	transportHeaderRequired := strings.Index(module, "if (!skb_transport_header_was_set(skb))")
+	transportIdentity := strings.Index(module, "transport_offset != actual_transport_offset")
+	partialOffsets := strings.Index(module, "skb_checksum_start_offset(skb) != transport_offset")
+	if networkIdentity < 0 || commonUDPBytes < 0 || noneCase < 0 || noneReturn < 0 || partialCase < 0 ||
+		transportHeaderRequired < 0 || transportIdentity < 0 || partialOffsets < 0 ||
+		!(networkIdentity < commonUDPBytes && commonUDPBytes < noneCase &&
+			noneCase < noneReturn && noneReturn < partialCase &&
+			partialCase < transportHeaderRequired && transportHeaderRequired < transportIdentity &&
+			transportIdentity < partialOffsets) {
+		t.Fatal("CHECKSUM_NONE must return without a transport header; CHECKSUM_PARTIAL must require exact transport/checksum metadata")
+	}
+	materializedReturn := strings.Index(module, "if (ret == WG_MIX_FAKETCP_CSUM_MATERIALIZED)")
+	partialReset := strings.Index(module, "skb_reset_csum_not_inet(skb)")
+	if materializedReturn < 0 || partialReset < 0 || materializedReturn >= partialReset {
+		t.Fatal("CHECKSUM_NONE must return before CHECKSUM_PARTIAL metadata normalization")
+	}
+	for _, forbidden := range []string{
+		"BPF_PROG_TYPE_XDP",
+		"BPF_PROG_TYPE_SCHED_ACT",
+		"request_module(",
+		"call_usermodehelper(",
+	} {
+		if strings.Contains(module, forbidden) {
+			t.Fatalf("checksum module contains forbidden expansion %q", forbidden)
+		}
+	}
+
+	bpf := string(bpfSource)
+	if strings.Count(bpf, "wg_mix_faketcp_skb_normalize_udp_csum(") != 2 {
+		t.Fatal("experimental BPF source must contain one declaration and one call of the required kfunc")
+	}
+	top := string(topSource)
+	licenseGate := strings.Index(top, "#ifdef WG_MIX_EXPERIMENTAL_FAKETCP\n// Kernel kfunc callers")
+	experimentalGPL := strings.Index(top, `char LICENSE[] SEC("license") = "GPL";`)
+	baselineMIT := strings.Index(top, `char LICENSE[] SEC("license") = "MIT";`)
+	if licenseGate < 0 || experimentalGPL < licenseGate || baselineMIT < experimentalGPL {
+		t.Fatal("experimental GPL/baseline MIT license split is missing or malformed")
+	}
+
+	makefile := string(makeSource)
+	if !strings.Contains(makefile, "build-faketcp-checksum-kmod:") ||
+		!strings.Contains(makefile, `MO="$(FAKETCP_CHECKSUM_KMOD_OUTPUT)" modules`) {
+		t.Fatal("out-of-tree checksum module build target is missing")
+	}
+	for _, forbidden := range []string{"modules_install", "modprobe", "insmod", "rmmod"} {
+		if strings.Contains(makefile, forbidden) {
+			t.Fatalf("Makefile must not install, load, unload or clean the module: found %q", forbidden)
+		}
+	}
+}
+
+func TestFakeTCPChecksumMetadataAcceptanceContract(t *testing.T) {
+	const (
+		checksumNone        = uint8(0)
+		checksumUnnecessary = uint8(1)
+		checksumComplete    = uint8(2)
+		checksumPartial     = uint8(3)
+	)
+	tests := []struct {
+		name                  string
+		mode                  uint8
+		gso                   bool
+		transportHeaderSet    bool
+		transportOffset       int
+		actualTransportOffset int
+		checksumStart         int
+		checksumOffset        int
+		want                  bool
+	}{
+		{name: "test-run-none-without-transport-header", mode: checksumNone, transportOffset: 34, want: true},
+		{name: "raw-reinject-none-ignores-transport-header", mode: checksumNone, transportHeaderSet: true, transportOffset: 34, actualTransportOffset: 33, want: true},
+		{name: "wireguard-partial", mode: checksumPartial, transportHeaderSet: true, transportOffset: 34, actualTransportOffset: 34, checksumStart: 34, checksumOffset: 6, want: true},
+		{name: "partial-missing-transport-header", mode: checksumPartial, transportOffset: 34, actualTransportOffset: 34, checksumStart: 34, checksumOffset: 6},
+		{name: "partial-wrong-transport-header", mode: checksumPartial, transportHeaderSet: true, transportOffset: 34, actualTransportOffset: 33, checksumStart: 34, checksumOffset: 6},
+		{name: "partial-wrong-start", mode: checksumPartial, transportHeaderSet: true, transportOffset: 34, actualTransportOffset: 34, checksumStart: 33, checksumOffset: 6},
+		{name: "partial-wrong-offset", mode: checksumPartial, transportHeaderSet: true, transportOffset: 34, actualTransportOffset: 34, checksumStart: 34, checksumOffset: 7},
+		{name: "none-gso", mode: checksumNone, gso: true, transportOffset: 34},
+		{name: "partial-gso", mode: checksumPartial, gso: true, transportHeaderSet: true, transportOffset: 34, actualTransportOffset: 34, checksumStart: 34, checksumOffset: 6},
+		{name: "complete", mode: checksumComplete, transportOffset: 34},
+		{name: "unnecessary", mode: checksumUnnecessary, transportOffset: 34},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := fakeTCPChecksumMetadataAccepted(
+				test.mode, test.gso, test.transportHeaderSet,
+				test.transportOffset, test.actualTransportOffset,
+				test.checksumStart, test.checksumOffset,
+			)
+			if got != test.want {
+				t.Fatalf("accepted=%v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func fakeTCPChecksumMetadataAccepted(
+	mode uint8,
+	gso bool,
+	transportHeaderSet bool,
+	transportOffset int,
+	actualTransportOffset int,
+	checksumStart int,
+	checksumOffset int,
+) bool {
+	if gso {
+		return false
+	}
+	switch mode {
+	case 0: // CHECKSUM_NONE: raw reinjection already materialized the packet.
+		return true
+	case 3: // CHECKSUM_PARTIAL: WireGuard/UDP tunnel offload metadata is exact.
+		return transportHeaderSet &&
+			actualTransportOffset == transportOffset &&
+			checksumStart == transportOffset && checksumOffset == 6
+	default:
+		return false
 	}
 }
 

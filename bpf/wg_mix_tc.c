@@ -2154,4 +2154,10 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	return TC_ACT_OK;
 }
 
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+// Kernel kfunc callers must use a GPL-compatible BPF license. This applies
+// only to the separately built experimental object; the baseline stays MIT.
+char LICENSE[] SEC("license") = "GPL";
+#else
 char LICENSE[] SEC("license") = "MIT";
+#endif
