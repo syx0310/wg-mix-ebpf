@@ -334,7 +334,7 @@ VETH_RB="wmr${RUN_ID}b"
 TEST_ROOT="/run/wg-mix-ebpf-tests"
 RUN_BASE="${TEST_ROOT}/${RUN_ID}"
 BPFFS_DIR="${RUN_BASE}/bpffs"
-BPFFS_SOURCE="bpf"
+BPFFS_SOURCE=""
 BPFFS_MOUNT_ID=""
 BPFFS_PARENT_DEV=""
 BPFFS_PARENT_INO=""
@@ -363,6 +363,11 @@ import secrets
 print(secrets.token_hex(16))
 PY
 )"
+if [[ ! "${OWNER_TOKEN}" =~ ^[0-9a-f]{32}$ ]]; then
+  echo "error: failed to generate a canonical 32-character owner token" >&2
+  exit 1
+fi
+BPFFS_SOURCE="wg-mix-ebpf-${RUN_ID}-${OWNER_TOKEN}"
 NETNS_SOCKET_A="wme-netns-${RUN_ID}-a-${OWNER_TOKEN}"
 NETNS_SOCKET_R="wme-netns-${RUN_ID}-r-${OWNER_TOKEN}"
 NETNS_SOCKET_B="wme-netns-${RUN_ID}-b-${OWNER_TOKEN}"

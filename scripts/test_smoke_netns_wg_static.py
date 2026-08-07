@@ -982,8 +982,19 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.assertIn(field, self.source)
         self.assertNotIn("lease_a=", self.source)
         self.assertNotIn("lease_b=", self.source)
-        self.assertIn('BPFFS_SOURCE="bpf"', self.source)
-        self.assertNotIn('BPFFS_SOURCE="wg-mix-ebpf-', self.source)
+        self.assertIn(
+            'BPFFS_SOURCE="wg-mix-ebpf-${RUN_ID}-${OWNER_TOKEN}"',
+            self.source,
+        )
+        self.assertNotIn('BPFFS_SOURCE="bpf"', self.source)
+        owner_source = self.source.index(
+            'BPFFS_SOURCE="wg-mix-ebpf-${RUN_ID}-${OWNER_TOKEN}"'
+        )
+        self.assertLess(self.source.index('RUN_ID="$(python3 -'), owner_source)
+        self.assertLess(
+            self.source.index('OWNER_TOKEN="$(python3 -'),
+            owner_source,
+        )
         self.assertIn("$5 != target", self.source)
         self.assertIn("other_bpf_count++", self.source)
         self.assertNotIn('-v production="/sys/fs/bpf"', self.source)
@@ -1139,30 +1150,36 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         )
         awk_program = self.source[program_start:program_end]
         target = "/run/wg-mix-ebpf-test/private-bpffs"
+        source = "wg-mix-ebpf-01234567-0123456789abcdef0123456789abcdef"
         mountinfo = (
             "25 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"
             "41 25 0:30 / /sys/fs/bpf rw,nosuid,nodev,noexec "
             "- bpf bpf rw,mode=700\n"
             f"77 25 0:31 / {target} rw,nosuid,nodev,noexec "
-            "shared:77 - bpf bpf rw,mode=700\n"
+            f"shared:77 - bpf {source} rw,mode=700\n"
         )
-        completed = subprocess.run(
-            [
-                "/usr/bin/awk",
-                "-v",
-                f"target={target}",
-                "-v",
-                "expected_source=bpf",
-                awk_program,
-            ],
-            input=mountinfo,
-            check=False,
-            capture_output=True,
-            text=True,
-            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
-        )
+        def inspect(expected_source: str) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    "/usr/bin/awk",
+                    "-v",
+                    f"target={target}",
+                    "-v",
+                    f"expected_source={expected_source}",
+                    awk_program,
+                ],
+                input=mountinfo,
+                check=False,
+                capture_output=True,
+                text=True,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+
+        completed = inspect(source)
         self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertEqual(completed.stdout, "77\n")
+        self.assertNotEqual(inspect("bpf").returncode, 0)
+        self.assertNotEqual(inspect(source + "0").returncode, 0)
 
     def test_pin_resources_are_validated_after_detach_before_exact_removal(self) -> None:
         detach_b = self.source.index('teardown_step "detach agent B pin=${PINB}"')
