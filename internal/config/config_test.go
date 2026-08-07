@@ -428,6 +428,64 @@ profiles:
 	}
 }
 
+func TestRejectAggregateFakeTCPBudgetsForSharedMapAndDaemon(t *testing.T) {
+	tests := []struct {
+		name     string
+		settings string
+		want     string
+	}{
+		{
+			name: "shared established map",
+			settings: `
+        session_capacity: 9000
+        max_half_open_sessions: 1000`,
+			want: "aggregate faketcp session_capacity",
+		},
+		{
+			name: "source ledgers",
+			settings: `
+        syn_source_ledger_capacity: 9000`,
+			want: "aggregate faketcp syn_source_ledger_capacity",
+		},
+		{
+			name: "pending bytes",
+			settings: `
+        max_pending_bytes: 700000`,
+			want: "aggregate faketcp max_pending_bytes",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			yaml := `
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: faketcp
+      faketcp:
+        experimental: true` + test.settings + `
+  - name: wg1
+    profile: mix-default
+    transport:
+      mode: faketcp
+      faketcp:
+        experimental: true` + test.settings + `
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`
+			_, err := Load([]byte(yaml))
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("aggregate budget error=%v, want %q", err, test.want)
+			}
+		})
+	}
+}
+
 func TestRejectUnsupportedUnderlayParser(t *testing.T) {
 	_, err := Load([]byte(`
 version: 1

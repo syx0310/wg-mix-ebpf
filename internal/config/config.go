@@ -752,6 +752,37 @@ func validateDataplaneCapacity(c *Config) error {
 	if icmp := underlays * icmpWireGuards; icmp > MaxDirectionalRulesPerGeneration {
 		return fmt.Errorf("configuration may create %d ICMP listeners, maximum is %d per generation", icmp, MaxDirectionalRulesPerGeneration)
 	}
+	// FakeTCP engines own admission/pending budgets per WireGuard, but all of
+	// them share one 16K established BPF map and one daemon address space. Sum
+	// per-WG quotas here so adding another WG cannot silently overcommit either
+	// the shared map or the process-wide bounded-state budgets.
+	var fakeSessions, fakeHalfOpen, fakeSourceLedger, fakePendingFlows, fakePendingBytes uint64
+	for _, wg := range c.WireGuards {
+		if wg.Transport.Mode != "faketcp" {
+			continue
+		}
+		fake := wg.Transport.FakeTCP
+		fakeSessions += uint64(fake.SessionCapacity)
+		fakeHalfOpen += uint64(fake.MaxHalfOpenSessions)
+		fakeSourceLedger += uint64(fake.SYNSourceLedgerCapacity)
+		fakePendingFlows += uint64(fake.MaxPendingFlows)
+		fakePendingBytes += uint64(fake.MaxPendingBytes)
+	}
+	for _, aggregate := range []struct {
+		name  string
+		value uint64
+		limit uint64
+	}{
+		{"session_capacity", fakeSessions, MaxFakeTCPSessions},
+		{"max_half_open_sessions", fakeHalfOpen, MaxFakeTCPHalfOpenSessions},
+		{"syn_source_ledger_capacity", fakeSourceLedger, MaxFakeTCPSYNSourceLedger},
+		{"max_pending_flows", fakePendingFlows, MaxFakeTCPPendingFlows},
+		{"max_pending_bytes", fakePendingBytes, MaxFakeTCPPendingBytes},
+	} {
+		if aggregate.value > aggregate.limit {
+			return fmt.Errorf("aggregate faketcp %s is %d across all WireGuards, maximum shared budget is %d", aggregate.name, aggregate.value, aggregate.limit)
+		}
+	}
 	return nil
 }
 
