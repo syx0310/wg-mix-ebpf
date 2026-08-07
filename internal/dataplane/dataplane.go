@@ -9,6 +9,7 @@ import (
 )
 
 var ErrUnsupported = errors.New("dataplane is unsupported on this platform")
+var ErrFakeTCPKernelGate = errors.New("experimental faketcp kernel gate is not satisfied")
 var ErrPinOwnershipLifecycleLeaseRequired = errors.New(
 	"pin ownership mutation requires the held global lifecycle lease",
 )

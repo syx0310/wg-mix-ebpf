@@ -6,12 +6,13 @@
 #include <linux/ip.h>
 #include <linux/ipv6.h>
 #include <linux/pkt_cls.h>
+#include <linux/tcp.h>
 #include <linux/udp.h>
 #include <stddef.h>
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-#define ABI_VERSION 10
+#define ABI_VERSION 11
 
 #define FAMILY_ANY  0
 #define FAMILY_IPV4 4
@@ -30,6 +31,7 @@
 
 #define TRANSPORT_UDP  0
 #define TRANSPORT_ICMP 1
+#define TRANSPORT_FAKETCP 2
 
 #define ICMP_ROLE_NONE   0
 #define ICMP_ROLE_CLIENT 1
@@ -58,6 +60,8 @@
 #define XOR_CONTEXT_MODE_SHIFT 12
 #define XOR_CONTEXT_MODE_MASK 0x00003000U
 #define XOR_CONTEXT_RESERVED_MASK 0x0000c000U
+#define XOR_CONTEXT_F_FAKETCP (1U << 14)
+#define XOR_CONTEXT_FORBIDDEN_MASK (1U << 15)
 
 #define ICMP_ECHOREPLY 0
 #define ICMP_ECHO      8
@@ -233,7 +237,8 @@ struct ingress_listener_value {
 	__u32 wg_id;
 	__u32 cipher_id;
 	__u8 action;
-	__u8 pad[3];
+	__u8 transport_mode;
+	__u8 pad[2];
 };
 
 struct icmp_listener_key {
@@ -286,6 +291,7 @@ struct xor_context {
 	__u32 payload_off;
 	__u32 target;
 	__u8 checksum_mode;
+	__u8 continue_faketcp;
 };
 
 struct xor_ingress_metadata {
@@ -351,6 +357,15 @@ enum stat_id {
 	STAT_EGRESS_BAD_CHECKSUM,
 	STAT_XOR_EGRESS_DISPATCH_ERROR,
 	STAT_XOR_INGRESS_DISPATCH_ERROR,
+	STAT_FAKETCP_EGRESS_OK,
+	STAT_FAKETCP_INGRESS_OK,
+	STAT_FAKETCP_SESSION_MISS,
+	STAT_FAKETCP_BAD_STATE,
+	STAT_FAKETCP_BAD_PACKET,
+	STAT_FAKETCP_GSO_REJECT,
+	STAT_FAKETCP_CHECKSUM_ERROR,
+	STAT_FAKETCP_METADATA_ERROR,
+	STAT_FAKETCP_EVENT_ERROR,
 	STAT_MAX,
 };
 
@@ -1558,7 +1573,8 @@ static __always_inline void set_xor_context(struct __sk_buff *skb,
 					    __u32 cipher_id,
 					    __u32 payload_off,
 					    __u32 target,
-					    __u8 checksum_mode)
+					    __u8 checksum_mode,
+					    __u8 continue_faketcp)
 {
 	skb->cb[0] = (__u32)generation;
 	skb->cb[1] = (__u32)(generation >> 32);
@@ -1566,6 +1582,7 @@ static __always_inline void set_xor_context(struct __sk_buff *skb,
 	skb->cb[3] = payload_off;
 	skb->cb[4] = XOR_CONTEXT_MAGIC |
 		     ((__u32)checksum_mode << XOR_CONTEXT_MODE_SHIFT) |
+		     (continue_faketcp ? XOR_CONTEXT_F_FAKETCP : 0) |
 		     target;
 }
 
@@ -1575,7 +1592,7 @@ static __always_inline int load_xor_context(struct __sk_buff *skb,
 	__u32 metadata = skb->cb[4];
 
 	if ((metadata & XOR_CONTEXT_MAGIC_MASK) != XOR_CONTEXT_MAGIC ||
-	    (metadata & XOR_CONTEXT_RESERVED_MASK))
+	    (metadata & XOR_CONTEXT_FORBIDDEN_MASK))
 		return -1;
 	context->generation = ((__u64)skb->cb[1] << 32) | skb->cb[0];
 	context->cipher_id = skb->cb[2];
@@ -1583,6 +1600,7 @@ static __always_inline int load_xor_context(struct __sk_buff *skb,
 	context->target = metadata & XOR_CONTEXT_TARGET_MASK;
 	context->checksum_mode = (metadata & XOR_CONTEXT_MODE_MASK) >>
 				 XOR_CONTEXT_MODE_SHIFT;
+	context->continue_faketcp = !!(metadata & XOR_CONTEXT_F_FAKETCP);
 	if (context->generation == 0 || context->cipher_id == 0 ||
 	    context->payload_off < sizeof(struct udphdr) ||
 	    context->payload_off + context->target < context->payload_off ||
@@ -1612,7 +1630,8 @@ static __always_inline int prepare_xor_context_by_id(struct __sk_buff *skb,
 						      struct packet_info *info,
 						      __u32 cipher_id,
 						      __u64 generation,
-						      __u8 checksum_mode)
+						      __u8 checksum_mode,
+						      __u8 continue_faketcp)
 {
 	struct cipher_value *cipher;
 	__u32 target = 0;
@@ -1628,9 +1647,11 @@ static __always_inline int prepare_xor_context_by_id(struct __sk_buff *skb,
 	if (rc < 0)
 		return rc;
 	set_xor_context(skb, generation, cipher_id, info->payload_off, target,
-			checksum_mode);
+			checksum_mode, continue_faketcp);
 	return 0;
 }
+
+#include "wg_mix_faketcp.h"
 
 static __always_inline int run_xor_egress_segment(struct __sk_buff *skb, __u32 segment)
 {
@@ -1668,8 +1689,13 @@ static __always_inline int run_xor_egress_segment(struct __sk_buff *skb, __u32 s
 	}
 
 	clear_xor_context(skb);
-	inc_stat(STAT_EGRESS_REWRITE_OK);
 	inc_stat(STAT_XOR_EGRESS_OK);
+	if (context.continue_faketcp) {
+		bpf_tail_call(skb, &faketcp_egress_programs,
+			      (__u32)context.generation & 1);
+		return xor_dispatch_fail(skb, STAT_XOR_EGRESS_DISPATCH_ERROR);
+	}
+	inc_stat(STAT_EGRESS_REWRITE_OK);
 	if (skb->gso_segs || skb->gso_size)
 		inc_stat(STAT_EGRESS_GSO_REWRITE_OK);
 	return TC_ACT_OK;
@@ -1830,7 +1856,8 @@ int wg_mix_egress(struct __sk_buff *skb)
 	}
 	cipher_id = rule->cipher_id;
 	if (cipher_id != 0) {
-		if (rule->transport_mode != TRANSPORT_UDP) {
+		if (rule->transport_mode != TRANSPORT_UDP &&
+		    rule->transport_mode != TRANSPORT_FAKETCP) {
 			inc_stat(STAT_XOR_KEY_MISSING);
 			return TC_ACT_SHOT;
 		}
@@ -1846,7 +1873,8 @@ int wg_mix_egress(struct __sk_buff *skb)
 			xor_checksum_mode = XOR_CSUM_MANUAL;
 		}
 		rc = prepare_xor_context_by_id(skb, &info, cipher_id, generation,
-					       xor_checksum_mode);
+					       xor_checksum_mode,
+					       rule->transport_mode == TRANSPORT_FAKETCP);
 		if (rc < 0) {
 			inc_xor_error(rc);
 			return TC_ACT_SHOT;
@@ -1883,6 +1911,8 @@ int wg_mix_egress(struct __sk_buff *skb)
 			inc_stat(STAT_CHECKSUM_ERROR);
 		return TC_ACT_SHOT;
 	}
+	if (rule->transport_mode == TRANSPORT_FAKETCP)
+		return faketcp_encode_established(skb, &info, rule, generation);
 	inc_stat(STAT_EGRESS_REWRITE_OK);
 	if (rule->transport_mode == TRANSPORT_ICMP)
 		inc_stat(STAT_ICMP_EGRESS_REWRITE_OK);
@@ -1998,6 +2028,11 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		inc_stat(STAT_INGRESS_RULE_MISS);
 		return TC_ACT_OK;
 	}
+	if (listener->transport_mode == TRANSPORT_FAKETCP &&
+	    !faketcp_metadata_valid(skb, generation)) {
+		inc_stat(STAT_FAKETCP_METADATA_ERROR);
+		return TC_ACT_SHOT;
+	}
 	if (gso_seen)
 		inc_stat(STAT_INGRESS_GSO_LISTENER_HIT);
 	if (parse_result_is_fragment(rc)) {
@@ -2066,7 +2101,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 			xor_checksum_mode = XOR_CSUM_MANUAL;
 		set_xor_context(skb, generation, cipher_id, info.payload_off,
 				xor_metadata.target,
-				xor_checksum_mode);
+				xor_checksum_mode, 0);
 		rc = update_type_word(skb, &info, encrypted_wire, new_wire, 0);
 		if (rc < 0) {
 			clear_xor_context(skb);

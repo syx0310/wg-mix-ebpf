@@ -26,17 +26,18 @@ import (
 )
 
 const (
-	ingressFilterName = "wg_mix_ingress"
-	egressFilterName  = "wg_mix_egress"
-	filterPriority    = 49152
-	ingressHandle     = 0x10001
-	egressHandle      = 0x10002
-	xorSegmentCount   = 8
-	pinPathPrefix     = "wg-mix-ebpf"
-	maxPinPathSuffix  = 64
-	pinPathLockRoot   = "/run/wg-mix-ebpf/pin-locks"
-	pinOwnerRoot      = "/var/lib/wg-mix-ebpf/pin-owners"
-	pinPathOwnerV2    = 2
+	ingressFilterName    = "wg_mix_ingress"
+	egressFilterName     = "wg_mix_egress"
+	filterPriority       = 49152
+	ingressHandle        = 0x10001
+	egressHandle         = 0x10002
+	xorSegmentCount      = 8
+	fakeTCPTailCallBanks = 2
+	pinPathPrefix        = "wg-mix-ebpf"
+	maxPinPathSuffix     = 64
+	pinPathLockRoot      = "/run/wg-mix-ebpf/pin-locks"
+	pinOwnerRoot         = "/var/lib/wg-mix-ebpf/pin-owners"
+	pinPathOwnerV2       = 2
 )
 
 type pinPathFilesystem struct {
@@ -320,11 +321,17 @@ func preflightUnpinnedCollection(spec *ebpf.CollectionSpec, source string) error
 	if collection.Programs[egressFilterName] == nil {
 		return fmt.Errorf("BPF object %s missing program %q", source, egressFilterName)
 	}
+	if collection.Programs["wg_mix_faketcp_ingress"] == nil {
+		return fmt.Errorf("BPF object %s missing program %q", source, "wg_mix_faketcp_ingress")
+	}
 	return nil
 }
 
 func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr error) {
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := preflightFakeTCPKernelRequirements(state); err != nil {
 		return err
 	}
 	runtime := l.pinRuntime(ctx)
@@ -539,7 +546,7 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	legacyAdoption := false
 	if ownerExists {
 		if directoryState != canonicalPinsOwned {
-			return errors.New("active BPF owner record does not have its exact 12-map canonical set")
+			return fmt.Errorf("active BPF owner record does not have its exact %d-map canonical set", len(pinnedMapDescriptors()))
 		}
 	} else {
 		switch directoryState {
@@ -547,7 +554,7 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		case canonicalPinsLegacy:
 			if !l.AdoptLegacyPins {
 				return errors.New(
-					"found legacy 11-map BPF pins without owner_map; refusing implicit adoption (run reload --adopt-legacy-pins explicitly)",
+					"found legacy BPF pins without owner_map; refusing implicit adoption (run reload --adopt-legacy-pins explicitly)",
 				)
 			}
 			legacyAdoption = true
@@ -1687,9 +1694,12 @@ func pinnedMapDescriptors() []pinnedMapDescriptor {
 		{name: "egress_rule_map", mapType: ebpf.Hash, keySize: 24, valueSize: 32, maxEntries: 2048},
 		{name: "ingress_listener_map", mapType: ebpf.Hash, keySize: 16, valueSize: 24, maxEntries: 2048},
 		{name: "icmp_listener_map", mapType: ebpf.Hash, keySize: 16, valueSize: 24, maxEntries: 2048},
-		{name: "stats_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 36},
+		{name: "stats_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 45},
 		{name: "xor_egress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: 16},
 		{name: "xor_ingress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: 16},
+		{name: "faketcp_session_map", mapType: ebpf.LRUHash, keySize: 24, valueSize: 40, maxEntries: 16384},
+		{name: "faketcp_events", mapType: ebpf.RingBuf, keySize: 0, valueSize: 0, maxEntries: 1 << 20},
+		{name: "faketcp_egress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: fakeTCPTailCallBanks},
 	}
 }
 
@@ -1971,6 +1981,20 @@ func populateXORTailCalls(coll *ebpf.Collection, generation uint64) error {
 				return fmt.Errorf("populate %s[%d] with %s: %w",
 					binding.mapName, index, programName, err)
 			}
+		}
+	}
+	fakeMap := coll.Maps["faketcp_egress_programs"]
+	if fakeMap == nil {
+		return fmt.Errorf("BPF object missing map %q", "faketcp_egress_programs")
+	}
+	fakeProgram := coll.Programs["wg_faketcp_egress"]
+	if fakeProgram == nil {
+		return fmt.Errorf("BPF object missing program %q", "wg_faketcp_egress")
+	}
+	for index := uint32(0); index < fakeTCPTailCallBanks; index++ {
+		fd := uint32(fakeProgram.FD())
+		if err := fakeMap.Update(index, fd, ebpf.UpdateAny); err != nil {
+			return fmt.Errorf("populate faketcp_egress_programs[%d] with wg_faketcp_egress: %w", index, err)
 		}
 	}
 	return nil
