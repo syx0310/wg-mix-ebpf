@@ -89,6 +89,7 @@ func newMemoryFakeTCPXDPRuntime() *memoryFakeTCPXDPRuntime {
 func TestFakeTCPXDPStageProbesThenOwnsSortedNativeAndGenericLinks(t *testing.T) {
 	runtime := newMemoryFakeTCPXDPRuntime()
 	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
 		[]fakeTCPXDPAttachRequest{
 			{IfIndex: 11, Mode: fakeTCPXDPAttachGeneric},
 			{IfIndex: 7, Mode: fakeTCPXDPAttachNative},
@@ -121,6 +122,7 @@ func TestFakeTCPXDPStageRefusesUnownedReplacementBeforeAttach(t *testing.T) {
 	runtime := newMemoryFakeTCPXDPRuntime()
 	runtime.probes[7] = fakeTCPXDPProbe{IfIndex: 7, Attached: true, ProgramID: 7001}
 	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
 		[]fakeTCPXDPAttachRequest{{IfIndex: 7, Mode: fakeTCPXDPAttachNative}},
 		&fakeExperimentalOwnedProgram{id: 8001}, runtime.backend(),
 	)
@@ -136,6 +138,7 @@ func TestFakeTCPXDPStageCompletesAllProbesBeforeFirstAttach(t *testing.T) {
 	runtime := newMemoryFakeTCPXDPRuntime()
 	runtime.probes[11] = fakeTCPXDPProbe{IfIndex: 11, Attached: true, ProgramID: 7001}
 	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
 		[]fakeTCPXDPAttachRequest{
 			{IfIndex: 7, Mode: fakeTCPXDPAttachNative},
 			{IfIndex: 11, Mode: fakeTCPXDPAttachGeneric},
@@ -164,6 +167,7 @@ func TestFakeTCPXDPStageRequiresProvenLibXDPChaining(t *testing.T) {
 			runtime := newMemoryFakeTCPXDPRuntime()
 			runtime.probes[7] = test.probe
 			stage, err := stageFakeTCPXDPAttachments(
+				t.Context(),
 				[]fakeTCPXDPAttachRequest{{IfIndex: 7, Mode: fakeTCPXDPAttachLibXDP}},
 				&fakeExperimentalOwnedProgram{id: 8001}, runtime.backend(),
 			)
@@ -190,6 +194,7 @@ func TestFakeTCPXDPStageReturnsOwnedPrefixOnLaterFailure(t *testing.T) {
 	runtime := newMemoryFakeTCPXDPRuntime()
 	runtime.attachErrs[11] = errors.New("injected attach failure")
 	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
 		[]fakeTCPXDPAttachRequest{
 			{IfIndex: 7, Mode: fakeTCPXDPAttachNative},
 			{IfIndex: 11, Mode: fakeTCPXDPAttachGeneric},
@@ -216,6 +221,7 @@ func TestFakeTCPXDPStageRetainsCloseErrorWithoutDoubleClose(t *testing.T) {
 	}
 	runtime.links[11] = &fakeOwnedXDPLink{ifindex: 11, programID: 8001, closeLog: &closeLog}
 	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
 		[]fakeTCPXDPAttachRequest{
 			{IfIndex: 7, Mode: fakeTCPXDPAttachNative},
 			{IfIndex: 11, Mode: fakeTCPXDPAttachGeneric},
@@ -245,6 +251,7 @@ func TestFakeTCPXDPStageIdentityFailureRetainsLinkForRollback(t *testing.T) {
 	runtime := newMemoryFakeTCPXDPRuntime()
 	runtime.links[7] = &fakeOwnedXDPLink{ifindex: 8, programID: 8001}
 	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
 		[]fakeTCPXDPAttachRequest{{IfIndex: 7, Mode: fakeTCPXDPAttachNative}},
 		&fakeExperimentalOwnedProgram{id: 8001}, runtime.backend(),
 	)

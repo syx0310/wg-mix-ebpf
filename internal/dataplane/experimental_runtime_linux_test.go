@@ -3,6 +3,7 @@
 package dataplane
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"strings"
@@ -53,6 +54,30 @@ type fakeRuntimeEventMapSourceFunc func() (*experimentalEventMapClone, error)
 
 func (function fakeRuntimeEventMapSourceFunc) Clone() (*experimentalEventMapClone, error) {
 	return function()
+}
+
+type cancelAtCommitBoundaryContext struct {
+	context.Context
+	mu     sync.Mutex
+	cancel context.CancelFunc
+	checks int
+}
+
+func (ctx *cancelAtCommitBoundaryContext) Err() error {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	ctx.checks++
+	if ctx.checks == 1 {
+		ctx.cancel()
+		return nil
+	}
+	return ctx.Context.Err()
+}
+
+func (ctx *cancelAtCommitBoundaryContext) checkCount() int {
+	ctx.mu.Lock()
+	defer ctx.mu.Unlock()
+	return ctx.checks
 }
 
 func (source *fakeRuntimeEventMapSource) Clone() (*experimentalEventMapClone, error) {
@@ -462,6 +487,120 @@ func TestExperimentalFakeTCPRuntimeFailureRollsBackOwnedPrefixAndClosesAll(t *te
 		if resource.closes != 1 {
 			t.Fatalf("map %s close count = %d", name, resource.closes)
 		}
+	}
+}
+
+func TestExperimentalFakeTCPRuntimeCancellationAfterMutationUsesCleanupContext(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	baseCtx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+	activeCtx, cancel := context.WithCancel(baseCtx)
+	xdpRuntime := fixture.xdpRuntime.backend()
+	attach := xdpRuntime.attach
+	xdpRuntime.attach = func(
+		request fakeTCPXDPAttachRequest,
+		program experimentalProgramResource,
+	) (fakeTCPXDPLink, error) {
+		owned, err := attach(request, program)
+		if err == nil {
+			cancel()
+		}
+		return owned, err
+	}
+
+	runtime, err := buildExperimentalFakeTCPRuntime(
+		activeCtx,
+		experimentalFakeTCPRuntimeBuildOptions{
+			collection: fixture.collection, transaction: transaction, snapshot: snapshot,
+			xdpRequests: []fakeTCPXDPAttachRequest{
+				{IfIndex: 3, Mode: fakeTCPXDPAttachNative},
+				{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
+			},
+			xdpRuntime: xdpRuntime, programArray: fixture.programArray,
+			sessionFactory: func(experimentalMapResource, uint64) (ownedFakeTCPSessionStore, error) {
+				return fixture.sessionStore, nil
+			},
+			eventSource: fixture.eventSource,
+		},
+	)
+	if runtime != nil || !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled runtime=%#v error=%v", runtime, err)
+	}
+	if len(fixture.xdpRuntime.attachCalls) != 1 || fixture.xdpRuntime.links[3].closes != 1 {
+		t.Fatalf("XDP attach calls=%v first-link closes=%d",
+			fixture.xdpRuntime.attachCalls, fixture.xdpRuntime.links[3].closes)
+	}
+	if _, exists := fixture.xdpRuntime.links[9]; exists {
+		t.Fatal("cancellation after first attach did not stop the second attach")
+	}
+	if len(fixture.programArray.entries) != 0 ||
+		!slices.Equal(fixture.programArray.deletes, []uint32{1}) {
+		t.Fatalf("program rollback entries=%v deletes=%v",
+			fixture.programArray.entries, fixture.programArray.deletes)
+	}
+	assertNoMemoryPolicyGeneration(t, fixture.policyMaps, 91)
+	if fixture.sessionStore.closes != 1 {
+		t.Fatalf("session close count = %d", fixture.sessionStore.closes)
+	}
+	for name, resource := range fixture.mapResources {
+		if resource.closes != 1 {
+			t.Fatalf("map %s close count = %d", name, resource.closes)
+		}
+	}
+}
+
+func TestExperimentalFakeTCPRuntimeCommitBoundaryIgnoresLaterCancellation(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	activeCtx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+	build := &experimentalRuntimeBuild{
+		options: experimentalFakeTCPRuntimeBuildOptions{
+			collection: fixture.collection, transaction: transaction, snapshot: snapshot,
+			xdpRequests: []fakeTCPXDPAttachRequest{
+				{IfIndex: 3, Mode: fakeTCPXDPAttachNative},
+				{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
+			},
+			xdpRuntime: fixture.xdpRuntime.backend(), programArray: fixture.programArray,
+			sessionFactory: func(experimentalMapResource, uint64) (ownedFakeTCPSessionStore, error) {
+				return fixture.sessionStore, nil
+			},
+			eventSource: fixture.eventSource,
+		},
+		activeCtx:  activeCtx,
+		cleanupCtx: context.WithoutCancel(activeCtx),
+	}
+	if err := build.prepare(); err != nil {
+		t.Fatal(err)
+	}
+	boundaryBase, cancel := context.WithCancel(activeCtx)
+	boundaryCtx := &cancelAtCommitBoundaryContext{Context: boundaryBase, cancel: cancel}
+	build.activeCtx = boundaryCtx
+	build.cleanupCtx = context.WithoutCancel(boundaryCtx)
+	if err := build.commit(); err != nil {
+		t.Fatalf("uninterruptible commit after boundary: %v", err)
+	}
+	if boundaryCtx.checkCount() != 1 || !errors.Is(boundaryBase.Err(), context.Canceled) {
+		t.Fatalf("commit boundary checks=%d context error=%v",
+			boundaryCtx.checkCount(), boundaryBase.Err())
+	}
+	if build.programStage.state != fakeTCPProgramArrayStageDisarmed ||
+		build.policyStage.state != fakeTCPPolicyStageDisarmed {
+		t.Fatalf("commit states program=%d policy=%d",
+			build.programStage.state, build.policyStage.state)
+	}
+	runtime := &ExperimentalFakeTCPRuntime{
+		generation: snapshot.Generation,
+		collection: fixture.collection,
+		xdp:        build.xdpStage,
+		handles: ExperimentalFakeTCPRuntimeHandles{
+			generation: snapshot.Generation,
+			sessions:   build.sessions,
+			events:     build.events,
+		},
+		closeDone: make(chan struct{}),
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

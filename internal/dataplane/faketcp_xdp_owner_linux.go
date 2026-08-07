@@ -3,6 +3,7 @@
 package dataplane
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math"
@@ -178,10 +179,17 @@ type fakeTCPXDPStage struct {
 }
 
 func stageFakeTCPXDPAttachments(
+	ctx context.Context,
 	requests []fakeTCPXDPAttachRequest,
 	program experimentalProgramResource,
 	runtime fakeTCPXDPRuntime,
 ) (*fakeTCPXDPStage, error) {
+	if ctx == nil {
+		return nil, errors.New("stage FakeTCP XDP: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
 	if len(requests) == 0 {
 		return nil, errors.New("stage FakeTCP XDP: at least one attachment is required")
 	}
@@ -219,6 +227,9 @@ func stageFakeTCPXDPAttachments(
 	// attach. One invalid later interface must not cause a transient partial
 	// deployment on an earlier interface.
 	for _, request := range ordered {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		probe, err := runtime.probe(request.IfIndex)
 		if err != nil {
 			return nil, fmt.Errorf("stage FakeTCP XDP probe ifindex %d: %w", request.IfIndex, err)
@@ -228,6 +239,9 @@ func stageFakeTCPXDPAttachments(
 		}
 	}
 	for _, request := range ordered {
+		if err := ctx.Err(); err != nil {
+			return stageOrNil(stage), err
+		}
 		ownedLink, err := runtime.attach(request, program)
 		if err != nil {
 			return stageOrNil(stage), fmt.Errorf(
