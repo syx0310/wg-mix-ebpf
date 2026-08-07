@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/pinidentity"
 	"golang.org/x/sys/unix"
@@ -88,9 +89,17 @@ type durableTCOwnerJournalFixture struct {
 	desired           []tcFilterBinding
 	mapStore          *fakePinnedMapStore
 	programLoadErrors map[string]error
+	plan              *tcAttachPlan
 }
 
 func newDurableTCOwnerJournalFixture(t *testing.T) *durableTCOwnerJournalFixture {
+	return newDurableTCOwnerJournalFixtureWithActive(t, true)
+}
+
+func newDurableTCOwnerJournalFixtureWithActive(
+	t *testing.T,
+	withActive bool,
+) *durableTCOwnerJournalFixture {
 	t.Helper()
 	bpffsRoot, validator := newTestBPFFS(t)
 	pinPath := filepath.Join(bpffsRoot, "wg-mix-ebpf-journal-handoff")
@@ -104,6 +113,9 @@ func newDurableTCOwnerJournalFixture(t *testing.T) *durableTCOwnerJournalFixture
 			return nil, err
 		}
 		id, ok := programIDs[name]
+		if !ok && strings.HasSuffix(name, ".retired") {
+			id, ok = programIDs[strings.TrimSuffix(name, ".retired")]
+		}
 		if !ok {
 			return nil, fmt.Errorf("unknown fake program stage %s", name)
 		}
@@ -159,6 +171,12 @@ func newDurableTCOwnerJournalFixture(t *testing.T) *durableTCOwnerJournalFixture
 			Handle: slots[1].handle, Priority: filterPriority, ProgramID: 22,
 		},
 	}
+	if !withActive {
+		active = []tcFilterBinding{}
+		controlObservation := mapStore.observations["control_map"]
+		controlObservation.control = abi.ControlValue{}
+		mapStore.observations["control_map"] = controlObservation
+	}
 	desired := []tcFilterBinding{
 		{
 			IfIndex: 11, Direction: "ingress", Parent: slots[0].parent,
@@ -170,25 +188,30 @@ func newDurableTCOwnerJournalFixture(t *testing.T) *durableTCOwnerJournalFixture
 		},
 	}
 	now := time.Date(2026, 8, 8, 1, 2, 3, 4, time.UTC)
-	activeRecord, err := newActivePinOwnerRecord(
-		parent,
-		token,
-		"12345678-1234-1234-1234-123456789abc",
-		now,
-		1,
-		ownerMaps,
-		active,
-	)
-	if err != nil {
-		t.Fatal(err)
+	var activeRecord *pinOwnerRecord
+	activeGeneration := uint64(0)
+	if withActive {
+		activeGeneration = 1
+		activeRecord, err = newActivePinOwnerRecord(
+			parent,
+			token,
+			"12345678-1234-1234-1234-123456789abc",
+			now,
+			activeGeneration,
+			ownerMaps,
+			active,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
 	}
 	applying, err := newApplyingPinOwnerRecord(
 		parent,
 		token,
-		activeRecord.BootID,
+		"12345678-1234-1234-1234-123456789abc",
 		now.Add(time.Second),
-		1,
-		2,
+		activeGeneration,
+		activeGeneration+1,
 		ownerMaps,
 		active,
 		desired,
@@ -222,8 +245,10 @@ func newDurableTCOwnerJournalFixture(t *testing.T) *durableTCOwnerJournalFixture
 	ownerObservation.owner = sentinel
 	ownerObservation.ownerSeen = true
 	mapStore.observations["owner_map"] = ownerObservation
-	if err := store.Persist(activeRecord, nil, handle.mountID); err != nil {
-		t.Fatal(err)
+	if activeRecord != nil {
+		if err := store.Persist(activeRecord, nil, handle.mountID); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if err := store.Persist(applying, activeRecord, handle.mountID); err != nil {
 		t.Fatal(err)
@@ -231,6 +256,31 @@ func newDurableTCOwnerJournalFixture(t *testing.T) *durableTCOwnerJournalFixture
 	if err := store.Persist(mutating, applying, handle.mountID); err != nil {
 		t.Fatal(err)
 	}
+	tcKernel := newFakeTCKernel(11)
+	for id, fd := range map[uint32]int{21: 201, 22: 202, 31: 301, 32: 302} {
+		tcKernel.addProgram(id, fd)
+	}
+	tcKernel.addClsact(11)
+	if withActive {
+		tcKernel.addManagedFilter(11, slots[0], 21)
+		tcKernel.addManagedFilter(11, slots[1], 22)
+	}
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		tcKernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.ValidatePreviousBindings(active, !withActive); err != nil {
+		t.Fatal(err)
+	}
+	if err := plan.AddOwnedStaleRemovals(active); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = plan.Close() })
 	return &durableTCOwnerJournalFixture{
 		handle:            handle,
 		store:             store,
@@ -239,6 +289,7 @@ func newDurableTCOwnerJournalFixture(t *testing.T) *durableTCOwnerJournalFixture
 		desired:           desired,
 		mapStore:          mapStore,
 		programLoadErrors: programLoadErrors,
+		plan:              plan,
 	}
 }
 
@@ -251,6 +302,7 @@ func TestPrepareDurableTCOwnerJournalHandoffFaults(t *testing.T) {
 			fixture.intent,
 			fixture.active,
 			fixture.desired,
+			fixture.plan,
 		)
 		if err != nil || handoff == nil ||
 			handoff.resourceKey != fixture.intent.ResourceKey ||
@@ -269,6 +321,7 @@ func TestPrepareDurableTCOwnerJournalHandoffFaults(t *testing.T) {
 			intent,
 			fixture.active,
 			fixture.desired,
+			fixture.plan,
 		)
 		if handoff != nil || err == nil || !strings.Contains(err.Error(), "differs") {
 			t.Fatalf("handoff=%#v error=%v", handoff, err)
@@ -286,6 +339,7 @@ func TestPrepareDurableTCOwnerJournalHandoffFaults(t *testing.T) {
 			fixture.intent,
 			fixture.active,
 			fixture.desired,
+			fixture.plan,
 		)
 		if handoff != nil || err == nil || !strings.Contains(err.Error(), "map ID") {
 			t.Fatalf("handoff=%#v error=%v", handoff, err)
@@ -303,6 +357,7 @@ func TestPrepareDurableTCOwnerJournalHandoffFaults(t *testing.T) {
 			fixture.intent,
 			fixture.active,
 			fixture.desired,
+			fixture.plan,
 		)
 		if handoff != nil || !errors.Is(err, wantErr) {
 			t.Fatalf("handoff=%#v error=%v", handoff, err)
@@ -352,6 +407,189 @@ func TestAbortFailedOwnerApplyReportsRollbackVerificationBoundary(t *testing.T) 
 		)
 		if !verified || err == nil || !strings.Contains(err.Error(), "clock") {
 			t.Fatalf("verified=%t error=%v", verified, err)
+		}
+	})
+}
+
+func exactActiveOwnerTCKernel(
+	t *testing.T,
+	fixture *durableTCOwnerJournalFixture,
+) *fakeTCKernel {
+	t.Helper()
+	kernel := newFakeTCKernel(11)
+	for id, fd := range map[uint32]int{21: 201, 22: 202, 31: 301, 32: 302} {
+		kernel.addProgram(id, fd)
+	}
+	kernel.addClsact(11)
+	for _, binding := range fixture.active {
+		slot, err := ownerFilterSlot(binding)
+		if err != nil {
+			t.Fatal(err)
+		}
+		kernel.addManagedFilter(binding.IfIndex, slot, binding.ProgramID)
+	}
+	return kernel
+}
+
+func TestAbortFailedOwnerApplyRollbackCleanupRestartConverges(t *testing.T) {
+	recoveryNow := time.Date(2026, 8, 8, 1, 2, 6, 0, time.UTC)
+
+	t.Run("quarantine failure resumes to active", func(t *testing.T) {
+		fixture := newDurableTCOwnerJournalFixture(t)
+		kernel := exactActiveOwnerTCKernel(t, fixture)
+		fixture.handle.runtime.now = func() time.Time { return recoveryNow }
+		wantErr := errors.New("injected rollback quarantine failure")
+		fixture.handle.runtime.beforePinQuarantine = func(string) error { return wantErr }
+		verified, err := abortFailedOwnerApply(
+			fixture.handle,
+			fixture.store,
+			fixture.intent,
+			kernel.runtime(),
+		)
+		if !verified || !errors.Is(err, wantErr) {
+			t.Fatalf("verified=%t error=%v", verified, err)
+		}
+		persisted, err := fixture.store.Load(fixture.handle.mountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.Phase != pinOwnerPhaseApplying ||
+			persisted.Step != pinOwnerStepRollbackCleanup {
+			t.Fatalf("durable rollback record = %s/%s", persisted.Phase, persisted.Step)
+		}
+		fixture.handle.runtime.beforePinQuarantine = nil
+		recovered, err := recoverPinOwnerTransaction(
+			fixture.handle,
+			fixture.store,
+			persisted,
+			kernel.runtime(),
+		)
+		if err != nil {
+			t.Fatalf("restart rollback recovery: %v", err)
+		}
+		if recovered.record == nil ||
+			recovered.record.Phase != pinOwnerPhaseActive ||
+			recovered.record.Step != pinOwnerStepReady ||
+			recovered.record.ActiveGeneration != fixture.intent.ActiveGeneration {
+			t.Fatalf("recovered owner = %#v", recovered.record)
+		}
+	})
+
+	t.Run("unlink failure resumes from retired stage", func(t *testing.T) {
+		fixture := newDurableTCOwnerJournalFixture(t)
+		kernel := exactActiveOwnerTCKernel(t, fixture)
+		fixture.handle.runtime.now = func() time.Time { return recoveryNow }
+		wantErr := errors.New("injected rollback unlink failure")
+		fixture.handle.runtime.beforePinUnlink = func(string) error { return wantErr }
+		verified, err := abortFailedOwnerApply(
+			fixture.handle,
+			fixture.store,
+			fixture.intent,
+			kernel.runtime(),
+		)
+		if !verified || !errors.Is(err, wantErr) {
+			t.Fatalf("verified=%t error=%v", verified, err)
+		}
+		persisted, err := fixture.store.Load(fixture.handle.mountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.Step != pinOwnerStepRollbackCleanup {
+			t.Fatalf("durable rollback step = %s", persisted.Step)
+		}
+		fixture.handle.runtime.beforePinUnlink = nil
+		recovered, err := recoverPinOwnerTransaction(
+			fixture.handle,
+			fixture.store,
+			persisted,
+			kernel.runtime(),
+		)
+		if err != nil {
+			t.Fatalf("restart retired-stage recovery: %v", err)
+		}
+		if recovered.record == nil || recovered.record.Phase != pinOwnerPhaseActive {
+			t.Fatalf("recovered owner = %#v", recovered.record)
+		}
+	})
+
+	t.Run("final persist failure is recovered from descriptor journal", func(t *testing.T) {
+		fixture := newDurableTCOwnerJournalFixture(t)
+		kernel := exactActiveOwnerTCKernel(t, fixture)
+		fixture.handle.runtime.now = func() time.Time { return recoveryNow }
+		exchanges := 0
+		var closeErr error
+		fixture.store.beforeOwnerExchange = func() {
+			exchanges++
+			if exchanges == 3 {
+				closeErr = fixture.store.root.Close()
+			}
+		}
+		verified, err := abortFailedOwnerApply(
+			fixture.handle,
+			fixture.store,
+			fixture.intent,
+			kernel.runtime(),
+		)
+		if closeErr != nil {
+			t.Fatalf("inject owner root close: %v", closeErr)
+		}
+		if !verified || err == nil {
+			t.Fatalf("verified=%t final Persist error=%v", verified, err)
+		}
+		restarted, err := openPinOwnerStore(
+			fixture.handle.runtime,
+			fixture.handle.resource,
+			true,
+		)
+		if err != nil {
+			t.Fatalf("reopen owner store after failed Persist: %v", err)
+		}
+		t.Cleanup(func() { _ = restarted.Close() })
+		persisted, err := restarted.Load(fixture.handle.mountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.Phase != pinOwnerPhaseActive ||
+			persisted.Step != pinOwnerStepReady ||
+			persisted.ActiveGeneration != fixture.intent.ActiveGeneration {
+			t.Fatalf("descriptor recovery owner = %#v", persisted)
+		}
+	})
+
+	t.Run("fresh apply resumes through detaching", func(t *testing.T) {
+		fixture := newDurableTCOwnerJournalFixtureWithActive(t, false)
+		kernel := exactActiveOwnerTCKernel(t, fixture)
+		fixture.handle.runtime.now = func() time.Time { return recoveryNow }
+		wantErr := errors.New("injected fresh rollback quarantine failure")
+		fixture.handle.runtime.beforePinQuarantine = func(string) error { return wantErr }
+		verified, err := abortFailedOwnerApply(
+			fixture.handle,
+			fixture.store,
+			fixture.intent,
+			kernel.runtime(),
+		)
+		if !verified || !errors.Is(err, wantErr) {
+			t.Fatalf("verified=%t error=%v", verified, err)
+		}
+		persisted, err := fixture.store.Load(fixture.handle.mountID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if persisted.Step != pinOwnerStepRollbackCleanup {
+			t.Fatalf("fresh durable rollback step = %s", persisted.Step)
+		}
+		fixture.handle.runtime.beforePinQuarantine = nil
+		recovered, err := recoverPinOwnerTransaction(
+			fixture.handle,
+			fixture.store,
+			persisted,
+			kernel.runtime(),
+		)
+		if err != nil {
+			t.Fatalf("restart fresh rollback recovery: %v", err)
+		}
+		if !recovered.directoryRemoved || recovered.record != nil {
+			t.Fatalf("fresh rollback result = %#v", recovered)
 		}
 	})
 }
@@ -440,6 +678,7 @@ func TestPinOwnerPhaseStepMatrix(t *testing.T) {
 		pinOwnerPhaseApplying: {
 			pinOwnerStepStaging,
 			pinOwnerStepMutating,
+			pinOwnerStepRollbackCleanup,
 			pinOwnerStepCleanup,
 		},
 		pinOwnerPhaseDetaching: {
@@ -458,6 +697,7 @@ func TestPinOwnerPhaseStepMatrix(t *testing.T) {
 		pinOwnerStepReady,
 		pinOwnerStepStaging,
 		pinOwnerStepMutating,
+		pinOwnerStepRollbackCleanup,
 		pinOwnerStepMutatingTC,
 		pinOwnerStepUnlinkingMaps,
 		pinOwnerStepCleanup,

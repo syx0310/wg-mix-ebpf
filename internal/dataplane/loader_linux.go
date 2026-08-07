@@ -815,6 +815,7 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		mutating,
 		activeFilters,
 		desiredFilters,
+		attachPlan,
 	)
 	if err != nil {
 		return fmt.Errorf("prove durable TC owner journal handoff: %w", err)
@@ -839,7 +840,12 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 				// abortFailedOwnerApply performs no writes before this point.
 				// The pre-mutation capability therefore still proves that the
 				// durable mutating journal owns roll-forward recovery.
-				handoff.Transfer(retainedTC)
+				if transferErr := handoff.Transfer(retainedTC); transferErr != nil {
+					abortErr = errors.Join(
+						abortErr,
+						fmt.Errorf("transfer retained TC rollback to owner journal: %w", transferErr),
+					)
+				}
 			}
 		}
 		if abortErr != nil {

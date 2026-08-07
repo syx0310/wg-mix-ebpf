@@ -56,11 +56,14 @@ func loadOwnerPrograms(
 	if handle == nil || record == nil {
 		return nil, errors.New("load owner programs requires a handle and record")
 	}
-	if handle.runtime.loadPinnedProgram == nil {
-		return nil, errors.New("pinned-program loader is unavailable")
-	}
 	loaded := &loadedOwnerPrograms{
 		byID: make(map[uint32]*pinnedProgramObservation),
+	}
+	if len(record.ProgramStages) == 0 {
+		return loaded, nil
+	}
+	if handle.runtime.loadPinnedProgram == nil {
+		return nil, errors.New("pinned-program loader is unavailable")
 	}
 	closeOnError := func(err error) (*loadedOwnerPrograms, error) {
 		return nil, errors.Join(err, loaded.Close())

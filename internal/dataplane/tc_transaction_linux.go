@@ -5,6 +5,7 @@ package dataplane
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"sort"
 	"sync"
 
@@ -405,6 +406,150 @@ func (plan *tcAttachPlan) ObservedBindings() []tcFilterBinding {
 	}
 	sortTCFilterBindings(bindings)
 	return bindings
+}
+
+func tcBindingForSnapshot(
+	ifindex int,
+	snapshot tcFilterSnapshot,
+	programID uint32,
+) tcFilterBinding {
+	direction := "ingress"
+	if snapshot.slot.parent == netlink.HANDLE_MIN_EGRESS {
+		direction = "egress"
+	}
+	return tcFilterBinding{
+		IfIndex:   ifindex,
+		Direction: direction,
+		Parent:    snapshot.slot.parent,
+		Handle:    snapshot.slot.handle,
+		Priority:  filterPriority,
+		ProgramID: programID,
+	}
+}
+
+func tcBindingSlotKey(binding tcFilterBinding) string {
+	return fmt.Sprintf("%d/%s", binding.IfIndex, binding.Direction)
+}
+
+func (plan *tcAttachPlan) previousBindings() []tcFilterBinding {
+	if plan == nil {
+		return nil
+	}
+	bindings := plan.ObservedBindings()
+	for _, stale := range plan.stale {
+		bindings = append(bindings, tcBindingForSnapshot(
+			stale.link.Attrs().Index,
+			stale.snapshot,
+			stale.snapshot.programID,
+		))
+	}
+	sortTCFilterBindings(bindings)
+	return bindings
+}
+
+func (plan *tcAttachPlan) validateOwnerJournalCoverage(
+	active []tcFilterBinding,
+	desired []tcFilterBinding,
+) error {
+	if plan == nil {
+		return errors.New("TC owner journal handoff has no attach plan")
+	}
+	if !slices.Equal(plan.previousBindings(), active) {
+		return errors.New("TC attach plan does not exactly cover journal active bindings")
+	}
+	if !slices.Equal(plan.Bindings(), desired) {
+		return errors.New("TC attach plan does not exactly cover journal desired bindings")
+	}
+	return nil
+}
+
+func (plan *tcAttachPlan) validateRetainedStageCoverage(
+	stage *tcAttachStage,
+	active []tcFilterBinding,
+	desired []tcFilterBinding,
+) error {
+	if plan == nil || stage == nil || stage.plan != plan || plan.stage != stage {
+		return errors.New("retained TC stage is not the exact stage produced by the bound plan")
+	}
+	if len(stage.applied) == 0 && len(stage.deleted) == 0 && len(stage.created) == 0 {
+		return errors.New("retained TC stage has no live rollback ownership")
+	}
+	activeBySlot := make(map[string]tcFilterBinding, len(active))
+	for _, binding := range active {
+		activeBySlot[tcBindingSlotKey(binding)] = binding
+	}
+	desiredBySlot := make(map[string]tcFilterBinding, len(desired))
+	for _, binding := range desired {
+		desiredBySlot[tcBindingSlotKey(binding)] = binding
+	}
+	seenApplied := make(map[string]struct{}, len(stage.applied))
+	for _, change := range stage.applied {
+		if change.link == nil || change.link.Attrs() == nil {
+			return errors.New("retained TC stage has an applied filter without a link identity")
+		}
+		got := tcBindingForSnapshot(
+			change.link.Attrs().Index,
+			change.snapshot,
+			change.program.id,
+		)
+		key := tcBindingSlotKey(got)
+		if _, duplicate := seenApplied[key]; duplicate {
+			return fmt.Errorf("retained TC stage repeats applied slot %s", key)
+		}
+		seenApplied[key] = struct{}{}
+		if want, ok := desiredBySlot[key]; !ok || want != got {
+			return fmt.Errorf("retained TC stage applied slot %s is outside journal desired bindings", key)
+		}
+		previous, hadPrevious := activeBySlot[key]
+		if change.snapshot.existed != hadPrevious ||
+			(hadPrevious && previous.ProgramID != change.snapshot.programID) {
+			return fmt.Errorf("retained TC stage snapshot for %s differs from journal active bindings", key)
+		}
+	}
+	seenDeleted := make(map[string]struct{}, len(stage.deleted))
+	for _, change := range stage.deleted {
+		if change.link == nil || change.link.Attrs() == nil {
+			return errors.New("retained TC stage has a deleted filter without a link identity")
+		}
+		got := tcBindingForSnapshot(
+			change.link.Attrs().Index,
+			change.snapshot,
+			change.snapshot.programID,
+		)
+		key := tcBindingSlotKey(got)
+		if _, duplicate := seenDeleted[key]; duplicate {
+			return fmt.Errorf("retained TC stage repeats deleted slot %s", key)
+		}
+		seenDeleted[key] = struct{}{}
+		if want, ok := activeBySlot[key]; !ok || want != got {
+			return fmt.Errorf("retained TC stage deleted slot %s is outside journal active bindings", key)
+		}
+		if _, remains := desiredBySlot[key]; remains {
+			return fmt.Errorf("retained TC stage deleted non-stale slot %s", key)
+		}
+	}
+	createdByIfindex := make(map[int]struct{}, len(stage.created))
+	for _, created := range stage.created {
+		if created.link == nil || created.link.Attrs() == nil ||
+			created.link.Attrs().Index != created.ifindex {
+			return errors.New("retained TC stage has a created qdisc without an exact link identity")
+		}
+		if _, duplicate := createdByIfindex[created.ifindex]; duplicate {
+			return fmt.Errorf("retained TC stage repeats created clsact on ifindex %d", created.ifindex)
+		}
+		createdByIfindex[created.ifindex] = struct{}{}
+		covered := false
+		for _, linkPlan := range plan.links {
+			if linkPlan.ifindex == created.ifindex && !linkPlan.clsactExists {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			return fmt.Errorf("retained TC stage created clsact on uncovered ifindex %d", created.ifindex)
+		}
+	}
+	return nil
 }
 
 func (plan *tcAttachPlan) ValidatePreviousBindings(
@@ -1060,6 +1205,32 @@ func (stage *tcAttachStage) returnProgramReferencesToPlan() error {
 	return nil
 }
 
+// transferToOwnerJournalLocked requires stage.mu. It consumes the retained
+// rollback owner only after its exact mutations match the durable journal.
+func (stage *tcAttachStage) transferToOwnerJournalLocked(
+	plan *tcAttachPlan,
+	active []tcFilterBinding,
+	desired []tcFilterBinding,
+) error {
+	if stage == nil {
+		return errors.New("retained TC stage is nil")
+	}
+	if stage.done {
+		return errors.New("retained TC stage is already resolved")
+	}
+	if err := plan.validateRetainedStageCoverage(stage, active, desired); err != nil {
+		return err
+	}
+	stage.done = true
+	stage.err = nil
+	plan.stage = nil
+	stage.plan = nil
+	stage.applied = nil
+	stage.deleted = nil
+	stage.created = nil
+	return nil
+}
+
 // Disarm transfers rollback responsibility out of a retained stage.  It is
 // intentionally infallible and performs no close so a commit callback remains
 // the final fallible operation in the persistent loader transaction.
@@ -1073,6 +1244,7 @@ func (stage *tcAttachStage) Disarm() {
 		return
 	}
 	stage.done = true
+	stage.err = nil
 	if stage.plan != nil && stage.plan.stage == stage {
 		stage.plan.stage = nil
 	}

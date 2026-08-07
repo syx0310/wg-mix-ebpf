@@ -32,15 +32,16 @@ const (
 	pinOwnerPhaseApplying  = "applying"
 	pinOwnerPhaseDetaching = "detaching"
 
-	pinOwnerStepReady          = "ready"
-	pinOwnerStepStaging        = "staging"
-	pinOwnerStepMutating       = "mutating"
-	pinOwnerStepMutatingTC     = "mutating_tc"
-	pinOwnerStepUnlinkingMaps  = "unlinking_maps"
-	pinOwnerStepCleanup        = "cleanup"
-	pinOwnerStepCleanupStages  = "cleanup_stages"
-	pinOwnerProgramStageActive = "active"
-	pinOwnerProgramStageNext   = "desired"
+	pinOwnerStepReady           = "ready"
+	pinOwnerStepStaging         = "staging"
+	pinOwnerStepMutating        = "mutating"
+	pinOwnerStepRollbackCleanup = "rollback_cleanup"
+	pinOwnerStepMutatingTC      = "mutating_tc"
+	pinOwnerStepUnlinkingMaps   = "unlinking_maps"
+	pinOwnerStepCleanup         = "cleanup"
+	pinOwnerStepCleanupStages   = "cleanup_stages"
+	pinOwnerProgramStageActive  = "active"
+	pinOwnerProgramStageNext    = "desired"
 )
 
 var bootIDPattern = regexp.MustCompile(
@@ -582,6 +583,33 @@ func abortApplyingPinOwnerRecord(
 	return next, nil
 }
 
+func newRollbackCleanupPinOwnerRecord(
+	current *pinOwnerRecord,
+	now time.Time,
+) (*pinOwnerRecord, error) {
+	if current == nil ||
+		current.Phase != pinOwnerPhaseApplying ||
+		(current.Step != pinOwnerStepStaging &&
+			current.Step != pinOwnerStepMutating) {
+		return nil, errors.New("rollback cleanup requires a pre-commit applying owner record")
+	}
+	next := advancePinOwnerRecord(
+		current,
+		now,
+		pinOwnerPhaseApplying,
+		pinOwnerStepRollbackCleanup,
+	)
+	if err := validatePinOwnerRecord(next, pinResourceIdentity{
+		key:          next.ResourceKey,
+		parentDevice: next.ParentDevice,
+		parentInode:  next.ParentInode,
+		base:         next.PinBaseName,
+	}, 0); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
 func newDetachingPinOwnerRecord(
 	current *pinOwnerRecord,
 	now time.Time,
@@ -628,7 +656,8 @@ func newInitialAbortDetachingPinOwnerRecord(
 	if current == nil ||
 		current.Phase != pinOwnerPhaseApplying ||
 		(current.Step != pinOwnerStepStaging &&
-			current.Step != pinOwnerStepMutating) ||
+			current.Step != pinOwnerStepMutating &&
+			current.Step != pinOwnerStepRollbackCleanup) ||
 		current.ActiveGeneration != 0 {
 		return nil, errors.New("initial abort requires a fresh pre-commit applying owner record")
 	}
@@ -915,6 +944,7 @@ func validatePinOwnerRecord(
 	case pinOwnerPhaseApplying:
 		if record.Step != pinOwnerStepStaging &&
 			record.Step != pinOwnerStepMutating &&
+			record.Step != pinOwnerStepRollbackCleanup &&
 			record.Step != pinOwnerStepCleanup {
 			return fmt.Errorf("applying pin owner record has invalid step %q", record.Step)
 		}
@@ -1141,11 +1171,14 @@ func stageOwnerPrograms(
 	if handle == nil {
 		return errors.New("pin handle is nil")
 	}
-	if handle.runtime.pinProgram == nil || handle.runtime.loadPinnedProgram == nil {
-		return errors.New("pinned-program runtime is unavailable")
-	}
 	if record.Phase != pinOwnerPhaseApplying && record.Phase != pinOwnerPhaseDetaching {
 		return fmt.Errorf("cannot stage programs for owner phase %q", record.Phase)
+	}
+	if len(record.ProgramStages) == 0 {
+		return nil
+	}
+	if handle.runtime.pinProgram == nil || handle.runtime.loadPinnedProgram == nil {
+		return errors.New("pinned-program runtime is unavailable")
 	}
 	for _, stage := range record.ProgramStages {
 		if err := handle.recheckTargetEntry(); err != nil {
