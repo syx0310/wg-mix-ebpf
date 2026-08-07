@@ -4,9 +4,9 @@
  *
  * The TC UAPI context intentionally does not expose ip_summed, csum_start or
  * csum_offset. This kfunc validates the one packet shape the encoder supports
- * before discarding a UDP CHECKSUM_PARTIAL request whose checksum field will
- * be replaced by a fully materialized TCP checksum. It is not a general skb
- * metadata write primitive.
+ * before admitting a materialized CHECKSUM_NONE packet or discarding a UDP
+ * CHECKSUM_PARTIAL request whose checksum field will be replaced by a fully
+ * materialized TCP checksum. It is not a general skb metadata write primitive.
  */
 #include <linux/bpf.h>
 #include <linux/btf.h>
@@ -14,14 +14,21 @@
 #include <linux/errno.h>
 #include <linux/if_ether.h>
 #include <linux/ip.h>
+#include <linux/limits.h>
 #include <linux/module.h>
 #include <linux/skbuff.h>
 #include <linux/udp.h>
+#include <net/ip.h>
 
-static int wg_mix_faketcp_validate_udp_partial(struct sk_buff *skb,
-						 u32 network_offset,
-						 u32 transport_offset,
-						 u32 udp_length)
+enum wg_mix_faketcp_checksum_action {
+	WG_MIX_FAKETCP_CSUM_MATERIALIZED,
+	WG_MIX_FAKETCP_CSUM_NORMALIZE_PARTIAL,
+};
+
+static int wg_mix_faketcp_validate_udp_checksum(struct sk_buff *skb,
+						  u32 network_offset,
+						  u32 transport_offset,
+						  u32 udp_length)
 {
 	struct iphdr ip_storage;
 	struct udphdr udp_storage;
@@ -63,7 +70,16 @@ static int wg_mix_faketcp_validate_udp_partial(struct sk_buff *skb,
 	    ntohs(udp->len) != udp_length)
 		return -EMSGSIZE;
 
-	if (skb->ip_summed != CHECKSUM_PARTIAL || skb_csum_is_sctp(skb))
+	switch (skb->ip_summed) {
+	case CHECKSUM_NONE:
+		/* Raw/IP_HDRINCL reinjection already carries materialized bytes. */
+		return WG_MIX_FAKETCP_CSUM_MATERIALIZED;
+	case CHECKSUM_PARTIAL:
+		break;
+	default:
+		return -EPROTO;
+	}
+	if (skb_csum_is_sctp(skb))
 		return -EPROTO;
 	if (skb_checksum_start_offset(skb) != transport_offset ||
 	    skb->csum_offset != offsetof(struct udphdr, check))
@@ -71,7 +87,7 @@ static int wg_mix_faketcp_validate_udp_partial(struct sk_buff *skb,
 	if (skb->csum_offset > udp_length - sizeof(__sum16))
 		return -EMSGSIZE;
 
-	return 0;
+	return WG_MIX_FAKETCP_CSUM_NORMALIZE_PARTIAL;
 }
 
 __bpf_kfunc_start_defs();
@@ -85,12 +101,16 @@ wg_mix_faketcp_skb_normalize_udp_csum(struct __sk_buff *ctx,
 	struct sk_buff *skb = (struct sk_buff *)ctx;
 	int ret;
 
-	ret = wg_mix_faketcp_validate_udp_partial(skb, network_offset,
-						  transport_offset, udp_length);
-	if (ret)
+	ret = wg_mix_faketcp_validate_udp_checksum(skb, network_offset,
+						   transport_offset, udp_length);
+	if (ret < 0)
 		return ret;
+	if (ret == WG_MIX_FAKETCP_CSUM_MATERIALIZED)
+		return 0;
+	if (ret != WG_MIX_FAKETCP_CSUM_NORMALIZE_PARTIAL)
+		return -EPROTO;
 
-	/* csum aliases csum_start/csum_offset, so clear the validated request. */
+	/* csum aliases csum_start/csum_offset, so clear only the PARTIAL request. */
 	skb->csum = 0;
 	skb->csum_valid = 0;
 	skb->csum_complete_sw = 0;

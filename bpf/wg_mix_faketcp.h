@@ -598,11 +598,13 @@ static __always_inline int faketcp_mtu_allows_growth(struct __sk_buff *skb,
 }
 
 // TC's public __sk_buff ABI does not expose ip_summed, csum_start or
-// csum_offset. The required module kfunc validates and clears exactly one
-// non-GSO UDP CHECKSUM_PARTIAL request before any type-word/XOR mutation. The
-// The old UDP checksum is deliberately ignored because it is only a pseudo-header
-// seed. This helper materializes a new TCP checksum from the IPv4
-// pseudo-header, constructed TCP header and complete final payload.
+// csum_offset. The required module kfunc accepts an already materialized
+// CHECKSUM_NONE skb or validates and clears exactly one non-GSO UDP
+// CHECKSUM_PARTIAL request before any type-word/XOR mutation.
+// The old UDP checksum is deliberately ignored because it is only a
+// pseudo-header seed.
+// This helper materializes a new TCP checksum from the IPv4 pseudo-header,
+// constructed TCP header and complete final payload.
 //
 // Every read is bounded by the previously validated fixed-IHL IPv4 total
 // length and FAKETCP_MAX_IPV4_TOTAL_LEN. bpf_skb_load_bytes handles a packet
@@ -740,9 +742,9 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		inc_stat(STAT_SKB_LOAD_ERROR);
 		return TC_ACT_SHOT;
 	}
-	// The kfunc already normalized the validated CHECKSUM_PARTIAL metadata.
-	// change_tail only grows/linearizes the skb; old_udp.check is never treated
-	// as a materialized checksum.
+	// The kfunc admitted CHECKSUM_NONE or normalized validated CHECKSUM_PARTIAL
+	// metadata. change_tail only grows/linearizes the skb; old_udp.check is
+	// never treated as the final TCP checksum.
 	if (bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0) < 0) {
 		inc_stat(STAT_SKB_STORE_ERROR);
 		return TC_ACT_SHOT;

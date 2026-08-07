@@ -71,16 +71,17 @@ func TestFakeTCPSKBContextLayout(t *testing.T) {
 // TestFakeTCPBPFPacketProbe verifier-loads the separately built experimental
 // object, populates only in-memory maps, and invokes the TC egress program with
 // BPF_PROG_TEST_RUN. It never attaches or pins a program. The test-run ABI
-// cannot synthesize ip_summed/csum_start/csum_offset, so otherwise valid input
-// must fail closed at the required CHECKSUM_PARTIAL kfunc boundary. This probe
-// is verifier, non-PARTIAL, GSO and frame-boundary coverage only; it is never a
-// successful real-TC CHECKSUM_PARTIAL capability result. Run explicitly on a
-// Linux test host as:
+// cannot synthesize ip_summed/csum_start/csum_offset, so its default skb covers
+// only the CHECKSUM_NONE path used after raw/IP_HDRINCL reinjection has already
+// materialized the UDP checksum. A successful cell is never evidence that the
+// real-TC CHECKSUM_PARTIAL path works. This probe covers verifier loading,
+// CHECKSUM_NONE transformation, GSO rejection and frame boundaries. Run
+// explicitly on a Linux test host as:
 //
 //	WG_MIX_FAKETCP_PACKET_TEST_OBJECT=/absolute/wg_mix_faketcp_experimental.o \
 //	  go test ./internal/dataplane -run '^TestFakeTCPBPFPacketProbe$' -v
 //
-// Successful transformation remains a separately reviewed real-TC/NIC
+// CHECKSUM_PARTIAL normalization remains a separately reviewed real-TC/NIC
 // acceptance requirement.
 func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	objectPath := os.Getenv(fakeTCPPacketProbeObjectEnv)
@@ -133,23 +134,21 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	populateFakeTCPPacketProbeTailCalls(t, collection, generation)
 
 	const (
-		fakeTCPStatBadPacket     = uint32(4)
-		fakeTCPStatGSOReject     = uint32(5)
-		fakeTCPStatChecksumError = uint32(6)
+		fakeTCPStatBadPacket = uint32(4)
+		fakeTCPStatGSOReject = uint32(5)
 	)
 	for _, xorEnabled := range []bool{false, true} {
 		for _, payloadLength := range []int{32, 33, 1459, 1460} {
-			name := fmt.Sprintf("checksum-none-hard-reject-payload-%d", payloadLength)
+			name := fmt.Sprintf("checksum-none-materialized-payload-%d", payloadLength)
 			if xorEnabled {
 				name += "-xor"
 			}
 			t.Run(name, func(t *testing.T) {
-				populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
+				xorKey := populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
 					ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, xorEnabled)
-				packet, _ := buildFakeTCPProbeUDPPacket(
+				packet, originalPayload := buildFakeTCPProbeUDPPacket(
 					t, sourcePort, remotePort, payloadLength,
 				)
-				before := readFakeTCPPacketProbeStat(t, collection, fakeTCPStatChecksumError)
 				context := fakeTCPSKBContext{Ifindex: ifindex}
 				result, output, err := runFakeTCPPacketProbe(
 					program, packet, context, len(packet)+64,
@@ -157,53 +156,56 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 				if err != nil {
 					t.Fatalf("BPF_PROG_TEST_RUN materialized packet: %v", err)
 				}
-				if result != 2 {
-					t.Fatalf("CHECKSUM_NONE packet action=%d, want TC_ACT_SHOT", result)
+				if result != 0 {
+					t.Fatalf("CHECKSUM_NONE packet action=%d, want TC_ACT_OK", result)
 				}
-				if !bytes.Equal(output, packet) {
-					t.Fatal("CHECKSUM_NONE packet was mutated before the checksum metadata reject")
-				}
-				after := readFakeTCPPacketProbeStat(t, collection, fakeTCPStatChecksumError)
-				if after != before+1 {
-					t.Fatalf("checksum-error stat delta=%d, want 1", after-before)
-				}
+				verifyFakeTCPProbeOutput(
+					t, output, packet, originalPayload, sourcePort, remotePort, xorKey,
+				)
 			})
 		}
 	}
 
-	for _, test := range []struct {
-		name          string
-		payloadLength int
-		wantStat      uint32
-	}{
-		{name: "frame-cap-exact-reaches-checksum-gate", payloadLength: 2276, wantStat: fakeTCPStatChecksumError},
-		{name: "frame-cap-one-over-hard-reject", payloadLength: 2277, wantStat: fakeTCPStatBadPacket},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
-				ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, false)
-			packet, _ := buildFakeTCPProbeUDPPacket(
-				t, sourcePort, remotePort, test.payloadLength,
-			)
-			before := readFakeTCPPacketProbeStat(t, collection, test.wantStat)
-			result, output, err := runFakeTCPPacketProbe(
-				program, packet, fakeTCPSKBContext{Ifindex: ifindex}, len(packet)+64,
-			)
-			if err != nil {
-				t.Fatalf("BPF_PROG_TEST_RUN frame boundary: %v", err)
-			}
-			if result != 2 {
-				t.Fatalf("frame-boundary packet action=%d, want TC_ACT_SHOT", result)
-			}
-			if !bytes.Equal(output, packet) {
-				t.Fatal("frame-boundary packet was mutated before the hard reject")
-			}
-			after := readFakeTCPPacketProbeStat(t, collection, test.wantStat)
-			if after != before+1 {
-				t.Fatalf("selected frame-boundary stat delta=%d, want 1", after-before)
-			}
-		})
-	}
+	t.Run("frame-cap-exact-materialized", func(t *testing.T) {
+		populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
+			ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, false)
+		packet, originalPayload := buildFakeTCPProbeUDPPacket(t, sourcePort, remotePort, 2276)
+		result, output, err := runFakeTCPPacketProbe(
+			program, packet, fakeTCPSKBContext{Ifindex: ifindex}, len(packet)+64,
+		)
+		if err != nil {
+			t.Fatalf("BPF_PROG_TEST_RUN exact frame boundary: %v", err)
+		}
+		if result != 0 {
+			t.Fatalf("exact frame-boundary packet action=%d, want TC_ACT_OK", result)
+		}
+		verifyFakeTCPProbeOutput(
+			t, output, packet, originalPayload, sourcePort, remotePort, nil,
+		)
+	})
+
+	t.Run("frame-cap-one-over-hard-reject", func(t *testing.T) {
+		populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
+			ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, false)
+		packet, _ := buildFakeTCPProbeUDPPacket(t, sourcePort, remotePort, 2277)
+		before := readFakeTCPPacketProbeStat(t, collection, fakeTCPStatBadPacket)
+		result, output, err := runFakeTCPPacketProbe(
+			program, packet, fakeTCPSKBContext{Ifindex: ifindex}, len(packet)+64,
+		)
+		if err != nil {
+			t.Fatalf("BPF_PROG_TEST_RUN frame boundary: %v", err)
+		}
+		if result != 2 {
+			t.Fatalf("frame-boundary packet action=%d, want TC_ACT_SHOT", result)
+		}
+		if !bytes.Equal(output, packet) {
+			t.Fatal("frame-boundary packet was mutated before the hard reject")
+		}
+		after := readFakeTCPPacketProbeStat(t, collection, fakeTCPStatBadPacket)
+		if after != before+1 {
+			t.Fatalf("bad-packet stat delta=%d, want 1", after-before)
+		}
+	})
 
 	t.Run("aggregate-gso-hard-reject", func(t *testing.T) {
 		populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,

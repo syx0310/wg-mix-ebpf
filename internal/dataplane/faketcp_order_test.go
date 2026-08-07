@@ -355,7 +355,10 @@ func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
 		"skb_is_gso(skb)",
 		"skb->protocol != htons(ETH_P_IP)",
 		"ip->protocol != IPPROTO_UDP",
-		"skb->ip_summed != CHECKSUM_PARTIAL",
+		"switch (skb->ip_summed)",
+		"case CHECKSUM_NONE:",
+		"case CHECKSUM_PARTIAL:",
+		"default:",
 		"skb_checksum_start_offset(skb) != transport_offset",
 		"skb->csum_offset != offsetof(struct udphdr, check)",
 		"skb_reset_csum_not_inet(skb)",
@@ -365,6 +368,18 @@ func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
 		if !strings.Contains(module, want) {
 			t.Fatalf("checksum kfunc hard-gate contract missing %q", want)
 		}
+	}
+	noneCase := strings.Index(module, "case CHECKSUM_NONE:")
+	partialCase := strings.Index(module, "case CHECKSUM_PARTIAL:")
+	partialOffsets := strings.Index(module, "skb_checksum_start_offset(skb) != transport_offset")
+	if noneCase < 0 || partialCase < 0 || partialOffsets < 0 ||
+		noneCase >= partialCase || partialCase >= partialOffsets {
+		t.Fatal("CHECKSUM_NONE pass-through and CHECKSUM_PARTIAL metadata validation are misordered")
+	}
+	materializedReturn := strings.Index(module, "if (ret == WG_MIX_FAKETCP_CSUM_MATERIALIZED)")
+	partialReset := strings.Index(module, "skb_reset_csum_not_inet(skb)")
+	if materializedReturn < 0 || partialReset < 0 || materializedReturn >= partialReset {
+		t.Fatal("CHECKSUM_NONE must return before CHECKSUM_PARTIAL metadata normalization")
 	}
 	for _, forbidden := range []string{
 		"BPF_PROG_TYPE_XDP",
@@ -398,6 +413,64 @@ func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
 		if strings.Contains(makefile, forbidden) {
 			t.Fatalf("Makefile must not install, load, unload or clean the module: found %q", forbidden)
 		}
+	}
+}
+
+func TestFakeTCPChecksumMetadataAcceptanceContract(t *testing.T) {
+	const (
+		checksumNone        = uint8(0)
+		checksumUnnecessary = uint8(1)
+		checksumComplete    = uint8(2)
+		checksumPartial     = uint8(3)
+	)
+	tests := []struct {
+		name            string
+		mode            uint8
+		gso             bool
+		transportOffset int
+		checksumStart   int
+		checksumOffset  int
+		want            bool
+	}{
+		{name: "raw-reinject-none", mode: checksumNone, transportOffset: 34, want: true},
+		{name: "wireguard-partial", mode: checksumPartial, transportOffset: 34, checksumStart: 34, checksumOffset: 6, want: true},
+		{name: "partial-wrong-start", mode: checksumPartial, transportOffset: 34, checksumStart: 33, checksumOffset: 6},
+		{name: "partial-wrong-offset", mode: checksumPartial, transportOffset: 34, checksumStart: 34, checksumOffset: 7},
+		{name: "none-gso", mode: checksumNone, gso: true, transportOffset: 34},
+		{name: "partial-gso", mode: checksumPartial, gso: true, transportOffset: 34, checksumStart: 34, checksumOffset: 6},
+		{name: "complete", mode: checksumComplete, transportOffset: 34},
+		{name: "unnecessary", mode: checksumUnnecessary, transportOffset: 34},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := fakeTCPChecksumMetadataAccepted(
+				test.mode, test.gso, test.transportOffset,
+				test.checksumStart, test.checksumOffset,
+			)
+			if got != test.want {
+				t.Fatalf("accepted=%v, want %v", got, test.want)
+			}
+		})
+	}
+}
+
+func fakeTCPChecksumMetadataAccepted(
+	mode uint8,
+	gso bool,
+	transportOffset int,
+	checksumStart int,
+	checksumOffset int,
+) bool {
+	if gso {
+		return false
+	}
+	switch mode {
+	case 0: // CHECKSUM_NONE: raw reinjection already materialized the packet.
+		return true
+	case 3: // CHECKSUM_PARTIAL: WireGuard/UDP tunnel offload metadata is exact.
+		return checksumStart == transportOffset && checksumOffset == 6
+	default:
+		return false
 	}
 }
 
