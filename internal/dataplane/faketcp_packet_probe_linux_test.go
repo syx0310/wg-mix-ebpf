@@ -139,13 +139,9 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 					t, sourcePort, remotePort, payloadLength,
 				)
 				context := fakeTCPSKBContext{Ifindex: ifindex}
-				output := make([]byte, len(packet)+64)
-				result, err := program.Run(&ebpf.RunOptions{
-					Data:    append([]byte(nil), packet...),
-					DataOut: output,
-					Context: context,
-					Repeat:  1,
-				})
+				result, output, err := runFakeTCPPacketProbe(
+					program, packet, context, len(packet)+64,
+				)
 				if err != nil {
 					t.Fatalf("BPF_PROG_TEST_RUN materialized packet: %v", err)
 				}
@@ -167,13 +163,9 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 			GSOSegments: 2,
 			GSOSize:     16,
 		}
-		output := make([]byte, len(packet)+64)
-		result, err := program.Run(&ebpf.RunOptions{
-			Data:    append([]byte(nil), packet...),
-			DataOut: output,
-			Context: context,
-			Repeat:  1,
-		})
+		result, output, err := runFakeTCPPacketProbe(
+			program, packet, context, len(packet)+64,
+		)
 		if err != nil {
 			if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.EOPNOTSUPP) {
 				t.Skipf("kernel cannot synthesize an skb GSO context for BPF_PROG_TEST_RUN: %v", err)
