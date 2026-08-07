@@ -350,6 +350,38 @@ func TestExperimentalCollectionAcquisitionFailsClosedOnNilCollectionOrOwner(t *t
 		}
 	})
 
+	t.Run("nil collection after cancellation", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+		fixture := newExperimentalAcquisitionFixture()
+		dependencies := fixture.dependencies(t)
+		dependencies.newCollection = func(*ebpf.CollectionSpec) (*ebpf.Collection, error) {
+			fixture.order = append(fixture.order, "new-collection")
+			cancel()
+			return nil, nil
+		}
+		owner, err := acquireExperimentalFakeTCPCollection(
+			ctx, canonicalExperimentalCollectionSpec(),
+			"/reviewed/experimental.o", dependencies,
+		)
+		if owner != nil {
+			t.Fatal("nil collection contract failure returned an owner")
+		}
+		if err == nil || !strings.Contains(err.Error(), "loader returned nil collection") ||
+			!errors.Is(err, context.Canceled) {
+			t.Fatalf("nil collection cancellation error = %v", err)
+		}
+		if got, want := strings.Join(fixture.order, ","), "kernel-dependency,remove-memlock,new-collection"; got != want {
+			t.Fatalf("nil collection cancellation order = %q, want %q", got, want)
+		}
+		if fixture.rawCloseCalls != 0 || fixture.ownedMap.closes != 0 {
+			t.Fatalf(
+				"nil collection cancellation close counts: raw=%d owner=%d, want 0/0",
+				fixture.rawCloseCalls, fixture.ownedMap.closes,
+			)
+		}
+	})
+
 	t.Run("nil owner", func(t *testing.T) {
 		fixture := newExperimentalAcquisitionFixture()
 		dependencies := fixture.dependencies(t)
