@@ -66,11 +66,14 @@ The post-final-check boundary always attempts another stable descriptor-based
 enumeration, even when the hook or binding check fails. A successful
 enumeration replaces the plan's evidence list and the error reports every
 current exact prefix path. If stable enumeration itself fails, the error labels
-the list only as last-known. An independently privileged concurrent writer can
-create arbitrarily many names and cannot be bounded by this process; an
-observed count above eight is reported in full and fails closed, and seven or
-more existing names block every later active-link move. No evidence is restored
-or deleted by pathname.
+the list only as last-known. This scope is carried into the public uninstall
+error audit: a later error may assert each path only when the post-final list
+was stably enumerated, otherwise it reports one last-known record and states
+that current exact paths are unavailable. An independently privileged
+concurrent writer can create arbitrarily many names and cannot be bounded by
+this process; an observed count above eight is reported in full and fails
+closed, and seven or more existing names block every later active-link move. No
+evidence is restored or deleted by pathname.
 
 Fresh service-unit, install-config, and ownership-manifest files prefer a Linux
 `O_TMPFILE` object under the held parent. Filesystems without that primitive,

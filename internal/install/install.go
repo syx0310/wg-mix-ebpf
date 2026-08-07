@@ -54,6 +54,7 @@ type installAfterSystemdEnableLinkHookContextKey struct{}
 type installAfterSystemdEnableCommitWalkOpenHookContextKey struct{}
 type installAfterSystemdEnableRetentionCheckHookContextKey struct{}
 type installBeforeObjectBoundFreshPublishHookContextKey struct{}
+type uninstallAfterFinalQuarantineCheckHookContextKey struct{}
 
 func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if err := ctx.Err(); err != nil {
@@ -581,17 +582,28 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	}()
 
 	if err := func() (retErr error) {
-		var retainedServiceArtifactEvidence []string
+		var retainedServiceArtifactEvidence retainedQuarantineEvidenceReport
 		defer func() {
-			if retErr == nil || len(retainedServiceArtifactEvidence) == 0 {
+			if retErr == nil || len(retainedServiceArtifactEvidence.paths) == 0 {
 				return
 			}
 			errs := []error{retErr}
-			for _, evidencePath := range retainedServiceArtifactEvidence {
+			if retainedServiceArtifactEvidence.current {
+				for _, evidencePath := range retainedServiceArtifactEvidence.paths {
+					errs = append(errs, fmt.Errorf(
+						"retained systemd enable-link quarantine evidence at stably enumerated current exact path %s; "+
+							"no pathname-based unlink was attempted",
+						evidencePath,
+					))
+				}
+			} else {
 				errs = append(errs, fmt.Errorf(
-					"retained systemd enable-link quarantine evidence at %s; "+
+					"retained systemd enable-link quarantine last-known path records [%s]; "+
+						"current exact paths are unavailable because stable post-final enumeration failed; "+
 						"no pathname-based unlink was attempted",
-					evidencePath,
+					formatExactQuarantineEvidencePaths(
+						retainedServiceArtifactEvidence.paths,
+					),
 				))
 			}
 			retErr = errors.Join(errs...)
@@ -658,18 +670,21 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 				return fmt.Errorf("cleanup startup guard: %w", err)
 			}
 		}
+		if hook, ok := ctx.Value(
+			uninstallAfterFinalQuarantineCheckHookContextKey{},
+		).(func(string, string) error); ok {
+			cleanupPlan.afterFinalQuarantineCheck = hook
+		}
 		serviceArtifactErr := cleanupPlan.executeServiceArtifacts()
-		retainedServiceArtifactEvidence = append(
-			retainedServiceArtifactEvidence[:0],
-			cleanupPlan.retainedQuarantineEvidencePaths()...,
-		)
+		retainedServiceArtifactEvidence =
+			cleanupPlan.retainedQuarantineEvidenceReport()
 		if serviceArtifactErr != nil {
 			return fmt.Errorf(
 				"remove descriptor-anchored service artifacts: %w",
 				serviceArtifactErr,
 			)
 		}
-		addQuarantineEvidenceActions(retainedServiceArtifactEvidence)
+		addQuarantineEvidenceActions(retainedServiceArtifactEvidence.paths)
 		if system == "systemd" {
 			if err := runSystemdManagerReloadAfterServiceArtifactRemoval(
 				ctx,

@@ -1319,13 +1319,14 @@ func (entry *cleanupEntryPlan) close() error {
 }
 
 type cleanupDirectoryPlan struct {
-	root                       *managedCleanupDir
-	entries                    []*cleanupEntryPlan
-	absentServiceArtifactPath  string
-	strictEntries              bool
-	removeRoot                 bool
-	rootMayDisappear           bool
-	retainedQuarantineEvidence []string
+	root                              *managedCleanupDir
+	entries                           []*cleanupEntryPlan
+	absentServiceArtifactPath         string
+	strictEntries                     bool
+	removeRoot                        bool
+	rootMayDisappear                  bool
+	retainedQuarantineEvidence        []string
+	retainedQuarantineEvidenceCurrent bool
 }
 
 const (
@@ -1376,15 +1377,33 @@ func (plan *uninstallCleanupPlan) close() error {
 }
 
 func (plan *uninstallCleanupPlan) retainedQuarantineEvidencePaths() []string {
+	return plan.retainedQuarantineEvidenceReport().paths
+}
+
+type retainedQuarantineEvidenceReport struct {
+	paths   []string
+	current bool
+}
+
+func (plan *uninstallCleanupPlan) retainedQuarantineEvidenceReport() retainedQuarantineEvidenceReport {
 	if plan == nil {
-		return nil
+		return retainedQuarantineEvidenceReport{}
 	}
-	var paths []string
+	report := retainedQuarantineEvidenceReport{current: true}
 	for _, directory := range plan.directories {
-		paths = append(paths, directory.retainedQuarantineEvidence...)
+		if len(directory.retainedQuarantineEvidence) == 0 {
+			continue
+		}
+		report.paths = append(
+			report.paths,
+			directory.retainedQuarantineEvidence...,
+		)
+		if !directory.retainedQuarantineEvidenceCurrent {
+			report.current = false
+		}
 	}
-	sort.Strings(paths)
-	return paths
+	sort.Strings(report.paths)
+	return report
 }
 
 func inspectRetainedSystemdQuarantineEvidence(
@@ -2342,9 +2361,10 @@ func prepareArtifactPlansForValidation(
 		}
 		if cleanupIsNotExist(snapshotErr) {
 			plans = append(plans, &cleanupDirectoryPlan{
-				root:                       parent,
-				absentServiceArtifactPath:  artifact.Path,
-				retainedQuarantineEvidence: retainedEvidence,
+				root:                              parent,
+				absentServiceArtifactPath:         artifact.Path,
+				retainedQuarantineEvidence:        retainedEvidence,
+				retainedQuarantineEvidenceCurrent: true,
 			})
 			continue
 		}
@@ -2365,11 +2385,12 @@ func prepareArtifactPlansForValidation(
 			)
 		}
 		plan := &cleanupDirectoryPlan{
-			root:                       parent,
-			entries:                    []*cleanupEntryPlan{node},
-			strictEntries:              false,
-			removeRoot:                 false,
-			retainedQuarantineEvidence: retainedEvidence,
+			root:                              parent,
+			entries:                           []*cleanupEntryPlan{node},
+			strictEntries:                     false,
+			removeRoot:                        false,
+			retainedQuarantineEvidence:        retainedEvidence,
+			retainedQuarantineEvidenceCurrent: true,
 		}
 		plans = append(plans, plan)
 	}
@@ -3679,6 +3700,7 @@ func (entry *cleanupEntryPlan) unlink(
 			evidencePath,
 		)
 		sort.Strings(directory.retainedQuarantineEvidence)
+		directory.retainedQuarantineEvidenceCurrent = true
 		var hookErr error
 		if afterFinalQuarantineCheck != nil {
 			if err := afterFinalQuarantineCheck(entry.path, evidencePath); err != nil {
@@ -3704,12 +3726,14 @@ func (entry *cleanupEntryPlan) unlink(
 			directory.root,
 		)
 		if err != nil {
+			directory.retainedQuarantineEvidenceCurrent = false
 			enumerationErr = fmt.Errorf(
 				"stably enumerate retained systemd enable-link quarantine evidence after final-check boundary: %w",
 				err,
 			)
 		} else {
 			directory.retainedQuarantineEvidence = currentEvidencePaths
+			directory.retainedQuarantineEvidenceCurrent = true
 		}
 		var boundaryErr error
 		if err := revalidateManagedCleanupDir(directory.root); err != nil {
@@ -3816,6 +3840,7 @@ func (entry *cleanupEntryPlan) moveToQuarantine(
 			)
 		}
 		directory.retainedQuarantineEvidence = evidencePaths
+		directory.retainedQuarantineEvidenceCurrent = true
 		if len(evidencePaths) > systemdEnableLinkQuarantineExistingLimit {
 			return "", false, retainedSystemdQuarantineOperationalThresholdError(
 				entry.path,

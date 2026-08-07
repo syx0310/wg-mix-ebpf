@@ -1053,6 +1053,9 @@ func TestSystemdEnableLinkAmbiguityReserveBoundsPostFinalReplacement(
 			wantEvidence,
 		)
 	}
+	if !linkDirectory.retainedQuarantineEvidenceCurrent {
+		t.Fatal("successful post-final replacement enumeration was not marked current")
+	}
 	if actual := systemdQuarantineEvidencePaths(t, layout); !slices.Equal(
 		actual,
 		wantEvidence,
@@ -1171,6 +1174,9 @@ func TestSystemdEnableLinkPostFinalEnumerationReportsConcurrentHardLimitOverflow
 			wantEvidence,
 		)
 	}
+	if !linkDirectory.retainedQuarantineEvidenceCurrent {
+		t.Fatal("successful post-final overflow enumeration was not marked current")
+	}
 	if actual := systemdQuarantineEvidencePaths(t, layout); !slices.Equal(
 		actual,
 		wantEvidence,
@@ -1264,6 +1270,102 @@ func TestSystemdEnableLinkPostFinalEnumerationFailureReportsOnlyLastKnownPaths(
 		systemdEnableLinkTarget,
 		linkIdentity,
 		"owned evidence in displaced wants directory",
+	)
+	if linkDirectory.retainedQuarantineEvidenceCurrent {
+		t.Fatal("failed stable enumeration marked last-known evidence as current")
+	}
+}
+
+func TestUninstallPostFinalEnumerationFailureDoesNotAssertLastKnownPathIsCurrent(
+	t *testing.T,
+) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"uninstall-post-final-enumeration-failure",
+		"systemd",
+	)
+	linkPath := systemdEnableLinkPath(layout)
+	if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	linkIdentity, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	setCleanupTestEnvironment(t, layout)
+	installFakeNft(t, "")
+	installFakeSystemctl(t, filepath.Join(t.TempDir(), "systemctl.log"), "")
+
+	wantsDir := filepath.Dir(linkPath)
+	displacedWants := wantsDir + ".displaced-after-public-uninstall"
+	var evidencePath string
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+	ctx = context.WithValue(
+		ctx,
+		uninstallAfterFinalQuarantineCheckHookContextKey{},
+		func(originalPath string, retainedPath string) error {
+			if originalPath != linkPath || evidencePath != "" {
+				return fmt.Errorf(
+					"unexpected final quarantine hook path %s retained=%s",
+					originalPath,
+					retainedPath,
+				)
+			}
+			evidencePath = retainedPath
+			if err := os.Rename(wantsDir, displacedWants); err != nil {
+				return err
+			}
+			return os.Mkdir(wantsDir, 0o700)
+		},
+	)
+
+	result, err := Uninstall(ctx, Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "systemd",
+		Yes:        true,
+	})
+	if evidencePath == "" {
+		t.Fatalf("public uninstall did not reach the post-final hook: %v", err)
+	}
+	if result != nil {
+		t.Fatalf("failed uninstall returned a public success plan: %#v", result)
+	}
+	if err == nil ||
+		!strings.Contains(err.Error(), "last-known path records") ||
+		!strings.Contains(err.Error(), "current exact paths are unavailable") ||
+		!strings.Contains(err.Error(), evidencePath) {
+		t.Fatalf("public uninstall enumeration failure = %v", err)
+	}
+	misleadingCurrentAssertion :=
+		"retained systemd enable-link quarantine evidence at " + evidencePath
+	if strings.Contains(err.Error(), misleadingCurrentAssertion) ||
+		strings.Contains(
+			err.Error(),
+			"stably enumerated current exact path "+evidencePath,
+		) {
+		t.Fatalf(
+			"public uninstall asserted a last-known path was current: %v",
+			err,
+		)
+	}
+	if _, statErr := os.Lstat(linkPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("replacement wants directory gained an active link: %v", statErr)
+	}
+	retainedInDisplacedWants := filepath.Join(
+		displacedWants,
+		filepath.Base(evidencePath),
+	)
+	assertSameSymlink(
+		t,
+		retainedInDisplacedWants,
+		systemdEnableLinkTarget,
+		linkIdentity,
+		"public uninstall retained evidence in displaced wants directory",
 	)
 }
 
@@ -2150,6 +2252,12 @@ func TestUninstallPurgeRetainsOwnershipUntilDaemonReloadSucceeds(t *testing.T) {
 			evidencePaths,
 			err,
 		)
+	}
+	if !strings.Contains(
+		err.Error(),
+		"stably enumerated current exact path "+evidencePaths[0],
+	) || strings.Contains(err.Error(), "last-known path records") {
+		t.Fatalf("failed reload evidence scope is not current: %v", err)
 	}
 	if _, statErr := os.Lstat(enableLink); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("failed daemon-reload restored active systemd enable link: %v", statErr)
