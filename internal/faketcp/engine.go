@@ -152,14 +152,18 @@ type tokenBucket struct {
 }
 
 type Engine struct {
-	mu           sync.Mutex
-	opts         Options
-	identity     RuntimeIdentity
-	sessions     map[abi.FakeTCPSessionKey]*session
-	pendingFlows int
-	pendingBytes int
-	halfOpen     int
-	globalSYNs   tokenBucket
+	mu       sync.Mutex
+	opts     Options
+	identity RuntimeIdentity
+	// One RuntimeIdentity may seed exactly one kernel collection. Reusing the
+	// Engine with fresh maps would restart every per-CPU capture sequence and
+	// collide with identities emitted by its first collection.
+	runtimeIdentityCommit *runtimeIdentityCommitState
+	sessions              map[abi.FakeTCPSessionKey]*session
+	pendingFlows          int
+	pendingBytes          int
+	halfOpen              int
+	globalSYNs            tokenBucket
 	// admissionEpoch is local to one Engine lifetime. New engines begin with
 	// zero tokens at this epoch; recreation can only discard accumulated
 	// budget and can never mint a fresh burst.
@@ -223,13 +227,14 @@ func New(options Options) (*Engine, error) {
 	}
 	admissionEpoch := options.Now()
 	return &Engine{
-		opts:           options,
-		identity:       RuntimeIdentity{Generation: options.Generation, Incarnation: incarnation},
-		sessions:       make(map[abi.FakeTCPSessionKey]*session),
-		globalSYNs:     tokenBucket{lastRefill: admissionEpoch, initialized: true},
-		admissionEpoch: admissionEpoch,
-		synSources:     make(map[synSourceKey]*synSourceState),
-		synSourceLRU:   list.New(),
+		opts:                  options,
+		identity:              RuntimeIdentity{Generation: options.Generation, Incarnation: incarnation},
+		runtimeIdentityCommit: &runtimeIdentityCommitState{},
+		sessions:              make(map[abi.FakeTCPSessionKey]*session),
+		globalSYNs:            tokenBucket{lastRefill: admissionEpoch, initialized: true},
+		admissionEpoch:        admissionEpoch,
+		synSources:            make(map[synSourceKey]*synSourceState),
+		synSourceLRU:          list.New(),
 	}, nil
 }
 
