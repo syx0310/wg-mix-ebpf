@@ -42,6 +42,11 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
         self.assertIn('exec 9<"${helper_path}"', self.launcher)
         self.assertIn("/proc/self/fd/8", self.launcher)
         self.assertIn("/proc/self/fd/9", self.launcher)
+        self.assertIn('"smoke_mountns_launcher"', self.helper)
+        self.assertIn(
+            '"run-smoke-netns-wg-private-mountns.sh"',
+            self.helper,
+        )
 
     def test_bootstrap_manifest_pins_launcher_helper_and_modes(self) -> None:
         fields = dict(

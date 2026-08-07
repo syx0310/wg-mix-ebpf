@@ -79,7 +79,7 @@ type vethPairThreadOperations struct {
 func Run(arguments []string) error {
 	if len(arguments) == 0 {
 		return errors.New(
-			"expected identity, anchor, inspect-ready, probe, exec, create-veth-pair, or stop",
+			"expected identity, review-staged-launch, review-system-tools, reviewed-exec, launch-private-mountns, anchor, inspect-ready, probe, exec, create-veth-pair, or stop",
 		)
 	}
 	if arguments[0] != "__worker" {
@@ -90,6 +90,14 @@ func Run(arguments []string) error {
 	switch arguments[0] {
 	case "identity":
 		return runIdentityCommand(arguments[1:])
+	case "review-staged-launch":
+		return runReviewStagedLaunchCommand(arguments[1:])
+	case "review-system-tools":
+		return runReviewSystemToolsCommand(arguments[1:])
+	case "reviewed-exec":
+		return runReviewedExecCommand(arguments[1:])
+	case "launch-private-mountns":
+		return runLaunchPrivateMountNSCommand(arguments[1:])
 	case "anchor":
 		return runAnchorCommand(arguments[1:])
 	case "inspect-ready":

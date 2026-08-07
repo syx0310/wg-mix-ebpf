@@ -831,6 +831,14 @@ def stage_source(
             ),
             ("smoke_script", os.path.join(source, "scripts", "smoke-netns-wg.sh")),
             (
+                "smoke_mountns_launcher",
+                os.path.join(
+                    source,
+                    "scripts",
+                    "run-smoke-netns-wg-private-mountns.sh",
+                ),
+            ),
+            (
                 "source_commit_script",
                 os.path.join(source, "scripts", "source-commit.sh"),
             ),
