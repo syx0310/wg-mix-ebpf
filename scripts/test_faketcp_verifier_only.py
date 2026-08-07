@@ -128,6 +128,59 @@ class VerifierGateTest(unittest.TestCase):
         with self.assertRaisesRegex(runner.GateError, re.escape(expected)):
             function(*arguments)
 
+    def scripted_poll_factory(self, descriptor, script, events):
+        class ScriptedPoll:
+            def register(_self, registered_descriptor, event_mask):
+                events.append(("register", registered_descriptor, event_mask))
+                self.assertEqual(registered_descriptor, descriptor)
+                self.assertEqual(event_mask, runner.READINESS_POLL_MASK)
+
+            def poll(_self, timeout_milliseconds):
+                events.append(("poll", timeout_milliseconds))
+                if not script:
+                    self.fail("readiness poll exceeded its scripted bound")
+                result = script.pop(0)
+                if isinstance(result, BaseException):
+                    raise result
+                if callable(result):
+                    return result(timeout_milliseconds)
+                return result
+
+        return ScriptedPoll
+
+    def nonblocking_readiness_pipe(self):
+        ready_read, ready_write = os.pipe()
+        os.set_inheritable(ready_read, False)
+        os.set_inheritable(ready_write, False)
+        os.set_blocking(ready_read, False)
+        return ready_read, ready_write
+
+    def bounded_cleanup_owned_child(self, pid):
+        cleanup_deadline = time.monotonic() + 1.0
+        signal_sent = False
+        while True:
+            try:
+                waited_pid, _ = os.waitpid(pid, os.WNOHANG)
+            except ChildProcessError:
+                return
+            except OSError as error:
+                if error.errno == errno.ECHILD:
+                    return
+                raise
+            if waited_pid == pid:
+                return
+            if waited_pid != 0:
+                self.fail("unexpected child returned during bounded cleanup")
+            if not signal_sent:
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                signal_sent = True
+            if time.monotonic() >= cleanup_deadline:
+                self.fail("owned child did not exit within cleanup deadline")
+            time.sleep(0.01)
+
     def test_parse_rejects_missing_and_additional_arguments(self) -> None:
         duplicate = [
             "--runner-sha256",
@@ -305,6 +358,16 @@ class VerifierGateTest(unittest.TestCase):
             wrong_policy,
         )
 
+    def test_directory_with_single_link_is_accepted(self) -> None:
+        _, _, _, policy = self.new_layout("single-link-directory-metadata")
+        metadata = types.SimpleNamespace(
+            st_mode=runner.stat.S_IFDIR | 0o700,
+            st_uid=self.current_owner[0],
+            st_gid=self.current_owner[1],
+            st_nlink=1,
+        )
+        runner.validate_directory_metadata(metadata, "/synthetic-overlay", policy)
+
     def test_symlink_parent_is_rejected(self) -> None:
         staging_root, _, bpf_object, policy = self.new_layout("symlink-parent")
         real_parent = os.path.join(staging_root, "real-parent")
@@ -367,6 +430,16 @@ class VerifierGateTest(unittest.TestCase):
                 "/proc/self/fd/101",
             ),
         )
+
+    def test_child_deadline_precedes_pipe_and_fork(self) -> None:
+        source = pathlib.Path(RUNNER_PATH).read_text(encoding="utf-8")
+        child_source = source[source.index("def run_descriptor_child(") :]
+        deadline_index = child_source.index("absolute_deadline = time.monotonic()")
+        pipe_index = child_source.index("os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)")
+        fork_index = child_source.index("os.fork()")
+        self.assertLess(deadline_index, pipe_index)
+        self.assertLess(pipe_index, fork_index)
+        self.assertNotIn("reap_blocking", child_source)
 
     def test_rename_replacement_cannot_change_verified_execution(self) -> None:
         staging_root, binary, bpf_object, policy = self.new_layout("fd-rename")
@@ -436,6 +509,424 @@ exit 0
                 self.assertEqual(runner.execute_verified(artifacts, policy), 23)
             finally:
                 artifacts.close()
+
+    def test_pre_setsid_readiness_timeout_directly_kills_child(self) -> None:
+        ready_read, ready_write = self.nonblocking_readiness_pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(ready_read)
+            os.kill(os.getpid(), signal.SIGSTOP)
+            os.setsid()
+            os.write(ready_write, runner.READINESS_BYTE)
+            os._exit(90)
+        os.close(ready_write)
+        events = []
+
+        def recording_killpg(group, signal_number):
+            events.append(("group", group, signal_number))
+            os.killpg(group, signal_number)
+
+        def recording_kill(child, signal_number):
+            events.append(("direct", child, signal_number))
+            os.kill(child, signal_number)
+
+        try:
+            with self.assertRaisesRegex(
+                runner.GateError,
+                "child readiness deadline expired",
+            ):
+                runner.wait_for_child_readiness(
+                    pid,
+                    ready_read,
+                    time.monotonic() + 0.1,
+                    killpg_function=recording_killpg,
+                    kill_function=recording_kill,
+                    kill_reap_seconds=1.0,
+                )
+            self.assertEqual(
+                events,
+                [("direct", pid, signal.SIGKILL)],
+            )
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            os.close(ready_read)
+            self.bounded_cleanup_owned_child(pid)
+
+    def test_post_setsid_pre_ready_timeout_kills_group_and_child(self) -> None:
+        ready_read, ready_write = self.nonblocking_readiness_pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(ready_read)
+            os.setsid()
+            os.kill(os.getpid(), signal.SIGSTOP)
+            os.write(ready_write, runner.READINESS_BYTE)
+            os._exit(90)
+        os.close(ready_write)
+        setup_deadline = time.monotonic() + 1.0
+        while os.getpgid(pid) != pid:
+            if time.monotonic() >= setup_deadline:
+                self.fail("child did not enter its own process group")
+            time.sleep(0.01)
+        events = []
+
+        def recording_killpg(group, signal_number):
+            events.append(("group", group, signal_number))
+            os.killpg(group, signal_number)
+
+        def recording_kill(child, signal_number):
+            events.append(("direct", child, signal_number))
+            os.kill(child, signal_number)
+
+        try:
+            with self.assertRaisesRegex(
+                runner.GateError,
+                "child readiness deadline expired",
+            ):
+                runner.wait_for_child_readiness(
+                    pid,
+                    ready_read,
+                    time.monotonic() + 0.1,
+                    killpg_function=recording_killpg,
+                    kill_function=recording_kill,
+                    kill_reap_seconds=1.0,
+                )
+            self.assertEqual(
+                events,
+                [
+                    ("group", pid, signal.SIGKILL),
+                    ("direct", pid, signal.SIGKILL),
+                ],
+            )
+            with self.assertRaises(ProcessLookupError):
+                os.kill(pid, 0)
+        finally:
+            os.close(ready_read)
+            self.bounded_cleanup_owned_child(pid)
+
+    def test_confirmed_pre_ready_cleanup_order_is_group_direct_reap(self) -> None:
+        events = []
+        child_killed = False
+
+        def fake_getpgid(pid):
+            events.append(("getpgid", pid))
+            return pid
+
+        def fake_killpg(pid, signal_number):
+            events.append(("group", pid, signal_number))
+
+        def fake_kill(pid, signal_number):
+            nonlocal child_killed
+            events.append(("direct", pid, signal_number))
+            child_killed = True
+
+        def fake_waitpid(pid, flags):
+            events.append(("wait", pid, flags))
+            return (pid, 0) if child_killed else (0, 0)
+
+        runner.cleanup_pre_ready_child(
+            5000,
+            waitpid_function=fake_waitpid,
+            getpgid_function=fake_getpgid,
+            killpg_function=fake_killpg,
+            kill_function=fake_kill,
+            reap_timeout_seconds=1.0,
+            monotonic_function=lambda: 0.0,
+            sleep_function=lambda _duration: self.fail(
+                "cleanup unexpectedly slept"
+            ),
+        )
+        self.assertEqual(
+            events,
+            [
+                ("getpgid", 5000),
+                ("group", 5000, signal.SIGKILL),
+                ("direct", 5000, signal.SIGKILL),
+                ("wait", 5000, os.WNOHANG),
+            ],
+        )
+
+    def test_readiness_poll_and_read_errors_cleanup_direct_child(self) -> None:
+        for case_name, poll_script, read_function, expected in (
+            (
+                "poll",
+                [OSError(errno.EIO, "injected poll failure")],
+                lambda _descriptor, _size: self.fail("unexpected readiness read"),
+                "injected poll failure",
+            ),
+            (
+                "read",
+                [[(81, runner.select.POLLIN)]],
+                lambda _descriptor, _size: (_ for _ in ()).throw(
+                    OSError(errno.EIO, "injected read failure")
+                ),
+                "injected read failure",
+            ),
+        ):
+            with self.subTest(case_name=case_name):
+                events = []
+                group_killed = False
+
+                def fake_waitpid(pid, flags):
+                    events.append(("wait", pid, flags))
+                    if group_killed:
+                        return pid, 0
+                    return 0, 0
+
+                def fake_getpgid(pid):
+                    events.append(("getpgid", pid))
+                    return pid - 1
+
+                def fake_direct_kill(pid, signal_number):
+                    nonlocal group_killed
+                    events.append(("direct", pid, signal_number))
+                    group_killed = True
+
+                with self.assertRaisesRegex(OSError, expected):
+                    runner.wait_for_child_readiness(
+                        5001,
+                        81,
+                        10.0,
+                        waitpid_function=fake_waitpid,
+                        getpgid_function=fake_getpgid,
+                        killpg_function=lambda _pid, _signal: self.fail(
+                            "unconfirmed group must not be signaled"
+                        ),
+                        kill_function=fake_direct_kill,
+                        monotonic_function=lambda: 0.0,
+                        sleep_function=lambda _duration: self.fail(
+                            "cleanup unexpectedly slept"
+                        ),
+                        poll_factory=self.scripted_poll_factory(
+                            81,
+                            list(poll_script),
+                            events,
+                        ),
+                        read_function=read_function,
+                    )
+                self.assertEqual(
+                    events[-3:],
+                    [
+                        ("getpgid", 5001),
+                        ("direct", 5001, signal.SIGKILL),
+                        ("wait", 5001, os.WNOHANG),
+                    ],
+                )
+
+    def test_persistent_readiness_eintr_is_bounded_by_absolute_deadline(self) -> None:
+        for case_name in ("poll", "read"):
+            with self.subTest(case_name=case_name):
+                events = []
+                now = 0.0
+                child_killed = False
+
+                def monotonic():
+                    nonlocal now
+                    now += 0.4
+                    return now
+
+                class InterruptingPoll:
+                    def register(_self, descriptor, event_mask):
+                        events.append(("register", descriptor, event_mask))
+
+                    def poll(_self, timeout_milliseconds):
+                        events.append(("poll", timeout_milliseconds))
+                        if case_name == "poll":
+                            raise OSError(errno.EINTR, "persistent poll EINTR")
+                        return [(84, runner.select.POLLIN)]
+
+                def interrupting_read(_descriptor, _size):
+                    events.append(("read",))
+                    raise OSError(errno.EINTR, "persistent read EINTR")
+
+                def fake_direct_kill(pid, signal_number):
+                    nonlocal child_killed
+                    events.append(("direct", pid, signal_number))
+                    child_killed = True
+
+                with self.assertRaisesRegex(
+                    runner.GateError,
+                    "child readiness deadline expired",
+                ):
+                    runner.wait_for_child_readiness(
+                        5004,
+                        84,
+                        1.0,
+                        waitpid_function=lambda pid, flags: (
+                            (pid, 0) if child_killed else (0, 0)
+                        ),
+                        getpgid_function=lambda pid: pid - 1,
+                        killpg_function=lambda _pid, _signal: self.fail(
+                            "unconfirmed group must not be signaled"
+                        ),
+                        kill_function=fake_direct_kill,
+                        monotonic_function=monotonic,
+                        sleep_function=lambda _duration: self.fail(
+                            "bounded cleanup unexpectedly slept"
+                        ),
+                        poll_factory=InterruptingPoll,
+                        read_function=interrupting_read,
+                        kill_reap_seconds=1.0,
+                    )
+                operation = "poll" if case_name == "poll" else "read"
+                operation_calls = [event for event in events if event[0] == operation]
+                self.assertEqual(len(operation_calls), 2)
+                self.assertIn(("direct", 5004, signal.SIGKILL), events)
+
+    def test_readiness_close_error_does_not_mask_cleanup_failure(self) -> None:
+        events = []
+        child_killed = False
+
+        def fake_direct_kill(pid, signal_number):
+            nonlocal child_killed
+            events.append(("direct", pid, signal_number))
+            child_killed = True
+
+        def failing_close(descriptor):
+            events.append(("close", descriptor))
+            raise OSError(errno.EBADF, "injected close failure")
+
+        with self.assertRaisesRegex(OSError, "injected poll failure"):
+            runner.supervise_ready_child(
+                5005,
+                85,
+                10.0,
+                0.0,
+                waitpid_function=lambda pid, flags: (
+                    (pid, 0) if child_killed else (0, 0)
+                ),
+                getpgid_function=lambda pid: pid - 1,
+                killpg_function=lambda _pid, _signal: self.fail(
+                    "unconfirmed group must not be signaled"
+                ),
+                kill_function=fake_direct_kill,
+                monotonic_function=lambda: 0.0,
+                sleep_function=lambda _duration: self.fail(
+                    "cleanup unexpectedly slept"
+                ),
+                poll_factory=self.scripted_poll_factory(
+                    85,
+                    [OSError(errno.EIO, "injected poll failure")],
+                    events,
+                ),
+                read_function=lambda _descriptor, _size: self.fail(
+                    "unexpected readiness read"
+                ),
+                close_function=failing_close,
+            )
+        self.assertIn(("direct", 5005, signal.SIGKILL), events)
+        self.assertEqual(events[-1], ("close", 85))
+
+    def test_readiness_eof_and_non_confirmation_are_bounded(self) -> None:
+        for payload, expected in (
+            (b"", "reached EOF"),
+            (b"X", "non-confirmation byte"),
+        ):
+            with self.subTest(payload=payload):
+                events = []
+                child_killed = False
+
+                def fake_waitpid(pid, flags):
+                    events.append(("wait", pid, flags))
+                    self.assertEqual(flags, os.WNOHANG)
+                    return (pid, 0) if child_killed else (0, 0)
+
+                def fake_direct_kill(pid, signal_number):
+                    nonlocal child_killed
+                    events.append(("direct", pid, signal_number))
+                    child_killed = True
+
+                with self.assertRaisesRegex(runner.GateError, expected):
+                    runner.wait_for_child_readiness(
+                        5002,
+                        82,
+                        10.0,
+                        waitpid_function=fake_waitpid,
+                        getpgid_function=lambda pid: pid - 1,
+                        killpg_function=lambda _pid, _signal: self.fail(
+                            "unconfirmed group must not be signaled"
+                        ),
+                        kill_function=fake_direct_kill,
+                        monotonic_function=lambda: 0.0,
+                        sleep_function=lambda _duration: self.fail(
+                            "cleanup unexpectedly slept"
+                        ),
+                        poll_factory=self.scripted_poll_factory(
+                            82,
+                            [[(82, runner.select.POLLIN | runner.select.POLLHUP)]],
+                            events,
+                        ),
+                        read_function=lambda _descriptor, _size: payload,
+                    )
+                self.assertIn(("direct", 5002, signal.SIGKILL), events)
+                self.assertEqual(events[-1], ("wait", 5002, os.WNOHANG))
+
+    def test_readiness_latency_consumes_execution_deadline(self) -> None:
+        events = []
+        now = 0.0
+        child_killed = False
+
+        def monotonic():
+            return now
+
+        def readiness_arrives(_timeout_milliseconds):
+            nonlocal now
+            now = 40.0
+            return [(83, runner.select.POLLIN)]
+
+        def fake_waitpid(pid, flags):
+            events.append(("wait", now, pid, flags))
+            self.assertEqual(flags, os.WNOHANG)
+            return (pid, 0) if child_killed else (0, 0)
+
+        def fake_sleep(duration):
+            nonlocal now
+            events.append(("sleep", now, duration))
+            now = 45.0
+
+        def fake_killpg(pid, signal_number):
+            nonlocal child_killed
+            events.append(("group", now, pid, signal_number))
+            if signal_number == signal.SIGKILL:
+                child_killed = True
+
+        self.assertEqual(
+            runner.supervise_ready_child(
+                5003,
+                83,
+                45.0,
+                0.0,
+                waitpid_function=fake_waitpid,
+                getpgid_function=lambda _pid: self.fail(
+                    "confirmed readiness must not probe getpgid"
+                ),
+                killpg_function=fake_killpg,
+                kill_function=lambda _pid, _signal: self.fail(
+                    "confirmed group cleanup should not need direct fallback"
+                ),
+                monotonic_function=monotonic,
+                sleep_function=fake_sleep,
+                poll_factory=self.scripted_poll_factory(
+                    83,
+                    [readiness_arrives],
+                    events,
+                ),
+                read_function=lambda _descriptor, _size: runner.READINESS_BYTE,
+                close_function=lambda descriptor: events.append(
+                    ("close", descriptor)
+                ),
+                kill_reap_seconds=1.0,
+            ),
+            124,
+        )
+        term_events = [
+            event
+            for event in events
+            if event[0] == "group" and event[3] == signal.SIGTERM
+        ]
+        self.assertEqual(term_events, [("group", 45.0, 5003, signal.SIGTERM)])
+        poll_event = next(event for event in events if event[0] == "poll")
+        self.assertEqual(poll_event[1], 45_000)
 
     def test_wait_retries_eintr_and_preserves_child_status(self) -> None:
         calls = []

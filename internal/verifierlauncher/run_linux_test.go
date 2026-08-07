@@ -138,50 +138,95 @@ func openRunnerForTest(
 
 func TestLinuxRunnerAdmissionRejectsHashOwnerModeLinkAndSymlink(t *testing.T) {
 	runnerContent := []byte("print('reviewed runner')\n")
-	for name, prepare := range map[string]func(*testing.T, *linuxTestLayout){
-		"wrong hash": func(_ *testing.T, layout *linuxTestLayout) {
-			layout.arguments.RunnerSHA256 = strings.Repeat("f", 64)
+	type rejectionCase struct {
+		expected string
+		prepare  func(*testing.T, *linuxTestLayout)
+	}
+	for name, currentCase := range map[string]rejectionCase{
+		"wrong hash": {
+			expected: "runner SHA-256 mismatch",
+			prepare: func(_ *testing.T, layout *linuxTestLayout) {
+				layout.arguments.RunnerSHA256 = strings.Repeat("f", 64)
+			},
 		},
-		"wrong owner": func(_ *testing.T, layout *linuxTestLayout) {
-			layout.policy.runnerOwner.uid++
+		"wrong owner": {
+			expected: "runner is not owned by the required uid:gid",
+			prepare: func(_ *testing.T, layout *linuxTestLayout) {
+				layout.policy.runnerOwner.uid++
+			},
 		},
-		"group writable mode": func(t *testing.T, layout *linuxTestLayout) {
-			if err := os.Chmod(layout.runner, 0o620); err != nil {
-				t.Fatalf("make runner group writable: %v", err)
-			}
+		"group writable mode": {
+			expected: "runner must not be group- or other-writable",
+			prepare: func(t *testing.T, layout *linuxTestLayout) {
+				if err := os.Chmod(layout.runner, 0o620); err != nil {
+					t.Fatalf("make runner group writable: %v", err)
+				}
+			},
 		},
-		"second hard link": func(t *testing.T, layout *linuxTestLayout) {
-			if err := os.Link(layout.runner, layout.runner+".link"); err != nil {
-				t.Fatalf("link runner: %v", err)
-			}
+		"second hard link": {
+			expected: "runner link count must be exactly one",
+			prepare: func(t *testing.T, layout *linuxTestLayout) {
+				if err := os.Link(layout.runner, layout.runner+".link"); err != nil {
+					t.Fatalf("link runner: %v", err)
+				}
+			},
 		},
-		"runner symlink": func(t *testing.T, layout *linuxTestLayout) {
-			symlink := layout.runner + ".symlink"
-			if err := os.Symlink(layout.runner, symlink); err != nil {
-				t.Fatalf("symlink runner: %v", err)
-			}
-			layout.arguments.Runner = symlink
+		"runner symlink": {
+			expected: "open runner",
+			prepare: func(t *testing.T, layout *linuxTestLayout) {
+				symlink := layout.runner + ".symlink"
+				if err := os.Symlink(layout.runner, symlink); err != nil {
+					t.Fatalf("symlink runner: %v", err)
+				}
+				layout.arguments.Runner = symlink
+			},
 		},
-		"symlink ancestor": func(t *testing.T, layout *linuxTestLayout) {
-			symlink := filepath.Join(layout.arguments.StagingRoot, "runner-link")
-			if err := os.Symlink(layout.runnerDir, symlink); err != nil {
-				t.Fatalf("symlink runner directory: %v", err)
-			}
-			layout.arguments.Runner = filepath.Join(
-				symlink,
-				filepath.Base(layout.runner),
-			)
+		"symlink ancestor": {
+			expected: "open runner ancestor",
+			prepare: func(t *testing.T, layout *linuxTestLayout) {
+				symlink := filepath.Join(layout.arguments.StagingRoot, "runner-link")
+				if err := os.Symlink(layout.runnerDir, symlink); err != nil {
+					t.Fatalf("symlink runner directory: %v", err)
+				}
+				layout.arguments.Runner = filepath.Join(
+					symlink,
+					filepath.Base(layout.runner),
+				)
+			},
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			layout := newLinuxTestLayout(t, strings.ReplaceAll(name, " ", "-"), runnerContent)
-			prepare(t, &layout)
+			currentCase.prepare(t, &layout)
 			descriptor, err := openRunnerForTest(t, layout)
 			if err == nil {
 				_ = unix.Close(descriptor)
 				t.Fatal("unexpectedly accepted invalid runner")
 			}
+			if !strings.Contains(err.Error(), currentCase.expected) {
+				t.Fatalf("runner rejection error = %v, want %q", err, currentCase.expected)
+			}
 		})
+	}
+}
+
+func TestDirectoryMetadataAllowsSingleLink(t *testing.T) {
+	currentOwner := owner{uid: uint32(os.Geteuid()), gid: uint32(os.Getegid())}
+	currentPolicy := policy{
+		directoryOwners: map[owner]struct{}{currentOwner: {}},
+	}
+	err := validateDirectory(
+		fileMetadata{
+			mode:  unix.S_IFDIR | 0o700,
+			uid:   currentOwner.uid,
+			gid:   currentOwner.gid,
+			links: 1,
+		},
+		"/synthetic-overlay",
+		currentPolicy,
+	)
+	if err != nil {
+		t.Fatalf("single-link directory rejected: %v", err)
 	}
 }
 
@@ -264,10 +309,20 @@ func TestLinuxRunnerAdmissionDetectsMetadataChangeWhileHashing(t *testing.T) {
 	}
 }
 
-func TestLinuxExecContractUsesHeldRunnerAndFixedFDs(t *testing.T) {
+func TestLinuxTempIntegrationReachesExecWithSingleLinkDirectories(t *testing.T) {
 	originalContent := []byte("print('held original')\n")
 	layout := newLinuxTestLayout(t, "exact-exec", originalContent)
 	system := productionLinuxSystem()
+	originalFstat := system.fstat
+	system.fstat = func(descriptor int, value *unix.Stat_t) error {
+		if err := originalFstat(descriptor, value); err != nil {
+			return err
+		}
+		if value.Mode&unix.S_IFMT == unix.S_IFDIR {
+			value.Nlink = 1
+		}
+		return nil
+	}
 	var (
 		gotPlan       execPlan
 		gotContent    []byte

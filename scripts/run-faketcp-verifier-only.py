@@ -13,10 +13,12 @@ import dataclasses
 import datetime
 import errno
 import hashlib
+import math
 import os
 import platform
 import posixpath
 import re
+import select
 import shlex
 import signal
 import socket
@@ -34,6 +36,11 @@ TERM_GRACE_SECONDS = 5.0
 KILL_REAP_SECONDS = 5.0
 BINARY_EXEC_FD = 100
 OBJECT_EXEC_FD = 101
+READINESS_BYTE = b"R"
+READINESS_POLL_MASK = (
+    select.POLLIN | select.POLLHUP | select.POLLERR | select.POLLNVAL
+)
+MAX_POLL_TIMEOUT_MILLISECONDS = 2_147_483_647
 RESERVED_ENV_PREFIX = "WG_MIX_FAKETCP_VERIFIER_"
 SAFE_PATH = re.compile(r"/[A-Za-z0-9_./+@-]+")
 SAFE_RUN_ID = re.compile(r"[a-z0-9][a-z0-9-]{6,62}[a-z0-9]")
@@ -211,8 +218,6 @@ def validate_directory_metadata(
         raise GateError(
             f"staging ancestor is not owned by an accepted uid:gid: {display_path}"
         )
-    if metadata.st_nlink < 2:
-        raise GateError(f"staging ancestor has an invalid link count: {display_path}")
     writable = stat.S_IMODE(metadata.st_mode) & 0o022
     sticky_system_directory = (
         policy.allow_sticky_ancestor
@@ -532,16 +537,31 @@ def status_return_code(status: int) -> int:
     return 125
 
 
-def poll_child(pid: int, waitpid_function=os.waitpid) -> Tuple[bool, Optional[int]]:
+def poll_child(
+    pid: int,
+    waitpid_function=os.waitpid,
+    retry_deadline: Optional[float] = None,
+    monotonic_function=time.monotonic,
+) -> Tuple[bool, Optional[int]]:
     while True:
         try:
             waited_pid, status_value = waitpid_function(pid, os.WNOHANG)
         except InterruptedError:
+            if (
+                retry_deadline is not None
+                and monotonic_function() >= retry_deadline
+            ):
+                raise GateError("waitpid EINTR retry deadline expired")
             continue
         except ChildProcessError:
             return True, None
         except OSError as error:
             if error.errno == errno.EINTR:
+                if (
+                    retry_deadline is not None
+                    and monotonic_function() >= retry_deadline
+                ):
+                    raise GateError("waitpid EINTR retry deadline expired")
                 continue
             if error.errno == errno.ECHILD:
                 return True, None
@@ -561,7 +581,12 @@ def wait_until(
     sleep_function=time.sleep,
 ) -> Tuple[bool, Optional[int]]:
     while True:
-        done, status_value = poll_child(pid, waitpid_function)
+        done, status_value = poll_child(
+            pid,
+            waitpid_function,
+            deadline,
+            monotonic_function,
+        )
         if done:
             return True, status_value
         remaining = deadline - monotonic_function()
@@ -570,57 +595,72 @@ def wait_until(
         sleep_function(min(0.05, remaining))
 
 
-def signal_process_group(pid: int, signal_number: int, killpg_function=os.killpg) -> None:
+def signal_process_group(
+    pid: int,
+    signal_number: int,
+    killpg_function=os.killpg,
+    retry_deadline: Optional[float] = None,
+    monotonic_function=time.monotonic,
+) -> None:
     while True:
         try:
             killpg_function(pid, signal_number)
             return
         except InterruptedError:
+            if (
+                retry_deadline is not None
+                and monotonic_function() >= retry_deadline
+            ):
+                raise GateError("process-group signal EINTR retry deadline expired")
             continue
         except ProcessLookupError:
             return
         except OSError as error:
             if error.errno == errno.EINTR:
+                if (
+                    retry_deadline is not None
+                    and monotonic_function() >= retry_deadline
+                ):
+                    raise GateError(
+                        "process-group signal EINTR retry deadline expired"
+                    )
                 continue
             if error.errno == errno.ESRCH:
                 return
             raise
 
 
-def signal_process(pid: int, signal_number: int, kill_function=os.kill) -> None:
+def signal_process(
+    pid: int,
+    signal_number: int,
+    kill_function=os.kill,
+    retry_deadline: Optional[float] = None,
+    monotonic_function=time.monotonic,
+) -> None:
     while True:
         try:
             kill_function(pid, signal_number)
             return
         except InterruptedError:
+            if (
+                retry_deadline is not None
+                and monotonic_function() >= retry_deadline
+            ):
+                raise GateError("process signal EINTR retry deadline expired")
             continue
         except ProcessLookupError:
             return
         except OSError as error:
             if error.errno == errno.EINTR:
+                if (
+                    retry_deadline is not None
+                    and monotonic_function() >= retry_deadline
+                ):
+                    raise GateError("process signal EINTR retry deadline expired")
                 continue
             if error.errno == errno.ESRCH:
                 return
             raise
-
-
-def reap_blocking(pid: int, waitpid_function=os.waitpid) -> Optional[int]:
-    while True:
-        try:
-            waited_pid, status_value = waitpid_function(pid, 0)
-        except InterruptedError:
-            continue
-        except ChildProcessError:
-            return None
-        except OSError as error:
-            if error.errno == errno.EINTR:
-                continue
-            if error.errno == errno.ECHILD:
-                return None
-            raise
-        if waited_pid == pid:
-            return status_value
-        raise GateError("blocking waitpid returned an unexpected child")
 
 
 def sleep_until(
@@ -635,6 +675,87 @@ def sleep_until(
         sleep_function(min(0.05, remaining))
 
 
+def wait_for_readiness_byte(
+    descriptor: int,
+    deadline: float,
+    monotonic_function=time.monotonic,
+    poll_factory=select.poll,
+    read_function=os.read,
+) -> None:
+    poller = poll_factory()
+    poller.register(descriptor, READINESS_POLL_MASK)
+    while True:
+        remaining = deadline - monotonic_function()
+        if remaining <= 0:
+            raise GateError("child readiness deadline expired")
+        timeout_milliseconds = min(
+            MAX_POLL_TIMEOUT_MILLISECONDS,
+            max(1, math.ceil(remaining * 1000.0)),
+        )
+        try:
+            events = poller.poll(timeout_milliseconds)
+        except InterruptedError:
+            continue
+        except OSError as error:
+            if error.errno == errno.EINTR:
+                continue
+            raise
+        if not events:
+            continue
+
+        event_mask = 0
+        for event_descriptor, current_mask in events:
+            if event_descriptor != descriptor:
+                raise GateError("readiness poll returned an unexpected descriptor")
+            event_mask |= current_mask
+        if event_mask & select.POLLNVAL:
+            raise GateError("readiness descriptor became invalid")
+        try:
+            ready = read_function(descriptor, 1)
+        except InterruptedError:
+            continue
+        except OSError as error:
+            if error.errno == errno.EINTR:
+                continue
+            if error.errno in (errno.EAGAIN, errno.EWOULDBLOCK):
+                if event_mask & (select.POLLHUP | select.POLLERR):
+                    raise GateError("readiness pipe closed without a byte")
+                continue
+            raise
+        if ready == b"":
+            raise GateError("readiness pipe reached EOF before confirmation")
+        if ready != READINESS_BYTE:
+            raise GateError("readiness pipe returned a non-confirmation byte")
+        if monotonic_function() > deadline:
+            raise GateError("child readiness arrived after the absolute deadline")
+        return
+
+
+def confirmed_child_process_group(
+    pid: int,
+    retry_deadline: float,
+    getpgid_function=os.getpgid,
+    monotonic_function=time.monotonic,
+) -> bool:
+    while True:
+        try:
+            return getpgid_function(pid) == pid
+        except InterruptedError:
+            if monotonic_function() >= retry_deadline:
+                raise GateError("getpgid EINTR retry deadline expired")
+            continue
+        except ProcessLookupError:
+            return False
+        except OSError as error:
+            if error.errno == errno.EINTR:
+                if monotonic_function() >= retry_deadline:
+                    raise GateError("getpgid EINTR retry deadline expired")
+                continue
+            if error.errno == errno.ESRCH:
+                return False
+            raise
+
+
 def kill_group_and_reap(
     pid: int,
     waitpid_function=os.waitpid,
@@ -644,22 +765,35 @@ def kill_group_and_reap(
     monotonic_function=time.monotonic,
     sleep_function=time.sleep,
 ) -> None:
+    cleanup_deadline = monotonic_function() + reap_timeout_seconds
     group_kill_error: Optional[BaseException] = None
     try:
-        signal_process_group(pid, signal.SIGKILL, killpg_function)
+        signal_process_group(
+            pid,
+            signal.SIGKILL,
+            killpg_function,
+            cleanup_deadline,
+            monotonic_function,
+        )
     except BaseException as error:
         group_kill_error = error
 
     leader_kill_error: Optional[BaseException] = None
     if group_kill_error is not None:
         try:
-            signal_process(pid, signal.SIGKILL, kill_function)
+            signal_process(
+                pid,
+                signal.SIGKILL,
+                kill_function,
+                cleanup_deadline,
+                monotonic_function,
+            )
         except BaseException as error:
             leader_kill_error = error
 
     done, _ = wait_until(
         pid,
-        monotonic_function() + reap_timeout_seconds,
+        cleanup_deadline,
         waitpid_function,
         monotonic_function,
         sleep_function,
@@ -681,9 +815,115 @@ def kill_group_and_reap(
         raise group_kill_error
 
 
-def wait_with_timeout(
+def cleanup_pre_ready_child(
     pid: int,
-    timeout_seconds: float,
+    waitpid_function=os.waitpid,
+    getpgid_function=os.getpgid,
+    killpg_function=os.killpg,
+    kill_function=os.kill,
+    reap_timeout_seconds: float = KILL_REAP_SECONDS,
+    monotonic_function=time.monotonic,
+    sleep_function=time.sleep,
+) -> None:
+    cleanup_deadline = monotonic_function() + reap_timeout_seconds
+    group_probe_error: Optional[BaseException] = None
+    group_confirmed = False
+    try:
+        group_confirmed = confirmed_child_process_group(
+            pid,
+            cleanup_deadline,
+            getpgid_function,
+            monotonic_function,
+        )
+    except BaseException as error:
+        group_probe_error = error
+
+    group_kill_error: Optional[BaseException] = None
+    if group_confirmed:
+        try:
+            signal_process_group(
+                pid,
+                signal.SIGKILL,
+                killpg_function,
+                cleanup_deadline,
+                monotonic_function,
+            )
+        except BaseException as error:
+            group_kill_error = error
+
+    direct_kill_error: Optional[BaseException] = None
+    try:
+        signal_process(
+            pid,
+            signal.SIGKILL,
+            kill_function,
+            cleanup_deadline,
+            monotonic_function,
+        )
+    except BaseException as error:
+        direct_kill_error = error
+
+    done, _ = wait_until(
+        pid,
+        cleanup_deadline,
+        waitpid_function,
+        monotonic_function,
+        sleep_function,
+    )
+    if not done:
+        raise GateError(
+            "pre-readiness child was not reaped within the fixed cleanup deadline"
+        ) from direct_kill_error
+    if direct_kill_error is not None:
+        raise GateError("direct pre-readiness child SIGKILL failed") from direct_kill_error
+    if group_kill_error is not None:
+        raise group_kill_error
+    if group_probe_error is not None:
+        raise group_probe_error
+
+
+def wait_for_child_readiness(
+    pid: int,
+    descriptor: int,
+    deadline: float,
+    waitpid_function=os.waitpid,
+    getpgid_function=os.getpgid,
+    killpg_function=os.killpg,
+    kill_function=os.kill,
+    monotonic_function=time.monotonic,
+    sleep_function=time.sleep,
+    poll_factory=select.poll,
+    read_function=os.read,
+    kill_reap_seconds: float = KILL_REAP_SECONDS,
+) -> None:
+    try:
+        wait_for_readiness_byte(
+            descriptor,
+            deadline,
+            monotonic_function,
+            poll_factory,
+            read_function,
+        )
+    except BaseException as readiness_error:
+        try:
+            cleanup_pre_ready_child(
+                pid,
+                waitpid_function,
+                getpgid_function,
+                killpg_function,
+                kill_function,
+                kill_reap_seconds,
+                monotonic_function,
+                sleep_function,
+            )
+        except BaseException as cleanup_error:
+            raise cleanup_error from readiness_error
+        raise
+
+
+def wait_with_deadline(
+    pid: int,
+    deadline: float,
     grace_seconds: float,
     waitpid_function=os.waitpid,
     killpg_function=os.killpg,
@@ -695,7 +935,7 @@ def wait_with_timeout(
     try:
         done, status_value = wait_until(
             pid,
-            monotonic_function() + timeout_seconds,
+            deadline,
             waitpid_function,
             monotonic_function,
             sleep_function,
@@ -722,10 +962,17 @@ def wait_with_timeout(
     # reserves its PID/PGID, so a fast-exiting leader cannot let the identifier be
     # reused while an ignore-SIGTERM descendant remains in the group.
     timeout_error: Optional[BaseException] = None
+    grace_deadline = monotonic_function() + grace_seconds
     try:
-        signal_process_group(pid, signal.SIGTERM, killpg_function)
+        signal_process_group(
+            pid,
+            signal.SIGTERM,
+            killpg_function,
+            grace_deadline,
+            monotonic_function,
+        )
         sleep_until(
-            monotonic_function() + grace_seconds,
+            grace_deadline,
             monotonic_function,
             sleep_function,
         )
@@ -752,16 +999,85 @@ def wait_with_timeout(
     return 124
 
 
-def read_ready_byte(descriptor: int) -> bytes:
-    while True:
+def wait_with_timeout(
+    pid: int,
+    timeout_seconds: float,
+    grace_seconds: float,
+    waitpid_function=os.waitpid,
+    killpg_function=os.killpg,
+    kill_function=os.kill,
+    monotonic_function=time.monotonic,
+    sleep_function=time.sleep,
+    kill_reap_seconds: float = KILL_REAP_SECONDS,
+) -> int:
+    return wait_with_deadline(
+        pid,
+        monotonic_function() + timeout_seconds,
+        grace_seconds,
+        waitpid_function,
+        killpg_function,
+        kill_function,
+        monotonic_function,
+        sleep_function,
+        kill_reap_seconds,
+    )
+
+
+def supervise_ready_child(
+    pid: int,
+    descriptor: int,
+    deadline: float,
+    grace_seconds: float,
+    waitpid_function=os.waitpid,
+    getpgid_function=os.getpgid,
+    killpg_function=os.killpg,
+    kill_function=os.kill,
+    monotonic_function=time.monotonic,
+    sleep_function=time.sleep,
+    poll_factory=select.poll,
+    read_function=os.read,
+    close_function=os.close,
+    kill_reap_seconds: float = KILL_REAP_SECONDS,
+) -> int:
+    supervision_error: Optional[BaseException] = None
+    try:
+        wait_for_child_readiness(
+            pid,
+            descriptor,
+            deadline,
+            waitpid_function,
+            getpgid_function,
+            killpg_function,
+            kill_function,
+            monotonic_function,
+            sleep_function,
+            poll_factory,
+            read_function,
+            kill_reap_seconds,
+        )
+        # The child writes the confirmation byte only after setsid(), so PGID=pid
+        # is trusted from here onward.  The unchanged absolute deadline ensures
+        # that readiness latency consumes the verifier execution budget.
+        return wait_with_deadline(
+            pid,
+            deadline,
+            grace_seconds,
+            waitpid_function,
+            killpg_function,
+            kill_function,
+            monotonic_function,
+            sleep_function,
+            kill_reap_seconds,
+        )
+    except BaseException as error:
+        supervision_error = error
+        raise
+    finally:
         try:
-            return os.read(descriptor, 1)
-        except InterruptedError:
-            continue
-        except OSError as error:
-            if error.errno == errno.EINTR:
-                continue
-            raise
+            close_function(descriptor)
+        except BaseException:
+            if supervision_error is None:
+                raise
 
 
 def run_descriptor_child(
@@ -770,7 +1086,8 @@ def run_descriptor_child(
     environment: dict[str, str],
     policy: GatePolicy,
 ) -> int:
-    ready_read, ready_write = os.pipe2(os.O_CLOEXEC)
+    absolute_deadline = time.monotonic() + policy.timeout_seconds
+    ready_read, ready_write = os.pipe2(os.O_CLOEXEC | os.O_NONBLOCK)
     try:
         pid = os.fork()
     except BaseException:
@@ -781,31 +1098,29 @@ def run_descriptor_child(
         try:
             os.close(ready_read)
             os.setsid()
-            os.write(ready_write, b"R")
+            os.write(ready_write, READINESS_BYTE)
             os.close(ready_write)
             os.execve(binary_path, arguments, environment)
         except BaseException as error:
             message = f"error: descriptor exec failed: {type(error).__name__}\n"
             os.write(2, message.encode("ascii", "replace"))
             os._exit(126)
-    os.close(ready_write)
     try:
+        os.close(ready_write)
+    except BaseException as parent_error:
         try:
-            ready = read_ready_byte(ready_read)
-        except BaseException as ready_error:
-            try:
-                kill_group_and_reap(pid)
-            except BaseException as cleanup_error:
-                raise cleanup_error from ready_error
-            raise
-    finally:
-        os.close(ready_read)
-    if ready != b"R":
-        status_value = reap_blocking(pid)
-        return status_return_code(status_value) if status_value is not None else 125
-    return wait_with_timeout(
+            os.close(ready_read)
+        except BaseException:
+            pass
+        try:
+            cleanup_pre_ready_child(pid)
+        except BaseException as cleanup_error:
+            raise cleanup_error from parent_error
+        raise
+    return supervise_ready_child(
         pid,
-        policy.timeout_seconds,
+        ready_read,
+        absolute_deadline,
         policy.term_grace_seconds,
     )
 

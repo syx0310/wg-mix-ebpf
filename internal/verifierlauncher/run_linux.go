@@ -95,9 +95,6 @@ func validateDirectory(
 			displayPath,
 		)
 	}
-	if metadata.links < 2 {
-		return fmt.Errorf("staging ancestor has an invalid link count: %s", displayPath)
-	}
 	writable := metadata.mode & 0o022
 	stickySystemDirectory := currentPolicy.allowStickyAncestor &&
 		fileOwner == (owner{uid: 0, gid: 0}) && metadata.mode&unix.S_ISVTX != 0
