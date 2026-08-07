@@ -12,6 +12,156 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
 
+func forceExclusiveNamedObjectBoundStages(t *testing.T) *uint32 {
+	t.Helper()
+	originalAnonymous := createAnonymousObjectBoundFileAt
+	originalExclusive := createExclusiveObjectBoundFileAt
+	var creationMode uint32
+	createAnonymousObjectBoundFileAt = func(
+		*cleanupDirFD,
+		uint32,
+	) (*os.File, error) {
+		return nil, errObjectBoundFreshFileUnsupported
+	}
+	createExclusiveObjectBoundFileAt = func(
+		parent *cleanupDirFD,
+		name string,
+		mode uint32,
+	) (*os.File, error) {
+		creationMode = mode
+		return cleanupCreateFileAt(parent, name, mode)
+	}
+	t.Cleanup(func() {
+		createAnonymousObjectBoundFileAt = originalAnonymous
+		createExclusiveObjectBoundFileAt = originalExclusive
+	})
+	return &creationMode
+}
+
+func TestObjectBoundFreshPublicationFallsBackToExclusiveNamedStage(
+	t *testing.T,
+) {
+	creationMode := forceExclusiveNamedObjectBoundStages(t)
+	parentPath := filepath.Join(t.TempDir(), "publication-parent")
+	if err := os.Mkdir(parentPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent, exists, err := openDeclaredArtifactParent(parentPath, parentPath)
+	if err != nil || !exists {
+		t.Fatalf("open publication parent: exists=%t err=%v", exists, err)
+	}
+	defer parent.close()
+
+	finalPath := filepath.Join(parentPath, "artifact")
+	var stagePath string
+	result, err := publishObjectBoundFreshFile(objectBoundFreshFileSpec{
+		parent:  parent,
+		name:    filepath.Base(finalPath),
+		path:    finalPath,
+		kind:    "test artifact",
+		mode:    0o644,
+		content: []byte("owned\n"),
+		beforePublish: func(state objectBoundFreshFileHookState) error {
+			stagePath = state.NamedStage
+			if filepath.Dir(stagePath) != parentPath ||
+				!strings.HasPrefix(
+					filepath.Base(stagePath),
+					objectBoundNamedStagePrefix,
+				) {
+				return fmt.Errorf("unsafe fallback stage path %q", stagePath)
+			}
+			info, err := os.Stat(stagePath)
+			if err != nil {
+				return err
+			}
+			if info.Mode().Perm() != 0o644 || state.HeldIdentity.Links != 1 {
+				return fmt.Errorf(
+					"fallback stage mode=%#o links=%d, want 0644 and 1",
+					info.Mode().Perm(),
+					state.HeldIdentity.Links,
+				)
+			}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := result.file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if *creationMode != 0o600 {
+		t.Fatalf("exclusive stage creation mode = %#o, want 0600", *creationMode)
+	}
+	if stagePath == "" {
+		t.Fatal("exclusive fallback did not expose its reviewed stage path")
+	}
+	if _, err := os.Lstat(stagePath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("published fallback retained its stage name: %v", err)
+	}
+	data, err := os.ReadFile(finalPath)
+	if err != nil || string(data) != "owned\n" {
+		t.Fatalf("fallback final data=%q err=%v", data, err)
+	}
+	info, err := os.Stat(finalPath)
+	if err != nil || info.Mode().Perm() != 0o644 {
+		t.Fatalf("fallback final mode=%v err=%v, want 0644", info, err)
+	}
+	if err := revalidateManagedCleanupDir(parent); err != nil {
+		t.Fatalf("fallback did not refresh held parent: %v", err)
+	}
+}
+
+func TestExclusiveNamedStageReplacementIsNeverPublishedOrDeleted(
+	t *testing.T,
+) {
+	forceExclusiveNamedObjectBoundStages(t)
+	parentPath := filepath.Join(t.TempDir(), "publication-parent")
+	if err := os.Mkdir(parentPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent, exists, err := openDeclaredArtifactParent(parentPath, parentPath)
+	if err != nil || !exists {
+		t.Fatalf("open publication parent: exists=%t err=%v", exists, err)
+	}
+	defer parent.close()
+
+	finalPath := filepath.Join(parentPath, "artifact")
+	var stagePath string
+	var ownedAway string
+	_, err = publishObjectBoundFreshFile(objectBoundFreshFileSpec{
+		parent:  parent,
+		name:    filepath.Base(finalPath),
+		path:    finalPath,
+		kind:    "test artifact",
+		mode:    0o600,
+		content: []byte("owned\n"),
+		beforePublish: func(state objectBoundFreshFileHookState) error {
+			stagePath = state.NamedStage
+			ownedAway = stagePath + ".owned-away"
+			if err := os.Rename(stagePath, ownedAway); err != nil {
+				return err
+			}
+			return os.WriteFile(stagePath, []byte("foreign\n"), 0o600)
+		},
+	})
+	if err == nil || !strings.Contains(err.Error(), "retained at") {
+		t.Fatalf("stage replacement error = %v, want fail-closed retention", err)
+	}
+	if _, statErr := os.Lstat(finalPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("stage replacement reached final path: %v", statErr)
+	}
+	for path, want := range map[string]string{
+		stagePath: "foreign\n",
+		ownedAway: "owned\n",
+	} {
+		data, readErr := os.ReadFile(path)
+		if readErr != nil || string(data) != want {
+			t.Fatalf("retained evidence %s data=%q err=%v, want %q", path, data, readErr, want)
+		}
+	}
+}
+
 func TestObjectBoundFreshPublicationRejectsUnsafeNameAndDisplayPath(t *testing.T) {
 	parentPath := filepath.Join(t.TempDir(), "publication-parent")
 	if err := os.Mkdir(parentPath, 0o700); err != nil {
@@ -108,8 +258,8 @@ func TestObjectBoundFreshPublicationPreservesForeignNamedObjects(t *testing.T) {
 		mode:    0o600,
 		content: []byte("owned\n"),
 		beforePublish: func(state objectBoundFreshFileHookState) error {
-			if state.NamedStage != "" {
-				return errors.New("publisher exposed a mutable named stage")
+			if state.NamedStage == foreignStage {
+				return errors.New("publisher reused a foreign stage name")
 			}
 			return os.WriteFile(foreignStage, []byte("foreign\n"), 0o600)
 		},
@@ -536,7 +686,8 @@ func assertNoInstallTemporaryNames(t *testing.T, layout paths) {
 			t.Fatal(err)
 		}
 		for _, entry := range entries {
-			if strings.Contains(entry.Name(), ".tmp-") {
+			if strings.Contains(entry.Name(), ".tmp-") ||
+				strings.HasPrefix(entry.Name(), objectBoundNamedStagePrefix) {
 				t.Fatalf("install retained temporary name %s", filepath.Join(dir, entry.Name()))
 			}
 		}

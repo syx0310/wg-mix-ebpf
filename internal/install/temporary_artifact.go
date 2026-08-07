@@ -8,11 +8,14 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 )
 
 var errObjectBoundFreshFileUnsupported = errors.New(
 	"object-bound fresh-file publication is unsupported on this platform or filesystem",
 )
+
+const objectBoundNamedStagePrefix = ".wg-mix-ebpf-stage-"
 
 type objectBoundFreshFileHookState struct {
 	Kind          string
@@ -40,22 +43,109 @@ type objectBoundFreshFileResult struct {
 	digest   [sha256.Size]byte
 }
 
-type objectBoundFreshFileTestPublisher func(
-	objectBoundFreshFileSpec,
-) (objectBoundFreshFileResult, error)
+type objectBoundFreshFileStage struct {
+	file         *os.File
+	name         string
+	initialLinks uint64
+}
 
-// Tests on platforms without a production object-bound primitive explicitly
-// install a no-replace-only backend from a platform-specific _test.go file.
-// Production builds leave this nil and fail closed.
-var objectBoundFreshFilePublisherForTest objectBoundFreshFileTestPublisher
+// These indirections let unit tests force the portable path without depending
+// on the filesystem backing the test directory.
+var createAnonymousObjectBoundFileAt = cleanupCreateObjectBoundFileAt
+var createExclusiveObjectBoundFileAt = cleanupCreateFileAt
 
 func publishObjectBoundFreshFile(
 	spec objectBoundFreshFileSpec,
 ) (objectBoundFreshFileResult, error) {
-	if objectBoundFreshFilePublisherForTest != nil {
-		return objectBoundFreshFilePublisherForTest(spec)
-	}
 	return publishObjectBoundFreshFileProduction(spec)
+}
+
+func createObjectBoundFreshFileStage(
+	spec objectBoundFreshFileSpec,
+) (objectBoundFreshFileStage, error) {
+	file, anonymousErr := createAnonymousObjectBoundFileAt(
+		spec.parent.dir,
+		uint32(spec.mode.Perm()),
+	)
+	if anonymousErr == nil {
+		return objectBoundFreshFileStage{file: file}, nil
+	}
+	if !errors.Is(anonymousErr, errObjectBoundFreshFileUnsupported) {
+		return objectBoundFreshFileStage{}, anonymousErr
+	}
+
+	const maxNameAttempts = 4
+	for attempt := 0; attempt < maxNameAttempts; attempt++ {
+		suffix, err := newCleanupInstallationID()
+		if err != nil {
+			return objectBoundFreshFileStage{}, fmt.Errorf(
+				"generate exclusive object-bound stage name: %w",
+				err,
+			)
+		}
+		name := objectBoundNamedStagePrefix + suffix
+		var namedFile *os.File
+		proof, err := performCleanupDirectoryMutation(
+			spec.parent.dir,
+			func() error {
+				var createErr error
+				namedFile, createErr = createExclusiveObjectBoundFileAt(
+					spec.parent.dir,
+					name,
+					0o600,
+				)
+				return createErr
+			},
+		)
+		if errors.Is(err, os.ErrExist) {
+			continue
+		}
+		if err != nil {
+			return objectBoundFreshFileStage{}, errors.Join(
+				fmt.Errorf("create exclusive named object-bound stage: %w", err),
+				fmt.Errorf("anonymous stage was unavailable: %w", anonymousErr),
+			)
+		}
+		stage := objectBoundFreshFileStage{
+			file:         namedFile,
+			name:         name,
+			initialLinks: 1,
+		}
+		if err := refreshObjectBoundParentAfterMutation(spec.parent, proof); err != nil {
+			return stage, fmt.Errorf(
+				"refresh parent after creating exclusive named stage %s: %w",
+				filepath.Join(spec.parent.spec.path, name),
+				err,
+			)
+		}
+		return stage, nil
+	}
+	return objectBoundFreshFileStage{}, errors.New(
+		"could not allocate a unique exclusive object-bound stage name",
+	)
+}
+
+func refreshObjectBoundParentAfterMutation(
+	parent *managedCleanupDir,
+	proof cleanupDirectoryMutationProof,
+) error {
+	if parent == nil {
+		return errors.New("cannot refresh a nil object-bound publication parent")
+	}
+	matched, err := refreshManagedCleanupDirGenerationAfterOwnedMutationAtName(
+		parent,
+		parent.name,
+		proof,
+	)
+	if err != nil {
+		return err
+	}
+	if !matched {
+		return errors.New(
+			"object-bound mutation did not match the held publication parent",
+		)
+	}
+	return nil
 }
 
 func publishObjectBoundFreshFileProduction(
@@ -75,17 +165,8 @@ func publishObjectBoundFreshFileProduction(
 		return objectBoundFreshFileResult{}, err
 	}
 
-	file, err := cleanupCreateObjectBoundFileAt(
-		spec.parent.dir,
-		uint32(spec.mode.Perm()),
-	)
-	if err != nil {
-		return objectBoundFreshFileResult{}, fmt.Errorf(
-			"create unnamed object-bound %s stage: %w",
-			spec.kind,
-			err,
-		)
-	}
+	stage, stageErr := createObjectBoundFreshFileStage(spec)
+	file := stage.file
 	published := false
 	var heldIdentity cleanupIdentity
 	defer func() {
@@ -104,7 +185,7 @@ func publishObjectBoundFreshFileProduction(
 						heldIdentity,
 					),
 				)
-			} else {
+			} else if stage.name == "" {
 				retErr = errors.Join(
 					retErr,
 					fmt.Errorf(
@@ -114,16 +195,34 @@ func publishObjectBoundFreshFileProduction(
 						cleanupIdentityAuditSummary(heldIdentity),
 					),
 				)
+			} else if cleanupErr := cleanupExclusiveObjectBoundStage(
+				spec,
+				stage.name,
+				file,
+			); cleanupErr != nil {
+				retErr = errors.Join(retErr, cleanupErr)
 			}
 		}
 		if file != nil {
 			retErr = errors.Join(retErr, file.Close())
 		}
 	}()
+	if stageErr != nil {
+		return objectBoundFreshFileResult{}, fmt.Errorf(
+			"create object-bound %s stage: %w",
+			spec.kind,
+			stageErr,
+		)
+	}
+	stageDescription := "unnamed"
+	if stage.name != "" {
+		stageDescription = "exclusive named"
+	}
 
 	if err := file.Chmod(spec.mode.Perm()); err != nil {
 		return objectBoundFreshFileResult{}, fmt.Errorf(
-			"set unnamed %s stage mode: %w",
+			"set %s %s stage mode: %w",
+			stageDescription,
 			spec.kind,
 			err,
 		)
@@ -131,14 +230,16 @@ func publishObjectBoundFreshFileProduction(
 	written, err := io.Copy(file, bytes.NewReader(spec.content))
 	if err != nil {
 		return objectBoundFreshFileResult{}, fmt.Errorf(
-			"write unnamed %s stage: %w",
+			"write %s %s stage: %w",
+			stageDescription,
 			spec.kind,
 			err,
 		)
 	}
 	if written != int64(len(spec.content)) {
 		return objectBoundFreshFileResult{}, fmt.Errorf(
-			"write unnamed %s stage: wrote %d bytes, want %d",
+			"write %s %s stage: wrote %d bytes, want %d",
+			stageDescription,
 			spec.kind,
 			written,
 			len(spec.content),
@@ -146,7 +247,8 @@ func publishObjectBoundFreshFileProduction(
 	}
 	if err := file.Sync(); err != nil {
 		return objectBoundFreshFileResult{}, fmt.Errorf(
-			"sync unnamed %s stage: %w",
+			"sync %s %s stage: %w",
+			stageDescription,
 			spec.kind,
 			err,
 		)
@@ -155,12 +257,13 @@ func publishObjectBoundFreshFileProduction(
 	heldIdentity, err = validateHeldObjectBoundFreshFile(
 		file,
 		spec,
-		0,
+		stage.initialLinks,
 		expectedDigest,
 	)
 	if err != nil {
 		return objectBoundFreshFileResult{}, fmt.Errorf(
-			"validate unnamed %s stage before publication: %w",
+			"validate %s %s stage before publication: %w",
+			stageDescription,
 			spec.kind,
 			err,
 		)
@@ -178,10 +281,14 @@ func publishObjectBoundFreshFileProduction(
 	}
 	var beforePublishErr error
 	if spec.beforePublish != nil {
+		namedStage := ""
+		if stage.name != "" {
+			namedStage = filepath.Join(spec.parent.spec.path, stage.name)
+		}
 		if err := spec.beforePublish(objectBoundFreshFileHookState{
 			Kind:          spec.kind,
 			FinalPath:     spec.path,
-			NamedStage:    "",
+			NamedStage:    namedStage,
 			HeldIdentity:  heldIdentity,
 			ExpectedBytes: len(spec.content),
 			ExpectedHash:  expectedDigest,
@@ -209,15 +316,29 @@ func publishObjectBoundFreshFileProduction(
 	); err != nil {
 		parentGenerationErr = err
 	}
-	revalidatedHeldIdentity, heldRevalidationErr := validateHeldObjectBoundFreshFile(
-		file,
-		spec,
-		0,
-		expectedDigest,
-	)
+	var revalidatedHeldIdentity cleanupIdentity
+	var heldRevalidationErr error
+	if stage.name == "" {
+		revalidatedHeldIdentity, heldRevalidationErr =
+			validateHeldObjectBoundFreshFile(
+				file,
+				spec,
+				stage.initialLinks,
+				expectedDigest,
+			)
+	} else {
+		revalidatedHeldIdentity, heldRevalidationErr =
+			validateHeldAndNamedObjectBoundStage(
+				file,
+				spec,
+				stage.name,
+				expectedDigest,
+			)
+	}
 	if heldRevalidationErr != nil {
 		heldRevalidationErr = fmt.Errorf(
-			"revalidate unnamed %s stage after pre-publication hook: %w",
+			"revalidate %s %s stage after pre-publication hook: %w",
+			stageDescription,
 			spec.kind,
 			heldRevalidationErr,
 		)
@@ -226,8 +347,9 @@ func publishObjectBoundFreshFileProduction(
 	if heldRevalidationErr == nil &&
 		!beforeHookIdentity.sameRegularFile(revalidatedHeldIdentity) {
 		heldIdentityErr = fmt.Errorf(
-			"refuse %s publication: held unnamed stage identity changed",
+			"refuse %s publication: held %s stage identity changed",
 			spec.kind,
+			stageDescription,
 		)
 	}
 	if err := errors.Join(
@@ -243,13 +365,26 @@ func publishObjectBoundFreshFileProduction(
 	if err := requireAbsentObjectBoundDestination(spec); err != nil {
 		return objectBoundFreshFileResult{}, err
 	}
-	if err := cleanupPublishObjectBoundFileAt(
+	parentProof, err := performCleanupDirectoryMutation(
 		spec.parent.dir,
-		file,
-		spec.name,
-	); err != nil {
+		func() error {
+			if stage.name == "" {
+				return cleanupPublishObjectBoundFileAt(
+					spec.parent.dir,
+					file,
+					spec.name,
+				)
+			}
+			return cleanupRenameNoReplaceAt(
+				spec.parent.dir,
+				stage.name,
+				spec.name,
+			)
+		},
+	)
+	if err != nil {
 		return objectBoundFreshFileResult{}, fmt.Errorf(
-			"publish held %s object directly at %s without replacement: %w",
+			"publish held %s object at %s without replacement: %w",
 			spec.kind,
 			spec.path,
 			err,
@@ -269,7 +404,11 @@ func publishObjectBoundFreshFileProduction(
 			err,
 		)
 	}
-	if !sameObjectBoundPublicationObject(beforeHookIdentity, heldIdentity) {
+	if !sameObjectBoundPublicationObject(
+		beforeHookIdentity,
+		heldIdentity,
+		stage.initialLinks,
+	) {
 		return objectBoundFreshFileResult{}, fmt.Errorf(
 			"refuse %s publication: linked held object differs from staged object",
 			spec.kind,
@@ -282,9 +421,7 @@ func publishObjectBoundFreshFileProduction(
 			err,
 		)
 	}
-	if err := refreshManagedFinalDirectoryGenerationAfterOwnedMutation(
-		spec.parent,
-	); err != nil {
+	if err := refreshObjectBoundParentAfterMutation(spec.parent, parentProof); err != nil {
 		return objectBoundFreshFileResult{}, fmt.Errorf(
 			"refresh held parent generation after publishing %s: %w",
 			spec.kind,
@@ -342,7 +479,11 @@ func publishObjectBoundFreshFileProduction(
 		)
 	var stagedObjectErr error
 	if publishedValidationErr == nil &&
-		!sameObjectBoundPublicationObject(beforeHookIdentity, publishedIdentity) {
+		!sameObjectBoundPublicationObject(
+			beforeHookIdentity,
+			publishedIdentity,
+			stage.initialLinks,
+		) {
 		stagedObjectErr = fmt.Errorf(
 			"refuse %s publication: published held object differs from staged object",
 			spec.kind,
@@ -490,6 +631,121 @@ func requireAbsentObjectBoundDestination(spec objectBoundFreshFileSpec) error {
 	}
 }
 
+func validateHeldAndNamedObjectBoundStage(
+	file *os.File,
+	spec objectBoundFreshFileSpec,
+	stageName string,
+	expectedDigest [sha256.Size]byte,
+) (cleanupIdentity, error) {
+	heldIdentity, heldErr := validateHeldObjectBoundFreshFile(
+		file,
+		spec,
+		1,
+		expectedDigest,
+	)
+	if heldErr != nil {
+		heldErr = fmt.Errorf("validate held named stage: %w", heldErr)
+	}
+
+	var namedIdentity cleanupIdentity
+	var namedErr error
+	named, _, err := cleanupOpenFileAt(spec.parent.dir, stageName)
+	if err != nil {
+		namedErr = fmt.Errorf(
+			"open exclusive named stage %s: %w",
+			filepath.Join(spec.parent.spec.path, stageName),
+			err,
+		)
+	} else {
+		var validateErr error
+		namedIdentity, validateErr = validateHeldObjectBoundFreshFile(
+			named,
+			spec,
+			1,
+			expectedDigest,
+		)
+		closeErr := named.Close()
+		if err := errors.Join(validateErr, closeErr); err != nil {
+			namedErr = fmt.Errorf("validate exclusive named stage: %w", err)
+		}
+	}
+	var bindingErr error
+	if heldErr == nil && namedErr == nil &&
+		!heldIdentity.sameRegularFile(namedIdentity) {
+		bindingErr = errors.New(
+			"exclusive named stage does not bind the held publication object",
+		)
+	}
+	return heldIdentity, errors.Join(heldErr, namedErr, bindingErr)
+}
+
+func cleanupExclusiveObjectBoundStage(
+	spec objectBoundFreshFileSpec,
+	stageName string,
+	file *os.File,
+) error {
+	stagePath := filepath.Join(spec.parent.spec.path, stageName)
+	retained := func(cause error) error {
+		return fmt.Errorf(
+			"exclusive named %s stage retained at %s because exact cleanup could not be proven: %w",
+			spec.kind,
+			stagePath,
+			cause,
+		)
+	}
+	if file == nil || stageName == "" ||
+		!strings.HasPrefix(stageName, objectBoundNamedStagePrefix) ||
+		filepath.Base(stageName) != stageName {
+		return retained(errors.New("stage handle or generated name is incomplete"))
+	}
+	if err := revalidateManagedCleanupDir(spec.parent); err != nil {
+		return retained(fmt.Errorf("revalidate held stage parent: %w", err))
+	}
+	heldIdentity, err := cleanupIdentityForFD(int(file.Fd()))
+	if err != nil {
+		return retained(fmt.Errorf("inspect held stage object: %w", err))
+	}
+	if heldIdentity.Mode&cleanupTypeMask != cleanupTypeFile ||
+		heldIdentity.UID != uint32(os.Geteuid()) || heldIdentity.Links != 1 {
+		return retained(fmt.Errorf(
+			"held stage identity [%s] is not an exclusively named owned regular file",
+			cleanupIdentityAuditSummary(heldIdentity),
+		))
+	}
+	named, namedIdentity, err := cleanupOpenFileAt(spec.parent.dir, stageName)
+	if err != nil {
+		return retained(fmt.Errorf("open exact named stage: %w", err))
+	}
+	if err := named.Close(); err != nil {
+		return retained(fmt.Errorf("close exact named stage check: %w", err))
+	}
+	if !heldIdentity.sameRegularFile(namedIdentity) {
+		return retained(errors.New(
+			"named stage no longer binds the held publication object",
+		))
+	}
+	proof, err := performCleanupDirectoryMutation(
+		spec.parent.dir,
+		func() error {
+			return cleanupUnlinkAt(spec.parent.dir, stageName, false)
+		},
+	)
+	if err != nil {
+		return retained(fmt.Errorf("unlink exact named stage: %w", err))
+	}
+	if err := spec.parent.dir.file.Sync(); err != nil {
+		return fmt.Errorf("sync parent after removing exact named stage %s: %w", stagePath, err)
+	}
+	if err := refreshObjectBoundParentAfterMutation(spec.parent, proof); err != nil {
+		return fmt.Errorf(
+			"refresh parent after removing exact named stage %s: %w",
+			stagePath,
+			err,
+		)
+	}
+	return nil
+}
+
 func validateHeldAndNamedObjectBoundFreshFile(
 	file *os.File,
 	spec objectBoundFreshFileSpec,
@@ -601,13 +857,17 @@ func validateHeldObjectBoundFreshFile(
 	return after, nil
 }
 
-func sameObjectBoundPublicationObject(before cleanupIdentity, after cleanupIdentity) bool {
+func sameObjectBoundPublicationObject(
+	before cleanupIdentity,
+	after cleanupIdentity,
+	beforeLinks uint64,
+) bool {
 	return before.sameObject(after) &&
 		before.UID == after.UID &&
 		before.GID == after.GID &&
 		before.Mode&0o7777 == after.Mode&0o7777 &&
 		before.Size == after.Size &&
-		before.Links == 0 &&
+		before.Links == beforeLinks &&
 		after.Links == 1
 }
 

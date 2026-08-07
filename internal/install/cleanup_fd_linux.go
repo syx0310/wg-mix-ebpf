@@ -216,7 +216,7 @@ func cleanupCreateFileAt(parent *cleanupDirFD, name string, mode uint32) (*os.Fi
 	fd, err := unix.Openat(
 		int(parent.file.Fd()),
 		name,
-		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW,
 		mode,
 	)
 	if err != nil {

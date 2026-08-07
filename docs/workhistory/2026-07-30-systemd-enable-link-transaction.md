@@ -50,16 +50,15 @@ inode, so automatic uninstall cleanup of a present enable link is blocked.
 Operators must inspect and manually remove or retain that exact link before
 retrying validated uninstall.
 
-Fresh service-unit, install-config, and ownership-manifest files no longer use a
-named staging file. Linux creates an `O_TMPFILE` object under the held parent,
-validates its exact bytes, content hash, descriptor identity, mode, size, and
-zero link count, then publishes that held object directly at the absent final
-name with `linkat`. `AT_EMPTY_PATH` is preferred; a `/proc/self/fd` fallback is
-accepted only after proving that the proc descriptor resolves to the same held
-object. The linked descriptor, final descriptor, bytes, hash, and one-link
-identity are checked again. Unsupported filesystems fail closed. Darwin
-production also fails closed because it lacks the required primitive; Darwin
-unit tests explicitly inject an exclusive, non-replacing test backend.
+Fresh service-unit, install-config, and ownership-manifest files prefer a Linux
+`O_TMPFILE` object under the held parent. Filesystems without that primitive,
+and Darwin, use a portable same-directory fallback: a cryptographically random
+name is created with `O_EXCL` and mode `0600`, retained by FD, changed to the
+requested final mode, and renamed with no-replace semantics only after its
+pathname, held identity, bytes, hash, link count, destination absence, and
+parent generation have been revalidated. The final pathname and held FD are
+checked again after publication. A concurrent replacement is never published
+or deleted; the conflicting objects are retained with an exact audit path.
 
 After the link and parent sync, publication refreshes only its own final-parent
 generation before invoking the post-link hook. It then performs an
@@ -75,11 +74,13 @@ config path is supplied, they also validate the raw default config directory
 before `filepath.Join`, so path construction cannot silently normalize these
 inputs.
 
-No named stage exists to swap, restore, delete, or accumulate. Failure before
-linking reports only the held identity. Failure after linking reports that the
-final object was published and explicitly forbids automatic unlink or rollback.
-The general config replacement API and binary replacement path remain unchanged
-from their pre-change behavior and are outside this fix.
+Before-publication failures remove a portable named stage only while its exact
+held identity, one-link ownership, parent binding, and generation remain
+provable. Otherwise the stage is retained for manual inspection. Failure after
+publication reports that the final object was published and explicitly forbids
+automatic unlink or rollback. The general config replacement API and binary
+replacement path remain unchanged from their pre-change behavior and are
+outside this fix.
 
 Local regression coverage includes:
 
@@ -92,7 +93,8 @@ Local regression coverage includes:
 - replacement of `systemRoot` after opening its component and replacement of a
   canonical root alias;
 - object-bound publication with a hook-inserted foreign final or foreign named
-  object, unsafe name/display-path rejection, simultaneous post-link hook and
+  object, forced `O_TMPFILE` fallback, exclusive-stage replacement retention,
+  unsafe name/display-path rejection, simultaneous post-link hook and
   content-mutation rejection, failure auditing, and an in-place install retry
   with no temporary-name accumulation;
 - install and uninstall dry runs rejecting non-clean raw systemd, OpenWrt, and
