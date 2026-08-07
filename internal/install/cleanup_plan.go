@@ -3737,7 +3737,6 @@ func (entry *cleanupEntryPlan) unlink(
 			evidencePath,
 		)
 		sort.Strings(directory.retainedQuarantineEvidence)
-		directory.retainedQuarantineEvidenceCurrent = true
 		var hookErr error
 		if afterFinalQuarantineCheck != nil {
 			if err := afterFinalQuarantineCheck(entry.path, evidencePath); err != nil {

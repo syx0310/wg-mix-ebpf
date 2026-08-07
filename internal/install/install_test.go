@@ -1276,6 +1276,130 @@ func TestSystemdEnableLinkPostFinalEnumerationFailureReportsOnlyLastKnownPaths(
 	}
 }
 
+func TestSystemdEnableLinkEvidenceBecomesCurrentOnlyAfterFinalStableEnumeration(
+	t *testing.T,
+) {
+	tests := []struct {
+		name                  string
+		displaceBeforeInspect bool
+		wantCurrent           bool
+	}{
+		{
+			name:        "stable enumeration",
+			wantCurrent: true,
+		},
+		{
+			name:                  "failed enumeration",
+			displaceBeforeInspect: true,
+			wantCurrent:           false,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			layout := newCleanupTestLayoutForSystem(
+				t,
+				"systemd-evidence-current-after-"+strings.ReplaceAll(test.name, " ", "-"),
+				"systemd",
+			)
+			linkPath := systemdEnableLinkPath(layout)
+			if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+				t.Fatal(err)
+			}
+			plan, err := prepareUninstallCleanup(
+				layout,
+				"systemd",
+				false,
+				filepath.Join(t.TempDir(), "daemon.lease"),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer plan.close()
+			linkDirectory := systemdEnableLinkCleanupDirectory(t, plan, linkPath)
+
+			wantsDir := filepath.Dir(linkPath)
+			displacedWants := wantsDir + ".displaced-during-final-hook"
+			var evidencePath string
+			hookRan := false
+			err = linkDirectory.remove(
+				nil,
+				func(originalPath string, retainedPath string) error {
+					if originalPath != linkPath || hookRan {
+						return fmt.Errorf(
+							"unexpected final quarantine hook path %s retained=%s",
+							originalPath,
+							retainedPath,
+						)
+					}
+					hookRan = true
+					evidencePath = retainedPath
+					if linkDirectory.retainedQuarantineEvidenceCurrent {
+						return errors.New(
+							"retained quarantine evidence became current before final stable enumeration",
+						)
+					}
+					if !slices.Contains(
+						linkDirectory.retainedQuarantineEvidence,
+						retainedPath,
+					) {
+						return fmt.Errorf(
+							"last-known evidence omitted retained path %s",
+							retainedPath,
+						)
+					}
+					if !test.displaceBeforeInspect {
+						return nil
+					}
+					if err := os.Rename(wantsDir, displacedWants); err != nil {
+						return err
+					}
+					return os.Mkdir(wantsDir, 0o700)
+				},
+				nil,
+			)
+			if !hookRan {
+				t.Fatalf("post-final hook did not run: %v", err)
+			}
+			if test.wantCurrent {
+				if err != nil {
+					t.Fatalf("stable final enumeration: %v", err)
+				}
+				if !linkDirectory.retainedQuarantineEvidenceCurrent {
+					t.Fatal("stable final enumeration did not restore current scope")
+				}
+				if !slices.Equal(
+					linkDirectory.retainedQuarantineEvidence,
+					[]string{evidencePath},
+				) {
+					t.Fatalf(
+						"current evidence = %v, want %s",
+						linkDirectory.retainedQuarantineEvidence,
+						evidencePath,
+					)
+				}
+				return
+			}
+			if err == nil ||
+				!strings.Contains(err.Error(), "last-known paths; current exact paths are unavailable") {
+				t.Fatalf("failed final enumeration scope = %v", err)
+			}
+			if linkDirectory.retainedQuarantineEvidenceCurrent {
+				t.Fatal("failed final enumeration marked last-known evidence as current")
+			}
+			if !slices.Equal(
+				linkDirectory.retainedQuarantineEvidence,
+				[]string{evidencePath},
+			) {
+				t.Fatalf(
+					"last-known evidence = %v, want %s",
+					linkDirectory.retainedQuarantineEvidence,
+					evidencePath,
+				)
+			}
+		})
+	}
+}
+
 func TestUninstallPostFinalEnumerationFailureDoesNotAssertLastKnownPathIsCurrent(
 	t *testing.T,
 ) {
