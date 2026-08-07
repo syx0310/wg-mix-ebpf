@@ -81,8 +81,10 @@ func fixedIPv4UDP(packet []byte, operation string) ([]byte, error) {
 	if int(binary.BigEndian.Uint16(packet[2:4])) != len(packet) {
 		return nil, fmt.Errorf("%s: IPv4 total length is inconsistent", operation)
 	}
-	if binary.BigEndian.Uint16(packet[6:8])&0x3fff != 0 {
-		return nil, fmt.Errorf("%s: IPv4 fragments are unsupported", operation)
+	// Only DF is meaningful for this fixed, non-fragmented reinjection path.
+	// Reject the reserved flag as well as MF and every non-zero fragment offset.
+	if binary.BigEndian.Uint16(packet[6:8])&0xbfff != 0 {
+		return nil, fmt.Errorf("%s: reserved IPv4 flags and fragments are unsupported", operation)
 	}
 	if packet[9] != 17 {
 		return nil, fmt.Errorf("%s: IPv4 protocol %d is not UDP", operation, packet[9])

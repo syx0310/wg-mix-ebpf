@@ -82,6 +82,12 @@ func TestValidateMaterializedIPv4UDPRejectsEveryHeaderMutationWithoutWriting(t *
 		{name: "long-IHL", mutate: byteMutation(0, 0x46)},
 		{name: "IPv4-total-length-short", mutate: uint16Mutation(2, uint16(len(valid)-1))},
 		{name: "IPv4-total-length-long", mutate: uint16Mutation(2, uint16(len(valid)+1))},
+		{name: "reserved-flag-with-valid-checksum", mutate: func(packet []byte) []byte {
+			binary.BigEndian.PutUint16(packet[6:8], 0x8000)
+			binary.BigEndian.PutUint16(packet[10:12], 0)
+			binary.BigEndian.PutUint16(packet[10:12], ^referenceChecksumResidual(packet[:20]))
+			return packet
+		}},
 		{name: "more-fragments", mutate: uint16Mutation(6, 0x2000)},
 		{name: "fragment-offset", mutate: uint16Mutation(6, 0x0001)},
 		{name: "protocol", mutate: byteMutation(9, 6)},
@@ -141,20 +147,32 @@ func TestValidateMaterializedIPv4UDPRejectsIncompleteFlowWithoutWriting(t *testi
 	}
 }
 
-func TestMaterializeIPv4UDPRequiresFixedHeaderAndDoesNotPartiallyWrite(t *testing.T) {
+func TestMaterializeIPv4UDPRejectsUnsupportedHeaderWithoutPartiallyWriting(t *testing.T) {
 	flow := packetTestFlow(t)
-	for _, firstByte := range []byte{0x44, 0x46} {
-		packet := unmaterializedIPv4UDP(flow, []byte{1})
-		packet[0] = firstByte
-		binary.BigEndian.PutUint16(packet[10:12], 0x1234)
-		binary.BigEndian.PutUint16(packet[26:28], 0x5678)
-		before := append([]byte(nil), packet...)
-		if err := MaterializeIPv4UDPChecksums(packet); err == nil {
-			t.Fatalf("IHL %#x was accepted", firstByte&0x0f)
-		}
-		if !bytes.Equal(packet, before) {
-			t.Fatal("rejected materialization partially modified the packet")
-		}
+	tests := []struct {
+		name   string
+		mutate func([]byte)
+	}{
+		{name: "short-IHL", mutate: func(packet []byte) { packet[0] = 0x44 }},
+		{name: "long-IHL", mutate: func(packet []byte) { packet[0] = 0x46 }},
+		{name: "reserved-flag", mutate: func(packet []byte) {
+			binary.BigEndian.PutUint16(packet[6:8], 0x8000)
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			packet := unmaterializedIPv4UDP(flow, []byte{1})
+			test.mutate(packet)
+			binary.BigEndian.PutUint16(packet[10:12], 0x1234)
+			binary.BigEndian.PutUint16(packet[26:28], 0x5678)
+			before := append([]byte(nil), packet...)
+			if err := MaterializeIPv4UDPChecksums(packet); err == nil {
+				t.Fatal("unsupported header was accepted")
+			}
+			if !bytes.Equal(packet, before) {
+				t.Fatal("rejected materialization partially modified the packet")
+			}
+		})
 	}
 }
 
