@@ -27,9 +27,10 @@
 
 #define FAKETCP_HEADER_DELTA 12
 #define FAKETCP_MAX_CAPTURED_PACKET 2304
+#define FAKETCP_MAX_IPV4_TOTAL_LEN 2304
 #define FAKETCP_CHECKSUM_CHUNK_BYTES 32
 #define FAKETCP_CHECKSUM_CHUNK_COUNT \
-	((FAKETCP_MAX_CAPTURED_PACKET + FAKETCP_CHECKSUM_CHUNK_BYTES - 1) / \
+	((FAKETCP_MAX_IPV4_TOTAL_LEN + FAKETCP_CHECKSUM_CHUNK_BYTES - 1) / \
 	 FAKETCP_CHECKSUM_CHUNK_BYTES)
 #define FAKETCP_METADATA_MAGIC 0x57474654U
 #define FAKETCP_CONTROL_MIN_INTERVAL_NANOS 10000000ULL
@@ -579,7 +580,7 @@ static __always_inline int faketcp_mtu_allows_growth(struct __sk_buff *skb,
 // complete final (rotated and possibly XORed) payload.
 //
 // Every read is bounded by the previously validated fixed-IHL IPv4 total
-// length and FAKETCP_MAX_CAPTURED_PACKET. bpf_skb_load_bytes handles a packet
+// length and FAKETCP_MAX_IPV4_TOTAL_LEN. bpf_skb_load_bytes handles a packet
 // that was non-linear before change_tail. The final short chunk is zero padded,
 // which is the Internet-checksum rule for odd-length payloads.
 static __always_inline int faketcp_materialize_tcp_checksum(
@@ -601,7 +602,7 @@ static __always_inline int faketcp_materialize_tcp_checksum(
 	__u32 remaining;
 	__s64 sum;
 
-	if (payload_len > FAKETCP_MAX_CAPTURED_PACKET - sizeof(struct iphdr) -
+	if (payload_len > FAKETCP_MAX_IPV4_TOTAL_LEN - sizeof(struct iphdr) -
 			  sizeof(struct udphdr))
 		return -1;
 	tcp->check = 0;
@@ -699,9 +700,9 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	old_total_len = bpf_ntohs(iph->tot_len);
 	if (udp_len != info->payload_len + sizeof(old_udp) ||
 	    old_total_len != sizeof(*iph) + udp_len ||
-	    old_total_len > FAKETCP_MAX_CAPTURED_PACKET ||
+	    old_total_len > FAKETCP_MAX_IPV4_TOTAL_LEN ||
 	    old_total_len > 0xffff - FAKETCP_HEADER_DELTA ||
-	    info->ip_off > skb->len || old_total_len > skb->len - info->ip_off ||
+	    info->ip_off > skb->len || old_total_len != skb->len - info->ip_off ||
 	    skb->len > 0xffffffffU - FAKETCP_HEADER_DELTA) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return TC_ACT_SHOT;

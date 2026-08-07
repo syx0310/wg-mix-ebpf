@@ -322,8 +322,8 @@ func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
 	}
 	for _, want := range []string{
 		"old_total_len != sizeof(*iph) + udp_len",
-		"old_total_len > FAKETCP_MAX_CAPTURED_PACKET",
-		"old_total_len > skb->len - info->ip_off",
+		"old_total_len > FAKETCP_MAX_IPV4_TOTAL_LEN",
+		"old_total_len != skb->len - info->ip_off",
 	} {
 		if !strings.Contains(encoder, want) {
 			t.Fatalf("bounded checksum read precondition missing %q", want)
