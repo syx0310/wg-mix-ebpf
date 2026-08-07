@@ -633,27 +633,75 @@ func runStop(ctx context.Context, args []string, stdout io.Writer) error {
 }
 
 func runBPFLoadTest(ctx context.Context, args []string, stdout io.Writer) error {
+	return runBPFLoadTestWithLoaders(
+		ctx,
+		args,
+		stdout,
+		dataplane.LoadObjectTestIdentity,
+		dataplane.LoadExperimentalFakeTCPObjectTestIdentity,
+	)
+}
+
+type bpfObjectIdentityLoader func(context.Context, string) (dataplane.ObjectIdentity, error)
+
+func runBPFLoadTestWithLoaders(
+	ctx context.Context,
+	args []string,
+	stdout io.Writer,
+	loadBaseline bpfObjectIdentityLoader,
+	loadExperimental bpfObjectIdentityLoader,
+) error {
 	fs := flag.NewFlagSet("bpf-load-test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	objectPath := fs.String("object", "", "path to TC/eBPF object")
+	experimentalFakeTCP := fs.Bool(
+		"experimental-faketcp",
+		false,
+		"explicitly verifier-load an unembedded experimental FakeTCP object",
+	)
 	jsonOut := fs.Bool("json", false, "print load and artifact identity as JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	identity, err := dataplane.LoadObjectTestIdentity(ctx, *objectPath)
+	if fs.NArg() != 0 {
+		return fmt.Errorf("bpf-load-test does not accept positional arguments")
+	}
+	if *experimentalFakeTCP && strings.TrimSpace(*objectPath) == "" {
+		return fmt.Errorf("--experimental-faketcp requires an explicit non-empty --object path")
+	}
+
+	kind := ""
+	loader := loadBaseline
+	if *experimentalFakeTCP {
+		kind = dataplane.ExperimentalFakeTCPObjectKind
+		loader = loadExperimental
+	}
+	identity, err := loader(ctx, *objectPath)
 	if err != nil {
 		return err
 	}
 	if *jsonOut {
 		return writeJSON(stdout, struct {
 			Status string                   `json:"status"`
+			Kind   string                   `json:"kind,omitempty"`
 			Build  buildinfo.Info           `json:"build"`
 			Object dataplane.ObjectIdentity `json:"object"`
 		}{
 			Status: "loaded",
+			Kind:   kind,
 			Build:  buildinfo.Current(),
 			Object: identity,
 		})
+	}
+	if *experimentalFakeTCP {
+		fmt.Fprintf(
+			stdout,
+			"Experimental FakeTCP BPF object verifier-loaded successfully: kind=%s source=%s sha256=%s\n",
+			kind,
+			identity.Source,
+			identity.SHA256,
+		)
+		return nil
 	}
 	fmt.Fprintf(
 		stdout,
@@ -954,7 +1002,8 @@ Commands:
   guard-plan  print nft startup guard script
   guard-apply apply nft startup guard
   guard-cleanup remove nft startup guard table
-  bpf-load-test load BPF object and report the exact loaded-object identity
+  bpf-load-test load the baseline BPF object; experimental FakeTCP requires
+                --experimental-faketcp and an explicit --object path
   features    print raw local feature probe JSON
   version     print version; use --json for source/object/ABI identity
 
