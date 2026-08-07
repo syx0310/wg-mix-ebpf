@@ -28,7 +28,6 @@ type tcRuntime struct {
 	linkByIndex   func(int) (netlink.Link, error)
 	qdiscList     func(netlink.Link) ([]netlink.Qdisc, error)
 	qdiscAdd      func(netlink.Qdisc) error
-	qdiscDelete   func(netlink.Qdisc) error
 	filterList    func(netlink.Link, uint32) ([]netlink.Filter, error)
 	filterAdd     func(netlink.Filter) error
 	filterReplace func(netlink.Filter) error
@@ -40,7 +39,6 @@ var liveTCRuntime = tcRuntime{
 	linkByIndex:   netlink.LinkByIndex,
 	qdiscList:     netlink.QdiscList,
 	qdiscAdd:      netlink.QdiscAdd,
-	qdiscDelete:   netlink.QdiscDel,
 	filterList:    netlink.FilterList,
 	filterAdd:     netlink.FilterAdd,
 	filterReplace: netlink.FilterReplace,
@@ -227,7 +225,6 @@ func prepareTCAttachPlan(
 
 func validateTCRuntime(runtime tcRuntime) error {
 	if runtime.linkByIndex == nil || runtime.qdiscList == nil || runtime.qdiscAdd == nil ||
-		runtime.qdiscDelete == nil ||
 		runtime.filterList == nil || runtime.filterAdd == nil ||
 		runtime.filterReplace == nil || runtime.filterDelete == nil ||
 		runtime.loadProgram == nil {
@@ -784,18 +781,12 @@ func (plan *tcAttachPlan) rollbackRetained(stage *tcAttachStage) error {
 	}
 	stage.applied = remainingApplied
 
-	var remainingCreated []tcOwnedCreatedQdisc
-	for index := len(stage.created) - 1; index >= 0; index-- {
-		change := stage.created[index]
-		complete, err := plan.removeCreatedQdisc(change)
-		if err != nil {
-			errs = append(errs, err)
-		}
-		if !complete {
-			remainingCreated = append([]tcOwnedCreatedQdisc{change}, remainingCreated...)
-		}
-	}
-	stage.created = remainingCreated
+	// clsact is a shared, identity-less kernel scaffold. RTM_DELQDISC matches
+	// only ifindex/handle/parent and atomically removes every child filter, so
+	// userspace cannot prove that a canonical clsact observed before deletion
+	// is still the one this transaction created. Preserve the harmless empty
+	// scaffold; exact program ownership is handled separately.
+	stage.created = nil
 	return errors.Join(errs...)
 }
 
@@ -928,48 +919,6 @@ func (plan *tcAttachPlan) restoreAppliedFilter(
 		)
 	}
 	return true, nil
-}
-
-func (plan *tcAttachPlan) removeCreatedQdisc(
-	change tcOwnedCreatedQdisc,
-) (bool, error) {
-	present, err := inspectClsact(change.link, plan.runtime)
-	if err != nil {
-		return false, fmt.Errorf("inspect owned clsact on ifindex %d before delete: %w", change.ifindex, err)
-	}
-	if !present {
-		return true, nil
-	}
-	for _, parent := range []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS} {
-		filters, err := plan.runtime.filterList(change.link, parent)
-		if err != nil {
-			return false, fmt.Errorf(
-				"inspect filters before deleting owned clsact on ifindex %d parent %#x: %w",
-				change.ifindex, parent, err,
-			)
-		}
-		if len(filters) != 0 {
-			return false, fmt.Errorf(
-				"preserve owned clsact on ifindex %d: parent %#x contains %d foreign or unresolved filters",
-				change.ifindex, parent, len(filters),
-			)
-		}
-	}
-	deleteErr := plan.runtime.qdiscDelete(canonicalClsact(change.ifindex))
-	after, inspectErr := inspectClsact(change.link, plan.runtime)
-	if inspectErr == nil && !after {
-		return true, nil
-	}
-	if inspectErr != nil {
-		return false, errors.Join(
-			wrapNonNilError(fmt.Sprintf("delete owned clsact on ifindex %d", change.ifindex), deleteErr),
-			fmt.Errorf("verify owned clsact deletion on ifindex %d: %w", change.ifindex, inspectErr),
-		)
-	}
-	return false, errors.Join(
-		wrapNonNilError(fmt.Sprintf("delete owned clsact on ifindex %d", change.ifindex), deleteErr),
-		fmt.Errorf("owned clsact remains on ifindex %d after delete", change.ifindex),
-	)
 }
 
 func (plan *tcAttachPlan) Close() error {

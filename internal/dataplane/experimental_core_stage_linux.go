@@ -14,7 +14,6 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
-	"github.com/syx0310/wg-mix-ebpf/internal/control"
 )
 
 type experimentalCoreProgramFD func(experimentalProgramResource) (uint32, error)
@@ -422,61 +421,4 @@ func liveExperimentalCoreProgramFD(program experimentalProgramResource) (uint32,
 		return 0, errors.New("experimental program has an invalid file descriptor")
 	}
 	return uint32(fd), nil
-}
-
-func stageLiveExperimentalTC(
-	ctx context.Context,
-	state *control.State,
-	ingress experimentalProgramResource,
-	egress experimentalProgramResource,
-	commit func() error,
-) (experimentalTCStageOwner, error) {
-	if ctx == nil {
-		return nil, errors.New("stage experimental TC core: context is nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
-	}
-	if state == nil {
-		return nil, errors.New("stage experimental TC core: attach state is nil")
-	}
-	ingressIdentity, err := tcProgramIdentityFromProgram(ingress.kernelProgram())
-	if err != nil {
-		return nil, fmt.Errorf("resolve experimental ingress TC program: %w", err)
-	}
-	egressIdentity, err := tcProgramIdentityFromProgram(egress.kernelProgram())
-	if err != nil {
-		return nil, fmt.Errorf("resolve experimental egress TC program: %w", err)
-	}
-	plan, err := prepareTCAttachPlan(state, ingressIdentity, egressIdentity, liveTCRuntime)
-	if err != nil {
-		return nil, fmt.Errorf("prepare experimental TC core: %w", err)
-	}
-	return executeFreshExperimentalTCPlan(plan, commit)
-}
-
-func executeFreshExperimentalTCPlan(
-	plan *tcAttachPlan,
-	commit func() error,
-) (experimentalTCStageOwner, error) {
-	if plan == nil {
-		return nil, errors.New("execute fresh experimental TC core: plan is nil")
-	}
-	// Experimental generations have no persistent TC owner record. A reserved
-	// slot that merely looks managed is therefore foreign and must never be
-	// replaced on first activation.
-	if err := plan.ValidatePreviousBindings(nil, true); err != nil {
-		return nil, errors.Join(
-			fmt.Errorf("validate fresh experimental TC ownership: %w", err),
-			plan.Close(),
-		)
-	}
-	stage, err := plan.ExecuteRetained(commit)
-	if err != nil {
-		if stage != nil {
-			return stage, err
-		}
-		return nil, errors.Join(err, plan.Close())
-	}
-	return stage, nil
 }
