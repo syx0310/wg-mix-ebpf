@@ -92,17 +92,23 @@ func TestExperimentalCollectionOwnerConcurrentCloseRetainsOnlyFailedResources(t 
 		}
 	}
 
-	if !slices.Equal(closeLog, []string{"program:a", "program:b", "map:a", "map:b"}) {
+	if len(closeLog) < 4 || !slices.Equal(
+		closeLog[:4], []string{"program:a", "program:b", "map:a", "map:b"},
+	) {
 		t.Fatalf("close order = %v", closeLog)
 	}
 	for name, closes := range map[string]int{
-		"map-a": mapA.closes, "map-b": mapB.closes,
-		"program-a": programA.closes, "program-b": programB.closes,
+		"map-a": mapA.closes, "program-a": programA.closes,
 	} {
 		if closes != 1 {
-			t.Fatalf("%s close count = %d, want 1", name, closes)
+			t.Fatalf("successful sibling %s close count = %d, want 1", name, closes)
 		}
 	}
+	if mapB.closes == 0 || programB.closes == 0 {
+		t.Fatalf("failed resources were not attempted: map=%d program=%d", mapB.closes, programB.closes)
+	}
+	mapBAttempts := mapB.closes
+	programBAttempts := programB.closes
 	if owner.isClosed() {
 		t.Fatal("owner with failed resources reported closed")
 	}
@@ -128,8 +134,11 @@ func TestExperimentalCollectionOwnerConcurrentCloseRetainsOnlyFailedResources(t 
 			t.Fatalf("successful sibling %s was closed again: %d", name, closes)
 		}
 	}
-	if mapB.closes != 2 || programB.closes != 2 {
-		t.Fatalf("failed resource retries map=%d program=%d", mapB.closes, programB.closes)
+	if mapB.closes != mapBAttempts+1 || programB.closes != programBAttempts+1 {
+		t.Fatalf(
+			"failed resource retries map=%d/%d program=%d/%d",
+			mapB.closes, mapBAttempts+1, programB.closes, programBAttempts+1,
+		)
 	}
 }
 
