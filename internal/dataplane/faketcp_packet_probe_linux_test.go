@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"net/netip"
 	"os"
 	"testing"
@@ -119,34 +120,40 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
-		ifindex, sourcePort, remotePort, localIPv4, remoteIPv4)
-
 	program := collection.Programs["wg_mix_egress"]
 	if program == nil {
 		t.Fatal("experimental object has no wg_mix_egress program")
 	}
-	packet, originalPayload := buildFakeTCPProbeUDPPacket(t, sourcePort, remotePort, 33)
 
-	t.Run("materialized-odd-payload", func(t *testing.T) {
-		context := fakeTCPSKBContext{Ifindex: ifindex}
-		output := make([]byte, len(packet)+64)
-		result, err := program.Run(&ebpf.RunOptions{
-			Data:    append([]byte(nil), packet...),
-			DataOut: output,
-			Context: context,
-			Repeat:  1,
+	for _, payloadLength := range []int{32, 33} {
+		t.Run(fmt.Sprintf("materialized-payload-%d", payloadLength), func(t *testing.T) {
+			populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
+				ifindex, sourcePort, remotePort, localIPv4, remoteIPv4)
+			packet, originalPayload := buildFakeTCPProbeUDPPacket(
+				t, sourcePort, remotePort, payloadLength,
+			)
+			context := fakeTCPSKBContext{Ifindex: ifindex}
+			output := make([]byte, len(packet)+64)
+			result, err := program.Run(&ebpf.RunOptions{
+				Data:    append([]byte(nil), packet...),
+				DataOut: output,
+				Context: context,
+				Repeat:  1,
+			})
+			if err != nil {
+				t.Fatalf("BPF_PROG_TEST_RUN materialized packet: %v", err)
+			}
+			if result != 0 {
+				t.Fatalf("materialized packet action=%d, want TC_ACT_OK", result)
+			}
+			verifyFakeTCPProbeOutput(t, output, packet, originalPayload, sourcePort, remotePort)
 		})
-		if err != nil {
-			t.Fatalf("BPF_PROG_TEST_RUN materialized packet: %v", err)
-		}
-		if result != 0 {
-			t.Fatalf("materialized packet action=%d, want TC_ACT_OK", result)
-		}
-		verifyFakeTCPProbeOutput(t, output, packet, originalPayload, sourcePort, remotePort)
-	})
+	}
 
 	t.Run("aggregate-gso-hard-reject", func(t *testing.T) {
+		populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
+			ifindex, sourcePort, remotePort, localIPv4, remoteIPv4)
+		packet, _ := buildFakeTCPProbeUDPPacket(t, sourcePort, remotePort, 33)
 		context := fakeTCPSKBContext{
 			Ifindex:     ifindex,
 			GSOSegments: 2,

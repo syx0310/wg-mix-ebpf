@@ -45,10 +45,10 @@ func TestFakeTCPFullTransportChecksumAndIngressInverseMatch(t *testing.T) {
 			// or IPv4 zero. All three states must produce the same materialized
 			// TCP checksum from pseudo-header + TCP header + complete payload.
 			for _, oldUDPChecksum := range []uint16{udpChecksum, 0x9a7b, 0} {
-					gotTCP := materializeFakeTCPTCPChecksumModel(oldUDPChecksum, tcp, wirePayload)
-					if gotTCP != wantTCP {
-						t.Fatalf("old UDP checksum %#04x: materialized TCP checksum = %#04x, want %#04x", oldUDPChecksum, gotTCP, wantTCP)
-					}
+				gotTCP := materializeFakeTCPTCPChecksumModel(oldUDPChecksum, tcp, wirePayload)
+				if gotTCP != wantTCP {
+					t.Fatalf("old UDP checksum %#04x: materialized TCP checksum = %#04x, want %#04x", oldUDPChecksum, gotTCP, wantTCP)
+				}
 			}
 			gotTCP := wantTCP
 
@@ -75,6 +75,7 @@ func TestFakeTCPMTUMinusHeaderDeltaBoundary(t *testing.T) {
 		want       bool
 	}{
 		{name: "exact-minus-twelve", inputL3Len: 1488, want: true},
+		{name: "odd-payload-one-under", inputL3Len: 1487, want: true},
 		{name: "one-over-boundary", inputL3Len: 1489, want: false},
 		{name: "ordinary-wireguard", inputL3Len: 1420, want: true},
 		{name: "invalid-too-short", inputL3Len: 27, want: false},
