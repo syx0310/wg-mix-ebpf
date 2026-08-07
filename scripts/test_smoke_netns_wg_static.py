@@ -364,7 +364,31 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             create_veth.index("\nfunc validateVethPairThreadContract(")
         ]
         self.assertIn("runtime.LockOSThread()", dedicated_thread)
-        self.assertNotIn("runtime.UnlockOSThread()", dedicated_thread)
+        self.assertNotIn("defer runtime.UnlockOSThread()", dedicated_thread)
+        self.assertEqual(3, dedicated_thread.count("runtime.UnlockOSThread()"))
+        hold_original = dedicated_thread.index(
+            '"/proc/thread-self/ns/net"'
+        )
+        create_in_left = dedicated_thread.index(
+            "workErr := createVethPairInExactLeftNamespace("
+        )
+        restore = dedicated_thread.index(
+            "restoreErr := operations.setNamespace(originalFD, unix.CLONE_NEWNET)"
+        )
+        verify_restore = dedicated_thread.index(
+            "verifyIdentity(observed, originalIdentity)"
+        )
+        unlock_after_restore = dedicated_thread.rindex(
+            "runtime.UnlockOSThread()"
+        )
+        self.assertLess(hold_original, create_in_left)
+        self.assertLess(create_in_left, restore)
+        self.assertLess(restore, verify_restore)
+        self.assertLess(verify_restore, dedicated_thread.index("if restored {"))
+        self.assertLess(
+            dedicated_thread.index("if restored {"),
+            unlock_after_restore,
+        )
         exact_create = create_veth[
             create_veth.index("func createVethPairInExactLeftNamespace(") :
             create_veth.index(
