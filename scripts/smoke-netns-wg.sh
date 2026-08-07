@@ -334,10 +334,15 @@ VETH_RB="wmr${RUN_ID}b"
 TEST_ROOT="/run/wg-mix-ebpf-tests"
 RUN_BASE="${TEST_ROOT}/${RUN_ID}"
 BPFFS_DIR="${RUN_BASE}/bpffs"
-BPFFS_SOURCE="bpf"
+BPFFS_SOURCE=""
+BPFFS_LEDGER="${RUN_BASE}/bpffs.creation.v1"
 BPFFS_MOUNT_ID=""
+BPFFS_MOUNT_DEVICE=""
 BPFFS_PARENT_DEV=""
 BPFFS_PARENT_INO=""
+BPFFS_PRE_TARGET_MOUNT_ID=""
+BPFFS_PRE_TARGET_DEVICE=""
+BPFFS_PRE_BPF_MOUNTS=""
 PREEXISTING_MOUNT_IDS=""
 PINA="${BPFFS_DIR}/wg-mix-ebpf-a"
 PINB="${BPFFS_DIR}/wg-mix-ebpf-b"
@@ -363,6 +368,11 @@ import secrets
 print(secrets.token_hex(16))
 PY
 )"
+if [[ ! "${OWNER_TOKEN}" =~ ^[0-9a-f]{32}$ ]]; then
+  echo "error: failed to generate a canonical 32-character owner token" >&2
+  exit 1
+fi
+BPFFS_SOURCE="wg-mix-ebpf-${RUN_ID}-${OWNER_TOKEN}"
 NETNS_SOCKET_A="wme-netns-${RUN_ID}-a-${OWNER_TOKEN}"
 NETNS_SOCKET_R="wme-netns-${RUN_ID}-r-${OWNER_TOKEN}"
 NETNS_SOCKET_B="wme-netns-${RUN_ID}-b-${OWNER_TOKEN}"
@@ -419,8 +429,9 @@ failure_report() {
     "${PHASE}" "${HOST_ID}" "${RUN_ID}" >&2
   printf 'the failure trap performed no detach, delete, unmount, kill, or file cleanup\n' >&2
   if ((RUN_BASE_CREATED)); then
-    printf 'evidence root: %s\nownership marker: %s\nmanifest: %s\n' \
-      "${RUN_BASE}" "${RUN_BASE}/${OWNER_MARKER}" "${MANIFEST}" >&2
+    printf 'evidence root: %s\nownership marker: %s\nmanifest: %s\nbpffs creation ledger: %s\n' \
+      "${RUN_BASE}" "${RUN_BASE}/${OWNER_MARKER}" "${MANIFEST}" \
+      "${BPFFS_LEDGER}" >&2
     printf 'sensitive recovery material (never copy as evidence): %s\n' \
       "${SECRET_DIR}" >&2
     printf 'review the marker, manifest, exact paths, and bounded inventory before recovery\n' >&2
@@ -572,6 +583,17 @@ manifest_payload() {
   printf 'evidence=%s\nsecrets=%s\n' "${TMPDIR}" "${SECRET_DIR}"
 }
 
+bpffs_creation_ledger_payload() {
+  printf 'format=wg-mix-ebpf-bpffs-creation-v1\n'
+  printf 'run_id=%s\nowner_token=%s\n' "${RUN_ID}" "${OWNER_TOKEN}"
+  printf 'target=%s\nsource=%s\n' "${BPFFS_DIR}" "${BPFFS_SOURCE}"
+  printf 'pre_target_mount_id=%s\npre_target_dev=%s\n' \
+    "${BPFFS_PRE_TARGET_MOUNT_ID}" "${BPFFS_PRE_TARGET_DEVICE}"
+  printf 'pre_bpf_mounts=%s\n' "${BPFFS_PRE_BPF_MOUNTS}"
+  printf 'post_mount_id=%s\npost_dev=%s\npost_ino=%s\n' \
+    "${BPFFS_MOUNT_ID}" "${BPFFS_MOUNT_DEVICE}" "${BPFFS_PARENT_INO}"
+}
+
 write_marker() {
   local dir="$1"
   local role="$2"
@@ -631,8 +653,167 @@ validate_manifest() {
   fi
 }
 
-inspect_private_bpffs_mount_id() {
+validate_bpffs_creation_state() {
+  if [[ "${BPFFS_SOURCE}" != "wg-mix-ebpf-${RUN_ID}-${OWNER_TOKEN}" ||
+    ! "${BPFFS_PRE_TARGET_MOUNT_ID}" =~ ^[1-9][0-9]*$ ||
+    ! "${BPFFS_PRE_TARGET_DEVICE}" =~ ^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$ ||
+    ! "${BPFFS_MOUNT_ID}" =~ ^[1-9][0-9]*$ ||
+    ! "${BPFFS_MOUNT_DEVICE}" =~ ^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$ ||
+    ! "${BPFFS_PARENT_INO}" =~ ^[1-9][0-9]*$ ||
+    ( "${BPFFS_PRE_BPF_MOUNTS}" != "none" &&
+      ! "${BPFFS_PRE_BPF_MOUNTS}" =~ ^[1-9][0-9]*@(0|[1-9][0-9]*):(0|[1-9][0-9]*)(,[1-9][0-9]*@(0|[1-9][0-9]*):(0|[1-9][0-9]*))*$ ) ]]; then
+    echo "error: incomplete or noncanonical private bpffs creation state" >&2
+    return 1
+  fi
+  if [[ "${BPFFS_PRE_TARGET_MOUNT_ID}" == "${BPFFS_MOUNT_ID}" ||
+    "${BPFFS_PRE_TARGET_DEVICE}" == "${BPFFS_MOUNT_DEVICE}" ||
+    ( "${BPFFS_PRE_BPF_MOUNTS}" != "none" &&
+      ( ",${BPFFS_PRE_BPF_MOUNTS}," == *",${BPFFS_MOUNT_ID}@"* ||
+        ",${BPFFS_PRE_BPF_MOUNTS}," == *"@${BPFFS_MOUNT_DEVICE},"* ) ) ]]; then
+    echo "error: private bpffs post-mount identity existed before creation" >&2
+    return 1
+  fi
+}
+
+validate_bpffs_creation_ledger() {
+  local expected
+  local actual
+  local resolved
+
+  validate_owned_path "${BPFFS_LEDGER}" || return 1
+  validate_bpffs_creation_state || return 1
+  if [[ ! -f "${BPFFS_LEDGER}" || -L "${BPFFS_LEDGER}" ||
+    "$(stat -c '%u' -- "${BPFFS_LEDGER}")" != "${EUID}" ||
+    "$(stat -c '%a' -- "${BPFFS_LEDGER}")" != "600" ||
+    "$(stat -c '%h' -- "${BPFFS_LEDGER}")" != "1" ]]; then
+    echo "error: invalid private bpffs creation ledger metadata: ${BPFFS_LEDGER}" >&2
+    return 1
+  fi
+  if ! resolved="$(realpath -e -- "${BPFFS_LEDGER}")" ||
+    [[ "${resolved}" != "${BPFFS_LEDGER}" ]]; then
+    echo "error: private bpffs creation ledger path changed: ${BPFFS_LEDGER}" >&2
+    return 1
+  fi
+  expected="$(bpffs_creation_ledger_payload)"
+  actual="$(<"${BPFFS_LEDGER}")"
+  if [[ "${actual}" != "${expected}" ]]; then
+    echo "error: private bpffs creation ledger content mismatch: ${BPFFS_LEDGER}" >&2
+    return 1
+  fi
+}
+
+write_bpffs_creation_ledger() {
+  validate_owned_path "${BPFFS_LEDGER}" || return 1
+  validate_bpffs_creation_state || return 1
+  if [[ -e "${BPFFS_LEDGER}" || -L "${BPFFS_LEDGER}" ]]; then
+    echo "error: private bpffs creation ledger already exists: ${BPFFS_LEDGER}" >&2
+    return 1
+  fi
+  if ! (set -o noclobber; bpffs_creation_ledger_payload >"${BPFFS_LEDGER}"); then
+    echo "error: could not exclusively create private bpffs creation ledger" >&2
+    return 1
+  fi
+  chmod 0600 "${BPFFS_LEDGER}" || return 1
+  validate_bpffs_creation_ledger
+}
+
+snapshot_private_bpffs_pre_mount() {
+  local mountinfo_path="${1:-/proc/self/mountinfo}"
+  local snapshot
+  local extra
+
+  if ! snapshot="$(awk -v target="${BPFFS_DIR}" '
+    function separator_index(   field_index) {
+      for (field_index = 6; field_index <= NF; field_index++) {
+        if ($field_index == "-") {
+          return field_index
+        }
+      }
+      return 0
+    }
+    function covers(path, child) {
+      return path == "/" || child == path || index(child, path "/") == 1
+    }
+    function decimal_greater(left, right) {
+      if (length(left) != length(right)) {
+        return length(left) > length(right)
+      }
+      return ("x" left) > ("x" right)
+    }
+    {
+      separator = separator_index()
+      if (separator == 0 || $1 !~ /^[1-9][0-9]*$/ ||
+          $3 !~ /^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$/ ||
+          seen_mount_id[$1]++) {
+        invalid = 1
+        exit 1
+      }
+      if ($(separator + 1) == "bpf") {
+        bpf_count++
+        bpf_id[bpf_count] = $1
+        bpf_device[bpf_count] = $3
+      }
+      if (covers($5, target)) {
+        if (index($5, "\\") != 0 || $5 == target) {
+          invalid = 1
+          exit 1
+        }
+        candidate_length = length($5)
+        if (candidate_length > best_length) {
+          best_length = candidate_length
+          best_count = 1
+          best_id = $1
+          best_device = $3
+        } else if (candidate_length == best_length) {
+          best_count++
+        }
+      }
+    }
+    END {
+      if (invalid || best_count != 1 || bpf_count > 1024) {
+        exit 1
+      }
+      for (index_value = 2; index_value <= bpf_count; index_value++) {
+        current_id = bpf_id[index_value]
+        current_device = bpf_device[index_value]
+        prior = index_value - 1
+        while (prior >= 1 && decimal_greater(bpf_id[prior], current_id)) {
+          bpf_id[prior + 1] = bpf_id[prior]
+          bpf_device[prior + 1] = bpf_device[prior]
+          prior--
+        }
+        bpf_id[prior + 1] = current_id
+        bpf_device[prior + 1] = current_device
+      }
+      printf "%s %s ", best_id, best_device
+      if (bpf_count == 0) {
+        print "none"
+      } else {
+        for (index_value = 1; index_value <= bpf_count; index_value++) {
+          printf "%s%s@%s", separator_value, bpf_id[index_value], bpf_device[index_value]
+          separator_value = ","
+        }
+        print ""
+      }
+    }
+  ' "${mountinfo_path}")"; then
+    echo "error: could not snapshot private bpffs pre-mount provenance" >&2
+    return 1
+  fi
+  read -r BPFFS_PRE_TARGET_MOUNT_ID BPFFS_PRE_TARGET_DEVICE \
+    BPFFS_PRE_BPF_MOUNTS extra <<<"${snapshot}"
+  if [[ -n "${extra}" ||
+    ! "${BPFFS_PRE_TARGET_MOUNT_ID}" =~ ^[1-9][0-9]*$ ||
+    ! "${BPFFS_PRE_TARGET_DEVICE}" =~ ^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$ ||
+    -z "${BPFFS_PRE_BPF_MOUNTS}" ]]; then
+    echo "error: invalid private bpffs pre-mount provenance snapshot" >&2
+    return 1
+  fi
+}
+
+inspect_private_bpffs_mount_record() {
   local observed
+  local mountinfo_path="${1:-/proc/self/mountinfo}"
 
   if ! mountpoint -q -- "${BPFFS_DIR}"; then
     echo "error: expected private bpffs mount is missing: ${BPFFS_DIR}" >&2
@@ -649,6 +830,10 @@ inspect_private_bpffs_mount_id() {
         }
         return 0
       }
+      {
+        entry_count[$1]++
+        entry_device[$1] = $3
+      }
       $5 == target {
         target_count++
         separator = separator_index()
@@ -658,6 +843,7 @@ inspect_private_bpffs_mount_id() {
           invalid = 1
         }
         target_id = $1
+        target_parent_id = $2
         target_device = $3
         target_root = $4
         target_source = $(separator + 2)
@@ -675,7 +861,10 @@ inspect_private_bpffs_mount_id() {
         nested = 1
       }
       END {
-        if (target_count != 1 || invalid || nested) {
+        if (target_count != 1 || invalid || nested ||
+            target_parent_id !~ /^[1-9][0-9]*$/ ||
+            entry_count[target_parent_id] != 1 ||
+            entry_device[target_parent_id] !~ /^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$/) {
           exit 1
         }
         for (other_index = 1; other_index <= other_bpf_count; other_index++) {
@@ -685,31 +874,34 @@ inspect_private_bpffs_mount_id() {
             exit 1
           }
         }
-        print target_id
+        print target_id, target_device, target_parent_id, entry_device[target_parent_id]
       }
-    ' /proc/self/mountinfo)"; then
+    ' "${mountinfo_path}")"; then
     echo "error: private bpffs is not an independent exact bpf mount root: ${BPFFS_DIR}" >&2
-    return 1
-  fi
-  if [[ ! "${observed}" =~ ^[1-9][0-9]*$ ]]; then
-    echo "error: invalid private bpffs mount ID: ${observed}" >&2
-    return 1
-  fi
-  if [[ " ${PREEXISTING_MOUNT_IDS} " == *" ${observed} "* ]]; then
-    echo "error: private bpffs mount ID was present before this run mounted bpffs: ${observed}" >&2
     return 1
   fi
   printf '%s\n' "${observed}"
 }
 
 validate_private_bpffs_mount() {
-  local observed
+  local observed_record
+  local observed_mount_id
+  local observed_mount_device
+  local observed_parent_mount_id
+  local observed_parent_device
+  local extra
   local observed_device
   local observed_inode
 
-  observed="$(inspect_private_bpffs_mount_id)" || return 1
-  if [[ -z "${BPFFS_MOUNT_ID}" || "${observed}" != "${BPFFS_MOUNT_ID}" ]]; then
-    echo "error: private bpffs mount ID changed: expected=${BPFFS_MOUNT_ID} observed=${observed}" >&2
+  observed_record="$(inspect_private_bpffs_mount_record)" || return 1
+  read -r observed_mount_id observed_mount_device observed_parent_mount_id \
+    observed_parent_device extra <<<"${observed_record}"
+  if [[ -n "${extra}" ||
+    "${observed_mount_id}" != "${BPFFS_MOUNT_ID}" ||
+    "${observed_mount_device}" != "${BPFFS_MOUNT_DEVICE}" ||
+    "${observed_parent_mount_id}" != "${BPFFS_PRE_TARGET_MOUNT_ID}" ||
+    "${observed_parent_device}" != "${BPFFS_PRE_TARGET_DEVICE}" ]]; then
+    echo "error: private bpffs mount or parent identity changed: ${observed_record}" >&2
     return 1
   fi
   read -r observed_device observed_inode < <(
@@ -722,6 +914,7 @@ validate_private_bpffs_mount() {
     echo "error: private bpffs dev:ino changed: expected=${BPFFS_PARENT_DEV}:${BPFFS_PARENT_INO} observed=${observed_device}:${observed_inode}" >&2
     return 1
   fi
+  validate_bpffs_creation_ledger
 }
 
 pin_resource_key() {
@@ -1424,6 +1617,7 @@ if mountpoint -q -- "${BPFFS_DIR}"; then
   echo "error: unexpected mount already exists at ${BPFFS_DIR}" >&2
   exit 1
 fi
+snapshot_private_bpffs_pre_mount
 PREEXISTING_MOUNT_IDS="$(awk '
   {
     if ($1 !~ /^[1-9][0-9]*$/) {
@@ -1437,7 +1631,20 @@ PREEXISTING_MOUNT_IDS="$(awk '
   }
 ' /proc/self/mountinfo)"
 mount -t bpf -o nosuid,nodev,noexec,mode=0700 "${BPFFS_SOURCE}" "${BPFFS_DIR}"
-BPFFS_MOUNT_ID="$(inspect_private_bpffs_mount_id)"
+BPFFS_MOUNT_RECORD="$(inspect_private_bpffs_mount_record)"
+read -r BPFFS_MOUNT_ID BPFFS_MOUNT_DEVICE BPFFS_POST_PARENT_MOUNT_ID \
+  BPFFS_POST_PARENT_DEVICE BPFFS_MOUNT_RECORD_EXTRA <<<"${BPFFS_MOUNT_RECORD}"
+if [[ -n "${BPFFS_MOUNT_RECORD_EXTRA}" ||
+  ! "${BPFFS_MOUNT_ID}" =~ ^[1-9][0-9]*$ ||
+  ! "${BPFFS_MOUNT_DEVICE}" =~ ^(0|[1-9][0-9]*):(0|[1-9][0-9]*)$ ||
+  " ${PREEXISTING_MOUNT_IDS} " == *" ${BPFFS_MOUNT_ID} "* ||
+  "${BPFFS_POST_PARENT_MOUNT_ID}" != "${BPFFS_PRE_TARGET_MOUNT_ID}" ||
+  "${BPFFS_POST_PARENT_DEVICE}" != "${BPFFS_PRE_TARGET_DEVICE}" ]]; then
+  echo "error: private bpffs post-mount identity does not match its creation baseline" >&2
+  exit 1
+fi
+unset BPFFS_MOUNT_RECORD BPFFS_POST_PARENT_MOUNT_ID \
+  BPFFS_POST_PARENT_DEVICE BPFFS_MOUNT_RECORD_EXTRA
 read -r BPFFS_PARENT_DEV BPFFS_PARENT_INO < <(
   stat -Lc '%d %i' -- "${BPFFS_DIR}"
 )
@@ -1470,6 +1677,7 @@ PIN_OWNER_B="${PIN_OWNER_ROOT}/${PIN_RESOURCE_KEY_B}.owner.json"
 for owned_path in "${PIN_LOCK_A}" "${PIN_LOCK_B}" "${PIN_OWNER_A}" "${PIN_OWNER_B}"; do
   validate_owned_path "${owned_path}"
 done
+write_bpffs_creation_ledger
 validate_private_bpffs_mount
 
 run_agent_in_netns() {
@@ -1979,6 +2187,7 @@ explicit_teardown() {
   release_lifecycle_hold || return 1
   printf 'test evidence intentionally retained at %s\n' "${TMPDIR}"
   printf 'manifest intentionally retained at %s\n' "${MANIFEST}"
+  printf 'bpffs creation ledger intentionally retained at %s\n' "${BPFFS_LEDGER}"
   printf 'sensitive recovery material removed from %s\n' "${SECRET_DIR}"
   TEARDOWN_COMPLETE=1
 }
