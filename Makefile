@@ -38,7 +38,7 @@ test-live-guard-build-provenance:
 
 test-faketcp-verifier-only:
 	scripts/test-faketcp-verifier-only.sh \
-		"$(CURDIR)/scripts/run-faketcp-verifier-only.sh"
+		"$(CURDIR)/scripts/run-faketcp-verifier-only.py"
 
 build-bpf:
 	@mkdir -p $(dir $(BPF_OBJECT))
@@ -138,7 +138,8 @@ test-lint:
 		{ echo "gofmt required for:"; $(GOFMT) -l $$(find cmd internal -name '*.go' -type f); exit 1; }
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) vet ./...
 	sh -n scripts/source-commit.sh scripts/test-bpf-object-manifest-path-contract.sh
-	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-faketcp-verifier-only.sh scripts/test-faketcp-verifier-only.sh
+	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/test-faketcp-verifier-only.sh
+	/usr/bin/python3 -I -c 'from pathlib import Path; [compile(Path(p).read_text(), p, "exec") for p in ("scripts/run-faketcp-verifier-only.py", "scripts/test_faketcp_verifier_only.py")]'
 	scripts/inspect-linux-test-host.sh --self-test-nft-table-gate
 	scripts/provision-ubuntu-test-host.sh --self-test-apt-gate
 	scripts/build-live-guard-test.sh --self-test-safety-gate
@@ -159,7 +160,7 @@ test-lint:
 	fi
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet -tags realhosttest ./internal/guard
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-faketcp-verifier-only.sh scripts/test-faketcp-verifier-only.sh; \
+		shellcheck scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/test-faketcp-verifier-only.sh; \
 	else \
 		echo "skip: shellcheck is unavailable"; \
 	fi

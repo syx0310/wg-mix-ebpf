@@ -1,0 +1,611 @@
+#!/usr/bin/python3 -I
+"""Unprivileged regression tests for the descriptor-only FakeTCP verifier gate."""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import errno
+import hashlib
+import importlib.util
+import io
+import os
+import pathlib
+import platform
+import re
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import types
+import unittest
+from typing import Optional
+
+
+def load_runner(path: str) -> types.ModuleType:
+    spec = importlib.util.spec_from_file_location("faketcp_verifier_runner", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("cannot create runner module spec")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    sys.dont_write_bytecode = True
+    spec.loader.exec_module(module)
+    return module
+
+
+RUNNER_PATH = os.path.abspath(sys.argv[1]) if len(sys.argv) == 2 else ""
+if not RUNNER_PATH or not os.path.isfile(RUNNER_PATH):
+    raise SystemExit(
+        "usage: test_faketcp_verifier_only.py /absolute/path/to/runner.py"
+    )
+sys.argv = [sys.argv[0]]
+runner = load_runner(RUNNER_PATH)
+
+
+class VerifierGateTest(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        evidence_root = tempfile.mkdtemp(
+            prefix="wg-mix-faketcp-verifier-selftest."
+        )
+        cls.evidence_root = os.path.realpath(evidence_root)
+        os.chmod(cls.evidence_root, 0o700)
+        cls.current_owner = (os.geteuid(), os.getegid())
+        cls.test_proc_prefix = "/proc/self/fd" if sys.platform.startswith("linux") else "/dev/fd"
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        print(f"retained FakeTCP verifier self-test fixtures: {cls.evidence_root}")
+
+    def new_layout(self, case_name: str):
+        case_root = os.path.join(self.evidence_root, case_name)
+        prefix = os.path.join(case_root, "wg-mix-ebpf-faketcp-verifier")
+        staging_root = os.path.join(prefix, "caseid-01234567")
+        artifact_dir = os.path.join(staging_root, "artifacts")
+        os.makedirs(artifact_dir, mode=0o700)
+        for path in (case_root, prefix, staging_root, artifact_dir):
+            os.chmod(path, 0o700)
+        owners = frozenset({(0, 0), self.current_owner})
+        policy = runner.GatePolicy(
+            staging_prefix=prefix,
+            hostname=socket.gethostname(),
+            kernel_release=platform.release(),
+            directory_owners=owners,
+            artifact_owner=self.current_owner,
+            require_root=False,
+            proc_fd_prefix=self.test_proc_prefix,
+            timeout_seconds=2.0,
+            term_grace_seconds=0.2,
+            allow_sticky_ancestor=True,
+            verify_descriptor_identity=sys.platform.startswith("linux"),
+        )
+        binary = os.path.join(artifact_dir, "wg-mix-ebpf")
+        bpf_object = os.path.join(artifact_dir, "wg_mix_faketcp_experimental.o")
+        return staging_root, binary, bpf_object, policy
+
+    def write_file(self, path: str, content: bytes, mode: int) -> None:
+        with open(path, "xb") as output:
+            output.write(content)
+            output.flush()
+            os.fsync(output.fileno())
+        os.chmod(path, mode)
+
+    def digest(self, path: str) -> str:
+        value = hashlib.sha256()
+        with open(path, "rb") as source:
+            while True:
+                block = source.read(1024 * 1024)
+                if not block:
+                    break
+                value.update(block)
+        return value.hexdigest()
+
+    def arguments(
+        self,
+        staging_root: str,
+        binary: str,
+        bpf_object: str,
+        binary_sha: Optional[str] = None,
+        object_sha: Optional[str] = None,
+    ) -> argparse.Namespace:
+        return argparse.Namespace(
+            staging_root=staging_root,
+            binary=binary,
+            binary_sha256=binary_sha or self.digest(binary),
+            object=bpf_object,
+            object_sha256=object_sha or self.digest(bpf_object),
+        )
+
+    def ordinary_files(self, case_name: str):
+        staging_root, binary, bpf_object, policy = self.new_layout(case_name)
+        self.write_file(binary, b"fake-binary\n", 0o700)
+        self.write_file(bpf_object, b"fake-object\n", 0o600)
+        return staging_root, binary, bpf_object, policy
+
+    def assert_gate_error(self, expected: str, function, *arguments) -> None:
+        with self.assertRaisesRegex(runner.GateError, re.escape(expected)):
+            function(*arguments)
+
+    def test_parse_rejects_missing_and_additional_arguments(self) -> None:
+        duplicate = [
+            "--runner-sha256",
+            "a" * 64,
+            "--runner-sha256",
+            "b" * 64,
+        ]
+        for arguments in (
+            [],
+            ["--test-policy", "unsafe"],
+            ["--runner-sha", "a" * 64],
+            duplicate,
+        ):
+            with self.subTest(arguments=arguments):
+                with contextlib.redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as raised:
+                        runner.parse_args(arguments)
+                self.assertEqual(raised.exception.code, 2)
+
+    def test_production_identity_and_prefix_are_locked(self) -> None:
+        policy = runner.PRODUCTION_POLICY
+        self.assertEqual(policy.staging_prefix, "/run/wg-mix-ebpf-faketcp-verifier")
+        self.assertEqual(policy.hostname, "ubuntu-2604-test")
+        self.assertEqual(policy.kernel_release, "7.0.0-28-generic")
+        self.assertEqual(policy.directory_owners, frozenset({(0, 0)}))
+        self.assertEqual(policy.artifact_owner, (0, 0))
+        self.assertTrue(policy.require_root)
+        self.assertEqual(policy.proc_fd_prefix, "/proc/self/fd")
+        self.assertTrue(policy.verify_descriptor_identity)
+        self.assertEqual(policy.timeout_seconds, 45.0)
+        self.assertEqual(policy.term_grace_seconds, 5.0)
+
+    def test_production_entry_requires_isolated_python(self) -> None:
+        self.assertTrue(sys.flags.isolated)
+        self.assertFalse(
+            pathlib.Path(RUNNER_PATH).read_text(encoding="utf-8").startswith("#!")
+        )
+        completed = subprocess.run(
+            ["/usr/bin/python3", RUNNER_PATH],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("requires /usr/bin/python3 -I", completed.stderr)
+
+    def test_runner_requires_held_inheritable_hash_pinned_descriptor(self) -> None:
+        fixture = os.path.join(self.evidence_root, "reviewed-runner.py")
+        self.write_file(fixture, b"reviewed runner fixture\n", 0o600)
+        descriptor = os.open(fixture, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        try:
+            descriptor_prefix = self.test_proc_prefix
+            descriptor_path = f"{descriptor_prefix}/{descriptor}"
+            digest = self.digest(fixture)
+            with self.assertRaisesRegex(runner.GateError, "remain inheritable"):
+                runner.require_held_runner_descriptor(
+                    descriptor_path,
+                    digest,
+                    self.current_owner,
+                    descriptor_prefix,
+                )
+            os.set_inheritable(descriptor, True)
+            identity = runner.require_held_runner_descriptor(
+                descriptor_path,
+                digest,
+                self.current_owner,
+                descriptor_prefix,
+            )
+            self.assertEqual(identity.sha256, digest)
+            self.assertFalse(os.get_inheritable(descriptor))
+            os.set_inheritable(descriptor, True)
+            with self.assertRaisesRegex(runner.GateError, "SHA-256 mismatch"):
+                runner.require_held_runner_descriptor(
+                    descriptor_path,
+                    "f" * 64,
+                    self.current_owner,
+                    descriptor_prefix,
+                )
+        finally:
+            os.close(descriptor)
+
+    def test_hostname_and_kernel_mismatch_are_rejected(self) -> None:
+        _, _, _, policy = self.new_layout("system-identity")
+        for changed_policy, expected in (
+            (dataclass_replace(policy, hostname=policy.hostname + "-wrong"), "hostname mismatch"),
+            (
+                dataclass_replace(policy, kernel_release=policy.kernel_release + "-wrong"),
+                "kernel mismatch",
+            ),
+        ):
+            with self.subTest(expected=expected):
+                self.assert_gate_error(
+                    expected,
+                    runner.require_system_identity,
+                    changed_policy,
+                )
+
+    def test_reserved_runtime_test_environment_is_rejected(self) -> None:
+        for name in (
+            "WG_MIX_FAKETCP_VERIFIER_TEST_POLICY",
+            "WG_MIX_FAKETCP_VERIFIER_SELF_TEST_TOOL_ROOT",
+        ):
+            self.assert_gate_error(
+                "reserved verifier environment is forbidden",
+                runner.reject_reserved_environment,
+                {name: "unsafe"},
+            )
+
+    def test_staging_root_requires_direct_canonical_unique_id(self) -> None:
+        _, _, _, policy = self.new_layout("root-text")
+        invalid = (
+            policy.staging_prefix,
+            policy.staging_prefix + "/short",
+            policy.staging_prefix + "/CASEID-01234567",
+            policy.staging_prefix + "/caseid-01234567/nested",
+            policy.staging_prefix + "/caseid-01234567/..",
+        )
+        for path in invalid:
+            with self.subTest(path=path):
+                with self.assertRaises(runner.GateError):
+                    runner.validate_staging_root_text(path, policy)
+
+    def test_prefix_escape_is_rejected_before_open(self) -> None:
+        staging_root, binary, bpf_object, policy = self.ordinary_files("escape")
+        escaping = staging_root + "/../outside/wg-mix-ebpf"
+        arguments = self.arguments(staging_root, binary, bpf_object)
+        arguments.binary = escaping
+        self.assert_gate_error(
+            "binary path must be an absolute normalized safe path",
+            runner.verify_artifacts,
+            arguments,
+            policy,
+        )
+
+    def test_relative_artifact_path_is_rejected_before_open(self) -> None:
+        staging_root, binary, bpf_object, policy = self.ordinary_files("relative")
+        arguments = self.arguments(staging_root, binary, bpf_object)
+        arguments.object = "relative/object.o"
+        self.assert_gate_error(
+            "object path must be an absolute normalized safe path",
+            runner.verify_artifacts,
+            arguments,
+            policy,
+        )
+
+    def test_group_writable_ancestor_is_rejected(self) -> None:
+        staging_root, binary, bpf_object, policy = self.ordinary_files("writable-parent")
+        artifact_dir = os.path.dirname(binary)
+        os.chmod(artifact_dir, 0o770)
+        self.assert_gate_error(
+            "group- or other-writable",
+            runner.verify_artifacts,
+            self.arguments(staging_root, binary, bpf_object),
+            policy,
+        )
+
+    def test_nonaccepted_owner_ancestor_is_rejected(self) -> None:
+        staging_root, binary, bpf_object, policy = self.ordinary_files("owner-parent")
+        wrong_policy = dataclass_replace(
+            policy,
+            directory_owners=frozenset({(os.geteuid() + 1, os.getegid())}),
+            allow_sticky_ancestor=False,
+        )
+        self.assert_gate_error(
+            "not owned by an accepted uid:gid",
+            runner.verify_artifacts,
+            self.arguments(staging_root, binary, bpf_object),
+            wrong_policy,
+        )
+
+    def test_symlink_parent_is_rejected(self) -> None:
+        staging_root, _, bpf_object, policy = self.new_layout("symlink-parent")
+        real_parent = os.path.join(staging_root, "real-parent")
+        alias_parent = os.path.join(staging_root, "alias-parent")
+        os.mkdir(real_parent, mode=0o700)
+        os.symlink(real_parent, alias_parent)
+        binary = os.path.join(alias_parent, "wg-mix-ebpf")
+        real_binary = os.path.join(real_parent, "wg-mix-ebpf")
+        self.write_file(real_binary, b"binary\n", 0o700)
+        self.write_file(bpf_object, b"object\n", 0o600)
+        arguments = argparse.Namespace(
+            staging_root=staging_root,
+            binary=binary,
+            binary_sha256=self.digest(real_binary),
+            object=bpf_object,
+            object_sha256=self.digest(bpf_object),
+        )
+        with self.assertRaises(OSError):
+            runner.verify_artifacts(arguments, policy)
+
+    def test_artifact_owner_mode_hash_and_link_count_are_enforced(self) -> None:
+        cases = ("owner", "mode", "hash", "link")
+        for case_name in cases:
+            with self.subTest(case_name=case_name):
+                staging_root, binary, bpf_object, policy = self.ordinary_files(
+                    "artifact-" + case_name
+                )
+                arguments = self.arguments(staging_root, binary, bpf_object)
+                expected = ""
+                if case_name == "owner":
+                    policy = dataclass_replace(
+                        policy,
+                        artifact_owner=(os.geteuid() + 1, os.getegid()),
+                    )
+                    expected = "not owned by the required uid:gid"
+                elif case_name == "mode":
+                    os.chmod(bpf_object, 0o660)
+                    expected = "group- or other-writable"
+                elif case_name == "hash":
+                    arguments.object_sha256 = "f" * 64
+                    expected = "SHA-256 mismatch"
+                else:
+                    os.link(bpf_object, bpf_object + ".second-link")
+                    expected = "link count must be exactly one"
+                self.assert_gate_error(
+                    expected,
+                    runner.verify_artifacts,
+                    arguments,
+                    policy,
+                )
+
+    def test_child_argv_is_exact_and_descriptor_only(self) -> None:
+        self.assertEqual(
+            runner.child_argv("/proc/self/fd/100", "/proc/self/fd/101"),
+            (
+                "/proc/self/fd/100",
+                "bpf-load-test",
+                "--experimental-faketcp",
+                "--object",
+                "/proc/self/fd/101",
+            ),
+        )
+
+    def test_rename_replacement_cannot_change_verified_execution(self) -> None:
+        staging_root, binary, bpf_object, policy = self.new_layout("fd-rename")
+        original_binary = b"""#!/bin/sh
+test "$#" -eq 4 || exit 71
+test "$1" = bpf-load-test || exit 72
+test "$2" = --experimental-faketcp || exit 73
+test "$3" = --object || exit 74
+IFS= read -r payload < "$4" || exit 75
+test "$payload" = verified-object || exit 76
+exit 0
+"""
+        self.write_file(binary, original_binary, 0o700)
+        self.write_file(bpf_object, b"verified-object\n", 0o600)
+        arguments = self.arguments(staging_root, binary, bpf_object)
+        artifacts = runner.verify_artifacts(arguments, policy)
+        try:
+            self.assertFalse(os.get_inheritable(artifacts.binary_fd))
+            self.assertFalse(os.get_inheritable(artifacts.object_fd))
+            os.rename(binary, binary + ".verified")
+            os.rename(bpf_object, bpf_object + ".verified")
+            self.write_file(binary, b"#!/bin/sh\nexit 88\n", 0o700)
+            self.write_file(bpf_object, b"replacement-object\n", 0o600)
+            for descriptor, expected in (
+                (artifacts.binary_fd, original_binary),
+                (artifacts.object_fd, b"verified-object\n"),
+            ):
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                self.assertEqual(os.read(descriptor, len(expected) + 32), expected)
+                os.lseek(descriptor, 0, os.SEEK_SET)
+                other_descriptor = (
+                    artifacts.object_fd
+                    if descriptor == artifacts.binary_fd
+                    else artifacts.binary_fd
+                )
+                inherited_fd, other_inherited_fd = runner.duplicate_pair_for_exec(
+                    descriptor,
+                    other_descriptor,
+                )
+                try:
+                    self.assertTrue(os.get_inheritable(inherited_fd))
+                    os.lseek(inherited_fd, 0, os.SEEK_SET)
+                    self.assertEqual(os.read(inherited_fd, len(expected) + 32), expected)
+                finally:
+                    os.close(inherited_fd)
+                    os.close(other_inherited_fd)
+            if sys.platform.startswith("linux"):
+                self.assertEqual(runner.execute_verified(artifacts, policy), 0)
+        finally:
+            artifacts.close()
+
+    def test_child_return_code_is_preserved(self) -> None:
+        pid = os.fork()
+        if pid == 0:
+            os._exit(23)
+        self.assertEqual(runner.wait_with_timeout(pid, 1.0, 0.1), 23)
+        if sys.platform.startswith("linux"):
+            staging_root, binary, bpf_object, policy = self.new_layout(
+                "linux-child-rc"
+            )
+            self.write_file(binary, b"#!/bin/sh\nexit 23\n", 0o700)
+            self.write_file(bpf_object, b"object\n", 0o600)
+            artifacts = runner.verify_artifacts(
+                self.arguments(staging_root, binary, bpf_object), policy
+            )
+            try:
+                self.assertEqual(runner.execute_verified(artifacts, policy), 23)
+            finally:
+                artifacts.close()
+
+    def test_wait_retries_eintr_and_preserves_child_status(self) -> None:
+        calls = []
+
+        def fake_waitpid(pid, flags):
+            calls.append((pid, flags))
+            if len(calls) == 1:
+                raise InterruptedError()
+            return pid, 23 << 8
+
+        self.assertEqual(
+            runner.wait_with_timeout(
+                4321,
+                1.0,
+                0.1,
+                waitpid_function=fake_waitpid,
+                monotonic_function=lambda: 0.0,
+                sleep_function=lambda _: None,
+            ),
+            23,
+        )
+        self.assertEqual(len(calls), 2)
+
+    def test_timeout_esrch_echild_race_is_deterministic(self) -> None:
+        wait_calls = []
+        signals = []
+
+        def fake_waitpid(pid, flags):
+            wait_calls.append((pid, flags))
+            if len(wait_calls) == 1:
+                return 0, 0
+            raise ChildProcessError()
+
+        def missing_group(pid, signal_number):
+            signals.append((pid, signal_number))
+            raise ProcessLookupError()
+
+        self.assertEqual(
+            runner.wait_with_timeout(
+                4322,
+                0.0,
+                0.0,
+                waitpid_function=fake_waitpid,
+                killpg_function=missing_group,
+                monotonic_function=lambda: 0.0,
+                sleep_function=lambda _: None,
+            ),
+            124,
+        )
+        self.assertEqual(signals, [(4322, signal.SIGTERM)])
+
+    def test_timeout_term_and_kill_esrch_still_returns_124(self) -> None:
+        nonblocking_calls = 0
+        signals = []
+
+        def fake_waitpid(pid, flags):
+            nonlocal nonblocking_calls
+            if flags == os.WNOHANG:
+                nonblocking_calls += 1
+                return 0, 0
+            raise ChildProcessError()
+
+        def missing_group(pid, signal_number):
+            signals.append((pid, signal_number))
+            raise OSError(errno.ESRCH, "no such process group")
+
+        self.assertEqual(
+            runner.wait_with_timeout(
+                4323,
+                0.0,
+                0.0,
+                waitpid_function=fake_waitpid,
+                killpg_function=missing_group,
+                monotonic_function=lambda: 0.0,
+                sleep_function=lambda _: None,
+            ),
+            124,
+        )
+        self.assertEqual(nonblocking_calls, 2)
+        self.assertEqual(
+            signals,
+            [(4323, signal.SIGTERM), (4323, signal.SIGKILL)],
+        )
+
+    def test_echild_before_deadline_has_stable_internal_rc(self) -> None:
+        self.assertEqual(
+            runner.wait_with_timeout(
+                4324,
+                1.0,
+                0.1,
+                waitpid_function=lambda _pid, _flags: (_ for _ in ()).throw(
+                    ChildProcessError()
+                ),
+                monotonic_function=lambda: 0.0,
+                sleep_function=lambda _: None,
+            ),
+            125,
+        )
+
+    def test_timeout_returns_124(self) -> None:
+        ready_read, ready_write = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(ready_read)
+            os.setsid()
+            os.write(ready_write, b"R")
+            os.close(ready_write)
+            time.sleep(5)
+            os._exit(0)
+        os.close(ready_write)
+        self.assertEqual(os.read(ready_read, 1), b"R")
+        os.close(ready_read)
+        self.assertEqual(runner.wait_with_timeout(pid, 0.1, 0.1), 124)
+        if sys.platform.startswith("linux"):
+            staging_root, binary, bpf_object, policy = self.new_layout(
+                "linux-timeout"
+            )
+            self.write_file(binary, b"#!/bin/sh\n/bin/sleep 5\n", 0o700)
+            self.write_file(bpf_object, b"object\n", 0o600)
+            policy = dataclass_replace(
+                policy,
+                timeout_seconds=0.1,
+                term_grace_seconds=0.1,
+            )
+            artifacts = runner.verify_artifacts(
+                self.arguments(staging_root, binary, bpf_object), policy
+            )
+            try:
+                self.assertEqual(runner.execute_verified(artifacts, policy), 124)
+            finally:
+                artifacts.close()
+
+    def test_timeout_terminates_the_child_process_group(self) -> None:
+        marker = os.path.join(self.evidence_root, "unexpected-grandchild-marker")
+        ready_read, ready_write = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(ready_read)
+            os.setsid()
+            grandchild = os.fork()
+            if grandchild == 0:
+                time.sleep(0.5)
+                with open(marker, "xb") as output:
+                    output.write(b"survived\n")
+                os._exit(0)
+            os.write(ready_write, b"R")
+            os.close(ready_write)
+            time.sleep(5)
+            os._exit(0)
+        os.close(ready_write)
+        self.assertEqual(os.read(ready_read, 1), b"R")
+        os.close(ready_read)
+        self.assertEqual(runner.wait_with_timeout(pid, 0.1, 0.1), 124)
+        time.sleep(0.7)
+        self.assertFalse(os.path.exists(marker))
+
+    def test_runner_source_has_no_mutating_host_operations(self) -> None:
+        source = pathlib.Path(RUNNER_PATH).read_text(encoding="utf-8")
+        self.assertIn("os.setsid()", source)
+        self.assertIn("os.killpg", source)
+        forbidden = (
+            r"\b(?:rm|find|sudo|chroot|nsenter)\b",
+            r"\b(?:bpftool|attach|pin|populate)\b",
+            r"\bmap\s+(?:create|update|delete|freeze)\b",
+            r"\b(?:build|install)\b",
+            r"\bos\.(?:remove|unlink|rename|renames)\b",
+            r"\bshutil\b",
+        )
+        for expression in forbidden:
+            with self.subTest(expression=expression):
+                self.assertIsNone(re.search(expression, source))
+
+
+def dataclass_replace(policy, **changes):
+    return runner.dataclasses.replace(policy, **changes)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
