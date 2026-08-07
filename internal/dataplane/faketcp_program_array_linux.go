@@ -18,6 +18,11 @@ type fakeTCPProgramArray interface {
 	DeleteProgram(uint32) error
 }
 
+type fakeTCPPolicyGenerationLeaseAccess interface {
+	assertHeld(context.Context) error
+	policyGeneration() uint64
+}
+
 type liveFakeTCPProgramArray struct {
 	resource experimentalMapResource
 }
@@ -68,11 +73,11 @@ type fakeTCPProgramArrayStage struct {
 
 func stageFakeTCPEgressProgram(
 	ctx context.Context,
-	transaction *fakeTCPPolicyGenerationTransaction,
+	leaseAccess fakeTCPPolicyGenerationLeaseAccess,
 	programs fakeTCPProgramArray,
 	program experimentalProgramResource,
 ) (*fakeTCPProgramArrayStage, error) {
-	if transaction == nil {
+	if leaseAccess == nil {
 		return nil, fmt.Errorf("stage FakeTCP egress program: %w", errFakeTCPPolicyGenerationLeaseRequired)
 	}
 	if programs == nil {
@@ -81,7 +86,7 @@ func stageFakeTCPEgressProgram(
 	if program == nil {
 		return nil, errors.New("stage FakeTCP egress program: program is nil")
 	}
-	if err := transaction.assertHeld(ctx); err != nil {
+	if err := leaseAccess.assertHeld(ctx); err != nil {
 		return nil, fmt.Errorf("stage FakeTCP egress program: %w", err)
 	}
 	programID, err := program.ID()
@@ -91,7 +96,7 @@ func stageFakeTCPEgressProgram(
 	if programID == 0 {
 		return nil, errors.New("stage FakeTCP egress program: program ID is zero")
 	}
-	slot := uint32(transaction.generation & 1)
+	slot := uint32(leaseAccess.policyGeneration() & 1)
 	actual, err := programs.LookupProgramID(slot)
 	switch {
 	case err == nil:
@@ -114,7 +119,7 @@ func stageFakeTCPEgressProgram(
 	stage := &fakeTCPProgramArrayStage{
 		programs: programs, slot: slot, programID: programID, owned: true,
 	}
-	if err := transaction.assertHeld(ctx); err != nil {
+	if err := leaseAccess.assertHeld(ctx); err != nil {
 		return stage, fmt.Errorf("stage FakeTCP egress program bank %d lost ownership: %w", slot, err)
 	}
 	actual, err = programs.LookupProgramID(slot)
@@ -132,16 +137,16 @@ func stageFakeTCPEgressProgram(
 
 func (stage *fakeTCPProgramArrayStage) Rollback(
 	ctx context.Context,
-	transaction *fakeTCPPolicyGenerationTransaction,
+	leaseAccess fakeTCPPolicyGenerationLeaseAccess,
 ) error {
 	if stage == nil || stage.state == fakeTCPProgramArrayStageRolledBack ||
 		stage.state == fakeTCPProgramArrayStageDisarmed {
 		return nil
 	}
-	if transaction == nil {
+	if leaseAccess == nil {
 		return errFakeTCPPolicyGenerationLeaseRequired
 	}
-	if err := transaction.assertHeld(ctx); err != nil {
+	if err := leaseAccess.assertHeld(ctx); err != nil {
 		return fmt.Errorf("rollback FakeTCP egress program: %w", err)
 	}
 	if !stage.owned {

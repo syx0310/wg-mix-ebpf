@@ -351,38 +351,36 @@ type experimentalFakeTCPRuntimeBuildOptions struct {
 	programArray   fakeTCPProgramArray
 }
 
-// buildExperimentalFakeTCPRuntime takes collection ownership immediately,
-// including on error. The caller retains ownership of transaction only until
-// this function returns; every path closes its retained lifecycle lease.
+// buildExperimentalFakeTCPRuntime transfers ownership of both collection and
+// transaction only after atomically claiming a fresh transaction. Errors
+// before that handoff leave both resources with the caller. Once the claim
+// succeeds, every success or failure path consumes the transaction and closes
+// its retained lifecycle lease; success transfers collection ownership onward
+// to the returned runtime.
 func buildExperimentalFakeTCPRuntime(
 	ctx context.Context,
 	options experimentalFakeTCPRuntimeBuildOptions,
 ) (*ExperimentalFakeTCPRuntime, error) {
 	if ctx == nil {
-		var cleanupErr error
-		if options.collection != nil {
-			cleanupErr = errors.Join(cleanupErr, options.collection.Close())
-		}
-		if options.transaction != nil {
-			cleanupErr = errors.Join(cleanupErr, options.transaction.Close())
-		}
-		return nil, errors.Join(
-			errors.New("build experimental FakeTCP runtime: context is nil"),
-			cleanupErr,
-		)
+		return nil, errors.New("build experimental FakeTCP runtime: context is nil")
 	}
-	cleanupCtx := context.WithoutCancel(ctx)
 	if err := ctx.Err(); err != nil {
-		if options.collection != nil {
-			err = errors.Join(err, options.collection.Close())
-		}
-		if options.transaction != nil {
-			err = errors.Join(err, options.transaction.Close())
-		}
 		return nil, err
 	}
+	if options.transaction == nil {
+		return nil, fmt.Errorf(
+			"build experimental FakeTCP runtime: %w",
+			errFakeTCPPolicyGenerationLeaseRequired,
+		)
+	}
+	claim, err := options.transaction.claimRuntimeBuild(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("build experimental FakeTCP runtime: %w", err)
+	}
+	cleanupCtx := context.WithoutCancel(ctx)
 	build := &experimentalRuntimeBuild{
 		options:    options,
+		claim:      claim,
 		activeCtx:  ctx,
 		cleanupCtx: cleanupCtx,
 	}
@@ -407,6 +405,7 @@ func buildExperimentalFakeTCPRuntime(
 
 type experimentalRuntimeBuild struct {
 	options    experimentalFakeTCPRuntimeBuildOptions
+	claim      *fakeTCPPolicyRuntimeBuildClaim
 	activeCtx  context.Context
 	cleanupCtx context.Context
 
@@ -425,10 +424,10 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if options.collection == nil {
 		return errors.New("build experimental FakeTCP runtime: collection owner is nil")
 	}
-	if options.transaction == nil {
+	if build.claim == nil {
 		return fmt.Errorf("build experimental FakeTCP runtime: %w", errFakeTCPPolicyGenerationLeaseRequired)
 	}
-	if err := options.transaction.assertHeld(build.activeCtx); err != nil {
+	if err := build.claim.assertHeld(build.activeCtx); err != nil {
 		return fmt.Errorf("build experimental FakeTCP runtime: %w", err)
 	}
 	if err := validateFakeTCPPolicySnapshot(options.snapshot); err != nil {
@@ -515,7 +514,7 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		programArray = liveFakeTCPProgramArray{resource: programArrayResource}
 	}
 	build.programStage, err = stageFakeTCPEgressProgram(
-		build.activeCtx, options.transaction, programArray, egressProgram,
+		build.activeCtx, build.claim, programArray, egressProgram,
 	)
 	if err != nil {
 		return build.prepareError(err)
@@ -532,7 +531,7 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if err := build.activeContextError(); err != nil {
 		return err
 	}
-	build.policyStage, err = options.transaction.Stage(
+	build.policyStage, err = build.claim.Stage(
 		build.activeCtx,
 		fakeTCPPolicyMaps{
 			ControlPolicies: controlPolicies, ManagedPorts: managedPorts,
@@ -541,7 +540,7 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		options.snapshot,
 	)
 	if build.policyStage != nil {
-		bindErr := options.transaction.bindStageCollectionOwner(
+		bindErr := build.claim.bindStageCollectionOwner(
 			build.cleanupCtx, build.policyStage, options.collection,
 		)
 		if bindErr != nil {
@@ -566,10 +565,10 @@ func (build *experimentalRuntimeBuild) commit() error {
 	if err := build.programStage.Disarm(); err != nil {
 		return fmt.Errorf("commit FakeTCP egress program stage: %w", err)
 	}
-	if err := build.options.transaction.Disarm(build.cleanupCtx, build.policyStage); err != nil {
+	if err := build.claim.Disarm(build.cleanupCtx, build.policyStage); err != nil {
 		return fmt.Errorf("commit FakeTCP policy stage: %w", err)
 	}
-	if err := build.options.transaction.Close(); err != nil {
+	if err := build.claim.Close(); err != nil {
 		return fmt.Errorf("release FakeTCP generation transaction: %w", err)
 	}
 	return nil
@@ -590,7 +589,7 @@ func (build *experimentalRuntimeBuild) fail(cause error) error {
 	var cleanupErrors []error
 	policyRollbackFailed := false
 	if build.policyStage != nil {
-		if err := build.options.transaction.Rollback(build.cleanupCtx, build.policyStage); err != nil {
+		if err := build.claim.Rollback(build.cleanupCtx, build.policyStage); err != nil {
 			policyRollbackFailed = true
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP policy stage: %w", err))
 		}
@@ -601,7 +600,7 @@ func (build *experimentalRuntimeBuild) fail(cause error) error {
 		}
 	}
 	if build.programStage != nil {
-		if err := build.programStage.Rollback(build.cleanupCtx, build.options.transaction); err != nil {
+		if err := build.programStage.Rollback(build.cleanupCtx, build.claim); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP program array stage: %w", err))
 		}
 	}
@@ -620,14 +619,14 @@ func (build *experimentalRuntimeBuild) fail(cause error) error {
 		cleanupErrors = append(cleanupErrors, fmt.Errorf("close experimental FakeTCP collection: %w", collectionErr))
 	}
 	if policyRollbackFailed && proof != nil {
-		if err := build.options.transaction.releaseStageAfterCollectionClose(
+		if err := build.claim.releaseStageAfterCollectionClose(
 			build.cleanupCtx, build.policyStage, proof,
 		); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("release destroyed FakeTCP policy stage: %w", err))
 		}
 	}
-	if build.options.transaction != nil {
-		if err := build.options.transaction.Close(); err != nil {
+	if build.claim != nil {
+		if err := build.claim.Close(); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("close FakeTCP generation transaction: %w", err))
 		}
 	}
