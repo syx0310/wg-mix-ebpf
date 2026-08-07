@@ -1016,7 +1016,7 @@ func TestTCAttachExecuteReturnsRollbackOwnerForDurableJournalHandoff(t *testing.
 		t.Fatalf("retained egress program=%d, want desired 32", got)
 	}
 
-	if err := handoff.Transfer(retained); err != nil {
+	if err := transferRetainedStage(handoff, retained); err != nil {
 		t.Fatalf("transfer retained stage: %v", err)
 	}
 	if retained.hasLiveFilterOwnership() || !retained.done || plan.stage != nil {
@@ -1050,6 +1050,20 @@ type retainedJournalHandoffFixture struct {
 	stage   *tcAttachStage
 	kernel  *fakeTCKernel
 	attach  error
+}
+
+func transferRetainedStage(
+	handoff *durableTCOwnerJournalHandoff,
+	stage *tcAttachStage,
+) error {
+	transferred, err := handoff.Transfer(stage)
+	if err != nil {
+		return err
+	}
+	if !transferred {
+		return errors.New("TC owner journal transfer returned no owner")
+	}
+	return nil
 }
 
 func newRetainedJournalHandoffFixture(
@@ -1176,6 +1190,7 @@ func TestFailedOwnerApplyProductionBoundaryResolvesFreshHandoffFaults(
 		wantErr := errors.New("injected owner program load failure")
 		stage := fixture.owner.intent.ProgramStages[0]
 		fixture.owner.programLoadErrors[stage.FileName] = wantErr
+		fixture.owner.programLoadErrors[stage.FileName+".handoff"] = wantErr
 		assertFailedOwnerApplyResolvedByProduction(t, fixture, wantErr)
 	})
 
@@ -1229,6 +1244,163 @@ func TestLinuxLoaderApplyReturnBoundaryOwnsFreshHandoffFailure(t *testing.T) {
 			fixture.plan.closed,
 		)
 	}
+	if fixture.owner.handle.targetFD != -1 ||
+		fixture.owner.store.root != nil {
+		t.Fatal("Apply return did not close its owner handle/store")
+	}
+	fixture.owner.assertProgramObservationsBalanced(t)
+}
+
+func TestDurableTCOwnerJournalHandoffTerminalLifecycle(t *testing.T) {
+	t.Run("successful Apply return releases proof observations once", func(t *testing.T) {
+		owner := newDurableTCOwnerJournalFixture(t)
+		handoff, err := prepareDurableTCOwnerJournalHandoff(
+			owner.handle,
+			owner.store,
+			owner.intent,
+			owner.active,
+			owner.desired,
+			owner.plan,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		opens, closes := owner.programObservationCounts()
+		if opens <= closes {
+			t.Fatalf("prepared handoff has no retained proof: opens=%d closes=%d", opens, closes)
+		}
+		if err := handoff.Close(); err != nil {
+			t.Fatal(err)
+		}
+		owner.assertProgramObservationsBalanced(t)
+		opens, closes = owner.programObservationCounts()
+		if err := handoff.Close(); err != nil {
+			t.Fatalf("second handoff close: %v", err)
+		}
+		afterOpens, afterCloses := owner.programObservationCounts()
+		if opens != afterOpens || closes != afterCloses {
+			t.Fatalf(
+				"second close touched observations: before=%d/%d after=%d/%d",
+				opens,
+				closes,
+				afterOpens,
+				afterCloses,
+			)
+		}
+	})
+
+	t.Run("nil stage early return releases proof observations", func(t *testing.T) {
+		owner := newDurableTCOwnerJournalFixture(t)
+		handoff, err := prepareDurableTCOwnerJournalHandoff(
+			owner.handle,
+			owner.store,
+			owner.intent,
+			owner.active,
+			owner.desired,
+			owner.plan,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		_ = resolveFailedOwnerApply(
+			owner.handle,
+			owner.store,
+			owner.intent,
+			handoff,
+			nil,
+			owner.kernel.runtime(),
+		)
+		owner.assertProgramObservationsBalanced(t)
+	})
+
+	t.Run("verified rollback cleanup error releases proof observations", func(t *testing.T) {
+		fixture := newRetainedJournalHandoffFixture(t)
+		fixture.kernel.failWrite = 0
+		if err := fixture.stage.Close(); err != nil {
+			t.Fatal(err)
+		}
+		err := resolveFailedOwnerApply(
+			fixture.owner.handle,
+			fixture.owner.store,
+			fixture.owner.intent,
+			fixture.handoff,
+			fixture.stage,
+			fixture.kernel.runtime(),
+		)
+		if err == nil || !strings.Contains(err.Error(), "clock") {
+			t.Fatalf("verified rollback cleanup error=%v", err)
+		}
+		fixture.owner.assertProgramObservationsBalanced(t)
+	})
+
+	t.Run("successful local rollback releases proof observations", func(t *testing.T) {
+		fixture := newRetainedJournalHandoffFixture(t)
+		wantErr := errors.New("injected handoff validation failure")
+		fixture.owner.mapStore.loadErrors["control_map"] = wantErr
+		fixture.kernel.failWrite = 0
+		err := resolveFailedOwnerApply(
+			fixture.owner.handle,
+			fixture.owner.store,
+			fixture.owner.intent,
+			fixture.handoff,
+			fixture.stage,
+			fixture.kernel.runtime(),
+		)
+		if !errors.Is(err, wantErr) || !fixture.stage.done {
+			t.Fatalf("local rollback error=%v done=%t", err, fixture.stage.done)
+		}
+		fixture.owner.assertProgramObservationsBalanced(t)
+	})
+
+	t.Run("durable transfer releases proof observations", func(t *testing.T) {
+		fixture := newRetainedJournalHandoffFixture(t)
+		_ = resolveFailedOwnerApply(
+			fixture.owner.handle,
+			fixture.owner.store,
+			fixture.owner.intent,
+			fixture.handoff,
+			fixture.stage,
+			fixture.kernel.runtime(),
+		)
+		if !fixture.stage.done || fixture.plan.stage != nil {
+			t.Fatal("durable transfer did not consume the retained stage")
+		}
+		fixture.owner.assertProgramObservationsBalanced(t)
+	})
+
+	t.Run("close report does not undo transfer or close twice", func(t *testing.T) {
+		fixture := newRetainedJournalHandoffFixture(t)
+		stageName := fixture.owner.intent.ProgramStages[0].FileName
+		wantErr := errors.New("injected pinned-program close report")
+		// Transfer performs one fresh validation observation before releasing
+		// the independently retained proof observation.
+		fixture.owner.programCloseErrors[stageName] = []error{nil, wantErr}
+		transferred, err := fixture.handoff.Transfer(fixture.stage)
+		if !transferred || !errors.Is(err, wantErr) {
+			t.Fatalf("transfer=%t close report=%v", transferred, err)
+		}
+		if !fixture.stage.done || fixture.plan.stage != nil {
+			t.Fatal("close report reverted durable ownership")
+		}
+		fixture.owner.assertProgramObservationsBalanced(t)
+		opens, closes := fixture.owner.programObservationCounts()
+		if err := fixture.handoff.Close(); err != nil {
+			t.Fatalf("close transferred handoff: %v", err)
+		}
+		afterOpens, afterCloses := fixture.owner.programObservationCounts()
+		if opens != afterOpens || closes != afterCloses {
+			t.Fatalf(
+				"post-transfer Close touched observations: before=%d/%d after=%d/%d",
+				opens,
+				closes,
+				afterOpens,
+				afterCloses,
+			)
+		}
+		if err := fixture.plan.Close(); err != nil {
+			t.Fatal(err)
+		}
+	})
 }
 
 func TestFailedOwnerApplyUsesDurableHandoffProgramAcrossRestart(
@@ -1305,37 +1477,296 @@ func TestFailedOwnerApplyUsesDurableHandoffProgramAcrossRestart(
 	}
 }
 
-func TestFailedOwnerApplyRetainsStageWhenTransferAndCloseBothFail(t *testing.T) {
-	fixture := newRetainedJournalHandoffFixture(t)
-	wantErr := errors.New("injected persistent map validation failure")
-	fixture.owner.mapStore.loadErrors["control_map"] = wantErr
-	fixture.kernel.failWrite = len(fixture.kernel.writes) + 1
-	err := resolveFailedOwnerApply(
-		fixture.owner.handle,
-		fixture.owner.store,
-		fixture.owner.intent,
-		fixture.handoff,
-		fixture.stage,
-		fixture.kernel.runtime(),
-	)
-	if !errors.Is(err, wantErr) || !fixture.stage.hasLiveFilterOwnership() {
-		t.Fatalf("long-term owner error=%v live=%t", err, fixture.stage.hasLiveFilterOwnership())
+func TestDurableHandoffRecoversTCButPreservesSuspiciousPrimary(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*testing.T, *durableTCOwnerJournalFixture, pinOwnerProgramStage)
+	}{
+		{
+			name: "wrong program ID",
+			mutate: func(
+				t *testing.T,
+				owner *durableTCOwnerJournalFixture,
+				stage pinOwnerProgramStage,
+			) {
+				t.Helper()
+				owner.programIDs[stage.FileName] = stage.ProgramID + 1000
+			},
+		},
+		{
+			name: "wrong mode",
+			mutate: func(
+				t *testing.T,
+				owner *durableTCOwnerJournalFixture,
+				stage pinOwnerProgramStage,
+			) {
+				t.Helper()
+				if err := os.Chmod(
+					filepath.Join(owner.handle.pinPath, stage.FileName),
+					0o640,
+				); err != nil {
+					t.Fatal(err)
+				}
+			},
+		},
 	}
 
-	// The next real Apply/Detach invokes this exact gate while holding the
-	// resource lock. The journal was independently pinned before mutation, so
-	// it can consume the retained stage even though the first local Close also
-	// failed.
-	delete(fixture.owner.mapStore.loadErrors, "control_map")
-	fixture.kernel.failWrite = 0
-	if err := retryRetainedTCRollbackOwner(
-		fixture.owner.intent.ResourceKey,
-	); err != nil {
-		t.Fatalf("retry process-lifetime TC owner: %v", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRetainedJournalHandoffFixture(t)
+			stage := fixture.owner.intent.ProgramStages[0]
+			test.mutate(t, fixture.owner, stage)
+			var suspiciousBefore unix.Stat_t
+			if err := unix.Fstatat(
+				fixture.owner.handle.targetFD,
+				stage.FileName,
+				&suspiciousBefore,
+				unix.AT_SYMLINK_NOFOLLOW,
+			); err != nil {
+				t.Fatal(err)
+			}
+			wrongID := fixture.owner.programIDs[stage.FileName]
+
+			err := resolveFailedOwnerApply(
+				fixture.owner.handle,
+				fixture.owner.store,
+				fixture.owner.intent,
+				fixture.handoff,
+				fixture.stage,
+				fixture.kernel.runtime(),
+			)
+			if err == nil || !fixture.stage.done || fixture.plan.stage != nil {
+				t.Fatalf("durable handoff transfer error=%v done=%t", err, fixture.stage.done)
+			}
+			fixture.owner.assertProgramObservationsBalanced(t)
+
+			if err := fixture.owner.store.Close(); err != nil {
+				t.Fatal(err)
+			}
+			restarted, err := openPinOwnerStore(
+				fixture.owner.handle.runtime,
+				fixture.owner.handle.resource,
+				true,
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer restarted.Close()
+			persisted, err := restarted.Load(fixture.owner.handle.mountID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			fixture.owner.handle.runtime.now = func() time.Time {
+				return time.Date(2026, 8, 8, 1, 2, 8, 0, time.UTC)
+			}
+			_, recoverErr := recoverPinOwnerTransaction(
+				fixture.owner.handle,
+				restarted,
+				persisted,
+				fixture.kernel.runtime(),
+			)
+			if recoverErr == nil {
+				t.Fatal("recovery removed or replaced a suspicious primary stage")
+			}
+			for index, slot := range canonicalTCFilterSlots() {
+				wantID := uint32(31 + index)
+				if got := fixture.kernel.managedProgramID(t, 11, slot); got != wantID {
+					t.Fatalf("recovered %s program=%d want=%d", slot.name, got, wantID)
+				}
+			}
+			cleanup, err := restarted.Load(fixture.owner.handle.mountID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cleanup.Phase != pinOwnerPhaseApplying ||
+				cleanup.Step != pinOwnerStepCleanup {
+				t.Fatalf("diagnostic owner journal=%s/%s", cleanup.Phase, cleanup.Step)
+			}
+			if err := validatePinnedProgramAt(
+				fixture.owner.handle,
+				stage.FileName+".handoff",
+				stage.ProgramID,
+			); err != nil {
+				t.Fatalf("durable handoff evidence was removed: %v", err)
+			}
+			var suspiciousAfter unix.Stat_t
+			if err := unix.Fstatat(
+				fixture.owner.handle.targetFD,
+				stage.FileName,
+				&suspiciousAfter,
+				unix.AT_SYMLINK_NOFOLLOW,
+			); err != nil {
+				t.Fatal(err)
+			}
+			if suspiciousAfter.Ino != suspiciousBefore.Ino ||
+				suspiciousAfter.Mode != suspiciousBefore.Mode ||
+				suspiciousAfter.Size != suspiciousBefore.Size ||
+				fixture.owner.programIDs[stage.FileName] != wrongID {
+				t.Fatalf(
+					"suspicious primary changed: before=%+v after=%+v id=%d want=%d",
+					suspiciousBefore,
+					suspiciousAfter,
+					fixture.owner.programIDs[stage.FileName],
+					wrongID,
+				)
+			}
+
+			// A future operation sees the same durable diagnostic and remains
+			// fail-closed until an operator resolves the foreign primary.
+			if _, err := recoverPinOwnerTransaction(
+				fixture.owner.handle,
+				restarted,
+				cleanup,
+				fixture.kernel.runtime(),
+			); err == nil {
+				t.Fatal("subsequent recovery accepted the suspicious primary")
+			}
+		})
 	}
-	if fixture.stage.hasLiveFilterOwnership() || !fixture.stage.done ||
-		fixture.plan.stage != nil {
-		t.Fatal("process-lifetime owner did not converge to the durable journal")
+}
+
+func TestFailedOwnerApplyRebindsRetainedStageFromNextOperation(t *testing.T) {
+	tests := []struct {
+		name   string
+		action string
+		mode   string
+	}{
+		{name: "apply", action: "apply", mode: "journal"},
+		{name: "detach", action: "detach", mode: "journal"},
+		{name: "apply close report", action: "apply", mode: "close-report"},
+		{name: "apply local rollback report", action: "apply", mode: "local-rollback"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRetainedJournalHandoffFixture(t)
+			resourceKey := fixture.owner.intent.ResourceKey
+			t.Cleanup(func() {
+				retainedTCRollbackOwners.Lock()
+				delete(retainedTCRollbackOwners.byResource, resourceKey)
+				retainedTCRollbackOwners.Unlock()
+			})
+
+			wantErr := errors.New("injected persistent map validation failure")
+			fixture.owner.mapStore.loadErrors["control_map"] = wantErr
+			fixture.kernel.failWrite = len(fixture.kernel.writes) + 1
+			pinPath := fixture.owner.handle.pinPath
+			oldHandle := fixture.owner.handle
+			oldStore := fixture.owner.store
+			runtime := oldHandle.runtime
+			runtime.ownerApplyFailure = func() (*ownerApplyFailureBoundary, error) {
+				return &ownerApplyFailureBoundary{
+					plan:      fixture.plan,
+					handle:    oldHandle,
+					store:     oldStore,
+					record:    fixture.owner.intent,
+					handoff:   fixture.handoff,
+					stage:     fixture.stage,
+					tcRuntime: fixture.kernel.runtime(),
+					attachErr: fixture.attach,
+				}, nil
+			}
+			loader := LinuxLoader{PinPath: pinPath, runtime: &runtime}
+			firstErr := loader.Apply(context.Background(), nil)
+			if !errors.Is(firstErr, wantErr) ||
+				!errors.Is(firstErr, fixture.attach) ||
+				!fixture.stage.hasLiveFilterOwnership() {
+				t.Fatalf(
+					"first Apply error=%v live=%t",
+					firstErr,
+					fixture.stage.hasLiveFilterOwnership(),
+				)
+			}
+			if oldHandle.targetFD != -1 || oldHandle.parentPath != nil ||
+				oldStore.root != nil {
+				t.Fatal("first Apply retained its closed handle/store in process state")
+			}
+			fixture.owner.assertProgramObservationsBalanced(t)
+
+			if test.mode != "local-rollback" {
+				delete(fixture.owner.mapStore.loadErrors, "control_map")
+			}
+			runtime.ownerApplyFailure = nil
+			runtime.ownerRetryOnly = func(got string) bool { return got == test.action }
+			closeReport := errors.New("injected rebound proof close report")
+			if test.mode == "close-report" {
+				stageName := fixture.owner.intent.ProgramStages[0].FileName
+				baseLoad := runtime.loadPinnedProgram
+				loads := 0
+				runtime.loadPinnedProgram = func(path string) (*pinnedProgramObservation, error) {
+					observation, err := baseLoad(path)
+					if err != nil || filepath.Base(path) != stageName {
+						return observation, err
+					}
+					loads++
+					// Rebind validates once, validates again before retaining,
+					// then opens the independent observation released by Transfer.
+					if loads == 3 {
+						baseClose := observation.close
+						observation.close = func() error {
+							return errors.Join(baseClose(), closeReport)
+						}
+					}
+					return observation, nil
+				}
+			}
+			// If the fresh journal rebind is skipped, the remaining local rollback
+			// still fails at its first write.
+			writesBeforeRetry := len(fixture.kernel.writes)
+			if test.mode == "local-rollback" {
+				fixture.kernel.failWrite = 0
+			} else {
+				fixture.kernel.failWrite = writesBeforeRetry + 1
+			}
+			var retryErr error
+			if test.action == "apply" {
+				retryErr = loader.Apply(context.Background(), nil)
+			} else {
+				retryErr = loader.Detach(context.Background(), nil)
+			}
+			switch test.mode {
+			case "journal":
+				if retryErr != nil {
+					t.Fatalf("fresh %s owner retry: %v", test.action, retryErr)
+				}
+			case "close-report":
+				if !errors.Is(retryErr, closeReport) {
+					t.Fatalf("fresh transfer close report=%v", retryErr)
+				}
+			case "local-rollback":
+				if !errors.Is(retryErr, wantErr) {
+					t.Fatalf("converged local rollback report=%v", retryErr)
+				}
+			}
+			if test.mode != "local-rollback" &&
+				len(fixture.kernel.writes) != writesBeforeRetry {
+				t.Fatalf(
+					"fresh journal retry attempted local TC rollback: writes=%v",
+					fixture.kernel.writes[writesBeforeRetry:],
+				)
+			}
+			if fixture.stage.hasLiveFilterOwnership() || !fixture.stage.done ||
+				fixture.plan.stage != nil || !fixture.plan.closed {
+				t.Fatalf(
+					"fresh owner did not converge: live=%t done=%t plan-stage=%p closed=%t",
+					fixture.stage.hasLiveFilterOwnership(),
+					fixture.stage.done,
+					fixture.plan.stage,
+					fixture.plan.closed,
+				)
+			}
+			fixture.owner.assertProgramObservationsBalanced(t)
+
+			// The same real operation gate remains usable after the retained owner
+			// is drained.
+			if test.action == "apply" {
+				retryErr = loader.Apply(context.Background(), nil)
+			} else {
+				retryErr = loader.Detach(context.Background(), nil)
+			}
+			if retryErr != nil {
+				t.Fatalf("drained %s owner gate: %v", test.action, retryErr)
+			}
+		})
 	}
 }
 
@@ -1343,11 +1774,11 @@ func TestDurableTCOwnerJournalHandoffIsExactAndOneShot(t *testing.T) {
 	t.Run("wrong plan does not consume capability", func(t *testing.T) {
 		first := newRetainedJournalHandoffFixture(t)
 		second := newRetainedJournalHandoffFixture(t)
-		if err := first.handoff.Transfer(second.stage); err == nil ||
+		if err := transferRetainedStage(first.handoff, second.stage); err == nil ||
 			!strings.Contains(err.Error(), "exact stage") {
 			t.Fatalf("wrong-plan transfer error = %v", err)
 		}
-		if err := first.handoff.Transfer(first.stage); err != nil {
+		if err := transferRetainedStage(first.handoff, first.stage); err != nil {
 			t.Fatalf("exact transfer after wrong plan: %v", err)
 		}
 		if err := second.stage.Close(); err != nil {
@@ -1362,12 +1793,12 @@ func TestDurableTCOwnerJournalHandoffIsExactAndOneShot(t *testing.T) {
 		}
 		original := fixture.stage.applied[0].program
 		fixture.stage.applied[0].program.id++
-		if err := fixture.handoff.Transfer(fixture.stage); err == nil ||
+		if err := transferRetainedStage(fixture.handoff, fixture.stage); err == nil ||
 			!strings.Contains(err.Error(), "outside journal desired") {
 			t.Fatalf("coverage mismatch transfer error = %v", err)
 		}
 		fixture.stage.applied[0].program = original
-		if err := fixture.handoff.Transfer(fixture.stage); err != nil {
+		if err := transferRetainedStage(fixture.handoff, fixture.stage); err != nil {
 			t.Fatalf("exact transfer after coverage mismatch: %v", err)
 		}
 	})
@@ -1387,7 +1818,7 @@ func TestDurableTCOwnerJournalHandoffIsExactAndOneShot(t *testing.T) {
 		); err != nil {
 			t.Fatal(err)
 		}
-		if err := fixture.handoff.Transfer(fixture.stage); err == nil ||
+		if err := transferRetainedStage(fixture.handoff, fixture.stage); err == nil ||
 			!strings.Contains(err.Error(), "stale") {
 			t.Fatalf("stale transfer error = %v", err)
 		}
@@ -1399,12 +1830,12 @@ func TestDurableTCOwnerJournalHandoffIsExactAndOneShot(t *testing.T) {
 	t.Run("mount binding change is rejected", func(t *testing.T) {
 		fixture := newRetainedJournalHandoffFixture(t)
 		fixture.handoff.mountID++
-		if err := fixture.handoff.Transfer(fixture.stage); err == nil ||
+		if err := transferRetainedStage(fixture.handoff, fixture.stage); err == nil ||
 			!strings.Contains(err.Error(), "mount binding changed") {
 			t.Fatalf("mount binding transfer error = %v", err)
 		}
 		fixture.handoff.mountID--
-		if err := fixture.handoff.Transfer(fixture.stage); err != nil {
+		if err := transferRetainedStage(fixture.handoff, fixture.stage); err != nil {
 			t.Fatalf("exact transfer after mount mismatch: %v", err)
 		}
 	})
@@ -1414,16 +1845,16 @@ func TestDurableTCOwnerJournalHandoffIsExactAndOneShot(t *testing.T) {
 		if err := resolved.stage.Close(); err != nil {
 			t.Fatal(err)
 		}
-		if err := resolved.handoff.Transfer(resolved.stage); err == nil ||
+		if err := transferRetainedStage(resolved.handoff, resolved.stage); err == nil ||
 			!strings.Contains(err.Error(), "already resolved") {
 			t.Fatalf("resolved stage transfer error = %v", err)
 		}
 
 		doubled := newRetainedJournalHandoffFixture(t)
-		if err := doubled.handoff.Transfer(doubled.stage); err != nil {
+		if err := transferRetainedStage(doubled.handoff, doubled.stage); err != nil {
 			t.Fatal(err)
 		}
-		if err := doubled.handoff.Transfer(doubled.stage); err == nil ||
+		if err := transferRetainedStage(doubled.handoff, doubled.stage); err == nil ||
 			!strings.Contains(err.Error(), "already transferred") {
 			t.Fatalf("double transfer error = %v", err)
 		}
@@ -1439,7 +1870,7 @@ func TestDurableTCOwnerJournalHandoffIsExactAndOneShot(t *testing.T) {
 		go func() {
 			defer wait.Done()
 			<-start
-			transferErr = fixture.handoff.Transfer(fixture.stage)
+			transferErr = transferRetainedStage(fixture.handoff, fixture.stage)
 		}()
 		go func() {
 			defer wait.Done()

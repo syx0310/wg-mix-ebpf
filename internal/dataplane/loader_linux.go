@@ -87,6 +87,7 @@ type pinPathRuntime struct {
 	beforePinQuarantine  func(string) error
 	beforePinUnlink      func(string) error
 	ownerApplyFailure    func() (*ownerApplyFailureBoundary, error)
+	ownerRetryOnly       func(string) bool
 }
 
 type pinnedProgramObservation struct {
@@ -337,20 +338,32 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 	runtime := l.pinRuntime(ctx)
+	pinPath := pinPathFromEnv(l.PinPath)
 	if runtime.ownerApplyFailure != nil {
 		boundary, err := runtime.ownerApplyFailure()
 		if err != nil {
 			return err
 		}
-		if boundary == nil || boundary.plan == nil {
+		if boundary == nil || boundary.plan == nil || boundary.handoff == nil ||
+			boundary.store == nil || boundary.handle == nil {
 			return errors.New("owner apply failure boundary is incomplete")
 		}
 		defer func() {
 			returnErr = errors.Join(returnErr, boundary.plan.Close())
+			returnErr = errors.Join(returnErr, boundary.handoff.Close())
+			returnErr = errors.Join(returnErr, boundary.store.Close())
+			returnErr = errors.Join(returnErr, boundary.handle.Close())
 		}()
 		return boundary.Resolve()
 	}
-	pinPath := pinPathFromEnv(l.PinPath)
+	if runtime.ownerRetryOnly != nil && runtime.ownerRetryOnly("apply") {
+		return retryRetainedTCRollbackWithFreshOwner(
+			ctx,
+			pinPath,
+			runtime,
+			"apply",
+		)
+	}
 	validated, err := validatePinPath(pinPath, runtime.validator)
 	if err != nil {
 		return err
@@ -383,13 +396,6 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return fmt.Errorf("serialize BPF pin path %s: %w", pinPath, err)
 	}
 	defer lock.Close()
-	if err := retryRetainedTCRollbackOwner(parent.resource.key); err != nil {
-		return fmt.Errorf(
-			"resolve retained TC rollback before applying %s: %w",
-			pinPath,
-			err,
-		)
-	}
 
 	validated, err = validatePinPath(pinPath, runtime.validator)
 	if err != nil {
@@ -435,6 +441,17 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 	defer store.Close()
+	if err := retryRetainedTCRollbackOwner(
+		parent.resource.key,
+		handle,
+		store,
+	); err != nil {
+		return fmt.Errorf(
+			"resolve retained TC rollback before applying %s: %w",
+			pinPath,
+			err,
+		)
+	}
 	ownerRecord, ownerExists, err := store.LoadOptional(handle.mountID)
 	if err != nil {
 		return fmt.Errorf("load persistent BPF pin owner: %w", err)
@@ -842,6 +859,9 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if err != nil {
 		return fmt.Errorf("prove durable TC owner journal handoff: %w", err)
 	}
+	defer func() {
+		returnErr = errors.Join(returnErr, handoff.Close())
+	}()
 	retainedTC, attachErr := attachPlan.Execute(func() error {
 		return commitControl(coll, snapshot.Control[abi.ControlKeyGlobal])
 	})
@@ -914,6 +934,14 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 	}
 	runtime := l.pinRuntime(ctx)
 	pinPath := pinPathFromEnv(l.PinPath)
+	if runtime.ownerRetryOnly != nil && runtime.ownerRetryOnly("detach") {
+		return retryRetainedTCRollbackWithFreshOwner(
+			ctx,
+			pinPath,
+			runtime,
+			"detach",
+		)
+	}
 	validated, err := validatePinPath(pinPath, runtime.validator)
 	if err != nil {
 		return err
@@ -929,13 +957,6 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 		return fmt.Errorf("serialize BPF pin path %s: %w", pinPath, err)
 	}
 	defer lock.Close()
-	if err := retryRetainedTCRollbackOwner(parent.resource.key); err != nil {
-		return fmt.Errorf(
-			"resolve retained TC rollback before detaching %s: %w",
-			pinPath,
-			err,
-		)
-	}
 
 	validated, err = validatePinPath(pinPath, runtime.validator)
 	if err != nil {
@@ -946,6 +967,17 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 		return err
 	}
 	if handle == nil {
+		if err := retryRetainedTCRollbackOwner(
+			parent.resource.key,
+			nil,
+			nil,
+		); err != nil {
+			return fmt.Errorf(
+				"resolve retained TC rollback before detaching missing %s: %w",
+				pinPath,
+				err,
+			)
+		}
 		return ensureMissingPinDirectoryHasNoActiveOwnership(
 			runtime,
 			parent,
@@ -957,6 +989,17 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 		return fmt.Errorf("open persistent BPF pin owner: %w", err)
 	}
 	defer store.Close()
+	if err := retryRetainedTCRollbackOwner(
+		parent.resource.key,
+		handle,
+		store,
+	); err != nil {
+		return fmt.Errorf(
+			"resolve retained TC rollback before detaching %s: %w",
+			pinPath,
+			err,
+		)
+	}
 	record, exists, err := store.LoadOptional(handle.mountID)
 	if err != nil {
 		return err
@@ -1190,6 +1233,49 @@ func (l LinuxLoader) pinRuntime(ctx context.Context) pinPathRuntime {
 		runtime.bpffsRootMode = 0o700
 	}
 	return runtime
+}
+
+// retryRetainedTCRollbackWithFreshOwner is the narrow operation gate used by
+// a subsequent Apply or Detach. It acquires the resource lock and reopens every
+// owner object; no handle or store from the failed Apply is reused.
+func retryRetainedTCRollbackWithFreshOwner(
+	ctx context.Context,
+	pinPath string,
+	runtime pinPathRuntime,
+	action string,
+) error {
+	validated, err := validatePinPath(pinPath, runtime.validator)
+	if err != nil {
+		return err
+	}
+	parent, err := openPinPathParent(pinPath, validated, runtime)
+	if err != nil {
+		return err
+	}
+	defer parent.Close()
+	lock, err := acquirePinPathLock(ctx, parent.resource, action+"-owner-retry", runtime)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	validated, err = validatePinPath(pinPath, runtime.validator)
+	if err != nil {
+		return err
+	}
+	handle, _, err := openPinPathHandleFromParent(parent, validated, false)
+	if err != nil {
+		return err
+	}
+	if handle == nil {
+		return retryRetainedTCRollbackOwner(parent.resource.key, nil, nil)
+	}
+	defer handle.Close()
+	store, err := openPinOwnerStore(runtime, handle.resource, false)
+	if err != nil {
+		return err
+	}
+	defer store.Close()
+	return retryRetainedTCRollbackOwner(parent.resource.key, handle, store)
 }
 
 func acquirePinPathLock(

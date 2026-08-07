@@ -37,7 +37,27 @@ type durableTCOwnerJournalHandoff struct {
 	sequence    uint64
 	coverage    [sha256.Size]byte
 	programs    map[string]*pinnedProgramObservation
-	transferred bool
+	state       durableTCOwnerJournalHandoffState
+}
+
+type durableTCOwnerJournalHandoffState uint8
+
+const (
+	durableTCOwnerJournalHandoffPrepared durableTCOwnerJournalHandoffState = iota + 1
+	durableTCOwnerJournalHandoffTransferred
+	durableTCOwnerJournalHandoffReleased
+	durableTCOwnerJournalHandoffExported
+)
+
+// durableTCOwnerJournalBinding is the handle/store-independent capability
+// retained across an Apply return. The next operation must bind it to freshly
+// opened owner resources before it can transfer a stage.
+type durableTCOwnerJournalBinding struct {
+	plan        *tcAttachPlan
+	intent      *pinOwnerRecord
+	resourceKey string
+	sequence    uint64
+	coverage    [sha256.Size]byte
 }
 
 type tcOwnerJournalCoverageSummary struct {
@@ -201,6 +221,7 @@ func prepareDurableTCOwnerJournalHandoff(
 	handoff.plan = plan
 	handoff.mountID = handle.mountID
 	handoff.programs = programs
+	handoff.state = durableTCOwnerJournalHandoffPrepared
 	return handoff, nil
 }
 
@@ -338,7 +359,13 @@ func (handoff *durableTCOwnerJournalHandoff) repairMissingProgramStages() error 
 	return nil
 }
 
-func (handoff *durableTCOwnerJournalHandoff) closeProgramsLocked() error {
+func (handoff *durableTCOwnerJournalHandoff) releaseProgramsLocked(
+	next durableTCOwnerJournalHandoffState,
+) error {
+	if handoff.state != durableTCOwnerJournalHandoffPrepared {
+		return nil
+	}
+	handoff.state = next
 	var errs []error
 	for name, observation := range handoff.programs {
 		if err := observation.Close(); err != nil {
@@ -346,6 +373,8 @@ func (handoff *durableTCOwnerJournalHandoff) closeProgramsLocked() error {
 		}
 	}
 	handoff.programs = nil
+	handoff.handle = nil
+	handoff.store = nil
 	return errors.Join(errs...)
 }
 
@@ -355,7 +384,118 @@ func (handoff *durableTCOwnerJournalHandoff) Close() error {
 	}
 	handoff.mu.Lock()
 	defer handoff.mu.Unlock()
-	return handoff.closeProgramsLocked()
+	if handoff.state == 0 && len(handoff.programs) == 0 {
+		handoff.state = durableTCOwnerJournalHandoffReleased
+		return nil
+	}
+	return handoff.releaseProgramsLocked(durableTCOwnerJournalHandoffReleased)
+}
+
+func (handoff *durableTCOwnerJournalHandoff) exportRetryBinding(
+	stage *tcAttachStage,
+) (*durableTCOwnerJournalBinding, error, error) {
+	if handoff == nil || stage == nil {
+		return nil, nil, errors.New("TC owner journal retry export is incomplete")
+	}
+	handoff.mu.Lock()
+	defer handoff.mu.Unlock()
+	if handoff.state != durableTCOwnerJournalHandoffPrepared {
+		return nil, nil, errors.New("TC owner journal handoff is not prepared")
+	}
+	stage.mu.Lock()
+	defer stage.mu.Unlock()
+	if stage.done || stage.plan != handoff.plan || handoff.plan.stage != stage {
+		return nil, nil, errors.New("TC owner journal retry export does not own the exact retained stage")
+	}
+	binding := &durableTCOwnerJournalBinding{
+		plan:        handoff.plan,
+		intent:      clonePinOwnerRecord(handoff.intent),
+		resourceKey: handoff.resourceKey,
+		sequence:    handoff.sequence,
+		coverage:    handoff.coverage,
+	}
+	closeReport := handoff.releaseProgramsLocked(
+		durableTCOwnerJournalHandoffExported,
+	)
+	return binding, closeReport, nil
+}
+
+func rebindDurableTCOwnerJournalHandoff(
+	binding *durableTCOwnerJournalBinding,
+	handle *pinPathHandle,
+	store *pinOwnerStore,
+) (*durableTCOwnerJournalHandoff, error) {
+	if binding == nil || binding.plan == nil || binding.intent == nil ||
+		handle == nil || store == nil {
+		return nil, errors.New("TC owner journal retry rebind is incomplete")
+	}
+	if binding.resourceKey == "" || handle.mountID == 0 ||
+		handle.resource.key != binding.resourceKey ||
+		store.resource.key != binding.resourceKey {
+		return nil, errors.New("TC owner journal retry rebind resource changed")
+	}
+	handoff := &durableTCOwnerJournalHandoff{
+		handle:      handle,
+		store:       store,
+		plan:        binding.plan,
+		intent:      clonePinOwnerRecord(binding.intent),
+		resourceKey: binding.resourceKey,
+		mountID:     handle.mountID,
+		sequence:    binding.sequence,
+		coverage:    binding.coverage,
+	}
+	if err := handoff.validateFreshCoverage(); err != nil {
+		return nil, err
+	}
+	programs, err := retainTCOwnerRecoveryPrograms(handle, binding.intent)
+	if err != nil {
+		return nil, err
+	}
+	handoff.programs = programs
+	handoff.state = durableTCOwnerJournalHandoffPrepared
+	return handoff, nil
+}
+
+func retainTCOwnerRecoveryPrograms(
+	handle *pinPathHandle,
+	record *pinOwnerRecord,
+) (map[string]*pinnedProgramObservation, error) {
+	programs := make(map[string]*pinnedProgramObservation, len(record.ProgramStages))
+	closeOnError := func(err error) (map[string]*pinnedProgramObservation, error) {
+		var closeErrs []error
+		for _, observation := range programs {
+			closeErrs = append(closeErrs, observation.Close())
+		}
+		return nil, errors.Join(err, errors.Join(closeErrs...))
+	}
+	for _, stage := range record.ProgramStages {
+		fileName, err := validateOwnerProgramRecoveryStage(handle, record, stage)
+		if err != nil {
+			return closeOnError(err)
+		}
+		observation, err := handle.runtime.loadPinnedProgram(
+			filepath.Join(handle.procPath(), fileName),
+		)
+		if err != nil {
+			return closeOnError(fmt.Errorf(
+				"retain recovery program stage %s: %w",
+				fileName,
+				err,
+			))
+		}
+		if observation == nil || observation.fd < 0 ||
+			observation.id != stage.ProgramID {
+			if observation != nil {
+				_ = observation.Close()
+			}
+			return closeOnError(fmt.Errorf(
+				"retain recovery program stage %s returned invalid FD/ID",
+				fileName,
+			))
+		}
+		programs[stage.FileName] = observation
+	}
+	return programs, nil
 }
 
 func (handoff *durableTCOwnerJournalHandoff) validateFreshCoverage() error {
@@ -432,34 +572,45 @@ func (handoff *durableTCOwnerJournalHandoff) validateFreshCoverage() error {
 // applying/mutating journal. A failed validation leaves the stage armed.
 func (handoff *durableTCOwnerJournalHandoff) Transfer(
 	stage *tcAttachStage,
-) error {
+) (bool, error) {
 	if handoff == nil {
-		return errors.New("TC owner journal handoff is nil")
+		return false, errors.New("TC owner journal handoff is nil")
 	}
 	handoff.mu.Lock()
 	defer handoff.mu.Unlock()
-	if handoff.transferred {
-		return errors.New("TC owner journal handoff was already transferred")
+	switch handoff.state {
+	case durableTCOwnerJournalHandoffPrepared:
+	case durableTCOwnerJournalHandoffTransferred:
+		return false, errors.New("TC owner journal handoff was already transferred")
+	case durableTCOwnerJournalHandoffReleased:
+		return false, errors.New("TC owner journal handoff was already released")
+	case durableTCOwnerJournalHandoffExported:
+		return false, errors.New("TC owner journal handoff was already exported")
+	default:
+		return false, fmt.Errorf(
+			"TC owner journal handoff has invalid state %d",
+			handoff.state,
+		)
 	}
 	if stage == nil {
-		return errors.New("retained TC stage is nil")
+		return false, errors.New("retained TC stage is nil")
 	}
 	// Serializing all plan reads with stage.Close is required because closing
 	// retained program references updates the bound plan in place.
 	stage.mu.Lock()
 	defer stage.mu.Unlock()
 	if stage.done {
-		return errors.New("retained TC stage is already resolved")
+		return false, errors.New("retained TC stage is already resolved")
 	}
 	if stage.plan != handoff.plan || handoff.plan.stage != stage {
-		return errors.New("retained TC stage is not the exact stage produced by the bound plan")
+		return false, errors.New("retained TC stage is not the exact stage produced by the bound plan")
 	}
 	if err := handoff.validateFreshCoverage(); err != nil {
 		if repairErr := handoff.repairMissingProgramStages(); repairErr != nil {
-			return errors.Join(err, repairErr)
+			return false, errors.Join(err, repairErr)
 		}
 		if retryErr := handoff.validateFreshCoverage(); retryErr != nil {
-			return errors.Join(err, fmt.Errorf("revalidate repaired TC owner journal handoff: %w", retryErr))
+			return false, errors.Join(err, fmt.Errorf("revalidate repaired TC owner journal handoff: %w", retryErr))
 		}
 	}
 	if err := stage.transferToOwnerJournalLocked(
@@ -467,10 +618,11 @@ func (handoff *durableTCOwnerJournalHandoff) Transfer(
 		handoff.intent.ActiveFilters,
 		handoff.intent.DesiredFilters,
 	); err != nil {
-		return err
+		return false, err
 	}
-	handoff.transferred = true
-	return handoff.closeProgramsLocked()
+	return true, handoff.releaseProgramsLocked(
+		durableTCOwnerJournalHandoffTransferred,
+	)
 }
 
 // resolveFailedOwnerApply is the production return-boundary owner resolver for
@@ -498,16 +650,18 @@ func resolveFailedOwnerApply(
 		tcRuntime,
 	)
 	if stage == nil {
-		return abortErr
+		return errors.Join(abortErr, handoff.Close())
 	}
 	if rollbackVerified {
 		stage.Disarm()
-		return abortErr
+		return errors.Join(abortErr, handoff.Close())
 	}
 
-	transferErr := handoff.Transfer(stage)
-	if transferErr == nil {
-		return abortErr
+	transferred, transferErr := handoff.Transfer(stage)
+	if transferred {
+		// The durable journal owns the stage even if releasing the independent
+		// proof observations produced a terminal close report.
+		return errors.Join(abortErr, transferErr)
 	}
 
 	// Fresh store/directory/map/program validation can fail after Execute has
@@ -533,11 +687,16 @@ func resolveFailedOwnerApply(
 			handoff.Close(),
 		)
 	}
-	retainErr := retainTCRollbackOwner(record.ResourceKey, stage, handoff)
+	closeReport, retainErr := retainTCRollbackOwner(
+		record.ResourceKey,
+		stage,
+		handoff,
+	)
 	return errors.Join(
 		abortErr,
 		fmt.Errorf("transfer retained TC rollback to owner journal: %w", transferErr),
 		rollbackErr,
+		closeReport,
 		retainErr,
 	)
 }

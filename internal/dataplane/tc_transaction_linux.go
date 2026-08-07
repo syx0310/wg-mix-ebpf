@@ -140,34 +140,43 @@ var retainedTCRollbackOwners = struct {
 }
 
 type retainedTCRollbackOwner struct {
-	stage   *tcAttachStage
-	handoff *durableTCOwnerJournalHandoff
+	stage              *tcAttachStage
+	binding            *durableTCOwnerJournalBinding
+	journalTransferred bool
 }
 
 func retainTCRollbackOwner(
 	resourceKey string,
 	stage *tcAttachStage,
 	handoff *durableTCOwnerJournalHandoff,
-) error {
+) (error, error) {
 	if resourceKey == "" || stage == nil || handoff == nil ||
 		!stage.hasLiveFilterOwnership() {
-		return errors.New("cannot retain an empty TC rollback owner")
+		return nil, errors.New("cannot retain an empty TC rollback owner")
+	}
+	binding, closeReport, err := handoff.exportRetryBinding(stage)
+	if err != nil {
+		return closeReport, err
 	}
 	retainedTCRollbackOwners.Lock()
 	defer retainedTCRollbackOwners.Unlock()
 	for _, current := range retainedTCRollbackOwners.byResource[resourceKey] {
 		if current.stage == stage {
-			return nil
+			return closeReport, nil
 		}
 	}
 	retainedTCRollbackOwners.byResource[resourceKey] = append(
 		retainedTCRollbackOwners.byResource[resourceKey],
-		retainedTCRollbackOwner{stage: stage, handoff: handoff},
+		retainedTCRollbackOwner{stage: stage, binding: binding},
 	)
-	return nil
+	return closeReport, nil
 }
 
-func retryRetainedTCRollbackOwner(resourceKey string) error {
+func retryRetainedTCRollbackOwner(
+	resourceKey string,
+	handle *pinPathHandle,
+	store *pinOwnerStore,
+) error {
 	retainedTCRollbackOwners.Lock()
 	defer retainedTCRollbackOwners.Unlock()
 	stages := retainedTCRollbackOwners.byResource[resourceKey]
@@ -177,9 +186,37 @@ func retryRetainedTCRollbackOwner(resourceKey string) error {
 	var unresolved []retainedTCRollbackOwner
 	var errs []error
 	for _, owner := range stages {
-		transferErr := owner.handoff.Transfer(owner.stage)
-		if transferErr == nil {
+		if owner.journalTransferred {
+			if err := owner.binding.plan.Close(); err != nil {
+				unresolved = append(unresolved, owner)
+				errs = append(errs, fmt.Errorf(
+					"close retained TC plan after journal transfer: %w",
+					err,
+				))
+			}
 			continue
+		}
+		handoff, transferErr := rebindDurableTCOwnerJournalHandoff(
+			owner.binding,
+			handle,
+			store,
+		)
+		if transferErr == nil {
+			transferred, reportErr := handoff.Transfer(owner.stage)
+			if transferred {
+				errs = append(errs, reportErr)
+				if closeErr := owner.binding.plan.Close(); closeErr != nil {
+					owner.journalTransferred = true
+					unresolved = append(unresolved, owner)
+					errs = append(errs, fmt.Errorf(
+						"close retained TC plan after journal transfer: %w",
+						closeErr,
+					))
+				}
+				continue
+			}
+			transferErr = reportErr
+			errs = append(errs, handoff.Close())
 		}
 		if err := owner.stage.Close(); err != nil {
 			unresolved = append(unresolved, owner)
@@ -189,14 +226,17 @@ func retryRetainedTCRollbackOwner(resourceKey string) error {
 			))
 			continue
 		}
-		errs = append(errs, owner.handoff.Close())
+		errs = append(errs, fmt.Errorf(
+			"retry retained TC journal transfer before successful local rollback: %w",
+			transferErr,
+		))
 	}
 	if len(unresolved) != 0 {
 		retainedTCRollbackOwners.byResource[resourceKey] = unresolved
 		return errors.Join(errs...)
 	}
 	delete(retainedTCRollbackOwners.byResource, resourceKey)
-	return nil
+	return errors.Join(errs...)
 }
 
 func tcProgramIdentityFromProgram(program *ebpf.Program) (tcProgramIdentity, error) {

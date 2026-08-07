@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -82,15 +83,49 @@ func testPinOwnerRecord(
 }
 
 type durableTCOwnerJournalFixture struct {
-	handle            *pinPathHandle
-	store             *pinOwnerStore
-	intent            *pinOwnerRecord
-	active            []tcFilterBinding
-	desired           []tcFilterBinding
-	mapStore          *fakePinnedMapStore
-	programLoadErrors map[string]error
-	programPinErrors  map[string][]error
-	plan              *tcAttachPlan
+	handle             *pinPathHandle
+	store              *pinOwnerStore
+	intent             *pinOwnerRecord
+	active             []tcFilterBinding
+	desired            []tcFilterBinding
+	mapStore           *fakePinnedMapStore
+	programLoadErrors  map[string]error
+	programPinErrors   map[string][]error
+	programCloseErrors map[string][]error
+	programIDs         map[string]uint32
+	programMu          *sync.Mutex
+	programOpens       map[string]int
+	programCloses      map[string]int
+	plan               *tcAttachPlan
+	kernel             *fakeTCKernel
+}
+
+func (fixture *durableTCOwnerJournalFixture) programObservationCounts() (int, int) {
+	fixture.programMu.Lock()
+	defer fixture.programMu.Unlock()
+	var opens int
+	var closes int
+	for _, count := range fixture.programOpens {
+		opens += count
+	}
+	for _, count := range fixture.programCloses {
+		closes += count
+	}
+	return opens, closes
+}
+
+func (fixture *durableTCOwnerJournalFixture) assertProgramObservationsBalanced(
+	t *testing.T,
+) {
+	t.Helper()
+	opens, closes := fixture.programObservationCounts()
+	if opens != closes {
+		t.Fatalf(
+			"pinned program observations remain live: opens=%d closes=%d",
+			opens,
+			closes,
+		)
+	}
 }
 
 func newDurableTCOwnerJournalFixture(t *testing.T) *durableTCOwnerJournalFixture {
@@ -108,7 +143,12 @@ func newDurableTCOwnerJournalFixtureWithActive(
 	runtime := newTestPinPathRuntime(t, validator, mapStore)
 	programLoadErrors := make(map[string]error)
 	programPinErrors := make(map[string][]error)
+	programCloseErrors := make(map[string][]error)
 	programIDs := make(map[string]uint32)
+	programFDs := map[uint32]int{21: 201, 22: 202, 31: 301, 32: 302}
+	programOpens := make(map[string]int)
+	programCloses := make(map[string]int)
+	programMu := &sync.Mutex{}
 	runtime.loadPinnedProgram = func(path string) (*pinnedProgramObservation, error) {
 		name := filepath.Base(path)
 		if err := programLoadErrors[name]; err != nil {
@@ -121,8 +161,15 @@ func newDurableTCOwnerJournalFixtureWithActive(
 		if !ok {
 			return nil, fmt.Errorf("unknown fake program stage %s", name)
 		}
+		programMu.Lock()
+		programOpens[name]++
+		programMu.Unlock()
+		fd, ok := programFDs[id]
+		if !ok {
+			fd = int(id) + 1000
+		}
 		return &pinnedProgramObservation{
-			fd: int(id) + 1000,
+			fd: fd,
 			id: id,
 			pin: func(path string) error {
 				if failures := programPinErrors[name]; len(failures) != 0 {
@@ -150,7 +197,18 @@ func newDurableTCOwnerJournalFixtureWithActive(
 				programIDs[filepath.Base(path)] = id
 				return nil
 			},
-			close: func() error { return nil },
+			close: func() error {
+				programMu.Lock()
+				defer programMu.Unlock()
+				programCloses[name]++
+				failures := programCloseErrors[name]
+				if len(failures) == 0 {
+					return nil
+				}
+				failure := failures[0]
+				programCloseErrors[name] = failures[1:]
+				return failure
+			},
 		}, nil
 	}
 	validated, err := validatePinPath(pinPath, validator)
@@ -312,15 +370,21 @@ func newDurableTCOwnerJournalFixtureWithActive(
 	}
 	t.Cleanup(func() { _ = plan.Close() })
 	return &durableTCOwnerJournalFixture{
-		handle:            handle,
-		store:             store,
-		intent:            mutating,
-		active:            active,
-		desired:           desired,
-		mapStore:          mapStore,
-		programLoadErrors: programLoadErrors,
-		programPinErrors:  programPinErrors,
-		plan:              plan,
+		handle:             handle,
+		store:              store,
+		intent:             mutating,
+		active:             active,
+		desired:            desired,
+		mapStore:           mapStore,
+		programLoadErrors:  programLoadErrors,
+		programPinErrors:   programPinErrors,
+		programCloseErrors: programCloseErrors,
+		programIDs:         programIDs,
+		programMu:          programMu,
+		programOpens:       programOpens,
+		programCloses:      programCloses,
+		plan:               plan,
+		kernel:             tcKernel,
 	}
 }
 
@@ -340,6 +404,10 @@ func TestPrepareDurableTCOwnerJournalHandoffFaults(t *testing.T) {
 			handoff.sequence != fixture.intent.Sequence {
 			t.Fatalf("handoff=%#v error=%v", handoff, err)
 		}
+		if err := handoff.Close(); err != nil {
+			t.Fatal(err)
+		}
+		fixture.assertProgramObservationsBalanced(t)
 	})
 
 	t.Run("read-back mismatch", func(t *testing.T) {
@@ -964,7 +1032,9 @@ func TestPinOwnerDraftPublicationRestartConvergenceMatrix(t *testing.T) {
 	}
 	faults := []faultCase{
 		{name: "create", point: "owner-create"},
-		{name: "validate-draft", point: "owner-validate-draft"},
+		{name: "validate-draft-before-write", point: "owner-validate-draft-1"},
+		{name: "validate-draft-after-write", point: "owner-validate-draft-2"},
+		{name: "validate-draft-before-rename", point: "owner-validate-draft-3"},
 		{
 			name:                "validate-next",
 			point:               "owner-validate-next",
@@ -1005,7 +1075,9 @@ func TestPinOwnerDraftPublicationRestartConvergenceMatrix(t *testing.T) {
 			wantNextBeforeClose: true,
 		},
 		{name: "index-create", point: "index-create", wantPublished: true, wantNextBeforeClose: true},
-		{name: "index-validate-draft", point: "index-validate-draft", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-validate-draft-before-write", point: "index-validate-draft-1", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-validate-draft-after-write", point: "index-validate-draft-2", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-validate-draft-before-rename", point: "index-validate-draft-3", wantPublished: true, wantNextBeforeClose: true},
 		{name: "index-short-write", point: "index-short-write", wantPublished: true, wantNextBeforeClose: true},
 		{name: "index-file-sync", point: "index-file-sync", wantPublished: true, wantNextBeforeClose: true},
 		{name: "index-draft-publish-before", point: "index-draft-rename-before", wantPublished: true, wantNextBeforeClose: true},
@@ -1068,7 +1140,10 @@ func TestPinOwnerDraftPublicationRestartConvergenceMatrix(t *testing.T) {
 				) (pinPathInodeIdentity, error) {
 					if name == store.draftName {
 						validateCalls++
-						if fault.point == "owner-validate-draft" && validateCalls == 2 {
+						if fault.point == fmt.Sprintf(
+							"owner-validate-draft-%d",
+							validateCalls,
+						) {
 							return pinPathInodeIdentity{}, wantErr
 						}
 					}
@@ -1077,7 +1152,10 @@ func TestPinOwnerDraftPublicationRestartConvergenceMatrix(t *testing.T) {
 					}
 					if name == pinOwnerIndexDraftName {
 						indexValidateCalls++
-						if fault.point == "index-validate-draft" && indexValidateCalls == 2 {
+						if fault.point == fmt.Sprintf(
+							"index-validate-draft-%d",
+							indexValidateCalls,
+						) {
 							return pinPathInodeIdentity{}, wantErr
 						}
 					}
