@@ -5,6 +5,7 @@ package dataplane
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -414,16 +415,15 @@ func (fixture *runtimeTestFixture) buildOptions(
 	snapshot *fakeTCPPolicySnapshot,
 	transaction *fakeTCPPolicyGenerationTransaction,
 ) experimentalFakeTCPRuntimeBuildOptions {
-	baseline := &abi.Snapshot{Control: map[abi.ControlKey]abi.ControlValue{
-		abi.ControlKeyGlobal: {
-			ActiveGeneration: snapshot.Generation,
-			ABIVersion:       abi.Version,
-		},
-	}}
+	attachState := fakeTCPPolicyTestState()
+	baseline, err := abi.FromStateWithGeneration(attachState, snapshot.Generation)
+	if err != nil {
+		panic(fmt.Sprintf("build runtime test baseline: %v", err))
+	}
 	return experimentalFakeTCPRuntimeBuildOptions{
 		collection: fixture.collection, transaction: transaction,
 		baselineSnapshot: baseline, snapshot: snapshot,
-		attachState: &control.State{Generation: snapshot.Generation},
+		attachState: attachState,
 		xdpRequests: []fakeTCPXDPAttachRequest{
 			{IfIndex: 3, Mode: fakeTCPXDPAttachNative},
 			{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
@@ -1588,6 +1588,73 @@ func TestExperimentalFakeTCPRuntimeValidatesXDPPolicySetBeforeMutation(t *testin
 		if resource.closes != 1 {
 			t.Fatalf("owned map %s was not closed on preflight failure", name)
 		}
+	}
+}
+
+func TestExperimentalFakeTCPRuntimeBindsCanonicalInterfacesBeforeMutation(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*testing.T, *experimentalFakeTCPRuntimeBuildOptions)
+		match  string
+	}{
+		{
+			name: "empty canonical state",
+			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
+				options.attachState = &control.State{Generation: 7}
+				options.baselineSnapshot.Underlays = map[abi.UnderlayConfigKey]abi.UnderlayConfigValue{}
+			},
+			match: "contains no attachable underlay",
+		},
+		{
+			name: "stale baseline generation",
+			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
+				for key, value := range options.baselineSnapshot.Underlays {
+					delete(options.baselineSnapshot.Underlays, key)
+					key.Generation--
+					value.Generation--
+					options.baselineSnapshot.Underlays[key] = value
+					break
+				}
+			},
+			match: "baseline underlays are stale or unrelated",
+		},
+		{
+			name: "unrelated FakeTCP interface",
+			mutate: func(t *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
+				state := fakeTCPPolicyTestState()
+				state.Underlays[1].IfIndex = 11
+				state.IngressListeners[1].UnderlayIfIndex = 11
+				baseline, err := abi.FromStateWithGeneration(state, options.snapshot.Generation)
+				if err != nil {
+					t.Fatal(err)
+				}
+				options.attachState = state
+				options.baselineSnapshot = baseline
+			},
+			match: "managed interfaces are stale or unrelated",
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRuntimeTestFixture(t)
+			snapshot := mustFakeTCPPolicySnapshot(t, 91)
+			ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+			options := fixture.buildOptions(snapshot, transaction)
+			test.mutate(t, &options)
+			runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
+			if runtime != nil || err == nil || !strings.Contains(err.Error(), test.match) {
+				t.Fatalf("runtime=%#v error=%v", runtime, err)
+			}
+			if fixture.commitCalls != 0 || fixture.collection.freshRuntimeClaimConsumed ||
+				len(fixture.xdpRuntime.probeCalls) != 0 || len(fixture.programArray.inserts) != 0 ||
+				fixture.sessionStore.closes != 0 {
+				t.Fatalf(
+					"canonical preflight commits=%d consumed=%t probes=%v programs=%v session closes=%d",
+					fixture.commitCalls, fixture.collection.freshRuntimeClaimConsumed,
+					fixture.xdpRuntime.probeCalls, fixture.programArray.inserts,
+					fixture.sessionStore.closes,
+				)
+			}
+		})
 	}
 }
 

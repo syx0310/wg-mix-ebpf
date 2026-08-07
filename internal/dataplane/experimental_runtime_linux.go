@@ -710,7 +710,12 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if options.attachState == nil {
 		return errors.New("build experimental FakeTCP runtime: TC attach state is nil")
 	}
-	if err := validateFakeTCPXDPRequests(options.snapshot, options.xdpRequests); err != nil {
+	if err := validateExperimentalRuntimeCanonicalInterfaces(
+		options.baselineSnapshot,
+		options.snapshot,
+		options.attachState,
+		options.xdpRequests,
+	); err != nil {
 		return err
 	}
 	if options.xdpRuntime.probe == nil || options.xdpRuntime.attach == nil {
@@ -1164,6 +1169,67 @@ func validateFakeTCPXDPRequests(
 				request.IfIndex,
 			)
 		}
+	}
+	return nil
+}
+
+// validateExperimentalRuntimeCanonicalInterfaces binds every independently
+// supplied projection before the first map, TC, or XDP mutation. Baseline TC
+// may cover more underlays than FakeTCP, but both the baseline underlay set and
+// the FakeTCP subset must be exact projections of the same control.State.
+func validateExperimentalRuntimeCanonicalInterfaces(
+	baseline *abi.Snapshot,
+	fakeSnapshot *fakeTCPPolicySnapshot,
+	attachState *control.State,
+	xdpRequests []fakeTCPXDPAttachRequest,
+) error {
+	if baseline == nil || fakeSnapshot == nil || attachState == nil {
+		return errors.New("build experimental FakeTCP runtime: canonical interface inputs are incomplete")
+	}
+	generation := fakeSnapshot.Generation
+	projectedBaseline, err := abi.FromStateWithGeneration(attachState, generation)
+	if err != nil {
+		return fmt.Errorf("build experimental FakeTCP runtime: project canonical baseline state: %w", err)
+	}
+	if len(projectedBaseline.Underlays) == 0 {
+		return errors.New("build experimental FakeTCP runtime: canonical baseline contains no attachable underlay")
+	}
+	if !reflect.DeepEqual(baseline.Underlays, projectedBaseline.Underlays) {
+		return errors.New("build experimental FakeTCP runtime: baseline underlays are stale or unrelated to TC attach state")
+	}
+	tcIfindexes, err := activeAttachIfindexes(attachState)
+	if err != nil {
+		return fmt.Errorf("build experimental FakeTCP runtime: derive canonical TC interfaces: %w", err)
+	}
+	if len(tcIfindexes) == 0 {
+		return errors.New("build experimental FakeTCP runtime: canonical TC interface set is empty")
+	}
+	if len(tcIfindexes) != len(projectedBaseline.Underlays) {
+		return errors.New("build experimental FakeTCP runtime: TC interfaces differ from baseline underlays")
+	}
+	for _, ifindex := range tcIfindexes {
+		if uint64(ifindex) > math.MaxUint32 {
+			return fmt.Errorf("build experimental FakeTCP runtime: TC ifindex %d exceeds the BPF ABI", ifindex)
+		}
+		key := abi.UnderlayConfigKey{
+			Generation: generation, UnderlayIndex: uint32(ifindex),
+		}
+		if _, exists := projectedBaseline.Underlays[key]; !exists {
+			return fmt.Errorf(
+				"build experimental FakeTCP runtime: TC ifindex %d has no canonical baseline underlay",
+				ifindex,
+			)
+		}
+	}
+	projectedFake, err := buildFakeTCPPolicySnapshot(attachState, generation)
+	if err != nil {
+		return fmt.Errorf("build experimental FakeTCP runtime: project canonical FakeTCP policy: %w", err)
+	}
+	if !reflect.DeepEqual(fakeSnapshot.ManagedInterfaces, projectedFake.ManagedInterfaces) {
+		return errors.New("build experimental FakeTCP runtime: FakeTCP managed interfaces are stale or unrelated to TC attach state")
+	}
+	if err := validateFakeTCPXDPRequests(fakeSnapshot, xdpRequests); err != nil {
+		return err
 	}
 	return nil
 }
