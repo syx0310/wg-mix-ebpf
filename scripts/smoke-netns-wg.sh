@@ -1,25 +1,271 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-XOR_SECRET="${XOR_PASSWORD-}"
+if [[ "${WG_MIX_EBPF_SMOKE_MOUNTNS_CHILD-}" == "1" ]]; then
+  mountns_xor_secret_fd="${WG_MIX_EBPF_SMOKE_MOUNTNS_XOR_SECRET_FD-}"
+  if [[ ! "${mountns_xor_secret_fd}" =~ ^[1-9][0-9]*$ ]] ||
+    ! IFS= read -r XOR_SECRET <&"${mountns_xor_secret_fd}"; then
+    echo "error: missing sealed XOR secret input from mount namespace launcher" >&2
+    exit 1
+  fi
+  if IFS= read -r _mountns_xor_secret_extra <&"${mountns_xor_secret_fd}"; then
+    echo "error: sealed XOR secret input has trailing data" >&2
+    exit 1
+  fi
+  MOUNTNS_XOR_SECRET_FD="${mountns_xor_secret_fd}"
+  exec {mountns_xor_secret_fd}<&-
+  unset WG_MIX_EBPF_SMOKE_MOUNTNS_XOR_SECRET_FD \
+    mountns_xor_secret_fd _mountns_xor_secret_extra
+else
+  XOR_SECRET="${XOR_PASSWORD-}"
+fi
 unset XOR_PASSWORD
 XOR_ENABLED=0
 if [[ -n "${XOR_SECRET}" ]]; then
   XOR_ENABLED=1
 fi
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if [[ "${WG_MIX_EBPF_SMOKE_MOUNTNS_CHILD-}" == "1" ]]; then
+  ROOT="${WG_MIX_EBPF_SMOKE_MOUNTNS_SOURCE_ROOT-}"
+else
+  ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+fi
 BIN="${ROOT}/bin/wg-mix-ebpf"
 NETNS_ANCHOR_HELPER="${ROOT}/bin/wg-mix-ebpf-netns-anchor"
 SOURCE_COMMIT_HELPER="${ROOT}/scripts/source-commit.sh"
 LIFECYCLE_HOLDER_HELPER="${ROOT}/scripts/hold-isolated-lifecycle-lease.py"
 IPERF_CHECKER_HELPER="${ROOT}/scripts/check-iperf3-tcp.py"
+MOUNTNS_EXPECTED_SOURCE_COMMIT=""
 
 source_commit_from_root() {
   (
     builtin cd -- "${ROOT}"
     "${SOURCE_COMMIT_HELPER}"
   )
+}
+
+validate_private_mount_chain() {
+  local target="$1"
+  local mountinfo_path="${2:-/proc/self/mountinfo}"
+  local observed
+
+  if [[ "${target}" != /* || "${target}" == "/" || "${target}" == *"//"* ||
+    "${target}" == *"/../"* || "${target}" == *"/./"* || "${target}" == *"\\"* ]]; then
+    echo "error: private mount-chain target is noncanonical: ${target}" >&2
+    return 1
+  fi
+  if ! observed="$(/usr/bin/awk -v target="${target}" '
+    function separator_index(   field_index) {
+      for (field_index = 7; field_index <= NF; field_index++) {
+        if ($field_index == "-") {
+          return field_index
+        }
+      }
+      return 0
+    }
+    function covers(path, child) {
+      return path == "/" || child == path || index(child, path "/") == 1
+    }
+    {
+      separator = separator_index()
+      if (separator == 0 || $1 !~ /^[1-9][0-9]*$/ ||
+          $2 !~ /^[1-9][0-9]*$/ || $5 !~ /^\// ||
+          index($5, "\\") != 0 || seen_id[$1]++) {
+        invalid = 1
+        exit 1
+      }
+      parent[$1] = $2
+      mount_path[$1] = $5
+      separator_at[$1] = separator
+      if (covers($5, target)) {
+        candidate_length = length($5)
+        if (candidate_length > best_length) {
+          best_length = candidate_length
+          best_count = 1
+          best_id = $1
+        } else if (candidate_length == best_length) {
+          best_count++
+        }
+      }
+    }
+    END {
+      if (invalid || best_count != 1) {
+        exit 1
+      }
+      current = best_id
+      for (depth = 0; depth <= 1024; depth++) {
+        if (!(current in mount_path) || chain_seen[current]++) {
+          exit 1
+        }
+        if (separator_at[current] != 7) {
+          exit 1
+        }
+        if (mount_path[current] == "/") {
+          print best_id, current
+          exit 0
+        }
+        next_parent = parent[current]
+        if (!(next_parent in mount_path) ||
+            (mount_path[next_parent] != "/" &&
+             index(mount_path[current], mount_path[next_parent] "/") != 1)) {
+          exit 1
+        }
+        current = next_parent
+      }
+      exit 1
+    }
+  ' "${mountinfo_path}")"; then
+    echo "error: target mount chain is not wholly private: ${target}" >&2
+    return 1
+  fi
+  if [[ ! "${observed}" =~ ^[1-9][0-9]*\ [1-9][0-9]*$ ]]; then
+    echo "error: private mount-chain result is malformed: ${target}" >&2
+    return 1
+  fi
+}
+
+validate_private_mountns_launch() {
+  local launch_fd="${WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_FD-}"
+  local launch_nonce="${WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_NONCE-}"
+  local expected_launch_sha256="${WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_SHA256-}"
+  local outer_fd="${WG_MIX_EBPF_SMOKE_MOUNTNS_OUTER_FD-}"
+  local script_fd="${WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_FD-}"
+  local outer_pid="${WG_MIX_EBPF_SMOKE_MOUNTNS_OUTER_PID-}"
+  local expected_outer_id="${WG_MIX_EBPF_SMOKE_MOUNTNS_OUTER_ID-}"
+  local expected_script_dev="${WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_DEV-}"
+  local expected_script_ino="${WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_INO-}"
+  local expected_script_sha256="${WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_SHA256-}"
+  local expected_source_commit="${WG_MIX_EBPF_SMOKE_MOUNTNS_SOURCE_COMMIT-}"
+  local current_id
+  local initial_id
+  local outer_id
+  local parent_id
+  local script_dev
+  local script_ino
+  local script_uid
+  local script_mode
+  local script_links
+  local script_kind
+  local path_dev
+  local path_ino
+  local opened_sha256
+  local path_sha256
+  local launch_record
+  local launch_record_sha256
+  local expected_launch_record
+  local launch_record_lines=()
+
+  if (($# != 1)) || [[ "${1-}" != "--private-mountns-child-v1" ]]; then
+    echo "error: invoke WireGuard netns smoke through scripts/run-smoke-netns-wg-private-mountns.sh" >&2
+    return 1
+  fi
+  if [[ "${WG_MIX_EBPF_SMOKE_MOUNTNS_CHILD-}" != "1" ||
+    ! "${launch_fd}" =~ ^[1-9][0-9]*$ ||
+    ! "${launch_nonce}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$ ||
+    ! "${expected_launch_sha256}" =~ ^[0-9a-f]{64}$ ||
+    ! "${MOUNTNS_XOR_SECRET_FD-}" =~ ^[1-9][0-9]*$ ||
+    ! "${outer_fd}" =~ ^[1-9][0-9]*$ ||
+    ! "${script_fd}" =~ ^[1-9][0-9]*$ || "${outer_fd}" == "${script_fd}" ||
+    "${launch_fd}" == "${outer_fd}" || "${launch_fd}" == "${script_fd}" ||
+    "${MOUNTNS_XOR_SECRET_FD}" == "${launch_fd}" ||
+    "${MOUNTNS_XOR_SECRET_FD}" == "${outer_fd}" ||
+    "${MOUNTNS_XOR_SECRET_FD}" == "${script_fd}" ||
+    ! "${outer_pid}" =~ ^[1-9][0-9]*$ || "${outer_pid}" != "${PPID}" ||
+    ! "${expected_outer_id}" =~ ^[1-9][0-9]*:[1-9][0-9]*$ ||
+    ! "${expected_script_dev}" =~ ^[1-9][0-9]*$ ||
+    ! "${expected_script_ino}" =~ ^[1-9][0-9]*$ ||
+    ! "${expected_script_sha256}" =~ ^[0-9a-f]{64}$ ||
+    ! "${expected_source_commit}" =~ ^[0-9a-f]{40}$ ||
+    ! "${ROOT}" =~ ^/run/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ ||
+    -L "${ROOT}" || ! -d "${ROOT}" ||
+    "$(/usr/bin/realpath -e -- "${ROOT}")" != "${ROOT}" ||
+    "${BASH_SOURCE[0]}" != "/proc/self/fd/${script_fd}" ]]; then
+    echo "error: private mount namespace launch record is missing or invalid" >&2
+    return 1
+  fi
+
+  mapfile -t launch_record_lines <&"${launch_fd}"
+  exec {launch_fd}<&-
+  if ((${#launch_record_lines[@]} != 11)); then
+    echo "error: private mount namespace launch record has invalid length" >&2
+    return 1
+  fi
+  printf -v launch_record '%s\n' "${launch_record_lines[@]}"
+  launch_record="${launch_record%$'\n'}"
+  printf -v expected_launch_record '%s\n' \
+    'format=wg-mix-ebpf-smoke-mountns-launch-v1' \
+    "nonce=${launch_nonce}" \
+    "outer_pid=${outer_pid}" \
+    "outer_id=${expected_outer_id}" \
+    "script_fd=${script_fd}" \
+    "script_dev=${expected_script_dev}" \
+    "script_ino=${expected_script_ino}" \
+    "script_sha256=${expected_script_sha256}" \
+    "source_commit=${expected_source_commit}" \
+    "source_root=${ROOT}" \
+    "xor_secret_fd=${MOUNTNS_XOR_SECRET_FD}"
+  expected_launch_record="${expected_launch_record%$'\n'}"
+  launch_record_sha256="$(printf '%s' "${launch_record}" | /usr/bin/sha256sum)"
+  launch_record_sha256="${launch_record_sha256%% *}"
+  if [[ "${launch_record}" != "${expected_launch_record}" ||
+    "${launch_record_sha256}" != "${expected_launch_sha256}" ]]; then
+    echo "error: private mount namespace launch record authentication failed" >&2
+    return 1
+  fi
+
+  current_id="$(/usr/bin/stat -Lc '%d:%i' -- /proc/self/ns/mnt)"
+  initial_id="$(/usr/bin/stat -Lc '%d:%i' -- /proc/1/ns/mnt)"
+  outer_id="$(/usr/bin/stat -Lc '%d:%i' -- "/proc/self/fd/${outer_fd}")"
+  parent_id="$(/usr/bin/stat -Lc '%d:%i' -- "/proc/${PPID}/ns/mnt")"
+  if [[ "${outer_id}" != "${expected_outer_id}" ||
+    "${parent_id}" != "${expected_outer_id}" ||
+    "${current_id}" == "${expected_outer_id}" ||
+    "${current_id}" == "${initial_id}" ]]; then
+    echo "error: smoke process is not isolated in the reviewed private mount namespace" >&2
+    return 1
+  fi
+
+  read -r script_dev script_ino script_uid script_mode script_links script_kind < <(
+    /usr/bin/stat -Lc '%d %i %u %a %h %F' -- "/proc/self/fd/${script_fd}"
+  )
+  read -r path_dev path_ino < <(
+    /usr/bin/stat -Lc '%d %i' -- "${ROOT}/scripts/smoke-netns-wg.sh"
+  )
+  opened_sha256="$(/usr/bin/sha256sum -- "/proc/self/fd/${script_fd}")"
+  opened_sha256="${opened_sha256%% *}"
+  path_sha256="$(/usr/bin/sha256sum -- "${ROOT}/scripts/smoke-netns-wg.sh")"
+  path_sha256="${path_sha256%% *}"
+  if [[ "${script_dev}" != "${expected_script_dev}" ||
+    "${script_ino}" != "${expected_script_ino}" ||
+    "${path_dev}" != "${expected_script_dev}" ||
+    "${path_ino}" != "${expected_script_ino}" ||
+    "${script_uid}" != "0" || ! "${script_mode}" =~ ^[0-7]{3,4}$ ||
+    ! "${script_links}" =~ ^[1-9][0-9]*$ || "${script_kind}" != "regular file" ||
+    "${opened_sha256}" != "${expected_script_sha256}" ||
+    "${path_sha256}" != "${expected_script_sha256}" ]] ||
+    (((8#${script_mode} & 8#22) != 0)) || (((8#${script_mode} & 8#111) == 0)); then
+    echo "error: inherited smoke script no longer matches the reviewed source identity" >&2
+    return 1
+  fi
+
+  validate_private_mount_chain "/run/wg-mix-ebpf-tests"
+  MOUNTNS_EXPECTED_SOURCE_COMMIT="${expected_source_commit}"
+  unset MOUNTNS_XOR_SECRET_FD
+  exec {outer_fd}<&-
+  exec {script_fd}<&-
+  unset WG_MIX_EBPF_SMOKE_MOUNTNS_CHILD \
+    WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_FD \
+    WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_NONCE \
+    WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_SHA256 \
+    WG_MIX_EBPF_SMOKE_MOUNTNS_OUTER_FD \
+    WG_MIX_EBPF_SMOKE_MOUNTNS_OUTER_ID \
+    WG_MIX_EBPF_SMOKE_MOUNTNS_OUTER_PID \
+    WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_DEV \
+    WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_FD \
+    WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_INO \
+    WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_SHA256 \
+    WG_MIX_EBPF_SMOKE_MOUNTNS_SOURCE_COMMIT \
+    WG_MIX_EBPF_SMOKE_MOUNTNS_SOURCE_ROOT
 }
 
 if [[ "${1-}" == "--self-test-source-commit-cwd" ]]; then
@@ -35,6 +281,8 @@ if [[ "${EUID}" -ne 0 ]]; then
   echo "error: run as root" >&2
   exit 1
 fi
+validate_private_mountns_launch "$@"
+shift
 
 OUTER_FAMILY="${OUTER_FAMILY:-ipv4}"
 XOR_SCOPE="${XOR_SCOPE:-wg-payload-full}"
@@ -305,9 +553,10 @@ for source_commit in \
     exit 1
   fi
 done
-if [[ "${MAIN_SOURCE_COMMIT}" != "${EXPECTED_SOURCE_COMMIT}" ||
+if [[ "${MOUNTNS_EXPECTED_SOURCE_COMMIT}" != "${EXPECTED_SOURCE_COMMIT}" ||
+  "${MAIN_SOURCE_COMMIT}" != "${EXPECTED_SOURCE_COMMIT}" ||
   "${NETNS_HELPER_SOURCE_COMMIT}" != "${EXPECTED_SOURCE_COMMIT}" ]]; then
-  echo "error: test binaries do not match the clean source commit: source=${EXPECTED_SOURCE_COMMIT} main=${MAIN_SOURCE_COMMIT} anchor=${NETNS_HELPER_SOURCE_COMMIT}" >&2
+  echo "error: private launch or test binaries do not match the clean source commit: launch=${MOUNTNS_EXPECTED_SOURCE_COMMIT} source=${EXPECTED_SOURCE_COMMIT} main=${MAIN_SOURCE_COMMIT} anchor=${NETNS_HELPER_SOURCE_COMMIT}" >&2
   exit 1
 fi
 
@@ -837,7 +1086,7 @@ inspect_private_bpffs_mount_record() {
       $5 == target {
         target_count++
         separator = separator_index()
-        if (separator == 0 || $4 != "/" ||
+        if (separator != 7 || $4 != "/" ||
             $(separator + 1) != "bpf" ||
             $(separator + 2) != expected_source) {
           invalid = 1
@@ -1631,6 +1880,7 @@ PREEXISTING_MOUNT_IDS="$(awk '
   }
 ' /proc/self/mountinfo)"
 mount -t bpf -o nosuid,nodev,noexec,mode=0700 "${BPFFS_SOURCE}" "${BPFFS_DIR}"
+validate_private_mount_chain "${BPFFS_DIR}"
 BPFFS_MOUNT_RECORD="$(inspect_private_bpffs_mount_record)"
 read -r BPFFS_MOUNT_ID BPFFS_MOUNT_DEVICE BPFFS_POST_PARENT_MOUNT_ID \
   BPFFS_POST_PARENT_DEVICE BPFFS_MOUNT_RECORD_EXTRA <<<"${BPFFS_MOUNT_RECORD}"

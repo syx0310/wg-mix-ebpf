@@ -3,6 +3,7 @@ GO ?= go
 GOFMT ?= gofmt
 BINARY ?= bin/wg-mix-ebpf
 NETNS_ANCHOR_BINARY ?= bin/wg-mix-ebpf-netns-anchor
+WG_NETNS_SMOKE_LAUNCHER := scripts/run-smoke-netns-wg-private-mountns.sh
 CLANG ?= clang
 BPF_MULTIARCH ?= $(shell gcc -print-multiarch 2>/dev/null)
 BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/include/$(BPF_MULTIARCH),)
@@ -52,38 +53,38 @@ bpf-load-test: build
 	./$(BINARY) bpf-load-test
 
 test-netns-smoke: build build-netns-anchor
-	scripts/smoke-netns-wg.sh
+	$(WG_NETNS_SMOKE_LAUNCHER)
 
 test-netns-xor-smoke: build build-netns-anchor
-	XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
+	XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 $(WG_NETNS_SMOKE_LAUNCHER)
 
 test-netns-xor-full-smoke: build build-netns-anchor
-	XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce XOR_DISPATCH_FAILURE_CHECKS=enforce scripts/smoke-netns-wg.sh
+	XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce XOR_DISPATCH_FAILURE_CHECKS=enforce $(WG_NETNS_SMOKE_LAUNCHER)
 
 test-netns-icmp-smoke: build
 	NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
 
 test-netns-tcp-native: build build-netns-anchor
-	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe $(WG_NETNS_SMOKE_LAUNCHER)
 
 test-netns-tcp-xor-prefix: build build-netns-anchor
-	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 $(WG_NETNS_SMOKE_LAUNCHER)
 
 test-netns-tcp-xor-full: build build-netns-anchor
-	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 $(WG_NETNS_SMOKE_LAUNCHER)
 
 test-netns-tcp: test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full
 
 test-netns-tcp-pmtu-ipv4: build build-netns-anchor
-	OUTER_FAMILY=ipv4 UNDERLAY_MTU=1500 TCP_CHECKS=enforce TCP_MTUS="1439 1440" TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe scripts/smoke-netns-wg.sh
+	OUTER_FAMILY=ipv4 UNDERLAY_MTU=1500 TCP_CHECKS=enforce TCP_MTUS="1439 1440" TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe $(WG_NETNS_SMOKE_LAUNCHER)
 
 test-netns-tcp-pmtu-ipv6: build build-netns-anchor
-	OUTER_FAMILY=ipv6 UNDERLAY_MTU=1500 TCP_CHECKS=enforce TCP_MTUS="1419 1420" TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe scripts/smoke-netns-wg.sh
+	OUTER_FAMILY=ipv6 UNDERLAY_MTU=1500 TCP_CHECKS=enforce TCP_MTUS="1419 1420" TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe $(WG_NETNS_SMOKE_LAUNCHER)
 
 test-netns-tcp-pmtu-positive: test-netns-tcp-pmtu-ipv4 test-netns-tcp-pmtu-ipv6
 
 test-netns-tcp-outer-gso-observe: build build-netns-anchor
-	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe TCP_MTUS="1420" TCP_STREAMS="16" TCP_DIRECTIONS="bidir" TCP_DURATION=30 scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe TCP_MTUS="1420" TCP_STREAMS="16" TCP_DIRECTIONS="bidir" TCP_DURATION=30 $(WG_NETNS_SMOKE_LAUNCHER)
 
 test-unit: test-pcap-helper test-smoke-script-helper test-stage-source-helper
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./...
@@ -97,7 +98,7 @@ test-lint:
 		{ echo "gofmt required for:"; $(GOFMT) -l $$(find cmd internal -name '*.go' -type f); exit 1; }
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) vet ./...
 	sh -n scripts/source-commit.sh
-	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh
+	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/run-smoke-netns-wg-private-mountns.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh
 	scripts/inspect-linux-test-host.sh --self-test-nft-table-gate
 	scripts/provision-ubuntu-test-host.sh --self-test-apt-gate
 	scripts/build-live-guard-test.sh --self-test-safety-gate
@@ -118,7 +119,7 @@ test-lint:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet -tags realhosttest ./internal/guard
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet ./internal/netnsanchor ./cmd/wg-mix-ebpf-netns-anchor
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/smoke-netns-wg.sh scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh; \
+		shellcheck scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-smoke-netns-wg-private-mountns.sh scripts/smoke-netns-wg.sh scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh; \
 	else \
 		echo "skip: shellcheck is unavailable"; \
 	fi
@@ -168,12 +169,12 @@ test-netns:
 	@echo "run as root on an external Linux VM: make test-netns-smoke"
 
 test-netns-full: build build-netns-anchor
-	scripts/smoke-netns-wg.sh
-	OUTER_FAMILY=ipv6 UDP_ZERO_CHECKSUM_CHECKS=enforce scripts/smoke-netns-wg.sh
-	XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
-	OUTER_FAMILY=ipv6 XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
-	XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce XOR_DISPATCH_FAILURE_CHECKS=enforce scripts/smoke-netns-wg.sh
-	OUTER_FAMILY=ipv6 XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce UDP_ZERO_CHECKSUM_CHECKS=enforce scripts/smoke-netns-wg.sh
+	$(WG_NETNS_SMOKE_LAUNCHER)
+	OUTER_FAMILY=ipv6 UDP_ZERO_CHECKSUM_CHECKS=enforce $(WG_NETNS_SMOKE_LAUNCHER)
+	XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 $(WG_NETNS_SMOKE_LAUNCHER)
+	OUTER_FAMILY=ipv6 XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 $(WG_NETNS_SMOKE_LAUNCHER)
+	XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce XOR_DISPATCH_FAILURE_CHECKS=enforce $(WG_NETNS_SMOKE_LAUNCHER)
+	OUTER_FAMILY=ipv6 XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce UDP_ZERO_CHECKSUM_CHECKS=enforce $(WG_NETNS_SMOKE_LAUNCHER)
 	NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
 	$(MAKE) test-netns-tcp
 	$(MAKE) test-netns-tcp-pmtu-positive

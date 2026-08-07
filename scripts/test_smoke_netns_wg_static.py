@@ -11,6 +11,9 @@ import unittest
 
 
 SCRIPT_PATH = pathlib.Path(__file__).with_name("smoke-netns-wg.sh")
+MOUNTNS_LAUNCHER_PATH = pathlib.Path(__file__).with_name(
+    "run-smoke-netns-wg-private-mountns.sh"
+)
 MAKEFILE_PATH = SCRIPT_PATH.parent.parent / "Makefile"
 GO_MOD_PATH = SCRIPT_PATH.parent.parent / "go.mod"
 GO_SUM_PATH = SCRIPT_PATH.parent.parent / "go.sum"
@@ -24,6 +27,7 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.source = SCRIPT_PATH.read_text(encoding="utf-8")
+        cls.mountns_launcher = MOUNTNS_LAUNCHER_PATH.read_text(encoding="utf-8")
         cls.lines = cls.source.splitlines()
         cls.makefile_source = MAKEFILE_PATH.read_text(encoding="utf-8")
         cls.go_mod_source = GO_MOD_PATH.read_text(encoding="utf-8")
@@ -61,6 +65,127 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
                 any(fragment in line for fragment in allowed),
                 f"line {number} reads or propagates XOR_PASSWORD: {line}",
             )
+
+    def test_wg_smoke_uses_only_reviewed_private_mountns_entry(self) -> None:
+        launcher = self.mountns_launcher
+        for fragment in (
+            'readonly UNSHARE_BIN="/usr/bin/unshare"',
+            '"${UNSHARE_BIN}" --mount --propagation private --',
+            'readonly BASH_BIN="/usr/bin/bash"',
+            'readonly ENV_BIN="/usr/bin/env"',
+            '"${ENV_BIN}" -i "${child_environment[@]}"',
+            'exec {smoke_fd}<"${smoke_path}"',
+            'exec {outer_mountns_fd}<"/proc/self/ns/mnt"',
+            'WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_SHA256',
+            'WG_MIX_EBPF_SMOKE_MOUNTNS_SOURCE_COMMIT',
+            'WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_FD',
+            'format=wg-mix-ebpf-smoke-mountns-launch-v1',
+            'exec {xor_secret_fd}<<<"${XOR_SECRET}"',
+            'launcher mount namespace identity changed while waiting for child',
+        ):
+            self.assertIn(fragment, launcher)
+        self.assertNotIn("--make-rprivate", launcher)
+        self.assertNotIn("--make-private", launcher)
+        self.assertNotIn("mount --make", launcher)
+        capture = launcher.index('XOR_SECRET="${XOR_PASSWORD-}"')
+        unset = launcher.index("unset XOR_PASSWORD")
+        first_external = launcher.index('"${STAT_BIN}" -Lc')
+        self.assertLess(capture, unset)
+        self.assertLess(unset, first_external)
+        child_environment = launcher[
+            launcher.index("child_environment=(") :
+            launcher.index("\nstatus=0", launcher.index("child_environment=("))
+        ]
+        self.assertNotIn("XOR_PASSWORD", child_environment)
+        self.assertIn("WG_MIX_EBPF_SMOKE_MOUNTNS_XOR_SECRET_FD", child_environment)
+
+        self.assertIn(
+            "WG_NETNS_SMOKE_LAUNCHER := "
+            "scripts/run-smoke-netns-wg-private-mountns.sh",
+            self.makefile_source,
+        )
+        for line in self.makefile_source.splitlines():
+            if not line.startswith("\t") or "scripts/smoke-netns-wg.sh" not in line:
+                continue
+            self.assertTrue(
+                "bash -n " in line or "shellcheck " in line,
+                f"direct WG smoke recipe bypasses mountns launcher: {line}",
+            )
+        self.assertGreaterEqual(
+            self.makefile_source.count("$(WG_NETNS_SMOKE_LAUNCHER)"),
+            15,
+        )
+
+    def test_mountns_child_gate_precedes_every_test_resource_write(self) -> None:
+        gate = self.source.index('validate_private_mountns_launch "$@"')
+        shift = self.source.index("\nshift\n", gate)
+        run_id = self.source.index('RUN_ID="$(python3 -')
+        first_phase = self.source.index('PHASE="create-owned-run-root"')
+        first_test_mkdir = self.source.index('mkdir -m 0700 -- "${TEST_ROOT}"')
+        self.assertLess(gate, shift)
+        self.assertLess(shift, run_id)
+        self.assertLess(run_id, first_phase)
+        self.assertLess(gate, first_test_mkdir)
+        self.assertIn(
+            'invoke WireGuard netns smoke through '
+            'scripts/run-smoke-netns-wg-private-mountns.sh',
+            self.source,
+        )
+        self.assertIn('exec {outer_fd}<&-', self.source)
+        self.assertIn('exec {script_fd}<&-', self.source)
+        self.assertNotIn("--make-rprivate", self.source)
+        self.assertNotIn("--make-private", self.source)
+
+    def test_prewrite_mount_chain_rejects_all_propagation_fields(self) -> None:
+        function = self.source[
+            self.source.index("validate_private_mount_chain() {") :
+            self.source.index("\nvalidate_private_mountns_launch() {")
+        ]
+        target = "/run/wg-mix-ebpf-tests"
+        harness = "\n".join(
+            (
+                "set -euo pipefail",
+                function,
+                f"validate_private_mount_chain {shlex.quote(target)} \"$1\"",
+            )
+        )
+
+        def inspect(mountinfo: str) -> subprocess.CompletedProcess[bytes]:
+            with tempfile.NamedTemporaryFile() as fixture:
+                fixture.write(mountinfo.encode("ascii"))
+                fixture.flush()
+                return subprocess.run(
+                    ["/bin/bash", "-c", harness, "mount-chain-fixture", fixture.name],
+                    check=False,
+                    capture_output=True,
+                    env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+                )
+
+        root = "25 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"
+        private_run = (
+            "100 25 0:100 / /run rw,nosuid,nodev,relatime "
+            "- tmpfs tmpfs rw\n"
+        )
+        accepted = inspect(root + private_run)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        for propagation in (
+            "shared:77",
+            "master:12",
+            "propagate_from:12",
+            "unbindable",
+        ):
+            with self.subTest(propagation=propagation):
+                propagated_run = (
+                    "100 25 0:100 / /run rw,nosuid,nodev,relatime "
+                    f"{propagation} - tmpfs tmpfs rw\n"
+                )
+                self.assertNotEqual(inspect(root + propagated_run).returncode, 0)
+
+        shared_root = (
+            "25 1 8:1 / / rw,relatime shared:1 - ext4 /dev/root rw\n"
+        )
+        self.assertNotEqual(inspect(shared_root + private_run).returncode, 0)
 
     def test_source_commit_is_resolved_from_source_root(self) -> None:
         helper = self.source[
@@ -1166,14 +1291,21 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         awk_program = self.source[program_start:program_end]
         target = "/run/wg-mix-ebpf-test/private-bpffs"
         source = "wg-mix-ebpf-01234567-0123456789abcdef0123456789abcdef"
-        mountinfo = (
+        mountinfo_prefix = (
             "25 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"
             "41 25 0:30 / /sys/fs/bpf rw,nosuid,nodev,noexec "
             "- bpf bpf rw,mode=700\n"
-            f"77 25 0:31 / {target} rw,nosuid,nodev,noexec "
-            f"shared:77 - bpf {source} rw,mode=700\n"
         )
-        def inspect(expected_source: str) -> subprocess.CompletedProcess[str]:
+
+        def inspect(
+            expected_source: str,
+            propagation: str = "",
+        ) -> subprocess.CompletedProcess[str]:
+            optional = f"{propagation} " if propagation else ""
+            mountinfo = mountinfo_prefix + (
+                f"77 25 0:31 / {target} rw,nosuid,nodev,noexec "
+                f"{optional}- bpf {source} rw,mode=700\n"
+            )
             return subprocess.run(
                 [
                     "/usr/bin/awk",
@@ -1195,6 +1327,14 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertEqual(completed.stdout, "77 0:31 25 8:1\n")
         self.assertNotEqual(inspect("bpf").returncode, 0)
         self.assertNotEqual(inspect(source + "0").returncode, 0)
+        for propagation in (
+            "shared:77",
+            "master:12",
+            "propagate_from:12",
+            "unbindable",
+        ):
+            with self.subTest(propagation=propagation):
+                self.assertNotEqual(inspect(source, propagation).returncode, 0)
 
     def test_private_bpffs_pre_mount_snapshot_is_bound_and_sorted(self) -> None:
         function = self.source[
