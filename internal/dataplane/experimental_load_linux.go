@@ -4,16 +4,13 @@ package dataplane
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/btf"
 )
-
-type experimentalCollectionCloser interface {
-	Close() error
-}
 
 // LoadExperimentalFakeTCPObjectTestIdentity verifier-loads every map and
 // program in an explicitly supplied experimental object, then closes the
@@ -22,6 +19,9 @@ func LoadExperimentalFakeTCPObjectTestIdentity(
 	ctx context.Context,
 	objectPath string,
 ) (ObjectIdentity, error) {
+	if ctx == nil {
+		return ObjectIdentity{}, errors.New("experimental FakeTCP BPF load: context is nil")
+	}
 	if err := ctx.Err(); err != nil {
 		return ObjectIdentity{}, err
 	}
@@ -36,22 +36,10 @@ func LoadExperimentalFakeTCPObjectTestIdentity(
 		return ObjectIdentity{}, err
 	}
 	err = loadExperimentalFakeTCPCollection(
+		ctx,
 		spec,
 		identity.Source,
-		probeExperimentalFakeTCPKernelDependency,
-		removeMemlockLimit,
-		func(spec *ebpf.CollectionSpec) (experimentalCollectionCloser, error) {
-			collection, err := ebpf.NewCollection(spec)
-			if err != nil {
-				return nil, err
-			}
-			owner, err := newExperimentalCollectionOwner(collection)
-			if err != nil {
-				collection.Close()
-				return nil, err
-			}
-			return owner, nil
-		},
+		liveExperimentalCollectionAcquisitionDependencies(),
 	)
 	if err != nil {
 		return ObjectIdentity{}, err
@@ -60,35 +48,21 @@ func LoadExperimentalFakeTCPObjectTestIdentity(
 }
 
 func loadExperimentalFakeTCPCollection(
+	ctx context.Context,
 	spec *ebpf.CollectionSpec,
 	source string,
-	probeKernelDependency func() error,
-	removeMemlock func() error,
-	newCollection func(*ebpf.CollectionSpec) (experimentalCollectionCloser, error),
+	dependencies experimentalCollectionAcquisitionDependencies,
 ) error {
-	if err := validateExperimentalExtensionManifest(spec); err != nil {
-		return fmt.Errorf("validate experimental FakeTCP BPF object %s: %w", source, err)
-	}
-	if probeKernelDependency == nil {
-		return fmt.Errorf("probe experimental FakeTCP kernel dependency: no probe configured")
-	}
-	if err := probeKernelDependency(); err != nil {
-		return fmt.Errorf("probe experimental FakeTCP kernel dependency: %w", err)
-	}
-	if err := removeMemlock(); err != nil {
+	owner, err := acquireExperimentalFakeTCPCollection(ctx, spec, source, dependencies)
+	if err != nil {
 		return err
 	}
-	collection, err := newCollection(spec)
-	if err != nil {
-		return fmt.Errorf("create experimental FakeTCP BPF collection from %s: %w", source, err)
+	// This is deliberately verifier-only: acquisition can retain ownership for
+	// a future runtime builder, while this path explicitly closes immediately.
+	if err := ctx.Err(); err != nil {
+		return errors.Join(err, closeExperimentalCollectionOwner(owner, source))
 	}
-	if collection == nil {
-		return fmt.Errorf("create experimental FakeTCP BPF collection from %s: loader returned nil collection", source)
-	}
-	if err := collection.Close(); err != nil {
-		return fmt.Errorf("close experimental FakeTCP BPF collection from %s: %w", source, err)
-	}
-	return nil
+	return closeExperimentalCollectionOwner(owner, source)
 }
 
 func probeExperimentalFakeTCPKernelDependency() error {
