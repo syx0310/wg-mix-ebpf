@@ -1328,7 +1328,18 @@ type cleanupDirectoryPlan struct {
 	retainedQuarantineEvidence []string
 }
 
-const maxRetainedSystemdEnableLinkQuarantineEvidence = 8
+const (
+	// A normal operation consumes the owned reservation and stops at seven.
+	// The final slot covers one supported binding ambiguity in which the owned
+	// link moves away while a foreign link appears at its quarantine name.
+	// Independent privileged writers are detected, not constrained by this cap.
+	systemdEnableLinkQuarantineHardLimit        = 8
+	systemdEnableLinkQuarantineOwnedReservation = 1
+	systemdEnableLinkQuarantineAmbiguityReserve = 1
+	systemdEnableLinkQuarantineExistingLimit    = systemdEnableLinkQuarantineHardLimit -
+		systemdEnableLinkQuarantineOwnedReservation -
+		systemdEnableLinkQuarantineAmbiguityReserve
+)
 
 func (directory *cleanupDirectoryPlan) close() error {
 	if directory == nil {
@@ -1475,21 +1486,30 @@ func revalidateManagedCleanupDirAllowFinalGenerationChange(
 	return revalidateDeclaredCanonicalRoot(dir)
 }
 
-func retainedSystemdQuarantineLimitError(
+func retainedSystemdQuarantineOperationalThresholdError(
 	activePath string,
 	evidencePaths []string,
 ) error {
+	return fmt.Errorf(
+		"refuse to quarantine systemd enable link %s: %d existing evidence paths exceed the operational "+
+			"pre-rename limit %d; hard limit %d reserves %d path for this owned quarantine and %d path for "+
+			"one supported binding ambiguity; active link was not moved; exact evidence paths: %s",
+		activePath,
+		len(evidencePaths),
+		systemdEnableLinkQuarantineExistingLimit,
+		systemdEnableLinkQuarantineHardLimit,
+		systemdEnableLinkQuarantineOwnedReservation,
+		systemdEnableLinkQuarantineAmbiguityReserve,
+		formatExactQuarantineEvidencePaths(evidencePaths),
+	)
+}
+
+func formatExactQuarantineEvidencePaths(evidencePaths []string) string {
 	quotedPaths := make([]string, 0, len(evidencePaths))
 	for _, evidencePath := range evidencePaths {
 		quotedPaths = append(quotedPaths, fmt.Sprintf("%q", evidencePath))
 	}
-	return fmt.Errorf(
-		"refuse to quarantine systemd enable link %s: retained evidence hard limit %d reached before rename; "+
-			"active link was not moved; exact evidence paths: %s",
-		activePath,
-		maxRetainedSystemdEnableLinkQuarantineEvidence,
-		strings.Join(quotedPaths, ", "),
-	)
+	return strings.Join(quotedPaths, ", ")
 }
 
 func prepareUninstallCleanup(
@@ -2336,10 +2356,10 @@ func prepareArtifactPlansForValidation(
 		node.remove = true
 		node.retainAfterQuarantine = artifact.Kind == systemdEnableLinkKind
 		if node.retainAfterQuarantine &&
-			len(retainedEvidence) >= maxRetainedSystemdEnableLinkQuarantineEvidence {
+			len(retainedEvidence) > systemdEnableLinkQuarantineExistingLimit {
 			_ = parent.close()
 			closeCleanupDirectoryPlans(plans)
-			return nil, retainedSystemdQuarantineLimitError(
+			return nil, retainedSystemdQuarantineOperationalThresholdError(
 				artifact.Path,
 				retainedEvidence,
 			)
@@ -3676,11 +3696,57 @@ func (entry *cleanupEntryPlan) unlink(
 				err,
 			)
 		}
-		if err := errors.Join(hookErr, bindingErr); err != nil {
+		// Re-enumerate even after hook or binding failures. The hook may have
+		// preserved the owned inode under another prefixed name and installed a
+		// foreign replacement, so the pre-hook list is not authoritative.
+		var enumerationErr error
+		currentEvidencePaths, err := inspectRetainedSystemdQuarantineEvidence(
+			directory.root,
+		)
+		if err != nil {
+			enumerationErr = fmt.Errorf(
+				"stably enumerate retained systemd enable-link quarantine evidence after final-check boundary: %w",
+				err,
+			)
+		} else {
+			directory.retainedQuarantineEvidence = currentEvidencePaths
+		}
+		var boundaryErr error
+		if err := revalidateManagedCleanupDir(directory.root); err != nil {
+			boundaryErr = fmt.Errorf(
+				"revalidate systemd wants-directory generation after final-check evidence enumeration: %w",
+				err,
+			)
+		}
+		var hardLimitErr error
+		if enumerationErr == nil &&
+			len(currentEvidencePaths) > systemdEnableLinkQuarantineHardLimit {
+			hardLimitErr = fmt.Errorf(
+				"detected %d retained evidence paths after the active link was moved, exceeding hard limit %d; "+
+					"a concurrent privileged writer cannot be prevented from adding names, so this operation fails closed",
+				len(currentEvidencePaths),
+				systemdEnableLinkQuarantineHardLimit,
+			)
+		}
+		if err := errors.Join(
+			hookErr,
+			bindingErr,
+			enumerationErr,
+			boundaryErr,
+			hardLimitErr,
+		); err != nil {
+			evidenceScope := "current exact paths"
+			if enumerationErr != nil {
+				evidenceScope = "last-known paths; current exact paths are unavailable because stable enumeration failed"
+			}
 			return fmt.Errorf(
-				"systemd enable link retained quarantine evidence at %s; "+
+				"systemd enable link retained quarantine evidence at %s [%s] after active link %s was moved; "+
 					"no pathname-based unlink or restore was attempted: %w",
-				evidencePath,
+				evidenceScope,
+				formatExactQuarantineEvidencePaths(
+					directory.retainedQuarantineEvidence,
+				),
+				entry.path,
 				err,
 			)
 		}
@@ -3750,8 +3816,8 @@ func (entry *cleanupEntryPlan) moveToQuarantine(
 			)
 		}
 		directory.retainedQuarantineEvidence = evidencePaths
-		if len(evidencePaths) >= maxRetainedSystemdEnableLinkQuarantineEvidence {
-			return "", false, retainedSystemdQuarantineLimitError(
+		if len(evidencePaths) > systemdEnableLinkQuarantineExistingLimit {
+			return "", false, retainedSystemdQuarantineOperationalThresholdError(
 				entry.path,
 				evidencePaths,
 			)

@@ -408,8 +408,9 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	case "systemd":
 		add(
 			"atomically quarantine the exact validated systemd enable link if present; "+
-				"retain its unique hidden quarantine name as audit evidence up to the hard limit of %d",
-			maxRetainedSystemdEnableLinkQuarantineEvidence,
+				"allow at most %d existing evidence paths before rename, reserving one owned path and one ambiguity path within hard limit %d",
+			systemdEnableLinkQuarantineExistingLimit,
+			systemdEnableLinkQuarantineHardLimit,
 		)
 		add("remove systemd unit %s", filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"))
 		add("reload systemd manager after removing the owned unit")
@@ -657,13 +658,17 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 				return fmt.Errorf("cleanup startup guard: %w", err)
 			}
 		}
-		if err := cleanupPlan.executeServiceArtifacts(); err != nil {
-			return fmt.Errorf("remove descriptor-anchored service artifacts: %w", err)
-		}
+		serviceArtifactErr := cleanupPlan.executeServiceArtifacts()
 		retainedServiceArtifactEvidence = append(
-			retainedServiceArtifactEvidence,
+			retainedServiceArtifactEvidence[:0],
 			cleanupPlan.retainedQuarantineEvidencePaths()...,
 		)
+		if serviceArtifactErr != nil {
+			return fmt.Errorf(
+				"remove descriptor-anchored service artifacts: %w",
+				serviceArtifactErr,
+			)
+		}
 		addQuarantineEvidenceActions(retainedServiceArtifactEvidence)
 		if system == "systemd" {
 			if err := runSystemdManagerReloadAfterServiceArtifactRemoval(
