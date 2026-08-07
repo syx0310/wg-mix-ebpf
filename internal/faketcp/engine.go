@@ -5,6 +5,7 @@
 package faketcp
 
 import (
+	"container/list"
 	"errors"
 	"fmt"
 	"sync"
@@ -29,6 +30,8 @@ type Options struct {
 	SYNRateInterval          time.Duration
 	SYNBurst                 int
 	SYNBurstPerSource        int
+	SYNSourceLedgerCapacity  int
+	SYNSourceLedgerTTL       time.Duration
 	MaxPendingFlows          int
 	MaxPendingPacketsPerFlow int
 	MaxPendingBytes          int
@@ -129,8 +132,10 @@ type synSourceKey struct {
 }
 
 type synSourceState struct {
-	bucket   tokenBucket
-	halfOpen int
+	bucket       tokenBucket
+	halfOpen     int
+	lastActivity time.Time
+	lruElement   *list.Element
 }
 
 type tokenBucket struct {
@@ -147,6 +152,7 @@ type Engine struct {
 	halfOpen     int
 	globalSYNs   tokenBucket
 	synSources   map[synSourceKey]*synSourceState
+	synSourceLRU *list.List
 }
 
 type engineCheckpoint struct {
@@ -168,7 +174,9 @@ func New(options Options) (*Engine, error) {
 	if options.MaxHalfOpenSessions <= 0 || options.MaxHalfOpenSessions >= options.SessionCapacity ||
 		options.MaxHalfOpenPerSource <= 0 || options.MaxHalfOpenPerSource > options.MaxHalfOpenSessions ||
 		options.SYNRateInterval <= 0 || options.SYNBurst <= 0 ||
-		options.SYNBurstPerSource <= 0 || options.SYNBurstPerSource > options.SYNBurst {
+		options.SYNBurstPerSource <= 0 || options.SYNBurstPerSource > options.SYNBurst ||
+		options.SYNSourceLedgerCapacity < options.MaxHalfOpenSessions ||
+		options.SYNSourceLedgerTTL < options.SYNRateInterval {
 		return nil, errors.New("faketcp half-open and SYN-rate limits are invalid")
 	}
 	if options.HandshakeTimeout <= 0 || options.HandshakeRetries <= 0 ||
@@ -191,9 +199,10 @@ func New(options Options) (*Engine, error) {
 		options.Window = 65535
 	}
 	return &Engine{
-		opts:       options,
-		sessions:   make(map[abi.FakeTCPSessionKey]*session),
-		synSources: make(map[synSourceKey]*synSourceState),
+		opts:         options,
+		sessions:     make(map[abi.FakeTCPSessionKey]*session),
+		synSources:   make(map[synSourceKey]*synSourceState),
+		synSourceLRU: list.New(),
 	}, nil
 }
 
@@ -319,6 +328,14 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) (
 	now := e.opts.Now()
 	s := e.sessions[flow]
 	checkpoint := e.checkpoint(s)
+	var synSource synSourceKey
+	if seg.Flags&FlagSYN != 0 {
+		var rejection string
+		synSource, rejection = e.chargeInboundSYN(flow, now)
+		if rejection != "" {
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: rejection}}, nil
+		}
+	}
 	if s != nil && wgID != 0 && s.wgID != 0 && wgID != s.wgID {
 		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
 	}
@@ -353,7 +370,7 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) (
 		if len(e.sessions) >= e.opts.SessionCapacity {
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-capacity"}}, nil
 		}
-		source, rejection := e.reserveInboundSYN(flow, now)
+		rejection := e.reserveInboundHalfOpen(synSource)
 		if rejection != "" {
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: rejection}}, nil
 		}
@@ -369,7 +386,7 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) (
 			nextRetry:    now.Add(e.opts.HandshakeTimeout),
 			retries:      1,
 			halfOpenHeld: true,
-			synSource:    source,
+			synSource:    synSource,
 		}
 		e.sessions[flow] = s
 		return []Action{e.control(flow, s, FlagSYN|FlagACK, s.localISN, s.rxSequence, "accept-syn")}, nil
@@ -624,34 +641,87 @@ func (e *Engine) enqueue(s *session, packet PendingPacket) bool {
 	return true
 }
 
-func (e *Engine) reserveInboundSYN(flow abi.FakeTCPSessionKey, now time.Time) (synSourceKey, string) {
-	if e.halfOpen >= e.opts.MaxHalfOpenSessions {
-		return synSourceKey{}, "half-open-capacity"
-	}
+func (e *Engine) chargeInboundSYN(flow abi.FakeTCPSessionKey, now time.Time) (synSourceKey, string) {
 	refillTokenBucket(&e.globalSYNs, now, e.opts.SYNRateInterval, e.opts.SYNBurst)
-	if e.globalSYNs.tokens == 0 {
-		return synSourceKey{}, "syn-rate-global"
-	}
-
 	key := synSourceKey{remoteIPv4: flow.RemoteIPv4, underlayIndex: flow.UnderlayIndex}
-	source := e.synSources[key]
-	if source != nil && source.halfOpen >= e.opts.MaxHalfOpenPerSource {
-		return synSourceKey{}, "half-open-source-capacity"
-	}
-	if source == nil {
-		source = &synSourceState{}
+	source, rejection := e.lookupOrCreateSYNSource(key, now)
+	if rejection != "" {
+		// A structurally valid SYN consumes any available global token even
+		// when its source cannot enter the bounded ledger. Tokens are never
+		// refunded on a later admission failure.
+		if e.globalSYNs.tokens > 0 {
+			e.globalSYNs.tokens--
+		}
+		return synSourceKey{}, rejection
 	}
 	refillTokenBucket(&source.bucket, now, e.opts.SYNRateInterval, e.opts.SYNBurstPerSource)
-	if source.bucket.tokens == 0 {
+	globalAvailable := e.globalSYNs.tokens > 0
+	sourceAvailable := source.bucket.tokens > 0
+	if globalAvailable {
+		e.globalSYNs.tokens--
+	}
+	if sourceAvailable {
+		source.bucket.tokens--
+	}
+	if !globalAvailable {
+		return synSourceKey{}, "syn-rate-global"
+	}
+	if !sourceAvailable {
 		return synSourceKey{}, "syn-rate-source"
 	}
-
-	e.globalSYNs.tokens--
-	source.bucket.tokens--
-	source.halfOpen++
-	e.synSources[key] = source
-	e.halfOpen++
 	return key, ""
+}
+
+func (e *Engine) reserveInboundHalfOpen(key synSourceKey) string {
+	if e.halfOpen >= e.opts.MaxHalfOpenSessions {
+		return "half-open-capacity"
+	}
+	source := e.synSources[key]
+	if source == nil {
+		return "syn-source-ledger-missing"
+	}
+	if source.halfOpen >= e.opts.MaxHalfOpenPerSource {
+		return "half-open-source-capacity"
+	}
+	source.halfOpen++
+	e.halfOpen++
+	return ""
+}
+
+func (e *Engine) lookupOrCreateSYNSource(key synSourceKey, now time.Time) (*synSourceState, string) {
+	e.pruneExpiredSYNSources(now)
+	if source := e.synSources[key]; source != nil {
+		e.touchSYNSource(source, now)
+		return source, ""
+	}
+	if len(e.synSources) >= e.opts.SYNSourceLedgerCapacity {
+		return nil, "syn-source-ledger-capacity"
+	}
+	source := &synSourceState{lastActivity: now}
+	source.lruElement = e.synSourceLRU.PushFront(key)
+	e.synSources[key] = source
+	return source, ""
+}
+
+func (e *Engine) touchSYNSource(source *synSourceState, now time.Time) {
+	source.lastActivity = now
+	if source.lruElement != nil {
+		e.synSourceLRU.MoveToFront(source.lruElement)
+	}
+}
+
+func (e *Engine) pruneExpiredSYNSources(now time.Time) {
+	for element := e.synSourceLRU.Back(); element != nil; {
+		previous := element.Prev()
+		key := element.Value.(synSourceKey)
+		source := e.synSources[key]
+		if source != nil && source.halfOpen == 0 &&
+			!now.Before(source.lastActivity.Add(e.opts.SYNSourceLedgerTTL)) {
+			delete(e.synSources, key)
+			e.synSourceLRU.Remove(element)
+		}
+		element = previous
+	}
 }
 
 func refillTokenBucket(bucket *tokenBucket, now time.Time, interval time.Duration, burst int) {
@@ -691,9 +761,10 @@ func (e *Engine) releaseHalfOpen(s *session) {
 	if source.halfOpen > 0 {
 		source.halfOpen--
 	}
-	if source.halfOpen == 0 {
-		delete(e.synSources, s.synSource)
-	}
+	// Releasing half-open state never returns tokens or deletes history. Keep
+	// the ledger entry for a full TTL from release so SYN->RST/success loops
+	// cannot reset the source bucket.
+	e.touchSYNSource(source, e.opts.Now())
 }
 
 func (e *Engine) release(flow abi.FakeTCPSessionKey, s *session) []Action {

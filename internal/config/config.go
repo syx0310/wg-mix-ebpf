@@ -28,6 +28,7 @@ const (
 	MaxFakeTCPHalfOpenSessions              = 4096
 	MaxFakeTCPHalfOpenPerSource             = 256
 	MaxFakeTCPSYNBurst                      = 4096
+	MaxFakeTCPSYNSourceLedger               = 16384
 	MaxFakeTCPPendingFlows                  = 4096
 	MaxFakeTCPPendingPacketsPerFlow         = 4
 	MaxFakeTCPPendingBytes                  = 1 << 20
@@ -105,6 +106,8 @@ type FakeTCPTransport struct {
 	SYNRateInterval          Duration `yaml:"syn_rate_interval"`
 	SYNBurst                 uint32   `yaml:"syn_burst"`
 	SYNBurstPerSource        uint32   `yaml:"syn_burst_per_source"`
+	SYNSourceLedgerCapacity  uint32   `yaml:"syn_source_ledger_capacity"`
+	SYNSourceLedgerTTL       Duration `yaml:"syn_source_ledger_ttl"`
 	MaxPendingFlows          uint32   `yaml:"max_pending_flows"`
 	MaxPendingPacketsPerFlow uint32   `yaml:"max_pending_packets_per_flow"`
 	MaxPendingBytes          uint32   `yaml:"max_pending_bytes"`
@@ -415,6 +418,12 @@ func (c *Config) ApplyDefaults() {
 			if fake.SYNBurstPerSource == 0 {
 				fake.SYNBurstPerSource = min(8, fake.SYNBurst)
 			}
+			if fake.SYNSourceLedgerCapacity == 0 {
+				fake.SYNSourceLedgerCapacity = max(fake.MaxHalfOpenSessions, 4096)
+			}
+			if fake.SYNSourceLedgerTTL.Duration == 0 {
+				fake.SYNSourceLedgerTTL.Duration = 5 * time.Minute
+			}
 			if fake.MaxPendingFlows == 0 {
 				fake.MaxPendingFlows = min(1024, fake.MaxHalfOpenSessions)
 			}
@@ -629,6 +638,12 @@ func validateFakeTCPTransport(prefix string, f FakeTCPTransport) error {
 	}
 	if f.SYNBurstPerSource == 0 || f.SYNBurstPerSource > f.SYNBurst {
 		return fmt.Errorf("%s.syn_burst_per_source must be between 1 and syn_burst", prefix)
+	}
+	if f.SYNSourceLedgerCapacity < f.MaxHalfOpenSessions || f.SYNSourceLedgerCapacity > MaxFakeTCPSYNSourceLedger {
+		return fmt.Errorf("%s.syn_source_ledger_capacity must be between max_half_open_sessions and %d", prefix, MaxFakeTCPSYNSourceLedger)
+	}
+	if f.SYNSourceLedgerTTL.Duration < f.SYNRateInterval.Duration || f.SYNSourceLedgerTTL.Duration > time.Hour {
+		return fmt.Errorf("%s.syn_source_ledger_ttl must be between syn_rate_interval and 1h", prefix)
 	}
 	if f.MaxPendingFlows == 0 || f.MaxPendingFlows > MaxFakeTCPPendingFlows || f.MaxPendingFlows > f.MaxHalfOpenSessions {
 		return fmt.Errorf("%s.max_pending_flows must be between 1 and min(max_half_open_sessions, %d)", prefix, MaxFakeTCPPendingFlows)

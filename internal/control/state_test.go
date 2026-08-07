@@ -392,7 +392,9 @@ ciphers:
 		wg.FakeTCPIngressMode != "xdp-required" || wg.FakeTCPSessionCapacity != 4096 ||
 		wg.FakeTCPMaxHalfOpenSessions != 1024 || wg.FakeTCPMaxHalfOpenPerSource != 16 ||
 		wg.FakeTCPSYNRateIntervalNanos != int64(100*time.Millisecond) ||
-		wg.FakeTCPSYNBurst != 256 || wg.FakeTCPSYNBurstPerSource != 8 {
+		wg.FakeTCPSYNBurst != 256 || wg.FakeTCPSYNBurstPerSource != 8 ||
+		wg.FakeTCPSYNSourceLedgerCapacity != 4096 ||
+		wg.FakeTCPSYNSourceLedgerTTLNanos != int64(5*time.Minute) {
 		t.Fatalf("faketcp state = %#v", wg)
 	}
 }

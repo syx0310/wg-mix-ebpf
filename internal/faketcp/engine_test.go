@@ -100,6 +100,7 @@ func testEngine(t *testing.T, mutate func(*Options)) (*Engine, *fakeClock) {
 		Generation: 1, SessionCapacity: 8,
 		MaxHalfOpenSessions: 4, MaxHalfOpenPerSource: 2,
 		SYNRateInterval: time.Second, SYNBurst: 4, SYNBurstPerSource: 2,
+		SYNSourceLedgerCapacity: 8, SYNSourceLedgerTTL: 10 * time.Second,
 		MaxPendingFlows:          4,
 		MaxPendingPacketsPerFlow: 2, MaxPendingBytes: 64,
 		HandshakeTimeout: time.Second, HandshakeRetries: 2,
@@ -162,6 +163,123 @@ func TestServerDuplicateSYNAndACKTransitions(t *testing.T) {
 	actions, err = engine.Inbound(flow, Segment{Flags: FlagACK, Acknowledgement: 1001})
 	if err != nil || len(actions) != 1 || actions[0].Kind != ActionForward {
 		t.Fatalf("duplicate ack actions=%#v err=%v", actions, err)
+	}
+}
+
+func TestDuplicateSYNConsumesSourceAndGlobalTokens(t *testing.T) {
+	engine, _ := testEngine(t, func(o *Options) {
+		o.SYNBurst = 4
+		o.SYNBurstPerSource = 2
+	})
+	flow := testFlow(31001)
+	for attempt := 1; attempt <= 2; attempt++ {
+		actions, err := engine.Inbound(flow, Segment{Flags: FlagSYN, Sequence: 7000})
+		if err != nil || len(actions) != 1 || (actions[0].Reason != "accept-syn" && actions[0].Reason != "duplicate-syn") {
+			t.Fatalf("attempt %d actions=%#v err=%v", attempt, actions, err)
+		}
+	}
+	actions, err := engine.Inbound(flow, Segment{Flags: FlagSYN, Sequence: 7000})
+	if err != nil || len(actions) != 1 || actions[0].Reason != "syn-rate-source" {
+		t.Fatalf("third duplicate actions=%#v err=%v", actions, err)
+	}
+}
+
+func TestSYNResetLoopCannotResetSourceTokenHistory(t *testing.T) {
+	engine, _ := testEngine(t, func(o *Options) {
+		o.SYNBurst = 4
+		o.SYNBurstPerSource = 1
+	})
+	first := testFlow(31001)
+	if actions, err := engine.Inbound(first, Segment{Flags: FlagSYN, Sequence: 100}); err != nil || actions[0].Reason != "accept-syn" {
+		t.Fatalf("first SYN actions=%#v err=%v", actions, err)
+	}
+	if actions, err := engine.Inbound(first, Segment{Flags: FlagRST}); err != nil || actions[0].Kind != ActionClose {
+		t.Fatalf("RST actions=%#v err=%v", actions, err)
+	}
+	second := testFlow(31002)
+	actions, err := engine.Inbound(second, Segment{Flags: FlagSYN, Sequence: 200})
+	if err != nil || len(actions) != 1 || actions[0].Reason != "syn-rate-source" {
+		t.Fatalf("post-RST SYN reset source history: actions=%#v err=%v", actions, err)
+	}
+}
+
+func TestSuccessfulAndRejectedSYNsDoNotRefundSourceTokens(t *testing.T) {
+	t.Run("successful-handshake", func(t *testing.T) {
+		engine, _ := testEngine(t, func(o *Options) {
+			o.SYNBurst = 4
+			o.SYNBurstPerSource = 1
+		})
+		first := testFlow(31001)
+		if _, err := engine.Inbound(first, Segment{Flags: FlagSYN, Sequence: 100}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := engine.Inbound(first, Segment{Flags: FlagACK, Acknowledgement: 1001}); err != nil {
+			t.Fatal(err)
+		}
+		second := testFlow(31002)
+		if actions, err := engine.Inbound(second, Segment{Flags: FlagSYN, Sequence: 200}); err != nil || actions[0].Reason != "syn-rate-source" {
+			t.Fatalf("successful handshake refunded token: actions=%#v err=%v", actions, err)
+		}
+	})
+
+	t.Run("half-open-rejection", func(t *testing.T) {
+		engine, _ := testEngine(t, func(o *Options) {
+			o.MaxHalfOpenSessions = 1
+			o.MaxHalfOpenPerSource = 1
+			o.SYNBurst = 8
+			o.SYNBurstPerSource = 1
+		})
+		blocking := testFlow(31001)
+		blocking.RemoteIPv4++
+		if _, err := engine.Inbound(blocking, Segment{Flags: FlagSYN, Sequence: 100}); err != nil {
+			t.Fatal(err)
+		}
+		rejected := testFlow(31002)
+		if actions, err := engine.Inbound(rejected, Segment{Flags: FlagSYN, Sequence: 200}); err != nil || actions[0].Reason != "half-open-capacity" {
+			t.Fatalf("capacity rejection actions=%#v err=%v", actions, err)
+		}
+		if _, err := engine.Inbound(blocking, Segment{Flags: FlagRST}); err != nil {
+			t.Fatal(err)
+		}
+		retry := testFlow(31003)
+		if actions, err := engine.Inbound(retry, Segment{Flags: FlagSYN, Sequence: 201}); err != nil || actions[0].Reason != "syn-rate-source" {
+			t.Fatalf("rejected SYN refunded token: actions=%#v err=%v", actions, err)
+		}
+	})
+}
+
+func TestBoundedSYNSourceLedgerPreservesKnownLegitimateSource(t *testing.T) {
+	engine, clock := testEngine(t, func(o *Options) {
+		o.SYNBurst = 16
+		o.SYNBurstPerSource = 1
+		o.SYNSourceLedgerCapacity = 4
+		o.SYNSourceLedgerTTL = 10 * time.Second
+	})
+	legitimate := testFlow(31001)
+	if _, err := engine.Inbound(legitimate, Segment{Flags: FlagSYN, Sequence: 100}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Inbound(legitimate, Segment{Flags: FlagRST}); err != nil {
+		t.Fatal(err)
+	}
+	for source := uint32(1); source <= 3; source++ {
+		flow := testFlow(uint16(32000 + source))
+		flow.RemoteIPv4 += source
+		if actions, err := engine.Inbound(flow, Segment{Flags: FlagSYN, Sequence: source}); err != nil || actions[0].Reason != "accept-syn" {
+			t.Fatalf("flood source %d actions=%#v err=%v", source, actions, err)
+		}
+	}
+	overflow := testFlow(33000)
+	overflow.RemoteIPv4 += 100
+	if actions, err := engine.Inbound(overflow, Segment{Flags: FlagSYN, Sequence: 1}); err != nil || actions[0].Reason != "syn-source-ledger-capacity" {
+		t.Fatalf("overflow actions=%#v err=%v", actions, err)
+	}
+	if len(engine.synSources) != 4 {
+		t.Fatalf("ledger size=%d, want hard bound 4", len(engine.synSources))
+	}
+	clock.Add(time.Second)
+	if actions, err := engine.Inbound(legitimate, Segment{Flags: FlagSYN, Sequence: 101}); err != nil || actions[0].Reason != "accept-syn" {
+		t.Fatalf("known legitimate source starved by flood: actions=%#v err=%v", actions, err)
 	}
 }
 
@@ -371,8 +489,9 @@ func TestSYNFloodCannotEnterOrEvictEstablishedFastState(t *testing.T) {
 		o.Store = store
 		o.MaxHalfOpenSessions = 3
 		o.MaxHalfOpenPerSource = 1
-		o.SYNBurst = 8
+		o.SYNBurst = 32
 		o.SYNBurstPerSource = 1
+		o.SYNSourceLedgerCapacity = 16
 		o.HandshakeRetries = 1
 	})
 	established := testFlow(31001)

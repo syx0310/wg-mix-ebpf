@@ -87,6 +87,8 @@ type WireGuardState struct {
 	FakeTCPSYNRateIntervalNanos     int64  `json:"faketcp_syn_rate_interval_nanos,omitempty"`
 	FakeTCPSYNBurst                 uint32 `json:"faketcp_syn_burst,omitempty"`
 	FakeTCPSYNBurstPerSource        uint32 `json:"faketcp_syn_burst_per_source,omitempty"`
+	FakeTCPSYNSourceLedgerCapacity  uint32 `json:"faketcp_syn_source_ledger_capacity,omitempty"`
+	FakeTCPSYNSourceLedgerTTLNanos  int64  `json:"faketcp_syn_source_ledger_ttl_nanos,omitempty"`
 	FakeTCPMaxPendingFlows          uint32 `json:"faketcp_max_pending_flows,omitempty"`
 	FakeTCPMaxPendingPacketsPerFlow uint32 `json:"faketcp_max_pending_packets_per_flow,omitempty"`
 	FakeTCPMaxPendingBytes          uint32 `json:"faketcp_max_pending_bytes,omitempty"`
@@ -329,6 +331,8 @@ func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.Wire
 		FakeTCPSYNRateIntervalNanos:     wg.Transport.FakeTCP.SYNRateInterval.Duration.Nanoseconds(),
 		FakeTCPSYNBurst:                 wg.Transport.FakeTCP.SYNBurst,
 		FakeTCPSYNBurstPerSource:        wg.Transport.FakeTCP.SYNBurstPerSource,
+		FakeTCPSYNSourceLedgerCapacity:  wg.Transport.FakeTCP.SYNSourceLedgerCapacity,
+		FakeTCPSYNSourceLedgerTTLNanos:  wg.Transport.FakeTCP.SYNSourceLedgerTTL.Duration.Nanoseconds(),
 		FakeTCPMaxPendingFlows:          wg.Transport.FakeTCP.MaxPendingFlows,
 		FakeTCPMaxPendingPacketsPerFlow: wg.Transport.FakeTCP.MaxPendingPacketsPerFlow,
 		FakeTCPMaxPendingBytes:          wg.Transport.FakeTCP.MaxPendingBytes,

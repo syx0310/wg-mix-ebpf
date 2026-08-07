@@ -330,6 +330,7 @@ ciphers:
 	if fake.SessionCapacity != 4096 || fake.MaxHalfOpenSessions != 1024 ||
 		fake.MaxHalfOpenPerSource != 16 || fake.SYNRateInterval.Duration != 100*time.Millisecond ||
 		fake.SYNBurst != 256 || fake.SYNBurstPerSource != 8 ||
+		fake.SYNSourceLedgerCapacity != 4096 || fake.SYNSourceLedgerTTL.Duration != 5*time.Minute ||
 		fake.MaxPendingPacketsPerFlow != 1 {
 		t.Fatalf("faketcp bounds = %#v", fake)
 	}
