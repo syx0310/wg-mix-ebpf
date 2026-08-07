@@ -119,23 +119,22 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
             '"0:0:500:1:regular file"',
             'runner_actual_sha="$("${SHA256_BIN}" -- /proc/self/fd/9)"',
             '"${runner_actual_sha}" == "${RUNNER_SHA256}"',
-            'exec 6<"${SOURCE_LAUNCHER}"',
-            'exec 7<"${SOURCE_HELPER}"',
-            'exec 8<"${SOURCE_MANIFEST}"',
-            '"${path_stat}" == "${fd_stat}"',
-            '"${actual_sha}" == "${approved_sha}"',
-            "validate_approved_source launcher",
-            "validate_approved_source helper",
-            "validate_approved_source manifest",
+            'readonly PYTHON_BIN="/usr/bin/python3"',
+            'readonly APPROVED_SOURCE_COPY_PROGRAM_VERSION="1"',
+            'os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC',
+            "source_fd = os.open(source, source_flags)",
+            "copy_approved_source launcher",
+            "copy_approved_source helper",
+            "copy_approved_source manifest",
         ):
             self.assertIn(fragment, self.runner)
         self.assertLess(
             self.runner.index('"${runner_actual_sha}" == "${RUNNER_SHA256}"'),
-            self.runner.index("validate_approved_source launcher"),
+            self.runner.index("copy_approved_source launcher"),
         )
         self.assertLess(
-            self.runner.index("validate_approved_source manifest"),
-            self.runner.index('AUDIT_PATH="${runner_directory}/root-stage-runner.audit"'),
+            self.runner.index("AUDIT_READY=1"),
+            self.runner.index("copy_approved_source launcher"),
         )
         self.assertIn(
             "bash -n scripts/inspect-linux-test-host.sh",
@@ -166,8 +165,8 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
         ):
             self.assertIn(option, self.runner)
         for fragment in (
-            '"${INSTALL_BIN}" -o 0 -g 0 -m 0500 --',
-            '"${INSTALL_BIN}" -o 0 -g 0 -m 0400 --',
+            '"${PYTHON_BIN}" -I -B -c "${APPROVED_SOURCE_COPY_PROGRAM}"',
+            '"${source}" "${approved_sha}" "${target}" "${mode}"',
             "validate_root_copy launcher",
             "validate_root_copy helper",
             "validate_root_copy manifest",
@@ -177,68 +176,64 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
             self.assertIn(fragment, self.runner)
         self.assertNotIn("safe.directory", self.runner)
 
-    def test_root_runner_copies_only_from_held_verified_descriptors(self) -> None:
-        descriptor_contracts = (
+    def test_root_runner_atomically_opens_and_copies_approved_sources(self) -> None:
+        copy_contracts = (
             (
                 "launcher",
                 "LAUNCHER",
-                'readonly LAUNCHER_SOURCE_FD_PATH="/proc/self/fd/6"',
-                'exec 6<"${SOURCE_LAUNCHER}"',
+                "root_launcher",
+                "0500",
             ),
             (
                 "helper",
                 "HELPER",
-                'readonly HELPER_SOURCE_FD_PATH="/proc/self/fd/7"',
-                'exec 7<"${SOURCE_HELPER}"',
+                "root_helper",
+                "0400",
             ),
             (
                 "manifest",
                 "MANIFEST",
-                'readonly MANIFEST_SOURCE_FD_PATH="/proc/self/fd/8"',
-                'exec 8<"${SOURCE_MANIFEST}"',
+                "root_manifest",
+                "0400",
             ),
         )
-        for label, upper, path_constant, open_fragment in descriptor_contracts:
-            fd_path = f'"${{{upper}_SOURCE_FD_PATH}}"'
-            expected_stat = f'"${{{upper}_SOURCE_FD_STAT}}"'
-            approved_sha = f'"${{{upper}_SHA256}}"'
-            initial_validation = (
-                f"validate_approved_source {label} "
-                f'"${{SOURCE_{upper}}}" {approved_sha} \\\n'
-                f"  {fd_path} {upper}_SOURCE_FD_STAT"
+        for label, upper, target, mode in copy_contracts:
+            copy_call = (
+                f'copy_approved_source {label} "${{SOURCE_{upper}}}" '
+                f'"${{{upper}_SHA256}}" \\\n'
+                f'  "${{{target}}}" {mode}'
             )
-            precopy = (
-                f"revalidate_held_source {label} {fd_path} \\\n"
-                f"  {expected_stat} {approved_sha} precopy"
-            )
-            install_start = f"run_write install_root_{label}"
-            postcopy = (
-                f"revalidate_held_source {label} {fd_path} \\\n"
-                f"  {expected_stat} {approved_sha} postcopy"
-            )
+            postcopy = f"validate_root_copy {label}"
+            self.assertIn(copy_call, self.runner)
+            copy_at = self.runner.index(copy_call)
+            postcopy_at = self.runner.index(postcopy, copy_at)
+            self.assertLess(copy_at, postcopy_at)
 
-            self.assertIn(path_constant, self.runner)
-            self.assertIn(open_fragment, self.runner)
-            self.assertIn(initial_validation, self.runner)
-            self.assertIn(precopy, self.runner)
-            self.assertIn(postcopy, self.runner)
-            open_at = self.runner.index(open_fragment)
-            initial_at = self.runner.index(initial_validation)
-            precopy_at = self.runner.index(precopy)
-            install_at = self.runner.index(install_start, precopy_at)
-            postcopy_at = self.runner.index(postcopy, install_at)
-            self.assertLess(open_at, initial_at)
-            self.assertLess(initial_at, precopy_at)
-            self.assertLess(precopy_at, install_at)
-            self.assertLess(install_at, postcopy_at)
-            install_block = self.runner[install_at:postcopy_at]
-            self.assertIn(fd_path, install_block)
-            self.assertNotIn(f'"${{SOURCE_{upper}}}"', install_block)
-
-        self.assertNotIn("exec {source_fd}", self.runner)
-        self.assertNotRegex(self.runner, r"exec [678]<&-")
-        self.assertIn("source_size > APPROVED_SOURCE_MAX_BYTES", self.runner)
-        self.assertIn('[[ "${actual_sha}" != "${approved_sha}" ]]', self.runner)
+        for fragment in (
+            "source_fd = os.open(source, source_flags)",
+            "source_before = os.fstat(source_fd)",
+            "stat.S_ISREG(source_before.st_mode)",
+            "source_before.st_nlink != 1",
+            "source_before.st_size > max_bytes",
+            "source_sha_before = hash_exact_size(",
+            "target_fd = os.open(target, target_flags, modes[mode_text])",
+            "os.O_EXCL",
+            "copied_sha256 = copy_exact_size(",
+            "source_after_copy = os.fstat(source_fd)",
+            "source_sha_after = hash_exact_size(",
+            "target_sha256 = hash_exact_size(",
+            'run_write "copy_root_${label}" "${target}" "${copy_argv[@]}"',
+        ):
+            self.assertIn(fragment, self.runner)
+        self.assertNotRegex(self.runner, r'exec [0-9]+<"\$\{SOURCE_')
+        self.assertNotIn("/proc/self/fd/6", self.runner)
+        self.assertNotIn("/proc/self/fd/7", self.runner)
+        self.assertNotIn("/proc/self/fd/8", self.runner)
+        self.assertNotIn("validate_approved_source_path", self.runner)
+        self.assertNotIn("revalidate_held_source", self.runner)
+        self.assertNotIn("os.lstat(source)", self.runner)
+        self.assertNotIn('"${BASH_BIN}" -c', self.runner)
+        self.assertNotRegex(self.runner, r"(?m)^\s*eval\b")
         self.assertIn(
             "python3 scripts/test_root_stage_source_fd.py",
             self.makefile,
@@ -249,9 +244,10 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
             "timestamp=%q host=%q event=%q action=%q argv=%q target=%q rc=%q",
             "emit_audit write_start",
             "emit_audit write_finish",
-            "install_root_launcher",
-            "install_root_helper",
-            "install_root_manifest",
+            'run_write "copy_root_${label}"',
+            "validate_root_copy launcher",
+            "validate_root_copy helper",
+            "validate_root_copy manifest",
             "execute_root_stage",
             '"${BOOTSTRAP_PREFIX},${runner_directory},${STAGE_PREFIX},${stage_run}"',
         ):

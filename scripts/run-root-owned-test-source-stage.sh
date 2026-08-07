@@ -28,19 +28,202 @@ readonly DIRNAME_BIN="/usr/bin/dirname"
 readonly ENV_BIN="/usr/bin/env"
 readonly HOSTNAME_BIN="/usr/bin/hostname"
 readonly INSTALL_BIN="/usr/bin/install"
+readonly PYTHON_BIN="/usr/bin/python3"
 readonly READLINK_BIN="/usr/bin/readlink"
 readonly SHA256_BIN="/usr/bin/sha256sum"
 readonly STAT_BIN="/usr/bin/stat"
 readonly APPROVED_SOURCE_MAX_BYTES=16777216
+readonly APPROVED_SOURCE_COPY_PROGRAM_VERSION="1"
 readonly BOOTSTRAP_PREFIX="/run/wg-mix-ebpf-source-bootstrap"
 readonly STAGE_PREFIX="/run/wg-mix-ebpf-source-stages"
 readonly RUNNER_BASENAME="run-root-owned-test-source-stage.sh"
 readonly LAUNCHER_BASENAME="stage-root-owned-test-source.sh"
 readonly HELPER_BASENAME="stage-root-owned-test-source.py"
 readonly MANIFEST_BASENAME="stage-root-owned-test-source.bootstrap"
-readonly LAUNCHER_SOURCE_FD_PATH="/proc/self/fd/6"
-readonly HELPER_SOURCE_FD_PATH="/proc/self/fd/7"
-readonly MANIFEST_SOURCE_FD_PATH="/proc/self/fd/8"
+# This exact isolated -c program is covered by the externally approved runner
+# SHA-256. It never imports or executes a helper from the user-owned checkout.
+readonly APPROVED_SOURCE_COPY_PROGRAM='import hashlib
+import os
+import stat
+import sys
+
+CHUNK_BYTES = 65536
+HEX_DIGITS = frozenset("0123456789abcdef")
+PROGRAM_VERSION = "1"
+PROGRAM_MAX_BYTES = 16777216
+
+
+def fail(message):
+    raise ValueError(message)
+
+
+def exact_stat(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+        metadata.st_mode,
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def hash_exact_size(descriptor, expected_size, label):
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    remaining = expected_size
+    while remaining:
+        chunk = os.read(descriptor, min(CHUNK_BYTES, remaining))
+        if not chunk:
+            fail(f"{label} became shorter while hashing")
+        digest.update(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1) != b"":
+        fail(f"{label} became larger while hashing")
+    return digest.hexdigest()
+
+
+def write_all(descriptor, data):
+    view = memoryview(data)
+    while view:
+        written = os.write(descriptor, view)
+        if written <= 0:
+            fail("target write made no progress")
+        view = view[written:]
+
+
+def copy_exact_size(source_fd, target_fd, expected_size):
+    os.lseek(source_fd, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    remaining = expected_size
+    while remaining:
+        chunk = os.read(source_fd, min(CHUNK_BYTES, remaining))
+        if not chunk:
+            fail("source became shorter while copying")
+        digest.update(chunk)
+        write_all(target_fd, chunk)
+        remaining -= len(chunk)
+    if os.read(source_fd, 1) != b"":
+        fail("source became larger while copying")
+    return digest.hexdigest()
+
+
+def main():
+    if len(sys.argv) != 7:
+        fail("expected version, source, sha256, target, mode, and max bytes")
+    version, source, approved_sha256, target, mode_text, max_text = sys.argv[1:]
+    if version != PROGRAM_VERSION:
+        fail("approved source copier version mismatch")
+    if len(approved_sha256) != 64 or any(
+        character not in HEX_DIGITS for character in approved_sha256
+    ):
+        fail("approved SHA-256 is malformed")
+    if not os.path.isabs(source) or os.path.normpath(source) != source:
+        fail("source path is not canonical and absolute")
+    if not os.path.isabs(target) or os.path.normpath(target) != target:
+        fail("target path is not canonical and absolute")
+    if source == target:
+        fail("source and target paths must differ")
+    modes = {"0500": 0o500, "0400": 0o400}
+    if mode_text not in modes:
+        fail("target mode is not approved")
+    try:
+        max_bytes = int(max_text, 10)
+    except ValueError:
+        fail("maximum byte count is malformed")
+    if str(max_bytes) != max_text or max_bytes != PROGRAM_MAX_BYTES:
+        fail("maximum byte count does not match the program contract")
+
+    source_flags = (
+        os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
+    )
+    target_fd = -1
+    source_fd = os.open(source, source_flags)
+    try:
+        source_before = os.fstat(source_fd)
+        if not stat.S_ISREG(source_before.st_mode):
+            fail("source descriptor is not a regular file")
+        if source_before.st_nlink != 1:
+            fail("source descriptor does not have exactly one link")
+        if source_before.st_size < 0 or source_before.st_size > max_bytes:
+            fail("source descriptor exceeds the approved byte limit")
+        source_identity = exact_stat(source_before)
+        source_sha_before = hash_exact_size(
+            source_fd, source_before.st_size, "source"
+        )
+        source_after_hash = os.fstat(source_fd)
+        if exact_stat(source_after_hash) != source_identity:
+            fail("source descriptor changed while hashing")
+        if source_sha_before != approved_sha256:
+            fail("source descriptor SHA-256 mismatch")
+
+        target_flags = (
+            os.O_RDWR
+            | os.O_CREAT
+            | os.O_EXCL
+            | os.O_NOFOLLOW
+            | os.O_CLOEXEC
+        )
+        target_fd = os.open(target, target_flags, modes[mode_text])
+        target_created = os.fstat(target_fd)
+        if not stat.S_ISREG(target_created.st_mode):
+            fail("new target descriptor is not a regular file")
+        if target_created.st_nlink != 1 or target_created.st_size != 0:
+            fail("new target descriptor metadata is unsafe")
+
+        copied_sha256 = copy_exact_size(
+            source_fd, target_fd, source_before.st_size
+        )
+        os.fchmod(target_fd, modes[mode_text])
+        os.fsync(target_fd)
+
+        source_after_copy = os.fstat(source_fd)
+        if exact_stat(source_after_copy) != source_identity:
+            fail("source descriptor changed while copying")
+        source_sha_after = hash_exact_size(
+            source_fd, source_before.st_size, "source"
+        )
+        source_final = os.fstat(source_fd)
+        if exact_stat(source_final) != source_identity:
+            fail("source descriptor changed during final hashing")
+        if source_sha_after != approved_sha256 or copied_sha256 != approved_sha256:
+            fail("source descriptor or copied bytes failed final SHA-256")
+
+        target_after_copy = os.fstat(target_fd)
+        if not stat.S_ISREG(target_after_copy.st_mode):
+            fail("copied target descriptor is not a regular file")
+        if target_after_copy.st_nlink != 1:
+            fail("copied target descriptor does not have exactly one link")
+        if target_after_copy.st_size != source_before.st_size:
+            fail("copied target size mismatch")
+        if stat.S_IMODE(target_after_copy.st_mode) != modes[mode_text]:
+            fail("copied target mode mismatch")
+        target_identity = exact_stat(target_after_copy)
+        target_sha256 = hash_exact_size(
+            target_fd, source_before.st_size, "target"
+        )
+        if exact_stat(os.fstat(target_fd)) != target_identity:
+            fail("target descriptor changed during final hashing")
+        if target_sha256 != approved_sha256:
+            fail("target descriptor SHA-256 mismatch")
+        print(
+            f"version={version} bytes={source_before.st_size} "
+            f"source_sha256={source_sha_after} target={target}"
+        )
+    finally:
+        if target_fd >= 0:
+            os.close(target_fd)
+        os.close(source_fd)
+
+
+try:
+    main()
+except (OSError, ValueError) as error:
+    print(f"error: approved source copier: {error}", file=sys.stderr)
+    sys.exit(1)'
 export PATH LC_ALL
 unset CDPATH
 umask 077
@@ -165,8 +348,8 @@ fi
 
 for tool in \
   "${BASENAME_BIN}" "${BASH_BIN}" "${DATE_BIN}" "${DIRNAME_BIN}" \
-  "${ENV_BIN}" "${HOSTNAME_BIN}" "${INSTALL_BIN}" "${READLINK_BIN}" \
-  "${SHA256_BIN}" "${STAT_BIN}"; do
+  "${ENV_BIN}" "${HOSTNAME_BIN}" "${INSTALL_BIN}" "${PYTHON_BIN}" \
+  "${READLINK_BIN}" "${SHA256_BIN}" "${STAT_BIN}"; do
   [[ -x "${tool}" && -f "${tool}" ]] || {
     printf 'error: fixed runner tool is unavailable: %s\n' "${tool}" >&2
     exit 1
@@ -232,99 +415,6 @@ runner_actual_sha="${runner_actual_sha%% *}"
   echo "error: runner changed while hashing" >&2
   exit 1
 }
-
-validate_approved_source_path() {
-  local label="$1"
-  local path="$2"
-  local approved_sha="$3"
-  local metadata
-  local source_size
-
-  if ! valid_absolute_path "${path}" ||
-    ! valid_sha256 "${approved_sha}" ||
-    [[ -L "${path}" || ! -f "${path}" ]] ||
-    [[ "$("${READLINK_BIN}" -e -- "${path}")" != "${path}" ]]; then
-    printf 'error: approved %s source path is unsafe: %s\n' \
-      "${label}" "${path}" >&2
-    return 1
-  fi
-  metadata="$("${STAT_BIN}" -Lc '%h:%s:%F' -- "${path}")"
-  if [[ ! "${metadata}" =~ ^1:([0-9]+):regular\ file$ ]]; then
-    printf 'error: approved %s source is not a one-link regular file\n' \
-      "${label}" >&2
-    return 1
-  fi
-  source_size="${BASH_REMATCH[1]}"
-  if ((source_size > APPROVED_SOURCE_MAX_BYTES)); then
-    printf 'error: approved %s source exceeds the byte limit: %s\n' \
-      "${label}" "${source_size}" >&2
-    return 1
-  fi
-}
-
-validate_approved_source() {
-  local label="$1"
-  local path="$2"
-  local approved_sha="$3"
-  local fd_path="$4"
-  local stat_output_name="$5"
-  local path_stat
-  local fd_stat
-  local fd_metadata
-  local source_size
-  local actual_sha
-
-  fd_metadata="$("${STAT_BIN}" -Lc '%h:%s:%F' -- "${fd_path}")"
-  if [[ ! "${fd_metadata}" =~ ^1:([0-9]+):regular\ file$ ]]; then
-    printf 'error: approved %s source descriptor is not a one-link regular file\n' \
-      "${label}" >&2
-    return 1
-  fi
-  source_size="${BASH_REMATCH[1]}"
-  if ((source_size > APPROVED_SOURCE_MAX_BYTES)); then
-    printf 'error: approved %s source descriptor exceeds the byte limit: %s\n' \
-      "${label}" "${source_size}" >&2
-    return 1
-  fi
-  path_stat="$("${STAT_BIN}" -Lc '%d:%i:%u:%g:%f:%h:%s:%Y:%Z' -- "${path}")"
-  fd_stat="$("${STAT_BIN}" -Lc '%d:%i:%u:%g:%f:%h:%s:%Y:%Z' -- "${fd_path}")"
-  [[ "${path_stat}" == "${fd_stat}" ]] || {
-    printf 'error: approved %s source path/descriptor identity differs\n' \
-      "${label}" >&2
-    return 1
-  }
-  actual_sha="$("${SHA256_BIN}" -- "${fd_path}")"
-  actual_sha="${actual_sha%% *}"
-  [[ "${actual_sha}" == "${approved_sha}" &&
-    "$("${STAT_BIN}" -Lc '%d:%i:%u:%g:%f:%h:%s:%Y:%Z' -- "${path}")" == \
-    "${path_stat}" &&
-    "$("${STAT_BIN}" -Lc '%d:%i:%u:%g:%f:%h:%s:%Y:%Z' -- "${fd_path}")" == \
-    "${fd_stat}" ]] || {
-    printf 'error: approved %s source changed or has SHA mismatch\n' \
-      "${label}" >&2
-    return 1
-  }
-  printf -v "${stat_output_name}" '%s' "${fd_stat}"
-}
-
-validate_approved_source_path launcher "${SOURCE_LAUNCHER}" "${LAUNCHER_SHA256}"
-exec 6<"${SOURCE_LAUNCHER}"
-LAUNCHER_SOURCE_FD_STAT=""
-validate_approved_source launcher "${SOURCE_LAUNCHER}" "${LAUNCHER_SHA256}" \
-  "${LAUNCHER_SOURCE_FD_PATH}" LAUNCHER_SOURCE_FD_STAT
-
-validate_approved_source_path helper "${SOURCE_HELPER}" "${HELPER_SHA256}"
-exec 7<"${SOURCE_HELPER}"
-HELPER_SOURCE_FD_STAT=""
-validate_approved_source helper "${SOURCE_HELPER}" "${HELPER_SHA256}" \
-  "${HELPER_SOURCE_FD_PATH}" HELPER_SOURCE_FD_STAT
-
-validate_approved_source_path manifest "${SOURCE_MANIFEST}" "${MANIFEST_SHA256}"
-exec 8<"${SOURCE_MANIFEST}"
-MANIFEST_SOURCE_FD_STAT=""
-validate_approved_source manifest "${SOURCE_MANIFEST}" "${MANIFEST_SHA256}" \
-  "${MANIFEST_SOURCE_FD_PATH}" MANIFEST_SOURCE_FD_STAT
-readonly LAUNCHER_SOURCE_FD_STAT HELPER_SOURCE_FD_STAT MANIFEST_SOURCE_FD_STAT
 
 HOST_ID="$("${HOSTNAME_BIN}")"
 [[ -n "${HOST_ID}" && ! "${HOST_ID}" =~ [[:space:]] ]] || {
@@ -439,57 +529,20 @@ for target in "${root_launcher}" "${root_helper}" "${root_manifest}"; do
   }
 done
 
-revalidate_held_source() {
+copy_approved_source() {
   local label="$1"
-  local fd_path="$2"
-  local expected_stat="$3"
-  local approved_sha="$4"
-  local phase="$5"
-  local action="${phase}_${label}_source_fd"
-  local fd_metadata
-  local source_size
-  local before_stat
-  local after_stat
-  local sha_output
-  local actual_sha
+  local source="$2"
+  local approved_sha="$3"
+  local target="$4"
+  local mode="$5"
+  local -a copy_argv=(
+    "${PYTHON_BIN}" -I -B -c "${APPROVED_SOURCE_COPY_PROGRAM}"
+    "${APPROVED_SOURCE_COPY_PROGRAM_VERSION}"
+    "${source}" "${approved_sha}" "${target}" "${mode}"
+    "${APPROVED_SOURCE_MAX_BYTES}"
+  )
 
-  if ! fd_metadata="$("${STAT_BIN}" -Lc '%h:%s:%F' -- "${fd_path}")"; then
-    emit_audit validation_failure "${action}" "${fd_path}" 1 \
-      "stat-unavailable expected=${expected_stat}"
-    return 1
-  fi
-  if [[ ! "${fd_metadata}" =~ ^1:([0-9]+):regular\ file$ ]]; then
-    emit_audit validation_failure "${action}" "${fd_path}" 1 \
-      "unsafe-metadata=${fd_metadata} expected=${expected_stat}"
-    return 1
-  fi
-  source_size="${BASH_REMATCH[1]}"
-  if ((source_size > APPROVED_SOURCE_MAX_BYTES)); then
-    emit_audit validation_failure "${action}" "${fd_path}" 1 \
-      "size=${source_size} max_bytes=${APPROVED_SOURCE_MAX_BYTES}"
-    return 1
-  fi
-  if ! before_stat="$("${STAT_BIN}" -Lc '%d:%i:%u:%g:%f:%h:%s:%Y:%Z' -- "${fd_path}")" ||
-    [[ "${before_stat}" != "${expected_stat}" ]]; then
-    emit_audit validation_failure "${action}" "${fd_path}" 1 \
-      "stat=${before_stat:-unavailable} expected=${expected_stat}"
-    return 1
-  fi
-  if ! sha_output="$("${SHA256_BIN}" -- "${fd_path}")"; then
-    emit_audit validation_failure "${action}" "${fd_path}" 1 \
-      "sha256-command-failed expected=${approved_sha}"
-    return 1
-  fi
-  actual_sha="${sha_output%% *}"
-  if ! after_stat="$("${STAT_BIN}" -Lc '%d:%i:%u:%g:%f:%h:%s:%Y:%Z' -- "${fd_path}")" ||
-    [[ "${after_stat}" != "${expected_stat}" ]] ||
-    [[ "${actual_sha}" != "${approved_sha}" ]]; then
-    emit_audit validation_failure "${action}" "${fd_path}" 1 \
-      "stat=${after_stat:-unavailable} expected_stat=${expected_stat} sha256=${actual_sha} expected_sha256=${approved_sha}"
-    return 1
-  fi
-  emit_audit validation_success "${action}" "${fd_path}" 0 \
-    "stat=${after_stat} sha256=${actual_sha} max_bytes=${APPROVED_SOURCE_MAX_BYTES}"
+  run_write "copy_root_${label}" "${target}" "${copy_argv[@]}"
 }
 
 validate_root_copy() {
@@ -517,31 +570,16 @@ validate_root_copy() {
     "sha256=${actual_sha} stat=0:0:${mode}:1:regular-file"
 }
 
-revalidate_held_source launcher "${LAUNCHER_SOURCE_FD_PATH}" \
-  "${LAUNCHER_SOURCE_FD_STAT}" "${LAUNCHER_SHA256}" precopy
-run_write install_root_launcher "${root_launcher}" \
-  "${INSTALL_BIN}" -o 0 -g 0 -m 0500 -- \
-  "${LAUNCHER_SOURCE_FD_PATH}" "${root_launcher}"
-revalidate_held_source launcher "${LAUNCHER_SOURCE_FD_PATH}" \
-  "${LAUNCHER_SOURCE_FD_STAT}" "${LAUNCHER_SHA256}" postcopy
+copy_approved_source launcher "${SOURCE_LAUNCHER}" "${LAUNCHER_SHA256}" \
+  "${root_launcher}" 0500
 validate_root_copy launcher "${root_launcher}" 500 "${LAUNCHER_SHA256}"
 
-revalidate_held_source helper "${HELPER_SOURCE_FD_PATH}" \
-  "${HELPER_SOURCE_FD_STAT}" "${HELPER_SHA256}" precopy
-run_write install_root_helper "${root_helper}" \
-  "${INSTALL_BIN}" -o 0 -g 0 -m 0400 -- \
-  "${HELPER_SOURCE_FD_PATH}" "${root_helper}"
-revalidate_held_source helper "${HELPER_SOURCE_FD_PATH}" \
-  "${HELPER_SOURCE_FD_STAT}" "${HELPER_SHA256}" postcopy
+copy_approved_source helper "${SOURCE_HELPER}" "${HELPER_SHA256}" \
+  "${root_helper}" 0400
 validate_root_copy helper "${root_helper}" 400 "${HELPER_SHA256}"
 
-revalidate_held_source manifest "${MANIFEST_SOURCE_FD_PATH}" \
-  "${MANIFEST_SOURCE_FD_STAT}" "${MANIFEST_SHA256}" precopy
-run_write install_root_manifest "${root_manifest}" \
-  "${INSTALL_BIN}" -o 0 -g 0 -m 0400 -- \
-  "${MANIFEST_SOURCE_FD_PATH}" "${root_manifest}"
-revalidate_held_source manifest "${MANIFEST_SOURCE_FD_PATH}" \
-  "${MANIFEST_SOURCE_FD_STAT}" "${MANIFEST_SHA256}" postcopy
+copy_approved_source manifest "${SOURCE_MANIFEST}" "${MANIFEST_SHA256}" \
+  "${root_manifest}" 0400
 validate_root_copy manifest "${root_manifest}" 400 "${MANIFEST_SHA256}"
 
 launch_argv=(
