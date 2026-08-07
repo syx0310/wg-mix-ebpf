@@ -114,12 +114,13 @@ type tcOwnedCreatedQdisc struct {
 type tcAttachStage struct {
 	mu sync.Mutex
 
-	plan    *tcAttachPlan
-	applied []tcAppliedFilter
-	deleted []tcOwnedStaleFilter
-	created []tcOwnedCreatedQdisc
-	done    bool
-	err     error
+	plan       *tcAttachPlan
+	applied    []tcAppliedFilter
+	deleted    []tcOwnedStaleFilter
+	created    []tcOwnedCreatedQdisc
+	rolledBack bool
+	done       bool
+	err        error
 }
 
 func tcProgramIdentityFromProgram(program *ebpf.Program) (tcProgramIdentity, error) {
@@ -935,8 +936,8 @@ func (plan *tcAttachPlan) closeProgramReferences() error {
 	if plan == nil || plan.closed {
 		return nil
 	}
-	plan.closed = true
 	var errs []error
+	retained := false
 	for linkIndex := range plan.links {
 		for filterIndex := range plan.links[linkIndex].filters {
 			program := plan.links[linkIndex].filters[filterIndex].oldProgram
@@ -945,6 +946,8 @@ func (plan *tcAttachPlan) closeProgramReferences() error {
 			}
 			if err := program.Close(); err != nil {
 				errs = append(errs, fmt.Errorf("close retained old TC program: %w", err))
+				retained = true
+				continue
 			}
 			plan.links[linkIndex].filters[filterIndex].oldProgram = nil
 		}
@@ -956,9 +959,12 @@ func (plan *tcAttachPlan) closeProgramReferences() error {
 		}
 		if err := program.Close(); err != nil {
 			errs = append(errs, fmt.Errorf("close retained stale TC program: %w", err))
+			retained = true
+			continue
 		}
 		plan.stale[index].snapshot.oldProgram = nil
 	}
+	plan.closed = !retained
 	return errors.Join(errs...)
 }
 
@@ -980,18 +986,25 @@ func (stage *tcAttachStage) Close() error {
 		return stage.err
 	}
 	plan := stage.plan
-	if err := plan.rollbackRetained(stage); err != nil {
-		stage.err = fmt.Errorf("rollback retained TC attachment: %w", err)
+	if !stage.rolledBack {
+		if err := plan.rollbackRetained(stage); err != nil {
+			stage.err = fmt.Errorf("rollback retained TC attachment: %w", err)
+			return stage.err
+		}
+		stage.rolledBack = true
+		stage.applied = nil
+		stage.deleted = nil
+		stage.created = nil
+	}
+	if err := plan.closeProgramReferences(); err != nil {
+		stage.err = err
 		return stage.err
 	}
 	stage.done = true
 	plan.stage = nil
-	stage.err = plan.closeProgramReferences()
+	stage.err = nil
 	stage.plan = nil
-	stage.applied = nil
-	stage.deleted = nil
-	stage.created = nil
-	return stage.err
+	return nil
 }
 
 // Disarm transfers rollback responsibility out of a retained stage.  It is

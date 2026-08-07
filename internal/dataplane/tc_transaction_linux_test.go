@@ -15,8 +15,10 @@ import (
 )
 
 type fakeTCProgramRef struct {
-	fd     int
-	closed bool
+	fd         int
+	closed     bool
+	closeErrs  []error
+	closeCalls int
 }
 
 func (program *fakeTCProgramRef) FD() int {
@@ -27,6 +29,14 @@ func (program *fakeTCProgramRef) FD() int {
 }
 
 func (program *fakeTCProgramRef) Close() error {
+	program.closeCalls++
+	if len(program.closeErrs) != 0 {
+		err := program.closeErrs[0]
+		program.closeErrs = program.closeErrs[1:]
+		if err != nil {
+			return err
+		}
+	}
 	program.closed = true
 	return nil
 }
@@ -372,6 +382,111 @@ func TestTCAttachRetainedStageRestoresPriorFiltersOnClose(t *testing.T) {
 		if !retained.closed {
 			t.Fatalf("retained prior program %d was not closed", index)
 		}
+	}
+}
+
+func TestTCAttachRetainedStageRetriesOnlyFailedProgramReferenceClose(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	for id, fd := range map[uint32]int{21: 201, 22: 202, 31: 301, 32: 302} {
+		kernel.addProgram(id, fd)
+	}
+	kernel.addClsact(11)
+	kernel.addManagedFilter(11, canonicalTCFilterSlots()[0], 21)
+	kernel.addManagedFilter(11, canonicalTCFilterSlots()[1], 22)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(kernel.retained) != 2 {
+		t.Fatalf("retained references=%d, want 2", len(kernel.retained))
+	}
+	closeErr := errors.New("injected retained program close failure")
+	kernel.retained[0].closeErrs = []error{closeErr}
+	stage, err := plan.ExecuteRetained(func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stage.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("first stage Close error=%v", err)
+	}
+	if !stage.rolledBack || stage.done || stage.plan != plan || plan.stage != stage {
+		t.Fatalf(
+			"failed reference close lost owner: rolledBack=%t done=%t stage plan=%p plan stage=%p",
+			stage.rolledBack, stage.done, stage.plan, plan.stage,
+		)
+	}
+	if kernel.retained[0].closeCalls != 1 || kernel.retained[0].closed ||
+		kernel.retained[1].closeCalls != 1 || !kernel.retained[1].closed {
+		t.Fatalf(
+			"first close states failed=%#v successful=%#v",
+			kernel.retained[0], kernel.retained[1],
+		)
+	}
+	for index, slot := range canonicalTCFilterSlots() {
+		want := uint32(21 + index)
+		if got := kernel.managedProgramID(t, 11, slot); got != want {
+			t.Fatalf("restored %s program=%d want=%d", slot.name, got, want)
+		}
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatalf("retry stage Close error=%v", err)
+	}
+	if kernel.retained[0].closeCalls != 2 || !kernel.retained[0].closed ||
+		kernel.retained[1].closeCalls != 1 || !stage.done || stage.plan != nil || plan.stage != nil {
+		t.Fatalf(
+			"retry did not converge: failed=%#v successful=%#v stage=%#v plan stage=%p",
+			kernel.retained[0], kernel.retained[1], stage, plan.stage,
+		)
+	}
+	if err := stage.Close(); err != nil || kernel.retained[0].closeCalls != 2 || kernel.retained[1].closeCalls != 1 {
+		t.Fatalf(
+			"converged Close error=%v calls=%d/%d",
+			err, kernel.retained[0].closeCalls, kernel.retained[1].closeCalls,
+		)
+	}
+}
+
+func TestTCAttachPlanRetriesOnlyFailedProgramReferenceClose(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	for id, fd := range map[uint32]int{21: 201, 22: 202, 31: 301, 32: 302} {
+		kernel.addProgram(id, fd)
+	}
+	kernel.addClsact(11)
+	kernel.addManagedFilter(11, canonicalTCFilterSlots()[0], 21)
+	kernel.addManagedFilter(11, canonicalTCFilterSlots()[1], 22)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeErr := errors.New("injected direct plan reference close failure")
+	kernel.retained[0].closeErrs = []error{closeErr}
+	if err := plan.Close(); !errors.Is(err, closeErr) {
+		t.Fatalf("first plan Close error=%v", err)
+	}
+	if plan.closed || kernel.retained[0].closeCalls != 1 || kernel.retained[1].closeCalls != 1 {
+		t.Fatalf(
+			"failed plan close state closed=%t calls=%d/%d",
+			plan.closed, kernel.retained[0].closeCalls, kernel.retained[1].closeCalls,
+		)
+	}
+	if err := plan.Close(); err != nil {
+		t.Fatalf("retry plan Close error=%v", err)
+	}
+	if !plan.closed || kernel.retained[0].closeCalls != 2 || kernel.retained[1].closeCalls != 1 {
+		t.Fatalf(
+			"retry plan close state closed=%t calls=%d/%d",
+			plan.closed, kernel.retained[0].closeCalls, kernel.retained[1].closeCalls,
+		)
 	}
 }
 
