@@ -1,5 +1,3 @@
-//go:build linux
-
 package dataplane
 
 import (
@@ -17,6 +15,9 @@ const (
 	fakeTCPCapabilityManagedIngressParser
 	fakeTCPCapabilitySingleWriterState
 	fakeTCPCapabilityHalfOpenProtection
+	fakeTCPCapabilityBPFControlAdmission
+	fakeTCPCapabilityValidatedCloseControl
+	fakeTCPCapabilityL3Parser
 	fakeTCPCapabilityXDPOwnership
 	fakeTCPCapabilityManagedPolicyPopulation
 	fakeTCPCapabilityChecksumStateInspection
@@ -33,6 +34,9 @@ const fakeTCPRequiredCapabilities = fakeTCPCapabilityBaselineIsolation |
 	fakeTCPCapabilityManagedIngressParser |
 	fakeTCPCapabilitySingleWriterState |
 	fakeTCPCapabilityHalfOpenProtection |
+	fakeTCPCapabilityBPFControlAdmission |
+	fakeTCPCapabilityValidatedCloseControl |
+	fakeTCPCapabilityL3Parser |
 	fakeTCPCapabilityXDPOwnership |
 	fakeTCPCapabilityManagedPolicyPopulation |
 	fakeTCPCapabilityChecksumStateInspection |
@@ -48,7 +52,6 @@ const fakeTCPRequiredCapabilities = fakeTCPCapabilityBaselineIsolation |
 // override cannot claim kernel readiness. Each bit moves here only with its
 // implementation and packet/real-NIC acceptance tests in the same change.
 const fakeTCPImplementedCapabilities = fakeTCPCapabilityBaselineIsolation |
-	fakeTCPCapabilityManagedIngressParser |
 	fakeTCPCapabilitySingleWriterState |
 	fakeTCPCapabilityHalfOpenProtection
 
@@ -59,7 +62,10 @@ var fakeTCPRequirements = []struct {
 	{fakeTCPCapabilityBaselineIsolation, "baseline/experimental BPF object isolation"},
 	{fakeTCPCapabilityManagedIngressParser, "managed-port IPv4/IPv6 fail-closed parser"},
 	{fakeTCPCapabilitySingleWriterState, "single-writer established session state"},
-	{fakeTCPCapabilityHalfOpenProtection, "bounded and rate-limited half-open state"},
+	{fakeTCPCapabilityHalfOpenProtection, "bounded and rate-limited userspace half-open state"},
+	{fakeTCPCapabilityBPFControlAdmission, "BPF control-event admission/coalescing under SYN flood"},
+	{fakeTCPCapabilityValidatedCloseControl, "RST/FIN full IPv4/TCP checksum and receive-window validation"},
+	{fakeTCPCapabilityL3Parser, "parser:l3 FakeTCP policy and attachment support"},
 	{fakeTCPCapabilityXDPOwnership, "XDP link ownership/rollback and libxdp chaining"},
 	{fakeTCPCapabilityManagedPolicyPopulation, "atomic managed-interface/port policy population"},
 	{fakeTCPCapabilityChecksumStateInspection, "ip_summed/CHECKSUM_PARTIAL identification"},
@@ -72,13 +78,11 @@ var fakeTCPRequirements = []struct {
 	{fakeTCPCapabilityRealNICOffloadAcceptance, "real-NIC GSO/GRO/checksum-offload acceptance"},
 }
 
-// preflightFakeTCPKernelRequirements runs before any pin, map, TC, XDP or
-// network mutation. The established packet programs are present for verifier
-// and packet-level development, but production activation remains fail-closed
-// until ownership, complete offload handling, MTU and userspace-I/O
-// requirements are implemented and accepted on the kernel-7.0 real-NIC
-// matrix.
-func preflightFakeTCPKernelRequirements(state *control.State) error {
+// ValidateFakeTCPActivation is deliberately platform-independent so command
+// orchestration, including dry-run, cannot defer this gate to LinuxLoader.
+// Callers must invoke it after loading state and before any guard, pin, map,
+// TC, XDP, route, or other network mutation.
+func ValidateFakeTCPActivation(state *control.State) error {
 	references := fakeTCPStateReferences(state)
 	if len(references) == 0 {
 		return nil
@@ -89,6 +93,11 @@ func preflightFakeTCPKernelRequirements(state *control.State) error {
 		strings.Join(references, ","),
 		strings.Join(missingFakeTCPCapabilities(), "; "),
 	)
+}
+
+// preflightFakeTCPKernelRequirements remains a loader-local defence in depth.
+func preflightFakeTCPKernelRequirements(state *control.State) error {
+	return ValidateFakeTCPActivation(state)
 }
 
 func missingFakeTCPCapabilities() []string {
