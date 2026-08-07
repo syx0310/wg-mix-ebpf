@@ -52,6 +52,10 @@ func TestStructSizesAreStable(t *testing.T) {
 		{"ICMPListenerValue", unsafe.Sizeof(ICMPListenerValue{}), 24},
 		{"FakeTCPSessionKey", unsafe.Sizeof(FakeTCPSessionKey{}), 24},
 		{"FakeTCPSessionValue", unsafe.Sizeof(FakeTCPSessionValue{}), 40},
+		{"FakeTCPManagedIfKey", unsafe.Sizeof(FakeTCPManagedIfKey{}), 16},
+		{"FakeTCPManagedIfValue", unsafe.Sizeof(FakeTCPManagedIfValue{}), 8},
+		{"FakeTCPManagedPortKey", unsafe.Sizeof(FakeTCPManagedPortKey{}), 16},
+		{"FakeTCPManagedPortValue", unsafe.Sizeof(FakeTCPManagedPortValue{}), 16},
 		{"FakeTCPControlPolicyKey", unsafe.Sizeof(FakeTCPControlPolicyKey{}), 16},
 		{"FakeTCPControlPolicyValue", unsafe.Sizeof(FakeTCPControlPolicyValue{}), 32},
 		{"FakeTCPControlFlowKey", unsafe.Sizeof(FakeTCPControlFlowKey{}), 32},
@@ -69,6 +73,15 @@ func TestStructSizesAreStable(t *testing.T) {
 	}
 	if got, want := unsafe.Offsetof(CipherValue{}.Mode), uintptr(280); got != want {
 		t.Fatalf("CipherValue.Mode offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPManagedIfKey{}.UnderlayIndex), uintptr(8); got != want {
+		t.Fatalf("FakeTCPManagedIfKey.UnderlayIndex offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPManagedPortKey{}.DestinationPort), uintptr(12); got != want {
+		t.Fatalf("FakeTCPManagedPortKey.DestinationPort offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPManagedPortValue{}.Action), uintptr(12); got != want {
+		t.Fatalf("FakeTCPManagedPortValue.Action offset = %d, want %d", got, want)
 	}
 }
 

@@ -223,6 +223,40 @@ type FakeTCPSessionValue struct {
 
 func (v FakeTCPSessionValue) MapGeneration() uint64 { return v.Generation }
 
+// FakeTCPManagedIfKey and FakeTCPManagedIfValue are the experimental XDP
+// reachability latch. They intentionally remain outside Snapshot and the
+// canonical ABI-v10 pinned map set: the experimental collection owns their
+// unpinned maps independently.
+type FakeTCPManagedIfKey struct {
+	Generation    uint64
+	UnderlayIndex uint32
+	_             uint32
+}
+
+type FakeTCPManagedIfValue struct {
+	Generation uint64
+}
+
+func (v FakeTCPManagedIfValue) MapGeneration() uint64 { return v.Generation }
+
+// FakeTCPManagedPortKey and FakeTCPManagedPortValue are an exact per-interface
+// projection of managed FakeTCP listeners for the experimental XDP parser.
+type FakeTCPManagedPortKey struct {
+	Generation      uint64
+	UnderlayIndex   uint32
+	DestinationPort uint16
+	_               uint16
+}
+
+type FakeTCPManagedPortValue struct {
+	Generation uint64
+	WGID       uint32
+	Action     uint8
+	_          [3]byte
+}
+
+func (v FakeTCPManagedPortValue) MapGeneration() uint64 { return v.Generation }
+
 // FakeTCPControlPolicyKey isolates BPF control-event admission state by both
 // staged generation and managed WireGuard policy. The experimental object is
 // deliberately unpinned and remains outside the canonical ABI-v10 map set.
