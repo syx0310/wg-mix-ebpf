@@ -234,3 +234,59 @@ func TestFakeTCPRuntimeSupervisorStopTimeoutRetainsOwnership(t *testing.T) {
 		t.Fatalf("retry Stop: %v", err)
 	}
 }
+
+func TestFakeTCPRuntimeSupervisorRechecksEnsureCancellationAfterSerialization(t *testing.T) {
+	supervisor := &fakeTCPRuntimeSupervisor{}
+	supervisor.operationMu.Lock()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	buildCalls := 0
+	go func() {
+		done <- supervisor.Ensure(
+			ctx,
+			fakeTCPRuntimeDesiredKey{1},
+			func(context.Context) (fakeTCPRuntimeService, error) {
+				buildCalls++
+				return newControlledFakeTCPRuntime(), nil
+			},
+		)
+	}()
+	cancel()
+	supervisor.operationMu.Unlock()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Ensure error = %v", err)
+	}
+	if buildCalls != 0 || supervisor.loadCurrent() != nil {
+		t.Fatalf("build calls = %d, current = %#v", buildCalls, supervisor.loadCurrent())
+	}
+}
+
+func TestFakeTCPRuntimeSupervisorRechecksStopCancellationAfterSerialization(t *testing.T) {
+	supervisor := &fakeTCPRuntimeSupervisor{}
+	runtime := newControlledFakeTCPRuntime()
+	if err := supervisor.Ensure(
+		t.Context(),
+		fakeTCPRuntimeDesiredKey{1},
+		func(context.Context) (fakeTCPRuntimeService, error) { return runtime, nil },
+	); err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	<-runtime.runStarted
+
+	supervisor.operationMu.Lock()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- supervisor.Stop(ctx) }()
+	cancel()
+	supervisor.operationMu.Unlock()
+	if err := <-done; !errors.Is(err, context.Canceled) {
+		t.Fatalf("Stop error = %v", err)
+	}
+	stopCalls, closeCalls, _ := runtime.counts()
+	if stopCalls != 0 || closeCalls != 0 || !supervisor.Healthy(fakeTCPRuntimeDesiredKey{1}) {
+		t.Fatalf("runtime lifecycle = stop %d close %d healthy %t", stopCalls, closeCalls, supervisor.Healthy(fakeTCPRuntimeDesiredKey{1}))
+	}
+	if err := supervisor.Stop(t.Context()); err != nil {
+		t.Fatalf("cleanup Stop: %v", err)
+	}
+}

@@ -76,6 +76,9 @@ func (supervisor *fakeTCPRuntimeSupervisor) Ensure(
 
 	supervisor.operationMu.Lock()
 	defer supervisor.operationMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 
 	current := supervisor.loadCurrent()
 	if current != nil && !current.finished() {
@@ -159,11 +162,17 @@ func (supervisor *fakeTCPRuntimeSupervisor) Stop(ctx context.Context) error {
 
 	supervisor.operationMu.Lock()
 	defer supervisor.operationMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	current := supervisor.loadCurrent()
 	if current == nil {
 		return nil
 	}
 
+	// RuntimeStopRequester is explicitly the callback-safe, non-blocking stop
+	// contract.  Implementations must only interrupt Run here; the bounded
+	// completion wait and all potentially blocking Close work remain below.
 	stopErr := current.requestStop()
 	select {
 	case <-current.done:
