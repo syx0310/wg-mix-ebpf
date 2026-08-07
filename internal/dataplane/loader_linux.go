@@ -368,6 +368,13 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return fmt.Errorf("serialize BPF pin path %s: %w", pinPath, err)
 	}
 	defer lock.Close()
+	if err := retryRetainedTCRollbackOwner(parent.resource.key); err != nil {
+		return fmt.Errorf(
+			"resolve retained TC rollback before applying %s: %w",
+			pinPath,
+			err,
+		)
+	}
 
 	validated, err = validatePinPath(pinPath, runtime.validator)
 	if err != nil {
@@ -824,30 +831,14 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return commitControl(coll, snapshot.Control[abi.ControlKeyGlobal])
 	})
 	if attachErr != nil {
-		rollbackVerified, abortErr := abortFailedOwnerApply(
+		abortErr := resolveFailedOwnerApply(
 			handle,
 			store,
 			mutating,
+			handoff,
+			retainedTC,
 			liveTCRuntime,
 		)
-		if retainedTC != nil {
-			if rollbackVerified {
-				// The journal's active set was observed exactly, so the
-				// retained stage no longer owns a live filter even if its
-				// original netlink operation reported an ambiguous error.
-				retainedTC.Disarm()
-			} else {
-				// abortFailedOwnerApply performs no writes before this point.
-				// The pre-mutation capability therefore still proves that the
-				// durable mutating journal owns roll-forward recovery.
-				if transferErr := handoff.Transfer(retainedTC); transferErr != nil {
-					abortErr = errors.Join(
-						abortErr,
-						fmt.Errorf("transfer retained TC rollback to owner journal: %w", transferErr),
-					)
-				}
-			}
-		}
 		if abortErr != nil {
 			return errors.Join(
 				attachErr,
@@ -928,6 +919,13 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 		return fmt.Errorf("serialize BPF pin path %s: %w", pinPath, err)
 	}
 	defer lock.Close()
+	if err := retryRetainedTCRollbackOwner(parent.resource.key); err != nil {
+		return fmt.Errorf(
+			"resolve retained TC rollback before detaching %s: %w",
+			pinPath,
+			err,
+		)
+	}
 
 	validated, err = validatePinPath(pinPath, runtime.validator)
 	if err != nil {

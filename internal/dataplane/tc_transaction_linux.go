@@ -124,6 +124,62 @@ type tcAttachStage struct {
 	err        error
 }
 
+// retainedTCRollbackOwners is the process-lifetime owner of a stage that
+// could neither be rolled back nor transferred to its already-durable owner
+// journal before Apply returned. The next operation for the same resource
+// retries the exact stage before it is allowed to mutate TC again.
+//
+// Cross-process recovery remains owned by the durable journal. This registry
+// closes the in-process lifetime gap: an armed stage is never left reachable
+// only from an Apply stack frame.
+var retainedTCRollbackOwners = struct {
+	sync.Mutex
+	byResource map[string][]*tcAttachStage
+}{
+	byResource: make(map[string][]*tcAttachStage),
+}
+
+func retainTCRollbackOwner(resourceKey string, stage *tcAttachStage) error {
+	if resourceKey == "" || stage == nil || !stage.hasLiveFilterOwnership() {
+		return errors.New("cannot retain an empty TC rollback owner")
+	}
+	retainedTCRollbackOwners.Lock()
+	defer retainedTCRollbackOwners.Unlock()
+	for _, current := range retainedTCRollbackOwners.byResource[resourceKey] {
+		if current == stage {
+			return nil
+		}
+	}
+	retainedTCRollbackOwners.byResource[resourceKey] = append(
+		retainedTCRollbackOwners.byResource[resourceKey],
+		stage,
+	)
+	return nil
+}
+
+func retryRetainedTCRollbackOwner(resourceKey string) error {
+	retainedTCRollbackOwners.Lock()
+	defer retainedTCRollbackOwners.Unlock()
+	stages := retainedTCRollbackOwners.byResource[resourceKey]
+	if len(stages) == 0 {
+		return nil
+	}
+	var unresolved []*tcAttachStage
+	var errs []error
+	for _, stage := range stages {
+		if err := stage.Close(); err != nil {
+			unresolved = append(unresolved, stage)
+			errs = append(errs, fmt.Errorf("retry retained TC rollback owner: %w", err))
+		}
+	}
+	if len(unresolved) != 0 {
+		retainedTCRollbackOwners.byResource[resourceKey] = unresolved
+		return errors.Join(errs...)
+	}
+	delete(retainedTCRollbackOwners.byResource, resourceKey)
+	return nil
+}
+
 func tcProgramIdentityFromProgram(program *ebpf.Program) (tcProgramIdentity, error) {
 	if program == nil {
 		return tcProgramIdentity{}, errors.New("TC program is nil")

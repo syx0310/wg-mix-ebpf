@@ -5,6 +5,8 @@ package dataplane
 import (
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
@@ -1045,6 +1047,7 @@ type retainedJournalHandoffFixture struct {
 	plan    *tcAttachPlan
 	handoff *durableTCOwnerJournalHandoff
 	stage   *tcAttachStage
+	kernel  *fakeTCKernel
 }
 
 func newRetainedJournalHandoffFixture(
@@ -1096,7 +1099,100 @@ func newRetainedJournalHandoffFixture(
 		plan:    plan,
 		handoff: handoff,
 		stage:   stage,
+		kernel:  kernel,
 	}
+}
+
+func assertFailedOwnerApplyResolvedByProduction(
+	t *testing.T,
+	fixture *retainedJournalHandoffFixture,
+	want error,
+) {
+	t.Helper()
+	err := resolveFailedOwnerApply(
+		fixture.owner.handle,
+		fixture.owner.store,
+		fixture.owner.intent,
+		fixture.handoff,
+		fixture.stage,
+		fixture.kernel.runtime(),
+	)
+	if err == nil || (want != nil && !errors.Is(err, want)) {
+		t.Fatalf("production failed-apply resolution error = %v, want %v", err, want)
+	}
+	if fixture.stage.hasLiveFilterOwnership() || !fixture.stage.done ||
+		fixture.plan.stage != nil {
+		t.Fatalf(
+			"production return boundary retained an unowned stage: live=%t done=%t plan-stage=%p",
+			fixture.stage.hasLiveFilterOwnership(),
+			fixture.stage.done,
+			fixture.plan.stage,
+		)
+	}
+	for index, wantID := range []uint32{21, 22} {
+		if got := fixture.kernel.managedProgramID(
+			t,
+			11,
+			canonicalTCFilterSlots()[index],
+		); got != wantID {
+			t.Fatalf("rolled-back slot %d program=%d, want %d", index, got, wantID)
+		}
+	}
+}
+
+func TestFailedOwnerApplyProductionBoundaryResolvesFreshHandoffFaults(
+	t *testing.T,
+) {
+	t.Run("owner store load", func(t *testing.T) {
+		fixture := newRetainedJournalHandoffFixture(t)
+		if err := fixture.owner.store.root.Close(); err != nil {
+			t.Fatal(err)
+		}
+		assertFailedOwnerApplyResolvedByProduction(t, fixture, nil)
+	})
+
+	t.Run("owner directory coverage", func(t *testing.T) {
+		fixture := newRetainedJournalHandoffFixture(t)
+		wantErr := errors.New("injected owner directory entry")
+		name := filepath.Join(fixture.owner.handle.pinPath, "uncovered-entry")
+		if err := os.WriteFile(name, []byte(wantErr.Error()), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		assertFailedOwnerApplyResolvedByProduction(t, fixture, nil)
+	})
+
+	t.Run("owner map load", func(t *testing.T) {
+		fixture := newRetainedJournalHandoffFixture(t)
+		wantErr := errors.New("injected owner map load failure")
+		fixture.owner.mapStore.loadErrors["control_map"] = wantErr
+		assertFailedOwnerApplyResolvedByProduction(t, fixture, wantErr)
+	})
+
+	t.Run("owner program load", func(t *testing.T) {
+		fixture := newRetainedJournalHandoffFixture(t)
+		wantErr := errors.New("injected owner program load failure")
+		stage := fixture.owner.intent.ProgramStages[0]
+		fixture.owner.programLoadErrors[stage.FileName] = wantErr
+		assertFailedOwnerApplyResolvedByProduction(t, fixture, wantErr)
+	})
+
+	t.Run("stale durable sequence", func(t *testing.T) {
+		fixture := newRetainedJournalHandoffFixture(t)
+		next := advancePinOwnerRecord(
+			fixture.owner.intent,
+			time.Date(2026, 8, 8, 1, 2, 4, 0, time.UTC),
+			pinOwnerPhaseApplying,
+			pinOwnerStepCleanup,
+		)
+		if err := fixture.owner.store.Persist(
+			next,
+			fixture.owner.intent,
+			fixture.owner.handle.mountID,
+		); err != nil {
+			t.Fatal(err)
+		}
+		assertFailedOwnerApplyResolvedByProduction(t, fixture, nil)
+	})
 }
 
 func TestDurableTCOwnerJournalHandoffIsExactAndOneShot(t *testing.T) {

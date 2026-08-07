@@ -316,6 +316,73 @@ func (handoff *durableTCOwnerJournalHandoff) Transfer(
 	return nil
 }
 
+// resolveFailedOwnerApply is the production return-boundary owner resolver for
+// a failed TC mutation. It accepts only one of three terminal outcomes:
+//
+//   - the prior TC set was observed exact and the transient stage is disarmed;
+//   - the durable owner journal accepted the exact stage; or
+//   - local rollback completed, or the still-armed stage was retained by the
+//     process-lifetime retry owner.
+//
+// In particular, a fresh journal validation fault can never strand an armed
+// stage in the caller's stack frame.
+func resolveFailedOwnerApply(
+	handle *pinPathHandle,
+	store *pinOwnerStore,
+	record *pinOwnerRecord,
+	handoff *durableTCOwnerJournalHandoff,
+	stage *tcAttachStage,
+	tcRuntime tcRuntime,
+) error {
+	rollbackVerified, abortErr := abortFailedOwnerApply(
+		handle,
+		store,
+		record,
+		tcRuntime,
+	)
+	if stage == nil {
+		return abortErr
+	}
+	if rollbackVerified {
+		stage.Disarm()
+		return abortErr
+	}
+
+	transferErr := handoff.Transfer(stage)
+	if transferErr == nil {
+		return abortErr
+	}
+
+	// Fresh store/directory/map/program validation can fail after Execute has
+	// already returned a live stage. Production code, rather than its caller,
+	// owns the fallback rollback and verifies every changed slot in Close.
+	rollbackErr := stage.Close()
+	if rollbackErr == nil {
+		return errors.Join(
+			abortErr,
+			fmt.Errorf("transfer retained TC rollback to owner journal: %w", transferErr),
+		)
+	}
+	if !stage.hasLiveFilterOwnership() {
+		// Filter rollback is complete; only fallible program-reference closing
+		// remains. Return those references to the plan's existing deferred Close.
+		returnErr := stage.returnProgramReferencesToPlan()
+		return errors.Join(
+			abortErr,
+			fmt.Errorf("transfer retained TC rollback to owner journal: %w", transferErr),
+			rollbackErr,
+			returnErr,
+		)
+	}
+	retainErr := retainTCRollbackOwner(record.ResourceKey, stage)
+	return errors.Join(
+		abortErr,
+		fmt.Errorf("transfer retained TC rollback to owner journal: %w", transferErr),
+		rollbackErr,
+		retainErr,
+	)
+}
+
 func ownerRuntimeNow(runtime pinPathRuntime) (time.Time, error) {
 	if runtime.now == nil {
 		return time.Time{}, errors.New("pin owner clock is unavailable")
