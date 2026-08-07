@@ -124,35 +124,43 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	if program == nil {
 		t.Fatal("experimental object has no wg_mix_egress program")
 	}
+	populateFakeTCPPacketProbeTailCalls(t, collection, generation)
 
-	for _, payloadLength := range []int{32, 33} {
-		t.Run(fmt.Sprintf("materialized-payload-%d", payloadLength), func(t *testing.T) {
-			populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
-				ifindex, sourcePort, remotePort, localIPv4, remoteIPv4)
-			packet, originalPayload := buildFakeTCPProbeUDPPacket(
-				t, sourcePort, remotePort, payloadLength,
-			)
-			context := fakeTCPSKBContext{Ifindex: ifindex}
-			output := make([]byte, len(packet)+64)
-			result, err := program.Run(&ebpf.RunOptions{
-				Data:    append([]byte(nil), packet...),
-				DataOut: output,
-				Context: context,
-				Repeat:  1,
+	for _, xorEnabled := range []bool{false, true} {
+		for _, payloadLength := range []int{32, 33, 1459, 1460} {
+			name := fmt.Sprintf("materialized-payload-%d", payloadLength)
+			if xorEnabled {
+				name += "-xor"
+			}
+			t.Run(name, func(t *testing.T) {
+				xorKey := populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
+					ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, xorEnabled)
+				packet, originalPayload := buildFakeTCPProbeUDPPacket(
+					t, sourcePort, remotePort, payloadLength,
+				)
+				context := fakeTCPSKBContext{Ifindex: ifindex}
+				output := make([]byte, len(packet)+64)
+				result, err := program.Run(&ebpf.RunOptions{
+					Data:    append([]byte(nil), packet...),
+					DataOut: output,
+					Context: context,
+					Repeat:  1,
+				})
+				if err != nil {
+					t.Fatalf("BPF_PROG_TEST_RUN materialized packet: %v", err)
+				}
+				if result != 0 {
+					t.Fatalf("materialized packet action=%d, want TC_ACT_OK", result)
+				}
+				verifyFakeTCPProbeOutput(t, output, packet, originalPayload,
+					sourcePort, remotePort, xorKey)
 			})
-			if err != nil {
-				t.Fatalf("BPF_PROG_TEST_RUN materialized packet: %v", err)
-			}
-			if result != 0 {
-				t.Fatalf("materialized packet action=%d, want TC_ACT_OK", result)
-			}
-			verifyFakeTCPProbeOutput(t, output, packet, originalPayload, sourcePort, remotePort)
-		})
+		}
 	}
 
 	t.Run("aggregate-gso-hard-reject", func(t *testing.T) {
 		populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
-			ifindex, sourcePort, remotePort, localIPv4, remoteIPv4)
+			ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, true)
 		packet, _ := buildFakeTCPProbeUDPPacket(t, sourcePort, remotePort, 33)
 		context := fakeTCPSKBContext{
 			Ifindex:     ifindex,
@@ -192,8 +200,19 @@ func populateFakeTCPPacketProbeMaps(
 	remotePort uint16,
 	localIPv4 uint32,
 	remoteIPv4 uint32,
-) {
+	xorEnabled bool,
+) []byte {
 	t.Helper()
+	const cipherID = uint32(19)
+	var xorKey []byte
+	ruleCipherID := uint32(0)
+	if xorEnabled {
+		ruleCipherID = cipherID
+		xorKey = make([]byte, 256)
+		for i := range xorKey {
+			xorKey[i] = byte(i*17 + 5)
+		}
+	}
 	updates := []struct {
 		mapName string
 		key     any
@@ -237,6 +256,7 @@ func populateFakeTCPPacketProbeMaps(
 				Generation:    generation,
 				ProfileID:     profileID,
 				WGID:          wgID,
+				CipherID:      ruleCipherID,
 				Action:        abi.ActionRewrite,
 				TransportMode: abi.TransportFakeTCP,
 			},
@@ -260,6 +280,26 @@ func populateFakeTCPPacketProbeMaps(
 			},
 		},
 	}
+	if xorEnabled {
+		var key [256]byte
+		copy(key[:], xorKey)
+		updates = append(updates, struct {
+			mapName string
+			key     any
+			value   any
+		}{
+			mapName: "cipher_map",
+			key:     abi.CipherKey{Generation: generation, CipherID: cipherID},
+			value: abi.CipherValue{
+				Generation: generation,
+				Key:        key,
+				KeyLen:     256,
+				KeyMask:    255,
+				MaxBytes:   2048,
+				Mode:       abi.CipherModeXOR,
+			},
+		})
+	}
 	for _, update := range updates {
 		m := collection.Maps[update.mapName]
 		if m == nil {
@@ -268,6 +308,28 @@ func populateFakeTCPPacketProbeMaps(
 		if err := m.Update(update.key, update.value, ebpf.UpdateAny); err != nil {
 			t.Fatalf("populate %s: %v", update.mapName, err)
 		}
+	}
+	return xorKey
+}
+
+func populateFakeTCPPacketProbeTailCalls(
+	t *testing.T,
+	collection *ebpf.Collection,
+	generation uint64,
+) {
+	t.Helper()
+	if err := populateXORTailCalls(collection, generation); err != nil {
+		t.Fatalf("populate XOR packet-probe tail calls: %v", err)
+	}
+	m := collection.Maps["faketcp_egress_programs"]
+	program := collection.Programs["wg_faketcp_egress"]
+	if m == nil || program == nil {
+		t.Fatal("experimental object has no FakeTCP egress tail-call map/program")
+	}
+	index := uint32(generation & 1)
+	fd := uint32(program.FD())
+	if err := m.Update(index, fd, ebpf.UpdateAny); err != nil {
+		t.Fatalf("populate faketcp_egress_programs[%d]: %v", index, err)
 	}
 }
 
@@ -317,6 +379,7 @@ func verifyFakeTCPProbeOutput(
 	originalPayload []byte,
 	sourcePort uint16,
 	destinationPort uint16,
+	xorKey []byte,
 ) {
 	t.Helper()
 	const (
@@ -359,6 +422,11 @@ func verifyFakeTCPProbeOutput(
 
 	transformed := append([]byte(nil), originalPayload...)
 	binary.LittleEndian.PutUint32(transformed[:4], 0x13dff06b)
+	for i := range transformed {
+		if len(xorKey) != 0 {
+			transformed[i] ^= xorKey[i&255]
+		}
+	}
 	wantWirePayload := append(append([]byte(nil), transformed[headerDelta:]...), transformed[:headerDelta]...)
 	wirePayload := output[tcpOffset+tcpLength:]
 	if !bytes.Equal(wirePayload, wantWirePayload) {
