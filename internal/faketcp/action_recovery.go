@@ -14,6 +14,7 @@ var (
 	ErrActionCheckpointConflict          = errors.New("faketcp action checkpoint compare-and-swap conflict")
 	ErrActionCheckpointCorrupt           = errors.New("faketcp action checkpoint is invalid")
 	ErrActionCheckpointRevisionExhausted = errors.New("faketcp action checkpoint revision is exhausted")
+	ErrActionCheckpointIdentityMismatch  = errors.New("faketcp action checkpoint belongs to a different engine identity")
 )
 
 type ActionCheckpointPhase uint8
@@ -48,6 +49,7 @@ type ActionStep struct {
 type ActionCheckpoint struct {
 	Revision  uint64
 	Operation uint64
+	Identity  RuntimeIdentity
 	Phase     ActionCheckpointPhase
 	NextStep  int
 	Steps     []ActionStep
@@ -195,13 +197,18 @@ type ActionRecovery struct {
 
 	backend       ControllerBackend
 	store         ActionCheckpointStore
+	identity      RuntimeIdentity
 	nextOperation uint64
 }
 
 func NewActionRecovery(
+	identity RuntimeIdentity,
 	backend ControllerBackend,
 	store ActionCheckpointStore,
 ) (*ActionRecovery, error) {
+	if err := validateRuntimeIdentity(identity); err != nil {
+		return nil, err
+	}
 	if controllerBackendIsNil(backend) {
 		return nil, errors.New("faketcp action recovery backend is nil")
 	}
@@ -220,7 +227,7 @@ func NewActionRecovery(
 		nextOperation = checkpoint.Operation + 1
 	}
 	return &ActionRecovery{
-		backend: backend, store: store, nextOperation: nextOperation,
+		backend: backend, store: store, identity: identity, nextOperation: nextOperation,
 	}, nil
 }
 
@@ -253,6 +260,7 @@ func (recovery *ActionRecovery) Execute(ctx context.Context, actions []Action) e
 	}
 	checkpoint, err := recovery.store.CreateActionCheckpoint(ActionCheckpoint{
 		Operation: recovery.nextOperation,
+		Identity:  recovery.identity,
 		Phase:     ActionCheckpointPrepared,
 		Steps:     steps,
 	})
@@ -289,6 +297,14 @@ func (recovery *ActionRecovery) Recover(ctx context.Context) (RecoveryReport, er
 	}
 	if err := validateStoredActionCheckpoint(checkpoint); err != nil {
 		return RecoveryReport{}, err
+	}
+	if checkpoint.Identity != recovery.identity {
+		return RecoveryReport{}, fmt.Errorf(
+			"%w: checkpoint generation %d incarnation %x, engine generation %d incarnation %x",
+			ErrActionCheckpointIdentityMismatch,
+			checkpoint.Identity.Generation, checkpoint.Identity.Incarnation,
+			recovery.identity.Generation, recovery.identity.Incarnation,
+		)
 	}
 	return recovery.continueLocked(ctx, checkpoint, true)
 }
@@ -431,9 +447,18 @@ func validateActionCheckpoint(checkpoint ActionCheckpoint) error {
 	if checkpoint.Phase == ActionCheckpointAttempting && checkpoint.NextStep == len(checkpoint.Steps) {
 		return fmt.Errorf("%w: attempting after final step", ErrActionCheckpointCorrupt)
 	}
+	if err := validateRuntimeIdentity(checkpoint.Identity); err != nil {
+		return fmt.Errorf("%w: %v", ErrActionCheckpointCorrupt, err)
+	}
 	for _, step := range checkpoint.Steps {
 		if err := validateActionStep(step); err != nil {
 			return fmt.Errorf("%w: %v", ErrActionCheckpointCorrupt, err)
+		}
+		if step.Flow.Generation != checkpoint.Identity.Generation {
+			return fmt.Errorf(
+				"%w: action generation %d does not match identity generation %d",
+				ErrActionCheckpointCorrupt, step.Flow.Generation, checkpoint.Identity.Generation,
+			)
 		}
 	}
 	return nil

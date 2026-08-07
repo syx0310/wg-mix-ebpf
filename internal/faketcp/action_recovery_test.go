@@ -80,7 +80,7 @@ func TestMemoryActionCheckpointStoreFailsClosedOnRevisionExhaustion(t *testing.T
 func TestActionRecoveryExecutesAndClearsCheckpointInOrder(t *testing.T) {
 	backend := &fakeControllerBackend{}
 	store := NewMemoryActionCheckpointStore()
-	recovery, err := NewActionRecovery(backend, store)
+	recovery, err := NewActionRecovery(testRecoveryIdentity(), backend, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -105,7 +105,7 @@ func TestActionRecoveryReplaysAmbiguousControl(t *testing.T) {
 	wantErr := errors.New("ambiguous control send")
 	backend := &fakeControllerBackend{sendErr: wantErr}
 	store := NewMemoryActionCheckpointStore()
-	recovery, err := NewActionRecovery(backend, store)
+	recovery, err := NewActionRecovery(testRecoveryIdentity(), backend, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -118,7 +118,7 @@ func TestActionRecoveryReplaysAmbiguousControl(t *testing.T) {
 		t.Fatalf("Execute error = %v", err)
 	}
 	backend.sendErr = nil
-	recovery, err = NewActionRecovery(backend, store)
+	recovery, err = NewActionRecovery(testRecoveryIdentity(), backend, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestActionRecoverySkipsAmbiguousReinjectionAndContinues(t *testing.T) {
 	wantErr := errors.New("ambiguous reinjection")
 	backend := &fakeControllerBackend{reinjectErr: wantErr}
 	store := NewMemoryActionCheckpointStore()
-	recovery, err := NewActionRecovery(backend, store)
+	recovery, err := NewActionRecovery(testRecoveryIdentity(), backend, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,7 +152,7 @@ func TestActionRecoverySkipsAmbiguousReinjectionAndContinues(t *testing.T) {
 		t.Fatalf("Execute error = %v", err)
 	}
 	backend.reinjectErr = nil
-	recovery, err = NewActionRecovery(backend, store)
+	recovery, err = NewActionRecovery(testRecoveryIdentity(), backend, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,7 +172,7 @@ func TestActionRecoveryFlattensReleaseAndSkipsOnlyAttemptedPacket(t *testing.T) 
 	wantErr := errors.New("first reinjection failed")
 	backend := &fakeControllerBackend{reinjectErr: wantErr}
 	store := NewMemoryActionCheckpointStore()
-	recovery, err := NewActionRecovery(backend, store)
+	recovery, err := NewActionRecovery(testRecoveryIdentity(), backend, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestActionRecoveryFlattensReleaseAndSkipsOnlyAttemptedPacket(t *testing.T) 
 		t.Fatalf("Execute error = %v", err)
 	}
 	backend.reinjectErr = nil
-	recovery, err = NewActionRecovery(backend, store)
+	recovery, err = NewActionRecovery(testRecoveryIdentity(), backend, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,7 +220,7 @@ func TestActionRecoveryRetainsPreparedCheckpointOnCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	store := &cancelOnCreateCheckpointStore{MemoryActionCheckpointStore: NewMemoryActionCheckpointStore(), cancel: cancel}
 	backend := &fakeControllerBackend{}
-	recovery, err := NewActionRecovery(backend, store)
+	recovery, err := NewActionRecovery(testRecoveryIdentity(), backend, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -235,7 +235,7 @@ func TestActionRecoveryRetainsPreparedCheckpointOnCancellation(t *testing.T) {
 	if len(backend.sent) != 0 {
 		t.Fatal("backend was called after checkpoint-time cancellation")
 	}
-	recovery, err = NewActionRecovery(backend, store)
+	recovery, err = NewActionRecovery(testRecoveryIdentity(), backend, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -268,7 +268,7 @@ func TestNewActionRecoveryRejectsCorruptStoredCheckpoint(t *testing.T) {
 		recoveryControlStep(testFlow(31001), FlagSYN),
 	})
 	checkpoint.Revision = 0
-	if recovery, err := NewActionRecovery(&fakeControllerBackend{}, &staticCheckpointStore{
+	if recovery, err := NewActionRecovery(testRecoveryIdentity(), &fakeControllerBackend{}, &staticCheckpointStore{
 		checkpoint: checkpoint, found: true,
 	}); err == nil || recovery != nil || !errors.Is(err, ErrActionCheckpointCorrupt) {
 		t.Fatalf("recovery=%#v err=%v", recovery, err)
@@ -284,7 +284,7 @@ func TestActionRecoveryCompletesMaxOperationThenExhausts(t *testing.T) {
 		t.Fatal(err)
 	}
 	backend := &fakeControllerBackend{}
-	recovery, err := NewActionRecovery(backend, store)
+	recovery, err := NewActionRecovery(testRecoveryIdentity(), backend, store)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -385,14 +385,15 @@ func TestRecoverableControllerNeverRetriesAmbiguousReleasedPacket(t *testing.T) 
 
 func TestRecoverableControllerStartsFencedByRetainedCheckpoint(t *testing.T) {
 	flow := testFlow(31001)
+	engine, _ := testEngine(t, nil)
 	store := NewMemoryActionCheckpointStore()
 	checkpoint := recoveryCheckpoint(t, 9, ActionCheckpointPrepared, 0, []ActionStep{
 		recoveryControlStep(flow, FlagSYN),
 	})
+	checkpoint.Identity = engine.Identity()
 	if _, err := store.CreateActionCheckpoint(checkpoint); err != nil {
 		t.Fatal(err)
 	}
-	engine, _ := testEngine(t, nil)
 	backend := &fakeControllerBackend{}
 	controller, err := NewRecoverableController(engine, backend, store)
 	if err != nil {
@@ -417,15 +418,80 @@ func TestRecoverableControllerStartsFencedByRetainedCheckpoint(t *testing.T) {
 	}
 }
 
-func TestRecoverableControllerClosePreservesPendingCheckpoint(t *testing.T) {
-	flow := testFlow(31001)
-	store := NewMemoryActionCheckpointStore()
-	if _, err := store.CreateActionCheckpoint(recoveryCheckpoint(t, 9, ActionCheckpointAttempting, 0, []ActionStep{
-		recoveryPacketStep(t, flow, 11),
-	})); err != nil {
+func TestRecoverableControllerRejectsCheckpointFromDifferentEngineIdentity(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		generation uint64
+	}{
+		{name: "same-generation-new-incarnation", generation: 1},
+		{name: "different-generation", generation: 2},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			sourceEngine, _ := testEngine(t, nil)
+			flow := testFlow(31001)
+			store := NewMemoryActionCheckpointStore()
+			checkpoint := recoveryCheckpoint(t, 9, ActionCheckpointPrepared, 0, []ActionStep{
+				recoveryControlStep(flow, FlagSYN),
+			})
+			checkpoint.Identity = sourceEngine.Identity()
+			created, err := store.CreateActionCheckpoint(checkpoint)
+			if err != nil {
+				t.Fatal(err)
+			}
+			candidate, _ := testEngine(t, func(options *Options) {
+				options.Generation = test.generation
+			})
+			if candidate.Identity() == sourceEngine.Identity() {
+				t.Fatal("new Engine reused source identity")
+			}
+			backend := &fakeControllerBackend{}
+			controller, err := NewRecoverableController(candidate, backend, store)
+			if err != nil {
+				t.Fatal(err)
+			}
+			report, err := controller.Recover(context.Background())
+			if !errors.Is(err, ErrActionRecoveryRequired) || !errors.Is(err, ErrActionCheckpointIdentityMismatch) {
+				t.Fatalf("Recover report=%#v error=%v", report, err)
+			}
+			if len(backend.operations) != 0 {
+				t.Fatalf("identity mismatch reached backend: %v", backend.operations)
+			}
+			retained, found, err := store.LoadActionCheckpoint()
+			if err != nil || !found || retained.Revision != created.Revision || retained.Identity != created.Identity {
+				t.Fatalf("checkpoint evidence changed: found=%t checkpoint=%#v err=%v", found, retained, err)
+			}
+			if _, err := controller.Tick(context.Background()); !errors.Is(err, ErrActionCheckpointIdentityMismatch) {
+				t.Fatalf("ordinary work was not fenced by identity mismatch: %v", err)
+			}
+		})
+	}
+}
+
+func TestNewEngineAlwaysCreatesFreshRuntimeIncarnation(t *testing.T) {
+	first, _ := testEngine(t, nil)
+	second, _ := testEngine(t, nil)
+	if err := validateRuntimeIdentity(first.Identity()); err != nil {
 		t.Fatal(err)
 	}
+	if first.Identity().Generation != second.Identity().Generation {
+		t.Fatalf("test generations differ: first=%d second=%d", first.Identity().Generation, second.Identity().Generation)
+	}
+	if first.Identity().Incarnation == second.Identity().Incarnation {
+		t.Fatal("new empty Engine reused a prior incarnation")
+	}
+}
+
+func TestRecoverableControllerClosePreservesPendingCheckpoint(t *testing.T) {
+	flow := testFlow(31001)
 	engine, _ := testEngine(t, nil)
+	store := NewMemoryActionCheckpointStore()
+	checkpoint := recoveryCheckpoint(t, 9, ActionCheckpointAttempting, 0, []ActionStep{
+		recoveryPacketStep(t, flow, 11),
+	})
+	checkpoint.Identity = engine.Identity()
+	if _, err := store.CreateActionCheckpoint(checkpoint); err != nil {
+		t.Fatal(err)
+	}
 	backend := &fakeControllerBackend{}
 	controller, err := NewRecoverableController(engine, backend, store)
 	if err != nil {
@@ -468,11 +534,17 @@ func recoveryCheckpoint(
 	steps []ActionStep,
 ) ActionCheckpoint {
 	t.Helper()
-	checkpoint := ActionCheckpoint{Operation: operation, Phase: phase, NextStep: next, Steps: steps}
+	checkpoint := ActionCheckpoint{
+		Operation: operation, Identity: testRecoveryIdentity(), Phase: phase, NextStep: next, Steps: steps,
+	}
 	if err := validateActionCheckpoint(checkpoint); err != nil {
 		t.Fatal(err)
 	}
 	return checkpoint
+}
+
+func testRecoveryIdentity() RuntimeIdentity {
+	return RuntimeIdentity{Generation: 1, Incarnation: RuntimeIncarnation{1}}
 }
 
 func recoveryControlStep(flow abi.FakeTCPSessionKey, flags uint8) ActionStep {

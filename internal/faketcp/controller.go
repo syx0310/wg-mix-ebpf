@@ -243,7 +243,7 @@ func NewRecoverableController(
 	if err != nil {
 		return nil, err
 	}
-	recovery, err := NewActionRecovery(backend, store)
+	recovery, err := NewActionRecovery(engine.Identity(), backend, store)
 	if err != nil {
 		return nil, err
 	}
@@ -545,12 +545,12 @@ func (c *Controller) markFailed(cause error) error {
 func (c *Controller) markRecoveryRequired(cause error) error {
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
-	if c.recoveryErr == nil {
-		if cause == nil {
+	if cause == nil {
+		if c.recoveryErr == nil {
 			c.recoveryErr = ErrActionRecoveryRequired
-		} else {
-			c.recoveryErr = errors.Join(ErrActionRecoveryRequired, cause)
 		}
+	} else {
+		c.recoveryErr = errors.Join(ErrActionRecoveryRequired, cause)
 	}
 	return c.recoveryErr
 }

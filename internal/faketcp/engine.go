@@ -152,6 +152,7 @@ type tokenBucket struct {
 type Engine struct {
 	mu           sync.Mutex
 	opts         Options
+	identity     RuntimeIdentity
 	sessions     map[abi.FakeTCPSessionKey]*session
 	pendingFlows int
 	pendingBytes int
@@ -214,15 +215,29 @@ func New(options Options) (*Engine, error) {
 	if options.Window == 0 {
 		options.Window = 65535
 	}
+	incarnation, err := newRuntimeIncarnation()
+	if err != nil {
+		return nil, err
+	}
 	admissionEpoch := options.Now()
 	return &Engine{
 		opts:           options,
+		identity:       RuntimeIdentity{Generation: options.Generation, Incarnation: incarnation},
 		sessions:       make(map[abi.FakeTCPSessionKey]*session),
 		globalSYNs:     tokenBucket{lastRefill: admissionEpoch, initialized: true},
 		admissionEpoch: admissionEpoch,
 		synSources:     make(map[synSourceKey]*synSourceState),
 		synSourceLRU:   list.New(),
 	}, nil
+}
+
+// Identity returns the immutable generation/incarnation pair for this exact
+// Engine lifetime. A nil Engine has no provable identity.
+func (e *Engine) Identity() RuntimeIdentity {
+	if e == nil {
+		return RuntimeIdentity{}
+	}
+	return e.identity
 }
 
 // Outbound observes a UDP datagram before the BPF established path can encode
