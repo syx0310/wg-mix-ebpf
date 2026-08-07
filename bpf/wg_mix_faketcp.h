@@ -27,6 +27,20 @@
 
 #define FAKETCP_HEADER_DELTA 12
 #define FAKETCP_METADATA_MAGIC 0x57474654U
+#define FAKETCP_MAX_CAPTURED_PACKET 2304
+
+enum faketcp_stat_id {
+	FAKETCP_STAT_EGRESS_OK = 0,
+	FAKETCP_STAT_INGRESS_OK,
+	FAKETCP_STAT_SESSION_MISS,
+	FAKETCP_STAT_BAD_STATE,
+	FAKETCP_STAT_BAD_PACKET,
+	FAKETCP_STAT_GSO_REJECT,
+	FAKETCP_STAT_CHECKSUM_ERROR,
+	FAKETCP_STAT_METADATA_ERROR,
+	FAKETCP_STAT_EVENT_ERROR,
+	FAKETCP_STAT_MAX,
+};
 
 struct faketcp_session_key {
 	__u64 generation;
@@ -56,10 +70,21 @@ struct faketcp_event {
 	__u32 sequence;
 	__u32 acknowledgement;
 	__u32 payload_length;
+	__u32 fwmark;
+	__u32 wg_id;
+	__u16 packet_length;
 	__u8 type;
 	__u8 tcp_flags;
-	__u8 pad[2];
 };
+
+struct faketcp_packet_event {
+	struct faketcp_event event;
+	__u8 packet[FAKETCP_MAX_CAPTURED_PACKET];
+};
+
+_Static_assert(sizeof(struct faketcp_event) == 56, "faketcp event ABI drift");
+_Static_assert(sizeof(struct faketcp_packet_event) == 2360,
+	       "faketcp packet event ABI drift");
 
 struct faketcp_metadata {
 	__u32 magic;
@@ -84,6 +109,17 @@ struct {
 	__uint(max_entries, 1 << 20);
 } faketcp_events SEC(".maps");
 
+// bpf_ringbuf_output accepts a verifier-bounded variable record size whereas
+// bpf_ringbuf_reserve requires a constant size. A per-CPU staging record lets
+// us emit only the initialized event header and captured packet bytes, never
+// the unused tail of the fixed upper bound.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct faketcp_packet_event);
+} faketcp_capture_scratch SEC(".maps");
+
 struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
 	__uint(max_entries, 2);
@@ -91,10 +127,30 @@ struct {
 	__type(value, __u32);
 } faketcp_egress_programs SEC(".maps");
 
+// Experimental counters stay outside the version-10 canonical pinned stats
+// map. This preserves ordinary UDP/ICMP reload compatibility while FakeTCP is
+// hard-gated; the loader can expose this map together with the controller when
+// the feature is ready for activation.
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, FAKETCP_STAT_MAX);
+	__type(key, __u32);
+	__type(value, __u64);
+} faketcp_stats_map SEC(".maps");
+
+static __always_inline void inc_faketcp_stat(__u32 key)
+{
+	__u64 *value = bpf_map_lookup_elem(&faketcp_stats_map, &key);
+
+	if (value)
+		*value += 1;
+}
+
 static __always_inline int faketcp_emit_event(const struct faketcp_session_key *key,
 					       __u8 type, __u8 flags,
 					       __u32 seq, __u32 ack,
-					       __u32 payload_len)
+					       __u32 payload_len,
+					       __u32 fwmark, __u32 wg_id)
 {
 	struct faketcp_event event = {
 		.key = *key,
@@ -102,12 +158,14 @@ static __always_inline int faketcp_emit_event(const struct faketcp_session_key *
 		.sequence = seq,
 		.acknowledgement = ack,
 		.payload_length = payload_len,
+		.fwmark = fwmark,
+		.wg_id = wg_id,
 		.type = type,
 		.tcp_flags = flags,
 	};
 
 	if (bpf_ringbuf_output(&faketcp_events, &event, sizeof(event), 0) < 0) {
-		inc_stat(STAT_FAKETCP_EVENT_ERROR);
+		inc_faketcp_stat(FAKETCP_STAT_EVENT_ERROR);
 		return -1;
 	}
 	return 0;
@@ -122,7 +180,8 @@ static __always_inline int faketcp_tc_key(struct __sk_buff *skb,
 	void *data_end = (void *)(long)skb->data_end;
 	struct iphdr *iph = data + info->ip_off;
 
-	if (info->family != FAMILY_IPV4 || (void *)(iph + 1) > data_end)
+	if (info->family != FAMILY_IPV4 || (void *)(iph + 1) > data_end ||
+	    iph->version != 4 || iph->ihl != 5)
 		return -1;
 	key->generation = generation;
 	key->local_ipv4 = iph->saddr;
@@ -133,10 +192,102 @@ static __always_inline int faketcp_tc_key(struct __sk_buff *skb,
 	return 0;
 }
 
-static __always_inline int faketcp_tcp_checksum_from_udp(const struct iphdr *iph,
+// Capture happens before type-word and XOR mutation. The userspace release
+// path can therefore re-inject this exact IPv4 packet once and let the normal
+// egress pipeline apply every transform in the required order.
+static __always_inline int faketcp_capture_first_packet(struct __sk_buff *skb,
+						 const struct packet_info *info,
+						 const struct egress_rule_value *rule,
+						 const struct faketcp_session_key *key)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct iphdr *iph = data + info->ip_off;
+	struct faketcp_packet_event *record;
+	__u32 zero = 0;
+	__u64 record_len;
+	__u16 packet_len;
+
+	if ((void *)(iph + 1) > data_end)
+		return -1;
+	packet_len = bpf_ntohs(iph->tot_len);
+	if (packet_len < sizeof(*iph) + sizeof(struct udphdr) ||
+	    packet_len > FAKETCP_MAX_CAPTURED_PACKET)
+		return -1;
+	record = bpf_map_lookup_elem(&faketcp_capture_scratch, &zero);
+	if (!record)
+		return -1;
+	record->event = (struct faketcp_event){
+		.key = *key,
+		.timestamp_nanos = bpf_ktime_get_ns(),
+		.payload_length = info->payload_len,
+		.fwmark = skb->mark,
+		.wg_id = rule->wg_id,
+		.packet_length = packet_len,
+		.type = FAKETCP_EVENT_NEED_HANDSHAKE,
+	};
+	if (bpf_skb_load_bytes(skb, info->ip_off, record->packet, packet_len) < 0)
+		return -1;
+	record_len = sizeof(record->event) + packet_len;
+	if (bpf_ringbuf_output(&faketcp_events, record, record_len, 0) < 0)
+		return -1;
+	return 0;
+}
+
+static __always_inline int faketcp_preflight_egress(struct __sk_buff *skb,
+						     const struct packet_info *info,
+						     const struct egress_rule_value *rule,
+						     __u64 generation)
+{
+	struct faketcp_session_key key = {};
+	struct faketcp_session_value *session;
+
+	if (faketcp_tc_key(skb, info, generation, &key) < 0)
+		return -1;
+	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
+	if (session && session->generation == generation &&
+	    session->state == FAKETCP_STATE_ESTABLISHED)
+		return 0;
+	if (skb->gso_segs || skb->gso_size) {
+		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
+		return -1;
+	}
+	if (session)
+		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+	else
+		inc_faketcp_stat(FAKETCP_STAT_SESSION_MISS);
+	if (faketcp_capture_first_packet(skb, info, rule, &key) < 0)
+		inc_faketcp_stat(FAKETCP_STAT_EVENT_ERROR);
+	return -1;
+}
+
+static __always_inline __s64 faketcp_rotation_checksum(const __u8 head[FAKETCP_HEADER_DELTA],
+							__s64 seed, int inverse)
+{
+	__u8 aligned[16] = {};
+	__u8 shifted[16] = {};
+
+#pragma unroll
+	for (int i = 0; i < FAKETCP_HEADER_DELTA; i++) {
+		aligned[i] = head[i];
+		shifted[i + 1] = head[i];
+	}
+	if (inverse)
+		return bpf_csum_diff((__be32 *)shifted, sizeof(shifted),
+				     (__be32 *)aligned, sizeof(aligned), seed);
+	return bpf_csum_diff((__be32 *)aligned, sizeof(aligned),
+			     (__be32 *)shifted, sizeof(shifted), seed);
+}
+
+// This packet-level prototype accepts only a fully materialized UDP checksum.
+// CHECKSUM_PARTIAL is deliberately blocked by the loader gate: changing only
+// csum_offset would not turn its pseudo-header seed into a complete checksum.
+static __always_inline int faketcp_tcp_checksum_from_materialized_udp(
 						  struct udphdr old_udp,
 						  struct tcphdr *tcp,
-						  __u16 udp_len)
+						  __u16 udp_len,
+						  const __u8 head[FAKETCP_HEADER_DELTA],
+						  __u16 payload_len)
 {
 	struct faketcp_pseudo_tail old_pseudo = {
 		.protocol = IPPROTO_UDP,
@@ -149,7 +300,6 @@ static __always_inline int faketcp_tcp_checksum_from_udp(const struct iphdr *iph
 	__u16 old_checksum = bpf_ntohs(old_udp.check);
 	__s64 sum;
 
-	(void)iph;
 	if (old_checksum == 0)
 		return -1;
 	old_udp.check = 0;
@@ -163,6 +313,11 @@ static __always_inline int faketcp_tcp_checksum_from_udp(const struct iphdr *iph
 			     (__be32 *)tcp, sizeof(*tcp), sum);
 	if (sum < 0)
 		return -1;
+	if (payload_len & 1) {
+		sum = faketcp_rotation_checksum(head, sum, 0);
+		if (sum < 0)
+			return -1;
+	}
 	tcp->check = bpf_htons(fold_csum(sum));
 	if (tcp->check == 0)
 		tcp->check = bpf_htons(0xffff);
@@ -189,28 +344,30 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	__u32 seq;
 
 	if (rule->transport_mode != TRANSPORT_FAKETCP || info->family != FAMILY_IPV4 ||
-	    info->payload_len < FAKETCP_HEADER_DELTA || (info->payload_len & 1) ||
+	    info->payload_len < FAKETCP_HEADER_DELTA ||
 	    (void *)(iph + 1) > data_end || (void *)(udp + 1) > data_end) {
-		inc_stat(STAT_FAKETCP_BAD_PACKET);
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return TC_ACT_SHOT;
 	}
 	if (skb->gso_segs || skb->gso_size) {
-		inc_stat(STAT_FAKETCP_GSO_REJECT);
+		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
 		return TC_ACT_SHOT;
 	}
 	if (faketcp_tc_key(skb, info, generation, &key) < 0) {
-		inc_stat(STAT_FAKETCP_BAD_PACKET);
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return TC_ACT_SHOT;
 	}
 	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
 	if (!session || session->generation != generation) {
-		inc_stat(STAT_FAKETCP_SESSION_MISS);
-		faketcp_emit_event(&key, FAKETCP_EVENT_NEED_HANDSHAKE, 0, 0, 0,
-				   info->payload_len);
+		// The preflight hook is the only place allowed to emit the handshake request
+		// because it still owns the unmodified first packet. A map eviction in
+		// this narrow post-transform race is a deliberate drop; WireGuard/QUIC
+		// retransmission re-enters preflight with a capturable packet.
+		inc_faketcp_stat(FAKETCP_STAT_SESSION_MISS);
 		return TC_ACT_SHOT;
 	}
 	if (session->state != FAKETCP_STATE_ESTABLISHED) {
-		inc_stat(STAT_FAKETCP_BAD_STATE);
+		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 		return TC_ACT_SHOT;
 	}
 	old_udp = *udp;
@@ -218,7 +375,7 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	old_total_len = bpf_ntohs(iph->tot_len);
 	if (udp_len != info->payload_len + sizeof(old_udp) ||
 	    old_total_len > 0xffff - FAKETCP_HEADER_DELTA) {
-		inc_stat(STAT_FAKETCP_BAD_PACKET);
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return TC_ACT_SHOT;
 	}
 	if (bpf_skb_load_bytes(skb, info->payload_off, head, sizeof(head)) < 0) {
@@ -245,8 +402,9 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	tcp.ack = 1;
 	tcp.psh = 1;
 	tcp.window = bpf_htons(session->window ? session->window : 65535);
-	if (faketcp_tcp_checksum_from_udp(iph, old_udp, &tcp, udp_len) < 0) {
-		inc_stat(STAT_FAKETCP_CHECKSUM_ERROR);
+	if (faketcp_tcp_checksum_from_materialized_udp(old_udp, &tcp, udp_len,
+						      head, info->payload_len) < 0) {
+		inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
 		return TC_ACT_SHOT;
 	}
 	if (bpf_skb_store_bytes(skb, info->udp_off, &tcp, sizeof(tcp),
@@ -261,7 +419,7 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 				&(__be16){bpf_htons(new_total_len)}, sizeof(__be16),
 				BPF_F_INVALIDATE_HASH) < 0 ||
 	    update_ipv4_protocol(skb, info->ip_off, IPPROTO_UDP, IPPROTO_TCP) < 0) {
-		inc_stat(STAT_FAKETCP_CHECKSUM_ERROR);
+		inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
 		return TC_ACT_SHOT;
 	}
 
@@ -269,7 +427,7 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	// CHECKSUM_PARTIAL csum_offset. Do not weaken that loader gate merely
 	// because fully materialized packet tests pass.
 	inc_stat(STAT_EGRESS_REWRITE_OK);
-	inc_stat(STAT_FAKETCP_EGRESS_OK);
+	inc_faketcp_stat(FAKETCP_STAT_EGRESS_OK);
 	return TC_ACT_OK;
 }
 
@@ -294,7 +452,7 @@ static __always_inline int faketcp_continue_egress(struct __sk_buff *skb)
 	}
 	if (!rule || rule->generation != generation ||
 	    rule->transport_mode != TRANSPORT_FAKETCP) {
-		inc_stat(STAT_FAKETCP_BAD_STATE);
+		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 		return TC_ACT_SHOT;
 	}
 	return faketcp_encode_established(skb, &info, rule, generation);
@@ -430,20 +588,31 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	if (!session || session->generation != generation ||
 	    session->state != FAKETCP_STATE_ESTABLISHED) {
 		faketcp_emit_event(&key, faketcp_event_type(flags), flags, seq,
-				   bpf_ntohl(tcp->ack_seq), payload_len);
+				   bpf_ntohl(tcp->ack_seq), payload_len, 0,
+				   listener->wg_id);
 		return XDP_DROP;
 	}
-	if ((flags & (FAKETCP_FLAG_SYN | FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)) ||
-	    !(flags & FAKETCP_FLAG_ACK) || payload_len < FAKETCP_HEADER_DELTA ||
-	    (payload_len & 1)) {
-		inc_stat(STAT_FAKETCP_BAD_PACKET);
+	if (flags & (FAKETCP_FLAG_SYN | FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)) {
+		faketcp_emit_event(&key, faketcp_event_type(flags), flags, seq,
+				   bpf_ntohl(tcp->ack_seq), payload_len, 0,
+				   listener->wg_id);
+		return XDP_DROP;
+	}
+	if (payload_len == 0 && flags == FAKETCP_FLAG_ACK) {
+		// A userspace keepalive has no UDP image. Consume it before GRO and
+		// refresh only the peer session's idle clock.
+		session->last_seen_nanos = bpf_ktime_get_ns();
+		return XDP_DROP;
+	}
+	if (!(flags & FAKETCP_FLAG_ACK) || payload_len < FAKETCP_HEADER_DELTA) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return XDP_DROP;
 	}
 	old_tcp = *tcp;
 	if (old_tcp.check == 0 ||
 	    bpf_xdp_load_bytes(xdp, off + total_len - FAKETCP_HEADER_DELTA,
 			       tail, sizeof(tail)) < 0) {
-		inc_stat(STAT_FAKETCP_CHECKSUM_ERROR);
+		inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
 		return XDP_DROP;
 	}
 	udp.source = old_tcp.source;
@@ -468,6 +637,11 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 			     (__be32 *)&udp, sizeof(udp), sum);
 	if (sum < 0)
 		return XDP_DROP;
+	if (payload_len & 1) {
+		sum = faketcp_rotation_checksum(tail, sum, 1);
+		if (sum < 0)
+			return XDP_DROP;
+	}
 	udp.check = bpf_htons(fold_csum(sum));
 	if (udp.check == 0)
 		udp.check = bpf_htons(0xffff);
@@ -509,7 +683,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 		__sync_val_compare_and_swap(&session->rx_sequence,
 					    session->rx_sequence, next_seq);
 	session->last_seen_nanos = bpf_ktime_get_ns();
-	inc_stat(STAT_FAKETCP_INGRESS_OK);
+	inc_faketcp_stat(FAKETCP_STAT_INGRESS_OK);
 	return XDP_PASS;
 }
 

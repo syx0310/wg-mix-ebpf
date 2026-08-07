@@ -69,9 +69,20 @@ const (
 type Action struct {
 	Kind    ActionKind
 	Flow    abi.FakeTCPSessionKey
+	WGID    uint32
 	Control ControlPacket
-	Packets [][]byte
+	Packets []PendingPacket
 	Reason  string
+}
+
+// PendingPacket is a pre-transform IPv4 packet captured by BPF, with complete
+// checksums materialized by Controller. A raw sender must re-inject it with
+// FWMark on Flow.UnderlayIndex so it traverses the ordinary
+// type-word/XOR/FakeTCP egress pipeline exactly once.
+type PendingPacket struct {
+	Data   []byte
+	FWMark uint32
+	WGID   uint32
 }
 
 type SessionSnapshot struct {
@@ -85,6 +96,7 @@ type SessionSnapshot struct {
 
 type session struct {
 	state         uint8
+	wgID          uint32
 	localISN      uint32
 	remoteISN     uint32
 	txSequence    uint32
@@ -93,7 +105,7 @@ type session struct {
 	nextRetry     time.Time
 	nextKeepalive time.Time
 	retries       int
-	pending       [][]byte
+	pending       []PendingPacket
 	pendingBytes  int
 }
 
@@ -140,6 +152,37 @@ func New(options Options) (*Engine, error) {
 // Outbound observes a UDP datagram before the BPF established path can encode
 // it. The packet copy is retained only within all three configured limits.
 func (e *Engine) Outbound(flow abi.FakeTCPSessionKey, packet []byte) ([]Action, error) {
+	return e.outbound(flow, PendingPacket{Data: packet}, false)
+}
+
+// HandlePacketEvent accepts the fixed upper-bound ABI form used by low-level
+// tests. Production ring-buffer input goes through Controller so packet shape
+// and offload checksums are validated before reaching the state machine.
+func (e *Engine) HandlePacketEvent(event abi.FakeTCPPacketEvent) ([]Action, error) {
+	length := int(event.Event.PacketLength)
+	if length <= 0 || length > len(event.Packet) {
+		return nil, fmt.Errorf("faketcp captured packet length %d is invalid", length)
+	}
+	return e.handleCapturedPacket(event.Event, event.Packet[:length])
+}
+
+// handleCapturedPacket avoids materializing the fixed maximum-size ABI record
+// when a ring-buffer reader already owns the compact packet sample.
+func (e *Engine) handleCapturedPacket(event abi.FakeTCPEvent, packet []byte) ([]Action, error) {
+	if event.Type != abi.FakeTCPEventNeedHandshake {
+		return nil, fmt.Errorf("faketcp packet event type %d is not NEED_HANDSHAKE", event.Type)
+	}
+	if len(packet) == 0 || len(packet) != int(event.PacketLength) || len(packet) > abi.FakeTCPMaxCapturedPacket {
+		return nil, fmt.Errorf("faketcp captured packet body has %d bytes for declared length %d", len(packet), event.PacketLength)
+	}
+	return e.outbound(event.Key, PendingPacket{
+		Data:   packet,
+		FWMark: event.FWMark,
+		WGID:   event.WGID,
+	}, true)
+}
+
+func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alreadyDropped bool) ([]Action, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.validateFlow(flow); err != nil {
@@ -149,11 +192,22 @@ func (e *Engine) Outbound(flow abi.FakeTCPSessionKey, packet []byte) ([]Action, 
 	s := e.sessions[flow]
 	checkpoint := e.checkpoint(s)
 	if s != nil && s.state == abi.FakeTCPStateEstablished {
+		if packet.WGID != 0 && s.wgID != 0 && packet.WGID != s.wgID {
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+		}
+		if s.wgID == 0 {
+			s.wgID = packet.WGID
+		}
 		s.lastActivity = now
 		s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
 		if err := e.sync(flow, s); err != nil {
 			e.restore(flow, checkpoint)
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+		}
+		if alreadyDropped {
+			copyPacket := packet
+			copyPacket.Data = append([]byte(nil), packet.Data...)
+			return []Action{{Kind: ActionReleasePending, Flow: flow, Packets: []PendingPacket{copyPacket}}}, nil
 		}
 		return []Action{{Kind: ActionForward, Flow: flow}}, nil
 	}
@@ -165,6 +219,7 @@ func (e *Engine) Outbound(flow abi.FakeTCPSessionKey, packet []byte) ([]Action, 
 		isn := e.opts.InitialSequence()
 		s = &session{
 			state:        abi.FakeTCPStateSynSent,
+			wgID:         packet.WGID,
 			localISN:     isn,
 			txSequence:   isn + 1,
 			lastActivity: now,
@@ -173,6 +228,11 @@ func (e *Engine) Outbound(flow abi.FakeTCPSessionKey, packet []byte) ([]Action, 
 		}
 		e.sessions[flow] = s
 		created = true
+	}
+	if s.wgID == 0 {
+		s.wgID = packet.WGID
+	} else if packet.WGID != 0 && packet.WGID != s.wgID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
 	}
 	queued := e.enqueue(s, packet)
 	if err := e.sync(flow, s); err != nil {
@@ -190,6 +250,16 @@ func (e *Engine) Outbound(flow abi.FakeTCPSessionKey, packet []byte) ([]Action, 
 }
 
 func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, error) {
+	return e.inbound(flow, seg, 0)
+}
+
+// InboundWithWGID preserves the listener identity carried by the BPF event so
+// retries and replies are sent through the same configured WireGuard path.
+func (e *Engine) InboundWithWGID(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) ([]Action, error) {
+	return e.inbound(flow, seg, wgID)
+}
+
+func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) ([]Action, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.validateFlow(flow); err != nil {
@@ -198,6 +268,9 @@ func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, err
 	now := e.opts.Now()
 	s := e.sessions[flow]
 	checkpoint := e.checkpoint(s)
+	if s != nil && wgID != 0 && s.wgID != 0 && wgID != s.wgID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+	}
 	if seg.Flags&(FlagRST|FlagFIN) != 0 {
 		if s == nil {
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-close"}}, nil
@@ -220,6 +293,7 @@ func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, err
 		isn := e.opts.InitialSequence()
 		s = &session{
 			state:        abi.FakeTCPStateSynReceived,
+			wgID:         wgID,
 			localISN:     isn,
 			remoteISN:    seg.Sequence,
 			txSequence:   isn + 1,
@@ -234,6 +308,9 @@ func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, err
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
 		}
 		return []Action{e.control(flow, s, FlagSYN|FlagACK, s.localISN, s.rxSequence, "accept-syn")}, nil
+	}
+	if s.wgID == 0 {
+		s.wgID = wgID
 	}
 
 	s.lastActivity = now
@@ -408,7 +485,7 @@ func (e *Engine) checkpoint(s *session) engineCheckpoint {
 	}
 	if s != nil {
 		copySession := *s
-		copySession.pending = append([][]byte(nil), s.pending...)
+		copySession.pending = append([]PendingPacket(nil), s.pending...)
 		checkpoint.session = &copySession
 	}
 	return checkpoint
@@ -424,9 +501,9 @@ func (e *Engine) restore(flow abi.FakeTCPSessionKey, checkpoint engineCheckpoint
 	e.sessions[flow] = checkpoint.session
 }
 
-func (e *Engine) enqueue(s *session, packet []byte) bool {
-	if len(packet) == 0 || len(s.pending) >= e.opts.MaxPendingPacketsPerFlow ||
-		e.pendingBytes+len(packet) > e.opts.MaxPendingBytes {
+func (e *Engine) enqueue(s *session, packet PendingPacket) bool {
+	if len(packet.Data) == 0 || len(s.pending) >= e.opts.MaxPendingPacketsPerFlow ||
+		e.pendingBytes+len(packet.Data) > e.opts.MaxPendingBytes {
 		return false
 	}
 	if len(s.pending) == 0 {
@@ -435,10 +512,11 @@ func (e *Engine) enqueue(s *session, packet []byte) bool {
 		}
 		e.pendingFlows++
 	}
-	copyPacket := append([]byte(nil), packet...)
+	copyPacket := packet
+	copyPacket.Data = append([]byte(nil), packet.Data...)
 	s.pending = append(s.pending, copyPacket)
-	s.pendingBytes += len(copyPacket)
-	e.pendingBytes += len(copyPacket)
+	s.pendingBytes += len(copyPacket.Data)
+	e.pendingBytes += len(copyPacket.Data)
 	return true
 }
 
@@ -466,6 +544,7 @@ func (e *Engine) control(flow abi.FakeTCPSessionKey, s *session, flags uint8, se
 	return Action{
 		Kind:    ActionSendControl,
 		Flow:    flow,
+		WGID:    s.wgID,
 		Control: ControlPacket{Flags: flags, Sequence: seq, Acknowledgement: ack, Window: e.opts.Window},
 		Reason:  reason,
 	}

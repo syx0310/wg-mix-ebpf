@@ -10,8 +10,8 @@ import (
 )
 
 func TestABIVersion(t *testing.T) {
-	if Version != 11 {
-		t.Fatalf("ABI version = %d, want 11", Version)
+	if Version != 10 {
+		t.Fatalf("ABI version = %d, want backward-compatible 10", Version)
 	}
 }
 
@@ -52,7 +52,8 @@ func TestStructSizesAreStable(t *testing.T) {
 		{"ICMPListenerValue", unsafe.Sizeof(ICMPListenerValue{}), 24},
 		{"FakeTCPSessionKey", unsafe.Sizeof(FakeTCPSessionKey{}), 24},
 		{"FakeTCPSessionValue", unsafe.Sizeof(FakeTCPSessionValue{}), 40},
-		{"FakeTCPEvent", unsafe.Sizeof(FakeTCPEvent{}), 48},
+		{"FakeTCPEvent", unsafe.Sizeof(FakeTCPEvent{}), FakeTCPEventSize},
+		{"FakeTCPPacketEvent", unsafe.Sizeof(FakeTCPPacketEvent{}), FakeTCPPacketEventSize},
 	}
 	for _, check := range checks {
 		if check.got != check.want {

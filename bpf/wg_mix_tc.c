@@ -12,7 +12,7 @@
 #include <bpf/bpf_endian.h>
 #include <bpf/bpf_helpers.h>
 
-#define ABI_VERSION 11
+#define ABI_VERSION 10
 
 #define FAMILY_ANY  0
 #define FAMILY_IPV4 4
@@ -357,15 +357,6 @@ enum stat_id {
 	STAT_EGRESS_BAD_CHECKSUM,
 	STAT_XOR_EGRESS_DISPATCH_ERROR,
 	STAT_XOR_INGRESS_DISPATCH_ERROR,
-	STAT_FAKETCP_EGRESS_OK,
-	STAT_FAKETCP_INGRESS_OK,
-	STAT_FAKETCP_SESSION_MISS,
-	STAT_FAKETCP_BAD_STATE,
-	STAT_FAKETCP_BAD_PACKET,
-	STAT_FAKETCP_GSO_REJECT,
-	STAT_FAKETCP_CHECKSUM_ERROR,
-	STAT_FAKETCP_METADATA_ERROR,
-	STAT_FAKETCP_EVENT_ERROR,
 	STAT_MAX,
 };
 
@@ -1832,7 +1823,6 @@ int wg_mix_egress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	if (rule->action != ACTION_REWRITE)
 		return TC_ACT_OK;
-
 	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0) {
 		inc_stat(STAT_SKB_LOAD_ERROR);
 		return TC_ACT_SHOT;
@@ -1862,6 +1852,12 @@ int wg_mix_egress(struct __sk_buff *skb)
 			return TC_ACT_SHOT;
 		}
 	}
+	// Validate the unmodified WireGuard packet and all referenced policy
+	// objects before consuming bounded slow-path capacity. Capture still
+	// precedes type-word rewrite, XOR and FakeTCP encoding.
+	if (rule->transport_mode == TRANSPORT_FAKETCP &&
+	    faketcp_preflight_egress(skb, &info, rule, generation) < 0)
+		return TC_ACT_SHOT;
 	new_wire = wg_cpu_to_le32(profile->standard_to_mixed[kind]);
 	if (rule->transport_mode == TRANSPORT_ICMP) {
 		rc = rewrite_udp_to_icmp(skb, &info, rule, old_wire, new_wire);
@@ -2030,7 +2026,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	}
 	if (listener->transport_mode == TRANSPORT_FAKETCP &&
 	    !faketcp_metadata_valid(skb, generation)) {
-		inc_stat(STAT_FAKETCP_METADATA_ERROR);
+		inc_faketcp_stat(FAKETCP_STAT_METADATA_ERROR);
 		return TC_ACT_SHOT;
 	}
 	if (gso_seen)

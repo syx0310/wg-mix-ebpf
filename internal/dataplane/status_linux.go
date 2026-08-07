@@ -217,15 +217,6 @@ var statNames = []string{
 	"egress_bad_checksum",
 	"xor_egress_dispatch_error",
 	"xor_ingress_dispatch_error",
-	"faketcp_egress_ok",
-	"faketcp_ingress_ok",
-	"faketcp_session_miss",
-	"faketcp_bad_state",
-	"faketcp_bad_packet",
-	"faketcp_gso_reject",
-	"faketcp_checksum_error",
-	"faketcp_metadata_error",
-	"faketcp_event_error",
 }
 
 func filterStatuses(link netlink.Link, parent uint32, direction string) ([]FilterStatus, error) {

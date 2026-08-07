@@ -8,7 +8,7 @@ import (
 )
 
 const (
-	Version uint32 = 11
+	Version uint32 = 10
 
 	FamilyAny  uint8 = 0
 	FamilyIPv4 uint8 = 4
@@ -49,6 +49,10 @@ const (
 	FakeTCPEventACK           uint8 = 4
 	FakeTCPEventRST           uint8 = 5
 	FakeTCPEventFIN           uint8 = 6
+
+	FakeTCPEventSize         = 56
+	FakeTCPMaxCapturedPacket = 2304
+	FakeTCPPacketEventSize   = FakeTCPEventSize + FakeTCPMaxCapturedPacket
 )
 
 type ControlKey uint32
@@ -225,9 +229,19 @@ type FakeTCPEvent struct {
 	Sequence        uint32
 	Acknowledgement uint32
 	PayloadLength   uint32
+	FWMark          uint32
+	WGID            uint32
+	PacketLength    uint16
 	Type            uint8
 	TCPFlags        uint8
-	_               [2]byte
+}
+
+// FakeTCPPacketEvent carries the exact pre-transform IPv4 packet for the
+// bounded userspace first-packet queue. Consumers must use PacketLength and
+// ignore the unused tail of Packet.
+type FakeTCPPacketEvent struct {
+	Event  FakeTCPEvent
+	Packet [FakeTCPMaxCapturedPacket]byte
 }
 
 type ICMPListenerKey struct {

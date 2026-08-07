@@ -112,11 +112,25 @@ func TestValidateAndSetPinnedMapsRequiresCanonicalMapABI(t *testing.T) {
 			wantErr: `missing required pinned map "profile_map"`,
 		},
 		{
+			name: "missing experimental relocation map",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				delete(spec.Maps, "faketcp_session_map")
+			},
+			wantErr: `missing required unpinned map "faketcp_session_map"`,
+		},
+		{
 			name: "unexpected pinned map",
 			mutate: func(spec *ebpf.CollectionSpec) {
 				spec.Maps["icmp_seq_map"].Pinning = ebpf.PinByName
 			},
 			wantErr: "unexpected pinned maps: icmp_seq_map",
+		},
+		{
+			name: "experimental map cannot join owner set",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Maps["faketcp_events"].Pinning = ebpf.PinByName
+			},
+			wantErr: `experimental BPF map "faketcp_events" must remain unpinned`,
 		},
 		{
 			name: "unexpected unsupported pin mode",
@@ -1271,6 +1285,16 @@ func canonicalPinnedMapCollectionSpec() *ebpf.CollectionSpec {
 		Maps: make(map[string]*ebpf.MapSpec),
 	}
 	for _, descriptor := range pinnedMapDescriptors() {
+		spec.Maps[descriptor.name] = &ebpf.MapSpec{
+			Name:       descriptor.name,
+			Type:       descriptor.mapType,
+			KeySize:    descriptor.keySize,
+			ValueSize:  descriptor.valueSize,
+			MaxEntries: descriptor.maxEntries,
+			Flags:      descriptor.flags,
+		}
+	}
+	for _, descriptor := range fakeTCPUnpinnedMapDescriptors() {
 		spec.Maps[descriptor.name] = &ebpf.MapSpec{
 			Name:       descriptor.name,
 			Type:       descriptor.mapType,

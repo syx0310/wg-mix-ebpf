@@ -73,7 +73,7 @@ func TestClientHandshakeReleasesBoundedFirstPacket(t *testing.T) {
 	packet[0] = 9
 	actions, err = engine.Inbound(flow, Segment{Flags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001})
 	if err != nil || len(actions) != 2 || actions[0].Control.Flags != FlagACK ||
-		actions[1].Kind != ActionReleasePending || actions[1].Packets[0][0] != 1 {
+		actions[1].Kind != ActionReleasePending || actions[1].Packets[0].Data[0] != 1 {
 		t.Fatalf("handshake actions=%#v err=%v", actions, err)
 	}
 	state, ok := engine.Snapshot(flow)
@@ -235,5 +235,100 @@ func TestRawIPv4BE32MatchesBPFMemoryLayout(t *testing.T) {
 	binary.NativeEndian.PutUint32(bytes[:], raw)
 	if bytes != [4]byte{10, 0, 0, 1} {
 		t.Fatalf("raw __be32 memory = %v", bytes)
+	}
+}
+
+func TestAdjustTransportMTUAccountsForTCPHeaderDelta(t *testing.T) {
+	got, err := AdjustTransportMTU(1500)
+	if err != nil || got != 1488 {
+		t.Fatalf("adjusted MTU = %d, err=%v, want 1488", got, err)
+	}
+	if _, err := AdjustTransportMTU(WireHeaderOverhead); err == nil {
+		t.Fatal("non-positive post-encapsulation MTU was accepted")
+	}
+}
+
+func TestPacketEventFeedsRealBoundedQueueAndReleaseMetadata(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	flow := testFlow(31001)
+	event := abi.FakeTCPPacketEvent{Event: abi.FakeTCPEvent{
+		Key: flow, Type: abi.FakeTCPEventNeedHandshake,
+		PacketLength: 4, FWMark: 0x10000002, WGID: 7,
+	}}
+	copy(event.Packet[:], []byte{0x45, 1, 2, 3})
+	actions, err := engine.HandlePacketEvent(event)
+	if err != nil || len(actions) != 1 || actions[0].Control.Flags != FlagSYN {
+		t.Fatalf("capture actions=%#v err=%v", actions, err)
+	}
+	event.Packet[0] = 0xff
+	actions, err = engine.Inbound(flow, Segment{
+		Flags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001,
+	})
+	if err != nil || len(actions) != 2 || actions[1].Kind != ActionReleasePending {
+		t.Fatalf("release actions=%#v err=%v", actions, err)
+	}
+	packet := actions[1].Packets[0]
+	if packet.Data[0] != 0x45 || packet.FWMark != 0x10000002 || packet.WGID != 7 {
+		t.Fatalf("released packet=%#v", packet)
+	}
+}
+
+func TestPacketEventRejectsMissingPacketBody(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	_, err := engine.HandlePacketEvent(abi.FakeTCPPacketEvent{Event: abi.FakeTCPEvent{
+		Key: testFlow(31001), Type: abi.FakeTCPEventNeedHandshake,
+	}})
+	if err == nil {
+		t.Fatal("metadata-only NEED_HANDSHAKE event was accepted")
+	}
+}
+
+func TestWGIDMismatchCannotDriveOrCloseExistingSession(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	flow := testFlow(31001)
+	event := abi.FakeTCPPacketEvent{Event: abi.FakeTCPEvent{
+		Key: flow, Type: abi.FakeTCPEventNeedHandshake,
+		PacketLength: 1, WGID: 7,
+	}}
+	event.Packet[0] = 1
+	actions, err := engine.HandlePacketEvent(event)
+	if err != nil || len(actions) != 1 || actions[0].WGID != 7 {
+		t.Fatalf("initial actions=%#v err=%v", actions, err)
+	}
+	for _, segment := range []Segment{
+		{Flags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001},
+		{Flags: FlagRST},
+	} {
+		actions, err = engine.InboundWithWGID(flow, segment, 8)
+		if err != nil || len(actions) != 1 || actions[0].Reason != "wg-id-mismatch" {
+			t.Fatalf("mismatched actions=%#v err=%v", actions, err)
+		}
+	}
+	state, ok := engine.Snapshot(flow)
+	if !ok || state.State != abi.FakeTCPStateSynSent {
+		t.Fatalf("mismatched event changed state=%#v ok=%t", state, ok)
+	}
+}
+
+func TestLatePacketEventAfterEstablishmentIsReinjected(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	flow := testFlow(31001)
+	if _, err := engine.Outbound(flow, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Inbound(flow, Segment{
+		Flags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	event := abi.FakeTCPPacketEvent{Event: abi.FakeTCPEvent{
+		Key: flow, Type: abi.FakeTCPEventNeedHandshake,
+		PacketLength: 2, FWMark: 3, WGID: 7,
+	}}
+	copy(event.Packet[:], []byte{4, 5})
+	actions, err := engine.HandlePacketEvent(event)
+	if err != nil || len(actions) != 1 || actions[0].Kind != ActionReleasePending ||
+		len(actions[0].Packets) != 1 || actions[0].Packets[0].Data[1] != 5 {
+		t.Fatalf("late packet actions=%#v err=%v", actions, err)
 	}
 }
