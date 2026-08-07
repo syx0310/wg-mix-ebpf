@@ -175,7 +175,7 @@ func TestExperimentalRuntimeFactoryBuilderPreClaimFailureClosesBothOwners(t *tes
 	}
 }
 
-func TestExperimentalRuntimeFactoryClaimedPrepareFailureClosesExactlyOnce(t *testing.T) {
+func TestExperimentalRuntimeFactoryQuarantinesClaimedPrepareCleanupFailure(t *testing.T) {
 	fixture := newExperimentalRuntimeFactoryFixture(t, 91)
 	prepareErr := "does not match snapshot generation"
 	collectionErr := errors.New("injected collection close failure")
@@ -185,24 +185,55 @@ func TestExperimentalRuntimeFactoryClaimedPrepareFailureClosesExactlyOnce(t *tes
 	closeCalls := installFactoryTransactionClose(t, fixture.transaction, transactionErr)
 
 	runtime, err := fixture.build(fixture.ctx)
-	if runtime != nil || err == nil || !strings.Contains(err.Error(), prepareErr) ||
-		!errors.Is(err, collectionErr) || !errors.Is(err, transactionErr) {
+	if runtime == nil || err == nil || !strings.Contains(err.Error(), prepareErr) ||
+		!errors.Is(err, collectionErr) || errors.Is(err, transactionErr) {
 		t.Fatalf("runtime=%#v error=%v", runtime, err)
 	}
-	if *closeCalls != 1 || !fixture.transaction.isClosed() {
+	if *closeCalls != 0 || fixture.transaction.isClosed() {
 		t.Fatalf("transaction closes=%d closed=%t", *closeCalls, fixture.transaction.isClosed())
 	}
-	if strings.Count(err.Error(), collectionErr.Error()) != 1 ||
-		strings.Count(err.Error(), transactionErr.Error()) != 1 {
-		t.Fatalf("builder cleanup error was joined more than once: %v", err)
+	if _, handlesErr := runtime.Handles(); !errors.Is(
+		handlesErr, ErrExperimentalFakeTCPRuntimeClosed,
+	) {
+		t.Fatalf("quarantined runtime Handles error = %v", handlesErr)
 	}
-	assertFactoryCollectionCloseCount(t, fixture.runtime, 1)
+	failedMap := fixture.runtime.mapResources[fakeTCPSessionMapName]
+	if failedMap.closes != 2 {
+		t.Fatalf("failed collection map closes=%d, want build plus factory retry", failedMap.closes)
+	}
+	for name, resource := range fixture.runtime.mapResources {
+		if name != fakeTCPSessionMapName && resource.closes != 1 {
+			t.Fatalf("successful map %s closes=%d", name, resource.closes)
+		}
+	}
+	for name, resource := range fixture.runtime.programs {
+		if resource.closes != 1 {
+			t.Fatalf("successful program %s closes=%d", name, resource.closes)
+		}
+	}
 	if fixture.runtime.sessionStore.closes != 0 || fixture.runtime.commitCalls != 0 {
 		t.Fatalf(
 			"prepare failure session closes=%d commit calls=%d",
 			fixture.runtime.sessionStore.closes,
 			fixture.runtime.commitCalls,
 		)
+	}
+
+	failedMap.closeErr = nil
+	if closeErr := runtime.Close(); !errors.Is(closeErr, transactionErr) {
+		t.Fatalf("first owner retry error = %v", closeErr)
+	}
+	if *closeCalls != 1 || !fixture.transaction.isClosed() || runtime.state.closed {
+		t.Fatalf(
+			"first retry closes=%d transaction closed=%t runtime closed=%t",
+			*closeCalls, fixture.transaction.isClosed(), runtime.state.closed,
+		)
+	}
+	if closeErr := runtime.Close(); closeErr != nil {
+		t.Fatalf("second owner retry: %v", closeErr)
+	}
+	if !runtime.state.closed || failedMap.closes != 3 {
+		t.Fatalf("converged closed=%t failed map closes=%d", runtime.state.closed, failedMap.closes)
 	}
 }
 

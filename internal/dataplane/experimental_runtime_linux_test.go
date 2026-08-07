@@ -773,7 +773,7 @@ func TestGenerationFencedSessionStoreCloseWaitsForAdmittedOperation(t *testing.T
 	}
 }
 
-func TestExperimentalFakeTCPRuntimeCopiesShareExactlyOnceClose(t *testing.T) {
+func TestExperimentalFakeTCPRuntimeCopiesShareRetryableCloseQuarantine(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
 	wantErr := errors.New("injected session close failure")
 	fixture.sessionStore.closeErr = wantErr
@@ -806,23 +806,38 @@ func TestExperimentalFakeTCPRuntimeCopiesShareExactlyOnceClose(t *testing.T) {
 			t.Fatalf("concurrent close error = %v", err)
 		}
 	}
+	if runtime.state.closed || fixture.sessionStore.closes == 0 {
+		t.Fatalf(
+			"failed session owner closed=%t close attempts=%d",
+			runtime.state.closed, fixture.sessionStore.closes,
+		)
+	}
 	for name, target := range map[string]*ExperimentalFakeTCPRuntime{
-		"original": runtime,
-		"copy":     &runtimeCopy,
+		"original": runtime, "copy": &runtimeCopy,
 	} {
-		if err := target.Close(); !errors.Is(err, wantErr) {
-			t.Fatalf("sequential close through %s error = %v", name, err)
-		}
 		if _, err := target.Handles(); !errors.Is(err, ErrExperimentalFakeTCPRuntimeClosed) {
-			t.Fatalf("handles through closed %s error = %v", name, err)
+			t.Fatalf("handles through quarantined %s error = %v", name, err)
 		}
 	}
-	if fixture.sessionStore.closes != 1 {
-		t.Fatalf("session close count = %d", fixture.sessionStore.closes)
+	for name, resource := range fixture.mapResources {
+		if resource.closes != 0 {
+			t.Fatalf("unsafe collection close reached map %s: %d", name, resource.closes)
+		}
+	}
+	priorAttempts := fixture.sessionStore.closes
+	fixture.sessionStore.closeErr = nil
+	if err := runtimeCopy.Close(); err != nil {
+		t.Fatalf("retry through copied owner: %v", err)
+	}
+	if !runtime.state.closed || fixture.sessionStore.closes != priorAttempts+1 {
+		t.Fatalf(
+			"retry closed=%t session attempts=%d, want %d",
+			runtime.state.closed, fixture.sessionStore.closes, priorAttempts+1,
+		)
 	}
 	for name, resource := range fixture.mapResources {
 		if resource.closes != 1 {
-			t.Fatalf("map %s close count = %d", name, resource.closes)
+			t.Fatalf("map %s close count after convergence = %d", name, resource.closes)
 		}
 	}
 }
@@ -1713,7 +1728,87 @@ func TestExperimentalRuntimeCloseQuarantinesFailedDetachesUntilRetry(t *testing.
 	}
 }
 
-func TestExperimentalSlowPathConstructionFailureClosesPartialOwnerOnce(t *testing.T) {
+func TestExperimentalRuntimeBuildFailureQuarantinesRetainedTCRollback(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+	commitErr := errors.New("injected core commit failure")
+	tcCloseErr := errors.New("injected retained TC rollback failure")
+	options := fixture.buildOptions(snapshot, transaction)
+	options.coreStageFactory = func(
+		context.Context,
+		experimentalCoreResources,
+		*abi.Snapshot,
+	) (experimentalCoreStageOwner, error) {
+		stage := &fakeExperimentalCoreStage{
+			trace: &fixture.activationTrace, commitErr: commitErr,
+		}
+		fixture.lastCoreStage = stage
+		return stage, nil
+	}
+	options.tcStageFactory = func(
+		_ context.Context,
+		_ *control.State,
+		_, _ experimentalProgramResource,
+		commit func() error,
+	) (experimentalTCStageOwner, error) {
+		stage := &fakeExperimentalTCStage{
+			trace: &fixture.activationTrace, closeErr: tcCloseErr,
+		}
+		fixture.lastTCStage = stage
+		return stage, commit()
+	}
+
+	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
+	if runtime == nil || !errors.Is(err, commitErr) || !errors.Is(err, tcCloseErr) {
+		t.Fatalf("runtime=%#v error=%v", runtime, err)
+	}
+	if runtime.state.failedBuild == nil || runtime.state.closed || fixture.lastTCStage.closes != 1 {
+		t.Fatalf(
+			"failed build=%#v closed=%t TC closes=%d",
+			runtime.state.failedBuild, runtime.state.closed, fixture.lastTCStage.closes,
+		)
+	}
+	if transaction.isClosed() || len(fixture.programArray.deletes) != 0 ||
+		len(fixture.policyTrace.deleteAttempts) != 0 {
+		t.Fatalf(
+			"quarantine transaction closed=%t programs=%v policy deletes=%v",
+			transaction.isClosed(), fixture.programArray.deletes,
+			fixture.policyTrace.deleteAttempts,
+		)
+	}
+	for name, resource := range fixture.mapResources {
+		if resource.closes != 0 {
+			t.Fatalf("live rollback dependency map %s closed=%d", name, resource.closes)
+		}
+	}
+	if _, handlesErr := runtime.Handles(); !errors.Is(
+		handlesErr, ErrExperimentalFakeTCPRuntimeClosed,
+	) {
+		t.Fatalf("quarantined Handles error = %v", handlesErr)
+	}
+
+	fixture.lastTCStage.closeErr = nil
+	if closeErr := runtime.Close(); closeErr != nil {
+		t.Fatalf("retry failed-build Close: %v", closeErr)
+	}
+	if !runtime.state.closed || runtime.state.failedBuild != nil ||
+		!transaction.isClosed() || fixture.lastTCStage.closes != 2 {
+		t.Fatalf(
+			"retry closed=%t failed build=%#v transaction closed=%t TC closes=%d",
+			runtime.state.closed, runtime.state.failedBuild,
+			transaction.isClosed(), fixture.lastTCStage.closes,
+		)
+	}
+	if len(fixture.programArray.deletes) == 0 || len(fixture.policyTrace.deleteAttempts) == 0 {
+		t.Fatalf(
+			"retry did not roll back programs=%v policy deletes=%v",
+			fixture.programArray.deletes, fixture.policyTrace.deleteAttempts,
+		)
+	}
+}
+
+func TestExperimentalSlowPathConstructionFailureQuarantinesPartialOwner(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
@@ -1725,11 +1820,28 @@ func TestExperimentalSlowPathConstructionFailureClosesPartialOwnerOnce(t *testin
 		return fixture.slowPath, factoryErr
 	}
 	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
-	if runtime != nil || !errors.Is(err, factoryErr) || !errors.Is(err, closeErr) {
+	if runtime == nil || !errors.Is(err, factoryErr) || !errors.Is(err, closeErr) {
 		t.Fatalf("runtime=%#v error=%v", runtime, err)
 	}
-	if _, _, closes := fixture.slowPath.counts(); closes != 1 {
-		t.Fatalf("partial slow-path closes = %d", closes)
+	if _, _, closes := fixture.slowPath.counts(); closes != 2 {
+		t.Fatalf("partial slow-path closes = %d, want constructor plus cleanup", closes)
+	}
+	if _, handlesErr := runtime.Handles(); !errors.Is(
+		handlesErr, ErrExperimentalFakeTCPRuntimeClosed,
+	) {
+		t.Fatalf("quarantined Handles error = %v", handlesErr)
+	}
+	for name, resource := range fixture.mapResources {
+		if resource.closes != 0 {
+			t.Fatalf("partial slow path failure reached map %s close=%d", name, resource.closes)
+		}
+	}
+	fixture.slowPath.closeErr = nil
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("retry partial owner Close: %v", err)
+	}
+	if !runtime.state.closed {
+		t.Fatal("partial owner quarantine did not converge")
 	}
 }
 

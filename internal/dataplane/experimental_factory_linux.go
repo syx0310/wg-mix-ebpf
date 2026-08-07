@@ -70,11 +70,24 @@ func acquireAndBuildExperimentalFakeTCPRuntimeWithBuilder(
 			return
 		}
 		if runtime != nil {
-			returnErr = errors.Join(
-				returnErr,
-				wrapExperimentalRuntimeClose("failed factory result", runtime),
+			retainsOwner, retainsTransaction := experimentalFakeTCPRuntimeRetainsFactoryOwners(
+				runtime, owner, transaction,
 			)
-			runtime = nil
+			closeErr := wrapExperimentalRuntimeClose("failed factory result", runtime)
+			returnErr = errors.Join(returnErr, closeErr)
+			if closeErr == nil {
+				runtime = nil
+			} else {
+				// A failed Close leaves a quarantined, shutdown runtime as the
+				// unique retry capability. Do not race it by closing either
+				// factory owner through a second path.
+				if retainsOwner {
+					owner = nil
+				}
+				if retainsTransaction {
+					transaction = nil
+				}
+			}
 		}
 		if owner != nil && !owner.isClosed() {
 			returnErr = errors.Join(
@@ -124,9 +137,9 @@ func acquireAndBuildExperimentalFakeTCPRuntimeWithBuilder(
 	buildOptions.collection = owner
 	runtime, err = builder(ctx, buildOptions)
 	if err != nil {
-		// Preserve an anomalous non-nil result for the cleanup defer. The fixed
-		// production builder currently returns nil with every error, but this
-		// boundary must remain leak-free if that implementation later changes.
+		// Preserve a non-nil failed-build owner for the cleanup defer. If its
+		// immediate retry also fails, the defer returns that quarantined owner
+		// to the supervisor instead of losing the only teardown capability.
 		return runtime, err
 	}
 	if runtime == nil {
@@ -166,10 +179,36 @@ func experimentalFakeTCPRuntimeOwnsExactCollection(
 	state := runtime.state
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.closing || state.closed || state.collection != owner {
+	if state.shutdown || state.closing || state.closed || state.collection != owner {
 		return false
 	}
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
-	return !owner.closing && !owner.closed
+	return !owner.shutdown && !owner.closing && !owner.closed
+}
+
+// experimentalFakeTCPRuntimeRetainsFactoryOwners is intentionally a pointer
+// identity check, not a liveness check. It is used only after a builder error,
+// when the returned runtime is already shutdown and may be quarantining a
+// partially closed collection or a claimed generation transaction.
+func experimentalFakeTCPRuntimeRetainsFactoryOwners(
+	runtime *ExperimentalFakeTCPRuntime,
+	owner *experimentalCollectionOwner,
+	transaction *fakeTCPPolicyGenerationTransaction,
+) (retainsOwner, retainsTransaction bool) {
+	if runtime == nil || runtime.state == nil {
+		return false, false
+	}
+	state := runtime.state
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	retainsOwner = owner != nil && state.collection == owner
+	if state.failedBuild == nil {
+		return retainsOwner, false
+	}
+	build := state.failedBuild
+	retainsOwner = retainsOwner || owner != nil && build.options.collection == owner
+	retainsTransaction = transaction != nil && build.claim != nil &&
+		build.claim.transaction == transaction
+	return retainsOwner, retainsTransaction
 }

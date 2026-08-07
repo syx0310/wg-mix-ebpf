@@ -62,14 +62,15 @@ func (program *liveExperimentalProgram) kernelProgram() *ebpf.Program {
 // callers must not close them and must not use them after Close starts.
 //
 // The owner closes each resource itself instead of calling Collection.Close,
-// whose error-less API would hide FD close failures. Resources are removed
-// from the owner before their Close methods run, so concurrent Close calls can
-// neither double-close nor observe a partially reusable collection.
+// whose error-less API would hide FD close failures. A first Close permanently
+// fences borrowed access, but a failed resource remains owned and can be
+// retried. Successfully closed siblings are removed before the next attempt.
 type experimentalCollectionOwner struct {
 	mu sync.Mutex
 
 	maps                      map[string]experimentalMapResource
 	programs                  map[string]experimentalProgramResource
+	shutdown                  bool
 	closing                   bool
 	closed                    bool
 	freshRuntimeClaimConsumed bool
@@ -119,7 +120,7 @@ func (owner *experimentalCollectionOwner) mapResource(name string) (experimental
 	}
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
-	if owner.closing || owner.closed {
+	if owner.shutdown || owner.closing || owner.closed {
 		return nil, errExperimentalCollectionClosed
 	}
 	resource := owner.maps[name]
@@ -135,7 +136,7 @@ func (owner *experimentalCollectionOwner) programResource(name string) (experime
 	}
 	owner.mu.Lock()
 	defer owner.mu.Unlock()
-	if owner.closing || owner.closed {
+	if owner.shutdown || owner.closing || owner.closed {
 		return nil, errExperimentalCollectionClosed
 	}
 	resource := owner.programs[name]
@@ -151,9 +152,8 @@ func (owner *experimentalCollectionOwner) Close() error {
 	}
 	owner.mu.Lock()
 	if owner.closed {
-		err := owner.closeErr
 		owner.mu.Unlock()
-		return err
+		return nil
 	}
 	if owner.closing {
 		done := owner.closeDone
@@ -164,28 +164,31 @@ func (owner *experimentalCollectionOwner) Close() error {
 		owner.mu.Unlock()
 		return err
 	}
+	owner.shutdown = true
 	owner.closing = true
+	owner.closeDone = make(chan struct{})
+	done := owner.closeDone
 	maps := owner.maps
 	programs := owner.programs
 	owner.maps = nil
 	owner.programs = nil
 	owner.mu.Unlock()
 
-	err := closeExperimentalResources(maps, programs)
+	remainingMaps, remainingPrograms, err := closeExperimentalResources(maps, programs)
 
 	owner.mu.Lock()
+	owner.maps = remainingMaps
+	owner.programs = remainingPrograms
 	owner.closeErr = err
-	owner.closed = true
+	owner.closed = len(remainingMaps) == 0 && len(remainingPrograms) == 0
 	owner.closing = false
-	close(owner.closeDone)
+	close(done)
 	owner.mu.Unlock()
 	return err
 }
 
-// isClosed reports whether Close has completed. It deliberately does not
-// expose the retained close error: ownership combinators use it only to avoid
-// calling an idempotent owner a second time and duplicating that same cached
-// error in a larger errors.Join chain.
+// isClosed reports whether every exact resource has completed Close. A failed
+// attempt leaves this false so the unique owner remains a retry capability.
 func (owner *experimentalCollectionOwner) isClosed() bool {
 	if owner == nil {
 		return true
@@ -215,7 +218,11 @@ func (owner *experimentalCollectionOwner) closeAndReleaseProof() (
 func closeExperimentalResources(
 	maps map[string]experimentalMapResource,
 	programs map[string]experimentalProgramResource,
-) error {
+) (
+	map[string]experimentalMapResource,
+	map[string]experimentalProgramResource,
+	error,
+) {
 	mapNames := make([]string, 0, len(maps))
 	for name := range maps {
 		mapNames = append(mapNames, name)
@@ -227,16 +234,20 @@ func closeExperimentalResources(
 	}
 	sort.Strings(programNames)
 
+	remainingMaps := make(map[string]experimentalMapResource)
+	remainingPrograms := make(map[string]experimentalProgramResource)
 	var errs []error
 	for _, name := range programNames {
 		if err := programs[name].Close(); err != nil {
+			remainingPrograms[name] = programs[name]
 			errs = append(errs, fmt.Errorf("close experimental FakeTCP program %s: %w", name, err))
 		}
 	}
 	for _, name := range mapNames {
 		if err := maps[name].Close(); err != nil {
+			remainingMaps[name] = maps[name]
 			errs = append(errs, fmt.Errorf("close experimental FakeTCP map %s: %w", name, err))
 		}
 	}
-	return errors.Join(errs...)
+	return remainingMaps, remainingPrograms, errors.Join(errs...)
 }

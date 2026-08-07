@@ -136,6 +136,7 @@ type generationFencedSessionStore struct {
 	mu         sync.RWMutex
 	generation uint64
 	backend    ownedFakeTCPSessionStore
+	shutdown   bool
 	closed     bool
 	closeErr   error
 }
@@ -315,7 +316,7 @@ func (store *generationFencedSessionStore) DeleteEstablishedIfUnchanged(
 }
 
 func (store *generationFencedSessionStore) validateLocked(generations ...uint64) error {
-	if store == nil || store.closed || store.backend == nil {
+	if store == nil || store.shutdown || store.closed || store.backend == nil {
 		return ErrExperimentalFakeTCPRuntimeClosed
 	}
 	for _, generation := range generations {
@@ -338,12 +339,15 @@ func (store *generationFencedSessionStore) Close() error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.closed {
-		return store.closeErr
+		return nil
 	}
-	store.closed = true
+	store.shutdown = true
 	backend := store.backend
-	store.backend = nil
 	store.closeErr = backend.Close()
+	if store.closeErr == nil {
+		store.backend = nil
+		store.closed = true
+	}
 	return store.closeErr
 }
 
@@ -403,20 +407,21 @@ var (
 type experimentalFakeTCPRuntimeState struct {
 	mu sync.Mutex
 
-	generation uint64
-	identity   faketcp.RuntimeIdentity
-	engine     *faketcp.Engine
-	collection *experimentalCollectionOwner
-	core       experimentalCoreStageOwner
-	tc         experimentalTCStageOwner
-	xdp        *fakeTCPXDPStage
-	slowPath   experimentalSlowPath
-	handles    ExperimentalFakeTCPRuntimeHandles
-	closing    bool
-	closed     bool
-	shutdown   bool
-	closeErr   error
-	closeDone  chan struct{}
+	generation  uint64
+	identity    faketcp.RuntimeIdentity
+	engine      *faketcp.Engine
+	collection  *experimentalCollectionOwner
+	core        experimentalCoreStageOwner
+	tc          experimentalTCStageOwner
+	xdp         *fakeTCPXDPStage
+	slowPath    experimentalSlowPath
+	handles     ExperimentalFakeTCPRuntimeHandles
+	closing     bool
+	closed      bool
+	shutdown    bool
+	closeErr    error
+	closeDone   chan struct{}
+	failedBuild *experimentalRuntimeBuild
 }
 
 var errExperimentalFreshCollectionReleaseConsumed = errors.New(
@@ -619,33 +624,55 @@ func buildExperimentalFakeTCPRuntime(
 		cleanupCtx: cleanupCtx,
 	}
 	if err := build.prepare(); err != nil {
-		return nil, build.fail(err)
+		return build.fail(err)
 	}
 	if err := build.activate(); err != nil {
 		if build.committed.Load() {
-			return nil, build.failCommitted(err)
+			return build.failCommitted(err)
 		}
-		return nil, build.fail(err)
+		return build.fail(err)
 	}
+	return build.runtimeOwner(), nil
+}
+
+func (build *experimentalRuntimeBuild) runtimeOwner() *ExperimentalFakeTCPRuntime {
 	return &ExperimentalFakeTCPRuntime{
 		state: &experimentalFakeTCPRuntimeState{
-			generation: options.snapshot.Generation,
+			generation: build.options.snapshot.Generation,
 			identity:   build.engine.Identity(),
 			engine:     build.engine,
-			collection: options.collection,
+			collection: build.options.collection,
 			core:       build.coreStage,
 			tc:         build.tcStage,
 			xdp:        build.xdpStage,
 			slowPath:   build.slowPath,
 			handles: ExperimentalFakeTCPRuntimeHandles{
-				generation: options.snapshot.Generation,
+				generation: build.options.snapshot.Generation,
 				identity:   build.engine.Identity(),
 				sessions:   build.sessions,
 				events:     build.events,
 			},
 			closeDone: make(chan struct{}),
 		},
-	}, nil
+	}
+}
+
+func (build *experimentalRuntimeBuild) failedBuildOwner() *ExperimentalFakeTCPRuntime {
+	var generation uint64
+	if build != nil && build.options.snapshot != nil {
+		generation = build.options.snapshot.Generation
+	}
+	var identity faketcp.RuntimeIdentity
+	if build != nil && build.engine != nil {
+		identity = build.engine.Identity()
+	}
+	return &ExperimentalFakeTCPRuntime{state: &experimentalFakeTCPRuntimeState{
+		generation:  generation,
+		identity:    identity,
+		shutdown:    true,
+		failedBuild: build,
+		closeDone:   make(chan struct{}),
+	}}
 }
 
 type experimentalRuntimeBuild struct {
@@ -840,7 +867,13 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		constructed, constructErr := options.slowPathFactory(build.engine, eventsMap)
 		if constructErr != nil {
 			if !experimentalSlowPathIsNil(constructed) {
-				constructErr = errors.Join(constructErr, constructed.Close())
+				if closeErr := constructed.Close(); closeErr != nil {
+					// A failed constructor still transferred this partial owner.
+					// Retain it so failed-build quarantine can retry the exact
+					// teardown instead of losing a possibly live userspace path.
+					build.slowPath = constructed
+					constructErr = errors.Join(constructErr, closeErr)
+				}
 			}
 			return constructErr
 		}
@@ -1035,100 +1068,125 @@ func (build *experimentalRuntimeBuild) prepareError(err error) error {
 	return errors.Join(err, build.activeContextError())
 }
 
-func (build *experimentalRuntimeBuild) fail(cause error) error {
+func (build *experimentalRuntimeBuild) fail(
+	cause error,
+) (*ExperimentalFakeTCPRuntime, error) {
+	complete, cleanupErr := build.cleanupUncommitted()
+	err := errors.Join(cause, cleanupErr)
+	if complete {
+		return nil, err
+	}
+	return build.failedBuildOwner(), err
+}
+
+func (build *experimentalRuntimeBuild) cleanupUncommitted() (bool, error) {
 	var cleanupErrors []error
-	policyRollbackFailed := false
+	coreInactive := true
 	if build.coreStage != nil {
 		if err := build.coreStage.Deactivate(); err != nil {
+			coreInactive = false
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("deactivate FakeTCP baseline core: %w", err))
 		}
 	}
 	if build.xdpStage != nil {
 		if err := build.xdpStage.Close(); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP XDP stage: %w", err))
+		} else {
+			build.xdpStage = nil
 		}
 	}
 	if build.tcStage != nil {
 		if err := build.tcStage.Close(); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP TC stage: %w", err))
+		} else {
+			build.tcStage = nil
 		}
 	}
 	if !experimentalSlowPathIsNil(build.slowPath) {
 		if err := build.slowPath.Close(); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("close FakeTCP slow path: %w", err))
+		} else {
+			build.slowPath = nil
 		}
 	}
-	if build.policyStage != nil {
-		if err := build.claim.Rollback(build.cleanupCtx, build.policyStage); err != nil {
-			policyRollbackFailed = true
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP policy stage: %w", err))
+	externalDetached := coreInactive && build.xdpStage == nil && build.tcStage == nil &&
+		experimentalSlowPathIsNil(build.slowPath)
+	if externalDetached {
+		if build.policyStage != nil {
+			if err := build.claim.Rollback(build.cleanupCtx, build.policyStage); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP policy stage: %w", err))
+			} else {
+				build.policyStage = nil
+			}
+		}
+		if build.programStage != nil {
+			if err := build.programStage.Rollback(build.cleanupCtx, build.claim); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP program array stage: %w", err))
+			} else {
+				build.programStage = nil
+			}
+		}
+		if build.policyStage == nil && build.programStage == nil && build.coreStage != nil {
+			if err := build.coreStage.Close(); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP baseline core: %w", err))
+			} else {
+				build.coreStage = nil
+			}
+		}
+		if build.policyStage == nil && build.programStage == nil && build.coreStage == nil {
+			if build.sessions != nil {
+				if err := build.sessions.Close(); err != nil {
+					cleanupErrors = append(cleanupErrors, fmt.Errorf("close FakeTCP session handle: %w", err))
+				} else {
+					build.sessions = nil
+				}
+			}
+			if build.events != nil {
+				if err := build.events.Close(); err != nil {
+					cleanupErrors = append(cleanupErrors, fmt.Errorf("close FakeTCP event-map handle: %w", err))
+				} else {
+					build.events = nil
+				}
+			}
 		}
 	}
-	if build.programStage != nil {
-		if err := build.programStage.Rollback(build.cleanupCtx, build.claim); err != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP program array stage: %w", err))
+	internalClosed := externalDetached && build.policyStage == nil &&
+		build.programStage == nil && build.coreStage == nil &&
+		build.sessions == nil && build.events == nil
+	if internalClosed && build.options.collection != nil {
+		if err := build.options.collection.Close(); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("close experimental FakeTCP collection: %w", err))
+		} else {
+			build.options.collection = nil
 		}
 	}
-	if build.coreStage != nil {
-		if err := build.coreStage.Close(); err != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP baseline core: %w", err))
-		}
-	}
-	if build.sessions != nil {
-		if err := build.sessions.Close(); err != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("close FakeTCP session handle: %w", err))
-		}
-	}
-	if build.events != nil {
-		if err := build.events.Close(); err != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("close FakeTCP event-map handle: %w", err))
-		}
-	}
-	var proof *experimentalCollectionReleaseProof
-	if build.options.collection != nil {
-		var collectionErr error
-		proof, collectionErr = build.options.collection.closeAndReleaseProof()
-		if collectionErr != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("close experimental FakeTCP collection: %w", collectionErr))
-		}
-	}
-	if policyRollbackFailed && proof != nil {
-		if err := build.claim.releaseStageAfterCollectionClose(
-			build.cleanupCtx, build.policyStage, proof,
-		); err != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("release destroyed FakeTCP policy stage: %w", err))
-		}
-	}
-	if build.claim != nil {
+	if internalClosed && build.options.collection == nil && build.claim != nil {
 		if err := build.claim.Close(); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("close FakeTCP generation transaction: %w", err))
+		} else {
+			build.claim = nil
 		}
 	}
-	return errors.Join(append([]error{cause}, cleanupErrors...)...)
+	complete := internalClosed && build.options.collection == nil && build.claim == nil
+	if complete {
+		build.engine = nil
+		build.freshClaim = experimentalLinuxFreshCollectionClaim{}
+	}
+	return complete, errors.Join(cleanupErrors...)
 }
 
 // failCommitted is the only error path after the combined transaction commit
 // consumed rollback ownership. It closes every live owner in dependency order
 // and deliberately never calls Rollback or Close through the spent claim.
-func (build *experimentalRuntimeBuild) failCommitted(cause error) error {
-	var closeErrors []error
-	if build.coreStage != nil {
-		if err := build.coreStage.Deactivate(); err != nil {
-			closeErrors = append(closeErrors, fmt.Errorf("deactivate FakeTCP baseline core: %w", err))
-		}
+func (build *experimentalRuntimeBuild) failCommitted(
+	cause error,
+) (*ExperimentalFakeTCPRuntime, error) {
+	runtime := build.runtimeOwner()
+	closeErr := runtime.Close()
+	if closeErr == nil {
+		return nil, cause
 	}
-	for _, close := range []func() error{
-		func() error { return wrapExperimentalRuntimeClose("XDP links", build.xdpStage) },
-		func() error { return wrapExperimentalRuntimeClose("TC filters", build.tcStage) },
-		func() error { return wrapExperimentalRuntimeClose("slow path", build.slowPath) },
-		func() error { return wrapExperimentalRuntimeClose("baseline core", build.coreStage) },
-		func() error { return wrapExperimentalRuntimeClose("session handle", build.sessions) },
-		func() error { return wrapExperimentalRuntimeClose("event-map constructors", build.events) },
-		func() error { return wrapExperimentalRuntimeClose("collection", build.options.collection) },
-	} {
-		closeErrors = append(closeErrors, close())
-	}
-	return errors.Join(append([]error{cause}, closeErrors...)...)
+	return runtime, errors.Join(cause, closeErr)
 }
 
 func validateFakeTCPXDPRequests(
@@ -1316,6 +1374,23 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 	state.closing = true
 	state.shutdown = true
 	done := state.closeDone
+	failedBuild := state.failedBuild
+	if failedBuild != nil {
+		state.mu.Unlock()
+		complete, err := failedBuild.cleanupUncommitted()
+		state.mu.Lock()
+		state.closeErr = err
+		state.closing = false
+		if complete {
+			state.failedBuild = nil
+			state.closed = true
+			state.engine = nil
+			state.handles = ExperimentalFakeTCPRuntimeHandles{}
+		}
+		close(done)
+		state.mu.Unlock()
+		return err
+	}
 	core := state.core
 	slowPath := state.slowPath
 	sessions := state.handles.sessions

@@ -51,7 +51,7 @@ func (resource *fakeExperimentalOwnedProgram) Close() error {
 	return resource.closeErr
 }
 
-func TestExperimentalCollectionOwnerConcurrentCloseIsOnceOnly(t *testing.T) {
+func TestExperimentalCollectionOwnerConcurrentCloseRetainsOnlyFailedResources(t *testing.T) {
 	var closeLog []string
 	mapA := &fakeExperimentalOwnedMap{name: "a", closeLog: &closeLog}
 	mapBErr := errors.New("injected map close failure")
@@ -103,11 +103,33 @@ func TestExperimentalCollectionOwnerConcurrentCloseIsOnceOnly(t *testing.T) {
 			t.Fatalf("%s close count = %d, want 1", name, closes)
 		}
 	}
+	if owner.isClosed() {
+		t.Fatal("owner with failed resources reported closed")
+	}
 	if _, err := owner.mapResource("a"); !errors.Is(err, errExperimentalCollectionClosed) {
 		t.Fatalf("map accessor after close error = %v", err)
 	}
 	if _, err := owner.programResource("a"); !errors.Is(err, errExperimentalCollectionClosed) {
 		t.Fatalf("program accessor after close error = %v", err)
+	}
+
+	mapB.closeErr = nil
+	programB.closeErr = nil
+	if err := owner.Close(); err != nil {
+		t.Fatalf("retry Close: %v", err)
+	}
+	if !owner.isClosed() {
+		t.Fatal("owner did not close after failed resources converged")
+	}
+	for name, closes := range map[string]int{
+		"map-a": mapA.closes, "program-a": programA.closes,
+	} {
+		if closes != 1 {
+			t.Fatalf("successful sibling %s was closed again: %d", name, closes)
+		}
+	}
+	if mapB.closes != 2 || programB.closes != 2 {
+		t.Fatalf("failed resource retries map=%d program=%d", mapB.closes, programB.closes)
 	}
 }
 
