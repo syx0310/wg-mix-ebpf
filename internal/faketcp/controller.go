@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"reflect"
+	"sync"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 )
@@ -157,23 +159,76 @@ type PacketReinjector interface {
 	Reinject(context.Context, abi.FakeTCPSessionKey, PendingPacket) error
 }
 
-// Controller executes the userspace side effects selected by Engine. It does
-// not retry side effects: a captured packet leaves the engine queue once and
-// is passed to Reinject exactly once after preceding control sends succeed.
-type Controller struct {
-	engine     *Engine
-	sender     ControlSender
-	reinjector PacketReinjector
+// ControllerBackend owns every external resource used by Controller. Combining
+// both side-effect paths under one Close contract prevents two wrappers from
+// closing the same underlying file descriptor independently.
+type ControllerBackend interface {
+	ControlSender
+	PacketReinjector
+	Close() error
 }
 
-func NewController(engine *Engine, sender ControlSender, reinjector PacketReinjector) (*Controller, error) {
-	if engine == nil || sender == nil || reinjector == nil {
-		return nil, errors.New("faketcp controller requires engine, control sender, and packet reinjector")
+var (
+	// ErrControllerClosed means the controller has begun or completed closing.
+	// An operation returning this error has not touched Engine or the backend.
+	ErrControllerClosed = errors.New("faketcp controller is closed")
+
+	errControllerContextNil = errors.New("faketcp controller context is nil")
+)
+
+// Controller executes the userspace side effects selected by Engine. Engine
+// state transitions and all resulting side effects are serialised with Close.
+// It does not retry side effects: a captured packet leaves the engine queue
+// once and is passed to Reinject exactly once after preceding control sends
+// succeed.
+//
+// Engine currently commits a transition before its actions are executed. A
+// backend failure is therefore terminal and is never rolled back or retried.
+// The experimental activation gate must remain closed until this two-phase
+// action/rollback gap has a concrete solution.
+type Controller struct {
+	mu       sync.Mutex
+	engine   *Engine
+	backend  ControllerBackend
+	closed   bool
+	closeErr error
+}
+
+func NewController(engine *Engine, backend ControllerBackend) (*Controller, error) {
+	if engine == nil {
+		return nil, errors.New("faketcp controller requires an engine")
 	}
-	return &Controller{engine: engine, sender: sender, reinjector: reinjector}, nil
+	if controllerBackendIsNil(backend) {
+		return nil, errors.New("faketcp controller backend is nil")
+	}
+	return &Controller{engine: engine, backend: backend}, nil
+}
+
+func controllerBackendIsNil(backend ControllerBackend) bool {
+	if backend == nil {
+		return true
+	}
+	value := reflect.ValueOf(backend)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func (c *Controller) HandleSample(ctx context.Context, sample []byte) ([]Action, error) {
+	if c == nil {
+		return nil, ErrControllerClosed
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.requireOpenLocked(); err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		return nil, errControllerContextNil
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -198,35 +253,84 @@ func (c *Controller) HandleSample(ctx context.Context, sample []byte) ([]Action,
 	if err != nil {
 		return actions, err
 	}
-	if err := c.execute(ctx, actions); err != nil {
+	if err := c.executeLocked(ctx, actions); err != nil {
 		return actions, err
 	}
 	return actions, nil
 }
 
 func (c *Controller) Tick(ctx context.Context) ([]Action, error) {
+	if c == nil {
+		return nil, ErrControllerClosed
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.requireOpenLocked(); err != nil {
+		return nil, err
+	}
+	if ctx == nil {
+		return nil, errControllerContextNil
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	actions, engineErr := c.engine.Tick()
-	executeErr := c.execute(ctx, actions)
+	executeErr := c.executeLocked(ctx, actions)
 	return actions, errors.Join(engineErr, executeErr)
 }
 
-func (c *Controller) execute(ctx context.Context, actions []Action) error {
+// Close waits for an in-flight HandleSample or Tick, then closes the single
+// owned backend exactly once. A first close error is retained and returned by
+// every later Close call. Closing a nil receiver is an explicit no-op.
+func (c *Controller) Close() error {
+	if c == nil {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return c.closeErr
+	}
+	c.closed = true
+	if controllerBackendIsNil(c.backend) {
+		c.closeErr = errors.New("close faketcp controller: backend is nil")
+		return c.closeErr
+	}
+	if err := c.backend.Close(); err != nil {
+		c.closeErr = fmt.Errorf("close faketcp controller backend: %w", err)
+	}
+	return c.closeErr
+}
+
+func (c *Controller) requireOpenLocked() error {
+	if c.closed {
+		return ErrControllerClosed
+	}
+	if c.engine == nil {
+		return errors.New("faketcp controller has no engine")
+	}
+	if controllerBackendIsNil(c.backend) {
+		return errors.New("faketcp controller has no backend")
+	}
+	return nil
+}
+
+// executeLocked is called only while c.mu is held, keeping action order and
+// resource ownership serialised with every other operation and Close.
+func (c *Controller) executeLocked(ctx context.Context, actions []Action) error {
 	for _, action := range actions {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		switch action.Kind {
 		case ActionSendControl:
-			if err := c.sender.SendControl(ctx, action.Flow, action.WGID, action.Control); err != nil {
+			if err := c.backend.SendControl(ctx, action.Flow, action.WGID, action.Control); err != nil {
 				return fmt.Errorf("send faketcp control packet (%s): %w", action.Reason, err)
 			}
 		case ActionReleasePending:
 			var errs []error
 			for _, packet := range action.Packets {
-				if err := c.reinjector.Reinject(ctx, action.Flow, packet); err != nil {
+				if err := c.backend.Reinject(ctx, action.Flow, packet); err != nil {
 					errs = append(errs, fmt.Errorf("reinject faketcp first packet: %w", err))
 				}
 			}
