@@ -67,7 +67,7 @@ func experimentalProgramDescriptors() []baselineProgramDescriptor {
 		},
 		{
 			name: "wg_mix_faketcp_ingress", sectionName: "xdp",
-			programType: ebpf.XDP, license: "MIT",
+			programType: ebpf.XDP, attachType: ebpf.AttachXDP, license: "MIT",
 		},
 	}
 }
@@ -116,7 +116,14 @@ func validateExperimentalExtensionManifest(spec *ebpf.CollectionSpec) error {
 }
 
 func TestExperimentalManifestRejectsSchemaAndMetadataDrift(t *testing.T) {
-	if err := validateExperimentalExtensionManifest(canonicalExperimentalCollectionSpec()); err != nil {
+	canonical := canonicalExperimentalCollectionSpec()
+	if got := canonical.Programs["wg_mix_faketcp_ingress"].AttachType; got != ebpf.AttachXDP {
+		t.Fatalf("FakeTCP ingress attach type = %d, want AttachXDP", got)
+	}
+	if got := canonical.Programs["wg_faketcp_egress"].AttachType; got != ebpf.AttachNone {
+		t.Fatalf("FakeTCP egress attach type = %d, want AttachNone", got)
+	}
+	if err := validateExperimentalExtensionManifest(canonical); err != nil {
 		t.Fatalf("exact experimental manifest rejected: %v", err)
 	}
 
@@ -191,9 +198,15 @@ func TestExperimentalManifestRejectsSchemaAndMetadataDrift(t *testing.T) {
 			},
 		},
 		{
-			name: "program attach type",
+			name: "egress program attach type",
 			mutate: func(spec *ebpf.CollectionSpec) {
-				spec.Programs["wg_faketcp_egress"].AttachType = ebpf.AttachCGroupInetEgress
+				spec.Programs["wg_faketcp_egress"].AttachType = ebpf.AttachXDP
+			},
+		},
+		{
+			name: "ingress program attach type",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_mix_faketcp_ingress"].AttachType = ebpf.AttachNone
 			},
 		},
 		{
