@@ -470,6 +470,161 @@ func TestExperimentalRuntimeFactoryClosesUnexpectedRuntimeReturnedWithError(t *t
 	}
 }
 
+func TestExperimentalRuntimeFactoryRequiresExactAcquiredOwner(t *testing.T) {
+	for _, test := range []struct {
+		name        string
+		result      func(*experimentalCollectionOwner, *experimentalCollectionOwner) *ExperimentalFakeTCPRuntime
+		wantSuccess bool
+		usesOther   bool
+	}{
+		{
+			name: "exact owner",
+			result: func(acquired, _ *experimentalCollectionOwner) *ExperimentalFakeTCPRuntime {
+				return &ExperimentalFakeTCPRuntime{state: &experimentalFakeTCPRuntimeState{
+					collection: acquired,
+					closeDone:  make(chan struct{}),
+				}}
+			},
+			wantSuccess: true,
+		},
+		{
+			name: "nil state",
+			result: func(_, _ *experimentalCollectionOwner) *ExperimentalFakeTCPRuntime {
+				return &ExperimentalFakeTCPRuntime{}
+			},
+		},
+		{
+			name: "nil collection",
+			result: func(_, _ *experimentalCollectionOwner) *ExperimentalFakeTCPRuntime {
+				return &ExperimentalFakeTCPRuntime{state: &experimentalFakeTCPRuntimeState{
+					closeDone: make(chan struct{}),
+				}}
+			},
+		},
+		{
+			name: "other owner",
+			result: func(_, other *experimentalCollectionOwner) *ExperimentalFakeTCPRuntime {
+				return &ExperimentalFakeTCPRuntime{state: &experimentalFakeTCPRuntimeState{
+					collection: other,
+					closeDone:  make(chan struct{}),
+				}}
+			},
+			usesOther: true,
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExperimentalRuntimeFactoryFixture(t, 91)
+			closeCalls := installFactoryTransactionClose(t, fixture.transaction, nil)
+			var otherCloseLog []string
+			otherMap := &fakeExperimentalOwnedMap{
+				name: "other", closeLog: &otherCloseLog,
+			}
+			otherOwner := &experimentalCollectionOwner{
+				maps:      map[string]experimentalMapResource{"other": otherMap},
+				programs:  map[string]experimentalProgramResource{},
+				closeDone: make(chan struct{}),
+			}
+
+			runtime, err := acquireAndBuildExperimentalFakeTCPRuntimeWithBuilder(
+				fixture.ctx,
+				fixture.spec,
+				fixture.source,
+				fixture.dependencies,
+				fixture.options,
+				func(
+					_ context.Context,
+					options experimentalFakeTCPRuntimeBuildOptions,
+				) (*ExperimentalFakeTCPRuntime, error) {
+					if options.collection != fixture.runtime.collection {
+						t.Fatal("builder did not receive the acquired owner")
+					}
+					if err := options.transaction.Close(); err != nil {
+						return nil, err
+					}
+					return test.result(options.collection, otherOwner), nil
+				},
+			)
+			if test.wantSuccess {
+				if err != nil || runtime == nil {
+					t.Fatalf("runtime=%#v error=%v", runtime, err)
+				}
+				assertFactoryCollectionCloseCount(t, fixture.runtime, 0)
+				if err := runtime.Close(); err != nil {
+					t.Fatal(err)
+				}
+			} else {
+				if runtime != nil || err == nil ||
+					!strings.Contains(err.Error(), "does not own the exact acquired collection") {
+					t.Fatalf("runtime=%#v error=%v", runtime, err)
+				}
+			}
+			if !fixture.transaction.isClosed() || *closeCalls != 1 {
+				t.Fatalf(
+					"transaction closed=%t closes=%d",
+					fixture.transaction.isClosed(),
+					*closeCalls,
+				)
+			}
+			assertFactoryCollectionCloseCount(t, fixture.runtime, 1)
+			wantOtherCloses := 0
+			if test.usesOther {
+				wantOtherCloses = 1
+			}
+			if otherMap.closes != wantOtherCloses {
+				t.Fatalf(
+					"unrelated owner map closes=%d, want %d",
+					otherMap.closes,
+					wantOtherCloses,
+				)
+			}
+		})
+	}
+}
+
+func TestExperimentalRuntimeExactOwnerCheckIsConcurrentWithClose(t *testing.T) {
+	fixture := newExperimentalRuntimeFactoryFixture(t, 91)
+	runtime := &ExperimentalFakeTCPRuntime{state: &experimentalFakeTCPRuntimeState{
+		collection: fixture.runtime.collection,
+		closeDone:  make(chan struct{}),
+	}}
+	if !experimentalFakeTCPRuntimeOwnsExactCollection(runtime, fixture.runtime.collection) {
+		t.Fatal("live exact owner was rejected")
+	}
+
+	const readers = 16
+	start := make(chan struct{})
+	var wait sync.WaitGroup
+	for range readers {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			<-start
+			for range 128 {
+				_ = experimentalFakeTCPRuntimeOwnsExactCollection(
+					runtime,
+					fixture.runtime.collection,
+				)
+			}
+		}()
+	}
+	closeErr := make(chan error, 1)
+	wait.Add(1)
+	go func() {
+		defer wait.Done()
+		<-start
+		closeErr <- runtime.Close()
+	}()
+	close(start)
+	wait.Wait()
+	if err := <-closeErr; err != nil {
+		t.Fatal(err)
+	}
+	if experimentalFakeTCPRuntimeOwnsExactCollection(runtime, fixture.runtime.collection) {
+		t.Fatal("closed runtime retained exact-owner proof")
+	}
+	assertFactoryCollectionCloseCount(t, fixture.runtime, 1)
+}
+
 func TestExperimentalOwnershipClosedStateHelpers(t *testing.T) {
 	fixture := newExperimentalRuntimeFactoryFixture(t, 91)
 	if fixture.runtime.collection.isClosed() || fixture.transaction.isClosed() {

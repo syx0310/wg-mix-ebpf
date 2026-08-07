@@ -134,6 +134,11 @@ func acquireAndBuildExperimentalFakeTCPRuntimeWithBuilder(
 			"acquire and build experimental FakeTCP runtime: builder returned a nil runtime",
 		)
 	}
+	if !experimentalFakeTCPRuntimeOwnsExactCollection(runtime, owner) {
+		return runtime, errors.New(
+			"acquire and build experimental FakeTCP runtime: returned runtime does not own the exact acquired collection",
+		)
+	}
 	if !transaction.isClosed() {
 		return runtime, errors.New(
 			"acquire and build experimental FakeTCP runtime: successful builder left generation transaction open",
@@ -144,4 +149,27 @@ func acquireAndBuildExperimentalFakeTCPRuntimeWithBuilder(
 	// successful transfer; returnErr remains nil so the cleanup defer is inert.
 	owner = nil
 	return runtime, nil
+}
+
+// experimentalFakeTCPRuntimeOwnsExactCollection proves that a builder success
+// transferred the exact acquisition owner into a live runtime state. The lock
+// order matches runtime shutdown (state before collection); Close releases the
+// state lock before it enters the collection owner, so this nested read cannot
+// deadlock with normal teardown.
+func experimentalFakeTCPRuntimeOwnsExactCollection(
+	runtime *ExperimentalFakeTCPRuntime,
+	owner *experimentalCollectionOwner,
+) bool {
+	if runtime == nil || runtime.state == nil || owner == nil {
+		return false
+	}
+	state := runtime.state
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.closing || state.closed || state.collection != owner {
+		return false
+	}
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	return !owner.closing && !owner.closed
 }
