@@ -43,6 +43,10 @@ def document(
     primary: list[dict],
     reverse: list[dict] | None = None,
 ) -> dict:
+    if direction == "reverse":
+        for item in primary:
+            item["sender"]["sender"] = False
+            item["receiver"]["sender"] = False
     streams = list(primary)
     end = {
         "streams": streams,
@@ -164,6 +168,28 @@ class Iperf3TCPValidatorTests(unittest.TestCase):
         bad_direction["start"]["test_start"]["bidir"] = 1
         with self.assertRaisesRegex(ValueError, "direction mismatch"):
             self.validate(bad_direction, "forward", 1)
+
+        bad_sent_summary = document("forward", [stream(120)])
+        bad_sent_summary["end"]["sum_sent"]["bytes"] = 121
+        with self.assertRaisesRegex(ValueError, "sender byte sum=120"):
+            self.validate(bad_sent_summary, "forward", 1)
+
+    def test_non_bidir_stream_markers_must_match_direction(self) -> None:
+        malformed = document("reverse", [stream(120)])
+        malformed["end"]["streams"][0]["sender"]["sender"] = True
+        with self.assertRaisesRegex(ValueError, "direction marker mismatch"):
+            self.validate(malformed, "reverse", 1)
+
+    def test_fractional_integer_and_boolean_number_are_rejected(self) -> None:
+        fractional = document("forward", [stream(120)])
+        fractional["end"]["streams"][0]["receiver"]["bytes"] = 120.5
+        with self.assertRaisesRegex(ValueError, "must be an integer"):
+            self.validate(fractional, "forward", 1)
+
+        boolean_duration = document("forward", [stream(120)])
+        boolean_duration["end"]["sum_received"]["seconds"] = True
+        with self.assertRaisesRegex(ValueError, "must be numeric"):
+            self.validate(boolean_duration, "forward", 1)
 
     def test_bidir_requires_consistent_stream_direction_markers(self) -> None:
         malformed = document(

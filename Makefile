@@ -12,7 +12,7 @@ override BUILD_SOURCE_COMMIT := $(shell ./scripts/source-commit.sh)
 override BUILD_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/buildinfo.sourceCommit=$(BUILD_SOURCE_COMMIT)
 override NETNS_ANCHOR_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/netnsanchor.sourceCommit=$(BUILD_SOURCE_COMMIT)
 
-.PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-smoke-script-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-netns-anchor build-linux-amd64 build-linux-arm64 build-live-guard-test build-bpf prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-smoke-script-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns-tcp-pmtu-positive test-netns-tcp-pmtu-ipv4 test-netns-tcp-pmtu-ipv6 test-netns-tcp-outer-gso-observe test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-netns-anchor build-linux-amd64 build-linux-arm64 build-live-guard-test build-bpf prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=$(CGO_ENABLED) $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -64,15 +64,26 @@ test-netns-icmp-smoke: build
 	NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
 
 test-netns-tcp-native: build build-netns-anchor
-	TCP_CHECKS=enforce TCP_GSO_CHECKS=enforce scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe scripts/smoke-netns-wg.sh
 
 test-netns-tcp-xor-prefix: build build-netns-anchor
-	TCP_CHECKS=enforce TCP_GSO_CHECKS=enforce XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-prefix XOR_MAX_BYTES=128 scripts/smoke-netns-wg.sh
 
 test-netns-tcp-xor-full: build build-netns-anchor
-	TCP_CHECKS=enforce TCP_GSO_CHECKS=enforce XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 scripts/smoke-netns-wg.sh
+	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 scripts/smoke-netns-wg.sh
 
 test-netns-tcp: test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full
+
+test-netns-tcp-pmtu-ipv4: build build-netns-anchor
+	OUTER_FAMILY=ipv4 UNDERLAY_MTU=1500 TCP_CHECKS=enforce TCP_MTUS="1439 1440" TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe scripts/smoke-netns-wg.sh
+
+test-netns-tcp-pmtu-ipv6: build build-netns-anchor
+	OUTER_FAMILY=ipv6 UNDERLAY_MTU=1500 TCP_CHECKS=enforce TCP_MTUS="1419 1420" TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe scripts/smoke-netns-wg.sh
+
+test-netns-tcp-pmtu-positive: test-netns-tcp-pmtu-ipv4 test-netns-tcp-pmtu-ipv6
+
+test-netns-tcp-outer-gso-observe: build build-netns-anchor
+	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe TCP_MTUS="1420" TCP_STREAMS="16" TCP_DIRECTIONS="bidir" TCP_DURATION=30 scripts/smoke-netns-wg.sh
 
 test-unit: test-pcap-helper test-smoke-script-helper
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./...
@@ -156,6 +167,7 @@ test-netns-full: build build-netns-anchor
 	OUTER_FAMILY=ipv6 XOR_PASSWORD=wg-mix-ebpf-xor-smoke XOR_SCOPE=wg-payload-full XOR_MAX_BYTES=2048 XOR_GENERATION_CHECKS=enforce UDP_ZERO_CHECKSUM_CHECKS=enforce scripts/smoke-netns-wg.sh
 	NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
 	$(MAKE) test-netns-tcp
+	$(MAKE) test-netns-tcp-pmtu-positive
 
 test-vm:
 	@echo "skip: requires external VM matrix"

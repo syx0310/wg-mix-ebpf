@@ -521,6 +521,14 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.source,
         )
         self.assertIn('TCP_MTUS="${TCP_MTUS:-1419 1420 1421 1422}"', self.source)
+        self.assertIn('UNDERLAY_MTU="${UNDERLAY_MTU:-2200}"', self.source)
+        self.assertIn("TCP_MTUS contains duplicate value", self.source)
+        self.assertIn("UNDERLAY_MTU must be an integer", self.source)
+        self.assertIn("WG_MTU must be an integer", self.source)
+        self.assertIn(
+            "TCP_GSO_CHECKS was split into TCP_INNER_GSO_CHECKS",
+            self.source,
+        )
 
         run = self.source[
             self.source.index("exercise_tcp_run() {") :
@@ -554,7 +562,7 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.source.index("\nexercise_udp_zero_checksum() {")
         ]
         self.assertLess(
-            matrix.index("assert_tcp_gso_offload_state"),
+            matrix.index("classify_tcp_gso_capabilities"),
             matrix.index("capture_tcp_netns_evidence before"),
         )
         self.assertIn(
@@ -575,10 +583,6 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             "ingress_fragment",
             "egress_ipv6_ext",
             "ingress_ipv6_ext",
-            "egress_gso_managed_seen",
-            "egress_gso_rewrite_ok",
-            "ingress_gso_listener_hit",
-            "ingress_gso_rewrite_ok",
         ):
             self.assertIn(stat, matrix)
 
@@ -586,21 +590,49 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.source.index("capture_tcp_link_evidence() {") :
             self.source.index("\ntcp_server_listening() {")
         ]
-        gso_preflight = self.source[
-            self.source.index("assert_tcp_gso_link_features() {") :
+        gso_evidence = self.source[
+            self.source.index("tcp_gso_link_features_enabled() {") :
             self.source.index("\ncapture_tcp_netns_evidence() {")
         ]
         for link in ("wg0", "under0", "ra0", "rb0"):
-            self.assertIn(link, gso_preflight)
+            self.assertIn(link, gso_evidence)
         for feature in (
             "tx-checksumming",
             "scatter-gather",
             "tcp-segmentation-offload",
             "generic-segmentation-offload",
+            "generic-receive-offload",
             "tx-udp-segmentation",
         ):
-            self.assertIn(feature, gso_preflight)
-        self.assertIn('fields[1] == "on"', gso_preflight)
+            self.assertIn(feature, gso_evidence)
+        self.assertIn('fields[1] == "on"', gso_evidence)
+        self.assertIn(
+            'tcp evidence=outer-udp-gso mtu=%s side=%s status=%s',
+            gso_evidence,
+        )
+        self.assertIn('status="not-covered"', gso_evidence)
+        self.assertIn('status="unsupported"', gso_evidence)
+        self.assertIn('status="observed"', gso_evidence)
+        self.assertIn("TCP_OUTER_GSO_MEASUREMENT_OK=0", gso_evidence)
+        self.assertIn("reason=measurement-error", gso_evidence)
+        self.assertIn('elif ((!TCP_OUTER_GSO_MEASUREMENT_OK)); then', gso_evidence)
+        self.assertIn(
+            "tcp summary=inner-tcp-gso status=%s mode=%s",
+            gso_evidence,
+        )
+        self.assertIn(
+            "tcp summary=outer-udp-gso status=%s mode=%s "
+            "correctness_gate=false",
+            gso_evidence,
+        )
+        for stat in (
+            "egress_gso_managed_seen",
+            "egress_gso_rewrite_ok",
+            "ingress_gso_listener_hit",
+            "ingress_gso_rewrite_ok",
+        ):
+            self.assertIn(stat, gso_evidence)
+        self.assertNotIn('TCP_OUTER_GSO_CHECKS}" == "enforce', self.source)
         for command in (
             "ip -details -statistics link show",
             "ethtool -k",
@@ -622,6 +654,16 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertIn('"${TMPDIR}/${label}-ra.pcap"', evidence)
         self.assertIn('"${TMPDIR}/${label}-rb.pcap"', evidence)
         self.assertIn('for interface in ra rb; do', evidence)
+        self.assertIn('for flow in "${flows[@]}"; do', evidence)
+        self.assertIn('bidir) flows=(forward reverse) ;;', evidence)
+        self.assertIn('--src "${A_UNDER}" --dst "${B_UNDER}"', evidence)
+        self.assertIn('--src "${B_UNDER}" --dst "${A_UNDER}"', evidence)
+        self.assertIn('--sport 31001 --dport 31002', evidence)
+        self.assertIn('--sport 31002 --dport 31001', evidence)
+        self.assertIn(
+            '${label}-${interface}-${flow}-pcap-check.out',
+            evidence,
+        )
         self.assertIn('"${pcap_path}"', evidence)
         self.assertNotIn(
             '"${TMPDIR}/${label}-ra.pcap" '
@@ -643,6 +685,20 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             matrix.index("capture_tcp_netns_evidence failure"),
             matrix.index('return "${run_status}"'),
         )
+        transfer_gate = self.source[
+            self.source.index("assert_wg_transfer_increased() {") :
+            self.source.index("\ncapture_tcp_netns_evidence() {")
+        ]
+        self.assertIn("wg show wg0 transfer", matrix)
+        self.assertEqual(4, matrix.count("wg show wg0 transfer"))
+        self.assertIn("assert_wg_transfer_increased", matrix)
+        self.assertIn("tcp summary=correctness status=passed", matrix)
+        self.assertIn("received_delta <= 0 or sent_delta <= 0", transfer_gate)
+        self.assertIn("tcp evidence=wireguard-transfer", transfer_gate)
+        self.assertLess(
+            matrix.index("assert_wg_transfer_increased"),
+            matrix.index("assert_stat_increased"),
+        )
 
         for target in (
             "test-netns-tcp-native",
@@ -657,7 +713,53 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
                 )
             ]
             self.assertIn("TCP_CHECKS=enforce", recipe)
-            self.assertIn("TCP_GSO_CHECKS=enforce", recipe)
+            self.assertIn("TCP_INNER_GSO_CHECKS=report", recipe)
+            self.assertIn("TCP_OUTER_GSO_CHECKS=observe", recipe)
+            self.assertNotIn("TCP_GSO_CHECKS=enforce", recipe)
+
+        outer_target = self.makefile_source[
+            self.makefile_source.index("test-netns-tcp-outer-gso-observe:") :
+            self.makefile_source.index(
+                "\n\n",
+                self.makefile_source.index(
+                    "test-netns-tcp-outer-gso-observe:"
+                ),
+            )
+        ]
+        for setting in (
+            "TCP_OUTER_GSO_CHECKS=observe",
+            'TCP_MTUS="1420"',
+            'TCP_STREAMS="16"',
+            'TCP_DIRECTIONS="bidir"',
+            "TCP_DURATION=30",
+        ):
+            self.assertIn(setting, outer_target)
+        self.assertNotIn("TCP_GSO_CHECKS=enforce", self.makefile_source)
+
+        for target, family, mtus in (
+            ("test-netns-tcp-pmtu-ipv4", "ipv4", "1439 1440"),
+            ("test-netns-tcp-pmtu-ipv6", "ipv6", "1419 1420"),
+        ):
+            recipe = self.makefile_source[
+                self.makefile_source.index(f"{target}:") :
+                self.makefile_source.index(
+                    "\n\n",
+                    self.makefile_source.index(f"{target}:"),
+                )
+            ]
+            self.assertIn(f"OUTER_FAMILY={family}", recipe)
+            self.assertIn("UNDERLAY_MTU=1500", recipe)
+            self.assertIn(f'TCP_MTUS="{mtus}"', recipe)
+            self.assertIn("TCP_CHECKS=enforce", recipe)
+        self.assertIn(
+            "test-netns-tcp-pmtu-positive: "
+            "test-netns-tcp-pmtu-ipv4 test-netns-tcp-pmtu-ipv6",
+            self.makefile_source,
+        )
+        self.assertIn(
+            "$(MAKE) test-netns-tcp-pmtu-positive",
+            self.makefile_source,
+        )
 
     def test_success_teardown_holds_shared_lifecycle_until_contract_is_gone(
         self,

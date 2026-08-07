@@ -167,5 +167,40 @@ class TruncatedUDPPacketTest(unittest.TestCase):
         self.assertTrue(record.length_valid)
 
 
+class PcapFramingTest(unittest.TestCase):
+    @staticmethod
+    def global_header() -> bytes:
+        return struct.pack(
+            "<IHHIIII",
+            0xA1B2C3D4,
+            2,
+            4,
+            0,
+            0,
+            65535,
+            CHECKER.DLT_EN10MB,
+        )
+
+    def parse_bytes(self, payload: bytes) -> list[tuple[int, int, bytes]]:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir, "capture.pcap")
+            path.write_bytes(self.global_header() + payload)
+            return list(CHECKER.parse_pcap(path))
+
+    def test_truncated_packet_header_is_rejected(self) -> None:
+        with self.assertRaisesRegex(ValueError, "truncated packet header"):
+            self.parse_bytes(b"\x00")
+
+    def test_truncated_packet_data_is_rejected(self) -> None:
+        packet_header = struct.pack("<IIII", 0, 0, 8, 8)
+        with self.assertRaisesRegex(ValueError, "truncated packet data"):
+            self.parse_bytes(packet_header + b"short")
+
+    def test_captured_length_larger_than_original_is_rejected(self) -> None:
+        packet_header = struct.pack("<IIII", 0, 0, 8, 7)
+        with self.assertRaisesRegex(ValueError, "exceeds original length"):
+            self.parse_bytes(packet_header + b"12345678")
+
+
 if __name__ == "__main__":
     unittest.main()

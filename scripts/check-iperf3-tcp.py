@@ -13,16 +13,20 @@ from typing import Any
 def _integer(value: Any, label: str) -> int:
     if isinstance(value, bool):
         raise ValueError(f"{label} must be an integer")
-    try:
+    if isinstance(value, int):
+        result = value
+    elif isinstance(value, str) and value.isascii() and value.isdigit():
         result = int(value)
-    except (TypeError, ValueError) as exc:
-        raise ValueError(f"{label} must be an integer: {value!r}") from exc
+    else:
+        raise ValueError(f"{label} must be an integer: {value!r}")
     if result < 0:
         raise ValueError(f"{label} must be non-negative: {result}")
     return result
 
 
 def _number(value: Any, label: str) -> float:
+    if isinstance(value, bool):
+        raise ValueError(f"{label} must be numeric: {value!r}")
     try:
         result = float(value)
     except (TypeError, ValueError) as exc:
@@ -70,12 +74,16 @@ def _stream_directions(
             raise ValueError(
                 f"end.streams[{index}] requires sender and receiver objects"
             )
+        marker = sender.get("sender")
+        if not isinstance(marker, bool):
+            raise ValueError(
+                f"end.streams[{index}].sender.sender must be boolean"
+            )
+        if not isinstance(receiver.get("sender"), bool):
+            raise ValueError(
+                f"end.streams[{index}].receiver.sender must be boolean"
+            )
         if direction == "bidir":
-            marker = sender.get("sender")
-            if not isinstance(marker, bool):
-                raise ValueError(
-                    f"end.streams[{index}].sender.sender must be boolean"
-                )
             label = "forward" if marker else "reverse"
             if receiver.get("sender") is not marker:
                 raise ValueError(
@@ -83,6 +91,11 @@ def _stream_directions(
                 )
         else:
             label = "reverse" if direction == "reverse" else "forward"
+            expected_marker = direction == "forward"
+            if marker is not expected_marker or receiver.get("sender") is not marker:
+                raise ValueError(
+                    f"end.streams[{index}] direction marker mismatch for {direction}"
+                )
         grouped[label].append(stream)
 
     for label, streams in grouped.items():
@@ -209,6 +222,21 @@ def validate_iperf(
             raise ValueError(
                 f"{label} retransmit sum={retransmit_total}, "
                 f"summary={summary_retransmits}"
+            )
+        sent_bytes = [
+            _integer(
+                stream["sender"].get("bytes"),
+                f"{label} sender[{index}].bytes",
+            )
+            for index, stream in enumerate(streams)
+        ]
+        summary_sent_bytes = _integer(
+            sent_summary.get("bytes"), f"{label} sum_sent.bytes"
+        )
+        if summary_sent_bytes != sum(sent_bytes):
+            raise ValueError(
+                f"{label} sender byte sum={sum(sent_bytes)}, "
+                f"summary={summary_sent_bytes}"
             )
         seconds = _number(
             received_summary.get("seconds"), f"{label} sum_received.seconds"

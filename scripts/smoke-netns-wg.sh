@@ -33,7 +33,8 @@ TCP_DURATION="${TCP_DURATION:-2}"
 TCP_MIN_BYTES="${TCP_MIN_BYTES:-1048576}"
 TCP_MAX_RETRANSMITS="${TCP_MAX_RETRANSMITS:-0}"
 TCP_MIN_FAIRNESS="${TCP_MIN_FAIRNESS:-0.90}"
-TCP_GSO_CHECKS="${TCP_GSO_CHECKS:-report}"
+TCP_INNER_GSO_CHECKS="${TCP_INNER_GSO_CHECKS:-report}"
+TCP_OUTER_GSO_CHECKS="${TCP_OUTER_GSO_CHECKS:-observe}"
 TCP_CAPTURE_PACKETS="${TCP_CAPTURE_PACKETS:-4096}"
 TCP_PORT="${TCP_PORT:-5201}"
 UNDERLAY_MTU="${UNDERLAY_MTU:-2200}"
@@ -66,14 +67,34 @@ for check_mode in "${XOR_GENERATION_CHECKS}" "${XOR_DISPATCH_FAILURE_CHECKS}" \
     exit 1
   fi
 done
-if [[ "${TCP_GSO_CHECKS}" != "off" && "${TCP_GSO_CHECKS}" != "report" &&
-  "${TCP_GSO_CHECKS}" != "enforce" ]]; then
-  echo "error: TCP_GSO_CHECKS must be off, report, or enforce" >&2
+if [[ -n "${TCP_GSO_CHECKS+x}" ]]; then
+  echo "error: TCP_GSO_CHECKS was split into TCP_INNER_GSO_CHECKS and TCP_OUTER_GSO_CHECKS" >&2
+  exit 1
+fi
+if [[ "${TCP_INNER_GSO_CHECKS}" != "off" &&
+  "${TCP_INNER_GSO_CHECKS}" != "report" &&
+  "${TCP_INNER_GSO_CHECKS}" != "enforce" ]]; then
+  echo "error: TCP_INNER_GSO_CHECKS must be off, report, or enforce" >&2
+  exit 1
+fi
+if [[ "${TCP_OUTER_GSO_CHECKS}" != "off" &&
+  "${TCP_OUTER_GSO_CHECKS}" != "observe" ]]; then
+  echo "error: TCP_OUTER_GSO_CHECKS must be off or observe" >&2
   exit 1
 fi
 if [[ ! "${NETNS_ANCHOR_TTL_SECONDS}" =~ ^[0-9]+$ ]] ||
   ((NETNS_ANCHOR_TTL_SECONDS < 60 || NETNS_ANCHOR_TTL_SECONDS > 86400)); then
   echo "error: NETNS_ANCHOR_TTL_SECONDS must be an integer in [60, 86400]" >&2
+  exit 1
+fi
+if [[ ! "${UNDERLAY_MTU}" =~ ^[0-9]+$ ]] ||
+  ((UNDERLAY_MTU < 1280 || UNDERLAY_MTU > 65535)); then
+  echo "error: UNDERLAY_MTU must be an integer in [1280, 65535]" >&2
+  exit 1
+fi
+if [[ ! "${WG_MTU}" =~ ^[0-9]+$ ]] ||
+  ((WG_MTU < 576 || WG_MTU > 65535)); then
+  echo "error: WG_MTU must be an integer in [576, 65535]" >&2
   exit 1
 fi
 if [[ "${XOR_DISPATCH_FAILURE_CHECKS}" == "enforce" &&
@@ -101,11 +122,17 @@ if [[ "${TCP_CHECKS}" == "enforce" ]]; then
     echo "error: TCP_MTUS must contain at least one MTU" >&2
     exit 1
   fi
+  seen_tcp_mtus=" "
   for tcp_mtu in "${TCP_MTU_VALUES[@]}"; do
     if [[ ! "${tcp_mtu}" =~ ^[0-9]+$ ]] || ((tcp_mtu < 576 || tcp_mtu > 65535)); then
       echo "error: TCP_MTUS values must be integers in [576, 65535]" >&2
       exit 1
     fi
+    if [[ "${seen_tcp_mtus}" == *" ${tcp_mtu} "* ]]; then
+      echo "error: TCP_MTUS contains duplicate value: ${tcp_mtu}" >&2
+      exit 1
+    fi
+    seen_tcp_mtus+="${tcp_mtu} "
   done
   read -r -a TCP_STREAM_VALUES <<<"${TCP_STREAMS}"
   if ((${#TCP_STREAM_VALUES[@]} == 0)); then
@@ -342,6 +369,10 @@ PCAP_CHECKER_PID=""
 LIFECYCLE_HOLDER_PID=""
 TCPDUMP_RA=""
 TCPDUMP_RB=""
+TCP_INNER_GSO_CAPABILITY="not-covered"
+TCP_OUTER_GSO_CAPABILITY="not-covered"
+TCP_OUTER_GSO_OBSERVED_ALL=1
+TCP_OUTER_GSO_MEASUREMENT_OK=1
 NETNS_A_DEV=""
 NETNS_A_INO=""
 NETNS_R_DEV=""
@@ -1813,6 +1844,22 @@ print_stat_delta() {
     "${stat}" "${before}" "${after}" "$((after - before))"
 }
 
+stat_delta_value() {
+  local before_path="$1"
+  local after_path="$2"
+  local stat="$3"
+  local before
+  local after
+
+  before="$(stat_value "${before_path}" "${stat}")"
+  after="$(stat_value "${after_path}" "${stat}")"
+  if ((after < before)); then
+    echo "error: ${stat} counter moved backwards (${before} -> ${after})" >&2
+    return 1
+  fi
+  printf '%s\n' "$((after - before))"
+}
+
 capture_tcp_link_evidence() {
   local phase="$1"
   local label="$2"
@@ -1827,16 +1874,17 @@ capture_tcp_link_evidence() {
     ethtool -k "${link}" >"${prefix}-offloads.txt"
 }
 
-assert_tcp_gso_link_features() {
-  local label="$1"
-  local ns="$2"
-  local link="$3"
-  local evidence="${TMPDIR}/tcp-gso-preflight-${label}-offloads.txt"
+tcp_gso_link_features_enabled() {
+  local scope="$1"
+  local label="$2"
+  local ns="$3"
+  local link="$4"
+  local evidence="${TMPDIR}/tcp-gso-${scope}-${label}-offloads.txt"
   local feature
 
-  shift 3
-  if (($# == 0)); then
-    echo "error: no TCP GSO features requested for ${label}/${link}" >&2
+  shift 4
+  if [[ "${scope}" != "inner" && "${scope}" != "outer" ]] || (($# == 0)); then
+    echo "error: invalid TCP GSO capability request: scope=${scope} label=${label} link=${link}" >&2
     return 1
   fi
   run_in_owned_netns "${ns}" ethtool -k "${link}" >"${evidence}"
@@ -1858,37 +1906,204 @@ assert_tcp_gso_link_features() {
         exit !(found && enabled)
       }
     ' "${evidence}"; then
-      echo "error: required TCP GSO offload is absent or disabled: label=${label} link=${link} feature=${feature} evidence=${evidence}" >&2
+      printf 'tcp evidence=%s-gso-capability status=unsupported label=%s link=%s feature=%s evidence=%s\n' \
+        "${scope}" "${label}" "${link}" "${feature}" "${evidence}"
       return 1
     fi
-    printf 'tcp gso offload verified: label=%s link=%s feature=%s state=on\n' \
-      "${label}" "${link}" "${feature}"
+    printf 'tcp evidence=%s-gso-capability status=supported label=%s link=%s feature=%s state=on\n' \
+      "${scope}" "${label}" "${link}" "${feature}"
   done
 }
 
-assert_tcp_gso_offload_state() {
-  if [[ "${TCP_GSO_CHECKS}" != "enforce" ]]; then
+classify_tcp_gso_capabilities() {
+  local inner_supported=1
+  local outer_supported=1
+
+  if [[ "${TCP_INNER_GSO_CHECKS}" == "off" ]]; then
+    TCP_INNER_GSO_CAPABILITY="not-covered"
+    printf 'tcp evidence=inner-tcp-gso status=not-covered reason=disabled\n'
+  else
+    if ! tcp_gso_link_features_enabled inner a-wg "${NSA}" wg0 \
+      tx-checksumming scatter-gather \
+      tcp-segmentation-offload generic-segmentation-offload; then
+      inner_supported=0
+    fi
+    if ! tcp_gso_link_features_enabled inner b-wg "${NSB}" wg0 \
+      tx-checksumming scatter-gather \
+      tcp-segmentation-offload generic-segmentation-offload; then
+      inner_supported=0
+    fi
+    if ((inner_supported)); then
+      TCP_INNER_GSO_CAPABILITY="supported"
+    else
+      TCP_INNER_GSO_CAPABILITY="unsupported"
+    fi
+    printf 'tcp evidence=inner-tcp-gso status=%s mode=%s correctness_gate=false\n' \
+      "${TCP_INNER_GSO_CAPABILITY}" "${TCP_INNER_GSO_CHECKS}"
+    if [[ "${TCP_INNER_GSO_CHECKS}" == "enforce" &&
+      "${TCP_INNER_GSO_CAPABILITY}" != "supported" ]]; then
+      echo "error: requested inner TCP GSO capability is unsupported" >&2
+      return 1
+    fi
+  fi
+
+  if [[ "${TCP_OUTER_GSO_CHECKS}" == "off" ]]; then
+    TCP_OUTER_GSO_CAPABILITY="not-covered"
+    TCP_OUTER_GSO_OBSERVED_ALL=0
+    printf 'tcp evidence=outer-udp-gso status=not-covered reason=disabled\n'
     return 0
   fi
 
-  assert_tcp_gso_link_features a-wg "${NSA}" wg0 \
-    tx-checksumming scatter-gather \
-    tcp-segmentation-offload generic-segmentation-offload
-  assert_tcp_gso_link_features b-wg "${NSB}" wg0 \
-    tx-checksumming scatter-gather \
-    tcp-segmentation-offload generic-segmentation-offload
-  assert_tcp_gso_link_features a-underlay "${NSA}" under0 \
-    tx-checksumming scatter-gather \
-    generic-segmentation-offload tx-udp-segmentation
-  assert_tcp_gso_link_features b-underlay "${NSB}" under0 \
-    tx-checksumming scatter-gather \
-    generic-segmentation-offload tx-udp-segmentation
-  assert_tcp_gso_link_features router-a "${NSR}" ra0 \
-    tx-checksumming scatter-gather \
-    generic-segmentation-offload tx-udp-segmentation
-  assert_tcp_gso_link_features router-b "${NSR}" rb0 \
-    tx-checksumming scatter-gather \
-    generic-segmentation-offload tx-udp-segmentation
+  if ! tcp_gso_link_features_enabled outer a-underlay "${NSA}" under0 \
+    tx-checksumming scatter-gather generic-segmentation-offload \
+    generic-receive-offload tx-udp-segmentation; then
+    outer_supported=0
+  fi
+  if ! tcp_gso_link_features_enabled outer b-underlay "${NSB}" under0 \
+    tx-checksumming scatter-gather generic-segmentation-offload \
+    generic-receive-offload tx-udp-segmentation; then
+    outer_supported=0
+  fi
+  if ! tcp_gso_link_features_enabled outer router-a "${NSR}" ra0 \
+    tx-checksumming scatter-gather generic-segmentation-offload \
+    generic-receive-offload tx-udp-segmentation; then
+    outer_supported=0
+  fi
+  if ! tcp_gso_link_features_enabled outer router-b "${NSR}" rb0 \
+    tx-checksumming scatter-gather generic-segmentation-offload \
+    generic-receive-offload tx-udp-segmentation; then
+    outer_supported=0
+  fi
+  if ((outer_supported)); then
+    TCP_OUTER_GSO_CAPABILITY="supported"
+  else
+    TCP_OUTER_GSO_CAPABILITY="unsupported"
+  fi
+  printf 'tcp evidence=outer-udp-gso-capability status=%s\n' \
+    "${TCP_OUTER_GSO_CAPABILITY}"
+}
+
+record_tcp_outer_gso_observation() {
+  local before_path="$1"
+  local after_path="$2"
+  local mtu="$3"
+  local side="$4"
+  local stat
+  local delta
+  local measurement_ok=1
+  local observed=1
+  local status
+
+  if [[ "${TCP_OUTER_GSO_CHECKS}" == "off" ]]; then
+    return 0
+  fi
+  for stat in \
+    egress_gso_seen egress_gso_managed_seen egress_gso_rewrite_ok \
+    ingress_gso_seen ingress_gso_listener_hit ingress_gso_rewrite_ok; do
+    if ! delta="$(stat_delta_value "${before_path}" "${after_path}" "${stat}")"; then
+      measurement_ok=0
+      observed=0
+      TCP_OUTER_GSO_MEASUREMENT_OK=0
+      printf 'tcp evidence=outer-udp-gso-counter mtu=%s side=%s stat=%s status=not-covered reason=measurement-error\n' \
+        "${mtu}" "${side}" "${stat}" >&2
+      continue
+    fi
+    printf 'tcp stat_delta=%s before_file=%s after_file=%s delta=%s\n' \
+      "${stat}" "${before_path}" "${after_path}" "${delta}"
+    case "${stat}" in
+      egress_gso_managed_seen | egress_gso_rewrite_ok | \
+        ingress_gso_listener_hit | ingress_gso_rewrite_ok)
+        if ((delta == 0)); then
+          observed=0
+        fi
+        ;;
+    esac
+  done
+  if ((!measurement_ok)); then
+    status="not-covered"
+    TCP_OUTER_GSO_OBSERVED_ALL=0
+  elif ((observed)); then
+    status="observed"
+  elif [[ "${TCP_OUTER_GSO_CAPABILITY}" == "unsupported" ]]; then
+    status="unsupported"
+    TCP_OUTER_GSO_OBSERVED_ALL=0
+  else
+    status="not-covered"
+    TCP_OUTER_GSO_OBSERVED_ALL=0
+  fi
+  printf 'tcp evidence=outer-udp-gso mtu=%s side=%s status=%s\n' \
+    "${mtu}" "${side}" "${status}"
+}
+
+finalize_tcp_gso_evidence() {
+  local status
+
+  if [[ "${TCP_OUTER_GSO_CHECKS}" == "off" ]]; then
+    status="not-covered"
+  elif ((TCP_OUTER_GSO_OBSERVED_ALL)); then
+    status="observed"
+  elif ((!TCP_OUTER_GSO_MEASUREMENT_OK)); then
+    status="not-covered"
+  elif [[ "${TCP_OUTER_GSO_CAPABILITY}" == "unsupported" ]]; then
+    status="unsupported"
+  else
+    status="not-covered"
+  fi
+  printf 'tcp summary=inner-tcp-gso status=%s mode=%s\n' \
+    "${TCP_INNER_GSO_CAPABILITY}" "${TCP_INNER_GSO_CHECKS}"
+  printf 'tcp summary=outer-udp-gso status=%s mode=%s correctness_gate=false\n' \
+    "${status}" "${TCP_OUTER_GSO_CHECKS}"
+}
+
+assert_wg_transfer_increased() {
+  local before_path="$1"
+  local after_path="$2"
+  local side="$3"
+  local mtu="$4"
+
+  env -u XOR_PASSWORD python3 - \
+    "${before_path}" "${after_path}" "${side}" "${mtu}" <<'PY'
+import pathlib
+import sys
+
+
+def read_transfer(path_value: str) -> tuple[str, int, int]:
+    path = pathlib.Path(path_value)
+    lines = [
+        line.split()
+        for line in path.read_text(encoding="ascii").splitlines()
+        if line.strip()
+    ]
+    if len(lines) != 1 or len(lines[0]) != 3:
+        raise SystemExit(f"{path}: expected exactly one WireGuard transfer row")
+    peer, received_raw, sent_raw = lines[0]
+    if not peer or not received_raw.isascii() or not received_raw.isdigit():
+        raise SystemExit(f"{path}: malformed received transfer row")
+    if not sent_raw.isascii() or not sent_raw.isdigit():
+        raise SystemExit(f"{path}: malformed sent transfer row")
+    return peer, int(received_raw), int(sent_raw)
+
+
+before_path, after_path, side, mtu = sys.argv[1:]
+before_peer, before_received, before_sent = read_transfer(before_path)
+after_peer, after_received, after_sent = read_transfer(after_path)
+if before_peer != after_peer:
+    raise SystemExit(
+        f"WireGuard peer changed for side={side} mtu={mtu}: "
+        f"{before_peer!r} -> {after_peer!r}"
+    )
+received_delta = after_received - before_received
+sent_delta = after_sent - before_sent
+if received_delta <= 0 or sent_delta <= 0:
+    raise SystemExit(
+        f"WireGuard transfer did not increase both ways for side={side} "
+        f"mtu={mtu}: rx_delta={received_delta} tx_delta={sent_delta}"
+    )
+print(
+    f"tcp evidence=wireguard-transfer side={side} mtu={mtu} "
+    f"status=passed rx_delta={received_delta} tx_delta={sent_delta}"
+)
+PY
 }
 
 capture_tcp_netns_evidence() {
@@ -2007,6 +2222,7 @@ finish_tcp_capture() {
 check_tcp_capture_file() {
   local label="$1"
   local interface="$2"
+  local flow="$3"
   local pcap_path
   local output_path
   local log_path
@@ -2024,18 +2240,36 @@ check_tcp_capture_file() {
       return 1
       ;;
   esac
+  case "${flow}" in
+    forward)
+      checker_args+=(
+        --src "${A_UNDER}" --dst "${B_UNDER}"
+        --sport 31001 --dport 31002
+      )
+      ;;
+    reverse)
+      checker_args+=(
+        --src "${B_UNDER}" --dst "${A_UNDER}"
+        --sport 31002 --dport 31001
+      )
+      ;;
+    *)
+      echo "error: invalid TCP pcap flow label: ${flow}" >&2
+      return 1
+      ;;
+  esac
   pcap_path="${TMPDIR}/${label}-${interface}.pcap"
-  output_path="${TMPDIR}/${label}-${interface}-pcap-check.out"
-  log_path="${TMPDIR}/${label}-${interface}-pcap-check.log"
+  output_path="${TMPDIR}/${label}-${interface}-${flow}-pcap-check.out"
+  log_path="${TMPDIR}/${label}-${interface}-${flow}-pcap-check.log"
   if ((XOR_ENABLED)); then
-    checker_args=(
+    checker_args+=(
       --forbid-plain-standard
       --forbid-plain-mixed
       --xor-udp2raw-password-file "${SECRET_DIR}/xor-password"
       --require-xor-mixed transport
     )
   else
-    checker_args=(
+    checker_args+=(
       --forbid-standard
       --require-mixed transport
     )
@@ -2049,7 +2283,7 @@ check_tcp_capture_file() {
     2>"${log_path}" &
   PCAP_CHECKER_PID=$!
   assert_process_environment_secret_free \
-    "${PCAP_CHECKER_PID}" "pcap-checker-${label}-${interface}" || return 1
+    "${PCAP_CHECKER_PID}" "pcap-checker-${label}-${interface}-${flow}" || return 1
   if wait "${PCAP_CHECKER_PID}"; then
     checker_status=0
   else
@@ -2057,7 +2291,7 @@ check_tcp_capture_file() {
   fi
   PCAP_CHECKER_PID=""
   if ((checker_status != 0)); then
-    echo "error: TCP pcap checker failed for ${label}/${interface} (${checker_status})" >&2
+    echo "error: TCP pcap checker failed for ${label}/${interface}/${flow} (${checker_status})" >&2
     cat "${log_path}" >&2
     cat "${output_path}" >&2
     return "${checker_status}"
@@ -2067,19 +2301,32 @@ check_tcp_capture_file() {
 
 check_tcp_capture() {
   local label="$1"
+  local direction="${label##*-}"
   local interface
+  local flow
+  local flows=()
   local status
   local result=0
 
+  case "${direction}" in
+    forward | reverse) flows=("${direction}") ;;
+    bidir) flows=(forward reverse) ;;
+    *)
+      echo "error: could not derive TCP pcap direction from ${label}" >&2
+      return 1
+      ;;
+  esac
   for interface in ra rb; do
-    if check_tcp_capture_file "${label}" "${interface}"; then
-      :
-    else
-      status=$?
-      if ((result == 0)); then
-        result="${status}"
+    for flow in "${flows[@]}"; do
+      if check_tcp_capture_file "${label}" "${interface}" "${flow}"; then
+        :
+      else
+        status=$?
+        if ((result == 0)); then
+          result="${status}"
+        fi
       fi
-    fi
+    done
   done
   return "${result}"
 }
@@ -2234,7 +2481,7 @@ exercise_tcp_matrix() {
   local run_status
   local evidence_status
 
-  assert_tcp_gso_offload_state
+  classify_tcp_gso_capabilities
   capture_tcp_netns_evidence before
   for mtu in "${TCP_MTU_VALUES[@]}"; do
     validate_all_netns_identities
@@ -2247,6 +2494,10 @@ exercise_tcp_matrix() {
       >"${TMPDIR}/status-a-tcp-${mtu}-before.json"
     run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" \
       >"${TMPDIR}/status-b-tcp-${mtu}-before.json"
+    run_in_owned_netns "${NSA}" wg show wg0 transfer \
+      >"${TMPDIR}/wg-transfer-a-tcp-${mtu}-before.txt"
+    run_in_owned_netns "${NSB}" wg show wg0 transfer \
+      >"${TMPDIR}/wg-transfer-b-tcp-${mtu}-before.txt"
 
     run_status=0
     for streams in "${TCP_STREAM_VALUES[@]}"; do
@@ -2264,6 +2515,10 @@ exercise_tcp_matrix() {
       >"${TMPDIR}/status-a-tcp-${mtu}-after.json"
     run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" \
       >"${TMPDIR}/status-b-tcp-${mtu}-after.json"
+    run_in_owned_netns "${NSA}" wg show wg0 transfer \
+      >"${TMPDIR}/wg-transfer-a-tcp-${mtu}-after.txt"
+    run_in_owned_netns "${NSB}" wg show wg0 transfer \
+      >"${TMPDIR}/wg-transfer-b-tcp-${mtu}-after.txt"
 
     for side in a b; do
       before_path="${TMPDIR}/status-${side}-tcp-${mtu}-before.json"
@@ -2288,29 +2543,18 @@ exercise_tcp_matrix() {
       if ((run_status != 0)); then
         continue
       fi
+      assert_wg_transfer_increased \
+        "${TMPDIR}/wg-transfer-${side}-tcp-${mtu}-before.txt" \
+        "${TMPDIR}/wg-transfer-${side}-tcp-${mtu}-after.txt" \
+        "${side}" "${mtu}"
       assert_stat_increased "${before_path}" "${after_path}" egress_rewrite_ok
       assert_stat_increased "${before_path}" "${after_path}" ingress_rewrite_ok
       if ((XOR_ENABLED)); then
         assert_stat_increased "${before_path}" "${after_path}" xor_egress_ok
         assert_stat_increased "${before_path}" "${after_path}" xor_ingress_ok
       fi
-      if [[ "${TCP_GSO_CHECKS}" != "off" ]]; then
-        for stat in \
-          egress_gso_seen egress_gso_managed_seen egress_gso_rewrite_ok \
-          ingress_gso_seen ingress_gso_listener_hit ingress_gso_rewrite_ok; do
-          print_stat_delta "${before_path}" "${after_path}" "${stat}"
-        done
-      fi
-      if [[ "${TCP_GSO_CHECKS}" == "enforce" ]]; then
-        assert_stat_increased \
-          "${before_path}" "${after_path}" egress_gso_managed_seen
-        assert_stat_increased \
-          "${before_path}" "${after_path}" egress_gso_rewrite_ok
-        assert_stat_increased \
-          "${before_path}" "${after_path}" ingress_gso_listener_hit
-        assert_stat_increased \
-          "${before_path}" "${after_path}" ingress_gso_rewrite_ok
-      fi
+      record_tcp_outer_gso_observation \
+        "${before_path}" "${after_path}" "${mtu}" "${side}"
     done
     if ((run_status != 0)); then
       evidence_status=0
@@ -2325,6 +2569,8 @@ exercise_tcp_matrix() {
     fi
   done
   capture_tcp_netns_evidence after
+  finalize_tcp_gso_evidence
+  printf 'tcp summary=correctness status=passed\n'
 }
 
 exercise_udp_zero_checksum() {

@@ -145,6 +145,11 @@ expected-failure characterization:
   IPv6 1421
 ```
 
+`test-netns-tcp-pmtu-positive` covers the positive boundary cells. The two
+expected-failure cells remain characterization work and must be reported as
+not-covered until a dedicated negative oracle is implemented; they must not be
+inferred from a successful positive run.
+
 Correctness gates:
 
 ```text
@@ -153,8 +158,11 @@ netns TCP retransmits are zero
 rewrite success counters increase on both sides
 all type/length/fragment/checksum/load/store/XOR/dispatch error counters
   have zero delta in positive tests
-GSO-enabled cases must increment the corresponding managed-seen and
-  rewrite-success counters
+inner TCP GSO capability evidence is recorded independently from correctness
+outer UDP GSO managed/listener counters are classified as observed,
+  unsupported, or not-covered; absence is never reported as a pass
+dedicated outer-UDP UDP_SEGMENT/GRO traffic is required before marking the
+  outer GSO/GRO path passed
 standard WireGuard type-word leakage is zero
 received UDP checksum failures are zero
 WireGuard transfer counters increase in both directions

@@ -123,13 +123,24 @@ def parse_pcap(path: Path) -> Iterable[tuple[int, int, bytes]]:
     linktype = struct.unpack(endian + "I", data[20:24])[0] & 0xFFFF
     offset = 24
     packet_index = 0
-    while offset + 16 <= len(data):
-        _ts_sec, _ts_frac, incl_len, _orig_len = struct.unpack(
+    while offset < len(data):
+        if len(data) - offset < 16:
+            raise ValueError(
+                f"{path}: truncated packet header at byte offset {offset}"
+            )
+        _ts_sec, _ts_frac, incl_len, orig_len = struct.unpack(
             endian + "IIII", data[offset : offset + 16]
         )
         offset += 16
+        if incl_len > orig_len:
+            raise ValueError(
+                f"{path}: captured length {incl_len} exceeds original length "
+                f"{orig_len} for packet {packet_index + 1}"
+            )
         if offset + incl_len > len(data):
-            break
+            raise ValueError(
+                f"{path}: truncated packet data for packet {packet_index + 1}"
+            )
         packet_index += 1
         yield packet_index, linktype, data[offset : offset + incl_len]
         offset += incl_len

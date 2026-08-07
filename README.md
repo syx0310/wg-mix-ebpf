@@ -100,14 +100,28 @@ sudo make test-netns-full
 ```
 
 To run only the TCP 1/4/16-flow, forward/reverse/bidirectional, and WireGuard
-MTU 1419-1422 boundary matrix (type-word-only, XOR prefix, and XOR full), use:
+MTU 1419-1422 tail-alignment matrix (type-word-only, XOR prefix, and XOR full),
+use:
 
 ```bash
 sudo make test-netns-tcp
 ```
 
+The positive 1500-byte underlay PMTU boundaries are a separate IPv4/IPv6 gate:
+
+```bash
+sudo make test-netns-tcp-pmtu-positive
+```
+
 The TCP matrix requires `iperf3`; the default lightweight namespace smoke
-targets do not.
+targets do not. It treats TCP delivery, retransmits, packet captures, and
+dataplane error counters as correctness gates. Inner TCP GSO capability and
+outer UDP GSO/GRO observations are reported separately, because kernel
+WireGuard may segment an inner GSO skb before producing the outer UDP packets.
+Use `sudo make test-netns-tcp-outer-gso-observe` for a focused 16-flow,
+simultaneous-bidirectional outer-GSO observation run; a missing observation is
+reported as `not-covered`, not as a pass. This is still TCP-over-WireGuard and
+does not replace a dedicated outer-UDP `UDP_SEGMENT`/GRO workload.
 
 Run `bpf-load-test` on every supported kernel baseline as well as the build
 kernel; verifier acceptance can differ even when the embedded object is
