@@ -26,19 +26,17 @@ import (
 )
 
 const (
-	ingressFilterName      = "wg_mix_ingress"
-	egressFilterName       = "wg_mix_egress"
-	filterPriority         = 49152
-	ingressHandle          = 0x10001
-	egressHandle           = 0x10002
-	xorSegmentCount        = 8
-	fakeTCPTailCallBanks   = 2
-	fakeTCPMinInactiveRing = 4096
-	pinPathPrefix          = "wg-mix-ebpf"
-	maxPinPathSuffix       = 64
-	pinPathLockRoot        = "/run/wg-mix-ebpf/pin-locks"
-	pinOwnerRoot           = "/var/lib/wg-mix-ebpf/pin-owners"
-	pinPathOwnerV2         = 2
+	ingressFilterName = "wg_mix_ingress"
+	egressFilterName  = "wg_mix_egress"
+	filterPriority    = 49152
+	ingressHandle     = 0x10001
+	egressHandle      = 0x10002
+	xorSegmentCount   = 8
+	pinPathPrefix     = "wg-mix-ebpf"
+	maxPinPathSuffix  = 64
+	pinPathLockRoot   = "/run/wg-mix-ebpf/pin-locks"
+	pinOwnerRoot      = "/var/lib/wg-mix-ebpf/pin-owners"
+	pinPathOwnerV2    = 2
 )
 
 type pinPathFilesystem struct {
@@ -283,6 +281,9 @@ func LoadObjectTestIdentity(
 	if err != nil {
 		return ObjectIdentity{}, err
 	}
+	if err := validateBaselineCollectionSpec(spec); err != nil {
+		return ObjectIdentity{}, fmt.Errorf("validate BPF object %s: %w", identity.Source, err)
+	}
 	if err := removeMemlockLimit(); err != nil {
 		return ObjectIdentity{}, err
 	}
@@ -322,9 +323,6 @@ func preflightUnpinnedCollection(spec *ebpf.CollectionSpec, source string) error
 	if collection.Programs[egressFilterName] == nil {
 		return fmt.Errorf("BPF object %s missing program %q", source, egressFilterName)
 	}
-	if collection.Programs["wg_mix_faketcp_ingress"] == nil {
-		return fmt.Errorf("BPF object %s missing program %q", source, "wg_mix_faketcp_ingress")
-	}
 	return nil
 }
 
@@ -351,11 +349,11 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 	source := identity.Source
-	if err := validateAndSetPinnedMaps(spec); err != nil {
+	if err := validateBaselineCollectionSpec(spec); err != nil {
 		return fmt.Errorf("validate BPF object %s: %w", source, err)
 	}
-	if err := configureFakeTCPMapCapacity(spec, stateUsesFakeTCP(state)); err != nil {
-		return fmt.Errorf("configure BPF object %s: %w", source, err)
+	if err := validateAndSetPinnedMaps(spec); err != nil {
+		return fmt.Errorf("validate BPF object %s: %w", source, err)
 	}
 	if err := removeMemlockLimit(); err != nil {
 		return err
@@ -1704,19 +1702,6 @@ func pinnedMapDescriptors() []pinnedMapDescriptor {
 	}
 }
 
-// FakeTCP maps are deliberately not part of the canonical owner set while
-// activation is hard-gated. Existing ABI-v10 installations therefore keep
-// their exact 12-map identity and can reload ordinary UDP/ICMP configurations.
-func fakeTCPUnpinnedMapDescriptors() []pinnedMapDescriptor {
-	return []pinnedMapDescriptor{
-		{name: "faketcp_session_map", mapType: ebpf.LRUHash, keySize: 24, valueSize: 40, maxEntries: 16384},
-		{name: "faketcp_events", mapType: ebpf.RingBuf, keySize: 0, valueSize: 0, maxEntries: 1 << 20},
-		{name: "faketcp_egress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: fakeTCPTailCallBanks},
-		{name: "faketcp_stats_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 9},
-		{name: "faketcp_capture_scratch", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: abi.FakeTCPPacketEventSize, maxEntries: 1},
-	}
-}
-
 func pinnedMapNames() []string {
 	descriptors := pinnedMapDescriptors()
 	names := make([]string, 0, len(descriptors))
@@ -1742,19 +1727,6 @@ func validateAndSetPinnedMaps(spec *ebpf.CollectionSpec) error {
 			return err
 		}
 	}
-	for _, descriptor := range fakeTCPUnpinnedMapDescriptors() {
-		mapSpec := spec.Maps[descriptor.name]
-		if mapSpec == nil {
-			return fmt.Errorf("BPF object missing required unpinned map %q", descriptor.name)
-		}
-		if err := validatePinnedMapSpec(descriptor, mapSpec); err != nil {
-			return err
-		}
-		if mapSpec.Pinning != ebpf.PinNone {
-			return fmt.Errorf("experimental BPF map %q must remain unpinned", descriptor.name)
-		}
-	}
-
 	var unexpectedPinned []string
 	for name, mapSpec := range spec.Maps {
 		if mapSpec == nil {
@@ -1774,36 +1746,35 @@ func validateAndSetPinnedMaps(spec *ebpf.CollectionSpec) error {
 	return nil
 }
 
-// configureFakeTCPMapCapacity avoids paying the inactive feature's 1 MiB
-// ring-buffer and 16384-entry LRU cost on every ordinary reload. The compact
-// maps remain valid relocation targets, but no non-FakeTCP rule can reach them.
-func configureFakeTCPMapCapacity(spec *ebpf.CollectionSpec, enabled bool) error {
+// validateBaselineCollectionSpec is the loader boundary between the stable
+// UDP/ICMP object and the separately built FakeTCP experiment. It runs before
+// memlock changes, map creation, pinning or attachment, so an experimental
+// object can never be supplied to the production loader by path override.
+func validateBaselineCollectionSpec(spec *ebpf.CollectionSpec) error {
 	if spec == nil {
-		return errors.New("configure faketcp maps: collection spec is nil")
+		return errors.New("baseline BPF collection spec is nil")
 	}
-	if enabled {
-		return nil
-	}
-	capacities := map[string]uint32{
-		"faketcp_session_map": 1,
-		"faketcp_events":      inactiveFakeTCPRingCapacity(),
-	}
-	for name, capacity := range capacities {
-		mapSpec := spec.Maps[name]
+	for name, mapSpec := range spec.Maps {
 		if mapSpec == nil {
-			return fmt.Errorf("configure faketcp maps: missing map %q", name)
+			return fmt.Errorf("BPF object map %q has a nil spec", name)
 		}
-		mapSpec.MaxEntries = capacity
+		if isFakeTCPObjectSymbol(name) || isFakeTCPObjectSymbol(mapSpec.Name) {
+			return fmt.Errorf("baseline BPF object contains experimental FakeTCP map %q", name)
+		}
+	}
+	for name, programSpec := range spec.Programs {
+		if programSpec == nil {
+			return fmt.Errorf("BPF object program %q has a nil spec", name)
+		}
+		if isFakeTCPObjectSymbol(name) || isFakeTCPObjectSymbol(programSpec.Name) {
+			return fmt.Errorf("baseline BPF object contains experimental FakeTCP program %q", name)
+		}
 	}
 	return nil
 }
 
-func inactiveFakeTCPRingCapacity() uint32 {
-	capacity := uint32(os.Getpagesize())
-	if capacity < fakeTCPMinInactiveRing {
-		return fakeTCPMinInactiveRing
-	}
-	return capacity
+func isFakeTCPObjectSymbol(name string) bool {
+	return strings.Contains(strings.ToLower(name), "faketcp")
 }
 
 func validatePinnedMapSpec(descriptor pinnedMapDescriptor, spec *ebpf.MapSpec) error {
@@ -2039,20 +2010,6 @@ func populateXORTailCalls(coll *ebpf.Collection, generation uint64) error {
 				return fmt.Errorf("populate %s[%d] with %s: %w",
 					binding.mapName, index, programName, err)
 			}
-		}
-	}
-	fakeMap := coll.Maps["faketcp_egress_programs"]
-	if fakeMap == nil {
-		return fmt.Errorf("BPF object missing map %q", "faketcp_egress_programs")
-	}
-	fakeProgram := coll.Programs["wg_faketcp_egress"]
-	if fakeProgram == nil {
-		return fmt.Errorf("BPF object missing program %q", "wg_faketcp_egress")
-	}
-	for index := uint32(0); index < fakeTCPTailCallBanks; index++ {
-		fd := uint32(fakeProgram.FD())
-		if err := fakeMap.Update(index, fd, ebpf.UpdateAny); err != nil {
-			return fmt.Errorf("populate faketcp_egress_programs[%d] with wg_faketcp_egress: %w", index, err)
 		}
 	}
 	return nil

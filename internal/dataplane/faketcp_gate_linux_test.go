@@ -5,6 +5,7 @@ package dataplane
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 
@@ -53,7 +54,7 @@ func TestFakeTCPKernelGateCannotBeBypassedByRuleOnlyState(t *testing.T) {
 	}
 }
 
-func TestFakeTCPPrototypePreservesCanonicalOwnerAndInactiveMemory(t *testing.T) {
+func TestFakeTCPPrototypeIsAbsentFromBaselineCollection(t *testing.T) {
 	if abi.Version != 10 {
 		t.Fatalf("ABI version = %d, want the existing compatible version 10", abi.Version)
 	}
@@ -71,24 +72,27 @@ func TestFakeTCPPrototypePreservesCanonicalOwnerAndInactiveMemory(t *testing.T) 
 	}
 
 	spec := canonicalPinnedMapCollectionSpec()
+	if err := validateBaselineCollectionSpec(spec); err != nil {
+		t.Fatal(err)
+	}
 	if err := validateAndSetPinnedMaps(spec); err != nil {
 		t.Fatal(err)
 	}
-	if err := configureFakeTCPMapCapacity(spec, false); err != nil {
+	for name := range spec.Maps {
+		if isFakeTCPObjectSymbol(name) {
+			t.Fatalf("experimental map %q is present in baseline spec", name)
+		}
+	}
+}
+
+func TestFakeTCPBPFSourceRequiresExplicitExperimentalBuild(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_tc.c")
+	if err != nil {
 		t.Fatal(err)
 	}
-	if got := spec.Maps["faketcp_session_map"].MaxEntries; got != 1 {
-		t.Fatalf("inactive FakeTCP LRU entries = %d, want 1", got)
-	}
-	if got := spec.Maps["faketcp_events"].MaxEntries; got != inactiveFakeTCPRingCapacity() {
-		t.Fatalf("inactive FakeTCP ringbuf bytes = %d, want one page", got)
-	}
-	if inactiveFakeTCPRingCapacity() < abi.FakeTCPPacketEventSize+8 {
-		t.Fatal("inactive ringbuf cannot hold one maximum compact event")
-	}
-	for _, descriptor := range fakeTCPUnpinnedMapDescriptors() {
-		if got := spec.Maps[descriptor.name].Pinning; got != 0 {
-			t.Fatalf("experimental map %q pinning = %d, want unpinned", descriptor.name, got)
-		}
+	text := string(source)
+	guardedInclude := "#ifdef WG_MIX_EXPERIMENTAL_FAKETCP\n#include \"wg_mix_faketcp.h\"\n#endif"
+	if !strings.Contains(text, guardedInclude) {
+		t.Fatal("FakeTCP BPF include is not behind the explicit experimental build guard")
 	}
 }

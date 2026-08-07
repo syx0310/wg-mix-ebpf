@@ -112,25 +112,11 @@ func TestValidateAndSetPinnedMapsRequiresCanonicalMapABI(t *testing.T) {
 			wantErr: `missing required pinned map "profile_map"`,
 		},
 		{
-			name: "missing experimental relocation map",
-			mutate: func(spec *ebpf.CollectionSpec) {
-				delete(spec.Maps, "faketcp_session_map")
-			},
-			wantErr: `missing required unpinned map "faketcp_session_map"`,
-		},
-		{
 			name: "unexpected pinned map",
 			mutate: func(spec *ebpf.CollectionSpec) {
 				spec.Maps["icmp_seq_map"].Pinning = ebpf.PinByName
 			},
 			wantErr: "unexpected pinned maps: icmp_seq_map",
-		},
-		{
-			name: "experimental map cannot join owner set",
-			mutate: func(spec *ebpf.CollectionSpec) {
-				spec.Maps["faketcp_events"].Pinning = ebpf.PinByName
-			},
-			wantErr: `experimental BPF map "faketcp_events" must remain unpinned`,
 		},
 		{
 			name: "unexpected unsupported pin mode",
@@ -216,6 +202,61 @@ func TestValidateAndSetPinnedMapsRequiresCanonicalMapABI(t *testing.T) {
 			tt.mutate(spec)
 			if err := validateAndSetPinnedMaps(spec); err == nil || !strings.Contains(err.Error(), tt.wantErr) {
 				t.Fatalf("validation error = %v, want substring %q", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestValidateBaselineCollectionSpecRejectsExperimentalFakeTCPObject(t *testing.T) {
+	if err := validateBaselineCollectionSpec(canonicalPinnedMapCollectionSpec()); err != nil {
+		t.Fatalf("baseline spec rejected: %v", err)
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*ebpf.CollectionSpec)
+		wantErr string
+	}{
+		{
+			name: "map key",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Maps["faketcp_session_map"] = &ebpf.MapSpec{Name: "faketcp_session_map"}
+			},
+			wantErr: "experimental FakeTCP map",
+		},
+		{
+			name: "map kernel name",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Maps["hidden"] = &ebpf.MapSpec{Name: "faketcp_events"}
+			},
+			wantErr: "experimental FakeTCP map",
+		},
+		{
+			name: "program key",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs = map[string]*ebpf.ProgramSpec{
+					"wg_mix_faketcp_ingress": {Name: "hidden"},
+				}
+			},
+			wantErr: "experimental FakeTCP program",
+		},
+		{
+			name: "program kernel name",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs = map[string]*ebpf.ProgramSpec{
+					"hidden": {Name: "wg_faketcp_egress"},
+				}
+			},
+			wantErr: "experimental FakeTCP program",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := canonicalPinnedMapCollectionSpec()
+			tt.mutate(spec)
+			err := validateBaselineCollectionSpec(spec)
+			if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+				t.Fatalf("error = %v, want %q", err, tt.wantErr)
 			}
 		})
 	}
@@ -1285,16 +1326,6 @@ func canonicalPinnedMapCollectionSpec() *ebpf.CollectionSpec {
 		Maps: make(map[string]*ebpf.MapSpec),
 	}
 	for _, descriptor := range pinnedMapDescriptors() {
-		spec.Maps[descriptor.name] = &ebpf.MapSpec{
-			Name:       descriptor.name,
-			Type:       descriptor.mapType,
-			KeySize:    descriptor.keySize,
-			ValueSize:  descriptor.valueSize,
-			MaxEntries: descriptor.maxEntries,
-			Flags:      descriptor.flags,
-		}
-	}
-	for _, descriptor := range fakeTCPUnpinnedMapDescriptors() {
 		spec.Maps[descriptor.name] = &ebpf.MapSpec{
 			Name:       descriptor.name,
 			Type:       descriptor.mapType,
