@@ -297,9 +297,10 @@ const (
 // method: mutation is possible only through the exact transaction which holds
 // the retained lifecycle lease and generation-isolation backend.
 type fakeTCPPolicyStage struct {
-	operations []fakeTCPPolicyOperation
-	state      uint8
-	owner      *fakeTCPPolicyGenerationIdentity
+	operations      []fakeTCPPolicyOperation
+	state           uint8
+	owner           *fakeTCPPolicyGenerationIdentity
+	collectionOwner *experimentalCollectionOwner
 }
 
 // Rollback is idempotent after a complete rollback or Disarm. It first removes
@@ -356,6 +357,65 @@ func (transaction *fakeTCPPolicyGenerationTransaction) Disarm(
 	default:
 		return errors.New("cannot disarm a rolled-back FakeTCP policy stage")
 	}
+}
+
+func (transaction *fakeTCPPolicyGenerationTransaction) bindStageCollectionOwner(
+	ctx context.Context,
+	stage *fakeTCPPolicyStage,
+	owner *experimentalCollectionOwner,
+) error {
+	if transaction == nil {
+		return errFakeTCPPolicyGenerationLeaseRequired
+	}
+	if owner == nil {
+		return errors.New("bind FakeTCP policy stage: collection owner is nil")
+	}
+	transaction.mu.Lock()
+	defer transaction.mu.Unlock()
+	if err := transaction.assertStageLocked(ctx, stage); err != nil {
+		return err
+	}
+	if stage.collectionOwner != nil && stage.collectionOwner != owner {
+		return errors.New("bind FakeTCP policy stage: collection owner changed")
+	}
+	stage.collectionOwner = owner
+	return nil
+}
+
+// releaseStageAfterCollectionClose is the terminal construction-failure path
+// for an unpinned experimental collection. Ordinary policy owners must use
+// Rollback or Disarm. This path is permitted only after the exact collection
+// owner has attempted every map/program close and relinquished all handles;
+// at that point retrying map rollback is both impossible and unnecessary for
+// lifecycle-lease safety.
+func (transaction *fakeTCPPolicyGenerationTransaction) releaseStageAfterCollectionClose(
+	ctx context.Context,
+	stage *fakeTCPPolicyStage,
+	proof *experimentalCollectionReleaseProof,
+) error {
+	if transaction == nil {
+		return errFakeTCPPolicyGenerationLeaseRequired
+	}
+	if proof == nil || proof.owner == nil {
+		return errors.New("release FakeTCP policy stage requires collection close proof")
+	}
+	proof.owner.mu.Lock()
+	collectionClosed := proof.owner.closed
+	proof.owner.mu.Unlock()
+	if !collectionClosed {
+		return errors.New("release FakeTCP policy stage requires a closed collection owner")
+	}
+	transaction.mu.Lock()
+	defer transaction.mu.Unlock()
+	if err := transaction.assertStageLocked(ctx, stage); err != nil {
+		return err
+	}
+	if stage.collectionOwner == nil || stage.collectionOwner != proof.owner {
+		return errors.New("release FakeTCP policy stage collection proof does not match its bound owner")
+	}
+	stage.operations = nil
+	stage.state = fakeTCPPolicyStageRolledBack
+	return nil
 }
 
 func (transaction *fakeTCPPolicyGenerationTransaction) assertStageLocked(

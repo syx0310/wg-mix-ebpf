@@ -76,6 +76,10 @@ type experimentalCollectionOwner struct {
 	closeDone chan struct{}
 }
 
+type experimentalCollectionReleaseProof struct {
+	owner *experimentalCollectionOwner
+}
+
 func newExperimentalCollectionOwner(collection *ebpf.Collection) (*experimentalCollectionOwner, error) {
 	if collection == nil {
 		return nil, errors.New("experimental FakeTCP collection is nil")
@@ -175,6 +179,23 @@ func (owner *experimentalCollectionOwner) Close() error {
 	close(owner.closeDone)
 	owner.mu.Unlock()
 	return err
+}
+
+func (owner *experimentalCollectionOwner) closeAndReleaseProof() (
+	*experimentalCollectionReleaseProof,
+	error,
+) {
+	if owner == nil {
+		return nil, errExperimentalCollectionClosed
+	}
+	err := owner.Close()
+	owner.mu.Lock()
+	closed := owner.closed
+	owner.mu.Unlock()
+	if !closed {
+		return nil, errors.Join(err, errors.New("experimental FakeTCP collection did not finish closing"))
+	}
+	return &experimentalCollectionReleaseProof{owner: owner}, err
 }
 
 func closeExperimentalResources(
