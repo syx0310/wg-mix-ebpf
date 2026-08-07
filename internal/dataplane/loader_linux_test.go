@@ -4,6 +4,7 @@ package dataplane
 
 import (
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
@@ -1380,9 +1382,17 @@ func canonicalPinnedMapCollectionSpec() *ebpf.CollectionSpec {
 	}
 	for _, descriptor := range baselineProgramDescriptors() {
 		spec.Programs[descriptor.name] = &ebpf.ProgramSpec{
-			Name:        descriptor.name,
-			Type:        descriptor.programType,
-			SectionName: descriptor.sectionName,
+			Name:          descriptor.name,
+			Type:          descriptor.programType,
+			Ifindex:       descriptor.ifindex,
+			AttachType:    descriptor.attachType,
+			AttachTo:      descriptor.attachTo,
+			SectionName:   descriptor.sectionName,
+			Instructions:  asm.Instructions{asm.Return()},
+			Flags:         descriptor.flags,
+			License:       descriptor.license,
+			KernelVersion: descriptor.kernelVersion,
+			ByteOrder:     binary.LittleEndian,
 		}
 	}
 	return spec

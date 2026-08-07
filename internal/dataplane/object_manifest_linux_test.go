@@ -3,12 +3,14 @@
 package dataplane
 
 import (
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"os"
-	"sort"
-	"strings"
 	"testing"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/asm"
 )
 
 const (
@@ -40,78 +42,241 @@ func TestBuiltBPFObjectManifests(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantExtraMaps := map[string]ebpf.MapType{
-		"faketcp_session_map":      ebpf.Hash,
-		"faketcp_managed_if_map":   ebpf.Hash,
-		"faketcp_managed_port_map": ebpf.Hash,
-		"faketcp_events":           ebpf.RingBuf,
-		"faketcp_capture_scratch":  ebpf.PerCPUArray,
-		"faketcp_egress_programs":  ebpf.ProgramArray,
-		"faketcp_stats_map":        ebpf.PerCPUArray,
+	if err := validateExperimentalExtensionManifest(experimental); err != nil {
+		t.Fatalf("fresh experimental object violates exact extension manifest: %v", err)
 	}
-	wantExtraPrograms := map[string]baselineProgramDescriptor{
-		"wg_faketcp_egress": {
-			name: "wg_faketcp_egress", sectionName: "classifier/faketcp_egress", programType: ebpf.SchedCLS,
+}
+
+func experimentalMapDescriptors() []pinnedMapDescriptor {
+	return []pinnedMapDescriptor{
+		{name: "faketcp_session_map", mapType: ebpf.Hash, keySize: 24, valueSize: 40, maxEntries: 16384},
+		{name: "faketcp_managed_if_map", mapType: ebpf.Hash, keySize: 16, valueSize: 8, maxEntries: 512},
+		{name: "faketcp_managed_port_map", mapType: ebpf.Hash, keySize: 16, valueSize: 16, maxEntries: 2048},
+		{name: "faketcp_events", mapType: ebpf.RingBuf, maxEntries: 1 << 20},
+		{name: "faketcp_capture_scratch", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 2360, maxEntries: 1},
+		{name: "faketcp_egress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: 2},
+		{name: "faketcp_stats_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 9},
+	}
+}
+
+func experimentalProgramDescriptors() []baselineProgramDescriptor {
+	return []baselineProgramDescriptor{
+		{
+			name: "wg_faketcp_egress", sectionName: "classifier/faketcp_egress",
+			programType: ebpf.SchedCLS, license: "MIT",
 		},
-		"wg_mix_faketcp_ingress": {
-			name: "wg_mix_faketcp_ingress", sectionName: "xdp", programType: ebpf.XDP,
+		{
+			name: "wg_mix_faketcp_ingress", sectionName: "xdp",
+			programType: ebpf.XDP, license: "MIT",
 		},
 	}
-	experimentalCore := experimental.Copy()
-	for name := range wantExtraMaps {
-		delete(experimentalCore.Maps, name)
+}
+
+func validateExperimentalExtensionManifest(spec *ebpf.CollectionSpec) error {
+	if spec == nil {
+		return errors.New("experimental BPF collection spec is nil")
 	}
-	for name := range wantExtraPrograms {
-		delete(experimentalCore.Programs, name)
+
+	core := spec.Copy()
+	for _, descriptor := range experimentalMapDescriptors() {
+		delete(core.Maps, descriptor.name)
 	}
-	if err := validateBaselineCollectionSpec(experimentalCore); err != nil {
-		t.Fatalf("experimental object does not preserve the exact baseline core: %v", err)
+	for _, descriptor := range experimentalProgramDescriptors() {
+		delete(core.Programs, descriptor.name)
 	}
-	baselineMaps := make(map[string]struct{})
-	for _, descriptor := range baselineMapDescriptors() {
-		baselineMaps[descriptor.name] = struct{}{}
+	if err := validateBaselineCollectionSpec(core); err != nil {
+		return fmt.Errorf("experimental object does not preserve the exact baseline core: %w", err)
 	}
-	baselinePrograms := make(map[string]struct{})
-	for _, descriptor := range baselineProgramDescriptors() {
-		baselinePrograms[descriptor.name] = struct{}{}
-	}
-	var unexpected []string
-	seenMaps := make(map[string]struct{}, len(wantExtraMaps))
-	for name, spec := range experimental.Maps {
-		if _, core := baselineMaps[name]; core {
-			continue
+
+	for _, descriptor := range experimentalMapDescriptors() {
+		mapSpec := spec.Maps[descriptor.name]
+		if mapSpec == nil {
+			return fmt.Errorf("experimental BPF object missing required map %q", descriptor.name)
 		}
-		wantType, ok := wantExtraMaps[name]
-		if !ok || spec == nil || spec.Type != wantType {
-			unexpected = append(unexpected, "map:"+name)
-			continue
+		if err := validatePinnedMapSpec(descriptor, mapSpec); err != nil {
+			return fmt.Errorf("experimental map manifest: %w", err)
 		}
-		seenMaps[name] = struct{}{}
-	}
-	seenPrograms := make(map[string]struct{}, len(wantExtraPrograms))
-	for name, spec := range experimental.Programs {
-		if _, core := baselinePrograms[name]; core {
-			continue
-		}
-		want, ok := wantExtraPrograms[name]
-		if !ok || spec == nil || spec.Name != want.name || spec.SectionName != want.sectionName || spec.Type != want.programType {
-			unexpected = append(unexpected, "program:"+name)
-			continue
-		}
-		seenPrograms[name] = struct{}{}
-	}
-	for name := range wantExtraMaps {
-		if _, ok := seenMaps[name]; !ok {
-			unexpected = append(unexpected, "missing-map:"+name)
+		if mapSpec.Pinning != ebpf.PinNone {
+			return fmt.Errorf(
+				"experimental BPF map %q pinning is %d, want PinNone",
+				descriptor.name, mapSpec.Pinning,
+			)
 		}
 	}
-	for name := range wantExtraPrograms {
-		if _, ok := seenPrograms[name]; !ok {
-			unexpected = append(unexpected, "missing-program:"+name)
+	for _, descriptor := range experimentalProgramDescriptors() {
+		programSpec := spec.Programs[descriptor.name]
+		if programSpec == nil {
+			return fmt.Errorf("experimental BPF object missing required program %q", descriptor.name)
+		}
+		if err := validateProgramManifestSpec(descriptor, programSpec); err != nil {
+			return fmt.Errorf("experimental program manifest: %w", err)
 		}
 	}
-	if len(unexpected) != 0 {
-		sort.Strings(unexpected)
-		t.Fatalf("experimental BPF object differs from reviewed extension manifest: %s", strings.Join(unexpected, ", "))
+	return nil
+}
+
+func TestExperimentalManifestRejectsSchemaAndMetadataDrift(t *testing.T) {
+	if err := validateExperimentalExtensionManifest(canonicalExperimentalCollectionSpec()); err != nil {
+		t.Fatalf("exact experimental manifest rejected: %v", err)
 	}
+
+	tests := []struct {
+		name   string
+		mutate func(*ebpf.CollectionSpec)
+	}{
+		{
+			name: "map type",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Maps["faketcp_session_map"].Type = ebpf.LRUHash
+			},
+		},
+		{
+			name: "map key size",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Maps["faketcp_session_map"].KeySize++
+			},
+		},
+		{
+			name: "map value size",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Maps["faketcp_session_map"].ValueSize++
+			},
+		},
+		{
+			name: "map capacity",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Maps["faketcp_session_map"].MaxEntries++
+			},
+		},
+		{
+			name: "map flags",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Maps["faketcp_session_map"].Flags = 1
+			},
+		},
+		{
+			name: "map pinning",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Maps["faketcp_session_map"].Pinning = ebpf.PinByName
+			},
+		},
+		{
+			name: "map creation metadata",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Maps["faketcp_session_map"].Tags = []string{"unreviewed"}
+			},
+		},
+		{
+			name: "program kernel name",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_faketcp_egress"].Name = "renamed"
+			},
+		},
+		{
+			name: "program section",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_faketcp_egress"].SectionName = "classifier/other"
+			},
+		},
+		{
+			name: "program type",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_faketcp_egress"].Type = ebpf.XDP
+			},
+		},
+		{
+			name: "program interface",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_faketcp_egress"].Ifindex = 1
+			},
+		},
+		{
+			name: "program attach type",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_faketcp_egress"].AttachType = ebpf.AttachCGroupInetEgress
+			},
+		},
+		{
+			name: "program attach name",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_faketcp_egress"].AttachTo = "unreviewed"
+			},
+		},
+		{
+			name: "program attach target",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_faketcp_egress"].AttachTarget = new(ebpf.Program)
+			},
+		},
+		{
+			name: "program flags",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_faketcp_egress"].Flags = 1
+			},
+		},
+		{
+			name: "program kernel version",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_faketcp_egress"].KernelVersion = 1
+			},
+		},
+		{
+			name: "program license",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_faketcp_egress"].License = "GPL"
+			},
+		},
+		{
+			name: "program byte order",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_faketcp_egress"].ByteOrder = binary.BigEndian
+			},
+		},
+		{
+			name: "program instructions",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_faketcp_egress"].Instructions = nil
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			spec := canonicalExperimentalCollectionSpec()
+			tt.mutate(spec)
+			if err := validateExperimentalExtensionManifest(spec); err == nil {
+				t.Fatal("manifest drift was accepted")
+			}
+		})
+	}
+}
+
+func canonicalExperimentalCollectionSpec() *ebpf.CollectionSpec {
+	spec := canonicalPinnedMapCollectionSpec()
+	for _, descriptor := range experimentalMapDescriptors() {
+		spec.Maps[descriptor.name] = &ebpf.MapSpec{
+			Name:       descriptor.name,
+			Type:       descriptor.mapType,
+			KeySize:    descriptor.keySize,
+			ValueSize:  descriptor.valueSize,
+			MaxEntries: descriptor.maxEntries,
+			Flags:      descriptor.flags,
+			Pinning:    ebpf.PinNone,
+		}
+	}
+	for _, descriptor := range experimentalProgramDescriptors() {
+		spec.Programs[descriptor.name] = &ebpf.ProgramSpec{
+			Name:          descriptor.name,
+			Type:          descriptor.programType,
+			Ifindex:       descriptor.ifindex,
+			AttachType:    descriptor.attachType,
+			AttachTo:      descriptor.attachTo,
+			SectionName:   descriptor.sectionName,
+			Instructions:  asm.Instructions{asm.Return()},
+			Flags:         descriptor.flags,
+			License:       descriptor.license,
+			KernelVersion: descriptor.kernelVersion,
+			ByteOrder:     binary.LittleEndian,
+		}
+	}
+	return spec
 }
