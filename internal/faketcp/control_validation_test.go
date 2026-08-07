@@ -45,20 +45,28 @@ func TestValidateIPv4TCPControlRejectsBadChecksumAndWindowWithoutDelete(t *testi
 			want: "TCP checksum",
 		},
 		{
-			name: "out-of-window sequence",
+			name: "non-exact RST sequence inside receive window",
+			mutate: func(packet []byte, state abi.FakeTCPSessionValue) {
+				binary.BigEndian.PutUint32(packet[24:28], state.RXSequence+1)
+				setTCPChecksum(packet)
+			},
+			want: "exactly match",
+		},
+		{
+			name: "out-of-window RST sequence",
 			mutate: func(packet []byte, state abi.FakeTCPSessionValue) {
 				binary.BigEndian.PutUint32(packet[24:28], state.RXSequence+uint32(state.Window)+1)
 				setTCPChecksum(packet)
 			},
-			want: "receive window",
+			want: "exactly match",
 		},
 		{
-			name: "out-of-window acknowledgement",
+			name: "non-exact RST acknowledgement",
 			mutate: func(packet []byte, state abi.FakeTCPSessionValue) {
-				binary.BigEndian.PutUint32(packet[28:32], state.TXSequence+1)
+				binary.BigEndian.PutUint32(packet[28:32], state.TXSequence-1)
 				setTCPChecksum(packet)
 			},
-			want: "send window",
+			want: "exactly match",
 		},
 	}
 	for _, test := range tests {
@@ -108,6 +116,21 @@ func TestValidZeroTCPChecksumFieldIsNotRejectedByFieldValue(t *testing.T) {
 	}
 	if _, found := store.values[flow]; found || store.deleteAttempts != 1 {
 		t.Fatalf("validated close delete result: found=%t attempts=%d", found, store.deleteAttempts)
+	}
+}
+
+func TestFINUsesReceiveWindowAndRequiresAcknowledgement(t *testing.T) {
+	_, _, flow, state := establishedControlTestSession(t)
+	packet := buildIPv4TCPControl(flow, state, FlagFIN|FlagACK, 1234)
+	binary.BigEndian.PutUint32(packet[24:28], state.RXSequence+1)
+	setTCPChecksum(packet)
+	if _, err := ValidateIPv4TCPControl(packet, flow, state); err != nil {
+		t.Fatalf("in-window acknowledged FIN rejected: %v", err)
+	}
+	packet[33] = FlagFIN
+	setTCPChecksum(packet)
+	if _, err := ValidateIPv4TCPControl(packet, flow, state); err == nil || !strings.Contains(err.Error(), "must acknowledge") {
+		t.Fatalf("unacknowledged FIN error=%v", err)
 	}
 }
 

@@ -65,7 +65,8 @@ func ValidateIPv4TCPControl(packet []byte, flow abi.FakeTCPSessionKey, session a
 		return ValidatedControl{}, errors.New("faketcp close TCP checksum is invalid")
 	}
 	flags := tcp[13]
-	if flags&(FlagRST|FlagFIN) == 0 || flags&FlagSYN != 0 || len(tcp) != tcpHeaderLength {
+	closeFlags := flags & (FlagRST | FlagFIN)
+	if (closeFlags != FlagRST && closeFlags != FlagFIN) || flags&FlagSYN != 0 || len(tcp) != tcpHeaderLength {
 		return ValidatedControl{}, errors.New("faketcp close must be a payload-free RST or FIN without SYN")
 	}
 	if flags&FlagFIN != 0 && flags&FlagACK == 0 {
@@ -73,11 +74,24 @@ func ValidateIPv4TCPControl(packet []byte, flow abi.FakeTCPSessionKey, session a
 	}
 	sequence := binary.BigEndian.Uint32(tcp[4:8])
 	acknowledgement := binary.BigEndian.Uint32(tcp[8:12])
-	if !sequenceInReceiveWindow(sequence, session.RXSequence, session.Window) {
-		return ValidatedControl{}, errors.New("faketcp close sequence is outside the BPF receive window")
-	}
-	if flags&FlagACK != 0 && !acknowledgementInSendWindow(acknowledgement, session.LocalISN+1, session.TXSequence) {
-		return ValidatedControl{}, errors.New("faketcp close acknowledgement is outside the BPF send window")
+	if closeFlags == FlagRST {
+		// A reset is destructive, so apply the RFC 5961 exact-next-sequence
+		// rule rather than accepting any guess within a 64K receive window.
+		// This prototype drops non-exact resets; a future implementation may
+		// add a challenge ACK without weakening deletion authority.
+		if sequence != session.RXSequence {
+			return ValidatedControl{}, errors.New("faketcp RST sequence does not exactly match the BPF receive sequence")
+		}
+		if flags&FlagACK != 0 && acknowledgement != session.TXSequence {
+			return ValidatedControl{}, errors.New("faketcp RST acknowledgement does not exactly match the BPF send sequence")
+		}
+	} else {
+		if !sequenceInReceiveWindow(sequence, session.RXSequence, session.Window) {
+			return ValidatedControl{}, errors.New("faketcp FIN sequence is outside the BPF receive window")
+		}
+		if !acknowledgementInSendWindow(acknowledgement, session.LocalISN+1, session.TXSequence) {
+			return ValidatedControl{}, errors.New("faketcp FIN acknowledgement is outside the BPF send window")
+		}
 	}
 	segment := Segment{Flags: flags, Sequence: sequence, Acknowledgement: acknowledgement}
 	return ValidatedControl{flow: flow, segment: segment, session: session}, nil
