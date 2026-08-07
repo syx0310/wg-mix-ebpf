@@ -127,7 +127,47 @@ func testEngine(t *testing.T, mutate func(*Options)) (*Engine, *fakeClock) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// Ordinary state-machine tests start after one full global refill horizon.
+	// Dedicated restart tests below exercise New's zero-budget fail-safe edge.
+	clock.Add(opts.SYNRateInterval * time.Duration(opts.SYNBurst))
 	return engine, clock
+}
+
+func TestNewAndRepeatedRestartNeverGrantImmediateSYNBurst(t *testing.T) {
+	seed, clock := testEngine(t, nil)
+	options := seed.opts
+	for restart := 0; restart < 3; restart++ {
+		engine, err := New(options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		flow := testFlow(uint16(31000 + restart))
+		actions, err := engine.Inbound(flow, Segment{Flags: FlagSYN, Sequence: uint32(restart + 1)})
+		if err != nil || len(actions) != 1 || actions[0].Reason != "syn-rate-global" {
+			t.Fatalf("restart %d minted admission budget: actions=%#v err=%v", restart, actions, err)
+		}
+		if len(engine.synSources) != 0 || engine.synSourceLRU.Len() != 0 {
+			t.Fatalf("restart %d populated source ledger while globally empty", restart)
+		}
+	}
+
+	engine, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock.Add(options.SYNRateInterval)
+	flow := testFlow(32000)
+	if actions, err := engine.Inbound(flow, Segment{Flags: FlagSYN, Sequence: 10}); err != nil || actions[0].Reason != "accept-syn" {
+		t.Fatalf("same engine did not accrue one interval: actions=%#v err=%v", actions, err)
+	}
+	restarted, err := New(options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow = testFlow(32001)
+	if actions, err := restarted.Inbound(flow, Segment{Flags: FlagSYN, Sequence: 11}); err != nil || actions[0].Reason != "syn-rate-global" {
+		t.Fatalf("restart restored consumed/full burst: actions=%#v err=%v", actions, err)
+	}
 }
 
 func TestMonotonicClockContractRejectsDomainMismatchAndFallback(t *testing.T) {

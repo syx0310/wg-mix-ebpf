@@ -52,6 +52,7 @@ func TestFakeTCPActivationCannotBeEnabledWithoutEveryAcceptanceCapability(t *tes
 	for _, capability := range []string{
 		"XDP link ownership/rollback and libxdp chaining",
 		"atomic managed-interface/port policy population",
+		"persistent/reload-safe SYN admission checkpoint backend",
 		"ip_summed/CHECKSUM_PARTIAL identification",
 		"CHECKSUM_PARTIAL materialize/complete",
 		"checksum offset and skb metadata reset",

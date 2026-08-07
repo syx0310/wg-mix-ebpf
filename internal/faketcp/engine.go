@@ -143,8 +143,9 @@ type synSourceState struct {
 }
 
 type tokenBucket struct {
-	tokens     int
-	lastRefill time.Time
+	tokens      int
+	lastRefill  time.Time
+	initialized bool
 }
 
 type Engine struct {
@@ -155,8 +156,12 @@ type Engine struct {
 	pendingBytes int
 	halfOpen     int
 	globalSYNs   tokenBucket
-	synSources   map[synSourceKey]*synSourceState
-	synSourceLRU *list.List
+	// admissionEpoch is local to one Engine lifetime. New engines begin with
+	// zero tokens at this epoch; recreation can only discard accumulated
+	// budget and can never mint a fresh burst.
+	admissionEpoch time.Time
+	synSources     map[synSourceKey]*synSourceState
+	synSourceLRU   *list.List
 	// Counted under mu and used by complexity-contract tests. It also makes
 	// accidental replacement of bounded pruning with a full scan observable.
 	synSourcePruneVisits uint64
@@ -208,11 +213,14 @@ func New(options Options) (*Engine, error) {
 	if options.Window == 0 {
 		options.Window = 65535
 	}
+	admissionEpoch := options.Now()
 	return &Engine{
-		opts:         options,
-		sessions:     make(map[abi.FakeTCPSessionKey]*session),
-		synSources:   make(map[synSourceKey]*synSourceState),
-		synSourceLRU: list.New(),
+		opts:           options,
+		sessions:       make(map[abi.FakeTCPSessionKey]*session),
+		globalSYNs:     tokenBucket{lastRefill: admissionEpoch, initialized: true},
+		admissionEpoch: admissionEpoch,
+		synSources:     make(map[synSourceKey]*synSourceState),
+		synSourceLRU:   list.New(),
 	}, nil
 }
 
@@ -717,7 +725,13 @@ func (e *Engine) lookupOrCreateSYNSource(key synSourceKey, now time.Time) (*synS
 	if len(e.synSources) >= e.opts.SYNSourceLedgerCapacity {
 		return nil, "syn-source-ledger-capacity"
 	}
-	source := &synSourceState{lastActivity: now}
+	// New sources share the engine admission epoch. A source first observed
+	// after sufficient uptime may use accrued budget, but recreating Engine
+	// resets that epoch and never grants an immediate burst.
+	source := &synSourceState{
+		bucket:       tokenBucket{lastRefill: e.admissionEpoch, initialized: true},
+		lastActivity: now,
+	}
 	source.lruElement = e.synSourceLRU.PushFront(key)
 	e.synSources[key] = source
 	return source, ""
@@ -760,8 +774,10 @@ func (e *Engine) pruneExpiredSYNSources(now time.Time, budget int) {
 }
 
 func refillTokenBucket(bucket *tokenBucket, now time.Time, interval time.Duration, burst int) {
-	if bucket.lastRefill.IsZero() {
-		bucket.tokens = burst
+	if !bucket.initialized {
+		// Fail safe for zero-value buckets restored without a checkpoint. The
+		// first observation starts time accounting at zero budget.
+		bucket.initialized = true
 		bucket.lastRefill = now
 		return
 	}

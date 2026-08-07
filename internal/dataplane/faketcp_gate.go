@@ -15,6 +15,7 @@ const (
 	fakeTCPCapabilityManagedIngressParser
 	fakeTCPCapabilitySingleWriterState
 	fakeTCPCapabilityHalfOpenProtection
+	fakeTCPCapabilityAdmissionCheckpoint
 	fakeTCPCapabilityBPFControlAdmission
 	fakeTCPCapabilityValidatedCloseControl
 	fakeTCPCapabilityL3Parser
@@ -34,6 +35,7 @@ const fakeTCPRequiredCapabilities = fakeTCPCapabilityBaselineIsolation |
 	fakeTCPCapabilityManagedIngressParser |
 	fakeTCPCapabilitySingleWriterState |
 	fakeTCPCapabilityHalfOpenProtection |
+	fakeTCPCapabilityAdmissionCheckpoint |
 	fakeTCPCapabilityBPFControlAdmission |
 	fakeTCPCapabilityValidatedCloseControl |
 	fakeTCPCapabilityL3Parser |
@@ -63,6 +65,7 @@ var fakeTCPRequirements = []struct {
 	{fakeTCPCapabilityManagedIngressParser, "managed-port IPv4/IPv6 fail-closed parser"},
 	{fakeTCPCapabilitySingleWriterState, "single-writer established session state"},
 	{fakeTCPCapabilityHalfOpenProtection, "bounded and rate-limited userspace half-open state"},
+	{fakeTCPCapabilityAdmissionCheckpoint, "persistent/reload-safe SYN admission checkpoint backend"},
 	{fakeTCPCapabilityBPFControlAdmission, "BPF control-event admission/coalescing under SYN flood"},
 	{fakeTCPCapabilityValidatedCloseControl, "RST/FIN full IPv4/TCP checksum and receive-window validation"},
 	{fakeTCPCapabilityL3Parser, "parser:l3 FakeTCP policy and attachment support"},
