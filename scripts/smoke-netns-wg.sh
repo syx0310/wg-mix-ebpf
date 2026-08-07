@@ -607,10 +607,10 @@ inspect_private_bpffs_mount_id() {
   if ! observed="$(awk \
     -v target="${BPFFS_DIR}" \
     -v expected_source="${BPFFS_SOURCE}" '
-      function separator_index(   index) {
-        for (index = 6; index <= NF; index++) {
-          if ($index == "-") {
-            return index
+      function separator_index(   field_index) {
+        for (field_index = 6; field_index <= NF; field_index++) {
+          if ($field_index == "-") {
+            return field_index
           }
         }
         return 0
@@ -644,10 +644,10 @@ inspect_private_bpffs_mount_id() {
         if (target_count != 1 || invalid || nested) {
           exit 1
         }
-        for (index = 1; index <= other_bpf_count; index++) {
-          if (target_id == other_bpf_id[index] ||
-              (target_device == other_bpf_device[index] &&
-               target_root == other_bpf_root[index])) {
+        for (other_index = 1; other_index <= other_bpf_count; other_index++) {
+          if (target_id == other_bpf_id[other_index] ||
+              (target_device == other_bpf_device[other_index] &&
+               target_root == other_bpf_root[other_index])) {
             exit 1
           }
         }

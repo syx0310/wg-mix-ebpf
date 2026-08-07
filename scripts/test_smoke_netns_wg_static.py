@@ -288,6 +288,40 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertLess(owner_marker, seal)
         self.assertLess(seal, first_reload)
 
+    def test_private_bpffs_mountinfo_awk_accepts_positive_fixture(self) -> None:
+        start_marker = '-v expected_source="${BPFFS_SOURCE}" \'\n'
+        program_start = self.source.index(start_marker) + len(start_marker)
+        program_end = self.source.index(
+            "\n    ' /proc/self/mountinfo",
+            program_start,
+        )
+        awk_program = self.source[program_start:program_end]
+        target = "/run/wg-mix-ebpf-test/private-bpffs"
+        mountinfo = (
+            "25 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"
+            "41 25 0:30 / /sys/fs/bpf rw,nosuid,nodev,noexec "
+            "- bpf bpf rw,mode=700\n"
+            f"77 25 0:31 / {target} rw,nosuid,nodev,noexec "
+            "shared:77 - bpf bpf rw,mode=700\n"
+        )
+        completed = subprocess.run(
+            [
+                "/usr/bin/awk",
+                "-v",
+                f"target={target}",
+                "-v",
+                "expected_source=bpf",
+                awk_program,
+            ],
+            input=mountinfo,
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout, "77\n")
+
     def test_pin_resources_are_validated_after_detach_before_exact_removal(self) -> None:
         detach_b = self.source.index('teardown_step "detach agent B pin=${PINB}"')
         owner_absent_a = self.source.index(
