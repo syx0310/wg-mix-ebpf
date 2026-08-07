@@ -174,6 +174,15 @@ func (transaction *fakeTCPPolicyGenerationTransaction) assertHeldLocked(ctx cont
 	return nil
 }
 
+func (transaction *fakeTCPPolicyGenerationTransaction) assertHeld(ctx context.Context) error {
+	if transaction == nil {
+		return fmt.Errorf("%w: transaction is nil", errFakeTCPPolicyGenerationLeaseRequired)
+	}
+	transaction.mu.Lock()
+	defer transaction.mu.Unlock()
+	return transaction.assertHeldLocked(ctx)
+}
+
 // Close releases the transaction's retained lifecycle lease. It refuses to
 // release ownership while a stage can still require rollback.
 func (transaction *fakeTCPPolicyGenerationTransaction) Close() error {
