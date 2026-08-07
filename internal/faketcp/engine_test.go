@@ -363,6 +363,71 @@ func TestBoundedSYNSourceLedgerPreservesKnownLegitimateSource(t *testing.T) {
 	}
 }
 
+func TestGlobalSYNRejectionDoesNotTouchOrAllocateSourceLedger(t *testing.T) {
+	engine, clock := testEngine(t, func(options *Options) {
+		options.SYNBurst = 1
+		options.SYNBurstPerSource = 1
+		options.SYNSourceLedgerCapacity = 16384
+	})
+	first := testFlow(31001)
+	if actions, err := engine.Inbound(first, Segment{Flags: FlagSYN, Sequence: 1}); err != nil || actions[0].Reason != "accept-syn" {
+		t.Fatalf("first SYN actions=%#v err=%v", actions, err)
+	}
+	populateExpiredSYNSourceLedger(engine, clock.now, engine.opts.SYNSourceLedgerCapacity)
+	beforeSize := len(engine.synSources)
+	beforeLRU := engine.synSourceLRU.Len()
+	beforeVisits := engine.synSourcePruneVisits
+	rejected := testFlow(65000)
+	rejected.RemoteIPv4 += 1 << 24
+	actions, err := engine.Inbound(rejected, Segment{Flags: FlagSYN, Sequence: 2})
+	if err != nil || len(actions) != 1 || actions[0].Reason != "syn-rate-global" {
+		t.Fatalf("exhausted global limiter actions=%#v err=%v", actions, err)
+	}
+	key := synSourceKey{remoteIPv4: rejected.RemoteIPv4, underlayIndex: rejected.UnderlayIndex}
+	if _, created := engine.synSources[key]; created || len(engine.synSources) != beforeSize ||
+		engine.synSourceLRU.Len() != beforeLRU || engine.synSourcePruneVisits != beforeVisits {
+		t.Fatalf("global rejection touched ledger: created=%t size=%d/%d lru=%d/%d visits=%d/%d",
+			created, len(engine.synSources), beforeSize, engine.synSourceLRU.Len(), beforeLRU,
+			engine.synSourcePruneVisits, beforeVisits)
+	}
+}
+
+func TestSYNSourceExpiryWorkIsConstantForFullLedger(t *testing.T) {
+	engine, clock := testEngine(t, func(options *Options) {
+		options.SYNBurst = 1
+		options.SYNBurstPerSource = 1
+		options.SYNSourceLedgerCapacity = 16384
+	})
+	populateExpiredSYNSourceLedger(engine, clock.now, engine.opts.SYNSourceLedgerCapacity)
+	beforeVisits := engine.synSourcePruneVisits
+	flow := testFlow(65001)
+	flow.RemoteIPv4 += 1 << 24
+	actions, err := engine.Inbound(flow, Segment{Flags: FlagSYN, Sequence: 1})
+	if err != nil || len(actions) != 1 || actions[0].Reason != "accept-syn" {
+		t.Fatalf("bounded prune admission actions=%#v err=%v", actions, err)
+	}
+	visits := engine.synSourcePruneVisits - beforeVisits
+	if visits != synSourcePruneBudget {
+		t.Fatalf("full 16K ledger expiry visits=%d, want fixed budget %d", visits, synSourcePruneBudget)
+	}
+	wantSize := engine.opts.SYNSourceLedgerCapacity - synSourcePruneBudget + 1
+	if len(engine.synSources) != wantSize {
+		t.Fatalf("ledger size after bounded cleanup=%d, want %d", len(engine.synSources), wantSize)
+	}
+}
+
+func populateExpiredSYNSourceLedger(engine *Engine, now time.Time, target int) {
+	for candidate := uint32(1); len(engine.synSources) < target; candidate++ {
+		key := synSourceKey{remoteIPv4: candidate, underlayIndex: 99}
+		if _, exists := engine.synSources[key]; exists {
+			continue
+		}
+		source := &synSourceState{lastActivity: now.Add(-engine.opts.SYNSourceLedgerTTL - time.Second)}
+		source.lruElement = engine.synSourceLRU.PushBack(key)
+		engine.synSources[key] = source
+	}
+}
+
 func TestSimultaneousOpen(t *testing.T) {
 	engine, _ := testEngine(t, nil)
 	flow := testFlow(31001)

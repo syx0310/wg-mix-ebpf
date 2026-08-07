@@ -20,6 +20,10 @@ const (
 	FlagRST uint8 = 1 << 2
 	FlagPSH uint8 = 1 << 3
 	FlagACK uint8 = 1 << 4
+
+	// Each admitted SYN performs at most this many expiry visits. This keeps
+	// attacker-controlled ingress work independent of the 16K ledger size.
+	synSourcePruneBudget = 4
 )
 
 type Options struct {
@@ -153,6 +157,9 @@ type Engine struct {
 	globalSYNs   tokenBucket
 	synSources   map[synSourceKey]*synSourceState
 	synSourceLRU *list.List
+	// Counted under mu and used by complexity-contract tests. It also makes
+	// accidental replacement of bounded pruning with a full scan observable.
+	synSourcePruneVisits uint64
 }
 
 type engineCheckpoint struct {
@@ -342,7 +349,7 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32, v
 	var synSource synSourceKey
 	if seg.Flags&FlagSYN != 0 {
 		var rejection string
-		synSource, rejection = e.chargeInboundSYN(flow, now)
+		synSource, rejection = e.observeSYN(flow, now)
 		if rejection != "" {
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: rejection}}, nil
 		}
@@ -661,34 +668,27 @@ func (e *Engine) enqueue(s *session, packet PendingPacket) bool {
 	return true
 }
 
-func (e *Engine) chargeInboundSYN(flow abi.FakeTCPSessionKey, now time.Time) (synSourceKey, string) {
+// observeSYN applies the O(1) global limiter before any source-ledger lookup,
+// expiry work or allocation. A globally rejected flood therefore cannot
+// consume source memory or turn the bounded ledger into a CPU multiplier.
+func (e *Engine) observeSYN(flow abi.FakeTCPSessionKey, now time.Time) (synSourceKey, string) {
 	refillTokenBucket(&e.globalSYNs, now, e.opts.SYNRateInterval, e.opts.SYNBurst)
+	if e.globalSYNs.tokens == 0 {
+		return synSourceKey{}, "syn-rate-global"
+	}
+	// Never refund this token after a per-source, ledger or half-open failure.
+	e.globalSYNs.tokens--
+
 	key := synSourceKey{remoteIPv4: flow.RemoteIPv4, underlayIndex: flow.UnderlayIndex}
 	source, rejection := e.lookupOrCreateSYNSource(key, now)
 	if rejection != "" {
-		// A structurally valid SYN consumes any available global token even
-		// when its source cannot enter the bounded ledger. Tokens are never
-		// refunded on a later admission failure.
-		if e.globalSYNs.tokens > 0 {
-			e.globalSYNs.tokens--
-		}
 		return synSourceKey{}, rejection
 	}
 	refillTokenBucket(&source.bucket, now, e.opts.SYNRateInterval, e.opts.SYNBurstPerSource)
-	globalAvailable := e.globalSYNs.tokens > 0
-	sourceAvailable := source.bucket.tokens > 0
-	if globalAvailable {
-		e.globalSYNs.tokens--
-	}
-	if sourceAvailable {
-		source.bucket.tokens--
-	}
-	if !globalAvailable {
-		return synSourceKey{}, "syn-rate-global"
-	}
-	if !sourceAvailable {
+	if source.bucket.tokens == 0 {
 		return synSourceKey{}, "syn-rate-source"
 	}
+	source.bucket.tokens--
 	return key, ""
 }
 
@@ -709,7 +709,7 @@ func (e *Engine) reserveInboundHalfOpen(key synSourceKey) string {
 }
 
 func (e *Engine) lookupOrCreateSYNSource(key synSourceKey, now time.Time) (*synSourceState, string) {
-	e.pruneExpiredSYNSources(now)
+	e.pruneExpiredSYNSources(now, synSourcePruneBudget)
 	if source := e.synSources[key]; source != nil {
 		e.touchSYNSource(source, now)
 		return source, ""
@@ -730,17 +730,32 @@ func (e *Engine) touchSYNSource(source *synSourceState, now time.Time) {
 	}
 }
 
-func (e *Engine) pruneExpiredSYNSources(now time.Time) {
-	for element := e.synSourceLRU.Back(); element != nil; {
-		previous := element.Prev()
+func (e *Engine) pruneExpiredSYNSources(now time.Time, budget int) {
+	for visited := 0; visited < budget; visited++ {
+		element := e.synSourceLRU.Back()
+		if element == nil {
+			return
+		}
+		e.synSourcePruneVisits++
 		key := element.Value.(synSourceKey)
 		source := e.synSources[key]
-		if source != nil && source.halfOpen == 0 &&
-			!now.Before(source.lastActivity.Add(e.opts.SYNSourceLedgerTTL)) {
+		if source == nil {
+			e.synSourceLRU.Remove(element)
+			continue
+		}
+		if now.Before(source.lastActivity.Add(e.opts.SYNSourceLedgerTTL)) {
+			// LRU order is also last-activity order, so every newer entry is
+			// necessarily unexpired.
+			return
+		}
+		if source.halfOpen == 0 {
 			delete(e.synSources, key)
 			e.synSourceLRU.Remove(element)
+			continue
 		}
-		element = previous
+		// Active state cannot be evicted. Refresh/move it so one expired active
+		// tail cannot permanently obstruct amortized cleanup behind it.
+		e.touchSYNSource(source, now)
 	}
 }
 
