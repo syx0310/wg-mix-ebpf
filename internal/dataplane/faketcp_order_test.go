@@ -359,6 +359,7 @@ func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
 		"case CHECKSUM_NONE:",
 		"case CHECKSUM_PARTIAL:",
 		"default:",
+		"skb_transport_header_was_set(skb)",
 		"skb_checksum_start_offset(skb) != transport_offset",
 		"skb->csum_offset != offsetof(struct udphdr, check)",
 		"skb_reset_csum_not_inet(skb)",
@@ -369,12 +370,21 @@ func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
 			t.Fatalf("checksum kfunc hard-gate contract missing %q", want)
 		}
 	}
+	networkIdentity := strings.Index(module, "network_offset != actual_network_offset")
+	commonUDPBytes := strings.Index(module, "ntohs(udp->len) != udp_length")
 	noneCase := strings.Index(module, "case CHECKSUM_NONE:")
+	noneReturn := strings.Index(module, "return WG_MIX_FAKETCP_CSUM_MATERIALIZED;")
 	partialCase := strings.Index(module, "case CHECKSUM_PARTIAL:")
+	transportHeaderRequired := strings.Index(module, "if (!skb_transport_header_was_set(skb))")
+	transportIdentity := strings.Index(module, "transport_offset != actual_transport_offset")
 	partialOffsets := strings.Index(module, "skb_checksum_start_offset(skb) != transport_offset")
-	if noneCase < 0 || partialCase < 0 || partialOffsets < 0 ||
-		noneCase >= partialCase || partialCase >= partialOffsets {
-		t.Fatal("CHECKSUM_NONE pass-through and CHECKSUM_PARTIAL metadata validation are misordered")
+	if networkIdentity < 0 || commonUDPBytes < 0 || noneCase < 0 || noneReturn < 0 || partialCase < 0 ||
+		transportHeaderRequired < 0 || transportIdentity < 0 || partialOffsets < 0 ||
+		!(networkIdentity < commonUDPBytes && commonUDPBytes < noneCase &&
+			noneCase < noneReturn && noneReturn < partialCase &&
+			partialCase < transportHeaderRequired && transportHeaderRequired < transportIdentity &&
+			transportIdentity < partialOffsets) {
+		t.Fatal("CHECKSUM_NONE must return without a transport header; CHECKSUM_PARTIAL must require exact transport/checksum metadata")
 	}
 	materializedReturn := strings.Index(module, "if (ret == WG_MIX_FAKETCP_CSUM_MATERIALIZED)")
 	partialReset := strings.Index(module, "skb_reset_csum_not_inet(skb)")
@@ -424,27 +434,33 @@ func TestFakeTCPChecksumMetadataAcceptanceContract(t *testing.T) {
 		checksumPartial     = uint8(3)
 	)
 	tests := []struct {
-		name            string
-		mode            uint8
-		gso             bool
-		transportOffset int
-		checksumStart   int
-		checksumOffset  int
-		want            bool
+		name                  string
+		mode                  uint8
+		gso                   bool
+		transportHeaderSet    bool
+		transportOffset       int
+		actualTransportOffset int
+		checksumStart         int
+		checksumOffset        int
+		want                  bool
 	}{
-		{name: "raw-reinject-none", mode: checksumNone, transportOffset: 34, want: true},
-		{name: "wireguard-partial", mode: checksumPartial, transportOffset: 34, checksumStart: 34, checksumOffset: 6, want: true},
-		{name: "partial-wrong-start", mode: checksumPartial, transportOffset: 34, checksumStart: 33, checksumOffset: 6},
-		{name: "partial-wrong-offset", mode: checksumPartial, transportOffset: 34, checksumStart: 34, checksumOffset: 7},
+		{name: "test-run-none-without-transport-header", mode: checksumNone, transportOffset: 34, want: true},
+		{name: "raw-reinject-none-ignores-transport-header", mode: checksumNone, transportHeaderSet: true, transportOffset: 34, actualTransportOffset: 33, want: true},
+		{name: "wireguard-partial", mode: checksumPartial, transportHeaderSet: true, transportOffset: 34, actualTransportOffset: 34, checksumStart: 34, checksumOffset: 6, want: true},
+		{name: "partial-missing-transport-header", mode: checksumPartial, transportOffset: 34, actualTransportOffset: 34, checksumStart: 34, checksumOffset: 6},
+		{name: "partial-wrong-transport-header", mode: checksumPartial, transportHeaderSet: true, transportOffset: 34, actualTransportOffset: 33, checksumStart: 34, checksumOffset: 6},
+		{name: "partial-wrong-start", mode: checksumPartial, transportHeaderSet: true, transportOffset: 34, actualTransportOffset: 34, checksumStart: 33, checksumOffset: 6},
+		{name: "partial-wrong-offset", mode: checksumPartial, transportHeaderSet: true, transportOffset: 34, actualTransportOffset: 34, checksumStart: 34, checksumOffset: 7},
 		{name: "none-gso", mode: checksumNone, gso: true, transportOffset: 34},
-		{name: "partial-gso", mode: checksumPartial, gso: true, transportOffset: 34, checksumStart: 34, checksumOffset: 6},
+		{name: "partial-gso", mode: checksumPartial, gso: true, transportHeaderSet: true, transportOffset: 34, actualTransportOffset: 34, checksumStart: 34, checksumOffset: 6},
 		{name: "complete", mode: checksumComplete, transportOffset: 34},
 		{name: "unnecessary", mode: checksumUnnecessary, transportOffset: 34},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			got := fakeTCPChecksumMetadataAccepted(
-				test.mode, test.gso, test.transportOffset,
+				test.mode, test.gso, test.transportHeaderSet,
+				test.transportOffset, test.actualTransportOffset,
 				test.checksumStart, test.checksumOffset,
 			)
 			if got != test.want {
@@ -457,7 +473,9 @@ func TestFakeTCPChecksumMetadataAcceptanceContract(t *testing.T) {
 func fakeTCPChecksumMetadataAccepted(
 	mode uint8,
 	gso bool,
+	transportHeaderSet bool,
 	transportOffset int,
+	actualTransportOffset int,
 	checksumStart int,
 	checksumOffset int,
 ) bool {
@@ -468,7 +486,9 @@ func fakeTCPChecksumMetadataAccepted(
 	case 0: // CHECKSUM_NONE: raw reinjection already materialized the packet.
 		return true
 	case 3: // CHECKSUM_PARTIAL: WireGuard/UDP tunnel offload metadata is exact.
-		return checksumStart == transportOffset && checksumOffset == 6
+		return transportHeaderSet &&
+			actualTransportOffset == transportOffset &&
+			checksumStart == transportOffset && checksumOffset == 6
 	default:
 		return false
 	}

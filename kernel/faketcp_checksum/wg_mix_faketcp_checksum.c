@@ -41,14 +41,9 @@ static int wg_mix_faketcp_validate_udp_checksum(struct sk_buff *skb,
 		return -EOPNOTSUPP;
 	if (skb->protocol != htons(ETH_P_IP))
 		return -EPROTONOSUPPORT;
-	if (!skb_transport_header_was_set(skb))
-		return -EPROTO;
 
 	actual_network_offset = skb_network_offset(skb);
-	actual_transport_offset = skb_transport_offset(skb);
-	if (actual_network_offset < 0 || actual_transport_offset < 0 ||
-	    network_offset != actual_network_offset ||
-	    transport_offset != actual_transport_offset)
+	if (actual_network_offset < 0 || network_offset != actual_network_offset)
 		return -EPROTO;
 	if (network_offset > skb->len || transport_offset > skb->len ||
 	    transport_offset - network_offset != sizeof(struct iphdr) ||
@@ -79,6 +74,13 @@ static int wg_mix_faketcp_validate_udp_checksum(struct sk_buff *skb,
 	default:
 		return -EPROTO;
 	}
+	/* CHECKSUM_NONE is byte-validated above; PARTIAL also needs exact metadata. */
+	if (!skb_transport_header_was_set(skb))
+		return -EPROTO;
+	actual_transport_offset = skb_transport_offset(skb);
+	if (actual_transport_offset < 0 ||
+	    transport_offset != actual_transport_offset)
+		return -EPROTO;
 	if (skb_csum_is_sctp(skb))
 		return -EPROTO;
 	if (skb_checksum_start_offset(skb) != transport_offset ||
