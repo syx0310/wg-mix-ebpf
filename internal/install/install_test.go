@@ -10,6 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -771,6 +772,10 @@ func TestUninstallRemovesValidatedSystemdEnableLink(t *testing.T) {
 	if err := os.Symlink("../wg-mix-ebpf.service", enableLink); err != nil {
 		t.Fatal(err)
 	}
+	enableIdentity, err := os.Lstat(enableLink)
+	if err != nil {
+		t.Fatal(err)
+	}
 	setCleanupTestEnvironment(t, layout)
 	installFakeNft(t, "")
 	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
@@ -782,7 +787,7 @@ func TestUninstallRemovesValidatedSystemdEnableLink(t *testing.T) {
 		filepath.Join(lifecycleRoot, "maintenance.gate"),
 	)
 
-	_, err := Uninstall(ctx, Options{
+	result, err := Uninstall(ctx, Options{
 		ConfigPath: layout.ConfigPath,
 		System:     "systemd",
 		Yes:        true,
@@ -796,8 +801,149 @@ func TestUninstallRemovesValidatedSystemdEnableLink(t *testing.T) {
 	if _, err := os.Lstat(enableLink); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("uninstall retained validated systemd enable link: %v", err)
 	}
+	evidencePaths := systemdQuarantineEvidencePaths(t, layout)
+	if len(evidencePaths) != 1 {
+		t.Fatalf("retained enable-link evidence = %v, want exactly one", evidencePaths)
+	}
+	assertSameSymlink(
+		t,
+		evidencePaths[0],
+		systemdEnableLinkTarget,
+		enableIdentity,
+		"retained systemd enable-link quarantine evidence",
+	)
+	if !containsAction(
+		result.Actions,
+		"retained systemd enable-link quarantine evidence "+evidencePaths[0],
+	) {
+		t.Fatalf("uninstall plan omitted exact retained evidence: %#v", result.Actions)
+	}
 	if _, err := os.Stat(cleanupManifestPath(layout)); err != nil {
 		t.Fatalf("non-purge uninstall removed ownership marker: %v", err)
+	}
+}
+
+func TestSystemdEnableLinkReplacementAfterFinalQuarantineCheckIsNeverDeleted(
+	t *testing.T,
+) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"systemd-final-quarantine-swap",
+		"systemd",
+	)
+	linkPath := systemdEnableLinkPath(layout)
+	if err := os.MkdirAll(filepath.Dir(linkPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	plan, err := prepareUninstallCleanup(
+		layout,
+		"systemd",
+		false,
+		filepath.Join(t.TempDir(), "daemon.lease"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.close()
+
+	var linkDirectory *cleanupDirectoryPlan
+	for _, directory := range plan.directories {
+		if len(directory.entries) == 1 &&
+			directory.entries[0].path == linkPath {
+			linkDirectory = directory
+			break
+		}
+	}
+	if linkDirectory == nil {
+		t.Fatal("cleanup plan omitted the systemd enable-link entry")
+	}
+
+	type mutationResult struct {
+		ownedIdentity   os.FileInfo
+		foreignIdentity os.FileInfo
+		err             error
+	}
+	var evidencePath string
+	var ownedAway string
+	var ownedIdentity os.FileInfo
+	var foreignIdentity os.FileInfo
+	hookRan := false
+	hook := func(originalPath string, retainedPath string) error {
+		if originalPath != linkPath || hookRan {
+			return fmt.Errorf(
+				"unexpected final quarantine hook path %s retained=%s",
+				originalPath,
+				retainedPath,
+			)
+		}
+		hookRan = true
+		evidencePath = retainedPath
+		ownedAway = retainedPath + ".owned-after-final-check"
+		resultCh := make(chan mutationResult, 1)
+		go func() {
+			var result mutationResult
+			result.ownedIdentity, result.err = os.Lstat(retainedPath)
+			if result.err == nil {
+				result.err = os.Rename(retainedPath, ownedAway)
+			}
+			if result.err == nil {
+				result.err = os.Symlink("../foreign.service", retainedPath)
+			}
+			if result.err == nil {
+				result.foreignIdentity, result.err = os.Lstat(retainedPath)
+			}
+			resultCh <- result
+		}()
+		result := <-resultCh
+		if result.err != nil {
+			return result.err
+		}
+		if result.ownedIdentity == nil || result.foreignIdentity == nil {
+			return errors.New("concurrent quarantine mutation omitted identities")
+		}
+		ownedIdentity = result.ownedIdentity
+		foreignIdentity = result.foreignIdentity
+		return nil
+	}
+	err = linkDirectory.remove(nil, hook, nil)
+	if err == nil ||
+		!strings.Contains(err.Error(), "retained quarantine evidence at") ||
+		!strings.Contains(err.Error(), "no pathname-based unlink or restore") {
+		t.Fatalf("final-check replacement error = %v, want non-destructive retention", err)
+	}
+	if !hookRan {
+		t.Fatal("post-final-check quarantine hook did not run")
+	}
+	if !strings.Contains(err.Error(), evidencePath) {
+		t.Fatalf("retention error = %v, want exact evidence path %s", err, evidencePath)
+	}
+	if _, statErr := os.Lstat(linkPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("original enable-link path reappeared: %v", statErr)
+	}
+	assertSameSymlink(
+		t,
+		evidencePath,
+		"../foreign.service",
+		foreignIdentity,
+		"foreign post-check replacement",
+	)
+	assertSameSymlink(
+		t,
+		ownedAway,
+		systemdEnableLinkTarget,
+		ownedIdentity,
+		"owned post-check quarantine",
+	)
+	if len(linkDirectory.retainedQuarantineEvidence) != 1 ||
+		linkDirectory.retainedQuarantineEvidence[0] != evidencePath {
+		t.Fatalf(
+			"recorded quarantine evidence = %v, want %s",
+			linkDirectory.retainedQuarantineEvidence,
+			evidencePath,
+		)
 	}
 }
 
@@ -851,7 +997,7 @@ func TestSystemdEnableLinkCleanupRejectsPostPreflightReplacement(t *testing.T) {
 					return err
 				}
 				return os.Symlink(test.replacementTarget, linkPath)
-			}, nil)
+			}, nil, nil)
 			if err == nil {
 				t.Fatal("post-preflight systemd enable link replacement was removed")
 			}
@@ -936,7 +1082,7 @@ func TestUninstallWithoutSystemdEnableLinkCompletes(t *testing.T) {
 	}
 	if !containsAction(
 		plan.Actions,
-		"remove the exact validated systemd enable link if present",
+		"atomically quarantine the exact validated systemd enable link if present",
 	) {
 		t.Fatalf("uninstall plan omits enable-link cleanup policy: %#v", plan.Actions)
 	}
@@ -1310,6 +1456,10 @@ func TestUninstallPurgeIsIdempotentWithRetainedLifecycleLease(t *testing.T) {
 
 func TestUninstallPurgeRetainsOwnershipUntilDaemonReloadSucceeds(t *testing.T) {
 	layout := newCleanupTestLayoutForSystem(t, "purge-reload-retry", "systemd")
+	enableLink := systemdEnableLinkPath(layout)
+	if err := os.Symlink(systemdEnableLinkTarget, enableLink); err != nil {
+		t.Fatal(err)
+	}
 	setCleanupTestEnvironment(t, layout)
 	installFakeNft(t, "")
 	commandLog := filepath.Join(t.TempDir(), "systemctl.log")
@@ -1331,6 +1481,17 @@ func TestUninstallPurgeRetainsOwnershipUntilDaemonReloadSucceeds(t *testing.T) {
 	_, err := Uninstall(ctx, opts)
 	if err == nil || !strings.Contains(err.Error(), "daemon-reload") {
 		t.Fatalf("first purge error = %v, want daemon-reload failure", err)
+	}
+	evidencePaths := systemdQuarantineEvidencePaths(t, layout)
+	if len(evidencePaths) != 1 || !strings.Contains(err.Error(), evidencePaths[0]) {
+		t.Fatalf(
+			"failed reload evidence = %v error=%v, want one exact reported path",
+			evidencePaths,
+			err,
+		)
+	}
+	if _, statErr := os.Lstat(enableLink); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("failed daemon-reload restored active systemd enable link: %v", statErr)
 	}
 	unitPath := filepath.Join(layout.SystemdDir, "wg-mix-ebpf.service")
 	if _, err := os.Stat(unitPath); !errors.Is(err, os.ErrNotExist) {
@@ -3691,6 +3852,23 @@ func containsAction(actions []string, substr string) bool {
 		}
 	}
 	return false
+}
+
+func systemdQuarantineEvidencePaths(t *testing.T, layout paths) []string {
+	t.Helper()
+	wantsDir := filepath.Dir(systemdEnableLinkPath(layout))
+	entries, err := os.ReadDir(wantsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var paths []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), cleanupQuarantineNamePrefix) {
+			paths = append(paths, filepath.Join(wantsDir, entry.Name()))
+		}
+	}
+	slices.Sort(paths)
+	return paths
 }
 
 func installFakeNft(t *testing.T, commandLog string) {

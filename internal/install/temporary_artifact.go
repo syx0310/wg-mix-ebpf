@@ -27,14 +27,15 @@ type objectBoundFreshFileHookState struct {
 }
 
 type objectBoundFreshFileSpec struct {
-	parent        *managedCleanupDir
-	name          string
-	path          string
-	kind          string
-	mode          os.FileMode
-	content       []byte
-	beforePublish func(objectBoundFreshFileHookState) error
-	afterPublish  func(objectBoundFreshFileHookState) error
+	parent                *managedCleanupDir
+	name                  string
+	path                  string
+	kind                  string
+	mode                  os.FileMode
+	content               []byte
+	beforePublish         func(objectBoundFreshFileHookState) error
+	afterPublish          func(objectBoundFreshFileHookState) error
+	afterFailedStageCheck func(objectBoundFreshFileHookState) error
 }
 
 type objectBoundFreshFileResult struct {
@@ -724,26 +725,45 @@ func cleanupExclusiveObjectBoundStage(
 			"named stage no longer binds the held publication object",
 		))
 	}
-	proof, err := performCleanupDirectoryMutation(
-		spec.parent.dir,
-		func() error {
-			return cleanupUnlinkAt(spec.parent.dir, stageName, false)
-		},
+	// A pathname unlink after this check could delete a replacement. There is
+	// no portable descriptor-bound unlink for this held regular file, so every
+	// failed exclusive publication keeps its named stage for explicit audit.
+	var hookErr error
+	if spec.afterFailedStageCheck != nil {
+		if err := spec.afterFailedStageCheck(objectBoundFreshFileHookState{
+			Kind:          spec.kind,
+			FinalPath:     spec.path,
+			NamedStage:    stagePath,
+			HeldIdentity:  heldIdentity,
+			ExpectedBytes: len(spec.content),
+			ExpectedHash:  sha256.Sum256(spec.content),
+		}); err != nil {
+			hookErr = fmt.Errorf(
+				"run post-final-check failed-stage hook for %s: %w",
+				stagePath,
+				err,
+			)
+		}
+	}
+	_, postHookErr := validateHeldAndNamedObjectBoundStage(
+		file,
+		spec,
+		stageName,
+		sha256.Sum256(spec.content),
 	)
-	if err != nil {
-		return retained(fmt.Errorf("unlink exact named stage: %w", err))
-	}
-	if err := spec.parent.dir.file.Sync(); err != nil {
-		return fmt.Errorf("sync parent after removing exact named stage %s: %w", stagePath, err)
-	}
-	if err := refreshObjectBoundParentAfterMutation(spec.parent, proof); err != nil {
-		return fmt.Errorf(
-			"refresh parent after removing exact named stage %s: %w",
-			stagePath,
-			err,
+	if postHookErr != nil {
+		postHookErr = fmt.Errorf(
+			"audit retained named stage after final-check boundary: %w",
+			postHookErr,
 		)
 	}
-	return nil
+	return retained(errors.Join(
+		errors.New(
+			"descriptor-bound unlink is unavailable; no pathname-based cleanup was attempted",
+		),
+		hookErr,
+		postHookErr,
+	))
 }
 
 func validateHeldAndNamedObjectBoundFreshFile(

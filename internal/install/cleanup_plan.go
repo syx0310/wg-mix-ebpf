@@ -1287,19 +1287,20 @@ func managedCleanupAnchor(spec cleanupPathSpec) (string, error) {
 }
 
 type cleanupEntryPlan struct {
-	parent        *cleanupDirFD
-	dir           *cleanupDirFD
-	path          string
-	name          string
-	identity      cleanupIdentity
-	directory     bool
-	symlink       bool
-	symlinkTarget string
-	digest        [sha256.Size]byte
-	digestKnown   bool
-	mayDisappear  bool
-	remove        bool
-	children      []*cleanupEntryPlan
+	parent                *cleanupDirFD
+	dir                   *cleanupDirFD
+	path                  string
+	name                  string
+	identity              cleanupIdentity
+	directory             bool
+	symlink               bool
+	symlinkTarget         string
+	digest                [sha256.Size]byte
+	digestKnown           bool
+	mayDisappear          bool
+	remove                bool
+	retainAfterQuarantine bool
+	children              []*cleanupEntryPlan
 }
 
 func (entry *cleanupEntryPlan) close() error {
@@ -1318,12 +1319,13 @@ func (entry *cleanupEntryPlan) close() error {
 }
 
 type cleanupDirectoryPlan struct {
-	root                      *managedCleanupDir
-	entries                   []*cleanupEntryPlan
-	absentServiceArtifactPath string
-	strictEntries             bool
-	removeRoot                bool
-	rootMayDisappear          bool
+	root                       *managedCleanupDir
+	entries                    []*cleanupEntryPlan
+	absentServiceArtifactPath  string
+	strictEntries              bool
+	removeRoot                 bool
+	rootMayDisappear           bool
+	retainedQuarantineEvidence []string
 }
 
 func (directory *cleanupDirectoryPlan) close() error {
@@ -1343,6 +1345,7 @@ type uninstallCleanupPlan struct {
 	manifest                     cleanupManifest
 	beforeExecute                func() error
 	beforeQuarantine             func(string) error
+	afterFinalQuarantineCheck    func(string, string) error
 	beforeServiceExec            func(string) error
 	serviceActionExec            func(*os.File, string) error
 	beforeServiceFinalChainCheck func() error
@@ -1357,6 +1360,17 @@ func (plan *uninstallCleanupPlan) close() error {
 		errs = append(errs, directory.close())
 	}
 	return errors.Join(errs...)
+}
+
+func (plan *uninstallCleanupPlan) retainedQuarantineEvidencePaths() []string {
+	if plan == nil {
+		return nil
+	}
+	var paths []string
+	for _, directory := range plan.directories {
+		paths = append(paths, directory.retainedQuarantineEvidence...)
+	}
+	return paths
 }
 
 func prepareUninstallCleanup(
@@ -2186,6 +2200,7 @@ func prepareArtifactPlansForValidation(
 			return nil, err
 		}
 		node.remove = true
+		node.retainAfterQuarantine = artifact.Kind == systemdEnableLinkKind
 		plan := &cleanupDirectoryPlan{
 			root:          parent,
 			entries:       []*cleanupEntryPlan{node},
@@ -2783,7 +2798,11 @@ func (plan *uninstallCleanupPlan) execute() error {
 		coordinator := cleanupDirectoryMutationCoordinator{
 			peers: plan.directories[index+1:],
 		}
-		if err := directory.remove(plan.beforeQuarantine, &coordinator); err != nil {
+		if err := directory.remove(
+			plan.beforeQuarantine,
+			plan.afterFinalQuarantineCheck,
+			&coordinator,
+		); err != nil {
 			return err
 		}
 	}
@@ -2813,7 +2832,11 @@ func (plan *uninstallCleanupPlan) executeServiceArtifacts() error {
 		coordinator := cleanupDirectoryMutationCoordinator{
 			peers: serviceDirectories[index+1:],
 		}
-		if err := directory.remove(plan.beforeQuarantine, &coordinator); err != nil {
+		if err := directory.remove(
+			plan.beforeQuarantine,
+			plan.afterFinalQuarantineCheck,
+			&coordinator,
+		); err != nil {
 			return err
 		}
 	}
@@ -3169,6 +3192,7 @@ func (directory *cleanupDirectoryPlan) refreshAfterOwnedCleanupMutation(
 
 func (directory *cleanupDirectoryPlan) remove(
 	beforeQuarantine func(string) error,
+	afterFinalQuarantineCheck func(string, string) error,
 	coordinator *cleanupDirectoryMutationCoordinator,
 ) error {
 	if err := directory.revalidate(); err != nil {
@@ -3211,6 +3235,7 @@ func (directory *cleanupDirectoryPlan) remove(
 	for _, entry := range directory.entries {
 		if err := entry.unlink(
 			beforeQuarantine,
+			afterFinalQuarantineCheck,
 			directory,
 			rootName,
 			coordinator,
@@ -3399,6 +3424,7 @@ func (directory *cleanupDirectoryPlan) moveRootToQuarantine(
 
 func (entry *cleanupEntryPlan) unlink(
 	beforeQuarantine func(string) error,
+	afterFinalQuarantineCheck func(string, string) error,
 	directory *cleanupDirectoryPlan,
 	rootName string,
 	coordinator *cleanupDirectoryMutationCoordinator,
@@ -3432,6 +3458,7 @@ func (entry *cleanupEntryPlan) unlink(
 		for _, child := range entry.children {
 			if err := child.unlink(
 				beforeQuarantine,
+				afterFinalQuarantineCheck,
 				directory,
 				rootName,
 				coordinator,
@@ -3471,6 +3498,48 @@ func (entry *cleanupEntryPlan) unlink(
 			"refuse managed entry %s: quarantined identity changed before unlinkat",
 			entry.path,
 		))
+	}
+	if entry.retainAfterQuarantine {
+		if !entry.symlink || entry.directory {
+			return fmt.Errorf(
+				"refuse invalid retained quarantine policy for non-symlink %s",
+				entry.path,
+			)
+		}
+		// The rename already removes the enable link from its active systemd
+		// name. Keep the unique quarantine name because no portable unlink API
+		// can bind deletion to the symlink identity held by this plan.
+		evidencePath := filepath.Join(entry.parent.path, quarantineName)
+		directory.retainedQuarantineEvidence = append(
+			directory.retainedQuarantineEvidence,
+			evidencePath,
+		)
+		var hookErr error
+		if afterFinalQuarantineCheck != nil {
+			if err := afterFinalQuarantineCheck(entry.path, evidencePath); err != nil {
+				hookErr = fmt.Errorf(
+					"run post-final-check quarantine hook for %s: %w",
+					entry.path,
+					err,
+				)
+			}
+		}
+		var bindingErr error
+		if err := entry.revalidateName(quarantineName, false); err != nil {
+			bindingErr = fmt.Errorf(
+				"revalidate retained systemd enable-link quarantine after final-check boundary: %w",
+				err,
+			)
+		}
+		if err := errors.Join(hookErr, bindingErr); err != nil {
+			return fmt.Errorf(
+				"systemd enable link retained quarantine evidence at %s; "+
+					"no pathname-based unlink or restore was attempted: %w",
+				evidencePath,
+				err,
+			)
+		}
+		return nil
 	}
 	if err := directory.prepareOwnedCleanupMutation(
 		rootName,
@@ -3631,12 +3700,14 @@ func (entry *cleanupEntryPlan) moveToQuarantine(
 	return quarantineName, true, nil
 }
 
+const cleanupQuarantineNamePrefix = ".wg-mix-ebpf-quarantine-"
+
 func newCleanupQuarantineName() (string, error) {
 	suffix, err := newCleanupInstallationID()
 	if err != nil {
 		return "", err
 	}
-	return ".wg-mix-ebpf-quarantine-" + suffix, nil
+	return cleanupQuarantineNamePrefix + suffix, nil
 }
 
 func restoreCleanupQuarantine(

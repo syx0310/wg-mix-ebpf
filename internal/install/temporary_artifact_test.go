@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -158,6 +159,119 @@ func TestExclusiveNamedStageReplacementIsNeverPublishedOrDeleted(
 		data, readErr := os.ReadFile(path)
 		if readErr != nil || string(data) != want {
 			t.Fatalf("retained evidence %s data=%q err=%v, want %q", path, data, readErr, want)
+		}
+	}
+}
+
+func TestExclusiveNamedStageReplacementAfterFinalCheckIsNeverDeleted(
+	t *testing.T,
+) {
+	forceExclusiveNamedObjectBoundStages(t)
+	parentPath := filepath.Join(t.TempDir(), "publication-parent")
+	if err := os.Mkdir(parentPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	parent, exists, err := openDeclaredArtifactParent(parentPath, parentPath)
+	if err != nil || !exists {
+		t.Fatalf("open publication parent: exists=%t err=%v", exists, err)
+	}
+	defer parent.close()
+
+	finalPath := filepath.Join(parentPath, "artifact")
+	injected := errors.New("stop before publication")
+	var stagePath string
+	var ownedAway string
+	var ownedIdentity os.FileInfo
+	var foreignIdentity os.FileInfo
+	hookRan := false
+	_, err = publishObjectBoundFreshFile(objectBoundFreshFileSpec{
+		parent:  parent,
+		name:    filepath.Base(finalPath),
+		path:    finalPath,
+		kind:    "test artifact",
+		mode:    0o600,
+		content: []byte("owned\n"),
+		beforePublish: func(state objectBoundFreshFileHookState) error {
+			stagePath = state.NamedStage
+			return injected
+		},
+		afterFailedStageCheck: func(state objectBoundFreshFileHookState) error {
+			if hookRan || state.NamedStage != stagePath {
+				return fmt.Errorf(
+					"unexpected failed-stage final-check hook path %s, want %s",
+					state.NamedStage,
+					stagePath,
+				)
+			}
+			hookRan = true
+			ownedAway = stagePath + ".owned-after-final-check"
+			type mutationResult struct {
+				ownedIdentity   os.FileInfo
+				foreignIdentity os.FileInfo
+				err             error
+			}
+			resultCh := make(chan mutationResult, 1)
+			go func() {
+				var result mutationResult
+				result.ownedIdentity, result.err = os.Stat(stagePath)
+				if result.err == nil {
+					result.err = os.Rename(stagePath, ownedAway)
+				}
+				if result.err == nil {
+					result.err = os.WriteFile(stagePath, []byte("foreign\n"), 0o600)
+				}
+				if result.err == nil {
+					result.foreignIdentity, result.err = os.Stat(stagePath)
+				}
+				resultCh <- result
+			}()
+			result := <-resultCh
+			if result.err != nil {
+				return result.err
+			}
+			ownedIdentity = result.ownedIdentity
+			foreignIdentity = result.foreignIdentity
+			return nil
+		},
+	})
+	if !errors.Is(err, injected) ||
+		!strings.Contains(err.Error(), "retained at "+stagePath) ||
+		!strings.Contains(err.Error(), "no pathname-based cleanup was attempted") {
+		t.Fatalf("post-check stage replacement error = %v, want audited retention", err)
+	}
+	if !hookRan {
+		t.Fatal("post-final-check failed-stage hook did not run")
+	}
+	if _, statErr := os.Lstat(finalPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("failed stage reached final path: %v", statErr)
+	}
+	for _, retained := range []struct {
+		path     string
+		want     string
+		identity os.FileInfo
+	}{
+		{stagePath, "foreign\n", foreignIdentity},
+		{ownedAway, "owned\n", ownedIdentity},
+	} {
+		data, readErr := os.ReadFile(retained.path)
+		if readErr != nil || string(data) != retained.want {
+			t.Fatalf(
+				"retained evidence %s data=%q err=%v, want %q",
+				retained.path,
+				data,
+				readErr,
+				retained.want,
+			)
+		}
+		finalIdentity, statErr := os.Stat(retained.path)
+		if statErr != nil || retained.identity == nil ||
+			!os.SameFile(retained.identity, finalIdentity) {
+			t.Fatalf(
+				"retained evidence %s identity changed: identity=%v err=%v",
+				retained.path,
+				retained.identity,
+				statErr,
+			)
 		}
 	}
 }
@@ -626,7 +740,7 @@ func openObjectBoundGenerationTestParent(
 	return parent, parentPath, evidenceDir
 }
 
-func TestInstallRetryAfterUnpublishedManifestAddsNoTemporaryNames(t *testing.T) {
+func TestInstallRetryDoesNotOverwriteRetainedManifestStageEvidence(t *testing.T) {
 	layout := cleanupTestPaths(t.TempDir(), "object-bound-retry")
 	setCleanupTestEnvironment(t, layout)
 	lifecycleRoot := t.TempDir()
@@ -649,24 +763,71 @@ func TestInstallRetryAfterUnpublishedManifestAddsNoTemporaryNames(t *testing.T) 
 	)
 	options := Options{System: "unknown", AdoptExisting: true}
 
-	if _, err := Install(ctx, options); !errors.Is(err, injected) {
-		t.Fatalf("first install error = %v, want injected publication failure", err)
+	_, firstErr := Install(ctx, options)
+	if !errors.Is(firstErr, injected) {
+		t.Fatalf("first install error = %v, want injected publication failure", firstErr)
 	}
 	if !failedOnce {
 		t.Fatal("manifest publication hook did not run")
 	}
-	assertNoInstallTemporaryNames(t, layout)
 	if _, err := os.Lstat(cleanupManifestPath(layout)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("failed publication created ownership manifest: %v", err)
 	}
+	retainedStages := installObjectBoundStagePaths(t, layout)
+	if len(retainedStages) != 1 {
+		t.Fatalf("failed publication retained stages = %v, want exactly one", retainedStages)
+	}
+	if !strings.Contains(firstErr.Error(), "retained at "+retainedStages[0]) ||
+		!strings.Contains(firstErr.Error(), "no pathname-based cleanup was attempted") {
+		t.Fatalf(
+			"failed publication error = %v, want exact retained stage %s",
+			firstErr,
+			retainedStages[0],
+		)
+	}
 
-	if _, err := Install(ctx, options); err != nil {
-		t.Fatalf("in-place install retry: %v", err)
+	if _, err := Install(ctx, options); err == nil ||
+		!strings.Contains(err.Error(), retainedStages[0]) {
+		t.Fatalf("in-place install retry error = %v, want retained evidence refusal", err)
 	}
-	assertNoInstallTemporaryNames(t, layout)
-	if _, err := os.Stat(cleanupManifestPath(layout)); err != nil {
-		t.Fatalf("retry did not publish ownership manifest: %v", err)
+	stagesAfterRetry := installObjectBoundStagePaths(t, layout)
+	if len(stagesAfterRetry) != 1 || stagesAfterRetry[0] != retainedStages[0] {
+		t.Fatalf(
+			"retry changed retained stage evidence: before=%v after=%v",
+			retainedStages,
+			stagesAfterRetry,
+		)
 	}
+	if _, err := os.Lstat(cleanupManifestPath(layout)); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("refused retry created ownership manifest: %v", err)
+	}
+}
+
+func installObjectBoundStagePaths(t *testing.T, layout paths) []string {
+	t.Helper()
+	var paths []string
+	for _, dir := range []string{
+		filepath.Dir(layout.ConfigPath),
+		filepath.Dir(layout.BinaryPath),
+		layout.SystemdDir,
+		layout.OpenWrtInitDir,
+		layout.OpenWrtHotplugDir,
+	} {
+		entries, err := os.ReadDir(dir)
+		if errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if strings.HasPrefix(entry.Name(), objectBoundNamedStagePrefix) {
+				paths = append(paths, filepath.Join(dir, entry.Name()))
+			}
+		}
+	}
+	slices.Sort(paths)
+	return paths
 }
 
 func assertNoInstallTemporaryNames(t *testing.T, layout paths) {

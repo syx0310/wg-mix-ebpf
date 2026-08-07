@@ -407,7 +407,7 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	switch system {
 	case "systemd":
 		add(
-			"remove the exact validated systemd enable link if present",
+			"atomically quarantine the exact validated systemd enable link if present; retain its unique hidden quarantine name as audit evidence",
 		)
 		add("remove systemd unit %s", filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"))
 		add("reload systemd manager after removing the owned unit")
@@ -562,6 +562,21 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	}()
 
 	if err := func() (retErr error) {
+		var retainedServiceArtifactEvidence []string
+		defer func() {
+			if retErr == nil || len(retainedServiceArtifactEvidence) == 0 {
+				return
+			}
+			errs := []error{retErr}
+			for _, evidencePath := range retainedServiceArtifactEvidence {
+				errs = append(errs, fmt.Errorf(
+					"retained systemd enable-link quarantine evidence at %s; "+
+						"no pathname-based unlink was attempted",
+					evidencePath,
+				))
+			}
+			retErr = errors.Join(errs...)
+		}()
 		preStopPlan, err := prepareUninstallCleanup(
 			paths,
 			system,
@@ -626,6 +641,16 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 		}
 		if err := cleanupPlan.executeServiceArtifacts(); err != nil {
 			return fmt.Errorf("remove descriptor-anchored service artifacts: %w", err)
+		}
+		retainedServiceArtifactEvidence = append(
+			retainedServiceArtifactEvidence,
+			cleanupPlan.retainedQuarantineEvidencePaths()...,
+		)
+		for _, evidencePath := range retainedServiceArtifactEvidence {
+			add(
+				"retained systemd enable-link quarantine evidence %s; no pathname-based unlink was attempted",
+				evidencePath,
+			)
 		}
 		if system == "systemd" {
 			if err := runSystemdManagerReloadAfterServiceArtifactRemoval(
