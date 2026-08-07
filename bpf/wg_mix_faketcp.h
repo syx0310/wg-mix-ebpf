@@ -334,10 +334,20 @@ faketcp_admit_control_event(const struct faketcp_session_key *session,
 		.last_event_nanos = now,
 	};
 
-	// The policy lookup is first and fail-closed. No packet can allocate its
-	// own policy budget, and generations/WireGuards never share a cursor.
+	// Policy identity validation and lookup are first and fail-closed. No
+	// packet can allocate its own policy budget, and generations/WireGuards
+	// never share a cursor.
+	if (session->generation == 0 || wg_id == 0 ||
+	    event_type < FAKETCP_EVENT_NEED_HANDSHAKE ||
+	    event_type > FAKETCP_EVENT_FIN) {
+		inc_faketcp_stat(FAKETCP_STAT_CONTROL_POLICY_MISS);
+		return 0;
+	}
 	policy = bpf_map_lookup_elem(&faketcp_control_policy_map, &policy_key);
-	if (!policy || policy->generation != session->generation) {
+	if (!policy || policy->generation != session->generation ||
+	    policy->interval_nanos < FAKETCP_CONTROL_MIN_INTERVAL_NANOS ||
+	    policy->interval_nanos > FAKETCP_CONTROL_MAX_INTERVAL_NANOS ||
+	    policy->burst == 0 || policy->burst > FAKETCP_CONTROL_MAX_BURST) {
 		inc_faketcp_stat(FAKETCP_STAT_CONTROL_POLICY_MISS);
 		return 0;
 	}
@@ -368,7 +378,11 @@ static __always_inline int faketcp_emit_event(const struct faketcp_session_key *
 					       __u32 fwmark, __u32 wg_id)
 {
 	__u64 now = bpf_ktime_get_ns();
-	struct faketcp_event event = {
+	struct faketcp_event event;
+
+	if (!faketcp_admit_control_event(key, wg_id, type, now))
+		return 0;
+	event = (struct faketcp_event){
 		.key = *key,
 		.timestamp_nanos = now,
 		.sequence = seq,
@@ -379,9 +393,6 @@ static __always_inline int faketcp_emit_event(const struct faketcp_session_key *
 		.type = type,
 		.tcp_flags = flags,
 	};
-
-	if (!faketcp_admit_control_event(key, wg_id, type, now))
-		return 0;
 
 	if (bpf_ringbuf_output(&faketcp_events, &event, sizeof(event), 0) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_EVENT_ERROR);
@@ -425,20 +436,33 @@ static __always_inline int faketcp_capture_first_packet(struct __sk_buff *skb,
 	struct faketcp_packet_event *record;
 	__u32 zero = 0;
 	__u64 record_len;
+	__u64 now;
 	__u16 packet_len;
 
 	if ((void *)(iph + 1) > data_end)
 		return -1;
 	packet_len = bpf_ntohs(iph->tot_len);
 	if (packet_len < sizeof(*iph) + sizeof(struct udphdr) ||
-	    packet_len > FAKETCP_MAX_CAPTURED_PACKET)
+	    packet_len > FAKETCP_MAX_CAPTURED_PACKET ||
+	    (__u32)packet_len != sizeof(*iph) + sizeof(struct udphdr) +
+				 info->payload_len ||
+	    info->ip_off > skb->len || packet_len > skb->len - info->ip_off)
 		return -1;
 	record = bpf_map_lookup_elem(&faketcp_capture_scratch, &zero);
 	if (!record)
 		return -1;
+	// Cheap packet-shape and scratch-availability failures do not spend a
+	// control token. Admission still precedes every scratch write and the
+	// attacker-sized packet copy. A later copy/output failure deliberately
+	// burns its token: fail closed instead of letting a failing path retry at
+	// unlimited rate. The same timestamp is carried into the emitted record.
+	now = bpf_ktime_get_ns();
+	if (!faketcp_admit_control_event(key, rule->wg_id,
+					 FAKETCP_EVENT_NEED_HANDSHAKE, now))
+		return 0;
 	record->event = (struct faketcp_event){
 		.key = *key,
-		.timestamp_nanos = bpf_ktime_get_ns(),
+		.timestamp_nanos = now,
 		.payload_length = info->payload_len,
 		.fwmark = skb->mark,
 		.wg_id = rule->wg_id,

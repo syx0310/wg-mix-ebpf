@@ -201,8 +201,9 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 	if strings.Contains(fake, "info->payload_len & 1") || strings.Contains(fake, "(payload_len & 1))") {
 		t.Fatal("odd-length FakeTCP payload rejection reappeared")
 	}
-	if strings.Count(fake, "FAKETCP_EVENT_NEED_HANDSHAKE") != 2 {
-		t.Fatal("NEED_HANDSHAKE must only be defined and emitted with the captured pre-transform packet")
+	if strings.Count(fake, "#define FAKETCP_EVENT_NEED_HANDSHAKE 1") != 1 ||
+		strings.Count(fake, ".type = FAKETCP_EVENT_NEED_HANDSHAKE") != 1 {
+		t.Fatal("NEED_HANDSHAKE must only be emitted with the captured pre-transform packet")
 	}
 	egressStart := strings.Index(tc, "int wg_mix_egress(struct __sk_buff *skb)")
 	if egressStart < 0 {
@@ -297,6 +298,9 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 		".event_type = event_type",
 		"attempt < FAKETCP_CONTROL_CAS_ATTEMPTS",
 		"__sync_val_compare_and_swap(&policy->virtual_time_nanos",
+		"policy->interval_nanos < FAKETCP_CONTROL_MIN_INTERVAL_NANOS",
+		"policy->interval_nanos > FAKETCP_CONTROL_MAX_INTERVAL_NANOS",
+		"policy->burst == 0 || policy->burst > FAKETCP_CONTROL_MAX_BURST",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("FakeTCP control admission contract missing %q", want)
@@ -321,19 +325,62 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 		t.Fatal("attacker-keyed control map must have exactly one admitted-only write site")
 	}
 
-	emit := text[emitStart:]
-	admitCall := strings.Index(emit, "faketcp_admit_control_event(key, wg_id, type, now)")
+	if got := strings.Count(text, "bpf_ringbuf_output("); got != 2 {
+		t.Fatalf("FakeTCP source has %d ring-buffer output calls, want two enumerated calls", got)
+	}
+	if got := strings.Count(text, "bpf_ringbuf_output(&faketcp_events,"); got != 2 {
+		t.Fatalf("FakeTCP event ring has %d output sites, want two explicitly admitted sites", got)
+	}
+	if got := strings.Count(text, "bpf_ringbuf_output(&faketcp_events, &event"); got != 1 {
+		t.Fatalf("FakeTCP metadata ring output sites=%d, want exactly one", got)
+	}
+	if got := strings.Count(text, "bpf_ringbuf_output(&faketcp_events, record"); got != 1 {
+		t.Fatalf("FakeTCP packet ring output sites=%d, want exactly one", got)
+	}
+	for _, forbidden := range []string{"bpf_ringbuf_reserve(", "bpf_ringbuf_submit(", "bpf_ringbuf_discard("} {
+		if strings.Contains(text, forbidden) {
+			t.Fatalf("un-enumerated FakeTCP ring-buffer write path %q is forbidden", forbidden)
+		}
+	}
+
+	captureStart := strings.Index(text, "static __always_inline int faketcp_capture_first_packet")
+	preflightStart := strings.Index(text, "static __always_inline int faketcp_preflight_egress")
+	if captureStart < 0 || preflightStart < 0 || captureStart >= preflightStart {
+		t.Fatal("FakeTCP first-packet capture helper is missing or malformed")
+	}
+	emit := text[emitStart:captureStart]
+	admitCall := strings.Index(emit, "if (!faketcp_admit_control_event(key, wg_id, type, now))")
+	eventWrite := strings.Index(emit, "event = (struct faketcp_event)")
 	ringOutput := strings.Index(emit, "bpf_ringbuf_output(&faketcp_events, &event")
-	if admitCall < 0 || ringOutput < 0 || admitCall >= ringOutput {
-		t.Fatal("control admission must precede every metadata ring-buffer output")
+	if admitCall < 0 || eventWrite < 0 || ringOutput < 0 ||
+		admitCall >= eventWrite || eventWrite >= ringOutput {
+		t.Fatal("control admission must dominate metadata preparation and ring-buffer output")
+	}
+
+	capture := text[captureStart:preflightStart]
+	packetValidation := strings.Index(capture, "packet_len > FAKETCP_MAX_CAPTURED_PACKET")
+	scratchLookup := strings.Index(capture, "bpf_map_lookup_elem(&faketcp_capture_scratch")
+	packetAdmit := strings.Index(capture, "if (!faketcp_admit_control_event(key, rule->wg_id")
+	scratchWrite := strings.Index(capture, "record->event = (struct faketcp_event)")
+	packetCopy := strings.Index(capture, "bpf_skb_load_bytes")
+	packetOutput := strings.Index(capture, "bpf_ringbuf_output(&faketcp_events, record")
+	if packetValidation < 0 || scratchLookup < 0 || packetAdmit < 0 || scratchWrite < 0 ||
+		packetCopy < 0 || packetOutput < 0 || packetValidation >= packetAdmit ||
+		scratchLookup >= packetAdmit || packetAdmit >= scratchWrite ||
+		scratchWrite >= packetCopy || packetCopy >= packetOutput {
+		t.Fatal("NEED_HANDSHAKE admission must follow cheap validation and dominate scratch writes, packet copy, and ring output")
+	}
+	if strings.Count(capture, "bpf_ktime_get_ns()") != 1 ||
+		!strings.Contains(capture, ".timestamp_nanos = now") {
+		t.Fatal("NEED_HANDSHAKE admission and event must share one monotonic timestamp")
 	}
 }
 
 func TestFakeTCPControlAdmissionGCRAStartsEmptyAndCapsBurst(t *testing.T) {
 	const (
-		interval = uint64(100)
+		interval = uint64(100_000_000)
 		burst    = uint32(4)
-		start    = uint64(1_000)
+		start    = uint64(1_000_000_000)
 	)
 	var cursor uint64
 	if takeFakeTCPControlBudgetModel(&cursor, start, interval, burst) {
@@ -362,10 +409,66 @@ func TestFakeTCPControlAdmissionGCRAStartsEmptyAndCapsBurst(t *testing.T) {
 	}
 }
 
+func TestFakeTCPControlAdmissionGCRARejectsInvalidAndOverflowingPolicy(t *testing.T) {
+	maxUint64 := ^uint64(0)
+	tests := []struct {
+		name     string
+		now      uint64
+		interval uint64
+		burst    uint32
+	}{
+		{name: "interval-zero", now: 1, interval: 0, burst: 1},
+		{name: "interval-below-minimum", now: 1, interval: fakeTCPControlMinIntervalModel - 1, burst: 1},
+		{name: "interval-above-maximum", now: 1, interval: fakeTCPControlMaxIntervalModel + 1, burst: 1},
+		{name: "burst-zero", now: 1, interval: fakeTCPControlMinIntervalModel, burst: 0},
+		{name: "burst-above-maximum", now: 1, interval: fakeTCPControlMinIntervalModel, burst: fakeTCPControlMaxBurstModel + 1},
+		{name: "window-overflow", now: maxUint64, interval: fakeTCPControlMinIntervalModel, burst: 1},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			cursor := uint64(17)
+			if takeFakeTCPControlBudgetModel(&cursor, test.now, test.interval, test.burst) {
+				t.Fatal("invalid policy admitted an event")
+			}
+			if cursor != 17 {
+				t.Fatalf("invalid policy changed cursor to %d", cursor)
+			}
+		})
+	}
+
+	window := fakeTCPControlMinIntervalModel * uint64(fakeTCPControlMaxBurstModel)
+	cursor := uint64(0)
+	if takeFakeTCPControlBudgetModel(&cursor, maxUint64-window,
+		fakeTCPControlMinIntervalModel, fakeTCPControlMaxBurstModel) {
+		t.Fatal("zero-budget boundary unexpectedly admitted")
+	}
+	if cursor != maxUint64 {
+		t.Fatalf("largest non-overflowing boundary cursor=%d, want %d", cursor, maxUint64)
+	}
+	if takeFakeTCPControlBudgetModel(&cursor, maxUint64-window+fakeTCPControlMinIntervalModel,
+		fakeTCPControlMinIntervalModel, fakeTCPControlMaxBurstModel) {
+		t.Fatal("candidate overflow boundary admitted")
+	}
+}
+
+const (
+	fakeTCPControlMinIntervalModel = uint64(10_000_000)
+	fakeTCPControlMaxIntervalModel = uint64(10_000_000_000)
+	fakeTCPControlMaxBurstModel    = uint32(4096)
+)
+
 // takeFakeTCPControlBudgetModel mirrors the single-cursor arithmetic in the
 // BPF helper without modelling CAS contention (contention only adds rejects).
 func takeFakeTCPControlBudgetModel(cursor *uint64, now, interval uint64, burst uint32) bool {
+	if interval < fakeTCPControlMinIntervalModel || interval > fakeTCPControlMaxIntervalModel ||
+		burst == 0 || burst > fakeTCPControlMaxBurstModel {
+		return false
+	}
 	window := interval * uint64(burst)
+	maxUint64 := ^uint64(0)
+	if now > maxUint64-window {
+		return false
+	}
 	limit := now + window
 	if *cursor == 0 {
 		*cursor = limit
@@ -374,6 +477,9 @@ func takeFakeTCPControlBudgetModel(cursor *uint64, now, interval uint64, burst u
 	base := *cursor
 	if base < now {
 		base = now
+	}
+	if base > maxUint64-interval {
+		return false
 	}
 	candidate := base + interval
 	if candidate > limit {
