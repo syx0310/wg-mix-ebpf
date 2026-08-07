@@ -575,6 +575,20 @@ func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 			pinMountID:   42,
 		},
 		{
+			name: "legacy bpf source label",
+			fixture: strings.Replace(
+				validFixture,
+				" - bpf "+isolatedNetNSTestBPFFSSource(
+					layout.runID,
+					isolatedFixtureOwnerToken,
+				)+" ",
+				" - bpf bpf ",
+				1,
+			),
+			statxMountID: 42,
+			pinMountID:   42,
+		},
+		{
 			name: "nested pin mount",
 			fixture: isolatedMountInfoFixture(
 				layout,

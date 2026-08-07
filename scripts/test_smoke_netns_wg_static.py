@@ -998,6 +998,17 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertIn("$5 != target", self.source)
         self.assertIn("other_bpf_count++", self.source)
         self.assertNotIn('-v production="/sys/fs/bpf"', self.source)
+        self.assertIn('BPFFS_LEDGER="${RUN_BASE}/bpffs.creation.v1"', self.source)
+        for field in (
+            "format=wg-mix-ebpf-bpffs-creation-v1",
+            "pre_target_mount_id=%s",
+            "pre_target_dev=%s",
+            "pre_bpf_mounts=%s",
+            "post_mount_id=%s",
+            "post_dev=%s",
+            "post_ino=%s",
+        ):
+            self.assertIn(field, self.source)
         self.assertIn(
             'f"wg-mix-ebpf-pin-v1:{parent_device}:{parent_inode}:{basename}"',
             self.source,
@@ -1023,6 +1034,10 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         )
         self.assertLess(lock_marker, seal)
         self.assertLess(owner_marker, seal)
+        self.assertLess(
+            self.source.index("\nwrite_bpffs_creation_ledger\n"),
+            seal,
+        )
         self.assertLess(seal, first_reload)
 
     def test_lifecycle_lease_is_explicitly_created_before_consumers(self) -> None:
@@ -1145,7 +1160,7 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         start_marker = '-v expected_source="${BPFFS_SOURCE}" \'\n'
         program_start = self.source.index(start_marker) + len(start_marker)
         program_end = self.source.index(
-            "\n    ' /proc/self/mountinfo",
+            "\n    ' \"${mountinfo_path}\"",
             program_start,
         )
         awk_program = self.source[program_start:program_end]
@@ -1177,9 +1192,148 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
 
         completed = inspect(source)
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout, "77\n")
+        self.assertEqual(completed.stdout, "77 0:31 25 8:1\n")
         self.assertNotEqual(inspect("bpf").returncode, 0)
         self.assertNotEqual(inspect(source + "0").returncode, 0)
+
+    def test_private_bpffs_pre_mount_snapshot_is_bound_and_sorted(self) -> None:
+        function = self.source[
+            self.source.index("snapshot_private_bpffs_pre_mount() {") :
+            self.source.index("\ninspect_private_bpffs_mount_record() {")
+        ]
+        target = "/run/wg-mix-ebpf-tests/01234567/bpffs"
+        harness = "\n".join(
+            (
+                "set -euo pipefail",
+                f"BPFFS_DIR={shlex.quote(target)}",
+                function,
+                'snapshot_private_bpffs_pre_mount "$1"',
+                'printf "%s %s %s\\n" "${BPFFS_PRE_TARGET_MOUNT_ID}" '
+                '"${BPFFS_PRE_TARGET_DEVICE}" "${BPFFS_PRE_BPF_MOUNTS}"',
+            )
+        )
+
+        def inspect(mountinfo: str) -> subprocess.CompletedProcess[str]:
+            with tempfile.NamedTemporaryFile() as fixture:
+                fixture.write(mountinfo.encode("ascii"))
+                fixture.flush()
+                return subprocess.run(
+                    ["/bin/bash", "-c", harness, "snapshot-fixture", fixture.name],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+                )
+
+        baseline = (
+            "21 1 8:1 / / rw,relatime - ext4 /dev/root rw\n"
+            "91 21 0:91 / /sys/fs/bpf rw,nosuid,nodev,noexec "
+            "- bpf bpf rw\n"
+            "100 21 0:100 / /run rw,nosuid,nodev,relatime "
+            "- tmpfs tmpfs rw\n"
+            "30 21 0:30 / /other-bpf rw,nosuid,nodev,noexec "
+            "- bpf old-bpf rw\n"
+        )
+        accepted = inspect(baseline)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        self.assertEqual(
+            accepted.stdout,
+            "100 0:100 30@0:30,91@0:91\n",
+        )
+
+        exact_target = baseline + (
+            f"110 100 0:110 / {target} rw,relatime - tmpfs tmpfs rw\n"
+        )
+        self.assertNotEqual(inspect(exact_target).returncode, 0)
+        stacked_parent = baseline + (
+            "101 21 0:101 / /run rw,relatime - tmpfs stacked rw\n"
+        )
+        self.assertNotEqual(inspect(stacked_parent).returncode, 0)
+        duplicate_id = baseline + (
+            "91 21 0:92 / /duplicate rw,relatime - tmpfs duplicate rw\n"
+        )
+        self.assertNotEqual(inspect(duplicate_id).returncode, 0)
+
+    def test_bpffs_creation_ledger_unprivileged_fixture(self) -> None:
+        if not pathlib.Path("/proc/self").exists():
+            self.skipTest("bpffs ledger fixture requires Linux coreutils")
+
+        validate_owned_path = self.source[
+            self.source.index("validate_owned_path() {") :
+            self.source.index("\ncreate_lifecycle_lease() {")
+        ]
+        payload = self.source[
+            self.source.index("bpffs_creation_ledger_payload() {") :
+            self.source.index("\nwrite_marker() {")
+        ]
+        ledger_functions = self.source[
+            self.source.index("validate_bpffs_creation_state() {") :
+            self.source.index("\nsnapshot_private_bpffs_pre_mount() {")
+        ]
+        harness = "\n".join(
+            (
+                "set -euo pipefail",
+                "umask 077",
+                'RUN_BASE="$1"',
+                'RUN_ID="01234567"',
+                'OWNER_TOKEN="0123456789abcdef0123456789abcdef"',
+                'BPFFS_DIR="${RUN_BASE}/bpffs"',
+                'BPFFS_SOURCE="wg-mix-ebpf-${RUN_ID}-${OWNER_TOKEN}"',
+                'BPFFS_LEDGER="${RUN_BASE}/bpffs.creation.v1"',
+                'BPFFS_PRE_TARGET_MOUNT_ID="21"',
+                'BPFFS_PRE_TARGET_DEVICE="8:1"',
+                'BPFFS_PRE_BPF_MOUNTS="30@0:30,91@0:91"',
+                'BPFFS_MOUNT_ID="42"',
+                'BPFFS_MOUNT_DEVICE="0:42"',
+                'BPFFS_PARENT_INO="201"',
+                validate_owned_path,
+                payload,
+                ledger_functions,
+                'case "$2" in',
+                '  legacy-source) BPFFS_SOURCE="bpf" ;;',
+                '  reused-id) BPFFS_MOUNT_ID="30" ;;',
+                "esac",
+                "write_bpffs_creation_ledger",
+                "validate_bpffs_creation_ledger",
+            )
+        )
+
+        def invoke(
+            run_base: pathlib.Path, mode: str = "success"
+        ) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                ["/bin/bash", "-c", harness, "ledger-fixture", str(run_base), mode],
+                check=False,
+                capture_output=True,
+                text=True,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = pathlib.Path(temporary_directory).resolve()
+            success_root = temporary / "success"
+            success_root.mkdir(mode=0o700)
+            success = invoke(success_root)
+            self.assertEqual(success.returncode, 0, success.stderr)
+            ledger = success_root / "bpffs.creation.v1"
+            self.assertEqual(stat.S_IMODE(ledger.stat().st_mode), 0o600)
+            data = ledger.read_text(encoding="ascii")
+            self.assertIn(
+                "source=wg-mix-ebpf-01234567-"
+                "0123456789abcdef0123456789abcdef\n",
+                data,
+            )
+            self.assertNotIn("source=bpf\n", data)
+            collision = invoke(success_root)
+            self.assertNotEqual(collision.returncode, 0)
+            self.assertEqual(ledger.read_text(encoding="ascii"), data)
+
+            for mode in ("legacy-source", "reused-id"):
+                rejected_root = temporary / mode
+                rejected_root.mkdir(mode=0o700)
+                rejected = invoke(rejected_root, mode)
+                self.assertNotEqual(rejected.returncode, 0)
+                self.assertFalse((rejected_root / "bpffs.creation.v1").exists())
 
     def test_pin_resources_are_validated_after_detach_before_exact_removal(self) -> None:
         detach_b = self.source.index('teardown_step "detach agent B pin=${PINB}"')
