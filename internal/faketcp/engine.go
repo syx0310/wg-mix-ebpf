@@ -26,6 +26,8 @@ const (
 	synSourcePruneBudget = 4
 )
 
+var ErrEngineGenerationImmutable = errors.New("faketcp Engine generation is immutable; create a new Engine")
+
 type Options struct {
 	Generation               uint64
 	SessionCapacity          int
@@ -598,43 +600,23 @@ func (e *Engine) Tick() ([]Action, error) {
 	return actions, errors.Join(errs...)
 }
 
-// AdvanceGeneration explicitly drains all live sessions. The loader cannot
-// silently carry keys across generation changes because rules, profiles and
-// peers may have changed; callers must observe the returned close actions and
-// allow WireGuard/QUIC to re-handshake under the new generation.
+// AdvanceGeneration is retained as a fail-closed compatibility boundary.
+// RuntimeIdentity, capture sequences, action recovery, and kernel collection
+// commit state all belong to exactly one immutable Engine generation. A
+// generation transition therefore requires constructing a new Engine.
 func (e *Engine) AdvanceGeneration(generation uint64) ([]Action, error) {
+	if e == nil {
+		return nil, fmt.Errorf("%w: Engine is nil", ErrEngineGenerationImmutable)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if generation == 0 || generation == e.opts.Generation {
-		return nil, fmt.Errorf("new faketcp generation must be non-zero and differ from %d", e.opts.Generation)
-	}
-	actions := make([]Action, 0, len(e.sessions))
-	var errs []error
-	for flow, s := range e.sessions {
-		if s.state == abi.FakeTCPStateEstablished {
-			value, found, err := e.lookupEstablished(flow, s)
-			if err != nil {
-				errs = append(errs, err)
-				continue
-			}
-			if found {
-				deleted, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, value)
-				if err != nil {
-					errs = append(errs, err)
-					continue
-				}
-				if !deleted {
-					continue
-				}
-			}
-		}
-		e.remove(flow, s)
-		actions = append(actions, Action{Kind: ActionClose, Flow: flow, Reason: "generation-drain-rehandshake"})
-	}
-	if len(e.sessions) == 0 {
-		e.opts.Generation = generation
-	}
-	return actions, errors.Join(errs...)
+	return nil, fmt.Errorf(
+		"%w: current generation=%d runtime identity generation=%d requested generation=%d",
+		ErrEngineGenerationImmutable,
+		e.opts.Generation,
+		e.identity.Generation,
+		generation,
+	)
 }
 
 func (e *Engine) Snapshot(flow abi.FakeTCPSessionKey) (SessionSnapshot, bool, error) {
