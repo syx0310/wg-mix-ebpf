@@ -33,13 +33,19 @@ type Options struct {
 	IdleTimeout              time.Duration
 	Window                   uint16
 	Now                      func() time.Time
+	MonotonicNanos           func() uint64
 	InitialSequence          func() uint32
 	Store                    SessionStore
 }
 
+// SessionStore exposes the established fast-path state without granting the
+// userspace engine an overwrite operation. InsertEstablished is used exactly
+// once at handshake completion. From that point BPF owns sequence/activity
+// fields; userspace may only read them or request a compare-and-delete.
 type SessionStore interface {
-	Upsert(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) error
-	Delete(abi.FakeTCPSessionKey) error
+	InsertEstablished(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) error
+	LookupEstablished(abi.FakeTCPSessionKey) (abi.FakeTCPSessionValue, bool, error)
+	DeleteEstablishedIfUnchanged(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) (bool, error)
 }
 
 type Segment struct {
@@ -89,6 +95,7 @@ type SessionSnapshot struct {
 	State          uint8
 	TXSequence     uint32
 	RXSequence     uint32
+	LastSeenNanos  uint64
 	PendingPackets int
 	PendingBytes   int
 	LastActivity   time.Time
@@ -143,6 +150,12 @@ func New(options Options) (*Engine, error) {
 	if options.InitialSequence == nil {
 		return nil, errors.New("faketcp initial sequence source is required")
 	}
+	if options.MonotonicNanos == nil {
+		return nil, errors.New("faketcp monotonic clock source is required")
+	}
+	if options.Store == nil {
+		return nil, errors.New("faketcp established session store is required")
+	}
 	if options.Window == 0 {
 		options.Window = 65535
 	}
@@ -190,7 +203,6 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 	}
 	now := e.opts.Now()
 	s := e.sessions[flow]
-	checkpoint := e.checkpoint(s)
 	if s != nil && s.state == abi.FakeTCPStateEstablished {
 		if packet.WGID != 0 && s.wgID != 0 && packet.WGID != s.wgID {
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
@@ -198,12 +210,15 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 		if s.wgID == 0 {
 			s.wgID = packet.WGID
 		}
-		s.lastActivity = now
-		s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
-		if err := e.sync(flow, s); err != nil {
-			e.restore(flow, checkpoint)
+		_, found, err := e.lookupEstablished(flow, s)
+		if err != nil {
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
 		}
+		if !found {
+			e.remove(flow, s)
+			return []Action{{Kind: ActionClose, Flow: flow, Reason: "fast-session-missing"}}, nil
+		}
+		s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
 		if alreadyDropped {
 			copyPacket := packet
 			copyPacket.Data = append([]byte(nil), packet.Data...)
@@ -235,10 +250,6 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
 	}
 	queued := e.enqueue(s, packet)
-	if err := e.sync(flow, s); err != nil {
-		e.restore(flow, checkpoint)
-		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
-	}
 	actions := make([]Action, 0, 2)
 	if created {
 		actions = append(actions, e.control(flow, s, FlagSYN, s.localISN, 0, "initial-handshake"))
@@ -275,8 +286,20 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) (
 		if s == nil {
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-close"}}, nil
 		}
-		if err := e.deleteStore(flow); err != nil {
-			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+		if s.state == abi.FakeTCPStateEstablished {
+			value, found, err := e.lookupEstablished(flow, s)
+			if err != nil {
+				return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+			}
+			if found {
+				deleted, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, value)
+				if err != nil {
+					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+				}
+				if !deleted {
+					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
+				}
+			}
 		}
 		e.remove(flow, s)
 		return []Action{{Kind: ActionClose, Flow: flow, Reason: "peer-close"}}, nil
@@ -303,10 +326,6 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) (
 			retries:      1,
 		}
 		e.sessions[flow] = s
-		if err := e.sync(flow, s); err != nil {
-			e.restore(flow, checkpoint)
-			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
-		}
 		return []Action{e.control(flow, s, FlagSYN|FlagACK, s.localISN, s.rxSequence, "accept-syn")}, nil
 	}
 	if s.wgID == 0 {
@@ -316,6 +335,7 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) (
 	s.lastActivity = now
 	s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
 	var actions []Action
+	becameEstablished := false
 	switch s.state {
 	case abi.FakeTCPStateSynSent:
 		switch {
@@ -323,6 +343,7 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) (
 			s.remoteISN = seg.Sequence
 			s.rxSequence = seg.Sequence + 1
 			s.state = abi.FakeTCPStateEstablished
+			becameEstablished = true
 			actions = append(actions, e.control(flow, s, FlagACK, s.txSequence, s.rxSequence, "complete-handshake"))
 			actions = append(actions, e.release(flow, s)...)
 		case seg.Flags == FlagSYN:
@@ -340,6 +361,7 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) (
 			actions = append(actions, e.control(flow, s, FlagSYN|FlagACK, s.localISN, s.rxSequence, "duplicate-syn"))
 		case seg.Flags&FlagACK != 0 && seg.Acknowledgement == s.txSequence:
 			s.state = abi.FakeTCPStateEstablished
+			becameEstablished = true
 			actions = append(actions, e.release(flow, s)...)
 		default:
 			actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "invalid-syn-received-segment"})
@@ -348,17 +370,25 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) (
 		if seg.Flags&FlagSYN != 0 {
 			actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "syn-on-established"})
 		} else {
-			if end := seg.Sequence + seg.PayloadLength; int32(end-s.rxSequence) > 0 {
-				s.rxSequence = end
+			_, found, err := e.lookupEstablished(flow, s)
+			if err != nil {
+				e.restore(flow, checkpoint)
+				return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+			}
+			if !found {
+				e.remove(flow, s)
+				return []Action{{Kind: ActionClose, Flow: flow, Reason: "fast-session-missing"}}, nil
 			}
 			actions = append(actions, Action{Kind: ActionForward, Flow: flow})
 		}
 	default:
 		actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "invalid-state"})
 	}
-	if err := e.sync(flow, s); err != nil {
-		e.restore(flow, checkpoint)
-		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+	if becameEstablished {
+		if err := e.insertEstablished(flow, s); err != nil {
+			e.restore(flow, checkpoint)
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+		}
 	}
 	return actions, nil
 }
@@ -367,6 +397,7 @@ func (e *Engine) Tick() ([]Action, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := e.opts.Now()
+	nowMonotonic := e.opts.MonotonicNanos()
 	var actions []Action
 	var errs []error
 	for flow, s := range e.sessions {
@@ -376,34 +407,41 @@ func (e *Engine) Tick() ([]Action, error) {
 				continue
 			}
 			if s.retries >= e.opts.HandshakeRetries {
-				if err := e.deleteStore(flow); err != nil {
-					errs = append(errs, err)
-					actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"})
-					continue
-				}
 				e.remove(flow, s)
 				actions = append(actions, Action{Kind: ActionClose, Flow: flow, Reason: "handshake-timeout"})
 				continue
 			}
-			checkpoint := e.checkpoint(s)
 			s.retries++
 			s.nextRetry = now.Add(e.opts.HandshakeTimeout)
 			flags, ack := uint8(FlagSYN), uint32(0)
 			if s.state == abi.FakeTCPStateSynReceived {
 				flags, ack = FlagSYN|FlagACK, s.rxSequence
 			}
-			if err := e.sync(flow, s); err != nil {
-				e.restore(flow, checkpoint)
+			actions = append(actions, e.control(flow, s, flags, s.localISN, ack, "handshake-retry"))
+		case abi.FakeTCPStateEstablished:
+			value, found, err := e.lookupEstablished(flow, s)
+			if err != nil {
 				errs = append(errs, err)
 				actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"})
 				continue
 			}
-			actions = append(actions, e.control(flow, s, flags, s.localISN, ack, "handshake-retry"))
-		case abi.FakeTCPStateEstablished:
-			if now.Sub(s.lastActivity) >= e.opts.IdleTimeout {
-				if err := e.deleteStore(flow); err != nil {
+			if !found {
+				e.remove(flow, s)
+				actions = append(actions, Action{Kind: ActionClose, Flow: flow, Reason: "fast-session-missing"})
+				continue
+			}
+			idle := nowMonotonic >= value.LastSeenNanos &&
+				nowMonotonic-value.LastSeenNanos >= uint64(e.opts.IdleTimeout)
+			if idle {
+				deleted, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, value)
+				if err != nil {
 					errs = append(errs, err)
 					actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"})
+					continue
+				}
+				if !deleted {
+					// BPF advanced the fast state after our lookup. A later tick
+					// re-reads LastSeenNanos; this session is demonstrably active.
 					continue
 				}
 				e.remove(flow, s)
@@ -411,15 +449,9 @@ func (e *Engine) Tick() ([]Action, error) {
 				continue
 			}
 			if !now.Before(s.nextKeepalive) {
-				checkpoint := e.checkpoint(s)
 				s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
-				if err := e.sync(flow, s); err != nil {
-					e.restore(flow, checkpoint)
-					errs = append(errs, err)
-					actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"})
-					continue
-				}
-				actions = append(actions, e.control(flow, s, FlagACK, s.txSequence-1, s.rxSequence, "keepalive"))
+				actions = append(actions, e.controlEstablished(flow, s, value,
+					FlagACK, value.TXSequence-1, value.RXSequence, "keepalive"))
 			}
 		}
 	}
@@ -439,9 +471,22 @@ func (e *Engine) AdvanceGeneration(generation uint64) ([]Action, error) {
 	actions := make([]Action, 0, len(e.sessions))
 	var errs []error
 	for flow, s := range e.sessions {
-		if err := e.deleteStore(flow); err != nil {
-			errs = append(errs, err)
-			continue
+		if s.state == abi.FakeTCPStateEstablished {
+			value, found, err := e.lookupEstablished(flow, s)
+			if err != nil {
+				errs = append(errs, err)
+				continue
+			}
+			if found {
+				deleted, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, value)
+				if err != nil {
+					errs = append(errs, err)
+					continue
+				}
+				if !deleted {
+					continue
+				}
+			}
 		}
 		e.remove(flow, s)
 		actions = append(actions, Action{Kind: ActionClose, Flow: flow, Reason: "generation-drain-rehandshake"})
@@ -452,21 +497,33 @@ func (e *Engine) AdvanceGeneration(generation uint64) ([]Action, error) {
 	return actions, errors.Join(errs...)
 }
 
-func (e *Engine) Snapshot(flow abi.FakeTCPSessionKey) (SessionSnapshot, bool) {
+func (e *Engine) Snapshot(flow abi.FakeTCPSessionKey) (SessionSnapshot, bool, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	s := e.sessions[flow]
 	if s == nil {
-		return SessionSnapshot{}, false
+		return SessionSnapshot{}, false, nil
+	}
+	lastSeenNanos := uint64(0)
+	if s.state == abi.FakeTCPStateEstablished {
+		value, found, err := e.lookupEstablished(flow, s)
+		if err != nil {
+			return SessionSnapshot{}, true, err
+		}
+		if !found {
+			return SessionSnapshot{}, false, nil
+		}
+		lastSeenNanos = value.LastSeenNanos
 	}
 	return SessionSnapshot{
 		State:          s.state,
 		TXSequence:     s.txSequence,
 		RXSequence:     s.rxSequence,
+		LastSeenNanos:  lastSeenNanos,
 		PendingPackets: len(s.pending),
 		PendingBytes:   s.pendingBytes,
 		LastActivity:   s.lastActivity,
-	}, true
+	}, true, nil
 }
 
 func (e *Engine) validateFlow(flow abi.FakeTCPSessionKey) error {
@@ -550,16 +607,25 @@ func (e *Engine) control(flow abi.FakeTCPSessionKey, s *session, flags uint8, se
 	}
 }
 
-func (e *Engine) sync(flow abi.FakeTCPSessionKey, s *session) error {
-	if e.opts.Store == nil {
-		return nil
+func (e *Engine) controlEstablished(flow abi.FakeTCPSessionKey, s *session,
+	value abi.FakeTCPSessionValue, flags uint8, seq, ack uint32, reason string) Action {
+	window := value.Window
+	if window == 0 {
+		window = e.opts.Window
 	}
-	return e.opts.Store.Upsert(flow, abi.FakeTCPSessionValue{
-		Generation: flow.Generation,
-		// BPF uses monotonic bpf_ktime_get_ns(). Userspace cannot safely
-		// synthesize that clock domain, so zero means "not yet observed by
-		// the fast path" and the first packet replaces it.
-		LastSeenNanos: 0,
+	return Action{
+		Kind:    ActionSendControl,
+		Flow:    flow,
+		WGID:    s.wgID,
+		Control: ControlPacket{Flags: flags, Sequence: seq, Acknowledgement: ack, Window: window},
+		Reason:  reason,
+	}
+}
+
+func (e *Engine) insertEstablished(flow abi.FakeTCPSessionKey, s *session) error {
+	return e.opts.Store.InsertEstablished(flow, abi.FakeTCPSessionValue{
+		Generation:    flow.Generation,
+		LastSeenNanos: e.opts.MonotonicNanos(),
 		TXSequence:    s.txSequence,
 		RXSequence:    s.rxSequence,
 		LocalISN:      s.localISN,
@@ -569,9 +635,21 @@ func (e *Engine) sync(flow abi.FakeTCPSessionKey, s *session) error {
 	})
 }
 
-func (e *Engine) deleteStore(flow abi.FakeTCPSessionKey) error {
-	if e.opts.Store == nil {
-		return nil
+func (e *Engine) lookupEstablished(flow abi.FakeTCPSessionKey, s *session) (abi.FakeTCPSessionValue, bool, error) {
+	value, found, err := e.opts.Store.LookupEstablished(flow)
+	if err != nil || !found {
+		return value, found, err
 	}
-	return e.opts.Store.Delete(flow)
+	if value.Generation != flow.Generation || value.State != abi.FakeTCPStateEstablished {
+		return abi.FakeTCPSessionValue{}, false, errors.New("faketcp fast session has invalid generation or state")
+	}
+	if value.LocalISN != s.localISN || value.RemoteISN != s.remoteISN {
+		return abi.FakeTCPSessionValue{}, false, errors.New("faketcp fast session identity changed")
+	}
+	// BPF is the sole writer after insertion. These assignments only refresh
+	// the userspace snapshot used for observability; no whole-value write API
+	// exists on SessionStore.
+	s.txSequence = value.TXSequence
+	s.rxSequence = value.RXSequence
+	return value, true, nil
 }
