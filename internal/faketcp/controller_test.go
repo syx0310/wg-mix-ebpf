@@ -86,7 +86,7 @@ func TestControllerHandshakeSendsControlAndReinjectsFirstPacketOnce(t *testing.T
 		t.Fatal(err)
 	}
 	packetEvent := testEventSample(abi.FakeTCPEvent{
-		Key: flow, PayloadLength: 5, FWMark: 0x1234, WGID: 77,
+		Key: flow, TimestampNanos: 123456, PayloadLength: 5, FWMark: 0x1234, WGID: 77,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
 
@@ -116,7 +116,8 @@ func TestControllerHandshakeSendsControlAndReinjectsFirstPacketOnce(t *testing.T
 		t.Fatalf("reinjected packets=%#v", backend.packets)
 	}
 	got := backend.packets[0]
-	if got.flow != flow || got.packet.FWMark != 0x1234 || got.packet.WGID != 77 || !bytes.Equal(got.packet.Data, wantPacket) {
+	if got.flow != flow || got.packet.FWMark != 0x1234 || got.packet.WGID != 77 ||
+		got.packet.CaptureNanos != 123456 || !bytes.Equal(got.packet.Data, wantPacket) {
 		t.Fatalf("reinjected packet=%#v", got)
 	}
 

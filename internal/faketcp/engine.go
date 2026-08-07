@@ -98,9 +98,10 @@ type Action struct {
 // FWMark on Flow.UnderlayIndex so it traverses the ordinary
 // type-word/XOR/FakeTCP egress pipeline exactly once.
 type PendingPacket struct {
-	Data   []byte
-	FWMark uint32
-	WGID   uint32
+	Data         []byte
+	FWMark       uint32
+	WGID         uint32
+	CaptureNanos uint64
 }
 
 type SessionSnapshot struct {
@@ -251,9 +252,10 @@ func (e *Engine) handleCapturedPacket(event abi.FakeTCPEvent, packet []byte) ([]
 		return nil, fmt.Errorf("faketcp captured packet body has %d bytes for declared length %d", len(packet), event.PacketLength)
 	}
 	return e.outbound(event.Key, PendingPacket{
-		Data:   packet,
-		FWMark: event.FWMark,
-		WGID:   event.WGID,
+		Data:         packet,
+		FWMark:       event.FWMark,
+		WGID:         event.WGID,
+		CaptureNanos: event.TimestampNanos,
 	}, true)
 }
 
