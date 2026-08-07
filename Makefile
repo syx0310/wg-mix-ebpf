@@ -132,7 +132,9 @@ test-lint:
 	python3 -c 'from pathlib import Path; compile(Path("scripts/test_delete_owned_netns.py").read_text(), "scripts/test_delete_owned_netns.py", "exec")'
 	python3 -c 'from pathlib import Path; compile(Path("scripts/stage-root-owned-test-source.py").read_text(), "scripts/stage-root-owned-test-source.py", "exec")'
 	python3 -c 'from pathlib import Path; compile(Path("scripts/test_stage_root_owned_test_source_static.py").read_text(), "scripts/test_stage_root_owned_test_source_static.py", "exec")'
+	python3 -c 'from pathlib import Path; compile(Path("scripts/test_root_stage_source_fd.py").read_text(), "scripts/test_root_stage_source_fd.py", "exec")'
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_stage_root_owned_test_source_static.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_root_stage_source_fd.py
 
 test-config:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./internal/config ./internal/wgconfig
@@ -157,6 +159,7 @@ test-smoke-script-helper:
 
 test-stage-source-helper:
 	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_stage_root_owned_test_source_static.py
+	PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_root_stage_source_fd.py
 
 test-bpf-pkt:
 	@echo "skip: requires external Linux root VM with BPF/TC support"

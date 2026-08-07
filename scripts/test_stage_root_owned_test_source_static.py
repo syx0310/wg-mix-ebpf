@@ -119,7 +119,9 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
             '"0:0:500:1:regular file"',
             'runner_actual_sha="$("${SHA256_BIN}" -- /proc/self/fd/9)"',
             '"${runner_actual_sha}" == "${RUNNER_SHA256}"',
-            'exec {source_fd}<"${path}"',
+            'exec 6<"${SOURCE_LAUNCHER}"',
+            'exec 7<"${SOURCE_HELPER}"',
+            'exec 8<"${SOURCE_MANIFEST}"',
             '"${path_stat}" == "${fd_stat}"',
             '"${actual_sha}" == "${approved_sha}"',
             "validate_approved_source launcher",
@@ -174,6 +176,73 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
         ):
             self.assertIn(fragment, self.runner)
         self.assertNotIn("safe.directory", self.runner)
+
+    def test_root_runner_copies_only_from_held_verified_descriptors(self) -> None:
+        descriptor_contracts = (
+            (
+                "launcher",
+                "LAUNCHER",
+                'readonly LAUNCHER_SOURCE_FD_PATH="/proc/self/fd/6"',
+                'exec 6<"${SOURCE_LAUNCHER}"',
+            ),
+            (
+                "helper",
+                "HELPER",
+                'readonly HELPER_SOURCE_FD_PATH="/proc/self/fd/7"',
+                'exec 7<"${SOURCE_HELPER}"',
+            ),
+            (
+                "manifest",
+                "MANIFEST",
+                'readonly MANIFEST_SOURCE_FD_PATH="/proc/self/fd/8"',
+                'exec 8<"${SOURCE_MANIFEST}"',
+            ),
+        )
+        for label, upper, path_constant, open_fragment in descriptor_contracts:
+            fd_path = f'"${{{upper}_SOURCE_FD_PATH}}"'
+            expected_stat = f'"${{{upper}_SOURCE_FD_STAT}}"'
+            approved_sha = f'"${{{upper}_SHA256}}"'
+            initial_validation = (
+                f"validate_approved_source {label} "
+                f'"${{SOURCE_{upper}}}" {approved_sha} \\\n'
+                f"  {fd_path} {upper}_SOURCE_FD_STAT"
+            )
+            precopy = (
+                f"revalidate_held_source {label} {fd_path} \\\n"
+                f"  {expected_stat} {approved_sha} precopy"
+            )
+            install_start = f"run_write install_root_{label}"
+            postcopy = (
+                f"revalidate_held_source {label} {fd_path} \\\n"
+                f"  {expected_stat} {approved_sha} postcopy"
+            )
+
+            self.assertIn(path_constant, self.runner)
+            self.assertIn(open_fragment, self.runner)
+            self.assertIn(initial_validation, self.runner)
+            self.assertIn(precopy, self.runner)
+            self.assertIn(postcopy, self.runner)
+            open_at = self.runner.index(open_fragment)
+            initial_at = self.runner.index(initial_validation)
+            precopy_at = self.runner.index(precopy)
+            install_at = self.runner.index(install_start, precopy_at)
+            postcopy_at = self.runner.index(postcopy, install_at)
+            self.assertLess(open_at, initial_at)
+            self.assertLess(initial_at, precopy_at)
+            self.assertLess(precopy_at, install_at)
+            self.assertLess(install_at, postcopy_at)
+            install_block = self.runner[install_at:postcopy_at]
+            self.assertIn(fd_path, install_block)
+            self.assertNotIn(f'"${{SOURCE_{upper}}}"', install_block)
+
+        self.assertNotIn("exec {source_fd}", self.runner)
+        self.assertNotRegex(self.runner, r"exec [678]<&-")
+        self.assertIn("source_size > APPROVED_SOURCE_MAX_BYTES", self.runner)
+        self.assertIn('[[ "${actual_sha}" != "${approved_sha}" ]]', self.runner)
+        self.assertIn(
+            "python3 scripts/test_root_stage_source_fd.py",
+            self.makefile,
+        )
 
     def test_runner_audit_covers_every_write_boundary(self) -> None:
         for fragment in (
