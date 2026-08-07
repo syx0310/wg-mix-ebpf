@@ -908,7 +908,7 @@ func (fixture stagedLaunchFixture) close() {
 
 func installFixtureSystemTool(t *testing.T, root, logicalPath string) {
 	t.Helper()
-	for _, directory := range []string{"usr", "usr/bin", "lib", "libexec"} {
+	for _, directory := range []string{"usr", "usr/bin", "lib", "lib/libexec"} {
 		path := filepath.Join(root, directory)
 		if err := os.Mkdir(path, 0o755); err != nil && !errors.Is(err, os.ErrExist) {
 			t.Fatalf("create fixture system directory %s: %v", directory, err)
