@@ -3,9 +3,12 @@
 package dataplane
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"maps"
+	"os"
+	"path/filepath"
 	"reflect"
 	"slices"
 	"strings"
@@ -13,12 +16,14 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
 
 func TestStageFakeTCPPolicyGenerationWritesReachabilityLatchLast(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
-	stage, err := stageFakeTCPPolicyGeneration(policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,10 +46,10 @@ func TestStageFakeTCPPolicyGenerationWritesReachabilityLatchLast(t *testing.T) {
 	assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, snapshot.ControlPolicies)
 	assertMemoryPolicyMapMatches(t, policyMaps.ManagedPorts, snapshot.ManagedPorts)
 	assertMemoryPolicyMapMatches(t, policyMaps.ManagedInterfaces, snapshot.ManagedInterfaces)
-	if err := stage.Disarm(); err != nil {
+	if err := transaction.Disarm(ctx, stage); err != nil {
 		t.Fatal(err)
 	}
-	if err := stage.Rollback(); err != nil {
+	if err := transaction.Rollback(ctx, stage); err != nil {
 		t.Fatal(err)
 	}
 	assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, snapshot.ControlPolicies)
@@ -55,10 +60,11 @@ func TestStageFakeTCPPolicyGenerationRollsBackEveryWriteFailureInReverse(t *test
 	totalWrites := len(snapshot.ControlPolicies) + len(snapshot.ManagedPorts) + len(snapshot.ManagedInterfaces)
 	for failAt := 1; failAt <= totalWrites; failAt++ {
 		t.Run(fmt.Sprintf("write-%d", failAt), func(t *testing.T) {
+			ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 			policyMaps, trace := newMemoryFakeTCPPolicyMaps()
 			old := seedOldFakeTCPPolicyGeneration(policyMaps, 90)
 			trace.failUpdateAt = failAt
-			stage, err := stageFakeTCPPolicyGeneration(policyMaps, snapshot)
+			stage, err := transaction.Stage(ctx, policyMaps, snapshot)
 			if stage != nil {
 				t.Fatal("failed stage returned a rollback handle")
 			}
@@ -79,15 +85,16 @@ func TestStageFakeTCPPolicyGenerationRollsBackEveryWriteFailureInReverse(t *test
 
 func TestFakeTCPPolicyStageRollsBackLaterTransactionFailureAndIsIdempotent(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
 	old := seedOldFakeTCPPolicyGeneration(policyMaps, 90)
-	stage, err := stageFakeTCPPolicyGeneration(policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
 	wantDeletes := slices.Clone(trace.successfulUpdates)
 	slices.Reverse(wantDeletes)
-	if err := stage.Rollback(); err != nil {
+	if err := transaction.Rollback(ctx, stage); err != nil {
 		t.Fatal(err)
 	}
 	assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
@@ -96,21 +103,22 @@ func TestFakeTCPPolicyStageRollsBackLaterTransactionFailureAndIsIdempotent(t *te
 		t.Fatalf("outer rollback order = %v, want %v", trace.deletes, wantDeletes)
 	}
 	deleteCount := len(trace.deletes)
-	if err := stage.Rollback(); err != nil {
+	if err := transaction.Rollback(ctx, stage); err != nil {
 		t.Fatalf("idempotent rollback: %v", err)
 	}
 	if len(trace.deletes) != deleteCount {
 		t.Fatalf("second rollback deleted more entries: %v", trace.deletes)
 	}
-	if err := stage.Disarm(); err == nil || !strings.Contains(err.Error(), "rolled-back") {
+	if err := transaction.Disarm(ctx, stage); err == nil || !strings.Contains(err.Error(), "rolled-back") {
 		t.Fatalf("disarm after rollback error = %v", err)
 	}
 }
 
 func TestFakeTCPPolicyStageChangedValueIsRetryableAndNeverBlindDeleted(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
-	stage, err := stageFakeTCPPolicyGeneration(policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -125,24 +133,297 @@ func TestFakeTCPPolicyStageChangedValueIsRetryableAndNeverBlindDeleted(t *testin
 	changed.Generation++
 	managedInterfaces.entries[changedKey] = changed
 
-	err = stage.Rollback()
+	err = transaction.Rollback(ctx, stage)
 	if err == nil || !strings.Contains(err.Error(), "refusing rollback because inserted value changed") {
 		t.Fatalf("changed-value rollback error = %v", err)
 	}
 	if got := managedInterfaces.entries[changedKey]; got != changed {
 		t.Fatalf("changed value was blindly deleted or overwritten: %#v", got)
 	}
-	if err := stage.Disarm(); err == nil || !strings.Contains(err.Error(), "incomplete rollback") {
+	assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, snapshot.ControlPolicies)
+	assertMemoryPolicyMapMatches(t, policyMaps.ManagedPorts, snapshot.ManagedPorts)
+	if err := transaction.Disarm(ctx, stage); err == nil || !strings.Contains(err.Error(), "incomplete rollback") {
 		t.Fatalf("disarm after incomplete rollback error = %v", err)
 	}
 
-	// Once the exact inserted value is restored, retry cleans the only residue;
-	// already-removed entries are treated as an idempotent success.
+	// Once the exact latch is restored, retry completes the latch phase,
+	// quiesces BPF, and only then removes ports and policies.
 	managedInterfaces.entries[changedKey] = inserted
-	if err := stage.Rollback(); err != nil {
+	if err := transaction.Rollback(ctx, stage); err != nil {
 		t.Fatalf("retry exact rollback: %v", err)
 	}
 	assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
+}
+
+func TestFakeTCPPolicyRollbackStopsAtFailedInterfaceLatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		inject func(*memoryFakeTCPPolicyMap)
+	}{
+		{
+			name: "lookup",
+			inject: func(policyMap *memoryFakeTCPPolicyMap) {
+				policyMap.failNextLookup = errors.New("injected interface lookup failure")
+			},
+		},
+		{
+			name: "delete",
+			inject: func(policyMap *memoryFakeTCPPolicyMap) {
+				policyMap.failNextDelete = errors.New("injected interface delete failure")
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := mustFakeTCPPolicySnapshot(t, 91)
+			ctx, transaction, quiescer := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+			policyMaps, trace := newMemoryFakeTCPPolicyMaps()
+			stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.inject(policyMaps.ManagedInterfaces.(*memoryFakeTCPPolicyMap))
+
+			err = transaction.Rollback(ctx, stage)
+			if err == nil || !strings.Contains(err.Error(), "interface") {
+				t.Fatalf("interface-phase rollback error = %v", err)
+			}
+			if len(quiescer.calls) != 0 {
+				t.Fatalf("quiesce ran with an unconfirmed interface latch: %v", quiescer.calls)
+			}
+			if slices.Contains(trace.deleteAttempts, fakeTCPManagedPortMapName) ||
+				slices.Contains(trace.deleteAttempts, fakeTCPControlPolicyMapName) {
+				t.Fatalf("interface failure touched dependencies: %v", trace.deleteAttempts)
+			}
+			assertMemoryPolicyMapMatches(t, policyMaps.ManagedPorts, snapshot.ManagedPorts)
+			assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, snapshot.ControlPolicies)
+
+			if err := transaction.Rollback(ctx, stage); err != nil {
+				t.Fatalf("retry interface rollback: %v", err)
+			}
+			assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
+		})
+	}
+}
+
+func TestFakeTCPPolicyRollbackStopsAtFailedQuiescenceBarrier(t *testing.T) {
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, quiescer := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
+	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quiescer.fail = errors.New("injected quiescence failure")
+
+	err = transaction.Rollback(ctx, stage)
+	if err == nil || !strings.Contains(err.Error(), "injected quiescence failure") {
+		t.Fatalf("quiescence rollback error = %v", err)
+	}
+	if slices.Contains(trace.deleteAttempts, fakeTCPManagedPortMapName) ||
+		slices.Contains(trace.deleteAttempts, fakeTCPControlPolicyMapName) {
+		t.Fatalf("quiescence failure touched dependencies: %v", trace.deleteAttempts)
+	}
+	if len(policyMaps.ManagedInterfaces.(*memoryFakeTCPPolicyMap).entries) != 0 {
+		t.Fatal("quiescence ran before every interface latch was removed")
+	}
+	assertMemoryPolicyMapMatches(t, policyMaps.ManagedPorts, snapshot.ManagedPorts)
+	assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, snapshot.ControlPolicies)
+
+	quiescer.fail = nil
+	if err := transaction.Rollback(ctx, stage); err != nil {
+		t.Fatalf("retry after quiescence failure: %v", err)
+	}
+	assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
+}
+
+func TestFakeTCPPolicyRollbackStopsAtFailedPortBeforePolicies(t *testing.T) {
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
+	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policyMaps.ManagedPorts.(*memoryFakeTCPPolicyMap).failNextDelete =
+		errors.New("injected port delete failure")
+
+	err = transaction.Rollback(ctx, stage)
+	if err == nil || !strings.Contains(err.Error(), "injected port delete failure") {
+		t.Fatalf("port-phase rollback error = %v", err)
+	}
+	if slices.Contains(trace.deleteAttempts, fakeTCPControlPolicyMapName) {
+		t.Fatalf("port failure touched control policies: %v", trace.deleteAttempts)
+	}
+	assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, snapshot.ControlPolicies)
+
+	if err := transaction.Rollback(ctx, stage); err != nil {
+		t.Fatalf("retry port rollback: %v", err)
+	}
+	assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
+}
+
+func TestFakeTCPPolicyRollbackQuiescesBPFBeforeCursorCompareDeleteWindow(t *testing.T) {
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, quiescer := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
+	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlPolicies := policyMaps.ControlPolicies.(*memoryFakeTCPPolicyMap)
+	controlPolicies.beforeDelete = func(policyMap *memoryFakeTCPPolicyMap, key any) {
+		quiescer.attemptBPFMutation(func() {
+			value := policyMap.entries[key].(abi.FakeTCPControlPolicyValue)
+			value.VirtualTimeNanos++
+			policyMap.entries[key] = value
+		})
+	}
+
+	if err := transaction.Rollback(ctx, stage); err != nil {
+		t.Fatal(err)
+	}
+	if quiescer.bpfMutationAttempts != len(snapshot.ControlPolicies) ||
+		quiescer.bpfMutationBlocked != quiescer.bpfMutationAttempts ||
+		quiescer.bpfMutationUnexpectedly != 0 {
+		t.Fatalf(
+			"compare/delete cursor mutation attempts=%d blocked=%d unexpected=%d",
+			quiescer.bpfMutationAttempts,
+			quiescer.bpfMutationBlocked,
+			quiescer.bpfMutationUnexpectedly,
+		)
+	}
+	assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
+}
+
+func TestStageFakeTCPPolicyInternalFailureUsesLatchAndQuiescenceBarrier(t *testing.T) {
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, quiescer := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
+	trace.failUpdateAt = len(snapshot.ControlPolicies) + len(snapshot.ManagedPorts) +
+		len(snapshot.ManagedInterfaces)
+	quiescer.fail = errors.New("injected internal rollback quiescence failure")
+
+	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	if stage == nil || err == nil ||
+		!strings.Contains(err.Error(), "injected internal rollback quiescence failure") {
+		t.Fatalf("internal stage failure handle=%v error=%v", stage, err)
+	}
+	if len(policyMaps.ManagedInterfaces.(*memoryFakeTCPPolicyMap).entries) != 0 {
+		t.Fatal("internal rollback left its partial interface latch reachable")
+	}
+	if slices.Contains(trace.deleteAttempts, fakeTCPManagedPortMapName) ||
+		slices.Contains(trace.deleteAttempts, fakeTCPControlPolicyMapName) {
+		t.Fatalf("internal quiescence failure touched dependencies: %v", trace.deleteAttempts)
+	}
+	assertMemoryPolicyMapMatches(t, policyMaps.ManagedPorts, snapshot.ManagedPorts)
+	assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, snapshot.ControlPolicies)
+
+	quiescer.fail = nil
+	if err := transaction.Rollback(ctx, stage); err != nil {
+		t.Fatalf("retry internal rollback: %v", err)
+	}
+	assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
+}
+
+func TestFakeTCPPolicyGenerationTransactionRequiresHeldLeaseAndBarrier(t *testing.T) {
+	root := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(root, "daemon.lease"),
+		filepath.Join(root, "maintenance.gate"),
+	)
+	quiesce := func(context.Context, uint64) error { return nil }
+	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, nil, quiesce); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
+		t.Fatalf("transaction without lease = %v, error = %v", transaction, err)
+	}
+	lease, err := lockfile.AcquireLifecycle(
+		ctx,
+		lockfile.LifecycleOwner{PID: os.Getpid(), Action: "test-faketcp-required-lease"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, lease, nil); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
+		t.Fatalf("transaction without quiescence barrier = %v, error = %v", transaction, err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, lease, quiesce); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
+		t.Fatalf("transaction with closed lease = %v, error = %v", transaction, err)
+	}
+}
+
+func TestFakeTCPPolicyGenerationTransactionRetainsLeaseUntilTerminalStage(t *testing.T) {
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
+	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contender, err := lockfile.AcquireLifecycle(
+		ctx,
+		lockfile.LifecycleOwner{PID: os.Getpid(), Action: "test-faketcp-contender"},
+	); !errors.Is(err, lockfile.ErrLifecycleLeaseHeld) {
+		if contender != nil {
+			_ = contender.Close()
+		}
+		t.Fatalf("generation transaction did not retain lifecycle lease: %v", err)
+	}
+	if err := transaction.Close(); err == nil || !strings.Contains(err.Error(), "live policy stage") {
+		t.Fatalf("close with live stage error = %v", err)
+	}
+	if err := transaction.Rollback(ctx, stage); err != nil {
+		t.Fatal(err)
+	}
+	if err := transaction.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reacquired, err := lockfile.AcquireLifecycle(
+		ctx,
+		lockfile.LifecycleOwner{PID: os.Getpid(), Action: "test-faketcp-after-terminal-stage"},
+	)
+	if err != nil {
+		t.Fatalf("lifecycle lease was not released after terminal stage: %v", err)
+	}
+	if err := reacquired.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFakeTCPPolicyStageRejectsWrongGenerationTransactionAndOwner(t *testing.T) {
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	wrongCtx, wrongTransaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 92)
+	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
+	stage, err := wrongTransaction.Stage(wrongCtx, policyMaps, snapshot)
+	if stage != nil || err == nil || !strings.Contains(err.Error(), "does not match transaction") {
+		t.Fatalf("wrong-generation stage handle=%v error=%v", stage, err)
+	}
+	if len(trace.updateAttempts) != 0 || len(trace.deleteAttempts) != 0 {
+		t.Fatalf("wrong-generation transaction mutated maps: %#v", trace)
+	}
+
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+	stage, err = transaction.Stage(ctx, policyMaps, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deleteAttempts := len(trace.deleteAttempts)
+	if err := wrongTransaction.Rollback(wrongCtx, stage); err == nil ||
+		!strings.Contains(err.Error(), "not owned") {
+		t.Fatalf("wrong-owner rollback error = %v", err)
+	}
+	if len(trace.deleteAttempts) != deleteAttempts {
+		t.Fatalf("wrong-owner rollback mutated maps: %v", trace.deleteAttempts)
+	}
+	if err := transaction.Close(); err == nil || !strings.Contains(err.Error(), "live policy stage") {
+		t.Fatalf("close with live stage error = %v", err)
+	}
+	if err := transaction.Rollback(ctx, stage); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestStageFakeTCPPolicyGenerationRejectsExistingKeyWithoutResettingCursor(t *testing.T) {
@@ -186,11 +467,12 @@ func TestStageFakeTCPPolicyGenerationRejectsExistingKeyWithoutResettingCursor(t 
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			snapshot := mustFakeTCPPolicySnapshot(t, 91)
+			ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 			policyMaps, trace := newMemoryFakeTCPPolicyMaps()
 			memoryMap, key, existing := test.seed(policyMaps, snapshot)
 			memoryMap.entries[key] = existing
 
-			stage, err := stageFakeTCPPolicyGeneration(policyMaps, snapshot)
+			stage, err := transaction.Stage(ctx, policyMaps, snapshot)
 			if stage != nil {
 				t.Fatal("existing-key stage returned a rollback handle")
 			}
@@ -209,9 +491,10 @@ func TestStageFakeTCPPolicyGenerationRejectsExistingKeyWithoutResettingCursor(t 
 
 func TestStageFakeTCPPolicyGenerationReadbackMismatchRollsBack(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
 	policyMaps.ManagedPorts.(*memoryFakeTCPPolicyMap).corruptNextSuccessfulReadback = true
-	stage, err := stageFakeTCPPolicyGeneration(policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
 	if stage != nil {
 		t.Fatal("readback mismatch returned a rollback handle")
 	}
@@ -223,6 +506,7 @@ func TestStageFakeTCPPolicyGenerationReadbackMismatchRollsBack(t *testing.T) {
 
 func TestStageFakeTCPPolicyGenerationNeverDeletesChangedRollbackValue(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
 	managedPorts := policyMaps.ManagedPorts.(*memoryFakeTCPPolicyMap)
 	managedPorts.changeFirstInsertedValue = func(value any) any {
@@ -230,7 +514,7 @@ func TestStageFakeTCPPolicyGenerationNeverDeletesChangedRollbackValue(t *testing
 		changed.WGID++
 		return changed
 	}
-	stage, err := stageFakeTCPPolicyGeneration(policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
 	if stage == nil {
 		t.Fatal("incomplete internal rollback did not return a retryable rollback handle")
 	}
@@ -250,15 +534,15 @@ func TestStageFakeTCPPolicyGenerationNeverDeletesChangedRollbackValue(t *testing
 			t.Fatalf("test did not change inserted value: %#v", value)
 		}
 	}
-	if len(policyMaps.ControlPolicies.(*memoryFakeTCPPolicyMap).entries) != 0 ||
-		len(policyMaps.ManagedInterfaces.(*memoryFakeTCPPolicyMap).entries) != 0 {
-		t.Fatal("safe exact rollback did not remove preceding unchanged entries")
+	if len(policyMaps.ManagedInterfaces.(*memoryFakeTCPPolicyMap).entries) != 0 {
+		t.Fatal("internal rollback unexpectedly retained an interface latch")
 	}
-	if err := stage.Disarm(); err == nil || !strings.Contains(err.Error(), "incomplete rollback") {
+	assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, snapshot.ControlPolicies)
+	if err := transaction.Disarm(ctx, stage); err == nil || !strings.Contains(err.Error(), "incomplete rollback") {
 		t.Fatalf("incomplete stage disarm error = %v", err)
 	}
 	managedPorts.entries[changedKey] = wantValue
-	if err := stage.Rollback(); err != nil {
+	if err := transaction.Rollback(ctx, stage); err != nil {
 		t.Fatalf("retry incomplete stage rollback: %v", err)
 	}
 	assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
@@ -316,9 +600,10 @@ func TestStageFakeTCPPolicyGenerationRejectsMalformedSnapshotBeforeWrites(t *tes
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			snapshot := mustFakeTCPPolicySnapshot(t, 91)
+			ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 			test.mutate(snapshot)
 			policyMaps, trace := newMemoryFakeTCPPolicyMaps()
-			stage, err := stageFakeTCPPolicyGeneration(policyMaps, snapshot)
+			stage, err := transaction.Stage(ctx, policyMaps, snapshot)
 			if stage != nil {
 				t.Fatal("malformed snapshot returned a rollback handle")
 			}
@@ -364,11 +649,92 @@ func TestFakeTCPPolicyPerGenerationLimitsMatchTwoBankELFMaps(t *testing.T) {
 	}
 }
 
+type memoryFakeTCPPolicyQuiescer struct {
+	generation              uint64
+	calls                   []uint64
+	fail                    error
+	quiesced                bool
+	bpfMutationAttempts     int
+	bpfMutationBlocked      int
+	bpfMutationUnexpectedly int
+}
+
+func (quiescer *memoryFakeTCPPolicyQuiescer) Quiesce(
+	ctx context.Context,
+	generation uint64,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	quiescer.calls = append(quiescer.calls, generation)
+	if generation != quiescer.generation {
+		return fmt.Errorf("quiesce generation %d, want %d", generation, quiescer.generation)
+	}
+	if quiescer.fail != nil {
+		return quiescer.fail
+	}
+	quiescer.quiesced = true
+	return nil
+}
+
+func (quiescer *memoryFakeTCPPolicyQuiescer) attemptBPFMutation(mutate func()) {
+	quiescer.bpfMutationAttempts++
+	if quiescer.quiesced {
+		quiescer.bpfMutationBlocked++
+		return
+	}
+	quiescer.bpfMutationUnexpectedly++
+	mutate()
+}
+
+func newTestFakeTCPPolicyGenerationTransaction(
+	t *testing.T,
+	generation uint64,
+) (context.Context, *fakeTCPPolicyGenerationTransaction, *memoryFakeTCPPolicyQuiescer) {
+	t.Helper()
+	root := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(root, "daemon.lease"),
+		filepath.Join(root, "maintenance.gate"),
+	)
+	lease, err := lockfile.AcquireLifecycle(
+		ctx,
+		lockfile.LifecycleOwner{PID: os.Getpid(), Action: "test-faketcp-policy-generation"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quiescer := &memoryFakeTCPPolicyQuiescer{generation: generation}
+	transaction, err := newFakeTCPPolicyGenerationTransaction(
+		ctx,
+		generation,
+		lease,
+		quiescer.Quiesce,
+	)
+	if err != nil {
+		_ = lease.Close()
+		t.Fatal(err)
+	}
+	// The transaction's retained descriptor, rather than the caller's handle,
+	// must keep the global mutation lease held until rollback or disarm.
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := transaction.Close(); err != nil {
+			t.Errorf("close FakeTCP policy generation transaction: %v", err)
+		}
+	})
+	return ctx, transaction, quiescer
+}
+
 type memoryFakeTCPPolicyTrace struct {
 	updateAttempts    []string
 	successfulUpdates []string
 	updateFlags       []ebpf.MapUpdateFlags
 	deletes           []string
+	deleteAttempts    []string
 	failUpdateAt      int
 }
 
@@ -378,9 +744,17 @@ type memoryFakeTCPPolicyMap struct {
 	trace                         *memoryFakeTCPPolicyTrace
 	corruptNextSuccessfulReadback bool
 	changeFirstInsertedValue      func(any) any
+	failNextLookup                error
+	failNextDelete                error
+	beforeDelete                  func(*memoryFakeTCPPolicyMap, any)
 }
 
 func (m *memoryFakeTCPPolicyMap) Lookup(key, valueOut any) error {
+	if m.failNextLookup != nil {
+		err := m.failNextLookup
+		m.failNextLookup = nil
+		return err
+	}
 	value, exists := m.entries[key]
 	if !exists {
 		return ebpf.ErrKeyNotExist
@@ -415,8 +789,17 @@ func (m *memoryFakeTCPPolicyMap) Update(key, value any, flags ebpf.MapUpdateFlag
 }
 
 func (m *memoryFakeTCPPolicyMap) Delete(key any) error {
+	m.trace.deleteAttempts = append(m.trace.deleteAttempts, m.name)
+	if m.failNextDelete != nil {
+		err := m.failNextDelete
+		m.failNextDelete = nil
+		return err
+	}
 	if _, exists := m.entries[key]; !exists {
 		return ebpf.ErrKeyNotExist
+	}
+	if m.beforeDelete != nil {
+		m.beforeDelete(m, key)
 	}
 	delete(m.entries, key)
 	m.trace.deletes = append(m.trace.deletes, m.name)
