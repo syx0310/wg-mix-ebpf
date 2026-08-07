@@ -331,6 +331,76 @@ func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
 	}
 }
 
+func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
+	moduleSource, err := os.ReadFile("../../kernel/faketcp_checksum/wg_mix_faketcp_checksum.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bpfSource, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	topSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	makeSource, err := os.ReadFile("../../Makefile")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	module := string(moduleSource)
+	for _, want := range []string{
+		"SPDX-License-Identifier: GPL-2.0-only",
+		"skb_is_gso(skb)",
+		"skb->protocol != htons(ETH_P_IP)",
+		"ip->protocol != IPPROTO_UDP",
+		"skb->ip_summed != CHECKSUM_PARTIAL",
+		"skb_checksum_start_offset(skb) != transport_offset",
+		"skb->csum_offset != offsetof(struct udphdr, check)",
+		"skb_reset_csum_not_inet(skb)",
+		"register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS",
+		".owner = THIS_MODULE",
+	} {
+		if !strings.Contains(module, want) {
+			t.Fatalf("checksum kfunc hard-gate contract missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"BPF_PROG_TYPE_XDP",
+		"BPF_PROG_TYPE_SCHED_ACT",
+		"request_module(",
+		"call_usermodehelper(",
+	} {
+		if strings.Contains(module, forbidden) {
+			t.Fatalf("checksum module contains forbidden expansion %q", forbidden)
+		}
+	}
+
+	bpf := string(bpfSource)
+	if strings.Count(bpf, "wg_mix_faketcp_skb_normalize_udp_csum(") != 2 {
+		t.Fatal("experimental BPF source must contain one declaration and one call of the required kfunc")
+	}
+	top := string(topSource)
+	licenseGate := strings.Index(top, "#ifdef WG_MIX_EXPERIMENTAL_FAKETCP\n// Kernel kfunc callers")
+	experimentalGPL := strings.Index(top, `char LICENSE[] SEC("license") = "GPL";`)
+	baselineMIT := strings.Index(top, `char LICENSE[] SEC("license") = "MIT";`)
+	if licenseGate < 0 || experimentalGPL < licenseGate || baselineMIT < experimentalGPL {
+		t.Fatal("experimental GPL/baseline MIT license split is missing or malformed")
+	}
+
+	makefile := string(makeSource)
+	if !strings.Contains(makefile, "build-faketcp-checksum-kmod:") ||
+		!strings.Contains(makefile, `MO="$(FAKETCP_CHECKSUM_KMOD_OUTPUT)" modules`) {
+		t.Fatal("out-of-tree checksum module build target is missing")
+	}
+	for _, forbidden := range []string{"modules_install", "modprobe", "insmod", "rmmod"} {
+		if strings.Contains(makefile, forbidden) {
+			t.Fatalf("Makefile must not install, load, unload or clean the module: found %q", forbidden)
+		}
+	}
+}
+
 func TestFakeTCPXDPManagedPortLookupPrecedesUnsupportedHeaderExit(t *testing.T) {
 	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
 	if err != nil {

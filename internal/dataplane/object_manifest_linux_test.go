@@ -130,6 +130,12 @@ func TestExperimentalManifestRejectsSchemaAndMetadataDrift(t *testing.T) {
 			},
 		},
 		{
+			name: "kfunc caller program type",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_mix_egress"].Type = ebpf.XDP
+			},
+		},
+		{
 			name: "program interface",
 			mutate: func(spec *ebpf.CollectionSpec) {
 				spec.Programs["wg_faketcp_egress"].Ifindex = 1
@@ -174,7 +180,32 @@ func TestExperimentalManifestRejectsSchemaAndMetadataDrift(t *testing.T) {
 		{
 			name: "program license",
 			mutate: func(spec *ebpf.CollectionSpec) {
-				spec.Programs["wg_faketcp_egress"].License = "GPL"
+				spec.Programs["wg_faketcp_egress"].License = "MIT"
+			},
+		},
+		{
+			name: "missing required kfunc relocation",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_mix_egress"].Instructions = asm.Instructions{asm.Return()}
+			},
+		},
+		{
+			name: "required kfunc on wrong program",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				call := spec.Programs["wg_mix_egress"].Instructions[0]
+				spec.Programs["wg_mix_egress"].Instructions = asm.Instructions{asm.Return()}
+				spec.Programs["wg_faketcp_egress"].Instructions = asm.Instructions{call, asm.Return()}
+			},
+		},
+		{
+			name: "unreviewed kfunc relocation",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				call := asm.Call.Label("unreviewed_kfunc")
+				call.Src = asm.PseudoKfuncCall
+				spec.Programs["wg_mix_egress"].Instructions = append(
+					spec.Programs["wg_mix_egress"].Instructions,
+					call,
+				)
 			},
 		},
 		{
@@ -229,6 +260,9 @@ func TestBaselineAndExperimentalManifestsAreMutuallyExclusive(t *testing.T) {
 
 func canonicalExperimentalCollectionSpec() *ebpf.CollectionSpec {
 	spec := canonicalPinnedMapCollectionSpec()
+	for _, program := range spec.Programs {
+		program.License = experimentalFakeTCPLicense
+	}
 	for _, descriptor := range experimentalMapDescriptors() {
 		spec.Maps[descriptor.name] = &ebpf.MapSpec{
 			Name:       descriptor.name,
@@ -254,6 +288,12 @@ func canonicalExperimentalCollectionSpec() *ebpf.CollectionSpec {
 			KernelVersion: descriptor.kernelVersion,
 			ByteOrder:     binary.LittleEndian,
 		}
+	}
+	kfuncCall := asm.Call.Label(experimentalFakeTCPKfuncName)
+	kfuncCall.Src = asm.PseudoKfuncCall
+	spec.Programs["wg_mix_egress"].Instructions = asm.Instructions{
+		kfuncCall,
+		asm.Return(),
 	}
 	return spec
 }

@@ -7,6 +7,11 @@ BPF_MULTIARCH ?= $(shell gcc -print-multiarch 2>/dev/null)
 BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/include/$(BPF_MULTIARCH),)
 BPF_OBJECT ?= build/wg_mix_tc.o
 FAKETCP_EXPERIMENTAL_BPF_OBJECT ?= build/wg_mix_faketcp_experimental.o
+FAKETCP_CHECKSUM_KMOD_SOURCE ?= $(CURDIR)/kernel/faketcp_checksum
+FAKETCP_CHECKSUM_KMOD_OUTPUT ?= $(CURDIR)/build/faketcp_checksum_kmod
+FAKETCP_CHECKSUM_KMOD_OBJECT ?= $(FAKETCP_CHECKSUM_KMOD_OUTPUT)/wg_mix_faketcp_checksum.ko
+KERNEL_RELEASE ?= $(shell uname -r)
+KERNEL_BUILD ?= /lib/modules/$(KERNEL_RELEASE)/build
 FAKETCP_VERIFIER_LAUNCHER_AMD64 ?= bin/faketcp-verifier-launcher-linux-amd64
 FAKETCP_VERIFIER_LAUNCHER_ARM64 ?= bin/faketcp-verifier-launcher-linux-arm64
 FAKETCP_VERIFIER_LAUNCHER_TEST_AMD64 ?= build/verifierlauncher-linux-amd64.test
@@ -15,7 +20,7 @@ EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 override BUILD_SOURCE_COMMIT := $(shell ./scripts/source-commit.sh)
 override BUILD_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/buildinfo.sourceCommit=$(BUILD_SOURCE_COMMIT)
 
-.PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-faketcp-verifier-only test-faketcp-verifier-launcher test-bpf-object-manifests test-bpf-object-manifest-path-contract _test-bpf-object-manifests test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-faketcp-verifier-launcher build-faketcp-verifier-launcher-linux-amd64 build-faketcp-verifier-launcher-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-faketcp-verifier-only test-faketcp-verifier-launcher test-bpf-object-manifests test-bpf-object-manifest-path-contract _test-bpf-object-manifests test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-faketcp-verifier-launcher build-faketcp-verifier-launcher-linux-amd64 build-faketcp-verifier-launcher-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf build-faketcp-checksum-kmod prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=$(CGO_ENABLED) $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -72,6 +77,17 @@ build-faketcp-experimental-bpf:
 	@mkdir -p $(dir $(FAKETCP_EXPERIMENTAL_BPF_OBJECT))
 	$(CLANG) $(BPF_CFLAGS) -DWG_MIX_EXPERIMENTAL_FAKETCP=1 \
 		-c bpf/wg_mix_tc.c -o $(FAKETCP_EXPERIMENTAL_BPF_OBJECT)
+
+# This target only builds an out-of-tree module into build/. Installation,
+# loading, unloading and cleanup require a separately reviewed real-host step.
+build-faketcp-checksum-kmod:
+	@test -d "$(KERNEL_BUILD)" || { echo "kernel build tree not found: $(KERNEL_BUILD)"; exit 2; }
+	@mkdir -p "$(FAKETCP_CHECKSUM_KMOD_OUTPUT)"
+	$(MAKE) -C "$(KERNEL_BUILD)" \
+		M="$(FAKETCP_CHECKSUM_KMOD_SOURCE)" \
+		MO="$(FAKETCP_CHECKSUM_KMOD_OUTPUT)" modules
+	@test -f "$(FAKETCP_CHECKSUM_KMOD_OBJECT)" || \
+		{ echo "expected module was not built: $(FAKETCP_CHECKSUM_KMOD_OBJECT)"; exit 2; }
 
 define run_bpf_object_manifest_test
 	@baseline_object="$(BPF_OBJECT)"; \

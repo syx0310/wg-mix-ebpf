@@ -38,6 +38,14 @@
 #define FAKETCP_CONTROL_MAX_BURST 4096U
 #define FAKETCP_CONTROL_CAS_ATTEMPTS 4
 
+// Required, non-weak module kfunc. The experimental object cannot be linked or
+// verifier-loaded unless wg_mix_faketcp_checksum is loaded with this exact BTF
+// function. The baseline object never sees this declaration or relocation.
+extern int wg_mix_faketcp_skb_normalize_udp_csum(struct __sk_buff *skb,
+						  __u32 network_offset,
+						  __u32 transport_offset,
+						  __u32 udp_length) __ksym;
+
 enum faketcp_stat_id {
 	FAKETCP_STAT_EGRESS_OK = 0,
 	FAKETCP_STAT_INGRESS_OK,
@@ -505,6 +513,7 @@ static __always_inline int faketcp_preflight_egress(struct __sk_buff *skb,
 {
 	struct faketcp_session_key key = {};
 	struct faketcp_session_value *session;
+	__u32 old_total_len;
 
 	// A UDP GSO skb represents several future wire packets, but this hook is
 	// invoked only once for the aggregate. One header insertion cannot provide
@@ -516,12 +525,30 @@ static __always_inline int faketcp_preflight_egress(struct __sk_buff *skb,
 		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
 		return -1;
 	}
+	if (info->payload_len > FAKETCP_MAX_IPV4_TOTAL_LEN -
+				 sizeof(struct iphdr) - sizeof(struct udphdr)) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return -1;
+	}
+	old_total_len = sizeof(struct iphdr) + sizeof(struct udphdr) +
+			info->payload_len;
+	if (info->ip_off > skb->len || old_total_len != skb->len - info->ip_off) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return -1;
+	}
 	if (faketcp_tc_key(skb, info, generation, &key) < 0)
 		return -1;
 	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
 	if (session && session->generation == generation &&
-	    session->state == FAKETCP_STATE_ESTABLISHED)
+	    session->state == FAKETCP_STATE_ESTABLISHED) {
+		if (wg_mix_faketcp_skb_normalize_udp_csum(
+			    skb, info->ip_off, info->udp_off,
+			    info->payload_len + sizeof(struct udphdr)) < 0) {
+			inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
+			return -1;
+		}
 		return 0;
+	}
 	if (session)
 		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 	else
@@ -571,13 +598,11 @@ static __always_inline int faketcp_mtu_allows_growth(struct __sk_buff *skb,
 }
 
 // TC's public __sk_buff ABI does not expose ip_summed, csum_start or
-// csum_offset, so the program cannot honestly classify CHECKSUM_NONE versus
-// CHECKSUM_PARTIAL. Instead, bpf_skb_change_tail is used before this helper:
-// the kernel documents that operation as linearizing, uncloning and dropping
-// skb offloads. The old UDP checksum is deliberately ignored because it may be
-// only a CHECKSUM_PARTIAL pseudo-header seed. This helper then materializes a
-// new TCP checksum from the IPv4 pseudo-header, constructed TCP header and the
-// complete final (rotated and possibly XORed) payload.
+// csum_offset. The required module kfunc validates and clears exactly one
+// non-GSO UDP CHECKSUM_PARTIAL request before any type-word/XOR mutation. The
+// The old UDP checksum is deliberately ignored because it is only a pseudo-header
+// seed. This helper materializes a new TCP checksum from the IPv4
+// pseudo-header, constructed TCP header and complete final payload.
 //
 // Every read is bounded by the previously validated fixed-IHL IPv4 total
 // length and FAKETCP_MAX_IPV4_TOTAL_LEN. bpf_skb_load_bytes handles a packet
@@ -715,9 +740,9 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		inc_stat(STAT_SKB_LOAD_ERROR);
 		return TC_ACT_SHOT;
 	}
-	// Besides extending the packet, this slow-path helper linearizes, unclones
-	// and drops checksum/GSO offload state. The complete TCP checksum below is
-	// rebuilt from packet bytes; old_udp.check is never treated as materialized.
+	// The kfunc already normalized the validated CHECKSUM_PARTIAL metadata.
+	// change_tail only grows/linearizes the skb; old_udp.check is never treated
+	// as a materialized checksum.
 	if (bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0) < 0) {
 		inc_stat(STAT_SKB_STORE_ERROR);
 		return TC_ACT_SHOT;
@@ -761,9 +786,8 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		return TC_ACT_SHOT;
 	}
 
-	// The initial ip_summed state is not observable through __sk_buff, and the
-	// aggregate-GSO path remains unsupported. Keep activation gated until the
-	// real-NIC CHECKSUM_PARTIAL/metadata and per-segment matrices prove them.
+	// Aggregate GSO remains unsupported. Keep activation gated until the real
+	// TC CHECKSUM_PARTIAL/metadata and NIC matrices prove this module boundary.
 	inc_stat(STAT_EGRESS_REWRITE_OK);
 	inc_faketcp_stat(FAKETCP_STAT_EGRESS_OK);
 	return TC_ACT_OK;
