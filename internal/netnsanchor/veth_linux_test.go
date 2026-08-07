@@ -4,6 +4,7 @@ package netnsanchor
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"runtime"
 	"strconv"
@@ -29,8 +30,10 @@ func (handle *recordingVethLinkHandle) Close() {
 }
 
 type vethThreadObservation struct {
-	stage string
-	tid   int
+	stage     string
+	tid       int
+	startTime uint64
+	startErr  error
 }
 
 func testVethClient(role string) clientFlags {
@@ -279,9 +282,13 @@ func TestCreateVethPairDedicatedThreadTerminatesWithoutChangingCaller(
 
 	var observations []vethThreadObservation
 	record := func(stage string) {
+		tid := unix.Gettid()
+		startTime, startErr := threadTaskStartTime(tid)
 		observations = append(observations, vethThreadObservation{
-			stage: stage,
-			tid:   unix.Gettid(),
+			stage:     stage,
+			tid:       tid,
+			startTime: startTime,
+			startErr:  startErr,
 		})
 	}
 	setDescriptor := -1
@@ -336,6 +343,7 @@ func TestCreateVethPairDedicatedThreadTerminatesWithoutChangingCaller(
 		)
 	}
 	workerTID := observations[0].tid
+	workerStartTime := observations[0].startTime
 	if workerTID <= 0 || workerTID == callerTID {
 		t.Fatalf(
 			"dedicated worker TID = %d, caller TID = %d",
@@ -344,14 +352,24 @@ func TestCreateVethPairDedicatedThreadTerminatesWithoutChangingCaller(
 		)
 	}
 	for index, observation := range observations {
-		if observation.stage != wantStages[index] ||
-			observation.tid != workerTID {
+		if observation.startErr != nil {
 			t.Fatalf(
-				"observation[%d] = %+v, want stage %q on TID %d",
+				"observation[%d] could not identify worker task: %v",
+				index,
+				observation.startErr,
+			)
+		}
+		if observation.stage != wantStages[index] ||
+			observation.tid != workerTID ||
+			observation.startTime == 0 ||
+			observation.startTime != workerStartTime {
+			t.Fatalf(
+				"observation[%d] = %+v, want stage %q on task %d:%d",
 				index,
 				observation,
 				wantStages[index],
 				workerTID,
+				workerStartTime,
 			)
 		}
 	}
@@ -374,23 +392,38 @@ func TestCreateVethPairDedicatedThreadTerminatesWithoutChangingCaller(
 			callerIdentityAfter,
 		)
 	}
-	waitForThreadTaskExit(t, workerTID, 2*time.Second)
+	waitForThreadTaskExit(t, workerTID, workerStartTime, 2*time.Second)
 }
 
-func waitForThreadTaskExit(t *testing.T, tid int, timeout time.Duration) {
+func waitForThreadTaskExit(
+	t *testing.T,
+	tid int,
+	expectedStartTime uint64,
+	timeout time.Duration,
+) {
 	t.Helper()
-	if tid <= 0 || timeout <= 0 {
-		t.Fatalf("invalid thread exit wait contract: tid=%d timeout=%s", tid, timeout)
+	if tid <= 0 || expectedStartTime == 0 || timeout <= 0 {
+		t.Fatalf(
+			"invalid thread exit wait contract: task=%d:%d timeout=%s",
+			tid,
+			expectedStartTime,
+			timeout,
+		)
 	}
-	taskPath := "/proc/self/task/" + strconv.Itoa(tid)
 	deadline := time.Now().Add(timeout)
 	for {
-		_, err := os.Stat(taskPath)
+		observedStartTime, err := threadTaskStartTime(tid)
 		if errors.Is(err, os.ErrNotExist) {
 			return
 		}
 		if err != nil {
-			t.Fatalf("inspect dedicated thread task %s: %v", taskPath, err)
+			t.Fatalf("inspect dedicated thread task %d: %v", tid, err)
+		}
+		// Linux may recycle a TID immediately under concurrent package-test load.
+		// A task with the same numeric TID but a different procfs start time is
+		// not the locked namespace thread whose termination this test awaits.
+		if observedStartTime != expectedStartTime {
+			return
 		}
 		if !time.Now().Before(deadline) {
 			t.Fatalf(
@@ -401,4 +434,33 @@ func waitForThreadTaskExit(t *testing.T, tid int, timeout time.Duration) {
 		}
 		runtime.Gosched()
 	}
+}
+
+func threadTaskStartTime(tid int) (uint64, error) {
+	if tid <= 0 {
+		return 0, errors.New("thread task ID must be positive")
+	}
+	stat, err := os.ReadFile("/proc/self/task/" + strconv.Itoa(tid) + "/stat")
+	if err != nil {
+		return 0, err
+	}
+	// Field 2 is a parenthesized command and may contain spaces or ')'. Split
+	// after its final closing delimiter; field 22 (starttime) is then index 19.
+	commandEnd := strings.LastIndex(string(stat), ") ")
+	if commandEnd < 0 {
+		return 0, errors.New("thread task stat has no command delimiter")
+	}
+	fields := strings.Fields(string(stat[commandEnd+2:]))
+	const startTimeIndex = 19
+	if len(fields) <= startTimeIndex {
+		return 0, errors.New("thread task stat is missing starttime")
+	}
+	startTime, err := strconv.ParseUint(fields[startTimeIndex], 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parse thread task starttime %q: %w", fields[startTimeIndex], err)
+	}
+	if startTime == 0 {
+		return 0, errors.New("thread task starttime is zero")
+	}
+	return startTime, nil
 }
