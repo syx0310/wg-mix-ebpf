@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 import hashlib
+import json
 import pathlib
+import shlex
 import subprocess
+import tempfile
+import textwrap
 import unittest
 
 
@@ -178,6 +182,264 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         )
         self.assertNotIn("ip netns", self.source)
         self.assertNotIn("/run/netns", self.source)
+
+    def test_setup_mutations_have_redacted_start_and_finish_audits(self) -> None:
+        redactor = self.source[
+            self.source.index("print_redacted_netns_argv() {") :
+            self.source.index("\nset_netns_client_args() {")
+        ]
+        self.assertIn("private-key)", redactor)
+        self.assertIn("<redacted-private-key-source>", redactor)
+        self.assertIn('"$(date -u +%Y-%m-%dT%H:%M:%SZ)"', redactor)
+
+        runner = self.source[
+            self.source.index("run_in_owned_netns() {") :
+            self.source.index(
+                "\nrun_wg_set_with_private_key_in_owned_netns() {"
+            )
+        ]
+        self.assertIn('audit_netns_argv start "${ns}" pending', runner)
+        self.assertIn('audit_netns_argv finish "${ns}" "${status}"', runner)
+        self.assertLess(
+            runner.index("audit_netns_argv start"),
+            runner.index('if "${command[@]}"'),
+        )
+        self.assertLess(
+            runner.index('if "${command[@]}"'),
+            runner.index("audit_netns_argv finish"),
+        )
+
+        veth = self.source[
+            self.source.index("create_veth_pair() {") :
+            self.source.index("\nstart_netns_anchor() {")
+        ]
+        self.assertIn(
+            'audit_netns_argv start "${left_ns}<->${right_ns}" pending',
+            veth,
+        )
+        self.assertIn('audit_netns_argv finish \\\n', veth)
+        self.assertIn('return "${status}"', veth)
+
+    def test_private_key_crosses_exec_boundary_only_through_anonymous_stdin(
+        self,
+    ) -> None:
+        wrapper = self.source[
+            self.source.index(
+                "run_wg_set_with_private_key_in_owned_netns() {"
+            ) :
+            self.source.index("\nrun_bounded_in_owned_netns() {")
+        ]
+        self.assertIn('cat <"${private_key_file}" |', wrapper)
+        self.assertIn("private-key /dev/stdin", wrapper)
+        self.assertNotIn('cat "${private_key_file}"', wrapper)
+        self.assertNotIn('private-key "${private_key_file}"', wrapper)
+        self.assertNotIn(
+            'private-key "${SECRET_DIR}/',
+            self.source,
+        )
+
+        run_exec = self.anchor_linux_source[
+            self.anchor_linux_source.index("func runExecCommand(") :
+            self.anchor_linux_source.index("\nfunc runCreateVethPairCommand(")
+        ]
+        self.assertIn("unix.Exec(path, command, os.Environ())", run_exec)
+        self.assertIn("preserves inherited stdin", run_exec)
+        self.assertNotIn("Stdin = nil", run_exec)
+
+    def test_private_key_pipeline_preserves_stdin_rc_and_redaction(self) -> None:
+        audit_functions = self.source[
+            self.source.index("print_redacted_netns_argv() {") :
+            self.source.index("\nset_netns_client_args() {")
+        ]
+        run_function = self.source[
+            self.source.index("run_in_owned_netns() {") :
+            self.source.index(
+                "\nrun_wg_set_with_private_key_in_owned_netns() {"
+            )
+        ]
+        private_key_function = self.source[
+            self.source.index(
+                "run_wg_set_with_private_key_in_owned_netns() {"
+            ) :
+            self.source.index("\nrun_bounded_in_owned_netns() {")
+        ]
+        private_key = b"private-key-behavior-sentinel-7f3a\n"
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = pathlib.Path(temporary_directory)
+            key_path = temporary / "input.key"
+            key_path.write_bytes(private_key)
+            key_path.chmod(0o600)
+
+            producer = temporary / "cat"
+            producer.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import hashlib
+                    import json
+                    import os
+                    import pathlib
+                    import stat
+                    import sys
+
+                    payload = sys.stdin.buffer.read()
+                    record = {
+                        "argv": sys.argv,
+                        "environment": dict(os.environ),
+                        "stdin_is_regular": stat.S_ISREG(os.fstat(0).st_mode),
+                        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+                        "payload_size": len(payload),
+                    }
+                    pathlib.Path(os.environ["TEST_CAPTURE_DIR"], "producer.json").write_text(
+                        json.dumps(record, sort_keys=True), encoding="utf-8"
+                    )
+                    sys.stdout.buffer.write(payload)
+                    """
+                ),
+                encoding="utf-8",
+            )
+            producer.chmod(0o700)
+
+            anchor = temporary / "anchor-stub"
+            anchor.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import json
+                    import os
+                    import pathlib
+                    import stat
+                    import sys
+
+                    record = {
+                        "argv": sys.argv,
+                        "environment": dict(os.environ),
+                        "stdin_is_fifo": stat.S_ISFIFO(os.fstat(0).st_mode),
+                    }
+                    pathlib.Path(os.environ["TEST_CAPTURE_DIR"], "anchor.json").write_text(
+                        json.dumps(record, sort_keys=True), encoding="utf-8"
+                    )
+                    separator = sys.argv.index("--")
+                    command = sys.argv[separator + 1 :]
+                    os.execvpe(command[0], command, dict(os.environ))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            anchor.chmod(0o700)
+
+            wg = temporary / "wg"
+            wg.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import hashlib
+                    import json
+                    import os
+                    import pathlib
+                    import stat
+                    import sys
+
+                    source_index = sys.argv.index("private-key") + 1
+                    private_key_source = sys.argv[source_index]
+                    with open(private_key_source, "rb") as stream:
+                        stdin_is_fifo = stat.S_ISFIFO(os.fstat(stream.fileno()).st_mode)
+                        payload = stream.read()
+                    record = {
+                        "argv": sys.argv,
+                        "environment": dict(os.environ),
+                        "private_key_source": private_key_source,
+                        "stdin_is_fifo": stdin_is_fifo,
+                        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+                        "payload_size": len(payload),
+                    }
+                    pathlib.Path(os.environ["TEST_CAPTURE_DIR"], "wg.json").write_text(
+                        json.dumps(record, sort_keys=True), encoding="utf-8"
+                    )
+                    raise SystemExit(int(os.environ["WG_STUB_STATUS"]))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            wg.chmod(0o700)
+
+            status_path = temporary / "status"
+            harness = "\n".join(
+                (
+                    "set -euo pipefail",
+                    audit_functions,
+                    run_function,
+                    private_key_function,
+                    "set_netns_client_args() {",
+                    "  NETNS_CLIENT_ARGS=(--socket test-socket)",
+                    "}",
+                    "NETNS_CLIENT_ARGS=()",
+                    "NETNS_ANCHOR_IMAGE_FD=9",
+                    f"NETNS_ANCHOR_EXEC={shlex.quote(str(anchor))}",
+                    "export XOR_PASSWORD=xor-environment-sentinel",
+                    "status=0",
+                    "if run_wg_set_with_private_key_in_owned_netns "
+                    f"test-ns {shlex.quote(str(key_path))} wg0 listen-port 31001; then",
+                    "  status=0",
+                    "else",
+                    "  status=$?",
+                    "fi",
+                    f"printf '%s\\n' \"${{status}}\" >{shlex.quote(str(status_path))}",
+                )
+            )
+            completed = subprocess.run(
+                ["/bin/bash", "-c", harness],
+                check=False,
+                capture_output=True,
+                env={
+                    "PATH": f"{temporary}:/usr/bin:/bin",
+                    "LC_ALL": "C",
+                    "TEST_CAPTURE_DIR": str(temporary),
+                    "WG_STUB_STATUS": "23",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr.decode())
+            self.assertEqual(completed.stdout, b"")
+            self.assertEqual(status_path.read_text(encoding="ascii").strip(), "23")
+            producer_record = json.loads(
+                (temporary / "producer.json").read_text(encoding="utf-8")
+            )
+            anchor_record = json.loads(
+                (temporary / "anchor.json").read_text(encoding="utf-8")
+            )
+            wg_record = json.loads(
+                (temporary / "wg.json").read_text(encoding="utf-8")
+            )
+
+            expected_digest = hashlib.sha256(private_key).hexdigest()
+            self.assertTrue(producer_record["stdin_is_regular"])
+            self.assertTrue(anchor_record["stdin_is_fifo"])
+            self.assertTrue(wg_record["stdin_is_fifo"])
+            self.assertEqual(producer_record["payload_sha256"], expected_digest)
+            self.assertEqual(wg_record["payload_sha256"], expected_digest)
+            self.assertEqual(producer_record["payload_size"], len(private_key))
+            self.assertEqual(wg_record["payload_size"], len(private_key))
+            self.assertEqual(wg_record["private_key_source"], "/dev/stdin")
+
+            serialized_records = json.dumps(
+                [producer_record, anchor_record, wg_record], sort_keys=True
+            ).encode()
+            self.assertNotIn(private_key.rstrip(), serialized_records)
+            self.assertNotIn(str(key_path).encode(), serialized_records)
+            for record in (producer_record, anchor_record, wg_record):
+                self.assertNotIn("XOR_PASSWORD", record["environment"])
+
+            stderr = completed.stderr
+            self.assertNotIn(private_key.rstrip(), stderr)
+            self.assertNotIn(str(key_path).encode(), stderr)
+            self.assertNotIn(b"/dev/stdin", stderr)
+            self.assertEqual(stderr.count(b"netns command start:"), 1)
+            self.assertEqual(stderr.count(b"netns command finish:"), 1)
+            self.assertIn(b"netns=test-ns rc=pending argv=", stderr)
+            self.assertIn(b"netns=test-ns rc=23 argv=", stderr)
+            self.assertEqual(stderr.count(b"redacted-private-key-source"), 2)
 
     def test_failure_traps_report_only_and_never_mutate_resources(self) -> None:
         failure_report = self.source[

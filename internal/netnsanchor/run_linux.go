@@ -488,6 +488,9 @@ func runExecCommand(arguments []string) error {
 	if err != nil {
 		return fmt.Errorf("resolve command %q after setns: %w", command[0], err)
 	}
+	// unix.Exec deliberately preserves inherited stdin. Callers can open a
+	// sensitive file before an exec-triggered LSM profile transition, stream it
+	// through an anonymous pipe, and give the final command only /dev/stdin.
 	return unix.Exec(path, command, os.Environ())
 }
 

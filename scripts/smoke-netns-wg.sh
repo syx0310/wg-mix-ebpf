@@ -804,6 +804,52 @@ PY
 
 NETNS_CLIENT_ARGS=()
 
+print_redacted_netns_argv() {
+  local argument
+  local redact_next=0
+
+  for argument in "$@"; do
+    if ((redact_next)); then
+      printf '%q ' '<redacted-private-key-source>'
+      redact_next=0
+      continue
+    fi
+    case "${argument}" in
+      private-key)
+        printf '%q ' "${argument}"
+        redact_next=1
+        ;;
+      private-key=*)
+        printf '%q ' 'private-key=<redacted-private-key-source>'
+        ;;
+      *) printf '%q ' "${argument}" ;;
+    esac
+  done
+}
+
+audit_netns_argv() {
+  local phase="$1"
+  local ns="$2"
+  local status="$3"
+  shift 3
+
+  case "${phase}" in
+    start | finish) ;;
+    *)
+      echo "error: invalid network namespace audit phase: ${phase}" >&2
+      return 1
+      ;;
+  esac
+  if [[ "${status}" != "pending" && ! "${status}" =~ ^[0-9]+$ ]]; then
+    echo "error: invalid network namespace audit status: ${status}" >&2
+    return 1
+  fi
+  printf 'netns command %s: timestamp=%s netns=%q rc=%q argv=' \
+    "${phase}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${ns}" "${status}" >&2
+  print_redacted_netns_argv "$@" >&2
+  printf '\n' >&2
+}
+
 set_netns_client_args() {
   local ns="$1"
   local prefix="${2:-}"
@@ -900,6 +946,8 @@ validate_all_netns_identities() {
 
 run_in_owned_netns() {
   local ns="$1"
+  local status
+  local command=()
   shift
 
   if (($# == 0)); then
@@ -907,10 +955,51 @@ run_in_owned_netns() {
     return 1
   fi
   set_netns_client_args "${ns}" || return 1
-  env -u XOR_PASSWORD \
-    "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
-    "${NETNS_ANCHOR_EXEC}" exec \
-    "${NETNS_CLIENT_ARGS[@]}" -- env -u XOR_PASSWORD "$@"
+  command=(
+    env -u XOR_PASSWORD
+    "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}"
+    "${NETNS_ANCHOR_EXEC}" exec
+    "${NETNS_CLIENT_ARGS[@]}" --
+    env -u XOR_PASSWORD "$@"
+  )
+  audit_netns_argv start "${ns}" pending "${command[@]}"
+  if "${command[@]}"; then
+    status=0
+  else
+    status=$?
+  fi
+  audit_netns_argv finish "${ns}" "${status}" "${command[@]}"
+  return "${status}"
+}
+
+run_wg_set_with_private_key_in_owned_netns() {
+  local ns="$1"
+  local private_key_file="$2"
+  local interface="$3"
+  local status
+  shift 3
+
+  if [[ "${interface}" != "wg0" ]]; then
+    echo "error: invalid WireGuard private-key interface" >&2
+    return 1
+  fi
+  if [[ ! -f "${private_key_file}" || -L "${private_key_file}" ]]; then
+    echo "error: unsafe WireGuard private-key source" >&2
+    return 1
+  fi
+
+  # Bash opens the root-only key before any exec-triggered LSM profile change.
+  # The producer receives only that inherited descriptor and writes an anonymous
+  # pipe, so wg's /dev/stdin open cannot resolve back to the protected key path.
+  # shellcheck disable=SC2002
+  if env -u XOR_PASSWORD cat <"${private_key_file}" |
+    run_in_owned_netns "${ns}" \
+      wg set "${interface}" private-key /dev/stdin "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  return "${status}"
 }
 
 run_bounded_in_owned_netns() {
@@ -943,6 +1032,8 @@ create_veth_pair() {
   local right_ns="$4"
   local left_args=()
   local right_args=()
+  local status
+  local command=()
 
   case "${left_link}:${left_ns}:${right_link}:${right_ns}" in
     "${VETH_A}:${NSA}:${VETH_RA}:${NSR}" | \
@@ -956,13 +1047,24 @@ create_veth_pair() {
   left_args=("${NETNS_CLIENT_ARGS[@]}")
   set_netns_client_args "${right_ns}" "right-" || return 1
   right_args=("${NETNS_CLIENT_ARGS[@]}")
-  env -u XOR_PASSWORD \
-    "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}" \
-    "${NETNS_ANCHOR_EXEC}" create-veth-pair \
-    "${left_args[@]}" \
-    "${right_args[@]}" \
-    --left-link "${left_link}" \
+  command=(
+    env -u XOR_PASSWORD
+    "WG_MIX_EBPF_NETNS_ANCHOR_BOOTSTRAP_FD=${NETNS_ANCHOR_IMAGE_FD}"
+    "${NETNS_ANCHOR_EXEC}" create-veth-pair
+    "${left_args[@]}"
+    "${right_args[@]}"
+    --left-link "${left_link}"
     --right-link "${right_link}"
+  )
+  audit_netns_argv start "${left_ns}<->${right_ns}" pending "${command[@]}"
+  if "${command[@]}"; then
+    status=0
+  else
+    status=$?
+  fi
+  audit_netns_argv finish \
+    "${left_ns}<->${right_ns}" "${status}" "${command[@]}"
+  return "${status}"
 }
 
 start_netns_anchor() {
@@ -2897,12 +2999,12 @@ run_in_owned_netns "${NSA}" ip link add wg0 type wireguard
 run_in_owned_netns "${NSB}" ip link add wg0 type wireguard
 run_in_owned_netns "${NSA}" ip link set wg0 mtu "${WG_MTU}"
 run_in_owned_netns "${NSB}" ip link set wg0 mtu "${WG_MTU}"
-run_in_owned_netns "${NSA}" \
-  wg set wg0 private-key "${SECRET_DIR}/a.key" listen-port 31001 \
+run_wg_set_with_private_key_in_owned_netns \
+  "${NSA}" "${SECRET_DIR}/a.key" wg0 listen-port 31001 \
   fwmark 0x10000001 peer "${B_PUB}" allowed-ips 10.77.0.2/32 \
   endpoint "${B_ENDPOINT}"
-run_in_owned_netns "${NSB}" \
-  wg set wg0 private-key "${SECRET_DIR}/b.key" listen-port 31002 \
+run_wg_set_with_private_key_in_owned_netns \
+  "${NSB}" "${SECRET_DIR}/b.key" wg0 listen-port 31002 \
   fwmark 0x10000002 peer "${A_PUB}" allowed-ips 10.77.0.1/32 \
   endpoint "${A_ENDPOINT}"
 run_in_owned_netns "${NSA}" ip addr add 10.77.0.1/24 dev wg0
