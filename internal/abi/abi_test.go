@@ -80,8 +80,32 @@ func TestStructSizesAreStable(t *testing.T) {
 	if got, want := unsafe.Offsetof(FakeTCPManagedPortKey{}.DestinationPort), uintptr(12); got != want {
 		t.Fatalf("FakeTCPManagedPortKey.DestinationPort offset = %d, want %d", got, want)
 	}
+	if got, want := unsafe.Offsetof(FakeTCPManagedPortValue{}.Generation), uintptr(0); got != want {
+		t.Fatalf("FakeTCPManagedPortValue.Generation offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPManagedPortValue{}.WGID), uintptr(8); got != want {
+		t.Fatalf("FakeTCPManagedPortValue.WGID offset = %d, want %d", got, want)
+	}
 	if got, want := unsafe.Offsetof(FakeTCPManagedPortValue{}.Action), uintptr(12); got != want {
 		t.Fatalf("FakeTCPManagedPortValue.Action offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPManagedPortValue{}.Reserved), uintptr(13); got != want {
+		t.Fatalf("FakeTCPManagedPortValue.Reserved offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPControlPolicyValue{}.Generation), uintptr(0); got != want {
+		t.Fatalf("FakeTCPControlPolicyValue.Generation offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPControlPolicyValue{}.VirtualTimeNanos), uintptr(8); got != want {
+		t.Fatalf("FakeTCPControlPolicyValue.VirtualTimeNanos offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPControlPolicyValue{}.IntervalNanos), uintptr(16); got != want {
+		t.Fatalf("FakeTCPControlPolicyValue.IntervalNanos offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPControlPolicyValue{}.Burst), uintptr(24); got != want {
+		t.Fatalf("FakeTCPControlPolicyValue.Burst offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPControlPolicyValue{}.Reserved), uintptr(28); got != want {
+		t.Fatalf("FakeTCPControlPolicyValue.Reserved offset = %d, want %d", got, want)
 	}
 }
 

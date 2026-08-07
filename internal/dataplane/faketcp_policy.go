@@ -174,6 +174,7 @@ func buildFakeTCPPolicySnapshot(
 			Generation: generation,
 			WGID:       listener.WGID,
 			Action:     abi.ActionRewrite,
+			Reserved:   [3]byte{},
 		}
 
 		policyKey := abi.FakeTCPControlPolicyKey{Generation: generation, WGID: wg.ID}
@@ -183,6 +184,7 @@ func buildFakeTCPPolicySnapshot(
 				VirtualTimeNanos: 0,
 				IntervalNanos:    uint64(wg.FakeTCPSYNRateIntervalNanos),
 				Burst:            wg.FakeTCPSYNBurst,
+				Reserved:         0,
 			}
 		}
 	}
@@ -278,6 +280,12 @@ func validateFakeTCPPolicySnapshot(snapshot *fakeTCPPolicySnapshot) error {
 				key.WGID,
 			)
 		}
+		if value.Reserved != 0 {
+			return fmt.Errorf(
+				"control policy for WireGuard ID %d has nonzero reserved field",
+				key.WGID,
+			)
+		}
 		if value.IntervalNanos < uint64(fakeTCPControlMinInterval) ||
 			value.IntervalNanos > uint64(fakeTCPControlMaxInterval) {
 			return fmt.Errorf("control policy for WireGuard ID %d has invalid interval", key.WGID)
@@ -295,6 +303,9 @@ func validateFakeTCPPolicySnapshot(snapshot *fakeTCPPolicySnapshot) error {
 		}
 		if value.WGID == 0 || value.Action != abi.ActionRewrite {
 			return errors.New("managed port has invalid WireGuard ID or action")
+		}
+		if value.Reserved != ([3]byte{}) {
+			return errors.New("managed port has nonzero reserved bytes")
 		}
 		ifKey := abi.FakeTCPManagedIfKey{
 			Generation:    snapshot.Generation,

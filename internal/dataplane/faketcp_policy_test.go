@@ -62,6 +62,51 @@ func TestBuildFakeTCPPolicySnapshotProjectsExactManagedPolicy(t *testing.T) {
 	}
 }
 
+func TestValidateFakeTCPPolicySnapshotRejectsReservedFields(t *testing.T) {
+	tests := []struct {
+		name    string
+		mutate  func(*fakeTCPPolicySnapshot)
+		wantErr string
+	}{
+		{
+			name: "managed port",
+			mutate: func(snapshot *fakeTCPPolicySnapshot) {
+				for key, value := range snapshot.ManagedPorts {
+					value.Reserved[1] = 1
+					snapshot.ManagedPorts[key] = value
+					break
+				}
+			},
+			wantErr: "managed port has nonzero reserved bytes",
+		},
+		{
+			name: "control policy",
+			mutate: func(snapshot *fakeTCPPolicySnapshot) {
+				for key, value := range snapshot.ControlPolicies {
+					value.Reserved = 1
+					snapshot.ControlPolicies[key] = value
+					break
+				}
+			},
+			wantErr: "control policy for WireGuard ID",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot, err := buildFakeTCPPolicySnapshot(fakeTCPPolicyTestState(), 91)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.mutate(snapshot)
+			err = validateFakeTCPPolicySnapshot(snapshot)
+			if err == nil || !strings.Contains(err.Error(), test.wantErr) ||
+				!strings.Contains(err.Error(), "reserved") {
+				t.Fatalf("reserved validation error = %v, want %q and reserved", err, test.wantErr)
+			}
+		})
+	}
+}
+
 func TestBuildFakeTCPPolicySnapshotIsInputOrderIndependentAndGenerationIsolated(t *testing.T) {
 	state := fakeTCPPolicyTestState()
 	first, err := buildFakeTCPPolicySnapshot(state, 101)

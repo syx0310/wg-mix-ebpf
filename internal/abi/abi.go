@@ -252,7 +252,7 @@ type FakeTCPManagedPortValue struct {
 	Generation uint64
 	WGID       uint32
 	Action     uint8
-	_          [3]byte
+	Reserved   [3]byte // Must stay zero; maps exactly to the C ABI pad bytes.
 }
 
 func (v FakeTCPManagedPortValue) MapGeneration() uint64 { return v.Generation }
@@ -274,7 +274,7 @@ type FakeTCPControlPolicyValue struct {
 	VirtualTimeNanos uint64
 	IntervalNanos    uint64
 	Burst            uint32
-	_                uint32
+	Reserved         uint32 // Must stay zero; maps exactly to the C ABI pad field.
 }
 
 func (v FakeTCPControlPolicyValue) MapGeneration() uint64 { return v.Generation }

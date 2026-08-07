@@ -435,6 +435,44 @@ func TestFakeTCPPolicyRollbackAcceptsOnlyPreexistingBPFControlCursorDrift(t *tes
 	assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
 }
 
+func TestFakeTCPPolicyRollbackRejectsManagedPortReservedDrift(t *testing.T) {
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
+	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	managedPorts := policyMaps.ManagedPorts.(*memoryFakeTCPPolicyMap)
+	var changedKey abi.FakeTCPManagedPortKey
+	var inserted abi.FakeTCPManagedPortValue
+	for key, value := range snapshot.ManagedPorts {
+		changedKey, inserted = key, value
+		break
+	}
+	changed := inserted
+	changed.Reserved[0] = 1
+	managedPorts.entries[changedKey] = changed
+
+	err = transaction.Rollback(ctx, stage)
+	if err == nil || !strings.Contains(err.Error(), "refusing rollback because inserted value changed") {
+		t.Fatalf("managed-port reserved drift rollback error = %v", err)
+	}
+	if got := managedPorts.entries[changedKey]; got != changed {
+		t.Fatalf("managed-port reserved drift was deleted or overwritten: got %#v want %#v", got, changed)
+	}
+	if err := transaction.Disarm(ctx, stage); err == nil ||
+		!strings.Contains(err.Error(), "incomplete rollback") {
+		t.Fatalf("disarm after managed-port reserved drift error = %v", err)
+	}
+
+	managedPorts.entries[changedKey] = inserted
+	if err := transaction.Rollback(ctx, stage); err != nil {
+		t.Fatalf("retry exact managed-port rollback: %v", err)
+	}
+	assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
+}
+
 func TestFakeTCPPolicyRollbackRejectsNonCursorControlPolicyDrift(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -456,6 +494,12 @@ func TestFakeTCPPolicyRollbackRejectsNonCursorControlPolicyDrift(t *testing.T) {
 			name: "burst",
 			mutate: func(value *abi.FakeTCPControlPolicyValue) {
 				value.Burst++
+			},
+		},
+		{
+			name: "reserved",
+			mutate: func(value *abi.FakeTCPControlPolicyValue) {
+				value.Reserved++
 			},
 		},
 	}
@@ -776,6 +820,28 @@ func TestStageFakeTCPPolicyGenerationRejectsMalformedSnapshotBeforeWrites(t *tes
 				}
 			},
 			wantErr: "nonzero BPF-owned virtual time",
+		},
+		{
+			name: "nonzero control reserved",
+			mutate: func(snapshot *fakeTCPPolicySnapshot) {
+				for key, value := range snapshot.ControlPolicies {
+					value.Reserved = 1
+					snapshot.ControlPolicies[key] = value
+					break
+				}
+			},
+			wantErr: "nonzero reserved field",
+		},
+		{
+			name: "nonzero managed port reserved",
+			mutate: func(snapshot *fakeTCPPolicySnapshot) {
+				for key, value := range snapshot.ManagedPorts {
+					value.Reserved[2] = 1
+					snapshot.ManagedPorts[key] = value
+					break
+				}
+			},
+			wantErr: "nonzero reserved bytes",
 		},
 		{
 			name: "missing interface latch",
