@@ -1256,11 +1256,11 @@ fi
   exit 1
 }
 
-grep -qx 'ID=ubuntu' /etc/os-release &&
-  grep -qx 'VERSION_ID="26.04"' /etc/os-release || {
+if ! grep -qx 'ID=ubuntu' /etc/os-release ||
+  ! grep -qx 'VERSION_ID="26.04"' /etc/os-release; then
   echo "error: /etc/os-release does not exactly identify Ubuntu 26.04" >&2
   exit 1
-}
+fi
 
 validate_secure_directory "/" 0
 validate_secure_directory "/var" 0

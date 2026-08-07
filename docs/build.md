@@ -135,7 +135,10 @@ offline config validation
 amd64 tar.gz artifact packaging
 ```
 
-The normal build and release binary use `CGO_ENABLED=0`. The race-test step explicitly sets `CGO_ENABLED=1` because Go's race detector requires cgo on Linux; this is a CI-only test setting and does not affect the packaged binary.
+The normal build and release binary use `CGO_ENABLED=0`. The
+`test-unit-race` target explicitly sets `CGO_ENABLED=1` because Go's race
+detector requires cgo on Linux; this is a test-only setting and does not affect
+the packaged binary.
 
 The public CI intentionally does not run live TC attach, WireGuard, OpenWrt, PPPoE, VLAN, or public-internet tests. Those tests require controlled external machines and should be run in a private lab.
 
