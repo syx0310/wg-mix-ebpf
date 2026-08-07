@@ -164,10 +164,21 @@ func runInstall(ctx context.Context, args []string, stdout io.Writer) error {
 	system := fs.String("system", "", "init system override: systemd, openwrt, unknown")
 	enable := fs.Bool("enable", false, "enable service without starting it")
 	dryRun := fs.Bool("dry-run", false, "print actions instead of applying them")
+	adoptExisting := fs.Bool(
+		"adopt-existing",
+		false,
+		"adopt strictly validated unmarked installation resources",
+	)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	plan, err := install.Install(ctx, install.Options{ConfigPath: *configPath, System: *system, Enable: *enable, DryRun: *dryRun})
+	plan, err := install.Install(ctx, install.Options{
+		ConfigPath:    *configPath,
+		System:        *system,
+		Enable:        *enable,
+		DryRun:        *dryRun,
+		AdoptExisting: *adoptExisting,
+	})
 	if err != nil {
 		return err
 	}

@@ -2,13 +2,15 @@ package install
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
@@ -30,12 +32,13 @@ const (
 )
 
 type Options struct {
-	ConfigPath string
-	System     string
-	Enable     bool
-	DryRun     bool
-	Yes        bool
-	Purge      bool
+	ConfigPath    string
+	System        string
+	Enable        bool
+	DryRun        bool
+	Yes           bool
+	Purge         bool
+	AdoptExisting bool
 }
 
 type Plan struct {
@@ -45,12 +48,43 @@ type Plan struct {
 	BinaryPath string   `json:"binary_path"`
 }
 
+type installAfterInspectHookContextKey struct{}
+type installAfterLifecycleHookContextKey struct{}
+type installAfterSystemdEnableLinkHookContextKey struct{}
+type installAfterSystemdEnableCommitWalkOpenHookContextKey struct{}
+type installAfterSystemdEnableRetentionCheckHookContextKey struct{}
+type installBeforeObjectBoundFreshPublishHookContextKey struct{}
+type uninstallBeforeServiceArtifactExecuteHookContextKey struct{}
+type uninstallBeforeQuarantineHookContextKey struct{}
+type uninstallAfterFinalQuarantineCheckHookContextKey struct{}
+
 func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
+	if err := validateRawDefaultConfigDirectory(opts.ConfigPath); err != nil {
+		return nil, err
+	}
 	system := detectSystem(opts.System)
 	paths := resolvedPaths(opts.ConfigPath)
+	if err := validateInstallOwnershipPaths(paths, system); err != nil {
+		return nil, err
+	}
+	ownership, err := inspectInstallCleanupOwnership(paths, system)
+	if err != nil {
+		return nil, err
+	}
+	if ownership == cleanupOwnershipUnmarked && !opts.AdoptExisting {
+		return nil, errors.New(
+			"refuse to adopt unmarked installation resources without explicit authorization; " +
+				"review the resolved paths and rerun install with --adopt-existing",
+		)
+	}
+	if ownership == cleanupOwnershipUnmarked {
+		if err := validateUnmarkedCleanupResources(paths, system); err != nil {
+			return nil, fmt.Errorf("validate explicitly adopted installation resources: %w", err)
+		}
+	}
 	plan := &Plan{System: system, ConfigPath: paths.ConfigPath, BinaryPath: paths.BinaryPath}
 	add := func(format string, args ...any) { plan.Actions = append(plan.Actions, fmt.Sprintf(format, args...)) }
 
@@ -59,6 +93,9 @@ func Install(ctx context.Context, opts Options) (*Plan, error) {
 	add("ensure directory %s", paths.RunDir)
 	add("install binary to %s", paths.BinaryPath)
 	add("write safe template if %s is missing", paths.ConfigPath)
+	if ownership == cleanupOwnershipUnmarked {
+		add("adopt strictly validated existing resources under installation ownership")
+	}
 	switch system {
 	case "systemd":
 		add("write systemd unit %s", filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"))
@@ -77,6 +114,11 @@ func Install(ctx context.Context, opts Options) (*Plan, error) {
 	if opts.DryRun {
 		return plan, nil
 	}
+	if hook, ok := ctx.Value(installAfterInspectHookContextKey{}).(func() error); ok && hook != nil {
+		if err := hook(); err != nil {
+			return nil, fmt.Errorf("run install post-inspection hook: %w", err)
+		}
+	}
 
 	owner := lockfile.LifecycleOwner{
 		PID:        os.Getpid(),
@@ -84,76 +126,276 @@ func Install(ctx context.Context, opts Options) (*Plan, error) {
 		ConfigPath: paths.ConfigPath,
 		RunDir:     paths.RunDir,
 	}
-	if err := lockfile.WithLifecycle(ctx, nil, owner, func(*lockfile.LifecycleLease) error {
+	maintenance, err := lockfile.BeginLifecycleMaintenance(ctx, owner)
+	if err != nil {
+		return nil, err
+	}
+	lease, err := maintenance.TryAcquireLifecycle(owner)
+	if err != nil {
+		return nil, errors.Join(err, maintenance.Close())
+	}
+	installErr := lockfile.WithLifecycle(ctx, lease, owner, func(
+		lease *lockfile.LifecycleLease,
+	) error {
+		if hook, ok := ctx.Value(installAfterLifecycleHookContextKey{}).(func() error); ok &&
+			hook != nil {
+			if err := hook(); err != nil {
+				return fmt.Errorf("run install lifecycle hook: %w", err)
+			}
+		}
 		return lockfile.WithLock(ctx, paths.RunDir, func() error {
-			return applyInstall(ctx, opts, system, paths)
+			lockedOwnership, err := inspectLockedInstallOwnership(
+				paths,
+				system,
+				ownership,
+				opts.AdoptExisting,
+				lockfile.LifecycleLeasePath(ctx),
+				lease,
+			)
+			if err != nil {
+				return err
+			}
+			return applyInstall(ctx, opts, system, paths, lockedOwnership)
 		})
-	}); err != nil {
+	})
+	closeErr := errors.Join(lease.Close(), maintenance.Close())
+	if err := errors.Join(installErr, closeErr); err != nil {
 		return nil, err
 	}
 	return plan, nil
 }
 
-func applyInstall(ctx context.Context, opts Options, system string, paths paths) error {
-	for _, dir := range []string{filepath.Dir(paths.ConfigPath), paths.VarLibDir, paths.RunDir} {
-		if err := os.MkdirAll(dir, 0o755); err != nil {
-			return fmt.Errorf("create %s: %w", dir, err)
+func applyInstall(
+	ctx context.Context,
+	opts Options,
+	system string,
+	paths paths,
+	ownership cleanupOwnershipState,
+) (retErr error) {
+	freshPublishHook, _ := ctx.Value(
+		installBeforeObjectBoundFreshPublishHookContextKey{},
+	).(func(objectBoundFreshFileHookState) error)
+	configDir := filepath.Dir(paths.ConfigPath)
+	if ownership == cleanupOwnershipAbsent {
+		freshConfig, err := createFreshManagedCleanupDir(configCleanupPath(configDir))
+		if err != nil {
+			return err
 		}
+		if err := freshConfig.close(); err != nil {
+			return fmt.Errorf("close fresh config directory handles: %w", err)
+		}
+	} else if err := os.MkdirAll(configDir, 0o755); err != nil {
+		return fmt.Errorf("create %s: %w", configDir, err)
+	}
+	if err := ensureInstallArtifactParentDirectories(paths, system); err != nil {
+		return err
+	}
+	var stateDir *managedCleanupDir
+	defer func() {
+		if stateDir != nil {
+			retErr = errors.Join(retErr, stateDir.close())
+		}
+	}()
+	publication, err := prepareCleanupManifestPublication(
+		paths,
+		system,
+		cleanupManifestWriteOptions{
+			Fresh:              ownership == cleanupOwnershipAbsent,
+			AdoptExisting:      ownership == cleanupOwnershipUnmarked && opts.AdoptExisting,
+			LifecyclePath:      lockfile.LifecycleLeasePath(ctx),
+			beforeFreshPublish: freshPublishHook,
+			createState: func() (*managedCleanupDir, error) {
+				var err error
+				stateDir, err = createFreshManagedCleanupDir(stateCleanupPath(paths.VarLibDir))
+				return stateDir, err
+			},
+		},
+	)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		retErr = errors.Join(retErr, publication.close())
+	}()
+	if err := publication.revalidateOwnedInstallMetadata(); err != nil {
+		return err
+	}
+	if stateDir == nil {
+		var exists bool
+		var err error
+		stateCreated := false
+		stateDir, exists, err = openManagedCleanupDir(stateCleanupPath(paths.VarLibDir))
+		if err != nil {
+			return err
+		}
+		if !exists {
+			stateDir, err = createFreshManagedCleanupDir(stateCleanupPath(paths.VarLibDir))
+			if err != nil {
+				return err
+			}
+			stateCreated = true
+		}
+		if stateCreated {
+			if err := refreshManagedParentGenerationAfterOwnedChildCreation(
+				publication.configDir,
+				stateDir,
+			); err != nil {
+				return fmt.Errorf(
+					"refresh config-directory parent after recreating state dir: %w",
+					err,
+				)
+			}
+		}
+	}
+	if err := revalidateManagedCleanupDir(stateDir); err != nil {
+		return err
+	}
+	runDir, exists, err := openManagedCleanupDir(runtimeCleanupPath(paths.RunDir))
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return fmt.Errorf("runtime dir %s disappeared while holding its operation lock", paths.RunDir)
+	}
+	if err := revalidateManagedCleanupDir(runDir); err != nil {
+		_ = runDir.close()
+		return err
+	}
+	if err := runDir.close(); err != nil {
+		return fmt.Errorf("close runtime directory handles: %w", err)
+	}
+	if err := publication.revalidateOwnedInstallMetadata(); err != nil {
+		return err
+	}
+	if err := installServiceArtifacts(
+		paths,
+		system,
+		publication.revalidateOwnedInstallMetadata,
+		freshPublishHook,
+	); err != nil {
+		return err
+	}
+	if err := publication.revalidateOwnedInstallMetadata(); err != nil {
+		return err
 	}
 	if err := installBinary(paths.BinaryPath); err != nil {
 		return err
 	}
-	if _, err := os.Stat(paths.ConfigPath); errors.Is(err, os.ErrNotExist) {
-		if err := config.SaveFile(paths.ConfigPath, config.SafeTemplate()); err != nil {
+	if publication.configFile != nil {
+		if err := publication.revalidateOwnedInstallMetadata(); err != nil {
 			return err
 		}
-	} else if err != nil {
-		return fmt.Errorf("stat config %s: %w", paths.ConfigPath, err)
+	} else if err := ensureInstallConfigArtifact(
+		publication.configDir,
+		paths.ConfigPath,
+		ownership != cleanupOwnershipAbsent,
+		freshPublishHook,
+	); err != nil {
+		return err
+	}
+	if err := publication.revalidateOwnedInstallMetadata(); err != nil {
+		return err
 	}
 	switch system {
 	case "systemd":
-		if err := os.MkdirAll(paths.SystemdDir, 0o755); err != nil {
+		if err := runInstalledSystemdServiceCommit(
+			ctx,
+			paths,
+			opts.Enable,
+			ownership != cleanupOwnershipAbsent,
+			publication.revalidateOwnedInstallMetadata,
+			publication.publish,
+		); err != nil {
 			return err
-		}
-		if err := os.WriteFile(filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"), []byte(systemdUnit(paths.ConfigPath, paths.BinaryPath)), 0o644); err != nil {
-			return err
-		}
-		if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
-			return err
-		}
-		if opts.Enable {
-			if err := runCommand(ctx, "systemctl", "enable", "wg-mix-ebpf.service"); err != nil {
-				return err
-			}
 		}
 	case "openwrt":
-		if err := os.MkdirAll(paths.OpenWrtInitDir, 0o755); err != nil {
-			return err
-		}
-		if err := os.MkdirAll(paths.OpenWrtHotplugDir, 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf"), []byte(openWrtInit(paths.ConfigPath, paths.BinaryPath)), 0o755); err != nil {
-			return err
-		}
-		if err := os.WriteFile(filepath.Join(paths.OpenWrtHotplugDir, "90-wg-mix-ebpf"), []byte(openWrtHotplug()), 0o755); err != nil {
-			return err
-		}
 		if opts.Enable {
-			if err := runCommand(ctx, filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf"), "enable"); err != nil {
+			if err := publication.publish(); err != nil {
+				return fmt.Errorf(
+					"commit cleanup ownership before OpenWrt enable: %w",
+					err,
+				)
+			}
+			if err := runInstalledOpenWrtServiceAction(
+				ctx,
+				paths,
+				"enable",
+				publication.revalidateOwnedInstallMetadata,
+			); err != nil {
 				return err
 			}
+		} else if err := publication.publish(); err != nil {
+			return fmt.Errorf("commit cleanup ownership after completed install: %w", err)
+		}
+	default:
+		if err := publication.publish(); err != nil {
+			return fmt.Errorf("commit cleanup ownership after completed install: %w", err)
 		}
 	}
 	return nil
 }
 
-func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
+func ensureInstallArtifactParentDirectories(paths paths, system string) error {
+	type parentSpec struct {
+		path        string
+		defaultPath string
+	}
+	parents := []parentSpec{{
+		path:        filepath.Dir(paths.BinaryPath),
+		defaultPath: defaultBinaryParent,
+	}}
+	serviceSpecs, err := serviceArtifactInstallSpecs(paths, system)
+	if err != nil {
+		return err
+	}
+	for _, spec := range serviceSpecs {
+		parents = append(parents, parentSpec{
+			path:        filepath.Dir(spec.artifact.Path),
+			defaultPath: spec.defaultParent,
+		})
+	}
+	seen := make(map[string]struct{}, len(parents))
+	for _, spec := range parents {
+		key := filepath.Clean(spec.path) + "\x00" + filepath.Clean(spec.defaultPath)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		parent, _, err := openOrCreateDeclaredArtifactParent(
+			spec.path,
+			spec.defaultPath,
+			nil,
+		)
+		if err != nil {
+			return fmt.Errorf(
+				"prepare install artifact parent %s before ownership baselining: %w",
+				spec.path,
+				err,
+			)
+		}
+		if err := parent.close(); err != nil {
+			return fmt.Errorf(
+				"close prepared install artifact parent %s: %w",
+				spec.path,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := validateRawDefaultConfigDirectory(opts.ConfigPath); err != nil {
 		return nil, err
 	}
 	system := detectSystem(opts.System)
 	paths := resolvedPaths(opts.ConfigPath)
+	if err := validateRawServiceArtifactParentPaths(paths, system); err != nil {
+		return nil, err
+	}
 	if err := validateCleanupPaths(paths); err != nil {
 		return nil, err
 	}
@@ -167,8 +409,16 @@ func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
 	add("remove state dir %s", paths.VarLibDir)
 	switch system {
 	case "systemd":
+		add(
+			"atomically quarantine the exact validated systemd enable link if present; "+
+				"allow at most %d existing evidence paths before rename, reserving one owned path and one ambiguity path within hard limit %d",
+			systemdEnableLinkQuarantineExistingLimit,
+			systemdEnableLinkQuarantineHardLimit,
+		)
 		add("remove systemd unit %s", filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service"))
+		add("reload systemd manager after removing the owned unit")
 	case "openwrt":
+		add("disable OpenWrt service to remove derived rc.d links")
 		add("remove OpenWrt init/hotplug scripts")
 	}
 	if opts.Purge {
@@ -181,37 +431,207 @@ func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
 	}
 	add("keep binary %s", paths.BinaryPath)
 	add("binary removal hint: remove %s manually or with the package manager that installed it", paths.BinaryPath)
-	if opts.DryRun {
+
+	initialCleanup, err := prepareUninstallCleanup(
+		paths,
+		system,
+		opts.Purge,
+		lockfile.LifecycleLeasePath(ctx),
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if initialCleanup != nil {
+			if err := initialCleanup.close(); err != nil {
+				retErr = errors.Join(
+					retErr,
+					fmt.Errorf("close initial uninstall preflight handles: %w", err),
+				)
+			}
+		}
+	}()
+	ownsResources := initialCleanup.manifest.Product == cleanupManifestProduct
+	if !ownsResources {
+		plan.Actions = []string{
+			"no owned installation resources found; no changes",
+		}
+		if opts.Purge {
+			plan.Actions = append(
+				plan.Actions,
+				fmt.Sprintf(
+					"purge owned config dir %s: already absent; no-op",
+					filepath.Dir(paths.ConfigPath),
+				),
+			)
+		}
+		plan.Actions = append(
+			plan.Actions,
+			fmt.Sprintf("keep binary %s", paths.BinaryPath),
+			fmt.Sprintf(
+				"binary removal hint: remove %s manually or with the package manager that installed it",
+				paths.BinaryPath,
+			),
+		)
 		return plan, nil
 	}
+	reportedQuarantineEvidence := make(map[string]struct{})
+	addQuarantineEvidenceActions := func(evidencePaths []string) {
+		for _, evidencePath := range evidencePaths {
+			if _, reported := reportedQuarantineEvidence[evidencePath]; reported {
+				continue
+			}
+			reportedQuarantineEvidence[evidencePath] = struct{}{}
+			add(
+				"retained systemd enable-link quarantine evidence %s; no pathname-based unlink was attempted",
+				evidencePath,
+			)
+		}
+	}
+	addQuarantineEvidenceActions(
+		initialCleanup.retainedQuarantineEvidencePaths(),
+	)
 	if !opts.Yes && wireGuardAppearsRunning(ctx, paths.ConfigPath) {
 		return nil, errors.New("managed WireGuard runtime appears active; rerun uninstall with --yes to detach transform and continue")
 	}
-	switch system {
-	case "systemd":
-		unitPath := filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service")
-		if exists(unitPath) {
-			if err := runCommand(ctx, "systemctl", "stop", "wg-mix-ebpf.service"); err != nil {
-				return nil, err
-			}
-		}
-	case "openwrt":
-		initPath := filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf")
-		if exists(initPath) {
-			if err := runCommand(ctx, initPath, "stop"); err != nil {
-				return nil, err
-			}
-		}
+	if opts.DryRun {
+		return plan, nil
 	}
+	if err := initialCleanup.close(); err != nil {
+		return nil, fmt.Errorf("close initial uninstall preflight handles: %w", err)
+	}
+	initialCleanup = nil
 	owner := lockfile.LifecycleOwner{
 		PID:        os.Getpid(),
 		Action:     "uninstall",
 		ConfigPath: paths.ConfigPath,
 		RunDir:     paths.RunDir,
 	}
-	if err := lockfile.WithLifecycle(ctx, nil, owner, func(lease *lockfile.LifecycleLease) error {
+	maintenance, err := lockfile.BeginLifecycleMaintenance(ctx, owner)
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if maintenance != nil {
+			retErr = errors.Join(retErr, maintenance.Close())
+		}
+	}()
+
+	serviceStopPlan, err := prepareUninstallCleanup(
+		paths,
+		system,
+		opts.Purge,
+		lockfile.LifecycleLeasePath(ctx),
+	)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"repeat uninstall preflight after maintenance acquisition: %w",
+			err,
+		)
+	}
+	defer func() {
+		if serviceStopPlan != nil {
+			if err := serviceStopPlan.close(); err != nil {
+				retErr = errors.Join(
+					retErr,
+					fmt.Errorf("close service-stop cleanup handles: %w", err),
+				)
+			}
+		}
+	}()
+	if err := serviceStopPlan.revalidate(); err != nil {
+		return nil, fmt.Errorf(
+			"revalidate all uninstall targets before service stop: %w",
+			err,
+		)
+	}
+	switch system {
+	case "systemd":
+		if err := runSystemdServiceActions(
+			ctx,
+			paths,
+			serviceStopPlan,
+			"stop",
+		); err != nil {
+			return nil, err
+		}
+	case "openwrt":
+		if err := runOpenWrtServiceActions(
+			ctx,
+			serviceStopPlan,
+			"stop",
+			"disable",
+		); err != nil {
+			return nil, err
+		}
+	}
+	if err := serviceStopPlan.close(); err != nil {
+		return nil, fmt.Errorf("close service-stop cleanup handles: %w", err)
+	}
+	serviceStopPlan = nil
+
+	lease, err := maintenance.WaitAcquireLifecycle(ctx, owner)
+	if err != nil {
+		return nil, fmt.Errorf(
+			"wait for daemon lifecycle handoff after verified service stop: %w",
+			err,
+		)
+	}
+	defer func() {
+		if lease != nil {
+			retErr = errors.Join(retErr, lease.Close())
+		}
+	}()
+
+	if err := func() (retErr error) {
+		var retainedServiceArtifactEvidence retainedQuarantineEvidenceReport
+		defer func() {
+			if retErr == nil || len(retainedServiceArtifactEvidence.paths) == 0 {
+				return
+			}
+			errs := []error{retErr}
+			if retainedServiceArtifactEvidence.current {
+				for _, evidencePath := range retainedServiceArtifactEvidence.paths {
+					errs = append(errs, fmt.Errorf(
+						"retained systemd enable-link quarantine evidence at stably enumerated current exact path %s; "+
+							"no pathname-based unlink was attempted",
+						evidencePath,
+					))
+				}
+			} else {
+				errs = append(errs, fmt.Errorf(
+					"retained systemd enable-link quarantine last-known path records [%s]; "+
+						"current exact paths are unavailable because final stable validation did not complete; "+
+						"no pathname-based unlink was attempted",
+					formatExactQuarantineEvidencePaths(
+						retainedServiceArtifactEvidence.paths,
+					),
+				))
+			}
+			retErr = errors.Join(errs...)
+		}()
+		preStopPlan, err := prepareUninstallCleanup(
+			paths,
+			system,
+			opts.Purge,
+			lockfile.LifecycleLeasePath(ctx),
+		)
+		if err != nil {
+			return fmt.Errorf("repeat uninstall preflight after service stop: %w", err)
+		}
+		defer func() {
+			if preStopPlan != nil {
+				if err := preStopPlan.close(); err != nil {
+					retErr = errors.Join(retErr, fmt.Errorf("close pre-stop cleanup handles: %w", err))
+				}
+			}
+		}()
+
 		stopped := false
 		if shouldStopForUninstall(paths) {
+			if err := preStopPlan.revalidate(); err != nil {
+				return fmt.Errorf("revalidate all uninstall targets before detach: %w", err)
+			}
 			if _, err := reconcile.Stop(ctx, reconcile.Options{
 				ConfigPath:     paths.ConfigPath,
 				RunDir:         paths.RunDir,
@@ -222,74 +642,94 @@ func Uninstall(ctx context.Context, opts Options) (*Plan, error) {
 			}
 			stopped = true
 		}
-		if err := lockfile.WithLock(ctx, paths.RunDir, func() error {
-			if !stopped {
-				if err := guard.NewCommandExecutor(paths.VarLibDir).Cleanup(ctx); err != nil {
-					return fmt.Errorf("cleanup startup guard: %w", err)
-				}
-			}
-			if err := os.RemoveAll(paths.PinPath); err != nil {
-				return fmt.Errorf("remove BPF pins %s: %w", paths.PinPath, err)
-			}
-			if err := os.RemoveAll(paths.VarLibDir); err != nil {
-				return fmt.Errorf("remove state dir %s: %w", paths.VarLibDir, err)
-			}
-			switch system {
-			case "systemd":
-				if err := removeIfExists(filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service")); err != nil {
-					return err
-				}
-				if err := runCommand(ctx, "systemctl", "daemon-reload"); err != nil {
-					return err
-				}
-			case "openwrt":
-				if err := removeIfExists(filepath.Join(paths.OpenWrtInitDir, "wg-mix-ebpf")); err != nil {
-					return err
-				}
-				if err := removeIfExists(filepath.Join(paths.OpenWrtHotplugDir, "90-wg-mix-ebpf")); err != nil {
-					return err
-				}
-			}
-			if opts.Purge {
-				if err := os.RemoveAll(filepath.Dir(paths.ConfigPath)); err != nil {
-					return fmt.Errorf("purge config dir %s: %w", filepath.Dir(paths.ConfigPath), err)
-				}
-			}
-			return nil
-		}); err != nil {
-			return err
+		if err := preStopPlan.close(); err != nil {
+			return fmt.Errorf("close pre-stop cleanup handles: %w", err)
 		}
-		return cleanupRuntimeDir(paths.RunDir, lockfile.LifecycleLeasePath(ctx))
-	}); err != nil {
+		preStopPlan = nil
+
+		cleanupPlan, err := prepareUninstallCleanup(
+			paths,
+			system,
+			opts.Purge,
+			lockfile.LifecycleLeasePath(ctx),
+		)
+		if err != nil {
+			return fmt.Errorf("final uninstall preflight after detach: %w", err)
+		}
+		defer func() {
+			if cleanupPlan != nil {
+				if err := cleanupPlan.close(); err != nil {
+					retErr = errors.Join(retErr, fmt.Errorf("close final cleanup handles: %w", err))
+				}
+			}
+		}()
+
+		if !stopped {
+			if err := cleanupPlan.revalidate(); err != nil {
+				return fmt.Errorf("revalidate all uninstall targets before guard cleanup: %w", err)
+			}
+			if err := guard.NewCommandExecutor(paths.VarLibDir).Cleanup(ctx); err != nil {
+				return fmt.Errorf("cleanup startup guard: %w", err)
+			}
+		}
+		if hook, ok := ctx.Value(
+			uninstallBeforeServiceArtifactExecuteHookContextKey{},
+		).(func() error); ok {
+			cleanupPlan.beforeExecute = hook
+		}
+		if hook, ok := ctx.Value(
+			uninstallBeforeQuarantineHookContextKey{},
+		).(func(string) error); ok {
+			cleanupPlan.beforeQuarantine = hook
+		}
+		if hook, ok := ctx.Value(
+			uninstallAfterFinalQuarantineCheckHookContextKey{},
+		).(func(string, string) error); ok {
+			cleanupPlan.afterFinalQuarantineCheck = hook
+		}
+		serviceArtifactErr := cleanupPlan.executeServiceArtifacts()
+		retainedServiceArtifactEvidence =
+			cleanupPlan.retainedQuarantineEvidenceReport()
+		if serviceArtifactErr != nil {
+			return fmt.Errorf(
+				"remove descriptor-anchored service artifacts: %w",
+				serviceArtifactErr,
+			)
+		}
+		addQuarantineEvidenceActions(retainedServiceArtifactEvidence.paths)
+		if system == "systemd" {
+			if err := runSystemdManagerReloadAfterServiceArtifactRemoval(
+				ctx,
+				cleanupPlan,
+			); err != nil {
+				return err
+			}
+		}
+		if err := cleanupPlan.close(); err != nil {
+			return fmt.Errorf("close service-artifact cleanup handles: %w", err)
+		}
+		cleanupPlan = nil
+
+		cleanupPlan, err = prepareUninstallCleanup(
+			paths,
+			system,
+			opts.Purge,
+			lockfile.LifecycleLeasePath(ctx),
+		)
+		if err != nil {
+			return fmt.Errorf("repeat uninstall preflight after service reload: %w", err)
+		}
+		// The global lifecycle lease serializes every mutating entrypoint. Do
+		// not acquire the per-run lock here: WithLock creates a lock file, which
+		// would mutate the fully preflighted target set before revalidation.
+		if err := cleanupPlan.execute(); err != nil {
+			return fmt.Errorf("execute descriptor-anchored uninstall cleanup: %w", err)
+		}
+		return nil
+	}(); err != nil {
 		return nil, err
 	}
 	return plan, nil
-}
-
-func cleanupRuntimeDir(runDir string, lifecyclePath string) error {
-	if filepath.Clean(runDir) != filepath.Clean(filepath.Dir(lifecyclePath)) {
-		if err := os.RemoveAll(runDir); err != nil {
-			return fmt.Errorf("remove runtime dir %s: %w", runDir, err)
-		}
-		return nil
-	}
-	entries, err := os.ReadDir(runDir)
-	if errors.Is(err, os.ErrNotExist) {
-		return nil
-	}
-	if err != nil {
-		return fmt.Errorf("read runtime dir %s: %w", runDir, err)
-	}
-	for _, entry := range entries {
-		path := filepath.Join(runDir, entry.Name())
-		if filepath.Clean(path) == filepath.Clean(lifecyclePath) {
-			continue
-		}
-		if err := os.RemoveAll(path); err != nil {
-			return fmt.Errorf("remove runtime entry %s: %w", path, err)
-		}
-	}
-	return nil
 }
 
 func shouldStopForUninstall(paths paths) bool {
@@ -324,51 +764,6 @@ func resolvedPaths(configPath string) paths {
 	}
 }
 
-func installBinary(target string) error {
-	src, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("resolve current executable: %w", err)
-	}
-	srcAbs, _ := filepath.Abs(src)
-	dstAbs, _ := filepath.Abs(target)
-	if srcAbs == dstAbs {
-		return nil
-	}
-	if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
-		return err
-	}
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer in.Close()
-	out, err := os.CreateTemp(filepath.Dir(target), "."+filepath.Base(target)+".tmp-")
-	if err != nil {
-		return err
-	}
-	tmpPath := out.Name()
-	defer os.Remove(tmpPath)
-	if err := out.Chmod(0o755); err != nil {
-		_ = out.Close()
-		return err
-	}
-	if _, err := io.Copy(out, in); err != nil {
-		_ = out.Close()
-		return err
-	}
-	if err := out.Sync(); err != nil {
-		_ = out.Close()
-		return err
-	}
-	if err := out.Close(); err != nil {
-		return err
-	}
-	if err := os.Rename(tmpPath, target); err != nil {
-		return err
-	}
-	return nil
-}
-
 func wireGuardAppearsRunning(ctx context.Context, configPath string) bool {
 	cfg, err := config.LoadFileLenient(configPath)
 	if err != nil {
@@ -383,66 +778,130 @@ func wireGuardAppearsRunning(ctx context.Context, configPath string) bool {
 	return false
 }
 
+func validateInstallOwnershipPaths(paths paths, system string) error {
+	if err := validateRawServiceArtifactParentPaths(paths, system); err != nil {
+		return err
+	}
+	if err := validateCleanupPaths(paths); err != nil {
+		return err
+	}
+	if err := validateInstallBinaryPath(paths.BinaryPath); err != nil {
+		return err
+	}
+	if paths.ConfigPath == "" || !filepath.IsAbs(paths.ConfigPath) ||
+		filepath.Clean(paths.ConfigPath) != paths.ConfigPath {
+		return fmt.Errorf("refuse unsafe install config path %q", paths.ConfigPath)
+	}
+	if _, err := managedCleanupAnchor(configCleanupPath(filepath.Dir(paths.ConfigPath))); err != nil {
+		return err
+	}
+	for _, spec := range []cleanupPathSpec{
+		configCleanupPath(filepath.Dir(paths.ConfigPath)),
+		runtimeCleanupPath(paths.RunDir),
+		stateCleanupPath(paths.VarLibDir),
+		bpfPinCleanupPath(paths.PinPath),
+	} {
+		dir, exists, err := openManagedCleanupDir(spec)
+		if err != nil {
+			return fmt.Errorf("validate existing install ownership path: %w", err)
+		}
+		if exists {
+			if err := dir.close(); err != nil {
+				return fmt.Errorf("close validated install ownership path: %w", err)
+			}
+		}
+	}
+	return nil
+}
+
+func validateRawServiceArtifactParentPaths(paths paths, system string) error {
+	type parentSpec struct {
+		kind        string
+		path        string
+		defaultPath string
+	}
+	var parents []parentSpec
+	switch system {
+	case "systemd":
+		parents = []parentSpec{{
+			kind:        "systemd",
+			path:        paths.SystemdDir,
+			defaultPath: "/etc/systemd/system",
+		}}
+	case "openwrt":
+		parents = []parentSpec{
+			{
+				kind:        "OpenWrt init",
+				path:        paths.OpenWrtInitDir,
+				defaultPath: "/etc/init.d",
+			},
+			{
+				kind:        "OpenWrt hotplug",
+				path:        paths.OpenWrtHotplugDir,
+				defaultPath: "/etc/hotplug.d/iface",
+			},
+		}
+	}
+	for _, parent := range parents {
+		if _, err := declaredArtifactPathSpec(parent.path, parent.defaultPath); err != nil {
+			return fmt.Errorf(
+				"validate raw %s service artifact directory: %w",
+				parent.kind,
+				err,
+			)
+		}
+	}
+	return nil
+}
+
+func validateRawDefaultConfigDirectory(configPath string) error {
+	if configPath != "" {
+		return nil
+	}
+	etcDir := envOr(EnvEtcDir, "/etc/wg-mix-ebpf")
+	if !filepath.IsAbs(etcDir) || filepath.Clean(etcDir) != etcDir {
+		return fmt.Errorf(
+			"refuse relative or non-clean default config directory %q",
+			etcDir,
+		)
+	}
+	return nil
+}
+
 func validatePurgeDir(paths paths) error {
-	configDir := filepath.Clean(filepath.Dir(paths.ConfigPath))
-	ownedDir := filepath.Clean(envOr(EnvEtcDir, "/etc/wg-mix-ebpf"))
+	if paths.ConfigPath == "" || filepath.Clean(paths.ConfigPath) != paths.ConfigPath {
+		return fmt.Errorf("refuse to purge config with non-clean path %q", paths.ConfigPath)
+	}
+	configDir := filepath.Dir(paths.ConfigPath)
+	ownedDir := envOr(EnvEtcDir, "/etc/wg-mix-ebpf")
+	if filepath.Clean(ownedDir) != ownedDir {
+		return fmt.Errorf("refuse to purge non-clean owned config directory %q", ownedDir)
+	}
 	if configDir != ownedDir {
 		return fmt.Errorf("refuse to purge non-owned config directory %s; only %s is managed by uninstall --purge", configDir, ownedDir)
 	}
-	switch configDir {
-	case "/", "/etc", "/tmp", "/var", "/usr", "/usr/sbin", "/run", "/var/lib":
-		return fmt.Errorf("refuse to purge unsafe config directory %s", configDir)
-	}
-	if configDir == "." || configDir == "" {
-		return fmt.Errorf("refuse to purge invalid config directory %q", configDir)
+	if err := validateManagedCleanupPath(configCleanupPath(configDir)); err != nil {
+		return err
 	}
 	return nil
 }
 
 func validateCleanupPaths(paths paths) error {
-	cleanup := []struct {
-		name string
-		path string
-	}{
-		{name: "runtime dir", path: paths.RunDir},
-		{name: "state dir", path: paths.VarLibDir},
-		{name: "BPF pin path", path: paths.PinPath},
+	if err := validateServiceTemplatePath("config path", paths.ConfigPath); err != nil {
+		return err
 	}
-	protected := map[string]struct{}{
-		"/": {}, "/bin": {}, "/boot": {}, "/dev": {}, "/etc": {}, "/home": {},
-		"/lib": {}, "/lib64": {}, "/opt": {}, "/proc": {}, "/root": {}, "/run": {},
-		"/sbin": {}, "/srv": {}, "/sys": {}, "/sys/fs": {}, "/sys/fs/bpf": {},
-		"/tmp": {}, "/usr": {}, "/var": {}, "/var/lib": {},
-		"/Library": {}, "/System": {}, "/Users": {}, "/private": {},
-		"/private/tmp": {}, "/private/var": {},
+	cleanup := []cleanupPathSpec{
+		runtimeCleanupPath(paths.RunDir),
+		stateCleanupPath(paths.VarLibDir),
+		bpfPinCleanupPath(paths.PinPath),
 	}
 	configDir := filepath.Clean(filepath.Dir(paths.ConfigPath))
-	allowedRoots := map[string][]string{
-		"runtime dir":  {"/run", "/var/run", os.TempDir()},
-		"state dir":    {"/var/lib", os.TempDir()},
-		"BPF pin path": {"/sys/fs/bpf", os.TempDir()},
-	}
-	for i := range cleanup {
-		cleanup[i].path = filepath.Clean(cleanup[i].path)
-		if !filepath.IsAbs(cleanup[i].path) {
-			return fmt.Errorf("refuse unsafe relative %s %q", cleanup[i].name, cleanup[i].path)
+	for _, candidate := range cleanup {
+		if err := validateManagedCleanupPath(candidate); err != nil {
+			return err
 		}
-		if _, denied := protected[cleanup[i].path]; denied {
-			return fmt.Errorf("refuse unsafe %s %s", cleanup[i].name, cleanup[i].path)
-		}
-		allowed := false
-		for _, root := range allowedRoots[cleanup[i].name] {
-			root = filepath.Clean(root)
-			if cleanup[i].path != root && pathContains(root, cleanup[i].path) {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
-			return fmt.Errorf("refuse %s outside its managed roots: %s", cleanup[i].name, cleanup[i].path)
-		}
-		if pathContains(cleanup[i].path, configDir) {
-			return fmt.Errorf("refuse %s %s because it contains config directory %s", cleanup[i].name, cleanup[i].path, configDir)
+		if pathContains(candidate.path, configDir) {
+			return fmt.Errorf("refuse %s %s because it contains config directory %s", candidate.name, candidate.path, configDir)
 		}
 	}
 	for i := 0; i < len(cleanup); i++ {
@@ -453,6 +912,104 @@ func validateCleanupPaths(paths paths) error {
 		}
 	}
 	return nil
+}
+
+func validateServiceTemplatePath(name string, path string) error {
+	if path == "" || !filepath.IsAbs(path) || filepath.Clean(path) != path {
+		return fmt.Errorf("refuse unsafe %s %q: path must be absolute and clean", name, path)
+	}
+	if !utf8.ValidString(path) {
+		return fmt.Errorf("refuse unsafe %s %q: path is not valid UTF-8", name, path)
+	}
+	for _, character := range path {
+		if unicode.IsControl(character) {
+			return fmt.Errorf(
+				"refuse unsafe %s %q: path contains a control character",
+				name,
+				path,
+			)
+		}
+	}
+	if strings.ContainsAny(path, "%$") {
+		return fmt.Errorf(
+			"refuse unsafe %s %q: path contains a service-template expansion character",
+			name,
+			path,
+		)
+	}
+	return nil
+}
+
+const (
+	managedCleanupBase      = "wg-mix-ebpf"
+	maxCleanupPathSuffixLen = 64
+)
+
+type cleanupPathSpec struct {
+	name        string
+	path        string
+	defaultPath string
+	systemRoot  string
+}
+
+func runtimeCleanupPath(path string) cleanupPathSpec {
+	return cleanupPathSpec{name: "runtime dir", path: path, defaultPath: daemon.DefaultRunDir, systemRoot: "/run"}
+}
+
+func stateCleanupPath(path string) cleanupPathSpec {
+	return cleanupPathSpec{name: "state dir", path: path, defaultPath: attachstate.DefaultStateDir, systemRoot: "/var/lib"}
+}
+
+func bpfPinCleanupPath(path string) cleanupPathSpec {
+	return cleanupPathSpec{name: "BPF pin path", path: path, defaultPath: dataplane.DefaultPinPath, systemRoot: "/sys/fs/bpf"}
+}
+
+func configCleanupPath(path string) cleanupPathSpec {
+	return cleanupPathSpec{name: "config dir", path: path, defaultPath: "/etc/wg-mix-ebpf", systemRoot: "/etc"}
+}
+
+func validateManagedCleanupPath(spec cleanupPathSpec) error {
+	_, err := managedCleanupAnchor(spec)
+	return err
+}
+
+func validManagedCleanupBase(base string) bool {
+	if base == managedCleanupBase {
+		return true
+	}
+	prefix := managedCleanupBase + "-"
+	if !strings.HasPrefix(base, prefix) {
+		return false
+	}
+	suffix := strings.TrimPrefix(base, prefix)
+	if len(suffix) == 0 || len(suffix) > maxCleanupPathSuffixLen {
+		return false
+	}
+	for index := range len(suffix) {
+		character := suffix[index]
+		alphaNumeric := character >= 'a' && character <= 'z' ||
+			character >= 'A' && character <= 'Z' ||
+			character >= '0' && character <= '9'
+		if alphaNumeric {
+			continue
+		}
+		if character != '-' || index == 0 || index == len(suffix)-1 {
+			return false
+		}
+	}
+	return true
+}
+
+func validRuntimeQueueFile(name string) bool {
+	if !strings.HasSuffix(name, ".json") {
+		return false
+	}
+	id := strings.TrimSuffix(name, ".json")
+	if len(id) != 32 {
+		return false
+	}
+	_, err := hex.DecodeString(id)
+	return err == nil
 }
 
 func pathContains(parent string, child string) bool {
@@ -466,13 +1023,6 @@ func pathContains(parent string, child string) bool {
 func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
-}
-
-func removeIfExists(path string) error {
-	if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return fmt.Errorf("remove %s: %w", path, err)
-	}
-	return nil
 }
 
 func detectSystem(explicit string) string {
@@ -500,6 +1050,110 @@ func runCommand(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
+func verifySystemdServiceFragment(ctx context.Context, paths paths) error {
+	expected := filepath.Join(paths.SystemdDir, "wg-mix-ebpf.service")
+	if !filepath.IsAbs(expected) || filepath.Clean(expected) != expected {
+		return fmt.Errorf(
+			"refuse systemd service verification for non-clean unit path %q",
+			expected,
+		)
+	}
+	args := []string{
+		"show",
+		"--property=FragmentPath",
+		"--property=DropInPaths",
+		"--property=NeedDaemonReload",
+		"--property=LoadState",
+		"--property=Transient",
+		"wg-mix-ebpf.service",
+	}
+	cmd := exec.CommandContext(ctx, "systemctl", args...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf(
+			"systemctl %s failed while verifying owned service: %w: %s",
+			strings.Join(args, " "),
+			err,
+			string(out),
+		)
+	}
+	properties, err := parseSystemdUnitProperties(out)
+	if err != nil {
+		return fmt.Errorf("refuse systemd service with ambiguous manager state: %w", err)
+	}
+	if properties["FragmentPath"] != expected {
+		return fmt.Errorf(
+			"refuse to operate systemd service: FragmentPath %q does not match owned unit %q",
+			properties["FragmentPath"],
+			expected,
+		)
+	}
+	if properties["DropInPaths"] != "" {
+		return fmt.Errorf(
+			"refuse to operate systemd service with unowned DropInPaths %q",
+			properties["DropInPaths"],
+		)
+	}
+	if properties["NeedDaemonReload"] != "no" {
+		return fmt.Errorf(
+			"refuse to operate systemd service with NeedDaemonReload=%q",
+			properties["NeedDaemonReload"],
+		)
+	}
+	if properties["LoadState"] != "loaded" {
+		return fmt.Errorf(
+			"refuse to operate systemd service with LoadState=%q",
+			properties["LoadState"],
+		)
+	}
+	if properties["Transient"] != "no" {
+		return fmt.Errorf(
+			"refuse to operate transient systemd service: Transient=%q",
+			properties["Transient"],
+		)
+	}
+	return nil
+}
+
+func parseSystemdUnitProperties(data []byte) (map[string]string, error) {
+	const expectedPropertyCount = 5
+	allowed := map[string]struct{}{
+		"FragmentPath":     {},
+		"DropInPaths":      {},
+		"NeedDaemonReload": {},
+		"LoadState":        {},
+		"Transient":        {},
+	}
+	if len(data) == 0 || strings.IndexByte(string(data), 0) >= 0 {
+		return nil, errors.New("systemctl returned empty or NUL-containing output")
+	}
+	properties := make(map[string]string, expectedPropertyCount)
+	for _, line := range strings.Split(strings.TrimSuffix(string(data), "\n"), "\n") {
+		if strings.HasSuffix(line, "\r") {
+			line = strings.TrimSuffix(line, "\r")
+		}
+		name, value, found := strings.Cut(line, "=")
+		if !found {
+			return nil, fmt.Errorf("systemctl returned malformed property line %q", line)
+		}
+		if _, ok := allowed[name]; !ok {
+			return nil, fmt.Errorf("systemctl returned unexpected property %q", name)
+		}
+		if _, duplicate := properties[name]; duplicate {
+			return nil, fmt.Errorf("systemctl returned duplicate property %q", name)
+		}
+		properties[name] = value
+	}
+	if len(properties) != expectedPropertyCount {
+		return nil, fmt.Errorf(
+			"systemctl returned %d service properties, want %d",
+			len(properties),
+			expectedPropertyCount,
+		)
+	}
+	return properties, nil
+}
+
 func envOr(name string, fallback string) string {
 	if value := os.Getenv(name); value != "" {
 		return value
@@ -523,17 +1177,28 @@ RestartSec=3s
 
 [Install]
 WantedBy=multi-user.target
-`, binaryPath, configPath, binaryPath, configPath, binaryPath, configPath)
+`,
+		systemdExecArgument(binaryPath),
+		systemdExecArgument(configPath),
+		systemdExecArgument(binaryPath),
+		systemdExecArgument(configPath),
+		systemdExecArgument(binaryPath),
+		systemdExecArgument(configPath),
+	)
 }
 
-func openWrtInit(configPath string, binaryPath string) string {
+func openWrtInit(configPath string, binaryPath string, initPath string) string {
 	return fmt.Sprintf(`#!/bin/sh /etc/rc.common
 
 USE_PROCD=1
 START=99
 STOP=10
 
-CONF="%s"
+# rc.common sources this script through the verified descriptor path used by
+# the installer. Restore the installed pathname before rc.common derives the
+# procd service name or creates/removes rc.d links.
+initscript=%s
+CONF=%s
 
 start_service() {
     procd_open_instance
@@ -551,7 +1216,27 @@ reload_service() {
 stop_service() {
     %s stop --config "$CONF"
 }
-`, configPath, binaryPath, binaryPath, binaryPath)
+`,
+		shellSingleQuote(initPath),
+		shellSingleQuote(configPath),
+		shellSingleQuote(binaryPath),
+		shellSingleQuote(binaryPath),
+		shellSingleQuote(binaryPath),
+	)
+}
+
+func systemdExecArgument(value string) string {
+	replacer := strings.NewReplacer(
+		`\`, `\\`,
+		`"`, `\"`,
+		`%`, `%%`,
+		`$`, `$$`,
+	)
+	return `"` + replacer.Replace(value) + `"`
+}
+
+func shellSingleQuote(value string) string {
+	return `'` + strings.ReplaceAll(value, `'`, `'"'"'`) + `'`
 }
 
 func openWrtHotplug() string {
