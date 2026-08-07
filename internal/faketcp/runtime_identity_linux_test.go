@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -410,24 +411,46 @@ func TestConcurrentLinuxRuntimeIdentityHooksAllowExactlyOneSeed(t *testing.T) {
 }
 
 type fakeLinuxFreshCollectionClaim struct {
-	trace     *runtimeIdentityTestTrace
-	callbacks int
-	held      atomic.Bool
-	entries   atomic.Int32
+	trace      *runtimeIdentityTestTrace
+	callbacks  int
+	held       atomic.Bool
+	entries    atomic.Int32
+	releases   atomic.Int32
+	releaseErr error
+}
+
+type linuxFreshCollectionClaimFunc func(
+	func(*ebpf.Map, *ebpf.Map, LinuxFreshCollectionRelease) error,
+) error
+
+func (function linuxFreshCollectionClaimFunc) WithExclusiveFreshFakeTCPCollection(
+	callback func(*ebpf.Map, *ebpf.Map, LinuxFreshCollectionRelease) error,
+) error {
+	return function(callback)
 }
 
 func (claim *fakeLinuxFreshCollectionClaim) WithExclusiveFreshFakeTCPCollection(
-	callback func(*ebpf.Map, *ebpf.Map) error,
+	callback func(*ebpf.Map, *ebpf.Map, LinuxFreshCollectionRelease) error,
 ) error {
 	claim.entries.Add(1)
 	claim.held.Store(true)
 	claim.trace.add("claim-fresh-collection")
-	defer func() {
+	released := false
+	release := func() error {
+		if released {
+			return errors.New("test fresh collection release called more than once")
+		}
+		released = true
+		claim.releases.Add(1)
 		claim.trace.add("release-fresh-collection")
+		if claim.releaseErr != nil {
+			return claim.releaseErr
+		}
 		claim.held.Store(false)
-	}()
+		return nil
+	}
 	for range claim.callbacks {
-		if err := callback(nil, nil); err != nil {
+		if err := callback(nil, nil, release); err != nil {
 			return err
 		}
 	}
@@ -443,9 +466,9 @@ func successfulTestLinuxCommit(
 	return commitLinuxGenerationReachability(
 		engine,
 		claim,
-		func() error {
+		func(release LinuxFreshCollectionRelease) error {
 			reachabilityCalls.Add(1)
-			return nil
+			return release()
 		},
 		func() (int, error) { return 4, nil },
 		func(*ebpf.Map, *ebpf.Map, RuntimeIdentity, int) error {
@@ -462,14 +485,14 @@ func TestCommitLinuxGenerationReachabilityKeepsFreshClaimAcrossCommit(t *testing
 	err := commitLinuxGenerationReachability(
 		engine,
 		claim,
-		func() error {
+		func(release LinuxFreshCollectionRelease) error {
 			if !claim.held.Load() {
 				t.Fatal("fresh collection claim was released before reachability commit")
 			}
 			trace.add("populate-prog-array")
 			trace.add("publish-policy-reachability")
 			trace.add("attach-xdp-tc")
-			return nil
+			return release()
 		},
 		func() (int, error) { return 4, nil },
 		func(*ebpf.Map, *ebpf.Map, RuntimeIdentity, int) error {
@@ -503,7 +526,7 @@ func TestCommitLinuxGenerationReachabilityRejectsMissingClaimCallback(t *testing
 	err := commitLinuxGenerationReachability(
 		engine,
 		claim,
-		func() error {
+		func(LinuxFreshCollectionRelease) error {
 			trace.add("reachable")
 			return nil
 		},
@@ -521,6 +544,206 @@ func TestCommitLinuxGenerationReachabilityRejectsMissingClaimCallback(t *testing
 	}
 }
 
+func TestCommitLinuxGenerationReachabilityPreservesCallbackErrorSwallowedByClaim(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	wantErr := errors.New("injected seed failure swallowed by claim")
+	claim := linuxFreshCollectionClaimFunc(func(
+		callback func(*ebpf.Map, *ebpf.Map, LinuxFreshCollectionRelease) error,
+	) error {
+		_ = callback(nil, nil, func() error { return nil })
+		return nil
+	})
+	err := commitLinuxGenerationReachability(
+		engine,
+		claim,
+		func(LinuxFreshCollectionRelease) error {
+			t.Fatal("swallowed seed failure reached makeReachable")
+			return nil
+		},
+		func() (int, error) { return 4, nil },
+		func(*ebpf.Map, *ebpf.Map, RuntimeIdentity, int) error { return wantErr },
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("swallowed callback error = %v", err)
+	}
+}
+
+func TestCommitLinuxGenerationReachabilityRejectsLateClaimCallbackWithoutSideEffects(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	allowCallback := make(chan struct{})
+	callbackDone := make(chan error, 1)
+	claim := linuxFreshCollectionClaimFunc(func(
+		callback func(*ebpf.Map, *ebpf.Map, LinuxFreshCollectionRelease) error,
+	) error {
+		go func() {
+			<-allowCallback
+			callbackDone <- callback(nil, nil, func() error { return nil })
+		}()
+		return nil
+	})
+	var seedCalls, reachabilityCalls atomic.Int32
+	err := commitLinuxGenerationReachability(
+		engine,
+		claim,
+		func(LinuxFreshCollectionRelease) error {
+			reachabilityCalls.Add(1)
+			return nil
+		},
+		func() (int, error) { return 4, nil },
+		func(*ebpf.Map, *ebpf.Map, RuntimeIdentity, int) error {
+			seedCalls.Add(1)
+			return nil
+		},
+	)
+	if err == nil {
+		t.Fatal("claim returning before its callback was accepted")
+	}
+	close(allowCallback)
+	if lateErr := <-callbackDone; lateErr == nil ||
+		!strings.Contains(lateErr.Error(), "after the claim returned") {
+		t.Fatalf("late callback error = %v", lateErr)
+	}
+	if seedCalls.Load() != 0 || reachabilityCalls.Load() != 0 {
+		t.Fatalf("late callback side effects seed=%d reachability=%d",
+			seedCalls.Load(), reachabilityCalls.Load())
+	}
+}
+
+func TestCommitLinuxGenerationReachabilityRejectsMissingReleaseAndSealsCapability(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	trace := &runtimeIdentityTestTrace{}
+	claim := &fakeLinuxFreshCollectionClaim{trace: trace, callbacks: 1}
+	var retained LinuxFreshCollectionRelease
+	err := commitLinuxGenerationReachability(
+		engine,
+		claim,
+		func(release LinuxFreshCollectionRelease) error {
+			retained = release
+			trace.add("reachable-callback-return")
+			return nil
+		},
+		func() (int, error) { return 4, nil },
+		func(*ebpf.Map, *ebpf.Map, RuntimeIdentity, int) error {
+			trace.add("seed")
+			return nil
+		},
+	)
+	if !errors.Is(err, ErrLinuxFreshCollectionReleaseNotCalled) {
+		t.Fatalf("missing release error = %v", err)
+	}
+	if retained == nil {
+		t.Fatal("reachability callback did not receive release capability")
+	}
+	if lateErr := retained(); !errors.Is(lateErr, ErrLinuxFreshCollectionReleaseConsumed) {
+		t.Fatalf("late release error = %v", lateErr)
+	}
+	if claim.releases.Load() != 0 || !claim.held.Load() {
+		t.Fatalf("late release side effects=%d held=%t", claim.releases.Load(), claim.held.Load())
+	}
+}
+
+func TestCommitLinuxGenerationReachabilityRejectsDoubleReleaseWithoutSecondSideEffect(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	claim := &fakeLinuxFreshCollectionClaim{
+		trace: &runtimeIdentityTestTrace{}, callbacks: 1,
+	}
+	err := commitLinuxGenerationReachability(
+		engine,
+		claim,
+		func(release LinuxFreshCollectionRelease) error {
+			firstErr := release()
+			secondErr := release()
+			return errors.Join(firstErr, secondErr)
+		},
+		func() (int, error) { return 4, nil },
+		func(*ebpf.Map, *ebpf.Map, RuntimeIdentity, int) error { return nil },
+	)
+	if !errors.Is(err, ErrLinuxFreshCollectionReleaseConsumed) ||
+		!errors.Is(err, ErrLinuxFreshCollectionReleaseNotCalled) {
+		t.Fatalf("double release error = %v", err)
+	}
+	if claim.releases.Load() != 1 {
+		t.Fatalf("underlying release calls = %d", claim.releases.Load())
+	}
+}
+
+func TestCommitLinuxGenerationReachabilityRejectsRetainedReleaseAfterSuccess(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	claim := &fakeLinuxFreshCollectionClaim{
+		trace: &runtimeIdentityTestTrace{}, callbacks: 1,
+	}
+	var retained LinuxFreshCollectionRelease
+	err := commitLinuxGenerationReachability(
+		engine,
+		claim,
+		func(release LinuxFreshCollectionRelease) error {
+			retained = release
+			return release()
+		},
+		func() (int, error) { return 4, nil },
+		func(*ebpf.Map, *ebpf.Map, RuntimeIdentity, int) error { return nil },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if lateErr := retained(); !errors.Is(lateErr, ErrLinuxFreshCollectionReleaseConsumed) {
+		t.Fatalf("retained release error = %v", lateErr)
+	}
+	if claim.releases.Load() != 1 {
+		t.Fatalf("underlying release calls = %d", claim.releases.Load())
+	}
+}
+
+func TestCommitLinuxGenerationReachabilityPreservesReleaseFailure(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	wantErr := errors.New("injected fresh collection release failure")
+	claim := &fakeLinuxFreshCollectionClaim{
+		trace: &runtimeIdentityTestTrace{}, callbacks: 1, releaseErr: wantErr,
+	}
+	err := commitLinuxGenerationReachability(
+		engine,
+		claim,
+		func(release LinuxFreshCollectionRelease) error { return release() },
+		func() (int, error) { return 4, nil },
+		func(*ebpf.Map, *ebpf.Map, RuntimeIdentity, int) error { return nil },
+	)
+	if !errors.Is(err, wantErr) || claim.releases.Load() != 1 {
+		t.Fatalf("release failure=%v calls=%d", err, claim.releases.Load())
+	}
+}
+
+func TestCommitLinuxGenerationReachabilityRejectsPossibleCPUFailureBeforeClaim(t *testing.T) {
+	for _, test := range []struct {
+		name  string
+		count int
+		err   error
+	}{
+		{name: "source error", err: errors.New("possible CPU failure")},
+		{name: "zero CPUs"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			engine, _ := testEngine(t, nil)
+			claim := &fakeLinuxFreshCollectionClaim{
+				trace: &runtimeIdentityTestTrace{}, callbacks: 1,
+			}
+			seedCalls := 0
+			err := commitLinuxGenerationReachability(
+				engine,
+				claim,
+				func(release LinuxFreshCollectionRelease) error { return release() },
+				func() (int, error) { return test.count, test.err },
+				func(*ebpf.Map, *ebpf.Map, RuntimeIdentity, int) error {
+					seedCalls++
+					return nil
+				},
+			)
+			if err == nil || claim.entries.Load() != 0 || seedCalls != 0 {
+				t.Fatalf("possible CPU error=%v claims=%d seeds=%d", err, claim.entries.Load(), seedCalls)
+			}
+		})
+	}
+}
+
 func TestCommitLinuxGenerationReachabilityRejectsNilAndZeroEngineBeforeClaim(t *testing.T) {
 	for _, engine := range []*Engine{nil, &Engine{}} {
 		trace := &runtimeIdentityTestTrace{}
@@ -528,7 +751,7 @@ func TestCommitLinuxGenerationReachabilityRejectsNilAndZeroEngineBeforeClaim(t *
 		err := commitLinuxGenerationReachability(
 			engine,
 			claim,
-			func() error {
+			func(LinuxFreshCollectionRelease) error {
 				trace.add("reachable")
 				return nil
 			},
@@ -637,7 +860,7 @@ func TestFailedLinuxCollectionCommitConsumesEngineAndRequiresNewEngine(t *testin
 	err := commitLinuxGenerationReachability(
 		engine,
 		firstClaim,
-		func() error { return nil },
+		func(LinuxFreshCollectionRelease) error { return nil },
 		func() (int, error) { return 4, nil },
 		func(*ebpf.Map, *ebpf.Map, RuntimeIdentity, int) error { return firstFailure },
 	)
