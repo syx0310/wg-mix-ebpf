@@ -15,6 +15,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/faketcp"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
@@ -57,14 +58,15 @@ type fakeOwnedSessionStore struct {
 type fakeExperimentalSlowPath struct {
 	mu sync.Mutex
 
-	engine   *faketcp.Engine
-	runErr   error
-	stopErr  error
-	closeErr error
-	runs     int
-	stops    int
-	closes   int
-	closeLog *[]string
+	engine         *faketcp.Engine
+	runErr         error
+	stopErr        error
+	closeErr       error
+	runs           int
+	stops          int
+	closes         int
+	closeLog       *[]string
+	lifecycleTrace *[]string
 }
 
 func (slowPath *fakeExperimentalSlowPath) Run(context.Context) error {
@@ -87,6 +89,9 @@ func (slowPath *fakeExperimentalSlowPath) Close() error {
 	slowPath.closes++
 	if slowPath.closeLog != nil {
 		*slowPath.closeLog = append(*slowPath.closeLog, "slow-path")
+	}
+	if slowPath.lifecycleTrace != nil {
+		*slowPath.lifecycleTrace = append(*slowPath.lifecycleTrace, "slow-close")
 	}
 	return slowPath.closeErr
 }
@@ -219,6 +224,58 @@ type runtimeTestFixture struct {
 	commitEngine    *faketcp.Engine
 	commitCalls     int
 	retainedRelease faketcp.LinuxFreshCollectionRelease
+	lastCoreStage   *fakeExperimentalCoreStage
+	lastTCStage     *fakeExperimentalTCStage
+}
+
+type fakeExperimentalCoreStage struct {
+	trace         *[]string
+	commitErr     error
+	deactivateErr error
+	closeErr      error
+	commits       int
+	deactivates   int
+	closes        int
+	active        bool
+}
+
+func (stage *fakeExperimentalCoreStage) Deactivate() error {
+	if !stage.active {
+		return nil
+	}
+	stage.deactivates++
+	*stage.trace = append(*stage.trace, "core-deactivate")
+	if stage.deactivateErr == nil {
+		stage.active = false
+	}
+	return stage.deactivateErr
+}
+
+func (stage *fakeExperimentalCoreStage) CommitControl() error {
+	stage.commits++
+	*stage.trace = append(*stage.trace, "core-commit")
+	if stage.commitErr == nil {
+		stage.active = true
+	}
+	return stage.commitErr
+}
+
+func (stage *fakeExperimentalCoreStage) Close() error {
+	stage.closes++
+	*stage.trace = append(*stage.trace, "core-close")
+	return stage.closeErr
+}
+
+type fakeExperimentalTCStage struct {
+	trace    *[]string
+	closeErr error
+	closes   int
+}
+
+func (stage *fakeExperimentalTCStage) Close() error {
+	stage.closes++
+	*stage.trace = append(*stage.trace, "tc-close")
+	return stage.closeErr
 }
 
 func newRuntimeTestFixture(t *testing.T) *runtimeTestFixture {
@@ -251,6 +308,13 @@ func newRuntimeTestFixture(t *testing.T) *runtimeTestFixture {
 	addMap(fakeTCPEgressProgramArrayMapName, dummyMap)
 	addMap(fakeTCPRuntimeIDMapName, dummyMap)
 	addMap(fakeTCPCaptureSeqMapName, dummyMap)
+	for _, name := range []string{
+		"control_map", "profile_map", "cipher_map", "underlay_config_map",
+		"managed_fwmark_map", "egress_rule_map", "ingress_listener_map",
+		"icmp_listener_map", "xor_egress_programs", "xor_ingress_programs",
+	} {
+		addMap(name, dummyMap)
+	}
 	fixture.mapResources[fakeTCPRuntimeIDMapName].bpfMap = &ebpf.Map{}
 	fixture.mapResources[fakeTCPCaptureSeqMapName].bpfMap = &ebpf.Map{}
 	collectionMaps := make(map[string]experimentalMapResource, len(fixture.mapResources))
@@ -260,22 +324,37 @@ func newRuntimeTestFixture(t *testing.T) *runtimeTestFixture {
 	for name, id := range map[string]uint32{
 		fakeTCPEgressProgramName: 8001,
 		fakeTCPXDPProgramName:    8002,
+		ingressFilterName:        8003,
+		egressFilterName:         8004,
 	} {
 		program := &fakeExperimentalOwnedProgram{
 			name: name, id: id, closeLog: &fixture.closeLog,
 		}
 		fixture.programs[name] = program
 	}
+	nextProgramID := uint32(8100)
+	for _, binding := range xorTailCallBindings {
+		for _, name := range binding.programNames {
+			program := &fakeExperimentalOwnedProgram{
+				name: name, id: nextProgramID, closeLog: &fixture.closeLog,
+			}
+			fixture.programs[name] = program
+			nextProgramID++
+		}
+	}
+	collectionPrograms := make(map[string]experimentalProgramResource, len(fixture.programs))
+	for name, program := range fixture.programs {
+		collectionPrograms[name] = program
+	}
 	fixture.collection = &experimentalCollectionOwner{
-		maps: collectionMaps,
-		programs: map[string]experimentalProgramResource{
-			fakeTCPEgressProgramName: fixture.programs[fakeTCPEgressProgramName],
-			fakeTCPXDPProgramName:    fixture.programs[fakeTCPXDPProgramName],
-		},
+		maps:      collectionMaps,
+		programs:  collectionPrograms,
 		closeDone: make(chan struct{}),
 	}
 	fixture.sessionStore.closeLog = &fixture.closeLog
-	fixture.slowPath = &fakeExperimentalSlowPath{closeLog: &fixture.closeLog}
+	fixture.slowPath = &fakeExperimentalSlowPath{
+		closeLog: &fixture.closeLog, lifecycleTrace: &fixture.activationTrace,
+	}
 	fixture.programArray.events = &fixture.activationTrace
 	fixture.xdpRuntime.events = &fixture.activationTrace
 	fixture.policyTrace.externalEvents = &fixture.activationTrace
@@ -335,8 +414,16 @@ func (fixture *runtimeTestFixture) buildOptions(
 	snapshot *fakeTCPPolicySnapshot,
 	transaction *fakeTCPPolicyGenerationTransaction,
 ) experimentalFakeTCPRuntimeBuildOptions {
+	baseline := &abi.Snapshot{Control: map[abi.ControlKey]abi.ControlValue{
+		abi.ControlKeyGlobal: {
+			ActiveGeneration: snapshot.Generation,
+			ABIVersion:       abi.Version,
+		},
+	}}
 	return experimentalFakeTCPRuntimeBuildOptions{
-		collection: fixture.collection, transaction: transaction, snapshot: snapshot,
+		collection: fixture.collection, transaction: transaction,
+		baselineSnapshot: baseline, snapshot: snapshot,
+		attachState: &control.State{Generation: snapshot.Generation},
 		xdpRequests: []fakeTCPXDPAttachRequest{
 			{IfIndex: 3, Mode: fakeTCPXDPAttachNative},
 			{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
@@ -350,6 +437,31 @@ func (fixture *runtimeTestFixture) buildOptions(
 		engineOptions:    runtimeTestEngineOptions(snapshot.Generation),
 		slowPathFactory:  fixture.slowPathFactory,
 		commitGeneration: fixture.commitGeneration,
+		coreStageFactory: func(
+			context.Context,
+			experimentalCoreResources,
+			*abi.Snapshot,
+		) (experimentalCoreStageOwner, error) {
+			fixture.activationTrace = append(fixture.activationTrace, "core-stage")
+			stage := &fakeExperimentalCoreStage{trace: &fixture.activationTrace}
+			fixture.lastCoreStage = stage
+			return stage, nil
+		},
+		tcStageFactory: func(
+			_ context.Context,
+			_ *control.State,
+			_, _ experimentalProgramResource,
+			commit func() error,
+		) (experimentalTCStageOwner, error) {
+			fixture.activationTrace = append(fixture.activationTrace, "tc-stage")
+			if err := commit(); err != nil {
+				fixture.activationTrace = append(fixture.activationTrace, "tc-rollback")
+				return nil, err
+			}
+			stage := &fakeExperimentalTCStage{trace: &fixture.activationTrace}
+			fixture.lastTCStage = stage
+			return stage, nil
+		},
 	}
 }
 
@@ -391,8 +503,18 @@ func TestExperimentalFakeTCPRuntimeBuildsPolicyTailCallsXDPAndHandles(t *testing
 		t.Fatalf("commit Engine=%p slow-path Engine=%p calls=%d identity=%#v",
 			fixture.commitEngine, fixture.slowPath.engine, fixture.commitCalls, runtime.Identity())
 	}
+	coreStageIndex := slices.Index(fixture.activationTrace, "core-stage")
+	programInsertIndex := slices.Index(fixture.activationTrace, "program-insert")
+	xdpAttachIndex := slices.Index(fixture.activationTrace, "xdp-attach")
+	tcStageIndex := slices.Index(fixture.activationTrace, "tc-stage")
+	policyUpdateIndex := slices.Index(fixture.activationTrace, "policy:update:faketcp_control_policy_map")
+	coreCommitIndex := slices.Index(fixture.activationTrace, "core-commit")
+	releaseIndex := slices.Index(fixture.activationTrace, "release")
 	if len(fixture.activationTrace) < 2 || fixture.activationTrace[0] != "seed" ||
-		fixture.activationTrace[len(fixture.activationTrace)-1] != "release" {
+		coreStageIndex <= 0 || programInsertIndex <= coreStageIndex ||
+		xdpAttachIndex <= programInsertIndex || tcStageIndex <= xdpAttachIndex ||
+		policyUpdateIndex <= tcStageIndex || coreCommitIndex <= policyUpdateIndex ||
+		releaseIndex <= coreCommitIndex || releaseIndex != len(fixture.activationTrace)-1 {
 		t.Fatalf("activation order = %v", fixture.activationTrace)
 	}
 	if lateErr := fixture.retainedRelease(); !errors.Is(lateErr, errExperimentalFreshCollectionReleaseConsumed) {
@@ -478,6 +600,108 @@ func TestExperimentalFakeTCPRuntimeBuildsPolicyTailCallsXDPAndHandles(t *testing
 	}
 	if err := handles.WithEventsMap(func(*ebpf.Map) error { return nil }); !errors.Is(err, ErrExperimentalFakeTCPRuntimeClosed) {
 		t.Fatalf("retained event constructor after close error = %v", err)
+	}
+}
+
+func TestExperimentalFakeTCPFreshClaimUsesPreResolvedCoreResourcesWithoutOwnerReentry(
+	t *testing.T,
+) {
+	fixture := newRuntimeTestFixture(t)
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+	options := fixture.buildOptions(snapshot, transaction)
+	options.coreStageFactory = func(
+		_ context.Context,
+		resources experimentalCoreResources,
+		_ *abi.Snapshot,
+	) (experimentalCoreStageOwner, error) {
+		if resources.control == nil || len(resources.dataMaps) != 7 ||
+			len(resources.tailCalls) != len(xorTailCallBindings) {
+			return nil, errors.New("pre-resolved core resource bundle is incomplete")
+		}
+		if fixture.collection.mu.TryLock() {
+			fixture.collection.mu.Unlock()
+			return nil, errors.New("fresh claim callback does not hold collection ownership lock")
+		}
+		return &fakeExperimentalCoreStage{trace: &fixture.activationTrace}, nil
+	}
+	type result struct {
+		runtime *ExperimentalFakeTCPRuntime
+		err     error
+	}
+	done := make(chan result, 1)
+	go func() {
+		runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
+		done <- result{runtime: runtime, err: err}
+	}()
+	var built result
+	select {
+	case built = <-done:
+	case <-time.After(time.Second):
+		t.Fatal("fresh collection callback deadlocked on collection owner reentry")
+	}
+	if built.err != nil {
+		t.Fatal(built.err)
+	}
+	if !fixture.collection.mu.TryLock() {
+		t.Fatal("collection owner remained locked after fresh callback")
+	}
+	fixture.collection.mu.Unlock()
+	if err := built.runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExperimentalRuntimeCloseBlocksReachabilityBeforeDependentTeardown(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	runtime, _, err := fixture.build(t, 91)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeStart := len(fixture.activationTrace)
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	got := fixture.activationTrace[closeStart:]
+	want := []string{
+		"core-deactivate",
+		"xdp-close",
+		"xdp-close",
+		"tc-close",
+		"slow-close",
+		"core-close",
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("runtime dependency close order = %v, want %v", got, want)
+	}
+}
+
+func TestExperimentalRuntimeDeactivateFailureStillDetachesXDPAndTC(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	runtime, _, err := fixture.build(t, 91)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deactivateErr := errors.New("injected runtime deactivate failure")
+	fixture.lastCoreStage.deactivateErr = deactivateErr
+	if err := runtime.Close(); !errors.Is(err, deactivateErr) {
+		t.Fatalf("runtime Close error = %v", err)
+	}
+	if fixture.lastTCStage.closes != 1 ||
+		fixture.xdpRuntime.links[3].closes != 1 ||
+		fixture.xdpRuntime.links[9].closes != 1 {
+		t.Fatalf(
+			"deactivate failure teardown tc=%d xdp3=%d xdp9=%d",
+			fixture.lastTCStage.closes,
+			fixture.xdpRuntime.links[3].closes,
+			fixture.xdpRuntime.links[9].closes,
+		)
+	}
+	deactivateIndex := slices.Index(fixture.activationTrace, "core-deactivate")
+	xdpIndex := slices.Index(fixture.activationTrace, "xdp-close")
+	tcIndex := slices.Index(fixture.activationTrace, "tc-close")
+	if deactivateIndex < 0 || xdpIndex <= deactivateIndex || tcIndex <= xdpIndex {
+		t.Fatalf("deactivate failure dependency order = %v", fixture.activationTrace)
 	}
 }
 
@@ -859,8 +1083,22 @@ func TestExperimentalFakeTCPRuntimeReleaseFailureBeforeCommitRollsBack(t *testin
 	}
 	releaseIndex := slices.Index(fixture.activationTrace, "release-failure")
 	xdpIndex := slices.Index(fixture.activationTrace, "xdp-attach")
+	deactivateIndex := slices.Index(fixture.activationTrace, "core-deactivate")
+	xdpCloseIndex := slices.Index(fixture.activationTrace, "xdp-close")
+	tcRollbackIndex := slices.Index(fixture.activationTrace, "tc-rollback")
+	slowCloseIndex := slices.Index(fixture.activationTrace, "slow-close")
+	policyDeleteIndex := slices.Index(
+		fixture.activationTrace,
+		"policy:delete:faketcp_managed_if_map",
+	)
+	programDeleteIndex := slices.Index(fixture.activationTrace, "program-delete")
+	coreCloseIndex := slices.Index(fixture.activationTrace, "core-close")
 	if len(fixture.activationTrace) == 0 || fixture.activationTrace[0] != "seed" ||
-		xdpIndex <= 0 || releaseIndex <= xdpIndex {
+		xdpIndex <= 0 || releaseIndex <= xdpIndex ||
+		deactivateIndex <= releaseIndex || xdpCloseIndex <= deactivateIndex ||
+		tcRollbackIndex <= xdpCloseIndex || slowCloseIndex <= tcRollbackIndex ||
+		policyDeleteIndex <= slowCloseIndex || programDeleteIndex <= policyDeleteIndex ||
+		coreCloseIndex <= programDeleteIndex {
 		t.Fatalf("release failure order = %v", fixture.activationTrace)
 	}
 	if len(fixture.programArray.entries) != 0 || len(fixture.programArray.deletes) != 1 {
@@ -965,25 +1203,8 @@ func TestExperimentalFakeTCPRuntimeRejectsPreStagedTransactionWithoutOwnershipTr
 	}
 	updatesBefore := len(fixture.policyTrace.updateAttempts)
 	deletesBefore := len(fixture.policyTrace.deleteAttempts)
-
-	runtime, err := buildExperimentalFakeTCPRuntime(
-		ctx,
-		experimentalFakeTCPRuntimeBuildOptions{
-			collection: fixture.collection, transaction: transaction, snapshot: snapshot,
-			xdpRequests: []fakeTCPXDPAttachRequest{
-				{IfIndex: 3, Mode: fakeTCPXDPAttachNative},
-				{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
-			},
-			xdpRuntime: fixture.xdpRuntime.backend(), programArray: fixture.programArray,
-			sessionFactory: func(experimentalMapResource, uint64) (ownedFakeTCPSessionStore, error) {
-				return fixture.sessionStore, nil
-			},
-			eventSource:      fixture.eventSource,
-			engineOptions:    runtimeTestEngineOptions(snapshot.Generation),
-			slowPathFactory:  fixture.slowPathFactory,
-			commitGeneration: fixture.commitGeneration,
-		},
-	)
+	options := fixture.buildOptions(snapshot, transaction)
+	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
 	if runtime != nil || err == nil || !strings.Contains(err.Error(), "not fresh") {
 		t.Fatalf("pre-staged runtime=%#v error=%v", runtime, err)
 	}
@@ -1246,24 +1467,9 @@ func TestExperimentalFakeTCPRuntimeCancellationAfterMutationUsesCleanupContext(t
 		return owned, err
 	}
 
-	runtime, err := buildExperimentalFakeTCPRuntime(
-		activeCtx,
-		experimentalFakeTCPRuntimeBuildOptions{
-			collection: fixture.collection, transaction: transaction, snapshot: snapshot,
-			xdpRequests: []fakeTCPXDPAttachRequest{
-				{IfIndex: 3, Mode: fakeTCPXDPAttachNative},
-				{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
-			},
-			xdpRuntime: xdpRuntime, programArray: fixture.programArray,
-			sessionFactory: func(experimentalMapResource, uint64) (ownedFakeTCPSessionStore, error) {
-				return fixture.sessionStore, nil
-			},
-			eventSource:      fixture.eventSource,
-			engineOptions:    runtimeTestEngineOptions(snapshot.Generation),
-			slowPathFactory:  fixture.slowPathFactory,
-			commitGeneration: fixture.commitGeneration,
-		},
-	)
+	options := fixture.buildOptions(snapshot, transaction)
+	options.xdpRuntime = xdpRuntime
+	runtime, err := buildExperimentalFakeTCPRuntime(activeCtx, options)
 	if runtime != nil || !errors.Is(err, context.Canceled) {
 		t.Fatalf("canceled runtime=%#v error=%v", runtime, err)
 	}
@@ -1298,22 +1504,9 @@ func TestExperimentalFakeTCPRuntimeCommitBoundaryIgnoresLaterCancellation(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
+	options := fixture.buildOptions(snapshot, transaction)
 	build := &experimentalRuntimeBuild{
-		options: experimentalFakeTCPRuntimeBuildOptions{
-			collection: fixture.collection, transaction: transaction, snapshot: snapshot,
-			xdpRequests: []fakeTCPXDPAttachRequest{
-				{IfIndex: 3, Mode: fakeTCPXDPAttachNative},
-				{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
-			},
-			xdpRuntime: fixture.xdpRuntime.backend(), programArray: fixture.programArray,
-			sessionFactory: func(experimentalMapResource, uint64) (ownedFakeTCPSessionStore, error) {
-				return fixture.sessionStore, nil
-			},
-			eventSource:      fixture.eventSource,
-			engineOptions:    runtimeTestEngineOptions(snapshot.Generation),
-			slowPathFactory:  fixture.slowPathFactory,
-			commitGeneration: fixture.commitGeneration,
-		},
+		options:    options,
 		claim:      claim,
 		activeCtx:  activeCtx,
 		cleanupCtx: context.WithoutCancel(activeCtx),
@@ -1358,6 +1551,8 @@ func TestExperimentalFakeTCPRuntimeCommitBoundaryIgnoresLaterCancellation(t *tes
 			identity:   build.engine.Identity(),
 			engine:     build.engine,
 			collection: fixture.collection,
+			core:       build.coreStage,
+			tc:         build.tcStage,
 			xdp:        build.xdpStage,
 			slowPath:   build.slowPath,
 			handles: ExperimentalFakeTCPRuntimeHandles{
@@ -1378,21 +1573,9 @@ func TestExperimentalFakeTCPRuntimeValidatesXDPPolicySetBeforeMutation(t *testin
 	fixture := newRuntimeTestFixture(t)
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
-	runtime, err := buildExperimentalFakeTCPRuntime(
-		ctx,
-		experimentalFakeTCPRuntimeBuildOptions{
-			collection: fixture.collection, transaction: transaction, snapshot: snapshot,
-			xdpRequests: []fakeTCPXDPAttachRequest{{IfIndex: 3, Mode: fakeTCPXDPAttachNative}},
-			xdpRuntime:  fixture.xdpRuntime.backend(), programArray: fixture.programArray,
-			sessionFactory: func(experimentalMapResource, uint64) (ownedFakeTCPSessionStore, error) {
-				return fixture.sessionStore, nil
-			},
-			eventSource:      fixture.eventSource,
-			engineOptions:    runtimeTestEngineOptions(snapshot.Generation),
-			slowPathFactory:  fixture.slowPathFactory,
-			commitGeneration: fixture.commitGeneration,
-		},
-	)
+	options := fixture.buildOptions(snapshot, transaction)
+	options.xdpRequests = []fakeTCPXDPAttachRequest{{IfIndex: 3, Mode: fakeTCPXDPAttachNative}}
+	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
 	if runtime != nil || err == nil || !strings.Contains(err.Error(), "do not match managed interfaces") {
 		t.Fatalf("runtime=%#v error=%v", runtime, err)
 	}

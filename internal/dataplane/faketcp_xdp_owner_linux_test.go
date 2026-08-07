@@ -16,6 +16,7 @@ type fakeOwnedXDPLink struct {
 	closeErrs   []error
 	closes      int
 	closeLog    *[]int
+	closeEvents *[]string
 }
 
 func (owned *fakeOwnedXDPLink) Identity() (int, uint32, error) {
@@ -26,6 +27,9 @@ func (owned *fakeOwnedXDPLink) Close() error {
 	owned.closes++
 	if owned.closeLog != nil {
 		*owned.closeLog = append(*owned.closeLog, owned.ifindex)
+	}
+	if owned.closeEvents != nil {
+		*owned.closeEvents = append(*owned.closeEvents, "xdp-close")
 	}
 	if len(owned.closeErrs) == 0 {
 		return nil
@@ -78,7 +82,10 @@ func (runtime *memoryFakeTCPXDPRuntime) backend() fakeTCPXDPRuntime {
 				if err != nil {
 					return nil, err
 				}
-				owned = &fakeOwnedXDPLink{ifindex: request.IfIndex, programID: programID}
+				owned = &fakeOwnedXDPLink{
+					ifindex: request.IfIndex, programID: programID,
+					closeEvents: runtime.events,
+				}
 				runtime.links[request.IfIndex] = owned
 			}
 			return owned, nil
