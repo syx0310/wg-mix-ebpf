@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/btf"
 )
 
 type fakeExperimentalCollection struct {
@@ -30,6 +31,10 @@ func TestExperimentalVerifierLoadValidatesBeforeKernelLoadAndCloses(t *testing.T
 	err := loadExperimentalFakeTCPCollection(
 		spec,
 		"/reviewed/experimental.o",
+		func() error {
+			order = append(order, "kernel-dependency")
+			return nil
+		},
 		func() error {
 			order = append(order, "remove-memlock")
 			return nil
@@ -58,7 +63,7 @@ func TestExperimentalVerifierLoadValidatesBeforeKernelLoadAndCloses(t *testing.T
 	if !closed {
 		t.Fatal("verifier-loaded collection was not closed")
 	}
-	if got, want := strings.Join(order, ","), "remove-memlock,new-collection,close"; got != want {
+	if got, want := strings.Join(order, ","), "kernel-dependency,remove-memlock,new-collection,close"; got != want {
 		t.Fatalf("load order = %q, want %q", got, want)
 	}
 }
@@ -82,6 +87,7 @@ func TestExperimentalVerifierLoadFailsBeforeKernelMutationOnManifestDrift(t *tes
 		err := loadExperimentalFakeTCPCollection(
 			spec,
 			"/reviewed/experimental.o",
+			func() error { return nil },
 			func() error {
 				memlockCalls++
 				return nil
@@ -106,6 +112,7 @@ func TestExperimentalVerifierLoadStopsAfterMemlockFailure(t *testing.T) {
 	err := loadExperimentalFakeTCPCollection(
 		canonicalExperimentalCollectionSpec(),
 		"/reviewed/experimental.o",
+		func() error { return nil },
 		func() error { return wantErr },
 		func(*ebpf.CollectionSpec) (experimentalCollectionCloser, error) {
 			collectionCalls++
@@ -125,12 +132,87 @@ func TestExperimentalVerifierLoadFailsClosedOnNilCollection(t *testing.T) {
 		canonicalExperimentalCollectionSpec(),
 		"/reviewed/experimental.o",
 		func() error { return nil },
+		func() error { return nil },
 		func(*ebpf.CollectionSpec) (experimentalCollectionCloser, error) {
 			return nil, nil
 		},
 	)
 	if err == nil || !strings.Contains(err.Error(), "loader returned nil collection") {
 		t.Fatalf("nil collection error = %v", err)
+	}
+}
+
+func TestExperimentalVerifierLoadStopsAfterKernelDependencyFailure(t *testing.T) {
+	wantErr := errors.New("required module is unavailable")
+	memlockCalls := 0
+	collectionCalls := 0
+	err := loadExperimentalFakeTCPCollection(
+		canonicalExperimentalCollectionSpec(),
+		"/reviewed/experimental.o",
+		func() error { return wantErr },
+		func() error {
+			memlockCalls++
+			return nil
+		},
+		func(*ebpf.CollectionSpec) (experimentalCollectionCloser, error) {
+			collectionCalls++
+			return nil, nil
+		},
+	)
+	if !errors.Is(err, wantErr) || !strings.Contains(err.Error(), "kernel dependency") {
+		t.Fatalf("dependency error = %v, want wrapped %v", err, wantErr)
+	}
+	if memlockCalls != 0 || collectionCalls != 0 {
+		t.Fatalf("dependency failure reached kernel steps: memlock=%d collection=%d", memlockCalls, collectionCalls)
+	}
+}
+
+func TestExperimentalKernelDependencyProbeRequiresExactModuleAndKfuncBTF(t *testing.T) {
+	wantErr := errors.New("module missing")
+	err := probeExperimentalFakeTCPKernelDependencyWith(
+		func(module string) (*btf.Spec, error) {
+			if module != experimentalFakeTCPKfuncModule {
+				t.Fatalf("module=%q, want %q", module, experimentalFakeTCPKfuncModule)
+			}
+			return nil, wantErr
+		},
+	)
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("module load error=%v, want wrapped %v", err, wantErr)
+	}
+
+	emptyBuilder, err := btf.NewBuilder(nil, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	emptySpec, err := emptyBuilder.Spec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = probeExperimentalFakeTCPKernelDependencyWith(
+		func(string) (*btf.Spec, error) { return emptySpec, nil },
+	)
+	if err == nil || !strings.Contains(err.Error(), experimentalFakeTCPKfuncName) {
+		t.Fatalf("missing kfunc BTF error=%v", err)
+	}
+
+	intType := &btf.Int{Name: "int", Size: 4, Encoding: btf.Signed}
+	function := &btf.Func{
+		Name: experimentalFakeTCPKfuncName,
+		Type: &btf.FuncProto{Return: intType},
+	}
+	builder, err := btf.NewBuilder([]btf.Type{function}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	spec, err := builder.Spec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := probeExperimentalFakeTCPKernelDependencyWith(
+		func(string) (*btf.Spec, error) { return spec, nil },
+	); err != nil {
+		t.Fatalf("exact module/kfunc BTF probe failed: %v", err)
 	}
 }
 
