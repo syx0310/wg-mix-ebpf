@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import ast
 import hashlib
+import os
 import pathlib
 import re
+import subprocess
 import unittest
 
 
@@ -10,6 +12,9 @@ SCRIPTS = pathlib.Path(__file__).resolve().parent
 LAUNCHER = SCRIPTS / "stage-root-owned-test-source.sh"
 HELPER = SCRIPTS / "stage-root-owned-test-source.py"
 MANIFEST = SCRIPTS / "stage-root-owned-test-source.bootstrap"
+RUNNER = SCRIPTS / "run-root-owned-test-source-stage.sh"
+BASH_ENV_FIXTURE = SCRIPTS / "testdata" / "root-stage-bash-env-injection.sh"
+MAKEFILE = SCRIPTS.parent / "Makefile"
 
 
 class RootOwnedSourceStageContractTests(unittest.TestCase):
@@ -18,6 +23,8 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
         cls.launcher = LAUNCHER.read_text(encoding="utf-8")
         cls.helper = HELPER.read_text(encoding="utf-8")
         cls.manifest = MANIFEST.read_text(encoding="utf-8")
+        cls.runner = RUNNER.read_text(encoding="utf-8")
+        cls.makefile = MAKEFILE.read_text(encoding="utf-8")
         cls.helper_tree = ast.parse(cls.helper, filename=str(HELPER))
 
     def test_launcher_pins_the_exact_helper_content(self) -> None:
@@ -54,11 +61,26 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
                 "helper_sha256": hashlib.sha256(HELPER.read_bytes()).hexdigest(),
                 "manifest_file": MANIFEST.name,
                 "manifest_mode": "0400",
+                "manifest_scope": "root-copy-consistency-only",
+                "authenticity_root": "external-approved-postcopy-sha256",
+                "direct_user_checkout_sudo": "forbidden",
+                "runner_file": RUNNER.name,
+                "runner_mode": "0500",
+                "runner_authenticity": "external-approved-postcopy-sha256-argument",
+                "runner_entry": "env-i-fixed-path-lc-bash-root-copy",
             },
         )
         self.assertIn("mapfile -t bootstrap_contract", self.launcher)
         self.assertIn('"launcher_sha256=${launcher_sha256}"', self.launcher)
         self.assertIn('"helper_sha256=${helper_sha256}"', self.launcher)
+        self.assertIn(
+            "manifest check below proves only mutual consistency",
+            self.launcher,
+        )
+        self.assertIn(
+            "it is not an authenticity root",
+            self.launcher,
+        )
 
     def test_user_checkout_cannot_satisfy_root_bootstrap_contract(self) -> None:
         required = (
@@ -87,6 +109,117 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
             "validate_directory(BOOTSTRAP_PREFIX, 0, 0, 0o700)",
         ):
             self.assertIn(fragment, self.helper)
+
+    def test_root_runner_has_an_explicit_external_authenticity_boundary(self) -> None:
+        for fragment in (
+            "this runner is not safe to execute from a user-owned checkout",
+            "externally approved authenticity root",
+            'readonly BOOTSTRAP_PREFIX="/run/wg-mix-ebpf-source-bootstrap"',
+            'readonly RUNNER_BASENAME="run-root-owned-test-source-stage.sh"',
+            '"0:0:500:1:regular file"',
+            'runner_actual_sha="$("${SHA256_BIN}" -- /proc/self/fd/9)"',
+            '"${runner_actual_sha}" == "${RUNNER_SHA256}"',
+            'exec {source_fd}<"${path}"',
+            '"${path_stat}" == "${fd_stat}"',
+            '"${actual_sha}" == "${approved_sha}"',
+            "validate_approved_source launcher",
+            "validate_approved_source helper",
+            "validate_approved_source manifest",
+        ):
+            self.assertIn(fragment, self.runner)
+        self.assertLess(
+            self.runner.index('"${runner_actual_sha}" == "${RUNNER_SHA256}"'),
+            self.runner.index("validate_approved_source launcher"),
+        )
+        self.assertLess(
+            self.runner.index("validate_approved_source manifest"),
+            self.runner.index('AUDIT_PATH="${runner_directory}/root-stage-runner.audit"'),
+        )
+        self.assertIn(
+            "bash -n scripts/inspect-linux-test-host.sh",
+            self.makefile,
+        )
+        self.assertIn(
+            "scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh",
+            self.makefile,
+        )
+        self.assertIn(
+            "scripts/smoke-netns-wg.sh scripts/run-root-owned-test-source-stage.sh",
+            self.makefile,
+        )
+
+    def test_root_runner_arguments_and_install_targets_are_strict(self) -> None:
+        for option in (
+            "--runner-sha256",
+            "--source-launcher",
+            "--launcher-sha256",
+            "--source-helper",
+            "--helper-sha256",
+            "--source-manifest",
+            "--manifest-sha256",
+            "--bundle",
+            "--bundle-sha256",
+            "--commit",
+            "--run-id",
+        ):
+            self.assertIn(option, self.runner)
+        for fragment in (
+            '"${INSTALL_BIN}" -o 0 -g 0 -m 0500 --',
+            '"${INSTALL_BIN}" -o 0 -g 0 -m 0400 --',
+            "validate_root_copy launcher",
+            "validate_root_copy helper",
+            "validate_root_copy manifest",
+            '"${ENV_BIN}" -i "PATH=${PATH}" "LC_ALL=${LC_ALL}"',
+            '"${BASH_BIN}" "${root_launcher}"',
+        ):
+            self.assertIn(fragment, self.runner)
+        self.assertNotIn("safe.directory", self.runner)
+
+    def test_runner_audit_covers_every_write_boundary(self) -> None:
+        for fragment in (
+            "timestamp=%q host=%q event=%q action=%q argv=%q target=%q rc=%q",
+            "emit_audit write_start",
+            "emit_audit write_finish",
+            "install_root_launcher",
+            "install_root_helper",
+            "install_root_manifest",
+            "execute_root_stage",
+            '"${BOOTSTRAP_PREFIX},${runner_directory},${STAGE_PREFIX},${stage_run}"',
+        ):
+            self.assertIn(fragment, self.runner)
+        self.assertNotRegex(
+            self.runner,
+            r"(?m)^\s*(eval|trap|sudo|rm|chroot|nsenter)\b",
+        )
+        self.assertNotIn("find -delete", self.runner)
+
+    def test_env_i_runner_entry_drops_inherited_bash_env(self) -> None:
+        environment = dict(os.environ)
+        environment["BASH_ENV"] = str(BASH_ENV_FIXTURE)
+        environment["ENV"] = str(BASH_ENV_FIXTURE)
+        environment["SHELLOPTS"] = "braceexpand:hashall:interactive-comments:xtrace"
+        completed = subprocess.run(
+            [
+                "/usr/bin/env",
+                "-i",
+                "PATH=/usr/bin:/bin",
+                "LC_ALL=C",
+                "/bin/bash",
+                str(RUNNER),
+            ],
+            cwd="/",
+            env=environment,
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertNotIn("BASH_ENV_INJECTION_EXECUTED", completed.stdout)
+        self.assertNotIn("BASH_ENV_INJECTION_EXECUTED", completed.stderr)
+        self.assertFalse(
+            any(line.startswith("+") for line in completed.stderr.splitlines()),
+            completed.stderr,
+        )
 
     def test_production_scope_is_fixed_and_root_only(self) -> None:
         self.assertIn(

@@ -1,4 +1,10 @@
 #!/bin/bash
+# TRUST BOUNDARY: never execute this file directly from a user-owned checkout,
+# including with sudo. The only supported caller is the separately approved,
+# root-owned runner. It installs this launcher, helper, and manifest into the
+# fixed bootstrap run directory and verifies each approved SHA after the copy.
+# The manifest check below proves only mutual consistency of those root copies;
+# it is not an authenticity root and cannot replace the external approved SHA.
 set -euo pipefail
 
 readonly PATH="/usr/bin:/bin"
@@ -127,6 +133,13 @@ expected_contract=(
   "helper_sha256=${helper_sha256}"
   "manifest_file=${MANIFEST_BASENAME}"
   "manifest_mode=0400"
+  "manifest_scope=root-copy-consistency-only"
+  "authenticity_root=external-approved-postcopy-sha256"
+  "direct_user_checkout_sudo=forbidden"
+  "runner_file=run-root-owned-test-source-stage.sh"
+  "runner_mode=0500"
+  "runner_authenticity=external-approved-postcopy-sha256-argument"
+  "runner_entry=env-i-fixed-path-lc-bash-root-copy"
 )
 [[ "${#bootstrap_contract[@]}" -eq "${#expected_contract[@]}" ]] || {
   echo "error: bootstrap manifest field count is invalid" >&2
