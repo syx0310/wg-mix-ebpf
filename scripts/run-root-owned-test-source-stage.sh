@@ -493,8 +493,9 @@ set -e
 emit_audit write_finish create_root_audit "${AUDIT_PATH}" \
   "${audit_create_rc}" "$(format_argv "${audit_create_argv[@]}")"
 ((audit_create_rc == 0)) || exit "${audit_create_rc}"
-[[ "$("${STAT_BIN}" -Lc '%u:%g:%a:%h:%F' -- "${AUDIT_PATH}")" == \
-  "0:0:600:1:regular file" ]] || {
+[[ ! -L "${AUDIT_PATH}" && -f "${AUDIT_PATH}" &&
+  "$("${STAT_BIN}" -Lc '%u:%g:%a:%h:%s' -- "${AUDIT_PATH}")" == \
+  "0:0:600:1:0" ]] || {
   echo "error: new root runner audit metadata is unsafe" >&2
   exit 1
 }
@@ -505,7 +506,7 @@ emit_audit write_start create_root_audit "${AUDIT_PATH}" pending \
 emit_audit write_finish create_root_audit "${AUDIT_PATH}" 0 \
   "$(format_argv "${audit_create_argv[@]}")"
 emit_audit validation_success create_root_audit "${AUDIT_PATH}" 0 \
-  "stat=0:0:600:1:regular-file"
+  "stat=0:0:600:1:0 type=regular-file"
 emit_audit validation_success observed_external_bootstrap \
   "${BOOTSTRAP_PREFIX},${runner_directory},${runner_path}" 0 \
   "prefix=root:root:0700 run=root:root:0700 runner=root:root:0500:sha256=${runner_actual_sha}"

@@ -258,6 +258,41 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
         )
         self.assertNotIn("find -delete", self.runner)
 
+    def test_empty_root_audit_uses_numeric_gnu_stat_contract(self) -> None:
+        validation_start = self.runner.index("((audit_create_rc == 0))")
+        validation_end = self.runner.index('exec 10>>"${AUDIT_PATH}"')
+        validation = self.runner[validation_start:validation_end]
+        self.assertIn(
+            '[[ ! -L "${AUDIT_PATH}" && -f "${AUDIT_PATH}" &&',
+            validation,
+        )
+        self.assertIn(
+            '"$("${STAT_BIN}" -Lc \'%u:%g:%a:%h:%s\' -- '
+            '"${AUDIT_PATH}")" == \\\n  "0:0:600:1:0"',
+            validation,
+        )
+        self.assertNotIn("%F", validation)
+        self.assertIn(
+            '"stat=0:0:600:1:0 type=regular-file"',
+            self.runner,
+        )
+
+        fake_gnu_stat = {
+            "%u": "0",
+            "%g": "0",
+            "%a": "600",
+            "%h": "1",
+            "%s": "0",
+            "%F": "regular empty file",
+        }
+        numeric_contract = ":".join(
+            fake_gnu_stat[field] for field in ("%u", "%g", "%a", "%h", "%s")
+        )
+        self.assertEqual(numeric_contract, "0:0:600:1:0")
+        self.assertNotEqual(fake_gnu_stat["%F"], "regular file")
+        for bootstrap_file in (RUNNER, LAUNCHER, HELPER, MANIFEST):
+            self.assertGreater(bootstrap_file.stat().st_size, 0)
+
     def test_env_i_runner_entry_drops_inherited_bash_env(self) -> None:
         environment = dict(os.environ)
         environment["BASH_ENV"] = str(BASH_ENV_FIXTURE)
