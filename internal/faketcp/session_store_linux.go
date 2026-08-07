@@ -15,10 +15,33 @@ type ciliumSessionMapAPI interface {
 	Info() (*ebpf.MapInfo, error)
 	Update(key, value any, flags ebpf.MapUpdateFlags) error
 	Lookup(key, valueOut any) error
+	Close() error
 }
 
 type ciliumSessionMap struct {
-	bpfMap ciliumSessionMapAPI
+	bpfMap     ciliumSessionMapAPI
+	cloneMap   func() (*ciliumSessionMap, error)
+	inspectMap func() (SessionMapIdentity, error)
+}
+
+func wrapCiliumSessionMap(bpfMap *ebpf.Map) *ciliumSessionMap {
+	sessionMap := &ciliumSessionMap{
+		bpfMap: bpfMap,
+		inspectMap: func() (SessionMapIdentity, error) {
+			return inspectCiliumSessionMapIdentity(bpfMap)
+		},
+	}
+	sessionMap.cloneMap = func() (*ciliumSessionMap, error) {
+		cloned, err := bpfMap.Clone()
+		if err != nil {
+			return nil, err
+		}
+		if cloned == nil {
+			return nil, errors.New("cilium eBPF map clone returned nil without error")
+		}
+		return wrapCiliumSessionMap(cloned), nil
+	}
+	return sessionMap
 }
 
 // InspectLinuxSessionMapIdentity returns the complete identity a caller must
@@ -28,7 +51,7 @@ func InspectLinuxSessionMapIdentity(bpfMap *ebpf.Map) (SessionMapIdentity, error
 	if bpfMap == nil {
 		return SessionMapIdentity{}, errors.New("faketcp session eBPF map is nil")
 	}
-	identity, err := (&ciliumSessionMap{bpfMap: bpfMap}).Identity()
+	identity, err := wrapCiliumSessionMap(bpfMap).Identity()
 	if err != nil {
 		return SessionMapIdentity{}, err
 	}
@@ -40,7 +63,10 @@ func InspectLinuxSessionMapIdentity(bpfMap *ebpf.Map) (SessionMapIdentity, error
 
 // NewLinuxSessionStore binds one generation to one exact eBPF hash map. The
 // expected identity must come from the loader's admitted collection (or from
-// InspectLinuxSessionMapIdentity) rather than from configuration text.
+// InspectLinuxSessionMapIdentity) rather than from configuration text. As
+// required by cilium/ebpf's Map contract, the caller must not race Close with
+// this constructor itself. Once this function returns successfully, the
+// caller may close its handle without affecting the store-owned clone.
 func NewLinuxSessionStore(
 	bpfMap *ebpf.Map,
 	generation uint64,
@@ -49,14 +75,45 @@ func NewLinuxSessionStore(
 	if bpfMap == nil {
 		return nil, errors.New("faketcp session eBPF map is nil")
 	}
-	return newLinuxSessionStore(&ciliumSessionMap{bpfMap: bpfMap}, generation, expected)
+	return newLinuxSessionStore(wrapCiliumSessionMap(bpfMap), generation, expected)
+}
+
+func (sessionMap *ciliumSessionMap) Clone() (sessionMapBackend, error) {
+	if sessionMap == nil || ciliumSessionMapAPIIsNil(sessionMap.bpfMap) {
+		return nil, errors.New("clone faketcp session eBPF map: source map is nil")
+	}
+	if sessionMap.cloneMap == nil {
+		return nil, errors.New("clone faketcp session eBPF map: clone operation is unavailable")
+	}
+	cloned, err := sessionMap.cloneMap()
+	if err != nil {
+		return nil, err
+	}
+	if cloned == nil || ciliumSessionMapAPIIsNil(cloned.bpfMap) {
+		return nil, errors.New("clone faketcp session eBPF map: clone operation returned nil")
+	}
+	return cloned, nil
+}
+
+func (sessionMap *ciliumSessionMap) Close() error {
+	if sessionMap == nil || ciliumSessionMapAPIIsNil(sessionMap.bpfMap) {
+		return nil
+	}
+	return sessionMap.bpfMap.Close()
 }
 
 func (sessionMap *ciliumSessionMap) Identity() (SessionMapIdentity, error) {
 	if sessionMap == nil || ciliumSessionMapAPIIsNil(sessionMap.bpfMap) {
 		return SessionMapIdentity{}, errors.New("faketcp session eBPF map is nil")
 	}
-	info, err := sessionMap.bpfMap.Info()
+	if sessionMap.inspectMap != nil {
+		return sessionMap.inspectMap()
+	}
+	return inspectCiliumSessionMapIdentity(sessionMap.bpfMap)
+}
+
+func inspectCiliumSessionMapIdentity(bpfMap ciliumSessionMapAPI) (SessionMapIdentity, error) {
+	info, err := bpfMap.Info()
 	if err != nil {
 		return SessionMapIdentity{}, fmt.Errorf("read eBPF map info: %w", err)
 	}

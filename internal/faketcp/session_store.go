@@ -32,6 +32,10 @@ var (
 	// entry and leaves the activation capability disabled.
 	ErrSessionCompareDeleteUnavailable = errors.New("atomic faketcp session compare-delete is unavailable")
 
+	// ErrSessionStoreClosed means the store's private map handle has already
+	// been closed. No operation which returns this error touches the backend.
+	ErrSessionStoreClosed = errors.New("faketcp session store is closed")
+
 	errSessionMapKeyNotExist = errors.New("faketcp session map key does not exist")
 )
 
@@ -51,6 +55,8 @@ type SessionMapIdentity struct {
 // exposes no delete primitive, making an unsafe lookup-then-delete impossible
 // in this slice while the kernel lacks atomic compare-delete.
 type sessionMapBackend interface {
+	Clone() (sessionMapBackend, error)
+	Close() error
 	Identity() (SessionMapIdentity, error)
 	InsertNoExist(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) error
 	Lookup(abi.FakeTCPSessionKey, *abi.FakeTCPSessionValue) error
@@ -65,6 +71,8 @@ type LinuxSessionStore struct {
 	backend    sessionMapBackend
 	generation uint64
 	identity   SessionMapIdentity
+	closed     bool
+	closeErr   error
 }
 
 var _ SessionStore = (*LinuxSessionStore)(nil)
@@ -83,26 +91,58 @@ func newLinuxSessionStore(
 	if err := validateSessionMapIdentity(expected); err != nil {
 		return nil, fmt.Errorf("invalid expected faketcp session map identity: %w", err)
 	}
-	actual, err := backend.Identity()
+	owned, err := backend.Clone()
 	if err != nil {
-		return nil, fmt.Errorf("inspect faketcp session map identity: %w", err)
+		cause := fmt.Errorf("clone faketcp session map handle: %w", err)
+		if sessionMapBackendIsNil(owned) {
+			return nil, cause
+		}
+		return closeClonedSessionMapAfterConstructionFailure(owned, cause)
+	}
+	if sessionMapBackendIsNil(owned) {
+		return nil, errors.New("clone faketcp session map handle: backend returned nil without error")
+	}
+
+	actual, err := owned.Identity()
+	if err != nil {
+		return closeClonedSessionMapAfterConstructionFailure(
+			owned,
+			fmt.Errorf("inspect cloned faketcp session map identity: %w", err),
+		)
 	}
 	if err := validateSessionMapIdentity(actual); err != nil {
-		return nil, fmt.Errorf("invalid actual faketcp session map identity: %w", err)
+		return closeClonedSessionMapAfterConstructionFailure(
+			owned,
+			fmt.Errorf("invalid cloned faketcp session map identity: %w", err),
+		)
 	}
 	if actual != expected {
-		return nil, fmt.Errorf(
-			"%w during construction: expected %#v, got %#v",
-			ErrSessionMapIdentityChanged,
-			expected,
-			actual,
+		return closeClonedSessionMapAfterConstructionFailure(
+			owned,
+			fmt.Errorf(
+				"%w during construction: expected %#v, got %#v",
+				ErrSessionMapIdentityChanged,
+				expected,
+				actual,
+			),
 		)
 	}
 	return &LinuxSessionStore{
-		backend:    backend,
+		backend:    owned,
 		generation: generation,
 		identity:   expected,
 	}, nil
+}
+
+func closeClonedSessionMapAfterConstructionFailure(
+	owned sessionMapBackend,
+	cause error,
+) (*LinuxSessionStore, error) {
+	closeErr := owned.Close()
+	if closeErr != nil {
+		closeErr = fmt.Errorf("close cloned faketcp session map after construction failure: %w", closeErr)
+	}
+	return nil, errors.Join(cause, closeErr)
 }
 
 func sessionMapBackendIsNil(backend sessionMapBackend) bool {
@@ -153,15 +193,18 @@ func (store *LinuxSessionStore) InsertEstablished(
 	if store == nil {
 		return errors.New("faketcp session store is nil")
 	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.requireOpenLocked(); err != nil {
+		return err
+	}
 	if err := validateBoundSessionKey(key, store.generation); err != nil {
 		return err
 	}
 	if err := validateEstablishedSessionValue(value, store.generation); err != nil {
 		return err
 	}
-
-	store.mu.Lock()
-	defer store.mu.Unlock()
 	if err := store.validateMapBindingLocked(); err != nil {
 		return err
 	}
@@ -177,12 +220,15 @@ func (store *LinuxSessionStore) LookupEstablished(
 	if store == nil {
 		return abi.FakeTCPSessionValue{}, false, errors.New("faketcp session store is nil")
 	}
-	if err := validateBoundSessionKey(key, store.generation); err != nil {
-		return abi.FakeTCPSessionValue{}, false, err
-	}
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if err := store.requireOpenLocked(); err != nil {
+		return abi.FakeTCPSessionValue{}, false, err
+	}
+	if err := validateBoundSessionKey(key, store.generation); err != nil {
+		return abi.FakeTCPSessionValue{}, false, err
+	}
 	if err := store.validateMapBindingLocked(); err != nil {
 		return abi.FakeTCPSessionValue{}, false, err
 	}
@@ -196,6 +242,12 @@ func (store *LinuxSessionStore) DeleteEstablishedIfUnchanged(
 	if store == nil {
 		return false, errors.New("faketcp session store is nil")
 	}
+
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if err := store.requireOpenLocked(); err != nil {
+		return false, err
+	}
 	if err := validateBoundSessionKey(key, store.generation); err != nil {
 		return false, err
 	}
@@ -203,8 +255,6 @@ func (store *LinuxSessionStore) DeleteEstablishedIfUnchanged(
 		return false, err
 	}
 
-	store.mu.Lock()
-	defer store.mu.Unlock()
 	if err := store.validateMapBindingLocked(); err != nil {
 		return false, err
 	}
@@ -226,6 +276,40 @@ func (store *LinuxSessionStore) DeleteEstablishedIfUnchanged(
 		store.identity.ID,
 		store.generation,
 	)
+}
+
+// Close releases only the store-owned cloned map handle. It never closes the
+// caller's handle. Close serialises with every store operation and is
+// idempotent: a close failure is retained and returned by later Close calls,
+// but the store remains permanently closed either way.
+func (store *LinuxSessionStore) Close() error {
+	if store == nil {
+		return nil
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.closed {
+		return store.closeErr
+	}
+	store.closed = true
+	if sessionMapBackendIsNil(store.backend) {
+		store.closeErr = errors.New("close faketcp session store: owned backend is nil")
+		return store.closeErr
+	}
+	if err := store.backend.Close(); err != nil {
+		store.closeErr = fmt.Errorf("close owned faketcp session map handle: %w", err)
+	}
+	return store.closeErr
+}
+
+func (store *LinuxSessionStore) requireOpenLocked() error {
+	if store.closed {
+		return ErrSessionStoreClosed
+	}
+	if sessionMapBackendIsNil(store.backend) {
+		return errors.New("faketcp session store has no owned map backend")
+	}
+	return nil
 }
 
 func (store *LinuxSessionStore) validateMapBindingLocked() error {

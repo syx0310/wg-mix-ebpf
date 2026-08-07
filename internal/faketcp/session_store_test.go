@@ -15,22 +15,46 @@ var (
 	errMemorySessionMapInspect = errors.New("memory session map inspect failed")
 	errMemorySessionMapUpdate  = errors.New("memory session map update failed")
 	errMemorySessionMapLookup  = errors.New("memory session map lookup failed")
+	errMemorySessionMapClone   = errors.New("memory session map clone failed")
+	errMemorySessionMapClose   = errors.New("memory session map close failed")
 )
 
 type memorySessionMap struct {
 	mu sync.Mutex
 
-	identity    SessionMapIdentity
-	values      map[abi.FakeTCPSessionKey]abi.FakeTCPSessionValue
-	identityErr error
-	insertErr   error
-	lookupErr   error
-	closed      bool
+	identity      SessionMapIdentity
+	values        map[abi.FakeTCPSessionKey]abi.FakeTCPSessionValue
+	identityErr   error
+	insertErr     error
+	lookupErr     error
+	closed        bool
+	closeErr      error
+	cloneErr      error
+	cloneWithErr  bool
+	cloneCloseErr error
+	cloneIdentity *SessionMapIdentity
+	cloneTypedNil bool
 
 	identityCalls int
 	insertCalls   int
 	lookupCalls   int
+	cloneCalls    int
+	closeCalls    int
 	beforeLookup  func(*memorySessionMap, abi.FakeTCPSessionKey)
+	lastClone     *clonedMemorySessionMap
+}
+
+// clonedMemorySessionMap is a handle with lifecycle independent from the
+// caller-owned memorySessionMap. Both handles intentionally share map data and
+// operation counters, just like dup(2) descriptors for one kernel eBPF map.
+type clonedMemorySessionMap struct {
+	mu sync.Mutex
+
+	state            *memorySessionMap
+	closed           bool
+	closeErr         error
+	closeCalls       int
+	identityOverride *SessionMapIdentity
 }
 
 func newMemorySessionMap() *memorySessionMap {
@@ -38,6 +62,43 @@ func newMemorySessionMap() *memorySessionMap {
 		identity: validSessionMapIdentity(),
 		values:   make(map[abi.FakeTCPSessionKey]abi.FakeTCPSessionValue),
 	}
+}
+
+func (sessionMap *memorySessionMap) Clone() (sessionMapBackend, error) {
+	sessionMap.mu.Lock()
+	defer sessionMap.mu.Unlock()
+	sessionMap.cloneCalls++
+	if sessionMap.closed {
+		return nil, errMemorySessionMapClosed
+	}
+	if sessionMap.cloneErr != nil && !sessionMap.cloneWithErr {
+		return nil, sessionMap.cloneErr
+	}
+	if sessionMap.cloneTypedNil {
+		var cloned *clonedMemorySessionMap
+		return cloned, nil
+	}
+	cloned := &clonedMemorySessionMap{
+		state:            sessionMap,
+		closeErr:         sessionMap.cloneCloseErr,
+		identityOverride: sessionMap.cloneIdentity,
+	}
+	sessionMap.lastClone = cloned
+	if sessionMap.cloneErr != nil {
+		return cloned, sessionMap.cloneErr
+	}
+	return cloned, nil
+}
+
+func (sessionMap *memorySessionMap) Close() error {
+	sessionMap.mu.Lock()
+	defer sessionMap.mu.Unlock()
+	sessionMap.closeCalls++
+	if sessionMap.closed {
+		return sessionMap.closeErr
+	}
+	sessionMap.closed = true
+	return sessionMap.closeErr
 }
 
 func (sessionMap *memorySessionMap) Identity() (SessionMapIdentity, error) {
@@ -123,9 +184,98 @@ func (sessionMap *memorySessionMap) setIdentity(identity SessionMapIdentity) {
 }
 
 func (sessionMap *memorySessionMap) close() {
+	_ = sessionMap.Close()
+}
+
+func (sessionMap *memorySessionMap) clonedHandle() *clonedMemorySessionMap {
 	sessionMap.mu.Lock()
 	defer sessionMap.mu.Unlock()
-	sessionMap.closed = true
+	return sessionMap.lastClone
+}
+
+func (cloned *clonedMemorySessionMap) Clone() (sessionMapBackend, error) {
+	return nil, errors.New("test cloned session map cannot be cloned again")
+}
+
+func (cloned *clonedMemorySessionMap) Close() error {
+	if cloned == nil {
+		return nil
+	}
+	cloned.mu.Lock()
+	defer cloned.mu.Unlock()
+	cloned.closeCalls++
+	if cloned.closed {
+		return cloned.closeErr
+	}
+	cloned.closed = true
+	return cloned.closeErr
+}
+
+func (cloned *clonedMemorySessionMap) Identity() (SessionMapIdentity, error) {
+	cloned.mu.Lock()
+	defer cloned.mu.Unlock()
+	if cloned.closed {
+		return SessionMapIdentity{}, errMemorySessionMapClosed
+	}
+	if cloned.identityOverride != nil {
+		return *cloned.identityOverride, nil
+	}
+	cloned.state.mu.Lock()
+	defer cloned.state.mu.Unlock()
+	cloned.state.identityCalls++
+	if cloned.state.identityErr != nil {
+		return SessionMapIdentity{}, cloned.state.identityErr
+	}
+	return cloned.state.identity, nil
+}
+
+func (cloned *clonedMemorySessionMap) InsertNoExist(
+	key abi.FakeTCPSessionKey,
+	value abi.FakeTCPSessionValue,
+) error {
+	cloned.mu.Lock()
+	defer cloned.mu.Unlock()
+	if cloned.closed {
+		return errMemorySessionMapClosed
+	}
+	cloned.state.mu.Lock()
+	defer cloned.state.mu.Unlock()
+	cloned.state.insertCalls++
+	if cloned.state.insertErr != nil {
+		return cloned.state.insertErr
+	}
+	if _, exists := cloned.state.values[key]; exists {
+		return errMemorySessionKeyExists
+	}
+	cloned.state.values[key] = value
+	return nil
+}
+
+func (cloned *clonedMemorySessionMap) Lookup(
+	key abi.FakeTCPSessionKey,
+	value *abi.FakeTCPSessionValue,
+) error {
+	cloned.mu.Lock()
+	defer cloned.mu.Unlock()
+	if cloned.closed {
+		return errMemorySessionMapClosed
+	}
+	cloned.state.mu.Lock()
+	defer cloned.state.mu.Unlock()
+	cloned.state.lookupCalls++
+	if cloned.state.lookupErr != nil {
+		return cloned.state.lookupErr
+	}
+	if hook := cloned.state.beforeLookup; hook != nil {
+		cloned.state.beforeLookup = nil
+		hook(cloned.state, key)
+	}
+	actual, found := cloned.state.values[key]
+	if !found {
+		return errSessionMapKeyNotExist
+	}
+	*value = actual
+	return nil
 }
 
 func validSessionMapIdentity() SessionMapIdentity {
@@ -202,39 +352,148 @@ func TestSessionMapIdentityRequiresExactLinuxABI(t *testing.T) {
 }
 
 func TestNewLinuxSessionStoreBindsGenerationAndMapIdentity(t *testing.T) {
-	backend := newMemorySessionMap()
-	store, err := newLinuxSessionStore(backend, 7, backend.identity)
-	if err != nil || store.generation != 7 || store.identity != backend.identity {
-		t.Fatalf("store=%#v err=%v", store, err)
-	}
+	identity := validSessionMapIdentity()
+	t.Run("success owns only clone", func(t *testing.T) {
+		backend := newMemorySessionMap()
+		store, err := newLinuxSessionStore(backend, 7, identity)
+		if err != nil || store.generation != 7 || store.identity != identity {
+			t.Fatalf("store=%#v err=%v", store, err)
+		}
+		if backend.cloneCalls != 1 || backend.clonedHandle() == nil ||
+			store.backend != backend.clonedHandle() || backend.closeCalls != 0 {
+			t.Fatalf(
+				"clone calls=%d clone=%p store backend=%p source close calls=%d",
+				backend.cloneCalls,
+				backend.clonedHandle(),
+				store.backend,
+				backend.closeCalls,
+			)
+		}
+	})
 
-	if _, err := newLinuxSessionStore(nil, 7, backend.identity); err == nil {
-		t.Fatal("nil backend accepted")
-	}
-	var typedNil *memorySessionMap
-	if _, err := newLinuxSessionStore(typedNil, 7, backend.identity); err == nil {
-		t.Fatal("typed-nil backend accepted")
-	}
-	if _, err := newLinuxSessionStore(backend, 0, backend.identity); err == nil {
-		t.Fatal("zero generation accepted")
-	}
+	t.Run("nil and typed nil", func(t *testing.T) {
+		if _, err := newLinuxSessionStore(nil, 7, identity); err == nil {
+			t.Fatal("nil backend accepted")
+		}
+		var typedNil *memorySessionMap
+		if _, err := newLinuxSessionStore(typedNil, 7, identity); err == nil {
+			t.Fatal("typed-nil backend accepted")
+		}
+	})
 
-	invalidExpected := backend.identity
-	invalidExpected.KeySize++
-	if _, err := newLinuxSessionStore(backend, 7, invalidExpected); err == nil {
-		t.Fatal("invalid expected ABI accepted")
-	}
+	t.Run("pre-clone validation", func(t *testing.T) {
+		backend := newMemorySessionMap()
+		if _, err := newLinuxSessionStore(backend, 0, identity); err == nil {
+			t.Fatal("zero generation accepted")
+		}
+		invalidExpected := identity
+		invalidExpected.KeySize++
+		if _, err := newLinuxSessionStore(backend, 7, invalidExpected); err == nil {
+			t.Fatal("invalid expected ABI accepted")
+		}
+		if backend.cloneCalls != 0 {
+			t.Fatalf("pre-clone validation cloned map %d times", backend.cloneCalls)
+		}
+	})
 
-	wrongExpected := backend.identity
-	wrongExpected.ID++
-	if _, err := newLinuxSessionStore(backend, 7, wrongExpected); !errors.Is(err, ErrSessionMapIdentityChanged) {
-		t.Fatalf("wrong identity error = %v", err)
-	}
+	t.Run("clone failure", func(t *testing.T) {
+		backend := newMemorySessionMap()
+		backend.cloneErr = errMemorySessionMapClone
+		if _, err := newLinuxSessionStore(backend, 7, identity); !errors.Is(err, errMemorySessionMapClone) {
+			t.Fatalf("clone error = %v", err)
+		}
+		if backend.lastClone != nil || backend.closeCalls != 0 {
+			t.Fatal("clone failure closed the caller or produced an owned handle")
+		}
+	})
 
-	backend.identityErr = errMemorySessionMapInspect
-	if _, err := newLinuxSessionStore(backend, 7, backend.identity); !errors.Is(err, errMemorySessionMapInspect) {
-		t.Fatalf("identity read error = %v", err)
-	}
+	t.Run("partial clone failure closes returned handle", func(t *testing.T) {
+		backend := newMemorySessionMap()
+		backend.cloneErr = errMemorySessionMapClone
+		backend.cloneWithErr = true
+		backend.cloneCloseErr = errMemorySessionMapClose
+		_, err := newLinuxSessionStore(backend, 7, identity)
+		if !errors.Is(err, errMemorySessionMapClone) ||
+			!errors.Is(err, errMemorySessionMapClose) {
+			t.Fatalf("partial clone joined error = %v", err)
+		}
+		clone := backend.clonedHandle()
+		if clone == nil || clone.closeCalls != 1 {
+			t.Fatalf("partial clone was not closed exactly once: clone=%p", clone)
+		}
+		if backend.closeCalls != 0 {
+			t.Fatal("partial clone failure closed caller handle")
+		}
+	})
+
+	t.Run("typed nil clone", func(t *testing.T) {
+		backend := newMemorySessionMap()
+		backend.cloneTypedNil = true
+		if _, err := newLinuxSessionStore(backend, 7, identity); err == nil {
+			t.Fatal("typed-nil clone accepted")
+		}
+		if backend.closeCalls != 0 {
+			t.Fatal("typed-nil clone closed the caller handle")
+		}
+	})
+
+	t.Run("cloned identity drift closes clone", func(t *testing.T) {
+		backend := newMemorySessionMap()
+		drifted := identity
+		drifted.ID++
+		backend.cloneIdentity = &drifted
+		if _, err := newLinuxSessionStore(backend, 7, identity); !errors.Is(err, ErrSessionMapIdentityChanged) {
+			t.Fatalf("identity drift error = %v", err)
+		}
+		clone := backend.clonedHandle()
+		if clone == nil {
+			t.Fatal("identity drift did not retain cloned-handle evidence")
+		}
+		if clone.closeCalls != 1 {
+			t.Fatalf("failed construction clone close calls=%d", clone.closeCalls)
+		}
+		if backend.closeCalls != 0 {
+			t.Fatal("identity drift closed caller handle")
+		}
+	})
+
+	t.Run("invalid cloned ABI closes clone", func(t *testing.T) {
+		backend := newMemorySessionMap()
+		invalid := identity
+		invalid.ValueSize++
+		backend.cloneIdentity = &invalid
+		if _, err := newLinuxSessionStore(backend, 7, identity); err == nil {
+			t.Fatal("invalid cloned ABI accepted")
+		}
+		clone := backend.clonedHandle()
+		if clone == nil || clone.closeCalls != 1 {
+			t.Fatalf("invalid ABI clone was not closed exactly once: clone=%p", clone)
+		}
+		if backend.closeCalls != 0 {
+			t.Fatal("invalid cloned ABI closed caller handle")
+		}
+	})
+
+	t.Run("identity failure joins clone close failure", func(t *testing.T) {
+		backend := newMemorySessionMap()
+		backend.identityErr = errMemorySessionMapInspect
+		backend.cloneCloseErr = errMemorySessionMapClose
+		_, err := newLinuxSessionStore(backend, 7, identity)
+		if !errors.Is(err, errMemorySessionMapInspect) ||
+			!errors.Is(err, errMemorySessionMapClose) {
+			t.Fatalf("joined construction error = %v", err)
+		}
+		clone := backend.clonedHandle()
+		if clone == nil {
+			t.Fatal("identity failure did not retain cloned-handle evidence")
+		}
+		if clone.closeCalls != 1 {
+			t.Fatalf("failed construction clone close calls=%d", clone.closeCalls)
+		}
+		if backend.closeCalls != 0 {
+			t.Fatal("construction failure closed caller handle")
+		}
+	})
 }
 
 func TestLinuxSessionStoreInsertsOnceAndReadsValidatedValue(t *testing.T) {
@@ -372,15 +631,39 @@ func TestLinuxSessionStoreRevalidatesIdentityAndPropagatesMapFailures(t *testing
 		}
 	})
 
-	t.Run("closed map", func(t *testing.T) {
+	t.Run("caller close does not affect owned clone", func(t *testing.T) {
 		store, backend := newTestLinuxSessionStore(t)
+		key := sessionStoreTestKey(7)
+		value := sessionStoreTestValue(7)
+		if err := store.InsertEstablished(key, value); err != nil {
+			t.Fatal(err)
+		}
 		backend.close()
+		got, found, err := store.LookupEstablished(key)
+		if err != nil || !found || got != value {
+			t.Fatalf("lookup after caller close got=%#v found=%t err=%v", got, found, err)
+		}
+		clone := backend.clonedHandle()
+		if backend.closeCalls != 1 || clone == nil || clone.closeCalls != 0 {
+			t.Fatalf("source close calls=%d clone=%p", backend.closeCalls, clone)
+		}
+	})
+
+	t.Run("unexpected owned handle close is detected", func(t *testing.T) {
+		store, backend := newTestLinuxSessionStore(t)
+		clone := backend.clonedHandle()
+		if clone == nil {
+			t.Fatal("store did not own a cloned handle")
+		}
+		if err := clone.Close(); err != nil {
+			t.Fatal(err)
+		}
 		_, _, err := store.LookupEstablished(sessionStoreTestKey(7))
 		if !errors.Is(err, errMemorySessionMapClosed) {
-			t.Fatalf("closed map error = %v", err)
+			t.Fatalf("externally closed owned handle error = %v", err)
 		}
 		if backend.lookupCalls != 0 {
-			t.Fatal("closed map reached lookup after identity failure")
+			t.Fatal("closed owned handle reached map lookup")
 		}
 	})
 
@@ -454,6 +737,82 @@ func TestLinuxSessionStoreCompareDeleteFailsClosedWithoutTOCTOU(t *testing.T) {
 			t.Fatalf("deleted=%t err=%v", deleted, err)
 		}
 	})
+}
+
+func TestLinuxSessionStoreCloseOwnsOnlyCloneAndFailsOperationsClosed(t *testing.T) {
+	t.Run("idempotent close leaves caller open", func(t *testing.T) {
+		store, backend := newTestLinuxSessionStore(t)
+		clone := backend.clonedHandle()
+		if clone == nil {
+			t.Fatal("store did not retain cloned handle")
+		}
+		if err := store.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.Close(); err != nil {
+			t.Fatalf("second close error = %v", err)
+		}
+		if clone.closeCalls != 1 || backend.closeCalls != 0 {
+			t.Fatalf("clone close calls=%d caller close calls=%d", clone.closeCalls, backend.closeCalls)
+		}
+
+		identityCalls := backend.identityCalls
+		insertCalls := backend.insertCalls
+		lookupCalls := backend.lookupCalls
+		key := sessionStoreTestKey(7)
+		value := sessionStoreTestValue(7)
+		if err := store.InsertEstablished(key, value); !errors.Is(err, ErrSessionStoreClosed) {
+			t.Fatalf("closed insert error = %v", err)
+		}
+		if _, found, err := store.LookupEstablished(key); !errors.Is(err, ErrSessionStoreClosed) || found {
+			t.Fatalf("closed lookup found=%t err=%v", found, err)
+		}
+		if deleted, err := store.DeleteEstablishedIfUnchanged(key, value); !errors.Is(err, ErrSessionStoreClosed) || deleted {
+			t.Fatalf("closed delete deleted=%t err=%v", deleted, err)
+		}
+		if backend.identityCalls != identityCalls || backend.insertCalls != insertCalls ||
+			backend.lookupCalls != lookupCalls {
+			t.Fatalf(
+				"closed operations touched backend: identity=%d/%d insert=%d/%d lookup=%d/%d",
+				backend.identityCalls,
+				identityCalls,
+				backend.insertCalls,
+				insertCalls,
+				backend.lookupCalls,
+				lookupCalls,
+			)
+		}
+		if _, err := backend.Identity(); err != nil {
+			t.Fatalf("store close closed caller handle: %v", err)
+		}
+	})
+
+	t.Run("close error is retained without retry", func(t *testing.T) {
+		backend := newMemorySessionMap()
+		backend.cloneCloseErr = errMemorySessionMapClose
+		store, err := newLinuxSessionStore(backend, 7, backend.identity)
+		if err != nil {
+			t.Fatal(err)
+		}
+		firstErr := store.Close()
+		secondErr := store.Close()
+		if !errors.Is(firstErr, errMemorySessionMapClose) ||
+			!errors.Is(secondErr, errMemorySessionMapClose) {
+			t.Fatalf("close errors first=%v second=%v", firstErr, secondErr)
+		}
+		clone := backend.clonedHandle()
+		if clone == nil || clone.closeCalls != 1 {
+			t.Fatalf("close failure retried or lost clone: clone=%p", clone)
+		}
+		if _, _, err := store.LookupEstablished(sessionStoreTestKey(7)); !errors.Is(err, ErrSessionStoreClosed) {
+			t.Fatalf("store remained usable after close failure: %v", err)
+		}
+	})
+
+	var nilStore *LinuxSessionStore
+	if err := nilStore.Close(); err != nil {
+		t.Fatalf("nil store close error = %v", err)
+	}
 }
 
 func TestLinuxSessionStoreConcurrentInsertAndBPFReads(t *testing.T) {
@@ -538,12 +897,12 @@ func TestLinuxSessionStoreConcurrentInsertAndBPFReads(t *testing.T) {
 		}
 	})
 
-	t.Run("concurrent close propagates without panic", func(t *testing.T) {
+	t.Run("store close serializes with lookups", func(t *testing.T) {
 		store, backend := newTestLinuxSessionStore(t)
 		key := sessionStoreTestKey(7)
 		backend.putFromBPF(key, sessionStoreTestValue(7))
 		start := make(chan struct{})
-		errCh := make(chan error, 1)
+		errCh := make(chan error, 2)
 		var wait sync.WaitGroup
 		wait.Add(2)
 		go func() {
@@ -551,7 +910,7 @@ func TestLinuxSessionStoreConcurrentInsertAndBPFReads(t *testing.T) {
 			<-start
 			for index := 0; index < 1000; index++ {
 				_, _, err := store.LookupEstablished(key)
-				if err != nil && !errors.Is(err, errMemorySessionMapClosed) {
+				if err != nil && !errors.Is(err, ErrSessionStoreClosed) {
 					errCh <- err
 					return
 				}
@@ -560,7 +919,9 @@ func TestLinuxSessionStoreConcurrentInsertAndBPFReads(t *testing.T) {
 		go func() {
 			defer wait.Done()
 			<-start
-			backend.close()
+			if err := store.Close(); err != nil {
+				errCh <- err
+			}
 		}()
 		close(start)
 		wait.Wait()
@@ -568,8 +929,12 @@ func TestLinuxSessionStoreConcurrentInsertAndBPFReads(t *testing.T) {
 		for err := range errCh {
 			t.Fatal(err)
 		}
-		if _, _, err := store.LookupEstablished(key); !errors.Is(err, errMemorySessionMapClosed) {
+		if _, _, err := store.LookupEstablished(key); !errors.Is(err, ErrSessionStoreClosed) {
 			t.Fatalf("post-close lookup error = %v", err)
+		}
+		clone := backend.clonedHandle()
+		if clone == nil || clone.closeCalls != 1 || backend.closeCalls != 0 {
+			t.Fatalf("clone=%p caller close calls=%d", clone, backend.closeCalls)
 		}
 	})
 }
