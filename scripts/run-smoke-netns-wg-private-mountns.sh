@@ -1,4 +1,9 @@
-#!/usr/bin/env bash
+#!/usr/bin/bash -p
+if [[ "$-" != *p* ]]; then
+  builtin printf '%s\n' \
+    'error: private mount namespace launcher requires Bash privileged mode' >&2
+  exit 1
+fi
 set -euo pipefail
 
 # This launcher is the only supported root entry point for the WireGuard

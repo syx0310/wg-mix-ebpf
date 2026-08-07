@@ -1,9 +1,10 @@
+override SHELL := /bin/sh
 CGO_ENABLED ?= 0
 GO ?= go
 GOFMT ?= gofmt
 BINARY ?= bin/wg-mix-ebpf
 NETNS_ANCHOR_BINARY ?= bin/wg-mix-ebpf-netns-anchor
-WG_NETNS_SMOKE_LAUNCHER := scripts/run-smoke-netns-wg-private-mountns.sh
+override WG_NETNS_SMOKE_LAUNCHER := scripts/run-smoke-netns-wg-private-mountns.sh
 CLANG ?= clang
 BPF_MULTIARCH ?= $(shell gcc -print-multiarch 2>/dev/null)
 BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/include/$(BPF_MULTIARCH),)

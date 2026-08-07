@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import hashlib
 import json
+import os
 import pathlib
 import shlex
 import stat
@@ -69,6 +70,8 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
     def test_wg_smoke_uses_only_reviewed_private_mountns_entry(self) -> None:
         launcher = self.mountns_launcher
         for fragment in (
+            "#!/usr/bin/bash -p",
+            'if [[ "$-" != *p* ]]',
             'readonly UNSHARE_BIN="/usr/bin/unshare"',
             '"${UNSHARE_BIN}" --mount --propagation private --',
             'readonly BASH_BIN="/usr/bin/bash"',
@@ -100,10 +103,11 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertIn("WG_MIX_EBPF_SMOKE_MOUNTNS_XOR_SECRET_FD", child_environment)
 
         self.assertIn(
-            "WG_NETNS_SMOKE_LAUNCHER := "
+            "override WG_NETNS_SMOKE_LAUNCHER := "
             "scripts/run-smoke-netns-wg-private-mountns.sh",
             self.makefile_source,
         )
+        self.assertIn("override SHELL := /bin/sh", self.makefile_source)
         for line in self.makefile_source.splitlines():
             if not line.startswith("\t") or "scripts/smoke-netns-wg.sh" not in line:
                 continue
@@ -115,6 +119,129 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.makefile_source.count("$(WG_NETNS_SMOKE_LAUNCHER)"),
             15,
         )
+
+    def test_launcher_startup_ignores_bash_env_and_exported_functions(self) -> None:
+        if os.geteuid() == 0:
+            self.skipTest("startup-injection fixture must stay unprivileged")
+        bash = pathlib.Path("/usr/bin/bash")
+        if not bash.is_file():
+            bash = pathlib.Path("/bin/bash")
+        if not bash.is_file():
+            self.skipTest("startup-injection fixture requires fixed Bash")
+
+        secret = "xor-startup-injection-secret-7b61"
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = pathlib.Path(temporary_directory)
+            bash_env_marker = temporary / "bash-env-ran"
+            function_marker = temporary / "exported-function-ran"
+            bash_env = temporary / "malicious-bash-env.sh"
+            bash_env.write_text(
+                f'/usr/bin/touch {shlex.quote(str(bash_env_marker))}\n',
+                encoding="utf-8",
+            )
+            environment = {
+                "PATH": "/usr/bin:/bin",
+                "LC_ALL": "C",
+                "BASH_ENV": str(bash_env),
+                "XOR_PASSWORD": secret,
+                "BASH_FUNC_echo%%": (
+                    "() { /usr/bin/touch "
+                    f"{shlex.quote(str(function_marker))}; "
+                    'builtin echo "$@"; }'
+                ),
+            }
+
+            control = subprocess.run(
+                [str(bash), "-c", "echo control"],
+                check=False,
+                capture_output=True,
+                env=environment,
+            )
+            self.assertEqual(control.returncode, 0, control.stderr)
+            self.assertTrue(bash_env_marker.is_file())
+            self.assertTrue(function_marker.is_file())
+            bash_env_marker.unlink()
+            function_marker.unlink()
+
+            privileged = subprocess.run(
+                [str(bash), "-p", str(MOUNTNS_LAUNCHER_PATH)],
+                check=False,
+                capture_output=True,
+                env=environment,
+            )
+            self.assertNotEqual(privileged.returncode, 0)
+            self.assertFalse(bash_env_marker.exists())
+            self.assertFalse(function_marker.exists())
+            self.assertNotIn(secret.encode(), privileged.stdout)
+            self.assertNotIn(secret.encode(), privileged.stderr)
+
+            if pathlib.Path("/usr/bin/bash").is_file():
+                direct = subprocess.run(
+                    [str(MOUNTNS_LAUNCHER_PATH)],
+                    check=False,
+                    capture_output=True,
+                    env=environment,
+                )
+                self.assertNotEqual(direct.returncode, 0)
+                self.assertFalse(bash_env_marker.exists())
+                self.assertFalse(function_marker.exists())
+                self.assertNotIn(secret.encode(), direct.stdout)
+                self.assertNotIn(secret.encode(), direct.stderr)
+
+    def test_make_command_line_cannot_override_smoke_entry_or_recipe_shell(
+        self,
+    ) -> None:
+        make = pathlib.Path("/usr/bin/make")
+        if not make.is_file():
+            self.skipTest("make override fixture requires /usr/bin/make")
+        repository = SCRIPT_PATH.parent.parent
+        malicious_launcher = "/tmp/not-reviewed-wg-smoke-launcher"
+        dry_run = subprocess.run(
+            [
+                str(make),
+                "--no-print-directory",
+                "-n",
+                "test-netns-smoke",
+                f"WG_NETNS_SMOKE_LAUNCHER={malicious_launcher}",
+            ],
+            cwd=repository,
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+        self.assertEqual(dry_run.returncode, 0, dry_run.stderr)
+        self.assertIn(
+            "scripts/run-smoke-netns-wg-private-mountns.sh",
+            dry_run.stdout,
+        )
+        self.assertNotIn(malicious_launcher, dry_run.stdout)
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = pathlib.Path(temporary_directory)
+            shell_marker = temporary / "malicious-shell-ran"
+            malicious_shell = temporary / "malicious-shell"
+            malicious_shell.write_text(
+                "#!/bin/sh\n"
+                f"/usr/bin/touch {shlex.quote(str(shell_marker))}\n"
+                "exit 91\n",
+                encoding="utf-8",
+            )
+            malicious_shell.chmod(0o700)
+            executed = subprocess.run(
+                [
+                    str(make),
+                    "--no-print-directory",
+                    "test-netns",
+                    f"SHELL={malicious_shell}",
+                ],
+                cwd=repository,
+                check=False,
+                capture_output=True,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+            self.assertEqual(executed.returncode, 0, executed.stderr)
+            self.assertFalse(shell_marker.exists())
 
     def test_mountns_child_gate_precedes_every_test_resource_write(self) -> None:
         gate = self.source.index('validate_private_mountns_launch "$@"')
@@ -168,6 +295,25 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         )
         accepted = inspect(root + private_run)
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+        unrelated_escaped = (
+            "90 25 0:90 / /mnt/with\\040space rw,relatime "
+            "- tmpfs unrelated rw\n"
+        )
+        accepted_unrelated = inspect(root + private_run + unrelated_escaped)
+        self.assertEqual(
+            accepted_unrelated.returncode,
+            0,
+            accepted_unrelated.stderr,
+        )
+
+        selected_target = (
+            f"110 90 0:110 / {target} rw,relatime - tmpfs selected rw\n"
+        )
+        self.assertNotEqual(
+            inspect(root + unrelated_escaped + selected_target).returncode,
+            0,
+        )
 
         for propagation in (
             "shared:77",

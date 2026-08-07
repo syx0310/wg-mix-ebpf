@@ -69,8 +69,7 @@ validate_private_mount_chain() {
     {
       separator = separator_index()
       if (separator == 0 || $1 !~ /^[1-9][0-9]*$/ ||
-          $2 !~ /^[1-9][0-9]*$/ || $5 !~ /^\// ||
-          index($5, "\\") != 0 || seen_id[$1]++) {
+          $2 !~ /^[1-9][0-9]*$/ || $5 !~ /^\// || seen_id[$1]++) {
         invalid = 1
         exit 1
       }
@@ -94,7 +93,8 @@ validate_private_mount_chain() {
       }
       current = best_id
       for (depth = 0; depth <= 1024; depth++) {
-        if (!(current in mount_path) || chain_seen[current]++) {
+        if (!(current in mount_path) || chain_seen[current]++ ||
+            index(mount_path[current], "\\") != 0) {
           exit 1
         }
         if (separator_at[current] != 7) {
