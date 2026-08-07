@@ -432,8 +432,30 @@ func stageLiveExperimentalTC(
 	if err != nil {
 		return nil, fmt.Errorf("prepare experimental TC core: %w", err)
 	}
+	return executeFreshExperimentalTCPlan(plan, commit)
+}
+
+func executeFreshExperimentalTCPlan(
+	plan *tcAttachPlan,
+	commit func() error,
+) (experimentalTCStageOwner, error) {
+	if plan == nil {
+		return nil, errors.New("execute fresh experimental TC core: plan is nil")
+	}
+	// Experimental generations have no persistent TC owner record. A reserved
+	// slot that merely looks managed is therefore foreign and must never be
+	// replaced on first activation.
+	if err := plan.ValidatePreviousBindings(nil, true); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("validate fresh experimental TC ownership: %w", err),
+			plan.Close(),
+		)
+	}
 	stage, err := plan.ExecuteRetained(commit)
 	if err != nil {
+		if stage != nil {
+			return stage, err
+		}
 		return nil, errors.Join(err, plan.Close())
 	}
 	return stage, nil

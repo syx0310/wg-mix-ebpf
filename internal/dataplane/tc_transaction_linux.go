@@ -28,6 +28,7 @@ type tcRuntime struct {
 	linkByIndex   func(int) (netlink.Link, error)
 	qdiscList     func(netlink.Link) ([]netlink.Qdisc, error)
 	qdiscAdd      func(netlink.Qdisc) error
+	qdiscDelete   func(netlink.Qdisc) error
 	filterList    func(netlink.Link, uint32) ([]netlink.Filter, error)
 	filterAdd     func(netlink.Filter) error
 	filterReplace func(netlink.Filter) error
@@ -39,6 +40,7 @@ var liveTCRuntime = tcRuntime{
 	linkByIndex:   netlink.LinkByIndex,
 	qdiscList:     netlink.QdiscList,
 	qdiscAdd:      netlink.QdiscAdd,
+	qdiscDelete:   netlink.QdiscDel,
 	filterList:    netlink.FilterList,
 	filterAdd:     netlink.FilterAdd,
 	filterReplace: netlink.FilterReplace,
@@ -102,6 +104,11 @@ type tcOwnedStaleFilter struct {
 	snapshot tcFilterSnapshot
 }
 
+type tcOwnedCreatedQdisc struct {
+	link    netlink.Link
+	ifindex int
+}
+
 // tcAttachStage retains the exact preflight snapshots and program references
 // needed to restore every filter changed by one successful attachment.  It is
 // used by unpinned experimental generations whose TC ownership ends with the
@@ -112,6 +119,7 @@ type tcAttachStage struct {
 	plan    *tcAttachPlan
 	applied []tcAppliedFilter
 	deleted []tcOwnedStaleFilter
+	created []tcOwnedCreatedQdisc
 	done    bool
 	err     error
 }
@@ -219,6 +227,7 @@ func prepareTCAttachPlan(
 
 func validateTCRuntime(runtime tcRuntime) error {
 	if runtime.linkByIndex == nil || runtime.qdiscList == nil || runtime.qdiscAdd == nil ||
+		runtime.qdiscDelete == nil ||
 		runtime.filterList == nil || runtime.filterAdd == nil ||
 		runtime.filterReplace == nil || runtime.filterDelete == nil ||
 		runtime.loadProgram == nil {
@@ -520,7 +529,10 @@ func (plan *tcAttachPlan) AddOwnedStaleRemovals(
 func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
 	stage, err := plan.ExecuteRetained(commit)
 	if err != nil {
-		return err
+		if stage != nil {
+			return errors.Join(err, stage.Close())
+		}
+		return errors.Join(err, plan.Close())
 	}
 	// Persistent loader callers transfer rollback responsibility to their
 	// owner journal in commit.  Disarm leaves retained program handles with the
@@ -535,7 +547,7 @@ func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
 // invalidate the retained program references until the stage is resolved.
 func (plan *tcAttachPlan) ExecuteRetained(
 	commit func() error,
-) (_ *tcAttachStage, returnErr error) {
+) (*tcAttachStage, error) {
 	if plan == nil {
 		return nil, errors.New("TC attach plan is nil")
 	}
@@ -549,64 +561,64 @@ func (plan *tcAttachPlan) ExecuteRetained(
 		return nil, errors.New("TC activation callback is nil")
 	}
 	plan.executed = true
-	var applied []tcAppliedFilter
-	var deleted []tcOwnedStaleFilter
-	defer func() {
-		if returnErr == nil {
-			return
+	stage := &tcAttachStage{plan: plan}
+	fail := func(err error) (*tcAttachStage, error) {
+		if len(stage.applied) == 0 && len(stage.deleted) == 0 && len(stage.created) == 0 {
+			return nil, err
 		}
-		rollbackErr := plan.rollback(applied, deleted)
-		if rollbackErr != nil {
-			returnErr = errors.Join(returnErr, fmt.Errorf("rollback TC attachment transaction: %w", rollbackErr))
-		}
-	}()
+		plan.stage = stage
+		return stage, err
+	}
 
 	for index := range plan.links {
 		linkPlan := &plan.links[index]
 		currentClsact, err := inspectClsact(linkPlan.link, plan.runtime)
 		if err != nil {
-			return nil, fmt.Errorf("recheck clsact on ifindex %d: %w", linkPlan.ifindex, err)
+			return fail(fmt.Errorf("recheck clsact on ifindex %d: %w", linkPlan.ifindex, err))
 		}
 		if currentClsact != linkPlan.clsactExists {
-			return nil, fmt.Errorf("clsact state changed on ifindex %d after preflight", linkPlan.ifindex)
+			return fail(fmt.Errorf("clsact state changed on ifindex %d after preflight", linkPlan.ifindex))
 		}
 		if !linkPlan.clsactExists {
 			qdisc := canonicalClsact(linkPlan.ifindex)
 			if err := plan.runtime.qdiscAdd(qdisc); err != nil {
-				return nil, fmt.Errorf("add clsact on ifindex %d: %w", linkPlan.ifindex, err)
+				return fail(fmt.Errorf("add clsact on ifindex %d: %w", linkPlan.ifindex, err))
 			}
+			stage.created = append(stage.created, tcOwnedCreatedQdisc{
+				link: linkPlan.link, ifindex: linkPlan.ifindex,
+			})
 			present, err := inspectClsact(linkPlan.link, plan.runtime)
 			if err != nil {
-				return nil, fmt.Errorf("verify clsact on ifindex %d: %w", linkPlan.ifindex, err)
+				return fail(fmt.Errorf("verify clsact on ifindex %d: %w", linkPlan.ifindex, err))
 			}
 			if !present {
-				return nil, fmt.Errorf("clsact did not appear on ifindex %d", linkPlan.ifindex)
+				return fail(fmt.Errorf("clsact did not appear on ifindex %d", linkPlan.ifindex))
 			}
 		}
 
 		for _, snapshot := range linkPlan.filters {
 			if err := plan.recheckFilterSnapshot(linkPlan.link, snapshot); err != nil {
-				return nil, fmt.Errorf(
+				return fail(fmt.Errorf(
 					"recheck %s on ifindex %d before mutation: %w",
 					snapshot.slot.name, linkPlan.ifindex, err,
-				)
+				))
 			}
 			program := plan.programForSlot(snapshot.slot)
 			filter := managedBpfFilter(linkPlan.ifindex, snapshot.slot, program.fd)
 			if snapshot.existed {
 				if err := plan.runtime.filterReplace(filter); err != nil {
-					return nil, fmt.Errorf(
+					return fail(fmt.Errorf(
 						"replace %s on ifindex %d: %w",
 						snapshot.slot.name, linkPlan.ifindex, err,
-					)
+					))
 				}
 			} else if err := plan.runtime.filterAdd(filter); err != nil {
-				return nil, fmt.Errorf(
+				return fail(fmt.Errorf(
 					"add %s on ifindex %d: %w",
 					snapshot.slot.name, linkPlan.ifindex, err,
-				)
+				))
 			}
-			applied = append(applied, tcAppliedFilter{
+			stage.applied = append(stage.applied, tcAppliedFilter{
 				link:     linkPlan.link,
 				snapshot: snapshot,
 				program:  program,
@@ -616,10 +628,10 @@ func (plan *tcAttachPlan) ExecuteRetained(
 				snapshot.slot,
 				program.id,
 			); err != nil {
-				return nil, fmt.Errorf(
+				return fail(fmt.Errorf(
 					"verify %s on ifindex %d after mutation: %w",
 					snapshot.slot.name, linkPlan.ifindex, err,
-				)
+				))
 			}
 		}
 	}
@@ -628,10 +640,10 @@ func (plan *tcAttachPlan) ExecuteRetained(
 			stale.link,
 			stale.snapshot,
 		); err != nil {
-			return nil, fmt.Errorf(
+			return fail(fmt.Errorf(
 				"recheck stale owner TC slot %s before delete: %w",
 				stale.key, err,
-			)
+			))
 		}
 		filter := managedBpfFilter(
 			stale.link.Attrs().Index,
@@ -642,9 +654,9 @@ func (plan *tcAttachPlan) ExecuteRetained(
 		filter.ClassId = stale.snapshot.classID
 		filter.Id = int(stale.snapshot.programID)
 		if err := plan.runtime.filterDelete(filter); err != nil {
-			return nil, fmt.Errorf("delete stale owner TC slot %s: %w", stale.key, err)
+			return fail(fmt.Errorf("delete stale owner TC slot %s: %w", stale.key, err))
 		}
-		deleted = append(deleted, stale)
+		stage.deleted = append(stage.deleted, stale)
 		after, err := inspectTCFilterSlot(
 			stale.link,
 			stale.snapshot.slot,
@@ -652,22 +664,17 @@ func (plan *tcAttachPlan) ExecuteRetained(
 			false,
 		)
 		if err != nil {
-			return nil, err
+			return fail(err)
 		}
 		if after.existed {
-			return nil, fmt.Errorf(
+			return fail(fmt.Errorf(
 				"stale owner TC slot %s remains after delete",
 				stale.key,
-			)
+			))
 		}
 	}
 	if err := commit(); err != nil {
-		return nil, fmt.Errorf("activate attached TC programs: %w", err)
-	}
-	stage := &tcAttachStage{
-		plan:    plan,
-		applied: applied,
-		deleted: deleted,
+		return fail(fmt.Errorf("activate attached TC programs: %w", err))
 	}
 	plan.stage = stage
 	return stage, nil
@@ -746,134 +753,223 @@ func (plan *tcAttachPlan) verifyManagedFilter(
 	return nil
 }
 
-func (plan *tcAttachPlan) rollback(
-	applied []tcAppliedFilter,
-	deleted []tcOwnedStaleFilter,
-) error {
+func (plan *tcAttachPlan) rollbackRetained(stage *tcAttachStage) error {
+	if plan == nil || stage == nil {
+		return errors.New("rollback retained TC attachment: owner is nil")
+	}
 	var errs []error
-	for index := len(deleted) - 1; index >= 0; index-- {
-		change := deleted[index]
-		current, err := inspectTCFilterSlot(
-			change.link,
-			change.snapshot.slot,
-			plan.runtime,
-			false,
-		)
+	var remainingDeleted []tcOwnedStaleFilter
+	for index := len(stage.deleted) - 1; index >= 0; index-- {
+		change := stage.deleted[index]
+		complete, err := plan.restoreDeletedFilter(change)
 		if err != nil {
 			errs = append(errs, err)
-			continue
 		}
-		if current.existed {
-			errs = append(errs, fmt.Errorf(
-				"refuse restore of stale owner TC slot %s because it was repopulated",
-				change.key,
-			))
-			continue
+		if !complete {
+			remainingDeleted = append([]tcOwnedStaleFilter{change}, remainingDeleted...)
+		}
+	}
+	stage.deleted = remainingDeleted
+
+	var remainingApplied []tcAppliedFilter
+	for index := len(stage.applied) - 1; index >= 0; index-- {
+		change := stage.applied[index]
+		complete, err := plan.restoreAppliedFilter(change)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if !complete {
+			remainingApplied = append([]tcAppliedFilter{change}, remainingApplied...)
+		}
+	}
+	stage.applied = remainingApplied
+
+	var remainingCreated []tcOwnedCreatedQdisc
+	for index := len(stage.created) - 1; index >= 0; index-- {
+		change := stage.created[index]
+		complete, err := plan.removeCreatedQdisc(change)
+		if err != nil {
+			errs = append(errs, err)
+		}
+		if !complete {
+			remainingCreated = append([]tcOwnedCreatedQdisc{change}, remainingCreated...)
+		}
+	}
+	stage.created = remainingCreated
+	return errors.Join(errs...)
+}
+
+func (plan *tcAttachPlan) restoreDeletedFilter(
+	change tcOwnedStaleFilter,
+) (bool, error) {
+	current, err := inspectTCFilterSlot(
+		change.link, change.snapshot.slot, plan.runtime, false,
+	)
+	if err != nil {
+		return false, fmt.Errorf("inspect stale owner TC slot %s during restore: %w", change.key, err)
+	}
+	if current.existed {
+		if current.programID == change.snapshot.programID {
+			return true, nil
+		}
+		return false, fmt.Errorf(
+			"refuse restore of stale owner TC slot %s because it was repopulated with program ID %d",
+			change.key, current.programID,
+		)
+	}
+	if change.snapshot.oldProgram == nil || change.snapshot.oldProgram.FD() < 0 {
+		return false, fmt.Errorf("restore stale owner TC slot %s: retained program is unavailable", change.key)
+	}
+	filter := managedBpfFilter(
+		change.link.Attrs().Index,
+		change.snapshot.slot,
+		change.snapshot.oldProgram.FD(),
+	).(*netlink.BpfFilter)
+	filter.FilterAttrs = change.snapshot.attrs
+	filter.ClassId = change.snapshot.classID
+	if err := plan.runtime.filterAdd(filter); err != nil {
+		return false, fmt.Errorf("restore stale owner TC slot %s: %w", change.key, err)
+	}
+	if err := plan.verifyManagedFilter(
+		change.link, change.snapshot.slot, change.snapshot.programID,
+	); err != nil {
+		return false, fmt.Errorf("verify restored stale owner TC slot %s: %w", change.key, err)
+	}
+	return true, nil
+}
+
+func (plan *tcAttachPlan) restoreAppliedFilter(
+	change tcAppliedFilter,
+) (bool, error) {
+	ifindex := change.link.Attrs().Index
+	current, err := inspectTCFilterSlot(
+		change.link, change.snapshot.slot, plan.runtime, false,
+	)
+	if err != nil {
+		return false, fmt.Errorf(
+			"inspect %s on ifindex %d during rollback: %w",
+			change.snapshot.slot.name, ifindex, err,
+		)
+	}
+	if change.snapshot.existed {
+		switch {
+		case current.existed && current.programID == change.snapshot.programID:
+			return true, nil
+		case !current.existed:
+			return false, fmt.Errorf(
+				"refuse rollback of %s on ifindex %d because the owned slot disappeared",
+				change.snapshot.slot.name, ifindex,
+			)
+		case current.programID != change.program.id:
+			return false, fmt.Errorf(
+				"refuse rollback of %s on ifindex %d because program ID changed to %d",
+				change.snapshot.slot.name, ifindex, current.programID,
+			)
+		case change.snapshot.oldProgram == nil || change.snapshot.oldProgram.FD() < 0:
+			return false, fmt.Errorf(
+				"restore %s on ifindex %d: retained program is unavailable",
+				change.snapshot.slot.name, ifindex,
+			)
 		}
 		filter := managedBpfFilter(
-			change.link.Attrs().Index,
+			ifindex,
 			change.snapshot.slot,
 			change.snapshot.oldProgram.FD(),
 		).(*netlink.BpfFilter)
 		filter.FilterAttrs = change.snapshot.attrs
 		filter.ClassId = change.snapshot.classID
-		if err := plan.runtime.filterAdd(filter); err != nil {
-			errs = append(errs, fmt.Errorf(
-				"restore stale owner TC slot %s: %w",
-				change.key, err,
-			))
-			continue
+		if err := plan.runtime.filterReplace(filter); err != nil {
+			return false, fmt.Errorf(
+				"restore %s on ifindex %d: %w",
+				change.snapshot.slot.name, ifindex, err,
+			)
 		}
 		if err := plan.verifyManagedFilter(
-			change.link,
-			change.snapshot.slot,
-			change.snapshot.programID,
+			change.link, change.snapshot.slot, change.snapshot.programID,
 		); err != nil {
-			errs = append(errs, fmt.Errorf(
-				"verify restored stale owner TC slot %s: %w",
-				change.key, err,
-			))
+			return false, fmt.Errorf(
+				"verify restored %s on ifindex %d: %w",
+				change.snapshot.slot.name, ifindex, err,
+			)
+		}
+		return true, nil
+	}
+
+	if !current.existed {
+		return true, nil
+	}
+	if current.programID != change.program.id {
+		return false, fmt.Errorf(
+			"refuse rollback of %s on ifindex %d because program ID changed to %d",
+			change.snapshot.slot.name, ifindex, current.programID,
+		)
+	}
+	filter := managedBpfFilter(ifindex, change.snapshot.slot, change.program.fd)
+	filter.(*netlink.BpfFilter).Id = int(current.programID)
+	if err := plan.runtime.filterDelete(filter); err != nil && !isNotFound(err) {
+		return false, fmt.Errorf(
+			"delete newly added %s on ifindex %d: %w",
+			change.snapshot.slot.name, ifindex, err,
+		)
+	}
+	after, err := inspectTCFilterSlot(
+		change.link, change.snapshot.slot, plan.runtime, false,
+	)
+	if err != nil {
+		return false, fmt.Errorf(
+			"verify deleted %s on ifindex %d: %w",
+			change.snapshot.slot.name, ifindex, err,
+		)
+	}
+	if after.existed {
+		return false, fmt.Errorf(
+			"newly added %s remains on ifindex %d after rollback",
+			change.snapshot.slot.name, ifindex,
+		)
+	}
+	return true, nil
+}
+
+func (plan *tcAttachPlan) removeCreatedQdisc(
+	change tcOwnedCreatedQdisc,
+) (bool, error) {
+	present, err := inspectClsact(change.link, plan.runtime)
+	if err != nil {
+		return false, fmt.Errorf("inspect owned clsact on ifindex %d before delete: %w", change.ifindex, err)
+	}
+	if !present {
+		return true, nil
+	}
+	for _, parent := range []uint32{netlink.HANDLE_MIN_INGRESS, netlink.HANDLE_MIN_EGRESS} {
+		filters, err := plan.runtime.filterList(change.link, parent)
+		if err != nil {
+			return false, fmt.Errorf(
+				"inspect filters before deleting owned clsact on ifindex %d parent %#x: %w",
+				change.ifindex, parent, err,
+			)
+		}
+		if len(filters) != 0 {
+			return false, fmt.Errorf(
+				"preserve owned clsact on ifindex %d: parent %#x contains %d foreign or unresolved filters",
+				change.ifindex, parent, len(filters),
+			)
 		}
 	}
-	for index := len(applied) - 1; index >= 0; index-- {
-		change := applied[index]
-		if err := plan.verifyManagedFilter(
-			change.link,
-			change.snapshot.slot,
-			change.program.id,
-		); err != nil {
-			errs = append(errs, fmt.Errorf(
-				"refuse rollback of %s on ifindex %d because the slot changed: %w",
-				change.snapshot.slot.name, change.link.Attrs().Index, err,
-			))
-			continue
-		}
-		if change.snapshot.existed {
-			filter := managedBpfFilter(
-				change.link.Attrs().Index,
-				change.snapshot.slot,
-				change.snapshot.oldProgram.FD(),
-			).(*netlink.BpfFilter)
-			filter.FilterAttrs = change.snapshot.attrs
-			filter.ClassId = change.snapshot.classID
-			if err := plan.runtime.filterReplace(filter); err != nil {
-				errs = append(errs, fmt.Errorf(
-					"restore %s on ifindex %d: %w",
-					change.snapshot.slot.name, change.link.Attrs().Index, err,
-				))
-				continue
-			}
-			if err := plan.verifyManagedFilter(
-				change.link,
-				change.snapshot.slot,
-				change.snapshot.programID,
-			); err != nil {
-				errs = append(errs, fmt.Errorf(
-					"verify restored %s on ifindex %d: %w",
-					change.snapshot.slot.name, change.link.Attrs().Index, err,
-				))
-			}
-			continue
-		}
-		current, err := inspectTCFilterSlot(
-			change.link,
-			change.snapshot.slot,
-			plan.runtime,
-			false,
-		)
-		if err != nil {
-			errs = append(errs, err)
-			continue
-		}
-		filter := managedBpfFilter(
-			change.link.Attrs().Index,
-			change.snapshot.slot,
-			change.program.fd,
-		)
-		filter.(*netlink.BpfFilter).Id = int(current.programID)
-		if err := plan.runtime.filterDelete(filter); err != nil && !isNotFound(err) {
-			errs = append(errs, fmt.Errorf(
-				"delete newly added %s on ifindex %d: %w",
-				change.snapshot.slot.name, change.link.Attrs().Index, err,
-			))
-			continue
-		}
-		after, err := inspectTCFilterSlot(
-			change.link,
-			change.snapshot.slot,
-			plan.runtime,
-			false,
-		)
-		if err != nil {
-			errs = append(errs, err)
-		} else if after.existed {
-			errs = append(errs, fmt.Errorf(
-				"newly added %s remains on ifindex %d after rollback",
-				change.snapshot.slot.name, change.link.Attrs().Index,
-			))
-		}
+	deleteErr := plan.runtime.qdiscDelete(canonicalClsact(change.ifindex))
+	after, inspectErr := inspectClsact(change.link, plan.runtime)
+	if inspectErr == nil && !after {
+		return true, nil
 	}
-	return errors.Join(errs...)
+	if inspectErr != nil {
+		return false, errors.Join(
+			wrapNonNilError(fmt.Sprintf("delete owned clsact on ifindex %d", change.ifindex), deleteErr),
+			fmt.Errorf("verify owned clsact deletion on ifindex %d: %w", change.ifindex, inspectErr),
+		)
+	}
+	return false, errors.Join(
+		wrapNonNilError(fmt.Sprintf("delete owned clsact on ifindex %d", change.ifindex), deleteErr),
+		fmt.Errorf("owned clsact remains on ifindex %d after delete", change.ifindex),
+	)
 }
 
 func (plan *tcAttachPlan) Close() error {
@@ -930,20 +1026,22 @@ func (stage *tcAttachStage) Close() error {
 	if stage.done {
 		return stage.err
 	}
-	stage.done = true
 	if stage.plan == nil {
 		stage.err = errors.New("retained TC attach stage has no plan")
 		return stage.err
 	}
 	plan := stage.plan
+	if err := plan.rollbackRetained(stage); err != nil {
+		stage.err = fmt.Errorf("rollback retained TC attachment: %w", err)
+		return stage.err
+	}
+	stage.done = true
 	plan.stage = nil
-	stage.err = errors.Join(
-		plan.rollback(stage.applied, stage.deleted),
-		plan.closeProgramReferences(),
-	)
+	stage.err = plan.closeProgramReferences()
 	stage.plan = nil
 	stage.applied = nil
 	stage.deleted = nil
+	stage.created = nil
 	return stage.err
 }
 
@@ -966,4 +1064,5 @@ func (stage *tcAttachStage) Disarm() {
 	stage.plan = nil
 	stage.applied = nil
 	stage.deleted = nil
+	stage.created = nil
 }

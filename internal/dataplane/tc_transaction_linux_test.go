@@ -89,6 +89,27 @@ func (kernel *fakeTCKernel) runtime() tcRuntime {
 			kernel.qdiscs[ifindex] = append(kernel.qdiscs[ifindex], qdisc)
 			return nil
 		},
+		qdiscDelete: func(qdisc netlink.Qdisc) error {
+			if err := kernel.recordWrite("qdisc-delete"); err != nil {
+				return err
+			}
+			attrs := qdisc.Attrs()
+			if attrs == nil {
+				return errors.New("qdisc has no attributes")
+			}
+			qdiscs := kernel.qdiscs[attrs.LinkIndex]
+			for index, existing := range qdiscs {
+				if existing == nil || existing.Attrs() == nil ||
+					existing.Type() != qdisc.Type() ||
+					existing.Attrs().Handle != attrs.Handle ||
+					existing.Attrs().Parent != attrs.Parent {
+					continue
+				}
+				kernel.qdiscs[attrs.LinkIndex] = append(qdiscs[:index], qdiscs[index+1:]...)
+				return nil
+			}
+			return errors.New("not found")
+		},
 		filterList: func(link netlink.Link, parent uint32) ([]netlink.Filter, error) {
 			key := fakeTCFilterKey{ifindex: link.Attrs().Index, parent: parent}
 			kernel.filterLists[key]++
@@ -369,6 +390,40 @@ func TestTCAttachRetainedStageRemovesFreshFiltersOnClose(t *testing.T) {
 			t.Fatalf("fresh %s program remains after stage Close: %d", slot.name, got)
 		}
 	}
+	if got := len(kernel.qdiscs[11]); got != 0 {
+		t.Fatalf("fresh clsact remains after stage Close: %d", got)
+	}
+}
+
+func TestFreshExperimentalTCAttachRejectsUnrecordedReservedSlot(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	for id, fd := range map[uint32]int{21: 201, 31: 301, 32: 302} {
+		kernel.addProgram(id, fd)
+	}
+	kernel.addClsact(11)
+	kernel.addManagedFilter(11, canonicalTCFilterSlots()[0], 21)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := executeFreshExperimentalTCPlan(plan, func() error {
+		t.Fatal("foreign reserved slot reached commit")
+		return nil
+	})
+	if stage != nil || err == nil || !strings.Contains(err.Error(), "pre-existing managed-looking") {
+		t.Fatalf("stage=%#v error=%v", stage, err)
+	}
+	if len(kernel.writes) != 0 {
+		t.Fatalf("fresh ownership rejection performed writes: %v", kernel.writes)
+	}
+	if got := kernel.managedProgramID(t, 11, canonicalTCFilterSlots()[0]); got != 21 {
+		t.Fatalf("foreign reserved slot changed to program %d", got)
+	}
 }
 
 func TestTCAttachRetainedStagePreservesForeignReplacement(t *testing.T) {
@@ -480,8 +535,146 @@ func TestTCAttachTransactionRollsBackWhenCommitFails(t *testing.T) {
 			t.Fatalf("%s program remains after rollback: %d", slot.name, got)
 		}
 	}
-	if len(kernel.qdiscs[11]) != 1 {
-		t.Fatalf("clsact count = %d, want shared scaffold retained", len(kernel.qdiscs[11]))
+	if len(kernel.qdiscs[11]) != 0 {
+		t.Fatalf("clsact count = %d, want fresh scaffold removed", len(kernel.qdiscs[11]))
+	}
+}
+
+func TestFreshExperimentalTCPartialFailureReturnsQdiscOwner(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	kernel.addProgram(31, 301)
+	kernel.addProgram(32, 302)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kernel.failWrite = 2 // clsact succeeds; the first filter mutation fails.
+	stage, err := executeFreshExperimentalTCPlan(plan, func() error { return nil })
+	if stage == nil || err == nil || !strings.Contains(err.Error(), "injected filter-add failure") {
+		t.Fatalf("stage=%#v error=%v", stage, err)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatalf("rollback partial attachment: %v", err)
+	}
+	if got := len(kernel.qdiscs[11]); got != 0 {
+		t.Fatalf("partial failure retained fresh clsact: %d", got)
+	}
+}
+
+func TestTCAttachRetainedStageRetriesExactQdiscDelete(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	kernel.addProgram(31, 301)
+	kernel.addProgram(32, 302)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := plan.ExecuteRetained(func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	kernel.failWrite = len(kernel.writes) + 3 // two filter deletes, then qdisc delete.
+	if err := stage.Close(); err == nil || !strings.Contains(err.Error(), "qdisc-delete") {
+		t.Fatalf("first stage Close error = %v", err)
+	}
+	if got := len(kernel.qdiscs[11]); got != 1 {
+		t.Fatalf("failed delete lost clsact ownership: %d", got)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatalf("retry stage Close: %v", err)
+	}
+	if got := len(kernel.qdiscs[11]); got != 0 {
+		t.Fatalf("retry retained clsact: %d", got)
+	}
+}
+
+func TestTCAttachRetainedStagePreservesQdiscWithForeignFilterUntilRetry(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	kernel.addProgram(31, 301)
+	kernel.addProgram(32, 302)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := plan.ExecuteRetained(func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := fakeTCFilterKey{ifindex: 11, parent: netlink.HANDLE_MIN_INGRESS}
+	kernel.filters[key] = append(kernel.filters[key], &netlink.GenericFilter{
+		FilterAttrs: netlink.FilterAttrs{
+			LinkIndex: 11,
+			Parent:    netlink.HANDLE_MIN_INGRESS,
+			Handle:    0x20001,
+			Priority:  99,
+			Protocol:  unix.ETH_P_ALL,
+		},
+		FilterType: "flower",
+	})
+	if err := stage.Close(); err == nil || !strings.Contains(err.Error(), "foreign or unresolved filters") {
+		t.Fatalf("stage Close error = %v", err)
+	}
+	if got := len(kernel.qdiscs[11]); got != 1 {
+		t.Fatalf("foreign filter lost shared clsact: %d", got)
+	}
+	kernel.filters[key] = nil
+	if err := stage.Close(); err != nil {
+		t.Fatalf("retry after foreign filter removal: %v", err)
+	}
+	if got := len(kernel.qdiscs[11]); got != 0 {
+		t.Fatalf("retry retained clsact: %d", got)
+	}
+}
+
+func TestTCAttachRetainedStagePreservesChangedQdiscIdentity(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	kernel.addProgram(31, 301)
+	kernel.addProgram(32, 302)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stage, err := plan.ExecuteRetained(func() error { return nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	kernel.qdiscs[11] = []netlink.Qdisc{&netlink.GenericQdisc{
+		QdiscAttrs: netlink.QdiscAttrs{
+			LinkIndex: 11,
+			Handle:    netlink.MakeHandle(0xffff, 0),
+			Parent:    netlink.HANDLE_CLSACT,
+		},
+		QdiscType: "foreign",
+	}}
+	if err := stage.Close(); err == nil || !strings.Contains(err.Error(), "foreign qdisc collides") {
+		t.Fatalf("stage Close error = %v", err)
+	}
+	if got := kernel.qdiscs[11][0].Type(); got != "foreign" {
+		t.Fatalf("foreign qdisc identity changed to %q", got)
+	}
+	kernel.qdiscs[11] = []netlink.Qdisc{canonicalClsact(11)}
+	if err := stage.Close(); err != nil {
+		t.Fatalf("retry after canonical identity restoration: %v", err)
 	}
 }
 
