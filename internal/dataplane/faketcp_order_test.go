@@ -215,3 +215,33 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 		t.Fatal("FakeTCP first-packet capture must precede type-word and XOR mutation")
 	}
 }
+
+func TestFakeTCPXDPManagedPortLookupPrecedesUnsupportedHeaderExit(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, want := range []string{
+		"faketcp_managed_if_map SEC(\".maps\")",
+		"faketcp_managed_port_map SEC(\".maps\")",
+		"faketcp_xdp_ipv6_policy",
+		"for (int vlan_depth = 0; vlan_depth < 2; vlan_depth++)",
+		"return managed_interface ? XDP_DROP : XDP_PASS",
+		"A managed packet can only PASS after successful FakeTCP decoding",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("managed-port fail-closed source contract missing %q", want)
+		}
+	}
+	xdpStart := strings.Index(text, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
+	if xdpStart < 0 {
+		t.Fatal("FakeTCP XDP entry point is missing")
+	}
+	xdp := text[xdpStart:]
+	lookup := strings.Index(xdp, "listener = faketcp_xdp_managed_port")
+	unsupported := strings.Index(xdp, "if ((fragment_offset & IP_MF) || iph->ihl != 5 || tcp->doff != 5)")
+	if lookup < 0 || unsupported < 0 || lookup >= unsupported {
+		t.Fatal("managed-port lookup must precede IPv4 options/fragment rejection")
+	}
+}

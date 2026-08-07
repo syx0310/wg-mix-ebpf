@@ -97,12 +97,64 @@ struct faketcp_pseudo_tail {
 	__be16 length;
 };
 
+// These policy maps are populated for every concrete XDP attachment before
+// the link becomes reachable. They deliberately duplicate the small listener
+// projection needed at XDP: the baseline ingress map permits wildcard
+// interfaces and cannot classify non-initial fragments that have no port.
+// Keeping an exact per-interface marker makes every ambiguous TCP fragment or
+// truncated header fail closed instead of reaching the host TCP stack.
+struct faketcp_managed_if_key {
+	__u64 generation;
+	__u32 underlay_index;
+	__u32 pad;
+};
+
+struct faketcp_managed_port_key {
+	__u64 generation;
+	__u32 underlay_index;
+	__u16 destination_port;
+	__u16 pad;
+};
+
+struct faketcp_managed_port_value {
+	__u64 generation;
+	__u32 wg_id;
+	__u8 action;
+	__u8 pad[3];
+};
+
+struct faketcp_ipv6_extension {
+	__u8 next_header;
+	__u8 header_length;
+};
+
+struct faketcp_ipv6_fragment {
+	__u8 next_header;
+	__u8 reserved;
+	__be16 fragment_offset;
+	__be32 identification;
+};
+
 struct {
 	__uint(type, BPF_MAP_TYPE_LRU_HASH);
 	__uint(max_entries, 16384);
 	__type(key, struct faketcp_session_key);
 	__type(value, struct faketcp_session_value);
 } faketcp_session_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 512);
+	__type(key, struct faketcp_managed_if_key);
+	__type(value, __u64);
+} faketcp_managed_if_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 2048);
+	__type(key, struct faketcp_managed_port_key);
+	__type(value, struct faketcp_managed_port_value);
+} faketcp_managed_port_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -477,28 +529,89 @@ static __always_inline int faketcp_metadata_valid(struct __sk_buff *skb,
 	       value->generation_low == (__u32)generation;
 }
 
-static __always_inline int faketcp_xdp_listener(__u32 ifindex, __u16 port,
-						 __u64 generation,
-						 struct ingress_listener_value **out)
+static __always_inline int faketcp_xdp_managed_interface(__u32 ifindex,
+						  __u64 generation)
 {
-	struct ingress_listener_key key = {
+	struct faketcp_managed_if_key key = {
+		.generation = generation,
+		.underlay_index = ifindex,
+	};
+	__u64 *value = bpf_map_lookup_elem(&faketcp_managed_if_map, &key);
+
+	return value && *value == generation;
+}
+
+static __always_inline struct faketcp_managed_port_value *
+faketcp_xdp_managed_port(__u32 ifindex, __u16 port, __u64 generation)
+{
+	struct faketcp_managed_port_key key = {
 		.generation = generation,
 		.underlay_index = ifindex,
 		.destination_port = port,
-		.family = FAMILY_IPV4,
 	};
-	struct ingress_listener_value *listener;
+	struct faketcp_managed_port_value *value;
 
-	listener = bpf_map_lookup_elem(&ingress_listener_map, &key);
-	if (!listener || listener->generation != generation) {
-		key.underlay_index = UNDERLAY_WILDCARD;
-		listener = bpf_map_lookup_elem(&ingress_listener_map, &key);
-	}
-	if (!listener || listener->generation != generation ||
-	    listener->transport_mode != TRANSPORT_FAKETCP)
+	value = bpf_map_lookup_elem(&faketcp_managed_port_map, &key);
+	if (!value || value->generation != generation)
 		return 0;
-	*out = listener;
-	return 1;
+	return value;
+}
+
+static __always_inline int faketcp_xdp_ipv6_policy(void *data, void *data_end,
+						    __u64 off, __u32 ifindex,
+						    __u64 generation,
+						    int managed_interface)
+{
+	struct ipv6hdr *ip6 = data + off;
+	__u8 next_header;
+
+	if ((void *)(ip6 + 1) > data_end || ip6->version != 6)
+		return managed_interface ? XDP_DROP : XDP_PASS;
+	next_header = ip6->nexthdr;
+	off += sizeof(*ip6);
+
+#pragma unroll
+	for (int depth = 0; depth < 4; depth++) {
+		if (next_header == IPPROTO_TCP) {
+			struct tcphdr *tcp = data + off;
+
+			if ((void *)(tcp + 1) > data_end)
+				return managed_interface ? XDP_DROP : XDP_PASS;
+			return faketcp_xdp_managed_port(ifindex,
+							 bpf_ntohs(tcp->dest),
+							 generation) ? XDP_DROP : XDP_PASS;
+		}
+		if (next_header == NEXTHDR_FRAGMENT) {
+			struct faketcp_ipv6_fragment *fragment = data + off;
+
+			if ((void *)(fragment + 1) > data_end)
+				return managed_interface ? XDP_DROP : XDP_PASS;
+			// Non-initial fragments have no trustworthy destination port.
+			if (bpf_ntohs(fragment->fragment_offset) & 0xfff8)
+				return managed_interface ? XDP_DROP : XDP_PASS;
+			next_header = fragment->next_header;
+			off += sizeof(*fragment);
+			continue;
+		}
+		if (next_header == NEXTHDR_HOP || next_header == NEXTHDR_ROUTING ||
+		    next_header == NEXTHDR_DEST) {
+			struct faketcp_ipv6_extension *extension = data + off;
+			__u64 extension_length;
+
+			if ((void *)(extension + 1) > data_end)
+				return managed_interface ? XDP_DROP : XDP_PASS;
+			extension_length = ((__u64)extension->header_length + 1) * 8;
+			if (extension_length < 8 || data + off + extension_length > data_end)
+				return managed_interface ? XDP_DROP : XDP_PASS;
+			next_header = extension->next_header;
+			off += extension_length;
+			continue;
+		}
+		return XDP_PASS;
+	}
+	// An extension chain deeper than the verifier-bounded parser is
+	// ambiguous on a managed interface and must never reach the host stack.
+	return managed_interface ? XDP_DROP : XDP_PASS;
 }
 
 static __always_inline __u8 faketcp_tcp_flags(const struct tcphdr *tcp)
@@ -528,9 +641,10 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	void *data_end = (void *)(long)xdp->data_end;
 	__u64 off = sizeof(struct ethhdr);
 	struct ethhdr *eth = data;
+	__be16 protocol;
 	struct iphdr *iph;
 	struct tcphdr *tcp;
-	struct ingress_listener_value *listener = 0;
+	struct faketcp_managed_port_value *listener = 0;
 	struct faketcp_session_key key = {};
 	struct faketcp_session_value *session;
 	struct faketcp_metadata *metadata;
@@ -543,32 +657,59 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	__u32 seq, next_seq;
 	__u64 generation = 0;
 	__s64 sum;
+	__u16 fragment_offset;
+	__u32 ipv4_header_length;
+	int managed_interface;
 
 	if (!active_generation(&generation))
 		return XDP_PASS;
+	managed_interface = faketcp_xdp_managed_interface(xdp->ingress_ifindex,
+							 generation);
 	if ((void *)(eth + 1) > data_end)
-		return XDP_PASS;
-	if (eth->h_proto == bpf_htons(ETH_P_8021Q) ||
-	    eth->h_proto == bpf_htons(ETH_P_8021AD)) {
+		return managed_interface ? XDP_DROP : XDP_PASS;
+	protocol = eth->h_proto;
+#pragma unroll
+	for (int vlan_depth = 0; vlan_depth < 2; vlan_depth++) {
+		if (protocol != bpf_htons(ETH_P_8021Q) &&
+		    protocol != bpf_htons(ETH_P_8021AD))
+			break;
 		struct wg_vlan_hdr *vlan = data + off;
 		if ((void *)(vlan + 1) > data_end)
-			return XDP_PASS;
-		if (vlan->h_vlan_encapsulated_proto != bpf_htons(ETH_P_IP))
-			return XDP_PASS;
+			return managed_interface ? XDP_DROP : XDP_PASS;
+		protocol = vlan->h_vlan_encapsulated_proto;
 		off += sizeof(*vlan);
-	} else if (eth->h_proto != bpf_htons(ETH_P_IP)) {
-		return XDP_PASS;
 	}
+	if (protocol == bpf_htons(ETH_P_8021Q) ||
+	    protocol == bpf_htons(ETH_P_8021AD))
+		return managed_interface ? XDP_DROP : XDP_PASS;
+	if (protocol == bpf_htons(ETH_P_IPV6))
+		return faketcp_xdp_ipv6_policy(data, data_end, off,
+						 xdp->ingress_ifindex, generation,
+						 managed_interface);
+	if (protocol != bpf_htons(ETH_P_IP))
+		return XDP_PASS;
 	iph = data + off;
-	if ((void *)(iph + 1) > data_end || iph->version != 4 || iph->ihl != 5 ||
-	    iph->protocol != IPPROTO_TCP || (bpf_ntohs(iph->frag_off) & (IP_MF | IP_OFFSET)))
+	if ((void *)(iph + 1) > data_end || iph->version != 4 || iph->ihl < 5)
+		return managed_interface ? XDP_DROP : XDP_PASS;
+	if (iph->protocol != IPPROTO_TCP)
 		return XDP_PASS;
-	tcp = data + off + sizeof(*iph);
-	if ((void *)(tcp + 1) > data_end || tcp->doff != 5)
+	fragment_offset = bpf_ntohs(iph->frag_off);
+	if (fragment_offset & IP_OFFSET)
+		return managed_interface ? XDP_DROP : XDP_PASS;
+	ipv4_header_length = (__u32)iph->ihl * 4;
+	if (data + off + ipv4_header_length > data_end)
+		return managed_interface ? XDP_DROP : XDP_PASS;
+	tcp = data + off + ipv4_header_length;
+	if ((void *)(tcp + 1) > data_end)
+		return managed_interface ? XDP_DROP : XDP_PASS;
+	listener = faketcp_xdp_managed_port(xdp->ingress_ifindex,
+						    bpf_ntohs(tcp->dest), generation);
+	if (!listener)
 		return XDP_PASS;
-	if (!faketcp_xdp_listener(xdp->ingress_ifindex, bpf_ntohs(tcp->dest),
-				   generation, &listener))
-		return XDP_PASS;
+	// The policy lookup deliberately precedes all unsupported-header checks.
+	// A managed packet can only PASS after successful FakeTCP decoding.
+	if ((fragment_offset & IP_MF) || iph->ihl != 5 || tcp->doff != 5)
+		return XDP_DROP;
 	if (listener->action != ACTION_REWRITE)
 		return XDP_DROP;
 	total_len = bpf_ntohs(iph->tot_len);
