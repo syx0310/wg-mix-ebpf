@@ -11,7 +11,7 @@ EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 override BUILD_SOURCE_COMMIT := $(shell ./scripts/source-commit.sh)
 override BUILD_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/buildinfo.sourceCommit=$(BUILD_SOURCE_COMMIT)
 
-.PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-bpf-object-manifests test-bpf-object-manifest-path-contract _test-bpf-object-manifests test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-faketcp-verifier-only test-bpf-object-manifests test-bpf-object-manifest-path-contract _test-bpf-object-manifests test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=$(CGO_ENABLED) $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -35,6 +35,10 @@ build-live-guard-test:
 test-live-guard-build-provenance:
 	scripts/test-build-live-guard-provenance.sh \
 		"$(CURDIR)/scripts/build-live-guard-test.sh"
+
+test-faketcp-verifier-only:
+	scripts/test-faketcp-verifier-only.sh \
+		"$(CURDIR)/scripts/run-faketcp-verifier-only.sh"
 
 build-bpf:
 	@mkdir -p $(dir $(BPF_OBJECT))
@@ -134,7 +138,7 @@ test-lint:
 		{ echo "gofmt required for:"; $(GOFMT) -l $$(find cmd internal -name '*.go' -type f); exit 1; }
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) vet ./...
 	sh -n scripts/source-commit.sh scripts/test-bpf-object-manifest-path-contract.sh
-	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh
+	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-faketcp-verifier-only.sh scripts/test-faketcp-verifier-only.sh
 	scripts/inspect-linux-test-host.sh --self-test-nft-table-gate
 	scripts/provision-ubuntu-test-host.sh --self-test-apt-gate
 	scripts/build-live-guard-test.sh --self-test-safety-gate
@@ -144,6 +148,7 @@ test-lint:
 		echo "skip: provenance TMPDIR gate self-test requires fixed env and python3"; \
 	fi
 	scripts/test-live-guard-ownership.sh --self-test-safety-gate
+	$(MAKE) --no-print-directory test-faketcp-verifier-only
 	@if test "$$(/usr/bin/uname -s)" = Linux && \
 		test "$$(/usr/bin/id -u)" != 0 && \
 		test -x /usr/bin/go && test -x /usr/bin/timeout && \
@@ -154,7 +159,7 @@ test-lint:
 	fi
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet -tags realhosttest ./internal/guard
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh; \
+		shellcheck scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-faketcp-verifier-only.sh scripts/test-faketcp-verifier-only.sh; \
 	else \
 		echo "skip: shellcheck is unavailable"; \
 	fi
