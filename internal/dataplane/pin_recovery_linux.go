@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"slices"
 	"sync"
 	"time"
@@ -35,6 +36,7 @@ type durableTCOwnerJournalHandoff struct {
 	mountID     uint64
 	sequence    uint64
 	coverage    [sha256.Size]byte
+	programs    map[string]*pinnedProgramObservation
 	transferred bool
 }
 
@@ -190,20 +192,170 @@ func prepareDurableTCOwnerJournalHandoff(
 	if err := closePinnedMapPins(pins); err != nil {
 		return nil, fmt.Errorf("close durable TC owner journal map observations: %w", err)
 	}
-	for _, stage := range persisted.ProgramStages {
-		if err := validateOwnerProgramStage(handle, persisted, stage); err != nil {
-			return nil, fmt.Errorf(
-				"validate durable TC owner program stage %s: %w",
-				stage.FileName,
-				err,
-			)
-		}
+	programs, err := retainTCOwnerJournalPrograms(handle, persisted)
+	if err != nil {
+		return nil, err
 	}
 	handoff.handle = handle
 	handoff.store = store
 	handoff.plan = plan
 	handoff.mountID = handle.mountID
+	handoff.programs = programs
 	return handoff, nil
+}
+
+func retainTCOwnerJournalPrograms(
+	handle *pinPathHandle,
+	record *pinOwnerRecord,
+) (map[string]*pinnedProgramObservation, error) {
+	programs := make(map[string]*pinnedProgramObservation, len(record.ProgramStages))
+	closeOnError := func(err error) (map[string]*pinnedProgramObservation, error) {
+		var closeErrs []error
+		for _, observation := range programs {
+			closeErrs = append(closeErrs, observation.Close())
+		}
+		return nil, errors.Join(err, errors.Join(closeErrs...))
+	}
+	for _, stage := range record.ProgramStages {
+		if err := validateOwnerProgramStage(handle, record, stage); err != nil {
+			return closeOnError(fmt.Errorf(
+				"validate durable TC owner program stage %s: %w",
+				stage.FileName,
+				err,
+			))
+		}
+		observation, err := handle.runtime.loadPinnedProgram(
+			filepath.Join(handle.procPath(), stage.FileName),
+		)
+		if err != nil {
+			return closeOnError(fmt.Errorf(
+				"retain durable TC owner program stage %s: %w",
+				stage.FileName,
+				err,
+			))
+		}
+		if observation == nil || observation.fd < 0 ||
+			observation.id != stage.ProgramID || observation.pin == nil {
+			if observation != nil {
+				_ = observation.Close()
+			}
+			return closeOnError(fmt.Errorf(
+				"retain durable TC owner program stage %s returned invalid FD/ID/pin capability",
+				stage.FileName,
+			))
+		}
+		programs[stage.FileName] = observation
+		backupName := stage.FileName + ".handoff"
+		var stat unix.Stat_t
+		statErr := unix.Fstatat(
+			handle.targetFD,
+			backupName,
+			&stat,
+			unix.AT_SYMLINK_NOFOLLOW,
+		)
+		switch {
+		case statErr == nil:
+			if err := validatePinnedProgramAt(
+				handle,
+				backupName,
+				stage.ProgramID,
+			); err != nil {
+				return closeOnError(fmt.Errorf(
+					"validate durable TC owner handoff program stage %s: %w",
+					backupName,
+					err,
+				))
+			}
+		case errors.Is(statErr, unix.ENOENT):
+			if err := observation.pin(filepath.Join(
+				handle.procPath(),
+				backupName,
+			)); err != nil {
+				return closeOnError(fmt.Errorf(
+					"pin durable TC owner handoff program stage %s: %w",
+					backupName,
+					err,
+				))
+			}
+			if err := validatePinnedProgramAt(
+				handle,
+				backupName,
+				stage.ProgramID,
+			); err != nil {
+				return closeOnError(fmt.Errorf(
+					"validate pinned TC owner handoff program stage %s: %w",
+					backupName,
+					err,
+				))
+			}
+		default:
+			return closeOnError(statErr)
+		}
+	}
+	return programs, nil
+}
+
+func (handoff *durableTCOwnerJournalHandoff) repairMissingProgramStages() error {
+	if err := handoff.handle.recheckTargetEntry(); err != nil {
+		return err
+	}
+	for _, stage := range handoff.intent.ProgramStages {
+		var stat unix.Stat_t
+		err := unix.Fstatat(
+			handoff.handle.targetFD,
+			stage.FileName,
+			&stat,
+			unix.AT_SYMLINK_NOFOLLOW,
+		)
+		if err == nil {
+			continue
+		}
+		if !errors.Is(err, unix.ENOENT) {
+			return err
+		}
+		observation := handoff.programs[stage.FileName]
+		if observation == nil || observation.id != stage.ProgramID ||
+			observation.pin == nil {
+			return fmt.Errorf(
+				"missing program stage %s has no retained repair capability",
+				stage.FileName,
+			)
+		}
+		if err := observation.pin(filepath.Join(
+			handoff.handle.procPath(),
+			stage.FileName,
+		)); err != nil {
+			return fmt.Errorf("repair missing program stage %s: %w", stage.FileName, err)
+		}
+		if err := validateOwnerProgramStage(
+			handoff.handle,
+			handoff.intent,
+			stage,
+		); err != nil {
+			return fmt.Errorf("validate repaired program stage %s: %w", stage.FileName, err)
+		}
+	}
+	return nil
+}
+
+func (handoff *durableTCOwnerJournalHandoff) closeProgramsLocked() error {
+	var errs []error
+	for name, observation := range handoff.programs {
+		if err := observation.Close(); err != nil {
+			errs = append(errs, fmt.Errorf("close retained owner program %s: %w", name, err))
+		}
+	}
+	handoff.programs = nil
+	return errors.Join(errs...)
+}
+
+func (handoff *durableTCOwnerJournalHandoff) Close() error {
+	if handoff == nil {
+		return nil
+	}
+	handoff.mu.Lock()
+	defer handoff.mu.Unlock()
+	return handoff.closeProgramsLocked()
 }
 
 func (handoff *durableTCOwnerJournalHandoff) validateFreshCoverage() error {
@@ -260,7 +412,7 @@ func (handoff *durableTCOwnerJournalHandoff) validateFreshCoverage() error {
 		return fmt.Errorf("close revalidated TC owner journal maps: %w", err)
 	}
 	for _, programStage := range persisted.ProgramStages {
-		if err := validateOwnerProgramStage(
+		if _, err := validateOwnerProgramRecoveryStage(
 			handoff.handle,
 			persisted,
 			programStage,
@@ -303,7 +455,12 @@ func (handoff *durableTCOwnerJournalHandoff) Transfer(
 		return errors.New("retained TC stage is not the exact stage produced by the bound plan")
 	}
 	if err := handoff.validateFreshCoverage(); err != nil {
-		return err
+		if repairErr := handoff.repairMissingProgramStages(); repairErr != nil {
+			return errors.Join(err, repairErr)
+		}
+		if retryErr := handoff.validateFreshCoverage(); retryErr != nil {
+			return errors.Join(err, fmt.Errorf("revalidate repaired TC owner journal handoff: %w", retryErr))
+		}
 	}
 	if err := stage.transferToOwnerJournalLocked(
 		handoff.plan,
@@ -313,7 +470,7 @@ func (handoff *durableTCOwnerJournalHandoff) Transfer(
 		return err
 	}
 	handoff.transferred = true
-	return nil
+	return handoff.closeProgramsLocked()
 }
 
 // resolveFailedOwnerApply is the production return-boundary owner resolver for
@@ -361,6 +518,7 @@ func resolveFailedOwnerApply(
 		return errors.Join(
 			abortErr,
 			fmt.Errorf("transfer retained TC rollback to owner journal: %w", transferErr),
+			handoff.Close(),
 		)
 	}
 	if !stage.hasLiveFilterOwnership() {
@@ -372,15 +530,52 @@ func resolveFailedOwnerApply(
 			fmt.Errorf("transfer retained TC rollback to owner journal: %w", transferErr),
 			rollbackErr,
 			returnErr,
+			handoff.Close(),
 		)
 	}
-	retainErr := retainTCRollbackOwner(record.ResourceKey, stage)
+	retainErr := retainTCRollbackOwner(record.ResourceKey, stage, handoff)
 	return errors.Join(
 		abortErr,
 		fmt.Errorf("transfer retained TC rollback to owner journal: %w", transferErr),
 		rollbackErr,
 		retainErr,
 	)
+}
+
+// ownerApplyFailureBoundary is the exact post-Execute failure state consumed
+// by LinuxLoader.Apply. Keeping this boundary explicit lets the loader's
+// named-return defer and plan ownership be exercised without privileged BPF
+// syscalls in fault tests.
+type ownerApplyFailureBoundary struct {
+	plan      *tcAttachPlan
+	handle    *pinPathHandle
+	store     *pinOwnerStore
+	record    *pinOwnerRecord
+	handoff   *durableTCOwnerJournalHandoff
+	stage     *tcAttachStage
+	tcRuntime tcRuntime
+	attachErr error
+}
+
+func (boundary *ownerApplyFailureBoundary) Resolve() error {
+	if boundary == nil || boundary.plan == nil || boundary.attachErr == nil {
+		return errors.New("owner apply failure boundary is incomplete")
+	}
+	abortErr := resolveFailedOwnerApply(
+		boundary.handle,
+		boundary.store,
+		boundary.record,
+		boundary.handoff,
+		boundary.stage,
+		boundary.tcRuntime,
+	)
+	if abortErr != nil {
+		return errors.Join(
+			boundary.attachErr,
+			fmt.Errorf("owner-aware apply rollback: %w", abortErr),
+		)
+	}
+	return boundary.attachErr
 }
 
 func ownerRuntimeNow(runtime pinPathRuntime) (time.Time, error) {

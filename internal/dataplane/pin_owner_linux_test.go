@@ -89,6 +89,7 @@ type durableTCOwnerJournalFixture struct {
 	desired           []tcFilterBinding
 	mapStore          *fakePinnedMapStore
 	programLoadErrors map[string]error
+	programPinErrors  map[string][]error
 	plan              *tcAttachPlan
 }
 
@@ -106,6 +107,7 @@ func newDurableTCOwnerJournalFixtureWithActive(
 	mapStore := writeCanonicalMockPins(t, pinPath)
 	runtime := newTestPinPathRuntime(t, validator, mapStore)
 	programLoadErrors := make(map[string]error)
+	programPinErrors := make(map[string][]error)
 	programIDs := make(map[string]uint32)
 	runtime.loadPinnedProgram = func(path string) (*pinnedProgramObservation, error) {
 		name := filepath.Base(path)
@@ -120,7 +122,35 @@ func newDurableTCOwnerJournalFixtureWithActive(
 			return nil, fmt.Errorf("unknown fake program stage %s", name)
 		}
 		return &pinnedProgramObservation{
-			fd: int(id) + 1000, id: id, close: func() error { return nil },
+			fd: int(id) + 1000,
+			id: id,
+			pin: func(path string) error {
+				if failures := programPinErrors[name]; len(failures) != 0 {
+					failure := failures[0]
+					programPinErrors[name] = failures[1:]
+					if failure != nil {
+						return failure
+					}
+				}
+				file, err := os.OpenFile(
+					path,
+					os.O_CREATE|os.O_EXCL|os.O_WRONLY,
+					0o600,
+				)
+				if err != nil {
+					return err
+				}
+				if _, err := file.WriteString("mock BPF program stage: " + name); err != nil {
+					_ = file.Close()
+					return err
+				}
+				if err := file.Close(); err != nil {
+					return err
+				}
+				programIDs[filepath.Base(path)] = id
+				return nil
+			},
+			close: func() error { return nil },
 		}, nil
 	}
 	validated, err := validatePinPath(pinPath, validator)
@@ -289,6 +319,7 @@ func newDurableTCOwnerJournalFixtureWithActive(
 		desired:           desired,
 		mapStore:          mapStore,
 		programLoadErrors: programLoadErrors,
+		programPinErrors:  programPinErrors,
 		plan:              plan,
 	}
 }
@@ -921,6 +952,281 @@ func TestPinOwnerDescriptorAndIndexRecoveryAtEveryDurablePhase(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestPinOwnerDraftPublicationRestartConvergenceMatrix(t *testing.T) {
+	type faultCase struct {
+		name                string
+		point               string
+		wantPublished       bool
+		wantNextBeforeClose bool
+	}
+	faults := []faultCase{
+		{name: "create", point: "owner-create"},
+		{name: "validate-draft", point: "owner-validate-draft"},
+		{
+			name:                "validate-next",
+			point:               "owner-validate-next",
+			wantPublished:       true,
+			wantNextBeforeClose: true,
+		},
+		{name: "short-write", point: "owner-short-write"},
+		{name: "file-sync", point: "owner-file-sync"},
+		{name: "draft-publish-before", point: "owner-draft-rename-before"},
+		{
+			name:                "draft-publish-after",
+			point:               "owner-draft-rename-after",
+			wantPublished:       true,
+			wantNextBeforeClose: true,
+		},
+		{
+			name:                "draft-dir-sync",
+			point:               "owner-draft-dir-sync",
+			wantPublished:       true,
+			wantNextBeforeClose: true,
+		},
+		{
+			name:                "exchange-before",
+			point:               "owner-exchange-before",
+			wantPublished:       true,
+			wantNextBeforeClose: true,
+		},
+		{
+			name:                "exchange-after",
+			point:               "owner-exchange-after",
+			wantPublished:       true,
+			wantNextBeforeClose: true,
+		},
+		{
+			name:                "exchange-dir-sync",
+			point:               "owner-exchange-dir-sync",
+			wantPublished:       true,
+			wantNextBeforeClose: true,
+		},
+		{name: "index-create", point: "index-create", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-validate-draft", point: "index-validate-draft", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-short-write", point: "index-short-write", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-file-sync", point: "index-file-sync", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-draft-publish-before", point: "index-draft-rename-before", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-draft-publish-after", point: "index-draft-rename-after", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-draft-dir-sync", point: "index-draft-dir-sync", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-validate-next", point: "index-validate-next", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-exchange-before", point: "index-exchange-before", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-exchange-after", point: "index-exchange-after", wantPublished: true, wantNextBeforeClose: true},
+		{name: "index-exchange-dir-sync", point: "index-exchange-dir-sync", wantPublished: true, wantNextBeforeClose: true},
+	}
+
+	for _, phase := range []string{pinOwnerPhaseActive, pinOwnerPhaseDetaching} {
+		for _, fault := range faults {
+			t.Run(phase+"/"+fault.name, func(t *testing.T) {
+				runtime, parent, record, store, _ := openPersistedTestPinOwner(t)
+				next := clonePinOwnerRecord(record)
+				if phase == pinOwnerPhaseDetaching {
+					var err error
+					next, err = newDetachingPinOwnerRecord(
+						record,
+						time.Date(2026, 7, 29, 1, 2, 4, 0, time.UTC),
+					)
+					if err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					next.Sequence++
+					next.UpdatedAt = time.Date(
+						2026, 7, 29, 1, 2, 4, 0, time.UTC,
+					).Format(time.RFC3339Nano)
+				}
+
+				wantErr := errors.New("injected descriptor durability fault")
+				base := store.descriptorOps
+				ops := base
+				validateCalls := 0
+				indexValidateCalls := 0
+				lastRename := ""
+				ops.create = func(
+					root *anchoredDirectoryPath,
+					name string,
+					mode uint32,
+					uid uint32,
+				) (*os.File, pinPathInodeIdentity, error) {
+					if fault.point == "owner-create" && name == store.draftName {
+						return nil, pinPathInodeIdentity{}, wantErr
+					}
+					if fault.point == "index-create" && name == pinOwnerIndexDraftName {
+						return nil, pinPathInodeIdentity{}, wantErr
+					}
+					return base.create(root, name, mode, uid)
+				}
+				ops.validate = func(
+					root *anchoredDirectoryPath,
+					name string,
+					fd int,
+					mode uint32,
+					uid uint32,
+					identity *pinPathInodeIdentity,
+				) (pinPathInodeIdentity, error) {
+					if name == store.draftName {
+						validateCalls++
+						if fault.point == "owner-validate-draft" && validateCalls == 2 {
+							return pinPathInodeIdentity{}, wantErr
+						}
+					}
+					if fault.point == "owner-validate-next" && name == store.nextName {
+						return pinPathInodeIdentity{}, wantErr
+					}
+					if name == pinOwnerIndexDraftName {
+						indexValidateCalls++
+						if fault.point == "index-validate-draft" && indexValidateCalls == 2 {
+							return pinPathInodeIdentity{}, wantErr
+						}
+					}
+					if fault.point == "index-validate-next" && name == pinOwnerIndexNextName {
+						return pinPathInodeIdentity{}, wantErr
+					}
+					return base.validate(root, name, fd, mode, uid, identity)
+				}
+				ops.write = func(file *os.File, data []byte) (int, error) {
+					name := filepath.Base(file.Name())
+					switch {
+					case fault.point == "owner-short-write" && name == store.draftName,
+						fault.point == "index-short-write" && name == pinOwnerIndexDraftName:
+						if len(data) < 2 {
+							return 0, wantErr
+						}
+						return base.write(file, data[:len(data)-1])
+					default:
+						return base.write(file, data)
+					}
+				}
+				ops.syncFile = func(file *os.File) error {
+					if fault.point == "owner-file-sync" &&
+						filepath.Base(file.Name()) == store.draftName {
+						return wantErr
+					}
+					if fault.point == "index-file-sync" &&
+						filepath.Base(file.Name()) == pinOwnerIndexDraftName {
+						return wantErr
+					}
+					return base.syncFile(file)
+				}
+				ops.rename = func(
+					root *anchoredDirectoryPath,
+					oldName string,
+					newName string,
+					flags uint,
+				) error {
+					lastRename = oldName + ">" + newName
+					if fault.point == "owner-draft-rename-before" &&
+						oldName == store.draftName {
+						return wantErr
+					}
+					if fault.point == "owner-exchange-before" &&
+						oldName == store.nextName && flags == unix.RENAME_EXCHANGE {
+						return wantErr
+					}
+					if fault.point == "index-draft-rename-before" &&
+						oldName == pinOwnerIndexDraftName {
+						return wantErr
+					}
+					if fault.point == "index-exchange-before" &&
+						oldName == pinOwnerIndexNextName && flags == unix.RENAME_EXCHANGE {
+						return wantErr
+					}
+					if err := base.rename(root, oldName, newName, flags); err != nil {
+						return err
+					}
+					if fault.point == "owner-draft-rename-after" &&
+						oldName == store.draftName {
+						return wantErr
+					}
+					if fault.point == "owner-exchange-after" &&
+						oldName == store.nextName && flags == unix.RENAME_EXCHANGE {
+						return wantErr
+					}
+					if fault.point == "index-draft-rename-after" &&
+						oldName == pinOwnerIndexDraftName {
+						return wantErr
+					}
+					if fault.point == "index-exchange-after" &&
+						oldName == pinOwnerIndexNextName && flags == unix.RENAME_EXCHANGE {
+						return wantErr
+					}
+					return nil
+				}
+				ops.syncDir = func(root *anchoredDirectoryPath) error {
+					if fault.point == "owner-draft-dir-sync" &&
+						lastRename == store.draftName+">"+store.nextName {
+						return wantErr
+					}
+					if fault.point == "owner-exchange-dir-sync" &&
+						lastRename == store.nextName+">"+store.fileName {
+						return wantErr
+					}
+					if fault.point == "index-draft-dir-sync" &&
+						lastRename == pinOwnerIndexDraftName+">"+pinOwnerIndexNextName {
+						return wantErr
+					}
+					if fault.point == "index-exchange-dir-sync" &&
+						lastRename == pinOwnerIndexNextName+">"+pinOwnerIndexFileName {
+						return wantErr
+					}
+					return base.syncDir(root)
+				}
+				store.descriptorOps = ops
+
+				err := store.Persist(next, record, parent.mountID)
+				if !errors.Is(err, wantErr) &&
+					!(fault.point == "owner-short-write" ||
+						fault.point == "index-short-write") {
+					t.Fatalf("Persist fault = %v, want injected error", err)
+				}
+				if err == nil {
+					t.Fatal("faulted Persist unexpectedly succeeded")
+				}
+				_, nextErr := os.Lstat(filepath.Join(runtime.ownerRoot, store.nextName))
+				if fault.wantNextBeforeClose != (nextErr == nil) {
+					t.Fatalf("recoverable .next presence error=%v", nextErr)
+				}
+				if err := store.Close(); err != nil {
+					t.Fatal(err)
+				}
+
+				restarted, err := openPinOwnerStore(runtime, parent.resource, true)
+				if err != nil {
+					t.Fatalf("restart owner recovery: %v", err)
+				}
+				defer restarted.Close()
+				recovered, err := restarted.Load(parent.mountID)
+				if err != nil {
+					t.Fatal(err)
+				}
+				want := record
+				if fault.wantPublished {
+					want = next
+				}
+				if !sameExpectedOwnerRecord(recovered, want) {
+					t.Fatalf("recovered owner=%#v, want %#v", recovered, want)
+				}
+				indexed, err := activeIndexedOwnerForRecord(
+					indexStoreFromOwner(restarted),
+					want,
+				)
+				if err != nil || indexed == nil {
+					t.Fatalf("recovered owner index entry=%#v error=%v", indexed, err)
+				}
+				for _, name := range []string{
+					restarted.draftName,
+					restarted.nextName,
+					pinOwnerIndexDraftName,
+					pinOwnerIndexNextName,
+				} {
+					if _, err := os.Lstat(filepath.Join(runtime.ownerRoot, name)); !errors.Is(err, os.ErrNotExist) {
+						t.Fatalf("restart left descriptor %s: %v", name, err)
+					}
+				}
+			})
+		}
 	}
 }
 

@@ -26,6 +26,7 @@ const (
 	pinOwnerIndexMaxHistory    = 8
 	pinOwnerIndexMaxBytes      = 512 * 1024
 	pinOwnerIndexFileName      = "instances.v2.json"
+	pinOwnerIndexDraftName     = "instances.v2.draft"
 	pinOwnerIndexNextName      = "instances.v2.next"
 	pinOwnerIndexRetired       = "instances.v2.retired"
 	pinOwnerIndexActive        = "active"
@@ -80,6 +81,7 @@ type pinOwnerIndexStore struct {
 	root                *anchoredDirectoryPath
 	expectedUID         uint32
 	beforeOwnerExchange func()
+	descriptorOps       pinOwnerDescriptorOps
 	now                 func() time.Time
 }
 
@@ -97,6 +99,7 @@ func indexStoreFromOwner(store *pinOwnerStore) *pinOwnerIndexStore {
 		root:                store.root,
 		expectedUID:         store.expectedUID,
 		beforeOwnerExchange: store.beforeOwnerExchange,
+		descriptorOps:       store.descriptorOps,
 		now:                 store.now,
 	}
 }
@@ -733,26 +736,21 @@ func (store *pinOwnerIndexStore) persistLocked(
 			return err
 		}
 	}
-	nextFile, nextIdentity, err := createAnchoredRegularFileExclusive(
+	nextFile, nextIdentity, err := stageSyncedDescriptor(
 		store.root,
+		pinOwnerIndexDraftName,
 		pinOwnerIndexNextName,
-		0o600,
+		data,
 		store.expectedUID,
+		store.descriptorOps,
 	)
 	if err != nil {
+		if nextFile != nil {
+			_ = nextFile.Close()
+		}
 		return err
 	}
 	defer nextFile.Close()
-	if err := writeAndSyncAnchoredFile(
-		store.root,
-		pinOwnerIndexNextName,
-		nextFile,
-		nextIdentity,
-		data,
-		store.expectedUID,
-	); err != nil {
-		return err
-	}
 	if expected == nil {
 		if store.beforeOwnerExchange != nil {
 			store.beforeOwnerExchange()
@@ -774,16 +772,15 @@ func (store *pinOwnerIndexStore) persistLocked(
 		if !samePinOwnerIndex(published, next) {
 			return errors.New("next pin owner index changed before initial publish")
 		}
-		if err := unix.Renameat2(
-			store.root.FD(),
+		if err := store.descriptorOps.rename(
+			store.root,
 			pinOwnerIndexNextName,
-			store.root.FD(),
 			pinOwnerIndexFileName,
 			unix.RENAME_NOREPLACE,
 		); err != nil {
 			return err
 		}
-		if err := unix.Fsync(store.root.FD()); err != nil {
+		if err := store.descriptorOps.syncDir(store.root); err != nil {
 			return err
 		}
 		_, err = validateAnchoredRegularFile(
@@ -840,16 +837,15 @@ func (store *pinOwnerIndexStore) persistLocked(
 	if !samePinOwnerIndex(recheckedNext, next) {
 		return errors.New("next pin owner index changed at exchange hook")
 	}
-	if err := unix.Renameat2(
-		store.root.FD(),
+	if err := store.descriptorOps.rename(
+		store.root,
 		pinOwnerIndexNextName,
-		store.root.FD(),
 		pinOwnerIndexFileName,
 		unix.RENAME_EXCHANGE,
 	); err != nil {
 		return err
 	}
-	if err := unix.Fsync(store.root.FD()); err != nil {
+	if err := store.descriptorOps.syncDir(store.root); err != nil {
 		return err
 	}
 	if _, err := validateAnchoredRegularFile(
@@ -894,6 +890,13 @@ func (store *pinOwnerIndexStore) recover() error {
 }
 
 func (store *pinOwnerIndexStore) recoverLocked() error {
+	if err := discardUnpublishedDescriptorDraft(
+		store.root,
+		pinOwnerIndexDraftName,
+		store.expectedUID,
+	); err != nil {
+		return fmt.Errorf("discard unpublished pin owner index draft: %w", err)
+	}
 	if err := store.recoverRetiredLocked(); err != nil {
 		return err
 	}

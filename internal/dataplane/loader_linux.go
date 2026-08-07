@@ -86,11 +86,13 @@ type pinPathRuntime struct {
 	beforeOwnerExchange  func()
 	beforePinQuarantine  func(string) error
 	beforePinUnlink      func(string) error
+	ownerApplyFailure    func() (*ownerApplyFailureBoundary, error)
 }
 
 type pinnedProgramObservation struct {
 	fd    int
 	id    uint32
+	pin   func(string) error
 	close func() error
 }
 
@@ -335,6 +337,19 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 	runtime := l.pinRuntime(ctx)
+	if runtime.ownerApplyFailure != nil {
+		boundary, err := runtime.ownerApplyFailure()
+		if err != nil {
+			return err
+		}
+		if boundary == nil || boundary.plan == nil {
+			return errors.New("owner apply failure boundary is incomplete")
+		}
+		defer func() {
+			returnErr = errors.Join(returnErr, boundary.plan.Close())
+		}()
+		return boundary.Resolve()
+	}
 	pinPath := pinPathFromEnv(l.PinPath)
 	validated, err := validatePinPath(pinPath, runtime.validator)
 	if err != nil {
@@ -831,21 +846,16 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return commitControl(coll, snapshot.Control[abi.ControlKeyGlobal])
 	})
 	if attachErr != nil {
-		abortErr := resolveFailedOwnerApply(
-			handle,
-			store,
-			mutating,
-			handoff,
-			retainedTC,
-			liveTCRuntime,
-		)
-		if abortErr != nil {
-			return errors.Join(
-				attachErr,
-				fmt.Errorf("owner-aware apply rollback: %w", abortErr),
-			)
-		}
-		return attachErr
+		return (&ownerApplyFailureBoundary{
+			plan:      attachPlan,
+			handle:    handle,
+			store:     store,
+			record:    mutating,
+			handoff:   handoff,
+			stage:     retainedTC,
+			tcRuntime: liveTCRuntime,
+			attachErr: attachErr,
+		}).Resolve()
 	}
 	if retainedTC != nil {
 		return errors.New("successful TC owner transaction returned rollback ownership")

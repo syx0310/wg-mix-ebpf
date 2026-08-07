@@ -69,16 +69,17 @@ func loadOwnerPrograms(
 		return nil, errors.Join(err, loaded.Close())
 	}
 	for _, stage := range record.ProgramStages {
-		if err := validateOwnerProgramStage(handle, record, stage); err != nil {
+		fileName, err := validateOwnerProgramRecoveryStage(handle, record, stage)
+		if err != nil {
 			return closeOnError(err)
 		}
 		observation, err := handle.runtime.loadPinnedProgram(
-			filepath.Join(handle.procPath(), stage.FileName),
+			filepath.Join(handle.procPath(), fileName),
 		)
 		if err != nil {
 			return closeOnError(fmt.Errorf(
 				"load owner program stage %s: %w",
-				stage.FileName, err,
+				fileName, err,
 			))
 		}
 		loaded.observations = append(loaded.observations, observation)

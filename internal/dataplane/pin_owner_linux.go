@@ -97,10 +97,46 @@ type pinOwnerStore struct {
 	resource            pinResourceIdentity
 	expectedUID         uint32
 	fileName            string
+	draftName           string
 	nextName            string
 	retiredName         string
 	beforeOwnerExchange func()
+	descriptorOps       pinOwnerDescriptorOps
 	now                 func() time.Time
+}
+
+// pinOwnerDescriptorOps keeps the small set of durability primitives used by
+// owner and index publication injectable for deterministic crash testing. Live
+// stores always use the syscall-backed defaults below.
+type pinOwnerDescriptorOps struct {
+	create   func(*anchoredDirectoryPath, string, uint32, uint32) (*os.File, pinPathInodeIdentity, error)
+	validate func(*anchoredDirectoryPath, string, int, uint32, uint32, *pinPathInodeIdentity) (pinPathInodeIdentity, error)
+	write    func(*os.File, []byte) (int, error)
+	syncFile func(*os.File) error
+	rename   func(*anchoredDirectoryPath, string, string, uint) error
+	syncDir  func(*anchoredDirectoryPath) error
+}
+
+func livePinOwnerDescriptorOps() pinOwnerDescriptorOps {
+	return pinOwnerDescriptorOps{
+		create:   createAnchoredRegularFileExclusive,
+		validate: validateAnchoredRegularFile,
+		write: func(file *os.File, data []byte) (int, error) {
+			return file.Write(data)
+		},
+		syncFile: func(file *os.File) error { return file.Sync() },
+		rename: func(
+			root *anchoredDirectoryPath,
+			oldName string,
+			newName string,
+			flags uint,
+		) error {
+			return unix.Renameat2(root.FD(), oldName, root.FD(), newName, flags)
+		},
+		syncDir: func(root *anchoredDirectoryPath) error {
+			return unix.Fsync(root.FD())
+		},
+	}
 }
 
 type canonicalPinDirectoryState int
@@ -240,6 +276,8 @@ func validateOwnerDirectoryEntries(
 	for _, stage := range record.ProgramStages {
 		allowed[stage.FileName] = struct{}{}
 		allowed[stage.FileName+".retired"] = struct{}{}
+		allowed[stage.FileName+".handoff"] = struct{}{}
+		allowed[stage.FileName+".handoff.retired"] = struct{}{}
 	}
 	for _, stage := range record.MapStages {
 		allowed[stage.FileName] = struct{}{}
@@ -357,6 +395,7 @@ func loadPinnedProgramObservation(path string) (*pinnedProgramObservation, error
 	return &pinnedProgramObservation{
 		fd:    program.FD(),
 		id:    uint32(id),
+		pin:   program.Pin,
 		close: program.Close,
 	}, nil
 }
@@ -1240,6 +1279,34 @@ func validateOwnerProgramStage(
 	)
 }
 
+// validateOwnerProgramRecoveryStage returns an exact durable program pin for
+// restart recovery. The primary stage is preferred, while the independently
+// pinned handoff copy keeps recovery complete if the primary name is missing
+// or was damaged after the pre-mutation proof.
+func validateOwnerProgramRecoveryStage(
+	handle *pinPathHandle,
+	record *pinOwnerRecord,
+	stage pinOwnerProgramStage,
+) (string, error) {
+	primaryErr := validateOwnerProgramStage(handle, record, stage)
+	if primaryErr == nil {
+		return stage.FileName, nil
+	}
+	backupName := stage.FileName + ".handoff"
+	if backupErr := validatePinnedProgramAt(
+		handle,
+		backupName,
+		stage.ProgramID,
+	); backupErr == nil {
+		return backupName, nil
+	} else {
+		return "", errors.Join(
+			fmt.Errorf("primary program stage %s: %w", stage.FileName, primaryErr),
+			fmt.Errorf("handoff program stage %s: %w", backupName, backupErr),
+		)
+	}
+}
+
 func validatePinnedProgramAt(
 	handle *pinPathHandle,
 	fileName string,
@@ -1440,6 +1507,131 @@ func removeOwnerProgramStages(
 			return fmt.Errorf("remove retired program stage %s: %w", retiredName, err)
 		}
 	}
+	return removeOwnerProgramHandoffStages(handle, record)
+}
+
+func removeOwnerProgramHandoffStages(
+	handle *pinPathHandle,
+	record *pinOwnerRecord,
+) error {
+	for _, stage := range record.ProgramStages {
+		name := stage.FileName + ".handoff"
+		retiredName := name + ".retired"
+		var retiredStat unix.Stat_t
+		retiredErr := unix.Fstatat(
+			handle.targetFD,
+			retiredName,
+			&retiredStat,
+			unix.AT_SYMLINK_NOFOLLOW,
+		)
+		if retiredErr == nil {
+			var activeStat unix.Stat_t
+			if err := unix.Fstatat(
+				handle.targetFD,
+				name,
+				&activeStat,
+				unix.AT_SYMLINK_NOFOLLOW,
+			); err == nil {
+				return fmt.Errorf("both active and retired handoff stage %s exist", name)
+			} else if !errors.Is(err, unix.ENOENT) {
+				return err
+			}
+			if err := validatePinnedProgramAt(
+				handle,
+				retiredName,
+				stage.ProgramID,
+			); err != nil {
+				return err
+			}
+			if handle.runtime.beforePinUnlink != nil {
+				if err := handle.runtime.beforePinUnlink(retiredName); err != nil {
+					return fmt.Errorf("handoff stage unlink hook %s: %w", retiredName, err)
+				}
+			}
+			if err := validatePinnedProgramAt(
+				handle,
+				retiredName,
+				stage.ProgramID,
+			); err != nil {
+				return fmt.Errorf("handoff stage %s changed at unlink hook: %w", retiredName, err)
+			}
+			if err := unix.Unlinkat(handle.targetFD, retiredName, 0); err != nil {
+				return fmt.Errorf("remove retired handoff stage %s: %w", retiredName, err)
+			}
+			continue
+		}
+		if !errors.Is(retiredErr, unix.ENOENT) {
+			return retiredErr
+		}
+		var stat unix.Stat_t
+		if err := unix.Fstatat(
+			handle.targetFD,
+			name,
+			&stat,
+			unix.AT_SYMLINK_NOFOLLOW,
+		); errors.Is(err, unix.ENOENT) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		if err := validatePinnedProgramAt(handle, name, stage.ProgramID); err != nil {
+			return err
+		}
+		if handle.runtime.beforePinQuarantine != nil {
+			if err := handle.runtime.beforePinQuarantine(name); err != nil {
+				return fmt.Errorf("handoff stage quarantine hook %s: %w", name, err)
+			}
+		}
+		if err := handle.recheckTargetEntry(); err != nil {
+			return err
+		}
+		var recheck unix.Stat_t
+		if err := unix.Fstatat(
+			handle.targetFD,
+			name,
+			&recheck,
+			unix.AT_SYMLINK_NOFOLLOW,
+		); err != nil {
+			return err
+		}
+		if !samePinPathInode(
+			pinPathInodeFromStat(&stat),
+			pinPathInodeFromStat(&recheck),
+		) {
+			return fmt.Errorf("handoff stage %s changed before quarantine", name)
+		}
+		if err := unix.Renameat2(
+			handle.targetFD,
+			name,
+			handle.targetFD,
+			retiredName,
+			unix.RENAME_NOREPLACE,
+		); err != nil {
+			return fmt.Errorf("quarantine handoff stage %s: %w", name, err)
+		}
+		if err := validatePinnedProgramAt(
+			handle,
+			retiredName,
+			stage.ProgramID,
+		); err != nil {
+			return fmt.Errorf("validate retired handoff stage %s: %w", retiredName, err)
+		}
+		if handle.runtime.beforePinUnlink != nil {
+			if err := handle.runtime.beforePinUnlink(retiredName); err != nil {
+				return fmt.Errorf("handoff stage unlink hook %s: %w", retiredName, err)
+			}
+		}
+		if err := validatePinnedProgramAt(
+			handle,
+			retiredName,
+			stage.ProgramID,
+		); err != nil {
+			return fmt.Errorf("handoff stage %s changed at unlink hook: %w", retiredName, err)
+		}
+		if err := unix.Unlinkat(handle.targetFD, retiredName, 0); err != nil {
+			return fmt.Errorf("remove retired handoff stage %s: %w", retiredName, err)
+		}
+	}
 	return nil
 }
 
@@ -1601,9 +1793,11 @@ func openPinOwnerStoreWithPolicy(
 		resource:            resource,
 		expectedUID:         runtime.expectedUID,
 		fileName:            fileName,
+		draftName:           resource.key + ".owner.draft",
 		nextName:            resource.key + ".owner.next",
 		retiredName:         resource.key + ".owner.retired",
 		beforeOwnerExchange: runtime.beforeOwnerExchange,
+		descriptorOps:       livePinOwnerDescriptorOps(),
 		now:                 runtime.now,
 	}
 	if recoverDescriptors {
@@ -1721,6 +1915,64 @@ func marshalPinOwnerRecord(record *pinOwnerRecord) ([]byte, error) {
 	return append(data, '\n'), nil
 }
 
+// stageSyncedDescriptor writes through a name that recovery never adopts.
+// Only after the complete file has passed file fsync and identity validation
+// is it atomically published under the recoverable pending name.
+func stageSyncedDescriptor(
+	root *anchoredDirectoryPath,
+	draftName string,
+	nextName string,
+	data []byte,
+	expectedUID uint32,
+	ops pinOwnerDescriptorOps,
+) (*os.File, pinPathInodeIdentity, error) {
+	file, identity, err := ops.create(root, draftName, 0o600, expectedUID)
+	if err != nil {
+		return nil, pinPathInodeIdentity{}, err
+	}
+	fail := func(err error) (*os.File, pinPathInodeIdentity, error) {
+		return file, identity, err
+	}
+	if err := writeAndSyncAnchoredFileWithOps(
+		root,
+		draftName,
+		file,
+		identity,
+		data,
+		expectedUID,
+		ops,
+	); err != nil {
+		return fail(err)
+	}
+	if _, err := ops.validate(
+		root,
+		draftName,
+		int(file.Fd()),
+		0o600,
+		expectedUID,
+		&identity,
+	); err != nil {
+		return fail(err)
+	}
+	if err := ops.rename(root, draftName, nextName, unix.RENAME_NOREPLACE); err != nil {
+		return fail(err)
+	}
+	if err := ops.syncDir(root); err != nil {
+		return fail(err)
+	}
+	if _, err := ops.validate(
+		root,
+		nextName,
+		int(file.Fd()),
+		0o600,
+		expectedUID,
+		&identity,
+	); err != nil {
+		return fail(err)
+	}
+	return file, identity, nil
+}
+
 func (store *pinOwnerStore) Persist(
 	record *pinOwnerRecord,
 	expected *pinOwnerRecord,
@@ -1759,26 +2011,21 @@ func (store *pinOwnerStore) Persist(
 	if err := store.recoverDescriptorTransaction(); err != nil {
 		return err
 	}
-	nextFile, nextIdentity, err := createAnchoredRegularFileExclusive(
+	nextFile, nextIdentity, err := stageSyncedDescriptor(
 		store.root,
+		store.draftName,
 		store.nextName,
-		0o600,
-		store.expectedUID,
-	)
-	if err != nil {
-		return fmt.Errorf("create next pin owner record: %w", err)
-	}
-	defer nextFile.Close()
-	if err := writeAndSyncAnchoredFile(
-		store.root,
-		store.nextName,
-		nextFile,
-		nextIdentity,
 		data,
 		store.expectedUID,
-	); err != nil {
-		return fmt.Errorf("write next pin owner record: %w", err)
+		store.descriptorOps,
+	)
+	if err != nil {
+		if nextFile != nil {
+			_ = nextFile.Close()
+		}
+		return fmt.Errorf("stage next pin owner record: %w", err)
 	}
+	defer nextFile.Close()
 
 	targetFile, targetIdentity, targetErr := openExistingAnchoredRegularFile(
 		store.root,
@@ -1823,16 +2070,15 @@ func (store *pinOwnerStore) Persist(
 		); err != nil {
 			return fmt.Errorf("next owner record changed at initial publish hook: %w", err)
 		}
-		if err := unix.Renameat2(
-			store.root.FD(),
+		if err := store.descriptorOps.rename(
+			store.root,
 			store.nextName,
-			store.root.FD(),
 			store.fileName,
 			unix.RENAME_NOREPLACE,
 		); err != nil {
 			return fmt.Errorf("publish initial pin owner record: %w", err)
 		}
-		if err := unix.Fsync(store.root.FD()); err != nil {
+		if err := store.descriptorOps.syncDir(store.root); err != nil {
 			return fmt.Errorf("sync pin owner root after initial publish: %w", err)
 		}
 		_, err := validateAnchoredRegularFile(
@@ -1902,16 +2148,15 @@ func (store *pinOwnerStore) Persist(
 	); err != nil {
 		return fmt.Errorf("next owner record changed at exchange hook: %w", err)
 	}
-	if err := unix.Renameat2(
-		store.root.FD(),
+	if err := store.descriptorOps.rename(
+		store.root,
 		store.nextName,
-		store.root.FD(),
 		store.fileName,
 		unix.RENAME_EXCHANGE,
 	); err != nil {
 		return fmt.Errorf("exchange pin owner record: %w", err)
 	}
-	if err := unix.Fsync(store.root.FD()); err != nil {
+	if err := store.descriptorOps.syncDir(store.root); err != nil {
 		return fmt.Errorf("sync pin owner root after exchange: %w", err)
 	}
 	if _, err := validateAnchoredRegularFile(
@@ -1957,7 +2202,27 @@ func writeAndSyncAnchoredFile(
 	data []byte,
 	expectedUID uint32,
 ) error {
-	if _, err := validateAnchoredRegularFile(
+	return writeAndSyncAnchoredFileWithOps(
+		root,
+		name,
+		file,
+		identity,
+		data,
+		expectedUID,
+		livePinOwnerDescriptorOps(),
+	)
+}
+
+func writeAndSyncAnchoredFileWithOps(
+	root *anchoredDirectoryPath,
+	name string,
+	file *os.File,
+	identity pinPathInodeIdentity,
+	data []byte,
+	expectedUID uint32,
+	ops pinOwnerDescriptorOps,
+) error {
+	if _, err := ops.validate(
 		root,
 		name,
 		int(file.Fd()),
@@ -1973,17 +2238,17 @@ func writeAndSyncAnchoredFile(
 	if _, err := file.Seek(0, 0); err != nil {
 		return err
 	}
-	written, err := file.Write(data)
+	written, err := ops.write(file, data)
 	if err != nil {
 		return err
 	}
 	if written != len(data) {
 		return io.ErrShortWrite
 	}
-	if err := file.Sync(); err != nil {
+	if err := ops.syncFile(file); err != nil {
 		return err
 	}
-	_, err = validateAnchoredRegularFile(
+	_, err = ops.validate(
 		root,
 		name,
 		int(file.Fd()),
@@ -2029,9 +2294,43 @@ func unlinkAnchoredRegularFile(
 	return nil
 }
 
+func discardUnpublishedDescriptorDraft(
+	root *anchoredDirectoryPath,
+	name string,
+	expectedUID uint32,
+) error {
+	file, identity, err := openExistingAnchoredRegularFile(
+		root,
+		name,
+		0o600,
+		expectedUID,
+	)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+	return unlinkAnchoredRegularFile(
+		root,
+		name,
+		int(file.Fd()),
+		identity,
+		expectedUID,
+	)
+}
+
 func (store *pinOwnerStore) recoverDescriptorTransaction() error {
 	if store == nil || store.root == nil {
 		return errors.New("pin owner store is unavailable")
+	}
+	if err := discardUnpublishedDescriptorDraft(
+		store.root,
+		store.draftName,
+		store.expectedUID,
+	); err != nil {
+		return fmt.Errorf("discard unpublished pin owner draft: %w", err)
 	}
 	if err := store.recoverRetiredRecord(); err != nil {
 		return err

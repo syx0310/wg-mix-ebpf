@@ -3,6 +3,7 @@
 package dataplane
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"os"
@@ -1048,6 +1049,7 @@ type retainedJournalHandoffFixture struct {
 	handoff *durableTCOwnerJournalHandoff
 	stage   *tcAttachStage
 	kernel  *fakeTCKernel
+	attach  error
 }
 
 func newRetainedJournalHandoffFixture(
@@ -1100,6 +1102,7 @@ func newRetainedJournalHandoffFixture(
 		handoff: handoff,
 		stage:   stage,
 		kernel:  kernel,
+		attach:  err,
 	}
 }
 
@@ -1193,6 +1196,147 @@ func TestFailedOwnerApplyProductionBoundaryResolvesFreshHandoffFaults(
 		}
 		assertFailedOwnerApplyResolvedByProduction(t, fixture, nil)
 	})
+}
+
+func TestLinuxLoaderApplyReturnBoundaryOwnsFreshHandoffFailure(t *testing.T) {
+	fixture := newRetainedJournalHandoffFixture(t)
+	wantErr := errors.New("injected Apply-boundary map load failure")
+	fixture.owner.mapStore.loadErrors["control_map"] = wantErr
+	runtime := fixture.owner.handle.runtime
+	runtime.ownerApplyFailure = func() (*ownerApplyFailureBoundary, error) {
+		return &ownerApplyFailureBoundary{
+			plan:      fixture.plan,
+			handle:    fixture.owner.handle,
+			store:     fixture.owner.store,
+			record:    fixture.owner.intent,
+			handoff:   fixture.handoff,
+			stage:     fixture.stage,
+			tcRuntime: fixture.kernel.runtime(),
+			attachErr: fixture.attach,
+		}, nil
+	}
+	err := (LinuxLoader{runtime: &runtime}).Apply(context.Background(), nil)
+	if !errors.Is(err, wantErr) || !errors.Is(err, fixture.attach) {
+		t.Fatalf("LinuxLoader.Apply error=%v", err)
+	}
+	if fixture.stage.hasLiveFilterOwnership() || !fixture.stage.done ||
+		fixture.plan.stage != nil || !fixture.plan.closed {
+		t.Fatalf(
+			"Apply return/defer lost ownership: live=%t done=%t plan-stage=%p closed=%t",
+			fixture.stage.hasLiveFilterOwnership(),
+			fixture.stage.done,
+			fixture.plan.stage,
+			fixture.plan.closed,
+		)
+	}
+}
+
+func TestFailedOwnerApplyUsesDurableHandoffProgramAcrossRestart(
+	t *testing.T,
+) {
+	fixture := newRetainedJournalHandoffFixture(t)
+	programStage := fixture.owner.intent.ProgramStages[0]
+	preserved := filepath.Join(
+		filepath.Dir(fixture.owner.handle.pinPath),
+		"preserved-"+programStage.FileName,
+	)
+	if err := os.Rename(
+		filepath.Join(fixture.owner.handle.pinPath, programStage.FileName),
+		preserved,
+	); err != nil {
+		t.Fatal(err)
+	}
+	err := resolveFailedOwnerApply(
+		fixture.owner.handle,
+		fixture.owner.store,
+		fixture.owner.intent,
+		fixture.handoff,
+		fixture.stage,
+		fixture.kernel.runtime(),
+	)
+	if err == nil {
+		t.Fatal("failed apply unexpectedly returned nil")
+	}
+	if fixture.stage.hasLiveFilterOwnership() || !fixture.stage.done ||
+		fixture.plan.stage != nil {
+		t.Fatal("durable handoff program did not accept the retained stage")
+	}
+	if err := validatePinnedProgramAt(
+		fixture.owner.handle,
+		programStage.FileName+".handoff",
+		programStage.ProgramID,
+	); err != nil {
+		t.Fatalf("durable handoff program stage is unavailable: %v", err)
+	}
+
+	// Reopen only durable state and run the normal restart recovery path. No
+	// tcAttachStage or test-side rollback participates in convergence.
+	if err := fixture.owner.store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	restarted, err := openPinOwnerStore(
+		fixture.owner.handle.runtime,
+		fixture.owner.handle.resource,
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer restarted.Close()
+	persisted, err := restarted.Load(fixture.owner.handle.mountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.owner.handle.runtime.now = func() time.Time {
+		return time.Date(2026, 8, 8, 1, 2, 7, 0, time.UTC)
+	}
+	recovered, err := recoverPinOwnerTransaction(
+		fixture.owner.handle,
+		restarted,
+		persisted,
+		fixture.kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatalf("restart durable TC owner recovery: %v", err)
+	}
+	if recovered.record == nil || recovered.record.Phase != pinOwnerPhaseActive ||
+		recovered.record.ActiveGeneration != fixture.owner.intent.NextGeneration {
+		t.Fatalf("restart recovered owner=%#v", recovered.record)
+	}
+}
+
+func TestFailedOwnerApplyRetainsStageWhenTransferAndCloseBothFail(t *testing.T) {
+	fixture := newRetainedJournalHandoffFixture(t)
+	wantErr := errors.New("injected persistent map validation failure")
+	fixture.owner.mapStore.loadErrors["control_map"] = wantErr
+	fixture.kernel.failWrite = len(fixture.kernel.writes) + 1
+	err := resolveFailedOwnerApply(
+		fixture.owner.handle,
+		fixture.owner.store,
+		fixture.owner.intent,
+		fixture.handoff,
+		fixture.stage,
+		fixture.kernel.runtime(),
+	)
+	if !errors.Is(err, wantErr) || !fixture.stage.hasLiveFilterOwnership() {
+		t.Fatalf("long-term owner error=%v live=%t", err, fixture.stage.hasLiveFilterOwnership())
+	}
+
+	// The next real Apply/Detach invokes this exact gate while holding the
+	// resource lock. The journal was independently pinned before mutation, so
+	// it can consume the retained stage even though the first local Close also
+	// failed.
+	delete(fixture.owner.mapStore.loadErrors, "control_map")
+	fixture.kernel.failWrite = 0
+	if err := retryRetainedTCRollbackOwner(
+		fixture.owner.intent.ResourceKey,
+	); err != nil {
+		t.Fatalf("retry process-lifetime TC owner: %v", err)
+	}
+	if fixture.stage.hasLiveFilterOwnership() || !fixture.stage.done ||
+		fixture.plan.stage != nil {
+		t.Fatal("process-lifetime owner did not converge to the durable journal")
+	}
 }
 
 func TestDurableTCOwnerJournalHandoffIsExactAndOneShot(t *testing.T) {

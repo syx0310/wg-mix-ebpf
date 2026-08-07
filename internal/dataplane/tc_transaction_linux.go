@@ -134,25 +134,35 @@ type tcAttachStage struct {
 // only from an Apply stack frame.
 var retainedTCRollbackOwners = struct {
 	sync.Mutex
-	byResource map[string][]*tcAttachStage
+	byResource map[string][]retainedTCRollbackOwner
 }{
-	byResource: make(map[string][]*tcAttachStage),
+	byResource: make(map[string][]retainedTCRollbackOwner),
 }
 
-func retainTCRollbackOwner(resourceKey string, stage *tcAttachStage) error {
-	if resourceKey == "" || stage == nil || !stage.hasLiveFilterOwnership() {
+type retainedTCRollbackOwner struct {
+	stage   *tcAttachStage
+	handoff *durableTCOwnerJournalHandoff
+}
+
+func retainTCRollbackOwner(
+	resourceKey string,
+	stage *tcAttachStage,
+	handoff *durableTCOwnerJournalHandoff,
+) error {
+	if resourceKey == "" || stage == nil || handoff == nil ||
+		!stage.hasLiveFilterOwnership() {
 		return errors.New("cannot retain an empty TC rollback owner")
 	}
 	retainedTCRollbackOwners.Lock()
 	defer retainedTCRollbackOwners.Unlock()
 	for _, current := range retainedTCRollbackOwners.byResource[resourceKey] {
-		if current == stage {
+		if current.stage == stage {
 			return nil
 		}
 	}
 	retainedTCRollbackOwners.byResource[resourceKey] = append(
 		retainedTCRollbackOwners.byResource[resourceKey],
-		stage,
+		retainedTCRollbackOwner{stage: stage, handoff: handoff},
 	)
 	return nil
 }
@@ -164,13 +174,22 @@ func retryRetainedTCRollbackOwner(resourceKey string) error {
 	if len(stages) == 0 {
 		return nil
 	}
-	var unresolved []*tcAttachStage
+	var unresolved []retainedTCRollbackOwner
 	var errs []error
-	for _, stage := range stages {
-		if err := stage.Close(); err != nil {
-			unresolved = append(unresolved, stage)
-			errs = append(errs, fmt.Errorf("retry retained TC rollback owner: %w", err))
+	for _, owner := range stages {
+		transferErr := owner.handoff.Transfer(owner.stage)
+		if transferErr == nil {
+			continue
 		}
+		if err := owner.stage.Close(); err != nil {
+			unresolved = append(unresolved, owner)
+			errs = append(errs, errors.Join(
+				fmt.Errorf("retry retained TC journal transfer: %w", transferErr),
+				fmt.Errorf("retry retained TC rollback owner: %w", err),
+			))
+			continue
+		}
+		errs = append(errs, owner.handoff.Close())
 	}
 	if len(unresolved) != 0 {
 		retainedTCRollbackOwners.byResource[resourceKey] = unresolved
