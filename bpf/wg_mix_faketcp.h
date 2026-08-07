@@ -26,8 +26,12 @@
 #define FAKETCP_FLAG_ACK 0x10
 
 #define FAKETCP_HEADER_DELTA 12
-#define FAKETCP_METADATA_MAGIC 0x57474654U
 #define FAKETCP_MAX_CAPTURED_PACKET 2304
+#define FAKETCP_CHECKSUM_CHUNK_BYTES 32
+#define FAKETCP_CHECKSUM_CHUNK_COUNT \
+	((FAKETCP_MAX_CAPTURED_PACKET + FAKETCP_CHECKSUM_CHUNK_BYTES - 1) / \
+	 FAKETCP_CHECKSUM_CHUNK_BYTES)
+#define FAKETCP_METADATA_MAGIC 0x57474654U
 #define FAKETCP_CONTROL_MIN_INTERVAL_NANOS 10000000ULL
 #define FAKETCP_CONTROL_MAX_INTERVAL_NANOS 10000000000ULL
 #define FAKETCP_CONTROL_MAX_BURST 4096U
@@ -108,6 +112,17 @@ struct faketcp_pseudo_tail {
 	__u8 protocol;
 	__be16 length;
 };
+
+struct faketcp_ipv4_pseudo_header {
+	__be32 source;
+	__be32 destination;
+	__u8 zero;
+	__u8 protocol;
+	__be16 length;
+};
+
+_Static_assert(sizeof(struct faketcp_ipv4_pseudo_header) == 12,
+	       "faketcp IPv4 pseudo-header ABI drift");
 
 // These policy maps are populated for every concrete XDP attachment before
 // the link becomes reachable. They deliberately duplicate the small listener
@@ -490,19 +505,22 @@ static __always_inline int faketcp_preflight_egress(struct __sk_buff *skb,
 	struct faketcp_session_key key = {};
 	struct faketcp_session_value *session;
 
+	// A UDP GSO skb represents several future wire packets, but this hook is
+	// invoked only once for the aggregate. One header insertion cannot provide
+	// a distinct TCP header, sequence number and checksum for every segment,
+	// and the TC context cannot safely retag UDP GSO as TCP GSO. Reject before
+	// type-word/XOR mutation or slow-path capture; this is a hard capability
+	// gate, not an implementation of per-segment FakeTCP.
+	if (skb->gso_segs || skb->gso_size) {
+		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
+		return -1;
+	}
 	if (faketcp_tc_key(skb, info, generation, &key) < 0)
 		return -1;
 	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
 	if (session && session->generation == generation &&
 	    session->state == FAKETCP_STATE_ESTABLISHED)
 		return 0;
-	if (skb->gso_segs || skb->gso_size) {
-		// Dropping is only a development fail-safe, not GSO support. The
-		// activation gate requires a verified per-segment transform and real
-		// offload acceptance before this object can be attached.
-		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
-		return -1;
-	}
 	if (session)
 		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 	else
@@ -530,47 +548,99 @@ static __always_inline __s64 faketcp_rotation_checksum(const __u8 head[FAKETCP_H
 			     (__be32 *)shifted, sizeof(shifted), seed);
 }
 
-// This packet-level prototype accepts only a fully materialized UDP checksum.
-// Activation remains blocked until the kernel path can identify ip_summed,
-// materialize/complete every CHECKSUM_PARTIAL seed, and reset checksum offset
-// plus skb checksum metadata after the UDP-to-TCP header-size change. Merely
-// rewriting csum_offset is not a valid completion strategy.
-static __always_inline int faketcp_tcp_checksum_from_materialized_udp(
-						  struct udphdr old_udp,
-						  struct tcphdr *tcp,
-						  __u16 udp_len,
-						  const __u8 head[FAKETCP_HEADER_DELTA],
-						  __u16 payload_len)
+// bpf_check_mtu interprets a non-zero mtu_len input as an L3 packet length.
+// Asking about the planned +12 byte transport-header growth gives the exact
+// pre-transform boundary: an input IPv4 packet must be no larger than the
+// current underlay MTU minus FAKETCP_HEADER_DELTA. Route-specific PMTU is not
+// exposed by this helper, so the activation gate still requires real-host PMTU
+// acceptance rather than claiming that this interface-MTU check is sufficient.
+static __always_inline int faketcp_mtu_allows_growth(struct __sk_buff *skb,
+						      __u16 old_total_len)
 {
-	struct faketcp_pseudo_tail old_pseudo = {
-		.protocol = IPPROTO_UDP,
-		.length = bpf_htons(udp_len),
-	};
-	struct faketcp_pseudo_tail new_pseudo = {
+	__u32 mtu_len = old_total_len;
+	long rc;
+
+	rc = bpf_check_mtu(skb, 0, &mtu_len, FAKETCP_HEADER_DELTA, 0);
+	if (rc != 0 || mtu_len < FAKETCP_HEADER_DELTA ||
+	    old_total_len > mtu_len - FAKETCP_HEADER_DELTA) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return 0;
+	}
+	return 1;
+}
+
+// TC's public __sk_buff ABI does not expose ip_summed, csum_start or
+// csum_offset, so the program cannot honestly classify CHECKSUM_NONE versus
+// CHECKSUM_PARTIAL. Instead, bpf_skb_change_tail is used before this helper:
+// the kernel documents that operation as linearizing, uncloning and dropping
+// skb offloads. The old UDP checksum is deliberately ignored because it may be
+// only a CHECKSUM_PARTIAL pseudo-header seed. This helper then materializes a
+// new TCP checksum from the IPv4 pseudo-header, constructed TCP header and the
+// complete final (rotated and possibly XORed) payload.
+//
+// Every read is bounded by the previously validated fixed-IHL IPv4 total
+// length and FAKETCP_MAX_CAPTURED_PACKET. bpf_skb_load_bytes handles a packet
+// that was non-linear before change_tail. The final short chunk is zero padded,
+// which is the Internet-checksum rule for odd-length payloads.
+static __always_inline int faketcp_materialize_tcp_checksum(
+						 struct __sk_buff *skb,
+						 __be32 source,
+						 __be32 destination,
+						 struct tcphdr *tcp,
+						 __u32 payload_off,
+						 __u16 payload_len)
+{
+	struct faketcp_ipv4_pseudo_header pseudo = {
+		.source = source,
+		.destination = destination,
 		.protocol = IPPROTO_TCP,
-		.length = bpf_htons(udp_len + FAKETCP_HEADER_DELTA),
+		.length = bpf_htons(sizeof(*tcp) + payload_len),
 	};
-	__u16 old_checksum = bpf_ntohs(old_udp.check);
+	__u8 chunk[FAKETCP_CHECKSUM_CHUNK_BYTES] = {};
+	__u32 processed = 0;
+	__u32 remaining;
 	__s64 sum;
 
-	if (old_checksum == 0)
+	if (payload_len > FAKETCP_MAX_CAPTURED_PACKET - sizeof(struct iphdr) -
+			  sizeof(struct udphdr))
 		return -1;
-	old_udp.check = 0;
 	tcp->check = 0;
-	sum = (~old_checksum) & 0xffff;
-	sum = bpf_csum_diff((__be32 *)&old_pseudo, sizeof(old_pseudo),
-			     (__be32 *)&new_pseudo, sizeof(new_pseudo), sum);
+	sum = bpf_csum_diff(0, 0, (__be32 *)&pseudo, sizeof(pseudo), 0);
 	if (sum < 0)
 		return -1;
-	sum = bpf_csum_diff((__be32 *)&old_udp, sizeof(old_udp),
-			     (__be32 *)tcp, sizeof(*tcp), sum);
+	sum = bpf_csum_diff(0, 0, (__be32 *)tcp, sizeof(*tcp), (__wsum)sum);
 	if (sum < 0)
 		return -1;
-	if (payload_len & 1) {
-		sum = faketcp_rotation_checksum(head, sum, 0);
+
+#pragma unroll
+	for (int i = 0; i < FAKETCP_CHECKSUM_CHUNK_COUNT; i++) {
+		if (processed + FAKETCP_CHECKSUM_CHUNK_BYTES > payload_len)
+			break;
+		if (bpf_skb_load_bytes(skb, payload_off + processed, chunk,
+				       sizeof(chunk)) < 0)
+			return -1;
+		sum = bpf_csum_diff(0, 0, (__be32 *)chunk, sizeof(chunk),
+				     (__wsum)sum);
 		if (sum < 0)
 			return -1;
+		processed += FAKETCP_CHECKSUM_CHUNK_BYTES;
 	}
+	if (processed < payload_len) {
+		remaining = payload_len - processed;
+		if (remaining == 0 || remaining > sizeof(chunk))
+			return -1;
+		__builtin_memset(chunk, 0, sizeof(chunk));
+		if (bpf_skb_load_bytes(skb, payload_off + processed, chunk,
+				       remaining) < 0)
+			return -1;
+		sum = bpf_csum_diff(0, 0, (__be32 *)chunk, sizeof(chunk),
+				     (__wsum)sum);
+		if (sum < 0)
+			return -1;
+		processed += remaining;
+	}
+	if (processed != payload_len)
+		return -1;
 	tcp->check = bpf_htons(fold_csum(sum));
 	if (tcp->check == 0)
 		tcp->check = bpf_htons(0xffff);
@@ -594,6 +664,7 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	struct tcphdr tcp = {};
 	__u8 head[FAKETCP_HEADER_DELTA] = {};
 	__u16 old_total_len, new_total_len, udp_len;
+	__be32 source_ipv4, destination_ipv4;
 	__u32 seq;
 
 	if (rule->transport_mode != TRANSPORT_FAKETCP || info->family != FAMILY_IPV4 ||
@@ -627,14 +698,25 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	udp_len = bpf_ntohs(old_udp.len);
 	old_total_len = bpf_ntohs(iph->tot_len);
 	if (udp_len != info->payload_len + sizeof(old_udp) ||
-	    old_total_len > 0xffff - FAKETCP_HEADER_DELTA) {
+	    old_total_len != sizeof(*iph) + udp_len ||
+	    old_total_len > FAKETCP_MAX_CAPTURED_PACKET ||
+	    old_total_len > 0xffff - FAKETCP_HEADER_DELTA ||
+	    info->ip_off > skb->len || old_total_len > skb->len - info->ip_off ||
+	    skb->len > 0xffffffffU - FAKETCP_HEADER_DELTA) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return TC_ACT_SHOT;
 	}
+	if (!faketcp_mtu_allows_growth(skb, old_total_len))
+		return TC_ACT_SHOT;
+	source_ipv4 = iph->saddr;
+	destination_ipv4 = iph->daddr;
 	if (bpf_skb_load_bytes(skb, info->payload_off, head, sizeof(head)) < 0) {
 		inc_stat(STAT_SKB_LOAD_ERROR);
 		return TC_ACT_SHOT;
 	}
+	// Besides extending the packet, this slow-path helper linearizes, unclones
+	// and drops checksum/GSO offload state. The complete TCP checksum below is
+	// rebuilt from packet bytes; old_udp.check is never treated as materialized.
 	if (bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0) < 0) {
 		inc_stat(STAT_SKB_STORE_ERROR);
 		return TC_ACT_SHOT;
@@ -655,8 +737,10 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	tcp.ack = 1;
 	tcp.psh = 1;
 	tcp.window = bpf_htons(session->window ? session->window : 65535);
-	if (faketcp_tcp_checksum_from_materialized_udp(old_udp, &tcp, udp_len,
-						      head, info->payload_len) < 0) {
+	if (faketcp_materialize_tcp_checksum(skb, source_ipv4, destination_ipv4,
+					       &tcp,
+					       info->udp_off + sizeof(tcp),
+					       info->payload_len) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
 		return TC_ACT_SHOT;
 	}
@@ -676,10 +760,9 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		return TC_ACT_SHOT;
 	}
 
-	// Loading this path is gated until CHECKSUM_PARTIAL inspection,
-	// materialization/completion and checksum-metadata reset all pass the real
-	// NIC offload matrix. Do not weaken that gate merely because fully
-	// materialized packet tests pass.
+	// The initial ip_summed state is not observable through __sk_buff, and the
+	// aggregate-GSO path remains unsupported. Keep activation gated until the
+	// real-NIC CHECKSUM_PARTIAL/metadata and per-segment matrices prove them.
 	inc_stat(STAT_EGRESS_REWRITE_OK);
 	inc_faketcp_stat(FAKETCP_STAT_EGRESS_OK);
 	return TC_ACT_OK;

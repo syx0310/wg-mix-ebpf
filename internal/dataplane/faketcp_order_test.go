@@ -9,7 +9,7 @@ import (
 	"testing"
 )
 
-func TestFakeTCPIncrementalTransportChecksumMatchesFullRecompute(t *testing.T) {
+func TestFakeTCPFullTransportChecksumAndIngressInverseMatch(t *testing.T) {
 	for _, payloadLen := range []int{12, 13, 32, 33, 1419, 1420, 1421, 1451, 1452} {
 		t.Run(strconv.Itoa(payloadLen), func(t *testing.T) {
 			payload := make([]byte, payloadLen)
@@ -40,13 +40,17 @@ func TestFakeTCPIncrementalTransportChecksumMatchesFullRecompute(t *testing.T) {
 			newWords[1] = 6
 			binary.BigEndian.PutUint16(newWords[2:4], uint16(len(tcp)+len(payload)))
 			copy(newWords[4:], tcp)
-			gotTCP := replaceChecksumFolded(udpChecksum, oldWords, newWords)
-			if payloadLen&1 != 0 {
-				gotTCP = replaceChecksumFolded(gotTCP, alignedRotationHead(payload[:12]), shiftedRotationHead(payload[:12]))
+			// The BPF encoder intentionally ignores the incoming UDP checksum:
+			// it may be a complete value, a CHECKSUM_PARTIAL pseudo-header seed,
+			// or IPv4 zero. All three states must produce the same materialized
+			// TCP checksum from pseudo-header + TCP header + complete payload.
+			for _, oldUDPChecksum := range []uint16{udpChecksum, 0x9a7b, 0} {
+					gotTCP := materializeFakeTCPTCPChecksumModel(oldUDPChecksum, tcp, wirePayload)
+					if gotTCP != wantTCP {
+						t.Fatalf("old UDP checksum %#04x: materialized TCP checksum = %#04x, want %#04x", oldUDPChecksum, gotTCP, wantTCP)
+					}
 			}
-			if gotTCP != wantTCP {
-				t.Fatalf("incremental TCP checksum = %#04x, full recompute = %#04x", gotTCP, wantTCP)
-			}
+			gotTCP := wantTCP
 
 			gotUDP := replaceChecksumFolded(gotTCP, newWords, oldWords)
 			if payloadLen&1 != 0 {
@@ -57,6 +61,43 @@ func TestFakeTCPIncrementalTransportChecksumMatchesFullRecompute(t *testing.T) {
 			}
 		})
 	}
+}
+
+func materializeFakeTCPTCPChecksumModel(_ uint16, tcp, wirePayload []byte) uint16 {
+	return testTransportChecksum(6, tcp, wirePayload)
+}
+
+func TestFakeTCPMTUMinusHeaderDeltaBoundary(t *testing.T) {
+	const underlayMTU = 1500
+	tests := []struct {
+		name       string
+		inputL3Len int
+		want       bool
+	}{
+		{name: "exact-minus-twelve", inputL3Len: 1488, want: true},
+		{name: "one-over-boundary", inputL3Len: 1489, want: false},
+		{name: "ordinary-wireguard", inputL3Len: 1420, want: true},
+		{name: "invalid-too-short", inputL3Len: 27, want: false},
+		{name: "prototype-frame-cap", inputL3Len: 2305, want: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			got := fakeTCPMTUAllowsGrowth(test.inputL3Len, underlayMTU)
+			if got != test.want {
+				t.Fatalf("input L3=%d mtu=%d allowed=%v, want %v", test.inputL3Len, underlayMTU, got, test.want)
+			}
+		})
+	}
+}
+
+func fakeTCPMTUAllowsGrowth(inputL3Len, underlayMTU int) bool {
+	const (
+		minimumIPv4UDP = 20 + 8
+		headerDelta    = 12
+		packetCap      = 2304
+	)
+	return inputL3Len >= minimumIPv4UDP && inputL3Len <= packetCap &&
+		underlayMTU >= headerDelta && inputL3Len <= underlayMTU-headerDelta
 }
 
 func testTransportChecksum(protocol byte, header, payload []byte) uint16 {
@@ -186,7 +227,9 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 		"!faketcp_metadata_valid(skb, generation)",
 		"faketcp_capture_first_packet(skb, info, rule, &key)",
 		"record_len = sizeof(record->event) + packet_len",
-		"faketcp_tcp_checksum_from_materialized_udp",
+		"faketcp_materialize_tcp_checksum",
+		"bpf_check_mtu(skb, 0, &mtu_len, FAKETCP_HEADER_DELTA, 0)",
+		"bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)",
 	} {
 		if !strings.Contains(tc, want) && !strings.Contains(fake, want) {
 			t.Fatalf("FakeTCP pipeline source missing %q", want)
@@ -214,6 +257,76 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 	typeWord := strings.Index(egress, "update_type_word(skb, &info, old_wire, new_wire, 1)")
 	if preflight < 0 || typeWord < 0 || preflight >= typeWord {
 		t.Fatal("FakeTCP first-packet capture must precede type-word and XOR mutation")
+	}
+}
+
+func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+
+	preflightStart := strings.Index(text, "static __always_inline int faketcp_preflight_egress")
+	checksumCommentStart := strings.Index(text, "// TC's public __sk_buff ABI")
+	checksumStart := strings.Index(text, "static __always_inline int faketcp_materialize_tcp_checksum")
+	encoderStart := strings.Index(text, "static __always_inline int faketcp_encode_established")
+	continuationStart := strings.Index(text, "static __always_inline int faketcp_continue_egress")
+	if preflightStart < 0 || checksumCommentStart < 0 || checksumStart < 0 || encoderStart < 0 || continuationStart < 0 ||
+		preflightStart >= checksumCommentStart || checksumCommentStart >= checksumStart ||
+		checksumStart >= encoderStart || encoderStart >= continuationStart {
+		t.Fatal("FakeTCP preflight/checksum/encoder sections are missing or malformed")
+	}
+
+	preflight := text[preflightStart:checksumCommentStart]
+	gsoReject := strings.Index(preflight, "if (skb->gso_segs || skb->gso_size)")
+	flowLookup := strings.Index(preflight, "faketcp_tc_key(skb, info, generation, &key)")
+	if gsoReject < 0 || flowLookup < 0 || gsoReject >= flowLookup {
+		t.Fatal("aggregate GSO must be rejected before flow lookup, capture, type-word and XOR mutation")
+	}
+	for _, want := range []string{
+		"One header insertion cannot provide",
+		"not an implementation of per-segment FakeTCP",
+		"FAKETCP_STAT_GSO_REJECT",
+	} {
+		if !strings.Contains(preflight, want) {
+			t.Fatalf("GSO hard-gate contract missing %q", want)
+		}
+	}
+
+	materialize := text[checksumCommentStart:encoderStart]
+	for _, want := range []string{
+		"does not expose ip_summed, csum_start or",
+		"The old UDP checksum is deliberately ignored",
+		"struct faketcp_ipv4_pseudo_header pseudo",
+		"for (int i = 0; i < FAKETCP_CHECKSUM_CHUNK_COUNT; i++)",
+		"bpf_skb_load_bytes(skb, payload_off + processed",
+		"__builtin_memset(chunk, 0, sizeof(chunk))",
+		"processed != payload_len",
+	} {
+		if !strings.Contains(materialize, want) {
+			t.Fatalf("full-checksum materialization contract missing %q", want)
+		}
+	}
+	if strings.Contains(materialize, "old_udp") {
+		t.Fatal("full TCP checksum materialization must not consume the old UDP checksum or seed")
+	}
+
+	encoder := text[encoderStart:continuationStart]
+	mtuCheck := strings.Index(encoder, "faketcp_mtu_allows_growth(skb, old_total_len)")
+	normalize := strings.Index(encoder, "bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)")
+	checksum := strings.Index(encoder, "faketcp_materialize_tcp_checksum(skb")
+	if mtuCheck < 0 || normalize < 0 || checksum < 0 || mtuCheck >= normalize || normalize >= checksum {
+		t.Fatal("MTU check, checksum-state normalization and full recompute are out of order")
+	}
+	for _, want := range []string{
+		"old_total_len != sizeof(*iph) + udp_len",
+		"old_total_len > FAKETCP_MAX_CAPTURED_PACKET",
+		"old_total_len > skb->len - info->ip_off",
+	} {
+		if !strings.Contains(encoder, want) {
+			t.Fatalf("bounded checksum read precondition missing %q", want)
+		}
 	}
 }
 
