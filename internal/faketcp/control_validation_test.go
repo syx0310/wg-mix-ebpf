@@ -193,7 +193,7 @@ func buildIPv4TCPControl(flow abi.FakeTCPSessionKey, state abi.FakeTCPSessionVal
 
 func setIPv4Checksum(packet []byte) {
 	packet[10], packet[11] = 0, 0
-	binary.BigEndian.PutUint16(packet[10:12], ^foldChecksumSum(checksumSum(0, packet[:20])))
+	binary.BigEndian.PutUint16(packet[10:12], finishChecksum(addChecksumBytes(0, packet[:20])))
 }
 
 func setTCPChecksum(packet []byte) {
@@ -202,7 +202,7 @@ func setTCPChecksum(packet []byte) {
 	copy(pseudo[:8], packet[12:20])
 	pseudo[9] = 6
 	binary.BigEndian.PutUint16(pseudo[10:12], uint16(len(packet)-20))
-	sum := checksumSum(0, pseudo[:])
-	sum = checksumSum(sum, packet[20:])
-	binary.BigEndian.PutUint16(packet[36:38], ^foldChecksumSum(sum))
+	sum := addChecksumBytes(0, pseudo[:])
+	sum = addChecksumBytes(sum, packet[20:])
+	binary.BigEndian.PutUint16(packet[36:38], finishChecksum(sum))
 }
