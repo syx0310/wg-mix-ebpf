@@ -497,6 +497,40 @@ validate_owned_path() {
   fi
 }
 
+create_lifecycle_lease() {
+  local resolved
+
+  validate_owned_path "${LIFECYCLE_LEASE}" || return 1
+  if [[ -e "${LIFECYCLE_LEASE}" || -L "${LIFECYCLE_LEASE}" ]]; then
+    echo "error: lifecycle lease path already exists: ${LIFECYCLE_LEASE}" >&2
+    return 1
+  fi
+  if ! (set -o noclobber; : >"${LIFECYCLE_LEASE}"); then
+    echo "error: could not exclusively create lifecycle lease: ${LIFECYCLE_LEASE}" >&2
+    return 1
+  fi
+  if ! chmod 0600 "${LIFECYCLE_LEASE}"; then
+    echo "error: could not seal lifecycle lease mode: ${LIFECYCLE_LEASE}" >&2
+    return 1
+  fi
+  if [[ ! -f "${LIFECYCLE_LEASE}" || -L "${LIFECYCLE_LEASE}" ||
+    "$(stat -c '%u' -- "${LIFECYCLE_LEASE}")" != "${EUID}" ||
+    "$(stat -c '%a' -- "${LIFECYCLE_LEASE}")" != "600" ||
+    "$(stat -c '%h' -- "${LIFECYCLE_LEASE}")" != "1" ]]; then
+    echo "error: invalid lifecycle lease metadata: ${LIFECYCLE_LEASE}" >&2
+    return 1
+  fi
+  if ! resolved="$(realpath -e -- "${LIFECYCLE_LEASE}")"; then
+    echo "error: could not resolve lifecycle lease: ${LIFECYCLE_LEASE}" >&2
+    return 1
+  fi
+  if [[ "${resolved}" != "${LIFECYCLE_LEASE}" ||
+    "${resolved}" != "${RUN_BASE}/"* ]]; then
+    echo "error: lifecycle lease escaped run root: ${LIFECYCLE_LEASE} -> ${resolved}" >&2
+    return 1
+  fi
+}
+
 marker_payload() {
   local role="$1"
 
@@ -1371,6 +1405,7 @@ write_marker "${TMPDIR}" evidence
 write_marker "${SECRET_DIR}" secrets
 write_marker "${PIN_LOCK_ROOT}" pin-locks
 write_marker "${PIN_OWNER_ROOT}" pin-owners
+create_lifecycle_lease
 if [[ ! "${NETNS_AUTH_TOKEN}" =~ ^[0-9a-f]{64}$ ]]; then
   echo "error: failed to generate a canonical anonymous netns authentication token" >&2
   exit 1

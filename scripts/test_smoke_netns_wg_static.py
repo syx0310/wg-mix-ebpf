@@ -3,6 +3,7 @@ import hashlib
 import json
 import pathlib
 import shlex
+import stat
 import subprocess
 import tempfile
 import textwrap
@@ -1012,6 +1013,122 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertLess(lock_marker, seal)
         self.assertLess(owner_marker, seal)
         self.assertLess(seal, first_reload)
+
+    def test_lifecycle_lease_is_explicitly_created_before_consumers(self) -> None:
+        function_start = self.source.index("create_lifecycle_lease() {")
+        function_end = self.source.index("\nmarker_payload() {", function_start)
+        function = self.source[function_start:function_end]
+        for gate in (
+            'validate_owned_path "${LIFECYCLE_LEASE}"',
+            '[[ -e "${LIFECYCLE_LEASE}" || -L "${LIFECYCLE_LEASE}" ]]',
+            '(set -o noclobber; : >"${LIFECYCLE_LEASE}")',
+            'chmod 0600 "${LIFECYCLE_LEASE}"',
+            '[[ ! -f "${LIFECYCLE_LEASE}" || -L "${LIFECYCLE_LEASE}" ||',
+            'stat -c \'%u\'',
+            'stat -c \'%a\'',
+            'stat -c \'%h\'',
+            'realpath -e -- "${LIFECYCLE_LEASE}"',
+            '"${resolved}" != "${RUN_BASE}/"*',
+        ):
+            self.assertIn(gate, function)
+        self.assertLess(
+            function.index('validate_owned_path "${LIFECYCLE_LEASE}"'),
+            function.index('(set -o noclobber; : >"${LIFECYCLE_LEASE}")'),
+        )
+        self.assertNotIn("touch ", function)
+
+        initialization = self.source[
+            self.source.index('PHASE="create-owned-run-root"') :
+            self.source.index('PHASE="mount-private-bpffs"')
+        ]
+        create = initialization.index("\ncreate_lifecycle_lease\n")
+        for marker in (
+            'write_marker "${RUN_BASE}" root',
+            'write_marker "${PIN_LOCK_ROOT}" pin-locks',
+            'write_marker "${PIN_OWNER_ROOT}" pin-owners',
+        ):
+            self.assertLess(initialization.index(marker), create)
+        manifest = self.source.index(
+            '(set -o noclobber; manifest_payload >"${MANIFEST}")'
+        )
+        first_agent = self.source.index(
+            'run_agent_in_netns "${NSA}" "${PINA}" reload'
+        )
+        create_absolute = self.source.index("\ncreate_lifecycle_lease\n")
+        self.assertLess(create_absolute, manifest)
+        self.assertLess(create_absolute, first_agent)
+
+        holder_open_start = self.holder_source.index(
+            "lease_fd, lease_metadata = open_verified_file("
+        )
+        holder_open = self.holder_source[
+            holder_open_start : self.holder_source.index(
+                "\n        try:", holder_open_start
+            )
+        ]
+        self.assertIn("os.O_RDWR", holder_open)
+        self.assertNotIn("os.O_CREAT", holder_open)
+
+    def test_lifecycle_lease_creation_unprivileged_fixture(self) -> None:
+        if not pathlib.Path("/proc/self").exists():
+            self.skipTest("lifecycle lease fixture requires Linux coreutils")
+
+        functions = self.source[
+            self.source.index("validate_owned_path() {") :
+            self.source.index("\nmarker_payload() {")
+        ]
+        harness = "\n".join(
+            (
+                "set -euo pipefail",
+                'RUN_BASE="$1"',
+                'LIFECYCLE_LEASE="${RUN_BASE}/lifecycle.lease"',
+                functions,
+                "create_lifecycle_lease",
+            )
+        )
+
+        def invoke(run_base: pathlib.Path) -> subprocess.CompletedProcess[bytes]:
+            return subprocess.run(
+                ["/bin/bash", "-c", harness, "lease-fixture", str(run_base)],
+                check=False,
+                capture_output=True,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = pathlib.Path(temporary_directory).resolve()
+
+            success_root = temporary / "success"
+            success_root.mkdir(mode=0o700)
+            success = invoke(success_root)
+            self.assertEqual(success.returncode, 0, success.stderr)
+            lease = success_root / "lifecycle.lease"
+            metadata = lease.lstat()
+            self.assertTrue(stat.S_ISREG(metadata.st_mode))
+            self.assertFalse(lease.is_symlink())
+            self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+            self.assertEqual(metadata.st_uid, success_root.stat().st_uid)
+            self.assertEqual(metadata.st_nlink, 1)
+            self.assertEqual(lease.resolve(strict=True), lease)
+
+            existing_root = temporary / "existing"
+            existing_root.mkdir(mode=0o700)
+            existing = existing_root / "lifecycle.lease"
+            existing.write_bytes(b"do-not-clobber\n")
+            rejected_existing = invoke(existing_root)
+            self.assertNotEqual(rejected_existing.returncode, 0)
+            self.assertEqual(existing.read_bytes(), b"do-not-clobber\n")
+
+            symlink_root = temporary / "symlink"
+            symlink_root.mkdir(mode=0o700)
+            target = symlink_root / "target"
+            target.write_bytes(b"do-not-follow\n")
+            symlink = symlink_root / "lifecycle.lease"
+            symlink.symlink_to(target.name)
+            rejected_symlink = invoke(symlink_root)
+            self.assertNotEqual(rejected_symlink.returncode, 0)
+            self.assertTrue(symlink.is_symlink())
+            self.assertEqual(target.read_bytes(), b"do-not-follow\n")
 
     def test_private_bpffs_mountinfo_awk_accepts_positive_fixture(self) -> None:
         start_marker = '-v expected_source="${BPFFS_SOURCE}" \'\n'
