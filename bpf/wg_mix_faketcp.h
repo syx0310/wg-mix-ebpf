@@ -742,6 +742,14 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	payload_len = tcp_len - sizeof(*tcp);
 	flags = faketcp_tcp_flags(tcp);
 	seq = bpf_ntohl(tcp->seq);
+	// The current ring ABI does not carry the complete TCP packet, so
+	// userspace cannot independently prove checksum and receive-window state.
+	// Until the BPF validator capability is implemented, close controls must
+	// never be emitted as session-deletion authority.
+	if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return XDP_DROP;
+	}
 	key.generation = generation;
 	key.local_ipv4 = iph->daddr;
 	key.remote_ipv4 = iph->saddr;
@@ -773,8 +781,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 		return XDP_DROP;
 	}
 	old_tcp = *tcp;
-	if (old_tcp.check == 0 ||
-	    bpf_xdp_load_bytes(xdp, off + total_len - FAKETCP_HEADER_DELTA,
+	if (bpf_xdp_load_bytes(xdp, off + total_len - FAKETCP_HEADER_DELTA,
 			       tail, sizeof(tail)) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
 		return XDP_DROP;

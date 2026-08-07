@@ -310,16 +310,24 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 }
 
 func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, error) {
-	return e.inbound(flow, seg, 0)
+	return e.inbound(flow, seg, 0, nil)
 }
 
 // InboundWithWGID preserves the listener identity carried by the BPF event so
 // retries and replies are sent through the same configured WireGuard path.
 func (e *Engine) InboundWithWGID(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) ([]Action, error) {
-	return e.inbound(flow, seg, wgID)
+	return e.inbound(flow, seg, wgID, nil)
 }
 
-func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) ([]Action, error) {
+// InboundValidatedControl is the only path that may remove an established
+// session in response to peer RST/FIN. The opaque value can only be produced
+// by ValidateIPv4TCPControl from the complete packet and the exact BPF-owned
+// session snapshot used for its sequence/window checks.
+func (e *Engine) InboundValidatedControl(control ValidatedControl, wgID uint32) ([]Action, error) {
+	return e.inbound(control.flow, control.segment, wgID, &control)
+}
+
+func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32, validated *ValidatedControl) ([]Action, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.validateFlow(flow); err != nil {
@@ -344,12 +352,18 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) (
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-close"}}, nil
 		}
 		if s.state == abi.FakeTCPStateEstablished {
+			if validated == nil || validated.flow != flow || validated.segment != seg {
+				return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
+			}
 			value, found, err := e.lookupEstablished(flow, s)
 			if err != nil {
 				return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
 			}
 			if found {
-				deleted, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, value)
+				if value != validated.session {
+					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
+				}
+				deleted, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, validated.session)
 				if err != nil {
 					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
 				}

@@ -267,3 +267,24 @@ func TestFakeTCPEstablishedMapCannotLRUEvictUnderSYNPressure(t *testing.T) {
 		}
 	}
 }
+
+func TestFakeTCPCloseControlsCannotAuthorizeDeleteBeforeBPFValidation(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	xdpStart := strings.Index(text, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
+	if xdpStart < 0 {
+		t.Fatal("FakeTCP XDP entry point is missing")
+	}
+	xdp := text[xdpStart:]
+	closeDrop := strings.Index(xdp, "if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN))")
+	firstEvent := strings.Index(xdp, "faketcp_emit_event")
+	if closeDrop < 0 || firstEvent < 0 || closeDrop >= firstEvent {
+		t.Fatal("RST/FIN can reach the ring before the unavailable BPF checksum/window validator")
+	}
+	if strings.Contains(xdp, "old_tcp.check == 0") {
+		t.Fatal("TCP checksum field zero is not independently invalid")
+	}
+}
