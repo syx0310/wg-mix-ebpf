@@ -214,7 +214,7 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.source.index("\nstart_netns_anchor() {")
         ]
         self.assertIn(
-            'audit_netns_argv start "${left_ns}<->${right_ns}" pending',
+            'start "${left_ns}<->${right_ns}" pending "${command[@]}"',
             veth,
         )
         self.assertIn('audit_netns_argv finish \\\n', veth)
@@ -225,14 +225,62 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
     ) -> None:
         wrapper = self.source[
             self.source.index(
-                "run_wg_set_with_private_key_in_owned_netns() {"
+                "produce_held_private_key() {"
             ) :
             self.source.index("\nrun_bounded_in_owned_netns() {")
         ]
-        self.assertIn('cat <"${private_key_file}" |', wrapper)
+        self.assertIn('exec {private_key_fd}<"${private_key_file}"', wrapper)
+        self.assertIn('exec 0<&"${private_key_fd}"', wrapper)
+        self.assertGreaterEqual(wrapper.count('exec {private_key_fd}<&-'), 3)
+        self.assertIn(
+            '"${private_key_fd}" == "${NETNS_ANCHOR_IMAGE_FD}"',
+            wrapper,
+        )
+        self.assertIn('produce_held_private_key "${private_key_fd}"', wrapper)
+        self.assertIn("  ) | (\n", wrapper)
         self.assertIn("private-key /dev/stdin", wrapper)
         self.assertNotIn('cat "${private_key_file}"', wrapper)
         self.assertNotIn('private-key "${private_key_file}"', wrapper)
+        self.assertNotIn("eval ", wrapper)
+        self.assertNotIn("sh -c", wrapper)
+        self.assertNotIn("trap ", wrapper)
+        producer = wrapper[
+            wrapper.index("produce_held_private_key() {") :
+            wrapper.index("\nrun_wg_set_from_stdin_in_owned_netns() {")
+        ]
+        self.assertLess(
+            producer.index('exec 0<&"${private_key_fd}"'),
+            producer.index('exec {private_key_fd}<&-'),
+        )
+        self.assertLess(
+            producer.index('exec {private_key_fd}<&-'),
+            producer.index("env -u XOR_PASSWORD cat"),
+        )
+        consumer = wrapper[
+            wrapper.index("run_wg_set_from_stdin_in_owned_netns() {") :
+            wrapper.index(
+                "\nrun_wg_set_with_private_key_in_owned_netns() {"
+            )
+        ]
+        self.assertLess(
+            consumer.index('exec {private_key_fd}<&-'),
+            consumer.index("run_in_owned_netns"),
+        )
+        orchestrator = wrapper[
+            wrapper.index(
+                "run_wg_set_with_private_key_in_owned_netns() {"
+            ) :
+        ]
+        self.assertLess(
+            orchestrator.index(
+                'exec {private_key_fd}<"${private_key_file}"'
+            ),
+            orchestrator.index('produce_held_private_key "${private_key_fd}"'),
+        )
+        self.assertLess(
+            orchestrator.index('produce_held_private_key "${private_key_fd}"'),
+            orchestrator.rindex('exec {private_key_fd}<&-'),
+        )
         self.assertNotIn(
             'private-key "${SECRET_DIR}/',
             self.source,
@@ -247,6 +295,14 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertNotIn("Stdin = nil", run_exec)
 
     def test_private_key_pipeline_preserves_stdin_rc_and_redaction(self) -> None:
+        dynamic_fd_probe = subprocess.run(
+            ["/bin/bash", "-c", "exec {probe_fd}</dev/null"],
+            check=False,
+            capture_output=True,
+        )
+        if dynamic_fd_probe.returncode != 0:
+            self.skipTest("private-key pipeline requires Bash dynamic FDs")
+
         audit_functions = self.source[
             self.source.index("print_redacted_netns_argv() {") :
             self.source.index("\nset_netns_client_args() {")
@@ -254,12 +310,12 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         run_function = self.source[
             self.source.index("run_in_owned_netns() {") :
             self.source.index(
-                "\nrun_wg_set_with_private_key_in_owned_netns() {"
+                "\nproduce_held_private_key() {"
             )
         ]
         private_key_function = self.source[
             self.source.index(
-                "run_wg_set_with_private_key_in_owned_netns() {"
+                "produce_held_private_key() {"
             ) :
             self.source.index("\nrun_bounded_in_owned_netns() {")
         ]
@@ -270,6 +326,10 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             key_path = temporary / "input.key"
             key_path.write_bytes(private_key)
             key_path.chmod(0o600)
+            occupied_path = temporary / "caller-fd-9"
+            occupied_path.write_text("caller-fd-9-marker\n", encoding="ascii")
+            anchor_fd_path = temporary / "anchor-held-fd"
+            anchor_fd_path.write_text("anchor-held-fd-marker\n", encoding="ascii")
 
             producer = temporary / "cat"
             producer.write_text(
@@ -283,10 +343,29 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
                     import stat
                     import sys
 
+                    def describe_fds():
+                        records = []
+                        for name in os.listdir("/dev/fd"):
+                            if not name.isdigit():
+                                continue
+                            descriptor = int(name)
+                            try:
+                                metadata = os.fstat(descriptor)
+                            except OSError:
+                                continue
+                            records.append({
+                                "fd": descriptor,
+                                "device": metadata.st_dev,
+                                "inode": metadata.st_ino,
+                                "regular": stat.S_ISREG(metadata.st_mode),
+                            })
+                        return records
+
                     payload = sys.stdin.buffer.read()
                     record = {
                         "argv": sys.argv,
                         "environment": dict(os.environ),
+                        "fds": describe_fds(),
                         "stdin_is_regular": stat.S_ISREG(os.fstat(0).st_mode),
                         "payload_sha256": hashlib.sha256(payload).hexdigest(),
                         "payload_size": len(payload),
@@ -312,9 +391,28 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
                     import stat
                     import sys
 
+                    def describe_fds():
+                        records = []
+                        for name in os.listdir("/dev/fd"):
+                            if not name.isdigit():
+                                continue
+                            descriptor = int(name)
+                            try:
+                                metadata = os.fstat(descriptor)
+                            except OSError:
+                                continue
+                            records.append({
+                                "fd": descriptor,
+                                "device": metadata.st_dev,
+                                "inode": metadata.st_ino,
+                                "regular": stat.S_ISREG(metadata.st_mode),
+                            })
+                        return records
+
                     record = {
                         "argv": sys.argv,
                         "environment": dict(os.environ),
+                        "fds": describe_fds(),
                         "stdin_is_fifo": stat.S_ISFIFO(os.fstat(0).st_mode),
                     }
                     pathlib.Path(os.environ["TEST_CAPTURE_DIR"], "anchor.json").write_text(
@@ -341,6 +439,24 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
                     import stat
                     import sys
 
+                    def describe_fds():
+                        records = []
+                        for name in os.listdir("/dev/fd"):
+                            if not name.isdigit():
+                                continue
+                            descriptor = int(name)
+                            try:
+                                metadata = os.fstat(descriptor)
+                            except OSError:
+                                continue
+                            records.append({
+                                "fd": descriptor,
+                                "device": metadata.st_dev,
+                                "inode": metadata.st_ino,
+                                "regular": stat.S_ISREG(metadata.st_mode),
+                            })
+                        return records
+
                     source_index = sys.argv.index("private-key") + 1
                     private_key_source = sys.argv[source_index]
                     with open(private_key_source, "rb") as stream:
@@ -349,6 +465,7 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
                     record = {
                         "argv": sys.argv,
                         "environment": dict(os.environ),
+                        "fds": describe_fds(),
                         "private_key_source": private_key_source,
                         "stdin_is_fifo": stdin_is_fifo,
                         "payload_sha256": hashlib.sha256(payload).hexdigest(),
@@ -375,7 +492,8 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
                     "  NETNS_CLIENT_ARGS=(--socket test-socket)",
                     "}",
                     "NETNS_CLIENT_ARGS=()",
-                    "NETNS_ANCHOR_IMAGE_FD=9",
+                    f"exec 9<{shlex.quote(str(occupied_path))}",
+                    f"exec {{NETNS_ANCHOR_IMAGE_FD}}<{shlex.quote(str(anchor_fd_path))}",
                     f"NETNS_ANCHOR_EXEC={shlex.quote(str(anchor))}",
                     "export XOR_PASSWORD=xor-environment-sentinel",
                     "status=0",
@@ -385,7 +503,11 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
                     "else",
                     "  status=$?",
                     "fi",
+                    "IFS= read -r caller_fd_marker <&9",
+                    "IFS= read -r anchor_fd_marker <&\"${NETNS_ANCHOR_IMAGE_FD}\"",
                     f"printf '%s\\n' \"${{status}}\" >{shlex.quote(str(status_path))}",
+                    "printf '%s\\n' \"${caller_fd_marker}\"",
+                    "printf '%s\\n' \"${anchor_fd_marker}\"",
                 )
             )
             completed = subprocess.run(
@@ -401,7 +523,10 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             )
 
             self.assertEqual(completed.returncode, 0, completed.stderr.decode())
-            self.assertEqual(completed.stdout, b"")
+            self.assertEqual(
+                completed.stdout,
+                b"caller-fd-9-marker\nanchor-held-fd-marker\n",
+            )
             self.assertEqual(status_path.read_text(encoding="ascii").strip(), "23")
             producer_record = json.loads(
                 (temporary / "producer.json").read_text(encoding="utf-8")
@@ -423,6 +548,28 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.assertEqual(wg_record["payload_size"], len(private_key))
             self.assertEqual(wg_record["private_key_source"], "/dev/stdin")
 
+            key_metadata = key_path.stat()
+            key_identity = (key_metadata.st_dev, key_metadata.st_ino)
+            caller_metadata = occupied_path.stat()
+            caller_identity = (caller_metadata.st_dev, caller_metadata.st_ino)
+            anchor_metadata = anchor_fd_path.stat()
+            anchor_identity = (anchor_metadata.st_dev, anchor_metadata.st_ino)
+            for record in (anchor_record, wg_record):
+                regular_identities = {
+                    (entry["device"], entry["inode"])
+                    for entry in record["fds"]
+                    if entry["regular"]
+                }
+                self.assertNotIn(key_identity, regular_identities)
+                self.assertIn(caller_identity, regular_identities)
+                self.assertIn(anchor_identity, regular_identities)
+            producer_key_fds = [
+                entry["fd"]
+                for entry in producer_record["fds"]
+                if (entry["device"], entry["inode"]) == key_identity
+            ]
+            self.assertEqual(producer_key_fds, [0])
+
             serialized_records = json.dumps(
                 [producer_record, anchor_record, wg_record], sort_keys=True
             ).encode()
@@ -432,6 +579,8 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
                 self.assertNotIn("XOR_PASSWORD", record["environment"])
 
             stderr = completed.stderr
+            self.assertNotIn(private_key.rstrip(), completed.stdout)
+            self.assertNotIn(str(key_path).encode(), completed.stdout)
             self.assertNotIn(private_key.rstrip(), stderr)
             self.assertNotIn(str(key_path).encode(), stderr)
             self.assertNotIn(b"/dev/stdin", stderr)
@@ -440,6 +589,320 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.assertIn(b"netns=test-ns rc=pending argv=", stderr)
             self.assertIn(b"netns=test-ns rc=23 argv=", stderr)
             self.assertEqual(stderr.count(b"redacted-private-key-source"), 2)
+
+    def test_private_key_open_failure_is_redacted_and_starts_no_rhs(self) -> None:
+        dynamic_fd_probe = subprocess.run(
+            ["/bin/bash", "-c", "exec {probe_fd}</dev/null"],
+            check=False,
+            capture_output=True,
+        )
+        if dynamic_fd_probe.returncode != 0:
+            self.skipTest("private-key open failure requires Bash dynamic FDs")
+
+        audit_functions = self.source[
+            self.source.index("print_redacted_netns_argv() {") :
+            self.source.index("\nset_netns_client_args() {")
+        ]
+        private_key_functions = self.source[
+            self.source.index("produce_held_private_key() {") :
+            self.source.index("\nrun_bounded_in_owned_netns() {")
+        ]
+        private_key = b"private-key-open-failure-sentinel-19d2\n"
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = pathlib.Path(temporary_directory)
+            key_path = temporary / "rlimit-input.key"
+            key_path.write_bytes(private_key)
+            key_path.chmod(0o600)
+            caller_path = temporary / "caller-nine"
+            caller_path.write_text("caller-nine-marker\n", encoding="ascii")
+            anchor_path = temporary / "anchor-held"
+            anchor_path.write_text("anchor-held-marker\n", encoding="ascii")
+            command_sentinel = temporary / "rhs-started"
+
+            harness = "\n".join(
+                (
+                    "set -euo pipefail",
+                    audit_functions,
+                    private_key_functions,
+                    "run_in_owned_netns() {",
+                    f"  printf started >{shlex.quote(str(command_sentinel))}",
+                    "}",
+                    f"exec 9<{shlex.quote(str(caller_path))}",
+                    f"exec {{NETNS_ANCHOR_IMAGE_FD}}<{shlex.quote(str(anchor_path))}",
+                    "ulimit -n 11",
+                    "status=0",
+                    "if run_wg_set_with_private_key_in_owned_netns "
+                    f"test-ns {shlex.quote(str(key_path))} wg0; then",
+                    "  status=0",
+                    "else",
+                    "  status=$?",
+                    "fi",
+                    "IFS= read -r caller_marker <&9",
+                    "IFS= read -r anchor_marker <&\"${NETNS_ANCHOR_IMAGE_FD}\"",
+                    "echo \"${status}:${caller_marker}:${anchor_marker}\"",
+                )
+            )
+            result = subprocess.run(
+                ["/bin/bash", "-c", harness],
+                check=False,
+                capture_output=True,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            fields = result.stdout.decode("ascii").strip().split(":")
+            self.assertNotEqual(fields[0], "0")
+            self.assertEqual(fields[1:], ["caller-nine-marker", "anchor-held-marker"])
+            self.assertFalse(command_sentinel.exists())
+            self.assertNotIn(str(key_path).encode(), result.stderr)
+            self.assertNotIn(private_key.rstrip(), result.stderr)
+            self.assertNotIn(str(key_path).encode(), result.stdout)
+            self.assertNotIn(private_key.rstrip(), result.stdout)
+            self.assertEqual(
+                result.stderr.count(b"private-key input open failure:"),
+                1,
+            )
+            self.assertIn(b"redacted-private-key-source", result.stderr)
+
+    def test_audit_failures_are_fatal_in_all_shell_contexts(self) -> None:
+        run_function = self.source[
+            self.source.index("run_in_owned_netns() {") :
+            self.source.index("\nproduce_held_private_key() {")
+        ]
+        create_veth_function = self.source[
+            self.source.index("create_veth_pair() {") :
+            self.source.index("\nstart_netns_anchor() {")
+        ]
+
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            temporary = pathlib.Path(temporary_directory)
+            anchor = temporary / "anchor-sentinel"
+            anchor.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import os
+                    import pathlib
+
+                    pathlib.Path(os.environ["COMMAND_SENTINEL"]).write_text(
+                        "executed\\n", encoding="ascii"
+                    )
+                    print("anchor-output")
+                    raise SystemExit(int(os.environ["COMMAND_STATUS"]))
+                    """
+                ),
+                encoding="utf-8",
+            )
+            anchor.chmod(0o700)
+
+            common = "\n".join(
+                (
+                    "set -euo pipefail",
+                    run_function,
+                    create_veth_function,
+                    "set_netns_client_args() {",
+                    '  local prefix="${2:-}"',
+                    '  NETNS_CLIENT_ARGS=("--${prefix}socket" test-socket)',
+                    "  return 0",
+                    "}",
+                    "audit_netns_argv() {",
+                    '  local phase="$1"',
+                    '  if [[ "${phase}" == "${AUDIT_FAIL_PHASE}" ]]; then',
+                    '    return "${AUDIT_FAIL_STATUS}"',
+                    "  fi",
+                    "  return 0",
+                    "}",
+                    "NETNS_CLIENT_ARGS=()",
+                    "NETNS_ANCHOR_IMAGE_FD=10",
+                    f"NETNS_ANCHOR_EXEC={shlex.quote(str(anchor))}",
+                    "NSA=test-a",
+                    "NSR=test-r",
+                    "NSB=test-b",
+                    "VETH_A=left-a",
+                    "VETH_RA=right-a",
+                    "VETH_B=left-b",
+                    "VETH_RB=right-b",
+                )
+            )
+
+            start_sentinel = temporary / "start-command"
+            start_harness = "\n".join(
+                (
+                    common,
+                    "AUDIT_FAIL_PHASE=start",
+                    "AUDIT_FAIL_STATUS=71",
+                    "status=0",
+                    "if run_in_owned_netns test-a command-sentinel; then",
+                    "  status=0",
+                    "else",
+                    "  status=$?",
+                    "fi",
+                    "echo \"${status}\"",
+                )
+            )
+            start_result = subprocess.run(
+                ["/bin/bash", "-c", start_harness],
+                check=False,
+                capture_output=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "LC_ALL": "C",
+                    "COMMAND_SENTINEL": str(start_sentinel),
+                    "COMMAND_STATUS": "0",
+                },
+            )
+            self.assertEqual(start_result.returncode, 0, start_result.stderr)
+            self.assertEqual(start_result.stdout, b"71\n")
+            self.assertFalse(start_sentinel.exists())
+
+            pipeline_sentinel = temporary / "pipeline-command"
+            pipeline_harness = "\n".join(
+                (
+                    common,
+                    "AUDIT_FAIL_PHASE=finish",
+                    "AUDIT_FAIL_STATUS=72",
+                    "status=0",
+                    "if echo pipeline-input | "
+                    "run_in_owned_netns test-a command-sentinel; then",
+                    "  status=0",
+                    "else",
+                    "  status=$?",
+                    "fi",
+                    "echo \"${status}\"",
+                )
+            )
+            pipeline_result = subprocess.run(
+                ["/bin/bash", "-c", pipeline_harness],
+                check=False,
+                capture_output=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "LC_ALL": "C",
+                    "COMMAND_SENTINEL": str(pipeline_sentinel),
+                    "COMMAND_STATUS": "23",
+                },
+            )
+            self.assertEqual(pipeline_result.returncode, 0, pipeline_result.stderr)
+            self.assertEqual(pipeline_result.stdout, b"anchor-output\n72\n")
+            self.assertTrue(pipeline_sentinel.is_file())
+
+            substitution_sentinel = temporary / "substitution-command"
+            substitution_harness = "\n".join(
+                (
+                    common,
+                    "AUDIT_FAIL_PHASE=finish",
+                    "AUDIT_FAIL_STATUS=73",
+                    "status=0",
+                    "output=",
+                    "if output=\"$(create_veth_pair "
+                    "left-a test-a right-a test-r)\"; then",
+                    "  status=0",
+                    "else",
+                    "  status=$?",
+                    "fi",
+                    "echo \"${status}:${output}\"",
+                )
+            )
+            substitution_result = subprocess.run(
+                ["/bin/bash", "-c", substitution_harness],
+                check=False,
+                capture_output=True,
+                env={
+                    "PATH": "/usr/bin:/bin",
+                    "LC_ALL": "C",
+                    "COMMAND_SENTINEL": str(substitution_sentinel),
+                    "COMMAND_STATUS": "0",
+                },
+            )
+            self.assertEqual(
+                substitution_result.returncode,
+                0,
+                substitution_result.stderr,
+            )
+            self.assertEqual(
+                substitution_result.stdout,
+                b"73:anchor-output\n",
+            )
+            self.assertTrue(substitution_sentinel.is_file())
+
+    def test_audit_helpers_propagate_internal_failures(self) -> None:
+        audit_functions = self.source[
+            self.source.index("print_redacted_netns_argv() {") :
+            self.source.index("\nset_netns_client_args() {")
+        ]
+
+        cases = {
+            "timestamp": """
+                date() { return 61; }
+                if audit_netns_argv start test-ns pending command; then
+                  status=0
+                else
+                  status=$?
+                fi
+                echo "${status}"
+            """,
+            "redactor": """
+                date() { echo 2026-08-07T00:00:00Z; }
+                print_redacted_netns_argv() { return 62; }
+                if audit_netns_argv finish test-ns 23 command; then
+                  status=0
+                else
+                  status=$?
+                fi
+                echo "${status}"
+            """,
+            "prefix-printf": """
+                date() { echo 2026-08-07T00:00:00Z; }
+                printf() { return 63; }
+                if audit_netns_argv start test-ns pending; then
+                  status=0
+                else
+                  status=$?
+                fi
+                echo "${status}"
+            """,
+            "newline-printf": """
+                date() { echo 2026-08-07T00:00:00Z; }
+                printf_calls=0
+                printf() {
+                  printf_calls=$((printf_calls + 1))
+                  if ((printf_calls == 2)); then
+                    return 64
+                  fi
+                  builtin printf "$@"
+                }
+                if audit_netns_argv finish test-ns 0; then
+                  status=0
+                else
+                  status=$?
+                fi
+                echo "${status}"
+            """,
+        }
+        expected = {
+            "timestamp": b"61\n",
+            "redactor": b"62\n",
+            "prefix-printf": b"63\n",
+            "newline-printf": b"64\n",
+        }
+        for name, body in cases.items():
+            with self.subTest(name=name):
+                harness = "\n".join(
+                    (
+                        "set -euo pipefail",
+                        audit_functions,
+                        textwrap.dedent(body),
+                    )
+                )
+                result = subprocess.run(
+                    ["/bin/bash", "-c", harness],
+                    check=False,
+                    capture_output=True,
+                    env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout, expected[name])
 
     def test_failure_traps_report_only_and_never_mutate_resources(self) -> None:
         failure_report = self.source[

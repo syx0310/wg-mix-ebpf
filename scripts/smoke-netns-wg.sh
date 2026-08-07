@@ -810,24 +810,27 @@ print_redacted_netns_argv() {
 
   for argument in "$@"; do
     if ((redact_next)); then
-      printf '%q ' '<redacted-private-key-source>'
+      printf '%q ' '<redacted-private-key-source>' || return "$?"
       redact_next=0
       continue
     fi
     case "${argument}" in
       private-key)
-        printf '%q ' "${argument}"
+        printf '%q ' "${argument}" || return "$?"
         redact_next=1
         ;;
       private-key=*)
-        printf '%q ' 'private-key=<redacted-private-key-source>'
+        printf '%q ' 'private-key=<redacted-private-key-source>' || return "$?"
         ;;
-      *) printf '%q ' "${argument}" ;;
+      *) printf '%q ' "${argument}" || return "$?" ;;
     esac
   done
+  return 0
 }
 
 audit_netns_argv() {
+  local timestamp
+  local timestamp_status
   local phase="$1"
   local ns="$2"
   local status="$3"
@@ -836,18 +839,49 @@ audit_netns_argv() {
   case "${phase}" in
     start | finish) ;;
     *)
-      echo "error: invalid network namespace audit phase: ${phase}" >&2
+      printf 'error: invalid network namespace audit phase: %s\n' \
+        "${phase}" >&2 || return "$?"
       return 1
       ;;
   esac
   if [[ "${status}" != "pending" && ! "${status}" =~ ^[0-9]+$ ]]; then
-    echo "error: invalid network namespace audit status: ${status}" >&2
+    printf 'error: invalid network namespace audit status: %s\n' \
+      "${status}" >&2 || return "$?"
     return 1
   fi
+  if timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
+    :
+  else
+    timestamp_status=$?
+    printf 'error: failed to obtain network namespace audit timestamp\n' \
+      >&2 || return "$?"
+    return "${timestamp_status}"
+  fi
   printf 'netns command %s: timestamp=%s netns=%q rc=%q argv=' \
-    "${phase}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${ns}" "${status}" >&2
-  print_redacted_netns_argv "$@" >&2
-  printf '\n' >&2
+    "${phase}" "${timestamp}" "${ns}" "${status}" >&2 || return "$?"
+  print_redacted_netns_argv "$@" >&2 || return "$?"
+  printf '\n' >&2 || return "$?"
+  return 0
+}
+
+audit_private_key_open_failure() {
+  local ns="$1"
+  local status="$2"
+  local timestamp
+  local timestamp_status
+
+  if timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
+    :
+  else
+    timestamp_status=$?
+    printf 'error: failed to obtain private-key input audit timestamp\n' \
+      >&2 || return "$?"
+    return "${timestamp_status}"
+  fi
+  printf 'private-key input open failure: timestamp=%s netns=%q rc=%q source=%q\n' \
+    "${timestamp}" "${ns}" "${status}" '<redacted-private-key-source>' \
+    >&2 || return "$?"
+  return 0
 }
 
 set_netns_client_args() {
@@ -946,6 +980,7 @@ validate_all_netns_identities() {
 
 run_in_owned_netns() {
   local ns="$1"
+  local audit_status
   local status
   local command=()
   shift
@@ -962,42 +997,163 @@ run_in_owned_netns() {
     "${NETNS_CLIENT_ARGS[@]}" --
     env -u XOR_PASSWORD "$@"
   )
-  audit_netns_argv start "${ns}" pending "${command[@]}"
+  if audit_netns_argv start "${ns}" pending "${command[@]}"; then
+    :
+  else
+    audit_status=$?
+    return "${audit_status}"
+  fi
   if "${command[@]}"; then
     status=0
   else
     status=$?
   fi
-  audit_netns_argv finish "${ns}" "${status}" "${command[@]}"
+  if audit_netns_argv finish "${ns}" "${status}" "${command[@]}"; then
+    :
+  else
+    audit_status=$?
+    return "${audit_status}"
+  fi
   return "${status}"
+}
+
+produce_held_private_key() {
+  local private_key_fd="$1"
+  local status
+  shift
+
+  if [[ ! "${private_key_fd}" =~ ^[1-9][0-9]*$ || $# -ne 0 ]]; then
+    printf 'error: invalid producer private-key descriptor contract\n' \
+      >&2 || return "$?"
+    return 1
+  fi
+  if exec 0<&"${private_key_fd}"; then
+    :
+  else
+    status=$?
+    printf 'error: failed to duplicate producer private-key descriptor\n' \
+      >&2 || return "$?"
+    return "${status}"
+  fi
+  if exec {private_key_fd}<&-; then
+    :
+  else
+    status=$?
+    printf 'error: failed to close producer private-key descriptor\n' \
+      >&2 || return "$?"
+    return "${status}"
+  fi
+  if env -u XOR_PASSWORD cat; then
+    return 0
+  else
+    return "$?"
+  fi
+}
+
+run_wg_set_from_stdin_in_owned_netns() {
+  local private_key_fd="$1"
+  local ns="$2"
+  local interface="$3"
+  local status
+  shift 3
+
+  if [[ ! "${private_key_fd}" =~ ^[1-9][0-9]*$ ]]; then
+    printf 'error: invalid consumer private-key descriptor contract\n' \
+      >&2 || return "$?"
+    return 1
+  fi
+  if exec {private_key_fd}<&-; then
+    :
+  else
+    status=$?
+    printf 'error: failed to close consumer private-key descriptor\n' \
+      >&2 || return "$?"
+    return "${status}"
+  fi
+  if run_in_owned_netns "${ns}" \
+    wg set "${interface}" private-key /dev/stdin "$@"; then
+    return 0
+  else
+    return "$?"
+  fi
 }
 
 run_wg_set_with_private_key_in_owned_netns() {
   local ns="$1"
   local private_key_file="$2"
   local interface="$3"
+  local audit_status
+  local close_status
+  local open_status
+  local private_key_fd
   local status
   shift 3
 
   if [[ "${interface}" != "wg0" ]]; then
-    echo "error: invalid WireGuard private-key interface" >&2
+    printf 'error: invalid WireGuard private-key interface\n' >&2 || return "$?"
     return 1
   fi
   if [[ ! -f "${private_key_file}" || -L "${private_key_file}" ]]; then
-    echo "error: unsafe WireGuard private-key source" >&2
+    if audit_private_key_open_failure "${ns}" 1; then
+      :
+    else
+      audit_status=$?
+      return "${audit_status}"
+    fi
     return 1
   fi
 
-  # Bash opens the root-only key before any exec-triggered LSM profile change.
-  # The producer receives only that inherited descriptor and writes an anonymous
-  # pipe, so wg's /dev/stdin open cannot resolve back to the protected key path.
-  # shellcheck disable=SC2002
-  if env -u XOR_PASSWORD cat <"${private_key_file}" |
-    run_in_owned_netns "${ns}" \
-      wg set "${interface}" private-key /dev/stdin "$@"; then
+  # Allocate without clobbering caller-owned descriptors. Suppress Bash's
+  # path-bearing open diagnostic and emit only the generic audit on failure.
+  if { exec {private_key_fd}<"${private_key_file}"; } 2>&-; then
+    :
+  else
+    open_status=$?
+    if audit_private_key_open_failure "${ns}" "${open_status}"; then
+      :
+    else
+      audit_status=$?
+      return "${audit_status}"
+    fi
+    return "${open_status}"
+  fi
+  if [[ ! "${private_key_fd}" =~ ^[1-9][0-9]*$ ||
+    "${private_key_fd}" == "${NETNS_ANCHOR_IMAGE_FD}" ]]; then
+    if exec {private_key_fd}<&-; then
+      :
+    else
+      close_status=$?
+      printf 'error: failed to close invalid private-key descriptor\n' \
+        >&2 || return "$?"
+      return "${close_status}"
+    fi
+    printf 'error: invalid allocated private-key descriptor identity\n' \
+      >&2 || return "$?"
+    return 1
+  fi
+
+  # The producer gets the pre-opened key as stdin, then both sides close the
+  # direct descriptor before exec. Only the anonymous pipe reaches anchor/wg,
+  # across an AppArmor or other exec-triggered LSM profile transition.
+  if (
+    produce_held_private_key "${private_key_fd}"
+  ) | (
+    run_wg_set_from_stdin_in_owned_netns \
+      "${private_key_fd}" "${ns}" "${interface}" "$@"
+  ); then
     status=0
   else
     status=$?
+  fi
+  if exec {private_key_fd}<&-; then
+    close_status=0
+  else
+    close_status=$?
+    printf 'error: failed to close parent private-key descriptor\n' \
+      >&2 || return "$?"
+  fi
+  if ((close_status != 0)); then
+    return "${close_status}"
   fi
   return "${status}"
 }
@@ -1032,6 +1188,7 @@ create_veth_pair() {
   local right_ns="$4"
   local left_args=()
   local right_args=()
+  local audit_status
   local status
   local command=()
 
@@ -1056,14 +1213,25 @@ create_veth_pair() {
     --left-link "${left_link}"
     --right-link "${right_link}"
   )
-  audit_netns_argv start "${left_ns}<->${right_ns}" pending "${command[@]}"
+  if audit_netns_argv \
+    start "${left_ns}<->${right_ns}" pending "${command[@]}"; then
+    :
+  else
+    audit_status=$?
+    return "${audit_status}"
+  fi
   if "${command[@]}"; then
     status=0
   else
     status=$?
   fi
-  audit_netns_argv finish \
-    "${left_ns}<->${right_ns}" "${status}" "${command[@]}"
+  if audit_netns_argv finish \
+    "${left_ns}<->${right_ns}" "${status}" "${command[@]}"; then
+    :
+  else
+    audit_status=$?
+    return "${audit_status}"
+  fi
   return "${status}"
 }
 
