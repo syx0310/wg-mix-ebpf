@@ -595,12 +595,25 @@ func createVethPairOnDedicatedThread(
 	result := make(chan error, 1)
 	go func() {
 		runtime.LockOSThread()
-		// Deliberately do not call runtime.UnlockOSThread. Once setns succeeds,
-		// this OS thread belongs to the isolated left namespace. The documented
-		// LockOSThread contract terminates a locked thread when its goroutine
-		// returns without unlocking it, so it can never re-enter the Go thread
-		// pool carrying that namespace.
-		result <- createVethPairInExactLeftNamespace(
+		originalFD, err := unix.Open(
+			"/proc/thread-self/ns/net",
+			unix.O_RDONLY|unix.O_CLOEXEC,
+			0,
+		)
+		if err != nil {
+			runtime.UnlockOSThread()
+			result <- fmt.Errorf("open original worker network namespace: %w", err)
+			return
+		}
+		originalIdentity, err := validateNetworkNamespaceFD(originalFD)
+		if err != nil {
+			_ = unix.Close(originalFD)
+			runtime.UnlockOSThread()
+			result <- fmt.Errorf("validate original worker network namespace: %w", err)
+			return
+		}
+
+		workErr := createVethPairInExactLeftNamespace(
 			leftLink,
 			rightLink,
 			leftFD,
@@ -608,6 +621,37 @@ func createVethPairOnDedicatedThread(
 			expectedLeft,
 			operations,
 		)
+		restoreErr := operations.setNamespace(originalFD, unix.CLONE_NEWNET)
+		restored := false
+		if restoreErr != nil {
+			restoreErr = fmt.Errorf("restore original worker network namespace: %w", restoreErr)
+		} else {
+			observed, identityErr := operations.currentNamespaceIdentity()
+			if identityErr != nil {
+				restoreErr = fmt.Errorf(
+					"inspect restored worker network namespace: %w",
+					identityErr,
+				)
+			} else if identityErr = verifyIdentity(observed, originalIdentity); identityErr != nil {
+				restoreErr = fmt.Errorf(
+					"restored worker network namespace: %w",
+					identityErr,
+				)
+			} else {
+				restored = true
+			}
+		}
+		closeErr := unix.Close(originalFD)
+		if restored {
+			// Only a descriptor-bound restore followed by identity verification
+			// permits this M to return to the Go scheduler. On any restore failure
+			// the goroutine exits while still locked, so the runtime retires the M.
+			runtime.UnlockOSThread()
+		}
+		if closeErr != nil {
+			closeErr = fmt.Errorf("close original worker network namespace: %w", closeErr)
+		}
+		result <- errors.Join(workErr, restoreErr, closeErr)
 	}()
 	return <-result
 }

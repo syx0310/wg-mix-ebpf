@@ -4,13 +4,9 @@ package netnsanchor
 
 import (
 	"errors"
-	"fmt"
-	"os"
 	"runtime"
-	"strconv"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
@@ -30,10 +26,8 @@ func (handle *recordingVethLinkHandle) Close() {
 }
 
 type vethThreadObservation struct {
-	stage     string
-	tid       int
-	startTime uint64
-	startErr  error
+	stage string
+	tid   int
 }
 
 func testVethClient(role string) clientFlags {
@@ -268,7 +262,7 @@ func TestCreateVethPairRejectsCurrentNamespaceIdentityMismatch(t *testing.T) {
 	}
 }
 
-func TestCreateVethPairDedicatedThreadTerminatesWithoutChangingCaller(
+func TestCreateVethPairDedicatedThreadRestoresNamespaceWithoutChangingCaller(
 	t *testing.T,
 ) {
 	runtime.LockOSThread()
@@ -282,17 +276,13 @@ func TestCreateVethPairDedicatedThreadTerminatesWithoutChangingCaller(
 
 	var observations []vethThreadObservation
 	record := func(stage string) {
-		tid := unix.Gettid()
-		startTime, startErr := threadTaskStartTime(tid)
 		observations = append(observations, vethThreadObservation{
-			stage:     stage,
-			tid:       tid,
-			startTime: startTime,
-			startErr:  startErr,
+			stage: stage,
+			tid:   unix.Gettid(),
 		})
 	}
-	setDescriptor := -1
-	setNamespaceType := -1
+	var setDescriptors []int
+	var setNamespaceTypes []int
 	handle := &recordingVethLinkHandle{
 		add: func(netlink.Link) error {
 			record("link-add")
@@ -308,8 +298,8 @@ func TestCreateVethPairDedicatedThreadTerminatesWithoutChangingCaller(
 		callerIdentityBefore,
 		vethPairThreadOperations{
 			setNamespace: func(descriptor int, namespaceType int) error {
-				setDescriptor = descriptor
-				setNamespaceType = namespaceType
+				setDescriptors = append(setDescriptors, descriptor)
+				setNamespaceTypes = append(setNamespaceTypes, namespaceType)
 				record("setns")
 				return nil
 			},
@@ -326,15 +316,26 @@ func TestCreateVethPairDedicatedThreadTerminatesWithoutChangingCaller(
 	if err != nil {
 		t.Fatalf("run dedicated-thread veth wrapper: %v", err)
 	}
-	if setDescriptor != 41 || setNamespaceType != unix.CLONE_NEWNET {
+	if len(setDescriptors) != 2 ||
+		setDescriptors[0] != 41 ||
+		setDescriptors[1] < 0 ||
+		len(setNamespaceTypes) != 2 ||
+		setNamespaceTypes[0] != unix.CLONE_NEWNET ||
+		setNamespaceTypes[1] != unix.CLONE_NEWNET {
 		t.Fatalf(
-			"setns arguments = (%d, %#x), want (41, %#x)",
-			setDescriptor,
-			setNamespaceType,
-			unix.CLONE_NEWNET,
+			"setns arguments = descriptors:%v types:%v, want enter 41 then restore an original namespace FD",
+			setDescriptors,
+			setNamespaceTypes,
 		)
 	}
-	wantStages := []string{"setns", "identity", "new-handle", "link-add"}
+	wantStages := []string{
+		"setns",
+		"identity",
+		"new-handle",
+		"link-add",
+		"setns",
+		"identity",
+	}
 	if len(observations) != len(wantStages) {
 		t.Fatalf(
 			"dedicated-thread observations = %+v, want stages %v",
@@ -343,7 +344,6 @@ func TestCreateVethPairDedicatedThreadTerminatesWithoutChangingCaller(
 		)
 	}
 	workerTID := observations[0].tid
-	workerStartTime := observations[0].startTime
 	if workerTID <= 0 || workerTID == callerTID {
 		t.Fatalf(
 			"dedicated worker TID = %d, caller TID = %d",
@@ -352,24 +352,14 @@ func TestCreateVethPairDedicatedThreadTerminatesWithoutChangingCaller(
 		)
 	}
 	for index, observation := range observations {
-		if observation.startErr != nil {
-			t.Fatalf(
-				"observation[%d] could not identify worker task: %v",
-				index,
-				observation.startErr,
-			)
-		}
 		if observation.stage != wantStages[index] ||
-			observation.tid != workerTID ||
-			observation.startTime == 0 ||
-			observation.startTime != workerStartTime {
+			observation.tid != workerTID {
 			t.Fatalf(
-				"observation[%d] = %+v, want stage %q on task %d:%d",
+				"observation[%d] = %+v, want stage %q on TID %d",
 				index,
 				observation,
 				wantStages[index],
 				workerTID,
-				workerStartTime,
 			)
 		}
 	}
@@ -392,75 +382,42 @@ func TestCreateVethPairDedicatedThreadTerminatesWithoutChangingCaller(
 			callerIdentityAfter,
 		)
 	}
-	waitForThreadTaskExit(t, workerTID, workerStartTime, 2*time.Second)
 }
 
-func waitForThreadTaskExit(
-	t *testing.T,
-	tid int,
-	expectedStartTime uint64,
-	timeout time.Duration,
-) {
-	t.Helper()
-	if tid <= 0 || expectedStartTime == 0 || timeout <= 0 {
-		t.Fatalf(
-			"invalid thread exit wait contract: task=%d:%d timeout=%s",
-			tid,
-			expectedStartTime,
-			timeout,
-		)
-	}
-	deadline := time.Now().Add(timeout)
-	for {
-		observedStartTime, err := threadTaskStartTime(tid)
-		if errors.Is(err, os.ErrNotExist) {
-			return
-		}
-		if err != nil {
-			t.Fatalf("inspect dedicated thread task %d: %v", tid, err)
-		}
-		// Linux may recycle a TID immediately under concurrent package-test load.
-		// A task with the same numeric TID but a different procfs start time is
-		// not the locked namespace thread whose termination this test awaits.
-		if observedStartTime != expectedStartTime {
-			return
-		}
-		if !time.Now().Before(deadline) {
-			t.Fatalf(
-				"dedicated locked thread %d still exists after %s",
-				tid,
-				timeout,
-			)
-		}
-		runtime.Gosched()
-	}
-}
-
-func threadTaskStartTime(tid int) (uint64, error) {
-	if tid <= 0 {
-		return 0, errors.New("thread task ID must be positive")
-	}
-	stat, err := os.ReadFile("/proc/self/task/" + strconv.Itoa(tid) + "/stat")
+func TestCreateVethPairDedicatedThreadFailsClosedOnRestoreError(t *testing.T) {
+	originalIdentity, err := currentThreadNetworkNamespaceIdentity()
 	if err != nil {
-		return 0, err
+		t.Fatalf("inspect original test network namespace: %v", err)
 	}
-	// Field 2 is a parenthesized command and may contain spaces or ')'. Split
-	// after its final closing delimiter; field 22 (starttime) is then index 19.
-	commandEnd := strings.LastIndex(string(stat), ") ")
-	if commandEnd < 0 {
-		return 0, errors.New("thread task stat has no command delimiter")
+	restoreFailure := errors.New("injected namespace restore failure")
+	setCalls := 0
+	handle := &recordingVethLinkHandle{
+		add:   func(netlink.Link) error { return nil },
+		close: func() {},
 	}
-	fields := strings.Fields(string(stat[commandEnd+2:]))
-	const startTimeIndex = 19
-	if len(fields) <= startTimeIndex {
-		return 0, errors.New("thread task stat is missing starttime")
+	err = createVethPairOnDedicatedThread(
+		"wma012345670",
+		"wmr01234567a",
+		41,
+		42,
+		originalIdentity,
+		vethPairThreadOperations{
+			setNamespace: func(int, int) error {
+				setCalls++
+				if setCalls == 2 {
+					return restoreFailure
+				}
+				return nil
+			},
+			currentNamespaceIdentity: func() (Identity, error) {
+				return originalIdentity, nil
+			},
+			newLinkHandle: func() (vethLinkHandle, error) {
+				return handle, nil
+			},
+		},
+	)
+	if !errors.Is(err, restoreFailure) || setCalls != 2 {
+		t.Fatalf("restore failure result = calls:%d err:%v", setCalls, err)
 	}
-	startTime, err := strconv.ParseUint(fields[startTimeIndex], 10, 64)
-	if err != nil {
-		return 0, fmt.Errorf("parse thread task starttime %q: %w", fields[startTimeIndex], err)
-	}
-	if startTime == 0 {
-		return 0, errors.New("thread task starttime is zero")
-	}
-	return startTime, nil
 }
