@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import hashlib
 import pathlib
+import subprocess
 import unittest
 
 
@@ -55,6 +56,68 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
                 any(fragment in line for fragment in allowed),
                 f"line {number} reads or propagates XOR_PASSWORD: {line}",
             )
+
+    def test_source_commit_is_resolved_from_source_root(self) -> None:
+        helper = self.source[
+            self.source.index("source_commit_from_root() {") :
+            self.source.index(
+                '\nif [[ "${1-}" == "--self-test-source-commit-cwd" ]]'
+            )
+        ]
+        self.assertIn('builtin cd -- "${ROOT}"', helper)
+        self.assertIn('"${SOURCE_COMMIT_HELPER}"', helper)
+        self.assertIn(
+            'EXPECTED_SOURCE_COMMIT="$(source_commit_from_root)"',
+            self.source,
+        )
+        self.assertLess(
+            self.source.index('if [[ "${1-}" == "--self-test-source-commit-cwd" ]]'),
+            self.source.index('if [[ "${EUID}" -ne 0 ]]'),
+        )
+
+    def test_absolute_script_resolves_commit_from_unrelated_cwd(self) -> None:
+        repository = SCRIPT_PATH.parent.parent.resolve()
+        git_environment = {
+            "PATH": "/usr/bin:/bin",
+            "LC_ALL": "C",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_OPTIONAL_LOCKS": "0",
+        }
+        status = subprocess.run(
+            [
+                "/usr/bin/git",
+                "-C",
+                str(repository),
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=normal",
+                "--ignore-submodules=none",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=git_environment,
+        )
+        if status.stdout:
+            self.skipTest("source-commit behavior requires a clean repository")
+        expected = subprocess.run(
+            ["/usr/bin/git", "-C", str(repository), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=git_environment,
+        ).stdout.strip()
+        completed = subprocess.run(
+            [str(SCRIPT_PATH.resolve()), "--self-test-source-commit-cwd"],
+            cwd="/",
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.strip(), expected)
 
     def test_plaintext_shell_variable_is_dropped_after_secret_file_write(self) -> None:
         write = self.source.index(

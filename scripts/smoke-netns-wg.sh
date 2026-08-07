@@ -1,11 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-if [[ "${EUID}" -ne 0 ]]; then
-  echo "error: run as root" >&2
-  exit 1
-fi
-
 XOR_SECRET="${XOR_PASSWORD-}"
 unset XOR_PASSWORD
 XOR_ENABLED=0
@@ -19,6 +14,28 @@ NETNS_ANCHOR_HELPER="${ROOT}/bin/wg-mix-ebpf-netns-anchor"
 SOURCE_COMMIT_HELPER="${ROOT}/scripts/source-commit.sh"
 LIFECYCLE_HOLDER_HELPER="${ROOT}/scripts/hold-isolated-lifecycle-lease.py"
 IPERF_CHECKER_HELPER="${ROOT}/scripts/check-iperf3-tcp.py"
+
+source_commit_from_root() {
+  (
+    builtin cd -- "${ROOT}"
+    "${SOURCE_COMMIT_HELPER}"
+  )
+}
+
+if [[ "${1-}" == "--self-test-source-commit-cwd" ]]; then
+  if (($# != 1)); then
+    echo "error: --self-test-source-commit-cwd accepts no other arguments" >&2
+    exit 2
+  fi
+  source_commit_from_root
+  exit 0
+fi
+
+if [[ "${EUID}" -ne 0 ]]; then
+  echo "error: run as root" >&2
+  exit 1
+fi
+
 OUTER_FAMILY="${OUTER_FAMILY:-ipv4}"
 XOR_SCOPE="${XOR_SCOPE:-wg-payload-full}"
 XOR_MAX_BYTES="${XOR_MAX_BYTES:-2048}"
@@ -269,7 +286,7 @@ if [[ ! -x "${SOURCE_COMMIT_HELPER}" || -L "${SOURCE_COMMIT_HELPER}" ]]; then
   echo "error: missing fixed source commit helper: ${SOURCE_COMMIT_HELPER}" >&2
   exit 1
 fi
-EXPECTED_SOURCE_COMMIT="$("${SOURCE_COMMIT_HELPER}")"
+EXPECTED_SOURCE_COMMIT="$(source_commit_from_root)"
 MAIN_SOURCE_COMMIT="$(
   env -u XOR_PASSWORD "${BIN}" version --json |
     python3 -c 'import json, sys; print(json.load(sys.stdin).get("source_commit", ""))'
