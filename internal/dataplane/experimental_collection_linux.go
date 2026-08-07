@@ -182,6 +182,19 @@ func (owner *experimentalCollectionOwner) Close() error {
 	return err
 }
 
+// isClosed reports whether Close has completed. It deliberately does not
+// expose the retained close error: ownership combinators use it only to avoid
+// calling an idempotent owner a second time and duplicating that same cached
+// error in a larger errors.Join chain.
+func (owner *experimentalCollectionOwner) isClosed() bool {
+	if owner == nil {
+		return true
+	}
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	return owner.closed
+}
+
 func (owner *experimentalCollectionOwner) closeAndReleaseProof() (
 	*experimentalCollectionReleaseProof,
 	error,

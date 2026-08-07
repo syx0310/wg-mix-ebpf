@@ -269,6 +269,18 @@ func (transaction *fakeTCPPolicyGenerationTransaction) Close() error {
 	return transaction.closeForRuntimeClaim(nil)
 }
 
+// isClosed reports whether the transaction has irreversibly consumed its
+// retained lifecycle lease. Factory cleanup uses this only to distinguish a
+// builder-owned terminal path from a pre-claim path which it must close.
+func (transaction *fakeTCPPolicyGenerationTransaction) isClosed() bool {
+	if transaction == nil {
+		return true
+	}
+	transaction.mu.Lock()
+	defer transaction.mu.Unlock()
+	return transaction.closed
+}
+
 func (claim *fakeTCPPolicyRuntimeBuildClaim) Close() error {
 	if claim == nil || claim.transaction == nil {
 		return nil
