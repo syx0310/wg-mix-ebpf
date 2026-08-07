@@ -11,7 +11,7 @@ EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 override BUILD_SOURCE_COMMIT := $(shell ./scripts/source-commit.sh)
 override BUILD_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/buildinfo.sourceCommit=$(BUILD_SOURCE_COMMIT)
 
-.PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-bpf-object-manifests test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=$(CGO_ENABLED) $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -46,6 +46,11 @@ build-faketcp-experimental-bpf:
 	@mkdir -p $(dir $(FAKETCP_EXPERIMENTAL_BPF_OBJECT))
 	$(CLANG) $(BPF_CFLAGS) -DWG_MIX_EXPERIMENTAL_FAKETCP=1 \
 		-c bpf/wg_mix_tc.c -o $(FAKETCP_EXPERIMENTAL_BPF_OBJECT)
+
+test-bpf-object-manifests: build-bpf build-faketcp-experimental-bpf
+	WG_MIX_BASELINE_MANIFEST_OBJECT="$(BPF_OBJECT)" \
+	WG_MIX_FAKETCP_MANIFEST_OBJECT="$(FAKETCP_EXPERIMENTAL_BPF_OBJECT)" \
+	CGO_ENABLED=0 $(GO) test ./internal/dataplane -run '^TestBuiltBPFObjectManifests$$' -count=1
 
 prepare-embedded-bpf: build-bpf
 	@mkdir -p $(dir $(EMBEDDED_BPF_OBJECT))

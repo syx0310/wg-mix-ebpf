@@ -1746,28 +1746,104 @@ func validateAndSetPinnedMaps(spec *ebpf.CollectionSpec) error {
 	return nil
 }
 
-// validateBaselineCollectionSpec is the loader boundary between the stable
-// UDP/ICMP object and the separately built FakeTCP experiment. It runs before
-// memlock changes, map creation, pinning or attachment, so an experimental
-// object can never be supplied to the production loader by path override.
+type baselineProgramDescriptor struct {
+	name        string
+	sectionName string
+	programType ebpf.ProgramType
+}
+
+func baselineMapDescriptors() []pinnedMapDescriptor {
+	descriptors := append([]pinnedMapDescriptor(nil), pinnedMapDescriptors()...)
+	return append(descriptors, pinnedMapDescriptor{
+		name: "icmp_seq_map", mapType: ebpf.LRUHash,
+		keySize: 24, valueSize: 16, maxEntries: 2048,
+	})
+}
+
+func baselineProgramDescriptors() []baselineProgramDescriptor {
+	descriptors := []baselineProgramDescriptor{
+		{name: "wg_mix_egress", sectionName: "classifier/egress", programType: ebpf.SchedCLS},
+		{name: "wg_mix_ingress", sectionName: "classifier/ingress", programType: ebpf.SchedCLS},
+	}
+	for index := 0; index < xorSegmentCount; index++ {
+		descriptors = append(descriptors,
+			baselineProgramDescriptor{
+				name: fmt.Sprintf("wg_xor_eg_%d", index), sectionName: fmt.Sprintf("classifier/xor_egress/%d", index), programType: ebpf.SchedCLS,
+			},
+			baselineProgramDescriptor{
+				name: fmt.Sprintf("wg_xor_in_%d", index), sectionName: fmt.Sprintf("classifier/xor_ingress/%d", index), programType: ebpf.SchedCLS,
+			},
+		)
+	}
+	return descriptors
+}
+
+// validateBaselineCollectionSpec is the exact schema manifest at the loader
+// boundary between the stable UDP/ICMP object and every other ELF object. It
+// runs before memlock changes, map creation, pinning or attachment. Names that
+// merely avoid the word "faketcp" cannot bypass the map/program allowlist.
 func validateBaselineCollectionSpec(spec *ebpf.CollectionSpec) error {
 	if spec == nil {
 		return errors.New("baseline BPF collection spec is nil")
 	}
-	for name, mapSpec := range spec.Maps {
-		if mapSpec == nil {
-			return fmt.Errorf("BPF object map %q has a nil spec", name)
-		}
-		if isFakeTCPObjectSymbol(name) || isFakeTCPObjectSymbol(mapSpec.Name) {
-			return fmt.Errorf("baseline BPF object contains experimental FakeTCP map %q", name)
+	mapManifest := baselineMapDescriptors()
+	wantedMaps := make(map[string]pinnedMapDescriptor, len(mapManifest))
+	for _, descriptor := range mapManifest {
+		wantedMaps[descriptor.name] = descriptor
+	}
+	var unexpectedMaps []string
+	for name := range spec.Maps {
+		if _, ok := wantedMaps[name]; !ok {
+			unexpectedMaps = append(unexpectedMaps, name)
 		}
 	}
-	for name, programSpec := range spec.Programs {
-		if programSpec == nil {
-			return fmt.Errorf("BPF object program %q has a nil spec", name)
+	if len(unexpectedMaps) != 0 {
+		sort.Strings(unexpectedMaps)
+		return fmt.Errorf("baseline BPF object has unexpected maps outside its manifest: %s", strings.Join(unexpectedMaps, ", "))
+	}
+	for _, descriptor := range mapManifest {
+		mapSpec := spec.Maps[descriptor.name]
+		if mapSpec == nil {
+			return fmt.Errorf("baseline BPF object missing required map %q", descriptor.name)
 		}
-		if isFakeTCPObjectSymbol(name) || isFakeTCPObjectSymbol(programSpec.Name) {
-			return fmt.Errorf("baseline BPF object contains experimental FakeTCP program %q", name)
+		if err := validatePinnedMapSpec(descriptor, mapSpec); err != nil {
+			return fmt.Errorf("baseline map manifest: %w", err)
+		}
+		if mapSpec.Pinning != ebpf.PinNone {
+			return fmt.Errorf("baseline map manifest: BPF map %q unexpectedly requests pinning mode %d", descriptor.name, mapSpec.Pinning)
+		}
+	}
+
+	programManifest := baselineProgramDescriptors()
+	wantedPrograms := make(map[string]baselineProgramDescriptor, len(programManifest))
+	for _, descriptor := range programManifest {
+		wantedPrograms[descriptor.name] = descriptor
+	}
+	var unexpectedPrograms []string
+	for name := range spec.Programs {
+		if _, ok := wantedPrograms[name]; !ok {
+			unexpectedPrograms = append(unexpectedPrograms, name)
+		}
+	}
+	if len(unexpectedPrograms) != 0 {
+		sort.Strings(unexpectedPrograms)
+		return fmt.Errorf("baseline BPF object has unexpected programs outside its manifest: %s", strings.Join(unexpectedPrograms, ", "))
+	}
+	for _, descriptor := range programManifest {
+		programSpec := spec.Programs[descriptor.name]
+		if programSpec == nil {
+			return fmt.Errorf("baseline BPF object missing required program %q", descriptor.name)
+		}
+		if programSpec.Name != descriptor.name || programSpec.SectionName != descriptor.sectionName || programSpec.Type != descriptor.programType {
+			return fmt.Errorf(
+				"baseline BPF program %q schema is kernel_name=%q section=%q type=%s, want kernel_name=%q section=%q type=%s",
+				descriptor.name, programSpec.Name, programSpec.SectionName, programSpec.Type,
+				descriptor.name, descriptor.sectionName, descriptor.programType,
+			)
+		}
+		if programSpec.Ifindex != 0 || programSpec.AttachType != ebpf.AttachNone || programSpec.AttachTo != "" ||
+			programSpec.AttachTarget != nil || programSpec.Flags != 0 || programSpec.KernelVersion != 0 {
+			return fmt.Errorf("baseline BPF program %q has unsupported attach/load metadata", descriptor.name)
 		}
 	}
 	return nil

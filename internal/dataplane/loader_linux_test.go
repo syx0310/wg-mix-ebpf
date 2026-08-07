@@ -222,14 +222,14 @@ func TestValidateBaselineCollectionSpecRejectsExperimentalFakeTCPObject(t *testi
 			mutate: func(spec *ebpf.CollectionSpec) {
 				spec.Maps["faketcp_session_map"] = &ebpf.MapSpec{Name: "faketcp_session_map"}
 			},
-			wantErr: "experimental FakeTCP map",
+			wantErr: "unexpected maps outside its manifest",
 		},
 		{
 			name: "map kernel name",
 			mutate: func(spec *ebpf.CollectionSpec) {
 				spec.Maps["hidden"] = &ebpf.MapSpec{Name: "faketcp_events"}
 			},
-			wantErr: "experimental FakeTCP map",
+			wantErr: "unexpected maps outside its manifest",
 		},
 		{
 			name: "program key",
@@ -238,7 +238,7 @@ func TestValidateBaselineCollectionSpecRejectsExperimentalFakeTCPObject(t *testi
 					"wg_mix_faketcp_ingress": {Name: "hidden"},
 				}
 			},
-			wantErr: "experimental FakeTCP program",
+			wantErr: "unexpected programs outside its manifest",
 		},
 		{
 			name: "program kernel name",
@@ -247,7 +247,42 @@ func TestValidateBaselineCollectionSpecRejectsExperimentalFakeTCPObject(t *testi
 					"hidden": {Name: "wg_faketcp_egress"},
 				}
 			},
-			wantErr: "experimental FakeTCP program",
+			wantErr: "unexpected programs outside its manifest",
+		},
+		{
+			name: "innocuous extra map",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Maps["unreviewed_cache"] = &ebpf.MapSpec{Name: "unreviewed_cache"}
+			},
+			wantErr: "unexpected maps outside its manifest",
+		},
+		{
+			name: "missing map",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				delete(spec.Maps, "icmp_seq_map")
+			},
+			wantErr: "missing required map",
+		},
+		{
+			name: "unpinned map schema",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Maps["icmp_seq_map"].Type = ebpf.Hash
+			},
+			wantErr: "baseline map manifest",
+		},
+		{
+			name: "missing program",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				delete(spec.Programs, "wg_mix_ingress")
+			},
+			wantErr: "missing required program",
+		},
+		{
+			name: "program schema",
+			mutate: func(spec *ebpf.CollectionSpec) {
+				spec.Programs["wg_mix_ingress"].Type = ebpf.XDP
+			},
+			wantErr: "program \"wg_mix_ingress\" schema",
 		},
 	}
 	for _, tt := range tests {
@@ -1323,7 +1358,8 @@ func newTestBPFFS(t *testing.T) (string, pinPathValidator) {
 
 func canonicalPinnedMapCollectionSpec() *ebpf.CollectionSpec {
 	spec := &ebpf.CollectionSpec{
-		Maps: make(map[string]*ebpf.MapSpec),
+		Maps:     make(map[string]*ebpf.MapSpec),
+		Programs: make(map[string]*ebpf.ProgramSpec),
 	}
 	for _, descriptor := range pinnedMapDescriptors() {
 		spec.Maps[descriptor.name] = &ebpf.MapSpec{
@@ -1341,6 +1377,13 @@ func canonicalPinnedMapCollectionSpec() *ebpf.CollectionSpec {
 		KeySize:    24,
 		ValueSize:  16,
 		MaxEntries: 2048,
+	}
+	for _, descriptor := range baselineProgramDescriptors() {
+		spec.Programs[descriptor.name] = &ebpf.ProgramSpec{
+			Name:        descriptor.name,
+			Type:        descriptor.programType,
+			SectionName: descriptor.sectionName,
+		}
 	}
 	return spec
 }
