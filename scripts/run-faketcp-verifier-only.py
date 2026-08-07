@@ -31,6 +31,7 @@ STAGING_PREFIX = "/run/wg-mix-ebpf-faketcp-verifier"
 CHILD_PATH = "/usr/sbin:/usr/bin:/sbin:/bin"
 LOAD_TIMEOUT_SECONDS = 45.0
 TERM_GRACE_SECONDS = 5.0
+KILL_REAP_SECONDS = 5.0
 BINARY_EXEC_FD = 100
 OBJECT_EXEC_FD = 101
 RESERVED_ENV_PREFIX = "WG_MIX_FAKETCP_VERIFIER_"
@@ -317,6 +318,9 @@ def require_held_runner_descriptor(
     expected_owner: Tuple[int, int] = (0, 0),
     descriptor_prefix: str = "/proc/self/fd",
 ) -> ArtifactIdentity:
+    # Defense-in-depth only: the independently approved Go launcher establishes
+    # the initial trust boundary before this Python source can execute.  Code
+    # cannot establish its own initial trust merely by hashing itself here.
     require_sha256_text(expected_sha256, "runner")
     match = re.fullmatch(re.escape(descriptor_prefix) + r"/([1-9][0-9]*)", source_path)
     if match is None:
@@ -567,14 +571,37 @@ def wait_until(
 
 
 def signal_process_group(pid: int, signal_number: int, killpg_function=os.killpg) -> None:
-    try:
-        killpg_function(pid, signal_number)
-    except ProcessLookupError:
-        return
-    except OSError as error:
-        if error.errno == errno.ESRCH:
+    while True:
+        try:
+            killpg_function(pid, signal_number)
             return
-        raise
+        except InterruptedError:
+            continue
+        except ProcessLookupError:
+            return
+        except OSError as error:
+            if error.errno == errno.EINTR:
+                continue
+            if error.errno == errno.ESRCH:
+                return
+            raise
+
+
+def signal_process(pid: int, signal_number: int, kill_function=os.kill) -> None:
+    while True:
+        try:
+            kill_function(pid, signal_number)
+            return
+        except InterruptedError:
+            continue
+        except ProcessLookupError:
+            return
+        except OSError as error:
+            if error.errno == errno.EINTR:
+                continue
+            if error.errno == errno.ESRCH:
+                return
+            raise
 
 
 def reap_blocking(pid: int, waitpid_function=os.waitpid) -> Optional[int]:
@@ -596,35 +623,132 @@ def reap_blocking(pid: int, waitpid_function=os.waitpid) -> Optional[int]:
         raise GateError("blocking waitpid returned an unexpected child")
 
 
+def sleep_until(
+    deadline: float,
+    monotonic_function=time.monotonic,
+    sleep_function=time.sleep,
+) -> None:
+    while True:
+        remaining = deadline - monotonic_function()
+        if remaining <= 0:
+            return
+        sleep_function(min(0.05, remaining))
+
+
+def kill_group_and_reap(
+    pid: int,
+    waitpid_function=os.waitpid,
+    killpg_function=os.killpg,
+    kill_function=os.kill,
+    reap_timeout_seconds: float = KILL_REAP_SECONDS,
+    monotonic_function=time.monotonic,
+    sleep_function=time.sleep,
+) -> None:
+    group_kill_error: Optional[BaseException] = None
+    try:
+        signal_process_group(pid, signal.SIGKILL, killpg_function)
+    except BaseException as error:
+        group_kill_error = error
+
+    leader_kill_error: Optional[BaseException] = None
+    if group_kill_error is not None:
+        try:
+            signal_process(pid, signal.SIGKILL, kill_function)
+        except BaseException as error:
+            leader_kill_error = error
+
+    done, _ = wait_until(
+        pid,
+        monotonic_function() + reap_timeout_seconds,
+        waitpid_function,
+        monotonic_function,
+        sleep_function,
+    )
+    if not done:
+        if leader_kill_error is not None:
+            raise GateError(
+                "process-group and leader SIGKILL failed; leader was not reaped "
+                "within the fixed cleanup deadline"
+            ) from group_kill_error
+        raise GateError(
+            "leader was not reaped within the fixed post-SIGKILL cleanup deadline"
+        ) from group_kill_error
+    if group_kill_error is not None:
+        if leader_kill_error is not None:
+            raise GateError(
+                "process-group SIGKILL and leader SIGKILL both failed"
+            ) from group_kill_error
+        raise group_kill_error
+
+
 def wait_with_timeout(
     pid: int,
     timeout_seconds: float,
     grace_seconds: float,
     waitpid_function=os.waitpid,
     killpg_function=os.killpg,
+    kill_function=os.kill,
     monotonic_function=time.monotonic,
     sleep_function=time.sleep,
+    kill_reap_seconds: float = KILL_REAP_SECONDS,
 ) -> int:
-    done, status_value = wait_until(
-        pid,
-        monotonic_function() + timeout_seconds,
-        waitpid_function,
-        monotonic_function,
-        sleep_function,
-    )
+    try:
+        done, status_value = wait_until(
+            pid,
+            monotonic_function() + timeout_seconds,
+            waitpid_function,
+            monotonic_function,
+            sleep_function,
+        )
+    except BaseException as wait_error:
+        try:
+            kill_group_and_reap(
+                pid,
+                waitpid_function,
+                killpg_function,
+                kill_function,
+                kill_reap_seconds,
+                monotonic_function,
+                sleep_function,
+            )
+        except BaseException as cleanup_error:
+            raise cleanup_error from wait_error
+        raise
     if done:
         return status_return_code(status_value) if status_value is not None else 125
-    signal_process_group(pid, signal.SIGTERM, killpg_function)
-    done, _ = wait_until(
-        pid,
-        monotonic_function() + grace_seconds,
-        waitpid_function,
-        monotonic_function,
-        sleep_function,
-    )
-    if not done:
-        signal_process_group(pid, signal.SIGKILL, killpg_function)
-        reap_blocking(pid, waitpid_function)
+
+    # Once the deadline expires, the leader deliberately remains unreaped until
+    # the original process group has received its final SIGKILL.  A zombie still
+    # reserves its PID/PGID, so a fast-exiting leader cannot let the identifier be
+    # reused while an ignore-SIGTERM descendant remains in the group.
+    timeout_error: Optional[BaseException] = None
+    try:
+        signal_process_group(pid, signal.SIGTERM, killpg_function)
+        sleep_until(
+            monotonic_function() + grace_seconds,
+            monotonic_function,
+            sleep_function,
+        )
+    except BaseException as error:
+        timeout_error = error
+
+    try:
+        kill_group_and_reap(
+            pid,
+            waitpid_function,
+            killpg_function,
+            kill_function,
+            kill_reap_seconds,
+            monotonic_function,
+            sleep_function,
+        )
+    except BaseException as cleanup_error:
+        if timeout_error is not None:
+            raise cleanup_error from timeout_error
+        raise
+
+    if timeout_error is not None:
+        raise timeout_error
     return 124
 
 
@@ -666,7 +790,14 @@ def run_descriptor_child(
             os._exit(126)
     os.close(ready_write)
     try:
-        ready = read_ready_byte(ready_read)
+        try:
+            ready = read_ready_byte(ready_read)
+        except BaseException as ready_error:
+            try:
+                kill_group_and_reap(pid)
+            except BaseException as cleanup_error:
+                raise cleanup_error from ready_error
+            raise
     finally:
         os.close(ready_read)
     if ready != b"R":

@@ -159,6 +159,7 @@ class VerifierGateTest(unittest.TestCase):
         self.assertTrue(policy.verify_descriptor_identity)
         self.assertEqual(policy.timeout_seconds, 45.0)
         self.assertEqual(policy.term_grace_seconds, 5.0)
+        self.assertEqual(runner.KILL_REAP_SECONDS, 5.0)
 
     def test_production_entry_requires_isolated_python(self) -> None:
         self.assertTrue(sys.flags.isolated)
@@ -209,6 +210,11 @@ class VerifierGateTest(unittest.TestCase):
                 )
         finally:
             os.close(descriptor)
+
+    def test_runner_self_check_is_explicitly_defense_in_depth(self) -> None:
+        source = pathlib.Path(RUNNER_PATH).read_text(encoding="utf-8")
+        self.assertIn("Defense-in-depth only", source)
+        self.assertIn("cannot establish its own initial trust", source)
 
     def test_hostname_and_kernel_mismatch_are_rejected(self) -> None:
         _, _, _, policy = self.new_layout("system-identity")
@@ -479,21 +485,30 @@ exit 0
             ),
             124,
         )
-        self.assertEqual(signals, [(4322, signal.SIGTERM)])
+        self.assertEqual(
+            signals,
+            [(4322, signal.SIGTERM), (4322, signal.SIGKILL)],
+        )
 
     def test_timeout_term_and_kill_esrch_still_returns_124(self) -> None:
         nonblocking_calls = 0
         signals = []
+        group_killed = False
 
         def fake_waitpid(pid, flags):
             nonlocal nonblocking_calls
             if flags == os.WNOHANG:
                 nonblocking_calls += 1
+                if group_killed:
+                    raise ChildProcessError()
                 return 0, 0
             raise ChildProcessError()
 
         def missing_group(pid, signal_number):
+            nonlocal group_killed
             signals.append((pid, signal_number))
+            if signal_number == signal.SIGKILL:
+                group_killed = True
             raise OSError(errno.ESRCH, "no such process group")
 
         self.assertEqual(
@@ -512,6 +527,220 @@ exit 0
         self.assertEqual(
             signals,
             [(4323, signal.SIGTERM), (4323, signal.SIGKILL)],
+        )
+
+    def test_timeout_keeps_leader_unreaped_until_group_kill(self) -> None:
+        events = []
+        group_killed = False
+
+        def fake_waitpid(pid, flags):
+            events.append(("wait", pid, flags))
+            if flags == os.WNOHANG:
+                if group_killed:
+                    return pid, 0
+                return 0, 0
+            raise AssertionError("blocking waitpid is forbidden")
+
+        def fake_killpg(pid, signal_number):
+            nonlocal group_killed
+            events.append(("signal", pid, signal_number))
+            if signal_number == signal.SIGKILL:
+                group_killed = True
+
+        def fake_sleep(_duration):
+            events.append(("sleep",))
+
+        clock = iter((0.0, 0.0, 0.0, 0.0, 0.05, 0.05))
+        self.assertEqual(
+            runner.wait_with_timeout(
+                4325,
+                0.0,
+                0.05,
+                waitpid_function=fake_waitpid,
+                killpg_function=fake_killpg,
+                monotonic_function=lambda: next(clock),
+                sleep_function=fake_sleep,
+            ),
+            124,
+        )
+        self.assertEqual(
+            events,
+            [
+                ("wait", 4325, os.WNOHANG),
+                ("signal", 4325, signal.SIGTERM),
+                ("sleep",),
+                ("signal", 4325, signal.SIGKILL),
+                ("wait", 4325, os.WNOHANG),
+            ],
+        )
+
+    def test_timeout_exception_still_kills_group_and_reaps_leader(self) -> None:
+        events = []
+        group_killed = False
+
+        def fake_waitpid(pid, flags):
+            events.append(("wait", pid, flags))
+            if flags == os.WNOHANG:
+                if group_killed:
+                    return pid, 0
+                return 0, 0
+            raise AssertionError("blocking waitpid is forbidden")
+
+        def fake_killpg(pid, signal_number):
+            nonlocal group_killed
+            events.append(("signal", pid, signal_number))
+            if signal_number == signal.SIGKILL:
+                group_killed = True
+
+        def failing_sleep(_duration):
+            events.append(("sleep",))
+            raise RuntimeError("injected grace failure")
+
+        clock = iter((0.0, 0.0, 0.0, 0.0, 0.0))
+        with self.assertRaisesRegex(RuntimeError, "injected grace failure"):
+            runner.wait_with_timeout(
+                4326,
+                0.0,
+                0.1,
+                waitpid_function=fake_waitpid,
+                killpg_function=fake_killpg,
+                monotonic_function=lambda: next(clock),
+                sleep_function=failing_sleep,
+            )
+        self.assertEqual(
+            events,
+            [
+                ("wait", 4326, os.WNOHANG),
+                ("signal", 4326, signal.SIGTERM),
+                ("sleep",),
+                ("signal", 4326, signal.SIGKILL),
+                ("wait", 4326, os.WNOHANG),
+            ],
+        )
+
+    def test_wait_exception_still_kills_group_and_reaps_leader(self) -> None:
+        events = []
+        wait_failed = False
+        group_killed = False
+
+        def fake_waitpid(pid, flags):
+            nonlocal wait_failed
+            events.append(("wait", pid, flags))
+            if flags == os.WNOHANG and not wait_failed:
+                wait_failed = True
+                raise RuntimeError("injected wait failure")
+            if flags == os.WNOHANG and group_killed:
+                return pid, 0
+            raise AssertionError("unexpected waitpid call")
+
+        def fake_killpg(pid, signal_number):
+            nonlocal group_killed
+            events.append(("signal", pid, signal_number))
+            if signal_number == signal.SIGKILL:
+                group_killed = True
+
+        with self.assertRaisesRegex(RuntimeError, "injected wait failure"):
+            runner.wait_with_timeout(
+                4327,
+                1.0,
+                0.1,
+                waitpid_function=fake_waitpid,
+                killpg_function=fake_killpg,
+                monotonic_function=lambda: 0.0,
+                sleep_function=lambda _: None,
+            )
+        self.assertEqual(
+            events,
+            [
+                ("wait", 4327, os.WNOHANG),
+                ("signal", 4327, signal.SIGKILL),
+                ("wait", 4327, os.WNOHANG),
+            ],
+        )
+
+    def test_group_kill_error_uses_leader_fallback_and_bounded_reap(self) -> None:
+        events = []
+
+        def denied_group(pid, signal_number):
+            events.append(("group", pid, signal_number))
+            raise OSError(errno.EPERM, "injected group denial")
+
+        def leader_kill(pid, signal_number):
+            events.append(("leader", pid, signal_number))
+
+        def reaped_leader(pid, flags):
+            events.append(("wait", pid, flags))
+            return pid, 0
+
+        with self.assertRaisesRegex(PermissionError, "injected group denial"):
+            runner.kill_group_and_reap(
+                4328,
+                waitpid_function=reaped_leader,
+                killpg_function=denied_group,
+                kill_function=leader_kill,
+                reap_timeout_seconds=0.1,
+                monotonic_function=lambda: 0.0,
+                sleep_function=lambda _: None,
+            )
+        self.assertEqual(
+            events,
+            [
+                ("group", 4328, signal.SIGKILL),
+                ("leader", 4328, signal.SIGKILL),
+                ("wait", 4328, os.WNOHANG),
+            ],
+        )
+
+    def test_double_kill_failure_is_bounded_and_fail_closed(self) -> None:
+        events = []
+
+        def denied_group(pid, signal_number):
+            events.append(("group", pid, signal_number))
+            raise OSError(errno.EPERM, "injected group denial")
+
+        def denied_leader(pid, signal_number):
+            events.append(("leader", pid, signal_number))
+            raise OSError(errno.EPERM, "injected leader denial")
+
+        def still_running(pid, flags):
+            events.append(("wait", pid, flags))
+            return 0, 0
+
+        clock = iter((0.0, 1.0))
+        with self.assertRaisesRegex(
+            runner.GateError,
+            "fixed cleanup deadline",
+        ):
+            runner.kill_group_and_reap(
+                4329,
+                waitpid_function=still_running,
+                killpg_function=denied_group,
+                kill_function=denied_leader,
+                reap_timeout_seconds=0.5,
+                monotonic_function=lambda: next(clock),
+                sleep_function=lambda _: self.fail("cleanup wait exceeded deadline"),
+            )
+        self.assertEqual(
+            events,
+            [
+                ("group", 4329, signal.SIGKILL),
+                ("leader", 4329, signal.SIGKILL),
+                ("wait", 4329, os.WNOHANG),
+            ],
+        )
+
+    def test_group_signal_retries_eintr(self) -> None:
+        calls = []
+
+        def interrupted_then_sent(pid, signal_number):
+            calls.append((pid, signal_number))
+            if len(calls) == 1:
+                raise OSError(errno.EINTR, "injected interruption")
+
+        runner.signal_process_group(4330, signal.SIGKILL, interrupted_then_sent)
+        self.assertEqual(
+            calls,
+            [(4330, signal.SIGKILL), (4330, signal.SIGKILL)],
         )
 
     def test_echild_before_deadline_has_stable_internal_rc(self) -> None:
@@ -535,6 +764,7 @@ exit 0
         if pid == 0:
             os.close(ready_read)
             os.setsid()
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
             os.write(ready_write, b"R")
             os.close(ready_write)
             time.sleep(5)
@@ -571,6 +801,7 @@ exit 0
             os.setsid()
             grandchild = os.fork()
             if grandchild == 0:
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
                 time.sleep(0.5)
                 with open(marker, "xb") as output:
                     output.write(b"survived\n")
@@ -585,6 +816,54 @@ exit 0
         self.assertEqual(runner.wait_with_timeout(pid, 0.1, 0.1), 124)
         time.sleep(0.7)
         self.assertFalse(os.path.exists(marker))
+
+    def test_timeout_kills_term_ignoring_descendant_after_leader_exits(self) -> None:
+        marker = os.path.join(
+            self.evidence_root,
+            "unexpected-term-ignoring-grandchild-marker",
+        )
+        ready_read, ready_write = os.pipe()
+        pid_read, pid_write = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(ready_read)
+            os.close(pid_read)
+            os.setsid()
+            armed_read, armed_write = os.pipe()
+            grandchild = os.fork()
+            if grandchild == 0:
+                os.close(armed_read)
+                os.close(ready_write)
+                os.close(pid_write)
+                signal.signal(signal.SIGTERM, signal.SIG_IGN)
+                os.write(armed_write, b"A")
+                os.close(armed_write)
+                time.sleep(0.7)
+                with open(marker, "xb") as output:
+                    output.write(b"survived\n")
+                os._exit(0)
+            os.close(armed_write)
+            if os.read(armed_read, 1) != b"A":
+                os._exit(91)
+            os.close(armed_read)
+            os.write(pid_write, f"{grandchild}\n".encode("ascii"))
+            os.close(pid_write)
+            signal.signal(signal.SIGTERM, lambda _signum, _frame: os._exit(0))
+            os.write(ready_write, b"R")
+            os.close(ready_write)
+            time.sleep(5)
+            os._exit(0)
+        os.close(ready_write)
+        os.close(pid_write)
+        self.assertEqual(os.read(ready_read, 1), b"R")
+        os.close(ready_read)
+        grandchild_pid = int(os.read(pid_read, 32).strip())
+        os.close(pid_read)
+        self.assertEqual(runner.wait_with_timeout(pid, 0.1, 0.2), 124)
+        time.sleep(0.8)
+        self.assertFalse(os.path.exists(marker))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(grandchild_pid, 0)
 
     def test_runner_source_has_no_mutating_host_operations(self) -> None:
         source = pathlib.Path(RUNNER_PATH).read_text(encoding="utf-8")

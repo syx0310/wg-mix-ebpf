@@ -7,11 +7,15 @@ BPF_MULTIARCH ?= $(shell gcc -print-multiarch 2>/dev/null)
 BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/include/$(BPF_MULTIARCH),)
 BPF_OBJECT ?= build/wg_mix_tc.o
 FAKETCP_EXPERIMENTAL_BPF_OBJECT ?= build/wg_mix_faketcp_experimental.o
+FAKETCP_VERIFIER_LAUNCHER_AMD64 ?= bin/faketcp-verifier-launcher-linux-amd64
+FAKETCP_VERIFIER_LAUNCHER_ARM64 ?= bin/faketcp-verifier-launcher-linux-arm64
+FAKETCP_VERIFIER_LAUNCHER_TEST_AMD64 ?= build/verifierlauncher-linux-amd64.test
+FAKETCP_VERIFIER_LAUNCHER_TEST_ARM64 ?= build/verifierlauncher-linux-arm64.test
 EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 override BUILD_SOURCE_COMMIT := $(shell ./scripts/source-commit.sh)
 override BUILD_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/buildinfo.sourceCommit=$(BUILD_SOURCE_COMMIT)
 
-.PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-faketcp-verifier-only test-bpf-object-manifests test-bpf-object-manifest-path-contract _test-bpf-object-manifests test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-faketcp-verifier-only test-faketcp-verifier-launcher test-bpf-object-manifests test-bpf-object-manifest-path-contract _test-bpf-object-manifests test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-linux-amd64 build-linux-arm64 build-faketcp-verifier-launcher build-faketcp-verifier-launcher-linux-amd64 build-faketcp-verifier-launcher-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=$(CGO_ENABLED) $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -21,6 +25,18 @@ build-linux-amd64: prepare-embedded-bpf
 
 build-linux-arm64: prepare-embedded-bpf
 	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o bin/wg-mix-ebpf-linux-arm64 ./cmd/wg-mix-ebpf
+
+# These standalone launchers only become trusted after the root phase verifies
+# the selected root-owned artifact and its approved SHA-256 before execution.
+build-faketcp-verifier-launcher: build-faketcp-verifier-launcher-linux-amd64 build-faketcp-verifier-launcher-linux-arm64
+
+build-faketcp-verifier-launcher-linux-amd64:
+	@mkdir -p $(dir $(FAKETCP_VERIFIER_LAUNCHER_AMD64))
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -mod=readonly -buildvcs=false -o $(FAKETCP_VERIFIER_LAUNCHER_AMD64) ./cmd/faketcp-verifier-launcher
+
+build-faketcp-verifier-launcher-linux-arm64:
+	@mkdir -p $(dir $(FAKETCP_VERIFIER_LAUNCHER_ARM64))
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -mod=readonly -buildvcs=false -o $(FAKETCP_VERIFIER_LAUNCHER_ARM64) ./cmd/faketcp-verifier-launcher
 
 # This convenience target is unprivileged. The fixed-tool and immutable
 # candidate-snapshot checks in the invoked script define the artifact gate;
@@ -36,7 +52,13 @@ test-live-guard-build-provenance:
 	scripts/test-build-live-guard-provenance.sh \
 		"$(CURDIR)/scripts/build-live-guard-test.sh"
 
-test-faketcp-verifier-only:
+test-faketcp-verifier-launcher:
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=$(CGO_ENABLED) $(GO) test -count=1 ./internal/verifierlauncher ./cmd/faketcp-verifier-launcher
+	@mkdir -p $(dir $(FAKETCP_VERIFIER_LAUNCHER_TEST_AMD64)) $(dir $(FAKETCP_VERIFIER_LAUNCHER_TEST_ARM64))
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) test -c -o $(FAKETCP_VERIFIER_LAUNCHER_TEST_AMD64) ./internal/verifierlauncher
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) test -c -o $(FAKETCP_VERIFIER_LAUNCHER_TEST_ARM64) ./internal/verifierlauncher
+
+test-faketcp-verifier-only: test-faketcp-verifier-launcher
 	scripts/test-faketcp-verifier-only.sh \
 		"$(CURDIR)/scripts/run-faketcp-verifier-only.py"
 
@@ -137,6 +159,7 @@ test-lint:
 	@test -z "$$($(GOFMT) -l $$(find cmd internal -name '*.go' -type f))" || \
 		{ echo "gofmt required for:"; $(GOFMT) -l $$(find cmd internal -name '*.go' -type f); exit 1; }
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) vet ./...
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet ./internal/verifierlauncher ./cmd/faketcp-verifier-launcher
 	sh -n scripts/source-commit.sh scripts/test-bpf-object-manifest-path-contract.sh
 	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/test-faketcp-verifier-only.sh
 	/usr/bin/python3 -I -c 'from pathlib import Path; [compile(Path(p).read_text(), p, "exec") for p in ("scripts/run-faketcp-verifier-only.py", "scripts/test_faketcp_verifier_only.py")]'
