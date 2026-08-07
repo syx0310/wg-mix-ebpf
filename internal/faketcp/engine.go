@@ -41,7 +41,7 @@ type Options struct {
 	IdleTimeout              time.Duration
 	Window                   uint16
 	Now                      func() time.Time
-	MonotonicNanos           func() uint64
+	MonotonicClock           MonotonicClock
 	InitialSequence          func() uint32
 	Store                    SessionStore
 }
@@ -189,8 +189,11 @@ func New(options Options) (*Engine, error) {
 	if options.InitialSequence == nil {
 		return nil, errors.New("faketcp initial sequence source is required")
 	}
-	if options.MonotonicNanos == nil {
-		return nil, errors.New("faketcp monotonic clock source is required")
+	if options.MonotonicClock == nil {
+		return nil, errors.New("faketcp CLOCK_MONOTONIC source is required")
+	}
+	if domain := options.MonotonicClock.Domain(); domain != BPFMonotonicClockDomain {
+		return nil, fmt.Errorf("faketcp monotonic clock domain %q does not match BPF domain %q", domain, BPFMonotonicClockDomain)
 	}
 	if options.Store == nil {
 		return nil, errors.New("faketcp established session store is required")
@@ -475,7 +478,10 @@ func (e *Engine) Tick() ([]Action, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	now := e.opts.Now()
-	nowMonotonic := e.opts.MonotonicNanos()
+	nowMonotonic, err := e.opts.MonotonicClock.NowNanos()
+	if err != nil {
+		return nil, fmt.Errorf("read faketcp %s clock: %w", BPFMonotonicClockDomain, err)
+	}
 	var actions []Action
 	var errs []error
 	for flow, s := range e.sessions {
@@ -828,9 +834,13 @@ func (e *Engine) controlEstablished(flow abi.FakeTCPSessionKey, s *session,
 }
 
 func (e *Engine) insertEstablished(flow abi.FakeTCPSessionKey, s *session) error {
+	nowMonotonic, err := e.opts.MonotonicClock.NowNanos()
+	if err != nil {
+		return fmt.Errorf("read faketcp %s clock for established insert: %w", BPFMonotonicClockDomain, err)
+	}
 	return e.opts.Store.InsertEstablished(flow, abi.FakeTCPSessionValue{
 		Generation:    flow.Generation,
-		LastSeenNanos: e.opts.MonotonicNanos(),
+		LastSeenNanos: nowMonotonic,
 		TXSequence:    s.txSequence,
 		RXSequence:    s.rxSequence,
 		LocalISN:      s.localISN,

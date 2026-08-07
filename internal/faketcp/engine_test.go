@@ -3,7 +3,9 @@ package faketcp
 import (
 	"encoding/binary"
 	"errors"
+	"math"
 	"net/netip"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,10 +15,18 @@ import (
 type fakeClock struct {
 	now       time.Time
 	monotonic uint64
+	clockErr  error
+	domain    string
 }
 
-func (c *fakeClock) Now() time.Time         { return c.now }
-func (c *fakeClock) MonotonicNanos() uint64 { return c.monotonic }
+func (c *fakeClock) Now() time.Time { return c.now }
+func (c *fakeClock) Domain() string {
+	if c.domain != "" {
+		return c.domain
+	}
+	return BPFMonotonicClockDomain
+}
+func (c *fakeClock) NowNanos() (uint64, error) { return c.monotonic, c.clockErr }
 func (c *fakeClock) Add(d time.Duration) {
 	c.now = c.now.Add(d)
 	c.monotonic += uint64(d)
@@ -106,7 +116,7 @@ func testEngine(t *testing.T, mutate func(*Options)) (*Engine, *fakeClock) {
 		HandshakeTimeout: time.Second, HandshakeRetries: 2,
 		KeepaliveInterval: 5 * time.Second, IdleTimeout: 20 * time.Second,
 		Now:             clock.Now,
-		MonotonicNanos:  clock.MonotonicNanos,
+		MonotonicClock:  clock,
 		Store:           newFakeSessionStore(),
 		InitialSequence: func() uint32 { value := nextISN; nextISN += 1000; return value },
 	}
@@ -118,6 +128,76 @@ func testEngine(t *testing.T, mutate func(*Options)) (*Engine, *fakeClock) {
 		t.Fatal(err)
 	}
 	return engine, clock
+}
+
+func TestMonotonicClockContractRejectsDomainMismatchAndFallback(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	options := engine.opts
+	options.MonotonicClock = &fakeClock{domain: "CLOCK_BOOTTIME"}
+	if _, err := New(options); err == nil || !strings.Contains(err.Error(), "does not match BPF domain") {
+		t.Fatalf("domain mismatch error=%v", err)
+	}
+
+	store := newFakeSessionStore()
+	engine, clock := testEngine(t, func(options *Options) { options.Store = store })
+	flow := testFlow(31001)
+	if _, err := engine.Outbound(flow, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	clock.clockErr = errors.New("clock unavailable")
+	actions, err := engine.Inbound(flow, Segment{Flags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001})
+	if err == nil || !strings.Contains(err.Error(), "clock unavailable") || len(actions) != 1 || actions[0].Reason != "session-store-unavailable" {
+		t.Fatalf("clock insert failure actions=%#v err=%v", actions, err)
+	}
+	if len(store.values) != 0 {
+		t.Fatal("clock failure fell back and inserted an incomparable timestamp")
+	}
+}
+
+func TestMonotonicClockFailureAndUintBoundariesNeverFalseDelete(t *testing.T) {
+	store := newFakeSessionStore()
+	engine, clock := testEngine(t, func(options *Options) { options.Store = store })
+	flow := testFlow(31001)
+	if _, err := engine.Outbound(flow, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Inbound(flow, Segment{Flags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001}); err != nil {
+		t.Fatal(err)
+	}
+
+	clock.clockErr = errors.New("clock unavailable")
+	if actions, err := engine.Tick(); err == nil || len(actions) != 0 || store.deleteAttempts != 0 {
+		t.Fatalf("clock failure actions=%#v err=%v deleteAttempts=%d", actions, err, store.deleteAttempts)
+	}
+	clock.clockErr = nil
+	value := store.values[flow]
+	value.LastSeenNanos = math.MaxUint64 - 10
+	store.values[flow] = value
+	clock.monotonic = 5
+	if actions, err := engine.Tick(); err != nil || len(actions) != 0 || store.deleteAttempts != 0 {
+		t.Fatalf("future timestamp underflow actions=%#v err=%v deleteAttempts=%d", actions, err, store.deleteAttempts)
+	}
+
+	value.LastSeenNanos = math.MaxUint64 - uint64(engine.opts.IdleTimeout)
+	store.values[flow] = value
+	clock.monotonic = math.MaxUint64
+	actions, err := engine.Tick()
+	if err != nil || len(actions) != 1 || actions[0].Reason != "idle-timeout" || store.deleteAttempts != 1 {
+		t.Fatalf("max-uint idle actions=%#v err=%v deleteAttempts=%d", actions, err, store.deleteAttempts)
+	}
+}
+
+func TestMonotonicTimespecConversionBounds(t *testing.T) {
+	maxSeconds := int64(math.MaxUint64 / 1_000_000_000)
+	maxNanoseconds := int64(math.MaxUint64 - uint64(maxSeconds)*1_000_000_000)
+	if got, err := monotonicNanosFromParts(maxSeconds, maxNanoseconds); err != nil || got != math.MaxUint64 {
+		t.Fatalf("boundary conversion=%d err=%v want=%d", got, err, uint64(math.MaxUint64))
+	}
+	for _, parts := range [][2]int64{{-1, 0}, {0, -1}, {0, 1_000_000_000}, {maxSeconds, maxNanoseconds + 1}, {maxSeconds + 1, 0}} {
+		if _, err := monotonicNanosFromParts(parts[0], parts[1]); err == nil {
+			t.Fatalf("invalid timespec (%d,%d) accepted", parts[0], parts[1])
+		}
+	}
 }
 
 func TestClientHandshakeReleasesBoundedFirstPacket(t *testing.T) {
@@ -436,7 +516,7 @@ func TestEstablishedStateReadsBPFAdvanceAndNeverOverwritesOrRacyDeletes(t *testi
 	value := store.values[flow]
 	value.TXSequence += 4096
 	value.RXSequence += 2048
-	value.LastSeenNanos = clock.MonotonicNanos()
+	value.LastSeenNanos = clock.monotonic
 	store.values[flow] = value
 	clock.Add(5 * time.Second)
 	actions, err := engine.Tick()
@@ -459,7 +539,7 @@ func TestEstablishedStateReadsBPFAdvanceAndNeverOverwritesOrRacyDeletes(t *testi
 	advanced := value
 	advanced.TXSequence += 128
 	advanced.RXSequence += 64
-	advanced.LastSeenNanos = clock.MonotonicNanos()
+	advanced.LastSeenNanos = clock.monotonic
 	store.beforeDelete = func(key abi.FakeTCPSessionKey) {
 		store.values[key] = advanced
 		store.beforeDelete = nil
