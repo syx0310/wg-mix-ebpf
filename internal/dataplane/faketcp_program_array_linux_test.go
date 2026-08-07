@@ -20,6 +20,34 @@ type memoryFakeTCPProgramArray struct {
 	deletes         []uint32
 }
 
+type fakeKernelExperimentalProgram struct {
+	program *ebpf.Program
+}
+
+func (*fakeKernelExperimentalProgram) ID() (uint32, error) { return 8001, nil }
+func (*fakeKernelExperimentalProgram) Close() error        { return nil }
+func (program *fakeKernelExperimentalProgram) kernelProgram() *ebpf.Program {
+	return program.program
+}
+
+type flagCaptureProgramArrayMap struct {
+	flags ebpf.MapUpdateFlags
+	value any
+}
+
+func (*flagCaptureProgramArrayMap) Lookup(any, any) error { return ebpf.ErrKeyNotExist }
+func (resource *flagCaptureProgramArrayMap) Update(
+	_ any,
+	value any,
+	flags ebpf.MapUpdateFlags,
+) error {
+	resource.flags = flags
+	resource.value = value
+	return nil
+}
+func (*flagCaptureProgramArrayMap) Delete(any) error { return nil }
+func (*flagCaptureProgramArrayMap) Close() error     { return nil }
+
 func (programs *memoryFakeTCPProgramArray) LookupProgramID(slot uint32) (uint32, error) {
 	if programs.lookupErr != nil {
 		err := programs.lookupErr
@@ -84,6 +112,19 @@ func TestFakeTCPEgressProgramStageOwnsGenerationBankAndRollsBack(t *testing.T) {
 	}
 	if err := stage.Rollback(ctx, transaction); err != nil || len(programs.deletes) != 1 {
 		t.Fatalf("idempotent rollback error=%v deletes=%v", err, programs.deletes)
+	}
+}
+
+func TestLiveFakeTCPProgramArrayUsesArrayCompatibleSingleWriterUpdate(t *testing.T) {
+	resource := &flagCaptureProgramArrayMap{}
+	kernelProgram := &ebpf.Program{}
+	program := &fakeKernelExperimentalProgram{program: kernelProgram}
+	programs := liveFakeTCPProgramArray{resource: resource}
+	if err := programs.InsertProgram(1, program); err != nil {
+		t.Fatal(err)
+	}
+	if resource.flags != ebpf.UpdateAny || resource.value != kernelProgram {
+		t.Fatalf("program-array update flags=%v value=%T", resource.flags, resource.value)
 	}
 }
 

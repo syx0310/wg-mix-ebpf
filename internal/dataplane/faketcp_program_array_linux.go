@@ -37,7 +37,11 @@ func (programs liveFakeTCPProgramArray) InsertProgram(
 	if program == nil || program.kernelProgram() == nil {
 		return errors.New("insert FakeTCP tail program: live kernel program is unavailable")
 	}
-	return programs.resource.Update(slot, program.kernelProgram(), ebpf.UpdateNoExist)
+	// Program arrays are array-like maps: BPF_NOEXIST is not a usable empty-
+	// slot primitive. The retained lifecycle lease supplies the single-writer
+	// exclusion between the preceding lookup and this BPF_ANY update; exact-ID
+	// readback and rollback comparisons detect any non-cooperating mutation.
+	return programs.resource.Update(slot, program.kernelProgram(), ebpf.UpdateAny)
 }
 
 func (programs liveFakeTCPProgramArray) DeleteProgram(slot uint32) error {
