@@ -678,7 +678,9 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if err != nil {
 		return fmt.Errorf("preflight TC attachment transaction: %w", err)
 	}
-	defer attachPlan.Close()
+	defer func() {
+		returnErr = errors.Join(returnErr, attachPlan.Close())
+	}()
 	activeFilters := []tcFilterBinding{}
 	var token [32]byte
 	var ownerMaps []pinOwnerMapIdentity
@@ -807,22 +809,49 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if err := store.Persist(mutating, applying, handle.mountID); err != nil {
 		return err
 	}
-	if err := attachPlan.Execute(func() error {
+	handoff, err := prepareDurableTCOwnerJournalHandoff(
+		handle,
+		store,
+		mutating,
+		activeFilters,
+		desiredFilters,
+	)
+	if err != nil {
+		return fmt.Errorf("prove durable TC owner journal handoff: %w", err)
+	}
+	retainedTC, attachErr := attachPlan.Execute(func() error {
 		return commitControl(coll, snapshot.Control[abi.ControlKeyGlobal])
-	}); err != nil {
-		abortErr := abortFailedOwnerApply(
+	})
+	if attachErr != nil {
+		rollbackVerified, abortErr := abortFailedOwnerApply(
 			handle,
 			store,
 			mutating,
 			liveTCRuntime,
 		)
+		if retainedTC != nil {
+			if rollbackVerified {
+				// The journal's active set was observed exactly, so the
+				// retained stage no longer owns a live filter even if its
+				// original netlink operation reported an ambiguous error.
+				retainedTC.Disarm()
+			} else {
+				// abortFailedOwnerApply performs no writes before this point.
+				// The pre-mutation capability therefore still proves that the
+				// durable mutating journal owns roll-forward recovery.
+				handoff.Transfer(retainedTC)
+			}
+		}
 		if abortErr != nil {
 			return errors.Join(
-				err,
+				attachErr,
 				fmt.Errorf("owner-aware apply rollback: %w", abortErr),
 			)
 		}
-		return err
+		return attachErr
+	}
+	if retainedTC != nil {
+		return errors.New("successful TC owner transaction returned rollback ownership")
 	}
 	cleanup := advancePinOwnerRecord(
 		mutating,

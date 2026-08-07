@@ -524,19 +524,40 @@ func (plan *tcAttachPlan) AddOwnedStaleRemovals(
 	return nil
 }
 
-func (plan *tcAttachPlan) Execute(commit func() error) (returnErr error) {
+// Execute commits a persistent-owner transaction. Success transfers live TC
+// ownership to the caller's already durable journal and returns no stage. On
+// failure it first attempts local rollback; if any filter rollback remains,
+// the exact retained stage is returned and must be either retried or handed to
+// a journal that was proven durable before Execute began.
+func (plan *tcAttachPlan) Execute(
+	commit func() error,
+) (*tcAttachStage, error) {
 	stage, err := plan.ExecuteRetained(commit)
 	if err != nil {
-		if stage != nil {
-			return errors.Join(err, stage.Close())
+		if stage == nil {
+			return nil, errors.Join(err, plan.Close())
 		}
-		return errors.Join(err, plan.Close())
+		closeErr := stage.Close()
+		joined := errors.Join(err, closeErr)
+		if closeErr == nil {
+			return nil, joined
+		}
+		if stage.hasLiveFilterOwnership() {
+			return stage, joined
+		}
+		// Filter rollback completed and only fallible retained-program Close
+		// reporting remains. Return those references to plan.Close; they are
+		// not live filter ownership and must never be journal-transferred.
+		if releaseErr := stage.returnProgramReferencesToPlan(); releaseErr != nil {
+			return stage, errors.Join(joined, releaseErr)
+		}
+		return nil, joined
 	}
-	// Persistent loader callers transfer rollback responsibility to their
-	// owner journal in commit.  Disarm leaves retained program handles with the
-	// plan so its existing deferred Close keeps the post-commit path infallible.
+	// Persistent loader callers prove their owner journal before Execute and
+	// activate it in commit. Disarm leaves retained program handles with the
+	// plan so its deferred Close can report their terminal close outcome.
 	stage.Disarm()
-	return nil
+	return nil, nil
 }
 
 // ExecuteRetained performs the same preflight-fenced transaction as Execute,
@@ -1002,6 +1023,38 @@ func (stage *tcAttachStage) Close() error {
 	}
 	stage.done = true
 	plan.stage = nil
+	stage.err = nil
+	stage.plan = nil
+	return nil
+}
+
+func (stage *tcAttachStage) hasLiveFilterOwnership() bool {
+	if stage == nil {
+		return false
+	}
+	stage.mu.Lock()
+	defer stage.mu.Unlock()
+	return !stage.done &&
+		(len(stage.applied) != 0 || len(stage.deleted) != 0 || len(stage.created) != 0)
+}
+
+func (stage *tcAttachStage) returnProgramReferencesToPlan() error {
+	if stage == nil {
+		return nil
+	}
+	stage.mu.Lock()
+	defer stage.mu.Unlock()
+	if stage.done {
+		return nil
+	}
+	if stage.plan == nil || !stage.rolledBack ||
+		len(stage.applied) != 0 || len(stage.deleted) != 0 || len(stage.created) != 0 {
+		return errors.New("retained TC stage still owns filter rollback")
+	}
+	if stage.plan.stage == stage {
+		stage.plan.stage = nil
+	}
+	stage.done = true
 	stage.err = nil
 	stage.plan = nil
 	return nil

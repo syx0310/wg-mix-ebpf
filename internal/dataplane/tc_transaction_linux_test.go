@@ -292,6 +292,32 @@ func testTCState(ifindexes ...int) *control.State {
 	return state
 }
 
+func testMutatingTCOwnerJournal(
+	active []tcFilterBinding,
+	desired []tcFilterBinding,
+) *pinOwnerRecord {
+	record := &pinOwnerRecord{
+		Sequence:       7,
+		ResourceKey:    "journal-test-resource",
+		Token:          strings.Repeat("01", 32),
+		Phase:          pinOwnerPhaseApplying,
+		Step:           pinOwnerStepMutating,
+		ActiveFilters:  slices.Clone(active),
+		DesiredFilters: slices.Clone(desired),
+	}
+	token, err := tokenFromOwnerRecord(record)
+	if err != nil {
+		panic(err)
+	}
+	record.ProgramStages = buildOwnerProgramStages(
+		record.ResourceKey,
+		token,
+		record.ActiveFilters,
+		record.DesiredFilters,
+	)
+	return record
+}
+
 func TestTCAttachTransactionCommitsAfterEveryDirection(t *testing.T) {
 	kernel := newFakeTCKernel(11, 12)
 	kernel.addProgram(101, 1001)
@@ -309,11 +335,15 @@ func TestTCAttachTransactionCommitsAfterEveryDirection(t *testing.T) {
 	defer plan.Close()
 
 	committedAfterWrites := 0
-	if err := plan.Execute(func() error {
+	retained, err := plan.Execute(func() error {
 		committedAfterWrites = len(kernel.writes)
 		return nil
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
+	}
+	if retained != nil {
+		t.Fatal("successful Execute returned rollback ownership")
 	}
 	if committedAfterWrites != 6 {
 		t.Fatalf("commit ran after %d writes, want 2 clsact + 4 filter writes", committedAfterWrites)
@@ -613,10 +643,13 @@ func TestTCAttachTransactionRollsBackPartialMultiUnderlayFailure(t *testing.T) {
 	defer plan.Close()
 	kernel.failWrite = 4
 	commitCalls := 0
-	err = plan.Execute(func() error {
+	retained, err := plan.Execute(func() error {
 		commitCalls++
 		return nil
 	})
+	if retained != nil {
+		t.Fatal("successful partial-failure rollback retained ownership")
+	}
 	if err == nil || !strings.Contains(err.Error(), "injected") {
 		t.Fatalf("attach error = %v, want injected failure", err)
 	}
@@ -648,7 +681,10 @@ func TestTCAttachTransactionRollsBackWhenCommitFails(t *testing.T) {
 	}
 	defer plan.Close()
 
-	err = plan.Execute(func() error { return errors.New("commit failed") })
+	retained, err := plan.Execute(func() error { return errors.New("commit failed") })
+	if retained != nil {
+		t.Fatal("commit failure with complete rollback retained ownership")
+	}
 	if err == nil || !strings.Contains(err.Error(), "commit failed") {
 		t.Fatalf("attach error = %v, want commit failure", err)
 	}
@@ -899,12 +935,205 @@ func TestTCAttachTransactionRefusesRollbackAfterFilterSwap(t *testing.T) {
 		filter.Id = 99
 		kernel.filters[key] = []netlink.Filter{filter}
 	}
-	err = plan.Execute(func() error { return errors.New("commit failed") })
+	retained, err := plan.Execute(func() error { return errors.New("commit failed") })
 	if err == nil || !strings.Contains(err.Error(), "refuse rollback") {
 		t.Fatalf("attach error = %v, want rollback swap refusal", err)
 	}
+	if retained == nil || !retained.hasLiveFilterOwnership() {
+		t.Fatal("rollback swap refusal lost retained filter owner")
+	}
 	if got := kernel.managedProgramID(t, 11, canonicalTCFilterSlots()[0]); got != 99 {
 		t.Fatalf("foreign replacement program = %d, want preserved 99", got)
+	}
+	ingress := canonicalTCFilterSlots()[0]
+	key := fakeTCFilterKey{ifindex: 11, parent: ingress.parent}
+	owned := managedBpfFilter(11, ingress, 301).(*netlink.BpfFilter)
+	owned.Id = 31
+	kernel.filters[key] = []netlink.Filter{owned}
+	if err := retained.Close(); err != nil {
+		t.Fatalf("retry retained rollback: %v", err)
+	}
+}
+
+func TestTCAttachExecuteReturnsRollbackOwnerForDurableJournalHandoff(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	kernel.addProgram(31, 301)
+	kernel.addProgram(32, 302)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	active := []tcFilterBinding{}
+	desired := plan.Bindings()
+	intent := testMutatingTCOwnerJournal(active, desired)
+	handoff, err := validateTCOwnerJournalCoverage(
+		intent,
+		clonePinOwnerRecord(intent),
+		active,
+		desired,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The fourth write is the first rollback delete. Its failure leaves the
+	// desired egress filter live while ingress rollback succeeds.
+	kernel.failWrite = 4
+	retained, err := plan.Execute(func() error { return errors.New("commit failed") })
+	if retained == nil || err == nil || !strings.Contains(err.Error(), "injected filter-delete failure") {
+		t.Fatalf("retained=%#v Execute error=%v", retained, err)
+	}
+	if !retained.hasLiveFilterOwnership() || plan.stage != retained {
+		t.Fatal("Execute lost the exact partial rollback owner")
+	}
+	if got := kernel.managedProgramID(t, 11, canonicalTCFilterSlots()[0]); got != 0 {
+		t.Fatalf("rolled-back ingress program=%d, want absent", got)
+	}
+	if got := kernel.managedProgramID(t, 11, canonicalTCFilterSlots()[1]); got != 32 {
+		t.Fatalf("retained egress program=%d, want desired 32", got)
+	}
+
+	handoff.Transfer(retained)
+	if retained.hasLiveFilterOwnership() || !retained.done || plan.stage != nil {
+		t.Fatal("durable journal handoff did not disarm the transient stage")
+	}
+	programs := &loadedOwnerPrograms{byID: map[uint32]*pinnedProgramObservation{
+		31: {fd: 301, id: 31},
+		32: {fd: 302, id: 32},
+	}}
+	kernel.failWrite = 0
+	if err := rollForwardOwnerApplyFilters(
+		intent.ActiveFilters,
+		intent.DesiredFilters,
+		programs,
+		kernel.runtime(),
+	); err != nil {
+		t.Fatalf("journal roll-forward after handoff: %v", err)
+	}
+	for index, slot := range canonicalTCFilterSlots() {
+		want := uint32(31 + index)
+		if got := kernel.managedProgramID(t, 11, slot); got != want {
+			t.Fatalf("recovered %s program=%d want=%d", slot.name, got, want)
+		}
+	}
+}
+
+func TestTCOwnerJournalHandoffRejectsFaultsBeforeTCMutation(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	kernel.addProgram(31, 301)
+	kernel.addProgram(32, 302)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer plan.Close()
+	active := []tcFilterBinding{}
+	desired := plan.Bindings()
+
+	tests := []struct {
+		name   string
+		mutate func(*pinOwnerRecord, *pinOwnerRecord)
+		match  string
+	}{
+		{
+			name: "persisted record differs",
+			mutate: func(_ *pinOwnerRecord, persisted *pinOwnerRecord) {
+				persisted.Sequence++
+			},
+			match: "differs",
+		},
+		{
+			name: "wrong journal step",
+			mutate: func(intent *pinOwnerRecord, persisted *pinOwnerRecord) {
+				intent.Step = pinOwnerStepCleanup
+				persisted.Step = pinOwnerStepCleanup
+			},
+			match: "requires applying/mutating",
+		},
+		{
+			name: "missing desired filter coverage",
+			mutate: func(intent *pinOwnerRecord, persisted *pinOwnerRecord) {
+				intent.DesiredFilters = intent.DesiredFilters[:1]
+				persisted.DesiredFilters = persisted.DesiredFilters[:1]
+			},
+			match: "desired filter set",
+		},
+		{
+			name: "missing desired program stage",
+			mutate: func(intent *pinOwnerRecord, persisted *pinOwnerRecord) {
+				intent.ProgramStages = intent.ProgramStages[:1]
+				persisted.ProgramStages = persisted.ProgramStages[:1]
+			},
+			match: "program stages",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			intent := testMutatingTCOwnerJournal(active, desired)
+			persisted := clonePinOwnerRecord(intent)
+			test.mutate(intent, persisted)
+			handoff, err := validateTCOwnerJournalCoverage(
+				intent,
+				persisted,
+				active,
+				desired,
+			)
+			if handoff != nil || err == nil || !strings.Contains(err.Error(), test.match) {
+				t.Fatalf("handoff=%#v error=%v want %q", handoff, err, test.match)
+			}
+			if len(kernel.writes) != 0 {
+				t.Fatalf("failed journal proof reached TC mutation: %v", kernel.writes)
+			}
+		})
+	}
+}
+
+func TestTCAttachExecuteReturnsOnlyProgramReferencesToPlan(t *testing.T) {
+	kernel := newFakeTCKernel(11)
+	for id, fd := range map[uint32]int{21: 201, 22: 202, 31: 301, 32: 302} {
+		kernel.addProgram(id, fd)
+	}
+	kernel.addClsact(11)
+	kernel.addManagedFilter(11, canonicalTCFilterSlots()[0], 21)
+	kernel.addManagedFilter(11, canonicalTCFilterSlots()[1], 22)
+	plan, err := prepareTCAttachPlan(
+		testTCState(11),
+		tcProgramIdentity{fd: 301, id: 31},
+		tcProgramIdentity{fd: 302, id: 32},
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	closeErr := errors.New("terminal retained program close report")
+	kernel.retained[0].closeErrs = []error{closeErr}
+	retained, err := plan.Execute(func() error { return errors.New("commit failed") })
+	if retained != nil || !errors.Is(err, closeErr) {
+		t.Fatalf("retained=%#v Execute error=%v", retained, err)
+	}
+	if plan.stage != nil || plan.closed || kernel.retained[0].closeCalls != 1 ||
+		kernel.retained[1].closeCalls != 1 {
+		t.Fatalf(
+			"program reference ownership was not returned to plan: stage=%p closed=%t calls=%d/%d",
+			plan.stage, plan.closed, kernel.retained[0].closeCalls, kernel.retained[1].closeCalls,
+		)
+	}
+	if err := plan.Close(); err != nil {
+		t.Fatalf("plan reference retry: %v", err)
+	}
+	if kernel.retained[0].closeCalls != 2 || kernel.retained[1].closeCalls != 1 {
+		t.Fatalf("plan retry calls=%d/%d", kernel.retained[0].closeCalls, kernel.retained[1].closeCalls)
 	}
 }
 
@@ -975,10 +1204,13 @@ func TestTCAttachTransactionIncludesOwnedStaleDeletesAndRollback(t *testing.T) {
 				t.Fatal(err)
 			}
 			kernel.failWrite = test.failWrite
-			err = plan.Execute(func() error { return test.commitErr })
+			retained, err := plan.Execute(func() error { return test.commitErr })
 			if test.wantOldIDs {
 				if err == nil {
 					t.Fatal("stale-delete transaction unexpectedly succeeded")
+				}
+				if retained != nil {
+					t.Fatal("complete stale-delete rollback retained ownership")
 				}
 				if got := kernel.managedProgramID(
 					t,
@@ -998,6 +1230,9 @@ func TestTCAttachTransactionIncludesOwnedStaleDeletesAndRollback(t *testing.T) {
 			}
 			if err != nil {
 				t.Fatal(err)
+			}
+			if retained != nil {
+				t.Fatal("successful stale-delete transaction retained ownership")
 			}
 			for _, slot := range canonicalTCFilterSlots() {
 				if got := kernel.managedProgramID(t, 11, slot); got != 0 {
@@ -1063,9 +1298,12 @@ func TestTCAttachFailureAtEveryFilterWriteRestoresAllOwnedSlots(t *testing.T) {
 				t.Fatal(err)
 			}
 			kernel.failWrite = failAt
-			err = plan.Execute(func() error { return nil })
+			retained, err := plan.Execute(func() error { return nil })
 			if err == nil || !strings.Contains(err.Error(), "injected") {
 				t.Fatalf("write %d error = %v", failAt, err)
+			}
+			if retained != nil {
+				t.Fatalf("write %d complete rollback retained ownership", failAt)
 			}
 			for _, ifindex := range []int{11, 12, 13} {
 				if got := kernel.managedProgramID(

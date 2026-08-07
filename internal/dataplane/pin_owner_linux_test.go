@@ -80,6 +80,282 @@ func testPinOwnerRecord(
 	return runtime, parent, record
 }
 
+type durableTCOwnerJournalFixture struct {
+	handle            *pinPathHandle
+	store             *pinOwnerStore
+	intent            *pinOwnerRecord
+	active            []tcFilterBinding
+	desired           []tcFilterBinding
+	mapStore          *fakePinnedMapStore
+	programLoadErrors map[string]error
+}
+
+func newDurableTCOwnerJournalFixture(t *testing.T) *durableTCOwnerJournalFixture {
+	t.Helper()
+	bpffsRoot, validator := newTestBPFFS(t)
+	pinPath := filepath.Join(bpffsRoot, "wg-mix-ebpf-journal-handoff")
+	mapStore := writeCanonicalMockPins(t, pinPath)
+	runtime := newTestPinPathRuntime(t, validator, mapStore)
+	programLoadErrors := make(map[string]error)
+	programIDs := make(map[string]uint32)
+	runtime.loadPinnedProgram = func(path string) (*pinnedProgramObservation, error) {
+		name := filepath.Base(path)
+		if err := programLoadErrors[name]; err != nil {
+			return nil, err
+		}
+		id, ok := programIDs[name]
+		if !ok {
+			return nil, fmt.Errorf("unknown fake program stage %s", name)
+		}
+		return &pinnedProgramObservation{
+			fd: int(id) + 1000, id: id, close: func() error { return nil },
+		}, nil
+	}
+	validated, err := validatePinPath(pinPath, validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := openPinPathParent(pinPath, validated, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, _, err := openPinPathHandleFromParent(parent, validated, false)
+	if err != nil {
+		_ = parent.Close()
+		t.Fatal(err)
+	}
+	store, err := openPinOwnerStore(runtime, handle.resource, true)
+	if err != nil {
+		_ = handle.Close()
+		_ = parent.Close()
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = store.Close()
+		_ = handle.Close()
+		_ = parent.Close()
+	})
+
+	pins, err := inspectPinnedMapSet(handle, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerMaps := ownerMapsFromPins(pins)
+	if err := closePinnedMapPins(pins); err != nil {
+		t.Fatal(err)
+	}
+	var token [32]byte
+	for index := range token {
+		token[index] = byte(index + 1)
+	}
+	slots := canonicalTCFilterSlots()
+	active := []tcFilterBinding{
+		{
+			IfIndex: 11, Direction: "ingress", Parent: slots[0].parent,
+			Handle: slots[0].handle, Priority: filterPriority, ProgramID: 21,
+		},
+		{
+			IfIndex: 11, Direction: "egress", Parent: slots[1].parent,
+			Handle: slots[1].handle, Priority: filterPriority, ProgramID: 22,
+		},
+	}
+	desired := []tcFilterBinding{
+		{
+			IfIndex: 11, Direction: "ingress", Parent: slots[0].parent,
+			Handle: slots[0].handle, Priority: filterPriority, ProgramID: 31,
+		},
+		{
+			IfIndex: 11, Direction: "egress", Parent: slots[1].parent,
+			Handle: slots[1].handle, Priority: filterPriority, ProgramID: 32,
+		},
+	}
+	now := time.Date(2026, 8, 8, 1, 2, 3, 4, time.UTC)
+	activeRecord, err := newActivePinOwnerRecord(
+		parent,
+		token,
+		"12345678-1234-1234-1234-123456789abc",
+		now,
+		1,
+		ownerMaps,
+		active,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	applying, err := newApplyingPinOwnerRecord(
+		parent,
+		token,
+		activeRecord.BootID,
+		now.Add(time.Second),
+		1,
+		2,
+		ownerMaps,
+		active,
+		desired,
+		activeRecord,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutating := advancePinOwnerRecord(
+		applying,
+		now.Add(2*time.Second),
+		pinOwnerPhaseApplying,
+		pinOwnerStepMutating,
+	)
+	observeOwnerMount(mutating, handle.mountID)
+	for _, stage := range mutating.ProgramStages {
+		programIDs[stage.FileName] = stage.ProgramID
+		if err := os.WriteFile(
+			filepath.Join(pinPath, stage.FileName),
+			[]byte("mock BPF program pin"),
+			0o600,
+		); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sentinel, err := pinOwnerSentinelFor(handle.resource, token)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerObservation := mapStore.observations["owner_map"]
+	ownerObservation.owner = sentinel
+	ownerObservation.ownerSeen = true
+	mapStore.observations["owner_map"] = ownerObservation
+	if err := store.Persist(activeRecord, nil, handle.mountID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Persist(applying, activeRecord, handle.mountID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Persist(mutating, applying, handle.mountID); err != nil {
+		t.Fatal(err)
+	}
+	return &durableTCOwnerJournalFixture{
+		handle:            handle,
+		store:             store,
+		intent:            mutating,
+		active:            active,
+		desired:           desired,
+		mapStore:          mapStore,
+		programLoadErrors: programLoadErrors,
+	}
+}
+
+func TestPrepareDurableTCOwnerJournalHandoffFaults(t *testing.T) {
+	t.Run("exact durable coverage", func(t *testing.T) {
+		fixture := newDurableTCOwnerJournalFixture(t)
+		handoff, err := prepareDurableTCOwnerJournalHandoff(
+			fixture.handle,
+			fixture.store,
+			fixture.intent,
+			fixture.active,
+			fixture.desired,
+		)
+		if err != nil || handoff == nil ||
+			handoff.resourceKey != fixture.intent.ResourceKey ||
+			handoff.sequence != fixture.intent.Sequence {
+			t.Fatalf("handoff=%#v error=%v", handoff, err)
+		}
+	})
+
+	t.Run("read-back mismatch", func(t *testing.T) {
+		fixture := newDurableTCOwnerJournalFixture(t)
+		intent := clonePinOwnerRecord(fixture.intent)
+		intent.Sequence++
+		handoff, err := prepareDurableTCOwnerJournalHandoff(
+			fixture.handle,
+			fixture.store,
+			intent,
+			fixture.active,
+			fixture.desired,
+		)
+		if handoff != nil || err == nil || !strings.Contains(err.Error(), "differs") {
+			t.Fatalf("handoff=%#v error=%v", handoff, err)
+		}
+	})
+
+	t.Run("map identity fault", func(t *testing.T) {
+		fixture := newDurableTCOwnerJournalFixture(t)
+		observation := fixture.mapStore.observations["control_map"]
+		observation.id++
+		fixture.mapStore.observations["control_map"] = observation
+		handoff, err := prepareDurableTCOwnerJournalHandoff(
+			fixture.handle,
+			fixture.store,
+			fixture.intent,
+			fixture.active,
+			fixture.desired,
+		)
+		if handoff != nil || err == nil || !strings.Contains(err.Error(), "map ID") {
+			t.Fatalf("handoff=%#v error=%v", handoff, err)
+		}
+	})
+
+	t.Run("program stage load fault", func(t *testing.T) {
+		fixture := newDurableTCOwnerJournalFixture(t)
+		stage := fixture.intent.ProgramStages[0]
+		wantErr := errors.New("injected staged program load failure")
+		fixture.programLoadErrors[stage.FileName] = wantErr
+		handoff, err := prepareDurableTCOwnerJournalHandoff(
+			fixture.handle,
+			fixture.store,
+			fixture.intent,
+			fixture.active,
+			fixture.desired,
+		)
+		if handoff != nil || !errors.Is(err, wantErr) {
+			t.Fatalf("handoff=%#v error=%v", handoff, err)
+		}
+	})
+}
+
+func TestAbortFailedOwnerApplyReportsRollbackVerificationBoundary(t *testing.T) {
+	t.Run("TC mismatch leaves journal handoff responsible", func(t *testing.T) {
+		fixture := newDurableTCOwnerJournalFixture(t)
+		kernel := newFakeTCKernel(11)
+		for id, fd := range map[uint32]int{21: 201, 22: 202, 31: 301, 32: 302} {
+			kernel.addProgram(id, fd)
+		}
+		kernel.addClsact(11)
+		kernel.addManagedFilter(11, canonicalTCFilterSlots()[0], 31)
+		kernel.addManagedFilter(11, canonicalTCFilterSlots()[1], 32)
+		verified, err := abortFailedOwnerApply(
+			fixture.handle,
+			fixture.store,
+			fixture.intent,
+			kernel.runtime(),
+		)
+		if verified || err == nil || !strings.Contains(err.Error(), "did not restore") {
+			t.Fatalf("verified=%t error=%v", verified, err)
+		}
+		persisted, loadErr := fixture.store.Load(fixture.handle.mountID)
+		if loadErr != nil || !sameExpectedOwnerRecord(persisted, fixture.intent) {
+			t.Fatalf("unverified abort changed durable journal: record=%#v error=%v", persisted, loadErr)
+		}
+	})
+
+	t.Run("exact active TC releases transient stage before later abort fault", func(t *testing.T) {
+		fixture := newDurableTCOwnerJournalFixture(t)
+		kernel := newFakeTCKernel(11)
+		for id, fd := range map[uint32]int{21: 201, 22: 202, 31: 301, 32: 302} {
+			kernel.addProgram(id, fd)
+		}
+		kernel.addClsact(11)
+		kernel.addManagedFilter(11, canonicalTCFilterSlots()[0], 21)
+		kernel.addManagedFilter(11, canonicalTCFilterSlots()[1], 22)
+		verified, err := abortFailedOwnerApply(
+			fixture.handle,
+			fixture.store,
+			fixture.intent,
+			kernel.runtime(),
+		)
+		if !verified || err == nil || !strings.Contains(err.Error(), "clock") {
+			t.Fatalf("verified=%t error=%v", verified, err)
+		}
+	})
+}
+
 func TestPinOwnerJSONFieldOrderAndCanonicalUTC(t *testing.T) {
 	_, parent, record := testPinOwnerRecord(t, t.TempDir())
 	data, err := marshalPinOwnerRecord(record)

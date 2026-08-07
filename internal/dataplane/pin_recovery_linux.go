@@ -17,6 +17,125 @@ type pinOwnerRecoveryResult struct {
 	directoryRemoved bool
 }
 
+// durableTCOwnerJournalHandoff is created only after the exact mutating owner
+// record has been read back from durable storage and every active/desired
+// program stage has been revalidated. Holding it proves that a partial or
+// missing TC filter set can be rolled forward after this process exits.
+type durableTCOwnerJournalHandoff struct {
+	resourceKey string
+	sequence    uint64
+}
+
+func validateTCOwnerJournalCoverage(
+	intent *pinOwnerRecord,
+	persisted *pinOwnerRecord,
+	active []tcFilterBinding,
+	desired []tcFilterBinding,
+) (*durableTCOwnerJournalHandoff, error) {
+	if intent == nil || persisted == nil {
+		return nil, errors.New("TC owner journal handoff requires intent and persisted records")
+	}
+	if !sameExpectedOwnerRecord(intent, persisted) {
+		return nil, errors.New("persisted TC owner journal differs from the mutating intent")
+	}
+	if persisted.Phase != pinOwnerPhaseApplying || persisted.Step != pinOwnerStepMutating {
+		return nil, fmt.Errorf(
+			"TC owner journal handoff requires applying/%s, got %s/%s",
+			pinOwnerStepMutating, persisted.Phase, persisted.Step,
+		)
+	}
+	if !slices.Equal(persisted.ActiveFilters, active) {
+		return nil, errors.New("TC owner journal handoff does not exactly cover the active filter set")
+	}
+	if !slices.Equal(persisted.DesiredFilters, desired) {
+		return nil, errors.New("TC owner journal handoff does not exactly cover the desired filter set")
+	}
+	token, err := tokenFromOwnerRecord(persisted)
+	if err != nil {
+		return nil, err
+	}
+	wantStages := buildOwnerProgramStages(
+		persisted.ResourceKey,
+		token,
+		active,
+		desired,
+	)
+	if !slices.Equal(persisted.ProgramStages, wantStages) {
+		return nil, errors.New("TC owner journal handoff program stages do not exactly cover active and desired programs")
+	}
+	return &durableTCOwnerJournalHandoff{
+		resourceKey: persisted.ResourceKey,
+		sequence:    persisted.Sequence,
+	}, nil
+}
+
+func prepareDurableTCOwnerJournalHandoff(
+	handle *pinPathHandle,
+	store *pinOwnerStore,
+	intent *pinOwnerRecord,
+	active []tcFilterBinding,
+	desired []tcFilterBinding,
+) (*durableTCOwnerJournalHandoff, error) {
+	if handle == nil || store == nil {
+		return nil, errors.New("TC owner journal handoff requires a pin handle and owner store")
+	}
+	persisted, err := store.Load(handle.mountID)
+	if err != nil {
+		return nil, fmt.Errorf("read back mutating TC owner journal: %w", err)
+	}
+	handoff, err := validateTCOwnerJournalCoverage(
+		intent,
+		persisted,
+		active,
+		desired,
+	)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateOwnerDirectoryEntries(handle, persisted); err != nil {
+		return nil, fmt.Errorf("validate TC owner journal directory coverage: %w", err)
+	}
+	pins, err := inspectPinnedMapSetWithPolicy(handle, true, false, false)
+	if err != nil {
+		return nil, fmt.Errorf("inspect durable TC owner journal maps: %w", err)
+	}
+	if err := validateOwnerPins(handle, persisted, pins, true); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("validate durable TC owner journal maps: %w", err),
+			closePinnedMapPins(pins),
+		)
+	}
+	if err := validateOwnerControlGeneration(pins, persisted.ActiveGeneration); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("validate durable TC owner journal control generation: %w", err),
+			closePinnedMapPins(pins),
+		)
+	}
+	if err := closePinnedMapPins(pins); err != nil {
+		return nil, fmt.Errorf("close durable TC owner journal map observations: %w", err)
+	}
+	for _, stage := range persisted.ProgramStages {
+		if err := validateOwnerProgramStage(handle, persisted, stage); err != nil {
+			return nil, fmt.Errorf(
+				"validate durable TC owner program stage %s: %w",
+				stage.FileName,
+				err,
+			)
+		}
+	}
+	return handoff, nil
+}
+
+// Transfer is infallible because the journal capability was acquired before
+// TC mutation. The retained stage's exact filters and program IDs are a subset
+// of that active/desired old/new set; recovery owns roll-forward from here.
+func (handoff *durableTCOwnerJournalHandoff) Transfer(stage *tcAttachStage) {
+	if handoff == nil || stage == nil {
+		return
+	}
+	stage.Disarm()
+}
+
 func ownerRuntimeNow(runtime pinPathRuntime) (time.Time, error) {
 	if runtime.now == nil {
 		return time.Time{}, errors.New("pin owner clock is unavailable")
@@ -405,20 +524,24 @@ func recoverApplyingPinOwnerTransaction(
 	}
 }
 
+// abortFailedOwnerApply reports whether the active TC set was observed exact.
+// Every path before that boundary is read-only. Once true is returned, a
+// transient tcAttachStage no longer owns a live filter even if later journal
+// cleanup or persistence fails.
 func abortFailedOwnerApply(
 	handle *pinPathHandle,
 	store *pinOwnerStore,
 	record *pinOwnerRecord,
 	tcRuntime tcRuntime,
-) error {
+) (bool, error) {
 	if record == nil ||
 		record.Phase != pinOwnerPhaseApplying ||
 		(record.Step != pinOwnerStepStaging &&
 			record.Step != pinOwnerStepMutating) {
-		return errors.New("failed owner apply is not at a rollback-safe journal step")
+		return false, errors.New("failed owner apply is not at a rollback-safe journal step")
 	}
 	if err := validateOwnerDirectoryEntries(handle, record); err != nil {
-		return err
+		return false, err
 	}
 	pins, err := inspectPinnedMapSetWithPolicy(
 		handle,
@@ -427,7 +550,7 @@ func abortFailedOwnerApply(
 		false,
 	)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer closePinnedMapPins(pins)
 	if err := validateOwnerPins(
@@ -436,13 +559,13 @@ func abortFailedOwnerApply(
 		pins,
 		record.ActiveGeneration != 0,
 	); err != nil {
-		return err
+		return false, err
 	}
 	if err := validateOwnerControlGeneration(
 		pins,
 		record.ActiveGeneration,
 	); err != nil {
-		return err
+		return false, err
 	}
 	covered := retainStaleOwnerFilters(
 		record.DesiredFilters,
@@ -453,25 +576,26 @@ func abortFailedOwnerApply(
 		covered,
 		tcRuntime,
 	); err != nil {
-		return fmt.Errorf(
+		return false, fmt.Errorf(
 			"TC rollback did not restore the owner journal's active set: %w",
 			err,
 		)
 	}
+	rollbackVerified := true
 	now, err := ownerRuntimeNow(handle.runtime)
 	if err != nil {
-		return err
+		return rollbackVerified, err
 	}
 	if record.ActiveGeneration == 0 {
 		if err := removeOwnerProgramStages(handle, record); err != nil {
-			return err
+			return rollbackVerified, err
 		}
 		detaching, err := newInitialAbortDetachingPinOwnerRecord(
 			record,
 			now,
 		)
 		if err != nil {
-			return err
+			return rollbackVerified, err
 		}
 		observeOwnerMount(detaching, handle.mountID)
 		if err := store.Persist(
@@ -479,7 +603,7 @@ func abortFailedOwnerApply(
 			record,
 			handle.mountID,
 		); err != nil {
-			return err
+			return rollbackVerified, err
 		}
 		_, err = recoverDetachingPinOwnerTransaction(
 			handle,
@@ -488,17 +612,17 @@ func abortFailedOwnerApply(
 			now,
 			tcRuntime,
 		)
-		return err
+		return rollbackVerified, err
 	}
 	if err := removeOwnerProgramStages(handle, record); err != nil {
-		return err
+		return rollbackVerified, err
 	}
 	active, err := abortApplyingPinOwnerRecord(record, now)
 	if err != nil {
-		return err
+		return rollbackVerified, err
 	}
 	observeOwnerMount(active, handle.mountID)
-	return store.Persist(active, record, handle.mountID)
+	return rollbackVerified, store.Persist(active, record, handle.mountID)
 }
 
 func executeOwnerDetachTransaction(
