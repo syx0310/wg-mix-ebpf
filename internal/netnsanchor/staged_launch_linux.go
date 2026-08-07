@@ -11,8 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -107,14 +109,21 @@ func (values *repeatedStringFlag) Set(value string) error {
 }
 
 type privateMountNSOperations struct {
-	unshare func(int) error
-	mount   func(string, string, string, uintptr, string) error
-	exec    reviewedExecFunc
+	lockThread            func()
+	unlockThread          func()
+	threadID              func() int
+	unshare               func(int) error
+	mount                 func(string, string, string, uintptr, string) error
+	setNamespace          func(int, int) error
+	inspectMountNamespace func() (unix.Stat_t, int, error)
+	exec                  reviewedExecFunc
 }
 
 type privateMountNSChildContract struct {
 	environment  []string
 	inheritedFDs []int
+	outerFD      int
+	outer        unix.Stat_t
 }
 
 func runReviewStagedLaunchCommand(arguments []string) error {
@@ -224,9 +233,14 @@ func runLaunchPrivateMountNSCommand(arguments []string) error {
 		childEnvironment,
 		productionReviewedPathPolicy(),
 		privateMountNSOperations{
-			unshare: unix.Unshare,
-			mount:   unix.Mount,
-			exec:    unix.Exec,
+			lockThread:            runtime.LockOSThread,
+			unlockThread:          runtime.UnlockOSThread,
+			threadID:              unix.Gettid,
+			unshare:               unix.Unshare,
+			mount:                 unix.Mount,
+			setNamespace:          unix.Setns,
+			inspectMountNamespace: inspectCurrentThreadMountNamespace,
+			exec:                  unix.Exec,
 		},
 	)
 }
@@ -238,7 +252,14 @@ func launchPrivateMountNS(
 	policy reviewedPathPolicy,
 	operations privateMountNSOperations,
 ) error {
-	if operations.unshare == nil || operations.mount == nil || operations.exec == nil {
+	if operations.lockThread == nil ||
+		operations.unlockThread == nil ||
+		operations.threadID == nil ||
+		operations.unshare == nil ||
+		operations.mount == nil ||
+		operations.setNamespace == nil ||
+		operations.inspectMountNamespace == nil ||
+		operations.exec == nil {
 		return errors.New("private mount namespace operations are incomplete")
 	}
 	if err := validateStagedSourceRoot(sourceRoot); err != nil {
@@ -282,8 +303,32 @@ func launchPrivateMountNS(
 			}
 		}
 	}
+	operations.lockThread()
+	lockedTID := operations.threadID()
+	if lockedTID <= 0 {
+		operations.unlockThread()
+		return errors.New("locked private mount namespace thread has an invalid TID")
+	}
+	lockedMetadata, lockedType, err := operations.inspectMountNamespace()
+	if err != nil {
+		operations.unlockThread()
+		return fmt.Errorf("inspect locked mount namespace before unshare: %w", err)
+	}
+	if err := validateOuterMountNamespacePair(
+		child.outer,
+		unix.CLONE_NEWNS,
+		lockedMetadata,
+		lockedType,
+	); err != nil {
+		operations.unlockThread()
+		return err
+	}
 	if err := operations.unshare(unix.CLONE_NEWNS); err != nil {
+		operations.unlockThread()
 		return fmt.Errorf("create private mount namespace: %w", err)
+	}
+	if operations.threadID() != lockedTID {
+		return errors.New("private mount namespace thread changed TID after unshare")
 	}
 	if err := operations.mount(
 		"",
@@ -292,11 +337,20 @@ func launchPrivateMountNS(
 		unix.MS_REC|unix.MS_PRIVATE,
 		"",
 	); err != nil {
-		return fmt.Errorf("make new mount namespace recursively private: %w", err)
+		return restoreOuterMountNamespaceAfterFailure(
+			child.outerFD,
+			child.outer,
+			lockedTID,
+			operations,
+			fmt.Errorf("make new mount namespace recursively private: %w", err),
+		)
+	}
+	if operations.threadID() != lockedTID {
+		return errors.New("private mount namespace thread changed TID before exec")
 	}
 	// Execute in this helper process: no fork/wait layer may change the smoke
 	// script's PPID contract with the outer launcher.
-	return operations.exec(
+	execErr := operations.exec(
 		"/proc/self/fd/"+strconv.Itoa(bash.targetFD),
 		[]string{
 			"/usr/bin/bash",
@@ -305,6 +359,59 @@ func launchPrivateMountNS(
 		},
 		child.environment,
 	)
+	if execErr == nil {
+		execErr = errors.New("held Bash exec returned without replacing the helper")
+	} else {
+		execErr = fmt.Errorf("execute held Bash in private mount namespace: %w", execErr)
+	}
+	return restoreOuterMountNamespaceAfterFailure(
+		child.outerFD,
+		child.outer,
+		lockedTID,
+		operations,
+		execErr,
+	)
+}
+
+func restoreOuterMountNamespaceAfterFailure(
+	outerFD int,
+	outerMetadata unix.Stat_t,
+	lockedTID int,
+	operations privateMountNSOperations,
+	cause error,
+) error {
+	if cause == nil {
+		cause = errors.New("private mount namespace launch failed")
+	}
+	if operations.threadID() != lockedTID {
+		return errors.Join(
+			cause,
+			errors.New("cannot restore outer mount namespace after locked TID changed"),
+		)
+	}
+	if err := operations.setNamespace(outerFD, unix.CLONE_NEWNS); err != nil {
+		return errors.Join(
+			cause,
+			fmt.Errorf("restore sealed outer mount namespace: %w", err),
+		)
+	}
+	restoredMetadata, restoredType, err := operations.inspectMountNamespace()
+	if err != nil {
+		return errors.Join(
+			cause,
+			fmt.Errorf("inspect restored outer mount namespace: %w", err),
+		)
+	}
+	if err := validateOuterMountNamespacePair(
+		outerMetadata,
+		unix.CLONE_NEWNS,
+		restoredMetadata,
+		restoredType,
+	); err != nil {
+		return errors.Join(cause, fmt.Errorf("verify restored outer mount namespace: %w", err))
+	}
+	operations.unlockThread()
+	return cause
 }
 
 func validatePrivateMountNSChildEnvironment(
@@ -407,6 +514,34 @@ func validatePrivateMountNSChildEnvironment(
 	if values["WG_MIX_EBPF_SMOKE_MOUNTNS_OUTER_ID"] != observedOuterIdentity {
 		return privateMountNSChildContract{}, errors.New("outer mount namespace FD identity differs from launch seal")
 	}
+	currentMountNSFD, err := unix.Open(
+		"/proc/thread-self/ns/mnt",
+		unix.O_RDONLY|unix.O_CLOEXEC,
+		0,
+	)
+	if err != nil {
+		return privateMountNSChildContract{}, fmt.Errorf("open current mount namespace before unshare: %w", err)
+	}
+	defer unix.Close(currentMountNSFD)
+	var currentMountNSMetadata unix.Stat_t
+	if err := unix.Fstat(currentMountNSFD, &currentMountNSMetadata); err != nil {
+		return privateMountNSChildContract{}, fmt.Errorf("stat current mount namespace before unshare: %w", err)
+	}
+	currentNamespaceType, err := unix.IoctlRetInt(
+		currentMountNSFD,
+		unix.NS_GET_NSTYPE,
+	)
+	if err != nil {
+		return privateMountNSChildContract{}, fmt.Errorf("query current mount namespace type before unshare: %w", err)
+	}
+	if err := validateOuterMountNamespacePair(
+		outerMetadata,
+		namespaceType,
+		currentMountNSMetadata,
+		currentNamespaceType,
+	); err != nil {
+		return privateMountNSChildContract{}, err
+	}
 	smokeDigest, err := sha256RegularFD(smokeFD, 16*1024*1024)
 	if err != nil {
 		return privateMountNSChildContract{}, fmt.Errorf("hash held staged smoke FD: %w", err)
@@ -414,10 +549,173 @@ func validatePrivateMountNSChildEnvironment(
 	if values["WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_SHA256"] != smokeDigest {
 		return privateMountNSChildContract{}, errors.New("held staged smoke hash differs from launch seal")
 	}
+	launchRecord := expectedPrivateMountNSLaunchRecord(values)
+	if err := validateAndRebindLaunchRecordFD(
+		parsedFDs["WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_FD"],
+		launchRecord,
+		values["WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_SHA256"],
+	); err != nil {
+		return privateMountNSChildContract{}, err
+	}
 	return privateMountNSChildContract{
 		environment:  append([]string(nil), entries...),
 		inheritedFDs: inheritedFDs,
+		outerFD:      outerFD,
+		outer:        outerMetadata,
 	}, nil
+}
+
+func validateOuterMountNamespacePair(
+	outer unix.Stat_t,
+	outerType int,
+	current unix.Stat_t,
+	currentType int,
+) error {
+	if outerType != unix.CLONE_NEWNS ||
+		currentType != unix.CLONE_NEWNS ||
+		outer.Dev == 0 ||
+		outer.Ino == 0 ||
+		current.Dev != outer.Dev ||
+		current.Ino != outer.Ino {
+		return errors.New("current and sealed outer mount namespace identities differ before unshare")
+	}
+	return nil
+}
+
+func inspectCurrentThreadMountNamespace() (unix.Stat_t, int, error) {
+	descriptor, err := unix.Open(
+		"/proc/thread-self/ns/mnt",
+		unix.O_RDONLY|unix.O_CLOEXEC,
+		0,
+	)
+	if err != nil {
+		return unix.Stat_t{}, 0, err
+	}
+	defer unix.Close(descriptor)
+	var metadata unix.Stat_t
+	if err := unix.Fstat(descriptor, &metadata); err != nil {
+		return unix.Stat_t{}, 0, err
+	}
+	namespaceType, err := unix.IoctlRetInt(descriptor, unix.NS_GET_NSTYPE)
+	if err != nil {
+		return unix.Stat_t{}, 0, err
+	}
+	return metadata, namespaceType, nil
+}
+
+func expectedPrivateMountNSLaunchRecord(values map[string]string) string {
+	return strings.Join([]string{
+		"format=wg-mix-ebpf-smoke-mountns-launch-v1",
+		"nonce=" + values["WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_NONCE"],
+		"outer_pid=" + values["WG_MIX_EBPF_SMOKE_MOUNTNS_OUTER_PID"],
+		"outer_id=" + values["WG_MIX_EBPF_SMOKE_MOUNTNS_OUTER_ID"],
+		"script_fd=" + values["WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_FD"],
+		"script_dev=" + values["WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_DEV"],
+		"script_ino=" + values["WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_INO"],
+		"script_sha256=" + values["WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_SHA256"],
+		"source_commit=" + values["WG_MIX_EBPF_SMOKE_MOUNTNS_SOURCE_COMMIT"],
+		"source_root=" + values["WG_MIX_EBPF_SMOKE_MOUNTNS_SOURCE_ROOT"],
+		"xor_secret_fd=" + values["WG_MIX_EBPF_SMOKE_MOUNTNS_XOR_SECRET_FD"],
+	}, "\n")
+}
+
+func validateAndRebindLaunchRecordFD(
+	descriptor int,
+	expectedRecord string,
+	expectedDigest string,
+) error {
+	if descriptor < 3 || expectedRecord == "" ||
+		!hexSHA256Pattern.MatchString(expectedDigest) {
+		return errors.New("launch record FD contract is invalid")
+	}
+	observed, err := readBoundedFD(descriptor, 64*1024)
+	if err != nil {
+		return fmt.Errorf("read launch record FD before unshare: %w", err)
+	}
+	expectedBytes := []byte(expectedRecord + "\n")
+	digest := sha256.Sum256([]byte(expectedRecord))
+	if string(observed) != string(expectedBytes) ||
+		fmt.Sprintf("%x", digest[:]) != expectedDigest {
+		return errors.New("launch record FD content differs from its sealed contract")
+	}
+	sealedFD, err := unix.MemfdCreate(
+		"wg-mix-ebpf-launch-record",
+		unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING,
+	)
+	if err != nil {
+		return fmt.Errorf("create sealed launch record FD: %w", err)
+	}
+	defer unix.Close(sealedFD)
+	for written := 0; written < len(expectedBytes); {
+		count, writeErr := unix.Write(sealedFD, expectedBytes[written:])
+		if writeErr != nil {
+			return fmt.Errorf("write sealed launch record FD: %w", writeErr)
+		}
+		if count == 0 {
+			return errors.New("write sealed launch record FD made no progress")
+		}
+		written += count
+	}
+	if _, err := unix.Seek(sealedFD, 0, 0); err != nil {
+		return fmt.Errorf("rewind sealed launch record FD: %w", err)
+	}
+	if _, err := unix.FcntlInt(
+		uintptr(sealedFD),
+		unix.F_ADD_SEALS,
+		unix.F_SEAL_SEAL|unix.F_SEAL_SHRINK|unix.F_SEAL_GROW|unix.F_SEAL_WRITE,
+	); err != nil {
+		return fmt.Errorf("seal launch record FD: %w", err)
+	}
+	if err := unix.Dup3(sealedFD, descriptor, 0); err != nil {
+		return fmt.Errorf("rebind launch record to its inherited FD number: %w", err)
+	}
+	return nil
+}
+
+func readBoundedFD(descriptor int, maximumBytes int) ([]byte, error) {
+	if descriptor < 0 || maximumBytes <= 0 {
+		return nil, errors.New("bounded FD read contract is invalid")
+	}
+	result := make([]byte, 0, 4096)
+	buffer := make([]byte, 4096)
+	deadline := time.Now().Add(ioTimeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil, errors.New("bounded FD input did not reach EOF before its deadline")
+		}
+		pollTimeout := int((remaining + time.Millisecond - 1) / time.Millisecond)
+		ready, err := unix.Poll(
+			[]unix.PollFd{{
+				Fd:     int32(descriptor),
+				Events: unix.POLLIN | unix.POLLHUP | unix.POLLERR,
+			}},
+			pollTimeout,
+		)
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return nil, err
+		}
+		if ready == 0 {
+			return nil, errors.New("bounded FD input did not reach EOF before its deadline")
+		}
+		count, err := unix.Read(descriptor, buffer)
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return nil, err
+		}
+		if count == 0 {
+			return result, nil
+		}
+		if len(result)+count > maximumBytes {
+			return nil, errors.New("bounded FD input exceeds its maximum size")
+		}
+		result = append(result, buffer[:count]...)
+	}
 }
 
 func sha256RegularFD(descriptor int, maximumBytes int64) (string, error) {

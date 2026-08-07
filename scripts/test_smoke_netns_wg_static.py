@@ -37,6 +37,12 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         cls.anchor_linux_source = (ANCHOR_PACKAGE / "run_linux.go").read_text(
             encoding="utf-8"
         )
+        cls.anchor_reviewed_tool_source = (
+            ANCHOR_PACKAGE / "reviewed_system_tool_linux.go"
+        ).read_text(encoding="utf-8")
+        cls.anchor_staged_launch_source = (
+            ANCHOR_PACKAGE / "staged_launch_linux.go"
+        ).read_text(encoding="utf-8")
         cls.anchor_protocol_source = (
             ANCHOR_PACKAGE / "protocol.go"
         ).read_text(
@@ -72,13 +78,15 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         for fragment in (
             "#!/usr/bin/bash -p",
             'if [[ "$-" != *p* ]]',
-            'readonly UNSHARE_BIN="/usr/bin/unshare"',
-            '"${UNSHARE_BIN}" --mount --propagation private --',
-            'readonly BASH_BIN="/usr/bin/bash"',
-            'readonly ENV_BIN="/usr/bin/env"',
-            '"${ENV_BIN}" -i "${child_environment[@]}"',
+            "run_anchor review-staged-launch",
+            "run_anchor review-system-tools",
+            'run_anchor reviewed-exec "${logical_path}" -- "$@"',
+            'exec {anchor_fd}<"${anchor_path}"',
+            'exec {anchor_review_fd}<&"${anchor_fd}"',
             'exec {smoke_fd}<"${smoke_path}"',
             'exec {outer_mountns_fd}<"/proc/self/ns/mnt"',
+            "launch-private-mountns",
+            '--child-env "${child_entry}"',
             'WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_SHA256',
             'WG_MIX_EBPF_SMOKE_MOUNTNS_SOURCE_COMMIT',
             'WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_FD',
@@ -90,9 +98,12 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertNotIn("--make-rprivate", launcher)
         self.assertNotIn("--make-private", launcher)
         self.assertNotIn("mount --make", launcher)
+        self.assertNotIn('"${ENV_BIN}" -i', launcher)
+        self.assertNotIn('"${UNSHARE_BIN}"', launcher)
+        self.assertNotIn('"${BASH_BIN}" "/proc/self/fd/', launcher)
         capture = launcher.index('XOR_SECRET="${XOR_PASSWORD-}"')
         unset = launcher.index("unset XOR_PASSWORD")
-        first_external = launcher.index('"${STAT_BIN}" -Lc')
+        first_external = launcher.index("\nrun_anchor review-staged-launch")
         self.assertLess(capture, unset)
         self.assertLess(unset, first_external)
         child_environment = launcher[
@@ -101,6 +112,63 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         ]
         self.assertNotIn("XOR_PASSWORD", child_environment)
         self.assertIn("WG_MIX_EBPF_SMOKE_MOUNTNS_XOR_SECRET_FD", child_environment)
+
+        reviewed = self.anchor_reviewed_tool_source
+        for path in (
+            "/usr/bin/bash",
+            "/usr/bin/env",
+            "/usr/bin/realpath",
+            "/usr/bin/sha256sum",
+            "/usr/bin/stat",
+            "/usr/bin/unshare",
+        ):
+            self.assertIn(f'"{path}"', reviewed)
+        for fragment in (
+            "unix.O_PATH|unix.O_NOFOLLOW|unix.O_CLOEXEC",
+            "unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS",
+            "equalReviewedChains(first.chain, second.chain)",
+            "argv[0] = logicalPath",
+            '"/proc/self/fd/" + strconv.Itoa(resolved.targetFD)',
+        ):
+            self.assertIn(fragment, reviewed)
+
+        staged = self.anchor_staged_launch_source
+        for fragment in (
+            "unix.RESOLVE_NO_SYMLINKS",
+            "metadata.nlink != 1",
+            "staged anchor path, held FD, and current image differ",
+            "unix.Unshare",
+            "unix.MS_REC|unix.MS_PRIVATE",
+            '"/usr/bin/bash"',
+            '"/proc/self/fd/" + strconv.Itoa(smokeFD)',
+            "outer mount namespace FD identity differs from launch seal",
+            "current and sealed outer mount namespace identities differ before unshare",
+            "held staged smoke hash differs from launch seal",
+            "validateAndRebindLaunchRecordFD(",
+            "launch record FD content differs from its sealed contract",
+            "unix.MFD_CLOEXEC|unix.MFD_ALLOW_SEALING",
+            "unix.F_SEAL_SEAL|unix.F_SEAL_SHRINK|unix.F_SEAL_GROW|unix.F_SEAL_WRITE",
+            "unix.Dup3(sealedFD, descriptor, 0)",
+            "runtime.LockOSThread",
+            "runtime.UnlockOSThread",
+            "unix.Gettid",
+            "unix.Setns",
+            "inspectCurrentThreadMountNamespace",
+            "restoreOuterMountNamespaceAfterFailure(",
+        ):
+            self.assertIn(fragment, staged)
+        launch = staged[
+            staged.index("func launchPrivateMountNS(") :
+            staged.index("\nfunc restoreOuterMountNamespaceAfterFailure(")
+        ]
+        self.assertLess(
+            launch.index("validatePrivateMountNSChildEnvironment("),
+            launch.index("operations.unshare(unix.CLONE_NEWNS)"),
+        )
+        self.assertLess(
+            launch.index("operations.lockThread()"),
+            launch.index("operations.unshare(unix.CLONE_NEWNS)"),
+        )
 
         self.assertIn(
             "override WG_NETNS_SMOKE_LAUNCHER := "

@@ -3,10 +3,12 @@
 package netnsanchor
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -309,7 +311,7 @@ func TestStrictStagedLaunchRejectsHardLinkedLeaf(t *testing.T) {
 	}
 }
 
-func TestPrivateMountNSLaunchUsesSameProcessFDExec(t *testing.T) {
+func TestPrivateMountNSExecFailureRestoresSameLockedThread(t *testing.T) {
 	fixture := newStagedLaunchFixture(t)
 	defer fixture.close()
 	installFixtureSystemTool(t, fixture.root, "/usr/bin/bash")
@@ -331,7 +333,14 @@ func TestPrivateMountNSLaunchUsesSameProcessFDExec(t *testing.T) {
 		smokeMetadata,
 		validCommit,
 	)
-	order := make([]string, 0, 3)
+	order := make([]string, 0, 8)
+	lockedTID := 0
+	assertLockedTID := func() {
+		t.Helper()
+		if lockedTID <= 0 || unix.Gettid() != lockedTID {
+			t.Fatalf("private mount namespace operation changed TID: locked=%d current=%d", lockedTID, unix.Gettid())
+		}
+	}
 	execError := errors.New("exec callback returned")
 	err = launchPrivateMountNS(
 		fixture.sourceRoot,
@@ -339,7 +348,19 @@ func TestPrivateMountNSLaunchUsesSameProcessFDExec(t *testing.T) {
 		environment,
 		fixture.policy,
 		privateMountNSOperations{
+			lockThread: func() {
+				runtime.LockOSThread()
+				lockedTID = unix.Gettid()
+				order = append(order, "lock")
+			},
+			unlockThread: func() {
+				assertLockedTID()
+				order = append(order, "unlock")
+				runtime.UnlockOSThread()
+			},
+			threadID: unix.Gettid,
 			unshare: func(flags int) error {
+				assertLockedTID()
 				order = append(order, "unshare")
 				if flags != unix.CLONE_NEWNS {
 					t.Fatalf("unshare flags = %#x", flags)
@@ -347,6 +368,7 @@ func TestPrivateMountNSLaunchUsesSameProcessFDExec(t *testing.T) {
 				return nil
 			},
 			mount: func(source, target, filesystem string, flags uintptr, data string) error {
+				assertLockedTID()
 				order = append(order, "mount")
 				if source != "" || target != "/" || filesystem != "" ||
 					flags != unix.MS_REC|unix.MS_PRIVATE || data != "" {
@@ -361,7 +383,25 @@ func TestPrivateMountNSLaunchUsesSameProcessFDExec(t *testing.T) {
 				}
 				return nil
 			},
+			setNamespace: func(descriptor int, namespaceType int) error {
+				assertLockedTID()
+				order = append(order, "setns")
+				if descriptor != mustEnvironmentFD(
+					t,
+					environment,
+					"WG_MIX_EBPF_SMOKE_MOUNTNS_OUTER_FD",
+				) || namespaceType != unix.CLONE_NEWNS {
+					t.Fatalf("outer namespace restore contract = fd %d type %#x", descriptor, namespaceType)
+				}
+				return nil
+			},
+			inspectMountNamespace: func() (unix.Stat_t, int, error) {
+				assertLockedTID()
+				order = append(order, "inspect")
+				return inspectCurrentThreadMountNamespace()
+			},
 			exec: func(path string, argv []string, gotEnvironment []string) error {
+				assertLockedTID()
 				order = append(order, "exec")
 				if !strings.HasPrefix(path, "/proc/self/fd/") {
 					t.Fatalf("private launch exec path = %q", path)
@@ -375,6 +415,25 @@ func TestPrivateMountNSLaunchUsesSameProcessFDExec(t *testing.T) {
 				if strings.Join(gotEnvironment, "\x00") != strings.Join(environment, "\x00") {
 					t.Fatalf("private launch environment changed: %#v", gotEnvironment)
 				}
+				launchFD, err := strconv.Atoi(environmentValue(
+					t,
+					gotEnvironment,
+					"WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_FD",
+				))
+				if err != nil {
+					t.Fatalf("parse rebound launch record FD: %v", err)
+				}
+				seals, err := unix.FcntlInt(uintptr(launchFD), unix.F_GET_SEALS, 0)
+				if err != nil {
+					t.Fatalf("inspect rebound launch record FD seals: %v", err)
+				}
+				wantSeals := unix.F_SEAL_SEAL |
+					unix.F_SEAL_SHRINK |
+					unix.F_SEAL_GROW |
+					unix.F_SEAL_WRITE
+				if seals != wantSeals {
+					t.Fatalf("rebound launch record FD seals = %#x, want %#x", seals, wantSeals)
+				}
 				return execError
 			},
 		},
@@ -382,8 +441,143 @@ func TestPrivateMountNSLaunchUsesSameProcessFDExec(t *testing.T) {
 	if !errors.Is(err, execError) {
 		t.Fatalf("private mount namespace launch error = %v", err)
 	}
-	if strings.Join(order, ",") != "unshare,mount,exec" {
+	if strings.Join(order, ",") != "lock,inspect,unshare,mount,exec,setns,inspect,unlock" {
 		t.Fatalf("private mount namespace operation order = %#v", order)
+	}
+}
+
+func TestPrivateMountNSMountFailureRestoresBeforeUnlock(t *testing.T) {
+	fixture, smokeFD, environment := newPrivateMountNSLaunchFixture(t)
+	outerFD := mustEnvironmentFD(
+		t,
+		environment,
+		"WG_MIX_EBPF_SMOKE_MOUNTNS_OUTER_FD",
+	)
+	var outerMetadata unix.Stat_t
+	if err := unix.Fstat(outerFD, &outerMetadata); err != nil {
+		t.Fatalf("stat outer mount namespace fixture: %v", err)
+	}
+	order := make([]string, 0, 7)
+	locked := false
+	restored := false
+	executed := false
+	mountError := errors.New("mount callback failed")
+	err := launchPrivateMountNS(
+		fixture.sourceRoot,
+		smokeFD,
+		environment,
+		fixture.policy,
+		privateMountNSOperations{
+			lockThread: func() {
+				locked = true
+				order = append(order, "lock")
+			},
+			unlockThread: func() {
+				if !locked || !restored {
+					t.Fatal("mount namespace thread unlocked before verified restore")
+				}
+				locked = false
+				order = append(order, "unlock")
+			},
+			threadID: func() int { return 73 },
+			unshare: func(int) error {
+				order = append(order, "unshare")
+				return nil
+			},
+			mount: func(string, string, string, uintptr, string) error {
+				order = append(order, "mount")
+				return mountError
+			},
+			setNamespace: func(descriptor int, namespaceType int) error {
+				order = append(order, "setns")
+				if descriptor != outerFD || namespaceType != unix.CLONE_NEWNS {
+					t.Fatalf("restore contract = fd %d type %#x", descriptor, namespaceType)
+				}
+				restored = true
+				return nil
+			},
+			inspectMountNamespace: func() (unix.Stat_t, int, error) {
+				order = append(order, "inspect")
+				return outerMetadata, unix.CLONE_NEWNS, nil
+			},
+			exec: func(string, []string, []string) error {
+				executed = true
+				return nil
+			},
+		},
+	)
+	if !errors.Is(err, mountError) {
+		t.Fatalf("mount failure result = %v", err)
+	}
+	if locked || !restored || executed {
+		t.Fatalf("mount failure state: locked=%t restored=%t executed=%t", locked, restored, executed)
+	}
+	if strings.Join(order, ",") != "lock,inspect,unshare,mount,setns,inspect,unlock" {
+		t.Fatalf("mount failure restore order = %#v", order)
+	}
+}
+
+func TestPrivateMountNSRestoreFailureStaysLockedAndStops(t *testing.T) {
+	fixture, smokeFD, environment := newPrivateMountNSLaunchFixture(t)
+	outerFD := mustEnvironmentFD(
+		t,
+		environment,
+		"WG_MIX_EBPF_SMOKE_MOUNTNS_OUTER_FD",
+	)
+	var outerMetadata unix.Stat_t
+	if err := unix.Fstat(outerFD, &outerMetadata); err != nil {
+		t.Fatalf("stat outer mount namespace fixture: %v", err)
+	}
+	order := make([]string, 0, 5)
+	unlocked := false
+	executed := false
+	mountError := errors.New("mount callback failed")
+	restoreError := errors.New("setns callback failed")
+	err := launchPrivateMountNS(
+		fixture.sourceRoot,
+		smokeFD,
+		environment,
+		fixture.policy,
+		privateMountNSOperations{
+			lockThread: func() { order = append(order, "lock") },
+			unlockThread: func() {
+				unlocked = true
+				order = append(order, "unlock")
+			},
+			threadID: func() int { return 79 },
+			unshare: func(int) error {
+				order = append(order, "unshare")
+				return nil
+			},
+			mount: func(string, string, string, uintptr, string) error {
+				order = append(order, "mount")
+				return mountError
+			},
+			setNamespace: func(descriptor int, namespaceType int) error {
+				order = append(order, "setns")
+				if descriptor != outerFD || namespaceType != unix.CLONE_NEWNS {
+					t.Fatalf("restore contract = fd %d type %#x", descriptor, namespaceType)
+				}
+				return restoreError
+			},
+			inspectMountNamespace: func() (unix.Stat_t, int, error) {
+				order = append(order, "inspect")
+				return outerMetadata, unix.CLONE_NEWNS, nil
+			},
+			exec: func(string, []string, []string) error {
+				executed = true
+				return nil
+			},
+		},
+	)
+	if !errors.Is(err, mountError) || !errors.Is(err, restoreError) {
+		t.Fatalf("restore failure result = %v", err)
+	}
+	if unlocked || executed {
+		t.Fatalf("restore failure continued: unlocked=%t executed=%t", unlocked, executed)
+	}
+	if strings.Join(order, ",") != "lock,inspect,unshare,mount,setns" {
+		t.Fatalf("restore failure order = %#v", order)
 	}
 }
 
@@ -418,17 +612,7 @@ func TestPrivateMountNSLaunchRejectsUnallowlistedEnvironment(t *testing.T) {
 		smokeFD,
 		environment,
 		fixture.policy,
-		privateMountNSOperations{
-			unshare: func(int) error { mutated = true; return nil },
-			mount: func(string, string, string, uintptr, string) error {
-				mutated = true
-				return nil
-			},
-			exec: func(string, []string, []string) error {
-				mutated = true
-				return nil
-			},
-		},
+		mutatingPrivateMountNSOperations(&mutated),
 	)
 	if err == nil {
 		t.Fatal("unallowlisted child environment was accepted")
@@ -452,6 +636,36 @@ func TestPrivateMountNSLaunchRejectsSealMismatchBeforeMutation(t *testing.T) {
 					"WG_MIX_EBPF_SMOKE_MOUNTNS_SCRIPT_SHA256",
 					strings.Repeat("c", 64),
 				)
+			},
+		},
+		{
+			name: "launch-record-digest",
+			mutate: func(t *testing.T, environment []string) {
+				replaceEnvironmentValue(
+					t,
+					environment,
+					"WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_SHA256",
+					strings.Repeat("d", 64),
+				)
+			},
+		},
+		{
+			name: "launch-record-content",
+			mutate: func(t *testing.T, environment []string) {
+				descriptor, err := strconv.Atoi(environmentValue(
+					t,
+					environment,
+					"WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_FD",
+				))
+				if err != nil {
+					t.Fatalf("parse launch record FD fixture: %v", err)
+				}
+				if _, err := unix.Pwrite(descriptor, []byte("X"), 0); err != nil {
+					t.Fatalf("mutate launch record FD fixture: %v", err)
+				}
+				if _, err := unix.Seek(descriptor, 0, 0); err != nil {
+					t.Fatalf("rewind mutated launch record FD fixture: %v", err)
+				}
 			},
 		},
 		{
@@ -511,17 +725,7 @@ func TestPrivateMountNSLaunchRejectsSealMismatchBeforeMutation(t *testing.T) {
 				smokeFD,
 				environment,
 				fixture.policy,
-				privateMountNSOperations{
-					unshare: func(int) error { mutated = true; return nil },
-					mount: func(string, string, string, uintptr, string) error {
-						mutated = true
-						return nil
-					},
-					exec: func(string, []string, []string) error {
-						mutated = true
-						return nil
-					},
-				},
+				mutatingPrivateMountNSOperations(&mutated),
 			)
 			if err == nil {
 				t.Fatal("private mount namespace launch seal mismatch was accepted")
@@ -530,6 +734,36 @@ func TestPrivateMountNSLaunchRejectsSealMismatchBeforeMutation(t *testing.T) {
 				t.Fatal("private mount namespace mutated before seal rejection")
 			}
 		})
+	}
+}
+
+func TestOuterMountNamespacePairRequiresExactIdentity(t *testing.T) {
+	outer := unix.Stat_t{Dev: 7, Ino: 11}
+	if err := validateOuterMountNamespacePair(
+		outer,
+		unix.CLONE_NEWNS,
+		outer,
+		unix.CLONE_NEWNS,
+	); err != nil {
+		t.Fatalf("matching mount namespace identities were rejected: %v", err)
+	}
+	changed := outer
+	changed.Ino++
+	if err := validateOuterMountNamespacePair(
+		outer,
+		unix.CLONE_NEWNS,
+		changed,
+		unix.CLONE_NEWNS,
+	); err == nil {
+		t.Fatal("different current mount namespace identity was accepted")
+	}
+	if err := validateOuterMountNamespacePair(
+		outer,
+		unix.CLONE_NEWNS,
+		outer,
+		unix.CLONE_NEWNET,
+	); err == nil {
+		t.Fatal("different current namespace type was accepted")
 	}
 }
 
@@ -646,6 +880,34 @@ func newStagedLaunchFixture(t *testing.T) stagedLaunchFixture {
 	}
 }
 
+func newPrivateMountNSLaunchFixture(
+	t *testing.T,
+) (stagedLaunchFixture, int, []string) {
+	t.Helper()
+	fixture := newStagedLaunchFixture(t)
+	t.Cleanup(fixture.close)
+	installFixtureSystemTool(t, fixture.root, "/usr/bin/bash")
+	validCommit := "0123456789abcdef0123456789abcdef01234567"
+	originalCommit := sourceCommit
+	sourceCommit = validCommit
+	t.Cleanup(func() {
+		sourceCommit = originalCommit
+	})
+	smokeFD := fixture.descriptors[stagedSmokeName]
+	smokeMetadata, err := reviewedMetadataFromFD(smokeFD)
+	if err != nil {
+		t.Fatalf("stat held staged smoke fixture: %v", err)
+	}
+	environment := privateMountNSFixtureEnvironment(
+		t,
+		fixture.sourceRoot,
+		smokeFD,
+		smokeMetadata,
+		validCommit,
+	)
+	return fixture, smokeFD, environment
+}
+
 func (fixture stagedLaunchFixture) close() {
 	for _, descriptor := range fixture.descriptors {
 		_ = unix.Close(descriptor)
@@ -676,7 +938,10 @@ func privateMountNSFixtureEnvironment(
 	commit string,
 ) []string {
 	t.Helper()
-	launchFD, err := unix.Open("/dev/null", unix.O_RDONLY|unix.O_CLOEXEC, 0)
+	launchFD, err := unix.MemfdCreate(
+		"wg-mix-ebpf-launch-record-fixture",
+		unix.MFD_CLOEXEC,
+	)
 	if err != nil {
 		t.Fatalf("open launch record FD fixture: %v", err)
 	}
@@ -704,7 +969,7 @@ func privateMountNSFixtureEnvironment(
 	if err != nil {
 		t.Fatalf("hash staged smoke FD fixture: %v", err)
 	}
-	return []string{
+	environment := []string{
 		"PATH=/usr/sbin:/usr/bin:/sbin:/bin",
 		"LC_ALL=C",
 		"WG_MIX_EBPF_SMOKE_MOUNTNS_CHILD=1",
@@ -722,6 +987,37 @@ func privateMountNSFixtureEnvironment(
 		"WG_MIX_EBPF_SMOKE_MOUNTNS_SOURCE_ROOT=" + sourceRoot,
 		"WG_MIX_EBPF_SMOKE_MOUNTNS_XOR_SECRET_FD=" + strconv.Itoa(xorFD),
 	}
+	values := make(map[string]string, len(environment))
+	for _, entry := range environment {
+		name, value, found := strings.Cut(entry, "=")
+		if !found {
+			t.Fatalf("malformed launch environment fixture: %q", entry)
+		}
+		values[name] = value
+	}
+	record := expectedPrivateMountNSLaunchRecord(values)
+	digest := sha256.Sum256([]byte(record))
+	replaceEnvironmentValue(
+		t,
+		environment,
+		"WG_MIX_EBPF_SMOKE_MOUNTNS_LAUNCH_SHA256",
+		fmt.Sprintf("%x", digest[:]),
+	)
+	payload := []byte(record + "\n")
+	for written := 0; written < len(payload); {
+		count, err := unix.Write(launchFD, payload[written:])
+		if err != nil {
+			t.Fatalf("write launch record FD fixture: %v", err)
+		}
+		if count == 0 {
+			t.Fatal("write launch record FD fixture made no progress")
+		}
+		written += count
+	}
+	if _, err := unix.Seek(launchFD, 0, 0); err != nil {
+		t.Fatalf("rewind launch record FD fixture: %v", err)
+	}
+	return environment
 }
 
 func environmentValue(t *testing.T, environment []string, name string) string {
@@ -734,6 +1030,46 @@ func environmentValue(t *testing.T, environment []string, name string) string {
 	}
 	t.Fatalf("environment fixture is missing %s", name)
 	return ""
+}
+
+func mustEnvironmentFD(t *testing.T, environment []string, name string) int {
+	t.Helper()
+	descriptor, err := strconv.Atoi(environmentValue(t, environment, name))
+	if err != nil || descriptor < 0 {
+		t.Fatalf("environment fixture FD %s = %q", name, environmentValue(t, environment, name))
+	}
+	return descriptor
+}
+
+func mutatingPrivateMountNSOperations(mutated *bool) privateMountNSOperations {
+	mark := func() {
+		*mutated = true
+	}
+	return privateMountNSOperations{
+		lockThread:   mark,
+		unlockThread: mark,
+		threadID:     unix.Gettid,
+		unshare: func(int) error {
+			mark()
+			return nil
+		},
+		mount: func(string, string, string, uintptr, string) error {
+			mark()
+			return nil
+		},
+		setNamespace: func(int, int) error {
+			mark()
+			return nil
+		},
+		inspectMountNamespace: func() (unix.Stat_t, int, error) {
+			mark()
+			return unix.Stat_t{}, 0, nil
+		},
+		exec: func(string, []string, []string) error {
+			mark()
+			return nil
+		},
+	}
 }
 
 func replaceEnvironmentValue(
