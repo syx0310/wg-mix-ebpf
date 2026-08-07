@@ -6,6 +6,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"reflect"
+	"sync"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 )
@@ -157,23 +159,102 @@ type PacketReinjector interface {
 	Reinject(context.Context, abi.FakeTCPSessionKey, PendingPacket) error
 }
 
-// Controller executes the userspace side effects selected by Engine. It does
-// not retry side effects: a captured packet leaves the engine queue once and
-// is passed to Reinject exactly once after preceding control sends succeed.
-type Controller struct {
-	engine     *Engine
-	sender     ControlSender
-	reinjector PacketReinjector
+// ControllerBackend owns every external resource used by Controller.
+// NewController takes ownership on success. Combining both side-effect paths
+// under one Close contract prevents two wrappers from closing the same
+// underlying file descriptor independently.
+//
+// SendControl and Reinject must not synchronously call HandleSample, Tick, or
+// Close on their owning Controller: action execution is deliberately
+// serialised, so such re-entry cannot preserve the ordering contract. Close is
+// called after admitted operations drain and without either controller lock.
+// It may call HandleSample or Tick, which immediately return
+// ErrControllerClosed, but it must not recursively call Close.
+type ControllerBackend interface {
+	ControlSender
+	PacketReinjector
+	Close() error
 }
 
-func NewController(engine *Engine, sender ControlSender, reinjector PacketReinjector) (*Controller, error) {
-	if engine == nil || sender == nil || reinjector == nil {
-		return nil, errors.New("faketcp controller requires engine, control sender, and packet reinjector")
+var (
+	// ErrControllerClosed means the controller has begun or completed closing.
+	// An operation returning this error has not touched Engine or the backend.
+	ErrControllerClosed = errors.New("faketcp controller is closed")
+
+	// ErrControllerFailed means action execution failed after Engine had
+	// already committed its transition. The first execution error is retained,
+	// and later operations return it without touching Engine or the backend.
+	ErrControllerFailed = errors.New("faketcp controller action execution failed")
+
+	errControllerContextNil = errors.New("faketcp controller context is nil")
+)
+
+// Controller executes the userspace side effects selected by Engine. Engine
+// state transitions and all resulting side effects are serialised with each
+// other. Close rejects new work, waits for admitted operations to drain, and
+// then closes the backend without holding either controller lock.
+// It does not retry side effects: a captured packet leaves the engine queue
+// once and is passed to Reinject exactly once after preceding control sends
+// succeed.
+//
+// Engine currently commits a transition before its actions are executed. Any
+// action-execution failure, including a backend error or side-effect-stage
+// context cancellation, is therefore terminal and is never rolled back or
+// retried. The experimental activation gate must remain closed until this
+// two-phase action/rollback gap has a concrete solution. A Controller must not
+// be copied after NewController returns.
+type Controller struct {
+	stateMu sync.Mutex
+	opMu    sync.Mutex
+
+	engine       *Engine
+	backend      ControllerBackend
+	inflightDone *sync.Cond
+	closeDone    chan struct{}
+	inflight     uint64
+	closing      bool
+	closed       bool
+	failureErr   error
+	closeErr     error
+}
+
+func NewController(engine *Engine, backend ControllerBackend) (*Controller, error) {
+	if engine == nil {
+		return nil, errors.New("faketcp controller requires an engine")
 	}
-	return &Controller{engine: engine, sender: sender, reinjector: reinjector}, nil
+	if controllerBackendIsNil(backend) {
+		return nil, errors.New("faketcp controller backend is nil")
+	}
+	controller := &Controller{
+		engine:    engine,
+		backend:   backend,
+		closeDone: make(chan struct{}),
+	}
+	controller.inflightDone = sync.NewCond(&controller.stateMu)
+	return controller, nil
+}
+
+func controllerBackendIsNil(backend ControllerBackend) bool {
+	if backend == nil {
+		return true
+	}
+	value := reflect.ValueOf(backend)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
 }
 
 func (c *Controller) HandleSample(ctx context.Context, sample []byte) ([]Action, error) {
+	if err := c.beginSerializedOperation(); err != nil {
+		return nil, err
+	}
+	defer c.endSerializedOperation()
+	if ctx == nil {
+		return nil, errControllerContextNil
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -198,35 +279,169 @@ func (c *Controller) HandleSample(ctx context.Context, sample []byte) ([]Action,
 	if err != nil {
 		return actions, err
 	}
-	if err := c.execute(ctx, actions); err != nil {
-		return actions, err
+	if err := c.executeActions(ctx, actions); err != nil {
+		return actions, c.markFailed(err)
 	}
 	return actions, nil
 }
 
 func (c *Controller) Tick(ctx context.Context) ([]Action, error) {
+	if err := c.beginSerializedOperation(); err != nil {
+		return nil, err
+	}
+	defer c.endSerializedOperation()
+	if ctx == nil {
+		return nil, errControllerContextNil
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	actions, engineErr := c.engine.Tick()
-	executeErr := c.execute(ctx, actions)
-	return actions, errors.Join(engineErr, executeErr)
+	if executeErr := c.executeActions(ctx, actions); executeErr != nil {
+		return actions, errors.Join(engineErr, c.markFailed(executeErr))
+	}
+	return actions, engineErr
 }
 
-func (c *Controller) execute(ctx context.Context, actions []Action) error {
+// Close first rejects new operations, waits for admitted HandleSample and Tick
+// calls, and then closes the single owned backend exactly once without holding
+// stateMu or opMu. A first close error is retained and returned by every later
+// Close call. A nil or zero-value receiver fails closed with
+// ErrControllerClosed.
+func (c *Controller) Close() error {
+	if c == nil {
+		return ErrControllerClosed
+	}
+
+	c.stateMu.Lock()
+	if !c.initializedLocked() {
+		c.stateMu.Unlock()
+		return ErrControllerClosed
+	}
+	if c.closed {
+		closeErr := c.closeErr
+		c.stateMu.Unlock()
+		return closeErr
+	}
+	if c.closing {
+		closeDone := c.closeDone
+		c.stateMu.Unlock()
+		<-closeDone
+		c.stateMu.Lock()
+		closeErr := c.closeErr
+		c.stateMu.Unlock()
+		return closeErr
+	}
+
+	c.closing = true
+	for c.inflight != 0 {
+		c.inflightDone.Wait()
+	}
+	backend := c.backend
+	c.stateMu.Unlock()
+
+	var closeErr error
+	if err := backend.Close(); err != nil {
+		closeErr = fmt.Errorf("close faketcp controller backend: %w", err)
+	}
+
+	c.stateMu.Lock()
+	c.closeErr = closeErr
+	c.closed = true
+	close(c.closeDone)
+	c.inflightDone.Broadcast()
+	c.stateMu.Unlock()
+	return closeErr
+}
+
+func (c *Controller) beginSerializedOperation() error {
+	if c == nil {
+		return ErrControllerClosed
+	}
+
+	c.stateMu.Lock()
+	if !c.initializedLocked() || c.closing || c.closed {
+		c.stateMu.Unlock()
+		return ErrControllerClosed
+	}
+	if c.failureErr != nil {
+		failureErr := c.failureErr
+		c.stateMu.Unlock()
+		return failureErr
+	}
+	c.inflight++
+	c.stateMu.Unlock()
+
+	c.opMu.Lock()
+	c.stateMu.Lock()
+	failureErr := c.failureErr
+	initialized := c.initializedLocked()
+	c.stateMu.Unlock()
+	if failureErr != nil {
+		c.opMu.Unlock()
+		c.finishOperation()
+		return failureErr
+	}
+	if !initialized {
+		c.opMu.Unlock()
+		c.finishOperation()
+		return ErrControllerClosed
+	}
+	return nil
+}
+
+func (c *Controller) endSerializedOperation() {
+	c.opMu.Unlock()
+	c.finishOperation()
+}
+
+func (c *Controller) finishOperation() {
+	c.stateMu.Lock()
+	if c.inflight > 0 {
+		c.inflight--
+	}
+	if c.inflight == 0 && c.inflightDone != nil {
+		c.inflightDone.Broadcast()
+	}
+	c.stateMu.Unlock()
+}
+
+func (c *Controller) initializedLocked() bool {
+	return c.engine != nil &&
+		!controllerBackendIsNil(c.backend) &&
+		c.inflightDone != nil &&
+		c.closeDone != nil
+}
+
+func (c *Controller) markFailed(cause error) error {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if c.failureErr == nil {
+		c.failureErr = fmt.Errorf("%w: %w", ErrControllerFailed, cause)
+	}
+	return c.failureErr
+}
+
+// executeActions is called only while opMu is held. A non-nil error after an
+// Engine transition is promoted by the caller to the permanent failed state.
+func (c *Controller) executeActions(ctx context.Context, actions []Action) error {
 	for _, action := range actions {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		switch action.Kind {
 		case ActionSendControl:
-			if err := c.sender.SendControl(ctx, action.Flow, action.WGID, action.Control); err != nil {
+			if err := c.backend.SendControl(ctx, action.Flow, action.WGID, action.Control); err != nil {
 				return fmt.Errorf("send faketcp control packet (%s): %w", action.Reason, err)
 			}
 		case ActionReleasePending:
 			var errs []error
 			for _, packet := range action.Packets {
-				if err := c.reinjector.Reinject(ctx, action.Flow, packet); err != nil {
+				if err := ctx.Err(); err != nil {
+					errs = append(errs, fmt.Errorf("reinject faketcp first packet: %w", err))
+					break
+				}
+				if err := c.backend.Reinject(ctx, action.Flow, packet); err != nil {
 					errs = append(errs, fmt.Errorf("reinject faketcp first packet: %w", err))
 				}
 			}
