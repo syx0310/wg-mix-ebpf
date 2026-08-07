@@ -23,15 +23,17 @@ const (
 )
 
 type coreMemoryMap struct {
-	name          string
-	kind          coreMemoryMapKind
-	entries       map[any]any
-	events        *[]string
-	programIDs    map[uint32]uint32
-	failLookup    error
-	failUpdate    error
-	failDelete    error
-	corruptUpdate any
+	name                  string
+	kind                  coreMemoryMapKind
+	entries               map[any]any
+	events                *[]string
+	programIDs            map[uint32]uint32
+	failLookup            error
+	failUpdate            error
+	failLookupAfterUpdate error
+	failUpdateAfterWrite  error
+	failDelete            error
+	corruptUpdate         any
 }
 
 func (memory *coreMemoryMap) Lookup(key, valueOut any) error {
@@ -97,6 +99,15 @@ func (memory *coreMemoryMap) Update(
 		memory.corruptUpdate = nil
 	}
 	memory.entries[key] = stored
+	if memory.failLookupAfterUpdate != nil {
+		memory.failLookup = memory.failLookupAfterUpdate
+		memory.failLookupAfterUpdate = nil
+	}
+	if memory.failUpdateAfterWrite != nil {
+		err := memory.failUpdateAfterWrite
+		memory.failUpdateAfterWrite = nil
+		return err
+	}
 	return nil
 }
 
@@ -360,6 +371,75 @@ func TestExperimentalCoreDeactivateFailureKeepsDependentMapsIntact(t *testing.T)
 	}
 	if got := fixture.maps["control_map"].entries[abi.ControlKeyGlobal]; got != coreTestSnapshot(91).Control[abi.ControlKeyGlobal] {
 		t.Fatalf("failed deactivate changed control: %#v", got)
+	}
+}
+
+func TestExperimentalCoreDeactivateReadbackFailureConvergesFromObservedZero(t *testing.T) {
+	fixture := newCoreStageFixture(t)
+	stage := fixture.stage(t, 91)
+	if err := stage.CommitControl(); err != nil {
+		t.Fatal(err)
+	}
+	control := fixture.maps["control_map"]
+	readErr := errors.New("injected zero readback failure")
+	control.failLookupAfterUpdate = readErr
+	if err := stage.Deactivate(); !errors.Is(err, readErr) {
+		t.Fatalf("first Deactivate error = %v", err)
+	}
+	if got := control.entries[abi.ControlKeyGlobal]; got != (abi.ControlValue{}) ||
+		!stage.controlCommitted {
+		t.Fatalf("post-fault control=%#v committed=%t", got, stage.controlCommitted)
+	}
+	updatesBeforeRetry := 0
+	for _, event := range fixture.events {
+		if event == "update:control_map" {
+			updatesBeforeRetry++
+		}
+	}
+	if err := stage.Deactivate(); err != nil {
+		t.Fatalf("retry Deactivate: %v", err)
+	}
+	if stage.controlCommitted {
+		t.Fatal("observed zero retained control ownership")
+	}
+	updatesAfterRetry := 0
+	for _, event := range fixture.events {
+		if event == "update:control_map" {
+			updatesAfterRetry++
+		}
+	}
+	if updatesAfterRetry != updatesBeforeRetry {
+		t.Fatalf("zero convergence rewrote control: before=%d after=%d", updatesBeforeRetry, updatesAfterRetry)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestExperimentalCoreDeactivateUpdateErrorConvergesWhenZeroWasWritten(t *testing.T) {
+	fixture := newCoreStageFixture(t)
+	stage := fixture.stage(t, 91)
+	if err := stage.CommitControl(); err != nil {
+		t.Fatal(err)
+	}
+	control := fixture.maps["control_map"]
+	writeErr := errors.New("injected zero write completion error")
+	control.failUpdateAfterWrite = writeErr
+	if err := stage.Deactivate(); !errors.Is(err, writeErr) {
+		t.Fatalf("first Deactivate error = %v", err)
+	}
+	if got := control.entries[abi.ControlKeyGlobal]; got != (abi.ControlValue{}) ||
+		!stage.controlCommitted {
+		t.Fatalf("post-fault control=%#v committed=%t", got, stage.controlCommitted)
+	}
+	if err := stage.Deactivate(); err != nil {
+		t.Fatalf("retry Deactivate: %v", err)
+	}
+	if stage.controlCommitted {
+		t.Fatal("retry did not converge from observed zero")
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

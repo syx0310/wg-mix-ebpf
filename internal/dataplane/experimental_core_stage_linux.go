@@ -389,10 +389,17 @@ func (stage *experimentalCoreStage) deactivateLocked() error {
 	if err := stage.control.Lookup(abi.ControlKeyGlobal, &observed); err != nil {
 		return fmt.Errorf("read experimental control map before deactivate: %w", err)
 	}
+	zero := abi.ControlValue{}
+	if observed == zero {
+		// A prior zero write may have succeeded even though Update or its
+		// readback reported an error. Observed zero is the authoritative
+		// inactive state, so retry converges without issuing another write.
+		stage.controlCommitted = false
+		return nil
+	}
 	if observed != stage.controlValue {
 		return errors.New("refuse to deactivate experimental control map because its value changed")
 	}
-	zero := abi.ControlValue{}
 	if err := stage.control.Update(abi.ControlKeyGlobal, zero, ebpf.UpdateAny); err != nil {
 		return fmt.Errorf("deactivate experimental control map: %w", err)
 	}
