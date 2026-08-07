@@ -54,6 +54,8 @@ type installAfterSystemdEnableLinkHookContextKey struct{}
 type installAfterSystemdEnableCommitWalkOpenHookContextKey struct{}
 type installAfterSystemdEnableRetentionCheckHookContextKey struct{}
 type installBeforeObjectBoundFreshPublishHookContextKey struct{}
+type uninstallBeforeServiceArtifactExecuteHookContextKey struct{}
+type uninstallBeforeQuarantineHookContextKey struct{}
 type uninstallAfterFinalQuarantineCheckHookContextKey struct{}
 
 func Install(ctx context.Context, opts Options) (*Plan, error) {
@@ -599,7 +601,7 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 			} else {
 				errs = append(errs, fmt.Errorf(
 					"retained systemd enable-link quarantine last-known path records [%s]; "+
-						"current exact paths are unavailable because stable post-final enumeration failed; "+
+						"current exact paths are unavailable because final stable validation did not complete; "+
 						"no pathname-based unlink was attempted",
 					formatExactQuarantineEvidencePaths(
 						retainedServiceArtifactEvidence.paths,
@@ -669,6 +671,16 @@ func Uninstall(ctx context.Context, opts Options) (_ *Plan, retErr error) {
 			if err := guard.NewCommandExecutor(paths.VarLibDir).Cleanup(ctx); err != nil {
 				return fmt.Errorf("cleanup startup guard: %w", err)
 			}
+		}
+		if hook, ok := ctx.Value(
+			uninstallBeforeServiceArtifactExecuteHookContextKey{},
+		).(func() error); ok {
+			cleanupPlan.beforeExecute = hook
+		}
+		if hook, ok := ctx.Value(
+			uninstallBeforeQuarantineHookContextKey{},
+		).(func(string) error); ok {
+			cleanupPlan.beforeQuarantine = hook
 		}
 		if hook, ok := ctx.Value(
 			uninstallAfterFinalQuarantineCheckHookContextKey{},

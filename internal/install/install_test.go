@@ -1369,6 +1369,221 @@ func TestUninstallPostFinalEnumerationFailureDoesNotAssertLastKnownPathIsCurrent
 	)
 }
 
+func TestUninstallPreRenameEnumerationFailureDoesNotAssertPreflightPathIsCurrent(
+	t *testing.T,
+) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"uninstall-pre-rename-enumeration-failure",
+		"systemd",
+	)
+	linkPath := systemdEnableLinkPath(layout)
+	if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	linkIdentity, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := createSystemdQuarantineEvidence(t, layout, 1)
+	existingIdentity, err := os.Lstat(existing[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	setCleanupTestEnvironment(t, layout)
+	installFakeNft(t, "")
+	installFakeSystemctl(t, filepath.Join(t.TempDir(), "systemctl.log"), "")
+
+	wantsDir := filepath.Dir(linkPath)
+	displacedWants := wantsDir + ".displaced-before-rename"
+	hookRan := false
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+	ctx = context.WithValue(
+		ctx,
+		uninstallBeforeQuarantineHookContextKey{},
+		func(path string) error {
+			if path != linkPath {
+				return nil
+			}
+			if hookRan {
+				return errors.New("enable-link pre-rename hook ran more than once")
+			}
+			hookRan = true
+			if err := os.Rename(wantsDir, displacedWants); err != nil {
+				return err
+			}
+			return os.Mkdir(wantsDir, 0o700)
+		},
+	)
+
+	result, err := Uninstall(ctx, Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "systemd",
+		Yes:        true,
+	})
+	if !hookRan {
+		t.Fatalf("public uninstall did not reach the pre-rename hook: %v", err)
+	}
+	if result != nil {
+		t.Fatalf("failed uninstall returned a public success plan: %#v", result)
+	}
+	if err == nil ||
+		!strings.Contains(err.Error(), "inspect retained systemd enable-link quarantine evidence before rename") ||
+		!strings.Contains(err.Error(), "last-known path records") ||
+		!strings.Contains(err.Error(), "current exact paths are unavailable") ||
+		!strings.Contains(err.Error(), existing[0]) {
+		t.Fatalf("public uninstall pre-rename enumeration failure = %v", err)
+	}
+	if strings.Contains(err.Error(), "stably enumerated current exact path") ||
+		strings.Contains(
+			err.Error(),
+			"retained systemd enable-link quarantine evidence at "+existing[0],
+		) {
+		t.Fatalf("public uninstall asserted a preflight path was current: %v", err)
+	}
+	assertSameSymlink(
+		t,
+		filepath.Join(displacedWants, filepath.Base(linkPath)),
+		systemdEnableLinkTarget,
+		linkIdentity,
+		"active enable link after failed pre-rename enumeration",
+	)
+	assertSameSymlink(
+		t,
+		filepath.Join(displacedWants, filepath.Base(existing[0])),
+		"../retained-evidence-00.service",
+		existingIdentity,
+		"preflight evidence after failed pre-rename enumeration",
+	)
+	if _, statErr := os.Lstat(linkPath); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("replacement wants directory gained an active link: %v", statErr)
+	}
+}
+
+func TestUninstallServiceArtifactRevalidationFailureInvalidatesPreflightEvidence(
+	t *testing.T,
+) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"uninstall-service-artifact-revalidation-failure",
+		"systemd",
+	)
+	linkPath := systemdEnableLinkPath(layout)
+	if err := os.Symlink(systemdEnableLinkTarget, linkPath); err != nil {
+		t.Fatal(err)
+	}
+	linkIdentity, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	existing := createSystemdQuarantineEvidence(t, layout, 1)
+	setCleanupTestEnvironment(t, layout)
+	installFakeNft(t, "")
+	installFakeSystemctl(t, filepath.Join(t.TempDir(), "systemctl.log"), "")
+
+	foreignPath := filepath.Join(layout.SystemdDir, "foreign-before-service-exec")
+	hookRan := false
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+	ctx = context.WithValue(
+		ctx,
+		uninstallBeforeServiceArtifactExecuteHookContextKey{},
+		func() error {
+			hookRan = true
+			return os.WriteFile(foreignPath, []byte("foreign"), 0o600)
+		},
+	)
+
+	result, err := Uninstall(ctx, Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "systemd",
+		Yes:        true,
+	})
+	if !hookRan {
+		t.Fatalf("public uninstall did not reach the service-artifact execution hook: %v", err)
+	}
+	if result != nil {
+		t.Fatalf("failed uninstall returned a public success plan: %#v", result)
+	}
+	if err == nil ||
+		!strings.Contains(err.Error(), "generation") ||
+		!strings.Contains(err.Error(), "last-known path records") ||
+		!strings.Contains(err.Error(), "current exact paths are unavailable") ||
+		!strings.Contains(err.Error(), existing[0]) {
+		t.Fatalf("public uninstall service-artifact revalidation failure = %v", err)
+	}
+	if strings.Contains(err.Error(), "stably enumerated current exact path") ||
+		strings.Contains(
+			err.Error(),
+			"retained systemd enable-link quarantine evidence at "+existing[0],
+		) {
+		t.Fatalf("public uninstall asserted preflight evidence was current: %v", err)
+	}
+	assertSameSymlink(
+		t,
+		linkPath,
+		systemdEnableLinkTarget,
+		linkIdentity,
+		"active enable link after service-artifact revalidation failure",
+	)
+	if data, readErr := os.ReadFile(foreignPath); readErr != nil || string(data) != "foreign" {
+		t.Fatalf("foreign revalidation witness data=%q err=%v", data, readErr)
+	}
+}
+
+func TestUninstallAbsentEnableLinkFinalEnumerationRestoresCurrentEvidence(
+	t *testing.T,
+) {
+	layout := newCleanupTestLayoutForSystem(
+		t,
+		"uninstall-absent-link-final-evidence-enumeration",
+		"systemd",
+	)
+	existing := createSystemdQuarantineEvidence(t, layout, 1)
+	setCleanupTestEnvironment(t, layout)
+	installFakeNft(t, "")
+	installFakeSystemctl(
+		t,
+		filepath.Join(t.TempDir(), "systemctl.log"),
+		"daemon-reload",
+	)
+	t.Setenv("WG_MIX_EBPF_TEST_SYSTEMCTL_FAIL_OCCURRENCE", "2")
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+
+	result, err := Uninstall(ctx, Options{
+		ConfigPath: layout.ConfigPath,
+		System:     "systemd",
+		Yes:        true,
+	})
+	if result != nil {
+		t.Fatalf("failed uninstall returned a public success plan: %#v", result)
+	}
+	if err == nil ||
+		!strings.Contains(err.Error(), "daemon-reload") ||
+		!strings.Contains(
+			err.Error(),
+			"stably enumerated current exact path "+existing[0],
+		) ||
+		strings.Contains(err.Error(), "last-known path records") {
+		t.Fatalf("public uninstall final stable evidence scope = %v", err)
+	}
+	assertSymlinkTarget(t, existing[0], "../retained-evidence-00.service")
+}
+
 func TestSystemdEnableLinkQuarantineEvidenceBelowLimitIsRetainedAndReported(
 	t *testing.T,
 ) {

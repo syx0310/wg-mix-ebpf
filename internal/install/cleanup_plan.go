@@ -1406,6 +1406,36 @@ func (plan *uninstallCleanupPlan) retainedQuarantineEvidenceReport() retainedQua
 	return report
 }
 
+func (plan *uninstallCleanupPlan) invalidateRetainedQuarantineEvidenceCurrent() {
+	if plan == nil {
+		return
+	}
+	for _, directory := range plan.directories {
+		if len(directory.retainedQuarantineEvidence) == 0 {
+			continue
+		}
+		directory.retainedQuarantineEvidenceCurrent = false
+	}
+}
+
+func (directory *cleanupDirectoryPlan) refreshRetainedQuarantineEvidenceAtFinalBoundary() error {
+	if directory == nil ||
+		len(directory.retainedQuarantineEvidence) == 0 ||
+		directory.retainedQuarantineEvidenceCurrent {
+		return nil
+	}
+	evidencePaths, err := inspectRetainedSystemdQuarantineEvidence(directory.root)
+	if err != nil {
+		return fmt.Errorf(
+			"stably enumerate retained systemd enable-link quarantine evidence at final service-artifact boundary: %w",
+			err,
+		)
+	}
+	directory.retainedQuarantineEvidence = evidencePaths
+	directory.retainedQuarantineEvidenceCurrent = true
+	return nil
+}
+
 func inspectRetainedSystemdQuarantineEvidence(
 	dir *managedCleanupDir,
 ) ([]string, error) {
@@ -2998,6 +3028,10 @@ func (plan *uninstallCleanupPlan) executeServiceArtifacts() error {
 	if plan == nil {
 		return nil
 	}
+	// Preflight evidence is only a last-known snapshot once final service-
+	// artifact execution begins. Every exit below remains conservative until
+	// the affected directory has passed a final stable enumeration.
+	plan.invalidateRetainedQuarantineEvidenceCurrent()
 	if plan.beforeExecute != nil {
 		if err := plan.beforeExecute(); err != nil {
 			return err
@@ -3022,6 +3056,9 @@ func (plan *uninstallCleanupPlan) executeServiceArtifacts() error {
 			plan.afterFinalQuarantineCheck,
 			&coordinator,
 		); err != nil {
+			return err
+		}
+		if err := directory.refreshRetainedQuarantineEvidenceAtFinalBoundary(); err != nil {
 			return err
 		}
 	}
@@ -3830,6 +3867,9 @@ func (entry *cleanupEntryPlan) moveToQuarantine(
 		)
 	}
 	if entry.retainAfterQuarantine {
+		// This is still a pre-rename observation. Keep it scoped as last-known
+		// until the post-rename final boundary is stably enumerated.
+		directory.retainedQuarantineEvidenceCurrent = false
 		evidencePaths, err := inspectRetainedSystemdQuarantineEvidence(
 			directory.root,
 		)
@@ -3840,7 +3880,6 @@ func (entry *cleanupEntryPlan) moveToQuarantine(
 			)
 		}
 		directory.retainedQuarantineEvidence = evidencePaths
-		directory.retainedQuarantineEvidenceCurrent = true
 		if len(evidencePaths) > systemdEnableLinkQuarantineExistingLimit {
 			return "", false, retainedSystemdQuarantineOperationalThresholdError(
 				entry.path,

@@ -62,14 +62,17 @@ which that binding is replaced while both the moved owned link and its foreign
 replacement must be retained. Normal cycles therefore stop at seven names,
 while one binding ambiguity can reach but not exceed the hard limit of eight.
 
-The post-final-check boundary always attempts another stable descriptor-based
-enumeration, even when the hook or binding check fails. A successful
-enumeration replaces the plan's evidence list and the error reports every
-current exact prefix path. If stable enumeration itself fails, the error labels
-the list only as last-known. This scope is carried into the public uninstall
-error audit: a later error may assert each path only when the post-final list
-was stably enumerated, otherwise it reports one last-known record and states
-that current exact paths are unavailable. An independently privileged
+Entering final service-artifact execution first downgrades every non-empty
+preflight evidence snapshot to last-known, before hooks or plan revalidation.
+Only a final stable descriptor-based enumeration upgrades that directory back
+to current. The post-final-check boundary always attempts this enumeration,
+even when the hook or binding check fails. A successful enumeration replaces
+the plan's evidence list and the error reports every current exact prefix path.
+If execution returns earlier or stable enumeration itself fails, the error
+labels the list only as last-known. This scope is carried into the public
+uninstall error audit: a later error may assert each path only when the final
+list was stably enumerated, otherwise it reports one last-known record and
+states that current exact paths are unavailable. An independently privileged
 concurrent writer can create arbitrarily many names and cannot be bounded by
 this process; an observed count above eight is reported in full and fails
 closed, and seven or more existing names block every later active-link move. No
