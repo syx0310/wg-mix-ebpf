@@ -2885,7 +2885,8 @@ func TestCleanupQuarantineRestoresForeignFileSwappedAtFinalHook(t *testing.T) {
 	err = plan.execute()
 	if err == nil ||
 		(!strings.Contains(err.Error(), "moved object identity") &&
-			!strings.Contains(err.Error(), "component generation changed")) {
+			!strings.Contains(err.Error(), "component generation changed") &&
+			!strings.Contains(err.Error(), "inode or mount identity changed")) {
 		t.Fatalf("execute error = %v, want quarantined identity rejection", err)
 	}
 	if !hookRan {

@@ -3522,6 +3522,13 @@ func (entry *cleanupEntryPlan) moveToQuarantine(
 			return "", false, err
 		}
 	}
+	if err := entry.revalidate(); err != nil {
+		return "", false, fmt.Errorf(
+			"revalidate managed entry after quarantine hook for %s: %w",
+			entry.path,
+			err,
+		)
+	}
 	if err := directory.prepareOwnedCleanupMutation(
 		rootName,
 		entry.parent,
