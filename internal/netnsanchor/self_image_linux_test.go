@@ -89,13 +89,29 @@ func TestHeldSelfImageSurvivesExecutablePathReplacement(t *testing.T) {
 			output,
 		)
 	}
-	if strings.TrimSpace(string(output)) != "BOUND "+expected {
+	lines := strings.Split(strings.TrimSpace(string(output)), "\n")
+	if len(lines) == 0 || lines[0] != "BOUND "+expected {
 		t.Fatalf(
 			"worker rebound to replacement path: ready=%q output=%q stderr=%s",
 			ready,
 			output,
 			stderr.String(),
 		)
+	}
+	// The launcher and grandchild are test binaries executed directly rather
+	// than through `go test`. Go 1.26 prints one PASS line for each nested test
+	// binary after the identity assertion succeeds. Treat those framework lines
+	// as transport noise, but reject every other trailing line so the test still
+	// fails closed on unexpected worker output.
+	for _, line := range lines[1:] {
+		if line != "PASS" {
+			t.Fatalf(
+				"held-image worker emitted unexpected output: ready=%q output=%q stderr=%s",
+				ready,
+				output,
+				stderr.String(),
+			)
+		}
 	}
 }
 
