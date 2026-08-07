@@ -17,6 +17,9 @@ var (
 	errFakeTCPRuntimeExited = errors.New(
 		"experimental FakeTCP userspace runtime exited without a stop request",
 	)
+	errFakeTCPRuntimeStopping = errors.New(
+		"experimental FakeTCP userspace runtime stop is already in progress",
+	)
 )
 
 // fakeTCPRuntimeDesiredKey is an opaque digest of every input that affects one
@@ -83,6 +86,9 @@ func (supervisor *fakeTCPRuntimeSupervisor) Ensure(
 	current := supervisor.loadCurrent()
 	if current != nil && !current.finished() {
 		if current.key == key {
+			if current.stopWasRequested() {
+				return errFakeTCPRuntimeStopping
+			}
 			return nil
 		}
 		return fmt.Errorf(
@@ -143,7 +149,7 @@ func (supervisor *fakeTCPRuntimeSupervisor) Healthy(
 		return false
 	}
 	current := supervisor.loadCurrent()
-	return current != nil && current.key == key && !current.finished()
+	return current != nil && current.key == key && current.healthy()
 }
 
 func (supervisor *fakeTCPRuntimeSupervisor) RuntimeError() error {
@@ -285,6 +291,19 @@ func (runtime *supervisedFakeTCPRuntime) finished() bool {
 	default:
 		return false
 	}
+}
+
+func (runtime *supervisedFakeTCPRuntime) stopWasRequested() bool {
+	if runtime == nil {
+		return false
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.stopRequested
+}
+
+func (runtime *supervisedFakeTCPRuntime) healthy() bool {
+	return runtime != nil && !runtime.stopWasRequested() && !runtime.finished()
 }
 
 func (runtime *supervisedFakeTCPRuntime) terminalError() error {

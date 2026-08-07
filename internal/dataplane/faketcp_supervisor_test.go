@@ -259,6 +259,23 @@ func TestFakeTCPRuntimeSupervisorStopTimeoutRetainsOwnership(t *testing.T) {
 	if supervisor.loadCurrent() == nil {
 		t.Fatal("timed-out stop discarded runtime ownership")
 	}
+	key := fakeTCPRuntimeDesiredKey{1}
+	if supervisor.Healthy(key) {
+		t.Fatal("stop-requested runtime reported healthy after timeout")
+	}
+	replacementBuilds := 0
+	if err := supervisor.Ensure(
+		t.Context(), key,
+		func(context.Context) (fakeTCPRuntimeService, error) {
+			replacementBuilds++
+			return newControlledFakeTCPRuntime(), nil
+		},
+	); !errors.Is(err, errFakeTCPRuntimeStopping) {
+		t.Fatalf("same-key Ensure during timed-out stop error = %v", err)
+	}
+	if replacementBuilds != 0 {
+		t.Fatalf("same-key Ensure built %d overlapping runtimes", replacementBuilds)
+	}
 	_, closeCalls, _ := runtime.counts()
 	if closeCalls != 0 {
 		t.Fatalf("close calls = %d before Run exit", closeCalls)
