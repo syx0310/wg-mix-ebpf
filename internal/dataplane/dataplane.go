@@ -15,10 +15,11 @@ var ErrPinOwnershipLifecycleLeaseRequired = errors.New(
 )
 
 const (
-	DefaultObjectPath = "build/wg_mix_tc.o"
-	EnvObjectPath     = "WG_MIX_EBPF_OBJECT"
-	DefaultPinPath    = "/sys/fs/bpf/wg-mix-ebpf"
-	EnvPinPath        = "WG_MIX_EBPF_PIN_PATH"
+	DefaultObjectPath             = "build/wg_mix_tc.o"
+	EnvObjectPath                 = "WG_MIX_EBPF_OBJECT"
+	ExperimentalFakeTCPObjectKind = "experimental-faketcp"
+	DefaultPinPath                = "/sys/fs/bpf/wg-mix-ebpf"
+	EnvPinPath                    = "WG_MIX_EBPF_PIN_PATH"
 )
 
 type Loader interface {
