@@ -69,7 +69,18 @@ type fakeTCPPolicyGenerationTransaction struct {
 	isolation      fakeTCPPolicyGenerationIsolationBackend
 	identity       *fakeTCPPolicyGenerationIdentity
 	stage          *fakeTCPPolicyStage
+	runtimeClaim   *fakeTCPPolicyRuntimeBuildClaim
 	closed         bool
+}
+
+// fakeTCPPolicyRuntimeBuildClaim is an exclusive, single-use ownership token
+// for composing one fresh generation transaction into a complete runtime. A
+// successful claim transfers transaction ownership to the runtime builder;
+// a failed claim changes no transaction state and leaves ownership with the
+// caller. While the token is live, ordinary transaction entrypoints reject
+// access so no second builder or caller can interleave generation mutations.
+type fakeTCPPolicyRuntimeBuildClaim struct {
+	transaction *fakeTCPPolicyGenerationTransaction
 }
 
 func newFakeTCPPolicyGenerationTransaction(
@@ -174,9 +185,99 @@ func (transaction *fakeTCPPolicyGenerationTransaction) assertHeldLocked(ctx cont
 	return nil
 }
 
+func (transaction *fakeTCPPolicyGenerationTransaction) assertHeld(ctx context.Context) error {
+	if transaction == nil {
+		return fmt.Errorf("%w: transaction is nil", errFakeTCPPolicyGenerationLeaseRequired)
+	}
+	transaction.mu.Lock()
+	defer transaction.mu.Unlock()
+	return transaction.assertAccessLocked(ctx, nil)
+}
+
+func (transaction *fakeTCPPolicyGenerationTransaction) assertAccessLocked(
+	ctx context.Context,
+	claim *fakeTCPPolicyRuntimeBuildClaim,
+) error {
+	if err := transaction.assertHeldLocked(ctx); err != nil {
+		return err
+	}
+	if claim == nil {
+		if transaction.runtimeClaim != nil {
+			return errors.New("FakeTCP generation transaction is exclusively claimed by a runtime build")
+		}
+		return nil
+	}
+	if claim.transaction != transaction || transaction.runtimeClaim != claim {
+		return errors.New("FakeTCP runtime build claim does not own this generation transaction")
+	}
+	return nil
+}
+
+// claimRuntimeBuild atomically verifies that the transaction is held, open,
+// fresh, and unclaimed before installing the exclusive build token. No
+// collection or dataplane ownership may move to a builder before this returns
+// successfully.
+func (transaction *fakeTCPPolicyGenerationTransaction) claimRuntimeBuild(
+	ctx context.Context,
+) (*fakeTCPPolicyRuntimeBuildClaim, error) {
+	if transaction == nil {
+		return nil, fmt.Errorf("claim FakeTCP runtime build: %w", errFakeTCPPolicyGenerationLeaseRequired)
+	}
+	transaction.mu.Lock()
+	defer transaction.mu.Unlock()
+	if err := transaction.assertHeldLocked(ctx); err != nil {
+		return nil, fmt.Errorf("claim FakeTCP runtime build: %w", err)
+	}
+	if transaction.stage != nil {
+		return nil, errors.New("claim FakeTCP runtime build: generation transaction is not fresh")
+	}
+	if transaction.runtimeClaim != nil {
+		return nil, errors.New("claim FakeTCP runtime build: generation transaction is already claimed")
+	}
+	claim := &fakeTCPPolicyRuntimeBuildClaim{transaction: transaction}
+	transaction.runtimeClaim = claim
+	return claim, nil
+}
+
+func (claim *fakeTCPPolicyRuntimeBuildClaim) assertHeld(ctx context.Context) error {
+	if claim == nil || claim.transaction == nil {
+		return fmt.Errorf("%w: runtime build claim is nil", errFakeTCPPolicyGenerationLeaseRequired)
+	}
+	claim.transaction.mu.Lock()
+	defer claim.transaction.mu.Unlock()
+	return claim.transaction.assertAccessLocked(ctx, claim)
+}
+
+func (claim *fakeTCPPolicyRuntimeBuildClaim) policyGeneration() uint64 {
+	if claim == nil || claim.transaction == nil {
+		return 0
+	}
+	return claim.transaction.generation
+}
+
+func (transaction *fakeTCPPolicyGenerationTransaction) policyGeneration() uint64 {
+	if transaction == nil {
+		return 0
+	}
+	return transaction.generation
+}
+
 // Close releases the transaction's retained lifecycle lease. It refuses to
 // release ownership while a stage can still require rollback.
 func (transaction *fakeTCPPolicyGenerationTransaction) Close() error {
+	return transaction.closeForRuntimeClaim(nil)
+}
+
+func (claim *fakeTCPPolicyRuntimeBuildClaim) Close() error {
+	if claim == nil || claim.transaction == nil {
+		return nil
+	}
+	return claim.transaction.closeForRuntimeClaim(claim)
+}
+
+func (transaction *fakeTCPPolicyGenerationTransaction) closeForRuntimeClaim(
+	claim *fakeTCPPolicyRuntimeBuildClaim,
+) error {
 	if transaction == nil {
 		return nil
 	}
@@ -185,14 +286,25 @@ func (transaction *fakeTCPPolicyGenerationTransaction) Close() error {
 	if transaction.closed {
 		return nil
 	}
+	if claim == nil && transaction.runtimeClaim != nil {
+		return errors.New("cannot close FakeTCP generation transaction claimed by a runtime build")
+	}
+	if claim != nil &&
+		(claim.transaction != transaction || transaction.runtimeClaim != claim) {
+		return errors.New("cannot close FakeTCP generation transaction through a foreign runtime build claim")
+	}
 	if transaction.stage != nil &&
 		(transaction.stage.state == fakeTCPPolicyStageActive ||
 			transaction.stage.state == fakeTCPPolicyStageRollbackPending) {
 		return errors.New("cannot close FakeTCP generation transaction with a live policy stage")
 	}
 	transaction.closed = true
+	transaction.runtimeClaim = nil
 	lease := transaction.lifecycleLease
 	transaction.lifecycleLease = nil
+	if lease == nil {
+		return nil
+	}
 	return lease.Close()
 }
 
@@ -206,12 +318,32 @@ func (transaction *fakeTCPPolicyGenerationTransaction) Stage(
 	maps fakeTCPPolicyMaps,
 	snapshot *fakeTCPPolicySnapshot,
 ) (*fakeTCPPolicyStage, error) {
+	return transaction.stageForRuntimeClaim(ctx, nil, maps, snapshot)
+}
+
+func (claim *fakeTCPPolicyRuntimeBuildClaim) Stage(
+	ctx context.Context,
+	maps fakeTCPPolicyMaps,
+	snapshot *fakeTCPPolicySnapshot,
+) (*fakeTCPPolicyStage, error) {
+	if claim == nil || claim.transaction == nil {
+		return nil, fmt.Errorf("stage FakeTCP policy: %w", errFakeTCPPolicyGenerationLeaseRequired)
+	}
+	return claim.transaction.stageForRuntimeClaim(ctx, claim, maps, snapshot)
+}
+
+func (transaction *fakeTCPPolicyGenerationTransaction) stageForRuntimeClaim(
+	ctx context.Context,
+	claim *fakeTCPPolicyRuntimeBuildClaim,
+	maps fakeTCPPolicyMaps,
+	snapshot *fakeTCPPolicySnapshot,
+) (*fakeTCPPolicyStage, error) {
 	if transaction == nil {
 		return nil, fmt.Errorf("stage FakeTCP policy: %w", errFakeTCPPolicyGenerationLeaseRequired)
 	}
 	transaction.mu.Lock()
 	defer transaction.mu.Unlock()
-	if err := transaction.assertHeldLocked(ctx); err != nil {
+	if err := transaction.assertAccessLocked(ctx, claim); err != nil {
 		return nil, fmt.Errorf("stage FakeTCP policy: %w", err)
 	}
 	if err := validateFakeTCPPolicySnapshot(snapshot); err != nil {
@@ -288,9 +420,10 @@ const (
 // method: mutation is possible only through the exact transaction which holds
 // the retained lifecycle lease and generation-isolation backend.
 type fakeTCPPolicyStage struct {
-	operations []fakeTCPPolicyOperation
-	state      uint8
-	owner      *fakeTCPPolicyGenerationIdentity
+	operations      []fakeTCPPolicyOperation
+	state           uint8
+	owner           *fakeTCPPolicyGenerationIdentity
+	collectionOwner *experimentalCollectionOwner
 }
 
 // Rollback is idempotent after a complete rollback or Disarm. It first removes
@@ -301,12 +434,30 @@ func (transaction *fakeTCPPolicyGenerationTransaction) Rollback(
 	ctx context.Context,
 	stage *fakeTCPPolicyStage,
 ) error {
+	return transaction.rollbackForRuntimeClaim(ctx, nil, stage)
+}
+
+func (claim *fakeTCPPolicyRuntimeBuildClaim) Rollback(
+	ctx context.Context,
+	stage *fakeTCPPolicyStage,
+) error {
+	if claim == nil || claim.transaction == nil {
+		return errFakeTCPPolicyGenerationLeaseRequired
+	}
+	return claim.transaction.rollbackForRuntimeClaim(ctx, claim, stage)
+}
+
+func (transaction *fakeTCPPolicyGenerationTransaction) rollbackForRuntimeClaim(
+	ctx context.Context,
+	claim *fakeTCPPolicyRuntimeBuildClaim,
+	stage *fakeTCPPolicyStage,
+) error {
 	if transaction == nil {
 		return errFakeTCPPolicyGenerationLeaseRequired
 	}
 	transaction.mu.Lock()
 	defer transaction.mu.Unlock()
-	if err := transaction.assertStageLocked(ctx, stage); err != nil {
+	if err := transaction.assertStageLocked(ctx, claim, stage); err != nil {
 		return err
 	}
 	if stage.state == fakeTCPPolicyStageRolledBack || stage.state == fakeTCPPolicyStageDisarmed {
@@ -327,12 +478,30 @@ func (transaction *fakeTCPPolicyGenerationTransaction) Disarm(
 	ctx context.Context,
 	stage *fakeTCPPolicyStage,
 ) error {
+	return transaction.disarmForRuntimeClaim(ctx, nil, stage)
+}
+
+func (claim *fakeTCPPolicyRuntimeBuildClaim) Disarm(
+	ctx context.Context,
+	stage *fakeTCPPolicyStage,
+) error {
+	if claim == nil || claim.transaction == nil {
+		return errFakeTCPPolicyGenerationLeaseRequired
+	}
+	return claim.transaction.disarmForRuntimeClaim(ctx, claim, stage)
+}
+
+func (transaction *fakeTCPPolicyGenerationTransaction) disarmForRuntimeClaim(
+	ctx context.Context,
+	claim *fakeTCPPolicyRuntimeBuildClaim,
+	stage *fakeTCPPolicyStage,
+) error {
 	if transaction == nil {
 		return errFakeTCPPolicyGenerationLeaseRequired
 	}
 	transaction.mu.Lock()
 	defer transaction.mu.Unlock()
-	if err := transaction.assertStageLocked(ctx, stage); err != nil {
+	if err := transaction.assertStageLocked(ctx, claim, stage); err != nil {
 		return err
 	}
 	switch stage.state {
@@ -349,11 +518,113 @@ func (transaction *fakeTCPPolicyGenerationTransaction) Disarm(
 	}
 }
 
-func (transaction *fakeTCPPolicyGenerationTransaction) assertStageLocked(
+func (transaction *fakeTCPPolicyGenerationTransaction) bindStageCollectionOwner(
 	ctx context.Context,
 	stage *fakeTCPPolicyStage,
+	owner *experimentalCollectionOwner,
 ) error {
-	if err := transaction.assertHeldLocked(ctx); err != nil {
+	return transaction.bindStageCollectionOwnerForRuntimeClaim(ctx, nil, stage, owner)
+}
+
+func (claim *fakeTCPPolicyRuntimeBuildClaim) bindStageCollectionOwner(
+	ctx context.Context,
+	stage *fakeTCPPolicyStage,
+	owner *experimentalCollectionOwner,
+) error {
+	if claim == nil || claim.transaction == nil {
+		return errFakeTCPPolicyGenerationLeaseRequired
+	}
+	return claim.transaction.bindStageCollectionOwnerForRuntimeClaim(ctx, claim, stage, owner)
+}
+
+func (transaction *fakeTCPPolicyGenerationTransaction) bindStageCollectionOwnerForRuntimeClaim(
+	ctx context.Context,
+	claim *fakeTCPPolicyRuntimeBuildClaim,
+	stage *fakeTCPPolicyStage,
+	owner *experimentalCollectionOwner,
+) error {
+	if transaction == nil {
+		return errFakeTCPPolicyGenerationLeaseRequired
+	}
+	if owner == nil {
+		return errors.New("bind FakeTCP policy stage: collection owner is nil")
+	}
+	transaction.mu.Lock()
+	defer transaction.mu.Unlock()
+	if err := transaction.assertStageLocked(ctx, claim, stage); err != nil {
+		return err
+	}
+	if stage.collectionOwner != nil && stage.collectionOwner != owner {
+		return errors.New("bind FakeTCP policy stage: collection owner changed")
+	}
+	stage.collectionOwner = owner
+	return nil
+}
+
+// releaseStageAfterCollectionClose is the terminal construction-failure path
+// for an unpinned experimental collection. Ordinary policy owners must use
+// Rollback or Disarm. This path is permitted only after the exact collection
+// owner has attempted every map/program close and relinquished all handles;
+// at that point retrying map rollback is both impossible and unnecessary for
+// lifecycle-lease safety.
+func (transaction *fakeTCPPolicyGenerationTransaction) releaseStageAfterCollectionClose(
+	ctx context.Context,
+	stage *fakeTCPPolicyStage,
+	proof *experimentalCollectionReleaseProof,
+) error {
+	return transaction.releaseStageAfterCollectionCloseForRuntimeClaim(ctx, nil, stage, proof)
+}
+
+func (claim *fakeTCPPolicyRuntimeBuildClaim) releaseStageAfterCollectionClose(
+	ctx context.Context,
+	stage *fakeTCPPolicyStage,
+	proof *experimentalCollectionReleaseProof,
+) error {
+	if claim == nil || claim.transaction == nil {
+		return errFakeTCPPolicyGenerationLeaseRequired
+	}
+	return claim.transaction.releaseStageAfterCollectionCloseForRuntimeClaim(
+		ctx, claim, stage, proof,
+	)
+}
+
+func (transaction *fakeTCPPolicyGenerationTransaction) releaseStageAfterCollectionCloseForRuntimeClaim(
+	ctx context.Context,
+	claim *fakeTCPPolicyRuntimeBuildClaim,
+	stage *fakeTCPPolicyStage,
+	proof *experimentalCollectionReleaseProof,
+) error {
+	if transaction == nil {
+		return errFakeTCPPolicyGenerationLeaseRequired
+	}
+	if proof == nil || proof.owner == nil {
+		return errors.New("release FakeTCP policy stage requires collection close proof")
+	}
+	proof.owner.mu.Lock()
+	collectionClosed := proof.owner.closed
+	proof.owner.mu.Unlock()
+	if !collectionClosed {
+		return errors.New("release FakeTCP policy stage requires a closed collection owner")
+	}
+	transaction.mu.Lock()
+	defer transaction.mu.Unlock()
+	if err := transaction.assertStageLocked(ctx, claim, stage); err != nil {
+		return err
+	}
+	if stage.collectionOwner == nil || stage.collectionOwner != proof.owner {
+		return errors.New("release FakeTCP policy stage collection proof does not match its bound owner")
+	}
+	stage.operations = nil
+	stage.state = fakeTCPPolicyStageRolledBack
+	return nil
+}
+
+func (transaction *fakeTCPPolicyGenerationTransaction) assertStageLocked(
+	ctx context.Context,
+	claim *fakeTCPPolicyRuntimeBuildClaim,
+	stage *fakeTCPPolicyStage,
+) error {
+	if err := transaction.assertAccessLocked(ctx, claim); err != nil {
 		return err
 	}
 	if stage == nil || transaction.stage != stage || stage.owner != transaction.identity {

@@ -11,7 +11,7 @@ import (
 )
 
 type experimentalCollectionCloser interface {
-	Close()
+	Close() error
 }
 
 // LoadExperimentalFakeTCPObjectTestIdentity verifier-loads every map and
@@ -39,7 +39,16 @@ func LoadExperimentalFakeTCPObjectTestIdentity(
 		identity.Source,
 		removeMemlockLimit,
 		func(spec *ebpf.CollectionSpec) (experimentalCollectionCloser, error) {
-			return ebpf.NewCollection(spec)
+			collection, err := ebpf.NewCollection(spec)
+			if err != nil {
+				return nil, err
+			}
+			owner, err := newExperimentalCollectionOwner(collection)
+			if err != nil {
+				collection.Close()
+				return nil, err
+			}
+			return owner, nil
 		},
 	)
 	if err != nil {
@@ -67,6 +76,8 @@ func loadExperimentalFakeTCPCollection(
 	if collection == nil {
 		return fmt.Errorf("create experimental FakeTCP BPF collection from %s: loader returned nil collection", source)
 	}
-	collection.Close()
+	if err := collection.Close(); err != nil {
+		return fmt.Errorf("close experimental FakeTCP BPF collection from %s: %w", source, err)
+	}
 	return nil
 }
