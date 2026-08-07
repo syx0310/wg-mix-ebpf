@@ -1,0 +1,485 @@
+package faketcp
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sync"
+
+	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+)
+
+var (
+	ErrActionRecoveryRequired            = errors.New("faketcp action recovery is required")
+	ErrActionCheckpointConflict          = errors.New("faketcp action checkpoint compare-and-swap conflict")
+	ErrActionCheckpointCorrupt           = errors.New("faketcp action checkpoint is invalid")
+	ErrActionCheckpointRevisionExhausted = errors.New("faketcp action checkpoint revision is exhausted")
+)
+
+type ActionCheckpointPhase uint8
+
+const (
+	ActionCheckpointPrepared ActionCheckpointPhase = iota + 1
+	ActionCheckpointAttempting
+)
+
+type ActionStepKind uint8
+
+const (
+	ActionStepSendControl ActionStepKind = iota + 1
+	ActionStepReinject
+)
+
+// ActionStep is one externally visible side effect. ReleasePending actions are
+// split into one step per datagram so recovery never has to guess which packet
+// in a batch was attempted.
+type ActionStep struct {
+	Kind    ActionStepKind
+	Flow    abi.FakeTCPSessionKey
+	WGID    uint32
+	Control ControlPacket
+	Packet  PendingPacket
+	Reason  string
+}
+
+// ActionCheckpoint is a single-controller write-ahead checkpoint. Revision is
+// assigned by ActionCheckpointStore and must be used for every update/delete.
+// NextStep identifies the prepared or currently attempting step.
+type ActionCheckpoint struct {
+	Revision  uint64
+	Operation uint64
+	Phase     ActionCheckpointPhase
+	NextStep  int
+	Steps     []ActionStep
+}
+
+// ActionCheckpointStore is a one-slot atomic CAS store. A daemon may back it
+// with durable state; the in-memory implementation is suitable for one
+// process lifetime. Implementations must deep-copy packet bytes on ingress and
+// egress and must never report a successful CAS before the new value is
+// recoverable. A returned conflict must mean no mutation occurred; any other
+// write error is treated as an unrecoverable store fault by Controller because
+// its commit outcome cannot be inferred safely.
+type ActionCheckpointStore interface {
+	LoadActionCheckpoint() (ActionCheckpoint, bool, error)
+	CreateActionCheckpoint(ActionCheckpoint) (ActionCheckpoint, error)
+	UpdateActionCheckpoint(uint64, ActionCheckpoint) (ActionCheckpoint, error)
+	DeleteActionCheckpoint(uint64) error
+}
+
+// MemoryActionCheckpointStore provides the exact CAS semantics used by tests
+// and non-durable embedding. It deliberately retains no history after delete.
+type MemoryActionCheckpointStore struct {
+	mu sync.Mutex
+
+	checkpoint   *ActionCheckpoint
+	nextRevision uint64
+}
+
+func NewMemoryActionCheckpointStore() *MemoryActionCheckpointStore {
+	return &MemoryActionCheckpointStore{nextRevision: 1}
+}
+
+func (store *MemoryActionCheckpointStore) LoadActionCheckpoint() (ActionCheckpoint, bool, error) {
+	if store == nil {
+		return ActionCheckpoint{}, false, errors.New("faketcp action checkpoint store is nil")
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.checkpoint == nil {
+		return ActionCheckpoint{}, false, nil
+	}
+	return cloneActionCheckpoint(*store.checkpoint), true, nil
+}
+
+func (store *MemoryActionCheckpointStore) CreateActionCheckpoint(
+	checkpoint ActionCheckpoint,
+) (ActionCheckpoint, error) {
+	if store == nil {
+		return ActionCheckpoint{}, errors.New("faketcp action checkpoint store is nil")
+	}
+	if checkpoint.Revision != 0 {
+		return ActionCheckpoint{}, fmt.Errorf("%w: create revision is %d", ErrActionCheckpointCorrupt, checkpoint.Revision)
+	}
+	if err := validateActionCheckpoint(checkpoint); err != nil {
+		return ActionCheckpoint{}, err
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.checkpoint != nil {
+		return ActionCheckpoint{}, ErrActionCheckpointConflict
+	}
+	revision, err := store.allocateRevisionLocked()
+	if err != nil {
+		return ActionCheckpoint{}, err
+	}
+	checkpoint.Revision = revision
+	copyCheckpoint := cloneActionCheckpoint(checkpoint)
+	store.checkpoint = &copyCheckpoint
+	return cloneActionCheckpoint(copyCheckpoint), nil
+}
+
+func (store *MemoryActionCheckpointStore) UpdateActionCheckpoint(
+	expectedRevision uint64,
+	checkpoint ActionCheckpoint,
+) (ActionCheckpoint, error) {
+	if store == nil {
+		return ActionCheckpoint{}, errors.New("faketcp action checkpoint store is nil")
+	}
+	if expectedRevision == 0 {
+		return ActionCheckpoint{}, fmt.Errorf("%w: expected revision is zero", ErrActionCheckpointCorrupt)
+	}
+	if checkpoint.Revision != expectedRevision {
+		return ActionCheckpoint{}, fmt.Errorf(
+			"%w: update revision %d does not match expected %d",
+			ErrActionCheckpointCorrupt, checkpoint.Revision, expectedRevision,
+		)
+	}
+	if err := validateActionCheckpoint(checkpoint); err != nil {
+		return ActionCheckpoint{}, err
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.checkpoint == nil || store.checkpoint.Revision != expectedRevision {
+		return ActionCheckpoint{}, ErrActionCheckpointConflict
+	}
+	revision, err := store.allocateRevisionLocked()
+	if err != nil {
+		return ActionCheckpoint{}, err
+	}
+	checkpoint.Revision = revision
+	copyCheckpoint := cloneActionCheckpoint(checkpoint)
+	store.checkpoint = &copyCheckpoint
+	return cloneActionCheckpoint(copyCheckpoint), nil
+}
+
+func (store *MemoryActionCheckpointStore) DeleteActionCheckpoint(expectedRevision uint64) error {
+	if store == nil {
+		return errors.New("faketcp action checkpoint store is nil")
+	}
+	if expectedRevision == 0 {
+		return fmt.Errorf("%w: expected revision is zero", ErrActionCheckpointCorrupt)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.checkpoint == nil || store.checkpoint.Revision != expectedRevision {
+		return ErrActionCheckpointConflict
+	}
+	store.checkpoint = nil
+	return nil
+}
+
+func (store *MemoryActionCheckpointStore) allocateRevisionLocked() (uint64, error) {
+	if store.nextRevision == 0 {
+		return 0, ErrActionCheckpointRevisionExhausted
+	}
+	revision := store.nextRevision
+	store.nextRevision++
+	return revision, nil
+}
+
+type RecoveryReport struct {
+	ReplayedControls             int
+	SkippedAmbiguousReinjections int
+	CompletedSteps               int
+}
+
+// ActionRecovery owns no external resource. It serialises checkpoint changes
+// and backend calls, allowing a new controller instance to resume a retained
+// checkpoint. An attempting control step is safe to replay because FakeTCP
+// handshakes accept duplicate SYN/SYNACK/ACK. An attempting reinjection is
+// never replayed: its send outcome is ambiguous and WireGuard/QUIC remains
+// responsible for retransmitting the dropped datagram.
+type ActionRecovery struct {
+	mu sync.Mutex
+
+	backend       ControllerBackend
+	store         ActionCheckpointStore
+	nextOperation uint64
+}
+
+func NewActionRecovery(
+	backend ControllerBackend,
+	store ActionCheckpointStore,
+) (*ActionRecovery, error) {
+	if controllerBackendIsNil(backend) {
+		return nil, errors.New("faketcp action recovery backend is nil")
+	}
+	if actionCheckpointStoreIsNil(store) {
+		return nil, errors.New("faketcp action checkpoint store is nil")
+	}
+	checkpoint, found, err := store.LoadActionCheckpoint()
+	if err != nil {
+		return nil, fmt.Errorf("load faketcp action checkpoint: %w", err)
+	}
+	nextOperation := uint64(1)
+	if found {
+		if err := validateStoredActionCheckpoint(checkpoint); err != nil {
+			return nil, err
+		}
+		nextOperation = checkpoint.Operation + 1
+	}
+	return &ActionRecovery{
+		backend: backend, store: store, nextOperation: nextOperation,
+	}, nil
+}
+
+func (recovery *ActionRecovery) Execute(ctx context.Context, actions []Action) error {
+	if recovery == nil {
+		return errors.New("faketcp action recovery is nil")
+	}
+	if ctx == nil {
+		return errors.New("faketcp action execution context is nil")
+	}
+	steps, err := actionSteps(actions)
+	if err != nil {
+		return err
+	}
+	if len(steps) == 0 {
+		return nil
+	}
+	recovery.mu.Lock()
+	defer recovery.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, found, err := recovery.store.LoadActionCheckpoint(); err != nil {
+		return fmt.Errorf("load faketcp action checkpoint before execute: %w", err)
+	} else if found {
+		return ErrActionRecoveryRequired
+	}
+	if recovery.nextOperation == 0 {
+		return errors.New("faketcp action operation counter is exhausted")
+	}
+	checkpoint, err := recovery.store.CreateActionCheckpoint(ActionCheckpoint{
+		Operation: recovery.nextOperation,
+		Phase:     ActionCheckpointPrepared,
+		Steps:     steps,
+	})
+	if err != nil {
+		checkpointErr := fmt.Errorf("create faketcp action checkpoint: %w", err)
+		if errors.Is(err, ErrActionCheckpointConflict) {
+			return errors.Join(ErrActionRecoveryRequired, checkpointErr)
+		}
+		return checkpointErr
+	}
+	recovery.nextOperation++
+	_, err = recovery.continueLocked(ctx, checkpoint, false)
+	return err
+}
+
+func (recovery *ActionRecovery) Recover(ctx context.Context) (RecoveryReport, error) {
+	if recovery == nil {
+		return RecoveryReport{}, errors.New("faketcp action recovery is nil")
+	}
+	if ctx == nil {
+		return RecoveryReport{}, errors.New("faketcp action recovery context is nil")
+	}
+	recovery.mu.Lock()
+	defer recovery.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return RecoveryReport{}, err
+	}
+	checkpoint, found, err := recovery.store.LoadActionCheckpoint()
+	if err != nil {
+		return RecoveryReport{}, fmt.Errorf("load faketcp action checkpoint for recovery: %w", err)
+	}
+	if !found {
+		return RecoveryReport{}, nil
+	}
+	if err := validateStoredActionCheckpoint(checkpoint); err != nil {
+		return RecoveryReport{}, err
+	}
+	return recovery.continueLocked(ctx, checkpoint, true)
+}
+
+func (recovery *ActionRecovery) Pending() (bool, error) {
+	if recovery == nil {
+		return false, errors.New("faketcp action recovery is nil")
+	}
+	recovery.mu.Lock()
+	defer recovery.mu.Unlock()
+	checkpoint, found, err := recovery.store.LoadActionCheckpoint()
+	if err != nil {
+		return false, fmt.Errorf("load faketcp action checkpoint status: %w", err)
+	}
+	if found {
+		if err := validateStoredActionCheckpoint(checkpoint); err != nil {
+			return false, err
+		}
+	}
+	return found, nil
+}
+
+func (recovery *ActionRecovery) continueLocked(
+	ctx context.Context,
+	checkpoint ActionCheckpoint,
+	recovering bool,
+) (RecoveryReport, error) {
+	var report RecoveryReport
+	if checkpoint.Phase == ActionCheckpointAttempting {
+		step := checkpoint.Steps[checkpoint.NextStep]
+		if !recovering {
+			return report, ErrActionRecoveryRequired
+		}
+		if step.Kind == ActionStepReinject {
+			checkpoint.Phase = ActionCheckpointPrepared
+			checkpoint.NextStep++
+			updated, err := recovery.store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+			if err != nil {
+				return report, fmt.Errorf("%w: checkpoint ambiguous faketcp reinjection as skipped: %w", ErrActionRecoveryRequired, err)
+			}
+			checkpoint = updated
+			report.SkippedAmbiguousReinjections++
+		} else {
+			checkpoint.Phase = ActionCheckpointPrepared
+			updated, err := recovery.store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+			if err != nil {
+				return report, fmt.Errorf("%w: checkpoint faketcp control replay: %w", ErrActionRecoveryRequired, err)
+			}
+			checkpoint = updated
+			report.ReplayedControls++
+		}
+	}
+
+	for checkpoint.NextStep < len(checkpoint.Steps) {
+		if err := ctx.Err(); err != nil {
+			return report, fmt.Errorf("%w: %w", ErrActionRecoveryRequired, err)
+		}
+		checkpoint.Phase = ActionCheckpointAttempting
+		updated, err := recovery.store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+		if err != nil {
+			return report, fmt.Errorf("%w: mark faketcp action step attempting: %w", ErrActionRecoveryRequired, err)
+		}
+		checkpoint = updated
+		step := checkpoint.Steps[checkpoint.NextStep]
+		if err := executeActionStep(ctx, recovery.backend, step); err != nil {
+			return report, fmt.Errorf("%w: %w", ErrActionRecoveryRequired, err)
+		}
+		checkpoint.Phase = ActionCheckpointPrepared
+		checkpoint.NextStep++
+		updated, err = recovery.store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+		if err != nil {
+			return report, fmt.Errorf("%w: checkpoint completed faketcp action step: %w", ErrActionRecoveryRequired, err)
+		}
+		checkpoint = updated
+		report.CompletedSteps++
+	}
+	if err := recovery.store.DeleteActionCheckpoint(checkpoint.Revision); err != nil {
+		return report, fmt.Errorf("%w: delete completed faketcp action checkpoint: %w", ErrActionRecoveryRequired, err)
+	}
+	return report, nil
+}
+
+func actionSteps(actions []Action) ([]ActionStep, error) {
+	steps := make([]ActionStep, 0, len(actions))
+	for _, action := range actions {
+		switch action.Kind {
+		case ActionDrop, ActionForward, ActionClose:
+		case ActionSendControl:
+			steps = append(steps, ActionStep{
+				Kind: ActionStepSendControl, Flow: action.Flow, WGID: action.WGID,
+				Control: action.Control, Reason: action.Reason,
+			})
+		case ActionReleasePending:
+			for _, packet := range action.Packets {
+				copyPacket := packet
+				copyPacket.Data = append([]byte(nil), packet.Data...)
+				steps = append(steps, ActionStep{
+					Kind: ActionStepReinject, Flow: action.Flow, Packet: copyPacket,
+					Reason: action.Reason,
+				})
+			}
+		default:
+			return nil, fmt.Errorf("unknown faketcp action kind %d", action.Kind)
+		}
+	}
+	for _, step := range steps {
+		if err := validateActionStep(step); err != nil {
+			return nil, err
+		}
+	}
+	return steps, nil
+}
+
+func executeActionStep(ctx context.Context, backend ControllerBackend, step ActionStep) error {
+	switch step.Kind {
+	case ActionStepSendControl:
+		if err := backend.SendControl(ctx, step.Flow, step.WGID, step.Control); err != nil {
+			return fmt.Errorf("send faketcp control packet (%s): %w", step.Reason, err)
+		}
+	case ActionStepReinject:
+		if err := backend.Reinject(ctx, step.Flow, step.Packet); err != nil {
+			return fmt.Errorf("reinject faketcp first packet: %w", err)
+		}
+	default:
+		return fmt.Errorf("unknown faketcp action step kind %d", step.Kind)
+	}
+	return nil
+}
+
+func validateActionCheckpoint(checkpoint ActionCheckpoint) error {
+	if checkpoint.Operation == 0 || len(checkpoint.Steps) == 0 {
+		return fmt.Errorf("%w: zero operation or empty steps", ErrActionCheckpointCorrupt)
+	}
+	if checkpoint.NextStep < 0 || checkpoint.NextStep > len(checkpoint.Steps) {
+		return fmt.Errorf("%w: next step %d of %d", ErrActionCheckpointCorrupt, checkpoint.NextStep, len(checkpoint.Steps))
+	}
+	if checkpoint.Phase != ActionCheckpointPrepared && checkpoint.Phase != ActionCheckpointAttempting {
+		return fmt.Errorf("%w: phase %d", ErrActionCheckpointCorrupt, checkpoint.Phase)
+	}
+	if checkpoint.Phase == ActionCheckpointAttempting && checkpoint.NextStep == len(checkpoint.Steps) {
+		return fmt.Errorf("%w: attempting after final step", ErrActionCheckpointCorrupt)
+	}
+	for _, step := range checkpoint.Steps {
+		if err := validateActionStep(step); err != nil {
+			return fmt.Errorf("%w: %v", ErrActionCheckpointCorrupt, err)
+		}
+	}
+	return nil
+}
+
+func validateStoredActionCheckpoint(checkpoint ActionCheckpoint) error {
+	if checkpoint.Revision == 0 {
+		return fmt.Errorf("%w: stored revision is zero", ErrActionCheckpointCorrupt)
+	}
+	return validateActionCheckpoint(checkpoint)
+}
+
+func validateActionStep(step ActionStep) error {
+	if err := validatePacketFlow(step.Flow); err != nil {
+		return fmt.Errorf("invalid faketcp action step flow: %w", err)
+	}
+	switch step.Kind {
+	case ActionStepSendControl:
+		if len(step.Packet.Data) != 0 {
+			return errors.New("faketcp control action step contains packet data")
+		}
+		switch step.Control.Flags {
+		case FlagSYN, FlagSYN | FlagACK, FlagACK:
+		default:
+			return fmt.Errorf("faketcp control action step has unsupported flags %#x", step.Control.Flags)
+		}
+	case ActionStepReinject:
+		if step.Packet.CaptureNanos == 0 || len(step.Packet.Data) == 0 {
+			return errors.New("faketcp reinjection action step has no packet or capture identity")
+		}
+	default:
+		return fmt.Errorf("unknown faketcp action step kind %d", step.Kind)
+	}
+	return nil
+}
+
+func cloneActionCheckpoint(checkpoint ActionCheckpoint) ActionCheckpoint {
+	clone := checkpoint
+	clone.Steps = make([]ActionStep, len(checkpoint.Steps))
+	for index, step := range checkpoint.Steps {
+		clone.Steps[index] = step
+		clone.Steps[index].Packet.Data = append([]byte(nil), step.Packet.Data...)
+	}
+	return clone
+}
+
+func actionCheckpointStoreIsNil(store ActionCheckpointStore) bool {
+	return interfaceValueIsNil(store)
+}
