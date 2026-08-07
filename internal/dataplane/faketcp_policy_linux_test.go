@@ -21,8 +21,9 @@ import (
 
 func TestStageFakeTCPPolicyGenerationWritesReachabilityLatchLast(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
-	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+	ctx, transaction, isolation := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
+	isolation.events = &trace.events
 	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
 	if err != nil {
 		t.Fatal(err)
@@ -37,6 +38,12 @@ func TestStageFakeTCPPolicyGenerationWritesReachabilityLatchLast(t *testing.T) {
 	}
 	if !slices.Equal(trace.successfulUpdates, want) {
 		t.Fatalf("update order = %v, want %v", trace.successfulUpdates, want)
+	}
+	if len(trace.events) == 0 || trace.events[0] != "assert-inactive" {
+		t.Fatalf("first generation/map event = %v, want assert-inactive", trace.events)
+	}
+	if !slices.Equal(isolation.inactiveCalls, []uint64{snapshot.Generation}) {
+		t.Fatalf("inactive checks = %v, want generation %d", isolation.inactiveCalls, snapshot.Generation)
 	}
 	for _, flags := range trace.updateFlags {
 		if flags != ebpf.UpdateNoExist {
@@ -53,6 +60,111 @@ func TestStageFakeTCPPolicyGenerationWritesReachabilityLatchLast(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, snapshot.ControlPolicies)
+}
+
+func TestStageFakeTCPPolicyGenerationRequiresInactiveBeforeMapAccess(t *testing.T) {
+	tests := []struct {
+		name      string
+		configure func(*memoryFakeTCPPolicyQuiescer)
+		wantError string
+	}{
+		{
+			name: "backend failure",
+			configure: func(isolation *memoryFakeTCPPolicyQuiescer) {
+				isolation.failInactive = errors.New("injected inactive check failure")
+			},
+			wantError: "injected inactive check failure",
+		},
+		{
+			name: "backend rejects wrong generation",
+			configure: func(isolation *memoryFakeTCPPolicyQuiescer) {
+				isolation.generation++
+			},
+			wantError: "inactive generation 91, want 92",
+		},
+		{
+			name: "target is active",
+			configure: func(isolation *memoryFakeTCPPolicyQuiescer) {
+				isolation.inactive = false
+			},
+			wantError: "target generation is active",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := mustFakeTCPPolicySnapshot(t, 91)
+			ctx, transaction, isolation := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+			policyMaps, trace := newMemoryFakeTCPPolicyMaps()
+			isolation.events = &trace.events
+			test.configure(isolation)
+
+			stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+			if stage != nil || err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("inactive-gated stage handle=%v error=%v, want %q", stage, err, test.wantError)
+			}
+			if !slices.Equal(trace.events, []string{"assert-inactive"}) ||
+				len(trace.updateAttempts) != 0 || len(trace.deleteAttempts) != 0 ||
+				len(isolation.calls) != 0 {
+				t.Fatalf(
+					"failed inactive proof touched maps/quiesce: events=%v updates=%v deletes=%v quiesce=%v",
+					trace.events,
+					trace.updateAttempts,
+					trace.deleteAttempts,
+					isolation.calls,
+				)
+			}
+		})
+	}
+}
+
+func TestFakeTCPPolicyGenerationTransactionRejectsMismatchedLifecycleContext(t *testing.T) {
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, isolation := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
+	isolation.events = &trace.events
+	wrongRoot := t.TempDir()
+	wrongCtx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(wrongRoot, "other-daemon.lease"),
+		filepath.Join(wrongRoot, "other-maintenance.gate"),
+	)
+
+	stage, err := transaction.Stage(wrongCtx, policyMaps, snapshot)
+	if stage != nil || err == nil || !strings.Contains(err.Error(), "does not match transaction path") {
+		t.Fatalf("mismatched-context stage handle=%v error=%v", stage, err)
+	}
+	if len(trace.events) != 0 || len(isolation.inactiveCalls) != 0 || len(isolation.calls) != 0 {
+		t.Fatalf(
+			"mismatched stage context touched backend/maps: events=%v inactive=%v quiesce=%v",
+			trace.events,
+			isolation.inactiveCalls,
+			isolation.calls,
+		)
+	}
+
+	stage, err = transaction.Stage(ctx, policyMaps, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	eventCount := len(trace.events)
+	deleteCount := len(trace.deleteAttempts)
+	quiesceCount := len(isolation.calls)
+	if err := transaction.Rollback(wrongCtx, stage); err == nil ||
+		!strings.Contains(err.Error(), "does not match transaction path") {
+		t.Fatalf("mismatched-context rollback error = %v", err)
+	}
+	if len(trace.events) != eventCount || len(trace.deleteAttempts) != deleteCount ||
+		len(isolation.calls) != quiesceCount {
+		t.Fatalf(
+			"mismatched rollback context touched maps/quiesce: events=%v deletes=%v quiesce=%v",
+			trace.events[eventCount:],
+			trace.deleteAttempts[deleteCount:],
+			isolation.calls[quiesceCount:],
+		)
+	}
+	if err := transaction.Rollback(ctx, stage); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestStageFakeTCPPolicyGenerationRollsBackEveryWriteFailureInReverse(t *testing.T) {
@@ -296,6 +408,102 @@ func TestFakeTCPPolicyRollbackQuiescesBPFBeforeCursorCompareDeleteWindow(t *test
 	assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
 }
 
+func TestFakeTCPPolicyRollbackAcceptsOnlyPreexistingBPFControlCursorDrift(t *testing.T) {
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, isolation := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
+	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlPolicies := policyMaps.ControlPolicies.(*memoryFakeTCPPolicyMap)
+	for key, inserted := range snapshot.ControlPolicies {
+		drifted := inserted
+		drifted.VirtualTimeNanos = 987654321
+		controlPolicies.entries[key] = drifted
+	}
+	if isolation.quiesced {
+		t.Fatal("test cursor drift did not precede the quiescence barrier")
+	}
+
+	if err := transaction.Rollback(ctx, stage); err != nil {
+		t.Fatalf("rollback cursor-only drift after quiescence: %v", err)
+	}
+	if !isolation.quiesced || len(isolation.calls) == 0 {
+		t.Fatal("cursor-only rollback bypassed the quiescence barrier")
+	}
+	assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
+}
+
+func TestFakeTCPPolicyRollbackRejectsNonCursorControlPolicyDrift(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*abi.FakeTCPControlPolicyValue)
+	}{
+		{
+			name: "generation",
+			mutate: func(value *abi.FakeTCPControlPolicyValue) {
+				value.Generation++
+			},
+		},
+		{
+			name: "interval",
+			mutate: func(value *abi.FakeTCPControlPolicyValue) {
+				value.IntervalNanos++
+			},
+		},
+		{
+			name: "burst",
+			mutate: func(value *abi.FakeTCPControlPolicyValue) {
+				value.Burst++
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			snapshot := mustFakeTCPPolicySnapshot(t, 91)
+			ctx, transaction, isolation := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
+			policyMaps, _ := newMemoryFakeTCPPolicyMaps()
+			stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			controlPolicies := policyMaps.ControlPolicies.(*memoryFakeTCPPolicyMap)
+			var changedKey abi.FakeTCPControlPolicyKey
+			var inserted abi.FakeTCPControlPolicyValue
+			for key, value := range snapshot.ControlPolicies {
+				changedKey, inserted = key, value
+				break
+			}
+			changed := inserted
+			changed.VirtualTimeNanos = 123456789
+			test.mutate(&changed)
+			controlPolicies.entries[changedKey] = changed
+
+			err = transaction.Rollback(ctx, stage)
+			if err == nil || !strings.Contains(err.Error(), "refusing rollback because inserted value changed") {
+				t.Fatalf("non-cursor policy drift rollback error = %v", err)
+			}
+			if !isolation.quiesced {
+				t.Fatal("control policy comparator ran before quiescence")
+			}
+			if got := controlPolicies.entries[changedKey]; got != changed {
+				t.Fatalf("non-cursor drift was deleted or overwritten: got %#v want %#v", got, changed)
+			}
+			if err := transaction.Disarm(ctx, stage); err == nil ||
+				!strings.Contains(err.Error(), "incomplete rollback") {
+				t.Fatalf("disarm after non-cursor drift error = %v", err)
+			}
+
+			controlPolicies.entries[changedKey] = inserted
+			if err := transaction.Rollback(ctx, stage); err != nil {
+				t.Fatalf("retry exact non-cursor policy rollback: %v", err)
+			}
+			assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
+		})
+	}
+}
+
 func TestStageFakeTCPPolicyInternalFailureUsesLatchAndQuiescenceBarrier(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, quiescer := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
@@ -333,8 +541,8 @@ func TestFakeTCPPolicyGenerationTransactionRequiresHeldLeaseAndBarrier(t *testin
 		filepath.Join(root, "daemon.lease"),
 		filepath.Join(root, "maintenance.gate"),
 	)
-	quiesce := func(context.Context, uint64) error { return nil }
-	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, nil, quiesce); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
+	isolation := &memoryFakeTCPPolicyQuiescer{generation: 91, inactive: true}
+	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, nil, isolation); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
 		t.Fatalf("transaction without lease = %v, error = %v", transaction, err)
 	}
 	lease, err := lockfile.AcquireLifecycle(
@@ -345,12 +553,16 @@ func TestFakeTCPPolicyGenerationTransactionRequiresHeldLeaseAndBarrier(t *testin
 		t.Fatal(err)
 	}
 	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, lease, nil); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
-		t.Fatalf("transaction without quiescence barrier = %v, error = %v", transaction, err)
+		t.Fatalf("transaction without isolation backend = %v, error = %v", transaction, err)
+	}
+	var typedNilIsolation *memoryFakeTCPPolicyQuiescer
+	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, lease, typedNilIsolation); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
+		t.Fatalf("transaction with typed-nil isolation backend = %v, error = %v", transaction, err)
 	}
 	if err := lease.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, lease, quiesce); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
+	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, lease, isolation); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
 		t.Fatalf("transaction with closed lease = %v, error = %v", transaction, err)
 	}
 }
@@ -651,12 +863,39 @@ func TestFakeTCPPolicyPerGenerationLimitsMatchTwoBankELFMaps(t *testing.T) {
 
 type memoryFakeTCPPolicyQuiescer struct {
 	generation              uint64
+	inactiveCalls           []uint64
+	failInactive            error
+	inactive                bool
 	calls                   []uint64
 	fail                    error
 	quiesced                bool
+	events                  *[]string
 	bpfMutationAttempts     int
 	bpfMutationBlocked      int
 	bpfMutationUnexpectedly int
+}
+
+func (quiescer *memoryFakeTCPPolicyQuiescer) AssertInactive(
+	ctx context.Context,
+	generation uint64,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	quiescer.inactiveCalls = append(quiescer.inactiveCalls, generation)
+	if quiescer.events != nil {
+		*quiescer.events = append(*quiescer.events, "assert-inactive")
+	}
+	if generation != quiescer.generation {
+		return fmt.Errorf("inactive generation %d, want %d", generation, quiescer.generation)
+	}
+	if quiescer.failInactive != nil {
+		return quiescer.failInactive
+	}
+	if !quiescer.inactive {
+		return errors.New("target generation is active")
+	}
+	return nil
 }
 
 func (quiescer *memoryFakeTCPPolicyQuiescer) Quiesce(
@@ -667,6 +906,9 @@ func (quiescer *memoryFakeTCPPolicyQuiescer) Quiesce(
 		return err
 	}
 	quiescer.calls = append(quiescer.calls, generation)
+	if quiescer.events != nil {
+		*quiescer.events = append(*quiescer.events, "quiesce")
+	}
 	if generation != quiescer.generation {
 		return fmt.Errorf("quiesce generation %d, want %d", generation, quiescer.generation)
 	}
@@ -705,12 +947,12 @@ func newTestFakeTCPPolicyGenerationTransaction(
 	if err != nil {
 		t.Fatal(err)
 	}
-	quiescer := &memoryFakeTCPPolicyQuiescer{generation: generation}
+	quiescer := &memoryFakeTCPPolicyQuiescer{generation: generation, inactive: true}
 	transaction, err := newFakeTCPPolicyGenerationTransaction(
 		ctx,
 		generation,
 		lease,
-		quiescer.Quiesce,
+		quiescer,
 	)
 	if err != nil {
 		_ = lease.Close()
@@ -730,6 +972,7 @@ func newTestFakeTCPPolicyGenerationTransaction(
 }
 
 type memoryFakeTCPPolicyTrace struct {
+	events            []string
 	updateAttempts    []string
 	successfulUpdates []string
 	updateFlags       []ebpf.MapUpdateFlags
@@ -750,6 +993,7 @@ type memoryFakeTCPPolicyMap struct {
 }
 
 func (m *memoryFakeTCPPolicyMap) Lookup(key, valueOut any) error {
+	m.trace.events = append(m.trace.events, "lookup:"+m.name)
 	if m.failNextLookup != nil {
 		err := m.failNextLookup
 		m.failNextLookup = nil
@@ -767,6 +1011,7 @@ func (m *memoryFakeTCPPolicyMap) Lookup(key, valueOut any) error {
 }
 
 func (m *memoryFakeTCPPolicyMap) Update(key, value any, flags ebpf.MapUpdateFlags) error {
+	m.trace.events = append(m.trace.events, "update:"+m.name)
 	m.trace.updateAttempts = append(m.trace.updateAttempts, m.name)
 	m.trace.updateFlags = append(m.trace.updateFlags, flags)
 	if m.trace.failUpdateAt != 0 && len(m.trace.updateAttempts) == m.trace.failUpdateAt {
@@ -789,6 +1034,7 @@ func (m *memoryFakeTCPPolicyMap) Update(key, value any, flags ebpf.MapUpdateFlag
 }
 
 func (m *memoryFakeTCPPolicyMap) Delete(key any) error {
+	m.trace.events = append(m.trace.events, "delete:"+m.name)
 	m.trace.deleteAttempts = append(m.trace.deleteAttempts, m.name)
 	if m.failNextDelete != nil {
 		err := m.failNextDelete
