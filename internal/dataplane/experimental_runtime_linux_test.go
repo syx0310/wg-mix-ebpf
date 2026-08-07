@@ -1641,6 +1641,99 @@ func TestExperimentalFakeTCPRuntimeBindsCanonicalInterfacesBeforeMutation(t *tes
 			match: "baseline underlays are stale or unrelated",
 		},
 		{
+			name: "stale baseline control",
+			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
+				value := options.baselineSnapshot.Control[abi.ControlKeyGlobal]
+				value.ABIVersion++
+				options.baselineSnapshot.Control[abi.ControlKeyGlobal] = value
+			},
+			match: "baseline control are stale or unrelated",
+		},
+		{
+			name: "unrelated baseline profile",
+			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
+				generation := options.snapshot.Generation
+				options.baselineSnapshot.Profiles[abi.ProfileKey{
+					Generation: generation, ProfileID: 99,
+				}] = abi.ProfileValue{Generation: generation}
+			},
+			match: "baseline profiles are stale or unrelated",
+		},
+		{
+			name: "unrelated baseline cipher",
+			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
+				generation := options.snapshot.Generation
+				options.baselineSnapshot.Ciphers[abi.CipherKey{
+					Generation: generation, CipherID: 99,
+				}] = abi.CipherValue{Generation: generation}
+			},
+			match: "baseline ciphers are stale or unrelated",
+		},
+		{
+			name: "unrelated baseline managed fwmark",
+			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
+				generation := options.snapshot.Generation
+				options.baselineSnapshot.ManagedFwmarks[abi.ManagedFwmarkKey{
+					Generation: generation, FwMark: 99, UnderlayIndex: 3,
+				}] = abi.ManagedFwmarkValue{Generation: generation}
+			},
+			match: "baseline managed fwmarks are stale or unrelated",
+		},
+		{
+			name: "unrelated baseline egress rule",
+			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
+				generation := options.snapshot.Generation
+				options.baselineSnapshot.EgressRules[abi.EgressRuleKey{
+					Generation: generation, FwMark: 99, UnderlayIndex: 3,
+				}] = abi.EgressRuleValue{Generation: generation}
+			},
+			match: "baseline egress rules are stale or unrelated",
+		},
+		{
+			name: "stale baseline ingress listener",
+			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
+				for key, value := range options.baselineSnapshot.IngressListeners {
+					value.WGID++
+					options.baselineSnapshot.IngressListeners[key] = value
+					break
+				}
+			},
+			match: "baseline ingress listeners are stale or unrelated",
+		},
+		{
+			name: "unrelated baseline ICMP listener",
+			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
+				generation := options.snapshot.Generation
+				options.baselineSnapshot.ICMPListeners[abi.ICMPListenerKey{
+					Generation: generation, UnderlayIndex: 3, ICMPID: 99,
+				}] = abi.ICMPListenerValue{Generation: generation}
+			},
+			match: "baseline ICMP listeners are stale or unrelated",
+		},
+		{
+			name: "stale FakeTCP managed port",
+			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
+				for key, value := range options.snapshot.ManagedPorts {
+					delete(options.snapshot.ManagedPorts, key)
+					key.DestinationPort++
+					options.snapshot.ManagedPorts[key] = value
+					break
+				}
+			},
+			match: "managed ports are stale or unrelated",
+		},
+		{
+			name: "stale FakeTCP control policy",
+			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
+				for key, value := range options.snapshot.ControlPolicies {
+					value.Burst++
+					options.snapshot.ControlPolicies[key] = value
+					break
+				}
+			},
+			match: "control policies are stale or unrelated",
+		},
+		{
 			name: "unrelated FakeTCP interface",
 			mutate: func(t *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
 				state := fakeTCPPolicyTestState()

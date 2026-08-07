@@ -1233,9 +1233,9 @@ func validateFakeTCPXDPRequests(
 }
 
 // validateExperimentalRuntimeCanonicalInterfaces binds every independently
-// supplied projection before the first map, TC, or XDP mutation. Baseline TC
-// may cover more underlays than FakeTCP, but both the baseline underlay set and
-// the FakeTCP subset must be exact projections of the same control.State.
+// supplied projection before the first map, TCX, or XDP mutation. Baseline TCX
+// may cover more underlays than FakeTCP, but every baseline map and every
+// FakeTCP policy map must be an exact projection of the same control.State.
 func validateExperimentalRuntimeCanonicalInterfaces(
 	baseline *abi.Snapshot,
 	fakeSnapshot *fakeTCPPolicySnapshot,
@@ -1255,6 +1255,26 @@ func validateExperimentalRuntimeCanonicalInterfaces(
 	}
 	if !reflect.DeepEqual(baseline.Underlays, projectedBaseline.Underlays) {
 		return errors.New("build experimental FakeTCP runtime: baseline underlays are stale or unrelated to TC attach state")
+	}
+	for _, projection := range []struct {
+		label     string
+		supplied  any
+		canonical any
+	}{
+		{"control", baseline.Control, projectedBaseline.Control},
+		{"profiles", baseline.Profiles, projectedBaseline.Profiles},
+		{"ciphers", baseline.Ciphers, projectedBaseline.Ciphers},
+		{"managed fwmarks", baseline.ManagedFwmarks, projectedBaseline.ManagedFwmarks},
+		{"egress rules", baseline.EgressRules, projectedBaseline.EgressRules},
+		{"ingress listeners", baseline.IngressListeners, projectedBaseline.IngressListeners},
+		{"ICMP listeners", baseline.ICMPListeners, projectedBaseline.ICMPListeners},
+	} {
+		if !reflect.DeepEqual(projection.supplied, projection.canonical) {
+			return fmt.Errorf(
+				"build experimental FakeTCP runtime: baseline %s are stale or unrelated to TC attach state",
+				projection.label,
+			)
+		}
 	}
 	tcIfindexes, err := activeAttachIfindexes(attachState)
 	if err != nil {
@@ -1286,6 +1306,12 @@ func validateExperimentalRuntimeCanonicalInterfaces(
 	}
 	if !reflect.DeepEqual(fakeSnapshot.ManagedInterfaces, projectedFake.ManagedInterfaces) {
 		return errors.New("build experimental FakeTCP runtime: FakeTCP managed interfaces are stale or unrelated to TC attach state")
+	}
+	if !reflect.DeepEqual(fakeSnapshot.ManagedPorts, projectedFake.ManagedPorts) {
+		return errors.New("build experimental FakeTCP runtime: FakeTCP managed ports are stale or unrelated to TC attach state")
+	}
+	if !reflect.DeepEqual(fakeSnapshot.ControlPolicies, projectedFake.ControlPolicies) {
+		return errors.New("build experimental FakeTCP runtime: FakeTCP control policies are stale or unrelated to TC attach state")
 	}
 	if err := validateFakeTCPXDPRequests(fakeSnapshot, xdpRequests); err != nil {
 		return err
