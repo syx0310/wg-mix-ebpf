@@ -324,31 +324,44 @@ func (stage *experimentalCoreStage) Close() error {
 		return stage.closeErr
 	}
 	if err := stage.deactivateLocked(); err != nil {
-		stage.closed = true
 		stage.closeErr = err
 		return stage.closeErr
 	}
-	stage.closed = true
 	var errs []error
+	var remaining []experimentalCoreMapChange
 	for index := len(stage.changes) - 1; index >= 0; index-- {
 		change := stage.changes[index]
 		observed := reflect.New(reflect.TypeOf(change.expected))
 		if err := change.resource.Lookup(change.key, observed.Interface()); err != nil {
 			if !errors.Is(err, ebpf.ErrKeyNotExist) {
 				errs = append(errs, fmt.Errorf("read experimental map %s before rollback: %w", change.name, err))
+				remaining = append([]experimentalCoreMapChange{change}, remaining...)
 			}
 			continue
 		}
 		if !reflect.DeepEqual(observed.Elem().Interface(), change.expected) {
 			errs = append(errs, fmt.Errorf("refuse rollback of experimental map %s because its value changed", change.name))
+			remaining = append([]experimentalCoreMapChange{change}, remaining...)
 			continue
 		}
 		if err := change.resource.Delete(change.key); err != nil && !errors.Is(err, ebpf.ErrKeyNotExist) {
 			errs = append(errs, fmt.Errorf("rollback experimental map %s: %w", change.name, err))
+			remaining = append([]experimentalCoreMapChange{change}, remaining...)
+			continue
 		}
+		if err := change.resource.Lookup(change.key, observed.Interface()); err != nil {
+			if !errors.Is(err, ebpf.ErrKeyNotExist) {
+				errs = append(errs, fmt.Errorf("verify rollback of experimental map %s: %w", change.name, err))
+				remaining = append([]experimentalCoreMapChange{change}, remaining...)
+			}
+			continue
+		}
+		errs = append(errs, fmt.Errorf("verify rollback of experimental map %s: key remains", change.name))
+		remaining = append([]experimentalCoreMapChange{change}, remaining...)
 	}
-	stage.changes = nil
+	stage.changes = remaining
 	stage.closeErr = errors.Join(errs...)
+	stage.closed = len(stage.changes) == 0
 	return stage.closeErr
 }
 

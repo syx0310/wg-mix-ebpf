@@ -226,7 +226,7 @@ func TestFakeTCPXDPStageReturnsOwnedPrefixOnLaterFailure(t *testing.T) {
 	}
 }
 
-func TestFakeTCPXDPStageRetainsCloseErrorWithoutDoubleClose(t *testing.T) {
+func TestFakeTCPXDPStageRetriesOnlyFailedClose(t *testing.T) {
 	runtime := newMemoryFakeTCPXDPRuntime()
 	var closeLog []int
 	wantErr := errors.New("injected XDP close failure")
@@ -251,12 +251,12 @@ func TestFakeTCPXDPStageRetainsCloseErrorWithoutDoubleClose(t *testing.T) {
 	if !slices.Equal(closeLog, []int{11, 7}) {
 		t.Fatalf("first reverse close order = %v", closeLog)
 	}
-	if err := stage.Close(); !errors.Is(err, wantErr) {
-		t.Fatalf("retained close error: %v", err)
+	if err := stage.Close(); err != nil {
+		t.Fatalf("retry close error: %v", err)
 	}
-	if !slices.Equal(closeLog, []int{11, 7}) || runtime.links[7].closes != 1 ||
+	if !slices.Equal(closeLog, []int{11, 7, 7}) || runtime.links[7].closes != 2 ||
 		runtime.links[11].closes != 1 {
-		t.Fatalf("retained close log=%v link7=%d link11=%d",
+		t.Fatalf("retry close log=%v link7=%d link11=%d",
 			closeLog, runtime.links[7].closes, runtime.links[11].closes)
 	}
 }

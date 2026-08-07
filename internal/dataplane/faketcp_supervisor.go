@@ -105,7 +105,11 @@ func (supervisor *fakeTCPRuntimeSupervisor) Ensure(
 	runtime, err := build(ctx)
 	if err != nil {
 		if !fakeTCPRuntimeServiceIsNil(runtime) {
-			err = errors.Join(err, closeUnstartedFakeTCPRuntime(runtime))
+			closeErr := closeUnstartedFakeTCPRuntime(runtime)
+			err = errors.Join(err, closeErr)
+			if closeErr != nil {
+				supervisor.storeCurrent(newQuarantinedFakeTCPRuntime(key, runtime))
+			}
 		}
 		return fmt.Errorf("build experimental FakeTCP runtime: %w", err)
 	}
@@ -113,7 +117,11 @@ func (supervisor *fakeTCPRuntimeSupervisor) Ensure(
 		return errors.New("build experimental FakeTCP runtime: builder returned nil")
 	}
 	if err := ctx.Err(); err != nil {
-		return errors.Join(err, closeUnstartedFakeTCPRuntime(runtime))
+		closeErr := closeUnstartedFakeTCPRuntime(runtime)
+		if closeErr != nil {
+			supervisor.storeCurrent(newQuarantinedFakeTCPRuntime(key, runtime))
+		}
+		return errors.Join(err, closeErr)
 	}
 
 	runCtx, cancel := context.WithCancel(context.Background())
@@ -182,7 +190,9 @@ func (supervisor *fakeTCPRuntimeSupervisor) Stop(ctx context.Context) error {
 		return errors.Join(stopErr, ctx.Err())
 	}
 	closeErr := current.runtime.Close()
-	supervisor.clearCurrent(current)
+	if closeErr == nil {
+		supervisor.clearCurrent(current)
+	}
 	return errors.Join(
 		wrapFakeTCPRunError(current.terminalError()),
 		wrapFakeTCPStopError(stopErr),
@@ -197,11 +207,25 @@ func (supervisor *fakeTCPRuntimeSupervisor) retireFinished(
 		return errors.New("retire experimental FakeTCP runtime: runtime is not finished")
 	}
 	closeErr := current.runtime.Close()
-	supervisor.clearCurrent(current)
+	if closeErr == nil {
+		supervisor.clearCurrent(current)
+	}
 	return errors.Join(
 		wrapFakeTCPRunError(current.terminalError()),
 		wrapFakeTCPCloseError(closeErr),
 	)
+}
+
+func newQuarantinedFakeTCPRuntime(
+	key fakeTCPRuntimeDesiredKey,
+	runtime fakeTCPRuntimeService,
+) *supervisedFakeTCPRuntime {
+	done := make(chan struct{})
+	close(done)
+	return &supervisedFakeTCPRuntime{
+		key: key, runtime: runtime, done: done, stopRequested: true,
+		cancel: func() {},
+	}
 }
 
 func (supervisor *fakeTCPRuntimeSupervisor) loadCurrent() *supervisedFakeTCPRuntime {

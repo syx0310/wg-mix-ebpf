@@ -414,6 +414,7 @@ type experimentalFakeTCPRuntimeState struct {
 	handles    ExperimentalFakeTCPRuntimeHandles
 	closing    bool
 	closed     bool
+	shutdown   bool
 	closeErr   error
 	closeDone  chan struct{}
 }
@@ -1241,7 +1242,7 @@ func (runtime *ExperimentalFakeTCPRuntime) Handles() (ExperimentalFakeTCPRuntime
 	state := runtime.state
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if state.closing || state.closed {
+	if state.shutdown || state.closing || state.closed {
 		return ExperimentalFakeTCPRuntimeHandles{}, ErrExperimentalFakeTCPRuntimeClosed
 	}
 	return state.handles, nil
@@ -1267,7 +1268,7 @@ func (runtime *ExperimentalFakeTCPRuntime) Run(ctx context.Context) error {
 	}
 	state := runtime.state
 	state.mu.Lock()
-	if state.closing || state.closed || experimentalSlowPathIsNil(state.slowPath) {
+	if state.shutdown || state.closing || state.closed || experimentalSlowPathIsNil(state.slowPath) {
 		state.mu.Unlock()
 		return ErrExperimentalFakeTCPRuntimeClosed
 	}
@@ -1282,7 +1283,7 @@ func (runtime *ExperimentalFakeTCPRuntime) RequestStop() error {
 	}
 	state := runtime.state
 	state.mu.Lock()
-	if state.closing || state.closed || experimentalSlowPathIsNil(state.slowPath) {
+	if state.shutdown || state.closing || state.closed || experimentalSlowPathIsNil(state.slowPath) {
 		state.mu.Unlock()
 		return ErrExperimentalFakeTCPRuntimeClosed
 	}
@@ -1311,10 +1312,10 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 		state.mu.Unlock()
 		return err
 	}
-	if state.closeDone == nil {
-		state.closeDone = make(chan struct{})
-	}
+	state.closeDone = make(chan struct{})
 	state.closing = true
+	state.shutdown = true
+	done := state.closeDone
 	core := state.core
 	slowPath := state.slowPath
 	sessions := state.handles.sessions
@@ -1325,36 +1326,64 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 	state.mu.Unlock()
 
 	var closeErrors []error
+	coreInactive := true
 	if core != nil {
 		if err := core.Deactivate(); err != nil {
+			coreInactive = false
 			closeErrors = append(closeErrors, fmt.Errorf("deactivate experimental FakeTCP runtime baseline core: %w", err))
 		}
 	}
-	for _, close := range []func() error{
-		func() error { return wrapExperimentalRuntimeClose("XDP links", xdp) },
-		func() error { return wrapExperimentalRuntimeClose("TC filters", tc) },
-		func() error { return wrapExperimentalRuntimeClose("slow path", slowPath) },
-		func() error { return wrapExperimentalRuntimeClose("baseline core", core) },
-		func() error { return wrapExperimentalRuntimeClose("session handle", sessions) },
-		func() error { return wrapExperimentalRuntimeClose("event-map constructors", events) },
-		func() error { return wrapExperimentalRuntimeClose("collection", collection) },
-	} {
-		closeErrors = append(closeErrors, close())
+	xdpErr := wrapExperimentalRuntimeClose("XDP links", xdp)
+	tcErr := wrapExperimentalRuntimeClose("TC filters", tc)
+	slowPathErr := wrapExperimentalRuntimeClose("slow path", slowPath)
+	closeErrors = append(closeErrors, xdpErr, tcErr, slowPathErr)
+
+	var coreErr, sessionErr, eventErr, collectionErr error
+	if coreInactive && xdpErr == nil && tcErr == nil && slowPathErr == nil {
+		coreErr = wrapExperimentalRuntimeClose("baseline core", core)
+		closeErrors = append(closeErrors, coreErr)
+		if coreErr == nil {
+			sessionErr = wrapExperimentalRuntimeClose("session handle", sessions)
+			eventErr = wrapExperimentalRuntimeClose("event-map constructors", events)
+			closeErrors = append(closeErrors, sessionErr, eventErr)
+			if sessionErr == nil && eventErr == nil {
+				collectionErr = wrapExperimentalRuntimeClose("collection", collection)
+				closeErrors = append(closeErrors, collectionErr)
+			}
+		}
 	}
 	err := errors.Join(closeErrors...)
 
 	state.mu.Lock()
 	state.closeErr = err
-	state.closed = true
 	state.closing = false
-	state.handles = ExperimentalFakeTCPRuntimeHandles{}
-	state.engine = nil
-	state.slowPath = nil
-	state.core = nil
-	state.tc = nil
-	state.xdp = nil
-	state.collection = nil
-	close(state.closeDone)
+	if xdpErr == nil {
+		state.xdp = nil
+	}
+	if tcErr == nil {
+		state.tc = nil
+	}
+	if slowPathErr == nil {
+		state.slowPath = nil
+	}
+	if coreInactive && coreErr == nil && xdpErr == nil && tcErr == nil && slowPathErr == nil {
+		state.core = nil
+		if sessionErr == nil {
+			state.handles.sessions = nil
+		}
+		if eventErr == nil {
+			state.handles.events = nil
+		}
+	}
+	complete := coreInactive && xdpErr == nil && tcErr == nil && slowPathErr == nil &&
+		coreErr == nil && sessionErr == nil && eventErr == nil && collectionErr == nil
+	if complete {
+		state.closed = true
+		state.handles = ExperimentalFakeTCPRuntimeHandles{}
+		state.engine = nil
+		state.collection = nil
+	}
+	close(done)
 	state.mu.Unlock()
 	return err
 }

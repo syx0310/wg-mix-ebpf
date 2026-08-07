@@ -703,6 +703,13 @@ func TestExperimentalRuntimeDeactivateFailureStillDetachesXDPAndTC(t *testing.T)
 	if deactivateIndex < 0 || xdpIndex <= deactivateIndex || tcIndex <= xdpIndex {
 		t.Fatalf("deactivate failure dependency order = %v", fixture.activationTrace)
 	}
+	fixture.lastCoreStage.deactivateErr = nil
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("retry runtime Close: %v", err)
+	}
+	if !runtime.state.closed || runtime.state.collection != nil {
+		t.Fatalf("retry closed=%t collection=%#v", runtime.state.closed, runtime.state.collection)
+	}
 }
 
 func TestGenerationFencedSessionStoreRejectsCrossGenerationWithoutBackendCall(t *testing.T) {
@@ -1658,30 +1665,51 @@ func TestExperimentalFakeTCPRuntimeBindsCanonicalInterfacesBeforeMutation(t *tes
 	}
 }
 
-func TestExperimentalRuntimeClosePreservesAllResourceErrors(t *testing.T) {
+func TestExperimentalRuntimeCloseQuarantinesFailedDetachesUntilRetry(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
-	slowPathErr := errors.New("slow-path close")
-	sessionErr := errors.New("session close")
 	xdpErr := errors.New("XDP close")
-	mapErr := errors.New("map close")
-	fixture.sessionStore.closeErr = sessionErr
-	fixture.slowPath.closeErr = slowPathErr
+	tcErr := errors.New("TC close")
 	fixture.xdpRuntime.links[3] = &fakeOwnedXDPLink{
 		ifindex: 3, programID: 8002, closeErrs: []error{xdpErr},
 	}
-	fixture.mapResources[fakeTCPSessionMapName].closeErr = mapErr
 	runtime, _, err := fixture.build(t, 91)
 	if err != nil {
 		t.Fatal(err)
 	}
+	fixture.lastTCStage.closeErr = tcErr
 	err = runtime.Close()
-	for _, want := range []error{slowPathErr, sessionErr, xdpErr, mapErr} {
+	for _, want := range []error{xdpErr, tcErr} {
 		if !errors.Is(err, want) {
 			t.Fatalf("close error %v does not contain %v", err, want)
 		}
 	}
-	if retryErr := runtime.Close(); retryErr == nil || retryErr.Error() != err.Error() {
-		t.Fatalf("retained close error = %v, want %v", retryErr, err)
+	if runtime.state.closed || runtime.state.xdp == nil || runtime.state.tc == nil ||
+		runtime.state.core == nil || runtime.state.collection == nil {
+		t.Fatalf(
+			"failed detach owner closed=%t xdp=%#v tc=%#v core=%#v collection=%#v",
+			runtime.state.closed, runtime.state.xdp, runtime.state.tc,
+			runtime.state.core, runtime.state.collection,
+		)
+	}
+	if _, err := runtime.Handles(); !errors.Is(err, ErrExperimentalFakeTCPRuntimeClosed) {
+		t.Fatalf("quarantined Handles error = %v", err)
+	}
+	for name, resource := range fixture.mapResources {
+		if resource.closes != 0 {
+			t.Fatalf("unsafe dependency close reached map %s: %d", name, resource.closes)
+		}
+	}
+	fixture.lastTCStage.closeErr = nil
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("retry Close: %v", err)
+	}
+	if !runtime.state.closed || runtime.state.collection != nil ||
+		fixture.xdpRuntime.links[3].closes != 2 || fixture.lastTCStage.closes != 2 {
+		t.Fatalf(
+			"retry closed=%t collection=%#v xdp closes=%d tc closes=%d",
+			runtime.state.closed, runtime.state.collection,
+			fixture.xdpRuntime.links[3].closes, fixture.lastTCStage.closes,
+		)
 	}
 }
 

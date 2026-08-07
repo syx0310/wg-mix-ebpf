@@ -30,6 +30,7 @@ type coreMemoryMap struct {
 	programIDs    map[uint32]uint32
 	failLookup    error
 	failUpdate    error
+	failDelete    error
 	corruptUpdate any
 }
 
@@ -101,6 +102,11 @@ func (memory *coreMemoryMap) Update(
 
 func (memory *coreMemoryMap) Delete(key any) error {
 	*memory.events = append(*memory.events, "delete:"+memory.name)
+	if memory.failDelete != nil {
+		err := memory.failDelete
+		memory.failDelete = nil
+		return err
+	}
 	if _, exists := memory.entries[key]; !exists {
 		return ebpf.ErrKeyNotExist
 	}
@@ -354,5 +360,32 @@ func TestExperimentalCoreDeactivateFailureKeepsDependentMapsIntact(t *testing.T)
 	}
 	if got := fixture.maps["control_map"].entries[abi.ControlKeyGlobal]; got != coreTestSnapshot(91).Control[abi.ControlKeyGlobal] {
 		t.Fatalf("failed deactivate changed control: %#v", got)
+	}
+}
+
+func TestExperimentalCoreCloseRetriesFailedDeactivateAndExactDelete(t *testing.T) {
+	fixture := newCoreStageFixture(t)
+	stage := fixture.stage(t, 91)
+	if err := stage.CommitControl(); err != nil {
+		t.Fatal(err)
+	}
+	deactivateErr := errors.New("injected transient deactivate failure")
+	fixture.maps["control_map"].failUpdate = deactivateErr
+	if err := stage.Close(); !errors.Is(err, deactivateErr) {
+		t.Fatalf("first Close error = %v", err)
+	}
+	deleteErr := errors.New("injected transient profile delete failure")
+	fixture.maps["profile_map"].failDelete = deleteErr
+	if err := stage.Close(); !errors.Is(err, deleteErr) {
+		t.Fatalf("second Close error = %v", err)
+	}
+	if len(stage.changes) != 1 || stage.changes[0].name != "profile_map" {
+		t.Fatalf("retry owner changes = %#v", stage.changes)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatalf("third Close: %v", err)
+	}
+	if !stage.closed || len(stage.changes) != 0 {
+		t.Fatalf("closed=%t changes=%v", stage.closed, stage.changes)
 	}
 }

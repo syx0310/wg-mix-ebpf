@@ -101,6 +101,12 @@ func (runtime *controlledFakeTCPRuntime) counts() (int, int, bool) {
 	return runtime.stopCalls, runtime.closeCalls, runtime.closeEarly
 }
 
+func (runtime *controlledFakeTCPRuntime) setCloseError(err error) {
+	runtime.mu.Lock()
+	runtime.closeErr = err
+	runtime.mu.Unlock()
+}
+
 func TestFakeTCPRuntimeSupervisorRepeatedEnsureOwnsOneRuntime(t *testing.T) {
 	supervisor := &fakeTCPRuntimeSupervisor{}
 	runtime := newControlledFakeTCPRuntime()
@@ -260,6 +266,80 @@ func TestFakeTCPRuntimeSupervisorStopTimeoutRetainsOwnership(t *testing.T) {
 	close(runtime.stop)
 	if err := supervisor.Stop(t.Context()); err != nil {
 		t.Fatalf("retry Stop: %v", err)
+	}
+}
+
+func TestFakeTCPRuntimeSupervisorCloseFailureQuarantinesOwnerUntilRetry(t *testing.T) {
+	supervisor := &fakeTCPRuntimeSupervisor{}
+	runtime := newControlledFakeTCPRuntime()
+	closeErr := errors.New("injected runtime close failure")
+	runtime.setCloseError(closeErr)
+	key := fakeTCPRuntimeDesiredKey{1}
+	if err := supervisor.Ensure(
+		t.Context(), key,
+		func(context.Context) (fakeTCPRuntimeService, error) { return runtime, nil },
+	); err != nil {
+		t.Fatal(err)
+	}
+	<-runtime.runStarted
+	if err := supervisor.Stop(t.Context()); !errors.Is(err, closeErr) {
+		t.Fatalf("first Stop error = %v", err)
+	}
+	if supervisor.loadCurrent() == nil {
+		t.Fatal("failed Close discarded the only runtime owner")
+	}
+	replacementBuilds := 0
+	if err := supervisor.Ensure(
+		t.Context(), fakeTCPRuntimeDesiredKey{2},
+		func(context.Context) (fakeTCPRuntimeService, error) {
+			replacementBuilds++
+			return newControlledFakeTCPRuntime(), nil
+		},
+	); !errors.Is(err, closeErr) {
+		t.Fatalf("Ensure during quarantine error = %v", err)
+	}
+	if replacementBuilds != 0 || supervisor.loadCurrent() == nil {
+		t.Fatalf("replacement builds=%d current=%#v", replacementBuilds, supervisor.loadCurrent())
+	}
+	runtime.setCloseError(nil)
+	if err := supervisor.Stop(t.Context()); err != nil {
+		t.Fatalf("retry Stop: %v", err)
+	}
+	if supervisor.loadCurrent() != nil {
+		t.Fatal("successful retry retained quarantine owner")
+	}
+	_, closeCalls, _ := runtime.counts()
+	if closeCalls != 3 {
+		t.Fatalf("Close calls = %d, want Stop + Ensure retry + Stop retry", closeCalls)
+	}
+}
+
+func TestFakeTCPRuntimeSupervisorQuarantinesUnstartedCloseFailure(t *testing.T) {
+	supervisor := &fakeTCPRuntimeSupervisor{}
+	runtime := newControlledFakeTCPRuntime()
+	closeErr := errors.New("injected unstarted close failure")
+	runtime.setCloseError(closeErr)
+	ctx, cancel := context.WithCancel(t.Context())
+	err := supervisor.Ensure(
+		ctx,
+		fakeTCPRuntimeDesiredKey{1},
+		func(context.Context) (fakeTCPRuntimeService, error) {
+			cancel()
+			return runtime, nil
+		},
+	)
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, closeErr) {
+		t.Fatalf("Ensure error = %v", err)
+	}
+	if supervisor.loadCurrent() == nil {
+		t.Fatal("unstarted Close failure discarded runtime owner")
+	}
+	runtime.setCloseError(nil)
+	if err := supervisor.Stop(t.Context()); err != nil {
+		t.Fatalf("retry quarantined Close: %v", err)
+	}
+	if supervisor.loadCurrent() != nil {
+		t.Fatal("quarantined unstarted owner remains after retry")
 	}
 }
 

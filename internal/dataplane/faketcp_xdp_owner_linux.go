@@ -305,9 +305,9 @@ func stageOrNil(stage *fakeTCPXDPStage) *fakeTCPXDPStage {
 	return stage
 }
 
-// Close rolls back or retires only links returned by this exact stage. Every
-// link handle is closed exactly once. The joined result is retained so later
-// and concurrent callers observe the failure without risking a double detach.
+// Close rolls back or retires only links returned by this exact stage.
+// Successful detaches are released immediately; failed links remain uniquely
+// owned so a later call can retry without touching already-detached siblings.
 func (stage *fakeTCPXDPStage) Close() error {
 	if stage == nil {
 		return nil
@@ -318,6 +318,7 @@ func (stage *fakeTCPXDPStage) Close() error {
 		return stage.closeErr
 	}
 	var errs []error
+	var remaining []fakeTCPXDPAttachment
 	for index := len(stage.attachments) - 1; index >= 0; index-- {
 		attachment := stage.attachments[index]
 		if err := attachment.link.Close(); err != nil {
@@ -325,10 +326,11 @@ func (stage *fakeTCPXDPStage) Close() error {
 				"close owned FakeTCP XDP link ifindex %d mode %s program %d: %w",
 				attachment.request.IfIndex, attachment.request.Mode, attachment.programID, err,
 			))
+			remaining = append([]fakeTCPXDPAttachment{attachment}, remaining...)
 		}
 	}
-	stage.attachments = nil
+	stage.attachments = remaining
 	stage.closeErr = errors.Join(errs...)
-	stage.closed = true
+	stage.closed = len(stage.attachments) == 0
 	return stage.closeErr
 }
