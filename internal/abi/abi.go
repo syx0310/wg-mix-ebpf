@@ -50,9 +50,10 @@ const (
 	FakeTCPEventRST           uint8 = 5
 	FakeTCPEventFIN           uint8 = 6
 
-	FakeTCPEventSize         = 56
-	FakeTCPMaxCapturedPacket = 2304
-	FakeTCPPacketEventSize   = FakeTCPEventSize + FakeTCPMaxCapturedPacket
+	FakeTCPEventABIVersion   uint16 = 1
+	FakeTCPEventSize                = 88
+	FakeTCPMaxCapturedPacket        = 2304
+	FakeTCPPacketEventSize          = FakeTCPEventSize + FakeTCPMaxCapturedPacket
 )
 
 type ControlKey uint32
@@ -293,17 +294,32 @@ type FakeTCPControlFlowValue struct {
 
 func (v FakeTCPControlFlowValue) MapGeneration() uint64 { return v.Generation }
 
+// FakeTCPRuntimeIdentityValue must be written before the experimental BPF
+// programs become reachable. Incarnation is unique for one Engine lifetime;
+// a zero/mismatched value makes every event fail closed.
+type FakeTCPRuntimeIdentityValue struct {
+	Generation      uint64
+	Incarnation     [16]byte
+	EventABIVersion uint16
+	_               [6]byte
+}
+
 type FakeTCPEvent struct {
-	Key             FakeTCPSessionKey
-	TimestampNanos  uint64
-	Sequence        uint32
-	Acknowledgement uint32
-	PayloadLength   uint32
-	FWMark          uint32
-	WGID            uint32
-	PacketLength    uint16
-	Type            uint8
-	TCPFlags        uint8
+	Key                FakeTCPSessionKey
+	TimestampNanos     uint64
+	RuntimeIncarnation [16]byte
+	CaptureSequence    uint64
+	CaptureCPU         uint32
+	Sequence           uint32
+	Acknowledgement    uint32
+	PayloadLength      uint32
+	FWMark             uint32
+	WGID               uint32
+	PacketLength       uint16
+	EventABIVersion    uint16
+	Type               uint8
+	TCPFlags           uint8
+	_                  [2]byte
 }
 
 // FakeTCPPacketEvent carries the exact pre-transform IPv4 packet for the

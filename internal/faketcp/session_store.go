@@ -51,6 +51,25 @@ type SessionMapIdentity struct {
 	Flags      uint32
 }
 
+// AtomicSessionCompareDeleter is an optional kernel-side primitive used to
+// remove an established session only when the complete value still equals the
+// caller's snapshot. CompareDeleteEstablished must be linearizable with every
+// TC/XDP read and write to the identified map: a userspace lookup followed by
+// BPF_MAP_DELETE_ELEM does not satisfy this contract.
+//
+// The map identity is supplied on every call so an implementation backed by a
+// dedicated BPF operation or a generation-quiescence lease can reject a stale
+// or foreign target. Implementations must return (false, nil) when the key is
+// absent or its value differs. They must not delete, replace, or otherwise
+// mutate a differing value.
+type AtomicSessionCompareDeleter interface {
+	CompareDeleteEstablished(
+		SessionMapIdentity,
+		abi.FakeTCPSessionKey,
+		abi.FakeTCPSessionValue,
+	) (bool, error)
+}
+
 // sessionMapBackend is deliberately narrower than ebpf.Map. In particular it
 // exposes no delete primitive, making an unsafe lookup-then-delete impossible
 // in this slice while the kernel lacks atomic compare-delete.
@@ -67,12 +86,13 @@ type sessionMapBackend interface {
 // protects this store's calls, while the immutable map ID and ABI checks bind
 // every call to the originally admitted kernel map.
 type LinuxSessionStore struct {
-	mu         sync.Mutex
-	backend    sessionMapBackend
-	generation uint64
-	identity   SessionMapIdentity
-	closed     bool
-	closeErr   error
+	mu            sync.Mutex
+	backend       sessionMapBackend
+	compareDelete AtomicSessionCompareDeleter
+	generation    uint64
+	identity      SessionMapIdentity
+	closed        bool
+	closeErr      error
 }
 
 var _ SessionStore = (*LinuxSessionStore)(nil)
@@ -82,8 +102,25 @@ func newLinuxSessionStore(
 	generation uint64,
 	expected SessionMapIdentity,
 ) (*LinuxSessionStore, error) {
+	return newLinuxSessionStoreWithAtomicCompareDelete(
+		backend,
+		generation,
+		expected,
+		nil,
+	)
+}
+
+func newLinuxSessionStoreWithAtomicCompareDelete(
+	backend sessionMapBackend,
+	generation uint64,
+	expected SessionMapIdentity,
+	compareDelete AtomicSessionCompareDeleter,
+) (*LinuxSessionStore, error) {
 	if sessionMapBackendIsNil(backend) {
 		return nil, errors.New("faketcp session map backend is nil")
+	}
+	if compareDelete != nil && atomicSessionCompareDeleterIsNil(compareDelete) {
+		return nil, errors.New("faketcp atomic session compare-deleter is typed nil")
 	}
 	if generation == 0 {
 		return nil, errors.New("faketcp session store generation must be non-zero")
@@ -128,9 +165,10 @@ func newLinuxSessionStore(
 		)
 	}
 	return &LinuxSessionStore{
-		backend:    owned,
-		generation: generation,
-		identity:   expected,
+		backend:       owned,
+		compareDelete: compareDelete,
+		generation:    generation,
+		identity:      expected,
 	}, nil
 }
 
@@ -150,6 +188,19 @@ func sessionMapBackendIsNil(backend sessionMapBackend) bool {
 		return true
 	}
 	value := reflect.ValueOf(backend)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
+func atomicSessionCompareDeleterIsNil(deleter AtomicSessionCompareDeleter) bool {
+	if deleter == nil {
+		return true
+	}
+	value := reflect.ValueOf(deleter)
 	switch value.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return value.IsNil()
@@ -257,6 +308,17 @@ func (store *LinuxSessionStore) DeleteEstablishedIfUnchanged(
 
 	if err := store.validateMapBindingLocked(); err != nil {
 		return false, err
+	}
+	if store.compareDelete != nil {
+		deleted, err := store.compareDelete.CompareDeleteEstablished(
+			store.identity,
+			key,
+			expected,
+		)
+		if err != nil {
+			return false, fmt.Errorf("atomically compare-delete established faketcp session: %w", err)
+		}
+		return deleted, nil
 	}
 	actual, found, err := store.lookupEstablishedLocked(key)
 	if err != nil || !found {

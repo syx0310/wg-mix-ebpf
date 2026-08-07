@@ -70,24 +70,40 @@ func decodeEventHeader(header []byte) abi.FakeTCPEvent {
 			LocalPort:     native.Uint16(header[20:22]),
 			RemotePort:    native.Uint16(header[22:24]),
 		},
-		TimestampNanos:  native.Uint64(header[24:32]),
-		Sequence:        native.Uint32(header[32:36]),
-		Acknowledgement: native.Uint32(header[36:40]),
-		PayloadLength:   native.Uint32(header[40:44]),
-		FWMark:          native.Uint32(header[44:48]),
-		WGID:            native.Uint32(header[48:52]),
-		PacketLength:    native.Uint16(header[52:54]),
-		Type:            header[54],
-		TCPFlags:        header[55],
+		TimestampNanos:     native.Uint64(header[24:32]),
+		RuntimeIncarnation: [16]byte(header[32:48]),
+		CaptureSequence:    native.Uint64(header[48:56]),
+		CaptureCPU:         native.Uint32(header[56:60]),
+		Sequence:           native.Uint32(header[60:64]),
+		Acknowledgement:    native.Uint32(header[64:68]),
+		PayloadLength:      native.Uint32(header[68:72]),
+		FWMark:             native.Uint32(header[72:76]),
+		WGID:               native.Uint32(header[76:80]),
+		PacketLength:       native.Uint16(header[80:82]),
+		EventABIVersion:    native.Uint16(header[82:84]),
+		Type:               header[84],
+		TCPFlags:           header[85],
 	}
 }
 
 func validateEventType(event abi.FakeTCPEvent) error {
+	if event.EventABIVersion != abi.FakeTCPEventABIVersion {
+		return fmt.Errorf(
+			"faketcp event ABI version %d does not match %d",
+			event.EventABIVersion, abi.FakeTCPEventABIVersion,
+		)
+	}
+	if err := validateRuntimeIdentity(runtimeIdentityFromEvent(event)); err != nil {
+		return fmt.Errorf("invalid faketcp event runtime identity: %w", err)
+	}
 	flags := event.TCPFlags
 	switch event.Type {
 	case abi.FakeTCPEventNeedHandshake:
 		if flags != 0 {
 			return fmt.Errorf("faketcp NEED_HANDSHAKE event has TCP flags %#x", flags)
+		}
+		if err := validateCaptureIdentity(captureIdentityFromEvent(event), event.Key.Generation); err != nil {
+			return fmt.Errorf("invalid faketcp event capture identity: %w", err)
 		}
 	case abi.FakeTCPEventSYN:
 		if flags&FlagSYN == 0 || flags&(FlagACK|FlagRST|FlagFIN) != 0 {
@@ -111,6 +127,10 @@ func validateEventType(event abi.FakeTCPEvent) error {
 		}
 	default:
 		return fmt.Errorf("unknown faketcp event type %d", event.Type)
+	}
+	if event.Type != abi.FakeTCPEventNeedHandshake &&
+		(event.CaptureSequence != 0 || event.CaptureCPU != 0) {
+		return errors.New("faketcp control event contains a capture sequence")
 	}
 	return nil
 }
@@ -186,6 +206,10 @@ var (
 	// and later operations return it without touching Engine or the backend.
 	ErrControllerFailed = errors.New("faketcp controller action execution failed")
 
+	// ErrControllerRecoveryUnavailable means this controller was constructed
+	// without a write-ahead ActionCheckpointStore.
+	ErrControllerRecoveryUnavailable = errors.New("faketcp controller action recovery is unavailable")
+
 	errControllerContextNil = errors.New("faketcp controller context is nil")
 )
 
@@ -193,32 +217,68 @@ var (
 // state transitions and all resulting side effects are serialised with each
 // other. Close rejects new work, waits for admitted operations to drain, and
 // then closes the backend without holding either controller lock.
-// It does not retry side effects: a captured packet leaves the engine queue
-// once and is passed to Reinject exactly once after preceding control sends
-// succeed.
+// NewController does not retry side effects: a captured packet leaves the
+// engine queue once and is passed to Reinject exactly once after preceding
+// control sends succeed. NewRecoverableController instead checkpoints each
+// side effect and gates ordinary work behind Recover after an ambiguous
+// result.
 //
-// Engine currently commits a transition before its actions are executed. Any
-// action-execution failure, including a backend error or side-effect-stage
-// context cancellation, is therefore terminal and is never rolled back or
-// retried. The experimental activation gate must remain closed until this
-// two-phase action/rollback gap has a concrete solution. A Controller must not
-// be copied after NewController returns.
+// Engine currently commits a transition before its actions are executed. The
+// legacy constructor therefore treats execution failure as terminal. The
+// recoverable constructor makes side-effect ambiguity explicit, but it does
+// not persist Engine state; the experimental activation gate must remain
+// closed until daemon-level generation recovery binds both pieces together. A
+// Controller must not be copied after construction.
 type Controller struct {
 	stateMu sync.Mutex
 	opMu    sync.Mutex
 
 	engine       *Engine
 	backend      ControllerBackend
+	recovery     *ActionRecovery
 	inflightDone *sync.Cond
 	closeDone    chan struct{}
 	inflight     uint64
 	closing      bool
 	closed       bool
 	failureErr   error
+	recoveryErr  error
 	closeErr     error
 }
 
 func NewController(engine *Engine, backend ControllerBackend) (*Controller, error) {
+	return newController(engine, backend)
+}
+
+// NewRecoverableController adds a one-slot write-ahead checkpoint around
+// Controller side effects. It takes ownership of backend only on successful
+// construction; the checkpoint store remains borrowed and may be durable.
+// A retained checkpoint blocks HandleSample and Tick until Recover completes.
+func NewRecoverableController(
+	engine *Engine,
+	backend ControllerBackend,
+	store ActionCheckpointStore,
+) (*Controller, error) {
+	controller, err := newController(engine, backend)
+	if err != nil {
+		return nil, err
+	}
+	recovery, err := NewActionRecovery(engine.Identity(), backend, store)
+	if err != nil {
+		return nil, err
+	}
+	pending, err := recovery.Pending()
+	if err != nil {
+		return nil, err
+	}
+	controller.recovery = recovery
+	if pending {
+		controller.recoveryErr = ErrActionRecoveryRequired
+	}
+	return controller, nil
+}
+
+func newController(engine *Engine, backend ControllerBackend) (*Controller, error) {
 	if engine == nil {
 		return nil, errors.New("faketcp controller requires an engine")
 	}
@@ -262,6 +322,12 @@ func (c *Controller) HandleSample(ctx context.Context, sample []byte) ([]Action,
 	if err != nil {
 		return nil, err
 	}
+	if identity := runtimeIdentityFromEvent(decoded.Event); identity != c.engine.Identity() {
+		return nil, fmt.Errorf(
+			"faketcp event runtime identity does not match controller Engine: event=%x engine=%x",
+			identity.Incarnation, c.engine.Identity().Incarnation,
+		)
+	}
 	var actions []Action
 	if decoded.Event.Type == abi.FakeTCPEventNeedHandshake {
 		if err := MaterializeIPv4UDPChecksums(decoded.Packet); err != nil {
@@ -280,7 +346,7 @@ func (c *Controller) HandleSample(ctx context.Context, sample []byte) ([]Action,
 		return actions, err
 	}
 	if err := c.executeActions(ctx, actions); err != nil {
-		return actions, c.markFailed(err)
+		return actions, c.handleActionExecutionError(err)
 	}
 	return actions, nil
 }
@@ -298,9 +364,33 @@ func (c *Controller) Tick(ctx context.Context) ([]Action, error) {
 	}
 	actions, engineErr := c.engine.Tick()
 	if executeErr := c.executeActions(ctx, actions); executeErr != nil {
-		return actions, errors.Join(engineErr, c.markFailed(executeErr))
+		return actions, errors.Join(engineErr, c.handleActionExecutionError(executeErr))
 	}
 	return actions, engineErr
+}
+
+// Recover resumes a retained action checkpoint. Ambiguous controls are
+// replayed, while an ambiguous reinjection is permanently skipped. Ordinary
+// operations remain fenced until no checkpoint remains. Recover itself is
+// serialised with HandleSample, Tick, and Close.
+func (c *Controller) Recover(ctx context.Context) (RecoveryReport, error) {
+	if err := c.beginRecoveryOperation(); err != nil {
+		return RecoveryReport{}, err
+	}
+	defer c.endSerializedOperation()
+	if ctx == nil {
+		return RecoveryReport{}, errControllerContextNil
+	}
+	report, recoveryErr := c.recovery.Recover(ctx)
+	pending, pendingErr := c.recovery.Pending()
+	if pendingErr != nil {
+		return report, c.markRecoveryRequired(errors.Join(recoveryErr, pendingErr))
+	}
+	if pending {
+		return report, c.markRecoveryRequired(recoveryErr)
+	}
+	c.clearRecoveryRequired()
+	return report, recoveryErr
 }
 
 // Close first rejects new operations, waits for admitted HandleSample and Tick
@@ -369,6 +459,56 @@ func (c *Controller) beginSerializedOperation() error {
 		c.stateMu.Unlock()
 		return failureErr
 	}
+	if c.recoveryErr != nil {
+		recoveryErr := c.recoveryErr
+		c.stateMu.Unlock()
+		return recoveryErr
+	}
+	c.inflight++
+	c.stateMu.Unlock()
+
+	c.opMu.Lock()
+	c.stateMu.Lock()
+	failureErr := c.failureErr
+	recoveryErr := c.recoveryErr
+	initialized := c.initializedLocked()
+	c.stateMu.Unlock()
+	if failureErr != nil {
+		c.opMu.Unlock()
+		c.finishOperation()
+		return failureErr
+	}
+	if recoveryErr != nil {
+		c.opMu.Unlock()
+		c.finishOperation()
+		return recoveryErr
+	}
+	if !initialized {
+		c.opMu.Unlock()
+		c.finishOperation()
+		return ErrControllerClosed
+	}
+	return nil
+}
+
+func (c *Controller) beginRecoveryOperation() error {
+	if c == nil {
+		return ErrControllerClosed
+	}
+	c.stateMu.Lock()
+	if !c.initializedLocked() || c.closing || c.closed {
+		c.stateMu.Unlock()
+		return ErrControllerClosed
+	}
+	if c.failureErr != nil {
+		failureErr := c.failureErr
+		c.stateMu.Unlock()
+		return failureErr
+	}
+	if c.recovery == nil {
+		c.stateMu.Unlock()
+		return ErrControllerRecoveryUnavailable
+	}
 	c.inflight++
 	c.stateMu.Unlock()
 
@@ -376,6 +516,7 @@ func (c *Controller) beginSerializedOperation() error {
 	c.stateMu.Lock()
 	failureErr := c.failureErr
 	initialized := c.initializedLocked()
+	recoveryAvailable := c.recovery != nil
 	c.stateMu.Unlock()
 	if failureErr != nil {
 		c.opMu.Unlock()
@@ -386,6 +527,11 @@ func (c *Controller) beginSerializedOperation() error {
 		c.opMu.Unlock()
 		c.finishOperation()
 		return ErrControllerClosed
+	}
+	if !recoveryAvailable {
+		c.opMu.Unlock()
+		c.finishOperation()
+		return ErrControllerRecoveryUnavailable
 	}
 	return nil
 }
@@ -422,9 +568,39 @@ func (c *Controller) markFailed(cause error) error {
 	return c.failureErr
 }
 
-// executeActions is called only while opMu is held. A non-nil error after an
-// Engine transition is promoted by the caller to the permanent failed state.
+func (c *Controller) markRecoveryRequired(cause error) error {
+	c.stateMu.Lock()
+	defer c.stateMu.Unlock()
+	if cause == nil {
+		if c.recoveryErr == nil {
+			c.recoveryErr = ErrActionRecoveryRequired
+		}
+	} else {
+		c.recoveryErr = errors.Join(ErrActionRecoveryRequired, cause)
+	}
+	return c.recoveryErr
+}
+
+func (c *Controller) clearRecoveryRequired() {
+	c.stateMu.Lock()
+	c.recoveryErr = nil
+	c.stateMu.Unlock()
+}
+
+func (c *Controller) handleActionExecutionError(cause error) error {
+	if c.recovery != nil && errors.Is(cause, ErrActionRecoveryRequired) {
+		return c.markRecoveryRequired(cause)
+	}
+	return c.markFailed(cause)
+}
+
+// executeActions is called only while opMu is held. Its caller promotes a
+// legacy execution error to permanent failure, or fences a recoverable
+// controller while a write-ahead checkpoint remains.
 func (c *Controller) executeActions(ctx context.Context, actions []Action) error {
+	if c.recovery != nil {
+		return c.recovery.Execute(ctx, actions)
+	}
 	for _, action := range actions {
 		if err := ctx.Err(); err != nil {
 			return err

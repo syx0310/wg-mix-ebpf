@@ -26,6 +26,8 @@ const (
 	synSourcePruneBudget = 4
 )
 
+var ErrEngineGenerationImmutable = errors.New("faketcp Engine generation is immutable; create a new Engine")
+
 type Options struct {
 	Generation               uint64
 	SessionCapacity          int
@@ -96,11 +98,14 @@ type Action struct {
 // PendingPacket is a pre-transform IPv4 packet captured by BPF, with complete
 // checksums materialized by Controller. A raw sender must re-inject it with
 // FWMark on Flow.UnderlayIndex so it traverses the ordinary
-// type-word/XOR/FakeTCP egress pipeline exactly once.
+// type-word/XOR/FakeTCP egress pipeline exactly once. CaptureID, not
+// CaptureNanos, is the once-only identity; the timestamp is diagnostic.
 type PendingPacket struct {
-	Data   []byte
-	FWMark uint32
-	WGID   uint32
+	Data         []byte
+	FWMark       uint32
+	WGID         uint32
+	CaptureNanos uint64
+	CaptureID    CaptureIdentity
 }
 
 type SessionSnapshot struct {
@@ -149,13 +154,18 @@ type tokenBucket struct {
 }
 
 type Engine struct {
-	mu           sync.Mutex
-	opts         Options
-	sessions     map[abi.FakeTCPSessionKey]*session
-	pendingFlows int
-	pendingBytes int
-	halfOpen     int
-	globalSYNs   tokenBucket
+	mu       sync.Mutex
+	opts     Options
+	identity RuntimeIdentity
+	// One RuntimeIdentity may seed exactly one kernel collection. Reusing the
+	// Engine with fresh maps would restart every per-CPU capture sequence and
+	// collide with identities emitted by its first collection.
+	runtimeIdentityCommit *runtimeIdentityCommitState
+	sessions              map[abi.FakeTCPSessionKey]*session
+	pendingFlows          int
+	pendingBytes          int
+	halfOpen              int
+	globalSYNs            tokenBucket
 	// admissionEpoch is local to one Engine lifetime. New engines begin with
 	// zero tokens at this epoch; recreation can only discard accumulated
 	// budget and can never mint a fresh burst.
@@ -213,15 +223,30 @@ func New(options Options) (*Engine, error) {
 	if options.Window == 0 {
 		options.Window = 65535
 	}
+	incarnation, err := newRuntimeIncarnation()
+	if err != nil {
+		return nil, err
+	}
 	admissionEpoch := options.Now()
 	return &Engine{
-		opts:           options,
-		sessions:       make(map[abi.FakeTCPSessionKey]*session),
-		globalSYNs:     tokenBucket{lastRefill: admissionEpoch, initialized: true},
-		admissionEpoch: admissionEpoch,
-		synSources:     make(map[synSourceKey]*synSourceState),
-		synSourceLRU:   list.New(),
+		opts:                  options,
+		identity:              RuntimeIdentity{Generation: options.Generation, Incarnation: incarnation},
+		runtimeIdentityCommit: &runtimeIdentityCommitState{},
+		sessions:              make(map[abi.FakeTCPSessionKey]*session),
+		globalSYNs:            tokenBucket{lastRefill: admissionEpoch, initialized: true},
+		admissionEpoch:        admissionEpoch,
+		synSources:            make(map[synSourceKey]*synSourceState),
+		synSourceLRU:          list.New(),
 	}, nil
+}
+
+// Identity returns the immutable generation/incarnation pair for this exact
+// Engine lifetime. A nil Engine has no provable identity.
+func (e *Engine) Identity() RuntimeIdentity {
+	if e == nil {
+		return RuntimeIdentity{}
+	}
+	return e.identity
 }
 
 // Outbound observes a UDP datagram before the BPF established path can encode
@@ -250,10 +275,28 @@ func (e *Engine) handleCapturedPacket(event abi.FakeTCPEvent, packet []byte) ([]
 	if len(packet) == 0 || len(packet) != int(event.PacketLength) || len(packet) > abi.FakeTCPMaxCapturedPacket {
 		return nil, fmt.Errorf("faketcp captured packet body has %d bytes for declared length %d", len(packet), event.PacketLength)
 	}
+	if event.EventABIVersion != abi.FakeTCPEventABIVersion {
+		return nil, fmt.Errorf(
+			"faketcp event ABI version %d does not match %d",
+			event.EventABIVersion, abi.FakeTCPEventABIVersion,
+		)
+	}
+	if identity := runtimeIdentityFromEvent(event); identity != e.identity {
+		return nil, fmt.Errorf(
+			"faketcp packet event identity does not match Engine: event=%x engine=%x",
+			identity.Incarnation, e.identity.Incarnation,
+		)
+	}
+	captureID := captureIdentityFromEvent(event)
+	if err := validateCaptureIdentity(captureID, event.Key.Generation); err != nil {
+		return nil, err
+	}
 	return e.outbound(event.Key, PendingPacket{
-		Data:   packet,
-		FWMark: event.FWMark,
-		WGID:   event.WGID,
+		Data:         packet,
+		FWMark:       event.FWMark,
+		WGID:         event.WGID,
+		CaptureNanos: event.TimestampNanos,
+		CaptureID:    captureID,
 	}, true)
 }
 
@@ -557,43 +600,23 @@ func (e *Engine) Tick() ([]Action, error) {
 	return actions, errors.Join(errs...)
 }
 
-// AdvanceGeneration explicitly drains all live sessions. The loader cannot
-// silently carry keys across generation changes because rules, profiles and
-// peers may have changed; callers must observe the returned close actions and
-// allow WireGuard/QUIC to re-handshake under the new generation.
+// AdvanceGeneration is retained as a fail-closed compatibility boundary.
+// RuntimeIdentity, capture sequences, action recovery, and kernel collection
+// commit state all belong to exactly one immutable Engine generation. A
+// generation transition therefore requires constructing a new Engine.
 func (e *Engine) AdvanceGeneration(generation uint64) ([]Action, error) {
+	if e == nil {
+		return nil, fmt.Errorf("%w: Engine is nil", ErrEngineGenerationImmutable)
+	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if generation == 0 || generation == e.opts.Generation {
-		return nil, fmt.Errorf("new faketcp generation must be non-zero and differ from %d", e.opts.Generation)
-	}
-	actions := make([]Action, 0, len(e.sessions))
-	var errs []error
-	for flow, s := range e.sessions {
-		if s.state == abi.FakeTCPStateEstablished {
-			value, found, err := e.lookupEstablished(flow, s)
-			if err != nil {
-				errs = append(errs, err)
-				continue
-			}
-			if found {
-				deleted, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, value)
-				if err != nil {
-					errs = append(errs, err)
-					continue
-				}
-				if !deleted {
-					continue
-				}
-			}
-		}
-		e.remove(flow, s)
-		actions = append(actions, Action{Kind: ActionClose, Flow: flow, Reason: "generation-drain-rehandshake"})
-	}
-	if len(e.sessions) == 0 {
-		e.opts.Generation = generation
-	}
-	return actions, errors.Join(errs...)
+	return nil, fmt.Errorf(
+		"%w: current generation=%d runtime identity generation=%d requested generation=%d",
+		ErrEngineGenerationImmutable,
+		e.opts.Generation,
+		e.identity.Generation,
+		generation,
+	)
 }
 
 func (e *Engine) Snapshot(flow abi.FakeTCPSessionKey) (SessionSnapshot, bool, error) {

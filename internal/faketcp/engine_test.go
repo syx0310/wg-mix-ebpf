@@ -3,9 +3,12 @@ package faketcp
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"net/netip"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -127,6 +130,7 @@ func testEngine(t *testing.T, mutate func(*Options)) (*Engine, *fakeClock) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	engine.identity = testRuntimeIdentity(opts.Generation)
 	// Ordinary state-machine tests start after one full global refill horizon.
 	// Dedicated restart tests below exercise New's zero-budget fail-safe edge.
 	clock.Add(opts.SYNRateInterval * time.Duration(opts.SYNBurst))
@@ -553,22 +557,219 @@ func TestUnknownProbeDoesNotAllocate(t *testing.T) {
 	}
 }
 
-func TestGenerationAdvanceIsExplicitDrain(t *testing.T) {
+func TestAdvanceGenerationRequiresNewEngineWithoutStateChange(t *testing.T) {
 	engine, _ := testEngine(t, nil)
 	flow := testFlow(31001)
 	if _, err := engine.Outbound(flow, []byte{1}); err != nil {
 		t.Fatal(err)
 	}
+	beforeIdentity := engine.Identity()
+	beforeGeneration := engine.opts.Generation
+	beforeCommitState := engine.runtimeIdentityCommit
 	actions, err := engine.AdvanceGeneration(2)
-	if err != nil || len(actions) != 1 || actions[0].Reason != "generation-drain-rehandshake" {
+	if !errors.Is(err, ErrEngineGenerationImmutable) || len(actions) != 0 {
 		t.Fatalf("actions=%#v err=%v", actions, err)
 	}
-	if _, ok, _ := engine.Snapshot(flow); ok {
-		t.Fatal("old generation session survived drain")
+	if engine.opts.Generation != beforeGeneration || engine.Identity() != beforeIdentity ||
+		engine.runtimeIdentityCommit != beforeCommitState {
+		t.Fatalf(
+			"generation rejection changed Engine: opts=%d identity=%#v commit=%p",
+			engine.opts.Generation, engine.Identity(), engine.runtimeIdentityCommit,
+		)
 	}
-	flow.Generation = 2
+	if snapshot, found, snapshotErr := engine.Snapshot(flow); snapshotErr != nil || !found || snapshot.PendingPackets != 1 {
+		t.Fatalf("old generation session changed: snapshot=%#v found=%t err=%v", snapshot, found, snapshotErr)
+	}
+	newFlow := flow
+	newFlow.Generation = 2
+	if _, err := engine.Outbound(newFlow, []byte{2}); err == nil {
+		t.Fatal("rejected generation became active")
+	}
 	if _, err := engine.Outbound(flow, []byte{2}); err != nil {
 		t.Fatal(err)
+	}
+	freshOptions := engine.opts
+	freshOptions.Generation = 2
+	freshEngine, err := New(freshOptions)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if freshEngine.Identity().Generation != 2 {
+		t.Fatalf("fresh Engine identity generation=%d want=2", freshEngine.Identity().Generation)
+	}
+	if _, err := freshEngine.Outbound(newFlow, []byte{3}); err != nil {
+		t.Fatalf("fresh Engine rejected its generation: %v", err)
+	}
+}
+
+func TestAdvanceGenerationNeverDrainsEstablishedStore(t *testing.T) {
+	store := newFakeSessionStore()
+	engine, _ := testEngine(t, func(options *Options) { options.Store = store })
+	flow := testFlow(31001)
+	if _, err := engine.Outbound(flow, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Inbound(flow, Segment{
+		Flags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	beforeValue, found := store.values[flow]
+	if !found {
+		t.Fatal("established session was not inserted")
+	}
+	beforeDeletes := store.deleteAttempts
+	actions, err := engine.AdvanceGeneration(2)
+	if len(actions) != 0 || !errors.Is(err, ErrEngineGenerationImmutable) {
+		t.Fatalf("actions=%#v err=%v", actions, err)
+	}
+	if store.deleteAttempts != beforeDeletes || store.values[flow] != beforeValue {
+		t.Fatalf(
+			"generation rejection changed established store: deletes=%d value=%#v",
+			store.deleteAttempts, store.values[flow],
+		)
+	}
+	if snapshot, found, snapshotErr := engine.Snapshot(flow); snapshotErr != nil || !found || snapshot.State != abi.FakeTCPStateEstablished {
+		t.Fatalf("established session changed: snapshot=%#v found=%t err=%v", snapshot, found, snapshotErr)
+	}
+}
+
+func TestRejectedGenerationAdvanceKeepsPacketEventIdentityConsistent(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	if _, err := engine.AdvanceGeneration(2); !errors.Is(err, ErrEngineGenerationImmutable) {
+		t.Fatalf("AdvanceGeneration error=%v", err)
+	}
+	flow := testFlow(31001)
+	event := abi.FakeTCPPacketEvent{Event: abi.FakeTCPEvent{
+		Key: flow, Type: abi.FakeTCPEventNeedHandshake, PacketLength: 1,
+	}}
+	bindTestEvent(&event.Event, engine.Identity(), 1)
+	event.Packet[0] = 1
+	if actions, err := engine.HandlePacketEvent(event); err != nil || len(actions) != 1 {
+		t.Fatalf("original generation packet event actions=%#v err=%v", actions, err)
+	}
+
+	newFlow := flow
+	newFlow.Generation = 2
+	newEvent := abi.FakeTCPPacketEvent{Event: abi.FakeTCPEvent{
+		Key: newFlow, Type: abi.FakeTCPEventNeedHandshake, PacketLength: 1,
+	}}
+	bindTestEvent(&newEvent.Event, RuntimeIdentity{
+		Generation: 2, Incarnation: engine.Identity().Incarnation,
+	}, 1)
+	newEvent.Packet[0] = 1
+	if _, err := engine.HandlePacketEvent(newEvent); err == nil {
+		t.Fatal("rejected generation packet event was accepted")
+	}
+	if _, found, err := engine.Snapshot(newFlow); err != nil || found {
+		t.Fatalf("rejected generation touched Engine: found=%t err=%v", found, err)
+	}
+}
+
+func TestAdvanceGenerationDoesNotConsumeOrResetRuntimeIdentityCommit(t *testing.T) {
+	consumed := errors.New("consumed")
+
+	t.Run("not yet consumed", func(t *testing.T) {
+		engine, _ := testEngine(t, nil)
+		if _, err := engine.AdvanceGeneration(2); !errors.Is(err, ErrEngineGenerationImmutable) {
+			t.Fatalf("AdvanceGeneration error=%v", err)
+		}
+		var calls atomic.Int32
+		if err := engine.commitRuntimeIdentityOnce(consumed, func() error {
+			calls.Add(1)
+			return nil
+		}); err != nil {
+			t.Fatal(err)
+		}
+		if calls.Load() != 1 {
+			t.Fatalf("generation rejection consumed commit capability: calls=%d", calls.Load())
+		}
+	})
+
+	t.Run("already consumed", func(t *testing.T) {
+		engine, _ := testEngine(t, nil)
+		if err := engine.commitRuntimeIdentityOnce(consumed, func() error { return nil }); err != nil {
+			t.Fatal(err)
+		}
+		beforeIdentity := engine.Identity()
+		beforeCommitState := engine.runtimeIdentityCommit
+		if _, err := engine.AdvanceGeneration(2); !errors.Is(err, ErrEngineGenerationImmutable) {
+			t.Fatalf("AdvanceGeneration error=%v", err)
+		}
+		called := false
+		if err := engine.commitRuntimeIdentityOnce(consumed, func() error {
+			called = true
+			return nil
+		}); !errors.Is(err, consumed) {
+			t.Fatalf("consumed commit error=%v", err)
+		}
+		if called || engine.Identity() != beforeIdentity || engine.runtimeIdentityCommit != beforeCommitState {
+			t.Fatal("generation rejection reset consumed identity state")
+		}
+	})
+}
+
+func TestAdvanceGenerationCannotRaceRuntimeIdentityCommit(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	flow := testFlow(31001)
+	if _, err := engine.Outbound(flow, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	beforeIdentity := engine.Identity()
+	beforeGeneration := engine.opts.Generation
+	beforeCommitState := engine.runtimeIdentityCommit
+	consumed := errors.New("consumed")
+	var commitCalls atomic.Int32
+	start := make(chan struct{})
+	results := make(chan error, 33)
+	var group sync.WaitGroup
+	group.Add(1)
+	go func() {
+		defer group.Done()
+		<-start
+		results <- engine.commitRuntimeIdentityOnce(consumed, func() error {
+			commitCalls.Add(1)
+			return nil
+		})
+	}()
+	for range 32 {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			actions, err := engine.AdvanceGeneration(2)
+			if len(actions) != 0 || !errors.Is(err, ErrEngineGenerationImmutable) {
+				results <- fmt.Errorf("advance actions=%#v error=%w", actions, err)
+				return
+			}
+			results <- nil
+		}()
+	}
+	close(start)
+	group.Wait()
+	close(results)
+	for err := range results {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if commitCalls.Load() != 1 {
+		t.Fatalf("commit callbacks=%d want=1", commitCalls.Load())
+	}
+	if engine.opts.Generation != beforeGeneration || engine.Identity() != beforeIdentity ||
+		engine.runtimeIdentityCommit != beforeCommitState {
+		t.Fatal("concurrent generation rejection changed Engine identity state")
+	}
+	if snapshot, found, err := engine.Snapshot(flow); err != nil || !found || snapshot.PendingPackets != 1 {
+		t.Fatalf("concurrent generation rejection changed session: snapshot=%#v found=%t err=%v", snapshot, found, err)
+	}
+}
+
+func TestAdvanceGenerationNilAndZeroEngineFailClosed(t *testing.T) {
+	for _, engine := range []*Engine{nil, &Engine{}} {
+		if actions, err := engine.AdvanceGeneration(2); len(actions) != 0 || !errors.Is(err, ErrEngineGenerationImmutable) {
+			t.Fatalf("actions=%#v err=%v", actions, err)
+		}
 	}
 }
 
@@ -809,6 +1010,7 @@ func TestPacketEventFeedsRealBoundedQueueAndReleaseMetadata(t *testing.T) {
 		Key: flow, Type: abi.FakeTCPEventNeedHandshake,
 		PacketLength: 4, FWMark: 0x10000002, WGID: 7,
 	}}
+	bindTestEvent(&event.Event, engine.Identity(), 1)
 	copy(event.Packet[:], []byte{0x45, 1, 2, 3})
 	actions, err := engine.HandlePacketEvent(event)
 	if err != nil || len(actions) != 1 || actions[0].Control.Flags != FlagSYN {
@@ -829,11 +1031,31 @@ func TestPacketEventFeedsRealBoundedQueueAndReleaseMetadata(t *testing.T) {
 
 func TestPacketEventRejectsMissingPacketBody(t *testing.T) {
 	engine, _ := testEngine(t, nil)
-	_, err := engine.HandlePacketEvent(abi.FakeTCPPacketEvent{Event: abi.FakeTCPEvent{
+	event := abi.FakeTCPPacketEvent{Event: abi.FakeTCPEvent{
 		Key: testFlow(31001), Type: abi.FakeTCPEventNeedHandshake,
-	}})
+	}}
+	bindTestEvent(&event.Event, engine.Identity(), 1)
+	_, err := engine.HandlePacketEvent(event)
 	if err == nil {
 		t.Fatal("metadata-only NEED_HANDSHAKE event was accepted")
+	}
+}
+
+func TestEngineRejectsPacketEventFromDifferentIncarnation(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	flow := testFlow(31001)
+	event := abi.FakeTCPPacketEvent{Event: abi.FakeTCPEvent{
+		Key: flow, Type: abi.FakeTCPEventNeedHandshake, PacketLength: 1,
+	}}
+	wrong := engine.Identity()
+	wrong.Incarnation[0] = 2
+	bindTestEvent(&event.Event, wrong, 1)
+	event.Packet[0] = 1
+	if _, err := engine.HandlePacketEvent(event); err == nil {
+		t.Fatal("packet event from another Engine incarnation was accepted")
+	}
+	if _, found, err := engine.Snapshot(flow); err != nil || found {
+		t.Fatalf("mismatched packet event touched Engine: found=%t err=%v", found, err)
 	}
 }
 
@@ -844,6 +1066,7 @@ func TestWGIDMismatchCannotDriveOrCloseExistingSession(t *testing.T) {
 		Key: flow, Type: abi.FakeTCPEventNeedHandshake,
 		PacketLength: 1, WGID: 7,
 	}}
+	bindTestEvent(&event.Event, engine.Identity(), 1)
 	event.Packet[0] = 1
 	actions, err := engine.HandlePacketEvent(event)
 	if err != nil || len(actions) != 1 || actions[0].WGID != 7 {
@@ -879,6 +1102,7 @@ func TestLatePacketEventAfterEstablishmentIsReinjected(t *testing.T) {
 		Key: flow, Type: abi.FakeTCPEventNeedHandshake,
 		PacketLength: 2, FWMark: 3, WGID: 7,
 	}}
+	bindTestEvent(&event.Event, engine.Identity(), 2)
 	copy(event.Packet[:], []byte{4, 5})
 	actions, err := engine.HandlePacketEvent(event)
 	if err != nil || len(actions) != 1 || actions[0].Kind != ActionReleasePending ||

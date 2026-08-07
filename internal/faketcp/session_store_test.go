@@ -57,6 +57,37 @@ type clonedMemorySessionMap struct {
 	identityOverride *SessionMapIdentity
 }
 
+type memoryAtomicSessionCompareDeleter struct {
+	backend      *memorySessionMap
+	err          error
+	calls        int
+	lastIdentity SessionMapIdentity
+	beforeDelete func(*memorySessionMap, abi.FakeTCPSessionKey)
+}
+
+func (deleter *memoryAtomicSessionCompareDeleter) CompareDeleteEstablished(
+	identity SessionMapIdentity,
+	key abi.FakeTCPSessionKey,
+	expected abi.FakeTCPSessionValue,
+) (bool, error) {
+	deleter.calls++
+	deleter.lastIdentity = identity
+	if deleter.err != nil {
+		return false, deleter.err
+	}
+	deleter.backend.mu.Lock()
+	defer deleter.backend.mu.Unlock()
+	if deleter.beforeDelete != nil {
+		deleter.beforeDelete(deleter.backend, key)
+	}
+	actual, found := deleter.backend.values[key]
+	if !found || actual != expected {
+		return false, nil
+	}
+	delete(deleter.backend.values, key)
+	return true, nil
+}
+
 func newMemorySessionMap() *memorySessionMap {
 	return &memorySessionMap{
 		identity: validSessionMapIdentity(),
@@ -735,6 +766,94 @@ func TestLinuxSessionStoreCompareDeleteFailsClosedWithoutTOCTOU(t *testing.T) {
 		deleted, err := store.DeleteEstablishedIfUnchanged(key, expected)
 		if deleted || !errors.Is(err, errMemorySessionMapLookup) {
 			t.Fatalf("deleted=%t err=%v", deleted, err)
+		}
+	})
+}
+
+func TestLinuxSessionStoreUsesOnlyExplicitAtomicCompareDeletePrimitive(t *testing.T) {
+	key := sessionStoreTestKey(7)
+	expected := sessionStoreTestValue(7)
+	newStore := func(t *testing.T) (*LinuxSessionStore, *memorySessionMap, *memoryAtomicSessionCompareDeleter) {
+		t.Helper()
+		backend := newMemorySessionMap()
+		deleter := &memoryAtomicSessionCompareDeleter{backend: backend}
+		store, err := newLinuxSessionStoreWithAtomicCompareDelete(
+			backend,
+			7,
+			backend.identity,
+			deleter,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return store, backend, deleter
+	}
+
+	t.Run("equal value is removed in one primitive", func(t *testing.T) {
+		store, backend, deleter := newStore(t)
+		backend.putFromBPF(key, expected)
+		lookupsBefore := backend.lookupCalls
+		deleted, err := store.DeleteEstablishedIfUnchanged(key, expected)
+		if err != nil || !deleted {
+			t.Fatalf("deleted=%t err=%v", deleted, err)
+		}
+		if _, found := backend.value(key); found {
+			t.Fatal("equal value survived atomic compare-delete")
+		}
+		if deleter.calls != 1 || deleter.lastIdentity != backend.identity {
+			t.Fatalf("compare-delete calls=%d identity=%#v", deleter.calls, deleter.lastIdentity)
+		}
+		if backend.lookupCalls != lookupsBefore {
+			t.Fatal("atomic compare-delete path performed a userspace lookup")
+		}
+	})
+
+	t.Run("concurrent BPF advance is preserved", func(t *testing.T) {
+		store, backend, deleter := newStore(t)
+		backend.putFromBPF(key, expected)
+		advanced := expected
+		advanced.TXSequence++
+		advanced.LastSeenNanos++
+		deleter.beforeDelete = func(locked *memorySessionMap, deleteKey abi.FakeTCPSessionKey) {
+			locked.values[deleteKey] = advanced
+		}
+		deleted, err := store.DeleteEstablishedIfUnchanged(key, expected)
+		if err != nil || deleted {
+			t.Fatalf("deleted=%t err=%v", deleted, err)
+		}
+		if got, found := backend.value(key); !found || got != advanced {
+			t.Fatalf("advanced value got=%#v found=%t", got, found)
+		}
+	})
+
+	t.Run("primitive failure is wrapped without fallback", func(t *testing.T) {
+		store, backend, deleter := newStore(t)
+		backend.putFromBPF(key, expected)
+		wantErr := errors.New("atomic primitive failed")
+		deleter.err = wantErr
+		deleted, err := store.DeleteEstablishedIfUnchanged(key, expected)
+		if deleted || !errors.Is(err, wantErr) {
+			t.Fatalf("deleted=%t err=%v", deleted, err)
+		}
+		if got, found := backend.value(key); !found || got != expected {
+			t.Fatalf("failed primitive changed value got=%#v found=%t", got, found)
+		}
+	})
+
+	t.Run("typed nil primitive is rejected before clone", func(t *testing.T) {
+		backend := newMemorySessionMap()
+		var deleter *memoryAtomicSessionCompareDeleter
+		_, err := newLinuxSessionStoreWithAtomicCompareDelete(
+			backend,
+			7,
+			backend.identity,
+			deleter,
+		)
+		if err == nil {
+			t.Fatal("typed-nil atomic compare-deleter was accepted")
+		}
+		if backend.cloneCalls != 0 {
+			t.Fatal("typed-nil compare-deleter reached map clone")
 		}
 	})
 }

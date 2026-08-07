@@ -72,10 +72,34 @@ func NewLinuxSessionStore(
 	generation uint64,
 	expected SessionMapIdentity,
 ) (*LinuxSessionStore, error) {
+	return NewLinuxSessionStoreWithAtomicCompareDelete(
+		bpfMap,
+		generation,
+		expected,
+		nil,
+	)
+}
+
+// NewLinuxSessionStoreWithAtomicCompareDelete is the activation-oriented
+// constructor for a session map paired with a separately owned kernel-side
+// compare-delete primitive. The deleter is borrowed for the store lifetime;
+// its owner must fence Close against admitted store operations. Passing nil
+// preserves the verifier-only, fail-closed behaviour of NewLinuxSessionStore.
+func NewLinuxSessionStoreWithAtomicCompareDelete(
+	bpfMap *ebpf.Map,
+	generation uint64,
+	expected SessionMapIdentity,
+	compareDelete AtomicSessionCompareDeleter,
+) (*LinuxSessionStore, error) {
 	if bpfMap == nil {
 		return nil, errors.New("faketcp session eBPF map is nil")
 	}
-	return newLinuxSessionStore(wrapCiliumSessionMap(bpfMap), generation, expected)
+	return newLinuxSessionStoreWithAtomicCompareDelete(
+		wrapCiliumSessionMap(bpfMap),
+		generation,
+		expected,
+		compareDelete,
+	)
 }
 
 func (sessionMap *ciliumSessionMap) Clone() (sessionMapBackend, error) {
