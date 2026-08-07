@@ -247,3 +247,23 @@ func TestFakeTCPXDPManagedPortLookupPrecedesUnsupportedHeaderExit(t *testing.T) 
 		t.Fatal("managed-port lookup must precede IPv4 options/fragment rejection")
 	}
 }
+
+func TestFakeTCPEstablishedMapCannotLRUEvictUnderSYNPressure(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	if strings.Contains(text, "BPF_MAP_TYPE_LRU_HASH") {
+		t.Fatal("FakeTCP established sessions must not use an eviction-capable LRU map")
+	}
+	for _, want := range []string{
+		"Only established sessions enter this map",
+		"__uint(type, BPF_MAP_TYPE_HASH)",
+		"session->state != FAKETCP_STATE_ESTABLISHED",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("established-only fast-map contract missing %q", want)
+		}
+	}
+}

@@ -97,7 +97,10 @@ func testEngine(t *testing.T, mutate func(*Options)) (*Engine, *fakeClock) {
 	clock := &fakeClock{now: time.Unix(100, 0), monotonic: uint64(100 * time.Second)}
 	nextISN := uint32(1000)
 	opts := Options{
-		Generation: 1, SessionCapacity: 8, MaxPendingFlows: 4,
+		Generation: 1, SessionCapacity: 8,
+		MaxHalfOpenSessions: 4, MaxHalfOpenPerSource: 2,
+		SYNRateInterval: time.Second, SYNBurst: 4, SYNBurstPerSource: 2,
+		MaxPendingFlows:          4,
 		MaxPendingPacketsPerFlow: 2, MaxPendingBytes: 64,
 		HandshakeTimeout: time.Second, HandshakeRetries: 2,
 		KeepaliveInterval: 5 * time.Second, IdleTimeout: 20 * time.Second,
@@ -359,6 +362,117 @@ func TestEstablishedStateReadsBPFAdvanceAndNeverOverwritesOrRacyDeletes(t *testi
 	}
 	if store.inserts != 1 {
 		t.Fatalf("established state was reinserted %d times", store.inserts)
+	}
+}
+
+func TestSYNFloodCannotEnterOrEvictEstablishedFastState(t *testing.T) {
+	store := newFakeSessionStore()
+	engine, clock := testEngine(t, func(o *Options) {
+		o.Store = store
+		o.MaxHalfOpenSessions = 3
+		o.MaxHalfOpenPerSource = 1
+		o.SYNBurst = 8
+		o.SYNBurstPerSource = 1
+		o.HandshakeRetries = 1
+	})
+	established := testFlow(31001)
+	if _, err := engine.Outbound(established, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Inbound(established, Segment{
+		Flags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	wantEstablished := store.values[established]
+
+	accepted := 0
+	rejected := 0
+	for source := uint32(1); source <= 12; source++ {
+		flow := testFlow(uint16(32000 + source))
+		flow.RemoteIPv4 += source
+		actions, err := engine.Inbound(flow, Segment{Flags: FlagSYN, Sequence: source * 100})
+		if err != nil || len(actions) != 1 {
+			t.Fatalf("source %d actions=%#v err=%v", source, actions, err)
+		}
+		if actions[0].Reason == "accept-syn" {
+			accepted++
+		} else if actions[0].Reason == "half-open-capacity" {
+			rejected++
+		} else {
+			t.Fatalf("source %d unexpected reason %q", source, actions[0].Reason)
+		}
+	}
+	if accepted != 3 || rejected != 9 {
+		t.Fatalf("SYN budget accepted=%d rejected=%d, want 3/9", accepted, rejected)
+	}
+	if store.inserts != 1 || len(store.values) != 1 || store.values[established] != wantEstablished {
+		t.Fatal("half-open flood entered or changed the established fast map")
+	}
+
+	clock.Add(time.Second)
+	if _, err := engine.Tick(); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, ok, err := engine.Snapshot(established)
+	if err != nil || !ok || snapshot.State != abi.FakeTCPStateEstablished ||
+		store.values[established] != wantEstablished {
+		t.Fatalf("established session after flood=%#v ok=%t err=%v", snapshot, ok, err)
+	}
+}
+
+func TestInboundSYNRateAndPerSourceBudgets(t *testing.T) {
+	tests := []struct {
+		name          string
+		mutate        func(*Options)
+		secondSource  bool
+		wantRejection string
+	}{
+		{
+			name: "global rate",
+			mutate: func(o *Options) {
+				o.SYNBurst = 1
+				o.SYNBurstPerSource = 1
+			},
+			secondSource:  true,
+			wantRejection: "syn-rate-global",
+		},
+		{
+			name: "source rate",
+			mutate: func(o *Options) {
+				o.SYNBurst = 4
+				o.SYNBurstPerSource = 1
+				o.MaxHalfOpenPerSource = 4
+			},
+			wantRejection: "syn-rate-source",
+		},
+		{
+			name: "source half-open",
+			mutate: func(o *Options) {
+				o.SYNBurst = 4
+				o.SYNBurstPerSource = 4
+				o.MaxHalfOpenPerSource = 1
+			},
+			wantRejection: "half-open-source-capacity",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			engine, _ := testEngine(t, tt.mutate)
+			first := testFlow(31001)
+			actions, err := engine.Inbound(first, Segment{Flags: FlagSYN, Sequence: 100})
+			if err != nil || len(actions) != 1 || actions[0].Reason != "accept-syn" {
+				t.Fatalf("first actions=%#v err=%v", actions, err)
+			}
+			second := testFlow(31002)
+			if tt.secondSource {
+				second.RemoteIPv4++
+			}
+			actions, err = engine.Inbound(second, Segment{Flags: FlagSYN, Sequence: 200})
+			if err != nil || len(actions) != 1 || actions[0].Reason != tt.wantRejection {
+				t.Fatalf("second actions=%#v err=%v, want %q", actions, err, tt.wantRejection)
+			}
+		})
 	}
 }
 

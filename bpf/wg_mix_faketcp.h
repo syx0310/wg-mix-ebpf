@@ -136,7 +136,10 @@ struct faketcp_ipv6_fragment {
 };
 
 struct {
-	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	// Only established sessions enter this map. A bounded userspace half-open
+	// table absorbs SYN pressure, and HASH insertion fails at capacity instead
+	// of evicting an active established flow as LRU_HASH would.
+	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 16384);
 	__type(key, struct faketcp_session_key);
 	__type(value, struct faketcp_session_value);
