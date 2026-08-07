@@ -827,8 +827,6 @@ func normalizePinOwnerRecord(record *pinOwnerRecord) {
 	sort.Slice(record.Maps, func(i, j int) bool {
 		return record.Maps[i].Name < record.Maps[j].Name
 	})
-	sortTCFilterBindings(record.ActiveFilters)
-	sortTCFilterBindings(record.DesiredFilters)
 	sortExactTCXBindings(record.ActiveLinks)
 	sortExactTCXBindings(record.DesiredLinks)
 	sort.Slice(record.ProgramStages, func(i, j int) bool {
@@ -869,57 +867,6 @@ func normalizePinOwnerRecord(record *pinOwnerRecord) {
 	if record.BPFFSMountIDs == nil {
 		record.BPFFSMountIDs = []uint64{}
 	}
-}
-
-func sortTCFilterBindings(filters []tcFilterBinding) {
-	sort.Slice(filters, func(i, j int) bool {
-		left := filters[i]
-		right := filters[j]
-		if left.IfIndex != right.IfIndex {
-			return left.IfIndex < right.IfIndex
-		}
-		leftDirection := 0
-		if left.Direction == "egress" {
-			leftDirection = 1
-		}
-		rightDirection := 0
-		if right.Direction == "egress" {
-			rightDirection = 1
-		}
-		if leftDirection != rightDirection {
-			return leftDirection < rightDirection
-		}
-		if left.Parent != right.Parent {
-			return left.Parent < right.Parent
-		}
-		if left.Handle != right.Handle {
-			return left.Handle < right.Handle
-		}
-		if left.Priority != right.Priority {
-			return left.Priority < right.Priority
-		}
-		return left.ProgramID < right.ProgramID
-	})
-}
-
-func retainStaleOwnerFilters(
-	desired []tcFilterBinding,
-	active []tcFilterBinding,
-) []tcFilterBinding {
-	desiredSlots := make(map[string]struct{}, len(desired))
-	out := slices.Clone(desired)
-	for _, filter := range desired {
-		desiredSlots[fmt.Sprintf("%d/%s", filter.IfIndex, filter.Direction)] = struct{}{}
-	}
-	for _, filter := range active {
-		key := fmt.Sprintf("%d/%s", filter.IfIndex, filter.Direction)
-		if _, replaced := desiredSlots[key]; replaced {
-			continue
-		}
-		out = append(out, filter)
-	}
-	sortTCFilterBindings(out)
-	return out
 }
 
 func sortExactTCXBindings(bindings []exactTCXBinding) {

@@ -28,9 +28,6 @@ import (
 const (
 	ingressFilterName = "wg_mix_ingress"
 	egressFilterName  = "wg_mix_egress"
-	filterPriority    = 49152
-	ingressHandle     = 0x10001
-	egressHandle      = 0x10002
 	xorSegmentCount   = 8
 	pinPathPrefix     = "wg-mix-ebpf"
 	maxPinPathSuffix  = 64
@@ -2640,9 +2637,4 @@ func (plan *pinnedMapCleanupPlan) Close() error {
 	handleErr := plan.handle.Close()
 	plan.handle = nil
 	return errors.Join(pinErr, handleErr)
-}
-
-func isNotFound(err error) bool {
-	lower := strings.ToLower(err.Error())
-	return errors.Is(err, os.ErrNotExist) || strings.Contains(lower, "no such file") || strings.Contains(lower, "not found")
 }

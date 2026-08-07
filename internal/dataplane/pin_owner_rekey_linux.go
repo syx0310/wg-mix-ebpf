@@ -301,50 +301,6 @@ func recheckIndexedOwnerForRekey(
 	return nil
 }
 
-func validateRebootedFiltersAbsent(
-	bindings []tcFilterBinding,
-	runtime tcRuntime,
-) error {
-	seen := make(map[string]struct{}, len(bindings))
-	for _, binding := range bindings {
-		key := ownerFilterKey(binding)
-		if _, duplicate := seen[key]; duplicate {
-			return fmt.Errorf("prior-boot owner repeats TC slot %s", key)
-		}
-		seen[key] = struct{}{}
-		link, err := runtime.linkByIndex(binding.IfIndex)
-		if err != nil {
-			if isNotFound(err) {
-				continue
-			}
-			return fmt.Errorf("inspect prior-boot TC link %d: %w", binding.IfIndex, err)
-		}
-		if link == nil ||
-			link.Attrs() == nil ||
-			link.Attrs().Index != binding.IfIndex {
-			return fmt.Errorf(
-				"prior-boot TC link lookup returned a mismatch for ifindex %d",
-				binding.IfIndex,
-			)
-		}
-		slot, err := ownerFilterSlot(binding)
-		if err != nil {
-			return err
-		}
-		snapshot, err := inspectTCFilterSlot(link, slot, runtime, false)
-		if err != nil {
-			return err
-		}
-		if snapshot.existed {
-			return fmt.Errorf(
-				"prior-boot TC slot %s still contains program ID %d; refusing cross-boot ID trust",
-				key, snapshot.programID,
-			)
-		}
-	}
-	return nil
-}
-
 func indexedOwnerEntryForRekey(
 	store *pinOwnerStore,
 	handle *pinPathHandle,
