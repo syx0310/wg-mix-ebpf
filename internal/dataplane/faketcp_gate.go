@@ -55,7 +55,8 @@ const fakeTCPRequiredCapabilities = fakeTCPCapabilityBaselineIsolation |
 // implementation and packet/real-NIC acceptance tests in the same change.
 const fakeTCPImplementedCapabilities = fakeTCPCapabilityBaselineIsolation |
 	fakeTCPCapabilitySingleWriterState |
-	fakeTCPCapabilityHalfOpenProtection
+	fakeTCPCapabilityHalfOpenProtection |
+	fakeTCPCapabilityBPFControlAdmission
 
 var fakeTCPRequirements = []struct {
 	capability fakeTCPCapability

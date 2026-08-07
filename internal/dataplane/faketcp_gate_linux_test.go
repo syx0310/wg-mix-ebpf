@@ -49,6 +49,10 @@ func TestFakeTCPActivationCannotBeEnabledWithoutEveryAcceptanceCapability(t *tes
 		t.Fatal("experimental FakeTCP object became attachable without the missing acceptance capabilities")
 	}
 	missing := strings.Join(missingFakeTCPCapabilities(), "\n")
+	if strings.Contains(missing, "BPF control-event admission/coalescing") ||
+		fakeTCPImplementedCapabilities&fakeTCPCapabilityBPFControlAdmission == 0 {
+		t.Fatalf("implemented BPF control-event admission is still reported missing: %q", missing)
+	}
 	for _, capability := range []string{
 		"XDP link ownership/rollback and libxdp chaining",
 		"atomic managed-interface/port policy population",

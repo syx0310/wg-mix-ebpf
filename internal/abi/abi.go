@@ -223,6 +223,42 @@ type FakeTCPSessionValue struct {
 
 func (v FakeTCPSessionValue) MapGeneration() uint64 { return v.Generation }
 
+// FakeTCPControlPolicyKey isolates BPF control-event admission state by both
+// staged generation and managed WireGuard policy. The experimental object is
+// deliberately unpinned and remains outside the canonical ABI-v10 map set.
+type FakeTCPControlPolicyKey struct {
+	Generation uint64
+	WGID       uint32
+	_          uint32
+}
+
+// VirtualTimeNanos is a BPF-owned GCRA cursor. Policy population must create
+// each value with a zero cursor; the BPF path then starts with zero immediately
+// available events and accrues at IntervalNanos up to Burst.
+type FakeTCPControlPolicyValue struct {
+	Generation       uint64
+	VirtualTimeNanos uint64
+	IntervalNanos    uint64
+	Burst            uint32
+	_                uint32
+}
+
+func (v FakeTCPControlPolicyValue) MapGeneration() uint64 { return v.Generation }
+
+type FakeTCPControlFlowKey struct {
+	Session   FakeTCPSessionKey
+	WGID      uint32
+	EventType uint8
+	_         [3]byte
+}
+
+type FakeTCPControlFlowValue struct {
+	Generation     uint64
+	LastEventNanos uint64
+}
+
+func (v FakeTCPControlFlowValue) MapGeneration() uint64 { return v.Generation }
+
 type FakeTCPEvent struct {
 	Key             FakeTCPSessionKey
 	TimestampNanos  uint64

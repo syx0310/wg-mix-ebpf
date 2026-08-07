@@ -254,18 +254,133 @@ func TestFakeTCPEstablishedMapCannotLRUEvictUnderSYNPressure(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(source)
-	if strings.Contains(text, "BPF_MAP_TYPE_LRU_HASH") {
+	sessionEnd := strings.Index(text, `} faketcp_session_map SEC(".maps");`)
+	if sessionEnd < 0 {
+		t.Fatal("FakeTCP established session map is missing")
+	}
+	sessionStart := strings.LastIndex(text[:sessionEnd], "struct {")
+	if sessionStart < 0 {
+		t.Fatal("FakeTCP established session map declaration is malformed")
+	}
+	sessionMap := text[sessionStart:sessionEnd]
+	if strings.Contains(sessionMap, "BPF_MAP_TYPE_LRU_HASH") {
 		t.Fatal("FakeTCP established sessions must not use an eviction-capable LRU map")
 	}
 	for _, want := range []string{
 		"Only established sessions enter this map",
-		"__uint(type, BPF_MAP_TYPE_HASH)",
 		"session->state != FAKETCP_STATE_ESTABLISHED",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("established-only fast-map contract missing %q", want)
 		}
 	}
+	if !strings.Contains(sessionMap, "__uint(type, BPF_MAP_TYPE_HASH)") {
+		t.Fatal("FakeTCP established session map must remain a non-evicting HASH")
+	}
+}
+
+func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, want := range []string{
+		"struct faketcp_control_policy_key",
+		"struct faketcp_control_policy_value",
+		"struct faketcp_control_flow_key",
+		"faketcp_control_policy_map SEC(\".maps\")",
+		"faketcp_control_flow_map SEC(\".maps\")",
+		"__uint(type, BPF_MAP_TYPE_LRU_HASH)",
+		".generation = session->generation",
+		".wg_id = wg_id",
+		".event_type = event_type",
+		"attempt < FAKETCP_CONTROL_CAS_ATTEMPTS",
+		"__sync_val_compare_and_swap(&policy->virtual_time_nanos",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("FakeTCP control admission contract missing %q", want)
+		}
+	}
+
+	admissionStart := strings.Index(text, "faketcp_admit_control_event(const struct faketcp_session_key")
+	emitStart := strings.Index(text, "static __always_inline int faketcp_emit_event")
+	if admissionStart < 0 || emitStart < 0 || admissionStart >= emitStart {
+		t.Fatal("FakeTCP control admission helper is missing or misplaced")
+	}
+	admission := text[admissionStart:emitStart]
+	policyLookup := strings.Index(admission, "bpf_map_lookup_elem(&faketcp_control_policy_map")
+	flowLookup := strings.Index(admission, "bpf_map_lookup_elem(&faketcp_control_flow_map")
+	budget := strings.Index(admission, "faketcp_take_control_budget(policy, now)")
+	flowUpdate := strings.Index(admission, "bpf_map_update_elem(&faketcp_control_flow_map")
+	if policyLookup < 0 || flowLookup < 0 || budget < 0 || flowUpdate < 0 ||
+		policyLookup >= flowLookup || flowLookup >= budget || budget >= flowUpdate {
+		t.Fatal("policy lookup, duplicate lookup, budget allocation and admitted-only map update are out of order")
+	}
+	if strings.Count(admission, "bpf_map_update_elem(&faketcp_control_flow_map") != 1 {
+		t.Fatal("attacker-keyed control map must have exactly one admitted-only write site")
+	}
+
+	emit := text[emitStart:]
+	admitCall := strings.Index(emit, "faketcp_admit_control_event(key, wg_id, type, now)")
+	ringOutput := strings.Index(emit, "bpf_ringbuf_output(&faketcp_events, &event")
+	if admitCall < 0 || ringOutput < 0 || admitCall >= ringOutput {
+		t.Fatal("control admission must precede every metadata ring-buffer output")
+	}
+}
+
+func TestFakeTCPControlAdmissionGCRAStartsEmptyAndCapsBurst(t *testing.T) {
+	const (
+		interval = uint64(100)
+		burst    = uint32(4)
+		start    = uint64(1_000)
+	)
+	var cursor uint64
+	if takeFakeTCPControlBudgetModel(&cursor, start, interval, burst) {
+		t.Fatal("new policy minted an immediate control-event token")
+	}
+	if want := start + interval*uint64(burst); cursor != want {
+		t.Fatalf("zero-budget epoch cursor=%d, want %d", cursor, want)
+	}
+	if !takeFakeTCPControlBudgetModel(&cursor, start+interval, interval, burst) {
+		t.Fatal("one interval did not accrue exactly one event")
+	}
+	if takeFakeTCPControlBudgetModel(&cursor, start+interval, interval, burst) {
+		t.Fatal("one interval accrued more than one event")
+	}
+
+	// After a long idle period, exactly Burst events may be emitted; the next
+	// one is rejected without relying on a flow-map insertion or ring capacity.
+	now := start + 10*interval
+	for admitted := uint32(0); admitted < burst; admitted++ {
+		if !takeFakeTCPControlBudgetModel(&cursor, now, interval, burst) {
+			t.Fatalf("idle burst stopped after %d admissions", admitted)
+		}
+	}
+	if takeFakeTCPControlBudgetModel(&cursor, now, interval, burst) {
+		t.Fatalf("policy admitted more than burst=%d events at one instant", burst)
+	}
+}
+
+// takeFakeTCPControlBudgetModel mirrors the single-cursor arithmetic in the
+// BPF helper without modelling CAS contention (contention only adds rejects).
+func takeFakeTCPControlBudgetModel(cursor *uint64, now, interval uint64, burst uint32) bool {
+	window := interval * uint64(burst)
+	limit := now + window
+	if *cursor == 0 {
+		*cursor = limit
+		return false
+	}
+	base := *cursor
+	if base < now {
+		base = now
+	}
+	candidate := base + interval
+	if candidate > limit {
+		return false
+	}
+	*cursor = candidate
+	return true
 }
 
 func TestFakeTCPCloseControlsCannotAuthorizeDeleteBeforeBPFValidation(t *testing.T) {

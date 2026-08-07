@@ -28,6 +28,10 @@
 #define FAKETCP_HEADER_DELTA 12
 #define FAKETCP_METADATA_MAGIC 0x57474654U
 #define FAKETCP_MAX_CAPTURED_PACKET 2304
+#define FAKETCP_CONTROL_MIN_INTERVAL_NANOS 10000000ULL
+#define FAKETCP_CONTROL_MAX_INTERVAL_NANOS 10000000000ULL
+#define FAKETCP_CONTROL_MAX_BURST 4096U
+#define FAKETCP_CONTROL_CAS_ATTEMPTS 4
 
 enum faketcp_stat_id {
 	FAKETCP_STAT_EGRESS_OK = 0,
@@ -39,6 +43,9 @@ enum faketcp_stat_id {
 	FAKETCP_STAT_CHECKSUM_ERROR,
 	FAKETCP_STAT_METADATA_ERROR,
 	FAKETCP_STAT_EVENT_ERROR,
+	FAKETCP_STAT_CONTROL_COALESCED,
+	FAKETCP_STAT_CONTROL_RATE_LIMITED,
+	FAKETCP_STAT_CONTROL_POLICY_MISS,
 	FAKETCP_STAT_MAX,
 };
 
@@ -123,6 +130,48 @@ struct faketcp_managed_port_value {
 	__u8 pad[3];
 };
 
+// The controller creates one policy value per managed WireGuard and staged
+// generation before an XDP link can become reachable. virtual_time_nanos is a
+// BPF-owned GCRA cursor: zero starts with no immediately spendable budget, so
+// reloading or recreating this unpinned experimental map cannot mint a burst.
+struct faketcp_control_policy_key {
+	__u64 generation;
+	__u32 wg_id;
+	__u32 pad;
+};
+
+struct faketcp_control_policy_value {
+	__u64 generation;
+	__u64 virtual_time_nanos;
+	__u64 interval_nanos;
+	__u32 burst;
+	__u32 pad;
+};
+
+// Repeated control packets are coalesced by managed policy, generation, flow
+// and event type. This cache may evict old coalescing hints, but it never owns
+// established session state; the policy budget remains the strict event cap.
+struct faketcp_control_flow_key {
+	struct faketcp_session_key session;
+	__u32 wg_id;
+	__u8 event_type;
+	__u8 pad[3];
+};
+
+struct faketcp_control_flow_value {
+	__u64 generation;
+	__u64 last_event_nanos;
+};
+
+_Static_assert(sizeof(struct faketcp_control_policy_key) == 16,
+	       "faketcp control policy key ABI drift");
+_Static_assert(sizeof(struct faketcp_control_policy_value) == 32,
+	       "faketcp control policy value ABI drift");
+_Static_assert(sizeof(struct faketcp_control_flow_key) == 32,
+	       "faketcp control flow key ABI drift");
+_Static_assert(sizeof(struct faketcp_control_flow_value) == 16,
+	       "faketcp control flow value ABI drift");
+
 struct faketcp_ipv6_extension {
 	__u8 next_header;
 	__u8 header_length;
@@ -158,6 +207,24 @@ struct {
 	__type(key, struct faketcp_managed_port_key);
 	__type(value, struct faketcp_managed_port_value);
 } faketcp_managed_port_map SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_HASH);
+	__uint(max_entries, 512);
+	__type(key, struct faketcp_control_policy_key);
+	__type(value, struct faketcp_control_policy_value);
+} faketcp_control_policy_map SEC(".maps");
+
+struct {
+	// Only an admitted event can update this LRU. Once a policy budget is
+	// exhausted, a unique-flow SYN flood performs lookups but cannot amplify
+	// into map writes. Eviction can reduce coalescing, never bypass the policy
+	// cursor that caps ring-buffer output.
+	__uint(type, BPF_MAP_TYPE_LRU_HASH);
+	__uint(max_entries, 16384);
+	__type(key, struct faketcp_control_flow_key);
+	__type(value, struct faketcp_control_flow_value);
+} faketcp_control_flow_map SEC(".maps");
 
 struct {
 	__uint(type, BPF_MAP_TYPE_RINGBUF);
@@ -201,15 +268,109 @@ static __always_inline void inc_faketcp_stat(__u32 key)
 		*value += 1;
 }
 
+// Allocate one event slot from a per-WireGuard, per-generation GCRA cursor.
+// Every retry bound is a compile-time constant. Under contention this helper
+// rejects after four failed compare-and-swaps instead of doing attacker-sized
+// work. interval/burst bounds also make every multiplication verifier-safe.
+static __always_inline int
+faketcp_take_control_budget(struct faketcp_control_policy_value *policy,
+			    __u64 now)
+{
+	__u64 interval = policy->interval_nanos;
+	__u32 burst = policy->burst;
+	__u64 window;
+
+	if (interval < FAKETCP_CONTROL_MIN_INTERVAL_NANOS ||
+	    interval > FAKETCP_CONTROL_MAX_INTERVAL_NANOS || burst == 0 ||
+	    burst > FAKETCP_CONTROL_MAX_BURST)
+		return 0;
+	window = interval * (__u64)burst;
+	if (now > ~0ULL - window)
+		return 0;
+
+#pragma unroll
+	for (int attempt = 0; attempt < FAKETCP_CONTROL_CAS_ATTEMPTS; attempt++) {
+		__u64 old = policy->virtual_time_nanos;
+		__u64 base, candidate, limit = now + window;
+
+		if (old == 0) {
+			// The first packet establishes the zero-budget epoch. Exactly one
+			// token becomes available after one configured interval.
+			if (__sync_val_compare_and_swap(&policy->virtual_time_nanos,
+						old, limit) == old)
+				return 0;
+			continue;
+		}
+		base = old > now ? old : now;
+		if (base > ~0ULL - interval)
+			return 0;
+		candidate = base + interval;
+		if (candidate > limit)
+			return 0;
+		if (__sync_val_compare_and_swap(&policy->virtual_time_nanos,
+						old, candidate) == old)
+			return 1;
+	}
+	return 0;
+}
+
+static __always_inline int
+faketcp_admit_control_event(const struct faketcp_session_key *session,
+			    __u32 wg_id, __u8 event_type, __u64 now)
+{
+	struct faketcp_control_policy_key policy_key = {
+		.generation = session->generation,
+		.wg_id = wg_id,
+	};
+	struct faketcp_control_flow_key flow_key = {
+		.session = *session,
+		.wg_id = wg_id,
+		.event_type = event_type,
+	};
+	struct faketcp_control_policy_value *policy;
+	struct faketcp_control_flow_value *previous;
+	struct faketcp_control_flow_value next = {
+		.generation = session->generation,
+		.last_event_nanos = now,
+	};
+
+	// The policy lookup is first and fail-closed. No packet can allocate its
+	// own policy budget, and generations/WireGuards never share a cursor.
+	policy = bpf_map_lookup_elem(&faketcp_control_policy_map, &policy_key);
+	if (!policy || policy->generation != session->generation) {
+		inc_faketcp_stat(FAKETCP_STAT_CONTROL_POLICY_MISS);
+		return 0;
+	}
+	previous = bpf_map_lookup_elem(&faketcp_control_flow_map, &flow_key);
+	if (previous && previous->generation == session->generation &&
+	    previous->last_event_nanos != 0 &&
+	    (now <= previous->last_event_nanos ||
+	     now - previous->last_event_nanos < policy->interval_nanos)) {
+		inc_faketcp_stat(FAKETCP_STAT_CONTROL_COALESCED);
+		return 0;
+	}
+	if (!faketcp_take_control_budget(policy, now)) {
+		inc_faketcp_stat(FAKETCP_STAT_CONTROL_RATE_LIMITED);
+		return 0;
+	}
+	// This is the only attacker-keyed write, and only a policy-admitted event
+	// reaches it. A failed hint update does not remove the strict policy cap.
+	if (bpf_map_update_elem(&faketcp_control_flow_map, &flow_key, &next,
+				BPF_ANY) < 0)
+		inc_faketcp_stat(FAKETCP_STAT_EVENT_ERROR);
+	return 1;
+}
+
 static __always_inline int faketcp_emit_event(const struct faketcp_session_key *key,
 					       __u8 type, __u8 flags,
 					       __u32 seq, __u32 ack,
 					       __u32 payload_len,
 					       __u32 fwmark, __u32 wg_id)
 {
+	__u64 now = bpf_ktime_get_ns();
 	struct faketcp_event event = {
 		.key = *key,
-		.timestamp_nanos = bpf_ktime_get_ns(),
+		.timestamp_nanos = now,
 		.sequence = seq,
 		.acknowledgement = ack,
 		.payload_length = payload_len,
@@ -218,6 +379,9 @@ static __always_inline int faketcp_emit_event(const struct faketcp_session_key *
 		.type = type,
 		.tcp_flags = flags,
 	};
+
+	if (!faketcp_admit_control_event(key, wg_id, type, now))
+		return 0;
 
 	if (bpf_ringbuf_output(&faketcp_events, &event, sizeof(event), 0) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_EVENT_ERROR);

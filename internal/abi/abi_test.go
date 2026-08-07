@@ -52,6 +52,10 @@ func TestStructSizesAreStable(t *testing.T) {
 		{"ICMPListenerValue", unsafe.Sizeof(ICMPListenerValue{}), 24},
 		{"FakeTCPSessionKey", unsafe.Sizeof(FakeTCPSessionKey{}), 24},
 		{"FakeTCPSessionValue", unsafe.Sizeof(FakeTCPSessionValue{}), 40},
+		{"FakeTCPControlPolicyKey", unsafe.Sizeof(FakeTCPControlPolicyKey{}), 16},
+		{"FakeTCPControlPolicyValue", unsafe.Sizeof(FakeTCPControlPolicyValue{}), 32},
+		{"FakeTCPControlFlowKey", unsafe.Sizeof(FakeTCPControlFlowKey{}), 32},
+		{"FakeTCPControlFlowValue", unsafe.Sizeof(FakeTCPControlFlowValue{}), 16},
 		{"FakeTCPEvent", unsafe.Sizeof(FakeTCPEvent{}), FakeTCPEventSize},
 		{"FakeTCPPacketEvent", unsafe.Sizeof(FakeTCPPacketEvent{}), FakeTCPPacketEventSize},
 	}

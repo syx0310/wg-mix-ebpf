@@ -57,8 +57,10 @@ func TestReloadFakeTCPGatePrecedesGuardAndLoaderInApplyAndDryRun(t *testing.T) {
 			if !errors.Is(err, dataplane.ErrFakeTCPKernelGate) {
 				t.Fatalf("expected FakeTCP activation gate, got %v", err)
 			}
+			if strings.Contains(err.Error(), "BPF control-event admission/coalescing under SYN flood") {
+				t.Fatalf("gate still reports implemented BPF control-event admission as missing: %v", err)
+			}
 			for _, want := range []string{
-				"BPF control-event admission/coalescing under SYN flood",
 				"RST/FIN full IPv4/TCP checksum and receive-window validation",
 				"parser:l3 FakeTCP policy and attachment support",
 				"real-NIC GSO/GRO/checksum-offload acceptance",
