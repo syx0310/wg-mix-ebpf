@@ -10,19 +10,19 @@ import (
 func TestCanonicalPerfEventSampleTrimsOnlyProvenKernelPadding(t *testing.T) {
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1, 2, 3})
-	compact := testEventSample(abi.FakeTCPEvent{
+	compact := testBoundEventSample(abi.FakeTCPEvent{
 		Key:           flow,
 		PayloadLength: 3,
 		PacketLength:  uint16(len(packet)),
 		Type:          abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
-	fixed := testEventSample(abi.FakeTCPEvent{
+	fixed := testBoundEventSample(abi.FakeTCPEvent{
 		Key:           flow,
 		PayloadLength: 3,
 		PacketLength:  uint16(len(packet)),
 		Type:          abi.FakeTCPEventNeedHandshake,
 	}, packet, true)
-	control := testEventSample(abi.FakeTCPEvent{
+	control := testBoundEventSample(abi.FakeTCPEvent{
 		Key: flow, Type: abi.FakeTCPEventACK, TCPFlags: FlagACK,
 	}, nil, false)
 

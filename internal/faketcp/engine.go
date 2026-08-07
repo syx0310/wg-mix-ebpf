@@ -96,12 +96,14 @@ type Action struct {
 // PendingPacket is a pre-transform IPv4 packet captured by BPF, with complete
 // checksums materialized by Controller. A raw sender must re-inject it with
 // FWMark on Flow.UnderlayIndex so it traverses the ordinary
-// type-word/XOR/FakeTCP egress pipeline exactly once.
+// type-word/XOR/FakeTCP egress pipeline exactly once. CaptureID, not
+// CaptureNanos, is the once-only identity; the timestamp is diagnostic.
 type PendingPacket struct {
 	Data         []byte
 	FWMark       uint32
 	WGID         uint32
 	CaptureNanos uint64
+	CaptureID    CaptureIdentity
 }
 
 type SessionSnapshot struct {
@@ -266,11 +268,28 @@ func (e *Engine) handleCapturedPacket(event abi.FakeTCPEvent, packet []byte) ([]
 	if len(packet) == 0 || len(packet) != int(event.PacketLength) || len(packet) > abi.FakeTCPMaxCapturedPacket {
 		return nil, fmt.Errorf("faketcp captured packet body has %d bytes for declared length %d", len(packet), event.PacketLength)
 	}
+	if event.EventABIVersion != abi.FakeTCPEventABIVersion {
+		return nil, fmt.Errorf(
+			"faketcp event ABI version %d does not match %d",
+			event.EventABIVersion, abi.FakeTCPEventABIVersion,
+		)
+	}
+	if identity := runtimeIdentityFromEvent(event); identity != e.identity {
+		return nil, fmt.Errorf(
+			"faketcp packet event identity does not match Engine: event=%x engine=%x",
+			identity.Incarnation, e.identity.Incarnation,
+		)
+	}
+	captureID := captureIdentityFromEvent(event)
+	if err := validateCaptureIdentity(captureID, event.Key.Generation); err != nil {
+		return nil, err
+	}
 	return e.outbound(event.Key, PendingPacket{
 		Data:         packet,
 		FWMark:       event.FWMark,
 		WGID:         event.WGID,
 		CaptureNanos: event.TimestampNanos,
+		CaptureID:    captureID,
 	}, true)
 }
 

@@ -11,9 +11,10 @@ import (
 )
 
 var (
-	ErrRawBackendClosed       = errors.New("faketcp raw controller backend is closed")
-	ErrReinjectorClosed       = errors.New("faketcp once-only reinjector is closed")
-	ErrReinjectLedgerCapacity = errors.New("faketcp once-only reinjection ledger is full")
+	ErrRawBackendClosed        = errors.New("faketcp raw controller backend is closed")
+	ErrReinjectorClosed        = errors.New("faketcp once-only reinjector is closed")
+	ErrReinjectLedgerCapacity  = errors.New("faketcp once-only reinjection ledger is full")
+	ErrCaptureIdentityConflict = errors.New("faketcp capture identity was reused with different packet metadata")
 )
 
 // RawIPv4Write is one complete IPv4 packet and the exact routing metadata
@@ -295,23 +296,28 @@ func (backend *RawControllerBackend) initializedLocked() bool {
 }
 
 type reinjectIdentity struct {
-	flow         abi.FakeTCPSessionKey
-	fwmark       uint32
-	wgID         uint32
-	captureNanos uint64
-	packet       string
+	capture CaptureIdentity
+}
+
+type reinjectFingerprint struct {
+	flow   abi.FakeTCPSessionKey
+	fwmark uint32
+	wgID   uint32
+	packet string
 }
 
 type reinjectAttempt struct {
-	done chan struct{}
-	err  error
+	fingerprint reinjectFingerprint
+	done        chan struct{}
+	err         error
 }
 
 // OnceReinjector retains an exact identity for every attempted captured
 // packet. It claims an identity before calling the writer, so an error with an
 // ambiguous send outcome is never retried. Concurrent duplicate callers wait
-// for and receive the first attempt's result. The ledger never evicts: reaching
-// the configured bound fails closed and requires a generation/runtime reload.
+// for and receive the first attempt's result. Reusing an identity with changed
+// flow/mark/WGID/bytes fails closed without a write. The ledger never evicts:
+// reaching the configured bound requires a generation/runtime reload.
 type OnceReinjector struct {
 	mu sync.Mutex
 
@@ -354,18 +360,18 @@ func (reinjector *OnceReinjector) Reinject(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if packet.CaptureNanos == 0 {
-		return errors.New("faketcp captured packet has no monotonic capture identity")
+	if err := validateCaptureIdentity(packet.CaptureID, flow.Generation); err != nil {
+		return fmt.Errorf("validate faketcp captured packet identity: %w", err)
 	}
 	if err := ValidateMaterializedIPv4UDP(packet.Data, flow); err != nil {
 		return err
 	}
-	identity := reinjectIdentity{
-		flow:         flow,
-		fwmark:       packet.FWMark,
-		wgID:         packet.WGID,
-		captureNanos: packet.CaptureNanos,
-		packet:       string(packet.Data),
+	identity := reinjectIdentity{capture: packet.CaptureID}
+	fingerprint := reinjectFingerprint{
+		flow:   flow,
+		fwmark: packet.FWMark,
+		wgID:   packet.WGID,
+		packet: string(packet.Data),
 	}
 
 	reinjector.mu.Lock()
@@ -374,6 +380,10 @@ func (reinjector *OnceReinjector) Reinject(
 		return ErrReinjectorClosed
 	}
 	if previous := reinjector.attempts[identity]; previous != nil {
+		if previous.fingerprint != fingerprint {
+			reinjector.mu.Unlock()
+			return ErrCaptureIdentityConflict
+		}
 		done := previous.done
 		reinjector.mu.Unlock()
 		select {
@@ -387,7 +397,7 @@ func (reinjector *OnceReinjector) Reinject(
 		reinjector.mu.Unlock()
 		return fmt.Errorf("%w: maximum %d", ErrReinjectLedgerCapacity, reinjector.maxAttempts)
 	}
-	attempt := &reinjectAttempt{done: make(chan struct{})}
+	attempt := &reinjectAttempt{fingerprint: fingerprint, done: make(chan struct{})}
 	reinjector.attempts[identity] = attempt
 	reinjector.mu.Unlock()
 

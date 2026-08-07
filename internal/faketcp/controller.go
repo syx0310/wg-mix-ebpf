@@ -70,24 +70,40 @@ func decodeEventHeader(header []byte) abi.FakeTCPEvent {
 			LocalPort:     native.Uint16(header[20:22]),
 			RemotePort:    native.Uint16(header[22:24]),
 		},
-		TimestampNanos:  native.Uint64(header[24:32]),
-		Sequence:        native.Uint32(header[32:36]),
-		Acknowledgement: native.Uint32(header[36:40]),
-		PayloadLength:   native.Uint32(header[40:44]),
-		FWMark:          native.Uint32(header[44:48]),
-		WGID:            native.Uint32(header[48:52]),
-		PacketLength:    native.Uint16(header[52:54]),
-		Type:            header[54],
-		TCPFlags:        header[55],
+		TimestampNanos:     native.Uint64(header[24:32]),
+		RuntimeIncarnation: [16]byte(header[32:48]),
+		CaptureSequence:    native.Uint64(header[48:56]),
+		CaptureCPU:         native.Uint32(header[56:60]),
+		Sequence:           native.Uint32(header[60:64]),
+		Acknowledgement:    native.Uint32(header[64:68]),
+		PayloadLength:      native.Uint32(header[68:72]),
+		FWMark:             native.Uint32(header[72:76]),
+		WGID:               native.Uint32(header[76:80]),
+		PacketLength:       native.Uint16(header[80:82]),
+		EventABIVersion:    native.Uint16(header[82:84]),
+		Type:               header[84],
+		TCPFlags:           header[85],
 	}
 }
 
 func validateEventType(event abi.FakeTCPEvent) error {
+	if event.EventABIVersion != abi.FakeTCPEventABIVersion {
+		return fmt.Errorf(
+			"faketcp event ABI version %d does not match %d",
+			event.EventABIVersion, abi.FakeTCPEventABIVersion,
+		)
+	}
+	if err := validateRuntimeIdentity(runtimeIdentityFromEvent(event)); err != nil {
+		return fmt.Errorf("invalid faketcp event runtime identity: %w", err)
+	}
 	flags := event.TCPFlags
 	switch event.Type {
 	case abi.FakeTCPEventNeedHandshake:
 		if flags != 0 {
 			return fmt.Errorf("faketcp NEED_HANDSHAKE event has TCP flags %#x", flags)
+		}
+		if err := validateCaptureIdentity(captureIdentityFromEvent(event), event.Key.Generation); err != nil {
+			return fmt.Errorf("invalid faketcp event capture identity: %w", err)
 		}
 	case abi.FakeTCPEventSYN:
 		if flags&FlagSYN == 0 || flags&(FlagACK|FlagRST|FlagFIN) != 0 {
@@ -111,6 +127,10 @@ func validateEventType(event abi.FakeTCPEvent) error {
 		}
 	default:
 		return fmt.Errorf("unknown faketcp event type %d", event.Type)
+	}
+	if event.Type != abi.FakeTCPEventNeedHandshake &&
+		(event.CaptureSequence != 0 || event.CaptureCPU != 0) {
+		return errors.New("faketcp control event contains a capture sequence")
 	}
 	return nil
 }
@@ -301,6 +321,12 @@ func (c *Controller) HandleSample(ctx context.Context, sample []byte) ([]Action,
 	decoded, err := DecodeEventSample(sample)
 	if err != nil {
 		return nil, err
+	}
+	if identity := runtimeIdentityFromEvent(decoded.Event); identity != c.engine.Identity() {
+		return nil, fmt.Errorf(
+			"faketcp event runtime identity does not match controller Engine: event=%x engine=%x",
+			identity.Incarnation, c.engine.Identity().Incarnation,
+		)
 	}
 	var actions []Action
 	if decoded.Event.Type == abi.FakeTCPEventNeedHandshake {

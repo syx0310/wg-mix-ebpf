@@ -73,6 +73,7 @@ func testPendingPacket(t *testing.T, flow abi.FakeTCPSessionKey, capture uint64)
 	}
 	return PendingPacket{
 		Data: data, FWMark: 0xa1230007, WGID: 77, CaptureNanos: capture,
+		CaptureID: CaptureIdentity{Runtime: testRuntimeIdentity(flow.Generation), CPU: 3, Sequence: capture},
 	}
 }
 
@@ -161,6 +162,63 @@ func TestOnceReinjectorAttemptsExactIdentityOnlyOnce(t *testing.T) {
 	writes, _ := writer.snapshot()
 	if len(writes) != 1 {
 		t.Fatalf("raw attempts=%d, want one", len(writes))
+	}
+}
+
+func TestOnceReinjectorUsesCaptureSequenceAndIncarnationNotTimestamp(t *testing.T) {
+	writer := &memoryRawIPv4Writer{}
+	reinjector, err := NewOnceReinjector(writer, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow := testFlow(31001)
+	first := testPendingPacket(t, flow, 1)
+	first.CaptureNanos = 999
+	second := first
+	second.Data = append([]byte(nil), first.Data...)
+	second.CaptureID.Sequence = 2
+	third := first
+	third.Data = append([]byte(nil), first.Data...)
+	third.CaptureID.Runtime.Incarnation[0] = 2
+	fourth := first
+	fourth.Data = append([]byte(nil), first.Data...)
+	fourth.CaptureID.CPU = 4
+	for _, packet := range []PendingPacket{first, second, third, fourth} {
+		if err := reinjector.Reinject(context.Background(), flow, packet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Exact replay of each identity is coalesced independently.
+	for _, packet := range []PendingPacket{first, second, third, fourth} {
+		if err := reinjector.Reinject(context.Background(), flow, packet); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writes, _ := writer.snapshot()
+	if len(writes) != 4 {
+		t.Fatalf("raw attempts=%d, want one per capture identity", len(writes))
+	}
+}
+
+func TestOnceReinjectorRejectsCaptureIdentityReuseWithDifferentMetadata(t *testing.T) {
+	writer := &memoryRawIPv4Writer{}
+	reinjector, err := NewOnceReinjector(writer, 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow := testFlow(31001)
+	packet := testPendingPacket(t, flow, 1)
+	if err := reinjector.Reinject(context.Background(), flow, packet); err != nil {
+		t.Fatal(err)
+	}
+	conflict := packet
+	conflict.FWMark++
+	if err := reinjector.Reinject(context.Background(), flow, conflict); !errors.Is(err, ErrCaptureIdentityConflict) {
+		t.Fatalf("capture identity conflict error=%v", err)
+	}
+	writes, _ := writer.snapshot()
+	if len(writes) != 1 {
+		t.Fatalf("conflicting capture identity wrote %d packets", len(writes))
 	}
 }
 

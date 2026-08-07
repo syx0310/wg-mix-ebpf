@@ -60,6 +60,7 @@ func TestStructSizesAreStable(t *testing.T) {
 		{"FakeTCPControlPolicyValue", unsafe.Sizeof(FakeTCPControlPolicyValue{}), 32},
 		{"FakeTCPControlFlowKey", unsafe.Sizeof(FakeTCPControlFlowKey{}), 32},
 		{"FakeTCPControlFlowValue", unsafe.Sizeof(FakeTCPControlFlowValue{}), 16},
+		{"FakeTCPRuntimeIdentityValue", unsafe.Sizeof(FakeTCPRuntimeIdentityValue{}), 32},
 		{"FakeTCPEvent", unsafe.Sizeof(FakeTCPEvent{}), FakeTCPEventSize},
 		{"FakeTCPPacketEvent", unsafe.Sizeof(FakeTCPPacketEvent{}), FakeTCPPacketEventSize},
 	}
@@ -97,6 +98,18 @@ func TestStructSizesAreStable(t *testing.T) {
 	}
 	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Window), uintptr(32); got != want {
 		t.Fatalf("FakeTCPSessionValue.Window offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPEvent{}.RuntimeIncarnation), uintptr(32); got != want {
+		t.Fatalf("FakeTCPEvent.RuntimeIncarnation offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPEvent{}.CaptureSequence), uintptr(48); got != want {
+		t.Fatalf("FakeTCPEvent.CaptureSequence offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPEvent{}.CaptureCPU), uintptr(56); got != want {
+		t.Fatalf("FakeTCPEvent.CaptureCPU offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPEvent{}.EventABIVersion), uintptr(82); got != want {
+		t.Fatalf("FakeTCPEvent.EventABIVersion offset = %d, want %d", got, want)
 	}
 	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.State), uintptr(34); got != want {
 		t.Fatalf("FakeTCPSessionValue.State offset = %d, want %d", got, want)

@@ -460,6 +460,12 @@ func validateActionCheckpoint(checkpoint ActionCheckpoint) error {
 				ErrActionCheckpointCorrupt, step.Flow.Generation, checkpoint.Identity.Generation,
 			)
 		}
+		if step.Kind == ActionStepReinject && step.Packet.CaptureID.Runtime != checkpoint.Identity {
+			return fmt.Errorf(
+				"%w: captured packet identity does not match checkpoint Engine identity",
+				ErrActionCheckpointCorrupt,
+			)
+		}
 	}
 	return nil
 }
@@ -486,8 +492,11 @@ func validateActionStep(step ActionStep) error {
 			return fmt.Errorf("faketcp control action step has unsupported flags %#x", step.Control.Flags)
 		}
 	case ActionStepReinject:
-		if step.Packet.CaptureNanos == 0 || len(step.Packet.Data) == 0 {
+		if len(step.Packet.Data) == 0 {
 			return errors.New("faketcp reinjection action step has no packet or capture identity")
+		}
+		if err := validateCaptureIdentity(step.Packet.CaptureID, step.Flow.Generation); err != nil {
+			return fmt.Errorf("faketcp reinjection action step identity: %w", err)
 		}
 	default:
 		return fmt.Errorf("unknown faketcp action step kind %d", step.Kind)

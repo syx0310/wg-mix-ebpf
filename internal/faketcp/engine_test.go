@@ -127,6 +127,7 @@ func testEngine(t *testing.T, mutate func(*Options)) (*Engine, *fakeClock) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	engine.identity = testRuntimeIdentity(opts.Generation)
 	// Ordinary state-machine tests start after one full global refill horizon.
 	// Dedicated restart tests below exercise New's zero-budget fail-safe edge.
 	clock.Add(opts.SYNRateInterval * time.Duration(opts.SYNBurst))
@@ -809,6 +810,7 @@ func TestPacketEventFeedsRealBoundedQueueAndReleaseMetadata(t *testing.T) {
 		Key: flow, Type: abi.FakeTCPEventNeedHandshake,
 		PacketLength: 4, FWMark: 0x10000002, WGID: 7,
 	}}
+	bindTestEvent(&event.Event, engine.Identity(), 1)
 	copy(event.Packet[:], []byte{0x45, 1, 2, 3})
 	actions, err := engine.HandlePacketEvent(event)
 	if err != nil || len(actions) != 1 || actions[0].Control.Flags != FlagSYN {
@@ -829,11 +831,31 @@ func TestPacketEventFeedsRealBoundedQueueAndReleaseMetadata(t *testing.T) {
 
 func TestPacketEventRejectsMissingPacketBody(t *testing.T) {
 	engine, _ := testEngine(t, nil)
-	_, err := engine.HandlePacketEvent(abi.FakeTCPPacketEvent{Event: abi.FakeTCPEvent{
+	event := abi.FakeTCPPacketEvent{Event: abi.FakeTCPEvent{
 		Key: testFlow(31001), Type: abi.FakeTCPEventNeedHandshake,
-	}})
+	}}
+	bindTestEvent(&event.Event, engine.Identity(), 1)
+	_, err := engine.HandlePacketEvent(event)
 	if err == nil {
 		t.Fatal("metadata-only NEED_HANDSHAKE event was accepted")
+	}
+}
+
+func TestEngineRejectsPacketEventFromDifferentIncarnation(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	flow := testFlow(31001)
+	event := abi.FakeTCPPacketEvent{Event: abi.FakeTCPEvent{
+		Key: flow, Type: abi.FakeTCPEventNeedHandshake, PacketLength: 1,
+	}}
+	wrong := engine.Identity()
+	wrong.Incarnation[0] = 2
+	bindTestEvent(&event.Event, wrong, 1)
+	event.Packet[0] = 1
+	if _, err := engine.HandlePacketEvent(event); err == nil {
+		t.Fatal("packet event from another Engine incarnation was accepted")
+	}
+	if _, found, err := engine.Snapshot(flow); err != nil || found {
+		t.Fatalf("mismatched packet event touched Engine: found=%t err=%v", found, err)
 	}
 }
 
@@ -844,6 +866,7 @@ func TestWGIDMismatchCannotDriveOrCloseExistingSession(t *testing.T) {
 		Key: flow, Type: abi.FakeTCPEventNeedHandshake,
 		PacketLength: 1, WGID: 7,
 	}}
+	bindTestEvent(&event.Event, engine.Identity(), 1)
 	event.Packet[0] = 1
 	actions, err := engine.HandlePacketEvent(event)
 	if err != nil || len(actions) != 1 || actions[0].WGID != 7 {
@@ -879,6 +902,7 @@ func TestLatePacketEventAfterEstablishmentIsReinjected(t *testing.T) {
 		Key: flow, Type: abi.FakeTCPEventNeedHandshake,
 		PacketLength: 2, FWMark: 3, WGID: 7,
 	}}
+	bindTestEvent(&event.Event, engine.Identity(), 2)
 	copy(event.Packet[:], []byte{4, 5})
 	actions, err := engine.HandlePacketEvent(event)
 	if err != nil || len(actions) != 1 || actions[0].Kind != ActionReleasePending ||

@@ -324,6 +324,31 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 	if strings.Count(admission, "bpf_map_update_elem(&faketcp_control_flow_map") != 1 {
 		t.Fatal("attacker-keyed control map must have exactly one admitted-only write site")
 	}
+	for _, want := range []string{
+		"bpf_map_lookup_elem(&faketcp_rt_id",
+		"identity->generation != key->generation",
+		"identity->event_abi_version != FAKETCP_EVENT_ABI_VERSION",
+		"if (!nonzero)",
+		"__builtin_memcpy(event->runtime_incarnation",
+		"bpf_map_lookup_elem(&faketcp_cap_seq",
+		"*sequence == ~0ULL",
+		"event->capture_cpu = bpf_get_smp_processor_id()",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("FakeTCP capture identity contract missing %q", want)
+		}
+	}
+	sequenceHelperStart := strings.Index(text, "faketcp_assign_capture_sequence(struct faketcp_event *event)")
+	admissionHelperStart := strings.Index(text, "faketcp_take_control_budget(struct faketcp_control_policy_value")
+	if sequenceHelperStart < 0 || admissionHelperStart < 0 || sequenceHelperStart >= admissionHelperStart {
+		t.Fatal("FakeTCP capture sequence helper is missing or misplaced")
+	}
+	sequenceHelper := text[sequenceHelperStart:admissionHelperStart]
+	saturation := strings.Index(sequenceHelper, "*sequence == ~0ULL")
+	increment := strings.Index(sequenceHelper, "*sequence += 1")
+	if saturation < 0 || increment < 0 || saturation >= increment {
+		t.Fatal("FakeTCP capture sequence must reject saturation before increment and never wrap")
+	}
 
 	if got := strings.Count(text, "bpf_ringbuf_output("); got != 2 {
 		t.Fatalf("FakeTCP source has %d ring-buffer output calls, want two enumerated calls", got)
@@ -351,9 +376,10 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 	emit := text[emitStart:captureStart]
 	admitCall := strings.Index(emit, "if (!faketcp_admit_control_event(key, wg_id, type, now))")
 	eventWrite := strings.Index(emit, "event = (struct faketcp_event)")
+	controlIdentityBind := strings.Index(emit, "faketcp_bind_runtime_identity(key, &event)")
 	ringOutput := strings.Index(emit, "bpf_ringbuf_output(&faketcp_events, &event")
-	if admitCall < 0 || eventWrite < 0 || ringOutput < 0 ||
-		admitCall >= eventWrite || eventWrite >= ringOutput {
+	if admitCall < 0 || eventWrite < 0 || controlIdentityBind < 0 || ringOutput < 0 ||
+		admitCall >= eventWrite || eventWrite >= controlIdentityBind || controlIdentityBind >= ringOutput {
 		t.Fatal("control admission must dominate metadata preparation and ring-buffer output")
 	}
 
@@ -364,10 +390,13 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 	scratchWrite := strings.Index(capture, "record->event = (struct faketcp_event)")
 	packetCopy := strings.Index(capture, "bpf_skb_load_bytes")
 	packetOutput := strings.Index(capture, "bpf_ringbuf_output(&faketcp_events, record")
+	identityBind := strings.Index(capture, "faketcp_bind_runtime_identity(key, &record->event)")
+	sequenceAssign := strings.Index(capture, "faketcp_assign_capture_sequence(&record->event)")
 	if packetValidation < 0 || scratchLookup < 0 || packetAdmit < 0 || scratchWrite < 0 ||
-		packetCopy < 0 || packetOutput < 0 || packetValidation >= packetAdmit ||
+		identityBind < 0 || sequenceAssign < 0 || packetCopy < 0 || packetOutput < 0 || packetValidation >= packetAdmit ||
 		scratchLookup >= packetAdmit || packetAdmit >= scratchWrite ||
-		scratchWrite >= packetCopy || packetCopy >= packetOutput {
+		scratchWrite >= identityBind || identityBind >= sequenceAssign ||
+		sequenceAssign >= packetCopy || packetCopy >= packetOutput {
 		t.Fatal("NEED_HANDSHAKE admission must follow cheap validation and dominate scratch writes, packet copy, and ring output")
 	}
 	if strings.Count(capture, "bpf_ktime_get_ns()") != 1 ||

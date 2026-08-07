@@ -18,6 +18,7 @@
 #define FAKETCP_EVENT_ACK            4
 #define FAKETCP_EVENT_RST            5
 #define FAKETCP_EVENT_FIN            6
+#define FAKETCP_EVENT_ABI_VERSION    1
 
 #define FAKETCP_FLAG_FIN 0x01
 #define FAKETCP_FLAG_SYN 0x02
@@ -46,6 +47,7 @@ enum faketcp_stat_id {
 	FAKETCP_STAT_CONTROL_COALESCED,
 	FAKETCP_STAT_CONTROL_RATE_LIMITED,
 	FAKETCP_STAT_CONTROL_POLICY_MISS,
+	FAKETCP_STAT_CAPTURE_ID_ERROR,
 	FAKETCP_STAT_MAX,
 };
 
@@ -79,14 +81,19 @@ _Static_assert(sizeof(struct faketcp_session_value) == 40,
 struct faketcp_event {
 	struct faketcp_session_key key;
 	__u64 timestamp_nanos;
+	__u8 runtime_incarnation[16];
+	__u64 capture_sequence;
+	__u32 capture_cpu;
 	__u32 sequence;
 	__u32 acknowledgement;
 	__u32 payload_length;
 	__u32 fwmark;
 	__u32 wg_id;
 	__u16 packet_length;
+	__u16 event_abi_version;
 	__u8 type;
 	__u8 tcp_flags;
+	__u8 pad[2];
 };
 
 struct faketcp_packet_event {
@@ -94,9 +101,27 @@ struct faketcp_packet_event {
 	__u8 packet[FAKETCP_MAX_CAPTURED_PACKET];
 };
 
-_Static_assert(sizeof(struct faketcp_event) == 56, "faketcp event ABI drift");
-_Static_assert(sizeof(struct faketcp_packet_event) == 2360,
+_Static_assert(sizeof(struct faketcp_event) == 88, "faketcp event ABI drift");
+_Static_assert(__builtin_offsetof(struct faketcp_event, runtime_incarnation) == 32,
+	       "faketcp runtime incarnation ABI drift");
+_Static_assert(__builtin_offsetof(struct faketcp_event, capture_sequence) == 48,
+	       "faketcp capture sequence ABI drift");
+_Static_assert(__builtin_offsetof(struct faketcp_event, capture_cpu) == 56,
+	       "faketcp capture CPU ABI drift");
+_Static_assert(__builtin_offsetof(struct faketcp_event, event_abi_version) == 82,
+	       "faketcp event version ABI drift");
+_Static_assert(sizeof(struct faketcp_packet_event) == 2392,
 	       "faketcp packet event ABI drift");
+
+struct faketcp_runtime_identity_value {
+	__u64 generation;
+	__u8 incarnation[16];
+	__u16 event_abi_version;
+	__u8 pad[6];
+};
+
+_Static_assert(sizeof(struct faketcp_runtime_identity_value) == 32,
+	       "faketcp runtime identity ABI drift");
 
 struct faketcp_metadata {
 	__u32 magic;
@@ -248,6 +273,20 @@ struct {
 } faketcp_capture_scratch SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct faketcp_runtime_identity_value);
+} faketcp_rt_id SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, __u64);
+} faketcp_cap_seq SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_PROG_ARRAY);
 	__uint(max_entries, 2);
 	__type(key, __u32);
@@ -271,6 +310,46 @@ static __always_inline void inc_faketcp_stat(__u32 key)
 
 	if (value)
 		*value += 1;
+}
+
+static __always_inline int
+faketcp_bind_runtime_identity(const struct faketcp_session_key *key,
+			      struct faketcp_event *event)
+{
+	__u32 zero = 0;
+	struct faketcp_runtime_identity_value *identity;
+	__u8 nonzero = 0;
+
+	identity = bpf_map_lookup_elem(&faketcp_rt_id, &zero);
+	if (!identity || identity->generation != key->generation ||
+	    identity->event_abi_version != FAKETCP_EVENT_ABI_VERSION)
+		return -1;
+#pragma unroll
+	for (int i = 0; i < 16; i++)
+		nonzero |= identity->incarnation[i];
+	if (!nonzero)
+		return -1;
+	__builtin_memcpy(event->runtime_incarnation, identity->incarnation,
+			 sizeof(event->runtime_incarnation));
+	event->event_abi_version = FAKETCP_EVENT_ABI_VERSION;
+	return 0;
+}
+
+static __always_inline int
+faketcp_assign_capture_sequence(struct faketcp_event *event)
+{
+	__u32 zero = 0;
+	__u64 *sequence = bpf_map_lookup_elem(&faketcp_cap_seq, &zero);
+
+	// Zero is reserved for non-capture events. Saturation is permanent for
+	// this per-CPU map/runtime and requires a fresh runtime incarnation/map;
+	// never wrap and alias an earlier capture.
+	if (!sequence || *sequence == ~0ULL)
+		return -1;
+	*sequence += 1;
+	event->capture_sequence = *sequence;
+	event->capture_cpu = bpf_get_smp_processor_id();
+	return 0;
 }
 
 // Allocate one event slot from a per-WireGuard, per-generation GCRA cursor.
@@ -398,6 +477,10 @@ static __always_inline int faketcp_emit_event(const struct faketcp_session_key *
 		.type = type,
 		.tcp_flags = flags,
 	};
+	if (faketcp_bind_runtime_identity(key, &event) < 0) {
+		inc_faketcp_stat(FAKETCP_STAT_CAPTURE_ID_ERROR);
+		return -1;
+	}
 
 	if (bpf_ringbuf_output(&faketcp_events, &event, sizeof(event), 0) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_EVENT_ERROR);
@@ -474,6 +557,11 @@ static __always_inline int faketcp_capture_first_packet(struct __sk_buff *skb,
 		.packet_length = packet_len,
 		.type = FAKETCP_EVENT_NEED_HANDSHAKE,
 	};
+	if (faketcp_bind_runtime_identity(key, &record->event) < 0 ||
+	    faketcp_assign_capture_sequence(&record->event) < 0) {
+		inc_faketcp_stat(FAKETCP_STAT_CAPTURE_ID_ERROR);
+		return -1;
+	}
 	if (bpf_skb_load_bytes(skb, info->ip_off, record->packet, packet_len) < 0)
 		return -1;
 	record_len = sizeof(record->event) + packet_len;

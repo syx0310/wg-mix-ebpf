@@ -310,7 +310,7 @@ func TestRecoverableControllerGatesAfterControlFailureUntilRecover(t *testing.T)
 	}
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1, 2})
-	sample := testEventSample(abi.FakeTCPEvent{
+	sample := testBoundEventSample(abi.FakeTCPEvent{
 		Key: flow, TimestampNanos: 11, PayloadLength: 2, FWMark: 3, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
@@ -350,14 +350,14 @@ func TestRecoverableControllerNeverRetriesAmbiguousReleasedPacket(t *testing.T) 
 	}
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1, 2})
-	first := testEventSample(abi.FakeTCPEvent{
+	first := testBoundEventSample(abi.FakeTCPEvent{
 		Key: flow, TimestampNanos: 11, PayloadLength: 2, FWMark: 3, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
 	if _, err := controller.HandleSample(context.Background(), first); err != nil {
 		t.Fatal(err)
 	}
-	synACK := testEventSample(abi.FakeTCPEvent{
+	synACK := testBoundEventSample(abi.FakeTCPEvent{
 		Key: flow, Sequence: 9000, Acknowledgement: 1001, WGID: 7,
 		Type: abi.FakeTCPEventSYNACK, TCPFlags: FlagSYN | FlagACK,
 	}, nil, false)
@@ -400,7 +400,7 @@ func TestRecoverableControllerStartsFencedByRetainedCheckpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	packet := testIPv4UDPPacket(t, flow, []byte{1})
-	sample := testEventSample(abi.FakeTCPEvent{
+	sample := testBoundEventSample(abi.FakeTCPEvent{
 		Key: flow, TimestampNanos: 11, PayloadLength: 1, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
@@ -441,6 +441,7 @@ func TestRecoverableControllerRejectsCheckpointFromDifferentEngineIdentity(t *te
 			candidate, _ := testEngine(t, func(options *Options) {
 				options.Generation = test.generation
 			})
+			candidate.identity.Incarnation[0] = 2
 			if candidate.Identity() == sourceEngine.Identity() {
 				t.Fatal("new Engine reused source identity")
 			}
@@ -469,7 +470,10 @@ func TestRecoverableControllerRejectsCheckpointFromDifferentEngineIdentity(t *te
 
 func TestNewEngineAlwaysCreatesFreshRuntimeIncarnation(t *testing.T) {
 	first, _ := testEngine(t, nil)
-	second, _ := testEngine(t, nil)
+	second, err := New(first.opts)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := validateRuntimeIdentity(first.Identity()); err != nil {
 		t.Fatal(err)
 	}
