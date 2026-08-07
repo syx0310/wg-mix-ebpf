@@ -23,6 +23,34 @@ type controlledFakeTCPRuntime struct {
 	ignoreCancel bool
 }
 
+// firstNilErrContext makes the pre-serialization Err observation visible. The
+// first call always reports an active context and closes prechecked; later
+// calls delegate to the cancellable parent.
+type firstNilErrContext struct {
+	context.Context
+	prechecked chan struct{}
+	once       sync.Once
+}
+
+func newFirstNilErrContext(parent context.Context) *firstNilErrContext {
+	return &firstNilErrContext{
+		Context:    parent,
+		prechecked: make(chan struct{}),
+	}
+}
+
+func (ctx *firstNilErrContext) Err() error {
+	first := false
+	ctx.once.Do(func() {
+		first = true
+		close(ctx.prechecked)
+	})
+	if first {
+		return nil
+	}
+	return ctx.Context.Err()
+}
+
 func newControlledFakeTCPRuntime() *controlledFakeTCPRuntime {
 	return &controlledFakeTCPRuntime{
 		runStarted: make(chan struct{}),
@@ -238,7 +266,8 @@ func TestFakeTCPRuntimeSupervisorStopTimeoutRetainsOwnership(t *testing.T) {
 func TestFakeTCPRuntimeSupervisorRechecksEnsureCancellationAfterSerialization(t *testing.T) {
 	supervisor := &fakeTCPRuntimeSupervisor{}
 	supervisor.operationMu.Lock()
-	ctx, cancel := context.WithCancel(t.Context())
+	parent, cancel := context.WithCancel(t.Context())
+	ctx := newFirstNilErrContext(parent)
 	done := make(chan error, 1)
 	buildCalls := 0
 	go func() {
@@ -251,6 +280,7 @@ func TestFakeTCPRuntimeSupervisorRechecksEnsureCancellationAfterSerialization(t 
 			},
 		)
 	}()
+	<-ctx.prechecked
 	cancel()
 	supervisor.operationMu.Unlock()
 	if err := <-done; !errors.Is(err, context.Canceled) {
@@ -274,9 +304,11 @@ func TestFakeTCPRuntimeSupervisorRechecksStopCancellationAfterSerialization(t *t
 	<-runtime.runStarted
 
 	supervisor.operationMu.Lock()
-	ctx, cancel := context.WithCancel(t.Context())
+	parent, cancel := context.WithCancel(t.Context())
+	ctx := newFirstNilErrContext(parent)
 	done := make(chan error, 1)
 	go func() { done <- supervisor.Stop(ctx) }()
+	<-ctx.prechecked
 	cancel()
 	supervisor.operationMu.Unlock()
 	if err := <-done; !errors.Is(err, context.Canceled) {
