@@ -151,6 +151,30 @@ type retainedTCRollbackOwner struct {
 	stageReleased bool
 }
 
+func finishRetainedTCRollbackOwner(
+	owner retainedTCRollbackOwner,
+	store *pinOwnerStore,
+) (retainedTCRollbackOwner, error) {
+	owner.stageReleased = true
+	if owner.binding == nil || owner.binding.plan == nil {
+		return owner, errors.New("retained TC rollback owner binding is incomplete")
+	}
+	if err := owner.binding.plan.Close(); err != nil {
+		return owner, fmt.Errorf("close resolved retained TC plan: %w", err)
+	}
+	if store == nil {
+		return owner, errors.New("retained TC rollback owner witness store is unavailable")
+	}
+	if err := store.releaseTCHandoffWitnessHolder(
+		owner.binding.intent,
+		owner.binding.sourceDigest,
+		owner.binding.holderID,
+	); err != nil {
+		return owner, fmt.Errorf("release resolved TC handoff witness holder: %w", err)
+	}
+	return owner, nil
+}
+
 func retainTCRollbackOwner(
 	resourceKey string,
 	stage *tcAttachStage,
@@ -193,12 +217,10 @@ func retryRetainedTCRollbackOwner(
 	var errs []error
 	for _, owner := range stages {
 		if owner.stageReleased {
-			if err := owner.binding.plan.Close(); err != nil {
-				unresolved = append(unresolved, owner)
-				errs = append(errs, fmt.Errorf(
-					"close retained TC plan after journal transfer: %w",
-					err,
-				))
+			updated, err := finishRetainedTCRollbackOwner(owner, store)
+			if err != nil {
+				unresolved = append(unresolved, updated)
+				errs = append(errs, err)
 			}
 			continue
 		}
@@ -210,11 +232,11 @@ func retryRetainedTCRollbackOwner(
 		switch progress {
 		case durableTCOwnerJournalProgressAdvanced:
 			owner.stage.Disarm()
-			if err := owner.binding.plan.Close(); err != nil {
-				owner.stageReleased = true
-				unresolved = append(unresolved, owner)
+			updated, err := finishRetainedTCRollbackOwner(owner, store)
+			if err != nil {
+				unresolved = append(unresolved, updated)
 				errs = append(errs, fmt.Errorf(
-					"close retained TC plan after durable owner advanced: %w",
+					"finish retained TC plan after durable owner advanced: %w",
 					err,
 				))
 			}
@@ -237,12 +259,12 @@ func retryRetainedTCRollbackOwner(
 			transferred, reportErr := handoff.Transfer(owner.stage)
 			if transferred {
 				errs = append(errs, reportErr)
-				if closeErr := owner.binding.plan.Close(); closeErr != nil {
-					owner.stageReleased = true
-					unresolved = append(unresolved, owner)
+				updated, finishErr := finishRetainedTCRollbackOwner(owner, store)
+				if finishErr != nil {
+					unresolved = append(unresolved, updated)
 					errs = append(errs, fmt.Errorf(
-						"close retained TC plan after journal transfer: %w",
-						closeErr,
+						"finish retained TC plan after journal transfer: %w",
+						finishErr,
 					))
 				}
 				continue
@@ -258,11 +280,11 @@ func retryRetainedTCRollbackOwner(
 		switch progress {
 		case durableTCOwnerJournalProgressAdvanced:
 			owner.stage.Disarm()
-			if err := owner.binding.plan.Close(); err != nil {
-				owner.stageReleased = true
-				unresolved = append(unresolved, owner)
+			updated, err := finishRetainedTCRollbackOwner(owner, store)
+			if err != nil {
+				unresolved = append(unresolved, updated)
 				errs = append(errs, fmt.Errorf(
-					"close retained TC plan after durable owner advanced during rebind: %w",
+					"finish retained TC plan after durable owner advanced during rebind: %w",
 					err,
 				))
 			}
@@ -283,6 +305,14 @@ func retryRetainedTCRollbackOwner(
 				fmt.Errorf("retry retained TC rollback owner: %w", err),
 			))
 			continue
+		}
+		updated, finishErr := finishRetainedTCRollbackOwner(owner, store)
+		if finishErr != nil {
+			unresolved = append(unresolved, updated)
+			errs = append(errs, fmt.Errorf(
+				"finish retained TC plan after successful local rollback: %w",
+				finishErr,
+			))
 		}
 		errs = append(errs, fmt.Errorf(
 			"retry retained TC journal transfer before successful local rollback: %w",

@@ -456,6 +456,9 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 	defer store.Close()
+	if err := store.cleanupPriorBootTCHandoffWitnesses(bootID); err != nil {
+		return fmt.Errorf("cleanup prior-boot TC handoff witnesses: %w", err)
+	}
 	if err := retryRetainedTCRollbackOwner(
 		parent.resource.key,
 		handle,
@@ -1011,6 +1014,16 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 		return fmt.Errorf("open persistent BPF pin owner: %w", err)
 	}
 	defer store.Close()
+	if runtime.bootID == nil {
+		return errors.New("pin owner boot ID runtime is unavailable")
+	}
+	bootID, err := runtime.bootID()
+	if err != nil {
+		return err
+	}
+	if err := store.cleanupPriorBootTCHandoffWitnesses(bootID); err != nil {
+		return fmt.Errorf("cleanup prior-boot TC handoff witnesses: %w", err)
+	}
 	if err := retryRetainedTCRollbackOwner(
 		parent.resource.key,
 		handle,
@@ -1047,13 +1060,6 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 		return errors.New(
 			"BPF pins have no persistent owner record; refusing state/name-based detach",
 		)
-	}
-	if runtime.bootID == nil {
-		return errors.New("pin owner boot ID runtime is unavailable")
-	}
-	bootID, err := runtime.bootID()
-	if err != nil {
-		return err
 	}
 	if record.BootID != bootID {
 		return fmt.Errorf(
@@ -1300,6 +1306,15 @@ func retryRetainedTCRollbackWithFreshOwner(
 		return err
 	}
 	defer store.Close()
+	if runtime.bootID != nil {
+		bootID, bootErr := runtime.bootID()
+		if bootErr != nil {
+			return bootErr
+		}
+		if err := store.cleanupPriorBootTCHandoffWitnesses(bootID); err != nil {
+			return fmt.Errorf("cleanup prior-boot TC handoff witnesses: %w", err)
+		}
+	}
 	return retryRetainedTCRollbackOwner(parent.resource.key, handle, store)
 }
 
@@ -1311,7 +1326,8 @@ func retryRetainedTCRollbackWithoutPinDirectory(
 	runtime pinPathRuntime,
 	resource pinResourceIdentity,
 ) (returnErr error) {
-	if !hasRetainedTCRollbackOwner(resource.key) {
+	hasRetained := hasRetainedTCRollbackOwner(resource.key)
+	if !hasRetained && runtime.bootID == nil {
 		return nil
 	}
 	store, err := openPinOwnerStoreWithPolicy(
@@ -1320,10 +1336,25 @@ func retryRetainedTCRollbackWithoutPinDirectory(
 		false,
 		false,
 	)
+	if errors.Is(err, unix.ENOENT) && !hasRetained {
+		return nil
+	}
 	if err != nil {
 		return fmt.Errorf("open TC handoff completion witness store: %w", err)
 	}
 	defer func() { returnErr = errors.Join(returnErr, store.Close()) }()
+	if runtime.bootID != nil {
+		bootID, bootErr := runtime.bootID()
+		if bootErr != nil {
+			return bootErr
+		}
+		if err := store.cleanupPriorBootTCHandoffWitnesses(bootID); err != nil {
+			return fmt.Errorf("cleanup prior-boot TC handoff witnesses: %w", err)
+		}
+	}
+	if !hasRetained {
+		return nil
+	}
 	return retryRetainedTCRollbackOwner(resource.key, nil, store)
 }
 

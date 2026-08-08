@@ -115,6 +115,7 @@ type pinOwnerDescriptorOps struct {
 	syncFile func(*os.File) error
 	rename   func(*anchoredDirectoryPath, string, string, uint) error
 	syncDir  func(*anchoredDirectoryPath) error
+	unlink   func(*anchoredDirectoryPath, string, int, pinPathInodeIdentity, uint32) error
 }
 
 func livePinOwnerDescriptorOps() pinOwnerDescriptorOps {
@@ -136,6 +137,7 @@ func livePinOwnerDescriptorOps() pinOwnerDescriptorOps {
 		syncDir: func(root *anchoredDirectoryPath) error {
 			return unix.Fsync(root.FD())
 		},
+		unlink: unlinkAnchoredRegularFile,
 	}
 }
 

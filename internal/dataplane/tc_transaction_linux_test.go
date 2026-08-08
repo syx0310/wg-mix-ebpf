@@ -2365,6 +2365,21 @@ func TestCompletedTCHandoffWitnessRetainsPlanUntilCloseRetry(t *testing.T) {
 	if closeReport != nil || retainErr != nil {
 		t.Fatalf("retain completion-witness stage close=%v error=%v", closeReport, retainErr)
 	}
+	witnessSource, witnessDigest, err := tcHandoffWitnessSourceFromMutating(
+		fixture.owner.intent,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	witnessName, _, _, err := tcHandoffWitnessNames(
+		witnessSource.ResourceKey,
+		witnessSource.BootID,
+		witnessDigest,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	witnessPath := filepath.Join(fixture.owner.handle.runtime.ownerRoot, witnessName)
 	now := time.Date(2026, 8, 8, 3, 3, 0, 0, time.UTC)
 	fixture.owner.handle.runtime.now = func() time.Time { return now }
 	fixture.owner.store.now = func() time.Time { return now }
@@ -2410,6 +2425,9 @@ func TestCompletedTCHandoffWitnessRetainsPlanUntilCloseRetry(t *testing.T) {
 	if len(fixture.kernel.writes) != writesBefore {
 		t.Fatalf("plan close retry mutated TC: %v", fixture.kernel.writes[writesBefore:])
 	}
+	if _, err := os.Lstat(witnessPath); err != nil {
+		t.Fatalf("failed plan close released witness holder early: %v", err)
+	}
 	if err := retryRetainedTCRollbackOwner(
 		resourceKey,
 		fixture.owner.handle,
@@ -2428,6 +2446,9 @@ func TestCompletedTCHandoffWitnessRetainsPlanUntilCloseRetry(t *testing.T) {
 	}
 	if len(fixture.kernel.writes) != writesBefore {
 		t.Fatalf("second plan close retry mutated TC: %v", fixture.kernel.writes[writesBefore:])
+	}
+	if _, err := os.Lstat(witnessPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("successful plan close retained final witness holder: %v", err)
 	}
 	fixture.owner.assertProgramObservationsBalanced(t)
 }

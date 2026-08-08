@@ -59,6 +59,7 @@ type durableTCOwnerJournalBinding struct {
 	sequence     uint64
 	coverage     [sha256.Size]byte
 	sourceDigest [sha256.Size]byte
+	holderID     string
 }
 
 type durableTCOwnerJournalProgress uint8
@@ -430,10 +431,27 @@ func (handoff *durableTCOwnerJournalHandoff) exportRetryBinding(
 		sequence:    handoff.sequence,
 		coverage:    handoff.coverage,
 	}
-	sourceDigest, witnessErr := handoff.store.persistPendingTCHandoffWitness(
-		handoff.intent,
-	)
+	_, sourceDigest, witnessErr := tcHandoffWitnessSourceFromMutating(handoff.intent)
 	binding.sourceDigest = sourceDigest
+	if witnessErr == nil {
+		holderID, holderErr := newTCHandoffWitnessHolderID()
+		if holderErr != nil {
+			witnessErr = holderErr
+		} else {
+			binding.holderID = holderID
+			persistedDigest, persistErr := handoff.store.persistPendingTCHandoffWitness(
+				handoff.intent,
+				holderID,
+			)
+			if persistedDigest != sourceDigest {
+				persistErr = errors.Join(
+					persistErr,
+					errors.New("persisted TC handoff source digest changed"),
+				)
+			}
+			witnessErr = persistErr
+		}
+	}
 	closeReport := handoff.releaseProgramsLocked(
 		durableTCOwnerJournalHandoffExported,
 	)
@@ -540,6 +558,7 @@ func classifyDurableTCOwnerJournalProgress(
 	completed, witnessErr := store.loadCompletedTCHandoffWitness(
 		binding.intent,
 		binding.sourceDigest,
+		binding.holderID,
 	)
 	if completed && witnessErr == nil {
 		return durableTCOwnerJournalProgressAdvanced, nil
