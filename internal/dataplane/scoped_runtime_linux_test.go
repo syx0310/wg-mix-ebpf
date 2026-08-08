@@ -191,6 +191,27 @@ func TestScopedRealNICContextIsolationContract(t *testing.T) {
 	if got := standaloneLoader.pinRuntime(t.Context()); got.lockRoot != config.LockRoot || got.ownerRoot != config.OwnerRoot {
 		t.Fatalf("standalone integration did not honor explicit roots: %+v", got)
 	}
+
+	realNICRoot := filepath.Join(root, "scoped-realnic-original")
+	realNICCommon := scopedRealNICCommon{
+		RunID: scopedRealNICRunID, Cell: "original", Root: realNICRoot,
+		StateRoot: filepath.Join(realNICRoot, "state"), LeaseRoot: filepath.Join(realNICRoot, "lease"),
+		OwnerRoot: filepath.Join(realNICRoot, "owners"), EvidenceRoot: filepath.Join(realNICRoot, "evidence"),
+		PinPath: "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-original",
+	}
+	if err := validateScopedRealNICLayout(realNICCommon); err != nil {
+		t.Fatalf("real-NIC scoped layout contract: %v", err)
+	}
+	realNICLockRoot := filepath.Join(realNICCommon.LeaseRoot, "pin-locks")
+	realNICRuntime, err := newScopedLinuxLoaderRuntime(realNICLockRoot, realNICCommon.OwnerRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotRealNICRuntime := (LinuxLoader{runtime: realNICRuntime}).pinRuntime(t.Context())
+	if gotRealNICRuntime.lockRoot != realNICLockRoot || gotRealNICRuntime.ownerRoot != realNICCommon.OwnerRoot ||
+		gotRealNICRuntime.lockRoot == pinPathLockRoot || gotRealNICRuntime.ownerRoot == pinOwnerRoot {
+		t.Fatalf("real-NIC integration runtime escaped scoped roots: %+v", gotRealNICRuntime)
+	}
 }
 
 func setScopedBPFFSContractEnv(t *testing.T, config scopedBPFFSIntegrationConfig) {
@@ -269,6 +290,12 @@ func runScopedBPFFSIntegration(t *testing.T, config scopedBPFFSIntegrationConfig
 	if config.Action == "restore" {
 		restoreScopedBPFFSIntegration(t, config)
 		return
+	}
+	if err := validateNoSymlinkDirectoryChain(filepath.Dir(config.RuntimeRoot)); err != nil {
+		t.Fatal(err)
+	}
+	if err := validatePrivateOwnedDirectory(filepath.Dir(config.RuntimeRoot), 0); err != nil {
+		t.Fatalf("validate scoped bpffs runtime parent: %v", err)
 	}
 	objectIdentity, err := snapshotScopedFile(config.ObjectPath, 0)
 	if err != nil {
@@ -402,6 +429,9 @@ func runScopedBPFFSIntegration(t *testing.T, config scopedBPFFSIntegrationConfig
 
 func restoreScopedBPFFSIntegration(t *testing.T, config scopedBPFFSIntegrationConfig) {
 	t.Helper()
+	if err := validateNoSymlinkDirectoryChain(config.RuntimeRoot); err != nil {
+		t.Fatal(err)
+	}
 	for _, path := range []string{config.RuntimeRoot, config.LockRoot, config.OwnerRoot} {
 		if err := validatePrivateOwnedDirectory(path, uint32(os.Geteuid())); err != nil {
 			t.Fatal(err)
@@ -794,6 +824,15 @@ func snapshotScopedFile(path string, expectedUID uint32) (scopedFileIdentity, er
 	if !ok || !sameScopedFileStat(openedStat, afterStat) {
 		return scopedFileIdentity{}, fmt.Errorf("scoped artifact %s changed while hashing", path)
 	}
+	afterPath, err := os.Lstat(path)
+	if err != nil {
+		return scopedFileIdentity{}, fmt.Errorf("reinspect scoped artifact %s: %w", path, err)
+	}
+	afterPathStat, ok := afterPath.Sys().(*syscall.Stat_t)
+	if !ok || !afterPath.Mode().IsRegular() || afterPath.Mode()&os.ModeSymlink != 0 ||
+		!sameScopedFileStat(openedStat, afterPathStat) {
+		return scopedFileIdentity{}, fmt.Errorf("scoped artifact %s pathname identity changed while hashing", path)
+	}
 	return scopedFileIdentity{
 		Path: path, Device: uint64(openedStat.Dev), Inode: openedStat.Ino, Mode: openedStat.Mode,
 		UID: openedStat.Uid, GID: openedStat.Gid, NLink: openedStat.Nlink,
@@ -843,21 +882,59 @@ func writeJSONExclusive(path string, value any) error {
 }
 
 func readJSONFile(path string, destination any) error {
-	info, err := os.Lstat(path)
+	before, err := os.Lstat(path)
 	if err != nil {
 		return fmt.Errorf("inspect journal %s: %w", path, err)
 	}
-	if !info.Mode().IsRegular() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 {
-		return fmt.Errorf("journal %s has unsafe type or mode %s", path, info.Mode())
+	if !before.Mode().IsRegular() || before.Mode()&os.ModeSymlink != 0 || before.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("journal %s has unsafe type or mode %s", path, before.Mode())
 	}
-	data, err := os.ReadFile(path)
+	file, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("open journal %s: %w", path, err)
+	}
+	defer file.Close()
+	opened, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("stat opened journal %s: %w", path, err)
+	}
+	beforeStat, beforeOK := before.Sys().(*syscall.Stat_t)
+	openedStat, openedOK := opened.Sys().(*syscall.Stat_t)
+	if !beforeOK || !openedOK || !sameScopedFileStat(beforeStat, openedStat) || openedStat.Nlink != 1 {
+		return fmt.Errorf("journal %s pathname and opened identity differ", path)
+	}
+	data, err := io.ReadAll(file)
 	if err != nil {
 		return fmt.Errorf("read journal %s: %w", path, err)
+	}
+	after, err := file.Stat()
+	if err != nil {
+		return fmt.Errorf("restat journal %s: %w", path, err)
+	}
+	afterStat, ok := after.Sys().(*syscall.Stat_t)
+	if !ok || !sameScopedFileStat(openedStat, afterStat) {
+		return fmt.Errorf("journal %s changed while reading", path)
+	}
+	afterPath, err := os.Lstat(path)
+	if err != nil {
+		return fmt.Errorf("reinspect journal %s: %w", path, err)
+	}
+	afterPathStat, ok := afterPath.Sys().(*syscall.Stat_t)
+	if !ok || !afterPath.Mode().IsRegular() || afterPath.Mode()&os.ModeSymlink != 0 ||
+		!sameScopedFileStat(openedStat, afterPathStat) {
+		return fmt.Errorf("journal %s pathname identity changed while reading", path)
 	}
 	decoder := json.NewDecoder(strings.NewReader(string(data)))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(destination); err != nil {
 		return fmt.Errorf("decode journal %s: %w", path, err)
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("decode journal %s: trailing JSON value", path)
+		}
+		return fmt.Errorf("decode journal %s trailing data: %w", path, err)
 	}
 	return nil
 }
