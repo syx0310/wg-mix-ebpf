@@ -65,7 +65,7 @@ Matrix
 The reviewed run contains:
 
 1. Exact host, namespace, link, TC, BPF program/map/link, module, NIC feature,
-   MTU, and safe WireGuard snapshots.
+   MTU, and safe snapshots of the single reviewed WireGuard interface.
 2. Standalone TCX lifecycle on the run-owned veth and run-owned runtime roots.
 3. FakeTCP verifier, packet probe, lifecycle, XOR/typeword/header composition,
    and baseline mutual-exclusion tests on the run-owned veth.
@@ -89,10 +89,11 @@ Timeout arithmetic is enforced by `test_matrix_static.py`:
 WireGuard confidentiality
 -------------------------
 
-The matrix never invokes `wg show all dump`, `private-key`, or
-`preshared-key`. Its snapshot is limited to public-key, listen-port, fwmark,
-peers, endpoints, allowed-ips, latest-handshakes, and transfer. Static gates
-reject secret-bearing WireGuard commands.
+The matrix never invokes `wg show all` for any selector and never requests
+`dump`, `private-key`, or `preshared-key`. Every snapshot names the exact
+`FINAL_WG_INTERFACE` and is limited to public-key, listen-port, fwmark, peers,
+endpoints, allowed-ips, latest-handshakes, and transfer. Static gates reject
+all-interface and secret-bearing WireGuard commands.
 
 Write set and failure policy
 ----------------------------

@@ -168,8 +168,27 @@ def main() -> None:
         fail("retired host appears in v6 scripts")
     if re.search(r"/usr/bin/wg[^\n]*(?:\bdump\b|private-key|preshared-key)", matrix):
         fail("matrix reads a WireGuard secret-bearing field")
-    if "show all dump" in matrix or "show all private-key" in matrix:
-        fail("matrix contains a WireGuard secret-bearing snapshot")
+    all_interface_wg = re.compile(r"/usr/bin/wg\s+show\s+all(?:\s|$)")
+    if not all_interface_wg.search("/usr/bin/wg show all peers"):
+        fail("internal all-interface WireGuard detector fixture did not match")
+    if all_interface_wg.search(matrix):
+        fail("matrix reads WireGuard state outside the exact reviewed interface")
+    wg_show_targets = re.findall(r"/usr/bin/wg\s+show\s+([^\s;\\]+)", matrix)
+    if not wg_show_targets or set(wg_show_targets) != {'"${WG_INTERFACE}"'}:
+        fail("every WireGuard snapshot must name the exact reviewed interface")
+    for selector in (
+        "public-key",
+        "listen-port",
+        "fwmark",
+        "peers",
+        "endpoints",
+        "allowed-ips",
+        "latest-handshakes",
+        "transfer",
+    ):
+        literal = f'/usr/bin/wg show "${{WG_INTERFACE}}" {selector}'
+        if literal not in matrix:
+            fail(f"matrix exact-interface WireGuard selector is missing: {selector}")
     for production_root in ("/run/wg-mix-ebpf/daemon.lease", "/var/lib/wg-mix-ebpf"):
         if production_root in matrix + checker:
             fail(f"production lifecycle root appears in scoped test scripts: {production_root}")

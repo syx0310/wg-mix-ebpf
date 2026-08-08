@@ -178,7 +178,7 @@ plan_command() {
 }
 
 render_plan() {
-  local streams direction cell
+  local streams direction cell selector
   printf 'REALHOST_V6_PLAN_ONLY run_id=%s package_id=%s evidence_id=%s commit=%s bundle_sha256=%s\n' \
     "${RUN_ID}" "${PACKAGE_ID}" "${EVIDENCE_ID}" "${COMMIT}" "${BUNDLE_SHA256}"
   printf 'REALHOST_V6_PLAN_ENDPOINTS bare=%s:%s active_wg=%s:%s->%s:%s\n' \
@@ -188,6 +188,9 @@ render_plan() {
   plan_command A2 /usr/bin/uname -r
   plan_command A3 /usr/bin/cat /etc/machine-id
   plan_command A4 /usr/sbin/ip -j address show dev "${INTERFACE}"
+  for selector in public-key listen-port fwmark peers endpoints allowed-ips latest-handshakes transfer; do
+    plan_command "A16-wg-${selector}" /usr/bin/wg show "${WG_INTERFACE}" "${selector}"
+  done
   plan_command N0 /usr/bin/go -C "${SOURCE}" test ./internal/dataplane \
     -run '^TestBPFFSPinLifecycleIntegration$' -count=1
   plan_command N1 /usr/sbin/ip link add "${VETH_A}" type veth peer name "${VETH_B}"
@@ -452,14 +455,14 @@ snapshot_host() {
   run_step A13 bpf-links /usr/sbin/bpftool -j link show; require_zero A13
   run_step A14 bpf-programs /usr/sbin/bpftool -j prog show; require_zero A14
   run_step A15 bpf-maps /usr/sbin/bpftool -j map show; require_zero A15
-  run_step A16.wg-public-keys wireguard /usr/bin/wg show all public-key; require_zero A16.wg-public-keys
-  run_step A16.wg-listen-ports wireguard /usr/bin/wg show all listen-port; require_zero A16.wg-listen-ports
-  run_step A16.wg-fwmarks wireguard /usr/bin/wg show all fwmark; require_zero A16.wg-fwmarks
-  run_step A16.wg-peers wireguard /usr/bin/wg show all peers; require_zero A16.wg-peers
-  run_step A16.wg-endpoints wireguard /usr/bin/wg show all endpoints; require_zero A16.wg-endpoints
-  run_step A16.wg-allowed-ips wireguard /usr/bin/wg show all allowed-ips; require_zero A16.wg-allowed-ips
-  run_step A16.wg-handshakes wireguard /usr/bin/wg show all latest-handshakes; require_zero A16.wg-handshakes
-  run_step A16.wg-transfer wireguard /usr/bin/wg show all transfer; require_zero A16.wg-transfer
+  run_step A16.wg-public-keys wireguard /usr/bin/wg show "${WG_INTERFACE}" public-key; require_zero A16.wg-public-keys
+  run_step A16.wg-listen-ports wireguard /usr/bin/wg show "${WG_INTERFACE}" listen-port; require_zero A16.wg-listen-ports
+  run_step A16.wg-fwmarks wireguard /usr/bin/wg show "${WG_INTERFACE}" fwmark; require_zero A16.wg-fwmarks
+  run_step A16.wg-peers wireguard /usr/bin/wg show "${WG_INTERFACE}" peers; require_zero A16.wg-peers
+  run_step A16.wg-endpoints wireguard /usr/bin/wg show "${WG_INTERFACE}" endpoints; require_zero A16.wg-endpoints
+  run_step A16.wg-allowed-ips wireguard /usr/bin/wg show "${WG_INTERFACE}" allowed-ips; require_zero A16.wg-allowed-ips
+  run_step A16.wg-handshakes wireguard /usr/bin/wg show "${WG_INTERFACE}" latest-handshakes; require_zero A16.wg-handshakes
+  run_step A16.wg-transfer wireguard /usr/bin/wg show "${WG_INTERFACE}" transfer; require_zero A16.wg-transfer
   run_step A17 nftables /usr/sbin/nft -j list ruleset; require_zero A17
   run_step A18 modules /usr/sbin/lsmod; require_zero A18
   run_step A19 wg-interface /usr/sbin/ip -d -j link show dev "${WG_INTERFACE}"; require_zero A19

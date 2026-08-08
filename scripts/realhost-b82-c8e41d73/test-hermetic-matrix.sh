@@ -41,6 +41,12 @@ plan_output="$(${MATRIX} plan \
 
 [[ "${plan_output}" == *'REALHOST_V6_PLAN_ONLY run_id=c8e41d73'* ]] || fail 'plan header missing'
 [[ "${plan_output}" == *'WG_MIX_EBPF_RUN_BPFFS_INTEGRATION=1'* ]] || fail 'exact TCX plan missing'
+for selector in public-key listen-port fwmark peers endpoints allowed-ips latest-handshakes transfer; do
+  [[ "${plan_output}" == *"/usr/bin/wg show wg0 ${selector}"* ]] ||
+    fail "exact-interface WireGuard plan missing selector: ${selector}"
+done
+[[ "${plan_output}" != *'/usr/bin/wg show all '* ]] ||
+  fail 'all-interface WireGuard plan was rendered'
 [[ "${plan_output}" == *'TestExperimentalFakeTCPRealHostLifecycleIntegration'* ]] || fail 'FakeTCP runtime plan missing'
 [[ "${plan_output}" == *'TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration'* ]] || fail 'composition plan missing'
 [[ "${plan_output}" == *'TestBaselineExperimentalRealHostMutualExclusionIntegration'* ]] || fail 'mutual exclusion plan missing'
