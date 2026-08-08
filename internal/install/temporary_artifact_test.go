@@ -741,6 +741,7 @@ func openObjectBoundGenerationTestParent(
 }
 
 func TestInstallRetryDoesNotOverwriteRetainedManifestStageEvidence(t *testing.T) {
+	creationMode := forceExclusiveNamedObjectBoundStages(t)
 	layout := cleanupTestPaths(t.TempDir(), "object-bound-retry")
 	setCleanupTestEnvironment(t, layout)
 	lifecycleRoot := t.TempDir()
@@ -769,6 +770,9 @@ func TestInstallRetryDoesNotOverwriteRetainedManifestStageEvidence(t *testing.T)
 	}
 	if !failedOnce {
 		t.Fatal("manifest publication hook did not run")
+	}
+	if *creationMode != 0o600 {
+		t.Fatalf("exclusive manifest stage creation mode = %#o, want 0600", *creationMode)
 	}
 	if _, err := os.Lstat(cleanupManifestPath(layout)); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("failed publication created ownership manifest: %v", err)
