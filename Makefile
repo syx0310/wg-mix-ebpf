@@ -9,12 +9,22 @@ CLANG ?= clang
 BPF_MULTIARCH ?= $(shell gcc -print-multiarch 2>/dev/null)
 BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/include/$(BPF_MULTIARCH),)
 BPF_OBJECT ?= build/wg_mix_tc.o
+FAKETCP_EXPERIMENTAL_BPF_OBJECT ?= build/wg_mix_faketcp_experimental.o
+FAKETCP_CHECKSUM_KMOD_SOURCE ?= $(CURDIR)/kernel/faketcp_checksum
+FAKETCP_CHECKSUM_KMOD_OUTPUT ?= $(CURDIR)/build/faketcp_checksum_kmod
+FAKETCP_CHECKSUM_KMOD_OBJECT ?= $(FAKETCP_CHECKSUM_KMOD_OUTPUT)/wg_mix_faketcp_checksum.ko
+KERNEL_RELEASE ?= $(shell uname -r)
+KERNEL_BUILD ?= /lib/modules/$(KERNEL_RELEASE)/build
+FAKETCP_VERIFIER_LAUNCHER_AMD64 ?= bin/faketcp-verifier-launcher-linux-amd64
+FAKETCP_VERIFIER_LAUNCHER_ARM64 ?= bin/faketcp-verifier-launcher-linux-arm64
+FAKETCP_VERIFIER_LAUNCHER_TEST_AMD64 ?= build/verifierlauncher-linux-amd64.test
+FAKETCP_VERIFIER_LAUNCHER_TEST_ARM64 ?= build/verifierlauncher-linux-arm64.test
 EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 override BUILD_SOURCE_COMMIT := $(shell ./scripts/source-commit.sh)
 override BUILD_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/buildinfo.sourceCommit=$(BUILD_SOURCE_COMMIT)
 override NETNS_ANCHOR_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/netnsanchor.sourceCommit=$(BUILD_SOURCE_COMMIT)
 
-.PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-smoke-script-helper test-stage-source-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns-tcp-pmtu-positive test-netns-tcp-pmtu-ipv4 test-netns-tcp-pmtu-ipv6 test-netns-tcp-outer-gso-observe test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-netns-anchor build-linux-amd64 build-linux-arm64 build-live-guard-test build-bpf prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-lint test-live-guard-build-provenance test-faketcp-verifier-only test-faketcp-verifier-launcher test-bpf-object-manifests test-bpf-object-manifest-path-contract _test-bpf-object-manifests test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-smoke-script-helper test-stage-source-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns-tcp-pmtu-positive test-netns-tcp-pmtu-ipv4 test-netns-tcp-pmtu-ipv6 test-netns-tcp-outer-gso-observe test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-netns-anchor build-linux-amd64 build-linux-arm64 build-faketcp-verifier-launcher build-faketcp-verifier-launcher-linux-amd64 build-faketcp-verifier-launcher-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf build-faketcp-checksum-kmod prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=$(CGO_ENABLED) $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -27,6 +37,18 @@ build-linux-amd64: prepare-embedded-bpf
 
 build-linux-arm64: prepare-embedded-bpf
 	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o bin/wg-mix-ebpf-linux-arm64 ./cmd/wg-mix-ebpf
+
+# These standalone launchers only become trusted after the root phase verifies
+# the selected root-owned artifact and its approved SHA-256 before execution.
+build-faketcp-verifier-launcher: build-faketcp-verifier-launcher-linux-amd64 build-faketcp-verifier-launcher-linux-arm64
+
+build-faketcp-verifier-launcher-linux-amd64:
+	@mkdir -p $(dir $(FAKETCP_VERIFIER_LAUNCHER_AMD64))
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) build -trimpath -mod=readonly -buildvcs=false -o $(FAKETCP_VERIFIER_LAUNCHER_AMD64) ./cmd/faketcp-verifier-launcher
+
+build-faketcp-verifier-launcher-linux-arm64:
+	@mkdir -p $(dir $(FAKETCP_VERIFIER_LAUNCHER_ARM64))
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -mod=readonly -buildvcs=false -o $(FAKETCP_VERIFIER_LAUNCHER_ARM64) ./cmd/faketcp-verifier-launcher
 
 # This convenience target is unprivileged. The fixed-tool and immutable
 # candidate-snapshot checks in the invoked script define the artifact gate;
@@ -42,9 +64,82 @@ test-live-guard-build-provenance:
 	scripts/test-build-live-guard-provenance.sh \
 		"$(CURDIR)/scripts/build-live-guard-test.sh"
 
+test-faketcp-verifier-launcher:
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=$(CGO_ENABLED) $(GO) test -count=1 ./internal/verifierlauncher ./cmd/faketcp-verifier-launcher
+	@mkdir -p $(dir $(FAKETCP_VERIFIER_LAUNCHER_TEST_AMD64)) $(dir $(FAKETCP_VERIFIER_LAUNCHER_TEST_ARM64))
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) test -c -o $(FAKETCP_VERIFIER_LAUNCHER_TEST_AMD64) ./internal/verifierlauncher
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) test -c -o $(FAKETCP_VERIFIER_LAUNCHER_TEST_ARM64) ./internal/verifierlauncher
+
+test-faketcp-verifier-only: test-faketcp-verifier-launcher
+	scripts/test-faketcp-verifier-only.sh \
+		"$(CURDIR)/scripts/run-faketcp-verifier-only.py"
+
 build-bpf:
 	@mkdir -p $(dir $(BPF_OBJECT))
 	$(CLANG) $(BPF_CFLAGS) -c bpf/wg_mix_tc.c -o $(BPF_OBJECT)
+
+# The Mimic-style FakeTCP wire path is a separate, deliberately unembedded
+# experiment. The ordinary loader only accepts the baseline object above.
+build-faketcp-experimental-bpf:
+	@mkdir -p $(dir $(FAKETCP_EXPERIMENTAL_BPF_OBJECT))
+	$(CLANG) $(BPF_CFLAGS) -DWG_MIX_EXPERIMENTAL_FAKETCP=1 \
+		-c bpf/wg_mix_tc.c -o $(FAKETCP_EXPERIMENTAL_BPF_OBJECT)
+
+# This target only builds an out-of-tree module into build/. Installation,
+# loading, unloading and cleanup require a separately reviewed real-host step.
+build-faketcp-checksum-kmod:
+	@test -d "$(KERNEL_BUILD)" || { echo "kernel build tree not found: $(KERNEL_BUILD)"; exit 2; }
+	@mkdir -p "$(FAKETCP_CHECKSUM_KMOD_OUTPUT)"
+	$(MAKE) -C "$(KERNEL_BUILD)" \
+		M="$(FAKETCP_CHECKSUM_KMOD_SOURCE)" \
+		MO="$(FAKETCP_CHECKSUM_KMOD_OUTPUT)" modules
+	@test -f "$(FAKETCP_CHECKSUM_KMOD_OBJECT)" || \
+		{ echo "expected module was not built: $(FAKETCP_CHECKSUM_KMOD_OBJECT)"; exit 2; }
+
+define run_bpf_object_manifest_test
+	@baseline_object="$(BPF_OBJECT)"; \
+	experimental_object="$(FAKETCP_EXPERIMENTAL_BPF_OBJECT)"; \
+	case "$$baseline_object" in \
+		/*) ;; \
+		*) baseline_object="$(CURDIR)/$$baseline_object" ;; \
+	esac; \
+	case "$$experimental_object" in \
+		/*) ;; \
+		*) experimental_object="$(CURDIR)/$$experimental_object" ;; \
+	esac; \
+	WG_MIX_BASELINE_MANIFEST_OBJECT="$$baseline_object" \
+	WG_MIX_FAKETCP_MANIFEST_OBJECT="$$experimental_object" \
+	WG_MIX_MANIFEST_CONTRACT_EXPECT_BASELINE="$(MANIFEST_CONTRACT_EXPECT_BASELINE)" \
+	WG_MIX_MANIFEST_CONTRACT_EXPECT_EXPERIMENTAL="$(MANIFEST_CONTRACT_EXPECT_EXPERIMENTAL)" \
+	WG_MIX_MANIFEST_CONTRACT_EXPECT_CWD="$(MANIFEST_CONTRACT_EXPECT_CWD)" \
+	CGO_ENABLED=0 "$(GO)" test ./internal/dataplane \
+		-run '^TestBuiltBPFObjectManifests$$' -count=1
+endef
+
+test-bpf-object-manifests: build-bpf build-faketcp-experimental-bpf
+	$(run_bpf_object_manifest_test)
+
+# This internal entry point deliberately has no BPF build prerequisites. The
+# path-contract test substitutes a capture helper for Go, so it runs on hosts
+# without Linux headers or a BPF-capable clang.
+_test-bpf-object-manifests:
+	$(run_bpf_object_manifest_test)
+
+test-bpf-object-manifest-path-contract:
+	@$(MAKE) --no-print-directory -C "$(CURDIR)" _test-bpf-object-manifests \
+		BPF_OBJECT="manifest contract/relative baseline object.o" \
+		FAKETCP_EXPERIMENTAL_BPF_OBJECT="manifest contract/relative experimental object.o" \
+		MANIFEST_CONTRACT_EXPECT_BASELINE="$(CURDIR)/manifest contract/relative baseline object.o" \
+		MANIFEST_CONTRACT_EXPECT_EXPERIMENTAL="$(CURDIR)/manifest contract/relative experimental object.o" \
+		MANIFEST_CONTRACT_EXPECT_CWD="$(CURDIR)" \
+		GO="$(CURDIR)/scripts/test-bpf-object-manifest-path-contract.sh"
+	@$(MAKE) --no-print-directory -C "$(CURDIR)" _test-bpf-object-manifests \
+		BPF_OBJECT="$(CURDIR)/manifest contract/absolute baseline object.o" \
+		FAKETCP_EXPERIMENTAL_BPF_OBJECT="$(CURDIR)/manifest contract/absolute experimental object.o" \
+		MANIFEST_CONTRACT_EXPECT_BASELINE="$(CURDIR)/manifest contract/absolute baseline object.o" \
+		MANIFEST_CONTRACT_EXPECT_EXPERIMENTAL="$(CURDIR)/manifest contract/absolute experimental object.o" \
+		MANIFEST_CONTRACT_EXPECT_CWD="$(CURDIR)" \
+		GO="$(CURDIR)/scripts/test-bpf-object-manifest-path-contract.sh"
 
 prepare-embedded-bpf: build-bpf
 	@mkdir -p $(dir $(EMBEDDED_BPF_OBJECT))
@@ -87,7 +182,7 @@ test-netns-tcp-pmtu-positive: test-netns-tcp-pmtu-ipv4 test-netns-tcp-pmtu-ipv6
 test-netns-tcp-outer-gso-observe: build build-netns-anchor
 	TCP_CHECKS=enforce TCP_INNER_GSO_CHECKS=report TCP_OUTER_GSO_CHECKS=observe TCP_MTUS="1420" TCP_STREAMS="16" TCP_DIRECTIONS="bidir" TCP_DURATION=30 $(WG_NETNS_SMOKE_LAUNCHER)
 
-test-unit: test-pcap-helper test-smoke-script-helper test-stage-source-helper
+test-unit: test-pcap-helper test-smoke-script-helper test-stage-source-helper test-bpf-object-manifest-path-contract
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./...
 
 test-unit-race:
@@ -98,8 +193,10 @@ test-lint:
 	@test -z "$$($(GOFMT) -l $$(find cmd internal -name '*.go' -type f))" || \
 		{ echo "gofmt required for:"; $(GOFMT) -l $$(find cmd internal -name '*.go' -type f); exit 1; }
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) vet ./...
-	sh -n scripts/source-commit.sh
-	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/run-smoke-netns-wg-private-mountns.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh
+	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet ./internal/verifierlauncher ./cmd/faketcp-verifier-launcher
+	sh -n scripts/source-commit.sh scripts/test-bpf-object-manifest-path-contract.sh
+	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/run-smoke-netns-wg-private-mountns.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh scripts/test-faketcp-verifier-only.sh
+	/usr/bin/python3 -I -c 'from pathlib import Path; [compile(Path(p).read_text(), p, "exec") for p in ("scripts/run-faketcp-verifier-only.py", "scripts/test_faketcp_verifier_only.py")]'
 	scripts/inspect-linux-test-host.sh --self-test-nft-table-gate
 	scripts/provision-ubuntu-test-host.sh --self-test-apt-gate
 	scripts/build-live-guard-test.sh --self-test-safety-gate
@@ -109,6 +206,7 @@ test-lint:
 		echo "skip: provenance TMPDIR gate self-test requires fixed env and python3"; \
 	fi
 	scripts/test-live-guard-ownership.sh --self-test-safety-gate
+	$(MAKE) --no-print-directory test-faketcp-verifier-only
 	@if test "$$(/usr/bin/uname -s)" = Linux && \
 		test "$$(/usr/bin/id -u)" != 0 && \
 		test -x /usr/bin/go && test -x /usr/bin/timeout && \
@@ -120,7 +218,7 @@ test-lint:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet -tags realhosttest ./internal/guard
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet ./internal/netnsanchor ./cmd/wg-mix-ebpf-netns-anchor
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-smoke-netns-wg-private-mountns.sh scripts/smoke-netns-wg.sh scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh; \
+		shellcheck scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-smoke-netns-wg-private-mountns.sh scripts/smoke-netns-wg.sh scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh scripts/test-faketcp-verifier-only.sh; \
 	else \
 		echo "skip: shellcheck is unavailable"; \
 	fi

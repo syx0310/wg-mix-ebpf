@@ -32,6 +32,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends clang llvm gcc linux-libc-dev libbpf-dev
 
+      - name: Compile and validate baseline and FakeTCP BPF manifests
+        run: make test-bpf-object-manifests
+
       - name: Unit tests
         run: make test-unit
 

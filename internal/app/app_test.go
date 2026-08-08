@@ -2,6 +2,7 @@ package app
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -19,6 +20,176 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/install"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
+
+func TestBPFLoadTestDefaultsToBaselineLoaderAndOutput(t *testing.T) {
+	var baselineCalls, experimentalCalls int
+	identity := dataplane.ObjectIdentity{
+		Source:   "embedded:wg_mix_tc.o",
+		SHA256:   strings.Repeat("a", 64),
+		Embedded: true,
+	}
+	baseline := func(_ context.Context, objectPath string) (dataplane.ObjectIdentity, error) {
+		baselineCalls++
+		if objectPath != "" {
+			t.Fatalf("default object path = %q, want empty embedded-object selector", objectPath)
+		}
+		return identity, nil
+	}
+	experimental := func(context.Context, string) (dataplane.ObjectIdentity, error) {
+		experimentalCalls++
+		return dataplane.ObjectIdentity{}, errors.New("experimental loader must not run")
+	}
+
+	var stdout bytes.Buffer
+	if err := runBPFLoadTestWithLoaders(
+		t.Context(), nil, &stdout, baseline, experimental,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if baselineCalls != 1 || experimentalCalls != 0 {
+		t.Fatalf("loader calls baseline=%d experimental=%d", baselineCalls, experimentalCalls)
+	}
+	want := "BPF object loaded successfully: " + identity.Source + " (sha256=" + identity.SHA256 + ")\n"
+	if got := stdout.String(); got != want {
+		t.Fatalf("default text output = %q, want %q", got, want)
+	}
+
+	stdout.Reset()
+	if err := runBPFLoadTestWithLoaders(
+		t.Context(), []string{"--json"}, &stdout, baseline, experimental,
+	); err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]json.RawMessage
+	if err := json.Unmarshal(stdout.Bytes(), &document); err != nil {
+		t.Fatalf("decode default JSON: %v\n%s", err, stdout.String())
+	}
+	if _, found := document["kind"]; found {
+		t.Fatalf("default baseline JSON unexpectedly changed kind contract: %s", stdout.String())
+	}
+	if baselineCalls != 2 || experimentalCalls != 0 {
+		t.Fatalf("loader calls after JSON baseline=%d experimental=%d", baselineCalls, experimentalCalls)
+	}
+}
+
+func TestBPFLoadTestExperimentalFlagRequiresExplicitObject(t *testing.T) {
+	loaderCalls := 0
+	loader := func(context.Context, string) (dataplane.ObjectIdentity, error) {
+		loaderCalls++
+		return dataplane.ObjectIdentity{}, errors.New("loader must not run")
+	}
+	for _, args := range [][]string{
+		{"--experimental-faketcp"},
+		{"--experimental-faketcp", "--object="},
+		{"--experimental-faketcp", "--object", "   "},
+	} {
+		var stdout bytes.Buffer
+		err := runBPFLoadTestWithLoaders(t.Context(), args, &stdout, loader, loader)
+		if err == nil || !strings.Contains(err.Error(), "requires an explicit non-empty --object path") {
+			t.Fatalf("args=%q error=%v", args, err)
+		}
+		if stdout.Len() != 0 {
+			t.Fatalf("args=%q produced output %q", args, stdout.String())
+		}
+	}
+	if loaderCalls != 0 {
+		t.Fatalf("missing-object contract invoked a loader %d times", loaderCalls)
+	}
+}
+
+func TestBPFLoadTestExperimentalDispatchAndIdentityOutput(t *testing.T) {
+	const objectPath = "/reviewed/wg_mix_faketcp_experimental.o"
+	identity := dataplane.ObjectIdentity{
+		Source: objectPath,
+		SHA256: strings.Repeat("b", 64),
+	}
+	baselineCalls := 0
+	baseline := func(context.Context, string) (dataplane.ObjectIdentity, error) {
+		baselineCalls++
+		return dataplane.ObjectIdentity{}, errors.New("baseline loader must not run")
+	}
+	experimentalCalls := 0
+	experimental := func(_ context.Context, gotPath string) (dataplane.ObjectIdentity, error) {
+		experimentalCalls++
+		if gotPath != objectPath {
+			t.Fatalf("experimental object path = %q, want %q", gotPath, objectPath)
+		}
+		return identity, nil
+	}
+
+	var textOut bytes.Buffer
+	err := runBPFLoadTestWithLoaders(
+		t.Context(),
+		[]string{"--experimental-faketcp", "--object", objectPath},
+		&textOut,
+		baseline,
+		experimental,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		"kind=" + dataplane.ExperimentalFakeTCPObjectKind,
+		"source=" + objectPath,
+		"sha256=" + identity.SHA256,
+	} {
+		if !strings.Contains(textOut.String(), want) {
+			t.Fatalf("experimental text output %q missing %q", textOut.String(), want)
+		}
+	}
+
+	var jsonOut bytes.Buffer
+	err = runBPFLoadTestWithLoaders(
+		t.Context(),
+		[]string{"--experimental-faketcp", "--object", objectPath, "--json"},
+		&jsonOut,
+		baseline,
+		experimental,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Status string                   `json:"status"`
+		Kind   string                   `json:"kind"`
+		Object dataplane.ObjectIdentity `json:"object"`
+	}
+	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
+		t.Fatalf("decode output: %v\n%s", err, jsonOut.String())
+	}
+	if got.Status != "loaded" || got.Kind != dataplane.ExperimentalFakeTCPObjectKind || got.Object != identity {
+		t.Fatalf("experimental JSON identity = %#v", got)
+	}
+	if baselineCalls != 0 || experimentalCalls != 2 {
+		t.Fatalf("loader calls baseline=%d experimental=%d", baselineCalls, experimentalCalls)
+	}
+}
+
+func TestBPFLoadTestExplicitObjectWithoutOptInRemainsBaseline(t *testing.T) {
+	const objectPath = "/candidate/object.o"
+	baselineCalls := 0
+	baseline := func(_ context.Context, gotPath string) (dataplane.ObjectIdentity, error) {
+		baselineCalls++
+		if gotPath != objectPath {
+			t.Fatalf("baseline object path = %q, want %q", gotPath, objectPath)
+		}
+		return dataplane.ObjectIdentity{Source: gotPath, SHA256: strings.Repeat("c", 64)}, nil
+	}
+	experimentalCalls := 0
+	experimental := func(context.Context, string) (dataplane.ObjectIdentity, error) {
+		experimentalCalls++
+		return dataplane.ObjectIdentity{}, errors.New("experimental loader must not run")
+	}
+	var stdout bytes.Buffer
+	if err := runBPFLoadTestWithLoaders(
+		t.Context(), []string{"--object", objectPath}, &stdout, baseline, experimental,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if baselineCalls != 1 || experimentalCalls != 0 {
+		t.Fatalf("loader calls baseline=%d experimental=%d", baselineCalls, experimentalCalls)
+	}
+}
 
 func TestVersionOutputIsBackwardCompatible(t *testing.T) {
 	var stdout, stderr bytes.Buffer

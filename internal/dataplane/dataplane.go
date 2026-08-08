@@ -9,15 +9,17 @@ import (
 )
 
 var ErrUnsupported = errors.New("dataplane is unsupported on this platform")
+var ErrFakeTCPKernelGate = errors.New("experimental faketcp kernel gate is not satisfied")
 var ErrPinOwnershipLifecycleLeaseRequired = errors.New(
 	"pin ownership mutation requires the held global lifecycle lease",
 )
 
 const (
-	DefaultObjectPath = "build/wg_mix_tc.o"
-	EnvObjectPath     = "WG_MIX_EBPF_OBJECT"
-	DefaultPinPath    = "/sys/fs/bpf/wg-mix-ebpf"
-	EnvPinPath        = "WG_MIX_EBPF_PIN_PATH"
+	DefaultObjectPath             = "build/wg_mix_tc.o"
+	EnvObjectPath                 = "WG_MIX_EBPF_OBJECT"
+	ExperimentalFakeTCPObjectKind = "experimental-faketcp"
+	DefaultPinPath                = "/sys/fs/bpf/wg-mix-ebpf"
+	EnvPinPath                    = "WG_MIX_EBPF_PIN_PATH"
 )
 
 type Loader interface {
