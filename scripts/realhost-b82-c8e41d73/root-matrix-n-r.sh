@@ -427,7 +427,7 @@ write_once() {
     fail "write-scope:${path}" 65
   [[ ! -e "${path}" && ! -L "${path}" ]] || fail "write-exists:${path}" 78
   step="write-$(/usr/bin/basename -- "${path}")"
-  rendered="$(quote_argv shell-builtin printf '%s\\n' "$@")>$(quote_argv "${path}")" ||
+  rendered="$(quote_argv shell-builtin printf '%s\n' "$@")>$(quote_argv "${path}")" ||
     fail "render-write:${path}"
   audit_line start "${step}" "${path}" not-run "${rendered}" || fail "audit-write-start:${path}"
   set -o noclobber
