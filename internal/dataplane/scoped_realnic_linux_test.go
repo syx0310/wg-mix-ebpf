@@ -147,6 +147,12 @@ type scopedWGTransfer struct {
 	Sent     uint64 `json:"sent"`
 }
 
+type scopedRestoredMarker struct {
+	Version  int    `json:"version"`
+	Cell     string `json:"cell"`
+	Restored bool   `json:"restored"`
+}
+
 func TestScopedRealNICDataplaneActiveIntegration(t *testing.T) {
 	if os.Getenv(scopedRealNICGateEnv) != "1" {
 		t.Skip("set WG_MIX_EBPF_RUN_SCOPED_REALNIC_INTEGRATION=1 for the reviewed physical-NIC integration")
@@ -607,9 +613,7 @@ func executeScopedRealNICActive(ctx context.Context, config scopedRealNICConfig)
 		if err := recheckScopedRealNICJournalLayout(journal); err != nil {
 			return fmt.Errorf("post-detach scoped layout identity: %w", err)
 		}
-		return writeJSONExclusive(filepath.Join(config.Common.StateRoot, "restored.v1.json"), map[string]any{
-			"version": 1, "cell": config.Common.Cell, "restored": true,
-		})
+		return writeScopedRestoredMarker(filepath.Join(config.Common.StateRoot, "restored.v1.json"), config.Common.Cell)
 	})
 }
 
@@ -670,11 +674,26 @@ func executeScopedRealNICRestore(ctx context.Context, config scopedRealNICConfig
 			status.IndexPath != filepath.Join(journal.Common.OwnerRoot, pinOwnerIndexFileName) {
 			return fmt.Errorf("restore owner identity escaped run-owned roots: %+v", status)
 		}
+		if status.RecoveryRequired {
+			status, inspectErr = inspectPinOwnershipWithRuntime(
+				lifecycleCtx, journal.Common.PinPath, true, *runtime, runtime.exactTCX,
+			)
+			if inspectErr != nil {
+				return fmt.Errorf("recover exact LinuxLoader owner before restore: %w", inspectErr)
+			}
+			if status.PinPath != journal.Common.PinPath || status.OwnerRoot != journal.Common.OwnerRoot ||
+				status.IndexPath != filepath.Join(journal.Common.OwnerRoot, pinOwnerIndexFileName) {
+				return fmt.Errorf("recovered owner identity escaped run-owned roots: %+v", status)
+			}
+		}
+		alreadyRestored := !status.DirectoryExists && !status.OwnerExists && !status.RecoveryRequired
 		var applied scopedAppliedJournal
 		appliedPath := scopedRealNICAppliedPath(journal.Common)
 		if err := readJSONFile(appliedPath, &applied); err == nil {
-			if err := recheckScopedAppliedJournal(journal.Common, applied, &journal.State, *runtime, lifecycleCtx); err != nil {
-				return err
+			if !alreadyRestored {
+				if err := recheckScopedAppliedLinks(journal.Common, applied, &journal.State, *runtime, lifecycleCtx); err != nil {
+					return err
+				}
 			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -688,9 +707,10 @@ func executeScopedRealNICRestore(ctx context.Context, config scopedRealNICConfig
 		if err := recheckScopedRealNICHost(lifecycleCtx, config.Common, journal.Host); err != nil {
 			return fmt.Errorf("post-restore host identity: %w", err)
 		}
-		return writeJSONExclusive(filepath.Join(journal.Common.StateRoot, "explicit-restore.v1.json"), map[string]any{
-			"version": 1, "cell": journal.Common.Cell, "restored": true,
-		})
+		return writeScopedRestoredMarker(
+			filepath.Join(journal.Common.StateRoot, "explicit-restore.v1.json"),
+			journal.Common.Cell,
+		)
 	})
 }
 
@@ -1042,6 +1062,31 @@ func recheckScopedAppliedJournal(
 	return nil
 }
 
+func recheckScopedAppliedLinks(
+	common scopedRealNICCommon,
+	want scopedAppliedJournal,
+	state *control.State,
+	runtime pinPathRuntime,
+	ctx context.Context,
+) error {
+	if want.Version != 1 || want.Common != common || len(want.Links) != 2 {
+		return errors.New("applied link journal does not match the requested run")
+	}
+	kernel, err := scopedInspect(ctx, state, common.PinPath, runtime)
+	if err != nil {
+		return err
+	}
+	if kernel == nil || kernel.MapError != "" || len(kernel.Underlays) != 1 || len(kernel.Underlays[0].Filters) != 2 {
+		return fmt.Errorf("current exact TCX link status is incomplete: %+v", kernel)
+	}
+	links := append([]FilterStatus(nil), kernel.Underlays[0].Filters...)
+	sort.Slice(links, func(left, right int) bool { return links[left].Direction < links[right].Direction })
+	if !reflect.DeepEqual(links, want.Links) {
+		return fmt.Errorf("current exact TCX links differ from applied journal: got %+v, want %+v", links, want.Links)
+	}
+	return nil
+}
+
 func captureScopedStatus(
 	ctx context.Context,
 	path string,
@@ -1136,7 +1181,9 @@ func validateScopedCounterGrowth(before, after *scopedStatusDocument) error {
 func scopedErrorCounterNames() []string {
 	return []string{
 		"egress_rule_miss", "egress_bad_type", "egress_bad_length", "egress_fragment", "egress_ipv6_ext",
-		"ingress_rule_miss", "ingress_bad_type", "ingress_bad_length", "ingress_fragment", "ingress_ipv6_ext",
+		// ingress_rule_miss is observation, not corruption: unrelated physical-NIC
+		// UDP can legitimately miss this run's managed listener.
+		"ingress_bad_type", "ingress_bad_length", "ingress_fragment", "ingress_ipv6_ext",
 		"checksum_error", "skb_load_error", "skb_store_error", "icmp_checksum_error",
 		"xor_key_missing", "xor_len_overflow", "xor_bad_type_after_decrypt", "xor_load_error", "xor_store_error",
 		"xor_csum_error", "ingress_bad_checksum", "egress_bad_checksum", "xor_egress_dispatch_error", "xor_ingress_dispatch_error",
@@ -1158,6 +1205,23 @@ func writeBytesExclusive(path string, data []byte) error {
 	}
 	if err := file.Close(); err != nil {
 		return fmt.Errorf("close evidence %s: %w", path, err)
+	}
+	return nil
+}
+
+func writeScopedRestoredMarker(path, cell string) error {
+	want := scopedRestoredMarker{Version: 1, Cell: cell, Restored: true}
+	if err := writeJSONExclusive(path, want); err == nil {
+		return nil
+	} else if !errors.Is(err, os.ErrExist) {
+		return err
+	}
+	var existing scopedRestoredMarker
+	if err := readJSONFile(path, &existing); err != nil {
+		return err
+	}
+	if existing != want {
+		return fmt.Errorf("existing restored marker %s does not match this run", path)
 	}
 	return nil
 }
