@@ -1180,9 +1180,9 @@ func validateScopedCounterGrowth(before, after *scopedStatusDocument) error {
 
 func scopedErrorCounterNames() []string {
 	return []string{
-		"egress_rule_miss", "egress_bad_type", "egress_bad_length", "egress_fragment", "egress_ipv6_ext",
-		// ingress_rule_miss is observation, not corruption: unrelated physical-NIC
-		// UDP can legitimately miss this run's managed listener.
+		// Rule misses are policy/observation counters, not hard dataplane errors.
+		// In particular, unrelated physical-NIC UDP can grow ingress_rule_miss.
+		"egress_bad_type", "egress_bad_length", "egress_fragment", "egress_ipv6_ext",
 		"ingress_bad_type", "ingress_bad_length", "ingress_fragment", "ingress_ipv6_ext",
 		"checksum_error", "skb_load_error", "skb_store_error", "icmp_checksum_error",
 		"xor_key_missing", "xor_len_overflow", "xor_bad_type_after_decrypt", "xor_load_error", "xor_store_error",
