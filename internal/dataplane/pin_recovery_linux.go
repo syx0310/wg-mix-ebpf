@@ -53,11 +53,12 @@ const (
 // retained across an Apply return. The next operation must bind it to freshly
 // opened owner resources before it can transfer a stage.
 type durableTCOwnerJournalBinding struct {
-	plan        *tcAttachPlan
-	intent      *pinOwnerRecord
-	resourceKey string
-	sequence    uint64
-	coverage    [sha256.Size]byte
+	plan         *tcAttachPlan
+	intent       *pinOwnerRecord
+	resourceKey  string
+	sequence     uint64
+	coverage     [sha256.Size]byte
+	sourceDigest [sha256.Size]byte
 }
 
 type durableTCOwnerJournalProgress uint8
@@ -429,10 +430,20 @@ func (handoff *durableTCOwnerJournalHandoff) exportRetryBinding(
 		sequence:    handoff.sequence,
 		coverage:    handoff.coverage,
 	}
+	sourceDigest, witnessErr := handoff.store.persistPendingTCHandoffWitness(
+		handoff.intent,
+	)
+	binding.sourceDigest = sourceDigest
 	closeReport := handoff.releaseProgramsLocked(
 		durableTCOwnerJournalHandoffExported,
 	)
-	return binding, closeReport, nil
+	if witnessErr != nil {
+		witnessErr = fmt.Errorf(
+			"persist pending TC handoff completion witness: %w",
+			witnessErr,
+		)
+	}
+	return binding, closeReport, witnessErr
 }
 
 func rebindDurableTCOwnerJournalHandoff(
@@ -481,36 +492,61 @@ func classifyDurableTCOwnerJournalProgress(
 	handle *pinPathHandle,
 	store *pinOwnerStore,
 ) (durableTCOwnerJournalProgress, error) {
-	if binding == nil || binding.intent == nil || handle == nil || store == nil {
+	if binding == nil || binding.intent == nil || store == nil {
 		return durableTCOwnerJournalProgressUnproven,
 			errors.New("TC owner journal progress proof is incomplete")
 	}
 	if binding.resourceKey == "" || binding.sequence == 0 ||
 		binding.intent.ResourceKey != binding.resourceKey ||
-		binding.intent.Sequence != binding.sequence || handle.mountID == 0 ||
-		handle.resource.key != binding.resourceKey ||
-		store.resource.key != binding.resourceKey {
+		binding.intent.Sequence != binding.sequence ||
+		store.resource.key != binding.resourceKey ||
+		store.resource.parentDevice != binding.intent.ParentDevice ||
+		store.resource.parentInode != binding.intent.ParentInode ||
+		store.resource.base != binding.intent.PinBaseName {
 		return durableTCOwnerJournalProgressUnproven,
 			errors.New("TC owner journal progress proof resource changed")
 	}
-	persisted, err := store.Load(handle.mountID)
-	if err != nil {
-		return durableTCOwnerJournalProgressUnproven,
-			fmt.Errorf("load TC owner journal progress proof: %w", err)
+	var ownerErr error
+	if handle != nil {
+		if handle.mountID == 0 || handle.resource.key != binding.resourceKey ||
+			handle.resource.parentDevice != binding.intent.ParentDevice ||
+			handle.resource.parentInode != binding.intent.ParentInode ||
+			handle.resource.base != binding.intent.PinBaseName {
+			return durableTCOwnerJournalProgressUnproven,
+				errors.New("TC owner journal progress proof handle changed")
+		}
+		persisted, err := store.Load(handle.mountID)
+		if err == nil {
+			if persisted.Sequence == binding.sequence &&
+				sameExpectedOwnerRecord(persisted, binding.intent) {
+				return durableTCOwnerJournalProgressExact, nil
+			}
+			if provesDurableTCOwnerJournalAdvanced(binding.intent, persisted) {
+				return durableTCOwnerJournalProgressAdvanced, nil
+			}
+			ownerErr = fmt.Errorf(
+				"TC owner journal sequence %d at %s/%s is neither exact sequence %d nor a directly proven forward descendant",
+				persisted.Sequence,
+				persisted.Phase,
+				persisted.Step,
+				binding.sequence,
+			)
+		} else {
+			ownerErr = fmt.Errorf("load TC owner journal progress proof: %w", err)
+		}
+	} else {
+		ownerErr = errors.New("TC owner journal path no longer exists")
 	}
-	if persisted.Sequence == binding.sequence &&
-		sameExpectedOwnerRecord(persisted, binding.intent) {
-		return durableTCOwnerJournalProgressExact, nil
-	}
-	if provesDurableTCOwnerJournalAdvanced(binding.intent, persisted) {
+	completed, witnessErr := store.loadCompletedTCHandoffWitness(
+		binding.intent,
+		binding.sourceDigest,
+	)
+	if completed && witnessErr == nil {
 		return durableTCOwnerJournalProgressAdvanced, nil
 	}
-	return durableTCOwnerJournalProgressUnproven, fmt.Errorf(
-		"TC owner journal sequence %d at %s/%s is neither exact sequence %d nor a proven forward descendant",
-		persisted.Sequence,
-		persisted.Phase,
-		persisted.Step,
-		binding.sequence,
+	return durableTCOwnerJournalProgressUnproven, errors.Join(
+		ownerErr,
+		fmt.Errorf("load exact TC handoff completion witness: %w", witnessErr),
 	)
 }
 
@@ -1264,6 +1300,12 @@ func recoverApplyingPinOwnerTransaction(
 			tcRuntime,
 		); err != nil {
 			return nil, err
+		}
+		if _, err := store.completePendingTCHandoffWitness(record); err != nil {
+			return nil, fmt.Errorf(
+				"complete durable TC handoff witness: %w",
+				err,
+			)
 		}
 		if err := removeOwnerProgramStages(handle, record); err != nil {
 			return nil, err

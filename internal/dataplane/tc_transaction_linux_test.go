@@ -1959,6 +1959,479 @@ func TestRetainedStageDoesNotRollbackAdvancedDurableOwner(t *testing.T) {
 	}
 }
 
+func TestRetainedStageCompletionWitnessSurvivesRealLoaderDetach(t *testing.T) {
+	fixture := newRetainedJournalHandoffFixture(t)
+	resourceKey := fixture.owner.intent.ResourceKey
+	t.Cleanup(func() {
+		retainedTCRollbackOwners.Lock()
+		delete(retainedTCRollbackOwners.byResource, resourceKey)
+		retainedTCRollbackOwners.Unlock()
+	})
+
+	journalErr := errors.New("injected first-process map validation failure")
+	fixture.owner.mapStore.loadErrors["control_map"] = journalErr
+	fixture.kernel.failWrite = len(fixture.kernel.writes) + 1
+	pinPath := fixture.owner.handle.pinPath
+	runtime := fixture.owner.handle.runtime
+	runtime.ownerApplyFailure = func() (*ownerApplyFailureBoundary, error) {
+		return &ownerApplyFailureBoundary{
+			plan:      fixture.plan,
+			handle:    fixture.owner.handle,
+			store:     fixture.owner.store,
+			record:    fixture.owner.intent,
+			handoff:   fixture.handoff,
+			stage:     fixture.stage,
+			tcRuntime: fixture.kernel.runtime(),
+			attachErr: fixture.attach,
+		}, nil
+	}
+	oldLoader := LinuxLoader{PinPath: pinPath, runtime: &runtime}
+	if err := oldLoader.Apply(context.Background(), nil); !errors.Is(err, journalErr) || !fixture.stage.hasLiveFilterOwnership() {
+		t.Fatalf("first-process Apply error=%v live=%t", err, fixture.stage.hasLiveFilterOwnership())
+	}
+
+	// Remove only the process-local registry entry while the fresh loader runs;
+	// this models a separate process, which can see the durable witness and
+	// owner journal but cannot see A's in-memory rollback stage.
+	retainedTCRollbackOwners.Lock()
+	externalOwner := retainedTCRollbackOwners.byResource[resourceKey]
+	delete(retainedTCRollbackOwners.byResource, resourceKey)
+	retainedTCRollbackOwners.Unlock()
+	if len(externalOwner) != 1 || externalOwner[0].stage != fixture.stage {
+		t.Fatalf("retained external-process fixture=%#v", externalOwner)
+	}
+
+	delete(fixture.owner.mapStore.loadErrors, "control_map")
+	fixture.kernel.failWrite = 0
+	runtime.ownerApplyFailure = nil
+	runtime.now = func() time.Time {
+		return time.Date(2026, 8, 8, 3, 1, 0, 0, time.UTC)
+	}
+	runtime.bootID = func() (string, error) {
+		return fixture.owner.intent.BootID, nil
+	}
+	runtime.pinProgram = func(programID uint32, path string) error {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		if _, err := file.WriteString("mock detached owner program"); err != nil {
+			return errors.Join(err, file.Close())
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+		fixture.owner.programIDs[filepath.Base(path)] = programID
+		return nil
+	}
+	previousTCRuntime := liveTCRuntime
+	liveTCRuntime = fixture.kernel.runtime()
+	t.Cleanup(func() { liveTCRuntime = previousTCRuntime })
+	freshLoader := LinuxLoader{PinPath: pinPath, runtime: &runtime}
+	if err := freshLoader.Detach(context.Background(), nil); err != nil {
+		t.Fatalf("fresh loader completed recovery plus detach: %v", err)
+	}
+	if _, err := os.Lstat(pinPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fresh loader did not complete exact pin-directory detach: %v", err)
+	}
+
+	retainedTCRollbackOwners.Lock()
+	retainedTCRollbackOwners.byResource[resourceKey] = externalOwner
+	retainedTCRollbackOwners.Unlock()
+
+	gateCalls := 0
+	runtime.ownerRetryOnly = func(action string) bool {
+		if action != "detach" {
+			return false
+		}
+		gateCalls++
+		return gateCalls == 1
+	}
+	writesBeforeRetry := len(fixture.kernel.writes)
+	if err := oldLoader.Detach(context.Background(), nil); err != nil {
+		t.Fatalf("old loader completion-witness retry: %v", err)
+	}
+	if len(fixture.kernel.writes) != writesBeforeRetry {
+		t.Fatalf(
+			"old loader attempted reverse TC rollback: writes=%v",
+			fixture.kernel.writes[writesBeforeRetry:],
+		)
+	}
+	if fixture.stage.hasLiveFilterOwnership() || !fixture.stage.done ||
+		fixture.plan.stage != nil || !fixture.plan.closed {
+		t.Fatalf(
+			"completion witness did not release old stage: live=%t done=%t plan-stage=%p closed=%t",
+			fixture.stage.hasLiveFilterOwnership(),
+			fixture.stage.done,
+			fixture.plan.stage,
+			fixture.plan.closed,
+		)
+	}
+
+	// ownerRetryOnly is deliberately one-shot. This second call must enter the
+	// normal LinuxLoader.Detach path and prove the already-detached resource is
+	// clean instead of returning from the process-local gate again.
+	if err := oldLoader.Detach(context.Background(), nil); err != nil {
+		t.Fatalf("second real loader Detach: %v", err)
+	}
+	if gateCalls != 2 {
+		t.Fatalf("normal detach continuation was not reached: gate calls=%d", gateCalls)
+	}
+	if len(fixture.kernel.writes) != writesBeforeRetry {
+		t.Fatalf("already-detached continuation mutated TC: %v", fixture.kernel.writes[writesBeforeRetry:])
+	}
+	fixture.owner.assertProgramObservationsBalanced(t)
+}
+
+func executeTestOwnerApplyContinuation(
+	parent *pinPathParent,
+	handle *pinPathHandle,
+	store *pinOwnerStore,
+	active *pinOwnerRecord,
+	kernel *fakeTCKernel,
+	programIDs map[string]uint32,
+	now time.Time,
+) (returnErr error) {
+	if parent == nil || handle == nil || store == nil || active == nil {
+		return errors.New("test owner Apply continuation is incomplete")
+	}
+	token, err := tokenFromOwnerRecord(active)
+	if err != nil {
+		return err
+	}
+	desired := slices.Clone(active.ActiveFilters)
+	desiredBase := uint32((active.ActiveGeneration+1)*20 + 1)
+	for index := range desired {
+		desired[index].ProgramID = desiredBase + uint32(index)
+		fd := int(desired[index].ProgramID) + 1000
+		kernel.addProgram(desired[index].ProgramID, fd)
+	}
+	applying, err := newApplyingPinOwnerRecord(
+		parent,
+		token,
+		active.BootID,
+		now,
+		active.ActiveGeneration,
+		active.ActiveGeneration+1,
+		active.Maps,
+		active.ActiveFilters,
+		desired,
+		active,
+	)
+	if err != nil {
+		return err
+	}
+	if err := store.Persist(applying, active, handle.mountID); err != nil {
+		return err
+	}
+	if err := stageOwnerPrograms(handle, applying); err != nil {
+		return err
+	}
+	for _, stage := range applying.ProgramStages {
+		programIDs[stage.FileName] = stage.ProgramID
+	}
+	mutating := advancePinOwnerRecord(
+		applying,
+		now.Add(time.Second),
+		pinOwnerPhaseApplying,
+		pinOwnerStepMutating,
+	)
+	observeOwnerMount(mutating, handle.mountID)
+	if err := store.Persist(mutating, applying, handle.mountID); err != nil {
+		return err
+	}
+	pins, err := inspectPinnedMapSet(handle, true)
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, closePinnedMapPins(pins)) }()
+	if err := validateOwnerPins(handle, mutating, pins, true); err != nil {
+		return err
+	}
+	programs, err := loadOwnerPrograms(handle, mutating)
+	if err != nil {
+		return err
+	}
+	defer func() { returnErr = errors.Join(returnErr, programs.Close()) }()
+	if err := rollForwardOwnerApplyFilters(
+		mutating.ActiveFilters,
+		mutating.DesiredFilters,
+		programs,
+		kernel.runtime(),
+	); err != nil {
+		return err
+	}
+	if err := commitOwnerControlGeneration(handle, mutating, pins); err != nil {
+		return err
+	}
+	cleanup := advancePinOwnerRecord(
+		mutating,
+		now.Add(2*time.Second),
+		pinOwnerPhaseApplying,
+		pinOwnerStepCleanup,
+	)
+	observeOwnerMount(cleanup, handle.mountID)
+	if err := store.Persist(cleanup, mutating, handle.mountID); err != nil {
+		return err
+	}
+	recovered, err := recoverApplyingPinOwnerTransaction(
+		handle,
+		store,
+		cleanup,
+		now.Add(3*time.Second),
+		kernel.runtime(),
+	)
+	if err != nil {
+		return err
+	}
+	if recovered == nil || recovered.record == nil ||
+		recovered.record.Phase != pinOwnerPhaseActive ||
+		recovered.record.ActiveGeneration != active.ActiveGeneration+1 {
+		return fmt.Errorf("test owner Apply continuation recovered %#v", recovered)
+	}
+	return nil
+}
+
+func TestRetainedStageCompletionWitnessSurvivesRealLoaderDeepApply(t *testing.T) {
+	fixture := newRetainedJournalHandoffFixture(t)
+	resourceKey := fixture.owner.intent.ResourceKey
+	t.Cleanup(func() {
+		retainedTCRollbackOwners.Lock()
+		delete(retainedTCRollbackOwners.byResource, resourceKey)
+		retainedTCRollbackOwners.Unlock()
+	})
+
+	journalErr := errors.New("injected first-process map validation failure")
+	fixture.owner.mapStore.loadErrors["control_map"] = journalErr
+	fixture.kernel.failWrite = len(fixture.kernel.writes) + 1
+	pinPath := fixture.owner.handle.pinPath
+	runtime := fixture.owner.handle.runtime
+	runtime.ownerApplyFailure = func() (*ownerApplyFailureBoundary, error) {
+		return &ownerApplyFailureBoundary{
+			plan:      fixture.plan,
+			handle:    fixture.owner.handle,
+			store:     fixture.owner.store,
+			record:    fixture.owner.intent,
+			handoff:   fixture.handoff,
+			stage:     fixture.stage,
+			tcRuntime: fixture.kernel.runtime(),
+			attachErr: fixture.attach,
+		}, nil
+	}
+	loader := LinuxLoader{PinPath: pinPath, runtime: &runtime}
+	if err := loader.Apply(context.Background(), nil); !errors.Is(err, journalErr) || !fixture.stage.hasLiveFilterOwnership() {
+		t.Fatalf("first-process Apply error=%v live=%t", err, fixture.stage.hasLiveFilterOwnership())
+	}
+
+	retainedTCRollbackOwners.Lock()
+	externalOwner := retainedTCRollbackOwners.byResource[resourceKey]
+	delete(retainedTCRollbackOwners.byResource, resourceKey)
+	retainedTCRollbackOwners.Unlock()
+	if len(externalOwner) != 1 || externalOwner[0].stage != fixture.stage {
+		t.Fatalf("retained external-process fixture=%#v", externalOwner)
+	}
+
+	delete(fixture.owner.mapStore.loadErrors, "control_map")
+	fixture.kernel.failWrite = 0
+	runtime.ownerApplyFailure = nil
+	runtime.now = func() time.Time {
+		return time.Date(2026, 8, 8, 3, 2, 0, 0, time.UTC)
+	}
+	runtime.bootID = func() (string, error) {
+		return fixture.owner.intent.BootID, nil
+	}
+	runtime.random = strings.NewReader(strings.Repeat("r", 64))
+	runtime.pinProgram = func(programID uint32, path string) error {
+		file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+		if err != nil {
+			return err
+		}
+		if _, err := file.WriteString("mock applied owner program"); err != nil {
+			return errors.Join(err, file.Close())
+		}
+		if err := file.Close(); err != nil {
+			return err
+		}
+		fixture.owner.programIDs[filepath.Base(path)] = programID
+		return nil
+	}
+	continuations := 0
+	runtime.ownerApplyContinuationForTest = func(
+		parent *pinPathParent,
+		handle *pinPathHandle,
+		store *pinOwnerStore,
+		active *pinOwnerRecord,
+	) error {
+		continuations++
+		return executeTestOwnerApplyContinuation(
+			parent,
+			handle,
+			store,
+			active,
+			fixture.kernel,
+			fixture.owner.programIDs,
+			runtime.now().Add(time.Duration(continuations)*10*time.Second),
+		)
+	}
+	previousTCRuntime := liveTCRuntime
+	liveTCRuntime = fixture.kernel.runtime()
+	t.Cleanup(func() { liveTCRuntime = previousTCRuntime })
+
+	// This is a fresh LinuxLoader.Apply call. The process-local owner has been
+	// hidden, so it must recover A's g->g+1 intent and then complete a distinct
+	// g+1->g+2 owner transaction through the normal post-recovery continuation.
+	if err := loader.Apply(context.Background(), nil); err != nil {
+		t.Fatalf("fresh loader deep Apply: %v", err)
+	}
+	if continuations != 1 {
+		t.Fatalf("fresh loader continuation calls=%d", continuations)
+	}
+	deepHandle, deepStore := openFreshOwnerTestResources(t, pinPath, runtime)
+	deep, err := deepStore.Load(deepHandle.mountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deep.ActiveGeneration != fixture.owner.intent.NextGeneration+1 {
+		t.Fatalf("fresh loader generation=%d", deep.ActiveGeneration)
+	}
+	if err := deepStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := deepHandle.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	retainedTCRollbackOwners.Lock()
+	retainedTCRollbackOwners.byResource[resourceKey] = externalOwner
+	retainedTCRollbackOwners.Unlock()
+	gateCalls := 0
+	runtime.ownerRetryOnly = func(action string) bool {
+		if action != "apply" {
+			return false
+		}
+		gateCalls++
+		return gateCalls == 1
+	}
+	writesBeforeRetry := len(fixture.kernel.writes)
+	if err := loader.Apply(context.Background(), nil); err != nil {
+		t.Fatalf("old loader deep-witness retry: %v", err)
+	}
+	if len(fixture.kernel.writes) != writesBeforeRetry {
+		t.Fatalf("old loader reversed deep TC state: %v", fixture.kernel.writes[writesBeforeRetry:])
+	}
+	if fixture.stage.hasLiveFilterOwnership() || !fixture.stage.done ||
+		fixture.plan.stage != nil || !fixture.plan.closed {
+		t.Fatal("deep completion witness did not release the exact old stage")
+	}
+
+	// ownerRetryOnly now returns false. A second real Apply must pass the gate,
+	// run the continuation, and commit one further generation.
+	if err := loader.Apply(context.Background(), nil); err != nil {
+		t.Fatalf("second real loader Apply: %v", err)
+	}
+	if gateCalls != 2 || continuations != 2 {
+		t.Fatalf("real Apply continuation gate=%d continuation=%d", gateCalls, continuations)
+	}
+	finalHandle, finalStore := openFreshOwnerTestResources(t, pinPath, runtime)
+	finalRecord, err := finalStore.Load(finalHandle.mountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if finalRecord.ActiveGeneration != fixture.owner.intent.NextGeneration+2 {
+		t.Fatalf("second real Apply generation=%d", finalRecord.ActiveGeneration)
+	}
+	if err := finalStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := finalHandle.Close(); err != nil {
+		t.Fatal(err)
+	}
+	fixture.owner.assertProgramObservationsBalanced(t)
+}
+
+func TestCompletedTCHandoffWitnessRetainsPlanUntilCloseRetry(t *testing.T) {
+	fixture := newRetainedJournalHandoffFixture(t)
+	resourceKey := fixture.owner.intent.ResourceKey
+	t.Cleanup(func() {
+		retainedTCRollbackOwners.Lock()
+		delete(retainedTCRollbackOwners.byResource, resourceKey)
+		retainedTCRollbackOwners.Unlock()
+	})
+	closeReport, retainErr := retainTCRollbackOwner(
+		resourceKey,
+		fixture.stage,
+		fixture.handoff,
+	)
+	if closeReport != nil || retainErr != nil {
+		t.Fatalf("retain completion-witness stage close=%v error=%v", closeReport, retainErr)
+	}
+	now := time.Date(2026, 8, 8, 3, 3, 0, 0, time.UTC)
+	fixture.owner.handle.runtime.now = func() time.Time { return now }
+	fixture.owner.store.now = func() time.Time { return now }
+	fixture.kernel.failWrite = 0
+	recovered, err := recoverPinOwnerTransaction(
+		fixture.owner.handle,
+		fixture.owner.store,
+		fixture.owner.intent,
+		fixture.kernel.runtime(),
+	)
+	if err != nil || recovered == nil || recovered.record == nil {
+		t.Fatalf("complete retained witness recovery=%#v error=%v", recovered, err)
+	}
+	_ = advanceTestOwnerOneMoreGeneration(t, fixture.owner, recovered.record)
+
+	wantClose := errors.New("injected completed-witness plan close failure")
+	var injected *fakeTCProgramRef
+	for _, program := range fixture.kernel.retained {
+		if !program.closed {
+			program.closeErrs = []error{wantClose, nil}
+			injected = program
+			break
+		}
+	}
+	if injected == nil {
+		t.Fatal("retained plan has no injectable program reference")
+	}
+	writesBefore := len(fixture.kernel.writes)
+	firstErr := retryRetainedTCRollbackOwner(
+		resourceKey,
+		fixture.owner.handle,
+		fixture.owner.store,
+	)
+	if !errors.Is(firstErr, wantClose) || !fixture.stage.done ||
+		fixture.plan.closed {
+		t.Fatalf(
+			"first completed-witness close retry error=%v done=%t closed=%t",
+			firstErr,
+			fixture.stage.done,
+			fixture.plan.closed,
+		)
+	}
+	if len(fixture.kernel.writes) != writesBefore {
+		t.Fatalf("plan close retry mutated TC: %v", fixture.kernel.writes[writesBefore:])
+	}
+	if err := retryRetainedTCRollbackOwner(
+		resourceKey,
+		fixture.owner.handle,
+		fixture.owner.store,
+	); err != nil {
+		t.Fatalf("second completed-witness close retry: %v", err)
+	}
+	if !fixture.plan.closed || hasRetainedTCRollbackOwner(resourceKey) ||
+		injected.closeCalls != 2 {
+		t.Fatalf(
+			"plan close did not converge: closed=%t retained=%t calls=%d",
+			fixture.plan.closed,
+			hasRetainedTCRollbackOwner(resourceKey),
+			injected.closeCalls,
+		)
+	}
+	if len(fixture.kernel.writes) != writesBefore {
+		t.Fatalf("second plan close retry mutated TC: %v", fixture.kernel.writes[writesBefore:])
+	}
+	fixture.owner.assertProgramObservationsBalanced(t)
+}
+
 func TestRetainedStageFailsClosedOnUnprovenStaleJournal(t *testing.T) {
 	fixture := newRetainedJournalHandoffFixture(t)
 	resourceKey := fixture.owner.intent.ResourceKey

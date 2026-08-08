@@ -88,6 +88,16 @@ type pinPathRuntime struct {
 	beforePinUnlink      func(string) error
 	ownerApplyFailure    func() (*ownerApplyFailureBoundary, error)
 	ownerRetryOnly       func(string) bool
+	// ownerApplyContinuationForTest is nil in the live runtime. It lets
+	// unprivileged Linux tests exercise the real loader gate, lock, durable
+	// recovery, and post-recovery continuation while supplying a fake-kernel
+	// owner transaction instead of loading BPF programs.
+	ownerApplyContinuationForTest func(
+		*pinPathParent,
+		*pinPathHandle,
+		*pinOwnerStore,
+		*pinOwnerRecord,
+	) error
 }
 
 type pinnedProgramObservation struct {
@@ -373,22 +383,27 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 	defer parent.Close()
-	spec, identity, err := loadCollectionSpec(l.ObjectPath)
-	if err != nil {
-		return err
-	}
-	source := identity.Source
-	if err := validateBaselineCollectionSpec(spec); err != nil {
-		return fmt.Errorf("validate BPF object %s: %w", source, err)
-	}
-	if err := validateAndSetPinnedMaps(spec); err != nil {
-		return fmt.Errorf("validate BPF object %s: %w", source, err)
-	}
-	if err := removeMemlockLimit(); err != nil {
-		return err
-	}
-	if err := preflightUnpinnedCollection(spec, source); err != nil {
-		return err
+	var spec *ebpf.CollectionSpec
+	var source string
+	if runtime.ownerApplyContinuationForTest == nil {
+		loadedSpec, identity, err := loadCollectionSpec(l.ObjectPath)
+		if err != nil {
+			return err
+		}
+		spec = loadedSpec
+		source = identity.Source
+		if err := validateBaselineCollectionSpec(spec); err != nil {
+			return fmt.Errorf("validate BPF object %s: %w", source, err)
+		}
+		if err := validateAndSetPinnedMaps(spec); err != nil {
+			return fmt.Errorf("validate BPF object %s: %w", source, err)
+		}
+		if err := removeMemlockLimit(); err != nil {
+			return err
+		}
+		if err := preflightUnpinnedCollection(spec, source); err != nil {
+			return err
+		}
 	}
 
 	lock, err := acquirePinPathLock(ctx, parent.resource, "apply", runtime)
@@ -613,6 +628,14 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		}
 	}
 	freshPins := !ownerExists && directoryState == canonicalPinsEmpty
+	if runtime.ownerApplyContinuationForTest != nil {
+		if freshPins || !ownerExists || ownerRecord == nil ||
+			ownerRecord.Phase != pinOwnerPhaseActive ||
+			ownerRecord.Step != pinOwnerStepReady {
+			return errors.New("owner Apply continuation requires an active durable owner")
+		}
+		return runtime.ownerApplyContinuationForTest(parent, handle, store, ownerRecord)
+	}
 
 	var preexistingPins []pinnedMapPin
 	if ownerExists || legacyAdoption {
@@ -967,10 +990,9 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 		return err
 	}
 	if handle == nil {
-		if err := retryRetainedTCRollbackOwner(
-			parent.resource.key,
-			nil,
-			nil,
+		if err := retryRetainedTCRollbackWithoutPinDirectory(
+			runtime,
+			parent.resource,
 		); err != nil {
 			return fmt.Errorf(
 				"resolve retained TC rollback before detaching missing %s: %w",
@@ -1267,7 +1289,10 @@ func retryRetainedTCRollbackWithFreshOwner(
 		return err
 	}
 	if handle == nil {
-		return retryRetainedTCRollbackOwner(parent.resource.key, nil, nil)
+		return retryRetainedTCRollbackWithoutPinDirectory(
+			runtime,
+			parent.resource,
+		)
 	}
 	defer handle.Close()
 	store, err := openPinOwnerStore(runtime, handle.resource, false)
@@ -1276,6 +1301,30 @@ func retryRetainedTCRollbackWithFreshOwner(
 	}
 	defer store.Close()
 	return retryRetainedTCRollbackOwner(parent.resource.key, handle, store)
+}
+
+// retryRetainedTCRollbackWithoutPinDirectory reopens only the FD-anchored
+// owner root. A completed detach can remove the bpffs child and owner
+// descriptor while leaving the exact per-transaction completion witness as
+// the sole durable proof that the old stage must be disarmed.
+func retryRetainedTCRollbackWithoutPinDirectory(
+	runtime pinPathRuntime,
+	resource pinResourceIdentity,
+) (returnErr error) {
+	if !hasRetainedTCRollbackOwner(resource.key) {
+		return nil
+	}
+	store, err := openPinOwnerStoreWithPolicy(
+		runtime,
+		resource,
+		false,
+		false,
+	)
+	if err != nil {
+		return fmt.Errorf("open TC handoff completion witness store: %w", err)
+	}
+	defer func() { returnErr = errors.Join(returnErr, store.Close()) }()
+	return retryRetainedTCRollbackOwner(resource.key, nil, store)
 }
 
 func acquirePinPathLock(

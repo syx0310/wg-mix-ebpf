@@ -139,6 +139,12 @@ var retainedTCRollbackOwners = struct {
 	byResource: make(map[string][]retainedTCRollbackOwner),
 }
 
+func hasRetainedTCRollbackOwner(resourceKey string) bool {
+	retainedTCRollbackOwners.Lock()
+	defer retainedTCRollbackOwners.Unlock()
+	return len(retainedTCRollbackOwners.byResource[resourceKey]) != 0
+}
+
 type retainedTCRollbackOwner struct {
 	stage         *tcAttachStage
 	binding       *durableTCOwnerJournalBinding
@@ -155,7 +161,7 @@ func retainTCRollbackOwner(
 		return nil, errors.New("cannot retain an empty TC rollback owner")
 	}
 	binding, closeReport, err := handoff.exportRetryBinding(stage)
-	if err != nil {
+	if binding == nil {
 		return closeReport, err
 	}
 	retainedTCRollbackOwners.Lock()
@@ -169,7 +175,7 @@ func retainTCRollbackOwner(
 		retainedTCRollbackOwners.byResource[resourceKey],
 		retainedTCRollbackOwner{stage: stage, binding: binding},
 	)
-	return closeReport, nil
+	return closeReport, err
 }
 
 func retryRetainedTCRollbackOwner(
