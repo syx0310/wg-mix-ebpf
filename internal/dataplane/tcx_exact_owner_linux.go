@@ -610,7 +610,11 @@ func observePinnedExactTCXAttachment(
 				"detached TCX pin has no exact journaled link ID",
 			))
 		}
-		if err := validateDetachedExactTCXIdentity(template, identity); err != nil {
+		// The caller already fenced identity.ProgramID to its explicit allowed
+		// old/new set. Validate the observed program just as the attached branch
+		// does so a crash after an exact CAS can retire either journaled version
+		// of the same detached link ID.
+		if err := validateDetachedExactTCXIdentity(observedBinding, identity); err != nil {
 			return closeOnError(err)
 		}
 		absent, err := exactTCXLinkAbsentFromOriginalSlot(template, runtime)

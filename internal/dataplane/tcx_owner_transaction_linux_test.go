@@ -33,6 +33,7 @@ type faultExactTCXOwnerStore struct {
 	persisted  int
 	persistErr error
 	attempts   []*pinOwnerRecord
+	expected   []*pinOwnerRecord
 }
 
 func (store *faultExactTCXOwnerStore) Persist(
@@ -42,6 +43,7 @@ func (store *faultExactTCXOwnerStore) Persist(
 ) error {
 	store.persisted++
 	store.attempts = append(store.attempts, clonePinOwnerRecord(record))
+	store.expected = append(store.expected, clonePinOwnerRecord(expected))
 	if store.persisted == store.failAt {
 		return store.persistErr
 	}
@@ -288,6 +290,68 @@ func establishCompletedRollbackReplacementExactTCX(
 		t.Fatal(err)
 	}
 	return recovered, active, target
+}
+
+func persistRollbackPredecessorMarkerExactTCX(
+	t *testing.T,
+	fixture *exactTCXOwnerTestFixture,
+	kernel *fakeExactTCXKernel,
+	activeIntent exactTCXBinding,
+	desiredProgramID uint32,
+	forwardBeforeAttach bool,
+	pinnedProgramID uint32,
+) (*pinOwnerRecord, exactTCXBinding, exactTCXBinding, string) {
+	t.Helper()
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+	owner, pinPath := stageTestExactTCXAtPath(
+		t, kernel, activeIntent, journal, fixture.handle.procPath(),
+	)
+	active := owner.binding
+	if err := owner.Release(); err != nil {
+		t.Fatal(err)
+	}
+	desired := active
+	desired.ProgramID = desiredProgramID
+	if forwardBeforeAttach {
+		desired.LinkID = 0
+		desired.ReplacesLinkID = active.LinkID
+	}
+	mutating := fixture.mutatingRecord(
+		t, []exactTCXBinding{active}, []exactTCXBinding{desired},
+	)
+	rollingBack := advancePinOwnerRecord(
+		mutating,
+		fixture.now.Add(2*time.Minute),
+		pinOwnerPhaseApplying,
+		pinOwnerStepRollingBack,
+	)
+	if err := fixture.store.Persist(rollingBack, mutating, fixture.handle.mountID); err != nil {
+		t.Fatal(err)
+	}
+	slot := fakeExactTCXSlot{
+		ifindex: active.IfIndex,
+		attach:  ebpf.AttachType(active.AttachType),
+	}
+	state := kernel.links[active.LinkID]
+	state.attached = false
+	state.identity.IfIndex = 0
+	state.identity.ProgramID = pinnedProgramID
+	kernel.revs[slot] = kernel.revision(slot) + 1
+	marker, err := ownerRecordReplacingRollbackActive(
+		rollingBack, active, fixture.handle, fixture.store,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if marker.ActiveLinks[0].LinkID != 0 ||
+		marker.ActiveLinks[0].ReplacesLinkID != active.LinkID ||
+		kernel.pins[pinPath] != active.LinkID {
+		t.Fatalf(
+			"rollback predecessor marker/pin: marker=%+v pins=%+v",
+			marker.ActiveLinks, kernel.pins,
+		)
+	}
+	return marker, active, desired, pinPath
 }
 
 func TestConvergeOwnerExactTCXPublishesAttachIdentity(t *testing.T) {
@@ -980,6 +1044,305 @@ func TestRollbackExactOwnerApplyCompletedReplacementForeignPinFailsClosed(t *tes
 	}
 }
 
+func TestRollbackExactOwnerApplyCompletedReplacementPredecessorReappearsFailsClosed(t *testing.T) {
+	fixture := newExactTCXOwnerTestFixture(t)
+	kernel := newFakeExactTCXKernel()
+	kernel.materializePins = true
+	current, original, target := establishCompletedRollbackReplacementExactTCX(
+		t, fixture, kernel,
+		testExactTCXBinding(46, exactTCXIngress, 661),
+		662,
+	)
+	replacement := current.ActiveLinks[0]
+	kernel.links[original.LinkID].attached = true
+	kernel.links[original.LinkID].identity.IfIndex = original.IfIndex
+	kernel.links[original.LinkID].identity.ProgramID = original.ProgramID
+	beforeEvents := len(kernel.events)
+	faults := &faultExactTCXOwnerStore{
+		base:       fixture.store,
+		failAt:     1,
+		persistErr: errors.New("reappeared predecessor attempted to persist"),
+	}
+	_, err := rollbackFailedExactOwnerApplyLinks(
+		t.Context(), fixture.handle, current,
+		fakeLoadedOwnerPrograms(original.ProgramID, target.ProgramID),
+		faults, kernel.runtime(),
+	)
+	if err == nil || !strings.Contains(err.Error(), "predecessor exact TCX link") {
+		t.Fatalf("reappeared predecessor error=%v", err)
+	}
+	if faults.persisted != 0 {
+		t.Fatalf("reappeared predecessor persisted %d records", faults.persisted)
+	}
+	if mutations := exactTCXMutationEvents(kernel.events[beforeEvents:]); len(mutations) != 0 {
+		t.Fatalf("reappeared predecessor caused TCX mutation: %v", mutations)
+	}
+	if !kernel.links[original.LinkID].attached ||
+		!kernel.links[replacement.LinkID].attached ||
+		kernel.links[target.LinkID].attached {
+		t.Fatalf("reappeared predecessor fail-closed state changed: %+v", kernel.links)
+	}
+}
+
+func TestRollbackExactOwnerApplyRetiresPersistedPredecessorCrashMatrix(t *testing.T) {
+	tests := []struct {
+		name                 string
+		forwardBeforeAttach  bool
+		pinHasDesiredProgram bool
+	}{
+		{name: "forward-before-attach", forwardBeforeAttach: true},
+		{name: "same-link-CAS-before-update"},
+		{name: "same-link-CAS-after-update", pinHasDesiredProgram: true},
+		{name: "marker-persist-before-unpin", forwardBeforeAttach: true},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExactTCXOwnerTestFixture(t)
+			kernel := newFakeExactTCXKernel()
+			kernel.materializePins = true
+			activeIntent := testExactTCXBinding(
+				50+index, exactTCXIngress, uint32(701+index*2),
+			)
+			desiredProgramID := activeIntent.ProgramID + 1
+			pinnedProgramID := activeIntent.ProgramID
+			if test.pinHasDesiredProgram {
+				pinnedProgramID = desiredProgramID
+			}
+			marker, original, desired, pinPath := persistRollbackPredecessorMarkerExactTCX(
+				t, fixture, kernel, activeIntent, desiredProgramID,
+				test.forwardBeforeAttach, pinnedProgramID,
+			)
+			persisted, err := fixture.store.Load(fixture.handle.mountID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if persisted.Sequence != marker.Sequence ||
+				persisted.ActiveLinks[0] != marker.ActiveLinks[0] ||
+				kernel.pins[pinPath] != original.LinkID ||
+				kernel.links[original.LinkID].attached {
+				t.Fatalf(
+					"predecessor boundary was not durable before unpin: persisted=%+v pins=%+v links=%+v",
+					persisted, kernel.pins, kernel.links,
+				)
+			}
+			foreignID := kernel.addLink(
+				original.IfIndex, ebpf.AttachType(original.AttachType), 999,
+			)
+			beforeEvents := len(kernel.events)
+			recovered, err := rollbackFailedExactOwnerApplyLinks(
+				t.Context(), fixture.handle, persisted,
+				fakeLoadedOwnerPrograms(original.ProgramID, desired.ProgramID),
+				fixture.store, kernel.runtime(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			replacement := recovered.ActiveLinks[0]
+			mutations := exactTCXMutationEvents(kernel.events[beforeEvents:])
+			if len(mutations) < 3 ||
+				mutations[0] != fmt.Sprintf("unpin:%d", original.LinkID) ||
+				mutations[1] != "attach" || mutations[2] != "pin" {
+				t.Fatalf("predecessor retirement/replace mutation order=%v", mutations)
+			}
+			if replacement.LinkID == 0 || replacement.LinkID == original.LinkID ||
+				replacement.ReplacesLinkID != original.LinkID ||
+				replacement.ProgramID != original.ProgramID ||
+				kernel.pins[pinPath] != replacement.LinkID ||
+				!kernel.links[replacement.LinkID].attached ||
+				kernel.links[replacement.LinkID].identity.ProgramID != original.ProgramID ||
+				kernel.links[original.LinkID].attached || !kernel.links[foreignID].attached {
+				t.Fatalf(
+					"predecessor crash recovery: replacement=%+v pins=%+v links=%+v",
+					replacement, kernel.pins, kernel.links,
+				)
+			}
+
+			beforeEvents = len(kernel.events)
+			persistTrap := errors.New("idempotent predecessor restart persisted")
+			faults := &faultExactTCXOwnerStore{
+				base: fixture.store, failAt: 1, persistErr: persistTrap,
+			}
+			idempotent, err := rollbackFailedExactOwnerApplyLinks(
+				t.Context(), fixture.handle, recovered,
+				fakeLoadedOwnerPrograms(original.ProgramID, desired.ProgramID),
+				faults, kernel.runtime(),
+			)
+			if err != nil {
+				t.Fatalf("idempotent predecessor restart: %v", err)
+			}
+			if faults.persisted != 0 ||
+				len(exactTCXMutationEvents(kernel.events[beforeEvents:])) != 0 ||
+				idempotent.ActiveLinks[0] != replacement ||
+				!kernel.links[foreignID].attached {
+				t.Fatalf(
+					"idempotent predecessor restart changed state: persists=%d record=%+v events=%v links=%+v",
+					faults.persisted, idempotent,
+					kernel.events[beforeEvents:], kernel.links,
+				)
+			}
+		})
+	}
+}
+
+func TestRollbackExactOwnerApplyPredecessorForeignIdentityFailsClosed(t *testing.T) {
+	tests := []struct {
+		name      string
+		wantError string
+		mutate    func(*fakeExactTCXKernel, exactTCXBinding, string) uint32
+	}{
+		{
+			name:      "foreign-pin-path",
+			wantError: "owner journal requires",
+			mutate: func(kernel *fakeExactTCXKernel, active exactTCXBinding, pinPath string) uint32 {
+				foreignID := kernel.addLink(
+					active.IfIndex, ebpf.AttachType(active.AttachType), active.ProgramID,
+				)
+				kernel.links[active.LinkID].pins--
+				kernel.links[foreignID].pins++
+				kernel.pins[pinPath] = foreignID
+				return foreignID
+			},
+		},
+		{
+			name:      "attached-predecessor",
+			wantError: "is still attached",
+			mutate: func(kernel *fakeExactTCXKernel, active exactTCXBinding, _ string) uint32 {
+				kernel.links[active.LinkID].attached = true
+				kernel.links[active.LinkID].identity.IfIndex = active.IfIndex
+				return active.LinkID
+			},
+		},
+		{
+			name:      "foreign-program",
+			wantError: "outside the owner journal old/new set",
+			mutate: func(kernel *fakeExactTCXKernel, active exactTCXBinding, _ string) uint32 {
+				kernel.links[active.LinkID].identity.ProgramID = 999
+				return active.LinkID
+			},
+		},
+		{
+			name:      "foreign-slot-identity",
+			wantError: "target changed",
+			mutate: func(kernel *fakeExactTCXKernel, active exactTCXBinding, _ string) uint32 {
+				kernel.links[active.LinkID].attached = true
+				kernel.links[active.LinkID].identity.IfIndex = active.IfIndex + 100
+				return active.LinkID
+			},
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExactTCXOwnerTestFixture(t)
+			kernel := newFakeExactTCXKernel()
+			kernel.materializePins = true
+			marker, original, desired, pinPath := persistRollbackPredecessorMarkerExactTCX(
+				t, fixture, kernel,
+				testExactTCXBinding(60+index, exactTCXEgress, uint32(801+index*2)),
+				uint32(802+index*2), false, uint32(801+index*2),
+			)
+			pinnedID := test.mutate(kernel, original, pinPath)
+			beforeEvents := len(kernel.events)
+			faults := &faultExactTCXOwnerStore{
+				base:       fixture.store,
+				failAt:     1,
+				persistErr: errors.New("foreign predecessor attempted to persist"),
+			}
+			_, err := rollbackFailedExactOwnerApplyLinks(
+				t.Context(), fixture.handle, marker,
+				fakeLoadedOwnerPrograms(original.ProgramID, desired.ProgramID),
+				faults, kernel.runtime(),
+			)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("foreign predecessor error=%v, want %q", err, test.wantError)
+			}
+			if faults.persisted != 0 {
+				t.Fatalf("foreign predecessor persisted %d records", faults.persisted)
+			}
+			if mutations := exactTCXMutationEvents(kernel.events[beforeEvents:]); len(mutations) != 0 {
+				t.Fatalf("foreign predecessor mutated TCX state: %v", mutations)
+			}
+			if kernel.pins[pinPath] != pinnedID ||
+				(test.name == "foreign-pin-path" && !kernel.links[pinnedID].attached) {
+				t.Fatalf("foreign predecessor pin state changed: pins=%+v links=%+v", kernel.pins, kernel.links)
+			}
+		})
+	}
+}
+
+func TestRecoverExactOwnerRejectsMalformedRollingBackBeforeSideEffects(t *testing.T) {
+	tests := []struct {
+		name      string
+		wantError string
+		mutate    func(*pinOwnerRecord)
+	}{
+		{
+			name:      "stable-different-link-without-lineage",
+			wantError: "without replacement lineage",
+			mutate: func(record *pinOwnerRecord) {
+				record.DesiredLinks[0].LinkID += 1000
+			},
+		},
+		{
+			name:      "rollback-replacement-retiring",
+			wantError: "cannot be retiring",
+			mutate: func(record *pinOwnerRecord) {
+				oldLinkID := record.ActiveLinks[0].LinkID
+				record.ActiveLinks[0].LinkID = oldLinkID + 1000
+				record.ActiveLinks[0].ReplacesLinkID = oldLinkID
+				record.ActiveLinks[0].Retiring = true
+			},
+		},
+	}
+	for index, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newExactTCXOwnerTestFixture(t)
+			kernel := newFakeExactTCXKernel()
+			kernel.materializePins = true
+			journal := &fakeExactTCXJournal{events: &kernel.events}
+			owner, _ := stageTestExactTCXAtPath(
+				t, kernel,
+				testExactTCXBinding(80+index, exactTCXIngress, uint32(901+index*2)),
+				journal,
+				fixture.handle.procPath(),
+			)
+			active := owner.binding
+			if err := owner.Release(); err != nil {
+				t.Fatal(err)
+			}
+			desired := active
+			desired.ProgramID++
+			mutating := fixture.mutatingRecord(
+				t, []exactTCXBinding{active}, []exactTCXBinding{desired},
+			)
+			malformed := advancePinOwnerRecord(
+				mutating,
+				fixture.now.Add(2*time.Minute),
+				pinOwnerPhaseApplying,
+				pinOwnerStepRollingBack,
+			)
+			test.mutate(malformed)
+			beforeEvents := len(kernel.events)
+			faults := &faultExactTCXOwnerStore{
+				base:       fixture.store,
+				failAt:     1,
+				persistErr: errors.New("malformed journal attempted to persist"),
+			}
+			_, err := recoverExactPinOwnerTransaction(
+				t.Context(), fixture.handle, faults, malformed, kernel.runtime(),
+			)
+			if err == nil || !strings.Contains(err.Error(), test.wantError) {
+				t.Fatalf("malformed rollback error=%v, want %q", err, test.wantError)
+			}
+			if faults.persisted != 0 || len(kernel.events) != beforeEvents {
+				t.Fatalf(
+					"malformed rollback caused side effects: persists=%d events=%v",
+					faults.persisted, kernel.events[beforeEvents:],
+				)
+			}
+		})
+	}
+}
+
 func TestRollbackExactOwnerApplyRebuildsDetachedSameLinkCASOnRestart(t *testing.T) {
 	fixture := newExactTCXOwnerTestFixture(t)
 	kernel := newFakeExactTCXKernel()
@@ -1404,16 +1767,46 @@ func TestReconcileDetachedActiveExactTCXPersistsTruthWithForeignSlotReuse(t *tes
 		t.Fatal(err)
 	}
 	foreignID := kernel.addLink(active.IfIndex, ebpf.AttachType(active.AttachType), 999)
+	journalStore := &faultExactTCXOwnerStore{base: fixture.store}
 
 	recovered, err := recoverExactPinOwnerTransaction(
-		t.Context(), fixture.handle, fixture.store, record, kernel.runtime(),
+		t.Context(), fixture.handle, journalStore, record, kernel.runtime(),
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	reconciled := recovered.record
-	if len(reconciled.ActiveLinks) != 0 || reconciled.Sequence != record.Sequence+1 {
+	if len(reconciled.ActiveLinks) != 0 || reconciled.Sequence != record.Sequence+2 {
 		t.Fatalf("reconciled active record=%+v", reconciled)
+	}
+	if len(journalStore.attempts) != 2 || len(journalStore.expected) != 2 {
+		t.Fatalf(
+			"detached truth persist count: records=%+v expected=%+v",
+			journalStore.attempts, journalStore.expected,
+		)
+	}
+	retiring := journalStore.attempts[0]
+	if retiring.Phase != pinOwnerPhaseActive || retiring.Step != pinOwnerStepRetiring ||
+		retiring.Sequence != record.Sequence+1 || len(retiring.ActiveLinks) != 1 ||
+		retiring.ActiveLinks[0].LinkID != active.LinkID ||
+		!retiring.ActiveLinks[0].Retiring ||
+		journalStore.expected[0].Sequence != record.Sequence ||
+		journalStore.expected[0].ActiveLinks[0] != active {
+		t.Fatalf(
+			"first detached truth persist: next=%+v expected=%+v",
+			retiring, journalStore.expected[0],
+		)
+	}
+	truth := journalStore.attempts[1]
+	if truth.Phase != pinOwnerPhaseActive || truth.Step != pinOwnerStepReady ||
+		truth.Sequence != record.Sequence+2 || len(truth.ActiveLinks) != 0 ||
+		journalStore.expected[1].Sequence != retiring.Sequence ||
+		len(journalStore.expected[1].ActiveLinks) != 1 ||
+		!journalStore.expected[1].ActiveLinks[0].Retiring {
+		t.Fatalf(
+			"second detached truth persist: next=%+v expected=%+v",
+			truth, journalStore.expected[1],
+		)
 	}
 	if _, exists := kernel.pins[pinPath]; exists || kernel.links[active.LinkID].attached {
 		t.Fatalf("detached exact owner survived reconciliation: pin=%v link=%+v", exists, kernel.links[active.LinkID])

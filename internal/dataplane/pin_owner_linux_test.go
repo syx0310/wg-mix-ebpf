@@ -311,6 +311,141 @@ func TestPinOwnerV4ExactLinkIdentityAndTransitionValidation(t *testing.T) {
 	}
 }
 
+func TestValidateRollingBackOwnerLinkMatrix(t *testing.T) {
+	stable := testExactTCXBinding(71, exactTCXIngress, 901)
+	stable.LinkID = 1001
+	desiredCAS := stable
+	desiredCAS.ProgramID = 902
+	desiredReplacement := desiredCAS
+	desiredReplacement.LinkID = 1002
+	desiredReplacement.ReplacesLinkID = stable.LinkID
+	rollbackReplacement := stable
+	rollbackReplacement.LinkID = 1003
+	rollbackReplacement.ReplacesLinkID = stable.LinkID
+	pendingRollbackReplacement := rollbackReplacement
+	pendingRollbackReplacement.LinkID = 0
+	targetOnly := testExactTCXBinding(72, exactTCXEgress, 903)
+	targetOnly.LinkID = 1004
+
+	tests := []struct {
+		name      string
+		active    []exactTCXBinding
+		desired   []exactTCXBinding
+		wantError string
+	}{
+		{
+			name:   "same-link-CAS",
+			active: []exactTCXBinding{stable}, desired: []exactTCXBinding{desiredCAS},
+		},
+		{
+			name:   "detached-forward-pending",
+			active: []exactTCXBinding{stable},
+			desired: []exactTCXBinding{{
+				Backend: stable.Backend, IfIndex: stable.IfIndex,
+				Direction: stable.Direction, AttachType: stable.AttachType,
+				PinName: stable.PinName, ProgramID: desiredCAS.ProgramID,
+				ReplacesLinkID: stable.LinkID,
+			}},
+		},
+		{
+			name:   "detached-forward-published",
+			active: []exactTCXBinding{stable}, desired: []exactTCXBinding{desiredReplacement},
+		},
+		{
+			name:   "rollback-replacement-pending",
+			active: []exactTCXBinding{pendingRollbackReplacement},
+			desired: []exactTCXBinding{{
+				Backend: stable.Backend, IfIndex: stable.IfIndex,
+				Direction: stable.Direction, AttachType: stable.AttachType,
+				PinName: stable.PinName, ProgramID: desiredCAS.ProgramID,
+				ReplacesLinkID: stable.LinkID,
+			}},
+		},
+		{
+			name:    "rollback-replacement-detached-forward",
+			active:  []exactTCXBinding{rollbackReplacement},
+			desired: []exactTCXBinding{desiredReplacement},
+		},
+		{
+			name:   "rollback-replacement-same-link-CAS",
+			active: []exactTCXBinding{rollbackReplacement}, desired: []exactTCXBinding{desiredCAS},
+		},
+		{
+			name:    "target-only-slot",
+			desired: []exactTCXBinding{targetOnly},
+		},
+		{
+			name:   "stable-different-link-without-lineage",
+			active: []exactTCXBinding{stable},
+			desired: []exactTCXBinding{func() exactTCXBinding {
+				binding := desiredCAS
+				binding.LinkID = 1002
+				return binding
+			}()},
+			wantError: "without replacement lineage",
+		},
+		{
+			name:   "stable-zero-link-without-lineage",
+			active: []exactTCXBinding{stable},
+			desired: []exactTCXBinding{func() exactTCXBinding {
+				binding := desiredCAS
+				binding.LinkID = 0
+				return binding
+			}()},
+			wantError: "without replacement lineage",
+		},
+		{
+			name: "rollback-replacement-retiring",
+			active: []exactTCXBinding{func() exactTCXBinding {
+				binding := rollbackReplacement
+				binding.Retiring = true
+				return binding
+			}()},
+			desired:   []exactTCXBinding{desiredReplacement},
+			wantError: "cannot be retiring",
+		},
+		{
+			name:   "failed-target-reuses-rollback-link",
+			active: []exactTCXBinding{rollbackReplacement},
+			desired: []exactTCXBinding{func() exactTCXBinding {
+				binding := desiredReplacement
+				binding.LinkID = rollbackReplacement.LinkID
+				return binding
+			}()},
+			wantError: "reuses rollback active link ID",
+		},
+		{
+			name:   "failed-target-wrong-lineage",
+			active: []exactTCXBinding{rollbackReplacement},
+			desired: []exactTCXBinding{func() exactTCXBinding {
+				binding := desiredReplacement
+				binding.ReplacesLinkID = rollbackReplacement.LinkID
+				return binding
+			}()},
+			wantError: "rollback active lineage",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateOwnerLinks(test.active, "rollback active", false)
+			if err == nil {
+				err = validateOwnerLinks(test.desired, "desired", false)
+			}
+			if err == nil {
+				err = validateRollingBackOwnerLinks(test.active, test.desired)
+			}
+			if test.wantError == "" && err != nil {
+				t.Fatalf("legal rolling-back lineage rejected: %v", err)
+			}
+			if test.wantError != "" &&
+				(err == nil || !strings.Contains(err.Error(), test.wantError)) {
+				t.Fatalf("rolling-back lineage error=%v, want %q", err, test.wantError)
+			}
+		})
+	}
+}
+
 func mustPinOwnerToken(t *testing.T, record *pinOwnerRecord) [32]byte {
 	t.Helper()
 	token, err := tokenFromOwnerRecord(record)

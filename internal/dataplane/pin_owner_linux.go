@@ -1157,6 +1157,8 @@ func validateOwnerLinks(bindings []exactTCXBinding, label string, requireLinkID 
 		}
 		if label == "rollback active" {
 			switch {
+			case binding.Retiring:
+				return fmt.Errorf("rollback active exact TCX slot %s cannot be retiring", exactTCXOwnerKey(binding))
 			case binding.ReplacesLinkID == 0 && binding.LinkID == 0:
 				return fmt.Errorf("rollback active exact TCX slot %s has no stable or replacement identity", exactTCXOwnerKey(binding))
 			case binding.ReplacesLinkID != 0 && binding.LinkID == binding.ReplacesLinkID:
@@ -1268,6 +1270,13 @@ func validateRollingBackOwnerLinks(active, desired []exactTCXBinding) error {
 	for _, binding := range desired {
 		key := exactTCXOwnerKey(binding)
 		active, hasActive := activeBySlot[key]
+		if hasActive && active.ReplacesLinkID == 0 &&
+			binding.ReplacesLinkID == 0 && binding.LinkID != active.LinkID {
+			return fmt.Errorf(
+				"rolling-back desired exact TCX slot %s changes stable link ID %d to %d without replacement lineage",
+				key, active.LinkID, binding.LinkID,
+			)
+		}
 		if hasActive && active.ReplacesLinkID != 0 {
 			if active.LinkID != 0 && binding.LinkID == active.LinkID {
 				return fmt.Errorf(

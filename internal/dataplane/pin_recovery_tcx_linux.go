@@ -293,35 +293,110 @@ func validateRollbackActiveExactTCXLinks(
 	return nil
 }
 
-func validateRetiredDesiredBehindRollbackReplacement(
+func retireRollbackPredecessorExactTCX(
 	handle *pinPathHandle,
 	active exactTCXBinding,
 	desired exactTCXBinding,
+	hasDesired bool,
 	runtime exactTCXRuntime,
 ) error {
-	if active.ReplacesLinkID == 0 || desired.LinkID == 0 ||
-		desired.LinkID == active.LinkID || !sameExactTCXSlot(active, desired) {
+	if active.LinkID != 0 || active.ReplacesLinkID == 0 ||
+		active.PinPending || active.Retiring {
+		return errors.New("rollback predecessor retirement requires durable replacement lineage")
+	}
+	predecessor := active
+	predecessor.LinkID = active.ReplacesLinkID
+	predecessor.ReplacesLinkID = 0
+	predecessor.PinPending = false
+	predecessor.Retiring = false
+	allowedProgramIDs := rollbackAllowedProgramIDs(active, desired, hasDesired)
+	owner, observed, err := observePinnedExactTCXAt(
+		handle, predecessor, allowedProgramIDs, runtime,
+	)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("validate rollback predecessor exact TCX pin: %w", err)
+		}
+		absent, queryErr := exactTCXLinkAbsentFromOriginalSlot(predecessor, runtime)
+		if queryErr != nil {
+			return queryErr
+		}
+		if !absent {
+			return fmt.Errorf(
+				"rollback predecessor exact TCX link %d lost its pin while attached",
+				predecessor.LinkID,
+			)
+		}
+		return nil
+	}
+	if observed.Attached {
+		return errors.Join(
+			fmt.Errorf(
+				"rollback predecessor exact TCX link %d is still attached",
+				predecessor.LinkID,
+			),
+			owner.Release(),
+		)
+	}
+	if err := owner.Rollback(); err != nil {
+		return fmt.Errorf("retire detached rollback predecessor exact TCX link: %w", err)
+	}
+	var stat unix.Stat_t
+	err = unix.Fstatat(
+		handle.targetFD, predecessor.PinName, &stat, unix.AT_SYMLINK_NOFOLLOW,
+	)
+	if err == nil {
+		return fmt.Errorf(
+			"rollback predecessor exact TCX pin %s remains after retirement",
+			predecessor.PinName,
+		)
+	}
+	if !errors.Is(err, unix.ENOENT) {
+		return err
+	}
+	absent, err := exactTCXLinkAbsentFromOriginalSlot(observed.Binding, runtime)
+	if err != nil {
+		return err
+	}
+	if !absent {
+		return fmt.Errorf(
+			"rollback predecessor exact TCX link %d remains after retirement",
+			predecessor.LinkID,
+		)
+	}
+	return nil
+}
+
+func validateRetiredLineageBehindRollbackReplacement(
+	handle *pinPathHandle,
+	active exactTCXBinding,
+	desired exactTCXBinding,
+	hasDesired bool,
+	runtime exactTCXRuntime,
+) error {
+	if active.ReplacesLinkID == 0 || active.LinkID == 0 ||
+		active.LinkID == active.ReplacesLinkID || active.Retiring ||
+		(hasDesired && !sameExactTCXSlot(active, desired)) {
 		return errors.New("invalid rollback replacement retirement proof")
 	}
 
 	// Once a completed rollback replacement owns the deterministic path, that
-	// path no longer names the failed target. Hold an exact, anchored handle to
-	// the replacement while proving the target link ID absent by an independent
-	// slot query. A missing replacement pin is recoverable below; any present
-	// but mismatched pin is foreign and must fail closed without mutation.
+	// path no longer names the predecessor or failed target. Hold an exact,
+	// anchored handle to the replacement while proving those retired link IDs
+	// absent by independent slot queries. A missing replacement pin is
+	// recoverable below; any present but mismatched pin is foreign and must fail
+	// closed without mutation.
 	var owner *exactTCXAttachment
 	var observed *exactTCXObservation
-	if active.LinkID != 0 {
-		var err error
-		owner, observed, err = observePinnedExactTCXAt(
-			handle, active, []uint32{active.ProgramID}, runtime,
-		)
-		if err != nil {
-			if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOENT) {
-				return fmt.Errorf("validate rollback replacement exact TCX pin: %w", err)
-			}
-			owner = nil
+	var err error
+	owner, observed, err = observePinnedExactTCXAt(
+		handle, active, []uint32{active.ProgramID}, runtime,
+	)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOENT) {
+			return fmt.Errorf("validate rollback replacement exact TCX pin: %w", err)
 		}
+		owner = nil
 	}
 
 	if owner != nil && !observed.Attached {
@@ -339,18 +414,40 @@ func validateRetiredDesiredBehindRollbackReplacement(
 			)
 		}
 	}
-	absent, err := exactTCXLinkAbsentFromOriginalSlot(desired, runtime)
+	predecessor := active
+	predecessor.LinkID = active.ReplacesLinkID
+	predecessor.ReplacesLinkID = 0
+	predecessor.PinPending = false
+	predecessor.Retiring = false
+	absent, err := exactTCXLinkAbsentFromOriginalSlot(predecessor, runtime)
+	if err == nil && !absent {
+		err = fmt.Errorf(
+			"retired rollback predecessor exact TCX link %d reappeared",
+			predecessor.LinkID,
+		)
+	}
+	if err == nil && hasDesired && desired.LinkID != 0 &&
+		desired.LinkID != predecessor.LinkID {
+		if desired.LinkID == active.LinkID {
+			err = fmt.Errorf(
+				"failed target reuses rollback replacement exact TCX link ID %d",
+				active.LinkID,
+			)
+		} else {
+			absent, err = exactTCXLinkAbsentFromOriginalSlot(desired, runtime)
+			if err == nil && !absent {
+				err = fmt.Errorf(
+					"failed-apply exact TCX target link %d remains behind rollback replacement %d",
+					desired.LinkID, active.LinkID,
+				)
+			}
+		}
+	}
 	if owner != nil {
 		err = errors.Join(err, owner.Release())
 	}
 	if err != nil {
 		return err
-	}
-	if !absent {
-		return fmt.Errorf(
-			"failed-apply exact TCX target link %d remains behind rollback replacement %d",
-			desired.LinkID, active.LinkID,
-		)
 	}
 	return nil
 }
@@ -408,32 +505,33 @@ func rollbackFailedExactOwnerApplyLinks(
 		original.ReplacesLinkID = 0
 		original.PinPending = false
 		original.Retiring = false
+		if active.ReplacesLinkID != 0 && active.LinkID == 0 {
+			// ReplacesLinkID is the durable predecessor identity. A crash may
+			// leave its detached pin behind before either a forward attach or a
+			// same-link CAS was published. Retire only that exact old lineage;
+			// the desired record cannot safely identify the shared path here.
+			if err := retireRollbackPredecessorExactTCX(
+				handle, active, desired, hasDesired, runtime,
+			); err != nil {
+				return current, err
+			}
+		}
+		if active.ReplacesLinkID != 0 && active.LinkID != 0 {
+			if err := validateRetiredLineageBehindRollbackReplacement(
+				handle, active, desired, hasDesired, runtime,
+			); err != nil {
+				return current, err
+			}
+		}
 
 		// A forward replacement may already own the deterministic path. Retire
 		// that exact new identity before recovering the old program. Once a
 		// rollback replacement marker exists, however, the path belongs to the
 		// rollback identity; only an exact slot query may prove the old target
 		// absent, and the shared pin must never be opened as that target.
-		if hasDesired && desired.LinkID != 0 && desired.LinkID != active.LinkID {
-			if active.ReplacesLinkID != 0 {
-				if active.LinkID == 0 {
-					// The replacement lineage is durable but no rollback link
-					// identity has been published yet. The shared path may still
-					// hold the exact failed target from the pre-crash retirement.
-					if err := removeOwnedExactTCXLink(handle, desired, runtime); err != nil {
-						return current, fmt.Errorf(
-							"complete rollback target retirement %s: %w",
-							desired.PinName, err,
-						)
-					}
-				} else {
-					if err := validateRetiredDesiredBehindRollbackReplacement(
-						handle, active, desired, runtime,
-					); err != nil {
-						return current, err
-					}
-				}
-			} else if err := removeOwnedExactTCXLink(handle, desired, runtime); err != nil {
+		if hasDesired && desired.LinkID != 0 &&
+			desired.LinkID != active.LinkID && active.ReplacesLinkID == 0 {
+			if err := removeOwnedExactTCXLink(handle, desired, runtime); err != nil {
 				return current, fmt.Errorf(
 					"retire replacement exact TCX link %s: %w",
 					desired.PinName, err,
