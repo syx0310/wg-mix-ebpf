@@ -33,15 +33,18 @@ const (
 	pinOwnerPhaseApplying  = "applying"
 	pinOwnerPhaseDetaching = "detaching"
 
-	pinOwnerStepReady          = "ready"
-	pinOwnerStepStaging        = "staging"
-	pinOwnerStepMutating       = "mutating"
-	pinOwnerStepMutatingTC     = "mutating_tc"
-	pinOwnerStepUnlinkingMaps  = "unlinking_maps"
-	pinOwnerStepCleanup        = "cleanup"
-	pinOwnerStepCleanupStages  = "cleanup_stages"
-	pinOwnerProgramStageActive = "active"
-	pinOwnerProgramStageNext   = "desired"
+	pinOwnerStepReady           = "ready"
+	pinOwnerStepRetiring        = "retiring"
+	pinOwnerStepStaging         = "staging"
+	pinOwnerStepMutating        = "mutating"
+	pinOwnerStepRollingBack     = "rolling_back"
+	pinOwnerStepRollbackCleanup = "rollback_cleanup"
+	pinOwnerStepMutatingTC      = "mutating_tc"
+	pinOwnerStepUnlinkingMaps   = "unlinking_maps"
+	pinOwnerStepCleanup         = "cleanup"
+	pinOwnerStepCleanupStages   = "cleanup_stages"
+	pinOwnerProgramStageActive  = "active"
+	pinOwnerProgramStageNext    = "desired"
 )
 
 var errLegacyClassicOwnerRequiresMigration = errors.New(
@@ -327,12 +330,18 @@ func validateOwnerDirectoryEntries(
 	wantCanonical := len(canonical)
 	switch {
 	case record.Phase == pinOwnerPhaseActive:
-		if err := requireLinks(record.ActiveLinks, "active"); err != nil {
+		requiredActive := make([]exactTCXBinding, 0, len(record.ActiveLinks))
+		for _, binding := range record.ActiveLinks {
+			if !binding.Retiring {
+				requiredActive = append(requiredActive, binding)
+			}
+		}
+		if err := requireLinks(requiredActive, "active"); err != nil {
 			return err
 		}
 		if canonicalCount != wantCanonical ||
 			len(seen) != wantCanonical+len(seenLinks) ||
-			len(seenLinks) != len(linkNames) {
+			(record.Step == pinOwnerStepReady && len(seenLinks) != len(linkNames)) {
 			return fmt.Errorf(
 				"active owner directory has %d canonical maps, %d exact links, and %d total entries; want %d/%d",
 				canonicalCount, len(seenLinks), len(seen), wantCanonical, len(record.ActiveLinks),
@@ -372,7 +381,7 @@ func validateOwnerDirectoryEntries(
 				return err
 			}
 			for _, binding := range record.DesiredLinks {
-				if binding.LinkID == 0 || binding.PinPending {
+				if binding.LinkID == 0 || binding.PinPending || binding.Retiring {
 					continue
 				}
 				if err := requireLinks([]exactTCXBinding{binding}, "applying mutation"); err != nil {
@@ -383,6 +392,10 @@ func validateOwnerDirectoryEntries(
 			if err := requireLinks(record.DesiredLinks, "applying cleanup"); err != nil {
 				return err
 			}
+		case pinOwnerStepRollingBack, pinOwnerStepRollbackCleanup:
+			// This durable state covers a partially retired/recreated exact
+			// link set. Any journaled active or desired pin may be absent at
+			// a crash boundary; exact identities still fence every mutation.
 		}
 	case record.Phase == pinOwnerPhaseDetaching &&
 		record.Step == pinOwnerStepStaging:
@@ -669,6 +682,7 @@ func completeApplyingPinOwnerRecord(
 	for index := range next.ActiveLinks {
 		next.ActiveLinks[index].ReplacesLinkID = 0
 		next.ActiveLinks[index].PinPending = false
+		next.ActiveLinks[index].Retiring = false
 	}
 	next.DesiredFilters = []tcFilterBinding{}
 	next.DesiredLinks = []exactTCXBinding{}
@@ -752,7 +766,9 @@ func newInitialAbortDetachingPinOwnerRecord(
 	if current == nil ||
 		current.Phase != pinOwnerPhaseApplying ||
 		(current.Step != pinOwnerStepStaging &&
-			current.Step != pinOwnerStepMutating) ||
+			current.Step != pinOwnerStepMutating &&
+			current.Step != pinOwnerStepRollingBack &&
+			current.Step != pinOwnerStepRollbackCleanup) ||
 		current.ActiveGeneration != 0 {
 		return nil, errors.New("initial abort requires a fresh pre-commit applying owner record")
 	}
@@ -1018,13 +1034,28 @@ func validatePinOwnerRecord(
 	if len(record.ActiveFilters) != 0 || len(record.DesiredFilters) != 0 {
 		return errors.New("pin owner schema v4 must not contain classic TC filters")
 	}
-	if err := validateOwnerLinks(record.ActiveLinks, "active", true); err != nil {
+	rollingBack := record.Phase == pinOwnerPhaseApplying &&
+		(record.Step == pinOwnerStepRollingBack ||
+			record.Step == pinOwnerStepRollbackCleanup)
+	activeLabel := "active"
+	requireActiveLinkID := true
+	if rollingBack {
+		activeLabel = "rollback active"
+		requireActiveLinkID = false
+	} else if record.Phase == pinOwnerPhaseActive && record.Step == pinOwnerStepRetiring {
+		activeLabel = "retiring active"
+	}
+	if err := validateOwnerLinks(record.ActiveLinks, activeLabel, requireActiveLinkID); err != nil {
 		return err
 	}
 	if err := validateOwnerLinks(record.DesiredLinks, "desired", false); err != nil {
 		return err
 	}
-	if err := validateOwnerLinkTransition(record.ActiveLinks, record.DesiredLinks); err != nil {
+	if rollingBack {
+		if err := validateRollingBackOwnerLinks(record.ActiveLinks, record.DesiredLinks); err != nil {
+			return err
+		}
+	} else if err := validateOwnerLinkTransition(record.ActiveLinks, record.DesiredLinks); err != nil {
 		return err
 	}
 	if err := validateOwnerStages(record); err != nil {
@@ -1032,7 +1063,7 @@ func validatePinOwnerRecord(
 	}
 	switch record.Phase {
 	case pinOwnerPhaseActive:
-		if record.Step != pinOwnerStepReady ||
+		if (record.Step != pinOwnerStepReady && record.Step != pinOwnerStepRetiring) ||
 			record.ActiveGeneration == 0 ||
 			record.NextGeneration != 0 ||
 			len(record.DesiredFilters) != 0 ||
@@ -1041,9 +1072,22 @@ func validatePinOwnerRecord(
 			len(record.MapStages) != 0 {
 			return errors.New("active pin owner record has inconsistent transaction fields")
 		}
+		if record.Step == pinOwnerStepRetiring {
+			retiring := 0
+			for _, binding := range record.ActiveLinks {
+				if binding.Retiring {
+					retiring++
+				}
+			}
+			if retiring == 0 {
+				return errors.New("retiring active pin owner has no retiring exact TCX link")
+			}
+		}
 	case pinOwnerPhaseApplying:
 		if record.Step != pinOwnerStepStaging &&
 			record.Step != pinOwnerStepMutating &&
+			record.Step != pinOwnerStepRollingBack &&
+			record.Step != pinOwnerStepRollbackCleanup &&
 			record.Step != pinOwnerStepCleanup {
 			return fmt.Errorf("applying pin owner record has invalid step %q", record.Step)
 		}
@@ -1056,7 +1100,7 @@ func validatePinOwnerRecord(
 		}
 		if record.Step == pinOwnerStepCleanup {
 			for _, binding := range record.DesiredLinks {
-				if binding.LinkID == 0 || binding.PinPending {
+				if binding.LinkID == 0 || binding.PinPending || binding.Retiring {
 					return errors.New("applying cleanup has an unpublished exact TCX link ID")
 				}
 			}
@@ -1093,11 +1137,33 @@ func validateOwnerLinks(bindings []exactTCXBinding, label string, requireLinkID 
 		if err := validateExactTCXBinding(binding, requireLinkID); err != nil {
 			return fmt.Errorf("%s link[%d]: %w", label, index, err)
 		}
-		if label == "active" && binding.ReplacesLinkID != 0 {
+		if (label == "active" || label == "retiring active") && binding.ReplacesLinkID != 0 {
 			return errors.New("active exact TCX link retains a replacement marker")
 		}
-		if label == "active" && binding.PinPending {
-			return errors.New("active exact TCX link retains a pending-pin marker")
+		if label == "active" && (binding.PinPending || binding.Retiring) {
+			return errors.New("active exact TCX link retains a transient lifecycle marker")
+		}
+		if label == "retiring active" && binding.PinPending {
+			return errors.New("retiring active exact TCX link retains a pending-pin marker")
+		}
+		if binding.PinPending && binding.LinkID == 0 {
+			return fmt.Errorf("%s exact TCX slot %s has a pending pin without a link ID", label, exactTCXOwnerKey(binding))
+		}
+		if binding.PinPending && binding.Retiring {
+			return fmt.Errorf("%s exact TCX slot %s is both pending and retiring", label, exactTCXOwnerKey(binding))
+		}
+		if binding.Retiring && binding.LinkID == 0 {
+			return fmt.Errorf("%s exact TCX slot %s retires an unpublished link", label, exactTCXOwnerKey(binding))
+		}
+		if label == "rollback active" {
+			switch {
+			case binding.ReplacesLinkID == 0 && binding.LinkID == 0:
+				return fmt.Errorf("rollback active exact TCX slot %s has no stable or replacement identity", exactTCXOwnerKey(binding))
+			case binding.ReplacesLinkID != 0 && binding.LinkID == binding.ReplacesLinkID:
+				return fmt.Errorf("rollback active exact TCX slot %s still uses retired link ID %d", exactTCXOwnerKey(binding), binding.LinkID)
+			case binding.ReplacesLinkID == 0 && (binding.PinPending || binding.Retiring):
+				return fmt.Errorf("rollback active exact TCX slot %s has a marker without replacement lineage", exactTCXOwnerKey(binding))
+			}
 		}
 		key := exactTCXOwnerKey(binding)
 		if _, duplicate := seenSlots[key]; duplicate {
@@ -1179,6 +1245,66 @@ func validateOwnerLinkTransition(active, desired []exactTCXBinding) error {
 			)
 		}
 		usedLinkIDs[binding.LinkID] = key
+	}
+	return nil
+}
+
+func validateRollingBackOwnerLinks(active, desired []exactTCXBinding) error {
+	activeBySlot := make(map[string]exactTCXBinding, len(active))
+	knownLinkIDs := make(map[uint32]string, len(active)+len(desired))
+	for _, binding := range active {
+		key := exactTCXOwnerKey(binding)
+		activeBySlot[key] = binding
+		for _, id := range []uint32{binding.LinkID, binding.ReplacesLinkID} {
+			if id == 0 {
+				continue
+			}
+			if previous, duplicate := knownLinkIDs[id]; duplicate && previous != key {
+				return fmt.Errorf("rolling-back exact TCX slots %s and %s share link ID %d", previous, key, id)
+			}
+			knownLinkIDs[id] = key
+		}
+	}
+	for _, binding := range desired {
+		key := exactTCXOwnerKey(binding)
+		active, hasActive := activeBySlot[key]
+		if hasActive && active.ReplacesLinkID != 0 {
+			if active.LinkID != 0 && binding.LinkID == active.LinkID {
+				return fmt.Errorf(
+					"rolling-back desired exact TCX slot %s reuses rollback active link ID %d",
+					key, active.LinkID,
+				)
+			}
+			detachedReplacement := binding.ReplacesLinkID == active.ReplacesLinkID &&
+				binding.LinkID != active.ReplacesLinkID
+			detachedSameLinkUpdate := binding.ReplacesLinkID == 0 &&
+				binding.LinkID == active.ReplacesLinkID
+			if !detachedReplacement && !detachedSameLinkUpdate {
+				return fmt.Errorf(
+					"rolling-back desired exact TCX slot %s has replacement lineage %d/link %d, rollback active lineage is %d",
+					key, binding.ReplacesLinkID, binding.LinkID, active.ReplacesLinkID,
+				)
+			}
+		}
+		if binding.ReplacesLinkID != 0 {
+			if !hasActive || (active.ReplacesLinkID == 0 &&
+				binding.ReplacesLinkID != active.LinkID) {
+				return fmt.Errorf("rolling-back desired exact TCX slot %s has unknown replacement lineage %d", key, binding.ReplacesLinkID)
+			}
+			if active.ReplacesLinkID == 0 && binding.LinkID == active.LinkID {
+				return fmt.Errorf(
+					"rolling-back desired exact TCX slot %s replacement still uses retired link ID %d",
+					key, active.LinkID,
+				)
+			}
+		}
+		if binding.LinkID == 0 {
+			continue
+		}
+		if previous, duplicate := knownLinkIDs[binding.LinkID]; duplicate && previous != key {
+			return fmt.Errorf("rolling-back exact TCX slots %s and %s share link ID %d", previous, key, binding.LinkID)
+		}
+		knownLinkIDs[binding.LinkID] = key
 	}
 	return nil
 }

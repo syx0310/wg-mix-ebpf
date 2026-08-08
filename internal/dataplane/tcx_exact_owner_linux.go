@@ -41,6 +41,7 @@ type exactTCXBinding struct {
 	ProgramID      uint32            `json:"program_id"`
 	ReplacesLinkID uint32            `json:"replaces_link_id,omitempty"`
 	PinPending     bool              `json:"pin_pending,omitempty"`
+	Retiring       bool              `json:"retiring,omitempty"`
 }
 
 type exactTCXLinkIdentity struct {
@@ -421,7 +422,7 @@ func stageExactTCXAttachment(
 	if err := validateExactTCXBinding(binding, false); err != nil {
 		return nil, err
 	}
-	if binding.LinkID != 0 || binding.PinPending {
+	if binding.LinkID != 0 || binding.PinPending || binding.Retiring {
 		return nil, errors.New("new TCX attachment intent must not predict a link ID or pending pin")
 	}
 	if program.id == 0 || program.id != binding.ProgramID {

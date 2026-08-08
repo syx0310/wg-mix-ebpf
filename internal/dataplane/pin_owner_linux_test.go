@@ -230,6 +230,59 @@ func TestPinOwnerV4ExactLinkIdentityAndTransitionValidation(t *testing.T) {
 	if err := validatePinOwnerRecord(publishedReplacement, parent.resource, parent.mountID); err != nil {
 		t.Fatalf("published detached-link replacement identity: %v", err)
 	}
+	rollingBackReplacement := advancePinOwnerRecord(
+		publishedReplacement,
+		time.Date(2026, 7, 29, 1, 2, 5, 250, time.UTC),
+		pinOwnerPhaseApplying,
+		pinOwnerStepRollingBack,
+	)
+	rollingBackReplacement.ActiveLinks[0].LinkID = active.LinkID + 200
+	rollingBackReplacement.ActiveLinks[0].ReplacesLinkID = active.LinkID
+	if err := validatePinOwnerRecord(
+		rollingBackReplacement, parent.resource, parent.mountID,
+	); err != nil {
+		t.Fatalf("rollback detached-link replacement lineage: %v", err)
+	}
+	wrongRollbackLineage := clonePinOwnerRecord(rollingBackReplacement)
+	wrongRollbackLineage.DesiredLinks[0].ReplacesLinkID =
+		wrongRollbackLineage.ActiveLinks[0].LinkID
+	if err := validatePinOwnerRecord(
+		wrongRollbackLineage, parent.resource, parent.mountID,
+	); err == nil || !strings.Contains(err.Error(), "rollback active lineage") {
+		t.Fatalf("rollback replacement accepted new-link lineage: %v", err)
+	}
+	sharedRollbackIdentity := clonePinOwnerRecord(rollingBackReplacement)
+	sharedRollbackIdentity.DesiredLinks[0].LinkID =
+		sharedRollbackIdentity.ActiveLinks[0].LinkID
+	if err := validatePinOwnerRecord(
+		sharedRollbackIdentity, parent.resource, parent.mountID,
+	); err == nil || !strings.Contains(err.Error(), "reuses rollback active link ID") {
+		t.Fatalf("failed target reused rollback identity: %v", err)
+	}
+	reusedRetiredRollbackID := clonePinOwnerRecord(rollingBackReplacement)
+	reusedRetiredRollbackID.DesiredLinks[0].LinkID = active.LinkID
+	if err := validatePinOwnerRecord(
+		reusedRetiredRollbackID, parent.resource, parent.mountID,
+	); err == nil || !strings.Contains(err.Error(), "rollback active lineage") {
+		t.Fatalf("rollback detached replacement reused retired link ID: %v", err)
+	}
+	sameLinkRollback := advancePinOwnerRecord(
+		applying,
+		time.Date(2026, 7, 29, 1, 2, 5, 300, time.UTC),
+		pinOwnerPhaseApplying,
+		pinOwnerStepRollingBack,
+	)
+	if err := validatePinOwnerRecord(sameLinkRollback, parent.resource, parent.mountID); err != nil {
+		t.Fatalf("same-link CAS rollback: %v", err)
+	}
+	detachedSameLinkRollback := clonePinOwnerRecord(sameLinkRollback)
+	detachedSameLinkRollback.ActiveLinks[0].LinkID = active.LinkID + 300
+	detachedSameLinkRollback.ActiveLinks[0].ReplacesLinkID = active.LinkID
+	if err := validatePinOwnerRecord(
+		detachedSameLinkRollback, parent.resource, parent.mountID,
+	); err != nil {
+		t.Fatalf("detached same-link CAS rollback lineage: %v", err)
+	}
 	badReplacement := clonePinOwnerRecord(replacing)
 	badReplacement.DesiredLinks[0].ReplacesLinkID++
 	if err := validatePinOwnerRecord(badReplacement, parent.resource, parent.mountID); err == nil ||
@@ -300,6 +353,8 @@ func TestPinOwnerPhaseStepMatrix(t *testing.T) {
 		pinOwnerPhaseApplying: {
 			pinOwnerStepStaging,
 			pinOwnerStepMutating,
+			pinOwnerStepRollingBack,
+			pinOwnerStepRollbackCleanup,
 			pinOwnerStepCleanup,
 		},
 		pinOwnerPhaseDetaching: {
@@ -316,8 +371,11 @@ func TestPinOwnerPhaseStepMatrix(t *testing.T) {
 	}
 	allSteps := []string{
 		pinOwnerStepReady,
+		pinOwnerStepRetiring,
 		pinOwnerStepStaging,
 		pinOwnerStepMutating,
+		pinOwnerStepRollingBack,
+		pinOwnerStepRollbackCleanup,
 		pinOwnerStepMutatingTC,
 		pinOwnerStepUnlinkingMaps,
 		pinOwnerStepCleanup,

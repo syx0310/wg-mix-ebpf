@@ -16,6 +16,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+type exactTCXOwnerStore interface {
+	Persist(*pinOwnerRecord, *pinOwnerRecord, uint64) error
+	Remove(*pinOwnerRecord) error
+}
+
 func exactTCXBindingsForState(
 	state *control.State,
 	ingressProgramID uint32,
@@ -289,84 +294,119 @@ func validateOwnerExactTCXLinks(
 
 func reconcileDetachedActiveExactTCXLinks(
 	handle *pinPathHandle,
-	store *pinOwnerStore,
+	store exactTCXOwnerStore,
 	record *pinOwnerRecord,
 	runtime exactTCXRuntime,
 ) (*pinOwnerRecord, error) {
 	if handle == nil || store == nil || record == nil ||
-		record.Phase != pinOwnerPhaseActive || record.Step != pinOwnerStepReady {
+		record.Phase != pinOwnerPhaseActive ||
+		(record.Step != pinOwnerStepReady && record.Step != pinOwnerStepRetiring) {
 		return nil, errors.New("reconcile detached active TCX links requires an active owner record")
 	}
-	retained := make([]exactTCXBinding, 0, len(record.ActiveLinks))
-	changed := false
-	for _, binding := range record.ActiveLinks {
-		owner, observed, err := observePinnedExactTCXAt(
-			handle,
-			binding,
-			[]uint32{binding.ProgramID},
-			runtime,
-		)
-		if err != nil {
-			if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOENT) {
-				return nil, err
-			}
-			absent, queryErr := exactTCXLinkAbsentFromOriginalSlot(binding, runtime)
-			if queryErr != nil {
-				return nil, queryErr
-			}
-			if !absent {
-				return nil, fmt.Errorf(
-					"active exact TCX link %d lost its anchored pin but remains in the original slot",
-					binding.LinkID,
+	current := record
+	for {
+		restarted := false
+		for index, binding := range current.ActiveLinks {
+			if binding.Retiring {
+				if err := removeOwnedExactTCXLink(handle, binding, runtime); err != nil {
+					return current, fmt.Errorf("complete active exact TCX retirement %d: %w", binding.LinkID, err)
+				}
+				now, err := ownerRuntimeNow(handle.runtime)
+				if err != nil {
+					return current, err
+				}
+				next := advancePinOwnerRecord(current, now, pinOwnerPhaseActive, pinOwnerStepReady)
+				next.ActiveLinks = append(
+					slices.Clone(current.ActiveLinks[:index]),
+					current.ActiveLinks[index+1:]...,
 				)
+				for _, remaining := range next.ActiveLinks {
+					if remaining.Retiring {
+						next.Step = pinOwnerStepRetiring
+						break
+					}
+				}
+				normalizePinOwnerRecord(next)
+				if err := validatePinOwnerRecord(next, handle.resource, handle.mountID); err != nil {
+					return current, err
+				}
+				observeOwnerMount(next, handle.mountID)
+				if err := store.Persist(next, current, handle.mountID); err != nil {
+					return current, err
+				}
+				current = next
+				restarted = true
+				break
 			}
-			changed = true
+			owner, observed, err := observePinnedExactTCXAt(
+				handle,
+				binding,
+				[]uint32{binding.ProgramID},
+				runtime,
+			)
+			if err != nil {
+				if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOENT) {
+					return current, err
+				}
+				absent, queryErr := exactTCXLinkAbsentFromOriginalSlot(binding, runtime)
+				if queryErr != nil {
+					return current, queryErr
+				}
+				if !absent {
+					return current, fmt.Errorf(
+						"active exact TCX link %d lost its anchored pin but remains in the original slot",
+						binding.LinkID,
+					)
+				}
+			} else if observed.Attached {
+				if err := owner.Release(); err != nil {
+					return current, err
+				}
+				continue
+			}
+			now, err := ownerRuntimeNow(handle.runtime)
+			if err != nil {
+				if owner != nil {
+					return current, errors.Join(err, owner.Release())
+				}
+				return current, err
+			}
+			retiring := advancePinOwnerRecord(
+				current, now, pinOwnerPhaseActive, pinOwnerStepRetiring,
+			)
+			retiring.ActiveLinks[index].Retiring = true
+			normalizePinOwnerRecord(retiring)
+			if err := validatePinOwnerRecord(retiring, handle.resource, handle.mountID); err != nil {
+				if owner != nil {
+					return current, errors.Join(err, owner.Release())
+				}
+				return current, err
+			}
+			observeOwnerMount(retiring, handle.mountID)
+			if err := store.Persist(retiring, current, handle.mountID); err != nil {
+				if owner != nil {
+					return current, errors.Join(err, owner.Release())
+				}
+				return current, err
+			}
+			current = retiring
+			if owner != nil {
+				if err := owner.Rollback(); err != nil {
+					return current, fmt.Errorf(
+						"retire detached active exact TCX link %d: %w",
+						binding.LinkID,
+						err,
+					)
+				}
+			}
+			restarted = true
+			break
+		}
+		if restarted {
 			continue
 		}
-		if observed.Attached {
-			if err := owner.Release(); err != nil {
-				return nil, err
-			}
-			retained = append(retained, binding)
-			continue
-		}
-		if err := owner.Rollback(); err != nil {
-			return nil, fmt.Errorf(
-				"retire detached active exact TCX link %d: %w",
-				binding.LinkID,
-				err,
-			)
-		}
-		absent, err := exactTCXLinkAbsentFromOriginalSlot(binding, runtime)
-		if err != nil {
-			return nil, err
-		}
-		if !absent {
-			return nil, fmt.Errorf(
-				"retired active exact TCX link %d reappeared in its original slot",
-				binding.LinkID,
-			)
-		}
-		changed = true
+		return current, nil
 	}
-	if !changed {
-		return record, nil
-	}
-	now, err := ownerRuntimeNow(handle.runtime)
-	if err != nil {
-		return nil, err
-	}
-	next := advancePinOwnerRecord(record, now, pinOwnerPhaseActive, pinOwnerStepReady)
-	next.ActiveLinks = retained
-	normalizePinOwnerRecord(next)
-	if err := validatePinOwnerRecord(next, handle.resource, handle.mountID); err != nil {
-		return nil, err
-	}
-	observeOwnerMount(next, handle.mountID)
-	if err := store.Persist(next, record, handle.mountID); err != nil {
-		return nil, err
-	}
-	return next, nil
 }
 
 func validateJournaledAttachedOrDetachedExactTCXLinks(
@@ -421,7 +461,7 @@ func exactTCXProgramFromStages(
 func ownerExactTCXJournal(
 	record **pinOwnerRecord,
 	handle *pinPathHandle,
-	store *pinOwnerStore,
+	store exactTCXOwnerStore,
 ) exactTCXJournal {
 	return exactTCXJournal{
 		persistIntent: func(intent exactTCXJournalIntent) error {
@@ -516,7 +556,7 @@ func ownerRecordWithoutDesiredLinkIdentity(
 	current *pinOwnerRecord,
 	binding exactTCXBinding,
 	handle *pinPathHandle,
-	store *pinOwnerStore,
+	store exactTCXOwnerStore,
 ) (*pinOwnerRecord, error) {
 	if current == nil || handle == nil || store == nil ||
 		current.Phase != pinOwnerPhaseApplying || current.Step != pinOwnerStepMutating ||
@@ -546,6 +586,7 @@ func ownerRecordWithoutDesiredLinkIdentity(
 		}
 		next.DesiredLinks[index].LinkID = 0
 		next.DesiredLinks[index].PinPending = false
+		next.DesiredLinks[index].Retiring = false
 		found = true
 		break
 	}
@@ -563,11 +604,56 @@ func ownerRecordWithoutDesiredLinkIdentity(
 	return next, nil
 }
 
+func ownerRecordRetiringDesiredLink(
+	current *pinOwnerRecord,
+	binding exactTCXBinding,
+	handle *pinPathHandle,
+	store exactTCXOwnerStore,
+) (*pinOwnerRecord, error) {
+	if current == nil || handle == nil || store == nil ||
+		current.Phase != pinOwnerPhaseApplying || current.Step != pinOwnerStepMutating ||
+		binding.LinkID == 0 || binding.PinPending {
+		return nil, errors.New("cannot journal exact TCX retirement outside a published applying mutation")
+	}
+	if binding.Retiring {
+		return current, nil
+	}
+	now, err := ownerRuntimeNow(handle.runtime)
+	if err != nil {
+		return nil, err
+	}
+	next := advancePinOwnerRecord(current, now, current.Phase, current.Step)
+	found := false
+	for index := range next.DesiredLinks {
+		desired := next.DesiredLinks[index]
+		if !sameExactTCXSlot(desired, binding) ||
+			desired.ProgramID != binding.ProgramID ||
+			desired.LinkID != binding.LinkID || desired.PinPending {
+			continue
+		}
+		next.DesiredLinks[index].Retiring = true
+		found = true
+		break
+	}
+	if !found {
+		return nil, errors.New("retiring exact TCX link has no matching desired journal entry")
+	}
+	normalizePinOwnerRecord(next)
+	if err := validatePinOwnerRecord(next, handle.resource, handle.mountID); err != nil {
+		return nil, err
+	}
+	observeOwnerMount(next, handle.mountID)
+	if err := store.Persist(next, current, handle.mountID); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
 func ownerRecordReplacingDetachedLink(
 	current *pinOwnerRecord,
 	active exactTCXBinding,
 	handle *pinPathHandle,
-	store *pinOwnerStore,
+	store exactTCXOwnerStore,
 ) (*pinOwnerRecord, error) {
 	if current == nil || handle == nil || store == nil ||
 		current.Phase != pinOwnerPhaseApplying || current.Step != pinOwnerStepMutating ||
@@ -607,10 +693,165 @@ func ownerRecordReplacingDetachedLink(
 	return next, nil
 }
 
+func ownerRecordReplacingRollbackActive(
+	current *pinOwnerRecord,
+	active exactTCXBinding,
+	handle *pinPathHandle,
+	store exactTCXOwnerStore,
+) (*pinOwnerRecord, error) {
+	if current == nil || handle == nil || store == nil ||
+		current.Phase != pinOwnerPhaseApplying || current.Step != pinOwnerStepRollingBack ||
+		active.LinkID == 0 {
+		return nil, errors.New("cannot journal rollback active replacement outside rolling_back")
+	}
+	if active.ReplacesLinkID != 0 {
+		return current, nil
+	}
+	now, err := ownerRuntimeNow(handle.runtime)
+	if err != nil {
+		return nil, err
+	}
+	next := advancePinOwnerRecord(current, now, current.Phase, current.Step)
+	found := false
+	for index := range next.ActiveLinks {
+		candidate := next.ActiveLinks[index]
+		if !sameExactTCXSlot(candidate, active) ||
+			candidate.ProgramID != active.ProgramID || candidate.LinkID != active.LinkID ||
+			candidate.ReplacesLinkID != 0 {
+			continue
+		}
+		next.ActiveLinks[index].LinkID = 0
+		next.ActiveLinks[index].ReplacesLinkID = active.LinkID
+		next.ActiveLinks[index].PinPending = false
+		next.ActiveLinks[index].Retiring = false
+		found = true
+		break
+	}
+	if !found {
+		return nil, errors.New("rollback active replacement has no exact journal slot")
+	}
+	normalizePinOwnerRecord(next)
+	if err := validatePinOwnerRecord(next, handle.resource, handle.mountID); err != nil {
+		return nil, err
+	}
+	observeOwnerMount(next, handle.mountID)
+	if err := store.Persist(next, current, handle.mountID); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+func ownerRecordResetRollbackActiveIdentity(
+	current *pinOwnerRecord,
+	active exactTCXBinding,
+	handle *pinPathHandle,
+	store exactTCXOwnerStore,
+) (*pinOwnerRecord, error) {
+	if current == nil || handle == nil || store == nil ||
+		current.Phase != pinOwnerPhaseApplying || current.Step != pinOwnerStepRollingBack ||
+		active.LinkID == 0 || active.ReplacesLinkID == 0 {
+		return nil, errors.New("cannot reset rollback replacement identity outside rolling_back")
+	}
+	now, err := ownerRuntimeNow(handle.runtime)
+	if err != nil {
+		return nil, err
+	}
+	next := advancePinOwnerRecord(current, now, current.Phase, current.Step)
+	found := false
+	for index := range next.ActiveLinks {
+		candidate := next.ActiveLinks[index]
+		if !sameExactTCXSlot(candidate, active) ||
+			candidate.ProgramID != active.ProgramID || candidate.LinkID != active.LinkID ||
+			candidate.ReplacesLinkID != active.ReplacesLinkID {
+			continue
+		}
+		next.ActiveLinks[index].LinkID = 0
+		next.ActiveLinks[index].PinPending = false
+		next.ActiveLinks[index].Retiring = false
+		found = true
+		break
+	}
+	if !found {
+		return nil, errors.New("rollback replacement identity has no exact active journal entry")
+	}
+	normalizePinOwnerRecord(next)
+	if err := validatePinOwnerRecord(next, handle.resource, handle.mountID); err != nil {
+		return nil, err
+	}
+	observeOwnerMount(next, handle.mountID)
+	if err := store.Persist(next, current, handle.mountID); err != nil {
+		return nil, err
+	}
+	return next, nil
+}
+
+func rollingBackExactTCXJournal(
+	record **pinOwnerRecord,
+	handle *pinPathHandle,
+	store exactTCXOwnerStore,
+	activeIndex int,
+) exactTCXJournal {
+	return exactTCXJournal{
+		persistIntent: func(intent exactTCXJournalIntent) error {
+			if record == nil || *record == nil || handle == nil || store == nil ||
+				(*record).Phase != pinOwnerPhaseApplying ||
+				(*record).Step != pinOwnerStepRollingBack ||
+				activeIndex < 0 || activeIndex >= len((*record).ActiveLinks) {
+				return errors.New("exact TCX rollback mutation is outside durable rolling_back intent")
+			}
+			active := (*record).ActiveLinks[activeIndex]
+			if !sameExactTCXSlot(active, intent.Desired) ||
+				active.ProgramID != intent.Desired.ProgramID ||
+				(active.LinkID != 0 && active.LinkID != intent.Desired.LinkID) {
+				return errors.New("exact TCX rollback mutation escaped its active journal slot")
+			}
+			return nil
+		},
+		persistIdentity: func(binding exactTCXBinding, _ exactTCXJournalIntent) error {
+			if record == nil || *record == nil || activeIndex < 0 ||
+				activeIndex >= len((*record).ActiveLinks) {
+				return errors.New("exact TCX rollback identity has no active journal slot")
+			}
+			current := *record
+			active := current.ActiveLinks[activeIndex]
+			if !sameExactTCXSlot(active, binding) ||
+				active.ProgramID != binding.ProgramID ||
+				active.ReplacesLinkID != binding.ReplacesLinkID || binding.LinkID == 0 {
+				return errors.New("exact TCX rollback published an unexpected active identity")
+			}
+			if active.LinkID == binding.LinkID &&
+				active.PinPending == binding.PinPending && !active.Retiring {
+				return nil
+			}
+			if active.LinkID != 0 && active.LinkID != binding.LinkID {
+				return fmt.Errorf("rollback active link ID changed from %d to %d", active.LinkID, binding.LinkID)
+			}
+			now, err := ownerRuntimeNow(handle.runtime)
+			if err != nil {
+				return err
+			}
+			next := advancePinOwnerRecord(current, now, current.Phase, current.Step)
+			next.ActiveLinks[activeIndex].LinkID = binding.LinkID
+			next.ActiveLinks[activeIndex].PinPending = binding.PinPending
+			next.ActiveLinks[activeIndex].Retiring = false
+			normalizePinOwnerRecord(next)
+			if err := validatePinOwnerRecord(next, handle.resource, handle.mountID); err != nil {
+				return err
+			}
+			observeOwnerMount(next, handle.mountID)
+			if err := store.Persist(next, current, handle.mountID); err != nil {
+				return err
+			}
+			*record = next
+			return nil
+		},
+	}
+}
+
 func convergeOwnerApplyExactTCXLinks(
 	ctx context.Context,
 	handle *pinPathHandle,
-	store *pinOwnerStore,
+	store exactTCXOwnerStore,
 	record *pinOwnerRecord,
 	programs *loadedOwnerPrograms,
 	runtime exactTCXRuntime,
@@ -637,11 +878,37 @@ func convergeOwnerApplyExactTCXLinks(
 			if desired.ReplacesLinkID != active.LinkID {
 				return current, errors.New("desired TCX replacement marker no longer matches the active link")
 			}
+			if desired.LinkID == 0 {
+				if err := removeOwnedExactTCXLink(handle, active, runtime); err != nil {
+					return current, fmt.Errorf("complete journaled detached active TCX retirement: %w", err)
+				}
+			} else {
+				absent, err := exactTCXLinkAbsentFromOriginalSlot(active, runtime)
+				if err != nil {
+					return current, err
+				}
+				if !absent {
+					return current, fmt.Errorf("retired active exact TCX link %d reappeared", active.LinkID)
+				}
+			}
 			replacing = false
 		}
 		pinPath := filepath.Join(handle.procPath(), desired.PinName)
 		if err := retryRetainedUnpinnedExactTCXOwner(pinPath); err != nil {
 			return current, err
+		}
+		if desired.Retiring {
+			if err := removeOwnedExactTCXLink(handle, desired, runtime); err != nil {
+				return current, fmt.Errorf("complete journaled desired TCX retirement: %w", err)
+			}
+			cleared, err := ownerRecordWithoutDesiredLinkIdentity(
+				current, desired, handle, store,
+			)
+			if err != nil {
+				return current, err
+			}
+			current = cleared
+			desired = current.DesiredLinks[index]
 		}
 		if replacing {
 			owner, observed, err := observePinnedExactTCXAt(
@@ -654,19 +921,19 @@ func convergeOwnerApplyExactTCXLinks(
 				return current, err
 			}
 			if !observed.Attached {
+				replacement, err := ownerRecordReplacingDetachedLink(
+					current, active, handle, store,
+				)
+				if err != nil {
+					return current, errors.Join(err, owner.Release())
+				}
+				current = replacement
 				if err := owner.Rollback(); err != nil {
 					return current, fmt.Errorf(
 						"retire detached active exact TCX link during apply: %w",
 						err,
 					)
 				}
-				replacement, err := ownerRecordReplacingDetachedLink(
-					current, active, handle, store,
-				)
-				if err != nil {
-					return current, err
-				}
-				current = replacement
 				desired = current.DesiredLinks[index]
 				replacing = false
 			}
@@ -729,6 +996,16 @@ func convergeOwnerApplyExactTCXLinks(
 					return current, err
 				}
 				continue
+			}
+			if desired.LinkID != 0 {
+				retiring, retireErr := ownerRecordRetiringDesiredLink(
+					current, desired, handle, store,
+				)
+				if retireErr != nil {
+					return current, errors.Join(retireErr, owner.Release())
+				}
+				current = retiring
+				desired = current.DesiredLinks[index]
 			}
 			if err := owner.Rollback(); err != nil {
 				return current, fmt.Errorf("discard detached exact TCX attach pin: %w", err)
