@@ -36,6 +36,7 @@ type fakeExactTCXKernel struct {
 
 	beforeAttach        func(*fakeExactTCXKernel, fakeExactTCXSlot)
 	beforeCompareUpdate func(*fakeExactTCXKernel, uint32)
+	lastUpdate          *exactTCXLinkUpdate
 	queryErr            error
 	pinErr              error
 	detachErrs          map[uint32][]error
@@ -190,19 +191,27 @@ func (handle *fakeExactTCXHandle) Pin(path string) error {
 	return nil
 }
 
-func (handle *fakeExactTCXHandle) CompareUpdate(next, previous exactTCXProgram) error {
+func (handle *fakeExactTCXHandle) CompareUpdate(update exactTCXLinkUpdate) error {
 	handle.kernel.events = append(handle.kernel.events, "compare-update")
 	state, err := handle.state()
 	if err != nil {
 		return err
 	}
+	if update.New.id == 0 || update.Old.id == 0 || update.New.id == update.Old.id {
+		return errors.New("fake TCX compare-update requires explicit distinct old/new programs")
+	}
+	if update.Flags != unix.BPF_F_REPLACE {
+		return fmt.Errorf("fake TCX compare-update flags %#x, want BPF_F_REPLACE", update.Flags)
+	}
+	captured := update
+	handle.kernel.lastUpdate = &captured
 	if handle.kernel.beforeCompareUpdate != nil {
 		handle.kernel.beforeCompareUpdate(handle.kernel, handle.id)
 	}
-	if state.identity.ProgramID != previous.id {
+	if state.identity.ProgramID != update.Old.id {
 		return unix.ESTALE
 	}
-	state.identity.ProgramID = next.id
+	state.identity.ProgramID = update.New.id
 	slot := fakeExactTCXSlot{ifindex: state.identity.IfIndex, attach: state.identity.Attach}
 	handle.kernel.revs[slot] = handle.kernel.revision(slot) + 1
 	return nil
@@ -548,6 +557,12 @@ func TestExactTCXCompareUpdateUsesKernelOldProgramCAS(t *testing.T) {
 	}
 	if updateJournal.intent == nil || updateJournal.active != nil {
 		t.Fatalf("intent=%+v active=%+v", updateJournal.intent, updateJournal.active)
+	}
+	if kernel.lastUpdate == nil ||
+		kernel.lastUpdate.Old.id != 71 ||
+		kernel.lastUpdate.New.id != 72 ||
+		kernel.lastUpdate.Flags != unix.BPF_F_REPLACE {
+		t.Fatalf("explicit compare-update arguments=%+v", kernel.lastUpdate)
 	}
 	observed := owner.binding
 	observed.ProgramID = 999

@@ -14,6 +14,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	ciliumlink "github.com/cilium/ebpf/link"
+	"golang.org/x/sys/unix"
 )
 
 const exactTCXBackend = "tcx"
@@ -50,10 +51,16 @@ type exactTCXLinkIdentity struct {
 type exactTCXKernelLink interface {
 	Identity() (exactTCXLinkIdentity, error)
 	Pin(string) error
-	CompareUpdate(next, previous exactTCXProgram) error
+	CompareUpdate(exactTCXLinkUpdate) error
 	Detach() error
 	Unpin() error
 	Close() error
+}
+
+type exactTCXLinkUpdate struct {
+	New   exactTCXProgram
+	Old   exactTCXProgram
+	Flags uint32
 }
 
 type exactTCXRuntime struct {
@@ -110,20 +117,24 @@ func (owned *liveExactTCXLink) Pin(path string) error {
 	return owned.link.Pin(path)
 }
 
-func (owned *liveExactTCXLink) CompareUpdate(next, previous exactTCXProgram) error {
+func (owned *liveExactTCXLink) CompareUpdate(update exactTCXLinkUpdate) error {
 	if owned == nil || owned.link == nil {
 		return errors.New("TCX link is nil")
 	}
-	if next.kernel == nil || previous.kernel == nil {
+	if update.New.kernel == nil || update.Old.kernel == nil {
 		return errors.New("TCX compare-update requires live old and new programs")
+	}
+	if update.Flags != unix.BPF_F_REPLACE {
+		return fmt.Errorf("TCX compare-update flags %#x, want BPF_F_REPLACE", update.Flags)
 	}
 	updater, ok := owned.link.(exactTCXLinkUpdater)
 	if !ok {
 		return errors.New("TCX link backend does not expose compare-update")
 	}
 	return updater.UpdateArgs(ciliumlink.RawLinkUpdateOptions{
-		New: next.kernel,
-		Old: previous.kernel,
+		New:   update.New.kernel,
+		Old:   update.Old.kernel,
+		Flags: update.Flags,
 	})
 }
 
@@ -625,7 +636,11 @@ func (owner *exactTCXAttachment) CompareUpdateWithOld(
 		return fmt.Errorf("persist TCX update intent: %w", err)
 	}
 	owner.committed = false
-	if err := owner.link.CompareUpdate(next, previous); err != nil {
+	if err := owner.link.CompareUpdate(exactTCXLinkUpdate{
+		New:   next,
+		Old:   previous,
+		Flags: unix.BPF_F_REPLACE,
+	}); err != nil {
 		return fmt.Errorf("compare-update exact TCX link: %w", err)
 	}
 	identity, err := owner.link.Identity()
