@@ -75,9 +75,13 @@ The reviewed run contains:
 5. MTU 1492 and 1500 positive/negative boundaries and a program-active scoped
    contract at each MTU.
 6. Twelve bounded 300-second program-active soak windows (exactly 3600
-   seconds), with 10-second monitoring and 360 expected samples.
-7. Exact restoration comparisons for NIC settings, MTU, qdisc/filter state,
-   BPF links/programs/maps, module state, and every run-owned pin.
+   seconds), with 10-second monitoring and 360 expected samples. The
+   throughput floor uses the median of all twelve first-hour windows, and TCP
+   retransmits are normalized by sender bytes.
+7. Exact restoration comparisons for the complete `ethtool -k` snapshot,
+   MTU, qdisc/filter state, BPF links/programs/maps, module state, and every
+   run-owned pin. Selected feature toggles are not accepted as proof if any
+   collateral offload field differs from the original complete snapshot.
 
 Timeout arithmetic is enforced by `test_matrix_static.py`:
 
@@ -113,6 +117,17 @@ The scoped physical tests must not use `/run/wg-mix-ebpf/daemon.lease` or any
 path below `/var/lib/wg-mix-ebpf`. The matrix does not add/delete clsact, does
 not mount filesystems, and does not use containers, chroot, nsenter, recursive
 deletion, traps, eval, or error-suppression cleanup.
+
+The argv gate rejects non-canonical interface names and non-canonical,
+non-unicast IPv4 values before evidence creation. Bootstrap creation of the
+evidence directory and audit file emits UTC, exact target, full argv, and exit
+status to stdout and persists those records once the audit file exists. Every
+later write uses the same start/finish audit contract; NIC state is assembled
+and validated in memory before one exclusive write.
+
+Rule-miss counters remain monotonic observations because unrelated physical
+traffic can legitimately grow them. Checksum, load/store, malformed packet,
+and other hard-error counters must remain unchanged.
 
 Failures retain evidence and stop without automatic teardown. Recovery is an
 explicit `restore` invocation with exactly one reviewed `--restore-cell` value.

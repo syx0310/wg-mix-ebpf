@@ -132,13 +132,28 @@ def main() -> None:
         "SCOPED_REALNIC_COMPLETE cell=${cell} restored=1",
         "SCOPED_REALNIC_RESTORE_COMPLETE cell=${cell} restored=1",
         "verify_scoped_kernel_restored",
+        "valid_interface_name",
+        "valid_unicast_ipv4",
+        "bootstrap_run_step",
+        "create_bootstrap_audit_log",
+        "verify_full_feature_restore",
+        '/usr/bin/cmp -s "${EVIDENCE_ROOT}/A7.out" "${STEP_LOG}"',
         "REALHOST_V6_STOP",
         "no automatic teardown",
     )
     for literal in required_literals:
         if literal not in matrix:
             fail(f"matrix contract is missing {literal!r}")
-    for literal in ("stats-contrast", "--require-egress", "--require-ingress"):
+    for literal in (
+        "stats-contrast",
+        "--require-egress",
+        "--require-ingress",
+        "OBSERVATION_COUNTERS",
+        "HARD_ERROR_COUNTERS",
+        "first_hour_throughput_baseline",
+        "soak_group_totals",
+        '"sent_bytes": sum(sent)',
+    ):
         if literal not in checker:
             fail(f"checker contract is missing {literal!r}")
     for literal in ("owner-snapshot", "OWNER_ROOT"):
@@ -194,6 +209,12 @@ def main() -> None:
             fail(f"production lifecycle root appears in scoped test scripts: {production_root}")
     if re.search(r"\btc\s+qdisc\s+(?:add|delete|del)\b", matrix):
         fail("matrix manually creates or removes clsact despite TCX contract")
+    if '>>"${NIC_STATE}"' in matrix or '>"${NIC_STATE}"' in matrix:
+        fail("NIC state is written incrementally outside audited write_once")
+    if 'write_once "${NIC_STATE}" "${records[@]}"' not in matrix:
+        fail("NIC state is not materialized by one audited exclusive write")
+    if matrix.count('verify_full_feature_restore "${prefix}"') != 1:
+        fail("every NIC restoration must end in one complete offload comparison")
     if "FINAL_INTEGRATION_COMMIT_REQUIRED" in matrix:
         fail("matrix embeds a source-commit placeholder instead of requiring argv")
     if "COMMIT='c8e41d73'" in matrix:
@@ -226,7 +247,11 @@ def main() -> None:
     fixture = iperf_fixture()
     checker_module.expected_direction(fixture, "forward", 4)
     groups = checker_module.measured_groups(fixture, "forward", 4)
-    if len(groups) != 1 or groups[0]["received_bytes"] != 57_920_000:
+    if (
+        len(groups) != 1
+        or groups[0]["sent_bytes"] != 57_920_000
+        or groups[0]["received_bytes"] != 57_920_000
+    ):
         fail("iperf positive fixture was not measured exactly")
     fixture["end"]["streams"][0]["sender"]["retransmits"] = 1000  # type: ignore[index]
     fixture["end"]["sum_sent"]["retransmits"] = 1000  # type: ignore[index]
@@ -234,11 +259,19 @@ def main() -> None:
     if groups[0]["retransmit_rate"] <= 0.0001:
         fail("iperf retransmit fixture did not exceed the acceptance threshold")
 
-    before = {name: 0 for name in checker_module.ERROR_COUNTERS}
+    before = {
+        name: 0
+        for name in (
+            *checker_module.OBSERVATION_COUNTERS,
+            *checker_module.HARD_ERROR_COUNTERS,
+        )
+    }
     before.update({"egress_rewrite_ok": 10, "ingress_rewrite_ok": 20})
     after = dict(before)
     after["egress_rewrite_ok"] += 2
     after["ingress_rewrite_ok"] += 3
+    after["egress_rule_miss"] += 5
+    after["ingress_rule_miss"] += 7
     deltas = checker_module.counter_deltas(
         before,
         after,
@@ -248,6 +281,8 @@ def main() -> None:
     )
     if deltas["egress_rewrite_ok"] != 2 or deltas["ingress_rewrite_ok"] != 3:
         fail("program-active counter fixture was not measured exactly")
+    if deltas["egress_rule_miss"] != 5 or deltas["ingress_rule_miss"] != 7:
+        fail("rule-miss observation fixture was not retained exactly")
     try:
         checker_module.counter_deltas(
             before,
@@ -261,7 +296,7 @@ def main() -> None:
     else:
         fail("bare-control rewrite growth was accepted")
     error_after = dict(before)
-    error_after[checker_module.ERROR_COUNTERS[0]] = 1
+    error_after[checker_module.HARD_ERROR_COUNTERS[0]] = 1
     try:
         checker_module.counter_deltas(
             before,
@@ -274,6 +309,42 @@ def main() -> None:
         pass
     else:
         fail("dataplane error-counter growth was accepted")
+
+    sender_denominator = checker_module.soak_group_totals(
+        [
+            {
+                "sent_bytes": 14_480,
+                "received_bytes": 1_448,
+                "throughput_mbps": 1.0,
+                "retransmits": 5,
+            }
+        ]
+    )
+    if (
+        sender_denominator["estimated_segments"] != 10
+        or sender_denominator["retransmit_rate"] != 0.5
+    ):
+        fail("soak retransmits were not normalized by sender bytes")
+
+    first_hour = [
+        {"throughput_mbps": 10.0, "window": index}
+        for index in range(3)
+    ] + [
+        {"throughput_mbps": 100.0, "window": index}
+        for index in range(3, 12)
+    ]
+    try:
+        checker_module.first_hour_throughput_baseline(first_hour, 0.70)
+    except checker_module.CheckError:
+        pass
+    else:
+        fail("three slow opening windows bypassed the full first-hour median")
+    baseline, floor = checker_module.first_hour_throughput_baseline(
+        [{"throughput_mbps": 100.0, "window": index} for index in range(12)],
+        0.70,
+    )
+    if baseline != 100.0 or floor != 70.0:
+        fail("first-hour twelve-window median fixture was not measured exactly")
 
     print("static real-host safety and checker fixtures: PASS")
 

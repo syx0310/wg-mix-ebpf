@@ -14,13 +14,15 @@ from typing import Any
 
 
 MSS_ESTIMATE = 1448
-ERROR_COUNTERS = (
+OBSERVATION_COUNTERS = (
     "egress_rule_miss",
+    "ingress_rule_miss",
+)
+HARD_ERROR_COUNTERS = (
     "egress_bad_type",
     "egress_bad_length",
     "egress_fragment",
     "egress_ipv6_ext",
-    "ingress_rule_miss",
     "ingress_bad_type",
     "ingress_bad_length",
     "ingress_fragment",
@@ -91,7 +93,12 @@ def status_stats(path: Path) -> dict[str, int]:
         if not isinstance(name, str) or not re.fullmatch(r"[a-z0-9_]{1,80}", name):
             raise CheckError(f"invalid dataplane counter name in {path}")
         result[name] = integer(raw, f"counter {name}")
-    for required in ("egress_rewrite_ok", "ingress_rewrite_ok", *ERROR_COUNTERS):
+    for required in (
+        "egress_rewrite_ok",
+        "ingress_rewrite_ok",
+        *OBSERVATION_COUNTERS,
+        *HARD_ERROR_COUNTERS,
+    ):
         if required not in result:
             raise CheckError(f"required dataplane counter {required} is missing in {path}")
     return result
@@ -113,7 +120,7 @@ def counter_deltas(
         if delta < 0:
             raise CheckError(f"dataplane counter {name} decreased")
         deltas[name] = delta
-    for name in ERROR_COUNTERS:
+    for name in HARD_ERROR_COUNTERS:
         if deltas[name] != 0:
             raise CheckError(f"dataplane error counter {name} grew by {deltas[name]}")
     if forbid_rewrite_growth and (
@@ -257,6 +264,7 @@ def measured_groups(
         result.append(
             {
                 "direction": label,
+                "sent_bytes": sum(sent),
                 "received_bytes": sum(received),
                 "throughput_mbps": sum(received) * 8 / seconds / 1_000_000,
                 "retransmits": retransmits,
@@ -281,59 +289,80 @@ def check_one(args: argparse.Namespace) -> list[dict[str, float | int]]:
     return groups
 
 
+def soak_group_totals(
+    groups: list[dict[str, float | int]],
+) -> dict[str, float | int]:
+    sent_bytes = sum(int(group["sent_bytes"]) for group in groups)
+    received_bytes = sum(int(group["received_bytes"]) for group in groups)
+    retransmits = sum(int(group["retransmits"]) for group in groups)
+    segments = max(1, math.ceil(sent_bytes / MSS_ESTIMATE))
+    return {
+        "sent_bytes": sent_bytes,
+        "received_bytes": received_bytes,
+        "throughput_mbps": sum(float(group["throughput_mbps"]) for group in groups),
+        "retransmits": retransmits,
+        "estimated_segments": segments,
+        "retransmit_rate": retransmits / segments,
+    }
+
+
+def first_hour_throughput_baseline(
+    windows: list[dict[str, float | int]], minimum_ratio: float
+) -> tuple[float, float]:
+    if len(windows) != 12:
+        raise CheckError(f"first-hour soak window count={len(windows)}, want 12")
+    baseline = statistics.median(
+        float(window["throughput_mbps"]) for window in windows
+    )
+    floor = baseline * minimum_ratio
+    for window in windows:
+        if float(window["throughput_mbps"]) < floor:
+            raise CheckError(f"soak throughput window below floor: {window}")
+    return baseline, floor
+
+
 def check_soak(args: argparse.Namespace) -> dict[str, Any]:
+    if args.expected_windows != 12:
+        raise CheckError(
+            f"reviewed first-hour soak requires 12 windows, got {args.expected_windows}"
+        )
     if len(args.paths) != args.expected_windows:
         raise CheckError(
             f"soak JSON count={len(args.paths)}, want {args.expected_windows}"
         )
     windows: list[dict[str, float | int]] = []
-    total_bytes = 0
+    total_received_bytes = 0
+    total_sent_bytes = 0
     total_retransmits = 0
-    total_segments = 0
     for path in args.paths:
         doc = document(path)
         expected_direction(doc, "bidir", args.streams)
         groups = measured_groups(doc, "bidir", args.streams)
-        combined_bytes = sum(int(group["received_bytes"]) for group in groups)
-        combined_mbps = sum(float(group["throughput_mbps"]) for group in groups)
-        combined_retransmits = sum(int(group["retransmits"]) for group in groups)
-        sent_bytes = sum(
-            int(group["received_bytes"]) for group in groups
-        )
-        segments = max(1, math.ceil(sent_bytes / MSS_ESTIMATE))
-        rate = combined_retransmits / segments
-        if rate > args.maximum_window_retransmit_rate:
-            raise CheckError(f"soak retransmit window above maximum in {path}: {rate}")
+        totals = soak_group_totals(groups)
+        if float(totals["retransmit_rate"]) > args.maximum_window_retransmit_rate:
+            raise CheckError(
+                f"soak retransmit window above maximum in {path}: "
+                f"{totals['retransmit_rate']}"
+            )
         if any(float(group["fairness"]) < args.minimum_fairness for group in groups):
             raise CheckError(f"soak fairness below minimum in {path}")
-        windows.append(
-            {
-                "path": str(path),
-                "received_bytes": combined_bytes,
-                "throughput_mbps": combined_mbps,
-                "retransmits": combined_retransmits,
-                "retransmit_rate": rate,
-            }
-        )
-        total_bytes += combined_bytes
-        total_retransmits += combined_retransmits
-        total_segments += segments
-    baseline_count = min(3, len(windows))
-    baseline = statistics.median(
-        float(window["throughput_mbps"]) for window in windows[:baseline_count]
+        windows.append({"path": str(path), **totals})
+        total_received_bytes += int(totals["received_bytes"])
+        total_sent_bytes += int(totals["sent_bytes"])
+        total_retransmits += int(totals["retransmits"])
+    baseline, floor = first_hour_throughput_baseline(
+        windows, args.minimum_throughput_ratio
     )
-    floor = baseline * args.minimum_throughput_ratio
-    for window in windows:
-        if float(window["throughput_mbps"]) < floor:
-            raise CheckError(f"soak throughput window below floor: {window}")
-    overall_rate = total_retransmits / max(1, total_segments)
+    overall_segments = max(1, math.ceil(total_sent_bytes / MSS_ESTIMATE))
+    overall_rate = total_retransmits / overall_segments
     if overall_rate > args.maximum_overall_retransmit_rate:
         raise CheckError(f"soak overall retransmit rate above maximum: {overall_rate}")
     return {
         "windows": windows,
         "baseline_mbps": baseline,
         "minimum_mbps": floor,
-        "received_bytes": total_bytes,
+        "sent_bytes": total_sent_bytes,
+        "received_bytes": total_received_bytes,
         "retransmits": total_retransmits,
         "retransmit_rate": overall_rate,
     }

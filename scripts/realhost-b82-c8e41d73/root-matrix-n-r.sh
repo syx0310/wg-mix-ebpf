@@ -73,6 +73,7 @@ ORIGINAL_MTU=''
 VETH_A_IFINDEX=''
 VETH_B_IFINDEX=''
 INITIAL_NETNS=''
+declare -a BOOTSTRAP_AUDIT_LINES=()
 
 readonly -a FEATURE_NAMES=(
   rx-checksumming
@@ -115,6 +116,29 @@ valid_sha256() {
     ! "${value}" =~ ^0{64}$ && ! "${value}" =~ ^f{64}$ ]]
 }
 
+valid_interface_name() {
+  local value="$1"
+  [[ "${value}" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,14}$ &&
+    "${value}" != '.' && "${value}" != '..' ]]
+}
+
+valid_unicast_ipv4() {
+  local value="$1"
+  local first second third fourth extra octet number
+  IFS=. read -r first second third fourth extra <<<"${value}"
+  [[ -z "${extra}" && -n "${first}" && -n "${second}" &&
+    -n "${third}" && -n "${fourth}" ]] || return 1
+  [[ "${value}" == "${first}.${second}.${third}.${fourth}" ]] || return 1
+  for octet in "${first}" "${second}" "${third}" "${fourth}"; do
+    [[ "${octet}" =~ ^(0|[1-9][0-9]{0,2})$ ]] || return 1
+    number=$((10#${octet}))
+    ((number <= 255)) || return 1
+  done
+  number=$((10#${first}))
+  ((number >= 1 && number <= 223 && number != 127)) || return 1
+  [[ "${value}" != '255.255.255.255' ]]
+}
+
 parse_arguments() {
   (($# >= 1)) || { usage; return 64; }
   MODE="$1"
@@ -152,12 +176,13 @@ parse_arguments() {
   [[ "${SESSION_SECONDS}" == "${EXPECTED_SESSION_SECONDS}" ]] || return 65
   valid_commit "${COMMIT}" || return 65
   valid_sha256 "${BUNDLE_SHA256}" || return 65
-  [[ "${WG_INTERFACE}" =~ ^[A-Za-z0-9_.-]{1,15}$ &&
+  valid_interface_name "${WG_INTERFACE}" &&
+  [[
     "${WG_INTERFACE}" != "${INTERFACE}" && "${WG_INTERFACE}" != "${VETH_A}" &&
     "${WG_INTERFACE}" != "${VETH_B}" ]] || return 65
-  [[ "${WG_LOCAL_ADDRESS}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ &&
-    "${WG_PEER_ADDRESS}" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ &&
-    "${WG_LOCAL_ADDRESS}" != "${WG_PEER_ADDRESS}" ]] || return 65
+  valid_unicast_ipv4 "${WG_LOCAL_ADDRESS}" || return 65
+  valid_unicast_ipv4 "${WG_PEER_ADDRESS}" || return 65
+  [[ "${WG_LOCAL_ADDRESS}" != "${WG_PEER_ADDRESS}" ]] || return 65
   case "${MODE}:${RESTORE_CELL}" in
     plan:none | run:none | restore:none | restore:tcx | restore:original | restore:all-on | restore:all-off | \
       restore:tx-path | restore:rx-path | restore:mtu1492 | restore:mtu1500 | restore:soak) ;;
@@ -184,6 +209,8 @@ render_plan() {
   printf 'REALHOST_V6_PLAN_ENDPOINTS bare=%s:%s active_wg=%s:%s->%s:%s\n' \
     "${PEER_ADDRESS}" "${PEER_PORT}" "${WG_INTERFACE}" "${WG_LOCAL_ADDRESS}" \
     "${WG_PEER_ADDRESS}" "${PEER_PORT}"
+  plan_command B0 /usr/bin/mkdir --mode=0700 -- "${EVIDENCE_ROOT}"
+  plan_command B1 shell-builtin noclobber-create-and-persist-bootstrap-audit "${AUDIT_LOG}"
   plan_command A1 /usr/bin/hostname
   plan_command A2 /usr/bin/uname -r
   plan_command A3 /usr/bin/cat /etc/machine-id
@@ -286,6 +313,8 @@ render_plan() {
   printf 'R-scoped-soak windows=%s session_seconds=%s total_seconds=%s monitor_samples=360\n' \
     "${SOAK_WINDOWS}" "${SESSION_SECONDS}" "$((SOAK_WINDOWS * SESSION_SECONDS))"
   plan_command R-restore /usr/sbin/ethtool -K "${INTERFACE}" EXACT_ORIGINAL_VALUES
+  plan_command R-full-offload-snapshot /usr/sbin/ethtool -k "${INTERFACE}"
+  plan_command R-full-offload-compare /usr/bin/cmp -s "${EVIDENCE_ROOT}/A7.out" EXACT_RESTORED_FEATURE_SNAPSHOT
   plan_command R-mtu /usr/sbin/ip link set dev "${INTERFACE}" mtu EXACT_ORIGINAL_MTU
   plan_command Z-scoped-restore /usr/bin/env -i \
     WG_MIX_EBPF_RUN_SCOPED_REALNIC_INTEGRATION=1 \
@@ -300,6 +329,49 @@ render_plan() {
 
 utc_now() {
   /bin/date -u '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+bootstrap_audit_line() {
+  local event="$1" step="$2" target="$3" rc="$4" rendered="$5"
+  local timestamp line
+  timestamp="$(utc_now)" || return $?
+  [[ "${timestamp}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 79
+  printf -v line 'utc=%q event=%q step=%q target=%q rc=%q argv=%q' \
+    "${timestamp}" "${event}" "${step}" "${target}" "${rc}" "${rendered}"
+  BOOTSTRAP_AUDIT_LINES+=("${line}")
+  printf 'REALHOST_V6_BOOTSTRAP_AUDIT %s\n' "${line}"
+}
+
+bootstrap_run_step() {
+  local step="$1" target="$2" rendered rc
+  shift 2
+  rendered="$(quote_argv "$@")" || return $?
+  bootstrap_audit_line start "${step}" "${target}" not-run "${rendered}" || return $?
+  "$@"
+  rc=$?
+  bootstrap_audit_line finish "${step}" "${target}" "${rc}" "${rendered}" || return $?
+  return "${rc}"
+}
+
+create_bootstrap_audit_log() {
+  local rendered rc persist_rc finish_line last_index
+  rendered="shell-builtin: noclobber create ${AUDIT_LOG}; persist bootstrap start/finish records"
+  bootstrap_audit_line start B1.audit-create "${AUDIT_LOG}" not-run "${rendered}" || return $?
+  set -o noclobber
+  printf '%s\n' "${BOOTSTRAP_AUDIT_LINES[@]}" >"${AUDIT_LOG}"
+  rc=$?
+  set +o noclobber
+  bootstrap_audit_line finish B1.audit-create "${AUDIT_LOG}" "${rc}" "${rendered}" || return $?
+  ((rc == 0)) || return "${rc}"
+  last_index=$((${#BOOTSTRAP_AUDIT_LINES[@]} - 1))
+  finish_line="${BOOTSTRAP_AUDIT_LINES[${last_index}]}"
+  printf '%s\n' "${finish_line}" >>"${AUDIT_LOG}"
+  persist_rc=$?
+  if ((persist_rc != 0)); then
+    bootstrap_audit_line finish B1.audit-persist "${AUDIT_LOG}" "${persist_rc}" \
+      'shell-builtin: append audit-create finish record' || return $?
+    return "${persist_rc}"
+  fi
 }
 
 audit_line() {
@@ -321,20 +393,25 @@ audit_line() {
 run_step() {
   local step="$1"
   local target="$2"
-  local rendered
+  local rendered evidence_rendered
   local -a status
   shift 2
   STEP_LOG="${EVIDENCE_ROOT}/${step}.out"
   [[ "${step}" =~ ^[A-Z][A-Za-z0-9_.-]{0,95}$ ]] || fail "invalid-step:${step}" 64
   [[ ! -e "${STEP_LOG}" && ! -L "${STEP_LOG}" ]] || fail "step-output-exists:${step}" 78
   rendered="$(quote_argv "$@")" || fail "render:${step}"
+  evidence_rendered="$(quote_argv /usr/bin/tee "${STEP_LOG}")" || fail "render-evidence:${step}"
   audit_line start "${step}" "${target}" not-run "${rendered}" || fail "audit-start:${step}"
+  audit_line start "${step}.evidence" "${STEP_LOG}" not-run "${evidence_rendered}" ||
+    fail "audit-evidence-start:${step}"
   "$@" 2>&1 | /usr/bin/tee "${STEP_LOG}"
   status=("${PIPESTATUS[@]}")
   ((${#status[@]} == 2)) || fail "pipeline-status:${step}"
   STEP_RC="${status[0]}"
-  ((status[1] == 0)) || fail "evidence-write:${step}:rc=${status[1]}" "${status[1]}"
   audit_line finish "${step}" "${target}" "${STEP_RC}" "${rendered}" || fail "audit-finish:${step}"
+  audit_line finish "${step}.evidence" "${STEP_LOG}" "${status[1]}" "${evidence_rendered}" ||
+    fail "audit-evidence-finish:${step}"
+  ((status[1] == 0)) || fail "evidence-write:${step}:rc=${status[1]}" "${status[1]}"
 }
 
 require_zero() {
@@ -344,17 +421,21 @@ require_zero() {
 
 write_once() {
   local path="$1"
+  local step rendered rc
   shift
   [[ "${path}" == "${EVIDENCE_ROOT}/"* && "${path#${EVIDENCE_ROOT}/}" != */* ]] ||
     fail "write-scope:${path}" 65
   [[ ! -e "${path}" && ! -L "${path}" ]] || fail "write-exists:${path}" 78
+  step="write-$(/usr/bin/basename -- "${path}")"
+  rendered="$(quote_argv shell-builtin printf '%s\\n' "$@")>$(quote_argv "${path}")" ||
+    fail "render-write:${path}"
+  audit_line start "${step}" "${path}" not-run "${rendered}" || fail "audit-write-start:${path}"
   set -o noclobber
   printf '%s\n' "$@" >"${path}"
-  local rc=$?
+  rc=$?
   set +o noclobber
+  audit_line finish "${step}" "${path}" "${rc}" "${rendered}" || fail "audit-write-finish:${path}"
   ((rc == 0)) || fail "write:${path}:rc=${rc}" "${rc}"
-  audit_line write "$(/usr/bin/basename "${path}")" "${path}" "${rc}" \
-    "printf fixed-record > ${path}" || fail "audit-write:${path}"
 }
 
 require_tooling() {
@@ -418,12 +499,16 @@ validate_common_identity() {
 }
 
 create_evidence_root() {
+  local rc
   [[ ! -e "${EVIDENCE_ROOT}" && ! -L "${EVIDENCE_ROOT}" ]] || fail 'evidence-exists' 78
-  /usr/bin/mkdir --mode=0700 -- "${EVIDENCE_ROOT}" || fail 'evidence-create'
+  bootstrap_run_step B0.evidence-create "${EVIDENCE_ROOT}" \
+    /usr/bin/mkdir --mode=0700 -- "${EVIDENCE_ROOT}"
+  rc=$?
+  ((rc == 0)) || fail "evidence-create:rc=${rc}" "${rc}"
   [[ -d "${EVIDENCE_ROOT}" && ! -L "${EVIDENCE_ROOT}" ]] || fail 'evidence-shape' 79
-  set -o noclobber
-  : >"${AUDIT_LOG}" || fail 'audit-create'
-  set +o noclobber
+  create_bootstrap_audit_log
+  rc=$?
+  ((rc == 0)) || fail "audit-create:rc=${rc}" "${rc}"
   ORIGINAL_BOOT_ID="$(read_single_line /proc/sys/kernel/random/boot_id)" || fail 'boot-id-read'
   [[ "${ORIGINAL_BOOT_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
     fail 'boot-id-invalid' 79
@@ -492,18 +577,20 @@ feature_line() {
 
 capture_nic_state() {
   local feature value state line
+  local -a records=(
+    'format=wg-mix-ebpf-nic-state-v1'
+    "interface=${INTERFACE}"
+    "ifindex=${ORIGINAL_IFINDEX}"
+    "mac=${ORIGINAL_MAC}"
+    "mtu=${ORIGINAL_MTU}"
+  )
   [[ ! -e "${NIC_STATE}" && ! -L "${NIC_STATE}" ]] || fail 'nic-state-exists' 78
-  set -o noclobber
-  printf 'format=wg-mix-ebpf-nic-state-v1\ninterface=%s\nifindex=%s\nmac=%s\nmtu=%s\n' \
-    "${INTERFACE}" "${ORIGINAL_IFINDEX}" "${ORIGINAL_MAC}" "${ORIGINAL_MTU}" >"${NIC_STATE}" ||
-    fail 'nic-state-create'
   for feature in "${FEATURE_NAMES[@]}"; do
     line="$(feature_line "${EVIDENCE_ROOT}/A7.out" "${feature}")" || fail "feature-parse:${feature}"
     if [[ -z "${line}" ]]; then
       case "${feature}" in
         tx-udp-segmentation | rx-udp-gro-forwarding)
-          printf 'feature=%s value=unsupported mutability=unsupported\n' "${feature}" >>"${NIC_STATE}" ||
-            fail "feature-record:${feature}"
+          records+=("feature=${feature} value=unsupported mutability=unsupported")
           continue
           ;;
         *) fail "required-feature-absent:${feature}" 79 ;;
@@ -512,11 +599,9 @@ capture_nic_state() {
     read -r value state <<<"${line}"
     [[ "${value}" =~ ^(on|off)$ && "${state}" =~ ^(fixed|mutable)$ ]] ||
       fail "feature-state-invalid:${feature}" 79
-    printf 'feature=%s value=%s mutability=%s\n' "${feature}" "${value}" "${state}" >>"${NIC_STATE}" ||
-      fail "feature-record:${feature}"
+    records+=("feature=${feature} value=${value} mutability=${state}")
   done
-  set +o noclobber
-  audit_line write nic-original "${NIC_STATE}" 0 "write exact original NIC state" || fail 'audit-nic-state'
+  write_once "${NIC_STATE}" "${records[@]}"
 }
 
 current_interface_identity() {
@@ -553,6 +638,14 @@ set_feature() {
   [[ "${current}" == "${desired} mutable" ]] || fail "feature-not-applied:${feature}" 79
 }
 
+verify_full_feature_restore() {
+  local prefix="$1"
+  run_step "${prefix}.all-features" "${INTERFACE}" /usr/sbin/ethtool -k "${INTERFACE}"
+  require_zero "${prefix}.all-features"
+  /usr/bin/cmp -s "${EVIDENCE_ROOT}/A7.out" "${STEP_LOG}" ||
+    fail "${prefix}:complete-offload-state-drift" 79
+}
+
 restore_nic_state() {
   local prefix="$1"
   local feature original desired mutability
@@ -574,6 +667,7 @@ restore_nic_state() {
   current_interface_identity || fail "${prefix}:post-identity" 79
   [[ "$(read_single_line "/sys/class/net/${INTERFACE}/mtu")" == "${ORIGINAL_MTU}" ]] ||
     fail "${prefix}:mtu-not-restored" 79
+  verify_full_feature_restore "${prefix}"
 }
 
 apply_feature_cell() {
