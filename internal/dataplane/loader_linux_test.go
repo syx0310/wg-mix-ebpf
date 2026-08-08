@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -19,6 +20,14 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/pinidentity"
 )
+
+func TestApplyRefusesLegacyAdoptionBeforeRuntimeAccess(t *testing.T) {
+	loader := LinuxLoader{AdoptLegacyPins: true}
+	err := loader.Apply(context.Background(), &control.State{})
+	if err == nil || !strings.Contains(err.Error(), "detach with a trusted legacy build") {
+		t.Fatalf("legacy adoption error = %v", err)
+	}
+}
 
 func TestXORTailCallBankStartAlternatesWithoutOverlap(t *testing.T) {
 	tests := []struct {
@@ -1212,16 +1221,55 @@ func TestBPFFSPinLifecycleIntegration(t *testing.T) {
 	if validated.exists {
 		t.Fatalf("refuse integration test because pin path already exists: %s", pinPath)
 	}
+	ifindexText := os.Getenv("WG_MIX_EBPF_TEST_IFINDEX")
+	ifindex, err := strconv.Atoi(ifindexText)
+	if err != nil || ifindex <= 0 {
+		t.Fatalf("WG_MIX_EBPF_TEST_IFINDEX must be a positive integer, got %q", ifindexText)
+	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	loader := LinuxLoader{
 		ObjectPath: objectPath,
 		PinPath:    pinPath,
 	}
-	state := &control.State{}
+	t.Setenv(EnvPinPath, pinPath)
+	state := &control.State{Underlays: []control.UnderlayState{{
+		Name:     "approved-bpffs-integration",
+		IfIndex:  ifindex,
+		Role:     "transform",
+		Resolved: true,
+	}}}
 	if err := loader.Apply(ctx, state); err != nil {
 		t.Fatalf("apply test collection: %v", err)
+	}
+	first, err := inspect(ctx, state)
+	if err != nil || first.MapError != "" || len(first.Underlays) != 1 || len(first.Underlays[0].Filters) != 2 {
+		t.Fatalf("inspect first exact TCX apply: status=%+v error=%v", first, err)
+	}
+	firstByDirection := make(map[string]FilterStatus, 2)
+	for _, filter := range first.Underlays[0].Filters {
+		if filter.Backend != exactTCXBackend || filter.LinkID == 0 || filter.ProgramID == 0 {
+			t.Fatalf("first apply returned incomplete exact TCX filter: %+v", filter)
+		}
+		firstByDirection[filter.Direction] = filter
+	}
+	if len(firstByDirection) != 2 {
+		t.Fatalf("first exact TCX apply did not expose both directions: %+v", first.Underlays[0].Filters)
+	}
+	if err := loader.Apply(ctx, state); err != nil {
+		t.Fatalf("compare-update test collection: %v", err)
+	}
+	second, err := inspect(ctx, state)
+	if err != nil || second.MapError != "" || len(second.Underlays) != 1 || len(second.Underlays[0].Filters) != 2 {
+		t.Fatalf("inspect compare-updated exact TCX apply: status=%+v error=%v", second, err)
+	}
+	for _, filter := range second.Underlays[0].Filters {
+		previous, ok := firstByDirection[filter.Direction]
+		if !ok || filter.LinkID != previous.LinkID ||
+			filter.ProgramID == 0 || filter.ProgramID == previous.ProgramID {
+			t.Fatalf("exact TCX update did not preserve link/switch program: before=%+v after=%+v", previous, filter)
+		}
 	}
 	if err := loader.Detach(ctx, state); err != nil {
 		t.Fatalf("detach test collection: %v", err)

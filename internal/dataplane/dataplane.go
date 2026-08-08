@@ -31,6 +31,9 @@ type AttachStateLoader interface {
 }
 
 type LoaderOptions struct {
+	// Deprecated: v4 refuses classic pin/filter adoption because those records
+	// do not carry exact bpf_link identity. The field remains for API
+	// compatibility and causes Apply to return an explicit migration error.
 	AdoptLegacyPins bool
 }
 
@@ -54,6 +57,8 @@ type PinOwnershipStatus struct {
 	NextGeneration    uint64 `json:"next_generation,omitempty"`
 	MapCount          int    `json:"map_count,omitempty"`
 	ActiveFilterCount int    `json:"active_filter_count,omitempty"`
+	ActiveLinkCount   int    `json:"active_link_count,omitempty"`
+	AttachmentBackend string `json:"attachment_backend,omitempty"`
 }
 
 // InspectPinOwnership validates owner metadata and steady-state kernel
@@ -80,7 +85,7 @@ func RecoverPinOwnership(
 }
 
 // DetachPinOwnership removes only resources proven by the owner
-// sentinel/record/map/filter identities. The caller must pass the global
+// sentinel/record/map/exact-link identities. The caller must pass the global
 // lifecycle lease it already holds; this function verifies that lease before
 // acquiring the FD-anchored resource lock.
 func DetachPinOwnership(

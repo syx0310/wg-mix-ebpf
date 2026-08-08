@@ -21,7 +21,7 @@ func rekeyRebootedPinOwner(
 	entry *pinOwnerIndexEntry,
 	bootID string,
 	now time.Time,
-	tcRuntime tcRuntime,
+	_ exactTCXRuntime,
 ) (*pinOwnerRecord, error) {
 	if handle == nil || parent == nil || store == nil || entry == nil {
 		return nil, errors.New("reboot owner rekey requires anchored current and indexed old owners")
@@ -71,10 +71,7 @@ func rekeyRebootedPinOwner(
 	); err != nil {
 		return nil, err
 	}
-	if err := validateRebootedFiltersAbsent(
-		oldRecord.ActiveFilters,
-		tcRuntime,
-	); err != nil {
+	if err := validateRebootedExactTCXPinsAbsent(handle, oldRecord.ActiveLinks); err != nil {
 		return nil, err
 	}
 
@@ -200,6 +197,41 @@ func rekeyRebootedPinOwner(
 	return record, nil
 }
 
+func validateRebootedExactTCXPinsAbsent(
+	handle *pinPathHandle,
+	bindings []exactTCXBinding,
+) error {
+	if handle == nil {
+		return errors.New("prior-boot exact TCX pin validation has no anchored directory")
+	}
+	if err := handle.recheckTargetEntry(); err != nil {
+		return err
+	}
+	for _, binding := range bindings {
+		if err := validateExactTCXBinding(binding, true); err != nil {
+			return err
+		}
+		var stat unix.Stat_t
+		err := unix.Fstatat(
+			handle.targetFD,
+			binding.PinName,
+			&stat,
+			unix.AT_SYMLINK_NOFOLLOW,
+		)
+		if errors.Is(err, unix.ENOENT) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		return fmt.Errorf(
+			"prior-boot exact TCX pin %s still exists; refusing cross-boot link ID trust",
+			binding.PinName,
+		)
+	}
+	return nil
+}
+
 func recheckIndexedOwnerForRekey(
 	store *pinOwnerStore,
 	entry *pinOwnerIndexEntry,
@@ -265,50 +297,6 @@ func recheckIndexedOwnerForRekey(
 	}
 	if !sameExpectedOwnerRecord(rechecked, oldRecord) {
 		return errors.New("indexed prior-boot owner record changed before mutation")
-	}
-	return nil
-}
-
-func validateRebootedFiltersAbsent(
-	bindings []tcFilterBinding,
-	runtime tcRuntime,
-) error {
-	seen := make(map[string]struct{}, len(bindings))
-	for _, binding := range bindings {
-		key := ownerFilterKey(binding)
-		if _, duplicate := seen[key]; duplicate {
-			return fmt.Errorf("prior-boot owner repeats TC slot %s", key)
-		}
-		seen[key] = struct{}{}
-		link, err := runtime.linkByIndex(binding.IfIndex)
-		if err != nil {
-			if isNotFound(err) {
-				continue
-			}
-			return fmt.Errorf("inspect prior-boot TC link %d: %w", binding.IfIndex, err)
-		}
-		if link == nil ||
-			link.Attrs() == nil ||
-			link.Attrs().Index != binding.IfIndex {
-			return fmt.Errorf(
-				"prior-boot TC link lookup returned a mismatch for ifindex %d",
-				binding.IfIndex,
-			)
-		}
-		slot, err := ownerFilterSlot(binding)
-		if err != nil {
-			return err
-		}
-		snapshot, err := inspectTCFilterSlot(link, slot, runtime, false)
-		if err != nil {
-			return err
-		}
-		if snapshot.existed {
-			return fmt.Errorf(
-				"prior-boot TC slot %s still contains program ID %d; refusing cross-boot ID trust",
-				key, snapshot.programID,
-			)
-		}
 	}
 	return nil
 }

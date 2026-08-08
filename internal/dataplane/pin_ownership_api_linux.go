@@ -23,7 +23,7 @@ func inspectPinOwnership(
 		pinPathFromEnv(explicitPinPath),
 		recoverTransaction,
 		loader.pinRuntime(ctx),
-		liveTCRuntime,
+		liveExactTCXRuntime,
 	)
 }
 
@@ -32,7 +32,7 @@ func inspectPinOwnershipWithRuntime(
 	pinPath string,
 	recoverTransaction bool,
 	runtime pinPathRuntime,
-	tcRuntime tcRuntime,
+	tcxRuntime exactTCXRuntime,
 ) (*PinOwnershipStatus, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
@@ -225,11 +225,12 @@ func inspectPinOwnershipWithRuntime(
 				record.BootID, currentBootID,
 			)
 		}
-		recovered, err := recoverPinOwnerTransaction(
+		recovered, err := recoverExactPinOwnerTransaction(
+			ctx,
 			handle,
 			store,
 			record,
-			tcRuntime,
+			tcxRuntime,
 		)
 		if err != nil {
 			return status, err
@@ -267,11 +268,7 @@ func inspectPinOwnershipWithRuntime(
 	); err != nil {
 		return status, err
 	}
-	if err := validateOwnerTCExact(
-		record.ActiveFilters,
-		record.ActiveFilters,
-		tcRuntime,
-	); err != nil {
+	if err := validateOwnerExactTCXLinks(handle, record.ActiveLinks, tcxRuntime); err != nil {
 		return status, err
 	}
 	return status, nil
@@ -641,7 +638,9 @@ func setPinOwnershipStatusRecord(
 	status.ActiveGeneration = record.ActiveGeneration
 	status.NextGeneration = record.NextGeneration
 	status.MapCount = len(record.Maps)
-	status.ActiveFilterCount = len(record.ActiveFilters)
+	status.ActiveFilterCount = len(record.ActiveLinks)
+	status.ActiveLinkCount = len(record.ActiveLinks)
+	status.AttachmentBackend = exactTCXBackend
 	status.RecoveryRequired = record.Phase != pinOwnerPhaseActive ||
 		record.Step != pinOwnerStepReady
 }
