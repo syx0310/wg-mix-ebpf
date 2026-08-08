@@ -135,31 +135,47 @@ func TestSourceCommitScriptRejectsDirtyWorktrees(t *testing.T) {
 	}
 }
 
+func TestSourceCommitScriptAcceptsCleanDetachedHead(t *testing.T) {
+	root := repositoryRoot(t)
+	repo := identityTestRepository(t)
+	want := runGit(t, repo, "rev-parse", "HEAD")
+	runGit(t, repo, "checkout", "--detach", "--quiet", want)
+	if got := runSourceCommitScript(
+		t,
+		filepath.Join(root, "scripts", "source-commit.sh"),
+		repo,
+		nil,
+	); got != want {
+		t.Fatalf("detached source commit = %q, want %q", got, want)
+	}
+}
+
 func TestMakeBuildIdentityCannotBeOverridden(t *testing.T) {
 	if _, err := exec.LookPath("make"); err != nil {
 		t.Skip("make is unavailable")
 	}
 	root := repositoryRoot(t)
-	want := sourceCommitScript(t, root, nil)
+	repo := makeBuildIdentityTestRepository(t, root)
+	want := sourceCommitScript(t, repo, nil)
 	injectedCommit := "ffffffffffffffffffffffffffffffffffffffff"
-	overlay := filepath.Join(root, "outside-overlay.json")
+	overlay := filepath.Join(repo, "outside-overlay.json")
 	cmd := exec.Command(
 		"make",
 		"-n",
 		"BUILD_SOURCE_COMMIT="+injectedCommit,
 		"BUILD_IDENTITY_LDFLAG=-X=injected",
 		"GOFLAGS=-overlay="+overlay,
-		"GOENV="+filepath.Join(root, "outside-goenv"),
-		"GOWORK="+filepath.Join(root, "outside-go.work"),
+		"GOENV="+filepath.Join(repo, "outside-goenv"),
+		"GOWORK="+filepath.Join(repo, "outside-go.work"),
 		"build-linux-amd64",
 	)
-	cmd.Dir = root
+	cmd.Dir = repo
 	cmd.Env = environmentWith(os.Environ(), map[string]string{
 		"SOURCE_COMMIT":       injectedCommit,
 		"BUILD_SOURCE_COMMIT": injectedCommit,
 		"GOFLAGS":             "-overlay=" + overlay,
-		"GOENV":               filepath.Join(root, "outside-goenv"),
-		"GOWORK":              filepath.Join(root, "outside-go.work"),
+		"GOENV":               filepath.Join(repo, "outside-goenv"),
+		"GOWORK":              filepath.Join(repo, "outside-go.work"),
 		"GO111MODULE":         "off",
 	})
 	output, err := cmd.CombinedOutput()
@@ -252,6 +268,47 @@ func identityTestRepository(t *testing.T) string {
 	}
 	runGit(t, repo, "add", "tracked.txt")
 	runGit(t, repo, "commit", "-q", "--no-gpg-sign", "--no-verify", "-m", "initial")
+	return repo
+}
+
+func makeBuildIdentityTestRepository(t *testing.T, sourceRoot string) string {
+	t.Helper()
+	repo := identityTestRepository(t)
+	if err := os.Mkdir(filepath.Join(repo, "scripts"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, fixture := range []struct {
+		path string
+		mode os.FileMode
+	}{
+		{path: "Makefile", mode: 0o600},
+		{path: filepath.Join("scripts", "source-commit.sh"), mode: 0o700},
+	} {
+		data, err := os.ReadFile(filepath.Join(sourceRoot, fixture.path))
+		if err != nil {
+			t.Fatalf("read build identity fixture %s: %v", fixture.path, err)
+		}
+		if err := os.WriteFile(
+			filepath.Join(repo, fixture.path),
+			data,
+			fixture.mode,
+		); err != nil {
+			t.Fatalf("write build identity fixture %s: %v", fixture.path, err)
+		}
+	}
+	runGit(t, repo, "add", "Makefile", "scripts/source-commit.sh")
+	runGit(
+		t,
+		repo,
+		"commit",
+		"-q",
+		"--no-gpg-sign",
+		"--no-verify",
+		"-m",
+		"add build identity inputs",
+	)
+	head := runGit(t, repo, "rev-parse", "HEAD")
+	runGit(t, repo, "checkout", "--detach", "--quiet", head)
 	return repo
 }
 

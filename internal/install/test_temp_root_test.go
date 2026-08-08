@@ -10,39 +10,43 @@ import (
 	"testing"
 )
 
-const installTestTempPrefix = ".wg-mix-ebpf-install-tests-"
+const (
+	installTestTempPrefix    = ".wg-mix-ebpf-install-tests-"
+	installTestTempParentEnv = "WG_MIX_EBPF_INSTALL_TEST_TEMP_PARENT"
+)
 
 // Capture the inherited value before TestMain changes it. The regression test
 // uses this to prove that an external GOTMPDIR is replaced before t.TempDir is
 // first called.
 var installTestInitialGOTMPDIR = os.Getenv("GOTMPDIR")
 
+// Capture the parent before TestMain runs for the same reason. Real-host and
+// other hermetic runners can keep the test tree outside the source checkout,
+// so package-parallel tests never make source identity appear dirty.
+var installTestInitialTempParent = os.Getenv(installTestTempParentEnv)
+
 var installTestsTemp installTestTempState
 
 type installTestTempState struct {
-	packageDir   string
-	root         string
-	rootIdentity os.FileInfo
+	parentDir      string
+	parentIdentity os.FileInfo
+	root           string
+	rootIdentity   os.FileInfo
 }
 
 func prepareInstallTestTemp() (installTestTempState, error) {
 	var state installTestTempState
 
-	packageDir, err := os.Getwd()
+	parentDir, parentIdentity, err := resolveInstallTestTempParent(
+		installTestInitialTempParent,
+	)
 	if err != nil {
-		return state, fmt.Errorf("resolve install package test directory: %w", err)
+		return state, err
 	}
-	packageDir, err = filepath.Abs(packageDir)
-	if err != nil {
-		return state, fmt.Errorf("make install package test directory absolute: %w", err)
-	}
-	packageDir, err = filepath.EvalSymlinks(filepath.Clean(packageDir))
-	if err != nil {
-		return state, fmt.Errorf("canonicalize install package test directory: %w", err)
-	}
-	state.packageDir = filepath.Clean(packageDir)
+	state.parentDir = parentDir
+	state.parentIdentity = parentIdentity
 
-	root, err := os.MkdirTemp(state.packageDir, installTestTempPrefix)
+	root, err := os.MkdirTemp(state.parentDir, installTestTempPrefix)
 	if err != nil {
 		return state, fmt.Errorf("create isolated install test root: %w", err)
 	}
@@ -63,6 +67,70 @@ func prepareInstallTestTemp() (installTestTempState, error) {
 	return state, nil
 }
 
+func resolveInstallTestTempParent(
+	externalParent string,
+) (string, os.FileInfo, error) {
+	parentDir := externalParent
+	if parentDir == "" {
+		workingDir, err := os.Getwd()
+		if err != nil {
+			return "", nil, fmt.Errorf(
+				"resolve install package test directory: %w",
+				err,
+			)
+		}
+		parentDir, err = filepath.Abs(workingDir)
+		if err != nil {
+			return "", nil, fmt.Errorf(
+				"make install package test directory absolute: %w",
+				err,
+			)
+		}
+	} else if !filepath.IsAbs(parentDir) {
+		return "", nil, fmt.Errorf(
+			"refuse non-absolute isolated install test parent %q",
+			parentDir,
+		)
+	}
+
+	parentDir = filepath.Clean(parentDir)
+	if parentDir == string(os.PathSeparator) {
+		return "", nil, errors.New("refuse kernel root as isolated install test parent")
+	}
+	canonicalParent, err := filepath.EvalSymlinks(parentDir)
+	if err != nil {
+		return "", nil, fmt.Errorf(
+			"canonicalize isolated install test parent %s: %w",
+			parentDir,
+			err,
+		)
+	}
+	canonicalParent = filepath.Clean(canonicalParent)
+	parentIdentity, err := os.Lstat(parentDir)
+	if err != nil {
+		return "", nil, fmt.Errorf(
+			"identify isolated install test parent %s: %w",
+			parentDir,
+			err,
+		)
+	}
+	if canonicalParent != parentDir || !parentIdentity.IsDir() ||
+		parentIdentity.Mode()&os.ModeSymlink != 0 {
+		return "", nil, fmt.Errorf(
+			"isolated install test parent is not a canonical directory: %s",
+			parentDir,
+		)
+	}
+	if parentIdentity.Mode().Perm()&0o022 != 0 {
+		return "", nil, fmt.Errorf(
+			"refuse group/other writable isolated install test parent %s mode %#o",
+			parentDir,
+			parentIdentity.Mode().Perm(),
+		)
+	}
+	return parentDir, parentIdentity, nil
+}
+
 func setInstallTestTempEnvironment(
 	root string,
 	setenv func(string, string) error,
@@ -76,39 +144,42 @@ func setInstallTestTempEnvironment(
 }
 
 func validateInstallTestTempIdentity(state installTestTempState) error {
-	if state.packageDir == "" || !filepath.IsAbs(state.packageDir) ||
-		filepath.Clean(state.packageDir) != state.packageDir {
+	if state.parentDir == "" || !filepath.IsAbs(state.parentDir) ||
+		filepath.Clean(state.parentDir) != state.parentDir ||
+		state.parentDir == string(os.PathSeparator) {
 		return fmt.Errorf(
-			"refuse unsafe install package test directory %q",
-			state.packageDir,
+			"refuse unsafe isolated install test parent %q",
+			state.parentDir,
 		)
 	}
 	rootName := filepath.Base(state.root)
 	if state.root == "" || !filepath.IsAbs(state.root) ||
 		filepath.Clean(state.root) != state.root ||
-		filepath.Dir(state.root) != state.packageDir ||
+		filepath.Dir(state.root) != state.parentDir ||
 		!strings.HasPrefix(rootName, installTestTempPrefix) ||
 		len(rootName) <= len(installTestTempPrefix) {
 		return fmt.Errorf("refuse unsafe isolated install test root %q", state.root)
 	}
-	if state.rootIdentity == nil {
+	if state.parentIdentity == nil || state.rootIdentity == nil {
 		return errors.New("isolated install test root identity is missing")
 	}
 
-	canonicalPackageDir, err := filepath.EvalSymlinks(state.packageDir)
+	canonicalParent, err := filepath.EvalSymlinks(state.parentDir)
 	if err != nil {
-		return fmt.Errorf("canonicalize install package test directory: %w", err)
+		return fmt.Errorf("canonicalize isolated install test parent: %w", err)
 	}
-	packageDirIdentity, err := os.Lstat(state.packageDir)
+	parentIdentity, err := os.Lstat(state.parentDir)
 	if err != nil {
-		return fmt.Errorf("identify install package test directory: %w", err)
+		return fmt.Errorf("identify isolated install test parent: %w", err)
 	}
-	if filepath.Clean(canonicalPackageDir) != state.packageDir ||
-		!packageDirIdentity.IsDir() ||
-		packageDirIdentity.Mode()&os.ModeSymlink != 0 {
+	if filepath.Clean(canonicalParent) != state.parentDir ||
+		!parentIdentity.IsDir() ||
+		parentIdentity.Mode()&os.ModeSymlink != 0 ||
+		parentIdentity.Mode().Perm()&0o022 != 0 ||
+		!os.SameFile(state.parentIdentity, parentIdentity) {
 		return fmt.Errorf(
-			"install package test directory is no longer canonical: %s",
-			state.packageDir,
+			"isolated install test parent identity changed: %s",
+			state.parentDir,
 		)
 	}
 
@@ -215,6 +286,21 @@ func TestInstallTempDirUsesTestMainRoot(t *testing.T) {
 	if err := validateInstallTestTempEnvironment(installTestsTemp); err != nil {
 		t.Fatalf("TestMain install test root is invalid: %v", err)
 	}
+	if installTestInitialTempParent != "" {
+		expectedParent, _, err := resolveInstallTestTempParent(
+			installTestInitialTempParent,
+		)
+		if err != nil {
+			t.Fatalf("resolve requested external test parent: %v", err)
+		}
+		if installTestsTemp.parentDir != expectedParent {
+			t.Fatalf(
+				"isolated test parent=%q, want external parent %q",
+				installTestsTemp.parentDir,
+				expectedParent,
+			)
+		}
+	}
 
 	testTempDir := t.TempDir()
 	canonicalTestTempDir, err := filepath.EvalSymlinks(testTempDir)
@@ -244,6 +330,53 @@ func TestInstallTempDirUsesTestMainRoot(t *testing.T) {
 			relative,
 			err,
 		)
+	}
+}
+
+func TestResolveInstallTestTempParentRejectsUnsafeExternalPaths(t *testing.T) {
+	secureParent := filepath.Join(t.TempDir(), "secure-parent")
+	if err := os.Mkdir(secureParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	resolved, identity, err := resolveInstallTestTempParent(secureParent)
+	if err != nil {
+		t.Fatalf("resolve secure external parent: %v", err)
+	}
+	if resolved != secureParent || identity == nil || !identity.IsDir() {
+		t.Fatalf(
+			"resolved parent=(%q, %#v), want secure directory %q",
+			resolved,
+			identity,
+			secureParent,
+		)
+	}
+
+	writableParent := filepath.Join(t.TempDir(), "writable-parent")
+	if err := os.Mkdir(writableParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(writableParent, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	symlinkParent := filepath.Join(t.TempDir(), "parent-link")
+	if err := os.Symlink(secureParent, symlinkParent); err != nil {
+		t.Fatal(err)
+	}
+
+	for _, test := range []struct {
+		name string
+		path string
+	}{
+		{name: "relative", path: "relative-parent"},
+		{name: "kernel-root", path: string(os.PathSeparator)},
+		{name: "group-writable", path: writableParent},
+		{name: "symlink", path: symlinkParent},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if _, _, err := resolveInstallTestTempParent(test.path); err == nil {
+				t.Fatalf("unsafe external parent %q was accepted", test.path)
+			}
+		})
 	}
 }
 
