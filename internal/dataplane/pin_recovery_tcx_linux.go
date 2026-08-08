@@ -480,6 +480,14 @@ func rollbackFailedExactOwnerApplyLinks(
 		if _, existed := activeSlots[exactTCXOwnerKey(desired)]; existed || desired.LinkID == 0 {
 			continue
 		}
+		if err := retryRetainedUnpinnedExactTCXOwner(
+			filepath.Join(handle.procPath(), desired.PinName),
+		); err != nil {
+			return current, fmt.Errorf(
+				"retry retained failed-apply exact TCX link %s: %w",
+				desired.PinName, err,
+			)
+		}
 		if err := removeOwnedExactTCXLink(handle, desired, runtime); err != nil {
 			return current, fmt.Errorf("retire failed-apply exact TCX link %s: %w", desired.PinName, err)
 		}

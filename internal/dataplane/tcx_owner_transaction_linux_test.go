@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -192,6 +193,12 @@ func exactTCXMutationEvents(events []string) []string {
 		}
 	}
 	return mutations
+}
+
+func retainedUnpinnedExactTCXOwnerCount(pinPath string) int {
+	retainedUnpinnedExactTCXOwners.Lock()
+	defer retainedUnpinnedExactTCXOwners.Unlock()
+	return len(retainedUnpinnedExactTCXOwners.byPinPath[pinPath])
 }
 
 func persistDetachedDesiredExactTCX(
@@ -1589,6 +1596,141 @@ func TestRollbackExactOwnerApplyRecoversAfterTargetOnlyLinkAlreadyRemoved(t *tes
 	if kernel.links[target.LinkID].attached || !kernel.links[foreignID].attached ||
 		!kernel.links[active.LinkID].attached {
 		t.Fatalf("target-only/foreign/active links=%+v", kernel.links)
+	}
+}
+
+func TestRollbackExactOwnerApplyRetriesRetainedTargetOnlyOwner(t *testing.T) {
+	fixture := newExactTCXOwnerTestFixture(t)
+	kernel := newFakeExactTCXKernel()
+	kernel.materializePins = true
+	target := testExactTCXBinding(70, exactTCXEgress, 901)
+	mutating := fixture.mutatingRecord(t, nil, []exactTCXBinding{target})
+	failedID := kernel.nextID + 1
+	pinErr := errors.New("injected target-only pin failure")
+	detachErr := errors.New("injected target-only detach failure")
+	closeErr := errors.New("injected target-only close failure")
+	kernel.pinErr = pinErr
+	kernel.detachErrs[failedID] = []error{detachErr}
+	kernel.closeErrs[failedID] = []error{closeErr}
+
+	failed, err := convergeOwnerApplyExactTCXLinks(
+		t.Context(), fixture.handle, fixture.store, mutating,
+		fakeLoadedOwnerPrograms(target.ProgramID), kernel.runtime(),
+	)
+	if !errors.Is(err, pinErr) || !errors.Is(err, detachErr) || !errors.Is(err, closeErr) {
+		t.Fatalf("target-only failed stage error=%v", err)
+	}
+	target = failed.DesiredLinks[0]
+	pinPath := filepath.Join(fixture.handle.procPath(), target.PinName)
+	if target.LinkID != failedID || !target.PinPending ||
+		retainedUnpinnedExactTCXOwnerCount(pinPath) != 1 {
+		t.Fatalf("failed target identity=%+v retained=%d", target, retainedUnpinnedExactTCXOwnerCount(pinPath))
+	}
+	rollingBack := advancePinOwnerRecord(
+		failed, fixture.now.Add(2*time.Minute),
+		pinOwnerPhaseApplying, pinOwnerStepRollingBack,
+	)
+	if err := fixture.store.Persist(rollingBack, failed, fixture.handle.mountID); err != nil {
+		t.Fatal(err)
+	}
+	kernel.pinErr = nil
+	foreignID := kernel.addLink(target.IfIndex, ebpf.AttachType(target.AttachType), 999)
+
+	recovered, err := rollbackFailedExactOwnerApplyLinks(
+		t.Context(), fixture.handle, rollingBack,
+		fakeLoadedOwnerPrograms(target.ProgramID), fixture.store, kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Sequence != rollingBack.Sequence ||
+		retainedUnpinnedExactTCXOwnerCount(pinPath) != 0 ||
+		kernel.links[failedID].attached || !kernel.links[foreignID].attached {
+		t.Fatalf("target-only rollback record=%+v retained=%d links=%+v", recovered, retainedUnpinnedExactTCXOwnerCount(pinPath), kernel.links)
+	}
+
+	beforeEvents := len(kernel.events)
+	faults := &faultExactTCXOwnerStore{
+		base: fixture.store, failAt: 1,
+		persistErr: errors.New("idempotent target-only rollback persisted"),
+	}
+	idempotent, err := rollbackFailedExactOwnerApplyLinks(
+		t.Context(), fixture.handle, recovered,
+		fakeLoadedOwnerPrograms(target.ProgramID), faults, kernel.runtime(),
+	)
+	if err != nil || faults.persisted != 0 || idempotent.Sequence != recovered.Sequence ||
+		len(exactTCXMutationEvents(kernel.events[beforeEvents:])) != 0 ||
+		retainedUnpinnedExactTCXOwnerCount(pinPath) != 0 || !kernel.links[foreignID].attached {
+		t.Fatalf("idempotent target-only rollback record=%+v error=%v persists=%d events=%v retained=%d links=%+v", idempotent, err, faults.persisted, kernel.events[beforeEvents:], retainedUnpinnedExactTCXOwnerCount(pinPath), kernel.links)
+	}
+}
+
+func TestRollbackExactOwnerApplyRetainedTargetOnlyRetryFailureFailsClosed(t *testing.T) {
+	fixture := newExactTCXOwnerTestFixture(t)
+	kernel := newFakeExactTCXKernel()
+	kernel.materializePins = true
+	target := testExactTCXBinding(71, exactTCXIngress, 902)
+	mutating := fixture.mutatingRecord(t, nil, []exactTCXBinding{target})
+	failedID := kernel.nextID + 1
+	pinErr := errors.New("injected target-only pin failure")
+	firstDetachErr := errors.New("injected first target-only detach failure")
+	retryDetachErr := errors.New("injected retry target-only detach failure")
+	firstCloseErr := errors.New("injected first target-only close failure")
+	retryCloseErr := errors.New("injected retry target-only close failure")
+	kernel.pinErr = pinErr
+	kernel.detachErrs[failedID] = []error{firstDetachErr, retryDetachErr}
+	kernel.closeErrs[failedID] = []error{firstCloseErr, retryCloseErr}
+
+	failed, err := convergeOwnerApplyExactTCXLinks(
+		t.Context(), fixture.handle, fixture.store, mutating,
+		fakeLoadedOwnerPrograms(target.ProgramID), kernel.runtime(),
+	)
+	if !errors.Is(err, pinErr) || !errors.Is(err, firstDetachErr) || !errors.Is(err, firstCloseErr) {
+		t.Fatalf("target-only failed stage error=%v", err)
+	}
+	target = failed.DesiredLinks[0]
+	pinPath := filepath.Join(fixture.handle.procPath(), target.PinName)
+	rollingBack := advancePinOwnerRecord(
+		failed, fixture.now.Add(2*time.Minute),
+		pinOwnerPhaseApplying, pinOwnerStepRollingBack,
+	)
+	if err := fixture.store.Persist(rollingBack, failed, fixture.handle.mountID); err != nil {
+		t.Fatal(err)
+	}
+	kernel.pinErr = nil
+	foreignID := kernel.addLink(target.IfIndex, ebpf.AttachType(target.AttachType), 999)
+	beforeEvents := len(kernel.events)
+	faults := &faultExactTCXOwnerStore{
+		base: fixture.store, failAt: 1,
+		persistErr: errors.New("failed retained retry attempted to persist"),
+	}
+
+	current, err := rollbackFailedExactOwnerApplyLinks(
+		t.Context(), fixture.handle, rollingBack,
+		fakeLoadedOwnerPrograms(target.ProgramID), faults, kernel.runtime(),
+	)
+	if !errors.Is(err, retryDetachErr) || !errors.Is(err, retryCloseErr) {
+		t.Fatalf("retained target-only retry error=%v", err)
+	}
+	wantEvents := []string{
+		fmt.Sprintf("detach:%d", failedID),
+		fmt.Sprintf("close:%d", failedID),
+		"query",
+	}
+	if current.Sequence != rollingBack.Sequence || faults.persisted != 0 ||
+		!slices.Equal(kernel.events[beforeEvents:], wantEvents) ||
+		retainedUnpinnedExactTCXOwnerCount(pinPath) != 1 ||
+		!kernel.links[failedID].attached || !kernel.links[foreignID].attached {
+		t.Fatalf("failed retained retry record=%+v persists=%d events=%v retained=%d links=%+v", current, faults.persisted, kernel.events[beforeEvents:], retainedUnpinnedExactTCXOwnerCount(pinPath), kernel.links)
+	}
+
+	recovered, err := rollbackFailedExactOwnerApplyLinks(
+		t.Context(), fixture.handle, current,
+		fakeLoadedOwnerPrograms(target.ProgramID), fixture.store, kernel.runtime(),
+	)
+	if err != nil || retainedUnpinnedExactTCXOwnerCount(pinPath) != 0 ||
+		kernel.links[failedID].attached || !kernel.links[foreignID].attached {
+		t.Fatalf("settled retained retry record=%+v error=%v retained=%d links=%+v", recovered, err, retainedUnpinnedExactTCXOwnerCount(pinPath), kernel.links)
 	}
 }
 
