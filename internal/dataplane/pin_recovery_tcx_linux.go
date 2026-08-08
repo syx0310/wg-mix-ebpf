@@ -19,7 +19,7 @@ func recoverExactPinOwnerTransaction(
 	store *pinOwnerStore,
 	record *pinOwnerRecord,
 	runtime exactTCXRuntime,
-) (*pinOwnerRecoveryResult, error) {
+) (result *pinOwnerRecoveryResult, returnErr error) {
 	if ctx == nil {
 		return nil, errors.New("exact owner recovery: context is nil")
 	}
@@ -50,7 +50,9 @@ func recoverExactPinOwnerTransaction(
 		if err != nil {
 			return nil, err
 		}
-		defer closePinnedMapPins(pins)
+		defer func() {
+			returnErr = errors.Join(returnErr, closePinnedMapPins(pins))
+		}()
 		if err := validateOwnerPins(handle, record, pins, true); err != nil {
 			return nil, err
 		}
@@ -76,7 +78,7 @@ func recoverExactApplyingPinOwnerTransaction(
 	store *pinOwnerStore,
 	record *pinOwnerRecord,
 	runtime exactTCXRuntime,
-) (*pinOwnerRecoveryResult, error) {
+) (result *pinOwnerRecoveryResult, returnErr error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
@@ -91,7 +93,9 @@ func recoverExactApplyingPinOwnerTransaction(
 	if err != nil {
 		return nil, err
 	}
-	defer closePinnedMapPins(pins)
+	defer func() {
+		returnErr = errors.Join(returnErr, closePinnedMapPins(pins))
+	}()
 	if err := validateOwnerPins(
 		handle,
 		record,
@@ -347,7 +351,7 @@ func abortFailedExactOwnerApply(
 	store *pinOwnerStore,
 	record *pinOwnerRecord,
 	runtime exactTCXRuntime,
-) error {
+) (returnErr error) {
 	if ctx == nil {
 		return errors.New("failed exact owner apply rollback: context is nil")
 	}
@@ -369,7 +373,9 @@ func abortFailedExactOwnerApply(
 	if err != nil {
 		return err
 	}
-	defer closePinnedMapPins(pins)
+	defer func() {
+		returnErr = errors.Join(returnErr, closePinnedMapPins(pins))
+	}()
 	if err := validateOwnerPins(
 		handle, record, pins, requireCompleteMaps,
 	); err != nil {
@@ -448,7 +454,7 @@ func recoverExactDetachingPinOwnerTransaction(
 	store *pinOwnerStore,
 	record *pinOwnerRecord,
 	runtime exactTCXRuntime,
-) (*pinOwnerRecoveryResult, error) {
+) (result *pinOwnerRecoveryResult, returnErr error) {
 	if ctx == nil {
 		return nil, errors.New("exact owner detach recovery: context is nil")
 	}
@@ -466,7 +472,9 @@ func recoverExactDetachingPinOwnerTransaction(
 		if err != nil {
 			return nil, err
 		}
-		defer closePinnedMapPins(pins)
+		defer func() {
+			returnErr = errors.Join(returnErr, closePinnedMapPins(pins))
+		}()
 		if err := validateOwnerPins(
 			handle, record, pins, record.ActiveGeneration != 0,
 		); err != nil {
@@ -522,12 +530,16 @@ func recoverExactDetachingPinOwnerTransaction(
 		if err != nil {
 			return nil, err
 		}
-		defer mapStages.Close()
+		defer func() {
+			returnErr = errors.Join(returnErr, mapStages.Close())
+		}()
 		partial, err := inspectPinnedMapSetWithPolicy(handle, false, false, false)
 		if err != nil {
 			return nil, err
 		}
-		defer closePinnedMapPins(partial)
+		defer func() {
+			returnErr = errors.Join(returnErr, closePinnedMapPins(partial))
+		}()
 		if err := validateOwnerPins(handle, record, partial, false); err != nil {
 			return nil, err
 		}
