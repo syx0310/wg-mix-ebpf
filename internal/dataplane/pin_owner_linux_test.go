@@ -219,6 +219,32 @@ func TestPinOwnerV4ExactLinkIdentityAndTransitionValidation(t *testing.T) {
 		!strings.Contains(err.Error(), "changes link ID") {
 		t.Fatalf("same-slot link-ID change error = %v", err)
 	}
+	replacing := clonePinOwnerRecord(applying)
+	replacing.DesiredLinks[0].LinkID = 0
+	replacing.DesiredLinks[0].ReplacesLinkID = active.LinkID
+	if err := validatePinOwnerRecord(replacing, parent.resource, parent.mountID); err != nil {
+		t.Fatalf("explicit detached-link replacement intent: %v", err)
+	}
+	publishedReplacement := clonePinOwnerRecord(replacing)
+	publishedReplacement.DesiredLinks[0].LinkID = active.LinkID + 100
+	if err := validatePinOwnerRecord(publishedReplacement, parent.resource, parent.mountID); err != nil {
+		t.Fatalf("published detached-link replacement identity: %v", err)
+	}
+	badReplacement := clonePinOwnerRecord(replacing)
+	badReplacement.DesiredLinks[0].ReplacesLinkID++
+	if err := validatePinOwnerRecord(badReplacement, parent.resource, parent.mountID); err == nil ||
+		!strings.Contains(err.Error(), "active is") {
+		t.Fatalf("mismatched detached-link replacement error = %v", err)
+	}
+	completedReplacement := completeApplyingPinOwnerRecord(
+		publishedReplacement,
+		time.Date(2026, 7, 29, 1, 2, 5, 500, time.UTC),
+	)
+	if len(completedReplacement.ActiveLinks) != 1 ||
+		completedReplacement.ActiveLinks[0].ReplacesLinkID != 0 ||
+		completedReplacement.ActiveLinks[0].LinkID != active.LinkID+100 {
+		t.Fatalf("completed replacement retained transient marker: %+v", completedReplacement.ActiveLinks)
+	}
 	cleanup := advancePinOwnerRecord(
 		applying,
 		time.Date(2026, 7, 29, 1, 2, 6, 0, time.UTC),

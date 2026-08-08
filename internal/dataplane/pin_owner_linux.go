@@ -356,11 +356,23 @@ func validateOwnerDirectoryEntries(
 				return err
 			}
 		case pinOwnerStepMutating:
-			if err := requireLinks(record.ActiveLinks, "applying mutation"); err != nil {
+			replacedActive := make(map[uint32]struct{}, len(record.DesiredLinks))
+			for _, binding := range record.DesiredLinks {
+				if binding.ReplacesLinkID != 0 {
+					replacedActive[binding.ReplacesLinkID] = struct{}{}
+				}
+			}
+			activePins := make([]exactTCXBinding, 0, len(record.ActiveLinks))
+			for _, binding := range record.ActiveLinks {
+				if _, retired := replacedActive[binding.LinkID]; !retired {
+					activePins = append(activePins, binding)
+				}
+			}
+			if err := requireLinks(activePins, "applying mutation"); err != nil {
 				return err
 			}
 			for _, binding := range record.DesiredLinks {
-				if binding.LinkID == 0 {
+				if binding.LinkID == 0 || binding.PinPending {
 					continue
 				}
 				if err := requireLinks([]exactTCXBinding{binding}, "applying mutation"); err != nil {
@@ -654,6 +666,10 @@ func completeApplyingPinOwnerRecord(
 	next.NextGeneration = 0
 	next.ActiveFilters = []tcFilterBinding{}
 	next.ActiveLinks = slices.Clone(current.DesiredLinks)
+	for index := range next.ActiveLinks {
+		next.ActiveLinks[index].ReplacesLinkID = 0
+		next.ActiveLinks[index].PinPending = false
+	}
 	next.DesiredFilters = []tcFilterBinding{}
 	next.DesiredLinks = []exactTCXBinding{}
 	next.ProgramStages = []pinOwnerProgramStage{}
@@ -1040,7 +1056,7 @@ func validatePinOwnerRecord(
 		}
 		if record.Step == pinOwnerStepCleanup {
 			for _, binding := range record.DesiredLinks {
-				if binding.LinkID == 0 {
+				if binding.LinkID == 0 || binding.PinPending {
 					return errors.New("applying cleanup has an unpublished exact TCX link ID")
 				}
 			}
@@ -1077,6 +1093,12 @@ func validateOwnerLinks(bindings []exactTCXBinding, label string, requireLinkID 
 		if err := validateExactTCXBinding(binding, requireLinkID); err != nil {
 			return fmt.Errorf("%s link[%d]: %w", label, index, err)
 		}
+		if label == "active" && binding.ReplacesLinkID != 0 {
+			return errors.New("active exact TCX link retains a replacement marker")
+		}
+		if label == "active" && binding.PinPending {
+			return errors.New("active exact TCX link retains a pending-pin marker")
+		}
 		key := exactTCXOwnerKey(binding)
 		if _, duplicate := seenSlots[key]; duplicate {
 			return fmt.Errorf("%s links repeat slot %s", label, key)
@@ -1107,14 +1129,45 @@ func validateOwnerLinkTransition(active, desired []exactTCXBinding) error {
 	}
 	for _, binding := range desired {
 		key := exactTCXOwnerKey(binding)
+		if binding.PinPending && binding.LinkID == 0 {
+			return fmt.Errorf("desired exact TCX slot %s has a pending pin without a link ID", key)
+		}
 		if previous, sameSlot := activeBySlot[key]; sameSlot {
-			if binding.LinkID != previous.LinkID {
+			switch {
+			case binding.ReplacesLinkID == 0 && binding.LinkID != previous.LinkID:
 				return fmt.Errorf(
 					"desired exact TCX slot %s changes link ID %d to %d",
 					key, previous.LinkID, binding.LinkID,
 				)
+			case binding.ReplacesLinkID != 0 && binding.ReplacesLinkID != previous.LinkID:
+				return fmt.Errorf(
+					"desired exact TCX slot %s replaces link ID %d, active is %d",
+					key, binding.ReplacesLinkID, previous.LinkID,
+				)
+			case binding.ReplacesLinkID != 0 && binding.LinkID == previous.LinkID:
+				return fmt.Errorf(
+					"desired exact TCX slot %s replacement still uses retired link ID %d",
+					key, previous.LinkID,
+				)
+			case binding.ReplacesLinkID != 0 && binding.LinkID != 0:
+				if other, duplicate := usedLinkIDs[binding.LinkID]; duplicate {
+					return fmt.Errorf(
+						"desired exact TCX slot %s replacement reuses link ID %d from %s",
+						key, binding.LinkID, other,
+					)
+				}
+				usedLinkIDs[binding.LinkID] = key
+			}
+			if binding.ReplacesLinkID == 0 && binding.PinPending {
+				return fmt.Errorf("active exact TCX slot %s cannot have a pending deterministic pin", key)
 			}
 			continue
+		}
+		if binding.ReplacesLinkID != 0 {
+			return fmt.Errorf(
+				"new desired exact TCX slot %s unexpectedly replaces link ID %d",
+				key, binding.ReplacesLinkID,
+			)
 		}
 		if binding.LinkID == 0 {
 			continue

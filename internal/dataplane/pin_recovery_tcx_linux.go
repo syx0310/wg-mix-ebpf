@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"slices"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
@@ -32,6 +31,15 @@ func recoverExactPinOwnerTransaction(
 	}
 	if err := validatePinOwnerRecord(record, handle.resource, handle.mountID); err != nil {
 		return nil, err
+	}
+	if record.Phase == pinOwnerPhaseActive {
+		reconciled, err := reconcileDetachedActiveExactTCXLinks(
+			handle, store, record, runtime,
+		)
+		if err != nil {
+			return nil, err
+		}
+		record = reconciled
 	}
 	if err := validateOwnerDirectoryEntries(handle, record); err != nil {
 		return nil, err
@@ -98,7 +106,7 @@ func recoverExactApplyingPinOwnerTransaction(
 		if err := validateOwnerControlGeneration(pins, record.ActiveGeneration); err != nil {
 			return nil, err
 		}
-		if err := validateOwnerExactTCXLinks(handle, record.ActiveLinks, runtime); err != nil {
+		if err := validateJournaledAttachedOrDetachedExactTCXLinks(handle, record.ActiveLinks, runtime); err != nil {
 			return nil, err
 		}
 		if err := removeOwnerProgramStages(handle, record); err != nil {
@@ -129,7 +137,7 @@ func recoverExactApplyingPinOwnerTransaction(
 		if err := store.Persist(active, record, handle.mountID); err != nil {
 			return nil, err
 		}
-		return &pinOwnerRecoveryResult{record: active}, nil
+		return recoverExactPinOwnerTransaction(ctx, handle, store, active, runtime)
 
 	case pinOwnerStepMutating:
 		programs, err := loadOwnerPrograms(handle, record)
@@ -243,10 +251,9 @@ func rollbackFailedExactOwnerApplyLinks(
 	}
 	for _, desired := range record.DesiredLinks {
 		active, replacing := activeBySlot[exactTCXOwnerKey(desired)]
-		pinPath := filepath.Join(handle.procPath(), desired.PinName)
 		if !replacing {
-			owner, _, err := observePinnedExactTCXAttachment(
-				desired, pinPath, []uint32{desired.ProgramID}, runtime,
+			owner, _, err := observePinnedExactTCXAt(
+				handle, desired, []uint32{desired.ProgramID}, runtime,
 			)
 			if err != nil {
 				if (errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOENT)) &&
@@ -269,9 +276,9 @@ func rollbackFailedExactOwnerApplyLinks(
 			}
 			continue
 		}
-		owner, observed, err := observePinnedExactTCXAttachment(
+		owner, observed, err := observePinnedExactTCXAt(
+			handle,
 			active,
-			pinPath,
 			[]uint32{active.ProgramID, desired.ProgramID},
 			runtime,
 		)
@@ -309,7 +316,7 @@ func rollbackFailedExactOwnerApplyLinks(
 				persistIntent: func(exactTCXJournalIntent) error {
 					return nil
 				},
-				persistActive: func(binding exactTCXBinding, _ exactTCXJournalIntent) error {
+				persistIdentity: func(binding exactTCXBinding, _ exactTCXJournalIntent) error {
 					if binding.LinkID != active.LinkID ||
 						binding.ProgramID != active.ProgramID ||
 						!sameExactTCXSlot(binding, active) {
@@ -468,7 +475,7 @@ func recoverExactDetachingPinOwnerTransaction(
 		if err := validateOwnerControlGeneration(pins, record.ActiveGeneration); err != nil {
 			return nil, err
 		}
-		if err := validateOwnerExactTCXLinks(handle, record.ActiveLinks, runtime); err != nil {
+		if err := validateJournaledAttachedOrDetachedExactTCXLinks(handle, record.ActiveLinks, runtime); err != nil {
 			return nil, err
 		}
 		if err := stageOwnerMaps(handle, record, pins); err != nil {

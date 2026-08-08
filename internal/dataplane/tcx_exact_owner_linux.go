@@ -32,13 +32,15 @@ type exactTCXProgram struct {
 }
 
 type exactTCXBinding struct {
-	Backend    string            `json:"backend"`
-	IfIndex    int               `json:"ifindex"`
-	Direction  exactTCXDirection `json:"direction"`
-	AttachType uint32            `json:"attach_type"`
-	PinName    string            `json:"pin_name"`
-	LinkID     uint32            `json:"link_id"`
-	ProgramID  uint32            `json:"program_id"`
+	Backend        string            `json:"backend"`
+	IfIndex        int               `json:"ifindex"`
+	Direction      exactTCXDirection `json:"direction"`
+	AttachType     uint32            `json:"attach_type"`
+	PinName        string            `json:"pin_name"`
+	LinkID         uint32            `json:"link_id"`
+	ProgramID      uint32            `json:"program_id"`
+	ReplacesLinkID uint32            `json:"replaces_link_id,omitempty"`
+	PinPending     bool              `json:"pin_pending,omitempty"`
 }
 
 type exactTCXLinkIdentity struct {
@@ -80,7 +82,15 @@ type exactTCXQuery struct {
 }
 
 type liveExactTCXLink struct {
-	link ciliumlink.Link
+	link exactTCXLiveLink
+}
+
+type exactTCXLiveLink interface {
+	Pin(string) error
+	Unpin() error
+	Close() error
+	Detach() error
+	Info() (*ciliumlink.Info, error)
 }
 
 type exactTCXLinkUpdater interface {
@@ -99,7 +109,7 @@ func (owned *liveExactTCXLink) Identity() (exactTCXLinkIdentity, error) {
 	if tcx == nil {
 		return exactTCXLinkIdentity{}, errors.New("pinned BPF link is not TCX")
 	}
-	if info.ID == 0 || info.Program == 0 || tcx.Ifindex == 0 {
+	if info.ID == 0 || info.Program == 0 {
 		return exactTCXLinkIdentity{}, errors.New("kernel returned incomplete TCX link identity")
 	}
 	return exactTCXLinkIdentity{
@@ -231,21 +241,74 @@ type exactTCXJournalIntent struct {
 }
 
 type exactTCXJournal struct {
-	persistIntent func(exactTCXJournalIntent) error
-	persistActive func(exactTCXBinding, exactTCXJournalIntent) error
+	persistIntent   func(exactTCXJournalIntent) error
+	persistIdentity func(exactTCXBinding, exactTCXJournalIntent) error
 }
 
 type exactTCXAttachment struct {
 	mu sync.Mutex
 
-	runtime   exactTCXRuntime
-	link      exactTCXKernelLink
-	binding   exactTCXBinding
-	pinPath   string
-	pinned    bool
-	committed bool
-	detached  bool
-	closed    bool
+	runtime    exactTCXRuntime
+	link       exactTCXKernelLink
+	binding    exactTCXBinding
+	pinPath    string
+	pinned     bool
+	recheckPin func() error
+	committed  bool
+	detached   bool
+	closed     bool
+}
+
+var retainedUnpinnedExactTCXOwners = struct {
+	sync.Mutex
+	byPinPath map[string]map[uint32]*exactTCXAttachment
+}{byPinPath: make(map[string]map[uint32]*exactTCXAttachment)}
+
+func retainUnpinnedExactTCXOwner(owner *exactTCXAttachment) error {
+	if owner == nil || owner.pinPath == "" || owner.pinned || owner.closed || owner.link == nil {
+		return errors.New("cannot retain invalid unpinned exact TCX owner")
+	}
+	retainedUnpinnedExactTCXOwners.Lock()
+	defer retainedUnpinnedExactTCXOwners.Unlock()
+	owners := retainedUnpinnedExactTCXOwners.byPinPath[owner.pinPath]
+	if owners == nil {
+		owners = make(map[uint32]*exactTCXAttachment)
+		retainedUnpinnedExactTCXOwners.byPinPath[owner.pinPath] = owners
+	}
+	if previous := owners[owner.binding.LinkID]; previous != nil && previous != owner {
+		return fmt.Errorf(
+			"another unpinned exact TCX owner already retains link ID %d for %s",
+			owner.binding.LinkID,
+			owner.pinPath,
+		)
+	}
+	owners[owner.binding.LinkID] = owner
+	return nil
+}
+
+func retryRetainedUnpinnedExactTCXOwner(pinPath string) error {
+	retainedUnpinnedExactTCXOwners.Lock()
+	defer retainedUnpinnedExactTCXOwners.Unlock()
+	owners := retainedUnpinnedExactTCXOwners.byPinPath[pinPath]
+	if len(owners) == 0 {
+		return nil
+	}
+	var cleanupErr error
+	for linkID, owner := range owners {
+		complete, err := owner.closeUnpinnedAfterFailure()
+		cleanupErr = errors.Join(cleanupErr, err)
+		if complete {
+			delete(owners, linkID)
+		}
+	}
+	if len(owners) != 0 {
+		return errors.Join(
+			errors.New("retained unpinned exact TCX owner is still live; refusing a duplicate attach"),
+			cleanupErr,
+		)
+	}
+	delete(retainedUnpinnedExactTCXOwners.byPinPath, pinPath)
+	return cleanupErr
 }
 
 func exactTCXPinName(ifindex int, direction exactTCXDirection) string {
@@ -355,8 +418,8 @@ func stageExactTCXAttachment(
 	if err := validateExactTCXBinding(binding, false); err != nil {
 		return nil, err
 	}
-	if binding.LinkID != 0 {
-		return nil, errors.New("new TCX attachment intent must not predict a link ID")
+	if binding.LinkID != 0 || binding.PinPending {
+		return nil, errors.New("new TCX attachment intent must not predict a link ID or pending pin")
 	}
 	if program.id == 0 || program.id != binding.ProgramID {
 		return nil, errors.New("TCX program identity does not match desired binding")
@@ -367,8 +430,11 @@ func stageExactTCXAttachment(
 	if err := validateExactTCXRuntime(runtime); err != nil {
 		return nil, err
 	}
-	if journal.persistIntent == nil || journal.persistActive == nil {
+	if journal.persistIntent == nil || journal.persistIdentity == nil {
 		return nil, errors.New("exact TCX attachment requires durable journal callbacks")
+	}
+	if err := retryRetainedUnpinnedExactTCXOwner(pinPath); err != nil {
+		return nil, err
 	}
 	attach, err := exactTCXAttachType(binding.Direction)
 	if err != nil {
@@ -413,7 +479,12 @@ func stageExactTCXAttachment(
 		if owner.pinned {
 			return owner, cause
 		}
-		return nil, errors.Join(cause, owner.Rollback())
+		complete, cleanupErr := owner.closeUnpinnedAfterFailure()
+		if complete {
+			return nil, errors.Join(cause, cleanupErr)
+		}
+		retainErr := retainUnpinnedExactTCXOwner(owner)
+		return nil, errors.Join(cause, cleanupErr, retainErr)
 	}
 	if ownedLink == nil {
 		return fail(errors.New("attach exact TCX link returned nil ownership"))
@@ -429,39 +500,20 @@ func stageExactTCXAttachment(
 		return fail(err)
 	}
 	owner.binding.LinkID = identity.LinkID
+	// Persist the exact LinkID before creating the deterministic pin. This
+	// closes the crash window where a detached pinned link could otherwise be
+	// observed without a journaled identity precise enough to retire it.
+	pendingPin := owner.binding
+	pendingPin.PinPending = true
+	if err := journal.persistIdentity(pendingPin, intent); err != nil {
+		return fail(fmt.Errorf("persist exact TCX link identity: %w", err))
+	}
 	if err := ownedLink.Pin(pinPath); err != nil {
 		return fail(fmt.Errorf("pin exact TCX link: %w", err))
 	}
 	owner.pinned = true
-	if err := journal.persistActive(owner.binding, intent); err != nil {
-		return fail(fmt.Errorf("persist active TCX link identity: %w", err))
-	}
-	owner.committed = true
-	return owner, nil
-}
-
-func loadExactTCXAttachment(
-	binding exactTCXBinding,
-	pinPath string,
-	runtime exactTCXRuntime,
-) (*exactTCXAttachment, error) {
-	if err := validateExactTCXBinding(binding, true); err != nil {
-		return nil, err
-	}
-	owner, observed, err := observePinnedExactTCXAttachment(
-		binding,
-		pinPath,
-		[]uint32{binding.ProgramID},
-		runtime,
-	)
-	if err != nil {
-		return nil, err
-	}
-	if !observed.Attached {
-		return nil, errors.Join(
-			errors.New("pinned exact TCX link is detached"),
-			owner.link.Close(),
-		)
+	if err := journal.persistIdentity(owner.binding, intent); err != nil {
+		return fail(fmt.Errorf("persist exact TCX pin completion: %w", err))
 	}
 	owner.committed = true
 	return owner, nil
@@ -509,9 +561,7 @@ func observePinnedExactTCXAttachment(
 	observedBinding := template
 	observedBinding.LinkID = identity.LinkID
 	observedBinding.ProgramID = identity.ProgramID
-	if err := validateExactTCXIdentity(observedBinding, identity, true); err != nil {
-		return closeOnError(err)
-	}
+	observedBinding.PinPending = false
 	if template.LinkID != 0 && identity.LinkID != template.LinkID {
 		return closeOnError(fmt.Errorf(
 			"TCX link ID %d, owner journal requires %d",
@@ -528,16 +578,53 @@ func observePinnedExactTCXAttachment(
 	if err != nil {
 		return closeOnError(err)
 	}
-	query, err := runtime.query(template.IfIndex, attach)
-	if err != nil {
-		return closeOnError(fmt.Errorf("query pinned exact TCX attachment: %w", err))
-	}
-	if err := validateExactTCXQuery(query); err != nil {
-		return closeOnError(fmt.Errorf("validate pinned exact TCX query: %w", err))
-	}
-	attached, err := exactTCXQueryContains(observedBinding, query)
-	if err != nil {
-		return closeOnError(err)
+	attached := false
+	switch identity.IfIndex {
+	case template.IfIndex:
+		if err := validateExactTCXIdentity(observedBinding, identity, true); err != nil {
+			return closeOnError(err)
+		}
+		query, err := runtime.query(template.IfIndex, attach)
+		if err != nil {
+			return closeOnError(fmt.Errorf("query pinned exact TCX attachment: %w", err))
+		}
+		if err := validateExactTCXQuery(query); err != nil {
+			return closeOnError(fmt.Errorf("validate pinned exact TCX query: %w", err))
+		}
+		attached, err = exactTCXQueryContains(observedBinding, query)
+		if err != nil {
+			return closeOnError(err)
+		}
+		if !attached {
+			return closeOnError(fmt.Errorf(
+				"active TCX link %d is absent from its original slot query",
+				identity.LinkID,
+			))
+		}
+	case 0:
+		if template.LinkID == 0 {
+			return closeOnError(errors.New(
+				"detached TCX pin has no exact journaled link ID",
+			))
+		}
+		if err := validateDetachedExactTCXIdentity(template, identity); err != nil {
+			return closeOnError(err)
+		}
+		absent, err := exactTCXLinkAbsentFromOriginalSlot(template, runtime)
+		if err != nil {
+			return closeOnError(err)
+		}
+		if !absent {
+			return closeOnError(fmt.Errorf(
+				"detached TCX link %d still appears in its original slot",
+				template.LinkID,
+			))
+		}
+	default:
+		return closeOnError(fmt.Errorf(
+			"TCX link target changed: ifindex/type=%d/%s, want active %d/%s or detached 0/%s",
+			identity.IfIndex, identity.Attach, template.IfIndex, attach, attach,
+		))
 	}
 	owner := &exactTCXAttachment{
 		runtime:   runtime,
@@ -553,6 +640,34 @@ func observePinnedExactTCXAttachment(
 		Attached: attached,
 	}
 	return owner, observation, nil
+}
+
+func exactTCXLinkAbsentFromOriginalSlot(
+	binding exactTCXBinding,
+	runtime exactTCXRuntime,
+) (bool, error) {
+	attach, err := exactTCXAttachType(binding.Direction)
+	if err != nil {
+		return false, err
+	}
+	query, err := runtime.query(binding.IfIndex, attach)
+	if err != nil {
+		// Once an exact pinned link reports detached ifindex=0, a missing
+		// original netdevice is also an absence proof for that old slot. A
+		// reused ifindex is queried normally and must not contain our LinkID.
+		if errors.Is(err, unix.ENODEV) || errors.Is(err, unix.ENOENT) {
+			return true, nil
+		}
+		return false, fmt.Errorf("query detached TCX link original slot: %w", err)
+	}
+	if err := validateExactTCXQuery(query); err != nil {
+		return false, fmt.Errorf("validate detached TCX link original slot: %w", err)
+	}
+	present, err := exactTCXQueryContains(binding, query)
+	if err != nil {
+		return false, err
+	}
+	return !present, nil
 }
 
 func exactTCXQueryContains(binding exactTCXBinding, query exactTCXQuery) (bool, error) {
@@ -605,6 +720,29 @@ func validateExactTCXIdentity(
 	return nil
 }
 
+func validateDetachedExactTCXIdentity(
+	binding exactTCXBinding,
+	identity exactTCXLinkIdentity,
+) error {
+	attach, err := exactTCXAttachType(binding.Direction)
+	if err != nil {
+		return err
+	}
+	if binding.LinkID == 0 || identity.IfIndex != 0 || identity.Attach != attach {
+		return fmt.Errorf(
+			"detached TCX link target changed: ifindex/type=%d/%s, want 0/%s with a journaled link ID",
+			identity.IfIndex, identity.Attach, attach,
+		)
+	}
+	if identity.LinkID != binding.LinkID || identity.ProgramID != binding.ProgramID {
+		return fmt.Errorf(
+			"detached TCX identity changed: link/program=%d/%d, owner requires %d/%d",
+			identity.LinkID, identity.ProgramID, binding.LinkID, binding.ProgramID,
+		)
+	}
+	return nil
+}
+
 func (owner *exactTCXAttachment) CompareUpdateWithOld(
 	previous exactTCXProgram,
 	next exactTCXProgram,
@@ -621,7 +759,7 @@ func (owner *exactTCXAttachment) CompareUpdateWithOld(
 	if previous.id != owner.binding.ProgramID || next.id == 0 || next.id == previous.id {
 		return errors.New("TCX update program identities do not match active/desired state")
 	}
-	if journal.persistIntent == nil || journal.persistActive == nil {
+	if journal.persistIntent == nil || journal.persistIdentity == nil {
 		return errors.New("exact TCX update requires durable journal callbacks")
 	}
 	active := owner.binding
@@ -651,7 +789,7 @@ func (owner *exactTCXAttachment) CompareUpdateWithOld(
 		return err
 	}
 	owner.binding = desired
-	if err := journal.persistActive(desired, intent); err != nil {
+	if err := journal.persistIdentity(desired, intent); err != nil {
 		return fmt.Errorf("persist updated active TCX identity: %w", err)
 	}
 	owner.committed = true
@@ -667,7 +805,7 @@ func (owner *exactTCXAttachment) Release() error {
 	if owner.closed {
 		return nil
 	}
-	if !owner.pinned || owner.detached {
+	if !owner.pinned {
 		return errors.New("cannot release a TCX owner before its exact pin exists")
 	}
 	// A pinned owner is always journal-covered: stageExactTCXAttachment writes
@@ -681,6 +819,51 @@ func (owner *exactTCXAttachment) Release() error {
 	owner.link = nil
 	owner.closed = true
 	return nil
+}
+
+func (owner *exactTCXAttachment) closeUnpinnedAfterFailure() (bool, error) {
+	if owner == nil {
+		return true, nil
+	}
+	owner.mu.Lock()
+	defer owner.mu.Unlock()
+	if owner.closed {
+		return true, nil
+	}
+	if owner.pinned || owner.link == nil || owner.binding.LinkID == 0 {
+		return false, errors.New("failed exact TCX owner is not an identifiable unpinned link")
+	}
+	var detachErr error
+	if !owner.detached {
+		detachErr = owner.link.Detach()
+		if detachErr == nil {
+			owner.detached = true
+		}
+	}
+	closeErr := owner.link.Close()
+	if closeErr == nil {
+		owner.link = nil
+		owner.closed = true
+	}
+	attached, queryErr := exactTCXLinkStillAttached(owner.binding, owner.runtime)
+	if queryErr != nil {
+		queryErr = fmt.Errorf("verify failed unpinned exact TCX link %d: %w", owner.binding.LinkID, queryErr)
+	} else if attached {
+		queryErr = fmt.Errorf("failed unpinned exact TCX link %d remains attached", owner.binding.LinkID)
+	}
+	complete := owner.closed && queryErr == nil
+	return complete, errors.Join(
+		wrapExactTCXCleanupError("detach failed unpinned exact TCX link", detachErr),
+		wrapExactTCXCleanupError("close failed unpinned exact TCX link", closeErr),
+		queryErr,
+	)
+}
+
+func wrapExactTCXCleanupError(operation string, err error) error {
+	if err == nil {
+		return nil
+	}
+	return fmt.Errorf("%s: %w", operation, err)
 }
 
 // Rollback detaches the exact bpf_link FD before removing its pin. It never
@@ -699,6 +882,11 @@ func (owner *exactTCXAttachment) Rollback() error {
 	if owner.link == nil {
 		return errors.New("exact TCX rollback lost its link FD")
 	}
+	if owner.pinned && owner.recheckPin != nil {
+		if err := owner.recheckPin(); err != nil {
+			return fmt.Errorf("recheck exact TCX pin %d before detach: %w", owner.binding.LinkID, err)
+		}
+	}
 	if !owner.detached {
 		if err := owner.link.Detach(); err != nil {
 			return fmt.Errorf("detach exact TCX link %d: %w", owner.binding.LinkID, err)
@@ -706,6 +894,11 @@ func (owner *exactTCXAttachment) Rollback() error {
 		owner.detached = true
 	}
 	if owner.pinned {
+		if owner.recheckPin != nil {
+			if err := owner.recheckPin(); err != nil {
+				return fmt.Errorf("recheck exact TCX pin %d before unpin: %w", owner.binding.LinkID, err)
+			}
+		}
 		if err := owner.link.Unpin(); err != nil {
 			return fmt.Errorf("unpin detached exact TCX link %d: %w", owner.binding.LinkID, err)
 		}
@@ -719,82 +912,6 @@ func (owner *exactTCXAttachment) Rollback() error {
 	return nil
 }
 
-type exactTCXRecoveryAction string
-
-const (
-	exactTCXRecoveryRetryAttach exactTCXRecoveryAction = "retry_attach"
-	exactTCXRecoveryDiscardPin  exactTCXRecoveryAction = "discard_detached_pin"
-	exactTCXRecoveryPublish     exactTCXRecoveryAction = "publish_active"
-	exactTCXRecoveryRetryUpdate exactTCXRecoveryAction = "retry_compare_update"
-)
-
-func classifyExactTCXRecovery(
-	intent exactTCXJournalIntent,
-	observed *exactTCXObservation,
-) (exactTCXRecoveryAction, error) {
-	if err := validateExactTCXBinding(intent.Desired, false); err != nil {
-		return "", err
-	}
-	switch intent.Operation {
-	case exactTCXJournalAttach:
-		if intent.Active != nil || intent.Desired.LinkID != 0 {
-			return "", errors.New("TCX attach intent has an active or predicted link ID")
-		}
-		if observed == nil {
-			return exactTCXRecoveryRetryAttach, nil
-		}
-		if err := validateExactTCXBinding(observed.Binding, true); err != nil {
-			return "", err
-		}
-		if !sameExactTCXSlot(observed.Binding, intent.Desired) ||
-			observed.Binding.ProgramID != intent.Desired.ProgramID {
-			return "", errors.New("pinned TCX link is outside attach journal intent")
-		}
-		if !observed.Attached {
-			return exactTCXRecoveryDiscardPin, nil
-		}
-		return exactTCXRecoveryPublish, nil
-	case exactTCXJournalUpdate:
-		if intent.Active == nil {
-			return "", errors.New("TCX update intent has no active binding")
-		}
-		if err := validateExactTCXBinding(*intent.Active, true); err != nil {
-			return "", err
-		}
-		if intent.Desired.LinkID != intent.Active.LinkID ||
-			!sameExactTCXSlot(intent.Desired, *intent.Active) ||
-			intent.Desired.ProgramID == intent.Active.ProgramID {
-			return "", errors.New("TCX update intent changes link identity or not its program")
-		}
-		if observed == nil {
-			return "", errors.New("owned TCX pin disappeared during update")
-		}
-		if err := validateExactTCXBinding(observed.Binding, true); err != nil {
-			return "", err
-		}
-		if observed.Binding.LinkID != intent.Active.LinkID ||
-			!sameExactTCXSlot(observed.Binding, *intent.Active) {
-			return "", errors.New("pinned TCX link identity changed during update")
-		}
-		if !observed.Attached {
-			return "", errors.New("owned TCX link detached during update")
-		}
-		switch observed.Binding.ProgramID {
-		case intent.Active.ProgramID:
-			return exactTCXRecoveryRetryUpdate, nil
-		case intent.Desired.ProgramID:
-			return exactTCXRecoveryPublish, nil
-		default:
-			return "", fmt.Errorf(
-				"owned TCX link has program ID %d outside journal old/new set",
-				observed.Binding.ProgramID,
-			)
-		}
-	default:
-		return "", fmt.Errorf("unsupported TCX journal operation %q", intent.Operation)
-	}
-}
-
 type exactTCXObservation struct {
 	Binding  exactTCXBinding
 	Attached bool
@@ -806,12 +923,4 @@ func sameExactTCXSlot(left, right exactTCXBinding) bool {
 		left.Direction == right.Direction &&
 		left.AttachType == right.AttachType &&
 		left.PinName == right.PinName
-}
-
-// classic fallback is permitted only before any TCX intent is durable and
-// only when cilium/ebpf's feature probe proves TCX unavailable. Permission,
-// validation, revision-staleness, and arbitrary syscall failures are not
-// capability signals and must fail closed.
-func canFallbackFromExactTCX(err error, durableIntent bool) bool {
-	return !durableIntent && errors.Is(err, ciliumlink.ErrNotSupported)
 }
