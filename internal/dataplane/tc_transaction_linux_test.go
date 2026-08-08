@@ -1066,6 +1066,31 @@ func transferRetainedStage(
 	return nil
 }
 
+func openFreshOwnerTestResources(
+	t *testing.T,
+	pinPath string,
+	runtime pinPathRuntime,
+) (*pinPathHandle, *pinOwnerStore) {
+	t.Helper()
+	validated, err := validatePinPath(pinPath, runtime.validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	handle, _, err := openPinPathHandle(pinPath, validated, false, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if handle == nil {
+		t.Fatal("fresh owner test handle is missing")
+	}
+	store, err := openPinOwnerStore(runtime, handle.resource, true)
+	if err != nil {
+		_ = handle.Close()
+		t.Fatal(err)
+	}
+	return handle, store
+}
+
 func newRetainedJournalHandoffFixture(
 	t *testing.T,
 ) *retainedJournalHandoffFixture {
@@ -1767,6 +1792,250 @@ func TestFailedOwnerApplyRebindsRetainedStageFromNextOperation(t *testing.T) {
 				t.Fatalf("drained %s owner gate: %v", test.action, retryErr)
 			}
 		})
+	}
+}
+
+func TestRetainedStageDoesNotRollbackAdvancedDurableOwner(t *testing.T) {
+	tests := []struct {
+		name   string
+		action string
+		state  string
+	}{
+		{name: "active then apply", action: "apply", state: "active"},
+		{name: "active then detach", action: "detach", state: "active"},
+		{name: "cleanup then apply", action: "apply", state: "cleanup"},
+		{name: "cleanup then detach", action: "detach", state: "cleanup"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			fixture := newRetainedJournalHandoffFixture(t)
+			resourceKey := fixture.owner.intent.ResourceKey
+			t.Cleanup(func() {
+				retainedTCRollbackOwners.Lock()
+				delete(retainedTCRollbackOwners.byResource, resourceKey)
+				retainedTCRollbackOwners.Unlock()
+			})
+
+			journalErr := errors.New("injected first-process map validation failure")
+			fixture.owner.mapStore.loadErrors["control_map"] = journalErr
+			fixture.kernel.failWrite = len(fixture.kernel.writes) + 1
+			pinPath := fixture.owner.handle.pinPath
+			runtime := fixture.owner.handle.runtime
+			runtime.ownerApplyFailure = func() (*ownerApplyFailureBoundary, error) {
+				return &ownerApplyFailureBoundary{
+					plan:      fixture.plan,
+					handle:    fixture.owner.handle,
+					store:     fixture.owner.store,
+					record:    fixture.owner.intent,
+					handoff:   fixture.handoff,
+					stage:     fixture.stage,
+					tcRuntime: fixture.kernel.runtime(),
+					attachErr: fixture.attach,
+				}, nil
+			}
+			loader := LinuxLoader{PinPath: pinPath, runtime: &runtime}
+			firstErr := loader.Apply(context.Background(), nil)
+			if !errors.Is(firstErr, journalErr) ||
+				!fixture.stage.hasLiveFilterOwnership() {
+				t.Fatalf(
+					"first Apply error=%v live=%t",
+					firstErr,
+					fixture.stage.hasLiveFilterOwnership(),
+				)
+			}
+
+			// A different process has no access to the first process's injected
+			// map fault or open descriptors. It reopens durable state and performs
+			// the normal restart recovery before the old process retries.
+			delete(fixture.owner.mapStore.loadErrors, "control_map")
+			runtime.ownerApplyFailure = nil
+			runtime.now = func() time.Time {
+				return time.Date(2026, 8, 8, 1, 2, 9, 0, time.UTC)
+			}
+			cleanupErr := errors.New("injected external cleanup pause")
+			if test.state == "cleanup" {
+				runtime.beforePinQuarantine = func(string) error { return cleanupErr }
+			}
+			externalHandle, externalStore := openFreshOwnerTestResources(
+				t,
+				pinPath,
+				runtime,
+			)
+			persisted, err := externalStore.Load(externalHandle.mountID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			recovered, recoverErr := recoverPinOwnerTransaction(
+				externalHandle,
+				externalStore,
+				persisted,
+				fixture.kernel.runtime(),
+			)
+			if test.state == "active" {
+				if recoverErr != nil || recovered == nil || recovered.record == nil ||
+					recovered.record.Phase != pinOwnerPhaseActive {
+					t.Fatalf("external active recovery=%#v error=%v", recovered, recoverErr)
+				}
+			} else if !errors.Is(recoverErr, cleanupErr) {
+				t.Fatalf("external cleanup recovery error=%v", recoverErr)
+			}
+			advanced, err := externalStore.Load(externalHandle.mountID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if test.state == "cleanup" &&
+				(advanced.Phase != pinOwnerPhaseApplying ||
+					advanced.Step != pinOwnerStepCleanup) {
+				t.Fatalf("external cleanup owner=%s/%s", advanced.Phase, advanced.Step)
+			}
+			if err := externalStore.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := externalHandle.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			runtime.beforePinQuarantine = nil
+			runtime.ownerRetryOnly = func(got string) bool { return got == test.action }
+			fixture.kernel.failWrite = 0
+			writesBeforeRetry := len(fixture.kernel.writes)
+			var retryErr error
+			if test.action == "apply" {
+				retryErr = loader.Apply(context.Background(), nil)
+			} else {
+				retryErr = loader.Detach(context.Background(), nil)
+			}
+			if retryErr != nil {
+				t.Fatalf("old-process %s retry: %v", test.action, retryErr)
+			}
+			if len(fixture.kernel.writes) != writesBeforeRetry {
+				t.Fatalf(
+					"old process attempted reverse rollback: writes=%v",
+					fixture.kernel.writes[writesBeforeRetry:],
+				)
+			}
+			if fixture.stage.hasLiveFilterOwnership() || !fixture.stage.done ||
+				fixture.plan.stage != nil || !fixture.plan.closed {
+				t.Fatalf(
+					"advanced owner did not release old stage: live=%t done=%t plan-stage=%p closed=%t",
+					fixture.stage.hasLiveFilterOwnership(),
+					fixture.stage.done,
+					fixture.plan.stage,
+					fixture.plan.closed,
+				)
+			}
+			for index, slot := range canonicalTCFilterSlots() {
+				wantID := uint32(31 + index)
+				if got := fixture.kernel.managedProgramID(t, 11, slot); got != wantID {
+					t.Fatalf("post-retry %s program=%d want=%d", slot.name, got, wantID)
+				}
+			}
+
+			checkHandle, checkStore := openFreshOwnerTestResources(t, pinPath, runtime)
+			current, err := checkStore.Load(checkHandle.mountID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !sameExpectedOwnerRecord(current, advanced) {
+				t.Fatalf("old retry changed advanced owner: got=%#v want=%#v", current, advanced)
+			}
+			if err := checkStore.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := checkHandle.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			// Once the stale stage is released, the same gate is still usable.
+			if test.action == "apply" {
+				retryErr = loader.Apply(context.Background(), nil)
+			} else {
+				retryErr = loader.Detach(context.Background(), nil)
+			}
+			if retryErr != nil {
+				t.Fatalf("drained advanced-owner gate: %v", retryErr)
+			}
+		})
+	}
+}
+
+func TestRetainedStageFailsClosedOnUnprovenStaleJournal(t *testing.T) {
+	fixture := newRetainedJournalHandoffFixture(t)
+	resourceKey := fixture.owner.intent.ResourceKey
+	t.Cleanup(func() {
+		retainedTCRollbackOwners.Lock()
+		delete(retainedTCRollbackOwners.byResource, resourceKey)
+		retainedTCRollbackOwners.Unlock()
+	})
+
+	journalErr := errors.New("injected initial journal validation failure")
+	fixture.owner.mapStore.loadErrors["control_map"] = journalErr
+	fixture.kernel.failWrite = len(fixture.kernel.writes) + 1
+	pinPath := fixture.owner.handle.pinPath
+	runtime := fixture.owner.handle.runtime
+	runtime.ownerApplyFailure = func() (*ownerApplyFailureBoundary, error) {
+		return &ownerApplyFailureBoundary{
+			plan:      fixture.plan,
+			handle:    fixture.owner.handle,
+			store:     fixture.owner.store,
+			record:    fixture.owner.intent,
+			handoff:   fixture.handoff,
+			stage:     fixture.stage,
+			tcRuntime: fixture.kernel.runtime(),
+			attachErr: fixture.attach,
+		}, nil
+	}
+	loader := LinuxLoader{PinPath: pinPath, runtime: &runtime}
+	if err := loader.Apply(context.Background(), nil); !errors.Is(err, journalErr) ||
+		!fixture.stage.hasLiveFilterOwnership() {
+		t.Fatalf("initial Apply error=%v live=%t", err, fixture.stage.hasLiveFilterOwnership())
+	}
+
+	delete(fixture.owner.mapStore.loadErrors, "control_map")
+	runtime.ownerApplyFailure = nil
+	freshHandle, freshStore := openFreshOwnerTestResources(t, pinPath, runtime)
+	current, err := freshStore.Load(freshHandle.mountID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unproven := advancePinOwnerRecord(
+		current,
+		time.Date(2026, 8, 8, 1, 2, 10, 0, time.UTC),
+		pinOwnerPhaseApplying,
+		pinOwnerStepMutating,
+	)
+	if err := freshStore.Persist(unproven, current, freshHandle.mountID); err != nil {
+		t.Fatal(err)
+	}
+	if err := freshStore.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := freshHandle.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	runtime.ownerRetryOnly = func(action string) bool { return action == "apply" }
+	fixture.kernel.failWrite = 0
+	writesBeforeRetry := len(fixture.kernel.writes)
+	retryErr := loader.Apply(context.Background(), nil)
+	if retryErr == nil || !strings.Contains(retryErr.Error(), "unproven") {
+		t.Fatalf("unproven stale retry error=%v", retryErr)
+	}
+	if len(fixture.kernel.writes) != writesBeforeRetry {
+		t.Fatalf(
+			"unproven stale retry mutated TC: writes=%v",
+			fixture.kernel.writes[writesBeforeRetry:],
+		)
+	}
+	if !fixture.stage.hasLiveFilterOwnership() || fixture.stage.done ||
+		fixture.plan.stage != fixture.stage {
+		t.Fatal("unproven stale journal did not retain the exact rollback owner")
+	}
+
+	// Resolve only the test-owned in-memory stage after the fail-closed
+	// assertions. Production keeps it in the registry for a later proof.
+	if err := fixture.stage.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

@@ -362,7 +362,7 @@ func newPinOwnerToken(random io.Reader) ([32]byte, error) {
 	return token, nil
 }
 
-func pinProgramByID(id uint32, path string) error {
+func pinProgramByID(id uint32, path string) (returnErr error) {
 	if id == 0 {
 		return errors.New("cannot pin zero TC program ID")
 	}
@@ -370,7 +370,9 @@ func pinProgramByID(id uint32, path string) error {
 	if err != nil {
 		return err
 	}
-	defer program.Close()
+	defer func() {
+		returnErr = errors.Join(returnErr, program.Close())
+	}()
 	if err := program.Pin(path); err != nil {
 		return err
 	}
@@ -384,13 +386,14 @@ func loadPinnedProgramObservation(path string) (*pinnedProgramObservation, error
 	}
 	info, err := program.Info()
 	if err != nil {
-		_ = program.Close()
-		return nil, err
+		return nil, errors.Join(err, program.Close())
 	}
 	id, ok := info.ID()
 	if !ok || id == 0 {
-		_ = program.Close()
-		return nil, errors.New("kernel did not report a pinned program ID")
+		return nil, errors.Join(
+			errors.New("kernel did not report a pinned program ID"),
+			program.Close(),
+		)
 	}
 	return &pinnedProgramObservation{
 		fd:    program.FD(),

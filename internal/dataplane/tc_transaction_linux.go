@@ -140,9 +140,9 @@ var retainedTCRollbackOwners = struct {
 }
 
 type retainedTCRollbackOwner struct {
-	stage              *tcAttachStage
-	binding            *durableTCOwnerJournalBinding
-	journalTransferred bool
+	stage         *tcAttachStage
+	binding       *durableTCOwnerJournalBinding
+	stageReleased bool
 }
 
 func retainTCRollbackOwner(
@@ -186,7 +186,7 @@ func retryRetainedTCRollbackOwner(
 	var unresolved []retainedTCRollbackOwner
 	var errs []error
 	for _, owner := range stages {
-		if owner.journalTransferred {
+		if owner.stageReleased {
 			if err := owner.binding.plan.Close(); err != nil {
 				unresolved = append(unresolved, owner)
 				errs = append(errs, fmt.Errorf(
@@ -195,6 +195,32 @@ func retryRetainedTCRollbackOwner(
 				))
 			}
 			continue
+		}
+		progress, progressErr := classifyDurableTCOwnerJournalProgress(
+			owner.binding,
+			handle,
+			store,
+		)
+		switch progress {
+		case durableTCOwnerJournalProgressAdvanced:
+			owner.stage.Disarm()
+			if err := owner.binding.plan.Close(); err != nil {
+				owner.stageReleased = true
+				unresolved = append(unresolved, owner)
+				errs = append(errs, fmt.Errorf(
+					"close retained TC plan after durable owner advanced: %w",
+					err,
+				))
+			}
+			continue
+		case durableTCOwnerJournalProgressUnproven:
+			unresolved = append(unresolved, owner)
+			errs = append(errs, fmt.Errorf(
+				"retain TC rollback owner because durable progress is unproven: %w",
+				progressErr,
+			))
+			continue
+		case durableTCOwnerJournalProgressExact:
 		}
 		handoff, transferErr := rebindDurableTCOwnerJournalHandoff(
 			owner.binding,
@@ -206,7 +232,7 @@ func retryRetainedTCRollbackOwner(
 			if transferred {
 				errs = append(errs, reportErr)
 				if closeErr := owner.binding.plan.Close(); closeErr != nil {
-					owner.journalTransferred = true
+					owner.stageReleased = true
 					unresolved = append(unresolved, owner)
 					errs = append(errs, fmt.Errorf(
 						"close retained TC plan after journal transfer: %w",
@@ -217,6 +243,32 @@ func retryRetainedTCRollbackOwner(
 			}
 			transferErr = reportErr
 			errs = append(errs, handoff.Close())
+		}
+		progress, progressErr = classifyDurableTCOwnerJournalProgress(
+			owner.binding,
+			handle,
+			store,
+		)
+		switch progress {
+		case durableTCOwnerJournalProgressAdvanced:
+			owner.stage.Disarm()
+			if err := owner.binding.plan.Close(); err != nil {
+				owner.stageReleased = true
+				unresolved = append(unresolved, owner)
+				errs = append(errs, fmt.Errorf(
+					"close retained TC plan after durable owner advanced during rebind: %w",
+					err,
+				))
+			}
+			continue
+		case durableTCOwnerJournalProgressUnproven:
+			unresolved = append(unresolved, owner)
+			errs = append(errs, errors.Join(
+				fmt.Errorf("retry retained TC journal transfer: %w", transferErr),
+				fmt.Errorf("retain TC rollback owner because rechecked durable progress is unproven: %w", progressErr),
+			))
+			continue
+		case durableTCOwnerJournalProgressExact:
 		}
 		if err := owner.stage.Close(); err != nil {
 			unresolved = append(unresolved, owner)

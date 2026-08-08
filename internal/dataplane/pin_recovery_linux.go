@@ -60,6 +60,14 @@ type durableTCOwnerJournalBinding struct {
 	coverage    [sha256.Size]byte
 }
 
+type durableTCOwnerJournalProgress uint8
+
+const (
+	durableTCOwnerJournalProgressUnproven durableTCOwnerJournalProgress = iota
+	durableTCOwnerJournalProgressExact
+	durableTCOwnerJournalProgressAdvanced
+)
+
 type tcOwnerJournalCoverageSummary struct {
 	ActiveFilters  []tcFilterBinding      `json:"active_filters"`
 	DesiredFilters []tcFilterBinding      `json:"desired_filters"`
@@ -257,13 +265,20 @@ func retainTCOwnerJournalPrograms(
 		}
 		if observation == nil || observation.fd < 0 ||
 			observation.id != stage.ProgramID || observation.pin == nil {
-			if observation != nil {
-				_ = observation.Close()
-			}
-			return closeOnError(fmt.Errorf(
+			invalidErr := fmt.Errorf(
 				"retain durable TC owner program stage %s returned invalid FD/ID/pin capability",
 				stage.FileName,
-			))
+			)
+			if observation != nil {
+				if closeErr := observation.Close(); closeErr != nil {
+					invalidErr = errors.Join(invalidErr, fmt.Errorf(
+						"close invalid durable TC owner program stage %s: %w",
+						stage.FileName,
+						closeErr,
+					))
+				}
+			}
+			return closeOnError(invalidErr)
 		}
 		programs[stage.FileName] = observation
 		backupName := stage.FileName + ".handoff"
@@ -456,6 +471,89 @@ func rebindDurableTCOwnerJournalHandoff(
 	return handoff, nil
 }
 
+// classifyDurableTCOwnerJournalProgress is the rollback gate for a retained
+// in-process stage. Only the exact original mutating record permits a local
+// rollback. A proven forward descendant has already made the durable owner
+// responsible for TC and must disarm the old stage. Every other state is
+// unproven and therefore remains fail-closed.
+func classifyDurableTCOwnerJournalProgress(
+	binding *durableTCOwnerJournalBinding,
+	handle *pinPathHandle,
+	store *pinOwnerStore,
+) (durableTCOwnerJournalProgress, error) {
+	if binding == nil || binding.intent == nil || handle == nil || store == nil {
+		return durableTCOwnerJournalProgressUnproven,
+			errors.New("TC owner journal progress proof is incomplete")
+	}
+	if binding.resourceKey == "" || binding.sequence == 0 ||
+		binding.intent.ResourceKey != binding.resourceKey ||
+		binding.intent.Sequence != binding.sequence || handle.mountID == 0 ||
+		handle.resource.key != binding.resourceKey ||
+		store.resource.key != binding.resourceKey {
+		return durableTCOwnerJournalProgressUnproven,
+			errors.New("TC owner journal progress proof resource changed")
+	}
+	persisted, err := store.Load(handle.mountID)
+	if err != nil {
+		return durableTCOwnerJournalProgressUnproven,
+			fmt.Errorf("load TC owner journal progress proof: %w", err)
+	}
+	if persisted.Sequence == binding.sequence &&
+		sameExpectedOwnerRecord(persisted, binding.intent) {
+		return durableTCOwnerJournalProgressExact, nil
+	}
+	if provesDurableTCOwnerJournalAdvanced(binding.intent, persisted) {
+		return durableTCOwnerJournalProgressAdvanced, nil
+	}
+	return durableTCOwnerJournalProgressUnproven, fmt.Errorf(
+		"TC owner journal sequence %d at %s/%s is neither exact sequence %d nor a proven forward descendant",
+		persisted.Sequence,
+		persisted.Phase,
+		persisted.Step,
+		binding.sequence,
+	)
+}
+
+func provesDurableTCOwnerJournalAdvanced(
+	intent *pinOwnerRecord,
+	persisted *pinOwnerRecord,
+) bool {
+	if intent == nil || persisted == nil ||
+		intent.Phase != pinOwnerPhaseApplying ||
+		intent.Step != pinOwnerStepMutating ||
+		persisted.Sequence <= intent.Sequence ||
+		intent.ResourceKey != persisted.ResourceKey ||
+		intent.ParentDevice != persisted.ParentDevice ||
+		intent.ParentInode != persisted.ParentInode ||
+		intent.PinBaseName != persisted.PinBaseName ||
+		intent.PinPath != persisted.PinPath ||
+		intent.BPFFSRootPath != persisted.BPFFSRootPath ||
+		!samePinOwnerImmutableFields(intent, persisted) ||
+		!slices.Equal(intent.Maps, persisted.Maps) {
+		return false
+	}
+
+	// The cleanup record is the first durable point after recovery has rolled
+	// TC forward and committed the next control generation. Its transaction
+	// payload must still exactly match the retained mutating intent.
+	if persisted.Phase == pinOwnerPhaseApplying &&
+		persisted.Step == pinOwnerStepCleanup &&
+		persisted.ActiveGeneration == intent.ActiveGeneration &&
+		persisted.NextGeneration == intent.NextGeneration &&
+		slices.Equal(persisted.ActiveFilters, intent.ActiveFilters) &&
+		slices.Equal(persisted.DesiredFilters, intent.DesiredFilters) &&
+		slices.Equal(persisted.ProgramStages, intent.ProgramStages) &&
+		slices.Equal(persisted.MapStages, intent.MapStages) {
+		return true
+	}
+
+	// Once the original next generation is the current active snapshot, the
+	// old rollback stage is obsolete even if a later Apply/Detach has already
+	// started from that snapshot.
+	return persisted.ActiveGeneration == intent.NextGeneration &&
+		slices.Equal(persisted.ActiveFilters, intent.DesiredFilters)
+}
+
 func retainTCOwnerRecoveryPrograms(
 	handle *pinPathHandle,
 	record *pinOwnerRecord,
@@ -485,13 +583,20 @@ func retainTCOwnerRecoveryPrograms(
 		}
 		if observation == nil || observation.fd < 0 ||
 			observation.id != stage.ProgramID {
-			if observation != nil {
-				_ = observation.Close()
-			}
-			return closeOnError(fmt.Errorf(
+			invalidErr := fmt.Errorf(
 				"retain recovery program stage %s returned invalid FD/ID",
 				fileName,
-			))
+			)
+			if observation != nil {
+				if closeErr := observation.Close(); closeErr != nil {
+					invalidErr = errors.Join(invalidErr, fmt.Errorf(
+						"close invalid recovery program stage %s: %w",
+						fileName,
+						closeErr,
+					))
+				}
+			}
+			return closeOnError(invalidErr)
 		}
 		programs[stage.FileName] = observation
 	}

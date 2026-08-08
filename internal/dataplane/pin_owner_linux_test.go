@@ -462,6 +462,88 @@ func TestPrepareDurableTCOwnerJournalHandoffFaults(t *testing.T) {
 			t.Fatalf("handoff=%#v error=%v", handoff, err)
 		}
 	})
+
+	t.Run("invalid retained program reports its close failure", func(t *testing.T) {
+		fixture := newDurableTCOwnerJournalFixture(t)
+		stage := fixture.intent.ProgramStages[0]
+		baseLoad := fixture.handle.runtime.loadPinnedProgram
+		loads := 0
+		fixture.handle.runtime.loadPinnedProgram = func(
+			path string,
+		) (*pinnedProgramObservation, error) {
+			observation, err := baseLoad(path)
+			if err != nil || filepath.Base(path) != stage.FileName {
+				return observation, err
+			}
+			loads++
+			if loads == 2 {
+				observation.fd = -1
+			}
+			return observation, nil
+		}
+		closeErr := errors.New("injected invalid retained observation close failure")
+		fixture.programCloseErrors[stage.FileName] = []error{nil, closeErr}
+		handoff, err := prepareDurableTCOwnerJournalHandoff(
+			fixture.handle,
+			fixture.store,
+			fixture.intent,
+			fixture.active,
+			fixture.desired,
+			fixture.plan,
+		)
+		if handoff != nil || !errors.Is(err, closeErr) ||
+			!strings.Contains(err.Error(), "invalid FD/ID/pin capability") {
+			t.Fatalf("handoff=%#v error=%v", handoff, err)
+		}
+		fixture.assertProgramObservationsBalanced(t)
+	})
+
+	t.Run("invalid rebound program reports its close failure", func(t *testing.T) {
+		fixture := newDurableTCOwnerJournalFixture(t)
+		handoff, err := prepareDurableTCOwnerJournalHandoff(
+			fixture.handle,
+			fixture.store,
+			fixture.intent,
+			fixture.active,
+			fixture.desired,
+			fixture.plan,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := handoff.Close(); err != nil {
+			t.Fatal(err)
+		}
+		fixture.assertProgramObservationsBalanced(t)
+
+		stage := fixture.intent.ProgramStages[0]
+		baseLoad := fixture.handle.runtime.loadPinnedProgram
+		loads := 0
+		fixture.handle.runtime.loadPinnedProgram = func(
+			path string,
+		) (*pinnedProgramObservation, error) {
+			observation, err := baseLoad(path)
+			if err != nil || filepath.Base(path) != stage.FileName {
+				return observation, err
+			}
+			loads++
+			if loads == 2 {
+				observation.id++
+			}
+			return observation, nil
+		}
+		closeErr := errors.New("injected invalid rebound observation close failure")
+		fixture.programCloseErrors[stage.FileName] = []error{nil, closeErr}
+		programs, err := retainTCOwnerRecoveryPrograms(
+			fixture.handle,
+			fixture.intent,
+		)
+		if programs != nil || !errors.Is(err, closeErr) ||
+			!strings.Contains(err.Error(), "invalid FD/ID") {
+			t.Fatalf("programs=%#v error=%v", programs, err)
+		}
+		fixture.assertProgramObservationsBalanced(t)
+	})
 }
 
 func TestAbortFailedOwnerApplyReportsRollbackVerificationBoundary(t *testing.T) {
