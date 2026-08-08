@@ -105,6 +105,9 @@ func (owned *liveExactTCXLink) Identity() (exactTCXLinkIdentity, error) {
 	if err != nil {
 		return exactTCXLinkIdentity{}, fmt.Errorf("inspect TCX link: %w", err)
 	}
+	if info == nil {
+		return exactTCXLinkIdentity{}, errors.New("inspect TCX link returned nil info")
+	}
 	tcx := info.TCX()
 	if tcx == nil {
 		return exactTCXLinkIdentity{}, errors.New("pinned BPF link is not TCX")
@@ -440,10 +443,9 @@ func stageExactTCXAttachment(
 	if err != nil {
 		return nil, err
 	}
-	// Query is the read-only capability gate. An unsupported result here is
-	// the only point at which a caller may choose a compatibility backend:
-	// no TCX journal intent or kernel attachment exists yet. The returned
-	// revision also fences the later attach across journal persistence.
+	// Query is the read-only capability gate. Unsupported TCX fails before any
+	// owner intent or kernel attachment exists. The returned revision also
+	// fences the later attach across journal persistence.
 	query, err := runtime.query(binding.IfIndex, attach)
 	if err != nil {
 		return nil, fmt.Errorf("query TCX revision fence: %w", err)
@@ -473,9 +475,9 @@ func stageExactTCXAttachment(
 			return nil, cause
 		}
 		// Once the deterministic pin exists, mutating owner intent covers it
-		// and restart recovery must retain it. Before the pin exists, no
-		// durable identity can recover this particular link, so detach the
-		// exact FD immediately instead of leaking an unpinned attachment.
+		// and restart recovery must retain it. Before the pin exists, close the
+		// exact unpinned owner or retain its FD in-process until cleanup can be
+		// proven complete, so a retry cannot create an untracked duplicate.
 		if owner.pinned {
 			return owner, cause
 		}
@@ -646,6 +648,12 @@ func exactTCXLinkAbsentFromOriginalSlot(
 	binding exactTCXBinding,
 	runtime exactTCXRuntime,
 ) (bool, error) {
+	if err := validateExactTCXBinding(binding, true); err != nil {
+		return false, err
+	}
+	if err := validateExactTCXRuntime(runtime); err != nil {
+		return false, err
+	}
 	attach, err := exactTCXAttachType(binding.Direction)
 	if err != nil {
 		return false, err
@@ -845,10 +853,10 @@ func (owner *exactTCXAttachment) closeUnpinnedAfterFailure() (bool, error) {
 		owner.link = nil
 		owner.closed = true
 	}
-	attached, queryErr := exactTCXLinkStillAttached(owner.binding, owner.runtime)
+	absent, queryErr := exactTCXLinkAbsentFromOriginalSlot(owner.binding, owner.runtime)
 	if queryErr != nil {
 		queryErr = fmt.Errorf("verify failed unpinned exact TCX link %d: %w", owner.binding.LinkID, queryErr)
-	} else if attached {
+	} else if !absent {
 		queryErr = fmt.Errorf("failed unpinned exact TCX link %d remains attached", owner.binding.LinkID)
 	}
 	complete := owner.closed && queryErr == nil

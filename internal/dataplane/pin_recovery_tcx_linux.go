@@ -261,11 +261,11 @@ func rollbackFailedExactOwnerApplyLinks(
 					continue
 				}
 				if errors.Is(err, os.ErrNotExist) || errors.Is(err, unix.ENOENT) {
-					attached, queryErr := exactTCXLinkStillAttached(desired, runtime)
+					absent, queryErr := exactTCXLinkAbsentFromOriginalSlot(desired, runtime)
 					if queryErr != nil {
 						return queryErr
 					}
-					if !attached {
+					if absent {
 						continue
 					}
 				}

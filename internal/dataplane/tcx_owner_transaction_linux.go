@@ -748,11 +748,11 @@ func convergeOwnerApplyExactTCXLinks(
 			return current, err
 		}
 		if err != nil && desired.LinkID != 0 {
-			attached, queryErr := exactTCXLinkStillAttached(desired, runtime)
+			absent, queryErr := exactTCXLinkAbsentFromOriginalSlot(desired, runtime)
 			if queryErr != nil {
 				return current, queryErr
 			}
-			if attached {
+			if !absent {
 				return current, fmt.Errorf(
 					"journaled exact TCX link %d lost deterministic pin %s",
 					desired.LinkID, desired.PinName,
@@ -796,36 +796,6 @@ func convergeOwnerApplyExactTCXLinks(
 	return current, nil
 }
 
-func exactTCXLinkStillAttached(
-	binding exactTCXBinding,
-	runtime exactTCXRuntime,
-) (bool, error) {
-	attach, err := exactTCXAttachType(binding.Direction)
-	if err != nil {
-		return false, err
-	}
-	query, err := runtime.query(binding.IfIndex, attach)
-	if err != nil {
-		return false, err
-	}
-	if err := validateExactTCXQuery(query); err != nil {
-		return false, err
-	}
-	for _, program := range query.Programs {
-		if program.LinkID != binding.LinkID {
-			continue
-		}
-		if program.ProgramID != binding.ProgramID {
-			return false, fmt.Errorf(
-				"exact TCX link %d now reports program ID %d, owner requires %d",
-				binding.LinkID, program.ProgramID, binding.ProgramID,
-			)
-		}
-		return true, nil
-	}
-	return false, nil
-}
-
 func removeOwnedExactTCXLink(
 	handle *pinPathHandle,
 	binding exactTCXBinding,
@@ -841,11 +811,11 @@ func removeOwnedExactTCXLink(
 		if !errors.Is(err, os.ErrNotExist) && !errors.Is(err, unix.ENOENT) {
 			return err
 		}
-		attached, queryErr := exactTCXLinkStillAttached(binding, runtime)
+		absent, queryErr := exactTCXLinkAbsentFromOriginalSlot(binding, runtime)
 		if queryErr != nil {
 			return queryErr
 		}
-		if attached {
+		if !absent {
 			return fmt.Errorf(
 				"exact TCX link %d remains attached after deterministic pin disappeared",
 				binding.LinkID,
@@ -864,11 +834,11 @@ func removeOwnedExactTCXLink(
 	if !errors.Is(err, unix.ENOENT) {
 		return err
 	}
-	attached, err := exactTCXLinkStillAttached(binding, runtime)
+	absent, err := exactTCXLinkAbsentFromOriginalSlot(binding, runtime)
 	if err != nil {
 		return err
 	}
-	if attached {
+	if !absent {
 		return fmt.Errorf("exact TCX link %d remains attached after exact detach", binding.LinkID)
 	}
 	return nil
@@ -926,11 +896,11 @@ func validateOwnerExactTCXLinksAbsent(
 		if !errors.Is(err, unix.ENOENT) {
 			return err
 		}
-		attached, err := exactTCXLinkStillAttached(binding, runtime)
+		absent, err := exactTCXLinkAbsentFromOriginalSlot(binding, runtime)
 		if err != nil {
 			return err
 		}
-		if attached {
+		if !absent {
 			return fmt.Errorf("removed exact TCX link %d reappeared", binding.LinkID)
 		}
 	}

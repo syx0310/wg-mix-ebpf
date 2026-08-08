@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 )
 
 type exactTCXOwnerTestFixture struct {
@@ -460,6 +461,10 @@ func TestRemoveOwnedExactTCXRecoversDetachedPinnedBoundary(t *testing.T) {
 	}
 	owner.link = nil
 	owner.closed = true
+	// A removed netdevice may make QueryPrograms return ENODEV instead of an
+	// empty revisioned slot. The exact detached identity still makes cleanup
+	// safe and restart-convergent.
+	kernel.queryErr = unix.ENODEV
 
 	if err := removeOwnedExactTCXLink(fixture.handle, binding, kernel.runtime()); err != nil {
 		t.Fatal(err)
