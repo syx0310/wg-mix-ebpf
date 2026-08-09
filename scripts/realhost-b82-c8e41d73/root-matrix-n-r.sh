@@ -18,11 +18,9 @@ readonly VETH_STATE="${EVIDENCE_ROOT}/veth-owned.v1"
 readonly MODULE_INTENT="${EVIDENCE_ROOT}/checksum-module-intent.v1"
 readonly MODULE_LOADED="${EVIDENCE_ROOT}/checksum-module-owned.v1"
 readonly MODULE_UNLOADED="${EVIDENCE_ROOT}/checksum-module-unloaded.v1"
-readonly COMPLETED_MARKER="${EVIDENCE_ROOT}/completed.v1"
 readonly RESTORED_MARKER="${EVIDENCE_ROOT}/restored.v1"
 readonly PIN_PATH="/sys/fs/bpf/wg-mix-ebpf-${RUN_ID}-tcx"
 readonly TCX_RUNTIME_ROOT="${EVIDENCE_ROOT}/tcx-runtime"
-readonly SCOPED_TEST_NAME='TestScopedRealNICDataplaneActiveIntegration'
 readonly SCOPED_RESTORE_TEST_NAME='TestScopedRealNICDataplaneRestoreIntegration'
 readonly SCOPED_CONTRACT_TEST_NAME='TestScopedRealNICContextIsolationContract'
 readonly VETH_A='wgc8e41a'
@@ -35,17 +33,6 @@ readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-${RUN_ID}/checksum-m
 readonly MODULE_LEASE_HELPER="${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}"
 readonly MODULE_LEASE_LOCK="${STAGE_ROOT}/checksum-module-lease.v1.lock"
 readonly MODULE_LEASE_ID="${RUN_ID}-${EVIDENCE_ID}"
-readonly SOAK_WINDOWS=12
-readonly MATRIX_TRAFFIC_SECONDS=30
-readonly MATRIX_PASSES=2
-readonly MATRIX_OUTER_TIMEOUT_SECONDS=1500
-readonly MATRIX_GO_TIMEOUT_SECONDS=1440
-readonly MTU_TRAFFIC_SECONDS=30
-readonly MTU_PASSES=2
-readonly MTU_OUTER_TIMEOUT_SECONDS=600
-readonly MTU_GO_TIMEOUT_SECONDS=540
-readonly SOAK_OUTER_TIMEOUT_SECONDS=4500
-readonly SOAK_GO_TIMEOUT_SECONDS=4440
 readonly EXPECTED_HOSTNAME='ubuntu-2604-test'
 readonly EXPECTED_KERNEL='7.0.0-28-generic'
 readonly EXPECTED_MACHINE_ID='9db3fb717cc74974b2a6b243d67f67b9'
@@ -78,7 +65,6 @@ ORIGINAL_MTU=''
 VETH_A_IFINDEX=''
 VETH_B_IFINDEX=''
 INITIAL_NETNS=''
-declare -a BOOTSTRAP_AUDIT_LINES=()
 
 readonly -a FEATURE_NAMES=(
   rx-checksumming
@@ -208,179 +194,36 @@ plan_command() {
 }
 
 render_plan() {
-  local streams direction cell selector
+  local cell
+  local -a common=(
+    --source "${SOURCE}"
+    --commit "${COMMIT}"
+    --bundle "${BUNDLE}"
+    --bundle-sha256 "${BUNDLE_SHA256}"
+    --interface "${INTERFACE}"
+    --peer-address "${PEER_ADDRESS}"
+    --peer-port "${PEER_PORT}"
+    --soak-seconds "${SOAK_SECONDS}"
+    --session-seconds "${SESSION_SECONDS}"
+    --wg-interface "${WG_INTERFACE}"
+    --wg-local-address "${WG_LOCAL_ADDRESS}"
+    --wg-peer-address "${WG_PEER_ADDRESS}"
+  )
   printf 'REALHOST_V6_PLAN_ONLY run_id=%s package_id=%s evidence_id=%s commit=%s bundle_sha256=%s\n' \
     "${RUN_ID}" "${PACKAGE_ID}" "${EVIDENCE_ID}" "${COMMIT}" "${BUNDLE_SHA256}"
-  printf 'REALHOST_V6_PLAN_ENDPOINTS bare=%s:%s active_wg=%s:%s->%s:%s\n' \
-    "${PEER_ADDRESS}" "${PEER_PORT}" "${WG_INTERFACE}" "${WG_LOCAL_ADDRESS}" \
-    "${WG_PEER_ADDRESS}" "${PEER_PORT}"
-  printf 'REALHOST_V6_MODULE_LEASE helper=%s lock=%s lease_id=%s receipt=insmod-rc0-only generation=sysfs,parameter,srcversion,btf\n' \
-    "${MODULE_LEASE_HELPER}" "${MODULE_LEASE_LOCK}" "${MODULE_LEASE_ID}"
-  plan_command B0 /usr/bin/mkdir --mode=0700 -- "${EVIDENCE_ROOT}"
-  plan_command B1 shell-builtin noclobber-create-and-persist-bootstrap-audit "${AUDIT_LOG}"
-  plan_command L0 /usr/bin/flock --exclusive --nonblock MODULE_LEASE_FD
-  plan_command A1 /usr/bin/hostname
-  plan_command A2 /usr/bin/uname -r
-  plan_command A3 /usr/bin/cat /etc/machine-id
-  plan_command A4 /usr/sbin/ip -j address show dev "${INTERFACE}"
-  for selector in public-key listen-port fwmark peers endpoints allowed-ips latest-handshakes transfer; do
-    plan_command "A16-wg-${selector}" /usr/bin/wg show "${WG_INTERFACE}" "${selector}"
-  done
-  plan_command N0 /usr/bin/go -C "${SOURCE}" test ./internal/dataplane \
-    -run '^TestBPFFSPinLifecycleIntegration$' -count=1
-  plan_command N1 /usr/sbin/ip link add "${VETH_A}" type veth peer name "${VETH_B}"
-  plan_command N2 /usr/sbin/ip link set dev "${VETH_A}" alias "${VETH_A_ALIAS}"
-  plan_command N3 /usr/sbin/ip link set dev "${VETH_B}" alias "${VETH_B_ALIAS}"
-  plan_command N4 /usr/sbin/ip link set dev "${VETH_A}" up
-  plan_command N5 /usr/sbin/ip link set dev "${VETH_B}" up
-  plan_command N6 /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
-    WG_MIX_EBPF_RUN_BPFFS_INTEGRATION=1 \
-    WG_MIX_EBPF_TEST_OBJECT_PATH="${SOURCE}/build/wg_mix_tc.o" \
-    WG_MIX_EBPF_TEST_PIN_PATH="${PIN_PATH}" \
-    WG_MIX_EBPF_TEST_IFINDEX=RUNTIME_VETH_IFINDEX \
-    WG_MIX_EBPF_TEST_RUNTIME_ROOT="${TCX_RUNTIME_ROOT}" \
-    WG_MIX_EBPF_TEST_PIN_LOCK_ROOT="${TCX_RUNTIME_ROOT}/locks" \
-    WG_MIX_EBPF_TEST_PIN_OWNER_ROOT="${TCX_RUNTIME_ROOT}/owners" \
-    WG_MIX_EBPF_TEST_INITIAL_NETNS=EXACT_INITIAL_NETNS \
-    WG_MIX_EBPF_TEST_ACTION=run \
-    WG_MIX_EBPF_TEST_FAILURE_POLICY=retain \
-    /usr/bin/go -C "${SOURCE}" test ./internal/dataplane \
-    -run '^TestBPFFSPinLifecycleIntegration$' -count=1 -timeout=2m
-  plan_command O1 /usr/bin/make --no-print-directory -C "${SOURCE}" \
-    build-bpf build-faketcp-experimental-bpf build-faketcp-checksum-kmod build
-  plan_command O2 /usr/sbin/insmod "${SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko" \
-    "lease_id=${MODULE_LEASE_ID}"
-  plan_command O3 "${SOURCE}/bin/wg-mix-ebpf" bpf-load-test \
-    --experimental-faketcp --object "${SOURCE}/build/wg_mix_faketcp_experimental.o" --json
-  plan_command O4 /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
-    WG_MIX_FAKETCP_PACKET_TEST_OBJECT="${SOURCE}/build/wg_mix_faketcp_experimental.o" \
-    /usr/bin/go -C "${SOURCE}" test ./internal/dataplane \
-    -run '^TestFakeTCPBPFPacketProbe$' -count=1 -timeout=3m
-  for label in \
-    TestExperimentalFakeTCPRealHostLifecycleIntegration \
-    TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration \
-    TestBaselineExperimentalRealHostMutualExclusionIntegration; do
-    plan_command "O-${label}" /usr/bin/env -i \
-      PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
-      WG_MIX_FAKETCP_RUN_REALHOST_INTEGRATION=1 \
-      WG_MIX_FAKETCP_REALHOST_OBJECT="${SOURCE}/build/wg_mix_faketcp_experimental.o" \
-      WG_MIX_FAKETCP_REALHOST_BASELINE_OBJECT="${SOURCE}/build/wg_mix_tc.o" \
-      WG_MIX_FAKETCP_REALHOST_IFINDEX=RUNTIME_VETH_IFINDEX \
-      WG_MIX_FAKETCP_REALHOST_PEER_IFINDEX=RUNTIME_PEER_IFINDEX \
-      WG_MIX_FAKETCP_REALHOST_XDP_MODE=generic \
-      WG_MIX_FAKETCP_REALHOST_RUN_ID="${RUN_ID}" \
-      /usr/bin/go -C "${SOURCE}" test ./internal/dataplane \
-      -run "^${label}$" -count=1 -timeout=5m
-  done
-  plan_command O8 /usr/sbin/rmmod "${MODULE_NAME}"
-  plan_command O9 /usr/sbin/ip link delete dev "${VETH_A}"
-  plan_command P-scoped-contract /usr/bin/go -C "${SOURCE}" test ./internal/dataplane \
-    -run "^${SCOPED_CONTRACT_TEST_NAME}$" -count=1
-  for cell in original all-on all-off tx-path rx-path; do
-    plan_command "P-${cell}-features" /usr/sbin/ethtool -K "${INTERFACE}" REVIEWED_CELL_VALUES
-    for streams in 1 4 16; do
-      for direction in forward reverse bidir; do
-        case "${direction}" in
-          forward)
-            plan_command "P-${cell}-p${streams}-${direction}" /usr/bin/timeout \
-              --signal=TERM --kill-after=10s 50s /usr/bin/iperf3 \
-              -c "${PEER_ADDRESS}" -p "${PEER_PORT}" --connect-timeout 5000 \
-              --json --omit 2 -t 30 -P "${streams}"
-            ;;
-          reverse)
-            plan_command "P-${cell}-p${streams}-${direction}" /usr/bin/timeout \
-              --signal=TERM --kill-after=10s 50s /usr/bin/iperf3 \
-              -c "${PEER_ADDRESS}" -p "${PEER_PORT}" --connect-timeout 5000 \
-              --json --omit 2 -t 30 -P "${streams}" -R
-            ;;
-          bidir)
-            plan_command "P-${cell}-p${streams}-${direction}" /usr/bin/timeout \
-              --signal=TERM --kill-after=10s 50s /usr/bin/iperf3 \
-              -c "${PEER_ADDRESS}" -p "${PEER_PORT}" --connect-timeout 5000 \
-              --json --omit 2 -t 30 -P "${streams}" --bidir
-            ;;
-        esac
-      done
-    done
-  done
-  plan_command Q1 /usr/sbin/ip link set dev "${INTERFACE}" mtu 1492
-  plan_command Q2 /usr/bin/ping -4 -I "${INTERFACE}" -M do -c 3 -W 2 -s 1464 "${PEER_ADDRESS}"
-  plan_command Q3 /usr/bin/ping -4 -I "${INTERFACE}" -M do -c 1 -W 2 -s 1465 "${PEER_ADDRESS}"
-  plan_command Q4 /usr/sbin/ip link set dev "${INTERFACE}" mtu 1500
-  plan_command P-scoped-active /usr/bin/env -i \
-    WG_MIX_EBPF_RUN_SCOPED_REALNIC_INTEGRATION=1 \
-    WG_MIX_EBPF_SCOPED_REALNIC_STATE_ROOT=RUN_OWNED_CELL_STATE \
-    WG_MIX_EBPF_SCOPED_REALNIC_LEASE_ROOT=RUN_OWNED_CELL_LEASE \
-    WG_MIX_EBPF_SCOPED_REALNIC_OWNER_ROOT=RUN_OWNED_CELL_OWNER \
-    WG_MIX_EBPF_SCOPED_REALNIC_PIN_PATH=RUN_OWNED_CELL_BPFFS_PIN \
-    WG_MIX_EBPF_SCOPED_REALNIC_INITIAL_NETNS=EXACT_INITIAL_NETNS \
-    WG_MIX_EBPF_SCOPED_REALNIC_TC_ATTACH=tcx \
-    WG_MIX_EBPF_SCOPED_REALNIC_TYPEWORD_MODE=identity \
-    WG_MIX_EBPF_SCOPED_REALNIC_FAILURE_POLICY=retain \
-    /usr/bin/go -C "${SOURCE}" test ./internal/dataplane \
-    -run "^${SCOPED_TEST_NAME}$" -count=1
-  printf 'R-scoped-soak windows=%s session_seconds=%s total_seconds=%s monitor_samples=360\n' \
-    "${SOAK_WINDOWS}" "${SESSION_SECONDS}" "$((SOAK_WINDOWS * SESSION_SECONDS))"
-  plan_command R-restore /usr/sbin/ethtool -K "${INTERFACE}" EXACT_ORIGINAL_VALUES
-  plan_command R-full-offload-snapshot /usr/sbin/ethtool -k "${INTERFACE}"
-  plan_command R-full-offload-compare /usr/bin/cmp -s "${EVIDENCE_ROOT}/A7.out" EXACT_RESTORED_FEATURE_SNAPSHOT
-  plan_command R-mtu /usr/sbin/ip link set dev "${INTERFACE}" mtu EXACT_ORIGINAL_MTU
-  plan_command Z-scoped-restore /usr/bin/env -i \
-    WG_MIX_EBPF_RUN_SCOPED_REALNIC_INTEGRATION=1 \
-    WG_MIX_EBPF_SCOPED_REALNIC_ACTION=restore \
-    /usr/bin/go -C "${SOURCE}" test ./internal/dataplane \
-    -run "^${SCOPED_RESTORE_TEST_NAME}$" -count=1
   printf '%s\n' \
-    'P-faketcp-physical-e2e classification=not-covered reason=read-only-peer-has-no-reviewed-faketcp-dataplane' \
-    'P-xor-physical-e2e classification=not-covered reason=read-only-peer-has-no-reviewed-shared-cipher'
-  printf 'REALHOST_V6_PLAN_COMPLETE commands_are_review_templates=1 no_commands_executed=1\n'
+    'REALHOST_V6_FORWARD_AUTHORITY state=retired replacement=realnic-acceptance' \
+    'REALHOST_V6_PLAN_SCOPE restore-only=1 network-writes-executed=0 filesystem-writes-executed=0'
+  for cell in tcx original all-on all-off tx-path rx-path mtu1492 mtu1500 soak; do
+    plan_command "restore-${cell}" /bin/bash -p \
+      "${SOURCE}/scripts/realhost-b82-${RUN_ID}/root-matrix-n-r.sh" restore \
+      "${common[@]}" --restore-cell "${cell}"
+  done
+  printf 'REALHOST_V6_PLAN_COMPLETE restore_entries=9 no_commands_executed=1\n'
 }
 
 utc_now() {
   /bin/date -u '+%Y-%m-%dT%H:%M:%SZ'
-}
-
-bootstrap_audit_line() {
-  local event="$1" step="$2" target="$3" rc="$4" rendered="$5"
-  local timestamp line
-  timestamp="$(utc_now)" || return $?
-  [[ "${timestamp}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$ ]] || return 79
-  printf -v line 'utc=%q event=%q step=%q target=%q rc=%q argv=%q' \
-    "${timestamp}" "${event}" "${step}" "${target}" "${rc}" "${rendered}"
-  BOOTSTRAP_AUDIT_LINES+=("${line}")
-  printf 'REALHOST_V6_BOOTSTRAP_AUDIT %s\n' "${line}"
-}
-
-bootstrap_run_step() {
-  local step="$1" target="$2" rendered rc
-  shift 2
-  rendered="$(quote_argv "$@")" || return $?
-  bootstrap_audit_line start "${step}" "${target}" not-run "${rendered}" || return $?
-  "$@"
-  rc=$?
-  bootstrap_audit_line finish "${step}" "${target}" "${rc}" "${rendered}" || return $?
-  return "${rc}"
-}
-
-create_bootstrap_audit_log() {
-  local rendered rc persist_rc finish_line last_index
-  rendered="shell-builtin: noclobber create ${AUDIT_LOG}; persist bootstrap start/finish records"
-  bootstrap_audit_line start B1.audit-create "${AUDIT_LOG}" not-run "${rendered}" || return $?
-  set -o noclobber
-  printf '%s\n' "${BOOTSTRAP_AUDIT_LINES[@]}" >"${AUDIT_LOG}"
-  rc=$?
-  set +o noclobber
-  bootstrap_audit_line finish B1.audit-create "${AUDIT_LOG}" "${rc}" "${rendered}" || return $?
-  ((rc == 0)) || return "${rc}"
-  last_index=$((${#BOOTSTRAP_AUDIT_LINES[@]} - 1))
-  finish_line="${BOOTSTRAP_AUDIT_LINES[${last_index}]}"
-  printf '%s\n' "${finish_line}" >>"${AUDIT_LOG}"
-  persist_rc=$?
-  if ((persist_rc != 0)); then
-    bootstrap_audit_line finish B1.audit-persist "${AUDIT_LOG}" "${persist_rc}" \
-      'shell-builtin: append audit-create finish record' || return $?
-    return "${persist_rc}"
-  fi
 }
 
 audit_line() {
@@ -452,12 +295,11 @@ require_tooling() {
   local -a tools=(
     /bin/bash /bin/date
     /usr/bin/awk /usr/bin/basename /usr/bin/cat /usr/bin/cmp /usr/bin/env
-    /usr/bin/git /usr/bin/go /usr/bin/grep /usr/bin/hostname /usr/bin/iperf3
-    /usr/bin/jq /usr/bin/ls /usr/bin/make /usr/bin/mkdir /usr/bin/ping /usr/bin/python3
+    /usr/bin/git /usr/bin/go /usr/bin/grep /usr/bin/hostname
     /usr/bin/flock /usr/bin/readlink /usr/bin/sha256sum /usr/bin/stat /usr/bin/tee
-    /usr/bin/test /usr/bin/timeout /usr/bin/uname /usr/bin/wg
-    /usr/sbin/bpftool /usr/sbin/ethtool /usr/sbin/insmod /usr/sbin/ip /usr/sbin/modinfo
-    /usr/sbin/lsmod /usr/sbin/nft /usr/sbin/rmmod /usr/sbin/tc
+    /usr/bin/test /usr/bin/timeout /usr/bin/uname
+    /usr/sbin/bpftool /usr/sbin/ethtool /usr/sbin/ip /usr/sbin/modinfo
+    /usr/sbin/lsmod /usr/sbin/rmmod /usr/sbin/tc
   )
   for path in "${tools[@]}"; do
     [[ -x "${path}" ]] || fail "missing-tool:${path}" 69
@@ -556,110 +398,10 @@ configure_checksum_module_lease() {
     fail 'module-lease-binding-contract' 79
 }
 
-create_evidence_root() {
-  local rc
-  [[ ! -e "${EVIDENCE_ROOT}" && ! -L "${EVIDENCE_ROOT}" ]] || fail 'evidence-exists' 78
-  bootstrap_run_step B0.evidence-create "${EVIDENCE_ROOT}" \
-    /usr/bin/mkdir --mode=0700 -- "${EVIDENCE_ROOT}"
-  rc=$?
-  ((rc == 0)) || fail "evidence-create:rc=${rc}" "${rc}"
-  [[ -d "${EVIDENCE_ROOT}" && ! -L "${EVIDENCE_ROOT}" ]] || fail 'evidence-shape' 79
-  create_bootstrap_audit_log
-  rc=$?
-  ((rc == 0)) || fail "audit-create:rc=${rc}" "${rc}"
-  ORIGINAL_BOOT_ID="$(read_single_line /proc/sys/kernel/random/boot_id)" || fail 'boot-id-read'
-  [[ "${ORIGINAL_BOOT_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
-    fail 'boot-id-invalid' 79
-  write_once "${OWNER_MARKER}" \
-    'format=wg-mix-ebpf-realhost-v6-owner-v1' \
-    "run_id=${RUN_ID}" "package_id=${PACKAGE_ID}" "evidence_id=${EVIDENCE_ID}" \
-    "commit=${COMMIT}" "bundle_sha256=${BUNDLE_SHA256}" \
-    "boot_id=${ORIGINAL_BOOT_ID}" "source=${SOURCE}" "interface=${INTERFACE}"
-}
-
-snapshot_host() {
-  INITIAL_NETNS="$(/usr/bin/readlink -- /proc/self/ns/net)" || fail 'initial-netns-read'
-  [[ "${INITIAL_NETNS}" =~ ^net:\[[1-9][0-9]*\]$ ]] || fail 'initial-netns-invalid' 79
-  write_once "${NETNS_STATE}" "run_id=${RUN_ID}" "initial_netns=${INITIAL_NETNS}"
-  run_step A1 hostname /usr/bin/hostname; require_zero A1
-  run_step A2 kernel /usr/bin/uname -r; require_zero A2
-  run_step A3 machine-id /usr/bin/cat /etc/machine-id; require_zero A3
-  run_step A4 interface-address /usr/sbin/ip -j address show dev "${INTERFACE}"; require_zero A4
-  run_step A5 interface-link /usr/sbin/ip -d -j link show dev "${INTERFACE}"; require_zero A5
-  run_step A6 interface-driver /usr/sbin/ethtool -i "${INTERFACE}"; require_zero A6
-  run_step A7 interface-features /usr/sbin/ethtool -k "${INTERFACE}"; require_zero A7
-  run_step A8 interface-stats /usr/sbin/ethtool -S "${INTERFACE}"; require_zero A8
-  run_step A9 route-peer /usr/sbin/ip -j route get "${PEER_ADDRESS}"; require_zero A9
-  /usr/bin/jq -e --arg dev "${INTERFACE}" \
-    'length == 1 and .[0].dev == $dev' "${STEP_LOG}" >/dev/stdout || fail 'peer-route-not-interface' 79
-  run_step A10 tc-qdisc /usr/sbin/tc -j qdisc show dev "${INTERFACE}"; require_zero A10
-  run_step A11 tc-ingress /usr/sbin/tc -j filter show dev "${INTERFACE}" ingress; require_zero A11
-  run_step A12 tc-egress /usr/sbin/tc -j filter show dev "${INTERFACE}" egress; require_zero A12
-  run_step A13 bpf-links /usr/sbin/bpftool -j link show; require_zero A13
-  run_step A14 bpf-programs /usr/sbin/bpftool -j prog show; require_zero A14
-  run_step A15 bpf-maps /usr/sbin/bpftool -j map show; require_zero A15
-  run_step A16.wg-public-keys wireguard /usr/bin/wg show "${WG_INTERFACE}" public-key; require_zero A16.wg-public-keys
-  run_step A16.wg-listen-ports wireguard /usr/bin/wg show "${WG_INTERFACE}" listen-port; require_zero A16.wg-listen-ports
-  run_step A16.wg-fwmarks wireguard /usr/bin/wg show "${WG_INTERFACE}" fwmark; require_zero A16.wg-fwmarks
-  run_step A16.wg-peers wireguard /usr/bin/wg show "${WG_INTERFACE}" peers; require_zero A16.wg-peers
-  run_step A16.wg-endpoints wireguard /usr/bin/wg show "${WG_INTERFACE}" endpoints; require_zero A16.wg-endpoints
-  run_step A16.wg-allowed-ips wireguard /usr/bin/wg show "${WG_INTERFACE}" allowed-ips; require_zero A16.wg-allowed-ips
-  run_step A16.wg-handshakes wireguard /usr/bin/wg show "${WG_INTERFACE}" latest-handshakes; require_zero A16.wg-handshakes
-  run_step A16.wg-transfer wireguard /usr/bin/wg show "${WG_INTERFACE}" transfer; require_zero A16.wg-transfer
-  run_step A17 nftables /usr/sbin/nft -j list ruleset; require_zero A17
-  run_step A18 modules /usr/sbin/lsmod; require_zero A18
-  run_step A19 wg-interface /usr/sbin/ip -d -j link show dev "${WG_INTERFACE}"; require_zero A19
-  run_step A20 wg-address /usr/sbin/ip -j address show dev "${WG_INTERFACE}"; require_zero A20
-  /usr/bin/jq -e --arg address "${WG_LOCAL_ADDRESS}" \
-    'length == 1 and any(.[0].addr_info[]?; .family == "inet" and .local == $address)' \
-    "${STEP_LOG}" >/dev/stdout || fail 'wg-local-address-mismatch' 79
-  run_step A21 wg-route /usr/sbin/ip -j route get "${WG_PEER_ADDRESS}" from "${WG_LOCAL_ADDRESS}"
-  require_zero A21
-  /usr/bin/jq -e --arg dev "${WG_INTERFACE}" \
-    'length == 1 and .[0].dev == $dev' "${STEP_LOG}" >/dev/stdout || fail 'wg-peer-route-mismatch' 79
-  run_step A22 wg-peer-public-keys /usr/bin/wg show "${WG_INTERFACE}" peers; require_zero A22
-  [[ -s "${STEP_LOG}" ]] || fail 'wg-interface-has-no-peer' 79
-  ORIGINAL_IFINDEX="$(read_single_line "/sys/class/net/${INTERFACE}/ifindex")" || fail 'ifindex-read'
-  [[ "${ORIGINAL_IFINDEX}" =~ ^[1-9][0-9]*$ ]] || fail 'ifindex-invalid' 79
-  ORIGINAL_MAC="$(read_single_line "/sys/class/net/${INTERFACE}/address")" || fail 'mac-read'
-  [[ "${ORIGINAL_MAC}" =~ ^[0-9a-f]{2}(:[0-9a-f]{2}){5}$ ]] || fail 'mac-invalid' 79
-  ORIGINAL_MTU="$(read_single_line "/sys/class/net/${INTERFACE}/mtu")" || fail 'mtu-read'
-  [[ "${ORIGINAL_MTU}" == '1500' ]] || fail 'unexpected-original-mtu' 79
-}
-
 feature_line() {
   local source="$1"
   local feature="$2"
   /usr/bin/awk -v key="${feature}:" '$1 == key {print $2 " " ($3 == "[fixed]" ? "fixed" : "mutable")}' "${source}"
-}
-
-capture_nic_state() {
-  local feature value state line
-  local -a records=(
-    'format=wg-mix-ebpf-nic-state-v1'
-    "interface=${INTERFACE}"
-    "ifindex=${ORIGINAL_IFINDEX}"
-    "mac=${ORIGINAL_MAC}"
-    "mtu=${ORIGINAL_MTU}"
-  )
-  [[ ! -e "${NIC_STATE}" && ! -L "${NIC_STATE}" ]] || fail 'nic-state-exists' 78
-  for feature in "${FEATURE_NAMES[@]}"; do
-    line="$(feature_line "${EVIDENCE_ROOT}/A7.out" "${feature}")" || fail "feature-parse:${feature}"
-    if [[ -z "${line}" ]]; then
-      case "${feature}" in
-        tx-udp-segmentation | rx-udp-gro-forwarding)
-          records+=("feature=${feature} value=unsupported mutability=unsupported")
-          continue
-          ;;
-        *) fail "required-feature-absent:${feature}" 79 ;;
-      esac
-    fi
-    read -r value state <<<"${line}"
-    [[ "${value}" =~ ^(on|off)$ && "${state}" =~ ^(fixed|mutable)$ ]] ||
-      fail "feature-state-invalid:${feature}" 79
-    records+=("feature=${feature} value=${value} mutability=${state}")
-  done
-  write_once "${NIC_STATE}" "${records[@]}"
 }
 
 current_interface_identity() {
@@ -728,30 +470,6 @@ restore_nic_state() {
   verify_full_feature_restore "${prefix}"
 }
 
-apply_feature_cell() {
-  local cell="$1"
-  local policy="${cell%-soak}"
-  local feature desired
-  restore_nic_state "P.${cell}.baseline"
-  for feature in "${FEATURE_NAMES[@]}"; do
-    case "${policy}:${feature}" in
-      original:*) continue ;;
-      all-on:*) desired=on ;;
-      all-off:*) desired=off ;;
-      tx-path:tx-checksumming | tx-path:generic-segmentation-offload | \
-      tx-path:tcp-segmentation-offload | tx-path:tx-udp-segmentation) desired=on ;;
-      tx-path:*) desired=off ;;
-      rx-path:rx-checksumming | rx-path:generic-receive-offload | \
-      rx-path:rx-udp-gro-forwarding) desired=on ;;
-      rx-path:*) desired=off ;;
-      *) fail "unknown-feature-cell:${cell}:${feature}" 64 ;;
-    esac
-    set_feature "P.${cell}.${feature}" "${feature}" "${desired}"
-  done
-  run_step "P.${cell}.snapshot" "${INTERFACE}" /usr/sbin/ethtool -k "${INTERFACE}"
-  require_zero "P.${cell}.snapshot"
-}
-
 go_test_exists() {
   local step="$1" name="$2"
   run_step "${step}.list" "${name}" /usr/bin/env -i \
@@ -763,51 +481,6 @@ go_test_exists() {
     test ./internal/dataplane -list "^${name}$"
   require_zero "${step}.list"
   /usr/bin/grep -Fxq -- "${name}" "${STEP_LOG}" || fail "missing-integration-test:${name}" 79
-}
-
-build_artifacts() {
-  run_step O1 build-artifacts /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
-    CGO_ENABLED=0 GO=/usr/bin/go CLANG=/usr/bin/clang \
-    GOCACHE="${STAGE_ROOT}/go-cache-realhost" GOENV=off GOFLAGS= \
-    GOMODCACHE="${STAGE_ROOT}/go-mod-cache-realhost" GOPATH="${STAGE_ROOT}/go-path-realhost" \
-    GOTMPDIR="${STAGE_ROOT}/go-tmp-realhost" GOWORK=off GO111MODULE=on TMPDIR="${STAGE_ROOT}/go-tmp-realhost" \
-    /usr/bin/timeout --signal=TERM --kill-after=30s 30m /usr/bin/make \
-    --no-print-directory -C "${SOURCE}" build-bpf build-faketcp-experimental-bpf \
-    build-faketcp-checksum-kmod build test-bpf-object-manifests
-  require_zero O1
-  run_step O1.hash artifacts /usr/bin/sha256sum -- \
-    "${SOURCE}/bin/wg-mix-ebpf" "${SOURCE}/build/wg_mix_tc.o" \
-    "${SOURCE}/build/wg_mix_faketcp_experimental.o" \
-    "${SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko" \
-    "${SOURCE}/scripts/realhost-b82-${RUN_ID}/check-realhost-iperf.py"
-  require_zero O1.hash
-}
-
-create_owned_veth() {
-  run_step N1.pre-a "${VETH_A}" /usr/sbin/ip link show dev "${VETH_A}"
-  ((STEP_RC == 1)) || fail "veth-a-preexists:rc=${STEP_RC}" 79
-  run_step N1.pre-b "${VETH_B}" /usr/sbin/ip link show dev "${VETH_B}"
-  ((STEP_RC == 1)) || fail "veth-b-preexists:rc=${STEP_RC}" 79
-  [[ ! -e "${PIN_PATH}" && ! -L "${PIN_PATH}" ]] || fail 'tcx-pin-preexists' 79
-  run_step N1 "${VETH_A}:${VETH_B}" /usr/sbin/ip link add "${VETH_A}" type veth peer name "${VETH_B}"
-  require_zero N1
-  run_step N2 "${VETH_A}" /usr/sbin/ip link set dev "${VETH_A}" alias "${VETH_A_ALIAS}"
-  require_zero N2
-  run_step N3 "${VETH_B}" /usr/sbin/ip link set dev "${VETH_B}" alias "${VETH_B_ALIAS}"
-  require_zero N3
-  run_step N4 "${VETH_A}" /usr/sbin/ip link set dev "${VETH_A}" up
-  require_zero N4
-  run_step N5 "${VETH_B}" /usr/sbin/ip link set dev "${VETH_B}" up
-  require_zero N5
-  VETH_A_IFINDEX="$(read_single_line "/sys/class/net/${VETH_A}/ifindex")" || fail 'veth-a-ifindex'
-  VETH_B_IFINDEX="$(read_single_line "/sys/class/net/${VETH_B}/ifindex")" || fail 'veth-b-ifindex'
-  [[ "${VETH_A_IFINDEX}" =~ ^[1-9][0-9]*$ && "${VETH_B_IFINDEX}" =~ ^[1-9][0-9]*$ ]] ||
-    fail 'veth-ifindex-invalid' 79
-  write_once "${VETH_STATE}" 'format=wg-mix-ebpf-realhost-veth-v1' \
-    "run_id=${RUN_ID}" "a=${VETH_A}" "a_ifindex=${VETH_A_IFINDEX}" "a_alias=${VETH_A_ALIAS}" \
-    "b=${VETH_B}" "b_ifindex=${VETH_B_IFINDEX}" "b_alias=${VETH_B_ALIAS}"
-  run_step N5.links-before bpf-links /usr/sbin/bpftool -j link show
-  require_zero N5.links-before
 }
 
 verify_owned_veth() {
@@ -829,36 +502,6 @@ delete_owned_veth() {
   run_step "${prefix}.verify-b" "${VETH_B}" /usr/sbin/ip link show dev "${VETH_B}"
   ((STEP_RC == 1)) || fail "veth-b-delete-verify:rc=${STEP_RC}" 79
   write_once "${EVIDENCE_ROOT}/veth-deleted.v1" "run_id=${RUN_ID}" 'status=deleted'
-}
-
-run_exact_tcx_lifecycle() {
-  go_test_exists N6 TestBPFFSPinLifecycleIntegration
-  run_step N6.runtime-pre "${TCX_RUNTIME_ROOT}" /usr/bin/test ! -e "${TCX_RUNTIME_ROOT}"
-  require_zero N6.runtime-pre
-  run_step N7 exact-tcx-lifecycle /usr/bin/env -i \
-    PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C CGO_ENABLED=0 \
-    GOCACHE="${STAGE_ROOT}/go-cache-realhost" GOENV=off GOFLAGS= \
-    GOMODCACHE="${STAGE_ROOT}/go-mod-cache-realhost" GOPATH="${STAGE_ROOT}/go-path-realhost" \
-    GOTMPDIR="${STAGE_ROOT}/go-tmp-realhost" GOWORK=off GO111MODULE=on TMPDIR="${STAGE_ROOT}/go-tmp-realhost" \
-    WG_MIX_EBPF_RUN_BPFFS_INTEGRATION=1 \
-    WG_MIX_EBPF_TEST_OBJECT_PATH="${SOURCE}/build/wg_mix_tc.o" \
-    WG_MIX_EBPF_TEST_PIN_PATH="${PIN_PATH}" WG_MIX_EBPF_TEST_IFINDEX="${VETH_A_IFINDEX}" \
-    WG_MIX_EBPF_TEST_RUNTIME_ROOT="${TCX_RUNTIME_ROOT}" \
-    WG_MIX_EBPF_TEST_PIN_LOCK_ROOT="${TCX_RUNTIME_ROOT}/locks" \
-    WG_MIX_EBPF_TEST_PIN_OWNER_ROOT="${TCX_RUNTIME_ROOT}/owners" \
-    WG_MIX_EBPF_TEST_INITIAL_NETNS="${INITIAL_NETNS}" \
-    WG_MIX_EBPF_TEST_ACTION=run \
-    WG_MIX_EBPF_TEST_FAILURE_POLICY=retain \
-    /usr/bin/timeout --signal=TERM --kill-after=10s 3m /usr/bin/go -C "${SOURCE}" \
-    test ./internal/dataplane -run '^TestBPFFSPinLifecycleIntegration$' -count=1 -timeout=2m
-  require_zero N7
-  /usr/bin/grep -Fqx -- 'SCOPED_BPFFS_COMPLETE restored=1' "${STEP_LOG}" ||
-    fail 'scoped-bpffs-completion-marker' 79
-  run_step N8 "${PIN_PATH}" /usr/bin/test ! -e "${PIN_PATH}"
-  require_zero N8
-  run_step N9 links-after-tcx /usr/sbin/bpftool -j link show
-  require_zero N9
-  /usr/bin/cmp -s "${EVIDENCE_ROOT}/N5.links-before.out" "${STEP_LOG}" || fail 'tcx-link-leak' 79
 }
 
 restore_exact_tcx_lifecycle() {
@@ -898,105 +541,9 @@ restore_exact_tcx_lifecycle() {
   /usr/bin/cmp -s "${EVIDENCE_ROOT}/A13.out" "${STEP_LOG}" || fail 'tcx-restore-link-drift' 79
 }
 
-load_checksum_module() {
-  configure_checksum_module_lease
-  c8_checksum_module_load O2
-}
-
 unload_checksum_module() {
   local prefix="${1:-O8}"
   c8_checksum_module_restore "${prefix}"
-}
-
-run_faketcp_tests() {
-  local name step
-  run_step O3 faketcp-verifier /usr/bin/timeout --signal=TERM --kill-after=10s 3m \
-    "${SOURCE}/bin/wg-mix-ebpf" bpf-load-test --experimental-faketcp \
-    --object "${SOURCE}/build/wg_mix_faketcp_experimental.o" --json
-  require_zero O3
-  go_test_exists O4 TestFakeTCPBPFPacketProbe
-  run_step O5 faketcp-packet-probe /usr/bin/env -i \
-    PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C CGO_ENABLED=0 \
-    GOCACHE="${STAGE_ROOT}/go-cache-realhost" GOENV=off GOFLAGS= \
-    GOMODCACHE="${STAGE_ROOT}/go-mod-cache-realhost" GOPATH="${STAGE_ROOT}/go-path-realhost" \
-    GOTMPDIR="${STAGE_ROOT}/go-tmp-realhost" GOWORK=off GO111MODULE=on TMPDIR="${STAGE_ROOT}/go-tmp-realhost" \
-    WG_MIX_FAKETCP_PACKET_TEST_OBJECT="${SOURCE}/build/wg_mix_faketcp_experimental.o" \
-    /usr/bin/timeout --signal=TERM --kill-after=10s 4m /usr/bin/go -C "${SOURCE}" \
-    test ./internal/dataplane -run '^TestFakeTCPBPFPacketProbe$' -count=1 -timeout=3m -v
-  require_zero O5
-  step=6
-  for name in \
-    TestExperimentalFakeTCPRealHostLifecycleIntegration \
-    TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration \
-    TestBaselineExperimentalRealHostMutualExclusionIntegration; do
-    go_test_exists "O${step}" "${name}"
-    run_step "O${step}.run" "${name}" /usr/bin/env -i \
-      PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C CGO_ENABLED=0 \
-      GOCACHE="${STAGE_ROOT}/go-cache-realhost" GOENV=off GOFLAGS= \
-      GOMODCACHE="${STAGE_ROOT}/go-mod-cache-realhost" GOPATH="${STAGE_ROOT}/go-path-realhost" \
-      GOTMPDIR="${STAGE_ROOT}/go-tmp-realhost" GOWORK=off GO111MODULE=on TMPDIR="${STAGE_ROOT}/go-tmp-realhost" \
-      WG_MIX_FAKETCP_RUN_REALHOST_INTEGRATION=1 \
-      WG_MIX_FAKETCP_REALHOST_OBJECT="${SOURCE}/build/wg_mix_faketcp_experimental.o" \
-      WG_MIX_FAKETCP_REALHOST_BASELINE_OBJECT="${SOURCE}/build/wg_mix_tc.o" \
-      WG_MIX_FAKETCP_REALHOST_IFINDEX="${VETH_A_IFINDEX}" \
-      WG_MIX_FAKETCP_REALHOST_PEER_IFINDEX="${VETH_B_IFINDEX}" \
-      WG_MIX_FAKETCP_REALHOST_XDP_MODE=generic WG_MIX_FAKETCP_REALHOST_RUN_ID="${RUN_ID}" \
-      /usr/bin/timeout --signal=TERM --kill-after=10s 6m /usr/bin/go -C "${SOURCE}" \
-      test ./internal/dataplane -run "^${name}$" -count=1 -timeout=5m -v
-    require_zero "O${step}.run"
-    run_step "O${step}.links" bpf-links /usr/sbin/bpftool -j link show
-    require_zero "O${step}.links"
-    /usr/bin/cmp -s "${EVIDENCE_ROOT}/N5.links-before.out" "${STEP_LOG}" ||
-      fail "faketcp-link-leak:${name}" 79
-    ((step++))
-  done
-  run_step O9.pin "${PIN_PATH}" /usr/bin/test ! -e "${PIN_PATH}"
-  require_zero O9.pin
-}
-
-check_iperf() {
-  local step="$1" direction="$2" streams="$3" expected_seconds="$4"
-  run_step "${step}.check" "${STEP_LOG}" /usr/bin/python3 -I \
-    "${SOURCE}/scripts/realhost-b82-${RUN_ID}/check-realhost-iperf.py" one "${STEP_LOG}" \
-    --direction "${direction}" --streams "${streams}" --minimum-stream-bytes 1048576 \
-    --minimum-fairness 0.90 --maximum-retransmit-rate 0.0001 \
-    --expected-seconds "${expected_seconds}" --maximum-duration-deviation 0.5 \
-    --minimum-delivery-ratio 0.99
-  require_zero "${step}.check"
-}
-
-run_iperf_cell() {
-  local cell="$1" streams direction step json_path
-  local -a direction_args=()
-  for streams in 1 4 16; do
-    for direction in forward reverse bidir; do
-      direction_args=()
-      case "${direction}" in
-        forward) ;;
-        reverse) direction_args=(-R) ;;
-        bidir) direction_args=(--bidir) ;;
-        *) fail "iperf-direction:${direction}" 64 ;;
-      esac
-      step="P.${cell}.bare.p${streams}.${direction}"
-      run_step "${step}" "${PEER_ADDRESS}:${PEER_PORT}" /usr/bin/timeout \
-        --signal=TERM --kill-after=10s 50s /usr/bin/iperf3 \
-        -c "${PEER_ADDRESS}" -p "${PEER_PORT}" --connect-timeout 5000 \
-        --json --omit 2 -t 30 -P "${streams}" "${direction_args[@]}"
-      require_zero "${step}"
-      json_path="${STEP_LOG}"
-      check_iperf "${step}" "${direction}" "${streams}" 30
-      [[ "${json_path}" == "${EVIDENCE_ROOT}/${step}.out" ]] || fail "iperf-log-path:${step}" 79
-    done
-  done
-}
-
-preflight_peer() {
-  run_step P0 "${PEER_ADDRESS}:${PEER_PORT}" /usr/bin/timeout \
-    --signal=TERM --kill-after=10s 15s /usr/bin/iperf3 \
-    -c "${PEER_ADDRESS}" -p "${PEER_PORT}" --connect-timeout 5000 \
-    --json --omit 1 -t 1 -P 1
-  require_zero P0
-  check_iperf P0 forward 1 1
 }
 
 scoped_cell_valid() {
@@ -1018,7 +565,7 @@ scoped_pin_for_cell() {
 
 require_scoped_realnic_contract() {
   local prefix="$1" name step=1
-  for name in "${SCOPED_CONTRACT_TEST_NAME}" "${SCOPED_TEST_NAME}" "${SCOPED_RESTORE_TEST_NAME}"; do
+  for name in "${SCOPED_CONTRACT_TEST_NAME}" "${SCOPED_RESTORE_TEST_NAME}"; do
     go_test_exists "${prefix}.contract${step}" "${name}"
     ((step++))
   done
@@ -1054,95 +601,6 @@ verify_scoped_kernel_restored() {
   run_step "${prefix}.egress" "${INTERFACE}" /usr/sbin/tc -j filter show dev "${INTERFACE}" egress
   require_zero "${prefix}.egress"
   /usr/bin/cmp -s "${EVIDENCE_ROOT}/A12.out" "${STEP_LOG}" || fail "${prefix}:egress-drift" 79
-}
-
-run_scoped_realnic_test() {
-  local cell="$1" profile="$2" timeout_outer="$3" timeout_go="$4"
-  local scope pin traffic_seconds passes streams directions windows minimum_seconds
-  scope="$(scoped_root_for_cell "${cell}")" || fail "scoped-root:${cell}" 64
-  pin="$(scoped_pin_for_cell "${cell}")" || fail "scoped-pin:${cell}" 64
-  [[ "${profile}" == 'matrix' || "${profile}" == 'mtu' || "${profile}" == 'soak' ]] ||
-    fail "scoped-profile:${profile}" 64
-  [[ "${timeout_outer}" =~ ^[1-9][0-9]*$ && "${timeout_go}" =~ ^[1-9][0-9]*$ ]] ||
-    fail "scoped-timeout:${profile}" 64
-  case "${profile}" in
-    matrix)
-      traffic_seconds="${MATRIX_TRAFFIC_SECONDS}"
-      passes="${MATRIX_PASSES}"
-      streams=1,4,16
-      directions=forward,reverse,bidir
-      windows=1
-      minimum_seconds=$((3 * 3 * traffic_seconds * passes))
-      ;;
-    mtu)
-      traffic_seconds="${MTU_TRAFFIC_SECONDS}"
-      passes="${MTU_PASSES}"
-      streams=4
-      directions=bidir
-      windows=1
-      minimum_seconds=$((traffic_seconds * passes))
-      ;;
-    soak)
-      traffic_seconds="${SESSION_SECONDS}"
-      passes=1
-      streams=4
-      directions=bidir
-      windows="${SOAK_WINDOWS}"
-      minimum_seconds=$((traffic_seconds * windows))
-      ;;
-  esac
-  ((timeout_go >= minimum_seconds + 60 && timeout_outer >= timeout_go + 30)) ||
-    fail "scoped-time-budget:${profile}:minimum=${minimum_seconds}" 64
-  run_step "P.${cell}.scope-pre" "${scope}" /usr/bin/test ! -e "${scope}"
-  require_zero "P.${cell}.scope-pre"
-  run_step "P.${cell}.pin-pre" "${pin}" /usr/bin/test ! -e "${pin}"
-  require_zero "P.${cell}.pin-pre"
-  run_step "P.${cell}.scoped-active" "${SCOPED_TEST_NAME}" /usr/bin/env -i \
-    PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C CGO_ENABLED=0 \
-    GOCACHE="${STAGE_ROOT}/go-cache-realhost" GOENV=off GOFLAGS= \
-    GOMODCACHE="${STAGE_ROOT}/go-mod-cache-realhost" GOPATH="${STAGE_ROOT}/go-path-realhost" \
-    GOTMPDIR="${STAGE_ROOT}/go-tmp-realhost" GOWORK=off GO111MODULE=on TMPDIR="${STAGE_ROOT}/go-tmp-realhost" \
-    WG_MIX_EBPF_RUN_SCOPED_REALNIC_INTEGRATION=1 \
-    WG_MIX_EBPF_SCOPED_REALNIC_ACTION=run WG_MIX_EBPF_SCOPED_REALNIC_RUN_ID="${RUN_ID}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_CELL="${cell}" WG_MIX_EBPF_SCOPED_REALNIC_PROFILE="${profile}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_SOURCE_COMMIT="${COMMIT}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_BUNDLE_SHA256="${BUNDLE_SHA256}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_OBJECT="${SOURCE}/build/wg_mix_tc.o" \
-    WG_MIX_EBPF_SCOPED_REALNIC_ROOT="${scope}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_STATE_ROOT="${scope}/state" \
-    WG_MIX_EBPF_SCOPED_REALNIC_LEASE_ROOT="${scope}/lease" \
-    WG_MIX_EBPF_SCOPED_REALNIC_OWNER_ROOT="${scope}/owners" \
-    WG_MIX_EBPF_SCOPED_REALNIC_EVIDENCE_ROOT="${scope}/evidence" \
-    WG_MIX_EBPF_SCOPED_REALNIC_PIN_PATH="${pin}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_INITIAL_NETNS="${INITIAL_NETNS}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_INTERFACE="${INTERFACE}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_INTERFACE_IFINDEX="${ORIGINAL_IFINDEX}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_INTERFACE_MAC="${ORIGINAL_MAC}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_WG_INTERFACE="${WG_INTERFACE}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_WG_LOCAL_ADDRESS="${WG_LOCAL_ADDRESS}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_WG_PEER_ADDRESS="${WG_PEER_ADDRESS}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_PEER_PORT="${PEER_PORT}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_IPERF_CHECKER="${SOURCE}/scripts/realhost-b82-${RUN_ID}/check-realhost-iperf.py" \
-    WG_MIX_EBPF_SCOPED_REALNIC_TC_ATTACH=tcx \
-    WG_MIX_EBPF_SCOPED_REALNIC_TYPEWORD_MODE=identity \
-    WG_MIX_EBPF_SCOPED_REALNIC_TRANSPORT=udp WG_MIX_EBPF_SCOPED_REALNIC_CIPHER=none \
-    WG_MIX_EBPF_SCOPED_REALNIC_FAILURE_POLICY=retain \
-    WG_MIX_EBPF_SCOPED_REALNIC_STREAMS="${streams}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_DIRECTIONS="${directions}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_PASSES="${passes}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_SESSION_SECONDS="${traffic_seconds}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_SOAK_SECONDS="${SOAK_SECONDS}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_SOAK_WINDOWS="${windows}" \
-    WG_MIX_EBPF_SCOPED_REALNIC_PING_INTERVAL_SECONDS=1 \
-    WG_MIX_EBPF_SCOPED_REALNIC_MONITOR_INTERVAL_SECONDS=10 \
-    WG_MIX_EBPF_SCOPED_REALNIC_MONITOR_SAMPLES=360 \
-    /usr/bin/timeout --signal=TERM --kill-after=30s "${timeout_outer}s" \
-    /usr/bin/go -C "${SOURCE}" test ./internal/dataplane \
-    -run "^${SCOPED_TEST_NAME}$" -count=1 -timeout="${timeout_go}s" -v
-  require_zero "P.${cell}.scoped-active"
-  /usr/bin/grep -Fqx -- "SCOPED_REALNIC_COMPLETE cell=${cell} restored=1" "${STEP_LOG}" ||
-    fail "scoped-completion-marker:${cell}" 79
-  verify_scoped_kernel_restored "P.${cell}.restored" "${cell}"
 }
 
 run_scoped_realnic_restore() {
@@ -1192,54 +650,6 @@ verify_all_scoped_pins_absent() {
     run_step "Z.pin-${cell}" "${pin}" /usr/bin/test ! -e "${pin}"
     require_zero "Z.pin-${cell}"
   done
-}
-
-run_nic_matrix() {
-  local cell
-  for cell in original all-on all-off tx-path rx-path; do
-    apply_feature_cell "${cell}"
-    run_iperf_cell "${cell}"
-    run_scoped_realnic_test "${cell}" matrix \
-      "${MATRIX_OUTER_TIMEOUT_SECONDS}" "${MATRIX_GO_TIMEOUT_SECONDS}"
-    run_step "P.${cell}.stats" "${INTERFACE}" /usr/sbin/ethtool -S "${INTERFACE}"
-    require_zero "P.${cell}.stats"
-  done
-  restore_nic_state P.matrix.restore
-  audit_line not-covered P.peer-mutation "${PEER_ADDRESS}" 0 \
-    'peer offload and MTU mutation prohibited; endpoint traffic only' || fail 'audit-peer-not-covered'
-  audit_line not-covered P.faketcp-physical-e2e "${WG_PEER_ADDRESS}" 0 \
-    'read-only peer has no reviewed FakeTCP dataplane; veth XDP/TCX coverage is not physical e2e' ||
-    fail 'audit-faketcp-physical-not-covered'
-  audit_line not-covered P.xor-physical-e2e "${WG_PEER_ADDRESS}" 0 \
-    'read-only peer has no reviewed shared XOR cipher; passthrough WG active control only' ||
-    fail 'audit-xor-physical-not-covered'
-}
-
-run_mtu_boundaries() {
-  restore_nic_state Q.baseline
-  run_step Q1 "${INTERFACE}" /usr/sbin/ip link set dev "${INTERFACE}" mtu 1492
-  require_zero Q1
-  [[ "$(read_single_line "/sys/class/net/${INTERFACE}/mtu")" == '1492' ]] || fail 'Q1:mtu-not-applied' 79
-  run_step Q2 mtu-positive /usr/bin/ping -4 -I "${INTERFACE}" -M do -c 3 -W 2 -s 1464 "${PEER_ADDRESS}"
-  require_zero Q2
-  run_step Q3 mtu-negative /usr/bin/ping -4 -I "${INTERFACE}" -M do -c 1 -W 2 -s 1465 "${PEER_ADDRESS}"
-  ((STEP_RC != 0)) || fail 'Q3:oversize-unexpected-success' 79
-  run_scoped_realnic_test mtu1492 mtu \
-    "${MTU_OUTER_TIMEOUT_SECONDS}" "${MTU_GO_TIMEOUT_SECONDS}"
-  restore_nic_state Q.restore
-  run_step Q4 mtu1500-positive /usr/bin/ping -4 -I "${INTERFACE}" -M do -c 3 -W 2 -s 1472 "${PEER_ADDRESS}"
-  require_zero Q4
-  run_step Q5 mtu1500-negative /usr/bin/ping -4 -I "${INTERFACE}" -M do -c 1 -W 2 -s 1473 "${PEER_ADDRESS}"
-  ((STEP_RC != 0)) || fail 'Q5:oversize-unexpected-success' 79
-  run_scoped_realnic_test mtu1500 mtu \
-    "${MTU_OUTER_TIMEOUT_SECONDS}" "${MTU_GO_TIMEOUT_SECONDS}"
-}
-
-run_soak() {
-  apply_feature_cell all-on-soak
-  run_scoped_realnic_test soak soak \
-    "${SOAK_OUTER_TIMEOUT_SECONDS}" "${SOAK_GO_TIMEOUT_SECONDS}"
-  restore_nic_state R.restore
 }
 
 validate_owner_marker() {
@@ -1313,85 +723,19 @@ restore_after_failure() {
   printf 'REALHOST_V6_RESTORE_COMPLETE run_id=%s evidence=%s\n' "${RUN_ID}" "${EVIDENCE_ROOT}"
 }
 
-run_all() {
-  validate_common_identity
-  load_checksum_module_helper
-  [[ ! -e "${PIN_PATH}" && ! -L "${PIN_PATH}" ]] || fail 'pin-path-preexists' 79
-  create_evidence_root
-  c8_checksum_module_acquire L0.run
-  c8_checksum_module_run L1.module-baseline "${MODULE_NAME}" \
-    /usr/bin/test ! -e "/sys/module/${MODULE_NAME}" || fail 'checksum-module-preexists' $?
-  run_step U1 "${STAGE_ROOT}/go-cache-realhost" /usr/bin/test ! -e "${STAGE_ROOT}/go-cache-realhost"
-  require_zero U1
-  run_step U2 "${STAGE_ROOT}/go-cache-realhost" /usr/bin/mkdir --mode=0700 -- "${STAGE_ROOT}/go-cache-realhost"
-  require_zero U2
-  run_step U3 "${STAGE_ROOT}/go-mod-cache-realhost" /usr/bin/test ! -e "${STAGE_ROOT}/go-mod-cache-realhost"
-  require_zero U3
-  run_step U4 "${STAGE_ROOT}/go-mod-cache-realhost" /usr/bin/mkdir --mode=0700 -- "${STAGE_ROOT}/go-mod-cache-realhost"
-  require_zero U4
-  run_step U5 "${STAGE_ROOT}/go-path-realhost" /usr/bin/test ! -e "${STAGE_ROOT}/go-path-realhost"
-  require_zero U5
-  run_step U6 "${STAGE_ROOT}/go-path-realhost" /usr/bin/mkdir --mode=0700 -- "${STAGE_ROOT}/go-path-realhost"
-  require_zero U6
-  run_step U7 "${STAGE_ROOT}/go-tmp-realhost" /usr/bin/test ! -e "${STAGE_ROOT}/go-tmp-realhost"
-  require_zero U7
-  run_step U8 "${STAGE_ROOT}/go-tmp-realhost" /usr/bin/mkdir --mode=0700 -- "${STAGE_ROOT}/go-tmp-realhost"
-  require_zero U8
-  snapshot_host
-  capture_nic_state
-  preflight_peer
-  build_artifacts
-  require_scoped_realnic_contract P
-  create_owned_veth
-  run_exact_tcx_lifecycle
-  load_checksum_module
-  run_faketcp_tests
-  unload_checksum_module
-  delete_owned_veth
-  run_nic_matrix
-  run_mtu_boundaries
-  run_soak
-  restore_nic_state Z.final
-  run_step Z0.tcx-pin "${PIN_PATH}" /usr/bin/test ! -e "${PIN_PATH}"
-  require_zero Z0.tcx-pin
-  verify_all_scoped_pins_absent
-  run_step Z1 links-final /usr/sbin/bpftool -j link show
-  require_zero Z1
-  /usr/bin/cmp -s "${EVIDENCE_ROOT}/A13.out" "${STEP_LOG}" || fail 'final-bpf-link-drift' 79
-  run_step Z2 qdisc-final /usr/sbin/tc -j qdisc show dev "${INTERFACE}"
-  require_zero Z2
-  /usr/bin/cmp -s "${EVIDENCE_ROOT}/A10.out" "${STEP_LOG}" || fail 'final-qdisc-drift' 79
-  run_step Z3 ingress-final /usr/sbin/tc -j filter show dev "${INTERFACE}" ingress
-  require_zero Z3
-  /usr/bin/cmp -s "${EVIDENCE_ROOT}/A11.out" "${STEP_LOG}" || fail 'final-ingress-drift' 79
-  run_step Z4 egress-final /usr/sbin/tc -j filter show dev "${INTERFACE}" egress
-  require_zero Z4
-  /usr/bin/cmp -s "${EVIDENCE_ROOT}/A12.out" "${STEP_LOG}" || fail 'final-egress-drift' 79
-  run_step Z5 programs-final /usr/sbin/bpftool -j prog show
-  require_zero Z5
-  /usr/bin/cmp -s "${EVIDENCE_ROOT}/A14.out" "${STEP_LOG}" || fail 'final-bpf-program-drift' 79
-  run_step Z6 maps-final /usr/sbin/bpftool -j map show
-  require_zero Z6
-  /usr/bin/cmp -s "${EVIDENCE_ROOT}/A15.out" "${STEP_LOG}" || fail 'final-bpf-map-drift' 79
-  run_step Z7 modules-final /usr/sbin/lsmod
-  require_zero Z7
-  /usr/bin/cmp -s "${EVIDENCE_ROOT}/A18.out" "${STEP_LOG}" || fail 'final-module-drift' 79
-  write_once "${COMPLETED_MARKER}" "run_id=${RUN_ID}" "commit=${COMMIT}" 'state=complete' "utc=$(utc_now)"
-  printf 'REALHOST_V6_COMPLETE run_id=%s commit=%s evidence=%s\n' "${RUN_ID}" "${COMMIT}" "${EVIDENCE_ROOT}"
-}
-
 parse_arguments "$@"
 parse_rc=$?
 ((parse_rc == 0)) || fail "arguments:rc=${parse_rc}" "${parse_rc}"
 
-if [[ "${MODE}" == 'plan' ]]; then
+if [[ "${MODE}" == 'run' ]]; then
+  fail 'legacy-forward-authority-retired-use-realnic-acceptance' 78
+elif [[ "${MODE}" == 'plan' ]]; then
   render_plan
   exit 0
 fi
 
 require_tooling
 case "${MODE}" in
-  run) run_all ;;
   restore) restore_after_failure ;;
   *) fail 'unreachable-mode' 64 ;;
 esac
