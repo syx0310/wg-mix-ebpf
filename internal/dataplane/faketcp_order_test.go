@@ -229,7 +229,7 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 		"faketcp_capture_first_packet(skb, info, rule, &key)",
 		"record_len = sizeof(record->event) + packet_len",
 		"faketcp_materialize_tcp_checksum",
-		"bpf_check_mtu(skb, 0, &mtu_len, FAKETCP_HEADER_DELTA, 0)",
+		"faketcp_prepare_udp(skb, info->ip_off, info->udp_off",
 		"bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)",
 	} {
 		if !strings.Contains(tc, want) && !strings.Contains(fake, want) {
@@ -261,7 +261,7 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 	}
 }
 
-func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
+func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T) {
 	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
 	if err != nil {
 		t.Fatal(err)
@@ -286,13 +286,27 @@ func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
 		t.Fatal("aggregate GSO must be rejected before flow lookup, capture, type-word and XOR mutation")
 	}
 	for _, want := range []string{
-		"One header insertion cannot provide",
-		"not an implementation of per-segment FakeTCP",
+		"dispatches supported UDP_L4 GSO aggregates",
+		"non-GSO continuation",
 		"FAKETCP_STAT_GSO_REJECT",
 	} {
 		if !strings.Contains(preflight, want) {
 			t.Fatalf("GSO hard-gate contract missing %q", want)
 		}
+	}
+	topSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	egressStart := strings.Index(string(topSource), "int wg_mix_egress(struct __sk_buff *skb)")
+	if egressStart < 0 {
+		t.Fatal("egress entry point is missing")
+	}
+	egress := string(topSource)[egressStart:]
+	gsoDispatch := strings.Index(egress, "return faketcp_encode_gso_segments(")
+	singlePacketPreflight := strings.Index(egress, "faketcp_preflight_egress(skb, &info, rule, generation)")
+	if gsoDispatch < 0 || singlePacketPreflight < 0 || gsoDispatch >= singlePacketPreflight {
+		t.Fatal("supported GSO must dispatch before the non-GSO preflight")
 	}
 
 	materialize := text[checksumCommentStart:encoderStart]
@@ -313,12 +327,15 @@ func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
 		t.Fatal("full TCP checksum materialization must not consume the old UDP checksum or seed")
 	}
 
+	prepare := strings.Index(preflight, "faketcp_prepare_udp(skb, info->ip_off, info->udp_off")
 	encoder := text[encoderStart:continuationStart]
-	mtuCheck := strings.Index(encoder, "faketcp_mtu_allows_growth(skb, old_total_len)")
 	normalize := strings.Index(encoder, "bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)")
 	checksum := strings.Index(encoder, "faketcp_materialize_tcp_checksum(skb")
-	if mtuCheck < 0 || normalize < 0 || checksum < 0 || mtuCheck >= normalize || normalize >= checksum {
-		t.Fatal("MTU check, checksum-state normalization and full recompute are out of order")
+	if prepare < 0 || normalize < 0 || checksum < 0 || normalize >= checksum {
+		t.Fatal("unified prepare, packet growth and full checksum recompute are missing or out of order")
+	}
+	if strings.Contains(encoder, "bpf_check_mtu") || strings.Contains(encoder, "faketcp_mtu_allows_growth") {
+		t.Fatal("legacy device-only MTU fallback remains reachable after unified prepare")
 	}
 	for _, want := range []string{
 		"old_total_len != sizeof(*iph) + udp_len",
@@ -374,7 +391,7 @@ func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
 	networkIdentity := strings.Index(module, "network_offset != actual_network_offset")
 	commonUDPBytes := strings.Index(module, "ntohs(udp->len) != udp_length")
 	noneCase := strings.Index(module, "case CHECKSUM_NONE:")
-	noneReturn := strings.Index(module, "return WG_MIX_FAKETCP_CSUM_ACCEPT_NONE;")
+	noneReturn := strings.Index(module, "return WG_MIX_FAKETCP_PREPARE_ACCEPT_NONE;")
 	partialCase := strings.Index(module, "case CHECKSUM_PARTIAL:")
 	transportHeaderRequired := strings.Index(module, "if (!skb_transport_header_was_set(skb))")
 	transportIdentity := strings.Index(module, "transport_offset != actual_transport_offset")
@@ -387,10 +404,31 @@ func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
 			transportIdentity < partialOffsets) {
 		t.Fatal("CHECKSUM_NONE must return without a transport header; CHECKSUM_PARTIAL must require exact transport/checksum metadata")
 	}
-	materializedReturn := strings.Index(module, "if (ret == WG_MIX_FAKETCP_CSUM_ACCEPT_NONE)")
+	materializedReturn := strings.Index(module, "if (ret == WG_MIX_FAKETCP_PREPARE_ACCEPT_NONE)")
 	partialReset := strings.Index(module, "skb_reset_csum_not_inet(skb)")
 	if materializedReturn < 0 || partialReset < 0 || materializedReturn >= partialReset {
 		t.Fatal("CHECKSUM_NONE must return before CHECKSUM_PARTIAL metadata normalization")
+	}
+	deviceGate := strings.Index(module, "if (!device)")
+	deviceMTU := strings.Index(module, "device_mtu = READ_ONCE(device->mtu)")
+	deviceExceeded := strings.Index(module, "planned_l3_length > device_mtu")
+	validRoute := strings.Index(module, "if (!skb_valid_dst(skb))")
+	routeIdentity := strings.Index(module, "if (READ_ONCE(dst->dev) != device)")
+	routeMTU := strings.Index(module, "route_mtu = dst_mtu(dst)")
+	if deviceGate < 0 || deviceMTU < 0 || deviceExceeded < 0 || validRoute < 0 ||
+		routeIdentity < 0 || routeMTU < 0 ||
+		!(deviceGate < deviceMTU && deviceMTU < deviceExceeded &&
+			deviceExceeded < validRoute && validRoute < routeIdentity && routeIdentity < routeMTU) {
+		t.Fatal("PMTU admission must validate current device before a live, device-identical route")
+	}
+	firstPMTUCall := strings.Index(module, "admission = wg_mix_faketcp_admit_pmtu")
+	lastPMTUCall := strings.LastIndex(module, "admission = wg_mix_faketcp_admit_pmtu")
+	firstChecksumMutation := strings.Index(module, "skb->csum = 0;")
+	firstGSOMutation := strings.Index(module, "skb_shinfo(skb)->gso_segs = DIV_ROUND_UP")
+	if firstPMTUCall < 0 || lastPMTUCall <= firstPMTUCall || firstChecksumMutation < 0 ||
+		firstGSOMutation < 0 || firstPMTUCall >= firstChecksumMutation ||
+		lastPMTUCall >= firstGSOMutation {
+		t.Fatal("unified prepare must finish PMTU admission before checksum or GSO metadata mutation")
 	}
 	for _, forbidden := range []string{
 		"BPF_PROG_TYPE_XDP",
@@ -404,7 +442,7 @@ func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
 	}
 
 	bpf := string(bpfSource)
-	if strings.Count(bpf, "wg_mix_faketcp_skb_normalize_udp_csum(") != 2 {
+	if strings.Count(bpf, "wg_mix_faketcp_skb_prepare_udp(") != 2 {
 		t.Fatal("experimental BPF source must contain one declaration and one call of the required kfunc")
 	}
 	top := string(topSource)
