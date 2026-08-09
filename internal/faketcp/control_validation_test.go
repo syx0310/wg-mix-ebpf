@@ -163,13 +163,16 @@ func TestValidZeroTCPChecksumFieldIsAcceptedByResidual(t *testing.T) {
 	flow := testFlow(31001)
 	identity := testRuntimeIdentity(flow.Generation)
 	state := abi.FakeTCPSessionValue{
-		Generation: flow.Generation,
-		TXSequence: 1001,
-		RXSequence: 9001,
-		LocalISN:   1000,
-		RemoteISN:  9000,
-		Window:     65535,
-		State:      abi.FakeTCPStateEstablished,
+		Generation:         flow.Generation,
+		TXSequence:         1001,
+		RXSequence:         9001,
+		LocalISN:           1000,
+		RemoteISN:          9000,
+		Window:             65535,
+		State:              abi.FakeTCPStateEstablished,
+		Revision:           1,
+		SessionID:          1,
+		RuntimeIncarnation: [16]byte{1},
 	}
 	for attempts := 0; attempts <= 0xffff; attempts++ {
 		packet := buildIPv4TCPControl(flow, state, FlagRST|FlagACK)
@@ -317,13 +320,16 @@ func TestCloseValidationBitFlipCorpusFailsClosed(t *testing.T) {
 func BenchmarkValidateIPv4TCPControl(b *testing.B) {
 	flow := testFlow(31001)
 	state := abi.FakeTCPSessionValue{
-		Generation: flow.Generation,
-		TXSequence: 1001,
-		RXSequence: 9001,
-		LocalISN:   1000,
-		RemoteISN:  9000,
-		Window:     65535,
-		State:      abi.FakeTCPStateEstablished,
+		Generation:         flow.Generation,
+		TXSequence:         1001,
+		RXSequence:         9001,
+		LocalISN:           1000,
+		RemoteISN:          9000,
+		Window:             65535,
+		State:              abi.FakeTCPStateEstablished,
+		Revision:           1,
+		SessionID:          1,
+		RuntimeIncarnation: [16]byte{1},
 	}
 	identity := testRuntimeIdentity(flow.Generation)
 	packet := buildIPv4TCPControl(flow, state, FlagRST|FlagACK)
