@@ -282,7 +282,28 @@ load_manifest_once() {
     read_manifest_field test_realnic_acceptance_static_py_sha256 discard &&
     read_manifest_field provision_ubuntu_test_host_sh_path discard &&
     read_manifest_field provision_ubuntu_test_host_sh_blob discard &&
-    read_manifest_field provision_ubuntu_test_host_sh_sha256 discard || {
+    read_manifest_field provision_ubuntu_test_host_sh_sha256 discard &&
+    read_manifest_field root_veth_n_r_sh_path discard &&
+    read_manifest_field root_veth_n_r_sh_blob discard &&
+    read_manifest_field root_veth_n_r_sh_sha256 discard &&
+    read_manifest_field test_hermetic_veth_runner_sh_path discard &&
+    read_manifest_field test_hermetic_veth_runner_sh_blob discard &&
+    read_manifest_field test_hermetic_veth_runner_sh_sha256 discard &&
+    read_manifest_field test_veth_runner_static_py_path discard &&
+    read_manifest_field test_veth_runner_static_py_blob discard &&
+    read_manifest_field test_veth_runner_static_py_sha256 discard &&
+    read_manifest_field controller_seam_sh_path discard &&
+    read_manifest_field controller_seam_sh_blob discard &&
+    read_manifest_field controller_seam_sh_sha256 discard &&
+    read_manifest_field root_routed_veth_n_r_sh_path discard &&
+    read_manifest_field root_routed_veth_n_r_sh_blob discard &&
+    read_manifest_field root_routed_veth_n_r_sh_sha256 discard &&
+    read_manifest_field test_hermetic_routed_veth_harness_sh_path discard &&
+    read_manifest_field test_hermetic_routed_veth_harness_sh_blob discard &&
+    read_manifest_field test_hermetic_routed_veth_harness_sh_sha256 discard &&
+    read_manifest_field test_routed_veth_harness_static_py_path discard &&
+    read_manifest_field test_routed_veth_harness_static_py_blob discard &&
+    read_manifest_field test_routed_veth_harness_static_py_sha256 discard || {
       exec {MANIFEST_FD}<&-
       return 65
     }
@@ -409,7 +430,7 @@ validate_snapshot_contract() {
   [[ "$(sha256_file "${SNAPSHOT_MANIFEST}")" == "${MANIFEST_SHA256}" &&
     "$(sha256_file "${SNAPSHOT_BUNDLE}")" == "${BUNDLE_SHA256}" ]] || return 79
   load_manifest_once || return $?
-  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v3' &&
+  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v4' &&
     "${MANIFEST_RUN_ID}" == "${CONTROLLER_RUN_ID}" &&
     "${MANIFEST_PACKAGE_ID}" == "${PACKAGE_ID}" &&
     "${MANIFEST_COMMIT}" == "${COMMIT}" &&

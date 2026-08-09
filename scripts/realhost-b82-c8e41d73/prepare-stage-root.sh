@@ -99,6 +99,27 @@ PREPARE_SHA256=''
 PROVISION_PATH=''
 PROVISION_BLOB=''
 PROVISION_SHA256=''
+ROOT_VETH_PATH=''
+ROOT_VETH_BLOB=''
+ROOT_VETH_SHA256=''
+VETH_HERMETIC_PATH=''
+VETH_HERMETIC_BLOB=''
+VETH_HERMETIC_SHA256=''
+VETH_STATIC_PATH=''
+VETH_STATIC_BLOB=''
+VETH_STATIC_SHA256=''
+ROUTED_SEAM_PATH=''
+ROUTED_SEAM_BLOB=''
+ROUTED_SEAM_SHA256=''
+ROUTED_ROOT_PATH=''
+ROUTED_ROOT_BLOB=''
+ROUTED_ROOT_SHA256=''
+ROUTED_HERMETIC_PATH=''
+ROUTED_HERMETIC_BLOB=''
+ROUTED_HERMETIC_SHA256=''
+ROUTED_STATIC_PATH=''
+ROUTED_STATIC_BLOB=''
+ROUTED_STATIC_SHA256=''
 PHYSICAL_INTERFACE_LOCK_FD=''
 APPROVED_PLAN_SHA256=''
 APPROVED_PLAN_FD=''
@@ -252,7 +273,28 @@ load_manifest() {
     read_manifest_field test_realnic_acceptance_static_py_sha256 REALNIC_STATIC_SHA256 &&
     read_manifest_field provision_ubuntu_test_host_sh_path PROVISION_PATH &&
     read_manifest_field provision_ubuntu_test_host_sh_blob PROVISION_BLOB &&
-    read_manifest_field provision_ubuntu_test_host_sh_sha256 PROVISION_SHA256 || {
+    read_manifest_field provision_ubuntu_test_host_sh_sha256 PROVISION_SHA256 &&
+    read_manifest_field root_veth_n_r_sh_path ROOT_VETH_PATH &&
+    read_manifest_field root_veth_n_r_sh_blob ROOT_VETH_BLOB &&
+    read_manifest_field root_veth_n_r_sh_sha256 ROOT_VETH_SHA256 &&
+    read_manifest_field test_hermetic_veth_runner_sh_path VETH_HERMETIC_PATH &&
+    read_manifest_field test_hermetic_veth_runner_sh_blob VETH_HERMETIC_BLOB &&
+    read_manifest_field test_hermetic_veth_runner_sh_sha256 VETH_HERMETIC_SHA256 &&
+    read_manifest_field test_veth_runner_static_py_path VETH_STATIC_PATH &&
+    read_manifest_field test_veth_runner_static_py_blob VETH_STATIC_BLOB &&
+    read_manifest_field test_veth_runner_static_py_sha256 VETH_STATIC_SHA256 &&
+    read_manifest_field controller_seam_sh_path ROUTED_SEAM_PATH &&
+    read_manifest_field controller_seam_sh_blob ROUTED_SEAM_BLOB &&
+    read_manifest_field controller_seam_sh_sha256 ROUTED_SEAM_SHA256 &&
+    read_manifest_field root_routed_veth_n_r_sh_path ROUTED_ROOT_PATH &&
+    read_manifest_field root_routed_veth_n_r_sh_blob ROUTED_ROOT_BLOB &&
+    read_manifest_field root_routed_veth_n_r_sh_sha256 ROUTED_ROOT_SHA256 &&
+    read_manifest_field test_hermetic_routed_veth_harness_sh_path ROUTED_HERMETIC_PATH &&
+    read_manifest_field test_hermetic_routed_veth_harness_sh_blob ROUTED_HERMETIC_BLOB &&
+    read_manifest_field test_hermetic_routed_veth_harness_sh_sha256 ROUTED_HERMETIC_SHA256 &&
+    read_manifest_field test_routed_veth_harness_static_py_path ROUTED_STATIC_PATH &&
+    read_manifest_field test_routed_veth_harness_static_py_blob ROUTED_STATIC_BLOB &&
+    read_manifest_field test_routed_veth_harness_static_py_sha256 ROUTED_STATIC_SHA256 || {
       exec 3<&-
       return 65
     }
@@ -265,7 +307,7 @@ load_manifest() {
 
 validate_manifest() {
   load_manifest || return $?
-  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v3' &&
+  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v4' &&
     "${MANIFEST_RUN_ID}" == "${RUN_ID}" && "${MANIFEST_PACKAGE_ID}" == "${PACKAGE_ID}" &&
     "${INTEGRATION_REF}" =~ ^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$ &&
     "${INTEGRATION_REF}" != *'..'* && "${INTEGRATION_REF}" != *'//'* &&
@@ -291,7 +333,10 @@ validate_manifest() {
     valid_sha256 "${FRESH_STATIC_SHA256}" && valid_sha256 "${PREPARE_SHA256}" &&
     valid_sha256 "${REALNIC_SHA256}" && valid_sha256 "${REALNIC_TEST_SHA256}" &&
     valid_sha256 "${REALNIC_STATIC_SHA256}" &&
-    valid_sha256 "${PROVISION_SHA256}" || return 65
+    valid_sha256 "${PROVISION_SHA256}" && valid_sha256 "${ROOT_VETH_SHA256}" &&
+    valid_sha256 "${VETH_HERMETIC_SHA256}" && valid_sha256 "${VETH_STATIC_SHA256}" &&
+    valid_sha256 "${ROUTED_SEAM_SHA256}" && valid_sha256 "${ROUTED_ROOT_SHA256}" &&
+    valid_sha256 "${ROUTED_HERMETIC_SHA256}" && valid_sha256 "${ROUTED_STATIC_SHA256}" || return 65
   [[ "${ROOT_MATRIX_BLOB}" =~ ^[0-9a-f]{40}$ && "${CHECKER_BLOB}" =~ ^[0-9a-f]{40}$ &&
     "${HERMETIC_BLOB}" =~ ^[0-9a-f]{40}$ && "${STATIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
     "${MODULE_LEASE_HELPER_BLOB}" =~ ^[0-9a-f]{40}$ &&
@@ -301,6 +346,10 @@ validate_manifest() {
     "${PREPARE_BLOB}" =~ ^[0-9a-f]{40}$ &&
     "${REALNIC_BLOB}" =~ ^[0-9a-f]{40}$ && "${REALNIC_TEST_BLOB}" =~ ^[0-9a-f]{40}$ &&
     "${REALNIC_STATIC_BLOB}" =~ ^[0-9a-f]{40}$ && "${PROVISION_BLOB}" =~ ^[0-9a-f]{40}$ &&
+    "${ROOT_VETH_BLOB}" =~ ^[0-9a-f]{40}$ && "${VETH_HERMETIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
+    "${VETH_STATIC_BLOB}" =~ ^[0-9a-f]{40}$ && "${ROUTED_SEAM_BLOB}" =~ ^[0-9a-f]{40}$ &&
+    "${ROUTED_ROOT_BLOB}" =~ ^[0-9a-f]{40}$ && "${ROUTED_HERMETIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
+    "${ROUTED_STATIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
     -n "${IGNORED}" ]] || return 65
   [[ "${ROOT_MATRIX_PATH}" == "scripts/realhost-b82-${RUN_ID}/root-matrix-n-r.sh" &&
     "${CHECKER_PATH}" == "scripts/realhost-b82-${RUN_ID}/check-realhost-iperf.py" &&
@@ -314,7 +363,14 @@ validate_manifest() {
     "${REALNIC_PATH}" == 'scripts/realhost-b82-acceptance-v1/realnic_acceptance.py' &&
     "${REALNIC_TEST_PATH}" == 'scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py' &&
     "${REALNIC_STATIC_PATH}" == 'scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py' &&
-    "${PROVISION_PATH}" == 'scripts/provision-ubuntu-test-host.sh' ]] || return 65
+    "${PROVISION_PATH}" == 'scripts/provision-ubuntu-test-host.sh' &&
+    "${ROOT_VETH_PATH}" == "scripts/realhost-b82-${RUN_ID}/root-veth-n-r.sh" &&
+    "${VETH_HERMETIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test-hermetic-veth-runner.sh" &&
+    "${VETH_STATIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test_veth_runner_static.py" &&
+    "${ROUTED_SEAM_PATH}" == 'scripts/realhost-b82-routed-veth-v1/controller-seam.sh' &&
+    "${ROUTED_ROOT_PATH}" == 'scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh' &&
+    "${ROUTED_HERMETIC_PATH}" == 'scripts/realhost-b82-routed-veth-v1/test-hermetic-routed-veth-harness.sh' &&
+    "${ROUTED_STATIC_PATH}" == 'scripts/realhost-b82-routed-veth-v1/test_routed_veth_harness_static.py' ]] || return 65
   case "${WG_STATE}" in
     bound) [[ "${WG_INTERFACE}" != 'absent' && "${WG_LOCAL_ADDRESS}" != 'absent' && "${WG_PEER_ADDRESS}" != 'absent' ]] ;;
     absent) [[ "${WG_INTERFACE}" == 'absent' && "${WG_LOCAL_ADDRESS}" == 'absent' && "${WG_PEER_ADDRESS}" == 'absent' ]] ;;
@@ -387,7 +443,9 @@ render_plan() {
     "${EXPECTED_SOURCE}/${HERMETIC_PATH}" "${EXPECTED_SOURCE}/${PREPARE_PATH}" \
     "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
     "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
-    "${EXPECTED_SOURCE}/${PROVISION_PATH}"
+    "${EXPECTED_SOURCE}/${PROVISION_PATH}" "${EXPECTED_SOURCE}/${ROOT_VETH_PATH}" \
+    "${EXPECTED_SOURCE}/${VETH_HERMETIC_PATH}" "${EXPECTED_SOURCE}/${ROUTED_SEAM_PATH}" \
+    "${EXPECTED_SOURCE}/${ROUTED_ROOT_PATH}" "${EXPECTED_SOURCE}/${ROUTED_HERMETIC_PATH}"
   plan_command S6.realnic /usr/bin/python3 -B -I "${EXPECTED_SOURCE}/${REALNIC_PATH}" --help
   plan_command S6.realnic-unit /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
     PYTHONDONTWRITEBYTECODE=1 /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
@@ -395,11 +453,28 @@ render_plan() {
   plan_command S6.realnic-static /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
     PYTHONDONTWRITEBYTECODE=1 /usr/bin/timeout --signal=TERM --kill-after=10s 2m \
     /usr/bin/python3 -B -I "${EXPECTED_SOURCE}/${REALNIC_STATIC_PATH}"
+  plan_command S6.veth-hermetic /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
+    /bin/bash "${EXPECTED_SOURCE}/${VETH_HERMETIC_PATH}"
+  plan_command S6.veth-static /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    PYTHONDONTWRITEBYTECODE=1 /usr/bin/timeout --signal=TERM --kill-after=10s 2m \
+    /usr/bin/python3 -B -I "${EXPECTED_SOURCE}/${VETH_STATIC_PATH}" \
+    "${EXPECTED_SOURCE}/${ROOT_VETH_PATH}" "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" \
+    "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}"
+  plan_command S6.routed-hermetic /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
+    /bin/bash "${EXPECTED_SOURCE}/${ROUTED_HERMETIC_PATH}"
+  plan_command S6.routed-static /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    PYTHONDONTWRITEBYTECODE=1 /usr/bin/timeout --signal=TERM --kill-after=10s 2m \
+    /usr/bin/python3 -B -I "${EXPECTED_SOURCE}/${ROUTED_STATIC_PATH}" \
+    "${EXPECTED_SOURCE}/${ROUTED_ROOT_PATH}" "${EXPECTED_SOURCE}/${ROUTED_SEAM_PATH}"
   plan_command S7 /usr/bin/shellcheck --norc --shell=bash -- \
     "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" "${EXPECTED_SOURCE}/${HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
     "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
-    "${EXPECTED_SOURCE}/${PROVISION_PATH}"
+    "${EXPECTED_SOURCE}/${PROVISION_PATH}" "${EXPECTED_SOURCE}/${ROOT_VETH_PATH}" \
+    "${EXPECTED_SOURCE}/${VETH_HERMETIC_PATH}" "${EXPECTED_SOURCE}/${ROUTED_SEAM_PATH}" \
+    "${EXPECTED_SOURCE}/${ROUTED_ROOT_PATH}" "${EXPECTED_SOURCE}/${ROUTED_HERMETIC_PATH}"
   plan_command S8 shell-builtin noclobber-write "${BINDING_MARKER}"
   printf 'B82_V6_REALNIC_AUTHORITY script=%s profile=%s traffic_seconds=%s soak_seconds=%s soak_window_seconds=%s approved_plan=%s snapshot=held-fd-writeall-fsync-hardlink-noclobber verify=final-pending-same-inode\n' \
     "${EXPECTED_SOURCE}/${REALNIC_PATH}" "${REALNIC_PROFILE}" "${REALNIC_TRAFFIC_SECONDS}" \
@@ -618,6 +693,22 @@ require_module_lease_lock() {
     'root:root:600:1:regular file' ]]
 }
 
+require_staged_identity() {
+  local relative="$1" expected_blob="$2" expected_sha="$3" path canonical shape
+  local mapped actual_blob tree_entry
+  path="${EXPECTED_SOURCE}/${relative}"
+  canonical="$(/usr/bin/readlink -e -- "${path}")" || return 79
+  [[ "${canonical}" == "${path}" && -f "${path}" && ! -L "${path}" ]] || return 79
+  shape="$(/usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${path}")" || return 79
+  [[ "${shape}" == 'root:root:700:1:regular file' ]] || return 79
+  mapped="$(git_stage -C "${EXPECTED_SOURCE}" rev-parse "${INTEGRATION_COMMIT}:${relative}")" || return 79
+  tree_entry="$(git_stage -C "${EXPECTED_SOURCE}" ls-tree "${INTEGRATION_COMMIT}" -- "${relative}")" || return 79
+  actual_blob="$(git_stage -C "${EXPECTED_SOURCE}" hash-object -- "${path}")" || return 79
+  [[ "${tree_entry}" == $'100755 blob '"${expected_blob}"$'\t'"${relative}" &&
+    "${mapped}" == "${expected_blob}" && "${actual_blob}" == "${expected_blob}" &&
+    "$(sha256_file "${path}")" == "${expected_sha}" ]]
+}
+
 require_staged_content() {
   local canonical stage_head stage_status stage_shape source_shape
   canonical="$(/usr/bin/readlink -e -- "${STAGE_ROOT}")" || return 79
@@ -646,7 +737,14 @@ require_staged_content() {
     "$(sha256_file "${EXPECTED_SOURCE}/${REALNIC_PATH}")" == "${REALNIC_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${REALNIC_TEST_PATH}")" == "${REALNIC_TEST_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${REALNIC_STATIC_PATH}")" == "${REALNIC_STATIC_SHA256}" &&
-    "$(sha256_file "${EXPECTED_SOURCE}/${PROVISION_PATH}")" == "${PROVISION_SHA256}" ]]
+    "$(sha256_file "${EXPECTED_SOURCE}/${PROVISION_PATH}")" == "${PROVISION_SHA256}" ]] || return 79
+  require_staged_identity "${ROOT_VETH_PATH}" "${ROOT_VETH_BLOB}" "${ROOT_VETH_SHA256}" &&
+    require_staged_identity "${VETH_HERMETIC_PATH}" "${VETH_HERMETIC_BLOB}" "${VETH_HERMETIC_SHA256}" &&
+    require_staged_identity "${VETH_STATIC_PATH}" "${VETH_STATIC_BLOB}" "${VETH_STATIC_SHA256}" &&
+    require_staged_identity "${ROUTED_SEAM_PATH}" "${ROUTED_SEAM_BLOB}" "${ROUTED_SEAM_SHA256}" &&
+    require_staged_identity "${ROUTED_ROOT_PATH}" "${ROUTED_ROOT_BLOB}" "${ROUTED_ROOT_SHA256}" &&
+    require_staged_identity "${ROUTED_HERMETIC_PATH}" "${ROUTED_HERMETIC_BLOB}" "${ROUTED_HERMETIC_SHA256}" &&
+    require_staged_identity "${ROUTED_STATIC_PATH}" "${ROUTED_STATIC_BLOB}" "${ROUTED_STATIC_SHA256}"
 }
 
 require_completed_stage() {
@@ -866,7 +964,10 @@ run_stage() {
     "${EXPECTED_SOURCE}/${HERMETIC_PATH}" "${EXPECTED_SOURCE}/${PREPARE_PATH}" \
     "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
     "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
-    "${EXPECTED_SOURCE}/${PROVISION_PATH}" || fail 'bash-syntax' $?
+    "${EXPECTED_SOURCE}/${PROVISION_PATH}" "${EXPECTED_SOURCE}/${ROOT_VETH_PATH}" \
+    "${EXPECTED_SOURCE}/${VETH_HERMETIC_PATH}" "${EXPECTED_SOURCE}/${ROUTED_SEAM_PATH}" \
+    "${EXPECTED_SOURCE}/${ROUTED_ROOT_PATH}" "${EXPECTED_SOURCE}/${ROUTED_HERMETIC_PATH}" ||
+    fail 'bash-syntax' $?
   run_step S6.realnic /usr/bin/python3 -B -I \
     "${EXPECTED_SOURCE}/${REALNIC_PATH}" --help || fail 'realnic-python-syntax' $?
   run_step S6.realnic-unit /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
@@ -877,11 +978,30 @@ run_stage() {
     PYTHONDONTWRITEBYTECODE=1 /usr/bin/timeout --signal=TERM --kill-after=10s 2m \
     /usr/bin/python3 -B -I "${EXPECTED_SOURCE}/${REALNIC_STATIC_PATH}" ||
     fail 'realnic-hermetic-static' $?
+  run_step S6.veth-hermetic /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
+    /bin/bash "${EXPECTED_SOURCE}/${VETH_HERMETIC_PATH}" || fail 'veth-hermetic' $?
+  run_step S6.veth-static /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    PYTHONDONTWRITEBYTECODE=1 /usr/bin/timeout --signal=TERM --kill-after=10s 2m \
+    /usr/bin/python3 -B -I "${EXPECTED_SOURCE}/${VETH_STATIC_PATH}" \
+    "${EXPECTED_SOURCE}/${ROOT_VETH_PATH}" "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" \
+    "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" || fail 'veth-static' $?
+  run_step S6.routed-hermetic /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
+    /bin/bash "${EXPECTED_SOURCE}/${ROUTED_HERMETIC_PATH}" || fail 'routed-hermetic' $?
+  run_step S6.routed-static /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    PYTHONDONTWRITEBYTECODE=1 /usr/bin/timeout --signal=TERM --kill-after=10s 2m \
+    /usr/bin/python3 -B -I "${EXPECTED_SOURCE}/${ROUTED_STATIC_PATH}" \
+    "${EXPECTED_SOURCE}/${ROUTED_ROOT_PATH}" "${EXPECTED_SOURCE}/${ROUTED_SEAM_PATH}" ||
+    fail 'routed-static' $?
   run_step S7 /usr/bin/shellcheck --norc --shell=bash -- \
     "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" "${EXPECTED_SOURCE}/${HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
     "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
-    "${EXPECTED_SOURCE}/${PROVISION_PATH}" || fail 'shellcheck' $?
+    "${EXPECTED_SOURCE}/${PROVISION_PATH}" "${EXPECTED_SOURCE}/${ROOT_VETH_PATH}" \
+    "${EXPECTED_SOURCE}/${VETH_HERMETIC_PATH}" "${EXPECTED_SOURCE}/${ROUTED_SEAM_PATH}" \
+    "${EXPECTED_SOURCE}/${ROUTED_ROOT_PATH}" "${EXPECTED_SOURCE}/${ROUTED_HERMETIC_PATH}" ||
+    fail 'shellcheck' $?
   require_staged_content || fail 'staged-content-postcheck' $?
   require_physical_interface_lock || fail 'physical-interface-lock-drift' $?
   require_legacy_retirement_reservation || fail 'legacy-retirement-reservation-drift' $?

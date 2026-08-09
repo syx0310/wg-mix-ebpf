@@ -12,6 +12,7 @@ SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
 readonly SCRIPT_DIR
 readonly REPOSITORY_PATH_FROM_ROOT="scripts/realhost-b82-${RUN_ID}"
 readonly REALNIC_PATH_FROM_ROOT='scripts/realhost-b82-acceptance-v1'
+readonly ROUTED_PATH_FROM_ROOT='scripts/realhost-b82-routed-veth-v1'
 readonly PHYSICAL_INTERFACE_LOCK='/run/wg-mix-ebpf-realnic-physical-interface.v1.lock'
 
 MODE=''
@@ -178,11 +179,25 @@ readonly -a PACKAGE_PATHS=(
   "scripts/provision-ubuntu-test-host.sh"
 )
 
+# These privileged runners are consumed only from the root-owned staged Git
+# tree.  They are manifest-bound, but deliberately are not copied into the
+# user-owned flat transport package as a second executable authority.
+readonly -a STAGED_IDENTITY_PATHS=(
+  "${REPOSITORY_PATH_FROM_ROOT}/root-veth-n-r.sh"
+  "${REPOSITORY_PATH_FROM_ROOT}/test-hermetic-veth-runner.sh"
+  "${REPOSITORY_PATH_FROM_ROOT}/test_veth_runner_static.py"
+  "${ROUTED_PATH_FROM_ROOT}/controller-seam.sh"
+  "${ROUTED_PATH_FROM_ROOT}/root-routed-veth-n-r.sh"
+  "${ROUTED_PATH_FROM_ROOT}/test-hermetic-routed-veth-harness.sh"
+  "${ROUTED_PATH_FROM_ROOT}/test_routed_veth_harness_static.py"
+)
+
 readonly -a IDENTITY_PATHS=(
   "${REPOSITORY_PATH_FROM_ROOT}/bind-final-package.sh"
   "${REPOSITORY_PATH_FROM_ROOT}/controller.sh"
   "${REPOSITORY_PATH_FROM_ROOT}/locked-transport.exp"
   "${PACKAGE_PATHS[@]}"
+  "${STAGED_IDENTITY_PATHS[@]}"
 )
 
 readonly -a TRANSFER_PATHS=(
@@ -331,7 +346,7 @@ bind_package() {
 
   (set -o noclobber
     {
-      manifest_line format wg-mix-ebpf-b82-v6-package-v3
+      manifest_line format wg-mix-ebpf-b82-v6-package-v4
       manifest_line run_id "${RUN_ID}"
       manifest_line package_id "${PACKAGE_ID}"
       manifest_line integration_ref "${SOURCE_REF}"

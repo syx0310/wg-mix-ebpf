@@ -64,6 +64,18 @@ proc load_manifest {path expected_sha} {
         test_realnic_acceptance_static_py_blob test_realnic_acceptance_static_py_sha256
         provision_ubuntu_test_host_sh_path
         provision_ubuntu_test_host_sh_blob provision_ubuntu_test_host_sh_sha256
+        root_veth_n_r_sh_path root_veth_n_r_sh_blob root_veth_n_r_sh_sha256
+        test_hermetic_veth_runner_sh_path test_hermetic_veth_runner_sh_blob
+        test_hermetic_veth_runner_sh_sha256 test_veth_runner_static_py_path
+        test_veth_runner_static_py_blob test_veth_runner_static_py_sha256
+        controller_seam_sh_path controller_seam_sh_blob controller_seam_sh_sha256
+        root_routed_veth_n_r_sh_path root_routed_veth_n_r_sh_blob
+        root_routed_veth_n_r_sh_sha256 test_hermetic_routed_veth_harness_sh_path
+        test_hermetic_routed_veth_harness_sh_blob
+        test_hermetic_routed_veth_harness_sh_sha256
+        test_routed_veth_harness_static_py_path
+        test_routed_veth_harness_static_py_blob
+        test_routed_veth_harness_static_py_sha256
     }
     set channel [open $path r]
     fconfigure $channel -encoding utf-8 -translation lf
@@ -90,7 +102,7 @@ proc load_manifest {path expected_sha} {
 }
 
 proc validate_manifest_values {values} {
-    if {[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v3" ||
+    if {[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v4" ||
         [dict get $values run_id] ne "c8e41d73" ||
         [dict get $values package_id] ne "4f2a9b61" ||
         ![regexp {^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$} [dict get $values integration_ref]] ||
@@ -134,7 +146,21 @@ proc validate_manifest_values {values} {
         [dict get $values test_realnic_acceptance_py_path] ne
             "scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py" ||
         [dict get $values test_realnic_acceptance_static_py_path] ne
-            "scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py"} {
+            "scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py" ||
+        [dict get $values root_veth_n_r_sh_path] ne
+            "scripts/realhost-b82-c8e41d73/root-veth-n-r.sh" ||
+        [dict get $values test_hermetic_veth_runner_sh_path] ne
+            "scripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh" ||
+        [dict get $values test_veth_runner_static_py_path] ne
+            "scripts/realhost-b82-c8e41d73/test_veth_runner_static.py" ||
+        [dict get $values controller_seam_sh_path] ne
+            "scripts/realhost-b82-routed-veth-v1/controller-seam.sh" ||
+        [dict get $values root_routed_veth_n_r_sh_path] ne
+            "scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh" ||
+        [dict get $values test_hermetic_routed_veth_harness_sh_path] ne
+            "scripts/realhost-b82-routed-veth-v1/test-hermetic-routed-veth-harness.sh" ||
+        [dict get $values test_routed_veth_harness_static_py_path] ne
+            "scripts/realhost-b82-routed-veth-v1/test_routed_veth_harness_static.py"} {
         return -code error "manifest-value"
     }
     set wg_state [dict get $values wg_state]
@@ -163,6 +189,10 @@ proc validate_manifest_values {values} {
         prepare_stage_root_sh_blob realnic_acceptance_py_blob
         test_realnic_acceptance_py_blob test_realnic_acceptance_static_py_blob
         provision_ubuntu_test_host_sh_blob
+        root_veth_n_r_sh_blob test_hermetic_veth_runner_sh_blob
+        test_veth_runner_static_py_blob controller_seam_sh_blob
+        root_routed_veth_n_r_sh_blob test_hermetic_routed_veth_harness_sh_blob
+        test_routed_veth_harness_static_py_blob
     } {
         if {![regexp {^[0-9a-f]{40}$} [dict get $values $key]]} {
             return -code error "blob-$key"
@@ -179,6 +209,10 @@ proc validate_manifest_values {values} {
         realnic_acceptance_py_sha256 test_realnic_acceptance_py_sha256
         test_realnic_acceptance_static_py_sha256
         provision_ubuntu_test_host_sh_sha256
+        root_veth_n_r_sh_sha256 test_hermetic_veth_runner_sh_sha256
+        test_veth_runner_static_py_sha256 controller_seam_sh_sha256
+        root_routed_veth_n_r_sh_sha256 test_hermetic_routed_veth_harness_sh_sha256
+        test_routed_veth_harness_static_py_sha256
     } {
         if {![regexp {^[0-9a-f]{64}$} [dict get $values $key]]} {
             return -code error "sha256-$key"
@@ -302,6 +336,27 @@ proc realnic_remote_argv {values mode approved_sha} {
             --approved-plan-sha256 $approved_sha
     }
     return $argv
+}
+
+proc veth_remote_argv {values mode bootstrap_root} {
+    if {[dict get $values wg_state] ne "absent"} {
+        return -code error "veth-wireguard-state"
+    }
+    set source [dict get $values remote_source]
+    set runner [dict get $values root_veth_n_r_sh_path]
+    return [list /bin/bash -p "${source}/${runner}" $mode \
+        --controller-source $source \
+        --commit [dict get $values integration_commit] \
+        --bundle "${bootstrap_root}/[dict get $values bundle_name]" \
+        --bundle-sha256 [dict get $values bundle_sha256] \
+        --wg-state absent]
+}
+
+proc routed_remote_argv {values mode} {
+    set source [dict get $values remote_source]
+    set seam [dict get $values controller_seam_sh_path]
+    return [list /bin/bash -p "${source}/${seam}" $mode \
+        --commit [dict get $values integration_commit]]
 }
 
 proc package_sha {values name} {
@@ -542,6 +597,22 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
             set tty 1
             set prompt_limit 2
             set timeout_seconds [expr {$fresh_mode eq "run" ? 3600 : 2400}]
+        }
+        veth-plan - veth-run - veth-restore {
+            set veth_mode [string range $operation 5 end]
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [veth_remote_argv $values $veth_mode $bootstrap_root]]
+            set tty 1
+            set prompt_limit 2
+            set timeout_seconds [expr {$veth_mode eq "run" ? 7200 : 2400}]
+        }
+        routed-plan - routed-run - routed-restore {
+            set routed_mode [string range $operation 7 end]
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [routed_remote_argv $values $routed_mode]]
+            set tty 1
+            set prompt_limit 2
+            set timeout_seconds [expr {$routed_mode eq "run" ? 7200 : 2400}]
         }
         stage-realnic-plan-snapshot - stage-realnic-plan-verify {
             if {![regexp {^[0-9a-f]{64}$} $approved_sha]} {

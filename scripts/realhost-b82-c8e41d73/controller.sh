@@ -98,6 +98,27 @@ PREPARE_STAGE_ROOT_SH_SHA256=''
 PROVISION_UBUNTU_TEST_HOST_SH_PATH=''
 PROVISION_UBUNTU_TEST_HOST_SH_BLOB=''
 PROVISION_UBUNTU_TEST_HOST_SH_SHA256=''
+ROOT_VETH_N_R_SH_PATH=''
+ROOT_VETH_N_R_SH_BLOB=''
+ROOT_VETH_N_R_SH_SHA256=''
+TEST_HERMETIC_VETH_RUNNER_SH_PATH=''
+TEST_HERMETIC_VETH_RUNNER_SH_BLOB=''
+TEST_HERMETIC_VETH_RUNNER_SH_SHA256=''
+TEST_VETH_RUNNER_STATIC_PY_PATH=''
+TEST_VETH_RUNNER_STATIC_PY_BLOB=''
+TEST_VETH_RUNNER_STATIC_PY_SHA256=''
+CONTROLLER_SEAM_SH_PATH=''
+CONTROLLER_SEAM_SH_BLOB=''
+CONTROLLER_SEAM_SH_SHA256=''
+ROOT_ROUTED_VETH_N_R_SH_PATH=''
+ROOT_ROUTED_VETH_N_R_SH_BLOB=''
+ROOT_ROUTED_VETH_N_R_SH_SHA256=''
+TEST_HERMETIC_ROUTED_VETH_HARNESS_SH_PATH=''
+TEST_HERMETIC_ROUTED_VETH_HARNESS_SH_BLOB=''
+TEST_HERMETIC_ROUTED_VETH_HARNESS_SH_SHA256=''
+TEST_ROUTED_VETH_HARNESS_STATIC_PY_PATH=''
+TEST_ROUTED_VETH_HARNESS_STATIC_PY_BLOB=''
+TEST_ROUTED_VETH_HARNESS_STATIC_PY_SHA256=''
 PROVISION_RESULT=''
 
 fail() {
@@ -108,7 +129,7 @@ fail() {
 
 usage() {
   printf '%s\n' \
-    "usage: $0 {plan|preflight|prepare|provision-apply|fresh-plan|fresh-run|fresh-restore|realnic-plan|realnic-run|realnic-restore}" \
+    "usage: $0 {plan|preflight|prepare|provision-apply|fresh-plan|fresh-run|fresh-restore|veth-plan|veth-run|veth-restore|routed-plan|routed-run|routed-restore|realnic-plan|realnic-run|realnic-restore}" \
     '  --manifest ABSOLUTE_PACKAGE_MANIFEST --manifest-sha256 64-lowercase-hex' \
     "  --credential-path ${CREDENTIAL_PATH}" \
     '  --approved-plan {none|ABSOLUTE_LOCAL_FILE} --approved-plan-sha256 {none|64-lowercase-hex}' >&2
@@ -176,7 +197,9 @@ parse_arguments() {
   shift
   case "${MODE}" in
     plan | preflight | prepare | provision-apply | \
-      fresh-plan | fresh-run | fresh-restore | realnic-plan | realnic-run | realnic-restore) ;;
+      fresh-plan | fresh-run | fresh-restore | \
+      veth-plan | veth-run | veth-restore | routed-plan | routed-run | routed-restore | \
+      realnic-plan | realnic-run | realnic-restore) ;;
     *) usage; return 64 ;;
   esac
   while (($# > 0)); do
@@ -301,7 +324,28 @@ load_manifest() {
     read_manifest_field test_realnic_acceptance_static_py_sha256 TEST_REALNIC_ACCEPTANCE_STATIC_PY_SHA256 &&
     read_manifest_field provision_ubuntu_test_host_sh_path PROVISION_UBUNTU_TEST_HOST_SH_PATH &&
     read_manifest_field provision_ubuntu_test_host_sh_blob PROVISION_UBUNTU_TEST_HOST_SH_BLOB &&
-    read_manifest_field provision_ubuntu_test_host_sh_sha256 PROVISION_UBUNTU_TEST_HOST_SH_SHA256 || {
+    read_manifest_field provision_ubuntu_test_host_sh_sha256 PROVISION_UBUNTU_TEST_HOST_SH_SHA256 &&
+    read_manifest_field root_veth_n_r_sh_path ROOT_VETH_N_R_SH_PATH &&
+    read_manifest_field root_veth_n_r_sh_blob ROOT_VETH_N_R_SH_BLOB &&
+    read_manifest_field root_veth_n_r_sh_sha256 ROOT_VETH_N_R_SH_SHA256 &&
+    read_manifest_field test_hermetic_veth_runner_sh_path TEST_HERMETIC_VETH_RUNNER_SH_PATH &&
+    read_manifest_field test_hermetic_veth_runner_sh_blob TEST_HERMETIC_VETH_RUNNER_SH_BLOB &&
+    read_manifest_field test_hermetic_veth_runner_sh_sha256 TEST_HERMETIC_VETH_RUNNER_SH_SHA256 &&
+    read_manifest_field test_veth_runner_static_py_path TEST_VETH_RUNNER_STATIC_PY_PATH &&
+    read_manifest_field test_veth_runner_static_py_blob TEST_VETH_RUNNER_STATIC_PY_BLOB &&
+    read_manifest_field test_veth_runner_static_py_sha256 TEST_VETH_RUNNER_STATIC_PY_SHA256 &&
+    read_manifest_field controller_seam_sh_path CONTROLLER_SEAM_SH_PATH &&
+    read_manifest_field controller_seam_sh_blob CONTROLLER_SEAM_SH_BLOB &&
+    read_manifest_field controller_seam_sh_sha256 CONTROLLER_SEAM_SH_SHA256 &&
+    read_manifest_field root_routed_veth_n_r_sh_path ROOT_ROUTED_VETH_N_R_SH_PATH &&
+    read_manifest_field root_routed_veth_n_r_sh_blob ROOT_ROUTED_VETH_N_R_SH_BLOB &&
+    read_manifest_field root_routed_veth_n_r_sh_sha256 ROOT_ROUTED_VETH_N_R_SH_SHA256 &&
+    read_manifest_field test_hermetic_routed_veth_harness_sh_path TEST_HERMETIC_ROUTED_VETH_HARNESS_SH_PATH &&
+    read_manifest_field test_hermetic_routed_veth_harness_sh_blob TEST_HERMETIC_ROUTED_VETH_HARNESS_SH_BLOB &&
+    read_manifest_field test_hermetic_routed_veth_harness_sh_sha256 TEST_HERMETIC_ROUTED_VETH_HARNESS_SH_SHA256 &&
+    read_manifest_field test_routed_veth_harness_static_py_path TEST_ROUTED_VETH_HARNESS_STATIC_PY_PATH &&
+    read_manifest_field test_routed_veth_harness_static_py_blob TEST_ROUTED_VETH_HARNESS_STATIC_PY_BLOB &&
+    read_manifest_field test_routed_veth_harness_static_py_sha256 TEST_ROUTED_VETH_HARNESS_STATIC_PY_SHA256 || {
       exec 3<&-
       return 65
     }
@@ -362,7 +406,7 @@ verify_bound_history() {
 
 verify_identity() {
   local path="$1" blob="$2" sha="$3" actual_blob actual_sha mapped_blob
-  [[ ("${path}" =~ ^scripts/realhost-b82-(c8e41d73|acceptance-v1)/[A-Za-z0-9_.-]+$ ||
+  [[ ("${path}" =~ ^scripts/realhost-b82-(c8e41d73|acceptance-v1|routed-veth-v1)/[A-Za-z0-9_.-]+$ ||
       "${path}" == 'scripts/provision-ubuntu-test-host.sh') &&
     "${blob}" =~ ^[0-9a-f]{40}$ ]] || return 65
   valid_sha256 "${sha}" || return 65
@@ -378,7 +422,7 @@ verify_manifest_contract() {
   [[ -f "${MANIFEST}" && ! -L "${MANIFEST}" ]] || return 66
   [[ "$(sha256_file "${MANIFEST}")" == "${MANIFEST_SHA256}" ]] || return 67
   load_manifest || return $?
-  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v3' &&
+  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v4' &&
     "${MANIFEST_RUN_ID}" == "${RUN_ID}" && "${MANIFEST_PACKAGE_ID}" == "${PACKAGE_ID}" &&
     "${INTEGRATION_REF}" =~ ^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$ &&
     "${INTEGRATION_REF}" != *'..'* && "${INTEGRATION_REF}" != *'//'* &&
@@ -396,7 +440,14 @@ verify_manifest_contract() {
     "${PHYSICAL_NIC_FORWARD_AUTHORITY}" == 'realnic-acceptance-v1' &&
     "${PHYSICAL_INTERFACE_LOCK}" == '/run/wg-mix-ebpf-realnic-physical-interface.v1.lock' &&
     "${LEGACY_MATRIX_MODE}" == 'retired' &&
-    "${REALNIC_PROFILE}" == 'acceptance' && "${REALNIC_TRAFFIC_SECONDS}" == '30' ]] || return 65
+    "${REALNIC_PROFILE}" == 'acceptance' && "${REALNIC_TRAFFIC_SECONDS}" == '30' &&
+    "${ROOT_VETH_N_R_SH_PATH}" == "scripts/realhost-b82-${RUN_ID}/root-veth-n-r.sh" &&
+    "${TEST_HERMETIC_VETH_RUNNER_SH_PATH}" == "scripts/realhost-b82-${RUN_ID}/test-hermetic-veth-runner.sh" &&
+    "${TEST_VETH_RUNNER_STATIC_PY_PATH}" == "scripts/realhost-b82-${RUN_ID}/test_veth_runner_static.py" &&
+    "${CONTROLLER_SEAM_SH_PATH}" == 'scripts/realhost-b82-routed-veth-v1/controller-seam.sh' &&
+    "${ROOT_ROUTED_VETH_N_R_SH_PATH}" == 'scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh' &&
+    "${TEST_HERMETIC_ROUTED_VETH_HARNESS_SH_PATH}" == 'scripts/realhost-b82-routed-veth-v1/test-hermetic-routed-veth-harness.sh' &&
+    "${TEST_ROUTED_VETH_HARNESS_STATIC_PY_PATH}" == 'scripts/realhost-b82-routed-veth-v1/test_routed_veth_harness_static.py' ]] || return 65
   valid_commit "${INTEGRATION_COMMIT}" || return 65
   case "${WG_STATE}" in
     bound)
@@ -440,7 +491,14 @@ verify_manifest_contract() {
     verify_identity "${TEST_REALNIC_ACCEPTANCE_PY_PATH}" "${TEST_REALNIC_ACCEPTANCE_PY_BLOB}" "${TEST_REALNIC_ACCEPTANCE_PY_SHA256}" &&
     verify_identity "${TEST_REALNIC_ACCEPTANCE_STATIC_PY_PATH}" "${TEST_REALNIC_ACCEPTANCE_STATIC_PY_BLOB}" "${TEST_REALNIC_ACCEPTANCE_STATIC_PY_SHA256}" &&
     verify_identity "${PROVISION_UBUNTU_TEST_HOST_SH_PATH}" "${PROVISION_UBUNTU_TEST_HOST_SH_BLOB}" \
-      "${PROVISION_UBUNTU_TEST_HOST_SH_SHA256}" || return $?
+      "${PROVISION_UBUNTU_TEST_HOST_SH_SHA256}" &&
+    verify_identity "${ROOT_VETH_N_R_SH_PATH}" "${ROOT_VETH_N_R_SH_BLOB}" "${ROOT_VETH_N_R_SH_SHA256}" &&
+    verify_identity "${TEST_HERMETIC_VETH_RUNNER_SH_PATH}" "${TEST_HERMETIC_VETH_RUNNER_SH_BLOB}" "${TEST_HERMETIC_VETH_RUNNER_SH_SHA256}" &&
+    verify_identity "${TEST_VETH_RUNNER_STATIC_PY_PATH}" "${TEST_VETH_RUNNER_STATIC_PY_BLOB}" "${TEST_VETH_RUNNER_STATIC_PY_SHA256}" &&
+    verify_identity "${CONTROLLER_SEAM_SH_PATH}" "${CONTROLLER_SEAM_SH_BLOB}" "${CONTROLLER_SEAM_SH_SHA256}" &&
+    verify_identity "${ROOT_ROUTED_VETH_N_R_SH_PATH}" "${ROOT_ROUTED_VETH_N_R_SH_BLOB}" "${ROOT_ROUTED_VETH_N_R_SH_SHA256}" &&
+    verify_identity "${TEST_HERMETIC_ROUTED_VETH_HARNESS_SH_PATH}" "${TEST_HERMETIC_ROUTED_VETH_HARNESS_SH_BLOB}" "${TEST_HERMETIC_ROUTED_VETH_HARNESS_SH_SHA256}" &&
+    verify_identity "${TEST_ROUTED_VETH_HARNESS_STATIC_PY_PATH}" "${TEST_ROUTED_VETH_HARNESS_STATIC_PY_BLOB}" "${TEST_ROUTED_VETH_HARNESS_STATIC_PY_SHA256}" || return $?
 
   for name in bind-final-package.sh controller.sh root-matrix-n-r.sh check-realhost-iperf.py \
     test-hermetic-matrix.sh test_matrix_static.py checksum-module-lease.sh \
@@ -581,6 +639,16 @@ plan_all() {
     run_operation plan "${operation}" || return $?
   done
   for operation in fresh-plan fresh-run fresh-restore; do
+    run_operation plan "${operation}" || return $?
+  done
+  if [[ "${WG_STATE}" == absent ]]; then
+    for operation in veth-plan veth-run veth-restore; do
+      run_operation plan "${operation}" || return $?
+    done
+  else
+    printf 'B82_V6_CONTROLLER_PLAN veth-unavailable wg_state=bound operations=veth-plan,veth-run,veth-restore\n'
+  fi
+  for operation in routed-plan routed-run routed-restore; do
     run_operation plan "${operation}" || return $?
   done
   run_operation plan realnic-plan || return $?
@@ -751,6 +819,11 @@ main() {
   parse_arguments "$@" || fail 'arguments' $?
   verify_manifest_contract || fail 'manifest-contract' $?
   case "${MODE}" in
+    veth-plan | veth-run | veth-restore)
+      [[ "${WG_STATE}" == absent ]] || fail 'veth-wireguard-state' 65
+      ;;
+  esac
+  case "${MODE}" in
     plan) plan_all || fail 'plan-operation' $? ;;
     preflight) execute_preflight || fail 'preflight-operation' $? ;;
     prepare) execute_prepare || fail 'prepare-operation' $? ;;
@@ -763,6 +836,24 @@ main() {
       ;;
     fresh-restore)
       run_operation execute fresh-restore || fail 'fresh-restore-operation' $?
+      ;;
+    veth-plan)
+      run_operation execute veth-plan || fail 'veth-plan-operation' $?
+      ;;
+    veth-run)
+      run_operation execute veth-run || fail 'veth-run-operation' $?
+      ;;
+    veth-restore)
+      run_operation execute veth-restore || fail 'veth-restore-operation' $?
+      ;;
+    routed-plan)
+      run_operation execute routed-plan || fail 'routed-plan-operation' $?
+      ;;
+    routed-run)
+      run_operation execute routed-run || fail 'routed-run-operation' $?
+      ;;
+    routed-restore)
+      run_operation execute routed-restore || fail 'routed-restore-operation' $?
       ;;
     realnic-plan)
       run_operation execute realnic-plan || fail 'realnic-plan-operation' $?
