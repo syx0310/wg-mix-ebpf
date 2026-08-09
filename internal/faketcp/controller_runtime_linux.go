@@ -18,7 +18,7 @@ const (
 	// exact, deliberately separate kernel identity, not a prefix fallback.
 	fakeTCPStatsKernelMapName = "faketcp_stats_m"
 	fakeTCPEventErrorStatKey  = uint32(8)
-	fakeTCPStatsCount         = uint32(17)
+	fakeTCPStatsCount         = uint32(19)
 )
 
 type linuxEventLossCounter struct {
