@@ -45,7 +45,7 @@ func TestProductionOwnedCaptureTransfersOneDecodedPacketToEngine(t *testing.T) {
 	}
 	s := engine.sessions[first.ownedSample.Event.Key]
 	if s == nil || len(s.pending) != 1 || &s.pending[0].Data[0] != firstPointer ||
-		s.pending[0].captureFingerprint != first.ownedSample.Fingerprint {
+		s.pending[0].CaptureFingerprint != first.ownedSample.Fingerprint {
 		t.Fatalf("first owned packet was copied or not queued: session=%#v", s)
 	}
 
@@ -124,7 +124,7 @@ func TestProductionEventReaderRestartFailsClosedOnMidstreamCapture(t *testing.T)
 
 func TestOwnedCaptureFingerprintSurvivesCheckpointReload(t *testing.T) {
 	packet := testPendingPacket(t, testFlow(31001), 1)
-	want := packet.captureFingerprint
+	want := packet.CaptureFingerprint
 	steps, err := actionSteps([]Action{{
 		Kind: ActionReleasePending, Flow: testFlow(31001),
 		Packets: []PendingPacket{packet}, Reason: "fingerprint-reload",
@@ -140,13 +140,13 @@ func TestOwnedCaptureFingerprintSurvivesCheckpointReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	packet.captureFingerprint[0] ^= 0xff
+	packet.CaptureFingerprint[0] ^= 0xff
 	loaded, found, err := store.LoadActionCheckpoint()
 	if err != nil || !found {
 		t.Fatalf("checkpoint reload found=%t err=%v", found, err)
 	}
-	if loaded.Revision != created.Revision || loaded.Steps[0].Packet.captureFingerprint != want {
-		t.Fatalf("checkpoint fingerprint=%x want=%x", loaded.Steps[0].Packet.captureFingerprint, want)
+	if loaded.Revision != created.Revision || loaded.Steps[0].Packet.CaptureFingerprint != want {
+		t.Fatalf("checkpoint fingerprint=%x want=%x", loaded.Steps[0].Packet.CaptureFingerprint, want)
 	}
 }
 

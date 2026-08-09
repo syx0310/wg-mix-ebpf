@@ -88,7 +88,7 @@ func testPendingPacket(t testing.TB, flow abi.FakeTCPSessionKey, capture uint64)
 	return PendingPacket{
 		Data: data, FWMark: 0xa1230007, WGID: 77, CaptureNanos: capture,
 		CaptureID:          CaptureIdentity{Runtime: testRuntimeIdentity(flow.Generation), CPU: 3, Sequence: capture},
-		captureFingerprint: sha256.Sum256(data),
+		CaptureFingerprint: sha256.Sum256(data),
 	}
 }
 
@@ -237,7 +237,7 @@ func TestOnceReinjectorRejectsCaptureIdentityReuseWithDifferentMetadata(t *testi
 	if err := MaterializeIPv4UDPChecksums(conflict.Data); err != nil {
 		t.Fatal(err)
 	}
-	conflict.captureFingerprint = sha256.Sum256(conflict.Data)
+	conflict.CaptureFingerprint = sha256.Sum256(conflict.Data)
 	if err := reinjector.Reinject(context.Background(), flow, conflict); !errors.Is(err, ErrCaptureIdentityConflict) {
 		t.Fatalf("capture packet fingerprint conflict error=%v", err)
 	}
