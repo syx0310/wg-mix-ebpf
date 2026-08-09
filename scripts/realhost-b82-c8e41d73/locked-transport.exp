@@ -520,7 +520,7 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
         stale-realnic-run-roots {
             set remote [concat [list /usr/bin/sudo --] [env_argv] \
                 [list /usr/bin/find /run -xdev -mindepth 1 -maxdepth 1 \
-                -name {wg-mix-ebpf-realnic-acceptance-*} -print -quit]]
+                -name {wg-mix-ebpf-realnic-acceptance-\*} -print -quit]]
             set assertion empty
             set tty 1
             set prompt_limit 2
@@ -528,7 +528,7 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
         stale-realnic-interface-leases {
             set remote [concat [list /usr/bin/sudo --] [env_argv] \
                 [list /usr/bin/find /run -xdev -mindepth 1 -maxdepth 1 \
-                -name {wg-mix-ebpf-realnic-interface-*.jsonl} -print -quit]]
+                -name {wg-mix-ebpf-realnic-interface-\*.jsonl} -print -quit]]
             set assertion empty
             set tty 1
             set prompt_limit 2
