@@ -87,7 +87,7 @@ func TestLinuxRawIPv4WriterZeroValueFailsClosedWithoutClosingFDZero(t *testing.T
 		return 1, nil
 	})
 	if backend, err := NewRawControllerBackend(RawControllerBackendOptions{
-		Writer: writer, ControlMarks: resolver, MaxRememberedReinjections: 1,
+		Writer: writer, ControlMarks: resolver, RuntimeIdentity: testRuntimeIdentity(1), MaxReinjectStreams: 1,
 	}); err == nil || backend != nil || !errors.Is(err, ErrRawBackendClosed) {
 		t.Fatalf("zero-value writer accepted: backend=%#v err=%v", backend, err)
 	}

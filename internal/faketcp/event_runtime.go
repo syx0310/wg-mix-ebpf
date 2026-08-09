@@ -16,10 +16,11 @@ var (
 	ErrEventSamplesLost       = errors.New("faketcp event samples were lost")
 )
 
-// EventRecord is one owned event sample. LostSamples is non-zero only for a
-// perf-event-array reader. Losing a control or first-packet event makes the
-// userspace handshake state unknowable, so EventRuntime treats any loss as a
-// terminal, fail-closed error.
+// EventRecord is one owned event sample. LostSamples may come from a perf
+// reader, the production ring error counter, or a capture-sequence gap.
+// Losing a control or first-packet event makes userspace handshake state
+// unknowable, so EventRuntime treats any loss as a terminal, fail-closed
+// error.
 type EventRecord struct {
 	RawSample   []byte
 	LostSamples uint64
