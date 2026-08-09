@@ -213,10 +213,6 @@ dpkg_status_has_pending_work() {
   '
 }
 
-run_required_probe() {
-  "$@"
-}
-
 if [[ "${MODE}" == "self-test" ]]; then
   for fixture in 'Inst new-package (1.0 repository)' \
     'Inst linux-headers-7.0.0-28-generic (1.0 repository)' \
@@ -260,19 +256,20 @@ if [[ "${MODE}" == "self-test" ]]; then
       exit 1
     fi
   done
-  if [[ "${BPFTOOL_VERSION_COMMAND[*]}" != \
-    '/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /usr/sbin/bpftool -V' ]]; then
-    echo 'error: bpftool version probe argv drifted' >&2
+  expected_bpftool_version_command=(
+    "${CLEAN_ENV[@]}" /usr/sbin/bpftool -V
+  )
+  if ((${#BPFTOOL_VERSION_COMMAND[@]} != ${#expected_bpftool_version_command[@]})); then
+    echo 'error: bpftool probe must be CLEAN_ENV plus /usr/sbin/bpftool -V only' >&2
     exit 1
   fi
-  run_required_probe /usr/bin/true || {
-    echo 'error: successful required probe was rejected' >&2
-    exit 1
-  }
-  if run_required_probe /usr/bin/false; then
-    echo 'error: failed required probe was accepted' >&2
-    exit 1
-  fi
+  for index in "${!expected_bpftool_version_command[@]}"; do
+    [[ "${BPFTOOL_VERSION_COMMAND[index]}" == \
+      "${expected_bpftool_version_command[index]}" ]] || {
+      echo 'error: bpftool probe must not use legacy version or a fallback argv' >&2
+      exit 1
+    }
+  done
   echo "APT/dpkg safety gate self-test passed"
   exit 0
 fi
