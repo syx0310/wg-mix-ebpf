@@ -428,6 +428,18 @@ faketcp_assign_capture_sequence(struct faketcp_event *event)
 	return 0;
 }
 
+static __always_inline int
+faketcp_output_packet_event(struct faketcp_packet_event *record,
+			    __u16 packet_len)
+{
+	__u64 record_len;
+
+	if (packet_len == 0 || packet_len > FAKETCP_MAX_CAPTURED_PACKET)
+		return -1;
+	record_len = sizeof(record->event) + packet_len;
+	return bpf_ringbuf_output(&faketcp_events, record, record_len, 0);
+}
+
 // Allocate one event slot from a per-WireGuard, per-generation GCRA cursor.
 // Every retry bound is a compile-time constant. Under contention this helper
 // rejects after four failed compare-and-swaps instead of doing attacker-sized
@@ -599,7 +611,6 @@ static __always_inline int faketcp_capture_first_packet(struct __sk_buff *skb,
 	struct iphdr *iph = data + info->ip_off;
 	struct faketcp_packet_event *record;
 	__u32 zero = 0;
-	__u64 record_len;
 	__u64 now;
 	__u16 packet_len;
 
@@ -640,8 +651,7 @@ static __always_inline int faketcp_capture_first_packet(struct __sk_buff *skb,
 	}
 	if (bpf_skb_load_bytes(skb, info->ip_off, record->packet, packet_len) < 0)
 		return -1;
-	record_len = sizeof(record->event) + packet_len;
-	if (bpf_ringbuf_output(&faketcp_events, record, record_len, 0) < 0)
+	if (faketcp_output_packet_event(record, packet_len) < 0)
 		return -1;
 	return 0;
 }
@@ -1091,6 +1101,74 @@ static __always_inline __u8 faketcp_event_type(__u8 flags)
 	return FAKETCP_EVENT_ACK;
 }
 
+// Close controls are deliberately canonical and payload-free. Validate both
+// checksums in XDP before spending control-event budget; userspace repeats the
+// validation against a fresh complete-value snapshot before teardown
+// authority is granted. A mathematically valid zero TCP checksum field is
+// accepted because
+// only the complete one's-complement residual is authoritative.
+static __always_inline int
+faketcp_close_checksums_valid(const struct iphdr *iph,
+			      const struct tcphdr *tcp)
+{
+	struct faketcp_ipv4_pseudo_header pseudo = {
+		.source = iph->saddr,
+		.destination = iph->daddr,
+		.protocol = IPPROTO_TCP,
+		.length = bpf_htons(sizeof(*tcp)),
+	};
+	__s64 sum;
+
+	sum = bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(*iph), 0);
+	if (sum < 0 || fold_csum(sum) != 0)
+		return 0;
+	sum = bpf_csum_diff(0, 0, (__be32 *)&pseudo, sizeof(pseudo), 0);
+	if (sum < 0)
+		return 0;
+	sum = bpf_csum_diff(0, 0, (__be32 *)tcp, sizeof(*tcp), (__wsum)sum);
+	return sum >= 0 && fold_csum(sum) == 0;
+}
+
+static __always_inline int
+faketcp_capture_close_packet(struct xdp_md *xdp, __u32 packet_off,
+			     __u16 packet_len,
+			     const struct faketcp_session_key *key,
+			     __u32 wg_id, __u8 event_type, __u8 flags,
+			     __u32 seq, __u32 ack)
+{
+	struct faketcp_packet_event *record;
+	__u32 zero = 0;
+	__u64 now;
+
+	if (packet_len != sizeof(struct iphdr) + sizeof(struct tcphdr))
+		return -1;
+	record = bpf_map_lookup_elem(&faketcp_capture_scratch, &zero);
+	if (!record)
+		return -1;
+	now = bpf_ktime_get_ns();
+	if (!faketcp_admit_control_event(key, wg_id, event_type, now))
+		return 0;
+	record->event = (struct faketcp_event){
+		.key = *key,
+		.timestamp_nanos = now,
+		.sequence = seq,
+		.acknowledgement = ack,
+		.wg_id = wg_id,
+		.packet_length = packet_len,
+		.type = event_type,
+		.tcp_flags = flags,
+	};
+	if (faketcp_bind_runtime_identity(key, &record->event) < 0) {
+		inc_faketcp_stat(FAKETCP_STAT_CAPTURE_ID_ERROR);
+		return -1;
+	}
+	if (bpf_xdp_load_bytes(xdp, packet_off, record->packet, packet_len) < 0)
+		return -1;
+	if (faketcp_output_packet_event(record, packet_len) < 0)
+		return -1;
+	return 0;
+}
+
 SEC("xdp")
 int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 {
@@ -1112,7 +1190,8 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	__u8 tail[FAKETCP_HEADER_DELTA] = {};
 	__u8 flags;
 	__u16 total_len, tcp_len, payload_len, new_total_len;
-	__u32 seq, next_seq;
+	__u16 expected_window;
+	__u32 seq, ack, next_seq;
 	__u64 generation = 0;
 	__s64 sum;
 	__u16 fragment_offset;
@@ -1191,14 +1270,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	payload_len = tcp_len - sizeof(*tcp);
 	flags = faketcp_tcp_flags(tcp);
 	seq = bpf_ntohl(tcp->seq);
-	// The current ring ABI does not carry the complete TCP packet, so
-	// userspace cannot independently prove checksum and receive-window state.
-	// Until the BPF validator capability is implemented, close controls must
-	// never be emitted as session-deletion authority.
-	if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)) {
-		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
-		return XDP_DROP;
-	}
+	ack = bpf_ntohl(tcp->ack_seq);
 	key.generation = generation;
 	key.local_ipv4 = iph->daddr;
 	key.remote_ipv4 = iph->saddr;
@@ -1206,16 +1278,49 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	key.local_port = bpf_ntohs(tcp->dest);
 	key.remote_port = bpf_ntohs(tcp->source);
 	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
+	if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)) {
+		const __u8 *raw_tcp = (const __u8 *)tcp;
+
+		// Only the exact inbound direction of an existing established session
+		// can reach the packet-bearing close event. Every field is rechecked by
+		// userspace against a fresh complete-value lookup and atomic delete.
+		if (!session || session->generation != generation ||
+		    session->state != FAKETCP_STATE_ESTABLISHED ||
+		    session->window == 0) {
+			inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+			return XDP_DROP;
+		}
+		expected_window = session->window;
+		if ((fragment_offset & 0xbfff) ||
+		    total_len != sizeof(*iph) + sizeof(*tcp) || payload_len != 0 ||
+		    raw_tcp[12] != (sizeof(*tcp) / 4) << 4 ||
+		    (flags != (FAKETCP_FLAG_RST | FAKETCP_FLAG_ACK) &&
+		     flags != (FAKETCP_FLAG_FIN | FAKETCP_FLAG_ACK)) ||
+		    seq != session->rx_sequence || ack != session->tx_sequence ||
+		    bpf_ntohs(tcp->window) != expected_window || tcp->urg_ptr != 0) {
+			inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+			return XDP_DROP;
+		}
+		if (!faketcp_close_checksums_valid(iph, tcp)) {
+			inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
+			return XDP_DROP;
+		}
+		if (faketcp_capture_close_packet(
+			    xdp, (__u32)off, total_len, &key, listener->wg_id,
+			    faketcp_event_type(flags), flags, seq, ack) < 0)
+			inc_faketcp_stat(FAKETCP_STAT_EVENT_ERROR);
+		return XDP_DROP;
+	}
 	if (!session || session->generation != generation ||
 	    session->state != FAKETCP_STATE_ESTABLISHED) {
 		faketcp_emit_event(&key, faketcp_event_type(flags), flags, seq,
-				   bpf_ntohl(tcp->ack_seq), payload_len, 0,
+				   ack, payload_len, 0,
 				   listener->wg_id);
 		return XDP_DROP;
 	}
 	if (flags & (FAKETCP_FLAG_SYN | FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)) {
 		faketcp_emit_event(&key, faketcp_event_type(flags), flags, seq,
-				   bpf_ntohl(tcp->ack_seq), payload_len, 0,
+				   ack, payload_len, 0,
 				   listener->wg_id);
 		return XDP_DROP;
 	}

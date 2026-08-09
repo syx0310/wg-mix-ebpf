@@ -24,10 +24,10 @@ type DecodedEvent struct {
 	Packet []byte
 }
 
-// DecodeEventSample accepts the compact variable-size packet event emitted by
-// the current BPF program and the original fixed-size record for safe rolling
-// upgrades. Metadata-only NEED_HANDSHAKE events are rejected because they
-// cannot release a real first packet after the handshake.
+// DecodeEventSample accepts compact variable-size packet events and the
+// original fixed-size record for safe rolling upgrades. NEED_HANDSHAKE and
+// destructive RST/FIN events must carry their complete L3 packet: metadata is
+// never sufficient to release a packet or authorize session teardown.
 func DecodeEventSample(sample []byte) (DecodedEvent, error) {
 	if len(sample) < fakeTCPEventSize {
 		return DecodedEvent{}, fmt.Errorf("faketcp event sample has %d bytes, need at least %d", len(sample), fakeTCPEventSize)
@@ -37,7 +37,7 @@ func DecodeEventSample(sample []byte) (DecodedEvent, error) {
 		return DecodedEvent{}, err
 	}
 
-	if event.Type != abi.FakeTCPEventNeedHandshake {
+	if !fakeTCPEventCarriesPacket(event.Type) {
 		if event.PacketLength != 0 || len(sample) != fakeTCPEventSize {
 			return DecodedEvent{}, fmt.Errorf("faketcp control event type %d has packet length %d and sample size %d", event.Type, event.PacketLength, len(sample))
 		}
@@ -53,10 +53,17 @@ func DecodeEventSample(sample []byte) (DecodedEvent, error) {
 		return DecodedEvent{}, fmt.Errorf("faketcp packet event sample has %d bytes, want compact %d or fixed %d", len(sample), compactSize, fakeTCPPacketEventSize)
 	}
 	packet := append([]byte(nil), sample[fakeTCPEventSize:compactSize]...)
-	if err := validateCapturedIPv4UDP(event, packet); err != nil {
-		return DecodedEvent{}, err
+	if event.Type == abi.FakeTCPEventNeedHandshake {
+		if err := validateCapturedIPv4UDP(event, packet); err != nil {
+			return DecodedEvent{}, err
+		}
 	}
 	return DecodedEvent{Event: event, Packet: packet}, nil
+}
+
+func fakeTCPEventCarriesPacket(eventType uint8) bool {
+	return eventType == abi.FakeTCPEventNeedHandshake ||
+		eventType == abi.FakeTCPEventRST || eventType == abi.FakeTCPEventFIN
 }
 
 func decodeEventHeader(header []byte) abi.FakeTCPEvent {
@@ -118,11 +125,11 @@ func validateEventType(event abi.FakeTCPEvent) error {
 			return fmt.Errorf("faketcp ACK event has inconsistent flags %#x", flags)
 		}
 	case abi.FakeTCPEventRST:
-		if flags&FlagRST == 0 {
+		if flags != FlagRST|FlagACK {
 			return fmt.Errorf("faketcp RST event has inconsistent flags %#x", flags)
 		}
 	case abi.FakeTCPEventFIN:
-		if flags&FlagFIN == 0 || flags&FlagRST != 0 {
+		if flags != FlagFIN|FlagACK {
 			return fmt.Errorf("faketcp FIN event has inconsistent flags %#x", flags)
 		}
 	default:
@@ -330,12 +337,15 @@ func (c *Controller) HandleSample(ctx context.Context, sample []byte) ([]Action,
 		)
 	}
 	var actions []Action
-	if decoded.Event.Type == abi.FakeTCPEventNeedHandshake {
+	switch decoded.Event.Type {
+	case abi.FakeTCPEventNeedHandshake:
 		if err := MaterializeIPv4UDPChecksums(decoded.Packet); err != nil {
 			return nil, err
 		}
 		actions, err = c.engine.handleCapturedPacket(decoded.Event, decoded.Packet)
-	} else {
+	case abi.FakeTCPEventRST, abi.FakeTCPEventFIN:
+		actions, err = c.engine.InboundCapturedControl(decoded.Event, decoded.Packet)
+	default:
 		actions, err = c.engine.InboundWithWGID(decoded.Event.Key, Segment{
 			Flags:           decoded.Event.TCPFlags,
 			Sequence:        decoded.Event.Sequence,

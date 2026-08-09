@@ -322,9 +322,10 @@ type FakeTCPEvent struct {
 	_                  [2]byte
 }
 
-// FakeTCPPacketEvent carries the exact pre-transform IPv4 packet for the
-// bounded userspace first-packet queue. Consumers must use PacketLength and
-// ignore the unused tail of Packet.
+// FakeTCPPacketEvent carries either the exact pre-transform IPv4/UDP packet
+// for the bounded userspace first-packet queue or a complete inbound IPv4/TCP
+// RST/FIN candidate for independent userspace validation. Consumers must use
+// PacketLength and ignore the unused tail of Packet.
 type FakeTCPPacketEvent struct {
 	Event  FakeTCPEvent
 	Packet [FakeTCPMaxCapturedPacket]byte

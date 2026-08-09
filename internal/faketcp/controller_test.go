@@ -219,6 +219,71 @@ func TestDecodeEventSampleAcceptsCompactAndFixedPacketRecords(t *testing.T) {
 	}
 }
 
+func TestDecodeEventSampleAcceptsCompactAndFixedCloseRecords(t *testing.T) {
+	engine, _, flow, state := establishedControlTestSession(t)
+	for _, flags := range []uint8{FlagRST | FlagACK, FlagFIN | FlagACK} {
+		event, packet := capturedCloseEvent(engine, flow, state, flags, 7)
+		for _, fixed := range []bool{false, true} {
+			decoded, err := DecodeEventSample(testBoundEventSample(event, packet, fixed))
+			if err != nil {
+				t.Fatalf("flags=%#x fixed=%t: %v", flags, fixed, err)
+			}
+			if decoded.Event != event || !bytes.Equal(decoded.Packet, packet) {
+				t.Fatalf("flags=%#x fixed=%t decoded=%#v", flags, fixed, decoded)
+			}
+		}
+	}
+}
+
+func TestControllerCloseValidationDropsForgeryThenAcceptsExactPacket(t *testing.T) {
+	engine, store, flow, state := establishedControlTestSession(t)
+	backend := &fakeControllerBackend{}
+	controller, err := NewController(engine, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, packet := capturedCloseEvent(engine, flow, state, FlagRST|FlagACK, 7)
+	mismatched := event
+	mismatched.Sequence++
+	actions, err := controller.HandleSample(
+		context.Background(), testBoundEventSample(mismatched, packet, false),
+	)
+	if err != nil || len(actions) != 1 || actions[0].Reason != "invalid-close-control" {
+		t.Fatalf("mismatched close actions=%#v err=%v", actions, err)
+	}
+	forged := append([]byte(nil), packet...)
+	forged[36] ^= 1
+	actions, err = controller.HandleSample(
+		context.Background(), testBoundEventSample(event, forged, false),
+	)
+	if err != nil || len(actions) != 1 || actions[0].Reason != "invalid-close-control" {
+		t.Fatalf("forged close actions=%#v err=%v", actions, err)
+	}
+	if _, found := store.values[flow]; !found || store.deleteAttempts != 0 {
+		t.Fatalf("forged close touched session: found=%t attempts=%d", found, store.deleteAttempts)
+	}
+
+	actions, err = controller.HandleSample(
+		context.Background(), testBoundEventSample(event, packet, false),
+	)
+	if err != nil || len(actions) != 1 || actions[0].Reason != "peer-close" {
+		t.Fatalf("exact close actions=%#v err=%v", actions, err)
+	}
+	if _, found := store.values[flow]; found || store.deleteAttempts != 1 {
+		t.Fatalf("exact close result: found=%t attempts=%d", found, store.deleteAttempts)
+	}
+	if len(backend.operations) != 0 {
+		t.Fatalf("peer close unexpectedly reached packet/control backend: %v", backend.operations)
+	}
+
+	actions, err = controller.HandleSample(
+		context.Background(), testBoundEventSample(event, packet, false),
+	)
+	if err != nil || len(actions) != 1 || actions[0].Reason != "unknown-close" {
+		t.Fatalf("replayed close actions=%#v err=%v", actions, err)
+	}
+}
+
 func TestDecodeEventSampleRejectsMetadataOnlyAndMismatchedPackets(t *testing.T) {
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1})
@@ -1090,7 +1155,7 @@ func testBoundEventSample(event abi.FakeTCPEvent, packet []byte, fixed bool) []b
 // hidden by a shared helper.
 func testEventSample(event abi.FakeTCPEvent, packet []byte, fixed bool) []byte {
 	size := fakeTCPEventSize + len(packet)
-	if fixed && event.Type == abi.FakeTCPEventNeedHandshake {
+	if fixed && fakeTCPEventCarriesPacket(event.Type) {
 		size = fakeTCPPacketEventSize
 	}
 	sample := make([]byte, size)

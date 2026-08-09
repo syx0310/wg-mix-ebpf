@@ -638,7 +638,7 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 		t.Fatalf("FakeTCP metadata ring output sites=%d, want exactly one", got)
 	}
 	if got := strings.Count(text, "bpf_ringbuf_output(&faketcp_events, record"); got != 1 {
-		t.Fatalf("FakeTCP packet ring output sites=%d, want exactly one", got)
+		t.Fatalf("FakeTCP shared packet ring output sites=%d, want exactly one", got)
 	}
 	for _, forbidden := range []string{"bpf_ringbuf_reserve(", "bpf_ringbuf_submit(", "bpf_ringbuf_discard("} {
 		if strings.Contains(text, forbidden) {
@@ -667,7 +667,7 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 	packetAdmit := strings.Index(capture, "if (!faketcp_admit_control_event(key, rule->wg_id")
 	scratchWrite := strings.Index(capture, "record->event = (struct faketcp_event)")
 	packetCopy := strings.Index(capture, "bpf_skb_load_bytes")
-	packetOutput := strings.Index(capture, "bpf_ringbuf_output(&faketcp_events, record")
+	packetOutput := strings.Index(capture, "faketcp_output_packet_event(record, packet_len)")
 	identityBind := strings.Index(capture, "faketcp_bind_runtime_identity(key, &record->event)")
 	sequenceAssign := strings.Index(capture, "faketcp_assign_capture_sequence(&record->event)")
 	if packetValidation < 0 || scratchLookup < 0 || packetAdmit < 0 || scratchWrite < 0 ||
@@ -675,7 +675,7 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 		scratchLookup >= packetAdmit || packetAdmit >= scratchWrite ||
 		scratchWrite >= identityBind || identityBind >= sequenceAssign ||
 		sequenceAssign >= packetCopy || packetCopy >= packetOutput {
-		t.Fatal("NEED_HANDSHAKE admission must follow cheap validation and dominate scratch writes, packet copy, and ring output")
+		t.Fatal("NEED_HANDSHAKE admission must follow cheap validation and dominate scratch writes, packet copy, and shared ring output")
 	}
 	if strings.Count(capture, "bpf_ktime_get_ns()") != 1 ||
 		!strings.Contains(capture, ".timestamp_nanos = now") {
@@ -796,7 +796,7 @@ func takeFakeTCPControlBudgetModel(cursor *uint64, now, interval uint64, burst u
 	return true
 }
 
-func TestFakeTCPCloseControlsCannotAuthorizeDeleteBeforeBPFValidation(t *testing.T) {
+func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
 	if err != nil {
 		t.Fatal(err)
@@ -807,12 +807,50 @@ func TestFakeTCPCloseControlsCannotAuthorizeDeleteBeforeBPFValidation(t *testing
 		t.Fatal("FakeTCP XDP entry point is missing")
 	}
 	xdp := text[xdpStart:]
-	closeDrop := strings.Index(xdp, "if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN))")
-	firstEvent := strings.Index(xdp, "faketcp_emit_event")
-	if closeDrop < 0 || firstEvent < 0 || closeDrop >= firstEvent {
-		t.Fatal("RST/FIN can reach the ring before the unavailable BPF checksum/window validator")
+	closePath := strings.Index(xdp, "if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN))")
+	established := strings.Index(xdp, "session->state != FAKETCP_STATE_ESTABLISHED")
+	canonical := strings.Index(xdp, "flags != (FAKETCP_FLAG_RST | FAKETCP_FLAG_ACK)")
+	sequence := strings.Index(xdp, "seq != session->rx_sequence || ack != session->tx_sequence")
+	window := strings.Index(xdp, "bpf_ntohs(tcp->window) != expected_window")
+	checksum := strings.Index(xdp, "faketcp_close_checksums_valid(iph, tcp)")
+	capture := strings.Index(xdp, "faketcp_capture_close_packet(")
+	if closePath < 0 || established < 0 || canonical < 0 || sequence < 0 ||
+		window < 0 || checksum < 0 || capture < 0 ||
+		closePath >= established || established >= canonical || canonical >= sequence ||
+		sequence >= window || window >= checksum || checksum >= capture {
+		t.Fatal("RST/FIN established, flags, sequence, window, checksum and packet capture checks are missing or out of order")
 	}
 	if strings.Contains(xdp, "old_tcp.check == 0") {
 		t.Fatal("TCP checksum field zero is not independently invalid")
+	}
+	if strings.Contains(text, "bpf_map_delete_elem(&faketcp_session_map") {
+		t.Fatal("BPF close validation must never become session-deletion authority")
+	}
+
+	checksumStart := strings.Index(text, "faketcp_close_checksums_valid(const struct iphdr *iph")
+	captureStart := strings.Index(text, "faketcp_capture_close_packet(struct xdp_md *xdp")
+	if checksumStart < 0 || captureStart < 0 || checksumStart >= captureStart {
+		t.Fatal("canonical close checksum and capture helpers are missing")
+	}
+	checksumHelper := text[checksumStart:captureStart]
+	for _, want := range []string{
+		"bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(*iph), 0)",
+		"fold_csum(sum) != 0",
+		"struct faketcp_ipv4_pseudo_header pseudo",
+		"bpf_csum_diff(0, 0, (__be32 *)tcp, sizeof(*tcp)",
+	} {
+		if !strings.Contains(checksumHelper, want) {
+			t.Fatalf("close checksum helper missing %q", want)
+		}
+	}
+	captureHelper := text[captureStart:xdpStart]
+	admit := strings.Index(captureHelper, "faketcp_admit_control_event(key, wg_id, event_type, now)")
+	write := strings.Index(captureHelper, "record->event = (struct faketcp_event)")
+	identity := strings.Index(captureHelper, "faketcp_bind_runtime_identity(key, &record->event)")
+	copyPacket := strings.Index(captureHelper, "bpf_xdp_load_bytes")
+	output := strings.Index(captureHelper, "faketcp_output_packet_event(record, packet_len)")
+	if admit < 0 || write < 0 || identity < 0 || copyPacket < 0 || output < 0 ||
+		admit >= write || write >= identity || identity >= copyPacket || copyPacket >= output {
+		t.Fatal("validated close admission must dominate event writes, identity binding, packet copy, and shared output")
 	}
 }

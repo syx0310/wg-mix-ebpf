@@ -25,6 +25,12 @@ func TestCanonicalPerfEventSampleTrimsOnlyProvenKernelPadding(t *testing.T) {
 	control := testBoundEventSample(abi.FakeTCPEvent{
 		Key: flow, Type: abi.FakeTCPEventACK, TCPFlags: FlagACK,
 	}, nil, false)
+	engine, _, closeFlow, closeState := establishedControlTestSession(t)
+	closeEvent, closePacket := capturedCloseEvent(
+		engine, closeFlow, closeState, FlagRST|FlagACK, 7,
+	)
+	closeCompact := testBoundEventSample(closeEvent, closePacket, false)
+	closeFixed := testBoundEventSample(closeEvent, closePacket, true)
 
 	for _, test := range []struct {
 		name  string
@@ -34,6 +40,8 @@ func TestCanonicalPerfEventSampleTrimsOnlyProvenKernelPadding(t *testing.T) {
 		{name: "compact", input: append(append([]byte(nil), compact...), 1, 2, 3), want: compact},
 		{name: "fixed", input: append(append([]byte(nil), fixed...), 1, 2, 3, 4, 5, 6, 7), want: fixed},
 		{name: "control", input: append(append([]byte(nil), control...), 9), want: control},
+		{name: "close-compact", input: append(append([]byte(nil), closeCompact...), 1, 2), want: closeCompact},
+		{name: "close-fixed", input: append(append([]byte(nil), closeFixed...), 1, 2, 3, 4), want: closeFixed},
 		{name: "too much", input: append(append([]byte(nil), control...), make([]byte, 8)...), want: append(append([]byte(nil), control...), make([]byte, 8)...)},
 		{name: "short", input: []byte{1, 2, 3}, want: []byte{1, 2, 3}},
 	} {

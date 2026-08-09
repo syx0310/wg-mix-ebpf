@@ -1,7 +1,5 @@
 package faketcp
 
-import "github.com/syx0310/wg-mix-ebpf/internal/abi"
-
 // Linux perf rings may append up to seven unspecified bytes. Trim only when
 // the FakeTCP header proves one exact compact/fixed sample length; malformed
 // records remain unmodified and are rejected by DecodeEventSample.
@@ -12,7 +10,7 @@ func canonicalPerfEventSample(sample []byte) []byte {
 	}
 	event := decodeEventHeader(sample[:fakeTCPEventSize])
 	expected := fakeTCPEventSize
-	if event.Type == abi.FakeTCPEventNeedHandshake {
+	if fakeTCPEventCarriesPacket(event.Type) {
 		packetLength := int(event.PacketLength)
 		if packetLength <= 0 || packetLength > fakeTCPPacketEventSize-fakeTCPEventSize {
 			return append([]byte(nil), sample...)
