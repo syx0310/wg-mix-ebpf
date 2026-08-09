@@ -235,7 +235,7 @@ plan_binding() {
   printf 'wg_state=%s wg_interface=%s wg_local_address=%s wg_peer_address=%s\n' \
     "${WG_STATE}" "${WG_INTERFACE}" "${WG_LOCAL_ADDRESS}" "${WG_PEER_ADDRESS}"
   printf '%s\n' \
-    'physical_nic_forward_authority=realnic-acceptance-v1 legacy_matrix_mode=restore-only'
+    'physical_nic_forward_authority=realnic-acceptance-v1 legacy_matrix_mode=retired'
   printf 'bundle_argv=/usr/bin/git bundle create %s %s\n' \
     "${OUTPUT_DIR}/source-${PACKAGE_ID}.bundle" "${SOURCE_REF}"
   printf 'repository_shallow=false history_verification=isolated-unbundle-rev-list-fsck-v1\n'
@@ -362,7 +362,7 @@ bind_package() {
       manifest_line session_seconds 300
       manifest_line physical_nic_forward_authority realnic-acceptance-v1
       manifest_line physical_interface_lock "${PHYSICAL_INTERFACE_LOCK}"
-      manifest_line legacy_matrix_mode restore-only
+      manifest_line legacy_matrix_mode retired
       manifest_line realnic_profile acceptance
       manifest_line realnic_traffic_seconds 30
       for path in "${IDENTITY_PATHS[@]}"; do

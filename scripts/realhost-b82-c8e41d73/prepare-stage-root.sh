@@ -23,7 +23,6 @@ readonly PHYSICAL_INTERFACE_LOCK='/run/wg-mix-ebpf-realnic-physical-interface.v1
 readonly PHYSICAL_INTERFACE_LOCK_INTERFACE='ens33'
 readonly LEGACY_RETIREMENT_RESERVATION="${STAGE_ROOT}/realhost-v6-6bd913ac"
 readonly LEGACY_RETIREMENT_RESERVATION_SHAPE='root:root:600:1:0:regular file'
-readonly LEGACY_RESTORE_CELLS='tcx,original,all-on,all-off,tx-path,rx-path,mtu1492,mtu1500,soak'
 readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-${RUN_ID}/checksum-module-lease.sh"
 readonly EXPECTED_HOSTNAME='ubuntu-2604-test'
 readonly EXPECTED_KERNEL='7.0.0-28-generic'
@@ -278,7 +277,7 @@ validate_manifest() {
     "${SOAK_SECONDS}" == '3600' && "${SESSION_SECONDS}" == '300' &&
     "${PHYSICAL_NIC_FORWARD_AUTHORITY}" == 'realnic-acceptance-v1' &&
     "${MANIFEST_PHYSICAL_INTERFACE_LOCK}" == "${PHYSICAL_INTERFACE_LOCK}" &&
-    "${LEGACY_MATRIX_MODE}" == 'restore-only' &&
+    "${LEGACY_MATRIX_MODE}" == 'retired' &&
     "${REALNIC_PROFILE}" == 'acceptance' && "${REALNIC_TRAFFIC_SECONDS}" == '30' &&
     "${TARGET_INTERFACE}" == "${PHYSICAL_INTERFACE_LOCK_INTERFACE}" &&
     "${SESSION_SECONDS}" == '300' ]] || return 65
@@ -540,7 +539,6 @@ render_binding_marker() {
     "physical_interface_lock=${PHYSICAL_INTERFACE_LOCK}" \
     "physical_interface_lock_interface=${PHYSICAL_INTERFACE_LOCK_INTERFACE}" \
     "legacy_matrix_mode=${LEGACY_MATRIX_MODE}" \
-    "legacy_matrix_restore_cells=${LEGACY_RESTORE_CELLS}" \
     "legacy_retirement_reservation=${LEGACY_RETIREMENT_RESERVATION}" \
     "legacy_retirement_reservation_shape=${LEGACY_RETIREMENT_RESERVATION_SHAPE}" \
     "module_lease_lock=${MODULE_LEASE_LOCK}" \

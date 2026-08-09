@@ -12,7 +12,6 @@ MODE=''
 MANIFEST=''
 MANIFEST_SHA256=''
 SUPPLIED_CREDENTIAL_PATH=''
-RESTORE_CELL='none'
 APPROVED_PLAN='none'
 APPROVED_PLAN_SHA256='none'
 
@@ -109,11 +108,10 @@ fail() {
 
 usage() {
   printf '%s\n' \
-    "usage: $0 {plan|preflight|prepare|provision-apply|restore|fresh-plan|fresh-run|fresh-restore|realnic-plan|realnic-run|realnic-restore}" \
+    "usage: $0 {plan|preflight|prepare|provision-apply|fresh-plan|fresh-run|fresh-restore|realnic-plan|realnic-run|realnic-restore}" \
     '  --manifest ABSOLUTE_PACKAGE_MANIFEST --manifest-sha256 64-lowercase-hex' \
     "  --credential-path ${CREDENTIAL_PATH}" \
-    '  --approved-plan {none|ABSOLUTE_LOCAL_FILE} --approved-plan-sha256 {none|64-lowercase-hex}' \
-    '  --restore-cell {none|tcx|original|all-on|all-off|tx-path|rx-path|mtu1492|mtu1500|soak}' >&2
+    '  --approved-plan {none|ABSOLUTE_LOCAL_FILE} --approved-plan-sha256 {none|64-lowercase-hex}' >&2
 }
 
 sha256_file() {
@@ -177,7 +175,7 @@ parse_arguments() {
   MODE="$1"
   shift
   case "${MODE}" in
-    plan | preflight | prepare | provision-apply | restore | \
+    plan | preflight | prepare | provision-apply | \
       fresh-plan | fresh-run | fresh-restore | realnic-plan | realnic-run | realnic-restore) ;;
     *) usage; return 64 ;;
   esac
@@ -187,7 +185,6 @@ parse_arguments() {
       --manifest) MANIFEST="$2" ;;
       --manifest-sha256) MANIFEST_SHA256="$2" ;;
       --credential-path) SUPPLIED_CREDENTIAL_PATH="$2" ;;
-      --restore-cell) RESTORE_CELL="$2" ;;
       --approved-plan) APPROVED_PLAN="$2" ;;
       --approved-plan-sha256) APPROVED_PLAN_SHA256="$2" ;;
       *) usage; return 64 ;;
@@ -196,14 +193,6 @@ parse_arguments() {
   done
   [[ "${MANIFEST}" == /* && "${SUPPLIED_CREDENTIAL_PATH}" == "${CREDENTIAL_PATH}" ]] || return 65
   valid_sha256 "${MANIFEST_SHA256}" || return 65
-  case "${MODE}:${RESTORE_CELL}" in
-    plan:none | preflight:none | prepare:none | provision-apply:none | \
-      fresh-plan:none | fresh-run:none | fresh-restore:none | \
-      realnic-plan:none | realnic-run:none | realnic-restore:none | \
-      restore:tcx | restore:original | restore:all-on | restore:all-off | \
-      restore:tx-path | restore:rx-path | restore:mtu1492 | restore:mtu1500 | restore:soak) ;;
-    *) return 65 ;;
-  esac
   case "${MODE}" in
     realnic-run)
       [[ "${APPROVED_PLAN}" == /* ]] && valid_sha256 "${APPROVED_PLAN_SHA256}" || return 65
@@ -406,7 +395,7 @@ verify_manifest_contract() {
     "${SESSION_SECONDS}" == '300' &&
     "${PHYSICAL_NIC_FORWARD_AUTHORITY}" == 'realnic-acceptance-v1' &&
     "${PHYSICAL_INTERFACE_LOCK}" == '/run/wg-mix-ebpf-realnic-physical-interface.v1.lock' &&
-    "${LEGACY_MATRIX_MODE}" == 'restore-only' &&
+    "${LEGACY_MATRIX_MODE}" == 'retired' &&
     "${REALNIC_PROFILE}" == 'acceptance' && "${REALNIC_TRAFFIC_SECONDS}" == '30' ]] || return 65
   valid_commit "${INTEGRATION_COMMIT}" || return 65
   case "${WG_STATE}" in
@@ -605,18 +594,9 @@ plan_all() {
   else
     printf 'B82_V6_REALNIC_APPROVAL_REQUIRED local_plan=explicit approved_plan_sha256=explicit automatic_approval=0\n'
   fi
-  if [[ "${WG_STATE}" == 'absent' ]]; then
-    printf 'B82_V6_LEGACY_RESTORE_BLOCKED reason=wireguard-topology-absent restore_entries=9\n'
-  else
-    for operation in tcx original all-on all-off tx-path rx-path mtu1492 mtu1500 soak; do
-      run_operation plan "matrix-restore-${operation}" || return $?
-    done
-  fi
+  printf '%s\n' \
+    'B82_V6_LEGACY_MATRIX_RETIRED controller_entries=0 historical_recovery=frozen-original-package-before-final-staging'
   printf 'B82_V6_CONTROLLER_PLAN_COMPLETE credential_read=0 network_operations=0 mutations=0 legacy_forward=retired\n'
-}
-
-require_bound_wireguard() {
-  [[ "${WG_STATE}" == 'bound' ]] || fail 'wireguard-topology-absent' 78
 }
 
 execute_preflight() {
@@ -775,10 +755,6 @@ main() {
     preflight) execute_preflight || fail 'preflight-operation' $? ;;
     prepare) execute_prepare || fail 'prepare-operation' $? ;;
     provision-apply) execute_provision_apply || fail 'provision-apply-operation' $? ;;
-    restore)
-      require_bound_wireguard
-      run_operation execute "matrix-restore-${RESTORE_CELL}" || fail 'matrix-restore-operation' $?
-      ;;
     fresh-plan)
       run_operation execute fresh-plan || fail 'fresh-plan-operation' $?
       ;;

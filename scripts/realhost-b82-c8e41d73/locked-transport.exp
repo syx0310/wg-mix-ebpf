@@ -126,7 +126,7 @@ proc validate_manifest_values {values} {
         [dict get $values physical_nic_forward_authority] ne "realnic-acceptance-v1" ||
         [dict get $values physical_interface_lock] ne
             "/run/wg-mix-ebpf-realnic-physical-interface.v1.lock" ||
-        [dict get $values legacy_matrix_mode] ne "restore-only" ||
+        [dict get $values legacy_matrix_mode] ne "retired" ||
         [dict get $values realnic_profile] ne "acceptance" ||
         [dict get $values realnic_traffic_seconds] ne "30" ||
         [dict get $values realnic_acceptance_py_path] ne
@@ -274,32 +274,6 @@ proc scp_options {} {
 
 proc env_argv {} {
     return [list /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C]
-}
-
-proc matrix_remote_argv {values mode restore_cell} {
-    if {$mode ne "restore"} {
-        return -code error "legacy-forward-authority-retired"
-    }
-    if {[dict get $values wg_state] ne "bound"} {
-        return -code error "wireguard-topology-absent"
-    }
-    set source [dict get $values remote_source]
-    set package [dict get $values remote_package_dir]
-    set argv [list /bin/bash -p \
-        "${source}/scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh" $mode \
-        --source $source --commit [dict get $values integration_commit] \
-        --bundle "${package}/[dict get $values bundle_name]" \
-        --bundle-sha256 [dict get $values bundle_sha256] \
-        --interface [dict get $values target_interface] \
-        --peer-address [dict get $values peer_address] \
-        --peer-port [dict get $values peer_port] \
-        --soak-seconds [dict get $values soak_seconds] \
-        --session-seconds [dict get $values session_seconds] \
-        --wg-interface [dict get $values wg_interface] \
-        --wg-local-address [dict get $values wg_local_address] \
-        --wg-peer-address [dict get $values wg_peer_address] \
-        --restore-cell $restore_cell]
-    return $argv
 }
 
 proc fresh_remote_argv {values manifest_sha mode bootstrap_root} {
@@ -593,13 +567,7 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
             set timeout_seconds [expr {$realnic_mode eq "run" ? 20000 : 2400}]
         }
         default {
-            if {[regexp {^matrix-restore-(tcx|original|all-on|all-off|tx-path|rx-path|mtu1492|mtu1500|soak)$} $operation -> cell]} {
-                set remote [concat [list /usr/bin/sudo --] [env_argv] \
-                    [matrix_remote_argv $values restore $cell]]
-                set tty 1
-                set prompt_limit 2
-                set timeout_seconds 2400
-            } elseif {$operation in {scp-realnic-approved-plan verify-sha-realnic-approved-plan
+            if {$operation in {scp-realnic-approved-plan verify-sha-realnic-approved-plan
                 verify-stat-realnic-approved-plan}} {
                 if {$approved_plan eq "none" ||
                     ![regexp {^[0-9a-f]{64}$} $approved_sha]} {

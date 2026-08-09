@@ -1109,7 +1109,7 @@ def physical_interface_lock_contract(
         },
         "authority": "ens33-physical-interface",
         "held_for_entire_mode": True,
-        "shared_with": ["legacy-root-matrix-restore"],
+        "shared_with": [],
         "lock_order": ["physical-interface", "persistent-interface-owner"],
     }
 
@@ -1128,6 +1128,8 @@ def legacy_retirement_contract() -> dict[str, Any]:
         "creator": "root-stager-o-creat-o-excl",
         "accepted_state": "exact-empty-sentinel-only",
         "legacy_forward_authority": "retired-before-final-staging",
+        "legacy_controller_authority": "retired",
+        "historical_recovery": "frozen-original-package-before-final-staging",
     }
 
 
