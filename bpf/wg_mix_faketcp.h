@@ -326,7 +326,7 @@ static __always_inline int faketcp_nonzero_incarnation(const __u8 incarnation[16
 	return aggregate != 0;
 }
 
-static __always_inline int faketcp_session_metadata_valid(
+static __always_inline int faketcp_session_metadata_valid_locked(
 	const struct faketcp_session_value *session, __u64 generation)
 {
 	__u8 pad = 0;
@@ -352,7 +352,7 @@ static __always_inline int faketcp_session_admit_established(
 	int admitted;
 
 	bpf_spin_lock(&session->lock);
-	admitted = faketcp_session_metadata_valid(session, generation);
+	admitted = faketcp_session_metadata_valid_locked(session, generation);
 	bpf_spin_unlock(&session->lock);
 	return admitted;
 }
@@ -372,7 +372,7 @@ static __always_inline int faketcp_session_mutate(
 	    (operation == FAKETCP_SESSION_MUTATE_TX && !result))
 		return 0;
 	bpf_spin_lock(&session->lock);
-	admitted = faketcp_session_metadata_valid(session, generation) &&
+	admitted = faketcp_session_metadata_valid_locked(session, generation) &&
 		   session->revision != ~0ULL;
 	if (admitted) {
 		if (operation == FAKETCP_SESSION_MUTATE_TX) {
@@ -391,7 +391,7 @@ static __always_inline int faketcp_session_mutate(
 	return admitted;
 }
 
-static __always_inline int faketcp_session_matches_expected(
+static __always_inline int faketcp_session_matches_expected_locked(
 	const struct faketcp_session_value *session,
 	const struct faketcp_session_expected_value *expected,
 	int permit_claimed_state)
@@ -465,7 +465,7 @@ int wg_faketcp_session_claim(struct __sk_buff *skb)
 		return FAKETCP_CLAIM_ABSENT;
 
 	bpf_spin_lock(&session->lock);
-	if (faketcp_session_matches_expected(session, &request.expected, 1)) {
+	if (faketcp_session_matches_expected_locked(session, &request.expected, 1)) {
 		if (session->state == FAKETCP_STATE_ESTABLISHED)
 			session->state = FAKETCP_STATE_DELETE_CLAIMED;
 		result = FAKETCP_CLAIMED;

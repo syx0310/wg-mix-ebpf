@@ -570,7 +570,7 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 		"SEC(\"classifier/faketcp_session_claim\")",
 		"int wg_faketcp_session_claim(struct __sk_buff *skb)",
 		"session->state = FAKETCP_STATE_DELETE_CLAIMED",
-		"faketcp_session_matches_expected(session, &request.expected, 1)",
+		"faketcp_session_matches_expected_locked(session, &request.expected, 1)",
 		"expected->revision != 0",
 		"expected->session_id != 0",
 		"expected->runtime_incarnation",
@@ -623,7 +623,7 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 	if mutationStart < 0 {
 		t.Fatal("shared FakeTCP session mutation helper is missing")
 	}
-	mutationEnd := strings.Index(text[mutationStart:], "\n}\n\nstatic __always_inline int faketcp_session_matches_expected")
+	mutationEnd := strings.Index(text[mutationStart:], "\n}\n\nstatic __always_inline int faketcp_session_matches_expected_locked")
 	if mutationEnd < 0 {
 		t.Fatal("shared FakeTCP session mutation helper end is missing")
 	}
@@ -655,7 +655,7 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 	}
 	claim := text[claimStart : claimStart+claimEnd]
 	lock := strings.Index(claim, "bpf_spin_lock(&session->lock)")
-	compare := strings.Index(claim, "faketcp_session_matches_expected")
+	compare := strings.Index(claim, "faketcp_session_matches_expected_locked")
 	tombstone := strings.Index(claim, "session->state = FAKETCP_STATE_DELETE_CLAIMED")
 	unlock := strings.Index(claim, "bpf_spin_unlock(&session->lock)")
 	if lock < 0 || compare < 0 || tombstone < 0 || unlock < 0 ||

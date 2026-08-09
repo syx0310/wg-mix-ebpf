@@ -44,7 +44,6 @@ const (
 	// FakeTCPStateDeleteClaimed is a kernel-owned tombstone. Packet programs
 	// may observe it, but userspace must never insert it as live state.
 	FakeTCPStateDeleteClaimed uint8 = 4
-	FakeTCPStateClosing             = FakeTCPStateDeleteClaimed
 
 	FakeTCPEventNeedHandshake uint8 = 1
 	FakeTCPEventSYN           uint8 = 2

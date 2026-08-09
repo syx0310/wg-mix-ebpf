@@ -638,7 +638,7 @@ func TestLinuxSessionStoreRejectsInvalidValuesReadFromMap(t *testing.T) {
 		mutate func(*abi.FakeTCPSessionValue)
 	}{
 		{name: "generation", mutate: func(value *abi.FakeTCPSessionValue) { value.Generation++ }},
-		{name: "state", mutate: func(value *abi.FakeTCPSessionValue) { value.State = abi.FakeTCPStateClosing }},
+		{name: "state", mutate: func(value *abi.FakeTCPSessionValue) { value.State = abi.FakeTCPStateDeleteClaimed }},
 		{name: "flags", mutate: func(value *abi.FakeTCPSessionValue) { value.Flags = 1 }},
 		{name: "reserved", mutate: func(value *abi.FakeTCPSessionValue) { value.Reserved[0] = 1 }},
 		{name: "kernel lock", mutate: func(value *abi.FakeTCPSessionValue) { value.KernelLock = 1 }},
