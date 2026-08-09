@@ -626,31 +626,14 @@ def nic_stat_keys(data: bytes) -> list[str]:
     return sorted(set(keys))
 
 
-def collect_snapshot(
-    spec: CoreSpec,
-    runner: CommandRunner,
-    *,
-    expected_mtu: int | None = None,
-    allowed_mtu: frozenset[int] | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
-    raw: dict[str, bytes] = {}
-    commands: list[dict[str, Any]] = []
-    for label, argv in snapshot_command_table(spec):
-        rc, stdout, stderr = runner.capture(argv)
-        commands.append({"label": label, "argv": argv, "timeout_seconds": 20, "write_set": []})
-        if rc != 0:
-            detail = stderr.decode("utf-8", "replace").strip()
-            raise HarnessError(f"read-only snapshot {label} failed rc={rc}: {detail}")
-        raw[label] = stdout
-
+def parse_owned_snapshot(spec: CoreSpec, raw: Mapping[str, bytes]) -> dict[str, Any]:
     driver = parse_key_values(raw["driver"], "ethtool driver")
     stat_value = single_line(raw["device_stat"], "device-stat")
     try:
         device_dev, device_ino = (int(part) for part in stat_value.split(":"))
     except (ValueError, TypeError) as exc:
         raise HarnessError("device-stat is not decimal dev:inode") from exc
-
-    snapshot = {
+    return {
         "host": {
             "hostname": single_line(raw["hostname"], "hostname"),
             "kernel": single_line(raw["kernel"], "kernel"),
@@ -671,6 +654,28 @@ def collect_snapshot(
         },
         "features": parse_features(raw["features"]),
         "link": stable_sort(parse_json_output(raw["link"], "ip link")),
+    }
+
+
+def collect_snapshot(
+    spec: CoreSpec,
+    runner: CommandRunner,
+    *,
+    expected_mtu: int | None = None,
+    allowed_mtu: frozenset[int] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    raw: dict[str, bytes] = {}
+    commands: list[dict[str, Any]] = []
+    for label, argv in snapshot_command_table(spec):
+        rc, stdout, stderr = runner.capture(argv)
+        commands.append({"label": label, "argv": argv, "timeout_seconds": 20, "write_set": []})
+        if rc != 0:
+            detail = stderr.decode("utf-8", "replace").strip()
+            raise HarnessError(f"read-only snapshot {label} failed rc={rc}: {detail}")
+        raw[label] = stdout
+
+    snapshot = parse_owned_snapshot(spec, raw)
+    snapshot.update({
         "addresses": normalize_addresses(parse_json_output(raw["addresses"], "ip address")),
         "routes": normalize_routes(parse_json_output(raw["routes"], "ip routes")),
         "peer_route": normalize_routes(parse_json_output(raw["peer_route"], "peer route")),
@@ -682,7 +687,7 @@ def collect_snapshot(
         "bpf_maps": normalize_bpf(parse_json_output(raw["bpf_maps"], "bpf maps"), "maps"),
         "wg_interfaces": sorted(raw["wg_interfaces"].decode("utf-8").split()),
         "nic_stat_keys": nic_stat_keys(raw["nic_stats"]),
-    }
+    })
     validate_snapshot_identity(spec, snapshot, expected_mtu=expected_mtu, allowed_mtu=allowed_mtu)
     return snapshot, commands
 
@@ -693,6 +698,7 @@ def validate_snapshot_identity(
     *,
     expected_mtu: int | None = None,
     allowed_mtu: frozenset[int] | None = None,
+    require_peer_route: bool = True,
 ) -> None:
     expected_host = {
         "hostname": spec.expected_hostname,
@@ -726,11 +732,131 @@ def validate_snapshot_identity(
         mismatches.append("mtu")
     if mismatches:
         raise HarnessError(f"interface identity mismatch: {','.join(mismatches)}")
-    peer_routes = snapshot.get("peer_route")
-    if not isinstance(peer_routes, list) or not peer_routes:
-        raise HarnessError("peer route is empty")
-    if not any(item.get("dev") == spec.interface for item in peer_routes if isinstance(item, dict)):
-        raise HarnessError("peer route does not use the reviewed interface")
+    if require_peer_route:
+        peer_routes = snapshot.get("peer_route")
+        if not isinstance(peer_routes, list) or not peer_routes:
+            raise HarnessError("peer route is empty")
+        if not any(item.get("dev") == spec.interface for item in peer_routes if isinstance(item, dict)):
+            raise HarnessError("peer route does not use the reviewed interface")
+
+
+RESTORE_REQUIRED_LABELS = frozenset(
+    {
+        "hostname",
+        "kernel",
+        "machine_id",
+        "boot_id",
+        "netns",
+        "ifindex",
+        "mac",
+        "mtu",
+        "device_path",
+        "device_stat",
+        "driver",
+        "features",
+        "link",
+    }
+)
+
+RESTORE_DIAGNOSTIC_FIELDS = {
+    "addresses": "addresses",
+    "routes": "routes",
+    "peer_route": "peer_route",
+    "qdisc": "qdisc",
+    "tc_ingress": "tc_ingress",
+    "tc_egress": "tc_egress",
+    "bpf_links": "bpf_links",
+    "bpf_programs": "bpf_programs",
+    "bpf_maps": "bpf_maps",
+    "wg_interfaces": "wg_interfaces",
+    "nic_stats": "nic_stat_keys",
+}
+
+
+def parse_restore_diagnostic(label: str, payload: bytes) -> Any:
+    if label == "addresses":
+        return normalize_addresses(parse_json_output(payload, "ip address"))
+    if label in {"routes", "peer_route"}:
+        return normalize_routes(parse_json_output(payload, label.replace("_", " ")))
+    if label in {"qdisc", "tc_ingress", "tc_egress"}:
+        return stable_sort(parse_json_output(payload, label.replace("_", " ")))
+    if label in {"bpf_links", "bpf_programs", "bpf_maps"}:
+        return normalize_bpf(
+            parse_json_output(payload, label.replace("_", " ")),
+            label.removeprefix("bpf_"),
+        )
+    if label == "wg_interfaces":
+        try:
+            return sorted(payload.decode("utf-8").split())
+        except UnicodeDecodeError as exc:
+            raise HarnessError("wg interfaces output is not UTF-8") from exc
+    if label == "nic_stats":
+        try:
+            return nic_stat_keys(payload)
+        except UnicodeDecodeError as exc:
+            raise HarnessError("NIC statistics output is not UTF-8") from exc
+    raise HarnessError(f"unknown restore diagnostic label: {label}")
+
+
+def collect_restore_snapshot(
+    spec: CoreSpec,
+    runner: CommandRunner,
+    baseline: Mapping[str, Any],
+    *,
+    allowed_mtu: frozenset[int] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    raw: dict[str, bytes] = {}
+    commands: list[dict[str, Any]] = []
+    observations: dict[str, dict[str, Any]] = {}
+    for label, argv in snapshot_command_table(spec):
+        rc, stdout, stderr = runner.capture(argv, timeout=20)
+        commands.append({"label": label, "argv": argv, "timeout_seconds": 20, "write_set": []})
+        if label in RESTORE_REQUIRED_LABELS:
+            if rc != 0:
+                detail = stderr.decode("utf-8", "replace").strip()
+                raise HarnessError(f"restore identity snapshot {label} failed rc={rc}: {detail}")
+            raw[label] = stdout
+            continue
+
+        observation: dict[str, Any] = {
+            "rc": rc,
+            "stdout_bytes": len(stdout),
+            "stdout_sha256": sha256_bytes(stdout),
+            "stderr_bytes": len(stderr),
+            "stderr_sha256": sha256_bytes(stderr),
+        }
+        baseline_field = RESTORE_DIAGNOSTIC_FIELDS[label]
+        if rc != 0:
+            observation["status"] = "command-failed"
+        else:
+            try:
+                normalized = parse_restore_diagnostic(label, stdout)
+            except HarnessError as exc:
+                observation["status"] = "unparseable"
+                observation["reason"] = str(exc)
+            else:
+                normalized_payload = canonical_json(normalized)
+                observation["normalized_sha256"] = sha256_bytes(normalized_payload)
+                observation["baseline_sha256"] = sha256_bytes(canonical_json(baseline[baseline_field]))
+                observation["status"] = (
+                    "baseline-match" if normalized == baseline[baseline_field] else "unrelated-drift"
+                )
+        observations[label] = observation
+
+    snapshot = parse_owned_snapshot(spec, raw)
+    validate_snapshot_identity(
+        spec,
+        snapshot,
+        allowed_mtu=allowed_mtu,
+        require_peer_route=False,
+    )
+    diagnostics = {
+        "observations": observations,
+        "drift_labels": sorted(
+            label for label, observation in observations.items() if observation["status"] != "baseline-match"
+        ),
+    }
+    return snapshot, commands, diagnostics
 
 
 def lease_identity(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
@@ -2745,6 +2871,63 @@ def validate_fully_restored(baseline: Mapping[str, Any], current: Mapping[str, A
         raise HarnessError(f"full baseline restoration mismatch: {','.join(different)}")
 
 
+def validate_restore_owned_scope(
+    baseline: Mapping[str, Any],
+    current: Mapping[str, Any],
+    cell: Mapping[str, Any] | None = None,
+) -> None:
+    if current["host"] != baseline["host"]:
+        raise HarnessError("restore host or network namespace identity changed")
+    baseline_identity = dict(baseline["interface_identity"])
+    current_identity = dict(current["interface_identity"])
+    baseline_mtu = int(baseline_identity.pop("mtu"))
+    current_mtu = int(current_identity.pop("mtu"))
+    if current_identity != baseline_identity:
+        raise HarnessError("restore interface identity changed")
+    if scrub_key(current["link"], "mtu") != scrub_key(baseline["link"], "mtu"):
+        raise HarnessError("restore interface link identity changed outside MTU")
+
+    target_mtu = baseline_mtu if cell is None else int(cell["expected_mtu"])
+    if current_mtu not in {baseline_mtu, target_mtu}:
+        raise HarnessError("restore MTU is outside its baseline/target receipt")
+    expected_features = None if cell is None else cell.get("expected_primary_features")
+    for name in FEATURE_ORDER:
+        baseline_entry = baseline["features"].get(name)
+        current_entry = current["features"].get(name)
+        if not isinstance(baseline_entry, dict) or not isinstance(current_entry, dict):
+            raise HarnessError(f"restore feature receipt is absent for {name}")
+        if current_entry.get("fixed") != baseline_entry.get("fixed"):
+            raise HarnessError(f"restore feature fixed-state changed for {name}")
+        baseline_enabled = bool(baseline_entry.get("enabled"))
+        target_enabled = (
+            baseline_enabled if expected_features is None else bool(expected_features[name])
+        )
+        if bool(current_entry.get("enabled")) not in {baseline_enabled, target_enabled}:
+            raise HarnessError(f"restore feature {name} is outside its baseline/target receipt")
+
+
+def append_restore_diagnostics(
+    journal: Journal,
+    phase: str,
+    diagnostics: Mapping[str, Any],
+) -> None:
+    journal.append(
+        "RESTORE_UNRELATED_DIAGNOSTICS",
+        phase=phase,
+        drift_labels=diagnostics["drift_labels"],
+        observations=diagnostics["observations"],
+    )
+
+
+def restore_owned_evidence(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "host": snapshot["host"],
+        "interface_identity": snapshot["interface_identity"],
+        "link": snapshot["link"],
+        "features": {name: snapshot["features"][name] for name in FEATURE_ORDER},
+    }
+
+
 def plan_cell(plan: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     for cell in plan["cells"]:
         if cell["name"] == name:
@@ -2969,8 +3152,10 @@ def restore_with_interface_lease(
             release_needed = not lease.same_owner_released()
             if release_needed:
                 lease.require_restore_owner()
-            current, _ = collect_snapshot(spec, runner)
-            validate_fully_restored(baseline, current)
+            current, _, diagnostics = collect_restore_snapshot(spec, runner, baseline)
+            if diagnostics["drift_labels"]:
+                append_restore_diagnostics(journal, "terminal-complete", diagnostics)
+            validate_restore_owned_scope(baseline, current)
             if release_needed:
                 lease.release()
                 journal.append("INTERFACE_LEASE_RELEASED", path=lease.path, terminal_restore=True)
@@ -2986,8 +3171,10 @@ def restore_with_interface_lease(
                 lease.require_restore_owner()
             if not os.path.lexists(marker_path) or read_regular_file(marker_path) != marker_payload:
                 raise HarnessError("completed explicit restore has no exact marker")
-            current, _ = collect_snapshot(spec, runner)
-            validate_fully_restored(baseline, current)
+            current, _, diagnostics = collect_restore_snapshot(spec, runner, baseline)
+            if diagnostics["drift_labels"]:
+                append_restore_diagnostics(journal, "terminal-explicit-restored", diagnostics)
+            validate_restore_owned_scope(baseline, current)
             if release_needed:
                 lease.release()
                 journal.append("INTERFACE_LEASE_RELEASED", path=lease.path, terminal_restore=True)
@@ -3008,17 +3195,20 @@ def restore_with_interface_lease(
         lease.require_restore_owner()
         attempt = 1 + sum(event.get("event") == "EXPLICIT_RESTORE_INTENT" for event in journal.events)
         if active is None:
-            current, _ = collect_snapshot(spec, runner)
-            validate_fully_restored(baseline, current)
+            current, _, diagnostics = collect_restore_snapshot(spec, runner, baseline)
+            append_restore_diagnostics(journal, "explicit-restore-start", diagnostics)
+            validate_restore_owned_scope(baseline, current)
             journal.append("EXPLICIT_RESTORE_INTENT", attempt=attempt, cell=None, exact_reverse_argv=[])
         else:
             cell = plan_cell(plan, active)
-            current, _ = collect_snapshot(
+            current, _, diagnostics = collect_restore_snapshot(
                 spec,
                 runner,
+                baseline,
                 allowed_mtu=frozenset({spec.expected_mtu, int(cell["expected_mtu"])}),
             )
-            validate_scoped_snapshot(baseline, current, cell, allow_partial=True)
+            append_restore_diagnostics(journal, "explicit-restore-start", diagnostics)
+            validate_restore_owned_scope(baseline, current, cell)
             journal.append(
                 "EXPLICIT_RESTORE_INTENT",
                 attempt=attempt,
@@ -3036,9 +3226,13 @@ def restore_with_interface_lease(
                     lease=lease,
                 )
                 journal.append("EXPLICIT_RESTORE_APPLIED", attempt=attempt, cell=active, index=index)
-        restored, _ = collect_snapshot(spec, runner)
-        validate_fully_restored(baseline, restored)
-        write_idempotent_exact(f"{spec.run_root}/explicit-restored-snapshot.json", canonical_json(restored))
+        restored, _, diagnostics = collect_restore_snapshot(spec, runner, baseline)
+        append_restore_diagnostics(journal, "explicit-restore-finish", diagnostics)
+        validate_restore_owned_scope(baseline, restored)
+        write_idempotent_exact(
+            f"{spec.run_root}/explicit-restored-snapshot.json",
+            canonical_json(restore_owned_evidence(restored)),
+        )
         write_idempotent_exact(marker_path, marker_payload)
         if active is not None:
             journal.append("CELL_RESTORED", attempt=attempt, cell=active, explicit=True)

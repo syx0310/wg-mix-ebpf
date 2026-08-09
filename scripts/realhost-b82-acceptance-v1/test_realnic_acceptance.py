@@ -99,6 +99,7 @@ class SimulatedRunner(FixtureRunner):
         self.fail_ethtool_write_call = None
         self.ifindex_reads = 0
         self.fail_ifindex_read = None
+        self.read_failures = set()
         self.started = []
 
     def feature_output(self):
@@ -232,6 +233,8 @@ class SimulatedRunner(FixtureRunner):
                 return 1, b"1 packets transmitted, 0 received, 100% packet loss\n", b""
             return 0, b"3 packets transmitted, 3 received, 0% packet loss\n", b""
         key = tuple(argv)
+        if key in self.read_failures:
+            return 1, b"", b"injected unrelated read failure\n"
         if key not in self.outputs:
             raise AssertionError(f"unexpected command {argv!r}")
         return 0, self.outputs[key], b""
@@ -964,6 +967,50 @@ class HermeticStateMachineTests(unittest.TestCase):
             truncated = next(index for index, event in enumerate(events) if event["event"] == "JOURNAL_TAIL_TRUNCATED")
             restore_intent = next(index for index, event in enumerate(events) if event["event"] == "EXPLICIT_RESTORE_INTENT")
             self.assertLess(truncated, restore_intent)
+
+    def test_explicit_restore_audits_but_ignores_unrelated_host_drift(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=10)
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                with self.assertRaises(MODULE.HarnessError):
+                    MODULE.run_mode(spec, plan_path, digest, runner)
+                self.assertTrue(runner.features["tx-udp-segmentation"])
+
+                runner.outputs[(MODULE.TOOLS["bpftool"], "-j", "link", "show")] = MODULE.canonical_json(
+                    [{"id": 81, "type": "xdp", "prog_id": 91, "ifindex": 9}]
+                )
+                runner.outputs[
+                    (MODULE.TOOLS["ip"], "-j", "route", "show", "table", "all", "dev", spec.interface)
+                ] = MODULE.canonical_json(
+                    [{"dst": "198.51.100.0/24", "dev": spec.interface, "protocol": "static"}]
+                )
+                runner.outputs[(MODULE.TOOLS["tc"], "-j", "qdisc", "show", "dev", spec.interface)] = (
+                    MODULE.canonical_json([{"kind": "fq_codel", "handle": "0:"}])
+                )
+                runner.outputs[(MODULE.TOOLS["wg"], "show", "interfaces")] = b"wg0 wg-diagnostic\n"
+                peer_route_argv = (MODULE.TOOLS["ip"], "-j", "route", "get", spec.peer_address)
+                runner.read_failures.add(peer_route_argv)
+
+                self.assertEqual(MODULE.restore_mode(spec, plan_path, digest, runner), 0)
+                self.assertEqual(MODULE.restore_mode(spec, plan_path, digest, runner), 0)
+
+            self.assertFalse(runner.features["tx-udp-segmentation"])
+            events = [
+                json.loads(line)
+                for line in pathlib.Path(spec.run_root, "journal.jsonl").read_bytes().splitlines()
+            ]
+            diagnostics = [
+                event for event in events if event["event"] == "RESTORE_UNRELATED_DIAGNOSTICS"
+            ]
+            self.assertGreaterEqual(len(diagnostics), 3)
+            for event in diagnostics:
+                self.assertTrue(
+                    {"bpf_links", "peer_route", "qdisc", "routes", "wg_interfaces"}
+                    <= set(event["drift_labels"])
+                )
+            self.assertEqual(diagnostics[0]["observations"]["peer_route"]["status"], "command-failed")
 
 
 class JournalDurabilityTests(unittest.TestCase):
