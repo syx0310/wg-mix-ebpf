@@ -169,26 +169,26 @@ apt_plan_has_forbidden_changes() {
 }
 
 if [[ "${MODE}" == "self-test" ]]; then
-  if printf '%s\n' 'Inst new-package (1.0 repository)' |
-    apt_plan_has_forbidden_changes; then
-    echo "error: fresh package install was rejected" >&2
-    exit 1
-  fi
-  if ! printf '%s\n' 'Inst existing-package [1.0] (1.1 repository)' |
-    apt_plan_has_forbidden_changes; then
-    echo "error: package upgrade fixture was accepted" >&2
-    exit 1
-  fi
-  if ! printf '%s\n' 'Remv existing-package [1.0]' |
-    apt_plan_has_forbidden_changes; then
-    echo "error: package removal fixture was accepted" >&2
-    exit 1
-  fi
-  if ! printf '%s\n' 'Purg existing-package [1.0]' |
-    apt_plan_has_forbidden_changes; then
-    echo "error: package purge fixture was accepted" >&2
-    exit 1
-  fi
+  for fixture in 'Inst new-package (1.0 repository)' \
+    'Inst linux-headers-7.0.0-28-generic (1.0 repository)'; do
+    if apt_plan_has_forbidden_changes <<<"${fixture}"; then
+      echo "error: safe package fixture was rejected: ${fixture}" >&2
+      exit 1
+    fi
+  done
+  for fixture in 'Inst existing-package [1.0] (1.1 repository)' \
+    'Remv existing-package [1.0]' 'Purg existing-package [1.0]' \
+    'Inst grub-pc (1.0 repository)' \
+    'Inst initramfs-tools-core (1.0 repository)' \
+    'Inst linux-image-7.0.0-29-generic (1.0 repository)' \
+    'Inst linux-modules-extra-7.0.0-29-generic (1.0 repository)' \
+    'Inst shim-signed (1.0 repository)' \
+    'Inst systemd-boot-efi (1.0 repository)'; do
+    if ! apt_plan_has_forbidden_changes <<<"${fixture}"; then
+      echo "error: unsafe package fixture was accepted: ${fixture}" >&2
+      exit 1
+    fi
+  done
   echo "APT simulation gate self-test passed"
   exit 0
 fi
