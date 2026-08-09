@@ -39,12 +39,25 @@ def bash_array(payload: str, name: str) -> str:
 
 def tcl_proc(payload: str, name: str) -> str:
     match = re.search(
-        rf"(?ms)^proc {re.escape(name)} \{{[^\n]*\}} \{{\n(?P<body>.*?)^\}}\n",
+        rf"(?ms)^proc {re.escape(name)} \{{[^}}]*\}} \{{\n(?P<body>.*?)^\}}\n",
         payload,
     )
     if not match:
         fail(f"cannot isolate Tcl procedure {name}")
     return match.group("body")
+
+
+def python_function(payload: str, name: str) -> str:
+    match = re.search(rf"(?m)^def {re.escape(name)}\(", payload)
+    if not match:
+        fail(f"cannot isolate embedded Python function {name}")
+    start = match.start()
+    following = re.search(
+        r"(?m)^(?:def [A-Za-z_][A-Za-z0-9_]*\(|class [A-Za-z_][A-Za-z0-9_]*|try:\s*$)",
+        payload[start + 1 :],
+    )
+    end = len(payload) if not following else start + 1 + following.start()
+    return payload[start:end]
 
 
 def tcl_return_words(payload: str, name: str) -> tuple[str, ...]:
@@ -92,6 +105,9 @@ def main() -> None:
     fresh_path, fresh = read_regular(
         str(controller_path.with_name("root-fresh-verifier-gate.sh"))
     )
+    hermetic_path, hermetic = read_regular(
+        str(controller_path.with_name("test-hermetic-controller.sh"))
+    )
 
     production = {
         binder_path.name: binder,
@@ -100,9 +116,92 @@ def main() -> None:
         stager_path.name: stager,
         fresh_path.name: fresh,
     }
+    retire_id = "c8e41d73-2c690050ae1d-r1"
+    predecessor_commit = "2c690050ae1d69dbd074acfd612faa2b80e29f8a"
+    predecessor_manifest_sha = (
+        "21f14e1f7e646649fdad864dce23dce2055585962d92bfaba6e71158372c1ebe"
+    )
+    retired_bundle_sha = (
+        "5c53adec58363ec2ff51d9bd5dcd7e467874c839393178491c74b16a8c9f922c"
+    )
+    predecessor_local_package = (
+        "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-2c690050ae1d"
+    )
+    predecessor_remote_package = "/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61"
+    retirement_constant_contracts = {
+        controller_path.name: (
+            f"readonly PREDECESSOR_COMMIT='{predecessor_commit}'",
+            f"readonly PREDECESSOR_PACKAGE='{predecessor_local_package}'",
+            'readonly PREDECESSOR_MANIFEST="${PREDECESSOR_PACKAGE}/package-manifest.v1"',
+            f"readonly PREDECESSOR_MANIFEST_SHA256='{predecessor_manifest_sha}'",
+        ),
+        transport_path.name: (
+            f'set ::RETIRE_ID "{retire_id}"',
+            f'set ::PREDECESSOR_COMMIT "{predecessor_commit}"',
+            f'    "{predecessor_manifest_sha}"',
+            f'    "{predecessor_local_package}"',
+            '    "/home/siyixuan/wg-mix-ebpf-test/retire-prestage-${::RETIRE_ID}.intake"',
+            'set ::RETIREMENT_HOME_QROOT "/home/.wg-mix-ebpf-retirement-${::RETIRE_ID}"',
+            'set ::RETIREMENT_AUTH_ROOT "${::RETIREMENT_HOME_QROOT}/authority"',
+            "set ::RETIREMENT_AUTH_MANIFEST \\",
+            '    "${::RETIREMENT_AUTH_ROOT}/package-manifest.v1"',
+            "set ::RETIREMENT_AUTH_SELF \\",
+            '    "${::RETIREMENT_AUTH_ROOT}/prepare-stage-root.sh"',
+            'set ::RETIREMENT_Q_INTAKE "${::RETIREMENT_HOME_QROOT}/intake"',
+            'set ::RETIREMENT_Q_PACKAGE "${::RETIREMENT_HOME_QROOT}/package"',
+            'set ::RETIREMENT_RUN_QROOT "/run/wg-mix-ebpf-retirement-${::RETIRE_ID}"',
+            'set ::RETIREMENT_Q_BOOTSTRAP "${::RETIREMENT_RUN_QROOT}/bootstrap"',
+            'set ::RETIREMENT_LOCK "${::RETIREMENT_RUN_QROOT}/retirement.v1.lock"',
+            '    "${::RETIREMENT_RUN_QROOT}/retirement-complete.v1.pending"',
+            '    "${::RETIREMENT_RUN_QROOT}/retirement-complete.v1"',
+        ),
+        stager_path.name: (
+            f"readonly RETIRE_ID='{retire_id}'",
+            f"readonly PREDECESSOR_COMMIT='{predecessor_commit}'",
+            f"readonly PREDECESSOR_MANIFEST_SHA256='{predecessor_manifest_sha}'",
+            'readonly RETIREMENT_USER_INTAKE="/home/siyixuan/wg-mix-ebpf-test/retire-prestage-${RETIRE_ID}.intake"',
+            'readonly RETIREMENT_HOME_QROOT="/home/.wg-mix-ebpf-retirement-${RETIRE_ID}"',
+            'readonly RETIREMENT_AUTH_ROOT="${RETIREMENT_HOME_QROOT}/authority"',
+            'readonly RETIREMENT_AUTH_MANIFEST="${RETIREMENT_AUTH_ROOT}/package-manifest.v1"',
+            'readonly RETIREMENT_AUTH_SELF="${RETIREMENT_AUTH_ROOT}/prepare-stage-root.sh"',
+            'readonly RETIREMENT_Q_INTAKE="${RETIREMENT_HOME_QROOT}/intake"',
+            'readonly RETIREMENT_Q_PACKAGE="${RETIREMENT_HOME_QROOT}/package"',
+            'readonly RETIREMENT_RUN_QROOT="/run/wg-mix-ebpf-retirement-${RETIRE_ID}"',
+            'readonly RETIREMENT_Q_BOOTSTRAP="${RETIREMENT_RUN_QROOT}/bootstrap"',
+            'readonly RETIREMENT_LOCK="${RETIREMENT_RUN_QROOT}/retirement.v1.lock"',
+            'readonly RETIREMENT_RECEIPT_PENDING="${RETIREMENT_RUN_QROOT}/retirement-complete.v1.pending"',
+            'readonly RETIREMENT_RECEIPT_FINAL="${RETIREMENT_RUN_QROOT}/retirement-complete.v1"',
+        ),
+    }
+    retirement_sources = {
+        controller_path.name: controller,
+        transport_path.name: transport,
+        stager_path.name: stager,
+    }
+    for name, required_constants in retirement_constant_contracts.items():
+        payload = retirement_sources[name]
+        for literal in required_constants:
+            if payload.count(literal) != 1:
+                fail(f"{name} retirement constant is not unique and fixed: {literal!r}")
+        literal_digests = re.findall(r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", payload)
+        if literal_digests != [predecessor_manifest_sha]:
+            fail(f"{name} does not carry the sole predecessor-manifest digest literal")
+        if retired_bundle_sha in payload:
+            fail(f"{name} hard-codes the retired bundle digest outside its manifest")
+
+    executable_rmdir_pattern = r"(?<![A-Za-z0-9_-])rmdir(?=\s|\()"
+    if re.search(executable_rmdir_pattern, "no-unlink-no-rmdir-no-copy-fallback"):
+        fail("executable rmdir matcher rejects the exact retention receipt literal")
+    for executable_rmdir in (
+        "rmdir /fixed/path",
+        "/usr/bin/rmdir /fixed/path",
+        'os.rmdir("/fixed/path")',
+    ):
+        if not re.search(executable_rmdir_pattern, executable_rmdir):
+            fail("executable rmdir matcher no longer rejects an executable form")
     forbidden_patterns = (
         r"\brm\s+-[^\n]*r",
-        r"\brmdir\b",
+        executable_rmdir_pattern,
         r"\bfind\b[^\n]*-delete",
         r"\bxargs\b[^\n]*\brm\b",
         r"\brsync\b[^\n]*--delete",
@@ -656,11 +755,93 @@ def main() -> None:
         "prepare", "provision-apply", "realnic-run", "realnic-restore",
         "fresh-plan", "fresh-run", "fresh-restore", "veth-plan", "veth-run",
         "veth-restore", "routed-plan", "routed-run", "routed-restore",
+        "retire-prestage-2c690050", "verify-retirement",
     }
     if set(literal_executes) != allowed_executes or len(literal_executes) != len(allowed_executes):
         fail("controller retains direct primitive mutation sequencing")
+    controller_main = bash_function(controller, "main")
+    controller_retirement_executes = tuple(
+        re.findall(
+            r"run_operation execute (retire-prestage-2c690050|verify-retirement)",
+            controller_main,
+        )
+    )
+    if controller_retirement_executes != (
+        "retire-prestage-2c690050",
+        "verify-retirement",
+    ):
+        fail("controller does not expose exactly one retirement mutation and verification")
+    parse_arguments = bash_function(controller, "parse_arguments")
+    if parse_arguments.count(
+        "retire-prestage-2c690050 | verify-retirement) ;;"
+    ) != 1:
+        fail("controller retirement mode parser is not the exact two-mode surface")
+    if "retire-raw-" in controller or re.search(
+        r"run_operation execute (?:retire|verify-retirement)[a-z0-9-]+",
+        controller_main.replace(
+            "run_operation execute retire-prestage-2c690050", ""
+        ).replace("run_operation execute verify-retirement", ""),
+    ):
+        fail("controller exposes a private retirement primitive")
+    predecessor_authority = controller[
+        controller.index("verify_predecessor_manifest_contract() {") :
+        controller.index("\n}\n\nverify_retirement_local_authority() {")
+    ]
+    for literal in (
+        '[[ -f "${PREDECESSOR_MANIFEST}" && ! -L "${PREDECESSOR_MANIFEST}" ]]',
+        'sha256_file "${PREDECESSOR_MANIFEST}"',
+        'canonical_package="$(CDPATH=\'\' cd -- "${PREDECESSOR_PACKAGE}" && pwd -P)"',
+        "/usr/bin/python3 -B -I -c '",
+        'flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)',
+        "metadata = os.fstat(descriptor)",
+        "named = os.stat(path, follow_symlinks=False)",
+        "(metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino)",
+        "hashlib.sha256(payload).hexdigest() != expected_sha",
+        '"integration_commit": expected_commit',
+        '"local_package_dir": expected_package',
+        f'"remote_package_dir": "{predecessor_remote_package}"',
+        'for key in ("bundle_sha256", "prepare_stage_root_sh_sha256",',
+        '"${PREDECESSOR_MANIFEST}" "${PREDECESSOR_MANIFEST_SHA256}"',
+        '"${PREDECESSOR_COMMIT}" "${PREDECESSOR_PACKAGE}"',
+    ):
+        if predecessor_authority.count(literal) != 1:
+            fail(f"controller predecessor authority is missing exact gate {literal!r}")
+    local_retirement_authority = bash_function(
+        controller, "verify_retirement_local_authority"
+    )
+    ordered(
+        local_retirement_authority,
+        (
+            "verify_predecessor_manifest_contract || return $?",
+            "B82_V6_RETIREMENT_LOCAL_AUTHORITY",
+            "current_manifest_sha256=%s current_commit=%s",
+            "predecessor_commit=%s predecessor_manifest_sha256=%s",
+            "credential_read=0 network_operations=0",
+        ),
+        "controller retirement local authority",
+    )
+    if local_retirement_authority.count("verify_predecessor_manifest_contract") != 1:
+        fail("controller retirement modes do not share one predecessor authority gate")
+    ordered(
+        controller_main,
+        (
+            'parse_arguments "$@"',
+            "verify_manifest_contract || fail 'manifest-contract' $?",
+            "derive_approved_plan_path || fail 'approved-plan-binding' $?",
+            "retire-prestage-2c690050 | verify-retirement)",
+            "verify_retirement_local_authority || fail 'retirement-local-authority' $?",
+            "run_operation execute retire-prestage-2c690050",
+            "run_operation execute verify-retirement",
+        ),
+        "controller pre-transport current and predecessor authority",
+    )
+    if (
+        controller_main.count("verify_manifest_contract") != 1
+        or controller_main.count("verify_retirement_local_authority") != 1
+    ):
+        fail("controller duplicates or bypasses retirement pre-transport authority")
     verify_arm = re.search(
-        r"(?ms)^\s*verify-package\)\n(.*?)^\s*;;$", bash_function(controller, "main")
+        r"(?ms)^\s*verify-package\)\n(.*?)^\s*;;$", controller_main
     )
     if (
         not verify_arm
@@ -821,7 +1002,8 @@ def main() -> None:
     )
     expected_transactions = tuple(
         "prepare provision-apply fresh-run fresh-restore veth-run veth-restore "
-        "routed-run routed-restore realnic-run realnic-restore".split()
+        "routed-run routed-restore realnic-run realnic-restore "
+        "retire-prestage-2c690050".split()
     )
     if not transaction_match or tuple(transaction_match.group(1).split()) != expected_transactions:
         fail("transport high-level transaction set is not exact")
@@ -850,6 +1032,103 @@ def main() -> None:
     )
     if "{^(identity-|tool-|kernel-|stale-)}" in read_only:
         fail("transport read-only authority accepts an open-ended operation prefix")
+
+    retirement_mutation = tcl_proc(transport, "retirement_mutation_operation")
+    retirement_verification = tcl_proc(transport, "retirement_read_only_operation")
+    if retirement_mutation.strip() != (
+        'return [expr {$operation eq "retire-prestage-2c690050"}]'
+    ):
+        fail("transport retirement mutation classifier is not one exact high-level mode")
+    if retirement_verification.strip() != (
+        'return [expr {$operation eq "verify-retirement"}]'
+    ):
+        fail("transport retirement verification classifier is not one exact read-only mode")
+    if read_only.count("retirement_read_only_operation $operation") != 1:
+        fail("transport read-only surface does not admit only the fixed retirement verifier")
+
+    retirement_helper_argv = tcl_proc(transport, "retirement_helper_remote_argv")
+    ordered(
+        retirement_helper_argv,
+        (
+            'if {$mode ni {retire-prestage-2c690050 verify-retirement}}',
+            'return -code error "retirement-helper-mode"',
+            "return [list /bin/bash -p $::RETIREMENT_AUTH_SELF $mode",
+            "--manifest $::RETIREMENT_AUTH_MANIFEST",
+            "--manifest-sha256 $manifest_sha]",
+        ),
+        "fixed root retirement helper argv",
+    )
+    if any(
+        literal in retirement_helper_argv
+        for literal in ("RETIREMENT_USER_INTAKE", "PREDECESSOR_LOCAL_PACKAGE", "eval", "sh -c")
+    ):
+        fail("root retirement helper argv interprets a user-owned or caller-supplied script")
+
+    retirement_builder = tcl_proc(transport, "build_retirement_operation")
+    expected_retirement_raw_leaves = {
+        "retire-raw-auth-manifest-install",
+        "retire-raw-auth-root-create",
+        "retire-raw-auth-self-install",
+        "retire-raw-helper-mutate",
+        "retire-raw-home-qroot-create",
+        "retire-raw-intake-mkdir",
+        "retire-raw-link-auth-manifest",
+        "retire-raw-link-auth-self",
+        "retire-raw-run-qroot-create",
+        "retire-raw-scp-manifest",
+        "retire-raw-scp-self",
+        "retire-raw-sync-auth-manifest-pending",
+        "retire-raw-sync-auth-root",
+        "retire-raw-sync-auth-self-pending",
+        "retire-raw-sync-home-parent",
+        "retire-raw-sync-home-qroot",
+        "retire-raw-sync-intake-directory",
+        "retire-raw-sync-intake-manifest",
+        "retire-raw-sync-intake-parent",
+        "retire-raw-sync-intake-self",
+        "retire-raw-sync-run-parent",
+    }
+    actual_retirement_raw_leaves = set(
+        re.findall(r"\bretire-raw-[a-z0-9-]+\b", retirement_builder)
+    )
+    if actual_retirement_raw_leaves != expected_retirement_raw_leaves:
+        fail("transport private retirement raw-leaf set is not exact")
+    public_retirement_surface = "\n".join(
+        (
+            tcl_proc(transport, "transaction_operation"),
+            retirement_mutation,
+            retirement_verification,
+            read_only,
+            transport_main,
+        )
+    )
+    if any(leaf in public_retirement_surface for leaf in expected_retirement_raw_leaves):
+        fail("transport accepts a private retirement raw leaf at its CLI boundary")
+    retirement_primitive = tcl_proc(transport, "execute_retirement_primitive")
+    if transport.count("build_retirement_operation") != 2 or retirement_primitive.count(
+        "build_retirement_operation"
+    ) != 1:
+        fail("private retirement builder is reachable outside its sole executor")
+    if "retire-raw-lock" in retirement_builder or "retirement.v1.lock" in retirement_builder:
+        fail("transport contains an inline retirement-lock mutation leaf")
+    helper_builder = retirement_builder[
+        retirement_builder.index("retire-raw-helper-mutate - retire-ro-helper-verify") :
+    ]
+    ordered(
+        helper_builder,
+        (
+            'retire-raw-helper-mutate - retire-ro-helper-verify',
+            '"retire-prestage-2c690050" : "verify-retirement"',
+            "[list /usr/bin/sudo --] [env_argv]",
+            "[retirement_helper_remote_argv $values $manifest_sha $helper_mode]",
+        ),
+        "root AUTH_SELF helper transport branch",
+    )
+    if re.search(
+        r"/bin/bash[^\n]*(?:RETIREMENT_USER_INTAKE|retire-prestage-.*\.intake)",
+        transport,
+    ):
+        fail("transport executes the user-owned retirement intake self")
 
     list_pairs = (
         ("BASE_IDENTITY_OPERATIONS", "base_identity_operations"),
@@ -923,6 +1202,308 @@ def main() -> None:
         ),
         "credential-front transaction/prebuild seam",
     )
+    predecessor_transport_authority = tcl_proc(
+        transport, "require_retirement_predecessor_authority"
+    )
+    ordered(
+        predecessor_transport_authority,
+        (
+            'set manifest "${::PREDECESSOR_LOCAL_PACKAGE}/package-manifest.v1"',
+            "load_manifest $manifest $::PREDECESSOR_MANIFEST_SHA256",
+            "validate_manifest_values $values",
+            "[dict get $values integration_commit] ne $::PREDECESSOR_COMMIT",
+            "[dict get $values local_package_dir] ne $::PREDECESSOR_LOCAL_PACKAGE",
+            f'"{predecessor_remote_package}"',
+            "require_manifest_authority $values $::PREDECESSOR_MANIFEST_SHA256",
+            "B82_V6_RETIREMENT_PREDECESSOR_AUTHORITY",
+            "credential_read=0 network_operations=0",
+            "return $values",
+        ),
+        "transport predecessor pre-credential authority",
+    )
+    ordered(
+        transport_main,
+        (
+            "set prebuilt_operation_spec {}",
+            "set predecessor_values {}",
+            "require_transaction_local_authority $values $manifest_sha $operation $approved_sha",
+            "set predecessor_values [require_retirement_predecessor_authority]",
+            '} elseif {[retirement_read_only_operation $operation]}',
+            "require_transaction_local_authority $values $manifest_sha $operation $approved_sha",
+            "set predecessor_values [require_retirement_predecessor_authority]",
+            "set password [read_execute_credential $credential_path]",
+            "execute_retirement_transaction $values $manifest_sha",
+            '} elseif {[retirement_read_only_operation $operation]}',
+            "execute_retirement_verify_transaction $values $manifest_sha",
+        ),
+        "direct retirement invocation authority-before-credential seam",
+    )
+    credential_prefix = transport_main[: transport_main.index(
+        "set password [read_execute_credential $credential_path]"
+    )]
+    if (
+        credential_prefix.count("require_transaction_local_authority") != 2
+        or credential_prefix.count("require_retirement_predecessor_authority") != 2
+        or "execute_retirement_transaction" in credential_prefix
+        or "execute_retirement_verify_transaction" in credential_prefix
+    ):
+        fail("transport retirement authority does not fail closed before credential read")
+
+    retirement_stale = tcl_proc(transport, "retirement_stale_operations")
+    ordered(
+        retirement_stale,
+        (
+            "foreach operation [prepare_stale_operations]",
+            'if {$operation ni {stale-package-root stale-bootstrap-root}}',
+            "lappend operations $operation",
+            "[llength $operations] != 28",
+            'return -code error "retirement-stale-cardinality"',
+            "return $operations",
+        ),
+        "retirement exact 28-item stale projection",
+    )
+    if tuple(tcl_return_words(transport, "base_identity_operations")) != tuple(
+        bash_array(controller, "BASE_IDENTITY_OPERATIONS").split()
+    ) or len(tcl_return_words(transport, "base_identity_operations")) != 5:
+        fail("retirement common gate base identity set is not the fixed five")
+    if tuple(expected_stale_operations[2:]) != tuple(
+        item
+        for item in expected_stale_operations
+        if item not in {"stale-package-root", "stale-bootstrap-root"}
+    ):
+        fail("static stale fixture does not define the expected retirement projection")
+    common_gate = tcl_proc(transport, "execute_retirement_common_gate")
+    ordered(
+        common_gate,
+        (
+            "foreach operation [base_identity_operations]",
+            "transaction_step $values $manifest_sha $operation none $password",
+            "set stale_operations [retirement_stale_operations]",
+            "set total [llength $stale_operations]",
+            "foreach operation $stale_operations",
+            "execute_primitive $values $manifest_sha $operation none $password",
+            "B82_V6_RETIREMENT_STALE_SUMMARY items=$total checked=$total absent=$total",
+            "B82_V6_RETIREMENT_COMMON_GATE identities=5 stale_absent=28 writes=0 result=PASS",
+        ),
+        "retirement 5+28 common gate",
+    )
+    if (
+        common_gate.count("foreach operation [base_identity_operations]") != 1
+        or common_gate.count("foreach operation $stale_operations") != 1
+    ):
+        fail("retirement common gate does not execute each fixed set exactly once")
+
+    predecessor_gate = tcl_proc(transport, "execute_retirement_predecessor_gate")
+    package_names = tcl_return_words(transport, "package_names")
+    if len(package_names) != 17 or len(set(package_names)) != 17:
+        fail("retirement predecessor package authority is not the exact 17 files")
+    ordered(
+        predecessor_gate,
+        (
+            "transaction_step $values $manifest_sha package-parent-stat none $password",
+            "retire-ro-old-package-readlink retire-ro-old-package-stat",
+            "retire-ro-old-package-entries",
+            "foreach name [package_names]",
+            '"verify-sha-$name"',
+            '"verify-stat-$name"',
+            "bootstrap-root-readlink bootstrap-root-stat",
+            "bootstrap-provisioner-readlink bootstrap-provisioner-stat",
+            "bootstrap-provisioner-sha bootstrap-stager-readlink bootstrap-stager-stat",
+            "bootstrap-stager-sha",
+            "retire-ro-old-bootstrap-entries",
+            "provision-check $password",
+            'if {[lindex $provision_result 3] ne "none"}',
+            "package_files=17 bootstrap_files=2 provision_missing=none writes=0 result=PASS",
+        ),
+        "retirement predecessor remote authority gate",
+    )
+    for operation, assertion in (
+        ("retire-ro-old-package-entries", "[package_names]"),
+        (
+            "retire-ro-old-bootstrap-entries",
+            "{prepare-stage-root.sh provision-ubuntu-test-host.sh}",
+        ),
+    ):
+        branch = retirement_builder[retirement_builder.index(operation) :]
+        branch = branch[: branch.index("}", branch.index("set assertion")) + 1]
+        if assertion not in branch:
+            fail(f"retirement predecessor no-extra entry assertion drifted: {operation}")
+
+    retirement_transaction = tcl_proc(transport, "execute_retirement_transaction")
+    ordered(
+        retirement_transaction,
+        (
+            "set state [retirement_authority_state",
+            'if {$state ne "complete"}',
+            "execute_retirement_common_gate $values $manifest_sha $password",
+            "execute_retirement_predecessor_gate $values $manifest_sha",
+            "retirement_ensure_delivery $values $manifest_sha",
+            "retirement_converge_delivery_durability $values $manifest_sha",
+            "retirement_ensure_authority $values $manifest_sha $predecessor_values",
+            "execute_retirement_common_gate $values $manifest_sha $password",
+            "retire-raw-helper-mutate $password",
+            "retire-ro-helper-verify $password",
+            "B82_V6_RETIREMENT_TRANSACTION_COMPLETE",
+        ),
+        "single retirement high-level transaction",
+    )
+    if retirement_transaction.count("execute_retirement_common_gate") != 2:
+        fail("retirement mutation does not gate both initial and complete-authority retries")
+    final_common_gate = retirement_transaction.rindex(
+        "execute_retirement_common_gate $values $manifest_sha $password"
+    )
+    helper_mutation = retirement_transaction.index(
+        "retire-raw-helper-mutate $password", final_common_gate
+    )
+    between_gate_and_mutation = retirement_transaction[
+        final_common_gate:helper_mutation
+    ]
+    if (
+        between_gate_and_mutation.count("retirement_step") != 1
+        or "retirement_ensure_" in between_gate_and_mutation
+        or "execute_retirement_predecessor_gate" in between_gate_and_mutation
+    ):
+        fail("5+28 common gate is not immediately before every helper mutation retry")
+    retirement_verify_transaction = tcl_proc(
+        transport, "execute_retirement_verify_transaction"
+    )
+    ordered(
+        retirement_verify_transaction,
+        (
+            "set state [retirement_authority_state",
+            'if {$state ne "complete"}',
+            'fail "retirement-verify-authority-state" 78',
+            "retire-ro-helper-verify $password",
+            "state=T mutations=0",
+        ),
+        "read-only retirement verification transaction",
+    )
+    if "retire-raw-" in retirement_verify_transaction:
+        fail("verify-retirement can reach a raw mutation leaf")
+
+    intake_prefix = tcl_proc(transport, "retirement_require_intake_prefix")
+    ordered(
+        intake_prefix,
+        (
+            "retirement_local_delivery_file $values $manifest_sha $name",
+            "file lstat $local_path local_stat",
+            "retirement_observe_user_file_size",
+            "retirement_observe_sha",
+            'if {$remote_sha eq $expected_sha}',
+            "return exact",
+            "$remote_size > $local_stat(size)",
+            "file_prefix_sha256 $local_path $remote_size",
+            "$remote_sha ne $prefix_sha",
+            'fail "retirement-intake-nonprefix" 78',
+            "retirement_local_delivery_file $values $manifest_sha $name",
+            "foreach field {dev ino size mode nlink uid gid type}",
+            'fail "retirement-intake-local-drift" 66',
+            "return prefix",
+        ),
+        "manifest-bound empty-or-exact-prefix intake proof",
+    )
+    retirement_delivery = tcl_proc(transport, "retirement_ensure_delivery")
+    ordered(
+        retirement_delivery,
+        (
+            'if {$entries eq {}}',
+            "retire-raw-scp-manifest",
+            "retirement_require_intake_prefix $values $manifest_sha",
+            'if {$prefix_state eq "prefix"}',
+            "retire-raw-scp-manifest",
+            'if {[retirement_require_intake_prefix $values $manifest_sha',
+            'package-manifest.v1 $password] ne "exact"}',
+            'fail "retirement-intake-earlier-prefix" 78',
+            "retirement_require_intake_prefix $values $manifest_sha",
+            "prepare-stage-root.sh $password",
+            "retire-raw-scp-self",
+            "retire-ro-intake-manifest-stat retire-ro-intake-manifest-sha",
+            "retire-ro-intake-self-stat retire-ro-intake-self-sha",
+            '"retirement-intake-final-entries"',
+        ),
+        "prefix-only retirement intake delivery",
+    )
+    delivery_durability = tcl_proc(
+        transport, "retirement_converge_delivery_durability"
+    )
+    ordered(
+        delivery_durability,
+        (
+            "retire-raw-sync-intake-manifest retire-raw-sync-intake-self",
+            "retire-raw-sync-intake-directory retire-raw-sync-intake-parent",
+            "package-parent-stat",
+            "retire-ro-intake-readlink retire-ro-intake-stat",
+            "retire-ro-intake-manifest-stat retire-ro-intake-manifest-sha",
+            "retire-ro-intake-self-stat retire-ro-intake-self-sha",
+            '"retirement-intake-postsync-entries"',
+            "B82_V6_RETIREMENT_INTAKE_DURABLE files=2 directories=2 postcheck=exact",
+        ),
+        "retirement intake file/directory/parent durability convergence",
+    )
+
+    for proc_name, mode, pair_operation in (
+        ("retirement_verify_manifest_pair", "600", "retire-ro-auth-manifest-pair"),
+        ("retirement_verify_self_pair", "700", "retire-ro-auth-self-pair"),
+    ):
+        pair_body = tcl_proc(transport, proc_name)
+        if pair_operation not in pair_body:
+            fail(f"retirement authority pair verifier missing {pair_operation}")
+        stat_literal = f"exact:root:root:{mode}:2:regular\\ file"
+        if stat_literal not in retirement_builder:
+            fail(f"retirement authority final mode/link contract missing {mode}:2")
+    for operation, pending, final in (
+        (
+            "retire-ro-auth-manifest-pair",
+            "RETIREMENT_AUTH_MANIFEST_PENDING",
+            "RETIREMENT_AUTH_MANIFEST",
+        ),
+        (
+            "retire-ro-auth-self-pair",
+            "RETIREMENT_AUTH_SELF_PENDING",
+            "RETIREMENT_AUTH_SELF",
+        ),
+    ):
+        pair_branch = retirement_builder[retirement_builder.index(operation) :]
+        ordered(
+            pair_branch,
+            (
+                f"$::{pending}",
+                f"$::{final}",
+                "set assertion same-two-inodes",
+            ),
+            f"retirement authority same-inode pair {operation}",
+        )
+    if retirement_builder.count("set assertion same-two-inodes") != 2:
+        fail("retirement root authority pairs are not both same-inode/nlink-two")
+    authority_convergence = tcl_proc(transport, "retirement_ensure_authority")
+    ordered(
+        authority_convergence,
+        (
+            "retire-raw-auth-manifest-install",
+            "retire-ro-auth-manifest-pending-stat",
+            "retire-ro-auth-manifest-pending-sha",
+            "retire-raw-sync-auth-manifest-pending retire-raw-sync-auth-root",
+            "retire-raw-link-auth-manifest",
+            "retire-raw-sync-auth-root",
+            'if {$state ne "manifest-pair"}',
+            "retire-raw-auth-self-install",
+            "retire-ro-auth-self-pending-stat retire-ro-auth-self-pending-sha",
+            "retire-raw-sync-auth-self-pending retire-raw-sync-auth-root",
+            "retire-raw-link-auth-self",
+            "retire-raw-sync-auth-root",
+            'if {$state ne "complete"}',
+            "retire-raw-sync-auth-manifest-pending retire-raw-sync-auth-self-pending",
+            "retire-raw-sync-auth-root",
+            'fail "retirement-authority-final-recheck" 78',
+        ),
+        "root authority pending-sync-hardlink-parent-sync convergence",
+    )
+    if (
+        retirement_builder.count("/usr/bin/ln --no-target-directory --") != 2
+        or "/bin/cp" in retirement_builder
+        or "--force" in retirement_builder
+    ):
+        fail("retirement authority publication is not two no-clobber hardlinks")
 
     approved_proc = tcl_proc(transport, "operation_requires_approved_sha")
     approved_match = re.search(r"(?ms)\$operation in \{(?P<body>.*?)\}", approved_proc)
@@ -1179,6 +1760,955 @@ def main() -> None:
     for literal in required_stager:
         if literal not in stager:
             fail(f"root stager contract is missing {literal!r}")
+
+    retirement_wrapper_start = stager.index("run_retirement_engine() {")
+    retirement_wrapper_end = stager.index("\n}\n\nrun_stage() {", retirement_wrapper_start)
+    retirement_wrapper = stager[retirement_wrapper_start:retirement_wrapper_end]
+    retirement_heredoc = re.search(
+        r"(?ms)<<'PY'\n(?P<body>.*?)\nPY$", retirement_wrapper
+    )
+    if not retirement_heredoc:
+        fail("cannot isolate fixed embedded retirement engine")
+    retirement_engine = retirement_heredoc.group("body")
+    retirement_shell_argv = tuple(
+        re.findall(
+            r'"\$\{([A-Z][A-Z0-9_]*)\}"',
+            retirement_wrapper[: retirement_wrapper.index("<<'PY'")],
+        )
+    )
+    expected_retirement_shell_argv = (
+        "MODE",
+        "MANIFEST",
+        "MANIFEST_SHA256",
+        "RETIREMENT_AUTH_MANIFEST_PENDING",
+        "RETIREMENT_AUTH_SELF",
+        "RETIREMENT_AUTH_SELF_PENDING",
+        "PREPARE_SHA256",
+        "RETIREMENT_USER_INTAKE",
+        "RETIREMENT_HOME_QROOT",
+        "RETIREMENT_AUTH_ROOT",
+        "RETIREMENT_Q_INTAKE",
+        "RETIREMENT_Q_PACKAGE",
+        "EXPECTED_REMOTE_PACKAGE",
+        "BOOTSTRAP_ROOT",
+        "RETIREMENT_RUN_QROOT",
+        "RETIREMENT_Q_BOOTSTRAP",
+        "RETIREMENT_LOCK",
+        "RETIREMENT_RECEIPT_PENDING",
+        "RETIREMENT_RECEIPT_FINAL",
+        "PREDECESSOR_COMMIT",
+        "PREDECESSOR_MANIFEST_SHA256",
+        "EXPECTED_HOSTNAME",
+        "EXPECTED_KERNEL",
+        "EXPECTED_MACHINE_ID",
+    )
+    if retirement_shell_argv != expected_retirement_shell_argv:
+        fail("root stager retirement helper argv is not the fixed ordered 24 values")
+    if retirement_wrapper.count("/usr/bin/python3 -B -I -") != 1:
+        fail("root stager retirement engine is not one isolated stdin program")
+    if retirement_engine.count("if len(sys.argv) != 25:") != 1:
+        fail("root stager retirement engine does not enforce argc 25 exactly once")
+    unpack_match = re.search(
+        r"(?ms)^\((?P<body>.*?)\) = sys\.argv\[1:\]$", retirement_engine
+    )
+    if not unpack_match:
+        fail("cannot isolate root stager retirement argv unpack")
+    actual_engine_argv = tuple(
+        re.findall(r"[a-z][a-z0-9_]*", unpack_match.group("body"))
+    )
+    expected_engine_argv = (
+        "mode",
+        "current_manifest",
+        "current_manifest_sha",
+        "current_manifest_pending",
+        "current_self",
+        "current_self_pending",
+        "current_self_sha",
+        "user_intake",
+        "home_qroot",
+        "auth_root",
+        "q_intake",
+        "q_package",
+        "source_package",
+        "source_bootstrap",
+        "run_qroot",
+        "q_bootstrap",
+        "lock_path",
+        "receipt_pending",
+        "receipt_final",
+        "predecessor_commit",
+        "predecessor_manifest_sha",
+        "expected_hostname",
+        "expected_kernel",
+        "expected_machine_id",
+    )
+    if actual_engine_argv != expected_engine_argv:
+        fail("root stager retirement Python argv binding drifted")
+    if retirement_engine.count(
+        'mode not in {"retire-prestage-2c690050", "verify-retirement"}'
+    ) != 1:
+        fail("root stager retirement engine mode set is not exact")
+
+    current_authority = python_function(
+        retirement_engine, "validate_current_authority"
+    )
+    ordered(
+        current_authority,
+        (
+            "require_exact_names(auth_descriptor",
+            "os.path.basename(current_manifest_pending)",
+            "os.path.basename(current_self_pending)",
+            "require_pair(",
+            "os.path.basename(current_manifest), 0o600, current_manifest_sha",
+            "require_pair(",
+            "os.path.basename(current_self), 0o700, current_self_sha",
+            'values.get("format") != "wg-mix-ebpf-b82-v6-package-v4"',
+            'values.get("integration_commit") == predecessor_commit',
+            "hashlib.sha256(self_payload).hexdigest() != current_self_sha",
+        ),
+        "root stager current manifest/self nlink-two authority",
+    )
+    require_pair_body = python_function(retirement_engine, "require_pair")
+    if require_pair_body.count("require_file_at(") != 2 or "links, 2" in require_pair_body:
+        fail("root stager authority pair validation structure drifted")
+    ordered(
+        require_pair_body,
+        (
+            "pending_descriptor = require_file_at(",
+            "mode_bits, 2,",
+            "final_descriptor = require_file_at(",
+            "mode_bits, 2,",
+            "(first.st_dev, first.st_ino) != (second.st_dev, second.st_ino)",
+        ),
+        "root authority same-inode nlink-two validation",
+    )
+
+    receipt_body = python_function(retirement_engine, "receipt_bytes")
+    receipt_lines = receipt_body[
+        receipt_body.index("lines = (") : receipt_body.index("if len(lines) != 18")
+    ]
+    receipt_keys = tuple(re.findall(r'\("([a-z0-9_]+)",', receipt_lines))
+    expected_receipt_keys = (
+        "format",
+        "retire_id",
+        "state",
+        "predecessor_commit",
+        "predecessor_manifest_sha256",
+        "predecessor_bundle_sha256",
+        "authority_manifest_sha256",
+        "authority_prepare_stage_root_sha256",
+        "authority_integration_commit",
+        "source_intake",
+        "source_package",
+        "source_bootstrap",
+        "quarantine_intake",
+        "quarantine_package",
+        "quarantine_bootstrap",
+        "rename_order",
+        "rename_primitive",
+        "retention",
+    )
+    if receipt_keys != expected_receipt_keys or receipt_body.count("len(lines) != 18") != 1:
+        fail("root stager retirement receipt is not the exact ordered 18-line contract")
+    for literal in (
+        f'("retire_id", "{retire_id}")',
+        '("state", "TERMINAL")',
+        '("predecessor_bundle_sha256", bundle_sha)',
+        '("rename_order", "intake,package,bootstrap")',
+        '("rename_primitive", "renameat2-RENAME_NOREPLACE-dirfd-v1")',
+        '("retention", "no-unlink-no-rmdir-no-copy-fallback")',
+    ):
+        if receipt_body.count(literal) != 1:
+            fail(f"root stager receipt field drifted: {literal!r}")
+    if "boot_id" in receipt_body or retired_bundle_sha in receipt_body:
+        fail("root stager receipt adds boot identity or hard-codes the old bundle digest")
+    pending_receipt = python_function(retirement_engine, "validate_pending_receipt")
+    ordered(
+        pending_receipt,
+        (
+            "require_file_at(",
+            "0o600, 1, None",
+            "existing = read_all(descriptor, 8192)",
+            "if not expected_payload.startswith(existing)",
+            'stop("receipt-pending-not-owned-prefix")',
+        ),
+        "retained receipt empty-or-exact-prefix ownership proof",
+    )
+
+    classify_state = python_function(retirement_engine, "classify_state")
+    state_signatures = (
+        '(True, True, True, False, False, False, False): "D"',
+        '(False, True, True, True, False, False, False): "I"',
+        '(False, False, True, True, True, False, False): "S1"',
+        '(False, False, False, True, True, True, False): "S2"',
+        '(False, False, False, True, True, True, True): "T_CANDIDATE"',
+    )
+    for signature in state_signatures:
+        if classify_state.count(signature) != 1:
+            fail(f"root stager retirement state signature drifted: {signature}")
+    state_labels = set(
+        re.findall(r'"(D|I|S1|S2|S2P|T_CANDIDATE)"', classify_state)
+    )
+    if state_labels != {"D", "I", "S1", "S2", "S2P", "T_CANDIDATE"}:
+        fail("root stager retirement state classifier adds or drops a state")
+    ordered(
+        classify_state,
+        (
+            'if state == "S2" and pending_present',
+            'state = "S2P"',
+            "elif pending_present",
+            'stop("retirement-state")',
+            'expected_run = set() if allow_lockless_d and state == "D" else',
+            "os.path.basename(lock_path)",
+            'if state == "S2P"',
+            "os.path.basename(receipt_pending)",
+            'if state == "T_CANDIDATE"',
+            "os.path.basename(receipt_final)",
+            'require_exact_names(run_descriptor, expected_run, "run-qroot")',
+        ),
+        "retirement classifier lock/receipt exact namespace",
+    )
+
+    if retirement_engine.count('ctypes.CDLL("libc.so.6", use_errno=True)') != 1:
+        fail("root stager does not bind glibc renameat2 exactly once")
+    for literal in (
+        "RENAME_NOREPLACE = 1",
+        "libc_renameat2 = libc.renameat2",
+        "libc_renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p,",
+        "ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]",
+        "libc_renameat2.restype = ctypes.c_int",
+        'stop("glibc-renameat2-unavailable", 69)',
+    ):
+        if retirement_engine.count(literal) != 1:
+            fail(f"root stager glibc renameat2 contract is missing {literal!r}")
+    rename_wrapper = python_function(retirement_engine, "renameat2_noreplace")
+    ordered(
+        rename_wrapper,
+        (
+            "libc_renameat2(source_parent, os.fsencode(source_name)",
+            "destination_parent, os.fsencode(destination_name)",
+            "RENAME_NOREPLACE)",
+            "ctypes.get_errno()",
+            "raise OSError(error_number, os.strerror(error_number))",
+        ),
+        "glibc renameat2 RENAME_NOREPLACE wrapper",
+    )
+    retirement_forbidden_mutations = (
+        r"os\.(?:unlink|remove|rmdir|rename|replace)\s*\(",
+        r"\b(?:shutil|subprocess)\b",
+        r"libc\.syscall\s*\(",
+        r"\bSYS_renameat2\b",
+        r"/(?:usr/)?bin/mv\b",
+        r"\bcopy(?:file|tree)\s*\(",
+    )
+    for pattern in retirement_forbidden_mutations:
+        if re.search(pattern, retirement_engine):
+            fail(f"root retirement engine contains forbidden delete/copy/fallback: {pattern}")
+    if (
+        retirement_engine.count("renameat2_noreplace(") != 3
+        or retirement_engine.count("libc_renameat2(") != 1
+    ):
+        fail("root retirement engine has an extra rename primitive or fallback")
+    directory_rename = python_function(retirement_engine, "rename_directory_noreplace")
+    ordered(
+        directory_rename,
+        (
+            "validator(held_descriptor)",
+            "renameat2_noreplace(source_parent, source_name",
+            "same_open_inode(held_descriptor, destination_descriptor",
+            "validator(destination_descriptor)",
+            "entry_stat(source_parent, source_name) is not None",
+            "os.fsync(source_parent)",
+            "os.fsync(destination_parent)",
+            "validator(held_descriptor)",
+        ),
+        "retained directory rename and parent durability",
+    )
+
+    acquire_lock = python_function(retirement_engine, "acquire_retirement_lock")
+    ordered(
+        acquire_lock,
+        (
+            'writable = mode == "retire-prestage-2c690050"',
+            "if entry_stat(run_descriptor, lock_name) is None",
+            "if not writable",
+            'stop("retirement-lock-absent", 78)',
+            "classify_state(",
+            "allow_lockless_d=True",
+            'if provisional_state != "D" or provisional_pending',
+            "os.O_RDWR | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_CLOEXEC",
+            "metadata.st_nlink != 1",
+            "(metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino)",
+            "os.fsync(lock_descriptor)",
+            "os.fsync(run_descriptor)",
+            "lock_descriptor = require_file_at(",
+            "ROOT_UID, ROOT_GID, 0o600, 1",
+            "fcntl.LOCK_EX if writable else fcntl.LOCK_SH",
+            "fcntl.flock(lock_descriptor, lock_mode | fcntl.LOCK_NB)",
+        ),
+        "provisional-D O_EXCL retirement lock acquisition",
+    )
+    boot_marker = python_function(
+        retirement_engine, "initialize_or_verify_boot_marker"
+    )
+    ordered(
+        boot_marker,
+        (
+            'writable = mode == "retire-prestage-2c690050"',
+            'expected = f"boot_id\\t{boot_id}\\n".encode("ascii")',
+            "if existing == expected",
+            "os.fsync(lock_descriptor)",
+            "os.fsync(run_descriptor)",
+            "if read_all(lock_descriptor, 256) != expected",
+            'state != "D" or not writable or not expected.startswith(existing)',
+            'stop("same-boot-residual")',
+            "os.ftruncate(lock_descriptor, 0)",
+            "write_all(lock_descriptor, expected)",
+            "os.fsync(lock_descriptor)",
+            "os.fsync(run_descriptor)",
+            "if read_all(lock_descriptor, 256) != expected",
+        ),
+        "same-boot lock marker convergence",
+    )
+    engine_main = python_function(retirement_engine, "engine_main")
+    ordered(
+        engine_main,
+        (
+            "current_values = validate_current_authority(auth_descriptor)",
+            "fsync_current_authority(auth_descriptor)",
+            "validate_current_authority(auth_descriptor) != current_values",
+            "acquire_retirement_lock(",
+            "state, pending_present = classify_state(",
+            "boot_id = boot_identity()",
+            "initialize_or_verify_boot_marker(lock_descriptor, run_descriptor, state, boot_id)",
+            "state_after_lock, pending_after_lock = classify_state(",
+            'stop("post-lock-state-drift")',
+            "validate_state_objects(",
+        ),
+        "lock-before-classification and boot convergence",
+    )
+    if engine_main.count("acquire_retirement_lock(") != 1:
+        fail("root retirement engine does not hold one lock for the full transaction")
+
+    require_file = python_function(retirement_engine, "require_file_at")
+    ordered(
+        require_file,
+        (
+            "metadata = os.fstat(descriptor)",
+            "metadata.st_nlink != links",
+            "os.fsync(descriptor)",
+            "sha256_fd(descriptor) != expected_sha",
+            "os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)",
+            "(path_metadata.st_dev, path_metadata.st_ino) != (metadata.st_dev, metadata.st_ino)",
+        ),
+        "retained file fsync/SHA/named-inode gate",
+    )
+    fsync_authority = python_function(retirement_engine, "fsync_current_authority")
+    ordered(
+        fsync_authority,
+        (
+            "os.path.basename(current_manifest), os.path.basename(current_self)",
+            "os.fsync(descriptor)",
+            "os.fsync(auth_descriptor)",
+        ),
+        "current authority retained-file and parent fsync",
+    )
+    for function_name, postcheck_literal in (
+        ("validate_intake", "intake-manifest-postfsync"),
+        ("validate_old_package", "predecessor-package-postfsync-"),
+        ("validate_old_bootstrap", "predecessor-bootstrap-postfsync-"),
+    ):
+        validator = python_function(retirement_engine, function_name)
+        ordered(
+            validator,
+            (
+                "require_file_at(",
+                "os.fsync(descriptor)",
+                "require_file_at(",
+                postcheck_literal,
+            ),
+            f"{function_name} retained-file parent convergence",
+        )
+    completed_parents = python_function(
+        retirement_engine, "converge_completed_rename_parents"
+    )
+    ordered(
+        completed_parents,
+        (
+            'state in {"I", "S1", "S2", "S2P", "T_CANDIDATE"}',
+            '"converge-intake"',
+            'state in {"S1", "S2", "S2P", "T_CANDIDATE"}',
+            '"converge-package"',
+            'state in {"S2", "S2P", "T_CANDIDATE"}',
+            '"converge-bootstrap"',
+            "converge_completed_rename(source, destination, uid, gid, label)",
+        ),
+        "I/S1/S2/S2P/T retained parent convergence matrix",
+    )
+    completed_rename = python_function(retirement_engine, "converge_completed_rename")
+    ordered(
+        completed_rename,
+        (
+            "entry_stat(source_parent, source_name) is not None",
+            "destination_descriptor = open_child_dir(",
+            "os.fsync(source_parent)",
+            "os.fsync(destination_parent)",
+            "entry_stat(source_parent, source_name) is not None",
+            "os.stat(",
+            "fd_mnt_id(destination_descriptor) != destination_mount",
+            "require_dir_fd(destination_descriptor",
+        ),
+        "completed rename source/destination parent convergence",
+    )
+    resumed_state = python_function(retirement_engine, "converge_resumed_state")
+    ordered(
+        resumed_state,
+        (
+            'expected_state not in {"I", "S1", "S2", "S2P"}',
+            "converge_completed_rename_parents(expected_state, user_uid, user_gid)",
+            "visible_state, visible_pending = classify_state(",
+            "validate_state_objects(",
+            "final_state, final_pending = classify_state(",
+            'stop("resume-postvalidation-state")',
+        ),
+        "resumed I/S1/S2/S2P convergence and reclassification",
+    )
+    terminal_convergence = python_function(retirement_engine, "converge_terminal")
+    ordered(
+        terminal_convergence,
+        (
+            'converge_completed_rename_parents("T_CANDIDATE"',
+            "validate_receipt(run_descriptor, payload)",
+            "os.fsync(final_descriptor)",
+            "os.fsync(run_descriptor)",
+            "visible_state, visible_pending = classify_state(",
+            "validate_state_objects(",
+            'visible_state != "T_CANDIDATE"',
+            "final_state, final_pending = classify_state(",
+            'final_state != "T_CANDIDATE" or final_pending',
+            'return "T"',
+        ),
+        "terminal T read-only durability convergence",
+    )
+    ordered(
+        engine_main,
+        (
+            'if state in {"I", "S1", "S2", "S2P"}',
+            "converge_resumed_state(",
+            'if mode == "verify-retirement"',
+            'if state != "T_CANDIDATE"',
+            "terminal_state = converge_terminal(",
+            'if terminal_state != "T"',
+            "namespace_writes=0",
+            'if state == "T_CANDIDATE"',
+            "terminal_state = converge_terminal(",
+            'if terminal_state != "T"',
+            "disposition=verified-existing",
+            "namespace_writes=0",
+            'if state == "D"',
+            "rename_directory_noreplace(",
+            'if state == "I"',
+            "rename_directory_noreplace(",
+            'if state == "S1"',
+            "rename_directory_noreplace(",
+            'if state not in {"S2", "S2P"}',
+            "publish_receipt(",
+            'if state != "T_CANDIDATE"',
+            "terminal_state = converge_terminal(",
+            'if terminal_state != "T"',
+            "disposition=advanced",
+        ),
+        "D/I/S1/S2/S2P/T retirement convergence",
+    )
+    dispatch_markers = (
+        'if state in {"I", "S1", "S2", "S2P"}:',
+        'if mode == "verify-retirement":',
+        'if state == "T_CANDIDATE":',
+        'if state == "D":',
+        'if state == "I":',
+        'if state == "S1":',
+        'if state not in {"S2", "S2P"}:',
+    )
+    for marker in dispatch_markers:
+        if engine_main.count(marker) != 1:
+            fail(f"root retirement engine dispatch marker is not unique: {marker}")
+    if re.search(r'if state\s*==\s*["\']T["\']', engine_main):
+        fail("root retirement engine treats synthetic T as a classifier input state")
+
+    resume_dispatch = engine_main[
+        engine_main.index('if state in {"I", "S1", "S2", "S2P"}:') :
+        engine_main.index('if mode == "verify-retirement":')
+    ]
+    ordered(
+        resume_dispatch,
+        (
+            'if state in {"I", "S1", "S2", "S2P"}:',
+            "predecessor_values, payload = converge_resumed_state(",
+            "state, pending_present, home_descriptor, run_descriptor,",
+            "user.pw_uid, user.pw_gid, current_values, boot_id)",
+        ),
+        "I/S1/S2/S2P exact resume dispatch argv",
+    )
+    if (
+        resume_dispatch.count("converge_resumed_state(") != 1
+        or "rename_directory_noreplace(" in resume_dispatch
+        or "publish_receipt(" in resume_dispatch
+    ):
+        fail("I/S1/S2/S2P resume dispatch adds a namespace mutation")
+
+    verify_dispatch = engine_main[
+        engine_main.index('if mode == "verify-retirement":') :
+        engine_main.index('if state == "T_CANDIDATE":')
+    ]
+    ordered(
+        verify_dispatch,
+        (
+            'if mode == "verify-retirement":',
+            'if state != "T_CANDIDATE":',
+            'stop("retirement-not-terminal", 78)',
+            "terminal_state = converge_terminal(",
+            "home_descriptor, run_descriptor, user.pw_uid, user.pw_gid,",
+            "current_values, boot_id, payload)",
+            'if terminal_state != "T":',
+            'stop("verify-terminal-state")',
+            "B82_V6_RETIREMENT_VERIFIED state=T namespace_writes=0",
+            "return",
+        ),
+        "verify-retirement T_CANDIDATE-to-T dispatch",
+    )
+    if (
+        verify_dispatch.count("converge_terminal(") != 1
+        or "rename_directory_noreplace(" in verify_dispatch
+        or "publish_receipt(" in verify_dispatch
+        or "namespace_writes +=" in verify_dispatch
+    ):
+        fail("verify-retirement terminal dispatch is not read-only")
+
+    terminal_retry_dispatch = engine_main[
+        engine_main.index('if state == "T_CANDIDATE":') :
+        engine_main.index("namespace_writes = 1 if lock_created else 0")
+    ]
+    ordered(
+        terminal_retry_dispatch,
+        (
+            'if state == "T_CANDIDATE":',
+            "terminal_state = converge_terminal(",
+            "home_descriptor, run_descriptor, user.pw_uid, user.pw_gid,",
+            "current_values, boot_id, payload)",
+            'if terminal_state != "T":',
+            'stop("retire-terminal-state")',
+            "state=T disposition=verified-existing",
+            "namespace_writes=0 same_boot=1",
+            "return",
+        ),
+        "mutation T_CANDIDATE-to-T retry dispatch",
+    )
+    if (
+        terminal_retry_dispatch.count("converge_terminal(") != 1
+        or "rename_directory_noreplace(" in terminal_retry_dispatch
+        or "publish_receipt(" in terminal_retry_dispatch
+        or "namespace_writes +=" in terminal_retry_dispatch
+    ):
+        fail("mutation terminal retry can perform a new namespace write")
+
+    state_d_dispatch = engine_main[
+        engine_main.index('if state == "D":') : engine_main.index('if state == "I":')
+    ]
+    ordered(
+        state_d_dispatch,
+        (
+            'if state == "D":',
+            "rename_directory_noreplace(",
+            "user_intake, q_intake, user.pw_uid, user.pw_gid,",
+            "lambda descriptor: validate_intake(",
+            'descriptor, user.pw_uid, user.pw_gid), "retire-intake")',
+            "namespace_writes += 1",
+            "state, pending_present = classify_state(",
+            "home_descriptor, run_descriptor, user.pw_uid, user.pw_gid)",
+            'if state != "I":',
+            'stop("post-intake-state")',
+            "predecessor_values, payload = validate_state_objects(",
+            "state, pending_present, home_descriptor, run_descriptor,",
+            "user.pw_uid, user.pw_gid, current_values, boot_id)",
+            "confirmed_state, confirmed_pending = classify_state(",
+            'stop("post-intake-validation-state")',
+        ),
+        "D-to-I intake dispatch wiring",
+    )
+    if (
+        state_d_dispatch.count("rename_directory_noreplace(") != 1
+        or state_d_dispatch.count("classify_state(") != 2
+        or state_d_dispatch.count("validate_state_objects(") != 1
+        or state_d_dispatch.count("namespace_writes += 1") != 1
+        or any(
+            name in state_d_dispatch
+            for name in ("source_package", "q_package", "source_bootstrap", "q_bootstrap")
+        )
+    ):
+        fail("D-to-I dispatch is not the sole intake rename/validate transition")
+
+    state_i_dispatch = engine_main[
+        engine_main.index('if state == "I":') : engine_main.index('if state == "S1":')
+    ]
+    ordered(
+        state_i_dispatch,
+        (
+            'if state == "I":',
+            "rename_directory_noreplace(",
+            "source_package, q_package, user.pw_uid, user.pw_gid,",
+            "lambda descriptor: validate_old_package(",
+            'descriptor, user.pw_uid, user.pw_gid), "retire-package")',
+            "namespace_writes += 1",
+            "state, pending_present = classify_state(",
+            'if state != "S1":',
+            'stop("post-package-state")',
+            "predecessor_values, payload = validate_state_objects(",
+            "confirmed_state, confirmed_pending = classify_state(",
+            'stop("post-package-validation-state")',
+        ),
+        "I-to-S1 package dispatch wiring",
+    )
+    if (
+        state_i_dispatch.count("rename_directory_noreplace(") != 1
+        or state_i_dispatch.count("classify_state(") != 2
+        or state_i_dispatch.count("validate_state_objects(") != 1
+        or state_i_dispatch.count("namespace_writes += 1") != 1
+        or any(
+            name in state_i_dispatch
+            for name in ("user_intake", "q_intake", "source_bootstrap", "q_bootstrap")
+        )
+    ):
+        fail("I-to-S1 dispatch is not the sole predecessor-package transition")
+
+    state_s1_dispatch = engine_main[
+        engine_main.index('if state == "S1":') :
+        engine_main.index('if state not in {"S2", "S2P"}:')
+    ]
+    ordered(
+        state_s1_dispatch,
+        (
+            'if state == "S1":',
+            "rename_directory_noreplace(",
+            "source_bootstrap, q_bootstrap, ROOT_UID, ROOT_GID,",
+            "lambda descriptor: validate_old_bootstrap(",
+            'descriptor, predecessor_values), "retire-bootstrap")',
+            "namespace_writes += 1",
+            "state, pending_present = classify_state(",
+            'if state != "S2":',
+            'stop("post-bootstrap-state")',
+            "predecessor_values, payload = validate_state_objects(",
+            "confirmed_state, confirmed_pending = classify_state(",
+            'stop("post-bootstrap-validation-state")',
+        ),
+        "S1-to-S2 bootstrap dispatch wiring",
+    )
+    if (
+        state_s1_dispatch.count("rename_directory_noreplace(") != 1
+        or state_s1_dispatch.count("classify_state(") != 2
+        or state_s1_dispatch.count("validate_state_objects(") != 1
+        or state_s1_dispatch.count("namespace_writes += 1") != 1
+        or any(
+            name in state_s1_dispatch
+            for name in ("user_intake", "q_intake", "source_package", "q_package")
+        )
+    ):
+        fail("S1-to-S2 dispatch is not the sole root bootstrap transition")
+
+    receipt_dispatch = engine_main[
+        engine_main.index('if state not in {"S2", "S2P"}:') :
+        engine_main.index("    finally:")
+    ]
+    ordered(
+        receipt_dispatch,
+        (
+            'if state not in {"S2", "S2P"}:',
+            'stop("pre-receipt-state")',
+            "namespace_writes += publish_receipt(",
+            'run_descriptor, payload, state == "S2P" and pending_present)',
+            "state, pending_present = classify_state(",
+            'if state != "T_CANDIDATE":',
+            'stop("post-receipt-visible-state")',
+            "terminal_state = converge_terminal(",
+            "home_descriptor, run_descriptor, user.pw_uid, user.pw_gid,",
+            "current_values, boot_id, payload)",
+            'if terminal_state != "T":',
+            'stop("post-receipt-terminal-state")',
+            "state=T disposition=advanced",
+        ),
+        "S2/S2P receipt-to-T dispatch wiring",
+    )
+    if (
+        receipt_dispatch.count("publish_receipt(") != 1
+        or receipt_dispatch.count("classify_state(") != 1
+        or receipt_dispatch.count("converge_terminal(") != 1
+        or "rename_directory_noreplace(" in receipt_dispatch
+    ):
+        fail("S2/S2P-to-T dispatch does not use one receipt publish and convergence")
+    if retirement_engine.count("\n    engine_main()\n") != 1:
+        fail("embedded production retirement engine does not invoke engine_main exactly once")
+
+    harness_marker = "<<'RETIREMENT_ENGINE_HARNESS_PY'\n"
+    if hermetic.count(harness_marker) != 1:
+        fail("hermetic test does not define one retirement engine fault harness")
+    harness_start = hermetic.index(harness_marker) + len(harness_marker)
+    harness_end = hermetic.index("\nRETIREMENT_ENGINE_HARNESS_PY\n", harness_start)
+    fault_harness = hermetic[harness_start:harness_end]
+    selected_match = re.search(
+        r"(?ms)^SELECTED = \{(?P<body>.*?)^\}\n", fault_harness
+    )
+    if not selected_match:
+        fail("cannot isolate hermetic extracted-engine function set")
+    selected_functions = tuple(
+        re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"', selected_match.group("body"))
+    )
+    if (
+        selected_functions.count("engine_main") != 1
+        or len(selected_functions) != len(set(selected_functions))
+    ):
+        fail("hermetic dynamic matrix does not extract production engine_main exactly once")
+    load_fault_engine = python_function(fault_harness, "load_engine")
+    ordered(
+        load_fault_engine,
+        (
+            'marker = "<<\'PY\'\\n"',
+            'engine = shell[start:shell.index("\\nPY\\n", start)]',
+            'tree = ast.parse(engine, filename="retirement-engine")',
+            "node for node in tree.body",
+            "node.name in SELECTED",
+            "compile(ast.Module(body=selected, type_ignores=[])",
+            '"retirement-engine-selected", "exec")',
+        ),
+        "hermetic production engine AST extraction",
+    )
+    if re.search(
+        r'[A-Za-z_][A-Za-z0-9_]*\["engine_main"\]\s*=', fault_harness
+    ):
+        fail("hermetic matrix replaces production engine_main with a fixture implementation")
+    engine_main_calls = tuple(
+        re.finditer(
+            r'\b[A-Za-z_][A-Za-z0-9_]*\["engine_main"\]\(\)', fault_harness
+        )
+    )
+    if len(engine_main_calls) != 1:
+        fail("hermetic dynamic matrix does not invoke extracted engine_main exactly once")
+    engine_call_position = engine_main_calls[0].start()
+    enclosing_headers = tuple(
+        re.finditer(
+            r"(?m)^def ([A-Za-z_][A-Za-z0-9_]*)\([^\n]*\):",
+            fault_harness[:engine_call_position],
+        )
+    )
+    if not enclosing_headers:
+        fail("hermetic extracted engine_main invocation is outside a test driver")
+    engine_driver_name = enclosing_headers[-1].group(1)
+    matrix_test_bodies = {
+        name: python_function(fault_harness, name)
+        for name in ("test_all_failure_cuts", "drive_fault_matrix")
+    }
+    engine_driver_wired = engine_driver_name in matrix_test_bodies or any(
+        re.search(rf"\b{re.escape(engine_driver_name)}\(", body)
+        for body in matrix_test_bodies.values()
+    )
+    if engine_driver_name == "run_child":
+        child_result_body = python_function(fault_harness, "child_result")
+        harness_main_body = python_function(fault_harness, "main")
+        ordered(
+            child_result_body,
+            (
+                "subprocess.run(",
+                '[sys.executable, "-B", "-I", os.path.realpath(__file__)',
+                '"--child", stager, raw_root, operation, cut,',
+                '"retire-prestage-2c690050"',
+            ),
+            "fault matrix child-to-engine_main subprocess wiring",
+        )
+        ordered(
+            harness_main_body,
+            (
+                'arguments[0] == "--child"',
+                "run_child(*arguments[1:])",
+                "test_all_failure_cuts(stager)",
+                "drive_fault_matrix(stager)",
+            ),
+            "fault harness child/parent dispatch wiring",
+        )
+        engine_driver_wired = all(
+            "child_result(" in body for body in matrix_test_bodies.values()
+        )
+    if not engine_driver_wired:
+        fail("extracted engine_main invocation is not wired into the dynamic fault matrix")
+
+    failure_cut_test = matrix_test_bodies["test_all_failure_cuts"]
+    expected_states_start = failure_cut_test.index("expected_states = {")
+    expected_states_end = failure_cut_test.index(
+        "    for operation in expected_states:", expected_states_start
+    )
+    expected_states_block = failure_cut_test[
+        expected_states_start:expected_states_end
+    ]
+    expected_failure_states = tuple(
+        (operation, state, pending == "True")
+        for operation, state, pending in re.findall(
+            r'"([a-z-]+)": \("([A-Z0-9_]+)", (True|False)\)',
+            expected_states_block,
+        )
+    )
+    if expected_failure_states != (
+        ("intake", "I", False),
+        ("package", "S1", False),
+        ("bootstrap", "S2", False),
+        ("receipt-pending", "S2P", True),
+        ("receipt-final", "T_CANDIDATE", False),
+    ):
+        fail("hermetic fault-cut oracle is not the fixed independent state table")
+    if any(
+        derived in expected_states_block
+        for derived in ("classify", "namespace", "load_engine", "ast.", "engine")
+    ):
+        fail("hermetic fault-cut state oracle is derived from production source")
+    if (
+        'assert classify(namespace, value) == expected_states[operation]'
+        not in failure_cut_test
+    ):
+        fail("hermetic production classifier is not checked against the fixed state oracle")
+
+    fault_matrix = matrix_test_bodies["drive_fault_matrix"]
+    for independent_oracle in (
+        'assert transitions == ["D", "I", "S1", "S2", "S2P", "T_CANDIDATE", "T"]',
+        "assert cuts == [91, -signal.SIGTERM, 91, 91, -signal.SIGTERM]",
+    ):
+        if fault_matrix.count(independent_oracle) != 1:
+            fail(f"hermetic dynamic oracle drifted: {independent_oracle!r}")
+    prepare_fault_state = python_function(fault_harness, "prepare_for_operation")
+    ordered(
+        prepare_fault_state,
+        (
+            'operation in {"package", "bootstrap", "receipt-pending", "receipt-final"}',
+            'os.rename(value["user_intake"], value["q_intake"])',
+            'operation in {"bootstrap", "receipt-pending", "receipt-final"}',
+            'os.rename(value["source_package"], value["q_package"])',
+            'operation in {"receipt-pending", "receipt-final"}',
+            'os.rename(value["source_bootstrap"], value["q_bootstrap"])',
+            'if operation == "receipt-final"',
+            'exact_file(value["receipt_pending"], PAYLOAD)',
+        ),
+        "independent fixed fault-cut filesystem oracle",
+    )
+    if prepare_fault_state.count("os.rename(") != 3 or any(
+        source_derived in prepare_fault_state
+        for source_derived in ("namespace", "load_engine", "classify", "ast.")
+    ):
+        fail("hermetic fault prestate oracle is generated from production behavior")
+
+    expect_harness_marker = "<<'EXPECT_HARNESS'\n"
+    if hermetic.count(expect_harness_marker) != 1:
+        fail("hermetic test does not define one transport transaction harness")
+    expect_harness_start = hermetic.index(expect_harness_marker) + len(
+        expect_harness_marker
+    )
+    expect_harness_end = hermetic.index("\nEXPECT_HARNESS\n", expect_harness_start)
+    transport_harness = hermetic[expect_harness_start:expect_harness_end]
+    sequence_oracle = transport_harness[
+        transport_harness.index("    retirement-sequence {") :
+        transport_harness.index("    retirement-delivery-durability {")
+    ]
+    for same_source_oracle in (
+        "[base_identity_operations]",
+        "[retirement_stale_operations]",
+        "[package_names]",
+    ):
+        if same_source_oracle in sequence_oracle:
+            fail(f"hermetic retirement sequence oracle is production-derived: {same_source_oracle}")
+    common_match = re.search(
+        r"(?ms)\n\s*set common \{(?P<body>.*?)\n\s*\}\n\s*set predecessor \{",
+        sequence_oracle,
+    )
+    if not common_match:
+        fail("cannot isolate independent retirement 5+28 sequence oracle")
+    fixed_common_oracle = (
+        "identity-hostname",
+        "identity-kernel",
+        "identity-machine",
+        "identity-netns",
+        "identity-interface",
+    ) + expected_stale_operations[2:]
+    if tuple(common_match.group("body").split()) != fixed_common_oracle:
+        fail("hermetic retirement common-gate oracle is not the fixed 5+28 tuple")
+    predecessor_names_match = re.search(
+        r"(?ms)\n\s*set predecessor_package_names \{(?P<body>.*?)\n\s*\}\n",
+        sequence_oracle,
+    )
+    if not predecessor_names_match:
+        fail("cannot isolate independent predecessor package-name oracle")
+    fixed_predecessor_names = (
+        "source-4f2a9b61.bundle",
+        "package-manifest.v1",
+        "bind-final-package.sh",
+        "controller.sh",
+        "prepare-stage-root.sh",
+        "provision-ubuntu-test-host.sh",
+        "root-matrix-n-r.sh",
+        "check-realhost-iperf.py",
+        "test-hermetic-matrix.sh",
+        "test_matrix_static.py",
+        "checksum-module-lease.sh",
+        "root-fresh-verifier-gate.sh",
+        "test-hermetic-fresh-verifier-gate.sh",
+        "test_fresh_verifier_gate_static.py",
+        "realnic_acceptance.py",
+        "test_realnic_acceptance.py",
+        "test_realnic_acceptance_static.py",
+    )
+    if tuple(predecessor_names_match.group("body").split()) != fixed_predecessor_names:
+        fail("hermetic predecessor package oracle is not the fixed 17-file tuple")
+    ordered(
+        sequence_oracle,
+        (
+            "set predecessor {",
+            "package-parent-stat retire-ro-old-package-readlink",
+            "retire-ro-old-package-stat retire-ro-old-package-entries",
+            "foreach name $predecessor_package_names",
+            'lappend predecessor "verify-sha-$name" "verify-stat-$name"',
+            "bootstrap-root-readlink bootstrap-root-stat",
+            "bootstrap-provisioner-readlink bootstrap-provisioner-stat",
+            "bootstrap-provisioner-sha bootstrap-stager-readlink",
+            "bootstrap-stager-stat bootstrap-stager-sha",
+            "retire-ro-old-bootstrap-entries provision-check",
+            "[list FIRST_DELIVERY_WRITE DELIVERY_DURABLE AUTHORITY] $common",
+            "[list retire-raw-helper-mutate retire-ro-helper-verify]",
+            "[lsearch -exact $::observed FIRST_DELIVERY_WRITE] != 82",
+            "set ::authority_state complete",
+            "[list STATE AUTHORITY] $common",
+            '[lindex $::observed end-1] ne "retire-raw-helper-mutate"',
+        ),
+        "fixed independent retirement sequence oracle",
+    )
+
+    prefix_oracle = transport_harness[
+        transport_harness.index("    retirement-intake-prefixes {") :
+        transport_harness.index("    default { harness_die", transport_harness.index(
+            "    retirement-intake-prefixes {"
+        ))
+    ]
+    if "file_prefix_sha256" in prefix_oracle:
+        fail("hermetic intake-prefix oracle reuses the production prefix helper")
+    ordered(
+        prefix_oracle,
+        (
+            "proc harness_prefix_sha256 {path length}",
+            "/usr/bin/python3 -B -I -c {",
+            "payload = pathlib.Path(sys.argv[1]).read_bytes()",
+            "length = int(sys.argv[2])",
+            "length < 0 or length > len(payload)",
+            "hashlib.sha256(payload[:length]).hexdigest()",
+            'harness_die "independent-prefix-sha"',
+            "set before_sha [harness_prefix_sha256 $local_path $before_stat(size)]",
+            "set ::remote_sha [harness_prefix_sha256 $local_path 0]",
+            "set ::remote_sha [harness_prefix_sha256 $local_path 17]",
+            "[harness_prefix_sha256 $local_path $after_stat(size)] ne",
+        ),
+        "independent retirement intake-prefix SHA oracle",
+    )
     if re.search(r"\b(?:apt|apt-get)\b", stager):
         fail("root stager contains package installation")
     if "${EXPECTED_SOURCE}" not in stager or "${STAGE_ROOT}" not in stager:
