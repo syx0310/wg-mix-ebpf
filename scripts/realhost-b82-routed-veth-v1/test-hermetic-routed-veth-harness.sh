@@ -74,7 +74,7 @@ readonly SEAM_OUTPUT
 
 for literal in \
   'B82_ROUTED_VETH_PLAN_ONLY run_id=c8e41d73 resource_id=5b8d30f1' \
-  'state_schema=owner,baseline,operation-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module,tested,cleanup-intent,restored' \
+  'state_schema=owner,baseline,operation-intent,dependency-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module,tested,cleanup-intent,restored' \
   'netns=initial veth=wg5b8d3a,wg5b8d3b sender=198.18.82.1/32 peer=wg5b8d3b/unnumbered route=198.18.82.2/32 mtu=1500 neighbor=02:5b:8d:30:f1:0b no_external_peer=1' \
   'N5 operation=address-add target=wg5b8d3a:198.18.82.1/32 argv=/usr/sbin/ip -4 address add 198.18.82.1/32 dev wg5b8d3a scope global' \
   'N6 operation=route-add target=198.18.82.2/32 argv=/usr/sbin/ip -4 route add 198.18.82.2/32 dev wg5b8d3a src 198.18.82.1 mtu 1500 proto static scope link' \
@@ -90,20 +90,39 @@ for literal in \
   'R6 operation=veth-delete target=wg5b8d3a argv=/usr/sbin/ip link delete dev wg5b8d3a' \
   'B82_ROUTED_VETH_RESTORE_ORDER cleanup-intent,bpf-baseline,module,offload,neighbor,route,address,veth,bpf-baseline,restored retryable=1 exact_reverse=1' \
   'af_packet=none,partial,gso:route-unknown-negative routed=iphdrincl-none,udp-partial,udp-segment-gso:positive capability_bits_changed=0' \
-  'B82_ROUTED_VETH_PLAN_COMPLETE commands_are_review_templates=1 preflight_before_host_mutation=1 network_downloads=0 no_commands_executed=1 credential_read=0 remote_connections=0 network_operations=0'; do
+  'B82_ROUTED_VETH_PLAN_COMPLETE commands_are_review_templates=1 preflight_before_host_mutation=1 network_downloads=bounded-go-module-proxy-only no_commands_executed=1 credential_read=0 remote_connections=0 network_operations=0'; do
   [[ "${PLAN_OUTPUT}" == *"${literal}"* ]] || fail "runner plan is missing ${literal}"
 done
 
-[[ "${PLAN_OUTPUT}" == *'P0 operation=preflight-mod-verify target=/run/wg-mix-ebpf-source-stages/c8e41d73/go-mod-cache argv='* ]] ||
-  fail 'runner plan is missing the offline staged-module verification'
-[[ "${PLAN_OUTPUT}" == *'P1 operation=preflight-build target=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/dataplane-preflight.test argv='* ]] ||
+for spec in \
+  'C0 operation=go-cache-mkdir target=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-cache' \
+  'C1 operation=go-mod-cache-mkdir target=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-mod-cache' \
+  'C2 operation=go-path-mkdir target=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-path' \
+  'C3 operation=go-tmp-mkdir target=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-tmp'; do
+  [[ "${PLAN_OUTPUT}" == *"${spec}"* ]] || fail "runner plan is missing clean-cache producer ${spec}"
+done
+[[ "${PLAN_OUTPUT}" == *'P0 operation=preflight-mod-download target=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-mod-cache argv='* ]] ||
+  fail 'runner plan is missing the bounded clean-cache dependency producer'
+[[ "${PLAN_OUTPUT}" == *'P1 operation=preflight-mod-verify target=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-mod-cache argv='* ]] ||
+  fail 'runner plan is missing the offline produced-module verification'
+[[ "${PLAN_OUTPUT}" == *'P2 operation=preflight-build target=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/dataplane-preflight.test argv='* ]] ||
   fail 'runner plan is missing the pre-mutation compiled test binary'
-[[ "${PLAN_OUTPUT}" == *'GOMODCACHE=/run/wg-mix-ebpf-source-stages/c8e41d73/go-mod-cache'* ]] ||
-  fail 'clean-stage fixture does not reuse the bound staged module cache'
-[[ "${PLAN_OUTPUT}" == *'GOTMPDIR=/run/wg-mix-ebpf-source-stages/c8e41d73/go-tmp TMPDIR=/run/wg-mix-ebpf-source-stages/c8e41d73/go-tmp'* ]] ||
-  fail 'Go preflight does not use the generic staged temp root'
-[[ "${PLAN_OUTPUT}" != *'go-mod-cache-routed'* && "${PLAN_OUTPUT}" != *'go-cache-routed'* ]] ||
-  fail 'clean-stage fixture still depends on an empty routed-only cache'
+[[ "${PLAN_OUTPUT}" == *'GOMODCACHE=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-mod-cache'* ]] ||
+  fail 'clean-stage producer does not use the routed evidence-owned module cache'
+[[ "${PLAN_OUTPUT}" == *'GOTMPDIR=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-tmp TMPDIR=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-tmp'* ]] ||
+  fail 'Go preflight does not use the routed evidence-owned temp root'
+download_line="$(printf '%s\n' "${PLAN_OUTPUT}" | /usr/bin/grep -F 'P0 operation=preflight-mod-download ')" ||
+  fail 'cannot isolate the dependency producer argv'
+[[ "${download_line}" == *'GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org'* ]] ||
+  fail 'dependency producer is not bound to the reviewed Go module proxy'
+for offline_label in \
+  'P1 operation=preflight-mod-verify ' \
+  'P2 operation=preflight-build '; do
+  offline_line="$(printf '%s\n' "${PLAN_OUTPUT}" | /usr/bin/grep -F "${offline_label}")" ||
+    fail "cannot isolate offline consumer ${offline_label}"
+  [[ "${offline_line}" == *'GOPROXY=off GOSUMDB=off'* ]] ||
+    fail "post-download consumer is not offline: ${offline_label}"
+done
 preflight_offset="${PLAN_OUTPUT%%P.contract operation=preflight-contract*}"
 runtime_temp_offset="${PLAN_OUTPUT%%B1 operation=runtime-temp-mkdir*}"
 mutation_offset="${PLAN_OUTPUT%%N0 operation=veth-add*}"
@@ -139,6 +158,8 @@ done
 
 [[ "${PLAN_OUTPUT}" == *'B82_ROUTED_VETH_WRITE_SET filesystem='*'/run/wg-mix-ebpf-source-stages/c8e41d73/go-tmp-realhost-5b8d30f1 network='* ]] ||
   fail 'write set does not declare the retained real-host TMPDIR'
+[[ "${PLAN_OUTPUT}" == *'/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-mod-cache'* ]] ||
+  fail 'write set does not declare the routed dependency cache producer'
 
 for central_owned in \
   'veth=wgc8e41a,wgc8e41b' \
@@ -179,4 +200,4 @@ expect_failure duplicate-commit /bin/bash "${RUNNER}" plan "${RUNNER_ARGS[@]}" -
 expect_failure extra-argv /bin/bash "${SEAM}" plan "${SEAM_ARGS[@]}" --remote-argv arbitrary
 
 [[ ! -e "${STAGE_ROOT}" && ! -L "${STAGE_ROOT}" ]] || fail 'plan or failure fixture mutated the stage root'
-printf 'hermetic routed-veth runner, controller seam, exact argv and lifecycle model: PASS\n'
+printf 'hermetic routed-veth runner, executable empty-cache producer, controller seam, exact argv and lifecycle model: PASS\n'

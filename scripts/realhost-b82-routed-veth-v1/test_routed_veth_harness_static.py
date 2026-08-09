@@ -5,9 +5,15 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import json
+import os
 import pathlib
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
+import zipfile
 
 
 def fail(message: str) -> None:
@@ -45,7 +51,9 @@ class Lifecycle:
     owner: bool = True
     baseline: bool = True
     operation: bool = True
-    dependencies_staged: bool = True
+    dependency_intent: bool = False
+    dependency_caches: str = "absent"  # absent, exact, foreign
+    dependencies_downloaded: bool = False
     dependencies_verified: bool = False
     dependency_binary: bool = False
     preflight: bool = False
@@ -89,8 +97,18 @@ def run_model(state: Lifecycle, cut_after: str | None = None) -> None:
         raise Rejected("foundation")
     if state.cleanup or state.restored or not state.bpf_baseline:
         raise Rejected("run-after-cleanup-or-bpf-drift")
-    if not state.dependencies_staged:
-        raise Rejected("dependency-preflight-before-host-mutation")
+    require_exact_or_absent(state.dependency_caches, "dependency-caches")
+    if not state.dependency_intent:
+        if state.dependency_caches != "absent" or state.dependency_binary:
+            raise Rejected("dependency-resource-without-intent")
+        state.dependency_intent = True
+        checkpoint("dependency-intent", cut_after)
+    if state.dependency_caches == "absent":
+        state.dependency_caches = "exact"
+        checkpoint("dependency-cache-create", cut_after)
+    if not state.dependencies_downloaded:
+        state.dependencies_downloaded = True
+        checkpoint("dependency-download", cut_after)
     if not state.dependencies_verified:
         state.dependencies_verified = True
         checkpoint("dependency-verify", cut_after)
@@ -171,6 +189,16 @@ def restore_model(state: Lifecycle, cut_after: str | None = None) -> None:
         raise Rejected("foundation")
     if not state.bpf_baseline:
         raise Rejected("bpf-drift")
+    if state.dependency_caches == "foreign":
+        raise Rejected("dependency-cache-identity")
+    if not state.dependency_intent and (
+        state.dependency_caches != "absent"
+        or state.dependencies_downloaded
+        or state.dependencies_verified
+        or state.dependency_binary
+        or state.preflight
+    ):
+        raise Rejected("dependency-resource-without-intent")
 
     receipt_prefix = tuple(name for name in SETUP if name in state.receipts)
     if receipt_prefix != SETUP[: len(receipt_prefix)]:
@@ -240,6 +268,9 @@ def restore_model(state: Lifecycle, cut_after: str | None = None) -> None:
 
 def exercise_lifecycle_model() -> None:
     setup_cuts = (
+        "dependency-intent",
+        "dependency-cache-create",
+        "dependency-download",
         "dependency-verify",
         "dependency-build",
         "dependency-receipt",
@@ -280,15 +311,17 @@ def exercise_lifecycle_model() -> None:
         ):
             fail(f"setup cut {cut} did not restore directly from partial state: {state}")
 
-    clean_stage = Lifecycle(dependencies_staged=True)
+    clean_stage = Lifecycle()
     run_model(clean_stage)
     if (
         not clean_stage.preflight
+        or clean_stage.dependency_caches != "exact"
+        or not clean_stage.dependencies_downloaded
         or clean_stage.runtime_temp != "exact"
         or clean_stage.receipts != set(SETUP)
     ):
-        fail(f"clean-stage fixture did not use the bound staged dependencies: {clean_stage}")
-    missing_dependencies = Lifecycle(dependencies_staged=False)
+        fail(f"clean-stage fixture did not produce dependencies before mutation: {clean_stage}")
+    missing_dependencies = Lifecycle(dependency_caches="foreign")
     try:
         run_model(missing_dependencies)
     except Rejected:
@@ -299,7 +332,7 @@ def exercise_lifecycle_model() -> None:
         ):
             fail("dependency preflight failure reached a host mutation")
     else:
-        fail("clean-stage fixture accepted missing staged dependencies")
+        fail("clean-stage fixture accepted a foreign dependency cache")
 
     restored_cuts = (
         "cleanup-intent",
@@ -333,6 +366,7 @@ def exercise_lifecycle_model() -> None:
         "foreign-veth": lambda state: setattr(state, "veth", "foreign"),
         "foreign-veth-alias": lambda state: setattr(state, "veth", "foreign-alias"),
         "foreign-runtime-temp": lambda state: setattr(state, "runtime_temp", "foreign"),
+        "foreign-dependency-cache": lambda state: setattr(state, "dependency_caches", "foreign"),
         "foreign-route": lambda state: setattr(state, "route", "foreign"),
         "foreign-offload": lambda state: setattr(state, "offload", "foreign"),
         "foreign-module": lambda state: setattr(state, "module", "foreign"),
@@ -399,11 +433,14 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
     required = (
         "readonly RUN_ID='c8e41d73'",
         "readonly RESOURCE_ID='5b8d30f1'",
-        "STATE_SCHEMA='owner,baseline,operation-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module,tested,cleanup-intent,restored'",
+        "STATE_SCHEMA='owner,baseline,operation-intent,dependency-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module,tested,cleanup-intent,restored'",
         "readonly LOCAL_IPV4='198.18.82.1'",
         "readonly REMOTE_IPV4='198.18.82.2'",
         "readonly ROUTE_MTU='1500'",
-        'readonly GO_MOD_CACHE="${STAGE_ROOT}/go-mod-cache"',
+        'readonly GO_CACHE="${EVIDENCE_ROOT}/go-cache"',
+        'readonly GO_MOD_CACHE="${EVIDENCE_ROOT}/go-mod-cache"',
+        'readonly GO_PATH="${EVIDENCE_ROOT}/go-path"',
+        'readonly GO_TMP="${EVIDENCE_ROOT}/go-tmp"',
         'readonly RUNTIME_TEMP="${STAGE_ROOT}/go-tmp-realhost-${RESOURCE_ID}"',
         'readonly VETH_A="wg${RESOURCE_ID:0:5}a"',
         'readonly VETH_B="wg${RESOURCE_ID:0:5}b"',
@@ -419,10 +456,13 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         "TestFakeTCPRealHostRoutedUDPSocketPartial",
         "TestFakeTCPRealHostRoutedUDPSegmentGSO",
         "GOPROXY=off",
+        "GOPROXY=https://proxy.golang.org",
+        "preflight-mod-download",
         "preflight-mod-verify",
         "preflight-build",
         "TestFakeTCPRealHostRoutedHarnessSelectedBinaryContract",
         "ensure_operation_intent",
+        "ensure_dependency_intent",
         "ensure_dependency_preflight",
         "ensure_runtime_temp",
         "ensure_veth_intent",
@@ -452,6 +492,10 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         'OP_ARGV=(/usr/sbin/ethtool -K "${VETH_A}" tso on)',
         'OP_ARGV=(/usr/sbin/rmmod "${MODULE_NAME}")',
         'OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${RUNTIME_TEMP}")',
+        'OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${GO_CACHE}")',
+        'OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${GO_MOD_CACHE}")',
+        'OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${GO_PATH}")',
+        'OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${GO_TMP}")',
     ):
         if literal not in builder:
             fail(f"argv builder is missing exact reverse operation {literal!r}")
@@ -463,7 +507,7 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
     if 'TMPDIR="${RUNTIME_TEMP}"' not in builder:
         fail("selected binary does not receive the reviewed real-host TMPDIR")
     if 'GOTMPDIR="${GO_TMP}" TMPDIR="${GO_TMP}"' not in runner:
-        fail("offline Go preflight does not retain the generic staged temp root")
+        fail("Go preflight does not use its run-owned temp root")
     run_tests = function_body(runner, "run_tests")
     if "/usr/bin/go" in run_tests or "list:" in run_tests:
         fail("post-mutation test phase can rebuild or rediscover dependencies")
@@ -498,6 +542,7 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         "ensure_owner",
         "ensure_baseline",
         "ensure_operation_intent",
+        "ensure_dependency_intent",
         "ensure_dependency_preflight",
         "ensure_runtime_temp",
         "ensure_veth_phase",
@@ -510,6 +555,7 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         item in preflight
         for item in (
             "preflight-mod-verify",
+            "preflight-mod-download",
             "preflight-build",
             "list:${name}",
             "preflight-contract",
@@ -534,6 +580,7 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
 
     cleanup = function_body(runner, "render_cleanup_intent")
     for receipt in (
+        "DEPENDENCY_INTENT",
         "DEPENDENCY",
         "VETH_INTENT",
         "VETH",
@@ -549,10 +596,15 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         fail("cleanup intent does not bind the optional offload baseline")
     if 'directory_binding "${RUNTIME_TEMP}"' not in cleanup:
         fail("cleanup intent does not bind the retained real-host TMPDIR identity")
+    for cache in ("GO_CACHE", "GO_MOD_CACHE", "GO_PATH", "GO_TMP"):
+        if f'directory_binding "${{{cache}}}"' not in cleanup:
+            fail(f"cleanup intent does not bind retained dependency directory {cache}")
 
     partial_restore = function_body(runner, "validate_partial_setup_for_restore")
     if "validate_runtime_temp_for_restore" not in partial_restore:
         fail("partial restore does not validate the retained real-host TMPDIR")
+    if "validate_dependency_caches_for_restore" not in partial_restore:
+        fail("partial restore does not validate run-owned dependency caches")
 
     for forbidden in ("ssh", "scp", "sudo", "credientials/", "192.168.10.28", "47.116.202.155"):
         if forbidden in seam:
@@ -567,6 +619,122 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
             fail(f"controller seam is missing {required_seam!r}")
 
 
+def exercise_empty_go_cache() -> None:
+    """Execute the producer/offline-consumer contract against genuinely empty caches."""
+
+    go = shutil.which("go")
+    if go is None:
+        fail("clean-stage cache fixture requires go")
+    with tempfile.TemporaryDirectory(prefix="wg-mix-routed-clean-cache-") as temp_text:
+        root = pathlib.Path(temp_text)
+        proxy = root / "proxy"
+        dependency = "example.com/cachedep"
+        version = "v1.0.0"
+        version_root = proxy / dependency / "@v"
+        version_root.mkdir(parents=True, mode=0o700)
+        (version_root / f"{version}.info").write_text(
+            json.dumps({"Version": version, "Time": "2026-01-01T00:00:00Z"}) + "\n",
+            encoding="utf-8",
+        )
+        (version_root / f"{version}.mod").write_text(
+            f"module {dependency}\n\ngo 1.20\n", encoding="utf-8"
+        )
+        with zipfile.ZipFile(
+            version_root / f"{version}.zip", "w", compression=zipfile.ZIP_DEFLATED
+        ) as archive:
+            archive.writestr(
+                f"{dependency}@{version}/dep.go",
+                "package cachedep\n\nconst Value = 42\n",
+            )
+
+        source = root / "source"
+        source.mkdir(mode=0o700)
+        (source / "go.mod").write_text(
+            "module example.com/fixture\n\ngo 1.20\n\n"
+            f"require {dependency} {version}\n",
+            encoding="utf-8",
+        )
+        (source / "fixture.go").write_text(
+            'package fixture\n\nimport "example.com/cachedep"\n\n'
+            "const Value = cachedep.Value\n",
+            encoding="utf-8",
+        )
+        (source / "fixture_test.go").write_text(
+            'package fixture\n\nimport "testing"\n\n'
+            "func TestValue(t *testing.T) { if Value != 42 { t.Fatal(Value) } }\n",
+            encoding="utf-8",
+        )
+
+        seed_dirs = {name: root / f"seed-{name}" for name in ("cache", "mod", "path", "tmp")}
+        for path in seed_dirs.values():
+            path.mkdir(mode=0o700)
+        base_env = {
+            "PATH": f"{pathlib.Path(go).parent}:/usr/bin:/bin",
+            "LC_ALL": "C",
+            "CGO_ENABLED": "0",
+            "GOENV": "off",
+            "GOTOOLCHAIN": "local",
+            "GOWORK": "off",
+            "GO111MODULE": "on",
+            "GOVCS": "*:off",
+            "GOPROXY": proxy.as_uri(),
+            "GOSUMDB": "off",
+            "GOCACHE": str(seed_dirs["cache"]),
+            "GOMODCACHE": str(seed_dirs["mod"]),
+            "GOPATH": str(seed_dirs["path"]),
+            "GOTMPDIR": str(seed_dirs["tmp"]),
+            "TMPDIR": str(seed_dirs["tmp"]),
+        }
+        subprocess.run(
+            [go, "-C", str(source), "mod", "download", "all"],
+            env=base_env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        if not (source / "go.sum").is_file():
+            fail("clean-stage fixture failed to seed a committed-style go.sum")
+
+        caches = {name: root / name for name in ("go-cache", "go-mod-cache", "go-path", "go-tmp")}
+        for path in caches.values():
+            path.mkdir(mode=0o700)
+            if any(path.iterdir()):
+                fail(f"clean-stage target cache was not empty: {path}")
+        clean_env = base_env | {
+            "GOFLAGS": "-mod=readonly",
+            "GOCACHE": str(caches["go-cache"]),
+            "GOMODCACHE": str(caches["go-mod-cache"]),
+            "GOPATH": str(caches["go-path"]),
+            "GOTMPDIR": str(caches["go-tmp"]),
+            "TMPDIR": str(caches["go-tmp"]),
+        }
+        subprocess.run(
+            [go, "-C", str(source), "mod", "download", "all"],
+            env=clean_env,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        offline_env = clean_env | {"GOPROXY": "off"}
+        for argv in (
+            [go, "-C", str(source), "mod", "verify"],
+            [go, "-C", str(source), "test", "-c", "-o", str(root / "fixture.test"), "."],
+        ):
+            subprocess.run(
+                argv,
+                env=offline_env,
+                check=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+        downloaded = caches["go-mod-cache"] / "cache" / "download" / dependency / "@v" / f"{version}.zip"
+        if not downloaded.is_file() or not (root / "fixture.test").is_file():
+            fail("clean-stage producer did not make the offline dependency build executable")
+
+
 def main() -> None:
     if len(sys.argv) != 3:
         fail("usage: test_routed_veth_harness_static.py ROOT_RUNNER CONTROLLER_SEAM")
@@ -574,7 +742,8 @@ def main() -> None:
     _, seam = read_regular(sys.argv[2])
     inspect_sources(runner_path, runner, seam)
     exercise_lifecycle_model()
-    print("routed-veth static safety and failure-cut lifecycle model: PASS")
+    exercise_empty_go_cache()
+    print("routed-veth static safety, empty-cache execution and failure-cut lifecycle model: PASS")
 
 
 if __name__ == "__main__":
