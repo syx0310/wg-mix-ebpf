@@ -646,6 +646,8 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(lease["path"], MODULE.interface_lease_path(spec, snapshot["host"]["netns"]))
         self.assertFalse(lease["path"].startswith(f"{spec.run_root}/"))
         self.assertEqual(plan["write_set"]["filesystem"].count(lease["path"]), 1)
+        self.assertIn(f"{spec.run_root}/journal-tail-recovery.json", plan["write_set"]["filesystem"])
+        self.assertIn(f"{spec.run_root}/journal-tail-recovery.pending", plan["write_set"]["filesystem"])
         self.assertTrue(lease["held_for_entire_run_or_restore"])
         self.assertTrue(lease["persistent_active_owner"])
         self.assertEqual(
@@ -1044,6 +1046,43 @@ class JournalDurabilityTests(unittest.TestCase):
                 reopened.close()
             self.assertTrue(path.read_bytes().endswith(b"\n"))
             self.assertNotIn(fragment, path.read_bytes())
+
+    def test_tail_receipt_survives_crash_between_truncate_and_audit(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary, "journal.jsonl")
+            journal = self.open_journal(path, create=True)
+            journal.append("BASELINE_CAPTURED", baseline_sha256="abcdef0123456789" * 4)
+            journal.close()
+            fragment = b'{"event":"CELL_MUTATION_INTENT"'
+            with path.open("ab") as stream:
+                stream.write(fragment)
+
+            append_record = MODULE.Journal._append_record
+
+            def crash_before_audit(instance, record):
+                if record.get("event") == "JOURNAL_TAIL_TRUNCATED":
+                    raise MODULE.HarnessError("injected post-truncate crash")
+                return append_record(instance, record)
+
+            with mock.patch.object(MODULE.Journal, "_append_record", new=crash_before_audit):
+                with self.assertRaisesRegex(MODULE.HarnessError, "post-truncate crash"):
+                    self.open_journal(path, create=False)
+
+            receipt_path = pathlib.Path(temporary, "journal-tail-recovery.json")
+            receipt_payload = receipt_path.read_bytes()
+            receipt = json.loads(receipt_payload)
+            self.assertEqual(receipt["removed_sha256"], MODULE.sha256_bytes(fragment))
+            self.assertEqual(receipt["removed_bytes"], len(fragment))
+            self.assertTrue(path.read_bytes().endswith(b"\n"))
+
+            reopened = self.open_journal(path, create=False)
+            try:
+                audit = reopened.events[-1]
+                self.assertEqual(audit["event"], "JOURNAL_TAIL_TRUNCATED")
+                self.assertEqual(audit["removed_sha256"], MODULE.sha256_bytes(fragment))
+                self.assertEqual(audit["receipt_sha256"], MODULE.sha256_bytes(receipt_payload))
+            finally:
+                reopened.close()
 
     def test_complete_or_middle_corruption_is_never_truncated(self):
         for corruption in ("complete-tail", "middle"):

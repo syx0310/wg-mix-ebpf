@@ -28,6 +28,7 @@ from typing import Any, Mapping, Sequence
 
 SCHEMA = "wg-mix-ebpf-b82-realnic-acceptance-plan-v1"
 JOURNAL_SCHEMA = "wg-mix-ebpf-b82-realnic-acceptance-journal-v1"
+JOURNAL_TAIL_RECEIPT_SCHEMA = "wg-mix-ebpf-b82-realnic-journal-tail-receipt-v1"
 LEASE_SCHEMA = "wg-mix-ebpf-b82-realnic-interface-lease-v1"
 READ_ONLY_PEER = "47.116.202.155"
 RUN_ROOT_PREFIX = "/run/wg-mix-ebpf-realnic-acceptance-"
@@ -1315,6 +1316,8 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         f"{spec.run_root}/owner.json",
         f"{spec.run_root}/approved-plan.json",
         f"{spec.run_root}/journal.jsonl",
+        f"{spec.run_root}/journal-tail-recovery.json",
+        f"{spec.run_root}/journal-tail-recovery.pending",
         f"{spec.run_root}/baseline.json",
         f"{spec.run_root}/results.json",
         f"{spec.run_root}/complete.json",
@@ -1733,6 +1736,9 @@ def read_regular_file(path: str, maximum: int = 16 << 20) -> bytes:
 class Journal:
     def __init__(self, path: str, run_id: str, plan_sha256: str, *, create: bool):
         self.path = path
+        parent = os.path.dirname(path)
+        self.tail_receipt_path = os.path.join(parent, "journal-tail-recovery.json")
+        self.tail_receipt_pending_path = os.path.join(parent, "journal-tail-recovery.pending")
         self.run_id = run_id
         self.plan_sha256 = plan_sha256
         flags = os.O_RDWR | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
@@ -1751,10 +1757,117 @@ class Journal:
             self._tail_recovery: dict[str, Any] | None = None
             self.events = [] if create else self._read_events()
             if self._tail_recovery is not None:
-                self.append("JOURNAL_TAIL_TRUNCATED", **self._tail_recovery)
+                self._append_record(self._tail_recovery)
         except BaseException:
             os.close(self.descriptor)
             raise
+
+    def _tail_audit_record(self, receipt: Mapping[str, Any], receipt_sha256: str) -> dict[str, Any]:
+        return {
+            "schema": JOURNAL_SCHEMA,
+            "run_id": self.run_id,
+            "plan_sha256": self.plan_sha256,
+            "sequence": receipt["audit_sequence"],
+            "monotonic_ns": receipt["audit_monotonic_ns"],
+            "utc": receipt["audit_utc"],
+            "event": "JOURNAL_TAIL_TRUNCATED",
+            "removed_bytes": receipt["removed_bytes"],
+            "removed_sha256": receipt["removed_sha256"],
+            "complete_bytes": receipt["complete_bytes"],
+            "complete_sha256": receipt["complete_sha256"],
+            "receipt_sha256": receipt_sha256,
+        }
+
+    def _validate_tail_receipt(self, payload: bytes) -> tuple[dict[str, Any], str]:
+        try:
+            receipt = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HarnessError("journal tail receipt is not JSON") from exc
+        if canonical_json(receipt) != payload:
+            raise HarnessError("journal tail receipt is not canonical")
+        if (
+            receipt.get("schema") != JOURNAL_TAIL_RECEIPT_SCHEMA
+            or receipt.get("run_id") != self.run_id
+            or receipt.get("plan_sha256") != self.plan_sha256
+            or type(receipt.get("complete_bytes")) is not int
+            or receipt["complete_bytes"] < 0
+            or not SHA256_RE.fullmatch(str(receipt.get("complete_sha256", "")))
+            or type(receipt.get("removed_bytes")) is not int
+            or receipt["removed_bytes"] <= 0
+            or not SHA256_RE.fullmatch(str(receipt.get("removed_sha256", "")))
+            or type(receipt.get("audit_sequence")) is not int
+            or receipt["audit_sequence"] <= 0
+            or type(receipt.get("audit_monotonic_ns")) is not int
+            or receipt["audit_monotonic_ns"] <= 0
+            or not isinstance(receipt.get("audit_utc"), str)
+        ):
+            raise HarnessError("journal tail receipt identity or shape is invalid")
+        return receipt, sha256_bytes(payload)
+
+    def _load_tail_receipt(self) -> tuple[dict[str, Any], str] | None:
+        if not os.path.lexists(self.tail_receipt_path):
+            return None
+        return self._validate_tail_receipt(read_regular_file(self.tail_receipt_path))
+
+    def _store_tail_receipt(self, receipt: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
+        payload = canonical_json(receipt)
+        flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            descriptor = os.open(self.tail_receipt_pending_path, flags, 0o600)
+        except OSError as exc:
+            raise HarnessError(f"journal tail receipt staging open failed: {exc}") from exc
+        try:
+            metadata = os.fstat(descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise HarnessError("journal tail receipt staging must be a single-link regular file")
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            offset = 0
+            while offset < len(payload):
+                written = os.write(descriptor, payload[offset:])
+                if written <= 0:
+                    raise HarnessError("journal tail receipt staging write made no progress")
+                offset += written
+            os.ftruncate(descriptor, len(payload))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        try:
+            os.replace(self.tail_receipt_pending_path, self.tail_receipt_path)
+            directory = os.open(os.path.dirname(self.tail_receipt_path), os.O_RDONLY)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        except OSError as exc:
+            raise HarnessError(f"journal tail receipt commit failed: {exc}") from exc
+        return self._validate_tail_receipt(read_regular_file(self.tail_receipt_path))
+
+    def _new_tail_receipt(
+        self,
+        complete_payload: bytes,
+        fragment: bytes,
+        event_count: int,
+    ) -> tuple[dict[str, Any], str]:
+        receipt = {
+            "schema": JOURNAL_TAIL_RECEIPT_SCHEMA,
+            "run_id": self.run_id,
+            "plan_sha256": self.plan_sha256,
+            "complete_bytes": len(complete_payload),
+            "complete_sha256": sha256_bytes(complete_payload),
+            "removed_bytes": len(fragment),
+            "removed_sha256": sha256_bytes(fragment),
+            "audit_sequence": event_count + 1,
+            "audit_monotonic_ns": time.monotonic_ns(),
+            "audit_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        return self._store_tail_receipt(receipt)
+
+    @staticmethod
+    def _receipt_prefix_matches(receipt: Mapping[str, Any], complete_payload: bytes) -> bool:
+        return (
+            receipt["complete_bytes"] == len(complete_payload)
+            and receipt["complete_sha256"] == sha256_bytes(complete_payload)
+        )
 
     def _read_events(self) -> list[dict[str, Any]]:
         os.lseek(self.descriptor, 0, os.SEEK_SET)
@@ -1771,14 +1884,11 @@ class Journal:
             remaining -= len(chunk)
         payload = b"".join(chunks)
         complete_payload = payload
+        fragment = b""
         if payload and not payload.endswith(b"\n"):
             boundary = payload.rfind(b"\n") + 1
             complete_payload = payload[:boundary]
             fragment = payload[boundary:]
-            self._tail_recovery = {
-                "removed_bytes": len(fragment),
-                "removed_sha256": sha256_bytes(fragment),
-            }
         events: list[dict[str, Any]] = []
         for index, raw in enumerate(complete_payload.splitlines(), start=1):
             try:
@@ -1795,24 +1905,52 @@ class Journal:
             ):
                 raise HarnessError("journal identity or sequence is invalid")
             events.append(event)
-        if self._tail_recovery is not None:
+
+        receipt_state = self._load_tail_receipt()
+        receipt: dict[str, Any] | None = None
+        receipt_sha256 = ""
+        receipt_audited = False
+        if receipt_state is not None:
+            receipt, receipt_sha256 = receipt_state
+            expected_audit = self._tail_audit_record(receipt, receipt_sha256)
+            receipt_audited = expected_audit in events
+
+        if fragment:
+            if receipt is not None and not receipt_audited:
+                if not self._receipt_prefix_matches(receipt, complete_payload):
+                    raise HarnessError("journal advanced without its durable tail-recovery audit")
+                expected_audit_payload = canonical_json(self._tail_audit_record(receipt, receipt_sha256))
+                original_fragment = (
+                    len(fragment) == receipt["removed_bytes"]
+                    and sha256_bytes(fragment) == receipt["removed_sha256"]
+                )
+                if not original_fragment and not expected_audit_payload.startswith(fragment):
+                    raise HarnessError("journal tail does not match its durable recovery receipt")
+            else:
+                receipt, receipt_sha256 = self._new_tail_receipt(
+                    complete_payload,
+                    fragment,
+                    len(events),
+                )
+            self._tail_recovery = self._tail_audit_record(receipt, receipt_sha256)
             os.ftruncate(self.descriptor, len(complete_payload))
             os.fsync(self.descriptor)
+        elif receipt is not None and not receipt_audited:
+            if not self._receipt_prefix_matches(receipt, complete_payload):
+                raise HarnessError("journal tail receipt does not match the repaired journal prefix")
+            self._tail_recovery = self._tail_audit_record(receipt, receipt_sha256)
         return events
 
-    def append(self, event: str, **fields: Any) -> None:
+    def _append_record(self, record: Mapping[str, Any]) -> None:
         if self._poisoned:
             raise HarnessError("journal is poisoned after an incomplete append")
-        record = {
-            "schema": JOURNAL_SCHEMA,
-            "run_id": self.run_id,
-            "plan_sha256": self.plan_sha256,
-            "sequence": len(self.events) + 1,
-            "monotonic_ns": time.monotonic_ns(),
-            "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "event": event,
-            **fields,
-        }
+        if (
+            record.get("schema") != JOURNAL_SCHEMA
+            or record.get("run_id") != self.run_id
+            or record.get("plan_sha256") != self.plan_sha256
+            or record.get("sequence") != len(self.events) + 1
+        ):
+            raise HarnessError("journal append record identity or sequence is invalid")
         payload = canonical_json(record)
         try:
             offset = 0
@@ -1827,7 +1965,19 @@ class Journal:
             if isinstance(exc, HarnessError):
                 raise
             raise HarnessError(f"journal append failed: {exc}") from exc
-        self.events.append(record)
+        self.events.append(dict(record))
+
+    def append(self, event: str, **fields: Any) -> None:
+        self._append_record({
+            "schema": JOURNAL_SCHEMA,
+            "run_id": self.run_id,
+            "plan_sha256": self.plan_sha256,
+            "sequence": len(self.events) + 1,
+            "monotonic_ns": time.monotonic_ns(),
+            "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": event,
+            **fields,
+        })
 
     def close(self) -> None:
         fcntl.flock(self.descriptor, fcntl.LOCK_UN)
