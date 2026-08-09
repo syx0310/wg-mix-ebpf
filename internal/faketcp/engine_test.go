@@ -415,21 +415,35 @@ func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 	})
 }
 
-func TestNewAndRepeatedRestartNeverGrantImmediateSYNBurst(t *testing.T) {
+func TestEveryEngineRestartStartsWithZeroSYNCredit(t *testing.T) {
 	seed, clock := testEngine(t, nil)
 	options := seed.opts
-	for restart := 0; restart < 3; restart++ {
+	// Exercise different wall-clock gaps before each recreation. New uses the
+	// current instant as its own admission epoch, so elapsed time belonging to
+	// an earlier owner must never become credit in the new owner.
+	for restart := 0; restart < 64; restart++ {
+		steps := (restart*17 + 3) % (options.SYNBurst*3 + 1)
+		clock.Add(time.Duration(steps)*options.SYNRateInterval +
+			time.Duration(restart%2)*(options.SYNRateInterval/2))
 		engine, err := New(options)
 		if err != nil {
 			t.Fatal(err)
 		}
-		flow := testFlow(uint16(31000 + restart))
-		actions, err := engine.Inbound(flow, Segment{Flags: FlagSYN, Sequence: uint32(restart + 1)})
-		if err != nil || len(actions) != 1 || actions[0].Reason != "syn-rate-global" {
-			t.Fatalf("restart %d minted admission budget: actions=%#v err=%v", restart, actions, err)
+		for attempt := 0; attempt < 3; attempt++ {
+			flow := testFlow(uint16(31000 + restart*3 + attempt))
+			actions, err := engine.Inbound(flow, Segment{
+				Flags: FlagSYN, Sequence: uint32(restart*3 + attempt + 1),
+			})
+			if err != nil || len(actions) != 1 || actions[0].Reason != "syn-rate-global" {
+				t.Fatalf("restart %d attempt %d minted admission credit: actions=%#v err=%v",
+					restart, attempt, actions, err)
+			}
 		}
-		if len(engine.synSources) != 0 || engine.synSourceLRU.Len() != 0 {
-			t.Fatalf("restart %d populated source ledger while globally empty", restart)
+		if engine.globalSYNs.tokens != 0 ||
+			!engine.globalSYNs.lastRefill.Equal(clock.now) ||
+			len(engine.synSources) != 0 || engine.synSourceLRU.Len() != 0 {
+			t.Fatalf("restart %d did not retain zero-credit epoch: bucket=%+v sources=%d lru=%d",
+				restart, engine.globalSYNs, len(engine.synSources), engine.synSourceLRU.Len())
 		}
 	}
 
