@@ -6,6 +6,7 @@ umask 077
 readonly RUN_ID='7e42a19c'
 readonly SOURCE="/run/wg-mix-ebpf-source-stages/${RUN_ID}/source"
 readonly ROOT_RUNNER="${SOURCE}/scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh"
+readonly EXPECTED_SELF="${SOURCE}/scripts/realhost-b82-routed-veth-v1/controller-seam.sh"
 
 MODE=''
 COMMIT=''
@@ -96,6 +97,7 @@ main() {
     return
   fi
   [[ "$EUID" == 0 ]] || fail 'root-required' 77
+  [[ "$(/usr/bin/readlink -e -- "$0")" == "${EXPECTED_SELF}" ]] || fail 'self-path' 79
   [[ -f "${ROOT_RUNNER}" && ! -L "${ROOT_RUNNER}" ]] || fail 'runner-identity' 79
   exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C "${RUNNER_ARGV[@]}"
 }

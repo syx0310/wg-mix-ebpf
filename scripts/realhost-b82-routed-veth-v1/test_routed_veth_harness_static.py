@@ -252,7 +252,7 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         r"/proc/1/root",
         r"(?:^|\s)--privileged(?:\s|$)",
         r"\|\|\s*true",
-        r"/dev/null",
+        r"(?:>|2>)\s*/dev/null",
         r"while\s+true",
     )
     for name, source in production.items():

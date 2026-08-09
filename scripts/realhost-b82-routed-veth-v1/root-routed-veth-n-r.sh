@@ -44,7 +44,10 @@ readonly EXPERIMENTAL_OBJECT="${EXPECTED_SOURCE}/build/wg_mix_faketcp_experiment
 readonly BASELINE_OBJECT="${EXPECTED_SOURCE}/build/wg_mix_tc.o"
 readonly MODULE_OBJECT="${EXPECTED_SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko"
 readonly SELF_RELATIVE='scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh'
+readonly SEAM_RELATIVE='scripts/realhost-b82-routed-veth-v1/controller-seam.sh'
 readonly ROUTED_TEST_RELATIVE='internal/dataplane/faketcp_routed_realhost_linux_test.go'
+readonly NEGATIVE_TEST_RELATIVE='internal/dataplane/faketcp_realhost_linux_test.go'
+readonly GSO_KFUNC_RELATIVE='kernel/faketcp_checksum/wg_mix_faketcp_checksum.c'
 readonly NEGATIVE_TEST='TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration'
 readonly -a POSITIVE_TESTS=(
   TestFakeTCPRealHostRoutedIPHdrInclNone
@@ -76,6 +79,14 @@ readonly -a GO_ENV=(
   CGO_ENABLED=0 GOENV=off GOFLAGS= GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off
   GOCACHE="${GO_CACHE}" GOMODCACHE="${GO_MOD_CACHE}" GOPATH="${GO_PATH}"
   GOTMPDIR="${TEMP_ROOT}" TMPDIR="${TEMP_ROOT}" GOWORK=off GO111MODULE=on
+)
+readonly -a GIT_COMMAND=(
+  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C
+  GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
+  GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0
+  /usr/bin/git --no-pager --no-replace-objects
+  -c core.attributesFile=/dev/null -c core.fsmonitor=false
+  -c core.hooksPath=/dev/null
 )
 
 usage() {
@@ -374,7 +385,7 @@ phase_matches() {
 }
 
 verify_source_and_artifacts() {
-  local actual head mapped self_blob actual_blob status line
+  local actual head mapped self_blob actual_blob status line identity
   [[ "$EUID" == 0 ]] || fail 'root-required' 77
   [[ "$(/usr/bin/hostname)" == "${EXPECTED_HOSTNAME}" ]] || fail 'hostname' 77
   [[ "$(/usr/bin/cat /etc/machine-id)" == "${EXPECTED_MACHINE_ID}" ]] || fail 'machine-id' 77
@@ -385,11 +396,11 @@ verify_source_and_artifacts() {
   [[ "${BOOT_ID}" =~ ^[0-9a-f-]{36}$ ]] || fail 'boot-id-format' 77
   require_root_directory "${STAGE_ROOT}" || fail 'stage-root-identity' 79
   [[ -d "${SOURCE}/.git" && ! -L "${SOURCE}" ]] || fail 'source-identity' 79
-  head="$(/usr/bin/git -C "${SOURCE}" rev-parse --verify HEAD^{commit})" || fail 'source-head'
+  head="$("${GIT_COMMAND[@]}" -C "${SOURCE}" rev-parse --verify HEAD^{commit})" || fail 'source-head'
   [[ "${head}" == "${COMMIT}" ]] || fail 'source-commit' 79
-  /usr/bin/git -C "${SOURCE}" diff --quiet "${COMMIT}" -- || fail 'tracked-worktree-drift' 79
-  /usr/bin/git -C "${SOURCE}" diff --cached --quiet "${COMMIT}" -- || fail 'index-drift' 79
-  status="$(/usr/bin/git -C "${SOURCE}" status --porcelain=v1 --untracked-files=all)" || fail 'source-status'
+  "${GIT_COMMAND[@]}" -C "${SOURCE}" diff --quiet "${COMMIT}" -- || fail 'tracked-worktree-drift' 79
+  "${GIT_COMMAND[@]}" -C "${SOURCE}" diff --cached --quiet "${COMMIT}" -- || fail 'index-drift' 79
+  status="$("${GIT_COMMAND[@]}" -C "${SOURCE}" status --porcelain=v1 --untracked-files=all)" || fail 'source-status'
   while IFS= read -r line; do
     [[ -z "${line}" || "${line}" == '?? build/'* ]] || fail 'untracked-source-input' 79
   done <<<"${status}"
@@ -399,19 +410,33 @@ verify_source_and_artifacts() {
     "${MODULE_OBJECT}|${MODULE_SHA256}"; do
     IFS='|' read -r path expected <<<"${spec}"
     [[ -f "${path}" && ! -L "${path}" ]] || fail "artifact-shape:${path}" 79
-    [[ "$(/usr/bin/stat -Lc '%u:%g:%h:%F' -- "${path}")" == '0:0:1:regular file' ]] || fail "artifact-owner:${path}" 79
+    identity="$(/usr/bin/stat -Lc '%u:%g:%a:%h:%F' -- "${path}")" || fail "artifact-stat:${path}"
+    [[ "${identity}" == '0:0:600:1:regular file' || "${identity}" == '0:0:644:1:regular file' ]] || fail "artifact-owner:${path}" 79
     actual="$(sha256_file "${path}")" || fail "artifact-sha-read:${path}"
     [[ "${actual}" == "${expected}" ]] || fail "artifact-sha:${path}" 79
   done
-  for relative in "${SELF_RELATIVE}" "${ROUTED_TEST_RELATIVE}"; do
-    mapped="$(/usr/bin/git -C "${SOURCE}" rev-parse "${COMMIT}:${relative}")" || fail "mapped-blob:${relative}"
-    actual_blob="$(/usr/bin/git -C "${SOURCE}" hash-object -- "${SOURCE}/${relative}")" || fail "actual-blob:${relative}"
+  for relative in "${SELF_RELATIVE}" "${SEAM_RELATIVE}" "${ROUTED_TEST_RELATIVE}" \
+    "${NEGATIVE_TEST_RELATIVE}" "${GSO_KFUNC_RELATIVE}"; do
+    mapped="$("${GIT_COMMAND[@]}" -C "${SOURCE}" rev-parse "${COMMIT}:${relative}")" || fail "mapped-blob:${relative}"
+    actual_blob="$("${GIT_COMMAND[@]}" -C "${SOURCE}" hash-object -- "${SOURCE}/${relative}")" || fail "actual-blob:${relative}"
     [[ "${mapped}" == "${actual_blob}" ]] || fail "blob-drift:${relative}" 79
   done
   self_blob="$(/usr/bin/readlink -e -- "$0")" || fail 'self-canonical'
   [[ "${self_blob}" == "${SOURCE}/${SELF_RELATIVE}" ]] || fail 'self-path' 79
   EXPECTED_MODULE_SRCVERSION="$(/usr/sbin/modinfo -F srcversion -- "${MODULE_OBJECT}")" || fail 'module-srcversion'
   [[ "${EXPECTED_MODULE_SRCVERSION}" =~ ^[0-9A-Fa-f]{8,64}$ ]] || fail 'module-srcversion-format' 79
+  for literal in \
+    'AF_PACKET fixture as negative evidence only' \
+    'fakeTCPRealHostStatMTUReject: 3' \
+    'fakeTCPRealHostMTURouteUnknownAuditKey: 3'; do
+    [[ "$(/usr/bin/grep -Fc -- "${literal}" "${SOURCE}/${NEGATIVE_TEST_RELATIVE}")" == 1 ]] || fail 'negative-source-contract' 78
+  done
+  for literal in \
+    'if (!skb_valid_dst(skb))' \
+    'if (READ_ONCE(dst->dev) != device)' \
+    'route_mtu = dst_mtu(dst)'; do
+    [[ "$(/usr/bin/grep -Fc -- "${literal}" "${SOURCE}/${GSO_KFUNC_RELATIVE}")" == 1 ]] || fail 'routed-pmtu-source-contract' 78
+  done
 }
 
 ensure_directory() {
