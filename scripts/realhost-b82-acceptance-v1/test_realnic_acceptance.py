@@ -459,6 +459,50 @@ class ProcessGroupTests(unittest.TestCase):
                     parent.wait(timeout=5)
                 self.exact_group_cleanup(pgid)
 
+    def test_signal_during_error_convergence_is_deferred_until_group_absent(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            metadata_path = pathlib.Path(temporary, "owned.json")
+            converging_path = pathlib.Path(temporary, "converging.json")
+            wrapper = self.stubborn_wrapper(metadata_path)
+            module_path = str(MODULE_PATH)
+            harness = (
+                "import importlib.util,json,pathlib,sys\n"
+                f"spec=importlib.util.spec_from_file_location('converge_fixture',{module_path!r})\n"
+                "module=importlib.util.module_from_spec(spec)\n"
+                "sys.modules[spec.name]=module\n"
+                "spec.loader.exec_module(module)\n"
+                "original_wait=module.RunningProcess._wait_group_absent\n"
+                "def marked_wait(self,timeout):\n"
+                f" pathlib.Path({str(converging_path)!r}).write_text(json.dumps({{'pgid':self.pgid}}))\n"
+                " return original_wait(self,timeout)\n"
+                "module.RunningProcess._wait_group_absent=marked_wait\n"
+                "rc=0\n"
+                "try:\n"
+                " with module.TerminationBoundary():\n"
+                f"  with module.OwnedProcessScope(module.CommandRunner(),[sys.executable,'-c',{wrapper!r}]):\n"
+                "   raise module.HarnessError('ordinary body failure')\n"
+                "except module.HarnessAbort:\n"
+                " rc=125\n"
+                "except module.HarnessError:\n"
+                " rc=126\n"
+                "raise SystemExit(rc)\n"
+            )
+            parent = subprocess.Popen([sys.executable, "-c", harness], start_new_session=True)
+            pgid = None
+            try:
+                metadata = self.wait_metadata(metadata_path)
+                pgid = metadata["pgid"]
+                self.wait_metadata(converging_path)
+                os.kill(parent.pid, signal.SIGTERM)
+                self.assertEqual(parent.wait(timeout=12), 125)
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(pgid, 0)
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait(timeout=5)
+                self.exact_group_cleanup(pgid)
+
     def test_boundary_covers_term_int_and_hup(self):
         wanted = {signal.SIGTERM, signal.SIGINT}
         if hasattr(signal, "SIGHUP"):

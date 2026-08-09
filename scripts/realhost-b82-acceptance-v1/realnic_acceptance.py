@@ -298,6 +298,8 @@ class CommandRunner:
                         try:
                             owned.converge()
                         except BaseException as cleanup_error:
+                            if owned.proven_absent and isinstance(cleanup_error, HarnessAbort):
+                                raise
                             raise HarnessError(
                                 f"start interruption ({abort_error}); process-group convergence failure ({cleanup_error})"
                             ) from cleanup_error
@@ -327,6 +329,8 @@ class OwnedProcessScope:
         try:
             self.process.converge()
         except BaseException as cleanup_error:
+            if self.process.proven_absent and isinstance(cleanup_error, HarnessAbort):
+                raise
             if error is not None:
                 raise HarnessError(
                     f"command failure ({error}); process-group convergence failure ({cleanup_error})"
@@ -431,34 +435,41 @@ class RunningProcess:
         term_timeout: float = 5.0,
         kill_timeout: float = 5.0,
     ) -> tuple[int, bytes, bytes, dict[str, Any]]:
-        self.convergence_attempted = True
-        report: dict[str, Any] = {
-            "pid": self.pid,
-            "pgid": self.pgid,
-            "term": "not-needed",
-            "kill": "not-needed",
-        }
-        if self._group_exists():
-            report["term"] = self._signal_group(signal.SIGTERM)
-        if not self._wait_group_absent(term_timeout):
-            report["kill"] = self._signal_group(signal.SIGKILL)
-            if not self._wait_group_absent(kill_timeout):
-                raise HarnessError(f"owned process group {self.pgid} survived TERM and KILL: {report}")
-        if self._process.poll() is None:
-            try:
-                self._process.wait(timeout=kill_timeout)
-            except subprocess.TimeoutExpired as exc:
-                raise HarnessError("owned wrapper was not reaped after process-group convergence") from exc
-        stdout, stderr = self._collect_output()
-        if self._group_exists():
-            raise HarnessError(f"owned process group {self.pgid} still exists after convergence")
-        rc = self._process.returncode
-        if rc is None:
-            raise HarnessError("owned wrapper has no terminal return code")
-        report["group_absent"] = True
-        report["wrapper_rc"] = rc
-        self.proven_absent = True
-        return rc, stdout, stderr, report
+        previous_mask: set[signal.Signals] | None = None
+        if hasattr(signal, "pthread_sigmask"):
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, termination_signals())
+        try:
+            self.convergence_attempted = True
+            report: dict[str, Any] = {
+                "pid": self.pid,
+                "pgid": self.pgid,
+                "term": "not-needed",
+                "kill": "not-needed",
+            }
+            if self._group_exists():
+                report["term"] = self._signal_group(signal.SIGTERM)
+            if not self._wait_group_absent(term_timeout):
+                report["kill"] = self._signal_group(signal.SIGKILL)
+                if not self._wait_group_absent(kill_timeout):
+                    raise HarnessError(f"owned process group {self.pgid} survived TERM and KILL: {report}")
+            if self._process.poll() is None:
+                try:
+                    self._process.wait(timeout=kill_timeout)
+                except subprocess.TimeoutExpired as exc:
+                    raise HarnessError("owned wrapper was not reaped after process-group convergence") from exc
+            stdout, stderr = self._collect_output()
+            if self._group_exists():
+                raise HarnessError(f"owned process group {self.pgid} still exists after convergence")
+            rc = self._process.returncode
+            if rc is None:
+                raise HarnessError("owned wrapper has no terminal return code")
+            report["group_absent"] = True
+            report["wrapper_rc"] = rc
+            self.proven_absent = True
+            return rc, stdout, stderr, report
+        finally:
+            if previous_mask is not None:
+                signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def snapshot_command_table(spec: CoreSpec) -> list[tuple[str, list[str]]]:
@@ -2797,6 +2808,8 @@ def run_traffic(
                     report=report,
                 )
             except BaseException as stop_error:
+                if process.proven_absent and isinstance(stop_error, HarnessAbort):
+                    raise
                 journal.append(
                     "OWNED_PROCESS_GROUP_STOP_FAILED",
                     label=monitor["label"],
