@@ -13,7 +13,10 @@ import (
 )
 
 const (
-	fakeTCPStatsKernelMapName = "faketcp_stats_map"
+	// Linux exposes only BPF_OBJ_NAME_LEN-1 bytes through Map.Info().Name.
+	// The ELF resource remains "faketcp_stats_map" in dataplane; this is its
+	// exact, deliberately separate kernel identity, not a prefix fallback.
+	fakeTCPStatsKernelMapName = "faketcp_stats_m"
 	fakeTCPEventErrorStatKey  = uint32(8)
 	fakeTCPStatsCount         = uint32(17)
 )

@@ -33,6 +33,7 @@ import (
 
 const (
 	fakeTCPRealHostObjectSizeLimit              = 128 << 20
+	fakeTCPRealHostStatsKernelMapName           = "faketcp_stats_m"
 	fakeTCPRealHostStatCount                    = 17
 	fakeTCPRealHostStatEgressOK                 = uint32(0)
 	fakeTCPRealHostStatIngressOK                = uint32(1)
@@ -875,7 +876,7 @@ func buildFakeTCPRealHostRuntime(
 				if err != nil {
 					return nil, fmt.Errorf("inspect FakeTCP real-host stats map: %w", err)
 				}
-				if statsInfo.Name != fakeTCPStatsMapName {
+				if statsInfo.Name != fakeTCPRealHostStatsKernelMapName {
 					return nil, fmt.Errorf("FakeTCP real-host stats map name=%q", statsInfo.Name)
 				}
 				return slowPath, nil
