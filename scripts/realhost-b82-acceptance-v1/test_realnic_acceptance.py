@@ -845,6 +845,26 @@ class CounterGateTests(unittest.TestCase):
         with self.assertRaisesRegex(MODULE.HarnessError, "schema changed"):
             MODULE.counter_delta(baseline, {key: value for key, value in baseline.items() if key != "/usr/sbin/ip:rx_bytes"})
 
+    def test_checksum_success_counters_are_observed_but_failures_are_gated(self):
+        success = ("csum_good", "csum_unneeded", "hw_csum")
+        failures = ("csum_err", "checksum_error", "bad_csum")
+        baseline = {
+            **{f"/usr/sbin/ethtool:{name}": 0 for name in success},
+            **{f"/usr/sbin/ethtool:{name}": 0 for name in failures},
+        }
+        for name in success:
+            key = f"/usr/sbin/ethtool:{name}"
+            with self.subTest(success=name):
+                self.assertFalse(MODULE.counter_id_is_failure(key))
+                delta = MODULE.counter_delta(baseline, {**baseline, key: 1})
+                self.assertEqual(delta[key], 1)
+        for name in failures:
+            key = f"/usr/sbin/ethtool:{name}"
+            with self.subTest(failure=name):
+                self.assertTrue(MODULE.counter_id_is_failure(key))
+                with self.assertRaisesRegex(MODULE.HarnessError, "counters grew"):
+                    MODULE.counter_delta(baseline, {**baseline, key: 1})
+
 
 class PlannerTests(unittest.TestCase):
     def test_plan_rejects_incomplete_or_non_failure_counter_schemas(self):
@@ -974,6 +994,12 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(plan["counter_failure_policy"], MODULE.counter_failure_policy())
         self.assertIn("failure", plan["counter_failure_policy"]["failure_tokens"])
         self.assertIn("no_buffer", plan["counter_failure_policy"]["failure_phrases"])
+        self.assertEqual(
+            plan["counter_failure_policy"]["qualified_observation_tokens"],
+            ["checksum", "csum"],
+        )
+        self.assertNotIn("csum", plan["counter_failure_policy"]["failure_tokens"])
+        self.assertNotIn("checksum", plan["counter_failure_policy"]["failure_token_prefixes"])
         self.assertIn("tx-checksum-ipv4", plan["owned_feature_closure"])
         self.assertNotIn("foreign-offload", plan["owned_feature_closure"])
         self.assertEqual(plan["counter_gate"], MODULE.counter_gate_contract(plan["baseline"]))

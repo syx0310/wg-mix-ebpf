@@ -1158,18 +1158,21 @@ def monitor_command_table(spec: CoreSpec) -> list[tuple[str, list[str]]]:
 
 def counter_failure_policy() -> dict[str, Any]:
     return {
-        "schema": "wg-mix-ebpf-realnic-counter-failure-policy-v1",
+        "schema": "wg-mix-ebpf-realnic-counter-failure-policy-v2",
         "scope": "all ethtool -S and ip -s link counters",
         "growth_action": "reject",
         "name_normalization": "lowercase ASCII alphanumeric tokens split on non-alphanumeric bytes",
+        "qualified_observation_tokens": ["checksum", "csum"],
+        "qualified_observation_rule": (
+            "checksum/csum growth is observed unless the same canonical counter ID also has "
+            "a failure token, prefix, or phrase"
+        ),
         "failure_tokens": sorted(
             {
                 "abort",
                 "aborted",
                 "bad",
-                "checksum",
                 "crc",
-                "csum",
                 "discard",
                 "discards",
                 "drop",
@@ -1213,9 +1216,7 @@ def counter_failure_policy() -> dict[str, Any]:
             {
                 "allocfail",
                 "bad",
-                "checksum",
                 "crc",
-                "csum",
                 "discard",
                 "drop",
                 "err",
