@@ -26,20 +26,41 @@ OUTPUT_REFS = {
     "main": "refs/heads/main",
     "legacy-public-history": "refs/heads/legacy-public-history",
 }
-DENIED_EXACT = {
-    b"AGENTS.md",
+DENIED_ROOTS = (
+    b".worktree",
+    b"credentials",
+    b"credientials",
     b"docs",
     b"refs",
-    b"credientials",
-    b".worktree",
     b"scripts/private-release",
-}
-DENIED_PREFIXES = tuple(path + b"/" for path in DENIED_EXACT if path != b"AGENTS.md")
+)
+DENIED_LITERAL_PREFIXES = (b"scripts/realhost-b82-",)
+GRAPH_BOUND_HEADERS = (b"gpgsig", b"gpgsig-sha256", b"mergetag")
+EMPTY_TREE_OID = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
+DIAGNOSTIC_LIMIT = 2048
 OID_RE = re.compile(r"[0-9a-f]{40}\Z")
 
 
 class ReplayError(RuntimeError):
     pass
+
+
+class CommandError(ReplayError):
+    def __init__(
+        self,
+        argv: Sequence[str],
+        returncode: int,
+        stdout: bytes,
+        stderr: bytes,
+        reason: str,
+    ) -> None:
+        command = " ".join(argv)
+        if len(command) > DIAGNOSTIC_LIMIT:
+            command = command[:DIAGNOSTIC_LIMIT] + "...[truncated]"
+        super().__init__(
+            f"command {reason} ({returncode}): {command}; "
+            f"{bounded_stream('stdout', stdout)}; {bounded_stream('stderr', stderr)}"
+        )
 
 
 @dataclass(frozen=True, order=True)
@@ -67,6 +88,12 @@ class SourceHistory:
     trees: dict[str, tuple[TreeEntry, ...]]
 
 
+@dataclass(frozen=True)
+class RepoBoundary:
+    command_root: Path
+    protected_roots: tuple[Path, ...]
+
+
 def git_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
     for name in (
@@ -76,6 +103,7 @@ def git_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
         "GIT_OBJECT_DIRECTORY",
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_COMMON_DIR",
+        "GIT_TEMPLATE_DIR",
     ):
         env.pop(name, None)
     env.update(
@@ -90,6 +118,16 @@ def git_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
     if extra:
         env.update(extra)
     return env
+
+
+def bounded_stream(name: str, contents: bytes) -> str:
+    sample = contents[:DIAGNOSTIC_LIMIT].decode("utf-8", "replace")
+    suffix = (
+        f"...[truncated {len(contents) - DIAGNOSTIC_LIMIT} bytes]"
+        if len(contents) > DIAGNOSTIC_LIMIT
+        else ""
+    )
+    return f"{name}={sample!r}{suffix}"
 
 
 def run_command(
@@ -110,24 +148,114 @@ def run_command(
     except OSError as exc:
         raise ReplayError(f"cannot execute {argv[0]}: {exc}") from exc
     if completed.returncode != 0:
-        detail = completed.stderr.decode("utf-8", "replace").strip()
-        raise ReplayError(
-            f"command failed ({completed.returncode}): {' '.join(argv)}: {detail}"
+        raise CommandError(
+            argv,
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            "failed",
+        )
+    if completed.stderr:
+        raise CommandError(
+            argv,
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            "emitted unexpected stderr",
         )
     return completed.stdout
 
 
+def decoded_path(raw: bytes, description: str, *, strict: bool) -> Path:
+    value = raw.rstrip(b"\n")
+    if not value or b"\0" in value:
+        raise ReplayError(f"Git returned an invalid {description}")
+    try:
+        return Path(os.fsdecode(value)).resolve(strict=strict)
+    except OSError as exc:
+        raise ReplayError(f"cannot canonicalize {description}: {exc}") from exc
+
+
+def canonical_repo_boundary(path: Path) -> RepoBoundary:
+    try:
+        requested = path.resolve(strict=True)
+    except OSError as exc:
+        raise ReplayError(f"repository path is not accessible: {path}: {exc}") from exc
+    if not requested.is_dir():
+        raise ReplayError(f"repository path is not a directory: {requested}")
+
+    def probe(*args: str) -> bytes:
+        return run_command(("git", "--no-replace-objects", "-C", str(requested), *args))
+
+    bare = probe("rev-parse", "--is-bare-repository").decode("ascii").strip()
+    if bare not in {"true", "false"}:
+        raise ReplayError(f"Git returned an invalid bare-repository state: {bare!r}")
+    git_dir = decoded_path(
+        probe("rev-parse", "--absolute-git-dir"), "Git directory", strict=True
+    )
+    common_dir = decoded_path(
+        probe("rev-parse", "--path-format=absolute", "--git-common-dir"),
+        "Git common directory",
+        strict=True,
+    )
+    object_dir = decoded_path(
+        probe("rev-parse", "--path-format=absolute", "--git-path", "objects"),
+        "Git object directory",
+        strict=True,
+    )
+    worktree = (
+        None
+        if bare == "true"
+        else decoded_path(
+            probe("rev-parse", "--show-toplevel"),
+            "Git worktree top level",
+            strict=True,
+        )
+    )
+
+    for alternates_name in ("alternates", "http-alternates"):
+        if os.path.lexists(object_dir / "info" / alternates_name):
+            raise ReplayError(
+                f"input repository object alternates are forbidden: {object_dir / 'info' / alternates_name}"
+            )
+    pack_dir = object_dir / "pack"
+    if pack_dir.is_dir():
+        with os.scandir(pack_dir) as entries:
+            if any(entry.name.endswith(".promisor") for entry in entries):
+                raise ReplayError(
+                    f"input repository promisor packs are forbidden: {pack_dir}"
+                )
+    config_names = probe("config", "--local", "--name-only", "--null", "--list")
+    for name in config_names.rstrip(b"\0").split(b"\0") if config_names else ():
+        lowered = name.lower()
+        if lowered == b"extensions.partialclone" or (
+            lowered.startswith(b"remote.")
+            and lowered.endswith((b".promisor", b".partialclonefilter"))
+        ):
+            raise ReplayError(
+                f"input repository partial-clone configuration is forbidden: {os.fsdecode(name)}"
+            )
+
+    protected = {git_dir, common_dir, object_dir}
+    if worktree is not None:
+        protected.add(worktree)
+    worktree_list = probe("worktree", "list", "--porcelain", "-z")
+    for field in worktree_list.split(b"\0"):
+        if field.startswith(b"worktree "):
+            protected.add(
+                decoded_path(
+                    field.removeprefix(b"worktree "),
+                    "registered Git worktree",
+                    strict=False,
+                )
+            )
+    return RepoBoundary(worktree or git_dir, tuple(sorted(protected, key=os.fspath)))
+
+
 class GitRepo:
     def __init__(self, path: Path) -> None:
-        try:
-            self.path = path.resolve(strict=True)
-        except OSError as exc:
-            raise ReplayError(
-                f"repository path is not accessible: {path}: {exc}"
-            ) from exc
-        if not self.path.is_dir():
-            raise ReplayError(f"repository path is not a directory: {self.path}")
-        self.run_text("rev-parse", "--git-dir")
+        self.boundary = canonical_repo_boundary(path)
+        self.path = self.boundary.command_root
         if self.run_text("rev-parse", "--show-object-format") != "sha1":
             raise ReplayError(f"repository must use SHA-1 objects: {self.path}")
         if self.run_text("rev-parse", "--is-shallow-repository") != "false":
@@ -205,6 +333,12 @@ class GitRepo:
         require_oid(oid)
         return oid
 
+    def protects(self, path: Path) -> bool:
+        return any(
+            root == path or path.is_relative_to(root)
+            for root in self.boundary.protected_roots
+        )
+
 
 def require_oid(oid: str) -> None:
     if not OID_RE.fullmatch(oid):
@@ -236,7 +370,13 @@ def display_path(path: bytes) -> str:
 
 
 def is_denied(path: bytes) -> bool:
-    return path in DENIED_EXACT or path.startswith(DENIED_PREFIXES)
+    components = path.split(b"/")
+    return (
+        b"AGENTS.md" in components
+        or any(component.lower().endswith(b".md") for component in components)
+        or any(path == root or path.startswith(root + b"/") for root in DENIED_ROOTS)
+        or path.startswith(DENIED_LITERAL_PREFIXES)
+    )
 
 
 def load_manifest(path: Path, main_commit: str, legacy_commit: str) -> frozenset[bytes]:
@@ -343,6 +483,10 @@ def rewrite_commit(raw: bytes, tree: str, parents: tuple[str, ...]) -> bytes:
     tree_count = 0
     for field in fields:
         name = field_name(field)
+        if name in GRAPH_BOUND_HEADERS:
+            raise ReplayError(
+                f"graph-bound commit header is not replayable: {name.decode('ascii')}"
+            )
         if name == b"tree":
             tree_count += 1
             rewritten.append(b"tree " + tree.encode("ascii"))
@@ -358,6 +502,30 @@ def rewrite_commit(raw: bytes, tree: str, parents: tuple[str, ...]) -> bytes:
     if tree_count != 1 or parent_index != len(parents):
         raise ReplayError("commit tree/parent headers do not match its history walk")
     return b"\n".join(rewritten) + b"\n\n" + message
+
+
+def validated_source_commits(histories: Iterable[SourceHistory]) -> dict[str, bytes]:
+    commits: dict[str, bytes] = {}
+    for history in histories:
+        for record in history.commits:
+            raw = history.repo.object_bytes("commit", record.oid)
+            previous = commits.get(record.oid)
+            if previous is not None and previous != raw:
+                raise ReplayError(
+                    f"same source commit OID has different raw objects: {record.oid}"
+                )
+            fields, _ = parse_commit(raw)
+            forbidden = sorted(
+                {field_name(field) for field in fields} & set(GRAPH_BOUND_HEADERS)
+            )
+            if forbidden:
+                raise ReplayError(
+                    "graph-bound commit headers prevent replay; "
+                    f"source={history.label} commit={record.oid} "
+                    f"headers={','.join(name.decode('ascii') for name in forbidden)}"
+                )
+            commits[record.oid] = raw
+    return commits
 
 
 def graph_headers(raw: bytes) -> tuple[str, tuple[str, ...], tuple[bytes, ...], bytes]:
@@ -381,18 +549,20 @@ class ReplayEngine:
     def __init__(
         self,
         histories: list[SourceHistory],
+        source_commits: dict[str, bytes],
         public_paths: frozenset[bytes],
         private_blobs: set[str],
         output: Path,
     ) -> None:
         self.histories = histories
+        self.source_commits = source_commits
         self.public_paths = public_paths
         self.private_blobs = private_blobs
         self.output = output
         self.destination: GitRepo | None = None
-        self.commit_maps: dict[str, dict[str, str]] = {
-            history.label: {} for history in histories
-        }
+        self.commit_map: dict[str, str] = {}
+        self.target_map: dict[str, str] = {}
+        self.projected_graph: dict[str, tuple[str, tuple[str, ...]]] = {}
         self.tree_maps: dict[tuple[str, str], str] = {}
         self.copied_blobs: set[str] = set()
 
@@ -405,7 +575,7 @@ class ReplayEngine:
         self._publish_refs()
         self._verify()
         return [
-            (history.label, record.oid, self.commit_maps[history.label][record.oid])
+            (history.label, record.oid, self.commit_map[record.oid])
             for history in self.histories
             for record in history.commits
         ]
@@ -421,17 +591,20 @@ class ReplayEngine:
             ) from exc
         output = parent / self.output.name
         for history in self.histories:
-            if output == history.repo.path or output.is_relative_to(history.repo.path):
+            if history.repo.protects(output):
                 raise ReplayError(
-                    f"output must not be inside an input repository: {output}"
+                    f"output must not be inside an input repository boundary: {output}"
                 )
         run_command(
             (
                 "git",
                 "-c",
                 "init.templateDir=",
+                "-c",
+                "init.defaultBranch=main",
                 "init",
                 "--bare",
+                "--quiet",
                 "--object-format=sha1",
                 str(output),
             )
@@ -448,6 +621,12 @@ class ReplayEngine:
         entries = tuple(
             entry for entry in history.trees[tree] if entry.path in self.public_paths
         )
+        if not entries:
+            projected = self.destination.write_object("tree", b"")
+            if projected != EMPTY_TREE_OID:
+                raise ReplayError(f"canonical empty tree identity changed: {projected}")
+            self.tree_maps[cache_key] = projected
+            return projected
         for entry in entries:
             if entry.kind != b"blob" or entry.oid in self.copied_blobs:
                 continue
@@ -478,30 +657,55 @@ class ReplayEngine:
 
     def _replay_history(self, history: SourceHistory, index_dir: Path) -> None:
         assert self.destination is not None
-        mapping = self.commit_maps[history.label]
         for record in history.commits:
             projected_tree = self._project_tree(history, record.tree, index_dir)
             try:
-                projected_parents = tuple(mapping[parent] for parent in record.parents)
+                projected_parents = tuple(
+                    self.commit_map[parent] for parent in record.parents
+                )
             except KeyError as exc:
                 raise ReplayError(
                     f"parent was not replayed before {record.oid}"
                 ) from exc
             old_raw = history.repo.object_bytes("commit", record.oid)
+            if old_raw != self.source_commits[record.oid]:
+                raise ReplayError(
+                    f"source commit changed after validation: {record.oid}"
+                )
             old_tree, old_parents, _, _ = graph_headers(old_raw)
             if old_tree != record.tree or old_parents != record.parents:
                 raise ReplayError(
                     f"raw commit graph differs from history walk at {record.oid}"
                 )
+            previous = self.commit_map.get(record.oid)
+            if previous is not None:
+                if self.projected_graph[record.oid] != (
+                    projected_tree,
+                    projected_parents,
+                ):
+                    raise ReplayError(
+                        f"shared source commit projects differently across inputs: {record.oid}"
+                    )
+                continue
             new_raw = rewrite_commit(old_raw, projected_tree, projected_parents)
             new_oid = self.destination.write_object("commit", new_raw)
-            mapping[record.oid] = new_oid
+            collision = self.target_map.get(new_oid)
+            if collision is not None and collision != record.oid:
+                raise ReplayError(
+                    "distinct source commits collapse after PUBLIC projection; "
+                    f"source_a={collision} source_b={record.oid} target={new_oid}"
+                )
+            self.commit_map[record.oid] = new_oid
+            self.target_map[new_oid] = record.oid
+            self.projected_graph[record.oid] = (
+                projected_tree,
+                projected_parents,
+            )
 
     def _publish_refs(self) -> None:
         assert self.destination is not None
         tips = {
-            history.label: self.commit_maps[history.label][history.tip]
-            for history in self.histories
+            history.label: self.commit_map[history.tip] for history in self.histories
         }
         commands = ["start"]
         for label, ref in OUTPUT_REFS.items():
@@ -527,16 +731,17 @@ class ReplayEngine:
 
         output_blob_oids: set[str] = set()
         for history in self.histories:
-            mapping = self.commit_maps[history.label]
             for record in history.commits:
-                new_oid = mapping[record.oid]
-                old_raw = history.repo.object_bytes("commit", record.oid)
+                new_oid = self.commit_map[record.oid]
+                old_raw = self.source_commits[record.oid]
                 new_raw = self.destination.object_bytes("commit", new_oid)
                 old_tree, _, old_metadata, old_message = graph_headers(old_raw)
                 new_tree, new_parents, new_metadata, new_message = graph_headers(
                     new_raw
                 )
-                expected_parents = tuple(mapping[parent] for parent in record.parents)
+                expected_parents = tuple(
+                    self.commit_map[parent] for parent in record.parents
+                )
                 if new_parents != expected_parents:
                     raise ReplayError(
                         f"ordered parents changed while replaying {record.oid}"
@@ -563,13 +768,22 @@ class ReplayEngine:
 
         for label, ref in OUTPUT_REFS.items():
             tip = self.destination.run_text("rev-parse", ref)
-            expected_tip = self.commit_maps[label][self._history(label).tip]
+            expected_tip = self.commit_map[self._history(label).tip]
             if tip != expected_tip:
                 raise ReplayError(f"output ref has the wrong tip: {ref}")
         if output_blob_oids & self.private_blobs:
             oid = sorted(output_blob_oids & self.private_blobs)[0]
             raise ReplayError(
                 f"output shares a blob OID with fixed-deny content: {oid}"
+            )
+
+        reachable = set(self.destination.run_text("rev-list", "--all").splitlines())
+        expected_commits = set(self.commit_map.values())
+        if reachable != expected_commits or len(expected_commits) != len(
+            self.commit_map
+        ):
+            raise ReplayError(
+                "output commit graph is missing a source node or is not injective"
             )
 
         fsck = self.destination.run(
@@ -659,7 +873,10 @@ def replay(args: argparse.Namespace) -> int:
         raise ReplayError(
             f"a PUBLIC path shares fixed-deny blob content: {sorted(overlap)[0]}"
         )
-    engine = ReplayEngine(histories, public_paths, private_blobs, args.output)
+    source_commits = validated_source_commits(histories)
+    engine = ReplayEngine(
+        histories, source_commits, public_paths, private_blobs, args.output
+    )
     for label, old_oid, new_oid in engine.run():
         print(f"{label}\t{old_oid}\t{new_oid}")
     return 0
