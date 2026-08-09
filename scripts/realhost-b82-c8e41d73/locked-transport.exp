@@ -534,6 +534,17 @@ proc prefix_line_count {lines prefix} {
     return $count
 }
 
+proc successful_write_finish_count {lines} {
+    set count 0
+    foreach line $lines {
+        if {[string first "write_finish " $line] == 0 &&
+            [string match "* exit=0" $line]} {
+            incr count
+        }
+    }
+    return $count
+}
+
 proc provision_missing_class {lines} {
     set matches {}
     foreach line $lines {
@@ -588,6 +599,7 @@ proc provision_plan_policy {payload expected_mode} {
         if {$missing_class eq "none" ||
             [prefix_line_count $lines "write_start "] != 2 ||
             [prefix_line_count $lines "write_finish "] != 2 ||
+            [successful_write_finish_count $lines] != 2 ||
             [exact_line_count $lines "provisioning completed"] != 1} {
             return -code error "apply-write-evidence"
         }
