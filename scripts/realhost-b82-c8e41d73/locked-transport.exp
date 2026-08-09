@@ -1109,6 +1109,15 @@ proc read_capture_credential {path} {
     return $password_bytes
 }
 
+proc clean_child_exit_status {wait_status} {
+    if {[llength $wait_status] != 4 || [lindex $wait_status 2] != 0 ||
+        ![string is integer -strict [lindex $wait_status 3]] ||
+        [lindex $wait_status 3] < 0 || [lindex $wait_status 3] > 255} {
+        return -code error "child-wait-status"
+    }
+    return [lindex $wait_status 3]
+}
+
 proc capture_payload_to_eof {child_id variable_name credential_sends password_bytes \
     password_json_escape deadline_ms} {
     upvar 1 $variable_name captured_output
@@ -1133,7 +1142,9 @@ proc capture_payload_to_eof {child_id variable_name credential_sends password_by
                 }
             }
             set wait_status [wait -i $child_id]
-            set child_rc [lindex $wait_status 3]
+            if {[catch {clean_child_exit_status $wait_status} child_rc]} {
+                fail "child-wait-status" 78
+            }
             if {$child_rc != 0} {
                 exit $child_rc
             }
@@ -1224,7 +1235,11 @@ proc capture_child_payload {child_id password_bytes prompt_limit timeout_seconds
         }
         eof {
             set wait_status [wait -i $child_id]
-            set child_rc [lindex $wait_status 3]
+            if {[catch {clean_child_exit_status $wait_status} child_rc]} {
+                set password_bytes ""
+                set password_json_escape ""
+                fail "child-wait-status" 78
+            }
             if {$child_rc != 0} {
                 set password_bytes ""
                 set password_json_escape ""
