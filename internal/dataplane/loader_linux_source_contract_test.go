@@ -16,6 +16,12 @@ func TestLinuxLoaderRetainsGateAndExactManifestCallers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	newLoader := linuxLoaderFunction(t, file, "NewLoaderWithOptions", false)
+	assertLinuxLoaderCallOrder(t, newLoader,
+		"objectPathFromEnv",
+		"pinPathFromEnv",
+		"newFakeTCPProductionLoader",
+	)
 
 	loadObject := linuxLoaderFunction(t, file, "LoadObjectTestIdentity", false)
 	assertLinuxLoaderCallOrder(t, loadObject,

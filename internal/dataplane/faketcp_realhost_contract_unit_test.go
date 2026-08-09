@@ -44,8 +44,8 @@ func TestParseFakeTCPRealHostContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if contract.experimentalObject != "/review/source/build/wg_mix_faketcp_experimental.o" ||
-		contract.baselineObject != "/review/source/build/wg_mix_tc.o" ||
+	if contract.experimentalObject != "/run/wg-mix-ebpf-source-stages/c8e41d73/source/build/wg_mix_faketcp_experimental.o" ||
+		contract.baselineObject != "/run/wg-mix-ebpf-source-stages/c8e41d73/source/build/wg_mix_tc.o" ||
 		contract.ifindex != 101 || contract.peerIfindex != 102 ||
 		contract.xdpMode != fakeTCPRealHostXDPGeneric || contract.runID != "c8e41d73" ||
 		contract.tempRoot != "/run/wg-mix-ebpf-source-stages/c8e41d73/go-tmp-realhost" ||
@@ -82,23 +82,39 @@ func TestParseFakeTCPRealHostContractRejectsDriftBeforeMutation(t *testing.T) {
 		{
 			name: "unclean object",
 			mutate: func(values map[string]string) {
-				values[fakeTCPRealHostObjectEnv] = "/review/source/build/../build/wg_mix_faketcp_experimental.o"
+				values[fakeTCPRealHostObjectEnv] = "/run/wg-mix-ebpf-source-stages/c8e41d73/source/build/../build/wg_mix_faketcp_experimental.o"
 			},
 			match: "clean absolute path",
 		},
 		{
 			name: "wrong experimental basename",
 			mutate: func(values map[string]string) {
-				values[fakeTCPRealHostObjectEnv] = "/review/source/build/not-reviewed.o"
+				values[fakeTCPRealHostObjectEnv] = "/run/wg-mix-ebpf-source-stages/c8e41d73/source/build/not-reviewed.o"
 			},
 			match: "basename",
 		},
 		{
-			name: "different build roots",
+			name: "different build root",
 			mutate: func(values map[string]string) {
 				values[fakeTCPRealHostBaselineObjectEnv] = "/other/source/build/wg_mix_tc.o"
 			},
-			match: "share one reviewed build directory",
+			match: "reviewed v6 build directory",
+		},
+		{
+			name: "foreign shared build root",
+			mutate: func(values map[string]string) {
+				values[fakeTCPRealHostObjectEnv] = "/other/source/build/wg_mix_faketcp_experimental.o"
+				values[fakeTCPRealHostBaselineObjectEnv] = "/other/source/build/wg_mix_tc.o"
+			},
+			match: "reviewed v6 build directory",
+		},
+		{
+			name: "different run object root",
+			mutate: func(values map[string]string) {
+				values[fakeTCPRealHostObjectEnv] = "/run/wg-mix-ebpf-source-stages/aaaaaaaa/source/build/wg_mix_faketcp_experimental.o"
+				values[fakeTCPRealHostBaselineObjectEnv] = "/run/wg-mix-ebpf-source-stages/aaaaaaaa/source/build/wg_mix_tc.o"
+			},
+			match: "reviewed v6 build directory",
 		},
 		{
 			name: "zero ifindex",
@@ -161,14 +177,14 @@ func TestParseFakeTCPRealHostContractRejectsDriftBeforeMutation(t *testing.T) {
 			mutate: func(values map[string]string) {
 				values[fakeTCPRealHostTempRootEnv] = "/tmp"
 			},
-			match: "reviewed go-tmp-realhost directory",
+			match: "reviewed v6 temporary directory",
 		},
 		{
 			name: "different run temp root",
 			mutate: func(values map[string]string) {
 				values[fakeTCPRealHostTempRootEnv] = "/run/wg-mix-ebpf-source-stages/aaaaaaaa/go-tmp-realhost"
 			},
-			match: "directly below run c8e41d73",
+			match: "reviewed v6 temporary directory",
 		},
 		{
 			name: "newline injection",
@@ -204,6 +220,15 @@ func TestFakeTCPRealHostLinuxEntryPointStaticContract(t *testing.T) {
 		"fakeTCPRealHostGateEnabled(os.LookupEnv)",
 		"validateFakeTCPRealHostOwnedVethPair(t, contract)",
 		"assertFakeTCPRealHostKernelEmpty(t, contract)",
+		"fakeTCPRealHostStatCount",
+		"fakeTCPRealHostStatChecksumNoneAccepted",
+		"fakeTCPRealHostStatChecksumPartialReset",
+		"unix.PACKET_VNET_HDR",
+		"unix.VIRTIO_NET_HDR_F_NEEDS_CSUM",
+		"unix.VIRTIO_NET_HDR_GSO_UDP_L4",
+		"sendFakeTCPRealHostGSOProbe",
+		"assertNoFakeTCPRealHostGSOProbePacket",
+		"TestFakeTCPRealHostGSOProbeIsolationContract",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("FakeTCP real-host Linux test source is missing %q", required)
@@ -226,8 +251,8 @@ func TestFakeTCPRealHostLinuxEntryPointStaticContract(t *testing.T) {
 
 func validFakeTCPRealHostEnvironment() map[string]string {
 	return map[string]string{
-		fakeTCPRealHostObjectEnv:         "/review/source/build/wg_mix_faketcp_experimental.o",
-		fakeTCPRealHostBaselineObjectEnv: "/review/source/build/wg_mix_tc.o",
+		fakeTCPRealHostObjectEnv:         "/run/wg-mix-ebpf-source-stages/c8e41d73/source/build/wg_mix_faketcp_experimental.o",
+		fakeTCPRealHostBaselineObjectEnv: "/run/wg-mix-ebpf-source-stages/c8e41d73/source/build/wg_mix_tc.o",
 		fakeTCPRealHostIfindexEnv:        "101",
 		fakeTCPRealHostPeerIfindexEnv:    "102",
 		fakeTCPRealHostXDPModeEnv:        "generic",
