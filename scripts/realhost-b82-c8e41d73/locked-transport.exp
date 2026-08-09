@@ -1,5 +1,7 @@
 #!/usr/bin/expect -f
 
+set ::TRANSPORT_SCRIPT_PATH [file normalize [info script]]
+
 proc fail {message code} {
     puts stderr "B82_V6_TRANSPORT_STOP reason=$message rc=$code"
     exit $code
@@ -44,7 +46,8 @@ proc load_manifest {path expected_sha} {
         test_hermetic_matrix_sh_sha256 test_matrix_static_py_path
         test_matrix_static_py_blob test_matrix_static_py_sha256
         prepare_stage_root_sh_path prepare_stage_root_sh_blob
-        prepare_stage_root_sh_sha256
+        prepare_stage_root_sh_sha256 provision_ubuntu_test_host_sh_path
+        provision_ubuntu_test_host_sh_blob provision_ubuntu_test_host_sh_sha256
     }
     set channel [open $path r]
     fconfigure $channel -encoding utf-8 -translation lf
@@ -118,7 +121,7 @@ proc validate_manifest_values {values} {
         bind_final_package_sh_blob controller_sh_blob locked_transport_exp_blob
         root_matrix_n_r_sh_blob check_realhost_iperf_py_blob
         test_hermetic_matrix_sh_blob test_matrix_static_py_blob
-        prepare_stage_root_sh_blob
+        prepare_stage_root_sh_blob provision_ubuntu_test_host_sh_blob
     } {
         if {![regexp {^[0-9a-f]{40}$} [dict get $values $key]]} {
             return -code error "blob-$key"
@@ -129,6 +132,7 @@ proc validate_manifest_values {values} {
         locked_transport_exp_sha256 root_matrix_n_r_sh_sha256
         check_realhost_iperf_py_sha256 test_hermetic_matrix_sh_sha256
         test_matrix_static_py_sha256 prepare_stage_root_sh_sha256
+        provision_ubuntu_test_host_sh_sha256
     } {
         if {![regexp {^[0-9a-f]{64}$} [dict get $values $key]]} {
             return -code error "sha256-$key"
@@ -140,7 +144,7 @@ proc validate_self {values} {
     set repository [dict get $values local_repository]
     set repository_path [dict get $values locked_transport_exp_path]
     set script_path "${repository}/${repository_path}"
-    if {[file normalize [info script]] ne $script_path || [file type $script_path] ne "file" ||
+    if {$::TRANSPORT_SCRIPT_PATH ne $script_path || [file type $script_path] ne "file" ||
         [file_sha256 $script_path] ne [dict get $values locked_transport_exp_sha256]} {
         return -code error "transport-self"
     }
@@ -256,6 +260,7 @@ proc package_sha {values name} {
         bind-final-package.sh { return [dict get $values bind_final_package_sh_sha256] }
         controller.sh { return [dict get $values controller_sh_sha256] }
         prepare-stage-root.sh { return [dict get $values prepare_stage_root_sh_sha256] }
+        provision-ubuntu-test-host.sh { return [dict get $values provision_ubuntu_test_host_sh_sha256] }
         root-matrix-n-r.sh { return [dict get $values root_matrix_n_r_sh_sha256] }
         check-realhost-iperf.py { return [dict get $values check_realhost_iperf_py_sha256] }
         test-hermetic-matrix.sh { return [dict get $values test_hermetic_matrix_sh_sha256] }
@@ -270,6 +275,7 @@ proc build_operation {values manifest_sha operation} {
     set local_package [dict get $values local_package_dir]
     set bootstrap_root "/run/wg-mix-ebpf-source-bootstrap-c8e41d73"
     set bootstrap_stager "${bootstrap_root}/prepare-stage-root.sh"
+    set bootstrap_provisioner "${bootstrap_root}/provision-ubuntu-test-host.sh"
     set snapshot_manifest "${bootstrap_root}/package-manifest.v1"
     set remote {}
     set tty 0
@@ -301,7 +307,7 @@ proc build_operation {values manifest_sha operation} {
         tool-go { set remote [list /usr/bin/go version]; set assertion "contains:go1.26.0" }
         tool-clang { set remote [list /usr/bin/clang --version]; set assertion "contains:21.1.8" }
         tool-llvm { set remote [list /usr/bin/llvm-config --version]; set assertion "exact:21.1.8" }
-        tool-bpftool { set remote [list /usr/sbin/bpftool version]; set assertion "contains:v7.7.0" }
+        tool-bpftool { set remote [list /usr/sbin/bpftool -V]; set assertion "contains:v7.7.0" }
         tool-make { set remote [list /usr/bin/make --version]; set assertion "contains:GNU Make 4.4.1" }
         tool-gcc { set remote [list /usr/bin/gcc --version]; set assertion "contains:15.2" }
         tool-iperf3 { set remote [list /usr/bin/iperf3 --version]; set assertion "contains:iperf 3.20" }
@@ -332,7 +338,8 @@ proc build_operation {values manifest_sha operation} {
                 /usr/bin/shellcheck --norc --shell=bash -- \
                 "${package}/bind-final-package.sh" "${package}/controller.sh" \
                 "${package}/prepare-stage-root.sh" "${package}/root-matrix-n-r.sh" \
-                "${package}/test-hermetic-matrix.sh"]]
+                "${package}/test-hermetic-matrix.sh" \
+                "${package}/provision-ubuntu-test-host.sh"]]
             set timeout_seconds 660
         }
         bootstrap-absent {
@@ -374,6 +381,13 @@ proc build_operation {values manifest_sha operation} {
             set tty 1
             set prompt_limit 2
         }
+        bootstrap-install-provisioner {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/install --owner=root --group=root --mode=0700 --no-target-directory -- \
+                "${package}/provision-ubuntu-test-host.sh" $bootstrap_provisioner]]
+            set tty 1
+            set prompt_limit 2
+        }
         bootstrap-stager-readlink {
             set remote [concat [list /usr/bin/sudo --] [env_argv] \
                 [list /usr/bin/readlink -e -- $bootstrap_stager]]
@@ -394,6 +408,41 @@ proc build_operation {values manifest_sha operation} {
             set assertion exact:root:root:700:1:regular\ file
             set tty 1
             set prompt_limit 2
+        }
+        bootstrap-provisioner-readlink {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/readlink -e -- $bootstrap_provisioner]]
+            set assertion "exact:${bootstrap_provisioner}"
+            set tty 1
+            set prompt_limit 2
+        }
+        bootstrap-provisioner-stat {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- $bootstrap_provisioner]]
+            set assertion exact:root:root:700:1:regular\ file
+            set tty 1
+            set prompt_limit 2
+        }
+        bootstrap-provisioner-sha {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/sha256sum -- $bootstrap_provisioner]]
+            set assertion "exact:[dict get $values provision_ubuntu_test_host_sh_sha256]  ${bootstrap_provisioner}"
+            set tty 1
+            set prompt_limit 2
+        }
+        provision-check - provision-apply {
+            set provision_mode [expr {$operation eq "provision-check" ? "--check" : "--apply"}]
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /bin/bash -p $bootstrap_provisioner $provision_mode \
+                --expected-address 192.168.10.82 \
+                --expected-interface ens33 \
+                --expected-hostname ubuntu-2604-test \
+                --expected-kernel 7.0.0-28-generic \
+                --expected-machine-id 9db3fb717cc74974b2a6b243d67f67b9]]
+            set assertion $operation
+            set tty 1
+            set prompt_limit 2
+            set timeout_seconds [expr {$operation eq "provision-apply" ? 2400 : 600}]
         }
         stage-snapshot {
             set remote [concat [list /usr/bin/sudo --] [env_argv] \
@@ -465,6 +514,87 @@ proc output_value {payload} {
     return [string trim $value "\n"]
 }
 
+proc exact_line_count {lines expected} {
+    set count 0
+    foreach line $lines {
+        if {$line eq $expected} {
+            incr count
+        }
+    }
+    return $count
+}
+
+proc prefix_line_count {lines prefix} {
+    set count 0
+    foreach line $lines {
+        if {[string first $prefix $line] == 0} {
+            incr count
+        }
+    }
+    return $count
+}
+
+proc provision_missing_class {lines} {
+    set matches {}
+    foreach line $lines {
+        if {[string first "missing_packages=" $line] == 0} {
+            lappend matches $line
+        }
+    }
+    if {[llength $matches] != 1} {
+        return -code error "missing-set-cardinality"
+    }
+    switch -- [lindex $matches 0] {
+        "missing_packages=" { return none }
+        "missing_packages= clang gcc golang-go iperf3 libbpf-dev llvm make pkg-config shellcheck wireguard-tools" {
+            return initial
+        }
+        "missing_packages= iperf3" { return iperf3 }
+        default { return -code error "unexpected-missing-set" }
+    }
+}
+
+proc provision_plan_policy {payload expected_mode} {
+    set normalized [output_value $payload]
+    set lines [split $normalized "\n"]
+    set missing_class [provision_missing_class $lines]
+    if {[exact_line_count $lines "mode=$expected_mode"] != 1 ||
+        [exact_line_count $lines \
+            "plan_complete planned_commands_executed=0 writes=0 automatic_cleanup=0"] != 1} {
+        return -code error "plan-evidence"
+    }
+    set plan_count [prefix_line_count $lines "plan_command="]
+    if {$missing_class eq "none"} {
+        if {$plan_count != 0 ||
+            [exact_line_count $lines \
+                "plan_apt_commands=skipped reason=fixed-package-set-already-installed"] != 1} {
+            return -code error "already-ready-plan"
+        }
+    } else {
+        if {$plan_count != 3 ||
+            [prefix_line_count $lines "plan_command=A0 argv="] != 1 ||
+            [prefix_line_count $lines "plan_command=A1 argv="] != 1 ||
+            [prefix_line_count $lines "plan_command=A2 argv="] != 1} {
+            return -code error "missing-package-plan"
+        }
+    }
+    if {$expected_mode eq "check"} {
+        if {[prefix_line_count $lines "write_start "] != 0 ||
+            [prefix_line_count $lines "write_finish "] != 0 ||
+            [exact_line_count $lines "provisioning completed"] != 0} {
+            return -code error "check-write-evidence"
+        }
+    } else {
+        if {$missing_class eq "none" ||
+            [prefix_line_count $lines "write_start "] != 2 ||
+            [prefix_line_count $lines "write_finish "] != 2 ||
+            [exact_line_count $lines "provisioning completed"] != 1} {
+            return -code error "apply-write-evidence"
+        }
+    }
+    return $missing_class
+}
+
 proc assert_output {assertion payload} {
     set value [output_value $payload]
     if {$assertion eq "none"} {
@@ -507,104 +637,127 @@ proc emit_safe {payload password} {
     flush stdout
 }
 
-if {$argc != 10 ||
-    [lindex $argv 0] ne "--manifest" ||
-    [lindex $argv 2] ne "--manifest-sha256" ||
-    [lindex $argv 4] ne "--credential-path" ||
-    [lindex $argv 6] ne "--action" ||
-    [lindex $argv 8] ne "--operation"} {
-    fail "arguments" 64
-}
-set manifest [lindex $argv 1]
-set manifest_sha [lindex $argv 3]
-set credential_path [lindex $argv 5]
-set action [lindex $argv 7]
-set operation [lindex $argv 9]
-set argv {}
-
-if {![regexp {^[0-9a-f]{64}$} $manifest_sha] ||
-    $credential_path ne "/Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82" ||
-    $action ni {plan execute} ||
-    ![regexp {^[A-Za-z0-9_.-]+$} $operation]} {
-    fail "argument-values" 65
-}
-if {[catch {load_manifest $manifest $manifest_sha} values] ||
-    [catch {validate_manifest_values $values} validation_message] ||
-    [catch {validate_self $values} self_message] ||
-    [catch {build_operation $values $manifest_sha $operation} operation_spec]} {
-    fail "policy" 66
-}
-lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds
-
-if {$action eq "plan"} {
-    puts "B82_V6_TRANSPORT_PLAN operation=$operation transport=$transport_type credential_read=0 network_operations=0"
-    puts "EXPECT_PROGRAM [info nameofexecutable] SCRIPT [file normalize [info script]]"
-    puts "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
-    puts "EXPECT_OUTPUT_ASSERTION [list $assertion]"
-    exit 0
-}
-
-set password ""
-if {[catch {open $credential_path r} credential_file]} {
-    fail "credential-open" 65
-}
-fconfigure $credential_file -encoding utf-8 -translation lf
-if {[gets $credential_file ssh_line] < 0 || [gets $credential_file password] < 0 ||
-    [gets $credential_file unexpected] >= 0} {
-    close $credential_file
-    set password ""
-    fail "credential-shape" 65
-}
-close $credential_file
-set ssh_parts [split [string trim $ssh_line]]
-set ssh_line ""
-if {$ssh_parts ne [list ssh siyixuan@192.168.10.82] || $password eq "" ||
-    [string first "\u0000" $password] >= 0 || [string first "\r" $password] >= 0 ||
-    [string first "\n" $password] >= 0} {
-    set password ""
-    fail "credential-value" 65
-}
-
-set timeout $timeout_seconds
-set captured_output ""
-set credential_sends 0
-puts "B82_V6_TRANSPORT_EXECUTE operation=$operation transport=$transport_type credential_in_argv=0"
-puts "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
-log_user 0
-spawn -noecho {*}$spawn_argv
-expect {
-    -re {(?i)(?:password|passphrase)[^:\r\n]*:[ \t]*$} {
-        incr credential_sends
-        if {$credential_sends > $prompt_limit} {
-            set password ""
-            fail "credential-prompt-count" 77
-        }
-        send -- "$password\r"
-        exp_continue
+proc transport_main {arguments} {
+    set argc [llength $arguments]
+    set argv $arguments
+    if {$argc != 10 ||
+        [lindex $argv 0] ne "--manifest" ||
+        [lindex $argv 2] ne "--manifest-sha256" ||
+        [lindex $argv 4] ne "--credential-path" ||
+        [lindex $argv 6] ne "--action" ||
+        [lindex $argv 8] ne "--operation"} {
+        fail "arguments" 64
     }
-    -re {[^\r\n]*(?:\r\n|\n|\r)} {
-        append captured_output $expect_out(buffer)
-        emit_safe $expect_out(buffer) $password
-        exp_continue
+    set manifest [lindex $argv 1]
+    set manifest_sha [lindex $argv 3]
+    set credential_path [lindex $argv 5]
+    set action [lindex $argv 7]
+    set operation [lindex $argv 9]
+
+    if {![regexp {^[0-9a-f]{64}$} $manifest_sha] ||
+        $credential_path ne "/Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82" ||
+        $action ni {plan execute} ||
+        ![regexp {^[A-Za-z0-9_.-]+$} $operation]} {
+        fail "argument-values" 65
     }
-    timeout {
-        set password ""
-        fail "timeout" 124
+    if {[catch {load_manifest $manifest $manifest_sha} values] ||
+        [catch {validate_manifest_values $values} validation_message] ||
+        [catch {validate_self $values} self_message] ||
+        [catch {build_operation $values $manifest_sha $operation} operation_spec]} {
+        fail "policy" 66
     }
-    eof {
-        if {[info exists expect_out(buffer)] && $expect_out(buffer) ne ""} {
-            append captured_output $expect_out(buffer)
-            emit_safe $expect_out(buffer) $password
-        }
-        set password ""
-        set wait_status [wait]
-        set child_rc [lindex $wait_status 3]
-        if {$child_rc != 0} {
-            exit $child_rc
-        }
-        if {[catch {assert_output $assertion $captured_output} assertion_message]} {
-            fail "output-assertion" 78
-        }
+    lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds
+
+    if {$action eq "plan"} {
+        puts "B82_V6_TRANSPORT_PLAN operation=$operation transport=$transport_type credential_read=0 network_operations=0"
+        puts "EXPECT_PROGRAM [info nameofexecutable] SCRIPT $::TRANSPORT_SCRIPT_PATH"
+        puts "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
+        puts "EXPECT_OUTPUT_ASSERTION [list $assertion]"
         exit 0
     }
+
+    set password ""
+    if {[catch {open $credential_path r} credential_file]} {
+        fail "credential-open" 65
+    }
+    fconfigure $credential_file -encoding utf-8 -translation lf
+    if {[gets $credential_file ssh_line] < 0 || [gets $credential_file password] < 0 ||
+        [gets $credential_file unexpected] >= 0} {
+        close $credential_file
+        set password ""
+        fail "credential-shape" 65
+    }
+    close $credential_file
+    set ssh_parts [split [string trim $ssh_line]]
+    set ssh_line ""
+    if {$ssh_parts ne [list ssh siyixuan@192.168.10.82] || $password eq "" ||
+        [string first "\u0000" $password] >= 0 || [string first "\r" $password] >= 0 ||
+        [string first "\n" $password] >= 0} {
+        set password ""
+        fail "credential-value" 65
+    }
+
+    set timeout $timeout_seconds
+    set captured_output ""
+    set credential_sends 0
+    puts "B82_V6_TRANSPORT_EXECUTE operation=$operation transport=$transport_type credential_in_argv=0"
+    puts "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
+    log_user 0
+    spawn -noecho {*}$spawn_argv
+    expect {
+        -re {(?i)(?:password|passphrase)[^:\r\n]*:[ \t]*$} {
+            incr credential_sends
+            if {$credential_sends > $prompt_limit} {
+                set password ""
+                fail "credential-prompt-count" 77
+            }
+            send -- "$password\r"
+            exp_continue
+        }
+        -re {[^\r\n]*(?:\r\n|\n|\r)} {
+            append captured_output $expect_out(buffer)
+            emit_safe $expect_out(buffer) $password
+            exp_continue
+        }
+        timeout {
+            set password ""
+            fail "timeout" 124
+        }
+        eof {
+            if {[info exists expect_out(buffer)] && $expect_out(buffer) ne ""} {
+                append captured_output $expect_out(buffer)
+                emit_safe $expect_out(buffer) $password
+            }
+            set password ""
+            set wait_status [wait]
+            set child_rc [lindex $wait_status 3]
+            if {$child_rc != 0} {
+                if {$assertion in {provision-check provision-apply}} {
+                    puts "B82_V6_PROVISION_AUDIT operation=$assertion child_rc=$child_rc plan=unverified missing_set=unverified next_state=STOP"
+                }
+                exit $child_rc
+            }
+            if {$assertion eq "provision-check"} {
+                if {[catch {provision_plan_policy $captured_output check} missing_class]} {
+                    puts "B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=rejected missing_set=unexpected next_state=STOP policy=$missing_class"
+                    fail "output-assertion" 78
+                }
+                set next_state [expr {$missing_class eq "none" ? "POSTFLIGHT" : "AWAIT_APPLY"}]
+                puts "B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=valid missing_set=$missing_class next_state=$next_state"
+            } elseif {$assertion eq "provision-apply"} {
+                if {[catch {provision_plan_policy $captured_output apply} missing_class]} {
+                    puts "B82_V6_PROVISION_AUDIT operation=provision-apply child_rc=0 plan=rejected missing_set=unexpected next_state=STOP policy=$missing_class"
+                    fail "output-assertion" 78
+                }
+                puts "B82_V6_PROVISION_AUDIT operation=provision-apply child_rc=0 plan=valid missing_set=$missing_class next_state=POSTFLIGHT"
+            } elseif {[catch {assert_output $assertion $captured_output} assertion_message]} {
+                fail "output-assertion" 78
+            }
+            exit 0
+        }
+    }
+}
+
+if {[info exists argv0] && [file normalize $argv0] eq $::TRANSPORT_SCRIPT_PATH} {
+    transport_main $argv
 }

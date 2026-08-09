@@ -68,6 +68,10 @@ TEST_MATRIX_STATIC_PY_SHA256=''
 PREPARE_STAGE_ROOT_SH_PATH=''
 PREPARE_STAGE_ROOT_SH_BLOB=''
 PREPARE_STAGE_ROOT_SH_SHA256=''
+PROVISION_UBUNTU_TEST_HOST_SH_PATH=''
+PROVISION_UBUNTU_TEST_HOST_SH_BLOB=''
+PROVISION_UBUNTU_TEST_HOST_SH_SHA256=''
+PROVISION_RESULT=''
 
 fail() {
   printf 'B82_V6_CONTROLLER_STOP mode=%s reason=%s rc=%s; no automatic cleanup\n' \
@@ -77,7 +81,7 @@ fail() {
 
 usage() {
   printf '%s\n' \
-    "usage: $0 {plan|preflight|prepare|matrix-plan|run|restore}" \
+    "usage: $0 {plan|preflight|prepare|provision-apply|matrix-plan|run|restore}" \
     '  --manifest ABSOLUTE_PACKAGE_MANIFEST --manifest-sha256 64-lowercase-hex' \
     "  --credential-path ${CREDENTIAL_PATH}" \
     '  --restore-cell {none|tcx|original|all-on|all-off|tx-path|rx-path|mtu1492|mtu1500|soak}' >&2
@@ -144,7 +148,7 @@ parse_arguments() {
   MODE="$1"
   shift
   case "${MODE}" in
-    plan | preflight | prepare | matrix-plan | run | restore) ;;
+    plan | preflight | prepare | provision-apply | matrix-plan | run | restore) ;;
     *) usage; return 64 ;;
   esac
   while (($# > 0)); do
@@ -161,7 +165,7 @@ parse_arguments() {
   [[ "${MANIFEST}" == /* && "${SUPPLIED_CREDENTIAL_PATH}" == "${CREDENTIAL_PATH}" ]] || return 65
   valid_sha256 "${MANIFEST_SHA256}" || return 65
   case "${MODE}:${RESTORE_CELL}" in
-    plan:none | preflight:none | prepare:none | matrix-plan:none | run:none | \
+    plan:none | preflight:none | prepare:none | provision-apply:none | matrix-plan:none | run:none | \
       restore:tcx | restore:original | restore:all-on | restore:all-off | \
       restore:tx-path | restore:rx-path | restore:mtu1492 | restore:mtu1500 | restore:soak) ;;
     *) return 65 ;;
@@ -231,7 +235,10 @@ load_manifest() {
     read_manifest_field test_matrix_static_py_sha256 TEST_MATRIX_STATIC_PY_SHA256 &&
     read_manifest_field prepare_stage_root_sh_path PREPARE_STAGE_ROOT_SH_PATH &&
     read_manifest_field prepare_stage_root_sh_blob PREPARE_STAGE_ROOT_SH_BLOB &&
-    read_manifest_field prepare_stage_root_sh_sha256 PREPARE_STAGE_ROOT_SH_SHA256 || {
+    read_manifest_field prepare_stage_root_sh_sha256 PREPARE_STAGE_ROOT_SH_SHA256 &&
+    read_manifest_field provision_ubuntu_test_host_sh_path PROVISION_UBUNTU_TEST_HOST_SH_PATH &&
+    read_manifest_field provision_ubuntu_test_host_sh_blob PROVISION_UBUNTU_TEST_HOST_SH_BLOB &&
+    read_manifest_field provision_ubuntu_test_host_sh_sha256 PROVISION_UBUNTU_TEST_HOST_SH_SHA256 || {
       exec 3<&-
       return 65
     }
@@ -292,7 +299,8 @@ verify_bound_history() {
 
 verify_identity() {
   local path="$1" blob="$2" sha="$3" actual_blob actual_sha mapped_blob
-  [[ "${path}" =~ ^scripts/realhost-b82-c8e41d73/[A-Za-z0-9_.-]+$ &&
+  [[ ("${path}" =~ ^scripts/realhost-b82-c8e41d73/[A-Za-z0-9_.-]+$ ||
+      "${path}" == 'scripts/provision-ubuntu-test-host.sh') &&
     "${blob}" =~ ^[0-9a-f]{40}$ ]] || return 65
   valid_sha256 "${sha}" || return 65
   [[ -f "${LOCAL_REPOSITORY}/${path}" && ! -L "${LOCAL_REPOSITORY}/${path}" ]] || return 66
@@ -356,10 +364,12 @@ verify_manifest_contract() {
     verify_identity "${CHECK_REALHOST_IPERF_PY_PATH}" "${CHECK_REALHOST_IPERF_PY_BLOB}" "${CHECK_REALHOST_IPERF_PY_SHA256}" &&
     verify_identity "${TEST_HERMETIC_MATRIX_SH_PATH}" "${TEST_HERMETIC_MATRIX_SH_BLOB}" "${TEST_HERMETIC_MATRIX_SH_SHA256}" &&
     verify_identity "${TEST_MATRIX_STATIC_PY_PATH}" "${TEST_MATRIX_STATIC_PY_BLOB}" "${TEST_MATRIX_STATIC_PY_SHA256}" &&
-    verify_identity "${PREPARE_STAGE_ROOT_SH_PATH}" "${PREPARE_STAGE_ROOT_SH_BLOB}" "${PREPARE_STAGE_ROOT_SH_SHA256}" || return $?
+    verify_identity "${PREPARE_STAGE_ROOT_SH_PATH}" "${PREPARE_STAGE_ROOT_SH_BLOB}" "${PREPARE_STAGE_ROOT_SH_SHA256}" &&
+    verify_identity "${PROVISION_UBUNTU_TEST_HOST_SH_PATH}" "${PROVISION_UBUNTU_TEST_HOST_SH_BLOB}" \
+      "${PROVISION_UBUNTU_TEST_HOST_SH_SHA256}" || return $?
 
   for name in bind-final-package.sh controller.sh root-matrix-n-r.sh check-realhost-iperf.py \
-    test-hermetic-matrix.sh test_matrix_static.py prepare-stage-root.sh; do
+    test-hermetic-matrix.sh test_matrix_static.py prepare-stage-root.sh provision-ubuntu-test-host.sh; do
     [[ -f "${LOCAL_PACKAGE_DIR}/${name}" && ! -L "${LOCAL_PACKAGE_DIR}/${name}" ]] || return 66
     case "${name}" in
       bind-final-package.sh) sha="${BIND_FINAL_PACKAGE_SH_SHA256}" ;;
@@ -369,6 +379,7 @@ verify_manifest_contract() {
       test-hermetic-matrix.sh) sha="${TEST_HERMETIC_MATRIX_SH_SHA256}" ;;
       test_matrix_static.py) sha="${TEST_MATRIX_STATIC_PY_SHA256}" ;;
       prepare-stage-root.sh) sha="${PREPARE_STAGE_ROOT_SH_SHA256}" ;;
+      provision-ubuntu-test-host.sh) sha="${PROVISION_UBUNTU_TEST_HOST_SH_SHA256}" ;;
     esac
     [[ "$(sha256_file "${LOCAL_PACKAGE_DIR}/${name}")" == "${sha}" ]] || return 67
   done
@@ -402,8 +413,10 @@ run_operation() {
   return "${rc}"
 }
 
-readonly -a PREFLIGHT_OPERATIONS=(
+readonly -a BASE_IDENTITY_OPERATIONS=(
   identity-hostname identity-kernel identity-machine identity-netns identity-interface
+)
+readonly -a POSTFLIGHT_OPERATIONS=(
   identity-driver identity-wg-interfaces
   tool-go tool-clang tool-llvm tool-bpftool tool-make tool-gcc tool-iperf3
   tool-shellcheck tool-jq tool-wireguard tool-ethtool tool-tc tool-ip
@@ -411,18 +424,30 @@ readonly -a PREFLIGHT_OPERATIONS=(
 )
 readonly -a PACKAGE_NAMES=(
   source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh controller.sh prepare-stage-root.sh
-  root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh test_matrix_static.py
+  provision-ubuntu-test-host.sh root-matrix-n-r.sh check-realhost-iperf.py
+  test-hermetic-matrix.sh test_matrix_static.py
 )
-readonly -a BOOTSTRAP_OPERATIONS=(
+readonly -a BOOTSTRAP_CREATE_OPERATIONS=(
   bootstrap-absent bootstrap-not-symlink bootstrap-create bootstrap-root-readlink bootstrap-root-stat
-  bootstrap-install-stager
-  bootstrap-stager-readlink bootstrap-stager-sha bootstrap-stager-stat
+  bootstrap-install-provisioner bootstrap-install-stager
+)
+readonly -a BOOTSTRAP_ROOT_VERIFY_OPERATIONS=(bootstrap-root-readlink bootstrap-root-stat)
+readonly -a PROVISIONER_VERIFY_OPERATIONS=(
+  bootstrap-provisioner-readlink bootstrap-provisioner-stat bootstrap-provisioner-sha
+)
+readonly -a STAGER_VERIFY_OPERATIONS=(
+  bootstrap-stager-readlink bootstrap-stager-stat bootstrap-stager-sha
 )
 readonly -a STAGE_OPERATIONS=(stage-snapshot stage-plan stage-run)
 
+state_transition() {
+  printf 'B82_V6_CONTROLLER_STATE from=%s to=%s automatic_apply=0\n' "$1" "$2"
+}
+
 plan_all() {
   local operation name
-  for operation in "${PREFLIGHT_OPERATIONS[@]}" package-parent-stat package-mkdir; do
+  printf 'B82_V6_CONTROLLER_STATE current=PACKAGE_BOUND automatic_apply=0\n'
+  for operation in "${BASE_IDENTITY_OPERATIONS[@]}" package-parent-stat package-mkdir; do
     run_operation plan "${operation}" || return $?
   done
   for name in "${PACKAGE_NAMES[@]}"; do
@@ -430,7 +455,22 @@ plan_all() {
     run_operation plan "verify-sha-${name}" || return $?
     run_operation plan "verify-stat-${name}" || return $?
   done
-  for operation in controller-shellcheck hermetic-matrix "${BOOTSTRAP_OPERATIONS[@]}" "${STAGE_OPERATIONS[@]}"; do
+  for operation in "${BOOTSTRAP_CREATE_OPERATIONS[@]}"; do
+    run_operation plan "${operation}" || return $?
+  done
+  state_transition PACKAGE_BOUND BOOTSTRAP_ONLY
+  for operation in "${PROVISIONER_VERIFY_OPERATIONS[@]}" provision-check; do
+    run_operation plan "${operation}" || return $?
+  done
+  printf '%s\n' \
+    'B82_V6_CONTROLLER_BRANCH missing_set=none next_state=POSTFLIGHT' \
+    'B82_V6_CONTROLLER_BRANCH missing_set=initial|iperf3 next_state=AWAIT_APPLY' \
+    'B82_V6_CONTROLLER_STATE from=AWAIT_APPLY to=PROVISION_APPLY explicit_mode=provision-apply automatic_apply=0'
+  for operation in "${PROVISIONER_VERIFY_OPERATIONS[@]}" provision-apply; do
+    run_operation plan "${operation}" || return $?
+  done
+  for operation in "${POSTFLIGHT_OPERATIONS[@]}" controller-shellcheck hermetic-matrix \
+    "${STAGER_VERIFY_OPERATIONS[@]}" "${STAGE_OPERATIONS[@]}"; do
     run_operation plan "${operation}" || return $?
   done
   if [[ "${WG_STATE}" == 'absent' ]]; then
@@ -453,14 +493,79 @@ require_bound_wireguard() {
 
 execute_preflight() {
   local operation
-  for operation in "${PREFLIGHT_OPERATIONS[@]}"; do
+  for operation in "${BASE_IDENTITY_OPERATIONS[@]}" "${POSTFLIGHT_OPERATIONS[@]}"; do
     run_operation execute "${operation}" || return $?
   done
 }
 
+verify_remote_package() {
+  local name
+  for name in "${PACKAGE_NAMES[@]}"; do
+    run_operation execute "verify-sha-${name}" || return $?
+    run_operation execute "verify-stat-${name}" || return $?
+  done
+}
+
+verify_provisioner() {
+  local operation
+  for operation in "${PROVISIONER_VERIFY_OPERATIONS[@]}"; do
+    run_operation execute "${operation}" || return $?
+  done
+}
+
+verify_stager() {
+  local operation
+  for operation in "${STAGER_VERIFY_OPERATIONS[@]}"; do
+    run_operation execute "${operation}" || return $?
+  done
+}
+
+run_provision_check() {
+  local output rc started finished marker
+  PROVISION_RESULT=''
+  started="$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" || return 70
+  printf 'B82_V6_CONTROLLER_EVENT utc=%s event=start mode=%s operation=provision-check target=%s\n' \
+    "${started}" "${MODE}" "${TARGET_HOST}"
+  output="$(transport execute provision-check 2>&1)"
+  rc=$?
+  printf '%s\n' "${output}"
+  finished="$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" || return 70
+  printf 'B82_V6_CONTROLLER_EVENT utc=%s event=finish mode=%s operation=provision-check target=%s rc=%s\n' \
+    "${finished}" "${MODE}" "${TARGET_HOST}" "${rc}"
+  ((rc == 0)) || return "${rc}"
+  marker="$(printf '%s\n' "${output}" | /usr/bin/awk '
+    /^B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=valid missing_set=(none|initial|iperf3) next_state=(POSTFLIGHT|AWAIT_APPLY)$/ {
+      if (++seen > 1) exit 65
+      value = $0
+    }
+    END { if (seen != 1) exit 65; print value }
+  ')" || return 78
+  case "${marker}" in
+    *' missing_set=none next_state=POSTFLIGHT') PROVISION_RESULT='none' ;;
+    *' missing_set=initial next_state=AWAIT_APPLY') PROVISION_RESULT='initial' ;;
+    *' missing_set=iperf3 next_state=AWAIT_APPLY') PROVISION_RESULT='iperf3' ;;
+    *) return 78 ;;
+  esac
+}
+
+execute_postflight() {
+  local operation
+  verify_remote_package || return $?
+  for operation in "${POSTFLIGHT_OPERATIONS[@]}" controller-shellcheck hermetic-matrix; do
+    run_operation execute "${operation}" || return $?
+  done
+  verify_stager || return $?
+  for operation in "${STAGE_OPERATIONS[@]}"; do
+    run_operation execute "${operation}" || return $?
+  done
+  printf 'B82_V6_CONTROLLER_POSTFLIGHT_COMPLETE state=POSTFLIGHT\n'
+}
+
 execute_prepare() {
   local operation name
-  execute_preflight || return $?
+  for operation in "${BASE_IDENTITY_OPERATIONS[@]}"; do
+    run_operation execute "${operation}" || return $?
+  done
   run_operation execute package-parent-stat || return $?
   run_operation execute package-mkdir || return $?
   for name in "${PACKAGE_NAMES[@]}"; do
@@ -468,9 +573,55 @@ execute_prepare() {
     run_operation execute "verify-sha-${name}" || return $?
     run_operation execute "verify-stat-${name}" || return $?
   done
-  for operation in controller-shellcheck hermetic-matrix "${BOOTSTRAP_OPERATIONS[@]}" "${STAGE_OPERATIONS[@]}"; do
+  for operation in "${BOOTSTRAP_CREATE_OPERATIONS[@]}"; do
     run_operation execute "${operation}" || return $?
   done
+  state_transition PACKAGE_BOUND BOOTSTRAP_ONLY
+  verify_provisioner || return $?
+  state_transition BOOTSTRAP_ONLY PROVISION_CHECK
+  run_provision_check || return $?
+  case "${PROVISION_RESULT}" in
+    none)
+      state_transition PROVISION_CHECK POSTFLIGHT
+      execute_postflight
+      ;;
+    initial | iperf3)
+      state_transition PROVISION_CHECK AWAIT_APPLY
+      printf 'B82_V6_PROVISION_AWAIT_APPLY missing_set=%s explicit_mode=provision-apply automatic_apply=0\n' \
+        "${PROVISION_RESULT}"
+      ;;
+    *) return 78 ;;
+  esac
+}
+
+execute_provision_apply() {
+  local operation expected_missing
+  for operation in "${BASE_IDENTITY_OPERATIONS[@]}" "${BOOTSTRAP_ROOT_VERIFY_OPERATIONS[@]}"; do
+    run_operation execute "${operation}" || return $?
+  done
+  verify_provisioner || return $?
+  state_transition BOOTSTRAP_ONLY PROVISION_CHECK
+  run_provision_check || return $?
+  if [[ "${PROVISION_RESULT}" == 'none' ]]; then
+    state_transition PROVISION_CHECK POSTFLIGHT
+    execute_postflight
+    return $?
+  fi
+  [[ "${PROVISION_RESULT}" == 'initial' || "${PROVISION_RESULT}" == 'iperf3' ]] || return 78
+  expected_missing="${PROVISION_RESULT}"
+  state_transition PROVISION_CHECK AWAIT_APPLY
+  state_transition AWAIT_APPLY PROVISION_APPLY
+  verify_provisioner || return $?
+  run_operation execute provision-apply || return $?
+  verify_provisioner || return $?
+  run_provision_check || return $?
+  [[ "${PROVISION_RESULT}" == 'none' ]] || {
+    printf 'B82_V6_PROVISION_POSTCHECK_STOP expected_before=%s actual_after=%s\n' \
+      "${expected_missing}" "${PROVISION_RESULT}" >&2
+    return 78
+  }
+  state_transition PROVISION_APPLY POSTFLIGHT
+  execute_postflight
 }
 
 main() {
@@ -480,6 +631,7 @@ main() {
     plan) plan_all || fail 'plan-operation' $? ;;
     preflight) execute_preflight || fail 'preflight-operation' $? ;;
     prepare) execute_prepare || fail 'prepare-operation' $? ;;
+    provision-apply) execute_provision_apply || fail 'provision-apply-operation' $? ;;
     matrix-plan)
       require_bound_wireguard
       run_operation execute matrix-plan || fail 'matrix-plan-operation' $?
