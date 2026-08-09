@@ -23,6 +23,8 @@ source = path.read_text(encoding="utf-8")
 required = (
     "case \"${MODE}\" in plan | run | restore)",
     "readonly STAGE_ROOT=\"${STAGING_PREFIX}/${GATE_ID}\"",
+    "readonly SNAPSHOT_MANIFEST=\"${INTAKE_ROOT}/package-manifest.v1\"",
+    "readonly SNAPSHOT_BUNDLE=\"${INTAKE_ROOT}/source-${PACKAGE_ID}.bundle\"",
     "readonly RESERVED_PIN=\"/sys/fs/bpf/wg-mix-ebpf-${GATE_ID}\"",
     "GOCACHE=\"${GO_CACHE}\"",
     "GOMODCACHE=\"${GO_MOD_CACHE}\"",
@@ -34,6 +36,20 @@ required = (
     "GOPROXY=https://proxy.golang.org",
     "GOVCS=off",
     "GOTELEMETRY=off",
+    'exec {MANIFEST_FD}<"${MANIFEST}"',
+    'exec {BUNDLE_FD}<"${BUNDLE}"',
+    'source="/proc/self/fd/${descriptor}"',
+    'noclobber copy held ${source} to ${destination}',
+    'load_manifest_once',
+    'clone --no-local --no-checkout --single-branch',
+    '"${SNAPSHOT_BUNDLE}" "${SOURCE}"',
+    "rev-parse --is-shallow-repository",
+    "rev-list --count",
+    "rev-list --max-parents=0 --reverse",
+    "rev-list --parents --objects",
+    "--missing=print",
+    "fsck --full --strict --no-dangling",
+    "strict_fsck=passed",
     "build-faketcp-checksum-kmod build-faketcp-verifier-launcher-linux-amd64",
     "build test-bpf-object-manifests",
     "run-faketcp-verifier-only.py",
@@ -44,10 +60,16 @@ required = (
     "persistent_bpf_delta=zero",
     "restore=explicit-only",
     "phase-restore-intent.v1",
+    'ensure_phase "${RESTORE_INTENT_PHASE}"',
+    'ensure_phase "${RESTORED_PHASE}"',
+    'ensure_phase "${FILESYSTEM_PHASE}"',
     "reverse_argv=/usr/sbin/rmmod wg_mix_faketcp_checksum",
     "automatic_cleanup=0",
     "noclobber create ${STEP_LOG}",
     "/usr/bin/tee -a \"${STEP_LOG}\"",
+    'restore_module_transition "${live}${loaded_receipt}"',
+    "01 | 00) printf '%s\\n' already-absent ;;",
+    "assert_bpf_baseline_convergent R.final",
 )
 for value in required:
     if value not in source:
@@ -94,8 +116,30 @@ run_body = source[run_start:run_end]
 restore_body = source[restore_start:main_start]
 if "module-unload" in run_body or "restore_gate" in run_body:
     fail("run path contains automatic module cleanup")
-if "run_operation R.module module-unload" not in restore_body:
+if "run_convergent_operation R.module module-unload" not in restore_body:
     fail("explicit restore does not use the sole module-unload authority")
+if "fail 'already-restored'" in restore_body:
+    fail("restore still rejects its replayable terminal state")
+intent_index = restore_body.find('ensure_phase "${RESTORE_INTENT_PHASE}"')
+state_index = restore_body.find('restore_module_transition "${live}${loaded_receipt}"')
+unload_index = restore_body.find("run_convergent_operation R.module module-unload")
+if min(intent_index, state_index, unload_index) < 0 or not intent_index < state_index < unload_index:
+    fail("restore intent is not durable before state inspection and module mutation")
+
+if "manifest_value()" in source or "manifest_value " in source:
+    fail("manifest is reparsed by key instead of consumed exactly once")
+snapshot_index = source.find("snapshot_held_inputs", run_start)
+audit_index = source.find("create_audit_log", source.find("run_gate() {"))
+clone_index = source.find("create_fresh_source", source.find("run_gate() {"))
+if min(snapshot_index, audit_index, clone_index) < 0 or not snapshot_index < audit_index < clone_index:
+    fail("stable input snapshots are not sealed before clone/build")
+
+warning_index = source.find(
+    '/usr/bin/cmp -s "${EVIDENCE_ROOT}/A.kwarn.out" "${EVIDENCE_ROOT}/M.kwarn.out"'
+)
+loaded_index = source.find('write_phase "${MODULE_LOADED_PHASE}"')
+if min(warning_index, loaded_index) < 0 or warning_index > loaded_index:
+    fail("module warning delta is not checked before publishing the loaded receipt")
 
 if source.count("/usr/bin/mkdir --mode=0700 --") < 7:
     fail("fresh stage/cache directories are not exact mkdir operations")

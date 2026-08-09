@@ -31,13 +31,29 @@ run_plan() {
     --bundle "${BUNDLE}" --bundle-sha256 "${BUNDLE_SHA}"
 }
 
+restore_transition() {
+  /bin/bash -c 'source "$1"; restore_module_transition "$2"' \
+    fresh-verifier-transition "${SCRIPT}" "$1"
+}
+
 run_plan >"${OUTPUT}" || fail 'plan returned nonzero'
 PLAN="$(/bin/cat -- "${OUTPUT}")" || fail 'read plan'
 
 for expected in \
   'B82_FRESH_VERIFIER_PLAN_ONLY gate_id=fresh-c8e41d73' \
   'operation=fresh-stage-create' \
+  'operation=intake-create' \
+  'operation=held-fd-noclobber-copy' \
+  'snapshot_manifest=/run/wg-mix-ebpf-faketcp-verifier/fresh-c8e41d73/package/package-manifest.v1' \
+  'snapshot_bundle=/run/wg-mix-ebpf-faketcp-verifier/fresh-c8e41d73/package/source-4f2a9b61.bundle' \
   'operation=source-clone' \
+  'operation=source-shallow' \
+  'operation=history-count' \
+  'operation=history-roots' \
+  'operation=history-objects' \
+  'operation=history-fsck' \
+  'rev-list --parents --objects --missing=print' \
+  'fsck --full --strict --no-dangling' \
   'operation=cache-mkdir' \
   'operation=mod-cache-mkdir' \
   'operation=go-path-mkdir' \
@@ -69,6 +85,8 @@ done
   "${PLAN}" != *'chroot'* && "${PLAN}" != *'nsenter'* &&
   "${PLAN}" != *'/usr/sbin/ip '* && "${PLAN}" != *'/usr/sbin/tc '* ]] ||
   fail 'plan contains an out-of-scope destructive or network operation'
+[[ "$(/usr/bin/grep -c 'held-fd-noclobber-copy' "${OUTPUT}")" == 2 ]] ||
+  fail 'plan does not snapshot exactly one manifest and bundle held descriptor'
 
 if /bin/bash "${SCRIPT}" run \
   --controller-source "${CONTROLLER_SOURCE}" \
@@ -90,6 +108,19 @@ if /bin/bash "${SCRIPT}" plan \
   --manifest "${MANIFEST}" --manifest-sha256 "${MANIFEST_SHA}" \
   --bundle "${BUNDLE}" --bundle-sha256 "${BUNDLE_SHA}" >"${FIXTURE}/order.out" 2>&1; then
   fail 'reordered authority arguments were accepted'
+fi
+
+for transition in \
+  '11|unload-receipted-generation' \
+  '10|require-exact-generation-receipt' \
+  '01|already-absent' \
+  '00|already-absent'; do
+  IFS='|' read -r cut expected <<<"${transition}"
+  [[ "$(restore_transition "${cut}")" == "${expected}" ]] ||
+    fail "restore failure-cut ${cut} did not select ${expected}"
+done
+if restore_transition 12 >"${FIXTURE}/invalid-transition.out" 2>&1; then
+  fail 'invalid restore transition was accepted'
 fi
 
 printf 'fresh verifier hermetic plan test passed; retained=%s\n' "${FIXTURE}"

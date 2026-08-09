@@ -11,6 +11,9 @@ readonly EXPECTED_MANIFEST="/run/wg-mix-ebpf-source-bootstrap-${CONTROLLER_RUN_I
 readonly EXPECTED_BUNDLE="/run/wg-mix-ebpf-source-bootstrap-${CONTROLLER_RUN_ID}/source-${PACKAGE_ID}.bundle"
 readonly STAGING_PREFIX='/run/wg-mix-ebpf-faketcp-verifier'
 readonly STAGE_ROOT="${STAGING_PREFIX}/${GATE_ID}"
+readonly INTAKE_ROOT="${STAGE_ROOT}/package"
+readonly SNAPSHOT_MANIFEST="${INTAKE_ROOT}/package-manifest.v1"
+readonly SNAPSHOT_BUNDLE="${INTAKE_ROOT}/source-${PACKAGE_ID}.bundle"
 readonly SOURCE="${STAGE_ROOT}/source"
 readonly EVIDENCE_ROOT="${STAGE_ROOT}/evidence"
 readonly GO_CACHE="${STAGE_ROOT}/go-cache"
@@ -25,6 +28,7 @@ readonly OWNER_PHASE="${EVIDENCE_ROOT}/phase-owner.v1"
 readonly HOST_PHASE="${EVIDENCE_ROOT}/phase-host.v1"
 readonly BPF_BASELINE_PHASE="${EVIDENCE_ROOT}/phase-bpf-baseline.v1"
 readonly BUILD_PHASE="${EVIDENCE_ROOT}/phase-build.v1"
+readonly HISTORY_PHASE="${EVIDENCE_ROOT}/phase-history.v1"
 readonly MODULE_INTENT_PHASE="${EVIDENCE_ROOT}/phase-module-intent.v1"
 readonly MODULE_LOADED_PHASE="${EVIDENCE_ROOT}/phase-module-loaded.v1"
 readonly VERIFIER_PHASE="${EVIDENCE_ROOT}/phase-verifier.v1"
@@ -33,6 +37,8 @@ readonly COMPLETE_PHASE="${EVIDENCE_ROOT}/phase-complete.v1"
 readonly RESTORE_INTENT_PHASE="${EVIDENCE_ROOT}/phase-restore-intent.v1"
 readonly RESTORED_PHASE="${EVIDENCE_ROOT}/phase-restored.v1"
 readonly FILESYSTEM_PHASE="${EVIDENCE_ROOT}/phase-filesystem-retained.v1"
+readonly HISTORY_OBJECTS="${EVIDENCE_ROOT}/S4.objects.out"
+readonly HISTORY_ROOTS="${EVIDENCE_ROOT}/S4.roots.out"
 readonly BASELINE_OBJECT="${SOURCE}/build/wg_mix_tc.o"
 readonly EXPERIMENTAL_OBJECT="${SOURCE}/build/wg_mix_faketcp_experimental.o"
 readonly BINARY="${SOURCE}/bin/wg-mix-ebpf"
@@ -46,7 +52,7 @@ readonly SELF_FROM_SOURCE="scripts/realhost-b82-${CONTROLLER_RUN_ID}/root-fresh-
 readonly EXPECTED_HOSTNAME='ubuntu-2604-test'
 readonly EXPECTED_KERNEL='7.0.0-28-generic'
 readonly EXPECTED_MACHINE_ID='9db3fb717cc74974b2a6b243d67f67b9'
-readonly STATE_SCHEMA='owner,host,bpf-baseline,build,module-intent,module-loaded,verifier,test-run,complete,restore-intent,restored,filesystem-retained'
+readonly STATE_SCHEMA='owner,host,bpf-baseline,history,build,module-intent,module-loaded,verifier,test-run,complete,restore-intent,restored,filesystem-retained'
 
 readonly -a GIT_ENV=(
   /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C
@@ -74,6 +80,27 @@ MANIFEST_SHA256=''
 BUNDLE=''
 BUNDLE_SHA256=''
 INTEGRATION_REF=''
+HISTORY_VERIFICATION=''
+HISTORY_COMMIT_COUNT=''
+HISTORY_ROOTS_SHA256=''
+HISTORY_OBJECTS_SHA256=''
+FORMAT=''
+MANIFEST_RUN_ID=''
+MANIFEST_PACKAGE_ID=''
+MANIFEST_COMMIT=''
+BUNDLE_NAME=''
+MANIFEST_BUNDLE_SHA256=''
+MANIFEST_REMOTE_SOURCE=''
+MANIFEST_TARGET_HOST=''
+MANIFEST_TARGET_HOSTNAME=''
+MANIFEST_TARGET_KERNEL=''
+MANIFEST_TARGET_MACHINE_ID=''
+MANIFEST_FD=''
+BUNDLE_FD=''
+MANIFEST_FILE_IDENTITY=''
+BUNDLE_FILE_IDENTITY=''
+SNAPSHOT_MANIFEST_IDENTITY=''
+SNAPSHOT_BUNDLE_IDENTITY=''
 BOOT_ID=''
 INITIAL_NETNS=''
 SELF_SHA256=''
@@ -89,6 +116,7 @@ VMLINUX_BTF_SHA256=''
 BPFFS_IDENTITY=''
 STEP_RC=125
 STEP_LOG=''
+CONVERGENCE_OUTPUT=''
 OP_TARGET=''
 declare -a OP_ARGV=()
 declare -a BOOTSTRAP_AUDIT=()
@@ -149,19 +177,78 @@ sha256_file() {
   printf '%s\n' "${line}"
 }
 
-manifest_value() {
-  /usr/bin/awk -F '\t' -v wanted="$1" '
-    BEGIN { count = 0; invalid = 0 }
-    $1 == wanted {
-      count++
-      if (NF != 2 || $2 == "") invalid = 1
-      value = $2
+read_manifest_field() {
+  local expected="$1" destination="$2" key value extra
+  IFS=$'\t' read -r -u "${MANIFEST_FD}" key value extra || return 65
+  [[ "${key}" == "${expected}" && -n "${value}" && -z "${extra}" &&
+    "${value}" != *$'\t'* && "${value}" != *$'\n'* ]] || return 65
+  [[ "${destination}" == discard ]] || printf -v "${destination}" '%s' "${value}"
+}
+
+load_manifest_once() {
+  local unexpected
+  exec {MANIFEST_FD}<"${SNAPSHOT_MANIFEST}" || return 66
+  read_manifest_field format FORMAT &&
+    read_manifest_field run_id MANIFEST_RUN_ID &&
+    read_manifest_field package_id MANIFEST_PACKAGE_ID &&
+    read_manifest_field integration_ref INTEGRATION_REF &&
+    read_manifest_field integration_commit MANIFEST_COMMIT &&
+    read_manifest_field bundle_name BUNDLE_NAME &&
+    read_manifest_field bundle_sha256 MANIFEST_BUNDLE_SHA256 &&
+    read_manifest_field history_verification HISTORY_VERIFICATION &&
+    read_manifest_field history_commit_count HISTORY_COMMIT_COUNT &&
+    read_manifest_field history_roots_sha256 HISTORY_ROOTS_SHA256 &&
+    read_manifest_field history_objects_sha256 HISTORY_OBJECTS_SHA256 &&
+    read_manifest_field wg_state discard &&
+    read_manifest_field wg_interface discard &&
+    read_manifest_field wg_local_address discard &&
+    read_manifest_field wg_peer_address discard &&
+    read_manifest_field local_repository discard &&
+    read_manifest_field local_package_dir discard &&
+    read_manifest_field remote_package_dir discard &&
+    read_manifest_field remote_source MANIFEST_REMOTE_SOURCE &&
+    read_manifest_field target_user discard &&
+    read_manifest_field target_host MANIFEST_TARGET_HOST &&
+    read_manifest_field target_hostname MANIFEST_TARGET_HOSTNAME &&
+    read_manifest_field target_kernel MANIFEST_TARGET_KERNEL &&
+    read_manifest_field target_machine_id MANIFEST_TARGET_MACHINE_ID &&
+    read_manifest_field target_interface discard &&
+    read_manifest_field peer_address discard &&
+    read_manifest_field peer_port discard &&
+    read_manifest_field soak_seconds discard &&
+    read_manifest_field session_seconds discard &&
+    read_manifest_field bind_final_package_sh_path discard &&
+    read_manifest_field bind_final_package_sh_blob discard &&
+    read_manifest_field bind_final_package_sh_sha256 discard &&
+    read_manifest_field controller_sh_path discard &&
+    read_manifest_field controller_sh_blob discard &&
+    read_manifest_field controller_sh_sha256 discard &&
+    read_manifest_field locked_transport_exp_path discard &&
+    read_manifest_field locked_transport_exp_blob discard &&
+    read_manifest_field locked_transport_exp_sha256 discard &&
+    read_manifest_field root_matrix_n_r_sh_path discard &&
+    read_manifest_field root_matrix_n_r_sh_blob discard &&
+    read_manifest_field root_matrix_n_r_sh_sha256 discard &&
+    read_manifest_field check_realhost_iperf_py_path discard &&
+    read_manifest_field check_realhost_iperf_py_blob discard &&
+    read_manifest_field check_realhost_iperf_py_sha256 discard &&
+    read_manifest_field test_hermetic_matrix_sh_path discard &&
+    read_manifest_field test_hermetic_matrix_sh_blob discard &&
+    read_manifest_field test_hermetic_matrix_sh_sha256 discard &&
+    read_manifest_field test_matrix_static_py_path discard &&
+    read_manifest_field test_matrix_static_py_blob discard &&
+    read_manifest_field test_matrix_static_py_sha256 discard &&
+    read_manifest_field prepare_stage_root_sh_path discard &&
+    read_manifest_field prepare_stage_root_sh_blob discard &&
+    read_manifest_field prepare_stage_root_sh_sha256 discard || {
+      exec {MANIFEST_FD}<&-
+      return 65
     }
-    END {
-      if (count != 1 || invalid) exit 65
-      print value
-    }
-  ' "${MANIFEST}"
+  if IFS= read -r -u "${MANIFEST_FD}" unexpected; then
+    exec {MANIFEST_FD}<&-
+    return 65
+  fi
+  exec {MANIFEST_FD}<&-
 }
 
 phase_value() {
@@ -177,6 +264,10 @@ phase_value() {
       print value
     }
   ' "$1"
+}
+
+file_identity() {
+  /usr/bin/stat -Lc '%d:%i:%s:%Y:%Z:%u:%g:%a:%h:%F' -- "$1"
 }
 
 git_fixed() { "${GIT_ENV[@]}" "$@"; }
@@ -228,27 +319,53 @@ validate_controller_source() {
   SELF_SHA256="$(sha256_file "${self_path}")" || return $?
 }
 
-validate_manifest_bundle() {
-  local bundle_head
+hold_input_files() {
+  local manifest_fd_path bundle_fd_path
   validate_root_owned_file "${MANIFEST}" 600 || return $?
   validate_root_owned_file "${BUNDLE}" 600 || return $?
-  [[ "$(sha256_file "${MANIFEST}")" == "${MANIFEST_SHA256}" &&
-    "$(sha256_file "${BUNDLE}")" == "${BUNDLE_SHA256}" ]] || return 79
-  [[ "$(manifest_value format)" == 'wg-mix-ebpf-b82-v6-package-v1' &&
-    "$(manifest_value run_id)" == "${CONTROLLER_RUN_ID}" &&
-    "$(manifest_value package_id)" == "${PACKAGE_ID}" &&
-    "$(manifest_value integration_commit)" == "${COMMIT}" &&
-    "$(manifest_value bundle_sha256)" == "${BUNDLE_SHA256}" &&
-    "$(manifest_value remote_source)" == "${EXPECTED_CONTROLLER_SOURCE}" &&
-    "$(manifest_value target_host)" == '192.168.10.82' &&
-    "$(manifest_value target_hostname)" == "${EXPECTED_HOSTNAME}" &&
-    "$(manifest_value target_kernel)" == "${EXPECTED_KERNEL}" ]] || return 79
-  INTEGRATION_REF="$(manifest_value integration_ref)" || return $?
+  exec {MANIFEST_FD}<"${MANIFEST}" || return 66
+  exec {BUNDLE_FD}<"${BUNDLE}" || {
+    exec {MANIFEST_FD}<&-
+    return 66
+  }
+  manifest_fd_path="/proc/self/fd/${MANIFEST_FD}"
+  bundle_fd_path="/proc/self/fd/${BUNDLE_FD}"
+  MANIFEST_FILE_IDENTITY="$(file_identity "${manifest_fd_path}")" || return 66
+  BUNDLE_FILE_IDENTITY="$(file_identity "${bundle_fd_path}")" || return 66
+  [[ "$(file_identity "${MANIFEST}")" == "${MANIFEST_FILE_IDENTITY}" &&
+    "$(file_identity "${BUNDLE}")" == "${BUNDLE_FILE_IDENTITY}" &&
+    "$(sha256_file "${manifest_fd_path}")" == "${MANIFEST_SHA256}" &&
+    "$(sha256_file "${bundle_fd_path}")" == "${BUNDLE_SHA256}" ]] || return 79
+}
+
+validate_snapshot_contract() {
+  local bundle_head
+  validate_root_owned_file "${SNAPSHOT_MANIFEST}" 600 || return $?
+  validate_root_owned_file "${SNAPSHOT_BUNDLE}" 600 || return $?
+  SNAPSHOT_MANIFEST_IDENTITY="$(file_identity "${SNAPSHOT_MANIFEST}")" || return 66
+  SNAPSHOT_BUNDLE_IDENTITY="$(file_identity "${SNAPSHOT_BUNDLE}")" || return 66
+  [[ "$(sha256_file "${SNAPSHOT_MANIFEST}")" == "${MANIFEST_SHA256}" &&
+    "$(sha256_file "${SNAPSHOT_BUNDLE}")" == "${BUNDLE_SHA256}" ]] || return 79
+  load_manifest_once || return $?
+  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v1' &&
+    "${MANIFEST_RUN_ID}" == "${CONTROLLER_RUN_ID}" &&
+    "${MANIFEST_PACKAGE_ID}" == "${PACKAGE_ID}" &&
+    "${MANIFEST_COMMIT}" == "${COMMIT}" &&
+    "${BUNDLE_NAME}" == "source-${PACKAGE_ID}.bundle" &&
+    "${MANIFEST_BUNDLE_SHA256}" == "${BUNDLE_SHA256}" &&
+    "${HISTORY_VERIFICATION}" == 'isolated-unbundle-rev-list-fsck-v1' &&
+    "${HISTORY_COMMIT_COUNT}" =~ ^[1-9][0-9]*$ &&
+    "${MANIFEST_REMOTE_SOURCE}" == "${EXPECTED_CONTROLLER_SOURCE}" &&
+    "${MANIFEST_TARGET_HOST}" == '192.168.10.82' &&
+    "${MANIFEST_TARGET_HOSTNAME}" == "${EXPECTED_HOSTNAME}" &&
+    "${MANIFEST_TARGET_KERNEL}" == "${EXPECTED_KERNEL}" &&
+    "${MANIFEST_TARGET_MACHINE_ID}" == "${EXPECTED_MACHINE_ID}" ]] || return 79
+  valid_sha256 "${HISTORY_ROOTS_SHA256}" && valid_sha256 "${HISTORY_OBJECTS_SHA256}" || return 65
   [[ "${INTEGRATION_REF}" =~ ^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$ &&
     "${INTEGRATION_REF}" != *'..'* && "${INTEGRATION_REF}" != *'//' ]] || return 65
-  git_fixed -C "${CONTROLLER_SOURCE}" bundle verify "${BUNDLE}" || return 76
+  git_fixed -C "${CONTROLLER_SOURCE}" bundle verify "${SNAPSHOT_BUNDLE}" || return 76
   bundle_head="$(git_fixed -C "${CONTROLLER_SOURCE}" bundle list-heads \
-    "${BUNDLE}" "${INTEGRATION_REF}")" || return 76
+    "${SNAPSHOT_BUNDLE}" "${INTEGRATION_REF}")" || return 76
   [[ "${bundle_head}" == "${COMMIT} ${INTEGRATION_REF}" ]]
 }
 
@@ -287,8 +404,8 @@ validate_host() {
 validate_inputs() {
   require_tools
   validate_controller_source || fail 'controller-source' $?
-  validate_manifest_bundle || fail 'manifest-bundle' $?
   validate_host || fail 'host-identity' $?
+  hold_input_files || fail 'manifest-bundle-hold' $?
 }
 
 bootstrap_audit_line() {
@@ -326,23 +443,58 @@ ensure_prefix_and_stage() {
   [[ ! -e "${STAGE_ROOT}" && ! -L "${STAGE_ROOT}" ]] || fail 'stage-preexists' 73
   bootstrap_step B1.stage "${STAGE_ROOT}" /usr/bin/mkdir --mode=0700 -- \
     "${STAGE_ROOT}" || fail 'stage-create' $?
-  bootstrap_step B2.evidence "${EVIDENCE_ROOT}" /usr/bin/mkdir --mode=0700 -- \
+  bootstrap_step B2.intake "${INTAKE_ROOT}" /usr/bin/mkdir --mode=0700 -- \
+    "${INTAKE_ROOT}" || fail 'intake-create' $?
+  bootstrap_step B3.evidence "${EVIDENCE_ROOT}" /usr/bin/mkdir --mode=0700 -- \
     "${EVIDENCE_ROOT}" || fail 'evidence-create' $?
+}
+
+bootstrap_snapshot_file() {
+  local label="$1" descriptor="$2" destination="$3" rendered source rc
+  source="/proc/self/fd/${descriptor}"
+  rendered="shell-builtin: noclobber copy held ${source} to ${destination}"
+  bootstrap_audit_line start "${label}" "${destination}" not-run "${rendered}" || return $?
+  set -o noclobber
+  /usr/bin/cat -- "${source}" >"${destination}"
+  rc=$?
+  set +o noclobber
+  bootstrap_audit_line finish "${label}" "${destination}" "${rc}" "${rendered}" || return $?
+  return "${rc}"
+}
+
+snapshot_held_inputs() {
+  local manifest_fd_path="/proc/self/fd/${MANIFEST_FD}"
+  local bundle_fd_path="/proc/self/fd/${BUNDLE_FD}"
+  [[ "$(file_identity "${manifest_fd_path}")" == "${MANIFEST_FILE_IDENTITY}" &&
+    "$(file_identity "${bundle_fd_path}")" == "${BUNDLE_FILE_IDENTITY}" ]] ||
+    fail 'held-input-identity-drift' 79
+  bootstrap_snapshot_file B4.manifest-snapshot "${MANIFEST_FD}" "${SNAPSHOT_MANIFEST}" ||
+    fail 'manifest-snapshot' $?
+  bootstrap_snapshot_file B5.bundle-snapshot "${BUNDLE_FD}" "${SNAPSHOT_BUNDLE}" ||
+    fail 'bundle-snapshot' $?
+  [[ "$(file_identity "${manifest_fd_path}")" == "${MANIFEST_FILE_IDENTITY}" &&
+    "$(file_identity "${bundle_fd_path}")" == "${BUNDLE_FILE_IDENTITY}" &&
+    "$(sha256_file "${manifest_fd_path}")" == "${MANIFEST_SHA256}" &&
+    "$(sha256_file "${bundle_fd_path}")" == "${BUNDLE_SHA256}" ]] ||
+    fail 'held-input-content-drift' 79
+  exec {MANIFEST_FD}<&-
+  exec {BUNDLE_FD}<&-
+  validate_snapshot_contract || fail 'snapshot-contract' $?
 }
 
 create_audit_log() {
   local rc rendered timestamp
   rendered="shell-builtin: noclobber write bootstrap audit to ${AUDIT_LOG}"
-  bootstrap_audit_line start B3.audit "${AUDIT_LOG}" not-run "${rendered}" || fail 'audit-bootstrap-start'
+  bootstrap_audit_line start B6.audit "${AUDIT_LOG}" not-run "${rendered}" || fail 'audit-bootstrap-start'
   set -o noclobber
   printf '%s\n' "${BOOTSTRAP_AUDIT[@]}" >"${AUDIT_LOG}"
   rc=$?
   set +o noclobber
-  bootstrap_audit_line finish B3.audit "${AUDIT_LOG}" "${rc}" "${rendered}" || fail 'audit-bootstrap-finish'
+  bootstrap_audit_line finish B6.audit "${AUDIT_LOG}" "${rc}" "${rendered}" || fail 'audit-bootstrap-finish'
   ((rc == 0)) || fail 'audit-create' "${rc}"
   timestamp="$(utc_now)" || fail 'audit-created-time'
   printf 'utc=%q event=%q step=%q target=%q rc=%q argv=%q\n' \
-    "${timestamp}" finish B3.audit "${AUDIT_LOG}" 0 "${rendered}" >>"${AUDIT_LOG}" ||
+    "${timestamp}" finish B6.audit "${AUDIT_LOG}" 0 "${rendered}" >>"${AUDIT_LOG}" ||
     fail 'audit-finish-persist'
 }
 
@@ -410,6 +562,54 @@ write_phase() {
   ((rc == 0)) || fail "phase-write:${path}" "${rc}"
 }
 
+ensure_phase() {
+  local path="$1" expected actual
+  shift
+  expected="$(printf '%s\n' "$@")" || fail "phase-render-expected:${path}"
+  if [[ -e "${path}" || -L "${path}" ]]; then
+    validate_root_owned_file "${path}" 600 || fail "phase-replay-identity:${path}" $?
+    actual="$(/usr/bin/cat -- "${path}")" || fail "phase-replay-read:${path}"
+    [[ "${actual}" == "${expected}" ]] || fail "phase-replay-mismatch:${path}" 79
+    return
+  fi
+  write_phase "${path}" "$@"
+}
+
+run_convergent_operation() {
+  local label="$1" operation="$2" rendered rc
+  build_argv "${operation}" || fail "convergence-operation:${operation}" $?
+  rendered="$(quote_argv "${OP_ARGV[@]}")" || fail "convergence-render:${label}"
+  audit_line start "${label}" "${OP_TARGET}" not-run "${rendered}" ||
+    fail "convergence-audit-start:${label}"
+  CONVERGENCE_OUTPUT="$("${OP_ARGV[@]}" 2>&1)"
+  rc=$?
+  audit_line output "${label}" "${OP_TARGET}" "${rc}" "${CONVERGENCE_OUTPUT}" ||
+    fail "convergence-audit-output:${label}"
+  audit_line finish "${label}" "${OP_TARGET}" "${rc}" "${rendered}" ||
+    fail "convergence-audit-finish:${label}"
+  ((rc == 0)) || {
+    printf '%s\n' "${CONVERGENCE_OUTPUT}" >&2
+    fail "${label}:rc=${rc}" "${rc}"
+  }
+}
+
+assert_bpf_baseline_convergent() {
+  local label="$1" expected
+  run_convergent_operation "${label}.progs" snapshot-progs
+  expected="$(/usr/bin/cat -- "${EVIDENCE_ROOT}/A.progs.out")" || fail 'restore-progs-baseline-read'
+  [[ "${CONVERGENCE_OUTPUT}" == "${expected}" ]] || fail "${label}:program-drift" 79
+  run_convergent_operation "${label}.maps" snapshot-maps
+  expected="$(/usr/bin/cat -- "${EVIDENCE_ROOT}/A.maps.out")" || fail 'restore-maps-baseline-read'
+  [[ "${CONVERGENCE_OUTPUT}" == "${expected}" ]] || fail "${label}:map-drift" 79
+  run_convergent_operation "${label}.links" snapshot-links
+  expected="$(/usr/bin/cat -- "${EVIDENCE_ROOT}/A.links.out")" || fail 'restore-links-baseline-read'
+  [[ "${CONVERGENCE_OUTPUT}" == "${expected}" ]] || fail "${label}:link-drift" 79
+  run_convergent_operation "${label}.kwarn" snapshot-kernel-warnings
+  expected="$(/usr/bin/cat -- "${EVIDENCE_ROOT}/A.kwarn.out")" || fail 'restore-warning-baseline-read'
+  [[ "${CONVERGENCE_OUTPUT}" == "${expected}" ]] || fail "${label}:kernel-warning-drift" 79
+  run_convergent_operation "${label}.pin" reserved-pin-absent
+}
+
 build_argv() {
   local operation="$1"
   OP_TARGET="${operation}"
@@ -418,11 +618,32 @@ build_argv() {
     source-clone)
       OP_TARGET="${SOURCE}"
       OP_ARGV=("${GIT_ENV[@]}" clone --no-local --no-checkout --single-branch
-        --branch "${INTEGRATION_REF#refs/heads/}" -- "${BUNDLE}" "${SOURCE}")
+        --branch "${INTEGRATION_REF#refs/heads/}" -- "${SNAPSHOT_BUNDLE}" "${SOURCE}")
       ;;
     source-checkout)
       OP_TARGET="${SOURCE}"
       OP_ARGV=("${GIT_ENV[@]}" -C "${SOURCE}" checkout --detach "${COMMIT}")
+      ;;
+    source-shallow)
+      OP_TARGET="${SOURCE}"
+      OP_ARGV=("${GIT_ENV[@]}" -C "${SOURCE}" rev-parse --is-shallow-repository)
+      ;;
+    history-count)
+      OP_TARGET="${COMMIT}"
+      OP_ARGV=("${GIT_ENV[@]}" -C "${SOURCE}" rev-list --count "${COMMIT}")
+      ;;
+    history-roots)
+      OP_TARGET="${COMMIT}"
+      OP_ARGV=("${GIT_ENV[@]}" -C "${SOURCE}" rev-list --max-parents=0 --reverse "${COMMIT}")
+      ;;
+    history-objects)
+      OP_TARGET="${COMMIT}"
+      OP_ARGV=("${GIT_ENV[@]}" -C "${SOURCE}" rev-list --parents --objects
+        --missing=print "${COMMIT}")
+      ;;
+    history-fsck)
+      OP_TARGET="${COMMIT}"
+      OP_ARGV=("${GIT_ENV[@]}" -C "${SOURCE}" fsck --full --strict --no-dangling "${COMMIT}")
       ;;
     cache-mkdir) OP_TARGET="${GO_CACHE}"; OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${GO_CACHE}") ;;
     mod-cache-mkdir) OP_TARGET="${GO_MOD_CACHE}"; OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${GO_MOD_CACHE}") ;;
@@ -510,11 +731,20 @@ render_plan() {
   printf 'B1.stage operation=fresh-stage-create target=%q argv=' "${STAGE_ROOT}"
   quote_argv /usr/bin/mkdir --mode=0700 -- "${STAGE_ROOT}"
   printf '\n'
-  printf 'B2.evidence operation=evidence-create target=%q argv=' "${EVIDENCE_ROOT}"
+  printf 'B2.intake operation=intake-create target=%q argv=' "${INTAKE_ROOT}"
+  quote_argv /usr/bin/mkdir --mode=0700 -- "${INTAKE_ROOT}"
+  printf '\n'
+  printf 'B3.evidence operation=evidence-create target=%q argv=' "${EVIDENCE_ROOT}"
   quote_argv /usr/bin/mkdir --mode=0700 -- "${EVIDENCE_ROOT}"
   printf '\n'
+  printf 'B4.manifest-snapshot operation=held-fd-noclobber-copy source=/proc/self/fd/HELD_MANIFEST_FD target=%q sha256=%s\n' \
+    "${SNAPSHOT_MANIFEST}" "${MANIFEST_SHA256}"
+  printf 'B5.bundle-snapshot operation=held-fd-noclobber-copy source=/proc/self/fd/HELD_BUNDLE_FD target=%q sha256=%s\n' \
+    "${SNAPSHOT_BUNDLE}" "${BUNDLE_SHA256}"
   for spec in \
     'S0.clone|source-clone' 'S1.checkout|source-checkout' \
+    'S4.shallow|source-shallow' 'S4.count|history-count' \
+    'S4.roots|history-roots' 'S4.objects|history-objects' 'S4.fsck|history-fsck' \
     'S2.cache|cache-mkdir' 'S2.mod-cache|mod-cache-mkdir' \
     'S2.go-path|go-path-mkdir' 'S2.go-tmp|go-tmp-mkdir' \
     'S2.go-home|go-home-mkdir' 'S2.xdg-cache|xdg-cache-mkdir' \
@@ -542,17 +772,49 @@ render_plan() {
   plan_operation EXPLICIT_RESTORE_ONLY.R.links snapshot-links
   plan_operation EXPLICIT_RESTORE_ONLY.R.kwarn snapshot-kernel-warnings
   plan_operation EXPLICIT_RESTORE_ONLY.R.pin reserved-pin-absent
-  printf 'B82_FRESH_VERIFIER_WRITE_SET stage=%s source=%s evidence=%s go_cache=%s go_mod_cache=%s go_path=%s go_tmp=%s go_home=%s xdg_cache=%s xdg_config=%s transient_bpf=unpinned reserved_pin=%s module=%s retained=1 automatic_cleanup=0 network_state_mutations=0 dependency_fetch=proxy-only\n' \
-    "${STAGE_ROOT}" "${SOURCE}" "${EVIDENCE_ROOT}" "${GO_CACHE}" "${GO_MOD_CACHE}" \
+  printf 'B82_FRESH_VERIFIER_WRITE_SET stage=%s intake=%s snapshot_manifest=%s snapshot_bundle=%s source=%s evidence=%s go_cache=%s go_mod_cache=%s go_path=%s go_tmp=%s go_home=%s xdg_cache=%s xdg_config=%s transient_bpf=unpinned reserved_pin=%s module=%s retained=1 automatic_cleanup=0 network_state_mutations=0 dependency_fetch=proxy-only\n' \
+    "${STAGE_ROOT}" "${INTAKE_ROOT}" "${SNAPSHOT_MANIFEST}" "${SNAPSHOT_BUNDLE}" \
+    "${SOURCE}" "${EVIDENCE_ROOT}" "${GO_CACHE}" "${GO_MOD_CACHE}" \
     "${GO_PATH}" "${GO_TMP}" "${GO_HOME}" "${XDG_CACHE}" "${XDG_CONFIG}" \
     "${RESERVED_PIN}" "${MODULE_NAME}"
   printf 'B82_FRESH_VERIFIER_PLAN_COMPLETE commands_are_review_templates=1 no_commands_executed=1 credential_read=0 network_state_mutations=0 capability_bits_changed=0\n'
 }
 
 create_fresh_source() {
-  local head dirty spec label operation
-  for spec in 'S0.clone|source-clone' 'S1.checkout|source-checkout' \
-    'S2.cache|cache-mkdir' 'S2.mod-cache|mod-cache-mkdir' \
+  local head dirty spec label operation missing_rc count roots_sha objects_sha
+  for spec in 'S0.clone|source-clone' 'S1.checkout|source-checkout'; do
+    IFS='|' read -r label operation <<<"${spec}"
+    run_operation "${label}" "${operation}"
+  done
+  run_operation S4.shallow source-shallow
+  /usr/bin/grep -Fxq -- false "${EVIDENCE_ROOT}/S4.shallow.out" ||
+    fail 'fresh-source-shallow' 76
+  run_operation S4.count history-count
+  count="$(/usr/bin/cat -- "${EVIDENCE_ROOT}/S4.count.out")" || fail 'history-count-read'
+  [[ "${count}" == "${HISTORY_COMMIT_COUNT}" ]] || fail 'history-count-mismatch' 76
+  run_operation S4.roots history-roots
+  roots_sha="$(sha256_file "${HISTORY_ROOTS}")" || fail 'history-roots-sha'
+  [[ "${roots_sha}" == "${HISTORY_ROOTS_SHA256}" && -s "${HISTORY_ROOTS}" ]] ||
+    fail 'history-roots-mismatch' 76
+  run_operation S4.objects history-objects
+  /usr/bin/grep -E '^\?' -- "${HISTORY_OBJECTS}"
+  missing_rc=$?
+  case "${missing_rc}" in
+    1) ;;
+    0) fail 'history-object-missing' 76 ;;
+    *) fail 'history-object-evidence' "${missing_rc}" ;;
+  esac
+  objects_sha="$(sha256_file "${HISTORY_OBJECTS}")" || fail 'history-objects-sha'
+  [[ "${objects_sha}" == "${HISTORY_OBJECTS_SHA256}" ]] || fail 'history-objects-mismatch' 76
+  run_operation S4.fsck history-fsck
+  write_phase "${HISTORY_PHASE}" \
+    'format=wg-mix-ebpf-b82-fresh-verifier-history-v1' "gate_id=${GATE_ID}" \
+    "commit=${COMMIT}" 'repository_shallow=false' \
+    "history_verification=${HISTORY_VERIFICATION}" \
+    "history_commit_count=${HISTORY_COMMIT_COUNT}" \
+    "history_roots_sha256=${roots_sha}" "history_objects_sha256=${objects_sha}" \
+    'strict_fsck=passed'
+  for spec in 'S2.cache|cache-mkdir' 'S2.mod-cache|mod-cache-mkdir' \
     'S2.go-path|go-path-mkdir' 'S2.go-tmp|go-tmp-mkdir' \
     'S2.go-home|go-home-mkdir' 'S2.xdg-cache|xdg-cache-mkdir' \
     'S2.xdg-config|xdg-config-mkdir'; do
@@ -664,6 +926,8 @@ load_owned_module() {
     fail 'module-load-identity' 79
   MODULE_BTF_SHA256="$(sha256_file "${MODULE_BTF}")" || fail 'module-btf-sha'
   run_operation M.kwarn snapshot-kernel-warnings
+  /usr/bin/cmp -s "${EVIDENCE_ROOT}/A.kwarn.out" "${EVIDENCE_ROOT}/M.kwarn.out" ||
+    fail 'module-load-kernel-warning-delta' 79
   module_warning_sha="$(sha256_file "${EVIDENCE_ROOT}/M.kwarn.out")" ||
     fail 'module-warning-sha'
   write_phase "${MODULE_LOADED_PHASE}" \
@@ -709,11 +973,19 @@ run_verifier_and_test_run() {
 run_gate() {
   validate_inputs
   ensure_prefix_and_stage
+  snapshot_held_inputs
   create_audit_log
   write_phase "${OWNER_PHASE}" \
     'format=wg-mix-ebpf-b82-fresh-verifier-owner-v1' "gate_id=${GATE_ID}" \
     "state_schema=${STATE_SCHEMA}" "commit=${COMMIT}" \
     "manifest_sha256=${MANIFEST_SHA256}" "bundle_sha256=${BUNDLE_SHA256}" \
+    "snapshot_manifest=${SNAPSHOT_MANIFEST}" \
+    "snapshot_manifest_identity=${SNAPSHOT_MANIFEST_IDENTITY}" \
+    "snapshot_bundle=${SNAPSHOT_BUNDLE}" \
+    "snapshot_bundle_identity=${SNAPSHOT_BUNDLE_IDENTITY}" \
+    "history_commit_count=${HISTORY_COMMIT_COUNT}" \
+    "history_roots_sha256=${HISTORY_ROOTS_SHA256}" \
+    "history_objects_sha256=${HISTORY_OBJECTS_SHA256}" \
     "controller_source=${CONTROLLER_SOURCE}" "controller_script_sha256=${SELF_SHA256}" \
     "boot_id=${BOOT_ID}" "initial_netns=${INITIAL_NETNS}" 'failure_policy=retain'
   create_fresh_source
@@ -738,10 +1010,13 @@ run_gate() {
 }
 
 validate_restore_state() {
-  local canonical shape owner_commit owner_manifest owner_bundle
+  local canonical shape owner_commit owner_manifest owner_bundle path
   require_tools
   validate_controller_source || fail 'restore-controller-source' $?
-  validate_manifest_bundle || fail 'restore-manifest-bundle' $?
+  hold_input_files || fail 'restore-manifest-bundle-hold' $?
+  exec {MANIFEST_FD}<&-
+  exec {BUNDLE_FD}<&-
+  validate_snapshot_contract || fail 'restore-snapshot-contract' $?
   ((EUID == 0)) || fail 'restore-root-required' 77
   [[ "$(/usr/bin/hostname)" == "${EXPECTED_HOSTNAME}" &&
     "$(/usr/bin/uname -r)" == "${EXPECTED_KERNEL}" ]] || fail 'restore-host-identity' 79
@@ -750,17 +1025,25 @@ validate_restore_state() {
   [[ "${canonical}" == "${STAGE_ROOT}" && "${shape}" == '0:0:700:directory' ]] ||
     fail 'restore-stage-identity' 79
   for path in "${AUDIT_LOG}" "${OWNER_PHASE}" "${BPF_BASELINE_PHASE}" \
-    "${BUILD_PHASE}" "${MODULE_INTENT_PHASE}" \
+    "${HISTORY_PHASE}" "${BUILD_PHASE}" "${MODULE_INTENT_PHASE}" \
+    "${SNAPSHOT_MANIFEST}" "${SNAPSHOT_BUNDLE}" \
+    "${HISTORY_ROOTS}" "${HISTORY_OBJECTS}" \
     "${EVIDENCE_ROOT}/A.progs.out" "${EVIDENCE_ROOT}/A.maps.out" \
     "${EVIDENCE_ROOT}/A.links.out" "${EVIDENCE_ROOT}/A.kwarn.out"; do
     validate_root_owned_file "${path}" 600 || fail "restore-evidence-identity:${path}" $?
   done
-  [[ ! -e "${RESTORED_PHASE}" && ! -L "${RESTORED_PHASE}" ]] || fail 'already-restored' 78
   owner_commit="$(phase_value "${OWNER_PHASE}" commit)" || fail 'restore-owner-commit'
   owner_manifest="$(phase_value "${OWNER_PHASE}" manifest_sha256)" || fail 'restore-owner-manifest'
   owner_bundle="$(phase_value "${OWNER_PHASE}" bundle_sha256)" || fail 'restore-owner-bundle'
   [[ "${owner_commit}" == "${COMMIT}" && "${owner_manifest}" == "${MANIFEST_SHA256}" &&
     "${owner_bundle}" == "${BUNDLE_SHA256}" &&
+    "$(phase_value "${OWNER_PHASE}" snapshot_manifest)" == "${SNAPSHOT_MANIFEST}" &&
+    "$(phase_value "${OWNER_PHASE}" snapshot_manifest_identity)" == "${SNAPSHOT_MANIFEST_IDENTITY}" &&
+    "$(phase_value "${OWNER_PHASE}" snapshot_bundle)" == "${SNAPSHOT_BUNDLE}" &&
+    "$(phase_value "${OWNER_PHASE}" snapshot_bundle_identity)" == "${SNAPSHOT_BUNDLE_IDENTITY}" &&
+    "$(phase_value "${OWNER_PHASE}" history_commit_count)" == "${HISTORY_COMMIT_COUNT}" &&
+    "$(phase_value "${OWNER_PHASE}" history_roots_sha256)" == "${HISTORY_ROOTS_SHA256}" &&
+    "$(phase_value "${OWNER_PHASE}" history_objects_sha256)" == "${HISTORY_OBJECTS_SHA256}" &&
     "$(phase_value "${OWNER_PHASE}" boot_id)" == "$(/usr/bin/cat /proc/sys/kernel/random/boot_id)" &&
     "$(phase_value "${OWNER_PHASE}" initial_netns)" == "$(/usr/bin/readlink /proc/self/ns/net)" ]] ||
     fail 'restore-owner-binding' 79
@@ -779,62 +1062,119 @@ validate_restore_state() {
     "$(sha256_file "${EVIDENCE_ROOT}/A.kwarn.out")" == \
       "$(phase_value "${BPF_BASELINE_PHASE}" kernel_warnings_sha256)" ]] ||
     fail 'restore-bpf-baseline-binding' 79
+  [[ "$(sha256_file "${HISTORY_ROOTS}")" == "${HISTORY_ROOTS_SHA256}" &&
+    "$(sha256_file "${HISTORY_OBJECTS}")" == "${HISTORY_OBJECTS_SHA256}" &&
+    "$(phase_value "${HISTORY_PHASE}" format)" == \
+      'wg-mix-ebpf-b82-fresh-verifier-history-v1' &&
+    "$(phase_value "${HISTORY_PHASE}" gate_id)" == "${GATE_ID}" &&
+    "$(phase_value "${HISTORY_PHASE}" commit)" == "${COMMIT}" &&
+    "$(phase_value "${HISTORY_PHASE}" repository_shallow)" == 'false' &&
+    "$(phase_value "${HISTORY_PHASE}" history_verification)" == "${HISTORY_VERIFICATION}" &&
+    "$(phase_value "${HISTORY_PHASE}" history_commit_count)" == "${HISTORY_COMMIT_COUNT}" &&
+    "$(phase_value "${HISTORY_PHASE}" history_roots_sha256)" == "${HISTORY_ROOTS_SHA256}" &&
+    "$(phase_value "${HISTORY_PHASE}" history_objects_sha256)" == "${HISTORY_OBJECTS_SHA256}" &&
+    "$(phase_value "${HISTORY_PHASE}" strict_fsck)" == 'passed' ]] ||
+    fail 'restore-history-binding' 79
+}
+
+validate_module_loaded_receipt() {
+  validate_root_owned_file "${MODULE_LOADED_PHASE}" 600 ||
+    fail 'restore-module-loaded-marker' $?
+  [[ "$(phase_value "${MODULE_LOADED_PHASE}" format)" == \
+      'wg-mix-ebpf-b82-fresh-verifier-module-loaded-v1' &&
+    "$(phase_value "${MODULE_LOADED_PHASE}" gate_id)" == "${GATE_ID}" &&
+    "$(phase_value "${MODULE_LOADED_PHASE}" module)" == "${MODULE_NAME}" &&
+    "$(phase_value "${MODULE_LOADED_PHASE}" state)" == 'loaded' &&
+    "$(phase_value "${MODULE_LOADED_PHASE}" module_sha256)" == "${MODULE_SHA256}" &&
+    "$(phase_value "${MODULE_LOADED_PHASE}" module_srcversion)" == "${MODULE_SRCVERSION}" ]] ||
+    fail 'restore-module-loaded-binding' 79
+  MODULE_BTF_SHA256="$(phase_value "${MODULE_LOADED_PHASE}" module_btf_sha256)" ||
+    fail 'restore-module-btf-marker'
+  valid_sha256 "${MODULE_BTF_SHA256}" || fail 'restore-module-btf-marker-shape' 79
+  validate_root_owned_file "${EVIDENCE_ROOT}/M.kwarn.out" 600 ||
+    fail 'restore-module-warning-evidence' $?
+  [[ "$(sha256_file "${EVIDENCE_ROOT}/M.kwarn.out")" == \
+      "$(phase_value "${MODULE_LOADED_PHASE}" kernel_warnings_sha256)" &&
+    "$(phase_value "${MODULE_LOADED_PHASE}" module_btf)" == "${MODULE_BTF}" &&
+    "$(sha256_file "${EVIDENCE_ROOT}/M.kwarn.out")" == \
+      "$(phase_value "${BPF_BASELINE_PHASE}" kernel_warnings_sha256)" ]] ||
+    fail 'restore-module-loaded-evidence' 79
+}
+
+restore_module_transition() {
+  case "$1" in
+    11) printf '%s\n' unload-receipted-generation ;;
+    10) printf '%s\n' require-exact-generation-receipt ;;
+    01 | 00) printf '%s\n' already-absent ;;
+    *) return 65 ;;
+  esac
 }
 
 restore_gate() {
-  local module_state='not-loaded'
-  local warning_baseline='A.kwarn'
-  local baseline_phase_sha owner_boot
+  local baseline_phase_sha owner_boot live=0 loaded_receipt=0 already_restored=0 transition
   validate_restore_state
   owner_boot="$(phase_value "${OWNER_PHASE}" boot_id)" || fail 'restore-intent-boot'
   baseline_phase_sha="$(sha256_file "${BPF_BASELINE_PHASE}")" || fail 'restore-intent-baseline-sha'
-  write_phase "${RESTORE_INTENT_PHASE}" \
+  ensure_phase "${RESTORE_INTENT_PHASE}" \
     'format=wg-mix-ebpf-b82-fresh-verifier-restore-intent-v1' "gate_id=${GATE_ID}" \
     "commit=${COMMIT}" "boot_id=${owner_boot}" \
     "module=${MODULE_NAME}" "module_sha256=${MODULE_SHA256}" \
     "module_srcversion=${MODULE_SRCVERSION}" 'reverse_argv=/usr/sbin/rmmod wg_mix_faketcp_checksum' \
     "bpf_baseline_sha256=${baseline_phase_sha}" 'state=restoring'
-  if [[ ! -e "${MODULE_LOADED_PHASE}" && ! -L "${MODULE_LOADED_PHASE}" ]]; then
-    run_operation R.pre-kwarn snapshot-kernel-warnings
-    warning_baseline='R.pre-kwarn'
+  if [[ -e "${RESTORED_PHASE}" || -L "${RESTORED_PHASE}" ]]; then
+    ensure_phase "${RESTORED_PHASE}" \
+      'format=wg-mix-ebpf-b82-fresh-verifier-restored-v1' "gate_id=${GATE_ID}" \
+      "commit=${COMMIT}" "module=${MODULE_NAME}" 'module_state=absent' \
+      'persistent_bpf_delta=zero' "reserved_pin=${RESERVED_PIN}" 'reserved_pin_state=absent'
+    already_restored=1
   fi
   if [[ -e "/sys/module/${MODULE_NAME}" || -L "/sys/module/${MODULE_NAME}" ]]; then
-    [[ -d "/sys/module/${MODULE_NAME}" && ! -L "/sys/module/${MODULE_NAME}" &&
+    live=1
+  fi
+  if [[ -e "${MODULE_LOADED_PHASE}" || -L "${MODULE_LOADED_PHASE}" ]]; then
+    loaded_receipt=1
+    validate_module_loaded_receipt
+  fi
+  if ((already_restored == 1)); then
+    ((live == 0)) || fail 'restored-module-returned' 79
+    assert_bpf_baseline_convergent R.already
+    ensure_phase "${FILESYSTEM_PHASE}" \
+      'format=wg-mix-ebpf-b82-fresh-verifier-filesystem-v1' "gate_id=${GATE_ID}" \
+      "stage=${STAGE_ROOT}" "evidence=${EVIDENCE_ROOT}" 'state=retained' 'automatic_cleanup=0'
+    printf 'B82_FRESH_VERIFIER_RESTORE_COMPLETE gate_id=%s module=%s state=absent evidence=%s filesystem_retained=1 already_restored=1\n' \
+      "${GATE_ID}" "${MODULE_NAME}" "${EVIDENCE_ROOT}"
+    return
+  fi
+  transition="$(restore_module_transition "${live}${loaded_receipt}")" ||
+    fail 'restore-module-state-shape' $?
+  case "${transition}" in
+    unload-receipted-generation)
+      [[ -d "/sys/module/${MODULE_NAME}" && ! -L "/sys/module/${MODULE_NAME}" &&
       "$(/usr/bin/cat "/sys/module/${MODULE_NAME}/srcversion")" == "${MODULE_SRCVERSION}" ]] ||
-      fail 'restore-module-identity' 79
-    if [[ -f "${MODULE_LOADED_PHASE}" && ! -L "${MODULE_LOADED_PHASE}" ]]; then
-      [[ "$(phase_value "${MODULE_LOADED_PHASE}" module_sha256)" == "${MODULE_SHA256}" &&
-        "$(phase_value "${MODULE_LOADED_PHASE}" module_srcversion)" == "${MODULE_SRCVERSION}" ]] ||
-        fail 'restore-module-loaded-binding' 79
-      MODULE_BTF_SHA256="$(phase_value "${MODULE_LOADED_PHASE}" module_btf_sha256)" ||
-        fail 'restore-module-btf-marker'
+        fail 'restore-module-identity' 79
       [[ -f "${MODULE_BTF}" && ! -L "${MODULE_BTF}" &&
         "$(sha256_file "${MODULE_BTF}")" == "${MODULE_BTF_SHA256}" ]] ||
         fail 'restore-module-btf-identity' 79
-      validate_root_owned_file "${EVIDENCE_ROOT}/M.kwarn.out" 600 ||
-        fail 'restore-module-warning-evidence' $?
-      [[ "$(sha256_file "${EVIDENCE_ROOT}/M.kwarn.out")" == \
-        "$(phase_value "${MODULE_LOADED_PHASE}" kernel_warnings_sha256)" ]] ||
-        fail 'restore-module-warning-binding' 79
-      warning_baseline='M.kwarn'
-    fi
-    run_operation R.module module-unload
-    module_state='explicitly-unloaded'
-  elif [[ -f "${MODULE_LOADED_PHASE}" || -L "${MODULE_LOADED_PHASE}" ]]; then
-    fail 'restore-owned-module-missing' 79
-  fi
+      run_convergent_operation R.module module-unload
+      ;;
+    require-exact-generation-receipt)
+      fail 'restore-module-live-without-exact-generation-receipt' 79
+      ;;
+    already-absent) ;;
+    *) fail 'restore-module-transition-shape' 79 ;;
+  esac
   [[ ! -e "/sys/module/${MODULE_NAME}" && ! -L "/sys/module/${MODULE_NAME}" ]] ||
     fail 'restore-module-remains' 79
-  assert_bpf_baseline R "${warning_baseline}"
-  write_phase "${RESTORED_PHASE}" \
+  assert_bpf_baseline_convergent R.final
+  ensure_phase "${RESTORED_PHASE}" \
     'format=wg-mix-ebpf-b82-fresh-verifier-restored-v1' "gate_id=${GATE_ID}" \
-    "commit=${COMMIT}" "module=${MODULE_NAME}" "module_state=${module_state}" \
+    "commit=${COMMIT}" "module=${MODULE_NAME}" 'module_state=absent' \
     'persistent_bpf_delta=zero' "reserved_pin=${RESERVED_PIN}" 'reserved_pin_state=absent'
-  write_phase "${FILESYSTEM_PHASE}" \
+  ensure_phase "${FILESYSTEM_PHASE}" \
     'format=wg-mix-ebpf-b82-fresh-verifier-filesystem-v1' "gate_id=${GATE_ID}" \
     "stage=${STAGE_ROOT}" "evidence=${EVIDENCE_ROOT}" 'state=retained' 'automatic_cleanup=0'
-  printf 'B82_FRESH_VERIFIER_RESTORE_COMPLETE gate_id=%s module=%s state=%s evidence=%s filesystem_retained=1\n' \
-    "${GATE_ID}" "${MODULE_NAME}" "${module_state}" "${EVIDENCE_ROOT}"
+  printf 'B82_FRESH_VERIFIER_RESTORE_COMPLETE gate_id=%s module=%s state=absent evidence=%s filesystem_retained=1 already_restored=0\n' \
+    "${GATE_ID}" "${MODULE_NAME}" "${EVIDENCE_ROOT}"
 }
 
 main() {
@@ -846,4 +1186,6 @@ main() {
   esac
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
