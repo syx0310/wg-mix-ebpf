@@ -1953,6 +1953,9 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	__u8 gso_seen = 0;
 	__u8 icmp_wildcard_id = 0;
 	__u8 xor_checksum_mode = XOR_CSUM_NONE;
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	struct faketcp_l3_info faketcp_l3;
+#endif
 	int rc, kind = -1;
 
 	if (!active_generation(&generation))
@@ -2043,7 +2046,8 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	}
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
 	if (listener->transport_mode == TRANSPORT_FAKETCP &&
-	    !faketcp_metadata_valid(skb, generation)) {
+	    (!faketcp_metadata_valid(skb, generation) ||
+	     faketcp_parse_tc_l3(skb, &info, &faketcp_l3) < 0)) {
 		inc_faketcp_stat(FAKETCP_STAT_METADATA_ERROR);
 		return TC_ACT_SHOT;
 	}
