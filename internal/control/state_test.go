@@ -495,7 +495,7 @@ profiles:
 	}
 }
 
-func TestBuildStateRejectsFakeTCPOnL3ParserBeforeAttachment(t *testing.T) {
+func TestBuildStateAcceptsExplicitFakeTCPOnL3Parser(t *testing.T) {
 	cfg, err := config.Load([]byte(`
 version: 1
 underlays:
@@ -518,7 +518,7 @@ profiles:
 		t.Fatal(err)
 	}
 	mark := uint32(0x10000002)
-	_, err = BuildState(
+	state, err := BuildState(
 		context.Background(),
 		cfg,
 		runtime.StaticProvider{Devices: map[string]*runtime.Device{
@@ -532,8 +532,29 @@ profiles:
 		},
 		BuildOptions{},
 	)
-	if err == nil || !strings.Contains(err.Error(), "parser:l3") {
-		t.Fatalf("FakeTCP parser:l3 error = %v", err)
+	if err != nil {
+		t.Fatalf("FakeTCP parser:l3 state: %v", err)
+	}
+	if got := state.Underlays[0].Parser; got != "l3" {
+		t.Fatalf("FakeTCP underlay parser = %q, want l3", got)
+	}
+}
+
+func TestFakeTCPResolvedUnderlayParserMustBeUnambiguous(t *testing.T) {
+	state := &State{
+		WireGuards: []WireGuardState{{TransportMode: "faketcp"}},
+		Underlays: []UnderlayState{{
+			Name: "mystery0", Role: "transform", Resolved: true, Parser: "auto",
+		}},
+	}
+	if err := validateFakeTCPUnderlayParsers(state); err == nil || !strings.Contains(err.Error(), "ambiguous") {
+		t.Fatalf("FakeTCP parser:auto error = %v", err)
+	}
+	for _, parser := range []string{"ethernet", "l3"} {
+		state.Underlays[0].Parser = parser
+		if err := validateFakeTCPUnderlayParsers(state); err != nil {
+			t.Fatalf("FakeTCP parser:%s rejected: %v", parser, err)
+		}
 	}
 }
 
