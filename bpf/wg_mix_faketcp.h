@@ -1224,7 +1224,10 @@ faketcp_tc_l3_status_to_parse_result(const struct faketcp_l3_info *l3,
 	case FAKETCP_L3_TRUNCATED:
 	case FAKETCP_L3_MALFORMED:
 	default:
-		return PARSE_SHORT;
+		// The old generic parser could classify enough UDP fields for a
+		// FakeTCP rule before the shared parser rejected this shape. Do not
+		// turn that strict rejection into a managed pass on the unified path.
+		return PARSE_FAKETCP_FAIL_CLOSED;
 	}
 }
 

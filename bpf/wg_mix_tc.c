@@ -120,6 +120,9 @@
 #define PARSE_IPV6_FRAGMENT_NON_FIRST 9
 #define PARSE_BAD_CSUM 10
 #define PARSE_IPV6_EXT_TOO_DEEP 11
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+#define PARSE_FAKETCP_FAIL_CLOSED 12
+#endif
 
 struct wg_vlan_hdr {
 	__be16 h_vlan_TCI;
@@ -1873,6 +1876,12 @@ int wg_mix_egress(struct __sk_buff *skb)
 		inc_stat(STAT_EGRESS_IPV6_EXT);
 		return TC_ACT_SHOT;
 	}
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	if (rc == PARSE_FAKETCP_FAIL_CLOSED) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return TC_ACT_SHOT;
+	}
+#endif
 	if (rc == PARSE_BAD_CSUM)
 		return managed_miss_action(STAT_EGRESS_BAD_CHECKSUM, managed);
 	if (rc != PARSE_OK)
