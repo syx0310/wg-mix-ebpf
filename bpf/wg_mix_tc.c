@@ -1834,6 +1834,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 	struct profile_value *profile;
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
 	struct faketcp_egress_admission faketcp_admission = {};
+	struct faketcp_l3_info faketcp_l3;
 #endif
 	__u64 generation = 0;
 	__u32 old_wire = 0;
@@ -1932,8 +1933,14 @@ int wg_mix_egress(struct __sk_buff *skb)
 	// complete managed type-word/XOR/FakeTCP composition. Checksum metadata is
 	// normalized only after that proof and still before any packet-byte write.
 	if (rule->transport_mode == TRANSPORT_FAKETCP) {
+		if (faketcp_parse_tc_l3(skb, &info, &faketcp_l3) !=
+		    FAKETCP_L3_OK) {
+			inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+			return TC_ACT_SHOT;
+		}
 		if (faketcp_egress_admission_checkpoint(
-			    skb, &info, managed, rule, profile, generation, rc,
+			    skb, &info, &faketcp_l3, managed, rule, profile,
+			    generation, rc,
 			    kind, old_wire, new_wire, xor_checksum_mode,
 			    &faketcp_admission) != FAKETCP_ADMISSION_TRANSFORM)
 			return TC_ACT_SHOT;
@@ -2049,6 +2056,9 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	__u8 gso_seen = 0;
 	__u8 icmp_wildcard_id = 0;
 	__u8 xor_checksum_mode = XOR_CSUM_NONE;
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	struct faketcp_l3_info faketcp_l3;
+#endif
 	int rc, kind = -1;
 
 	if (!active_generation(&generation))
@@ -2137,6 +2147,13 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		inc_stat(STAT_INGRESS_RULE_MISS);
 		return TC_ACT_OK;
 	}
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	if (listener->transport_mode == TRANSPORT_FAKETCP &&
+	    faketcp_parse_tc_l3(skb, &info, &faketcp_l3) != FAKETCP_L3_OK) {
+		inc_faketcp_stat(FAKETCP_STAT_METADATA_ERROR);
+		return TC_ACT_SHOT;
+	}
+#endif
 	if (gso_seen)
 		inc_stat(STAT_INGRESS_GSO_LISTENER_HIT);
 	if (parse_result_is_fragment(rc)) {
