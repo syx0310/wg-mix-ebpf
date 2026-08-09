@@ -69,6 +69,19 @@ type ActionCheckpointStore interface {
 	DeleteActionCheckpoint(uint64) error
 }
 
+// ActionCheckpointTransitionStore optionally advances only checkpoint
+// execution progress. It must durably CAS Phase, NextStep, and Revision while
+// leaving Identity, Operation, and Steps unchanged. NewActionRecovery binds
+// this contract or the base update contract once for its entire lifetime.
+type ActionCheckpointTransitionStore interface {
+	ActionCheckpointStore
+	TransitionActionCheckpoint(
+		expectedRevision uint64,
+		phase ActionCheckpointPhase,
+		nextStep int,
+	) (newRevision uint64, err error)
+}
+
 // MemoryActionCheckpointStore provides the exact CAS semantics used by tests
 // and non-durable embedding. It deliberately retains no history after delete.
 type MemoryActionCheckpointStore struct {
@@ -155,6 +168,35 @@ func (store *MemoryActionCheckpointStore) UpdateActionCheckpoint(
 	return cloneActionCheckpoint(copyCheckpoint), nil
 }
 
+func (store *MemoryActionCheckpointStore) TransitionActionCheckpoint(
+	expectedRevision uint64,
+	phase ActionCheckpointPhase,
+	nextStep int,
+) (uint64, error) {
+	if store == nil {
+		return 0, errors.New("faketcp action checkpoint store is nil")
+	}
+	if expectedRevision == 0 {
+		return 0, fmt.Errorf("%w: expected revision is zero", ErrActionCheckpointCorrupt)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.checkpoint == nil || store.checkpoint.Revision != expectedRevision {
+		return 0, ErrActionCheckpointConflict
+	}
+	if err := validateActionCheckpointPosition(phase, nextStep, len(store.checkpoint.Steps)); err != nil {
+		return 0, err
+	}
+	revision, err := store.allocateRevisionLocked()
+	if err != nil {
+		return 0, err
+	}
+	store.checkpoint.Phase = phase
+	store.checkpoint.NextStep = nextStep
+	store.checkpoint.Revision = revision
+	return revision, nil
+}
+
 func (store *MemoryActionCheckpointStore) DeleteActionCheckpoint(expectedRevision uint64) error {
 	if store == nil {
 		return errors.New("faketcp action checkpoint store is nil")
@@ -195,10 +237,11 @@ type RecoveryReport struct {
 type ActionRecovery struct {
 	mu sync.Mutex
 
-	backend       ControllerBackend
-	store         ActionCheckpointStore
-	identity      RuntimeIdentity
-	nextOperation uint64
+	backend          ControllerBackend
+	store            ActionCheckpointStore
+	updateCheckpoint func(ActionCheckpoint) (ActionCheckpoint, error)
+	identity         RuntimeIdentity
+	nextOperation    uint64
 }
 
 func NewActionRecovery(
@@ -227,8 +270,28 @@ func NewActionRecovery(
 		nextOperation = checkpoint.Operation + 1
 	}
 	return &ActionRecovery{
-		backend: backend, store: store, identity: identity, nextOperation: nextOperation,
+		backend: backend, store: store, updateCheckpoint: bindActionCheckpointUpdate(store),
+		identity: identity, nextOperation: nextOperation,
 	}, nil
+}
+
+func bindActionCheckpointUpdate(
+	store ActionCheckpointStore,
+) func(ActionCheckpoint) (ActionCheckpoint, error) {
+	if transitionStore, ok := store.(ActionCheckpointTransitionStore); ok {
+		return func(checkpoint ActionCheckpoint) (ActionCheckpoint, error) {
+			revision, err := transitionStore.TransitionActionCheckpoint(
+				checkpoint.Revision,
+				checkpoint.Phase,
+				checkpoint.NextStep,
+			)
+			checkpoint.Revision = revision
+			return checkpoint, err
+		}
+	}
+	return func(checkpoint ActionCheckpoint) (ActionCheckpoint, error) {
+		return store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+	}
 }
 
 func (recovery *ActionRecovery) Execute(ctx context.Context, actions []Action) error {
@@ -341,7 +404,7 @@ func (recovery *ActionRecovery) continueLocked(
 		if step.Kind == ActionStepReinject {
 			checkpoint.Phase = ActionCheckpointPrepared
 			checkpoint.NextStep++
-			updated, err := recovery.store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+			updated, err := recovery.updateCheckpoint(checkpoint)
 			if err != nil {
 				return report, fmt.Errorf("%w: checkpoint ambiguous faketcp reinjection as skipped: %w", ErrActionRecoveryRequired, err)
 			}
@@ -349,7 +412,7 @@ func (recovery *ActionRecovery) continueLocked(
 			report.SkippedAmbiguousReinjections++
 		} else {
 			checkpoint.Phase = ActionCheckpointPrepared
-			updated, err := recovery.store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+			updated, err := recovery.updateCheckpoint(checkpoint)
 			if err != nil {
 				return report, fmt.Errorf("%w: checkpoint faketcp control replay: %w", ErrActionRecoveryRequired, err)
 			}
@@ -363,7 +426,7 @@ func (recovery *ActionRecovery) continueLocked(
 			return report, fmt.Errorf("%w: %w", ErrActionRecoveryRequired, err)
 		}
 		checkpoint.Phase = ActionCheckpointAttempting
-		updated, err := recovery.store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+		updated, err := recovery.updateCheckpoint(checkpoint)
 		if err != nil {
 			return report, fmt.Errorf("%w: mark faketcp action step attempting: %w", ErrActionRecoveryRequired, err)
 		}
@@ -374,7 +437,7 @@ func (recovery *ActionRecovery) continueLocked(
 		}
 		checkpoint.Phase = ActionCheckpointPrepared
 		checkpoint.NextStep++
-		updated, err = recovery.store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+		updated, err = recovery.updateCheckpoint(checkpoint)
 		if err != nil {
 			return report, fmt.Errorf("%w: checkpoint completed faketcp action step: %w", ErrActionRecoveryRequired, err)
 		}
@@ -438,14 +501,8 @@ func validateActionCheckpoint(checkpoint ActionCheckpoint) error {
 	if checkpoint.Operation == 0 || len(checkpoint.Steps) == 0 {
 		return fmt.Errorf("%w: zero operation or empty steps", ErrActionCheckpointCorrupt)
 	}
-	if checkpoint.NextStep < 0 || checkpoint.NextStep > len(checkpoint.Steps) {
-		return fmt.Errorf("%w: next step %d of %d", ErrActionCheckpointCorrupt, checkpoint.NextStep, len(checkpoint.Steps))
-	}
-	if checkpoint.Phase != ActionCheckpointPrepared && checkpoint.Phase != ActionCheckpointAttempting {
-		return fmt.Errorf("%w: phase %d", ErrActionCheckpointCorrupt, checkpoint.Phase)
-	}
-	if checkpoint.Phase == ActionCheckpointAttempting && checkpoint.NextStep == len(checkpoint.Steps) {
-		return fmt.Errorf("%w: attempting after final step", ErrActionCheckpointCorrupt)
+	if err := validateActionCheckpointPosition(checkpoint.Phase, checkpoint.NextStep, len(checkpoint.Steps)); err != nil {
+		return err
 	}
 	if err := validateRuntimeIdentity(checkpoint.Identity); err != nil {
 		return fmt.Errorf("%w: %v", ErrActionCheckpointCorrupt, err)
@@ -466,6 +523,19 @@ func validateActionCheckpoint(checkpoint ActionCheckpoint) error {
 				ErrActionCheckpointCorrupt,
 			)
 		}
+	}
+	return nil
+}
+
+func validateActionCheckpointPosition(phase ActionCheckpointPhase, nextStep, stepCount int) error {
+	if nextStep < 0 || nextStep > stepCount {
+		return fmt.Errorf("%w: next step %d of %d", ErrActionCheckpointCorrupt, nextStep, stepCount)
+	}
+	if phase != ActionCheckpointPrepared && phase != ActionCheckpointAttempting {
+		return fmt.Errorf("%w: phase %d", ErrActionCheckpointCorrupt, phase)
+	}
+	if phase == ActionCheckpointAttempting && nextStep == stepCount {
+		return fmt.Errorf("%w: attempting after final step", ErrActionCheckpointCorrupt)
 	}
 	return nil
 }
