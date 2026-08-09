@@ -5,6 +5,74 @@ import (
 	"math"
 )
 
+// MTUErrorCode and MTUBoundary define the future reason-by-boundary audit
+// schema for the test oracle. They remain test-only until the unified prepare
+// kfunc is the production producer of the same mutually exclusive result.
+type MTUErrorCode string
+
+const (
+	MTUErrorInvalidInput          MTUErrorCode = "invalid-input"
+	MTUErrorArithmeticOverflow    MTUErrorCode = "arithmetic-overflow"
+	MTUErrorFragmentationRejected MTUErrorCode = "fragmentation-rejected"
+	MTUErrorUnknown               MTUErrorCode = "mtu-unknown"
+	MTUErrorExceeded              MTUErrorCode = "mtu-exceeded"
+)
+
+type MTUBoundary string
+
+const (
+	MTUBoundaryInput  MTUBoundary = "input"
+	MTUBoundaryDevice MTUBoundary = "device"
+	MTUBoundaryRoute  MTUBoundary = "route"
+
+	mtuAuditReasonCount   uint32 = 5
+	mtuAuditBoundaryCount uint32 = 3
+	MTUAuditKeyCount             = mtuAuditReasonCount * mtuAuditBoundaryCount
+)
+
+var (
+	mtuAuditReasons = [...]MTUErrorCode{
+		MTUErrorInvalidInput,
+		MTUErrorArithmeticOverflow,
+		MTUErrorFragmentationRejected,
+		MTUErrorUnknown,
+		MTUErrorExceeded,
+	}
+	mtuAuditBoundaries = [...]MTUBoundary{
+		MTUBoundaryInput,
+		MTUBoundaryDevice,
+		MTUBoundaryRoute,
+	}
+)
+
+func EncodeMTUAuditKey(code MTUErrorCode, boundary MTUBoundary) (uint32, error) {
+	reasonIndex := -1
+	for index, candidate := range mtuAuditReasons {
+		if candidate == code {
+			reasonIndex = index
+			break
+		}
+	}
+	boundaryIndex := -1
+	for index, candidate := range mtuAuditBoundaries {
+		if candidate == boundary {
+			boundaryIndex = index
+			break
+		}
+	}
+	if reasonIndex < 0 || boundaryIndex < 0 {
+		return 0, fmt.Errorf("invalid faketcp MTU audit classification %q/%q", code, boundary)
+	}
+	return uint32(reasonIndex)*mtuAuditBoundaryCount + uint32(boundaryIndex), nil
+}
+
+func DecodeMTUAuditKey(key uint32) (MTUErrorCode, MTUBoundary, error) {
+	if key >= MTUAuditKeyCount {
+		return "", "", fmt.Errorf("faketcp MTU audit key %d is outside [0,%d)", key, MTUAuditKeyCount)
+	}
+	return mtuAuditReasons[key/mtuAuditBoundaryCount], mtuAuditBoundaries[key%mtuAuditBoundaryCount], nil
+}
+
 // MTUFamily is the on-wire IP family used by the reference admission model.
 type MTUFamily uint8
 

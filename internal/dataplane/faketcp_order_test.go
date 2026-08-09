@@ -195,6 +195,7 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 		"faketcp_capture_first_packet(skb, info, rule, &key)",
 		"record_len = sizeof(record->event) + packet_len",
 		"faketcp_materialize_tcp_checksum",
+		"bpf_check_mtu(skb, 0, &mtu_len, FAKETCP_HEADER_DELTA, 0)",
 		"bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)",
 	} {
 		if !strings.Contains(tc, want) && !strings.Contains(fake, want) {
@@ -226,7 +227,7 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 	}
 }
 
-func TestFakeTCPChecksumNormalizationAndGSOStayHardGated(t *testing.T) {
+func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
 	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
 	if err != nil {
 		t.Fatal(err)
@@ -279,10 +280,11 @@ func TestFakeTCPChecksumNormalizationAndGSOStayHardGated(t *testing.T) {
 	}
 
 	encoder := text[encoderStart:continuationStart]
+	mtuCheck := strings.Index(encoder, "faketcp_mtu_allows_growth(skb, old_total_len)")
 	normalize := strings.Index(encoder, "bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)")
 	checksum := strings.Index(encoder, "faketcp_materialize_tcp_checksum(skb")
-	if normalize < 0 || checksum < 0 || normalize >= checksum {
-		t.Fatal("checksum-state normalization and full recompute are out of order")
+	if mtuCheck < 0 || normalize < 0 || checksum < 0 || mtuCheck >= normalize || normalize >= checksum {
+		t.Fatal("device MTU check, checksum-state normalization and full recompute are out of order")
 	}
 	for _, want := range []string{
 		"old_total_len != sizeof(*iph) + udp_len",

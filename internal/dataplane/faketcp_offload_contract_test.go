@@ -252,6 +252,10 @@ func TestFakeTCPChecksumKfuncAndBPFReturnABIStayIdentical(t *testing.T) {
 			t.Fatalf("BPF checksum result/stat mapping missing %s -> %s", contract.name, contract.stat)
 		}
 	}
+	if !strings.Contains(bpf, "inc_faketcp_stat(FAKETCP_STAT_MTU_REJECT)") ||
+		!strings.Contains(bpf, "old_total_len > mtu_len - FAKETCP_HEADER_DELTA") {
+		t.Fatal("non-GSO device MTU growth rejection lost its dedicated aggregate counter")
+	}
 	resetOrder := []string{
 		"skb->csum = 0;",
 		"skb->csum_valid = 0;",

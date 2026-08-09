@@ -714,6 +714,26 @@ static __always_inline __s64 faketcp_rotation_checksum(const __u8 head[FAKETCP_H
 			     (__be32 *)shifted, sizeof(shifted), seed);
 }
 
+// bpf_check_mtu interprets a non-zero mtu_len input as an L3 packet length.
+// Asking about the planned +12 byte transport-header growth gives the exact
+// non-GSO device boundary. Route PMTU is deliberately not inferred here, so
+// the MTU capability remains closed until the unified skb prepare kfunc owns
+// both device and route admission.
+static __always_inline int faketcp_mtu_allows_growth(struct __sk_buff *skb,
+						      __u16 old_total_len)
+{
+	__u32 mtu_len = old_total_len;
+	long rc;
+
+	rc = bpf_check_mtu(skb, 0, &mtu_len, FAKETCP_HEADER_DELTA, 0);
+	if (rc != 0 || mtu_len < FAKETCP_HEADER_DELTA ||
+	    old_total_len > mtu_len - FAKETCP_HEADER_DELTA) {
+		inc_faketcp_stat(FAKETCP_STAT_MTU_REJECT);
+		return 0;
+	}
+	return 1;
+}
+
 // TC's public __sk_buff ABI does not expose ip_summed, csum_start or
 // csum_offset. The required module kfunc accepts an already materialized
 // CHECKSUM_NONE skb or validates and clears exactly one non-GSO UDP
@@ -853,6 +873,8 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return TC_ACT_SHOT;
 	}
+	if (!faketcp_mtu_allows_growth(skb, old_total_len))
+		return TC_ACT_SHOT;
 	source_ipv4 = iph->saddr;
 	destination_ipv4 = iph->daddr;
 	if (bpf_skb_load_bytes(skb, info->payload_off, head, sizeof(head)) < 0) {
