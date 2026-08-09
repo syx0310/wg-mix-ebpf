@@ -2,6 +2,7 @@ package faketcp
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -318,10 +319,11 @@ func (backend *RawControllerBackend) initializedLocked() bool {
 }
 
 type reinjectFingerprint struct {
-	flow    abi.FakeTCPSessionKey
-	fwmark  uint32
-	wgID    uint32
-	capture [32]byte
+	flow         abi.FakeTCPSessionKey
+	fwmark       uint32
+	wgID         uint32
+	capture      [32]byte
+	materialized [32]byte
 }
 
 type reinjectAttempt struct {
@@ -400,14 +402,18 @@ func (reinjector *onceReinjector) Reinject(
 			reinjector.identity.Incarnation,
 		)
 	}
+	if packet.CaptureFingerprint == ([32]byte{}) {
+		return errors.New("faketcp captured packet has zero capture fingerprint")
+	}
 	if err := ValidateMaterializedIPv4UDP(packet.Data, flow); err != nil {
 		return err
 	}
 	fingerprint := reinjectFingerprint{
-		flow:    flow,
-		fwmark:  packet.FWMark,
-		wgID:    packet.WGID,
-		capture: packet.CaptureFingerprint,
+		flow:         flow,
+		fwmark:       packet.FWMark,
+		wgID:         packet.WGID,
+		capture:      packet.CaptureFingerprint,
+		materialized: sha256.Sum256(packet.Data),
 	}
 
 	var attempt *reinjectAttempt
