@@ -65,6 +65,30 @@ func fakeTCPRoutedWireImage(
 	return wire, nil
 }
 
+func fakeTCPRoutedExactStatDeltas(
+	before, after []uint64,
+	want map[uint32]uint64,
+) (bool, error) {
+	if len(after) != len(before) {
+		return false, fmt.Errorf("resized: before=%d after=%d", len(before), len(after))
+	}
+	pending := false
+	for index := range after {
+		if after[index] < before[index] {
+			return false, fmt.Errorf("counter %d decreased", index)
+		}
+		delta := after[index] - before[index]
+		expected := want[uint32(index)]
+		if delta > expected {
+			return false, fmt.Errorf("counter %d delta=%d, want %d", index, delta, expected)
+		}
+		if delta < expected {
+			pending = true
+		}
+	}
+	return pending, nil
+}
+
 func parseFakeTCPRoutedRealHostContract(
 	lookup fakeTCPRealHostEnvLookup,
 ) (fakeTCPRoutedRealHostContract, error) {
@@ -235,6 +259,53 @@ func TestFakeTCPRealHostRoutedHarnessSelectedBinaryContract(t *testing.T) {
 	}
 }
 
+func TestFakeTCPRoutedExactStatDeltasRequireAdmissionAccept(t *testing.T) {
+	const (
+		egressOK        = uint32(0)
+		checksumNone    = uint32(13)
+		checksumReset   = uint32(14)
+		admissionAccept = uint32(17)
+		statCount       = 19
+	)
+	for _, test := range []struct {
+		name string
+		want map[uint32]uint64
+	}{
+		{name: "iphdrincl-none", want: map[uint32]uint64{
+			egressOK: 1, checksumNone: 1, admissionAccept: 1,
+		}},
+		{name: "udp-partial", want: map[uint32]uint64{
+			egressOK: 1, checksumReset: 1, admissionAccept: 1,
+		}},
+		{name: "udp-segment-gso", want: map[uint32]uint64{
+			egressOK: 1, admissionAccept: 1,
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			before := make([]uint64, statCount)
+			after := make([]uint64, statCount)
+			for index, delta := range test.want {
+				after[index] = delta
+			}
+			pending, err := fakeTCPRoutedExactStatDeltas(before, after, test.want)
+			if err != nil || pending {
+				t.Fatalf("complete exact deltas pending=%t error=%v", pending, err)
+			}
+
+			withoutAdmission := make(map[uint32]uint64, len(test.want)-1)
+			for index, delta := range test.want {
+				if index != admissionAccept {
+					withoutAdmission[index] = delta
+				}
+			}
+			if _, err := fakeTCPRoutedExactStatDeltas(before, after, withoutAdmission); err == nil ||
+				!strings.Contains(err.Error(), "counter 17 delta=1, want 0") {
+				t.Fatalf("missing admission delta error=%v", err)
+			}
+		})
+	}
+}
+
 func TestFakeTCPRoutedWireImageBindsTypewordXORAndRotation(t *testing.T) {
 	original := make([]byte, fakeTCPRoutedSegmentBytes)
 	binary.LittleEndian.PutUint32(original[:4], 4)
@@ -311,6 +382,7 @@ func TestFakeTCPRoutedRealHostLinuxStaticContract(t *testing.T) {
 		"fakeTCPRoutedFakeStatEgressOK":             0,
 		"fakeTCPRoutedFakeStatChecksumNoneAccepted": 13,
 		"fakeTCPRoutedFakeStatChecksumPartialReset": 14,
+		"fakeTCPRoutedFakeStatAdmissionAccept":      17,
 		"fakeTCPRoutedCoreStatEgressRewriteOK":      0,
 		"fakeTCPRoutedCoreStatIngressRuleMiss":      7,
 		"fakeTCPRoutedCoreStatEgressGSOSeen":        15,
@@ -344,6 +416,8 @@ func TestFakeTCPRoutedRealHostLinuxStaticContract(t *testing.T) {
 		"fakeTCPRoutedMTUAuditStatCount",
 		"fakeTCPRoutedFakeStatChecksumNoneAccepted",
 		"fakeTCPRoutedFakeStatChecksumPartialReset",
+		"fakeTCPRoutedFakeStatAdmissionAccept: 1",
+		"fakeTCPRoutedExactStatDeltas(",
 		"fakeTCPRoutedCoreStatGSORewriteOK",
 		"wireImages := fakeTCPRoutedExpectedWireSegments(",
 		"rule.SourcePort != fakeTCPRoutedSourcePort",
@@ -373,6 +447,7 @@ func TestFakeTCPRoutedRealHostLinuxStaticContract(t *testing.T) {
 		"fakeTCPRealHostStatEgressOK",
 		"fakeTCPRealHostStatChecksumNoneAccepted",
 		"fakeTCPRealHostStatChecksumPartialReset",
+		"fakeTCPRealHostStatAdmissionAccept",
 		"fakeTCPRealHostCoreStatEgressRewriteOK",
 		"fakeTCPRealHostCoreStatEgressGSOSeen",
 		"fakeTCPRealHostCoreStatEgressGSOManagedSeen",

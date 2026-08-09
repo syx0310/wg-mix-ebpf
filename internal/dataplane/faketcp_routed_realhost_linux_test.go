@@ -24,6 +24,7 @@ const (
 	fakeTCPRoutedFakeStatEgressOK             = uint32(0)
 	fakeTCPRoutedFakeStatChecksumNoneAccepted = uint32(13)
 	fakeTCPRoutedFakeStatChecksumPartialReset = uint32(14)
+	fakeTCPRoutedFakeStatAdmissionAccept      = uint32(17)
 	fakeTCPRoutedFakeStatCount                = 19
 	fakeTCPRoutedCoreStatEgressRewriteOK      = uint32(0)
 	fakeTCPRoutedCoreStatIngressRuleMiss      = uint32(7)
@@ -131,7 +132,10 @@ func runFakeTCPRoutedSocketAcceptance(t *testing.T, mode fakeTCPRoutedSocketMode
 	)
 	assertFakeTCPRoutedSegments(t, mode, segments, wireImages)
 
-	fakeWant := map[uint32]uint64{fakeTCPRoutedFakeStatEgressOK: 1}
+	fakeWant := map[uint32]uint64{
+		fakeTCPRoutedFakeStatEgressOK:        1,
+		fakeTCPRoutedFakeStatAdmissionAccept: 1,
+	}
 	coreWant := map[uint32]uint64{
 		fakeTCPRoutedCoreStatEgressRewriteOK: 1,
 		fakeTCPRoutedCoreStatIngressRuleMiss: uint64(wantSegments),
@@ -681,25 +685,13 @@ func waitForFakeTCPRoutedStatDeltas(
 			after := readFakeTCPRoutedStats(
 				t, runtime, expectation.name, len(expectation.before),
 			)
-			if len(after) != len(expectation.before) {
-				t.Fatalf("routed FakeTCP stat map %s resized: before=%d after=%d",
-					expectation.name, len(expectation.before), len(after))
+			mapPending, err := fakeTCPRoutedExactStatDeltas(
+				expectation.before, after, expectation.want,
+			)
+			if err != nil {
+				t.Fatalf("routed FakeTCP stat map %s: %v", expectation.name, err)
 			}
-			for index := range after {
-				if after[index] < expectation.before[index] {
-					t.Fatalf("routed FakeTCP stat map %s counter %d decreased",
-						expectation.name, index)
-				}
-				delta := after[index] - expectation.before[index]
-				want := expectation.want[uint32(index)]
-				if delta > want {
-					t.Fatalf("routed FakeTCP stat map %s counter %d delta=%d, want %d",
-						expectation.name, index, delta, want)
-				}
-				if delta < want {
-					pending = true
-				}
-			}
+			pending = pending || mapPending
 		}
 		if !pending {
 			return
