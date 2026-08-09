@@ -47,6 +47,16 @@ extern int wg_mix_faketcp_skb_normalize_udp_csum(struct __sk_buff *skb,
 						  __u32 transport_offset,
 						  __u32 udp_length) __ksym;
 
+// Stable result ABI shared with kernel/faketcp_checksum.  Positive results
+// identify the admitted checksum state; negative results classify a failure
+// before the packet can be mutated.
+#define FAKETCP_CSUM_ACCEPT_NONE           0
+#define FAKETCP_CSUM_ACCEPT_PARTIAL_RESET  1
+#define FAKETCP_CSUM_REJECT_PACKET        -1
+#define FAKETCP_CSUM_REJECT_STATE         -2
+#define FAKETCP_CSUM_REJECT_METADATA      -3
+#define FAKETCP_CSUM_REJECT_GSO           -4
+
 enum faketcp_stat_id {
 	FAKETCP_STAT_EGRESS_OK = 0,
 	FAKETCP_STAT_INGRESS_OK,
@@ -61,6 +71,10 @@ enum faketcp_stat_id {
 	FAKETCP_STAT_CONTROL_RATE_LIMITED,
 	FAKETCP_STAT_CONTROL_POLICY_MISS,
 	FAKETCP_STAT_CAPTURE_ID_ERROR,
+	FAKETCP_STAT_CHECKSUM_NONE_ACCEPTED,
+	FAKETCP_STAT_CHECKSUM_PARTIAL_RESET,
+	FAKETCP_STAT_CHECKSUM_STATE_REJECT,
+	FAKETCP_STAT_MTU_REJECT,
 	FAKETCP_STAT_MAX,
 };
 
@@ -334,6 +348,44 @@ static __always_inline void inc_faketcp_stat(__u32 key)
 
 	if (value)
 		*value += 1;
+}
+
+static __always_inline int
+faketcp_inspect_and_reset_udp_checksum(struct __sk_buff *skb,
+					       __u32 network_offset,
+					       __u32 transport_offset,
+					       __u32 udp_length)
+{
+	int result;
+
+	result = wg_mix_faketcp_skb_normalize_udp_csum(
+		skb, network_offset, transport_offset, udp_length);
+	switch (result) {
+	case FAKETCP_CSUM_ACCEPT_NONE:
+		inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_NONE_ACCEPTED);
+		return 0;
+	case FAKETCP_CSUM_ACCEPT_PARTIAL_RESET:
+		// The module has cleared CHECKSUM_PARTIAL and its offsets.  The
+		// encoder below completes the operation by materializing the final
+		// TCP checksum from the transformed bytes.
+		inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_PARTIAL_RESET);
+		return 0;
+	case FAKETCP_CSUM_REJECT_GSO:
+		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
+		return -1;
+	case FAKETCP_CSUM_REJECT_PACKET:
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return -1;
+	case FAKETCP_CSUM_REJECT_STATE:
+		inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_STATE_REJECT);
+		return -1;
+	case FAKETCP_CSUM_REJECT_METADATA:
+		inc_faketcp_stat(FAKETCP_STAT_METADATA_ERROR);
+		return -1;
+	default:
+		inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
+		return -1;
+	}
 }
 
 static __always_inline int
@@ -629,12 +681,10 @@ static __always_inline int faketcp_preflight_egress(struct __sk_buff *skb,
 	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
 	if (session && session->generation == generation &&
 	    session->state == FAKETCP_STATE_ESTABLISHED) {
-		if (wg_mix_faketcp_skb_normalize_udp_csum(
+		if (faketcp_inspect_and_reset_udp_checksum(
 			    skb, info->ip_off, info->udp_off,
-			    info->payload_len + sizeof(struct udphdr)) < 0) {
-			inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
+			    info->payload_len + sizeof(struct udphdr)) < 0)
 			return -1;
-		}
 		return 0;
 	}
 	if (session)
@@ -679,7 +729,7 @@ static __always_inline int faketcp_mtu_allows_growth(struct __sk_buff *skb,
 	rc = bpf_check_mtu(skb, 0, &mtu_len, FAKETCP_HEADER_DELTA, 0);
 	if (rc != 0 || mtu_len < FAKETCP_HEADER_DELTA ||
 	    old_total_len > mtu_len - FAKETCP_HEADER_DELTA) {
-		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		inc_faketcp_stat(FAKETCP_STAT_MTU_REJECT);
 		return 0;
 	}
 	return 1;
@@ -688,7 +738,9 @@ static __always_inline int faketcp_mtu_allows_growth(struct __sk_buff *skb,
 // TC's public __sk_buff ABI does not expose ip_summed, csum_start or
 // csum_offset. The required module kfunc accepts an already materialized
 // CHECKSUM_NONE skb or validates and clears exactly one non-GSO UDP
-// CHECKSUM_PARTIAL request before any type-word/XOR mutation.
+// CHECKSUM_PARTIAL request before any type-word/XOR mutation. Its stable
+// result is classified by faketcp_inspect_and_reset_udp_checksum, so a state,
+// metadata, GSO or packet-shape failure never collapses into a generic counter.
 // The old UDP checksum is deliberately ignored because it is only a
 // pseudo-header seed.
 // This helper materializes a new TCP checksum from the IPv4 pseudo-header,
@@ -831,8 +883,8 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		return TC_ACT_SHOT;
 	}
 	// The kfunc admitted CHECKSUM_NONE or normalized validated CHECKSUM_PARTIAL
-	// metadata. change_tail only grows/linearizes the skb; old_udp.check is
-	// never treated as the final TCP checksum.
+	// metadata to CHECKSUM_NONE. change_tail only grows/linearizes the skb;
+	// old_udp.check is never treated as the final TCP checksum.
 	if (bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0) < 0) {
 		inc_stat(STAT_SKB_STORE_ERROR);
 		return TC_ACT_SHOT;
