@@ -10,6 +10,8 @@ readonly REPOSITORY
 readonly RUNNER="${REVIEW_ROOT}/root-routed-veth-n-r.sh"
 readonly SEAM="${REVIEW_ROOT}/controller-seam.sh"
 readonly STATIC_TEST="${REVIEW_ROOT}/test_routed_veth_harness_static.py"
+readonly MODULE_LEASE_HELPER="${REVIEW_ROOT}/../realhost-b82-c8e41d73/checksum-module-lease.sh"
+readonly MODULE_LEASE_HERMETIC="${REVIEW_ROOT}/../realhost-b82-c8e41d73/test-hermetic-checksum-module-lease.sh"
 readonly SOURCE='/run/wg-mix-ebpf-source-stages/c8e41d73/source'
 readonly STAGE_ROOT='/run/wg-mix-ebpf-source-stages/c8e41d73'
 readonly COMMIT='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -33,15 +35,19 @@ expect_failure() {
   printf 'EXPECTED_FAILURE label=%s output=%q\n' "${label}" "${output}"
 }
 
-for path in "${RUNNER}" "${SEAM}" "${STATIC_TEST}"; do
+for path in "${RUNNER}" "${SEAM}" "${STATIC_TEST}" \
+  "${MODULE_LEASE_HELPER}" "${MODULE_LEASE_HERMETIC}"; do
   [[ -f "${path}" && ! -L "${path}" ]] || fail "fixture is not a regular file: ${path}"
 done
 
-/bin/bash -n "${RUNNER}" "${SEAM}" "$0" || fail 'Bash syntax gate'
+/bin/bash -n "${RUNNER}" "${SEAM}" "${MODULE_LEASE_HELPER}" \
+  "${MODULE_LEASE_HERMETIC}" "$0" || fail 'Bash syntax gate'
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I "${STATIC_TEST}" "${RUNNER}" "${SEAM}" ||
   fail 'static safety and lifecycle model'
+/bin/bash "${MODULE_LEASE_HERMETIC}" || fail 'shared checksum-module lease contract'
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck --norc --shell=bash -- "${RUNNER}" "${SEAM}" "$0" || fail 'ShellCheck gate'
+  shellcheck --norc --shell=bash -- "${RUNNER}" "${SEAM}" \
+    "${MODULE_LEASE_HELPER}" "${MODULE_LEASE_HERMETIC}" "$0" || fail 'ShellCheck gate'
 else
   printf 'SKIP: shellcheck unavailable locally; .82 execution remains shellcheck-gated\n'
 fi
@@ -74,7 +80,8 @@ readonly SEAM_OUTPUT
 
 for literal in \
   'B82_ROUTED_VETH_PLAN_ONLY run_id=c8e41d73 resource_id=5b8d30f1' \
-  'state_schema=owner,baseline,operation-intent,dependency-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module,tested,cleanup-intent,restored' \
+  'state_schema=owner,baseline,operation-intent,dependency-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module-intent,module,tested,cleanup-intent,restored' \
+  'L0 operation=shared-module-lock target=/run/wg-mix-ebpf-source-stages/c8e41d73/checksum-module-lease.v1.lock helper=/run/wg-mix-ebpf-source-stages/c8e41d73/source/scripts/realhost-b82-c8e41d73/checksum-module-lease.sh argv=/usr/bin/flock --exclusive --nonblock MODULE_LEASE_FD' \
   'netns=initial veth=wg5b8d3a,wg5b8d3b sender=198.18.82.1/32 peer=wg5b8d3b/unnumbered route=198.18.82.2/32 mtu=1500 neighbor=02:5b:8d:30:f1:0b no_external_peer=1' \
   'N5 operation=address-add target=wg5b8d3a:198.18.82.1/32 argv=/usr/sbin/ip -4 address add 198.18.82.1/32 dev wg5b8d3a scope global' \
   'N6 operation=route-add target=198.18.82.2/32 argv=/usr/sbin/ip -4 route add 198.18.82.2/32 dev wg5b8d3a src 198.18.82.1 mtu 1500 proto static scope link' \
@@ -82,6 +89,8 @@ for literal in \
   'N1 operation=veth-alias-a target=wg5b8d3a argv=/usr/sbin/ip link set dev wg5b8d3a alias wg-mix-ebpf:c8e41d73:5b8d30f1:a' \
   'N2 operation=veth-alias-b target=wg5b8d3b argv=/usr/sbin/ip link set dev wg5b8d3b alias wg-mix-ebpf:c8e41d73:5b8d30f1:b' \
   'N9 operation=offload-tso-off target=wg5b8d3a:tso=off argv=/usr/sbin/ethtool -K wg5b8d3a tso off' \
+  'M0 operation=shared-module-load target=wg_mix_faketcp_checksum helper=c8_checksum_module_load argv=/usr/sbin/insmod /run/wg-mix-ebpf-source-stages/c8e41d73/source/build/faketcp_checksum_kmod/wg_mix_faketcp_checksum.ko lease_id=c8e41d73-5b8d30f1' \
+  'R1 operation=shared-module-restore target=wg_mix_faketcp_checksum helper=c8_checksum_module_restore argv=/usr/sbin/rmmod wg_mix_faketcp_checksum' \
   'B1 operation=runtime-temp-mkdir target=/run/wg-mix-ebpf-source-stages/c8e41d73/go-tmp-realhost-5b8d30f1 argv=/usr/bin/mkdir --mode=0700 -- /run/wg-mix-ebpf-source-stages/c8e41d73/go-tmp-realhost-5b8d30f1' \
   'R2 operation=offload-tso-restore target=wg5b8d3a:tso=on argv=/usr/sbin/ethtool -K wg5b8d3a tso on' \
   'R3 operation=neighbor-delete target=wg5b8d3a:198.18.82.2 argv=/usr/sbin/ip -4 neigh del 198.18.82.2 lladdr 02:5b:8d:30:f1:0b nud permanent dev wg5b8d3a' \
@@ -156,10 +165,13 @@ for test_name in \
     fail "selected binary still receives the generic Go preflight TMPDIR for ${test_name}"
 done
 
-[[ "${PLAN_OUTPUT}" == *'B82_ROUTED_VETH_WRITE_SET filesystem='*'/run/wg-mix-ebpf-source-stages/c8e41d73/go-tmp-realhost-5b8d30f1 network='* ]] ||
+[[ "${PLAN_OUTPUT}" == *'B82_ROUTED_VETH_WRITE_SET filesystem='*'/run/wg-mix-ebpf-source-stages/c8e41d73/go-tmp-realhost-5b8d30f1 shared_lock='* ]] ||
   fail 'write set does not declare the retained real-host TMPDIR'
 [[ "${PLAN_OUTPUT}" == *'/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-mod-cache'* ]] ||
   fail 'write set does not declare the routed dependency cache producer'
+[[ "${PLAN_OUTPUT}" == *'shared_lock=/run/wg-mix-ebpf-source-stages/c8e41d73/checksum-module-lease.v1.lock:advisory-only'* &&
+  "${PLAN_OUTPUT}" == *'module=wg_mix_faketcp_checksum,lease_id:c8e41d73-5b8d30f1'* ]] ||
+  fail 'write set does not declare the shared module lock and exact lease token'
 
 for central_owned in \
   'veth=wgc8e41a,wgc8e41b' \

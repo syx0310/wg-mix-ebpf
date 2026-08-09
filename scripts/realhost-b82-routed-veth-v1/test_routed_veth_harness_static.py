@@ -66,7 +66,10 @@ class Lifecycle:
     neighbor: str = "absent"
     offload: str = "baseline"  # baseline, desired, foreign
     offload_baseline: bool = False
-    module: str = "absent"  # absent, exact, foreign
+    module_lock: bool = True
+    module_intent: bool = False
+    module: str = "absent"  # absent, exact, foreign, empty-lease
+    module_unloaded: bool = False
     bpf_baseline: bool = True
     cleanup: bool = False
     restored: bool = False
@@ -95,7 +98,7 @@ def require_exact_or_absent(value: str, label: str) -> None:
 def run_model(state: Lifecycle, cut_after: str | None = None) -> None:
     if not state.owner or not state.baseline or not state.operation:
         raise Rejected("foundation")
-    if state.cleanup or state.restored or not state.bpf_baseline:
+    if state.cleanup or state.restored or not state.bpf_baseline or not state.module_lock:
         raise Rejected("run-after-cleanup-or-bpf-drift")
     require_exact_or_absent(state.dependency_caches, "dependency-caches")
     if not state.dependency_intent:
@@ -167,9 +170,17 @@ def run_model(state: Lifecycle, cut_after: str | None = None) -> None:
     checkpoint("offload-receipt", cut_after)
 
     require_exact_or_absent(state.module, "module")
+    if state.module_unloaded:
+        raise Rejected("module-already-restored")
     if state.module == "absent":
+        if state.module_intent:
+            raise Rejected("module-intent-without-live")
+        state.module_intent = True
+        checkpoint("module-intent", cut_after)
         state.module = "exact"
         checkpoint("module-mutation", cut_after)
+    elif not state.module_intent:
+        raise Rejected("module-live-without-intent")
     state.receipts.add("module")
     checkpoint("module-receipt", cut_after)
 
@@ -182,10 +193,12 @@ def restore_model(state: Lifecycle, cut_after: str | None = None) -> None:
             or state.veth != "absent"
             or state.module != "absent"
             or not state.bpf_baseline
+            or not state.module_lock
+            or (state.module_intent and not state.module_unloaded)
         ):
             raise Rejected("restored-drift")
         return
-    if not state.owner or not state.baseline or not state.operation:
+    if not state.owner or not state.baseline or not state.operation or not state.module_lock:
         raise Rejected("foundation")
     if not state.bpf_baseline:
         raise Rejected("bpf-drift")
@@ -211,7 +224,12 @@ def restore_model(state: Lifecycle, cut_after: str | None = None) -> None:
     if state.veth_intent and state.runtime_temp != "exact":
         raise Rejected("veth-intent-without-runtime-temp")
     if not state.veth_intent:
-        if state.veth != "absent" or state.module != "absent" or state.receipts:
+        if (
+            state.veth != "absent"
+            or state.module != "absent"
+            or state.module_intent
+            or state.receipts
+        ):
             raise Rejected("resource-without-veth-intent")
     elif state.veth in {"foreign", "foreign-alias"}:
         raise Rejected("veth-identity")
@@ -228,8 +246,12 @@ def restore_model(state: Lifecycle, cut_after: str | None = None) -> None:
         raise Rejected("offload-identity")
     if state.offload == "desired" and "offload" not in state.receipts and first_missing != "offload":
         raise Rejected("offload-out-of-order")
-    if state.module == "foreign":
+    if state.module in {"foreign", "empty-lease"}:
         raise Rejected("module-identity")
+    if state.module == "exact" and not state.module_intent:
+        raise Rejected("module-live-without-intent")
+    if "module" in state.receipts and not state.module_intent:
+        raise Rejected("module-receipt-without-intent")
     if state.module == "exact" and "module" not in state.receipts and first_missing != "module":
         raise Rejected("module-out-of-order")
 
@@ -242,6 +264,9 @@ def restore_model(state: Lifecycle, cut_after: str | None = None) -> None:
         checkpoint("module-delete", cut_after)
     elif state.module != "absent":
         raise Rejected("module-identity")
+    if state.module_intent and not state.module_unloaded:
+        state.module_unloaded = True
+        checkpoint("module-unloaded-receipt", cut_after)
 
     if state.offload == "desired":
         state.offload = "baseline"
@@ -291,6 +316,7 @@ def exercise_lifecycle_model() -> None:
         "offload-baseline",
         "offload-mutation",
         "offload-receipt",
+        "module-intent",
         "module-mutation",
         "module-receipt",
     )
@@ -337,6 +363,7 @@ def exercise_lifecycle_model() -> None:
     restored_cuts = (
         "cleanup-intent",
         "module-delete",
+        "module-unloaded-receipt",
         "offload-restore",
         "neighbor-delete",
         "route-delete",
@@ -370,6 +397,8 @@ def exercise_lifecycle_model() -> None:
         "foreign-route": lambda state: setattr(state, "route", "foreign"),
         "foreign-offload": lambda state: setattr(state, "offload", "foreign"),
         "foreign-module": lambda state: setattr(state, "module", "foreign"),
+        "empty-lease-module": lambda state: setattr(state, "module", "empty-lease"),
+        "module-lock-missing": lambda state: setattr(state, "module_lock", False),
         "bpf-drift": lambda state: setattr(state, "bpf_baseline", False),
     }.items():
         state = copy.deepcopy(complete)
@@ -433,7 +462,7 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
     required = (
         "readonly RUN_ID='c8e41d73'",
         "readonly RESOURCE_ID='5b8d30f1'",
-        "STATE_SCHEMA='owner,baseline,operation-intent,dependency-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module,tested,cleanup-intent,restored'",
+        "STATE_SCHEMA='owner,baseline,operation-intent,dependency-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module-intent,module,tested,cleanup-intent,restored'",
         "readonly LOCAL_IPV4='198.18.82.1'",
         "readonly REMOTE_IPV4='198.18.82.2'",
         "readonly ROUTE_MTU='1500'",
@@ -446,6 +475,9 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         'readonly VETH_B="wg${RESOURCE_ID:0:5}b"',
         'readonly VETH_A_ALIAS="wg-mix-ebpf:${RUN_ID}:${RESOURCE_ID}:a"',
         'readonly VETH_B_ALIAS="wg-mix-ebpf:${RUN_ID}:${RESOURCE_ID}:b"',
+        'readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-c8e41d73/checksum-module-lease.sh"',
+        'readonly MODULE_LEASE_LOCK="${STAGE_ROOT}/checksum-module-lease.v1.lock"',
+        'readonly MODULE_LEASE_ID="${RUN_ID}-${RESOURCE_ID}"',
         "GOFLAGS=-mod=readonly",
         "WG_MIX_FAKETCP_ROUTED_LOCAL_IPV4=\"${LOCAL_IPV4}\"",
         "WG_MIX_FAKETCP_ROUTED_REMOTE_IPV4=\"${REMOTE_IPV4}\"",
@@ -473,6 +505,13 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         "no automatic teardown",
         "ensure_cleanup_intent",
         "assert_bpf_links_baseline",
+        "load_checksum_module_helper",
+        "configure_checksum_module_lease",
+        "module-lease-binding-contract",
+        "c8_checksum_module_acquire",
+        "c8_checksum_module_load",
+        "c8_checksum_module_restore",
+        "c8_checksum_module_validate_restore_state",
     )
     for literal in required:
         if literal not in runner:
@@ -490,7 +529,6 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         'OP_ARGV=(/usr/sbin/ip -4 route del "${REMOTE_IPV4}/${PREFIX_BITS}" dev "${VETH_A}" src "${LOCAL_IPV4}" mtu "${ROUTE_MTU}" proto static scope link)',
         'OP_ARGV=(/usr/sbin/ip -4 address del "${LOCAL_IPV4}/${PREFIX_BITS}" dev "${VETH_A}" scope global)',
         'OP_ARGV=(/usr/sbin/ethtool -K "${VETH_A}" tso on)',
-        'OP_ARGV=(/usr/sbin/rmmod "${MODULE_NAME}")',
         'OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${RUNTIME_TEMP}")',
         'OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${GO_CACHE}")',
         'OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${GO_MOD_CACHE}")',
@@ -500,8 +538,14 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         if literal not in builder:
             fail(f"argv builder is missing exact reverse operation {literal!r}")
     outside_builder = runner.replace(builder, "")
-    if re.search(r"/(?:usr/)?sbin/(?:ip|ethtool|rmmod)\s+[^\n]*(?:del|delete|-K)", outside_builder):
-        fail("runner has a destructive network/module argv outside the sole builder")
+    if re.search(r"/(?:usr/)?sbin/(?:ip|ethtool)\s+[^\n]*(?:del|delete|-K)", outside_builder):
+        fail("runner has a destructive network argv outside the sole builder")
+    if "/usr/sbin/insmod" in builder or "/usr/sbin/rmmod" in builder:
+        fail("runner duplicates shared module mutation argv in its local builder")
+    if "c8_checksum_module_load M0" not in function_body(runner, "ensure_module_phase"):
+        fail("module setup does not delegate to the shared lease helper")
+    if "c8_checksum_module_restore R1" not in function_body(runner, "restore_module"):
+        fail("module restore does not delegate to the shared lease helper")
     if '"${PREFLIGHT_BINARY}" -test.run' not in builder:
         fail("post-mutation tests do not execute the preflight-bound binary")
     if 'TMPDIR="${RUNTIME_TEMP}"' not in builder:
@@ -539,6 +583,8 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
 
     run = function_body(runner, "run_state_machine")
     run_order = (
+        "c8_checksum_module_acquire",
+        "configure_checksum_module_lease",
         "ensure_owner",
         "ensure_baseline",
         "ensure_operation_intent",
@@ -550,6 +596,16 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
     positions = [run.index(item) for item in run_order]
     if positions != sorted(positions):
         fail("run did not finish dependency/build preflight before host mutation")
+    restore_prefix = (
+        "c8_checksum_module_acquire",
+        "configure_checksum_module_lease",
+        "ensure_owner",
+        "ensure_baseline",
+        "validate_partial_setup_for_restore",
+    )
+    positions = [restore.index(item) for item in restore_prefix]
+    if positions != sorted(positions):
+        fail("restore does not hold the shared module lock across validation and cleanup")
     preflight = function_body(runner, "ensure_dependency_preflight")
     if not all(
         item in preflight
@@ -588,6 +644,7 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         "ROUTE",
         "NEIGHBOR",
         "OFFLOAD",
+        "MODULE_INTENT",
         "MODULE",
     ):
         if f'"${{{receipt}_PHASE}}"' not in cleanup:
@@ -605,6 +662,8 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         fail("partial restore does not validate the retained real-host TMPDIR")
     if "validate_dependency_caches_for_restore" not in partial_restore:
         fail("partial restore does not validate run-owned dependency caches")
+    if "validate_module_for_restore" not in partial_restore:
+        fail("partial restore does not classify the shared module lease state")
 
     for forbidden in ("ssh", "scp", "sudo", "credientials/", "192.168.10.28", "47.116.202.155"):
         if forbidden in seam:

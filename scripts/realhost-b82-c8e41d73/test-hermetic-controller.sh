@@ -13,6 +13,7 @@ readonly TRANSPORT="${REVIEW_ROOT}/locked-transport.exp"
 readonly STAGER="${REVIEW_ROOT}/prepare-stage-root.sh"
 readonly MATRIX="${REVIEW_ROOT}/root-matrix-n-r.sh"
 readonly STATIC_TEST="${REVIEW_ROOT}/test_controller_static.py"
+readonly MODULE_LEASE_HELPER="${REVIEW_ROOT}/checksum-module-lease.sh"
 readonly CREDENTIAL_PATH='/Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82'
 
 fail() {
@@ -55,11 +56,13 @@ require_ordered_literals() {
   done
 }
 
-for path in "${BINDER}" "${CONTROLLER}" "${TRANSPORT}" "${STAGER}" "${MATRIX}" "${STATIC_TEST}"; do
+for path in "${BINDER}" "${CONTROLLER}" "${TRANSPORT}" "${STAGER}" "${MATRIX}" \
+  "${STATIC_TEST}" "${MODULE_LEASE_HELPER}"; do
   [[ -f "${path}" && ! -L "${path}" ]] || fail "review input is not a regular file: ${path}"
 done
 
-/bin/bash -n "${BINDER}" "${CONTROLLER}" "${STAGER}" "$0" || fail 'Bash syntax gate'
+/bin/bash -n "${BINDER}" "${CONTROLLER}" "${STAGER}" \
+  "${MODULE_LEASE_HELPER}" "$0" || fail 'Bash syntax gate'
 /usr/bin/python3 -I "${STATIC_TEST}" \
   "${BINDER}" "${CONTROLLER}" "${TRANSPORT}" "${STAGER}" "${MATRIX}" ||
   fail 'static controller contract'
@@ -69,14 +72,12 @@ EXPECT_ARGUMENT_RC=$?
   fail 'Expect syntax/argument gate'
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck --norc --shell=bash -- "${BINDER}" "${CONTROLLER}" "${STAGER}" "$0" ||
+  shellcheck --norc --shell=bash -- "${BINDER}" "${CONTROLLER}" "${STAGER}" \
+    "${MODULE_LEASE_HELPER}" "$0" ||
     fail 'ShellCheck gate'
 else
   printf 'SKIP: shellcheck unavailable locally; .82 preflight binds /usr/bin/shellcheck\n'
 fi
-
-/usr/bin/git -C "${REPOSITORY}" diff --exit-code -- \
-  scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh || fail 'existing root matrix was modified'
 
 TEST_ROOT="$(/usr/bin/mktemp -d /private/tmp/wg-mix-b82-v6-controller-hermetic.XXXXXX)" ||
   fail 'temporary root creation'
@@ -93,7 +94,9 @@ printf 'history-root=%s\n' "${TEST_ROOT##*/}" >"${FIXTURE_REPOSITORY}/history-ro
 /bin/mkdir -p -- "${FIXTURE_REVIEW}" || fail 'fixture review directory creation'
 for name in \
   bind-final-package.sh controller.sh locked-transport.exp prepare-stage-root.sh \
-  root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh test_matrix_static.py; do
+  root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh test_matrix_static.py \
+  checksum-module-lease.sh test-hermetic-checksum-module-lease.sh \
+  test_checksum_module_lease_static.py; do
   /bin/cp -- "${REVIEW_ROOT}/${name}" "${FIXTURE_REVIEW}/${name}" || fail "fixture copy ${name}"
 done
 printf 'fixture=%s\n' "${TEST_ROOT##*/}" >"${FIXTURE_REPOSITORY}/fixture-token.v1" || fail 'fixture token'

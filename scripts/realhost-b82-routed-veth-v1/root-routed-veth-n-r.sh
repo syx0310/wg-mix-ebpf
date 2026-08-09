@@ -5,7 +5,7 @@ umask 077
 
 readonly RUN_ID='c8e41d73'
 readonly RESOURCE_ID='5b8d30f1'
-readonly STATE_SCHEMA='owner,baseline,operation-intent,dependency-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module,tested,cleanup-intent,restored'
+readonly STATE_SCHEMA='owner,baseline,operation-intent,dependency-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module-intent,module,tested,cleanup-intent,restored'
 readonly STAGE_ROOT="/run/wg-mix-ebpf-source-stages/${RUN_ID}"
 readonly EXPECTED_SOURCE="${STAGE_ROOT}/source"
 readonly EVIDENCE_ROOT="${STAGE_ROOT}/routed-evidence-${RESOURCE_ID}"
@@ -26,7 +26,9 @@ readonly ADDRESS_PHASE="${EVIDENCE_ROOT}/phase-address.v1"
 readonly ROUTE_PHASE="${EVIDENCE_ROOT}/phase-route.v1"
 readonly NEIGHBOR_PHASE="${EVIDENCE_ROOT}/phase-neighbor.v1"
 readonly OFFLOAD_PHASE="${EVIDENCE_ROOT}/phase-offload.v1"
-readonly MODULE_PHASE="${EVIDENCE_ROOT}/phase-module.v1"
+readonly MODULE_INTENT_PHASE="${EVIDENCE_ROOT}/checksum-module-intent.v1"
+readonly MODULE_PHASE="${EVIDENCE_ROOT}/checksum-module-owned.v1"
+readonly MODULE_UNLOADED_PHASE="${EVIDENCE_ROOT}/checksum-module-unloaded.v1"
 readonly TESTED_PHASE="${EVIDENCE_ROOT}/phase-tested.v1"
 readonly CLEANUP_PHASE="${EVIDENCE_ROOT}/phase-cleanup-intent.v1"
 readonly RESTORED_PHASE="${EVIDENCE_ROOT}/phase-restored.v1"
@@ -48,6 +50,10 @@ readonly MODULE_NAME='wg_mix_faketcp_checksum'
 readonly EXPERIMENTAL_OBJECT="${EXPECTED_SOURCE}/build/wg_mix_faketcp_experimental.o"
 readonly BASELINE_OBJECT="${EXPECTED_SOURCE}/build/wg_mix_tc.o"
 readonly MODULE_OBJECT="${EXPECTED_SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko"
+readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-c8e41d73/checksum-module-lease.sh"
+readonly MODULE_LEASE_HELPER="${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}"
+readonly MODULE_LEASE_LOCK="${STAGE_ROOT}/checksum-module-lease.v1.lock"
+readonly MODULE_LEASE_ID="${RUN_ID}-${RESOURCE_ID}"
 readonly SELF_RELATIVE='scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh'
 readonly SEAM_RELATIVE='scripts/realhost-b82-routed-veth-v1/controller-seam.sh'
 readonly ROUTED_CONTRACT_RELATIVE='internal/dataplane/faketcp_routed_realhost_contract_test.go'
@@ -76,7 +82,6 @@ VETH_A_IFINDEX=''
 VETH_B_IFINDEX=''
 VETH_A_SYSFS=''
 VETH_B_SYSFS=''
-EXPECTED_MODULE_SRCVERSION=''
 OP_TARGET=''
 declare -a OP_ARGV=()
 declare -a BOOTSTRAP_AUDIT_LINES=()
@@ -212,8 +217,6 @@ build_argv() {
     offload-show-a) OP_TARGET="${VETH_A}"; OP_ARGV=(/usr/sbin/ethtool -k "${VETH_A}") ;;
     offload-tso-off) OP_TARGET="${VETH_A}:tso=off"; OP_ARGV=(/usr/sbin/ethtool -K "${VETH_A}" tso off) ;;
     offload-tso-restore) OP_TARGET="${VETH_A}:tso=on"; OP_ARGV=(/usr/sbin/ethtool -K "${VETH_A}" tso on) ;;
-    module-load) OP_TARGET="${MODULE_NAME}"; OP_ARGV=(/usr/sbin/insmod "${MODULE_OBJECT}") ;;
-    module-unload) OP_TARGET="${MODULE_NAME}"; OP_ARGV=(/usr/sbin/rmmod "${MODULE_NAME}") ;;
     list:*)
       name="${operation#list:}"; valid_preflight_test_name "${name}" || return 64
       OP_TARGET="${name}"
@@ -254,6 +257,9 @@ render_plan() {
     "${VETH_A}" "${VETH_B}" "${LOCAL_IPV4}" "${PREFIX_BITS}" "${VETH_B}" \
     "${REMOTE_IPV4}" "${PREFIX_BITS}" "${ROUTE_MTU}" "${VETH_B_MAC}"
   plan_operation B0 evidence-mkdir
+  printf 'L0 operation=shared-module-lock target=%q helper=%q argv=' "${MODULE_LEASE_LOCK}" "${MODULE_LEASE_HELPER}"
+  quote_argv /usr/bin/flock --exclusive --nonblock MODULE_LEASE_FD
+  printf '\n'
   plan_operation A.bpf bpf-links
   plan_operation C0 go-cache-mkdir
   plan_operation C1 go-mod-cache-mkdir
@@ -271,24 +277,31 @@ render_plan() {
     'N0|veth-add' 'N1|veth-alias-a' 'N2|veth-alias-b' \
     'N3|veth-up-a' 'N4|veth-up-b' 'N5|address-add' \
     'N6|route-add' 'N7|neighbor-add' 'N8|offload-show-a' \
-    'N9|offload-tso-off' 'M0|module-load'; do
+    'N9|offload-tso-off'; do
     IFS='|' read -r label operation <<<"${spec}"
     plan_operation "${label}" "${operation}"
   done
+  printf 'M0 operation=shared-module-load target=%q helper=c8_checksum_module_load argv=' "${MODULE_NAME}"
+  quote_argv /usr/sbin/insmod "${MODULE_OBJECT}" "lease_id=${MODULE_LEASE_ID}"
+  printf '\n'
   for name in "${NEGATIVE_TEST}" "${POSITIVE_TESTS[@]}"; do
     plan_operation "T.${name}" "test:${name}"
   done
+  plan_operation R0 bpf-links
+  printf 'R1 operation=shared-module-restore target=%q helper=c8_checksum_module_restore argv=' "${MODULE_NAME}"
+  quote_argv /usr/sbin/rmmod "${MODULE_NAME}"
+  printf '\n'
   for spec in \
-    'R0|bpf-links' 'R1|module-unload' 'R2|offload-tso-restore' \
+    'R2|offload-tso-restore' \
     'R3|neighbor-delete' 'R4|route-delete' 'R5|address-delete' \
     'R6|veth-delete' 'R7|bpf-links'; do
     IFS='|' read -r label operation <<<"${spec}"
     plan_operation "${label}" "${operation}"
   done
-  printf 'B82_ROUTED_VETH_WRITE_SET filesystem=%s,%s,%s,%s,%s,%s,%s network=veth:%s,%s,address:%s/%s,route:%s/%s,neighbor:%s,offload:%s:tso module=%s bpf=transient-unpinned-test-owned evidence_retained=1\n' \
+  printf 'B82_ROUTED_VETH_WRITE_SET filesystem=%s,%s,%s,%s,%s,%s,%s shared_lock=%s:advisory-only network=veth:%s,%s,address:%s/%s,route:%s/%s,neighbor:%s,offload:%s:tso module=%s,lease_id:%s bpf=transient-unpinned-test-owned evidence_retained=1\n' \
     "${EVIDENCE_ROOT}" "${PREFLIGHT_BINARY}" "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}" "${RUNTIME_TEMP}" \
-    "${VETH_A}" "${VETH_B}" "${LOCAL_IPV4}" "${PREFIX_BITS}" "${REMOTE_IPV4}" \
-    "${PREFIX_BITS}" "${REMOTE_IPV4}" "${VETH_A}" "${MODULE_NAME}"
+    "${MODULE_LEASE_LOCK}" "${VETH_A}" "${VETH_B}" "${LOCAL_IPV4}" "${PREFIX_BITS}" "${REMOTE_IPV4}" \
+    "${PREFIX_BITS}" "${REMOTE_IPV4}" "${VETH_A}" "${MODULE_NAME}" "${MODULE_LEASE_ID}"
   printf 'B82_ROUTED_VETH_RESTORE_ORDER cleanup-intent,bpf-baseline,module,offload,neighbor,route,address,veth,bpf-baseline,restored retryable=1 exact_reverse=1\n'
   printf 'B82_ROUTED_VETH_COVERAGE af_packet=none,partial,gso:route-unknown-negative routed=iphdrincl-none,udp-partial,udp-segment-gso:positive capability_bits_changed=0\n'
   printf 'B82_ROUTED_VETH_PLAN_COMPLETE commands_are_review_templates=1 preflight_before_host_mutation=1 network_downloads=bounded-go-module-proxy-only no_commands_executed=1 credential_read=0 remote_connections=0 network_operations=0\n'
@@ -332,19 +345,37 @@ audit_line() {
     "${timestamp}" "${event}" "${step}" "${target}" "${rc}" "${rendered}" >>"${AUDIT_LOG}"
 }
 
-run_operation() {
-  local label="$1" operation="$2" rendered rc
+run_audited_argv() {
+  local label="$1" target="$2" rendered rc
   local -a status
-  build_argv "${operation}" || fail "operation-builder:${operation}" $?
-  rendered="$(quote_argv "${OP_ARGV[@]}")" || fail "render:${label}"
-  audit_line start "${label}" "${OP_TARGET}" not-run "${rendered}" || fail "audit-start:${label}"
-  "${OP_ARGV[@]}" 2>&1 | /usr/bin/tee -a "${AUDIT_LOG}"
+  shift 2
+  rendered="$(quote_argv "$@")" || fail "render:${label}"
+  audit_line start "${label}" "${target}" not-run "${rendered}" || fail "audit-start:${label}"
+  "$@" 2>&1 | /usr/bin/tee -a "${AUDIT_LOG}"
   status=("${PIPESTATUS[@]}")
   ((${#status[@]} == 2)) || fail "pipeline:${label}"
   rc="${status[0]}"
-  audit_line finish "${label}" "${OP_TARGET}" "${rc}" "${rendered}" || fail "audit-finish:${label}"
+  audit_line finish "${label}" "${target}" "${rc}" "${rendered}" || fail "audit-finish:${label}"
   ((status[1] == 0)) || fail "audit-output:${label}" "${status[1]}"
   return "${rc}"
+}
+
+run_operation() {
+  local label="$1" operation="$2"
+  build_argv "${operation}" || fail "operation-builder:${operation}" $?
+  run_audited_argv "${label}" "${OP_TARGET}" "${OP_ARGV[@]}"
+}
+
+c8_checksum_module_run() {
+  run_audited_argv "$@"
+}
+
+c8_checksum_module_write() {
+  write_phase "$1" "$2"
+}
+
+c8_checksum_module_fail() {
+  fail "checksum-module-lease:$1" "$2"
 }
 
 capture_operation() {
@@ -504,7 +535,8 @@ verify_source_and_artifacts() {
     actual="$(sha256_file "${path}")" || fail "artifact-sha-read:${path}"
     [[ "${actual}" == "${expected}" ]] || fail "artifact-sha:${path}" 79
   done
-  for relative in "${SELF_RELATIVE}" "${SEAM_RELATIVE}" "${ROUTED_CONTRACT_RELATIVE}" "${ROUTED_TEST_RELATIVE}" \
+  for relative in "${SELF_RELATIVE}" "${SEAM_RELATIVE}" "${MODULE_LEASE_HELPER_RELATIVE}" \
+    "${ROUTED_CONTRACT_RELATIVE}" "${ROUTED_TEST_RELATIVE}" \
     "${NEGATIVE_TEST_RELATIVE}" "${GSO_KFUNC_RELATIVE}"; do
     mapped="$("${GIT_COMMAND[@]}" -C "${SOURCE}" rev-parse "${COMMIT}:${relative}")" || fail "mapped-blob:${relative}"
     actual_blob="$("${GIT_COMMAND[@]}" -C "${SOURCE}" hash-object -- "${SOURCE}/${relative}")" || fail "actual-blob:${relative}"
@@ -512,8 +544,6 @@ verify_source_and_artifacts() {
   done
   self_blob="$(/usr/bin/readlink -e -- "$0")" || fail 'self-canonical'
   [[ "${self_blob}" == "${SOURCE}/${SELF_RELATIVE}" ]] || fail 'self-path' 79
-  EXPECTED_MODULE_SRCVERSION="$(/usr/sbin/modinfo -F srcversion -- "${MODULE_OBJECT}")" || fail 'module-srcversion'
-  [[ "${EXPECTED_MODULE_SRCVERSION}" =~ ^[0-9A-Fa-f]{8,64}$ ]] || fail 'module-srcversion-format' 79
   for literal in \
     'AF_PACKET fixture as negative evidence only' \
     'fakeTCPRealHostStatMTUReject: 3' \
@@ -526,6 +556,23 @@ verify_source_and_artifacts() {
     'route_mtu = dst_mtu(dst)'; do
     [[ "$(/usr/bin/grep -Fc -- "${literal}" "${SOURCE}/${GSO_KFUNC_RELATIVE}")" == 1 ]] || fail 'routed-pmtu-source-contract' 78
   done
+}
+
+load_checksum_module_helper() {
+  # shellcheck source=../realhost-b82-c8e41d73/checksum-module-lease.sh
+  source "${MODULE_LEASE_HELPER}" || fail 'module-lease-helper-source' $?
+  [[ "${C8_CHECKSUM_MODULE_LOCK}" == "${MODULE_LEASE_LOCK}" ]] ||
+    fail 'module-lease-helper-lock-contract' 79
+}
+
+configure_checksum_module_lease() {
+  c8_checksum_module_configure "${RUN_ID}" "${RESOURCE_ID}" "${COMMIT}" "${BOOT_ID}" \
+    "${EVIDENCE_ROOT}" "${MODULE_OBJECT}" "${MODULE_SHA256}" || fail 'module-lease-configure' $?
+  [[ "${C8_CHECKSUM_MODULE_LEASE_ID}" == "${MODULE_LEASE_ID}" &&
+    "${C8_CHECKSUM_MODULE_INTENT}" == "${MODULE_INTENT_PHASE}" &&
+    "${C8_CHECKSUM_MODULE_OWNED}" == "${MODULE_PHASE}" &&
+    "${C8_CHECKSUM_MODULE_UNLOADED}" == "${MODULE_UNLOADED_PHASE}" ]] ||
+    fail 'module-lease-binding-contract' 79
 }
 
 ensure_directory() {
@@ -918,22 +965,8 @@ ensure_offload_phase() {
   write_phase "${OFFLOAD_PHASE}" "${expected}" || fail 'offload-phase-write' $?
 }
 
-module_matches() {
-  [[ -d "/sys/module/${MODULE_NAME}" &&
-    "$(/usr/bin/cat "/sys/module/${MODULE_NAME}/srcversion")" == "${EXPECTED_MODULE_SRCVERSION}" ]]
-}
-
 ensure_module_phase() {
-  local expected
-  expected="$(render_fixed_phase module "module=${MODULE_NAME},sha256=${MODULE_SHA256},srcversion=${EXPECTED_MODULE_SRCVERSION}")" || fail 'module-render'
-  if [[ -f "${MODULE_PHASE}" ]]; then
-    phase_matches "${MODULE_PHASE}" "${expected}" || fail 'module-phase-drift' 79
-    module_matches || fail 'module-identity' 79
-    return
-  fi
-  if [[ -d "/sys/module/${MODULE_NAME}" ]]; then module_matches || fail 'module-unreceipted-drift' 79
-  else run_operation M0 module-load || fail 'module-load' $?; module_matches || fail 'module-postcondition' 79; fi
-  write_phase "${MODULE_PHASE}" "${expected}" || fail 'module-phase-write' $?
+  c8_checksum_module_load M0 || fail 'module-lease-load' $?
 }
 
 render_tested() {
@@ -965,7 +998,8 @@ assert_bpf_links_baseline() {
 
 render_cleanup_intent() {
   local owner baseline operation dependency_intent dependency veth_intent veth address route
-  local go_cache go_mod_cache go_path go_tmp runtime_temp neighbor offload_baseline offload module tested
+  local go_cache go_mod_cache go_path go_tmp runtime_temp neighbor offload_baseline offload
+  local module_intent module tested
   owner="$(sha256_file "${OWNER_PHASE}")" || return $?
   baseline="$(sha256_file "${BASELINE_PHASE}")" || return $?
   operation="$(sha256_file "${OPERATION_PHASE}")" || return $?
@@ -983,6 +1017,7 @@ render_cleanup_intent() {
   neighbor="$(phase_binding "${NEIGHBOR_PHASE}")" || return $?
   offload_baseline="$(phase_binding "${OFFLOAD_BASELINE_A}")" || return $?
   offload="$(phase_binding "${OFFLOAD_PHASE}")" || return $?
+  module_intent="$(phase_binding "${MODULE_INTENT_PHASE}")" || return $?
   module="$(phase_binding "${MODULE_PHASE}")" || return $?
   tested="$(phase_binding "${TESTED_PHASE}")" || return $?
   printf '%s\n' \
@@ -996,7 +1031,7 @@ render_cleanup_intent() {
     "veth_intent=${veth_intent}" "veth=${veth}" "address=${address}" \
     "route=${route}" "neighbor=${neighbor}" \
     "offload_baseline=${offload_baseline}" "offload=${offload}" \
-    "module=${module}" "tested=${tested}" \
+    "module_intent=${module_intent}" "module=${module}" "tested=${tested}" \
     'reverse=module,offload,neighbor,route,address,veth'
 }
 
@@ -1031,14 +1066,7 @@ ensure_cleanup_intent() {
 }
 
 restore_module() {
-  local fields
-  if [[ -d "/sys/module/${MODULE_NAME}" ]]; then
-    module_matches || fail 'restore-module-identity' 79
-    fields="$(/usr/bin/awk -v name="${MODULE_NAME}" '$1 == name {print $1 ":" $3}' /proc/modules)" || fail 'module-refcount-read'
-    [[ "${fields}" == "${MODULE_NAME}:0" ]] || fail 'module-refcount' 79
-    run_operation R1 module-unload || fail 'module-unload' $?
-  fi
-  [[ ! -d "/sys/module/${MODULE_NAME}" ]] || fail 'module-remains' 79
+  c8_checksum_module_restore R1 || fail 'module-lease-restore' $?
 }
 
 restore_offload() {
@@ -1144,17 +1172,40 @@ validate_dependency_caches_for_restore() {
   fi
 }
 
+validate_module_for_restore() {
+  local first="$1" state
+  state="$(c8_checksum_module_validate_restore_state)" || fail 'restore-module-state' $?
+  case "${state}" in
+    00-clean) ;;
+    00-intent-no-live | 10-unreceipted-live)
+      [[ "${first}" == module ]] || fail 'restore-module-unreceipted-order' 79
+      ;;
+    11-owned-live)
+      [[ "${first}" == none ]] || fail 'restore-module-owned-order' 79
+      ;;
+    01-owned-live-absent)
+      [[ "${first}" == none && -f "${CLEANUP_PHASE}" ]] ||
+        fail 'restore-module-owned-absent-before-cleanup' 79
+      ;;
+    00-restored)
+      [[ -f "${CLEANUP_PHASE}" && ("${first}" == module || "${first}" == none) ]] ||
+        fail 'restore-module-restored-order' 79
+      ;;
+    *) fail "restore-module-state-unknown:${state}" 79 ;;
+  esac
+}
+
 validate_partial_setup_for_restore() {
   local first names_present=1 baseline_sha existing live
   validate_dependency_caches_for_restore
   validate_runtime_temp_for_restore
   validate_receipt_prefix || fail 'restore-receipt-prefix' 79
   first="$(first_missing_receipt)" || fail 'restore-first-missing' $?
+  validate_module_for_restore "${first}"
 
   if [[ ! -e "${VETH_INTENT_PHASE}" && ! -L "${VETH_INTENT_PHASE}" ]]; then
     [[ "${first}" == veth ]] || fail 'restore-receipt-without-veth-intent' 79
     require_names_absent || fail 'restore-foreign-veth-without-intent' 79
-    [[ ! -d "/sys/module/${MODULE_NAME}" ]] || fail 'restore-module-without-veth-intent' 79
     existing="$(/usr/sbin/ip -4 -j address show to "${LOCAL_IPV4}/${PREFIX_BITS}")" || fail 'restore-address-without-intent-probe'
     [[ "${existing}" == '[]' ]] || fail 'restore-address-without-intent-drift' 79
     existing="$(/usr/sbin/ip -4 -j route show table all exact "${REMOTE_IPV4}/${PREFIX_BITS}")" || fail 'restore-route-without-intent-probe'
@@ -1253,20 +1304,12 @@ validate_partial_setup_for_restore() {
     fail 'restore-offload-phase-without-baseline' 79
   fi
 
-  if [[ -f "${MODULE_PHASE}" ]]; then
-    phase_matches "${MODULE_PHASE}" \
-      "$(render_fixed_phase module "module=${MODULE_NAME},sha256=${MODULE_SHA256},srcversion=${EXPECTED_MODULE_SRCVERSION}")" || fail 'restore-module-phase' 79
-  fi
-  if [[ -d "/sys/module/${MODULE_NAME}" ]]; then
-    module_matches || fail 'restore-module-foreign' 79
-    [[ -f "${MODULE_PHASE}" || "${first}" == module ]] || fail 'restore-module-out-of-order' 79
-  elif [[ -f "${MODULE_PHASE}" && ! -f "${CLEANUP_PHASE}" ]]; then
-    fail 'restore-module-live-missing' 79
-  fi
 }
 
 run_state_machine() {
   bootstrap_evidence
+  c8_checksum_module_acquire L0.run
+  configure_checksum_module_lease
   ensure_owner
   ensure_baseline
   [[ ! -f "${CLEANUP_PHASE}" && ! -f "${RESTORED_PHASE}" ]] || fail 'run-after-cleanup-intent' 79
@@ -1286,8 +1329,10 @@ run_state_machine() {
 }
 
 restore_state_machine() {
-  local restored
+  local restored module_state
   bootstrap_evidence
+  c8_checksum_module_acquire L0.restore
+  configure_checksum_module_lease
   ensure_owner
   [[ -f "${BASELINE_PHASE}" && -f "${OPERATION_PHASE}" ]] || fail 'restore-state-incomplete' 79
   ensure_baseline
@@ -1298,7 +1343,9 @@ restore_state_machine() {
     restored="$(render_fixed_phase restored 'result=restored,filesystem=retained')"
     phase_matches "${RESTORED_PHASE}" "${restored}" || fail 'restored-phase-drift' 79
     require_names_absent || fail 'restored-veth-drift' 79
-    [[ ! -d "/sys/module/${MODULE_NAME}" ]] || fail 'restored-module-drift' 79
+    module_state="$(c8_checksum_module_validate_restore_state)" || fail 'restored-module-state' $?
+    [[ "${module_state}" == 00-clean || "${module_state}" == 00-restored ]] ||
+      fail 'restored-module-drift' 79
     assert_bpf_links_baseline
     printf 'B82_ROUTED_VETH_ALREADY_RESTORED run_id=%s resource_id=%s evidence=%s\n' "${RUN_ID}" "${RESOURCE_ID}" "${EVIDENCE_ROOT}"
     return
@@ -1323,6 +1370,7 @@ main() {
     return
   fi
   verify_source_and_artifacts
+  load_checksum_module_helper
   case "${MODE}" in
     run) run_state_machine ;;
     restore) restore_state_machine ;;
