@@ -583,6 +583,30 @@ validate_artifact_receipt() {
   phase_matches "${ARTIFACT_PHASE}" "${expected}"
 }
 
+classify_artifact_retry_state() {
+  local intent_present=0 receipt_present=0
+  [[ ! -e "${ARTIFACT_INTENT_PHASE}" && ! -L "${ARTIFACT_INTENT_PHASE}" ]] || intent_present=1
+  [[ ! -e "${ARTIFACT_PHASE}" && ! -L "${ARTIFACT_PHASE}" ]] || receipt_present=1
+  if ((receipt_present)); then
+    ((intent_present)) || fail 'artifact-receipt-without-intent-preflight' 79
+    [[ -f "${ARTIFACT_INTENT_PHASE}" && ! -L "${ARTIFACT_INTENT_PHASE}" &&
+      -f "${ARTIFACT_PHASE}" && ! -L "${ARTIFACT_PHASE}" ]] ||
+      fail 'artifact-receipt-shape-preflight' 79
+    validate_artifact_receipt || fail 'artifact-receipt-drift-preflight' 79
+    return
+  fi
+  if ((intent_present)); then
+    [[ -f "${ARTIFACT_INTENT_PHASE}" && ! -L "${ARTIFACT_INTENT_PHASE}" ]] ||
+      fail 'artifact-intent-shape-preflight' 79
+    load_build_input_identity || fail 'artifact-intent-build-input-preflight' 79
+    phase_matches "${ARTIFACT_INTENT_PHASE}" "$(render_artifact_intent)" ||
+      fail 'artifact-intent-drift-preflight' 79
+    fail 'artifact-intent-without-receipt-preflight' 78
+  fi
+  [[ ! -e "${ARTIFACT_ROOT}" && ! -L "${ARTIFACT_ROOT}" ]] ||
+    fail 'artifact-root-without-intent-preflight' 79
+}
+
 ensure_artifacts() {
   load_build_input_identity || fail 'artifact-build-input-identity' $?
   if [[ -e "${ARTIFACT_PHASE}" || -L "${ARTIFACT_PHASE}" ]]; then
@@ -1518,6 +1542,7 @@ validate_partial_setup_for_restore() {
 }
 
 run_state_machine() {
+  classify_artifact_retry_state
   bootstrap_evidence
   c8_checksum_module_acquire L0.run
   ensure_owner
