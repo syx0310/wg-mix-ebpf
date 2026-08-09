@@ -1640,9 +1640,8 @@ func TestExperimentalFakeTCPRuntimeRejectsXDPBackendModeMismatchBeforeMutation(
 	t *testing.T,
 ) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	for index := range options.xdpRequests {
 		options.xdpRequests[index].Mode = fakeTCPXDPAttachLibXDP
 	}
@@ -1664,9 +1663,8 @@ func TestExperimentalFakeTCPRuntimeRefusesDirectAllHooksRequirementBeforeMutatio
 	t *testing.T,
 ) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	options.xdpRequirement = fakeTCPXDPRequireAllHooksExclusive
 	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
 	if runtime != nil || err == nil || !strings.Contains(err.Error(), "all-hooks exclusive activation") {
