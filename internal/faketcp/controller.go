@@ -24,41 +24,63 @@ type DecodedEvent struct {
 	Packet []byte
 }
 
+// borrowedDecodedEvent is valid only while its input sample remains owned by
+// the caller. Keeping this type private prevents the borrowed packet from
+// weakening DecodeEventSample's ownership contract.
+type borrowedDecodedEvent struct {
+	Event  abi.FakeTCPEvent
+	packet []byte
+}
+
 // DecodeEventSample accepts compact variable-size packet events and the
 // original fixed-size record for safe rolling upgrades. NEED_HANDSHAKE and
 // destructive RST/FIN events must carry their complete L3 packet: metadata is
 // never sufficient to release a packet or authorize session teardown.
 func DecodeEventSample(sample []byte) (DecodedEvent, error) {
+	decoded, err := decodeBorrowedEventSample(sample)
+	if err != nil {
+		return DecodedEvent{}, err
+	}
+	return DecodedEvent{
+		Event:  decoded.Event,
+		Packet: append([]byte(nil), decoded.packet...),
+	}, nil
+}
+
+// decodeBorrowedEventSample applies the same validation as DecodeEventSample
+// without copying the packet. Callers must not retain packet after the input
+// sample's ownership ends.
+func decodeBorrowedEventSample(sample []byte) (borrowedDecodedEvent, error) {
 	if len(sample) < fakeTCPEventSize {
-		return DecodedEvent{}, fmt.Errorf("faketcp event sample has %d bytes, need at least %d", len(sample), fakeTCPEventSize)
+		return borrowedDecodedEvent{}, fmt.Errorf("faketcp event sample has %d bytes, need at least %d", len(sample), fakeTCPEventSize)
 	}
 	event := decodeEventHeader(sample[:fakeTCPEventSize])
 	if err := validateEventType(event); err != nil {
-		return DecodedEvent{}, err
+		return borrowedDecodedEvent{}, err
 	}
 
 	if !fakeTCPEventCarriesPacket(event.Type) {
 		if event.PacketLength != 0 || len(sample) != fakeTCPEventSize {
-			return DecodedEvent{}, fmt.Errorf("faketcp control event type %d has packet length %d and sample size %d", event.Type, event.PacketLength, len(sample))
+			return borrowedDecodedEvent{}, fmt.Errorf("faketcp control event type %d has packet length %d and sample size %d", event.Type, event.PacketLength, len(sample))
 		}
-		return DecodedEvent{Event: event}, nil
+		return borrowedDecodedEvent{Event: event}, nil
 	}
 
 	packetLength := int(event.PacketLength)
 	if packetLength <= 0 || packetLength > abi.FakeTCPMaxCapturedPacket {
-		return DecodedEvent{}, fmt.Errorf("faketcp captured packet length %d is invalid", packetLength)
+		return borrowedDecodedEvent{}, fmt.Errorf("faketcp captured packet length %d is invalid", packetLength)
 	}
 	compactSize := fakeTCPEventSize + packetLength
 	if len(sample) != compactSize && len(sample) != fakeTCPPacketEventSize {
-		return DecodedEvent{}, fmt.Errorf("faketcp packet event sample has %d bytes, want compact %d or fixed %d", len(sample), compactSize, fakeTCPPacketEventSize)
+		return borrowedDecodedEvent{}, fmt.Errorf("faketcp packet event sample has %d bytes, want compact %d or fixed %d", len(sample), compactSize, fakeTCPPacketEventSize)
 	}
-	packet := append([]byte(nil), sample[fakeTCPEventSize:compactSize]...)
+	packet := sample[fakeTCPEventSize:compactSize]
 	if event.Type == abi.FakeTCPEventNeedHandshake {
 		if err := validateCapturedIPv4UDP(event, packet); err != nil {
-			return DecodedEvent{}, err
+			return borrowedDecodedEvent{}, err
 		}
 	}
-	return DecodedEvent{Event: event, Packet: packet}, nil
+	return borrowedDecodedEvent{Event: event, packet: packet}, nil
 }
 
 func fakeTCPEventCarriesPacket(eventType uint8) bool {
