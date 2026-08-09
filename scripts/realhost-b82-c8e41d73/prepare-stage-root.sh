@@ -19,6 +19,8 @@ readonly BINDING_MARKER="${STAGE_ROOT}/binding.v1"
 readonly MODULE_LEASE_LOCK="${STAGE_ROOT}/checksum-module-lease.v1.lock"
 readonly PHYSICAL_INTERFACE_LOCK='/run/wg-mix-ebpf-realnic-physical-interface.v1.lock'
 readonly PHYSICAL_INTERFACE_LOCK_INTERFACE='ens33'
+readonly LEGACY_RETIREMENT_RESERVATION="${STAGE_ROOT}/realhost-v6-6bd913ac"
+readonly LEGACY_RETIREMENT_RESERVATION_SHAPE='root:root:600:1:0:regular file'
 readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-${RUN_ID}/checksum-module-lease.sh"
 readonly EXPECTED_HOSTNAME='ubuntu-2604-test'
 readonly EXPECTED_KERNEL='7.0.0-28-generic'
@@ -69,6 +71,7 @@ PREPARE_SHA256=''
 PROVISION_PATH=''
 PROVISION_BLOB=''
 PROVISION_SHA256=''
+PHYSICAL_INTERFACE_LOCK_FD=''
 
 fail() {
   printf 'B82_V6_STAGE_STOP mode=%s reason=%s rc=%s snapshot=%s stage=%s; retained=1\n' \
@@ -270,6 +273,12 @@ render_plan() {
     "${PHYSICAL_INTERFACE_LOCK}" "${PHYSICAL_INTERFACE_LOCK_INTERFACE}"
   plan_command S3.physical-lock /usr/bin/flock --exclusive --nonblock \
     --conflict-exit-code 78 "${PHYSICAL_INTERFACE_LOCK}" /usr/bin/true
+  plan_command S3.physical-lock-hold /usr/bin/flock --exclusive --nonblock \
+    --conflict-exit-code 78 PHYSICAL_INTERFACE_LOCK_FD
+  printf 'B82_V6_LEGACY_RETIREMENT_RESERVATION path=%s shape=root:root:600:1:0:regular-file creator=root-stager-O_CREAT|O_EXCL existing=reject-retain\n' \
+    "${LEGACY_RETIREMENT_RESERVATION}"
+  plan_command S3.legacy-reservation shell-builtin noclobber-o-excl-create \
+    "${LEGACY_RETIREMENT_RESERVATION}"
   plan_command S3.lock /usr/bin/install --owner=root --group=root --mode=0600 \
     --no-target-directory -- /dev/null "${MODULE_LEASE_LOCK}"
   plan_command S4 /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
@@ -426,6 +435,8 @@ write_binding_marker() {
       "wg_state=${WG_STATE}" \
       "physical_interface_lock=${PHYSICAL_INTERFACE_LOCK}" \
       "physical_interface_lock_interface=${PHYSICAL_INTERFACE_LOCK_INTERFACE}" \
+      "legacy_retirement_reservation=${LEGACY_RETIREMENT_RESERVATION}" \
+      "legacy_retirement_reservation_shape=${LEGACY_RETIREMENT_RESERVATION_SHAPE}" \
       "module_lease_lock=${MODULE_LEASE_LOCK}" >"${BINDING_MARKER}")
 }
 
@@ -435,12 +446,38 @@ require_physical_interface_lock() {
     'root:root:600:1:0:regular file' ]]
 }
 
-ensure_physical_interface_lock() {
+acquire_physical_interface_lock() {
+  local descriptor_identity path_identity
   if [[ ! -e "${PHYSICAL_INTERFACE_LOCK}" && ! -L "${PHYSICAL_INTERFACE_LOCK}" ]]; then
     run_step S3.physical-lock /usr/bin/flock --exclusive --nonblock \
       --conflict-exit-code 78 "${PHYSICAL_INTERFACE_LOCK}" /usr/bin/true || return $?
   fi
-  require_physical_interface_lock
+  require_physical_interface_lock || return $?
+  exec {PHYSICAL_INTERFACE_LOCK_FD}<>"${PHYSICAL_INTERFACE_LOCK}" || return 79
+  descriptor_identity="$(/usr/bin/stat -Lc '%d:%i' -- \
+    "/proc/self/fd/${PHYSICAL_INTERFACE_LOCK_FD}")" || return 79
+  path_identity="$(/usr/bin/stat -Lc '%d:%i' -- "${PHYSICAL_INTERFACE_LOCK}")" || return 79
+  [[ "${descriptor_identity}" == "${path_identity}" ]] || return 79
+  run_step S3.physical-lock-hold /usr/bin/flock --exclusive --nonblock \
+    --conflict-exit-code 78 "${PHYSICAL_INTERFACE_LOCK_FD}" || return $?
+  require_physical_interface_lock || return $?
+  [[ "$(/usr/bin/stat -Lc '%d:%i' -- "${PHYSICAL_INTERFACE_LOCK}")" == \
+    "${descriptor_identity}" ]]
+}
+
+create_legacy_retirement_reservation() {
+  [[ ! -e "${LEGACY_RETIREMENT_RESERVATION}" && \
+    ! -L "${LEGACY_RETIREMENT_RESERVATION}" ]] || return 73
+  (umask 077
+    set -o noclobber
+    : >"${LEGACY_RETIREMENT_RESERVATION}")
+}
+
+require_legacy_retirement_reservation() {
+  [[ -f "${LEGACY_RETIREMENT_RESERVATION}" && \
+    ! -L "${LEGACY_RETIREMENT_RESERVATION}" ]] || return 79
+  [[ "$(/usr/bin/stat -Lc '%U:%G:%a:%h:%s:%F' -- \
+    "${LEGACY_RETIREMENT_RESERVATION}")" == "${LEGACY_RETIREMENT_RESERVATION_SHAPE}" ]]
 }
 
 require_module_lease_lock() {
@@ -462,7 +499,10 @@ run_stage() {
   fi
   [[ ! -e "${STAGE_ROOT}" && ! -L "${STAGE_ROOT}" ]] || fail 'stage-exists' 73
   run_step S3 /usr/bin/mkdir --mode=0700 -- "${STAGE_ROOT}" || fail 'stage-create' $?
-  ensure_physical_interface_lock || fail 'physical-interface-lock' $?
+  acquire_physical_interface_lock || fail 'physical-interface-lock' $?
+  run_step S3.legacy-reservation create_legacy_retirement_reservation ||
+    fail 'legacy-retirement-reservation-create' $?
+  require_legacy_retirement_reservation || fail 'legacy-retirement-reservation-shape' $?
   run_step S3.lock /usr/bin/install --owner=root --group=root --mode=0600 \
     --no-target-directory -- /dev/null "${MODULE_LEASE_LOCK}" || fail 'module-lease-lock-create' $?
   require_module_lease_lock || fail 'module-lease-lock-shape' $?
@@ -494,6 +534,7 @@ run_stage() {
   stage_status="$(git_stage -C "${EXPECTED_SOURCE}" status --porcelain=v1 --untracked-files=all)" || fail 'stage-status'
   [[ -z "${stage_status}" ]] || fail 'stage-dirty' 79
   require_physical_interface_lock || fail 'physical-interface-lock-drift' $?
+  require_legacy_retirement_reservation || fail 'legacy-retirement-reservation-drift' $?
   require_module_lease_lock || fail 'module-lease-lock-drift' $?
   write_binding_marker || fail 'binding-marker' $?
   printf 'B82_V6_STAGE_COMPLETE run_id=%s commit=%s source=%s binding=%s\n' \

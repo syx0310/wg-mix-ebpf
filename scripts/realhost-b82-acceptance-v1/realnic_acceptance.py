@@ -11,12 +11,10 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import fcntl
-import grp
 import hashlib
 import ipaddress
 import json
 import os
-import pwd
 import re
 import signal
 import stat
@@ -38,19 +36,9 @@ RUN_ROOT_PREFIX = "/run/wg-mix-ebpf-realnic-acceptance-"
 PHYSICAL_INTERFACE_LOCK_BASENAME = "wg-mix-ebpf-realnic-physical-interface.v1.lock"
 PHYSICAL_INTERFACE_LOCK_UID = 0
 PHYSICAL_INTERFACE_LOCK_GID = 0
-LEGACY_RUN_ID = "c8e41d73"
-LEGACY_PACKAGE_ID = "4f2a9b61"
-LEGACY_EVIDENCE_ID = "6bd913ac"
-LEGACY_SOURCE = f"/run/wg-mix-ebpf-source-stages/{LEGACY_RUN_ID}/source"
-LEGACY_EVIDENCE_ROOT = (
-    f"/run/wg-mix-ebpf-source-stages/{LEGACY_RUN_ID}/realhost-v6-{LEGACY_EVIDENCE_ID}"
+LEGACY_RETIREMENT_RESERVATION = (
+    "/run/wg-mix-ebpf-source-stages/c8e41d73/realhost-v6-6bd913ac"
 )
-LEGACY_BUNDLE = (
-    f"/home/siyixuan/wg-mix-ebpf-test/unpriv-{LEGACY_PACKAGE_ID}/"
-    f"source-{LEGACY_PACKAGE_ID}.bundle"
-)
-LEGACY_BUNDLE_USER = "siyixuan"
-LEGACY_BUNDLE_GROUP = "siyixuan"
 RUN_ID_RE = re.compile(r"^[0-9a-f]{8,32}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -60,14 +48,12 @@ MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
-UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 
 TOOLS = {
     "bpftool": "/usr/sbin/bpftool",
     "cat": "/usr/bin/cat",
     "env": "/usr/bin/env",
     "ethtool": "/usr/sbin/ethtool",
-    "git": "/usr/bin/git",
     "hostname": "/usr/bin/hostname",
     "ip": "/usr/sbin/ip",
     "iperf3": "/usr/bin/iperf3",
@@ -998,70 +984,26 @@ def physical_interface_lock_contract(
     }
 
 
-def legacy_git_argv(*arguments: str) -> list[str]:
-    return [
-        TOOLS["env"],
-        "-i",
-        "PATH=/usr/bin:/bin",
-        "LC_ALL=C",
-        "GIT_CONFIG_GLOBAL=/dev/null",
-        "GIT_CONFIG_NOSYSTEM=1",
-        "GIT_NO_REPLACE_OBJECTS=1",
-        "GIT_OPTIONAL_LOCKS=0",
-        TOOLS["git"],
-        "--no-pager",
-        "--no-replace-objects",
-        "-c",
-        "core.attributesFile=/dev/null",
-        "-c",
-        "core.fsmonitor=false",
-        "-c",
-        "core.hooksPath=/dev/null",
-        *arguments,
-    ]
-
-
-def legacy_authority_contract(spec: CoreSpec) -> dict[str, Any]:
+def legacy_retirement_contract() -> dict[str, Any]:
     return {
-        "evidence_root": LEGACY_EVIDENCE_ROOT,
-        "owner": f"{LEGACY_EVIDENCE_ROOT}/owner.v1",
-        "bundle": LEGACY_BUNDLE,
-        "bundle_shape": "siyixuan:siyixuan:0600:single-link-regular",
-        "terminal_markers": [
-            f"{LEGACY_EVIDENCE_ROOT}/completed.v1",
-            f"{LEGACY_EVIDENCE_ROOT}/restored.v1",
-        ],
-        "required_state_for_new_run": "absent-or-verified-terminal",
-        "expected_owner": {
-            "format": "wg-mix-ebpf-realhost-v6-owner-v1",
-            "run_id": LEGACY_RUN_ID,
-            "package_id": LEGACY_PACKAGE_ID,
-            "evidence_id": LEGACY_EVIDENCE_ID,
-            "commit": "retained-owner-40hex",
-            "boot_id": spec.expected_boot_id,
-            "source": LEGACY_SOURCE,
-            "interface": PHYSICAL_INTERFACE,
-            "bundle_sha256": "recompute-and-match-owner",
+        "path": LEGACY_RETIREMENT_RESERVATION,
+        "metadata": {
+            "uid": PHYSICAL_INTERFACE_LOCK_UID,
+            "gid": PHYSICAL_INTERFACE_LOCK_GID,
+            "mode": "0600",
+            "nlink": 1,
+            "size": 0,
+            "type": "regular-file",
         },
-        "retained_source": {
-            "head": legacy_git_argv("-C", LEGACY_SOURCE, "rev-parse", "--verify", "HEAD^{commit}"),
-            "clean": legacy_git_argv(
-                "-C",
-                LEGACY_SOURCE,
-                "status",
-                "--porcelain=v1",
-                "--untracked-files=all",
-                "--ignore-submodules=none",
-            ),
-            "bundle_heads": legacy_git_argv("bundle", "list-heads", LEGACY_BUNDLE),
-            "required_relation": "owner-commit-equals-source-head-and-one-bundle-head",
-        },
+        "creator": "root-stager-o-creat-o-excl",
+        "accepted_state": "exact-empty-sentinel-only",
+        "legacy_forward_authority": "retired-before-final-staging",
     }
 
 
-def validate_legacy_authority_contract(value: Any, spec: CoreSpec) -> None:
-    if value != legacy_authority_contract(spec):
-        raise HarnessError("approved plan legacy authority gate is not exact")
+def validate_legacy_retirement_contract(value: Any) -> None:
+    if value != legacy_retirement_contract():
+        raise HarnessError("approved plan legacy retirement reservation is not exact")
 
 
 def write_guard_command_table(spec: CoreSpec) -> list[tuple[str, list[str]]]:
@@ -2006,7 +1948,7 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         "baseline": snapshot,
         "traffic_oracle": traffic_oracle,
         "physical_interface_lock": physical_interface_lock_contract(spec, snapshot),
-        "legacy_physical_authority": legacy_authority_contract(spec),
+        "legacy_retirement_reservation": legacy_retirement_contract(),
         "interface_lease": {
             "path": lease_path,
             "identity": identity,
@@ -2048,7 +1990,7 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
             "shell_evaluation": False,
             "run_requires_exact_plan_sha256": True,
             "physical_interface_lock_is_outermost": True,
-            "legacy_nonterminal_evidence_blocks_new_run": True,
+            "legacy_forward_authority_retired": True,
             "restore_is_a_separate_explicit_action": True,
             "artifacts_are_retained": True,
         },
@@ -2120,16 +2062,14 @@ def execute_with_physical_authority(
     approved_sha256: str | None = None,
 ) -> int:
     with PhysicalInterfaceLock(physical_interface_lock_path()):
+        validate_legacy_retirement_reservation()
         if mode == "plan":
-            validate_legacy_physical_authority(spec, runner)
             snapshot, commands = collect_snapshot(spec, runner)
             sys.stdout.buffer.write(canonical_json(build_plan(spec, snapshot, commands)))
             return 0
         if mode not in {"run", "restore"} or approved_plan is None or approved_sha256 is None:
             raise HarnessError("physical authority mode arguments are incomplete")
         plan, plan_payload = read_approved_plan(approved_plan, approved_sha256, spec)
-        if mode == "run":
-            validate_legacy_physical_authority(spec, runner)
         lease_contract = plan["interface_lease"]
         with InterfaceLease(
             lease_contract["path"],
@@ -2224,7 +2164,7 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
     expected_identity = lease_identity(spec, baseline)
     if plan.get("physical_interface_lock") != physical_interface_lock_contract(spec, baseline):
         raise HarnessError("approved plan physical interface lock contract is not exact")
-    validate_legacy_authority_contract(plan.get("legacy_physical_authority"), spec)
+    validate_legacy_retirement_contract(plan.get("legacy_retirement_reservation"))
     expected_lease_path = interface_lease_path(spec, expected_identity["netns"])
     expected_guard = [
         {"label": label, "argv": argv, "timeout_seconds": 20, "write_set": []}
@@ -2499,12 +2439,17 @@ def read_regular_file(path: str, maximum: int = 16 << 20) -> bytes:
         os.close(descriptor)
 
 
-def read_legacy_root_file(path: str, maximum: int = 1 << 20) -> bytes:
+def validate_legacy_retirement_reservation() -> None:
+    path = LEGACY_RETIREMENT_RESERVATION
+    if not os.path.isabs(path) or os.path.normpath(path) != path:
+        raise HarnessError("legacy retirement reservation path is not canonical")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
     except OSError as exc:
-        raise HarnessError(f"legacy evidence open failed for {path}: {exc}") from exc
+        raise HarnessError(
+            "legacy retirement reservation is absent or cannot be opened; root stager must create it"
+        ) from exc
     try:
         metadata = os.fstat(descriptor)
         if (
@@ -2513,234 +2458,19 @@ def read_legacy_root_file(path: str, maximum: int = 1 << 20) -> bytes:
             or stat.S_IMODE(metadata.st_mode) != 0o600
             or metadata.st_uid != PHYSICAL_INTERFACE_LOCK_UID
             or metadata.st_gid != PHYSICAL_INTERFACE_LOCK_GID
-            or metadata.st_size > maximum
+            or metadata.st_size != 0
         ):
-            raise HarnessError(f"legacy evidence has an invalid root-owned shape: {path}")
-        payload = b""
-        while len(payload) < metadata.st_size:
-            chunk = os.read(descriptor, min(metadata.st_size - len(payload), 1 << 20))
-            if not chunk:
-                raise HarnessError(f"legacy evidence was truncated while reading: {path}")
-            payload += chunk
-        return payload
-    finally:
-        os.close(descriptor)
-
-
-def canonical_metadata(path: str, label: str) -> os.stat_result:
-    if os.path.normpath(path) != path or os.path.realpath(path) != path:
-        raise HarnessError(f"{label} is not the canonical fixed path")
-    try:
-        return os.lstat(path)
-    except OSError as exc:
-        raise HarnessError(f"{label} metadata read failed: {exc}") from exc
-
-
-def sha256_legacy_bundle(path: str) -> str:
-    path_metadata = canonical_metadata(path, "legacy bundle")
-    try:
-        owner = pwd.getpwuid(path_metadata.st_uid).pw_name
-        group = grp.getgrgid(path_metadata.st_gid).gr_name
-    except KeyError as exc:
-        raise HarnessError("legacy bundle owner or group is unknown") from exc
-    if (
-        not stat.S_ISREG(path_metadata.st_mode)
-        or path_metadata.st_nlink != 1
-        or stat.S_IMODE(path_metadata.st_mode) != 0o600
-        or owner != LEGACY_BUNDLE_USER
-        or group != LEGACY_BUNDLE_GROUP
-        or not 0 < path_metadata.st_size <= 4 << 30
-    ):
-        raise HarnessError("legacy bundle has an invalid siyixuan:siyixuan 0600 shape")
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-    except OSError as exc:
-        raise HarnessError(f"legacy bundle open failed: {exc}") from exc
-    digest = hashlib.sha256()
-    try:
-        metadata = os.fstat(descriptor)
-        if (metadata.st_dev, metadata.st_ino) != (path_metadata.st_dev, path_metadata.st_ino):
-            raise HarnessError("legacy bundle changed while opening")
-        remaining = metadata.st_size
-        while remaining:
-            chunk = os.read(descriptor, min(remaining, 1 << 20))
-            if not chunk:
-                raise HarnessError("legacy bundle was truncated while hashing")
-            digest.update(chunk)
-            remaining -= len(chunk)
+            raise HarnessError(
+                "legacy retirement reservation must be the staged root:root 0600 empty single-link file"
+            )
         current = os.lstat(path)
         if stat.S_ISLNK(current.st_mode) or (current.st_dev, current.st_ino) != (
             metadata.st_dev,
             metadata.st_ino,
         ):
-            raise HarnessError("legacy bundle path changed while hashing")
+            raise HarnessError("legacy retirement reservation path changed while validating")
     finally:
         os.close(descriptor)
-    return digest.hexdigest()
-
-
-def parse_ordered_key_file(
-    payload: bytes,
-    keys: Sequence[str],
-    label: str,
-) -> dict[str, str]:
-    try:
-        text = payload.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise HarnessError(f"{label} is not UTF-8") from exc
-    if not text.endswith("\n") or "\r" in text or "\x00" in text:
-        raise HarnessError(f"{label} is not canonical line evidence")
-    lines = text[:-1].split("\n")
-    if len(lines) != len(keys):
-        raise HarnessError(f"{label} has an unexpected field count")
-    result: dict[str, str] = {}
-    for expected, line in zip(keys, lines, strict=True):
-        key, separator, value = line.partition("=")
-        if key != expected or separator != "=" or not value:
-            raise HarnessError(f"{label} field order or value is invalid")
-        result[key] = value
-    return result
-
-
-def capture_legacy_git(
-    runner: CommandRunner,
-    argv: Sequence[str],
-    label: str,
-) -> bytes:
-    rc, stdout, stderr = runner.capture(argv, timeout=20)
-    if rc != 0:
-        detail = stderr.decode("utf-8", "replace").strip()
-        raise HarnessError(f"legacy {label} failed rc={rc}: {detail}")
-    return stdout
-
-
-def validate_legacy_physical_authority(spec: CoreSpec, runner: CommandRunner) -> None:
-    if not os.path.lexists(LEGACY_EVIDENCE_ROOT):
-        return
-    root = os.lstat(LEGACY_EVIDENCE_ROOT)
-    if (
-        not stat.S_ISDIR(root.st_mode)
-        or stat.S_ISLNK(root.st_mode)
-        or stat.S_IMODE(root.st_mode) != 0o700
-        or root.st_uid != PHYSICAL_INTERFACE_LOCK_UID
-        or root.st_gid != PHYSICAL_INTERFACE_LOCK_GID
-    ):
-        raise HarnessError("legacy physical evidence root has an invalid root-owned shape")
-    owner = parse_ordered_key_file(
-        read_legacy_root_file(f"{LEGACY_EVIDENCE_ROOT}/owner.v1"),
-        (
-            "format",
-            "run_id",
-            "package_id",
-            "evidence_id",
-            "commit",
-            "bundle_sha256",
-            "boot_id",
-            "source",
-            "interface",
-        ),
-        "legacy owner",
-    )
-    if (
-        owner["format"] != "wg-mix-ebpf-realhost-v6-owner-v1"
-        or owner["run_id"] != LEGACY_RUN_ID
-        or owner["package_id"] != LEGACY_PACKAGE_ID
-        or owner["evidence_id"] != LEGACY_EVIDENCE_ID
-        or owner["boot_id"] != spec.expected_boot_id
-        or owner["source"] != LEGACY_SOURCE
-        or owner["interface"] != spec.interface
-    ):
-        raise HarnessError("legacy owner identity does not match this host/interface/commit")
-    nontrivial_hex(owner["commit"], COMMIT_RE, "legacy owner commit")
-    nontrivial_hex(owner["bundle_sha256"], SHA256_RE, "legacy owner bundle sha256")
-    if sha256_legacy_bundle(LEGACY_BUNDLE) != owner["bundle_sha256"]:
-        raise HarnessError("legacy owner bundle SHA-256 does not match the retained bundle")
-    source = canonical_metadata(LEGACY_SOURCE, "legacy retained source")
-    if (
-        not stat.S_ISDIR(source.st_mode)
-        or stat.S_ISLNK(source.st_mode)
-        or stat.S_IMODE(source.st_mode) != 0o700
-        or source.st_uid != PHYSICAL_INTERFACE_LOCK_UID
-        or source.st_gid != PHYSICAL_INTERFACE_LOCK_GID
-    ):
-        raise HarnessError("legacy retained source has an invalid root-owned shape")
-    source_head = single_line(
-        capture_legacy_git(
-            runner,
-            legacy_git_argv("-C", LEGACY_SOURCE, "rev-parse", "--verify", "HEAD^{commit}"),
-            "source HEAD",
-        ),
-        "legacy source HEAD",
-    )
-    if source_head != owner["commit"]:
-        raise HarnessError("legacy owner commit does not match the retained source HEAD")
-    if capture_legacy_git(
-        runner,
-        legacy_git_argv(
-            "-C",
-            LEGACY_SOURCE,
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=all",
-            "--ignore-submodules=none",
-        ),
-        "source status",
-    ):
-        raise HarnessError("legacy retained source is dirty")
-    bundle_heads = capture_legacy_git(
-        runner,
-        legacy_git_argv("bundle", "list-heads", LEGACY_BUNDLE),
-        "bundle heads",
-    )
-    try:
-        parsed_heads = [line.split(" ", 1) for line in bundle_heads.decode("utf-8").splitlines()]
-    except UnicodeDecodeError as exc:
-        raise HarnessError("legacy bundle heads are not UTF-8") from exc
-    if (
-        len(parsed_heads) != 1
-        or any(
-            len(item) != 2
-            or not COMMIT_RE.fullmatch(item[0])
-            or not item[1].startswith("refs/heads/")
-            for item in parsed_heads
-        )
-        or parsed_heads[0][0] != owner["commit"]
-    ):
-        raise HarnessError("legacy retained bundle does not expose the owner commit as a branch head")
-
-    markers: list[str] = []
-    completed_path = f"{LEGACY_EVIDENCE_ROOT}/completed.v1"
-    restored_path = f"{LEGACY_EVIDENCE_ROOT}/restored.v1"
-    if os.path.lexists(completed_path):
-        completed = parse_ordered_key_file(
-            read_legacy_root_file(completed_path),
-            ("run_id", "commit", "state", "utc"),
-            "legacy completed marker",
-        )
-        if (
-            completed["run_id"] != LEGACY_RUN_ID
-            or completed["commit"] != owner["commit"]
-            or completed["state"] != "complete"
-            or not UTC_RE.fullmatch(completed["utc"])
-        ):
-            raise HarnessError("legacy completed marker is invalid")
-        markers.append("completed")
-    if os.path.lexists(restored_path):
-        restored = parse_ordered_key_file(
-            read_legacy_root_file(restored_path),
-            ("run_id", "state", "utc"),
-            "legacy restored marker",
-        )
-        if (
-            restored["run_id"] != LEGACY_RUN_ID
-            or restored["state"] != "restored"
-            or not UTC_RE.fullmatch(restored["utc"])
-        ):
-            raise HarnessError("legacy restored marker is invalid")
-        markers.append("restored")
-    if not markers:
-        raise HarnessError("legacy physical evidence is nonterminal; run its exact restore entry first")
 
 
 class Journal:
@@ -4116,7 +3846,7 @@ def run_with_interface_lease(
         "interface_lease_path": lease.path,
         "interface_lease_identity": lease.expected_identity,
         "physical_interface_lock": plan["physical_interface_lock"],
-        "legacy_physical_authority": legacy_authority_contract(spec),
+        "legacy_retirement_reservation": legacy_retirement_contract(),
         "run_root_identity": run_root_identity,
     }
     write_exclusive(f"{spec.run_root}/owner.json", canonical_json(owner))
@@ -4255,7 +3985,8 @@ def restore_with_interface_lease(
         or owner.get("interface_lease_path") != lease.path
         or owner.get("interface_lease_identity") != lease.expected_identity
         or owner.get("physical_interface_lock") != plan["physical_interface_lock"]
-        or owner.get("legacy_physical_authority") != plan["legacy_physical_authority"]
+        or owner.get("legacy_retirement_reservation")
+        != plan["legacy_retirement_reservation"]
     ):
         raise HarnessError("run owner marker does not match restore argv")
     validate_run_root_identity(spec, owner.get("run_root_identity", {}))
