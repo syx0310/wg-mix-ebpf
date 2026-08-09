@@ -61,7 +61,9 @@ UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 TOOLS = {
     "bpftool": "/usr/sbin/bpftool",
     "cat": "/usr/bin/cat",
+    "env": "/usr/bin/env",
     "ethtool": "/usr/sbin/ethtool",
+    "git": "/usr/bin/git",
     "hostname": "/usr/bin/hostname",
     "ip": "/usr/sbin/ip",
     "iperf3": "/usr/bin/iperf3",
@@ -992,6 +994,29 @@ def physical_interface_lock_contract(
     }
 
 
+def legacy_git_argv(*arguments: str) -> list[str]:
+    return [
+        TOOLS["env"],
+        "-i",
+        "PATH=/usr/bin:/bin",
+        "LC_ALL=C",
+        "GIT_CONFIG_GLOBAL=/dev/null",
+        "GIT_CONFIG_NOSYSTEM=1",
+        "GIT_NO_REPLACE_OBJECTS=1",
+        "GIT_OPTIONAL_LOCKS=0",
+        TOOLS["git"],
+        "--no-pager",
+        "--no-replace-objects",
+        "-c",
+        "core.attributesFile=/dev/null",
+        "-c",
+        "core.fsmonitor=false",
+        "-c",
+        "core.hooksPath=/dev/null",
+        *arguments,
+    ]
+
+
 def legacy_authority_contract(spec: CoreSpec) -> dict[str, Any]:
     return {
         "evidence_root": LEGACY_EVIDENCE_ROOT,
@@ -1007,11 +1032,24 @@ def legacy_authority_contract(spec: CoreSpec) -> dict[str, Any]:
             "run_id": LEGACY_RUN_ID,
             "package_id": LEGACY_PACKAGE_ID,
             "evidence_id": LEGACY_EVIDENCE_ID,
-            "commit": spec.source_commit,
+            "commit": "retained-owner-40hex",
             "boot_id": spec.expected_boot_id,
             "source": LEGACY_SOURCE,
             "interface": PHYSICAL_INTERFACE,
             "bundle_sha256": "recompute-and-match-owner",
+        },
+        "retained_source": {
+            "head": legacy_git_argv("-C", LEGACY_SOURCE, "rev-parse", "--verify", "HEAD^{commit}"),
+            "clean": legacy_git_argv(
+                "-C",
+                LEGACY_SOURCE,
+                "status",
+                "--porcelain=v1",
+                "--untracked-files=all",
+                "--ignore-submodules=none",
+            ),
+            "bundle_heads": legacy_git_argv("bundle", "list-heads", LEGACY_BUNDLE),
+            "required_relation": "owner-commit-equals-source-head-and-one-bundle-head",
         },
     }
 
@@ -2078,7 +2116,7 @@ def execute_with_physical_authority(
 ) -> int:
     with PhysicalInterfaceLock(physical_interface_lock_path()):
         if mode == "plan":
-            validate_legacy_physical_authority(spec)
+            validate_legacy_physical_authority(spec, runner)
             snapshot, commands = collect_snapshot(spec, runner)
             sys.stdout.buffer.write(canonical_json(build_plan(spec, snapshot, commands)))
             return 0
@@ -2086,7 +2124,7 @@ def execute_with_physical_authority(
             raise HarnessError("physical authority mode arguments are incomplete")
         plan, plan_payload = read_approved_plan(approved_plan, approved_sha256, spec)
         if mode == "run":
-            validate_legacy_physical_authority(spec)
+            validate_legacy_physical_authority(spec, runner)
         lease_contract = plan["interface_lease"]
         with InterfaceLease(
             lease_contract["path"],
@@ -2541,7 +2579,19 @@ def parse_ordered_key_file(
     return result
 
 
-def validate_legacy_physical_authority(spec: CoreSpec) -> None:
+def capture_legacy_git(
+    runner: CommandRunner,
+    argv: Sequence[str],
+    label: str,
+) -> bytes:
+    rc, stdout, stderr = runner.capture(argv, timeout=20)
+    if rc != 0:
+        detail = stderr.decode("utf-8", "replace").strip()
+        raise HarnessError(f"legacy {label} failed rc={rc}: {detail}")
+    return stdout
+
+
+def validate_legacy_physical_authority(spec: CoreSpec, runner: CommandRunner) -> None:
     if not os.path.lexists(LEGACY_EVIDENCE_ROOT):
         return
     root = os.lstat(LEGACY_EVIDENCE_ROOT)
@@ -2573,7 +2623,6 @@ def validate_legacy_physical_authority(spec: CoreSpec) -> None:
         or owner["run_id"] != LEGACY_RUN_ID
         or owner["package_id"] != LEGACY_PACKAGE_ID
         or owner["evidence_id"] != LEGACY_EVIDENCE_ID
-        or owner["commit"] != spec.source_commit
         or owner["boot_id"] != spec.expected_boot_id
         or owner["source"] != LEGACY_SOURCE
         or owner["interface"] != spec.interface
@@ -2583,6 +2632,58 @@ def validate_legacy_physical_authority(spec: CoreSpec) -> None:
     nontrivial_hex(owner["bundle_sha256"], SHA256_RE, "legacy owner bundle sha256")
     if sha256_legacy_bundle(LEGACY_BUNDLE) != owner["bundle_sha256"]:
         raise HarnessError("legacy owner bundle SHA-256 does not match the retained bundle")
+    source = os.lstat(LEGACY_SOURCE)
+    if (
+        not stat.S_ISDIR(source.st_mode)
+        or stat.S_ISLNK(source.st_mode)
+        or stat.S_IMODE(source.st_mode) != 0o700
+        or source.st_uid != PHYSICAL_INTERFACE_LOCK_UID
+        or source.st_gid != PHYSICAL_INTERFACE_LOCK_GID
+    ):
+        raise HarnessError("legacy retained source has an invalid root-owned shape")
+    source_head = single_line(
+        capture_legacy_git(
+            runner,
+            legacy_git_argv("-C", LEGACY_SOURCE, "rev-parse", "--verify", "HEAD^{commit}"),
+            "source HEAD",
+        ),
+        "legacy source HEAD",
+    )
+    if source_head != owner["commit"]:
+        raise HarnessError("legacy owner commit does not match the retained source HEAD")
+    if capture_legacy_git(
+        runner,
+        legacy_git_argv(
+            "-C",
+            LEGACY_SOURCE,
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+        ),
+        "source status",
+    ):
+        raise HarnessError("legacy retained source is dirty")
+    bundle_heads = capture_legacy_git(
+        runner,
+        legacy_git_argv("bundle", "list-heads", LEGACY_BUNDLE),
+        "bundle heads",
+    )
+    try:
+        parsed_heads = [line.split(" ", 1) for line in bundle_heads.decode("utf-8").splitlines()]
+    except UnicodeDecodeError as exc:
+        raise HarnessError("legacy bundle heads are not UTF-8") from exc
+    if (
+        not parsed_heads
+        or any(
+            len(item) != 2
+            or not COMMIT_RE.fullmatch(item[0])
+            or not item[1].startswith("refs/heads/")
+            for item in parsed_heads
+        )
+        or owner["commit"] not in {item[0] for item in parsed_heads}
+    ):
+        raise HarnessError("legacy retained bundle does not expose the owner commit as a branch head")
 
     markers: list[str] = []
     completed_path = f"{LEGACY_EVIDENCE_ROOT}/completed.v1"
