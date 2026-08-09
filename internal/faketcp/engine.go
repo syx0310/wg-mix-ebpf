@@ -220,11 +220,19 @@ type tokenBucket struct {
 	initialized bool
 }
 
+// engineInstanceToken identifies the mutable state allocated by one Engine
+// construction. It is deliberately non-zero-sized so distinct allocations
+// have distinct addresses; copying an Engine value preserves the pointer.
+type engineInstanceToken struct {
+	marker byte
+}
+
 type Engine struct {
 	mu       sync.Mutex
 	opts     Options
 	identity RuntimeIdentity
 	domain   *runtimeDomainState
+	instance *engineInstanceToken
 	// One RuntimeIdentity may seed exactly one kernel collection. Reusing the
 	// domain with fresh maps would restart every per-CPU capture sequence and
 	// collide with identities emitted by its first collection. Every Engine in
@@ -314,6 +322,7 @@ func newEngine(options Options, domain *runtimeDomainState) (*Engine, error) {
 		opts:                  options,
 		identity:              domain.identity,
 		domain:                domain,
+		instance:              &engineInstanceToken{},
 		runtimeIdentityCommit: domain.runtimeIdentityCommit,
 		sessionIDs:            domain.sessionIDs,
 		sessions:              make(map[abi.FakeTCPSessionKey]*session),

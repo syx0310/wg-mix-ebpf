@@ -70,7 +70,7 @@ func NewEngineRouter(
 	}
 
 	engines := make(map[uint32]*Engine, len(bindings))
-	owners := make(map[*Engine]uint32, len(bindings))
+	owners := make(map[*engineInstanceToken]uint32, len(bindings))
 	for index, binding := range bindings {
 		if binding.WGID == 0 || binding.Engine == nil {
 			return nil, fmt.Errorf("%w: binding[%d] has zero WGID or nil Engine", ErrEngineRouteInvalid, index)
@@ -78,24 +78,24 @@ func NewEngineRouter(
 		if _, exists := engines[binding.WGID]; exists {
 			return nil, fmt.Errorf("%w: duplicate binding for WGID %d", ErrEngineRouteConflict, binding.WGID)
 		}
-		if owner, exists := owners[binding.Engine]; exists {
-			return nil, fmt.Errorf(
-				"%w: one Engine is assigned to WGIDs %d and %d",
-				ErrEngineRouteConflict,
-				owner,
-				binding.WGID,
-			)
-		}
 		engine := binding.Engine
-		if engine.domain != domain.state || engine.Identity() != domain.Identity() {
+		if engine.instance == nil || engine.domain != domain.state || engine.Identity() != domain.Identity() {
 			return nil, fmt.Errorf(
 				"%w: Engine for WGID %d does not belong to the router RuntimeDomain",
 				ErrEngineRouteInvalid,
 				binding.WGID,
 			)
 		}
+		if owner, exists := owners[engine.instance]; exists {
+			return nil, fmt.Errorf(
+				"%w: one Engine instance is assigned to WGIDs %d and %d",
+				ErrEngineRouteConflict,
+				owner,
+				binding.WGID,
+			)
+		}
 		engines[binding.WGID] = engine
-		owners[engine] = binding.WGID
+		owners[engine.instance] = binding.WGID
 	}
 
 	frozenRoutes := make(map[engineRouteKey]engineRouteTarget, len(routes))
