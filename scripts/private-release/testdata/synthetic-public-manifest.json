@@ -1,0 +1,10 @@
+{
+  "format": "wg-mix-ebpf-oss-public-paths-v1",
+  "legacy_public_history_commit": "84193de16f758176c3c282ae28a53c189fcc048b",
+  "main_commit": "afcca714a579d51b3cb4197c04550078a8df15d6",
+  "public_paths": [
+    "Makefile",
+    "app.txt",
+    "lib.txt"
+  ]
+}

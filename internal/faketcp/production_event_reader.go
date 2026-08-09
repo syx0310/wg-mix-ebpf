@@ -104,6 +104,11 @@ func (reader *productionEventReader) Read() (EventRecord, error) {
 		)
 	}
 	if decoded.Event.Type != abi.FakeTCPEventNeedHandshake {
+		record.ownedSample = ownedDecodedEvent{
+			Event:  decoded.Event,
+			Packet: decoded.packet,
+		}
+		record.hasOwnedSample = true
 		return record, nil
 	}
 	cpu := decoded.Event.CaptureCPU
@@ -122,7 +127,6 @@ func (reader *productionEventReader) Read() (EventRecord, error) {
 		if fingerprint != state.fingerprint {
 			return EventRecord{}, ErrCaptureIdentityConflict
 		}
-		return record, nil
 	case sequence <= state.sequence:
 		return EventRecord{}, fmt.Errorf(
 			"%w on CPU %d: sequence %d follows %d",
@@ -136,8 +140,12 @@ func (reader *productionEventReader) Read() (EventRecord, error) {
 	default:
 		state.sequence = sequence
 		state.fingerprint = fingerprint
-		return record, nil
 	}
+	record.ownedSample = ownedDecodedEvent{
+		Event: decoded.Event, Packet: decoded.packet, Fingerprint: fingerprint,
+	}
+	record.hasOwnedSample = true
+	return record, nil
 }
 
 func (reader *productionEventReader) SetDeadline(deadline time.Time) {

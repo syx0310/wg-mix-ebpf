@@ -11,7 +11,7 @@ import tempfile
 
 
 STATE_SCHEMA = (
-    "owner,baseline,mutation-plan,veth,tcx,module,cleanup-intent,"
+    "owner,baseline,mutation-plan,veth,tcx,module-lease,cleanup-intent,"
     "restored|filesystem-retained"
 )
 
@@ -141,7 +141,6 @@ class RestoreState:
     mutation: bool = True
     veth_phase: bool = True
     tcx: str = "phase"  # none, started, run-internal, explicit-internal, phase
-    module_phase: bool = True
     cleanup: bool = False
     terminal: str | None = None
     receipt_a_ifindex: int = 101
@@ -153,7 +152,8 @@ class RestoreState:
     veth_a_sysfs: int | None = 1001
     veth_b_sysfs: int | None = 1002
     veth_pair_identity: bool = True
-    module: str = "owned"  # absent, owned, unowned
+    module_lease: str = "11"  # 00, 10, 11, 01, restored, foreign, empty
+    module_restore_calls: int = 0
     pin_present: bool = False
     final_matches_baseline: bool = True
     writes: int = 0
@@ -208,14 +208,18 @@ def restore_model(state: RestoreState, cut_after: str | None = None) -> str:
     if not state.owner:
         raise ModelRejected("owner")
     if state.terminal == "restored":
-        if not state.baseline or not veth_absent(state) or state.module != "absent":
+        if (
+            not state.baseline
+            or not veth_absent(state)
+            or state.module_lease not in {"00", "restored"}
+        ):
             raise ModelRejected("restored-drift")
         if state.pin_present or not state.final_matches_baseline:
             raise ModelRejected("restored-drift")
         return "already-restored"
     if state.terminal == "filesystem-retained":
         if state.baseline or any(
-            (state.mutation, state.veth_phase, state.module_phase, state.cleanup)
+            (state.mutation, state.veth_phase, state.cleanup)
         ) or state.tcx != "none":
             raise ModelRejected("filesystem-with-mutation")
         return "filesystem-retained"
@@ -223,22 +227,30 @@ def restore_model(state: RestoreState, cut_after: str | None = None) -> str:
         raise ModelRejected("terminal")
 
     if not state.baseline:
-        if any((state.mutation, state.veth_phase, state.module_phase, state.cleanup)):
+        if any((state.mutation, state.veth_phase, state.cleanup)):
             raise ModelRejected("filesystem-with-mutation")
-        if state.tcx != "none" or not veth_absent(state) or state.module != "absent":
+        if (
+            state.tcx != "none"
+            or not veth_absent(state)
+            or state.module_lease != "00"
+        ):
             raise ModelRejected("filesystem-with-resource")
         state.terminal = "filesystem-retained"
         checkpoint(state, "filesystem-retained", cut_after)
         return "filesystem-retained"
 
     if not state.mutation:
-        if state.veth_phase or state.module_phase or state.tcx != "none":
+        if state.veth_phase or state.tcx != "none":
             raise ModelRejected("resource-without-mutation-plan")
-        if not veth_absent(state) or state.module != "absent" or state.pin_present:
+        if (
+            not veth_absent(state)
+            or state.module_lease != "00"
+            or state.pin_present
+        ):
             raise ModelRejected("resource-without-mutation-plan")
     else:
-        if state.module == "unowned":
-            raise ModelRejected("module-identity")
+        if state.module_lease in {"foreign", "empty"}:
+            raise ModelRejected("module-lease-identity")
         if state.veth_phase:
             validate_receipted_veth(state)
             partial = (state.veth_a_ifindex is None) != (
@@ -261,12 +273,6 @@ def restore_model(state: RestoreState, cut_after: str | None = None) -> str:
             state.receipt_b_sysfs = state.veth_b_sysfs
             state.veth_phase = True
             checkpoint(state, "veth-phase", cut_after)
-        if not state.cleanup and state.module_phase and state.module == "absent":
-            raise ModelRejected("module-absent-before-cleanup-intent")
-        if not state.module_phase and state.module == "owned":
-            state.module_phase = True
-            checkpoint(state, "module-phase", cut_after)
-
         if state.tcx == "started":
             state.tcx = "explicit-internal"
             state.pin_present = False
@@ -287,14 +293,13 @@ def restore_model(state: RestoreState, cut_after: str | None = None) -> str:
         state.cleanup = True
         checkpoint(state, "cleanup-intent", cut_after)
 
-    if state.module_phase:
-        if state.module == "owned":
-            state.module = "absent"
+    if state.mutation:
+        state.module_restore_calls += 1
+        if state.module_lease in {"10", "11", "01"}:
+            state.module_lease = "restored"
             checkpoint(state, "module-delete", cut_after)
-        elif state.module != "absent":
-            raise ModelRejected("module-cleanup")
-    elif state.module != "absent":
-        raise ModelRejected("unowned-module")
+        elif state.module_lease not in {"00", "restored"}:
+            raise ModelRejected("module-lease-cleanup")
 
     if state.veth_phase:
         validate_receipted_veth(state)
@@ -340,20 +345,18 @@ def exercise_failure_cut_model() -> None:
             mutation=False,
             veth_phase=False,
             tcx="none",
-            module_phase=False,
-            module="absent",
+            module_lease="00",
         ),
         "veth-phase": RestoreState(veth_phase=False),
-        "module-phase": RestoreState(module_phase=False),
         "tcx-explicit-receipt": RestoreState(tcx="started", pin_present=True),
         "tcx-phase-from-run-internal": RestoreState(tcx="run-internal"),
         "tcx-phase-from-explicit-internal": RestoreState(tcx="explicit-internal"),
         "tcx-phase-not-started": RestoreState(tcx="none"),
         "cleanup-intent": RestoreState(),
         "module-delete": RestoreState(cleanup=True),
-        "veth-delete": RestoreState(cleanup=True, module="absent"),
-        "final-verify": state_without_veth(cleanup=True, module="absent"),
-        "restored": state_without_veth(cleanup=True, module="absent"),
+        "veth-delete": RestoreState(cleanup=True, module_lease="restored"),
+        "final-verify": state_without_veth(cleanup=True, module_lease="restored"),
+        "restored": state_without_veth(cleanup=True, module_lease="restored"),
     }
     for cut, state in scenarios.items():
         try:
@@ -371,11 +374,42 @@ def exercise_failure_cut_model() -> None:
             fail(f"modeled cut {cut} did not converge to restored")
 
     restored = state_without_veth(
-        cleanup=True, module="absent", terminal="restored"
+        cleanup=True, module_lease="restored", terminal="restored"
     )
     writes = restored.writes
     if restore_model(restored) != "already-restored" or restored.writes != writes:
         fail("already-restored retry created new evidence")
+
+    pre_mutation = state_without_veth(
+        mutation=False,
+        veth_phase=False,
+        tcx="none",
+        module_lease="00",
+    )
+    try:
+        restore_model(pre_mutation, "cleanup-intent")
+    except FailureCut as exc:
+        if str(exc) != "cleanup-intent":
+            fail(f"modeled pre-mutation cut stopped at {exc}")
+    else:
+        fail("modeled pre-mutation cleanup-intent cut was not reached")
+    if restore_model(pre_mutation) != "restored":
+        fail("baseline-to-pre-mutation failure cut did not converge")
+    if pre_mutation.module_restore_calls != 0:
+        fail("pre-mutation restore called the unconfigured module helper")
+
+    for label, module_lease in {
+        "00": "00",
+        "10": "10",
+        "11": "11",
+        "01": "01",
+    }.items():
+        state = RestoreState(cleanup=True, module_lease=module_lease)
+        if restore_model(state) != "restored":
+            fail(f"modeled module failure cut {label} did not converge")
+        expected = "00" if label == "00" else "restored"
+        if state.module_lease != expected:
+            fail(f"modeled module failure cut {label} ended as {state.module_lease}")
 
     for label, state in {
         "dual/invalid filesystem terminal": RestoreState(
@@ -413,16 +447,15 @@ def exercise_failure_cut_model() -> None:
             veth_b_sysfs=2002,
             veth_pair_identity=True,
         ),
-        "unowned module": RestoreState(module="unowned"),
+        "foreign module generation": RestoreState(module_lease="foreign"),
+        "empty lease module generation": RestoreState(module_lease="empty"),
         "unreceipted veth": RestoreState(
             veth_phase=False, veth_pair_identity=False
         ),
-        "unreceipted module": RestoreState(module_phase=False, module="unowned"),
-        "module absent before cleanup intent": RestoreState(module="absent"),
         "veth absent before cleanup intent": state_without_veth(),
         "final baseline drift": state_without_veth(
             cleanup=True,
-            module="absent",
+            module_lease="restored",
             final_matches_baseline=False,
         ),
     }.items():
@@ -431,18 +464,18 @@ def exercise_failure_cut_model() -> None:
     for label, state in {
         "a already absent": RestoreState(
             cleanup=True,
-            module="absent",
+            module_lease="restored",
             veth_a_ifindex=None,
             veth_a_sysfs=None,
         ),
         "b already absent": RestoreState(
             cleanup=True,
-            module="absent",
+            module_lease="restored",
             veth_b_ifindex=None,
             veth_b_sysfs=None,
         ),
         "both already absent": state_without_veth(
-            cleanup=True, module="absent"
+            cleanup=True, module_lease="restored"
         ),
     }.items():
         if restore_model(state) != "restored" or state.terminal != "restored":
@@ -513,7 +546,6 @@ def check_state_machine(runner: str) -> None:
         "MUTATION_PHASE": "phase-mutation-plan.v1",
         "VETH_PHASE": "phase-veth.v1",
         "TCX_PHASE": "phase-tcx.v1",
-        "MODULE_PHASE": "phase-module.v1",
         "CLEANUP_PHASE": "phase-cleanup-intent.v1",
         "RESTORED_PHASE": "phase-restored.v1",
         "FILESYSTEM_PHASE": "phase-filesystem-retained.v1",
@@ -547,12 +579,14 @@ def check_state_machine(runner: str) -> None:
             'mutation_sha256=$(file_sha_or_absent "${MUTATION_PHASE}")',
             'veth_sha256=$(file_sha_or_absent "${VETH_PHASE}")',
             'tcx_sha256=$(file_sha_or_absent "${TCX_PHASE}")',
-            'module_sha256=$(file_sha_or_absent "${MODULE_PHASE}")',
+            'module_intent_sha256=$(file_sha_or_absent "${MODULE_INTENT}")',
+            'module_owned_sha256=$(file_sha_or_absent "${MODULE_OWNED}")',
             '"pin=${PIN_PATH}"',
             '"runtime=${TCX_RUNTIME_ROOT}"',
             '"veth_a=${VETH_A}"',
             '"veth_b=${VETH_B}"',
             '"module=${MODULE_NAME}"',
+            '"lease_id=${MODULE_LEASE_ID}"',
         ),
         "cleanup ownership receipt",
     )
@@ -564,8 +598,10 @@ def check_state_machine(runner: str) -> None:
             '[[ ! -e "${RESTORED_PHASE}" ]] || fail \'invalid-restored-phase\'',
             "filesystem-terminal-with-mutation",
             "filesystem-phase-with-baseline",
+            "local mutation_started=0",
+            "mutation_started=1",
             "ensure_cleanup_intent",
-            "converge_module_absent",
+            "if ((mutation_started)); then converge_module_absent; fi",
             "converge_veth_absent",
             "assert_bpf_baseline R.cleanup-bpf",
             "verify_final_state R.final",
@@ -575,7 +611,7 @@ def check_state_machine(runner: str) -> None:
     )
     ordered = (
         "ensure_cleanup_intent",
-        "converge_module_absent",
+        "if ((mutation_started)); then converge_module_absent; fi",
         "converge_veth_absent",
         "assert_bpf_baseline R.cleanup-bpf",
         "verify_final_state R.final",
@@ -590,6 +626,22 @@ def check_state_machine(runner: str) -> None:
     filesystem_end = restore.index('[[ ! -e "${FILESYSTEM_PHASE}" ]]', filesystem_start)
     if 'write_phase "${RESTORED_PHASE}"' in restore[filesystem_start:filesystem_end]:
         fail("filesystem-only convergence can write the restored terminal")
+    no_mutation_start = restore.index('else\n    [[ ! -e "${VETH_PHASE}"', filesystem_end)
+    no_mutation_end = restore.index("  fi\n  ensure_cleanup_intent", no_mutation_start)
+    no_mutation = restore[no_mutation_start:no_mutation_end]
+    require_literals(
+        no_mutation,
+        (
+            '! -e "${MODULE_INTENT}"',
+            '! -e "${MODULE_OWNED}"',
+            '! -e "${MODULE_UNLOADED}"',
+            '! -e "/sys/module/${MODULE_NAME}"',
+            '"$(veth_presence)" == 00',
+        ),
+        "pre-mutation restore absence proof",
+    )
+    if "converge_module_absent" in no_mutation:
+        fail("pre-mutation restore calls the unconfigured module helper")
     completed = function_body(runner, "validate_completed_chain")
     require_literals(
         completed,
@@ -597,7 +649,8 @@ def check_state_machine(runner: str) -> None:
             "validate_baseline",
             "validate_mutation_plan",
             "ensure_veth_phase",
-            "ensure_module_phase",
+            "c8_checksum_module_validate_restore_state",
+            "completed-module-state",
             "validate_tcx_phase",
             "validate_cleanup_intent",
             "assert_bpf_baseline R.completed-bpf",
@@ -611,7 +664,6 @@ def check_state_machine(runner: str) -> None:
             "require_receipted_veth_endpoint",
             "partial-veth-before-cleanup-intent",
         ),
-        "ensure_module_phase": ("CLEANUP_PHASE", "module-identity-drift"),
         "converge_veth_absent": (
             "VETH_PHASE",
             "require_receipted_veth_pair",
@@ -621,9 +673,10 @@ def check_state_machine(runner: str) -> None:
             "unowned-veth-present",
         ),
         "converge_module_absent": (
-            "MODULE_PHASE",
-            "cleanup-module-identity",
-            "unowned-module-present",
+            "c8_checksum_module_restore R.module",
+            "c8_checksum_module_validate_restore_state",
+            "00-clean",
+            "00-restored",
         ),
     }.items():
         require_literals(function_body(runner, function), required, function)
@@ -719,7 +772,6 @@ def check_shared_argv_and_parser(runner: str) -> None:
         fail("reverse convergence can be blocked by a noclobber step receipt")
     for call in (
         "run_convergent_operation R.tcx tcx-restore",
-        "run_convergent_operation R.module module-unload",
         "run_convergent_operation R.veth veth-delete",
         "run_convergent_operation R.veth-peer veth-delete-b",
     ):
@@ -743,14 +795,25 @@ def check_shared_argv_and_parser(runner: str) -> None:
             "offload:*)",
             "realhost:*)",
             "6m",
-            "module-unload)",
-            'OP_ARGV=(/usr/sbin/rmmod "${MODULE_NAME}")',
             "veth-delete)",
             'OP_ARGV=(/usr/sbin/ip link delete dev "${VETH_A}")',
             "veth-delete-b)",
             'OP_ARGV=(/usr/sbin/ip link delete dev "${VETH_B}")',
         ),
         "shared argv/timeouts",
+    )
+    if "module-load)" in builder or "module-unload)" in builder:
+        fail("shared argv builder retains a direct checksum-module lifecycle")
+    module_audit = function_body(runner, "run_module_lease_argv")
+    require_literals(
+        module_audit,
+        (
+            "audit_line start",
+            '"$@" 2>&1 | /usr/bin/tee -a "${AUDIT_LOG}"',
+            "audit_line finish",
+            'return "${rc}"',
+        ),
+        "shared module audit adapter",
     )
     timeout_contracts = {
         "bundle-copy": ("--kill-after=10s 2m",),
@@ -774,7 +837,10 @@ def check_shared_argv_and_parser(runner: str) -> None:
         plan,
         (
             "plan_operation R.tcx tcx-restore",
-            "plan_operation R.module module-unload",
+            "operation=shared-module-lock",
+            "helper=c8_checksum_module_load",
+            '"lease_id=${MODULE_LEASE_ID}"',
+            "helper=c8_checksum_module_restore",
             "plan_operation R.veth-a veth-delete",
             "plan_operation R.veth-b veth-delete-b",
             'for spec in "${FINAL_SPECS[@]}"',
@@ -841,6 +907,34 @@ def check_self_and_tooling(runner: str) -> None:
         fail("restore does not validate controller/self identity first")
     if "validate_package_bundle" in restore_all or "validate_staged_source" not in function_body(runner, "converge_restore"):
         fail("restore depends on mutable package or omits retained source validation")
+    for body, label, acquire in (
+        (run_all, "run", "c8_checksum_module_acquire L0.run"),
+        (restore_all, "restore", "c8_checksum_module_acquire L0.restore"),
+    ):
+        require_literals(body, ("load_checksum_module_helper", acquire), f"{label} shared lease")
+        if body.index("load_checksum_module_helper") > body.index(acquire):
+            fail(f"{label} acquires the shared lease before sourcing its exact helper")
+    if run_all.index("c8_checksum_module_acquire L0.run") > run_all.index("snapshot_baseline"):
+        fail("run snapshots the module baseline before acquiring the shared lease")
+    if run_all.index("c8_checksum_module_acquire L0.run") > run_all.index("create_veth"):
+        fail("run mutates the veth before acquiring the shared module lease")
+    if restore_all.index("c8_checksum_module_acquire L0.restore") > restore_all.index("converge_restore"):
+        fail("restore enters convergence before acquiring the shared module lease")
+    prepare = function_body(runner, "prepare_mutation_plan")
+    if "configure_checksum_module_lease" not in prepare:
+        fail("run does not configure the exact module scope before veth mutation")
+    loader = function_body(runner, "load_checksum_module_helper")
+    require_literals(
+        loader,
+        (
+            'source "${MODULE_LEASE_HELPER}"',
+            '"${C8_CHECKSUM_MODULE_LOCK}" == "${MODULE_LEASE_LOCK}"',
+            '"${C8_CHECKSUM_MODULE_STANDALONE_RESOURCE_ID}" == "${RESOURCE_ID}"',
+            '"${C8_CHECKSUM_MODULE_STANDALONE_OBJECT}" == "${MODULE_OBJECT}"',
+            '"${C8_CHECKSUM_MODULE_STANDALONE_EVIDENCE}" == "${EVIDENCE_ROOT}"',
+        ),
+        "standalone shared-helper binding",
+    )
     gate = "((EUID == 0)) || fail 'root-required' 77\nrequire_tooling\ncase"
     if gate not in runner:
         fail("non-plan dispatch does not gate EUID before tooling")
@@ -854,10 +948,14 @@ def check_self_and_tooling(runner: str) -> None:
 
 
 def main() -> None:
-    if len(sys.argv) != 3:
-        fail("usage: test_veth_runner_static.py ROOT_VETH_RUNNER EXISTING_ROOT_MATRIX")
+    if len(sys.argv) != 4:
+        fail(
+            "usage: test_veth_runner_static.py ROOT_VETH_RUNNER "
+            "EXISTING_ROOT_MATRIX MODULE_LEASE_HELPER"
+        )
     runner_path, runner = read_regular(sys.argv[1])
     matrix_path, matrix = read_regular(sys.argv[2])
+    _, helper = read_regular(sys.argv[3])
 
     check_forbidden_operations(runner_path, runner)
     require_literals(
@@ -869,6 +967,10 @@ def main() -> None:
             'readonly ROOT_BUNDLE="${VETH_STAGE_ROOT}/source-${PACKAGE_ID}-${RESOURCE_ID}.bundle"',
             'readonly EVIDENCE_ROOT="${VETH_STAGE_ROOT}/veth-evidence-${RESOURCE_ID}"',
             'readonly PIN_PATH="/sys/fs/bpf/wg-mix-ebpf-${VETH_RUN_ID}-tcx"',
+            'readonly MODULE_INTENT="${EVIDENCE_ROOT}/checksum-module-intent.v1"',
+            'readonly MODULE_OWNED="${EVIDENCE_ROOT}/checksum-module-owned.v1"',
+            'readonly MODULE_UNLOADED="${EVIDENCE_ROOT}/checksum-module-unloaded.v1"',
+            'readonly MODULE_LEASE_ID="${CONTROLLER_RUN_ID}-${RESOURCE_ID}"',
             "wg_active_scoped=not-covered pass=0",
             "raw_ens33=not-covered raw_ens33_pass=0",
             "peer_47=read-only peer_access=0",
@@ -889,6 +991,15 @@ def main() -> None:
     )
     if re.search(r'clone[^\n]*"\$\{BUNDLE\}"', runner):
         fail("runner clones directly from the user-owned package bundle")
+    if "MODULE_PHASE" in runner or "phase-module.v1" in runner:
+        fail("standalone runner retains a second module authority marker")
+    for literal in (
+        "C8_CHECKSUM_MODULE_STANDALONE_RESOURCE_ID='d34b8e65'",
+        "C8_CHECKSUM_MODULE_STANDALONE_OBJECT",
+        "C8_CHECKSUM_MODULE_STANDALONE_EVIDENCE",
+    ):
+        if literal not in helper:
+            fail(f"shared helper lacks standalone exact scope {literal!r}")
     check_state_machine(runner)
     check_shared_argv_and_parser(runner)
     check_self_and_tooling(runner)
@@ -901,7 +1012,7 @@ def main() -> None:
         fail(f"standalone veth identity leaked into existing matrix {matrix_path}")
     print(
         "static standalone veth runner: PASS "
-        "state_positions=8 failure_cut_fixtures=12 veth_identity_fixtures=11"
+        "state_positions=8 module_failure_cuts=4 veth_identity_fixtures=11"
     )
 
 

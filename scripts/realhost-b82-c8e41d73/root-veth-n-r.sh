@@ -7,7 +7,7 @@ readonly CONTROLLER_RUN_ID='c8e41d73'
 readonly PACKAGE_ID='4f2a9b61'
 readonly VETH_RUN_ID='a19f7c2e'
 readonly RESOURCE_ID='d34b8e65'
-readonly STATE_SCHEMA='owner,baseline,mutation-plan,veth,tcx,module,cleanup-intent,restored|filesystem-retained'
+readonly STATE_SCHEMA='owner,baseline,mutation-plan,veth,tcx,module-lease,cleanup-intent,restored|filesystem-retained'
 readonly STAGES_ROOT='/run/wg-mix-ebpf-source-stages'
 readonly EXPECTED_CONTROLLER_SOURCE="${STAGES_ROOT}/${CONTROLLER_RUN_ID}/source"
 readonly EXPECTED_BUNDLE="/home/siyixuan/wg-mix-ebpf-test/unpriv-${PACKAGE_ID}/source-${PACKAGE_ID}.bundle"
@@ -21,7 +21,9 @@ readonly BASELINE_PHASE="${EVIDENCE_ROOT}/phase-baseline.v1"
 readonly MUTATION_PHASE="${EVIDENCE_ROOT}/phase-mutation-plan.v1"
 readonly VETH_PHASE="${EVIDENCE_ROOT}/phase-veth.v1"
 readonly TCX_PHASE="${EVIDENCE_ROOT}/phase-tcx.v1"
-readonly MODULE_PHASE="${EVIDENCE_ROOT}/phase-module.v1"
+readonly MODULE_INTENT="${EVIDENCE_ROOT}/checksum-module-intent.v1"
+readonly MODULE_OWNED="${EVIDENCE_ROOT}/checksum-module-owned.v1"
+readonly MODULE_UNLOADED="${EVIDENCE_ROOT}/checksum-module-unloaded.v1"
 readonly CLEANUP_PHASE="${EVIDENCE_ROOT}/phase-cleanup-intent.v1"
 readonly RESTORED_PHASE="${EVIDENCE_ROOT}/phase-restored.v1"
 readonly FILESYSTEM_PHASE="${EVIDENCE_ROOT}/phase-filesystem-retained.v1"
@@ -38,6 +40,11 @@ readonly VETH_B_ALIAS="wg-mix-ebpf:${VETH_RUN_ID}:b"
 readonly VETH_A_MAC='02:a1:9f:7c:2e:0a'
 readonly VETH_B_MAC='02:a1:9f:7c:2e:0b'
 readonly MODULE_NAME='wg_mix_faketcp_checksum'
+readonly MODULE_OBJECT="${VETH_SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko"
+readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-${CONTROLLER_RUN_ID}/checksum-module-lease.sh"
+readonly MODULE_LEASE_HELPER="${EXPECTED_CONTROLLER_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}"
+readonly MODULE_LEASE_LOCK="${STAGES_ROOT}/${CONTROLLER_RUN_ID}/checksum-module-lease.v1.lock"
+readonly MODULE_LEASE_ID="${CONTROLLER_RUN_ID}-${RESOURCE_ID}"
 readonly EXPECTED_HOSTNAME='ubuntu-2604-test'
 readonly EXPECTED_KERNEL='7.0.0-28-generic'
 readonly EXPECTED_MACHINE_ID='9db3fb717cc74974b2a6b243d67f67b9'
@@ -225,8 +232,6 @@ build_argv() {
       OP_TARGET="exact-tcx-${action}"
       OP_ARGV=("${GO_ENV[@]}" WG_MIX_EBPF_RUN_BPFFS_INTEGRATION=1 WG_MIX_EBPF_TEST_OBJECT_PATH="${VETH_SOURCE}/build/wg_mix_tc.o" WG_MIX_EBPF_TEST_PIN_PATH="${PIN_PATH}" WG_MIX_EBPF_TEST_IFINDEX="${VETH_A_IFINDEX}" WG_MIX_EBPF_TEST_RUNTIME_ROOT="${TCX_RUNTIME_ROOT}" WG_MIX_EBPF_TEST_PIN_LOCK_ROOT="${TCX_RUNTIME_ROOT}/locks" WG_MIX_EBPF_TEST_PIN_OWNER_ROOT="${TCX_RUNTIME_ROOT}/owners" WG_MIX_EBPF_TEST_INITIAL_NETNS="${INITIAL_NETNS}" WG_MIX_EBPF_TEST_ACTION="${action}" WG_MIX_EBPF_TEST_FAILURE_POLICY=retain /usr/bin/timeout --signal=TERM --kill-after=10s "${outer}" /usr/bin/go -C "${VETH_SOURCE}" test ./internal/dataplane -run '^TestBPFFSPinLifecycleIntegration$' -count=1 -timeout="${inner}" -v)
       ;;
-    module-load) OP_TARGET="${MODULE_NAME}"; OP_ARGV=(/usr/sbin/insmod "${VETH_SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko") ;;
-    module-unload) OP_TARGET="${MODULE_NAME}"; OP_ARGV=(/usr/sbin/rmmod "${MODULE_NAME}") ;;
     verifier) OP_ARGV=(/usr/bin/timeout --signal=TERM --kill-after=10s 3m "${VETH_SOURCE}/bin/wg-mix-ebpf" bpf-load-test --experimental-faketcp --object "${VETH_SOURCE}/build/wg_mix_faketcp_experimental.o" --json) ;;
     packet-probe) OP_ARGV=("${GO_ENV[@]}" WG_MIX_FAKETCP_PACKET_TEST_OBJECT="${VETH_SOURCE}/build/wg_mix_faketcp_experimental.o" /usr/bin/timeout --signal=TERM --kill-after=10s 4m /usr/bin/go -C "${VETH_SOURCE}" test ./internal/dataplane -run '^TestFakeTCPBPFPacketProbe$' -count=1 -timeout=3m -v) ;;
     offload:*) name="${operation#offload:}"; valid_test_name "${name}" || return 64; OP_TARGET="${name}"; OP_ARGV=("${GO_ENV[@]}" /usr/bin/timeout --signal=TERM --kill-after=10s 3m /usr/bin/go -C "${VETH_SOURCE}" test ./internal/dataplane -run "^${name}$" -count=1 -timeout=2m -v) ;;
@@ -253,22 +258,29 @@ render_plan() {
   for spec in 'B0|stage-mkdir' 'B1|evidence-mkdir' 'S0.copy|bundle-copy' 'S0.mode|bundle-mode' 'S0.verify|bundle-verify' 'S1|source-clone' 'S2|source-checkout' 'S3.cache|cache-mkdir' 'S3.mod-cache|mod-cache-mkdir' 'S3.go-path|go-path-mkdir' 'S3.tmp|go-tmp-mkdir'; do
     IFS='|' read -r label operation <<<"${spec}"; plan_operation "${label}" "${operation}"
   done
+  printf 'L0 operation=shared-module-lock target=%q helper=%q argv=' "${MODULE_LEASE_LOCK}" "${MODULE_LEASE_HELPER}"
+  quote_argv /usr/bin/flock --exclusive --nonblock MODULE_LEASE_FD
+  printf '\n'
   for spec in "${BASELINE_SPECS[@]}"; do IFS='|' read -r label operation <<<"${spec}"; plan_operation "A.${label}" "${operation}"; done
   plan_operation O.build build
   for spec in 'N.pre-a|veth-show-a' 'N.pre-b|veth-show-b' 'N.add|veth-add' 'N.alias-a|veth-alias-a' 'N.alias-b|veth-alias-b' 'N.up-a|veth-up-a' 'N.up-b|veth-up-b'; do IFS='|' read -r label operation <<<"${spec}"; plan_operation "${label}" "${operation}"; done
   plan_operation T.run tcx-run
-  plan_operation M.load module-load
+  printf 'M.load operation=shared-module-load target=%q helper=c8_checksum_module_load argv=' "${MODULE_NAME}"
+  quote_argv /usr/sbin/insmod "${MODULE_OBJECT}" "lease_id=${MODULE_LEASE_ID}"
+  printf '\n'
   for name in TestFakeTCPBPFPacketProbe "${OFFLOAD_TESTS[@]}" "${REALHOST_TESTS[@]}"; do plan_operation "C.${name}" "list:${name}"; done
   plan_operation F.verifier verifier
   plan_operation F.packet packet-probe
   for name in "${OFFLOAD_TESTS[@]}"; do plan_operation "F.${name}" "offload:${name}"; done
   for name in "${REALHOST_TESTS[@]}"; do plan_operation "F.${name}" "realhost:${name}"; done
   plan_operation R.tcx tcx-restore
-  plan_operation R.module module-unload
+  printf 'R.module operation=shared-module-restore target=%q helper=c8_checksum_module_restore argv=' "${MODULE_NAME}"
+  quote_argv /usr/sbin/rmmod "${MODULE_NAME}"
+  printf '\n'
   plan_operation R.veth-a veth-delete
   plan_operation R.veth-b veth-delete-b
   for spec in "${FINAL_SPECS[@]}"; do IFS='|' read -r label operation <<<"${spec}"; plan_operation "Z.${label}" "${operation}"; done
-  printf 'B82_VETH_V6_WRITE_SET stage=%s evidence=%s source=%s root_bundle=%s pin=%s veth=%s,%s module=%s phases=%s retained=1\n' "${VETH_STAGE_ROOT}" "${EVIDENCE_ROOT}" "${VETH_SOURCE}" "${ROOT_BUNDLE}" "${PIN_PATH}" "${VETH_A}" "${VETH_B}" "${MODULE_NAME}" "${STATE_SCHEMA}"
+  printf 'B82_VETH_V6_WRITE_SET stage=%s evidence=%s source=%s root_bundle=%s pin=%s shared_lock=%s:advisory-only veth=%s,%s module=%s lease_id=%s module_receipts=%s,%s,%s phases=%s retained=1\n' "${VETH_STAGE_ROOT}" "${EVIDENCE_ROOT}" "${VETH_SOURCE}" "${ROOT_BUNDLE}" "${PIN_PATH}" "${MODULE_LEASE_LOCK}" "${VETH_A}" "${VETH_B}" "${MODULE_NAME}" "${MODULE_LEASE_ID}" "${MODULE_INTENT}" "${MODULE_OWNED}" "${MODULE_UNLOADED}" "${STATE_SCHEMA}"
   printf 'B82_VETH_V6_PLAN_COMPLETE argv_builder=shared commands_are_review_templates=1 no_commands_executed=1 credential_read=0 network_operations=0 capability_bits_changed=0\n'
 }
 
@@ -346,6 +358,25 @@ run_convergent_operation() {
   ((rc == 0)) || { printf '%s\n' "${CONVERGENCE_OUTPUT}" >&2; fail "${label}:rc=${rc}" "${rc}"; }
 }
 
+run_module_lease_argv() {
+  local label="$1" target="$2" rendered rc
+  local -a status
+  shift 2
+  rendered="$(quote_argv "$@")" || fail "module-lease-render:${label}"
+  audit_line start "${label}" "${target}" not-run "${rendered}" || fail "module-lease-audit-start:${label}"
+  "$@" 2>&1 | /usr/bin/tee -a "${AUDIT_LOG}"
+  status=("${PIPESTATUS[@]}")
+  ((${#status[@]} == 2)) || fail "module-lease-pipeline:${label}"
+  rc="${status[0]}"
+  audit_line finish "${label}" "${target}" "${rc}" "${rendered}" || fail "module-lease-audit-finish:${label}"
+  ((status[1] == 0)) || fail "module-lease-output:${label}" "${status[1]}"
+  return "${rc}"
+}
+
+c8_checksum_module_run() {
+  run_module_lease_argv "$@"
+}
+
 capture_operation() {
   local label="$1" operation="$2" rendered output rc
   build_argv "${operation}" || fail "capture-builder:${operation}" $?
@@ -357,16 +388,38 @@ capture_operation() {
   printf '%s' "${output}"
 }
 
-write_phase() {
+write_noclobber_evidence() {
   local path="$1" rc
   shift
-  [[ "${path}" == "${EVIDENCE_ROOT}/phase-"* && "${path#${EVIDENCE_ROOT}/}" != */* && ! -e "${path}" && ! -L "${path}" ]] || fail "phase-write-scope:${path}" 78
-  audit_line start phase-write "${path}" not-run "shell-builtin:noclobber" || fail 'phase-audit-start'
+  [[ "${path}" == "${EVIDENCE_ROOT}/"* && "${path#${EVIDENCE_ROOT}/}" != */* &&
+    ! -e "${path}" && ! -L "${path}" ]] || fail "evidence-write-scope:${path}" 78
+  audit_line start evidence-write "${path}" not-run "shell-builtin:noclobber" || fail 'evidence-audit-start'
   set -o noclobber
   printf '%s\n' "$@" >"${path}"; rc=$?
   set +o noclobber
-  audit_line finish phase-write "${path}" "${rc}" "shell-builtin:noclobber" || fail 'phase-audit-finish'
-  ((rc == 0)) || fail "phase-write:${path}" "${rc}"
+  audit_line finish evidence-write "${path}" "${rc}" "shell-builtin:noclobber" || fail 'evidence-audit-finish'
+  ((rc == 0)) || fail "evidence-write:${path}" "${rc}"
+}
+
+write_phase() {
+  local path="$1"
+  shift
+  [[ "${path}" == "${EVIDENCE_ROOT}/phase-"* && "${path#${EVIDENCE_ROOT}/}" != */* ]] ||
+    fail "phase-write-scope:${path}" 78
+  write_noclobber_evidence "${path}" "$@"
+}
+
+c8_checksum_module_write() {
+  local path="$1"
+  case "${path}" in
+    "${MODULE_INTENT}" | "${MODULE_OWNED}" | "${MODULE_UNLOADED}") ;;
+    *) fail "module-lease-write-scope:${path}" 78 ;;
+  esac
+  write_noclobber_evidence "$1" "$2"
+}
+
+c8_checksum_module_fail() {
+  fail "checksum-module-lease:$1" "$2"
 }
 
 read_single_line() {
@@ -412,7 +465,9 @@ validate_evidence_shapes() {
   local path label
   validate_evidence_file "${AUDIT_LOG}" audit
   validate_evidence_file "${OWNER_PHASE}" owner
-  for path in "${BASELINE_PHASE}" "${MUTATION_PHASE}" "${VETH_PHASE}" "${TCX_PHASE}" "${MODULE_PHASE}" "${CLEANUP_PHASE}" "${RESTORED_PHASE}" "${FILESYSTEM_PHASE}"; do
+  for path in "${BASELINE_PHASE}" "${MUTATION_PHASE}" "${VETH_PHASE}" "${TCX_PHASE}" \
+    "${MODULE_INTENT}" "${MODULE_OWNED}" "${MODULE_UNLOADED}" \
+    "${CLEANUP_PHASE}" "${RESTORED_PHASE}" "${FILESYSTEM_PHASE}"; do
     label="${path#${EVIDENCE_ROOT}/}"
     validate_optional_evidence_file "${path}" "${label}"
   done
@@ -420,7 +475,7 @@ validate_evidence_shapes() {
 
 require_tooling() {
   local path
-  local -a tools=(/bin/bash /bin/date /usr/bin/awk /usr/bin/basename /usr/bin/cat /usr/bin/chmod /usr/bin/clang /usr/bin/cmp /usr/bin/cp /usr/bin/env /usr/bin/git /usr/bin/go /usr/bin/grep /usr/bin/hostname /usr/bin/make /usr/bin/mkdir /usr/bin/readlink /usr/bin/sha256sum /usr/bin/stat /usr/bin/tee /usr/bin/test /usr/bin/timeout /usr/bin/uname /usr/bin/wg /usr/sbin/bpftool /usr/sbin/ethtool /usr/sbin/insmod /usr/sbin/ip /usr/sbin/lsmod /usr/sbin/modinfo /usr/sbin/rmmod /usr/sbin/tc)
+  local -a tools=(/bin/bash /bin/date /usr/bin/awk /usr/bin/basename /usr/bin/cat /usr/bin/chmod /usr/bin/clang /usr/bin/cmp /usr/bin/cp /usr/bin/env /usr/bin/flock /usr/bin/git /usr/bin/go /usr/bin/grep /usr/bin/hostname /usr/bin/make /usr/bin/mkdir /usr/bin/readlink /usr/bin/sha256sum /usr/bin/stat /usr/bin/tee /usr/bin/test /usr/bin/timeout /usr/bin/uname /usr/bin/wg /usr/sbin/bpftool /usr/sbin/ethtool /usr/sbin/insmod /usr/sbin/ip /usr/sbin/lsmod /usr/sbin/modinfo /usr/sbin/rmmod /usr/sbin/tc)
   for path in "${tools[@]}"; do [[ -x "${path}" ]] || fail "missing-tool:${path}" 69; done
 }
 
@@ -444,9 +499,32 @@ validate_controller_identity() {
   commit_sha="$(git_fixed -C "${CONTROLLER_SOURCE}" show "${COMMIT}:${SELF_PATH_FROM_ROOT}" | /usr/bin/sha256sum)" || fail 'runner-commit-sha'
   commit_sha="${commit_sha%% *}"
   [[ "${actual_blob}" == "${commit_blob}" && "${actual_sha}" == "${commit_sha}" ]] || fail 'runner-self-content' 79
+  [[ -f "${MODULE_LEASE_HELPER}" && ! -L "${MODULE_LEASE_HELPER}" ]] ||
+    fail 'module-lease-helper-shape' 79
   actual="$(/usr/bin/hostname)"; [[ "${actual}" == "${EXPECTED_HOSTNAME}" ]] || fail 'hostname-mismatch' 79
   actual="$(/usr/bin/uname -r)"; [[ "${actual}" == "${EXPECTED_KERNEL}" ]] || fail 'kernel-mismatch' 79
   actual="$(read_single_line /etc/machine-id)"; [[ "${actual}" == "${EXPECTED_MACHINE_ID}" ]] || fail 'machine-id-mismatch' 79
+}
+
+load_checksum_module_helper() {
+  # shellcheck source=checksum-module-lease.sh
+  source "${MODULE_LEASE_HELPER}" || fail 'module-lease-helper-source' $?
+  [[ "${C8_CHECKSUM_MODULE_LOCK}" == "${MODULE_LEASE_LOCK}" &&
+    "${C8_CHECKSUM_MODULE_STANDALONE_RESOURCE_ID}" == "${RESOURCE_ID}" &&
+    "${C8_CHECKSUM_MODULE_STANDALONE_OBJECT}" == "${MODULE_OBJECT}" &&
+    "${C8_CHECKSUM_MODULE_STANDALONE_EVIDENCE}" == "${EVIDENCE_ROOT}" ]] ||
+    fail 'module-lease-helper-binding-contract' 79
+}
+
+configure_checksum_module_lease() {
+  c8_checksum_module_configure "${CONTROLLER_RUN_ID}" "${RESOURCE_ID}" "${COMMIT}" \
+    "${ORIGINAL_BOOT_ID}" "${EVIDENCE_ROOT}" "${MODULE_OBJECT}" "${MODULE_SHA256}" ||
+    fail 'module-lease-configure' $?
+  [[ "${C8_CHECKSUM_MODULE_LEASE_ID}" == "${MODULE_LEASE_ID}" &&
+    "${C8_CHECKSUM_MODULE_INTENT}" == "${MODULE_INTENT}" &&
+    "${C8_CHECKSUM_MODULE_OWNED}" == "${MODULE_OWNED}" &&
+    "${C8_CHECKSUM_MODULE_UNLOADED}" == "${MODULE_UNLOADED}" ]] ||
+    fail 'module-lease-receipt-contract' 79
 }
 
 validate_package_bundle() {
@@ -539,6 +617,7 @@ validate_mutation_plan() {
   expected="$(render_mutation_plan)" || fail 'mutation-plan-render'
   actual="$(/usr/bin/cat "${MUTATION_PHASE}")" || fail 'mutation-plan-read'
   [[ "${actual}" == "${expected}" ]] || fail 'mutation-plan-mismatch' 79
+  configure_checksum_module_lease
 }
 
 prepare_mutation_plan() {
@@ -546,6 +625,7 @@ prepare_mutation_plan() {
   MODULE_SRCVERSION="$(/usr/sbin/modinfo -F srcversion "${VETH_SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko")" || fail 'module-srcversion'
   [[ "${MODULE_SRCVERSION}" =~ ^[0-9A-F]{8,64}$ ]] || fail 'module-srcversion-shape' 79
   write_phase "${MUTATION_PHASE}" "$(render_mutation_plan)"
+  configure_checksum_module_lease
 }
 
 veth_presence() {
@@ -737,32 +817,11 @@ converge_tcx() {
   write_phase "${TCX_PHASE}" "$(render_tcx_phase explicit-restored)"
 }
 
-render_module_phase() { printf '%s\n' 'format=wg-mix-ebpf-b82-veth-module-v2' "run_id=${VETH_RUN_ID}" "resource_id=${RESOURCE_ID}" "module=${MODULE_NAME}" "module_sha256=${MODULE_SHA256}" "module_srcversion=${MODULE_SRCVERSION}"; }
-
-verify_loaded_module() {
-  [[ -d "/sys/module/${MODULE_NAME}" && "$(read_single_line "/sys/module/${MODULE_NAME}/srcversion")" == "${MODULE_SRCVERSION}" ]] || return 79
-}
-
-ensure_module_phase() {
-  local expected actual
-  if [[ -f "${MODULE_PHASE}" && ! -L "${MODULE_PHASE}" ]]; then
-    expected="$(render_module_phase)"; actual="$(/usr/bin/cat "${MODULE_PHASE}")"
-    [[ "${expected}" == "${actual}" ]] || fail 'module-phase-mismatch' 79
-    if [[ -e "/sys/module/${MODULE_NAME}" ]]; then
-      verify_loaded_module || fail 'module-identity-drift' 79
-    else
-      [[ -f "${CLEANUP_PHASE}" && ! -L "${CLEANUP_PHASE}" ]] || fail 'module-missing-before-cleanup-intent' 79
-    fi
-    return
-  fi
-  if [[ -e "/sys/module/${MODULE_NAME}" ]]; then verify_loaded_module || fail 'unreceipted-module-identity' 79; write_phase "${MODULE_PHASE}" "$(render_module_phase)"; fi
-}
-
 load_module() {
-  [[ ! -e "/sys/module/${MODULE_NAME}" ]] || fail 'module-preexists' 79
-  run_operation M.load module-load
-  verify_loaded_module || fail 'module-load-identity' 79
-  write_phase "${MODULE_PHASE}" "$(render_module_phase)"
+  local state
+  c8_checksum_module_load M.load || fail 'module-lease-load' $?
+  state="$(c8_checksum_module_validate_restore_state)" || fail 'module-lease-load-state' $?
+  [[ "${state}" == '11-owned-live' ]] || fail "module-lease-load-state:${state}" 79
 }
 
 run_faketcp_tests() {
@@ -781,7 +840,7 @@ run_faketcp_tests() {
 }
 
 render_cleanup_intent() {
-  printf '%s\n' 'format=wg-mix-ebpf-b82-veth-cleanup-v2' "run_id=${VETH_RUN_ID}" "resource_id=${RESOURCE_ID}" "boot_id=${ORIGINAL_BOOT_ID}" "netns=${INITIAL_NETNS}" "mutation_sha256=$(file_sha_or_absent "${MUTATION_PHASE}")" "veth_sha256=$(file_sha_or_absent "${VETH_PHASE}")" "tcx_sha256=$(file_sha_or_absent "${TCX_PHASE}")" "module_sha256=$(file_sha_or_absent "${MODULE_PHASE}")" "pin=${PIN_PATH}" "runtime=${TCX_RUNTIME_ROOT}" "veth_a=${VETH_A}" "veth_b=${VETH_B}" "module=${MODULE_NAME}"
+  printf '%s\n' 'format=wg-mix-ebpf-b82-veth-cleanup-v3' "run_id=${VETH_RUN_ID}" "resource_id=${RESOURCE_ID}" "boot_id=${ORIGINAL_BOOT_ID}" "netns=${INITIAL_NETNS}" "mutation_sha256=$(file_sha_or_absent "${MUTATION_PHASE}")" "veth_sha256=$(file_sha_or_absent "${VETH_PHASE}")" "tcx_sha256=$(file_sha_or_absent "${TCX_PHASE}")" "module_intent_sha256=$(file_sha_or_absent "${MODULE_INTENT}")" "module_owned_sha256=$(file_sha_or_absent "${MODULE_OWNED}")" "pin=${PIN_PATH}" "runtime=${TCX_RUNTIME_ROOT}" "veth_a=${VETH_A}" "veth_b=${VETH_B}" "module=${MODULE_NAME}" "lease_id=${MODULE_LEASE_ID}"
 }
 
 ensure_cleanup_intent() {
@@ -796,13 +855,11 @@ validate_cleanup_intent() {
 }
 
 converge_module_absent() {
-  ensure_module_phase
-  if [[ -f "${MODULE_PHASE}" ]]; then
-    if [[ -e "/sys/module/${MODULE_NAME}" ]]; then verify_loaded_module || fail 'cleanup-module-identity' 79; run_convergent_operation R.module module-unload; fi
-    [[ ! -e "/sys/module/${MODULE_NAME}" ]] || fail 'module-remove-incomplete' 79
-  else
-    [[ ! -e "/sys/module/${MODULE_NAME}" ]] || fail 'unowned-module-present' 79
-  fi
+  local state
+  c8_checksum_module_restore R.module || fail 'module-lease-restore' $?
+  state="$(c8_checksum_module_validate_restore_state)" || fail 'module-lease-restored-state' $?
+  [[ "${state}" == '00-clean' || "${state}" == '00-restored' ]] ||
+    fail "module-lease-restored-state:${state}" 79
 }
 
 converge_veth_absent() {
@@ -840,23 +897,30 @@ verify_final_state() {
 }
 
 validate_completed_chain() {
+  local module_state
   validate_baseline
   validate_staged_source
   if [[ -f "${MUTATION_PHASE}" && ! -L "${MUTATION_PHASE}" ]]; then
     validate_mutation_plan
     ensure_veth_phase
-    ensure_module_phase
     [[ -f "${TCX_PHASE}" && ! -L "${TCX_PHASE}" ]] || fail 'completed-tcx-phase-missing' 79
     validate_tcx_phase
     [[ ! -e "${PIN_PATH}" ]] || fail 'completed-tcx-pin-remains' 79
+    module_state="$(c8_checksum_module_validate_restore_state)" || fail 'completed-module-state' $?
+    [[ "${module_state}" == '00-clean' || "${module_state}" == '00-restored' ]] ||
+      fail "completed-module-state:${module_state}" 79
   else
-    [[ ! -e "${MUTATION_PHASE}" && ! -e "${VETH_PHASE}" && ! -e "${TCX_PHASE}" && ! -e "${MODULE_PHASE}" && ! -e "${PIN_PATH}" && ! -e "/sys/module/${MODULE_NAME}" && "$(veth_presence)" == 00 ]] || fail 'completed-resource-without-mutation-plan' 79
+    [[ ! -e "${MUTATION_PHASE}" && ! -e "${VETH_PHASE}" && ! -e "${TCX_PHASE}" &&
+      ! -e "${MODULE_INTENT}" && ! -e "${MODULE_OWNED}" && ! -e "${MODULE_UNLOADED}" &&
+      ! -e "${PIN_PATH}" && ! -e "/sys/module/${MODULE_NAME}" &&
+      "$(veth_presence)" == 00 ]] || fail 'completed-resource-without-mutation-plan' 79
   fi
   validate_cleanup_intent
   assert_bpf_baseline R.completed-bpf
 }
 
 converge_restore() {
+  local mutation_started=0
   validate_evidence_shapes
   if validate_terminal_phase "${RESTORED_PHASE}" restored; then
     [[ ! -e "${FILESYSTEM_PHASE}" ]] || fail 'dual-terminal-state' 79
@@ -867,7 +931,10 @@ converge_restore() {
   fi
   [[ ! -e "${RESTORED_PHASE}" ]] || fail 'invalid-restored-phase' 79
   if [[ ! -e "${BASELINE_PHASE}" ]]; then
-    [[ ! -e "${MUTATION_PHASE}" && ! -e "${VETH_PHASE}" && ! -e "${TCX_PHASE}" && ! -e "${MODULE_PHASE}" && ! -e "${CLEANUP_PHASE}" ]] || fail 'filesystem-terminal-with-mutation' 79
+    [[ ! -e "${MUTATION_PHASE}" && ! -e "${VETH_PHASE}" && ! -e "${TCX_PHASE}" &&
+      ! -e "${MODULE_INTENT}" && ! -e "${MODULE_OWNED}" && ! -e "${MODULE_UNLOADED}" &&
+      ! -e "${CLEANUP_PHASE}" ]] ||
+      fail 'filesystem-terminal-with-mutation' 79
     if ! validate_terminal_phase "${FILESYSTEM_PHASE}" filesystem-retained; then
       [[ ! -e "${FILESYSTEM_PHASE}" ]] || fail 'invalid-filesystem-phase' 79
       write_phase "${FILESYSTEM_PHASE}" 'format=wg-mix-ebpf-b82-veth-terminal-v2' "run_id=${VETH_RUN_ID}" "resource_id=${RESOURCE_ID}" 'state=filesystem-retained' "utc=$(utc_now)"
@@ -878,11 +945,19 @@ converge_restore() {
   [[ ! -e "${FILESYSTEM_PHASE}" ]] || fail 'filesystem-phase-with-baseline' 79
   validate_baseline
   validate_staged_source
-  if [[ -f "${MUTATION_PHASE}" ]]; then validate_mutation_plan; ensure_veth_phase; ensure_module_phase; converge_tcx; else
-    [[ ! -e "${VETH_PHASE}" && ! -e "${TCX_PHASE}" && ! -e "${MODULE_PHASE}" && ! -e "${PIN_PATH}" && ! -e "/sys/module/${MODULE_NAME}" && "$(veth_presence)" == 00 ]] || fail 'resource-without-mutation-plan' 79
+  if [[ -f "${MUTATION_PHASE}" ]]; then
+    mutation_started=1
+    validate_mutation_plan
+    ensure_veth_phase
+    converge_tcx
+  else
+    [[ ! -e "${VETH_PHASE}" && ! -e "${TCX_PHASE}" && ! -e "${MODULE_INTENT}" &&
+      ! -e "${MODULE_OWNED}" && ! -e "${MODULE_UNLOADED}" &&
+      ! -e "${PIN_PATH}" && ! -e "/sys/module/${MODULE_NAME}" && "$(veth_presence)" == 00 ]] ||
+      fail 'resource-without-mutation-plan' 79
   fi
   ensure_cleanup_intent
-  converge_module_absent
+  if ((mutation_started)); then converge_module_absent; fi
   converge_veth_absent
   assert_bpf_baseline R.cleanup-bpf
   verify_final_state R.final
@@ -892,7 +967,9 @@ converge_restore() {
 }
 
 run_all() {
-  validate_controller_identity; validate_package_bundle; create_roots; stage_source; snapshot_baseline
+  validate_controller_identity; load_checksum_module_helper; validate_package_bundle; create_roots
+  c8_checksum_module_acquire L0.run
+  stage_source; snapshot_baseline
   run_operation O.build build
   prepare_mutation_plan
   create_veth
@@ -905,8 +982,10 @@ run_all() {
 
 restore_all() {
   validate_controller_identity
+  load_checksum_module_helper
   [[ -d "${VETH_STAGE_ROOT}" && ! -L "${VETH_STAGE_ROOT}" && -d "${EVIDENCE_ROOT}" && ! -L "${EVIDENCE_ROOT}" ]] || fail 'restore-root-shape' 79
   validate_owner
+  c8_checksum_module_acquire L0.restore
   converge_restore
 }
 

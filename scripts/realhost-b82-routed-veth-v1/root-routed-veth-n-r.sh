@@ -3,21 +3,22 @@ set -u
 set -o pipefail
 umask 077
 
-readonly RUN_ID='7e42a19c'
+readonly RUN_ID='c8e41d73'
 readonly RESOURCE_ID='5b8d30f1'
-readonly STATE_SCHEMA='owner,baseline,operation-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module,tested,cleanup-intent,restored'
+readonly STATE_SCHEMA='owner,baseline,operation-intent,dependency-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module-intent,module,tested,cleanup-intent,restored'
 readonly STAGE_ROOT="/run/wg-mix-ebpf-source-stages/${RUN_ID}"
 readonly EXPECTED_SOURCE="${STAGE_ROOT}/source"
-readonly GO_CACHE="${STAGE_ROOT}/go-cache"
-readonly GO_MOD_CACHE="${STAGE_ROOT}/go-mod-cache"
-readonly GO_PATH="${STAGE_ROOT}/go-path"
-readonly GO_TMP="${STAGE_ROOT}/go-tmp"
-readonly RUNTIME_TEMP="${STAGE_ROOT}/go-tmp-realhost"
 readonly EVIDENCE_ROOT="${STAGE_ROOT}/routed-evidence-${RESOURCE_ID}"
+readonly GO_CACHE="${EVIDENCE_ROOT}/go-cache"
+readonly GO_MOD_CACHE="${EVIDENCE_ROOT}/go-mod-cache"
+readonly GO_PATH="${EVIDENCE_ROOT}/go-path"
+readonly GO_TMP="${EVIDENCE_ROOT}/go-tmp"
+readonly RUNTIME_TEMP="${STAGE_ROOT}/go-tmp-realhost-${RESOURCE_ID}"
 readonly AUDIT_LOG="${EVIDENCE_ROOT}/audit.log"
 readonly OWNER_PHASE="${EVIDENCE_ROOT}/phase-owner.v1"
 readonly BASELINE_PHASE="${EVIDENCE_ROOT}/phase-baseline.v1"
 readonly OPERATION_PHASE="${EVIDENCE_ROOT}/phase-operation-intent.v1"
+readonly DEPENDENCY_INTENT_PHASE="${EVIDENCE_ROOT}/phase-dependency-intent.v1"
 readonly DEPENDENCY_PHASE="${EVIDENCE_ROOT}/phase-dependency-preflight.v1"
 readonly VETH_INTENT_PHASE="${EVIDENCE_ROOT}/phase-veth-intent.v1"
 readonly VETH_PHASE="${EVIDENCE_ROOT}/phase-veth.v1"
@@ -25,7 +26,9 @@ readonly ADDRESS_PHASE="${EVIDENCE_ROOT}/phase-address.v1"
 readonly ROUTE_PHASE="${EVIDENCE_ROOT}/phase-route.v1"
 readonly NEIGHBOR_PHASE="${EVIDENCE_ROOT}/phase-neighbor.v1"
 readonly OFFLOAD_PHASE="${EVIDENCE_ROOT}/phase-offload.v1"
-readonly MODULE_PHASE="${EVIDENCE_ROOT}/phase-module.v1"
+readonly MODULE_INTENT_PHASE="${EVIDENCE_ROOT}/checksum-module-intent.v1"
+readonly MODULE_PHASE="${EVIDENCE_ROOT}/checksum-module-owned.v1"
+readonly MODULE_UNLOADED_PHASE="${EVIDENCE_ROOT}/checksum-module-unloaded.v1"
 readonly TESTED_PHASE="${EVIDENCE_ROOT}/phase-tested.v1"
 readonly CLEANUP_PHASE="${EVIDENCE_ROOT}/phase-cleanup-intent.v1"
 readonly RESTORED_PHASE="${EVIDENCE_ROOT}/phase-restored.v1"
@@ -33,12 +36,12 @@ readonly BPF_LINK_BASELINE="${EVIDENCE_ROOT}/baseline-bpf-links.json"
 readonly OFFLOAD_BASELINE_A="${EVIDENCE_ROOT}/baseline-offload-a.txt"
 readonly PREFLIGHT_BINARY="${EVIDENCE_ROOT}/dataplane-preflight.test"
 
-readonly VETH_A="wg${RUN_ID:0:5}a"
-readonly VETH_B="wg${RUN_ID:0:5}b"
-readonly VETH_A_ALIAS="wg-mix-ebpf:${RUN_ID}:a"
-readonly VETH_B_ALIAS="wg-mix-ebpf:${RUN_ID}:b"
-readonly VETH_A_MAC='02:7e:42:a1:9c:0a'
-readonly VETH_B_MAC='02:7e:42:a1:9c:0b'
+readonly VETH_A="wg${RESOURCE_ID:0:5}a"
+readonly VETH_B="wg${RESOURCE_ID:0:5}b"
+readonly VETH_A_ALIAS="wg-mix-ebpf:${RUN_ID}:${RESOURCE_ID}:a"
+readonly VETH_B_ALIAS="wg-mix-ebpf:${RUN_ID}:${RESOURCE_ID}:b"
+readonly VETH_A_MAC='02:5b:8d:30:f1:0a'
+readonly VETH_B_MAC='02:5b:8d:30:f1:0b'
 readonly LOCAL_IPV4='198.18.82.1'
 readonly REMOTE_IPV4='198.18.82.2'
 readonly PREFIX_BITS='32'
@@ -47,6 +50,10 @@ readonly MODULE_NAME='wg_mix_faketcp_checksum'
 readonly EXPERIMENTAL_OBJECT="${EXPECTED_SOURCE}/build/wg_mix_faketcp_experimental.o"
 readonly BASELINE_OBJECT="${EXPECTED_SOURCE}/build/wg_mix_tc.o"
 readonly MODULE_OBJECT="${EXPECTED_SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko"
+readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-c8e41d73/checksum-module-lease.sh"
+readonly MODULE_LEASE_HELPER="${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}"
+readonly MODULE_LEASE_LOCK="${STAGE_ROOT}/checksum-module-lease.v1.lock"
+readonly MODULE_LEASE_ID="${RUN_ID}-${RESOURCE_ID}"
 readonly SELF_RELATIVE='scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh'
 readonly SEAM_RELATIVE='scripts/realhost-b82-routed-veth-v1/controller-seam.sh'
 readonly ROUTED_CONTRACT_RELATIVE='internal/dataplane/faketcp_routed_realhost_contract_test.go'
@@ -75,17 +82,22 @@ VETH_A_IFINDEX=''
 VETH_B_IFINDEX=''
 VETH_A_SYSFS=''
 VETH_B_SYSFS=''
-EXPECTED_MODULE_SRCVERSION=''
 OP_TARGET=''
 declare -a OP_ARGV=()
 declare -a BOOTSTRAP_AUDIT_LINES=()
 
-readonly -a GO_ENV=(
+readonly -a GO_COMMON_ENV=(
   /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
-  CGO_ENABLED=0 GOENV=off GOFLAGS=-mod=readonly GOTOOLCHAIN=local GOPROXY=off GOSUMDB=off
+  CGO_ENABLED=0 GOENV=off GOFLAGS=-mod=readonly GOTOOLCHAIN=local
   'GOVCS=*:off'
   GOCACHE="${GO_CACHE}" GOMODCACHE="${GO_MOD_CACHE}" GOPATH="${GO_PATH}"
   GOTMPDIR="${GO_TMP}" TMPDIR="${GO_TMP}" GOWORK=off GO111MODULE=on
+)
+readonly -a GO_DOWNLOAD_ENV=(
+  "${GO_COMMON_ENV[@]}" GOPROXY=https://proxy.golang.org GOSUMDB=sum.golang.org
+)
+readonly -a GO_OFFLINE_ENV=(
+  "${GO_COMMON_ENV[@]}" GOPROXY=off GOSUMDB=off
 )
 readonly -a GIT_COMMAND=(
   /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C
@@ -185,10 +197,15 @@ build_argv() {
   OP_ARGV=()
   case "${operation}" in
     evidence-mkdir) OP_TARGET="${EVIDENCE_ROOT}"; OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${EVIDENCE_ROOT}") ;;
+    go-cache-mkdir) OP_TARGET="${GO_CACHE}"; OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${GO_CACHE}") ;;
+    go-mod-cache-mkdir) OP_TARGET="${GO_MOD_CACHE}"; OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${GO_MOD_CACHE}") ;;
+    go-path-mkdir) OP_TARGET="${GO_PATH}"; OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${GO_PATH}") ;;
+    go-tmp-mkdir) OP_TARGET="${GO_TMP}"; OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${GO_TMP}") ;;
     runtime-temp-mkdir) OP_TARGET="${RUNTIME_TEMP}"; OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${RUNTIME_TEMP}") ;;
     bpf-links) OP_TARGET='global-bpf-links'; OP_ARGV=(/usr/sbin/bpftool -j link show) ;;
-    preflight-mod-verify) OP_TARGET="${GO_MOD_CACHE}"; OP_ARGV=("${GO_ENV[@]}" /usr/bin/timeout --signal=TERM --kill-after=10s 5m /usr/bin/go -C "${SOURCE}" mod verify) ;;
-    preflight-build) OP_TARGET="${PREFLIGHT_BINARY}"; OP_ARGV=("${GO_ENV[@]}" /usr/bin/timeout --signal=TERM --kill-after=10s 10m /usr/bin/go -C "${SOURCE}" test -c -o "${PREFLIGHT_BINARY}" ./internal/dataplane) ;;
+    preflight-mod-download) OP_TARGET="${GO_MOD_CACHE}"; OP_ARGV=("${GO_DOWNLOAD_ENV[@]}" /usr/bin/timeout --signal=TERM --kill-after=10s 10m /usr/bin/go -C "${SOURCE}" mod download all) ;;
+    preflight-mod-verify) OP_TARGET="${GO_MOD_CACHE}"; OP_ARGV=("${GO_OFFLINE_ENV[@]}" /usr/bin/timeout --signal=TERM --kill-after=10s 5m /usr/bin/go -C "${SOURCE}" mod verify) ;;
+    preflight-build) OP_TARGET="${PREFLIGHT_BINARY}"; OP_ARGV=("${GO_OFFLINE_ENV[@]}" /usr/bin/timeout --signal=TERM --kill-after=10s 10m /usr/bin/go -C "${SOURCE}" test -c -o "${PREFLIGHT_BINARY}" ./internal/dataplane) ;;
     veth-add) OP_TARGET="${VETH_A}:${VETH_B}"; OP_ARGV=(/usr/sbin/ip link add "${VETH_A}" address "${VETH_A_MAC}" type veth peer name "${VETH_B}" address "${VETH_B_MAC}") ;;
     veth-alias-a) OP_TARGET="${VETH_A}"; OP_ARGV=(/usr/sbin/ip link set dev "${VETH_A}" alias "${VETH_A_ALIAS}") ;;
     veth-alias-b) OP_TARGET="${VETH_B}"; OP_ARGV=(/usr/sbin/ip link set dev "${VETH_B}" alias "${VETH_B_ALIAS}") ;;
@@ -200,8 +217,6 @@ build_argv() {
     offload-show-a) OP_TARGET="${VETH_A}"; OP_ARGV=(/usr/sbin/ethtool -k "${VETH_A}") ;;
     offload-tso-off) OP_TARGET="${VETH_A}:tso=off"; OP_ARGV=(/usr/sbin/ethtool -K "${VETH_A}" tso off) ;;
     offload-tso-restore) OP_TARGET="${VETH_A}:tso=on"; OP_ARGV=(/usr/sbin/ethtool -K "${VETH_A}" tso on) ;;
-    module-load) OP_TARGET="${MODULE_NAME}"; OP_ARGV=(/usr/sbin/insmod "${MODULE_OBJECT}") ;;
-    module-unload) OP_TARGET="${MODULE_NAME}"; OP_ARGV=(/usr/sbin/rmmod "${MODULE_NAME}") ;;
     list:*)
       name="${operation#list:}"; valid_preflight_test_name "${name}" || return 64
       OP_TARGET="${name}"
@@ -214,7 +229,7 @@ build_argv() {
     test:*)
       name="${operation#test:}"; valid_test_name "${name}" || return 64
       OP_TARGET="${name}"
-      OP_ARGV=(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C TMPDIR="${RUNTIME_TEMP}" WG_MIX_FAKETCP_RUN_REALHOST_INTEGRATION=1 WG_MIX_FAKETCP_REALHOST_OBJECT="${EXPERIMENTAL_OBJECT}" WG_MIX_FAKETCP_REALHOST_BASELINE_OBJECT="${BASELINE_OBJECT}" WG_MIX_FAKETCP_REALHOST_IFINDEX="${VETH_A_IFINDEX}" WG_MIX_FAKETCP_REALHOST_PEER_IFINDEX="${VETH_B_IFINDEX}" WG_MIX_FAKETCP_REALHOST_XDP_MODE=generic WG_MIX_FAKETCP_REALHOST_RUN_ID="${RUN_ID}" WG_MIX_FAKETCP_ROUTED_LOCAL_IPV4="${LOCAL_IPV4}" WG_MIX_FAKETCP_ROUTED_REMOTE_IPV4="${REMOTE_IPV4}" WG_MIX_FAKETCP_ROUTED_PREFIX_BITS="${PREFIX_BITS}" WG_MIX_FAKETCP_ROUTED_ROUTE_MTU="${ROUTE_MTU}" /usr/bin/timeout --signal=TERM --kill-after=10s 3m "${PREFLIGHT_BINARY}" -test.run "^${name}$" -test.count=1 -test.timeout=2m -test.v)
+      OP_ARGV=(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C TMPDIR="${RUNTIME_TEMP}" WG_MIX_FAKETCP_RUN_REALHOST_INTEGRATION=1 WG_MIX_FAKETCP_REALHOST_OBJECT="${EXPERIMENTAL_OBJECT}" WG_MIX_FAKETCP_REALHOST_BASELINE_OBJECT="${BASELINE_OBJECT}" WG_MIX_FAKETCP_REALHOST_IFINDEX="${VETH_A_IFINDEX}" WG_MIX_FAKETCP_REALHOST_PEER_IFINDEX="${VETH_B_IFINDEX}" WG_MIX_FAKETCP_REALHOST_XDP_MODE=generic WG_MIX_FAKETCP_REALHOST_RUN_ID="${RUN_ID}" WG_MIX_FAKETCP_REALHOST_RESOURCE_ID="${RESOURCE_ID}" WG_MIX_FAKETCP_ROUTED_LOCAL_IPV4="${LOCAL_IPV4}" WG_MIX_FAKETCP_ROUTED_REMOTE_IPV4="${REMOTE_IPV4}" WG_MIX_FAKETCP_ROUTED_PREFIX_BITS="${PREFIX_BITS}" WG_MIX_FAKETCP_ROUTED_ROUTE_MTU="${ROUTE_MTU}" /usr/bin/timeout --signal=TERM --kill-after=10s 3m "${PREFLIGHT_BINARY}" -test.run "^${name}$" -test.count=1 -test.timeout=2m -test.v)
       ;;
     neighbor-delete) OP_TARGET="${VETH_A}:${REMOTE_IPV4}"; OP_ARGV=(/usr/sbin/ip -4 neigh del "${REMOTE_IPV4}" lladdr "${VETH_B_MAC}" nud permanent dev "${VETH_A}") ;;
     route-delete) OP_TARGET="${REMOTE_IPV4}/${PREFIX_BITS}"; OP_ARGV=(/usr/sbin/ip -4 route del "${REMOTE_IPV4}/${PREFIX_BITS}" dev "${VETH_A}" src "${LOCAL_IPV4}" mtu "${ROUTE_MTU}" proto static scope link) ;;
@@ -242,9 +257,17 @@ render_plan() {
     "${VETH_A}" "${VETH_B}" "${LOCAL_IPV4}" "${PREFIX_BITS}" "${VETH_B}" \
     "${REMOTE_IPV4}" "${PREFIX_BITS}" "${ROUTE_MTU}" "${VETH_B_MAC}"
   plan_operation B0 evidence-mkdir
+  printf 'L0 operation=shared-module-lock target=%q helper=%q argv=' "${MODULE_LEASE_LOCK}" "${MODULE_LEASE_HELPER}"
+  quote_argv /usr/bin/flock --exclusive --nonblock MODULE_LEASE_FD
+  printf '\n'
   plan_operation A.bpf bpf-links
-  plan_operation P0 preflight-mod-verify
-  plan_operation P1 preflight-build
+  plan_operation C0 go-cache-mkdir
+  plan_operation C1 go-mod-cache-mkdir
+  plan_operation C2 go-path-mkdir
+  plan_operation C3 go-tmp-mkdir
+  plan_operation P0 preflight-mod-download
+  plan_operation P1 preflight-mod-verify
+  plan_operation P2 preflight-build
   for name in "${PREFLIGHT_CONTRACT_TEST}" "${NEGATIVE_TEST}" "${POSITIVE_TESTS[@]}"; do
     plan_operation "P.${name}" "list:${name}"
   done
@@ -254,27 +277,34 @@ render_plan() {
     'N0|veth-add' 'N1|veth-alias-a' 'N2|veth-alias-b' \
     'N3|veth-up-a' 'N4|veth-up-b' 'N5|address-add' \
     'N6|route-add' 'N7|neighbor-add' 'N8|offload-show-a' \
-    'N9|offload-tso-off' 'M0|module-load'; do
+    'N9|offload-tso-off'; do
     IFS='|' read -r label operation <<<"${spec}"
     plan_operation "${label}" "${operation}"
   done
+  printf 'M0 operation=shared-module-load target=%q helper=c8_checksum_module_load argv=' "${MODULE_NAME}"
+  quote_argv /usr/sbin/insmod "${MODULE_OBJECT}" "lease_id=${MODULE_LEASE_ID}"
+  printf '\n'
   for name in "${NEGATIVE_TEST}" "${POSITIVE_TESTS[@]}"; do
     plan_operation "T.${name}" "test:${name}"
   done
+  plan_operation R0 bpf-links
+  printf 'R1 operation=shared-module-restore target=%q helper=c8_checksum_module_restore argv=' "${MODULE_NAME}"
+  quote_argv /usr/sbin/rmmod "${MODULE_NAME}"
+  printf '\n'
   for spec in \
-    'R0|bpf-links' 'R1|module-unload' 'R2|offload-tso-restore' \
+    'R2|offload-tso-restore' \
     'R3|neighbor-delete' 'R4|route-delete' 'R5|address-delete' \
     'R6|veth-delete' 'R7|bpf-links'; do
     IFS='|' read -r label operation <<<"${spec}"
     plan_operation "${label}" "${operation}"
   done
-  printf 'B82_ROUTED_VETH_WRITE_SET filesystem=%s,%s,%s,%s,%s,%s,%s network=veth:%s,%s,address:%s/%s,route:%s/%s,neighbor:%s,offload:%s:tso module=%s bpf=transient-unpinned-test-owned evidence_retained=1\n' \
+  printf 'B82_ROUTED_VETH_WRITE_SET filesystem=%s,%s,%s,%s,%s,%s,%s shared_lock=%s:advisory-only network=veth:%s,%s,address:%s/%s,route:%s/%s,neighbor:%s,offload:%s:tso module=%s,lease_id:%s bpf=transient-unpinned-test-owned evidence_retained=1\n' \
     "${EVIDENCE_ROOT}" "${PREFLIGHT_BINARY}" "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}" "${RUNTIME_TEMP}" \
-    "${VETH_A}" "${VETH_B}" "${LOCAL_IPV4}" "${PREFIX_BITS}" "${REMOTE_IPV4}" \
-    "${PREFIX_BITS}" "${REMOTE_IPV4}" "${VETH_A}" "${MODULE_NAME}"
+    "${MODULE_LEASE_LOCK}" "${VETH_A}" "${VETH_B}" "${LOCAL_IPV4}" "${PREFIX_BITS}" "${REMOTE_IPV4}" \
+    "${PREFIX_BITS}" "${REMOTE_IPV4}" "${VETH_A}" "${MODULE_NAME}" "${MODULE_LEASE_ID}"
   printf 'B82_ROUTED_VETH_RESTORE_ORDER cleanup-intent,bpf-baseline,module,offload,neighbor,route,address,veth,bpf-baseline,restored retryable=1 exact_reverse=1\n'
   printf 'B82_ROUTED_VETH_COVERAGE af_packet=none,partial,gso:route-unknown-negative routed=iphdrincl-none,udp-partial,udp-segment-gso:positive capability_bits_changed=0\n'
-  printf 'B82_ROUTED_VETH_PLAN_COMPLETE commands_are_review_templates=1 preflight_before_host_mutation=1 network_downloads=0 no_commands_executed=1 credential_read=0 remote_connections=0 network_operations=0\n'
+  printf 'B82_ROUTED_VETH_PLAN_COMPLETE commands_are_review_templates=1 preflight_before_host_mutation=1 network_downloads=bounded-go-module-proxy-only no_commands_executed=1 credential_read=0 remote_connections=0 network_operations=0\n'
 }
 
 utc_now() { /bin/date -u '+%Y-%m-%dT%H:%M:%SZ'; }
@@ -315,19 +345,37 @@ audit_line() {
     "${timestamp}" "${event}" "${step}" "${target}" "${rc}" "${rendered}" >>"${AUDIT_LOG}"
 }
 
-run_operation() {
-  local label="$1" operation="$2" rendered rc
+run_audited_argv() {
+  local label="$1" target="$2" rendered rc
   local -a status
-  build_argv "${operation}" || fail "operation-builder:${operation}" $?
-  rendered="$(quote_argv "${OP_ARGV[@]}")" || fail "render:${label}"
-  audit_line start "${label}" "${OP_TARGET}" not-run "${rendered}" || fail "audit-start:${label}"
-  "${OP_ARGV[@]}" 2>&1 | /usr/bin/tee -a "${AUDIT_LOG}"
+  shift 2
+  rendered="$(quote_argv "$@")" || fail "render:${label}"
+  audit_line start "${label}" "${target}" not-run "${rendered}" || fail "audit-start:${label}"
+  "$@" 2>&1 | /usr/bin/tee -a "${AUDIT_LOG}"
   status=("${PIPESTATUS[@]}")
   ((${#status[@]} == 2)) || fail "pipeline:${label}"
   rc="${status[0]}"
-  audit_line finish "${label}" "${OP_TARGET}" "${rc}" "${rendered}" || fail "audit-finish:${label}"
+  audit_line finish "${label}" "${target}" "${rc}" "${rendered}" || fail "audit-finish:${label}"
   ((status[1] == 0)) || fail "audit-output:${label}" "${status[1]}"
   return "${rc}"
+}
+
+run_operation() {
+  local label="$1" operation="$2"
+  build_argv "${operation}" || fail "operation-builder:${operation}" $?
+  run_audited_argv "${label}" "${OP_TARGET}" "${OP_ARGV[@]}"
+}
+
+c8_checksum_module_run() {
+  run_audited_argv "$@"
+}
+
+c8_checksum_module_write() {
+  write_phase "$1" "$2"
+}
+
+c8_checksum_module_fail() {
+  fail "checksum-module-lease:$1" "$2"
 }
 
 capture_operation() {
@@ -376,7 +424,8 @@ render_baseline() {
   printf '%s\n' \
     'format=wg-mix-ebpf-b82-routed-baseline-v1' \
     "run_id=${RUN_ID}" "resource_id=${RESOURCE_ID}" "boot_id=${BOOT_ID}" \
-    "netns=${INITIAL_NETNS}" 'runtime_temp=absent' 'veth=absent' 'address=absent' 'route=absent' \
+    "netns=${INITIAL_NETNS}" 'dependency_caches=absent' 'runtime_temp=absent' \
+    'veth=absent' 'address=absent' 'route=absent' \
     'neighbor=absent' 'module=absent' \
     "bpf_links_sha256=$(sha256_file "${BPF_LINK_BASELINE}")"
 }
@@ -386,7 +435,8 @@ render_operation_intent() {
     'format=wg-mix-ebpf-b82-routed-operation-v1' \
     "run_id=${RUN_ID}" "resource_id=${RESOURCE_ID}" "boot_id=${BOOT_ID}" \
     "source=${SOURCE}" "commit=${COMMIT}" \
-    "dependency_cache=${GO_MOD_CACHE},proxy=off,mode=readonly" \
+    "dependency_caches=${GO_CACHE},${GO_MOD_CACHE},${GO_PATH},${GO_TMP}" \
+    'dependency_producer=bounded-go-module-proxy-then-offline,mode=readonly' \
     "preflight_binary=${PREFLIGHT_BINARY}" \
     "runtime_temp=${RUNTIME_TEMP},baseline=absent,operation=create,owner=0:0,mode=0700,restore=retained" \
     "veth=${VETH_A},${VETH_B}" "address=${LOCAL_IPV4}/${PREFIX_BITS}" \
@@ -396,13 +446,29 @@ render_operation_intent() {
     'reverse=module,offload,neighbor,route,address,veth'
 }
 
+render_dependency_intent() {
+  printf '%s\n' \
+    'format=wg-mix-ebpf-b82-routed-dependency-intent-v1' \
+    "run_id=${RUN_ID}" "resource_id=${RESOURCE_ID}" "boot_id=${BOOT_ID}" \
+    "go_cache=${GO_CACHE},owner=0:0,mode=0700,operation=create" \
+    "go_mod_cache=${GO_MOD_CACHE},owner=0:0,mode=0700,operation=create" \
+    "go_path=${GO_PATH},owner=0:0,mode=0700,operation=create" \
+    "go_tmp=${GO_TMP},owner=0:0,mode=0700,operation=create" \
+    'producer=go-mod-download-all' 'producer_proxy=https://proxy.golang.org' \
+    'consumer_proxy=off' 'go_mod=readonly' 'restore=retained'
+}
+
 render_dependency_preflight() {
   printf '%s\n' \
     'format=wg-mix-ebpf-b82-routed-dependency-v1' \
     "run_id=${RUN_ID}" "resource_id=${RESOURCE_ID}" "commit=${COMMIT}" \
     "binary=${PREFLIGHT_BINARY}" "binary_sha256=$(sha256_file "${PREFLIGHT_BINARY}")" \
-    "go_cache=${GO_CACHE}" "go_mod_cache=${GO_MOD_CACHE}" \
-    'module_cache_verified=1' 'goproxy=off' 'go_mod=readonly' \
+    "go_cache=${GO_CACHE},identity=$(directory_binding "${GO_CACHE}")" \
+    "go_mod_cache=${GO_MOD_CACHE},identity=$(directory_binding "${GO_MOD_CACHE}")" \
+    "go_path=${GO_PATH},identity=$(directory_binding "${GO_PATH}")" \
+    "go_tmp=${GO_TMP},identity=$(directory_binding "${GO_TMP}")" \
+    'module_cache_produced=1' 'module_cache_verified=1' \
+    'producer_proxy=https://proxy.golang.org' 'consumer_proxy=off' 'go_mod=readonly' \
     "contract_test=${PREFLIGHT_CONTRACT_TEST}:passed" \
     "tests=${NEGATIVE_TEST},${POSITIVE_TESTS[*]}"
 }
@@ -449,9 +515,6 @@ verify_source_and_artifacts() {
   BOOT_ID="$(/usr/bin/cat /proc/sys/kernel/random/boot_id)" || fail 'boot-id'
   [[ "${BOOT_ID}" =~ ^[0-9a-f-]{36}$ ]] || fail 'boot-id-format' 77
   require_root_directory "${STAGE_ROOT}" || fail 'stage-root-identity' 79
-  for path in "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}"; do
-    require_root_directory "${path}" || fail "stage-go-directory-identity:${path}" 79
-  done
   [[ -d "${SOURCE}/.git" && ! -L "${SOURCE}" ]] || fail 'source-identity' 79
   head="$("${GIT_COMMAND[@]}" -C "${SOURCE}" rev-parse --verify HEAD^{commit})" || fail 'source-head'
   [[ "${head}" == "${COMMIT}" ]] || fail 'source-commit' 79
@@ -472,7 +535,8 @@ verify_source_and_artifacts() {
     actual="$(sha256_file "${path}")" || fail "artifact-sha-read:${path}"
     [[ "${actual}" == "${expected}" ]] || fail "artifact-sha:${path}" 79
   done
-  for relative in "${SELF_RELATIVE}" "${SEAM_RELATIVE}" "${ROUTED_CONTRACT_RELATIVE}" "${ROUTED_TEST_RELATIVE}" \
+  for relative in "${SELF_RELATIVE}" "${SEAM_RELATIVE}" "${MODULE_LEASE_HELPER_RELATIVE}" \
+    "${ROUTED_CONTRACT_RELATIVE}" "${ROUTED_TEST_RELATIVE}" \
     "${NEGATIVE_TEST_RELATIVE}" "${GSO_KFUNC_RELATIVE}"; do
     mapped="$("${GIT_COMMAND[@]}" -C "${SOURCE}" rev-parse "${COMMIT}:${relative}")" || fail "mapped-blob:${relative}"
     actual_blob="$("${GIT_COMMAND[@]}" -C "${SOURCE}" hash-object -- "${SOURCE}/${relative}")" || fail "actual-blob:${relative}"
@@ -480,8 +544,6 @@ verify_source_and_artifacts() {
   done
   self_blob="$(/usr/bin/readlink -e -- "$0")" || fail 'self-canonical'
   [[ "${self_blob}" == "${SOURCE}/${SELF_RELATIVE}" ]] || fail 'self-path' 79
-  EXPECTED_MODULE_SRCVERSION="$(/usr/sbin/modinfo -F srcversion -- "${MODULE_OBJECT}")" || fail 'module-srcversion'
-  [[ "${EXPECTED_MODULE_SRCVERSION}" =~ ^[0-9A-Fa-f]{8,64}$ ]] || fail 'module-srcversion-format' 79
   for literal in \
     'AF_PACKET fixture as negative evidence only' \
     'fakeTCPRealHostStatMTUReject: 3' \
@@ -494,6 +556,23 @@ verify_source_and_artifacts() {
     'route_mtu = dst_mtu(dst)'; do
     [[ "$(/usr/bin/grep -Fc -- "${literal}" "${SOURCE}/${GSO_KFUNC_RELATIVE}")" == 1 ]] || fail 'routed-pmtu-source-contract' 78
   done
+}
+
+load_checksum_module_helper() {
+  # shellcheck source=../realhost-b82-c8e41d73/checksum-module-lease.sh
+  source "${MODULE_LEASE_HELPER}" || fail 'module-lease-helper-source' $?
+  [[ "${C8_CHECKSUM_MODULE_LOCK}" == "${MODULE_LEASE_LOCK}" ]] ||
+    fail 'module-lease-helper-lock-contract' 79
+}
+
+configure_checksum_module_lease() {
+  c8_checksum_module_configure "${RUN_ID}" "${RESOURCE_ID}" "${COMMIT}" "${BOOT_ID}" \
+    "${EVIDENCE_ROOT}" "${MODULE_OBJECT}" "${MODULE_SHA256}" || fail 'module-lease-configure' $?
+  [[ "${C8_CHECKSUM_MODULE_LEASE_ID}" == "${MODULE_LEASE_ID}" &&
+    "${C8_CHECKSUM_MODULE_INTENT}" == "${MODULE_INTENT_PHASE}" &&
+    "${C8_CHECKSUM_MODULE_OWNED}" == "${MODULE_PHASE}" &&
+    "${C8_CHECKSUM_MODULE_UNLOADED}" == "${MODULE_UNLOADED_PHASE}" ]] ||
+    fail 'module-lease-binding-contract' 79
 }
 
 ensure_directory() {
@@ -561,6 +640,10 @@ ensure_baseline() {
     return
   fi
   [[ ! -f "${OPERATION_PHASE}" ]] || fail 'operation-without-baseline' 79
+  for path in "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}"; do
+    [[ ! -e "${path}" && ! -L "${path}" ]] || fail "dependency-cache-preexists:${path}" 79
+  done
+  [[ ! -e "${PREFLIGHT_BINARY}" && ! -L "${PREFLIGHT_BINARY}" ]] || fail 'preflight-binary-preexists' 79
   [[ ! -e "${RUNTIME_TEMP}" && ! -L "${RUNTIME_TEMP}" ]] || fail 'runtime-temp-preexists' 79
   require_names_absent || fail 'veth-name-preexists' 79
   [[ ! -d "/sys/module/${MODULE_NAME}" ]] || fail 'module-preexists' 79
@@ -583,6 +666,28 @@ ensure_operation_intent() {
   write_phase "${OPERATION_PHASE}" "${expected}" || fail 'operation-write' $?
 }
 
+ensure_dependency_directory() {
+  local label="$1" operation="$2" path="$3"
+  if [[ ! -e "${path}" && ! -L "${path}" ]]; then
+    run_operation "${label}" "${operation}" || fail "dependency-directory-create:${label}" $?
+  fi
+  require_root_directory "${path}" || fail "dependency-directory-identity:${label}" 79
+}
+
+ensure_dependency_intent() {
+  local expected path
+  expected="$(render_dependency_intent)" || fail 'dependency-intent-render'
+  if [[ -f "${DEPENDENCY_INTENT_PHASE}" ]]; then
+    phase_matches "${DEPENDENCY_INTENT_PHASE}" "${expected}" || fail 'dependency-intent-drift' 79
+    return
+  fi
+  for path in "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}"; do
+    [[ ! -e "${path}" && ! -L "${path}" ]] || fail "dependency-cache-without-intent:${path}" 79
+  done
+  [[ ! -e "${PREFLIGHT_BINARY}" && ! -L "${PREFLIGHT_BINARY}" ]] || fail 'preflight-binary-without-intent' 79
+  write_phase "${DEPENDENCY_INTENT_PHASE}" "${expected}" || fail 'dependency-intent-write' $?
+}
+
 ensure_dependency_preflight() {
   local name expected output
   if [[ -f "${DEPENDENCY_PHASE}" ]]; then
@@ -591,9 +696,15 @@ ensure_dependency_preflight() {
     phase_matches "${DEPENDENCY_PHASE}" "${expected}" || fail 'preflight-phase-drift' 79
     return
   fi
-  run_operation P0 preflight-mod-verify || fail 'dependency-module-verification' $?
+  ensure_dependency_intent
+  ensure_dependency_directory C0 go-cache-mkdir "${GO_CACHE}"
+  ensure_dependency_directory C1 go-mod-cache-mkdir "${GO_MOD_CACHE}"
+  ensure_dependency_directory C2 go-path-mkdir "${GO_PATH}"
+  ensure_dependency_directory C3 go-tmp-mkdir "${GO_TMP}"
+  run_operation P0 preflight-mod-download || fail 'dependency-module-download' $?
+  run_operation P1 preflight-mod-verify || fail 'dependency-module-verification' $?
   if [[ ! -e "${PREFLIGHT_BINARY}" && ! -L "${PREFLIGHT_BINARY}" ]]; then
-    run_operation P1 preflight-build || fail 'dependency-build-preflight' $?
+    run_operation P2 preflight-build || fail 'dependency-build-preflight' $?
   fi
   require_root_test_binary "${PREFLIGHT_BINARY}" || fail 'preflight-binary-identity' 79
   for name in "${PREFLIGHT_CONTRACT_TEST}" "${NEGATIVE_TEST}" "${POSITIVE_TESTS[@]}"; do
@@ -614,6 +725,10 @@ ensure_runtime_temp() {
 
 validate_dependency_preflight() {
   local expected
+  phase_matches "${DEPENDENCY_INTENT_PHASE}" "$(render_dependency_intent)" || return 79
+  for path in "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}"; do
+    require_root_directory "${path}" || return 79
+  done
   require_root_test_binary "${PREFLIGHT_BINARY}" || return 79
   expected="$(render_dependency_preflight)" || return $?
   phase_matches "${DEPENDENCY_PHASE}" "${expected}"
@@ -850,22 +965,8 @@ ensure_offload_phase() {
   write_phase "${OFFLOAD_PHASE}" "${expected}" || fail 'offload-phase-write' $?
 }
 
-module_matches() {
-  [[ -d "/sys/module/${MODULE_NAME}" &&
-    "$(/usr/bin/cat "/sys/module/${MODULE_NAME}/srcversion")" == "${EXPECTED_MODULE_SRCVERSION}" ]]
-}
-
 ensure_module_phase() {
-  local expected
-  expected="$(render_fixed_phase module "module=${MODULE_NAME},sha256=${MODULE_SHA256},srcversion=${EXPECTED_MODULE_SRCVERSION}")" || fail 'module-render'
-  if [[ -f "${MODULE_PHASE}" ]]; then
-    phase_matches "${MODULE_PHASE}" "${expected}" || fail 'module-phase-drift' 79
-    module_matches || fail 'module-identity' 79
-    return
-  fi
-  if [[ -d "/sys/module/${MODULE_NAME}" ]]; then module_matches || fail 'module-unreceipted-drift' 79
-  else run_operation M0 module-load || fail 'module-load' $?; module_matches || fail 'module-postcondition' 79; fi
-  write_phase "${MODULE_PHASE}" "${expected}" || fail 'module-phase-write' $?
+  c8_checksum_module_load M0 || fail 'module-lease-load' $?
 }
 
 render_tested() {
@@ -896,12 +997,18 @@ assert_bpf_links_baseline() {
 }
 
 render_cleanup_intent() {
-  local owner baseline operation dependency veth_intent veth address route
-  local runtime_temp neighbor offload_baseline offload module tested
+  local owner baseline operation dependency_intent dependency veth_intent veth address route
+  local go_cache go_mod_cache go_path go_tmp runtime_temp neighbor offload_baseline offload
+  local module_intent module tested
   owner="$(sha256_file "${OWNER_PHASE}")" || return $?
   baseline="$(sha256_file "${BASELINE_PHASE}")" || return $?
   operation="$(sha256_file "${OPERATION_PHASE}")" || return $?
+  dependency_intent="$(phase_binding "${DEPENDENCY_INTENT_PHASE}")" || return $?
   dependency="$(phase_binding "${DEPENDENCY_PHASE}")" || return $?
+  go_cache="$(directory_binding "${GO_CACHE}")" || return $?
+  go_mod_cache="$(directory_binding "${GO_MOD_CACHE}")" || return $?
+  go_path="$(directory_binding "${GO_PATH}")" || return $?
+  go_tmp="$(directory_binding "${GO_TMP}")" || return $?
   runtime_temp="$(directory_binding "${RUNTIME_TEMP}")" || return $?
   veth_intent="$(phase_binding "${VETH_INTENT_PHASE}")" || return $?
   veth="$(phase_binding "${VETH_PHASE}")" || return $?
@@ -910,18 +1017,21 @@ render_cleanup_intent() {
   neighbor="$(phase_binding "${NEIGHBOR_PHASE}")" || return $?
   offload_baseline="$(phase_binding "${OFFLOAD_BASELINE_A}")" || return $?
   offload="$(phase_binding "${OFFLOAD_PHASE}")" || return $?
+  module_intent="$(phase_binding "${MODULE_INTENT_PHASE}")" || return $?
   module="$(phase_binding "${MODULE_PHASE}")" || return $?
   tested="$(phase_binding "${TESTED_PHASE}")" || return $?
   printf '%s\n' \
     'format=wg-mix-ebpf-b82-routed-cleanup-v1' "run_id=${RUN_ID}" \
     "resource_id=${RESOURCE_ID}" "boot_id=${BOOT_ID}" "netns=${INITIAL_NETNS}" \
     "owner_sha256=${owner}" "baseline_sha256=${baseline}" \
-    "operation_sha256=${operation}" "dependency=${dependency}" \
+    "operation_sha256=${operation}" "dependency_intent=${dependency_intent}" \
+    "dependency=${dependency}" \
+    "dependency_caches=${go_cache},${go_mod_cache},${go_path},${go_tmp}" \
     "runtime_temp=${runtime_temp}" \
     "veth_intent=${veth_intent}" "veth=${veth}" "address=${address}" \
     "route=${route}" "neighbor=${neighbor}" \
     "offload_baseline=${offload_baseline}" "offload=${offload}" \
-    "module=${module}" "tested=${tested}" \
+    "module_intent=${module_intent}" "module=${module}" "tested=${tested}" \
     'reverse=module,offload,neighbor,route,address,veth'
 }
 
@@ -956,14 +1066,7 @@ ensure_cleanup_intent() {
 }
 
 restore_module() {
-  local fields
-  if [[ -d "/sys/module/${MODULE_NAME}" ]]; then
-    module_matches || fail 'restore-module-identity' 79
-    fields="$(/usr/bin/awk -v name="${MODULE_NAME}" '$1 == name {print $1 ":" $3}' /proc/modules)" || fail 'module-refcount-read'
-    [[ "${fields}" == "${MODULE_NAME}:0" ]] || fail 'module-refcount' 79
-    run_operation R1 module-unload || fail 'module-unload' $?
-  fi
-  [[ ! -d "/sys/module/${MODULE_NAME}" ]] || fail 'module-remains' 79
+  c8_checksum_module_restore R1 || fail 'module-lease-restore' $?
 }
 
 restore_offload() {
@@ -1049,16 +1152,60 @@ validate_runtime_temp_for_restore() {
   [[ ! -f "${VETH_INTENT_PHASE}" ]] || fail 'restore-runtime-temp-missing-after-veth-intent' 79
 }
 
+validate_dependency_caches_for_restore() {
+  local path
+  if [[ ! -e "${DEPENDENCY_INTENT_PHASE}" && ! -L "${DEPENDENCY_INTENT_PHASE}" ]]; then
+    for path in "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}"; do
+      [[ ! -e "${path}" && ! -L "${path}" ]] || fail "restore-dependency-cache-without-intent:${path}" 79
+    done
+    [[ ! -e "${PREFLIGHT_BINARY}" && ! -L "${PREFLIGHT_BINARY}" ]] || fail 'restore-preflight-binary-without-intent' 79
+    return
+  fi
+  phase_matches "${DEPENDENCY_INTENT_PHASE}" "$(render_dependency_intent)" || fail 'restore-dependency-intent' 79
+  for path in "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}"; do
+    if [[ -e "${path}" || -L "${path}" ]]; then
+      require_root_directory "${path}" || fail "restore-dependency-cache-identity:${path}" 79
+    fi
+  done
+  if [[ -e "${DEPENDENCY_PHASE}" || -L "${DEPENDENCY_PHASE}" ]]; then
+    validate_dependency_preflight || fail 'restore-dependency-preflight' 79
+  fi
+}
+
+validate_module_for_restore() {
+  local first="$1" state
+  state="$(c8_checksum_module_validate_restore_state)" || fail 'restore-module-state' $?
+  case "${state}" in
+    00-clean) ;;
+    00-intent-no-live | 10-unreceipted-live)
+      [[ "${first}" == module ]] || fail 'restore-module-unreceipted-order' 79
+      ;;
+    11-owned-live)
+      [[ "${first}" == none ]] || fail 'restore-module-owned-order' 79
+      ;;
+    01-owned-live-absent)
+      [[ "${first}" == none && -f "${CLEANUP_PHASE}" ]] ||
+        fail 'restore-module-owned-absent-before-cleanup' 79
+      ;;
+    00-restored)
+      [[ -f "${CLEANUP_PHASE}" && ("${first}" == module || "${first}" == none) ]] ||
+        fail 'restore-module-restored-order' 79
+      ;;
+    *) fail "restore-module-state-unknown:${state}" 79 ;;
+  esac
+}
+
 validate_partial_setup_for_restore() {
   local first names_present=1 baseline_sha existing live
+  validate_dependency_caches_for_restore
   validate_runtime_temp_for_restore
   validate_receipt_prefix || fail 'restore-receipt-prefix' 79
   first="$(first_missing_receipt)" || fail 'restore-first-missing' $?
+  validate_module_for_restore "${first}"
 
   if [[ ! -e "${VETH_INTENT_PHASE}" && ! -L "${VETH_INTENT_PHASE}" ]]; then
     [[ "${first}" == veth ]] || fail 'restore-receipt-without-veth-intent' 79
     require_names_absent || fail 'restore-foreign-veth-without-intent' 79
-    [[ ! -d "/sys/module/${MODULE_NAME}" ]] || fail 'restore-module-without-veth-intent' 79
     existing="$(/usr/sbin/ip -4 -j address show to "${LOCAL_IPV4}/${PREFIX_BITS}")" || fail 'restore-address-without-intent-probe'
     [[ "${existing}" == '[]' ]] || fail 'restore-address-without-intent-drift' 79
     existing="$(/usr/sbin/ip -4 -j route show table all exact "${REMOTE_IPV4}/${PREFIX_BITS}")" || fail 'restore-route-without-intent-probe'
@@ -1157,24 +1304,17 @@ validate_partial_setup_for_restore() {
     fail 'restore-offload-phase-without-baseline' 79
   fi
 
-  if [[ -f "${MODULE_PHASE}" ]]; then
-    phase_matches "${MODULE_PHASE}" \
-      "$(render_fixed_phase module "module=${MODULE_NAME},sha256=${MODULE_SHA256},srcversion=${EXPECTED_MODULE_SRCVERSION}")" || fail 'restore-module-phase' 79
-  fi
-  if [[ -d "/sys/module/${MODULE_NAME}" ]]; then
-    module_matches || fail 'restore-module-foreign' 79
-    [[ -f "${MODULE_PHASE}" || "${first}" == module ]] || fail 'restore-module-out-of-order' 79
-  elif [[ -f "${MODULE_PHASE}" && ! -f "${CLEANUP_PHASE}" ]]; then
-    fail 'restore-module-live-missing' 79
-  fi
 }
 
 run_state_machine() {
   bootstrap_evidence
+  c8_checksum_module_acquire L0.run
+  configure_checksum_module_lease
   ensure_owner
   ensure_baseline
   [[ ! -f "${CLEANUP_PHASE}" && ! -f "${RESTORED_PHASE}" ]] || fail 'run-after-cleanup-intent' 79
   ensure_operation_intent
+  ensure_dependency_intent
   ensure_dependency_preflight
   ensure_runtime_temp
   ensure_veth_phase
@@ -1189,18 +1329,23 @@ run_state_machine() {
 }
 
 restore_state_machine() {
-  local restored
+  local restored module_state
   bootstrap_evidence
+  c8_checksum_module_acquire L0.restore
+  configure_checksum_module_lease
   ensure_owner
   [[ -f "${BASELINE_PHASE}" && -f "${OPERATION_PHASE}" ]] || fail 'restore-state-incomplete' 79
   ensure_baseline
   ensure_operation_intent
   if [[ -f "${RESTORED_PHASE}" ]]; then
+    validate_dependency_caches_for_restore
     validate_runtime_temp_for_restore
     restored="$(render_fixed_phase restored 'result=restored,filesystem=retained')"
     phase_matches "${RESTORED_PHASE}" "${restored}" || fail 'restored-phase-drift' 79
     require_names_absent || fail 'restored-veth-drift' 79
-    [[ ! -d "/sys/module/${MODULE_NAME}" ]] || fail 'restored-module-drift' 79
+    module_state="$(c8_checksum_module_validate_restore_state)" || fail 'restored-module-state' $?
+    [[ "${module_state}" == 00-clean || "${module_state}" == 00-restored ]] ||
+      fail 'restored-module-drift' 79
     assert_bpf_links_baseline
     printf 'B82_ROUTED_VETH_ALREADY_RESTORED run_id=%s resource_id=%s evidence=%s\n' "${RUN_ID}" "${RESOURCE_ID}" "${EVIDENCE_ROOT}"
     return
@@ -1225,6 +1370,7 @@ main() {
     return
   fi
   verify_source_and_artifacts
+  load_checksum_module_helper
   case "${MODE}" in
     run) run_state_machine ;;
     restore) restore_state_machine ;;

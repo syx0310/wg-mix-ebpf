@@ -325,6 +325,15 @@ def main() -> None:
         "root:root:700:1:regular file",
         'canonical_self="$(/usr/bin/readlink -e -- "$0")"',
         '[[ "$(sha256_file "${EXPECTED_SELF}")" == "${PREPARE_SHA256}" ]]',
+        'readonly MODULE_LEASE_LOCK="${STAGE_ROOT}/checksum-module-lease.v1.lock"',
+        'readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-${RUN_ID}/checksum-module-lease.sh"',
+        "plan_command S3.lock /usr/bin/install --owner=root --group=root --mode=0600",
+        '--no-target-directory -- /dev/null "${MODULE_LEASE_LOCK}"',
+        "require_module_lease_lock",
+        "module-lease-lock-create",
+        "module-lease-lock-drift",
+        '"module_lease_lock=${MODULE_LEASE_LOCK}"',
+        '"${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}"',
         "provision_ubuntu_test_host_sh_path",
         "provision_ubuntu_test_host_sh_blob",
         "provision_ubuntu_test_host_sh_sha256",
@@ -351,6 +360,12 @@ def main() -> None:
         fail("root stager parses the manifest before the bundle intake copy completes")
     if stager.count("validate_manifest || fail 'manifest-contract'") != 2:
         fail("root stager manifest parsing escaped the two root-snapshot consumers")
+    if stager.index("run_step S3.lock") > stager.index("run_step S4"):
+        fail("root stager creates the shared module lock after source staging begins")
+    if stager.index("require_module_lease_lock || fail 'module-lease-lock-drift'") > stager.index(
+        "write_binding_marker || fail 'binding-marker'"
+    ):
+        fail("root stager binds the stage before revalidating the shared module lock")
     if stager.count('readonly BOOTSTRAP_ROOT="/run/wg-mix-ebpf-source-bootstrap-${RUN_ID}"') != 1:
         fail("root stager has zero or multiple bootstrap roots")
 

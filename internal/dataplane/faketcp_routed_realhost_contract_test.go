@@ -229,14 +229,16 @@ func TestParseFakeTCPRoutedRealHostContract(t *testing.T) {
 
 func TestFakeTCPRealHostRoutedHarnessSelectedBinaryContract(t *testing.T) {
 	const (
-		runID     = "7e42a19c"
-		stageRoot = "/run/wg-mix-ebpf-source-stages/" + runID
+		runID      = "c8e41d73"
+		resourceID = "5b8d30f1"
+		stageRoot  = "/run/wg-mix-ebpf-source-stages/" + runID
 	)
 	values := validFakeTCPRealHostEnvironment()
 	values[fakeTCPRealHostObjectEnv] = stageRoot + "/source/build/wg_mix_faketcp_experimental.o"
 	values[fakeTCPRealHostBaselineObjectEnv] = stageRoot + "/source/build/wg_mix_tc.o"
 	values[fakeTCPRealHostRunIDEnv] = runID
-	values[fakeTCPRealHostTempRootEnv] = stageRoot + "/go-tmp-realhost"
+	values[fakeTCPRealHostResourceIDEnv] = resourceID
+	values[fakeTCPRealHostTempRootEnv] = stageRoot + "/go-tmp-realhost-" + resourceID
 	for name, value := range validFakeTCPRoutedRealHostEnvironment() {
 		values[name] = value
 	}
@@ -249,8 +251,11 @@ func TestFakeTCPRealHostRoutedHarnessSelectedBinaryContract(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if base.runID != runID || base.tempRoot != stageRoot+"/go-tmp-realhost" ||
-		base.vethName != "wg7e42aa" || base.peerVethName != "wg7e42ab" ||
+	if base.runID != runID || base.resourceID != resourceID ||
+		base.tempRoot != stageRoot+"/go-tmp-realhost-"+resourceID ||
+		base.vethName != "wg5b8d3a" || base.peerVethName != "wg5b8d3b" ||
+		base.vethAlias != "wg-mix-ebpf:c8e41d73:5b8d30f1:a" ||
+		base.peerVethAlias != "wg-mix-ebpf:c8e41d73:5b8d30f1:b" ||
 		routed.localIPv4.String() != fakeTCPRoutedLocalIPv4 ||
 		routed.remoteIPv4.String() != fakeTCPRoutedRemoteIPv4 ||
 		routed.prefixBits != fakeTCPRoutedPrefixBits ||
