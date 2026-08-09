@@ -11,6 +11,10 @@ readonly C8_CHECKSUM_MODULE_LOCK="${C8_CHECKSUM_MODULE_STAGE_ROOT}/checksum-modu
 readonly C8_CHECKSUM_MODULE_CENTRAL_OBJECT="${C8_CHECKSUM_MODULE_STAGE_ROOT}/source/build/faketcp_checksum_kmod/${C8_CHECKSUM_MODULE_NAME}.ko"
 readonly C8_CHECKSUM_MODULE_CENTRAL_RESOURCE_ID='6bd913ac'
 readonly C8_CHECKSUM_MODULE_ROUTED_RESOURCE_ID='5b8d30f1'
+readonly C8_CHECKSUM_MODULE_STANDALONE_ROOT='/run/wg-mix-ebpf-source-stages/a19f7c2e'
+readonly C8_CHECKSUM_MODULE_STANDALONE_RESOURCE_ID='d34b8e65'
+readonly C8_CHECKSUM_MODULE_STANDALONE_OBJECT="${C8_CHECKSUM_MODULE_STANDALONE_ROOT}/source/build/faketcp_checksum_kmod/${C8_CHECKSUM_MODULE_NAME}.ko"
+readonly C8_CHECKSUM_MODULE_STANDALONE_EVIDENCE="${C8_CHECKSUM_MODULE_STANDALONE_ROOT}/veth-evidence-${C8_CHECKSUM_MODULE_STANDALONE_RESOURCE_ID}"
 readonly C8_CHECKSUM_MODULE_FRESH_ROOT='/run/wg-mix-ebpf-faketcp-verifier/fresh-c8e41d73'
 readonly C8_CHECKSUM_MODULE_FRESH_RESOURCE_ID='f3e5c8a1'
 readonly C8_CHECKSUM_MODULE_FRESH_OBJECT="${C8_CHECKSUM_MODULE_FRESH_ROOT}/source/build/faketcp_checksum_kmod/${C8_CHECKSUM_MODULE_NAME}.ko"
@@ -79,20 +83,33 @@ c8_checksum_module_require_root_regular() {
   [[ "$(/usr/bin/stat -Lc '%u:%g:%a:%h:%F' -- "${path}")" == "0:0:${mode}:1:regular file" ]]
 }
 
-c8_checksum_module_require_evidence_root() {
-  local shape
-  case "${C8_CHECKSUM_MODULE_OBJECT}|${C8_CHECKSUM_MODULE_EVIDENCE_ROOT}" in
-    "${C8_CHECKSUM_MODULE_CENTRAL_OBJECT}|${C8_CHECKSUM_MODULE_STAGE_ROOT}/realhost-v6-${C8_CHECKSUM_MODULE_CENTRAL_RESOURCE_ID}")
-      [[ "${C8_CHECKSUM_MODULE_RESOURCE_ID}" == "${C8_CHECKSUM_MODULE_CENTRAL_RESOURCE_ID}" ]] || return 65
+c8_checksum_module_scope_allowed() {
+  local object="$1" evidence_root="$2" resource_id="$3"
+  case "${resource_id}" in
+    "${C8_CHECKSUM_MODULE_CENTRAL_RESOURCE_ID}")
+      [[ "${object}" == "${C8_CHECKSUM_MODULE_CENTRAL_OBJECT}" &&
+        "${evidence_root}" == "${C8_CHECKSUM_MODULE_STAGE_ROOT}/realhost-v6-${resource_id}" ]]
       ;;
-    "${C8_CHECKSUM_MODULE_CENTRAL_OBJECT}|${C8_CHECKSUM_MODULE_STAGE_ROOT}/routed-evidence-${C8_CHECKSUM_MODULE_ROUTED_RESOURCE_ID}")
-      [[ "${C8_CHECKSUM_MODULE_RESOURCE_ID}" == "${C8_CHECKSUM_MODULE_ROUTED_RESOURCE_ID}" ]] || return 65
+    "${C8_CHECKSUM_MODULE_ROUTED_RESOURCE_ID}")
+      [[ "${object}" == "${C8_CHECKSUM_MODULE_CENTRAL_OBJECT}" &&
+        "${evidence_root}" == "${C8_CHECKSUM_MODULE_STAGE_ROOT}/routed-evidence-${resource_id}" ]]
       ;;
-    "${C8_CHECKSUM_MODULE_FRESH_OBJECT}|${C8_CHECKSUM_MODULE_FRESH_EVIDENCE}")
-      [[ "${C8_CHECKSUM_MODULE_RESOURCE_ID}" == "${C8_CHECKSUM_MODULE_FRESH_RESOURCE_ID}" ]] || return 65
+    "${C8_CHECKSUM_MODULE_STANDALONE_RESOURCE_ID}")
+      [[ "${object}" == "${C8_CHECKSUM_MODULE_STANDALONE_OBJECT}" &&
+        "${evidence_root}" == "${C8_CHECKSUM_MODULE_STANDALONE_EVIDENCE}" ]]
+      ;;
+    "${C8_CHECKSUM_MODULE_FRESH_RESOURCE_ID}")
+      [[ "${object}" == "${C8_CHECKSUM_MODULE_FRESH_OBJECT}" &&
+        "${evidence_root}" == "${C8_CHECKSUM_MODULE_FRESH_EVIDENCE}" ]]
       ;;
     *) return 65 ;;
   esac
+}
+
+c8_checksum_module_require_evidence_root() {
+  local shape
+  c8_checksum_module_scope_allowed "${C8_CHECKSUM_MODULE_OBJECT}" \
+    "${C8_CHECKSUM_MODULE_EVIDENCE_ROOT}" "${C8_CHECKSUM_MODULE_RESOURCE_ID}" || return $?
   [[ -d "${C8_CHECKSUM_MODULE_EVIDENCE_ROOT}" &&
     ! -L "${C8_CHECKSUM_MODULE_EVIDENCE_ROOT}" ]] || return 79
   shape="$(/usr/bin/stat -Lc '%u:%g:%a:%F' -- "${C8_CHECKSUM_MODULE_EVIDENCE_ROOT}")" || return $?
@@ -108,10 +125,7 @@ c8_checksum_module_configure() {
     "${commit}" =~ ^[0-9a-f]{40}$ &&
     ! "${commit}" =~ ^0{40}$ && ! "${commit}" =~ ^f{40}$ &&
     "${boot_id}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] || return 65
-  case "${object}" in
-    "${C8_CHECKSUM_MODULE_CENTRAL_OBJECT}" | "${C8_CHECKSUM_MODULE_FRESH_OBJECT}") ;;
-    *) return 65 ;;
-  esac
+  c8_checksum_module_scope_allowed "${object}" "${evidence_root}" "${resource_id}" || return $?
   c8_checksum_module_valid_sha256 "${object_sha256}" || return 65
 
   C8_CHECKSUM_MODULE_RESOURCE_ID="${resource_id}"

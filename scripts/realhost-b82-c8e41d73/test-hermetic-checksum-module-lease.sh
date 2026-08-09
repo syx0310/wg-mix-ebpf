@@ -33,6 +33,24 @@ fi
 # shellcheck source=checksum-module-lease.sh
 source "${HELPER}"
 for spec in \
+  "${C8_CHECKSUM_MODULE_CENTRAL_OBJECT}|${C8_CHECKSUM_MODULE_STAGE_ROOT}/realhost-v6-${C8_CHECKSUM_MODULE_CENTRAL_RESOURCE_ID}|${C8_CHECKSUM_MODULE_CENTRAL_RESOURCE_ID}" \
+  "${C8_CHECKSUM_MODULE_CENTRAL_OBJECT}|${C8_CHECKSUM_MODULE_STAGE_ROOT}/routed-evidence-${C8_CHECKSUM_MODULE_ROUTED_RESOURCE_ID}|${C8_CHECKSUM_MODULE_ROUTED_RESOURCE_ID}" \
+  "${C8_CHECKSUM_MODULE_STANDALONE_OBJECT}|${C8_CHECKSUM_MODULE_STANDALONE_EVIDENCE}|${C8_CHECKSUM_MODULE_STANDALONE_RESOURCE_ID}" \
+  "${C8_CHECKSUM_MODULE_FRESH_OBJECT}|${C8_CHECKSUM_MODULE_FRESH_EVIDENCE}|${C8_CHECKSUM_MODULE_FRESH_RESOURCE_ID}"; do
+  IFS='|' read -r object evidence resource <<<"${spec}"
+  c8_checksum_module_scope_allowed "${object}" "${evidence}" "${resource}" ||
+    fail "scope rejected exact tuple: ${resource}"
+done
+for spec in \
+  "${C8_CHECKSUM_MODULE_STANDALONE_OBJECT}|${C8_CHECKSUM_MODULE_STANDALONE_EVIDENCE}|${C8_CHECKSUM_MODULE_ROUTED_RESOURCE_ID}" \
+  "${C8_CHECKSUM_MODULE_STANDALONE_OBJECT}|${C8_CHECKSUM_MODULE_FRESH_EVIDENCE}|${C8_CHECKSUM_MODULE_STANDALONE_RESOURCE_ID}" \
+  "${C8_CHECKSUM_MODULE_CENTRAL_OBJECT}|${C8_CHECKSUM_MODULE_STANDALONE_EVIDENCE}|${C8_CHECKSUM_MODULE_STANDALONE_RESOURCE_ID}"; do
+  IFS='|' read -r object evidence resource <<<"${spec}"
+  if c8_checksum_module_scope_allowed "${object}" "${evidence}" "${resource}"; then
+    fail "scope accepted crossed tuple: ${resource}"
+  fi
+done
+for spec in \
   '0 0 0 0|00-clean' \
   '1 0 0 0|00-intent-no-live' \
   '1 0 0 1|10-unreceipted-live' \
@@ -56,4 +74,4 @@ if /bin/bash "${HELPER}" >/dev/stdout 2>&1; then
   fail 'source-only helper executed as a command'
 fi
 
-printf 'hermetic shared checksum-module lease ABI and failure-cut classifier: PASS\n'
+printf 'hermetic shared checksum-module exact scopes, ABI and failure-cut classifier: PASS\n'

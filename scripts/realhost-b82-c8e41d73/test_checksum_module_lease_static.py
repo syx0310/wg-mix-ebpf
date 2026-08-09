@@ -159,6 +159,55 @@ def exercise_model() -> None:
             fail(f"restore cut did not converge: {cut}: {state}")
 
 
+def exercise_scope_model() -> None:
+    central_object = (
+        "/run/wg-mix-ebpf-source-stages/c8e41d73/source/build/"
+        "faketcp_checksum_kmod/wg_mix_faketcp_checksum.ko"
+    )
+    standalone_root = "/run/wg-mix-ebpf-source-stages/a19f7c2e"
+    fresh_root = "/run/wg-mix-ebpf-faketcp-verifier/fresh-c8e41d73"
+    accepted = {
+        (
+            central_object,
+            "/run/wg-mix-ebpf-source-stages/c8e41d73/realhost-v6-6bd913ac",
+            "6bd913ac",
+        ),
+        (
+            central_object,
+            "/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1",
+            "5b8d30f1",
+        ),
+        (
+            f"{standalone_root}/source/build/faketcp_checksum_kmod/wg_mix_faketcp_checksum.ko",
+            f"{standalone_root}/veth-evidence-d34b8e65",
+            "d34b8e65",
+        ),
+        (
+            f"{fresh_root}/source/build/faketcp_checksum_kmod/wg_mix_faketcp_checksum.ko",
+            f"{fresh_root}/evidence",
+            "f3e5c8a1",
+        ),
+    }
+    expected_by_resource = {
+        resource: (object_path, evidence)
+        for object_path, evidence, resource in accepted
+    }
+
+    def scope_allowed(object_path: str, evidence: str, resource: str) -> bool:
+        return expected_by_resource.get(resource) == (object_path, evidence)
+
+    objects = {item[0] for item in accepted}
+    evidence_roots = {item[1] for item in accepted}
+    resources = {*expected_by_resource, "00000001"}
+    for object_path in objects:
+        for evidence in evidence_roots:
+            for resource in resources:
+                modeled = scope_allowed(object_path, evidence, resource)
+                exact = (object_path, evidence, resource) in accepted
+                if modeled != exact:
+                    fail(f"exact scope model mismatch for {resource}")
+
+
 def inspect(helper: str, module: str) -> None:
     for pattern in (
         r"\brm\s+-[^\n]*r",
@@ -178,11 +227,16 @@ def inspect(helper: str, module: str) -> None:
         "C8_CHECKSUM_MODULE_CENTRAL_OBJECT",
         "C8_CHECKSUM_MODULE_CENTRAL_RESOURCE_ID='6bd913ac'",
         "C8_CHECKSUM_MODULE_ROUTED_RESOURCE_ID='5b8d30f1'",
+        "C8_CHECKSUM_MODULE_STANDALONE_OBJECT",
+        "C8_CHECKSUM_MODULE_STANDALONE_EVIDENCE",
+        "C8_CHECKSUM_MODULE_STANDALONE_RESOURCE_ID='d34b8e65'",
         "C8_CHECKSUM_MODULE_FRESH_OBJECT",
         "C8_CHECKSUM_MODULE_FRESH_EVIDENCE",
         "C8_CHECKSUM_MODULE_FRESH_RESOURCE_ID='f3e5c8a1'",
-        'C8_CHECKSUM_MODULE_STAGE_ROOT}/realhost-v6-${C8_CHECKSUM_MODULE_CENTRAL_RESOURCE_ID}',
-        'C8_CHECKSUM_MODULE_STAGE_ROOT}/routed-evidence-${C8_CHECKSUM_MODULE_ROUTED_RESOURCE_ID}',
+        'C8_CHECKSUM_MODULE_STAGE_ROOT}/realhost-v6-${resource_id}',
+        'C8_CHECKSUM_MODULE_STAGE_ROOT}/routed-evidence-${resource_id}',
+        "/run/wg-mix-ebpf-source-stages/a19f7c2e",
+        'C8_CHECKSUM_MODULE_STANDALONE_ROOT}/veth-evidence-${C8_CHECKSUM_MODULE_STANDALONE_RESOURCE_ID}',
         "/run/wg-mix-ebpf-faketcp-verifier/fresh-c8e41d73",
         "/usr/bin/flock --exclusive --nonblock",
         "ownership=exact-insmod-rc0-only",
@@ -200,6 +254,11 @@ def inspect(helper: str, module: str) -> None:
             fail(f"helper is missing {literal!r}")
 
     load_body = function_body(helper, "c8_checksum_module_load")
+    configure_body = function_body(helper, "c8_checksum_module_configure")
+    if 'c8_checksum_module_scope_allowed "${object}" "${evidence_root}" "${resource_id}"' not in configure_body:
+        fail("configure does not use the single exact scope allowlist")
+    if re.search(r'case "\$\{object\}"', configure_body):
+        fail("configure retains a second object-only allowlist")
     intent_write = load_body.index('c8_checksum_module_write "${C8_CHECKSUM_MODULE_INTENT}"')
     load_call = load_body.index("/usr/sbin/insmod", intent_write)
     rc_gate = load_body.index("((rc == 0))", load_call)
@@ -248,6 +307,7 @@ def main() -> None:
     module = read_regular(sys.argv[2])
     inspect(helper, module)
     exercise_model()
+    exercise_scope_model()
     print("shared checksum-module lease static and 00/10/11/01 failure-cut model: PASS")
 
 
