@@ -458,6 +458,9 @@ func TestEngineRouterRejectsWrongActionProvenanceBeforeBackend(t *testing.T) {
 	if len(fixture.backend.operations) != 0 {
 		t.Fatalf("wrong-owner Tick reached backend: %v", fixture.backend.operations)
 	}
+	if _, retryErr := fixture.controller.Tick(context.Background()); !errors.Is(retryErr, ErrControllerFailed) || len(fixture.backend.operations) != 0 {
+		t.Fatalf("route fault was not terminal: err=%v backend=%v", retryErr, fixture.backend.operations)
+	}
 	for _, kind := range []ActionKind{ActionDrop, ActionForward, ActionClose} {
 		if err := fixture.router.validateActions(9, []Action{{Kind: kind, Flow: wrongFlow}}); !errors.Is(err, ErrEngineRouteRejected) {
 			t.Fatalf("kind=%d error=%v", kind, err)
