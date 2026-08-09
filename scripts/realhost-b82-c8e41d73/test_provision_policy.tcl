@@ -58,6 +58,32 @@ if {[file type $transport] ne "file"} {
 set capture_case [expr {$argc == 3 ? [lindex $argv 2] : ""}]
 source $transport
 
+set prompt_fixture_values [dict create \
+    target_user siyixuan \
+    target_host 192.168.10.82 \
+    remote_package_dir /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61 \
+    local_package_dir /private/tmp/wg-mix-ebpf-capture-prompt-fixture \
+    remote_source /run/wg-mix-ebpf-source-stages/c8e41d73/source \
+    realnic_acceptance_py_path scripts/realhost-b82-acceptance-v1/realnic_acceptance.py \
+    integration_commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa]
+lassign [build_operation $prompt_fixture_values \
+    bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
+    realnic-plan none] prompt_kind prompt_spawn_argv prompt_limit prompt_assertion \
+    prompt_timeout
+set prompt_target_index [lsearch -exact $prompt_spawn_argv \
+    siyixuan@192.168.10.82]
+set prompt_remote_argv [lrange $prompt_spawn_argv [expr {$prompt_target_index + 1}] end]
+set prompt_remote_command [join $prompt_remote_argv " "]
+set prompt_remote_words [split $prompt_remote_command " "]
+set prompt_option_index [lsearch -exact $prompt_remote_words -p]
+if {$prompt_kind ne "ssh" || $prompt_limit != 2 || $prompt_assertion ne "none" ||
+    $prompt_timeout != 2400 || $prompt_target_index < 1 || $prompt_option_index < 0 ||
+    [lindex $prompt_remote_words [expr {$prompt_option_index + 1}]] ne
+        "B82_V6_SUDO_PASSWORD:" ||
+    [regexp {\s} [lindex $prompt_remote_words [expr {$prompt_option_index + 1}]]]} {
+    test_fail "RealNIC sudo prompt does not survive OpenSSH remote-command serialization"
+}
+
 set ::CAPTURE_CHILD_PROGRAM {
 import json
 import os
@@ -79,7 +105,7 @@ if (active[1] & termios.OPOST) or (active[3] & (termios.ECHO | termios.ECHONL)):
     os._exit(40)
 
 ssh_prompt = b"siyixuan@192.168.10.82's password: "
-sudo_prompt = b"B82_V6_SUDO_PASSWORD: "
+sudo_prompt = b"B82_V6_SUDO_PASSWORD:"
 
 def write_all(payload):
     view = memoryview(payload)
