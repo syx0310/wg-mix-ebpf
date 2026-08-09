@@ -86,14 +86,14 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		"parse_rc = faketcp_parse_l3(data, data_end, frame_len, l3_off, family, &l3)",
 		"parser_mode == PARSER_L3",
 		"parser_mode != PARSER_ETHERNET",
-		"faketcp_managed_transform_status(l3, IPPROTO_UDP)",
+		"faketcp_managed_transform_status(&faketcp_l3, IPPROTO_UDP)",
 		"faketcp_managed_transform_status(&l3, l3.transport_protocol)",
 		"sizeof(struct iphdr) + sizeof(struct udphdr)",
 		"l3.l4_off + sizeof(udp)",
 		"struct iphdr new_ip;",
 		"bpf_xdp_store_bytes(xdp, l3.l3_off, &new_ip, sizeof(new_ip))",
 	} {
-		if !strings.Contains(main, want) {
+		if !strings.Contains(main, want) && !strings.Contains(tc, want) {
 			t.Fatalf("TC/XDP shared parser integration missing %q", want)
 		}
 	}
@@ -120,9 +120,11 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		t.Fatal("FakeTCP egress boundaries are missing")
 	}
 	egress := tc[egressStart:egressEnd]
-	tcGate := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	tcParse := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	tcGate := strings.Index(egress, "faketcp_managed_transform_status(&faketcp_l3, IPPROTO_UDP)")
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
-	if tcGate < 0 || checkpoint < 0 || tcGate >= checkpoint {
+	if tcParse < 0 || tcGate < 0 || checkpoint < 0 ||
+		!(tcParse < tcGate && tcGate < checkpoint) {
 		t.Fatal("fixed-header transform gate must precede the admission checkpoint")
 	}
 	checkpointBody := sourceSection(t, main,

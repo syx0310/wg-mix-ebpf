@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"math"
+	"sync"
 	"testing"
 )
 
@@ -128,6 +129,237 @@ func BenchmarkFakeTCPAdmissionCheckpointHotPath(b *testing.B) {
 	}
 	if !result.transform {
 		b.Fatal("valid hot path rejected")
+	}
+}
+
+type fakeTCPAdmissionSessionKey struct {
+	generation uint64
+	localIPv4  uint32
+	remoteIPv4 uint32
+	underlay   uint32
+	localPort  uint16
+	remotePort uint16
+}
+
+type fakeTCPAdmissionLifetime struct {
+	sessionID   uint64
+	incarnation [16]byte
+}
+
+type fakeTCPAdmissionSessionProjection struct {
+	localISN  uint32
+	remoteISN uint32
+	window    uint16
+	state     uint8
+	flags     uint8
+}
+
+type fakeTCPAdmissionSessionProof struct {
+	key        fakeTCPAdmissionSessionKey
+	lifetime   fakeTCPAdmissionLifetime
+	projection fakeTCPAdmissionSessionProjection
+}
+
+type fakeTCPAdmissionLockedSnapshot struct {
+	proof    fakeTCPAdmissionSessionProof
+	revision uint64
+}
+
+type fakeTCPAdmissionSessionValue struct {
+	generation uint64
+	txSequence uint32
+	rxSequence uint32
+	revision   uint64
+	lifetime   fakeTCPAdmissionLifetime
+	projection fakeTCPAdmissionSessionProjection
+}
+
+type fakeTCPAdmissionSessionStore struct {
+	mu    sync.Mutex
+	key   fakeTCPAdmissionSessionKey
+	value fakeTCPAdmissionSessionValue
+}
+
+const (
+	fakeTCPAdmissionSessionEstablished uint8 = 3
+	fakeTCPAdmissionSessionClaimed     uint8 = 5
+)
+
+func validFakeTCPAdmissionSessionStore() *fakeTCPAdmissionSessionStore {
+	key := fakeTCPAdmissionSessionKey{
+		generation: 7, localIPv4: 0x0a000001, remoteIPv4: 0x0a000002,
+		underlay: 2, localPort: 51820, remotePort: 443,
+	}
+	return &fakeTCPAdmissionSessionStore{
+		key: key,
+		value: fakeTCPAdmissionSessionValue{
+			generation: 7, txSequence: 1000, rxSequence: 2000, revision: 11,
+			lifetime: fakeTCPAdmissionLifetime{sessionID: 99, incarnation: [16]byte{1, 2, 3, 4}},
+			projection: fakeTCPAdmissionSessionProjection{
+				localISN: 100, remoteISN: 200, window: 32768,
+				state: fakeTCPAdmissionSessionEstablished,
+			},
+		},
+	}
+}
+
+func fakeTCPAdmissionSessionValid(value fakeTCPAdmissionSessionValue) bool {
+	var incarnation byte
+	for _, octet := range value.lifetime.incarnation {
+		incarnation |= octet
+	}
+	return value.generation != 0 && value.revision != 0 &&
+		value.revision != math.MaxUint64 && value.lifetime.sessionID != 0 &&
+		incarnation != 0 && value.projection.state == fakeTCPAdmissionSessionEstablished &&
+		value.projection.flags == 0
+}
+
+func (store *fakeTCPAdmissionSessionStore) snapshot() (fakeTCPAdmissionLockedSnapshot, bool) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if !fakeTCPAdmissionSessionValid(store.value) || store.value.generation != store.key.generation {
+		return fakeTCPAdmissionLockedSnapshot{}, false
+	}
+	return fakeTCPAdmissionLockedSnapshot{
+		proof: fakeTCPAdmissionSessionProof{
+			key: store.key, lifetime: store.value.lifetime,
+			projection: store.value.projection,
+		},
+		revision: store.value.revision,
+	}, true
+}
+
+func (store *fakeTCPAdmissionSessionStore) matchesLocked(proof fakeTCPAdmissionSessionProof) bool {
+	return proof.key == store.key && proof.key.generation == store.value.generation &&
+		proof.lifetime == store.value.lifetime && proof.projection == store.value.projection &&
+		fakeTCPAdmissionSessionValid(store.value)
+}
+
+func (store *fakeTCPAdmissionSessionStore) matches(proof fakeTCPAdmissionSessionProof) bool {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.matchesLocked(proof)
+}
+
+func (store *fakeTCPAdmissionSessionStore) mutateTX(proof fakeTCPAdmissionSessionProof, payload uint32) (uint32, bool) {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if !store.matchesLocked(proof) {
+		return 0, false
+	}
+	sequence := store.value.txSequence
+	store.value.txSequence += payload
+	store.value.revision++
+	return sequence, true
+}
+
+func (store *fakeTCPAdmissionSessionStore) mutateRX(proof fakeTCPAdmissionSessionProof, nextSequence uint32) bool {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if !store.matchesLocked(proof) {
+		return false
+	}
+	if int32(nextSequence-store.value.rxSequence) > 0 {
+		store.value.rxSequence = nextSequence
+	}
+	store.value.revision++
+	return true
+}
+
+func TestFakeTCPAdmissionLifetimeAllowsConcurrentDirectWriters(t *testing.T) {
+	store := validFakeTCPAdmissionSessionStore()
+	snapshot, ok := store.snapshot()
+	if !ok {
+		t.Fatal("valid session snapshot failed")
+	}
+	start := make(chan struct{})
+	results := make(chan uint32, 2)
+	var writers sync.WaitGroup
+	for range 2 {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			<-start
+			sequence, admitted := store.mutateTX(snapshot.proof, 64)
+			if !admitted {
+				results <- 0
+				return
+			}
+			results <- sequence
+		}()
+	}
+	close(start)
+	writers.Wait()
+	close(results)
+	seen := map[uint32]bool{}
+	for sequence := range results {
+		seen[sequence] = true
+	}
+	if !seen[1000] || !seen[1064] || len(seen) != 2 {
+		t.Fatalf("same-lifetime writers did not serialize without loss: %v", seen)
+	}
+	if store.value.revision != snapshot.revision+2 {
+		t.Fatalf("writer revision=%d, want %d", store.value.revision, snapshot.revision+2)
+	}
+}
+
+func TestFakeTCPIngressProofSurvivesXDPRevisionMutation(t *testing.T) {
+	store := validFakeTCPAdmissionSessionStore()
+	snapshot, ok := store.snapshot()
+	if !ok || !store.mutateRX(snapshot.proof, 2064) {
+		t.Fatal("XDP stable-lifetime mutation failed")
+	}
+	if store.value.revision == snapshot.revision || !store.matches(snapshot.proof) {
+		t.Fatal("TC rejected the same lifetime solely because XDP advanced revision")
+	}
+}
+
+func TestFakeTCPAdmissionLifetimeRejectsReplacementAndClaim(t *testing.T) {
+	for _, test := range []struct {
+		name   string
+		mutate func(*fakeTCPAdmissionSessionStore)
+	}{
+		{name: "session replacement", mutate: func(store *fakeTCPAdmissionSessionStore) {
+			store.value.lifetime.sessionID++
+		}},
+		{name: "runtime replacement", mutate: func(store *fakeTCPAdmissionSessionStore) {
+			store.value.lifetime.incarnation[0]++
+		}},
+		{name: "delete claim", mutate: func(store *fakeTCPAdmissionSessionStore) {
+			store.value.projection.state = fakeTCPAdmissionSessionClaimed
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			store := validFakeTCPAdmissionSessionStore()
+			snapshot, ok := store.snapshot()
+			if !ok {
+				t.Fatal("valid session snapshot failed")
+			}
+			store.mu.Lock()
+			test.mutate(store)
+			store.mu.Unlock()
+			if store.matches(snapshot.proof) {
+				t.Fatal("stale lifetime proof remained valid")
+			}
+			if _, admitted := store.mutateTX(snapshot.proof, 64); admitted {
+				t.Fatal("stale lifetime proof authorized a writer")
+			}
+		})
+	}
+}
+
+func BenchmarkFakeTCPAdmissionLifetimeMatchHotPath(b *testing.B) {
+	store := validFakeTCPAdmissionSessionStore()
+	snapshot, ok := store.snapshot()
+	if !ok {
+		b.Fatal("valid session snapshot failed")
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !store.matches(snapshot.proof) {
+			b.Fatal("stable lifetime rejected")
+		}
 	}
 }
 

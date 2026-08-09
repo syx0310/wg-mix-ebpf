@@ -26,14 +26,17 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 	if got := strings.Count(egress, "faketcp_egress_admission_checkpoint("); got != 1 {
 		t.Fatalf("TC egress checkpoint calls=%d, want exactly one", got)
 	}
+	l3Gate := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	fixedGate := strings.Index(egress, "faketcp_managed_transform_status(&faketcp_l3, IPPROTO_UDP)")
+	mtuGate := strings.Index(egress, "faketcp_mtu_allows_growth(skb, faketcp_l3.l3_len)")
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
 	checksumState := strings.Index(egress, "faketcp_inspect_and_reset_udp_checksum(")
 	typeWord := strings.Index(egress, "update_type_word(skb, &info, old_wire, new_wire, 1)")
 	xorDispatch := strings.Index(egress, "bpf_tail_call(skb, &xor_egress_programs")
 	directEncode := strings.Index(egress, "return faketcp_encode_established(")
-	if checkpoint < 0 || checksumState < 0 || typeWord < 0 || xorDispatch < 0 || directEncode < 0 ||
-		!(checkpoint < checksumState && checksumState < typeWord && typeWord < xorDispatch && typeWord < directEncode) {
-		t.Fatal("TC admission proof does not dominate checksum, type-word, XOR and FakeTCP transforms")
+	if l3Gate < 0 || fixedGate < 0 || mtuGate < 0 || checkpoint < 0 || checksumState < 0 || typeWord < 0 || xorDispatch < 0 || directEncode < 0 ||
+		!(l3Gate < fixedGate && fixedGate < mtuGate && mtuGate < checkpoint && checkpoint < checksumState && checksumState < typeWord && typeWord < xorDispatch && typeWord < directEncode) {
+		t.Fatal("TC fixed-IPv4 and MTU gates must precede the proof which dominates every transform")
 	}
 
 	checkpointBody := sourceSection(t, fake,
@@ -129,6 +132,11 @@ func TestFakeTCPAdmissionProofBindsFullIdentityAndCapabilityStaysClosed(t *testi
 		"FAKETCP_TOKEN_XOR_COMPLETE",
 		"__sync_val_compare_and_swap(&active->token_state",
 		"__builtin_memset(&slot->active, 0, sizeof(slot->active))",
+		"struct faketcp_session_authority",
+		"struct faketcp_session_projection",
+		"session_authority",
+		"session_projection",
+		"session_id",
 		"runtime_incarnation[16]",
 		"standard_wire",
 		"mixed_wire",
@@ -138,8 +146,8 @@ func TestFakeTCPAdmissionProofBindsFullIdentityAndCapabilityStaysClosed(t *testi
 		"network_off",
 		"transport_off",
 		"payload_off",
-		"session_local_isn",
-		"session_remote_isn",
+		"local_isn",
+		"remote_isn",
 		"profile_policy_flags",
 		"metadata->direction = FAKETCP_DIRECTION_INGRESS",
 		"metadata->admission = admission",
@@ -179,8 +187,19 @@ func TestFakeTCPAdmissionProofBindsFullIdentityAndCapabilityStaysClosed(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(manifest), `{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 144, maxEntries: 1, flags: unix.BPF_F_RDONLY}`) {
+	if !strings.Contains(string(manifest), `{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 152, maxEntries: 1, flags: unix.BPF_F_RDONLY}`) {
 		t.Fatal("fresh admission map manifest does not lock PinNone-compatible type, size and syscall-side read-only flag")
+	}
+
+	egressProof := sourceSection(t, text, "struct faketcp_egress_admission {", "struct faketcp_egress_admission_slot {")
+	ingressProof := sourceSection(t, text, "struct faketcp_ingress_admission {", "_Static_assert(sizeof(struct faketcp_session_key)")
+	if strings.Contains(egressProof, "revision") || strings.Contains(ingressProof, "revision") {
+		t.Fatal("ordinary transform proof regained mutable revision equality authority")
+	}
+	if !strings.Contains(text, "struct faketcp_session_snapshot") ||
+		!strings.Contains(text, "future close") ||
+		!strings.Contains(text, "never becomes ordinary admission equality") {
+		t.Fatal("locked close snapshot and transform lifetime authority are no longer explicitly separated")
 	}
 }
 
@@ -205,8 +224,16 @@ func TestFakeTCPAdmissionStatisticsAreMutuallyExclusive(t *testing.T) {
 		strings.Contains(xdpCheckpoint, "FAKETCP_STAT_ADMISSION_ACCEPT") {
 		t.Fatal("early egress/XDP checkpoints must not count final admission acceptance")
 	}
-	if got := strings.Count(allSource, "inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT)"); got != 3 {
-		t.Fatalf("final egress-direct, egress-continuation and TC-ingress accept sites=%d, want 3", got)
+	if got := strings.Count(allSource, "inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT)"); got != 2 {
+		t.Fatalf("shared egress-writer and TC-ingress accept sites=%d, want 2", got)
+	}
+	encoder := sourceSection(t, text,
+		"static __always_inline int faketcp_encode_established(",
+		"static __always_inline int faketcp_continue_egress")
+	mutate := strings.Index(encoder, "faketcp_session_mutate(session, generation, now,")
+	accept := strings.Index(encoder, "inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT)")
+	if mutate < 0 || accept < 0 || mutate >= accept {
+		t.Fatal("egress acceptance must be counted once after the shared final writer admits the lifetime")
 	}
 	gso := sourceSection(t, checkpoint, "if (skb->gso_segs || skb->gso_size)", "if (info->payload_len")
 	if strings.Contains(gso, "FAKETCP_STAT_BAD_PACKET") ||

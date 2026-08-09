@@ -12,6 +12,11 @@ func TestFakeTCPMTUIntegrationRejectsLegacyStandaloneAdmission(t *testing.T) {
 		t.Fatal(err)
 	}
 	bpf := string(source)
+	tcSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc := string(tcSource)
 	for _, forbidden := range []string{
 		"faketcp_mtu_admit",
 		"bpf_fib_lookup(",
@@ -31,14 +36,22 @@ func TestFakeTCPMTUIntegrationRejectsLegacyStandaloneAdmission(t *testing.T) {
 			t.Fatalf("non-GSO device MTU fail-closed contract is missing %q", required)
 		}
 	}
-	if strings.Count(bpf, "bpf_check_mtu(") != 1 ||
-		strings.Count(bpf, "faketcp_mtu_allows_growth(skb, old_total_len)") != 1 {
-		t.Fatal("device MTU admission must have one helper call and one encoder call")
+	if strings.Count(bpf+tc, "bpf_check_mtu(") != 1 ||
+		strings.Count(bpf+tc, "faketcp_mtu_allows_growth(skb, faketcp_l3.l3_len)") != 1 {
+		t.Fatal("device MTU admission must have one helper and one pre-checkpoint call")
 	}
-	admit := strings.Index(bpf, "faketcp_mtu_allows_growth(skb, old_total_len)")
-	mutation := strings.Index(bpf, "bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA")
-	if admit < 0 || mutation < 0 || admit >= mutation {
-		t.Fatal("device MTU rejection must precede the first packet-size mutation")
+	egress := sourceSection(t, tc, "int wg_mix_egress(struct __sk_buff *skb)", "SEC(\"classifier/ingress\")")
+	l3Gate := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	fixedGate := strings.Index(egress, "faketcp_managed_transform_status(&faketcp_l3, IPPROTO_UDP)")
+	admit := strings.Index(egress, "faketcp_mtu_allows_growth(skb, faketcp_l3.l3_len)")
+	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
+	if l3Gate < 0 || fixedGate < 0 || admit < 0 || checkpoint < 0 ||
+		!(l3Gate < fixedGate && fixedGate < admit && admit < checkpoint) {
+		t.Fatal("device MTU rejection must run once after fixed-IPv4 parsing and before proof formation")
+	}
+	encoder := sourceSection(t, bpf, "static __always_inline int faketcp_encode_established(", "static __always_inline int faketcp_continue_egress")
+	if strings.Contains(encoder, "faketcp_mtu_allows_growth(") {
+		t.Fatal("encoder retained the late MTU check after proof formation")
 	}
 	if fakeTCPImplementedCapabilities&fakeTCPCapabilityMTUEnforcement != 0 {
 		t.Fatal("a model or static contract must not claim live MTU enforcement")

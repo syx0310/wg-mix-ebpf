@@ -234,6 +234,11 @@ func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(source)
+	tcSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc := string(tcSource)
 
 	preflightStart := strings.Index(text, "static __always_inline int faketcp_egress_admission_checkpoint")
 	checksumCommentStart := strings.Index(text, "// TC's public __sk_buff ABI")
@@ -281,11 +286,20 @@ func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
 	}
 
 	encoder := text[encoderStart:continuationStart]
-	mtuCheck := strings.Index(encoder, "faketcp_mtu_allows_growth(skb, old_total_len)")
 	normalize := strings.Index(encoder, "bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)")
 	checksum := strings.Index(encoder, "faketcp_materialize_tcp_checksum(skb")
-	if mtuCheck < 0 || normalize < 0 || checksum < 0 || mtuCheck >= normalize || normalize >= checksum {
-		t.Fatal("device MTU check, checksum-state normalization and full recompute are out of order")
+	if normalize < 0 || checksum < 0 || normalize >= checksum ||
+		strings.Contains(encoder, "faketcp_mtu_allows_growth(") {
+		t.Fatal("encoder must not repeat the pre-proof MTU gate and must recompute checksum after growth")
+	}
+	egress := sourceSection(t, tc, "int wg_mix_egress(struct __sk_buff *skb)", "SEC(\"classifier/ingress\")")
+	l3Gate := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	fixedGate := strings.Index(egress, "faketcp_managed_transform_status(&faketcp_l3, IPPROTO_UDP)")
+	mtuCheck := strings.Index(egress, "faketcp_mtu_allows_growth(skb, faketcp_l3.l3_len)")
+	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
+	if l3Gate < 0 || fixedGate < 0 || mtuCheck < 0 || checkpoint < 0 ||
+		!(l3Gate < fixedGate && fixedGate < mtuCheck && mtuCheck < checkpoint) {
+		t.Fatal("fixed-IPv4 and exact-once device MTU gates must precede proof formation")
 	}
 	for _, want := range []string{
 		"old_total_len != sizeof(*iph) + udp_len",
@@ -555,38 +569,56 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 	if strings.Contains(text, "bpf_map_delete_elem(&faketcp_session_map") {
 		t.Fatal("packet programs must never bypass the userspace exact-delete finalizer")
 	}
-	if got := strings.Count(text, "bpf_map_lookup_elem(&faketcp_session_map"); got != 4 {
-		t.Fatalf("session-map lookup sites=%d, want claim plus three packet paths", got)
+	if got := strings.Count(text, "bpf_map_lookup_elem(&faketcp_session_map"); got != 5 {
+		t.Fatalf("session-map lookup sites=%d, want claim plus four explicit packet-stage lookups", got)
 	}
 
-	preflightStart := strings.Index(text, "faketcp_preflight_egress(struct __sk_buff")
+	preflightStart := strings.Index(text, "faketcp_egress_admission_checkpoint(")
 	encodeStart := strings.Index(text, "faketcp_encode_established(struct __sk_buff")
+	continueStart := strings.Index(text, "faketcp_continue_egress(struct __sk_buff")
+	ingressConsumeStart := strings.Index(text, "faketcp_consume_ingress_admission(")
+	xdpCheckpointStart := strings.Index(text, "faketcp_xdp_admission_checkpoint(")
 	xdpStart := strings.Index(text, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
-	if preflightStart < 0 || encodeStart < 0 || xdpStart < 0 ||
-		!(preflightStart < encodeStart && encodeStart < xdpStart) {
+	if preflightStart < 0 || encodeStart < 0 || continueStart < 0 ||
+		ingressConsumeStart < 0 || xdpCheckpointStart < 0 || xdpStart < 0 ||
+		!(preflightStart < encodeStart && encodeStart < continueStart &&
+			continueStart < ingressConsumeStart && ingressConsumeStart < xdpCheckpointStart &&
+			xdpCheckpointStart < xdpStart) {
 		t.Fatal("FakeTCP packet path functions are missing or reordered")
 	}
 	preflight := text[preflightStart:encodeStart]
-	encode := text[encodeStart:xdpStart]
+	encode := text[encodeStart:continueStart]
+	ingressConsume := text[ingressConsumeStart:xdpCheckpointStart]
+	xdpCheckpoint := text[xdpCheckpointStart:xdpStart]
 	xdp := text[xdpStart:]
-	if !strings.Contains(preflight,
-		"faketcp_session_admit_established(session, generation)") {
-		t.Fatal("TC preflight admits established state without the per-value lock")
+	if strings.Count(preflight, "faketcp_session_snapshot_established(") != 1 {
+		t.Fatal("TC checkpoint must take exactly one locked established snapshot")
 	}
-	if strings.Contains(encode,
-		"faketcp_session_admit_established(session, generation)") ||
-		strings.Count(encode, "FAKETCP_SESSION_MUTATE_TX") != 1 {
-		t.Fatal("TC encoder regained a redundant admission lock or lost its mutation")
+	matcher := sourceSection(t, text,
+		"static __always_inline int faketcp_egress_admission_matches(",
+		"static __always_inline int faketcp_egress_admission_checkpoint(")
+	if strings.Contains(matcher, "bpf_map_lookup_elem(&faketcp_session_map") ||
+		strings.Contains(matcher, "faketcp_session_authority_matches(") ||
+		strings.Contains(matcher, "bpf_spin_lock(") {
+		t.Fatal("egress token comparison regained a redundant session lookup/lock")
+	}
+	if strings.Count(encode, "FAKETCP_SESSION_MUTATE_TX") != 1 ||
+		strings.Count(encode, "bpf_map_lookup_elem(&faketcp_session_map") != 1 {
+		t.Fatal("TC encoder must perform one lookup and one final writer mutation")
 	}
 	encoderMutation := strings.Index(encode, "faketcp_session_mutate(session, generation, now,")
 	if encoderMutation < 0 || strings.Contains(encode[:encoderMutation], "session->") {
 		t.Fatal("TC encoder consumed a session field before its sole locked mutation snapshot")
 	}
-	if strings.Count(xdp,
-		"faketcp_session_admit_established(session, generation)") != 1 ||
+	if strings.Count(ingressConsume, "faketcp_session_authority_matches(") != 1 ||
+		strings.Count(ingressConsume, "bpf_map_lookup_elem(&faketcp_session_map") != 1 {
+		t.Fatal("TC ingress must consume one stable-lifetime proof under one read lock")
+	}
+	if strings.Count(xdpCheckpoint, "faketcp_session_snapshot_established(") != 1 ||
+		strings.Count(xdpCheckpoint, "bpf_map_lookup_elem(&faketcp_session_map") != 1 ||
 		strings.Count(xdp, "FAKETCP_SESSION_MUTATE_TOUCH") != 1 ||
 		strings.Count(xdp, "FAKETCP_SESSION_MUTATE_RX") != 1 {
-		t.Fatal("XDP reader/keepalive/payload writer lock or revision contract drifted")
+		t.Fatal("XDP checkpoint reader or keepalive/payload writer lock contract drifted")
 	}
 
 	// Packet helpers and rewrite are deliberately outside the tiny writer
