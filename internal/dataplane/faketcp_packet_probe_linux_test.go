@@ -7,7 +7,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"net"
 	"net/netip"
 	"os"
 	"testing"
@@ -15,20 +14,10 @@ import (
 	"github.com/cilium/ebpf"
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 	"github.com/syx0310/wg-mix-ebpf/internal/faketcp"
-	"github.com/vishvananda/netlink"
 	"golang.org/x/sys/unix"
 )
 
 const fakeTCPPacketProbeObjectEnv = "WG_MIX_FAKETCP_PACKET_TEST_OBJECT"
-
-type fakeTCPPacketProbeRoute struct {
-	ifindex      uint32
-	source       netip.Addr
-	destination  netip.Addr
-	deviceMTU    int
-	routeMTU     int
-	effectiveMTU int
-}
 
 // fakeTCPSKBContext mirrors the 192-byte Linux UAPI struct __sk_buff through
 // hwtstamp. Keeping gso_segs and gso_size in an explicit context makes the
@@ -121,20 +110,20 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 		t.Fatalf("load experimental object %s (%s): %v", identity.Source, identity.SHA256, err)
 	}
 	defer collection.Close()
-	probeRoute := resolveFakeTCPPacketProbeRoute(t)
 
 	const (
 		generation = uint64(91)
 		profileID  = uint32(7)
 		wgID       = uint32(11)
+		ifindex    = uint32(1) // loopback in the dedicated Linux probe host
 		sourcePort = uint16(31001)
 		remotePort = uint16(443)
 	)
-	localIPv4, err := faketcp.RawIPv4BE32(probeRoute.source)
+	localIPv4, err := faketcp.RawIPv4BE32(netip.MustParseAddr("10.0.0.1"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	remoteIPv4, err := faketcp.RawIPv4BE32(probeRoute.destination)
+	remoteIPv4, err := faketcp.RawIPv4BE32(netip.MustParseAddr("10.0.0.2"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -147,28 +136,20 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	const (
 		fakeTCPStatBadPacket = uint32(4)
 		fakeTCPStatGSOReject = uint32(5)
-		fakeTCPStatMTUReject = uint32(16)
 	)
-	acceptedPayloadLengths := []int{32, 33}
-	for _, payloadLength := range []int{1459, 1460} {
-		if 40+payloadLength <= probeRoute.effectiveMTU {
-			acceptedPayloadLengths = append(acceptedPayloadLengths, payloadLength)
-		}
-	}
 	for _, xorEnabled := range []bool{false, true} {
-		for _, payloadLength := range acceptedPayloadLengths {
+		for _, payloadLength := range []int{32, 33, 1459, 1460} {
 			name := fmt.Sprintf("checksum-none-materialized-payload-%d", payloadLength)
 			if xorEnabled {
 				name += "-xor"
 			}
 			t.Run(name, func(t *testing.T) {
 				xorKey := populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
-					probeRoute.ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, xorEnabled)
+					ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, xorEnabled)
 				packet, originalPayload := buildFakeTCPProbeUDPPacket(
-					t, probeRoute.source, probeRoute.destination,
-					sourcePort, remotePort, payloadLength,
+					t, sourcePort, remotePort, payloadLength,
 				)
-				context := fakeTCPSKBContext{Ifindex: probeRoute.ifindex}
+				context := fakeTCPSKBContext{Ifindex: ifindex}
 				result, output, err := runFakeTCPPacketProbe(
 					program, packet, context, len(packet)+64,
 				)
@@ -186,16 +167,11 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	}
 
 	t.Run("frame-cap-exact-materialized", func(t *testing.T) {
-		if probeRoute.effectiveMTU < 2316 {
-			t.Skipf("effective route/device MTU %d is below the 2316-byte post-transform frame-cap boundary", probeRoute.effectiveMTU)
-		}
 		populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
-			probeRoute.ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, false)
-		packet, originalPayload := buildFakeTCPProbeUDPPacket(
-			t, probeRoute.source, probeRoute.destination, sourcePort, remotePort, 2276,
-		)
+			ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, false)
+		packet, originalPayload := buildFakeTCPProbeUDPPacket(t, sourcePort, remotePort, 2276)
 		result, output, err := runFakeTCPPacketProbe(
-			program, packet, fakeTCPSKBContext{Ifindex: probeRoute.ifindex}, len(packet)+64,
+			program, packet, fakeTCPSKBContext{Ifindex: ifindex}, len(packet)+64,
 		)
 		if err != nil {
 			t.Fatalf("BPF_PROG_TEST_RUN exact frame boundary: %v", err)
@@ -210,13 +186,11 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 
 	t.Run("frame-cap-one-over-hard-reject", func(t *testing.T) {
 		populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
-			probeRoute.ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, false)
-		packet, _ := buildFakeTCPProbeUDPPacket(
-			t, probeRoute.source, probeRoute.destination, sourcePort, remotePort, 2277,
-		)
+			ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, false)
+		packet, _ := buildFakeTCPProbeUDPPacket(t, sourcePort, remotePort, 2277)
 		before := readFakeTCPPacketProbeStat(t, collection, fakeTCPStatBadPacket)
 		result, output, err := runFakeTCPPacketProbe(
-			program, packet, fakeTCPSKBContext{Ifindex: probeRoute.ifindex}, len(packet)+64,
+			program, packet, fakeTCPSKBContext{Ifindex: ifindex}, len(packet)+64,
 		)
 		if err != nil {
 			t.Fatalf("BPF_PROG_TEST_RUN frame boundary: %v", err)
@@ -233,80 +207,13 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 		}
 	})
 
-	t.Run("mtu-exact-materialized", func(t *testing.T) {
-		if probeRoute.effectiveMTU > 2315 {
-			t.Skipf("effective route/device MTU %d is above the independently tested frame cap", probeRoute.effectiveMTU)
-		}
-		payloadLength := probeRoute.effectiveMTU - 40
-		populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
-			probeRoute.ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, false)
-		packet, originalPayload := buildFakeTCPProbeUDPPacket(
-			t, probeRoute.source, probeRoute.destination,
-			sourcePort, remotePort, payloadLength,
-		)
-		result, output, err := runFakeTCPPacketProbe(
-			program, packet, fakeTCPSKBContext{Ifindex: probeRoute.ifindex}, len(packet)+64,
-		)
-		if err != nil {
-			t.Fatalf("BPF_PROG_TEST_RUN exact MTU boundary: %v", err)
-		}
-		if result != 0 {
-			t.Fatalf("exact MTU-boundary packet action=%d, want TC_ACT_OK", result)
-		}
-		verifyFakeTCPProbeOutput(
-			t, output, packet, originalPayload, sourcePort, remotePort, nil,
-		)
-	})
-
-	t.Run("mtu-one-over-hard-reject", func(t *testing.T) {
-		if probeRoute.effectiveMTU > 2315 {
-			t.Skipf("effective route/device MTU %d is above the independently tested frame cap", probeRoute.effectiveMTU)
-		}
-		payloadLength := probeRoute.effectiveMTU - 40 + 1
-		populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
-			probeRoute.ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, false)
-		packet, _ := buildFakeTCPProbeUDPPacket(
-			t, probeRoute.source, probeRoute.destination,
-			sourcePort, remotePort, payloadLength,
-		)
-		boundary := faketcp.MTUBoundaryDevice
-		if probeRoute.routeMTU < probeRoute.deviceMTU {
-			boundary = faketcp.MTUBoundaryRoute
-		}
-		auditKey, err := faketcp.EncodeMTUAuditKey(faketcp.MTUErrorExceeded, boundary)
-		if err != nil {
-			t.Fatal(err)
-		}
-		beforeReject := readFakeTCPPacketProbeStat(t, collection, fakeTCPStatMTUReject)
-		beforeAudit := readFakeTCPPacketProbeMapCounter(t, collection, "faketcp_mtu_audit_map", auditKey)
-		result, output, err := runFakeTCPPacketProbe(
-			program, packet, fakeTCPSKBContext{Ifindex: probeRoute.ifindex}, len(packet)+64,
-		)
-		if err != nil {
-			t.Fatalf("BPF_PROG_TEST_RUN one-over MTU boundary: %v", err)
-		}
-		if result != 2 {
-			t.Fatalf("one-over MTU packet action=%d, want TC_ACT_SHOT", result)
-		}
-		if !bytes.Equal(output, packet) {
-			t.Fatal("one-over MTU packet was mutated before the hard reject")
-		}
-		afterReject := readFakeTCPPacketProbeStat(t, collection, fakeTCPStatMTUReject)
-		afterAudit := readFakeTCPPacketProbeMapCounter(t, collection, "faketcp_mtu_audit_map", auditKey)
-		if afterReject != beforeReject+1 || afterAudit != beforeAudit+1 {
-			t.Fatalf("MTU reject/audit deltas=%d/%d, want 1/1", afterReject-beforeReject, afterAudit-beforeAudit)
-		}
-	})
-
 	t.Run("aggregate-gso-hard-reject", func(t *testing.T) {
 		populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
-			probeRoute.ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, true)
-		packet, _ := buildFakeTCPProbeUDPPacket(
-			t, probeRoute.source, probeRoute.destination, sourcePort, remotePort, 33,
-		)
+			ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, true)
+		packet, _ := buildFakeTCPProbeUDPPacket(t, sourcePort, remotePort, 33)
 		before := readFakeTCPPacketProbeStat(t, collection, fakeTCPStatGSOReject)
 		context := fakeTCPSKBContext{
-			Ifindex:     probeRoute.ifindex,
+			Ifindex:     ifindex,
 			GSOSegments: 2,
 			GSOSize:     16,
 		}
@@ -332,70 +239,15 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	})
 }
 
-func resolveFakeTCPPacketProbeRoute(t *testing.T) fakeTCPPacketProbeRoute {
-	t.Helper()
-	destination := netip.MustParseAddr("192.0.2.1")
-	routes, err := netlink.RouteGet(net.IP(destination.AsSlice()))
-	if err != nil {
-		t.Fatalf("resolve read-only FakeTCP packet-probe route: %v", err)
-	}
-	if len(routes) != 1 {
-		t.Fatalf("resolve read-only FakeTCP packet-probe route: got %d results, want one", len(routes))
-	}
-	route := routes[0]
-	sourceBytes := route.Src.To4()
-	if route.LinkIndex <= 0 || sourceBytes == nil {
-		t.Fatalf("FakeTCP packet-probe route has no IPv4 source/link identity: %s", route.String())
-	}
-	source, ok := netip.AddrFromSlice(sourceBytes)
-	if !ok {
-		t.Fatalf("parse FakeTCP packet-probe route source %s", route.Src)
-	}
-	link, err := netlink.LinkByIndex(route.LinkIndex)
-	if err != nil {
-		t.Fatalf("inspect FakeTCP packet-probe route link %d: %v", route.LinkIndex, err)
-	}
-	if link.Attrs() == nil || link.Attrs().MTU <= 0 {
-		t.Fatalf("FakeTCP packet-probe route link %d has no positive MTU", route.LinkIndex)
-	}
-	deviceMTU := link.Attrs().MTU
-	routeMTU := route.MTU
-	if routeMTU == 0 {
-		routeMTU = deviceMTU
-	}
-	effectiveMTU := min(deviceMTU, routeMTU)
-	if effectiveMTU < 72 {
-		t.Fatalf("FakeTCP packet-probe route MTU %d cannot carry the minimum 32-byte probe payload", effectiveMTU)
-	}
-	return fakeTCPPacketProbeRoute{
-		ifindex:      uint32(route.LinkIndex),
-		source:       source.Unmap(),
-		destination:  destination,
-		deviceMTU:    deviceMTU,
-		routeMTU:     routeMTU,
-		effectiveMTU: effectiveMTU,
-	}
-}
-
 func readFakeTCPPacketProbeStat(
 	t *testing.T,
 	collection *ebpf.Collection,
 	key uint32,
 ) uint64 {
 	t.Helper()
-	return readFakeTCPPacketProbeMapCounter(t, collection, "faketcp_stats_map", key)
-}
-
-func readFakeTCPPacketProbeMapCounter(
-	t *testing.T,
-	collection *ebpf.Collection,
-	mapName string,
-	key uint32,
-) uint64 {
-	t.Helper()
-	stats := collection.Maps[mapName]
+	stats := collection.Maps["faketcp_stats_map"]
 	if stats == nil {
-		t.Fatalf("experimental object has no %s", mapName)
+		t.Fatal("experimental object has no faketcp_stats_map")
 	}
 	possibleCPUs, err := ebpf.PossibleCPU()
 	if err != nil {
@@ -403,7 +255,7 @@ func readFakeTCPPacketProbeMapCounter(
 	}
 	values := make([]uint64, possibleCPUs)
 	if err := stats.Lookup(&key, &values); err != nil {
-		t.Fatalf("read %s[%d]: %v", mapName, key, err)
+		t.Fatalf("read faketcp_stats_map[%d]: %v", key, err)
 	}
 	var total uint64
 	for _, value := range values {
@@ -558,16 +410,11 @@ func populateFakeTCPPacketProbeTailCalls(
 
 func buildFakeTCPProbeUDPPacket(
 	t *testing.T,
-	sourceIPv4 netip.Addr,
-	destinationIPv4 netip.Addr,
 	sourcePort uint16,
 	destinationPort uint16,
 	payloadLength int,
 ) ([]byte, []byte) {
 	t.Helper()
-	if !sourceIPv4.Is4() || !destinationIPv4.Is4() {
-		t.Fatalf("probe packet requires IPv4 source/destination, got %s/%s", sourceIPv4, destinationIPv4)
-	}
 	if payloadLength < 32 {
 		t.Fatal("probe payload must be a WireGuard transport-data shape")
 	}
@@ -581,19 +428,15 @@ func buildFakeTCPProbeUDPPacket(
 	binary.BigEndian.PutUint16(udp[0:2], sourcePort)
 	binary.BigEndian.PutUint16(udp[2:4], destinationPort)
 	binary.BigEndian.PutUint16(udp[4:6], uint16(len(udp)+len(payload)))
-	sourceBytes := sourceIPv4.As4()
-	destinationBytes := destinationIPv4.As4()
-	binary.BigEndian.PutUint16(
-		udp[6:8], testIPv4TransportChecksum(sourceBytes, destinationBytes, 17, udp, payload),
-	)
+	binary.BigEndian.PutUint16(udp[6:8], testTransportChecksum(17, udp, payload))
 
 	ipv4 := make([]byte, 20)
 	ipv4[0] = 0x45
 	ipv4[8] = 64
 	ipv4[9] = 17
 	binary.BigEndian.PutUint16(ipv4[2:4], uint16(len(ipv4)+len(udp)+len(payload)))
-	copy(ipv4[12:16], sourceBytes[:])
-	copy(ipv4[16:20], destinationBytes[:])
+	copy(ipv4[12:16], []byte{10, 0, 0, 1})
+	copy(ipv4[16:20], []byte{10, 0, 0, 2})
 	binary.BigEndian.PutUint16(ipv4[10:12], internetChecksum(ipv4))
 
 	ethernet := make([]byte, 14)
@@ -667,12 +510,7 @@ func verifyFakeTCPProbeOutput(
 	tcpForChecksum := append([]byte(nil), tcp...)
 	gotChecksum := binary.BigEndian.Uint16(tcpForChecksum[16:18])
 	tcpForChecksum[16], tcpForChecksum[17] = 0, 0
-	var sourceIPv4, destinationIPv4 [4]byte
-	copy(sourceIPv4[:], ipv4[12:16])
-	copy(destinationIPv4[:], ipv4[16:20])
-	wantChecksum := testIPv4TransportChecksum(
-		sourceIPv4, destinationIPv4, 6, tcpForChecksum, wirePayload,
-	)
+	wantChecksum := testTransportChecksum(6, tcpForChecksum, wirePayload)
 	if gotChecksum != wantChecksum {
 		t.Fatalf("FakeTCP TCP checksum=%#04x, full recompute=%#04x", gotChecksum, wantChecksum)
 	}

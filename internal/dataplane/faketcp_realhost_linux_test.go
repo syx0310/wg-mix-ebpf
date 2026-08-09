@@ -1130,14 +1130,7 @@ func buildFakeTCPRealHostProbePacket(
 		t.Fatalf("FakeTCP real-host probe requires exact Ethernet addresses: destination=%x source=%x",
 			destinationMAC, sourceMAC)
 	}
-	packet, payload := buildFakeTCPProbeUDPPacket(
-		t,
-		netip.MustParseAddr("10.0.0.1"),
-		netip.MustParseAddr("10.0.0.2"),
-		31001,
-		31002,
-		payloadLength,
-	)
+	packet, payload := buildFakeTCPProbeUDPPacket(t, 31001, 31002, payloadLength)
 	copy(packet[0:6], destinationMAC)
 	copy(packet[6:12], sourceMAC)
 	return packet, payload
@@ -1155,12 +1148,7 @@ func buildFakeTCPRealHostGSOProbePacket(
 			destinationMAC, sourceMAC)
 	}
 	packet, payload := buildFakeTCPProbeUDPPacket(
-		t,
-		netip.MustParseAddr("10.0.0.1"),
-		netip.MustParseAddr("10.0.0.2"),
-		fakeTCPRealHostGSOSourcePort,
-		fakeTCPRealHostGSODestinationPort,
-		payloadLength,
+		t, fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort, payloadLength,
 	)
 	copy(packet[0:6], destinationMAC)
 	copy(packet[6:12], sourceMAC)
