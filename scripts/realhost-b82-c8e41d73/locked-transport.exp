@@ -1,6 +1,33 @@
 #!/usr/bin/expect -f
 
 set ::TRANSPORT_SCRIPT_PATH [file normalize [info script]]
+set ::RETIRE_ID "c8e41d73-2c690050ae1d-r1"
+set ::PREDECESSOR_COMMIT "2c690050ae1d69dbd074acfd612faa2b80e29f8a"
+set ::PREDECESSOR_MANIFEST_SHA256 \
+    "21f14e1f7e646649fdad864dce23dce2055585962d92bfaba6e71158372c1ebe"
+set ::PREDECESSOR_LOCAL_PACKAGE \
+    "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-2c690050ae1d"
+set ::RETIREMENT_USER_INTAKE \
+    "/home/siyixuan/wg-mix-ebpf-test/retire-prestage-${::RETIRE_ID}.intake"
+set ::RETIREMENT_USER_INTAKE_PARENT "/home/siyixuan/wg-mix-ebpf-test"
+set ::RETIREMENT_HOME_QROOT "/home/.wg-mix-ebpf-retirement-${::RETIRE_ID}"
+set ::RETIREMENT_AUTH_ROOT "${::RETIREMENT_HOME_QROOT}/authority"
+set ::RETIREMENT_AUTH_MANIFEST \
+    "${::RETIREMENT_AUTH_ROOT}/package-manifest.v1"
+set ::RETIREMENT_AUTH_MANIFEST_PENDING \
+    "${::RETIREMENT_AUTH_MANIFEST}.pending"
+set ::RETIREMENT_AUTH_SELF \
+    "${::RETIREMENT_AUTH_ROOT}/prepare-stage-root.sh"
+set ::RETIREMENT_AUTH_SELF_PENDING "${::RETIREMENT_AUTH_SELF}.pending"
+set ::RETIREMENT_Q_INTAKE "${::RETIREMENT_HOME_QROOT}/intake"
+set ::RETIREMENT_Q_PACKAGE "${::RETIREMENT_HOME_QROOT}/package"
+set ::RETIREMENT_RUN_QROOT "/run/wg-mix-ebpf-retirement-${::RETIRE_ID}"
+set ::RETIREMENT_Q_BOOTSTRAP "${::RETIREMENT_RUN_QROOT}/bootstrap"
+set ::RETIREMENT_LOCK "${::RETIREMENT_RUN_QROOT}/retirement.v1.lock"
+set ::RETIREMENT_RECEIPT_PENDING \
+    "${::RETIREMENT_RUN_QROOT}/retirement-complete.v1.pending"
+set ::RETIREMENT_RECEIPT_FINAL \
+    "${::RETIREMENT_RUN_QROOT}/retirement-complete.v1"
 
 proc fail {message code} {
     puts stderr "B82_V6_TRANSPORT_STOP reason=$message rc=$code"
@@ -14,6 +41,32 @@ proc file_sha256 {path} {
     set digest [lindex $output 0]
     if {![regexp {^[0-9a-f]{64}$} $digest]} {
         return -code error "sha256-shape"
+    }
+    return $digest
+}
+
+proc file_prefix_sha256 {path length} {
+    if {![string is integer -strict $length] || $length < 0 ||
+        $length > 16777216 || [file normalize $path] ne $path ||
+        [file type $path] ne "file"} {
+        return -code error "sha256-prefix-arguments"
+    }
+    set channel [open $path r]
+    fconfigure $channel -encoding binary -translation binary
+    if {[catch {read $channel $length} payload]} {
+        close $channel
+        return -code error "sha256-prefix-read"
+    }
+    close $channel
+    if {[string bytelength $payload] != $length ||
+        [catch {exec /usr/bin/shasum -a 256 << $payload} output]} {
+        set payload ""
+        return -code error "sha256-prefix-command"
+    }
+    set payload ""
+    set digest [lindex $output 0]
+    if {![regexp {^[0-9a-f]{64}$} $digest]} {
+        return -code error "sha256-prefix-shape"
     }
     return $digest
 }
@@ -310,6 +363,35 @@ proc scp_options {} {
 
 proc env_argv {} {
     return [list /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C]
+}
+
+proc retirement_helper_remote_argv {values manifest_sha mode} {
+    if {$mode ni {retire-prestage-2c690050 verify-retirement}} {
+        return -code error "retirement-helper-mode"
+    }
+    return [list /bin/bash -p $::RETIREMENT_AUTH_SELF $mode \
+        --manifest $::RETIREMENT_AUTH_MANIFEST \
+        --manifest-sha256 $manifest_sha]
+}
+
+proc retirement_fixed_path {name} {
+    switch -- $name {
+        user-intake { return $::RETIREMENT_USER_INTAKE }
+        home-qroot { return $::RETIREMENT_HOME_QROOT }
+        auth-root { return $::RETIREMENT_AUTH_ROOT }
+        auth-manifest { return $::RETIREMENT_AUTH_MANIFEST }
+        auth-manifest-pending { return $::RETIREMENT_AUTH_MANIFEST_PENDING }
+        auth-self { return $::RETIREMENT_AUTH_SELF }
+        auth-self-pending { return $::RETIREMENT_AUTH_SELF_PENDING }
+        quarantine-intake { return $::RETIREMENT_Q_INTAKE }
+        quarantine-package { return $::RETIREMENT_Q_PACKAGE }
+        run-qroot { return $::RETIREMENT_RUN_QROOT }
+        quarantine-bootstrap { return $::RETIREMENT_Q_BOOTSTRAP }
+        lock { return $::RETIREMENT_LOCK }
+        receipt-pending { return $::RETIREMENT_RECEIPT_PENDING }
+        receipt-final { return $::RETIREMENT_RECEIPT_FINAL }
+        default { return -code error "retirement-fixed-path" }
+    }
 }
 
 proc fresh_remote_argv {values manifest_sha mode bootstrap_root} {
@@ -813,6 +895,359 @@ proc build_operation {values manifest_sha operation approved_sha} {
     return [list ssh $spawn_argv $prompt_limit $assertion $timeout_seconds]
 }
 
+proc retirement_entry_assertion {names} {
+    set assertion [list exact-entry-set]
+    foreach name $names {
+        lappend assertion "${name}\tf"
+    }
+    return $assertion
+}
+
+proc retirement_local_delivery_file {values manifest_sha name} {
+    set package [dict get $values local_package_dir]
+    switch -- $name {
+        package-manifest.v1 {
+            set expected_sha $manifest_sha
+        }
+        prepare-stage-root.sh {
+            set expected_sha [dict get $values prepare_stage_root_sh_sha256]
+        }
+        default {
+            return -code error "retirement-delivery-name"
+        }
+    }
+    set path "${package}/${name}"
+    if {[file normalize $path] ne $path ||
+        [catch {file lstat $path file_stat}] ||
+        [catch {file lstat $package package_stat}] ||
+        $file_stat(type) ne "file" || $file_stat(nlink) != 1 ||
+        $file_stat(size) < 1 || $file_stat(size) > 16777216 ||
+        ($file_stat(mode) & 07777) != 0600 ||
+        $package_stat(type) ne "directory" ||
+        ($package_stat(mode) & 07777) != 0700 ||
+        $file_stat(uid) != $package_stat(uid) ||
+        $file_stat(gid) != $package_stat(gid) ||
+        [file_sha256 $path] ne $expected_sha} {
+        return -code error "retirement-delivery-local-file"
+    }
+    return [list $path $expected_sha]
+}
+
+# This builder is deliberately private to the two fixed retirement workflows.
+# None of its raw leaves are accepted by transport_main as caller operations.
+proc build_retirement_operation {values manifest_sha predecessor_values operation} {
+    set target "[dict get $values target_user]@[dict get $values target_host]"
+    set old_package [dict get $predecessor_values remote_package_dir]
+    set old_bootstrap "/run/wg-mix-ebpf-source-bootstrap-c8e41d73"
+    set old_provisioner "${old_bootstrap}/provision-ubuntu-test-host.sh"
+    set remote {}
+    set tty 1
+    set prompt_limit 2
+    set assertion none
+    set timeout_seconds 600
+
+    if {[regexp {^retire-ro-exists-(.+)$} $operation -> path_name]} {
+        set path [retirement_fixed_path $path_name]
+        set remote [concat [list /usr/bin/sudo --] [env_argv] \
+            [list /usr/bin/test -e $path -o -L $path]]
+    } else {
+        switch -- $operation {
+            retire-ro-old-package-readlink {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/readlink -e -- $old_package]]
+                set assertion "exact:${old_package}"
+            }
+            retire-ro-old-package-stat {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%F -- $old_package]]
+                set assertion exact:siyixuan:siyixuan:700:directory
+            }
+            retire-ro-old-package-entries {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/find $old_package -xdev -mindepth 1 -maxdepth 1 \
+                    -printf {'%f\t%y\n'}]]
+                set assertion [retirement_entry_assertion [package_names]]
+            }
+            retire-ro-old-bootstrap-entries {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/find $old_bootstrap -xdev -mindepth 1 -maxdepth 1 \
+                    -printf {'%f\t%y\n'}]]
+                set assertion [retirement_entry_assertion \
+                    {prepare-stage-root.sh provision-ubuntu-test-host.sh}]
+            }
+            retire-ro-intake-readlink {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/readlink -e -- $::RETIREMENT_USER_INTAKE]]
+                set assertion "exact:$::RETIREMENT_USER_INTAKE"
+            }
+            retire-ro-intake-stat {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%F -- \
+                    $::RETIREMENT_USER_INTAKE]]
+                set assertion exact:siyixuan:siyixuan:700:directory
+            }
+            retire-ro-intake-entries {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/find $::RETIREMENT_USER_INTAKE -xdev \
+                    -mindepth 1 -maxdepth 1 -printf {'%f\t%y\n'}]]
+            }
+            retire-ro-home-qroot-entries - retire-ro-auth-root-entries -
+            retire-ro-run-qroot-entries {
+                set path [expr {$operation eq "retire-ro-home-qroot-entries" ?
+                    $::RETIREMENT_HOME_QROOT :
+                    ($operation eq "retire-ro-auth-root-entries" ?
+                    $::RETIREMENT_AUTH_ROOT : $::RETIREMENT_RUN_QROOT)}]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/find $path -xdev -mindepth 1 -maxdepth 1 \
+                    -printf {'%f\t%y\n'}]]
+            }
+            retire-ro-intake-manifest-sha {
+                set remote [list /usr/bin/sha256sum -- \
+                    "${::RETIREMENT_USER_INTAKE}/package-manifest.v1"]
+                set assertion "exact:${manifest_sha}  ${::RETIREMENT_USER_INTAKE}/package-manifest.v1"
+                set tty 0
+                set prompt_limit 1
+            }
+            retire-ro-intake-manifest-sha-observe {
+                set remote [list /usr/bin/sha256sum -- \
+                    "${::RETIREMENT_USER_INTAKE}/package-manifest.v1"]
+                set tty 0
+                set prompt_limit 1
+            }
+            retire-ro-intake-manifest-stat {
+                set remote [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- \
+                    "${::RETIREMENT_USER_INTAKE}/package-manifest.v1"]
+                set assertion exact:siyixuan:siyixuan:600:1:regular\ file
+                set tty 0
+                set prompt_limit 1
+            }
+            retire-ro-intake-manifest-shape-observe {
+                set remote [list /usr/bin/stat -Lc %U:%G:%a:%h:%s:%F -- \
+                    "${::RETIREMENT_USER_INTAKE}/package-manifest.v1"]
+                set tty 0
+                set prompt_limit 1
+            }
+            retire-ro-intake-self-sha {
+                set remote [list /usr/bin/sha256sum -- \
+                    "${::RETIREMENT_USER_INTAKE}/prepare-stage-root.sh"]
+                set expected [dict get $values prepare_stage_root_sh_sha256]
+                set assertion "exact:${expected}  ${::RETIREMENT_USER_INTAKE}/prepare-stage-root.sh"
+                set tty 0
+                set prompt_limit 1
+            }
+            retire-ro-intake-self-sha-observe {
+                set remote [list /usr/bin/sha256sum -- \
+                    "${::RETIREMENT_USER_INTAKE}/prepare-stage-root.sh"]
+                set tty 0
+                set prompt_limit 1
+            }
+            retire-ro-intake-self-stat {
+                set remote [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- \
+                    "${::RETIREMENT_USER_INTAKE}/prepare-stage-root.sh"]
+                set assertion exact:siyixuan:siyixuan:600:1:regular\ file
+                set tty 0
+                set prompt_limit 1
+            }
+            retire-ro-intake-self-shape-observe {
+                set remote [list /usr/bin/stat -Lc %U:%G:%a:%h:%s:%F -- \
+                    "${::RETIREMENT_USER_INTAKE}/prepare-stage-root.sh"]
+                set tty 0
+                set prompt_limit 1
+            }
+            retire-raw-intake-mkdir {
+                set remote [list /usr/bin/mkdir --mode=0700 -- \
+                    $::RETIREMENT_USER_INTAKE]
+                set tty 0
+                set prompt_limit 1
+            }
+            retire-raw-scp-manifest - retire-raw-scp-self {
+                set name [expr {$operation eq "retire-raw-scp-manifest" ?
+                    "package-manifest.v1" : "prepare-stage-root.sh"}]
+                lassign [retirement_local_delivery_file $values $manifest_sha $name] \
+                    local_path expected_sha
+                set destination \
+                    "${target}:${::RETIREMENT_USER_INTAKE}/${name}"
+                set spawn_argv [concat [list /usr/bin/scp] [scp_options] \
+                    [list -- $local_path $destination]]
+                return [list scp $spawn_argv 1 none $timeout_seconds]
+            }
+            retire-raw-sync-intake-manifest - retire-raw-sync-intake-self -
+            retire-raw-sync-intake-directory - retire-raw-sync-intake-parent {
+                set path [expr {$operation eq "retire-raw-sync-intake-manifest" ?
+                    "${::RETIREMENT_USER_INTAKE}/package-manifest.v1" :
+                    ($operation eq "retire-raw-sync-intake-self" ?
+                    "${::RETIREMENT_USER_INTAKE}/prepare-stage-root.sh" :
+                    ($operation eq "retire-raw-sync-intake-directory" ?
+                    $::RETIREMENT_USER_INTAKE :
+                    $::RETIREMENT_USER_INTAKE_PARENT))}]
+                set remote [list /usr/bin/sync -- $path]
+                set tty 0
+                set prompt_limit 1
+            }
+            retire-raw-home-qroot-create {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/mkdir --mode=0700 -- \
+                    $::RETIREMENT_HOME_QROOT]]
+            }
+            retire-raw-auth-root-create {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/mkdir --mode=0700 -- \
+                    $::RETIREMENT_AUTH_ROOT]]
+            }
+            retire-raw-run-qroot-create {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/mkdir --mode=0700 -- \
+                    $::RETIREMENT_RUN_QROOT]]
+            }
+            retire-ro-home-qroot-readlink - retire-ro-auth-root-readlink -
+            retire-ro-run-qroot-readlink {
+                set path [expr {$operation eq "retire-ro-home-qroot-readlink" ?
+                    $::RETIREMENT_HOME_QROOT :
+                    ($operation eq "retire-ro-auth-root-readlink" ?
+                    $::RETIREMENT_AUTH_ROOT : $::RETIREMENT_RUN_QROOT)}]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/readlink -e -- $path]]
+                set assertion "exact:${path}"
+            }
+            retire-ro-home-qroot-stat - retire-ro-auth-root-stat -
+            retire-ro-run-qroot-stat {
+                set path [expr {$operation eq "retire-ro-home-qroot-stat" ?
+                    $::RETIREMENT_HOME_QROOT :
+                    ($operation eq "retire-ro-auth-root-stat" ?
+                    $::RETIREMENT_AUTH_ROOT : $::RETIREMENT_RUN_QROOT)}]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%F -- $path]]
+                set assertion exact:root:root:700:directory
+            }
+            retire-raw-auth-manifest-install {
+                set source "${::RETIREMENT_USER_INTAKE}/package-manifest.v1"
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/install --owner=root --group=root --mode=0600 \
+                    --no-target-directory -- $source \
+                    $::RETIREMENT_AUTH_MANIFEST_PENDING]]
+            }
+            retire-raw-auth-self-install {
+                set source "${::RETIREMENT_USER_INTAKE}/prepare-stage-root.sh"
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/install --owner=root --group=root --mode=0700 \
+                    --no-target-directory -- $source \
+                    $::RETIREMENT_AUTH_SELF_PENDING]]
+            }
+            retire-ro-auth-manifest-pending-sha - retire-ro-auth-manifest-sha {
+                set path [expr {$operation eq "retire-ro-auth-manifest-pending-sha" ?
+                    $::RETIREMENT_AUTH_MANIFEST_PENDING :
+                    $::RETIREMENT_AUTH_MANIFEST}]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sha256sum -- $path]]
+                set assertion "exact:${manifest_sha}  ${path}"
+            }
+            retire-ro-auth-manifest-pending-sha-observe {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sha256sum -- \
+                    $::RETIREMENT_AUTH_MANIFEST_PENDING]]
+            }
+            retire-ro-auth-self-pending-sha - retire-ro-auth-self-sha {
+                set path [expr {$operation eq "retire-ro-auth-self-pending-sha" ?
+                    $::RETIREMENT_AUTH_SELF_PENDING : $::RETIREMENT_AUTH_SELF}]
+                set expected [dict get $values prepare_stage_root_sh_sha256]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sha256sum -- $path]]
+                set assertion "exact:${expected}  ${path}"
+            }
+            retire-ro-auth-self-pending-sha-observe {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sha256sum -- \
+                    $::RETIREMENT_AUTH_SELF_PENDING]]
+            }
+            retire-ro-auth-manifest-pending-stat {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- \
+                    $::RETIREMENT_AUTH_MANIFEST_PENDING]]
+                set assertion exact:root:root:600:1:regular\ file
+            }
+            retire-ro-auth-self-pending-stat {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- \
+                    $::RETIREMENT_AUTH_SELF_PENDING]]
+                set assertion exact:root:root:700:1:regular\ file
+            }
+            retire-ro-auth-manifest-stat {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- \
+                    $::RETIREMENT_AUTH_MANIFEST]]
+                set assertion exact:root:root:600:2:regular\ file
+            }
+            retire-ro-auth-self-stat {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- \
+                    $::RETIREMENT_AUTH_SELF]]
+                set assertion exact:root:root:700:2:regular\ file
+            }
+            retire-ro-auth-manifest-pair {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %d:%i -- \
+                    $::RETIREMENT_AUTH_MANIFEST_PENDING \
+                    $::RETIREMENT_AUTH_MANIFEST]]
+                set assertion same-two-inodes
+            }
+            retire-ro-auth-self-pair {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %d:%i -- \
+                    $::RETIREMENT_AUTH_SELF_PENDING $::RETIREMENT_AUTH_SELF]]
+                set assertion same-two-inodes
+            }
+            retire-raw-sync-auth-manifest-pending {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sync -- $::RETIREMENT_AUTH_MANIFEST_PENDING]]
+            }
+            retire-raw-sync-auth-self-pending {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sync -- $::RETIREMENT_AUTH_SELF_PENDING]]
+            }
+            retire-raw-link-auth-manifest {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/ln --no-target-directory -- \
+                    $::RETIREMENT_AUTH_MANIFEST_PENDING \
+                    $::RETIREMENT_AUTH_MANIFEST]]
+            }
+            retire-raw-link-auth-self {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/ln --no-target-directory -- \
+                    $::RETIREMENT_AUTH_SELF_PENDING $::RETIREMENT_AUTH_SELF]]
+            }
+            retire-raw-sync-auth-root {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sync -- $::RETIREMENT_AUTH_ROOT]]
+            }
+            retire-raw-sync-home-parent {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sync -- /home]]
+            }
+            retire-raw-sync-home-qroot {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sync -- $::RETIREMENT_HOME_QROOT]]
+            }
+            retire-raw-sync-run-parent {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sync -- /run]]
+            }
+            retire-raw-helper-mutate - retire-ro-helper-verify {
+                set helper_mode [expr {$operation eq "retire-raw-helper-mutate" ?
+                    "retire-prestage-2c690050" : "verify-retirement"}]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [retirement_helper_remote_argv $values $manifest_sha $helper_mode]]
+                set timeout_seconds 2400
+            }
+            default {
+                return -code error "retirement-operation"
+            }
+        }
+    }
+    set spawn_argv [concat [list /usr/bin/ssh] [ssh_options $tty] \
+        [list -- $target] $remote]
+    return [list ssh $spawn_argv $prompt_limit $assertion $timeout_seconds]
+}
+
 proc output_value {payload} {
     set value [string map [list "\r" ""] $payload]
     return [string trim $value "\n"]
@@ -914,6 +1349,26 @@ proc provision_plan_policy {payload expected_mode} {
 proc assert_output {assertion payload} {
     set value [output_value $payload]
     if {$assertion eq "none"} {
+        return
+    }
+    if {[string first "exact-entry-set" $assertion] == 0} {
+        set expected [lrange $assertion 1 end]
+        set actual {}
+        if {$value ne ""} {
+            set actual [split $value "\n"]
+        }
+        if {[llength $actual] != [llength $expected] ||
+            [lsort -ascii $actual] ne [lsort -ascii $expected]} {
+            return -code error "entry-set-output-mismatch"
+        }
+        return
+    }
+    if {$assertion eq "same-two-inodes"} {
+        set lines [split $value "\n"]
+        if {[llength $lines] != 2 || [lindex $lines 0] ne [lindex $lines 1] ||
+            ![regexp {^[0-9]+:[0-9]+$} [lindex $lines 0]]} {
+            return -code error "inode-pair-output-mismatch"
+        }
         return
     }
     if {$assertion eq "empty"} {
@@ -1293,6 +1748,19 @@ proc prepare_stale_operations {} {
     }
 }
 
+proc retirement_stale_operations {} {
+    set operations {}
+    foreach operation [prepare_stale_operations] {
+        if {$operation ni {stale-package-root stale-bootstrap-root}} {
+            lappend operations $operation
+        }
+    }
+    if {[llength $operations] != 28} {
+        return -code error "retirement-stale-cardinality"
+    }
+    return $operations
+}
+
 proc package_names {} {
     return {
         source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh
@@ -1334,10 +1802,22 @@ proc transaction_operation {operation} {
     return [expr {$operation in {
         prepare provision-apply fresh-run fresh-restore veth-run veth-restore
         routed-run routed-restore realnic-run realnic-restore
+        retire-prestage-2c690050
     }}]
 }
 
+proc retirement_mutation_operation {operation} {
+    return [expr {$operation eq "retire-prestage-2c690050"}]
+}
+
+proc retirement_read_only_operation {operation} {
+    return [expr {$operation eq "verify-retirement"}]
+}
+
 proc read_only_operation {operation} {
+    if {[retirement_read_only_operation $operation]} {
+        return 1
+    }
     if {[lsearch -exact [concat [base_identity_operations] [postflight_operations] \
         [prepare_stale_operations]] $operation] >= 0} {
         return 1
@@ -1408,6 +1888,21 @@ proc require_manifest_authority {values manifest_sha} {
         $manifest_stat(gid) != $package_stat(gid)} {
         fail "manifest-transaction-drift" 66
     }
+}
+
+proc require_retirement_predecessor_authority {} {
+    set manifest "${::PREDECESSOR_LOCAL_PACKAGE}/package-manifest.v1"
+    if {[catch {load_manifest $manifest $::PREDECESSOR_MANIFEST_SHA256} values] ||
+        [catch {validate_manifest_values $values} validation_message] ||
+        [dict get $values integration_commit] ne $::PREDECESSOR_COMMIT ||
+        [dict get $values local_package_dir] ne $::PREDECESSOR_LOCAL_PACKAGE ||
+        [dict get $values remote_package_dir] ne
+            "/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61"} {
+        fail "retirement-predecessor-manifest" 66
+    }
+    require_manifest_authority $values $::PREDECESSOR_MANIFEST_SHA256
+    puts "B82_V6_RETIREMENT_PREDECESSOR_AUTHORITY predecessor_commit=$::PREDECESSOR_COMMIT predecessor_manifest_sha256=$::PREDECESSOR_MANIFEST_SHA256 credential_read=0 network_operations=0"
+    return $values
 }
 
 proc require_controller_verifier_authority {values} {
@@ -1597,6 +2092,595 @@ proc transaction_step {values manifest_sha operation approved_sha password} {
     require_primitive_success $result
     puts "B82_V6_TRANSPORT_TRANSACTION_STEP operation=$operation rc=0"
     return $result
+}
+
+proc execute_retirement_primitive {values manifest_sha predecessor_values operation password} {
+    require_manifest_authority $values $manifest_sha
+    if {$predecessor_values ne ""} {
+        require_manifest_authority $predecessor_values \
+            $::PREDECESSOR_MANIFEST_SHA256
+    }
+    if {[catch {build_retirement_operation $values $manifest_sha \
+        $predecessor_values $operation} operation_spec]} {
+        fail "retirement-policy" 66
+    }
+    return [execute_operation_spec $operation $operation_spec $password]
+}
+
+proc retirement_step {values manifest_sha predecessor_values operation password} {
+    set result [execute_retirement_primitive $values $manifest_sha \
+        $predecessor_values $operation $password]
+    require_primitive_success $result
+    puts "B82_V6_RETIREMENT_STEP operation=$operation rc=0"
+    return $result
+}
+
+proc retirement_predecessor_step {values manifest_sha predecessor_values operation password} {
+    require_manifest_authority $values $manifest_sha
+    set result [execute_primitive $predecessor_values \
+        $::PREDECESSOR_MANIFEST_SHA256 $operation none $password]
+    require_primitive_success $result
+    puts "B82_V6_RETIREMENT_STEP operation=$operation authority=predecessor rc=0"
+    return $result
+}
+
+proc retirement_path_exists {values manifest_sha predecessor_values path_name password} {
+    set operation "retire-ro-exists-${path_name}"
+    set result [execute_retirement_primitive $values $manifest_sha \
+        $predecessor_values $operation $password]
+    if {[lindex $result 0] eq "ok"} {
+        return 1
+    }
+    if {[lindex $result 0] eq "child-failure" && [lindex $result 1] == 1} {
+        return 0
+    }
+    exit [lindex $result 1]
+}
+
+proc retirement_read_entries {values manifest_sha predecessor_values operation password} {
+    set result [retirement_step $values $manifest_sha $predecessor_values \
+        $operation $password]
+    set value [output_value [lindex $result 2]]
+    if {$value eq ""} {
+        return {}
+    }
+    if {[string first "\u0000" $value] >= 0 || [string first "\r" $value] >= 0} {
+        fail "retirement-entry-framing" 78
+    }
+    return [split $value "\n"]
+}
+
+proc retirement_require_entries {actual expected reason} {
+    if {[llength $actual] != [llength $expected] ||
+        [lsort -ascii $actual] ne [lsort -ascii $expected]} {
+        fail $reason 78
+    }
+}
+
+proc retirement_observe_sha {values manifest_sha predecessor_values operation path password} {
+    set result [retirement_step $values $manifest_sha $predecessor_values \
+        $operation $password]
+    set value [output_value [lindex $result 2]]
+    set digest [string range $value 0 63]
+    if {![regexp {^[0-9a-f]{64}$} $digest] ||
+        [string range $value 64 end] ne "  ${path}"} {
+        fail "retirement-sha-output" 78
+    }
+    return $digest
+}
+
+proc retirement_observe_user_file_size {values manifest_sha predecessor_values operation password} {
+    set result [retirement_step $values $manifest_sha $predecessor_values \
+        $operation $password]
+    set value [output_value [lindex $result 2]]
+    if {![regexp {^siyixuan:siyixuan:600:1:([0-9]+):regular file$} \
+        $value -> size] || ![string is integer -strict $size] ||
+        $size < 0 || $size > 16777216} {
+        fail "retirement-intake-file-shape" 78
+    }
+    return $size
+}
+
+proc retirement_require_intake_prefix {values manifest_sha predecessor_values name password} {
+    switch -- $name {
+        package-manifest.v1 {
+            set shape_operation retire-ro-intake-manifest-shape-observe
+            set sha_operation retire-ro-intake-manifest-sha-observe
+        }
+        prepare-stage-root.sh {
+            set shape_operation retire-ro-intake-self-shape-observe
+            set sha_operation retire-ro-intake-self-sha-observe
+        }
+        default { fail "retirement-intake-prefix-name" 78 }
+    }
+    if {[catch {retirement_local_delivery_file $values $manifest_sha $name} \
+        local_authority]} {
+        fail "retirement-intake-local-authority" 66
+    }
+    lassign $local_authority local_path expected_sha
+    if {[catch {file lstat $local_path local_stat}]} {
+        fail "retirement-intake-local-stat" 66
+    }
+    set remote_path "${::RETIREMENT_USER_INTAKE}/${name}"
+    set remote_size [retirement_observe_user_file_size $values $manifest_sha \
+        $predecessor_values $shape_operation $password]
+    set remote_sha [retirement_observe_sha $values $manifest_sha \
+        $predecessor_values $sha_operation $remote_path $password]
+    if {$remote_sha eq $expected_sha} {
+        return exact
+    }
+    if {$remote_size > $local_stat(size) ||
+        [catch {file_prefix_sha256 $local_path $remote_size} prefix_sha] ||
+        $remote_sha ne $prefix_sha} {
+        fail "retirement-intake-nonprefix" 78
+    }
+    if {[catch {retirement_local_delivery_file $values $manifest_sha $name} \
+        rechecked_authority]} {
+        fail "retirement-intake-local-drift" 66
+    }
+    lassign $rechecked_authority rechecked_path rechecked_sha
+    if {[catch {file lstat $rechecked_path rechecked_stat}] ||
+        $rechecked_path ne $local_path || $rechecked_sha ne $expected_sha} {
+        fail "retirement-intake-local-drift" 66
+    }
+    foreach field {dev ino size mode nlink uid gid type} {
+        if {$rechecked_stat($field) ne $local_stat($field)} {
+            fail "retirement-intake-local-drift" 66
+        }
+    }
+    return prefix
+}
+
+proc retirement_verify_manifest_pair {values manifest_sha predecessor_values password} {
+    foreach operation {
+        retire-ro-auth-manifest-pending-sha retire-ro-auth-manifest-sha
+        retire-ro-auth-manifest-stat retire-ro-auth-manifest-pair
+    } {
+        retirement_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+}
+
+proc retirement_verify_self_pair {values manifest_sha predecessor_values password} {
+    foreach operation {
+        retire-ro-auth-self-pending-sha retire-ro-auth-self-sha
+        retire-ro-auth-self-stat retire-ro-auth-self-pair
+    } {
+        retirement_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+}
+
+proc retirement_authority_state {values manifest_sha predecessor_values password} {
+    set names {
+        home-qroot auth-root run-qroot auth-manifest-pending auth-manifest
+        auth-self-pending auth-self quarantine-intake quarantine-package
+        quarantine-bootstrap lock receipt-pending receipt-final
+    }
+    set present [dict create]
+    foreach name $names {
+        dict set present $name [retirement_path_exists $values $manifest_sha \
+            $predecessor_values $name $password]
+    }
+
+    set home [dict get $present home-qroot]
+    set auth [dict get $present auth-root]
+    set run [dict get $present run-qroot]
+    set manifest_pending [dict get $present auth-manifest-pending]
+    set manifest_final [dict get $present auth-manifest]
+    set self_pending [dict get $present auth-self-pending]
+    set self_final [dict get $present auth-self]
+
+    if {$manifest_pending && $manifest_final && $self_pending && $self_final} {
+        if {!$home || !$auth || !$run} {
+            fail "retirement-authority-parent-missing" 78
+        }
+        foreach operation {
+            retire-ro-home-qroot-readlink retire-ro-home-qroot-stat
+            retire-ro-auth-root-readlink retire-ro-auth-root-stat
+            retire-ro-run-qroot-readlink retire-ro-run-qroot-stat
+        } {
+            retirement_step $values $manifest_sha $predecessor_values \
+                $operation $password
+        }
+        retirement_require_entries \
+            [retirement_read_entries $values $manifest_sha $predecessor_values \
+                retire-ro-auth-root-entries $password] \
+            [list "package-manifest.v1.pending\tf" \
+                "package-manifest.v1\tf" "prepare-stage-root.sh.pending\tf" \
+                "prepare-stage-root.sh\tf"] \
+            "retirement-authority-entry-set"
+        retirement_verify_manifest_pair $values $manifest_sha \
+            $predecessor_values $password
+        retirement_verify_self_pair $values $manifest_sha \
+            $predecessor_values $password
+        return complete
+    }
+
+    foreach name {
+        quarantine-intake quarantine-package quarantine-bootstrap lock
+        receipt-pending receipt-final
+    } {
+        if {[dict get $present $name]} {
+            fail "retirement-prefix-without-complete-authority" 78
+        }
+    }
+    if {!$home} {
+        foreach name {
+            auth-root run-qroot auth-manifest-pending auth-manifest
+            auth-self-pending auth-self
+        } {
+            if {[dict get $present $name]} {
+                fail "retirement-prefix-parent-order" 78
+            }
+        }
+        return absent
+    }
+
+    foreach operation {retire-ro-home-qroot-readlink retire-ro-home-qroot-stat} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+    if {!$auth} {
+        foreach name {
+            run-qroot auth-manifest-pending auth-manifest auth-self-pending auth-self
+        } {
+            if {[dict get $present $name]} {
+                fail "retirement-prefix-auth-order" 78
+            }
+        }
+        retirement_require_entries \
+            [retirement_read_entries $values $manifest_sha $predecessor_values \
+                retire-ro-home-qroot-entries $password] {} \
+            "retirement-home-prefix-entries"
+        return home-qroot
+    }
+
+    foreach operation {retire-ro-auth-root-readlink retire-ro-auth-root-stat} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+    retirement_require_entries \
+        [retirement_read_entries $values $manifest_sha $predecessor_values \
+            retire-ro-home-qroot-entries $password] [list "authority\td"] \
+        "retirement-home-prefix-entries"
+    if {!$run} {
+        foreach name {
+            auth-manifest-pending auth-manifest auth-self-pending auth-self
+        } {
+            if {[dict get $present $name]} {
+                fail "retirement-prefix-run-order" 78
+            }
+        }
+        retirement_require_entries \
+            [retirement_read_entries $values $manifest_sha $predecessor_values \
+                retire-ro-auth-root-entries $password] {} \
+            "retirement-auth-prefix-entries"
+        return auth-root
+    }
+
+    foreach operation {retire-ro-run-qroot-readlink retire-ro-run-qroot-stat} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+    retirement_require_entries \
+        [retirement_read_entries $values $manifest_sha $predecessor_values \
+            retire-ro-run-qroot-entries $password] {} \
+        "retirement-run-prefix-entries"
+    if {!$manifest_pending && !$manifest_final && !$self_pending && !$self_final} {
+        retirement_require_entries \
+            [retirement_read_entries $values $manifest_sha $predecessor_values \
+                retire-ro-auth-root-entries $password] {} \
+            "retirement-auth-prefix-entries"
+        return run-qroot
+    }
+    if {$manifest_pending && !$manifest_final && !$self_pending && !$self_final} {
+        retirement_require_entries \
+            [retirement_read_entries $values $manifest_sha $predecessor_values \
+                retire-ro-auth-root-entries $password] \
+            [list "package-manifest.v1.pending\tf"] \
+            "retirement-auth-prefix-entries"
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-ro-auth-manifest-pending-stat $password
+        return manifest-pending
+    }
+    if {$manifest_pending && $manifest_final && !$self_pending && !$self_final} {
+        retirement_require_entries \
+            [retirement_read_entries $values $manifest_sha $predecessor_values \
+                retire-ro-auth-root-entries $password] \
+            [list "package-manifest.v1.pending\tf" "package-manifest.v1\tf"] \
+            "retirement-auth-prefix-entries"
+        retirement_verify_manifest_pair $values $manifest_sha \
+            $predecessor_values $password
+        return manifest-pair
+    }
+    if {$manifest_pending && $manifest_final && $self_pending && !$self_final} {
+        retirement_require_entries \
+            [retirement_read_entries $values $manifest_sha $predecessor_values \
+                retire-ro-auth-root-entries $password] \
+            [list "package-manifest.v1.pending\tf" "package-manifest.v1\tf" \
+                "prepare-stage-root.sh.pending\tf"] \
+            "retirement-auth-prefix-entries"
+        retirement_verify_manifest_pair $values $manifest_sha \
+            $predecessor_values $password
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-ro-auth-self-pending-stat $password
+        return self-pending
+    }
+    fail "retirement-authority-prefix" 78
+}
+
+proc retirement_ensure_delivery {values manifest_sha predecessor_values password} {
+    set intake_exists [retirement_path_exists $values $manifest_sha \
+        $predecessor_values user-intake $password]
+    if {!$intake_exists} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-intake-mkdir $password
+    }
+    foreach operation {retire-ro-intake-readlink retire-ro-intake-stat} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+    set entries [retirement_read_entries $values $manifest_sha \
+        $predecessor_values retire-ro-intake-entries $password]
+    set manifest_entry "package-manifest.v1\tf"
+    set self_entry "prepare-stage-root.sh\tf"
+    if {$entries eq {}} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-scp-manifest $password
+        set entries [list $manifest_entry]
+    } elseif {[llength $entries] == 1 && [lindex $entries 0] eq $manifest_entry} {
+        set prefix_state [retirement_require_intake_prefix $values $manifest_sha \
+            $predecessor_values package-manifest.v1 $password]
+        if {$prefix_state eq "prefix"} {
+            retirement_step $values $manifest_sha $predecessor_values \
+                retire-raw-scp-manifest $password
+        }
+    } elseif {[llength $entries] == 2 &&
+        [lsort -ascii $entries] eq [lsort -ascii [list $manifest_entry $self_entry]]} {
+        if {[retirement_require_intake_prefix $values $manifest_sha \
+            $predecessor_values package-manifest.v1 $password] ne "exact"} {
+            fail "retirement-intake-earlier-prefix" 78
+        }
+        set prefix_state [retirement_require_intake_prefix $values $manifest_sha \
+            $predecessor_values prepare-stage-root.sh $password]
+        if {$prefix_state eq "prefix"} {
+            retirement_step $values $manifest_sha $predecessor_values \
+                retire-raw-scp-self $password
+        }
+    } else {
+        fail "retirement-intake-prefix" 78
+    }
+
+    foreach operation {retire-ro-intake-manifest-stat retire-ro-intake-manifest-sha} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+    set entries [retirement_read_entries $values $manifest_sha \
+        $predecessor_values retire-ro-intake-entries $password]
+    if {[llength $entries] == 1 && [lindex $entries 0] eq $manifest_entry} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-scp-self $password
+    }
+    foreach operation {retire-ro-intake-self-stat retire-ro-intake-self-sha} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+    retirement_require_entries \
+        [retirement_read_entries $values $manifest_sha $predecessor_values \
+            retire-ro-intake-entries $password] \
+        [list $manifest_entry $self_entry] "retirement-intake-final-entries"
+}
+
+proc retirement_converge_delivery_durability {
+    values manifest_sha predecessor_values password
+} {
+    foreach operation {
+        retire-raw-sync-intake-manifest retire-raw-sync-intake-self
+        retire-raw-sync-intake-directory retire-raw-sync-intake-parent
+    } {
+        retirement_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+    transaction_step $values $manifest_sha package-parent-stat none $password
+    foreach operation {
+        retire-ro-intake-readlink retire-ro-intake-stat
+        retire-ro-intake-manifest-stat retire-ro-intake-manifest-sha
+        retire-ro-intake-self-stat retire-ro-intake-self-sha
+    } {
+        retirement_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+    retirement_require_entries \
+        [retirement_read_entries $values $manifest_sha $predecessor_values \
+            retire-ro-intake-entries $password] \
+        [list "package-manifest.v1\tf" "prepare-stage-root.sh\tf"] \
+        "retirement-intake-postsync-entries"
+    puts "B82_V6_RETIREMENT_INTAKE_DURABLE files=2 directories=2 postcheck=exact"
+}
+
+proc execute_retirement_common_gate {values manifest_sha password} {
+    foreach operation [base_identity_operations] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    set stale_operations [retirement_stale_operations]
+    set total [llength $stale_operations]
+    set ordinal 0
+    foreach operation $stale_operations {
+        incr ordinal
+        set result [execute_primitive $values $manifest_sha $operation none $password]
+        set id [string range $operation 6 end]
+        if {[lindex $result 0] ne "ok"} {
+            set rc [lindex $result 1]
+            puts [format "B82_V6_RETIREMENT_STALE_ITEM ordinal=%02d id=%s class=STOP writes=0 rc=%d" $ordinal $id $rc]
+            puts "B82_V6_RETIREMENT_STALE_SUMMARY items=$total checked=$ordinal result=STOP writes=0 rc=$rc"
+            exit $rc
+        }
+        puts [format "B82_V6_RETIREMENT_STALE_ITEM ordinal=%02d id=%s class=ABSENT writes=0 rc=0" $ordinal $id]
+    }
+    puts "B82_V6_RETIREMENT_STALE_SUMMARY items=$total checked=$total absent=$total result=PASS writes=0 rc=0"
+    puts "B82_V6_RETIREMENT_COMMON_GATE identities=5 stale_absent=28 writes=0 result=PASS"
+}
+
+proc execute_retirement_predecessor_gate {values manifest_sha predecessor_values password} {
+    transaction_step $values $manifest_sha package-parent-stat none $password
+    foreach operation {
+        retire-ro-old-package-readlink retire-ro-old-package-stat
+        retire-ro-old-package-entries
+    } {
+        retirement_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+    foreach name [package_names] {
+        retirement_predecessor_step $values $manifest_sha $predecessor_values \
+            "verify-sha-$name" $password
+        retirement_predecessor_step $values $manifest_sha $predecessor_values \
+            "verify-stat-$name" $password
+    }
+    foreach operation {
+        bootstrap-root-readlink bootstrap-root-stat
+        bootstrap-provisioner-readlink bootstrap-provisioner-stat
+        bootstrap-provisioner-sha bootstrap-stager-readlink bootstrap-stager-stat
+        bootstrap-stager-sha
+    } {
+        retirement_predecessor_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+    retirement_step $values $manifest_sha $predecessor_values \
+        retire-ro-old-bootstrap-entries $password
+    set provision_result [retirement_predecessor_step $values $manifest_sha \
+        $predecessor_values provision-check $password]
+    if {[lindex $provision_result 3] ne "none"} {
+        fail "retirement-predecessor-provision-check" 78
+    }
+    puts "B82_V6_RETIREMENT_PREDECESSOR_GATE package_files=17 bootstrap_files=2 provision_missing=none writes=0 result=PASS"
+}
+
+proc retirement_ensure_authority {values manifest_sha predecessor_values state password} {
+    if {$state eq "absent"} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-home-qroot-create $password
+        set state [retirement_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        if {$state ne "home-qroot"} { fail "retirement-home-create-state" 78 }
+    }
+    if {$state eq "home-qroot"} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-sync-home-parent $password
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-auth-root-create $password
+        set state [retirement_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        if {$state ne "auth-root"} { fail "retirement-auth-create-state" 78 }
+    }
+    if {$state eq "auth-root"} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-sync-home-qroot $password
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-run-qroot-create $password
+        set state [retirement_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        if {$state ne "run-qroot"} { fail "retirement-run-create-state" 78 }
+    }
+    if {$state eq "run-qroot" || $state eq "manifest-pending"} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-sync-run-parent $password
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-auth-manifest-install $password
+        foreach operation {
+            retire-ro-auth-manifest-pending-stat
+            retire-ro-auth-manifest-pending-sha
+            retire-raw-sync-auth-manifest-pending retire-raw-sync-auth-root
+        } {
+            retirement_step $values $manifest_sha $predecessor_values \
+                $operation $password
+        }
+        if {[retirement_path_exists $values $manifest_sha $predecessor_values \
+            auth-manifest $password]} {
+            fail "retirement-manifest-final-before-link" 78
+        }
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-link-auth-manifest $password
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-sync-auth-root $password
+        set state [retirement_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        if {$state ne "manifest-pair"} { fail "retirement-manifest-pair-state" 78 }
+    }
+    if {$state eq "manifest-pair" || $state eq "self-pending"} {
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-sync-auth-manifest-pending $password
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-sync-auth-root $password
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-auth-self-install $password
+        foreach operation {
+            retire-ro-auth-self-pending-stat retire-ro-auth-self-pending-sha
+            retire-raw-sync-auth-self-pending retire-raw-sync-auth-root
+        } {
+            retirement_step $values $manifest_sha $predecessor_values \
+                $operation $password
+        }
+        if {[retirement_path_exists $values $manifest_sha $predecessor_values \
+            auth-self $password]} {
+            fail "retirement-self-final-before-link" 78
+        }
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-link-auth-self $password
+        retirement_step $values $manifest_sha $predecessor_values \
+            retire-raw-sync-auth-root $password
+        set state [retirement_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        if {$state ne "complete"} { fail "retirement-authority-complete-state" 78 }
+    }
+    if {$state ne "complete"} {
+        fail "retirement-authority-state" 78
+    }
+    foreach operation {
+        retire-raw-sync-auth-manifest-pending retire-raw-sync-auth-self-pending
+        retire-raw-sync-auth-root
+    } {
+        retirement_step $values $manifest_sha $predecessor_values \
+            $operation $password
+    }
+    if {[retirement_authority_state $values $manifest_sha \
+        $predecessor_values $password] ne "complete"} {
+        fail "retirement-authority-final-recheck" 78
+    }
+}
+
+proc execute_retirement_transaction {values manifest_sha predecessor_values password} {
+    puts "B82_V6_RETIREMENT_TRANSACTION_START retire_id=$::RETIRE_ID operation=retire-prestage-2c690050 sequence=fixed caller_argv=forbidden"
+    set state [retirement_authority_state $values $manifest_sha \
+        $predecessor_values $password]
+    if {$state ne "complete"} {
+        execute_retirement_common_gate $values $manifest_sha $password
+        execute_retirement_predecessor_gate $values $manifest_sha \
+            $predecessor_values $password
+        retirement_ensure_delivery $values $manifest_sha \
+            $predecessor_values $password
+        retirement_converge_delivery_durability $values $manifest_sha \
+            $predecessor_values $password
+    }
+    retirement_ensure_authority $values $manifest_sha $predecessor_values \
+        $state $password
+    execute_retirement_common_gate $values $manifest_sha $password
+    retirement_step $values $manifest_sha $predecessor_values \
+        retire-raw-helper-mutate $password
+    retirement_step $values $manifest_sha $predecessor_values \
+        retire-ro-helper-verify $password
+    puts "B82_V6_RETIREMENT_TRANSACTION_COMPLETE retire_id=$::RETIRE_ID state=T automatic_cleanup=0 retention=quarantine"
+}
+
+proc execute_retirement_verify_transaction {values manifest_sha predecessor_values password} {
+    set state [retirement_authority_state $values $manifest_sha \
+        $predecessor_values $password]
+    if {$state ne "complete"} {
+        fail "retirement-verify-authority-state" 78
+    }
+    retirement_step $values $manifest_sha $predecessor_values \
+        retire-ro-helper-verify $password
+    puts "B82_V6_RETIREMENT_VERIFY_COMPLETE retire_id=$::RETIRE_ID state=T mutations=0"
 }
 
 proc execute_stale_transaction_gate {values manifest_sha password} {
@@ -1799,6 +2883,16 @@ proc transport_main {arguments} {
         fail "local-package-owner" 66
     }
     if {$action eq "plan"} {
+        if {[retirement_mutation_operation $operation] ||
+            [retirement_read_only_operation $operation]} {
+            set helper_mode [expr {[retirement_mutation_operation $operation] ?
+                "retire-prestage-2c690050" : "verify-retirement"}]
+            puts "B82_V6_TRANSPORT_PLAN operation=$operation transport=high-level-fixed credential_read=0 network_operations=0 raw_leaves=unreachable"
+            puts "EXPECT_PROGRAM [info nameofexecutable] SCRIPT $::TRANSPORT_SCRIPT_PATH"
+            puts "RETIREMENT_AUTH_SELF_ARGV [list {*}[retirement_helper_remote_argv \
+                $values $manifest_sha $helper_mode]]"
+            exit 0
+        }
         if {[catch {build_operation $values $manifest_sha $operation $approved_sha} operation_spec]} {
             fail "policy" 66
         }
@@ -1839,14 +2933,27 @@ proc transport_main {arguments} {
         exit 0
     }
     set prebuilt_operation_spec {}
+    set predecessor_values {}
     if {[transaction_operation $operation]} {
         require_transaction_local_authority $values $manifest_sha $operation $approved_sha
+        if {[retirement_mutation_operation $operation]} {
+            set predecessor_values [require_retirement_predecessor_authority]
+        }
+    } elseif {[retirement_read_only_operation $operation]} {
+        require_transaction_local_authority $values $manifest_sha $operation $approved_sha
+        set predecessor_values [require_retirement_predecessor_authority]
     } elseif {[catch {build_operation $values $manifest_sha $operation \
         $approved_sha} prebuilt_operation_spec]} {
         fail "policy" 66
     }
     set password [read_execute_credential $credential_path]
-    if {[transaction_operation $operation]} {
+    if {[retirement_mutation_operation $operation]} {
+        execute_retirement_transaction $values $manifest_sha \
+            $predecessor_values $password
+    } elseif {[retirement_read_only_operation $operation]} {
+        execute_retirement_verify_transaction $values $manifest_sha \
+            $predecessor_values $password
+    } elseif {[transaction_operation $operation]} {
         execute_transaction $values $manifest_sha $operation $approved_sha $password
     } else {
         require_manifest_authority $values $manifest_sha

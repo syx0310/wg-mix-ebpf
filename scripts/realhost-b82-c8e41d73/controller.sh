@@ -7,6 +7,10 @@ readonly RUN_ID='c8e41d73'
 readonly PACKAGE_ID='4f2a9b61'
 readonly CREDENTIAL_PATH='/Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82'
 readonly EXPECTED_OUTPUT_PREFIX="/private/tmp/wg-mix-b82-v6-${RUN_ID}-${PACKAGE_ID}-"
+readonly PREDECESSOR_COMMIT='2c690050ae1d69dbd074acfd612faa2b80e29f8a'
+readonly PREDECESSOR_PACKAGE='/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-2c690050ae1d'
+readonly PREDECESSOR_MANIFEST="${PREDECESSOR_PACKAGE}/package-manifest.v1"
+readonly PREDECESSOR_MANIFEST_SHA256='21f14e1f7e646649fdad864dce23dce2055585962d92bfaba6e71158372c1ebe'
 
 MODE=''
 MANIFEST=''
@@ -127,7 +131,7 @@ fail() {
 
 usage() {
   printf '%s\n' \
-    "usage: $0 {verify-package|plan|preflight|prepare|provision-apply|fresh-plan|fresh-run|fresh-restore|veth-plan|veth-run|veth-restore|routed-plan|routed-run|routed-restore|realnic-plan|realnic-run|realnic-restore}" \
+    "usage: $0 {verify-package|plan|preflight|prepare|provision-apply|fresh-plan|fresh-run|fresh-restore|veth-plan|veth-run|veth-restore|routed-plan|routed-run|routed-restore|realnic-plan|realnic-run|realnic-restore|retire-prestage-2c690050|verify-retirement}" \
     '  --manifest ABSOLUTE_PACKAGE_MANIFEST --manifest-sha256 64-lowercase-hex' \
     "  --credential-path ${CREDENTIAL_PATH}" \
     '  --approved-plan-sha256 {none|64-lowercase-hex}' >&2
@@ -207,7 +211,8 @@ parse_arguments() {
     verify-package | plan | preflight | prepare | provision-apply | \
       fresh-plan | fresh-run | fresh-restore | \
       veth-plan | veth-run | veth-restore | routed-plan | routed-run | routed-restore | \
-      realnic-plan | realnic-run | realnic-restore) ;;
+      realnic-plan | realnic-run | realnic-restore | \
+      retire-prestage-2c690050 | verify-retirement) ;;
     *) usage; return 64 ;;
   esac
   while (($# > 0)); do
@@ -579,6 +584,102 @@ verify_manifest_contract() {
   verify_bound_history || return $?
 }
 
+verify_predecessor_manifest_contract() {
+  local canonical_package canonical_manifest caller_uid package_shape manifest_shape
+  local package_uid package_gid package_mode package_type
+  [[ -f "${PREDECESSOR_MANIFEST}" && ! -L "${PREDECESSOR_MANIFEST}" ]] || return 66
+  [[ "$(sha256_file "${PREDECESSOR_MANIFEST}")" == "${PREDECESSOR_MANIFEST_SHA256}" ]] ||
+    return 67
+  canonical_package="$(CDPATH='' cd -- "${PREDECESSOR_PACKAGE}" && pwd -P)" || return 66
+  canonical_manifest="${canonical_package}/package-manifest.v1"
+  [[ "${canonical_package}" == "${PREDECESSOR_PACKAGE}" &&
+    "${canonical_manifest}" == "${PREDECESSOR_MANIFEST}" ]] || return 66
+  caller_uid="$(/usr/bin/id -u)" || return 66
+  if [[ "$(/usr/bin/uname -s)" == 'Darwin' ]]; then
+    package_shape="$(/usr/bin/stat -f '%u:%g:%Lp:%HT' -- "${PREDECESSOR_PACKAGE}")" || return 66
+    manifest_shape="$(/usr/bin/stat -f '%u:%g:%Lp:%l:%HT' -- "${PREDECESSOR_MANIFEST}")" || return 66
+    IFS=: read -r package_uid package_gid package_mode package_type <<<"${package_shape}"
+    [[ "${package_uid}" == "${caller_uid}" && "${package_mode}" == '700' &&
+      "${package_type}" == 'Directory' &&
+      "${manifest_shape}" == "${package_uid}:${package_gid}:600:1:Regular File" ]] || return 66
+  else
+    package_shape="$(/usr/bin/stat -Lc '%u:%g:%a:%F' -- "${PREDECESSOR_PACKAGE}")" || return 66
+    manifest_shape="$(/usr/bin/stat -Lc '%u:%g:%a:%h:%F' -- "${PREDECESSOR_MANIFEST}")" || return 66
+    IFS=: read -r package_uid package_gid package_mode package_type <<<"${package_shape}"
+    [[ "${package_uid}" == "${caller_uid}" && "${package_mode}" == '700' &&
+      "${package_type}" == 'directory' &&
+      "${manifest_shape}" == "${package_uid}:${package_gid}:600:1:regular file" ]] || return 66
+  fi
+
+  /usr/bin/python3 -B -I -c '
+import hashlib
+import os
+import re
+import stat
+import sys
+
+path, expected_sha, expected_commit, expected_package = sys.argv[1:]
+flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+descriptor = os.open(path, flags)
+try:
+    metadata = os.fstat(descriptor)
+    payload = b""
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 65536, offset)
+        if not chunk:
+            break
+        payload += chunk
+        offset += len(chunk)
+    named = os.stat(path, follow_symlinks=False)
+    if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or
+            (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino) or
+            hashlib.sha256(payload).hexdigest() != expected_sha or
+            not payload.endswith(b"\n") or b"\0" in payload or b"\r" in payload):
+        raise SystemExit(67)
+finally:
+    os.close(descriptor)
+values = {}
+for line in payload[:-1].decode("utf-8", "strict").split("\n"):
+    fields = line.split("\t")
+    if len(fields) != 2 or not fields[0] or not fields[1] or fields[0] in values:
+        raise SystemExit(65)
+    values[fields[0]] = fields[1]
+expected = {
+    "format": "wg-mix-ebpf-b82-v6-package-v4",
+    "run_id": "c8e41d73",
+    "package_id": "4f2a9b61",
+    "integration_ref": "refs/heads/codex/tcx-faketcp-final-v2",
+    "integration_commit": expected_commit,
+    "bundle_name": "source-4f2a9b61.bundle",
+    "local_package_dir": expected_package,
+    "remote_package_dir": "/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61",
+    "remote_source": "/run/wg-mix-ebpf-source-stages/c8e41d73/source",
+    "target_user": "siyixuan",
+    "target_host": "192.168.10.82",
+    "target_hostname": "ubuntu-2604-test",
+    "target_kernel": "7.0.0-28-generic",
+    "target_machine_id": "9db3fb717cc74974b2a6b243d67f67b9",
+    "prepare_stage_root_sh_path": "scripts/realhost-b82-c8e41d73/prepare-stage-root.sh",
+    "provision_ubuntu_test_host_sh_path": "scripts/provision-ubuntu-test-host.sh",
+}
+if any(values.get(key) != value for key, value in expected.items()):
+    raise SystemExit(65)
+for key in ("bundle_sha256", "prepare_stage_root_sh_sha256",
+            "provision_ubuntu_test_host_sh_sha256"):
+    if not re.fullmatch(r"[0-9a-f]{64}", values.get(key, "")):
+        raise SystemExit(65)
+' "${PREDECESSOR_MANIFEST}" "${PREDECESSOR_MANIFEST_SHA256}" \
+    "${PREDECESSOR_COMMIT}" "${PREDECESSOR_PACKAGE}"
+}
+
+verify_retirement_local_authority() {
+  verify_predecessor_manifest_contract || return $?
+  printf 'B82_V6_RETIREMENT_LOCAL_AUTHORITY current_manifest_sha256=%s current_commit=%s predecessor_commit=%s predecessor_manifest_sha256=%s credential_read=0 network_operations=0\n' \
+    "${MANIFEST_SHA256}" "${INTEGRATION_COMMIT}" "${PREDECESSOR_COMMIT}" \
+    "${PREDECESSOR_MANIFEST_SHA256}"
+}
+
 verify_local_approved_plan() {
   local canonical shape size package_shape caller_uid package_uid package_gid package_mode package_type
   [[ "${APPROVED_PLAN}" == "${LOCAL_PACKAGE_DIR}/realnic-plan.${APPROVED_PLAN_SHA256}.json" ]] || return 65
@@ -857,6 +958,11 @@ main() {
   verify_manifest_contract || fail 'manifest-contract' $?
   derive_approved_plan_path || fail 'approved-plan-binding' $?
   case "${MODE}" in
+    retire-prestage-2c690050 | verify-retirement)
+      verify_retirement_local_authority || fail 'retirement-local-authority' $?
+      ;;
+  esac
+  case "${MODE}" in
     veth-plan | veth-run | veth-restore)
       [[ "${WG_STATE}" == absent ]] || fail 'veth-wireguard-state' 65
       ;;
@@ -907,6 +1013,13 @@ main() {
       ;;
     realnic-restore)
       execute_realnic_restore || fail 'realnic-restore-operation' $?
+      ;;
+    retire-prestage-2c690050)
+      run_operation execute retire-prestage-2c690050 ||
+        fail 'retire-prestage-2c690050-operation' $?
+      ;;
+    verify-retirement)
+      run_operation execute verify-retirement || fail 'verify-retirement-operation' $?
       ;;
   esac
 }
