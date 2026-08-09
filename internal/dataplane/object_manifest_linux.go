@@ -116,6 +116,20 @@ func validateBaselineCollectionSpec(spec *ebpf.CollectionSpec) error {
 	return nil
 }
 
+// validateBaselineLoaderCollectionSpec is the common pre-kernel boundary for
+// both verifier-only baseline loads and production Apply. Keeping the exact
+// manifest check behind one helper makes it harder for a merge to preserve the
+// validator while silently dropping one loader caller.
+func validateBaselineLoaderCollectionSpec(
+	spec *ebpf.CollectionSpec,
+	source string,
+) error {
+	if err := validateBaselineCollectionSpec(spec); err != nil {
+		return fmt.Errorf("validate BPF object %s: %w", source, err)
+	}
+	return nil
+}
+
 func validateManifestMapSpec(descriptor pinnedMapDescriptor, spec *ebpf.MapSpec) error {
 	if err := validatePinnedMapSpec(descriptor, spec); err != nil {
 		return err
