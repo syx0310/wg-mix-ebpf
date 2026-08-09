@@ -384,7 +384,8 @@ static __always_inline int faketcp_session_mutate(
 			   (__s32)(argument - session->rx_sequence) > 0) {
 			session->rx_sequence = argument;
 		}
-		session->last_seen_nanos = now;
+		if (now > session->last_seen_nanos)
+			session->last_seen_nanos = now;
 		session->revision++;
 	}
 	bpf_spin_unlock(&session->lock);

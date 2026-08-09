@@ -575,6 +575,7 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 		"expected->session_id != 0",
 		"expected->runtime_incarnation",
 		"session->revision != ~0ULL",
+		"if (now > session->last_seen_nanos)",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("established compare-claim source contract missing %q", want)
