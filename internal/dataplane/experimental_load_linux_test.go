@@ -516,16 +516,19 @@ func TestExperimentalKernelDependencyProbeRequiresExactModuleAndKfuncBTF(t *test
 	err = probeExperimentalFakeTCPKernelDependencyWith(
 		func(string) (*btf.Spec, error) { return emptySpec, nil },
 	)
-	if err == nil || !strings.Contains(err.Error(), experimentalFakeTCPKfuncName) {
+	if err == nil || !strings.Contains(err.Error(), experimentalFakeTCPPrepareKfuncName) {
 		t.Fatalf("missing kfunc BTF error=%v", err)
 	}
 
 	intType := &btf.Int{Name: "int", Size: 4, Encoding: btf.Signed}
-	function := &btf.Func{
-		Name: experimentalFakeTCPKfuncName,
-		Type: &btf.FuncProto{Return: intType},
+	types := make([]btf.Type, 0, len(experimentalFakeTCPKfuncNames))
+	for _, name := range experimentalFakeTCPKfuncNames {
+		types = append(types, &btf.Func{
+			Name: name,
+			Type: &btf.FuncProto{Return: intType},
+		})
 	}
-	builder, err := btf.NewBuilder([]btf.Type{function}, nil)
+	builder, err := btf.NewBuilder(types, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
