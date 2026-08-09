@@ -86,11 +86,59 @@ class StaticSafetyTests(unittest.TestCase):
         reservation = body.index("validate_legacy_retirement_reservation()")
         mode = body.index('if mode == "plan":')
         plan_read = body.index("read_approved_plan(")
-        lease = body.index("with InterfaceLease(")
+        execute = body.index("execute_validated_plan(")
         self.assertLess(lock, reservation)
         self.assertLess(reservation, mode)
         self.assertLess(reservation, plan_read)
-        self.assertLess(reservation, lease)
+        self.assertLess(reservation, execute)
+
+        controller_start = self.source.index("def controller_approved_mode(")
+        controller_end = self.source.index("\ndef validate_plan_shape(", controller_start)
+        controller = self.source[controller_start:controller_end]
+        self.assertLess(
+            controller.index("with PhysicalInterfaceLock(physical_interface_lock_path()):"),
+            controller.index("validate_legacy_retirement_reservation()"),
+        )
+        self.assertLess(
+            controller.index("validate_legacy_retirement_reservation()"),
+            controller.index("read_controller_approved_plan("),
+        )
+
+    def test_controller_cli_has_no_dynamic_compatibility_arguments(self):
+        start = self.source.index("def parser()")
+        end = self.source.index("\ndef reject_ambiguous_cli", start)
+        body = self.source[start:end]
+        self.assertIn('child.add_argument("--source-commit", required=True)', body)
+        self.assertIn('child.add_argument("--approved-plan", required=True)', body)
+        self.assertIn('child.add_argument("--approved-plan-sha256", required=True)', body)
+        for retired in (
+            "--run-id",
+            "--run-root",
+            "--interface",
+            "--expected-ifindex",
+            "--expected-mac",
+            "--expected-driver",
+            "--expected-mtu",
+            "--expected-boot-id",
+            "--peer-address",
+            "--profile",
+            "--mtu-low",
+        ):
+            self.assertNotIn(retired, body)
+
+    def test_one_root_plan_authority_and_one_validated_execution_core(self):
+        self.assertIn(
+            'APPROVED_PLAN_PATH = "/run/wg-mix-ebpf-source-bootstrap-c8e41d73/'
+            'realnic-approved-plan.json"',
+            self.source,
+        )
+        self.assertEqual(self.source.count("with InterfaceLease("), 1)
+        start = self.source.index("def read_controller_approved_plan(")
+        end = self.source.index("\ndef controller_plan_mode(", start)
+        body = self.source[start:end]
+        self.assertIn("if path_value != APPROVED_PLAN_PATH:", body)
+        self.assertIn("require_root_owned=True", body)
+        self.assertIn("controller_spec_from_plan(plan, source_commit)", body)
 
 
 if __name__ == "__main__":

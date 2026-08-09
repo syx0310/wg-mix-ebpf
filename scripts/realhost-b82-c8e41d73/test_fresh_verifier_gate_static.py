@@ -27,7 +27,15 @@ helper = helper_path.read_text(encoding="utf-8")
 
 required = (
     "case \"${MODE}\" in plan | run | restore)",
-    "wg-mix-ebpf-b82-v6-package-v2",
+    "wg-mix-ebpf-b82-v6-package-v3",
+    "read_manifest_field physical_nic_forward_authority discard",
+    "read_manifest_field physical_interface_lock discard",
+    "read_manifest_field legacy_matrix_mode discard",
+    "read_manifest_field realnic_profile discard",
+    "read_manifest_field realnic_traffic_seconds discard",
+    "read_manifest_field realnic_acceptance_py_path discard",
+    "read_manifest_field test_realnic_acceptance_py_path discard",
+    "read_manifest_field test_realnic_acceptance_static_py_path discard",
     "readonly STAGE_ROOT=\"${STAGING_PREFIX}/${GATE_ID}\"",
     "readonly SNAPSHOT_MANIFEST=\"${INTAKE_ROOT}/package-manifest.v1\"",
     "readonly SNAPSHOT_BUNDLE=\"${INTAKE_ROOT}/source-${PACKAGE_ID}.bundle\"",

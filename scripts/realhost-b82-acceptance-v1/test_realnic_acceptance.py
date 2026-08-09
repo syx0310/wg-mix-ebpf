@@ -1076,6 +1076,145 @@ class PhysicalAuthorityTests(unittest.TestCase):
                     MODULE.PhysicalInterfaceLock(str(physical))
 
 
+class ControllerPlanTests(unittest.TestCase):
+    source_commit = "1234567890abcdef1234567890abcdef12345678"
+
+    @staticmethod
+    def acceptance_fixture(**changes):
+        return fixture_spec(
+            profile="acceptance",
+            traffic_seconds=30,
+            soak_seconds=3600,
+            soak_window_seconds=300,
+            **changes,
+        )
+
+    def test_read_only_snapshot_derives_the_complete_fixed_controller_spec(self):
+        fixture = self.acceptance_fixture()
+        runner = FixtureRunner(fixture)
+        spec, snapshot, commands = MODULE.collect_controller_plan_snapshot(
+            self.source_commit,
+            runner,
+        )
+        identity = snapshot["interface_identity"]
+        self.assertEqual(spec.source_commit, self.source_commit)
+        self.assertEqual(spec.interface, MODULE.PHYSICAL_INTERFACE)
+        self.assertEqual(spec.expected_ifindex, fixture.expected_ifindex)
+        self.assertEqual(spec.expected_mac, fixture.expected_mac)
+        self.assertEqual(spec.expected_driver, fixture.expected_driver)
+        self.assertEqual(spec.expected_device_dev, fixture.expected_device_dev)
+        self.assertEqual(spec.expected_mtu, fixture.expected_mtu)
+        self.assertEqual(spec.mtu_low, fixture.expected_mtu - 8)
+        self.assertEqual(spec.profile, MODULE.CONTROLLER_PROFILE)
+        self.assertEqual(spec.traffic_seconds, MODULE.CONTROLLER_TRAFFIC_SECONDS)
+        self.assertEqual(spec.soak_seconds, MODULE.CONTROLLER_SOAK_SECONDS)
+        self.assertEqual(spec.soak_window_seconds, MODULE.CONTROLLER_SOAK_WINDOW_SECONDS)
+        self.assertEqual(
+            spec.run_id,
+            MODULE.controller_run_id(self.source_commit, fixture.expected_boot_id, identity),
+        )
+        self.assertEqual(spec.run_root, f"{MODULE.RUN_ROOT_PREFIX}{spec.run_id}")
+        self.assertEqual(
+            [call[0] for call in runner.calls],
+            [argv for _, argv in MODULE.snapshot_command_table(None)],
+        )
+        self.assertEqual([entry["argv"] for entry in commands], [call[0] for call in runner.calls])
+
+    def test_controller_plan_is_canonical_and_rejects_wrong_static_host(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = f"{temporary}/run-"
+            create_runtime_authorities(prefix)
+            with runtime_contract(prefix):
+                fixture = self.acceptance_fixture(run_root=f"{prefix}a1b2c3d4")
+                runner = FixtureRunner(fixture)
+                stdout = io.BytesIO()
+                wrapper = io.TextIOWrapper(stdout, encoding="utf-8")
+                with contextlib.redirect_stdout(wrapper):
+                    self.assertEqual(MODULE.controller_plan_mode(self.source_commit, runner), 0)
+                    wrapper.flush()
+                payload = stdout.getvalue()
+                plan = json.loads(payload)
+                self.assertEqual(payload, MODULE.canonical_json(plan))
+                self.assertEqual(plan["spec"]["source_commit"], self.source_commit)
+                self.assertEqual(plan["spec"]["profile"], "acceptance")
+
+                bad = FixtureRunner(fixture)
+                bad.outputs[(MODULE.TOOLS["hostname"],)] = b"not-the-reviewed-host\n"
+                with self.assertRaisesRegex(MODULE.HarnessError, "fixed target"):
+                    MODULE.collect_controller_plan_snapshot(self.source_commit, bad)
+
+    def test_controller_root_plan_reader_reconstructs_spec_and_rejects_other_authority(self):
+        fixture = self.acceptance_fixture()
+        runner = FixtureRunner(fixture)
+        spec, snapshot, commands = MODULE.collect_controller_plan_snapshot(
+            self.source_commit,
+            runner,
+        )
+        payload = MODULE.canonical_json(MODULE.build_plan(spec, snapshot, commands))
+        digest = MODULE.sha256_bytes(payload)
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary, "realnic-approved-plan.json")
+            path.write_bytes(payload)
+            path.chmod(0o600)
+            actual = os.stat(path)
+            root_metadata = types.SimpleNamespace(
+                st_mode=actual.st_mode,
+                st_nlink=actual.st_nlink,
+                st_size=actual.st_size,
+                st_uid=0,
+                st_gid=0,
+                st_dev=actual.st_dev,
+                st_ino=actual.st_ino,
+            )
+            with (
+                mock.patch.object(MODULE, "APPROVED_PLAN_PATH", str(path)),
+                mock.patch.object(MODULE.os, "fstat", return_value=root_metadata),
+            ):
+                loaded_spec, loaded_plan, loaded_payload = MODULE.read_controller_approved_plan(
+                    str(path),
+                    digest,
+                    self.source_commit,
+                )
+                self.assertEqual(loaded_spec, spec)
+                self.assertEqual(loaded_plan["spec"], spec.as_dict())
+                self.assertEqual(loaded_payload, payload)
+                with self.assertRaisesRegex(MODULE.HarnessError, "fixed controller contract"):
+                    MODULE.read_controller_approved_plan(
+                        str(path),
+                        digest,
+                        "abcdef0123456789abcdef0123456789abcdef01",
+                    )
+                with self.assertRaisesRegex(MODULE.HarnessError, "fixed root-owned"):
+                    MODULE.read_controller_approved_plan(
+                        str(path) + ".other",
+                        digest,
+                        self.source_commit,
+                    )
+
+    def test_public_parser_accepts_only_source_and_approval_artifact(self):
+        parser = MODULE.parser()
+        plan = parser.parse_args(["plan", "--source-commit", self.source_commit])
+        self.assertEqual(vars(plan), {"mode": "plan", "source_commit": self.source_commit})
+        run = parser.parse_args(
+            [
+                "run",
+                "--source-commit",
+                self.source_commit,
+                "--approved-plan",
+                MODULE.APPROVED_PLAN_PATH,
+                "--approved-plan-sha256",
+                "abcdef0123456789" * 4,
+            ]
+        )
+        self.assertEqual(run.approved_plan, MODULE.APPROVED_PLAN_PATH)
+        for retired in ("--run-id", "--expected-ifindex", "--expected-mtu", "--mtu-low"):
+            with self.subTest(retired=retired), contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    parser.parse_args(
+                        ["plan", "--source-commit", self.source_commit, retired, "1"]
+                    )
+
+
 class PlannerTests(unittest.TestCase):
     def test_plan_rejects_incomplete_or_non_failure_counter_schemas(self):
         spec = fixture_spec()
