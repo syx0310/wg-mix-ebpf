@@ -86,7 +86,7 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		"parse_rc = faketcp_parse_l3(data, data_end, frame_len, l3_off, family, &l3)",
 		"parser_mode == PARSER_L3",
 		"parser_mode != PARSER_ETHERNET",
-		"faketcp_managed_transform_status(&faketcp_l3, IPPROTO_UDP)",
+		"rc = faketcp_managed_transform_status(l3, IPPROTO_UDP)",
 		"faketcp_managed_transform_status(&l3, l3.transport_protocol)",
 		"sizeof(struct iphdr) + sizeof(struct udphdr)",
 		"l3.l4_off + sizeof(udp)",
@@ -121,15 +121,15 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 	}
 	egress := tc[egressStart:egressEnd]
 	tcParse := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
-	tcGate := strings.Index(egress, "faketcp_managed_transform_status(&faketcp_l3, IPPROTO_UDP)")
+	prepare := strings.Index(egress, "if (faketcp_prepare_udp(")
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
-	if tcParse < 0 || tcGate < 0 || checkpoint < 0 ||
-		!(tcParse < tcGate && tcGate < checkpoint) {
+	if tcParse < 0 || prepare < 0 || checkpoint < 0 ||
+		!(tcParse < prepare && prepare < checkpoint) {
 		t.Fatal("fixed-header transform gate must precede the admission checkpoint")
 	}
 	checkpointBody := sourceSection(t, main,
 		"static __always_inline int faketcp_egress_admission_checkpoint(",
-		"static __always_inline __s64 faketcp_rotation_checksum")
+		"struct faketcp_gso_loop_context {")
 	if !strings.Contains(checkpointBody, "faketcp_capture_first_packet(skb, info, l3") {
 		t.Fatal("first-packet capture escaped the L3-gated admission checkpoint")
 	}

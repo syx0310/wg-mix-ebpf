@@ -21,6 +21,7 @@ type fakeTCPAdmissionModelInput struct {
 	xorPolicyOK        bool
 	sessionEstablished bool
 	gso                bool
+	gsoContractOK      bool
 }
 
 type fakeTCPAdmissionModelResult struct {
@@ -33,13 +34,15 @@ const (
 	fakeTCPAdmissionModelXOR
 	fakeTCPAdmissionModelHeader
 	fakeTCPAdmissionModelWire
+	fakeTCPAdmissionModelGSO
 )
 
 func fakeTCPAdmissionCheckpointModel(input fakeTCPAdmissionModelInput) fakeTCPAdmissionModelResult {
 	required := input.managed && input.policyGeneration && input.parserOK &&
 		input.directionOK && input.keyGenerationOK && input.lengthOK &&
 		input.flagsOK && input.typeWord && input.headerRewrite &&
-		input.wireFakeTCP && input.sessionEstablished && !input.gso
+		input.wireFakeTCP && input.sessionEstablished &&
+		(!input.gso || input.gsoContractOK)
 	if !required || (input.xor && !input.xorPolicyOK) {
 		return fakeTCPAdmissionModelResult{}
 	}
@@ -47,6 +50,9 @@ func fakeTCPAdmissionCheckpointModel(input fakeTCPAdmissionModelInput) fakeTCPAd
 		fakeTCPAdmissionModelHeader | fakeTCPAdmissionModelWire
 	if input.xor {
 		features |= fakeTCPAdmissionModelXOR
+	}
+	if input.gso {
+		features |= fakeTCPAdmissionModelGSO
 	}
 	return fakeTCPAdmissionModelResult{transform: true, features: features}
 }
@@ -57,6 +63,7 @@ func validFakeTCPAdmissionModelInput() fakeTCPAdmissionModelInput {
 		directionOK: true, keyGenerationOK: true, lengthOK: true,
 		flagsOK: true, typeWord: true, headerRewrite: true,
 		wireFakeTCP: true, xorPolicyOK: true, sessionEstablished: true,
+		gsoContractOK: true,
 	}
 }
 
@@ -77,7 +84,7 @@ func TestFakeTCPAdmissionCheckpointModelRejectsBeforeMutation(t *testing.T) {
 		{"header rewrite", func(v *fakeTCPAdmissionModelInput) { v.headerRewrite = false }},
 		{"wire FakeTCP", func(v *fakeTCPAdmissionModelInput) { v.wireFakeTCP = false }},
 		{"session", func(v *fakeTCPAdmissionModelInput) { v.sessionEstablished = false }},
-		{"GSO/GRO", func(v *fakeTCPAdmissionModelInput) { v.gso = true }},
+		{"unsupported GSO/GRO", func(v *fakeTCPAdmissionModelInput) { v.gso = true; v.gsoContractOK = false }},
 		{"XOR policy", func(v *fakeTCPAdmissionModelInput) { v.xor = true; v.xorPolicyOK = false }},
 	}
 	for _, test := range reject {
@@ -101,19 +108,23 @@ func TestFakeTCPAdmissionCheckpointModelFeatureProperty(t *testing.T) {
 			flagsOK: mask&(1<<6) != 0, typeWord: mask&(1<<7) != 0,
 			headerRewrite: mask&(1<<8) != 0, wireFakeTCP: mask&(1<<9) != 0,
 			xor: mask&(1<<10) != 0, sessionEstablished: mask&(1<<11) != 0,
-			gso:         mask&(1<<12) != 0,
-			xorPolicyOK: true,
+			gso:           mask&(1<<12) != 0,
+			xorPolicyOK:   true,
+			gsoContractOK: true,
 		}
 		got := fakeTCPAdmissionCheckpointModel(input)
 		want := input.managed && input.policyGeneration && input.parserOK &&
 			input.directionOK && input.keyGenerationOK && input.lengthOK &&
 			input.flagsOK && input.typeWord && input.headerRewrite &&
-			input.wireFakeTCP && input.sessionEstablished && !input.gso
+			input.wireFakeTCP && input.sessionEstablished
 		if got.transform != want || (!want && got.features != 0) {
 			t.Fatalf("mask=%013b result=%+v want transform=%v", mask, got, want)
 		}
 		if got.transform && got.features&fakeTCPAdmissionModelXOR != 0 != input.xor {
 			t.Fatalf("mask=%013b feature projection=%04b xor=%v", mask, got.features, input.xor)
+		}
+		if got.transform && got.features&fakeTCPAdmissionModelGSO != 0 != input.gso {
+			t.Fatalf("mask=%013b feature projection=%05b gso=%v", mask, got.features, input.gso)
 		}
 	}
 }

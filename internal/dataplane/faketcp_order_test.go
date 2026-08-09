@@ -278,10 +278,13 @@ func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T
 	nonGSOPrepare := strings.Index(egress, "if (faketcp_prepare_udp(")
 	nonGSOCheckpoint := strings.Index(egress, "if (faketcp_egress_admission_checkpoint(")
 	nonGSOConsume := strings.Index(egress, "if (faketcp_consume_egress_admission(")
-	nonGSOType := strings.Index(egress, "rc = update_type_word(skb, &info, old_wire, new_wire, 1)")
-	if l3Gate < 0 || gsoDispatch < 0 || nonGSOPrepare < 0 || nonGSOCheckpoint < 0 || nonGSOConsume < 0 || nonGSOType < 0 ||
+	firstNonGSOType := strings.Index(egress, "rc = update_type_word(skb, &info, old_wire, new_wire, 1)")
+	directNonGSOType := strings.LastIndex(egress, "rc = update_type_word(skb, &info, old_wire, new_wire, 1)")
+	if l3Gate < 0 || gsoDispatch < 0 || nonGSOPrepare < 0 || nonGSOCheckpoint < 0 || nonGSOConsume < 0 ||
+		firstNonGSOType < 0 || directNonGSOType < 0 ||
 		!(l3Gate < gsoDispatch && gsoDispatch < nonGSOPrepare && nonGSOPrepare < nonGSOCheckpoint &&
-			nonGSOCheckpoint < nonGSOConsume && nonGSOConsume < nonGSOType) {
+			nonGSOCheckpoint < firstNonGSOType && firstNonGSOType < nonGSOConsume &&
+			nonGSOConsume < directNonGSOType) {
 		t.Fatal("shared L3 gate and unified prepare must precede one non-GSO proof/consume and mutation")
 	}
 	gso := text[gsoStart:checksumCommentStart]

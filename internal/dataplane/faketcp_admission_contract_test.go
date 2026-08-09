@@ -24,27 +24,25 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 		t.Fatal("TC egress does not state explicit unmanaged-pass and managed-reject-drop policy")
 	}
 	if got := strings.Count(egress, "faketcp_egress_admission_checkpoint("); got != 1 {
-		t.Fatalf("TC egress checkpoint calls=%d, want exactly one", got)
+		t.Fatalf("TC non-GSO checkpoint calls=%d, want exactly one", got)
 	}
 	l3Gate := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
-	fixedGate := strings.Index(egress, "faketcp_managed_transform_status(&faketcp_l3, IPPROTO_UDP)")
-	mtuGate := strings.Index(egress, "faketcp_mtu_allows_growth(skb, faketcp_l3.l3_len)")
+	prepare := strings.Index(egress, "if (faketcp_prepare_udp(")
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
-	checksumState := strings.Index(egress, "faketcp_inspect_and_reset_udp_checksum(")
 	typeWord := strings.Index(egress, "update_type_word(skb, &info, old_wire, new_wire, 1)")
 	xorDispatch := strings.Index(egress, "bpf_tail_call(skb, &xor_egress_programs")
 	directEncode := strings.Index(egress, "return faketcp_encode_established(")
-	if l3Gate < 0 || fixedGate < 0 || mtuGate < 0 || checkpoint < 0 || checksumState < 0 || typeWord < 0 || xorDispatch < 0 || directEncode < 0 ||
-		!(l3Gate < fixedGate && fixedGate < mtuGate && mtuGate < checkpoint && checkpoint < checksumState && checksumState < typeWord && typeWord < xorDispatch && typeWord < directEncode) {
-		t.Fatal("TC fixed-IPv4 and MTU gates must precede the proof which dominates every transform")
+	if l3Gate < 0 || prepare < 0 || checkpoint < 0 || typeWord < 0 || xorDispatch < 0 || directEncode < 0 ||
+		!(l3Gate < prepare && prepare < checkpoint && checkpoint < typeWord && typeWord < xorDispatch && typeWord < directEncode) {
+		t.Fatal("TC fixed-IPv4 and unified prepare gates must precede the proof which dominates every non-GSO transform")
 	}
 
 	checkpointBody := sourceSection(t, fake,
 		"static __always_inline int faketcp_egress_admission_checkpoint(",
-		"static __always_inline __s64 faketcp_rotation_checksum")
+		"struct faketcp_gso_loop_context {")
 	for _, mutation := range []string{
 		"bpf_skb_store_bytes(", "bpf_skb_change_tail(", "bpf_l3_csum_replace(",
-		"bpf_l4_csum_replace(", "wg_mix_faketcp_skb_normalize_udp_csum(",
+		"bpf_l4_csum_replace(", "wg_mix_faketcp_skb_prepare_udp(",
 	} {
 		if strings.Contains(checkpointBody, mutation) {
 			t.Fatalf("egress checkpoint mutates packet/checksum state through %q", mutation)
@@ -140,8 +138,12 @@ func TestFakeTCPAdmissionProofBindsFullIdentityAndCapabilityStaysClosed(t *testi
 		"runtime_incarnation[16]",
 		"standard_wire",
 		"mixed_wire",
-		"xor_type_word_copy(current_wire, cipher) != admission->mixed_wire",
+		"xor_type_word_copy(current_wire, cipher)",
+		"admission->mixed_wire",
 		"current_wire != admission->standard_wire",
+		"struct faketcp_gso_projection",
+		"segment_contract",
+		"logical_segments",
 		"wire_total_len",
 		"network_off",
 		"transport_off",
@@ -187,7 +189,7 @@ func TestFakeTCPAdmissionProofBindsFullIdentityAndCapabilityStaysClosed(t *testi
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(manifest), `{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 152, maxEntries: 1, flags: unix.BPF_F_RDONLY}`) {
+	if !strings.Contains(string(manifest), `{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 176, maxEntries: 1, flags: unix.BPF_F_RDONLY}`) {
 		t.Fatal("fresh admission map manifest does not lock PinNone-compatible type, size and syscall-side read-only flag")
 	}
 
@@ -216,7 +218,7 @@ func TestFakeTCPAdmissionStatisticsAreMutuallyExclusive(t *testing.T) {
 	allSource := text + string(tcSource)
 	checkpoint := sourceSection(t, text,
 		"static __always_inline int faketcp_egress_admission_checkpoint(",
-		"static __always_inline __s64 faketcp_rotation_checksum")
+		"struct faketcp_gso_loop_context {")
 	xdpCheckpoint := sourceSection(t, text,
 		"static __always_inline int faketcp_xdp_admission_checkpoint(",
 		"SEC(\"xdp\")")
@@ -224,8 +226,8 @@ func TestFakeTCPAdmissionStatisticsAreMutuallyExclusive(t *testing.T) {
 		strings.Contains(xdpCheckpoint, "FAKETCP_STAT_ADMISSION_ACCEPT") {
 		t.Fatal("early egress/XDP checkpoints must not count final admission acceptance")
 	}
-	if got := strings.Count(allSource, "inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT)"); got != 2 {
-		t.Fatalf("shared egress-writer and TC-ingress accept sites=%d, want 2", got)
+	if got := strings.Count(allSource, "inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT)"); got != 3 {
+		t.Fatalf("direct/GSO egress writers and TC-ingress accept sites=%d, want 3", got)
 	}
 	encoder := sourceSection(t, text,
 		"static __always_inline int faketcp_encode_established(",
@@ -235,7 +237,16 @@ func TestFakeTCPAdmissionStatisticsAreMutuallyExclusive(t *testing.T) {
 	if mutate < 0 || accept < 0 || mutate >= accept {
 		t.Fatal("egress acceptance must be counted once after the shared final writer admits the lifetime")
 	}
-	gso := sourceSection(t, checkpoint, "if (skb->gso_segs || skb->gso_size)", "if (info->payload_len")
+	gsoEncoder := sourceSection(t, text,
+		"faketcp_encode_gso_segments(struct __sk_buff *skb",
+		"static __always_inline __s64 faketcp_rotation_checksum")
+	gsoMutate := strings.Index(gsoEncoder, "faketcp_session_mutate(session, generation, now,")
+	gsoAccept := strings.Index(gsoEncoder, "inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT)")
+	if gsoMutate < 0 || gsoAccept < 0 || gsoMutate >= gsoAccept ||
+		strings.Count(gsoEncoder, "inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT)") != 1 {
+		t.Fatal("GSO acceptance must be counted once after its stable-lifetime writer")
+	}
+	gso := sourceSection(t, checkpoint, "if (is_gso) {", "} else if")
 	if strings.Contains(gso, "FAKETCP_STAT_BAD_PACKET") ||
 		strings.Count(gso, "inc_faketcp_stat(") != 1 {
 		t.Fatal("egress GSO rejection must have exactly one FakeTCP counter classification")
