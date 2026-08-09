@@ -1043,6 +1043,7 @@ def iperf_session_contract(expected_seconds: int) -> dict[str, Any]:
         "expected_seconds": expected_seconds,
         "maximum_duration_deviation_seconds": 0.5,
         "minimum_delivery_ratio": 0.99,
+        "minimum_stream_bytes": 1_048_576,
     }
 
 
@@ -1070,8 +1071,6 @@ def attach_iperf_oracle(
             direction,
             "--streams",
             str(streams),
-            "--minimum-bytes",
-            "1048576",
             "--minimum-fairness",
             "0.90",
             "--maximum-retransmit-rate",
@@ -1082,6 +1081,8 @@ def attach_iperf_oracle(
             str(session["maximum_duration_deviation_seconds"]),
             "--minimum-delivery-ratio",
             str(session["minimum_delivery_ratio"]),
+            "--minimum-stream-bytes",
+            str(session["minimum_stream_bytes"]),
         ],
         30,
         target=step["stdout"],
@@ -1134,6 +1135,8 @@ def soak_oracle_step(
             str(session["maximum_duration_deviation_seconds"]),
             "--minimum-delivery-ratio",
             str(session["minimum_delivery_ratio"]),
+            "--minimum-stream-bytes",
+            str(session["minimum_stream_bytes"]),
         ],
         60,
         target="first-hour-soak-window-set",
@@ -2999,6 +3002,7 @@ def iperf_oracle_metrics(
     expected_seconds = session["expected_seconds"]
     maximum_deviation = session["maximum_duration_deviation_seconds"]
     minimum_delivery_ratio = session["minimum_delivery_ratio"]
+    minimum_stream_bytes = session["minimum_stream_bytes"]
     for group in groups:
         numeric = [
             group.get("sent_duration_seconds") if isinstance(group, dict) else None,
@@ -3009,8 +3013,13 @@ def iperf_oracle_metrics(
         if (
             not isinstance(group, dict)
             or group.get("direction") not in wanted_directions
+            or not isinstance(group.get("sent_bytes"), int)
+            or group["sent_bytes"] <= 0
             or not isinstance(group.get("received_bytes"), int)
             or group["received_bytes"] <= 0
+            or group["received_bytes"] > group["sent_bytes"]
+            or not isinstance(group.get("minimum_stream_sent_bytes"), int)
+            or not isinstance(group.get("minimum_stream_received_bytes"), int)
             or not isinstance(group.get("throughput_mbps"), (int, float))
             or group["throughput_mbps"] <= 0
             or not isinstance(group.get("retransmits"), int)
@@ -3027,7 +3036,11 @@ def iperf_oracle_metrics(
             abs(group["sent_duration_seconds"] - expected_seconds) > maximum_deviation
             or abs(group["received_duration_seconds"] - expected_seconds) > maximum_deviation
             or group["delivery_ratio"] < minimum_delivery_ratio
+            or group["delivery_ratio"] > 1
             or group["minimum_stream_delivery_ratio"] < minimum_delivery_ratio
+            or group["minimum_stream_delivery_ratio"] > 1
+            or group["minimum_stream_sent_bytes"] < minimum_stream_bytes
+            or group["minimum_stream_received_bytes"] < minimum_stream_bytes
         ):
             raise HarnessError("strict iperf oracle metrics violate the reviewed session contract")
         observed.add(group["direction"])

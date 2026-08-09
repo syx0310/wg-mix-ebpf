@@ -254,7 +254,9 @@ def main() -> None:
     checker_module = load_checker(checker_path)
     fixture = iperf_fixture()
     checker_module.expected_direction(fixture, "forward", 4, 10)
-    groups = checker_module.measured_groups(fixture, "forward", 4, 10, 0.5, 0.99)
+    groups = checker_module.measured_groups(
+        fixture, "forward", 4, 10, 0.5, 0.99, 1_048_576
+    )
     if (
         len(groups) != 1
         or groups[0]["sent_bytes"] != 57_920_000
@@ -263,7 +265,9 @@ def main() -> None:
         fail("iperf positive fixture was not measured exactly")
     fixture["end"]["streams"][0]["sender"]["retransmits"] = 1000  # type: ignore[index]
     fixture["end"]["sum_sent"]["retransmits"] = 1000  # type: ignore[index]
-    groups = checker_module.measured_groups(fixture, "forward", 4, 10, 0.5, 0.99)
+    groups = checker_module.measured_groups(
+        fixture, "forward", 4, 10, 0.5, 0.99, 1_048_576
+    )
     if groups[0]["retransmit_rate"] <= 0.0001:
         fail("iperf retransmit fixture did not exceed the acceptance threshold")
 
@@ -326,6 +330,8 @@ def main() -> None:
                 "throughput_mbps": 1.0,
                 "retransmits": 5,
                 "minimum_stream_delivery_ratio": 0.1,
+                "minimum_stream_sent_bytes": 14_480,
+                "minimum_stream_received_bytes": 1_448,
             }
         ]
     )

@@ -917,7 +917,7 @@ check_iperf() {
   local step="$1" direction="$2" streams="$3" expected_seconds="$4"
   run_step "${step}.check" "${STEP_LOG}" /usr/bin/python3 -I \
     "${SOURCE}/scripts/realhost-b82-${RUN_ID}/check-realhost-iperf.py" one "${STEP_LOG}" \
-    --direction "${direction}" --streams "${streams}" --minimum-bytes 1048576 \
+    --direction "${direction}" --streams "${streams}" --minimum-stream-bytes 1048576 \
     --minimum-fairness 0.90 --maximum-retransmit-rate 0.0001 \
     --expected-seconds "${expected_seconds}" --maximum-duration-deviation 0.5 \
     --minimum-delivery-ratio 0.99

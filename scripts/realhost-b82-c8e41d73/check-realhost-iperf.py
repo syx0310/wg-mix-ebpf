@@ -198,7 +198,7 @@ def expected_direction(
         raise CheckError("iperf configured duration differs from the reviewed argv")
 
 
-def reviewed_session(args: argparse.Namespace) -> tuple[float, float, float]:
+def reviewed_session(args: argparse.Namespace) -> tuple[float, float, float, int]:
     expected_seconds = number(args.expected_seconds, "expected seconds")
     maximum_deviation = number(
         args.maximum_duration_deviation, "maximum duration deviation"
@@ -206,9 +206,14 @@ def reviewed_session(args: argparse.Namespace) -> tuple[float, float, float]:
     minimum_delivery_ratio = number(
         args.minimum_delivery_ratio, "minimum delivery ratio"
     )
-    if expected_seconds <= 0 or not 0 < minimum_delivery_ratio <= 1:
+    minimum_stream_bytes = integer(args.minimum_stream_bytes, "minimum stream bytes")
+    if (
+        expected_seconds <= 0
+        or not 0 < minimum_delivery_ratio <= 1
+        or minimum_stream_bytes <= 0
+    ):
         raise CheckError("iperf session thresholds are outside the reviewed range")
-    return expected_seconds, maximum_deviation, minimum_delivery_ratio
+    return expected_seconds, maximum_deviation, minimum_delivery_ratio, minimum_stream_bytes
 
 
 def measured_groups(
@@ -218,6 +223,7 @@ def measured_groups(
     expected_seconds: float,
     maximum_duration_deviation: float,
     minimum_delivery_ratio: float,
+    minimum_stream_bytes: int,
 ) -> list[dict[str, float | int]]:
     end = doc.get("end")
     if not isinstance(end, dict) or not isinstance(end.get("streams"), list):
@@ -264,8 +270,10 @@ def measured_groups(
             integer(item["sender"].get("bytes"), f"{label} sender bytes")
             for item in group
         ]
-        if any(value == 0 for value in sent):
-            raise CheckError(f"iperf {label} has an empty sender stream")
+        if any(value < minimum_stream_bytes for value in (*sent, *received)):
+            raise CheckError(f"iperf {label} stream bytes are below minimum")
+        if any(received_value > sent_value for sent_value, received_value in zip(sent, received)):
+            raise CheckError(f"iperf {label} received bytes exceed sent bytes")
         stream_delivery_ratios = [
             received_value / sent_value
             for sent_value, received_value in zip(sent, received)
@@ -311,6 +319,8 @@ def measured_groups(
                 "received_duration_seconds": received_seconds,
                 "delivery_ratio": delivery_ratio,
                 "minimum_stream_delivery_ratio": min(stream_delivery_ratios),
+                "minimum_stream_sent_bytes": min(sent),
+                "minimum_stream_received_bytes": min(received),
             }
         )
     return result
@@ -318,7 +328,9 @@ def measured_groups(
 
 def check_one(args: argparse.Namespace) -> list[dict[str, float | int]]:
     doc = document(args.path)
-    expected_seconds, maximum_deviation, minimum_delivery_ratio = reviewed_session(args)
+    expected_seconds, maximum_deviation, minimum_delivery_ratio, minimum_stream_bytes = (
+        reviewed_session(args)
+    )
     expected_direction(doc, args.direction, args.streams, expected_seconds)
     groups = measured_groups(
         doc,
@@ -327,10 +339,9 @@ def check_one(args: argparse.Namespace) -> list[dict[str, float | int]]:
         expected_seconds,
         maximum_deviation,
         minimum_delivery_ratio,
+        minimum_stream_bytes,
     )
     for group in groups:
-        if int(group["received_bytes"]) < args.minimum_bytes:
-            raise CheckError(f"received bytes below minimum: {group}")
         if float(group["fairness"]) < args.minimum_fairness:
             raise CheckError(f"Jain fairness below minimum: {group}")
         if float(group["retransmit_rate"]) > args.maximum_retransmit_rate:
@@ -356,6 +367,12 @@ def soak_group_totals(
         "minimum_stream_delivery_ratio": min(
             float(group["minimum_stream_delivery_ratio"]) for group in groups
         ),
+        "minimum_stream_sent_bytes": min(
+            int(group["minimum_stream_sent_bytes"]) for group in groups
+        ),
+        "minimum_stream_received_bytes": min(
+            int(group["minimum_stream_received_bytes"]) for group in groups
+        ),
     }
 
 
@@ -375,7 +392,9 @@ def first_hour_throughput_baseline(
 
 
 def check_soak(args: argparse.Namespace) -> dict[str, Any]:
-    expected_seconds, maximum_deviation, minimum_delivery_ratio = reviewed_session(args)
+    expected_seconds, maximum_deviation, minimum_delivery_ratio, minimum_stream_bytes = (
+        reviewed_session(args)
+    )
     if args.expected_windows != 12:
         raise CheckError(
             f"reviewed first-hour soak requires 12 windows, got {args.expected_windows}"
@@ -398,6 +417,7 @@ def check_soak(args: argparse.Namespace) -> dict[str, Any]:
             expected_seconds,
             maximum_deviation,
             minimum_delivery_ratio,
+            minimum_stream_bytes,
         )
         totals = soak_group_totals(groups)
         if float(totals["retransmit_rate"]) > args.maximum_window_retransmit_rate:
@@ -436,12 +456,12 @@ def parser() -> argparse.ArgumentParser:
     one.add_argument("path", type=Path)
     one.add_argument("--direction", choices=("forward", "reverse", "bidir"), required=True)
     one.add_argument("--streams", type=int, choices=(1, 4, 16), required=True)
-    one.add_argument("--minimum-bytes", type=int, default=1_048_576)
     one.add_argument("--minimum-fairness", type=float, default=0.90)
     one.add_argument("--maximum-retransmit-rate", type=float, default=0.0001)
     one.add_argument("--expected-seconds", type=float, required=True)
     one.add_argument("--maximum-duration-deviation", type=float, required=True)
     one.add_argument("--minimum-delivery-ratio", type=float, required=True)
+    one.add_argument("--minimum-stream-bytes", type=int, required=True)
 
     soak = subparsers.add_parser("soak")
     soak.add_argument("paths", nargs="+", type=Path)
@@ -454,6 +474,7 @@ def parser() -> argparse.ArgumentParser:
     soak.add_argument("--expected-seconds", type=float, required=True)
     soak.add_argument("--maximum-duration-deviation", type=float, required=True)
     soak.add_argument("--minimum-delivery-ratio", type=float, required=True)
+    soak.add_argument("--minimum-stream-bytes", type=int, required=True)
 
     stats_parser = subparsers.add_parser("stats")
     stats_parser.add_argument("before", type=Path)

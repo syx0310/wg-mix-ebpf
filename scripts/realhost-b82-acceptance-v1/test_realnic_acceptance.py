@@ -219,7 +219,6 @@ class SimulatedRunner(FixtureRunner):
                         path=pathlib.Path(argv[4]),
                         direction=options["--direction"],
                         streams=int(options["--streams"]),
-                        minimum_bytes=int(options["--minimum-bytes"]),
                         minimum_fairness=float(options["--minimum-fairness"]),
                         maximum_retransmit_rate=float(options["--maximum-retransmit-rate"]),
                         expected_seconds=float(options["--expected-seconds"]),
@@ -227,6 +226,7 @@ class SimulatedRunner(FixtureRunner):
                             options["--maximum-duration-deviation"]
                         ),
                         minimum_delivery_ratio=float(options["--minimum-delivery-ratio"]),
+                        minimum_stream_bytes=int(options["--minimum-stream-bytes"]),
                     )
                     output = CHECKER_MODULE.check_one(args)
                 else:
@@ -249,6 +249,7 @@ class SimulatedRunner(FixtureRunner):
                             options["--maximum-duration-deviation"]
                         ),
                         minimum_delivery_ratio=float(options["--minimum-delivery-ratio"]),
+                        minimum_stream_bytes=int(options["--minimum-stream-bytes"]),
                     )
                     output = CHECKER_MODULE.check_soak(args)
             except CHECKER_MODULE.CheckError as exc:
@@ -627,7 +628,7 @@ class StrictIperfOracleTests(unittest.TestCase):
             no_receive = json.loads(json.dumps(valid))
             no_receive["end"]["streams"][0]["receiver"]["bytes"] = 0
             no_receive["end"]["sum_received"]["bytes"] -= 10_000_000
-            cases["receiver"] = (no_receive, "delivery ratio")
+            cases["receiver"] = (no_receive, "stream bytes are below minimum")
 
             bad_summary = json.loads(json.dumps(valid))
             bad_summary["end"]["sum_received"]["bytes"] += 1
@@ -648,6 +649,11 @@ class StrictIperfOracleTests(unittest.TestCase):
             incomplete_delivery["end"]["sum_received_bidir_reverse"]["bytes"] = 8_000_000
             cases["delivery"] = (incomplete_delivery, "delivery ratio")
 
+            inflated_receive = json.loads(json.dumps(valid))
+            inflated_receive["end"]["streams"][0]["receiver"]["bytes"] += 1
+            inflated_receive["end"]["sum_received"]["bytes"] += 1
+            cases["inflated-receive"] = (inflated_receive, "received bytes exceed sent bytes")
+
             for name, (document, reason) in cases.items():
                 with self.subTest(name=name):
                     pathlib.Path(step["stdout"]).write_bytes(MODULE.canonical_json(document))
@@ -666,6 +672,28 @@ class StrictIperfOracleTests(unittest.TestCase):
             )
             self.assertEqual({group["direction"] for group in groups}, {"forward", "reverse"})
             self.assertTrue(all(group["streams"] == 4 for group in groups))
+
+    def test_one_tiny_stream_cannot_hide_inside_a_sixteen_stream_group(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = f"{temporary}/run-"
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix):
+                spec = fixture_spec(run_root=f"{prefix}a1b2c3d4")
+                pathlib.Path(spec.run_root, "logs").mkdir(parents=True)
+                step = next(
+                    item
+                    for item in MODULE.iperf_steps(spec, "strict")
+                    if item["streams"] == 16 and item["direction"] == "forward"
+                )
+            runner = SimulatedRunner(spec)
+            document = json.loads(runner.iperf_output(step["argv"]))
+            document["end"]["streams"][0]["sender"]["bytes"] = 1
+            document["end"]["streams"][0]["receiver"]["bytes"] = 1
+            document["end"]["sum_sent"]["bytes"] -= 9_999_999
+            document["end"]["sum_received"]["bytes"] -= 9_999_999
+            pathlib.Path(step["stdout"]).write_bytes(MODULE.canonical_json(document))
+            rc, _, stderr = MODULE.CommandRunner().capture(step["oracle"]["argv"], timeout=30)
+            self.assertEqual(rc, 1)
+            self.assertIn("stream bytes are below minimum", stderr.decode())
 
     def test_formal_30_and_300_second_sessions_reject_one_second_json(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1079,6 +1107,10 @@ class PlannerTests(unittest.TestCase):
                 step["oracle"]["session_contract"] == MODULE.iperf_session_contract(30)
                 for step in ordinary["traffic"]
             )
+        )
+        self.assertEqual(
+            ordinary["traffic"][0]["oracle"]["session_contract"]["minimum_stream_bytes"],
+            1_048_576,
         )
         self.assertIsNotNone(soak["soak_oracle"])
         self.assertIn("--minimum-throughput-ratio", soak["soak_oracle"]["argv"])
