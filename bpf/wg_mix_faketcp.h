@@ -68,8 +68,8 @@ extern int wg_mix_faketcp_skb_commit_udp_gso(struct __sk_buff *skb,
 #define FAKETCP_PREPARE_REJECT_WRITABLE               -6
 #define FAKETCP_PREPARE_REJECT_TRUNCATED              -7
 #define FAKETCP_PREPARE_REJECT_MTU_INVALID_INPUT      -8
-#define FAKETCP_PREPARE_REJECT_MTU_ARITHMETIC         -9
-#define FAKETCP_PREPARE_REJECT_MTU_FRAGMENTATION     -10
+#define FAKETCP_PREPARE_REJECT_MTU_ARITHMETIC_OVERFLOW -9
+#define FAKETCP_PREPARE_REJECT_MTU_FRAGMENTATION_REJECTED -10
 #define FAKETCP_PREPARE_REJECT_MTU_DEVICE_UNKNOWN    -11
 #define FAKETCP_PREPARE_REJECT_MTU_DEVICE_EXCEEDED   -12
 #define FAKETCP_PREPARE_REJECT_MTU_ROUTE_UNKNOWN     -13
@@ -442,10 +442,10 @@ faketcp_prepare_udp(struct __sk_buff *skb, __u32 network_offset,
 	case FAKETCP_PREPARE_REJECT_MTU_INVALID_INPUT:
 		return faketcp_mtu_reject(FAKETCP_MTU_INVALID_INPUT,
 					   FAKETCP_MTU_BOUNDARY_INPUT);
-	case FAKETCP_PREPARE_REJECT_MTU_ARITHMETIC:
+	case FAKETCP_PREPARE_REJECT_MTU_ARITHMETIC_OVERFLOW:
 		return faketcp_mtu_reject(FAKETCP_MTU_ARITHMETIC_OVERFLOW,
 					   FAKETCP_MTU_BOUNDARY_INPUT);
-	case FAKETCP_PREPARE_REJECT_MTU_FRAGMENTATION:
+	case FAKETCP_PREPARE_REJECT_MTU_FRAGMENTATION_REJECTED:
 		return faketcp_mtu_reject(FAKETCP_MTU_FRAGMENTATION_REJECTED,
 					   FAKETCP_MTU_BOUNDARY_INPUT);
 	case FAKETCP_PREPARE_REJECT_MTU_DEVICE_UNKNOWN:
@@ -936,16 +936,16 @@ static long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 	return 0;
 }
 
-// The only supported aggregate is a fixed-IHL IPv4 SKB_GSO_UDP_L4 packet.
-// The module kfunc validates the hidden skb metadata and prepares one writable
-// header allocation. Every logical UDP payload is then independently checked,
-// retagged and XORed before the single UDP-GSO -> TCPv4-GSO commit. No other
-// GSO type has a fallback path.
+// The only supported aggregate is the exact observable fixed-IHL IPv4
+// SKB_GSO_UDP_L4 shape. Non-fraglist aggregates are source-neutral because skb
+// metadata cannot reliably distinguish transmit GSO from a compatible GRO
+// image. The module prepares exclusive writable storage; every logical UDP
+// payload is then independently checked, retagged and XORed before the single
+// UDP-GSO -> TCPv4-GSO commit. No other GSO type has a fallback path.
 static __always_inline int
 faketcp_encode_gso_segments(struct __sk_buff *skb,
 			    const struct packet_info *info,
 			    const struct egress_rule_value *rule,
-			    const struct profile_value *profile,
 			    __u64 generation)
 {
 	struct faketcp_gso_loop_context context = {
@@ -956,6 +956,12 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 	};
 	struct faketcp_session_key key = {};
 	struct faketcp_session_value *session;
+	struct faketcp_l3_info l3;
+	struct profile_key profile_key = {
+		.generation = generation,
+		.profile_id = rule->profile_id,
+	};
+	struct profile_value *profile;
 	__u32 expected_segments;
 	__u32 xor_chunks;
 	__u32 xor_segment_bytes;
@@ -964,7 +970,8 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 	int result;
 
 	if (rule->transport_mode != TRANSPORT_FAKETCP ||
-	    info->family != FAMILY_IPV4 || info->payload_len <= skb->gso_size ||
+	    faketcp_parse_tc_l3(skb, info, &l3) != FAKETCP_L3_OK ||
+	    info->payload_len <= skb->gso_size ||
 	    info->payload_len > FAKETCP_GSO_MAX_PAYLOAD ||
 	    skb->gso_size < 32 ||
 	    info->payload_off > skb->len ||
@@ -980,7 +987,7 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 		return TC_ACT_SHOT;
 	}
 	context.gso_segments = expected_segments;
-	if (faketcp_tc_key(skb, info, generation, &key) < 0) {
+	if (faketcp_tc_key(skb, info, &l3, generation, &key) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
 		return TC_ACT_SHOT;
 	}
@@ -989,6 +996,11 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 	    session->state != FAKETCP_STATE_ESTABLISHED) {
 		inc_faketcp_stat(session ? FAKETCP_STAT_BAD_STATE :
 					    FAKETCP_STAT_SESSION_MISS);
+		return TC_ACT_SHOT;
+	}
+	profile = bpf_map_lookup_elem(&profile_map, &profile_key);
+	if (!profile || profile->generation != generation) {
+		inc_stat(STAT_EGRESS_RULE_MISS);
 		return TC_ACT_SHOT;
 	}
 

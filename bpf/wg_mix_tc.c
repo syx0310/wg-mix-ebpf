@@ -1832,6 +1832,24 @@ int wg_mix_egress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	if (rule->action != ACTION_REWRITE)
 		return TC_ACT_OK;
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	if (rule->transport_mode == TRANSPORT_FAKETCP && gso_seen)
+		return faketcp_encode_gso_segments(skb, &info, rule, generation);
+#endif
+	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0) {
+		inc_stat(STAT_SKB_LOAD_ERROR);
+		return TC_ACT_SHOT;
+	}
+	old_type = wg_le32_to_cpu(old_wire);
+	kind = kind_from_standard(old_type);
+	if (kind < 0) {
+		inc_stat(STAT_EGRESS_BAD_TYPE);
+		return TC_ACT_SHOT;
+	}
+	if (!validate_len(kind, info.payload_len)) {
+		inc_stat(STAT_EGRESS_BAD_LENGTH);
+		return TC_ACT_SHOT;
+	}
 	profile_key.generation = generation;
 	profile_key.profile_id = rule->profile_id;
 	profile = bpf_map_lookup_elem(&profile_map, &profile_key);
@@ -1849,25 +1867,6 @@ int wg_mix_egress(struct __sk_buff *skb)
 			inc_stat(STAT_XOR_KEY_MISSING);
 			return TC_ACT_SHOT;
 		}
-	}
-#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
-	if (rule->transport_mode == TRANSPORT_FAKETCP && gso_seen)
-		return faketcp_encode_gso_segments(skb, &info, rule, profile,
-						    generation);
-#endif
-	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0) {
-		inc_stat(STAT_SKB_LOAD_ERROR);
-		return TC_ACT_SHOT;
-	}
-	old_type = wg_le32_to_cpu(old_wire);
-	kind = kind_from_standard(old_type);
-	if (kind < 0) {
-		inc_stat(STAT_EGRESS_BAD_TYPE);
-		return TC_ACT_SHOT;
-	}
-	if (!validate_len(kind, info.payload_len)) {
-		inc_stat(STAT_EGRESS_BAD_LENGTH);
-		return TC_ACT_SHOT;
 	}
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
 	// Validate the unmodified WireGuard packet and all referenced policy

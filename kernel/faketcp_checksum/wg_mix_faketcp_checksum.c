@@ -47,7 +47,7 @@ enum wg_mix_faketcp_prepare_result {
 	WG_MIX_FAKETCP_PREPARE_REJECT_TRUNCATED = -7,
 	WG_MIX_FAKETCP_PREPARE_REJECT_MTU_INVALID_INPUT = -8,
 	WG_MIX_FAKETCP_PREPARE_REJECT_MTU_ARITHMETIC_OVERFLOW = -9,
-	WG_MIX_FAKETCP_PREPARE_REJECT_MTU_FRAGMENTATION = -10,
+	WG_MIX_FAKETCP_PREPARE_REJECT_MTU_FRAGMENTATION_REJECTED = -10,
 	WG_MIX_FAKETCP_PREPARE_REJECT_MTU_DEVICE_UNKNOWN = -11,
 	WG_MIX_FAKETCP_PREPARE_REJECT_MTU_DEVICE_EXCEEDED = -12,
 	WG_MIX_FAKETCP_PREPARE_REJECT_MTU_ROUTE_UNKNOWN = -13,
@@ -95,7 +95,7 @@ static int wg_mix_faketcp_validate_udp_packet(
 	    ntohs(udp->len) != udp_length)
 		return WG_MIX_FAKETCP_PREPARE_REJECT_PACKET;
 	if (ip->frag_off & htons(IP_MF | IP_OFFSET))
-		return WG_MIX_FAKETCP_PREPARE_REJECT_MTU_FRAGMENTATION;
+		return WG_MIX_FAKETCP_PREPARE_REJECT_MTU_FRAGMENTATION_REJECTED;
 	if (ntohs(ip->tot_len) > WG_MIX_FAKETCP_MAX_INPUT_TOTAL_LEN)
 		return WG_MIX_FAKETCP_PREPARE_REJECT_MTU_ARITHMETIC_OVERFLOW;
 
@@ -178,7 +178,10 @@ static int wg_mix_faketcp_admit_pmtu(struct sk_buff *skb,
  * converter: only one non-encapsulated IPv4 SKB_GSO_UDP_L4 aggregate is
  * accepted.  SKB_GSO_DODGY is the sole modifier because packet sockets and
  * other untrusted producers use it to request complete header validation.
- * GRO fraglists, UFO, tunnels, partial GSO and every other type fail here.
+ * Fraglist GRO, UFO, tunnels, partial GSO and every other type fail here.
+ * A non-fraglist UDP_L4 aggregate is source-neutral: transmit GSO and a
+ * compatible aggregate produced elsewhere are intentionally governed by the
+ * same exact observable metadata contract.
  */
 static int wg_mix_faketcp_validate_udp_gso(
 	struct sk_buff *skb, u32 transport_offset,
@@ -315,6 +318,8 @@ wg_mix_faketcp_skb_prepare_udp(struct __sk_buff *ctx,
 	admission = wg_mix_faketcp_admit_pmtu(skb, planned_l3_length);
 	if (admission < 0)
 		return admission;
+	if (skb_shared(skb))
+		return WG_MIX_FAKETCP_PREPARE_REJECT_WRITABLE;
 	if (skb_linearize_cow(skb) < 0)
 		return WG_MIX_FAKETCP_PREPARE_REJECT_WRITABLE;
 	if (skb_cow_head(skb, WG_MIX_FAKETCP_HEADER_DELTA) < 0 ||
@@ -379,7 +384,8 @@ wg_mix_faketcp_skb_commit_udp_gso(struct __sk_buff *ctx,
 					       false);
 	if (ret != WG_MIX_FAKETCP_PREPARE_ACCEPT_GSO)
 		return ret;
-	if (skb_is_nonlinear(skb) ||
+	if (skb_shared(skb) || skb_cloned(skb) || skb_header_cloned(skb) ||
+	    skb_is_nonlinear(skb) ||
 	    skb_headroom(skb) < WG_MIX_FAKETCP_HEADER_DELTA)
 		return WG_MIX_FAKETCP_PREPARE_REJECT_WRITABLE;
 

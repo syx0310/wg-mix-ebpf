@@ -151,7 +151,10 @@ func transformFakeTCPGSOSegments(
 		binary.BigEndian.PutUint32(tcp[4:8], sequence+uint32(processed))
 		binary.BigEndian.PutUint32(tcp[8:12], acknowledgement)
 		tcp[12] = 5 << 4
-		tcp[13] = 0x18
+		tcp[13] = 0x10
+		if processed+length == len(aggregate) {
+			tcp[13] |= 0x08
+		}
 		binary.BigEndian.PutUint16(tcp[14:16], 4096)
 		binary.BigEndian.PutUint16(tcp[16:18], testTransportChecksum(6, tcp, rotated))
 		segments = append(segments, fakeTCPGSOWireSegment{
@@ -347,6 +350,13 @@ func TestFakeTCPGSOPerSegmentTypeXORRotationSequenceAndChecksum(t *testing.T) {
 		if segment.sequence != wantSequence || binary.BigEndian.Uint32(segment.tcp[4:8]) != wantSequence {
 			t.Fatalf("segment %d sequence=%#x header=%#x want=%#x", index, segment.sequence, binary.BigEndian.Uint32(segment.tcp[4:8]), wantSequence)
 		}
+		wantFlags := byte(0x10)
+		if index == len(segments)-1 {
+			wantFlags = 0x18
+		}
+		if segment.tcp[13] != wantFlags {
+			t.Fatalf("segment %d flags=%#x, want %#x", index, segment.tcp[13], wantFlags)
+		}
 		tcp := append([]byte(nil), segment.tcp...)
 		gotChecksum := binary.BigEndian.Uint16(tcp[16:18])
 		tcp[16], tcp[17] = 0, 0
@@ -370,6 +380,35 @@ func TestFakeTCPGSOPerSegmentTypeXORRotationSequenceAndChecksum(t *testing.T) {
 	}
 }
 
+func TestFakeTCPGSODirectCommitRejectsNonExclusiveStorage(t *testing.T) {
+	commitWritable := func(shared, cloned, headerCloned, nonlinear bool, headroom int) bool {
+		return !shared && !cloned && !headerCloned && !nonlinear && headroom >= 12
+	}
+	if !commitWritable(false, false, false, false, 12) {
+		t.Fatal("exclusive prepared skb was rejected")
+	}
+	for _, test := range []struct {
+		name         string
+		shared       bool
+		cloned       bool
+		headerCloned bool
+		nonlinear    bool
+		headroom     int
+	}{
+		{name: "shared-skb", shared: true, headroom: 12},
+		{name: "linear-but-cloned", cloned: true, headroom: 12},
+		{name: "header-cloned", headerCloned: true, headroom: 12},
+		{name: "nonlinear", nonlinear: true, headroom: 12},
+		{name: "missing-headroom", headroom: 11},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if commitWritable(test.shared, test.cloned, test.headerCloned, test.nonlinear, test.headroom) {
+				t.Fatal("direct commit accepted storage that prepare did not make exclusive")
+			}
+		})
+	}
+}
+
 func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 	bpfSource, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
 	if err != nil {
@@ -384,6 +423,7 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 	for _, required := range []string{
 		"wg_mix_faketcp_skb_prepare_udp(",
 		"wg_mix_faketcp_skb_commit_udp_gso(",
+		"Non-fraglist aggregates are source-neutral",
 		"bpf_loop(context.gso_segments, faketcp_gso_validate_segment",
 		"segment_index = index / context->xor_chunks_per_segment",
 		"target_length = segment_length < context->cipher->max_bytes",
@@ -396,8 +436,10 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 	for _, required := range []string{
 		"const unsigned int allowed_gso_type = SKB_GSO_UDP_L4 | SKB_GSO_DODGY",
 		"shinfo->gso_type & ~allowed_gso_type",
+		"if (skb_shared(skb))",
 		"skb_linearize_cow(skb)",
 		"skb_cow_head(skb, WG_MIX_FAKETCP_HEADER_DELTA)",
+		"skb_shared(skb) || skb_cloned(skb) || skb_header_cloned(skb)",
 		"#include <net/dst_metadata.h>",
 		"struct net_device *device = READ_ONCE(skb->dev)",
 		"device_mtu = READ_ONCE(device->mtu)",
@@ -412,6 +454,29 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 		if !strings.Contains(kernel, required) {
 			t.Fatalf("kernel GSO contract missing %q", required)
 		}
+	}
+	gsoStart := strings.Index(bpf, "faketcp_encode_gso_segments(struct __sk_buff *skb")
+	gsoEnd := strings.Index(bpf, "static __always_inline __s64 faketcp_rotation_checksum")
+	if gsoStart < 0 || gsoEnd <= gsoStart {
+		t.Fatal("GSO encoder boundaries are missing")
+	}
+	gso := bpf[gsoStart:gsoEnd]
+	parseGate := strings.Index(gso, "faketcp_parse_tc_l3(skb, info, &l3) != FAKETCP_L3_OK")
+	prepare := strings.Index(gso, "faketcp_prepare_udp(skb, info->ip_off, info->udp_off")
+	rewrite := strings.Index(gso, "bpf_loop(context.gso_segments, faketcp_gso_rewrite_type")
+	if parseGate < 0 || prepare < 0 || rewrite < 0 || !(parseGate < prepare && prepare < rewrite) {
+		t.Fatal("shared fixed-IPv4 gate and unified prepare must precede every GSO mutation")
+	}
+	commitStart := strings.Index(kernel, "wg_mix_faketcp_skb_commit_udp_gso(struct __sk_buff *ctx")
+	if commitStart < 0 {
+		t.Fatal("GSO commit boundary is missing")
+	}
+	commit := kernel[commitStart:]
+	geometry := strings.Index(commit, "wg_mix_faketcp_validate_udp_gso(skb, transport_offset")
+	writable := strings.Index(commit, "skb_shared(skb) || skb_cloned(skb) || skb_header_cloned(skb)")
+	mutation := strings.Index(commit, "wg_mix_faketcp_rotate_gso_payload(skb")
+	if geometry < 0 || writable < 0 || mutation < 0 || !(geometry < writable && writable < mutation) {
+		t.Fatal("direct GSO commit must revalidate geometry and reject shared storage before its first write")
 	}
 	if fakeTCPImplementedCapabilities&fakeTCPCapabilityGSOPerSegmentTransform != 0 {
 		t.Fatal("GSO capability opened before verifier and .82 wire evidence")
