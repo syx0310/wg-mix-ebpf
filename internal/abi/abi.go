@@ -52,8 +52,8 @@ const (
 	FakeTCPEventRST           uint8 = 5
 	FakeTCPEventFIN           uint8 = 6
 
-	FakeTCPEventABIVersion   uint16 = 1
-	FakeTCPEventSize                = 88
+	FakeTCPEventABIVersion   uint16 = 2
+	FakeTCPEventSize                = 104
 	FakeTCPMaxCapturedPacket        = 2304
 	FakeTCPPacketEventSize          = FakeTCPEventSize + FakeTCPMaxCapturedPacket
 )
@@ -327,6 +327,8 @@ type FakeTCPEvent struct {
 	TimestampNanos     uint64
 	RuntimeIncarnation [16]byte
 	CaptureSequence    uint64
+	SessionRevision    uint64
+	SessionID          uint64
 	CaptureCPU         uint32
 	Sequence           uint32
 	Acknowledgement    uint32
@@ -340,9 +342,10 @@ type FakeTCPEvent struct {
 	_                  [2]byte
 }
 
-// FakeTCPPacketEvent carries the exact pre-transform IPv4 packet for the
-// bounded userspace first-packet queue. Consumers must use PacketLength and
-// ignore the unused tail of Packet.
+// FakeTCPPacketEvent carries either the exact pre-transform IPv4/UDP packet
+// for the bounded userspace first-packet queue or a complete inbound IPv4/TCP
+// RST/FIN candidate for independent userspace validation. Consumers must use
+// PacketLength and ignore the unused tail of Packet.
 type FakeTCPPacketEvent struct {
 	Event  FakeTCPEvent
 	Packet [FakeTCPMaxCapturedPacket]byte

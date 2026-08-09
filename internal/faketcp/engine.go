@@ -403,24 +403,80 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 }
 
 func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, error) {
-	return e.inbound(flow, seg, 0, nil)
+	return e.inbound(flow, seg, 0)
 }
 
 // InboundWithWGID preserves the listener identity carried by the BPF event so
 // retries and replies are sent through the same configured WireGuard path.
 func (e *Engine) InboundWithWGID(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) ([]Action, error) {
-	return e.inbound(flow, seg, wgID, nil)
+	return e.inbound(flow, seg, wgID)
 }
 
-// InboundValidatedControl is the only path that may remove an established
-// session in response to peer RST/FIN. The opaque value can only be produced
-// by ValidateIPv4TCPControl from the complete packet and the exact BPF-owned
-// session snapshot used for its sequence/window checks.
-func (e *Engine) InboundValidatedControl(control ValidatedControl, wgID uint32) ([]Action, error) {
-	return e.inbound(control.flow, control.segment, wgID, &control)
+// InboundCapturedControl is the production close-control boundary. It binds a
+// packet-bearing BPF event to this Engine incarnation, re-reads the current
+// established value, validates the complete packet independently of BPF, and
+// only then requests an atomic compare-delete. Malformed peer input is an
+// ordinary fail-closed drop rather than a runtime-fatal error.
+func (e *Engine) InboundCapturedControl(event abi.FakeTCPEvent, packet []byte) ([]Action, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	flow := event.Key
+	if err := e.validateFlow(flow); err != nil {
+		return nil, err
+	}
+	identity := runtimeIdentityFromEvent(event)
+	if identity != e.identity || event.EventABIVersion != abi.FakeTCPEventABIVersion {
+		return nil, errors.New("faketcp close event does not match the active runtime identity")
+	}
+	if event.Type != abi.FakeTCPEventRST && event.Type != abi.FakeTCPEventFIN {
+		return nil, errors.New("faketcp captured control event is not RST or FIN")
+	}
+	if event.PacketLength != uint16(len(packet)) || len(packet) != controlPacketLength ||
+		event.PayloadLength != 0 || event.CaptureSequence != 0 || event.CaptureCPU != 0 ||
+		event.FWMark != 0 {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "invalid-close-envelope"}}, nil
+	}
+
+	s := e.sessions[flow]
+	if s == nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-close"}}, nil
+	}
+	if event.WGID == 0 || s.wgID == 0 || event.WGID != s.wgID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+	}
+	if s.pendingDelete != nil {
+		action, err := e.retryPendingDelete(flow, s)
+		return []Action{action}, err
+	}
+	if s.state != abi.FakeTCPStateEstablished {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
+	}
+	value, found, err := e.lookupEstablished(flow, s)
+	if err != nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+	}
+	if !found {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-missing"}}, nil
+	}
+	if validationErr := validateIPv4TCPControl(packet, event, value); validationErr != nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "invalid-close-control"}}, nil
+	}
+	result, err := e.compareDeleteEstablished(flow, s, pendingSessionDelete{
+		expected: value,
+		reason:   "peer-close",
+	})
+	if err != nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+	}
+	if result == SessionDeleteDifferent {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
+	}
+	e.remove(flow, s)
+	return []Action{{Kind: ActionClose, Flow: flow, Reason: "peer-close"}}, nil
 }
 
-func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32, validated *ValidatedControl) ([]Action, error) {
+func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) ([]Action, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.validateFlow(flow); err != nil {
@@ -449,28 +505,7 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32, v
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-close"}}, nil
 		}
 		if s.state == abi.FakeTCPStateEstablished {
-			if validated == nil || validated.flow != flow || validated.segment != seg {
-				return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
-			}
-			value, found, err := e.lookupEstablished(flow, s)
-			if err != nil {
-				return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
-			}
-			if found {
-				if value != validated.session {
-					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
-				}
-				result, err := e.compareDeleteEstablished(flow, s, pendingSessionDelete{
-					expected: validated.session,
-					reason:   "peer-close",
-				})
-				if err != nil {
-					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
-				}
-				if result == SessionDeleteDifferent {
-					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
-				}
-			}
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
 		}
 		e.remove(flow, s)
 		return []Action{{Kind: ActionClose, Flow: flow, Reason: "peer-close"}}, nil

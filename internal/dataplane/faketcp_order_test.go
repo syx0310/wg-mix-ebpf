@@ -970,7 +970,7 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 		t.Fatalf("FakeTCP metadata ring output sites=%d, want exactly one", got)
 	}
 	if got := strings.Count(text, "bpf_ringbuf_output(&faketcp_events, record"); got != 1 {
-		t.Fatalf("FakeTCP packet ring output sites=%d, want exactly one", got)
+		t.Fatalf("FakeTCP shared packet ring output sites=%d, want exactly one", got)
 	}
 	for _, forbidden := range []string{"bpf_ringbuf_reserve(", "bpf_ringbuf_submit(", "bpf_ringbuf_discard("} {
 		if strings.Contains(text, forbidden) {
@@ -999,7 +999,7 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 	packetAdmit := strings.Index(capture, "if (!faketcp_admit_control_event(key, rule->wg_id")
 	scratchWrite := strings.Index(capture, "record->event = (struct faketcp_event)")
 	packetCopy := strings.Index(capture, "bpf_skb_load_bytes")
-	packetOutput := strings.Index(capture, "bpf_ringbuf_output(&faketcp_events, record")
+	packetOutput := strings.Index(capture, "faketcp_output_packet_event(record, packet_len)")
 	identityBind := strings.Index(capture, "faketcp_bind_runtime_identity(key, &record->event)")
 	sequenceAssign := strings.Index(capture, "faketcp_assign_capture_sequence(&record->event)")
 	if packetValidation < 0 || scratchLookup < 0 || packetAdmit < 0 || scratchWrite < 0 ||
@@ -1007,7 +1007,7 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 		scratchLookup >= packetAdmit || packetAdmit >= scratchWrite ||
 		scratchWrite >= identityBind || identityBind >= sequenceAssign ||
 		sequenceAssign >= packetCopy || packetCopy >= packetOutput {
-		t.Fatal("NEED_HANDSHAKE admission must follow cheap validation and dominate scratch writes, packet copy, and ring output")
+		t.Fatal("NEED_HANDSHAKE admission must follow cheap validation and dominate scratch writes, packet copy, and shared ring output")
 	}
 	if strings.Count(capture, "bpf_ktime_get_ns()") != 1 ||
 		!strings.Contains(capture, ".timestamp_nanos = now") {
@@ -1128,7 +1128,7 @@ func takeFakeTCPControlBudgetModel(cursor *uint64, now, interval uint64, burst u
 	return true
 }
 
-func TestFakeTCPCloseControlsCannotAuthorizeDeleteBeforeBPFValidation(t *testing.T) {
+func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
 	if err != nil {
 		t.Fatal(err)
@@ -1141,12 +1141,141 @@ func TestFakeTCPCloseControlsCannotAuthorizeDeleteBeforeBPFValidation(t *testing
 	}
 	checkpoint := text[checkpointStart:xdpStart]
 	xdp := text[xdpStart:]
-	closeDrop := strings.Index(checkpoint, "if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN))")
-	firstEvent := strings.Index(xdp, "faketcp_emit_event")
-	if closeDrop < 0 || firstEvent < 0 {
-		t.Fatal("RST/FIN can reach the ring before the unavailable BPF checksum/window validator")
+	snapshot := strings.Index(checkpoint, "faketcp_session_snapshot_established(")
+	closeDecision := strings.Index(checkpoint, "return FAKETCP_ADMISSION_CLOSE")
+	fixedIPv4Gate := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")
+	checkpointCall := strings.Index(xdp, "admission_decision = faketcp_xdp_admission_checkpoint(")
+	closePath := strings.Index(xdp, "if (admission_decision == FAKETCP_ADMISSION_CLOSE)")
+	canonical := strings.Index(xdp, "flags != (FAKETCP_FLAG_RST | FAKETCP_FLAG_ACK)")
+	sequence := strings.Index(xdp, "seq != admission.decision.close.rx_sequence")
+	window := strings.Index(xdp, "bpf_ntohs(tcp->window) != admission.session_projection.window")
+	checksum := strings.Index(xdp, "faketcp_close_checksums_valid(iph, tcp)")
+	capture := strings.Index(xdp, "faketcp_capture_close_packet(")
+	if snapshot < 0 || closeDecision < 0 || fixedIPv4Gate < 0 || checkpointCall < 0 ||
+		closePath < 0 || canonical < 0 || sequence < 0 || window < 0 || checksum < 0 || capture < 0 ||
+		snapshot >= closeDecision || fixedIPv4Gate >= checkpointCall || checkpointCall >= closePath ||
+		closePath >= canonical || canonical >= sequence || sequence >= window ||
+		window >= checksum || checksum >= capture {
+		t.Fatal("single admission CLOSE decision and exact packet authority checks are missing or out of order")
+	}
+	for _, want := range []string{
+		"close_control = flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)",
+		"if (!close_control && policy_listener->cipher_id != 0)",
+		"return close_control ? FAKETCP_ADMISSION_DROP :",
+		"admission->decision.close.session_revision = session_snapshot.revision",
+		"admission->decision.close.tx_sequence = session_snapshot.tx_sequence",
+		"admission->decision.close.rx_sequence = session_snapshot.rx_sequence",
+	} {
+		if !strings.Contains(checkpoint, want) {
+			t.Fatalf("single CLOSE checkpoint is missing %q", want)
+		}
+	}
+	keepalivePath := strings.Index(xdp, "if (admission_decision == FAKETCP_ADMISSION_KEEPALIVE)")
+	if keepalivePath < 0 || closePath >= keepalivePath {
+		t.Fatal("CLOSE decision does not terminate before ordinary admission decisions")
+	}
+	closeBlock := xdp[closePath:keepalivePath]
+	for _, forbidden := range []string{"faketcp_emit_event", "faketcp_session_mutate", "xor_", "FAKETCP_ADMISSION_TRANSFORM"} {
+		if strings.Contains(closeBlock, forbidden) {
+			t.Fatalf("CLOSE decision leaked into ordinary control/transform path through %q", forbidden)
+		}
+	}
+	if strings.Contains(checkpoint, "close topic") ||
+		strings.Contains(text, "faketcp_session_snapshot_close") ||
+		strings.Contains(text, "struct faketcp_close_snapshot") {
+		t.Fatal("validated close regained a parallel snapshot or pre-admission fallback")
 	}
 	if strings.Contains(xdp, "old_tcp.check == 0") {
 		t.Fatal("TCP checksum field zero is not independently invalid")
+	}
+	if strings.Contains(text, "bpf_map_delete_elem(&faketcp_session_map") {
+		t.Fatal("BPF close validation must never become session-deletion authority")
+	}
+
+	checksumStart := strings.Index(text, "faketcp_close_checksums_valid(const struct iphdr *iph")
+	captureStart := strings.Index(text, "faketcp_capture_close_packet(struct xdp_md *xdp")
+	if checksumStart < 0 || captureStart < 0 || checksumStart >= captureStart {
+		t.Fatal("canonical close checksum and capture helpers are missing")
+	}
+	checksumHelper := text[checksumStart:captureStart]
+	for _, want := range []string{
+		"bpf_csum_diff(0, 0, (__be32 *)iph, sizeof(*iph), 0)",
+		"fold_csum(sum) != 0",
+		"struct faketcp_ipv4_pseudo_header pseudo",
+		"bpf_csum_diff(0, 0, (__be32 *)tcp, sizeof(*tcp)",
+	} {
+		if !strings.Contains(checksumHelper, want) {
+			t.Fatalf("close checksum helper missing %q", want)
+		}
+	}
+	captureHelper := text[captureStart:xdpStart]
+	admit := strings.Index(captureHelper, "faketcp_admit_control_event(&admission->key, admission->wg_id")
+	write := strings.Index(captureHelper, "record->event = (struct faketcp_event)")
+	identity := strings.Index(captureHelper, "record->event.runtime_incarnation[i]")
+	copyPacket := strings.Index(captureHelper, "bpf_xdp_load_bytes")
+	output := strings.Index(captureHelper, "faketcp_output_packet_event(record, packet_len)")
+	if admit < 0 || write < 0 || identity < 0 || copyPacket < 0 || output < 0 ||
+		admit >= write || write >= identity || identity >= copyPacket || copyPacket >= output {
+		t.Fatal("validated close admission must dominate event writes, identity binding, packet copy, and shared output")
+	}
+	for _, want := range []string{
+		".session_revision = admission->decision.close.session_revision",
+		".session_id = admission->session_authority.session_id",
+		".sequence = admission->decision.close.rx_sequence",
+		".acknowledgement = admission->decision.close.tx_sequence",
+		".event_abi_version = FAKETCP_EVENT_ABI_VERSION",
+	} {
+		if !strings.Contains(captureHelper, want) {
+			t.Fatalf("close event snapshot binding missing %q", want)
+		}
+	}
+	if strings.Contains(captureHelper, "faketcp_bind_runtime_identity") {
+		t.Fatal("close event must use the incarnation from its locked session snapshot")
+	}
+
+	copyStart := strings.Index(text, "static __always_inline void faketcp_session_snapshot_locked(")
+	matchLockedStart := strings.Index(text, "static __always_inline int faketcp_session_authority_matches_locked(")
+	readerStart := strings.Index(text, "static __always_inline int faketcp_session_snapshot_established(")
+	authorityStart := strings.Index(text, "static __always_inline int faketcp_session_authority_matches(")
+	if copyStart < 0 || matchLockedStart < 0 || readerStart < 0 || authorityStart < 0 ||
+		!(copyStart < matchLockedStart && matchLockedStart < readerStart && readerStart < authorityStart) {
+		t.Fatal("unified locked session snapshot helpers are missing or misplaced")
+	}
+	copyHelper := text[copyStart:matchLockedStart]
+	for _, want := range []string{
+		"snapshot->revision = session->revision",
+		"snapshot->authority.session_id = session->session_id",
+		"snapshot->tx_sequence = session->tx_sequence",
+		"snapshot->rx_sequence = session->rx_sequence",
+	} {
+		if !strings.Contains(copyHelper, want) {
+			t.Fatalf("unified session snapshot is missing close authority %q", want)
+		}
+	}
+	reader := text[readerStart:authorityStart]
+	lock := strings.Index(reader, "bpf_spin_lock(&session->lock)")
+	validate := strings.Index(reader, "faketcp_session_metadata_valid_locked(session, generation)")
+	copyProof := strings.Index(reader, "faketcp_session_snapshot_locked(session, snapshot)")
+	unlock := strings.Index(reader, "bpf_spin_unlock(&session->lock)")
+	if lock < 0 || validate < 0 || copyProof < 0 || unlock < 0 ||
+		!(lock < validate && validate < copyProof && copyProof < unlock) {
+		t.Fatal("close authority is not copied from the admission checkpoint's one locked snapshot")
+	}
+	for _, forbidden := range []string{"bpf_ktime_get_ns", "bpf_xdp_", "bpf_csum_diff", "inc_faketcp_stat"} {
+		if strings.Contains(reader[lock:unlock], forbidden) {
+			t.Fatalf("close snapshot critical section contains helper/stat call %q", forbidden)
+		}
+	}
+	for _, want := range []string{
+		"sizeof(struct faketcp_session_snapshot) == 56",
+		"sizeof(union faketcp_ingress_decision_projection) == 16",
+		"sizeof(struct faketcp_ingress_admission) == 136",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("close/admission stack contract missing %q", want)
+		}
+	}
+	if fakeTCPImplementedCapabilities&fakeTCPCapabilityValidatedCloseControl != 0 {
+		t.Fatal("ValidatedCloseControl capability opened before Linux verifier and live evidence")
 	}
 }

@@ -194,13 +194,24 @@ func TestFakeTCPAdmissionProofBindsFullIdentityAndCapabilityStaysClosed(t *testi
 	}
 
 	egressProof := sourceSection(t, text, "struct faketcp_egress_admission {", "struct faketcp_egress_admission_slot {")
+	transformProjection := sourceSection(t, text,
+		"struct faketcp_ingress_transform_projection {",
+		"struct faketcp_ingress_close_projection {")
+	closeProjection := sourceSection(t, text,
+		"struct faketcp_ingress_close_projection {",
+		"union faketcp_ingress_decision_projection {")
 	ingressProof := sourceSection(t, text, "struct faketcp_ingress_admission {", "_Static_assert(sizeof(struct faketcp_session_key)")
-	if strings.Contains(egressProof, "revision") || strings.Contains(ingressProof, "revision") {
+	if strings.Contains(egressProof, "revision") || strings.Contains(transformProjection, "revision") ||
+		strings.Contains(ingressProof, "revision") {
 		t.Fatal("ordinary transform proof regained mutable revision equality authority")
 	}
+	if !strings.Contains(closeProjection, "session_revision") ||
+		!strings.Contains(ingressProof, "union faketcp_ingress_decision_projection decision") {
+		t.Fatal("CLOSE did not retain a distinct mutable snapshot projection")
+	}
 	if !strings.Contains(text, "struct faketcp_session_snapshot") ||
-		!strings.Contains(text, "future close") ||
-		!strings.Contains(text, "never becomes ordinary admission equality") {
+		!strings.Contains(text, "close decision") ||
+		!strings.Contains(text, "never become ordinary admission equality") {
 		t.Fatal("locked close snapshot and transform lifetime authority are no longer explicitly separated")
 	}
 }

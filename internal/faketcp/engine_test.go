@@ -246,12 +246,12 @@ func establishedModelClaimTestEngine(
 	t.Helper()
 	engine, clock := testEngine(t, func(options *Options) { options.Store = store })
 	flow := testFlow(31001)
-	if _, err := engine.Outbound(flow, []byte{1}); err != nil {
+	if _, err := engine.outbound(flow, PendingPacket{Data: []byte{1}, WGID: 7}, false); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := engine.Inbound(flow, Segment{
+	if _, err := engine.InboundWithWGID(flow, Segment{
 		Flags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001,
-	}); err != nil {
+	}, 7); err != nil {
 		t.Fatal(err)
 	}
 	expected, found := store.value(flow)
@@ -397,13 +397,9 @@ func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 		failure := errors.New("peer-close delete failed after claim")
 		store := newModelClaimSessionStore(t, modelClaimDeleteFailure{err: failure})
 		engine, _, flow, expected := establishedModelClaimTestEngine(t, store)
-		packet := buildIPv4TCPControl(flow, expected, FlagRST|FlagACK, 0)
-		validated, err := ValidateIPv4TCPControl(packet, flow, expected)
-		if err != nil {
-			t.Fatal(err)
-		}
+		event, packet := capturedCloseEvent(engine, flow, expected, FlagRST|FlagACK, 7)
 
-		actions, err := engine.InboundValidatedControl(validated, 0)
+		actions, err := engine.InboundCapturedControl(event, packet)
 		if !errors.Is(err, failure) || len(actions) != 1 || actions[0].Reason != "session-store-unavailable" {
 			t.Fatalf("first Inbound actions=%#v err=%v", actions, err)
 		}
