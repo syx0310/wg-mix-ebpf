@@ -329,9 +329,16 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 	if err := e.validateFlow(flow); err != nil {
 		return nil, err
 	}
-	now := e.opts.Now()
 	s := e.sessions[flow]
 	if s != nil && s.state == abi.FakeTCPStateEstablished {
+		if s.pendingDelete != nil {
+			action, err := e.retryPendingDelete(flow, s)
+			// ActionClose authorizes neither forwarding nor reinjection. A
+			// captured packet therefore remains BPF-dropped, while a direct
+			// outbound packet is likewise terminal for this Engine turn.
+			return []Action{action}, err
+		}
+		now := e.opts.Now()
 		if packet.WGID != 0 && s.wgID != 0 && packet.WGID != s.wgID {
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
 		}
@@ -354,6 +361,7 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 		}
 		return []Action{{Kind: ActionForward, Flow: flow}}, nil
 	}
+	now := e.opts.Now()
 	created := false
 	if s == nil {
 		if len(e.sessions) >= e.opts.SessionCapacity {

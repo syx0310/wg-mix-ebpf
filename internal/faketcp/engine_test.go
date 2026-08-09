@@ -290,7 +290,7 @@ func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 		}
 	})
 
-	t.Run("uncertain error after delete resolves absent", func(t *testing.T) {
+	t.Run("outbound resolves absent after uncertain delete", func(t *testing.T) {
 		failure := errors.New("delete completed but completion was uncertain")
 		store := newModelClaimSessionStore(t, modelClaimDeleteFailure{
 			err: failure, deleteBeforeError: true,
@@ -305,9 +305,9 @@ func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 			t.Fatalf("uncertain delete found=%t pending=%#v", found, engine.sessions[flow].pendingDelete)
 		}
 		lookupsAfterDelete, _ := store.counts()
-		actions, err := engine.Tick()
+		actions, err := engine.Outbound(flow, []byte{9})
 		if err != nil || len(actions) != 1 || actions[0].Kind != ActionClose || actions[0].Reason != "idle-timeout" {
-			t.Fatalf("absent retry actions=%#v err=%v", actions, err)
+			t.Fatalf("absent outbound retry actions=%#v err=%v", actions, err)
 		}
 		lookups, _ := store.counts()
 		if lookups != lookupsAfterDelete || engine.sessions[flow] != nil {
@@ -326,7 +326,13 @@ func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 		clock.Add(engine.opts.IdleTimeout)
 
 		for attempt := 0; attempt < 3; attempt++ {
-			actions, err := engine.Tick()
+			var actions []Action
+			var err error
+			if attempt == 1 {
+				actions, err = engine.Outbound(flow, []byte{9})
+			} else {
+				actions, err = engine.Tick()
+			}
 			if !errors.Is(err, failure) || len(actions) != 1 || actions[0].Reason != "session-store-unavailable" {
 				t.Fatalf("attempt %d actions=%#v err=%v", attempt, actions, err)
 			}
@@ -358,9 +364,9 @@ func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 		replacement.Revision++
 		store.put(flow, replacement)
 		lookupsAfterClaim, _ := store.counts()
-		actions, err := engine.Tick()
+		actions, err := engine.Outbound(flow, []byte{9})
 		if err != nil || len(actions) != 1 || actions[0].Reason != "fast-session-raced" {
-			t.Fatalf("different retry actions=%#v err=%v", actions, err)
+			t.Fatalf("different outbound retry actions=%#v err=%v", actions, err)
 		}
 		actual, _ := store.value(flow)
 		lookups, _ := store.counts()
