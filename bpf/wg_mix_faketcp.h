@@ -1172,8 +1172,8 @@ static __always_inline int faketcp_tc_key(struct __sk_buff *skb,
 	void *data_end = (void *)(long)skb->data_end;
 	struct iphdr *iph = data + l3->l3_off;
 
-	// faketcp_parse_tc_l3 already applied the sole fixed-header IPv4 gate.
-	// Keep only descriptor/source-parser coherence and verifier bounds here.
+	// The authoritative TC descriptor already applied the sole fixed-header
+	// IPv4 gate. Keep only descriptor coherence and verifier bounds here.
 	if (l3->l3_off != info->ip_off || l3->l4_off != info->udp_off ||
 	    (void *)(iph + 1) > data_end)
 		return -1;
@@ -1186,9 +1186,213 @@ static __always_inline int faketcp_tc_key(struct __sk_buff *skb,
 	return 0;
 }
 
-static __always_inline int faketcp_parse_tc_l3(struct __sk_buff *skb,
-						const struct packet_info *info,
-						struct faketcp_l3_info *l3)
+// One descriptor owns both the generic rule-lookup result and the stricter
+// FakeTCP projection. The observation and L3 views share storage because the
+// latter is derived immediately from scalar fields loaded by the sole parser.
+union faketcp_tc_packet_shape {
+	struct packet_parse_observation observation;
+	struct faketcp_l3_info l3;
+};
+
+struct faketcp_tc_packet_descriptor {
+	union faketcp_tc_packet_shape shape;
+	struct packet_info info;
+	int generic_status;
+	int faketcp_status;
+};
+
+_Static_assert(sizeof(struct faketcp_tc_packet_descriptor) == 64,
+	       "FakeTCP TC packet descriptor layout drift");
+
+static __always_inline int
+faketcp_tc_status_from_generic(int status)
+{
+	switch (status) {
+	case PARSE_SHORT:
+		return FAKETCP_L3_TRUNCATED;
+	case PARSE_IPV4_FIRST_FRAGMENT:
+	case PARSE_IPV6_FRAGMENT_FIRST:
+		return FAKETCP_L3_FIRST_FRAGMENT;
+	case PARSE_IPV4_NON_FIRST_FRAGMENT:
+	case PARSE_IPV6_FRAGMENT_NON_FIRST:
+		return FAKETCP_L3_NONINITIAL_FRAGMENT;
+	case PARSE_IPV6_EXT_TOO_DEEP:
+		return FAKETCP_L3_EXTENSION_TOO_DEEP;
+	case PARSE_BAD_CSUM:
+		return FAKETCP_L3_MALFORMED;
+	default:
+		return FAKETCP_L3_UNSUPPORTED;
+	}
+}
+
+static __always_inline int
+faketcp_tc_project_ipv4_udp(struct faketcp_tc_packet_descriptor *packet)
+{
+	__u32 frame_len = packet->shape.observation.frame_len;
+	__u32 total_len = packet->shape.observation.ipv4_total_len;
+	__u16 header_len = packet->shape.observation.ipv4_header_len;
+	__u16 fragment = packet->shape.observation.ipv4_fragment;
+	__u16 udp_len = packet->shape.observation.udp_len;
+	__u8 version = packet->shape.observation.ip_version;
+	__u8 protocol = packet->shape.observation.ip_protocol;
+	struct faketcp_l3_info *l3 = &packet->shape.l3;
+
+	__builtin_memset(l3, 0, sizeof(*l3));
+	l3->l3_off = packet->info.ip_off;
+	l3->family = packet->info.family;
+	if (packet->info.family != FAMILY_IPV4)
+		return FAKETCP_L3_UNSUPPORTED;
+	if (version != 4 || header_len < sizeof(struct iphdr))
+		return FAKETCP_L3_MALFORMED;
+	if (packet->info.ip_off > frame_len ||
+	    total_len > frame_len - packet->info.ip_off)
+		return FAKETCP_L3_TRUNCATED;
+	if (total_len < header_len)
+		return FAKETCP_L3_MALFORMED;
+
+	l3->l3_len = total_len;
+	l3->l3_header_len = header_len;
+	l3->l4_off = packet->info.ip_off + header_len;
+	l3->l4_len = total_len - header_len;
+	l3->transport_protocol = protocol;
+	if (header_len > sizeof(struct iphdr))
+		l3->flags |= FAKETCP_L3_F_IPV4_OPTIONS;
+	if (fragment & IP_RESERVED)
+		return FAKETCP_L3_MALFORMED;
+	if (fragment & IP_DF)
+		l3->flags |= FAKETCP_L3_F_IPV4_DF;
+	if ((fragment & IP_DF) && (fragment & (IP_MF | IP_OFFSET)))
+		return FAKETCP_L3_MALFORMED;
+	if (fragment & IP_OFFSET)
+		return FAKETCP_L3_NONINITIAL_FRAGMENT;
+	if (fragment & IP_MF)
+		return FAKETCP_L3_FIRST_FRAGMENT;
+	if (protocol != IPPROTO_UDP)
+		return FAKETCP_L3_UNSUPPORTED;
+	if (udp_len < sizeof(struct udphdr) || udp_len != l3->l4_len)
+		return FAKETCP_L3_MALFORMED;
+	l3->l4_header_len = sizeof(struct udphdr);
+	return FAKETCP_L3_OK;
+}
+
+static __always_inline int
+faketcp_parse_tc_egress_packet(struct __sk_buff *skb, __u64 generation,
+				struct faketcp_tc_packet_descriptor *packet)
+{
+	__builtin_memset(packet, 0, sizeof(*packet));
+	packet->generic_status = parse_packet_observed(
+		skb, &packet->info, &packet->shape.observation, generation);
+	if (packet->generic_status == PARSE_OK)
+		packet->faketcp_status = faketcp_tc_project_ipv4_udp(packet);
+	else {
+		packet->faketcp_status =
+			faketcp_tc_status_from_generic(packet->generic_status);
+		__builtin_memset(&packet->shape.l3, 0,
+				 sizeof(packet->shape.l3));
+	}
+	return packet->generic_status;
+}
+
+static __always_inline int faketcp_tc_fixed_udp_status(
+	const struct faketcp_tc_packet_descriptor *packet)
+{
+	if (packet->faketcp_status != FAKETCP_L3_OK)
+		return packet->faketcp_status;
+	if (faketcp_managed_transform_status(&packet->shape.l3, IPPROTO_UDP) !=
+	    FAKETCP_L3_OK)
+		return FAKETCP_L3_UNSUPPORTED;
+	if (packet->shape.l3.l3_off != packet->info.ip_off ||
+	    packet->shape.l3.l4_off != packet->info.udp_off ||
+	    packet->shape.l3.l4_len !=
+		    sizeof(struct udphdr) + packet->info.payload_len)
+		return FAKETCP_L3_MALFORMED;
+	return FAKETCP_L3_OK;
+}
+
+// XOR may mutate payload bytes and the UDP checksum, but it must not alter the
+// admitted fixed IPv4/UDP envelope. Re-read only those fixed header scalars
+// before trusting the projection; this is deliberately not an L3 parser.
+static __always_inline int faketcp_tc_current_admission_coherent(
+	struct __sk_buff *skb, const struct faketcp_egress_admission *admission)
+{
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct iphdr *iph;
+	struct udphdr *udp;
+	__u16 fragment;
+
+	if (!admission || admission->network_off > skb->len ||
+	    admission->transport_off < admission->network_off ||
+	    admission->payload_off < admission->transport_off ||
+	    admission->transport_off - admission->network_off !=
+		    sizeof(struct iphdr) ||
+	    admission->payload_off - admission->transport_off !=
+		    sizeof(struct udphdr) ||
+	    admission->wire_len < sizeof(struct udphdr) ||
+	    admission->wire_len - sizeof(struct udphdr) !=
+		    admission->payload_len ||
+	    admission->ip_total_len < sizeof(struct iphdr) ||
+	    admission->ip_total_len - sizeof(struct iphdr) !=
+		    admission->wire_len ||
+	    admission->skb_len != skb->len ||
+	    admission->ip_total_len != skb->len - admission->network_off ||
+	    admission->cipher_id == 0 ||
+	    admission->xor_checksum_mode > XOR_CSUM_RECOMPUTE)
+		return -1;
+	iph = data + admission->network_off;
+	udp = data + admission->transport_off;
+	if ((void *)(iph + 1) > data_end || (void *)(udp + 1) > data_end)
+		return -1;
+	fragment = bpf_ntohs(iph->frag_off);
+	if (iph->version != 4 || iph->ihl != sizeof(*iph) / 4 ||
+	    iph->protocol != IPPROTO_UDP ||
+	    (fragment & (IP_RESERVED | IP_MF | IP_OFFSET)) ||
+	    bpf_ntohs(iph->tot_len) != admission->ip_total_len ||
+	    bpf_ntohs(udp->len) != admission->wire_len ||
+	    bpf_ntohs(udp->source) != admission->key.local_port ||
+	    bpf_ntohs(udp->dest) != admission->key.remote_port ||
+	    ((udp->check == 0) !=
+	     (admission->xor_checksum_mode == XOR_CSUM_NONE)))
+		return -1;
+	return 0;
+}
+
+static __always_inline void faketcp_tc_descriptor_from_admission(
+	const struct faketcp_egress_admission *admission,
+	struct faketcp_tc_packet_descriptor *packet)
+{
+	__builtin_memset(packet, 0, sizeof(*packet));
+	packet->shape.l3 = (struct faketcp_l3_info){
+		.l3_off = admission->network_off,
+		.l3_len = admission->ip_total_len,
+		.l4_off = admission->transport_off,
+		.l4_len = admission->wire_len,
+		.l3_header_len = sizeof(struct iphdr),
+		.l4_header_len = sizeof(struct udphdr),
+		.family = FAMILY_IPV4,
+		.transport_protocol = IPPROTO_UDP,
+	};
+	packet->info = (struct packet_info){
+		.family = FAMILY_IPV4,
+		.ip_off = admission->network_off,
+		.udp_off = admission->transport_off,
+		.payload_off = admission->payload_off,
+		.payload_len = admission->payload_len,
+		.src_port = admission->key.local_port,
+		.dst_port = admission->key.remote_port,
+		.ipv4_udp_csum_zero =
+			admission->xor_checksum_mode == XOR_CSUM_NONE,
+	};
+	packet->generic_status = PARSE_OK;
+	packet->faketcp_status = FAKETCP_L3_OK;
+}
+
+// TC ingress receives an XDP-decoded packet, so it deliberately revalidates
+// that independent program boundary. Egress must use the single descriptor
+// above and never call this helper.
+static __always_inline int faketcp_revalidate_tc_ingress_l3(
+	struct __sk_buff *skb, const struct packet_info *info,
+	struct faketcp_l3_info *l3)
 {
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
@@ -1375,6 +1579,7 @@ static __always_inline int faketcp_gso_projection_matches(
 static __always_inline int faketcp_egress_admission_matches(
 	struct __sk_buff *skb,
 	const struct packet_info *info,
+	const struct faketcp_l3_info *l3,
 	const struct managed_fwmark_value *managed,
 	const struct egress_rule_value *rule,
 	const struct profile_value *profile,
@@ -1387,7 +1592,6 @@ static __always_inline int faketcp_egress_admission_matches(
 	struct iphdr *iph = data + info->ip_off;
 	struct udphdr *udp = data + info->udp_off;
 	struct faketcp_session_key key = {};
-	struct faketcp_l3_info l3;
 	struct faketcp_gso_projection observed_gso = {};
 	struct cipher_value *cipher = 0;
 	__u32 xor_target = 0;
@@ -1399,7 +1603,10 @@ static __always_inline int faketcp_egress_admission_matches(
 	__u8 expected_xor_checksum_mode = XOR_CSUM_NONE;
 	int is_gso = skb->gso_segs || skb->gso_size;
 
-	if (faketcp_parse_tc_l3(skb, info, &l3) != FAKETCP_L3_OK ||
+	if (!l3 || faketcp_managed_transform_status(l3, IPPROTO_UDP) !=
+			   FAKETCP_L3_OK ||
+	    l3->l3_off != info->ip_off || l3->l4_off != info->udp_off ||
+	    l3->l4_len != sizeof(struct udphdr) + info->payload_len ||
 	    !admission || !managed || !rule || !profile ||
 	    required_state == FAKETCP_TOKEN_FREE ||
 	    (void *)(iph + 1) > data_end || (void *)(udp + 1) > data_end)
@@ -1447,7 +1654,7 @@ static __always_inline int faketcp_egress_admission_matches(
 		generation,
 		admission->session_authority.runtime_incarnation))
 		return 0;
-	if (faketcp_tc_key(skb, info, &l3, generation, &key) < 0 ||
+	if (faketcp_tc_key(skb, info, l3, generation, &key) < 0 ||
 	    key.local_ipv4 != admission->key.local_ipv4 ||
 	    key.remote_ipv4 != admission->key.remote_ipv4 ||
 	    key.underlay_index != admission->key.underlay_index ||
@@ -1940,7 +2147,7 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 		return TC_ACT_SHOT;
 	if (faketcp_consume_egress_admission(admission.nonce, &admission) < 0 ||
 	    !faketcp_egress_admission_matches(
-		    skb, info, managed, rule, profile, generation,
+		    skb, info, l3, managed, rule, profile, generation,
 		    FAKETCP_TOKEN_ARMED, &admission)) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
@@ -2243,7 +2450,8 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 
 static __always_inline int faketcp_continue_egress(struct __sk_buff *skb)
 {
-	struct packet_info info = {};
+	struct faketcp_tc_packet_descriptor packet = {};
+	struct packet_info *info = &packet.info;
 	struct egress_rule_key key = {};
 	struct egress_rule_value *rule;
 	struct managed_fwmark_value *managed;
@@ -2258,7 +2466,7 @@ static __always_inline int faketcp_continue_egress(struct __sk_buff *skb)
 	context_ok = load_xor_context(skb, &progress) == 0 &&
 		     progress.continue_faketcp;
 	// Consume is deliberately first. It copies then clears the per-CPU active
-	// token before cb cleanup, parsing, lookup or comparison, so an independent
+	// token before cb cleanup, projection, lookup or comparison, so an independent
 	// call and every malformed/residual cb path are single-use failures.
 	consume_rc = faketcp_consume_egress_admission(
 		progress.admission_nonce, &admission);
@@ -2267,16 +2475,18 @@ static __always_inline int faketcp_continue_egress(struct __sk_buff *skb)
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
 	}
-	if (!active_generation(&generation) || parse_packet(skb, &info, generation) != PARSE_OK) {
+	if (!active_generation(&generation) ||
+	    faketcp_tc_current_admission_coherent(skb, &admission) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
 	}
+	faketcp_tc_descriptor_from_admission(&admission, &packet);
 	managed = lookup_managed_fwmark(skb->mark, skb->ifindex, generation);
 	key.generation = generation;
 	key.fwmark = skb->mark;
 	key.underlay_index = skb->ifindex;
-	key.source_port = info.src_port;
-	key.family = info.family;
+	key.source_port = info->src_port;
+	key.family = info->family;
 	rule = bpf_map_lookup_elem(&egress_rule_map, &key);
 	if (!rule || rule->generation != generation) {
 		key.underlay_index = UNDERLAY_WILDCARD;
@@ -2291,12 +2501,12 @@ static __always_inline int faketcp_continue_egress(struct __sk_buff *skb)
 	profile = bpf_map_lookup_elem(&profile_map, &profile_key);
 	if (!profile ||
 	    !faketcp_egress_admission_matches(
-		    skb, &info, managed, rule, profile, generation,
+		    skb, info, &packet.shape.l3, managed, rule, profile, generation,
 		    FAKETCP_TOKEN_XOR_COMPLETE, &admission)) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
 	}
-	return faketcp_encode_established(skb, &info, rule, generation,
+	return faketcp_encode_established(skb, info, rule, generation,
 					  &admission);
 }
 

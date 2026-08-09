@@ -26,14 +26,15 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 	if got := strings.Count(egress, "faketcp_egress_admission_checkpoint("); got != 1 {
 		t.Fatalf("TC non-GSO checkpoint calls=%d, want exactly one", got)
 	}
-	l3Gate := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	egressParse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
+	l3Gate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
 	prepare := strings.Index(egress, "if (faketcp_prepare_udp(")
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
-	typeWord := strings.Index(egress, "update_type_word(skb, &info, old_wire, new_wire, 1)")
+	typeWord := strings.Index(egress, "update_type_word(skb, info, old_wire, new_wire, 1)")
 	xorDispatch := strings.Index(egress, "bpf_tail_call(skb, &xor_egress_programs")
 	directEncode := strings.Index(egress, "return faketcp_encode_established(")
-	if l3Gate < 0 || prepare < 0 || checkpoint < 0 || typeWord < 0 || xorDispatch < 0 || directEncode < 0 ||
-		!(l3Gate < prepare && prepare < checkpoint && checkpoint < typeWord && typeWord < xorDispatch && typeWord < directEncode) {
+	if egressParse < 0 || l3Gate < 0 || prepare < 0 || checkpoint < 0 || typeWord < 0 || xorDispatch < 0 || directEncode < 0 ||
+		!(egressParse < l3Gate && l3Gate < prepare && prepare < checkpoint && checkpoint < typeWord && typeWord < xorDispatch && typeWord < directEncode) {
 		t.Fatal("TC fixed-IPv4 and unified prepare gates must precede the proof which dominates every non-GSO transform")
 	}
 
