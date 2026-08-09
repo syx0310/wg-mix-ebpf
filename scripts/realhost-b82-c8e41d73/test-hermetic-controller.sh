@@ -17,6 +17,19 @@ readonly REALNIC_ROOT="${REPOSITORY}/scripts/realhost-b82-acceptance-v1"
 readonly REALNIC="${REALNIC_ROOT}/realnic_acceptance.py"
 readonly REALNIC_TEST="${REALNIC_ROOT}/test_realnic_acceptance.py"
 readonly REALNIC_STATIC_TEST="${REALNIC_ROOT}/test_realnic_acceptance_static.py"
+readonly REALNIC_INTEGRATION_MERGE='7621f84df30b52428abed1988c6c1800cc7d1768'
+readonly REALNIC_STAGE_B_PARENT='9284344e58f949efb98be963438a173499791669'
+readonly REVIEWED_CANONICAL_PARENT='d28585bfaaefe44c0e71d2cbbced494da96dd7fa'
+readonly -a REALNIC_INTEGRATION_FILES=(
+  scripts/realhost-b82-acceptance-v1/realnic_acceptance.py
+  scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py
+  scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py
+  scripts/realhost-b82-c8e41d73/bind-final-package.sh
+  scripts/realhost-b82-c8e41d73/controller.sh
+  scripts/realhost-b82-c8e41d73/locked-transport.exp
+  scripts/realhost-b82-c8e41d73/prepare-stage-root.sh
+  scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh
+)
 readonly MODULE_LEASE_HELPER="${REVIEW_ROOT}/checksum-module-lease.sh"
 readonly PROVISION_POLICY_TEST="${REVIEW_ROOT}/test_provision_policy.tcl"
 readonly PROVISIONER="${REPOSITORY}/scripts/provision-ubuntu-test-host.sh"
@@ -92,6 +105,19 @@ for path in "${BINDER}" "${CONTROLLER}" "${TRANSPORT}" "${STAGER}" "${MATRIX}" \
   "${MODULE_LEASE_HELPER}" "${PROVISION_POLICY_TEST}" "${PROVISIONER}"; do
   [[ -f "${path}" && ! -L "${path}" ]] || fail "review input is not a regular file: ${path}"
 done
+
+REALNIC_INTEGRATION_PARENTS="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P \
+  "${REALNIC_INTEGRATION_MERGE}")" || fail 'cannot read realNIC integration parents'
+readonly REALNIC_INTEGRATION_PARENTS
+[[ "${REALNIC_INTEGRATION_PARENTS}" == \
+  "${REALNIC_STAGE_B_PARENT} ${REVIEWED_CANONICAL_PARENT}" ]] ||
+  fail 'realNIC integration does not preserve the exact two-parent topology'
+/usr/bin/git -C "${REPOSITORY}" merge-base --is-ancestor \
+  "${REALNIC_INTEGRATION_MERGE}" HEAD || fail 'HEAD does not contain the realNIC integration merge'
+/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
+  "${REALNIC_INTEGRATION_MERGE}^1" "${REALNIC_INTEGRATION_MERGE}" -- \
+  "${REALNIC_INTEGRATION_FILES[@]}" ||
+  fail 'canonical merge rewrote a Stage B authority or manifest source blob'
 
 /bin/bash -n "${BINDER}" "${CONTROLLER}" "${STAGER}" "${MODULE_LEASE_HELPER}" \
   "${PROVISIONER}" "$0" || fail 'Bash syntax gate'
@@ -188,6 +214,33 @@ BOUND_MANIFEST_SHA="$(sha256_file "${BOUND_MANIFEST}")" || fail 'manifest digest
 [[ "$(sha256_file "${BOUND_OUTPUT}/provision-ubuntu-test-host.sh")" == \
   "$(manifest_value provision_ubuntu_test_host_sh_sha256 "${BOUND_MANIFEST}")" ]] ||
   fail 'provisioner package digest binding'
+readonly -a REALNIC_MANIFEST_KEYS=(
+  realnic_acceptance_py
+  test_realnic_acceptance_py
+  test_realnic_acceptance_static_py
+)
+readonly -a REALNIC_MANIFEST_PATHS=(
+  scripts/realhost-b82-acceptance-v1/realnic_acceptance.py
+  scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py
+  scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py
+)
+readonly -a REALNIC_PACKAGE_NAMES=(
+  realnic_acceptance.py
+  test_realnic_acceptance.py
+  test_realnic_acceptance_static.py
+)
+for index in 0 1 2; do
+  key="${REALNIC_MANIFEST_KEYS[${index}]}"
+  source_file="${REALNIC_MANIFEST_PATHS[${index}]}"
+  package_name="${REALNIC_PACKAGE_NAMES[${index}]}"
+  expected_blob="$(/usr/bin/git -C "${FIXTURE_REPOSITORY}" rev-parse \
+    "${FIXTURE_COMMIT}:${source_file}")" || fail 'realNIC source blob lookup'
+  [[ "$(manifest_value "${key}_path" "${BOUND_MANIFEST}")" == "${source_file}" &&
+    "$(manifest_value "${key}_blob" "${BOUND_MANIFEST}")" == "${expected_blob}" &&
+    "$(sha256_file "${BOUND_OUTPUT}/${package_name}")" == \
+      "$(manifest_value "${key}_sha256" "${BOUND_MANIFEST}")" ]] ||
+    fail "realNIC manifest triplet is not bound to source blob: ${source_file}"
+done
 [[ "$(manifest_value format "${BOUND_MANIFEST}")" == 'wg-mix-ebpf-b82-v6-package-v3' &&
   "$(manifest_value physical_nic_forward_authority "${BOUND_MANIFEST}")" == \
     'realnic-acceptance-v1' &&
@@ -205,9 +258,7 @@ BOUND_MANIFEST_SHA="$(sha256_file "${BOUND_MANIFEST}")" || fail 'manifest digest
   "$(sha256_file "${BOUND_OUTPUT}/root-fresh-verifier-gate.sh")" == \
     "$(manifest_value root_fresh_verifier_gate_sh_sha256 "${BOUND_MANIFEST}")" &&
   "$(manifest_value realnic_acceptance_py_path "${BOUND_MANIFEST}")" == \
-    'scripts/realhost-b82-acceptance-v1/realnic_acceptance.py' &&
-  "$(sha256_file "${BOUND_OUTPUT}/realnic_acceptance.py")" == \
-    "$(manifest_value realnic_acceptance_py_sha256 "${BOUND_MANIFEST}")" ]] ||
+    'scripts/realhost-b82-acceptance-v1/realnic_acceptance.py' ]] ||
   fail 'single-schema fresh/realNIC authority binding'
 /usr/bin/git -C "${BOUND_OUTPUT}/history-verification.git" fsck --full --strict --no-dangling \
   "${FIXTURE_COMMIT}" || fail 'isolated history fsck'
