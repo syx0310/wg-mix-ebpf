@@ -373,10 +373,11 @@ func (c *Controller) HandleSample(ctx context.Context, sample []byte) ([]Action,
 	if err != nil {
 		return nil, err
 	}
-	return c.handleOwnedDecodedEvent(ctx, ownedDecodedEvent{
-		Event: decoded.Event, Packet: decoded.Packet,
-		Fingerprint: sha256.Sum256(sample),
-	})
+	owned := ownedDecodedEvent{Event: decoded.Event, Packet: decoded.Packet}
+	if decoded.Event.Type == abi.FakeTCPEventNeedHandshake {
+		owned.Fingerprint = sha256.Sum256(sample)
+	}
+	return c.handleOwnedDecodedEvent(ctx, owned)
 }
 
 // handleOwnedEvent is the private production boundary selected when the
