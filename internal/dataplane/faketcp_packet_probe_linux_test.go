@@ -62,16 +62,31 @@ type fakeTCPSKBContext struct {
 	HardwareStamp  uint64
 }
 
+type fakeTCPXDPContext struct {
+	Data           uint32
+	DataEnd        uint32
+	DataMeta       uint32
+	IngressIfindex uint32
+	RXQueueIndex   uint32
+	EgressIfindex  uint32
+}
+
 func TestFakeTCPSKBContextLayout(t *testing.T) {
 	if got, want := binary.Size(fakeTCPSKBContext{}), 192; got != want {
 		t.Fatalf("serialized __sk_buff context size=%d, want %d", got, want)
 	}
 }
 
+func TestFakeTCPXDPContextLayout(t *testing.T) {
+	if got, want := binary.Size(fakeTCPXDPContext{}), 24; got != want {
+		t.Fatalf("serialized xdp_md context size=%d, want %d", got, want)
+	}
+}
+
 // TestFakeTCPBPFPacketProbe verifier-loads the separately built experimental
-// object, populates only in-memory maps, and invokes the TC egress program with
-// BPF_PROG_TEST_RUN. It never attaches or pins a program. The test-run ABI
-// cannot synthesize ip_summed/csum_start/csum_offset or skb_dst. The unified
+// object, populates only in-memory maps, and invokes the TC egress and XDP
+// ingress programs with BPF_PROG_TEST_RUN. It never attaches or pins a program.
+// The test-run ABI cannot synthesize ip_summed/csum_start/csum_offset or skb_dst. The unified
 // prepare contract must therefore reject its otherwise materialized
 // CHECKSUM_NONE skb as route-PMTU-unknown before mutation. Success belongs only
 // to routed real-TC evidence. This probe covers verifier loading, the no-route
@@ -132,6 +147,7 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 		t.Fatal("experimental object has no wg_mix_egress program")
 	}
 	populateFakeTCPPacketProbeTailCalls(t, collection, generation)
+	probeFakeTCPXDPParserModes(t, collection, generation, wgID, ifindex, remotePort)
 
 	const (
 		fakeTCPStatBadPacket           = uint32(4)
@@ -256,6 +272,105 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 			t.Fatalf("GSO-reject stat delta=%d, want 1", after-before)
 		}
 	})
+}
+
+func probeFakeTCPXDPParserModes(
+	t *testing.T,
+	collection *ebpf.Collection,
+	generation uint64,
+	wgID uint32,
+	ifindex uint32,
+	destinationPort uint16,
+) {
+	t.Helper()
+	program := collection.Programs["wg_mix_faketcp_ingress"]
+	if program == nil {
+		t.Fatal("experimental object has no wg_mix_faketcp_ingress program")
+	}
+	for _, update := range []struct {
+		mapName string
+		key     any
+		value   any
+	}{
+		{
+			mapName: "control_map",
+			key:     abi.ControlKeyGlobal,
+			value: abi.ControlValue{
+				ActiveGeneration: generation,
+				ABIVersion:       abi.Version,
+			},
+		},
+		{
+			mapName: "faketcp_managed_if_map",
+			key: abi.FakeTCPManagedIfKey{
+				Generation: generation, UnderlayIndex: ifindex,
+			},
+			value: abi.FakeTCPManagedIfValue{Generation: generation},
+		},
+		{
+			mapName: "faketcp_managed_port_map",
+			key: abi.FakeTCPManagedPortKey{
+				Generation: generation, UnderlayIndex: ifindex,
+				DestinationPort: destinationPort,
+			},
+			value: abi.FakeTCPManagedPortValue{
+				Generation: generation, WGID: wgID, Action: abi.ActionRewrite,
+			},
+		},
+	} {
+		m := collection.Maps[update.mapName]
+		if m == nil {
+			t.Fatalf("experimental object has no %s map", update.mapName)
+		}
+		if err := m.Update(update.key, update.value, ebpf.UpdateAny); err != nil {
+			t.Fatalf("populate %s: %v", update.mapName, err)
+		}
+	}
+
+	ethernet, _ := buildFakeTCPProbeUDPPacket(t, 31001, destinationPort, 32)
+	rawL3 := append([]byte(nil), ethernet[14:]...)
+	const (
+		xdpDrop = uint32(1)
+		xdpPass = uint32(2)
+	)
+	for _, test := range []struct {
+		name   string
+		parser uint8
+		packet []byte
+		want   uint32
+	}{
+		{name: "ethernet/ethernet", parser: abi.ParserEthernet, packet: ethernet, want: xdpDrop},
+		{name: "ethernet/raw-l3", parser: abi.ParserEthernet, packet: rawL3, want: xdpPass},
+		{name: "l3/raw-l3", parser: abi.ParserL3, packet: rawL3, want: xdpDrop},
+		{name: "l3/ethernet", parser: abi.ParserL3, packet: ethernet, want: xdpDrop},
+	} {
+		t.Run("XDP parser "+test.name, func(t *testing.T) {
+			underlayMap := collection.Maps["underlay_config_map"]
+			if underlayMap == nil {
+				t.Fatal("experimental object has no underlay_config_map")
+			}
+			key := abi.UnderlayConfigKey{Generation: generation, UnderlayIndex: ifindex}
+			value := abi.UnderlayConfigValue{Generation: generation, ParserMode: test.parser}
+			if err := underlayMap.Update(key, value, ebpf.UpdateAny); err != nil {
+				t.Fatalf("select parser mode %d: %v", test.parser, err)
+			}
+			result, output, err := runFakeTCPPacketProbe(
+				program,
+				test.packet,
+				fakeTCPXDPContext{IngressIfindex: ifindex},
+				len(test.packet)+64,
+			)
+			if err != nil {
+				t.Fatalf("BPF_PROG_TEST_RUN parser mode %d: %v", test.parser, err)
+			}
+			if result != test.want {
+				t.Fatalf("XDP action=%d, want %d", result, test.want)
+			}
+			if !bytes.Equal(output, test.packet) {
+				t.Fatal("parser-policy probe mutated the packet")
+			}
+		})
+	}
 }
 
 func readFakeTCPPacketProbeStat(

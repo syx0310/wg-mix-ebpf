@@ -67,6 +67,36 @@ func TestClassifyManagedIngressFrameFailClosedMatrix(t *testing.T) {
 	}
 }
 
+func TestClassifyManagedIngressL3FailClosedMatrix(t *testing.T) {
+	managed := ManagedIngressPolicy{
+		InterfaceManaged: true,
+		Ports:            map[uint16]struct{}{443: {}},
+	}
+	tests := []struct {
+		name   string
+		packet []byte
+		policy ManagedIngressPolicy
+		want   IngressDisposition
+	}{
+		{name: "IPv4 fixed TCP", packet: testIPv4(5, L3ProtocolTCP, 0, testTCPWithDestination(5, 443)), policy: managed, want: IngressDecodeIPv4},
+		{name: "IPv4 native UDP", packet: testIPv4(5, L3ProtocolUDP, 0, testUDP(1, 443, nil)), policy: managed, want: IngressDrop},
+		{name: "IPv4 options", packet: testIPv4(6, L3ProtocolTCP, 0, testTCPWithDestination(5, 443)), policy: managed, want: IngressDrop},
+		{name: "IPv4 first fragment", packet: testIPv4(5, L3ProtocolTCP, 0x2000, testTCPWithDestination(5, 443)), policy: managed, want: IngressDrop},
+		{name: "IPv6 fixed TCP", packet: testIPv6(L3ProtocolTCP, testTCPWithDestination(5, 443)), policy: managed, want: IngressDrop},
+		{name: "IPv6 ICMP bypass", packet: testIPv6(L3ProtocolICMPv6, make([]byte, 8)), policy: managed, want: IngressPass},
+		{name: "unmanaged port", packet: testIPv4(5, L3ProtocolTCP, 0, testTCPWithDestination(5, 444)), policy: managed, want: IngressPass},
+		{name: "truncated managed interface", packet: []byte{0x45}, policy: managed, want: IngressDrop},
+		{name: "malformed unmanaged interface", packet: []byte{0x10}, policy: ManagedIngressPolicy{}, want: IngressPass},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			if got := ClassifyManagedIngressL3(test.packet, test.policy); got != test.want {
+				t.Fatalf("disposition = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
 func TestManagedFakeTCPTransformStatusNarrowsGenericParser(t *testing.T) {
 	tests := []struct {
 		name          string
@@ -246,6 +276,12 @@ func testIPv4ProtocolFrame(protocol byte) []byte {
 	frame := testIPv4TCPFrame(0, 5, 5, 0, 444)
 	frame[14+9] = protocol
 	return frame
+}
+
+func testTCPWithDestination(dataOffsetWords byte, destination uint16) []byte {
+	packet := testTCP(dataOffsetWords, nil)
+	binary.BigEndian.PutUint16(packet[2:4], destination)
+	return packet
 }
 
 func testEthernetPrefix(vlanDepth int, etherType uint16) []byte {
