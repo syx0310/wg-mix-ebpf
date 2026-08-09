@@ -20,6 +20,9 @@ readonly BASELINE_SHA='ccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
 readonly MODULE_SHA='dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
 readonly BASE_COMMIT='3ea1cf0272197d580e90d51c8997352e79c47ba9'
 readonly LOCKED_STANDALONE='scripts/realhost-b82-c8e41d73/root-veth-n-r.sh'
+readonly STANDALONE_LEASE_SCOPE='1c4102b96d28657b60ee58314c7088069c59eea9'
+readonly STANDALONE_LEASE_ADAPTER='e5757dc8063aec13c3fb8793cb4bcb2ed14dcc1e'
+readonly STANDALONE_LEASE_RUNNER_BLOB='35d62e78f8bb9d410b22f86d734740fab1c36855'
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
@@ -52,8 +55,28 @@ else
   printf 'SKIP: shellcheck unavailable locally; .82 execution remains shellcheck-gated\n'
 fi
 
-/usr/bin/git -C "${REPOSITORY}" diff --exit-code "${BASE_COMMIT}" -- "${LOCKED_STANDALONE}" ||
-  fail 'new routed harness changed the reviewer-locked standalone runner'
+ADAPTER_PARENT="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P "${STANDALONE_LEASE_ADAPTER}")" ||
+  fail 'cannot read standalone lease adapter parent'
+readonly ADAPTER_PARENT
+[[ "${ADAPTER_PARENT}" == "${STANDALONE_LEASE_SCOPE}" ]] ||
+  fail 'standalone lease adapter does not descend directly from its exact scope commit'
+/usr/bin/git -C "${REPOSITORY}" merge-base --is-ancestor \
+  "${STANDALONE_LEASE_ADAPTER}" HEAD || fail 'standalone lease adapter is not in bound history'
+/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
+  "${BASE_COMMIT}" "${STANDALONE_LEASE_ADAPTER}^" -- "${LOCKED_STANDALONE}" ||
+  fail 'pre-adapter routed history changed the reviewer-locked standalone runner'
+ADAPTER_PATHS="$(/usr/bin/git -C "${REPOSITORY}" diff --name-only \
+  "${STANDALONE_LEASE_ADAPTER}^" "${STANDALONE_LEASE_ADAPTER}")" ||
+  fail 'cannot read standalone lease adapter write set'
+readonly ADAPTER_PATHS
+[[ "${ADAPTER_PATHS}" == $'scripts/realhost-b82-c8e41d73/root-veth-n-r.sh\nscripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh\nscripts/realhost-b82-c8e41d73/test_veth_runner_static.py' ]] ||
+  fail 'standalone lease adapter changed an unexpected path'
+[[ "$(/usr/bin/git -C "${REPOSITORY}" rev-parse \
+  "${STANDALONE_LEASE_ADAPTER}:${LOCKED_STANDALONE}")" == "${STANDALONE_LEASE_RUNNER_BLOB}" ]] ||
+  fail 'standalone lease adapter runner blob drifted'
+/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
+  "${STANDALONE_LEASE_ADAPTER}" HEAD -- "${LOCKED_STANDALONE}" ||
+  fail 'standalone lease runner changed after its reviewed adapter commit'
 
 readonly -a RUNNER_ARGS=(
   --source "${SOURCE}"
