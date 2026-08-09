@@ -92,7 +92,7 @@ func (reader *productionEventReader) Read() (EventRecord, error) {
 		return EventRecord{}, readErr
 	}
 
-	decoded, err := DecodeEventSample(record.RawSample)
+	decoded, err := decodeBorrowedEventSample(record.RawSample)
 	if err != nil {
 		return EventRecord{}, fmt.Errorf("validate ordered faketcp event: %w", err)
 	}

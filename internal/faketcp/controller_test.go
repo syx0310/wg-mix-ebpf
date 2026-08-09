@@ -261,6 +261,26 @@ func TestDecodeEventSampleAcceptsCompactAndFixedPacketRecords(t *testing.T) {
 	}
 }
 
+func TestDecodeEventSampleOwnsPacket(t *testing.T) {
+	flow := testFlow(31001)
+	packet := testIPv4UDPPacket(t, flow, []byte{9, 8, 7})
+	event := abi.FakeTCPEvent{
+		Key: flow, PayloadLength: 3, PacketLength: uint16(len(packet)),
+		Type: abi.FakeTCPEventNeedHandshake,
+	}
+	bindTestEvent(&event, testRuntimeIdentity(flow.Generation), 1)
+	sample := testBoundEventSample(event, packet, false)
+	decoded, err := DecodeEventSample(sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := decoded.Packet[0]
+	sample[fakeTCPEventSize] ^= 0xff
+	if decoded.Packet[0] != want {
+		t.Fatal("decoded packet aliases its input sample")
+	}
+}
+
 func TestDecodeEventSampleAcceptsCompactAndFixedCloseRecords(t *testing.T) {
 	engine, _, flow, state := establishedControlTestSession(t)
 	for _, flags := range []uint8{FlagRST | FlagACK, FlagFIN | FlagACK} {
