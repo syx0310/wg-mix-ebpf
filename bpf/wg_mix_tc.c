@@ -1685,7 +1685,6 @@ static __always_inline int run_xor_egress_segment(struct __sk_buff *skb, __u32 s
 		return xor_dispatch_fail(skb, STAT_XOR_EGRESS_DISPATCH_ERROR);
 	}
 
-	clear_xor_context(skb);
 	inc_stat(STAT_XOR_EGRESS_OK);
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
 	if (context.continue_faketcp) {
@@ -1694,6 +1693,7 @@ static __always_inline int run_xor_egress_segment(struct __sk_buff *skb, __u32 s
 		return xor_dispatch_fail(skb, STAT_XOR_EGRESS_DISPATCH_ERROR);
 	}
 #endif
+	clear_xor_context(skb);
 	inc_stat(STAT_EGRESS_REWRITE_OK);
 	if (skb->gso_segs || skb->gso_size)
 		inc_stat(STAT_EGRESS_GSO_REWRITE_OK);
@@ -1780,6 +1780,9 @@ int wg_mix_egress(struct __sk_buff *skb)
 	struct managed_fwmark_value *managed;
 	struct profile_key profile_key = {};
 	struct profile_value *profile;
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	struct faketcp_egress_admission faketcp_admission = {};
+#endif
 	__u64 generation = 0;
 	__u32 old_wire = 0;
 	__u32 old_type = 0;
@@ -1865,12 +1868,19 @@ int wg_mix_egress(struct __sk_buff *skb)
 		}
 	}
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
-	// Validate the unmodified WireGuard packet and all referenced policy
-	// objects before consuming bounded slow-path capacity. Capture still
-	// precedes type-word rewrite, XOR and FakeTCP encoding.
-	if (rule->transport_mode == TRANSPORT_FAKETCP &&
-	    faketcp_preflight_egress(skb, &info, rule, generation) < 0)
-		return TC_ACT_SHOT;
+	// The single admission checkpoint validates the unmodified packet and the
+	// complete managed type-word/XOR/FakeTCP composition. Checksum metadata is
+	// normalized only after that proof and still before any packet-byte write.
+	if (rule->transport_mode == TRANSPORT_FAKETCP) {
+		if (faketcp_egress_admission_checkpoint(
+			    skb, &info, managed, rule, profile, generation, rc,
+			    &faketcp_admission) != FAKETCP_ADMISSION_TRANSFORM)
+			return TC_ACT_SHOT;
+		if (faketcp_inspect_and_reset_udp_checksum(
+			    skb, info.ip_off, info.udp_off,
+			    info.payload_len + sizeof(struct udphdr)) < 0)
+			return TC_ACT_SHOT;
+	}
 	continue_faketcp = rule->transport_mode == TRANSPORT_FAKETCP;
 #endif
 	new_wire = wg_cpu_to_le32(profile->standard_to_mixed[kind]);
@@ -1924,7 +1934,8 @@ int wg_mix_egress(struct __sk_buff *skb)
 	}
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
 	if (rule->transport_mode == TRANSPORT_FAKETCP)
-		return faketcp_encode_established(skb, &info, rule, generation);
+		return faketcp_encode_established(skb, &info, rule, generation,
+						  &faketcp_admission);
 #endif
 	inc_stat(STAT_EGRESS_REWRITE_OK);
 	if (rule->transport_mode == TRANSPORT_ICMP)
@@ -2041,13 +2052,6 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		inc_stat(STAT_INGRESS_RULE_MISS);
 		return TC_ACT_OK;
 	}
-#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
-	if (listener->transport_mode == TRANSPORT_FAKETCP &&
-	    !faketcp_metadata_valid(skb, generation)) {
-		inc_faketcp_stat(FAKETCP_STAT_METADATA_ERROR);
-		return TC_ACT_SHOT;
-	}
-#endif
 	if (gso_seen)
 		inc_stat(STAT_INGRESS_GSO_LISTENER_HIT);
 	if (parse_result_is_fragment(rc)) {
@@ -2077,6 +2081,12 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		inc_stat(STAT_INGRESS_RULE_MISS);
 		return TC_ACT_SHOT;
 	}
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	if (listener->transport_mode == TRANSPORT_FAKETCP &&
+	    faketcp_consume_ingress_admission(skb, &info, listener,
+					      generation) < 0)
+		return TC_ACT_SHOT;
+#endif
 	cipher_id = listener->cipher_id;
 	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0) {
 		inc_stat(STAT_SKB_LOAD_ERROR);

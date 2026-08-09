@@ -75,7 +75,24 @@ enum faketcp_stat_id {
 	FAKETCP_STAT_CHECKSUM_PARTIAL_RESET,
 	FAKETCP_STAT_CHECKSUM_STATE_REJECT,
 	FAKETCP_STAT_MTU_REJECT,
+	FAKETCP_STAT_ADMISSION_ACCEPT,
+	FAKETCP_STAT_ADMISSION_BYPASS_REJECT,
 	FAKETCP_STAT_MAX,
+};
+
+#define FAKETCP_ADMISSION_F_TYPE_WORD      (1U << 0)
+#define FAKETCP_ADMISSION_F_XOR            (1U << 1)
+#define FAKETCP_ADMISSION_F_HEADER_REWRITE (1U << 2)
+#define FAKETCP_ADMISSION_F_WIRE           (1U << 3)
+#define FAKETCP_ADMISSION_REQUIRED_FEATURES \
+	(FAKETCP_ADMISSION_F_TYPE_WORD | FAKETCP_ADMISSION_F_HEADER_REWRITE | \
+	 FAKETCP_ADMISSION_F_WIRE)
+
+enum faketcp_admission_decision {
+	FAKETCP_ADMISSION_DROP = 0,
+	FAKETCP_ADMISSION_TRANSFORM = 1,
+	FAKETCP_ADMISSION_CONTROL = 2,
+	FAKETCP_ADMISSION_KEEPALIVE = 3,
 };
 
 struct faketcp_session_key {
@@ -98,6 +115,18 @@ struct faketcp_session_value {
 	__u8 state;
 	__u8 flags;
 	__u8 pad[4];
+};
+
+// A proof is stack-local on the direct path. The XOR continuation receives a
+// single-use projection through skb->cb and reconstructs this proof only after
+// consuming that token. It deliberately contains no mutable session pointer.
+struct faketcp_egress_admission {
+	struct faketcp_session_key key;
+	__u32 feature_mask;
+	__u32 cipher_id;
+	__u32 payload_len;
+	__u8 direction;
+	__u8 pad[3];
 };
 
 _Static_assert(sizeof(struct faketcp_session_key) == 24,
@@ -153,7 +182,24 @@ _Static_assert(sizeof(struct faketcp_runtime_identity_value) == 32,
 struct faketcp_metadata {
 	__u32 magic;
 	__u32 generation_low;
+	__u32 generation_high;
+	__be32 local_ipv4;
+	__be32 remote_ipv4;
+	__u32 underlay_index;
+	__u16 local_port;
+	__u16 remote_port;
+	__u8 direction;
+	__u8 feature_mask;
+	__u16 pad;
 };
+
+#define FAKETCP_DIRECTION_EGRESS 1
+#define FAKETCP_DIRECTION_INGRESS 2
+#define FAKETCP_ADMISSION_XDP_FEATURES \
+	(FAKETCP_ADMISSION_F_HEADER_REWRITE | FAKETCP_ADMISSION_F_WIRE)
+
+_Static_assert(sizeof(struct faketcp_metadata) == 32,
+	       "faketcp metadata ABI drift");
 
 struct faketcp_pseudo_tail {
 	__u8 zero;
@@ -646,14 +692,57 @@ static __always_inline int faketcp_capture_first_packet(struct __sk_buff *skb,
 	return 0;
 }
 
-static __always_inline int faketcp_preflight_egress(struct __sk_buff *skb,
-						     const struct packet_info *info,
-						     const struct egress_rule_value *rule,
-						     __u64 generation)
+// This is the only TC egress admission checkpoint. It is deliberately pure
+// with respect to packet bytes and checksum metadata: policy, parser output,
+// direction, exact flow generation, bounds and the complete transform
+// composition are proven before checksum normalization, capture, type-word,
+// XOR or FakeTCP header mutation. A missing session may emit one bounded
+// pre-transform capture, but the packet itself is always dropped unchanged.
+static __always_inline int faketcp_egress_admission_checkpoint(
+	struct __sk_buff *skb,
+	const struct packet_info *info,
+	const struct managed_fwmark_value *managed,
+	const struct egress_rule_value *rule,
+	const struct profile_value *profile,
+	__u64 generation,
+	int parser_classification,
+	struct faketcp_egress_admission *admission)
 {
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct iphdr *iph = data + info->ip_off;
+	struct udphdr *udp = data + info->udp_off;
 	struct faketcp_session_key key = {};
 	struct faketcp_session_value *session;
+	struct cipher_value *cipher;
+	__u32 feature_mask = FAKETCP_ADMISSION_REQUIRED_FEATURES;
+	__u32 xor_target = 0;
 	__u32 old_total_len;
+	__u16 udp_len;
+
+	__builtin_memset(admission, 0, sizeof(*admission));
+	if (parser_classification != PARSE_OK || info->family != FAMILY_IPV4 ||
+	    (void *)(iph + 1) > data_end || (void *)(udp + 1) > data_end ||
+	    iph->version != 4 || iph->ihl != 5 || iph->protocol != IPPROTO_UDP) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return FAKETCP_ADMISSION_DROP;
+	}
+	if (!managed || !rule || !profile || generation == 0 ||
+	    managed->generation != generation || rule->generation != generation ||
+	    profile->generation != generation || rule->action != ACTION_REWRITE ||
+	    rule->transport_mode != TRANSPORT_FAKETCP) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+		return FAKETCP_ADMISSION_DROP;
+	}
+	if (rule->cipher_id != 0) {
+		cipher = lookup_cipher(rule->cipher_id, generation);
+		if (!cipher || xor_payload_target((struct packet_info *)info, cipher,
+					       &xor_target) < 0) {
+			inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+			return FAKETCP_ADMISSION_DROP;
+		}
+		feature_mask |= FAKETCP_ADMISSION_F_XOR;
+	}
 
 	// A UDP GSO skb represents several future wire packets, but this hook is
 	// invoked only once for the aggregate. One header insertion cannot provide
@@ -663,37 +752,48 @@ static __always_inline int faketcp_preflight_egress(struct __sk_buff *skb,
 	// gate, not an implementation of per-segment FakeTCP.
 	if (skb->gso_segs || skb->gso_size) {
 		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
-		return -1;
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return FAKETCP_ADMISSION_DROP;
 	}
-	if (info->payload_len > FAKETCP_MAX_IPV4_TOTAL_LEN -
+	if (info->payload_len < FAKETCP_HEADER_DELTA ||
+	    info->payload_len > FAKETCP_MAX_IPV4_TOTAL_LEN -
 				 sizeof(struct iphdr) - sizeof(struct udphdr)) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
-		return -1;
+		return FAKETCP_ADMISSION_DROP;
 	}
 	old_total_len = sizeof(struct iphdr) + sizeof(struct udphdr) +
 			info->payload_len;
-	if (info->ip_off > skb->len || old_total_len != skb->len - info->ip_off) {
+	udp_len = bpf_ntohs(udp->len);
+	if (info->ip_off > skb->len || old_total_len != skb->len - info->ip_off ||
+	    bpf_ntohs(iph->tot_len) != old_total_len ||
+	    udp_len != sizeof(*udp) + info->payload_len) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
-		return -1;
+		return FAKETCP_ADMISSION_DROP;
 	}
-	if (faketcp_tc_key(skb, info, generation, &key) < 0)
-		return -1;
+	if (faketcp_tc_key(skb, info, generation, &key) < 0) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return FAKETCP_ADMISSION_DROP;
+	}
 	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
 	if (session && session->generation == generation &&
 	    session->state == FAKETCP_STATE_ESTABLISHED) {
-		if (faketcp_inspect_and_reset_udp_checksum(
-			    skb, info->ip_off, info->udp_off,
-			    info->payload_len + sizeof(struct udphdr)) < 0)
-			return -1;
-		return 0;
+		admission->key = key;
+		admission->feature_mask = feature_mask;
+		admission->cipher_id = rule->cipher_id;
+		admission->payload_len = info->payload_len;
+		admission->direction = FAKETCP_DIRECTION_EGRESS;
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT);
+		return FAKETCP_ADMISSION_TRANSFORM;
 	}
-	if (session)
+	if (session) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
-	else
+		return FAKETCP_ADMISSION_DROP;
+	} else {
 		inc_faketcp_stat(FAKETCP_STAT_SESSION_MISS);
+	}
 	if (faketcp_capture_first_packet(skb, info, rule, &key) < 0)
 		inc_faketcp_stat(FAKETCP_STAT_EVENT_ERROR);
-	return -1;
+	return FAKETCP_ADMISSION_DROP;
 }
 
 static __always_inline __s64 faketcp_rotation_checksum(const __u8 head[FAKETCP_HEADER_DELTA],
@@ -820,13 +920,13 @@ static __always_inline int faketcp_materialize_tcp_checksum(
 static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 						       struct packet_info *info,
 						       struct egress_rule_value *rule,
-						       __u64 generation)
+						       __u64 generation,
+						       const struct faketcp_egress_admission *admission)
 {
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
 	struct iphdr *iph = data + info->ip_off;
 	struct udphdr *udp = data + info->udp_off;
-	struct faketcp_session_key key = {};
 	struct faketcp_session_value *session;
 	struct udphdr old_udp;
 	struct tcphdr tcp = {};
@@ -835,23 +935,20 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	__be32 source_ipv4, destination_ipv4;
 	__u32 seq;
 
-	if (rule->transport_mode != TRANSPORT_FAKETCP || info->family != FAMILY_IPV4 ||
-	    info->payload_len < FAKETCP_HEADER_DELTA ||
+	if (!admission || admission->key.generation != generation ||
+	    admission->direction != FAKETCP_DIRECTION_EGRESS ||
+	    admission->cipher_id != rule->cipher_id ||
+	    admission->payload_len != info->payload_len ||
+	    admission->feature_mask !=
+		(FAKETCP_ADMISSION_REQUIRED_FEATURES |
+		 (admission->cipher_id ? FAKETCP_ADMISSION_F_XOR : 0)) ||
 	    (void *)(iph + 1) > data_end || (void *)(udp + 1) > data_end) {
-		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
 	}
-	if (skb->gso_segs || skb->gso_size) {
-		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
-		return TC_ACT_SHOT;
-	}
-	if (faketcp_tc_key(skb, info, generation, &key) < 0) {
-		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
-		return TC_ACT_SHOT;
-	}
-	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
+	session = bpf_map_lookup_elem(&faketcp_session_map, &admission->key);
 	if (!session || session->generation != generation) {
-		// The preflight hook is the only place allowed to emit the handshake request
+		// The checkpoint is the only place allowed to emit the handshake request
 		// because it still owns the unmodified first packet. A map eviction in
 		// this narrow post-transform race is a deliberate drop; WireGuard/QUIC
 		// retransmission re-enters preflight with a capturable packet.
@@ -940,10 +1037,20 @@ static __always_inline int faketcp_continue_egress(struct __sk_buff *skb)
 	struct packet_info info = {};
 	struct egress_rule_key key = {};
 	struct egress_rule_value *rule;
+	struct faketcp_egress_admission admission = {};
+	struct xor_context proof = {};
 	__u64 generation = 0;
 
-	if (!active_generation(&generation) || parse_packet(skb, &info, generation) != PARSE_OK)
+	if (load_xor_context(skb, &proof) < 0 || !proof.continue_faketcp) {
+		clear_xor_context(skb);
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
+	}
+	clear_xor_context(skb);
+	if (!active_generation(&generation) || parse_packet(skb, &info, generation) != PARSE_OK) {
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
+		return TC_ACT_SHOT;
+	}
 	key.generation = generation;
 	key.fwmark = skb->mark;
 	key.underlay_index = skb->ifindex;
@@ -955,11 +1062,23 @@ static __always_inline int faketcp_continue_egress(struct __sk_buff *skb)
 		rule = bpf_map_lookup_elem(&egress_rule_map, &key);
 	}
 	if (!rule || rule->generation != generation ||
-	    rule->transport_mode != TRANSPORT_FAKETCP) {
+	    rule->transport_mode != TRANSPORT_FAKETCP ||
+	    proof.generation != generation || proof.cipher_id != rule->cipher_id ||
+	    proof.payload_off != info.payload_off) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 		return TC_ACT_SHOT;
 	}
-	return faketcp_encode_established(skb, &info, rule, generation);
+	if (faketcp_tc_key(skb, &info, generation, &admission.key) < 0) {
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
+		return TC_ACT_SHOT;
+	}
+	admission.feature_mask = FAKETCP_ADMISSION_REQUIRED_FEATURES |
+				 FAKETCP_ADMISSION_F_XOR;
+	admission.cipher_id = proof.cipher_id;
+	admission.payload_len = info.payload_len;
+	admission.direction = FAKETCP_DIRECTION_EGRESS;
+	return faketcp_encode_established(skb, &info, rule, generation,
+					  &admission);
 }
 
 SEC("classifier/faketcp_egress")
@@ -968,17 +1087,56 @@ int wg_faketcp_egress(struct __sk_buff *skb)
 	return faketcp_continue_egress(skb);
 }
 
-static __always_inline int faketcp_metadata_valid(struct __sk_buff *skb,
-						   __u64 generation)
+static __always_inline int faketcp_consume_ingress_admission(
+	struct __sk_buff *skb,
+	const struct packet_info *info,
+	const struct ingress_listener_value *listener,
+	__u64 generation)
 {
 	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
 	void *meta = (void *)(long)skb->data_meta;
-	struct faketcp_metadata *value = meta;
+	struct faketcp_metadata *metadata = meta;
+	struct cipher_value *cipher;
+	struct iphdr *iph = data + info->ip_off;
+	__u32 xor_target = 0;
 
-	if (meta + sizeof(*value) > data)
-		return 0;
-	return value->magic == FAKETCP_METADATA_MAGIC &&
-	       value->generation_low == (__u32)generation;
+	if (!listener || listener->generation != generation ||
+	    listener->transport_mode != TRANSPORT_FAKETCP ||
+	    listener->action != ACTION_REWRITE ||
+	    (void *)(iph + 1) > data_end) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+		return -1;
+	}
+	if (meta + sizeof(*metadata) > data ||
+	    metadata->magic != FAKETCP_METADATA_MAGIC ||
+	    metadata->direction != FAKETCP_DIRECTION_INGRESS ||
+	    metadata->feature_mask != FAKETCP_ADMISSION_XDP_FEATURES ||
+	    metadata->pad != 0) {
+		inc_faketcp_stat(FAKETCP_STAT_METADATA_ERROR);
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
+		return -1;
+	}
+	if (metadata->generation_low != (__u32)generation ||
+	    metadata->generation_high != (__u32)(generation >> 32) ||
+	    metadata->local_ipv4 != iph->daddr ||
+	    metadata->remote_ipv4 != iph->saddr ||
+	    metadata->underlay_index != skb->ifindex ||
+	    metadata->local_port != info->dst_port ||
+	    metadata->remote_port != info->src_port) {
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
+		return -1;
+	}
+	if (listener->cipher_id != 0) {
+		cipher = lookup_cipher(listener->cipher_id, generation);
+		if (!cipher || xor_payload_target((struct packet_info *)info, cipher,
+					       &xor_target) < 0) {
+			inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+			return -1;
+		}
+	}
+	inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT);
+	return 0;
 }
 
 static __always_inline int faketcp_xdp_managed_interface(__u32 ifindex,
@@ -1091,6 +1249,113 @@ static __always_inline __u8 faketcp_event_type(__u8 flags)
 	return FAKETCP_EVENT_ACK;
 }
 
+struct faketcp_xdp_admission {
+	struct faketcp_session_key key;
+	__u32 sequence;
+	__u32 acknowledgement;
+	__u16 total_len;
+	__u16 payload_len;
+	__u8 flags;
+};
+
+// All managed FakeTCP wire packets reach this one bounded classifier before
+// xdp metadata, header, payload, checksum or tail adjustment. Non-managed
+// traffic has already taken the explicit XDP_PASS branch; every failure after
+// a managed-port match is an explicit XDP_DROP.
+static __always_inline int faketcp_xdp_admission_checkpoint(
+	struct xdp_md *xdp,
+	void *data,
+	void *data_end,
+	__u64 ip_off,
+	struct iphdr *iph,
+	struct tcphdr *tcp,
+	const struct faketcp_managed_port_value *listener,
+	int managed_interface,
+	__u64 generation,
+	struct faketcp_xdp_admission *admission,
+	struct faketcp_session_value **established_session)
+{
+	struct faketcp_session_value *session;
+	__u16 fragment_offset;
+	__u16 tcp_len;
+	__u8 flags;
+
+	__builtin_memset(admission, 0, sizeof(*admission));
+	*established_session = 0;
+	if (!managed_interface || !listener || listener->generation != generation ||
+	    listener->wg_id == 0 || listener->action != ACTION_REWRITE) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+		return FAKETCP_ADMISSION_DROP;
+	}
+	if ((void *)(iph + 1) > data_end || (void *)(tcp + 1) > data_end) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return FAKETCP_ADMISSION_DROP;
+	}
+	fragment_offset = bpf_ntohs(iph->frag_off);
+	if (iph->version != 4 || iph->ihl != 5 || iph->protocol != IPPROTO_TCP ||
+	    (fragment_offset & (IP_MF | IP_OFFSET)) || tcp->doff != 5) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return FAKETCP_ADMISSION_DROP;
+	}
+	admission->total_len = bpf_ntohs(iph->tot_len);
+	if (admission->total_len < sizeof(*iph) + sizeof(*tcp) ||
+	    admission->total_len > FAKETCP_MAX_IPV4_TOTAL_LEN +
+				   FAKETCP_HEADER_DELTA ||
+	    data + ip_off + admission->total_len > data_end) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return FAKETCP_ADMISSION_DROP;
+	}
+	tcp_len = admission->total_len - sizeof(*iph);
+	admission->payload_len = tcp_len - sizeof(*tcp);
+	flags = faketcp_tcp_flags(tcp);
+	admission->flags = flags;
+	admission->sequence = bpf_ntohl(tcp->seq);
+	admission->acknowledgement = bpf_ntohl(tcp->ack_seq);
+	admission->key = (struct faketcp_session_key){
+		.generation = generation,
+		.local_ipv4 = iph->daddr,
+		.remote_ipv4 = iph->saddr,
+		.underlay_index = xdp->ingress_ifindex,
+		.local_port = bpf_ntohs(tcp->dest),
+		.remote_port = bpf_ntohs(tcp->source),
+	};
+	if (admission->key.local_port == 0 || admission->key.remote_port == 0 ||
+	    admission->key.underlay_index == 0) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return FAKETCP_ADMISSION_DROP;
+	}
+	// Close-control authority is intentionally owned by the separate validated
+	// close topic. Until that proof lands, these flags never reach a mutation.
+	if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return FAKETCP_ADMISSION_DROP;
+	}
+	session = bpf_map_lookup_elem(&faketcp_session_map, &admission->key);
+	if (!session || session->generation != generation ||
+	    session->state != FAKETCP_STATE_ESTABLISHED) {
+		if (session)
+			inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+		else
+			inc_faketcp_stat(FAKETCP_STAT_SESSION_MISS);
+		return FAKETCP_ADMISSION_CONTROL;
+	}
+	*established_session = session;
+	if (flags & FAKETCP_FLAG_SYN)
+		return FAKETCP_ADMISSION_CONTROL;
+	if (admission->payload_len == 0 && flags == FAKETCP_FLAG_ACK) {
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT);
+		return FAKETCP_ADMISSION_KEEPALIVE;
+	}
+	if ((flags & ~(FAKETCP_FLAG_ACK | FAKETCP_FLAG_PSH)) != 0 ||
+	    !(flags & FAKETCP_FLAG_ACK) ||
+	    admission->payload_len < FAKETCP_HEADER_DELTA) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+		return FAKETCP_ADMISSION_DROP;
+	}
+	inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT);
+	return FAKETCP_ADMISSION_TRANSFORM;
+}
+
 SEC("xdp")
 int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 {
@@ -1105,6 +1370,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	struct faketcp_managed_port_value *listener = 0;
 	struct faketcp_session_key key = {};
 	struct faketcp_session_value *session;
+	struct faketcp_xdp_admission admission = {};
 	struct faketcp_metadata *metadata;
 	struct faketcp_pseudo_tail old_pseudo, new_pseudo;
 	struct tcphdr old_tcp;
@@ -1118,6 +1384,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	__u16 fragment_offset;
 	__u32 ipv4_header_length;
 	int managed_interface;
+	int admission_decision;
 
 	if (!active_generation(&generation))
 		return XDP_PASS;
@@ -1178,55 +1445,37 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	tcp = (struct tcphdr *)wire_ports;
 	if ((void *)(tcp + 1) > data_end)
 		return XDP_DROP;
-	// The policy lookup deliberately precedes all unsupported-header checks.
-	// A managed packet can only PASS after successful FakeTCP decoding.
-	if ((fragment_offset & IP_MF) || iph->ihl != 5 || tcp->doff != 5)
+	// The policy lookup deliberately precedes the single admission checkpoint.
+	// A managed packet can only PASS after that checkpoint and full decoding.
+	admission_decision = faketcp_xdp_admission_checkpoint(
+		xdp, data, data_end, off, iph, tcp, listener, managed_interface,
+		generation, &admission, &session);
+	if (admission_decision == FAKETCP_ADMISSION_DROP)
 		return XDP_DROP;
-	if (listener->action != ACTION_REWRITE)
-		return XDP_DROP;
-	total_len = bpf_ntohs(iph->tot_len);
-	if (total_len < sizeof(*iph) + sizeof(*tcp) || data + off + total_len > data_end)
-		return XDP_DROP;
+	key = admission.key;
+	total_len = admission.total_len;
 	tcp_len = total_len - sizeof(*iph);
-	payload_len = tcp_len - sizeof(*tcp);
-	flags = faketcp_tcp_flags(tcp);
-	seq = bpf_ntohl(tcp->seq);
-	// The current ring ABI does not carry the complete TCP packet, so
-	// userspace cannot independently prove checksum and receive-window state.
-	// Until the BPF validator capability is implemented, close controls must
-	// never be emitted as session-deletion authority.
-	if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)) {
-		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
-		return XDP_DROP;
-	}
-	key.generation = generation;
-	key.local_ipv4 = iph->daddr;
-	key.remote_ipv4 = iph->saddr;
-	key.underlay_index = xdp->ingress_ifindex;
-	key.local_port = bpf_ntohs(tcp->dest);
-	key.remote_port = bpf_ntohs(tcp->source);
-	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
-	if (!session || session->generation != generation ||
-	    session->state != FAKETCP_STATE_ESTABLISHED) {
+	payload_len = admission.payload_len;
+	flags = admission.flags;
+	seq = admission.sequence;
+	if (admission_decision == FAKETCP_ADMISSION_CONTROL) {
 		faketcp_emit_event(&key, faketcp_event_type(flags), flags, seq,
-				   bpf_ntohl(tcp->ack_seq), payload_len, 0,
+				   admission.acknowledgement, payload_len, 0,
 				   listener->wg_id);
 		return XDP_DROP;
 	}
-	if (flags & (FAKETCP_FLAG_SYN | FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)) {
-		faketcp_emit_event(&key, faketcp_event_type(flags), flags, seq,
-				   bpf_ntohl(tcp->ack_seq), payload_len, 0,
-				   listener->wg_id);
+	if (!session) {
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return XDP_DROP;
 	}
-	if (payload_len == 0 && flags == FAKETCP_FLAG_ACK) {
+	if (admission_decision == FAKETCP_ADMISSION_KEEPALIVE) {
 		// A userspace keepalive has no UDP image. Consume it before GRO and
 		// refresh only the peer session's idle clock.
 		session->last_seen_nanos = bpf_ktime_get_ns();
 		return XDP_DROP;
 	}
-	if (!(flags & FAKETCP_FLAG_ACK) || payload_len < FAKETCP_HEADER_DELTA) {
-		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+	if (admission_decision != FAKETCP_ADMISSION_TRANSFORM) {
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return XDP_DROP;
 	}
 	old_tcp = *tcp;
@@ -1276,6 +1525,15 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 		return XDP_DROP;
 	metadata->magic = FAKETCP_METADATA_MAGIC;
 	metadata->generation_low = (__u32)generation;
+	metadata->generation_high = (__u32)(generation >> 32);
+	metadata->local_ipv4 = key.local_ipv4;
+	metadata->remote_ipv4 = key.remote_ipv4;
+	metadata->underlay_index = key.underlay_index;
+	metadata->local_port = key.local_port;
+	metadata->remote_port = key.remote_port;
+	metadata->direction = FAKETCP_DIRECTION_INGRESS;
+	metadata->feature_mask = FAKETCP_ADMISSION_XDP_FEATURES;
+	metadata->pad = 0;
 	if (bpf_xdp_store_bytes(xdp, off + sizeof(*iph), &udp, sizeof(udp)) < 0 ||
 	    bpf_xdp_store_bytes(xdp, off + sizeof(*iph) + sizeof(udp), tail,
 			       sizeof(tail)) < 0)

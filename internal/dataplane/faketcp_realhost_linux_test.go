@@ -33,7 +33,7 @@ import (
 
 const (
 	fakeTCPRealHostObjectSizeLimit              = 128 << 20
-	fakeTCPRealHostStatCount                    = 17
+	fakeTCPRealHostStatCount                    = 19
 	fakeTCPRealHostStatEgressOK                 = uint32(0)
 	fakeTCPRealHostStatIngressOK                = uint32(1)
 	fakeTCPRealHostStatGSOReject                = uint32(5)

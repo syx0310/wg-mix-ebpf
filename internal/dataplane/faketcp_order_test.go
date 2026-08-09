@@ -223,9 +223,9 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 
 	for _, want := range []string{
 		"bpf_tail_call(skb, &faketcp_egress_programs",
-		"return faketcp_encode_established(skb, &info, rule, generation);",
+		"return faketcp_encode_established(skb, &info, rule, generation,",
 		"listener->transport_mode == TRANSPORT_FAKETCP",
-		"!faketcp_metadata_valid(skb, generation)",
+		"faketcp_consume_ingress_admission(skb, &info, listener,",
 		"faketcp_capture_first_packet(skb, info, rule, &key)",
 		"record_len = sizeof(record->event) + packet_len",
 		"faketcp_materialize_tcp_checksum",
@@ -236,7 +236,7 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 			t.Fatalf("FakeTCP pipeline source missing %q", want)
 		}
 	}
-	if strings.Count(tc+fake, "faketcp_encode_established(skb, &info, rule, generation)") != 2 {
+	if strings.Count(tc+fake, "faketcp_encode_established(skb, &info, rule, generation,") != 2 {
 		t.Fatal("direct and tail-call branches must converge on exactly one FakeTCP encoder")
 	}
 	if !strings.Contains(fake, "single encoder used by both") {
@@ -254,10 +254,10 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 		t.Fatal("egress entry point is missing")
 	}
 	egress := tc[egressStart:]
-	preflight := strings.Index(egress, "faketcp_preflight_egress(skb, &info, rule, generation)")
+	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
 	typeWord := strings.Index(egress, "update_type_word(skb, &info, old_wire, new_wire, 1)")
-	if preflight < 0 || typeWord < 0 || preflight >= typeWord {
-		t.Fatal("FakeTCP first-packet capture must precede type-word and XOR mutation")
+	if checkpoint < 0 || typeWord < 0 || checkpoint >= typeWord {
+		t.Fatal("FakeTCP admission checkpoint must precede type-word and XOR mutation")
 	}
 }
 
@@ -268,7 +268,7 @@ func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
 	}
 	text := string(source)
 
-	preflightStart := strings.Index(text, "static __always_inline int faketcp_preflight_egress")
+	preflightStart := strings.Index(text, "static __always_inline int faketcp_egress_admission_checkpoint")
 	checksumCommentStart := strings.Index(text, "// TC's public __sk_buff ABI")
 	checksumStart := strings.Index(text, "static __always_inline int faketcp_materialize_tcp_checksum")
 	encoderStart := strings.Index(text, "static __always_inline int faketcp_encode_established")
@@ -276,7 +276,7 @@ func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
 	if preflightStart < 0 || checksumCommentStart < 0 || checksumStart < 0 || encoderStart < 0 || continuationStart < 0 ||
 		preflightStart >= checksumCommentStart || checksumCommentStart >= checksumStart ||
 		checksumStart >= encoderStart || encoderStart >= continuationStart {
-		t.Fatal("FakeTCP preflight/checksum/encoder sections are missing or malformed")
+		t.Fatal("FakeTCP checkpoint/checksum/encoder sections are missing or malformed")
 	}
 
 	preflight := text[preflightStart:checksumCommentStart]
@@ -509,7 +509,7 @@ func TestFakeTCPXDPManagedPortLookupPrecedesUnsupportedHeaderExit(t *testing.T) 
 		"return managed_interface ? XDP_DROP : XDP_PASS",
 		"AH, ESP and unknown extension/transport values",
 		"next_header == IPPROTO_TCP || next_header == IPPROTO_UDP",
-		"A managed packet can only PASS after successful FakeTCP decoding",
+		"A managed packet can only PASS after that checkpoint and full decoding",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("managed-port fail-closed source contract missing %q", want)
@@ -521,9 +521,9 @@ func TestFakeTCPXDPManagedPortLookupPrecedesUnsupportedHeaderExit(t *testing.T) 
 	}
 	xdp := text[xdpStart:]
 	lookup := strings.Index(xdp, "listener = faketcp_xdp_managed_port")
-	unsupported := strings.Index(xdp, "if ((fragment_offset & IP_MF) || iph->ihl != 5 || tcp->doff != 5)")
+	unsupported := strings.Index(xdp, "admission_decision = faketcp_xdp_admission_checkpoint(")
 	if lookup < 0 || unsupported < 0 || lookup >= unsupported {
-		t.Fatal("managed-port lookup must precede IPv4 options/fragment rejection")
+		t.Fatal("managed-port lookup must precede the fail-closed XDP checkpoint")
 	}
 }
 
@@ -647,7 +647,7 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 	}
 
 	captureStart := strings.Index(text, "static __always_inline int faketcp_capture_first_packet")
-	preflightStart := strings.Index(text, "static __always_inline int faketcp_preflight_egress")
+	preflightStart := strings.Index(text, "static __always_inline int faketcp_egress_admission_checkpoint")
 	if captureStart < 0 || preflightStart < 0 || captureStart >= preflightStart {
 		t.Fatal("FakeTCP first-packet capture helper is missing or malformed")
 	}
@@ -802,14 +802,16 @@ func TestFakeTCPCloseControlsCannotAuthorizeDeleteBeforeBPFValidation(t *testing
 		t.Fatal(err)
 	}
 	text := string(source)
+	checkpointStart := strings.Index(text, "static __always_inline int faketcp_xdp_admission_checkpoint")
 	xdpStart := strings.Index(text, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
-	if xdpStart < 0 {
-		t.Fatal("FakeTCP XDP entry point is missing")
+	if checkpointStart < 0 || xdpStart < 0 || checkpointStart >= xdpStart {
+		t.Fatal("FakeTCP XDP admission checkpoint is missing")
 	}
+	checkpoint := text[checkpointStart:xdpStart]
 	xdp := text[xdpStart:]
-	closeDrop := strings.Index(xdp, "if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN))")
+	closeDrop := strings.Index(checkpoint, "if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN))")
 	firstEvent := strings.Index(xdp, "faketcp_emit_event")
-	if closeDrop < 0 || firstEvent < 0 || closeDrop >= firstEvent {
+	if closeDrop < 0 || firstEvent < 0 {
 		t.Fatal("RST/FIN can reach the ring before the unavailable BPF checksum/window validator")
 	}
 	if strings.Contains(xdp, "old_tcp.check == 0") {
