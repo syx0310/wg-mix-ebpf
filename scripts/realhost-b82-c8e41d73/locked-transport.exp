@@ -730,7 +730,7 @@ proc build_operation {values manifest_sha operation approved_sha} {
             set realnic_mode [string range $operation 8 end]
             set sudo_prefix [list /usr/bin/sudo --]
             if {$realnic_mode eq "plan"} {
-                set sudo_prefix [list /usr/bin/sudo -p {B82_V6_SUDO_PASSWORD: } --]
+                set sudo_prefix [list /usr/bin/sudo -p B82_V6_SUDO_PASSWORD: --]
             }
             set remote [concat $sudo_prefix [env_argv] \
                 [list PYTHONDONTWRITEBYTECODE=1] \
@@ -1041,7 +1041,7 @@ proc accept_capture_prompt {variable_name credential_sends buffer} {
             return -code error "capture-ssh-prompt-frame"
         }
     } elseif {$credential_sends == 1} {
-        set expected_prompt {B82_V6_SUDO_PASSWORD: }
+        set expected_prompt B82_V6_SUDO_PASSWORD:
         if {$buffer ne $expected_prompt || $captured ne "\r\n"} {
             return -code error "capture-sudo-prompt-frame"
         }
@@ -1171,7 +1171,7 @@ proc capture_child_payload {child_id password_bytes prompt_limit timeout_seconds
     set captured_output ""
     set credential_sends 0
     set password_json_escape [python_json_escape_utf8_content $password_bytes]
-    set credential_pattern {(?:siyixuan@192\.168\.10\.82's password: |B82_V6_SUDO_PASSWORD: )$}
+    set credential_pattern {(?:siyixuan@192\.168\.10\.82's password: |B82_V6_SUDO_PASSWORD:)$}
     fconfigure $child_id -encoding binary -translation binary
     match_max -i $child_id 16781312
     remove_nulls -i $child_id 0
