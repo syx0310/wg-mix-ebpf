@@ -3,11 +3,11 @@ set -u
 set -o pipefail
 umask 077
 
-REVIEW_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
+REVIEW_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
 readonly REVIEW_ROOT
 readonly HELPER="${REVIEW_ROOT}/checksum-module-lease.sh"
 readonly STATIC_TEST="${REVIEW_ROOT}/test_checksum_module_lease_static.py"
-REPOSITORY="$(CDPATH= cd -- "${REVIEW_ROOT}/../.." && pwd -P)" || exit 70
+REPOSITORY="$(CDPATH='' cd -- "${REVIEW_ROOT}/../.." && pwd -P)" || exit 70
 readonly REPOSITORY
 readonly MODULE_SOURCE="${REPOSITORY}/kernel/faketcp_checksum/wg_mix_faketcp_checksum.c"
 
@@ -30,7 +30,8 @@ fi
 
 # The classifier is production code but pure: execute every accepted state and
 # representative invalid/foreign combinations without touching a real module.
-# shellcheck source=checksum-module-lease.sh
+# The fixed HELPER path is shape-checked before this test-only dynamic source.
+# shellcheck disable=SC1090,SC1091
 source "${HELPER}"
 for spec in \
   "${C8_CHECKSUM_MODULE_CENTRAL_OBJECT}|${C8_CHECKSUM_MODULE_STAGE_ROOT}/realhost-v6-${C8_CHECKSUM_MODULE_CENTRAL_RESOURCE_ID}|${C8_CHECKSUM_MODULE_CENTRAL_RESOURCE_ID}" \

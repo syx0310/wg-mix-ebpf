@@ -3,9 +3,9 @@ set -u
 set -o pipefail
 umask 077
 
-REVIEW_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
+REVIEW_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
 readonly REVIEW_ROOT
-REPOSITORY="$(CDPATH= cd -- "${REVIEW_ROOT}/../.." && pwd -P)" || exit 70
+REPOSITORY="$(CDPATH='' cd -- "${REVIEW_ROOT}/../.." && pwd -P)" || exit 70
 readonly REPOSITORY
 readonly RUNNER="${REVIEW_ROOT}/root-veth-n-r.sh"
 readonly STATIC_TEST="${REVIEW_ROOT}/test_veth_runner_static.py"
@@ -85,7 +85,7 @@ else
   printf 'SKIP: shellcheck unavailable locally; remote execution remains review-gated\n'
 fi
 
-BOUND_COMMIT="$(/usr/bin/git -C "${REPOSITORY}" rev-parse --verify HEAD^{commit})" ||
+BOUND_COMMIT="$(/usr/bin/git -C "${REPOSITORY}" rev-parse --verify 'HEAD^{commit}')" ||
   fail 'cannot bind the hermetic fixture to HEAD'
 readonly BOUND_COMMIT
 [[ "${BOUND_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || fail 'bound commit is malformed'

@@ -3,9 +3,9 @@ set -u
 set -o pipefail
 umask 077
 
-REVIEW_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
+REVIEW_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
 readonly REVIEW_ROOT
-REPOSITORY="$(CDPATH= cd -- "${REVIEW_ROOT}/../.." && pwd -P)" || exit 70
+REPOSITORY="$(CDPATH='' cd -- "${REVIEW_ROOT}/../.." && pwd -P)" || exit 70
 readonly REPOSITORY
 readonly RUNNER="${REVIEW_ROOT}/root-routed-veth-n-r.sh"
 readonly SEAM="${REVIEW_ROOT}/controller-seam.sh"
@@ -113,7 +113,7 @@ if [[ -e "${STAGE_ROOT}" || -L "${STAGE_ROOT}" ]]; then
     "$(/usr/bin/readlink -e -- "${SOURCE}")" == "${SOURCE}" &&
     "$(/usr/bin/stat -Lc '%u:%g:%a:%F' -- "${SOURCE}")" == '0:0:700:directory' ]] ||
     fail 'pre-existing stage is not the exact root-owned staged test context'
-  COMMIT="$(/usr/bin/git -C "${SOURCE}" rev-parse --verify HEAD^{commit})" ||
+  COMMIT="$(/usr/bin/git -C "${SOURCE}" rev-parse --verify 'HEAD^{commit}')" ||
     fail 'cannot bind exact staged context commit'
   STAGED_CONTEXT='exact'
 else
@@ -285,6 +285,8 @@ if [[ "${STAGED_CONTEXT}" == exact ]]; then
     "${SEAM_OUTPUT}" == *'B82_ROUTED_VETH_PLAN_COMPLETE commands_are_review_templates=1'* ]] ||
     fail 'controller seam did not execute the exact staged runner plan'
 else
+  # These patterns intentionally match literal variable references in generated shell.
+  # shellcheck disable=SC2016
   [[ "${SEAM_OUTPUT}" == *'/bin/bash -p "${ROOT_RUNNER}" "${MODE}"'* &&
     "${SEAM_OUTPUT}" == *'--source "${SOURCE}"'* &&
     "${SEAM_OUTPUT}" == *'--commit "${COMMIT}"'* &&
