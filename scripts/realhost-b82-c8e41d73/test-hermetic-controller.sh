@@ -246,7 +246,7 @@ done
     'realnic-acceptance-v1' &&
   "$(manifest_value physical_interface_lock "${BOUND_MANIFEST}")" == \
     '/run/wg-mix-ebpf-realnic-physical-interface.v1.lock' &&
-  "$(manifest_value legacy_matrix_mode "${BOUND_MANIFEST}")" == 'restore-only' &&
+  "$(manifest_value legacy_matrix_mode "${BOUND_MANIFEST}")" == 'retired' &&
   "$(manifest_value realnic_profile "${BOUND_MANIFEST}")" == 'acceptance' &&
   "$(manifest_value realnic_traffic_seconds "${BOUND_MANIFEST}")" == '30' &&
   "$(manifest_value checksum_module_lease_sh_path "${BOUND_MANIFEST}")" == \
@@ -274,7 +274,6 @@ CONTROLLER_ARGS=(
   --manifest "${BOUND_MANIFEST}"
   --manifest-sha256 "${BOUND_MANIFEST_SHA}"
   --credential-path "${CREDENTIAL_PATH}"
-  --restore-cell none
 )
 CONTROLLER_PLAN="$(/bin/bash "${FIXTURE_REVIEW}/controller.sh" plan "${CONTROLLER_ARGS[@]}")" ||
   fail 'controller plan'
@@ -330,8 +329,7 @@ for literal in \
   'operation=realnic-plan transport=ssh credential_read=0 network_operations=0' \
   '/usr/bin/python3 -B -I /run/wg-mix-ebpf-source-stages/c8e41d73/source/scripts/realhost-b82-acceptance-v1/realnic_acceptance.py plan --source-commit' \
   'B82_V6_REALNIC_APPROVAL_REQUIRED local_plan=explicit approved_plan_sha256=explicit automatic_approval=0' \
-  'operation=matrix-restore-tcx transport=ssh credential_read=0 network_operations=0' \
-  '--wg-interface wg0 --wg-local-address 10.200.0.1 --wg-peer-address 10.200.0.2' \
+  'B82_V6_LEGACY_MATRIX_RETIRED controller_entries=0 historical_recovery=frozen-original-package-before-final-staging' \
   'B82_V6_CONTROLLER_PLAN_COMPLETE credential_read=0 network_operations=0 mutations=0 legacy_forward=retired'; do
   [[ "${CONTROLLER_PLAN}" == *"${literal}"* ]] || fail "controller plan missing ${literal}"
 done
@@ -341,9 +339,8 @@ done
 [[ "${CONTROLLER_PLAN}" != *'/bin/bash -p /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/provision-ubuntu-test-host.sh'* ]] ||
   fail 'controller plan executes user-writable package provisioner'
 [[ "${CONTROLLER_PLAN}" != *'/usr/sbin/bpftool version'* ]] || fail 'legacy bpftool probe survived'
-[[ "${CONTROLLER_PLAN}" != *'operation=matrix-plan'* &&
-  "${CONTROLLER_PLAN}" != *'operation=matrix-run'* ]] ||
-  fail 'retired legacy matrix forward operation remained reachable'
+[[ "${CONTROLLER_PLAN}" != *'operation=matrix-'* ]] ||
+  fail 'retired legacy matrix operation remained reachable'
 [[ "${CONTROLLER_PLAN}" != *'operation=hermetic-realnic-'* ]] ||
   fail 'controller retained a package-copy realNIC test operation'
 [[ "${CONTROLLER_PLAN}" != *'prepare-stage-root.sh plan --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1'* ]] ||
@@ -377,11 +374,7 @@ require_ordered_literals "${CONTROLLER_PLAN}" \
   'operation=fresh-run ' \
   'operation=fresh-restore ' \
   'operation=realnic-plan ' \
-  'operation=matrix-restore-tcx '
-
-LEGACY_RESTORE_COUNT="$(/usr/bin/grep -o 'operation=matrix-restore-[a-z0-9-]* transport=ssh' \
-  <<<"${CONTROLLER_PLAN}" | /usr/bin/wc -l | /usr/bin/tr -d ' ')" || fail 'legacy restore count'
-[[ "${LEGACY_RESTORE_COUNT}" == '9' ]] || fail 'controller does not retain exactly nine legacy restore entries'
+  'B82_V6_LEGACY_MATRIX_RETIRED '
 
 APPROVED_PLAN="${TEST_ROOT}/reviewed-realnic-plan.json"
 printf '%s\n' '{"fixture":"explicitly-reviewed-realnic-plan"}' >"${APPROVED_PLAN}" ||
@@ -564,7 +557,7 @@ require_ordered_literals "${STAGE_PLAN}" 'C4 argv=' 'C7 argv=' 'C8 argv=' 'C11 a
 expect_failure wrong-manifest-sha /bin/bash "${FIXTURE_REVIEW}/controller.sh" plan \
   --manifest "${BOUND_MANIFEST}" \
   --manifest-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-  --credential-path "${CREDENTIAL_PATH}" --restore-cell none
+  --credential-path "${CREDENTIAL_PATH}"
 expect_failure existing-output /bin/bash "${FIXTURE_REVIEW}/bind-final-package.sh" bind "${BIND_ARGS[@]}"
 expect_failure ref-commit-mismatch /bin/bash "${FIXTURE_REVIEW}/bind-final-package.sh" plan \
   --repository "${FIXTURE_REPOSITORY}" --source-ref "${FIXTURE_REF}" \
@@ -583,6 +576,12 @@ expect_failure retired-matrix-run-transport /usr/bin/expect "${FIXTURE_REVIEW}/l
   --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
   --credential-path "${CREDENTIAL_PATH}" --action plan --operation matrix-run \
   --approved-plan none --approved-plan-sha256 none
+expect_failure retired-matrix-restore-transport /usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
+  --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
+  --credential-path "${CREDENTIAL_PATH}" --action plan --operation matrix-restore-tcx \
+  --approved-plan none --approved-plan-sha256 none
+expect_failure retired-matrix-controller-mode /bin/bash "${FIXTURE_REVIEW}/controller.sh" restore \
+  "${CONTROLLER_ARGS[@]}" --restore-cell tcx
 expect_failure credential-path-before-spawn /usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
   --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
   --credential-path /private/tmp/not-a-credential --action execute --operation identity-hostname \
@@ -634,14 +633,13 @@ ABSENT_MANIFEST="${ABSENT_OUTPUT}/package-manifest.v1"
 ABSENT_MANIFEST_SHA="$(sha256_file "${ABSENT_MANIFEST}")" || fail 'absent manifest digest'
 ABSENT_CONTROLLER_ARGS=(
   --manifest "${ABSENT_MANIFEST}" --manifest-sha256 "${ABSENT_MANIFEST_SHA}"
-  --credential-path "${CREDENTIAL_PATH}" --restore-cell none
+  --credential-path "${CREDENTIAL_PATH}"
 )
 ABSENT_PLAN="$(/bin/bash "${FIXTURE_REVIEW}/controller.sh" plan "${ABSENT_CONTROLLER_ARGS[@]}")" ||
   fail 'absent controller plan'
-[[ "${ABSENT_PLAN}" == *'B82_V6_LEGACY_RESTORE_BLOCKED reason=wireguard-topology-absent restore_entries=9'* ]] ||
-  fail 'absent WireGuard legacy restore block missing'
-[[ "${ABSENT_PLAN}" != *'operation=matrix-run'* &&
-  "${ABSENT_PLAN}" != *'operation=matrix-restore-'* ]] || fail 'absent plan rendered legacy matrix execution'
+[[ "${ABSENT_PLAN}" == *'B82_V6_LEGACY_MATRIX_RETIRED controller_entries=0 historical_recovery=frozen-original-package-before-final-staging'* ]] ||
+  fail 'absent WireGuard legacy retirement marker missing'
+[[ "${ABSENT_PLAN}" != *'operation=matrix-'* ]] || fail 'absent plan rendered legacy matrix execution'
 for operation in fresh-plan fresh-run fresh-restore; do
   [[ "${ABSENT_PLAN}" == *"operation=${operation} transport=ssh credential_read=0 network_operations=0"* ]] ||
     fail "absent WireGuard plan cannot reach ${operation}"

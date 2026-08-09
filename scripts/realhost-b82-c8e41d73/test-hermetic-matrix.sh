@@ -50,27 +50,28 @@ readonly -a MATRIX_ARGS=(
   --wg-peer-address 10.200.0.2
 )
 
-plan_output="$("${MATRIX}" plan "${MATRIX_ARGS[@]}" --restore-cell none)" ||
-  fail 'restore-only plan expansion'
-[[ "${plan_output}" == *'REALHOST_V6_FORWARD_AUTHORITY state=retired replacement=realnic-acceptance'* ]] ||
+plan_output="$("${MATRIX}" plan)" || fail 'retired plan expansion'
+[[ "${plan_output}" == *'REALHOST_V6_FORWARD_AUTHORITY state=retired replacement=realnic-acceptance-v1'* ]] ||
   fail 'forward retirement marker missing'
-[[ "${plan_output}" == *'REALHOST_V6_PLAN_SCOPE restore-only=1 network-writes-executed=0 filesystem-writes-executed=0'* ]] ||
-  fail 'restore-only side-effect fence missing'
-[[ "${plan_output}" == *'REALHOST_V6_PLAN_COMPLETE restore_entries=9 no_commands_executed=1'* ]] ||
-  fail 'restore-only completion fence missing'
-restore_entries="$(printf '%s\n' "${plan_output}" | /usr/bin/awk '/^restore-[^ ]+ argv=/ { count++ } END { print count + 0 }')" ||
-  fail 'restore entry count'
-[[ "${restore_entries}" == '9' ]] || fail 'restore entry set is not exactly nine'
+[[ "${plan_output}" == *'REALHOST_V6_LEGACY_CONTROLLER_AUTHORITY state=retired controller_entries=0 restore_entries=0'* ]] ||
+  fail 'legacy controller retirement marker missing'
+[[ "${plan_output}" == *'REALHOST_V6_HISTORICAL_RECOVERY package=frozen-original-package timing=before-final-staging'* ]] ||
+  fail 'historical recovery boundary missing'
+[[ "${plan_output}" == *'REALHOST_V6_PLAN_COMPLETE commands_executed=0 filesystem_writes=0 network_writes=0'* ]] ||
+  fail 'retired plan side-effect fence missing'
 for forbidden in '/usr/bin/iperf3' '/usr/sbin/ethtool -K' '/usr/sbin/ip link set' \
-  'WG_MIX_EBPF_SCOPED_REALNIC_ACTION=run'; do
-  [[ "${plan_output}" != *"${forbidden}"* ]] || fail "forward command leaked into plan: ${forbidden}"
+  'WG_MIX_EBPF_SCOPED_REALNIC_ACTION=run' 'restore-'; do
+  [[ "${plan_output}" != *"${forbidden}"* ]] || fail "retired authority leaked into plan: ${forbidden}"
 done
 
-run_output="$("${MATRIX}" run "${MATRIX_ARGS[@]}" --restore-cell none 2>&1)"
-run_rc=$?
-[[ "${run_rc}" -eq 78 ]] || fail "retired run returned ${run_rc}, expected 78"
-[[ "${run_output}" == *'reason=legacy-forward-authority-retired-use-realnic-acceptance rc=78'* ]] ||
-  fail 'retired run did not emit its fixed reason'
+for retired_mode in run restore; do
+  retired_output="$("${MATRIX}" "${retired_mode}" "${MATRIX_ARGS[@]}" --restore-cell tcx 2>&1)"
+  retired_rc=$?
+  [[ "${retired_rc}" -eq 78 ]] ||
+    fail "retired ${retired_mode} returned ${retired_rc}, expected 78"
+  [[ "${retired_output}" == *'reason=legacy-matrix-retired-use-frozen-original-package-before-final-staging rc=78'* ]] ||
+    fail "retired ${retired_mode} did not emit its fixed reason"
+done
 
 reservation_create() {
   local target="$1"

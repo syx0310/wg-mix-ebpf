@@ -98,7 +98,7 @@ def main() -> None:
         "test_fresh_verifier_gate_static.py",
         "manifest_line physical_nic_forward_authority realnic-acceptance-v1",
         'manifest_line physical_interface_lock "${PHYSICAL_INTERFACE_LOCK}"',
-        "manifest_line legacy_matrix_mode restore-only",
+        "manifest_line legacy_matrix_mode retired",
         "manifest_line realnic_profile acceptance",
         "manifest_line realnic_traffic_seconds 30",
         '"${REALNIC_PATH_FROM_ROOT}/realnic_acceptance.py"',
@@ -118,9 +118,7 @@ def main() -> None:
         fail("binder contains package installation")
 
     required_controller = (
-        "B82_V6_LEGACY_RESTORE_BLOCKED reason=wireguard-topology-absent restore_entries=9",
-        "require_bound_wireguard",
-        "fail 'wireguard-topology-absent' 78",
+        "B82_V6_LEGACY_MATRIX_RETIRED controller_entries=0 historical_recovery=frozen-original-package-before-final-staging",
         "identity-wg-interfaces",
         "identity-netns",
         "identity-driver",
@@ -173,9 +171,11 @@ def main() -> None:
             rf"{mode}\)\s+run_operation execute {mode}", controller, re.MULTILINE
         ):
             fail(f"controller {mode} is not an independent fixed operation")
-    for retired in ("matrix-plan", "matrix-run"):
+    for retired in ("matrix-plan", "matrix-run", "matrix-restore-", "--restore-cell"):
         if retired in controller:
             fail(f"controller still exposes retired physical-NIC mode {retired}")
+    if re.search(r"(?:^|[| {])restore(?:[| )}]|$)", controller):
+        fail("controller still exposes the legacy top-level restore mode")
     if "hermetic-realnic-" in controller or "hermetic-realnic-" in transport:
         fail("controller/transport runs realNIC tests from the flat package copy")
     realnic_run = controller[
@@ -265,7 +265,6 @@ def main() -> None:
         "contains:v7.7.0",
         "contains:GNU Make 4.4.1",
         "set assertion empty",
-        "wireguard-topology-absent",
         "/usr/bin/test -r /sys/kernel/btf/vmlinux",
         "/usr/bin/findmnt --noheadings --raw --output FSTYPE,TARGET --target /sys/fs/bpf",
         "controller-shellcheck",
@@ -333,7 +332,13 @@ def main() -> None:
         fail("transport accepts a caller-supplied remote argv")
     if "/usr/sbin/bpftool version" in transport:
         fail("transport retains the legacy bpftool version argv")
-    for retired in ("matrix-plan - matrix-run", '"matrix-plan"', '"matrix-run"'):
+    for retired in (
+        "matrix-plan - matrix-run",
+        '"matrix-plan"',
+        '"matrix-run"',
+        "matrix-restore-",
+        "proc matrix_remote_argv",
+    ):
         if retired in transport:
             fail(f"transport still exposes retired physical-NIC operation {retired}")
     fresh_argv_body = transport[
@@ -530,12 +535,24 @@ def main() -> None:
         "--privileged",
         "find -delete",
         "rm -rf",
+        "/usr/sbin/ethtool",
+        "/usr/sbin/ip",
+        "/usr/sbin/bpftool",
+        "/usr/bin/iperf3",
+        "--restore-cell",
     )
     for literal in matrix_forbidden:
         if literal in matrix:
             fail(f"existing matrix contains prohibited literal: {literal}")
     if "readonly RUN_ID='c8e41d73'" not in matrix:
         fail("existing matrix run identity changed")
+    for literal in (
+        "REALHOST_V6_LEGACY_CONTROLLER_AUTHORITY state=retired controller_entries=0 restore_entries=0",
+        "REALHOST_V6_HISTORICAL_RECOVERY package=frozen-original-package timing=before-final-staging",
+        "legacy-matrix-retired-use-frozen-original-package-before-final-staging",
+    ):
+        if literal not in matrix:
+            fail(f"retired matrix contract is missing {literal!r}")
 
     print("static v6 binder/controller/transport/stager safety contract: PASS")
 

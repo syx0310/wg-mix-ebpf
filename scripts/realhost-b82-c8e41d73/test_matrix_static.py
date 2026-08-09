@@ -60,62 +60,40 @@ def main() -> None:
         matrix,
         "retired matrix",
         (
-            "readonly PHYSICAL_INTERFACE_LOCK='/run/wg-mix-ebpf-realnic-physical-interface.v1.lock'",
-            "readonly PHYSICAL_INTERFACE_LOCK_INTERFACE='ens33'",
-            "REALHOST_V6_FORWARD_AUTHORITY state=retired replacement=realnic-acceptance",
-            "REALHOST_V6_PLAN_SCOPE restore-only=1 network-writes-executed=0 filesystem-writes-executed=0",
-            "REALHOST_V6_PLAN_COMPLETE restore_entries=9 no_commands_executed=1",
-            "fail 'legacy-forward-authority-retired-use-realnic-acceptance' 78",
-            "acquire_physical_interface_lock",
-            "physical-interface-lock-replaced-after-acquire",
-            "validate_owner_marker",
-            "restore_nic_state Z.restore",
-            "REALHOST_V6_RESTORE_COMPLETE",
+            "readonly RUN_ID='c8e41d73'",
+            "REALHOST_V6_FORWARD_AUTHORITY state=retired replacement=realnic-acceptance-v1",
+            "REALHOST_V6_LEGACY_CONTROLLER_AUTHORITY state=retired controller_entries=0 restore_entries=0",
+            "REALHOST_V6_HISTORICAL_RECOVERY package=frozen-original-package timing=before-final-staging",
+            "REALHOST_V6_PLAN_COMPLETE commands_executed=0 filesystem_writes=0 network_writes=0",
+            "legacy-matrix-retired-use-frozen-original-package-before-final-staging",
+            "run | restore)",
+            "return 78",
         ),
     )
-    for name in ("run_all", "create_evidence_root", "snapshot_host", "run_traffic"):
-        if re.search(rf"^{name}\(\)", matrix, re.MULTILINE):
-            fail(f"unreachable forward function survived retirement: {name}")
-    if "check-realhost-iperf.py" in matrix:
-        fail("legacy iperf checker glue survived matrix retirement")
-
-    plan = function_body(matrix, "render_plan")
-    if plan.count('plan_command "restore-${cell}"') != 1:
-        fail("restore plan must be emitted by one fixed nine-cell loop")
-    match = re.search(r"for cell in (?P<cells>[^;]+); do", plan)
-    if not match or match.group("cells").split() != [
-        "tcx",
-        "original",
-        "all-on",
-        "all-off",
-        "tx-path",
-        "rx-path",
-        "mtu1492",
-        "mtu1500",
-        "soak",
-    ]:
-        fail("restore plan cell set is not exact")
-    for forward in ("iperf3", 'ethtool -K', "ip link set", "WG_MIX_EBPF_SCOPED_REALNIC_ACTION=run"):
-        if forward in plan:
-            fail(f"restore-only plan contains forward action {forward!r}")
-
-    top_level = matrix[matrix.rfind('\nparse_arguments "$@"') :]
-    retired = top_level.find("legacy-forward-authority-retired-use-realnic-acceptance")
-    tooling = top_level.find("require_tooling")
-    restore = top_level.find("restore_after_failure")
-    if not 0 <= retired < tooling < restore:
-        fail("legacy run is not stopped before tooling and restore dispatch")
-    restore_body = function_body(matrix, "restore_after_failure")
-    ordered = (
-        "acquire_physical_interface_lock",
-        "validate_common_identity",
-        "validate_owner_marker",
-        "c8_checksum_module_acquire L0.restore",
-        "restore_nic_state Z.restore",
+    functions = set(re.findall(r"^([a-z][a-z0-9_]*)\(\) \{", matrix, re.MULTILINE))
+    if functions != {"usage", "retired", "main"}:
+        fail(f"legacy executable authority survived retirement: {sorted(functions)}")
+    retired_forbidden = (
+        "/usr/sbin/ethtool",
+        "/usr/sbin/ip",
+        "/usr/sbin/bpftool",
+        "/usr/bin/iperf3",
+        "/usr/bin/flock",
+        "/usr/bin/sudo",
+        "/usr/bin/mkdir",
+        "WG_MIX_EBPF_",
+        "--restore-cell",
+        "/sys/",
+        "/run/wg-mix-ebpf-source-stages/",
     )
-    positions = [restore_body.index(value) for value in ordered]
-    if positions != sorted(positions):
-        fail("legacy restore lock/identity/mutation order is not exact")
+    for literal in retired_forbidden:
+        if literal in matrix:
+            fail(f"retired matrix retains executable authority {literal!r}")
+    main_body = function_body(matrix, "main")
+    if len(re.findall(r"^\s+retired$", main_body, re.MULTILINE)) != 1 or "run | restore)" not in main_body:
+        fail("run and restore do not share one unconditional retirement exit")
+    if not matrix.rstrip().endswith('main "$@"'):
+        fail("retired matrix does not have one fixed entrypoint")
 
     require_literals(
         stager,
