@@ -427,7 +427,7 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 		"bpf_loop(context.gso_segments, faketcp_gso_validate_segment",
 		"segment_index = index / context->xor_chunks_per_segment",
 		"target_length = segment_length < context->cipher->max_bytes",
-		"__sync_fetch_and_add(&session->tx_sequence",
+		"faketcp_session_mutate(session, generation, now,",
 	} {
 		if !strings.Contains(bpf, required) {
 			t.Fatalf("BPF GSO contract missing %q", required)
@@ -464,8 +464,18 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 	parseGate := strings.Index(gso, "faketcp_parse_tc_l3(skb, info, &l3) != FAKETCP_L3_OK")
 	prepare := strings.Index(gso, "faketcp_prepare_udp(skb, info->ip_off, info->udp_off")
 	rewrite := strings.Index(gso, "bpf_loop(context.gso_segments, faketcp_gso_rewrite_type")
-	if parseGate < 0 || prepare < 0 || rewrite < 0 || !(parseGate < prepare && prepare < rewrite) {
-		t.Fatal("shared fixed-IPv4 gate and unified prepare must precede every GSO mutation")
+	sessionMutation := strings.Index(gso, "faketcp_session_mutate(session, generation, now,")
+	commitCall := strings.Index(gso, "wg_mix_faketcp_skb_commit_udp_gso(")
+	if parseGate < 0 || prepare < 0 || rewrite < 0 || sessionMutation < 0 || commitCall < 0 ||
+		strings.Contains(gso[:sessionMutation], "session->") ||
+		strings.Count(gso, "FAKETCP_SESSION_MUTATE_TX") != 1 ||
+		!(parseGate < prepare && prepare < rewrite && rewrite < sessionMutation && sessionMutation < commitCall) {
+		t.Fatal("L3/prepare/segment rewrites must precede one locked session snapshot and GSO commit")
+	}
+	for _, field := range []string{"mutation.sequence", "mutation.acknowledgement", "mutation.window"} {
+		if !strings.Contains(gso[sessionMutation:], field) {
+			t.Fatalf("GSO commit does not consume locked session snapshot field %q", field)
+		}
 	}
 	commitStart := strings.Index(kernel, "wg_mix_faketcp_skb_commit_udp_gso(struct __sk_buff *ctx")
 	if commitStart < 0 {
@@ -474,12 +484,42 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 	commit := kernel[commitStart:]
 	geometry := strings.Index(commit, "wg_mix_faketcp_validate_udp_gso(skb, transport_offset")
 	writable := strings.Index(commit, "skb_shared(skb) || skb_cloned(skb) || skb_header_cloned(skb)")
-	mutation := strings.Index(commit, "wg_mix_faketcp_rotate_gso_payload(skb")
-	if geometry < 0 || writable < 0 || mutation < 0 || !(geometry < writable && writable < mutation) {
+	firstMutation := strings.Index(commit, "wg_mix_faketcp_rotate_gso_payload(skb")
+	if geometry < 0 || writable < 0 || firstMutation < 0 || !(geometry < writable && writable < firstMutation) {
 		t.Fatal("direct GSO commit must revalidate geometry and reject shared storage before its first write")
 	}
 	if fakeTCPImplementedCapabilities&fakeTCPCapabilityGSOPerSegmentTransform != 0 {
 		t.Fatal("GSO capability opened before verifier and .82 wire evidence")
+	}
+}
+
+func TestFakeTCPGSODependencyManifestRetainsEstablishedStoreAndTwoKfuncs(t *testing.T) {
+	source, err := os.ReadFile("../../internal/dataplane/experimental_manifest_linux.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := string(source)
+	for _, required := range []string{
+		`{name: "faketcp_session_map", mapType: ebpf.Hash, keySize: 24, valueSize: 80, maxEntries: 16384}`,
+		`name: "wg_faketcp_session_claim", sectionName: "classifier/faketcp_session_claim"`,
+		"experimentalFakeTCPMTUAuditKeyCount   = 15",
+	} {
+		if !strings.Contains(manifest, required) {
+			t.Fatalf("merged experimental manifest missing %q", required)
+		}
+	}
+	kfuncStart := strings.Index(manifest, "var experimentalFakeTCPKfuncNames = [...]string{")
+	if kfuncStart < 0 {
+		t.Fatal("experimental kfunc manifest is missing")
+	}
+	kfuncEnd := strings.Index(manifest[kfuncStart:], "\n}")
+	if kfuncEnd < 0 {
+		t.Fatal("experimental kfunc manifest is malformed")
+	}
+	kfuncs := manifest[kfuncStart : kfuncStart+kfuncEnd]
+	if strings.Count(kfuncs, "experimentalFakeTCPPrepareKfuncName") != 1 ||
+		strings.Count(kfuncs, "experimentalFakeTCPGSOCommitKfuncName") != 1 {
+		t.Fatal("experimental manifest must retain exactly prepare and GSO commit kfuncs")
 	}
 }
 

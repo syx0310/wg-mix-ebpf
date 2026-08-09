@@ -1174,10 +1174,11 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 		.profile_id = rule->profile_id,
 	};
 	struct profile_value *profile;
+	struct faketcp_session_mutation_result mutation = {};
 	__u32 expected_segments;
 	__u32 xor_chunks;
 	__u32 xor_segment_bytes;
-	__u32 sequence;
+	__u64 now;
 	__u64 ack_window;
 	int result;
 
@@ -1204,10 +1205,8 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 		return TC_ACT_SHOT;
 	}
 	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
-	if (!session || session->generation != generation ||
-	    session->state != FAKETCP_STATE_ESTABLISHED) {
-		inc_faketcp_stat(session ? FAKETCP_STAT_BAD_STATE :
-					    FAKETCP_STAT_SESSION_MISS);
+	if (!session) {
+		inc_faketcp_stat(FAKETCP_STAT_SESSION_MISS);
 		return TC_ACT_SHOT;
 	}
 	profile = bpf_map_lookup_elem(&profile_map, &profile_key);
@@ -1263,19 +1262,25 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 		inc_stat(STAT_XOR_EGRESS_OK);
 	}
 
-	// prepare_udp completed the fallible allocation boundary. Commit performs
-	// one final contract check before its first mutation and cannot allocate.
-	sequence = __sync_fetch_and_add(&session->tx_sequence,
-					context.payload_length);
-	ack_window = session->rx_sequence |
-		     ((__u64)(session->window ? session->window : 65535) << 32);
+	// Packet validation, allocation and every per-segment rewrite stay outside
+	// the value lock. This sole mutation revalidates ESTABLISHED, advances the
+	// aggregate sequence once, publishes revision/last_seen and snapshots every
+	// header field consumed by commit.
+	now = bpf_ktime_get_ns();
+	if (!faketcp_session_mutate(session, generation, now,
+				    FAKETCP_SESSION_MUTATE_TX,
+				    context.payload_length, &mutation)) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+		return TC_ACT_SHOT;
+	}
+	ack_window = mutation.acknowledgement |
+		     ((__u64)(mutation.window ? mutation.window : 65535) << 32);
 	result = wg_mix_faketcp_skb_commit_udp_gso(
-		skb, info->ip_off, info->udp_off, sequence, ack_window);
+		skb, info->ip_off, info->udp_off, mutation.sequence, ack_window);
 	if (result != FAKETCP_GSO_COMMIT_ACCEPT) {
 		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
 		return TC_ACT_SHOT;
 	}
-	session->last_seen_nanos = bpf_ktime_get_ns();
 	inc_stat(STAT_EGRESS_REWRITE_OK);
 	inc_stat(STAT_EGRESS_GSO_REWRITE_OK);
 	inc_faketcp_stat(FAKETCP_STAT_EGRESS_OK);

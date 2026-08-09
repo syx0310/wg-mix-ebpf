@@ -593,18 +593,21 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 	if strings.Contains(text, "bpf_map_delete_elem(&faketcp_session_map") {
 		t.Fatal("packet programs must never bypass the userspace exact-delete finalizer")
 	}
-	if got := strings.Count(text, "bpf_map_lookup_elem(&faketcp_session_map"); got != 4 {
-		t.Fatalf("session-map lookup sites=%d, want claim plus three packet paths", got)
+	if got := strings.Count(text, "bpf_map_lookup_elem(&faketcp_session_map"); got != 5 {
+		t.Fatalf("session-map lookup sites=%d, want claim plus four packet paths", got)
 	}
 
 	preflightStart := strings.Index(text, "faketcp_preflight_egress(struct __sk_buff")
+	gsoStart := strings.Index(text, "faketcp_encode_gso_segments(struct __sk_buff")
+	gsoEnd := strings.Index(text, "static __always_inline __s64 faketcp_rotation_checksum")
 	encodeStart := strings.Index(text, "faketcp_encode_established(struct __sk_buff")
 	xdpStart := strings.Index(text, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
-	if preflightStart < 0 || encodeStart < 0 || xdpStart < 0 ||
-		!(preflightStart < encodeStart && encodeStart < xdpStart) {
+	if preflightStart < 0 || gsoStart < 0 || gsoEnd < 0 || encodeStart < 0 || xdpStart < 0 ||
+		!(preflightStart < gsoStart && gsoStart < gsoEnd && gsoEnd < encodeStart && encodeStart < xdpStart) {
 		t.Fatal("FakeTCP packet path functions are missing or reordered")
 	}
-	preflight := text[preflightStart:encodeStart]
+	preflight := text[preflightStart:gsoStart]
+	gso := text[gsoStart:gsoEnd]
 	encode := text[encodeStart:xdpStart]
 	xdp := text[xdpStart:]
 	if !strings.Contains(preflight,
@@ -619,6 +622,21 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 	encoderMutation := strings.Index(encode, "faketcp_session_mutate(session, generation, now,")
 	if encoderMutation < 0 || strings.Contains(encode[:encoderMutation], "session->") {
 		t.Fatal("TC encoder consumed a session field before its sole locked mutation snapshot")
+	}
+	if strings.Contains(gso, "faketcp_session_admit_established") ||
+		strings.Contains(gso, "__sync_fetch_and_add") ||
+		strings.Count(gso, "FAKETCP_SESSION_MUTATE_TX") != 1 {
+		t.Fatal("GSO encoder regained an unlocked/redundant session path or lost its sole mutation")
+	}
+	gsoMutation := strings.Index(gso, "faketcp_session_mutate(session, generation, now,")
+	gsoPrepare := strings.Index(gso, "faketcp_prepare_udp(skb, info->ip_off, info->udp_off")
+	gsoTypeRewrite := strings.Index(gso, "faketcp_gso_rewrite_type")
+	gsoXOR := strings.Index(gso, "faketcp_gso_xor_chunk")
+	gsoCommit := strings.Index(gso, "wg_mix_faketcp_skb_commit_udp_gso(")
+	if gsoMutation < 0 || gsoPrepare < 0 || gsoTypeRewrite < 0 || gsoXOR < 0 || gsoCommit < 0 ||
+		strings.Contains(gso[:gsoMutation], "session->") ||
+		!(gsoPrepare < gsoTypeRewrite && gsoTypeRewrite < gsoXOR && gsoXOR < gsoMutation && gsoMutation < gsoCommit) {
+		t.Fatal("GSO validation/prepare/type/XOR must precede one locked snapshot and commit")
 	}
 	if strings.Count(xdp,
 		"faketcp_session_admit_established(session, generation)") != 1 ||
@@ -682,6 +700,7 @@ type establishedEncoderLockModel struct {
 	mu       sync.Mutex
 	state    uint8
 	sequence uint32
+	revision uint64
 	locks    uint64
 }
 
@@ -696,10 +715,22 @@ func (model *establishedEncoderLockModel) mutate(payload uint32) bool {
 	model.mu.Lock()
 	defer model.mu.Unlock()
 	model.locks++
-	if model.state != 3 {
+	if model.state != 3 || model.revision == ^uint64(0) {
 		return false
 	}
 	model.sequence += payload
+	model.revision++
+	return true
+}
+
+func (model *establishedEncoderLockModel) claim(expectedRevision uint64) bool {
+	model.mu.Lock()
+	defer model.mu.Unlock()
+	model.locks++
+	if model.state != 3 || model.revision != expectedRevision {
+		return false
+	}
+	model.state = 4
 	return true
 }
 
@@ -759,6 +790,54 @@ func BenchmarkFakeTCPEncoderValueLocks(b *testing.B) {
 			b.StopTimer()
 			b.ReportMetric(float64(model.locks)/float64(b.N), "value-locks/op")
 		})
+	}
+}
+
+func TestFakeTCPGSOFinalMutationHasOneLockAndSerializesDeleteClaim(t *testing.T) {
+	model := &establishedEncoderLockModel{state: 3, sequence: 100, revision: 7}
+	if !model.encodeWithSingleMutation(160) || model.sequence != 260 ||
+		model.revision != 8 || model.locks != 1 {
+		t.Fatalf("single aggregate mutation model=%#v", model)
+	}
+
+	claimed := &establishedEncoderLockModel{state: 3, sequence: 100, revision: 7}
+	if !claimed.claim(7) {
+		t.Fatal("fixture claim was rejected")
+	}
+	if claimed.encodeWithSingleMutation(160) || claimed.sequence != 100 ||
+		claimed.revision != 7 || claimed.locks != 2 {
+		t.Fatalf("claimed session accepted aggregate mutation: %#v", claimed)
+	}
+
+	for iteration := 0; iteration < 256; iteration++ {
+		tracing := &establishedEncoderLockModel{state: 3, sequence: 100, revision: 7}
+		start := make(chan struct{})
+		var wait sync.WaitGroup
+		var mutated, deleteClaimed bool
+		wait.Add(2)
+		go func() {
+			defer wait.Done()
+			<-start
+			mutated = tracing.encodeWithSingleMutation(160)
+		}()
+		go func() {
+			defer wait.Done()
+			<-start
+			deleteClaimed = tracing.claim(7)
+		}()
+		close(start)
+		wait.Wait()
+
+		if mutated == deleteClaimed || tracing.locks != 2 {
+			t.Fatalf("iteration %d mutation=%v claim=%v model=%#v", iteration, mutated, deleteClaimed, tracing)
+		}
+		if mutated {
+			if tracing.state != 3 || tracing.sequence != 260 || tracing.revision != 8 {
+				t.Fatalf("iteration %d mutation-first model=%#v", iteration, tracing)
+			}
+		} else if tracing.state != 4 || tracing.sequence != 100 || tracing.revision != 7 {
+			t.Fatalf("iteration %d claim-first model=%#v", iteration, tracing)
+		}
 	}
 }
 
