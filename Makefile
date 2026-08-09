@@ -19,12 +19,13 @@ FAKETCP_VERIFIER_LAUNCHER_AMD64 ?= bin/faketcp-verifier-launcher-linux-amd64
 FAKETCP_VERIFIER_LAUNCHER_ARM64 ?= bin/faketcp-verifier-launcher-linux-arm64
 FAKETCP_VERIFIER_LAUNCHER_TEST_AMD64 ?= build/verifierlauncher-linux-amd64.test
 FAKETCP_VERIFIER_LAUNCHER_TEST_ARM64 ?= build/verifierlauncher-linux-arm64.test
+FAKETCP_DATAPLANE_TEST_AMD64 ?= build/dataplane-linux-amd64.test
 EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 override BUILD_SOURCE_COMMIT := $(shell ./scripts/source-commit.sh)
 override BUILD_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/buildinfo.sourceCommit=$(BUILD_SOURCE_COMMIT)
 override NETNS_ANCHOR_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/netnsanchor.sourceCommit=$(BUILD_SOURCE_COMMIT)
 
-.PHONY: test-unit test-unit-race test-private-oss-history-replay test-lint test-live-guard-build-provenance test-faketcp-verifier-only test-faketcp-verifier-launcher test-bpf-object-manifests test-bpf-object-manifest-path-contract _test-bpf-object-manifests test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-smoke-script-helper test-stage-source-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns-tcp-pmtu-positive test-netns-tcp-pmtu-ipv4 test-netns-tcp-pmtu-ipv6 test-netns-tcp-outer-gso-observe test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-netns-anchor build-linux-amd64 build-linux-arm64 build-faketcp-verifier-launcher build-faketcp-verifier-launcher-linux-amd64 build-faketcp-verifier-launcher-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf build-faketcp-checksum-kmod prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-private-oss-history-replay test-lint test-live-guard-build-provenance test-faketcp-verifier-only test-faketcp-verifier-launcher test-b82-fresh-verifier-gate test-bpf-object-manifests test-bpf-object-manifest-path-contract _test-bpf-object-manifests test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-smoke-script-helper test-stage-source-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns-tcp-pmtu-positive test-netns-tcp-pmtu-ipv4 test-netns-tcp-pmtu-ipv6 test-netns-tcp-outer-gso-observe test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-netns-anchor build-linux-amd64 build-linux-arm64 build-faketcp-verifier-launcher build-faketcp-verifier-launcher-linux-amd64 build-faketcp-verifier-launcher-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf build-faketcp-checksum-kmod prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=$(CGO_ENABLED) $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -73,6 +74,16 @@ test-faketcp-verifier-launcher:
 test-faketcp-verifier-only: test-faketcp-verifier-launcher
 	scripts/test-faketcp-verifier-only.sh \
 		"$(CURDIR)/scripts/run-faketcp-verifier-only.py"
+
+test-b82-fresh-verifier-gate:
+	scripts/realhost-b82-c8e41d73/test-hermetic-checksum-module-lease.sh
+	scripts/realhost-b82-c8e41d73/test-hermetic-fresh-verifier-gate.sh \
+		"$(CURDIR)/scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh" \
+		"$(CURDIR)/scripts/realhost-b82-c8e41d73/checksum-module-lease.sh" \
+		"$(CURDIR)/scripts/realhost-b82-c8e41d73/test_fresh_verifier_gate_static.py"
+	@mkdir -p $(dir $(FAKETCP_DATAPLANE_TEST_AMD64))
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+		$(GO) test -c -o $(FAKETCP_DATAPLANE_TEST_AMD64) ./internal/dataplane
 
 build-bpf:
 	@mkdir -p $(dir $(BPF_OBJECT))
@@ -191,7 +202,7 @@ test-private-oss-history-replay:
 		echo "SKIP: private OSS history replay gate not present"; \
 	fi
 
-test-unit: test-pcap-helper test-smoke-script-helper test-stage-source-helper test-bpf-object-manifest-path-contract test-private-oss-history-replay
+test-unit: test-pcap-helper test-smoke-script-helper test-stage-source-helper test-bpf-object-manifest-path-contract test-private-oss-history-replay test-b82-fresh-verifier-gate
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./...
 
 test-unit-race:
@@ -204,8 +215,8 @@ test-lint:
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) vet ./...
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet ./internal/verifierlauncher ./cmd/faketcp-verifier-launcher
 	sh -n scripts/source-commit.sh scripts/test-bpf-object-manifest-path-contract.sh
-	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/run-smoke-netns-wg-private-mountns.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh scripts/test-faketcp-verifier-only.sh
-	/usr/bin/python3 -I -c 'from pathlib import Path; [compile(Path(p).read_text(), p, "exec") for p in ("scripts/run-faketcp-verifier-only.py", "scripts/test_faketcp_verifier_only.py")]'
+	bash -n scripts/inspect-linux-test-host.sh scripts/provision-ubuntu-test-host.sh scripts/run-smoke-netns-wg-private-mountns.sh scripts/smoke-netns-wg.sh scripts/smoke-netns-icmp.sh scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh scripts/test-faketcp-verifier-only.sh scripts/realhost-b82-c8e41d73/checksum-module-lease.sh scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh scripts/realhost-b82-c8e41d73/test-hermetic-fresh-verifier-gate.sh
+	/usr/bin/python3 -I -c 'from pathlib import Path; [compile(Path(p).read_text(), p, "exec") for p in ("scripts/run-faketcp-verifier-only.py", "scripts/test_faketcp_verifier_only.py", "scripts/realhost-b82-c8e41d73/test_fresh_verifier_gate_static.py")]'
 	scripts/inspect-linux-test-host.sh --self-test-nft-table-gate
 	scripts/provision-ubuntu-test-host.sh --self-test-apt-gate
 	scripts/build-live-guard-test.sh --self-test-safety-gate
@@ -216,6 +227,7 @@ test-lint:
 	fi
 	scripts/test-live-guard-ownership.sh --self-test-safety-gate
 	$(MAKE) --no-print-directory test-faketcp-verifier-only
+	$(MAKE) --no-print-directory test-b82-fresh-verifier-gate
 	@if test "$$(/usr/bin/uname -s)" = Linux && \
 		test "$$(/usr/bin/id -u)" != 0 && \
 		test -x /usr/bin/go && test -x /usr/bin/timeout && \
@@ -227,7 +239,7 @@ test-lint:
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet -tags realhosttest ./internal/guard
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 $(GO) vet ./internal/netnsanchor ./cmd/wg-mix-ebpf-netns-anchor
 	@if command -v shellcheck >/dev/null 2>&1; then \
-		shellcheck scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-smoke-netns-wg-private-mountns.sh scripts/smoke-netns-wg.sh scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh scripts/test-faketcp-verifier-only.sh; \
+		shellcheck scripts/build-live-guard-test.sh scripts/test-build-live-guard-provenance.sh scripts/test-live-guard-ownership.sh scripts/run-smoke-netns-wg-private-mountns.sh scripts/smoke-netns-wg.sh scripts/run-root-owned-test-source-stage.sh scripts/stage-root-owned-test-source.sh scripts/test-faketcp-verifier-only.sh scripts/realhost-b82-c8e41d73/checksum-module-lease.sh scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh scripts/realhost-b82-c8e41d73/test-hermetic-fresh-verifier-gate.sh; \
 	else \
 		echo "skip: shellcheck is unavailable"; \
 	fi

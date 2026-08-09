@@ -61,6 +61,18 @@ HERMETIC_SHA256=''
 STATIC_PATH=''
 STATIC_BLOB=''
 STATIC_SHA256=''
+MODULE_LEASE_HELPER_PATH=''
+MODULE_LEASE_HELPER_BLOB=''
+MODULE_LEASE_HELPER_SHA256=''
+ROOT_FRESH_PATH=''
+ROOT_FRESH_BLOB=''
+ROOT_FRESH_SHA256=''
+FRESH_HERMETIC_PATH=''
+FRESH_HERMETIC_BLOB=''
+FRESH_HERMETIC_SHA256=''
+FRESH_STATIC_PATH=''
+FRESH_STATIC_BLOB=''
+FRESH_STATIC_SHA256=''
 PREPARE_PATH=''
 PREPARE_BLOB=''
 PREPARE_SHA256=''
@@ -171,6 +183,18 @@ load_manifest() {
     read_manifest_field test_matrix_static_py_path STATIC_PATH &&
     read_manifest_field test_matrix_static_py_blob STATIC_BLOB &&
     read_manifest_field test_matrix_static_py_sha256 STATIC_SHA256 &&
+    read_manifest_field checksum_module_lease_sh_path MODULE_LEASE_HELPER_PATH &&
+    read_manifest_field checksum_module_lease_sh_blob MODULE_LEASE_HELPER_BLOB &&
+    read_manifest_field checksum_module_lease_sh_sha256 MODULE_LEASE_HELPER_SHA256 &&
+    read_manifest_field root_fresh_verifier_gate_sh_path ROOT_FRESH_PATH &&
+    read_manifest_field root_fresh_verifier_gate_sh_blob ROOT_FRESH_BLOB &&
+    read_manifest_field root_fresh_verifier_gate_sh_sha256 ROOT_FRESH_SHA256 &&
+    read_manifest_field test_hermetic_fresh_verifier_gate_sh_path FRESH_HERMETIC_PATH &&
+    read_manifest_field test_hermetic_fresh_verifier_gate_sh_blob FRESH_HERMETIC_BLOB &&
+    read_manifest_field test_hermetic_fresh_verifier_gate_sh_sha256 FRESH_HERMETIC_SHA256 &&
+    read_manifest_field test_fresh_verifier_gate_static_py_path FRESH_STATIC_PATH &&
+    read_manifest_field test_fresh_verifier_gate_static_py_blob FRESH_STATIC_BLOB &&
+    read_manifest_field test_fresh_verifier_gate_static_py_sha256 FRESH_STATIC_SHA256 &&
     read_manifest_field prepare_stage_root_sh_path PREPARE_PATH &&
     read_manifest_field prepare_stage_root_sh_blob PREPARE_BLOB &&
     read_manifest_field prepare_stage_root_sh_sha256 PREPARE_SHA256 &&
@@ -189,7 +213,7 @@ load_manifest() {
 
 validate_manifest() {
   load_manifest || return $?
-  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v1' &&
+  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v2' &&
     "${MANIFEST_RUN_ID}" == "${RUN_ID}" && "${MANIFEST_PACKAGE_ID}" == "${PACKAGE_ID}" &&
     "${INTEGRATION_REF}" =~ ^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$ &&
     "${INTEGRATION_REF}" != *'..'* && "${INTEGRATION_REF}" != *'//'* &&
@@ -204,16 +228,26 @@ validate_manifest() {
     "${SOAK_SECONDS}" == '3600' && "${SESSION_SECONDS}" == '300' ]] || return 65
   valid_sha256 "${BUNDLE_SHA256}" && valid_sha256 "${ROOT_MATRIX_SHA256}" &&
     valid_sha256 "${CHECKER_SHA256}" && valid_sha256 "${HERMETIC_SHA256}" &&
-    valid_sha256 "${STATIC_SHA256}" && valid_sha256 "${PREPARE_SHA256}" &&
+    valid_sha256 "${STATIC_SHA256}" && valid_sha256 "${MODULE_LEASE_HELPER_SHA256}" &&
+    valid_sha256 "${ROOT_FRESH_SHA256}" && valid_sha256 "${FRESH_HERMETIC_SHA256}" &&
+    valid_sha256 "${FRESH_STATIC_SHA256}" && valid_sha256 "${PREPARE_SHA256}" &&
     valid_sha256 "${PROVISION_SHA256}" || return 65
   [[ "${ROOT_MATRIX_BLOB}" =~ ^[0-9a-f]{40}$ && "${CHECKER_BLOB}" =~ ^[0-9a-f]{40}$ &&
     "${HERMETIC_BLOB}" =~ ^[0-9a-f]{40}$ && "${STATIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
+    "${MODULE_LEASE_HELPER_BLOB}" =~ ^[0-9a-f]{40}$ &&
+    "${ROOT_FRESH_BLOB}" =~ ^[0-9a-f]{40}$ &&
+    "${FRESH_HERMETIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
+    "${FRESH_STATIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
     "${PREPARE_BLOB}" =~ ^[0-9a-f]{40}$ && "${PROVISION_BLOB}" =~ ^[0-9a-f]{40}$ &&
     -n "${IGNORED}" ]] || return 65
   [[ "${ROOT_MATRIX_PATH}" == "scripts/realhost-b82-${RUN_ID}/root-matrix-n-r.sh" &&
     "${CHECKER_PATH}" == "scripts/realhost-b82-${RUN_ID}/check-realhost-iperf.py" &&
     "${HERMETIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test-hermetic-matrix.sh" &&
     "${STATIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test_matrix_static.py" &&
+    "${MODULE_LEASE_HELPER_PATH}" == "${MODULE_LEASE_HELPER_RELATIVE}" &&
+    "${ROOT_FRESH_PATH}" == "scripts/realhost-b82-${RUN_ID}/root-fresh-verifier-gate.sh" &&
+    "${FRESH_HERMETIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test-hermetic-fresh-verifier-gate.sh" &&
+    "${FRESH_STATIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test_fresh_verifier_gate_static.py" &&
     "${PREPARE_PATH}" == "scripts/realhost-b82-${RUN_ID}/prepare-stage-root.sh" &&
     "${PROVISION_PATH}" == 'scripts/provision-ubuntu-test-host.sh' ]] || return 65
   case "${WG_STATE}" in
@@ -276,11 +310,13 @@ render_plan() {
     checkout --detach "${INTEGRATION_COMMIT}"
   plan_command S6 /bin/bash -n "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" \
     "${EXPECTED_SOURCE}/${HERMETIC_PATH}" "${EXPECTED_SOURCE}/${PREPARE_PATH}" \
-    "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}" \
+    "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
+    "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PROVISION_PATH}"
   plan_command S7 /usr/bin/shellcheck --norc --shell=bash -- \
     "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" "${EXPECTED_SOURCE}/${HERMETIC_PATH}" \
-    "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}" \
+    "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
+    "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PROVISION_PATH}"
   plan_command S8 shell-builtin noclobber-write "${BINDING_MARKER}"
   printf 'B82_V6_STAGE_PLAN_COMPLETE no_commands_executed=1 no_cleanup=1\n'
@@ -417,7 +453,9 @@ write_binding_marker() {
       "run_id=${RUN_ID}" "package_id=${PACKAGE_ID}" \
       "integration_ref=${INTEGRATION_REF}" "integration_commit=${INTEGRATION_COMMIT}" \
       "bundle_sha256=${BUNDLE_SHA256}" "manifest_sha256=${MANIFEST_SHA256}" \
-      "wg_state=${WG_STATE}" "module_lease_lock=${MODULE_LEASE_LOCK}" >"${BINDING_MARKER}")
+      "wg_state=${WG_STATE}" "module_lease_lock=${MODULE_LEASE_LOCK}" \
+      "module_lease_helper=${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
+      "fresh_verifier_gate=${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" >"${BINDING_MARKER}")
 }
 
 require_module_lease_lock() {
@@ -456,16 +494,22 @@ run_stage() {
     "$(sha256_file "${EXPECTED_SOURCE}/${CHECKER_PATH}")" == "${CHECKER_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${HERMETIC_PATH}")" == "${HERMETIC_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${STATIC_PATH}")" == "${STATIC_SHA256}" &&
+    "$(sha256_file "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}")" == "${MODULE_LEASE_HELPER_SHA256}" &&
+    "$(sha256_file "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}")" == "${ROOT_FRESH_SHA256}" &&
+    "$(sha256_file "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}")" == "${FRESH_HERMETIC_SHA256}" &&
+    "$(sha256_file "${EXPECTED_SOURCE}/${FRESH_STATIC_PATH}")" == "${FRESH_STATIC_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${PREPARE_PATH}")" == "${PREPARE_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${PROVISION_PATH}")" == "${PROVISION_SHA256}" ]] ||
     fail 'staged-script-hash' 79
   run_step S6 /bin/bash -n "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" \
     "${EXPECTED_SOURCE}/${HERMETIC_PATH}" "${EXPECTED_SOURCE}/${PREPARE_PATH}" \
-    "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}" \
+    "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
+    "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PROVISION_PATH}" || fail 'bash-syntax' $?
   run_step S7 /usr/bin/shellcheck --norc --shell=bash -- \
     "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" "${EXPECTED_SOURCE}/${HERMETIC_PATH}" \
-    "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}" \
+    "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
+    "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PROVISION_PATH}" || fail 'shellcheck' $?
   stage_status="$(git_stage -C "${EXPECTED_SOURCE}" status --porcelain=v1 --untracked-files=all)" || fail 'stage-status'
   [[ -z "${stage_status}" ]] || fail 'stage-dirty' 79

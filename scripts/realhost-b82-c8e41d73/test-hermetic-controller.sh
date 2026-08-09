@@ -98,6 +98,8 @@ printf 'history-root=%s\n' "${TEST_ROOT##*/}" >"${FIXTURE_REPOSITORY}/history-ro
 for name in \
   bind-final-package.sh controller.sh locked-transport.exp prepare-stage-root.sh \
   root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh test_matrix_static.py \
+  root-fresh-verifier-gate.sh test-hermetic-fresh-verifier-gate.sh \
+  test_fresh_verifier_gate_static.py \
   checksum-module-lease.sh test-hermetic-checksum-module-lease.sh \
   test_checksum_module_lease_static.py test_provision_policy.tcl; do
   /bin/cp -- "${REVIEW_ROOT}/${name}" "${FIXTURE_REVIEW}/${name}" || fail "fixture copy ${name}"
@@ -151,6 +153,16 @@ BOUND_MANIFEST_SHA="$(sha256_file "${BOUND_MANIFEST}")" || fail 'manifest digest
 [[ "$(sha256_file "${BOUND_OUTPUT}/provision-ubuntu-test-host.sh")" == \
   "$(manifest_value provision_ubuntu_test_host_sh_sha256 "${BOUND_MANIFEST}")" ]] ||
   fail 'provisioner package digest binding'
+[[ "$(manifest_value format "${BOUND_MANIFEST}")" == 'wg-mix-ebpf-b82-v6-package-v2' &&
+  "$(manifest_value checksum_module_lease_sh_path "${BOUND_MANIFEST}")" == \
+    'scripts/realhost-b82-c8e41d73/checksum-module-lease.sh' &&
+  "$(manifest_value root_fresh_verifier_gate_sh_path "${BOUND_MANIFEST}")" == \
+    'scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh' &&
+  "$(sha256_file "${BOUND_OUTPUT}/checksum-module-lease.sh")" == \
+    "$(manifest_value checksum_module_lease_sh_sha256 "${BOUND_MANIFEST}")" &&
+  "$(sha256_file "${BOUND_OUTPUT}/root-fresh-verifier-gate.sh")" == \
+    "$(manifest_value root_fresh_verifier_gate_sh_sha256 "${BOUND_MANIFEST}")" ]] ||
+  fail 'single-schema fresh authority binding'
 /usr/bin/git -C "${BOUND_OUTPUT}/history-verification.git" fsck --full --strict --no-dangling \
   "${FIXTURE_COMMIT}" || fail 'isolated history fsck'
 /usr/bin/grep -E '^\?' -- "${BOUND_OUTPUT}/history-objects.v1"
@@ -176,6 +188,7 @@ for literal in \
   '/usr/sbin/bpftool -V' \
   'operation=kernel-btf transport=ssh credential_read=0 network_operations=0' \
   'operation=scp-source-4f2a9b61.bundle transport=scp credential_read=0 network_operations=0' \
+  'operation=scp-root-fresh-verifier-gate.sh transport=scp credential_read=0 network_operations=0' \
   "${FIXTURE_REPOSITORY}/scripts/realhost-b82-c8e41d73/locked-transport.exp" \
   "${BOUND_OUTPUT}/source-4f2a9b61.bundle" \
   'siyixuan@192.168.10.82:/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/source-4f2a9b61.bundle' \
@@ -212,6 +225,11 @@ for literal in \
   '/bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh snapshot --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1' \
   '/bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh plan --manifest /run/wg-mix-ebpf-source-bootstrap-c8e41d73/package-manifest.v1' \
   '/bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh run --manifest /run/wg-mix-ebpf-source-bootstrap-c8e41d73/package-manifest.v1' \
+  'operation=hermetic-fresh transport=ssh credential_read=0 network_operations=0' \
+  'operation=fresh-plan transport=ssh credential_read=0 network_operations=0' \
+  'operation=fresh-run transport=ssh credential_read=0 network_operations=0' \
+  'operation=fresh-restore transport=ssh credential_read=0 network_operations=0' \
+  '/bin/bash -p /run/wg-mix-ebpf-source-stages/c8e41d73/source/scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh run --controller-source /run/wg-mix-ebpf-source-stages/c8e41d73/source' \
   'operation=matrix-run transport=ssh credential_read=0 network_operations=0' \
   '--wg-interface wg0 --wg-local-address 10.200.0.1 --wg-peer-address 10.200.0.2' \
   'B82_V6_CONTROLLER_PLAN_COMPLETE credential_read=0 network_operations=0 mutations=0'; do
@@ -249,7 +267,10 @@ require_ordered_literals "${CONTROLLER_PLAN}" \
   'operation=bootstrap-stager-sha ' \
   'operation=stage-snapshot ' \
   'operation=stage-plan ' \
-  'operation=stage-run '
+  'operation=stage-run ' \
+  'operation=fresh-plan ' \
+  'operation=fresh-run ' \
+  'operation=fresh-restore '
 
 BOOTSTRAP_FIXTURE="${TEST_ROOT}/bootstrap-first-run-c8e41d73"
 [[ ! -e "${BOOTSTRAP_FIXTURE}" && ! -L "${BOOTSTRAP_FIXTURE}" ]] || fail 'bootstrap fixture was not fresh'
@@ -413,10 +434,21 @@ ABSENT_PLAN="$(/bin/bash "${FIXTURE_REVIEW}/controller.sh" plan "${ABSENT_CONTRO
 [[ "${ABSENT_PLAN}" == *'B82_V6_MATRIX_BLOCKED reason=wireguard-topology-absent wg_active_scoped=not-covered pass=0'* ]] ||
   fail 'absent WireGuard matrix block missing'
 [[ "${ABSENT_PLAN}" != *'operation=matrix-run'* ]] || fail 'absent plan rendered matrix execution'
+for operation in fresh-plan fresh-run fresh-restore; do
+  [[ "${ABSENT_PLAN}" == *"operation=${operation} transport=ssh credential_read=0 network_operations=0"* ]] ||
+    fail "absent WireGuard plan cannot reach ${operation}"
+done
+ABSENT_FRESH_TRANSPORT="$(/usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
+  --manifest "${ABSENT_MANIFEST}" --manifest-sha256 "${ABSENT_MANIFEST_SHA}" \
+  --credential-path "${CREDENTIAL_PATH}" --action plan --operation fresh-run)" ||
+  fail 'absent fresh transport plan'
+[[ "${ABSENT_FRESH_TRANSPORT}" == *'credential_read=0 network_operations=0'* &&
+  "${ABSENT_FRESH_TRANSPORT}" == *'root-fresh-verifier-gate.sh run --controller-source'* ]] ||
+  fail 'absent fresh transport reachability'
 expect_failure absent-matrix-run /bin/bash "${FIXTURE_REVIEW}/controller.sh" run "${ABSENT_CONTROLLER_ARGS[@]}"
 
 printf '%s\n' \
   'hermetic v6 full-history binder, explicit toolchain state machine, root-owned bootstrap,' \
   'SSH/SCP/Expect fixed check/apply plans, provision output policy,' \
-  'immutable-intake/shallow/failure paths and WireGuard absence: PASS'
+  'immutable-intake/shallow/failure paths and WireGuard-absent fresh reachability: PASS'
 printf 'RETAINED_HERMETIC_ROOT path=%s reason=auditable-no-cleanup-test-policy\n' "${TEST_ROOT}"

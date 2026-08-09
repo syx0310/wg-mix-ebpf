@@ -84,6 +84,7 @@ def main() -> None:
         "manifest_line history_commit_count",
         "manifest_line history_roots_sha256",
         "manifest_line history_objects_sha256",
+        "wg-mix-ebpf-b82-v6-package-v2",
         "manifest_line wg_state",
         "absent)",
         '"${WG_INTERFACE}" == \'absent\'',
@@ -91,6 +92,10 @@ def main() -> None:
         "scripts/provision-ubuntu-test-host.sh",
         "locked-transport.exp",
         "controller.sh",
+        "checksum-module-lease.sh",
+        "root-fresh-verifier-gate.sh",
+        "test-hermetic-fresh-verifier-gate.sh",
+        "test_fresh_verifier_gate_static.py",
     )
     for literal in required_binder:
         if literal not in binder:
@@ -133,6 +138,13 @@ def main() -> None:
         "run_operation execute provision-apply",
         "B82_V6_PROVISION_AWAIT_APPLY",
         "automatic_apply=0",
+        "fresh-plan | fresh-run | fresh-restore",
+        "for operation in fresh-plan fresh-run fresh-restore",
+        "run_operation execute fresh-plan",
+        "run_operation execute fresh-run",
+        "run_operation execute fresh-restore",
+        "CHECKSUM_MODULE_LEASE_SH_PATH",
+        "ROOT_FRESH_VERIFIER_GATE_SH_PATH",
     )
     for literal in required_controller:
         if literal not in controller:
@@ -141,6 +153,11 @@ def main() -> None:
         fail("controller contains an implicit package installation path")
     if "open ${CREDENTIAL" in controller or "<\"${CREDENTIAL" in controller:
         fail("controller directly reads the credential file")
+    for mode in ("fresh-plan", "fresh-run", "fresh-restore"):
+        if not re.search(
+            rf"{mode}\)\s+run_operation execute {mode}", controller, re.MULTILINE
+        ):
+            fail(f"controller {mode} is not an independent fixed operation")
     prepare_body = controller[
         controller.index("execute_prepare() {") : controller.index("execute_provision_apply() {")
     ]
@@ -212,6 +229,11 @@ def main() -> None:
         "/usr/bin/test -r /sys/kernel/btf/vmlinux",
         "/usr/bin/findmnt --noheadings --raw --output FSTYPE,TARGET --target /sys/fs/bpf",
         "controller-shellcheck",
+        "hermetic-fresh",
+        "proc fresh_remote_argv",
+        "fresh-plan - fresh-run - fresh-restore",
+        "/root-fresh-verifier-gate.sh",
+        "--controller-source $source",
         'set bootstrap_root "/run/wg-mix-ebpf-source-bootstrap-c8e41d73"',
         "bootstrap-absent",
         "/usr/bin/test ! -e $bootstrap_root",
@@ -263,6 +285,11 @@ def main() -> None:
         fail("transport accepts a caller-supplied remote argv")
     if "/usr/sbin/bpftool version" in transport:
         fail("transport retains the legacy bpftool version argv")
+    fresh_argv_body = transport[
+        transport.index("proc fresh_remote_argv") : transport.index("proc package_sha")
+    ]
+    if "wg_state" in fresh_argv_body or "wireguard" in fresh_argv_body.lower():
+        fail("fresh transport reachability depends on WireGuard topology")
     if re.search(
         r'/bin/bash\s+-p\s+"?\$\{package\}/prepare-stage-root\.sh', transport
     ):
@@ -333,7 +360,12 @@ def main() -> None:
         "module-lease-lock-create",
         "module-lease-lock-drift",
         '"module_lease_lock=${MODULE_LEASE_LOCK}"',
-        '"${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}"',
+        '"${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}"',
+        "checksum_module_lease_sh_path",
+        "root_fresh_verifier_gate_sh_path",
+        "test_hermetic_fresh_verifier_gate_sh_path",
+        "test_fresh_verifier_gate_static_py_path",
+        '"${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}"',
         "provision_ubuntu_test_host_sh_path",
         "provision_ubuntu_test_host_sh_blob",
         "provision_ubuntu_test_host_sh_sha256",
