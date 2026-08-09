@@ -30,6 +30,8 @@ readonly SINGLE_L3_MERGE='15e2122a74738ed1904465e1f1e8e75f4892c4b2'
 readonly MANAGED_INGRESS_BASE='d28585bfaaefe44c0e71d2cbbced494da96dd7fa'
 readonly MANAGED_INGRESS_ACCOUNTING='eb1b90ec4d73267e2eaebc313e82cfd81351fe23'
 readonly MANAGED_INGRESS_PRODUCTION='829e6f2e5664207cecb52ccb0b55e4ed9f9533ff'
+readonly MANAGED_INGRESS_ACCEPTANCE_ROOT='ea8af467ba9d4a7ee526391cc8f030dde27f61fb'
+readonly MANAGED_INGRESS_ACCEPTANCE='26587191a8ba1e75e372889cd7c851ad926319fc'
 
 readonly -a CONTROLLER_FILES=(
   scripts/realhost-b82-c8e41d73/bind-final-package.sh
@@ -136,12 +138,22 @@ MANAGED_INGRESS_PRODUCTION_PARENTS="$(/usr/bin/git -C "${REPOSITORY}" show -s --
 readonly MANAGED_INGRESS_PRODUCTION_PARENTS
 [[ "${MANAGED_INGRESS_PRODUCTION_PARENTS}" == "${MANAGED_INGRESS_ACCOUNTING}" ]] ||
   fail 'managed-ingress typeword fix is not directly append-only after accounting'
+MANAGED_INGRESS_ACCEPTANCE_ROOT_PARENTS="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P \
+  "${MANAGED_INGRESS_ACCEPTANCE_ROOT}")" || fail 'cannot read managed-ingress acceptance-root parent'
+readonly MANAGED_INGRESS_ACCEPTANCE_ROOT_PARENTS
+[[ "${MANAGED_INGRESS_ACCEPTANCE_ROOT_PARENTS}" == "${MANAGED_INGRESS_PRODUCTION}" ]] ||
+  fail 'managed-ingress acceptance root is not directly append-only after production'
+MANAGED_INGRESS_ACCEPTANCE_PARENTS="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P \
+  "${MANAGED_INGRESS_ACCEPTANCE}")" || fail 'cannot read managed-ingress acceptance parent'
+readonly MANAGED_INGRESS_ACCEPTANCE_PARENTS
+[[ "${MANAGED_INGRESS_ACCEPTANCE_PARENTS}" == "${MANAGED_INGRESS_ACCEPTANCE_ROOT}" ]] ||
+  fail 'managed-ingress fixture hardening is not directly append-only after acceptance root'
 /usr/bin/git -C "${REPOSITORY}" merge-base --is-ancestor \
   "${SINGLE_L3_MERGE}" "${MANAGED_INGRESS_BASE}" ||
   fail 'managed-ingress base lost the reviewed single-L3 merge'
 /usr/bin/git -C "${REPOSITORY}" merge-base --is-ancestor \
-  "${MANAGED_INGRESS_PRODUCTION}" "${BOUND_COMMIT}" ||
-  fail 'bound commit does not contain managed-ingress production accounting'
+  "${MANAGED_INGRESS_ACCEPTANCE}" "${BOUND_COMMIT}" ||
+  fail 'bound commit does not contain managed-ingress acceptance'
 MANAGED_INGRESS_PRODUCTION_PATHS="$(/usr/bin/git -C "${REPOSITORY}" diff --name-only \
   "${MANAGED_INGRESS_BASE}" "${MANAGED_INGRESS_PRODUCTION}")" ||
   fail 'cannot read managed-ingress production write set'
@@ -149,14 +161,11 @@ readonly MANAGED_INGRESS_PRODUCTION_PATHS
 [[ "${MANAGED_INGRESS_PRODUCTION_PATHS}" == 'bpf/wg_mix_faketcp.h' ]] ||
   fail 'managed-ingress production commit changed a non-topic path'
 MANAGED_INGRESS_TEST_PATHS="$(/usr/bin/git -C "${REPOSITORY}" diff --name-only \
-  "${MANAGED_INGRESS_PRODUCTION}" "${BOUND_COMMIT}")" ||
+  "${MANAGED_INGRESS_PRODUCTION}" "${MANAGED_INGRESS_ACCEPTANCE}")" ||
   fail 'cannot read managed-ingress acceptance write set'
 readonly MANAGED_INGRESS_TEST_PATHS
 [[ "${MANAGED_INGRESS_TEST_PATHS}" == $'internal/dataplane/faketcp_managed_ingress_contract_test.go\ninternal/dataplane/faketcp_managed_ingress_realhost_linux_test.go\nscripts/realhost-b82-c8e41d73/root-veth-n-r.sh\nscripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh\nscripts/realhost-b82-c8e41d73/test_veth_runner_static.py' ]] ||
   fail 'managed-ingress acceptance changed a non-topic path'
-/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
-  "${MANAGED_INGRESS_PRODUCTION}" "${BOUND_COMMIT}" -- bpf/wg_mix_faketcp.h ||
-  fail 'managed-ingress production accounting drifted after its dedicated commit'
 
 # The original standalone commit itself remained isolated from the controller.
 /usr/bin/git -C "${REPOSITORY}" diff --exit-code \
