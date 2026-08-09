@@ -588,7 +588,6 @@ plan_all() {
     run_operation plan "${operation}" || return $?
   done
   for operation in "${POSTFLIGHT_OPERATIONS[@]}" controller-shellcheck hermetic-matrix hermetic-fresh \
-    hermetic-realnic-unit hermetic-realnic-static \
     "${STAGER_VERIFY_OPERATIONS[@]}" "${STAGE_OPERATIONS[@]}"; do
     run_operation plan "${operation}" || return $?
   done
@@ -680,8 +679,7 @@ run_provision_check() {
 execute_postflight() {
   local operation
   verify_remote_package || return $?
-  for operation in "${POSTFLIGHT_OPERATIONS[@]}" controller-shellcheck hermetic-matrix hermetic-fresh \
-    hermetic-realnic-unit hermetic-realnic-static; do
+  for operation in "${POSTFLIGHT_OPERATIONS[@]}" controller-shellcheck hermetic-matrix hermetic-fresh; do
     run_operation execute "${operation}" || return $?
   done
   verify_stager || return $?

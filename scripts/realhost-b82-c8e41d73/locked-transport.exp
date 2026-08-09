@@ -426,17 +426,6 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
                 "${package}/test_fresh_verifier_gate_static.py"]]
             set timeout_seconds 660
         }
-        hermetic-realnic-unit {
-            set remote [concat [env_argv] [list /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
-                /usr/bin/python3 -B -I "${package}/test_realnic_acceptance.py"]]
-            set timeout_seconds 660
-        }
-        hermetic-realnic-static {
-            set remote [concat [env_argv] [list /usr/bin/timeout --signal=TERM --kill-after=10s 2m \
-                /usr/bin/python3 -B -I "${package}/test_realnic_acceptance_static.py" \
-                "${package}/realnic_acceptance.py"]]
-            set timeout_seconds 180
-        }
         controller-shellcheck {
             set remote [concat [env_argv] [list /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
                 /usr/bin/shellcheck --norc --shell=bash -- \

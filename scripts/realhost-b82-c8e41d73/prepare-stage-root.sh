@@ -387,6 +387,12 @@ render_plan() {
     "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PROVISION_PATH}"
   plan_command S6.realnic /usr/bin/python3 -B -I "${EXPECTED_SOURCE}/${REALNIC_PATH}" --help
+  plan_command S6.realnic-unit /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    PYTHONDONTWRITEBYTECODE=1 /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
+    /usr/bin/python3 -B -I "${EXPECTED_SOURCE}/${REALNIC_TEST_PATH}"
+  plan_command S6.realnic-static /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    PYTHONDONTWRITEBYTECODE=1 /usr/bin/timeout --signal=TERM --kill-after=10s 2m \
+    /usr/bin/python3 -B -I "${EXPECTED_SOURCE}/${REALNIC_STATIC_PATH}"
   plan_command S7 /usr/bin/shellcheck --norc --shell=bash -- \
     "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" "${EXPECTED_SOURCE}/${HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
@@ -764,6 +770,14 @@ run_stage() {
     "${EXPECTED_SOURCE}/${PROVISION_PATH}" || fail 'bash-syntax' $?
   run_step S6.realnic /usr/bin/python3 -B -I \
     "${EXPECTED_SOURCE}/${REALNIC_PATH}" --help || fail 'realnic-python-syntax' $?
+  run_step S6.realnic-unit /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    PYTHONDONTWRITEBYTECODE=1 /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
+    /usr/bin/python3 -B -I "${EXPECTED_SOURCE}/${REALNIC_TEST_PATH}" ||
+    fail 'realnic-hermetic-unit' $?
+  run_step S6.realnic-static /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+    PYTHONDONTWRITEBYTECODE=1 /usr/bin/timeout --signal=TERM --kill-after=10s 2m \
+    /usr/bin/python3 -B -I "${EXPECTED_SOURCE}/${REALNIC_STATIC_PATH}" ||
+    fail 'realnic-hermetic-static' $?
   run_step S7 /usr/bin/shellcheck --norc --shell=bash -- \
     "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" "${EXPECTED_SOURCE}/${HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
