@@ -1320,6 +1320,27 @@ def ethtool_steps(
                 target=f"netdev:{spec.interface}",
             )
         )
+        children = sorted(
+            child
+            for child, entry in features.items()
+            if entry.get("parent") == name and not bool(entry["fixed"])
+        )
+        for child in children:
+            restore.append(
+                command_step(
+                    spec.run_root,
+                    f"{cell_name}.restore.{len(restore):02d}.{child}",
+                    [
+                        TOOLS["ethtool"],
+                        "-K",
+                        spec.interface,
+                        child,
+                        "on" if bool(features[child]["enabled"]) else "off",
+                    ],
+                    20,
+                    target=f"netdev:{spec.interface}",
+                )
+            )
     return mutation, restore, expected, unsupported
 
 

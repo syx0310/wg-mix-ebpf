@@ -300,7 +300,7 @@ def fixture_outputs(spec, *, fixed=()):
         suffix = " [fixed]" if name in fixed else ""
         features.append(f"{name}: {'on' if initial[name] else 'off'}{suffix}")
         if name == "tx-checksumming":
-            features.append("    tx-checksum-ipv4: on")
+            features.append("    tx-checksum-ipv4: off")
     features.append("foreign-offload: on")
     def json_bytes(value):
         return json.dumps(value).encode()
@@ -875,7 +875,8 @@ class PlannerTests(unittest.TestCase):
                 continue
             changed = [step["argv"][-2] for step in cell["mutation"] if step["argv"][0] == MODULE.TOOLS["ethtool"]]
             restored = [step["argv"][-2] for step in cell["restore"] if step["argv"][0] == MODULE.TOOLS["ethtool"]]
-            self.assertEqual(restored, list(reversed(changed)), cell["name"])
+            restored_primary = [name for name in restored if name in MODULE.FEATURE_ORDER]
+            self.assertEqual(restored_primary, list(reversed(changed)), cell["name"])
             for step in cell["restore"]:
                 if step["argv"][0] == MODULE.TOOLS["ethtool"]:
                     name, state = step["argv"][-2:]
@@ -894,7 +895,11 @@ class PlannerTests(unittest.TestCase):
         expected = [name for name in MODULE.FEATURE_DISABLE_ORDER if snapshot["features"][name]["enabled"]]
         self.assertEqual(names, expected)
         self.assertEqual(
-            [step["argv"][-2] for step in all_off["restore"]],
+            [
+                step["argv"][-2]
+                for step in all_off["restore"]
+                if step["argv"][-2] in MODULE.FEATURE_ORDER
+            ],
             list(reversed(expected)),
         )
 
@@ -1187,9 +1192,45 @@ class HermeticStateMachineTests(unittest.TestCase):
             ):
                 with self.assertRaises(MODULE.HarnessError):
                     MODULE.run_mode(spec, plan_path, digest, runner)
-                runner.features["tx-checksum-ipv4"] = False
+                runner.features["tx-checksum-ipv4"] = True
                 with self.assertRaisesRegex(MODULE.HarnessError, "owned feature closure mismatch"):
                     MODULE.restore_mode(spec, plan_path, digest, runner)
+
+    def test_cascaded_feature_children_have_exact_replayable_reverse_steps(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=19)
+            approved = json.loads(pathlib.Path(plan_path).read_bytes())
+            cell = next(item for item in approved["cells"] if item["name"] == "tcp-all-off")
+            recovery_argv = [step["argv"] for step in cell["recovery_restore"]]
+            child_argv = [
+                MODULE.TOOLS["ethtool"],
+                "-K",
+                spec.interface,
+                "tx-checksum-ipv4",
+                "off",
+            ]
+            child_index = recovery_argv.index(child_argv)
+            parent_index = recovery_argv.index(
+                [MODULE.TOOLS["ethtool"], "-K", spec.interface, "tx-checksumming", "on"]
+            )
+            self.assertEqual(child_index, parent_index + 1)
+
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                with self.assertRaises(MODULE.HarnessError):
+                    MODULE.run_mode(spec, plan_path, digest, runner)
+                runner.fail_ethtool_write_call = runner.ethtool_writes + child_index + 1
+                with self.assertRaisesRegex(MODULE.HarnessError, "post-ethtool failure"):
+                    MODULE.restore_mode(spec, plan_path, digest, runner)
+                runner.fail_ethtool_write_call = None
+                self.assertEqual(MODULE.restore_mode(spec, plan_path, digest, runner), 0)
+
+            baseline = approved["baseline"]["features"]
+            self.assertEqual(
+                {name: runner.features[name] for name in approved["owned_feature_closure"]},
+                {name: baseline[name]["enabled"] for name in approved["owned_feature_closure"]},
+            )
 
 
 class JournalDurabilityTests(unittest.TestCase):
