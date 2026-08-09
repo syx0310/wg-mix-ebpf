@@ -434,6 +434,13 @@ func TestEngineRouterTicksInSortedWGIDOrder(t *testing.T) {
 func TestEngineRouterRejectsWrongActionProvenanceBeforeBackend(t *testing.T) {
 	fixture := newRouterTestFixture(t, []uint32{7, 9}, nil)
 	wrongFlow := routedFlow(fixture.routes[7])
+	if _, err := fixture.engines[7].outbound(
+		wrongFlow,
+		PendingPacket{Data: []byte{1}, WGID: 7, FWMark: fixture.routes[7].FWMark},
+		false,
+	); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := fixture.engines[9].outbound(
 		wrongFlow,
 		PendingPacket{Data: []byte{1}, WGID: 9, FWMark: fixture.routes[9].FWMark},
@@ -441,6 +448,7 @@ func TestEngineRouterRejectsWrongActionProvenanceBeforeBackend(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	fixture.clocks[7].Add(time.Second)
 	fixture.clocks[9].Add(time.Second)
 	fixture.backend.operations = nil
 	actions, err := fixture.controller.Tick(context.Background())
