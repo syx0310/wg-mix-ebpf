@@ -5,8 +5,6 @@ umask 077
 
 REVIEW_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
 readonly REVIEW_ROOT
-REPOSITORY="$(CDPATH= cd -- "${REVIEW_ROOT}/../.." && pwd -P)" || exit 70
-readonly REPOSITORY
 readonly BINDER="${REVIEW_ROOT}/bind-final-package.sh"
 readonly CONTROLLER="${REVIEW_ROOT}/controller.sh"
 readonly TRANSPORT="${REVIEW_ROOT}/locked-transport.exp"

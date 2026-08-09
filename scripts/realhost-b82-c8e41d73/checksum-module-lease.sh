@@ -36,10 +36,6 @@ C8_CHECKSUM_MODULE_LIVE_PARAMETER=''
 C8_CHECKSUM_MODULE_LIVE_SRCVERSION=''
 C8_CHECKSUM_MODULE_LIVE_BTF=''
 C8_CHECKSUM_MODULE_LIVE_BTF_SHA256=''
-C8_CHECKSUM_MODULE_RECEIPT_SYSFS=''
-C8_CHECKSUM_MODULE_RECEIPT_PARAMETER=''
-C8_CHECKSUM_MODULE_RECEIPT_BTF=''
-C8_CHECKSUM_MODULE_RECEIPT_BTF_SHA256=''
 
 c8_checksum_module_valid_sha256() {
   [[ "$1" =~ ^[0-9a-f]{64}$ && ! "$1" =~ ^0{64}$ && ! "$1" =~ ^f{64}$ ]]
@@ -281,10 +277,6 @@ c8_checksum_module_validate_owned_receipt() {
     "${lines[12]}" =~ ^btf_generation=[0-9]+:[0-9]+$ &&
     "${lines[13]}" =~ ^btf_sha256=[0-9a-f]{64}$ &&
     "${lines[14]}" == 'ownership=exact-insmod-rc0' && "${lines[15]}" == 'state=owned' ]] || return 79
-  C8_CHECKSUM_MODULE_RECEIPT_SYSFS="${lines[10]#*=}"
-  C8_CHECKSUM_MODULE_RECEIPT_PARAMETER="${lines[11]#*=}"
-  C8_CHECKSUM_MODULE_RECEIPT_BTF="${lines[12]#*=}"
-  C8_CHECKSUM_MODULE_RECEIPT_BTF_SHA256="${lines[13]#*=}"
   [[ "${lines[9]#*=}" == "$(c8_checksum_module_sha_file "${C8_CHECKSUM_MODULE_INTENT}")" ]]
 }
 
