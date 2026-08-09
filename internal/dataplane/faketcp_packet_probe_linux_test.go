@@ -148,6 +148,9 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	}
 	populateFakeTCPPacketProbeTailCalls(t, collection, generation)
 	probeFakeTCPXDPParserModes(t, collection, generation, wgID, ifindex, remotePort)
+	// The following TC matrix retains its original Ethernet-first parser:auto
+	// contract. A leaked ParserL3 entry changes its first action and fails it.
+	requireFakeTCPPacketProbeUnderlayAbsent(t, collection, generation, ifindex)
 
 	const (
 		fakeTCPStatBadPacket           = uint32(4)
@@ -326,6 +329,21 @@ func probeFakeTCPXDPParserModes(
 			t.Fatalf("populate %s: %v", update.mapName, err)
 		}
 	}
+	underlayMap := collection.Maps["underlay_config_map"]
+	if underlayMap == nil {
+		t.Fatal("experimental object has no underlay_config_map")
+	}
+	underlayKey := abi.UnderlayConfigKey{
+		Generation: generation, UnderlayIndex: ifindex,
+	}
+	requireFakeTCPPacketProbeUnderlayAbsent(t, collection, generation, ifindex)
+	defer func() {
+		if err := underlayMap.Delete(underlayKey); err != nil &&
+			!errors.Is(err, ebpf.ErrKeyNotExist) {
+			t.Errorf("delete XDP parser probe underlay: %v", err)
+		}
+		requireFakeTCPPacketProbeUnderlayAbsent(t, collection, generation, ifindex)
+	}()
 
 	ethernet, _ := buildFakeTCPProbeUDPPacket(t, 31001, destinationPort, 32)
 	rawL3 := append([]byte(nil), ethernet[14:]...)
@@ -345,13 +363,8 @@ func probeFakeTCPXDPParserModes(
 		{name: "l3/ethernet", parser: abi.ParserL3, packet: ethernet, want: xdpDrop},
 	} {
 		t.Run("XDP parser "+test.name, func(t *testing.T) {
-			underlayMap := collection.Maps["underlay_config_map"]
-			if underlayMap == nil {
-				t.Fatal("experimental object has no underlay_config_map")
-			}
-			key := abi.UnderlayConfigKey{Generation: generation, UnderlayIndex: ifindex}
 			value := abi.UnderlayConfigValue{Generation: generation, ParserMode: test.parser}
-			if err := underlayMap.Update(key, value, ebpf.UpdateAny); err != nil {
+			if err := underlayMap.Update(underlayKey, value, ebpf.UpdateAny); err != nil {
 				t.Fatalf("select parser mode %d: %v", test.parser, err)
 			}
 			result, output, err := runFakeTCPPacketProbe(
@@ -370,6 +383,28 @@ func probeFakeTCPXDPParserModes(
 				t.Fatal("parser-policy probe mutated the packet")
 			}
 		})
+	}
+}
+
+func requireFakeTCPPacketProbeUnderlayAbsent(
+	t *testing.T,
+	collection *ebpf.Collection,
+	generation uint64,
+	ifindex uint32,
+) {
+	t.Helper()
+	underlayMap := collection.Maps["underlay_config_map"]
+	if underlayMap == nil {
+		t.Fatal("experimental object has no underlay_config_map")
+	}
+	key := abi.UnderlayConfigKey{Generation: generation, UnderlayIndex: ifindex}
+	var value abi.UnderlayConfigValue
+	err := underlayMap.Lookup(key, &value)
+	if err == nil {
+		t.Fatalf("unexpected retained underlay parser policy: key=%#v value=%#v", key, value)
+	}
+	if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Fatalf("check underlay parser policy absence: %v", err)
 	}
 }
 
