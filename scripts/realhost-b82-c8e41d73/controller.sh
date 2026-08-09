@@ -132,7 +132,7 @@ usage() {
     "usage: $0 {plan|preflight|prepare|provision-apply|fresh-plan|fresh-run|fresh-restore|veth-plan|veth-run|veth-restore|routed-plan|routed-run|routed-restore|realnic-plan|realnic-run|realnic-restore}" \
     '  --manifest ABSOLUTE_PACKAGE_MANIFEST --manifest-sha256 64-lowercase-hex' \
     "  --credential-path ${CREDENTIAL_PATH}" \
-    '  --approved-plan {none|ABSOLUTE_LOCAL_FILE} --approved-plan-sha256 {none|64-lowercase-hex}' >&2
+    '  --approved-plan-sha256 {none|64-lowercase-hex}' >&2
 }
 
 sha256_file() {
@@ -192,6 +192,8 @@ valid_unicast_ipv4() {
 }
 
 parse_arguments() {
+  local seen_manifest=0 seen_manifest_sha256=0 seen_credential_path=0
+  local seen_approved_plan_sha256=0
   (($# >= 1)) || { usage; return 64; }
   MODE="$1"
   shift
@@ -205,11 +207,26 @@ parse_arguments() {
   while (($# > 0)); do
     (($# >= 2)) || { usage; return 64; }
     case "$1" in
-      --manifest) MANIFEST="$2" ;;
-      --manifest-sha256) MANIFEST_SHA256="$2" ;;
-      --credential-path) SUPPLIED_CREDENTIAL_PATH="$2" ;;
-      --approved-plan) APPROVED_PLAN="$2" ;;
-      --approved-plan-sha256) APPROVED_PLAN_SHA256="$2" ;;
+      --manifest)
+        ((seen_manifest == 0)) || return 65
+        seen_manifest=1
+        MANIFEST="$2"
+        ;;
+      --manifest-sha256)
+        ((seen_manifest_sha256 == 0)) || return 65
+        seen_manifest_sha256=1
+        MANIFEST_SHA256="$2"
+        ;;
+      --credential-path)
+        ((seen_credential_path == 0)) || return 65
+        seen_credential_path=1
+        SUPPLIED_CREDENTIAL_PATH="$2"
+        ;;
+      --approved-plan-sha256)
+        ((seen_approved_plan_sha256 == 0)) || return 65
+        seen_approved_plan_sha256=1
+        APPROVED_PLAN_SHA256="$2"
+        ;;
       *) usage; return 64 ;;
     esac
     shift 2
@@ -217,18 +234,13 @@ parse_arguments() {
   [[ "${MANIFEST}" == /* && "${SUPPLIED_CREDENTIAL_PATH}" == "${CREDENTIAL_PATH}" ]] || return 65
   valid_sha256 "${MANIFEST_SHA256}" || return 65
   case "${MODE}" in
-    realnic-run)
-      [[ "${APPROVED_PLAN}" == /* ]] && valid_sha256 "${APPROVED_PLAN_SHA256}" || return 65
-      ;;
-    realnic-restore)
-      [[ "${APPROVED_PLAN}" == 'none' ]] && valid_sha256 "${APPROVED_PLAN_SHA256}" || return 65
+    realnic-run | realnic-restore)
+      valid_sha256 "${APPROVED_PLAN_SHA256}" || return 65
       ;;
     plan)
-      if [[ "${APPROVED_PLAN}" != 'none' || "${APPROVED_PLAN_SHA256}" != 'none' ]]; then
-        [[ "${APPROVED_PLAN}" == /* ]] && valid_sha256 "${APPROVED_PLAN_SHA256}" || return 65
-      fi
+      [[ "${APPROVED_PLAN_SHA256}" == 'none' ]] || valid_sha256 "${APPROVED_PLAN_SHA256}" || return 65
       ;;
-    *) [[ "${APPROVED_PLAN}" == 'none' && "${APPROVED_PLAN_SHA256}" == 'none' ]] || return 65 ;;
+    *) [[ "${APPROVED_PLAN_SHA256}" == 'none' ]] || return 65 ;;
   esac
 }
 
@@ -535,31 +547,56 @@ verify_manifest_contract() {
 }
 
 verify_local_approved_plan() {
-  local canonical shape size
+  local canonical shape size package_shape caller_uid package_uid package_gid package_mode package_type
+  [[ "${APPROVED_PLAN}" == "${LOCAL_PACKAGE_DIR}/realnic-plan.${APPROVED_PLAN_SHA256}.json" ]] || return 65
   [[ "${APPROVED_PLAN}" == /* && -f "${APPROVED_PLAN}" && ! -L "${APPROVED_PLAN}" ]] || return 66
   canonical="$(CDPATH= cd -- "$(/usr/bin/dirname -- "${APPROVED_PLAN}")" && pwd -P)/${APPROVED_PLAN##*/}" || return 66
   [[ "${canonical}" == "${APPROVED_PLAN}" ]] || return 66
+  caller_uid="$(/usr/bin/id -u)" || return 66
   if [[ "$(/usr/bin/uname -s)" == 'Darwin' ]]; then
-    shape="$(/usr/bin/stat -f '%Lp:%l:%HT' -- "${APPROVED_PLAN}")" || return 66
+    package_shape="$(/usr/bin/stat -f '%u:%g:%Lp:%HT' -- "${LOCAL_PACKAGE_DIR}")" || return 66
+    shape="$(/usr/bin/stat -f '%u:%g:%Lp:%l:%HT' -- "${APPROVED_PLAN}")" || return 66
     size="$(/usr/bin/stat -f '%z' -- "${APPROVED_PLAN}")" || return 66
-    [[ "${shape}" == '600:1:Regular File' ]] || return 66
+    IFS=: read -r package_uid package_gid package_mode package_type <<<"${package_shape}"
+    [[ "${package_uid}" == "${caller_uid}" && "${package_mode}" == '700' &&
+      "${package_type}" == 'Directory' &&
+      "${shape}" == "${package_uid}:${package_gid}:600:1:Regular File" ]] || return 66
   else
-    shape="$(/usr/bin/stat -Lc '%a:%h:%F' -- "${APPROVED_PLAN}")" || return 66
+    package_shape="$(/usr/bin/stat -Lc '%u:%g:%a:%F' -- "${LOCAL_PACKAGE_DIR}")" || return 66
+    shape="$(/usr/bin/stat -Lc '%u:%g:%a:%h:%F' -- "${APPROVED_PLAN}")" || return 66
     size="$(/usr/bin/stat -Lc '%s' -- "${APPROVED_PLAN}")" || return 66
-    [[ "${shape}" == '600:1:regular file' ]] || return 66
+    IFS=: read -r package_uid package_gid package_mode package_type <<<"${package_shape}"
+    [[ "${package_uid}" == "${caller_uid}" && "${package_mode}" == '700' &&
+      "${package_type}" == 'directory' &&
+      "${shape}" == "${package_uid}:${package_gid}:600:1:regular file" ]] || return 66
   fi
   [[ "${size}" =~ ^[1-9][0-9]*$ &&
     "${size}" -le 16777216 && "$(sha256_file "${APPROVED_PLAN}")" == "${APPROVED_PLAN_SHA256}" ]]
 }
 
+derive_approved_plan_path() {
+  if [[ "${APPROVED_PLAN_SHA256}" == 'none' ]]; then
+    APPROVED_PLAN='none'
+  else
+    valid_sha256 "${APPROVED_PLAN_SHA256}" || return 65
+    APPROVED_PLAN="${LOCAL_PACKAGE_DIR}/realnic-plan.${APPROVED_PLAN_SHA256}.json"
+  fi
+}
+
 transport() {
-  local action="$1" operation="$2"
+  local action="$1" operation="$2" transport_approved_sha256='none'
+  case "${operation}" in
+    scp-realnic-approved-plan | verify-sha-realnic-approved-plan | \
+      verify-stat-realnic-approved-plan | stage-realnic-plan-snapshot | \
+      realnic-run | stage-realnic-plan-verify | realnic-restore)
+      transport_approved_sha256="${APPROVED_PLAN_SHA256}"
+      ;;
+  esac
   /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
     /usr/bin/expect "${LOCAL_REPOSITORY}/${LOCKED_TRANSPORT_EXP_PATH}" \
     --manifest "${MANIFEST}" --manifest-sha256 "${MANIFEST_SHA256}" \
     --credential-path "${SUPPLIED_CREDENTIAL_PATH}" --action "${action}" \
-    --operation "${operation}" --approved-plan "${APPROVED_PLAN}" \
-    --approved-plan-sha256 "${APPROVED_PLAN_SHA256}"
+    --operation "${operation}" --approved-plan-sha256 "${transport_approved_sha256}"
 }
 
 run_operation() {
@@ -725,7 +762,8 @@ plan_all() {
       run_operation plan "${operation}" || return $?
     done
   else
-    printf 'B82_V6_REALNIC_APPROVAL_REQUIRED local_plan=explicit approved_plan_sha256=explicit automatic_approval=0\n'
+    printf 'B82_V6_REALNIC_APPROVAL_REQUIRED capture_mode=realnic-plan local_plan_pattern=%s/realnic-plan.SHA256.json approved_plan_sha256=explicit automatic_approval=0\n' \
+      "${LOCAL_PACKAGE_DIR}"
   fi
   printf '%s\n' \
     'B82_V6_LEGACY_MATRIX_RETIRED controller_entries=0 historical_recovery=frozen-original-package-before-final-staging'
@@ -877,6 +915,27 @@ execute_realnic_run() {
   done
 }
 
+execute_realnic_plan_capture() {
+  local started finished transport_rc publisher_rc
+  local -a pipeline_status
+  started="$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" || return 70
+  printf 'B82_V6_CONTROLLER_EVENT utc=%s event=start mode=%s operation=realnic-plan target=%s channel=capture\n' \
+    "${started}" "${MODE}" "${TARGET_HOST}" >&2
+  transport capture realnic-plan | \
+    /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+      /usr/bin/python3 -B -I "${LOCAL_PACKAGE_DIR}/realnic_acceptance.py" capture-local \
+      --source-commit "${INTEGRATION_COMMIT}" \
+      --manifest "${MANIFEST}" --manifest-sha256 "${MANIFEST_SHA256}"
+  pipeline_status=("${PIPESTATUS[@]}")
+  transport_rc="${pipeline_status[0]}"
+  publisher_rc="${pipeline_status[1]}"
+  finished="$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" || return 70
+  printf 'B82_V6_CONTROLLER_EVENT utc=%s event=finish mode=%s operation=realnic-plan target=%s channel=capture transport_rc=%s publisher_rc=%s\n' \
+    "${finished}" "${MODE}" "${TARGET_HOST}" "${transport_rc}" "${publisher_rc}" >&2
+  ((transport_rc == 0)) || return "${transport_rc}"
+  return "${publisher_rc}"
+}
+
 execute_realnic_restore() {
   run_operation execute stage-realnic-plan-verify || return $?
   run_operation execute realnic-restore
@@ -885,6 +944,7 @@ execute_realnic_restore() {
 main() {
   parse_arguments "$@" || fail 'arguments' $?
   verify_manifest_contract || fail 'manifest-contract' $?
+  derive_approved_plan_path || fail 'approved-plan-binding' $?
   case "${MODE}" in
     veth-plan | veth-run | veth-restore)
       [[ "${WG_STATE}" == absent ]] || fail 'veth-wireguard-state' 65
@@ -923,7 +983,7 @@ main() {
       run_operation execute routed-restore || fail 'routed-restore-operation' $?
       ;;
     realnic-plan)
-      run_operation execute realnic-plan || fail 'realnic-plan-operation' $?
+      execute_realnic_plan_capture || fail 'realnic-plan-operation' $?
       ;;
     realnic-run)
       execute_realnic_run || fail 'realnic-run-operation' $?

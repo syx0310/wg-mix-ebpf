@@ -109,6 +109,8 @@ proc validate_manifest_values {values} {
         [string first ".." [dict get $values integration_ref]] >= 0 ||
         [string first "//" [dict get $values integration_ref]] >= 0 ||
         ![regexp {^[0-9a-f]{40}$} [dict get $values integration_commit]] ||
+        [dict get $values local_package_dir] ne
+            "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-[string range [dict get $values integration_commit] 0 11]" ||
         [dict get $values bundle_name] ne "source-4f2a9b61.bundle" ||
         ![regexp {^[0-9a-f]{64}$} [dict get $values bundle_sha256]] ||
         [dict get $values history_verification] ne "isolated-unbundle-rev-list-fsck-v1" ||
@@ -440,7 +442,7 @@ proc stale_fixed_path {operation} {
     }
 }
 
-proc build_operation {values manifest_sha operation approved_plan approved_sha} {
+proc build_operation {values manifest_sha operation approved_sha} {
     set target "[dict get $values target_user]@[dict get $values target_host]"
     set package [dict get $values remote_package_dir]
     set local_package [dict get $values local_package_dir]
@@ -449,6 +451,10 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
     set bootstrap_provisioner "${bootstrap_root}/provision-ubuntu-test-host.sh"
     set snapshot_manifest "${bootstrap_root}/package-manifest.v1"
     set user_realnic_plan "${package}/realnic-approved-plan.json"
+    set approved_plan none
+    if {$approved_sha ne "none"} {
+        set approved_plan "${local_package}/realnic-plan.${approved_sha}.json"
+    }
     set remote {}
     set tty 0
     set prompt_limit 1
@@ -722,7 +728,11 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
         }
         realnic-plan - realnic-run - realnic-restore {
             set realnic_mode [string range $operation 8 end]
-            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+            set sudo_prefix [list /usr/bin/sudo --]
+            if {$realnic_mode eq "plan"} {
+                set sudo_prefix [list /usr/bin/sudo -p {B82_V6_SUDO_PASSWORD: } --]
+            }
+            set remote [concat $sudo_prefix [env_argv] \
                 [list PYTHONDONTWRITEBYTECODE=1] \
                 [realnic_remote_argv $values $realnic_mode $approved_sha]]
             set tty 1
@@ -742,9 +752,14 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
                     return -code error "realnic-approved-plan-local"
                 }
                 file lstat $approved_plan approved_stat
+                file lstat $local_package package_stat
                 if {$approved_stat(type) ne "file" || $approved_stat(nlink) != 1 ||
                     $approved_stat(size) < 1 || $approved_stat(size) > 16777216 ||
-                    ($approved_stat(mode) & 0777) != 0600} {
+                    ($approved_stat(mode) & 07777) != 0600 ||
+                    $package_stat(type) ne "directory" ||
+                    ($package_stat(mode) & 07777) != 0700 ||
+                    $approved_stat(uid) != $package_stat(uid) ||
+                    $approved_stat(gid) != $package_stat(gid)} {
                     return -code error "realnic-approved-plan-shape"
                 }
                 if {$operation eq "scp-realnic-approved-plan"} {
@@ -928,17 +943,318 @@ proc emit_safe {payload password} {
     flush stdout
 }
 
+proc python_json_escape_utf8_content {value} {
+    binary scan $value cu* octets
+    set escaped ""
+    set index 0
+    set count [llength $octets]
+    while {$index < $count} {
+        set first [lindex $octets $index]
+        if {$first <= 0x7f} {
+            set codepoint $first
+            set width 1
+        } elseif {$first >= 0xc2 && $first <= 0xdf && $index + 1 < $count} {
+            set second [lindex $octets [expr {$index + 1}]]
+            if {$second < 0x80 || $second > 0xbf} {
+                return -code error "credential-utf8"
+            }
+            set codepoint [expr {(($first & 0x1f) << 6) | ($second & 0x3f)}]
+            set width 2
+        } elseif {$first >= 0xe0 && $first <= 0xef && $index + 2 < $count} {
+            set second [lindex $octets [expr {$index + 1}]]
+            set third [lindex $octets [expr {$index + 2}]]
+            if {$third < 0x80 || $third > 0xbf ||
+                ($first == 0xe0 && ($second < 0xa0 || $second > 0xbf)) ||
+                ($first == 0xed && ($second < 0x80 || $second > 0x9f)) ||
+                ($first != 0xe0 && $first != 0xed &&
+                 ($second < 0x80 || $second > 0xbf))} {
+                return -code error "credential-utf8"
+            }
+            set codepoint [expr {(($first & 0x0f) << 12) |
+                (($second & 0x3f) << 6) | ($third & 0x3f)}]
+            set width 3
+        } elseif {$first >= 0xf0 && $first <= 0xf4 && $index + 3 < $count} {
+            set second [lindex $octets [expr {$index + 1}]]
+            set third [lindex $octets [expr {$index + 2}]]
+            set fourth [lindex $octets [expr {$index + 3}]]
+            if {$third < 0x80 || $third > 0xbf ||
+                $fourth < 0x80 || $fourth > 0xbf ||
+                ($first == 0xf0 && ($second < 0x90 || $second > 0xbf)) ||
+                ($first == 0xf4 && ($second < 0x80 || $second > 0x8f)) ||
+                ($first != 0xf0 && $first != 0xf4 &&
+                 ($second < 0x80 || $second > 0xbf))} {
+                return -code error "credential-utf8"
+            }
+            set codepoint [expr {(($first & 0x07) << 18) |
+                (($second & 0x3f) << 12) | (($third & 0x3f) << 6) |
+                ($fourth & 0x3f)}]
+            set width 4
+        } else {
+            return -code error "credential-utf8"
+        }
+        switch -- $codepoint {
+            8 { append escaped {\b} }
+            9 { append escaped {\t} }
+            10 { append escaped {\n} }
+            12 { append escaped {\f} }
+            13 { append escaped {\r} }
+            34 { append escaped {\"} }
+            92 { append escaped {\\} }
+            default {
+                if {$codepoint >= 0x20 && $codepoint <= 0x7e} {
+                    append escaped [format %c $codepoint]
+                } elseif {$codepoint <= 0xffff} {
+                    append escaped [format {\u%04x} $codepoint]
+                } else {
+                    set scalar [expr {$codepoint - 0x10000}]
+                    append escaped [format {\u%04x\u%04x} \
+                        [expr {0xd800 + ($scalar >> 10)}] \
+                        [expr {0xdc00 + ($scalar & 0x3ff)}]]
+                }
+            }
+        }
+        incr index $width
+    }
+    return $escaped
+}
+
+proc append_capture_output {variable_name chunk password password_json_escape} {
+    upvar 1 $variable_name captured
+    append captured $chunk
+    if {[string bytelength $captured] > 16777232} {
+        return -code error "candidate-too-large"
+    }
+    if {$password ne "" && [string first $password $captured] >= 0} {
+        return -code error "credential-in-candidate"
+    }
+    if {$password_json_escape ne "" &&
+        [string first $password_json_escape $captured] >= 0} {
+        return -code error "credential-json-escape-in-candidate"
+    }
+}
+
+proc accept_capture_prompt {variable_name credential_sends buffer} {
+    upvar 1 $variable_name captured
+    if {$credential_sends == 0} {
+        set expected_prompt {siyixuan@192.168.10.82's password: }
+        if {$buffer ne $expected_prompt || $captured ne ""} {
+            return -code error "capture-ssh-prompt-frame"
+        }
+    } elseif {$credential_sends == 1} {
+        set expected_prompt {B82_V6_SUDO_PASSWORD: }
+        if {$buffer ne $expected_prompt || $captured ne "\r\n"} {
+            return -code error "capture-sudo-prompt-frame"
+        }
+    } else {
+        return -code error "capture-credential-frame-count"
+    }
+}
+
+proc canonical_capture_payload {raw credential_sends} {
+    if {$credential_sends < 1 || $credential_sends > 2 ||
+        [string first "\u0000" $raw] >= 0} {
+        return -code error "capture-prompt-or-nul"
+    }
+    set without_crlf [string map [list "\r\n" ""] $raw]
+    if {[string first "\r" $without_crlf] >= 0 ||
+        [string first "\n" $without_crlf] >= 0} {
+        return -code error "capture-non-crlf"
+    }
+    set normalized [string map [list "\r\n" "\n"] $raw]
+    set prefix [string repeat "\n" $credential_sends]
+    if {[string range $normalized 0 [expr {[string length $prefix] - 1}]] ne $prefix} {
+        return -code error "capture-leading-frame"
+    }
+    set payload [string range $normalized [string length $prefix] end]
+    if {[string bytelength $payload] < 3 || [string bytelength $payload] > 16777216 ||
+        [string index $payload 0] ne "{" || [string range $payload end-1 end] ne "}\n" ||
+        [string first "\n" [string range $payload 0 end-1]] >= 0 ||
+        [string first "\r" $payload] >= 0} {
+        return -code error "capture-payload-frame"
+    }
+    return $payload
+}
+
+proc read_capture_credential {path} {
+    if {[catch {open $path r} credential_file]} {
+        return -code error "credential-open"
+    }
+    fconfigure $credential_file -encoding binary -translation binary
+    if {[catch {read $credential_file 4097} payload]} {
+        close $credential_file
+        return -code error "credential-read"
+    }
+    close $credential_file
+    if {[string bytelength $payload] > 4096 || $payload eq ""} {
+        return -code error "credential-shape"
+    }
+    if {[string index $payload end] eq "\n"} {
+        set payload [string range $payload 0 end-1]
+    }
+    set boundary [string first "\n" $payload]
+    if {$boundary < 1 || [string first "\n" $payload [expr {$boundary + 1}]] >= 0} {
+        return -code error "credential-shape"
+    }
+    set ssh_line [string range $payload 0 [expr {$boundary - 1}]]
+    set password_bytes [string range $payload [expr {$boundary + 1}] end]
+    set payload ""
+    if {$ssh_line ne "ssh siyixuan@192.168.10.82" || $password_bytes eq "" ||
+        [string first "\u0000" $password_bytes] >= 0 ||
+        [string first "\r" $password_bytes] >= 0 ||
+        [string first "\n" $password_bytes] >= 0 ||
+        [catch {python_json_escape_utf8_content $password_bytes} escape_error]} {
+        set password_bytes ""
+        return -code error "credential-value"
+    }
+    return $password_bytes
+}
+
+proc capture_payload_to_eof {child_id variable_name credential_sends password_bytes \
+    password_json_escape deadline_ms} {
+    upvar 1 $variable_name captured_output
+    set remaining_ms [expr {$deadline_ms - [clock milliseconds]}]
+    if {$remaining_ms < 1000} {
+        fail "timeout" 124
+    }
+    set timeout [expr {int($remaining_ms / 1000)}]
+    expect {
+        -i $child_id
+        timeout {
+            fail "timeout" 124
+        }
+        full_buffer {
+            fail "capture-full-buffer" 78
+        }
+        eof {
+            if {[info exists expect_out(buffer)] && $expect_out(buffer) ne ""} {
+                if {[catch {append_capture_output captured_output $expect_out(buffer) \
+                    $password_bytes $password_json_escape} capture_error]} {
+                    fail $capture_error 78
+                }
+            }
+            set wait_status [wait -i $child_id]
+            set child_rc [lindex $wait_status 3]
+            if {$child_rc != 0} {
+                exit $child_rc
+            }
+            if {[clock milliseconds] > $deadline_ms} {
+                fail "timeout" 124
+            }
+            if {($password_bytes ne "" &&
+                 [string first $password_bytes $captured_output] >= 0) ||
+                ($password_json_escape ne "" &&
+                 [string first $password_json_escape $captured_output] >= 0)} {
+                fail "credential-in-candidate" 78
+            }
+            if {[catch {canonical_capture_payload $captured_output $credential_sends} payload]} {
+                fail "capture-framing-$payload" 78
+            }
+            return [list $payload $credential_sends [string bytelength $captured_output]]
+        }
+    }
+}
+
+proc capture_child_payload {child_id password_bytes prompt_limit timeout_seconds} {
+    set timeout $timeout_seconds
+    set deadline_ms [expr {[clock milliseconds] + ($timeout_seconds * 1000)}]
+    set captured_output ""
+    set credential_sends 0
+    set password_json_escape [python_json_escape_utf8_content $password_bytes]
+    set credential_pattern {(?:siyixuan@192\.168\.10\.82's password: |B82_V6_SUDO_PASSWORD: )$}
+    fconfigure $child_id -encoding binary -translation binary
+    match_max -i $child_id 16781312
+    remove_nulls -i $child_id 0
+    expect {
+        -i $child_id
+        -re {^\r\n} {
+            if {[catch {append_capture_output captured_output $expect_out(buffer) \
+                $password_bytes $password_json_escape} capture_error]} {
+                set password_bytes ""
+                set password_json_escape ""
+                fail $capture_error 78
+            }
+            exp_continue -continue_timer
+        }
+        -re $credential_pattern {
+            if {[catch {accept_capture_prompt captured_output $credential_sends \
+                $expect_out(buffer)} capture_error]} {
+                set password_bytes ""
+                set password_json_escape ""
+                fail $capture_error 78
+            }
+            incr credential_sends
+            if {$credential_sends > $prompt_limit} {
+                set password_bytes ""
+                set password_json_escape ""
+                fail "credential-prompt-count" 77
+            }
+            send -i $child_id -- $password_bytes
+            send -i $child_id -- "\r"
+            exp_continue -continue_timer
+        }
+        -exact "\{" {
+            set expected_prefix [string repeat "\r\n" $credential_sends]
+            if {$credential_sends < 1 || $credential_sends > 2 ||
+                $expect_out(buffer) ne "\{" || $captured_output ne $expected_prefix} {
+                set password_bytes ""
+                set password_json_escape ""
+                fail "capture-payload-start-frame" 78
+            }
+            if {[catch {append_capture_output captured_output "\{" $password_bytes \
+                $password_json_escape} capture_error]} {
+                set password_bytes ""
+                set password_json_escape ""
+                fail $capture_error 78
+            }
+            set result [capture_payload_to_eof $child_id captured_output \
+                $credential_sends $password_bytes $password_json_escape $deadline_ms]
+            set password_bytes ""
+            set password_json_escape ""
+            return $result
+        }
+        timeout {
+            set password_bytes ""
+            set password_json_escape ""
+            fail "timeout" 124
+        }
+        full_buffer {
+            set password_bytes ""
+            set password_json_escape ""
+            fail "capture-full-buffer" 78
+        }
+        eof {
+            set wait_status [wait -i $child_id]
+            set child_rc [lindex $wait_status 3]
+            if {$child_rc != 0} {
+                set password_bytes ""
+                set password_json_escape ""
+                exit $child_rc
+            }
+            set password_bytes ""
+            set password_json_escape ""
+            fail "capture-missing-payload" 78
+        }
+    }
+}
+
+proc operation_requires_approved_sha {operation} {
+    return [expr {$operation in {
+        scp-realnic-approved-plan verify-sha-realnic-approved-plan
+        verify-stat-realnic-approved-plan stage-realnic-plan-snapshot
+        realnic-run stage-realnic-plan-verify realnic-restore
+    }}]
+}
+
 proc transport_main {arguments} {
     set argc [llength $arguments]
     set argv $arguments
-    if {$argc != 14 ||
+    if {$argc != 12 ||
         [lindex $argv 0] ne "--manifest" ||
         [lindex $argv 2] ne "--manifest-sha256" ||
         [lindex $argv 4] ne "--credential-path" ||
         [lindex $argv 6] ne "--action" ||
         [lindex $argv 8] ne "--operation" ||
-        [lindex $argv 10] ne "--approved-plan" ||
-        [lindex $argv 12] ne "--approved-plan-sha256"} {
+        [lindex $argv 10] ne "--approved-plan-sha256"} {
         fail "arguments" 64
     }
     set manifest [lindex $argv 1]
@@ -946,24 +1262,47 @@ proc transport_main {arguments} {
     set credential_path [lindex $argv 5]
     set action [lindex $argv 7]
     set operation [lindex $argv 9]
-    set approved_plan [lindex $argv 11]
-    set approved_sha [lindex $argv 13]
+    set approved_sha [lindex $argv 11]
 
     if {![regexp {^[0-9a-f]{64}$} $manifest_sha] ||
         $credential_path ne "/Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82" ||
-        $action ni {plan execute} ||
+        $action ni {plan execute capture} ||
         ![regexp {^[A-Za-z0-9_.-]+$} $operation] ||
-        !(($approved_plan eq "none" && $approved_sha eq "none") ||
-          [regexp {^[0-9a-f]{64}$} $approved_sha]) ||
-        ($approved_plan ne "none" &&
-          ([file pathtype $approved_plan] ne "absolute" ||
-           [file normalize $approved_plan] ne $approved_plan))} {
+        !($approved_sha eq "none" || [regexp {^[0-9a-f]{64}$} $approved_sha])} {
         fail "argument-values" 65
     }
+    if {($action eq "capture" && $operation ne "realnic-plan") ||
+        ($action eq "execute" && $operation eq "realnic-plan")} {
+        fail "action-operation" 65
+    }
+    set sha_is_valid [expr {
+        [regexp {^[0-9a-f]{64}$} $approved_sha] &&
+        ![regexp {^0{64}$} $approved_sha] &&
+        ![regexp {^f{64}$} $approved_sha]
+    }]
+    if {([operation_requires_approved_sha $operation] && !$sha_is_valid) ||
+        (![operation_requires_approved_sha $operation] && $approved_sha ne "none")} {
+        fail "approved-plan-sha-operation" 65
+    }
     if {[catch {load_manifest $manifest $manifest_sha} values] ||
+        $manifest ne "[dict get $values local_package_dir]/package-manifest.v1" ||
         [catch {validate_manifest_values $values} validation_message] ||
-        [catch {validate_self $values} self_message] ||
-        [catch {build_operation $values $manifest_sha $operation $approved_plan $approved_sha} operation_spec]} {
+        [catch {validate_self $values} self_message]} {
+        fail "policy" 66
+    }
+    if {[catch {exec /usr/bin/id -u} caller_uid] ||
+        ![regexp {^[0-9]+$} $caller_uid] ||
+        [catch {file lstat $manifest manifest_stat}] ||
+        [catch {file lstat [dict get $values local_package_dir] package_stat}] ||
+        $manifest_stat(type) ne "file" || $manifest_stat(nlink) != 1 ||
+        ($manifest_stat(mode) & 07777) != 0600 ||
+        $package_stat(type) ne "directory" || ($package_stat(mode) & 07777) != 0700 ||
+        $package_stat(uid) != $caller_uid ||
+        $manifest_stat(uid) != $package_stat(uid) ||
+        $manifest_stat(gid) != $package_stat(gid)} {
+        fail "local-package-owner" 66
+    }
+    if {[catch {build_operation $values $manifest_sha $operation $approved_sha} operation_spec]} {
         fail "policy" 66
     }
     lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds
@@ -977,35 +1316,60 @@ proc transport_main {arguments} {
     }
 
     set password ""
-    if {[catch {open $credential_path r} credential_file]} {
-        fail "credential-open" 65
-    }
-    fconfigure $credential_file -encoding utf-8 -translation lf
-    if {[gets $credential_file ssh_line] < 0 || [gets $credential_file password] < 0 ||
-        [gets $credential_file unexpected] >= 0} {
+    if {$action eq "capture"} {
+        if {[catch {read_capture_credential $credential_path} password]} {
+            set password ""
+            fail "credential-value" 65
+        }
+    } else {
+        if {[catch {open $credential_path r} credential_file]} {
+            fail "credential-open" 65
+        }
+        fconfigure $credential_file -encoding utf-8 -translation lf
+        if {[gets $credential_file ssh_line] < 0 || [gets $credential_file password] < 0 ||
+            [gets $credential_file unexpected] >= 0} {
+            close $credential_file
+            set password ""
+            fail "credential-shape" 65
+        }
         close $credential_file
-        set password ""
-        fail "credential-shape" 65
+        set ssh_parts [split [string trim $ssh_line]]
+        set ssh_line ""
+        if {$ssh_parts ne [list ssh siyixuan@192.168.10.82] || $password eq "" ||
+            [string first "\u0000" $password] >= 0 || [string first "\r" $password] >= 0 ||
+            [string first "\n" $password] >= 0} {
+            set password ""
+            fail "credential-value" 65
+        }
     }
-    close $credential_file
-    set ssh_parts [split [string trim $ssh_line]]
-    set ssh_line ""
-    if {$ssh_parts ne [list ssh siyixuan@192.168.10.82] || $password eq "" ||
-        [string first "\u0000" $password] >= 0 || [string first "\r" $password] >= 0 ||
-        [string first "\n" $password] >= 0} {
+
+    set audit_channel [expr {$action eq "capture" ? "stderr" : "stdout"}]
+    puts $audit_channel "B82_V6_TRANSPORT_EXECUTE operation=$operation transport=$transport_type credential_in_argv=0 channel=$action"
+    puts $audit_channel "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
+    log_user 0
+    spawn -noecho {*}$spawn_argv
+    if {$action eq "capture"} {
+        set child_id $spawn_id
+        if {[catch {capture_child_payload $child_id $password $prompt_limit \
+            $timeout_seconds} capture_result]} {
+            set password ""
+            fail "capture-expect" 78
+        }
         set password ""
-        fail "credential-value" 65
+        lassign $capture_result payload credential_sends raw_bytes
+        puts stderr "B82_V6_TRANSPORT_CAPTURE operation=$operation child_rc=0 prompts=$credential_sends raw_bytes=$raw_bytes payload_bytes=[string bytelength $payload] framing=canonical"
+        fconfigure stdout -encoding binary -translation binary
+        puts -nonewline stdout $payload
+        flush stdout
+        exit 0
     }
 
     set timeout $timeout_seconds
     set captured_output ""
     set credential_sends 0
-    puts "B82_V6_TRANSPORT_EXECUTE operation=$operation transport=$transport_type credential_in_argv=0"
-    puts "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
-    log_user 0
-    spawn -noecho {*}$spawn_argv
+    set credential_pattern {(?i)(?:password|passphrase)[^:\r\n]*:[ \t]*$}
     expect {
-        -re {(?i)(?:password|passphrase)[^:\r\n]*:[ \t]*$} {
+        -re $credential_pattern {
             incr credential_sends
             if {$credential_sends > $prompt_limit} {
                 set password ""
@@ -1028,15 +1392,16 @@ proc transport_main {arguments} {
                 append captured_output $expect_out(buffer)
                 emit_safe $expect_out(buffer) $password
             }
-            set password ""
             set wait_status [wait]
             set child_rc [lindex $wait_status 3]
             if {$child_rc != 0} {
+                set password ""
                 if {$assertion in {provision-check provision-apply}} {
                     puts "B82_V6_PROVISION_AUDIT operation=$assertion child_rc=$child_rc plan=unverified missing_set=unverified next_state=STOP"
                 }
                 exit $child_rc
             }
+            set password ""
             if {$assertion eq "provision-check"} {
                 if {[catch {provision_plan_policy $captured_output check} missing_class]} {
                     puts "B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=rejected missing_set=unexpected next_state=STOP policy=$missing_class"
