@@ -407,7 +407,7 @@ func (reinjector *onceReinjector) Reinject(
 		flow:    flow,
 		fwmark:  packet.FWMark,
 		wgID:    packet.WGID,
-		capture: packet.captureFingerprint,
+		capture: packet.CaptureFingerprint,
 	}
 
 	var attempt *reinjectAttempt

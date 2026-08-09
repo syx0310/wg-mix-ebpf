@@ -113,13 +113,15 @@ type Action struct {
 // FWMark on Flow.UnderlayIndex so it traverses the ordinary
 // type-word/XOR/FakeTCP egress pipeline exactly once. CaptureID, not
 // CaptureNanos, is the once-only identity; the timestamp is diagnostic.
+// CaptureFingerprint binds the exact pre-materialization event sample and is
+// part of any durable action checkpoint.
 type PendingPacket struct {
 	Data               []byte
 	FWMark             uint32
 	WGID               uint32
 	CaptureNanos       uint64
 	CaptureID          CaptureIdentity
-	captureFingerprint [sha256.Size]byte
+	CaptureFingerprint [sha256.Size]byte
 	dataOwned          bool
 }
 
@@ -332,7 +334,7 @@ func (e *Engine) handleOwnedCapturedPacket(
 		WGID:               event.WGID,
 		CaptureNanos:       event.TimestampNanos,
 		CaptureID:          captureID,
-		captureFingerprint: fingerprint,
+		CaptureFingerprint: fingerprint,
 		dataOwned:          true,
 	}, true)
 }
