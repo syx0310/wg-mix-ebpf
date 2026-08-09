@@ -23,14 +23,14 @@ func TestFakeTCPEgressUsesOneAuthoritativePacketDescriptor(t *testing.T) {
 		"SEC(\"classifier/ingress\")")
 	parse := strings.Index(egress,
 		"faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
-	failClosed := strings.Index(egress, "if (rc == PARSE_FAKETCP_FAIL_CLOSED)")
 	lookup := strings.Index(egress, "rule = bpf_map_lookup_elem(&egress_rule_map, &key)")
+	fakeTCPRule := strings.Index(egress, "if (rule->transport_mode == TRANSPORT_FAKETCP)")
 	fixedGate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
 	prepare := strings.Index(egress, "faketcp_prepare_udp(")
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
-	if parse < 0 || failClosed < 0 || lookup < 0 || fixedGate < 0 || prepare < 0 || checkpoint < 0 ||
-		!(parse < failClosed && failClosed < lookup && lookup < fixedGate && fixedGate < prepare && prepare < checkpoint) {
-		t.Fatal("one descriptor parse must precede policy lookup, fixed gate, prepare and admission")
+	if parse < 0 || lookup < 0 || fakeTCPRule < 0 || fixedGate < 0 || prepare < 0 || checkpoint < 0 ||
+		!(parse < lookup && lookup < fakeTCPRule && fakeTCPRule < fixedGate && fixedGate < prepare && prepare < checkpoint) {
+		t.Fatal("generic descriptor result must reach policy lookup before the FakeTCP-only strict gate")
 	}
 	if got := strings.Count(egress, "faketcp_parse_tc_egress_packet("); got != 1 {
 		t.Fatalf("authoritative egress descriptor parses=%d, want 1", got)
@@ -38,37 +38,47 @@ func TestFakeTCPEgressUsesOneAuthoritativePacketDescriptor(t *testing.T) {
 	for _, want := range []string{
 		"struct faketcp_tc_packet_descriptor faketcp_packet = {}",
 		"struct packet_info *info = &faketcp_packet.info",
-		"faketcp_encode_gso_segments(\n\t\t\t\tskb, info, &faketcp_packet.l3",
-		"skb, info, &faketcp_packet.l3, managed, rule, profile",
+		"faketcp_encode_gso_segments(\n\t\t\t\tskb, info, &faketcp_packet.shape.l3",
+		"skb, info, &faketcp_packet.shape.l3, managed, rule, profile",
 	} {
 		if !strings.Contains(egress, want) {
 			t.Fatalf("egress descriptor projection missing %q", want)
 		}
 	}
-	if strings.Contains(egress, "faketcp_parse_tc_l3(") {
-		t.Fatal("obsolete second FakeTCP egress parser remains")
+	if strings.Contains(tc, "PARSE_FAKETCP_FAIL_CLOSED") ||
+		strings.Contains(fake, "PARSE_FAKETCP_FAIL_CLOSED") {
+		t.Fatal("strict FakeTCP status must not become a pre-policy generic parse result")
 	}
 
 	parser := sourceSection(t, fake,
 		"faketcp_parse_tc_egress_packet(struct __sk_buff *skb",
 		"static __always_inline int faketcp_tc_fixed_udp_status(")
-	if got := strings.Count(parser, "faketcp_parse_l3("); got != 1 {
-		t.Fatalf("shared bounded parser calls in authoritative wrapper=%d, want 1", got)
+	if got := strings.Count(parser, "parse_packet_observed("); got != 1 {
+		t.Fatalf("generic superset parser calls in authoritative wrapper=%d, want 1", got)
 	}
-	for _, forbidden := range []string{"parse_packet(", "parse_udp_at("} {
+	for _, forbidden := range []string{"parse_packet(", "parse_udp_at(", "parse_link(", "faketcp_parse_l3("} {
 		if strings.Contains(parser, forbidden) {
 			t.Fatalf("authoritative wrapper retained parser fallback %q", forbidden)
 		}
 	}
 	for _, want := range []string{
-		"return faketcp_tc_derive_udp_info(data, data_end, packet)",
-		"return PARSE_FAKETCP_FAIL_CLOSED",
-		"info->ip_off = l3->l3_off",
-		"info->udp_off = l3->l4_off",
-		"info->payload_len = l3->l4_len - sizeof(*udp)",
+		"packet->generic_status = parse_packet_observed(",
+		"packet->faketcp_status = faketcp_tc_project_ipv4_udp(packet)",
+		"return packet->generic_status",
+		"struct packet_info info",
+		"int generic_status",
+		"int faketcp_status",
 	} {
 		if !strings.Contains(fake, want) {
-			t.Fatalf("generic packet_info is not derived from the descriptor: %q", want)
+			t.Fatalf("descriptor does not preserve generic and strict results: %q", want)
+		}
+	}
+	projection := sourceSection(t, fake,
+		"faketcp_tc_project_ipv4_udp(struct faketcp_tc_packet_descriptor *packet)",
+		"static __always_inline int\nfaketcp_parse_tc_egress_packet(")
+	for _, forbidden := range []string{"faketcp_parse_l3(", "parse_packet(", "parse_udp_at(", "bpf_skb_load_bytes("} {
+		if strings.Contains(projection, forbidden) {
+			t.Fatalf("strict projection reloaded packet data through %q", forbidden)
 		}
 	}
 }
@@ -90,23 +100,47 @@ func TestFakeTCPEgressConsumersNeverReparseDescriptor(t *testing.T) {
 		"admission matcher": matcher,
 		"XOR continuation":  continuation,
 	} {
-		for _, parser := range []string{"parse_packet(", "faketcp_parse_l3(", "faketcp_parse_tc_egress_packet("} {
+		for _, parser := range []string{"parse_packet(", "parse_packet_observed(", "parse_link(", "faketcp_parse_l3(", "faketcp_parse_tc_egress_packet("} {
 			if strings.Contains(section, parser) {
 				t.Fatalf("%s reparses through %q", name, parser)
 			}
 		}
 	}
 	consume := strings.Index(continuation, "faketcp_consume_egress_admission(")
+	coherent := strings.Index(continuation, "faketcp_tc_current_admission_coherent(")
 	project := strings.Index(continuation, "faketcp_tc_descriptor_from_admission(")
 	match := strings.Index(continuation, "faketcp_egress_admission_matches(")
 	encode := strings.Index(continuation, "faketcp_encode_established(")
-	if consume < 0 || project < 0 || match < 0 || encode < 0 ||
-		!(consume < project && project < match && match < encode) {
-		t.Fatal("XOR continuation must consume, project, compare and encode in that order")
+	if consume < 0 || coherent < 0 || project < 0 || match < 0 || encode < 0 ||
+		!(consume < coherent && coherent < project && project < match && match < encode) {
+		t.Fatal("XOR continuation must consume, check current fixed headers, project, compare and encode in that order")
 	}
 	if !strings.Contains(matcher,
 		"faketcp_managed_transform_status(l3, IPPROTO_UDP)") {
 		t.Fatal("descriptor consumer lost the fixed IPv4/UDP gate")
+	}
+	coherence := sourceSection(t, fake,
+		"static __always_inline int faketcp_tc_current_admission_coherent(",
+		"static __always_inline void faketcp_tc_descriptor_from_admission(")
+	for _, want := range []string{
+		"iph->version != 4",
+		"iph->ihl != sizeof(*iph) / 4",
+		"iph->protocol != IPPROTO_UDP",
+		"fragment & (IP_RESERVED | IP_MF | IP_OFFSET)",
+		"bpf_ntohs(iph->tot_len) != admission->ip_total_len",
+		"bpf_ntohs(udp->len) != admission->wire_len",
+		"bpf_ntohs(udp->source) != admission->key.local_port",
+		"bpf_ntohs(udp->dest) != admission->key.remote_port",
+		"admission->xor_checksum_mode == XOR_CSUM_NONE",
+	} {
+		if !strings.Contains(coherence, want) {
+			t.Fatalf("current-header coherence check missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{"parse_packet(", "parse_packet_observed(", "parse_link(", "faketcp_parse_l3("} {
+		if strings.Contains(coherence, forbidden) {
+			t.Fatalf("current-header coherence restored a full parser through %q", forbidden)
+		}
 	}
 }
 
