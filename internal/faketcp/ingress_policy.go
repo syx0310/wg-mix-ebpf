@@ -54,9 +54,15 @@ func ClassifyManagedIngressFrame(frame []byte, policy ManagedIngressPolicy) Ingr
 	if etherType != etherTypeIPv4 && etherType != etherTypeIPv6 {
 		return IngressPass
 	}
-	l3 := frame[offset:]
-	info, status := ParseL3(l3)
-	return managedFakeTCPDisposition(l3, info, status, policy)
+	return ClassifyManagedIngressL3(frame[offset:], policy)
+}
+
+// ClassifyManagedIngressL3 applies the same managed-port policy to a packet
+// whose first byte is the IP version byte. It is the parser:l3 counterpart to
+// ClassifyManagedIngressFrame; neither classifier guesses the other framing.
+func ClassifyManagedIngressL3(packet []byte, policy ManagedIngressPolicy) IngressDisposition {
+	info, status := ParseL3(packet)
+	return managedFakeTCPDisposition(packet, info, status, policy)
 }
 
 // managedFakeTCPDisposition is the sole status-to-policy mapper. The parser
