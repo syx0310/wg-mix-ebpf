@@ -1063,8 +1063,7 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		return TC_ACT_SHOT;
 	}
 	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
-	if (!session ||
-	    !faketcp_session_admit_established(session, generation)) {
+	if (!session) {
 		// The preflight hook is the only place allowed to emit the handshake request
 		// because it still owns the unmodified first packet. A map eviction in
 		// this narrow post-transform race is a deliberate drop; WireGuard/QUIC
@@ -1105,9 +1104,10 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		return TC_ACT_SHOT;
 	}
 
-	// Helpers and packet rewrite stay outside the critical section. This short
-	// region is the writer linearisation point: a delete claim which wins the
-	// same per-session lock prevents this packet from consuming a stale value.
+	// No session field is consumed before this call. Helpers and packet rewrite
+	// stay outside the critical section; this single short region both admits
+	// the established value and linearises its update. A delete claim which
+	// wins the same per-session lock drops the rewritten skb before emission.
 	now = bpf_ktime_get_ns();
 	if (!faketcp_session_mutate(session, generation, now,
 				    FAKETCP_SESSION_MUTATE_TX,

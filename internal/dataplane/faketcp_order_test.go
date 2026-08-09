@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -605,10 +606,14 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 		"faketcp_session_admit_established(session, generation)") {
 		t.Fatal("TC preflight admits established state without the per-value lock")
 	}
-	if strings.Count(encode,
-		"faketcp_session_admit_established(session, generation)") != 1 ||
+	if strings.Contains(encode,
+		"faketcp_session_admit_established(session, generation)") ||
 		strings.Count(encode, "FAKETCP_SESSION_MUTATE_TX") != 1 {
-		t.Fatal("TC encoder reader/writer lock or revision contract drifted")
+		t.Fatal("TC encoder regained a redundant admission lock or lost its mutation")
+	}
+	encoderMutation := strings.Index(encode, "faketcp_session_mutate(session, generation, now,")
+	if encoderMutation < 0 || strings.Contains(encode[:encoderMutation], "session->") {
+		t.Fatal("TC encoder consumed a session field before its sole locked mutation snapshot")
 	}
 	if strings.Count(xdp,
 		"faketcp_session_admit_established(session, generation)") != 1 ||
@@ -665,6 +670,90 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 	}
 	if strings.Count(claim, "session->state = FAKETCP_STATE_DELETE_CLAIMED") != 1 {
 		t.Fatal("claim program must have exactly one tombstone write site")
+	}
+}
+
+type establishedEncoderLockModel struct {
+	mu       sync.Mutex
+	state    uint8
+	sequence uint32
+	locks    uint64
+}
+
+func (model *establishedEncoderLockModel) admit() bool {
+	model.mu.Lock()
+	defer model.mu.Unlock()
+	model.locks++
+	return model.state == 3
+}
+
+func (model *establishedEncoderLockModel) mutate(payload uint32) bool {
+	model.mu.Lock()
+	defer model.mu.Unlock()
+	model.locks++
+	if model.state != 3 {
+		return false
+	}
+	model.sequence += payload
+	return true
+}
+
+func (model *establishedEncoderLockModel) encodeWithRedundantAdmission(payload uint32) bool {
+	return model.admit() && model.mutate(payload)
+}
+
+func (model *establishedEncoderLockModel) encodeWithSingleMutation(payload uint32) bool {
+	return model.mutate(payload)
+}
+
+func TestFakeTCPEncoderSingleMutationPreservesClaimOrdering(t *testing.T) {
+	oldPath := &establishedEncoderLockModel{state: 3, sequence: 100}
+	newPath := &establishedEncoderLockModel{state: 3, sequence: 100}
+	if !oldPath.encodeWithRedundantAdmission(32) || !newPath.encodeWithSingleMutation(32) ||
+		oldPath.sequence != newPath.sequence {
+		t.Fatalf("established results differ: old=%#v new=%#v", oldPath, newPath)
+	}
+	if oldPath.locks != 2 || newPath.locks != 1 {
+		t.Fatalf("value locks per packet old=%d new=%d", oldPath.locks, newPath.locks)
+	}
+
+	// A claim which wins before mutation is rejected by both paths. A claim
+	// which wins after mutation is ordered after that packet in both paths;
+	// the removed admission lock was never a packet-emission snapshot.
+	oldClaimed := &establishedEncoderLockModel{state: 4, sequence: 100}
+	newClaimed := &establishedEncoderLockModel{state: 4, sequence: 100}
+	if oldClaimed.encodeWithRedundantAdmission(32) || newClaimed.encodeWithSingleMutation(32) ||
+		oldClaimed.sequence != 100 || newClaimed.sequence != 100 {
+		t.Fatalf("claimed session was consumed: old=%#v new=%#v", oldClaimed, newClaimed)
+	}
+	if oldClaimed.locks != 1 || newClaimed.locks != 1 {
+		t.Fatalf("claimed value locks old=%d new=%d", oldClaimed.locks, newClaimed.locks)
+	}
+}
+
+func BenchmarkFakeTCPEncoderValueLocks(b *testing.B) {
+	for _, benchmark := range []struct {
+		name   string
+		encode func(*establishedEncoderLockModel) bool
+	}{
+		{"redundant-admission", func(model *establishedEncoderLockModel) bool {
+			return model.encodeWithRedundantAdmission(1)
+		}},
+		{"single-mutation", func(model *establishedEncoderLockModel) bool {
+			return model.encodeWithSingleMutation(1)
+		}},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			model := &establishedEncoderLockModel{state: 3}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if !benchmark.encode(model) {
+					b.Fatal("established model rejected packet")
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(model.locks)/float64(b.N), "value-locks/op")
+		})
 	}
 }
 
