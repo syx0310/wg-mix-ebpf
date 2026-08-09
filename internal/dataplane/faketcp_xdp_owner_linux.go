@@ -370,14 +370,9 @@ func mustLiveFakeTCPXDPRuntime() fakeTCPXDPRuntime {
 		probeLiveFakeTCPXDP,
 		func(
 			request fakeTCPXDPAttachRequest,
-			snapshot fakeTCPXDPProbe,
+			_ fakeTCPXDPProbe,
 			program experimentalProgramResource,
 		) (fakeTCPXDPLink, error) {
-			// This is only a compatibility guard. AttachXDP atomically owns the
-			// requested mode, but does not bind other XDP modes to this snapshot.
-			if snapshot.Attached || snapshot.ProgramID != 0 {
-				return nil, errors.New("live XDP attach received an occupied compatibility snapshot")
-			}
 			if program == nil || program.kernelProgram() == nil {
 				return nil, errors.New("live XDP attach requires a kernel program")
 			}
