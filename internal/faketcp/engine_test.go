@@ -207,7 +207,7 @@ func (s *fakeSessionStore) DeleteEstablishedIfUnchanged(key abi.FakeTCPSessionKe
 	return SessionDeleteRemoved, nil
 }
 
-func testEngine(t *testing.T, mutate func(*Options)) (*Engine, *fakeClock) {
+func testEngine(t testing.TB, mutate func(*Options)) (*Engine, *fakeClock) {
 	t.Helper()
 	clock := &fakeClock{now: time.Unix(100, 0), monotonic: uint64(100 * time.Second)}
 	nextISN := uint32(1000)

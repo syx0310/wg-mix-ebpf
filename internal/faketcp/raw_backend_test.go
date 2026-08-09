@@ -3,6 +3,7 @@ package faketcp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"sync"
 	"testing"
@@ -78,7 +79,7 @@ func (writer *memoryRawIPv4Writer) snapshot() ([]RawIPv4Write, int) {
 	return writes, writer.closeCalls
 }
 
-func testPendingPacket(t *testing.T, flow abi.FakeTCPSessionKey, capture uint64) PendingPacket {
+func testPendingPacket(t testing.TB, flow abi.FakeTCPSessionKey, capture uint64) PendingPacket {
 	t.Helper()
 	data := testIPv4UDPPacket(t, flow, []byte{1, 2, 3, 4, 5})
 	if err := MaterializeIPv4UDPChecksums(data); err != nil {
@@ -86,7 +87,8 @@ func testPendingPacket(t *testing.T, flow abi.FakeTCPSessionKey, capture uint64)
 	}
 	return PendingPacket{
 		Data: data, FWMark: 0xa1230007, WGID: 77, CaptureNanos: capture,
-		CaptureID: CaptureIdentity{Runtime: testRuntimeIdentity(flow.Generation), CPU: 3, Sequence: capture},
+		CaptureID:          CaptureIdentity{Runtime: testRuntimeIdentity(flow.Generation), CPU: 3, Sequence: capture},
+		captureFingerprint: sha256.Sum256(data),
 	}
 }
 
@@ -228,6 +230,16 @@ func TestOnceReinjectorRejectsCaptureIdentityReuseWithDifferentMetadata(t *testi
 	conflict.FWMark++
 	if err := reinjector.Reinject(context.Background(), flow, conflict); !errors.Is(err, ErrCaptureIdentityConflict) {
 		t.Fatalf("capture identity conflict error=%v", err)
+	}
+	conflict = packet
+	conflict.Data = append([]byte(nil), packet.Data...)
+	conflict.Data[len(conflict.Data)-1] ^= 1
+	if err := MaterializeIPv4UDPChecksums(conflict.Data); err != nil {
+		t.Fatal(err)
+	}
+	conflict.captureFingerprint = sha256.Sum256(conflict.Data)
+	if err := reinjector.Reinject(context.Background(), flow, conflict); !errors.Is(err, ErrCaptureIdentityConflict) {
+		t.Fatalf("capture packet fingerprint conflict error=%v", err)
 	}
 	writes, _ := writer.snapshot()
 	if len(writes) != 1 {

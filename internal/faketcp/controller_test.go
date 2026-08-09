@@ -1260,7 +1260,7 @@ func bindTestEvent(event *abi.FakeTCPEvent, identity RuntimeIdentity, captureSeq
 	}
 }
 
-func testIPv4UDPPacket(t *testing.T, flow abi.FakeTCPSessionKey, payload []byte) []byte {
+func testIPv4UDPPacket(t testing.TB, flow abi.FakeTCPSessionKey, payload []byte) []byte {
 	t.Helper()
 	packet := make([]byte, 20+8+len(payload))
 	packet[0] = 0x45
