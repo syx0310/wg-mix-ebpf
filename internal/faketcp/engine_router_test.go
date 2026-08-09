@@ -255,6 +255,27 @@ func TestEngineRouterRejectsAmbiguousConfiguration(t *testing.T) {
 	})
 }
 
+func TestEngineRouterRejectsCopiedEngineInstance(t *testing.T) {
+	domain, bindings, routes, _, _, _ := routerTestParts(t, []uint32{7, 9}, nil)
+	if bindings[0].Engine.instance == nil || bindings[1].Engine.instance == nil ||
+		bindings[0].Engine.instance == bindings[1].Engine.instance {
+		t.Fatal("separately constructed Engines do not have distinct instance identities")
+	}
+	if router, err := NewEngineRouter(domain, bindings, routes); router == nil || err != nil {
+		t.Fatalf("router for distinct Engine instances=%#v err=%v", router, err)
+	}
+
+	copied := copyEngineValue(t, bindings[0].Engine)
+	if copied == bindings[0].Engine || copied.instance != bindings[0].Engine.instance {
+		t.Fatal("Engine value copy did not preserve its instance identity")
+	}
+	bindings[1].Engine = copied
+	if router, err := NewEngineRouter(domain, bindings, routes); router != nil ||
+		!errors.Is(err, ErrEngineRouteConflict) {
+		t.Fatalf("router with copied Engine=%#v err=%v", router, err)
+	}
+}
+
 func TestEngineRouterFreezesCallerTables(t *testing.T) {
 	domain, bindings, routes, engines, _, _ := routerTestParts(t, []uint32{7, 9}, nil)
 	router, err := NewEngineRouter(domain, bindings, routes)
