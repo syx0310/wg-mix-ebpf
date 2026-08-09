@@ -20,6 +20,7 @@ const (
 	tcPacketParseIPv6NonInitialFragment
 	tcPacketParseBadChecksum
 	tcPacketParseIPv6ExtensionTooDeep
+	tcPacketParseFakeTCPFailClosed
 )
 
 type tcUDPProjection struct {
@@ -93,7 +94,7 @@ func tcResultFromL3Status(info L3Info, status L3ParseStatus) tcPacketParseResult
 		}
 		return tcPacketParseNotUDP
 	default:
-		return tcPacketParseShort
+		return tcPacketParseFakeTCPFailClosed
 	}
 }
 
@@ -137,8 +138,9 @@ func TestSingleTCDescriptorBoundaryModel(t *testing.T) {
 		{name: "ipv4-noninitial-fragment", packet: testIPv4(5, L3ProtocolUDP, 3, make([]byte, 8)), wantResult: tcPacketParseIPv4NonInitialFragment},
 		{name: "ipv6-first-fragment", packet: testIPv6(l3IPv6Fragment, append(testIPv6Fragment(L3ProtocolUDP, 1), v6UDP...)), wantResult: tcPacketParseIPv6FirstFragment},
 		{name: "ipv6-noninitial-fragment", packet: testIPv6(l3IPv6Fragment, append(testIPv6Fragment(L3ProtocolUDP, 0x0019), make([]byte, 8)...)), wantResult: tcPacketParseIPv6NonInitialFragment},
-		{name: "truncated-ipv4", packet: []byte{0x45}, wantResult: tcPacketParseShort},
-		{name: "malformed-udp-length", packet: testIPv4(5, L3ProtocolUDP, 0, testUDPWithLength(9, 12)), wantResult: tcPacketParseShort},
+		{name: "truncated-ipv4", packet: []byte{0x45}, wantResult: tcPacketParseFakeTCPFailClosed},
+		{name: "reserved-ipv4-fragment-bit", packet: testIPv4(5, L3ProtocolUDP, 0x8000, validUDP), wantResult: tcPacketParseFakeTCPFailClosed},
+		{name: "malformed-udp-length", packet: testIPv4(5, L3ProtocolUDP, 0, testUDPWithLength(9, 12)), wantResult: tcPacketParseFakeTCPFailClosed},
 		{name: "short-udp-payload", packet: testIPv4(5, L3ProtocolUDP, 0, testUDP(1, 2, []byte{1, 2, 3})), wantResult: tcPacketParseShort},
 		{name: "tcp-is-not-udp", packet: testIPv4(5, L3ProtocolTCP, 0, testTCP(5, nil)), wantResult: tcPacketParseNotUDP},
 		{name: "ipv6-extension-too-deep", packet: testIPv6(l3IPv6Destination, testIPv6Option(L3ProtocolUDP, 64)), wantResult: tcPacketParseIPv6ExtensionTooDeep},

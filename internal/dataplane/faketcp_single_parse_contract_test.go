@@ -23,12 +23,13 @@ func TestFakeTCPEgressUsesOneAuthoritativePacketDescriptor(t *testing.T) {
 		"SEC(\"classifier/ingress\")")
 	parse := strings.Index(egress,
 		"faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
+	failClosed := strings.Index(egress, "if (rc == PARSE_FAKETCP_FAIL_CLOSED)")
 	lookup := strings.Index(egress, "rule = bpf_map_lookup_elem(&egress_rule_map, &key)")
 	fixedGate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
 	prepare := strings.Index(egress, "faketcp_prepare_udp(")
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
-	if parse < 0 || lookup < 0 || fixedGate < 0 || prepare < 0 || checkpoint < 0 ||
-		!(parse < lookup && lookup < fixedGate && fixedGate < prepare && prepare < checkpoint) {
+	if parse < 0 || failClosed < 0 || lookup < 0 || fixedGate < 0 || prepare < 0 || checkpoint < 0 ||
+		!(parse < failClosed && failClosed < lookup && lookup < fixedGate && fixedGate < prepare && prepare < checkpoint) {
 		t.Fatal("one descriptor parse must precede policy lookup, fixed gate, prepare and admission")
 	}
 	if got := strings.Count(egress, "faketcp_parse_tc_egress_packet("); got != 1 {
@@ -61,6 +62,7 @@ func TestFakeTCPEgressUsesOneAuthoritativePacketDescriptor(t *testing.T) {
 	}
 	for _, want := range []string{
 		"return faketcp_tc_derive_udp_info(data, data_end, packet)",
+		"return PARSE_FAKETCP_FAIL_CLOSED",
 		"info->ip_off = l3->l3_off",
 		"info->udp_off = l3->l4_off",
 		"info->payload_len = l3->l4_len - sizeof(*udp)",
