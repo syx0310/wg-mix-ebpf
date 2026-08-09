@@ -2968,8 +2968,11 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
 	}
+	// The encoder moves the first 12 UDP payload bytes to the TCP wire tail.
+	// Bind the word that inverse rotation restores at the UDP payload start.
 	if (bpf_xdp_load_bytes(xdp,
-			       ip_off + sizeof(*iph) + sizeof(*tcp),
+			       ip_off + admission->wire_total_len -
+				       FAKETCP_HEADER_DELTA,
 			       &input_wire, sizeof(input_wire)) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
