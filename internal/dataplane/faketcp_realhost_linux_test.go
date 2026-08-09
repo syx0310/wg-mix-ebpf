@@ -857,8 +857,9 @@ func buildFakeTCPRealHostRuntime(
 				{IfIndex: prepared.contract.ifindex, Mode: fakeTCPXDPAttachGeneric},
 				{IfIndex: prepared.contract.peerIfindex, Mode: fakeTCPXDPAttachGeneric},
 			},
-			xdpRuntime:    liveFakeTCPXDPRuntime,
-			engineOptions: fakeTCPRealHostEngineOptions(generation),
+			xdpRuntime:     liveFakeTCPXDPRuntime,
+			xdpRequirement: fakeTCPXDPAllowSelectedModeTestOnly,
+			engineOptions:  fakeTCPRealHostEngineOptions(generation),
 			slowPathFactory: func(_ *faketcp.Engine, events *ebpf.Map) (experimentalSlowPath, error) {
 				if events == nil {
 					return nil, errors.New("FakeTCP real-host events map is nil")

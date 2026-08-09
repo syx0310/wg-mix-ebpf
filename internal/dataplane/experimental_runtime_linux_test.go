@@ -435,7 +435,8 @@ func (fixture *runtimeTestFixture) buildOptions(
 			{IfIndex: 3, Mode: fakeTCPXDPAttachNative},
 			{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
 		},
-		xdpRuntime: fixture.xdpRuntime.backend(),
+		xdpRuntime:     fixture.xdpRuntime.backend(),
+		xdpRequirement: fakeTCPXDPAllowSelectedModeTestOnly,
 		sessionFactory: func(sessionMap experimentalMapResource, claimProgram experimentalProgramResource, generation uint64) (ownedFakeTCPSessionStore, error) {
 			fixture.sessionMapArg = sessionMap
 			fixture.sessionClaimArg = claimProgram
@@ -1503,9 +1504,10 @@ func TestExperimentalFakeTCPRuntimeCancellationAfterMutationUsesCleanupContext(t
 	attach := xdpRuntime.attach
 	xdpRuntime.attach = func(
 		request fakeTCPXDPAttachRequest,
+		expected fakeTCPXDPProbe,
 		program experimentalProgramResource,
 	) (fakeTCPXDPLink, error) {
-		owned, err := attach(request, program)
+		owned, err := attach(request, expected, program)
 		if err == nil {
 			cancel()
 		}
@@ -1631,6 +1633,54 @@ func TestExperimentalFakeTCPRuntimeValidatesXDPPolicySetBeforeMutation(t *testin
 		if resource.closes != 1 {
 			t.Fatalf("owned map %s was not closed on preflight failure", name)
 		}
+	}
+}
+
+func TestExperimentalFakeTCPRuntimeRejectsXDPBackendModeMismatchBeforeMutation(
+	t *testing.T,
+) {
+	fixture := newRuntimeTestFixture(t)
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+	options := fixture.buildOptions(snapshot, transaction)
+	for index := range options.xdpRequests {
+		options.xdpRequests[index].Mode = fakeTCPXDPAttachLibXDP
+	}
+	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
+	if runtime != nil || err == nil || !strings.Contains(err.Error(), "does not match constructed") {
+		t.Fatalf("runtime=%#v error=%v", runtime, err)
+	}
+	if fixture.commitCalls != 0 || len(fixture.xdpRuntime.probeCalls) != 0 ||
+		len(fixture.programArray.inserts) != 0 || fixture.sessionStore.closes != 0 {
+		t.Fatalf(
+			"backend mismatch commits=%d probes=%v programs=%v session closes=%d",
+			fixture.commitCalls, fixture.xdpRuntime.probeCalls,
+			fixture.programArray.inserts, fixture.sessionStore.closes,
+		)
+	}
+}
+
+func TestExperimentalFakeTCPRuntimeRefusesDirectAllHooksRequirementBeforeMutation(
+	t *testing.T,
+) {
+	fixture := newRuntimeTestFixture(t)
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+	options := fixture.buildOptions(snapshot, transaction)
+	options.xdpRequirement = fakeTCPXDPRequireAllHooksExclusive
+	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
+	if runtime != nil || err == nil || !strings.Contains(err.Error(), "all-hooks exclusive activation") {
+		t.Fatalf("runtime=%#v error=%v", runtime, err)
+	}
+	if fixture.commitCalls != 0 || len(fixture.xdpRuntime.probeCalls) != 0 ||
+		len(fixture.xdpRuntime.attachCalls) != 0 || len(fixture.programArray.inserts) != 0 ||
+		fixture.sessionStore.closes != 0 {
+		t.Fatalf(
+			"strict refusal commits=%d probes=%v attaches=%v programs=%v session closes=%d",
+			fixture.commitCalls, fixture.xdpRuntime.probeCalls,
+			fixture.xdpRuntime.attachCalls, fixture.programArray.inserts,
+			fixture.sessionStore.closes,
+		)
 	}
 }
 
@@ -1792,7 +1842,11 @@ func TestExperimentalRuntimeCloseQuarantinesFailedDetachesUntilRetry(t *testing.
 	xdpErr := errors.New("XDP close")
 	tcErr := errors.New("TC close")
 	fixture.xdpRuntime.links[3] = &fakeOwnedXDPLink{
-		ifindex: 3, programID: 8002, closeErrs: []error{xdpErr},
+		identity: fakeTCPXDPLinkIdentity{
+			Family: fakeTCPXDPBackendDirect, Mode: fakeTCPXDPAttachNative,
+			IfIndex: 3, ProgramID: 8002, OwnerID: 100003,
+		},
+		releaseErrs: []error{xdpErr}, retainOnError: []bool{true},
 	}
 	runtime, _, err := fixture.build(t, 91)
 	if err != nil {
@@ -1832,6 +1886,48 @@ func TestExperimentalRuntimeCloseQuarantinesFailedDetachesUntilRetry(t *testing.
 			runtime.state.closed, runtime.state.collection,
 			fixture.xdpRuntime.links[3].closes, fixture.lastTCStage.closes,
 		)
+	}
+}
+
+func TestFakeTCPDaemonLifecycleRetainsRuntimeOnStaleXDPOwner(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	runtime, _, err := fixture.build(t, 91)
+	if err != nil {
+		t.Fatal(err)
+	}
+	owned := fixture.xdpRuntime.links[3]
+	stale := owned.identity
+	stale.OwnerID++
+	owned.setIdentity(stale)
+
+	supervisor := &fakeTCPRuntimeSupervisor{}
+	key := fakeTCPRuntimeDesiredKey{91}
+	if err := supervisor.Ensure(
+		t.Context(), key,
+		func(context.Context) (fakeTCPRuntimeService, error) { return runtime, nil },
+	); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-supervisor.loadCurrent().done:
+	case <-time.After(time.Second):
+		t.Fatal("test runtime did not reach its daemon lifecycle boundary")
+	}
+	if err := supervisor.Stop(t.Context()); err == nil ||
+		!strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("daemon Stop stale-owner error = %v", err)
+	}
+	if supervisor.loadCurrent() == nil || runtime.state.xdp == nil ||
+		runtime.state.collection == nil {
+		t.Fatal("daemon discarded the only stale XDP ownership capability")
+	}
+	if owned.closes != 0 {
+		t.Fatalf("stale daemon owner triggered %d destructive closes", owned.closes)
+	}
+	for name, resource := range fixture.mapResources {
+		if resource.closes != 0 {
+			t.Fatalf("stale XDP owner released dependent map %s", name)
+		}
 	}
 }
 
