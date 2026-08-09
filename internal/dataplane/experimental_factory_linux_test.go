@@ -705,17 +705,31 @@ func TestExperimentalOwnershipClosedStateHelpers(t *testing.T) {
 	}
 }
 
-func TestExperimentalRuntimeFactorySourceDoesNotCreateProductionCaller(t *testing.T) {
-	for _, candidate := range []string{
-		"../daemon/daemon.go",
-		"loader_linux.go",
-	} {
+func TestExperimentalRuntimeFactoryHasOnlyCoordinatorProductionCaller(t *testing.T) {
+	candidates, err := filepath.Glob("*.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	const call = "acquireAndBuildExperimentalFakeTCPRuntime("
+	productionCalls := 0
+	for _, candidate := range candidates {
+		if strings.HasSuffix(candidate, "_test.go") || candidate == "experimental_factory_linux.go" {
+			continue
+		}
 		contents, err := os.ReadFile(candidate)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if strings.Contains(string(contents), "acquireAndBuildExperimentalFakeTCPRuntime") {
-			t.Fatalf("production caller was added to %s", candidate)
+		count := strings.Count(string(contents), call)
+		if count == 0 {
+			continue
 		}
+		if candidate != "faketcp_production_linux.go" {
+			t.Fatalf("experimental runtime factory bypasses production coordinator in %s", candidate)
+		}
+		productionCalls += count
+	}
+	if productionCalls != 1 {
+		t.Fatalf("coordinator production factory calls = %d, want exactly one", productionCalls)
 	}
 }

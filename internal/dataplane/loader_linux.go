@@ -258,11 +258,12 @@ func NewLoader() Loader {
 }
 
 func NewLoaderWithOptions(options LoaderOptions) Loader {
-	return LinuxLoader{
+	baseline := LinuxLoader{
 		ObjectPath:      objectPathFromEnv(""),
 		PinPath:         pinPathFromEnv(""),
 		AdoptLegacyPins: options.AdoptLegacyPins,
 	}
+	return newFakeTCPProductionLoader(baseline)
 }
 
 func LoadObjectTest(ctx context.Context, objectPath string) error {
