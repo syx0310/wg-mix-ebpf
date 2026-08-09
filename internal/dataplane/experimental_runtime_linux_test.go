@@ -1865,6 +1865,87 @@ func TestExperimentalFakeTCPRuntimeValidatesXDPPolicySetBeforeMutation(t *testin
 	}
 }
 
+func TestExperimentalRuntimeCanonicalInterfacesBindL3UnderlayAuthority(t *testing.T) {
+	const generation = uint64(91)
+	canonical := func(t *testing.T) (
+		*control.State,
+		*abi.Snapshot,
+		*fakeTCPPolicyGenerationPlan,
+		[]fakeTCPXDPAttachRequest,
+	) {
+		t.Helper()
+		state := fakeTCPPolicyTestState()
+		state.Underlays[0].Parser = "l3"
+		baseline, err := abi.FromStateWithGeneration(state, generation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan, err := buildFakeTCPPolicyGenerationPlan(state, generation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return state, baseline, plan, []fakeTCPXDPAttachRequest{
+			{IfIndex: 3, Mode: fakeTCPXDPAttachNative},
+			{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
+		}
+	}
+
+	state, baseline, plan, requests := canonical(t)
+	for _, want := range []struct {
+		ifindex uint32
+		parser  uint8
+	}{
+		{ifindex: 3, parser: abi.ParserL3},
+		{ifindex: 9, parser: abi.ParserEthernet},
+	} {
+		key := abi.UnderlayConfigKey{Generation: generation, UnderlayIndex: want.ifindex}
+		if got := baseline.Underlays[key].ParserMode; got != want.parser {
+			t.Fatalf("underlay %d parser=%d, want %d", want.ifindex, got, want.parser)
+		}
+	}
+	if got := []uint32{
+		plan.managedInterfaces[0].Key.UnderlayIndex,
+		plan.managedInterfaces[1].Key.UnderlayIndex,
+	}; !slices.Equal(got, []uint32{3, 9}) {
+		t.Fatalf("managed interfaces = %v, want [3 9]", got)
+	}
+	if err := validateExperimentalRuntimeCanonicalInterfaces(
+		baseline, plan, state, requests,
+	); err != nil {
+		t.Fatalf("canonical parser:l3 runtime inputs: %v", err)
+	}
+
+	t.Run("baseline parser fork", func(t *testing.T) {
+		state, baseline, plan, requests := canonical(t)
+		key := abi.UnderlayConfigKey{Generation: generation, UnderlayIndex: 3}
+		value := baseline.Underlays[key]
+		value.ParserMode = abi.ParserEthernet
+		baseline.Underlays[key] = value
+		err := validateExperimentalRuntimeCanonicalInterfaces(baseline, plan, state, requests)
+		if err == nil || !strings.Contains(err.Error(), "baseline underlays are stale") {
+			t.Fatalf("baseline parser fork error = %v", err)
+		}
+	})
+
+	t.Run("managed interface fork", func(t *testing.T) {
+		state, baseline, plan, requests := canonical(t)
+		plan.managedInterfaces[0].Key.UnderlayIndex = 7
+		err := validateExperimentalRuntimeCanonicalInterfaces(baseline, plan, state, requests)
+		if err == nil || !strings.Contains(err.Error(), "managed interfaces are stale") {
+			t.Fatalf("managed-interface fork error = %v", err)
+		}
+	})
+
+	t.Run("XDP request fork", func(t *testing.T) {
+		state, baseline, plan, requests := canonical(t)
+		requests[0].IfIndex = 7
+		err := validateExperimentalRuntimeCanonicalInterfaces(baseline, plan, state, requests)
+		if err == nil || !strings.Contains(err.Error(), "has no managed-interface policy") {
+			t.Fatalf("XDP request fork error = %v", err)
+		}
+	})
+}
+
 func TestExperimentalFakeTCPRuntimeRejectsXDPBackendModeMismatchBeforeMutation(
 	t *testing.T,
 ) {

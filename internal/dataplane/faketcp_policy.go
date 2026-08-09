@@ -290,9 +290,9 @@ func buildFakeTCPPolicySnapshot(
 				index, underlay.Name,
 			)
 		}
-		if underlay.Parser != "ethernet" {
+		if underlay.Parser != "ethernet" && underlay.Parser != "l3" {
 			return nil, fmt.Errorf(
-				"build FakeTCP policy: ingress[%d] underlay %q parser is %q; want ethernet",
+				"build FakeTCP policy: ingress[%d] underlay %q parser is %q; want ethernet or l3",
 				index, underlay.Name, underlay.Parser,
 			)
 		}

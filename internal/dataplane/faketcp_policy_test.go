@@ -63,6 +63,38 @@ func TestBuildFakeTCPPolicySnapshotProjectsExactManagedPolicy(t *testing.T) {
 	}
 }
 
+func TestBuildFakeTCPPolicySnapshotAcceptsExactUnderlayParserAllowlist(t *testing.T) {
+	for _, test := range []struct {
+		parser string
+		want   uint8
+	}{
+		{parser: "ethernet", want: abi.ParserEthernet},
+		{parser: "l3", want: abi.ParserL3},
+	} {
+		t.Run(test.parser, func(t *testing.T) {
+			state := fakeTCPPolicyTestState()
+			state.Underlays[0].Parser = test.parser
+			snapshot, err := buildFakeTCPPolicySnapshot(state, 91)
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := abi.FakeTCPManagedIfKey{Generation: 91, UnderlayIndex: 3}
+			if got, ok := snapshot.ManagedInterfaces[key]; !ok || got.Generation != 91 {
+				t.Fatalf("managed interface = %#v, present=%t", got, ok)
+			}
+
+			baseline, err := abi.FromStateWithGeneration(state, 91)
+			if err != nil {
+				t.Fatal(err)
+			}
+			underlayKey := abi.UnderlayConfigKey{Generation: 91, UnderlayIndex: 3}
+			if got := baseline.Underlays[underlayKey].ParserMode; got != test.want {
+				t.Fatalf("canonical parser mode = %d, want %d", got, test.want)
+			}
+		})
+	}
+}
+
 func TestBuildFakeTCPControllerMarksProjectsOnlyLiveReferencedWireGuards(t *testing.T) {
 	state := fakeTCPPolicyTestState()
 	for index := range state.WireGuards {
@@ -389,11 +421,25 @@ func TestBuildFakeTCPPolicySnapshotRejectsInvalidSourceState(t *testing.T) {
 			wantErr: "not a resolved transform attachment",
 		},
 		{
-			name: "l3 parser",
+			name: "empty parser",
 			mutate: func(state *control.State) {
-				state.Underlays[0].Parser = "l3"
+				state.Underlays[0].Parser = ""
 			},
-			wantErr: "want ethernet",
+			wantErr: "want ethernet or l3",
+		},
+		{
+			name: "auto parser",
+			mutate: func(state *control.State) {
+				state.Underlays[0].Parser = "auto"
+			},
+			wantErr: "want ethernet or l3",
+		},
+		{
+			name: "unknown parser",
+			mutate: func(state *control.State) {
+				state.Underlays[0].Parser = "raw"
+			},
+			wantErr: "want ethernet or l3",
 		},
 		{
 			name: "unknown WireGuard",
