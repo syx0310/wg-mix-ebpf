@@ -363,6 +363,7 @@ func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
 		"skb_checksum_start_offset(skb) != transport_offset",
 		"skb->csum_offset != offsetof(struct udphdr, check)",
 		"skb_reset_csum_not_inet(skb)",
+		"skb->ip_summed = CHECKSUM_NONE",
 		"register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS",
 		".owner = THIS_MODULE",
 	} {
@@ -373,7 +374,7 @@ func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
 	networkIdentity := strings.Index(module, "network_offset != actual_network_offset")
 	commonUDPBytes := strings.Index(module, "ntohs(udp->len) != udp_length")
 	noneCase := strings.Index(module, "case CHECKSUM_NONE:")
-	noneReturn := strings.Index(module, "return WG_MIX_FAKETCP_CSUM_MATERIALIZED;")
+	noneReturn := strings.Index(module, "return WG_MIX_FAKETCP_CSUM_ACCEPT_NONE;")
 	partialCase := strings.Index(module, "case CHECKSUM_PARTIAL:")
 	transportHeaderRequired := strings.Index(module, "if (!skb_transport_header_was_set(skb))")
 	transportIdentity := strings.Index(module, "transport_offset != actual_transport_offset")
@@ -386,7 +387,7 @@ func TestFakeTCPChecksumKfuncIsNarrowExplicitAndNeverAutoLoaded(t *testing.T) {
 			transportIdentity < partialOffsets) {
 		t.Fatal("CHECKSUM_NONE must return without a transport header; CHECKSUM_PARTIAL must require exact transport/checksum metadata")
 	}
-	materializedReturn := strings.Index(module, "if (ret == WG_MIX_FAKETCP_CSUM_MATERIALIZED)")
+	materializedReturn := strings.Index(module, "if (ret == WG_MIX_FAKETCP_CSUM_ACCEPT_NONE)")
 	partialReset := strings.Index(module, "skb_reset_csum_not_inet(skb)")
 	if materializedReturn < 0 || partialReset < 0 || materializedReturn >= partialReset {
 		t.Fatal("CHECKSUM_NONE must return before CHECKSUM_PARTIAL metadata normalization")
