@@ -36,7 +36,9 @@ proc load_manifest {path expected_sha} {
         wg_peer_address local_repository local_package_dir remote_package_dir
         remote_source target_user target_host target_hostname target_kernel
         target_machine_id target_interface peer_address peer_port soak_seconds
-        session_seconds bind_final_package_sh_path bind_final_package_sh_blob
+        session_seconds physical_nic_forward_authority physical_interface_lock
+        legacy_matrix_mode realnic_profile realnic_traffic_seconds
+        bind_final_package_sh_path bind_final_package_sh_blob
         bind_final_package_sh_sha256 controller_sh_path controller_sh_blob
         controller_sh_sha256 locked_transport_exp_path locked_transport_exp_blob
         locked_transport_exp_sha256 root_matrix_n_r_sh_path root_matrix_n_r_sh_blob
@@ -55,7 +57,12 @@ proc load_manifest {path expected_sha} {
         test_fresh_verifier_gate_static_py_blob
         test_fresh_verifier_gate_static_py_sha256
         prepare_stage_root_sh_path prepare_stage_root_sh_blob
-        prepare_stage_root_sh_sha256 provision_ubuntu_test_host_sh_path
+        prepare_stage_root_sh_sha256 realnic_acceptance_py_path
+        realnic_acceptance_py_blob realnic_acceptance_py_sha256
+        test_realnic_acceptance_py_path test_realnic_acceptance_py_blob
+        test_realnic_acceptance_py_sha256 test_realnic_acceptance_static_py_path
+        test_realnic_acceptance_static_py_blob test_realnic_acceptance_static_py_sha256
+        provision_ubuntu_test_host_sh_path
         provision_ubuntu_test_host_sh_blob provision_ubuntu_test_host_sh_sha256
     }
     set channel [open $path r]
@@ -83,7 +90,7 @@ proc load_manifest {path expected_sha} {
 }
 
 proc validate_manifest_values {values} {
-    if {[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v2" ||
+    if {[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v3" ||
         [dict get $values run_id] ne "c8e41d73" ||
         [dict get $values package_id] ne "4f2a9b61" ||
         ![regexp {^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$} [dict get $values integration_ref]] ||
@@ -115,7 +122,19 @@ proc validate_manifest_values {values} {
         [dict get $values peer_address] ne "47.116.202.155" ||
         [dict get $values peer_port] ne "5201" ||
         [dict get $values soak_seconds] ne "3600" ||
-        [dict get $values session_seconds] ne "300"} {
+        [dict get $values session_seconds] ne "300" ||
+        [dict get $values physical_nic_forward_authority] ne "realnic-acceptance-v1" ||
+        [dict get $values physical_interface_lock] ne
+            "/run/wg-mix-ebpf-realnic-physical-interface.v1.lock" ||
+        [dict get $values legacy_matrix_mode] ne "retired" ||
+        [dict get $values realnic_profile] ne "acceptance" ||
+        [dict get $values realnic_traffic_seconds] ne "30" ||
+        [dict get $values realnic_acceptance_py_path] ne
+            "scripts/realhost-b82-acceptance-v1/realnic_acceptance.py" ||
+        [dict get $values test_realnic_acceptance_py_path] ne
+            "scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py" ||
+        [dict get $values test_realnic_acceptance_static_py_path] ne
+            "scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py"} {
         return -code error "manifest-value"
     }
     set wg_state [dict get $values wg_state]
@@ -141,7 +160,9 @@ proc validate_manifest_values {values} {
         checksum_module_lease_sh_blob root_fresh_verifier_gate_sh_blob
         test_hermetic_fresh_verifier_gate_sh_blob
         test_fresh_verifier_gate_static_py_blob
-        prepare_stage_root_sh_blob provision_ubuntu_test_host_sh_blob
+        prepare_stage_root_sh_blob realnic_acceptance_py_blob
+        test_realnic_acceptance_py_blob test_realnic_acceptance_static_py_blob
+        provision_ubuntu_test_host_sh_blob
     } {
         if {![regexp {^[0-9a-f]{40}$} [dict get $values $key]]} {
             return -code error "blob-$key"
@@ -155,6 +176,8 @@ proc validate_manifest_values {values} {
         root_fresh_verifier_gate_sh_sha256
         test_hermetic_fresh_verifier_gate_sh_sha256
         test_fresh_verifier_gate_static_py_sha256 prepare_stage_root_sh_sha256
+        realnic_acceptance_py_sha256 test_realnic_acceptance_py_sha256
+        test_realnic_acceptance_static_py_sha256
         provision_ubuntu_test_host_sh_sha256
     } {
         if {![regexp {^[0-9a-f]{64}$} [dict get $values $key]]} {
@@ -253,29 +276,6 @@ proc env_argv {} {
     return [list /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C]
 }
 
-proc matrix_remote_argv {values mode restore_cell} {
-    if {[dict get $values wg_state] ne "bound"} {
-        return -code error "wireguard-topology-absent"
-    }
-    set source [dict get $values remote_source]
-    set package [dict get $values remote_package_dir]
-    set argv [list /bin/bash -p \
-        "${source}/scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh" $mode \
-        --source $source --commit [dict get $values integration_commit] \
-        --bundle "${package}/[dict get $values bundle_name]" \
-        --bundle-sha256 [dict get $values bundle_sha256] \
-        --interface [dict get $values target_interface] \
-        --peer-address [dict get $values peer_address] \
-        --peer-port [dict get $values peer_port] \
-        --soak-seconds [dict get $values soak_seconds] \
-        --session-seconds [dict get $values session_seconds] \
-        --wg-interface [dict get $values wg_interface] \
-        --wg-local-address [dict get $values wg_local_address] \
-        --wg-peer-address [dict get $values wg_peer_address] \
-        --restore-cell $restore_cell]
-    return $argv
-}
-
 proc fresh_remote_argv {values manifest_sha mode bootstrap_root} {
     set source [dict get $values remote_source]
     set script_path [dict get $values root_fresh_verifier_gate_sh_path]
@@ -286,6 +286,22 @@ proc fresh_remote_argv {values manifest_sha mode bootstrap_root} {
         --manifest-sha256 $manifest_sha \
         --bundle "${bootstrap_root}/[dict get $values bundle_name]" \
         --bundle-sha256 [dict get $values bundle_sha256]]
+}
+
+proc realnic_remote_argv {values mode approved_sha} {
+    set source [dict get $values remote_source]
+    set script_path [dict get $values realnic_acceptance_py_path]
+    set argv [list /usr/bin/python3 -B -I "${source}/${script_path}" $mode \
+        --source-commit [dict get $values integration_commit]]
+    if {$mode in {run restore}} {
+        if {![regexp {^[0-9a-f]{64}$} $approved_sha]} {
+            return -code error "realnic-approved-plan-sha256"
+        }
+        lappend argv --approved-plan \
+            /run/wg-mix-ebpf-source-bootstrap-c8e41d73/realnic-approved-plan.json \
+            --approved-plan-sha256 $approved_sha
+    }
+    return $argv
 }
 
 proc package_sha {values name} {
@@ -304,11 +320,14 @@ proc package_sha {values name} {
         root-fresh-verifier-gate.sh { return [dict get $values root_fresh_verifier_gate_sh_sha256] }
         test-hermetic-fresh-verifier-gate.sh { return [dict get $values test_hermetic_fresh_verifier_gate_sh_sha256] }
         test_fresh_verifier_gate_static.py { return [dict get $values test_fresh_verifier_gate_static_py_sha256] }
+        realnic_acceptance.py { return [dict get $values realnic_acceptance_py_sha256] }
+        test_realnic_acceptance.py { return [dict get $values test_realnic_acceptance_py_sha256] }
+        test_realnic_acceptance_static.py { return [dict get $values test_realnic_acceptance_static_py_sha256] }
         default { return -code error "package-name" }
     }
 }
 
-proc build_operation {values manifest_sha operation} {
+proc build_operation {values manifest_sha operation approved_plan approved_sha} {
     set target "[dict get $values target_user]@[dict get $values target_host]"
     set package [dict get $values remote_package_dir]
     set local_package [dict get $values local_package_dir]
@@ -316,6 +335,7 @@ proc build_operation {values manifest_sha operation} {
     set bootstrap_stager "${bootstrap_root}/prepare-stage-root.sh"
     set bootstrap_provisioner "${bootstrap_root}/provision-ubuntu-test-host.sh"
     set snapshot_manifest "${bootstrap_root}/package-manifest.v1"
+    set user_realnic_plan "${package}/realnic-approved-plan.json"
     set remote {}
     set tty 0
     set prompt_limit 1
@@ -515,14 +535,6 @@ proc build_operation {values manifest_sha operation} {
                 set timeout_seconds 2400
             }
         }
-        matrix-plan - matrix-run {
-            set matrix_mode [expr {$operation eq "matrix-plan" ? "plan" : "run"}]
-            set remote [concat [list /usr/bin/sudo --] [env_argv] \
-                [matrix_remote_argv $values $matrix_mode none]]
-            set tty 1
-            set prompt_limit 2
-            set timeout_seconds [expr {$matrix_mode eq "run" ? 20000 : 600}]
-        }
         fresh-plan - fresh-run - fresh-restore {
             set fresh_mode [string range $operation 6 end]
             set remote [concat [list /usr/bin/sudo --] [env_argv] \
@@ -531,13 +543,59 @@ proc build_operation {values manifest_sha operation} {
             set prompt_limit 2
             set timeout_seconds [expr {$fresh_mode eq "run" ? 3600 : 2400}]
         }
+        stage-realnic-plan-snapshot - stage-realnic-plan-verify {
+            if {![regexp {^[0-9a-f]{64}$} $approved_sha]} {
+                return -code error "realnic-approved-plan-sha256"
+            }
+            set stage_mode [expr {$operation eq "stage-realnic-plan-snapshot" ?
+                "realnic-plan-snapshot" : "realnic-plan-verify"}]
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /bin/bash -p $bootstrap_stager $stage_mode \
+                --manifest $snapshot_manifest --manifest-sha256 $manifest_sha \
+                --approved-plan-sha256 $approved_sha]]
+            set tty 1
+            set prompt_limit 2
+            set timeout_seconds 600
+        }
+        realnic-plan - realnic-run - realnic-restore {
+            set realnic_mode [string range $operation 8 end]
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list PYTHONDONTWRITEBYTECODE=1] \
+                [realnic_remote_argv $values $realnic_mode $approved_sha]]
+            set tty 1
+            set prompt_limit 2
+            set timeout_seconds [expr {$realnic_mode eq "run" ? 20000 : 2400}]
+        }
         default {
-            if {[regexp {^matrix-restore-(tcx|original|all-on|all-off|tx-path|rx-path|mtu1492|mtu1500|soak)$} $operation -> cell]} {
-                set remote [concat [list /usr/bin/sudo --] [env_argv] \
-                    [matrix_remote_argv $values restore $cell]]
-                set tty 1
-                set prompt_limit 2
-                set timeout_seconds 2400
+            if {$operation in {scp-realnic-approved-plan verify-sha-realnic-approved-plan
+                verify-stat-realnic-approved-plan}} {
+                if {$approved_plan eq "none" ||
+                    ![regexp {^[0-9a-f]{64}$} $approved_sha]} {
+                    return -code error "realnic-approved-plan-arguments"
+                }
+                if {[file normalize $approved_plan] ne $approved_plan ||
+                    [file type $approved_plan] ne "file" ||
+                    [file_sha256 $approved_plan] ne $approved_sha} {
+                    return -code error "realnic-approved-plan-local"
+                }
+                file lstat $approved_plan approved_stat
+                if {$approved_stat(type) ne "file" || $approved_stat(nlink) != 1 ||
+                    $approved_stat(size) < 1 || $approved_stat(size) > 16777216 ||
+                    ($approved_stat(mode) & 0777) != 0600} {
+                    return -code error "realnic-approved-plan-shape"
+                }
+                if {$operation eq "scp-realnic-approved-plan"} {
+                    set destination "${target}:${user_realnic_plan}"
+                    set spawn_argv [concat [list /usr/bin/scp] [scp_options] \
+                        [list -- $approved_plan $destination]]
+                    return [list scp $spawn_argv $prompt_limit $assertion $timeout_seconds]
+                } elseif {$operation eq "verify-sha-realnic-approved-plan"} {
+                    set remote [list /usr/bin/sha256sum -- $user_realnic_plan]
+                    set assertion "exact:${approved_sha}  ${user_realnic_plan}"
+                } else {
+                    set remote [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- $user_realnic_plan]
+                    set assertion exact:siyixuan:siyixuan:600:1:regular\ file
+                }
             } elseif {[regexp {^(scp|verify-sha|verify-stat)-(.+)$} $operation -> family name]} {
                 set expected_sha [package_sha $values $name]
                 if {$expected_sha eq "MANIFEST_SHA256"} {
@@ -710,12 +768,14 @@ proc emit_safe {payload password} {
 proc transport_main {arguments} {
     set argc [llength $arguments]
     set argv $arguments
-    if {$argc != 10 ||
+    if {$argc != 14 ||
         [lindex $argv 0] ne "--manifest" ||
         [lindex $argv 2] ne "--manifest-sha256" ||
         [lindex $argv 4] ne "--credential-path" ||
         [lindex $argv 6] ne "--action" ||
-        [lindex $argv 8] ne "--operation"} {
+        [lindex $argv 8] ne "--operation" ||
+        [lindex $argv 10] ne "--approved-plan" ||
+        [lindex $argv 12] ne "--approved-plan-sha256"} {
         fail "arguments" 64
     }
     set manifest [lindex $argv 1]
@@ -723,17 +783,24 @@ proc transport_main {arguments} {
     set credential_path [lindex $argv 5]
     set action [lindex $argv 7]
     set operation [lindex $argv 9]
+    set approved_plan [lindex $argv 11]
+    set approved_sha [lindex $argv 13]
 
     if {![regexp {^[0-9a-f]{64}$} $manifest_sha] ||
         $credential_path ne "/Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82" ||
         $action ni {plan execute} ||
-        ![regexp {^[A-Za-z0-9_.-]+$} $operation]} {
+        ![regexp {^[A-Za-z0-9_.-]+$} $operation] ||
+        !(($approved_plan eq "none" && $approved_sha eq "none") ||
+          [regexp {^[0-9a-f]{64}$} $approved_sha]) ||
+        ($approved_plan ne "none" &&
+          ([file pathtype $approved_plan] ne "absolute" ||
+           [file normalize $approved_plan] ne $approved_plan))} {
         fail "argument-values" 65
     }
     if {[catch {load_manifest $manifest $manifest_sha} values] ||
         [catch {validate_manifest_values $values} validation_message] ||
         [catch {validate_self $values} self_message] ||
-        [catch {build_operation $values $manifest_sha $operation} operation_spec]} {
+        [catch {build_operation $values $manifest_sha $operation $approved_plan $approved_sha} operation_spec]} {
         fail "policy" 66
     }
     lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds

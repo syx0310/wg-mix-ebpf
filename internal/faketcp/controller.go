@@ -283,7 +283,7 @@ type Controller struct {
 	stateMu sync.Mutex
 	opMu    sync.Mutex
 
-	engine       *Engine
+	dispatcher   controllerEngineDispatcher
 	backend      ControllerBackend
 	recovery     *ActionRecovery
 	inflightDone *sync.Cond
@@ -298,7 +298,20 @@ type Controller struct {
 }
 
 func NewController(engine *Engine, backend ControllerBackend) (*Controller, error) {
-	return newController(engine, backend)
+	if engine == nil {
+		return nil, errors.New("faketcp controller requires an engine")
+	}
+	return newController(&singleEngineDispatcher{engine: engine}, backend)
+}
+
+// NewRoutedController selects one independently-owned Engine through router's
+// immutable exact WGID table. It does not alter production runtime selection;
+// callers must opt into this pure-Go multi-WireGuard boundary explicitly.
+func NewRoutedController(router *EngineRouter, backend ControllerBackend) (*Controller, error) {
+	if router == nil || validateRuntimeIdentity(router.Identity()) != nil {
+		return nil, errors.New("faketcp routed controller requires an engine router")
+	}
+	return newController(router, backend)
 }
 
 // NewRecoverableController adds a one-slot write-ahead checkpoint around
@@ -310,11 +323,22 @@ func NewRecoverableController(
 	backend ControllerBackend,
 	store ActionCheckpointStore,
 ) (*Controller, error) {
-	controller, err := newController(engine, backend)
+	if engine == nil {
+		return nil, errors.New("faketcp controller requires an engine")
+	}
+	return newRecoverableController(&singleEngineDispatcher{engine: engine}, backend, store)
+}
+
+func newRecoverableController(
+	dispatcher *singleEngineDispatcher,
+	backend ControllerBackend,
+	store ActionCheckpointStore,
+) (*Controller, error) {
+	controller, err := newController(dispatcher, backend)
 	if err != nil {
 		return nil, err
 	}
-	recovery, err := NewActionRecovery(engine.Identity(), backend, store)
+	recovery, err := NewActionRecovery(dispatcher.Identity(), backend, store)
 	if err != nil {
 		return nil, err
 	}
@@ -329,17 +353,17 @@ func NewRecoverableController(
 	return controller, nil
 }
 
-func newController(engine *Engine, backend ControllerBackend) (*Controller, error) {
-	if engine == nil {
-		return nil, errors.New("faketcp controller requires an engine")
+func newController(dispatcher controllerEngineDispatcher, backend ControllerBackend) (*Controller, error) {
+	if interfaceValueIsNil(dispatcher) {
+		return nil, errors.New("faketcp controller engine dispatcher is nil")
 	}
 	if controllerBackendIsNil(backend) {
 		return nil, errors.New("faketcp controller backend is nil")
 	}
 	controller := &Controller{
-		engine:    engine,
-		backend:   backend,
-		closeDone: make(chan struct{}),
+		dispatcher: dispatcher,
+		backend:    backend,
+		closeDone:  make(chan struct{}),
 	}
 	controller.inflightDone = sync.NewCond(&controller.stateMu)
 	return controller, nil
@@ -406,38 +430,45 @@ func (c *Controller) handleOwnedDecodedEvent(
 	ctx context.Context,
 	decoded ownedDecodedEvent,
 ) ([]Action, error) {
-	if identity := runtimeIdentityFromEvent(decoded.Event); identity != c.engine.Identity() {
+	if identity := runtimeIdentityFromEvent(decoded.Event); identity != c.dispatcher.Identity() {
 		return nil, fmt.Errorf(
-			"faketcp event runtime identity does not match controller Engine: event=%x engine=%x",
-			identity.Incarnation, c.engine.Identity().Incarnation,
+			"faketcp event runtime identity does not match controller dispatcher: event=%x dispatcher=%x",
+			identity.Incarnation, c.dispatcher.Identity().Incarnation,
 		)
 	}
+	selection, err := c.dispatcher.selectEngine(decoded.Event)
+	if err != nil {
+		return nil, err
+	}
 	var (
-		actions []Action
-		err     error
+		actions   []Action
+		engineErr error
 	)
 	switch decoded.Event.Type {
 	case abi.FakeTCPEventNeedHandshake:
 		if err := MaterializeIPv4UDPChecksums(decoded.Packet); err != nil {
 			return nil, err
 		}
-		actions, err = c.engine.handleOwnedCapturedPacket(
+		actions, engineErr = selection.engine.handleOwnedCapturedPacket(
 			decoded.Event,
 			decoded.Packet,
 			decoded.Fingerprint,
 		)
 	case abi.FakeTCPEventRST, abi.FakeTCPEventFIN:
-		actions, err = c.engine.InboundCapturedControl(decoded.Event, decoded.Packet)
+		actions, engineErr = selection.engine.InboundCapturedControl(decoded.Event, decoded.Packet)
 	default:
-		actions, err = c.engine.InboundWithWGID(decoded.Event.Key, Segment{
+		actions, engineErr = selection.engine.InboundWithWGID(decoded.Event.Key, Segment{
 			Flags:           decoded.Event.TCPFlags,
 			Sequence:        decoded.Event.Sequence,
 			Acknowledgement: decoded.Event.Acknowledgement,
 			PayloadLength:   decoded.Event.PayloadLength,
 		}, decoded.Event.WGID)
 	}
-	if err != nil {
-		return actions, err
+	if engineErr != nil {
+		return actions, engineErr
+	}
+	if err := c.dispatcher.validateActions(selection.wgID, actions); err != nil {
+		return actions, c.markFailed(err)
 	}
 	if err := c.executeActions(ctx, actions); err != nil {
 		return actions, c.handleActionExecutionError(err)
@@ -456,7 +487,10 @@ func (c *Controller) Tick(ctx context.Context) ([]Action, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	actions, engineErr := c.engine.Tick()
+	actions, engineErr := c.dispatcher.Tick()
+	if errors.Is(engineErr, ErrEngineRouteRejected) {
+		return actions, c.markFailed(engineErr)
+	}
 	if executeErr := c.executeActions(ctx, actions); executeErr != nil {
 		return actions, errors.Join(engineErr, c.handleActionExecutionError(executeErr))
 	}
@@ -652,7 +686,7 @@ func (c *Controller) finishOperation() {
 }
 
 func (c *Controller) initializedLocked() bool {
-	return c.engine != nil &&
+	return !interfaceValueIsNil(c.dispatcher) &&
 		!controllerBackendIsNil(c.backend) &&
 		c.inflightDone != nil &&
 		c.closeDone != nil

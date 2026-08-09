@@ -13,6 +13,59 @@ readonly TRANSPORT="${REVIEW_ROOT}/locked-transport.exp"
 readonly STAGER="${REVIEW_ROOT}/prepare-stage-root.sh"
 readonly MATRIX="${REVIEW_ROOT}/root-matrix-n-r.sh"
 readonly STATIC_TEST="${REVIEW_ROOT}/test_controller_static.py"
+readonly REALNIC_ROOT="${REPOSITORY}/scripts/realhost-b82-acceptance-v1"
+readonly REALNIC="${REALNIC_ROOT}/realnic_acceptance.py"
+readonly REALNIC_TEST="${REALNIC_ROOT}/test_realnic_acceptance.py"
+readonly REALNIC_STATIC_TEST="${REALNIC_ROOT}/test_realnic_acceptance_static.py"
+readonly REALNIC_INTEGRATION_MERGE='7621f84df30b52428abed1988c6c1800cc7d1768'
+readonly REALNIC_STAGE_B_PARENT='9284344e58f949efb98be963438a173499791669'
+readonly REVIEWED_CANONICAL_PARENT='d28585bfaaefe44c0e71d2cbbced494da96dd7fa'
+readonly -a REALNIC_INTEGRATION_FILES=(
+  scripts/realhost-b82-acceptance-v1/realnic_acceptance.py
+  scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py
+  scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py
+  scripts/realhost-b82-c8e41d73/bind-final-package.sh
+  scripts/realhost-b82-c8e41d73/controller.sh
+  scripts/realhost-b82-c8e41d73/locked-transport.exp
+  scripts/realhost-b82-c8e41d73/prepare-stage-root.sh
+  scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh
+)
+readonly REALNIC_MANAGED_INTEGRATION_MERGE='93cd6a890ef37d75e9d7a63ed3504a1bbf4b9796'
+readonly REALNIC_DURABLE_PARENT='1e8e183fe8ff0d295fe9c40e5b9573b5f23f4e7c'
+readonly MANAGED_CANONICAL_PARENT='4636302fd45dae8134faf7b0aec4adc0737c5f3e'
+readonly -a REALNIC_DURABLE_INTEGRATION_FILES=(
+  internal/dataplane/scoped_realnic_checker_contract_test.go
+  internal/dataplane/scoped_realnic_linux_test.go
+  scripts/realhost-b82-acceptance-v1/realnic_acceptance.py
+  scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py
+  scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py
+  scripts/realhost-b82-c8e41d73/bind-final-package.sh
+  scripts/realhost-b82-c8e41d73/check-realhost-iperf.py
+  scripts/realhost-b82-c8e41d73/controller.sh
+  scripts/realhost-b82-c8e41d73/locked-transport.exp
+  scripts/realhost-b82-c8e41d73/prepare-stage-root.sh
+  scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh
+  scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh
+  scripts/realhost-b82-c8e41d73/test-hermetic-controller.sh
+  scripts/realhost-b82-c8e41d73/test-hermetic-fresh-verifier-gate.sh
+  scripts/realhost-b82-c8e41d73/test-hermetic-matrix.sh
+  scripts/realhost-b82-c8e41d73/test_controller_static.py
+  scripts/realhost-b82-c8e41d73/test_fresh_verifier_gate_static.py
+  scripts/realhost-b82-c8e41d73/test_matrix_static.py
+)
+readonly -a MANAGED_EXACT_INTEGRATION_FILES=(
+  bpf/wg_mix_faketcp.h
+  internal/dataplane/faketcp_managed_ingress_contract_test.go
+  internal/dataplane/faketcp_managed_ingress_realhost_linux_test.go
+  internal/faketcp/controller.go
+  internal/faketcp/engine.go
+  internal/faketcp/engine_router.go
+  internal/faketcp/engine_router_test.go
+  internal/faketcp/runtime_domain.go
+  internal/faketcp/runtime_domain_test.go
+  scripts/realhost-b82-c8e41d73/root-veth-n-r.sh
+  scripts/realhost-b82-c8e41d73/test_veth_runner_static.py
+)
 readonly MODULE_LEASE_HELPER="${REVIEW_ROOT}/checksum-module-lease.sh"
 readonly PROVISION_POLICY_TEST="${REVIEW_ROOT}/test_provision_policy.tcl"
 readonly PROVISIONER="${REPOSITORY}/scripts/provision-ubuntu-test-host.sh"
@@ -58,14 +111,155 @@ require_ordered_literals() {
   done
 }
 
+fixture_file_identity() {
+  /usr/bin/python3 -B -I -c \
+    'import os, sys; print(os.stat(sys.argv[1]).st_ino)' "$1"
+}
+
+approved_plan_verify_fixture() {
+  local destination="$1" expected_sha="$2" pending
+  pending="${destination}.pending.${expected_sha}"
+  /usr/bin/python3 -B -I -c \
+    'import hashlib, os, stat, sys
+final_path, pending_path, expected = sys.argv[1:]
+values = []
+for path in (final_path, pending_path):
+    value = os.lstat(path)
+    if not stat.S_ISREG(value.st_mode) or stat.S_ISLNK(value.st_mode):
+        raise SystemExit(79)
+    if stat.S_IMODE(value.st_mode) != 0o600 or value.st_nlink != 2 or not 0 < value.st_size <= 16 << 20:
+        raise SystemExit(79)
+    with open(path, "rb") as handle:
+        if hashlib.sha256(handle.read()).hexdigest() != expected:
+            raise SystemExit(79)
+    values.append((value.st_dev, value.st_ino))
+if values[0] != values[1]:
+    raise SystemExit(79)' "${destination}" "${pending}" "${expected_sha}"
+}
+
+approved_plan_pending_fixture() {
+  /usr/bin/python3 -B -I -c \
+    'import os, stat, sys
+value = os.lstat(sys.argv[1])
+if not stat.S_ISREG(value.st_mode) or stat.S_ISLNK(value.st_mode):
+    raise SystemExit(79)
+if stat.S_IMODE(value.st_mode) != 0o600 or value.st_nlink != 1 or value.st_size > 16 << 20:
+    raise SystemExit(79)' "$1"
+}
+
+approved_plan_snapshot_fixture() {
+  local source="$1" destination="$2" expected_sha="$3" cut="${4:-none}"
+  local source_sha pending descriptor_identity path_identity
+  pending="${destination}.pending.${expected_sha}"
+  [[ -f "${source}" && ! -L "${source}" ]] || return 79
+  source_sha="$(sha256_file "${source}")" || return $?
+  [[ "${source_sha}" == "${expected_sha}" ]] || return 79
+  exec 9<"${source}" || return 79
+  if [[ -e "${destination}" || -L "${destination}" ]]; then
+    approved_plan_verify_fixture "${destination}" "${expected_sha}" || return $?
+  else
+    if [[ ! -e "${pending}" && ! -L "${pending}" ]]; then
+      (umask 077
+        set -o noclobber
+        : >"${pending}") || return $?
+    fi
+    approved_plan_pending_fixture "${pending}" || return $?
+    exec 7<>"${pending}" || return 79
+    descriptor_identity="$(fixture_file_identity /dev/fd/7)" || return 79
+    path_identity="$(fixture_file_identity "${pending}")" || return 79
+    [[ "${descriptor_identity}" == "${path_identity}" ]] || return 79
+    if [[ "${cut}" == 'inode-swap' ]]; then
+      /bin/ln -- "${pending}" "${pending}.swapped-out" || return $?
+      : >"${pending}.replacement" || return $?
+      /bin/chmod 0600 "${pending}.replacement" || return $?
+      /bin/mv -- "${pending}.replacement" "${pending}" || return $?
+    fi
+    if [[ "${cut}" == 'partial-write' ]]; then
+      printf '{"cut' >"/dev/fd/7" || return $?
+      return 91
+    fi
+    /bin/cat -- /dev/fd/9 >"/dev/fd/7" || return $?
+    /usr/bin/python3 -B -I -c 'import os, sys; os.fsync(int(sys.argv[1]))' 7 || return $?
+    [[ "$(fixture_file_identity "${pending}")" == "${descriptor_identity}" ]] || return 79
+    [[ "$(sha256_file "${pending}")" == "${expected_sha}" ]] || return 79
+    /usr/bin/python3 -B -I -c \
+      'import os, sys; fd = os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)' \
+      "$(dirname -- "${destination}")" || return $?
+    [[ "${cut}" != 'post-fsync' ]] || return 92
+    /bin/ln -- "${pending}" "${destination}" || return $?
+    [[ "${cut}" != 'post-link' ]] || return 93
+  fi
+  /usr/bin/python3 -B -I -c \
+    'import os, sys; fd = os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)' \
+    "$(dirname -- "${destination}")" || return $?
+  approved_plan_verify_fixture "${destination}" "${expected_sha}" || return $?
+  [[ "$(fixture_file_identity "${source}")" == "$(fixture_file_identity /dev/fd/9)" &&
+    "$(sha256_file "${source}")" == "${expected_sha}" ]]
+}
+
 for path in "${BINDER}" "${CONTROLLER}" "${TRANSPORT}" "${STAGER}" "${MATRIX}" \
-  "${STATIC_TEST}" "${MODULE_LEASE_HELPER}" "${PROVISION_POLICY_TEST}" "${PROVISIONER}"; do
+  "${STATIC_TEST}" "${REALNIC}" "${REALNIC_TEST}" "${REALNIC_STATIC_TEST}" \
+  "${MODULE_LEASE_HELPER}" "${PROVISION_POLICY_TEST}" "${PROVISIONER}"; do
   [[ -f "${path}" && ! -L "${path}" ]] || fail "review input is not a regular file: ${path}"
 done
 
+REALNIC_INTEGRATION_PARENTS="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P \
+  "${REALNIC_INTEGRATION_MERGE}")" || fail 'cannot read realNIC integration parents'
+readonly REALNIC_INTEGRATION_PARENTS
+[[ "${REALNIC_INTEGRATION_PARENTS}" == \
+  "${REALNIC_STAGE_B_PARENT} ${REVIEWED_CANONICAL_PARENT}" ]] ||
+  fail 'realNIC integration does not preserve the exact two-parent topology'
+/usr/bin/git -C "${REPOSITORY}" merge-base --is-ancestor \
+  "${REALNIC_INTEGRATION_MERGE}" HEAD || fail 'HEAD does not contain the realNIC integration merge'
+/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
+  "${REALNIC_INTEGRATION_MERGE}^1" "${REALNIC_INTEGRATION_MERGE}" -- \
+  "${REALNIC_INTEGRATION_FILES[@]}" ||
+  fail 'canonical merge rewrote a Stage B authority or manifest source blob'
+
+REALNIC_MANAGED_INTEGRATION_PARENTS="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P \
+  "${REALNIC_MANAGED_INTEGRATION_MERGE}")" || fail 'cannot read managed realNIC integration parents'
+readonly REALNIC_MANAGED_INTEGRATION_PARENTS
+[[ "${REALNIC_MANAGED_INTEGRATION_PARENTS}" == \
+  "${REALNIC_DURABLE_PARENT} ${MANAGED_CANONICAL_PARENT}" ]] ||
+  fail 'managed realNIC integration does not preserve the exact two-parent topology'
+/usr/bin/git -C "${REPOSITORY}" merge-base --is-ancestor \
+  "${REALNIC_MANAGED_INTEGRATION_MERGE}" HEAD ||
+  fail 'HEAD does not contain the managed realNIC integration merge'
+/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
+  "${REALNIC_DURABLE_PARENT}" "${REALNIC_MANAGED_INTEGRATION_MERGE}" -- \
+  "${REALNIC_DURABLE_INTEGRATION_FILES[@]}" ||
+  fail 'managed canonical merge rewrote a durable realNIC authority or manifest source blob'
+/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
+  "${MANAGED_CANONICAL_PARENT}" "${REALNIC_MANAGED_INTEGRATION_MERGE}" -- \
+  "${MANAGED_EXACT_INTEGRATION_FILES[@]}" ||
+  fail 'managed realNIC integration rewrote a non-conflicting managed-ingress blob'
+MANAGED_INTEGRATION_WRITE_SET="$(/usr/bin/git -C "${REPOSITORY}" diff --name-only \
+  "${REALNIC_DURABLE_PARENT}" "${REALNIC_MANAGED_INTEGRATION_MERGE}")" ||
+  fail 'cannot read managed realNIC integration write set'
+readonly MANAGED_INTEGRATION_WRITE_SET
+[[ "${MANAGED_INTEGRATION_WRITE_SET}" == $'bpf/wg_mix_faketcp.h\ninternal/dataplane/faketcp_managed_ingress_contract_test.go\ninternal/dataplane/faketcp_managed_ingress_realhost_linux_test.go\ninternal/faketcp/controller.go\ninternal/faketcp/engine.go\ninternal/faketcp/engine_router.go\ninternal/faketcp/engine_router_test.go\ninternal/faketcp/runtime_domain.go\ninternal/faketcp/runtime_domain_test.go\nscripts/realhost-b82-c8e41d73/root-veth-n-r.sh\nscripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh\nscripts/realhost-b82-c8e41d73/test_veth_runner_static.py' ]] ||
+  fail 'managed realNIC integration changed a non-topic path'
+MANAGED_INTEGRATION_HERMETIC="$(/usr/bin/git -C "${REPOSITORY}" show \
+  "${REALNIC_MANAGED_INTEGRATION_MERGE}:scripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh")" ||
+  fail 'cannot read managed realNIC integration resolution'
+readonly MANAGED_INTEGRATION_HERMETIC
+for marker in \
+  ORIGINAL_MERGE_RESOLUTION_BLOBS \
+  MANAGED_INGRESS_ACCOUNTING_PARENTS \
+  MANAGED_INGRESS_PRODUCTION_PARENTS \
+  MANAGED_INGRESS_ACCEPTANCE_ROOT_PARENTS \
+  MANAGED_INGRESS_ACCEPTANCE_PARENTS \
+  MANAGED_INGRESS_PRODUCTION_PATHS \
+  MANAGED_INGRESS_TEST_PATHS; do
+  [[ "${MANAGED_INTEGRATION_HERMETIC}" == *"${marker}"* ]] ||
+    fail "managed realNIC integration dropped conflict contract: ${marker}"
+done
+[[ "${MANAGED_INTEGRATION_HERMETIC}" != *'MERGE_RESOLUTION_FILES'* ]] ||
+  fail 'managed realNIC integration replaced exact historical blobs with a moving file list'
+
 /bin/bash -n "${BINDER}" "${CONTROLLER}" "${STAGER}" "${MODULE_LEASE_HELPER}" \
   "${PROVISIONER}" "$0" || fail 'Bash syntax gate'
-/usr/bin/python3 -I "${STATIC_TEST}" \
+/usr/bin/python3 -B -I "${STATIC_TEST}" \
   "${BINDER}" "${CONTROLLER}" "${TRANSPORT}" "${STAGER}" "${MATRIX}" "${PROVISIONER}" ||
   fail 'static controller contract'
 /usr/bin/expect "${PROVISION_POLICY_TEST}" "${TRANSPORT}" || fail 'provision output policy'
@@ -86,6 +280,7 @@ TEST_ROOT="$(/usr/bin/mktemp -d /private/tmp/wg-mix-b82-v6-controller-hermetic.X
   fail 'temporary root creation'
 FIXTURE_REPOSITORY="${TEST_ROOT}/repository"
 FIXTURE_REVIEW="${FIXTURE_REPOSITORY}/scripts/realhost-b82-c8e41d73"
+FIXTURE_REALNIC="${FIXTURE_REPOSITORY}/scripts/realhost-b82-acceptance-v1"
 /bin/mkdir -m 0700 -- "${FIXTURE_REPOSITORY}" || fail 'fixture repository creation'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" init || fail 'fixture Git init'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" config user.name 'Hermetic Controller Test' || fail 'fixture Git name'
@@ -94,7 +289,7 @@ printf 'history-root=%s\n' "${TEST_ROOT##*/}" >"${FIXTURE_REPOSITORY}/history-ro
   fail 'fixture history root'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" add -- history-root.v1 || fail 'fixture history root add'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" commit -m 'Hermetic history root' || fail 'fixture history root commit'
-/bin/mkdir -p -- "${FIXTURE_REVIEW}" || fail 'fixture review directory creation'
+/bin/mkdir -p -- "${FIXTURE_REVIEW}" "${FIXTURE_REALNIC}" || fail 'fixture review directory creation'
 for name in \
   bind-final-package.sh controller.sh locked-transport.exp prepare-stage-root.sh \
   root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh test_matrix_static.py \
@@ -103,6 +298,10 @@ for name in \
   checksum-module-lease.sh test-hermetic-checksum-module-lease.sh \
   test_checksum_module_lease_static.py test_provision_policy.tcl; do
   /bin/cp -- "${REVIEW_ROOT}/${name}" "${FIXTURE_REVIEW}/${name}" || fail "fixture copy ${name}"
+done
+for name in realnic_acceptance.py test_realnic_acceptance.py test_realnic_acceptance_static.py; do
+  /bin/cp -- "${REALNIC_ROOT}/${name}" "${FIXTURE_REALNIC}/${name}" ||
+    fail "fixture copy ${name}"
 done
 /bin/cp -- "${PROVISIONER}" "${FIXTURE_REPOSITORY}/scripts/provision-ubuntu-test-host.sh" ||
   fail 'fixture copy provisioner'
@@ -153,7 +352,41 @@ BOUND_MANIFEST_SHA="$(sha256_file "${BOUND_MANIFEST}")" || fail 'manifest digest
 [[ "$(sha256_file "${BOUND_OUTPUT}/provision-ubuntu-test-host.sh")" == \
   "$(manifest_value provision_ubuntu_test_host_sh_sha256 "${BOUND_MANIFEST}")" ]] ||
   fail 'provisioner package digest binding'
-[[ "$(manifest_value format "${BOUND_MANIFEST}")" == 'wg-mix-ebpf-b82-v6-package-v2' &&
+readonly -a REALNIC_MANIFEST_KEYS=(
+  realnic_acceptance_py
+  test_realnic_acceptance_py
+  test_realnic_acceptance_static_py
+)
+readonly -a REALNIC_MANIFEST_PATHS=(
+  scripts/realhost-b82-acceptance-v1/realnic_acceptance.py
+  scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py
+  scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py
+)
+readonly -a REALNIC_PACKAGE_NAMES=(
+  realnic_acceptance.py
+  test_realnic_acceptance.py
+  test_realnic_acceptance_static.py
+)
+for index in 0 1 2; do
+  key="${REALNIC_MANIFEST_KEYS[${index}]}"
+  source_file="${REALNIC_MANIFEST_PATHS[${index}]}"
+  package_name="${REALNIC_PACKAGE_NAMES[${index}]}"
+  expected_blob="$(/usr/bin/git -C "${FIXTURE_REPOSITORY}" rev-parse \
+    "${FIXTURE_COMMIT}:${source_file}")" || fail 'realNIC source blob lookup'
+  [[ "$(manifest_value "${key}_path" "${BOUND_MANIFEST}")" == "${source_file}" &&
+    "$(manifest_value "${key}_blob" "${BOUND_MANIFEST}")" == "${expected_blob}" &&
+    "$(sha256_file "${BOUND_OUTPUT}/${package_name}")" == \
+      "$(manifest_value "${key}_sha256" "${BOUND_MANIFEST}")" ]] ||
+    fail "realNIC manifest triplet is not bound to source blob: ${source_file}"
+done
+[[ "$(manifest_value format "${BOUND_MANIFEST}")" == 'wg-mix-ebpf-b82-v6-package-v3' &&
+  "$(manifest_value physical_nic_forward_authority "${BOUND_MANIFEST}")" == \
+    'realnic-acceptance-v1' &&
+  "$(manifest_value physical_interface_lock "${BOUND_MANIFEST}")" == \
+    '/run/wg-mix-ebpf-realnic-physical-interface.v1.lock' &&
+  "$(manifest_value legacy_matrix_mode "${BOUND_MANIFEST}")" == 'retired' &&
+  "$(manifest_value realnic_profile "${BOUND_MANIFEST}")" == 'acceptance' &&
+  "$(manifest_value realnic_traffic_seconds "${BOUND_MANIFEST}")" == '30' &&
   "$(manifest_value checksum_module_lease_sh_path "${BOUND_MANIFEST}")" == \
     'scripts/realhost-b82-c8e41d73/checksum-module-lease.sh' &&
   "$(manifest_value root_fresh_verifier_gate_sh_path "${BOUND_MANIFEST}")" == \
@@ -161,8 +394,10 @@ BOUND_MANIFEST_SHA="$(sha256_file "${BOUND_MANIFEST}")" || fail 'manifest digest
   "$(sha256_file "${BOUND_OUTPUT}/checksum-module-lease.sh")" == \
     "$(manifest_value checksum_module_lease_sh_sha256 "${BOUND_MANIFEST}")" &&
   "$(sha256_file "${BOUND_OUTPUT}/root-fresh-verifier-gate.sh")" == \
-    "$(manifest_value root_fresh_verifier_gate_sh_sha256 "${BOUND_MANIFEST}")" ]] ||
-  fail 'single-schema fresh authority binding'
+    "$(manifest_value root_fresh_verifier_gate_sh_sha256 "${BOUND_MANIFEST}")" &&
+  "$(manifest_value realnic_acceptance_py_path "${BOUND_MANIFEST}")" == \
+    'scripts/realhost-b82-acceptance-v1/realnic_acceptance.py' ]] ||
+  fail 'single-schema fresh/realNIC authority binding'
 /usr/bin/git -C "${BOUND_OUTPUT}/history-verification.git" fsck --full --strict --no-dangling \
   "${FIXTURE_COMMIT}" || fail 'isolated history fsck'
 /usr/bin/grep -E '^\?' -- "${BOUND_OUTPUT}/history-objects.v1"
@@ -177,7 +412,6 @@ CONTROLLER_ARGS=(
   --manifest "${BOUND_MANIFEST}"
   --manifest-sha256 "${BOUND_MANIFEST_SHA}"
   --credential-path "${CREDENTIAL_PATH}"
-  --restore-cell none
 )
 CONTROLLER_PLAN="$(/bin/bash "${FIXTURE_REVIEW}/controller.sh" plan "${CONTROLLER_ARGS[@]}")" ||
   fail 'controller plan'
@@ -230,9 +464,11 @@ for literal in \
   'operation=fresh-run transport=ssh credential_read=0 network_operations=0' \
   'operation=fresh-restore transport=ssh credential_read=0 network_operations=0' \
   '/bin/bash -p /run/wg-mix-ebpf-source-stages/c8e41d73/source/scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh run --controller-source /run/wg-mix-ebpf-source-stages/c8e41d73/source' \
-  'operation=matrix-run transport=ssh credential_read=0 network_operations=0' \
-  '--wg-interface wg0 --wg-local-address 10.200.0.1 --wg-peer-address 10.200.0.2' \
-  'B82_V6_CONTROLLER_PLAN_COMPLETE credential_read=0 network_operations=0 mutations=0'; do
+  'operation=realnic-plan transport=ssh credential_read=0 network_operations=0' \
+  '/usr/bin/python3 -B -I /run/wg-mix-ebpf-source-stages/c8e41d73/source/scripts/realhost-b82-acceptance-v1/realnic_acceptance.py plan --source-commit' \
+  'B82_V6_REALNIC_APPROVAL_REQUIRED local_plan=explicit approved_plan_sha256=explicit automatic_approval=0' \
+  'B82_V6_LEGACY_MATRIX_RETIRED controller_entries=0 historical_recovery=frozen-original-package-before-final-staging' \
+  'B82_V6_CONTROLLER_PLAN_COMPLETE credential_read=0 network_operations=0 mutations=0 legacy_forward=retired'; do
   [[ "${CONTROLLER_PLAN}" == *"${literal}"* ]] || fail "controller plan missing ${literal}"
 done
 [[ "${CONTROLLER_PLAN}" != *'B82_V6_MATRIX_BLOCKED'* ]] || fail 'bound plan was blocked'
@@ -241,6 +477,10 @@ done
 [[ "${CONTROLLER_PLAN}" != *'/bin/bash -p /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/provision-ubuntu-test-host.sh'* ]] ||
   fail 'controller plan executes user-writable package provisioner'
 [[ "${CONTROLLER_PLAN}" != *'/usr/sbin/bpftool version'* ]] || fail 'legacy bpftool probe survived'
+[[ "${CONTROLLER_PLAN}" != *'operation=matrix-'* ]] ||
+  fail 'retired legacy matrix operation remained reachable'
+[[ "${CONTROLLER_PLAN}" != *'operation=hermetic-realnic-'* ]] ||
+  fail 'controller retained a package-copy realNIC test operation'
 [[ "${CONTROLLER_PLAN}" != *'prepare-stage-root.sh plan --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1'* ]] ||
   fail 'controller stage plan reopens the user-owned manifest'
 [[ "${CONTROLLER_PLAN}" != *'prepare-stage-root.sh run --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1'* ]] ||
@@ -270,7 +510,54 @@ require_ordered_literals "${CONTROLLER_PLAN}" \
   'operation=stage-run ' \
   'operation=fresh-plan ' \
   'operation=fresh-run ' \
-  'operation=fresh-restore '
+  'operation=fresh-restore ' \
+  'operation=realnic-plan ' \
+  'B82_V6_LEGACY_MATRIX_RETIRED '
+
+APPROVED_PLAN="${TEST_ROOT}/reviewed-realnic-plan.json"
+printf '%s\n' '{"fixture":"explicitly-reviewed-realnic-plan"}' >"${APPROVED_PLAN}" ||
+  fail 'approved plan fixture'
+/bin/chmod 0600 "${APPROVED_PLAN}" || fail 'approved plan fixture mode'
+APPROVED_PLAN_SHA="$(sha256_file "${APPROVED_PLAN}")" || fail 'approved plan fixture digest'
+APPROVED_CONTROLLER_ARGS=(
+  "${CONTROLLER_ARGS[@]}"
+  --approved-plan "${APPROVED_PLAN}"
+  --approved-plan-sha256 "${APPROVED_PLAN_SHA}"
+)
+APPROVED_CONTROLLER_PLAN="$(/bin/bash "${FIXTURE_REVIEW}/controller.sh" plan \
+  "${APPROVED_CONTROLLER_ARGS[@]}")" || fail 'approved controller plan'
+for literal in \
+  'operation=scp-realnic-approved-plan transport=scp credential_read=0 network_operations=0' \
+  "${APPROVED_PLAN}" \
+  'siyixuan@192.168.10.82:/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/realnic-approved-plan.json' \
+  'operation=verify-sha-realnic-approved-plan transport=ssh credential_read=0 network_operations=0' \
+  'operation=verify-stat-realnic-approved-plan transport=ssh credential_read=0 network_operations=0' \
+  'operation=stage-realnic-plan-snapshot transport=ssh credential_read=0 network_operations=0' \
+  'realnic-plan-snapshot --manifest /run/wg-mix-ebpf-source-bootstrap-c8e41d73/package-manifest.v1' \
+  'operation=realnic-run transport=ssh credential_read=0 network_operations=0' \
+  'realnic_acceptance.py run --source-commit' \
+  '--approved-plan /run/wg-mix-ebpf-source-bootstrap-c8e41d73/realnic-approved-plan.json' \
+  "--approved-plan-sha256 ${APPROVED_PLAN_SHA}" \
+  'operation=stage-realnic-plan-verify transport=ssh credential_read=0 network_operations=0' \
+  'realnic-plan-verify --manifest /run/wg-mix-ebpf-source-bootstrap-c8e41d73/package-manifest.v1' \
+  'operation=realnic-restore transport=ssh credential_read=0 network_operations=0' \
+  'realnic_acceptance.py restore --source-commit'; do
+  [[ "${APPROVED_CONTROLLER_PLAN}" == *"${literal}"* ]] ||
+    fail "approved controller plan missing ${literal}"
+done
+require_ordered_literals "${APPROVED_CONTROLLER_PLAN}" \
+  'operation=scp-realnic-approved-plan ' \
+  'operation=verify-sha-realnic-approved-plan ' \
+  'operation=verify-stat-realnic-approved-plan ' \
+  'operation=stage-realnic-plan-snapshot ' \
+  'operation=realnic-run ' \
+  'operation=stage-realnic-plan-verify ' \
+  'operation=realnic-restore '
+for dynamic in --run-id --run-root --expected-ifindex --expected-mac --expected-driver \
+  --expected-device-path --expected-mtu --expected-boot-id --mtu-low; do
+  [[ "${APPROVED_CONTROLLER_PLAN}" != *"${dynamic} "* ]] ||
+    fail "approved controller retained dynamic CLI option ${dynamic}"
+done
 
 BOOTSTRAP_FIXTURE="${TEST_ROOT}/bootstrap-first-run-c8e41d73"
 [[ ! -e "${BOOTSTRAP_FIXTURE}" && ! -L "${BOOTSTRAP_FIXTURE}" ]] || fail 'bootstrap fixture was not fresh'
@@ -347,6 +634,163 @@ IMMUTABLE_CLONE="${IMMUTABLE_FIXTURE}/source"
 printf 'HERMETIC_IMMUTABLE_INTAKE old_manifest_reopen=failed old_bundle_reopen=failed root_copy_only=pass retained=%s\n' \
   "${IMMUTABLE_FIXTURE}"
 
+REALNIC_INTAKE_FIXTURE="${TEST_ROOT}/realnic-approved-plan-intake"
+/bin/mkdir -m 0700 -- "${REALNIC_INTAKE_FIXTURE}" || fail 'realNIC intake fixture creation'
+REALNIC_INTAKE="${REALNIC_INTAKE_FIXTURE}/user-plan.json"
+REALNIC_SNAPSHOT="${REALNIC_INTAKE_FIXTURE}/root-plan.json"
+printf '%s\n' '{"approved":"exact-held-fd-bytes"}' >"${REALNIC_INTAKE}" || fail 'realNIC intake bytes'
+/bin/chmod 0600 "${REALNIC_INTAKE}" || fail 'realNIC intake mode'
+REALNIC_INTAKE_SHA="$(sha256_file "${REALNIC_INTAKE}")" || fail 'realNIC intake hash'
+approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${REALNIC_SNAPSHOT}" \
+  "${REALNIC_INTAKE_SHA}" || fail 'realNIC fresh snapshot'
+approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${REALNIC_SNAPSHOT}" \
+  "${REALNIC_INTAKE_SHA}" || fail 'realNIC exact snapshot retry'
+/bin/mv -- "${REALNIC_INTAKE}" "${REALNIC_INTAKE}.held" || fail 'realNIC remove intake before restore'
+approved_plan_verify_fixture "${REALNIC_SNAPSHOT}" "${REALNIC_INTAKE_SHA}" ||
+  fail 'realNIC restore-only root snapshot verify'
+/bin/mv -- "${REALNIC_INTAKE}.held" "${REALNIC_INTAKE}" || fail 'realNIC restore intake fixture'
+
+for cut in partial-write post-fsync post-link; do
+  target="${REALNIC_INTAKE_FIXTURE}/root-plan-${cut}.json"
+  cut_rc=0
+  approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${target}" \
+    "${REALNIC_INTAKE_SHA}" "${cut}" || cut_rc=$?
+  case "${cut}:${cut_rc}" in
+    partial-write:91 | post-fsync:92 | post-link:93) ;;
+    *) fail "realNIC ${cut} did not stop at its exact cut: rc=${cut_rc}" ;;
+  esac
+  approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${target}" \
+    "${REALNIC_INTAKE_SHA}" || fail "realNIC ${cut} retry did not converge"
+  approved_plan_verify_fixture "${target}" "${REALNIC_INTAKE_SHA}" ||
+    fail "realNIC ${cut} retry terminal identity"
+done
+
+foreign_final="${REALNIC_INTAKE_FIXTURE}/root-plan-foreign-final.json"
+foreign_pending="${foreign_final}.pending.${REALNIC_INTAKE_SHA}"
+/bin/cp -- "${REALNIC_INTAKE}" "${foreign_final}" || fail 'foreign final fixture'
+/bin/cp -- "${REALNIC_INTAKE}" "${foreign_pending}" || fail 'foreign pending fixture'
+/bin/chmod 0600 "${foreign_final}" "${foreign_pending}" || fail 'foreign final mode'
+if approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${foreign_final}" "${REALNIC_INTAKE_SHA}"; then
+  fail 'same-content foreign final inode was accepted'
+fi
+
+for cut in symlink mode nlink; do
+  target="${REALNIC_INTAKE_FIXTURE}/root-plan-pending-${cut}.json"
+  pending="${target}.pending.${REALNIC_INTAKE_SHA}"
+  case "${cut}" in
+    symlink) /bin/ln -s "${REALNIC_INTAKE}" "${pending}" ;;
+    mode)
+      : >"${pending}"
+      /bin/chmod 0644 "${pending}"
+      ;;
+    nlink)
+      : >"${pending}"
+      /bin/chmod 0600 "${pending}"
+      /bin/ln -- "${pending}" "${pending}.extra"
+      ;;
+  esac || fail "pending ${cut} fixture"
+  if approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${target}" "${REALNIC_INTAKE_SHA}"; then
+    fail "pending ${cut} drift was accepted"
+  fi
+done
+
+inode_swap_final="${REALNIC_INTAKE_FIXTURE}/root-plan-inode-swap.json"
+inode_swap_rc=0
+approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${inode_swap_final}" \
+  "${REALNIC_INTAKE_SHA}" inode-swap || inode_swap_rc=$?
+[[ "${inode_swap_rc}" -eq 79 && ! -e "${inode_swap_final}" &&
+  -f "${inode_swap_final}.pending.${REALNIC_INTAKE_SHA}.swapped-out" ]] ||
+  fail "pending inode swap was not retained and rejected: rc=${inode_swap_rc}"
+approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${inode_swap_final}" \
+  "${REALNIC_INTAKE_SHA}" || fail 'pending inode swap retry did not converge'
+
+extra_link_final="${REALNIC_INTAKE_FIXTURE}/root-plan-extra-link.json"
+approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${extra_link_final}" \
+  "${REALNIC_INTAKE_SHA}" || fail 'extra-link terminal setup'
+/bin/ln -- "${extra_link_final}" "${extra_link_final}.extra" || fail 'extra-link injection'
+if approved_plan_verify_fixture "${extra_link_final}" "${REALNIC_INTAKE_SHA}"; then
+  fail 'published plan with nlink greater than two was accepted'
+fi
+if approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${extra_link_final}" "${REALNIC_INTAKE_SHA}"; then
+  fail 'published plan retry accepted nlink greater than two'
+fi
+
+old_sha='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+different_sha_final="${REALNIC_INTAKE_FIXTURE}/root-plan-different-sha.json"
+printf 'retained-old-sha-partial\n' >"${different_sha_final}.pending.${old_sha}" ||
+  fail 'different-SHA pending fixture'
+/bin/chmod 0600 "${different_sha_final}.pending.${old_sha}" || fail 'different-SHA mode'
+approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${different_sha_final}" \
+  "${REALNIC_INTAKE_SHA}" || fail 'different-SHA old pending blocked current authority'
+[[ "$(/bin/cat -- "${different_sha_final}.pending.${old_sha}")" == \
+  'retained-old-sha-partial' ]] || fail 'different-SHA evidence changed'
+
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B -I -c \
+  'import fcntl, hashlib, os, stat, sys
+root, payload_path, expected = sys.argv[1:]
+payload = open(payload_path, "rb").read()
+if hashlib.sha256(payload).hexdigest() != expected:
+    raise SystemExit("fixture payload digest")
+lock_path = os.path.join(root, "physical.lock")
+pending = os.path.join(root, f"concurrent.json.pending.{expected}")
+final = os.path.join(root, "concurrent.json")
+first = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+second = os.open(lock_path, os.O_RDWR)
+try:
+    fcntl.flock(first, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    pending_fd = os.open(pending, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.write(pending_fd, payload[:5])
+    try:
+        fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise SystemExit("second snapshot entered while pending was mutable")
+    os.ftruncate(pending_fd, 0)
+    os.lseek(pending_fd, 0, os.SEEK_SET)
+    offset = 0
+    while offset < len(payload):
+        written = os.write(pending_fd, payload[offset:])
+        if written <= 0:
+            raise SystemExit("write made no progress")
+        offset += written
+    os.fsync(pending_fd)
+    parent_fd = os.open(root, os.O_RDONLY)
+    os.fsync(parent_fd)
+    os.close(parent_fd)
+    os.link(pending, final)
+    parent_fd = os.open(root, os.O_RDONLY)
+    os.fsync(parent_fd)
+    os.close(parent_fd)
+    os.close(pending_fd)
+    fcntl.flock(first, fcntl.LOCK_UN)
+    fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    left, right = os.stat(final), os.stat(pending)
+    if (left.st_dev, left.st_ino) != (right.st_dev, right.st_ino) or left.st_nlink != 2:
+        raise SystemExit("terminal inode contract")
+    if open(final, "rb").read() != payload:
+        raise SystemExit("published payload changed")
+finally:
+    os.close(second)
+    os.close(first)' "${REALNIC_INTAKE_FIXTURE}" "${REALNIC_INTAKE}" "${REALNIC_INTAKE_SHA}" ||
+  fail 'physical-lock concurrent snapshot model'
+
+HELD_SOURCE="${REALNIC_INTAKE_FIXTURE}/held-source.json"
+HELD_DESTINATION="${REALNIC_INTAKE_FIXTURE}/held-destination.json"
+/bin/cp -- "${REALNIC_INTAKE}" "${HELD_SOURCE}" || fail 'held-FD source setup'
+exec 8<"${HELD_SOURCE}" || fail 'held-FD open'
+printf '%s\n' '{"approved":"replacement"}' >"${HELD_SOURCE}.replacement" ||
+  fail 'held-FD replacement bytes'
+/bin/mv -- "${HELD_SOURCE}.replacement" "${HELD_SOURCE}" || fail 'held-FD source replacement'
+(umask 077
+  set -o noclobber
+  /bin/cat -- /dev/fd/8 >"${HELD_DESTINATION}") || fail 'held-FD snapshot copy'
+[[ "$(sha256_file "${HELD_DESTINATION}")" == "${REALNIC_INTAKE_SHA}" &&
+  "$(sha256_file "${HELD_SOURCE}")" != "${REALNIC_INTAKE_SHA}" ]] ||
+  fail 'held-FD bytes were not isolated from path replacement'
+printf 'HERMETIC_REALNIC_APPROVED_PLAN fresh=pass retry=durable-link restore=no-intake-copy cuts=10 concurrent_lock=pass held_fd=pass retained=%s\n' \
+  "${REALNIC_INTAKE_FIXTURE}"
+
 STAGE_PLAN="$(/bin/bash "${BOUND_OUTPUT}/prepare-stage-root.sh" snapshot-plan \
   --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1 \
   --manifest-sha256 "${BOUND_MANIFEST_SHA}")" || fail 'root snapshot plan'
@@ -363,7 +807,7 @@ require_ordered_literals "${STAGE_PLAN}" 'C4 argv=' 'C7 argv=' 'C8 argv=' 'C11 a
 expect_failure wrong-manifest-sha /bin/bash "${FIXTURE_REVIEW}/controller.sh" plan \
   --manifest "${BOUND_MANIFEST}" \
   --manifest-sha256 bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-  --credential-path "${CREDENTIAL_PATH}" --restore-cell none
+  --credential-path "${CREDENTIAL_PATH}"
 expect_failure existing-output /bin/bash "${FIXTURE_REVIEW}/bind-final-package.sh" bind "${BIND_ARGS[@]}"
 expect_failure ref-commit-mismatch /bin/bash "${FIXTURE_REVIEW}/bind-final-package.sh" plan \
   --repository "${FIXTURE_REPOSITORY}" --source-ref "${FIXTURE_REF}" \
@@ -376,10 +820,22 @@ expect_failure inconsistent-absent-binding /bin/bash "${FIXTURE_REVIEW}/bind-fin
   --output-dir "${BOUND_OUTPUT}"
 expect_failure invalid-transport-operation /usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
   --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
-  --credential-path "${CREDENTIAL_PATH}" --action plan --operation arbitrary-command
+  --credential-path "${CREDENTIAL_PATH}" --action plan --operation arbitrary-command \
+  --approved-plan none --approved-plan-sha256 none
+expect_failure retired-matrix-run-transport /usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
+  --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
+  --credential-path "${CREDENTIAL_PATH}" --action plan --operation matrix-run \
+  --approved-plan none --approved-plan-sha256 none
+expect_failure retired-matrix-restore-transport /usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
+  --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
+  --credential-path "${CREDENTIAL_PATH}" --action plan --operation matrix-restore-tcx \
+  --approved-plan none --approved-plan-sha256 none
+expect_failure retired-matrix-controller-mode /bin/bash "${FIXTURE_REVIEW}/controller.sh" restore \
+  "${CONTROLLER_ARGS[@]}" --restore-cell tcx
 expect_failure credential-path-before-spawn /usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
   --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
-  --credential-path /private/tmp/not-a-credential --action execute --operation identity-hostname
+  --credential-path /private/tmp/not-a-credential --action execute --operation identity-hostname \
+  --approved-plan none --approved-plan-sha256 none
 expect_failure package-stager-root-run /bin/bash "${BOUND_OUTPUT}/prepare-stage-root.sh" run \
   --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}"
 
@@ -427,28 +883,43 @@ ABSENT_MANIFEST="${ABSENT_OUTPUT}/package-manifest.v1"
 ABSENT_MANIFEST_SHA="$(sha256_file "${ABSENT_MANIFEST}")" || fail 'absent manifest digest'
 ABSENT_CONTROLLER_ARGS=(
   --manifest "${ABSENT_MANIFEST}" --manifest-sha256 "${ABSENT_MANIFEST_SHA}"
-  --credential-path "${CREDENTIAL_PATH}" --restore-cell none
+  --credential-path "${CREDENTIAL_PATH}"
 )
 ABSENT_PLAN="$(/bin/bash "${FIXTURE_REVIEW}/controller.sh" plan "${ABSENT_CONTROLLER_ARGS[@]}")" ||
   fail 'absent controller plan'
-[[ "${ABSENT_PLAN}" == *'B82_V6_MATRIX_BLOCKED reason=wireguard-topology-absent wg_active_scoped=not-covered pass=0'* ]] ||
-  fail 'absent WireGuard matrix block missing'
-[[ "${ABSENT_PLAN}" != *'operation=matrix-run'* ]] || fail 'absent plan rendered matrix execution'
+[[ "${ABSENT_PLAN}" == *'B82_V6_LEGACY_MATRIX_RETIRED controller_entries=0 historical_recovery=frozen-original-package-before-final-staging'* ]] ||
+  fail 'absent WireGuard legacy retirement marker missing'
+[[ "${ABSENT_PLAN}" != *'operation=matrix-'* ]] || fail 'absent plan rendered legacy matrix execution'
 for operation in fresh-plan fresh-run fresh-restore; do
   [[ "${ABSENT_PLAN}" == *"operation=${operation} transport=ssh credential_read=0 network_operations=0"* ]] ||
     fail "absent WireGuard plan cannot reach ${operation}"
 done
+[[ "${ABSENT_PLAN}" == *'operation=realnic-plan transport=ssh credential_read=0 network_operations=0'* ]] ||
+  fail 'absent WireGuard plan cannot reach realnic-plan'
+ABSENT_APPROVED_ARGS=(
+  "${ABSENT_CONTROLLER_ARGS[@]}"
+  --approved-plan "${APPROVED_PLAN}"
+  --approved-plan-sha256 "${APPROVED_PLAN_SHA}"
+)
+ABSENT_APPROVED_PLAN="$(/bin/bash "${FIXTURE_REVIEW}/controller.sh" plan \
+  "${ABSENT_APPROVED_ARGS[@]}")" || fail 'absent approved controller plan'
+for operation in realnic-plan realnic-run realnic-restore; do
+  [[ "${ABSENT_APPROVED_PLAN}" == *"operation=${operation} transport=ssh credential_read=0 network_operations=0"* ]] ||
+    fail "absent WireGuard approved plan cannot reach ${operation}"
+done
 ABSENT_FRESH_TRANSPORT="$(/usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
   --manifest "${ABSENT_MANIFEST}" --manifest-sha256 "${ABSENT_MANIFEST_SHA}" \
-  --credential-path "${CREDENTIAL_PATH}" --action plan --operation fresh-run)" ||
+  --credential-path "${CREDENTIAL_PATH}" --action plan --operation fresh-run \
+  --approved-plan none --approved-plan-sha256 none)" ||
   fail 'absent fresh transport plan'
 [[ "${ABSENT_FRESH_TRANSPORT}" == *'credential_read=0 network_operations=0'* &&
   "${ABSENT_FRESH_TRANSPORT}" == *'root-fresh-verifier-gate.sh run --controller-source'* ]] ||
   fail 'absent fresh transport reachability'
-expect_failure absent-matrix-run /bin/bash "${FIXTURE_REVIEW}/controller.sh" run "${ABSENT_CONTROLLER_ARGS[@]}"
+expect_failure retired-matrix-run-mode /bin/bash "${FIXTURE_REVIEW}/controller.sh" run \
+  "${ABSENT_CONTROLLER_ARGS[@]}"
 
 printf '%s\n' \
   'hermetic v6 full-history binder, explicit toolchain state machine, root-owned bootstrap,' \
   'SSH/SCP/Expect fixed check/apply plans, provision output policy,' \
-  'immutable-intake/shallow/failure paths and WireGuard-absent fresh reachability: PASS'
+  'immutable-intake/shallow/failure paths and WireGuard-absent fresh/realNIC reachability: PASS'
 printf 'RETAINED_HERMETIC_ROOT path=%s reason=auditable-no-cleanup-test-policy\n' "${TEST_ROOT}"
