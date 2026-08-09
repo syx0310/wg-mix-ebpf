@@ -20,6 +20,14 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/pinidentity"
 )
 
+func TestApplyRefusesLegacyAdoptionBeforeRuntimeAccess(t *testing.T) {
+	loader := LinuxLoader{AdoptLegacyPins: true}
+	err := loader.Apply(context.Background(), &control.State{})
+	if err == nil || !strings.Contains(err.Error(), "detach with a trusted legacy build") {
+		t.Fatalf("legacy adoption error = %v", err)
+	}
+}
+
 func TestXORTailCallBankStartAlternatesWithoutOverlap(t *testing.T) {
 	tests := []struct {
 		generation uint64
@@ -1191,44 +1199,14 @@ func TestApplyDetachAndStatusShareFailClosedPinPathValidation(t *testing.T) {
 }
 
 func TestBPFFSPinLifecycleIntegration(t *testing.T) {
-	if os.Getenv("WG_MIX_EBPF_RUN_BPFFS_INTEGRATION") != "1" {
+	if os.Getenv(scopedBPFFSRunEnv) != "1" {
 		t.Skip("set WG_MIX_EBPF_RUN_BPFFS_INTEGRATION=1 for an explicitly approved real bpffs test")
 	}
-	if os.Geteuid() != 0 {
-		t.Fatal("explicit bpffs integration test requires root")
-	}
-	objectPath := os.Getenv("WG_MIX_EBPF_TEST_OBJECT_PATH")
-	if objectPath == "" {
-		t.Fatal("WG_MIX_EBPF_TEST_OBJECT_PATH is required")
-	}
-	pinPath := os.Getenv("WG_MIX_EBPF_TEST_PIN_PATH")
-	if pinPath == "" {
-		t.Fatal("WG_MIX_EBPF_TEST_PIN_PATH is required")
-	}
-	validated, err := validatePinPath(pinPath, livePinPathValidator)
+	config, err := scopedBPFFSConfigFromEnv()
 	if err != nil {
-		t.Fatalf("validate explicitly supplied test pin path: %v", err)
+		t.Fatal(err)
 	}
-	if validated.exists {
-		t.Fatalf("refuse integration test because pin path already exists: %s", pinPath)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	loader := LinuxLoader{
-		ObjectPath: objectPath,
-		PinPath:    pinPath,
-	}
-	state := &control.State{}
-	if err := loader.Apply(ctx, state); err != nil {
-		t.Fatalf("apply test collection: %v", err)
-	}
-	if err := loader.Detach(ctx, state); err != nil {
-		t.Fatalf("detach test collection: %v", err)
-	}
-	if _, err := os.Lstat(pinPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("test pin path still exists or cannot be inspected: %v", err)
-	}
+	runScopedBPFFSIntegration(t, config)
 }
 
 func newTestBPFFS(t *testing.T) (string, pinPathValidator) {

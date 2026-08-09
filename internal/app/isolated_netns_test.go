@@ -1,6 +1,7 @@
 package app
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -571,6 +572,20 @@ func TestParseAndValidatePrivateBPFFSMountInfo(t *testing.T) {
 		{
 			name:         "custom source label",
 			fixture:      isolatedMountInfoFixture(layout, "0:42", "/", "wg-mix-ebpf-"+layout.runID, ""),
+			statxMountID: 42,
+			pinMountID:   42,
+		},
+		{
+			name: "legacy bpf source label",
+			fixture: strings.Replace(
+				validFixture,
+				" - bpf "+isolatedNetNSTestBPFFSSource(
+					layout.runID,
+					isolatedFixtureOwnerToken,
+				)+" ",
+				" - bpf bpf ",
+				1,
+			),
 			statxMountID: 42,
 			pinMountID:   42,
 		},
@@ -4770,6 +4785,118 @@ func TestParseAndValidateIsolatedBPFFSCreationLedger(t *testing.T) {
 			t.Fatal("ledger post mount ID differing from manifest unexpectedly accepted")
 		}
 	})
+}
+
+func TestSmokeScriptBPFFSCreationLedgerMatchesGoContract(t *testing.T) {
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve isolated netns test source path")
+	}
+	scriptPath := filepath.Join(
+		filepath.Dir(testFile),
+		"..",
+		"..",
+		"scripts",
+		"smoke-netns-wg.sh",
+	)
+	scriptData, err := os.ReadFile(scriptPath)
+	if err != nil {
+		t.Fatalf("read smoke script: %v", err)
+	}
+	const functionHeader = "bpffs_creation_ledger_payload() {"
+	functionStart := strings.Index(string(scriptData), functionHeader)
+	if functionStart < 0 {
+		t.Fatalf("smoke script does not define %s", functionHeader)
+	}
+	functionEndOffset := strings.Index(
+		string(scriptData[functionStart:]),
+		"\nwrite_marker() {",
+	)
+	if functionEndOffset < 0 {
+		t.Fatal("smoke script bpffs creation ledger payload has no fixed boundary")
+	}
+	functionSource := string(
+		scriptData[functionStart : functionStart+functionEndOffset],
+	)
+
+	layout, _, _, _, _ := isolatedFixtureLayout(t, "a")
+	source := isolatedNetNSTestBPFFSSource(
+		layout.runID,
+		isolatedFixtureOwnerToken,
+	)
+	harness := fmt.Sprintf(`set -euo pipefail
+RUN_ID=%q
+OWNER_TOKEN=%q
+BPFFS_DIR=%q
+BPFFS_SOURCE=%q
+BPFFS_PRE_TARGET_MOUNT_ID=21
+BPFFS_PRE_TARGET_DEVICE=8:1
+BPFFS_PRE_BPF_MOUNTS=30@0:30
+BPFFS_MOUNT_ID=42
+BPFFS_MOUNT_DEVICE=0:42
+BPFFS_PARENT_INO=201
+%s
+bpffs_creation_ledger_payload
+`, layout.runID, isolatedFixtureOwnerToken, layout.bpffsDir, source, functionSource)
+	command := exec.Command("/bin/bash", "-c", harness)
+	command.Env = []string{"PATH=/usr/bin:/bin", "LC_ALL=C"}
+	ledgerData, err := command.Output()
+	if err != nil {
+		t.Fatalf("render smoke script bpffs creation ledger: %v", err)
+	}
+	ledger, err := parseIsolatedNetNSTestBPFFSLedger(ledgerData)
+	if err != nil {
+		t.Fatalf("parse smoke script bpffs creation ledger: %v", err)
+	}
+	manifest, err := parseIsolatedNetNSTestManifest(
+		isolatedFixtureManifest(layout),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries, err := parseMountInfo([]byte(
+		isolatedMountInfoFixture(layout, "0:42", "/", "bpf", ""),
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	chain, err := privateBPFFSMountChain(entries, layout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateIsolatedNetNSTestBPFFSLedger(
+		ledger,
+		entries,
+		chain,
+		layout,
+		manifest,
+		"0:42",
+		201,
+	); err != nil {
+		t.Fatalf("validate smoke script bpffs creation ledger: %v", err)
+	}
+
+	legacyData := bytes.Replace(
+		ledgerData,
+		[]byte("source="+source+"\n"),
+		[]byte("source=bpf\n"),
+		1,
+	)
+	legacy, err := parseIsolatedNetNSTestBPFFSLedger(legacyData)
+	if err != nil {
+		t.Fatalf("parse structurally valid legacy source fixture: %v", err)
+	}
+	if err := validateIsolatedNetNSTestBPFFSLedger(
+		legacy,
+		entries,
+		chain,
+		layout,
+		manifest,
+		"0:42",
+		201,
+	); err == nil {
+		t.Fatal("legacy bpf shell source unexpectedly satisfied Go contract")
+	}
 }
 
 func TestIsolatedBPFFSCreationLedgerRejectsHistoricalAliases(t *testing.T) {

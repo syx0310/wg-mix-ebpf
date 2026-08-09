@@ -1,0 +1,160 @@
+wg-mix-ebpf .82 real-host v6 local-only contract
+================================================
+
+Status
+------
+
+This directory is a local review artifact. It contains no SSH/SCP/Expect
+transport and no credential handling. Nothing in this directory has been run
+on 192.168.10.82. The only executable local gate is
+`test-hermetic-matrix.sh`; it runs syntax/static fixtures and the matrix's
+side-effect-free `plan` mode.
+
+The following values intentionally remain unbound until the final integration
+commit is selected and reviewed:
+
+* FINAL_INTEGRATION_COMMIT=<exact nonzero/non-ffff 40-lowercase-hex commit>
+* FINAL_INTEGRATION_BUNDLE_SHA256=<exact nonzero/non-ffff 64-lowercase-hex SHA-256>
+* FINAL_WG_INTERFACE=<exact interface name observed by read-only preflight>
+* FINAL_WG_LOCAL_ADDRESS=<exact IPv4 address observed by read-only preflight>
+* FINAL_WG_PEER_ADDRESS=<exact routed peer IPv4 observed by read-only preflight>
+
+`root-matrix-n-r.sh` requires all five values as argv and fails closed when
+they are absent or malformed. A separate, later commit must provide a reviewed
+transport/controller and bind its exact argv. This local-only commit must not
+be interpreted as authorization to read credentials, connect to either host,
+install packages, use sudo, or run the matrix.
+
+Scope and topology
+------------------
+
+* Mutable test host: 192.168.10.82 only. Expected identity is
+  `ubuntu-2604-test`, kernel `7.0.0-28-generic`, machine-id
+  `9db3fb717cc74974b2a6b243d67f67b9`, physical interface `ens33`.
+* 47.116.202.155 is an iperf endpoint only. No remote mutation is planned or
+  permitted there.
+* 192.168.10.28 is retired and must not appear in executable v6 inputs.
+* Source and bundle paths are exact run-owned paths for run `c8e41d73` and
+  package `4f2a9b61`; evidence is under the unique id `6bd913ac`.
+
+Coverage classification
+-----------------------
+
+The raw ens33 iperf matrix is only a NIC/offload baseline. It is never counted
+as wg-mix-ebpf dataplane coverage. Program-active physical-NIC coverage is
+provided only by the fail-closed Go integration contract:
+
+* `TestScopedRealNICContextIsolationContract`
+* `TestScopedRealNICDataplaneActiveIntegration`
+* `TestScopedRealNICDataplaneRestoreIntegration`
+
+The contract must use TCX and run-owned state, lease, owner, evidence, and pin
+roots. It must revalidate the initial network namespace, ens33 ifindex/MAC,
+WireGuard interface/address/route before and after Apply, traffic, status, and
+Detach. A missing test or completion marker is a hard failure.
+
+FakeTCP and XOR/typeword/header composition receive local veth/BPF lifecycle
+coverage. Physical FakeTCP/XOR end-to-end coverage is explicitly
+`not-covered`: the read-only peer has no reviewed matching dataplane or shared
+cipher configuration. The veth result must not be promoted to a physical E2E
+pass.
+
+Matrix
+------
+
+The reviewed run contains:
+
+1. Exact host, namespace, link, TC, BPF program/map/link, module, NIC feature,
+   MTU, and safe snapshots of the single reviewed WireGuard interface.
+2. Standalone TCX lifecycle on the run-owned veth and run-owned runtime roots.
+3. FakeTCP verifier, packet probe, lifecycle, XOR/typeword/header composition,
+   and baseline mutual-exclusion tests on the run-owned veth.
+4. Five ens33 offload cells (`original`, `all-on`, `all-off`, `tx-path`,
+   `rx-path`), each with 1/4/16 streams and forward/reverse/bidirectional
+   30-second iperf groups, followed by the program-active scoped contract.
+5. MTU 1492 and 1500 positive/negative boundaries and a program-active scoped
+   contract at each MTU.
+6. Twelve bounded 300-second program-active soak windows (exactly 3600
+   seconds), with 10-second monitoring and 360 expected samples. The
+   throughput floor uses the median of all twelve first-hour windows, and TCP
+   retransmits are normalized by sender bytes.
+7. Exact restoration comparisons for the complete `ethtool -k` snapshot,
+   MTU, qdisc/filter state, BPF links/programs/maps, module state, and every
+   run-owned pin. Selected feature toggles are not accepted as proof if any
+   collateral offload field differs from the original complete snapshot.
+
+Timeout arithmetic is enforced by `test_matrix_static.py`:
+
+* matrix minimum 3 stream counts x 3 directions x 2 passes x 30s = 540s;
+  Go timeout 1440s; outer timeout 1500s;
+* MTU minimum 2 passes x 30s = 60s; Go timeout 540s; outer timeout 600s;
+* soak minimum 12 x 300s = 3600s; Go timeout 4440s; outer timeout 4500s.
+
+WireGuard confidentiality
+-------------------------
+
+The matrix never invokes `wg show all` for any selector and never requests
+`dump`, `private-key`, or `preshared-key`. Every snapshot names the exact
+`FINAL_WG_INTERFACE` and is limited to public-key, listen-port, fwmark, peers,
+endpoints, allowed-ips, latest-handshakes, and transfer. Static gates reject
+all-interface and secret-bearing WireGuard commands.
+
+Write set and failure policy
+----------------------------
+
+If a later reviewed controller invokes `run`, its write set is limited to:
+
+* `/run/wg-mix-ebpf-source-stages/c8e41d73/realhost-v6-6bd913ac`;
+* `go-*-realhost` directories below
+  `/run/wg-mix-ebpf-source-stages/c8e41d73`;
+* `/sys/fs/bpf/wg-mix-ebpf-c8e41d73-tcx` and
+  `/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-<reviewed-cell>`;
+* exact veth names `wgc8e41a` and `wgc8e41b` with run-specific aliases;
+* the exact checksum test module `wg_mix_faketcp_checksum`;
+* reviewed, recorded feature/MTU mutations on ens33.
+
+The scoped physical tests must not use `/run/wg-mix-ebpf/daemon.lease` or any
+path below `/var/lib/wg-mix-ebpf`. The matrix does not add/delete clsact, does
+not mount filesystems, and does not use containers, chroot, nsenter, recursive
+deletion, traps, eval, or error-suppression cleanup.
+
+The argv gate rejects non-canonical interface names and non-canonical,
+non-unicast IPv4 values before evidence creation. Bootstrap creation of the
+evidence directory and audit file emits UTC, exact target, full argv, and exit
+status to stdout and persists those records once the audit file exists. Every
+later write uses the same start/finish audit contract; NIC state is assembled
+and validated in memory before one exclusive write.
+
+Rule-miss counters remain monotonic observations because unrelated physical
+traffic can legitimately grow them. Checksum, load/store, malformed packet,
+and other hard-error counters must remain unchanged.
+
+Failures retain evidence and stop without automatic teardown. Recovery is an
+explicit `restore` invocation with exactly one reviewed `--restore-cell` value.
+`tcx` delegates exact detach to `TestBPFFSPinLifecycleIntegration`; physical
+cells delegate exact detach to `TestScopedRealNICDataplaneRestoreIntegration`.
+Ownership, initial namespace, ifindex/MAC, state roots, and exact pin identity
+must match before detach. A missing or ambiguous owner marker fails closed.
+
+Local acceptance
+----------------
+
+From the repository worktree, the local-only acceptance command is:
+
+    /bin/bash scripts/realhost-b82-c8e41d73/test-hermetic-matrix.sh
+
+It must report both:
+
+    static real-host safety and checker fixtures: PASS
+    hermetic matrix argv and failure-path tests: PASS
+
+ShellCheck is mandatory on .82 before any later sudo phase; its absence on the
+local macOS host is an explicit skip, not a remote pass. The old v5 package must
+remain byte-for-byte unchanged relative to parent `1c629b0`:
+
+    git diff --exit-code -- scripts/realhost-b82-74e22ab8
+    git diff --exit-code 1c629b0 -- scripts/realhost-b82-74e22ab8
+
+No execution approval is conveyed by this plan. Final commit, bundle digest,
+WireGuard topology, Go test env names/markers, transport argv, and the complete
+high-privilege script hash must be reviewed together before .82 execution.

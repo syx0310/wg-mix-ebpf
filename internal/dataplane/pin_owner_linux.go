@@ -24,23 +24,31 @@ import (
 )
 
 const (
-	pinOwnerSentinelVersion = 1
-	pinOwnerRecordVersion   = 3
-	pinOwnerRecordMaxBytes  = 256 * 1024
+	pinOwnerSentinelVersion      = 1
+	pinOwnerLegacyClassicVersion = 3
+	pinOwnerRecordVersion        = 4
+	pinOwnerRecordMaxBytes       = 256 * 1024
 
 	pinOwnerPhaseActive    = "active"
 	pinOwnerPhaseApplying  = "applying"
 	pinOwnerPhaseDetaching = "detaching"
 
-	pinOwnerStepReady          = "ready"
-	pinOwnerStepStaging        = "staging"
-	pinOwnerStepMutating       = "mutating"
-	pinOwnerStepMutatingTC     = "mutating_tc"
-	pinOwnerStepUnlinkingMaps  = "unlinking_maps"
-	pinOwnerStepCleanup        = "cleanup"
-	pinOwnerStepCleanupStages  = "cleanup_stages"
-	pinOwnerProgramStageActive = "active"
-	pinOwnerProgramStageNext   = "desired"
+	pinOwnerStepReady           = "ready"
+	pinOwnerStepRetiring        = "retiring"
+	pinOwnerStepStaging         = "staging"
+	pinOwnerStepMutating        = "mutating"
+	pinOwnerStepRollingBack     = "rolling_back"
+	pinOwnerStepRollbackCleanup = "rollback_cleanup"
+	pinOwnerStepMutatingTC      = "mutating_tc"
+	pinOwnerStepUnlinkingMaps   = "unlinking_maps"
+	pinOwnerStepCleanup         = "cleanup"
+	pinOwnerStepCleanupStages   = "cleanup_stages"
+	pinOwnerProgramStageActive  = "active"
+	pinOwnerProgramStageNext    = "desired"
+)
+
+var errLegacyClassicOwnerRequiresMigration = errors.New(
+	"pin owner schema v3 uses non-exact classic TC filters; detach it with a trusted legacy build before upgrading",
 )
 
 var bootIDPattern = regexp.MustCompile(
@@ -83,8 +91,10 @@ type pinOwnerRecord struct {
 	ActiveGeneration       uint64                 `json:"active_generation"`
 	NextGeneration         uint64                 `json:"next_generation"`
 	Maps                   []pinOwnerMapIdentity  `json:"maps"`
-	ActiveFilters          []tcFilterBinding      `json:"active_filters"`
-	DesiredFilters         []tcFilterBinding      `json:"desired_filters"`
+	ActiveFilters          []tcFilterBinding      `json:"active_filters,omitempty"`
+	DesiredFilters         []tcFilterBinding      `json:"desired_filters,omitempty"`
+	ActiveLinks            []exactTCXBinding      `json:"active_links"`
+	DesiredLinks           []exactTCXBinding      `json:"desired_links"`
 	ProgramStages          []pinOwnerProgramStage `json:"program_stages"`
 	MapStages              []pinOwnerMapStage     `json:"map_stages"`
 	RetiredFromResourceKey string                 `json:"retired_from_resource_key"`
@@ -108,6 +118,7 @@ const (
 	canonicalPinsEmpty canonicalPinDirectoryState = iota
 	canonicalPinsLegacy
 	canonicalPinsOwned
+	canonicalPinsOwnedTCX
 )
 
 func readLinuxBootID() (string, error) {
@@ -157,28 +168,37 @@ func classifyCanonicalPinDirectory(
 		known[descriptor.name] = struct{}{}
 	}
 	seen := make(map[string]struct{}, len(entries))
+	linkPins := 0
 	for _, entry := range entries {
 		name := entry.Name()
 		if _, duplicate := seen[name]; duplicate {
 			return canonicalPinsEmpty, fmt.Errorf("BPF pin directory repeats entry %q", name)
 		}
 		seen[name] = struct{}{}
-		if _, ok := known[name]; !ok {
-			return canonicalPinsEmpty, fmt.Errorf(
-				"unknown BPF pin entry %q is not covered by an active owner transaction",
-				name,
-			)
+		if _, ok := known[name]; ok {
+			continue
 		}
+		if _, _, ok := parseExactTCXPinName(name); ok {
+			linkPins++
+			continue
+		}
+		return canonicalPinsEmpty, fmt.Errorf(
+			"unknown BPF pin entry %q is not covered by an active owner transaction",
+			name,
+		)
 	}
 	if len(seen) == 0 {
 		return canonicalPinsEmpty, nil
 	}
 	_, ownerSeen := seen["owner_map"]
 	want := len(pinnedMapDescriptors())
-	if ownerSeen && len(seen) == want {
+	if ownerSeen && len(seen) == want+linkPins {
+		if linkPins != 0 {
+			return canonicalPinsOwnedTCX, nil
+		}
 		return canonicalPinsOwned, nil
 	}
-	if !ownerSeen && len(seen) == want-1 {
+	if linkPins == 0 && !ownerSeen && len(seen) == want-1 {
 		for _, descriptor := range pinnedMapDescriptors() {
 			if descriptor.name == "owner_map" {
 				continue
@@ -193,8 +213,8 @@ func classifyCanonicalPinDirectory(
 		return canonicalPinsLegacy, nil
 	}
 	return canonicalPinsEmpty, fmt.Errorf(
-		"incomplete canonical BPF pin set: found %d entries, owner_map=%t, want either %d legacy or %d owned maps",
-		len(seen), ownerSeen, want-1, want,
+		"incomplete canonical BPF pin set: found %d entries (%d TCX links), owner_map=%t, want either %d legacy maps or %d owned maps plus exact owner links",
+		len(seen), linkPins, ownerSeen, want-1, want,
 	)
 }
 
@@ -231,6 +251,7 @@ func validateOwnerDirectoryEntries(
 	}
 
 	canonical := make(map[string]struct{}, len(pinnedMapDescriptors()))
+	linkNames := make(map[string]struct{}, len(record.ActiveLinks)+len(record.DesiredLinks))
 	allowed := make(map[string]struct{}, len(entries))
 	for _, descriptor := range pinnedMapDescriptors() {
 		canonical[descriptor.name] = struct{}{}
@@ -245,8 +266,17 @@ func validateOwnerDirectoryEntries(
 		allowed[stage.FileName+".retired"] = struct{}{}
 		allowed[stage.FileName+".canonical-retired"] = struct{}{}
 	}
+	for _, binding := range record.ActiveLinks {
+		allowed[binding.PinName] = struct{}{}
+		linkNames[binding.PinName] = struct{}{}
+	}
+	for _, binding := range record.DesiredLinks {
+		allowed[binding.PinName] = struct{}{}
+		linkNames[binding.PinName] = struct{}{}
+	}
 
 	seen := make(map[string]struct{}, len(entries))
+	seenLinks := make(map[string]struct{}, len(linkNames))
 	canonicalCount := 0
 	for _, entry := range entries {
 		name := entry.Name()
@@ -263,46 +293,140 @@ func validateOwnerDirectoryEntries(
 		if _, ok := canonical[name]; ok {
 			canonicalCount++
 		}
+		if _, _, ok := parseExactTCXPinName(name); ok {
+			seenLinks[name] = struct{}{}
+		}
 	}
 
+	requireLinks := func(bindings []exactTCXBinding, label string) error {
+		for _, binding := range bindings {
+			if _, present := seenLinks[binding.PinName]; !present {
+				return fmt.Errorf(
+					"%s owner directory is missing exact TCX pin %s",
+					label, binding.PinName,
+				)
+			}
+		}
+		return nil
+	}
+	requireOnlyLinks := func(bindings []exactTCXBinding, label string) error {
+		expected := make(map[string]struct{}, len(bindings))
+		for _, binding := range bindings {
+			expected[binding.PinName] = struct{}{}
+		}
+		for name := range seenLinks {
+			if _, ok := expected[name]; !ok {
+				return fmt.Errorf(
+					"%s owner directory has unexpected exact TCX pin %s",
+					label, name,
+				)
+			}
+		}
+		return nil
+	}
+	if len(seenLinks) > len(linkNames) {
+		return errors.New("owner directory contains an unjournaled exact TCX pin")
+	}
 	wantCanonical := len(canonical)
 	switch {
 	case record.Phase == pinOwnerPhaseActive:
-		if canonicalCount != wantCanonical || len(seen) != wantCanonical {
+		requiredActive := make([]exactTCXBinding, 0, len(record.ActiveLinks))
+		for _, binding := range record.ActiveLinks {
+			if !binding.Retiring {
+				requiredActive = append(requiredActive, binding)
+			}
+		}
+		if err := requireLinks(requiredActive, "active"); err != nil {
+			return err
+		}
+		if canonicalCount != wantCanonical ||
+			len(seen) != wantCanonical+len(seenLinks) ||
+			(record.Step == pinOwnerStepReady && len(seenLinks) != len(linkNames)) {
 			return fmt.Errorf(
-				"active owner directory has %d canonical and %d total entries, want %d",
-				canonicalCount, len(seen), wantCanonical,
+				"active owner directory has %d canonical maps, %d exact links, and %d total entries; want %d/%d",
+				canonicalCount, len(seenLinks), len(seen), wantCanonical, len(record.ActiveLinks),
 			)
 		}
 	case record.Phase == pinOwnerPhaseApplying:
-		if record.Step == pinOwnerStepStaging &&
-			record.ActiveGeneration == 0 {
-			break
-		}
-		if canonicalCount != wantCanonical {
+		requireCompleteMaps := record.ActiveGeneration != 0 ||
+			record.Step != pinOwnerStepStaging
+		if requireCompleteMaps && canonicalCount != wantCanonical {
 			return fmt.Errorf(
 				"applying owner directory has %d canonical maps, want %d",
 				canonicalCount, wantCanonical,
 			)
 		}
-	case record.Phase == pinOwnerPhaseDetaching &&
-		(record.Step == pinOwnerStepStaging ||
-			record.Step == pinOwnerStepMutatingTC):
-		if record.ActiveGeneration == 0 {
-			break
+		switch record.Step {
+		case pinOwnerStepStaging:
+			if err := requireLinks(record.ActiveLinks, "applying staging"); err != nil {
+				return err
+			}
+			if err := requireOnlyLinks(record.ActiveLinks, "applying staging"); err != nil {
+				return err
+			}
+		case pinOwnerStepMutating:
+			replacedActive := make(map[uint32]struct{}, len(record.DesiredLinks))
+			for _, binding := range record.DesiredLinks {
+				if binding.ReplacesLinkID != 0 {
+					replacedActive[binding.ReplacesLinkID] = struct{}{}
+				}
+			}
+			activePins := make([]exactTCXBinding, 0, len(record.ActiveLinks))
+			for _, binding := range record.ActiveLinks {
+				if _, retired := replacedActive[binding.LinkID]; !retired {
+					activePins = append(activePins, binding)
+				}
+			}
+			if err := requireLinks(activePins, "applying mutation"); err != nil {
+				return err
+			}
+			for _, binding := range record.DesiredLinks {
+				if binding.LinkID == 0 || binding.PinPending || binding.Retiring {
+					continue
+				}
+				if err := requireLinks([]exactTCXBinding{binding}, "applying mutation"); err != nil {
+					return err
+				}
+			}
+		case pinOwnerStepCleanup:
+			if err := requireLinks(record.DesiredLinks, "applying cleanup"); err != nil {
+				return err
+			}
+		case pinOwnerStepRollingBack, pinOwnerStepRollbackCleanup:
+			// This durable state covers a partially retired/recreated exact
+			// link set. Any journaled active or desired pin may be absent at
+			// a crash boundary; exact identities still fence every mutation.
 		}
-		if canonicalCount != wantCanonical {
+	case record.Phase == pinOwnerPhaseDetaching &&
+		record.Step == pinOwnerStepStaging:
+		if record.ActiveGeneration != 0 && canonicalCount != wantCanonical {
+			return fmt.Errorf(
+				"detaching owner directory has %d canonical maps before unlink, want %d",
+				canonicalCount, wantCanonical,
+			)
+		}
+		if err := requireLinks(record.ActiveLinks, "detaching staging"); err != nil {
+			return err
+		}
+	case record.Phase == pinOwnerPhaseDetaching &&
+		record.Step == pinOwnerStepMutatingTC:
+		if record.ActiveGeneration != 0 && canonicalCount != wantCanonical {
 			return fmt.Errorf(
 				"detaching owner directory has %d canonical maps before unlink, want %d",
 				canonicalCount, wantCanonical,
 			)
 		}
 	case record.Phase == pinOwnerPhaseDetaching &&
+		record.Step == pinOwnerStepUnlinkingMaps:
+		if len(seenLinks) != 0 {
+			return errors.New("detaching map unlink still has exact TCX link pins")
+		}
+	case record.Phase == pinOwnerPhaseDetaching &&
 		record.Step == pinOwnerStepCleanupStages:
-		if canonicalCount != 0 {
+		if canonicalCount != 0 || len(seenLinks) != 0 {
 			return fmt.Errorf(
-				"detaching cleanup has %d canonical maps, want none",
-				canonicalCount,
+				"detaching cleanup has %d canonical maps and %d exact TCX links, want none",
+				canonicalCount, len(seenLinks),
 			)
 		}
 	}
@@ -354,9 +478,10 @@ func loadPinnedProgramObservation(path string) (*pinnedProgramObservation, error
 		return nil, errors.New("kernel did not report a pinned program ID")
 	}
 	return &pinnedProgramObservation{
-		fd:    program.FD(),
-		id:    uint32(id),
-		close: program.Close,
+		fd:      program.FD(),
+		id:      uint32(id),
+		program: program,
+		close:   program.Close,
 	}, nil
 }
 
@@ -366,7 +491,12 @@ func (observation *pinnedProgramObservation) Close() error {
 	}
 	closeProgram := observation.close
 	observation.close = nil
-	return closeProgram()
+	err := closeProgram()
+	if err == nil {
+		observation.program = nil
+		observation.fd = -1
+	}
+	return err
 }
 
 func pinOwnerSentinelFor(
@@ -411,7 +541,7 @@ func newActivePinOwnerRecord(
 	now time.Time,
 	generation uint64,
 	maps []pinOwnerMapIdentity,
-	filters []tcFilterBinding,
+	links []exactTCXBinding,
 ) (*pinOwnerRecord, error) {
 	if parent == nil {
 		return nil, errors.New("pin owner parent is nil")
@@ -435,8 +565,10 @@ func newActivePinOwnerRecord(
 		Step:             pinOwnerStepReady,
 		ActiveGeneration: generation,
 		Maps:             slices.Clone(maps),
-		ActiveFilters:    slices.Clone(filters),
+		ActiveFilters:    []tcFilterBinding{},
 		DesiredFilters:   []tcFilterBinding{},
+		ActiveLinks:      slices.Clone(links),
+		DesiredLinks:     []exactTCXBinding{},
 		ProgramStages:    []pinOwnerProgramStage{},
 		MapStages:        []pinOwnerMapStage{},
 	}
@@ -455,8 +587,8 @@ func newApplyingPinOwnerRecord(
 	activeGeneration uint64,
 	nextGeneration uint64,
 	maps []pinOwnerMapIdentity,
-	activeFilters []tcFilterBinding,
-	desiredFilters []tcFilterBinding,
+	activeLinks []exactTCXBinding,
+	desiredLinks []exactTCXBinding,
 	previous *pinOwnerRecord,
 ) (*pinOwnerRecord, error) {
 	if parent == nil {
@@ -491,8 +623,10 @@ func newApplyingPinOwnerRecord(
 		ActiveGeneration: activeGeneration,
 		NextGeneration:   nextGeneration,
 		Maps:             slices.Clone(maps),
-		ActiveFilters:    slices.Clone(activeFilters),
-		DesiredFilters:   slices.Clone(desiredFilters),
+		ActiveFilters:    []tcFilterBinding{},
+		DesiredFilters:   []tcFilterBinding{},
+		ActiveLinks:      slices.Clone(activeLinks),
+		DesiredLinks:     slices.Clone(desiredLinks),
 		MapStages:        []pinOwnerMapStage{},
 	}
 	if previous != nil {
@@ -506,8 +640,8 @@ func newApplyingPinOwnerRecord(
 	record.ProgramStages = buildOwnerProgramStages(
 		record.ResourceKey,
 		token,
-		record.ActiveFilters,
-		record.DesiredFilters,
+		record.ActiveLinks,
+		record.DesiredLinks,
 	)
 	normalizePinOwnerRecord(record)
 	if err := validatePinOwnerRecord(record, parent.resource, parent.mountID); err != nil {
@@ -543,8 +677,15 @@ func completeApplyingPinOwnerRecord(
 	)
 	next.ActiveGeneration = current.NextGeneration
 	next.NextGeneration = 0
-	next.ActiveFilters = slices.Clone(current.DesiredFilters)
+	next.ActiveFilters = []tcFilterBinding{}
+	next.ActiveLinks = slices.Clone(current.DesiredLinks)
+	for index := range next.ActiveLinks {
+		next.ActiveLinks[index].ReplacesLinkID = 0
+		next.ActiveLinks[index].PinPending = false
+		next.ActiveLinks[index].Retiring = false
+	}
 	next.DesiredFilters = []tcFilterBinding{}
+	next.DesiredLinks = []exactTCXBinding{}
 	next.ProgramStages = []pinOwnerProgramStage{}
 	next.MapStages = []pinOwnerMapStage{}
 	normalizePinOwnerRecord(next)
@@ -568,6 +709,7 @@ func abortApplyingPinOwnerRecord(
 	)
 	next.NextGeneration = 0
 	next.DesiredFilters = []tcFilterBinding{}
+	next.DesiredLinks = []exactTCXBinding{}
 	next.ProgramStages = []pinOwnerProgramStage{}
 	next.MapStages = []pinOwnerMapStage{}
 	normalizePinOwnerRecord(next)
@@ -602,12 +744,8 @@ func newDetachingPinOwnerRecord(
 		pinOwnerStepStaging,
 	)
 	next.DesiredFilters = []tcFilterBinding{}
-	next.ProgramStages = buildOwnerProgramStages(
-		next.ResourceKey,
-		token,
-		next.ActiveFilters,
-		nil,
-	)
+	next.DesiredLinks = []exactTCXBinding{}
+	next.ProgramStages = []pinOwnerProgramStage{}
 	next.MapStages = buildOwnerMapStages(next.ResourceKey, token, next.Maps)
 	normalizePinOwnerRecord(next)
 	if err := validatePinOwnerRecord(next, pinResourceIdentity{
@@ -628,7 +766,9 @@ func newInitialAbortDetachingPinOwnerRecord(
 	if current == nil ||
 		current.Phase != pinOwnerPhaseApplying ||
 		(current.Step != pinOwnerStepStaging &&
-			current.Step != pinOwnerStepMutating) ||
+			current.Step != pinOwnerStepMutating &&
+			current.Step != pinOwnerStepRollingBack &&
+			current.Step != pinOwnerStepRollbackCleanup) ||
 		current.ActiveGeneration != 0 {
 		return nil, errors.New("initial abort requires a fresh pre-commit applying owner record")
 	}
@@ -645,6 +785,8 @@ func newInitialAbortDetachingPinOwnerRecord(
 	next.NextGeneration = 0
 	next.ActiveFilters = []tcFilterBinding{}
 	next.DesiredFilters = []tcFilterBinding{}
+	next.ActiveLinks = []exactTCXBinding{}
+	next.DesiredLinks = []exactTCXBinding{}
 	next.ProgramStages = []pinOwnerProgramStage{}
 	next.MapStages = buildOwnerMapStages(next.ResourceKey, token, next.Maps)
 	normalizePinOwnerRecord(next)
@@ -676,6 +818,7 @@ func abortDetachingPinOwnerRecord(
 	)
 	next.NextGeneration = 0
 	next.DesiredFilters = []tcFilterBinding{}
+	next.DesiredLinks = []exactTCXBinding{}
 	next.ProgramStages = []pinOwnerProgramStage{}
 	next.MapStages = []pinOwnerMapStage{}
 	normalizePinOwnerRecord(next)
@@ -699,6 +842,8 @@ func clonePinOwnerRecord(record *pinOwnerRecord) *pinOwnerRecord {
 	cloned.Maps = slices.Clone(record.Maps)
 	cloned.ActiveFilters = slices.Clone(record.ActiveFilters)
 	cloned.DesiredFilters = slices.Clone(record.DesiredFilters)
+	cloned.ActiveLinks = slices.Clone(record.ActiveLinks)
+	cloned.DesiredLinks = slices.Clone(record.DesiredLinks)
 	cloned.ProgramStages = slices.Clone(record.ProgramStages)
 	cloned.MapStages = slices.Clone(record.MapStages)
 	return &cloned
@@ -714,8 +859,8 @@ func normalizePinOwnerRecord(record *pinOwnerRecord) {
 	sort.Slice(record.Maps, func(i, j int) bool {
 		return record.Maps[i].Name < record.Maps[j].Name
 	})
-	sortTCFilterBindings(record.ActiveFilters)
-	sortTCFilterBindings(record.DesiredFilters)
+	sortExactTCXBindings(record.ActiveLinks)
+	sortExactTCXBindings(record.DesiredLinks)
 	sort.Slice(record.ProgramStages, func(i, j int) bool {
 		left := record.ProgramStages[i]
 		right := record.ProgramStages[j]
@@ -736,6 +881,12 @@ func normalizePinOwnerRecord(record *pinOwnerRecord) {
 	if record.DesiredFilters == nil {
 		record.DesiredFilters = []tcFilterBinding{}
 	}
+	if record.ActiveLinks == nil {
+		record.ActiveLinks = []exactTCXBinding{}
+	}
+	if record.DesiredLinks == nil {
+		record.DesiredLinks = []exactTCXBinding{}
+	}
 	if record.ProgramStages == nil {
 		record.ProgramStages = []pinOwnerProgramStage{}
 	}
@@ -750,54 +901,38 @@ func normalizePinOwnerRecord(record *pinOwnerRecord) {
 	}
 }
 
-func sortTCFilterBindings(filters []tcFilterBinding) {
-	sort.Slice(filters, func(i, j int) bool {
-		left := filters[i]
-		right := filters[j]
+func sortExactTCXBindings(bindings []exactTCXBinding) {
+	sort.Slice(bindings, func(i, j int) bool {
+		left, right := bindings[i], bindings[j]
 		if left.IfIndex != right.IfIndex {
 			return left.IfIndex < right.IfIndex
 		}
-		leftDirection := 0
-		if left.Direction == "egress" {
-			leftDirection = 1
+		if left.Direction != right.Direction {
+			return left.Direction < right.Direction
 		}
-		rightDirection := 0
-		if right.Direction == "egress" {
-			rightDirection = 1
-		}
-		if leftDirection != rightDirection {
-			return leftDirection < rightDirection
-		}
-		if left.Parent != right.Parent {
-			return left.Parent < right.Parent
-		}
-		if left.Handle != right.Handle {
-			return left.Handle < right.Handle
-		}
-		if left.Priority != right.Priority {
-			return left.Priority < right.Priority
+		if left.LinkID != right.LinkID {
+			return left.LinkID < right.LinkID
 		}
 		return left.ProgramID < right.ProgramID
 	})
 }
 
-func retainStaleOwnerFilters(
-	desired []tcFilterBinding,
-	active []tcFilterBinding,
-) []tcFilterBinding {
+func retainStaleOwnerLinks(
+	desired []exactTCXBinding,
+	active []exactTCXBinding,
+) []exactTCXBinding {
 	desiredSlots := make(map[string]struct{}, len(desired))
 	out := slices.Clone(desired)
-	for _, filter := range desired {
-		desiredSlots[fmt.Sprintf("%d/%s", filter.IfIndex, filter.Direction)] = struct{}{}
+	for _, binding := range desired {
+		desiredSlots[exactTCXOwnerKey(binding)] = struct{}{}
 	}
-	for _, filter := range active {
-		key := fmt.Sprintf("%d/%s", filter.IfIndex, filter.Direction)
-		if _, replaced := desiredSlots[key]; replaced {
+	for _, binding := range active {
+		if _, replaced := desiredSlots[exactTCXOwnerKey(binding)]; replaced {
 			continue
 		}
-		out = append(out, filter)
+		out = append(out, binding)
 	}
-	sortTCFilterBindings(out)
+	sortExactTCXBindings(out)
 	return out
 }
 
@@ -808,6 +943,9 @@ func validatePinOwnerRecord(
 ) error {
 	if record == nil {
 		return errors.New("pin owner record is nil")
+	}
+	if record.Version == pinOwnerLegacyClassicVersion {
+		return errLegacyClassicOwnerRequiresMigration
 	}
 	if record.Version != pinOwnerRecordVersion {
 		return fmt.Errorf("pin owner record version = %d, want %d", record.Version, pinOwnerRecordVersion)
@@ -893,10 +1031,31 @@ func validatePinOwnerRecord(
 	if err := validateOwnerMaps(record.Maps); err != nil {
 		return err
 	}
-	if err := validateOwnerFilters(record.ActiveFilters, "active"); err != nil {
+	if len(record.ActiveFilters) != 0 || len(record.DesiredFilters) != 0 {
+		return errors.New("pin owner schema v4 must not contain classic TC filters")
+	}
+	rollingBack := record.Phase == pinOwnerPhaseApplying &&
+		(record.Step == pinOwnerStepRollingBack ||
+			record.Step == pinOwnerStepRollbackCleanup)
+	activeLabel := "active"
+	requireActiveLinkID := true
+	if rollingBack {
+		activeLabel = "rollback active"
+		requireActiveLinkID = false
+	} else if record.Phase == pinOwnerPhaseActive && record.Step == pinOwnerStepRetiring {
+		activeLabel = "retiring active"
+	}
+	if err := validateOwnerLinks(record.ActiveLinks, activeLabel, requireActiveLinkID); err != nil {
 		return err
 	}
-	if err := validateOwnerFilters(record.DesiredFilters, "desired"); err != nil {
+	if err := validateOwnerLinks(record.DesiredLinks, "desired", false); err != nil {
+		return err
+	}
+	if rollingBack {
+		if err := validateRollingBackOwnerLinks(record.ActiveLinks, record.DesiredLinks); err != nil {
+			return err
+		}
+	} else if err := validateOwnerLinkTransition(record.ActiveLinks, record.DesiredLinks); err != nil {
 		return err
 	}
 	if err := validateOwnerStages(record); err != nil {
@@ -904,23 +1063,47 @@ func validatePinOwnerRecord(
 	}
 	switch record.Phase {
 	case pinOwnerPhaseActive:
-		if record.Step != pinOwnerStepReady ||
+		if (record.Step != pinOwnerStepReady && record.Step != pinOwnerStepRetiring) ||
 			record.ActiveGeneration == 0 ||
 			record.NextGeneration != 0 ||
 			len(record.DesiredFilters) != 0 ||
+			len(record.DesiredLinks) != 0 ||
 			len(record.ProgramStages) != 0 ||
 			len(record.MapStages) != 0 {
 			return errors.New("active pin owner record has inconsistent transaction fields")
 		}
+		if record.Step == pinOwnerStepRetiring {
+			retiring := 0
+			for _, binding := range record.ActiveLinks {
+				if binding.Retiring {
+					retiring++
+				}
+			}
+			if retiring == 0 {
+				return errors.New("retiring active pin owner has no retiring exact TCX link")
+			}
+		}
 	case pinOwnerPhaseApplying:
 		if record.Step != pinOwnerStepStaging &&
 			record.Step != pinOwnerStepMutating &&
+			record.Step != pinOwnerStepRollingBack &&
+			record.Step != pinOwnerStepRollbackCleanup &&
 			record.Step != pinOwnerStepCleanup {
 			return fmt.Errorf("applying pin owner record has invalid step %q", record.Step)
 		}
 		if record.NextGeneration == 0 ||
 			len(record.MapStages) != 0 {
 			return errors.New("applying pin owner record has incomplete transaction intent")
+		}
+		if record.ActiveGeneration == 0 && len(record.ActiveLinks) != 0 {
+			return errors.New("fresh applying owner unexpectedly has active exact TCX links")
+		}
+		if record.Step == pinOwnerStepCleanup {
+			for _, binding := range record.DesiredLinks {
+				if binding.LinkID == 0 || binding.PinPending || binding.Retiring {
+					return errors.New("applying cleanup has an unpublished exact TCX link ID")
+				}
+			}
 		}
 	case pinOwnerPhaseDetaching:
 		if record.Step != pinOwnerStepStaging &&
@@ -931,16 +1114,206 @@ func validatePinOwnerRecord(
 		}
 		if record.NextGeneration != 0 ||
 			len(record.DesiredFilters) != 0 ||
+			len(record.DesiredLinks) != 0 ||
 			len(record.MapStages) != len(pinnedMapDescriptors()) {
 			return errors.New("detaching pin owner record has incomplete transaction intent")
 		}
 		if record.ActiveGeneration == 0 &&
 			(len(record.ActiveFilters) != 0 ||
+				len(record.ActiveLinks) != 0 ||
 				len(record.ProgramStages) != 0) {
 			return errors.New("fresh abort detach unexpectedly owns active filters or programs")
 		}
 	default:
 		return fmt.Errorf("pin owner record has invalid phase %q", record.Phase)
+	}
+	return nil
+}
+
+func validateOwnerLinks(bindings []exactTCXBinding, label string, requireLinkID bool) error {
+	seenSlots := make(map[string]struct{}, len(bindings))
+	seenLinks := make(map[uint32]string, len(bindings))
+	for index, binding := range bindings {
+		if err := validateExactTCXBinding(binding, requireLinkID); err != nil {
+			return fmt.Errorf("%s link[%d]: %w", label, index, err)
+		}
+		if (label == "active" || label == "retiring active") && binding.ReplacesLinkID != 0 {
+			return errors.New("active exact TCX link retains a replacement marker")
+		}
+		if label == "active" && (binding.PinPending || binding.Retiring) {
+			return errors.New("active exact TCX link retains a transient lifecycle marker")
+		}
+		if label == "retiring active" && binding.PinPending {
+			return errors.New("retiring active exact TCX link retains a pending-pin marker")
+		}
+		if binding.PinPending && binding.LinkID == 0 {
+			return fmt.Errorf("%s exact TCX slot %s has a pending pin without a link ID", label, exactTCXOwnerKey(binding))
+		}
+		if binding.PinPending && binding.Retiring {
+			return fmt.Errorf("%s exact TCX slot %s is both pending and retiring", label, exactTCXOwnerKey(binding))
+		}
+		if binding.Retiring && binding.LinkID == 0 {
+			return fmt.Errorf("%s exact TCX slot %s retires an unpublished link", label, exactTCXOwnerKey(binding))
+		}
+		if label == "rollback active" {
+			switch {
+			case binding.Retiring:
+				return fmt.Errorf("rollback active exact TCX slot %s cannot be retiring", exactTCXOwnerKey(binding))
+			case binding.ReplacesLinkID == 0 && binding.LinkID == 0:
+				return fmt.Errorf("rollback active exact TCX slot %s has no stable or replacement identity", exactTCXOwnerKey(binding))
+			case binding.ReplacesLinkID != 0 && binding.LinkID == binding.ReplacesLinkID:
+				return fmt.Errorf("rollback active exact TCX slot %s still uses retired link ID %d", exactTCXOwnerKey(binding), binding.LinkID)
+			case binding.ReplacesLinkID == 0 && (binding.PinPending || binding.Retiring):
+				return fmt.Errorf("rollback active exact TCX slot %s has a marker without replacement lineage", exactTCXOwnerKey(binding))
+			}
+		}
+		key := exactTCXOwnerKey(binding)
+		if _, duplicate := seenSlots[key]; duplicate {
+			return fmt.Errorf("%s links repeat slot %s", label, key)
+		}
+		seenSlots[key] = struct{}{}
+		if binding.LinkID != 0 {
+			if previous, duplicate := seenLinks[binding.LinkID]; duplicate {
+				return fmt.Errorf("%s links %s and %s share link ID %d", label, previous, key, binding.LinkID)
+			}
+			seenLinks[binding.LinkID] = key
+		}
+	}
+	sorted := slices.Clone(bindings)
+	sortExactTCXBindings(sorted)
+	if !slices.Equal(sorted, bindings) {
+		return fmt.Errorf("%s links are not canonically sorted", label)
+	}
+	return nil
+}
+
+func validateOwnerLinkTransition(active, desired []exactTCXBinding) error {
+	activeBySlot := make(map[string]exactTCXBinding, len(active))
+	usedLinkIDs := make(map[uint32]string, len(active)+len(desired))
+	for _, binding := range active {
+		key := exactTCXOwnerKey(binding)
+		activeBySlot[key] = binding
+		usedLinkIDs[binding.LinkID] = key
+	}
+	for _, binding := range desired {
+		key := exactTCXOwnerKey(binding)
+		if binding.PinPending && binding.LinkID == 0 {
+			return fmt.Errorf("desired exact TCX slot %s has a pending pin without a link ID", key)
+		}
+		if previous, sameSlot := activeBySlot[key]; sameSlot {
+			switch {
+			case binding.ReplacesLinkID == 0 && binding.LinkID != previous.LinkID:
+				return fmt.Errorf(
+					"desired exact TCX slot %s changes link ID %d to %d",
+					key, previous.LinkID, binding.LinkID,
+				)
+			case binding.ReplacesLinkID != 0 && binding.ReplacesLinkID != previous.LinkID:
+				return fmt.Errorf(
+					"desired exact TCX slot %s replaces link ID %d, active is %d",
+					key, binding.ReplacesLinkID, previous.LinkID,
+				)
+			case binding.ReplacesLinkID != 0 && binding.LinkID == previous.LinkID:
+				return fmt.Errorf(
+					"desired exact TCX slot %s replacement still uses retired link ID %d",
+					key, previous.LinkID,
+				)
+			case binding.ReplacesLinkID != 0 && binding.LinkID != 0:
+				if other, duplicate := usedLinkIDs[binding.LinkID]; duplicate {
+					return fmt.Errorf(
+						"desired exact TCX slot %s replacement reuses link ID %d from %s",
+						key, binding.LinkID, other,
+					)
+				}
+				usedLinkIDs[binding.LinkID] = key
+			}
+			if binding.ReplacesLinkID == 0 && binding.PinPending {
+				return fmt.Errorf("active exact TCX slot %s cannot have a pending deterministic pin", key)
+			}
+			continue
+		}
+		if binding.ReplacesLinkID != 0 {
+			return fmt.Errorf(
+				"new desired exact TCX slot %s unexpectedly replaces link ID %d",
+				key, binding.ReplacesLinkID,
+			)
+		}
+		if binding.LinkID == 0 {
+			continue
+		}
+		if previous, duplicate := usedLinkIDs[binding.LinkID]; duplicate {
+			return fmt.Errorf(
+				"desired exact TCX slot %s reuses link ID %d from %s",
+				key, binding.LinkID, previous,
+			)
+		}
+		usedLinkIDs[binding.LinkID] = key
+	}
+	return nil
+}
+
+func validateRollingBackOwnerLinks(active, desired []exactTCXBinding) error {
+	activeBySlot := make(map[string]exactTCXBinding, len(active))
+	knownLinkIDs := make(map[uint32]string, len(active)+len(desired))
+	for _, binding := range active {
+		key := exactTCXOwnerKey(binding)
+		activeBySlot[key] = binding
+		for _, id := range []uint32{binding.LinkID, binding.ReplacesLinkID} {
+			if id == 0 {
+				continue
+			}
+			if previous, duplicate := knownLinkIDs[id]; duplicate && previous != key {
+				return fmt.Errorf("rolling-back exact TCX slots %s and %s share link ID %d", previous, key, id)
+			}
+			knownLinkIDs[id] = key
+		}
+	}
+	for _, binding := range desired {
+		key := exactTCXOwnerKey(binding)
+		active, hasActive := activeBySlot[key]
+		if hasActive && active.ReplacesLinkID == 0 &&
+			binding.ReplacesLinkID == 0 && binding.LinkID != active.LinkID {
+			return fmt.Errorf(
+				"rolling-back desired exact TCX slot %s changes stable link ID %d to %d without replacement lineage",
+				key, active.LinkID, binding.LinkID,
+			)
+		}
+		if hasActive && active.ReplacesLinkID != 0 {
+			if active.LinkID != 0 && binding.LinkID == active.LinkID {
+				return fmt.Errorf(
+					"rolling-back desired exact TCX slot %s reuses rollback active link ID %d",
+					key, active.LinkID,
+				)
+			}
+			detachedReplacement := binding.ReplacesLinkID == active.ReplacesLinkID &&
+				binding.LinkID != active.ReplacesLinkID
+			detachedSameLinkUpdate := binding.ReplacesLinkID == 0 &&
+				binding.LinkID == active.ReplacesLinkID
+			if !detachedReplacement && !detachedSameLinkUpdate {
+				return fmt.Errorf(
+					"rolling-back desired exact TCX slot %s has replacement lineage %d/link %d, rollback active lineage is %d",
+					key, binding.ReplacesLinkID, binding.LinkID, active.ReplacesLinkID,
+				)
+			}
+		}
+		if binding.ReplacesLinkID != 0 {
+			if !hasActive || (active.ReplacesLinkID == 0 &&
+				binding.ReplacesLinkID != active.LinkID) {
+				return fmt.Errorf("rolling-back desired exact TCX slot %s has unknown replacement lineage %d", key, binding.ReplacesLinkID)
+			}
+			if active.ReplacesLinkID == 0 && binding.LinkID == active.LinkID {
+				return fmt.Errorf(
+					"rolling-back desired exact TCX slot %s replacement still uses retired link ID %d",
+					key, active.LinkID,
+				)
+			}
+		}
+		if binding.LinkID == 0 {
+			continue
+		}
+		if previous, duplicate := knownLinkIDs[binding.LinkID]; duplicate && previous != key {
+			return fmt.Errorf("rolling-back exact TCX slots %s and %s share link ID %d", previous, key, binding.LinkID)
+		}
+		knownLinkIDs[binding.LinkID] = key
 	}
 	return nil
 }
@@ -977,57 +1350,30 @@ func validateOwnerMaps(maps []pinOwnerMapIdentity) error {
 	return nil
 }
 
-func validateOwnerFilters(filters []tcFilterBinding, label string) error {
-	previousIfindex := -1
-	seen := make(map[string]struct{}, len(filters))
-	for index, filter := range filters {
-		if filter.IfIndex <= 0 || filter.ProgramID == 0 {
-			return fmt.Errorf("%s filter[%d] has an invalid ifindex or program ID", label, index)
-		}
-		var slot tcFilterSlot
-		switch filter.Direction {
-		case "ingress":
-			slot = canonicalTCFilterSlots()[0]
-		case "egress":
-			slot = canonicalTCFilterSlots()[1]
-		default:
-			return fmt.Errorf("%s filter[%d] has invalid direction %q", label, index, filter.Direction)
-		}
-		if filter.Parent != slot.parent ||
-			filter.Handle != slot.handle ||
-			filter.Priority != filterPriority {
-			return fmt.Errorf("%s filter[%d] does not use its canonical TC slot", label, index)
-		}
-		key := fmt.Sprintf("%d/%s", filter.IfIndex, filter.Direction)
-		if _, duplicate := seen[key]; duplicate {
-			return fmt.Errorf("%s filters repeat %s", label, key)
-		}
-		seen[key] = struct{}{}
-		if filter.IfIndex < previousIfindex {
-			return fmt.Errorf("%s filters are not sorted", label)
-		}
-		previousIfindex = filter.IfIndex
-	}
-	sorted := slices.Clone(filters)
-	sortTCFilterBindings(sorted)
-	if !slices.Equal(sorted, filters) {
-		return fmt.Errorf("%s filters are not canonically sorted", label)
-	}
-	return nil
-}
-
 func validateOwnerStages(record *pinOwnerRecord) error {
 	token, err := tokenFromOwnerRecord(record)
 	if err != nil {
 		return err
 	}
+	expectedPrograms := []pinOwnerProgramStage{}
+	if record.Phase == pinOwnerPhaseApplying {
+		expectedPrograms = buildOwnerProgramStages(
+			record.ResourceKey,
+			token,
+			record.ActiveLinks,
+			record.DesiredLinks,
+		)
+	}
+	if !slices.Equal(record.ProgramStages, expectedPrograms) {
+		return errors.New("program stage list does not exactly cover the owner transaction programs")
+	}
 	activeIDs := make(map[uint32]struct{})
-	for _, filter := range record.ActiveFilters {
-		activeIDs[filter.ProgramID] = struct{}{}
+	for _, binding := range record.ActiveLinks {
+		activeIDs[binding.ProgramID] = struct{}{}
 	}
 	desiredIDs := make(map[uint32]struct{})
-	for _, filter := range record.DesiredFilters {
-		desiredIDs[filter.ProgramID] = struct{}{}
+	for _, binding := range record.DesiredLinks {
+		desiredIDs[binding.ProgramID] = struct{}{}
 	}
 	seenProgramFiles := make(map[string]struct{}, len(record.ProgramStages))
 	for _, stage := range record.ProgramStages {
@@ -1097,8 +1443,8 @@ func pinOwnerProgramStageName(
 func buildOwnerProgramStages(
 	resourceKey string,
 	token [32]byte,
-	active []tcFilterBinding,
-	desired []tcFilterBinding,
+	active []exactTCXBinding,
+	desired []exactTCXBinding,
 ) []pinOwnerProgramStage {
 	type stageKey struct {
 		id   uint32
@@ -1106,16 +1452,16 @@ func buildOwnerProgramStages(
 	}
 	seen := make(map[stageKey]struct{})
 	var stages []pinOwnerProgramStage
-	add := func(filters []tcFilterBinding, kind string) {
-		for _, filter := range filters {
-			key := stageKey{id: filter.ProgramID, kind: kind}
+	add := func(bindings []exactTCXBinding, kind string) {
+		for _, binding := range bindings {
+			key := stageKey{id: binding.ProgramID, kind: kind}
 			if _, exists := seen[key]; exists {
 				continue
 			}
 			seen[key] = struct{}{}
 			stages = append(stages, pinOwnerProgramStage{
-				FileName:  pinOwnerProgramStageName(resourceKey, token, kind, filter.ProgramID),
-				ProgramID: filter.ProgramID,
+				FileName:  pinOwnerProgramStageName(resourceKey, token, kind, binding.ProgramID),
+				ProgramID: binding.ProgramID,
 				Kind:      kind,
 			})
 		}
