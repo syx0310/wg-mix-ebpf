@@ -16,6 +16,7 @@ import ipaddress
 import json
 import os
 import re
+import signal
 import stat
 import subprocess
 import sys
@@ -222,6 +223,7 @@ class CommandRunner:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+                start_new_session=True,
             )
         except OSError as exc:
             raise HarnessError(f"command did not start: {argv!r}: {exc}") from exc
@@ -231,6 +233,16 @@ class CommandRunner:
 class RunningProcess:
     def __init__(self, process: subprocess.Popen[bytes]):
         self._process = process
+        self.pid = process.pid
+        self.pgid = process.pid
+        try:
+            actual_pgid = os.getpgid(process.pid)
+        except ProcessLookupError:
+            actual_pgid = process.pid
+        if actual_pgid != process.pid:
+            process.kill()
+            process.wait(timeout=5)
+            raise HarnessError("background command did not enter its exact owned process group")
         self._stdout = bytearray()
         self._stderr = bytearray()
         self._overflow = False
@@ -253,22 +265,88 @@ class RunningProcess:
             else:
                 self._overflow = True
 
+    def _collect_output(self) -> tuple[bytes, bytes]:
+        for thread in self._threads:
+            thread.join(timeout=5)
+        if any(thread.is_alive() for thread in self._threads):
+            raise HarnessError("background command output drain did not converge")
+        for stream in (self._process.stdout, self._process.stderr):
+            if stream is not None and not stream.closed:
+                stream.close()
+        if self._overflow:
+            raise HarnessError("background command output exceeded 8 MiB")
+        return bytes(self._stdout), bytes(self._stderr)
+
+    def _group_exists(self) -> bool:
+        try:
+            os.killpg(self.pgid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+
+    def _wait_group_absent(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            self._process.poll()
+            if not self._group_exists():
+                return True
+            time.sleep(0.05)
+        self._process.poll()
+        return not self._group_exists()
+
+    def _signal_group(self, wanted_signal: int) -> str:
+        try:
+            os.killpg(self.pgid, wanted_signal)
+            return "sent"
+        except ProcessLookupError:
+            return "already-absent"
+        except OSError as exc:
+            return f"error:{type(exc).__name__}:{exc}"
+
     def wait(self, timeout: int) -> tuple[int, bytes, bytes]:
         try:
             rc = self._process.wait(timeout=timeout)
         except subprocess.TimeoutExpired as exc:
             raise HarnessError("background command exceeded its reviewed timeout") from exc
-        for thread in self._threads:
-            thread.join(timeout=5)
-        if any(thread.is_alive() for thread in self._threads):
-            raise HarnessError("background command output drain did not converge")
-        if self._overflow:
-            raise HarnessError("background command output exceeded 8 MiB")
-        return rc, bytes(self._stdout), bytes(self._stderr)
+        stdout, stderr = self._collect_output()
+        if self._group_exists():
+            raise HarnessError("owned process group remains after wrapper exit")
+        return rc, stdout, stderr
 
-    def terminate(self) -> None:
+    def converge(
+        self,
+        *,
+        term_timeout: float = 5.0,
+        kill_timeout: float = 5.0,
+    ) -> tuple[int, bytes, bytes, dict[str, Any]]:
+        report: dict[str, Any] = {
+            "pid": self.pid,
+            "pgid": self.pgid,
+            "term": "not-needed",
+            "kill": "not-needed",
+        }
+        if self._group_exists():
+            report["term"] = self._signal_group(signal.SIGTERM)
+        if not self._wait_group_absent(term_timeout):
+            report["kill"] = self._signal_group(signal.SIGKILL)
+            if not self._wait_group_absent(kill_timeout):
+                raise HarnessError(f"owned process group {self.pgid} survived TERM and KILL: {report}")
         if self._process.poll() is None:
-            self._process.terminate()
+            try:
+                self._process.wait(timeout=kill_timeout)
+            except subprocess.TimeoutExpired as exc:
+                raise HarnessError("owned wrapper was not reaped after process-group convergence") from exc
+        stdout, stderr = self._collect_output()
+        if self._group_exists():
+            raise HarnessError(f"owned process group {self.pgid} still exists after convergence")
+        rc = self._process.returncode
+        if rc is None:
+            raise HarnessError("owned wrapper has no terminal return code")
+        report["group_absent"] = True
+        report["wrapper_rc"] = rc
+        return rc, stdout, stderr, report
 
 
 def snapshot_command_table(spec: CoreSpec) -> list[tuple[str, list[str]]]:
@@ -1620,6 +1698,12 @@ def run_traffic(
     monitor = steps[0]
     journal.append("COMMAND_START", label=monitor["label"], argv=monitor["argv"], target=monitor["target"])
     process = runner.start(monitor["argv"])
+    journal.append(
+        "OWNED_PROCESS_GROUP_BOUND",
+        label=monitor["label"],
+        pid=process.pid,
+        pgid=process.pgid,
+    )
     try:
         for step in steps[1:]:
             rc, stdout, _ = execute_step(step, runner, journal)
@@ -1635,17 +1719,36 @@ def run_traffic(
         if metrics["packet_loss_percent"] > 0.01:
             raise HarnessError("soak ping loss exceeds 0.01%")
         results.insert(0, {"label": monitor["label"], "rc": rc, "metrics": metrics})
-    except BaseException:
-        process.terminate()
-        journal.append("OWNED_MONITOR_TERMINATE", label=monitor["label"])
+    except BaseException as primary_error:
+        journal.append(
+            "OWNED_PROCESS_GROUP_STOP_INTENT",
+            label=monitor["label"],
+            pid=process.pid,
+            pgid=process.pgid,
+            reason=str(primary_error),
+        )
         try:
-            rc, stdout, stderr = process.wait(10)
-            if not os.path.lexists(monitor["stdout"]):
-                write_exclusive(monitor["stdout"], stdout)
-                write_exclusive(monitor["stderr"], stderr)
-            journal.append("OWNED_MONITOR_STOPPED", label=monitor["label"], rc=rc)
-        except HarnessError as stop_error:
-            journal.append("OWNED_MONITOR_STOP_ERROR", label=monitor["label"], reason=str(stop_error))
+            rc, stdout, stderr, report = process.converge()
+            write_idempotent_exact(monitor["stdout"], stdout)
+            write_idempotent_exact(monitor["stderr"], stderr)
+            journal.append(
+                "OWNED_PROCESS_GROUP_STOPPED",
+                label=monitor["label"],
+                rc=rc,
+                report=report,
+            )
+        except BaseException as stop_error:
+            journal.append(
+                "OWNED_PROCESS_GROUP_STOP_FAILED",
+                label=monitor["label"],
+                pid=process.pid,
+                pgid=process.pgid,
+                primary_reason=str(primary_error),
+                convergence_reason=str(stop_error),
+            )
+            raise HarnessError(
+                f"traffic failure ({primary_error}); owned process-group convergence failure ({stop_error})"
+            ) from stop_error
         raise
     return results
 

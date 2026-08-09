@@ -6,7 +6,9 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import pathlib
+import signal
 import sys
 import tempfile
 import unittest
@@ -38,6 +40,8 @@ class FakeRunningProcess:
     def __init__(self):
         self.terminated = False
         self.waited = False
+        self.pid = 10001
+        self.pgid = 10001
 
     def wait(self, timeout):
         del timeout
@@ -45,8 +49,23 @@ class FakeRunningProcess:
         rc = -15 if self.terminated else 0
         return rc, b"60 packets transmitted, 60 received, 0% packet loss\n", b""
 
-    def terminate(self):
+    def converge(self, *, term_timeout=5.0, kill_timeout=5.0):
+        del term_timeout, kill_timeout
         self.terminated = True
+        self.waited = True
+        return (
+            -15,
+            b"60 packets transmitted, 60 received, 0% packet loss\n",
+            b"",
+            {
+                "pid": self.pid,
+                "pgid": self.pgid,
+                "term": "sent",
+                "kill": "not-needed",
+                "group_absent": True,
+                "wrapper_rc": -15,
+            },
+        )
 
 
 class SimulatedRunner(FixtureRunner):
@@ -216,6 +235,87 @@ def fixture_outputs(spec, *, fixed=()):
         (MODULE.TOOLS["ethtool"], "-S", spec.interface): b"NIC statistics:\n     rx_errors: 0\n     tx_errors: 0\n",
     }
     return result
+
+
+class ProcessGroupTests(unittest.TestCase):
+    def test_stubborn_wrapper_and_grandchild_are_killed_as_one_owned_group(self):
+        grandchild = (
+            "import os,signal,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "print(os.getpid(),flush=True);"
+            "time.sleep(30)"
+        )
+        wrapper = (
+            "import os,signal,subprocess,sys,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            f"subprocess.Popen([sys.executable,'-c',{grandchild!r}]);"
+            "time.sleep(30)"
+        )
+        process = MODULE.CommandRunner().start([sys.executable, "-c", wrapper])
+        pgid = process.pgid
+        try:
+            with self.assertRaisesRegex(MODULE.HarnessError, "reviewed timeout"):
+                process.wait(0.1)
+            rc, stdout, stderr, report = process.converge(term_timeout=0.2, kill_timeout=3.0)
+        finally:
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        self.assertLess(rc, 0)
+        self.assertEqual(stderr, b"")
+        self.assertRegex(stdout.decode(), r"^[1-9][0-9]*\n$")
+        self.assertEqual(report["pid"], pgid)
+        self.assertEqual(report["pgid"], pgid)
+        self.assertEqual(report["term"], "sent")
+        self.assertEqual(report["kill"], "sent")
+        self.assertTrue(report["group_absent"])
+        with self.assertRaises(ProcessLookupError):
+            os.killpg(pgid, 0)
+
+    def test_term_signal_error_does_not_skip_kill_or_proof(self):
+        process = object.__new__(MODULE.RunningProcess)
+        process.pid = 101
+        process.pgid = 101
+        process._process = mock.Mock()
+        process._process.poll.return_value = -9
+        process._process.returncode = -9
+        process._collect_output = mock.Mock(return_value=(b"out", b"err"))
+        process._group_exists = mock.Mock(side_effect=[True, False])
+        process._wait_group_absent = mock.Mock(side_effect=[False, True])
+        process._signal_group = mock.Mock(side_effect=["error:PermissionError:denied", "sent"])
+        rc, stdout, stderr, report = process.converge(term_timeout=0.1, kill_timeout=0.1)
+        self.assertEqual((rc, stdout, stderr), (-9, b"out", b"err"))
+        self.assertEqual(report["term"], "error:PermissionError:denied")
+        self.assertEqual(report["kill"], "sent")
+        self.assertEqual(
+            process._signal_group.call_args_list,
+            [mock.call(signal.SIGTERM), mock.call(signal.SIGKILL)],
+        )
+
+    def test_failed_kill_and_lingering_group_is_fatal(self):
+        process = object.__new__(MODULE.RunningProcess)
+        process.pid = 102
+        process.pgid = 102
+        process._process = mock.Mock()
+        process._group_exists = mock.Mock(return_value=True)
+        process._wait_group_absent = mock.Mock(side_effect=[False, False])
+        process._signal_group = mock.Mock(side_effect=["sent", "error:PermissionError:denied"])
+        with self.assertRaisesRegex(MODULE.HarnessError, "survived TERM and KILL"):
+            process.converge(term_timeout=0.1, kill_timeout=0.1)
+
+    def test_output_drain_failure_after_group_exit_is_fatal(self):
+        process = object.__new__(MODULE.RunningProcess)
+        process.pid = 103
+        process.pgid = 103
+        process._process = mock.Mock()
+        process._process.poll.return_value = 0
+        process._process.returncode = 0
+        process._group_exists = mock.Mock(side_effect=[False, False])
+        process._wait_group_absent = mock.Mock(return_value=True)
+        process._collect_output = mock.Mock(side_effect=MODULE.HarnessError("drain failed"))
+        with self.assertRaisesRegex(MODULE.HarnessError, "drain failed"):
+            process.converge(term_timeout=0.1, kill_timeout=0.1)
 
 
 class PlannerTests(unittest.TestCase):
