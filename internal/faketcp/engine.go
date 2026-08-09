@@ -125,6 +125,7 @@ type SessionSnapshot struct {
 	TXSequence     uint32
 	RXSequence     uint32
 	LastSeenNanos  uint64
+	PendingDelete  bool
 	PendingPackets int
 	PendingBytes   int
 	LastActivity   time.Time
@@ -676,21 +677,34 @@ func (e *Engine) Snapshot(flow abi.FakeTCPSessionKey) (SessionSnapshot, bool, er
 		return SessionSnapshot{}, false, nil
 	}
 	lastSeenNanos := uint64(0)
+	txSequence, rxSequence := s.txSequence, s.rxSequence
+	pendingDelete := s.pendingDelete != nil
 	if s.state == abi.FakeTCPStateEstablished {
-		value, found, err := e.lookupEstablished(flow, s)
-		if err != nil {
-			return SessionSnapshot{}, true, err
+		if pendingDelete {
+			// Snapshot is observability-only: report the complete cached delete
+			// candidate without looking up its possible kernel tombstone or
+			// creating another retry/delete entry point.
+			value := s.pendingDelete.expected
+			lastSeenNanos = value.LastSeenNanos
+			txSequence, rxSequence = value.TXSequence, value.RXSequence
+		} else {
+			value, found, err := e.lookupEstablished(flow, s)
+			if err != nil {
+				return SessionSnapshot{}, true, err
+			}
+			if !found {
+				return SessionSnapshot{}, false, nil
+			}
+			lastSeenNanos = value.LastSeenNanos
+			txSequence, rxSequence = value.TXSequence, value.RXSequence
 		}
-		if !found {
-			return SessionSnapshot{}, false, nil
-		}
-		lastSeenNanos = value.LastSeenNanos
 	}
 	return SessionSnapshot{
 		State:          s.state,
-		TXSequence:     s.txSequence,
-		RXSequence:     s.rxSequence,
+		TXSequence:     txSequence,
+		RXSequence:     rxSequence,
 		LastSeenNanos:  lastSeenNanos,
+		PendingDelete:  pendingDelete,
 		PendingPackets: len(s.pending),
 		PendingBytes:   s.pendingBytes,
 		LastActivity:   s.lastActivity,

@@ -278,7 +278,23 @@ func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 			engine.sessions[flow].pendingDelete.expected != expected {
 			t.Fatalf("claim recovery state=%#v pending=%#v", claimed, engine.sessions[flow].pendingDelete)
 		}
-		lookupsAfterClaim, _ := store.counts()
+		lookupsAfterClaim, deletesAfterClaim := store.counts()
+		snapshot, found, snapshotErr := engine.Snapshot(flow)
+		if snapshotErr != nil || !found || !snapshot.PendingDelete ||
+			snapshot.State != abi.FakeTCPStateEstablished ||
+			snapshot.TXSequence != expected.TXSequence ||
+			snapshot.RXSequence != expected.RXSequence ||
+			snapshot.LastSeenNanos != expected.LastSeenNanos {
+			t.Fatalf("pending snapshot=%#v found=%t err=%v", snapshot, found, snapshotErr)
+		}
+		lookupsAfterSnapshot, deletesAfterSnapshot := store.counts()
+		if lookupsAfterSnapshot != lookupsAfterClaim || deletesAfterSnapshot != deletesAfterClaim ||
+			engine.sessions[flow].pendingDelete == nil ||
+			engine.sessions[flow].pendingDelete.expected != expected {
+			t.Fatalf("Snapshot touched pending delete: lookups=%d/%d deletes=%d/%d pending=%#v",
+				lookupsAfterSnapshot, lookupsAfterClaim, deletesAfterSnapshot, deletesAfterClaim,
+				engine.sessions[flow].pendingDelete)
+		}
 
 		actions, err = engine.Tick()
 		if err != nil || len(actions) != 1 || actions[0].Kind != ActionClose || actions[0].Reason != "idle-timeout" {
