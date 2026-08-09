@@ -21,6 +21,7 @@
 #include <linux/module.h>
 #include <linux/netdevice.h>
 #include <linux/skbuff.h>
+#include <linux/string.h>
 #include <linux/tcp.h>
 #include <linux/udp.h>
 #include <net/dst.h>
@@ -32,6 +33,36 @@
 #define WG_MIX_FAKETCP_MIN_SEGMENT_PAYLOAD 32U
 #define WG_MIX_FAKETCP_MAX_INPUT_TOTAL_LEN \
 	(U16_MAX - WG_MIX_FAKETCP_HEADER_DELTA)
+#define WG_MIX_FAKETCP_LEASE_ID_LENGTH 17U
+
+/*
+ * A managed real-host runner supplies <8 lowercase hex>-<8 lowercase hex>.
+ * Empty remains valid for existing non-managed verifier/unit loading.  The
+ * parameter is load-time only so a recovery process can identify the exact
+ * managed module generation after a crash between insmod and its receipt.
+ */
+static char lease_id[WG_MIX_FAKETCP_LEASE_ID_LENGTH + 1];
+module_param_string(lease_id, lease_id, sizeof(lease_id), 0444);
+MODULE_PARM_DESC(lease_id, "managed real-host module generation lease");
+
+static bool wg_mix_faketcp_valid_lease_id(void)
+{
+	size_t index;
+
+	if (!lease_id[0])
+		return true;
+	if (strnlen(lease_id, sizeof(lease_id)) !=
+	    WG_MIX_FAKETCP_LEASE_ID_LENGTH || lease_id[8] != '-')
+		return false;
+	for (index = 0; index < WG_MIX_FAKETCP_LEASE_ID_LENGTH; index++) {
+		if (index == 8)
+			continue;
+		if (!((lease_id[index] >= '0' && lease_id[index] <= '9') ||
+		      (lease_id[index] >= 'a' && lease_id[index] <= 'f')))
+			return false;
+	}
+	return true;
+}
 
 /* Stable result ABI shared with the experimental BPF object. */
 enum wg_mix_faketcp_prepare_result {
@@ -456,6 +487,8 @@ static const struct btf_kfunc_id_set wg_mix_faketcp_checksum_kfunc_set = {
 
 static int __init wg_mix_faketcp_checksum_init(void)
 {
+	if (!wg_mix_faketcp_valid_lease_id())
+		return -EINVAL;
 	return register_btf_kfunc_id_set(BPF_PROG_TYPE_SCHED_CLS,
 					 &wg_mix_faketcp_checksum_kfunc_set);
 }
