@@ -49,6 +49,7 @@ TOOLS = {
     "ip": "/usr/sbin/ip",
     "iperf3": "/usr/bin/iperf3",
     "ping": "/usr/bin/ping",
+    "python3": "/usr/bin/python3",
     "readlink": "/usr/bin/readlink",
     "stat": "/usr/bin/stat",
     "tc": "/usr/sbin/tc",
@@ -834,6 +835,59 @@ def command_step(
     }
 
 
+def iperf_checker_path() -> str:
+    return str(Path(__file__).resolve().parent.parent / "realhost-b82-c8e41d73" / "check-realhost-iperf.py")
+
+
+def iperf_checker_contract() -> dict[str, str]:
+    path = iperf_checker_path()
+    return {"path": path, "sha256": sha256_bytes(read_regular_file(path))}
+
+
+def attach_iperf_oracle(
+    spec: CoreSpec,
+    step: dict[str, Any],
+    direction: str,
+    streams: int,
+    *,
+    soak: bool,
+    checker: Mapping[str, str],
+) -> None:
+    oracle = command_step(
+        spec.run_root,
+        f"{step['label']}.oracle",
+        [
+            TOOLS["python3"],
+            "-I",
+            checker["path"],
+            "one",
+            step["stdout"],
+            "--direction",
+            direction,
+            "--streams",
+            str(streams),
+            "--minimum-bytes",
+            "1048576",
+            "--minimum-fairness",
+            "0.90",
+            "--maximum-retransmit-rate",
+            "0.001" if soak else "0.0001",
+        ],
+        30,
+        target=step["stdout"],
+    )
+    oracle.update(
+        {
+            "kind": "iperf-oracle",
+            "direction": direction,
+            "streams": streams,
+            "program_path": checker["path"],
+            "program_sha256": checker["sha256"],
+        }
+    )
+    step["oracle"] = oracle
+
+
 def monitor_steps(spec: CoreSpec, cell_name: str, phase: str) -> list[dict[str, Any]]:
     return [
         command_step(
@@ -926,6 +980,7 @@ def recovery_steps_from_restore(restore: Sequence[Mapping[str, Any]]) -> list[di
 
 def iperf_steps(spec: CoreSpec, cell_name: str) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
+    checker = iperf_checker_contract()
     for streams in (1, 4, 16):
         for direction in ("forward", "reverse", "bidir"):
             argv = [
@@ -960,6 +1015,7 @@ def iperf_steps(spec: CoreSpec, cell_name: str) -> list[dict[str, Any]]:
                 target=f"peer:{spec.peer_address}:{spec.peer_port}",
             )
             step.update({"kind": "iperf", "streams": streams, "direction": direction})
+            attach_iperf_oracle(spec, step, direction, streams, soak=False, checker=checker)
             steps.append(step)
     return steps
 
@@ -1096,6 +1152,7 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
     )
     ping.update({"kind": "ping-monitor", "parallel_group": name})
     traffic.append(ping)
+    checker = iperf_checker_contract()
     for window in range(windows):
         argv = [
             TOOLS["timeout"],
@@ -1126,6 +1183,7 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
             target=f"peer:{spec.peer_address}:{spec.peer_port}",
         )
         step.update({"kind": "iperf", "streams": 4, "direction": "bidir", "window": window})
+        attach_iperf_oracle(spec, step, "bidir", 4, soak=True, checker=checker)
         traffic.append(step)
     recovery_restore = recovery_steps_from_restore(restore)
     return {
@@ -1208,6 +1266,10 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
             for step in cell.get(group, []):
                 files.add(step["stdout"])
                 files.add(step["stderr"])
+                oracle = step.get("oracle")
+                if isinstance(oracle, dict):
+                    files.add(oracle["stdout"])
+                    files.add(oracle["stderr"])
     network_write_set = [
         {
             "target": f"netdev:{spec.interface}:features",
@@ -1226,6 +1288,7 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         entry["operations"] = [list(argv) for argv in entry["operations"]]
     identity = lease_identity(spec, snapshot)
     lease_path = interface_lease_path(spec, identity["netns"])
+    traffic_oracle = iperf_checker_contract()
     guard_commands = [
         {"label": label, "argv": argv, "timeout_seconds": 20, "write_set": []}
         for label, argv in write_guard_command_table(spec)
@@ -1235,6 +1298,7 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         "spec": spec.as_dict(),
         "snapshot_commands": snapshot_commands,
         "baseline": snapshot,
+        "traffic_oracle": traffic_oracle,
         "interface_lease": {
             "path": lease_path,
             "identity": identity,
@@ -1386,6 +1450,15 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
     baseline = plan.get("baseline")
     if not isinstance(baseline, dict):
         raise HarnessError("approved plan has no baseline")
+    oracle_contract = plan.get("traffic_oracle")
+    if (
+        not isinstance(oracle_contract, dict)
+        or oracle_contract.get("path") != iperf_checker_path()
+        or not isinstance(oracle_contract.get("sha256"), str)
+        or not SHA256_RE.fullmatch(oracle_contract["sha256"])
+        or set(oracle_contract) != {"path", "sha256"}
+    ):
+        raise HarnessError("approved plan traffic oracle contract is not exact")
     expected_identity = lease_identity(spec, baseline)
     expected_lease_path = interface_lease_path(spec, expected_identity["netns"])
     expected_guard = [
@@ -1444,6 +1517,29 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
                 validate_step(step, filesystem_set)
                 if looks_like_network_write(step["argv"]) and not is_owned_network_write(step["argv"], spec):
                     raise HarnessError("planned network write is outside the exact owned interface knobs")
+                oracle = step.get("oracle")
+                if step.get("kind") == "iperf":
+                    if not isinstance(oracle, dict):
+                        raise HarnessError("iperf step has no strict oracle")
+                    validate_step(oracle, filesystem_set)
+                    if (
+                        oracle.get("kind") != "iperf-oracle"
+                        or oracle.get("direction") != step.get("direction")
+                        or oracle.get("streams") != step.get("streams")
+                        or oracle.get("program_path") != oracle_contract["path"]
+                        or oracle.get("program_sha256") != oracle_contract["sha256"]
+                        or oracle["argv"][:5]
+                        != [
+                            TOOLS["python3"],
+                            "-I",
+                            oracle_contract["path"],
+                            "one",
+                            step["stdout"],
+                        ]
+                    ):
+                        raise HarnessError("iperf oracle does not match its exact traffic step")
+                elif oracle is not None:
+                    raise HarnessError("non-iperf step unexpectedly has a traffic oracle")
         recovery_steps = cell.get("recovery_restore")
         if not isinstance(recovery_steps, list):
             raise HarnessError(f"cell {cell['name']} has invalid recovery_restore")
@@ -1948,6 +2044,16 @@ def execute_step(
         if spec is None or lease is None or not is_owned_network_write(step["argv"], spec):
             raise HarnessError("network write has no exact interface lease")
         lease.assert_owned_for_write(spec, runner, journal, step["argv"])
+    program_path = step.get("program_path")
+    program_sha256 = step.get("program_sha256")
+    if program_path is not None or program_sha256 is not None:
+        if (
+            not isinstance(program_path, str)
+            or not isinstance(program_sha256, str)
+            or not SHA256_RE.fullmatch(program_sha256)
+            or sha256_bytes(read_regular_file(program_path)) != program_sha256
+        ):
+            raise HarnessError(f"planned program identity changed for {step['label']}")
     try:
         rc, stdout, stderr = runner.capture(step["argv"], timeout=step["timeout_seconds"])
     except HarnessError as exc:
@@ -2043,62 +2149,41 @@ def execute_recovery_step(
         raise HarnessError(f"recovery command {step['label']} failed rc={rc}")
 
 
-def jain_fairness(values: Sequence[float]) -> float:
-    positives = [value for value in values if value > 0]
-    if not positives:
-        return 0.0
-    return sum(positives) ** 2 / (len(positives) * sum(value * value for value in positives))
+def iperf_oracle_metrics(payload: bytes, streams: int, direction: str) -> list[dict[str, Any]]:
+    groups = parse_json_output(payload, "strict iperf oracle")
+    wanted_directions = {"forward", "reverse"} if direction == "bidir" else {direction}
+    if not isinstance(groups, list) or len(groups) != len(wanted_directions):
+        raise HarnessError("strict iperf oracle returned an incomplete direction set")
+    observed: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for group in groups:
+        if (
+            not isinstance(group, dict)
+            or group.get("direction") not in wanted_directions
+            or not isinstance(group.get("received_bytes"), int)
+            or group["received_bytes"] <= 0
+            or not isinstance(group.get("throughput_mbps"), (int, float))
+            or group["throughput_mbps"] <= 0
+            or not isinstance(group.get("retransmits"), int)
+            or group["retransmits"] < 0
+            or not isinstance(group.get("fairness"), (int, float))
+            or not 0.90 <= group["fairness"] <= 1.0
+        ):
+            raise HarnessError("strict iperf oracle returned malformed metrics")
+        observed.add(group["direction"])
+        normalized.append({**group, "streams": streams})
+    if observed != wanted_directions:
+        raise HarnessError("strict iperf oracle direction set differs from the reviewed argv")
+    return normalized
 
 
-def iperf_metrics(payload: bytes, streams: int, *, soak: bool) -> dict[str, Any]:
-    document = parse_json_output(payload, "iperf3")
-    if not isinstance(document, dict) or document.get("error"):
-        raise HarnessError(f"iperf3 JSON reports an error: {document.get('error') if isinstance(document, dict) else 'invalid'}")
-    end = document.get("end")
-    if not isinstance(end, dict):
-        raise HarnessError("iperf3 JSON has no end object")
-    raw_streams = end.get("streams", [])
-    rates: list[float] = []
-    total_bytes = 0
-    retransmits = 0
-    if isinstance(raw_streams, list):
-        for stream in raw_streams:
-            if not isinstance(stream, dict):
-                continue
-            sender = stream.get("sender")
-            if not isinstance(sender, dict):
-                continue
-            rate = sender.get("bits_per_second")
-            byte_count = sender.get("bytes")
-            if isinstance(rate, (int, float)) and rate > 0:
-                rates.append(float(rate))
-            if isinstance(byte_count, int) and byte_count > 0:
-                total_bytes += byte_count
-            retransmit = sender.get("retransmits", 0)
-            if isinstance(retransmit, int) and retransmit >= 0:
-                retransmits += retransmit
-    if len(rates) < streams or total_bytes <= 0:
-        raise HarnessError("iperf3 did not report nonzero data for every requested stream")
-    groups = [rates[index : index + streams] for index in range(0, len(rates), streams)]
-    fairness = min(jain_fairness(group) for group in groups if group)
-    if streams > 1 and fairness < 0.90:
-        raise HarnessError(f"iperf3 Jain fairness {fairness:.6f} is below 0.90")
-    start = document.get("start", {})
-    mss = start.get("tcp_mss_default", 1448) if isinstance(start, dict) else 1448
-    if not isinstance(mss, int) or mss <= 0:
-        mss = 1448
-    estimated_segments = max(1.0, total_bytes / mss)
-    retransmit_rate = retransmits / estimated_segments
-    limit = 0.001 if soak else 0.0001
-    if retransmit_rate > limit:
-        raise HarnessError(f"iperf3 estimated retransmit rate {retransmit_rate:.8f} exceeds {limit:.4f}")
-    return {
-        "bytes": total_bytes,
-        "sender_streams": len(rates),
-        "jain_fairness": fairness,
-        "retransmits": retransmits,
-        "estimated_retransmit_rate": retransmit_rate,
-    }
+def run_iperf_step(
+    step: Mapping[str, Any], runner: CommandRunner, journal: Journal
+) -> tuple[int, list[dict[str, Any]]]:
+    rc, _, _ = execute_step(step, runner, journal)
+    oracle = step["oracle"]
+    _, oracle_stdout, _ = execute_step(oracle, runner, journal)
+    return rc, iperf_oracle_metrics(oracle_stdout, step["streams"], step["direction"])
 
 
 def ping_metrics(payload: bytes) -> dict[str, Any]:
@@ -2161,11 +2246,13 @@ def run_traffic(
     results: list[dict[str, Any]] = []
     if cell["kind"] != "tcp-soak":
         for step in steps:
-            rc, stdout, _ = execute_step(step, runner, journal)
-            result: dict[str, Any] = {"label": step["label"], "rc": rc}
             if step.get("kind") == "iperf":
-                result["metrics"] = iperf_metrics(stdout, step["streams"], soak=False)
-            elif step["argv"][-1] == READ_ONLY_PEER and TOOLS["ping"] in step["argv"] and rc == 0:
+                rc, metrics = run_iperf_step(step, runner, journal)
+                result: dict[str, Any] = {"label": step["label"], "rc": rc, "metrics": metrics}
+            else:
+                rc, stdout, _ = execute_step(step, runner, journal)
+                result = {"label": step["label"], "rc": rc}
+            if step.get("kind") != "iperf" and step["argv"][-1] == READ_ONLY_PEER and TOOLS["ping"] in step["argv"] and rc == 0:
                 result["metrics"] = ping_metrics(stdout)
             results.append(result)
         return results
@@ -2181,12 +2268,12 @@ def run_traffic(
         )
         try:
             for step in steps[1:]:
-                rc, stdout, _ = execute_step(step, runner, journal)
+                rc, metrics = run_iperf_step(step, runner, journal)
                 results.append(
                     {
                         "label": step["label"],
                         "rc": rc,
-                        "metrics": iperf_metrics(stdout, step["streams"], soak=True),
+                        "metrics": metrics,
                     }
                 )
             rc, stdout, _ = execute_started_result(monitor, process, journal)

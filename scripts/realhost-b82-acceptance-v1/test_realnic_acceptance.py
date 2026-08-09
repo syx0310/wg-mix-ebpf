@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import unittest
 from unittest import mock
 
@@ -23,6 +24,13 @@ assert SPEC and SPEC.loader
 MODULE = importlib.util.module_from_spec(SPEC)
 sys.modules[SPEC.name] = MODULE
 SPEC.loader.exec_module(MODULE)
+
+CHECKER_MODULE_PATH = pathlib.Path(MODULE.iperf_checker_path())
+CHECKER_SPEC = importlib.util.spec_from_file_location("realhost_iperf_checker", CHECKER_MODULE_PATH)
+assert CHECKER_SPEC and CHECKER_SPEC.loader
+CHECKER_MODULE = importlib.util.module_from_spec(CHECKER_SPEC)
+sys.modules[CHECKER_SPEC.name] = CHECKER_MODULE
+CHECKER_SPEC.loader.exec_module(CHECKER_MODULE)
 
 
 class FixtureRunner(MODULE.CommandRunner):
@@ -101,16 +109,48 @@ class SimulatedRunner(FixtureRunner):
 
     def iperf_output(self, argv):
         streams = int(argv[argv.index("-P") + 1])
-        count = streams * (2 if "--bidir" in argv else 1)
+        direction = "bidir" if "--bidir" in argv else "reverse" if "-R" in argv else "forward"
+        markers = [True] * streams
+        if direction == "reverse":
+            markers = [False] * streams
+        elif direction == "bidir":
+            markers += [False] * streams
+        rows = [
+            {
+                "sender": {
+                    "sender": marker,
+                    "bytes": 10_000_000,
+                    "bits_per_second": 80_000_000,
+                    "retransmits": 0,
+                },
+                "receiver": {
+                    "sender": marker,
+                    "bytes": 10_000_000,
+                    "bits_per_second": 80_000_000,
+                },
+            }
+            for marker in markers
+        ]
+        summary = {"bytes": 10_000_000 * streams, "seconds": 1.0}
+        sent_summary = {"bytes": 10_000_000 * streams, "seconds": 1.0, "retransmits": 0}
         document = {
-            "start": {"tcp_mss_default": 1448},
+            "start": {
+                "tcp_mss_default": 1448,
+                "test_start": {
+                    "num_streams": streams,
+                    "reverse": 1 if direction == "reverse" else 0,
+                    "bidir": 1 if direction == "bidir" else 0,
+                },
+            },
             "end": {
-                "streams": [
-                    {"sender": {"bytes": 10_000_000, "bits_per_second": 80_000_000, "retransmits": 0}}
-                    for _ in range(count)
-                ]
+                "streams": rows,
+                "sum_sent": sent_summary,
+                "sum_received": summary,
             },
         }
+        if direction == "bidir":
+            document["end"]["sum_sent_bidir_reverse"] = sent_summary
+            document["end"]["sum_received_bidir_reverse"] = summary
         return MODULE.canonical_json(document)
 
     def capture(self, argv, timeout=20):
@@ -152,6 +192,21 @@ class SimulatedRunner(FixtureRunner):
             if self.fail_iperf_call == self.iperf_calls:
                 return 1, b'{"error":"injected failure"}\n', b""
             return 0, self.iperf_output(argv), b""
+        if argv[:3] == [MODULE.TOOLS["python3"], "-I", MODULE.iperf_checker_path()]:
+            options = dict(zip(argv[5::2], argv[6::2]))
+            args = types.SimpleNamespace(
+                path=pathlib.Path(argv[4]),
+                direction=options["--direction"],
+                streams=int(options["--streams"]),
+                minimum_bytes=int(options["--minimum-bytes"]),
+                minimum_fairness=float(options["--minimum-fairness"]),
+                maximum_retransmit_rate=float(options["--maximum-retransmit-rate"]),
+            )
+            try:
+                output = CHECKER_MODULE.check_one(args)
+            except CHECKER_MODULE.CheckError as exc:
+                return 1, b"", f"FAIL: {exc}\n".encode()
+            return 0, MODULE.canonical_json(output), b""
         if MODULE.TOOLS["ping"] in argv:
             payload = int(argv[argv.index("-s") + 1]) if "-s" in argv else 56
             if payload > self.mtu - 28:
@@ -425,6 +480,56 @@ class ProcessGroupTests(unittest.TestCase):
         process._collect_output = mock.Mock(side_effect=MODULE.HarnessError("drain failed"))
         with self.assertRaisesRegex(MODULE.HarnessError, "drain failed"):
             process.converge(term_timeout=0.1, kill_timeout=0.1)
+
+
+class StrictIperfOracleTests(unittest.TestCase):
+    def test_bidir_requires_2p_directions_receivers_and_summaries(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = f"{temporary}/run-"
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix):
+                spec = fixture_spec(run_root=f"{prefix}a1b2c3d4")
+                pathlib.Path(spec.run_root, "logs").mkdir(parents=True)
+                step = next(
+                    item
+                    for item in MODULE.iperf_steps(spec, "strict")
+                    if item["streams"] == 4 and item["direction"] == "bidir"
+                )
+            runner = SimulatedRunner(spec)
+            valid = json.loads(runner.iperf_output(step["argv"]))
+            cases = {}
+
+            incomplete = json.loads(json.dumps(valid))
+            incomplete["end"]["streams"] = incomplete["end"]["streams"][:4]
+            cases["count"] = (incomplete, "count=4, want 8")
+
+            one_direction = json.loads(json.dumps(valid))
+            for stream in one_direction["end"]["streams"]:
+                stream["sender"]["sender"] = True
+                stream["receiver"]["sender"] = True
+            cases["direction"] = (one_direction, "stream count is incomplete")
+
+            no_receive = json.loads(json.dumps(valid))
+            no_receive["end"]["streams"][0]["receiver"]["bytes"] = 0
+            no_receive["end"]["sum_received"]["bytes"] -= 10_000_000
+            cases["receiver"] = (no_receive, "Jain fairness")
+
+            bad_summary = json.loads(json.dumps(valid))
+            bad_summary["end"]["sum_received"]["bytes"] += 1
+            cases["summary"] = (bad_summary, "summary mismatch")
+
+            for name, (document, reason) in cases.items():
+                with self.subTest(name=name):
+                    pathlib.Path(step["stdout"]).write_bytes(MODULE.canonical_json(document))
+                    rc, _, stderr = MODULE.CommandRunner().capture(step["oracle"]["argv"], timeout=30)
+                    self.assertEqual(rc, 1)
+                    self.assertIn(reason, stderr.decode())
+
+            pathlib.Path(step["stdout"]).write_bytes(MODULE.canonical_json(valid))
+            rc, stdout, stderr = MODULE.CommandRunner().capture(step["oracle"]["argv"], timeout=30)
+            self.assertEqual((rc, stderr), (0, b""))
+            groups = MODULE.iperf_oracle_metrics(stdout, 4, "bidir")
+            self.assertEqual({group["direction"] for group in groups}, {"forward", "reverse"})
+            self.assertTrue(all(group["streams"] == 4 for group in groups))
 
 
 class PlannerTests(unittest.TestCase):
