@@ -1407,8 +1407,14 @@ proc transport_main {arguments} {
                 append captured_output $expect_out(buffer)
                 emit_safe $expect_out(buffer) $password
             }
-            set wait_status [wait]
-            set child_rc [lindex $wait_status 3]
+            if {[catch {wait -i $spawn_id} wait_status]} {
+                set password ""
+                fail "child-wait-status" 78
+            }
+            if {[catch {clean_child_exit_status $wait_status} child_rc]} {
+                set password ""
+                fail "child-wait-status" 78
+            }
             if {$child_rc != 0} {
                 set password ""
                 if {$assertion in {provision-check provision-apply}} {
