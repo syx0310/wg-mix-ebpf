@@ -16,6 +16,7 @@ const (
 	fakeTCPRealHostXDPModeEnv        = "WG_MIX_FAKETCP_REALHOST_XDP_MODE"
 	fakeTCPRealHostRunIDEnv          = "WG_MIX_FAKETCP_REALHOST_RUN_ID"
 	fakeTCPRealHostTempRootEnv       = "TMPDIR"
+	fakeTCPRealHostStageRoot         = "/run/wg-mix-ebpf-source-stages"
 )
 
 // fakeTCPRealHostContract is intentionally limited to values supplied by the
@@ -69,6 +70,16 @@ func parseFakeTCPRealHostContract(lookup fakeTCPRealHostEnvLookup) (fakeTCPRealH
 		}
 		return value, nil
 	}
+	runID, err := require(fakeTCPRealHostRunIDEnv)
+	if err != nil {
+		return fakeTCPRealHostContract{}, err
+	}
+	if !validFakeTCPRealHostRunID(runID) {
+		return fakeTCPRealHostContract{}, fmt.Errorf(
+			"%s must be exactly eight lower-case nonzero hexadecimal characters",
+			fakeTCPRealHostRunIDEnv,
+		)
+	}
 
 	experimentalObject, err := require(fakeTCPRealHostObjectEnv)
 	if err != nil {
@@ -78,7 +89,7 @@ func parseFakeTCPRealHostContract(lookup fakeTCPRealHostEnvLookup) (fakeTCPRealH
 	if err != nil {
 		return fakeTCPRealHostContract{}, err
 	}
-	if err := validateFakeTCPRealHostObjectPaths(experimentalObject, baselineObject); err != nil {
+	if err := validateFakeTCPRealHostObjectPaths(experimentalObject, baselineObject, runID); err != nil {
 		return fakeTCPRealHostContract{}, err
 	}
 
@@ -118,16 +129,6 @@ func parseFakeTCPRealHostContract(lookup fakeTCPRealHostEnvLookup) (fakeTCPRealH
 		)
 	}
 
-	runID, err := require(fakeTCPRealHostRunIDEnv)
-	if err != nil {
-		return fakeTCPRealHostContract{}, err
-	}
-	if !validFakeTCPRealHostRunID(runID) {
-		return fakeTCPRealHostContract{}, fmt.Errorf(
-			"%s must be exactly eight lower-case nonzero hexadecimal characters",
-			fakeTCPRealHostRunIDEnv,
-		)
-	}
 	tempRoot, err := require(fakeTCPRealHostTempRootEnv)
 	if err != nil {
 		return fakeTCPRealHostContract{}, err
@@ -152,7 +153,8 @@ func parseFakeTCPRealHostContract(lookup fakeTCPRealHostEnvLookup) (fakeTCPRealH
 	}, nil
 }
 
-func validateFakeTCPRealHostObjectPaths(experimentalObject, baselineObject string) error {
+func validateFakeTCPRealHostObjectPaths(experimentalObject, baselineObject, runID string) error {
+	expectedBuildRoot := filepath.Join(fakeTCPRealHostStageRoot, runID, "source", "build")
 	for _, object := range []struct {
 		name     string
 		path     string
@@ -167,8 +169,12 @@ func validateFakeTCPRealHostObjectPaths(experimentalObject, baselineObject strin
 		if filepath.Base(object.path) != object.basename {
 			return fmt.Errorf("%s basename must be %s", object.name, object.basename)
 		}
-		if filepath.Base(filepath.Dir(object.path)) != "build" {
-			return fmt.Errorf("%s must be an artifact directly below the reviewed build directory", object.name)
+		if filepath.Dir(object.path) != expectedBuildRoot {
+			return fmt.Errorf(
+				"%s must be an artifact directly below the reviewed v6 build directory %s",
+				object.name,
+				expectedBuildRoot,
+			)
 		}
 	}
 	if experimentalObject == baselineObject {
@@ -210,12 +216,12 @@ func validateFakeTCPRealHostTempRoot(tempRoot, runID string) error {
 	if !filepath.IsAbs(tempRoot) || filepath.Clean(tempRoot) != tempRoot {
 		return fmt.Errorf("%s must be a clean absolute path", fakeTCPRealHostTempRootEnv)
 	}
-	if filepath.Base(tempRoot) != "go-tmp-realhost" ||
-		filepath.Base(filepath.Dir(tempRoot)) != runID {
+	expectedTempRoot := filepath.Join(fakeTCPRealHostStageRoot, runID, "go-tmp-realhost")
+	if tempRoot != expectedTempRoot {
 		return fmt.Errorf(
-			"%s must be the reviewed go-tmp-realhost directory directly below run %s",
+			"%s must be the reviewed v6 temporary directory %s",
 			fakeTCPRealHostTempRootEnv,
-			runID,
+			expectedTempRoot,
 		)
 	}
 	return nil

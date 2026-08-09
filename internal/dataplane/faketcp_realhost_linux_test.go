@@ -31,7 +31,31 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-const fakeTCPRealHostObjectSizeLimit = 128 << 20
+const (
+	fakeTCPRealHostObjectSizeLimit              = 128 << 20
+	fakeTCPRealHostStatCount                    = 17
+	fakeTCPRealHostStatEgressOK                 = uint32(0)
+	fakeTCPRealHostStatIngressOK                = uint32(1)
+	fakeTCPRealHostStatGSOReject                = uint32(5)
+	fakeTCPRealHostStatChecksumNoneAccepted     = uint32(13)
+	fakeTCPRealHostStatChecksumPartialReset     = uint32(14)
+	fakeTCPRealHostCoreStatEgressRewriteOK      = uint32(0)
+	fakeTCPRealHostCoreStatIngressRewriteOK     = uint32(6)
+	fakeTCPRealHostCoreStatEgressGSOSeen        = uint32(15)
+	fakeTCPRealHostCoreStatEgressGSOManagedSeen = uint32(16)
+	fakeTCPRealHostCoreStatXOREgressOK          = uint32(24)
+	fakeTCPRealHostCoreStatXORIngressOK         = uint32(25)
+	fakeTCPRealHostVirtioNetHeaderSize          = 10
+	fakeTCPRealHostEthernetHeaderSize           = 14
+	fakeTCPRealHostIPv4HeaderSize               = 20
+	fakeTCPRealHostUDPHeaderSize                = 8
+	fakeTCPRealHostVirtioChecksumStart          = fakeTCPRealHostEthernetHeaderSize + fakeTCPRealHostIPv4HeaderSize
+	fakeTCPRealHostVirtioChecksumOffset         = 6
+	// Linux packet_snd requires hdr_len to cover the checksum field when
+	// NEEDS_CSUM is set: csum_start + csum_offset + sizeof(__sum16) = 42.
+	fakeTCPRealHostVirtioHeaderLength        = fakeTCPRealHostVirtioChecksumStart + fakeTCPRealHostUDPHeaderSize
+	fakeTCPRealHostVirtioGSOSize      uint16 = 32
+)
 
 type fakeTCPRealHostPrepared struct {
 	contract         fakeTCPRealHostContract
@@ -59,6 +83,62 @@ type fakeTCPRealHostSlowPath struct {
 	stop      chan struct{}
 	startOnce sync.Once
 	stopOnce  sync.Once
+}
+
+func TestFakeTCPRealHostVirtioNetHeaderEncoding(t *testing.T) {
+	packet := make([]byte, 128)
+	partial := prependFakeTCPRealHostVirtioNetHeader(
+		t, packet, unix.VIRTIO_NET_HDR_GSO_NONE, 0,
+	)
+	if got, want := partial[:fakeTCPRealHostVirtioNetHeaderSize], []byte{
+		unix.VIRTIO_NET_HDR_F_NEEDS_CSUM,
+		unix.VIRTIO_NET_HDR_GSO_NONE,
+		42, 0,
+		0, 0,
+		34, 0,
+		6, 0,
+	}; !bytes.Equal(got, want) {
+		t.Fatalf("CHECKSUM_PARTIAL virtio header=%v, want %v", got, want)
+	}
+	if !bytes.Equal(partial[fakeTCPRealHostVirtioNetHeaderSize:], packet) {
+		t.Fatal("CHECKSUM_PARTIAL virtio header changed frame bytes")
+	}
+
+	gso := prependFakeTCPRealHostVirtioNetHeader(
+		t, packet, unix.VIRTIO_NET_HDR_GSO_UDP_L4, fakeTCPRealHostVirtioGSOSize,
+	)
+	if got, want := gso[:fakeTCPRealHostVirtioNetHeaderSize], []byte{
+		unix.VIRTIO_NET_HDR_F_NEEDS_CSUM,
+		unix.VIRTIO_NET_HDR_GSO_UDP_L4,
+		42, 0,
+		32, 0,
+		34, 0,
+		6, 0,
+	}; !bytes.Equal(got, want) {
+		t.Fatalf("UDP_L4 GSO virtio header=%v, want %v", got, want)
+	}
+	if !bytes.Equal(gso[fakeTCPRealHostVirtioNetHeaderSize:], packet) {
+		t.Fatal("UDP_L4 GSO virtio header changed frame bytes")
+	}
+
+	udpFrame, _ := buildFakeTCPProbeUDPPacket(t, 31001, 31002, 67)
+	if !fakeTCPRealHostFlowFrameMatches(udpFrame, 31001, 31002, 67) ||
+		fakeTCPRealHostFlowFrameMatches(udpFrame, 31001, 31002, 66) {
+		t.Fatal("UDP negative-output matcher did not bind the exact payload length")
+	}
+	tcpFrame := make([]byte, fakeTCPRealHostEthernetHeaderSize+
+		fakeTCPRealHostIPv4HeaderSize+20+67)
+	copy(tcpFrame[:fakeTCPRealHostEthernetHeaderSize], udpFrame[:fakeTCPRealHostEthernetHeaderSize])
+	copy(tcpFrame[fakeTCPRealHostEthernetHeaderSize:], udpFrame[fakeTCPRealHostEthernetHeaderSize:])
+	ip := tcpFrame[fakeTCPRealHostEthernetHeaderSize:]
+	ip[9] = 6
+	binary.BigEndian.PutUint16(ip[2:4], uint16(fakeTCPRealHostIPv4HeaderSize+20+67))
+	binary.BigEndian.PutUint16(ip[fakeTCPRealHostIPv4HeaderSize:], 31001)
+	binary.BigEndian.PutUint16(ip[fakeTCPRealHostIPv4HeaderSize+2:], 31002)
+	if !fakeTCPRealHostFlowFrameMatches(tcpFrame, 31001, 31002, 67) ||
+		fakeTCPRealHostFlowFrameMatches(tcpFrame, 31001, 31002, 65) {
+		t.Fatal("TCP negative-output matcher did not bind the exact payload length")
+	}
 }
 
 func newFakeTCPRealHostSlowPath() *fakeTCPRealHostSlowPath {
@@ -240,13 +320,13 @@ func TestExperimentalFakeTCPRealHostLifecycleIntegration(t *testing.T) {
 	t.Logf("FAKETCP_REALHOST_LIFECYCLE_COMPLETE run_id=%s restored=1", prepared.contract.runID)
 }
 
-// TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration sends one
-// materialized CHECKSUM_NONE Ethernet/IPv4/UDP frame through the exact veth
-// pair. The AF_PACKET observation must equal one of the two reviewed receive
-// images (post-XDP encrypted UDP or post-TCX restored UDP), and the FakeTCP,
-// core, and XOR success counters must each advance exactly once with no error
-// growth. Together those oracles cover header conversion, type-word mapping,
-// XOR, inverse XOR, inverse type-word mapping, and checksum restoration.
+// TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration sends exact
+// Ethernet/IPv4/UDP frames through the controller-owned veth pair in three
+// checksum/offload states. A materialized CHECKSUM_NONE frame and a
+// PACKET_VNET_HDR CHECKSUM_PARTIAL frame must both complete the FakeTCP, XOR
+// and type-word round trip. A PACKET_VNET_HDR UDP GSO frame must be rejected
+// before mutation and produce no peer observation. Exact stats distinguish the
+// two checksum admissions and the GSO fail-closed path.
 func TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration(t *testing.T) {
 	prepared := requireFakeTCPRealHostPrepared(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
@@ -268,14 +348,10 @@ func TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration(t *testing.T) {
 		t.Fatal(err)
 	}
 	installFakeTCPRealHostSessions(t, handles, runtime.Generation(), prepared.contract)
-	beforeEgress := readFakeTCPRealHostStat(t, runtime, 0)
-	beforeIngress := readFakeTCPRealHostStat(t, runtime, 1)
-	beforeCoreEgress := readFakeTCPRealHostCoreStat(t, runtime, 0)
-	beforeCoreIngress := readFakeTCPRealHostCoreStat(t, runtime, 6)
-	beforeXOREgress := readFakeTCPRealHostCoreStat(t, runtime, 24)
-	beforeXORIngress := readFakeTCPRealHostCoreStat(t, runtime, 25)
-	fakeErrorsBefore := readFakeTCPRealHostStats(t, runtime, "faketcp_stats_map", 13)
-	coreErrorsBefore := readFakeTCPRealHostStats(t, runtime, "stats_map", 36)
+	fakeStatsBefore := readFakeTCPRealHostStats(
+		t, runtime, "faketcp_stats_map", fakeTCPRealHostStatCount,
+	)
+	coreStatsBefore := readFakeTCPRealHostStats(t, runtime, "stats_map", 36)
 
 	local, err := netlink.LinkByIndex(prepared.contract.ifindex)
 	if err != nil {
@@ -285,81 +361,101 @@ func TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	packet, originalPayload := buildFakeTCPProbeUDPPacket(t, 31001, 31002, 65)
-	copy(packet[0:6], peer.Attrs().HardwareAddr)
-	copy(packet[6:12], local.Attrs().HardwareAddr)
-
 	receiver := openFakeTCPRealHostPacketSocket(t, prepared.contract.peerIfindex)
 	defer closeFakeTCPRealHostFD(t, receiver, "peer packet socket")
 	sender := openFakeTCPRealHostPacketSocket(t, prepared.contract.ifindex)
 	defer closeFakeTCPRealHostFD(t, sender, "sender packet socket")
-	if err := unix.Sendto(sender, packet, 0, &unix.SockaddrLinklayer{
-		Protocol: fakeTCPRealHostHTONS(unix.ETH_P_IP),
-		Ifindex:  prepared.contract.ifindex,
-	}); err != nil {
-		t.Fatalf("send run-owned veth frame: %v", err)
-	}
-	receiveCtx, stopReceive := context.WithTimeout(ctx, 10*time.Second)
-	defer stopReceive()
-	received, err := receiveFakeTCPRealHostUDPPacket(receiveCtx, receiver, 31001, 31002)
-	if err != nil {
-		t.Fatal(err)
-	}
-	const payloadOffset = 14 + 20 + 8
-	if len(received) < payloadOffset+len(originalPayload) {
-		t.Fatalf("FakeTCP+XOR+type-word observation is short: %d", len(received))
-	}
-	encryptedPayload := append([]byte(nil), originalPayload...)
-	binary.LittleEndian.PutUint32(encryptedPayload[:4], 0x13dff06b)
-	for index := range encryptedPayload {
-		encryptedPayload[index] ^= byte(index*17 + 5)
-	}
-	observedPayload := received[payloadOffset : payloadOffset+len(originalPayload)]
-	// AF_PACKET taps are kernel-order dependent relative to clsact ingress.
-	// Seeing encryptedPayload proves the post-XDP/pre-TCX image; seeing the
-	// original proves the post-TCX image. The four exact success counters below
-	// are mandatory in either case and prove that both halves completed.
-	if !bytes.Equal(observedPayload, encryptedPayload) && !bytes.Equal(observedPayload, originalPayload) {
-		t.Fatalf("FakeTCP+XOR+type-word observation is neither reviewed pipeline image: got=%x encrypted=%x original=%x",
-			observedPayload, encryptedPayload, originalPayload)
-	}
-	waitForFakeTCPRealHostStat(t, runtime, "stats_map", 25, beforeXORIngress+1)
-	if after := readFakeTCPRealHostStat(t, runtime, 0); after != beforeEgress+1 {
-		t.Fatalf("FakeTCP egress success delta=%d, want 1", after-beforeEgress)
-	}
-	if after := readFakeTCPRealHostStat(t, runtime, 1); after != beforeIngress+1 {
-		t.Fatalf("FakeTCP ingress success delta=%d, want 1", after-beforeIngress)
-	}
-	for _, success := range []struct {
-		name   string
-		key    uint32
-		before uint64
-	}{
-		{"core egress rewrite", 0, beforeCoreEgress},
-		{"core ingress rewrite", 6, beforeCoreIngress},
-		{"XOR egress", 24, beforeXOREgress},
-		{"XOR ingress", 25, beforeXORIngress},
-	} {
-		after := readFakeTCPRealHostCoreStat(t, runtime, success.key)
-		if after != success.before+1 {
-			t.Fatalf("%s success delta=%d, want 1", success.name, after-success.before)
-		}
-	}
-	fakeErrorsAfter := readFakeTCPRealHostStats(t, runtime, "faketcp_stats_map", 13)
-	for key := 2; key < len(fakeErrorsAfter); key++ {
-		if fakeErrorsAfter[key] != fakeErrorsBefore[key] {
-			t.Fatalf("FakeTCP error stat %d delta=%d, want 0", key, fakeErrorsAfter[key]-fakeErrorsBefore[key])
-		}
-	}
-	coreErrorsAfter := readFakeTCPRealHostStats(t, runtime, "stats_map", 36)
-	for key := range coreErrorsAfter {
-		if key == 0 || key == 6 || key == 24 || key == 25 {
-			continue
-		}
-		if coreErrorsAfter[key] != coreErrorsBefore[key] {
-			t.Fatalf("unexpected core stat %d delta=%d, want 0", key, coreErrorsAfter[key]-coreErrorsBefore[key])
-		}
-	}
+	vnetSender := openFakeTCPRealHostVNetPacketSocket(t, prepared.contract.ifindex)
+	defer closeFakeTCPRealHostFD(t, vnetSender, "vnet sender packet socket")
+	destinationMAC := peer.Attrs().HardwareAddr
+	sourceMAC := local.Attrs().HardwareAddr
+
+	packetNone, payloadNone := buildFakeTCPRealHostProbePacket(
+		t, destinationMAC, sourceMAC, 65,
+	)
+	sendFakeTCPRealHostPacket(t, sender, prepared.contract.ifindex, packetNone)
+	receivedNone := receiveFakeTCPRealHostProbePacket(t, ctx, receiver, len(payloadNone))
+	assertFakeTCPRealHostPipelineImage(t, receivedNone, payloadNone)
+	waitForFakeTCPRealHostStat(
+		t,
+		runtime,
+		"faketcp_stats_map",
+		fakeTCPRealHostStatChecksumNoneAccepted,
+		fakeStatsBefore[fakeTCPRealHostStatChecksumNoneAccepted]+1,
+	)
+	waitForFakeTCPRealHostStat(
+		t,
+		runtime,
+		"stats_map",
+		fakeTCPRealHostCoreStatXORIngressOK,
+		coreStatsBefore[fakeTCPRealHostCoreStatXORIngressOK]+1,
+	)
+
+	packetPartial, payloadPartial := buildFakeTCPRealHostProbePacket(
+		t, destinationMAC, sourceMAC, 66,
+	)
+	sendFakeTCPRealHostPacket(
+		t,
+		vnetSender,
+		prepared.contract.ifindex,
+		prependFakeTCPRealHostVirtioNetHeader(t, packetPartial, unix.VIRTIO_NET_HDR_GSO_NONE, 0),
+	)
+	receivedPartial := receiveFakeTCPRealHostProbePacket(t, ctx, receiver, len(payloadPartial))
+	assertFakeTCPRealHostPipelineImage(t, receivedPartial, payloadPartial)
+	waitForFakeTCPRealHostStat(
+		t,
+		runtime,
+		"faketcp_stats_map",
+		fakeTCPRealHostStatChecksumPartialReset,
+		fakeStatsBefore[fakeTCPRealHostStatChecksumPartialReset]+1,
+	)
+	waitForFakeTCPRealHostStat(
+		t,
+		runtime,
+		"stats_map",
+		fakeTCPRealHostCoreStatXORIngressOK,
+		coreStatsBefore[fakeTCPRealHostCoreStatXORIngressOK]+2,
+	)
+
+	packetGSO, payloadGSO := buildFakeTCPRealHostProbePacket(
+		t, destinationMAC, sourceMAC, 67,
+	)
+	sendFakeTCPRealHostPacket(
+		t,
+		vnetSender,
+		prepared.contract.ifindex,
+		prependFakeTCPRealHostVirtioNetHeader(
+			t, packetGSO, unix.VIRTIO_NET_HDR_GSO_UDP_L4, fakeTCPRealHostVirtioGSOSize,
+		),
+	)
+	waitForFakeTCPRealHostStat(
+		t,
+		runtime,
+		"faketcp_stats_map",
+		fakeTCPRealHostStatGSOReject,
+		fakeStatsBefore[fakeTCPRealHostStatGSOReject]+1,
+	)
+	assertNoFakeTCPRealHostProbePacket(t, receiver, len(payloadGSO))
+
+	fakeStatsAfter := readFakeTCPRealHostStats(
+		t, runtime, "faketcp_stats_map", fakeTCPRealHostStatCount,
+	)
+	assertFakeTCPRealHostStatDeltas(t, "FakeTCP", fakeStatsBefore, fakeStatsAfter, map[uint32]uint64{
+		fakeTCPRealHostStatEgressOK:             2,
+		fakeTCPRealHostStatIngressOK:            2,
+		fakeTCPRealHostStatGSOReject:            1,
+		fakeTCPRealHostStatChecksumNoneAccepted: 1,
+		fakeTCPRealHostStatChecksumPartialReset: 1,
+	})
+	coreStatsAfter := readFakeTCPRealHostStats(t, runtime, "stats_map", 36)
+	assertFakeTCPRealHostStatDeltas(t, "core", coreStatsBefore, coreStatsAfter, map[uint32]uint64{
+		fakeTCPRealHostCoreStatEgressRewriteOK:      2,
+		fakeTCPRealHostCoreStatIngressRewriteOK:     2,
+		fakeTCPRealHostCoreStatEgressGSOSeen:        1,
+		fakeTCPRealHostCoreStatEgressGSOManagedSeen: 1,
+		fakeTCPRealHostCoreStatXOREgressOK:          2,
+		fakeTCPRealHostCoreStatXORIngressOK:         2,
+	})
 
 	if err := runtime.Close(); err != nil {
 		t.Fatalf("close FakeTCP composition runtime: %v", err)
@@ -905,14 +1001,70 @@ func installFakeTCPRealHostSessions(
 	}
 }
 
-func readFakeTCPRealHostStat(t *testing.T, runtime *ExperimentalFakeTCPRuntime, key uint32) uint64 {
+func buildFakeTCPRealHostProbePacket(
+	t *testing.T,
+	destinationMAC net.HardwareAddr,
+	sourceMAC net.HardwareAddr,
+	payloadLength int,
+) ([]byte, []byte) {
 	t.Helper()
-	return readFakeTCPRealHostStats(t, runtime, "faketcp_stats_map", 13)[key]
+	if len(destinationMAC) != 6 || len(sourceMAC) != 6 {
+		t.Fatalf("FakeTCP real-host probe requires exact Ethernet addresses: destination=%x source=%x",
+			destinationMAC, sourceMAC)
+	}
+	packet, payload := buildFakeTCPProbeUDPPacket(t, 31001, 31002, payloadLength)
+	copy(packet[0:6], destinationMAC)
+	copy(packet[6:12], sourceMAC)
+	return packet, payload
 }
 
-func readFakeTCPRealHostCoreStat(t *testing.T, runtime *ExperimentalFakeTCPRuntime, key uint32) uint64 {
+func assertFakeTCPRealHostPipelineImage(t *testing.T, received, originalPayload []byte) {
 	t.Helper()
-	return readFakeTCPRealHostStats(t, runtime, "stats_map", 36)[key]
+	const payloadOffset = fakeTCPRealHostEthernetHeaderSize +
+		fakeTCPRealHostIPv4HeaderSize + fakeTCPRealHostUDPHeaderSize
+	if len(received) < payloadOffset+len(originalPayload) {
+		t.Fatalf("FakeTCP+XOR+type-word observation is short: %d", len(received))
+	}
+	encryptedPayload := append([]byte(nil), originalPayload...)
+	binary.LittleEndian.PutUint32(encryptedPayload[:4], 0x13dff06b)
+	for index := range encryptedPayload {
+		encryptedPayload[index] ^= byte(index*17 + 5)
+	}
+	observedPayload := received[payloadOffset : payloadOffset+len(originalPayload)]
+	// AF_PACKET taps are kernel-order dependent relative to clsact ingress.
+	// The encrypted image proves post-XDP/pre-TCX observation; the original
+	// image proves post-TCX observation. Exact success counters prove both
+	// pipeline halves completed in either case.
+	if !bytes.Equal(observedPayload, encryptedPayload) &&
+		!bytes.Equal(observedPayload, originalPayload) {
+		t.Fatalf("FakeTCP+XOR+type-word observation is neither reviewed pipeline image: got=%x encrypted=%x original=%x",
+			observedPayload, encryptedPayload, originalPayload)
+	}
+}
+
+func assertFakeTCPRealHostStatDeltas(
+	t *testing.T,
+	label string,
+	before []uint64,
+	after []uint64,
+	want map[uint32]uint64,
+) {
+	t.Helper()
+	if len(before) != len(after) {
+		t.Fatalf("%s stat snapshot lengths differ: before=%d after=%d", label, len(before), len(after))
+	}
+	for key := range want {
+		if int(key) >= len(before) {
+			t.Fatalf("%s expected stat key %d is outside snapshot length %d", label, key, len(before))
+		}
+	}
+	for key := range before {
+		expected := before[key] + want[uint32(key)]
+		if after[key] != expected {
+			t.Fatalf("%s stat %d=%d, want %d (delta %d)",
+				label, key, after[key], expected, want[uint32(key)])
+		}
+	}
 }
 
 func readFakeTCPRealHostStats(
@@ -989,6 +1141,74 @@ func openFakeTCPRealHostPacketSocket(t *testing.T, ifindex int) int {
 	return fd
 }
 
+func openFakeTCPRealHostVNetPacketSocket(t *testing.T, ifindex int) int {
+	t.Helper()
+	fd := openFakeTCPRealHostPacketSocket(t, ifindex)
+	if err := unix.SetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_VNET_HDR, 1); err != nil {
+		closeErr := unix.Close(fd)
+		t.Fatalf("enable PACKET_VNET_HDR on run-owned veth socket: %v", errors.Join(err, closeErr))
+	}
+	enabled, err := unix.GetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_VNET_HDR)
+	if err != nil {
+		closeErr := unix.Close(fd)
+		t.Fatalf("verify PACKET_VNET_HDR on run-owned veth socket: %v", errors.Join(err, closeErr))
+	}
+	headerSize, err := unix.GetsockoptInt(fd, unix.SOL_PACKET, unix.PACKET_VNET_HDR_SZ)
+	if err != nil {
+		closeErr := unix.Close(fd)
+		t.Fatalf("read PACKET_VNET_HDR_SZ on run-owned veth socket: %v", errors.Join(err, closeErr))
+	}
+	if enabled != 1 || headerSize != fakeTCPRealHostVirtioNetHeaderSize {
+		closeErr := unix.Close(fd)
+		t.Fatalf("PACKET_VNET_HDR contract enabled=%d size=%d, want enabled=1 size=%d: %v",
+			enabled, headerSize, fakeTCPRealHostVirtioNetHeaderSize, closeErr)
+	}
+	return fd
+}
+
+func prependFakeTCPRealHostVirtioNetHeader(
+	t *testing.T,
+	packet []byte,
+	gsoType uint8,
+	gsoSize uint16,
+) []byte {
+	t.Helper()
+	if len(packet) <= fakeTCPRealHostVirtioHeaderLength {
+		t.Fatalf("FakeTCP real-host virtio frame is too short: %d", len(packet))
+	}
+	switch gsoType {
+	case unix.VIRTIO_NET_HDR_GSO_NONE:
+		if gsoSize != 0 {
+			t.Fatalf("non-GSO virtio frame has GSO size %d", gsoSize)
+		}
+	case unix.VIRTIO_NET_HDR_GSO_UDP_L4:
+		if gsoSize == 0 || len(packet)-fakeTCPRealHostVirtioHeaderLength <= int(gsoSize) {
+			t.Fatalf("UDP L4 GSO frame payload=%d size=%d does not represent multiple segments",
+				len(packet)-fakeTCPRealHostVirtioHeaderLength, gsoSize)
+		}
+	default:
+		t.Fatalf("unsupported FakeTCP real-host virtio GSO type %d", gsoType)
+	}
+	header := make([]byte, fakeTCPRealHostVirtioNetHeaderSize)
+	header[0] = unix.VIRTIO_NET_HDR_F_NEEDS_CSUM
+	header[1] = gsoType
+	binary.LittleEndian.PutUint16(header[2:4], uint16(fakeTCPRealHostVirtioHeaderLength))
+	binary.LittleEndian.PutUint16(header[4:6], gsoSize)
+	binary.LittleEndian.PutUint16(header[6:8], uint16(fakeTCPRealHostVirtioChecksumStart))
+	binary.LittleEndian.PutUint16(header[8:10], fakeTCPRealHostVirtioChecksumOffset)
+	return append(header, packet...)
+}
+
+func sendFakeTCPRealHostPacket(t *testing.T, fd, ifindex int, packet []byte) {
+	t.Helper()
+	if err := unix.Sendto(fd, packet, 0, &unix.SockaddrLinklayer{
+		Protocol: fakeTCPRealHostHTONS(unix.ETH_P_IP),
+		Ifindex:  ifindex,
+	}); err != nil {
+		t.Fatalf("send run-owned veth frame: %v", err)
+	}
+}
+
 func closeFakeTCPRealHostFD(t *testing.T, fd int, label string) {
 	t.Helper()
 	if fd >= 0 {
@@ -1003,7 +1223,40 @@ func receiveFakeTCPRealHostUDPPacket(
 	fd int,
 	sourcePort uint16,
 	destinationPort uint16,
+	payloadLength int,
 ) ([]byte, error) {
+	return receiveFakeTCPRealHostPacket(ctx, fd, func(frame []byte) bool {
+		return fakeTCPRealHostUDPFrameMatches(
+			frame, sourcePort, destinationPort, payloadLength,
+		)
+	})
+}
+
+func receiveFakeTCPRealHostFlowPacket(
+	ctx context.Context,
+	fd int,
+	sourcePort uint16,
+	destinationPort uint16,
+	payloadLength int,
+) ([]byte, error) {
+	return receiveFakeTCPRealHostPacket(ctx, fd, func(frame []byte) bool {
+		return fakeTCPRealHostFlowFrameMatches(
+			frame, sourcePort, destinationPort, payloadLength,
+		)
+	})
+}
+
+func receiveFakeTCPRealHostPacket(
+	ctx context.Context,
+	fd int,
+	match func([]byte) bool,
+) ([]byte, error) {
+	if ctx == nil {
+		return nil, errors.New("receive FakeTCP real-host packet: context is nil")
+	}
+	if match == nil {
+		return nil, errors.New("receive FakeTCP real-host packet: matcher is nil")
+	}
 	buffer := make([]byte, 4096)
 	for {
 		if err := ctx.Err(); err != nil {
@@ -1043,13 +1296,82 @@ func receiveFakeTCPRealHostUDPPacket(
 			return nil, fmt.Errorf("receive FakeTCP real-host packet: %w", err)
 		}
 		frame := buffer[:length]
-		if fakeTCPRealHostUDPFrameMatches(frame, sourcePort, destinationPort) {
+		if match(frame) {
 			return append([]byte(nil), frame...), nil
 		}
 	}
 }
 
-func fakeTCPRealHostUDPFrameMatches(frame []byte, sourcePort, destinationPort uint16) bool {
+func receiveFakeTCPRealHostProbePacket(
+	t *testing.T,
+	parent context.Context,
+	fd int,
+	payloadLength int,
+) []byte {
+	t.Helper()
+	receiveCtx, stopReceive := context.WithTimeout(parent, 10*time.Second)
+	defer stopReceive()
+	received, err := receiveFakeTCPRealHostUDPPacket(
+		receiveCtx, fd, 31001, 31002, payloadLength,
+	)
+	if err != nil {
+		t.Fatalf("receive FakeTCP real-host payload length %d: %v", payloadLength, err)
+	}
+	return received
+}
+
+func assertNoFakeTCPRealHostProbePacket(t *testing.T, fd, payloadLength int) {
+	t.Helper()
+	receiveCtx, stopReceive := context.WithTimeout(t.Context(), 750*time.Millisecond)
+	defer stopReceive()
+	received, err := receiveFakeTCPRealHostFlowPacket(
+		receiveCtx, fd, 31001, 31002, payloadLength,
+	)
+	if err == nil {
+		t.Fatalf("GSO-rejected FakeTCP frame with input payload length %d reached peer: %x",
+			payloadLength, received)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("observe GSO-rejected FakeTCP frame: %v", err)
+	}
+}
+
+func fakeTCPRealHostFlowFrameMatches(
+	frame []byte,
+	sourcePort uint16,
+	destinationPort uint16,
+	payloadLength int,
+) bool {
+	if len(frame) < fakeTCPRealHostEthernetHeaderSize+fakeTCPRealHostIPv4HeaderSize+4 ||
+		frame[12] != 0x08 || frame[13] != 0x00 || payloadLength < 0 {
+		return false
+	}
+	ip := frame[fakeTCPRealHostEthernetHeaderSize:]
+	if ip[0] != 0x45 || (ip[9] != 6 && ip[9] != 17) ||
+		!bytes.Equal(ip[12:16], []byte{10, 0, 0, 1}) ||
+		!bytes.Equal(ip[16:20], []byte{10, 0, 0, 2}) {
+		return false
+	}
+	transportHeaderLength := fakeTCPRealHostUDPHeaderSize
+	if ip[9] == 6 {
+		transportHeaderLength = 20
+	}
+	expectedIPv4Length := fakeTCPRealHostIPv4HeaderSize + transportHeaderLength + payloadLength
+	if int(binary.BigEndian.Uint16(ip[2:4])) != expectedIPv4Length ||
+		len(frame) < fakeTCPRealHostEthernetHeaderSize+expectedIPv4Length {
+		return false
+	}
+	transport := ip[fakeTCPRealHostIPv4HeaderSize:]
+	return binary.BigEndian.Uint16(transport[0:2]) == sourcePort &&
+		binary.BigEndian.Uint16(transport[2:4]) == destinationPort
+}
+
+func fakeTCPRealHostUDPFrameMatches(
+	frame []byte,
+	sourcePort uint16,
+	destinationPort uint16,
+	payloadLength int,
+) bool {
 	if len(frame) < 14+20+8 || frame[12] != 0x08 || frame[13] != 0x00 {
 		return false
 	}
@@ -1059,7 +1381,10 @@ func fakeTCPRealHostUDPFrameMatches(frame []byte, sourcePort, destinationPort ui
 		return false
 	}
 	udp := ip[20:]
-	return uint16(udp[0])<<8|uint16(udp[1]) == sourcePort &&
+	return payloadLength >= 0 &&
+		int(binary.BigEndian.Uint16(ip[2:4])) == 20+8+payloadLength &&
+		int(binary.BigEndian.Uint16(udp[4:6])) == 8+payloadLength &&
+		uint16(udp[0])<<8|uint16(udp[1]) == sourcePort &&
 		uint16(udp[2])<<8|uint16(udp[3]) == destinationPort
 }
 
