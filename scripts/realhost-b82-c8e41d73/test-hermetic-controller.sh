@@ -30,6 +30,42 @@ readonly -a REALNIC_INTEGRATION_FILES=(
   scripts/realhost-b82-c8e41d73/prepare-stage-root.sh
   scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh
 )
+readonly REALNIC_MANAGED_INTEGRATION_MERGE='93cd6a890ef37d75e9d7a63ed3504a1bbf4b9796'
+readonly REALNIC_DURABLE_PARENT='1e8e183fe8ff0d295fe9c40e5b9573b5f23f4e7c'
+readonly MANAGED_CANONICAL_PARENT='4636302fd45dae8134faf7b0aec4adc0737c5f3e'
+readonly -a REALNIC_DURABLE_INTEGRATION_FILES=(
+  internal/dataplane/scoped_realnic_checker_contract_test.go
+  internal/dataplane/scoped_realnic_linux_test.go
+  scripts/realhost-b82-acceptance-v1/realnic_acceptance.py
+  scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py
+  scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py
+  scripts/realhost-b82-c8e41d73/bind-final-package.sh
+  scripts/realhost-b82-c8e41d73/check-realhost-iperf.py
+  scripts/realhost-b82-c8e41d73/controller.sh
+  scripts/realhost-b82-c8e41d73/locked-transport.exp
+  scripts/realhost-b82-c8e41d73/prepare-stage-root.sh
+  scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh
+  scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh
+  scripts/realhost-b82-c8e41d73/test-hermetic-controller.sh
+  scripts/realhost-b82-c8e41d73/test-hermetic-fresh-verifier-gate.sh
+  scripts/realhost-b82-c8e41d73/test-hermetic-matrix.sh
+  scripts/realhost-b82-c8e41d73/test_controller_static.py
+  scripts/realhost-b82-c8e41d73/test_fresh_verifier_gate_static.py
+  scripts/realhost-b82-c8e41d73/test_matrix_static.py
+)
+readonly -a MANAGED_EXACT_INTEGRATION_FILES=(
+  bpf/wg_mix_faketcp.h
+  internal/dataplane/faketcp_managed_ingress_contract_test.go
+  internal/dataplane/faketcp_managed_ingress_realhost_linux_test.go
+  internal/faketcp/controller.go
+  internal/faketcp/engine.go
+  internal/faketcp/engine_router.go
+  internal/faketcp/engine_router_test.go
+  internal/faketcp/runtime_domain.go
+  internal/faketcp/runtime_domain_test.go
+  scripts/realhost-b82-c8e41d73/root-veth-n-r.sh
+  scripts/realhost-b82-c8e41d73/test_veth_runner_static.py
+)
 readonly MODULE_LEASE_HELPER="${REVIEW_ROOT}/checksum-module-lease.sh"
 readonly PROVISION_POLICY_TEST="${REVIEW_ROOT}/test_provision_policy.tcl"
 readonly PROVISIONER="${REPOSITORY}/scripts/provision-ubuntu-test-host.sh"
@@ -179,6 +215,47 @@ readonly REALNIC_INTEGRATION_PARENTS
   "${REALNIC_INTEGRATION_MERGE}^1" "${REALNIC_INTEGRATION_MERGE}" -- \
   "${REALNIC_INTEGRATION_FILES[@]}" ||
   fail 'canonical merge rewrote a Stage B authority or manifest source blob'
+
+REALNIC_MANAGED_INTEGRATION_PARENTS="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P \
+  "${REALNIC_MANAGED_INTEGRATION_MERGE}")" || fail 'cannot read managed realNIC integration parents'
+readonly REALNIC_MANAGED_INTEGRATION_PARENTS
+[[ "${REALNIC_MANAGED_INTEGRATION_PARENTS}" == \
+  "${REALNIC_DURABLE_PARENT} ${MANAGED_CANONICAL_PARENT}" ]] ||
+  fail 'managed realNIC integration does not preserve the exact two-parent topology'
+/usr/bin/git -C "${REPOSITORY}" merge-base --is-ancestor \
+  "${REALNIC_MANAGED_INTEGRATION_MERGE}" HEAD ||
+  fail 'HEAD does not contain the managed realNIC integration merge'
+/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
+  "${REALNIC_DURABLE_PARENT}" "${REALNIC_MANAGED_INTEGRATION_MERGE}" -- \
+  "${REALNIC_DURABLE_INTEGRATION_FILES[@]}" ||
+  fail 'managed canonical merge rewrote a durable realNIC authority or manifest source blob'
+/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
+  "${MANAGED_CANONICAL_PARENT}" "${REALNIC_MANAGED_INTEGRATION_MERGE}" -- \
+  "${MANAGED_EXACT_INTEGRATION_FILES[@]}" ||
+  fail 'managed realNIC integration rewrote a non-conflicting managed-ingress blob'
+MANAGED_INTEGRATION_WRITE_SET="$(/usr/bin/git -C "${REPOSITORY}" diff --name-only \
+  "${REALNIC_DURABLE_PARENT}" "${REALNIC_MANAGED_INTEGRATION_MERGE}")" ||
+  fail 'cannot read managed realNIC integration write set'
+readonly MANAGED_INTEGRATION_WRITE_SET
+[[ "${MANAGED_INTEGRATION_WRITE_SET}" == $'bpf/wg_mix_faketcp.h\ninternal/dataplane/faketcp_managed_ingress_contract_test.go\ninternal/dataplane/faketcp_managed_ingress_realhost_linux_test.go\ninternal/faketcp/controller.go\ninternal/faketcp/engine.go\ninternal/faketcp/engine_router.go\ninternal/faketcp/engine_router_test.go\ninternal/faketcp/runtime_domain.go\ninternal/faketcp/runtime_domain_test.go\nscripts/realhost-b82-c8e41d73/root-veth-n-r.sh\nscripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh\nscripts/realhost-b82-c8e41d73/test_veth_runner_static.py' ]] ||
+  fail 'managed realNIC integration changed a non-topic path'
+MANAGED_INTEGRATION_HERMETIC="$(/usr/bin/git -C "${REPOSITORY}" show \
+  "${REALNIC_MANAGED_INTEGRATION_MERGE}:scripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh")" ||
+  fail 'cannot read managed realNIC integration resolution'
+readonly MANAGED_INTEGRATION_HERMETIC
+for marker in \
+  ORIGINAL_MERGE_RESOLUTION_BLOBS \
+  MANAGED_INGRESS_ACCOUNTING_PARENTS \
+  MANAGED_INGRESS_PRODUCTION_PARENTS \
+  MANAGED_INGRESS_ACCEPTANCE_ROOT_PARENTS \
+  MANAGED_INGRESS_ACCEPTANCE_PARENTS \
+  MANAGED_INGRESS_PRODUCTION_PATHS \
+  MANAGED_INGRESS_TEST_PATHS; do
+  [[ "${MANAGED_INTEGRATION_HERMETIC}" == *"${marker}"* ]] ||
+    fail "managed realNIC integration dropped conflict contract: ${marker}"
+done
+[[ "${MANAGED_INTEGRATION_HERMETIC}" != *'MERGE_RESOLUTION_FILES'* ]] ||
+  fail 'managed realNIC integration replaced exact historical blobs with a moving file list'
 
 /bin/bash -n "${BINDER}" "${CONTROLLER}" "${STAGER}" "${MODULE_LEASE_HELPER}" \
   "${PROVISIONER}" "$0" || fail 'Bash syntax gate'
