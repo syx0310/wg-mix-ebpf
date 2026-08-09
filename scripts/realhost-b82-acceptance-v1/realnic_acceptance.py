@@ -11,10 +11,12 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import fcntl
+import grp
 import hashlib
 import ipaddress
 import json
 import os
+import pwd
 import re
 import signal
 import stat
@@ -47,6 +49,8 @@ LEGACY_BUNDLE = (
     f"/home/siyixuan/wg-mix-ebpf-test/unpriv-{LEGACY_PACKAGE_ID}/"
     f"source-{LEGACY_PACKAGE_ID}.bundle"
 )
+LEGACY_BUNDLE_USER = "siyixuan"
+LEGACY_BUNDLE_GROUP = "siyixuan"
 RUN_ID_RE = re.compile(r"^[0-9a-f]{8,32}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -1022,6 +1026,7 @@ def legacy_authority_contract(spec: CoreSpec) -> dict[str, Any]:
         "evidence_root": LEGACY_EVIDENCE_ROOT,
         "owner": f"{LEGACY_EVIDENCE_ROOT}/owner.v1",
         "bundle": LEGACY_BUNDLE,
+        "bundle_shape": "siyixuan:siyixuan:0600:single-link-regular",
         "terminal_markers": [
             f"{LEGACY_EVIDENCE_ROOT}/completed.v1",
             f"{LEGACY_EVIDENCE_ROOT}/restored.v1",
@@ -2522,7 +2527,31 @@ def read_legacy_root_file(path: str, maximum: int = 1 << 20) -> bytes:
         os.close(descriptor)
 
 
+def canonical_metadata(path: str, label: str) -> os.stat_result:
+    if os.path.normpath(path) != path or os.path.realpath(path) != path:
+        raise HarnessError(f"{label} is not the canonical fixed path")
+    try:
+        return os.lstat(path)
+    except OSError as exc:
+        raise HarnessError(f"{label} metadata read failed: {exc}") from exc
+
+
 def sha256_legacy_bundle(path: str) -> str:
+    path_metadata = canonical_metadata(path, "legacy bundle")
+    try:
+        owner = pwd.getpwuid(path_metadata.st_uid).pw_name
+        group = grp.getgrgid(path_metadata.st_gid).gr_name
+    except KeyError as exc:
+        raise HarnessError("legacy bundle owner or group is unknown") from exc
+    if (
+        not stat.S_ISREG(path_metadata.st_mode)
+        or path_metadata.st_nlink != 1
+        or stat.S_IMODE(path_metadata.st_mode) != 0o600
+        or owner != LEGACY_BUNDLE_USER
+        or group != LEGACY_BUNDLE_GROUP
+        or not 0 < path_metadata.st_size <= 4 << 30
+    ):
+        raise HarnessError("legacy bundle has an invalid siyixuan:siyixuan 0600 shape")
     flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
         descriptor = os.open(path, flags)
@@ -2531,13 +2560,8 @@ def sha256_legacy_bundle(path: str) -> str:
     digest = hashlib.sha256()
     try:
         metadata = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
-            or stat.S_IMODE(metadata.st_mode) != 0o600
-            or not 0 < metadata.st_size <= 4 << 30
-        ):
-            raise HarnessError("legacy bundle has an invalid bounded 0600 shape")
+        if (metadata.st_dev, metadata.st_ino) != (path_metadata.st_dev, path_metadata.st_ino):
+            raise HarnessError("legacy bundle changed while opening")
         remaining = metadata.st_size
         while remaining:
             chunk = os.read(descriptor, min(remaining, 1 << 20))
@@ -2632,7 +2656,7 @@ def validate_legacy_physical_authority(spec: CoreSpec, runner: CommandRunner) ->
     nontrivial_hex(owner["bundle_sha256"], SHA256_RE, "legacy owner bundle sha256")
     if sha256_legacy_bundle(LEGACY_BUNDLE) != owner["bundle_sha256"]:
         raise HarnessError("legacy owner bundle SHA-256 does not match the retained bundle")
-    source = os.lstat(LEGACY_SOURCE)
+    source = canonical_metadata(LEGACY_SOURCE, "legacy retained source")
     if (
         not stat.S_ISDIR(source.st_mode)
         or stat.S_ISLNK(source.st_mode)
@@ -2674,14 +2698,14 @@ def validate_legacy_physical_authority(spec: CoreSpec, runner: CommandRunner) ->
     except UnicodeDecodeError as exc:
         raise HarnessError("legacy bundle heads are not UTF-8") from exc
     if (
-        not parsed_heads
+        len(parsed_heads) != 1
         or any(
             len(item) != 2
             or not COMMIT_RE.fullmatch(item[0])
             or not item[1].startswith("refs/heads/")
             for item in parsed_heads
         )
-        or owner["commit"] not in {item[0] for item in parsed_heads}
+        or parsed_heads[0][0] != owner["commit"]
     ):
         raise HarnessError("legacy retained bundle does not expose the owner commit as a branch head")
 
