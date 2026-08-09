@@ -102,6 +102,16 @@ expect_failure() {
   printf 'EXPECTED_FAILURE label=%s output=%q\n' "${label}" "${output}"
 }
 
+expect_exact_rc() {
+  local label="$1" expected_rc="$2" output rc
+  shift 2
+  output="$("$@" 2>&1)"
+  rc=$?
+  [[ "${rc}" == "${expected_rc}" ]] ||
+    fail "${label}: expected rc=${expected_rc}, observed rc=${rc}, output=${output}"
+  printf 'EXPECTED_FAILURE label=%s rc=%s output=%q\n' "${label}" "${rc}" "${output}"
+}
+
 require_ordered_literals() {
   local remaining="$1" marker
   shift
@@ -281,6 +291,7 @@ TEST_ROOT="$(/usr/bin/mktemp -d /private/tmp/wg-mix-b82-v6-controller-hermetic.X
 FIXTURE_REPOSITORY="${TEST_ROOT}/repository"
 FIXTURE_REVIEW="${FIXTURE_REPOSITORY}/scripts/realhost-b82-c8e41d73"
 FIXTURE_REALNIC="${FIXTURE_REPOSITORY}/scripts/realhost-b82-acceptance-v1"
+FIXTURE_ROUTED="${FIXTURE_REPOSITORY}/scripts/realhost-b82-routed-veth-v1"
 /bin/mkdir -m 0700 -- "${FIXTURE_REPOSITORY}" || fail 'fixture repository creation'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" init || fail 'fixture Git init'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" config user.name 'Hermetic Controller Test' || fail 'fixture Git name'
@@ -289,15 +300,22 @@ printf 'history-root=%s\n' "${TEST_ROOT##*/}" >"${FIXTURE_REPOSITORY}/history-ro
   fail 'fixture history root'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" add -- history-root.v1 || fail 'fixture history root add'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" commit -m 'Hermetic history root' || fail 'fixture history root commit'
-/bin/mkdir -p -- "${FIXTURE_REVIEW}" "${FIXTURE_REALNIC}" || fail 'fixture review directory creation'
+/bin/mkdir -p -- "${FIXTURE_REVIEW}" "${FIXTURE_REALNIC}" "${FIXTURE_ROUTED}" ||
+  fail 'fixture review directory creation'
 for name in \
   bind-final-package.sh controller.sh locked-transport.exp prepare-stage-root.sh \
   root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh test_matrix_static.py \
   root-fresh-verifier-gate.sh test-hermetic-fresh-verifier-gate.sh \
   test_fresh_verifier_gate_static.py \
+  root-veth-n-r.sh test-hermetic-veth-runner.sh test_veth_runner_static.py \
   checksum-module-lease.sh test-hermetic-checksum-module-lease.sh \
   test_checksum_module_lease_static.py test_provision_policy.tcl; do
   /bin/cp -- "${REVIEW_ROOT}/${name}" "${FIXTURE_REVIEW}/${name}" || fail "fixture copy ${name}"
+done
+for name in controller-seam.sh root-routed-veth-n-r.sh \
+  test-hermetic-routed-veth-harness.sh test_routed_veth_harness_static.py; do
+  /bin/cp -- "${REPOSITORY}/scripts/realhost-b82-routed-veth-v1/${name}" \
+    "${FIXTURE_ROUTED}/${name}" || fail "fixture copy routed ${name}"
 done
 for name in realnic_acceptance.py test_realnic_acceptance.py test_realnic_acceptance_static.py; do
   /bin/cp -- "${REALNIC_ROOT}/${name}" "${FIXTURE_REALNIC}/${name}" ||
@@ -336,6 +354,68 @@ BIND_RESULT="$(/bin/bash "${FIXTURE_REVIEW}/bind-final-package.sh" bind "${BIND_
 [[ "${BIND_RESULT}" == *'B82_V6_BIND_COMPLETE'* ]] || fail 'binding completion marker'
 BOUND_MANIFEST="${BOUND_OUTPUT}/package-manifest.v1"
 BOUND_MANIFEST_SHA="$(sha256_file "${BOUND_MANIFEST}")" || fail 'manifest digest'
+CONTROLLER_READER_ONLY="${TEST_ROOT}/controller.manifest-reader.sh"
+STAGER_READER_ONLY="${TEST_ROOT}/stager.manifest-reader.sh"
+for source_only_spec in \
+  "${FIXTURE_REVIEW}/controller.sh:${CONTROLLER_READER_ONLY}" \
+  "${FIXTURE_REVIEW}/prepare-stage-root.sh:${STAGER_READER_ONLY}"; do
+  source_script="${source_only_spec%%:*}"
+  source_only="${source_only_spec#*:}"
+  [[ "$(/usr/bin/tail -n 1 -- "${source_script}")" == 'main "$@"' ]] ||
+    fail "manifest reader source has an unexpected dispatch tail: ${source_script}"
+  /usr/bin/sed '$d' "${source_script}" >"${source_only}" ||
+    fail "manifest reader source-only fixture: ${source_script}"
+  /bin/chmod 0600 "${source_only}" || fail 'manifest reader source-only fixture mode'
+done
+MANIFEST_TAIL_NEWLINE="${TEST_ROOT}/package-manifest.trailing-newline.v1"
+MANIFEST_TAIL_NO_NEWLINE="${TEST_ROOT}/package-manifest.trailing-no-newline.v1"
+MANIFEST_EXTRA_FINAL_LF="${TEST_ROOT}/package-manifest.extra-final-lf.v1"
+/bin/cp -- "${BOUND_MANIFEST}" "${MANIFEST_TAIL_NEWLINE}" || fail 'newline tail manifest copy'
+printf 'unexpected_tail\tfixture-extra\n' >>"${MANIFEST_TAIL_NEWLINE}" ||
+  fail 'newline tail manifest append'
+/bin/cp -- "${BOUND_MANIFEST}" "${MANIFEST_TAIL_NO_NEWLINE}" ||
+  fail 'unterminated tail manifest copy'
+printf 'unexpected_tail\tfixture-extra' >>"${MANIFEST_TAIL_NO_NEWLINE}" ||
+  fail 'unterminated tail manifest append'
+/bin/cp -- "${BOUND_MANIFEST}" "${MANIFEST_EXTRA_FINAL_LF}" ||
+  fail 'extra final LF manifest copy'
+printf '\n' >>"${MANIFEST_EXTRA_FINAL_LF}" || fail 'extra final LF manifest append'
+for reader_spec in \
+  "controller:${CONTROLLER_READER_ONLY}" \
+  "stager:${STAGER_READER_ONLY}"; do
+  reader_name="${reader_spec%%:*}"
+  reader_script="${reader_spec#*:}"
+  for manifest_spec in \
+    "newline-tail:${MANIFEST_TAIL_NEWLINE}" \
+    "unterminated-tail:${MANIFEST_TAIL_NO_NEWLINE}" \
+    "extra-final-lf:${MANIFEST_EXTRA_FINAL_LF}"; do
+    manifest_name="${manifest_spec%%:*}"
+    manifest_path="${manifest_spec#*:}"
+    expect_exact_rc "${reader_name}-${manifest_name}" 65 /bin/bash -c '
+      source "$1" || exit $?
+      MANIFEST="$2"
+      load_manifest
+    ' manifest-reader "${reader_script}" "${manifest_path}"
+  done
+done
+/bin/bash "${FIXTURE_REVIEW}/test-hermetic-fresh-verifier-gate.sh" \
+  "${FIXTURE_REVIEW}/root-fresh-verifier-gate.sh" \
+  "${FIXTURE_REVIEW}/checksum-module-lease.sh" \
+  "${FIXTURE_REVIEW}/test_fresh_verifier_gate_static.py" "${BOUND_MANIFEST}" ||
+  fail 'fresh verifier exact package-v4 reader target'
+for manifest_spec in \
+  "newline-tail:${MANIFEST_TAIL_NEWLINE}" \
+  "unterminated-tail:${MANIFEST_TAIL_NO_NEWLINE}" \
+  "extra-final-lf:${MANIFEST_EXTRA_FINAL_LF}"; do
+  manifest_name="${manifest_spec%%:*}"
+  manifest_path="${manifest_spec#*:}"
+  manifest_sha="$(sha256_file "${manifest_path}")" || fail 'malformed manifest digest'
+  expect_exact_rc "transport-${manifest_name}" 66 /usr/bin/expect \
+    "${FIXTURE_REVIEW}/locked-transport.exp" \
+    --manifest "${manifest_path}" --manifest-sha256 "${manifest_sha}" \
+    --credential-path "${CREDENTIAL_PATH}" --action plan --operation identity-hostname \
+    --approved-plan-sha256 none
+done
 [[ -d "${BOUND_OUTPUT}/history-verification.git" && ! -L "${BOUND_OUTPUT}/history-verification.git" &&
   -f "${BOUND_OUTPUT}/history-objects.v1" && -f "${BOUND_OUTPUT}/history-roots.v1" ]] ||
   fail 'isolated history evidence shape'
@@ -379,7 +459,38 @@ for index in 0 1 2; do
       "$(manifest_value "${key}_sha256" "${BOUND_MANIFEST}")" ]] ||
     fail "realNIC manifest triplet is not bound to source blob: ${source_file}"
 done
-[[ "$(manifest_value format "${BOUND_MANIFEST}")" == 'wg-mix-ebpf-b82-v6-package-v3' &&
+readonly -a STAGED_MANIFEST_KEYS=(
+  root_veth_n_r_sh
+  test_hermetic_veth_runner_sh
+  test_veth_runner_static_py
+  controller_seam_sh
+  root_routed_veth_n_r_sh
+  test_hermetic_routed_veth_harness_sh
+  test_routed_veth_harness_static_py
+)
+readonly -a STAGED_MANIFEST_PATHS=(
+  scripts/realhost-b82-c8e41d73/root-veth-n-r.sh
+  scripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh
+  scripts/realhost-b82-c8e41d73/test_veth_runner_static.py
+  scripts/realhost-b82-routed-veth-v1/controller-seam.sh
+  scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh
+  scripts/realhost-b82-routed-veth-v1/test-hermetic-routed-veth-harness.sh
+  scripts/realhost-b82-routed-veth-v1/test_routed_veth_harness_static.py
+)
+for index in 0 1 2 3 4 5 6; do
+  key="${STAGED_MANIFEST_KEYS[${index}]}"
+  source_file="${STAGED_MANIFEST_PATHS[${index}]}"
+  package_name="${source_file##*/}"
+  expected_blob="$(/usr/bin/git -C "${FIXTURE_REPOSITORY}" rev-parse \
+    "${FIXTURE_COMMIT}:${source_file}")" || fail 'staged identity blob lookup'
+  [[ "$(manifest_value "${key}_path" "${BOUND_MANIFEST}")" == "${source_file}" &&
+    "$(manifest_value "${key}_blob" "${BOUND_MANIFEST}")" == "${expected_blob}" &&
+    "$(manifest_value "${key}_sha256" "${BOUND_MANIFEST}")" == \
+      "$(sha256_file "${FIXTURE_REPOSITORY}/${source_file}")" &&
+    ! -e "${BOUND_OUTPUT}/${package_name}" && ! -L "${BOUND_OUTPUT}/${package_name}" ]] ||
+    fail "staged-only manifest triplet or flat-package exclusion drifted: ${source_file}"
+done
+[[ "$(manifest_value format "${BOUND_MANIFEST}")" == 'wg-mix-ebpf-b82-v6-package-v4' &&
   "$(manifest_value physical_nic_forward_authority "${BOUND_MANIFEST}")" == \
     'realnic-acceptance-v1' &&
   "$(manifest_value physical_interface_lock "${BOUND_MANIFEST}")" == \
@@ -466,7 +577,7 @@ for literal in \
   '/bin/bash -p /run/wg-mix-ebpf-source-stages/c8e41d73/source/scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh run --controller-source /run/wg-mix-ebpf-source-stages/c8e41d73/source' \
   'operation=realnic-plan transport=ssh credential_read=0 network_operations=0' \
   '/usr/bin/python3 -B -I /run/wg-mix-ebpf-source-stages/c8e41d73/source/scripts/realhost-b82-acceptance-v1/realnic_acceptance.py plan --source-commit' \
-  'B82_V6_REALNIC_APPROVAL_REQUIRED local_plan=explicit approved_plan_sha256=explicit automatic_approval=0' \
+  "B82_V6_REALNIC_APPROVAL_REQUIRED capture_mode=realnic-plan local_plan_pattern=${BOUND_OUTPUT}/realnic-plan.SHA256.json approved_plan_sha256=explicit automatic_approval=0" \
   'B82_V6_LEGACY_MATRIX_RETIRED controller_entries=0 historical_recovery=frozen-original-package-before-final-staging' \
   'B82_V6_CONTROLLER_PLAN_COMPLETE credential_read=0 network_operations=0 mutations=0 legacy_forward=retired'; do
   [[ "${CONTROLLER_PLAN}" == *"${literal}"* ]] || fail "controller plan missing ${literal}"
@@ -485,6 +596,35 @@ done
   fail 'controller stage plan reopens the user-owned manifest'
 [[ "${CONTROLLER_PLAN}" != *'prepare-stage-root.sh run --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1'* ]] ||
   fail 'controller stage run reopens the user-owned manifest'
+[[ "${CONTROLLER_PLAN}" == *'B82_V6_CONTROLLER_PLAN veth-unavailable wg_state=bound operations=veth-plan,veth-run,veth-restore'* ]] ||
+  fail 'bound controller plan did not explicitly classify standalone veth as unavailable'
+for operation in routed-plan routed-run routed-restore; do
+  [[ "${CONTROLLER_PLAN}" == *"operation=${operation} transport=ssh credential_read=0 network_operations=0"* ]] ||
+    fail "bound controller plan cannot reach ${operation}"
+done
+readonly -a EXPECTED_STALE_IDS=(
+  package-root bootstrap-root alternate-bootstrap-root stage-root fresh-root
+  standalone-root routed-evidence-root realnic-run-roots realnic-interface-leases
+  veth-wgc8e41a veth-wgc8e41b veth-wga19f7a veth-wga19f7b
+  veth-wg5b8d3a veth-wg5b8d3b pin-fresh pin-standalone pin-legacy-tcx
+  pin-legacy-nic-original pin-legacy-nic-all-on pin-legacy-nic-all-off
+  pin-legacy-nic-tx-path pin-legacy-nic-rx-path pin-legacy-nic-mtu1492
+  pin-legacy-nic-mtu1500 pin-legacy-nic-soak checksum-module
+  checksum-module-btf checksum-module-lock physical-interface-lock
+)
+[[ "${#EXPECTED_STALE_IDS[@]}" == 30 ]] || fail 'stale fixture cardinality'
+for index in "${!EXPECTED_STALE_IDS[@]}"; do
+  printf -v ordinal '%02d' "$((index + 1))"
+  stale_id="${EXPECTED_STALE_IDS[${index}]}"
+  stale_line="B82_V6_STALE_ITEM_V1 ordinal=${ordinal} id=${stale_id} class=PLANNED writes=0 cleanup=0 rc=0"
+  [[ "$(printf '%s\n' "${CONTROLLER_PLAN}" | /usr/bin/grep -Fxc -- "${stale_line}")" == 1 ]] ||
+    fail "stale plan item is not exact and unique: ${stale_line}"
+done
+[[ "$(printf '%s\n' "${CONTROLLER_PLAN}" | /usr/bin/grep -Fc -- 'B82_V6_STALE_ITEM_V1 ')" == 30 &&
+  "${CONTROLLER_PLAN}" == *'B82_V6_STALE_SUMMARY_V1 profile=prepare-new items=30 checked=30 absent=0 writes=0 cleanup=0 result=PLANNED rc=0'* &&
+  "${CONTROLLER_PLAN}" == *'wg-mix-ebpf-realnic-acceptance-\*'* &&
+  "${CONTROLLER_PLAN}" == *'wg-mix-ebpf-realnic-interface-\*.jsonl'* ]] ||
+  fail 'stale plan cardinality, summary, or protected remote glob drifted'
 require_ordered_literals "${CONTROLLER_PLAN}" \
   'operation=bootstrap-absent ' \
   'operation=bootstrap-not-symlink ' \
@@ -514,14 +654,15 @@ require_ordered_literals "${CONTROLLER_PLAN}" \
   'operation=realnic-plan ' \
   'B82_V6_LEGACY_MATRIX_RETIRED '
 
-APPROVED_PLAN="${TEST_ROOT}/reviewed-realnic-plan.json"
-printf '%s\n' '{"fixture":"explicitly-reviewed-realnic-plan"}' >"${APPROVED_PLAN}" ||
-  fail 'approved plan fixture'
+APPROVED_PLAN_PAYLOAD="${TEST_ROOT}/reviewed-realnic-plan.payload"
+printf '%s\n' '{"fixture":"explicitly-reviewed-realnic-plan"}' >"${APPROVED_PLAN_PAYLOAD}" ||
+  fail 'approved plan payload fixture'
+APPROVED_PLAN_SHA="$(sha256_file "${APPROVED_PLAN_PAYLOAD}")" || fail 'approved plan fixture digest'
+APPROVED_PLAN="${BOUND_OUTPUT}/realnic-plan.${APPROVED_PLAN_SHA}.json"
+/bin/cp -- "${APPROVED_PLAN_PAYLOAD}" "${APPROVED_PLAN}" || fail 'approved plan fixed-path fixture'
 /bin/chmod 0600 "${APPROVED_PLAN}" || fail 'approved plan fixture mode'
-APPROVED_PLAN_SHA="$(sha256_file "${APPROVED_PLAN}")" || fail 'approved plan fixture digest'
 APPROVED_CONTROLLER_ARGS=(
   "${CONTROLLER_ARGS[@]}"
-  --approved-plan "${APPROVED_PLAN}"
   --approved-plan-sha256 "${APPROVED_PLAN_SHA}"
 )
 APPROVED_CONTROLLER_PLAN="$(/bin/bash "${FIXTURE_REVIEW}/controller.sh" plan \
@@ -821,21 +962,23 @@ expect_failure inconsistent-absent-binding /bin/bash "${FIXTURE_REVIEW}/bind-fin
 expect_failure invalid-transport-operation /usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
   --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
   --credential-path "${CREDENTIAL_PATH}" --action plan --operation arbitrary-command \
-  --approved-plan none --approved-plan-sha256 none
+  --approved-plan-sha256 none
 expect_failure retired-matrix-run-transport /usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
   --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
   --credential-path "${CREDENTIAL_PATH}" --action plan --operation matrix-run \
-  --approved-plan none --approved-plan-sha256 none
+  --approved-plan-sha256 none
 expect_failure retired-matrix-restore-transport /usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
   --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
   --credential-path "${CREDENTIAL_PATH}" --action plan --operation matrix-restore-tcx \
-  --approved-plan none --approved-plan-sha256 none
+  --approved-plan-sha256 none
 expect_failure retired-matrix-controller-mode /bin/bash "${FIXTURE_REVIEW}/controller.sh" restore \
   "${CONTROLLER_ARGS[@]}" --restore-cell tcx
 expect_failure credential-path-before-spawn /usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
   --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
   --credential-path /private/tmp/not-a-credential --action execute --operation identity-hostname \
-  --approved-plan none --approved-plan-sha256 none
+  --approved-plan-sha256 none
+expect_failure removed-public-approved-plan /bin/bash "${FIXTURE_REVIEW}/controller.sh" plan \
+  "${CONTROLLER_ARGS[@]}" --approved-plan "${APPROVED_PLAN}"
 expect_failure package-stager-root-run /bin/bash "${BOUND_OUTPUT}/prepare-stage-root.sh" run \
   --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}"
 
@@ -894,11 +1037,18 @@ for operation in fresh-plan fresh-run fresh-restore; do
   [[ "${ABSENT_PLAN}" == *"operation=${operation} transport=ssh credential_read=0 network_operations=0"* ]] ||
     fail "absent WireGuard plan cannot reach ${operation}"
 done
+for operation in veth-plan veth-run veth-restore routed-plan routed-run routed-restore; do
+  [[ "${ABSENT_PLAN}" == *"operation=${operation} transport=ssh credential_read=0 network_operations=0"* ]] ||
+    fail "absent WireGuard plan cannot reach ${operation}"
+done
 [[ "${ABSENT_PLAN}" == *'operation=realnic-plan transport=ssh credential_read=0 network_operations=0'* ]] ||
   fail 'absent WireGuard plan cannot reach realnic-plan'
+ABSENT_APPROVED_PLAN="${ABSENT_OUTPUT}/realnic-plan.${APPROVED_PLAN_SHA}.json"
+/bin/cp -- "${APPROVED_PLAN_PAYLOAD}" "${ABSENT_APPROVED_PLAN}" ||
+  fail 'absent approved plan fixed-path fixture'
+/bin/chmod 0600 "${ABSENT_APPROVED_PLAN}" || fail 'absent approved plan fixture mode'
 ABSENT_APPROVED_ARGS=(
   "${ABSENT_CONTROLLER_ARGS[@]}"
-  --approved-plan "${APPROVED_PLAN}"
   --approved-plan-sha256 "${APPROVED_PLAN_SHA}"
 )
 ABSENT_APPROVED_PLAN="$(/bin/bash "${FIXTURE_REVIEW}/controller.sh" plan \
@@ -910,11 +1060,35 @@ done
 ABSENT_FRESH_TRANSPORT="$(/usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
   --manifest "${ABSENT_MANIFEST}" --manifest-sha256 "${ABSENT_MANIFEST_SHA}" \
   --credential-path "${CREDENTIAL_PATH}" --action plan --operation fresh-run \
-  --approved-plan none --approved-plan-sha256 none)" ||
+  --approved-plan-sha256 none)" ||
   fail 'absent fresh transport plan'
 [[ "${ABSENT_FRESH_TRANSPORT}" == *'credential_read=0 network_operations=0'* &&
   "${ABSENT_FRESH_TRANSPORT}" == *'root-fresh-verifier-gate.sh run --controller-source'* ]] ||
   fail 'absent fresh transport reachability'
+ABSENT_VETH_TRANSPORT="$(/usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
+  --manifest "${ABSENT_MANIFEST}" --manifest-sha256 "${ABSENT_MANIFEST_SHA}" \
+  --credential-path "${CREDENTIAL_PATH}" --action plan --operation veth-plan \
+  --approved-plan-sha256 none)" || fail 'absent veth transport plan'
+ABSENT_BUNDLE_SHA="$(manifest_value bundle_sha256 "${ABSENT_MANIFEST}")" ||
+  fail 'absent bundle digest'
+[[ "${ABSENT_VETH_TRANSPORT}" == *"/bin/bash -p /run/wg-mix-ebpf-source-stages/c8e41d73/source/scripts/realhost-b82-c8e41d73/root-veth-n-r.sh plan --controller-source /run/wg-mix-ebpf-source-stages/c8e41d73/source --commit ${ABSENT_COMMIT} --bundle /run/wg-mix-ebpf-source-bootstrap-c8e41d73/source-4f2a9b61.bundle --bundle-sha256 ${ABSENT_BUNDLE_SHA} --wg-state absent"$'\n''EXPECT_OUTPUT_ASSERTION none' ]] ||
+  fail 'absent veth transport does not use the exact root-owned bundle argv'
+ABSENT_ROUTED_TRANSPORT="$(/usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
+  --manifest "${ABSENT_MANIFEST}" --manifest-sha256 "${ABSENT_MANIFEST_SHA}" \
+  --credential-path "${CREDENTIAL_PATH}" --action plan --operation routed-plan \
+  --approved-plan-sha256 none)" || fail 'absent routed transport plan'
+[[ "${ABSENT_ROUTED_TRANSPORT}" == *"/bin/bash -p /run/wg-mix-ebpf-source-stages/c8e41d73/source/scripts/realhost-b82-routed-veth-v1/controller-seam.sh plan --commit ${ABSENT_COMMIT}"$'\n''EXPECT_OUTPUT_ASSERTION none' ]] ||
+  fail 'absent routed transport argv extends beyond the staged seam and commit'
+expect_exact_rc capture-non-realnic-operation 65 /usr/bin/expect \
+  "${FIXTURE_REVIEW}/locked-transport.exp" \
+  --manifest "${ABSENT_MANIFEST}" --manifest-sha256 "${ABSENT_MANIFEST_SHA}" \
+  --credential-path "${CREDENTIAL_PATH}" --action capture --operation identity-hostname \
+  --approved-plan-sha256 none
+expect_exact_rc execute-realnic-plan 65 /usr/bin/expect \
+  "${FIXTURE_REVIEW}/locked-transport.exp" \
+  --manifest "${ABSENT_MANIFEST}" --manifest-sha256 "${ABSENT_MANIFEST_SHA}" \
+  --credential-path "${CREDENTIAL_PATH}" --action execute --operation realnic-plan \
+  --approved-plan-sha256 none
 expect_failure retired-matrix-run-mode /bin/bash "${FIXTURE_REVIEW}/controller.sh" run \
   "${ABSENT_CONTROLLER_ARGS[@]}"
 

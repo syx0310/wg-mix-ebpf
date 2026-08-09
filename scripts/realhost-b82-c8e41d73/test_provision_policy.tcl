@@ -56,6 +56,34 @@ if {[file type $transport] ne "file"} {
 }
 source $transport
 
+proc expect_signaled_wait_rejected {operation assertion signal_name} {
+    log_user 0
+    spawn -noecho /usr/bin/python3 -B -I -c \
+        "import os, signal; os.kill(os.getpid(), signal.$signal_name)"
+    set child_id $spawn_id
+    expect -i $child_id eof
+    if {[catch {wait -i $child_id} wait_status]} {
+        log_user 1
+        fail "$operation/$assertion/$signal_name could not collect wait status"
+    }
+    log_user 1
+    if {![catch {clean_child_exit_status $wait_status} error] ||
+        $error ne "child-wait-status"} {
+        fail "$operation/$assertion/$signal_name accepted signaled wait status $wait_status"
+    }
+}
+
+foreach {operation assertion} {
+    stale-package-root none
+    stale-realnic-run-roots empty
+    veth-run none
+    routed-run none
+} {
+    foreach signal_name {SIGTERM SIGKILL} {
+        expect_signaled_wait_rejected $operation $assertion $signal_name
+    }
+}
+
 set initial " clang gcc golang-go iperf3 libbpf-dev llvm make pkg-config shellcheck wireguard-tools"
 expect_value ready none {
     provision_plan_policy [payload check "" ready none] check
@@ -101,4 +129,4 @@ expect_error sha-drift exact-output-mismatch {
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb  /run/wg-mix-ebpf-source-bootstrap-c8e41d73/provision-ubuntu-test-host.sh\n"
 }
 
-puts "provision check/apply output policy: PASS"
+puts "provision check/apply output policy and ordinary signaled-child cuts: PASS"

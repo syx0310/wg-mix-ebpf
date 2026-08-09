@@ -6,12 +6,20 @@ umask 077
 SCRIPT="${1:-}"
 HELPER="${2:-}"
 STATIC_TEST="${3:-}"
-[[ "${SCRIPT}" == /* && -f "${SCRIPT}" && ! -L "${SCRIPT}" &&
+MANIFEST_FIXTURE="${4:-}"
+[[ ($# == 3 || $# == 4) &&
+  "${SCRIPT}" == /* && -f "${SCRIPT}" && ! -L "${SCRIPT}" &&
   "${HELPER}" == /* && -f "${HELPER}" && ! -L "${HELPER}" &&
   "${STATIC_TEST}" == /* && -f "${STATIC_TEST}" && ! -L "${STATIC_TEST}" ]] || {
-  printf 'usage: %s ABSOLUTE_ROOT_FRESH_VERIFIER_GATE ABSOLUTE_MODULE_LEASE_HELPER ABSOLUTE_STATIC_TEST\n' "$0" >&2
+  printf 'usage: %s ABSOLUTE_ROOT_FRESH_VERIFIER_GATE ABSOLUTE_MODULE_LEASE_HELPER ABSOLUTE_STATIC_TEST [ABSOLUTE_PACKAGE_MANIFEST]\n' "$0" >&2
   exit 64
 }
+if [[ -n "${MANIFEST_FIXTURE}" &&
+  ("${MANIFEST_FIXTURE}" != /* || ! -f "${MANIFEST_FIXTURE}" ||
+    -L "${MANIFEST_FIXTURE}") ]]; then
+  printf 'fresh verifier hermetic test failed: optional manifest must be an absolute regular non-symlink file\n' >&2
+  exit 64
+fi
 /bin/bash -n "${SCRIPT}" "${HELPER}" || exit $?
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B -I "${STATIC_TEST}" "${SCRIPT}" "${HELPER}" ||
   exit $?
@@ -29,6 +37,103 @@ fail() {
   printf 'fresh verifier hermetic test failed: %s; retained=%s\n' "$1" "${FIXTURE}" >&2
   exit 1
 }
+
+MANIFEST_KEYS="${FIXTURE}/manifest.keys"
+SYNTHETIC_MANIFEST="${FIXTURE}/package-manifest.v1"
+TESTABLE_READER="${FIXTURE}/root-fresh-verifier-gate.reader-test.sh"
+TAIL_NEWLINE="${FIXTURE}/package-manifest.trailing-newline.v1"
+TAIL_NO_NEWLINE="${FIXTURE}/package-manifest.trailing-no-newline.v1"
+REORDERED_MANIFEST="${FIXTURE}/package-manifest.reordered.v1"
+
+/usr/bin/awk '
+  /^load_manifest_once\(\) \{/ { in_loader = 1; next }
+  in_loader && /^}/ { exit }
+  in_loader && $1 == "read_manifest_field" { print $2 }
+' "${SCRIPT}" >"${MANIFEST_KEYS}" || fail 'extract production manifest keys'
+[[ "$(/usr/bin/wc -l <"${MANIFEST_KEYS}" | /usr/bin/tr -d ' ')" == 103 &&
+  "$(LC_ALL=C /usr/bin/sort -- "${MANIFEST_KEYS}" | /usr/bin/uniq | /usr/bin/wc -l |
+    /usr/bin/tr -d ' ')" == 103 ]] ||
+  fail 'production manifest reader is not exactly 103 unique keys'
+
+while IFS= read -r key; do
+  [[ -n "${key}" ]] || fail 'empty manifest key extracted'
+  if [[ "${key}" == format ]]; then
+    value='wg-mix-ebpf-b82-v6-package-v4'
+  else
+    value="fixture-${key}"
+  fi
+  printf '%s\t%s\n' "${key}" "${value}"
+done <"${MANIFEST_KEYS}" >"${SYNTHETIC_MANIFEST}" || fail 'create package-v4 fixture'
+
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B -I "${STATIC_TEST}" \
+  "${SCRIPT}" "${HELPER}" "${SYNTHETIC_MANIFEST}" ||
+  fail 'package-v4 fixture does not match the static 103-key schema'
+if [[ -n "${MANIFEST_FIXTURE}" ]]; then
+  PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B -I "${STATIC_TEST}" \
+    "${SCRIPT}" "${HELPER}" "${MANIFEST_FIXTURE}" ||
+    fail 'provided package manifest does not match the package-v4 103-key schema'
+fi
+
+/usr/bin/awk '
+  /^load_manifest_once\(\) \{/ { in_loader = 1 }
+  $0 == "readonly SNAPSHOT_MANIFEST=\"${INTAKE_ROOT}/package-manifest.v1\"" {
+    print "readonly SNAPSHOT_MANIFEST=\"${FRESH_TEST_MANIFEST}\""
+    replacements++
+    next
+  }
+  in_loader && $0 == "  exec {MANIFEST_FD}<\"${SNAPSHOT_MANIFEST}\" || return 66" {
+    print "  MANIFEST_FD=9"
+    print "  exec 9<\"${SNAPSHOT_MANIFEST}\" || return 66"
+    reader_opens++
+    next
+  }
+  in_loader && /exec \{MANIFEST_FD\}<\&-/ {
+    gsub(/exec \{MANIFEST_FD\}<\&-/, "exec 9<\\&-")
+    reader_closes++
+  }
+  { print }
+  in_loader && /^}/ { in_loader = 0 }
+  END {
+    if (replacements != 1 || reader_opens != 1 || reader_closes != 3) exit 65
+  }
+' "${SCRIPT}" >"${TESTABLE_READER}" || fail 'prepare isolated manifest reader'
+/bin/chmod 0700 "${TESTABLE_READER}" || fail 'mode isolated manifest reader'
+
+run_manifest_reader() {
+  local manifest="$1" expected_rc="$2" label="$3" rc
+  FRESH_TEST_MANIFEST="${manifest}" /bin/bash -c '
+    source "$1" || exit $?
+    load_manifest_once
+    rc=$?
+    if ((rc == 0)); then
+      [[ "${FORMAT}" == "wg-mix-ebpf-b82-v6-package-v4" ]] || exit 79
+    fi
+    exit "${rc}"
+  ' fresh-manifest-reader "${TESTABLE_READER}"
+  rc=$?
+  [[ "${rc}" == "${expected_rc}" ]] ||
+    fail "${label}: expected rc=${expected_rc}, observed rc=${rc}"
+}
+
+run_manifest_reader "${SYNTHETIC_MANIFEST}" 0 'valid package-v4 manifest'
+/bin/cp -- "${SYNTHETIC_MANIFEST}" "${TAIL_NEWLINE}" || fail 'copy newline-tail fixture'
+printf 'unexpected_tail\tfixture-extra\n' >>"${TAIL_NEWLINE}" ||
+  fail 'append newline-tail fixture'
+run_manifest_reader "${TAIL_NEWLINE}" 65 '104th newline-terminated record'
+/bin/cp -- "${SYNTHETIC_MANIFEST}" "${TAIL_NO_NEWLINE}" ||
+  fail 'copy unterminated-tail fixture'
+printf 'unexpected_tail\tfixture-extra' >>"${TAIL_NO_NEWLINE}" ||
+  fail 'append unterminated-tail fixture'
+run_manifest_reader "${TAIL_NO_NEWLINE}" 65 '104th unterminated record'
+/usr/bin/awk '
+  NR == 1 { first = $0; next }
+  NR == 2 { print; print first; next }
+  { print }
+' "${SYNTHETIC_MANIFEST}" >"${REORDERED_MANIFEST}" || fail 'create reordered fixture'
+run_manifest_reader "${REORDERED_MANIFEST}" 65 'reordered manifest keys'
+if [[ -n "${MANIFEST_FIXTURE}" ]]; then
+  run_manifest_reader "${MANIFEST_FIXTURE}" 0 'provided package-v4 manifest'
+fi
 
 run_plan() {
   /bin/bash "${SCRIPT}" plan \
@@ -122,4 +227,5 @@ if /bin/bash "${SCRIPT}" plan \
   fail 'reordered authority arguments were accepted'
 fi
 
-printf 'fresh verifier hermetic plan test passed; retained=%s\n' "${FIXTURE}"
+printf 'fresh verifier hermetic plan and exact package-v4 manifest test passed; retained=%s\n' \
+  "${FIXTURE}"
