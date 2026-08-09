@@ -96,7 +96,7 @@ class RepoBoundary:
 
 def git_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
     env = os.environ.copy()
-    for name in (
+    fixed_injections = (
         "GIT_DIR",
         "GIT_WORK_TREE",
         "GIT_INDEX_FILE",
@@ -104,8 +104,16 @@ def git_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
         "GIT_ALTERNATE_OBJECT_DIRECTORIES",
         "GIT_COMMON_DIR",
         "GIT_TEMPLATE_DIR",
-    ):
-        env.pop(name, None)
+        "GIT_CONFIG",
+        "GIT_CONFIG_COUNT",
+        "GIT_CONFIG_PARAMETERS",
+        "GIT_CONFIG_SYSTEM",
+    )
+    for name in tuple(env):
+        if name in fixed_injections or name.startswith(
+            ("GIT_CONFIG_KEY_", "GIT_CONFIG_VALUE_")
+        ):
+            env.pop(name, None)
     env.update(
         {
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -166,8 +174,15 @@ def run_command(
     return completed.stdout
 
 
-def decoded_path(raw: bytes, description: str, *, strict: bool) -> Path:
-    value = raw.rstrip(b"\n")
+def decoded_path(
+    raw: bytes, description: str, *, strict: bool, newline_terminated: bool
+) -> Path:
+    if newline_terminated:
+        if not raw.endswith(b"\n"):
+            raise ReplayError(f"Git returned an invalid {description}")
+        value = raw[:-1]
+    else:
+        value = raw
     if not value or b"\0" in value:
         raise ReplayError(f"Git returned an invalid {description}")
     try:
@@ -191,17 +206,22 @@ def canonical_repo_boundary(path: Path) -> RepoBoundary:
     if bare not in {"true", "false"}:
         raise ReplayError(f"Git returned an invalid bare-repository state: {bare!r}")
     git_dir = decoded_path(
-        probe("rev-parse", "--absolute-git-dir"), "Git directory", strict=True
+        probe("rev-parse", "--absolute-git-dir"),
+        "Git directory",
+        strict=True,
+        newline_terminated=True,
     )
     common_dir = decoded_path(
         probe("rev-parse", "--path-format=absolute", "--git-common-dir"),
         "Git common directory",
         strict=True,
+        newline_terminated=True,
     )
     object_dir = decoded_path(
         probe("rev-parse", "--path-format=absolute", "--git-path", "objects"),
         "Git object directory",
         strict=True,
+        newline_terminated=True,
     )
     worktree = (
         None
@@ -210,6 +230,7 @@ def canonical_repo_boundary(path: Path) -> RepoBoundary:
             probe("rev-parse", "--show-toplevel"),
             "Git worktree top level",
             strict=True,
+            newline_terminated=True,
         )
     )
 
@@ -225,7 +246,7 @@ def canonical_repo_boundary(path: Path) -> RepoBoundary:
                 raise ReplayError(
                     f"input repository promisor packs are forbidden: {pack_dir}"
                 )
-    config_names = probe("config", "--local", "--name-only", "--null", "--list")
+    config_names = probe("config", "--name-only", "--null", "--list")
     for name in config_names.rstrip(b"\0").split(b"\0") if config_names else ():
         lowered = name.lower()
         if lowered == b"extensions.partialclone" or (
@@ -247,6 +268,7 @@ def canonical_repo_boundary(path: Path) -> RepoBoundary:
                     field.removeprefix(b"worktree "),
                     "registered Git worktree",
                     strict=False,
+                    newline_terminated=False,
                 )
             )
     return RepoBoundary(worktree or git_dir, tuple(sorted(protected, key=os.fspath)))

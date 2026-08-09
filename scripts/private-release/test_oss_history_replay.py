@@ -696,6 +696,46 @@ class OssHistoryReplayTests(unittest.TestCase):
         self.assertIn(b"input repository boundary", result.stderr)
         self.assertFalse(output.exists())
 
+    def test_registered_worktree_with_trailing_newline_is_protected(self) -> None:
+        primary = self.root / "primary-worktree"
+        run(
+            [
+                "git",
+                "clone",
+                "--quiet",
+                "--no-hardlinks",
+                str(self.dag.repo),
+                str(primary),
+            ]
+        )
+        linked = self.root / "linked\n"
+        run(
+            [
+                "git",
+                "-C",
+                str(primary),
+                "worktree",
+                "add",
+                "--detach",
+                "--quiet",
+                str(linked),
+                self.dag.tip,
+            ]
+        )
+        output = linked / "must-not-create.git"
+        result = self.tool(
+            "replay",
+            "--public-manifest",
+            str(MANIFEST),
+            "--output",
+            str(output),
+            check=False,
+            main_repo=primary,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"input repository boundary", result.stderr)
+        self.assertFalse(output.exists())
+
     def test_alternates_and_promisor_inputs_fail_closed(self) -> None:
         facade = self.root / "facade.git"
         run(
@@ -777,6 +817,46 @@ class OssHistoryReplayTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 1)
                 self.assertIn(b"forbidden", result.stderr)
+
+        worktree_promisor = self.root / "worktree-promisor"
+        run(
+            [
+                "git",
+                "clone",
+                "--quiet",
+                "--no-hardlinks",
+                str(self.dag.repo),
+                str(worktree_promisor),
+            ]
+        )
+        run(
+            [
+                "git",
+                "-C",
+                str(worktree_promisor),
+                "config",
+                "extensions.worktreeConfig",
+                "true",
+            ]
+        )
+        run(
+            [
+                "git",
+                "-C",
+                str(worktree_promisor),
+                "config",
+                "--worktree",
+                "remote.origin.promisor",
+                "true",
+            ]
+        )
+        result = self.tool(
+            "inventory",
+            check=False,
+            main_repo=worktree_promisor,
+        )
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"partial-clone configuration is forbidden", result.stderr)
 
     def test_command_diagnostics_include_bounded_stdout_and_stderr(self) -> None:
         failing = (
