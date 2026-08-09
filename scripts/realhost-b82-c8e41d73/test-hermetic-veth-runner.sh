@@ -24,6 +24,9 @@ readonly CONTROLLER_LEASE_TIP='eb46d2d6142e6d91b34f031c8a198b35ce927879'
 readonly CANONICAL_FINAL='8f6418c4877eb29d163080402381da2ba9bb3b2b'
 readonly CANONICAL_MERGE='232aad72afa9327985d869eb80aad7e359201a36'
 readonly STANDALONE_SCOPE_COMMIT='1c4102b96d28657b60ee58314c7088069c59eea9'
+readonly SINGLE_L3_PARENT='cecf74ceded6b13a770d7b02283abe45de2faedb'
+readonly SINGLE_L3_FINAL='ad31ae79af828b756c884ae342f8e4f51a6bacf7'
+readonly SINGLE_L3_MERGE='15e2122a74738ed1904465e1f1e8e75f4892c4b2'
 
 readonly -a CONTROLLER_FILES=(
   scripts/realhost-b82-c8e41d73/bind-final-package.sh
@@ -36,6 +39,18 @@ readonly -a MERGE_RESOLUTION_FILES=(
   scripts/realhost-b82-c8e41d73/prepare-stage-root.sh
   scripts/realhost-b82-c8e41d73/test-hermetic-controller.sh
   scripts/realhost-b82-c8e41d73/test_controller_static.py
+)
+readonly -a SINGLE_L3_FILES=(
+  bpf/wg_mix_faketcp.h
+  bpf/wg_mix_tc.c
+  internal/dataplane/faketcp_admission_contract_test.go
+  internal/dataplane/faketcp_gso_contract_test.go
+  internal/dataplane/faketcp_l3_parser_test.go
+  internal/dataplane/faketcp_mtu_contract_test.go
+  internal/dataplane/faketcp_order_test.go
+  internal/dataplane/faketcp_policy_test.go
+  internal/dataplane/faketcp_single_parse_contract_test.go
+  internal/faketcp/l3_single_parse_model_test.go
 )
 readonly -a GSO_TESTS=(
   TestFakeTCPRealHostVirtioNetHeaderEncoding
@@ -99,6 +114,22 @@ readonly CANONICAL_PARENTS
   fail 'bound commit does not descend from the explicit canonical merge'
 /usr/bin/git -C "${REPOSITORY}" merge-base --is-ancestor "${STANDALONE_SCOPE_COMMIT}" "${BOUND_COMMIT}" ||
   fail 'bound commit does not contain the exact standalone lease scope'
+
+SINGLE_L3_PARENTS="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P "${SINGLE_L3_MERGE}")" ||
+  fail 'cannot read single-L3 merge parents'
+readonly SINGLE_L3_PARENTS
+[[ "${SINGLE_L3_PARENTS}" == "${SINGLE_L3_PARENT} ${SINGLE_L3_FINAL}" ]] ||
+  fail 'single-L3 merge does not preserve the exact reviewed parents'
+/usr/bin/git -C "${REPOSITORY}" merge-base --is-ancestor "${SINGLE_L3_MERGE}" "${BOUND_COMMIT}" ||
+  fail 'bound commit does not descend from the explicit single-L3 merge'
+SINGLE_L3_PATHS="$(/usr/bin/git -C "${REPOSITORY}" diff --name-only \
+  "${SINGLE_L3_MERGE}^1" "${SINGLE_L3_MERGE}")" || fail 'cannot read single-L3 merge write set'
+readonly SINGLE_L3_PATHS
+[[ "${SINGLE_L3_PATHS}" == $'bpf/wg_mix_faketcp.h\nbpf/wg_mix_tc.c\ninternal/dataplane/faketcp_admission_contract_test.go\ninternal/dataplane/faketcp_gso_contract_test.go\ninternal/dataplane/faketcp_l3_parser_test.go\ninternal/dataplane/faketcp_mtu_contract_test.go\ninternal/dataplane/faketcp_order_test.go\ninternal/dataplane/faketcp_policy_test.go\ninternal/dataplane/faketcp_single_parse_contract_test.go\ninternal/faketcp/l3_single_parse_model_test.go' ]] ||
+  fail 'single-L3 merge changed a non-topic path'
+/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
+  "${SINGLE_L3_MERGE}" "${BOUND_COMMIT}" -- "${SINGLE_L3_FILES[@]}" ||
+  fail 'reviewed single-L3 topic drifted after its explicit merge'
 
 # The original standalone commit itself remained isolated from the controller.
 /usr/bin/git -C "${REPOSITORY}" diff --exit-code \
