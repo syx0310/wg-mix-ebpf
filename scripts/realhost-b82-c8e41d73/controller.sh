@@ -599,6 +599,7 @@ execute_provision_apply() {
   for operation in "${BASE_IDENTITY_OPERATIONS[@]}" "${BOOTSTRAP_ROOT_VERIFY_OPERATIONS[@]}"; do
     run_operation execute "${operation}" || return $?
   done
+  verify_remote_package || return $?
   verify_provisioner || return $?
   state_transition BOOTSTRAP_ONLY PROVISION_CHECK
   run_provision_check || return $?
