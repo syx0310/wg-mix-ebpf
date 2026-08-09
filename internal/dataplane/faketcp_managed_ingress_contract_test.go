@@ -78,9 +78,11 @@ func TestFakeTCPManagedIngressEarlyDropSourceOrderAndABI(t *testing.T) {
 	) {
 		t.Fatal("TC ingress no longer binds metadata to the inverse-rotated payload typeword")
 	}
-	bodyMarker := "int wg_mix_faketcp_ingress(struct xdp_md *xdp)"
-	if strings.Contains(source, "static __always_inline int faketcp_xdp_ingress_body(") {
-		bodyMarker = "static __always_inline int faketcp_xdp_ingress_body("
+	bodyMarker := "faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)"
+	bodyStart := strings.Index(source, bodyMarker)
+	wrapperStart := strings.Index(source, "SEC(\"xdp\")\nint wg_mix_faketcp_ingress(struct xdp_md *xdp)")
+	if bodyStart < 0 || wrapperStart < 0 || bodyStart >= wrapperStart {
+		t.Fatal("managed-ingress accounting is not wholly inside the generation-guarded XDP body")
 	}
 	xdp := sourceSection(
 		t, source, bodyMarker,

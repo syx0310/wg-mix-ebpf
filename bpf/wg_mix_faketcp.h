@@ -51,6 +51,25 @@
 #define FAKETCP_CONTROL_MAX_BURST 4096U
 #define FAKETCP_CONTROL_CAS_ATTEMPTS 4
 
+#define FAKETCP_GENERATION_OPEN       (1ULL << 63)
+#define FAKETCP_GENERATION_SEALED     (1ULL << 62)
+#define FAKETCP_GENERATION_POISON     (1ULL << 61)
+#define FAKETCP_GENERATION_WAKE_ARMED (1ULL << 60)
+#define FAKETCP_GENERATION_INFLIGHT_MASK \
+	(FAKETCP_GENERATION_WAKE_ARMED - 1)
+#define FAKETCP_GENERATION_CAS_ATTEMPTS 8
+
+#define FAKETCP_GENERATION_CONTROL_ASSERT_CLOSED 1
+#define FAKETCP_GENERATION_CONTROL_OPEN          2
+#define FAKETCP_GENERATION_CONTROL_CLOSE         3
+
+#define FAKETCP_GENERATION_RESULT_MALFORMED 0
+#define FAKETCP_GENERATION_RESULT_IDLE      1
+#define FAKETCP_GENERATION_RESULT_OPEN      2
+#define FAKETCP_GENERATION_RESULT_WAIT      3
+#define FAKETCP_GENERATION_RESULT_POISON    4
+#define FAKETCP_GENERATION_RESULT_MISMATCH  5
+
 // Required, non-weak module kfunc. The experimental object cannot be linked or
 // verifier-loaded unless wg_mix_faketcp_checksum is loaded with this exact BTF
 // function. The baseline object never sees this declaration or relocation.
@@ -426,6 +445,33 @@ struct faketcp_runtime_identity_value {
 
 _Static_assert(sizeof(struct faketcp_runtime_identity_value) == 32,
 	       "faketcp runtime identity ABI drift");
+
+struct faketcp_generation_gate_value {
+	__u64 generation;
+	__u64 state;
+};
+
+struct faketcp_generation_control_request {
+	__u64 generation;
+	__u8 incarnation[16];
+	__u32 operation;
+	__u32 reserved;
+};
+
+struct faketcp_generation_wake {
+	__u64 generation;
+	__u8 incarnation[16];
+	__u64 state;
+};
+
+_Static_assert(sizeof(struct faketcp_generation_gate_value) == 16,
+	       "faketcp generation gate ABI drift");
+_Static_assert(__builtin_offsetof(struct faketcp_generation_gate_value, state) == 8,
+	       "faketcp generation state alignment drift");
+_Static_assert(sizeof(struct faketcp_generation_control_request) == 32,
+	       "faketcp generation control request ABI drift");
+_Static_assert(sizeof(struct faketcp_generation_wake) == 32,
+	       "faketcp generation wake ABI drift");
 
 #define FAKETCP_DIRECTION_EGRESS 1
 #define FAKETCP_DIRECTION_INGRESS 2
@@ -830,6 +876,19 @@ struct {
 } faketcp_rt_id SEC(".maps");
 
 struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(map_flags, BPF_F_RDONLY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct faketcp_generation_gate_value);
+} faketcp_gen_gt SEC(".maps");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_RINGBUF);
+	__uint(max_entries, 4096);
+} faketcp_gen_wk SEC(".maps");
+
+struct {
 	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
 	__uint(max_entries, 1);
 	__type(key, __u32);
@@ -982,6 +1041,243 @@ faketcp_runtime_identity(__u64 generation)
 }
 
 static __always_inline int
+faketcp_generation_poison(struct faketcp_generation_gate_value *gate)
+{
+	__sync_fetch_and_or(&gate->state, FAKETCP_GENERATION_POISON);
+	return FAKETCP_GENERATION_RESULT_POISON;
+}
+
+static __always_inline int faketcp_generation_enter(__u64 generation)
+{
+	__u32 zero = 0;
+	struct faketcp_generation_gate_value *gate;
+
+	gate = bpf_map_lookup_elem(&faketcp_gen_gt, &zero);
+	if (!gate || generation == 0)
+		return -1;
+	if (gate->generation != generation) {
+		if (gate->generation != 0 || gate->state != 0)
+			faketcp_generation_poison(gate);
+		return -1;
+	}
+
+#pragma unroll
+	for (int attempt = 0; attempt < FAKETCP_GENERATION_CAS_ATTEMPTS; attempt++) {
+		__u64 old = gate->state;
+		__u64 count = old & FAKETCP_GENERATION_INFLIGHT_MASK;
+		__u64 flags = old & ~FAKETCP_GENERATION_INFLIGHT_MASK;
+
+		if (flags & FAKETCP_GENERATION_POISON)
+			return -1;
+		if ((flags == 0 && count == 0) ||
+		    (flags == FAKETCP_GENERATION_SEALED && count == 0) ||
+		    flags == (FAKETCP_GENERATION_SEALED |
+			      FAKETCP_GENERATION_WAKE_ARMED))
+			return -1;
+		if (flags != FAKETCP_GENERATION_OPEN) {
+			faketcp_generation_poison(gate);
+			return -1;
+		}
+		if (count == FAKETCP_GENERATION_INFLIGHT_MASK) {
+			faketcp_generation_poison(gate);
+			return -1;
+		}
+		if (__sync_val_compare_and_swap(&gate->state, old, old + 1) == old)
+			return 0;
+	}
+	return -1;
+}
+
+static __always_inline void faketcp_generation_exit(__u64 generation)
+{
+	__u32 zero = 0;
+	struct faketcp_generation_gate_value *gate;
+	struct faketcp_runtime_identity_value *identity;
+	struct faketcp_generation_wake wake = {};
+	__u64 old, count, flags;
+
+	gate = bpf_map_lookup_elem(&faketcp_gen_gt, &zero);
+	if (!gate)
+		return;
+	old = __sync_fetch_and_sub(&gate->state, 1);
+	count = old & FAKETCP_GENERATION_INFLIGHT_MASK;
+	flags = old & ~FAKETCP_GENERATION_INFLIGHT_MASK;
+	if (count == 0 || gate->generation != generation) {
+		faketcp_generation_poison(gate);
+		return;
+	}
+	if (flags & FAKETCP_GENERATION_POISON)
+		return;
+	if (flags != FAKETCP_GENERATION_OPEN &&
+	    flags != (FAKETCP_GENERATION_SEALED |
+		      FAKETCP_GENERATION_WAKE_ARMED)) {
+		faketcp_generation_poison(gate);
+		return;
+	}
+	if (count != 1 || flags != (FAKETCP_GENERATION_SEALED |
+				    FAKETCP_GENERATION_WAKE_ARMED))
+		return;
+
+	identity = faketcp_runtime_identity(generation);
+	if (!identity) {
+		faketcp_generation_poison(gate);
+		return;
+	}
+	wake.generation = generation;
+	__builtin_memcpy(wake.incarnation, identity->incarnation,
+			 sizeof(wake.incarnation));
+	wake.state = FAKETCP_GENERATION_SEALED |
+		     FAKETCP_GENERATION_WAKE_ARMED;
+	if (bpf_ringbuf_output(&faketcp_gen_wk, &wake,
+			       sizeof(wake), 0) == 0)
+		__sync_val_compare_and_swap(
+			&gate->state,
+			FAKETCP_GENERATION_SEALED |
+				FAKETCP_GENERATION_WAKE_ARMED,
+			FAKETCP_GENERATION_SEALED);
+}
+
+static __always_inline int
+faketcp_generation_open(struct faketcp_generation_gate_value *gate,
+			__u64 generation)
+{
+	__u64 bound;
+
+	bound = __sync_val_compare_and_swap(&gate->generation, 0, generation);
+	if (bound != 0 && bound != generation)
+		return faketcp_generation_poison(gate);
+
+#pragma unroll
+	for (int attempt = 0; attempt < FAKETCP_GENERATION_CAS_ATTEMPTS; attempt++) {
+		__u64 old = gate->state;
+		__u64 count = old & FAKETCP_GENERATION_INFLIGHT_MASK;
+		__u64 flags = old & ~FAKETCP_GENERATION_INFLIGHT_MASK;
+
+		if (flags & FAKETCP_GENERATION_POISON)
+			return FAKETCP_GENERATION_RESULT_POISON;
+		if (flags == FAKETCP_GENERATION_OPEN)
+			return FAKETCP_GENERATION_RESULT_OPEN;
+		if ((flags == FAKETCP_GENERATION_SEALED && count == 0) ||
+		    flags == (FAKETCP_GENERATION_SEALED |
+			      FAKETCP_GENERATION_WAKE_ARMED))
+			return FAKETCP_GENERATION_RESULT_MISMATCH;
+		if (old != 0)
+			return faketcp_generation_poison(gate);
+		if (__sync_val_compare_and_swap(&gate->state, 0,
+						FAKETCP_GENERATION_OPEN) == 0)
+			return FAKETCP_GENERATION_RESULT_OPEN;
+	}
+	return FAKETCP_GENERATION_RESULT_MISMATCH;
+}
+
+static __always_inline int
+faketcp_generation_close(struct faketcp_generation_gate_value *gate,
+			 __u64 generation)
+{
+	__u64 bound;
+
+	bound = __sync_val_compare_and_swap(&gate->generation, 0, generation);
+	if (bound != 0 && bound != generation)
+		return faketcp_generation_poison(gate);
+
+#pragma unroll
+	for (int attempt = 0; attempt < FAKETCP_GENERATION_CAS_ATTEMPTS; attempt++) {
+		__u64 old = gate->state;
+		__u64 count = old & FAKETCP_GENERATION_INFLIGHT_MASK;
+		__u64 flags = old & ~FAKETCP_GENERATION_INFLIGHT_MASK;
+		__u64 next;
+
+		if (flags & FAKETCP_GENERATION_POISON)
+			return FAKETCP_GENERATION_RESULT_POISON;
+		if (old == 0) {
+			if (__sync_val_compare_and_swap(
+				    &gate->state, 0,
+				    FAKETCP_GENERATION_SEALED) == 0)
+				return FAKETCP_GENERATION_RESULT_IDLE;
+			continue;
+		}
+		if (flags == FAKETCP_GENERATION_OPEN) {
+			next = FAKETCP_GENERATION_SEALED | count;
+			if (count != 0)
+				next |= FAKETCP_GENERATION_WAKE_ARMED;
+			if (__sync_val_compare_and_swap(&gate->state, old, next) != old)
+				continue;
+			return count == 0 ? FAKETCP_GENERATION_RESULT_IDLE :
+				FAKETCP_GENERATION_RESULT_WAIT;
+		}
+		if (flags == FAKETCP_GENERATION_SEALED && count == 0)
+			return FAKETCP_GENERATION_RESULT_IDLE;
+		if (flags == (FAKETCP_GENERATION_SEALED |
+			      FAKETCP_GENERATION_WAKE_ARMED)) {
+			if (count != 0)
+				return FAKETCP_GENERATION_RESULT_WAIT;
+			if (__sync_val_compare_and_swap(
+				    &gate->state, old,
+				    FAKETCP_GENERATION_SEALED) == old)
+				return FAKETCP_GENERATION_RESULT_IDLE;
+			continue;
+		}
+		return faketcp_generation_poison(gate);
+	}
+	return FAKETCP_GENERATION_RESULT_MISMATCH;
+}
+
+SEC("classifier/faketcp_generation_control")
+int wg_faketcp_generation_control(struct __sk_buff *skb)
+{
+	struct faketcp_generation_control_request request = {};
+	struct faketcp_generation_gate_value *gate;
+	struct faketcp_runtime_identity_value *identity;
+	__u32 zero = 0;
+	__u8 difference = 0;
+	__u64 state, count, flags, bound;
+
+	if (skb->len != sizeof(request) ||
+	    bpf_skb_load_bytes(skb, 0, &request, sizeof(request)) < 0 ||
+	    bpf_ringbuf_query(&faketcp_gen_wk, BPF_RB_RING_SIZE) != 4096 ||
+	    request.generation == 0 || request.reserved != 0 ||
+	    request.operation < FAKETCP_GENERATION_CONTROL_ASSERT_CLOSED ||
+	    request.operation > FAKETCP_GENERATION_CONTROL_CLOSE)
+		return FAKETCP_GENERATION_RESULT_MALFORMED;
+	identity = faketcp_runtime_identity(request.generation);
+	if (!identity)
+		return FAKETCP_GENERATION_RESULT_MALFORMED;
+#pragma unroll
+	for (int i = 0; i < 16; i++)
+		difference |= request.incarnation[i] ^ identity->incarnation[i];
+	if (difference != 0)
+		return FAKETCP_GENERATION_RESULT_MALFORMED;
+	gate = bpf_map_lookup_elem(&faketcp_gen_gt, &zero);
+	if (!gate)
+		return FAKETCP_GENERATION_RESULT_MALFORMED;
+	switch (request.operation) {
+	case FAKETCP_GENERATION_CONTROL_ASSERT_CLOSED:
+		bound = gate->generation;
+		state = gate->state;
+		count = state & FAKETCP_GENERATION_INFLIGHT_MASK;
+		flags = state & ~FAKETCP_GENERATION_INFLIGHT_MASK;
+		if (flags & FAKETCP_GENERATION_POISON)
+			return FAKETCP_GENERATION_RESULT_POISON;
+		if (bound != 0 && bound != request.generation)
+			return faketcp_generation_poison(gate);
+		if (state == 0)
+			return FAKETCP_GENERATION_RESULT_IDLE;
+		if (flags == FAKETCP_GENERATION_OPEN ||
+		    (flags == FAKETCP_GENERATION_SEALED && count == 0) ||
+		    flags == (FAKETCP_GENERATION_SEALED |
+			      FAKETCP_GENERATION_WAKE_ARMED))
+			return FAKETCP_GENERATION_RESULT_MISMATCH;
+		return faketcp_generation_poison(gate);
+	case FAKETCP_GENERATION_CONTROL_OPEN:
+		return faketcp_generation_open(gate, request.generation);
+	case FAKETCP_GENERATION_CONTROL_CLOSE:
+		return faketcp_generation_close(gate, request.generation);
+	default:
+		return FAKETCP_GENERATION_RESULT_MALFORMED;
+	}
+}
+
+static __always_inline int
 faketcp_bind_runtime_identity(const struct faketcp_session_key *key,
 			      struct faketcp_event *event)
 {
@@ -1072,8 +1368,8 @@ faketcp_take_control_budget(struct faketcp_control_policy_value *policy,
 }
 
 static __always_inline int
-faketcp_admit_control_event(const struct faketcp_session_key *session,
-			    __u32 wg_id, __u8 event_type, __u64 now)
+faketcp_admit_control_event_inner(const struct faketcp_session_key *session,
+				  __u32 wg_id, __u8 event_type, __u64 now)
 {
 	struct faketcp_control_policy_key policy_key = {
 		.generation = session->generation,
@@ -1126,6 +1422,22 @@ faketcp_admit_control_event(const struct faketcp_session_key *session,
 				BPF_ANY) < 0)
 		inc_faketcp_stat(FAKETCP_STAT_EVENT_ERROR);
 	return 1;
+}
+
+static __always_inline int
+faketcp_admit_control_event(const struct faketcp_session_key *session,
+			    __u32 wg_id, __u8 event_type, __u64 now)
+{
+	int admitted;
+
+	if (faketcp_generation_enter(session->generation) < 0) {
+		inc_faketcp_stat(FAKETCP_STAT_CONTROL_POLICY_MISS);
+		return 0;
+	}
+	admitted = faketcp_admit_control_event_inner(
+		session, wg_id, event_type, now);
+	faketcp_generation_exit(session->generation);
+	return admitted;
 }
 
 static __always_inline int faketcp_emit_event(const struct faketcp_session_key *key,
@@ -3023,8 +3335,8 @@ static __always_inline int faketcp_xdp_reject(__u32 stat)
 	return XDP_DROP;
 }
 
-SEC("xdp")
-int wg_mix_faketcp_ingress(struct xdp_md *xdp)
+static __always_inline int
+faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 {
 	void *data = (void *)(long)xdp->data;
 	void *data_end = (void *)(long)xdp->data_end;
@@ -3049,12 +3361,9 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	__u16 total_len, tcp_len, payload_len, new_total_len;
 	__u32 frame_len, l3_off = 0, seq, next_seq;
 	__u64 now;
-	__u64 generation = 0;
 	__s64 sum;
 	int managed_interface, parse_rc, parse_action, admission_decision;
 
-	if (!active_generation(&generation))
-		return XDP_PASS;
 	managed_interface = faketcp_xdp_managed_interface(xdp->ingress_ifindex,
 							 generation);
 	frame_len = (__u32)((long)data_end - (long)data);
@@ -3251,6 +3560,21 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	}
 	inc_faketcp_stat(FAKETCP_STAT_INGRESS_OK);
 	return XDP_PASS;
+}
+
+SEC("xdp")
+int wg_mix_faketcp_ingress(struct xdp_md *xdp)
+{
+	__u64 generation = 0;
+	int action;
+
+	if (!active_generation(&generation))
+		return XDP_PASS;
+	if (faketcp_generation_enter(generation) < 0)
+		return XDP_DROP;
+	action = faketcp_xdp_ingress_body(xdp, generation);
+	faketcp_generation_exit(generation);
+	return action;
 }
 
 #endif

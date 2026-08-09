@@ -85,6 +85,10 @@ type experimentalTCStageFactory func(
 	func() error,
 ) (experimentalTCStageOwner, error)
 
+type fakeTCPPolicyGenerationCollectionBinder interface {
+	BindCollection(context.Context, *experimentalCollectionOwner, faketcp.RuntimeIdentity) error
+}
+
 type experimentalEventMapClone struct {
 	bpfMap *ebpf.Map
 	close  func() error
@@ -427,6 +431,7 @@ type experimentalFakeTCPRuntimeState struct {
 	identity    faketcp.RuntimeIdentity
 	engine      *faketcp.Engine
 	collection  *experimentalCollectionOwner
+	isolation   fakeTCPPolicyGenerationIsolationBackend
 	core        experimentalCoreStageOwner
 	tc          experimentalTCStageOwner
 	xdp         *fakeTCPXDPStage
@@ -485,6 +490,32 @@ func linuxMapFromExperimentalResource(resource experimentalMapResource) (*ebpf.M
 	default:
 		return nil, false
 	}
+}
+
+func (claim *fakeTCPPolicyRuntimeBuildClaim) bindIsolationCollection(
+	ctx context.Context,
+	owner *experimentalCollectionOwner,
+	identity faketcp.RuntimeIdentity,
+) (fakeTCPPolicyGenerationIsolationBackend, error) {
+	if claim == nil || claim.transaction == nil {
+		return nil, errFakeTCPPolicyGenerationLeaseRequired
+	}
+	transaction := claim.transaction
+	transaction.mu.Lock()
+	defer transaction.mu.Unlock()
+	if err := transaction.assertAccessLocked(ctx, claim); err != nil {
+		return nil, err
+	}
+	if identity.Generation != transaction.plan.generation {
+		return nil, errors.New("bind FakeTCP generation isolation: runtime identity generation mismatch")
+	}
+	isolation := transaction.isolation
+	if binder, ok := isolation.(fakeTCPPolicyGenerationCollectionBinder); ok {
+		if err := binder.BindCollection(ctx, owner, identity); err != nil {
+			return nil, err
+		}
+	}
+	return isolation, nil
 }
 
 func (claim experimentalLinuxFreshCollectionClaim) WithExclusiveFreshFakeTCPCollection(
@@ -659,6 +690,7 @@ func (build *experimentalRuntimeBuild) runtimeOwner() *ExperimentalFakeTCPRuntim
 			identity:   build.engine.Identity(),
 			engine:     build.engine,
 			collection: build.options.collection,
+			isolation:  build.isolation,
 			core:       build.coreStage,
 			tc:         build.tcStage,
 			xdp:        build.xdpStage,
@@ -702,6 +734,7 @@ type experimentalRuntimeBuild struct {
 	sessions          *generationFencedSessionStore
 	events            *generationFencedEventMap
 	engine            *faketcp.Engine
+	isolation         fakeTCPPolicyGenerationIsolationBackend
 	slowPath          experimentalSlowPath
 	freshClaim        experimentalLinuxFreshCollectionClaim
 	policyMaps        fakeTCPPolicyMaps
@@ -890,6 +923,14 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if err != nil {
 		return fmt.Errorf("build experimental FakeTCP runtime Engine: %w", err)
 	}
+	build.isolation, err = build.claim.bindIsolationCollection(
+		build.activeCtx,
+		options.collection,
+		build.engine.Identity(),
+	)
+	if err != nil {
+		return fmt.Errorf("bind experimental FakeTCP generation isolation: %w", err)
+	}
 	eventSource := options.eventSource
 	if eventSource == nil {
 		bpfMap, ok := eventsMap.(*ebpf.Map)
@@ -1048,6 +1089,12 @@ func (build *experimentalRuntimeBuild) commitAttachedCore(
 	if err := build.activeContextError(); err != nil {
 		return err
 	}
+	if err := build.claim.Activate(build.activeCtx, build.policyStage); err != nil {
+		return err
+	}
+	if err := build.activeContextError(); err != nil {
+		return err
+	}
 	if err := build.coreStage.CommitControl(); err != nil {
 		return err
 	}
@@ -1120,30 +1167,33 @@ func (build *experimentalRuntimeBuild) cleanupUncommitted() (bool, error) {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("deactivate FakeTCP baseline core: %w", err))
 		}
 	}
-	if build.xdpStage != nil {
-		if err := build.xdpStage.Close(); err != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP XDP stage: %w", err))
+	if coreInactive && build.policyStage != nil {
+		if err := build.claim.Rollback(build.cleanupCtx, build.policyStage); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP policy stage: %w", err))
 		} else {
-			build.xdpStage = nil
+			build.policyStage = nil
 		}
 	}
-	if build.tcStage != nil {
-		if err := build.tcStage.Close(); err != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP TC stage: %w", err))
-		} else {
-			build.tcStage = nil
-		}
-	}
-	externalDetached := coreInactive && build.xdpStage == nil && build.tcStage == nil &&
-		experimentalSlowPathIsNil(build.slowPath)
-	if externalDetached {
-		if build.policyStage != nil {
-			if err := build.claim.Rollback(build.cleanupCtx, build.policyStage); err != nil {
-				cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP policy stage: %w", err))
+	policyClosed := coreInactive && build.policyStage == nil
+	if policyClosed {
+		if build.xdpStage != nil {
+			if err := build.xdpStage.Close(); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP XDP stage: %w", err))
 			} else {
-				build.policyStage = nil
+				build.xdpStage = nil
 			}
 		}
+		if build.tcStage != nil {
+			if err := build.tcStage.Close(); err != nil {
+				cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP TC stage: %w", err))
+			} else {
+				build.tcStage = nil
+			}
+		}
+	}
+	externalDetached := policyClosed && build.xdpStage == nil && build.tcStage == nil &&
+		experimentalSlowPathIsNil(build.slowPath)
+	if externalDetached {
 		if build.programStage != nil {
 			if err := build.programStage.Rollback(build.cleanupCtx, build.claim); err != nil {
 				cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP program array stage: %w", err))
@@ -1195,6 +1245,7 @@ func (build *experimentalRuntimeBuild) cleanupUncommitted() (bool, error) {
 	complete := internalClosed && build.options.collection == nil && build.claim == nil
 	if complete {
 		build.engine = nil
+		build.isolation = nil
 		build.freshClaim = experimentalLinuxFreshCollectionClaim{}
 	}
 	return complete, errors.Join(cleanupErrors...)
@@ -1448,6 +1499,8 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 	events := state.handles.events
 	tc := state.tc
 	xdp := state.xdp
+	isolation := state.isolation
+	generation := state.generation
 	collection := state.collection
 	state.mu.Unlock()
 
@@ -1472,12 +1525,28 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 			closeErrors = append(closeErrors, fmt.Errorf("deactivate experimental FakeTCP runtime baseline core: %w", err))
 		}
 	}
-	xdpErr := wrapExperimentalRuntimeClose("XDP links", xdp)
-	tcErr := wrapExperimentalRuntimeClose("TC filters", tc)
-	closeErrors = append(closeErrors, xdpErr, tcErr)
+	var isolationErr error
+	if coreInactive {
+		if fakeTCPPolicyGenerationIsolationBackendIsNil(isolation) {
+			isolationErr = errors.New("quiesce experimental FakeTCP runtime: generation isolation owner is nil")
+		} else {
+			isolationErr = isolation.Quiesce(context.Background(), generation)
+			if isolationErr != nil {
+				isolationErr = fmt.Errorf("quiesce experimental FakeTCP runtime generation %d: %w", generation, isolationErr)
+			}
+		}
+		closeErrors = append(closeErrors, isolationErr)
+	}
+	quiesced := coreInactive && isolationErr == nil
+	var xdpErr, tcErr error
+	if quiesced {
+		xdpErr = wrapExperimentalRuntimeClose("XDP links", xdp)
+		tcErr = wrapExperimentalRuntimeClose("TC filters", tc)
+		closeErrors = append(closeErrors, xdpErr, tcErr)
+	}
 
 	var coreErr, sessionErr, eventErr, collectionErr error
-	if coreInactive && xdpErr == nil && tcErr == nil {
+	if quiesced && xdpErr == nil && tcErr == nil {
 		coreErr = wrapExperimentalRuntimeClose("baseline core", core)
 		closeErrors = append(closeErrors, coreErr)
 		if coreErr == nil {
@@ -1495,14 +1564,14 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 	state.mu.Lock()
 	state.closeErr = err
 	state.closing = false
-	if xdpErr == nil {
+	if quiesced && xdpErr == nil {
 		state.xdp = nil
 	}
-	if tcErr == nil {
+	if quiesced && tcErr == nil {
 		state.tc = nil
 	}
 	state.slowPath = nil
-	if coreInactive && coreErr == nil && xdpErr == nil && tcErr == nil {
+	if quiesced && coreErr == nil && xdpErr == nil && tcErr == nil {
 		state.core = nil
 		if sessionErr == nil {
 			state.handles.sessions = nil
@@ -1511,13 +1580,14 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 			state.handles.events = nil
 		}
 	}
-	complete := coreInactive && xdpErr == nil && tcErr == nil &&
+	complete := quiesced && xdpErr == nil && tcErr == nil &&
 		coreErr == nil && sessionErr == nil && eventErr == nil && collectionErr == nil
 	if complete {
 		state.closed = true
 		state.handles = ExperimentalFakeTCPRuntimeHandles{}
 		state.engine = nil
 		state.collection = nil
+		state.isolation = nil
 	}
 	close(done)
 	state.mu.Unlock()

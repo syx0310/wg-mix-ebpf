@@ -61,6 +61,9 @@ func TestStructSizesAreStable(t *testing.T) {
 		{"FakeTCPControlFlowKey", unsafe.Sizeof(FakeTCPControlFlowKey{}), 32},
 		{"FakeTCPControlFlowValue", unsafe.Sizeof(FakeTCPControlFlowValue{}), 16},
 		{"FakeTCPRuntimeIdentityValue", unsafe.Sizeof(FakeTCPRuntimeIdentityValue{}), 32},
+		{"FakeTCPGenerationGateValue", unsafe.Sizeof(FakeTCPGenerationGateValue{}), 16},
+		{"FakeTCPGenerationControlRequest", unsafe.Sizeof(FakeTCPGenerationControlRequest{}), 32},
+		{"FakeTCPGenerationWake", unsafe.Sizeof(FakeTCPGenerationWake{}), 32},
 		{"FakeTCPEvent", unsafe.Sizeof(FakeTCPEvent{}), FakeTCPEventSize},
 		{"FakeTCPPacketEvent", unsafe.Sizeof(FakeTCPPacketEvent{}), FakeTCPPacketEventSize},
 	}
@@ -77,6 +80,15 @@ func TestStructSizesAreStable(t *testing.T) {
 	}
 	if got, want := unsafe.Offsetof(FakeTCPManagedIfKey{}.UnderlayIndex), uintptr(8); got != want {
 		t.Fatalf("FakeTCPManagedIfKey.UnderlayIndex offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPGenerationGateValue{}.State), uintptr(8); got != want {
+		t.Fatalf("FakeTCPGenerationGateValue.State offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPGenerationControlRequest{}.Operation), uintptr(24); got != want {
+		t.Fatalf("FakeTCPGenerationControlRequest.Operation offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPGenerationWake{}.State), uintptr(24); got != want {
+		t.Fatalf("FakeTCPGenerationWake.State offset = %d, want %d", got, want)
 	}
 	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Generation), uintptr(0); got != want {
 		t.Fatalf("FakeTCPSessionValue.Generation offset = %d, want %d", got, want)

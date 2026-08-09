@@ -124,7 +124,7 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load experimental object %s (%s): %v", identity.Source, identity.SHA256, err)
 	}
-	defer collection.Close()
+	t.Cleanup(collection.Close)
 
 	const (
 		generation = uint64(91)
@@ -134,6 +134,15 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 		sourcePort = uint16(31001)
 		remotePort = uint16(443)
 	)
+	incarnation := faketcp.RuntimeIncarnation{1}
+	openFakeTCPPacketProbeGenerationGate(
+		t, collection, generation, incarnation, ifindex, remotePort,
+	)
+	t.Run("generation poison fails closed", func(t *testing.T) {
+		probeFakeTCPPacketProbePoisonFailClosed(
+			t, spec.Copy(), generation, incarnation, ifindex, remotePort,
+		)
+	})
 	localIPv4, err := faketcp.RawIPv4BE32(netip.MustParseAddr("10.0.0.1"))
 	if err != nil {
 		t.Fatal(err)
@@ -275,6 +284,186 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 			t.Fatalf("GSO-reject stat delta=%d, want 1", after-before)
 		}
 	})
+}
+
+func openFakeTCPPacketProbeGenerationGate(
+	t *testing.T,
+	collection *ebpf.Collection,
+	generation uint64,
+	incarnation faketcp.RuntimeIncarnation,
+	ifindex uint32,
+	destinationPort uint16,
+) {
+	t.Helper()
+	gate := collection.Maps[fakeTCPGenerationGateMapName]
+	wake := collection.Maps[fakeTCPGenerationWakeMapName]
+	runtimeIdentity := collection.Maps[fakeTCPRuntimeIDMapName]
+	control := collection.Programs[fakeTCPGenerationControlProgramName]
+	xdp := collection.Programs[fakeTCPXDPProgramName]
+	if gate == nil || wake == nil || runtimeIdentity == nil || control == nil || xdp == nil {
+		t.Fatal("experimental object has an incomplete generation barrier")
+	}
+	if err := validateLiveFakeTCPGenerationControl(gate, wake, runtimeIdentity, control); err != nil {
+		t.Fatalf("validate packet-probe generation control identity: %v", err)
+	}
+	if err := gate.Update(uint32(0), abi.FakeTCPGenerationGateValue{
+		Generation: generation,
+		State:      abi.FakeTCPGenerationStateOpen,
+	}, ebpf.UpdateAny); !errors.Is(err, unix.EPERM) {
+		t.Fatalf("syscall write to BPF_F_RDONLY generation gate error=%v, want EPERM", err)
+	}
+	updateFakeTCPPacketProbeRuntimeIdentity(t, runtimeIdentity, generation, incarnation)
+	if result, err := runFakeTCPPacketProbeGenerationControl(
+		control, generation, incarnation, abi.FakeTCPGenerationControlAssertClosed,
+	); err != nil || result != abi.FakeTCPGenerationResultIdle {
+		t.Fatalf("ASSERT_CLOSED result=%d error=%v", result, err)
+	}
+
+	controlMap := collection.Maps["control_map"]
+	if controlMap == nil {
+		t.Fatal("experimental object has no control_map")
+	}
+	if err := controlMap.Update(abi.ControlKeyGlobal, abi.ControlValue{
+		ActiveGeneration: generation,
+		ABIVersion:       abi.Version,
+	}, ebpf.UpdateAny); err != nil {
+		t.Fatalf("publish unopened packet-probe selector: %v", err)
+	}
+	packet, _ := buildFakeTCPProbeUDPPacket(t, 31001, destinationPort, 32)
+	result, output, err := runFakeTCPPacketProbe(
+		xdp, packet, fakeTCPXDPContext{IngressIfindex: ifindex}, len(packet)+64,
+	)
+	if err != nil || result != uint32(1) || !bytes.Equal(output, packet) {
+		t.Fatalf("unopened generation action=%d error=%v mutated=%t",
+			result, err, !bytes.Equal(output, packet))
+	}
+
+	if result, err := runFakeTCPPacketProbeGenerationControl(
+		control, generation, incarnation, abi.FakeTCPGenerationControlOpen,
+	); err != nil || result != abi.FakeTCPGenerationResultOpen {
+		t.Fatalf("OPEN result=%d error=%v", result, err)
+	}
+	t.Cleanup(func() {
+		result, err := runFakeTCPPacketProbeGenerationControl(
+			control, generation, incarnation, abi.FakeTCPGenerationControlClose,
+		)
+		if err != nil || result != abi.FakeTCPGenerationResultIdle {
+			t.Errorf("CLOSE result=%d error=%v", result, err)
+			return
+		}
+		var observed abi.FakeTCPGenerationGateValue
+		if err := gate.Lookup(uint32(0), &observed); err != nil {
+			t.Errorf("reread closed generation gate: %v", err)
+		} else if observed.Generation != generation ||
+			observed.State != abi.FakeTCPGenerationStateSealed {
+			t.Errorf("closed generation gate=%#v, want sealed idle", observed)
+		}
+	})
+}
+
+func probeFakeTCPPacketProbePoisonFailClosed(
+	t *testing.T,
+	spec *ebpf.CollectionSpec,
+	generation uint64,
+	incarnation faketcp.RuntimeIncarnation,
+	ifindex uint32,
+	destinationPort uint16,
+) {
+	t.Helper()
+	collection, err := ebpf.NewCollection(spec)
+	if err != nil {
+		t.Fatalf("load poison-negative experimental collection: %v", err)
+	}
+	defer collection.Close()
+	gate := collection.Maps[fakeTCPGenerationGateMapName]
+	runtimeIdentity := collection.Maps[fakeTCPRuntimeIDMapName]
+	control := collection.Programs[fakeTCPGenerationControlProgramName]
+	xdp := collection.Programs[fakeTCPXDPProgramName]
+	if gate == nil || runtimeIdentity == nil || control == nil || xdp == nil {
+		t.Fatal("poison-negative collection has an incomplete generation barrier")
+	}
+	updateFakeTCPPacketProbeRuntimeIdentity(t, runtimeIdentity, generation, incarnation)
+	wrongIncarnation := incarnation
+	wrongIncarnation[1] = 1
+	if result, err := runFakeTCPPacketProbeGenerationControl(
+		control, generation, wrongIncarnation, abi.FakeTCPGenerationControlAssertClosed,
+	); err != nil || result != abi.FakeTCPGenerationResultMalformed {
+		t.Fatalf("wrong-incarnation result=%d error=%v", result, err)
+	}
+	var observed abi.FakeTCPGenerationGateValue
+	if err := gate.Lookup(uint32(0), &observed); err != nil || observed != (abi.FakeTCPGenerationGateValue{}) {
+		t.Fatalf("wrong incarnation changed fresh gate=%#v error=%v", observed, err)
+	}
+	if result, err := runFakeTCPPacketProbeGenerationControl(
+		control, generation, incarnation, abi.FakeTCPGenerationControlClose,
+	); err != nil || result != abi.FakeTCPGenerationResultIdle {
+		t.Fatalf("terminal CLOSE-before-OPEN result=%d error=%v", result, err)
+	}
+
+	wrongGeneration := generation + 1
+	wrongGenerationIncarnation := faketcp.RuntimeIncarnation{2}
+	updateFakeTCPPacketProbeRuntimeIdentity(
+		t, runtimeIdentity, wrongGeneration, wrongGenerationIncarnation,
+	)
+	if result, err := runFakeTCPPacketProbeGenerationControl(
+		control, wrongGeneration, wrongGenerationIncarnation, abi.FakeTCPGenerationControlOpen,
+	); err != nil || result != abi.FakeTCPGenerationResultPoison {
+		t.Fatalf("wrong-generation OPEN result=%d error=%v", result, err)
+	}
+	if err := gate.Lookup(uint32(0), &observed); err != nil ||
+		observed.Generation != generation ||
+		observed.State&abi.FakeTCPGenerationStatePoison == 0 {
+		t.Fatalf("wrong generation did not stick poison: gate=%#v error=%v", observed, err)
+	}
+
+	controlMap := collection.Maps["control_map"]
+	if controlMap == nil {
+		t.Fatal("poison-negative collection has no control_map")
+	}
+	if err := controlMap.Update(abi.ControlKeyGlobal, abi.ControlValue{
+		ActiveGeneration: generation,
+		ABIVersion:       abi.Version,
+	}, ebpf.UpdateAny); err != nil {
+		t.Fatalf("publish poison-negative selector: %v", err)
+	}
+	packet, _ := buildFakeTCPProbeUDPPacket(t, 31001, destinationPort, 32)
+	result, output, err := runFakeTCPPacketProbe(
+		xdp, packet, fakeTCPXDPContext{IngressIfindex: ifindex}, len(packet)+64,
+	)
+	if err != nil || result != uint32(1) || !bytes.Equal(output, packet) {
+		t.Fatalf("poisoned generation action=%d error=%v mutated=%t",
+			result, err, !bytes.Equal(output, packet))
+	}
+}
+
+func updateFakeTCPPacketProbeRuntimeIdentity(
+	t *testing.T,
+	runtimeIdentity *ebpf.Map,
+	generation uint64,
+	incarnation faketcp.RuntimeIncarnation,
+) {
+	t.Helper()
+	value := abi.FakeTCPRuntimeIdentityValue{
+		Generation:      generation,
+		Incarnation:     [16]byte(incarnation),
+		EventABIVersion: abi.FakeTCPEventABIVersion,
+	}
+	if err := runtimeIdentity.Update(uint32(0), value, ebpf.UpdateAny); err != nil {
+		t.Fatalf("populate packet-probe runtime identity: %v", err)
+	}
+}
+
+func runFakeTCPPacketProbeGenerationControl(
+	control *ebpf.Program,
+	generation uint64,
+	incarnation faketcp.RuntimeIncarnation,
+	operation uint32,
+) (uint32, error) {
+	request := make([]byte, 32)
+	binary.NativeEndian.PutUint64(request[0:8], generation)
+	copy(request[8:24], incarnation[:])
+	binary.NativeEndian.PutUint32(request[24:28], operation)
+	return control.Run(&ebpf.RunOptions{Data: request})
 }
 
 func probeFakeTCPXDPParserModes(

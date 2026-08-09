@@ -56,6 +56,23 @@ const (
 	FakeTCPEventSize                = 104
 	FakeTCPMaxCapturedPacket        = 2304
 	FakeTCPPacketEventSize          = FakeTCPEventSize + FakeTCPMaxCapturedPacket
+
+	FakeTCPGenerationStateOpen      uint64 = 1 << 63
+	FakeTCPGenerationStateSealed    uint64 = 1 << 62
+	FakeTCPGenerationStatePoison    uint64 = 1 << 61
+	FakeTCPGenerationStateWakeArmed uint64 = 1 << 60
+	FakeTCPGenerationInflightMask   uint64 = FakeTCPGenerationStateWakeArmed - 1
+
+	FakeTCPGenerationControlAssertClosed uint32 = 1
+	FakeTCPGenerationControlOpen         uint32 = 2
+	FakeTCPGenerationControlClose        uint32 = 3
+
+	FakeTCPGenerationResultMalformed uint32 = 0
+	FakeTCPGenerationResultIdle      uint32 = 1
+	FakeTCPGenerationResultOpen      uint32 = 2
+	FakeTCPGenerationResultWait      uint32 = 3
+	FakeTCPGenerationResultPoison    uint32 = 4
+	FakeTCPGenerationResultMismatch  uint32 = 5
 )
 
 type ControlKey uint32
@@ -320,6 +337,24 @@ type FakeTCPRuntimeIdentityValue struct {
 	Incarnation     [16]byte
 	EventABIVersion uint16
 	_               [6]byte
+}
+
+type FakeTCPGenerationGateValue struct {
+	Generation uint64
+	State      uint64
+}
+
+type FakeTCPGenerationControlRequest struct {
+	Generation  uint64
+	Incarnation [16]byte
+	Operation   uint32
+	_           uint32
+}
+
+type FakeTCPGenerationWake struct {
+	Generation  uint64
+	Incarnation [16]byte
+	State       uint64
 }
 
 type FakeTCPEvent struct {

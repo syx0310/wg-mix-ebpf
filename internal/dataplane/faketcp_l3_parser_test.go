@@ -145,11 +145,9 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		t.Fatal("fixed-header transform gate must precede TC ingress mutation")
 	}
 
-	xdpStart := strings.Index(main, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
-	if xdpStart < 0 {
-		t.Fatal("FakeTCP XDP entry point is missing")
-	}
-	xdp := main[xdpStart:]
+	xdp := sourceSection(t, main,
+		"faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)",
+		"SEC(\"xdp\")")
 	parse := strings.Index(xdp, "parse_rc = faketcp_parse_l3")
 	lookup := strings.Index(xdp, "managed_listener = faketcp_xdp_managed_port")
 	xdpGate := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")

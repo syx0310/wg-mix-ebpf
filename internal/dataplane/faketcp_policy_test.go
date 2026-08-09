@@ -631,7 +631,9 @@ func TestFakeTCPMimicTransformCompositionOrderContract(t *testing.T) {
 		t.Fatal("XOR egress completion must precede the FakeTCP encoder tail call")
 	}
 
-	xdp := sourceSection(t, fake, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)", "#endif")
+	xdp := sourceSection(t, fake,
+		"faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)",
+		"SEC(\"xdp\")")
 	udpRestore := strings.Index(xdp, "bpf_xdp_store_bytes(xdp, l3.l4_off, &udp")
 	tailShrink := strings.Index(xdp, "bpf_xdp_adjust_tail(xdp, -FAKETCP_HEADER_DELTA)")
 	xdpPass := strings.LastIndex(xdp, "return XDP_PASS")
