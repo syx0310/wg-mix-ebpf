@@ -920,6 +920,7 @@ validate_completed_chain() {
 }
 
 converge_restore() {
+  local mutation_started=0
   validate_evidence_shapes
   if validate_terminal_phase "${RESTORED_PHASE}" restored; then
     [[ ! -e "${FILESYSTEM_PHASE}" ]] || fail 'dual-terminal-state' 79
@@ -944,14 +945,19 @@ converge_restore() {
   [[ ! -e "${FILESYSTEM_PHASE}" ]] || fail 'filesystem-phase-with-baseline' 79
   validate_baseline
   validate_staged_source
-  if [[ -f "${MUTATION_PHASE}" ]]; then validate_mutation_plan; ensure_veth_phase; converge_tcx; else
+  if [[ -f "${MUTATION_PHASE}" ]]; then
+    mutation_started=1
+    validate_mutation_plan
+    ensure_veth_phase
+    converge_tcx
+  else
     [[ ! -e "${VETH_PHASE}" && ! -e "${TCX_PHASE}" && ! -e "${MODULE_INTENT}" &&
       ! -e "${MODULE_OWNED}" && ! -e "${MODULE_UNLOADED}" &&
       ! -e "${PIN_PATH}" && ! -e "/sys/module/${MODULE_NAME}" && "$(veth_presence)" == 00 ]] ||
       fail 'resource-without-mutation-plan' 79
   fi
   ensure_cleanup_intent
-  converge_module_absent
+  if ((mutation_started)); then converge_module_absent; fi
   converge_veth_absent
   assert_bpf_baseline R.cleanup-bpf
   verify_final_state R.final

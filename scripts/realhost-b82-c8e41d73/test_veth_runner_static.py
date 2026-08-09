@@ -153,6 +153,7 @@ class RestoreState:
     veth_b_sysfs: int | None = 1002
     veth_pair_identity: bool = True
     module_lease: str = "11"  # 00, 10, 11, 01, restored, foreign, empty
+    module_restore_calls: int = 0
     pin_present: bool = False
     final_matches_baseline: bool = True
     writes: int = 0
@@ -292,11 +293,13 @@ def restore_model(state: RestoreState, cut_after: str | None = None) -> str:
         state.cleanup = True
         checkpoint(state, "cleanup-intent", cut_after)
 
-    if state.module_lease in {"10", "11", "01"}:
-        state.module_lease = "restored"
-        checkpoint(state, "module-delete", cut_after)
-    elif state.module_lease not in {"00", "restored"}:
-        raise ModelRejected("module-lease-cleanup")
+    if state.mutation:
+        state.module_restore_calls += 1
+        if state.module_lease in {"10", "11", "01"}:
+            state.module_lease = "restored"
+            checkpoint(state, "module-delete", cut_after)
+        elif state.module_lease not in {"00", "restored"}:
+            raise ModelRejected("module-lease-cleanup")
 
     if state.veth_phase:
         validate_receipted_veth(state)
@@ -376,6 +379,24 @@ def exercise_failure_cut_model() -> None:
     writes = restored.writes
     if restore_model(restored) != "already-restored" or restored.writes != writes:
         fail("already-restored retry created new evidence")
+
+    pre_mutation = state_without_veth(
+        mutation=False,
+        veth_phase=False,
+        tcx="none",
+        module_lease="00",
+    )
+    try:
+        restore_model(pre_mutation, "cleanup-intent")
+    except FailureCut as exc:
+        if str(exc) != "cleanup-intent":
+            fail(f"modeled pre-mutation cut stopped at {exc}")
+    else:
+        fail("modeled pre-mutation cleanup-intent cut was not reached")
+    if restore_model(pre_mutation) != "restored":
+        fail("baseline-to-pre-mutation failure cut did not converge")
+    if pre_mutation.module_restore_calls != 0:
+        fail("pre-mutation restore called the unconfigured module helper")
 
     for label, module_lease in {
         "00": "00",
@@ -577,8 +598,10 @@ def check_state_machine(runner: str) -> None:
             '[[ ! -e "${RESTORED_PHASE}" ]] || fail \'invalid-restored-phase\'',
             "filesystem-terminal-with-mutation",
             "filesystem-phase-with-baseline",
+            "local mutation_started=0",
+            "mutation_started=1",
             "ensure_cleanup_intent",
-            "converge_module_absent",
+            "if ((mutation_started)); then converge_module_absent; fi",
             "converge_veth_absent",
             "assert_bpf_baseline R.cleanup-bpf",
             "verify_final_state R.final",
@@ -588,7 +611,7 @@ def check_state_machine(runner: str) -> None:
     )
     ordered = (
         "ensure_cleanup_intent",
-        "converge_module_absent",
+        "if ((mutation_started)); then converge_module_absent; fi",
         "converge_veth_absent",
         "assert_bpf_baseline R.cleanup-bpf",
         "verify_final_state R.final",
@@ -603,6 +626,22 @@ def check_state_machine(runner: str) -> None:
     filesystem_end = restore.index('[[ ! -e "${FILESYSTEM_PHASE}" ]]', filesystem_start)
     if 'write_phase "${RESTORED_PHASE}"' in restore[filesystem_start:filesystem_end]:
         fail("filesystem-only convergence can write the restored terminal")
+    no_mutation_start = restore.index('else\n    [[ ! -e "${VETH_PHASE}"', filesystem_end)
+    no_mutation_end = restore.index("  fi\n  ensure_cleanup_intent", no_mutation_start)
+    no_mutation = restore[no_mutation_start:no_mutation_end]
+    require_literals(
+        no_mutation,
+        (
+            '! -e "${MODULE_INTENT}"',
+            '! -e "${MODULE_OWNED}"',
+            '! -e "${MODULE_UNLOADED}"',
+            '! -e "/sys/module/${MODULE_NAME}"',
+            '"$(veth_presence)" == 00',
+        ),
+        "pre-mutation restore absence proof",
+    )
+    if "converge_module_absent" in no_mutation:
+        fail("pre-mutation restore calls the unconfigured module helper")
     completed = function_body(runner, "validate_completed_chain")
     require_literals(
         completed,
