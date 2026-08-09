@@ -40,6 +40,10 @@ type fakeTCPProductionPlanner func(
 
 type fakeTCPActivationValidator func(*control.State) error
 
+type fakeTCPProductionScopeResolver func(
+	context.Context,
+) (fakeTCPProductionScopeIdentity, error)
+
 type fakeTCPRuntimeLifecycle interface {
 	Ensure(context.Context, fakeTCPRuntimeDesiredKey, fakeTCPRuntimeBuild) error
 	Stop(context.Context) error
@@ -54,6 +58,8 @@ type fakeTCPProductionCoordinatorState struct {
 	operationMu sync.Mutex
 	supervisor  fakeTCPRuntimeLifecycle
 	owner       dataplaneCoreOwner
+	scope       fakeTCPProductionScopeIdentity
+	scopeBound  bool
 }
 
 // fakeTCPProductionCoordinator is the production Loader boundary. Baseline
@@ -64,6 +70,7 @@ type fakeTCPProductionCoordinator struct {
 	baseline           AttachStateLoader
 	shared             *fakeTCPProductionCoordinatorState
 	validateActivation fakeTCPActivationValidator
+	resolveScope       fakeTCPProductionScopeResolver
 	planExperimental   fakeTCPProductionPlanner
 }
 
@@ -94,6 +101,9 @@ func (coordinator *fakeTCPProductionCoordinator) Apply(
 	if coordinator.validateActivation == nil {
 		return errors.New("production FakeTCP activation gate is nil")
 	}
+	if coordinator.resolveScope == nil {
+		return errors.New("production dataplane scope resolver is nil")
+	}
 
 	shared := coordinator.shared
 	shared.operationMu.Lock()
@@ -108,10 +118,72 @@ func (coordinator *fakeTCPProductionCoordinator) Apply(
 	if err := coordinator.validateActivation(state); err != nil {
 		return err
 	}
+	if _, err := coordinator.bindScopeLocked(ctx); err != nil {
+		return err
+	}
 	if len(fakeTCPStateReferences(state)) == 0 {
 		return coordinator.applyBaselineLocked(ctx, state)
 	}
 	return coordinator.applyExperimentalLocked(ctx, state)
+}
+
+func (coordinator *fakeTCPProductionCoordinator) bindScopeLocked(
+	ctx context.Context,
+) (fakeTCPProductionScopeIdentity, error) {
+	if coordinator == nil || coordinator.shared == nil {
+		return fakeTCPProductionScopeIdentity{}, errors.New(
+			"bind production dataplane scope: coordinator is incomplete",
+		)
+	}
+	if coordinator.resolveScope == nil {
+		return fakeTCPProductionScopeIdentity{}, errors.New(
+			"bind production dataplane scope: resolver is nil",
+		)
+	}
+	scope, err := coordinator.resolveScope(ctx)
+	if err != nil {
+		return fakeTCPProductionScopeIdentity{}, fmt.Errorf(
+			"resolve production dataplane scope: %w",
+			err,
+		)
+	}
+	if err := scope.validate(); err != nil {
+		return fakeTCPProductionScopeIdentity{}, fmt.Errorf(
+			"validate production dataplane scope: %w",
+			err,
+		)
+	}
+	shared := coordinator.shared
+	if !shared.scopeBound {
+		if shared.owner != dataplaneCoreOwnerUnknown &&
+			shared.owner != dataplaneCoreOwnerNone {
+			return fakeTCPProductionScopeIdentity{}, fmt.Errorf(
+				"%w: owner=%d",
+				errFakeTCPProductionScopeUnboundOwner,
+				shared.owner,
+			)
+		}
+		shared.scope = scope
+		shared.scopeBound = true
+		return scope, nil
+	}
+	if shared.scope != scope {
+		return fakeTCPProductionScopeIdentity{}, fmt.Errorf(
+			"%w: retained {%s}; requested {%s}",
+			errFakeTCPProductionScopeMismatch,
+			shared.scope,
+			scope,
+		)
+	}
+	return scope, nil
+}
+
+func (shared *fakeTCPProductionCoordinatorState) clearScopeLocked() {
+	if shared == nil {
+		return
+	}
+	shared.scope = fakeTCPProductionScopeIdentity{}
+	shared.scopeBound = false
 }
 
 func (coordinator *fakeTCPProductionCoordinator) applyBaselineLocked(
@@ -231,11 +303,17 @@ func (coordinator *fakeTCPProductionCoordinator) Detach(
 	if coordinator.baseline == nil {
 		return errors.New("production baseline dataplane loader is nil")
 	}
+	if coordinator.resolveScope == nil {
+		return errors.New("production dataplane scope resolver is nil")
+	}
 
 	shared := coordinator.shared
 	shared.operationMu.Lock()
 	defer shared.operationMu.Unlock()
 	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if _, err := coordinator.bindScopeLocked(ctx); err != nil {
 		return err
 	}
 	if err := shared.supervisor.Stop(ctx); err != nil {
@@ -251,6 +329,7 @@ func (coordinator *fakeTCPProductionCoordinator) Detach(
 		return err
 	}
 	shared.owner = dataplaneCoreOwnerNone
+	shared.clearScopeLocked()
 	return nil
 }
 
@@ -277,6 +356,9 @@ func (coordinator *fakeTCPProductionCoordinator) DetachStale(
 	if coordinator.validateActivation == nil {
 		return errors.New("production FakeTCP activation gate is nil")
 	}
+	if coordinator.resolveScope == nil {
+		return errors.New("production dataplane scope resolver is nil")
+	}
 
 	shared := coordinator.shared
 	shared.operationMu.Lock()
@@ -287,6 +369,9 @@ func (coordinator *fakeTCPProductionCoordinator) DetachStale(
 	// DetachStale is part of Apply orchestration and can mutate baseline TCX
 	// state, so it observes the same gate-before-mutation rule.
 	if err := coordinator.validateActivation(current); err != nil {
+		return err
+	}
+	if _, err := coordinator.bindScopeLocked(ctx); err != nil {
 		return err
 	}
 	if len(fakeTCPStateReferences(current)) != 0 {

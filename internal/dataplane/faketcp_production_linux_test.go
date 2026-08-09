@@ -5,9 +5,12 @@ package dataplane
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
+	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
 
 func TestNewLoaderReturnsSharedFakeTCPProductionCoordinator(t *testing.T) {
@@ -38,6 +41,143 @@ func TestNewLoaderCoordinatorGatesBeforeInvalidBaselinePinPath(t *testing.T) {
 	if !errors.Is(err, ErrFakeTCPKernelGate) {
 		t.Fatalf("production coordinator did not fail at the pre-mutation gate: %v", err)
 	}
+}
+
+func TestResolveLinuxFakeTCPProductionScopeIncludesEveryOwnershipSelector(t *testing.T) {
+	root := fakeTCPProductionRealTempDir(t)
+	objectPath := filepath.Join(root, "objects", "wg_mix_tc.o")
+	if err := os.MkdirAll(filepath.Dir(objectPath), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(objectPath, []byte("object generation A"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pinPath := filepath.Join(root, "pins", "production")
+	lifecyclePath := filepath.Join(root, "leases", "daemon.lease")
+	maintenancePath := filepath.Join(root, "leases", "maintenance.lock")
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		lifecyclePath,
+		maintenancePath,
+	)
+	baseline := LinuxLoader{
+		ObjectPath:       objectPath,
+		PinPath:          pinPath,
+		AdoptLegacyPins:  true,
+		objectPathFrozen: true,
+	}
+
+	got, err := resolveLinuxFakeTCPProductionScope(ctx, baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := fakeTCPProductionScopeIdentity{
+		objectKind:      fakeTCPProductionObjectScopeFilesystem,
+		objectPath:      objectPath,
+		pinPath:         pinPath,
+		lifecyclePath:   lifecyclePath,
+		adoptLegacyPins: true,
+	}
+	if got != want {
+		t.Fatalf("resolved scope = %#v, want %#v", got, want)
+	}
+	if err := got.validate(); err != nil {
+		t.Fatalf("resolved scope is invalid: %v", err)
+	}
+
+	otherLifecyclePath := filepath.Join(root, "leases", "other-daemon.lease")
+	otherContext := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		otherLifecyclePath,
+		maintenancePath,
+	)
+	other, err := resolveLinuxFakeTCPProductionScope(otherContext, baseline)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if other == got || other.lifecyclePath != otherLifecyclePath {
+		t.Fatalf("lifecycle lease did not distinguish scope: first=%#v other=%#v", got, other)
+	}
+}
+
+func TestResolveLinuxFakeTCPProductionScopeRepresentsEmbeddedObjectExplicitly(t *testing.T) {
+	root := fakeTCPProductionRealTempDir(t)
+	pinPath := filepath.Join(root, "pins", "production")
+	lifecyclePath := filepath.Join(root, "leases", "daemon.lease")
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		lifecyclePath,
+		filepath.Join(root, "leases", "maintenance.lock"),
+	)
+	got, err := resolveLinuxFakeTCPProductionScope(ctx, LinuxLoader{
+		PinPath:          pinPath,
+		objectPathFrozen: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.objectKind != fakeTCPProductionObjectScopeEmbedded ||
+		got.objectPath != EmbeddedObjectSource || got.pinPath != pinPath ||
+		got.lifecyclePath != lifecyclePath {
+		t.Fatalf("embedded production scope = %#v", got)
+	}
+}
+
+func TestNewProductionLoaderFreezesEnvironmentBackedScopeSelectors(t *testing.T) {
+	root := fakeTCPProductionRealTempDir(t)
+	objectA := filepath.Join(root, "object-a.o")
+	objectB := filepath.Join(root, "object-b.o")
+	pinA := filepath.Join(root, "pins-a")
+	pinB := filepath.Join(root, "pins-b")
+	lifecyclePath := filepath.Join(root, "daemon.lease")
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		lifecyclePath,
+		filepath.Join(root, "maintenance.lock"),
+	)
+
+	t.Run("explicit environment selection", func(t *testing.T) {
+		t.Setenv(EnvObjectPath, objectA)
+		t.Setenv(EnvPinPath, pinA)
+		coordinator, ok := NewLoaderWithOptions(LoaderOptions{AdoptLegacyPins: true}).(*fakeTCPProductionCoordinator)
+		if !ok {
+			t.Fatalf("NewLoaderWithOptions returned %T", NewLoaderWithOptions(LoaderOptions{}))
+		}
+		baseline, ok := coordinator.baseline.(LinuxLoader)
+		if !ok || !baseline.objectPathFrozen {
+			t.Fatalf("production baseline is not frozen: %#v", coordinator.baseline)
+		}
+
+		t.Setenv(EnvObjectPath, objectB)
+		t.Setenv(EnvPinPath, pinB)
+		scope, err := coordinator.resolveScope(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if scope.objectPath != objectA || scope.pinPath != pinA ||
+			!scope.adoptLegacyPins {
+			t.Fatalf("environment changed frozen scope: %#v", scope)
+		}
+	})
+
+	t.Run("embedded selection", func(t *testing.T) {
+		t.Setenv(EnvObjectPath, "")
+		t.Setenv(EnvPinPath, pinA)
+		coordinator, ok := NewLoader().(*fakeTCPProductionCoordinator)
+		if !ok {
+			t.Fatalf("NewLoader returned %T", NewLoader())
+		}
+		t.Setenv(EnvObjectPath, objectB)
+		t.Setenv(EnvPinPath, pinB)
+		scope, err := coordinator.resolveScope(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if scope.objectKind != fakeTCPProductionObjectScopeEmbedded ||
+			scope.objectPath != EmbeddedObjectSource || scope.pinPath != pinA {
+			t.Fatalf("environment changed frozen embedded scope: %#v", scope)
+		}
+	})
 }
 
 func TestExperimentalProductionPlannerInjectsRequestAndFactory(t *testing.T) {
@@ -101,6 +241,9 @@ func TestLiveExperimentalProductionPlanningRemainsPreMutationFailClosed(t *testi
 		// Model a future gate opening without silently making the incomplete
 		// request planner attachable.
 		validateActivation: func(*control.State) error { return nil },
+		resolveScope: func(context.Context) (fakeTCPProductionScopeIdentity, error) {
+			return fakeTCPProductionTestScope(), nil
+		},
 		planExperimental: composeExperimentalFakeTCPProductionPlanner(
 			LinuxLoader{ObjectPath: "/experimental-planning-test.o"},
 			buildLiveExperimentalFakeTCPProductionRequest,

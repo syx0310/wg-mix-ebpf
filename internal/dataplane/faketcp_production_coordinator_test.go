@@ -47,6 +47,47 @@ type fakeTCPProductionTestBaseline struct {
 	detachStaleCalls int
 }
 
+type fakeTCPProductionTestLifecycle struct {
+	mu          sync.Mutex
+	ensureCalls int
+	stopCalls   int
+	onStop      func()
+}
+
+func (lifecycle *fakeTCPProductionTestLifecycle) Ensure(
+	context.Context,
+	fakeTCPRuntimeDesiredKey,
+	fakeTCPRuntimeBuild,
+) error {
+	lifecycle.mu.Lock()
+	lifecycle.ensureCalls++
+	lifecycle.mu.Unlock()
+	return nil
+}
+
+func (lifecycle *fakeTCPProductionTestLifecycle) Stop(context.Context) error {
+	lifecycle.mu.Lock()
+	lifecycle.stopCalls++
+	onStop := lifecycle.onStop
+	lifecycle.mu.Unlock()
+	if onStop != nil {
+		onStop()
+	}
+	return nil
+}
+
+func (lifecycle *fakeTCPProductionTestLifecycle) setOnStop(onStop func()) {
+	lifecycle.mu.Lock()
+	lifecycle.onStop = onStop
+	lifecycle.mu.Unlock()
+}
+
+func (lifecycle *fakeTCPProductionTestLifecycle) counts() (ensure, stop int) {
+	lifecycle.mu.Lock()
+	defer lifecycle.mu.Unlock()
+	return lifecycle.ensureCalls, lifecycle.stopCalls
+}
+
 func (baseline *fakeTCPProductionTestBaseline) Apply(
 	context.Context,
 	*control.State,
@@ -107,6 +148,15 @@ func fakeTCPProductionTestState() *control.State {
 	}
 }
 
+func fakeTCPProductionTestScope() fakeTCPProductionScopeIdentity {
+	return fakeTCPProductionScopeIdentity{
+		objectKind:    fakeTCPProductionObjectScopeFilesystem,
+		objectPath:    "/test/wg-mix-ebpf/object.o",
+		pinPath:       "/test/wg-mix-ebpf/pins",
+		lifecyclePath: "/test/wg-mix-ebpf/lifecycle.lease",
+	}
+}
+
 func newFakeTCPProductionTestCoordinator(
 	baseline AttachStateLoader,
 	gate fakeTCPActivationValidator,
@@ -120,8 +170,29 @@ func newFakeTCPProductionTestCoordinator(
 		baseline:           baseline,
 		shared:             shared,
 		validateActivation: gate,
-		planExperimental:   planner,
+		resolveScope: func(context.Context) (fakeTCPProductionScopeIdentity, error) {
+			return fakeTCPProductionTestScope(), nil
+		},
+		planExperimental: planner,
 	}, shared
+}
+
+func newFakeTCPProductionTestCoordinatorWithScope(
+	baseline AttachStateLoader,
+	shared *fakeTCPProductionCoordinatorState,
+	scope fakeTCPProductionScopeIdentity,
+	gate fakeTCPActivationValidator,
+	planner fakeTCPProductionPlanner,
+) *fakeTCPProductionCoordinator {
+	return &fakeTCPProductionCoordinator{
+		baseline:           baseline,
+		shared:             shared,
+		validateActivation: gate,
+		resolveScope: func(context.Context) (fakeTCPProductionScopeIdentity, error) {
+			return scope, nil
+		},
+		planExperimental: planner,
+	}
 }
 
 func TestFakeTCPProductionCoordinatorGatePrecedesEveryApplyMutation(t *testing.T) {
@@ -200,6 +271,22 @@ func TestFakeTCPProductionCoordinatorCommitsExclusiveCoreTransitions(t *testing.
 	if shared.owner != dataplaneCoreOwnerBaseline {
 		t.Fatalf("owner after initial baseline commit = %d", shared.owner)
 	}
+	differentScope := fakeTCPProductionTestScope()
+	differentScope.pinPath = "/test/wg-mix-ebpf/different-baseline-owner-pins"
+	differentBaseline := &fakeTCPProductionTestBaseline{}
+	differentHandle := newFakeTCPProductionTestCoordinatorWithScope(
+		differentBaseline,
+		shared,
+		differentScope,
+		func(*control.State) error { return nil },
+		nil,
+	)
+	if err := differentHandle.Apply(t.Context(), &control.State{}); !errors.Is(err, errFakeTCPProductionScopeMismatch) {
+		t.Fatalf("different scope crossed baseline owner: %v", err)
+	}
+	if apply, detach, stale := differentBaseline.counts(); apply != 0 || detach != 0 || stale != 0 {
+		t.Fatalf("different scope mutated baseline owner: %d/%d/%d", apply, detach, stale)
+	}
 
 	events.reset()
 	if err := coordinator.Apply(t.Context(), fakeTCPProductionTestState()); err != nil {
@@ -277,6 +364,68 @@ func TestFakeTCPProductionCoordinatorCancelsUnclaimedPlanBeforeDetach(t *testing
 	}
 	if shared.owner != dataplaneCoreOwnerUnknown {
 		t.Fatalf("owner changed before canceled mutation: %d", shared.owner)
+	}
+	if !shared.scopeBound || shared.scope != fakeTCPProductionTestScope() {
+		t.Fatalf("canceled Apply lost its conservative scope: bound=%t scope=%#v", shared.scopeBound, shared.scope)
+	}
+	differentScope := fakeTCPProductionTestScope()
+	differentScope.lifecyclePath = "/test/wg-mix-ebpf/different-canceled.lease"
+	differentBaseline := &fakeTCPProductionTestBaseline{}
+	differentHandle := newFakeTCPProductionTestCoordinatorWithScope(
+		differentBaseline,
+		shared,
+		differentScope,
+		func(*control.State) error { return nil },
+		nil,
+	)
+	if err := differentHandle.Detach(t.Context(), nil); !errors.Is(err, errFakeTCPProductionScopeMismatch) {
+		t.Fatalf("different scope crossed canceled owner: %v", err)
+	}
+	if _, detach, _ := differentBaseline.counts(); detach != 0 {
+		t.Fatal("different scope detached after canceled Apply")
+	}
+}
+
+func TestFakeTCPProductionCoordinatorDetachCancellationDoesNotUnbindScope(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	baseline := &fakeTCPProductionTestBaseline{}
+	lifecycle := &fakeTCPProductionTestLifecycle{}
+	shared := &fakeTCPProductionCoordinatorState{
+		supervisor: lifecycle,
+		owner:      dataplaneCoreOwnerUnknown,
+	}
+	coordinator := newFakeTCPProductionTestCoordinatorWithScope(
+		baseline,
+		shared,
+		fakeTCPProductionTestScope(),
+		func(*control.State) error { return nil },
+		nil,
+	)
+	if err := coordinator.Apply(t.Context(), &control.State{}); err != nil {
+		t.Fatal(err)
+	}
+	_, detachBefore, _ := baseline.counts()
+	lifecycle.setOnStop(cancel)
+	err := coordinator.Detach(ctx, &control.State{})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Detach error = %v, want cancellation", err)
+	}
+	_, detachAfter, _ := baseline.counts()
+	if detachAfter != detachBefore {
+		t.Fatal("baseline Detach ran after cancellation at the Stop boundary")
+	}
+	if !shared.scopeBound || shared.scope != fakeTCPProductionTestScope() ||
+		shared.owner != dataplaneCoreOwnerNone {
+		t.Fatalf(
+			"canceled Detach unbound scope: bound=%t scope=%#v owner=%d",
+			shared.scopeBound, shared.scope, shared.owner,
+		)
+	}
+	if err := coordinator.Detach(t.Context(), &control.State{}); err != nil {
+		t.Fatal(err)
+	}
+	if shared.scopeBound {
+		t.Fatal("complete retry retained scope")
 	}
 }
 
@@ -434,6 +583,25 @@ func TestFakeTCPProductionCoordinatorRetriesCloseBeforeBaselineDetach(t *testing
 	if shared.owner != dataplaneCoreOwnerExperimental {
 		t.Fatalf("owner after failed close = %d", shared.owner)
 	}
+	if !shared.scopeBound || shared.scope != fakeTCPProductionTestScope() {
+		t.Fatalf("failed close lost its scope: bound=%t scope=%#v", shared.scopeBound, shared.scope)
+	}
+	differentScope := fakeTCPProductionTestScope()
+	differentScope.objectPath = "/test/wg-mix-ebpf/different-close-owner.o"
+	differentBaseline := &fakeTCPProductionTestBaseline{}
+	differentHandle := newFakeTCPProductionTestCoordinatorWithScope(
+		differentBaseline,
+		shared,
+		differentScope,
+		func(*control.State) error { return nil },
+		nil,
+	)
+	if err := differentHandle.Apply(t.Context(), &control.State{}); !errors.Is(err, errFakeTCPProductionScopeMismatch) {
+		t.Fatalf("different scope crossed retained close owner: %v", err)
+	}
+	if apply, detach, stale := differentBaseline.counts(); apply != 0 || detach != 0 || stale != 0 {
+		t.Fatalf("different scope mutated during close retry: %d/%d/%d", apply, detach, stale)
+	}
 
 	runtime.setCloseError(nil)
 	if err := coordinator.Detach(t.Context(), state); err != nil {
@@ -446,6 +614,9 @@ func TestFakeTCPProductionCoordinatorRetriesCloseBeforeBaselineDetach(t *testing
 	_, closeCalls, _ := runtime.counts()
 	if closeCalls != 2 || shared.owner != dataplaneCoreOwnerNone {
 		t.Fatalf("close retry: calls=%d owner=%d", closeCalls, shared.owner)
+	}
+	if shared.scopeBound {
+		t.Fatal("complete close retry and baseline detach retained scope")
 	}
 }
 
@@ -633,8 +804,15 @@ func TestFakeTCPProductionCoordinatorDetachStaleRetriesExperimentalClose(t *test
 		t.Fatalf("first DetachStale error = %v, want close error", err)
 	}
 	_, _, stale := baseline.counts()
-	if stale != 0 || shared.owner != dataplaneCoreOwnerExperimental {
-		t.Fatalf("stale mutation crossed failed close: stale=%d owner=%d", stale, shared.owner)
+	if stale != 0 || shared.owner != dataplaneCoreOwnerExperimental ||
+		!shared.scopeBound || shared.scope != fakeTCPProductionTestScope() {
+		t.Fatalf(
+			"stale mutation crossed failed close: stale=%d owner=%d bound=%t scope=%#v",
+			stale,
+			shared.owner,
+			shared.scopeBound,
+			shared.scope,
+		)
 	}
 
 	runtime.setCloseError(nil)
@@ -643,8 +821,16 @@ func TestFakeTCPProductionCoordinatorDetachStaleRetriesExperimentalClose(t *test
 	}
 	_, _, stale = baseline.counts()
 	_, closeCalls, _ := runtime.counts()
-	if stale != 1 || closeCalls != 2 || shared.owner != dataplaneCoreOwnerBaseline {
-		t.Fatalf("stale close retry: stale=%d closes=%d owner=%d", stale, closeCalls, shared.owner)
+	if stale != 1 || closeCalls != 2 || shared.owner != dataplaneCoreOwnerBaseline ||
+		!shared.scopeBound || shared.scope != fakeTCPProductionTestScope() {
+		t.Fatalf(
+			"stale close retry: stale=%d closes=%d owner=%d bound=%t scope=%#v",
+			stale,
+			closeCalls,
+			shared.owner,
+			shared.scopeBound,
+			shared.scope,
+		)
 	}
 }
 
@@ -672,13 +858,599 @@ func TestFakeTCPProductionCoordinatorDetachStaleDoesNotTouchExperimentalCore(t *
 	stopCalls, closeCalls, _ := runtime.counts()
 	_, _, stale := baseline.counts()
 	if stopCalls != 0 || closeCalls != 0 || stale != 0 ||
-		shared.owner != dataplaneCoreOwnerExperimental {
+		shared.owner != dataplaneCoreOwnerExperimental || !shared.scopeBound ||
+		shared.scope != fakeTCPProductionTestScope() {
 		t.Fatalf(
-			"experimental stale no-op: stop=%d close=%d stale=%d owner=%d",
-			stopCalls, closeCalls, stale, shared.owner,
+			"experimental stale no-op: stop=%d close=%d stale=%d owner=%d bound=%t scope=%#v",
+			stopCalls,
+			closeCalls,
+			stale,
+			shared.owner,
+			shared.scopeBound,
+			shared.scope,
 		)
 	}
 	if err := coordinator.Detach(t.Context(), state); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFakeTCPProductionCoordinatorRejectsEveryDifferentHandleScopeBeforeMutation(t *testing.T) {
+	scopeA := fakeTCPProductionTestScope()
+	tests := []struct {
+		name   string
+		scopeB fakeTCPProductionScopeIdentity
+	}{
+		{
+			name: "object",
+			scopeB: func() fakeTCPProductionScopeIdentity {
+				scope := scopeA
+				scope.objectPath = "/test/wg-mix-ebpf/other-object.o"
+				return scope
+			}(),
+		},
+		{
+			name: "pin",
+			scopeB: func() fakeTCPProductionScopeIdentity {
+				scope := scopeA
+				scope.pinPath = "/test/wg-mix-ebpf/other-pins"
+				return scope
+			}(),
+		},
+		{
+			name: "lifecycle",
+			scopeB: func() fakeTCPProductionScopeIdentity {
+				scope := scopeA
+				scope.lifecyclePath = "/test/wg-mix-ebpf/other-lifecycle.lease"
+				return scope
+			}(),
+		},
+		{
+			name: "adopt-legacy-pins",
+			scopeB: func() fakeTCPProductionScopeIdentity {
+				scope := scopeA
+				scope.adoptLegacyPins = true
+				return scope
+			}(),
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			runtime := newControlledFakeTCPRuntime()
+			baselineA := &fakeTCPProductionTestBaseline{}
+			baselineB := &fakeTCPProductionTestBaseline{}
+			shared := &fakeTCPProductionCoordinatorState{
+				supervisor: &fakeTCPRuntimeSupervisor{},
+				owner:      dataplaneCoreOwnerUnknown,
+			}
+			handleA := newFakeTCPProductionTestCoordinatorWithScope(
+				baselineA,
+				shared,
+				scopeA,
+				func(*control.State) error { return nil },
+				func(context.Context, *control.State) (*fakeTCPProductionPlan, error) {
+					return &fakeTCPProductionPlan{
+						key:   fakeTCPRuntimeDesiredKey{1},
+						build: func(context.Context) (fakeTCPRuntimeService, error) { return runtime, nil },
+					}, nil
+				},
+			)
+			plannerBCalls := 0
+			handleB := newFakeTCPProductionTestCoordinatorWithScope(
+				baselineB,
+				shared,
+				test.scopeB,
+				func(*control.State) error { return nil },
+				func(context.Context, *control.State) (*fakeTCPProductionPlan, error) {
+					plannerBCalls++
+					return nil, errors.New("mismatched handle planner must not run")
+				},
+			)
+			fakeState := fakeTCPProductionTestState()
+			if err := handleA.Apply(t.Context(), fakeState); err != nil {
+				t.Fatal(err)
+			}
+			<-runtime.runStarted
+			applyA, detachA, staleA := baselineA.counts()
+
+			operations := []struct {
+				name string
+				run  func() error
+			}{
+				{"apply-baseline", func() error { return handleB.Apply(t.Context(), &control.State{}) }},
+				{"apply-experimental", func() error { return handleB.Apply(t.Context(), fakeState) }},
+				{"detach", func() error { return handleB.Detach(t.Context(), fakeState) }},
+				{"detach-stale", func() error {
+					return handleB.DetachStale(t.Context(), fakeState, &control.State{})
+				}},
+			}
+			for _, operation := range operations {
+				err := operation.run()
+				if !errors.Is(err, errFakeTCPProductionScopeMismatch) {
+					t.Fatalf("%s error = %v, want scope mismatch", operation.name, err)
+				}
+			}
+
+			if plannerBCalls != 0 {
+				t.Fatalf("mismatched handle planner calls = %d", plannerBCalls)
+			}
+			if gotApply, gotDetach, gotStale := baselineA.counts(); gotApply != applyA || gotDetach != detachA || gotStale != staleA {
+				t.Fatalf(
+					"handle B touched baseline A: before=%d/%d/%d after=%d/%d/%d",
+					applyA, detachA, staleA, gotApply, gotDetach, gotStale,
+				)
+			}
+			if applyB, detachB, staleB := baselineB.counts(); applyB != 0 || detachB != 0 || staleB != 0 {
+				t.Fatalf(
+					"mismatched handle B mutated baseline: apply=%d detach=%d stale=%d",
+					applyB, detachB, staleB,
+				)
+			}
+			stopCalls, closeCalls, closeEarly := runtime.counts()
+			if stopCalls != 0 || closeCalls != 0 || closeEarly {
+				t.Fatalf(
+					"mismatched handle B touched supervisor A: stop=%d close=%d early=%t",
+					stopCalls, closeCalls, closeEarly,
+				)
+			}
+			if !shared.scopeBound || shared.scope != scopeA ||
+				shared.owner != dataplaneCoreOwnerExperimental {
+				t.Fatalf(
+					"retained A scope/owner changed: bound=%t scope=%#v owner=%d",
+					shared.scopeBound, shared.scope, shared.owner,
+				)
+			}
+
+			if err := handleA.Detach(t.Context(), fakeState); err != nil {
+				t.Fatal(err)
+			}
+			if shared.scopeBound || shared.scope != (fakeTCPProductionScopeIdentity{}) ||
+				shared.owner != dataplaneCoreOwnerNone {
+				t.Fatalf(
+					"complete A detach did not release scope: bound=%t scope=%#v owner=%d",
+					shared.scopeBound, shared.scope, shared.owner,
+				)
+			}
+			if err := handleB.Apply(t.Context(), &control.State{}); err != nil {
+				t.Fatalf("handle B did not bind after complete A detach: %v", err)
+			}
+			if !shared.scopeBound || shared.scope != test.scopeB ||
+				shared.owner != dataplaneCoreOwnerBaseline {
+				t.Fatalf(
+					"handle B scope/owner = bound=%t scope=%#v owner=%d",
+					shared.scopeBound, shared.scope, shared.owner,
+				)
+			}
+			if err := handleB.Detach(t.Context(), &control.State{}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestFakeTCPProductionCoordinatorRejectsDifferentScopeAcrossRetainedOwnerStates(t *testing.T) {
+	setupErr := errors.New("conservative setup failure")
+	tests := []struct {
+		name        string
+		state       *control.State
+		baselineErr error
+		plannerErr  error
+		wantOwner   dataplaneCoreOwner
+	}{
+		{
+			name:       "bound-unknown-after-planning-error",
+			state:      fakeTCPProductionTestState(),
+			plannerErr: setupErr,
+			wantOwner:  dataplaneCoreOwnerUnknown,
+		},
+		{
+			name:      "baseline",
+			state:     &control.State{},
+			wantOwner: dataplaneCoreOwnerBaseline,
+		},
+		{
+			name:      "experimental",
+			state:     fakeTCPProductionTestState(),
+			wantOwner: dataplaneCoreOwnerExperimental,
+		},
+		{
+			name:        "conservative-baseline-after-apply-error",
+			state:       &control.State{},
+			baselineErr: setupErr,
+			wantOwner:   dataplaneCoreOwnerBaseline,
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			scopeA := fakeTCPProductionTestScope()
+			scopeB := scopeA
+			scopeB.pinPath = "/test/wg-mix-ebpf/other-owner-state-pins"
+			baselineA := &fakeTCPProductionTestBaseline{applyErr: test.baselineErr}
+			baselineB := &fakeTCPProductionTestBaseline{}
+			lifecycle := &fakeTCPProductionTestLifecycle{}
+			shared := &fakeTCPProductionCoordinatorState{
+				supervisor: lifecycle,
+				owner:      dataplaneCoreOwnerUnknown,
+			}
+			handleA := newFakeTCPProductionTestCoordinatorWithScope(
+				baselineA,
+				shared,
+				scopeA,
+				func(*control.State) error { return nil },
+				func(context.Context, *control.State) (*fakeTCPProductionPlan, error) {
+					if test.plannerErr != nil {
+						return nil, test.plannerErr
+					}
+					return &fakeTCPProductionPlan{
+						key: fakeTCPRuntimeDesiredKey{1},
+						build: func(context.Context) (fakeTCPRuntimeService, error) {
+							return newControlledFakeTCPRuntime(), nil
+						},
+					}, nil
+				},
+			)
+			setupResult := handleA.Apply(t.Context(), test.state)
+			if test.baselineErr != nil || test.plannerErr != nil {
+				if !errors.Is(setupResult, setupErr) {
+					t.Fatalf("setup error = %v, want %v", setupResult, setupErr)
+				}
+			} else if setupResult != nil {
+				t.Fatal(setupResult)
+			}
+			if !shared.scopeBound || shared.scope != scopeA || shared.owner != test.wantOwner {
+				t.Fatalf(
+					"setup owner = bound=%t scope=%#v owner=%d, want owner=%d",
+					shared.scopeBound,
+					shared.scope,
+					shared.owner,
+					test.wantOwner,
+				)
+			}
+
+			plannerBCalls := 0
+			handleB := newFakeTCPProductionTestCoordinatorWithScope(
+				baselineB,
+				shared,
+				scopeB,
+				func(*control.State) error { return nil },
+				func(context.Context, *control.State) (*fakeTCPProductionPlan, error) {
+					plannerBCalls++
+					return nil, errors.New("mismatched planner must not run")
+				},
+			)
+			applyA, detachA, staleA := baselineA.counts()
+			ensureA, stopA := lifecycle.counts()
+			operations := []struct {
+				name string
+				run  func() error
+			}{
+				{name: "apply-baseline", run: func() error {
+					return handleB.Apply(t.Context(), &control.State{})
+				}},
+				{name: "apply-experimental", run: func() error {
+					return handleB.Apply(t.Context(), fakeTCPProductionTestState())
+				}},
+				{name: "detach", run: func() error {
+					return handleB.Detach(t.Context(), test.state)
+				}},
+				{name: "detach-stale", run: func() error {
+					return handleB.DetachStale(t.Context(), test.state, &control.State{})
+				}},
+			}
+			for _, operation := range operations {
+				if err := operation.run(); !errors.Is(err, errFakeTCPProductionScopeMismatch) {
+					t.Fatalf("%s error = %v, want scope mismatch", operation.name, err)
+				}
+			}
+			if gotApply, gotDetach, gotStale := baselineA.counts(); gotApply != applyA || gotDetach != detachA || gotStale != staleA {
+				t.Fatalf(
+					"mismatched handle touched owner baseline: before=%d/%d/%d after=%d/%d/%d",
+					applyA,
+					detachA,
+					staleA,
+					gotApply,
+					gotDetach,
+					gotStale,
+				)
+			}
+			if gotEnsure, gotStop := lifecycle.counts(); gotEnsure != ensureA || gotStop != stopA {
+				t.Fatalf(
+					"mismatched handle touched owner lifecycle: before=%d/%d after=%d/%d",
+					ensureA,
+					stopA,
+					gotEnsure,
+					gotStop,
+				)
+			}
+			if applyB, detachB, staleB := baselineB.counts(); applyB != 0 || detachB != 0 || staleB != 0 || plannerBCalls != 0 {
+				t.Fatalf(
+					"mismatched handle mutated: baseline=%d/%d/%d planner=%d",
+					applyB,
+					detachB,
+					staleB,
+					plannerBCalls,
+				)
+			}
+			if !shared.scopeBound || shared.scope != scopeA || shared.owner != test.wantOwner {
+				t.Fatal("mismatched operations changed the retained owner identity")
+			}
+
+			baselineA.applyErr = nil
+			if err := handleA.Detach(t.Context(), test.state); err != nil {
+				t.Fatalf("same-scope full detach: %v", err)
+			}
+			if shared.scopeBound {
+				t.Fatal("same-scope full detach retained scope")
+			}
+			if err := handleB.Apply(t.Context(), &control.State{}); err != nil {
+				t.Fatalf("new scope could not bind after full detach: %v", err)
+			}
+			if err := handleB.Detach(t.Context(), &control.State{}); err != nil {
+				t.Fatal(err)
+			}
+		})
+	}
+}
+
+func TestFakeTCPProductionCoordinatorScopeResolutionFailsBeforeEveryMutation(t *testing.T) {
+	scopeErr := errors.New("scope resolution failed")
+	tests := []struct {
+		name       string
+		wantEvents []string
+		run        func(*fakeTCPProductionCoordinator) error
+	}{
+		{
+			name:       "apply-baseline",
+			wantEvents: []string{"gate", "scope"},
+			run: func(coordinator *fakeTCPProductionCoordinator) error {
+				return coordinator.Apply(t.Context(), &control.State{})
+			},
+		},
+		{
+			name:       "apply-experimental",
+			wantEvents: []string{"gate", "scope"},
+			run: func(coordinator *fakeTCPProductionCoordinator) error {
+				return coordinator.Apply(t.Context(), fakeTCPProductionTestState())
+			},
+		},
+		{
+			name:       "detach",
+			wantEvents: []string{"scope"},
+			run: func(coordinator *fakeTCPProductionCoordinator) error {
+				return coordinator.Detach(t.Context(), &control.State{})
+			},
+		},
+		{
+			name:       "detach-stale",
+			wantEvents: []string{"gate", "scope"},
+			run: func(coordinator *fakeTCPProductionCoordinator) error {
+				return coordinator.DetachStale(t.Context(), &control.State{}, &control.State{})
+			},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			events := &fakeTCPProductionTestEvents{}
+			baseline := &fakeTCPProductionTestBaseline{events: events}
+			lifecycle := &fakeTCPProductionTestLifecycle{}
+			plannerCalls := 0
+			shared := &fakeTCPProductionCoordinatorState{
+				supervisor: lifecycle,
+				owner:      dataplaneCoreOwnerUnknown,
+			}
+			coordinator := &fakeTCPProductionCoordinator{
+				baseline: baseline,
+				shared:   shared,
+				validateActivation: func(*control.State) error {
+					events.add("gate")
+					return nil
+				},
+				resolveScope: func(context.Context) (fakeTCPProductionScopeIdentity, error) {
+					events.add("scope")
+					return fakeTCPProductionScopeIdentity{}, scopeErr
+				},
+				planExperimental: func(context.Context, *control.State) (*fakeTCPProductionPlan, error) {
+					plannerCalls++
+					return nil, errors.New("planner must not run")
+				},
+			}
+			err := test.run(coordinator)
+			if !errors.Is(err, scopeErr) {
+				t.Fatalf("operation error = %v, want scope error", err)
+			}
+			if got := events.snapshot(); !reflect.DeepEqual(got, test.wantEvents) {
+				t.Fatalf("operation order = %q, want %q", got, test.wantEvents)
+			}
+			apply, detach, stale := baseline.counts()
+			ensure, stop := lifecycle.counts()
+			if apply != 0 || detach != 0 || stale != 0 || ensure != 0 || stop != 0 ||
+				plannerCalls != 0 {
+				t.Fatalf(
+					"scope failure mutated: baseline=%d/%d/%d lifecycle=%d/%d planner=%d",
+					apply, detach, stale, ensure, stop, plannerCalls,
+				)
+			}
+			if shared.scopeBound || shared.owner != dataplaneCoreOwnerUnknown {
+				t.Fatalf("scope failure bound state: bound=%t owner=%d", shared.scopeBound, shared.owner)
+			}
+		})
+	}
+}
+
+func TestFakeTCPProductionCoordinatorScopeResolutionFailureRetainsActiveBinding(t *testing.T) {
+	scopeErr := errors.New("active scope resolution failed")
+	boundScope := fakeTCPProductionTestScope()
+	baseline := &fakeTCPProductionTestBaseline{}
+	lifecycle := &fakeTCPProductionTestLifecycle{}
+	plannerCalls := 0
+	shared := &fakeTCPProductionCoordinatorState{
+		supervisor: lifecycle,
+		owner:      dataplaneCoreOwnerExperimental,
+		scope:      boundScope,
+		scopeBound: true,
+	}
+	coordinator := &fakeTCPProductionCoordinator{
+		baseline: baseline,
+		shared:   shared,
+		validateActivation: func(*control.State) error {
+			return nil
+		},
+		resolveScope: func(context.Context) (fakeTCPProductionScopeIdentity, error) {
+			return fakeTCPProductionScopeIdentity{}, scopeErr
+		},
+		planExperimental: func(context.Context, *control.State) (*fakeTCPProductionPlan, error) {
+			plannerCalls++
+			return nil, errors.New("planner must not run")
+		},
+	}
+	operations := []struct {
+		name string
+		run  func() error
+	}{
+		{name: "apply-baseline", run: func() error {
+			return coordinator.Apply(t.Context(), &control.State{})
+		}},
+		{name: "apply-experimental", run: func() error {
+			return coordinator.Apply(t.Context(), fakeTCPProductionTestState())
+		}},
+		{name: "detach", run: func() error {
+			return coordinator.Detach(t.Context(), &control.State{})
+		}},
+		{name: "detach-stale", run: func() error {
+			return coordinator.DetachStale(t.Context(), &control.State{}, &control.State{})
+		}},
+	}
+	for _, operation := range operations {
+		if err := operation.run(); !errors.Is(err, scopeErr) {
+			t.Fatalf("%s error = %v, want resolver error", operation.name, err)
+		}
+	}
+	apply, detach, stale := baseline.counts()
+	ensure, stop := lifecycle.counts()
+	if apply != 0 || detach != 0 || stale != 0 || ensure != 0 || stop != 0 ||
+		plannerCalls != 0 {
+		t.Fatalf(
+			"active resolver failure mutated: baseline=%d/%d/%d lifecycle=%d/%d planner=%d",
+			apply,
+			detach,
+			stale,
+			ensure,
+			stop,
+			plannerCalls,
+		)
+	}
+	if !shared.scopeBound || shared.scope != boundScope ||
+		shared.owner != dataplaneCoreOwnerExperimental {
+		t.Fatalf(
+			"resolver failure changed active binding: bound=%t scope=%#v owner=%d",
+			shared.scopeBound,
+			shared.scope,
+			shared.owner,
+		)
+	}
+}
+
+func TestFakeTCPProductionCoordinatorReconcileHandlesShareExactScope(t *testing.T) {
+	shared := &fakeTCPProductionCoordinatorState{
+		supervisor: &fakeTCPRuntimeSupervisor{},
+		owner:      dataplaneCoreOwnerUnknown,
+	}
+	scope := fakeTCPProductionTestScope()
+	applyBaseline := &fakeTCPProductionTestBaseline{}
+	staleBaseline := &fakeTCPProductionTestBaseline{}
+	applyHandle := newFakeTCPProductionTestCoordinatorWithScope(
+		applyBaseline,
+		shared,
+		scope,
+		func(*control.State) error { return nil },
+		nil,
+	)
+	staleHandle := newFakeTCPProductionTestCoordinatorWithScope(
+		staleBaseline,
+		shared,
+		scope,
+		func(*control.State) error { return nil },
+		nil,
+	)
+	state := &control.State{}
+	if err := applyHandle.Apply(t.Context(), state); err != nil {
+		t.Fatal(err)
+	}
+	if err := staleHandle.DetachStale(t.Context(), &control.State{}, state); err != nil {
+		t.Fatal(err)
+	}
+	apply, _, _ := applyBaseline.counts()
+	_, _, stale := staleBaseline.counts()
+	if apply != 1 || stale != 1 || !shared.scopeBound || shared.scope != scope ||
+		shared.owner != dataplaneCoreOwnerBaseline {
+		t.Fatalf(
+			"same-scope reconcile: apply=%d stale=%d bound=%t scope=%#v owner=%d",
+			apply, stale, shared.scopeBound, shared.scope, shared.owner,
+		)
+	}
+	if err := staleHandle.Detach(t.Context(), state); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestFakeTCPProductionCoordinatorSameObjectPathContentChangeUsesDesiredKey(t *testing.T) {
+	scope := fakeTCPProductionTestScope()
+	shared := &fakeTCPProductionCoordinatorState{
+		supervisor: &fakeTCPRuntimeSupervisor{},
+		owner:      dataplaneCoreOwnerUnknown,
+	}
+	firstRuntime := newControlledFakeTCPRuntime()
+	first := newFakeTCPProductionTestCoordinatorWithScope(
+		&fakeTCPProductionTestBaseline{},
+		shared,
+		scope,
+		func(*control.State) error { return nil },
+		func(context.Context, *control.State) (*fakeTCPProductionPlan, error) {
+			// Model desired key material that includes object content digest A.
+			return &fakeTCPProductionPlan{
+				key:   fakeTCPRuntimeDesiredKey{1},
+				build: func(context.Context) (fakeTCPRuntimeService, error) { return firstRuntime, nil },
+			}, nil
+		},
+	)
+	secondBuilds := 0
+	second := newFakeTCPProductionTestCoordinatorWithScope(
+		&fakeTCPProductionTestBaseline{},
+		shared,
+		scope,
+		func(*control.State) error { return nil },
+		func(context.Context, *control.State) (*fakeTCPProductionPlan, error) {
+			// The path scope is unchanged, but digest B changes the desired key.
+			return &fakeTCPProductionPlan{
+				key: fakeTCPRuntimeDesiredKey{2},
+				build: func(context.Context) (fakeTCPRuntimeService, error) {
+					secondBuilds++
+					return newControlledFakeTCPRuntime(), nil
+				},
+			}, nil
+		},
+	)
+	state := fakeTCPProductionTestState()
+	if err := first.Apply(t.Context(), state); err != nil {
+		t.Fatal(err)
+	}
+	<-firstRuntime.runStarted
+	err := second.Apply(t.Context(), state)
+	if !errors.Is(err, errFakeTCPRuntimeReplacementUnsafe) {
+		t.Fatalf("same-path content replacement error = %v", err)
+	}
+	if secondBuilds != 0 || !shared.scopeBound || shared.scope != scope ||
+		shared.owner != dataplaneCoreOwnerExperimental {
+		t.Fatalf(
+			"same-path desired-key fence: builds=%d bound=%t scope=%#v owner=%d",
+			secondBuilds, shared.scopeBound, shared.scope, shared.owner,
+		)
+	}
+	stopCalls, closeCalls, _ := firstRuntime.counts()
+	if stopCalls != 0 || closeCalls != 0 {
+		t.Fatal("same-path desired-key rejection stopped the active runtime")
+	}
+	if err := first.Detach(t.Context(), state); err != nil {
 		t.Fatal(err)
 	}
 }

@@ -9,6 +9,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
+	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
 
 var errExperimentalFakeTCPProductionRequestUnavailable = errors.New(
@@ -44,16 +45,69 @@ var liveFakeTCPProductionCoordinatorState = &fakeTCPProductionCoordinatorState{
 }
 
 func newFakeTCPProductionLoader(baseline LinuxLoader) Loader {
+	// Freeze both environment-backed selectors in the handle. Scope resolution
+	// and every later baseline operation now use these exact values even if a
+	// process mutates its environment between reconcile phases.
+	baseline.ObjectPath = baseline.effectiveObjectPath()
+	baseline.objectPathFrozen = true
+	baseline.PinPath = pinPathFromEnv(baseline.PinPath)
 	return &fakeTCPProductionCoordinator{
 		baseline:           baseline,
 		shared:             liveFakeTCPProductionCoordinatorState,
 		validateActivation: ValidateFakeTCPActivation,
+		resolveScope: func(ctx context.Context) (fakeTCPProductionScopeIdentity, error) {
+			return resolveLinuxFakeTCPProductionScope(ctx, baseline)
+		},
 		planExperimental: composeExperimentalFakeTCPProductionPlanner(
 			baseline,
 			buildLiveExperimentalFakeTCPProductionRequest,
 			acquireExperimentalFakeTCPProductionRuntime,
 		),
 	}
+}
+
+func resolveLinuxFakeTCPProductionScope(
+	ctx context.Context,
+	baseline LinuxLoader,
+) (fakeTCPProductionScopeIdentity, error) {
+	if ctx == nil {
+		return fakeTCPProductionScopeIdentity{}, errors.New(
+			"resolve Linux production dataplane scope: context is nil",
+		)
+	}
+	objectPath := baseline.effectiveObjectPath()
+	objectKind := fakeTCPProductionObjectScopeFilesystem
+	if objectPath == "" {
+		objectKind = fakeTCPProductionObjectScopeEmbedded
+		objectPath = EmbeddedObjectSource
+	} else {
+		var err error
+		objectPath, err = canonicalFakeTCPProductionPath("object", objectPath)
+		if err != nil {
+			return fakeTCPProductionScopeIdentity{}, err
+		}
+	}
+	pinPath, err := canonicalFakeTCPProductionPath(
+		"pin",
+		pinPathFromEnv(baseline.PinPath),
+	)
+	if err != nil {
+		return fakeTCPProductionScopeIdentity{}, err
+	}
+	lifecyclePath, err := canonicalFakeTCPProductionPath(
+		"lifecycle lease",
+		lockfile.LifecycleLeasePath(ctx),
+	)
+	if err != nil {
+		return fakeTCPProductionScopeIdentity{}, err
+	}
+	return fakeTCPProductionScopeIdentity{
+		objectKind:      objectKind,
+		objectPath:      objectPath,
+		pinPath:         pinPath,
+		lifecyclePath:   lifecyclePath,
+		adoptLegacyPins: baseline.AdoptLegacyPins,
+	}, nil
 }
 
 // composeExperimentalFakeTCPProductionPlanner keeps request construction and
