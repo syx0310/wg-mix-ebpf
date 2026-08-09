@@ -580,6 +580,7 @@ type experimentalFakeTCPRuntimeBuildOptions struct {
 	attachState      *control.State
 	xdpRequests      []fakeTCPXDPAttachRequest
 	xdpRuntime       fakeTCPXDPRuntime
+	xdpRequirement   fakeTCPXDPActivationRequirement
 	sessionFactory   experimentalSessionStoreFactory
 	eventSource      experimentalEventMapSource
 	programArray     fakeTCPProgramArray
@@ -748,6 +749,12 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	}
 	if options.xdpRuntime.probe == nil || options.xdpRuntime.attach == nil {
 		return errors.New("build experimental FakeTCP runtime: XDP backend is incomplete")
+	}
+	if err := validateFakeTCPXDPActivationRequirement(
+		options.xdpRuntime.capabilities,
+		options.xdpRequirement,
+	); err != nil {
+		return fmt.Errorf("build experimental FakeTCP runtime: %w", err)
 	}
 	if _, err := canonicalFakeTCPXDPRequests(
 		options.xdpRequests, options.xdpRuntime.capabilities.Family,

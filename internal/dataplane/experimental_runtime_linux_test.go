@@ -428,7 +428,8 @@ func (fixture *runtimeTestFixture) buildOptions(
 			{IfIndex: 3, Mode: fakeTCPXDPAttachNative},
 			{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
 		},
-		xdpRuntime: fixture.xdpRuntime.backend(),
+		xdpRuntime:     fixture.xdpRuntime.backend(),
+		xdpRequirement: fakeTCPXDPAllowSelectedModeTestOnly,
 		sessionFactory: func(experimentalMapResource, uint64) (ownedFakeTCPSessionStore, error) {
 			return fixture.sessionStore, nil
 		},
@@ -1634,6 +1635,30 @@ func TestExperimentalFakeTCPRuntimeRejectsXDPBackendModeMismatchBeforeMutation(
 			"backend mismatch commits=%d probes=%v programs=%v session closes=%d",
 			fixture.commitCalls, fixture.xdpRuntime.probeCalls,
 			fixture.programArray.inserts, fixture.sessionStore.closes,
+		)
+	}
+}
+
+func TestExperimentalFakeTCPRuntimeRefusesDirectAllHooksRequirementBeforeMutation(
+	t *testing.T,
+) {
+	fixture := newRuntimeTestFixture(t)
+	snapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+	options := fixture.buildOptions(snapshot, transaction)
+	options.xdpRequirement = fakeTCPXDPRequireAllHooksExclusive
+	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
+	if runtime != nil || err == nil || !strings.Contains(err.Error(), "all-hooks exclusive activation") {
+		t.Fatalf("runtime=%#v error=%v", runtime, err)
+	}
+	if fixture.commitCalls != 0 || len(fixture.xdpRuntime.probeCalls) != 0 ||
+		len(fixture.xdpRuntime.attachCalls) != 0 || len(fixture.programArray.inserts) != 0 ||
+		fixture.sessionStore.closes != 0 {
+		t.Fatalf(
+			"strict refusal commits=%d probes=%v attaches=%v programs=%v session closes=%d",
+			fixture.commitCalls, fixture.xdpRuntime.probeCalls,
+			fixture.xdpRuntime.attachCalls, fixture.programArray.inserts,
+			fixture.sessionStore.closes,
 		)
 	}
 }

@@ -162,8 +162,13 @@ func newMemoryFakeTCPXDPRuntimeFor(
 ) *memoryFakeTCPXDPRuntime {
 	capabilities := fakeTCPXDPBackendCapabilities{
 		Family: family, APIVersion: 1,
-		AtomicExpectedAttach: true, ExactOwner: true,
+		Guarantee:               fakeTCPXDPExactSelectedModeLink,
+		Scope:                   fakeTCPXDPOwnershipSelectedMode,
 		ExactDispatcherIdentity: family == fakeTCPXDPBackendLibXDP,
+	}
+	if family == fakeTCPXDPBackendLibXDP {
+		capabilities.Guarantee = fakeTCPXDPExactDispatcherComponent
+		capabilities.Scope = fakeTCPXDPOwnershipAllHooks
 	}
 	return &memoryFakeTCPXDPRuntime{
 		family: family, capabilities: capabilities,
@@ -272,6 +277,69 @@ func TestFakeTCPXDPRuntimeDetectsCapabilitiesOnlyAtConstruction(t *testing.T) {
 	}
 }
 
+func TestFakeTCPXDPDirectCapabilityIsSelectedModeOnly(t *testing.T) {
+	for _, mutate := range []func(*fakeTCPXDPBackendCapabilities){
+		func(capabilities *fakeTCPXDPBackendCapabilities) {
+			capabilities.Guarantee = fakeTCPXDPExactDispatcherComponent
+		},
+		func(capabilities *fakeTCPXDPBackendCapabilities) {
+			capabilities.Scope = fakeTCPXDPOwnershipAllHooks
+		},
+	} {
+		capabilities := newMemoryFakeTCPXDPRuntime().capabilities
+		mutate(&capabilities)
+		_, err := newFakeTCPXDPRuntime(
+			func() (fakeTCPXDPBackendCapabilities, error) { return capabilities, nil },
+			func(int) (fakeTCPXDPProbe, error) { return fakeTCPXDPProbe{}, nil },
+			func(fakeTCPXDPAttachRequest, fakeTCPXDPProbe, experimentalProgramResource) (fakeTCPXDPLink, error) {
+				t.Fatal("invalid direct capability reached attach")
+				return nil, nil
+			},
+		)
+		if err == nil || !strings.Contains(err.Error(), "selected-mode bpf_link") {
+			t.Fatalf("constructor error = %v", err)
+		}
+	}
+}
+
+func TestFakeTCPXDPSelectedModeOwnerDoesNotClaimHardwareRace(t *testing.T) {
+	runtime := newMemoryFakeTCPXDPRuntime()
+	backend := runtime.backend()
+	attach := backend.attach
+	var foreignHardwareProgramID uint32
+	backend.attach = func(
+		request fakeTCPXDPAttachRequest,
+		probe fakeTCPXDPProbe,
+		program experimentalProgramResource,
+	) (fakeTCPXDPLink, error) {
+		// Model a foreign hardware-mode attachment appearing after the
+		// compatibility snapshot and before the selected native-mode attach.
+		foreignHardwareProgramID = 7001
+		return attach(request, probe, program)
+	}
+	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
+		[]fakeTCPXDPAttachRequest{{IfIndex: 7, Mode: fakeTCPXDPAttachNative}},
+		&fakeExperimentalOwnedProgram{id: 8001},
+		backend,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if backend.capabilities.Scope != fakeTCPXDPOwnershipSelectedMode ||
+		foreignHardwareProgramID != 7001 {
+		t.Fatalf("scope=%d foreign hardware program=%d",
+			backend.capabilities.Scope, foreignHardwareProgramID)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if foreignHardwareProgramID != 7001 || runtime.links[7].closes != 1 {
+		t.Fatalf("foreign hardware program=%d selected closes=%d",
+			foreignHardwareProgramID, runtime.links[7].closes)
+	}
+}
+
 func TestFakeTCPXDPRuntimeRejectsUnprovenLibXDPCapability(t *testing.T) {
 	for _, test := range []struct {
 		name   string
@@ -279,14 +347,15 @@ func TestFakeTCPXDPRuntimeRejectsUnprovenLibXDPCapability(t *testing.T) {
 		match  string
 	}{
 		{name: "api", mutate: func(cap *fakeTCPXDPBackendCapabilities) { cap.APIVersion = 0 }, match: "not proven"},
-		{name: "atomic expected attach", mutate: func(cap *fakeTCPXDPBackendCapabilities) { cap.AtomicExpectedAttach = false }, match: "not proven"},
-		{name: "exact owner", mutate: func(cap *fakeTCPXDPBackendCapabilities) { cap.ExactOwner = false }, match: "not proven"},
+		{name: "dispatcher component", mutate: func(cap *fakeTCPXDPBackendCapabilities) { cap.Guarantee = 0 }, match: "not proven"},
+		{name: "all hooks", mutate: func(cap *fakeTCPXDPBackendCapabilities) { cap.Scope = fakeTCPXDPOwnershipSelectedMode }, match: "not proven"},
 		{name: "dispatcher identity", mutate: func(cap *fakeTCPXDPBackendCapabilities) { cap.ExactDispatcherIdentity = false }, match: "dispatcher identity"},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			capabilities := fakeTCPXDPBackendCapabilities{
 				Family: fakeTCPXDPBackendLibXDP, APIVersion: 1,
-				AtomicExpectedAttach: true, ExactOwner: true,
+				Guarantee:               fakeTCPXDPExactDispatcherComponent,
+				Scope:                   fakeTCPXDPOwnershipAllHooks,
 				ExactDispatcherIdentity: true,
 			}
 			test.mutate(&capabilities)

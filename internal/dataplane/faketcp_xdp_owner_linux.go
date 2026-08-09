@@ -58,16 +58,38 @@ type fakeTCPXDPAttachRequest struct {
 	Mode    fakeTCPXDPAttachMode
 }
 
+type fakeTCPXDPAttachGuarantee uint8
+
+const (
+	fakeTCPXDPExactSelectedModeLink fakeTCPXDPAttachGuarantee = iota + 1
+	fakeTCPXDPExactDispatcherComponent
+)
+
+type fakeTCPXDPOwnershipScope uint8
+
+const (
+	fakeTCPXDPOwnershipSelectedMode fakeTCPXDPOwnershipScope = iota + 1
+	fakeTCPXDPOwnershipAllHooks
+)
+
+type fakeTCPXDPActivationRequirement uint8
+
+const (
+	// Zero is deliberately strict so an omitted production option fails closed.
+	fakeTCPXDPRequireAllHooksExclusive fakeTCPXDPActivationRequirement = iota
+	fakeTCPXDPAllowSelectedModeTestOnly
+)
+
 // fakeTCPXDPBackendCapabilities is detected once when a backend is built.
-// Runtime attachment never changes backend or retries through another mode.
-// A libxdp adapter must prove all three ownership properties before it may be
-// used: an atomic expected-dispatcher attach, an exact component owner, and a
-// stable dispatcher identity.
+// Guarantee describes the mutation primitive while Scope describes what that
+// primitive excludes. In particular, a direct bpf_link owns exactly one
+// selected XDP mode; observations of native, generic, or hardware modes are
+// compatibility snapshots and are not atomic with that attach.
 type fakeTCPXDPBackendCapabilities struct {
 	Family                  fakeTCPXDPBackendFamily
 	APIVersion              uint32
-	AtomicExpectedAttach    bool
-	ExactOwner              bool
+	Guarantee               fakeTCPXDPAttachGuarantee
+	Scope                   fakeTCPXDPOwnershipScope
 	ExactDispatcherIdentity bool
 }
 
@@ -150,24 +172,54 @@ func newFakeTCPXDPRuntime(
 func validateFakeTCPXDPBackendCapabilities(
 	capabilities fakeTCPXDPBackendCapabilities,
 ) error {
-	if capabilities.APIVersion == 0 || !capabilities.AtomicExpectedAttach ||
-		!capabilities.ExactOwner {
-		return fmt.Errorf(
-			"construct FakeTCP XDP backend %s: exact expected-attach and owner capability is not proven",
-			capabilities.Family,
-		)
+	if capabilities.APIVersion == 0 {
+		return fmt.Errorf("construct FakeTCP XDP backend %s: API version is not proven", capabilities.Family)
 	}
-	if capabilities.Family == fakeTCPXDPBackendLibXDP {
+	switch capabilities.Family {
+	case fakeTCPXDPBackendDirect:
+		if capabilities.Guarantee != fakeTCPXDPExactSelectedModeLink ||
+			capabilities.Scope != fakeTCPXDPOwnershipSelectedMode {
+			return errors.New(
+				"construct FakeTCP XDP direct backend: exact selected-mode bpf_link ownership is not proven",
+			)
+		}
+	case fakeTCPXDPBackendLibXDP:
+		if capabilities.Guarantee != fakeTCPXDPExactDispatcherComponent ||
+			capabilities.Scope != fakeTCPXDPOwnershipAllHooks {
+			return errors.New(
+				"construct FakeTCP XDP libxdp backend: exact all-hooks dispatcher-component ownership is not proven",
+			)
+		}
 		if !capabilities.ExactDispatcherIdentity {
 			return errors.New(
 				"construct FakeTCP XDP libxdp backend: exact dispatcher identity is not proven",
 			)
 		}
-	} else if capabilities.Family != fakeTCPXDPBackendDirect {
+	default:
 		return fmt.Errorf(
 			"construct FakeTCP XDP backend: unsupported family %s",
 			capabilities.Family,
 		)
+	}
+	return nil
+}
+
+func validateFakeTCPXDPActivationRequirement(
+	capabilities fakeTCPXDPBackendCapabilities,
+	requirement fakeTCPXDPActivationRequirement,
+) error {
+	switch requirement {
+	case fakeTCPXDPRequireAllHooksExclusive:
+		if capabilities.Scope != fakeTCPXDPOwnershipAllHooks {
+			return fmt.Errorf(
+				"FakeTCP XDP backend %s owns only the selected mode; all-hooks exclusive activation is unavailable",
+				capabilities.Family,
+			)
+		}
+	case fakeTCPXDPAllowSelectedModeTestOnly:
+		return nil
+	default:
+		return fmt.Errorf("invalid FakeTCP XDP activation requirement %d", requirement)
 	}
 	return nil
 }
@@ -243,7 +295,8 @@ func mustLiveFakeTCPXDPRuntime() fakeTCPXDPRuntime {
 		func() (fakeTCPXDPBackendCapabilities, error) {
 			return fakeTCPXDPBackendCapabilities{
 				Family: fakeTCPXDPBackendDirect, APIVersion: 1,
-				AtomicExpectedAttach: true, ExactOwner: true,
+				Guarantee: fakeTCPXDPExactSelectedModeLink,
+				Scope:     fakeTCPXDPOwnershipSelectedMode,
 			}, nil
 		},
 		probeLiveFakeTCPXDP,
