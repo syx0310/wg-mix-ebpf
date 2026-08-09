@@ -492,9 +492,16 @@ verify_local_approved_plan() {
   [[ "${APPROVED_PLAN}" == /* && -f "${APPROVED_PLAN}" && ! -L "${APPROVED_PLAN}" ]] || return 66
   canonical="$(CDPATH= cd -- "$(/usr/bin/dirname -- "${APPROVED_PLAN}")" && pwd -P)/${APPROVED_PLAN##*/}" || return 66
   [[ "${canonical}" == "${APPROVED_PLAN}" ]] || return 66
-  shape="$(/usr/bin/stat -Lc '%a:%h:%F' -- "${APPROVED_PLAN}")" || return 66
-  size="$(/usr/bin/stat -Lc '%s' -- "${APPROVED_PLAN}")" || return 66
-  [[ "${shape}" == '600:1:regular file' && "${size}" =~ ^[1-9][0-9]*$ &&
+  if [[ "$(/usr/bin/uname -s)" == 'Darwin' ]]; then
+    shape="$(/usr/bin/stat -f '%Lp:%l:%HT' -- "${APPROVED_PLAN}")" || return 66
+    size="$(/usr/bin/stat -f '%z' -- "${APPROVED_PLAN}")" || return 66
+    [[ "${shape}" == '600:1:Regular File' ]] || return 66
+  else
+    shape="$(/usr/bin/stat -Lc '%a:%h:%F' -- "${APPROVED_PLAN}")" || return 66
+    size="$(/usr/bin/stat -Lc '%s' -- "${APPROVED_PLAN}")" || return 66
+    [[ "${shape}" == '600:1:regular file' ]] || return 66
+  fi
+  [[ "${size}" =~ ^[1-9][0-9]*$ &&
     "${size}" -le 16777216 && "$(sha256_file "${APPROVED_PLAN}")" == "${APPROVED_PLAN_SHA256}" ]]
 }
 
