@@ -769,7 +769,7 @@ func snapshotScopedDirectory(path string, expectedUID uint32) (scopedDirectoryId
 	}
 	return scopedDirectoryIdentity{
 		Path: path, Device: uint64(stat.Dev), Inode: stat.Ino, Mode: stat.Mode,
-		UID: stat.Uid, GID: stat.Gid, NLink: stat.Nlink,
+		UID: stat.Uid, GID: stat.Gid, NLink: uint64(stat.Nlink),
 	}, nil
 }
 
@@ -835,7 +835,7 @@ func snapshotScopedFile(path string, expectedUID uint32) (scopedFileIdentity, er
 	}
 	return scopedFileIdentity{
 		Path: path, Device: uint64(openedStat.Dev), Inode: openedStat.Ino, Mode: openedStat.Mode,
-		UID: openedStat.Uid, GID: openedStat.Gid, NLink: openedStat.Nlink,
+		UID: openedStat.Uid, GID: openedStat.Gid, NLink: uint64(openedStat.Nlink),
 		Size: opened.Size(), SHA256: fmt.Sprintf("%x", hash.Sum(nil)),
 	}, nil
 }
