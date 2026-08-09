@@ -860,7 +860,7 @@ func buildFakeTCPRealHostRuntime(
 			},
 			xdpRuntime:    liveFakeTCPXDPRuntime,
 			engineOptions: fakeTCPRealHostEngineOptions(generation),
-			slowPathFactory: func(_ *faketcp.Engine, events *ebpf.Map) (experimentalSlowPath, error) {
+			slowPathFactory: func(_ *faketcp.Engine, events, stats *ebpf.Map) (experimentalSlowPath, error) {
 				if events == nil {
 					return nil, errors.New("FakeTCP real-host events map is nil")
 				}
@@ -870,6 +870,13 @@ func buildFakeTCPRealHostRuntime(
 				}
 				if info.Name != "faketcp_events" {
 					return nil, fmt.Errorf("FakeTCP real-host events map name=%q", info.Name)
+				}
+				statsInfo, err := stats.Info()
+				if err != nil {
+					return nil, fmt.Errorf("inspect FakeTCP real-host stats map: %w", err)
+				}
+				if statsInfo.Name != fakeTCPStatsMapName {
+					return nil, fmt.Errorf("FakeTCP real-host stats map name=%q", statsInfo.Name)
 				}
 				return slowPath, nil
 			},

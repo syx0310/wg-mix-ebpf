@@ -227,6 +227,50 @@ func validateFakeTCPPolicyWireGuard(wg control.WireGuardState) error {
 	return nil
 }
 
+// buildFakeTCPControllerMarks projects only WireGuard identities referenced by
+// the exact target policy. The returned map is a new immutable-factory input;
+// later state slice mutation cannot change control routing.
+func buildFakeTCPControllerMarks(
+	state *control.State,
+	snapshot *fakeTCPPolicySnapshot,
+) (map[uint32]uint32, error) {
+	if state == nil {
+		return nil, errors.New("build FakeTCP controller marks: state is nil")
+	}
+	if err := validateFakeTCPPolicySnapshot(snapshot); err != nil {
+		return nil, fmt.Errorf("build FakeTCP controller marks: %w", err)
+	}
+	wireGuards := make(map[uint32]control.WireGuardState, len(state.WireGuards))
+	for _, wg := range state.WireGuards {
+		if wg.ID == 0 {
+			continue
+		}
+		if _, exists := wireGuards[wg.ID]; exists {
+			return nil, fmt.Errorf("build FakeTCP controller marks: duplicate WireGuard ID %d", wg.ID)
+		}
+		wireGuards[wg.ID] = wg
+	}
+	marks := make(map[uint32]uint32, len(snapshot.ControlPolicies))
+	for key := range snapshot.ControlPolicies {
+		wg, exists := wireGuards[key.WGID]
+		if !exists {
+			return nil, fmt.Errorf(
+				"build FakeTCP controller marks: WireGuard ID %d is absent",
+				key.WGID,
+			)
+		}
+		if wg.TransportMode != "faketcp" || !wg.RuntimeStateAvailable ||
+			wg.RuntimeFirewallMark == 0 {
+			return nil, fmt.Errorf(
+				"build FakeTCP controller marks: WireGuard %q has no live nonzero FakeTCP mark",
+				wg.Name,
+			)
+		}
+		marks[key.WGID] = wg.RuntimeFirewallMark
+	}
+	return marks, nil
+}
+
 func validateFakeTCPPolicySnapshot(snapshot *fakeTCPPolicySnapshot) error {
 	if snapshot == nil {
 		return errors.New("snapshot is nil")

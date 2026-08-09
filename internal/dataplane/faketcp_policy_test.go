@@ -62,6 +62,66 @@ func TestBuildFakeTCPPolicySnapshotProjectsExactManagedPolicy(t *testing.T) {
 	}
 }
 
+func TestBuildFakeTCPControllerMarksProjectsOnlyLiveReferencedWireGuards(t *testing.T) {
+	state := fakeTCPPolicyTestState()
+	for index := range state.WireGuards {
+		state.WireGuards[index].RuntimeStateAvailable = true
+		state.WireGuards[index].RuntimeFirewallMark = uint32(0xa1230001 + index)
+	}
+	snapshot, err := buildFakeTCPPolicySnapshot(state, 91)
+	if err != nil {
+		t.Fatal(err)
+	}
+	marks, err := buildFakeTCPControllerMarks(state, snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(marks, map[uint32]uint32{
+		1: 0xa1230001,
+		2: 0xa1230002,
+	}) {
+		t.Fatalf("controller marks=%#v", marks)
+	}
+	state.WireGuards[0].RuntimeFirewallMark = 0xffffffff
+	if marks[1] != 0xa1230001 {
+		t.Fatalf("controller mark followed source mutation: %#x", marks[1])
+	}
+}
+
+func TestBuildFakeTCPControllerMarksRejectsAmbiguousRuntimeProjection(t *testing.T) {
+	newFixture := func(t *testing.T) (*control.State, *fakeTCPPolicySnapshot) {
+		t.Helper()
+		state := fakeTCPPolicyTestState()
+		for index := range state.WireGuards {
+			state.WireGuards[index].RuntimeStateAvailable = true
+			state.WireGuards[index].RuntimeFirewallMark = uint32(index + 1)
+		}
+		snapshot, err := buildFakeTCPPolicySnapshot(state, 91)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return state, snapshot
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*control.State)
+	}{
+		{name: "missing", mutate: func(state *control.State) { state.WireGuards = state.WireGuards[1:] }},
+		{name: "duplicate", mutate: func(state *control.State) { state.WireGuards[1].ID = state.WireGuards[0].ID }},
+		{name: "transport", mutate: func(state *control.State) { state.WireGuards[0].TransportMode = "udp" }},
+		{name: "runtime unavailable", mutate: func(state *control.State) { state.WireGuards[0].RuntimeStateAvailable = false }},
+		{name: "zero mark", mutate: func(state *control.State) { state.WireGuards[0].RuntimeFirewallMark = 0 }},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state, snapshot := newFixture(t)
+			test.mutate(state)
+			if _, err := buildFakeTCPControllerMarks(state, snapshot); err == nil {
+				t.Fatal("ambiguous controller mark projection was accepted")
+			}
+		})
+	}
+}
+
 func TestValidateFakeTCPPolicySnapshotRejectsReservedFields(t *testing.T) {
 	tests := []struct {
 		name    string

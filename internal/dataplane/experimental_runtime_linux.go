@@ -20,6 +20,7 @@ import (
 const (
 	fakeTCPSessionMapName    = "faketcp_session_map"
 	fakeTCPEventsMapName     = "faketcp_events"
+	fakeTCPStatsMapName      = "faketcp_stats_map"
 	fakeTCPRuntimeIDMapName  = "faketcp_rt_id"
 	fakeTCPCaptureSeqMapName = "faketcp_cap_seq"
 	fakeTCPEgressProgramName = "wg_faketcp_egress"
@@ -48,6 +49,7 @@ type experimentalSlowPath interface {
 
 type experimentalSlowPathFactory func(
 	*faketcp.Engine,
+	*ebpf.Map,
 	*ebpf.Map,
 ) (experimentalSlowPath, error)
 
@@ -809,6 +811,14 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if err != nil {
 		return err
 	}
+	statsResource, err := options.collection.mapResource(fakeTCPStatsMapName)
+	if err != nil {
+		return err
+	}
+	statsMap, ok := linuxMapFromExperimentalResource(statsResource)
+	if !ok {
+		return errors.New("experimental FakeTCP stats resource is not a live eBPF map")
+	}
 	programArrayResource, err := options.collection.mapResource(fakeTCPEgressProgramArrayMapName)
 	if err != nil {
 		return err
@@ -864,7 +874,7 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		return err
 	}
 	err = build.events.withMap(func(eventsMap *ebpf.Map) error {
-		constructed, constructErr := options.slowPathFactory(build.engine, eventsMap)
+		constructed, constructErr := options.slowPathFactory(build.engine, eventsMap, statsMap)
 		if constructErr != nil {
 			if !experimentalSlowPathIsNil(constructed) {
 				if closeErr := constructed.Close(); closeErr != nil {

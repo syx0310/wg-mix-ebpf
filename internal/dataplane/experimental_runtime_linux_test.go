@@ -306,6 +306,7 @@ func newRuntimeTestFixture(t *testing.T) *runtimeTestFixture {
 	}
 	addMap(fakeTCPSessionMapName, dummyMap)
 	addMap(fakeTCPEventsMapName, dummyMap)
+	addMap(fakeTCPStatsMapName, dummyMap)
 	addMap(fakeTCPEgressProgramArrayMapName, dummyMap)
 	addMap(fakeTCPRuntimeIDMapName, dummyMap)
 	addMap(fakeTCPCaptureSeqMapName, dummyMap)
@@ -318,6 +319,7 @@ func newRuntimeTestFixture(t *testing.T) *runtimeTestFixture {
 	}
 	fixture.mapResources[fakeTCPRuntimeIDMapName].bpfMap = &ebpf.Map{}
 	fixture.mapResources[fakeTCPCaptureSeqMapName].bpfMap = &ebpf.Map{}
+	fixture.mapResources[fakeTCPStatsMapName].bpfMap = &ebpf.Map{}
 	collectionMaps := make(map[string]experimentalMapResource, len(fixture.mapResources))
 	for name, resource := range fixture.mapResources {
 		collectionMaps[name] = resource
@@ -379,9 +381,13 @@ func runtimeTestEngineOptions(generation uint64) faketcp.Options {
 func (fixture *runtimeTestFixture) slowPathFactory(
 	engine *faketcp.Engine,
 	eventsMap *ebpf.Map,
+	statsMap *ebpf.Map,
 ) (experimentalSlowPath, error) {
 	if eventsMap != fixture.eventSource.bpfMap {
 		return nil, errors.New("slow-path factory received unrelated events map")
+	}
+	if statsMap != fixture.mapResources[fakeTCPStatsMapName].bpfMap {
+		return nil, errors.New("slow-path factory received unrelated stats map")
 	}
 	fixture.slowPath.engine = engine
 	return fixture.slowPath, nil
@@ -1909,7 +1915,7 @@ func TestExperimentalSlowPathConstructionFailureQuarantinesPartialOwner(t *testi
 	closeErr := errors.New("injected partial slow-path close failure")
 	fixture.slowPath.closeErr = closeErr
 	options := fixture.buildOptions(snapshot, transaction)
-	options.slowPathFactory = func(*faketcp.Engine, *ebpf.Map) (experimentalSlowPath, error) {
+	options.slowPathFactory = func(*faketcp.Engine, *ebpf.Map, *ebpf.Map) (experimentalSlowPath, error) {
 		return fixture.slowPath, factoryErr
 	}
 	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
@@ -1943,7 +1949,7 @@ func TestExperimentalSlowPathTypedNilFailsClosed(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
 	options := fixture.buildOptions(snapshot, transaction)
-	options.slowPathFactory = func(*faketcp.Engine, *ebpf.Map) (experimentalSlowPath, error) {
+	options.slowPathFactory = func(*faketcp.Engine, *ebpf.Map, *ebpf.Map) (experimentalSlowPath, error) {
 		var typedNil *fakeExperimentalSlowPath
 		return typedNil, nil
 	}
