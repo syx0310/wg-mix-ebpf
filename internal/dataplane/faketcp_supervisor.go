@@ -35,10 +35,11 @@ type fakeTCPRuntimeService interface {
 type fakeTCPRuntimeBuild func(context.Context) (fakeTCPRuntimeService, error)
 
 // fakeTCPRuntimeSupervisor is the single userspace ownership boundary for an
-// activated experimental generation.  Ensure and Stop are serialised because
-// collection, TC, and XDP ownership must never be split between two callers.
-// A successful Ensure transfers exactly one runtime to the supervisor; Close
-// is only called after its Run method has returned.
+// activated experimental generation, including its half-open and SYN quota.
+// Ensure and Stop are serialised because collection, TC, XDP, and quota
+// ownership must never be split between two runtimes. A successful Ensure
+// transfers exactly one runtime to the supervisor; a replacement is not built
+// until the prior Run has returned and Close has released its complete owner.
 type fakeTCPRuntimeSupervisor struct {
 	operationMu sync.Mutex
 	mu          sync.Mutex

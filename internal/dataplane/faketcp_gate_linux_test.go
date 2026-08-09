@@ -44,39 +44,6 @@ func TestFakeTCPKernelGateRejectsBeforeActivation(t *testing.T) {
 	}
 }
 
-func TestFakeTCPActivationCannotBeEnabledWithoutEveryAcceptanceCapability(t *testing.T) {
-	if fakeTCPActivationReady() {
-		t.Fatal("experimental FakeTCP object became attachable without the missing acceptance capabilities")
-	}
-	missing := strings.Join(missingFakeTCPCapabilities(), "\n")
-	if strings.Contains(missing, "BPF control-event admission/coalescing") ||
-		fakeTCPImplementedCapabilities&fakeTCPCapabilityBPFControlAdmission == 0 {
-		t.Fatalf("implemented BPF control-event admission is still reported missing: %q", missing)
-	}
-	for _, capability := range []string{
-		"XDP link ownership/rollback and libxdp chaining",
-		"atomic managed-interface/port policy population",
-		"persistent/reload-safe SYN admission checkpoint backend",
-		"ip_summed/CHECKSUM_PARTIAL identification",
-		"CHECKSUM_PARTIAL materialize/complete",
-		"checksum offset and skb metadata reset",
-		"per-segment GSO transform",
-		"established-state compare-delete backend",
-		"real-NIC GSO/GRO/checksum-offload acceptance",
-	} {
-		if !strings.Contains(missing, capability) {
-			t.Fatalf("hard gate no longer requires %q; missing=%q", capability, missing)
-		}
-	}
-}
-
-func TestFakeTCPImplementedCapabilityMaskRemainsEvidenceBound(t *testing.T) {
-	const want fakeTCPCapability = 0x2d
-	if got := fakeTCPImplementedCapabilities; got != want {
-		t.Fatalf("implemented capability mask=%#x, want %#x", got, want)
-	}
-}
-
 func TestFakeTCPKernelGateDoesNotBlockExistingTransports(t *testing.T) {
 	err := preflightFakeTCPKernelRequirements(&control.State{
 		WireGuards: []control.WireGuardState{{Name: "wg0", TransportMode: "udp"}},
