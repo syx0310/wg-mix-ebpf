@@ -190,10 +190,10 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 
 	for _, want := range []string{
 		"bpf_tail_call(skb, &faketcp_egress_programs",
-		"return faketcp_encode_established(skb, &info, rule, generation);",
+		"return faketcp_encode_established(skb, &info, rule, generation,",
 		"listener->transport_mode == TRANSPORT_FAKETCP",
-		"!faketcp_metadata_valid(skb, generation)",
-		"faketcp_capture_first_packet(skb, info, &l3, rule, &key)",
+		"faketcp_consume_ingress_admission(skb, &info, listener,",
+		"faketcp_capture_first_packet(skb, info, l3, rule, &key)",
 		"record_len = sizeof(record->event) + packet_len",
 		"faketcp_materialize_tcp_checksum",
 		"faketcp_prepare_udp(skb, info->ip_off, info->udp_off",
@@ -203,7 +203,7 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 			t.Fatalf("FakeTCP pipeline source missing %q", want)
 		}
 	}
-	if strings.Count(tc+fake, "faketcp_encode_established(skb, &info, rule, generation)") != 2 {
+	if strings.Count(tc+fake, "faketcp_encode_established(skb, &info, rule, generation,") != 2 {
 		t.Fatal("direct and tail-call branches must converge on exactly one FakeTCP encoder")
 	}
 	if !strings.Contains(fake, "single encoder used by both") {
@@ -221,10 +221,10 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 		t.Fatal("egress entry point is missing")
 	}
 	egress := tc[egressStart:]
-	preflight := strings.Index(egress, "faketcp_preflight_egress(skb, &info, rule, generation)")
+	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
 	typeWord := strings.Index(egress, "update_type_word(skb, &info, old_wire, new_wire, 1)")
-	if preflight < 0 || typeWord < 0 || preflight >= typeWord {
-		t.Fatal("FakeTCP first-packet capture must precede type-word and XOR mutation")
+	if checkpoint < 0 || typeWord < 0 || checkpoint >= typeWord {
+		t.Fatal("FakeTCP admission checkpoint must precede type-word and XOR mutation")
 	}
 }
 
@@ -234,46 +234,70 @@ func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T
 		t.Fatal(err)
 	}
 	text := string(source)
+	tcSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc := string(tcSource)
 
-	preflightStart := strings.Index(text, "static __always_inline int faketcp_preflight_egress")
+	preflightStart := strings.Index(text, "static __always_inline int faketcp_egress_admission_checkpoint")
+	gsoStart := strings.Index(text, "faketcp_encode_gso_segments(struct __sk_buff *skb")
 	checksumCommentStart := strings.Index(text, "// TC's public __sk_buff ABI")
 	checksumStart := strings.Index(text, "static __always_inline int faketcp_materialize_tcp_checksum")
 	encoderStart := strings.Index(text, "static __always_inline int faketcp_encode_established")
 	continuationStart := strings.Index(text, "static __always_inline int faketcp_continue_egress")
-	if preflightStart < 0 || checksumCommentStart < 0 || checksumStart < 0 || encoderStart < 0 || continuationStart < 0 ||
-		preflightStart >= checksumCommentStart || checksumCommentStart >= checksumStart ||
+	if preflightStart < 0 || gsoStart < 0 || checksumCommentStart < 0 || checksumStart < 0 || encoderStart < 0 || continuationStart < 0 ||
+		preflightStart >= gsoStart || gsoStart >= checksumCommentStart || checksumCommentStart >= checksumStart ||
 		checksumStart >= encoderStart || encoderStart >= continuationStart {
-		t.Fatal("FakeTCP preflight/checksum/encoder sections are missing or malformed")
+		t.Fatal("FakeTCP checkpoint/checksum/encoder sections are missing or malformed")
 	}
 
-	preflight := text[preflightStart:checksumCommentStart]
-	gsoReject := strings.Index(preflight, "if (skb->gso_segs || skb->gso_size)")
-	flowLookup := strings.Index(preflight, "faketcp_tc_key(skb, info, &l3, generation, &key)")
-	if gsoReject < 0 || flowLookup < 0 || gsoReject >= flowLookup {
-		t.Fatal("aggregate GSO must be rejected before flow lookup, capture, type-word and XOR mutation")
+	preflight := text[preflightStart : strings.Index(text[preflightStart:], "struct faketcp_gso_loop_context")+preflightStart]
+	gsoProjection := strings.Index(preflight, "faketcp_gso_build_projection(skb, info, profile, cipher")
+	flowLookup := strings.Index(preflight, "faketcp_tc_key(skb, info, l3, generation, &key)")
+	if gsoProjection < 0 || flowLookup < 0 || gsoProjection >= flowLookup {
+		t.Fatal("aggregate geometry and every segment contract must be proven before flow/session admission")
 	}
 	for _, want := range []string{
-		"dispatches supported UDP_L4 GSO aggregates",
-		"non-GSO continuation",
+		"feature_mask |= FAKETCP_ADMISSION_F_GSO",
+		".gso = gso",
+		"if (is_gso)",
 		"FAKETCP_STAT_GSO_REJECT",
 	} {
 		if !strings.Contains(preflight, want) {
-			t.Fatalf("GSO hard-gate contract missing %q", want)
+			t.Fatalf("GSO admission contract missing %q", want)
 		}
 	}
-	topSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
-	if err != nil {
-		t.Fatal(err)
-	}
-	egressStart := strings.Index(string(topSource), "int wg_mix_egress(struct __sk_buff *skb)")
+	egressStart := strings.Index(tc, "int wg_mix_egress(struct __sk_buff *skb)")
 	if egressStart < 0 {
 		t.Fatal("egress entry point is missing")
 	}
-	egress := string(topSource)[egressStart:]
+	egress := tc[egressStart:]
+	l3Gate := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
 	gsoDispatch := strings.Index(egress, "return faketcp_encode_gso_segments(")
-	singlePacketPreflight := strings.Index(egress, "faketcp_preflight_egress(skb, &info, rule, generation)")
-	if gsoDispatch < 0 || singlePacketPreflight < 0 || gsoDispatch >= singlePacketPreflight {
-		t.Fatal("supported GSO must dispatch before the non-GSO preflight")
+	nonGSOPrepare := strings.Index(egress, "if (faketcp_prepare_udp(")
+	nonGSOCheckpoint := strings.Index(egress, "if (faketcp_egress_admission_checkpoint(")
+	nonGSOConsume := strings.Index(egress, "if (faketcp_consume_egress_admission(")
+	firstNonGSOType := strings.Index(egress, "rc = update_type_word(skb, &info, old_wire, new_wire, 1)")
+	directNonGSOType := strings.LastIndex(egress, "rc = update_type_word(skb, &info, old_wire, new_wire, 1)")
+	if l3Gate < 0 || gsoDispatch < 0 || nonGSOPrepare < 0 || nonGSOCheckpoint < 0 || nonGSOConsume < 0 ||
+		firstNonGSOType < 0 || directNonGSOType < 0 ||
+		!(l3Gate < gsoDispatch && gsoDispatch < nonGSOPrepare && nonGSOPrepare < nonGSOCheckpoint &&
+			nonGSOCheckpoint < firstNonGSOType && firstNonGSOType < nonGSOConsume &&
+			nonGSOConsume < directNonGSOType) {
+		t.Fatal("shared L3 gate and unified prepare must precede one non-GSO proof/consume and mutation")
+	}
+	gso := text[gsoStart:checksumCommentStart]
+	gsoPrepare := strings.Index(gso, "faketcp_prepare_udp(skb, info->ip_off, info->udp_off")
+	gsoCheckpoint := strings.Index(gso, "faketcp_egress_admission_checkpoint(")
+	gsoConsume := strings.Index(gso, "faketcp_consume_egress_admission(")
+	gsoRewrite := strings.Index(gso, "bpf_loop(context.gso_segments, faketcp_gso_rewrite_type")
+	gsoMutation := strings.Index(gso, "faketcp_session_mutate(session, generation, now,")
+	gsoCommit := strings.Index(gso, "wg_mix_faketcp_skb_commit_udp_gso(")
+	if gsoPrepare < 0 || gsoCheckpoint < 0 || gsoConsume < 0 || gsoRewrite < 0 || gsoMutation < 0 || gsoCommit < 0 ||
+		!(gsoPrepare < gsoCheckpoint && gsoCheckpoint < gsoConsume && gsoConsume < gsoRewrite &&
+			gsoRewrite < gsoMutation && gsoMutation < gsoCommit) {
+		t.Fatal("GSO prepare/checkpoint/consume/transform/stable-writer/commit order drifted")
 	}
 
 	materialize := text[checksumCommentStart:encoderStart]
@@ -294,12 +318,11 @@ func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T
 		t.Fatal("full TCP checksum materialization must not consume the old UDP checksum or seed")
 	}
 
-	prepare := strings.Index(preflight, "faketcp_prepare_udp(skb, info->ip_off, info->udp_off")
 	encoder := text[encoderStart:continuationStart]
 	normalize := strings.Index(encoder, "bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)")
 	checksum := strings.Index(encoder, "faketcp_materialize_tcp_checksum(skb")
-	if prepare < 0 || normalize < 0 || checksum < 0 || normalize >= checksum {
-		t.Fatal("unified prepare, packet growth and full checksum recompute are missing or out of order")
+	if normalize < 0 || checksum < 0 || normalize >= checksum {
+		t.Fatal("packet growth and full checksum recompute are missing or out of order")
 	}
 	if strings.Contains(encoder, "bpf_check_mtu") || strings.Contains(encoder, "faketcp_mtu_allows_growth") {
 		t.Fatal("legacy device-only MTU fallback remains reachable after unified prepare")
@@ -526,7 +549,7 @@ func TestFakeTCPXDPUsesSharedL3ParserBeforeManagedPortPolicy(t *testing.T) {
 	}
 	xdp := text[xdpStart:]
 	parse := strings.Index(xdp, "parse_rc = faketcp_parse_l3")
-	lookup := strings.Index(xdp, "listener = faketcp_xdp_managed_port")
+	lookup := strings.Index(xdp, "managed_listener = faketcp_xdp_managed_port")
 	unsupported := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")
 	if parse < 0 || lookup < 0 || unsupported < 0 || parse >= lookup || lookup >= unsupported {
 		t.Fatal("shared L3 validation must precede managed-port lookup and the single transform gate")
@@ -593,31 +616,47 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 	if strings.Contains(text, "bpf_map_delete_elem(&faketcp_session_map") {
 		t.Fatal("packet programs must never bypass the userspace exact-delete finalizer")
 	}
-	if got := strings.Count(text, "bpf_map_lookup_elem(&faketcp_session_map"); got != 5 {
-		t.Fatalf("session-map lookup sites=%d, want claim plus four packet paths", got)
+	if got := strings.Count(text, "bpf_map_lookup_elem(&faketcp_session_map"); got != 6 {
+		t.Fatalf("session-map lookup sites=%d, want claim plus checkpoint/GSO/direct/ingress/XDP paths", got)
 	}
 
-	preflightStart := strings.Index(text, "faketcp_preflight_egress(struct __sk_buff")
+	preflightStart := strings.Index(text, "faketcp_egress_admission_checkpoint(")
 	gsoStart := strings.Index(text, "faketcp_encode_gso_segments(struct __sk_buff")
 	gsoEnd := strings.Index(text, "static __always_inline __s64 faketcp_rotation_checksum")
 	encodeStart := strings.Index(text, "faketcp_encode_established(struct __sk_buff")
+	continueStart := strings.Index(text, "faketcp_continue_egress(struct __sk_buff")
+	ingressConsumeStart := strings.Index(text, "faketcp_consume_ingress_admission(")
+	xdpCheckpointStart := strings.Index(text, "faketcp_xdp_admission_checkpoint(")
 	xdpStart := strings.Index(text, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
-	if preflightStart < 0 || gsoStart < 0 || gsoEnd < 0 || encodeStart < 0 || xdpStart < 0 ||
-		!(preflightStart < gsoStart && gsoStart < gsoEnd && gsoEnd < encodeStart && encodeStart < xdpStart) {
+	if preflightStart < 0 || gsoStart < 0 || gsoEnd < 0 || encodeStart < 0 || continueStart < 0 ||
+		ingressConsumeStart < 0 || xdpCheckpointStart < 0 || xdpStart < 0 ||
+		!(preflightStart < gsoStart && gsoStart < gsoEnd && gsoEnd < encodeStart &&
+			encodeStart < continueStart &&
+			continueStart < ingressConsumeStart && ingressConsumeStart < xdpCheckpointStart &&
+			xdpCheckpointStart < xdpStart) {
 		t.Fatal("FakeTCP packet path functions are missing or reordered")
 	}
 	preflight := text[preflightStart:gsoStart]
 	gso := text[gsoStart:gsoEnd]
-	encode := text[encodeStart:xdpStart]
+	encode := text[encodeStart:continueStart]
+	ingressConsume := text[ingressConsumeStart:xdpCheckpointStart]
+	xdpCheckpoint := text[xdpCheckpointStart:xdpStart]
 	xdp := text[xdpStart:]
-	if !strings.Contains(preflight,
-		"faketcp_session_admit_established(session, generation)") {
-		t.Fatal("TC preflight admits established state without the per-value lock")
+	if strings.Count(preflight, "faketcp_session_snapshot_established(") != 1 ||
+		strings.Count(preflight, "bpf_map_lookup_elem(&faketcp_session_map") != 1 {
+		t.Fatal("TC checkpoint must take exactly one locked established snapshot")
 	}
-	if strings.Contains(encode,
-		"faketcp_session_admit_established(session, generation)") ||
-		strings.Count(encode, "FAKETCP_SESSION_MUTATE_TX") != 1 {
-		t.Fatal("TC encoder regained a redundant admission lock or lost its mutation")
+	matcher := sourceSection(t, text,
+		"static __always_inline int faketcp_egress_admission_matches(",
+		"static __always_inline int faketcp_egress_admission_checkpoint(")
+	if strings.Contains(matcher, "bpf_map_lookup_elem(&faketcp_session_map") ||
+		strings.Contains(matcher, "faketcp_session_authority_matches(") ||
+		strings.Contains(matcher, "bpf_spin_lock(") {
+		t.Fatal("egress token comparison regained a redundant session lookup/lock")
+	}
+	if strings.Count(encode, "FAKETCP_SESSION_MUTATE_TX") != 1 ||
+		strings.Count(encode, "bpf_map_lookup_elem(&faketcp_session_map") != 1 {
+		t.Fatal("TC encoder must perform one lookup and one final writer mutation")
 	}
 	encoderMutation := strings.Index(encode, "faketcp_session_mutate(session, generation, now,")
 	if encoderMutation < 0 || strings.Contains(encode[:encoderMutation], "session->") {
@@ -625,24 +664,34 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 	}
 	if strings.Contains(gso, "faketcp_session_admit_established") ||
 		strings.Contains(gso, "__sync_fetch_and_add") ||
-		strings.Count(gso, "FAKETCP_SESSION_MUTATE_TX") != 1 {
+		strings.Count(gso, "FAKETCP_SESSION_MUTATE_TX") != 1 ||
+		strings.Count(gso, "bpf_map_lookup_elem(&faketcp_session_map") != 1 {
 		t.Fatal("GSO encoder regained an unlocked/redundant session path or lost its sole mutation")
 	}
 	gsoMutation := strings.Index(gso, "faketcp_session_mutate(session, generation, now,")
 	gsoPrepare := strings.Index(gso, "faketcp_prepare_udp(skb, info->ip_off, info->udp_off")
+	gsoCheckpoint := strings.Index(gso, "faketcp_egress_admission_checkpoint(")
+	gsoConsume := strings.Index(gso, "faketcp_consume_egress_admission(")
 	gsoTypeRewrite := strings.Index(gso, "faketcp_gso_rewrite_type")
 	gsoXOR := strings.Index(gso, "faketcp_gso_xor_chunk")
 	gsoCommit := strings.Index(gso, "wg_mix_faketcp_skb_commit_udp_gso(")
-	if gsoMutation < 0 || gsoPrepare < 0 || gsoTypeRewrite < 0 || gsoXOR < 0 || gsoCommit < 0 ||
+	if gsoMutation < 0 || gsoPrepare < 0 || gsoCheckpoint < 0 || gsoConsume < 0 ||
+		gsoTypeRewrite < 0 || gsoXOR < 0 || gsoCommit < 0 ||
 		strings.Contains(gso[:gsoMutation], "session->") ||
-		!(gsoPrepare < gsoTypeRewrite && gsoTypeRewrite < gsoXOR && gsoXOR < gsoMutation && gsoMutation < gsoCommit) {
-		t.Fatal("GSO validation/prepare/type/XOR must precede one locked snapshot and commit")
+		!(gsoPrepare < gsoCheckpoint && gsoCheckpoint < gsoConsume &&
+			gsoConsume < gsoTypeRewrite && gsoTypeRewrite < gsoXOR &&
+			gsoXOR < gsoMutation && gsoMutation < gsoCommit) {
+		t.Fatal("GSO prepare/proof/consume/type/XOR must precede one stable writer and commit")
 	}
-	if strings.Count(xdp,
-		"faketcp_session_admit_established(session, generation)") != 1 ||
+	if strings.Count(ingressConsume, "faketcp_session_authority_matches(") != 1 ||
+		strings.Count(ingressConsume, "bpf_map_lookup_elem(&faketcp_session_map") != 1 {
+		t.Fatal("TC ingress must consume one stable-lifetime proof under one read lock")
+	}
+	if strings.Count(xdpCheckpoint, "faketcp_session_snapshot_established(") != 1 ||
+		strings.Count(xdpCheckpoint, "bpf_map_lookup_elem(&faketcp_session_map") != 1 ||
 		strings.Count(xdp, "FAKETCP_SESSION_MUTATE_TOUCH") != 1 ||
 		strings.Count(xdp, "FAKETCP_SESSION_MUTATE_RX") != 1 {
-		t.Fatal("XDP reader/keepalive/payload writer lock or revision contract drifted")
+		t.Fatal("XDP checkpoint reader or keepalive/payload writer lock contract drifted")
 	}
 
 	// Packet helpers and rewrite are deliberately outside the tiny writer
@@ -887,7 +936,7 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 	}
 	for _, want := range []string{
 		"bpf_map_lookup_elem(&faketcp_rt_id",
-		"identity->generation != key->generation",
+		"identity->generation != generation",
 		"identity->event_abi_version != FAKETCP_EVENT_ABI_VERSION",
 		"if (!nonzero)",
 		"__builtin_memcpy(event->runtime_incarnation",
@@ -930,7 +979,7 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 	}
 
 	captureStart := strings.Index(text, "static __always_inline int faketcp_capture_first_packet")
-	preflightStart := strings.Index(text, "static __always_inline int faketcp_preflight_egress")
+	preflightStart := strings.Index(text, "static __always_inline int faketcp_egress_admission_checkpoint")
 	if captureStart < 0 || preflightStart < 0 || captureStart >= preflightStart {
 		t.Fatal("FakeTCP first-packet capture helper is missing or malformed")
 	}
@@ -1085,14 +1134,16 @@ func TestFakeTCPCloseControlsCannotAuthorizeDeleteBeforeBPFValidation(t *testing
 		t.Fatal(err)
 	}
 	text := string(source)
+	checkpointStart := strings.Index(text, "static __always_inline int faketcp_xdp_admission_checkpoint")
 	xdpStart := strings.Index(text, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
-	if xdpStart < 0 {
-		t.Fatal("FakeTCP XDP entry point is missing")
+	if checkpointStart < 0 || xdpStart < 0 || checkpointStart >= xdpStart {
+		t.Fatal("FakeTCP XDP admission checkpoint is missing")
 	}
+	checkpoint := text[checkpointStart:xdpStart]
 	xdp := text[xdpStart:]
-	closeDrop := strings.Index(xdp, "if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN))")
+	closeDrop := strings.Index(checkpoint, "if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN))")
 	firstEvent := strings.Index(xdp, "faketcp_emit_event")
-	if closeDrop < 0 || firstEvent < 0 || closeDrop >= firstEvent {
+	if closeDrop < 0 || firstEvent < 0 {
 		t.Fatal("RST/FIN can reach the ring before the unavailable BPF checksum/window validator")
 	}
 	if strings.Contains(xdp, "old_tcp.check == 0") {

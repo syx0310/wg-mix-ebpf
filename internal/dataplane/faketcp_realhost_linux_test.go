@@ -33,7 +33,7 @@ import (
 
 const (
 	fakeTCPRealHostObjectSizeLimit              = 128 << 20
-	fakeTCPRealHostStatCount                    = 17
+	fakeTCPRealHostStatCount                    = 19
 	fakeTCPRealHostStatMTUReject                = uint32(16)
 	fakeTCPRealHostMTURouteUnknownAuditKey      = uint32(3*3 + 2)
 	fakeTCPRealHostCoreStatEgressGSOSeen        = uint32(15)

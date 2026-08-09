@@ -97,6 +97,67 @@ type fakeTCPGSOModelCipher struct {
 	prefix   bool
 }
 
+type fakeTCPGSOAdmissionProjection struct {
+	segmentContract uint64
+	gsoSize         uint32
+	gsoSegments     uint32
+	logicalSegments uint32
+}
+
+func fakeTCPGSOAdmissionContractWord(contract uint64, word uint32) uint64 {
+	return (contract ^ uint64(word)) * 1099511628211
+}
+
+func projectFakeTCPGSOAdmission(
+	descriptor fakeTCPGSODescriptor,
+	aggregate []byte,
+	profile [4]uint32,
+	cipher *fakeTCPGSOModelCipher,
+) (fakeTCPGSOAdmissionProjection, error) {
+	if err := validateFakeTCPGSODescriptor(descriptor); err != nil {
+		return fakeTCPGSOAdmissionProjection{}, err
+	}
+	if len(aggregate) != descriptor.PayloadLength {
+		return fakeTCPGSOAdmissionProjection{}, errFakeTCPGSOGeometry
+	}
+	if cipher != nil && (cipher.maxBytes < 1 || cipher.maxBytes > 2048) {
+		return fakeTCPGSOAdmissionProjection{}, errFakeTCPGSOSegment
+	}
+	logicalSegments := (descriptor.PayloadLength + descriptor.GSOSize - 1) / descriptor.GSOSize
+	contract := uint64(1469598103934665603)
+	for index, offset := 0, 0; index < logicalSegments; index, offset = index+1, offset+descriptor.GSOSize {
+		length := min(descriptor.GSOSize, len(aggregate)-offset)
+		wire := binary.LittleEndian.Uint32(aggregate[offset : offset+4])
+		kind := fakeTCPWireGuardKind(wire)
+		if kind < 0 || !fakeTCPWireGuardLengthValid(kind, length) {
+			return fakeTCPGSOAdmissionProjection{}, errFakeTCPGSOSegment
+		}
+		xorTarget := 0
+		if cipher != nil {
+			xorTarget = length
+			if xorTarget > cipher.maxBytes {
+				if !cipher.prefix {
+					return fakeTCPGSOAdmissionProjection{}, errFakeTCPGSOSegment
+				}
+				xorTarget = cipher.maxBytes
+			}
+		}
+		for _, word := range [...]uint32{
+			uint32(index), uint32(length), wire, profile[kind], uint32(xorTarget),
+		} {
+			contract = fakeTCPGSOAdmissionContractWord(contract, word)
+		}
+	}
+	// Prepare publishes a validated exact gso_segs count for the only allowed
+	// DODGY-zero input before Admission forms this projection.
+	return fakeTCPGSOAdmissionProjection{
+		segmentContract: contract,
+		gsoSize:         uint32(descriptor.GSOSize),
+		gsoSegments:     uint32(logicalSegments),
+		logicalSegments: uint32(logicalSegments),
+	}, nil
+}
+
 type fakeTCPGSOWireSegment struct {
 	sequence uint32
 	payload  []byte
@@ -380,6 +441,86 @@ func TestFakeTCPGSOPerSegmentTypeXORRotationSequenceAndChecksum(t *testing.T) {
 	}
 }
 
+func TestFakeTCPGSOAdmissionProjectionRejectsEveryGeometryAndSegmentDrift(t *testing.T) {
+	descriptor := validFakeTCPGSODescriptor()
+	aggregate := make([]byte, descriptor.PayloadLength)
+	for index := range aggregate {
+		aggregate[index] = byte(index*13 + 9)
+	}
+	binary.LittleEndian.PutUint32(aggregate[0:4], 3)
+	binary.LittleEndian.PutUint32(aggregate[64:68], 3)
+	binary.LittleEndian.PutUint32(aggregate[128:132], 4)
+	profile := [4]uint32{0xa1b2c3d4, 0xb2c3d4e5, 0xc3d4e5f6, 0x13dff06b}
+	cipher := fakeTCPGSOModelCipher{maxBytes: 48, prefix: true}
+	proof, err := projectFakeTCPGSOAdmission(descriptor, aggregate, profile, &cipher)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if observed, err := projectFakeTCPGSOAdmission(descriptor, aggregate, profile, &cipher); err != nil || observed != proof {
+		t.Fatalf("unchanged aggregate rejected: projection=%+v error=%v", observed, err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*fakeTCPGSODescriptor, *[]byte, *[4]uint32, *fakeTCPGSOModelCipher) *fakeTCPGSOModelCipher
+	}{
+		{name: "gso size", mutate: func(d *fakeTCPGSODescriptor, _ *[]byte, _ *[4]uint32, c *fakeTCPGSOModelCipher) *fakeTCPGSOModelCipher {
+			d.GSOSize = 80
+			d.GSOSegments = 2
+			return c
+		}},
+		{name: "published segment count", mutate: func(d *fakeTCPGSODescriptor, _ *[]byte, _ *[4]uint32, c *fakeTCPGSOModelCipher) *fakeTCPGSOModelCipher {
+			d.GSOSegments++
+			return c
+		}},
+		{name: "aggregate payload length", mutate: func(d *fakeTCPGSODescriptor, packet *[]byte, _ *[4]uint32, c *fakeTCPGSOModelCipher) *fakeTCPGSOModelCipher {
+			d.PayloadLength++
+			*packet = append(*packet, 0x5a)
+			return c
+		}},
+		{name: "first segment input type", mutate: func(_ *fakeTCPGSODescriptor, packet *[]byte, _ *[4]uint32, c *fakeTCPGSOModelCipher) *fakeTCPGSOModelCipher {
+			binary.LittleEndian.PutUint32((*packet)[0:4], 4)
+			return c
+		}},
+		{name: "middle segment input type", mutate: func(_ *fakeTCPGSODescriptor, packet *[]byte, _ *[4]uint32, c *fakeTCPGSOModelCipher) *fakeTCPGSOModelCipher {
+			binary.LittleEndian.PutUint32((*packet)[64:68], 4)
+			return c
+		}},
+		{name: "last segment input type", mutate: func(_ *fakeTCPGSODescriptor, packet *[]byte, _ *[4]uint32, c *fakeTCPGSOModelCipher) *fakeTCPGSOModelCipher {
+			binary.LittleEndian.PutUint32((*packet)[128:132], 3)
+			return c
+		}},
+		{name: "expected mixed type", mutate: func(_ *fakeTCPGSODescriptor, _ *[]byte, p *[4]uint32, c *fakeTCPGSOModelCipher) *fakeTCPGSOModelCipher {
+			p[2] ^= 0x01010101
+			return c
+		}},
+		{name: "xor target", mutate: func(_ *fakeTCPGSODescriptor, _ *[]byte, _ *[4]uint32, c *fakeTCPGSOModelCipher) *fakeTCPGSOModelCipher {
+			c.maxBytes--
+			return c
+		}},
+		{name: "xor feature removed", mutate: func(_ *fakeTCPGSODescriptor, _ *[]byte, _ *[4]uint32, _ *fakeTCPGSOModelCipher) *fakeTCPGSOModelCipher {
+			return nil
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			candidateDescriptor := descriptor
+			candidatePacket := append([]byte(nil), aggregate...)
+			candidateProfile := profile
+			candidateCipher := cipher
+			candidateCipherPointer := test.mutate(
+				&candidateDescriptor, &candidatePacket, &candidateProfile, &candidateCipher,
+			)
+			observed, err := projectFakeTCPGSOAdmission(
+				candidateDescriptor, candidatePacket, candidateProfile, candidateCipherPointer,
+			)
+			if err == nil && observed == proof {
+				t.Fatalf("drift reused proof: %+v", observed)
+			}
+		})
+	}
+}
+
 func TestFakeTCPGSODirectCommitRejectsNonExclusiveStorage(t *testing.T) {
 	commitWritable := func(shared, cloned, headerCloned, nonlinear bool, headroom int) bool {
 		return !shared && !cloned && !headerCloned && !nonlinear && headroom >= 12
@@ -418,13 +559,21 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	tcSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
+	if err != nil {
+		t.Fatal(err)
+	}
 	bpf := string(bpfSource)
 	kernel := string(kernelSource)
+	tc := string(tcSource)
 	for _, required := range []string{
 		"wg_mix_faketcp_skb_prepare_udp(",
 		"wg_mix_faketcp_skb_commit_udp_gso(",
 		"Non-fraglist aggregates are source-neutral",
 		"bpf_loop(context.gso_segments, faketcp_gso_validate_segment",
+		"struct faketcp_gso_projection",
+		"faketcp_gso_build_projection(skb, info, profile, cipher",
+		"faketcp_consume_egress_admission(admission.nonce, &admission)",
 		"segment_index = index / context->xor_chunks_per_segment",
 		"target_length = segment_length < context->cipher->max_bytes",
 		"faketcp_session_mutate(session, generation, now,",
@@ -461,16 +610,23 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 		t.Fatal("GSO encoder boundaries are missing")
 	}
 	gso := bpf[gsoStart:gsoEnd]
-	parseGate := strings.Index(gso, "faketcp_parse_tc_l3(skb, info, &l3) != FAKETCP_L3_OK")
 	prepare := strings.Index(gso, "faketcp_prepare_udp(skb, info->ip_off, info->udp_off")
+	checkpoint := strings.Index(gso, "faketcp_egress_admission_checkpoint(")
+	consume := strings.Index(gso, "faketcp_consume_egress_admission(admission.nonce, &admission)")
 	rewrite := strings.Index(gso, "bpf_loop(context.gso_segments, faketcp_gso_rewrite_type")
 	sessionMutation := strings.Index(gso, "faketcp_session_mutate(session, generation, now,")
 	commitCall := strings.Index(gso, "wg_mix_faketcp_skb_commit_udp_gso(")
-	if parseGate < 0 || prepare < 0 || rewrite < 0 || sessionMutation < 0 || commitCall < 0 ||
+	if prepare < 0 || checkpoint < 0 || consume < 0 || rewrite < 0 || sessionMutation < 0 || commitCall < 0 ||
 		strings.Contains(gso[:sessionMutation], "session->") ||
 		strings.Count(gso, "FAKETCP_SESSION_MUTATE_TX") != 1 ||
-		!(parseGate < prepare && prepare < rewrite && rewrite < sessionMutation && sessionMutation < commitCall) {
-		t.Fatal("L3/prepare/segment rewrites must precede one locked session snapshot and GSO commit")
+		!(prepare < checkpoint && checkpoint < consume && consume < rewrite && rewrite < sessionMutation && sessionMutation < commitCall) {
+		t.Fatal("prepare/proof/consume/segment rewrites must precede one stable-lifetime writer and GSO commit")
+	}
+	egress := sourceSection(t, tc, "int wg_mix_egress(struct __sk_buff *skb)", "SEC(\"classifier/ingress\")")
+	parseGate := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	dispatch := strings.Index(egress, "return faketcp_encode_gso_segments(")
+	if parseGate < 0 || dispatch < 0 || parseGate >= dispatch {
+		t.Fatal("shared fixed-IPv4 gate must dominate the GSO encoder")
 	}
 	for _, field := range []string{"mutation.sequence", "mutation.acknowledgement", "mutation.window"} {
 		if !strings.Contains(gso[sessionMutation:], field) {
@@ -561,5 +717,22 @@ func BenchmarkFakeTCPGSOPerSegmentTransformModel(b *testing.B) {
 				}
 			}
 		})
+	}
+}
+
+func BenchmarkFakeTCPGSOAdmissionProjectionModel(b *testing.B) {
+	descriptor := validFakeTCPGSODescriptor()
+	aggregate := make([]byte, descriptor.PayloadLength)
+	for offset := 0; offset < len(aggregate); offset += descriptor.GSOSize {
+		binary.LittleEndian.PutUint32(aggregate[offset:], 4)
+	}
+	profile := [4]uint32{0xa1b2c3d4, 0xb2c3d4e5, 0xc3d4e5f6, 0x13dff06b}
+	cipher := fakeTCPGSOModelCipher{maxBytes: 48, prefix: true}
+	b.SetBytes(int64(len(aggregate)))
+	b.ReportAllocs()
+	for iteration := 0; iteration < b.N; iteration++ {
+		if _, err := projectFakeTCPGSOAdmission(descriptor, aggregate, profile, &cipher); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

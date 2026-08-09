@@ -11,11 +11,16 @@ func TestFakeTCPMTUIntegrationUsesUnifiedPrepareOnly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	tcSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
+	if err != nil {
+		t.Fatal(err)
+	}
 	kernelSource, err := os.ReadFile("../../kernel/faketcp_checksum/wg_mix_faketcp_checksum.c")
 	if err != nil {
 		t.Fatal(err)
 	}
 	bpf := string(bpfSource)
+	tc := string(tcSource)
 	kernel := string(kernelSource)
 	for _, forbidden := range []string{
 		"faketcp_mtu_admit",
@@ -50,6 +55,18 @@ func TestFakeTCPMTUIntegrationUsesUnifiedPrepareOnly(t *testing.T) {
 	}
 	if strings.Count(bpf, "wg_mix_faketcp_skb_prepare_udp(") != 2 {
 		t.Fatal("unified prepare must have one declaration and one BPF call")
+	}
+	if strings.Count(bpf+tc, "faketcp_prepare_udp(") != 3 {
+		t.Fatal("unified prepare must have one wrapper and exactly one call in each non-GSO/GSO branch")
+	}
+	egress := sourceSection(t, tc, "int wg_mix_egress(struct __sk_buff *skb)", "SEC(\"classifier/ingress\")")
+	l3Gate := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	gsoDispatch := strings.Index(egress, "return faketcp_encode_gso_segments(")
+	nonGSOPrepare := strings.Index(egress, "if (faketcp_prepare_udp(")
+	nonGSOCheckpoint := strings.Index(egress, "if (faketcp_egress_admission_checkpoint(")
+	if l3Gate < 0 || gsoDispatch < 0 || nonGSOPrepare < 0 || nonGSOCheckpoint < 0 ||
+		!(l3Gate < gsoDispatch && gsoDispatch < nonGSOPrepare && nonGSOPrepare < nonGSOCheckpoint) {
+		t.Fatal("fixed-IPv4 gate and unified non-GSO prepare must precede proof formation")
 	}
 	if fakeTCPImplementedCapabilities&fakeTCPCapabilityMTUEnforcement != 0 {
 		t.Fatal("a model or static contract must not claim live MTU enforcement")
