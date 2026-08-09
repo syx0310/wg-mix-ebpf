@@ -6,6 +6,7 @@ package faketcp
 
 import (
 	"container/list"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -112,12 +113,58 @@ type Action struct {
 // FWMark on Flow.UnderlayIndex so it traverses the ordinary
 // type-word/XOR/FakeTCP egress pipeline exactly once. CaptureID, not
 // CaptureNanos, is the once-only identity; the timestamp is diagnostic.
+// CaptureFingerprint is the SHA-256 digest of the exact event sample before
+// Controller materializes packet checksums. Captured packets must carry the
+// non-zero digest unchanged into every durable action checkpoint; it cannot be
+// reconstructed from Data after checksum materialization.
 type PendingPacket struct {
-	Data         []byte
-	FWMark       uint32
-	WGID         uint32
-	CaptureNanos uint64
-	CaptureID    CaptureIdentity
+	Data               []byte
+	FWMark             uint32
+	WGID               uint32
+	CaptureNanos       uint64
+	CaptureID          CaptureIdentity
+	CaptureFingerprint [32]byte
+	dataOwned          bool
+}
+
+// capturedPacketBinding is the complete immutable value associated with one
+// CaptureID. It stays comparable so both durable checkpoint validation and the
+// in-process reinjection ledger use the same conflict definition.
+type capturedPacketBinding struct {
+	flow               abi.FakeTCPSessionKey
+	fwmark             uint32
+	wgID               uint32
+	captureNanos       uint64
+	captureFingerprint [32]byte
+	dataFingerprint    [32]byte
+}
+
+func bindCapturedPacket(flow abi.FakeTCPSessionKey, packet PendingPacket) capturedPacketBinding {
+	return capturedPacketBinding{
+		flow:               flow,
+		fwmark:             packet.FWMark,
+		wgID:               packet.WGID,
+		captureNanos:       packet.CaptureNanos,
+		captureFingerprint: packet.CaptureFingerprint,
+		dataFingerprint:    sha256.Sum256(packet.Data),
+	}
+}
+
+func observeCapturedPacket(
+	bindings map[CaptureIdentity]capturedPacketBinding,
+	flow abi.FakeTCPSessionKey,
+	packet PendingPacket,
+) (bool, error) {
+	binding := bindCapturedPacket(flow, packet)
+	previous, found := bindings[packet.CaptureID]
+	if !found {
+		bindings[packet.CaptureID] = binding
+		return false, nil
+	}
+	if previous != binding {
+		return false, ErrCaptureIdentityConflict
+	}
+	return true, nil
 }
 
 type SessionSnapshot struct {
@@ -287,12 +334,20 @@ func (e *Engine) HandlePacketEvent(event abi.FakeTCPPacketEvent) ([]Action, erro
 	if length <= 0 || length > len(event.Packet) {
 		return nil, fmt.Errorf("faketcp captured packet length %d is invalid", length)
 	}
-	return e.handleCapturedPacket(event.Event, event.Packet[:length])
+	// The fixed ABI value is caller-owned test input, unlike the production
+	// ring sample. Copy only its declared packet before transferring ownership.
+	packet := append([]byte(nil), event.Packet[:length]...)
+	return e.handleOwnedCapturedPacket(event.Event, packet, sha256.Sum256(packet))
 }
 
-// handleCapturedPacket avoids materializing the fixed maximum-size ABI record
-// when a ring-buffer reader already owns the compact packet sample.
-func (e *Engine) handleCapturedPacket(event abi.FakeTCPEvent, packet []byte) ([]Action, error) {
+// handleOwnedCapturedPacket accepts an owned packet view from the production
+// decoder. CaptureFingerprint was computed over the exact original sample
+// before Controller materialized its checksums.
+func (e *Engine) handleOwnedCapturedPacket(
+	event abi.FakeTCPEvent,
+	packet []byte,
+	fingerprint [sha256.Size]byte,
+) ([]Action, error) {
 	if event.Type != abi.FakeTCPEventNeedHandshake {
 		return nil, fmt.Errorf("faketcp packet event type %d is not NEED_HANDSHAKE", event.Type)
 	}
@@ -316,11 +371,13 @@ func (e *Engine) handleCapturedPacket(event abi.FakeTCPEvent, packet []byte) ([]
 		return nil, err
 	}
 	return e.outbound(event.Key, PendingPacket{
-		Data:         packet,
-		FWMark:       event.FWMark,
-		WGID:         event.WGID,
-		CaptureNanos: event.TimestampNanos,
-		CaptureID:    captureID,
+		Data:               packet,
+		FWMark:             event.FWMark,
+		WGID:               event.WGID,
+		CaptureNanos:       event.TimestampNanos,
+		CaptureID:          captureID,
+		CaptureFingerprint: fingerprint,
+		dataOwned:          true,
 	}, true)
 }
 
@@ -356,9 +413,10 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 		}
 		s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
 		if alreadyDropped {
-			copyPacket := packet
-			copyPacket.Data = append([]byte(nil), packet.Data...)
-			return []Action{{Kind: ActionReleasePending, Flow: flow, Packets: []PendingPacket{copyPacket}}}, nil
+			return []Action{{
+				Kind: ActionReleasePending, Flow: flow,
+				Packets: []PendingPacket{ownPendingPacket(packet)},
+			}}, nil
 		}
 		return []Action{{Kind: ActionForward, Flow: flow}}, nil
 	}
@@ -403,24 +461,80 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 }
 
 func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, error) {
-	return e.inbound(flow, seg, 0, nil)
+	return e.inbound(flow, seg, 0)
 }
 
 // InboundWithWGID preserves the listener identity carried by the BPF event so
 // retries and replies are sent through the same configured WireGuard path.
 func (e *Engine) InboundWithWGID(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) ([]Action, error) {
-	return e.inbound(flow, seg, wgID, nil)
+	return e.inbound(flow, seg, wgID)
 }
 
-// InboundValidatedControl is the only path that may remove an established
-// session in response to peer RST/FIN. The opaque value can only be produced
-// by ValidateIPv4TCPControl from the complete packet and the exact BPF-owned
-// session snapshot used for its sequence/window checks.
-func (e *Engine) InboundValidatedControl(control ValidatedControl, wgID uint32) ([]Action, error) {
-	return e.inbound(control.flow, control.segment, wgID, &control)
+// InboundCapturedControl is the production close-control boundary. It binds a
+// packet-bearing BPF event to this Engine incarnation, re-reads the current
+// established value, validates the complete packet independently of BPF, and
+// only then requests an atomic compare-delete. Malformed peer input is an
+// ordinary fail-closed drop rather than a runtime-fatal error.
+func (e *Engine) InboundCapturedControl(event abi.FakeTCPEvent, packet []byte) ([]Action, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	flow := event.Key
+	if err := e.validateFlow(flow); err != nil {
+		return nil, err
+	}
+	identity := runtimeIdentityFromEvent(event)
+	if identity != e.identity || event.EventABIVersion != abi.FakeTCPEventABIVersion {
+		return nil, errors.New("faketcp close event does not match the active runtime identity")
+	}
+	if event.Type != abi.FakeTCPEventRST && event.Type != abi.FakeTCPEventFIN {
+		return nil, errors.New("faketcp captured control event is not RST or FIN")
+	}
+	if event.PacketLength != uint16(len(packet)) || len(packet) != controlPacketLength ||
+		event.PayloadLength != 0 || event.CaptureSequence != 0 || event.CaptureCPU != 0 ||
+		event.FWMark != 0 {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "invalid-close-envelope"}}, nil
+	}
+
+	s := e.sessions[flow]
+	if s == nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-close"}}, nil
+	}
+	if event.WGID == 0 || s.wgID == 0 || event.WGID != s.wgID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+	}
+	if s.pendingDelete != nil {
+		action, err := e.retryPendingDelete(flow, s)
+		return []Action{action}, err
+	}
+	if s.state != abi.FakeTCPStateEstablished {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
+	}
+	value, found, err := e.lookupEstablished(flow, s)
+	if err != nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+	}
+	if !found {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-missing"}}, nil
+	}
+	if validationErr := validateIPv4TCPControl(packet, event, value); validationErr != nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "invalid-close-control"}}, nil
+	}
+	result, err := e.compareDeleteEstablished(flow, s, pendingSessionDelete{
+		expected: value,
+		reason:   "peer-close",
+	})
+	if err != nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+	}
+	if result == SessionDeleteDifferent {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
+	}
+	e.remove(flow, s)
+	return []Action{{Kind: ActionClose, Flow: flow, Reason: "peer-close"}}, nil
 }
 
-func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32, validated *ValidatedControl) ([]Action, error) {
+func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) ([]Action, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.validateFlow(flow); err != nil {
@@ -449,28 +563,7 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32, v
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-close"}}, nil
 		}
 		if s.state == abi.FakeTCPStateEstablished {
-			if validated == nil || validated.flow != flow || validated.segment != seg {
-				return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
-			}
-			value, found, err := e.lookupEstablished(flow, s)
-			if err != nil {
-				return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
-			}
-			if found {
-				if value != validated.session {
-					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
-				}
-				result, err := e.compareDeleteEstablished(flow, s, pendingSessionDelete{
-					expected: validated.session,
-					reason:   "peer-close",
-				})
-				if err != nil {
-					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
-				}
-				if result == SessionDeleteDifferent {
-					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
-				}
-			}
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
 		}
 		e.remove(flow, s)
 		return []Action{{Kind: ActionClose, Flow: flow, Reason: "peer-close"}}, nil
@@ -754,12 +847,19 @@ func (e *Engine) enqueue(s *session, packet PendingPacket) bool {
 		}
 		e.pendingFlows++
 	}
-	copyPacket := packet
-	copyPacket.Data = append([]byte(nil), packet.Data...)
-	s.pending = append(s.pending, copyPacket)
-	s.pendingBytes += len(copyPacket.Data)
-	e.pendingBytes += len(copyPacket.Data)
+	packet = ownPendingPacket(packet)
+	s.pending = append(s.pending, packet)
+	s.pendingBytes += len(packet.Data)
+	e.pendingBytes += len(packet.Data)
 	return true
+}
+
+func ownPendingPacket(packet PendingPacket) PendingPacket {
+	if !packet.dataOwned {
+		packet.Data = append([]byte(nil), packet.Data...)
+		packet.dataOwned = true
+	}
+	return packet
 }
 
 // observeSYN applies the O(1) global limiter before any source-ledger lookup,

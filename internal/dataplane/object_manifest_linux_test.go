@@ -230,6 +230,25 @@ func TestExperimentalManifestRejectsSchemaAndMetadataDrift(t *testing.T) {
 			},
 		},
 	}
+	for _, requiredName := range experimentalFakeTCPKfuncNames {
+		name := requiredName
+		tests = append(tests, struct {
+			name   string
+			mutate func(*ebpf.CollectionSpec)
+		}{
+			name: "missing exact kfunc " + name,
+			mutate: func(spec *ebpf.CollectionSpec) {
+				program := spec.Programs["wg_mix_egress"]
+				filtered := make(asm.Instructions, 0, len(program.Instructions)-1)
+				for _, instruction := range program.Instructions {
+					if !instruction.IsKfuncCall() || instruction.Reference() != name {
+						filtered = append(filtered, instruction)
+					}
+				}
+				program.Instructions = filtered
+			},
+		})
+	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			spec := canonicalExperimentalCollectionSpec()
@@ -312,12 +331,13 @@ func canonicalExperimentalCollectionSpec() *ebpf.CollectionSpec {
 			ByteOrder:     binary.LittleEndian,
 		}
 	}
-	kfuncCall := asm.Call.Label(experimentalFakeTCPKfuncName)
-	kfuncCall.Src = asm.PseudoKfuncCall
-	spec.Programs["wg_mix_egress"].Instructions = asm.Instructions{
-		kfuncCall,
-		asm.Return(),
+	instructions := make(asm.Instructions, 0, len(experimentalFakeTCPKfuncNames)+1)
+	for _, name := range experimentalFakeTCPKfuncNames {
+		call := asm.Call.Label(name)
+		call.Src = asm.PseudoKfuncCall
+		instructions = append(instructions, call)
 	}
+	spec.Programs["wg_mix_egress"].Instructions = append(instructions, asm.Return())
 	return spec
 }
 

@@ -13,7 +13,8 @@ import (
 var (
 	ErrRawBackendClosed        = errors.New("faketcp raw controller backend is closed")
 	ErrReinjectorClosed        = errors.New("faketcp once-only reinjector is closed")
-	ErrReinjectLedgerCapacity  = errors.New("faketcp once-only reinjection ledger is full")
+	ErrReinjectLedgerCapacity  = errors.New("faketcp once-only reinjection stream ledger is full")
+	ErrReinjectOutOfOrder      = errors.New("faketcp capture sequence is out of order")
 	ErrCaptureIdentityConflict = errors.New("faketcp capture identity was reused with different packet metadata")
 )
 
@@ -105,9 +106,10 @@ func (resolve ControlMarkResolverFunc) ControlMark(
 }
 
 type RawControllerBackendOptions struct {
-	Writer                    RawIPv4Writer
-	ControlMarks              ControlMarkResolver
-	MaxRememberedReinjections int
+	Writer             RawIPv4Writer
+	ControlMarks       ControlMarkResolver
+	RuntimeIdentity    RuntimeIdentity
+	MaxReinjectStreams int
 }
 
 // RawControllerBackend implements ControllerBackend without owning any BPF
@@ -120,7 +122,7 @@ type RawControllerBackend struct {
 
 	writer       RawIPv4Writer
 	controlMarks ControlMarkResolver
-	reinjector   *OnceReinjector
+	reinjector   *onceReinjector
 	inflightDone *sync.Cond
 	closeDone    chan struct{}
 	inflight     uint64
@@ -139,7 +141,14 @@ func NewRawControllerBackend(options RawControllerBackendOptions) (*RawControlle
 	if controlMarkResolverIsNil(options.ControlMarks) {
 		return nil, errors.New("faketcp control mark resolver is nil")
 	}
-	reinjector, err := NewOnceReinjector(options.Writer, options.MaxRememberedReinjections)
+	if err := validateRuntimeIdentity(options.RuntimeIdentity); err != nil {
+		return nil, fmt.Errorf("faketcp raw controller runtime identity: %w", err)
+	}
+	reinjector, err := newOnceReinjector(
+		options.Writer,
+		options.RuntimeIdentity,
+		options.MaxReinjectStreams,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -277,7 +286,7 @@ func (backend *RawControllerBackend) Close() error {
 func (backend *RawControllerBackend) beginOperation() (
 	RawIPv4Writer,
 	ControlMarkResolver,
-	*OnceReinjector,
+	*onceReinjector,
 	error,
 ) {
 	backend.mu.Lock()
@@ -308,58 +317,59 @@ func (backend *RawControllerBackend) initializedLocked() bool {
 		backend.closeDone != nil
 }
 
-type reinjectIdentity struct {
-	capture CaptureIdentity
-}
-
-type reinjectFingerprint struct {
-	flow   abi.FakeTCPSessionKey
-	fwmark uint32
-	wgID   uint32
-	packet string
-}
-
 type reinjectAttempt struct {
-	fingerprint reinjectFingerprint
-	done        chan struct{}
-	err         error
+	identity CaptureIdentity
+	binding  capturedPacketBinding
+	done     chan struct{}
+	err      error
 }
 
-// OnceReinjector retains an exact identity for every attempted captured
-// packet. It claims an identity before calling the writer, so an error with an
-// ambiguous send outcome is never retried. Concurrent duplicate callers wait
-// for and receive the first attempt's result. Reusing an identity with changed
-// flow/mark/WGID/bytes fails closed without a write. The ledger never evicts:
-// reaching the configured bound requires a generation/runtime reload.
-type OnceReinjector struct {
+// onceReinjector is deliberately package-private: RawControllerBackend is the
+// only capability that may construct or expose a production reinjection path.
+// Each capture CPU is one monotonically sequenced stream. Only the newest
+// completed attempt per stream is retained, so memory is bounded by possible
+// CPUs instead of runtime duration. A lower sequence is rejected without a
+// write; an equal sequence is an exact duplicate and receives the first
+// attempt's result. The claim is installed before WriteIPv4, so an ambiguous
+// write result is never retried.
+type onceReinjector struct {
 	mu sync.Mutex
 
-	writer      RawIPv4Writer
-	maxAttempts int
-	attempts    map[reinjectIdentity]*reinjectAttempt
-	closed      bool
+	writer     RawIPv4Writer
+	identity   RuntimeIdentity
+	maxStreams int
+	lastByCPU  map[uint32]*reinjectAttempt
+	closed     bool
 }
 
-func NewOnceReinjector(writer RawIPv4Writer, maxAttempts int) (*OnceReinjector, error) {
+func newOnceReinjector(
+	writer RawIPv4Writer,
+	identity RuntimeIdentity,
+	maxStreams int,
+) (*onceReinjector, error) {
 	if rawIPv4WriterIsNil(writer) {
 		return nil, errors.New("faketcp once-only reinjector writer is nil")
+	}
+	if err := validateRuntimeIdentity(identity); err != nil {
+		return nil, fmt.Errorf("faketcp once-only reinjector runtime identity: %w", err)
 	}
 	if ready, ok := writer.(interface{ rawIPv4WriterReady() error }); ok {
 		if err := ready.rawIPv4WriterReady(); err != nil {
 			return nil, fmt.Errorf("faketcp once-only reinjector writer is not ready: %w", err)
 		}
 	}
-	if maxAttempts <= 0 {
-		return nil, errors.New("faketcp once-only reinjector capacity must be positive")
+	if maxStreams <= 0 {
+		return nil, errors.New("faketcp once-only reinjector stream capacity must be positive")
 	}
-	return &OnceReinjector{
-		writer:      writer,
-		maxAttempts: maxAttempts,
-		attempts:    make(map[reinjectIdentity]*reinjectAttempt),
+	return &onceReinjector{
+		writer:     writer,
+		identity:   identity,
+		maxStreams: maxStreams,
+		lastByCPU:  make(map[uint32]*reinjectAttempt),
 	}, nil
 }
 
-func (reinjector *OnceReinjector) Reinject(
+func (reinjector *onceReinjector) Reinject(
 	ctx context.Context,
 	flow abi.FakeTCPSessionKey,
 	packet PendingPacket,
@@ -376,43 +386,86 @@ func (reinjector *OnceReinjector) Reinject(
 	if err := validateCaptureIdentity(packet.CaptureID, flow.Generation); err != nil {
 		return fmt.Errorf("validate faketcp captured packet identity: %w", err)
 	}
+	if packet.CaptureID.Runtime != reinjector.identity {
+		return fmt.Errorf(
+			"faketcp captured packet runtime identity does not match reinjector: packet=%x reinjector=%x",
+			packet.CaptureID.Runtime.Incarnation,
+			reinjector.identity.Incarnation,
+		)
+	}
+	if packet.CaptureFingerprint == ([32]byte{}) {
+		return errors.New("faketcp captured packet has zero capture fingerprint")
+	}
 	if err := ValidateMaterializedIPv4UDP(packet.Data, flow); err != nil {
 		return err
 	}
-	identity := reinjectIdentity{capture: packet.CaptureID}
-	fingerprint := reinjectFingerprint{
-		flow:   flow,
-		fwmark: packet.FWMark,
-		wgID:   packet.WGID,
-		packet: string(packet.Data),
-	}
+	binding := bindCapturedPacket(flow, packet)
 
-	reinjector.mu.Lock()
-	if reinjector.closed {
-		reinjector.mu.Unlock()
-		return ErrReinjectorClosed
-	}
-	if previous := reinjector.attempts[identity]; previous != nil {
-		if previous.fingerprint != fingerprint {
+	var attempt *reinjectAttempt
+	for {
+		reinjector.mu.Lock()
+		if reinjector.closed {
 			reinjector.mu.Unlock()
-			return ErrCaptureIdentityConflict
+			return ErrReinjectorClosed
 		}
-		done := previous.done
-		reinjector.mu.Unlock()
-		select {
-		case <-done:
-			return previous.err
-		case <-ctx.Done():
-			return ctx.Err()
+		previous := reinjector.lastByCPU[packet.CaptureID.CPU]
+		if previous == nil {
+			if len(reinjector.lastByCPU) >= reinjector.maxStreams {
+				reinjector.mu.Unlock()
+				return fmt.Errorf(
+					"%w: maximum %d",
+					ErrReinjectLedgerCapacity,
+					reinjector.maxStreams,
+				)
+			}
+		} else {
+			switch {
+			case packet.CaptureID.Sequence < previous.identity.Sequence:
+				reinjector.mu.Unlock()
+				return fmt.Errorf(
+					"%w on CPU %d: sequence %d follows %d",
+					ErrReinjectOutOfOrder,
+					packet.CaptureID.CPU,
+					packet.CaptureID.Sequence,
+					previous.identity.Sequence,
+				)
+			case packet.CaptureID.Sequence == previous.identity.Sequence:
+				if previous.binding != binding {
+					reinjector.mu.Unlock()
+					return ErrCaptureIdentityConflict
+				}
+				done := previous.done
+				reinjector.mu.Unlock()
+				select {
+				case <-done:
+					return previous.err
+				case <-ctx.Done():
+					return ctx.Err()
+				}
+			default:
+				select {
+				case <-previous.done:
+					// The completed entry is replaced below while the lock is
+					// still held.
+				default:
+					// Preserve per-CPU write order and never replace an
+					// in-flight attempt that Close must still be able to join.
+					done := previous.done
+					reinjector.mu.Unlock()
+					select {
+					case <-done:
+						continue
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				}
+			}
 		}
-	}
-	if len(reinjector.attempts) >= reinjector.maxAttempts {
+		attempt = &reinjectAttempt{identity: packet.CaptureID, binding: binding, done: make(chan struct{})}
+		reinjector.lastByCPU[packet.CaptureID.CPU] = attempt
 		reinjector.mu.Unlock()
-		return fmt.Errorf("%w: maximum %d", ErrReinjectLedgerCapacity, reinjector.maxAttempts)
+		break
 	}
-	attempt := &reinjectAttempt{fingerprint: fingerprint, done: make(chan struct{})}
-	reinjector.attempts[identity] = attempt
-	reinjector.mu.Unlock()
 
 	err := reinjector.writer.WriteIPv4(ctx, RawIPv4Write{
 		Data:          packet.Data,
@@ -429,14 +482,14 @@ func (reinjector *OnceReinjector) Reinject(
 	return err
 }
 
-func (reinjector *OnceReinjector) Close() error {
+func (reinjector *onceReinjector) Close() error {
 	if reinjector == nil {
 		return nil
 	}
 	reinjector.mu.Lock()
 	reinjector.closed = true
 	pending := make([]<-chan struct{}, 0)
-	for _, attempt := range reinjector.attempts {
+	for _, attempt := range reinjector.lastByCPU {
 		select {
 		case <-attempt.done:
 		default:

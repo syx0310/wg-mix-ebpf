@@ -85,18 +85,20 @@ func probeExperimentalFakeTCPKernelDependencyWith(
 	if spec == nil {
 		return fmt.Errorf("required module BTF %q is nil", experimentalFakeTCPKfuncModule)
 	}
-	var function *btf.Func
-	if err := spec.TypeByName(experimentalFakeTCPKfuncName, &function); err != nil {
-		return fmt.Errorf(
-			"required module %q has no kfunc BTF %q: %w",
-			experimentalFakeTCPKfuncModule, experimentalFakeTCPKfuncName, err,
-		)
-	}
-	if function == nil {
-		return fmt.Errorf(
-			"required module %q returned nil kfunc BTF %q",
-			experimentalFakeTCPKfuncModule, experimentalFakeTCPKfuncName,
-		)
+	for _, name := range experimentalFakeTCPKfuncNames {
+		var function *btf.Func
+		if err := spec.TypeByName(name, &function); err != nil {
+			return fmt.Errorf(
+				"required module %q has no kfunc BTF %q: %w",
+				experimentalFakeTCPKfuncModule, name, err,
+			)
+		}
+		if function == nil {
+			return fmt.Errorf(
+				"required module %q returned nil kfunc BTF %q",
+				experimentalFakeTCPKfuncModule, name,
+			)
+		}
 	}
 	return nil
 }

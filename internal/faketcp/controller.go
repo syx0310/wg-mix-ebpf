@@ -3,6 +3,7 @@ package faketcp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -24,39 +25,78 @@ type DecodedEvent struct {
 	Packet []byte
 }
 
-// DecodeEventSample accepts the compact variable-size packet event emitted by
-// the current BPF program and the original fixed-size record for safe rolling
-// upgrades. Metadata-only NEED_HANDSHAKE events are rejected because they
-// cannot release a real first packet after the handshake.
+// borrowedDecodedEvent is valid only while its input sample remains owned by
+// the caller. Keeping this type private prevents the borrowed packet from
+// weakening DecodeEventSample's ownership contract.
+type borrowedDecodedEvent struct {
+	Event  abi.FakeTCPEvent
+	packet []byte
+}
+
+// ownedDecodedEvent transfers one validated event to the production
+// controller. Packet is either empty or an owned, capacity-bounded view into
+// the sample allocation. Fingerprint binds the exact pre-materialization
+// sample and remains valid after checksum materialization mutates Packet.
+type ownedDecodedEvent struct {
+	Event       abi.FakeTCPEvent
+	Packet      []byte
+	Fingerprint [sha256.Size]byte
+}
+
+// DecodeEventSample accepts compact variable-size packet events and the
+// original fixed-size record for safe rolling upgrades. NEED_HANDSHAKE and
+// destructive RST/FIN events must carry their complete L3 packet: metadata is
+// never sufficient to release a packet or authorize session teardown.
 func DecodeEventSample(sample []byte) (DecodedEvent, error) {
+	decoded, err := decodeBorrowedEventSample(sample)
+	if err != nil {
+		return DecodedEvent{}, err
+	}
+	return DecodedEvent{
+		Event:  decoded.Event,
+		Packet: append([]byte(nil), decoded.packet...),
+	}, nil
+}
+
+// decodeBorrowedEventSample applies the same validation as DecodeEventSample
+// without copying the packet. Callers must not retain packet after the input
+// sample's ownership ends.
+func decodeBorrowedEventSample(sample []byte) (borrowedDecodedEvent, error) {
 	if len(sample) < fakeTCPEventSize {
-		return DecodedEvent{}, fmt.Errorf("faketcp event sample has %d bytes, need at least %d", len(sample), fakeTCPEventSize)
+		return borrowedDecodedEvent{}, fmt.Errorf("faketcp event sample has %d bytes, need at least %d", len(sample), fakeTCPEventSize)
 	}
 	event := decodeEventHeader(sample[:fakeTCPEventSize])
 	if err := validateEventType(event); err != nil {
-		return DecodedEvent{}, err
+		return borrowedDecodedEvent{}, err
 	}
 
-	if event.Type != abi.FakeTCPEventNeedHandshake {
+	if !fakeTCPEventCarriesPacket(event.Type) {
 		if event.PacketLength != 0 || len(sample) != fakeTCPEventSize {
-			return DecodedEvent{}, fmt.Errorf("faketcp control event type %d has packet length %d and sample size %d", event.Type, event.PacketLength, len(sample))
+			return borrowedDecodedEvent{}, fmt.Errorf("faketcp control event type %d has packet length %d and sample size %d", event.Type, event.PacketLength, len(sample))
 		}
-		return DecodedEvent{Event: event}, nil
+		return borrowedDecodedEvent{Event: event}, nil
 	}
 
 	packetLength := int(event.PacketLength)
 	if packetLength <= 0 || packetLength > abi.FakeTCPMaxCapturedPacket {
-		return DecodedEvent{}, fmt.Errorf("faketcp captured packet length %d is invalid", packetLength)
+		return borrowedDecodedEvent{}, fmt.Errorf("faketcp captured packet length %d is invalid", packetLength)
 	}
 	compactSize := fakeTCPEventSize + packetLength
 	if len(sample) != compactSize && len(sample) != fakeTCPPacketEventSize {
-		return DecodedEvent{}, fmt.Errorf("faketcp packet event sample has %d bytes, want compact %d or fixed %d", len(sample), compactSize, fakeTCPPacketEventSize)
+		return borrowedDecodedEvent{}, fmt.Errorf("faketcp packet event sample has %d bytes, want compact %d or fixed %d", len(sample), compactSize, fakeTCPPacketEventSize)
 	}
-	packet := append([]byte(nil), sample[fakeTCPEventSize:compactSize]...)
-	if err := validateCapturedIPv4UDP(event, packet); err != nil {
-		return DecodedEvent{}, err
+	packet := sample[fakeTCPEventSize:compactSize:compactSize]
+	if event.Type == abi.FakeTCPEventNeedHandshake {
+		if err := validateCapturedIPv4UDP(event, packet); err != nil {
+			return borrowedDecodedEvent{}, err
+		}
 	}
-	return DecodedEvent{Event: event, Packet: packet}, nil
+	return borrowedDecodedEvent{Event: event, packet: packet}, nil
+}
+
+func fakeTCPEventCarriesPacket(eventType uint8) bool {
+	return eventType == abi.FakeTCPEventNeedHandshake ||
+		eventType == abi.FakeTCPEventRST || eventType == abi.FakeTCPEventFIN
 }
 
 func decodeEventHeader(header []byte) abi.FakeTCPEvent {
@@ -73,16 +113,18 @@ func decodeEventHeader(header []byte) abi.FakeTCPEvent {
 		TimestampNanos:     native.Uint64(header[24:32]),
 		RuntimeIncarnation: [16]byte(header[32:48]),
 		CaptureSequence:    native.Uint64(header[48:56]),
-		CaptureCPU:         native.Uint32(header[56:60]),
-		Sequence:           native.Uint32(header[60:64]),
-		Acknowledgement:    native.Uint32(header[64:68]),
-		PayloadLength:      native.Uint32(header[68:72]),
-		FWMark:             native.Uint32(header[72:76]),
-		WGID:               native.Uint32(header[76:80]),
-		PacketLength:       native.Uint16(header[80:82]),
-		EventABIVersion:    native.Uint16(header[82:84]),
-		Type:               header[84],
-		TCPFlags:           header[85],
+		SessionRevision:    native.Uint64(header[56:64]),
+		SessionID:          native.Uint64(header[64:72]),
+		CaptureCPU:         native.Uint32(header[72:76]),
+		Sequence:           native.Uint32(header[76:80]),
+		Acknowledgement:    native.Uint32(header[80:84]),
+		PayloadLength:      native.Uint32(header[84:88]),
+		FWMark:             native.Uint32(header[88:92]),
+		WGID:               native.Uint32(header[92:96]),
+		PacketLength:       native.Uint16(header[96:98]),
+		EventABIVersion:    native.Uint16(header[98:100]),
+		Type:               header[100],
+		TCPFlags:           header[101],
 	}
 }
 
@@ -118,15 +160,23 @@ func validateEventType(event abi.FakeTCPEvent) error {
 			return fmt.Errorf("faketcp ACK event has inconsistent flags %#x", flags)
 		}
 	case abi.FakeTCPEventRST:
-		if flags&FlagRST == 0 {
+		if flags != FlagRST|FlagACK {
 			return fmt.Errorf("faketcp RST event has inconsistent flags %#x", flags)
 		}
 	case abi.FakeTCPEventFIN:
-		if flags&FlagFIN == 0 || flags&FlagRST != 0 {
+		if flags != FlagFIN|FlagACK {
 			return fmt.Errorf("faketcp FIN event has inconsistent flags %#x", flags)
 		}
 	default:
 		return fmt.Errorf("unknown faketcp event type %d", event.Type)
+	}
+	closeEvent := event.Type == abi.FakeTCPEventRST || event.Type == abi.FakeTCPEventFIN
+	if closeEvent {
+		if event.SessionRevision == 0 || event.SessionID == 0 {
+			return errors.New("faketcp close event has no session identity")
+		}
+	} else if event.SessionRevision != 0 || event.SessionID != 0 {
+		return errors.New("faketcp non-close event contains a session identity")
 	}
 	if event.Type != abi.FakeTCPEventNeedHandshake &&
 		(event.CaptureSequence != 0 || event.CaptureCPU != 0) {
@@ -323,19 +373,62 @@ func (c *Controller) HandleSample(ctx context.Context, sample []byte) ([]Action,
 	if err != nil {
 		return nil, err
 	}
+	owned := ownedDecodedEvent{Event: decoded.Event, Packet: decoded.Packet}
+	if decoded.Event.Type == abi.FakeTCPEventNeedHandshake {
+		owned.Fingerprint = sha256.Sum256(sample)
+	}
+	return c.handleOwnedDecodedEvent(ctx, owned)
+}
+
+// handleOwnedEvent is the private production boundary selected when the
+// controller runtime is constructed. The reader has already decoded and
+// validated the sample, and transfers Packet ownership with this call.
+func (c *Controller) handleOwnedEvent(
+	ctx context.Context,
+	decoded ownedDecodedEvent,
+) ([]Action, error) {
+	if err := c.beginSerializedOperation(); err != nil {
+		return nil, err
+	}
+	defer c.endSerializedOperation()
+	if ctx == nil {
+		return nil, errControllerContextNil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return c.handleOwnedDecodedEvent(ctx, decoded)
+}
+
+// handleOwnedDecodedEvent runs with opMu held. Every packet reaching this
+// helper is owned by the call, so Engine may retain it without another copy.
+func (c *Controller) handleOwnedDecodedEvent(
+	ctx context.Context,
+	decoded ownedDecodedEvent,
+) ([]Action, error) {
 	if identity := runtimeIdentityFromEvent(decoded.Event); identity != c.engine.Identity() {
 		return nil, fmt.Errorf(
 			"faketcp event runtime identity does not match controller Engine: event=%x engine=%x",
 			identity.Incarnation, c.engine.Identity().Incarnation,
 		)
 	}
-	var actions []Action
-	if decoded.Event.Type == abi.FakeTCPEventNeedHandshake {
+	var (
+		actions []Action
+		err     error
+	)
+	switch decoded.Event.Type {
+	case abi.FakeTCPEventNeedHandshake:
 		if err := MaterializeIPv4UDPChecksums(decoded.Packet); err != nil {
 			return nil, err
 		}
-		actions, err = c.engine.handleCapturedPacket(decoded.Event, decoded.Packet)
-	} else {
+		actions, err = c.engine.handleOwnedCapturedPacket(
+			decoded.Event,
+			decoded.Packet,
+			decoded.Fingerprint,
+		)
+	case abi.FakeTCPEventRST, abi.FakeTCPEventFIN:
+		actions, err = c.engine.InboundCapturedControl(decoded.Event, decoded.Packet)
+	default:
 		actions, err = c.engine.InboundWithWGID(decoded.Event.Key, Segment{
 			Flags:           decoded.Event.TCPFlags,
 			Sequence:        decoded.Event.Sequence,

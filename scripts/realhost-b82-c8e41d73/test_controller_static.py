@@ -20,16 +20,17 @@ def read_regular(path_text: str) -> tuple[pathlib.Path, str]:
 
 
 def main() -> None:
-    if len(sys.argv) != 6:
+    if len(sys.argv) != 7:
         fail(
             "usage: test_controller_static.py BINDER CONTROLLER TRANSPORT "
-            "ROOT_STAGER ROOT_MATRIX"
+            "ROOT_STAGER ROOT_MATRIX PROVISIONER"
         )
     binder_path, binder = read_regular(sys.argv[1])
     controller_path, controller = read_regular(sys.argv[2])
     transport_path, transport = read_regular(sys.argv[3])
     stager_path, stager = read_regular(sys.argv[4])
     matrix_path, matrix = read_regular(sys.argv[5])
+    provisioner_path, provisioner = read_regular(sys.argv[6])
 
     production = {
         binder_path.name: binder,
@@ -87,6 +88,7 @@ def main() -> None:
         "absent)",
         '"${WG_INTERFACE}" == \'absent\'',
         "prepare-stage-root.sh",
+        "scripts/provision-ubuntu-test-host.sh",
         "locked-transport.exp",
         "controller.sh",
     )
@@ -115,10 +117,22 @@ def main() -> None:
         "--manifest-sha256",
         "--credential-path",
         "credential_read=0 network_operations=0 mutations=0",
-        "BOOTSTRAP_OPERATIONS",
+        "BASE_IDENTITY_OPERATIONS",
+        "POSTFLIGHT_OPERATIONS",
+        "BOOTSTRAP_CREATE_OPERATIONS",
         "bootstrap-absent bootstrap-not-symlink bootstrap-create bootstrap-root-readlink bootstrap-root-stat",
-        "bootstrap-stager-readlink bootstrap-stager-sha bootstrap-stager-stat",
+        "bootstrap-install-provisioner bootstrap-install-stager",
+        "bootstrap-provisioner-readlink bootstrap-provisioner-stat bootstrap-provisioner-sha",
+        "bootstrap-stager-readlink bootstrap-stager-stat bootstrap-stager-sha",
         "STAGE_OPERATIONS=(stage-snapshot stage-plan stage-run)",
+        "state_transition PACKAGE_BOUND BOOTSTRAP_ONLY",
+        "state_transition BOOTSTRAP_ONLY PROVISION_CHECK",
+        "state_transition PROVISION_CHECK AWAIT_APPLY",
+        "state_transition AWAIT_APPLY PROVISION_APPLY",
+        "state_transition PROVISION_APPLY POSTFLIGHT",
+        "run_operation execute provision-apply",
+        "B82_V6_PROVISION_AWAIT_APPLY",
+        "automatic_apply=0",
     )
     for literal in required_controller:
         if literal not in controller:
@@ -127,6 +141,47 @@ def main() -> None:
         fail("controller contains an implicit package installation path")
     if "open ${CREDENTIAL" in controller or "<\"${CREDENTIAL" in controller:
         fail("controller directly reads the credential file")
+    prepare_body = controller[
+        controller.index("execute_prepare() {") : controller.index("execute_provision_apply() {")
+    ]
+    if "run_operation execute provision-apply" in prepare_body:
+        fail("prepare can trigger provisioning apply")
+    apply_body = controller[
+        controller.index("execute_provision_apply() {") : controller.index("main() {")
+    ]
+    if apply_body.count("run_operation execute provision-apply") != 1:
+        fail("explicit apply path does not contain exactly one fixed apply operation")
+    apply_order = (
+        "verify_remote_package || return $?",
+        "run_provision_check || return $?",
+        "state_transition PROVISION_CHECK AWAIT_APPLY",
+        "state_transition AWAIT_APPLY PROVISION_APPLY",
+        "verify_provisioner || return $?",
+        "run_operation execute provision-apply",
+        "verify_provisioner || return $?",
+        "run_provision_check || return $?",
+        "state_transition PROVISION_APPLY POSTFLIGHT",
+        "execute_postflight",
+    )
+    remaining = apply_body
+    for literal in apply_order:
+        position = remaining.find(literal)
+        if position < 0:
+            fail(f"explicit apply order is missing {literal!r}")
+        remaining = remaining[position + len(literal) :]
+    postflight_body = controller[
+        controller.index("execute_postflight() {") : controller.index("execute_prepare() {")
+    ]
+    postflight_order = (
+        "verify_remote_package || return $?",
+        '"${POSTFLIGHT_OPERATIONS[@]}" controller-shellcheck hermetic-matrix',
+        "verify_stager || return $?",
+        '"${STAGE_OPERATIONS[@]}"',
+        "B82_V6_CONTROLLER_POSTFLIGHT_COMPLETE",
+    )
+    positions = [postflight_body.index(item) for item in postflight_order]
+    if positions != sorted(positions):
+        fail("postflight no longer performs full preflight before staging")
 
     required_transport = (
         'set action [lindex $argv 7]',
@@ -149,6 +204,7 @@ def main() -> None:
         "identity-wg-interfaces",
         "contains:go1.26.0",
         "contains:21.1.8",
+        "/usr/sbin/bpftool -V",
         "contains:v7.7.0",
         "contains:GNU Make 4.4.1",
         "set assertion empty",
@@ -170,6 +226,23 @@ def main() -> None:
         "bootstrap-stager-readlink",
         "bootstrap-stager-sha",
         "bootstrap-stager-stat",
+        "bootstrap-install-provisioner",
+        'set bootstrap_provisioner "${bootstrap_root}/provision-ubuntu-test-host.sh"',
+        '"${package}/provision-ubuntu-test-host.sh" $bootstrap_provisioner',
+        "bootstrap-provisioner-readlink",
+        "bootstrap-provisioner-stat",
+        "bootstrap-provisioner-sha",
+        "provision-check - provision-apply",
+        "/bin/bash -p $bootstrap_provisioner $provision_mode",
+        "--expected-address 192.168.10.82",
+        "--expected-interface ens33",
+        "--expected-hostname ubuntu-2604-test",
+        "--expected-kernel 7.0.0-28-generic",
+        "--expected-machine-id 9db3fb717cc74974b2a6b243d67f67b9",
+        "provision_plan_policy",
+        "unexpected-missing-set",
+        "B82_V6_PROVISION_AUDIT",
+        "child_rc=$child_rc plan=unverified missing_set=unverified next_state=STOP",
         "stage-snapshot",
         'set snapshot_manifest "${bootstrap_root}/package-manifest.v1"',
         'snapshot --manifest "${package}/package-manifest.v1"',
@@ -188,6 +261,8 @@ def main() -> None:
         fail("transport places the password in child argv")
     if "lrange $argv 2 end" in transport or "--remote-argv" in transport:
         fail("transport accepts a caller-supplied remote argv")
+    if "/usr/sbin/bpftool version" in transport:
+        fail("transport retains the legacy bpftool version argv")
     if re.search(
         r'/bin/bash\s+-p\s+"?\$\{package\}/prepare-stage-root\.sh', transport
     ):
@@ -208,6 +283,18 @@ def main() -> None:
     positions = [transport.index(item) for item in bootstrap_order]
     if positions != sorted(positions):
         fail("root-owned bootstrap operation order changed")
+    if transport.count('set bootstrap_root "/run/wg-mix-ebpf-source-bootstrap-c8e41d73"') != 1:
+        fail("transport has zero or multiple bootstrap roots")
+    if transport.count('set bootstrap_provisioner "${bootstrap_root}/provision-ubuntu-test-host.sh"') != 1:
+        fail("transport has zero or multiple provisioner paths")
+    provision_verify = (
+        "bootstrap-provisioner-readlink",
+        "bootstrap-provisioner-stat",
+        "bootstrap-provisioner-sha",
+    )
+    verify_positions = [transport.index(item) for item in provision_verify]
+    if verify_positions != sorted(verify_positions):
+        fail("provisioner canonical path/stat/SHA order changed")
 
     required_stager = (
         "root-required",
@@ -238,6 +325,19 @@ def main() -> None:
         "root:root:700:1:regular file",
         'canonical_self="$(/usr/bin/readlink -e -- "$0")"',
         '[[ "$(sha256_file "${EXPECTED_SELF}")" == "${PREPARE_SHA256}" ]]',
+        'readonly MODULE_LEASE_LOCK="${STAGE_ROOT}/checksum-module-lease.v1.lock"',
+        'readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-${RUN_ID}/checksum-module-lease.sh"',
+        "plan_command S3.lock /usr/bin/install --owner=root --group=root --mode=0600",
+        '--no-target-directory -- /dev/null "${MODULE_LEASE_LOCK}"',
+        "require_module_lease_lock",
+        "module-lease-lock-create",
+        "module-lease-lock-drift",
+        '"module_lease_lock=${MODULE_LEASE_LOCK}"',
+        '"${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}"',
+        "provision_ubuntu_test_host_sh_path",
+        "provision_ubuntu_test_host_sh_blob",
+        "provision_ubuntu_test_host_sh_sha256",
+        "${EXPECTED_SOURCE}/${PROVISION_PATH}",
     )
     for literal in required_stager:
         if literal not in stager:
@@ -260,6 +360,28 @@ def main() -> None:
         fail("root stager parses the manifest before the bundle intake copy completes")
     if stager.count("validate_manifest || fail 'manifest-contract'") != 2:
         fail("root stager manifest parsing escaped the two root-snapshot consumers")
+    if stager.index("run_step S3.lock") > stager.index("run_step S4"):
+        fail("root stager creates the shared module lock after source staging begins")
+    if stager.index("require_module_lease_lock || fail 'module-lease-lock-drift'") > stager.index(
+        "write_binding_marker || fail 'binding-marker'"
+    ):
+        fail("root stager binds the stage before revalidating the shared module lock")
+    if stager.count('readonly BOOTSTRAP_ROOT="/run/wg-mix-ebpf-source-bootstrap-${RUN_ID}"') != 1:
+        fail("root stager has zero or multiple bootstrap roots")
+
+    required_provisioner = (
+        "--check",
+        "--apply",
+        "BPFTOOL_VERSION_COMMAND",
+        "/usr/sbin/bpftool -V",
+        "missing_packages=",
+        "plan_complete planned_commands_executed=0 writes=0 automatic_cleanup=0",
+    )
+    for literal in required_provisioner:
+        if literal not in provisioner:
+            fail(f"reviewed provisioner contract is missing {literal!r}")
+    if "/usr/sbin/bpftool version" in provisioner:
+        fail("reviewed provisioner retains the legacy bpftool version argv")
 
     matrix_forbidden = (
         "chroot",

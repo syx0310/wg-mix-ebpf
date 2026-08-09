@@ -7,6 +7,8 @@ readonly REVIEW_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
 readonly MATRIX="${REVIEW_ROOT}/root-matrix-n-r.sh"
 readonly CHECKER="${REVIEW_ROOT}/check-realhost-iperf.py"
 readonly STATIC_TEST="${REVIEW_ROOT}/test_matrix_static.py"
+readonly MODULE_LEASE_HELPER="${REVIEW_ROOT}/checksum-module-lease.sh"
+readonly MODULE_LEASE_HERMETIC="${REVIEW_ROOT}/test-hermetic-checksum-module-lease.sh"
 readonly COMMIT_FIXTURE='77a15cfa34c10546a9a703596d9dee0deff91a48'
 readonly BUNDLE_FIXTURE='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 
@@ -15,15 +17,19 @@ fail() {
   exit "${2:-1}"
 }
 
-for path in "${MATRIX}" "${CHECKER}" "${STATIC_TEST}"; do
+for path in "${MATRIX}" "${CHECKER}" "${STATIC_TEST}" \
+  "${MODULE_LEASE_HELPER}" "${MODULE_LEASE_HERMETIC}"; do
   [[ -f "${path}" && ! -L "${path}" ]] || fail "review input is not a regular file: ${path}"
 done
 
-/bin/bash -n "${MATRIX}" "$0" || fail 'bash syntax gate'
+/bin/bash -n "${MATRIX}" "${MODULE_LEASE_HELPER}" \
+  "${MODULE_LEASE_HERMETIC}" "$0" || fail 'bash syntax gate'
 /usr/bin/python3 -B -I "${STATIC_TEST}" "${MATRIX}" "${CHECKER}" || fail 'static safety contract'
+/bin/bash "${MODULE_LEASE_HERMETIC}" || fail 'shared checksum-module lease contract'
 
 if command -v shellcheck >/dev/null 2>&1; then
-  shellcheck --norc --shell=bash -- "${MATRIX}" "$0" || fail 'ShellCheck gate'
+  shellcheck --norc --shell=bash -- "${MATRIX}" "${MODULE_LEASE_HELPER}" \
+    "${MODULE_LEASE_HERMETIC}" "$0" || fail 'ShellCheck gate'
 else
   printf 'SKIP: shellcheck unavailable; the .82 unprivileged U gate must run it before sudo\n'
 fi
@@ -50,6 +56,12 @@ done
   fail 'bootstrap evidence creation audit plan missing'
 [[ "${plan_output}" == *'B1 argv=shell-builtin noclobber-create-and-persist-bootstrap-audit'* ]] ||
   fail 'bootstrap audit-file creation plan missing'
+[[ "${plan_output}" == *'REALHOST_V6_MODULE_LEASE helper=/run/wg-mix-ebpf-source-stages/c8e41d73/source/scripts/realhost-b82-c8e41d73/checksum-module-lease.sh lock=/run/wg-mix-ebpf-source-stages/c8e41d73/checksum-module-lease.v1.lock lease_id=c8e41d73-6bd913ac receipt=insmod-rc0-only generation=sysfs,parameter,srcversion,btf'* ]] ||
+  fail 'shared module lease plan missing'
+[[ "${plan_output}" == *'L0 argv=/usr/bin/flock --exclusive --nonblock MODULE_LEASE_FD'* ]] ||
+  fail 'shared module lock argv missing'
+[[ "${plan_output}" == *'O2 argv=/usr/sbin/insmod /run/wg-mix-ebpf-source-stages/c8e41d73/source/build/faketcp_checksum_kmod/wg_mix_faketcp_checksum.ko lease_id=c8e41d73-6bd913ac'* ]] ||
+  fail 'managed module load token missing'
 [[ "${plan_output}" == *'R-full-offload-compare argv=/usr/bin/cmp -s'* ]] ||
   fail 'complete offload restore comparison plan missing'
 [[ "${plan_output}" == *'TestExperimentalFakeTCPRealHostLifecycleIntegration'* ]] || fail 'FakeTCP runtime plan missing'

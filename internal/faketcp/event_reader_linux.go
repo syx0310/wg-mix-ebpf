@@ -66,7 +66,12 @@ func (reader *ringEventReader) Read() (EventRecord, error) {
 	if err != nil {
 		return EventRecord{}, err
 	}
-	return EventRecord{RawSample: append([]byte(nil), record.RawSample...)}, nil
+	// cilium/ebpf ringbuf.Reader.Read uses a zero Record for every call;
+	// ReadInto therefore allocates RawSample and copies bytes out of the mmap.
+	// Taking that allocation is safe across the next Read and avoids copying it
+	// a second time in this wrapper. Do not replace Read with a reused ReadInto
+	// record without restoring an explicit ownership transfer here.
+	return EventRecord{RawSample: record.RawSample}, nil
 }
 
 func (reader *ringEventReader) SetDeadline(deadline time.Time) {

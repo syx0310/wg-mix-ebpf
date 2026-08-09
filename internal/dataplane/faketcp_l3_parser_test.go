@@ -86,14 +86,14 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		"parse_rc = faketcp_parse_l3(data, data_end, frame_len, l3_off, family, &l3)",
 		"parser_mode == PARSER_L3",
 		"parser_mode != PARSER_ETHERNET",
-		"faketcp_managed_transform_status(l3, IPPROTO_UDP)",
+		"rc = faketcp_managed_transform_status(l3, IPPROTO_UDP)",
 		"faketcp_managed_transform_status(&l3, l3.transport_protocol)",
 		"sizeof(struct iphdr) + sizeof(struct udphdr)",
 		"l3.l4_off + sizeof(udp)",
 		"struct iphdr new_ip;",
 		"bpf_xdp_store_bytes(xdp, l3.l3_off, &new_ip, sizeof(new_ip))",
 	} {
-		if !strings.Contains(main, want) {
+		if !strings.Contains(main, want) && !strings.Contains(tc, want) {
 			t.Fatalf("TC/XDP shared parser integration missing %q", want)
 		}
 	}
@@ -110,27 +110,36 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 			t.Fatalf("obsolete independent parser path remains: %q", removed)
 		}
 	}
-	if !strings.Contains(tc, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3) != FAKETCP_L3_OK") {
+	if !strings.Contains(tc, "faketcp_revalidate_tc_ingress_l3(skb, &info, &faketcp_l3) !=") {
 		t.Fatal("TC ingress did not revalidate the XDP-decoded packet with the shared L3 contract")
 	}
 
-	preflightStart := strings.Index(main, "static __always_inline int faketcp_preflight_egress")
-	preflightEnd := strings.Index(main, "static __always_inline __s64 faketcp_rotation_checksum")
-	if preflightStart < 0 || preflightEnd <= preflightStart {
-		t.Fatal("FakeTCP preflight boundaries are missing")
+	egressStart := strings.Index(tc, "int wg_mix_egress(struct __sk_buff *skb)")
+	egressEnd := strings.Index(tc, "SEC(\"classifier/ingress\")")
+	if egressStart < 0 || egressEnd <= egressStart {
+		t.Fatal("FakeTCP egress boundaries are missing")
 	}
-	preflight := main[preflightStart:preflightEnd]
-	tcGate := strings.Index(preflight, "faketcp_parse_tc_l3(skb, info, &l3)")
-	capture := strings.Index(preflight, "faketcp_capture_first_packet(skb, info, &l3")
-	if tcGate < 0 || capture < 0 || tcGate >= capture {
-		t.Fatal("fixed-header transform gate must precede first-packet capture")
+	egress := tc[egressStart:egressEnd]
+	tcParse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
+	tcGate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
+	prepare := strings.Index(egress, "if (faketcp_prepare_udp(")
+	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
+	if tcParse < 0 || tcGate < 0 || prepare < 0 || checkpoint < 0 ||
+		!(tcParse < tcGate && tcGate < prepare && prepare < checkpoint) {
+		t.Fatal("fixed-header transform gate must precede the admission checkpoint")
+	}
+	checkpointBody := sourceSection(t, main,
+		"static __always_inline int faketcp_egress_admission_checkpoint(",
+		"struct faketcp_gso_loop_context {")
+	if !strings.Contains(checkpointBody, "faketcp_capture_first_packet(skb, info, l3") {
+		t.Fatal("first-packet capture escaped the L3-gated admission checkpoint")
 	}
 	tcIngressStart := strings.Index(tc, "int wg_mix_ingress(struct __sk_buff *skb)")
 	if tcIngressStart < 0 {
 		t.Fatal("TC ingress entry point is missing")
 	}
 	tcIngress := tc[tcIngressStart:]
-	tcIngressGate := strings.Index(tcIngress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	tcIngressGate := strings.Index(tcIngress, "faketcp_revalidate_tc_ingress_l3(skb, &info, &faketcp_l3)")
 	tcMutation := strings.Index(tcIngress, "update_type_word(skb, &info")
 	if tcIngressGate < 0 || tcMutation < 0 || tcIngressGate >= tcMutation {
 		t.Fatal("fixed-header transform gate must precede TC ingress mutation")
@@ -142,7 +151,7 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 	}
 	xdp := main[xdpStart:]
 	parse := strings.Index(xdp, "parse_rc = faketcp_parse_l3")
-	lookup := strings.Index(xdp, "listener = faketcp_xdp_managed_port")
+	lookup := strings.Index(xdp, "managed_listener = faketcp_xdp_managed_port")
 	xdpGate := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")
 	event := strings.Index(xdp, "faketcp_emit_event(&key")
 	mutation := strings.Index(xdp, "bpf_xdp_store_bytes(xdp, l3.l4_off")

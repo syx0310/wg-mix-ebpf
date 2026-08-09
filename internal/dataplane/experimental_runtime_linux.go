@@ -20,6 +20,7 @@ import (
 const (
 	fakeTCPSessionMapName          = "faketcp_session_map"
 	fakeTCPEventsMapName           = "faketcp_events"
+	fakeTCPStatsMapName            = "faketcp_stats_map"
 	fakeTCPRuntimeIDMapName        = "faketcp_rt_id"
 	fakeTCPCaptureSeqMapName       = "faketcp_cap_seq"
 	fakeTCPEgressProgramName       = "wg_faketcp_egress"
@@ -50,6 +51,7 @@ type experimentalSlowPath interface {
 
 type experimentalSlowPathFactory func(
 	*faketcp.Engine,
+	*ebpf.Map,
 	*ebpf.Map,
 ) (experimentalSlowPath, error)
 
@@ -836,6 +838,14 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if err != nil {
 		return err
 	}
+	statsResource, err := options.collection.mapResource(fakeTCPStatsMapName)
+	if err != nil {
+		return err
+	}
+	statsMap, ok := linuxMapFromExperimentalResource(statsResource)
+	if !ok {
+		return errors.New("experimental FakeTCP stats resource is not a live eBPF map")
+	}
 	programArrayResource, err := options.collection.mapResource(fakeTCPEgressProgramArrayMapName)
 	if err != nil {
 		return err
@@ -893,7 +903,7 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		return err
 	}
 	err = build.events.withMap(func(eventsMap *ebpf.Map) error {
-		constructed, constructErr := options.slowPathFactory(build.engine, eventsMap)
+		constructed, constructErr := options.slowPathFactory(build.engine, eventsMap, statsMap)
 		if constructErr != nil {
 			if !experimentalSlowPathIsNil(constructed) {
 				if closeErr := constructed.Close(); closeErr != nil {
@@ -1039,30 +1049,15 @@ func (build *experimentalRuntimeBuild) commitAttachedCore(
 		return err
 	}
 	if err := build.coreStage.CommitControl(); err != nil {
-		return build.abortAttachedCore(err)
+		return err
 	}
 	// release is deliberately the final fallible operation. It commits local rollback
 	// ownership and releases the retained lifecycle claim without leaving any
 	// fallible wrapper work after the TC transaction callback succeeds.
 	if err := release(); err != nil {
-		return build.abortAttachedCore(err)
+		return err
 	}
 	return nil
-}
-
-func (build *experimentalRuntimeBuild) abortAttachedCore(cause error) error {
-	var cleanupErrors []error
-	if build.coreStage != nil {
-		if err := build.coreStage.Deactivate(); err != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("deactivate failed FakeTCP baseline core: %w", err))
-		}
-	}
-	if build.xdpStage != nil {
-		if err := build.xdpStage.Close(); err != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("detach XDP after FakeTCP activation failure: %w", err))
-		}
-	}
-	return errors.Join(append([]error{cause}, cleanupErrors...)...)
 }
 
 func (build *experimentalRuntimeBuild) commit() error {
@@ -1109,6 +1104,15 @@ func (build *experimentalRuntimeBuild) fail(
 
 func (build *experimentalRuntimeBuild) cleanupUncommitted() (bool, error) {
 	var cleanupErrors []error
+	// The slow path owns the reader, controller/backend, and raw writer. Fence
+	// all of them before making the generation or any TC/XDP attachment
+	// unreachable. A failed fence retains every later owner for an exact retry.
+	if !experimentalSlowPathIsNil(build.slowPath) {
+		if err := build.slowPath.Close(); err != nil {
+			return false, fmt.Errorf("close FakeTCP slow path: %w", err)
+		}
+		build.slowPath = nil
+	}
 	coreInactive := true
 	if build.coreStage != nil {
 		if err := build.coreStage.Deactivate(); err != nil {
@@ -1128,13 +1132,6 @@ func (build *experimentalRuntimeBuild) cleanupUncommitted() (bool, error) {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP TC stage: %w", err))
 		} else {
 			build.tcStage = nil
-		}
-	}
-	if !experimentalSlowPathIsNil(build.slowPath) {
-		if err := build.slowPath.Close(); err != nil {
-			cleanupErrors = append(cleanupErrors, fmt.Errorf("close FakeTCP slow path: %w", err))
-		} else {
-			build.slowPath = nil
 		}
 	}
 	externalDetached := coreInactive && build.xdpStage == nil && build.tcStage == nil &&
@@ -1454,6 +1451,19 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 	collection := state.collection
 	state.mu.Unlock()
 
+	// Closing the slow path synchronously fences its ring reader, controller,
+	// backend and raw writer. No dataplane owner may be detached while a write
+	// could still complete against that generation.
+	slowPathErr := wrapExperimentalRuntimeClose("slow path", slowPath)
+	if slowPathErr != nil {
+		state.mu.Lock()
+		state.closeErr = slowPathErr
+		state.closing = false
+		close(done)
+		state.mu.Unlock()
+		return slowPathErr
+	}
+
 	var closeErrors []error
 	coreInactive := true
 	if core != nil {
@@ -1464,11 +1474,10 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 	}
 	xdpErr := wrapExperimentalRuntimeClose("XDP links", xdp)
 	tcErr := wrapExperimentalRuntimeClose("TC filters", tc)
-	slowPathErr := wrapExperimentalRuntimeClose("slow path", slowPath)
-	closeErrors = append(closeErrors, xdpErr, tcErr, slowPathErr)
+	closeErrors = append(closeErrors, xdpErr, tcErr)
 
 	var coreErr, sessionErr, eventErr, collectionErr error
-	if coreInactive && xdpErr == nil && tcErr == nil && slowPathErr == nil {
+	if coreInactive && xdpErr == nil && tcErr == nil {
 		coreErr = wrapExperimentalRuntimeClose("baseline core", core)
 		closeErrors = append(closeErrors, coreErr)
 		if coreErr == nil {
@@ -1492,10 +1501,8 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 	if tcErr == nil {
 		state.tc = nil
 	}
-	if slowPathErr == nil {
-		state.slowPath = nil
-	}
-	if coreInactive && coreErr == nil && xdpErr == nil && tcErr == nil && slowPathErr == nil {
+	state.slowPath = nil
+	if coreInactive && coreErr == nil && xdpErr == nil && tcErr == nil {
 		state.core = nil
 		if sessionErr == nil {
 			state.handles.sessions = nil
@@ -1504,7 +1511,7 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 			state.handles.events = nil
 		}
 	}
-	complete := coreInactive && xdpErr == nil && tcErr == nil && slowPathErr == nil &&
+	complete := coreInactive && xdpErr == nil && tcErr == nil &&
 		coreErr == nil && sessionErr == nil && eventErr == nil && collectionErr == nil
 	if complete {
 		state.closed = true

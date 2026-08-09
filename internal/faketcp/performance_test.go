@@ -76,8 +76,9 @@ func benchmarkRecoveryActions(packetCount, packetSize int) []Action {
 	packets := make([]PendingPacket, packetCount)
 	for index := range packets {
 		packets[index] = PendingPacket{
-			Data:         make([]byte, packetSize),
-			CaptureNanos: uint64(index + 1),
+			Data:               make([]byte, packetSize),
+			CaptureNanos:       uint64(index + 1),
+			CaptureFingerprint: [32]byte{1},
 			CaptureID: CaptureIdentity{
 				Runtime:  testRecoveryIdentity(),
 				CPU:      1,

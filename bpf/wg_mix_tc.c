@@ -289,8 +289,24 @@ struct packet_info {
 	__u8 ipv4_udp_csum_zero;
 };
 
+// Optional scalar observations let the experimental egress path apply its
+// stricter FakeTCP gate without loading the IP or UDP header a second time.
+struct packet_parse_observation {
+	__u32 frame_len;
+	__u32 ipv4_total_len;
+	__u16 ipv4_header_len;
+	__u16 ipv4_fragment;
+	__u16 udp_len;
+	__u8 ip_version;
+	__u8 ip_protocol;
+};
+
+_Static_assert(sizeof(struct packet_parse_observation) == 16,
+	       "packet parse observation layout drift");
+
 struct xor_context {
 	__u64 generation;
+	__u64 admission_nonce;
 	__u32 cipher_id;
 	__u32 payload_off;
 	__u32 target;
@@ -557,9 +573,10 @@ static __always_inline int parse_link(struct __sk_buff *skb, void *data, void *d
 	return parse_l3_link(skb, off, proto);
 }
 
-static __always_inline int parse_udp_at(void *data, void *data_end, struct packet_info *info,
-					__u32 family, __u32 ip_off, __u32 udp_off,
-					int require_payload_word)
+static __always_inline int parse_udp_at(
+	void *data, void *data_end, struct packet_info *info,
+	struct packet_parse_observation *observation, __u32 family,
+	__u32 ip_off, __u32 udp_off, int require_payload_word)
 {
 	struct udphdr *udp = data + udp_off;
 	__u16 udp_len;
@@ -567,6 +584,8 @@ static __always_inline int parse_udp_at(void *data, void *data_end, struct packe
 	if ((void *)(udp + 1) > data_end)
 		return PARSE_SHORT;
 	udp_len = bpf_ntohs(udp->len);
+	if (observation)
+		observation->udp_len = udp_len;
 	if (udp_len < sizeof(*udp))
 		return PARSE_SHORT;
 	info->family = family;
@@ -589,8 +608,9 @@ static __always_inline int is_ipv6_option_header(__u8 nexthdr)
 	return nexthdr == NEXTHDR_HOP || nexthdr == NEXTHDR_ROUTING || nexthdr == NEXTHDR_DEST;
 }
 
-static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_info *info,
-					__u64 generation)
+static __always_inline int parse_packet_observed(
+	struct __sk_buff *skb, struct packet_info *info,
+	struct packet_parse_observation *observation, __u64 generation)
 {
 	void *data = (void *)(long)skb->data;
 	void *data_end = (void *)(long)skb->data_end;
@@ -599,6 +619,10 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 	int rc;
 
 	__builtin_memset(info, 0, sizeof(*info));
+	if (observation) {
+		__builtin_memset(observation, 0, sizeof(*observation));
+		observation->frame_len = skb->len;
+	}
 	rc = parse_link(skb, data, data_end, &off, &proto, generation);
 	if (rc != PARSE_OK)
 		return rc;
@@ -614,13 +638,21 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 		ihl = iph->ihl * 4;
 		if (ihl < sizeof(*iph) || data + off + ihl > data_end)
 			return PARSE_SHORT;
+		frag = bpf_ntohs(iph->frag_off);
+		if (observation) {
+			observation->ipv4_total_len = bpf_ntohs(iph->tot_len);
+			observation->ipv4_header_len = ihl;
+			observation->ipv4_fragment = frag;
+			observation->ip_version = iph->version;
+			observation->ip_protocol = iph->protocol;
+		}
 		if (iph->protocol != IPPROTO_UDP)
 			return PARSE_NOT_UDP;
-		frag = bpf_ntohs(iph->frag_off);
 		frag_off = frag & IP_OFFSET;
 		if (frag_off != 0)
 			return PARSE_IPV4_NON_FIRST_FRAGMENT;
-		rc = parse_udp_at(data, data_end, info, FAMILY_IPV4, off, off + ihl, !(frag & IP_MF));
+		rc = parse_udp_at(data, data_end, info, observation, FAMILY_IPV4,
+				  off, off + ihl, !(frag & IP_MF));
 		if (rc != PARSE_OK)
 			return rc;
 		if (frag & IP_MF)
@@ -642,7 +674,8 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 #pragma unroll
 		for (int i = 0; i < 8; i++) {
 			if (nexthdr == IPPROTO_UDP) {
-				rc = parse_udp_at(data, data_end, info, FAMILY_IPV6, off, hdr_off,
+				rc = parse_udp_at(data, data_end, info, observation,
+						  FAMILY_IPV6, off, hdr_off,
 						  !(saw_ext || saw_frag));
 				if (rc != PARSE_OK)
 					return rc;
@@ -690,6 +723,13 @@ static __always_inline int parse_packet(struct __sk_buff *skb, struct packet_inf
 	}
 
 	return PARSE_NOT_UDP;
+}
+
+static __always_inline int parse_packet(struct __sk_buff *skb,
+					struct packet_info *info,
+					__u64 generation)
+{
+	return parse_packet_observed(skb, info, 0, generation);
 }
 
 static __always_inline int parse_icmp_packet(struct __sk_buff *skb,
@@ -1568,8 +1608,7 @@ static __always_inline void set_xor_context(struct __sk_buff *skb,
 					    __u32 cipher_id,
 					    __u32 payload_off,
 					    __u32 target,
-					    __u8 checksum_mode,
-					    __u8 continue_faketcp)
+					    __u8 checksum_mode)
 {
 	skb->cb[0] = (__u32)generation;
 	skb->cb[1] = (__u32)(generation >> 32);
@@ -1577,8 +1616,19 @@ static __always_inline void set_xor_context(struct __sk_buff *skb,
 	skb->cb[3] = payload_off;
 	skb->cb[4] = XOR_CONTEXT_MAGIC |
 		     ((__u32)checksum_mode << XOR_CONTEXT_MODE_SHIFT) |
-		     (continue_faketcp ? XOR_CONTEXT_F_FAKETCP : 0) |
 		     target;
+}
+
+static __always_inline void set_faketcp_xor_context(struct __sk_buff *skb,
+						     __u64 nonce)
+{
+	// A FakeTCP continuation never trusts XOR geometry from skb->cb. The
+	// collection-local token is the only source for those fields.
+	skb->cb[0] = (__u32)nonce;
+	skb->cb[1] = (__u32)(nonce >> 32);
+	skb->cb[2] = 0;
+	skb->cb[3] = 0;
+	skb->cb[4] = XOR_CONTEXT_MAGIC | XOR_CONTEXT_F_FAKETCP;
 }
 
 static __always_inline int load_xor_context(struct __sk_buff *skb,
@@ -1586,16 +1636,24 @@ static __always_inline int load_xor_context(struct __sk_buff *skb,
 {
 	__u32 metadata = skb->cb[4];
 
+	context->admission_nonce = ((__u64)skb->cb[1] << 32) | skb->cb[0];
+	context->continue_faketcp = !!(metadata & XOR_CONTEXT_F_FAKETCP);
 	if ((metadata & XOR_CONTEXT_MAGIC_MASK) != XOR_CONTEXT_MAGIC ||
 	    (metadata & XOR_CONTEXT_FORBIDDEN_MASK))
 		return -1;
+	if (context->continue_faketcp) {
+		if (context->admission_nonce == 0 || skb->cb[2] != 0 ||
+		    skb->cb[3] != 0 ||
+		    metadata != (XOR_CONTEXT_MAGIC | XOR_CONTEXT_F_FAKETCP))
+			return -1;
+		return 0;
+	}
 	context->generation = ((__u64)skb->cb[1] << 32) | skb->cb[0];
 	context->cipher_id = skb->cb[2];
 	context->payload_off = skb->cb[3];
 	context->target = metadata & XOR_CONTEXT_TARGET_MASK;
 	context->checksum_mode = (metadata & XOR_CONTEXT_MODE_MASK) >>
 				 XOR_CONTEXT_MODE_SHIFT;
-	context->continue_faketcp = !!(metadata & XOR_CONTEXT_F_FAKETCP);
 	if (context->generation == 0 || context->cipher_id == 0 ||
 	    context->payload_off < sizeof(struct udphdr) ||
 	    context->payload_off + context->target < context->payload_off ||
@@ -1625,8 +1683,7 @@ static __always_inline int prepare_xor_context_by_id(struct __sk_buff *skb,
 						      struct packet_info *info,
 						      __u32 cipher_id,
 						      __u64 generation,
-						      __u8 checksum_mode,
-						      __u8 continue_faketcp)
+						      __u8 checksum_mode)
 {
 	struct cipher_value *cipher;
 	__u32 target = 0;
@@ -1642,7 +1699,7 @@ static __always_inline int prepare_xor_context_by_id(struct __sk_buff *skb,
 	if (rc < 0)
 		return rc;
 	set_xor_context(skb, generation, cipher_id, info->payload_off, target,
-			checksum_mode, continue_faketcp);
+			checksum_mode);
 	return 0;
 }
 
@@ -1656,11 +1713,28 @@ static __always_inline int run_xor_egress_segment(struct __sk_buff *skb, __u32 s
 	struct cipher_value *cipher;
 	int rc;
 
-	if (load_xor_context(skb, &context) < 0)
+	if (load_xor_context(skb, &context) < 0) {
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+		faketcp_consume_egress_admission(context.admission_nonce, 0);
+#endif
 		return xor_dispatch_fail(skb, STAT_XOR_EGRESS_DISPATCH_ERROR);
+	}
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	if (context.continue_faketcp &&
+	    faketcp_bind_egress_xor_progress(&context) < 0) {
+		faketcp_consume_egress_admission(context.admission_nonce, 0);
+		return xor_dispatch_fail(skb, STAT_XOR_EGRESS_DISPATCH_ERROR);
+	}
+#endif
 	cipher = lookup_cipher(context.cipher_id, context.generation);
-	if (!cipher)
+	if (!cipher) {
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+		if (context.continue_faketcp)
+			faketcp_consume_egress_admission(
+				context.admission_nonce, 0);
+#endif
 		return xor_dispatch_fail(skb, STAT_XOR_KEY_MISSING);
+	}
 
 	if (context.checksum_mode == XOR_CSUM_NONE)
 		rc = xor_segment_store_only(skb, cipher, context.payload_off,
@@ -1675,6 +1749,11 @@ static __always_inline int run_xor_egress_segment(struct __sk_buff *skb, __u32 s
 		rc = xor_segment_manual_diff(skb, cipher, context.payload_off,
 					     context.target, segment, 0);
 	if (rc < 0) {
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+		if (context.continue_faketcp)
+			faketcp_consume_egress_admission(
+				context.admission_nonce, 0);
+#endif
 		clear_xor_context(skb);
 		inc_xor_error(rc);
 		return TC_ACT_SHOT;
@@ -1682,18 +1761,30 @@ static __always_inline int run_xor_egress_segment(struct __sk_buff *skb, __u32 s
 	if (rc > 0) {
 		bpf_tail_call(skb, &xor_egress_programs,
 			      xor_program_index(context.generation, segment + 1));
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+		if (context.continue_faketcp)
+			faketcp_consume_egress_admission(
+				context.admission_nonce, 0);
+#endif
 		return xor_dispatch_fail(skb, STAT_XOR_EGRESS_DISPATCH_ERROR);
 	}
 
-	clear_xor_context(skb);
 	inc_stat(STAT_XOR_EGRESS_OK);
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
 	if (context.continue_faketcp) {
+		if (faketcp_complete_egress_xor(context.admission_nonce) < 0) {
+			faketcp_consume_egress_admission(
+				context.admission_nonce, 0);
+			return xor_dispatch_fail(
+				skb, STAT_XOR_EGRESS_DISPATCH_ERROR);
+		}
 		bpf_tail_call(skb, &faketcp_egress_programs,
 			      (__u32)context.generation & 1);
+		faketcp_consume_egress_admission(context.admission_nonce, 0);
 		return xor_dispatch_fail(skb, STAT_XOR_EGRESS_DISPATCH_ERROR);
 	}
 #endif
+	clear_xor_context(skb);
 	inc_stat(STAT_EGRESS_REWRITE_OK);
 	if (skb->gso_segs || skb->gso_size)
 		inc_stat(STAT_EGRESS_GSO_REWRITE_OK);
@@ -1774,12 +1865,19 @@ DEFINE_XOR_INGRESS_SEGMENT(7)
 SEC("classifier/egress")
 int wg_mix_egress(struct __sk_buff *skb)
 {
-	struct packet_info info;
 	struct egress_rule_key key = {};
 	struct egress_rule_value *rule;
 	struct managed_fwmark_value *managed;
 	struct profile_key profile_key = {};
 	struct profile_value *profile;
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	struct faketcp_tc_packet_descriptor faketcp_packet = {};
+	struct packet_info *info = &faketcp_packet.info;
+	struct faketcp_egress_admission faketcp_admission = {};
+#else
+	struct packet_info packet_info;
+	struct packet_info *info = &packet_info;
+#endif
 	__u64 generation = 0;
 	__u32 old_wire = 0;
 	__u32 old_type = 0;
@@ -1787,7 +1885,6 @@ int wg_mix_egress(struct __sk_buff *skb)
 	__u32 cipher_id = 0;
 	__u8 gso_seen = 0;
 	__u8 xor_checksum_mode = XOR_CSUM_NONE;
-	__u8 continue_faketcp = 0;
 	int rc, kind;
 
 	if (!active_generation(&generation))
@@ -1802,7 +1899,11 @@ int wg_mix_egress(struct __sk_buff *skb)
 		return TC_ACT_OK;
 	if (gso_seen)
 		inc_stat(STAT_EGRESS_GSO_MANAGED_SEEN);
-	rc = parse_packet(skb, &info, generation);
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	rc = faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet);
+#else
+	rc = parse_packet(skb, info, generation);
+#endif
 	if (parse_result_is_fragment(rc)) {
 		inc_stat(STAT_EGRESS_FRAGMENT);
 		return TC_ACT_SHOT;
@@ -1819,8 +1920,8 @@ int wg_mix_egress(struct __sk_buff *skb)
 	key.generation = generation;
 	key.fwmark = skb->mark;
 	key.underlay_index = skb->ifindex;
-	key.source_port = info.src_port;
-	key.family = info.family;
+	key.source_port = info->src_port;
+	key.family = info->family;
 	rule = bpf_map_lookup_elem(&egress_rule_map, &key);
 	if (!rule || rule->generation != generation) {
 		key.underlay_index = UNDERLAY_WILDCARD;
@@ -1832,7 +1933,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	if (rule->action != ACTION_REWRITE)
 		return TC_ACT_OK;
-	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0) {
+	if (bpf_skb_load_bytes(skb, info->payload_off, &old_wire, sizeof(old_wire)) < 0) {
 		inc_stat(STAT_SKB_LOAD_ERROR);
 		return TC_ACT_SHOT;
 	}
@@ -1842,7 +1943,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 		inc_stat(STAT_EGRESS_BAD_TYPE);
 		return TC_ACT_SHOT;
 	}
-	if (!validate_len(kind, info.payload_len)) {
+	if (!gso_seen && !validate_len(kind, info->payload_len)) {
 		inc_stat(STAT_EGRESS_BAD_LENGTH);
 		return TC_ACT_SHOT;
 	}
@@ -1854,7 +1955,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 	cipher_id = rule->cipher_id;
-	if (cipher_id != 0) {
+	if (cipher_id != 0 && !gso_seen) {
 		if (rule->transport_mode != TRANSPORT_UDP
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
 		    && rule->transport_mode != TRANSPORT_FAKETCP
@@ -1864,33 +1965,85 @@ int wg_mix_egress(struct __sk_buff *skb)
 			return TC_ACT_SHOT;
 		}
 	}
-#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
-	// Validate the unmodified WireGuard packet and all referenced policy
-	// objects before consuming bounded slow-path capacity. Capture still
-	// precedes type-word rewrite, XOR and FakeTCP encoding.
-	if (rule->transport_mode == TRANSPORT_FAKETCP &&
-	    faketcp_preflight_egress(skb, &info, rule, generation) < 0)
-		return TC_ACT_SHOT;
-	continue_faketcp = rule->transport_mode == TRANSPORT_FAKETCP;
-#endif
 	new_wire = wg_cpu_to_le32(profile->standard_to_mixed[kind]);
-	if (rule->transport_mode == TRANSPORT_ICMP) {
-		rc = rewrite_udp_to_icmp(skb, &info, rule, old_wire, new_wire);
-	} else if (cipher_id != 0) {
-		if (info.family == FAMILY_IPV4) {
-			if (!info.ipv4_udp_csum_zero)
+	if (cipher_id != 0) {
+		if (info->family == FAMILY_IPV4) {
+			if (!info->ipv4_udp_csum_zero)
 				xor_checksum_mode = XOR_CSUM_RECOMPUTE;
 		} else {
 			xor_checksum_mode = XOR_CSUM_MANUAL;
 		}
-		rc = prepare_xor_context_by_id(skb, &info, cipher_id, generation,
-					       xor_checksum_mode,
-					       continue_faketcp);
+	}
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	// The single authoritative descriptor, fixed-IPv4 gate and unified prepare
+	// precede the checkpoint. The admitted path then closes over exactly one
+	// direct/XOR or aggregate transform; there is no parser fallback.
+	if (rule->transport_mode == TRANSPORT_FAKETCP) {
+		if (faketcp_tc_fixed_udp_status(&faketcp_packet) != FAKETCP_L3_OK) {
+			inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
+			return TC_ACT_SHOT;
+		}
+		if (gso_seen)
+			return faketcp_encode_gso_segments(
+				skb, info, &faketcp_packet.shape.l3, managed, rule, profile,
+				generation, rc, kind, old_wire, new_wire);
+		if (faketcp_prepare_udp(
+			    skb, info->ip_off, info->udp_off,
+			    info->payload_len + sizeof(struct udphdr), 0) < 0)
+			return TC_ACT_SHOT;
+		if (faketcp_egress_admission_checkpoint(
+			    skb, info, &faketcp_packet.shape.l3, managed, rule, profile,
+			    generation, rc,
+			    kind, old_wire, new_wire, xor_checksum_mode,
+			    &faketcp_admission) != FAKETCP_ADMISSION_TRANSFORM)
+			return TC_ACT_SHOT;
+		if (cipher_id != 0) {
+			set_faketcp_xor_context(skb, faketcp_admission.nonce);
+			rc = update_type_word(skb, info, old_wire, new_wire, 1);
+			if (rc < 0) {
+				faketcp_consume_egress_admission(
+					faketcp_admission.nonce, 0);
+				clear_xor_context(skb);
+				inc_stat(rc == -2 ? STAT_XOR_STORE_ERROR :
+						    STAT_CHECKSUM_ERROR);
+				return TC_ACT_SHOT;
+			}
+			bpf_tail_call(skb, &xor_egress_programs,
+				      xor_program_index(generation, 0));
+			faketcp_consume_egress_admission(
+				faketcp_admission.nonce, 0);
+			return xor_dispatch_fail(
+				skb, STAT_XOR_EGRESS_DISPATCH_ERROR);
+		}
+		if (faketcp_consume_egress_admission(
+			    faketcp_admission.nonce, &faketcp_admission) < 0 ||
+		    !faketcp_egress_admission_matches(
+			    skb, info, &faketcp_packet.shape.l3, managed, rule, profile,
+			    generation,
+			    FAKETCP_TOKEN_ARMED, &faketcp_admission)) {
+			inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
+			return TC_ACT_SHOT;
+		}
+		rc = update_type_word(skb, info, old_wire, new_wire, 1);
+		if (rc < 0) {
+			inc_stat(rc == -2 ? STAT_SKB_STORE_ERROR :
+					    STAT_CHECKSUM_ERROR);
+			return TC_ACT_SHOT;
+		}
+		return faketcp_encode_established(skb, info, rule, generation,
+						  &faketcp_admission);
+	}
+#endif
+	if (rule->transport_mode == TRANSPORT_ICMP) {
+		rc = rewrite_udp_to_icmp(skb, info, rule, old_wire, new_wire);
+	} else if (cipher_id != 0) {
+		rc = prepare_xor_context_by_id(skb, info, cipher_id, generation,
+					       xor_checksum_mode);
 		if (rc < 0) {
 			inc_xor_error(rc);
 			return TC_ACT_SHOT;
 		}
-		rc = update_type_word(skb, &info, old_wire, new_wire, 1);
+		rc = update_type_word(skb, info, old_wire, new_wire, 1);
 		if (rc < 0) {
 			clear_xor_context(skb);
 			if (rc == -2)
@@ -1903,7 +2056,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 			      xor_program_index(generation, 0));
 		return xor_dispatch_fail(skb, STAT_XOR_EGRESS_DISPATCH_ERROR);
 	} else {
-		rc = update_type_word(skb, &info, old_wire, new_wire, 1);
+		rc = update_type_word(skb, info, old_wire, new_wire, 1);
 	}
 	if (rc < 0) {
 		if (rc == -2)
@@ -1922,10 +2075,6 @@ int wg_mix_egress(struct __sk_buff *skb)
 			inc_stat(STAT_CHECKSUM_ERROR);
 		return TC_ACT_SHOT;
 	}
-#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
-	if (rule->transport_mode == TRANSPORT_FAKETCP)
-		return faketcp_encode_established(skb, &info, rule, generation);
-#endif
 	inc_stat(STAT_EGRESS_REWRITE_OK);
 	if (rule->transport_mode == TRANSPORT_ICMP)
 		inc_stat(STAT_ICMP_EGRESS_REWRITE_OK);
@@ -2046,8 +2195,8 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	}
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
 	if (listener->transport_mode == TRANSPORT_FAKETCP &&
-	    (!faketcp_metadata_valid(skb, generation) ||
-	     faketcp_parse_tc_l3(skb, &info, &faketcp_l3) != FAKETCP_L3_OK)) {
+	    faketcp_revalidate_tc_ingress_l3(skb, &info, &faketcp_l3) !=
+		    FAKETCP_L3_OK) {
 		inc_faketcp_stat(FAKETCP_STAT_METADATA_ERROR);
 		return TC_ACT_SHOT;
 	}
@@ -2081,6 +2230,12 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		inc_stat(STAT_INGRESS_RULE_MISS);
 		return TC_ACT_SHOT;
 	}
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	if (listener->transport_mode == TRANSPORT_FAKETCP &&
+	    faketcp_consume_ingress_admission(skb, &info, listener, profile,
+					      generation) < 0)
+		return TC_ACT_SHOT;
+#endif
 	cipher_id = listener->cipher_id;
 	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0) {
 		inc_stat(STAT_SKB_LOAD_ERROR);
@@ -2120,7 +2275,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 			xor_checksum_mode = XOR_CSUM_MANUAL;
 		set_xor_context(skb, generation, cipher_id, info.payload_off,
 				xor_metadata.target,
-				xor_checksum_mode, 0);
+				xor_checksum_mode);
 		rc = update_type_word(skb, &info, encrypted_wire, new_wire, 0);
 		if (rc < 0) {
 			clear_xor_context(skb);
