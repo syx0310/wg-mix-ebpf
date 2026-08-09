@@ -397,16 +397,23 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
     if runner.count("build_argv() {") != 1:
         fail("runner must have exactly one operation argv builder")
     required = (
+        "readonly RUN_ID='c8e41d73'",
+        "readonly RESOURCE_ID='5b8d30f1'",
         "STATE_SCHEMA='owner,baseline,operation-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module,tested,cleanup-intent,restored'",
         "readonly LOCAL_IPV4='198.18.82.1'",
         "readonly REMOTE_IPV4='198.18.82.2'",
         "readonly ROUTE_MTU='1500'",
         'readonly GO_MOD_CACHE="${STAGE_ROOT}/go-mod-cache"',
-        'readonly RUNTIME_TEMP="${STAGE_ROOT}/go-tmp-realhost"',
+        'readonly RUNTIME_TEMP="${STAGE_ROOT}/go-tmp-realhost-${RESOURCE_ID}"',
+        'readonly VETH_A="wg${RESOURCE_ID:0:5}a"',
+        'readonly VETH_B="wg${RESOURCE_ID:0:5}b"',
+        'readonly VETH_A_ALIAS="wg-mix-ebpf:${RUN_ID}:${RESOURCE_ID}:a"',
+        'readonly VETH_B_ALIAS="wg-mix-ebpf:${RUN_ID}:${RESOURCE_ID}:b"',
         "GOFLAGS=-mod=readonly",
         "WG_MIX_FAKETCP_ROUTED_LOCAL_IPV4=\"${LOCAL_IPV4}\"",
         "WG_MIX_FAKETCP_ROUTED_REMOTE_IPV4=\"${REMOTE_IPV4}\"",
         "WG_MIX_FAKETCP_ROUTED_ROUTE_MTU=\"${ROUTE_MTU}\"",
+        "WG_MIX_FAKETCP_REALHOST_RESOURCE_ID=\"${RESOURCE_ID}\"",
         "TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration",
         "TestFakeTCPRealHostRoutedIPHdrInclNone",
         "TestFakeTCPRealHostRoutedUDPSocketPartial",
@@ -433,6 +440,8 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
     for stale_cache in ("go-cache-routed", "go-mod-cache-routed"):
         if stale_cache in runner:
             fail(f"runner still relies on empty harness-only cache {stale_cache!r}")
+    if "readonly RUN_ID='c8e41d73'" not in seam:
+        fail("controller seam is not bound to the controller stage run ID")
 
     builder = function_body(runner, "build_argv")
     for literal in (

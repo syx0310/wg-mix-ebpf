@@ -3,7 +3,7 @@ set -u
 set -o pipefail
 umask 077
 
-readonly RUN_ID='7e42a19c'
+readonly RUN_ID='c8e41d73'
 readonly RESOURCE_ID='5b8d30f1'
 readonly STATE_SCHEMA='owner,baseline,operation-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module,tested,cleanup-intent,restored'
 readonly STAGE_ROOT="/run/wg-mix-ebpf-source-stages/${RUN_ID}"
@@ -12,7 +12,7 @@ readonly GO_CACHE="${STAGE_ROOT}/go-cache"
 readonly GO_MOD_CACHE="${STAGE_ROOT}/go-mod-cache"
 readonly GO_PATH="${STAGE_ROOT}/go-path"
 readonly GO_TMP="${STAGE_ROOT}/go-tmp"
-readonly RUNTIME_TEMP="${STAGE_ROOT}/go-tmp-realhost"
+readonly RUNTIME_TEMP="${STAGE_ROOT}/go-tmp-realhost-${RESOURCE_ID}"
 readonly EVIDENCE_ROOT="${STAGE_ROOT}/routed-evidence-${RESOURCE_ID}"
 readonly AUDIT_LOG="${EVIDENCE_ROOT}/audit.log"
 readonly OWNER_PHASE="${EVIDENCE_ROOT}/phase-owner.v1"
@@ -33,12 +33,12 @@ readonly BPF_LINK_BASELINE="${EVIDENCE_ROOT}/baseline-bpf-links.json"
 readonly OFFLOAD_BASELINE_A="${EVIDENCE_ROOT}/baseline-offload-a.txt"
 readonly PREFLIGHT_BINARY="${EVIDENCE_ROOT}/dataplane-preflight.test"
 
-readonly VETH_A="wg${RUN_ID:0:5}a"
-readonly VETH_B="wg${RUN_ID:0:5}b"
-readonly VETH_A_ALIAS="wg-mix-ebpf:${RUN_ID}:a"
-readonly VETH_B_ALIAS="wg-mix-ebpf:${RUN_ID}:b"
-readonly VETH_A_MAC='02:7e:42:a1:9c:0a'
-readonly VETH_B_MAC='02:7e:42:a1:9c:0b'
+readonly VETH_A="wg${RESOURCE_ID:0:5}a"
+readonly VETH_B="wg${RESOURCE_ID:0:5}b"
+readonly VETH_A_ALIAS="wg-mix-ebpf:${RUN_ID}:${RESOURCE_ID}:a"
+readonly VETH_B_ALIAS="wg-mix-ebpf:${RUN_ID}:${RESOURCE_ID}:b"
+readonly VETH_A_MAC='02:5b:8d:30:f1:0a'
+readonly VETH_B_MAC='02:5b:8d:30:f1:0b'
 readonly LOCAL_IPV4='198.18.82.1'
 readonly REMOTE_IPV4='198.18.82.2'
 readonly PREFIX_BITS='32'
@@ -214,7 +214,7 @@ build_argv() {
     test:*)
       name="${operation#test:}"; valid_test_name "${name}" || return 64
       OP_TARGET="${name}"
-      OP_ARGV=(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C TMPDIR="${RUNTIME_TEMP}" WG_MIX_FAKETCP_RUN_REALHOST_INTEGRATION=1 WG_MIX_FAKETCP_REALHOST_OBJECT="${EXPERIMENTAL_OBJECT}" WG_MIX_FAKETCP_REALHOST_BASELINE_OBJECT="${BASELINE_OBJECT}" WG_MIX_FAKETCP_REALHOST_IFINDEX="${VETH_A_IFINDEX}" WG_MIX_FAKETCP_REALHOST_PEER_IFINDEX="${VETH_B_IFINDEX}" WG_MIX_FAKETCP_REALHOST_XDP_MODE=generic WG_MIX_FAKETCP_REALHOST_RUN_ID="${RUN_ID}" WG_MIX_FAKETCP_ROUTED_LOCAL_IPV4="${LOCAL_IPV4}" WG_MIX_FAKETCP_ROUTED_REMOTE_IPV4="${REMOTE_IPV4}" WG_MIX_FAKETCP_ROUTED_PREFIX_BITS="${PREFIX_BITS}" WG_MIX_FAKETCP_ROUTED_ROUTE_MTU="${ROUTE_MTU}" /usr/bin/timeout --signal=TERM --kill-after=10s 3m "${PREFLIGHT_BINARY}" -test.run "^${name}$" -test.count=1 -test.timeout=2m -test.v)
+      OP_ARGV=(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C TMPDIR="${RUNTIME_TEMP}" WG_MIX_FAKETCP_RUN_REALHOST_INTEGRATION=1 WG_MIX_FAKETCP_REALHOST_OBJECT="${EXPERIMENTAL_OBJECT}" WG_MIX_FAKETCP_REALHOST_BASELINE_OBJECT="${BASELINE_OBJECT}" WG_MIX_FAKETCP_REALHOST_IFINDEX="${VETH_A_IFINDEX}" WG_MIX_FAKETCP_REALHOST_PEER_IFINDEX="${VETH_B_IFINDEX}" WG_MIX_FAKETCP_REALHOST_XDP_MODE=generic WG_MIX_FAKETCP_REALHOST_RUN_ID="${RUN_ID}" WG_MIX_FAKETCP_REALHOST_RESOURCE_ID="${RESOURCE_ID}" WG_MIX_FAKETCP_ROUTED_LOCAL_IPV4="${LOCAL_IPV4}" WG_MIX_FAKETCP_ROUTED_REMOTE_IPV4="${REMOTE_IPV4}" WG_MIX_FAKETCP_ROUTED_PREFIX_BITS="${PREFIX_BITS}" WG_MIX_FAKETCP_ROUTED_ROUTE_MTU="${ROUTE_MTU}" /usr/bin/timeout --signal=TERM --kill-after=10s 3m "${PREFLIGHT_BINARY}" -test.run "^${name}$" -test.count=1 -test.timeout=2m -test.v)
       ;;
     neighbor-delete) OP_TARGET="${VETH_A}:${REMOTE_IPV4}"; OP_ARGV=(/usr/sbin/ip -4 neigh del "${REMOTE_IPV4}" lladdr "${VETH_B_MAC}" nud permanent dev "${VETH_A}") ;;
     route-delete) OP_TARGET="${REMOTE_IPV4}/${PREFIX_BITS}"; OP_ARGV=(/usr/sbin/ip -4 route del "${REMOTE_IPV4}/${PREFIX_BITS}" dev "${VETH_A}" src "${LOCAL_IPV4}" mtu "${ROUTE_MTU}" proto static scope link) ;;

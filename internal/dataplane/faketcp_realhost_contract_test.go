@@ -15,6 +15,7 @@ const (
 	fakeTCPRealHostPeerIfindexEnv    = "WG_MIX_FAKETCP_REALHOST_PEER_IFINDEX"
 	fakeTCPRealHostXDPModeEnv        = "WG_MIX_FAKETCP_REALHOST_XDP_MODE"
 	fakeTCPRealHostRunIDEnv          = "WG_MIX_FAKETCP_REALHOST_RUN_ID"
+	fakeTCPRealHostResourceIDEnv     = "WG_MIX_FAKETCP_REALHOST_RESOURCE_ID"
 	fakeTCPRealHostTempRootEnv       = "TMPDIR"
 	fakeTCPRealHostStageRoot         = "/run/wg-mix-ebpf-source-stages"
 )
@@ -29,6 +30,7 @@ type fakeTCPRealHostContract struct {
 	peerIfindex        int
 	xdpMode            fakeTCPRealHostXDPMode
 	runID              string
+	resourceID         string
 	tempRoot           string
 	vethName           string
 	peerVethName       string
@@ -79,6 +81,29 @@ func parseFakeTCPRealHostContract(lookup fakeTCPRealHostEnvLookup) (fakeTCPRealH
 			"%s must be exactly eight lower-case nonzero hexadecimal characters",
 			fakeTCPRealHostRunIDEnv,
 		)
+	}
+	resourceID := runID
+	if value, present := lookup(fakeTCPRealHostResourceIDEnv); present {
+		if value == "" {
+			return fakeTCPRealHostContract{}, fmt.Errorf(
+				"%s is required when present",
+				fakeTCPRealHostResourceIDEnv,
+			)
+		}
+		if strings.TrimSpace(value) != value || strings.ContainsAny(value, "\r\n\x00") {
+			return fakeTCPRealHostContract{}, fmt.Errorf(
+				"%s contains whitespace or control characters",
+				fakeTCPRealHostResourceIDEnv,
+			)
+		}
+		resourceID = value
+		if !validFakeTCPRealHostRunID(resourceID) || resourceID == runID {
+			return fakeTCPRealHostContract{}, fmt.Errorf(
+				"%s must be exactly eight lower-case nonzero hexadecimal characters distinct from %s",
+				fakeTCPRealHostResourceIDEnv,
+				fakeTCPRealHostRunIDEnv,
+			)
+		}
 	}
 
 	experimentalObject, err := require(fakeTCPRealHostObjectEnv)
@@ -133,11 +158,15 @@ func parseFakeTCPRealHostContract(lookup fakeTCPRealHostEnvLookup) (fakeTCPRealH
 	if err != nil {
 		return fakeTCPRealHostContract{}, err
 	}
-	if err := validateFakeTCPRealHostTempRoot(tempRoot, runID); err != nil {
+	if err := validateFakeTCPRealHostTempRoot(tempRoot, runID, resourceID); err != nil {
 		return fakeTCPRealHostContract{}, err
 	}
 
-	prefix := "wg" + runID[:5]
+	prefix := "wg" + resourceID[:5]
+	aliasPrefix := "wg-mix-ebpf:" + runID
+	if resourceID != runID {
+		aliasPrefix += ":" + resourceID
+	}
 	return fakeTCPRealHostContract{
 		experimentalObject: experimentalObject,
 		baselineObject:     baselineObject,
@@ -145,11 +174,12 @@ func parseFakeTCPRealHostContract(lookup fakeTCPRealHostEnvLookup) (fakeTCPRealH
 		peerIfindex:        peerIfindex,
 		xdpMode:            fakeTCPRealHostXDPGeneric,
 		runID:              runID,
+		resourceID:         resourceID,
 		tempRoot:           tempRoot,
 		vethName:           prefix + "a",
 		peerVethName:       prefix + "b",
-		vethAlias:          "wg-mix-ebpf:" + runID + ":a",
-		peerVethAlias:      "wg-mix-ebpf:" + runID + ":b",
+		vethAlias:          aliasPrefix + ":a",
+		peerVethAlias:      aliasPrefix + ":b",
 	}, nil
 }
 
@@ -212,11 +242,15 @@ func validFakeTCPRealHostRunID(runID string) bool {
 	return true
 }
 
-func validateFakeTCPRealHostTempRoot(tempRoot, runID string) error {
+func validateFakeTCPRealHostTempRoot(tempRoot, runID, resourceID string) error {
 	if !filepath.IsAbs(tempRoot) || filepath.Clean(tempRoot) != tempRoot {
 		return fmt.Errorf("%s must be a clean absolute path", fakeTCPRealHostTempRootEnv)
 	}
-	expectedTempRoot := filepath.Join(fakeTCPRealHostStageRoot, runID, "go-tmp-realhost")
+	tempName := "go-tmp-realhost"
+	if resourceID != runID {
+		tempName += "-" + resourceID
+	}
+	expectedTempRoot := filepath.Join(fakeTCPRealHostStageRoot, runID, tempName)
 	if tempRoot != expectedTempRoot {
 		return fmt.Errorf(
 			"%s must be the reviewed v6 temporary directory %s",

@@ -774,7 +774,7 @@ func buildFakeTCPRealHostRuntime(
 	leaseSuffix string,
 ) (*ExperimentalFakeTCPRuntime, *fakeTCPRealHostSlowPath) {
 	t.Helper()
-	generationText := prepared.contract.runID
+	generationText := prepared.contract.resourceID
 	generation, err := strconv.ParseUint(generationText, 16, 32)
 	if err != nil || generation == 0 {
 		t.Fatalf("derive FakeTCP real-host generation from %s: %v", generationText, err)
@@ -790,7 +790,7 @@ func buildFakeTCPRealHostRuntime(
 		t.Fatal(err)
 	}
 
-	leaseBase := "faketcp-" + prepared.contract.runID + "-" + leaseSuffix
+	leaseBase := "faketcp-" + prepared.contract.resourceID + "-" + leaseSuffix
 	leasePath := filepath.Join(prepared.contract.tempRoot, leaseBase+".lease")
 	maintenancePath := filepath.Join(prepared.contract.tempRoot, leaseBase+".maintenance")
 	leaseCtx := lockfile.WithLifecyclePathsForTest(ctx, leasePath, maintenancePath)

@@ -3,7 +3,7 @@ set -u
 set -o pipefail
 umask 077
 
-readonly RUN_ID='7e42a19c'
+readonly RUN_ID='c8e41d73'
 readonly SOURCE="/run/wg-mix-ebpf-source-stages/${RUN_ID}/source"
 readonly ROOT_RUNNER="${SOURCE}/scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh"
 readonly EXPECTED_SELF="${SOURCE}/scripts/realhost-b82-routed-veth-v1/controller-seam.sh"
