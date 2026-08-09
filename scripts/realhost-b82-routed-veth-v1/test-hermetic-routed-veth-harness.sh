@@ -74,7 +74,7 @@ readonly SEAM_OUTPUT
 
 for literal in \
   'B82_ROUTED_VETH_PLAN_ONLY run_id=7e42a19c resource_id=5b8d30f1' \
-  'state_schema=owner,baseline,mutation-plan,veth,address,route,neighbor,offload,module,tested,cleanup-intent,restored' \
+  'state_schema=owner,baseline,operation-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module,tested,cleanup-intent,restored' \
   'netns=initial veth=wg7e42aa,wg7e42ab sender=198.18.82.1/32 peer=wg7e42ab/unnumbered route=198.18.82.2/32 mtu=1500 neighbor=02:7e:42:a1:9c:0b no_external_peer=1' \
   'N5 operation=address-add target=wg7e42aa:198.18.82.1/32 argv=/usr/sbin/ip -4 address add 198.18.82.1/32 dev wg7e42aa scope global' \
   'N6 operation=route-add target=198.18.82.2/32 argv=/usr/sbin/ip -4 route add 198.18.82.2/32 dev wg7e42aa src 198.18.82.1 mtu 1500 proto static scope link' \
@@ -91,6 +91,19 @@ for literal in \
   [[ "${PLAN_OUTPUT}" == *"${literal}"* ]] || fail "runner plan is missing ${literal}"
 done
 
+[[ "${PLAN_OUTPUT}" == *'P0 operation=preflight-mod-verify target=/run/wg-mix-ebpf-source-stages/7e42a19c/go-mod-cache argv='* ]] ||
+  fail 'runner plan is missing the offline staged-module verification'
+[[ "${PLAN_OUTPUT}" == *'P1 operation=preflight-build target=/run/wg-mix-ebpf-source-stages/7e42a19c/routed-evidence-5b8d30f1/dataplane-preflight.test argv='* ]] ||
+  fail 'runner plan is missing the pre-mutation compiled test binary'
+[[ "${PLAN_OUTPUT}" == *'GOMODCACHE=/run/wg-mix-ebpf-source-stages/7e42a19c/go-mod-cache'* ]] ||
+  fail 'clean-stage fixture does not reuse the bound staged module cache'
+[[ "${PLAN_OUTPUT}" != *'go-mod-cache-routed'* && "${PLAN_OUTPUT}" != *'go-cache-routed'* ]] ||
+  fail 'clean-stage fixture still depends on an empty routed-only cache'
+preflight_offset="${PLAN_OUTPUT%%P0 operation=preflight-mod-verify*}"
+mutation_offset="${PLAN_OUTPUT%%N0 operation=veth-add*}"
+(( ${#preflight_offset} < ${#mutation_offset} )) ||
+  fail 'dependency/build preflight is not ordered before the first host mutation'
+
 for test_name in \
   TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration \
   TestFakeTCPRealHostRoutedIPHdrInclNone \
@@ -98,6 +111,8 @@ for test_name in \
   TestFakeTCPRealHostRoutedUDPSegmentGSO; do
   [[ "${PLAN_OUTPUT}" == *"operation=list:${test_name} target=${test_name} argv="* ]] ||
     fail "runner plan is missing list operation for ${test_name}"
+  [[ "${PLAN_OUTPUT}" == *"dataplane-preflight.test -test.list \\^${test_name}\\\$"* ]] ||
+    fail "clean-stage fixture does not list ${test_name} from the prebuilt binary"
   [[ "${PLAN_OUTPUT}" == *"operation=test:${test_name} target=${test_name} argv="* ]] ||
     fail "runner plan is missing test operation for ${test_name}"
 done
