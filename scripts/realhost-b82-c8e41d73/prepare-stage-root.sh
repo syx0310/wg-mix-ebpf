@@ -16,6 +16,8 @@ readonly STAGES_ROOT='/run/wg-mix-ebpf-source-stages'
 readonly STAGE_ROOT="${STAGES_ROOT}/${RUN_ID}"
 readonly EXPECTED_SOURCE="${STAGE_ROOT}/source"
 readonly BINDING_MARKER="${STAGE_ROOT}/binding.v1"
+readonly MODULE_LEASE_LOCK="${STAGE_ROOT}/checksum-module-lease.v1.lock"
+readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-${RUN_ID}/checksum-module-lease.sh"
 readonly EXPECTED_HOSTNAME='ubuntu-2604-test'
 readonly EXPECTED_KERNEL='7.0.0-28-generic'
 readonly EXPECTED_MACHINE_ID='9db3fb717cc74974b2a6b243d67f67b9'
@@ -262,6 +264,8 @@ render_plan() {
   plan_command S1 /usr/bin/sha256sum -- "${bundle}"
   plan_command S2 /usr/bin/mkdir --mode=0700 -- "${STAGES_ROOT}"
   plan_command S3 /usr/bin/mkdir --mode=0700 -- "${STAGE_ROOT}"
+  plan_command S3.lock /usr/bin/install --owner=root --group=root --mode=0600 \
+    --no-target-directory -- /dev/null "${MODULE_LEASE_LOCK}"
   plan_command S4 /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
     GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 \
     /usr/bin/git -c core.hooksPath=/dev/null clone --no-local --no-checkout \
@@ -272,10 +276,12 @@ render_plan() {
     checkout --detach "${INTEGRATION_COMMIT}"
   plan_command S6 /bin/bash -n "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" \
     "${EXPECTED_SOURCE}/${HERMETIC_PATH}" "${EXPECTED_SOURCE}/${PREPARE_PATH}" \
+    "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}" \
     "${EXPECTED_SOURCE}/${PROVISION_PATH}"
   plan_command S7 /usr/bin/shellcheck --norc --shell=bash -- \
     "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" "${EXPECTED_SOURCE}/${HERMETIC_PATH}" \
-    "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${PROVISION_PATH}"
+    "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}" \
+    "${EXPECTED_SOURCE}/${PROVISION_PATH}"
   plan_command S8 shell-builtin noclobber-write "${BINDING_MARKER}"
   printf 'B82_V6_STAGE_PLAN_COMPLETE no_commands_executed=1 no_cleanup=1\n'
 }
@@ -411,7 +417,13 @@ write_binding_marker() {
       "run_id=${RUN_ID}" "package_id=${PACKAGE_ID}" \
       "integration_ref=${INTEGRATION_REF}" "integration_commit=${INTEGRATION_COMMIT}" \
       "bundle_sha256=${BUNDLE_SHA256}" "manifest_sha256=${MANIFEST_SHA256}" \
-      "wg_state=${WG_STATE}" >"${BINDING_MARKER}")
+      "wg_state=${WG_STATE}" "module_lease_lock=${MODULE_LEASE_LOCK}" >"${BINDING_MARKER}")
+}
+
+require_module_lease_lock() {
+  [[ -f "${MODULE_LEASE_LOCK}" && ! -L "${MODULE_LEASE_LOCK}" ]] || return 79
+  [[ "$(/usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${MODULE_LEASE_LOCK}")" == \
+    'root:root:600:1:regular file' ]]
 }
 
 run_stage() {
@@ -427,6 +439,9 @@ run_stage() {
   fi
   [[ ! -e "${STAGE_ROOT}" && ! -L "${STAGE_ROOT}" ]] || fail 'stage-exists' 73
   run_step S3 /usr/bin/mkdir --mode=0700 -- "${STAGE_ROOT}" || fail 'stage-create' $?
+  run_step S3.lock /usr/bin/install --owner=root --group=root --mode=0600 \
+    --no-target-directory -- /dev/null "${MODULE_LEASE_LOCK}" || fail 'module-lease-lock-create' $?
+  require_module_lease_lock || fail 'module-lease-lock-shape' $?
   run_step S4 /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
     GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_NO_REPLACE_OBJECTS=1 \
     /usr/bin/git -c core.hooksPath=/dev/null clone --no-local --no-checkout \
@@ -446,12 +461,15 @@ run_stage() {
     fail 'staged-script-hash' 79
   run_step S6 /bin/bash -n "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" \
     "${EXPECTED_SOURCE}/${HERMETIC_PATH}" "${EXPECTED_SOURCE}/${PREPARE_PATH}" \
+    "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}" \
     "${EXPECTED_SOURCE}/${PROVISION_PATH}" || fail 'bash-syntax' $?
   run_step S7 /usr/bin/shellcheck --norc --shell=bash -- \
     "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" "${EXPECTED_SOURCE}/${HERMETIC_PATH}" \
-    "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${PROVISION_PATH}" || fail 'shellcheck' $?
+    "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}" \
+    "${EXPECTED_SOURCE}/${PROVISION_PATH}" || fail 'shellcheck' $?
   stage_status="$(git_stage -C "${EXPECTED_SOURCE}" status --porcelain=v1 --untracked-files=all)" || fail 'stage-status'
   [[ -z "${stage_status}" ]] || fail 'stage-dirty' 79
+  require_module_lease_lock || fail 'module-lease-lock-drift' $?
   write_binding_marker || fail 'binding-marker' $?
   printf 'B82_V6_STAGE_COMPLETE run_id=%s commit=%s source=%s binding=%s\n' \
     "${RUN_ID}" "${INTEGRATION_COMMIT}" "${EXPECTED_SOURCE}" "${BINDING_MARKER}"

@@ -14,6 +14,17 @@ def fail(message: str) -> None:
     raise SystemExit(message)
 
 
+def function_body(source: str, name: str) -> str:
+    match = re.search(
+        rf"^{re.escape(name)}\(\) \{{\n(?P<body>.*?)(?=^\}}\n)",
+        source,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not match:
+        fail(f"missing shell function {name}")
+    return match.group("body")
+
+
 def load_checker(path: pathlib.Path) -> ModuleType:
     spec = importlib.util.spec_from_file_location("reviewed_realhost_checker", path)
     if spec is None or spec.loader is None:
@@ -72,6 +83,20 @@ def main() -> None:
         "readonly RUN_ID='c8e41d73'",
         "readonly PACKAGE_ID='4f2a9b61'",
         "readonly EVIDENCE_ID='6bd913ac'",
+        'readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-${RUN_ID}/checksum-module-lease.sh"',
+        'readonly MODULE_LEASE_LOCK="${STAGE_ROOT}/checksum-module-lease.v1.lock"',
+        'readonly MODULE_LEASE_ID="${RUN_ID}-${EVIDENCE_ID}"',
+        "checksum-module-intent.v1",
+        "checksum-module-owned.v1",
+        "checksum-module-unloaded.v1",
+        "load_checksum_module_helper",
+        "configure_checksum_module_lease",
+        "module-lease-binding-contract",
+        "c8_checksum_module_acquire L0.run",
+        "c8_checksum_module_acquire L0.restore",
+        "c8_checksum_module_load O2",
+        'c8_checksum_module_restore "${prefix}"',
+        '"lease_id=${MODULE_LEASE_ID}"',
         "valid_commit \"${COMMIT}\"",
         "valid_sha256 \"${BUNDLE_SHA256}\"",
         "TestBPFFSPinLifecycleIntegration",
@@ -219,6 +244,38 @@ def main() -> None:
         fail("matrix embeds a source-commit placeholder instead of requiring argv")
     if "COMMIT='c8e41d73'" in matrix:
         fail("run ID is incorrectly used as a source commit")
+
+    load_module = function_body(matrix, "load_checksum_module")
+    restore_module = function_body(matrix, "unload_checksum_module")
+    for direct in ("/usr/sbin/insmod", "/usr/sbin/rmmod", "srcversion"):
+        if direct in load_module + restore_module:
+            fail(f"matrix duplicates shared module ownership logic: {direct}")
+    if "c8_checksum_module_load O2" not in load_module:
+        fail("matrix module setup does not delegate to the shared lease helper")
+    if 'c8_checksum_module_restore "${prefix}"' not in restore_module:
+        fail("matrix module restore does not delegate to the shared lease helper")
+    run_all = function_body(matrix, "run_all")
+    run_order = (
+        "create_evidence_root",
+        "c8_checksum_module_acquire L0.run",
+        "L1.module-baseline",
+        "snapshot_host",
+        "  load_checksum_module\n",
+        "  unload_checksum_module\n",
+    )
+    positions = [run_all.index(item) for item in run_order]
+    if positions != sorted(positions):
+        fail("matrix does not hold the shared module lease across run and restore")
+    failure_restore = function_body(matrix, "restore_after_failure")
+    restore_order = (
+        "load_checksum_module_helper",
+        "c8_checksum_module_acquire L0.restore",
+        "configure_checksum_module_lease",
+        "unload_checksum_module Z.module",
+    )
+    positions = [failure_restore.index(item) for item in restore_order]
+    if positions != sorted(positions):
+        fail("matrix failure restore validates module state outside the shared lease")
 
     matrix_minimum = (
         3

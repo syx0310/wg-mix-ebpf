@@ -15,9 +15,9 @@ readonly AUDIT_LOG="${EVIDENCE_ROOT}/audit.log"
 readonly NIC_STATE="${EVIDENCE_ROOT}/nic-original.v1"
 readonly NETNS_STATE="${EVIDENCE_ROOT}/initial-netns.v1"
 readonly VETH_STATE="${EVIDENCE_ROOT}/veth-owned.v1"
-readonly MODULE_INTENT="${EVIDENCE_ROOT}/module-load-intent.v1"
-readonly MODULE_LOADED="${EVIDENCE_ROOT}/module-loaded.v1"
-readonly MODULE_UNLOADED="${EVIDENCE_ROOT}/module-unloaded.v1"
+readonly MODULE_INTENT="${EVIDENCE_ROOT}/checksum-module-intent.v1"
+readonly MODULE_LOADED="${EVIDENCE_ROOT}/checksum-module-owned.v1"
+readonly MODULE_UNLOADED="${EVIDENCE_ROOT}/checksum-module-unloaded.v1"
 readonly COMPLETED_MARKER="${EVIDENCE_ROOT}/completed.v1"
 readonly RESTORED_MARKER="${EVIDENCE_ROOT}/restored.v1"
 readonly PIN_PATH="/sys/fs/bpf/wg-mix-ebpf-${RUN_ID}-tcx"
@@ -30,6 +30,11 @@ readonly VETH_B='wgc8e41b'
 readonly VETH_A_ALIAS="wg-mix-ebpf:${RUN_ID}:a"
 readonly VETH_B_ALIAS="wg-mix-ebpf:${RUN_ID}:b"
 readonly MODULE_NAME='wg_mix_faketcp_checksum'
+readonly MODULE_OBJECT="${EXPECTED_SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko"
+readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-${RUN_ID}/checksum-module-lease.sh"
+readonly MODULE_LEASE_HELPER="${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}"
+readonly MODULE_LEASE_LOCK="${STAGE_ROOT}/checksum-module-lease.v1.lock"
+readonly MODULE_LEASE_ID="${RUN_ID}-${EVIDENCE_ID}"
 readonly SOAK_WINDOWS=12
 readonly MATRIX_TRAFFIC_SECONDS=30
 readonly MATRIX_PASSES=2
@@ -209,8 +214,11 @@ render_plan() {
   printf 'REALHOST_V6_PLAN_ENDPOINTS bare=%s:%s active_wg=%s:%s->%s:%s\n' \
     "${PEER_ADDRESS}" "${PEER_PORT}" "${WG_INTERFACE}" "${WG_LOCAL_ADDRESS}" \
     "${WG_PEER_ADDRESS}" "${PEER_PORT}"
+  printf 'REALHOST_V6_MODULE_LEASE helper=%s lock=%s lease_id=%s receipt=insmod-rc0-only generation=sysfs,parameter,srcversion,btf\n' \
+    "${MODULE_LEASE_HELPER}" "${MODULE_LEASE_LOCK}" "${MODULE_LEASE_ID}"
   plan_command B0 /usr/bin/mkdir --mode=0700 -- "${EVIDENCE_ROOT}"
   plan_command B1 shell-builtin noclobber-create-and-persist-bootstrap-audit "${AUDIT_LOG}"
+  plan_command L0 /usr/bin/flock --exclusive --nonblock MODULE_LEASE_FD
   plan_command A1 /usr/bin/hostname
   plan_command A2 /usr/bin/uname -r
   plan_command A3 /usr/bin/cat /etc/machine-id
@@ -240,7 +248,8 @@ render_plan() {
     -run '^TestBPFFSPinLifecycleIntegration$' -count=1 -timeout=2m
   plan_command O1 /usr/bin/make --no-print-directory -C "${SOURCE}" \
     build-bpf build-faketcp-experimental-bpf build-faketcp-checksum-kmod build
-  plan_command O2 /usr/sbin/insmod "${SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko"
+  plan_command O2 /usr/sbin/insmod "${SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko" \
+    "lease_id=${MODULE_LEASE_ID}"
   plan_command O3 "${SOURCE}/bin/wg-mix-ebpf" bpf-load-test \
     --experimental-faketcp --object "${SOURCE}/build/wg_mix_faketcp_experimental.o" --json
   plan_command O4 /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
@@ -445,9 +454,9 @@ require_tooling() {
     /usr/bin/awk /usr/bin/basename /usr/bin/cat /usr/bin/cmp /usr/bin/env
     /usr/bin/git /usr/bin/go /usr/bin/grep /usr/bin/hostname /usr/bin/iperf3
     /usr/bin/jq /usr/bin/ls /usr/bin/make /usr/bin/mkdir /usr/bin/ping /usr/bin/python3
-    /usr/bin/readlink /usr/bin/sha256sum /usr/bin/stat /usr/bin/tee
+    /usr/bin/flock /usr/bin/readlink /usr/bin/sha256sum /usr/bin/stat /usr/bin/tee
     /usr/bin/test /usr/bin/timeout /usr/bin/uname /usr/bin/wg
-    /usr/sbin/bpftool /usr/sbin/ethtool /usr/sbin/insmod /usr/sbin/ip
+    /usr/sbin/bpftool /usr/sbin/ethtool /usr/sbin/insmod /usr/sbin/ip /usr/sbin/modinfo
     /usr/sbin/lsmod /usr/sbin/nft /usr/sbin/rmmod /usr/sbin/tc
   )
   for path in "${tools[@]}"; do
@@ -496,6 +505,55 @@ validate_common_identity() {
   [[ "${actual}" == "${EXPECTED_KERNEL}" ]] || fail 'kernel-mismatch' 79
   actual="$(read_single_line /etc/machine-id)" || fail 'machine-id-read'
   [[ "${actual}" == "${EXPECTED_MACHINE_ID}" ]] || fail 'machine-id-mismatch' 79
+  [[ -f "${MODULE_LEASE_HELPER}" && ! -L "${MODULE_LEASE_HELPER}" ]] ||
+    fail 'module-lease-helper-shape' 79
+}
+
+load_checksum_module_helper() {
+  # shellcheck source=checksum-module-lease.sh
+  source "${MODULE_LEASE_HELPER}" || fail 'module-lease-helper-source' $?
+  [[ "${C8_CHECKSUM_MODULE_LOCK}" == "${MODULE_LEASE_LOCK}" ]] ||
+    fail 'module-lease-helper-lock-contract' 79
+}
+
+run_module_lease_argv() {
+  local label="$1" target="$2" rendered rc
+  local -a status
+  shift 2
+  rendered="$(quote_argv "$@")" || fail "module-lease-render:${label}"
+  audit_line start "${label}" "${target}" not-run "${rendered}" || fail "module-lease-audit-start:${label}"
+  "$@" 2>&1 | /usr/bin/tee -a "${AUDIT_LOG}"
+  status=("${PIPESTATUS[@]}")
+  ((${#status[@]} == 2)) || fail "module-lease-pipeline:${label}"
+  rc="${status[0]}"
+  audit_line finish "${label}" "${target}" "${rc}" "${rendered}" || fail "module-lease-audit-finish:${label}"
+  ((status[1] == 0)) || fail "module-lease-output:${label}" "${status[1]}"
+  return "${rc}"
+}
+
+c8_checksum_module_run() {
+  run_module_lease_argv "$@"
+}
+
+c8_checksum_module_write() {
+  write_once "$1" "$2"
+}
+
+c8_checksum_module_fail() {
+  fail "checksum-module-lease:$1" "$2"
+}
+
+configure_checksum_module_lease() {
+  local module_sha
+  module_sha="$(c8_checksum_module_sha_file "${MODULE_OBJECT}")" || fail 'module-lease-object-sha' $?
+  c8_checksum_module_configure "${RUN_ID}" "${EVIDENCE_ID}" "${COMMIT}" \
+    "${ORIGINAL_BOOT_ID}" "${EVIDENCE_ROOT}" "${MODULE_OBJECT}" "${module_sha}" ||
+    fail 'module-lease-configure' $?
+  [[ "${C8_CHECKSUM_MODULE_LEASE_ID}" == "${MODULE_LEASE_ID}" &&
+    "${C8_CHECKSUM_MODULE_INTENT}" == "${MODULE_INTENT}" &&
+    "${C8_CHECKSUM_MODULE_OWNED}" == "${MODULE_LOADED}" &&
+    "${C8_CHECKSUM_MODULE_UNLOADED}" == "${MODULE_UNLOADED}" ]] ||
+    fail 'module-lease-binding-contract' 79
 }
 
 create_evidence_root() {
@@ -841,30 +899,13 @@ restore_exact_tcx_lifecycle() {
 }
 
 load_checksum_module() {
-  run_step O2.pre "${MODULE_NAME}" /usr/bin/test ! -e "/sys/module/${MODULE_NAME}"
-  require_zero O2.pre
-  local ko_sha
-  ko_sha="$(/usr/bin/sha256sum -- "${SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko")" || fail 'module-sha'
-  ko_sha="${ko_sha%% *}"
-  valid_sha256 "${ko_sha}" || fail 'module-sha-invalid' 79
-  write_once "${MODULE_INTENT}" 'format=wg-mix-ebpf-module-intent-v1' \
-    "run_id=${RUN_ID}" "module=${MODULE_NAME}" "ko_sha256=${ko_sha}" 'state=loading'
-  run_step O2 "${MODULE_NAME}" /usr/sbin/insmod \
-    "${SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko"
-  require_zero O2
-  run_step O2.verify "${MODULE_NAME}" /usr/bin/test -d "/sys/module/${MODULE_NAME}"
-  require_zero O2.verify
-  write_once "${MODULE_LOADED}" "run_id=${RUN_ID}" "module=${MODULE_NAME}" 'state=loaded'
+  configure_checksum_module_lease
+  c8_checksum_module_load O2
 }
 
 unload_checksum_module() {
   local prefix="${1:-O8}"
-  [[ -f "${MODULE_LOADED}" && ! -L "${MODULE_LOADED}" ]] || fail 'module-owner-marker-missing' 79
-  run_step "${prefix}" "${MODULE_NAME}" /usr/sbin/rmmod "${MODULE_NAME}"
-  require_zero "${prefix}"
-  run_step "${prefix}.verify" "${MODULE_NAME}" /usr/bin/test ! -e "/sys/module/${MODULE_NAME}"
-  require_zero "${prefix}.verify"
-  write_once "${MODULE_UNLOADED}" "run_id=${RUN_ID}" "module=${MODULE_NAME}" 'state=unloaded'
+  c8_checksum_module_restore "${prefix}"
 }
 
 run_faketcp_tests() {
@@ -1226,7 +1267,15 @@ validate_owner_marker() {
 
 restore_after_failure() {
   validate_common_identity
+  load_checksum_module_helper
   validate_owner_marker
+  c8_checksum_module_acquire L0.restore
+  if [[ -e "${MODULE_INTENT}" || -L "${MODULE_INTENT}" ||
+    -e "${MODULE_LOADED}" || -L "${MODULE_LOADED}" ||
+    -e "${MODULE_UNLOADED}" || -L "${MODULE_UNLOADED}" ||
+    -e "/sys/module/${MODULE_NAME}" ]]; then
+    configure_checksum_module_lease
+  fi
   [[ ! -e "${RESTORED_MARKER}" && ! -L "${RESTORED_MARKER}" ]] || fail 'already-restored' 78
   if [[ "${RESTORE_CELL}" == 'tcx' ]]; then
     require_scoped_realnic_contract Z.contract
@@ -1241,7 +1290,10 @@ restore_after_failure() {
     require_zero Z0
     fail 'exact-bpf-pin-remains-manual-code-owned-detach-required' 79
   fi
-  if [[ -f "${MODULE_LOADED}" && ! -f "${MODULE_UNLOADED}" ]]; then
+  if [[ -e "${MODULE_INTENT}" || -L "${MODULE_INTENT}" ||
+    -e "${MODULE_LOADED}" || -L "${MODULE_LOADED}" ||
+    -e "${MODULE_UNLOADED}" || -L "${MODULE_UNLOADED}" ||
+    -e "/sys/module/${MODULE_NAME}" ]]; then
     unload_checksum_module Z.module
   fi
   if [[ -f "${VETH_STATE}" && ! -f "${EVIDENCE_ROOT}/veth-deleted.v1" ]]; then
@@ -1261,9 +1313,12 @@ restore_after_failure() {
 
 run_all() {
   validate_common_identity
+  load_checksum_module_helper
   [[ ! -e "${PIN_PATH}" && ! -L "${PIN_PATH}" ]] || fail 'pin-path-preexists' 79
-  [[ ! -e "/sys/module/${MODULE_NAME}" ]] || fail 'checksum-module-preexists' 79
   create_evidence_root
+  c8_checksum_module_acquire L0.run
+  c8_checksum_module_run L1.module-baseline "${MODULE_NAME}" \
+    /usr/bin/test ! -e "/sys/module/${MODULE_NAME}" || fail 'checksum-module-preexists' $?
   run_step U1 "${STAGE_ROOT}/go-cache-realhost" /usr/bin/test ! -e "${STAGE_ROOT}/go-cache-realhost"
   require_zero U1
   run_step U2 "${STAGE_ROOT}/go-cache-realhost" /usr/bin/mkdir --mode=0700 -- "${STAGE_ROOT}/go-cache-realhost"
