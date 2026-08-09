@@ -33,9 +33,17 @@ import (
 
 const (
 	fakeTCPRealHostObjectSizeLimit              = 128 << 20
+	fakeTCPRealHostStatsKernelMapName           = "faketcp_stats_m"
 	fakeTCPRealHostStatCount                    = 19
+	fakeTCPRealHostStatEgressOK                 = uint32(0)
+	fakeTCPRealHostStatIngressOK                = uint32(1)
+	fakeTCPRealHostStatGSOReject                = uint32(5)
+	fakeTCPRealHostStatChecksumNoneAccepted     = uint32(13)
+	fakeTCPRealHostStatChecksumPartialReset     = uint32(14)
 	fakeTCPRealHostStatMTUReject                = uint32(16)
 	fakeTCPRealHostMTURouteUnknownAuditKey      = uint32(3*3 + 2)
+	fakeTCPRealHostCoreStatEgressRewriteOK      = uint32(0)
+	fakeTCPRealHostCoreStatIngressRewriteOK     = uint32(6)
 	fakeTCPRealHostCoreStatEgressGSOSeen        = uint32(15)
 	fakeTCPRealHostCoreStatEgressGSOManagedSeen = uint32(16)
 	fakeTCPRealHostVirtioNetHeaderSize          = 10
@@ -840,7 +848,7 @@ func buildFakeTCPRealHostRuntime(
 			xdpRuntime:     liveFakeTCPXDPRuntime,
 			xdpRequirement: fakeTCPXDPAllowSelectedModeTestOnly,
 			engineOptions:  fakeTCPRealHostEngineOptions(generation),
-			slowPathFactory: func(_ *faketcp.Engine, events *ebpf.Map) (experimentalSlowPath, error) {
+			slowPathFactory: func(_ *faketcp.Engine, events, stats *ebpf.Map) (experimentalSlowPath, error) {
 				if events == nil {
 					return nil, errors.New("FakeTCP real-host events map is nil")
 				}
@@ -850,6 +858,13 @@ func buildFakeTCPRealHostRuntime(
 				}
 				if info.Name != "faketcp_events" {
 					return nil, fmt.Errorf("FakeTCP real-host events map name=%q", info.Name)
+				}
+				statsInfo, err := stats.Info()
+				if err != nil {
+					return nil, fmt.Errorf("inspect FakeTCP real-host stats map: %w", err)
+				}
+				if statsInfo.Name != fakeTCPRealHostStatsKernelMapName {
+					return nil, fmt.Errorf("FakeTCP real-host stats map name=%q", statsInfo.Name)
 				}
 				return slowPath, nil
 			},

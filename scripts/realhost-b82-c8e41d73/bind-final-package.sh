@@ -166,6 +166,7 @@ readonly -a PACKAGE_PATHS=(
   "${REPOSITORY_PATH_FROM_ROOT}/test-hermetic-matrix.sh"
   "${REPOSITORY_PATH_FROM_ROOT}/test_matrix_static.py"
   "${REPOSITORY_PATH_FROM_ROOT}/prepare-stage-root.sh"
+  "scripts/provision-ubuntu-test-host.sh"
 )
 
 readonly -a IDENTITY_PATHS=(

@@ -5,6 +5,8 @@ umask 077
 
 REVIEW_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
 readonly REVIEW_ROOT
+REPOSITORY="$(CDPATH= cd -- "${REVIEW_ROOT}/../.." && pwd -P)" || exit 70
+readonly REPOSITORY
 readonly BINDER="${REVIEW_ROOT}/bind-final-package.sh"
 readonly CONTROLLER="${REVIEW_ROOT}/controller.sh"
 readonly TRANSPORT="${REVIEW_ROOT}/locked-transport.exp"
@@ -12,6 +14,8 @@ readonly STAGER="${REVIEW_ROOT}/prepare-stage-root.sh"
 readonly MATRIX="${REVIEW_ROOT}/root-matrix-n-r.sh"
 readonly STATIC_TEST="${REVIEW_ROOT}/test_controller_static.py"
 readonly MODULE_LEASE_HELPER="${REVIEW_ROOT}/checksum-module-lease.sh"
+readonly PROVISION_POLICY_TEST="${REVIEW_ROOT}/test_provision_policy.tcl"
+readonly PROVISIONER="${REPOSITORY}/scripts/provision-ubuntu-test-host.sh"
 readonly CREDENTIAL_PATH='/Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82'
 
 fail() {
@@ -55,15 +59,16 @@ require_ordered_literals() {
 }
 
 for path in "${BINDER}" "${CONTROLLER}" "${TRANSPORT}" "${STAGER}" "${MATRIX}" \
-  "${STATIC_TEST}" "${MODULE_LEASE_HELPER}"; do
+  "${STATIC_TEST}" "${MODULE_LEASE_HELPER}" "${PROVISION_POLICY_TEST}" "${PROVISIONER}"; do
   [[ -f "${path}" && ! -L "${path}" ]] || fail "review input is not a regular file: ${path}"
 done
 
-/bin/bash -n "${BINDER}" "${CONTROLLER}" "${STAGER}" \
-  "${MODULE_LEASE_HELPER}" "$0" || fail 'Bash syntax gate'
+/bin/bash -n "${BINDER}" "${CONTROLLER}" "${STAGER}" "${MODULE_LEASE_HELPER}" \
+  "${PROVISIONER}" "$0" || fail 'Bash syntax gate'
 /usr/bin/python3 -I "${STATIC_TEST}" \
-  "${BINDER}" "${CONTROLLER}" "${TRANSPORT}" "${STAGER}" "${MATRIX}" ||
+  "${BINDER}" "${CONTROLLER}" "${TRANSPORT}" "${STAGER}" "${MATRIX}" "${PROVISIONER}" ||
   fail 'static controller contract'
+/usr/bin/expect "${PROVISION_POLICY_TEST}" "${TRANSPORT}" || fail 'provision output policy'
 EXPECT_ARGUMENT_OUTPUT="$(/usr/bin/expect "${TRANSPORT}" 2>&1)"
 EXPECT_ARGUMENT_RC=$?
 [[ "${EXPECT_ARGUMENT_RC}" -eq 64 && "${EXPECT_ARGUMENT_OUTPUT}" == *'reason=arguments rc=64'* ]] ||
@@ -71,7 +76,7 @@ EXPECT_ARGUMENT_RC=$?
 
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck --norc --shell=bash -- "${BINDER}" "${CONTROLLER}" "${STAGER}" \
-    "${MODULE_LEASE_HELPER}" "$0" ||
+    "${MODULE_LEASE_HELPER}" "${PROVISIONER}" "$0" ||
     fail 'ShellCheck gate'
 else
   printf 'SKIP: shellcheck unavailable locally; .82 preflight binds /usr/bin/shellcheck\n'
@@ -94,9 +99,11 @@ for name in \
   bind-final-package.sh controller.sh locked-transport.exp prepare-stage-root.sh \
   root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh test_matrix_static.py \
   checksum-module-lease.sh test-hermetic-checksum-module-lease.sh \
-  test_checksum_module_lease_static.py; do
+  test_checksum_module_lease_static.py test_provision_policy.tcl; do
   /bin/cp -- "${REVIEW_ROOT}/${name}" "${FIXTURE_REVIEW}/${name}" || fail "fixture copy ${name}"
 done
+/bin/cp -- "${PROVISIONER}" "${FIXTURE_REPOSITORY}/scripts/provision-ubuntu-test-host.sh" ||
+  fail 'fixture copy provisioner'
 printf 'fixture=%s\n' "${TEST_ROOT##*/}" >"${FIXTURE_REPOSITORY}/fixture-token.v1" || fail 'fixture token'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" add -- scripts fixture-token.v1 || fail 'fixture Git add'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" commit -m 'Hermetic binding fixture' || fail 'fixture Git commit'
@@ -139,6 +146,11 @@ BOUND_MANIFEST_SHA="$(sha256_file "${BOUND_MANIFEST}")" || fail 'manifest digest
   "$(manifest_value history_objects_sha256 "${BOUND_MANIFEST}")" ]] || fail 'history objects digest'
 [[ "$(sha256_file "${BOUND_OUTPUT}/history-roots.v1")" == \
   "$(manifest_value history_roots_sha256 "${BOUND_MANIFEST}")" ]] || fail 'history roots digest'
+[[ "$(manifest_value provision_ubuntu_test_host_sh_path "${BOUND_MANIFEST}")" == \
+  'scripts/provision-ubuntu-test-host.sh' ]] || fail 'provisioner manifest path binding'
+[[ "$(sha256_file "${BOUND_OUTPUT}/provision-ubuntu-test-host.sh")" == \
+  "$(manifest_value provision_ubuntu_test_host_sh_sha256 "${BOUND_MANIFEST}")" ]] ||
+  fail 'provisioner package digest binding'
 /usr/bin/git -C "${BOUND_OUTPUT}/history-verification.git" fsck --full --strict --no-dangling \
   "${FIXTURE_COMMIT}" || fail 'isolated history fsck'
 /usr/bin/grep -E '^\?' -- "${BOUND_OUTPUT}/history-objects.v1"
@@ -161,6 +173,7 @@ for literal in \
   'operation=identity-hostname transport=ssh credential_read=0 network_operations=0' \
   'operation=identity-wg-interfaces transport=ssh credential_read=0 network_operations=0' \
   'operation=tool-bpftool transport=ssh credential_read=0 network_operations=0' \
+  '/usr/sbin/bpftool -V' \
   'operation=kernel-btf transport=ssh credential_read=0 network_operations=0' \
   'operation=scp-source-4f2a9b61.bundle transport=scp credential_read=0 network_operations=0' \
   "${FIXTURE_REPOSITORY}/scripts/realhost-b82-c8e41d73/locked-transport.exp" \
@@ -181,6 +194,20 @@ for literal in \
   'operation=bootstrap-stager-readlink transport=ssh credential_read=0 network_operations=0' \
   'operation=bootstrap-stager-sha transport=ssh credential_read=0 network_operations=0' \
   'operation=bootstrap-stager-stat transport=ssh credential_read=0 network_operations=0' \
+  'operation=bootstrap-install-provisioner transport=ssh credential_read=0 network_operations=0' \
+  '/usr/bin/install --owner=root --group=root --mode=0700 --no-target-directory -- /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/provision-ubuntu-test-host.sh /run/wg-mix-ebpf-source-bootstrap-c8e41d73/provision-ubuntu-test-host.sh' \
+  'operation=bootstrap-provisioner-readlink transport=ssh credential_read=0 network_operations=0' \
+  'operation=bootstrap-provisioner-stat transport=ssh credential_read=0 network_operations=0' \
+  'operation=bootstrap-provisioner-sha transport=ssh credential_read=0 network_operations=0' \
+  'operation=provision-check transport=ssh credential_read=0 network_operations=0' \
+  '/usr/bin/sudo -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/provision-ubuntu-test-host.sh --check --expected-address 192.168.10.82 --expected-interface ens33 --expected-hostname ubuntu-2604-test --expected-kernel 7.0.0-28-generic --expected-machine-id 9db3fb717cc74974b2a6b243d67f67b9' \
+  'operation=provision-apply transport=ssh credential_read=0 network_operations=0' \
+  '/usr/bin/sudo -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/provision-ubuntu-test-host.sh --apply --expected-address 192.168.10.82 --expected-interface ens33 --expected-hostname ubuntu-2604-test --expected-kernel 7.0.0-28-generic --expected-machine-id 9db3fb717cc74974b2a6b243d67f67b9' \
+  'B82_V6_CONTROLLER_STATE current=PACKAGE_BOUND automatic_apply=0' \
+  'B82_V6_CONTROLLER_STATE from=PACKAGE_BOUND to=BOOTSTRAP_ONLY automatic_apply=0' \
+  'B82_V6_CONTROLLER_BRANCH missing_set=none next_state=POSTFLIGHT' \
+  'B82_V6_CONTROLLER_BRANCH missing_set=initial|iperf3 next_state=AWAIT_APPLY' \
+  'B82_V6_CONTROLLER_STATE from=AWAIT_APPLY to=PROVISION_APPLY explicit_mode=provision-apply automatic_apply=0' \
   'operation=stage-snapshot transport=ssh credential_read=0 network_operations=0' \
   '/bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh snapshot --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1' \
   '/bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh plan --manifest /run/wg-mix-ebpf-source-bootstrap-c8e41d73/package-manifest.v1' \
@@ -193,6 +220,9 @@ done
 [[ "${CONTROLLER_PLAN}" != *'B82_V6_MATRIX_BLOCKED'* ]] || fail 'bound plan was blocked'
 [[ "${CONTROLLER_PLAN}" != *'/bin/bash -p /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/prepare-stage-root.sh'* ]] ||
   fail 'controller plan executes user-writable package stager'
+[[ "${CONTROLLER_PLAN}" != *'/bin/bash -p /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/provision-ubuntu-test-host.sh'* ]] ||
+  fail 'controller plan executes user-writable package provisioner'
+[[ "${CONTROLLER_PLAN}" != *'/usr/sbin/bpftool version'* ]] || fail 'legacy bpftool probe survived'
 [[ "${CONTROLLER_PLAN}" != *'prepare-stage-root.sh plan --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1'* ]] ||
   fail 'controller stage plan reopens the user-owned manifest'
 [[ "${CONTROLLER_PLAN}" != *'prepare-stage-root.sh run --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1'* ]] ||
@@ -203,10 +233,20 @@ require_ordered_literals "${CONTROLLER_PLAN}" \
   'operation=bootstrap-create ' \
   'operation=bootstrap-root-readlink ' \
   'operation=bootstrap-root-stat ' \
+  'operation=bootstrap-install-provisioner ' \
   'operation=bootstrap-install-stager ' \
+  'operation=bootstrap-provisioner-readlink ' \
+  'operation=bootstrap-provisioner-stat ' \
+  'operation=bootstrap-provisioner-sha ' \
+  'operation=provision-check ' \
+  'operation=bootstrap-provisioner-readlink ' \
+  'operation=bootstrap-provisioner-stat ' \
+  'operation=bootstrap-provisioner-sha ' \
+  'operation=provision-apply ' \
+  'operation=identity-driver ' \
   'operation=bootstrap-stager-readlink ' \
-  'operation=bootstrap-stager-sha ' \
   'operation=bootstrap-stager-stat ' \
+  'operation=bootstrap-stager-sha ' \
   'operation=stage-snapshot ' \
   'operation=stage-plan ' \
   'operation=stage-run '
@@ -376,6 +416,7 @@ ABSENT_PLAN="$(/bin/bash "${FIXTURE_REVIEW}/controller.sh" plan "${ABSENT_CONTRO
 expect_failure absent-matrix-run /bin/bash "${FIXTURE_REVIEW}/controller.sh" run "${ABSENT_CONTROLLER_ARGS[@]}"
 
 printf '%s\n' \
-  'hermetic v6 full-history binder, root-owned bootstrap, SSH/SCP/Expect plan,' \
+  'hermetic v6 full-history binder, explicit toolchain state machine, root-owned bootstrap,' \
+  'SSH/SCP/Expect fixed check/apply plans, provision output policy,' \
   'immutable-intake/shallow/failure paths and WireGuard absence: PASS'
 printf 'RETAINED_HERMETIC_ROOT path=%s reason=auditable-no-cleanup-test-policy\n' "${TEST_ROOT}"

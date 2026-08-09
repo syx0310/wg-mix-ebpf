@@ -68,6 +68,11 @@ type fakeExperimentalSlowPath struct {
 	closes         int
 	closeLog       *[]string
 	lifecycleTrace *[]string
+	// closeRelease models ControllerRuntime.Close waiting for an admitted raw
+	// writer before the outer runtime may detach any dataplane owner.
+	closeStarted   chan struct{}
+	closeRelease   <-chan struct{}
+	closeStartOnce sync.Once
 }
 
 func (slowPath *fakeExperimentalSlowPath) Run(context.Context) error {
@@ -93,6 +98,12 @@ func (slowPath *fakeExperimentalSlowPath) Close() error {
 	}
 	if slowPath.lifecycleTrace != nil {
 		*slowPath.lifecycleTrace = append(*slowPath.lifecycleTrace, "slow-close")
+	}
+	if slowPath.closeStarted != nil {
+		slowPath.closeStartOnce.Do(func() { close(slowPath.closeStarted) })
+	}
+	if slowPath.closeRelease != nil {
+		<-slowPath.closeRelease
 	}
 	return slowPath.closeErr
 }
@@ -236,19 +247,24 @@ type runtimeTestFixture struct {
 }
 
 type fakeExperimentalCoreStage struct {
-	trace         *[]string
-	commitErr     error
-	deactivateErr error
-	closeErr      error
-	commits       int
-	deactivates   int
-	closes        int
-	active        bool
+	trace             *[]string
+	commitErr         error
+	deactivateErr     error
+	closeErr          error
+	commits           int
+	deactivates       int
+	closes            int
+	active            bool
+	deactivateStarted chan struct{}
+	deactivateOnce    sync.Once
 }
 
 func (stage *fakeExperimentalCoreStage) Deactivate() error {
 	if !stage.active {
 		return nil
+	}
+	if stage.deactivateStarted != nil {
+		stage.deactivateOnce.Do(func() { close(stage.deactivateStarted) })
 	}
 	stage.deactivates++
 	*stage.trace = append(*stage.trace, "core-deactivate")
@@ -312,6 +328,7 @@ func newRuntimeTestFixture(t *testing.T) *runtimeTestFixture {
 	}
 	addMap(fakeTCPSessionMapName, dummyMap)
 	addMap(fakeTCPEventsMapName, dummyMap)
+	addMap(fakeTCPStatsMapName, dummyMap)
 	addMap(fakeTCPEgressProgramArrayMapName, dummyMap)
 	addMap(fakeTCPRuntimeIDMapName, dummyMap)
 	addMap(fakeTCPCaptureSeqMapName, dummyMap)
@@ -324,6 +341,7 @@ func newRuntimeTestFixture(t *testing.T) *runtimeTestFixture {
 	}
 	fixture.mapResources[fakeTCPRuntimeIDMapName].bpfMap = &ebpf.Map{}
 	fixture.mapResources[fakeTCPCaptureSeqMapName].bpfMap = &ebpf.Map{}
+	fixture.mapResources[fakeTCPStatsMapName].bpfMap = &ebpf.Map{}
 	collectionMaps := make(map[string]experimentalMapResource, len(fixture.mapResources))
 	for name, resource := range fixture.mapResources {
 		collectionMaps[name] = resource
@@ -386,9 +404,13 @@ func runtimeTestEngineOptions(generation uint64) faketcp.Options {
 func (fixture *runtimeTestFixture) slowPathFactory(
 	engine *faketcp.Engine,
 	eventsMap *ebpf.Map,
+	statsMap *ebpf.Map,
 ) (experimentalSlowPath, error) {
 	if eventsMap != fixture.eventSource.bpfMap {
 		return nil, errors.New("slow-path factory received unrelated events map")
+	}
+	if statsMap != fixture.mapResources[fakeTCPStatsMapName].bpfMap {
+		return nil, errors.New("slow-path factory received unrelated stats map")
 	}
 	fixture.slowPath.engine = engine
 	return fixture.slowPath, nil
@@ -465,12 +487,11 @@ func (fixture *runtimeTestFixture) buildOptions(
 			commit func() error,
 		) (experimentalTCStageOwner, error) {
 			fixture.activationTrace = append(fixture.activationTrace, "tc-stage")
-			if err := commit(); err != nil {
-				fixture.activationTrace = append(fixture.activationTrace, "tc-rollback")
-				return nil, err
-			}
 			stage := &fakeExperimentalTCStage{trace: &fixture.activationTrace}
 			fixture.lastTCStage = stage
+			if err := commit(); err != nil {
+				return stage, err
+			}
 			return stage, nil
 		},
 	}
@@ -691,15 +712,140 @@ func TestExperimentalRuntimeCloseBlocksReachabilityBeforeDependentTeardown(t *te
 	}
 	got := fixture.activationTrace[closeStart:]
 	want := []string{
+		"slow-close",
 		"core-deactivate",
 		"xdp-close",
 		"xdp-close",
 		"tc-close",
-		"slow-close",
 		"core-close",
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("runtime dependency close order = %v, want %v", got, want)
+	}
+}
+
+func TestExperimentalRuntimeCloseWaitsForBlockedSlowPathWriterFence(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	slowCloseStarted := make(chan struct{})
+	slowCloseRelease := make(chan struct{})
+	fixture.slowPath.closeStarted = slowCloseStarted
+	fixture.slowPath.closeRelease = slowCloseRelease
+	runtime, _, err := fixture.build(t, 91)
+	if err != nil {
+		t.Fatal(err)
+	}
+	deactivateStarted := make(chan struct{})
+	fixture.lastCoreStage.deactivateStarted = deactivateStarted
+	closeStart := len(fixture.activationTrace)
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- runtime.Close() }()
+	select {
+	case <-slowCloseStarted:
+	case <-time.After(time.Second):
+		t.Fatal("runtime Close did not enter the slow-path writer fence")
+	}
+	select {
+	case <-deactivateStarted:
+		t.Fatal("baseline core deactivated while the slow-path writer was still admitted")
+	case err := <-closeDone:
+		t.Fatalf("runtime Close returned before the slow-path writer fence: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	close(slowCloseRelease)
+	if err := <-closeDone; err != nil {
+		t.Fatal(err)
+	}
+	want := []string{
+		"slow-close",
+		"core-deactivate",
+		"xdp-close",
+		"xdp-close",
+		"tc-close",
+		"core-close",
+	}
+	if got := fixture.activationTrace[closeStart:]; !slices.Equal(got, want) {
+		t.Fatalf("blocked writer teardown order = %v, want %v", got, want)
+	}
+}
+
+func TestExperimentalRuntimeSlowPathCloseFailureRetainsDataplaneForExactRetry(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	wantErr := errors.New("injected slow-path writer close failure")
+	fixture.slowPath.closeErr = wantErr
+	runtime, _, err := fixture.build(t, 91)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownedSlowPath := runtime.state.slowPath
+	ownedCore := runtime.state.core
+	ownedXDP := runtime.state.xdp
+	ownedTC := runtime.state.tc
+	closeStart := len(fixture.activationTrace)
+	if err := runtime.Close(); !errors.Is(err, wantErr) {
+		t.Fatalf("runtime Close error = %v", err)
+	}
+	if runtime.state.closed || runtime.state.slowPath != ownedSlowPath ||
+		runtime.state.core != ownedCore || runtime.state.xdp != ownedXDP ||
+		runtime.state.tc != ownedTC || runtime.state.collection == nil {
+		t.Fatalf(
+			"failed slow-path fence lost ownership closed=%t slow=%#v core=%#v xdp=%#v tc=%#v collection=%#v",
+			runtime.state.closed,
+			runtime.state.slowPath,
+			runtime.state.core,
+			runtime.state.xdp,
+			runtime.state.tc,
+			runtime.state.collection,
+		)
+	}
+	if fixture.lastCoreStage.deactivates != 0 || fixture.lastTCStage.closes != 0 ||
+		fixture.xdpRuntime.links[3].closes != 0 || fixture.xdpRuntime.links[9].closes != 0 {
+		t.Fatalf(
+			"failed slow-path fence reached teardown core=%d tc=%d xdp3=%d xdp9=%d",
+			fixture.lastCoreStage.deactivates,
+			fixture.lastTCStage.closes,
+			fixture.xdpRuntime.links[3].closes,
+			fixture.xdpRuntime.links[9].closes,
+		)
+	}
+	for name, resource := range fixture.mapResources {
+		if resource.closes != 0 {
+			t.Fatalf("failed slow-path fence closed retained map %s %d times", name, resource.closes)
+		}
+	}
+	for name, program := range fixture.programs {
+		if program.closes != 0 {
+			t.Fatalf("failed slow-path fence closed retained program %s %d times", name, program.closes)
+		}
+	}
+	wantPolicy := mustFakeTCPPolicySnapshot(t, 91)
+	assertMemoryPolicyMapMatches(t, fixture.policyMaps.ControlPolicies, wantPolicy.ControlPolicies)
+	assertMemoryPolicyMapMatches(t, fixture.policyMaps.ManagedPorts, wantPolicy.ManagedPorts)
+	assertMemoryPolicyMapMatches(t, fixture.policyMaps.ManagedInterfaces, wantPolicy.ManagedInterfaces)
+	if fixture.sessionClaimArg != fixture.programs[fakeTCPSessionClaimProgramName] {
+		t.Fatal("runtime did not retain the exact session claim program")
+	}
+	if got := fixture.activationTrace[closeStart:]; !slices.Equal(got, []string{"slow-close"}) {
+		t.Fatalf("failed slow-path fence trace = %v", got)
+	}
+
+	fixture.slowPath.closeErr = nil
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("retry exact slow-path owner: %v", err)
+	}
+	want := []string{
+		"slow-close",
+		"slow-close",
+		"core-deactivate",
+		"xdp-close",
+		"xdp-close",
+		"tc-close",
+		"core-close",
+	}
+	if got := fixture.activationTrace[closeStart:]; !slices.Equal(got, want) {
+		t.Fatalf("slow-path retry teardown order = %v, want %v", got, want)
+	}
+	if !runtime.state.closed {
+		t.Fatal("retry did not converge the retained runtime owner")
 	}
 }
 
@@ -724,10 +870,11 @@ func TestExperimentalRuntimeDeactivateFailureStillDetachesXDPAndTC(t *testing.T)
 			fixture.xdpRuntime.links[9].closes,
 		)
 	}
+	slowIndex := slices.Index(fixture.activationTrace, "slow-close")
 	deactivateIndex := slices.Index(fixture.activationTrace, "core-deactivate")
 	xdpIndex := slices.Index(fixture.activationTrace, "xdp-close")
 	tcIndex := slices.Index(fixture.activationTrace, "tc-close")
-	if deactivateIndex < 0 || xdpIndex <= deactivateIndex || tcIndex <= xdpIndex {
+	if slowIndex < 0 || deactivateIndex <= slowIndex || xdpIndex <= deactivateIndex || tcIndex <= xdpIndex {
 		t.Fatalf("deactivate failure dependency order = %v", fixture.activationTrace)
 	}
 	fixture.lastCoreStage.deactivateErr = nil
@@ -1131,7 +1278,7 @@ func TestExperimentalFakeTCPRuntimeReleaseFailureBeforeCommitRollsBack(t *testin
 	xdpIndex := slices.Index(fixture.activationTrace, "xdp-attach")
 	deactivateIndex := slices.Index(fixture.activationTrace, "core-deactivate")
 	xdpCloseIndex := slices.Index(fixture.activationTrace, "xdp-close")
-	tcRollbackIndex := slices.Index(fixture.activationTrace, "tc-rollback")
+	tcCloseIndex := slices.Index(fixture.activationTrace, "tc-close")
 	slowCloseIndex := slices.Index(fixture.activationTrace, "slow-close")
 	policyDeleteIndex := slices.Index(
 		fixture.activationTrace,
@@ -1141,9 +1288,9 @@ func TestExperimentalFakeTCPRuntimeReleaseFailureBeforeCommitRollsBack(t *testin
 	coreCloseIndex := slices.Index(fixture.activationTrace, "core-close")
 	if len(fixture.activationTrace) == 0 || fixture.activationTrace[0] != "seed" ||
 		xdpIndex <= 0 || releaseIndex <= xdpIndex ||
-		deactivateIndex <= releaseIndex || xdpCloseIndex <= deactivateIndex ||
-		tcRollbackIndex <= xdpCloseIndex || slowCloseIndex <= tcRollbackIndex ||
-		policyDeleteIndex <= slowCloseIndex || programDeleteIndex <= policyDeleteIndex ||
+		slowCloseIndex <= releaseIndex || deactivateIndex <= slowCloseIndex ||
+		xdpCloseIndex <= deactivateIndex || tcCloseIndex <= xdpCloseIndex ||
+		policyDeleteIndex <= tcCloseIndex || programDeleteIndex <= policyDeleteIndex ||
 		coreCloseIndex <= programDeleteIndex {
 		t.Fatalf("release failure order = %v", fixture.activationTrace)
 	}
@@ -1158,6 +1305,88 @@ func TestExperimentalFakeTCPRuntimeReleaseFailureBeforeCommitRollsBack(t *testin
 	if fixture.xdpRuntime.links[3].closes != 1 || fixture.xdpRuntime.links[9].closes != 1 {
 		t.Fatalf("XDP closes 3=%d 9=%d",
 			fixture.xdpRuntime.links[3].closes, fixture.xdpRuntime.links[9].closes)
+	}
+}
+
+func TestExperimentalBuildCleanupRetainsDataplaneUntilSlowPathRetry(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+	releaseErr := errors.New("injected pre-commit release failure")
+	slowCloseErr := errors.New("injected failed-build slow-path close failure")
+	fixture.slowPath.closeErr = slowCloseErr
+	options := fixture.buildOptions(transaction)
+	options.commitGeneration = func(
+		_ *faketcp.Engine,
+		claim faketcp.LinuxFreshCollectionClaim,
+		makeReachable func(faketcp.LinuxFreshCollectionRelease) error,
+	) error {
+		return claim.WithExclusiveFreshFakeTCPCollection(func(
+			_, _ *ebpf.Map,
+			_ faketcp.LinuxFreshCollectionRelease,
+		) error {
+			fixture.activationTrace = append(fixture.activationTrace, "seed")
+			return makeReachable(func() error {
+				fixture.activationTrace = append(fixture.activationTrace, "release-failure")
+				return releaseErr
+			})
+		})
+	}
+	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
+	if runtime == nil || !errors.Is(err, releaseErr) || !errors.Is(err, slowCloseErr) {
+		t.Fatalf("failed-build runtime=%#v error=%v", runtime, err)
+	}
+	if runtime.state.failedBuild == nil || runtime.state.closed ||
+		!fixture.lastCoreStage.active || fixture.lastCoreStage.deactivates != 0 ||
+		fixture.lastTCStage.closes != 0 || fixture.xdpRuntime.links[3].closes != 0 ||
+		fixture.xdpRuntime.links[9].closes != 0 {
+		t.Fatalf(
+			"failed cleanup ownership failedBuild=%#v closed=%t coreActive=%t coreDeactivates=%d tc=%d xdp3=%d xdp9=%d",
+			runtime.state.failedBuild,
+			runtime.state.closed,
+			fixture.lastCoreStage.active,
+			fixture.lastCoreStage.deactivates,
+			fixture.lastTCStage.closes,
+			fixture.xdpRuntime.links[3].closes,
+			fixture.xdpRuntime.links[9].closes,
+		)
+	}
+	releaseIndex := slices.Index(fixture.activationTrace, "release-failure")
+	if releaseIndex < 0 || !slices.Equal(
+		fixture.activationTrace[releaseIndex+1:],
+		[]string{"slow-close"},
+	) {
+		t.Fatalf("failed cleanup crossed the slow-path fence: %v", fixture.activationTrace)
+	}
+	for name, resource := range fixture.mapResources {
+		if resource.closes != 0 {
+			t.Fatalf("failed slow-path cleanup reached map %s close=%d", name, resource.closes)
+		}
+	}
+
+	fixture.slowPath.closeErr = nil
+	retryStart := len(fixture.activationTrace)
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("retry failed-build owner: %v", err)
+	}
+	wantRetryPrefix := []string{
+		"slow-close",
+		"core-deactivate",
+		"xdp-close",
+		"xdp-close",
+		"tc-close",
+	}
+	retryTrace := fixture.activationTrace[retryStart:]
+	if len(retryTrace) < len(wantRetryPrefix) ||
+		!slices.Equal(retryTrace[:len(wantRetryPrefix)], wantRetryPrefix) {
+		t.Fatalf("failed-build retry teardown order = %v", retryTrace)
+	}
+	if !runtime.state.closed || runtime.state.failedBuild != nil || !transaction.isClosed() {
+		t.Fatalf(
+			"failed-build retry closed=%t retained=%#v transactionClosed=%t",
+			runtime.state.closed,
+			runtime.state.failedBuild,
+			transaction.isClosed(),
+		)
 	}
 }
 
@@ -2015,7 +2244,7 @@ func TestExperimentalSlowPathConstructionFailureQuarantinesPartialOwner(t *testi
 	closeErr := errors.New("injected partial slow-path close failure")
 	fixture.slowPath.closeErr = closeErr
 	options := fixture.buildOptions(transaction)
-	options.slowPathFactory = func(*faketcp.Engine, *ebpf.Map) (experimentalSlowPath, error) {
+	options.slowPathFactory = func(*faketcp.Engine, *ebpf.Map, *ebpf.Map) (experimentalSlowPath, error) {
 		return fixture.slowPath, factoryErr
 	}
 	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
@@ -2048,7 +2277,7 @@ func TestExperimentalSlowPathTypedNilFailsClosed(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
 	options := fixture.buildOptions(transaction)
-	options.slowPathFactory = func(*faketcp.Engine, *ebpf.Map) (experimentalSlowPath, error) {
+	options.slowPathFactory = func(*faketcp.Engine, *ebpf.Map, *ebpf.Map) (experimentalSlowPath, error) {
 		var typedNil *fakeExperimentalSlowPath
 		return typedNil, nil
 	}
