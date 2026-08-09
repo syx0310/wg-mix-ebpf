@@ -5,7 +5,6 @@ import (
 	"errors"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/runtime"
@@ -331,74 +330,6 @@ profiles:
 	}
 }
 
-func TestBuildStateFakeTCPIsIPv4OnlyAndKeepsCipher(t *testing.T) {
-	cfg, err := config.Load([]byte(`
-version: 1
-underlays:
-  - name: eth0
-    type: netdev
-wireguards:
-  - name: wg0
-    config: /tmp/wg0.conf
-    profile: mix-default
-    cipher: xor-home
-    transport:
-      mode: faketcp
-      faketcp:
-        experimental: true
-profiles:
-  mix-default:
-    preset: wireguard-mix-wire-values-v1
-ciphers:
-  xor-home:
-    mode: xor
-    secret: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	mark := uint32(0x10000002)
-	state, err := BuildState(
-		context.Background(),
-		cfg,
-		runtime.StaticProvider{Devices: map[string]*runtime.Device{
-			"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: mark, Up: true},
-		}},
-		underlay.StaticResolver{Underlays: map[string]*underlay.Resolved{
-			"eth0": {IfName: "eth0", IfIndex: 2, LinkType: "ethernet", Role: "transform"},
-		}},
-		func(string) (*wgconfig.Interface, error) {
-			return &wgconfig.Interface{FwMark: &mark}, nil
-		},
-		BuildOptions{},
-	)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if len(state.EgressRules) != 1 || len(state.IngressListeners) != 1 {
-		t.Fatalf("faketcp rules = egress %d ingress %d", len(state.EgressRules), len(state.IngressListeners))
-	}
-	egress := state.EgressRules[0]
-	ingress := state.IngressListeners[0]
-	if egress.Family != "ipv4" || ingress.Family != "ipv4" ||
-		egress.TransportMode != "faketcp" || ingress.TransportMode != "faketcp" {
-		t.Fatalf("faketcp rules = %#v %#v", egress, ingress)
-	}
-	if egress.CipherID == 0 || ingress.CipherID != egress.CipherID {
-		t.Fatalf("faketcp cipher IDs = egress %d ingress %d", egress.CipherID, ingress.CipherID)
-	}
-	wg := state.WireGuards[0]
-	if !wg.FakeTCPExperimental || wg.FakeTCPChecksumMode != config.FakeTCPChecksumModePartialCompleteReset ||
-		wg.FakeTCPIngressMode != "xdp-required" || wg.FakeTCPSessionCapacity != 4096 ||
-		wg.FakeTCPMaxHalfOpenSessions != 1024 || wg.FakeTCPMaxHalfOpenPerSource != 16 ||
-		wg.FakeTCPSYNRateIntervalNanos != int64(100*time.Millisecond) ||
-		wg.FakeTCPSYNBurst != 256 || wg.FakeTCPSYNBurstPerSource != 8 ||
-		wg.FakeTCPSYNSourceLedgerCapacity != 4096 ||
-		wg.FakeTCPSYNSourceLedgerTTLNanos != int64(5*time.Minute) {
-		t.Fatalf("faketcp state = %#v", wg)
-	}
-}
-
 func TestBuildStateICMPServerUsesWildcardRequestID(t *testing.T) {
 	cfg, err := config.Load([]byte(`
 version: 1
@@ -492,48 +423,6 @@ profiles:
 	}
 	if state.Underlays[0].Parser != "l3" {
 		t.Fatalf("underlay parser = %q", state.Underlays[0].Parser)
-	}
-}
-
-func TestBuildStateRejectsFakeTCPOnL3ParserBeforeAttachment(t *testing.T) {
-	cfg, err := config.Load([]byte(`
-version: 1
-underlays:
-  - name: pppoe-wan
-    type: netdev
-    parser: l3
-wireguards:
-  - name: wg0
-    config: /tmp/wg0.conf
-    profile: mix-default
-    transport:
-      mode: faketcp
-      faketcp:
-        experimental: true
-profiles:
-  mix-default:
-    preset: wireguard-mix-wire-values-v1
-`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	mark := uint32(0x10000002)
-	_, err = BuildState(
-		context.Background(),
-		cfg,
-		runtime.StaticProvider{Devices: map[string]*runtime.Device{
-			"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: mark, Up: true},
-		}},
-		underlay.StaticResolver{Underlays: map[string]*underlay.Resolved{
-			"pppoe-wan": {IfName: "pppoe-wan", IfIndex: 7, LinkType: "device", Role: "transform"},
-		}},
-		func(string) (*wgconfig.Interface, error) {
-			return &wgconfig.Interface{FwMark: &mark}, nil
-		},
-		BuildOptions{},
-	)
-	if err == nil || !strings.Contains(err.Error(), "parser:l3") {
-		t.Fatalf("FakeTCP parser:l3 error = %v", err)
 	}
 }
 

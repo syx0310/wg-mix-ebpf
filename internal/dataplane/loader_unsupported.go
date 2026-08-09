@@ -37,7 +37,3 @@ func LoadObjectTest(context.Context, string) error {
 func LoadObjectTestIdentity(context.Context, string) (ObjectIdentity, error) {
 	return ObjectIdentity{}, ErrUnsupported
 }
-
-func LoadExperimentalFakeTCPObjectTestIdentity(context.Context, string) (ObjectIdentity, error) {
-	return ObjectIdentity{}, ErrUnsupported
-}

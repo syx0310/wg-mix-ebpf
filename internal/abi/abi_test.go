@@ -11,7 +11,7 @@ import (
 
 func TestABIVersion(t *testing.T) {
 	if Version != 10 {
-		t.Fatalf("ABI version = %d, want backward-compatible 10", Version)
+		t.Fatalf("ABI version = %d, want 10", Version)
 	}
 }
 
@@ -50,19 +50,6 @@ func TestStructSizesAreStable(t *testing.T) {
 		{"IngressListenerValue", unsafe.Sizeof(IngressListenerValue{}), 24},
 		{"ICMPListenerKey", unsafe.Sizeof(ICMPListenerKey{}), 16},
 		{"ICMPListenerValue", unsafe.Sizeof(ICMPListenerValue{}), 24},
-		{"FakeTCPSessionKey", unsafe.Sizeof(FakeTCPSessionKey{}), 24},
-		{"FakeTCPSessionValue", unsafe.Sizeof(FakeTCPSessionValue{}), 40},
-		{"FakeTCPManagedIfKey", unsafe.Sizeof(FakeTCPManagedIfKey{}), 16},
-		{"FakeTCPManagedIfValue", unsafe.Sizeof(FakeTCPManagedIfValue{}), 8},
-		{"FakeTCPManagedPortKey", unsafe.Sizeof(FakeTCPManagedPortKey{}), 16},
-		{"FakeTCPManagedPortValue", unsafe.Sizeof(FakeTCPManagedPortValue{}), 16},
-		{"FakeTCPControlPolicyKey", unsafe.Sizeof(FakeTCPControlPolicyKey{}), 16},
-		{"FakeTCPControlPolicyValue", unsafe.Sizeof(FakeTCPControlPolicyValue{}), 32},
-		{"FakeTCPControlFlowKey", unsafe.Sizeof(FakeTCPControlFlowKey{}), 32},
-		{"FakeTCPControlFlowValue", unsafe.Sizeof(FakeTCPControlFlowValue{}), 16},
-		{"FakeTCPRuntimeIdentityValue", unsafe.Sizeof(FakeTCPRuntimeIdentityValue{}), 32},
-		{"FakeTCPEvent", unsafe.Sizeof(FakeTCPEvent{}), FakeTCPEventSize},
-		{"FakeTCPPacketEvent", unsafe.Sizeof(FakeTCPPacketEvent{}), FakeTCPPacketEventSize},
 	}
 	for _, check := range checks {
 		if check.got != check.want {
@@ -74,81 +61,6 @@ func TestStructSizesAreStable(t *testing.T) {
 	}
 	if got, want := unsafe.Offsetof(CipherValue{}.Mode), uintptr(280); got != want {
 		t.Fatalf("CipherValue.Mode offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPManagedIfKey{}.UnderlayIndex), uintptr(8); got != want {
-		t.Fatalf("FakeTCPManagedIfKey.UnderlayIndex offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Generation), uintptr(0); got != want {
-		t.Fatalf("FakeTCPSessionValue.Generation offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.LastSeenNanos), uintptr(8); got != want {
-		t.Fatalf("FakeTCPSessionValue.LastSeenNanos offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.TXSequence), uintptr(16); got != want {
-		t.Fatalf("FakeTCPSessionValue.TXSequence offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.RXSequence), uintptr(20); got != want {
-		t.Fatalf("FakeTCPSessionValue.RXSequence offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.LocalISN), uintptr(24); got != want {
-		t.Fatalf("FakeTCPSessionValue.LocalISN offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.RemoteISN), uintptr(28); got != want {
-		t.Fatalf("FakeTCPSessionValue.RemoteISN offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Window), uintptr(32); got != want {
-		t.Fatalf("FakeTCPSessionValue.Window offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPEvent{}.RuntimeIncarnation), uintptr(32); got != want {
-		t.Fatalf("FakeTCPEvent.RuntimeIncarnation offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPEvent{}.CaptureSequence), uintptr(48); got != want {
-		t.Fatalf("FakeTCPEvent.CaptureSequence offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPEvent{}.CaptureCPU), uintptr(56); got != want {
-		t.Fatalf("FakeTCPEvent.CaptureCPU offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPEvent{}.EventABIVersion), uintptr(82); got != want {
-		t.Fatalf("FakeTCPEvent.EventABIVersion offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.State), uintptr(34); got != want {
-		t.Fatalf("FakeTCPSessionValue.State offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Flags), uintptr(35); got != want {
-		t.Fatalf("FakeTCPSessionValue.Flags offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Reserved), uintptr(36); got != want {
-		t.Fatalf("FakeTCPSessionValue.Reserved offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPManagedPortKey{}.DestinationPort), uintptr(12); got != want {
-		t.Fatalf("FakeTCPManagedPortKey.DestinationPort offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPManagedPortValue{}.Generation), uintptr(0); got != want {
-		t.Fatalf("FakeTCPManagedPortValue.Generation offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPManagedPortValue{}.WGID), uintptr(8); got != want {
-		t.Fatalf("FakeTCPManagedPortValue.WGID offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPManagedPortValue{}.Action), uintptr(12); got != want {
-		t.Fatalf("FakeTCPManagedPortValue.Action offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPManagedPortValue{}.Reserved), uintptr(13); got != want {
-		t.Fatalf("FakeTCPManagedPortValue.Reserved offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPControlPolicyValue{}.Generation), uintptr(0); got != want {
-		t.Fatalf("FakeTCPControlPolicyValue.Generation offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPControlPolicyValue{}.VirtualTimeNanos), uintptr(8); got != want {
-		t.Fatalf("FakeTCPControlPolicyValue.VirtualTimeNanos offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPControlPolicyValue{}.IntervalNanos), uintptr(16); got != want {
-		t.Fatalf("FakeTCPControlPolicyValue.IntervalNanos offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPControlPolicyValue{}.Burst), uintptr(24); got != want {
-		t.Fatalf("FakeTCPControlPolicyValue.Burst offset = %d, want %d", got, want)
-	}
-	if got, want := unsafe.Offsetof(FakeTCPControlPolicyValue{}.Reserved), uintptr(28); got != want {
-		t.Fatalf("FakeTCPControlPolicyValue.Reserved offset = %d, want %d", got, want)
 	}
 }
 
@@ -188,7 +100,7 @@ func TestFromState(t *testing.T) {
 		},
 		IngressListeners: []control.IngressListener{
 			{Generation: 7, Family: "ipv4", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, WGID: 1, Action: "drop"},
-			{Generation: 7, Family: "ipv6", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, CipherID: 1, WGID: 1, Action: "rewrite", TransportMode: "faketcp"},
+			{Generation: 7, Family: "ipv6", DestinationPort: 31001, UnderlayIfIndex: 2, ProfileID: 1, CipherID: 1, WGID: 1, Action: "rewrite"},
 		},
 		ICMPListeners: []control.ICMPListener{
 			{Generation: 7, Family: "ipv4", UnderlayIfIndex: 2, ICMPType: 0, ICMPID: 0x5303, ListenPort: 31001, ProfileID: 1, WGID: 1, Action: "rewrite", Role: "client"},
@@ -223,7 +135,7 @@ func TestFromState(t *testing.T) {
 	if snapshot.IngressListeners[IngressListenerKey{Generation: 7, UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv4}].Action != ActionDrop {
 		t.Fatal("missing ingress drop rule")
 	}
-	if ingress := snapshot.IngressListeners[IngressListenerKey{Generation: 7, UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv6}]; ingress.Action != ActionRewrite || ingress.CipherID != 1 || ingress.TransportMode != TransportFakeTCP {
+	if ingress := snapshot.IngressListeners[IngressListenerKey{Generation: 7, UnderlayIndex: 2, DestinationPort: 31001, Family: FamilyIPv6}]; ingress.Action != ActionRewrite || ingress.CipherID != 1 {
 		t.Fatal("missing ingress rewrite rule")
 	}
 	icmp := snapshot.ICMPListeners[ICMPListenerKey{Generation: 7, UnderlayIndex: 2, ICMPID: 0x5303, Family: FamilyIPv4, ICMPType: 0}]

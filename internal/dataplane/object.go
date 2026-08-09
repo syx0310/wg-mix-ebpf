@@ -22,15 +22,7 @@ type ObjectIdentity struct {
 }
 
 func loadCollectionSpec(objectPath string) (*ebpf.CollectionSpec, ObjectIdentity, error) {
-	return loadCollectionSpecFromResolvedPath(objectPathFromEnv(objectPath))
-}
-
-// loadCollectionSpecFromResolvedPath does not consult the environment. An
-// empty path selects the embedded object; a non-empty path is used exactly as
-// supplied. Production coordinator handles use this after freezing their
-// effective object source so scope validation and the eventual read cannot
-// silently select different objects through a later environment lookup.
-func loadCollectionSpecFromResolvedPath(path string) (*ebpf.CollectionSpec, ObjectIdentity, error) {
+	path := objectPathFromEnv(objectPath)
 	if path != "" {
 		object, err := os.ReadFile(path)
 		if err != nil {

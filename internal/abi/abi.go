@@ -24,9 +24,8 @@ const (
 	ParserEthernet uint8 = 1
 	ParserL3       uint8 = 2
 
-	TransportUDP     uint8 = 0
-	TransportICMP    uint8 = 1
-	TransportFakeTCP uint8 = 2
+	TransportUDP  uint8 = 0
+	TransportICMP uint8 = 1
 
 	ICMPRoleNone   uint8 = 0
 	ICMPRoleClient uint8 = 1
@@ -36,24 +35,6 @@ const (
 
 	CipherModeNone uint8 = 0
 	CipherModeXOR  uint8 = 1
-
-	FakeTCPStateIdle        uint8 = 0
-	FakeTCPStateSynSent     uint8 = 1
-	FakeTCPStateSynReceived uint8 = 2
-	FakeTCPStateEstablished uint8 = 3
-	FakeTCPStateClosing     uint8 = 4
-
-	FakeTCPEventNeedHandshake uint8 = 1
-	FakeTCPEventSYN           uint8 = 2
-	FakeTCPEventSYNACK        uint8 = 3
-	FakeTCPEventACK           uint8 = 4
-	FakeTCPEventRST           uint8 = 5
-	FakeTCPEventFIN           uint8 = 6
-
-	FakeTCPEventABIVersion   uint16 = 1
-	FakeTCPEventSize                = 88
-	FakeTCPMaxCapturedPacket        = 2304
-	FakeTCPPacketEventSize          = FakeTCPEventSize + FakeTCPMaxCapturedPacket
 )
 
 type ControlKey uint32
@@ -184,151 +165,15 @@ type IngressListenerKey struct {
 }
 
 type IngressListenerValue struct {
-	Generation    uint64
-	ProfileID     uint32
-	WGID          uint32
-	CipherID      uint32
-	Action        uint8
-	TransportMode uint8
-	_             [2]byte
+	Generation uint64
+	ProfileID  uint32
+	WGID       uint32
+	CipherID   uint32
+	Action     uint8
+	_          [3]byte
 }
 
 func (v IngressListenerValue) MapGeneration() uint64 { return v.Generation }
-
-// FakeTCPSessionKey is local-endpoint oriented in both directions: egress
-// fills Local from the IPv4 source, while XDP ingress fills Local from the
-// destination. IPv4 fields are raw __be32 bytes represented as native Go
-// uint32 values; callers must use faketcp.RawIPv4BE32 rather than numeric
-// big-endian parsing. This gives the daemon and both BPF hooks one stable key.
-type FakeTCPSessionKey struct {
-	Generation    uint64
-	LocalIPv4     uint32
-	RemoteIPv4    uint32
-	UnderlayIndex uint32
-	LocalPort     uint16
-	RemotePort    uint16
-}
-
-type FakeTCPSessionValue struct {
-	Generation    uint64
-	LastSeenNanos uint64
-	TXSequence    uint32
-	RXSequence    uint32
-	LocalISN      uint32
-	RemoteISN     uint32
-	Window        uint16
-	State         uint8
-	Flags         uint8
-	Reserved      [4]byte // Must stay zero; maps exactly to the C ABI pad bytes.
-}
-
-func (v FakeTCPSessionValue) MapGeneration() uint64 { return v.Generation }
-
-// FakeTCPManagedIfKey and FakeTCPManagedIfValue are the experimental XDP
-// reachability latch. They intentionally remain outside Snapshot and the
-// canonical ABI-v10 pinned map set: the experimental collection owns their
-// unpinned maps independently.
-type FakeTCPManagedIfKey struct {
-	Generation    uint64
-	UnderlayIndex uint32
-	_             uint32
-}
-
-type FakeTCPManagedIfValue struct {
-	Generation uint64
-}
-
-func (v FakeTCPManagedIfValue) MapGeneration() uint64 { return v.Generation }
-
-// FakeTCPManagedPortKey and FakeTCPManagedPortValue are an exact per-interface
-// projection of managed FakeTCP listeners for the experimental XDP parser.
-type FakeTCPManagedPortKey struct {
-	Generation      uint64
-	UnderlayIndex   uint32
-	DestinationPort uint16
-	_               uint16
-}
-
-type FakeTCPManagedPortValue struct {
-	Generation uint64
-	WGID       uint32
-	Action     uint8
-	Reserved   [3]byte // Must stay zero; maps exactly to the C ABI pad bytes.
-}
-
-func (v FakeTCPManagedPortValue) MapGeneration() uint64 { return v.Generation }
-
-// FakeTCPControlPolicyKey isolates BPF control-event admission state by both
-// staged generation and managed WireGuard policy. The experimental object is
-// deliberately unpinned and remains outside the canonical ABI-v10 map set.
-type FakeTCPControlPolicyKey struct {
-	Generation uint64
-	WGID       uint32
-	_          uint32
-}
-
-// VirtualTimeNanos is a BPF-owned GCRA cursor. Policy population must create
-// each value with a zero cursor; the BPF path then starts with zero immediately
-// available events and accrues at IntervalNanos up to Burst.
-type FakeTCPControlPolicyValue struct {
-	Generation       uint64
-	VirtualTimeNanos uint64
-	IntervalNanos    uint64
-	Burst            uint32
-	Reserved         uint32 // Must stay zero; maps exactly to the C ABI pad field.
-}
-
-func (v FakeTCPControlPolicyValue) MapGeneration() uint64 { return v.Generation }
-
-type FakeTCPControlFlowKey struct {
-	Session   FakeTCPSessionKey
-	WGID      uint32
-	EventType uint8
-	_         [3]byte
-}
-
-type FakeTCPControlFlowValue struct {
-	Generation     uint64
-	LastEventNanos uint64
-}
-
-func (v FakeTCPControlFlowValue) MapGeneration() uint64 { return v.Generation }
-
-// FakeTCPRuntimeIdentityValue must be written before the experimental BPF
-// programs become reachable. Incarnation is unique for one Engine lifetime;
-// a zero/mismatched value makes every event fail closed.
-type FakeTCPRuntimeIdentityValue struct {
-	Generation      uint64
-	Incarnation     [16]byte
-	EventABIVersion uint16
-	_               [6]byte
-}
-
-type FakeTCPEvent struct {
-	Key                FakeTCPSessionKey
-	TimestampNanos     uint64
-	RuntimeIncarnation [16]byte
-	CaptureSequence    uint64
-	CaptureCPU         uint32
-	Sequence           uint32
-	Acknowledgement    uint32
-	PayloadLength      uint32
-	FWMark             uint32
-	WGID               uint32
-	PacketLength       uint16
-	EventABIVersion    uint16
-	Type               uint8
-	TCPFlags           uint8
-	_                  [2]byte
-}
-
-// FakeTCPPacketEvent carries the exact pre-transform IPv4 packet for the
-// bounded userspace first-packet queue. Consumers must use PacketLength and
-// ignore the unused tail of Packet.
-type FakeTCPPacketEvent struct {
-	Event  FakeTCPEvent
-	Packet [FakeTCPMaxCapturedPacket]byte
-}
 
 type ICMPListenerKey struct {
 	Generation    uint64
@@ -524,22 +369,17 @@ func FromStateWithGeneration(state *control.State, generation uint64) (*Snapshot
 		if err != nil {
 			return nil, err
 		}
-		transport, err := parseTransport(r.TransportMode)
-		if err != nil {
-			return nil, err
-		}
 		out.IngressListeners[IngressListenerKey{
 			Generation:      generation,
 			UnderlayIndex:   uint32(r.UnderlayIfIndex),
 			DestinationPort: r.DestinationPort,
 			Family:          family,
 		}] = IngressListenerValue{
-			Generation:    generation,
-			ProfileID:     r.ProfileID,
-			WGID:          r.WGID,
-			CipherID:      r.CipherID,
-			Action:        action,
-			TransportMode: transport,
+			Generation: generation,
+			ProfileID:  r.ProfileID,
+			WGID:       r.WGID,
+			CipherID:   r.CipherID,
+			Action:     action,
 		}
 	}
 	for _, r := range state.ICMPListeners {
@@ -630,8 +470,6 @@ func parseTransport(value string) (uint8, error) {
 		return TransportUDP, nil
 	case "icmp":
 		return TransportICMP, nil
-	case "faketcp":
-		return TransportFakeTCP, nil
 	default:
 		return 0, fmt.Errorf("unsupported transport mode %q", value)
 	}

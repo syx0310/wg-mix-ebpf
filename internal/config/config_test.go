@@ -6,7 +6,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestLoadAppliesDefaults(t *testing.T) {
@@ -298,70 +297,7 @@ profiles:
 	}
 }
 
-func TestAcceptExplicitExperimentalFakeTCPTransportWithXOR(t *testing.T) {
-	cfg, err := Load([]byte(`
-version: 1
-underlays:
-  - name: eth0
-    type: netdev
-wireguards:
-  - name: wg0
-    profile: mix-default
-    cipher: xor-home
-    transport:
-      mode: faketcp
-      faketcp:
-        experimental: true
-profiles:
-  mix-default:
-    preset: wireguard-mix-wire-values-v1
-ciphers:
-  xor-home:
-    mode: xor
-    secret: "base64:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
-`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	fake := cfg.WireGuards[0].Transport.FakeTCP
-	if fake.ChecksumMode != FakeTCPChecksumModePartialCompleteReset || fake.IngressMode != "xdp-required" {
-		t.Fatalf("faketcp capability defaults = checksum %q ingress %q", fake.ChecksumMode, fake.IngressMode)
-	}
-	if fake.SessionCapacity != 4096 || fake.MaxHalfOpenSessions != 1024 ||
-		fake.MaxHalfOpenPerSource != 16 || fake.SYNRateInterval.Duration != 100*time.Millisecond ||
-		fake.SYNBurst != 256 || fake.SYNBurstPerSource != 8 ||
-		fake.SYNSourceLedgerCapacity != 4096 || fake.SYNSourceLedgerTTL.Duration != 5*time.Minute ||
-		fake.MaxPendingPacketsPerFlow != 1 {
-		t.Fatalf("faketcp bounds = %#v", fake)
-	}
-}
-
-func TestRejectLegacyFakeTCPChecksumOffsetMode(t *testing.T) {
-	_, err := Load([]byte(`
-version: 1
-underlays:
-  - name: eth0
-    type: netdev
-wireguards:
-  - name: wg0
-    profile: mix-default
-    transport:
-      mode: faketcp
-      faketcp:
-        experimental: true
-        checksum_mode: kfunc-required
-profiles:
-  mix-default:
-    preset: wireguard-mix-wire-values-v1
-`))
-	if err == nil || !strings.Contains(err.Error(), "ip_summed identification") ||
-		!strings.Contains(err.Error(), "materialize/complete") ||
-		!strings.Contains(err.Error(), "metadata reset") {
-		t.Fatalf("legacy checksum-offset mode error = %v", err)
-	}
-}
-
-func TestRejectFakeTCPWithoutExperimentalAcknowledgement(t *testing.T) {
+func TestRejectFakeTCPTransport(t *testing.T) {
 	_, err := Load([]byte(`
 version: 1
 underlays:
@@ -376,157 +312,8 @@ profiles:
   mix-default:
     preset: wireguard-mix-wire-values-v1
 `))
-	if err == nil || !strings.Contains(err.Error(), "experimental must be true") {
-		t.Fatalf("expected experimental gate error, got %v", err)
-	}
-}
-
-func TestRejectUnboundedFakeTCPSettings(t *testing.T) {
-	_, err := Load([]byte(`
-version: 1
-underlays:
-  - name: eth0
-    type: netdev
-wireguards:
-  - name: wg0
-    profile: mix-default
-    transport:
-      mode: faketcp
-      faketcp:
-        experimental: true
-        session_capacity: 16385
-profiles:
-  mix-default:
-    preset: wireguard-mix-wire-values-v1
-`))
-	if err == nil || !strings.Contains(err.Error(), "session_capacity") {
-		t.Fatalf("expected bounded session error, got %v", err)
-	}
-}
-
-func TestRejectFakeTCPHalfOpenCapacityThatCanFillEstablishedTable(t *testing.T) {
-	_, err := Load([]byte(`
-version: 1
-underlays:
-  - name: eth0
-    type: netdev
-wireguards:
-  - name: wg0
-    profile: mix-default
-    transport:
-      mode: faketcp
-      faketcp:
-        experimental: true
-        session_capacity: 64
-        max_half_open_sessions: 64
-profiles:
-  mix-default:
-    preset: wireguard-mix-wire-values-v1
-`))
-	if err == nil || !strings.Contains(err.Error(), "max_half_open_sessions") {
-		t.Fatalf("expected established-capacity reservation error, got %v", err)
-	}
-}
-
-func TestRejectAggregateFakeTCPBudgetsForSharedMapAndDaemon(t *testing.T) {
-	tests := []struct {
-		name     string
-		settings string
-		want     string
-	}{
-		{
-			name: "shared established map",
-			settings: `
-        session_capacity: 9000
-        max_half_open_sessions: 1000`,
-			want: "aggregate faketcp session_capacity",
-		},
-		{
-			name: "source ledgers",
-			settings: `
-        syn_source_ledger_capacity: 9000`,
-			want: "aggregate faketcp syn_source_ledger_capacity",
-		},
-		{
-			name: "pending bytes",
-			settings: `
-        max_pending_bytes: 700000`,
-			want: "aggregate faketcp max_pending_bytes",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			yaml := `
-version: 1
-underlays:
-  - name: eth0
-    type: netdev
-wireguards:
-  - name: wg0
-    profile: mix-default
-    transport:
-      mode: faketcp
-      faketcp:
-        experimental: true` + test.settings + `
-  - name: wg1
-    profile: mix-default
-    transport:
-      mode: faketcp
-      faketcp:
-        experimental: true` + test.settings + `
-profiles:
-  mix-default:
-    preset: wireguard-mix-wire-values-v1
-`
-			_, err := Load([]byte(yaml))
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("aggregate budget error=%v, want %q", err, test.want)
-			}
-		})
-	}
-}
-
-func TestFakeTCPPolicyParametersAreOwnedPerWireGuard(t *testing.T) {
-	cfg, err := Load([]byte(`
-version: 1
-underlays:
-  - name: eth0
-    type: netdev
-wireguards:
-  - name: wg0
-    profile: mix-default
-    transport:
-      mode: faketcp
-      faketcp:
-        experimental: true
-        syn_rate_interval: 100ms
-        syn_source_ledger_ttl: 1m
-        handshake_timeout: 2s
-  - name: wg1
-    profile: mix-default
-    transport:
-      mode: faketcp
-      faketcp:
-        experimental: true
-        syn_rate_interval: 250ms
-        syn_source_ledger_ttl: 2m
-        handshake_timeout: 3s
-profiles:
-  mix-default:
-    preset: wireguard-mix-wire-values-v1
-`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	first := cfg.WireGuards[0].Transport.FakeTCP
-	second := cfg.WireGuards[1].Transport.FakeTCP
-	if first.SYNRateInterval.Duration != 100*time.Millisecond ||
-		first.SYNSourceLedgerTTL.Duration != time.Minute ||
-		first.HandshakeTimeout.Duration != 2*time.Second ||
-		second.SYNRateInterval.Duration != 250*time.Millisecond ||
-		second.SYNSourceLedgerTTL.Duration != 2*time.Minute ||
-		second.HandshakeTimeout.Duration != 3*time.Second {
-		t.Fatalf("per-WG FakeTCP policies collapsed: first=%#v second=%#v", first, second)
+	if err == nil {
+		t.Fatal("expected faketcp to be rejected")
 	}
 }
 

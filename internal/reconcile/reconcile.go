@@ -315,12 +315,6 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
-	// FakeTCP activation is gated here, after configuration/state loading but
-	// before even the temporary nft startup guard can mutate the host. Keep the
-	// loader gate as defence in depth, but do not rely on reaching it.
-	if err := dataplane.ValidateFakeTCPActivation(guardState); err != nil {
-		return nil, err
-	}
 	guardExecutor := configuredGuardExecutor(opts)
 	initialGuardPlan := guard.BuildNftPlan(guardState)
 	activeGuardPlan := initialGuardPlan
@@ -536,9 +530,6 @@ func GuardPlan(ctx context.Context, opts Options) (*Result, error) {
 func GuardApply(ctx context.Context, opts Options) (*Result, error) {
 	_, state, err := BuildGuardState(ctx, opts)
 	if err != nil {
-		return nil, err
-	}
-	if err := dataplane.ValidateFakeTCPActivation(state); err != nil {
 		return nil, err
 	}
 	plan := guard.BuildNftPlan(state)

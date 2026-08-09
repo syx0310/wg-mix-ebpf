@@ -28,6 +28,9 @@ import (
 const (
 	ingressFilterName = "wg_mix_ingress"
 	egressFilterName  = "wg_mix_egress"
+	filterPriority    = 49152
+	ingressHandle     = 0x10001
+	egressHandle      = 0x10002
 	xorSegmentCount   = 8
 	pinPathPrefix     = "wg-mix-ebpf"
 	maxPinPathSuffix  = 64
@@ -79,17 +82,15 @@ type pinPathRuntime struct {
 	bootID               func() (string, error)
 	pinProgram           func(uint32, string) error
 	loadPinnedProgram    func(string) (*pinnedProgramObservation, error)
-	exactTCX             exactTCXRuntime
 	beforeOwnerExchange  func()
 	beforePinQuarantine  func(string) error
 	beforePinUnlink      func(string) error
 }
 
 type pinnedProgramObservation struct {
-	fd      int
-	id      uint32
-	program *ebpf.Program
-	close   func() error
+	fd    int
+	id    uint32
+	close func() error
 }
 
 type pinResourceIdentity struct {
@@ -211,7 +212,6 @@ var livePinPathRuntime = pinPathRuntime{
 	bootID:            readLinuxBootID,
 	pinProgram:        pinProgramByID,
 	loadPinnedProgram: loadPinnedProgramObservation,
-	exactTCX:          liveExactTCXRuntime,
 }
 
 var xorTailCallBindings = []struct {
@@ -247,11 +247,10 @@ var xorTailCallBindings = []struct {
 }
 
 type LinuxLoader struct {
-	ObjectPath       string
-	PinPath          string
-	AdoptLegacyPins  bool
-	runtime          *pinPathRuntime
-	objectPathFrozen bool
+	ObjectPath      string
+	PinPath         string
+	AdoptLegacyPins bool
+	runtime         *pinPathRuntime
 }
 
 func NewLoader() Loader {
@@ -259,12 +258,11 @@ func NewLoader() Loader {
 }
 
 func NewLoaderWithOptions(options LoaderOptions) Loader {
-	baseline := LinuxLoader{
+	return LinuxLoader{
 		ObjectPath:      objectPathFromEnv(""),
 		PinPath:         pinPathFromEnv(""),
 		AdoptLegacyPins: options.AdoptLegacyPins,
 	}
-	return newFakeTCPProductionLoader(baseline)
 }
 
 func LoadObjectTest(ctx context.Context, objectPath string) error {
@@ -281,9 +279,6 @@ func LoadObjectTestIdentity(
 	}
 	spec, identity, err := loadCollectionSpec(objectPath)
 	if err != nil {
-		return ObjectIdentity{}, err
-	}
-	if err := validateBaselineLoaderCollectionSpec(spec, identity.Source); err != nil {
 		return ObjectIdentity{}, err
 	}
 	if err := removeMemlockLimit(); err != nil {
@@ -329,26 +324,8 @@ func preflightUnpinnedCollection(spec *ebpf.CollectionSpec, source string) error
 }
 
 func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr error) {
-	if ctx == nil {
-		return errors.New("apply context is nil")
-	}
 	if err := ctx.Err(); err != nil {
 		return err
-	}
-	if state == nil {
-		return errors.New("apply control state is nil")
-	}
-	// Keep this defence in depth even when a production caller performs the
-	// same activation check. LinuxLoader is exported and can be constructed
-	// directly, so it must refuse FakeTCP before pin validation, object loading,
-	// owner intent, map writes, or TCX mutation.
-	if err := preflightFakeTCPKernelRequirements(state); err != nil {
-		return err
-	}
-	if l.AdoptLegacyPins {
-		return errors.New(
-			"classic pin adoption is unsupported by owner schema v4; detach with a trusted legacy build before upgrading",
-		)
 	}
 	runtime := l.pinRuntime(ctx)
 	pinPath := pinPathFromEnv(l.PinPath)
@@ -356,25 +333,16 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if err != nil {
 		return err
 	}
-	// This read-only feature/revision probe is deliberately before BPF object
-	// loading, owner intent, map pinning, or any TCX kernel write. Production
-	// never falls back to non-exact classic TC after this point.
-	if err := preflightExactTCXCapabilities(state, runtime.exactTCX); err != nil {
-		return err
-	}
 	parent, err := openPinPathParent(pinPath, validated, runtime)
 	if err != nil {
 		return err
 	}
 	defer parent.Close()
-	spec, identity, err := l.loadCollectionSpec()
+	spec, identity, err := loadCollectionSpec(l.ObjectPath)
 	if err != nil {
 		return err
 	}
 	source := identity.Source
-	if err := validateBaselineLoaderCollectionSpec(spec, source); err != nil {
-		return err
-	}
 	if err := validateAndSetPinnedMaps(spec); err != nil {
 		return fmt.Errorf("validate BPF object %s: %w", source, err)
 	}
@@ -441,12 +409,11 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	}
 	if ownerExists && ownerRecord.BootID == bootID {
 		rollbackFreshPins = false
-		recovered, err := recoverExactPinOwnerTransaction(
-			ctx,
+		recovered, err := recoverPinOwnerTransaction(
 			handle,
 			store,
 			ownerRecord,
-			runtime.exactTCX,
+			liveTCRuntime,
 		)
 		if err != nil {
 			return fmt.Errorf("recover persistent BPF pin owner: %w", err)
@@ -468,7 +435,7 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		if directoryState != canonicalPinsEmpty &&
 			directoryState != canonicalPinsOwned {
 			return errors.New(
-				"prior-boot owner can only be archived after every prior-boot exact TCX link pin is absent",
+				"prior-boot owner can only be archived with an empty or exact owned canonical pin set",
 			)
 		}
 		indexed, err := activeIndexedOwnerForRecord(
@@ -512,7 +479,7 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 				if directoryState != canonicalPinsEmpty &&
 					directoryState != canonicalPinsOwned {
 					return errors.New(
-						"indexed prior-boot owner can only be archived after every prior-boot exact TCX link pin is absent",
+						"indexed prior-boot owner can only be archived with an empty or exact owned canonical pin set",
 					)
 				}
 				priorRecord, err := loadIndexedPriorBootOwner(
@@ -561,7 +528,7 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 			rebootSource,
 			bootID,
 			rekeyNow,
-			runtime.exactTCX,
+			liveTCRuntime,
 		)
 		if err != nil {
 			return fmt.Errorf("rekey rebooted BPF owner: %w", err)
@@ -569,34 +536,40 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		ownerExists = true
 		rollbackFreshPins = false
 	}
+	legacyAdoption := false
 	if ownerExists {
-		if directoryState != canonicalPinsOwned && directoryState != canonicalPinsOwnedTCX {
-			return errors.New("active BPF owner record does not have its exact canonical map/link set")
+		if directoryState != canonicalPinsOwned {
+			return errors.New("active BPF owner record does not have its exact 12-map canonical set")
 		}
 	} else {
 		switch directoryState {
 		case canonicalPinsEmpty:
 		case canonicalPinsLegacy:
-			return errors.New(
-				"found legacy BPF pins without exact TCX ownership; detach them with a trusted legacy build before upgrading",
-			)
+			if !l.AdoptLegacyPins {
+				return errors.New(
+					"found legacy 11-map BPF pins without owner_map; refusing implicit adoption (run reload --adopt-legacy-pins explicitly)",
+				)
+			}
+			legacyAdoption = true
 		case canonicalPinsOwned:
-			return errors.New(
-				"found owner_map pins without their persistent exact TCX owner record; refusing name-only adoption",
-			)
-		case canonicalPinsOwnedTCX:
-			return errors.New(
-				"found exact TCX link pins without their persistent owner record; refusing link-ID adoption",
-			)
+			if !l.AdoptLegacyPins {
+				return errors.New(
+					"found owner_map pins without their root-owned persistent owner record; refusing name-only ownership",
+				)
+			}
+			// An explicitly requested adoption also recovers the narrow crash
+			// window after owner_map was added but before its first descriptor
+			// publish. Schema/control/TC identity are still fully preflighted.
+			legacyAdoption = true
 		}
 	}
 	freshPins := !ownerExists && directoryState == canonicalPinsEmpty
 
 	var preexistingPins []pinnedMapPin
-	if ownerExists {
+	if ownerExists || legacyAdoption {
 		preexistingPins, err = inspectPinnedMapSetWithPolicy(
 			handle,
-			true,
+			!legacyAdoption || directoryState == canonicalPinsOwned,
 			true,
 			false,
 		)
@@ -604,13 +577,15 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 			return fmt.Errorf("preflight existing pinned maps under %s: %w", pinPath, err)
 		}
 		defer closePinnedMapPins(preexistingPins)
-		if err := validateOwnerPins(
-			handle,
-			ownerRecord,
-			preexistingPins,
-			true,
-		); err != nil {
-			return err
+		if ownerExists {
+			if err := validateOwnerPins(
+				handle,
+				ownerRecord,
+				preexistingPins,
+				true,
+			); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -639,7 +614,7 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 			return fmt.Errorf("existing pinned maps changed while loading %s: %w", source, err)
 		}
 	}
-	if ownerExists {
+	if ownerExists || legacyAdoption {
 		err = validateCollectionPinnedMaps(handle, coll, true)
 	}
 	if err != nil {
@@ -676,26 +651,28 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if egress == nil {
 		return fmt.Errorf("BPF object missing program %q", egressFilterName)
 	}
-	ingressProgramID, err := exactTCXProgramIdentity(ingress)
+	ingressIdentity, err := tcProgramIdentityFromProgram(ingress)
 	if err != nil {
-		return fmt.Errorf("inspect ingress TCX program: %w", err)
+		return fmt.Errorf("inspect ingress TC program: %w", err)
 	}
-	egressProgramID, err := exactTCXProgramIdentity(egress)
+	egressIdentity, err := tcProgramIdentityFromProgram(egress)
 	if err != nil {
-		return fmt.Errorf("inspect egress TCX program: %w", err)
+		return fmt.Errorf("inspect egress TC program: %w", err)
 	}
-	desiredLinks, err := exactTCXBindingsForState(
+	attachPlan, err := prepareTCAttachPlan(
 		state,
-		ingressProgramID,
-		egressProgramID,
+		ingressIdentity,
+		egressIdentity,
+		liveTCRuntime,
 	)
 	if err != nil {
-		return fmt.Errorf("build exact TCX attachment transaction: %w", err)
+		return fmt.Errorf("preflight TC attachment transaction: %w", err)
 	}
-	activeLinks := []exactTCXBinding{}
+	defer attachPlan.Close()
+	activeFilters := []tcFilterBinding{}
 	var token [32]byte
 	var ownerMaps []pinOwnerMapIdentity
-	if freshPins {
+	if freshPins || legacyAdoption {
 		token, err = newPinOwnerToken(runtime.random)
 		if err != nil {
 			return err
@@ -711,18 +688,27 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		if err != nil {
 			return err
 		}
+		if legacyAdoption {
+			activeFilters = attachPlan.ObservedBindings()
+		}
 	} else {
 		token, err = tokenFromOwnerRecord(ownerRecord)
 		if err != nil {
 			return err
 		}
 		ownerMaps = slices.Clone(ownerRecord.Maps)
-		activeLinks = slices.Clone(ownerRecord.ActiveLinks)
+		activeFilters = slices.Clone(ownerRecord.ActiveFilters)
 	}
-	desiredLinks, err = bindDesiredExactTCXLinks(activeLinks, desiredLinks)
-	if err != nil {
+	if err := attachPlan.ValidatePreviousBindings(
+		activeFilters,
+		freshPins,
+	); err != nil {
 		return err
 	}
+	if err := attachPlan.AddOwnedStaleRemovals(activeFilters); err != nil {
+		return err
+	}
+	desiredFilters := attachPlan.Bindings()
 	now, err := ownerRuntimeNow(runtime)
 	if err != nil {
 		return err
@@ -735,8 +721,8 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		active,
 		next,
 		ownerMaps,
-		activeLinks,
-		desiredLinks,
+		activeFilters,
+		desiredFilters,
 		ownerRecord,
 	)
 	if err != nil {
@@ -811,51 +797,26 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if err := store.Persist(mutating, applying, handle.mountID); err != nil {
 		return err
 	}
-	abortApply := func(cause error, current *pinOwnerRecord) error {
-		abortErr := abortFailedExactOwnerApply(
-			ctx,
+	if err := attachPlan.Execute(func() error {
+		return commitControl(coll, snapshot.Control[abi.ControlKeyGlobal])
+	}); err != nil {
+		abortErr := abortFailedOwnerApply(
 			handle,
 			store,
-			current,
-			runtime.exactTCX,
+			mutating,
+			liveTCRuntime,
 		)
 		if abortErr != nil {
 			return errors.Join(
-				cause,
-				fmt.Errorf("exact owner-aware apply rollback: %w", abortErr),
+				err,
+				fmt.Errorf("owner-aware apply rollback: %w", abortErr),
 			)
 		}
-		return cause
-	}
-	programs, err := loadOwnerPrograms(handle, mutating)
-	if err != nil {
-		return abortApply(err, mutating)
-	}
-	converged, convergeErr := convergeOwnerApplyExactTCXLinks(
-		ctx,
-		handle,
-		store,
-		mutating,
-		programs,
-		runtime.exactTCX,
-	)
-	closeProgramsErr := programs.Close()
-	if converged != nil {
-		mutating = converged
-	}
-	if convergeErr != nil || closeProgramsErr != nil {
-		return abortApply(errors.Join(convergeErr, closeProgramsErr), mutating)
-	}
-	if err := commitControl(coll, snapshot.Control[abi.ControlKeyGlobal]); err != nil {
-		return abortApply(err, mutating)
-	}
-	cleanupNow, err := ownerRuntimeNow(handle.runtime)
-	if err != nil {
 		return err
 	}
 	cleanup := advancePinOwnerRecord(
 		mutating,
-		cleanupNow,
+		now,
 		pinOwnerPhaseApplying,
 		pinOwnerStepCleanup,
 	)
@@ -863,12 +824,12 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if err := store.Persist(cleanup, mutating, handle.mountID); err != nil {
 		return err
 	}
-	recovered, err := recoverExactApplyingPinOwnerTransaction(
-		ctx,
+	recovered, err := recoverApplyingPinOwnerTransaction(
 		handle,
 		store,
 		cleanup,
-		runtime.exactTCX,
+		now,
+		liveTCRuntime,
 	)
 	if err != nil {
 		return err
@@ -891,22 +852,11 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	return nil
 }
 
-func (l LinuxLoader) effectiveObjectPath() string {
-	if l.objectPathFrozen {
-		return l.ObjectPath
-	}
-	return objectPathFromEnv(l.ObjectPath)
-}
-
-func (l LinuxLoader) loadCollectionSpec() (*ebpf.CollectionSpec, ObjectIdentity, error) {
-	return loadCollectionSpecFromResolvedPath(l.effectiveObjectPath())
-}
-
 func (l LinuxLoader) DetachStale(ctx context.Context, previous *control.State, current *control.State) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// Apply now includes owner-recorded stale exact TCX links in the same global
+	// Apply now includes owner-recorded stale filters in the same global
 	// preflight, rollback, and journal transaction as replacements/additions.
 	// Keep this compatibility hook side-effect free for older reconcile callers.
 	return nil
@@ -993,12 +943,11 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 			record.BootID, bootID,
 		)
 	}
-	recovered, err := recoverExactPinOwnerTransaction(
-		ctx,
+	recovered, err := recoverPinOwnerTransaction(
 		handle,
 		store,
 		record,
-		runtime.exactTCX,
+		liveTCRuntime,
 	)
 	if err != nil {
 		return fmt.Errorf("recover BPF owner before detach: %w", err)
@@ -1010,12 +959,11 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 		recovered.record.Phase != pinOwnerPhaseActive {
 		return errors.New("BPF owner recovery did not reach an active state")
 	}
-	return executeExactOwnerDetachTransaction(
-		ctx,
+	return executeOwnerDetachTransaction(
 		handle,
 		store,
 		recovered.record,
-		runtime.exactTCX,
+		liveTCRuntime,
 	)
 }
 
@@ -2663,4 +2611,9 @@ func (plan *pinnedMapCleanupPlan) Close() error {
 	handleErr := plan.handle.Close()
 	plan.handle = nil
 	return errors.Join(pinErr, handleErr)
+}
+
+func isNotFound(err error) bool {
+	lower := strings.ToLower(err.Error())
+	return errors.Is(err, os.ErrNotExist) || strings.Contains(lower, "no such file") || strings.Contains(lower, "not found")
 }

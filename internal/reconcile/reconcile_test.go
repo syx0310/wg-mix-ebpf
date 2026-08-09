@@ -12,7 +12,6 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/attachstate"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
-	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
 	"github.com/syx0310/wg-mix-ebpf/internal/guard"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/runtime"
@@ -25,80 +24,6 @@ func TestReloadRejectsOfflineApply(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "requires --dry-run") {
 		t.Fatalf("expected offline apply rejection, got %v", err)
 	}
-}
-
-func TestReloadFakeTCPGatePrecedesGuardAndLoaderInApplyAndDryRun(t *testing.T) {
-	for _, dryRun := range []bool{false, true} {
-		t.Run(fmt.Sprintf("dry-run=%t", dryRun), func(t *testing.T) {
-			cfg := mustFakeTCPReconcileConfig(t)
-			guardExec := &recordingGuardExecutor{}
-			loader := &recordingDataplaneLoader{}
-			mark := uint32(0x10000002)
-			lifecycleRoot := t.TempDir()
-			ctx := lockfile.WithLifecyclePathsForTest(
-				t.Context(),
-				filepath.Join(lifecycleRoot, "daemon.lease"),
-				filepath.Join(lifecycleRoot, "maintenance.gate"),
-			)
-			_, err := Reload(ctx, Options{
-				ConfigPath: "/ignored/by-test-loader.yaml",
-				RunDir:     t.TempDir(),
-				DryRun:     dryRun,
-				Offline:    dryRun,
-				deps: &dependencies{
-					loadConfigFile: func(string) (*config.Config, error) { return cfg, nil },
-					loadWGConfig: func(string) (*wgconfig.Interface, error) {
-						return &wgconfig.Interface{FwMark: &mark, ListenPort: func() *uint16 { value := uint16(31001); return &value }()}, nil
-					},
-					guardExecutor:   guardExec,
-					dataplaneLoader: loader,
-				},
-			})
-			if !errors.Is(err, dataplane.ErrFakeTCPKernelGate) {
-				t.Fatalf("expected FakeTCP activation gate, got %v", err)
-			}
-			if strings.Contains(err.Error(), "BPF control-event admission/coalescing under SYN flood") {
-				t.Fatalf("gate still reports implemented BPF control-event admission as missing: %v", err)
-			}
-			for _, want := range []string{
-				"RST/FIN full IPv4/TCP checksum and receive-window validation",
-				"parser:l3 FakeTCP policy and attachment support",
-				"real-NIC GSO/GRO/checksum-offload acceptance",
-			} {
-				if !strings.Contains(err.Error(), want) {
-					t.Fatalf("gate error missing %q: %v", want, err)
-				}
-			}
-			if len(guardExec.plans) != 0 || guardExec.cleanupCalls != 0 || loader.applyCalls != 0 {
-				t.Fatalf("gate ran after mutation: guard apply=%d cleanup=%d loader=%d", len(guardExec.plans), guardExec.cleanupCalls, loader.applyCalls)
-			}
-		})
-	}
-}
-
-func mustFakeTCPReconcileConfig(t *testing.T) *config.Config {
-	t.Helper()
-	cfg, err := config.Load([]byte(`
-version: 1
-underlays:
-  - name: eth0
-    type: netdev
-wireguards:
-  - name: wg0
-    config: /tmp/wg0.conf
-    profile: mix-default
-    transport:
-      mode: faketcp
-      faketcp:
-        experimental: true
-profiles:
-  mix-default:
-    preset: wireguard-mix-wire-values-v1
-`))
-	if err != nil {
-		t.Fatal(err)
-	}
-	return cfg
 }
 
 func TestStopCleansFixedGuardTableWhenCurrentConfigDisablesGuard(t *testing.T) {

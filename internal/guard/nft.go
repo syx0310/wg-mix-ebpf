@@ -97,14 +97,6 @@ func BuildNftPlan(state *control.State, additionalFwmarks ...uint32) NftPlan {
 		plan.Rules = append(plan.Rules,
 			fmt.Sprintf("add rule inet %s input udp dport %d counter drop comment \"wg-mix-ebpf startup ingress guard\"", TableName, wg.ConfigListenPort),
 		)
-		if wg.TransportMode == "faketcp" {
-			// The FakeTCP port is exclusive. Before XDP is attached, block
-			// TCP so the host stack cannot emit RSTs, and retain the UDP rule
-			// above so a failed startup cannot leak the original transport.
-			plan.Rules = append(plan.Rules,
-				fmt.Sprintf("add rule inet %s input tcp dport %d counter drop comment \"wg-mix-ebpf faketcp startup ingress guard\"", TableName, wg.ConfigListenPort),
-			)
-		}
 	}
 	sort.Strings(plan.Rules)
 	return plan

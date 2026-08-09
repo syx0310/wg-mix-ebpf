@@ -8,30 +8,19 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 
 	"github.com/cilium/ebpf"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
+	"github.com/vishvananda/netlink"
 )
 
 func inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
-	if ctx == nil {
-		return nil, errors.New("inspect context is nil")
-	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if state == nil {
-		return nil, errors.New("inspect control state is nil")
-	}
 	status := &KernelStatus{PinPath: pinPathFromEnv("")}
-	activeLinks, mapErr := inspectPinnedMaps(ctx, status)
-	if mapErr != nil {
-		status.MapError = mapErr.Error()
-	}
-	linksBySlot := make(map[string]exactTCXBinding, len(activeLinks))
-	for _, binding := range activeLinks {
-		linksBySlot[exactTCXOwnerKey(binding)] = binding
+	if err := inspectPinnedMaps(ctx, status); err != nil {
+		status.MapError = err.Error()
 	}
 	for _, u := range state.Underlays {
 		if !u.Resolved || u.IfIndex == 0 || u.Role == "disabled" {
@@ -42,23 +31,33 @@ func inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
 			IfIndex: u.IfIndex,
 			IfName:  u.IfName,
 		}
-		for _, direction := range []exactTCXDirection{exactTCXIngress, exactTCXEgress} {
-			key := exactTCXOwnerKey(exactTCXBinding{IfIndex: u.IfIndex, Direction: direction})
-			binding, exists := linksBySlot[key]
-			if !exists {
-				continue
-			}
-			entry.Filters = append(entry.Filters, FilterStatus{
-				Direction:  string(direction),
-				Name:       binding.PinName,
-				Backend:    binding.Backend,
-				AttachType: binding.AttachType,
-				LinkID:     binding.LinkID,
-				ProgramID:  binding.ProgramID,
-			})
-			if direction == exactTCXIngress {
+		link, err := netlink.LinkByIndex(u.IfIndex)
+		if err != nil {
+			entry.Error = err.Error()
+			status.Underlays = append(status.Underlays, entry)
+			continue
+		}
+		ingress, err := filterStatuses(link, netlink.HANDLE_MIN_INGRESS, "ingress")
+		if err != nil {
+			entry.Error = fmt.Sprintf("inspect ingress filters: %v", err)
+			status.Underlays = append(status.Underlays, entry)
+			continue
+		}
+		egress, err := filterStatuses(link, netlink.HANDLE_MIN_EGRESS, "egress")
+		if err != nil {
+			entry.Error = fmt.Sprintf("inspect egress filters: %v", err)
+			status.Underlays = append(status.Underlays, entry)
+			continue
+		}
+		entry.Filters = append(entry.Filters, ingress...)
+		entry.Filters = append(entry.Filters, egress...)
+		for _, filter := range ingress {
+			if filter.Name == ingressFilterName && filter.Handle == ingressHandle && filter.Priority == filterPriority {
 				entry.IngressAttached = true
-			} else {
+			}
+		}
+		for _, filter := range egress {
+			if filter.Name == egressFilterName && filter.Handle == egressHandle && filter.Priority == filterPriority {
 				entry.EgressAttached = true
 			}
 		}
@@ -67,35 +66,35 @@ func inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
 	return status, nil
 }
 
-func inspectPinnedMaps(ctx context.Context, status *KernelStatus) ([]exactTCXBinding, error) {
+func inspectPinnedMaps(ctx context.Context, status *KernelStatus) error {
 	runtime := LinuxLoader{}.pinRuntime(ctx)
 	validated, err := validatePinPath(status.PinPath, runtime.validator)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if !validated.exists {
-		return nil, nil
+		return nil
 	}
 	parent, err := openPinPathParent(status.PinPath, validated, runtime)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer parent.Close()
 	lock, err := acquirePinPathLock(ctx, parent.resource, "status", runtime)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer lock.Close()
 	validated, err = validatePinPath(status.PinPath, runtime.validator)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	handle, _, err := openPinPathHandleFromParent(parent, validated, false)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if handle == nil {
-		return nil, nil
+		return nil
 	}
 	defer handle.Close()
 
@@ -106,50 +105,50 @@ func inspectPinnedMaps(ctx context.Context, status *KernelStatus) ([]exactTCXBin
 		false,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("open persistent BPF pin owner: %w", err)
+		return fmt.Errorf("open persistent BPF pin owner: %w", err)
 	}
 	defer store.Close()
 	record, exists, err := store.LoadOptional(handle.mountID)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if !exists {
-		return nil, errors.New("BPF pins have no persistent owner record")
+		return errors.New("BPF pins have no persistent owner record")
 	}
 	if record.Phase != pinOwnerPhaseActive ||
 		record.Step != pinOwnerStepReady {
-		return nil, fmt.Errorf(
+		return fmt.Errorf(
 			"BPF owner transaction is %s/%s at sequence %d; status is not steady",
 			record.Phase, record.Step, record.Sequence,
 		)
 	}
 	if err := validateOwnerDirectoryEntries(handle, record); err != nil {
-		return nil, err
+		return err
 	}
 	pins, err := inspectPinnedMapSet(handle, true)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	defer closePinnedMapPins(pins)
 	if err := validateOwnerPins(handle, record, pins, true); err != nil {
-		return nil, err
+		return err
 	}
 	controlValue, err := ownerControlValue(pins)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if err := validateOwnerControlGeneration(
 		pins,
 		record.ActiveGeneration,
 	); err != nil {
-		return nil, err
+		return err
 	}
-	if err := validateOwnerExactTCXLinks(
-		handle,
-		record.ActiveLinks,
-		liveExactTCXRuntime,
+	if err := validateOwnerTCExact(
+		record.ActiveFilters,
+		record.ActiveFilters,
+		liveTCRuntime,
 	); err != nil {
-		return nil, err
+		return err
 	}
 	status.ActiveGeneration = controlValue.ActiveGeneration
 	status.ABIVersion = controlValue.ABIVersion
@@ -157,9 +156,9 @@ func inspectPinnedMaps(ctx context.Context, status *KernelStatus) ([]exactTCXBin
 	stats, err := ebpf.LoadPinnedMap(filepath.Join(handle.procPath(), "stats_map"), nil)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return slices.Clone(record.ActiveLinks), nil
+			return nil
 		}
-		return slices.Clone(record.ActiveLinks), fmt.Errorf("load pinned stats_map: %w", err)
+		return fmt.Errorf("load pinned stats_map: %w", err)
 	}
 	defer stats.Close()
 
@@ -170,7 +169,7 @@ func inspectPinnedMaps(ctx context.Context, status *KernelStatus) ([]exactTCXBin
 			if errors.Is(err, ebpf.ErrKeyNotExist) {
 				continue
 			}
-			return slices.Clone(record.ActiveLinks), fmt.Errorf("lookup stats_map[%s]: %w", name, err)
+			return fmt.Errorf("lookup stats_map[%s]: %w", name, err)
 		}
 		var total uint64
 		for _, value := range values {
@@ -178,7 +177,7 @@ func inspectPinnedMaps(ctx context.Context, status *KernelStatus) ([]exactTCXBin
 		}
 		status.Stats[name] = total
 	}
-	return slices.Clone(record.ActiveLinks), nil
+	return nil
 }
 
 var statNames = []string{
@@ -218,4 +217,25 @@ var statNames = []string{
 	"egress_bad_checksum",
 	"xor_egress_dispatch_error",
 	"xor_ingress_dispatch_error",
+}
+
+func filterStatuses(link netlink.Link, parent uint32, direction string) ([]FilterStatus, error) {
+	filters, err := netlink.FilterList(link, parent)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]FilterStatus, 0, len(filters))
+	for _, filter := range filters {
+		bpfFilter, ok := filter.(*netlink.BpfFilter)
+		if !ok {
+			continue
+		}
+		out = append(out, FilterStatus{
+			Direction: direction,
+			Name:      bpfFilter.Name,
+			Handle:    bpfFilter.Attrs().Handle,
+			Priority:  bpfFilter.Attrs().Priority,
+		})
+	}
+	return out, nil
 }

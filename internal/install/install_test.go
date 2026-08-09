@@ -38,11 +38,11 @@ func TestUninstallPurgeRejectsNonOwnedConfigDir(t *testing.T) {
 }
 
 func TestUninstallPurgeAllowsOwnedEmptyConfigDir(t *testing.T) {
-	layout := cleanupTestPaths(t.TempDir(), "owned-empty")
-	setCleanupTestEnvironment(t, layout)
-	etcDir := filepath.Dir(layout.ConfigPath)
+	root := t.TempDir()
+	etcDir := filepath.Join(root, "wg-mix-ebpf-owned")
+	t.Setenv(EnvEtcDir, etcDir)
 	plan, err := Uninstall(t.Context(), Options{
-		ConfigPath: layout.ConfigPath,
+		ConfigPath: filepath.Join(etcDir, "config.yaml"),
 		System:     "unknown",
 		DryRun:     true,
 		Purge:      true,
@@ -5138,6 +5138,70 @@ const (
 
 func TestMain(m *testing.M) {
 	os.Exit(testutil.RunWithStandardUmask(func() int {
-		return runInstallTestMain(m.Run, os.Stderr)
+		const testTempPrefix = ".wg-mix-ebpf-install-tests-"
+		workingDir, err := os.Getwd()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "resolve install package test directory: %v\n", err)
+			return 1
+		}
+		workingDir = filepath.Clean(workingDir)
+		testTempRoot, err := os.MkdirTemp(
+			workingDir,
+			testTempPrefix,
+		)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "create isolated install test root: %v\n", err)
+			return 1
+		}
+		removeTestTempRoot := func() error {
+			if testTempRoot == "" ||
+				!filepath.IsAbs(testTempRoot) ||
+				filepath.Clean(testTempRoot) != testTempRoot ||
+				filepath.Dir(testTempRoot) != workingDir ||
+				!strings.HasPrefix(filepath.Base(testTempRoot), testTempPrefix) {
+				return fmt.Errorf(
+					"refuse unsafe isolated install test root cleanup %q",
+					testTempRoot,
+				)
+			}
+			entries, err := os.ReadDir(testTempRoot)
+			if err != nil {
+				return err
+			}
+			if len(entries) != 0 {
+				return fmt.Errorf(
+					"isolated install test root %s retained %d entries",
+					testTempRoot,
+					len(entries),
+				)
+			}
+			return os.Remove(testTempRoot)
+		}
+		if err := os.Setenv("TMPDIR", testTempRoot); err != nil {
+			fmt.Fprintf(os.Stderr, "set isolated install test root: %v\n", err)
+			if removeErr := removeTestTempRoot(); removeErr != nil {
+				fmt.Fprintf(
+					os.Stderr,
+					"remove isolated install test root %s: %v\n",
+					testTempRoot,
+					removeErr,
+				)
+			}
+			return 1
+		}
+
+		code := m.Run()
+		if err := removeTestTempRoot(); err != nil {
+			fmt.Fprintf(
+				os.Stderr,
+				"remove isolated install test root %s: %v\n",
+				testTempRoot,
+				err,
+			)
+			if code == 0 {
+				code = 1
+			}
+		}
+		return code
 	}))
 }

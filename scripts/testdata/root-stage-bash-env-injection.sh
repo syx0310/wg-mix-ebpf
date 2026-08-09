@@ -1,1 +1,0 @@
-printf '%s\n' 'BASH_ENV_INJECTION_EXECUTED' >&2

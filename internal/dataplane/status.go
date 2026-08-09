@@ -26,14 +26,10 @@ type UnderlayKernelStatus struct {
 }
 
 type FilterStatus struct {
-	Direction  string `json:"direction"`
-	Name       string `json:"name"`
-	Handle     uint32 `json:"handle"`
-	Priority   uint16 `json:"priority"`
-	Backend    string `json:"backend,omitempty"`
-	AttachType uint32 `json:"attach_type,omitempty"`
-	LinkID     uint32 `json:"link_id,omitempty"`
-	ProgramID  uint32 `json:"program_id,omitempty"`
+	Direction string `json:"direction"`
+	Name      string `json:"name"`
+	Handle    uint32 `json:"handle"`
+	Priority  uint16 `json:"priority"`
 }
 
 func Inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
