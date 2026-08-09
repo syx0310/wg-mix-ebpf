@@ -1492,6 +1492,12 @@ proc execute_controller_package_verifier {values manifest_sha} {
 
 proc require_transaction_local_authority {values manifest_sha operation approved_sha} {
     require_controller_verifier_authority $values
+    foreach name [package_names] {
+        if {[catch {build_operation $values $manifest_sha "scp-$name" none} \
+            package_copy_spec]} {
+            fail "local-package-artifact" 66
+        }
+    }
     execute_controller_package_verifier $values $manifest_sha
     if {$operation eq "realnic-run" &&
         [catch {build_operation $values $manifest_sha scp-realnic-approved-plan \
