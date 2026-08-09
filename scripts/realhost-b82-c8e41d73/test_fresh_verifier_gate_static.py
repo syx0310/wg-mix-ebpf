@@ -154,6 +154,21 @@ if "c8_checksum_module_restore" in run_body or "restore_gate" in run_body:
     fail("run path contains automatic module cleanup")
 if "fail 'already-restored'" in restore_body:
     fail("restore still rejects its replayable terminal state")
+if "EXPLICIT_RESTORE_ONLY.R.pre-kwarn" in source:
+    fail("plan advertises a restore warning snapshot that is not executed")
+if source.count(
+    "plan_operation EXPLICIT_RESTORE_ONLY.R.kwarn snapshot-kernel-warnings"
+) != 1:
+    fail("plan must advertise exactly one post-restore warning snapshot")
+convergent_start = source.find("assert_bpf_baseline_convergent() {")
+convergent_end = source.find("build_argv() {", convergent_start)
+convergent_body = source[convergent_start:convergent_end]
+if min(convergent_start, convergent_end) < 0 or convergent_body.count(
+    'run_convergent_operation "${label}.kwarn" snapshot-kernel-warnings'
+) != 1:
+    fail("convergent baseline must execute exactly one labeled warning snapshot")
+if restore_body.count("assert_bpf_baseline_convergent R.final") != 1:
+    fail("restore warning snapshot is not uniquely bound to R.final")
 restore_order = tuple(
     restore_body.find(value)
     for value in (

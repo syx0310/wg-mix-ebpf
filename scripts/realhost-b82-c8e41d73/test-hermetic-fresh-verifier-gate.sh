@@ -78,6 +78,7 @@ for expected in \
   'lease_id=c8e41d73-f3e5c8a1' \
   'EXPLICIT_RESTORE_ONLY.R.lease operation=shared-module-lock' \
   'EXPLICIT_RESTORE_ONLY.R.module operation=shared-module-restore' \
+  'EXPLICIT_RESTORE_ONLY.R.kwarn operation=snapshot-kernel-warnings' \
   'helper=c8_checksum_module_restore' \
   'transient_bpf=unpinned' \
   'automatic_cleanup=0' \
@@ -89,6 +90,9 @@ done
 [[ "$(/usr/bin/grep -c 'operation=shared-module-load' "${OUTPUT}")" == 1 &&
   "$(/usr/bin/grep -c 'operation=shared-module-restore' "${OUTPUT}")" == 1 ]] ||
   fail 'shared helper module operations are not singular'
+[[ "${PLAN}" != *'EXPLICIT_RESTORE_ONLY.R.pre-kwarn'* &&
+  "$(/usr/bin/grep -c 'EXPLICIT_RESTORE_ONLY.R.kwarn operation=snapshot-kernel-warnings' \
+    "${OUTPUT}")" == 1 ]] || fail 'restore warning plan does not match R.final'
 [[ "${PLAN}" != *'rm -rf'* && "${PLAN}" != *'find -delete'* &&
   "${PLAN}" != *'chroot'* && "${PLAN}" != *'nsenter'* &&
   "${PLAN}" != *'/usr/sbin/ip '* && "${PLAN}" != *'/usr/sbin/tc '* ]] ||

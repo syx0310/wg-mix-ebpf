@@ -885,7 +885,6 @@ render_plan() {
       plan_operation "${label}" "${operation}"
     fi
   done
-  plan_operation EXPLICIT_RESTORE_ONLY.R.pre-kwarn snapshot-kernel-warnings
   plan_module_lock EXPLICIT_RESTORE_ONLY.R.lease
   plan_module_restore
   plan_operation EXPLICIT_RESTORE_ONLY.R.progs snapshot-progs
