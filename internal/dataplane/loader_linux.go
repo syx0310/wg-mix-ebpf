@@ -247,10 +247,11 @@ var xorTailCallBindings = []struct {
 }
 
 type LinuxLoader struct {
-	ObjectPath      string
-	PinPath         string
-	AdoptLegacyPins bool
-	runtime         *pinPathRuntime
+	ObjectPath       string
+	PinPath          string
+	AdoptLegacyPins  bool
+	runtime          *pinPathRuntime
+	objectPathFrozen bool
 }
 
 func NewLoader() Loader {
@@ -258,11 +259,12 @@ func NewLoader() Loader {
 }
 
 func NewLoaderWithOptions(options LoaderOptions) Loader {
-	return LinuxLoader{
+	baseline := LinuxLoader{
 		ObjectPath:      objectPathFromEnv(""),
 		PinPath:         pinPathFromEnv(""),
 		AdoptLegacyPins: options.AdoptLegacyPins,
 	}
+	return newFakeTCPProductionLoader(baseline)
 }
 
 func LoadObjectTest(ctx context.Context, objectPath string) error {
@@ -365,7 +367,7 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 	defer parent.Close()
-	spec, identity, err := loadCollectionSpec(l.ObjectPath)
+	spec, identity, err := l.loadCollectionSpec()
 	if err != nil {
 		return err
 	}
@@ -887,6 +889,17 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 	return nil
+}
+
+func (l LinuxLoader) effectiveObjectPath() string {
+	if l.objectPathFrozen {
+		return l.ObjectPath
+	}
+	return objectPathFromEnv(l.ObjectPath)
+}
+
+func (l LinuxLoader) loadCollectionSpec() (*ebpf.CollectionSpec, ObjectIdentity, error) {
+	return loadCollectionSpecFromResolvedPath(l.effectiveObjectPath())
 }
 
 func (l LinuxLoader) DetachStale(ctx context.Context, previous *control.State, current *control.State) error {
