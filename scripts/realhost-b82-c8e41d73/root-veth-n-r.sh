@@ -61,6 +61,7 @@ readonly -a REALHOST_TESTS=(
   TestExperimentalFakeTCPRealHostLifecycleIntegration
   TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration
   TestBaselineExperimentalRealHostMutualExclusionIntegration
+  TestFakeTCPRealHostManagedIngressAcceptance
 )
 readonly -a GIT_COMMAND=(
   /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C
