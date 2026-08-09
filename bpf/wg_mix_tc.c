@@ -2047,7 +2047,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
 	if (listener->transport_mode == TRANSPORT_FAKETCP &&
 	    (!faketcp_metadata_valid(skb, generation) ||
-	     faketcp_parse_tc_l3(skb, &info, &faketcp_l3) < 0)) {
+	     faketcp_parse_tc_l3(skb, &info, &faketcp_l3) != FAKETCP_L3_OK)) {
 		inc_faketcp_stat(FAKETCP_STAT_METADATA_ERROR);
 		return TC_ACT_SHOT;
 	}

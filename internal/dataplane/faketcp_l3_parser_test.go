@@ -1,8 +1,6 @@
 package dataplane
 
 import (
-	"bytes"
-	"encoding/binary"
 	"fmt"
 	"os"
 	"strings"
@@ -10,34 +8,6 @@ import (
 
 	faketcpmodel "github.com/syx0310/wg-mix-ebpf/internal/faketcp"
 )
-
-func TestFakeTCPIPv4OptionsChecksumDeltaMatchesFullRecompute(t *testing.T) {
-	header := make([]byte, 60)
-	header[0] = 0x4f
-	binary.BigEndian.PutUint16(header[2:4], 100)
-	header[6] = 0x40 // DF
-	header[8] = 64
-	header[9] = 6 // TCP
-	for i := 20; i < len(header); i++ {
-		header[i] = byte(i*17 + 3)
-	}
-	oldOptions := append([]byte(nil), header[20:]...)
-	binary.BigEndian.PutUint16(header[10:12], internetChecksum(header))
-
-	oldFields := []byte{0, 100, 64, 6}
-	newFields := []byte{0, 88, 64, 17}
-	got := replaceChecksumFolded(binary.BigEndian.Uint16(header[10:12]), oldFields, newFields)
-	binary.BigEndian.PutUint16(header[2:4], 88)
-	header[9] = 17
-	binary.BigEndian.PutUint16(header[10:12], 0)
-	want := internetChecksum(header)
-	if got != want {
-		t.Fatalf("IPv4 options checksum delta = %#04x, full recompute = %#04x", got, want)
-	}
-	if !bytes.Equal(header[20:], oldOptions) {
-		t.Fatal("IPv4 options changed while updating total length/protocol checksum")
-	}
-}
 
 func TestFakeTCPL3CAndGoResultContractsStaySynchronized(t *testing.T) {
 	source, err := os.ReadFile("../../bpf/wg_mix_faketcp_l3.h")
@@ -81,6 +51,8 @@ func TestFakeTCPL3CAndGoResultContractsStaySynchronized(t *testing.T) {
 		"next_header == NEXTHDR_FRAGMENT",
 		"next_header == NEXTHDR_AUTH",
 		"depth <= FAKETCP_L3_MAX_EXTENSION_HEADERS",
+		"faketcp_managed_transform_status",
+		"info->l3_header_len != sizeof(struct iphdr)",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("bounded L3 parser contract missing %q", want)
@@ -114,9 +86,12 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		"parse_rc = faketcp_parse_l3(data, data_end, frame_len, l3_off, family, &l3)",
 		"parser_mode == PARSER_L3",
 		"parser_mode != PARSER_ETHERNET",
-		"l3->l3_header_len + sizeof(struct udphdr)",
+		"faketcp_managed_transform_status(l3, IPPROTO_UDP)",
+		"faketcp_managed_transform_status(&l3, l3.transport_protocol)",
+		"sizeof(struct iphdr) + sizeof(struct udphdr)",
 		"l3.l4_off + sizeof(udp)",
-		"faketcp_xdp_update_ipv4_header",
+		"struct iphdr new_ip;",
+		"bpf_xdp_store_bytes(xdp, l3.l3_off, &new_ip, sizeof(new_ip))",
 	} {
 		if !strings.Contains(main, want) {
 			t.Fatalf("TC/XDP shared parser integration missing %q", want)
@@ -127,13 +102,53 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		"struct faketcp_ipv6_extension",
 		"struct faketcp_ipv6_fragment",
 		"iph->ihl != 5",
+		"struct faketcp_ipv4_checksum_delta",
+		"faketcp_xdp_update_ipv4_header",
+		"l3->l3_header_len + sizeof(struct udphdr)",
 	} {
 		if strings.Contains(main, removed) {
 			t.Fatalf("obsolete independent parser path remains: %q", removed)
 		}
 	}
-	if !strings.Contains(tc, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3) < 0") {
+	if !strings.Contains(tc, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3) != FAKETCP_L3_OK") {
 		t.Fatal("TC ingress did not revalidate the XDP-decoded packet with the shared L3 contract")
+	}
+
+	preflightStart := strings.Index(main, "static __always_inline int faketcp_preflight_egress")
+	preflightEnd := strings.Index(main, "static __always_inline __s64 faketcp_rotation_checksum")
+	if preflightStart < 0 || preflightEnd <= preflightStart {
+		t.Fatal("FakeTCP preflight boundaries are missing")
+	}
+	preflight := main[preflightStart:preflightEnd]
+	tcGate := strings.Index(preflight, "faketcp_parse_tc_l3(skb, info, &l3)")
+	capture := strings.Index(preflight, "faketcp_capture_first_packet(skb, info, &l3")
+	if tcGate < 0 || capture < 0 || tcGate >= capture {
+		t.Fatal("fixed-header transform gate must precede first-packet capture")
+	}
+	tcIngressStart := strings.Index(tc, "int wg_mix_ingress(struct __sk_buff *skb)")
+	if tcIngressStart < 0 {
+		t.Fatal("TC ingress entry point is missing")
+	}
+	tcIngress := tc[tcIngressStart:]
+	tcIngressGate := strings.Index(tcIngress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	tcMutation := strings.Index(tcIngress, "update_type_word(skb, &info")
+	if tcIngressGate < 0 || tcMutation < 0 || tcIngressGate >= tcMutation {
+		t.Fatal("fixed-header transform gate must precede TC ingress mutation")
+	}
+
+	xdpStart := strings.Index(main, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
+	if xdpStart < 0 {
+		t.Fatal("FakeTCP XDP entry point is missing")
+	}
+	xdp := main[xdpStart:]
+	parse := strings.Index(xdp, "parse_rc = faketcp_parse_l3")
+	lookup := strings.Index(xdp, "listener = faketcp_xdp_managed_port")
+	xdpGate := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")
+	event := strings.Index(xdp, "faketcp_emit_event(&key")
+	mutation := strings.Index(xdp, "bpf_xdp_store_bytes(xdp, l3.l4_off")
+	if parse < 0 || lookup < 0 || xdpGate < 0 || event < 0 || mutation < 0 ||
+		parse >= lookup || lookup >= xdpGate || xdpGate >= event || xdpGate >= mutation {
+		t.Fatal("ParseL3, managed-port lookup and the sole transform gate must precede XDP capture/mutation")
 	}
 	if fakeTCPImplementedCapabilities&fakeTCPCapabilityL3Parser != 0 {
 		t.Fatal("L3 parser capability opened before verifier and real-host evidence")

@@ -51,6 +51,26 @@ struct faketcp_l3_info {
 _Static_assert(sizeof(struct faketcp_l3_info) == 28,
 	       "faketcp L3 descriptor layout drift");
 
+// The generic parser accepts bounded IPv4 options, IPv6 and TCP options so it
+// can classify them without guessing ports. The current FakeTCP checksum,
+// capture, raw and controller contracts remain fixed-header IPv4-only; this
+// is the sole narrower integration gate used before any transform.
+static __always_inline int
+faketcp_managed_transform_status(const struct faketcp_l3_info *info,
+				  __u8 transport_protocol)
+{
+	if (info->family != FAMILY_IPV4 ||
+	    info->l3_header_len != sizeof(struct iphdr) ||
+	    info->transport_protocol != transport_protocol)
+		return FAKETCP_L3_UNSUPPORTED;
+	if ((transport_protocol == IPPROTO_UDP &&
+	     info->l4_header_len == sizeof(struct udphdr)) ||
+	    (transport_protocol == IPPROTO_TCP &&
+	     info->l4_header_len == sizeof(struct tcphdr)))
+		return FAKETCP_L3_OK;
+	return FAKETCP_L3_UNSUPPORTED;
+}
+
 struct faketcp_l3_ipv6_extension {
 	__u8 next_header;
 	__u8 header_length;

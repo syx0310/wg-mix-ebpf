@@ -321,7 +321,7 @@ func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
 		t.Fatal("MTU check, checksum-state normalization and full recompute are out of order")
 	}
 	for _, want := range []string{
-		"old_total_len != l3.l3_header_len + udp_len",
+		"old_total_len != sizeof(*iph) + udp_len",
 		"old_total_len > FAKETCP_MAX_IPV4_TOTAL_LEN",
 		"old_total_len != skb->len - info->ip_off",
 	} {
@@ -508,8 +508,8 @@ func TestFakeTCPXDPUsesSharedL3ParserBeforeManagedPortPolicy(t *testing.T) {
 		"parser_mode != PARSER_ETHERNET",
 		"parse_rc = faketcp_parse_l3",
 		"parse_rc == FAKETCP_L3_SAFE_BYPASS",
-		"l3.family != FAMILY_IPV4",
-		"A managed packet can only PASS after successful FakeTCP decoding",
+		"faketcp_managed_transform_status(&l3, l3.transport_protocol)",
+		"before native-UDP handling, event capture or any packet mutation",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("managed-port fail-closed source contract missing %q", want)
@@ -522,9 +522,9 @@ func TestFakeTCPXDPUsesSharedL3ParserBeforeManagedPortPolicy(t *testing.T) {
 	xdp := text[xdpStart:]
 	parse := strings.Index(xdp, "parse_rc = faketcp_parse_l3")
 	lookup := strings.Index(xdp, "listener = faketcp_xdp_managed_port")
-	unsupported := strings.Index(xdp, "if (l3.l4_header_len != sizeof(*tcp))")
+	unsupported := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")
 	if parse < 0 || lookup < 0 || unsupported < 0 || parse >= lookup || lookup >= unsupported {
-		t.Fatal("shared L3 validation must precede managed-port lookup and TCP option rejection")
+		t.Fatal("shared L3 validation must precede managed-port lookup and the single transform gate")
 	}
 }
 

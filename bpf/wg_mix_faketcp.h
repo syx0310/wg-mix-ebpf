@@ -565,9 +565,10 @@ static __always_inline int faketcp_tc_key(struct __sk_buff *skb,
 	void *data_end = (void *)(long)skb->data_end;
 	struct iphdr *iph = data + l3->l3_off;
 
-	if (info->family != FAMILY_IPV4 || l3->family != FAMILY_IPV4 ||
-	    l3->transport_protocol != IPPROTO_UDP ||
-	    l3->l4_off != info->udp_off || (void *)(iph + 1) > data_end)
+	// faketcp_parse_tc_l3 already applied the sole fixed-header IPv4 gate.
+	// Keep only descriptor/source-parser coherence and verifier bounds here.
+	if (l3->l3_off != info->ip_off || l3->l4_off != info->udp_off ||
+	    (void *)(iph + 1) > data_end)
 		return -1;
 	key->generation = generation;
 	key->local_ipv4 = iph->saddr;
@@ -588,12 +589,15 @@ static __always_inline int faketcp_parse_tc_l3(struct __sk_buff *skb,
 
 	rc = faketcp_parse_l3(data, data_end, skb->len, info->ip_off,
 			      info->family, l3);
-	if (rc != FAKETCP_L3_OK || l3->family != FAMILY_IPV4 ||
-	    l3->transport_protocol != IPPROTO_UDP ||
-	    l3->l4_off != info->udp_off || l3->l4_header_len != sizeof(struct udphdr) ||
+	if (rc != FAKETCP_L3_OK)
+		return rc;
+	rc = faketcp_managed_transform_status(l3, IPPROTO_UDP);
+	if (rc != FAKETCP_L3_OK)
+		return rc;
+	if (l3->l4_off != info->udp_off ||
 	    l3->l4_len != sizeof(struct udphdr) + info->payload_len)
-		return -1;
-	return 0;
+		return FAKETCP_L3_MALFORMED;
+	return FAKETCP_L3_OK;
 }
 
 // Capture happens before type-word and XOR mutation. The userspace release
@@ -612,9 +616,9 @@ static __always_inline int faketcp_capture_first_packet(struct __sk_buff *skb,
 	__u16 packet_len;
 
 	packet_len = l3->l3_len;
-	if (packet_len < l3->l3_header_len + sizeof(struct udphdr) ||
+	if (packet_len < sizeof(struct iphdr) + sizeof(struct udphdr) ||
 	    packet_len > FAKETCP_MAX_CAPTURED_PACKET ||
-	    (__u32)packet_len != l3->l3_header_len + sizeof(struct udphdr) +
+	    (__u32)packet_len != sizeof(struct iphdr) + sizeof(struct udphdr) +
 				 info->payload_len ||
 	    info->ip_off > skb->len || packet_len > skb->len - info->ip_off)
 		return -1;
@@ -672,14 +676,14 @@ static __always_inline int faketcp_preflight_egress(struct __sk_buff *skb,
 		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
 		return -1;
 	}
-	if (faketcp_parse_tc_l3(skb, info, &l3) < 0 ||
-	    l3.l3_len > FAKETCP_MAX_IPV4_TOTAL_LEN ||
+	if (faketcp_parse_tc_l3(skb, info, &l3) != FAKETCP_L3_OK ||
 	    info->payload_len > FAKETCP_MAX_IPV4_TOTAL_LEN -
-				 l3.l3_header_len - sizeof(struct udphdr)) {
+				 sizeof(struct iphdr) - sizeof(struct udphdr)) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return -1;
 	}
-	old_total_len = l3.l3_len;
+	old_total_len = sizeof(struct iphdr) + sizeof(struct udphdr) +
+			info->payload_len;
 	if (info->ip_off > skb->len || old_total_len != skb->len - info->ip_off) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return -1;
@@ -845,7 +849,7 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	__u32 seq;
 
 	if (rule->transport_mode != TRANSPORT_FAKETCP ||
-	    faketcp_parse_tc_l3(skb, info, &l3) < 0 ||
+	    faketcp_parse_tc_l3(skb, info, &l3) != FAKETCP_L3_OK ||
 	    info->payload_len < FAKETCP_HEADER_DELTA ||
 	    (void *)(iph + 1) > data_end || (void *)(udp + 1) > data_end) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
@@ -874,9 +878,9 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	}
 	old_udp = *udp;
 	udp_len = bpf_ntohs(old_udp.len);
-	old_total_len = l3.l3_len;
+	old_total_len = bpf_ntohs(iph->tot_len);
 	if (udp_len != info->payload_len + sizeof(old_udp) ||
-	    old_total_len != l3.l3_header_len + udp_len ||
+	    old_total_len != sizeof(*iph) + udp_len ||
 	    old_total_len > FAKETCP_MAX_IPV4_TOTAL_LEN ||
 	    old_total_len > 0xffff - FAKETCP_HEADER_DELTA ||
 	    info->ip_off > skb->len || old_total_len != skb->len - info->ip_off ||
@@ -1079,46 +1083,6 @@ static __always_inline int faketcp_xdp_l3_start(void *data, void *data_end,
 	return FAKETCP_L3_SAFE_BYPASS;
 }
 
-struct faketcp_ipv4_checksum_delta {
-	__be16 total_len;
-	__u8 ttl;
-	__u8 protocol;
-};
-
-static __always_inline int
-faketcp_xdp_update_ipv4_header(struct xdp_md *xdp,
-				const struct faketcp_l3_info *l3,
-				const struct iphdr *iph, __u16 new_total_len)
-{
-	struct faketcp_ipv4_checksum_delta old_fields = {
-		.total_len = iph->tot_len,
-		.ttl = iph->ttl,
-		.protocol = iph->protocol,
-	};
-	struct faketcp_ipv4_checksum_delta new_fields = {
-		.total_len = bpf_htons(new_total_len),
-		.ttl = iph->ttl,
-		.protocol = IPPROTO_UDP,
-	};
-	__be16 checksum;
-	__s64 sum = (~bpf_ntohs(iph->check)) & 0xffff;
-	__u8 protocol = IPPROTO_UDP;
-
-	sum = bpf_csum_diff((__be32 *)&old_fields, sizeof(old_fields),
-			    (__be32 *)&new_fields, sizeof(new_fields), sum);
-	if (sum < 0)
-		return -1;
-	checksum = bpf_htons(fold_csum(sum));
-	if (bpf_xdp_store_bytes(xdp, l3->l3_off + offsetof(struct iphdr, tot_len),
-				&new_fields.total_len, sizeof(new_fields.total_len)) < 0 ||
-	    bpf_xdp_store_bytes(xdp, l3->l3_off + offsetof(struct iphdr, protocol),
-				&protocol, sizeof(protocol)) < 0 ||
-	    bpf_xdp_store_bytes(xdp, l3->l3_off + offsetof(struct iphdr, check),
-				&checksum, sizeof(checksum)) < 0)
-		return -1;
-	return 0;
-}
-
 static __always_inline __u8 faketcp_tcp_flags(const struct tcphdr *tcp)
 {
 	const __u8 *raw = (const __u8 *)tcp;
@@ -1153,6 +1117,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	struct faketcp_session_value *session;
 	struct faketcp_metadata *metadata;
 	struct faketcp_pseudo_tail old_pseudo, new_pseudo;
+	struct iphdr new_ip;
 	struct tcphdr old_tcp;
 	struct udphdr udp = {};
 	__u8 tail[FAKETCP_HEADER_DELTA] = {};
@@ -1187,12 +1152,11 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 						    bpf_ntohs(wire_ports->dest), generation);
 	if (!listener)
 		return XDP_PASS;
-	// IPv6 is classified without ambiguity, but the current session ABI and
-	// wire transform are IPv4-only. A managed IPv6 port must fail closed.
-	if (l3.family != FAMILY_IPV4)
-		return XDP_DROP;
-	iph = data + l3.l3_off;
-	if ((void *)(iph + 1) > data_end)
+	// ParseL3 can classify IPv4 options, IPv6 and TCP options, but the current
+	// checksum/session ABI transforms only fixed-header IPv4. Reject once,
+	// before native-UDP handling, event capture or any packet mutation.
+	if (faketcp_managed_transform_status(&l3, l3.transport_protocol) !=
+	    FAKETCP_L3_OK)
 		return XDP_DROP;
 	// Native UDP to a FakeTCP port is a transport-bypass attempt. Decoded
 	// packets do not re-enter XDP, so this cannot catch the valid TCP-to-UDP
@@ -1202,11 +1166,10 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	tcp = (struct tcphdr *)wire_ports;
 	if ((void *)(tcp + 1) > data_end)
 		return XDP_DROP;
-	// The policy lookup deliberately precedes all unsupported-header checks.
-	// A managed packet can only PASS after successful FakeTCP decoding.
-	if (l3.l4_header_len != sizeof(*tcp))
-		return XDP_DROP;
 	if (listener->action != ACTION_REWRITE)
+		return XDP_DROP;
+	iph = data + l3.l3_off;
+	if ((void *)(iph + 1) > data_end)
 		return XDP_DROP;
 	total_len = l3.l3_len;
 	tcp_len = l3.l4_len;
@@ -1303,12 +1266,20 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 			       sizeof(tail)) < 0)
 		return XDP_DROP;
 
-	// The checksum delta touches only total_len and TTL/protocol, preserving
-	// bounded IPv4 options byte-for-byte.
+	// The integration gate accepts only a fixed 20-byte IPv4 header, so one
+	// bounded full-header checksum recomputation covers every transformed byte.
 	iph = data + l3.l3_off;
 	if ((void *)(iph + 1) > data_end)
 		return XDP_DROP;
-	if (faketcp_xdp_update_ipv4_header(xdp, &l3, iph, new_total_len) < 0 ||
+	new_ip = *iph;
+	new_ip.protocol = IPPROTO_UDP;
+	new_ip.tot_len = bpf_htons(new_total_len);
+	new_ip.check = 0;
+	sum = bpf_csum_diff(0, 0, (__be32 *)&new_ip, sizeof(new_ip), 0);
+	if (sum < 0)
+		return XDP_DROP;
+	new_ip.check = bpf_htons(fold_csum(sum));
+	if (bpf_xdp_store_bytes(xdp, l3.l3_off, &new_ip, sizeof(new_ip)) < 0 ||
 	    bpf_xdp_adjust_tail(xdp, -FAKETCP_HEADER_DELTA) < 0)
 		return XDP_DROP;
 
