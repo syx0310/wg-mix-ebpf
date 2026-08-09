@@ -169,19 +169,19 @@ func prepareFakeTCPManagedIngressUnmanagedProbe(
 	}
 	var existing abi.UnderlayConfigValue
 	if err := parserMap.Lookup(key, &existing); !errors.Is(err, ebpf.ErrKeyNotExist) {
-		t.Fatalf("synthetic managed-ingress parser key preexists: value=%#v error=%v", existing, err)
+		t.Fatalf("managed-ingress probe parser key preexists: value=%#v error=%v", existing, err)
 	}
 	managedKey := abi.FakeTCPManagedIfKey{
 		Generation: runtime.Generation(), UnderlayIndex: probeIfindex,
 	}
 	var managed abi.FakeTCPManagedIfValue
 	if err := managedInterfaces.Lookup(managedKey, &managed); !errors.Is(err, ebpf.ErrKeyNotExist) {
-		t.Fatalf("synthetic managed-ingress interface is unexpectedly managed: value=%#v error=%v", managed, err)
+		t.Fatalf("managed-ingress probe interface is unexpectedly managed: value=%#v error=%v", managed, err)
 	}
 	if err := parserMap.Update(key, abi.UnderlayConfigValue{
 		Generation: runtime.Generation(), ParserMode: abi.ParserEthernet,
 	}, ebpf.UpdateNoExist); err != nil {
-		t.Fatalf("install synthetic unmanaged Ethernet parser key: %v", err)
+		t.Fatalf("install unmanaged probe Ethernet parser key: %v", err)
 	}
 	released := false
 	release := func() {
@@ -190,11 +190,11 @@ func prepareFakeTCPManagedIngressUnmanagedProbe(
 		}
 		released = true
 		if err := parserMap.Delete(key); err != nil {
-			t.Errorf("delete synthetic unmanaged Ethernet parser key: %v", err)
+			t.Errorf("delete unmanaged probe Ethernet parser key: %v", err)
 			return
 		}
 		if err := parserMap.Lookup(key, &existing); !errors.Is(err, ebpf.ErrKeyNotExist) {
-			t.Errorf("synthetic unmanaged Ethernet parser key remains: value=%#v error=%v", existing, err)
+			t.Errorf("unmanaged probe Ethernet parser key remains: value=%#v error=%v", existing, err)
 		}
 	}
 	return program, probeIfindex, release
@@ -453,8 +453,14 @@ func buildFakeTCPManagedIngressCells(
 		))
 	}
 	makeTruncated := func(index byte) []byte {
-		l3 := make([]byte, 10)
-		l3[0] = 0x45
+		// Keep the frame at Ethernet's minimum wire size, but declare more L3
+		// bytes than are present so veth padding cannot change TRUNCATED.
+		l3 := make([]byte, 46)
+		l3[0], l3[8], l3[9] = 0x45, 64, unix.IPPROTO_TCP
+		binary.BigEndian.PutUint16(l3[2:4], 64)
+		copy(l3[12:16], []byte{10, 0, 0, 1})
+		copy(l3[16:20], []byte{10, 0, 0, 2})
+		binary.BigEndian.PutUint16(l3[10:12], internetChecksum(l3[:20]))
 		return frame(index, unix.ETH_P_IP, l3)
 	}
 
@@ -674,6 +680,11 @@ func fakeTCPManagedIngressIPv6TCP(
 	binary.BigEndian.PutUint16(tcp[2:4], destinationPort)
 	tcp[12], tcp[13] = 5<<4, faketcp.FlagACK|faketcp.FlagPSH
 	tcp = append(tcp, payload...)
+	source := netip.MustParseAddr("2001:db8::1")
+	destination := netip.MustParseAddr("2001:db8::2")
+	binary.BigEndian.PutUint16(tcp[16:18], fakeTCPManagedIngressIPv6Checksum(
+		source, destination, unix.IPPROTO_TCP, tcp,
+	))
 	nextHeader := byte(unix.IPPROTO_TCP)
 	prefix := make([]byte, 0, extensions*8+8)
 	if fragment != 0 {
@@ -692,8 +703,8 @@ func fakeTCPManagedIngressIPv6TCP(
 	ipv6 := make([]byte, 40, 40+len(prefix)+len(tcp))
 	ipv6[0], ipv6[6], ipv6[7] = 0x60, nextHeader, 64
 	binary.BigEndian.PutUint16(ipv6[4:6], uint16(len(prefix)+len(tcp)))
-	copy(ipv6[8:24], netip.MustParseAddr("2001:db8::1").AsSlice())
-	copy(ipv6[24:40], netip.MustParseAddr("2001:db8::2").AsSlice())
+	copy(ipv6[8:24], source.AsSlice())
+	copy(ipv6[24:40], destination.AsSlice())
 	ipv6 = append(ipv6, prefix...)
 	return append(ipv6, tcp...)
 }
@@ -722,7 +733,7 @@ func fakeTCPManagedIngressIPv6ICMP(payload []byte) []byte {
 	binary.BigEndian.PutUint16(icmp[4:6], 0x4242)
 	binary.BigEndian.PutUint16(icmp[6:8], 1)
 	icmp = append(icmp, payload...)
-	binary.BigEndian.PutUint16(icmp[2:4], fakeTCPRoutedTransportChecksum(
+	binary.BigEndian.PutUint16(icmp[2:4], fakeTCPManagedIngressIPv6Checksum(
 		source, destination, unix.IPPROTO_ICMPV6, icmp,
 	))
 	ipv6 := make([]byte, 40, 40+len(icmp))
@@ -731,4 +742,21 @@ func fakeTCPManagedIngressIPv6ICMP(payload []byte) []byte {
 	copy(ipv6[8:24], source.AsSlice())
 	copy(ipv6[24:40], destination.AsSlice())
 	return append(ipv6, icmp...)
+}
+
+func fakeTCPManagedIngressIPv6Checksum(
+	source, destination netip.Addr,
+	protocol byte,
+	transport []byte,
+) uint16 {
+	pseudo := make([]byte, 40, 40+len(transport))
+	copy(pseudo[0:16], source.AsSlice())
+	copy(pseudo[16:32], destination.AsSlice())
+	binary.BigEndian.PutUint32(pseudo[32:36], uint32(len(transport)))
+	pseudo[39] = protocol
+	checksum := internetChecksum(append(pseudo, transport...))
+	if checksum == 0 {
+		return 0xffff
+	}
+	return checksum
 }
