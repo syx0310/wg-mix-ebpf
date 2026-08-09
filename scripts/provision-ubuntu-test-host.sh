@@ -212,7 +212,8 @@ dpkg_status_has_pending_work() {
 
 if [[ "${MODE}" == "self-test" ]]; then
   for fixture in 'Inst new-package (1.0 repository)' \
-    'Inst linux-headers-7.0.0-28-generic (1.0 repository)'; do
+    'Inst linux-headers-7.0.0-28-generic (1.0 repository)' \
+    $'Inst clang (1.0 repository)\nConf clang (1.0 repository)'; do
     if apt_plan_has_forbidden_changes <<<"${fixture}"; then
       echo "error: safe package fixture was rejected: ${fixture}" >&2
       exit 1
@@ -225,13 +226,32 @@ if [[ "${MODE}" == "self-test" ]]; then
     'Inst linux-image-7.0.0-29-generic (1.0 repository)' \
     'Inst linux-modules-extra-7.0.0-29-generic (1.0 repository)' \
     'Inst shim-signed (1.0 repository)' \
-    'Inst systemd-boot-efi (1.0 repository)'; do
+    'Inst systemd-boot-efi (1.0 repository)' \
+    'Conf existing-package (1.1 repository)' \
+    'Conf grub-pc (1.0 repository)' \
+    'Conf initramfs-tools-core (1.0 repository)' \
+    'Conf linux-image-7.0.0-29-generic (1.0 repository)' \
+    'Conf linux-modules-extra-7.0.0-29-generic (1.0 repository)' \
+    'Conf shim-signed (1.0 repository)' \
+    'Conf systemd-boot-efi (1.0 repository)'; do
     if ! apt_plan_has_forbidden_changes <<<"${fixture}"; then
       echo "error: unsafe package fixture was accepted: ${fixture}" >&2
       exit 1
     fi
   done
-  echo "APT simulation gate self-test passed"
+  if dpkg_status_has_pending_work <<< $'ii \tbase-files\nhi \theld-package\nrc \tremoved-package\npn \tpurged-package\nun \tunknown-package'; then
+    echo 'error: stable dpkg status fixture was rejected' >&2
+    exit 1
+  fi
+  for fixture in $'iU \tunpacked-package' $'iF \thalf-configured-package' \
+    $'it \ttriggers-pending-package' $'iW \ttriggers-awaited-package' \
+    $'iH \thalf-installed-package' $'iiR\treinst-required-package' ''; do
+    if ! dpkg_status_has_pending_work <<<"${fixture}"; then
+      echo "error: incomplete dpkg status fixture was accepted: ${fixture}" >&2
+      exit 1
+    fi
+  done
+  echo "APT/dpkg safety gate self-test passed"
   exit 0
 fi
 
