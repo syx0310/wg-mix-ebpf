@@ -251,6 +251,8 @@ class CoreSpec:
             raise HarnessError("soak-window-seconds must be in [10,300]")
         if self.soak_seconds % self.soak_window_seconds:
             raise HarnessError("soak-seconds must be exactly divisible by soak-window-seconds")
+        if self.soak_window_seconds % 10:
+            raise HarnessError("soak-window-seconds must be exactly divisible by the 10s sample interval")
         return self
 
     def as_dict(self) -> dict[str, Any]:
@@ -265,9 +267,12 @@ class CommandRunner:
             return process.wait(timeout)
 
     def wait_until(self, deadline: float) -> None:
-        remaining = deadline - time.monotonic()
+        remaining = deadline - self.monotonic()
         if remaining > 0:
             time.sleep(remaining)
+
+    def monotonic(self) -> float:
+        return time.monotonic()
 
     def start(self, argv: Sequence[str]) -> "RunningProcess":
         if not argv or not os.path.isabs(argv[0]):
@@ -1506,10 +1511,27 @@ def mtu_cell(spec: CoreSpec, name: str, target_mtu: int) -> dict[str, Any]:
     }
 
 
+def soak_timing_contract(spec: CoreSpec) -> dict[str, int]:
+    interval = 10
+    maximum_gap = 2
+    windows = spec.soak_seconds // spec.soak_window_seconds
+    return {
+        "interval_seconds": interval,
+        "samples_per_window": spec.soak_window_seconds // interval,
+        "expected_windows": windows,
+        "expected_samples": spec.soak_seconds // interval,
+        "required_measured_seconds": spec.soak_seconds,
+        "maximum_lateness_seconds": 2,
+        "maximum_interwindow_gap_seconds": maximum_gap,
+        "monitor_seconds": spec.soak_seconds + (windows + 2) * maximum_gap,
+    }
+
+
 def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
     name = "tcp-soak-all-on"
     mutation, restore, expected, unsupported = ethtool_steps(spec, snapshot, "all-on", name)
     windows = spec.soak_seconds // spec.soak_window_seconds
+    timing = soak_timing_contract(spec)
     traffic: list[dict[str, Any]] = []
     ping = command_step(
         spec.run_root,
@@ -1518,7 +1540,7 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
             TOOLS["timeout"],
             "--signal=TERM",
             "--kill-after=5s",
-            f"{spec.soak_seconds + 5}s",
+            f"{timing['monitor_seconds'] + 5}s",
             TOOLS["ping"],
             "-4",
             "-I",
@@ -1526,10 +1548,10 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
             "-i",
             "1",
             "-w",
-            str(spec.soak_seconds),
+            str(timing["monitor_seconds"]),
             spec.peer_address,
         ],
-        spec.soak_seconds + 15,
+        timing["monitor_seconds"] + 15,
         target=f"peer:{spec.peer_address}",
     )
     ping.update({"kind": "ping-monitor", "parallel_group": name})
@@ -1549,8 +1571,6 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
             "--connect-timeout",
             "5000",
             "--json",
-            "--omit",
-            "2",
             "-t",
             str(spec.soak_window_seconds),
             "-P",
@@ -1589,8 +1609,7 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "traffic": traffic,
         "soak_oracle": aggregate_oracle,
         "counter_sample_schedule": {
-            "interval_seconds": 10,
-            "expected_samples": spec.soak_seconds // 10,
+            **timing,
             "commands": [argv for _, argv in monitor_command_table(spec)],
             "evidence": f"{spec.run_root}/tcp-soak-all-on.counter-samples.json",
         },
@@ -1966,8 +1985,7 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
         if cell.get("kind") == "tcp-soak":
             schedule = cell.get("counter_sample_schedule")
             expected_schedule = {
-                "interval_seconds": 10,
-                "expected_samples": spec.soak_seconds // 10,
+                **soak_timing_contract(spec),
                 "commands": [argv for _, argv in monitor_command_table(spec)],
                 "evidence": f"{spec.run_root}/tcp-soak-all-on.counter-samples.json",
             }
@@ -2886,6 +2904,95 @@ def validate_counter_gate_schema(contract: Mapping[str, Any], counters: Mapping[
         raise HarnessError("runtime counter schema differs from the approved plan")
 
 
+@dataclasses.dataclass
+class SoakCadence:
+    contract: Mapping[str, Any]
+    origin: float
+    points: list[dict[str, Any]] = dataclasses.field(default_factory=list)
+    _absolute_points: list[float] = dataclasses.field(default_factory=list)
+    _window_starts: list[float] = dataclasses.field(default_factory=list)
+    _start_gaps: list[float] = dataclasses.field(default_factory=list)
+    _active_window: int | None = None
+    _next_sample: int = 1
+
+    def start_window(self, window: int, now: float) -> float:
+        if self._active_window is not None or window != len(self._window_starts):
+            raise HarnessError("soak cadence window order is invalid")
+        reference = self.origin if not self._absolute_points else self._absolute_points[-1]
+        gap = now - reference
+        if gap < 0 or gap > self.contract["maximum_interwindow_gap_seconds"]:
+            raise HarnessError(f"soak interwindow gap={gap:.6f}s exceeds the reviewed bound")
+        self._window_starts.append(now)
+        self._start_gaps.append(gap)
+        self._active_window = window
+        self._next_sample = 1
+        return now
+
+    def record_sample(self, window: int, now: float) -> dict[str, Any]:
+        if window != self._active_window or self._next_sample > self.contract["samples_per_window"]:
+            raise HarnessError("soak cadence sample order is invalid")
+        scheduled = self._next_sample * self.contract["interval_seconds"]
+        observed = now - self._window_starts[window]
+        lateness = observed - scheduled
+        if lateness < 0 or lateness > self.contract["maximum_lateness_seconds"]:
+            raise HarnessError(f"soak counter sample lateness={lateness:.6f}s exceeds the reviewed bound")
+        point = {
+            "index": len(self.points) + 1,
+            "window": window,
+            "sample_in_window": self._next_sample,
+            "scheduled_window_seconds": scheduled,
+            "observed_window_seconds": round(observed, 6),
+            "observed_total_seconds": round(now - self.origin, 6),
+            "lateness_seconds": round(lateness, 6),
+        }
+        self.points.append(point)
+        self._absolute_points.append(now)
+        self._next_sample += 1
+        return point
+
+    def finish_window(self, window: int) -> None:
+        if (
+            window != self._active_window
+            or self._next_sample != self.contract["samples_per_window"] + 1
+        ):
+            raise HarnessError("soak cadence window has incomplete measured coverage")
+        self._active_window = None
+
+    def complete(self) -> dict[str, Any]:
+        expected_windows = self.contract["expected_windows"]
+        expected_samples = self.contract["expected_samples"]
+        measured_seconds = (
+            len(self._window_starts)
+            * self.contract["samples_per_window"]
+            * self.contract["interval_seconds"]
+        )
+        if (
+            self._active_window is not None
+            or len(self._window_starts) != expected_windows
+            or len(self.points) != expected_samples
+            or measured_seconds != self.contract["required_measured_seconds"]
+        ):
+            raise HarnessError("soak cadence does not cover every reviewed measured window")
+        last_offset = self.points[-1]["observed_total_seconds"] if self.points else 0
+        if last_offset > self.contract["monitor_seconds"]:
+            raise HarnessError("soak cadence outlasted its parallel ping monitor")
+        sample_gaps = [
+            current - previous
+            for previous, current in zip(self._absolute_points, self._absolute_points[1:])
+        ]
+        return {
+            "schema": "wg-mix-ebpf-realnic-soak-cadence-result-v1",
+            "windows": len(self._window_starts),
+            "samples": len(self.points),
+            "measured_seconds": measured_seconds,
+            "first_sample_offset_seconds": self.points[0]["observed_total_seconds"],
+            "last_sample_offset_seconds": last_offset,
+            "maximum_lateness_seconds": max(point["lateness_seconds"] for point in self.points),
+            "maximum_interwindow_gap_seconds": max(self._start_gaps),
+            "maximum_observed_sample_gap_seconds": max(sample_gaps, default=0),
+        }
+
+
 def run_traffic(
     spec: CoreSpec,
     cell: Mapping[str, Any],
@@ -2912,8 +3019,7 @@ def run_traffic(
     schedule = cell["counter_sample_schedule"]
     samples: list[dict[str, Any]] = []
     previous_counters = dict(counter_baseline)
-    sample_index = 0
-    sample_origin = time.monotonic()
+    cadence = SoakCadence(schedule, runner.monotonic())
     journal.append(
         "SOAK_COUNTER_SAMPLING_START",
         commands=schedule["commands"],
@@ -2930,6 +3036,7 @@ def run_traffic(
         )
         try:
             for step in steps[1:]:
+                window = step["window"]
                 journal.append("COMMAND_START", label=step["label"], argv=step["argv"], target=step["target"])
                 with OwnedProcessScope(runner, step["argv"]) as iperf_process:
                     journal.append(
@@ -2938,25 +3045,25 @@ def run_traffic(
                         pid=iperf_process.pid,
                         pgid=iperf_process.pgid,
                     )
-                    samples_this_window = spec.soak_window_seconds // schedule["interval_seconds"]
-                    for _ in range(samples_this_window):
+                    window_origin = cadence.start_window(window, runner.monotonic())
+                    for sample_in_window in range(1, schedule["samples_per_window"] + 1):
                         runner.wait_until(
-                            sample_origin + (sample_index + 1) * schedule["interval_seconds"]
+                            window_origin + sample_in_window * schedule["interval_seconds"]
                         )
                         counters = capture_counter_sample(spec, runner)
                         delta = counter_delta(previous_counters, counters)
-                        sample_index += 1
+                        timing = cadence.record_sample(window, runner.monotonic())
                         record = {
-                            "index": sample_index,
-                            "scheduled_elapsed_seconds": sample_index * schedule["interval_seconds"],
-                            "observed_monotonic_offset_seconds": round(time.monotonic() - sample_origin, 6),
+                            **timing,
                             "counters": counters,
                             "delta": delta,
                         }
                         samples.append(record)
                         journal.append(
                             "SOAK_COUNTER_SAMPLE",
-                            index=sample_index,
+                            index=timing["index"],
+                            window=window,
+                            lateness_seconds=timing["lateness_seconds"],
                             counters_sha256=sha256_bytes(canonical_json(counters)),
                             delta_sha256=sha256_bytes(canonical_json(delta)),
                         )
@@ -2965,6 +3072,7 @@ def run_traffic(
                 oracle = step["oracle"]
                 _, oracle_stdout, _ = execute_step(oracle, runner, journal)
                 metrics = iperf_oracle_metrics(oracle_stdout, step["streams"], step["direction"])
+                cadence.finish_window(window)
                 results.append(
                     {
                         "label": step["label"],
@@ -2972,21 +3080,20 @@ def run_traffic(
                         "metrics": metrics,
                     }
                 )
-            if sample_index != schedule["expected_samples"]:
-                raise HarnessError(
-                    f"soak counter sample count={sample_index}, want {schedule['expected_samples']}"
-                )
+            cadence_result = cadence.complete()
             sample_evidence = {
                 "schema": "wg-mix-ebpf-b82-realnic-soak-counters-v1",
                 "run_id": spec.run_id,
-                "interval_seconds": schedule["interval_seconds"],
+                "timing_contract": soak_timing_contract(spec),
+                "cadence": cadence_result,
                 "expected_samples": schedule["expected_samples"],
                 "samples": samples,
             }
             write_exclusive(schedule["evidence"], canonical_json(sample_evidence))
             journal.append(
                 "SOAK_COUNTER_SAMPLING_COMPLETE",
-                samples=sample_index,
+                samples=len(samples),
+                cadence=cadence_result,
                 evidence=schedule["evidence"],
                 evidence_sha256=sha256_bytes(canonical_json(sample_evidence)),
             )

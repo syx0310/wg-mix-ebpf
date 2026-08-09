@@ -102,6 +102,9 @@ class SimulatedRunner(FixtureRunner):
         self.ifindex_reads = 0
         self.fail_ifindex_read = None
         self.read_failures = set()
+        self.clock = 0.0
+        self.counter_command_seconds = 0.0
+        self.oracle_command_seconds = 0.0
         self.started = []
 
     def feature_output(self):
@@ -162,6 +165,8 @@ class SimulatedRunner(FixtureRunner):
         del timeout
         argv = list(argv)
         self.calls.append((argv, 0))
+        if any(argv == command for _, command in MODULE.monitor_command_table(self.spec)):
+            self.clock += self.counter_command_seconds
         if argv[:3] == [MODULE.TOOLS["ethtool"], "-K", self.spec.interface]:
             name, value = argv[3:5]
             if self.fixed.get(name):
@@ -200,6 +205,7 @@ class SimulatedRunner(FixtureRunner):
                 return 1, b'{"error":"injected failure"}\n', b""
             return 0, self.iperf_output(argv), b""
         if argv[:3] == [MODULE.TOOLS["python3"], "-I", MODULE.iperf_checker_path()]:
+            self.clock += self.oracle_command_seconds
             try:
                 if argv[3] == "one":
                     options = dict(zip(argv[5::2], argv[6::2]))
@@ -251,7 +257,10 @@ class SimulatedRunner(FixtureRunner):
         return FakeRunningProcess()
 
     def wait_until(self, deadline):
-        del deadline
+        self.clock = max(self.clock, deadline)
+
+    def monotonic(self):
+        return self.clock
 
 
 def fixture_spec(**changes):
@@ -835,6 +844,10 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(len(soak["traffic"]) - 1, 12)
         self.assertEqual(soak["counter_sample_schedule"]["expected_samples"], 360)
         self.assertEqual(soak["counter_sample_schedule"]["interval_seconds"], 10)
+        self.assertEqual(soak["counter_sample_schedule"]["maximum_lateness_seconds"], 2)
+        self.assertEqual(soak["counter_sample_schedule"]["maximum_interwindow_gap_seconds"], 2)
+        self.assertEqual(soak["counter_sample_schedule"]["required_measured_seconds"], 3600)
+        self.assertTrue(all("--omit" not in step["argv"] for step in soak["traffic"][1:]))
         self.assertIsNotNone(soak["soak_oracle"])
         self.assertIn("--minimum-throughput-ratio", soak["soak_oracle"]["argv"])
         with self.assertRaisesRegex(MODULE.HarnessError, "acceptance profile requires exact"):
@@ -995,6 +1008,31 @@ class HermeticStateMachineTests(unittest.TestCase):
             )
             self.assertEqual(samples["expected_samples"], 6)
             self.assertEqual(len(samples["samples"]), 6)
+            self.assertEqual(samples["cadence"]["windows"], 6)
+            self.assertEqual(samples["cadence"]["measured_seconds"], 60)
+            self.assertEqual(samples["cadence"]["first_sample_offset_seconds"], 10)
+            self.assertEqual(samples["cadence"]["last_sample_offset_seconds"], 60)
+            self.assertEqual(samples["cadence"]["maximum_lateness_seconds"], 0)
+
+    def test_slow_counter_sampling_fails_the_cadence_oracle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, digest = self.prepare(temporary)
+            runner.counter_command_seconds = 1.5
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                with self.assertRaisesRegex(MODULE.HarnessError, "sample lateness"):
+                    MODULE.run_mode(spec, plan_path, digest, runner)
+
+    def test_slow_interwindow_orchestration_fails_the_cadence_oracle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, digest = self.prepare(temporary)
+            runner.oracle_command_seconds = 3
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                with self.assertRaisesRegex(MODULE.HarnessError, "interwindow gap"):
+                    MODULE.run_mode(spec, plan_path, digest, runner)
 
     def test_acceptance_profile_executes_360_samples_and_first_hour_oracle(self):
         with tempfile.TemporaryDirectory() as temporary:
