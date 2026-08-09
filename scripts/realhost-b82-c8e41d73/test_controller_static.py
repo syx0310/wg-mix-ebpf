@@ -433,7 +433,14 @@ def main() -> None:
         "open_approved_plan_intake",
         'exec {APPROVED_PLAN_FD}<"${USER_REALNIC_PLAN}"',
         '"/proc/self/fd/${APPROVED_PLAN_FD}"',
-        "copy_approved_plan_noclobber",
+        'APPROVED_PLAN_PENDING="${ROOT_REALNIC_PLAN}.pending.${APPROVED_PLAN_SHA256}"',
+        "create_approved_plan_pending",
+        "write_approved_plan_pending",
+        "require_approved_plan_pending_fd",
+        "fsync_exact_target",
+        '/bin/ln --no-target-directory --',
+        "held-fd-writeall-fsync-hardlink-noclobber",
+        "final-pending-same-inode",
         "approved-plan-preexisting-differs",
         "approved-plan-root-snapshot",
         "verified-existing",
@@ -496,13 +503,35 @@ def main() -> None:
     snapshot_body = stager[
         stager.index("snapshot_realnic_plan() {") : stager.index("verify_realnic_plan() {")
     ]
-    if snapshot_body.count("copy_approved_plan_noclobber") != 1:
-        fail("realNIC run snapshot has zero or multiple copy primitives")
+    publish_order = (
+        "require_completed_stage",
+        "acquire_physical_interface_lock",
+        "open_approved_plan_intake",
+        "create_approved_plan_pending",
+        "write_approved_plan_pending",
+        'fsync_exact_target "${BOOTSTRAP_ROOT}" directory',
+        "require_approved_plan_pending_fd",
+        '/bin/ln --no-target-directory --',
+        'require_approved_plan_path "${ROOT_REALNIC_PLAN}"',
+        'fsync_exact_target "${BOOTSTRAP_ROOT}" directory',
+    )
+    remaining = snapshot_body
+    for literal in publish_order:
+        position = remaining.find(literal)
+        if position < 0:
+            fail(f"realNIC durable publish order is missing {literal!r}")
+        remaining = remaining[position + len(literal) :]
+    if snapshot_body.count('/bin/ln --no-target-directory --') != 1:
+        fail("realNIC durable publish has zero or multiple final link primitives")
+    if snapshot_body.count('fsync_exact_target "${BOOTSTRAP_ROOT}" directory') != 2:
+        fail("realNIC durable publish does not fsync the parent before and after link")
     verify_body = stager[
         stager.index("verify_realnic_plan() {") : stager.index("run_stage() {")
     ]
-    if "USER_REALNIC_PLAN" in verify_body or "copy_approved_plan_noclobber" in verify_body:
+    if "USER_REALNIC_PLAN" in verify_body or "write_approved_plan_pending" in verify_body:
         fail("realNIC restore verification reopens or recopies user intake")
+    if "published.v1" in stager or "publish-receipt" in stager:
+        fail("root stager introduced a second approved-plan terminal authority")
     redundant_manifest_fields = (
         "manifest_line physical_interface_lock_interface",
         "manifest_line legacy_matrix_restore_cells",

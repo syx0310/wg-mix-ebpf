@@ -1156,19 +1156,25 @@ class ControllerPlanTests(unittest.TestCase):
             path = pathlib.Path(temporary, "realnic-approved-plan.json")
             path.write_bytes(payload)
             path.chmod(0o600)
-            actual = os.stat(path)
-            root_metadata = types.SimpleNamespace(
-                st_mode=actual.st_mode,
-                st_nlink=actual.st_nlink,
-                st_size=actual.st_size,
-                st_uid=0,
-                st_gid=0,
-                st_dev=actual.st_dev,
-                st_ino=actual.st_ino,
-            )
+            pending = pathlib.Path(f"{path}.pending.{digest}")
+            os.link(path, pending)
+            original_fstat = os.fstat
+
+            def root_fstat(descriptor):
+                actual = original_fstat(descriptor)
+                return types.SimpleNamespace(
+                    st_mode=actual.st_mode,
+                    st_nlink=actual.st_nlink,
+                    st_size=actual.st_size,
+                    st_uid=0,
+                    st_gid=0,
+                    st_dev=actual.st_dev,
+                    st_ino=actual.st_ino,
+                )
+
             with (
                 mock.patch.object(MODULE, "APPROVED_PLAN_PATH", str(path)),
-                mock.patch.object(MODULE.os, "fstat", return_value=root_metadata),
+                mock.patch.object(MODULE.os, "fstat", side_effect=root_fstat),
             ):
                 loaded_spec, loaded_plan, loaded_payload = MODULE.read_controller_approved_plan(
                     str(path),
@@ -1190,6 +1196,25 @@ class ControllerPlanTests(unittest.TestCase):
                         digest,
                         self.source_commit,
                     )
+
+            foreign = pathlib.Path(temporary, "foreign-plan.json")
+            foreign.write_bytes(payload)
+            foreign.chmod(0o600)
+            foreign_pending = pathlib.Path(f"{foreign}.pending.{digest}")
+            foreign_pending.write_bytes(payload)
+            foreign_pending.chmod(0o600)
+            os.link(foreign, pathlib.Path(temporary, "foreign-plan.extra"))
+            os.link(foreign_pending, pathlib.Path(temporary, "foreign-pending.extra"))
+            with (
+                mock.patch.object(MODULE, "APPROVED_PLAN_PATH", str(foreign)),
+                mock.patch.object(MODULE.os, "fstat", side_effect=root_fstat),
+                self.assertRaisesRegex(MODULE.HarnessError, "durable publish identity"),
+            ):
+                MODULE.read_controller_approved_plan(
+                    str(foreign),
+                    digest,
+                    self.source_commit,
+                )
 
     def test_public_parser_accepts_only_source_and_approval_artifact(self):
         parser = MODULE.parser()

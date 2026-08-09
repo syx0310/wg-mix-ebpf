@@ -75,29 +75,90 @@ require_ordered_literals() {
   done
 }
 
+fixture_file_identity() {
+  /usr/bin/python3 -B -I -c \
+    'import os, sys; print(os.stat(sys.argv[1]).st_ino)' "$1"
+}
+
+approved_plan_verify_fixture() {
+  local destination="$1" expected_sha="$2" pending
+  pending="${destination}.pending.${expected_sha}"
+  /usr/bin/python3 -B -I -c \
+    'import hashlib, os, stat, sys
+final_path, pending_path, expected = sys.argv[1:]
+values = []
+for path in (final_path, pending_path):
+    value = os.lstat(path)
+    if not stat.S_ISREG(value.st_mode) or stat.S_ISLNK(value.st_mode):
+        raise SystemExit(79)
+    if stat.S_IMODE(value.st_mode) != 0o600 or value.st_nlink != 2 or not 0 < value.st_size <= 16 << 20:
+        raise SystemExit(79)
+    with open(path, "rb") as handle:
+        if hashlib.sha256(handle.read()).hexdigest() != expected:
+            raise SystemExit(79)
+    values.append((value.st_dev, value.st_ino))
+if values[0] != values[1]:
+    raise SystemExit(79)' "${destination}" "${pending}" "${expected_sha}"
+}
+
+approved_plan_pending_fixture() {
+  /usr/bin/python3 -B -I -c \
+    'import os, stat, sys
+value = os.lstat(sys.argv[1])
+if not stat.S_ISREG(value.st_mode) or stat.S_ISLNK(value.st_mode):
+    raise SystemExit(79)
+if stat.S_IMODE(value.st_mode) != 0o600 or value.st_nlink != 1 or value.st_size > 16 << 20:
+    raise SystemExit(79)' "$1"
+}
+
 approved_plan_snapshot_fixture() {
-  local source="$1" destination="$2" expected_sha="$3" source_sha destination_sha
+  local source="$1" destination="$2" expected_sha="$3" cut="${4:-none}"
+  local source_sha pending descriptor_identity path_identity
+  pending="${destination}.pending.${expected_sha}"
   [[ -f "${source}" && ! -L "${source}" ]] || return 79
   source_sha="$(sha256_file "${source}")" || return $?
   [[ "${source_sha}" == "${expected_sha}" ]] || return 79
   exec 9<"${source}" || return 79
   if [[ -e "${destination}" || -L "${destination}" ]]; then
-    [[ -f "${destination}" && ! -L "${destination}" ]] || return 79
-    destination_sha="$(sha256_file "${destination}")" || return $?
-    [[ "${destination_sha}" == "${expected_sha}" ]] || return 79
+    approved_plan_verify_fixture "${destination}" "${expected_sha}" || return $?
   else
-    (umask 077
-      set -o noclobber
-      /bin/cat -- /dev/fd/9 >"${destination}") || return $?
+    if [[ ! -e "${pending}" && ! -L "${pending}" ]]; then
+      (umask 077
+        set -o noclobber
+        : >"${pending}") || return $?
+    fi
+    approved_plan_pending_fixture "${pending}" || return $?
+    exec 7<>"${pending}" || return 79
+    descriptor_identity="$(fixture_file_identity /dev/fd/7)" || return 79
+    path_identity="$(fixture_file_identity "${pending}")" || return 79
+    [[ "${descriptor_identity}" == "${path_identity}" ]] || return 79
+    if [[ "${cut}" == 'inode-swap' ]]; then
+      /bin/ln -- "${pending}" "${pending}.swapped-out" || return $?
+      : >"${pending}.replacement" || return $?
+      /bin/chmod 0600 "${pending}.replacement" || return $?
+      /bin/mv -- "${pending}.replacement" "${pending}" || return $?
+    fi
+    if [[ "${cut}" == 'partial-write' ]]; then
+      printf '{"cut' >"/dev/fd/7" || return $?
+      return 91
+    fi
+    /bin/cat -- /dev/fd/9 >"/dev/fd/7" || return $?
+    /usr/bin/python3 -B -I -c 'import os, sys; os.fsync(int(sys.argv[1]))' 7 || return $?
+    [[ "$(fixture_file_identity "${pending}")" == "${descriptor_identity}" ]] || return 79
+    [[ "$(sha256_file "${pending}")" == "${expected_sha}" ]] || return 79
+    /usr/bin/python3 -B -I -c \
+      'import os, sys; fd = os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)' \
+      "$(dirname -- "${destination}")" || return $?
+    [[ "${cut}" != 'post-fsync' ]] || return 92
+    /bin/ln -- "${pending}" "${destination}" || return $?
+    [[ "${cut}" != 'post-link' ]] || return 93
   fi
-  [[ "$(sha256_file "${source}")" == "${expected_sha}" &&
-    "$(sha256_file "${destination}")" == "${expected_sha}" ]]
-}
-
-approved_plan_verify_fixture() {
-  local destination="$1" expected_sha="$2"
-  [[ -f "${destination}" && ! -L "${destination}" &&
-    "$(sha256_file "${destination}")" == "${expected_sha}" ]]
+  /usr/bin/python3 -B -I -c \
+    'import os, sys; fd = os.open(sys.argv[1], os.O_RDONLY); os.fsync(fd); os.close(fd)' \
+    "$(dirname -- "${destination}")" || return $?
+  approved_plan_verify_fixture "${destination}" "${expected_sha}" || return $?
+  [[ "$(fixture_file_identity "${source}")" == "$(fixture_file_identity /dev/fd/9)" &&
+    "$(sha256_file "${source}")" == "${expected_sha}" ]]
 }
 
 for path in "${BINDER}" "${CONTROLLER}" "${TRANSPORT}" "${STAGER}" "${MATRIX}" \
@@ -512,18 +573,130 @@ approved_plan_verify_fixture "${REALNIC_SNAPSHOT}" "${REALNIC_INTAKE_SHA}" ||
   fail 'realNIC restore-only root snapshot verify'
 /bin/mv -- "${REALNIC_INTAKE}.held" "${REALNIC_INTAKE}" || fail 'realNIC restore intake fixture'
 
-for cut in mismatch partial directory symlink; do
+for cut in partial-write post-fsync post-link; do
   target="${REALNIC_INTAKE_FIXTURE}/root-plan-${cut}.json"
+  cut_rc=0
+  approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${target}" \
+    "${REALNIC_INTAKE_SHA}" "${cut}" || cut_rc=$?
+  case "${cut}:${cut_rc}" in
+    partial-write:91 | post-fsync:92 | post-link:93) ;;
+    *) fail "realNIC ${cut} did not stop at its exact cut: rc=${cut_rc}" ;;
+  esac
+  approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${target}" \
+    "${REALNIC_INTAKE_SHA}" || fail "realNIC ${cut} retry did not converge"
+  approved_plan_verify_fixture "${target}" "${REALNIC_INTAKE_SHA}" ||
+    fail "realNIC ${cut} retry terminal identity"
+done
+
+foreign_final="${REALNIC_INTAKE_FIXTURE}/root-plan-foreign-final.json"
+foreign_pending="${foreign_final}.pending.${REALNIC_INTAKE_SHA}"
+/bin/cp -- "${REALNIC_INTAKE}" "${foreign_final}" || fail 'foreign final fixture'
+/bin/cp -- "${REALNIC_INTAKE}" "${foreign_pending}" || fail 'foreign pending fixture'
+/bin/chmod 0600 "${foreign_final}" "${foreign_pending}" || fail 'foreign final mode'
+if approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${foreign_final}" "${REALNIC_INTAKE_SHA}"; then
+  fail 'same-content foreign final inode was accepted'
+fi
+
+for cut in symlink mode nlink; do
+  target="${REALNIC_INTAKE_FIXTURE}/root-plan-pending-${cut}.json"
+  pending="${target}.pending.${REALNIC_INTAKE_SHA}"
   case "${cut}" in
-    mismatch) printf '%s\n' '{"approved":"different"}' >"${target}" ;;
-    partial) printf '{"appr' >"${target}" ;;
-    directory) /bin/mkdir -- "${target}" ;;
-    symlink) /bin/ln -s "${REALNIC_SNAPSHOT}" "${target}" ;;
-  esac || fail "realNIC ${cut} cut setup"
+    symlink) /bin/ln -s "${REALNIC_INTAKE}" "${pending}" ;;
+    mode)
+      : >"${pending}"
+      /bin/chmod 0644 "${pending}"
+      ;;
+    nlink)
+      : >"${pending}"
+      /bin/chmod 0600 "${pending}"
+      /bin/ln -- "${pending}" "${pending}.extra"
+      ;;
+  esac || fail "pending ${cut} fixture"
   if approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${target}" "${REALNIC_INTAKE_SHA}"; then
-    fail "realNIC ${cut} preexisting target was accepted"
+    fail "pending ${cut} drift was accepted"
   fi
 done
+
+inode_swap_final="${REALNIC_INTAKE_FIXTURE}/root-plan-inode-swap.json"
+inode_swap_rc=0
+approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${inode_swap_final}" \
+  "${REALNIC_INTAKE_SHA}" inode-swap || inode_swap_rc=$?
+[[ "${inode_swap_rc}" -eq 79 && ! -e "${inode_swap_final}" &&
+  -f "${inode_swap_final}.pending.${REALNIC_INTAKE_SHA}.swapped-out" ]] ||
+  fail "pending inode swap was not retained and rejected: rc=${inode_swap_rc}"
+approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${inode_swap_final}" \
+  "${REALNIC_INTAKE_SHA}" || fail 'pending inode swap retry did not converge'
+
+extra_link_final="${REALNIC_INTAKE_FIXTURE}/root-plan-extra-link.json"
+approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${extra_link_final}" \
+  "${REALNIC_INTAKE_SHA}" || fail 'extra-link terminal setup'
+/bin/ln -- "${extra_link_final}" "${extra_link_final}.extra" || fail 'extra-link injection'
+if approved_plan_verify_fixture "${extra_link_final}" "${REALNIC_INTAKE_SHA}"; then
+  fail 'published plan with nlink greater than two was accepted'
+fi
+if approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${extra_link_final}" "${REALNIC_INTAKE_SHA}"; then
+  fail 'published plan retry accepted nlink greater than two'
+fi
+
+old_sha='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+different_sha_final="${REALNIC_INTAKE_FIXTURE}/root-plan-different-sha.json"
+printf 'retained-old-sha-partial\n' >"${different_sha_final}.pending.${old_sha}" ||
+  fail 'different-SHA pending fixture'
+/bin/chmod 0600 "${different_sha_final}.pending.${old_sha}" || fail 'different-SHA mode'
+approved_plan_snapshot_fixture "${REALNIC_INTAKE}" "${different_sha_final}" \
+  "${REALNIC_INTAKE_SHA}" || fail 'different-SHA old pending blocked current authority'
+[[ "$(/bin/cat -- "${different_sha_final}.pending.${old_sha}")" == \
+  'retained-old-sha-partial' ]] || fail 'different-SHA evidence changed'
+
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B -I -c \
+  'import fcntl, hashlib, os, stat, sys
+root, payload_path, expected = sys.argv[1:]
+payload = open(payload_path, "rb").read()
+if hashlib.sha256(payload).hexdigest() != expected:
+    raise SystemExit("fixture payload digest")
+lock_path = os.path.join(root, "physical.lock")
+pending = os.path.join(root, f"concurrent.json.pending.{expected}")
+final = os.path.join(root, "concurrent.json")
+first = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+second = os.open(lock_path, os.O_RDWR)
+try:
+    fcntl.flock(first, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    pending_fd = os.open(pending, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.write(pending_fd, payload[:5])
+    try:
+        fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise SystemExit("second snapshot entered while pending was mutable")
+    os.ftruncate(pending_fd, 0)
+    os.lseek(pending_fd, 0, os.SEEK_SET)
+    offset = 0
+    while offset < len(payload):
+        written = os.write(pending_fd, payload[offset:])
+        if written <= 0:
+            raise SystemExit("write made no progress")
+        offset += written
+    os.fsync(pending_fd)
+    parent_fd = os.open(root, os.O_RDONLY)
+    os.fsync(parent_fd)
+    os.close(parent_fd)
+    os.link(pending, final)
+    parent_fd = os.open(root, os.O_RDONLY)
+    os.fsync(parent_fd)
+    os.close(parent_fd)
+    os.close(pending_fd)
+    fcntl.flock(first, fcntl.LOCK_UN)
+    fcntl.flock(second, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    left, right = os.stat(final), os.stat(pending)
+    if (left.st_dev, left.st_ino) != (right.st_dev, right.st_ino) or left.st_nlink != 2:
+        raise SystemExit("terminal inode contract")
+    if open(final, "rb").read() != payload:
+        raise SystemExit("published payload changed")
+finally:
+    os.close(second)
+    os.close(first)' "${REALNIC_INTAKE_FIXTURE}" "${REALNIC_INTAKE}" "${REALNIC_INTAKE_SHA}" ||
+  fail 'physical-lock concurrent snapshot model'
 
 HELD_SOURCE="${REALNIC_INTAKE_FIXTURE}/held-source.json"
 HELD_DESTINATION="${REALNIC_INTAKE_FIXTURE}/held-destination.json"
@@ -538,7 +711,7 @@ printf '%s\n' '{"approved":"replacement"}' >"${HELD_SOURCE}.replacement" ||
 [[ "$(sha256_file "${HELD_DESTINATION}")" == "${REALNIC_INTAKE_SHA}" &&
   "$(sha256_file "${HELD_SOURCE}")" != "${REALNIC_INTAKE_SHA}" ]] ||
   fail 'held-FD bytes were not isolated from path replacement'
-printf 'HERMETIC_REALNIC_APPROVED_PLAN fresh=pass retry=exact-only restore=no-intake-copy cuts=4 held_fd=pass retained=%s\n' \
+printf 'HERMETIC_REALNIC_APPROVED_PLAN fresh=pass retry=durable-link restore=no-intake-copy cuts=10 concurrent_lock=pass held_fd=pass retained=%s\n' \
   "${REALNIC_INTAKE_FIXTURE}"
 
 STAGE_PLAN="$(/bin/bash "${BOUND_OUTPUT}/prepare-stage-root.sh" snapshot-plan \
