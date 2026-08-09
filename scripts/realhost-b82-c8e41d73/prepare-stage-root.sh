@@ -190,7 +190,7 @@ read_manifest_field() {
 }
 
 load_manifest() {
-  local unexpected
+  local unexpected=''
   exec 3<"${MANIFEST}" || return 66
   read_manifest_field format FORMAT &&
     read_manifest_field run_id MANIFEST_RUN_ID &&
@@ -298,7 +298,7 @@ load_manifest() {
       exec 3<&-
       return 65
     }
-  if IFS= read -r unexpected <&3; then
+  if IFS= read -r unexpected <&3 || [[ -n "${unexpected}" ]]; then
     exec 3<&-
     return 65
   fi

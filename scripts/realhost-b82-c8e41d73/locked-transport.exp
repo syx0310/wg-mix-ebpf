@@ -84,7 +84,7 @@ proc load_manifest {path expected_sha} {
     if {[string first "\u0000" $payload] >= 0 || ![string match "*\n" $payload]} {
         return -code error "manifest-encoding"
     }
-    set lines [split [string trimright $payload "\n"] "\n"]
+    set lines [split [string range $payload 0 end-1] "\n"]
     if {[llength $lines] != [llength $expected_keys]} {
         return -code error "manifest-field-count"
     }

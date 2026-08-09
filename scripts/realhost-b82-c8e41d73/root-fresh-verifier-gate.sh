@@ -199,7 +199,7 @@ read_manifest_field() {
 }
 
 load_manifest_once() {
-  local unexpected
+  local unexpected=''
   exec {MANIFEST_FD}<"${SNAPSHOT_MANIFEST}" || return 66
   read_manifest_field format FORMAT &&
     read_manifest_field run_id MANIFEST_RUN_ID &&
@@ -307,7 +307,7 @@ load_manifest_once() {
       exec {MANIFEST_FD}<&-
       return 65
     }
-  if IFS= read -r -u "${MANIFEST_FD}" unexpected; then
+  if IFS= read -r -u "${MANIFEST_FD}" unexpected || [[ -n "${unexpected}" ]]; then
     exec {MANIFEST_FD}<&-
     return 65
   fi
