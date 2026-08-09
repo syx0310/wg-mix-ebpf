@@ -5,6 +5,7 @@ package dataplane
 import (
 	"encoding/binary"
 	"os"
+	"strings"
 	"testing"
 
 	"github.com/cilium/ebpf"
@@ -255,6 +256,28 @@ func TestBaselineAndExperimentalManifestsAreMutuallyExclusive(t *testing.T) {
 	}
 	if err := validateBaselineCollectionSpec(experimental); err == nil {
 		t.Fatal("baseline manifest accepted the experimental extension object")
+	}
+}
+
+func TestBaselineLoaderPreflightRejectsExperimentalObjectBeforeKernelLoad(t *testing.T) {
+	baseline := canonicalObjectManifestCollectionSpec()
+	if err := validateBaselineLoaderCollectionSpec(baseline, "baseline-test.o"); err != nil {
+		t.Fatalf("baseline loader preflight rejected canonical object: %v", err)
+	}
+
+	experimental := canonicalExperimentalCollectionSpec()
+	err := validateBaselineLoaderCollectionSpec(experimental, "experimental-test.o")
+	if err == nil {
+		t.Fatal("baseline loader preflight accepted the experimental object")
+	}
+	for _, want := range []string{
+		"experimental-test.o",
+		"unexpected maps outside its manifest",
+		fakeTCPSessionMapName,
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Fatalf("baseline loader preflight error missing %q: %v", want, err)
+		}
 	}
 }
 

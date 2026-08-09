@@ -281,6 +281,9 @@ func LoadObjectTestIdentity(
 	if err != nil {
 		return ObjectIdentity{}, err
 	}
+	if err := validateBaselineLoaderCollectionSpec(spec, identity.Source); err != nil {
+		return ObjectIdentity{}, err
+	}
 	if err := removeMemlockLimit(); err != nil {
 		return ObjectIdentity{}, err
 	}
@@ -333,6 +336,13 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	if state == nil {
 		return errors.New("apply control state is nil")
 	}
+	// Keep this defence in depth even when a production caller performs the
+	// same activation check. LinuxLoader is exported and can be constructed
+	// directly, so it must refuse FakeTCP before pin validation, object loading,
+	// owner intent, map writes, or TCX mutation.
+	if err := preflightFakeTCPKernelRequirements(state); err != nil {
+		return err
+	}
 	if l.AdoptLegacyPins {
 		return errors.New(
 			"classic pin adoption is unsupported by owner schema v4; detach with a trusted legacy build before upgrading",
@@ -360,6 +370,9 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 		return err
 	}
 	source := identity.Source
+	if err := validateBaselineLoaderCollectionSpec(spec, source); err != nil {
+		return err
+	}
 	if err := validateAndSetPinnedMaps(spec); err != nil {
 		return fmt.Errorf("validate BPF object %s: %w", source, err)
 	}
