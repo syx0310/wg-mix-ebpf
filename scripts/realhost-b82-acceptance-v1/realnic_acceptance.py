@@ -3326,7 +3326,11 @@ def validate_plan_shape(
         if write_set.get(field) != []:
             raise HarnessError(f"approved plan unexpectedly writes {field}")
     filesystem = write_set.get("filesystem")
-    if not isinstance(filesystem, list) or len(filesystem) != len(set(filesystem)):
+    if (
+        not isinstance(filesystem, list)
+        or not all(isinstance(path, str) for path in filesystem)
+        or len(filesystem) != len(set(filesystem))
+    ):
         raise HarnessError("filesystem write set is not a unique array")
     allowed_roots = {spec.run_root, f"{spec.run_root}/logs"}
     for path in filesystem:
@@ -3450,7 +3454,7 @@ def validate_plan_shape(
 
 def validate_step(step: Mapping[str, Any], filesystem_set: set[str]) -> None:
     required = {"label", "argv", "timeout_seconds", "expect_rc", "stdout", "stderr", "target"}
-    if not required.issubset(step):
+    if not isinstance(step, Mapping) or not required.issubset(step):
         raise HarnessError("planned command is incomplete")
     argv = step["argv"]
     if not isinstance(argv, list) or not argv or not all(isinstance(value, str) for value in argv):
