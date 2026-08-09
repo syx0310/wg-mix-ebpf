@@ -457,6 +457,163 @@ class HermeticStateMachineTests(unittest.TestCase):
             self.assertEqual([event["attempt"] for event in starts], [1, 2, 2])
             self.assertEqual(events[-1]["event"], "EXPLICIT_RESTORE_COMPLETE")
 
+    def test_mutated_interface_restores_after_unterminated_journal_tail(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=10)
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                with self.assertRaises(MODULE.HarnessError):
+                    MODULE.run_mode(spec, plan_path, digest, runner)
+                self.assertTrue(runner.features["tx-udp-segmentation"])
+                journal_path = pathlib.Path(spec.run_root, "journal.jsonl")
+                with journal_path.open("ab") as stream:
+                    stream.write(b'{"event":"crash-window"')
+                self.assertEqual(MODULE.restore_mode(spec, plan_path, digest, runner), 0)
+            self.assertFalse(runner.features["tx-udp-segmentation"])
+            events = [json.loads(line) for line in journal_path.read_bytes().splitlines()]
+            truncated = next(index for index, event in enumerate(events) if event["event"] == "JOURNAL_TAIL_TRUNCATED")
+            restore_intent = next(index for index, event in enumerate(events) if event["event"] == "EXPLICIT_RESTORE_INTENT")
+            self.assertLess(truncated, restore_intent)
+
+
+class JournalDurabilityTests(unittest.TestCase):
+    run_id = "a1b2c3d4"
+    plan_sha256 = "1234567890abcdef" * 4
+
+    def open_journal(self, path, *, create):
+        return MODULE.Journal(str(path), self.run_id, self.plan_sha256, create=create)
+
+    def test_append_writes_all_short_chunks_before_fsync(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary, "journal.jsonl")
+            journal = self.open_journal(path, create=True)
+            real_write = MODULE.os.write
+            write_calls = []
+
+            def short_write(descriptor, payload):
+                write_calls.append(len(payload))
+                return real_write(descriptor, payload[:7])
+
+            with mock.patch.object(MODULE.os, "write", side_effect=short_write):
+                journal.append("BASELINE_CAPTURED", baseline_sha256="abcdef0123456789" * 4)
+            journal.close()
+            self.assertGreater(len(write_calls), 1)
+            reopened = self.open_journal(path, create=False)
+            try:
+                self.assertEqual([event["event"] for event in reopened.events], ["BASELINE_CAPTURED"])
+            finally:
+                reopened.close()
+
+    def test_partial_append_is_poisoned_then_recovered_as_tail_only(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary, "journal.jsonl")
+            journal = self.open_journal(path, create=True)
+            journal.append("BASELINE_CAPTURED", baseline_sha256="abcdef0123456789" * 4)
+            real_write = MODULE.os.write
+            calls = 0
+
+            def partial_then_stop(descriptor, payload):
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    return real_write(descriptor, payload[:11])
+                return 0
+
+            with mock.patch.object(MODULE.os, "write", side_effect=partial_then_stop):
+                with self.assertRaisesRegex(MODULE.HarnessError, "no progress"):
+                    journal.append("CELL_MUTATION_INTENT", cell="tcp-all-on")
+                with self.assertRaisesRegex(MODULE.HarnessError, "poisoned"):
+                    journal.append("FAILED", cell="tcp-all-on", reason="must-not-append-after-partial")
+            journal.close()
+            reopened = self.open_journal(path, create=False)
+            try:
+                self.assertEqual(
+                    [event["event"] for event in reopened.events],
+                    ["BASELINE_CAPTURED", "JOURNAL_TAIL_TRUNCATED"],
+                )
+            finally:
+                reopened.close()
+
+    def test_only_unterminated_tail_is_truncated_and_audited(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = pathlib.Path(temporary, "journal.jsonl")
+            journal = self.open_journal(path, create=True)
+            journal.append("BASELINE_CAPTURED", baseline_sha256="abcdef0123456789" * 4)
+            journal.close()
+            fragment = b'{"event":"CELL_MUTATION_INTENT"'
+            with path.open("ab") as stream:
+                stream.write(fragment)
+            reopened = self.open_journal(path, create=False)
+            try:
+                self.assertEqual(
+                    [event["event"] for event in reopened.events],
+                    ["BASELINE_CAPTURED", "JOURNAL_TAIL_TRUNCATED"],
+                )
+                audit = reopened.events[-1]
+                self.assertEqual(audit["removed_bytes"], len(fragment))
+                self.assertEqual(audit["removed_sha256"], MODULE.sha256_bytes(fragment))
+            finally:
+                reopened.close()
+            self.assertTrue(path.read_bytes().endswith(b"\n"))
+            self.assertNotIn(fragment, path.read_bytes())
+
+    def test_complete_or_middle_corruption_is_never_truncated(self):
+        for corruption in ("complete-tail", "middle"):
+            with self.subTest(corruption=corruption), tempfile.TemporaryDirectory() as temporary:
+                path = pathlib.Path(temporary, "journal.jsonl")
+                journal = self.open_journal(path, create=True)
+                journal.append("BASELINE_CAPTURED", baseline_sha256="abcdef0123456789" * 4)
+                journal.append("FAILED", cell=None, reason="fixture")
+                journal.close()
+                lines = path.read_bytes().splitlines(keepends=True)
+                if corruption == "complete-tail":
+                    damaged = b"".join(lines) + b"not-json\n"
+                else:
+                    damaged = lines[0] + b"not-json\n" + lines[1]
+                path.write_bytes(damaged)
+                with self.assertRaisesRegex(MODULE.HarnessError, "invalid line"):
+                    self.open_journal(path, create=False)
+                self.assertEqual(path.read_bytes(), damaged)
+
+    def test_complete_canonical_identity_or_hash_corruption_is_rejected(self):
+        corruptions = {
+            "noncanonical": b'{"event": "FAILED"}\n',
+            "wrong-identity": MODULE.canonical_json(
+                {
+                    "schema": MODULE.JOURNAL_SCHEMA,
+                    "run_id": "ffffffff",
+                    "plan_sha256": self.plan_sha256,
+                    "sequence": 2,
+                    "monotonic_ns": 1,
+                    "utc": "2026-08-09T00:00:00Z",
+                    "event": "FAILED",
+                }
+            ),
+            "wrong-hash": MODULE.canonical_json(
+                {
+                    "schema": MODULE.JOURNAL_SCHEMA,
+                    "run_id": self.run_id,
+                    "plan_sha256": "abcdef0123456789" * 4,
+                    "sequence": 2,
+                    "monotonic_ns": 1,
+                    "utc": "2026-08-09T00:00:00Z",
+                    "event": "FAILED",
+                }
+            ),
+        }
+        for name, bad_line in corruptions.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as temporary:
+                path = pathlib.Path(temporary, "journal.jsonl")
+                journal = self.open_journal(path, create=True)
+                journal.append("BASELINE_CAPTURED", baseline_sha256="abcdef0123456789" * 4)
+                journal.close()
+                original = path.read_bytes()
+                path.write_bytes(original + bad_line)
+                with self.assertRaises(MODULE.HarnessError):
+                    self.open_journal(path, create=False)
+                self.assertEqual(path.read_bytes(), original + bad_line)
+
 
 if __name__ == "__main__":
     unittest.main()

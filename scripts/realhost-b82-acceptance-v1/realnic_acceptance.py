@@ -1272,7 +1272,11 @@ class Journal:
             if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
                 raise HarnessError("journal must be a single-link regular file")
             fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self._poisoned = False
+            self._tail_recovery: dict[str, Any] | None = None
             self.events = [] if create else self._read_events()
+            if self._tail_recovery is not None:
+                self.append("JOURNAL_TAIL_TRUNCATED", **self._tail_recovery)
         except BaseException:
             os.close(self.descriptor)
             raise
@@ -1291,8 +1295,17 @@ class Journal:
             chunks.append(chunk)
             remaining -= len(chunk)
         payload = b"".join(chunks)
+        complete_payload = payload
+        if payload and not payload.endswith(b"\n"):
+            boundary = payload.rfind(b"\n") + 1
+            complete_payload = payload[:boundary]
+            fragment = payload[boundary:]
+            self._tail_recovery = {
+                "removed_bytes": len(fragment),
+                "removed_sha256": sha256_bytes(fragment),
+            }
         events: list[dict[str, Any]] = []
-        for index, raw in enumerate(payload.splitlines(), start=1):
+        for index, raw in enumerate(complete_payload.splitlines(), start=1):
             try:
                 event = json.loads(raw)
             except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -1307,9 +1320,14 @@ class Journal:
             ):
                 raise HarnessError("journal identity or sequence is invalid")
             events.append(event)
+        if self._tail_recovery is not None:
+            os.ftruncate(self.descriptor, len(complete_payload))
+            os.fsync(self.descriptor)
         return events
 
     def append(self, event: str, **fields: Any) -> None:
+        if self._poisoned:
+            raise HarnessError("journal is poisoned after an incomplete append")
         record = {
             "schema": JOURNAL_SCHEMA,
             "run_id": self.run_id,
@@ -1321,10 +1339,19 @@ class Journal:
             **fields,
         }
         payload = canonical_json(record)
-        written = os.write(self.descriptor, payload)
-        if written != len(payload):
-            raise HarnessError("journal append was short")
-        os.fsync(self.descriptor)
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(self.descriptor, payload[offset:])
+                if written <= 0:
+                    raise HarnessError("journal append made no progress")
+                offset += written
+            os.fsync(self.descriptor)
+        except (HarnessError, OSError) as exc:
+            self._poisoned = True
+            if isinstance(exc, HarnessError):
+                raise
+            raise HarnessError(f"journal append failed: {exc}") from exc
         self.events.append(record)
 
     def close(self) -> None:
