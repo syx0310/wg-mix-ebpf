@@ -308,8 +308,7 @@ func NewController(engine *Engine, backend ControllerBackend) (*Controller, erro
 // immutable exact WGID table. It does not alter production runtime selection;
 // callers must opt into this pure-Go multi-WireGuard boundary explicitly.
 func NewRoutedController(router *EngineRouter, backend ControllerBackend) (*Controller, error) {
-	if router == nil || validateRuntimeIdentity(router.Identity()) != nil ||
-		len(router.engines) == 0 || len(router.routes) == 0 || len(router.wgIDs) == 0 {
+	if router == nil || validateRuntimeIdentity(router.Identity()) != nil {
 		return nil, errors.New("faketcp routed controller requires an engine router")
 	}
 	return newController(router, backend)

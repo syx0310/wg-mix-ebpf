@@ -87,9 +87,7 @@ func NewEngineRouter(
 			)
 		}
 		engine := binding.Engine
-		if engine.domain != domain.state || engine.Identity() != domain.Identity() ||
-			engine.runtimeIdentityCommit != domain.state.runtimeIdentityCommit ||
-			engine.sessionIDs != domain.state.sessionIDs {
+		if engine.domain != domain.state || engine.Identity() != domain.Identity() {
 			return nil, fmt.Errorf(
 				"%w: Engine for WGID %d does not belong to the router RuntimeDomain",
 				ErrEngineRouteInvalid,
@@ -314,23 +312,14 @@ type singleEngineDispatcher struct {
 }
 
 func (dispatcher *singleEngineDispatcher) Identity() RuntimeIdentity {
-	if dispatcher == nil || dispatcher.engine == nil {
-		return RuntimeIdentity{}
-	}
 	return dispatcher.engine.Identity()
 }
 
 func (dispatcher *singleEngineDispatcher) selectEngine(abi.FakeTCPEvent) (dispatchedEngine, error) {
-	if dispatcher == nil || dispatcher.engine == nil {
-		return dispatchedEngine{}, errors.New("faketcp single-engine dispatcher is unavailable")
-	}
 	return dispatchedEngine{engine: dispatcher.engine}, nil
 }
 
 func (dispatcher *singleEngineDispatcher) Tick() ([]Action, error) {
-	if dispatcher == nil || dispatcher.engine == nil {
-		return nil, errors.New("faketcp single-engine dispatcher is unavailable")
-	}
 	return dispatcher.engine.Tick()
 }
 
