@@ -39,6 +39,7 @@ const (
 	fakeTCPRealHostStatGSOReject                = uint32(5)
 	fakeTCPRealHostStatChecksumNoneAccepted     = uint32(13)
 	fakeTCPRealHostStatChecksumPartialReset     = uint32(14)
+	fakeTCPRealHostStatAdmissionAccept          = uint32(17)
 	fakeTCPRealHostCoreStatEgressRewriteOK      = uint32(0)
 	fakeTCPRealHostCoreStatIngressRewriteOK     = uint32(6)
 	fakeTCPRealHostCoreStatEgressGSOSeen        = uint32(15)
@@ -541,6 +542,7 @@ func TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration(t *testing.T) {
 		fakeTCPRealHostStatGSOReject:            1,
 		fakeTCPRealHostStatChecksumNoneAccepted: 1,
 		fakeTCPRealHostStatChecksumPartialReset: 1,
+		fakeTCPRealHostStatAdmissionAccept:      4,
 	})
 	coreStatsAfter := readFakeTCPRealHostStats(t, runtime, "stats_map", 36)
 	assertFakeTCPRealHostStatDeltas(t, "core", coreStatsBefore, coreStatsAfter, map[uint32]uint64{

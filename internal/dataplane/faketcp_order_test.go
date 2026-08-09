@@ -604,7 +604,7 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 	}
 	for _, want := range []string{
 		"bpf_map_lookup_elem(&faketcp_rt_id",
-		"identity->generation != key->generation",
+		"identity->generation != generation",
 		"identity->event_abi_version != FAKETCP_EVENT_ABI_VERSION",
 		"if (!nonzero)",
 		"__builtin_memcpy(event->runtime_incarnation",

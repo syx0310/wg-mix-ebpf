@@ -30,7 +30,7 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 	checksumState := strings.Index(egress, "faketcp_inspect_and_reset_udp_checksum(")
 	typeWord := strings.Index(egress, "update_type_word(skb, &info, old_wire, new_wire, 1)")
 	xorDispatch := strings.Index(egress, "bpf_tail_call(skb, &xor_egress_programs")
-	directEncode := strings.Index(egress, "return faketcp_encode_established(skb, &info, rule, generation,")
+	directEncode := strings.Index(egress, "return faketcp_encode_established(")
 	if checkpoint < 0 || checksumState < 0 || typeWord < 0 || xorDispatch < 0 || directEncode < 0 ||
 		!(checkpoint < checksumState && checksumState < typeWord && typeWord < xorDispatch && typeWord < directEncode) {
 		t.Fatal("TC admission proof does not dominate checksum, type-word, XOR and FakeTCP transforms")
@@ -50,19 +50,30 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 
 	xor := sourceSection(t, tc,
 		"static __always_inline int run_xor_egress_segment", "static __always_inline int run_xor_ingress_segment")
-	proofBranch := strings.Index(xor, "if (context.continue_faketcp)")
+	proofLookup := strings.Index(xor, "faketcp_bind_egress_xor_progress(&context)")
+	xorWrite := strings.Index(xor, "xor_segment_")
+	complete := strings.Index(xor, "faketcp_complete_egress_xor(context.admission_nonce)")
 	tailCall := strings.Index(xor, "bpf_tail_call(skb, &faketcp_egress_programs")
+	discard := -1
+	if tailCall >= 0 {
+		discard = strings.Index(xor[tailCall:], "faketcp_consume_egress_admission(context.admission_nonce, 0)")
+	}
 	failure := strings.LastIndex(xor, "xor_dispatch_fail(skb, STAT_XOR_EGRESS_DISPATCH_ERROR)")
-	if proofBranch < 0 || tailCall < 0 || failure < 0 || !(proofBranch < tailCall && tailCall < failure) {
-		t.Fatal("XOR continuation must carry its existing bounded context proof through the tail call")
+	if proofLookup < 0 || xorWrite < 0 || complete < 0 || tailCall < 0 || discard < 0 || failure < 0 ||
+		!(proofLookup < xorWrite && xorWrite < complete && complete < tailCall && tailCall < tailCall+discard && tailCall+discard < failure) {
+		t.Fatal("XOR must read the active token before mutation, CAS completion before continuation, and discard on tail miss")
 	}
 	continuation := sourceSection(t, fake,
 		"static __always_inline int faketcp_continue_egress", "SEC(\"classifier/faketcp_egress\")")
-	consume := strings.Index(continuation, "load_xor_context(skb, &proof)")
+	load := strings.Index(continuation, "load_xor_context(skb, &progress)")
+	consume := strings.Index(continuation, "faketcp_consume_egress_admission(")
 	clear := strings.Index(continuation, "clear_xor_context(skb)")
+	parse := strings.Index(continuation, "active_generation(&generation)")
+	match := strings.Index(continuation, "faketcp_egress_admission_matches(")
 	encode := strings.Index(continuation, "faketcp_encode_established(")
-	if consume < 0 || clear < 0 || encode < 0 || !(consume < clear && clear < encode) {
-		t.Fatal("FakeTCP tail-call program can reach the encoder without consuming its proof")
+	if load < 0 || consume < 0 || clear < 0 || parse < 0 || match < 0 || encode < 0 ||
+		!(load < consume && consume < clear && clear < parse && parse < match && match < encode) {
+		t.Fatal("FakeTCP continuation must consume and clear its token before exact comparison or encode")
 	}
 
 	xdp := sourceSection(t, fake, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)", "#endif")
@@ -70,7 +81,7 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 	if xdpCheckpoint < 0 {
 		t.Fatal("XDP admission checkpoint is missing")
 	}
-	if !strings.Contains(xdp, "if (!listener)\n\t\treturn XDP_PASS;") ||
+	if !strings.Contains(xdp, "if (!managed_listener)\n\t\treturn XDP_PASS;") ||
 		!strings.Contains(xdp, "admission_decision == FAKETCP_ADMISSION_DROP") {
 		t.Fatal("XDP does not state explicit unmanaged-pass and managed-reject-drop policy")
 	}
@@ -90,6 +101,17 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 	if proof < 0 || xorMetadata < 0 || typeRestore < 0 || !(proof < xorMetadata && xorMetadata < typeRestore) {
 		t.Fatal("TC ingress can transform a packet before consuming the XDP proof")
 	}
+	ingressConsume := sourceSection(t, fake,
+		"static __always_inline int faketcp_consume_ingress_admission(",
+		"static __always_inline int faketcp_xdp_managed_interface(")
+	copyProof := strings.Index(ingressConsume, "consumed = *metadata")
+	clearMagic := strings.Index(ingressConsume, "metadata->magic = 0")
+	gsoReject := strings.Index(ingressConsume, "if (skb->gso_segs || skb->gso_size)")
+	compare := strings.Index(ingressConsume, "admission->key.generation != generation")
+	if copyProof < 0 || clearMagic < 0 || gsoReject < 0 || compare < 0 ||
+		!(copyProof < clearMagic && clearMagic < gsoReject && gsoReject < compare) {
+		t.Fatal("TC ingress must copy and invalidate metadata before the exclusive GSO gate and proof comparison")
+	}
 }
 
 func TestFakeTCPAdmissionProofBindsFullIdentityAndCapabilityStaysClosed(t *testing.T) {
@@ -99,12 +121,31 @@ func TestFakeTCPAdmissionProofBindsFullIdentityAndCapabilityStaysClosed(t *testi
 	}
 	text := string(source)
 	for _, want := range []string{
+		"__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY)",
+		"__uint(map_flags, BPF_F_RDONLY)",
+		"faketcp_egress_admission_map",
+		"__u64 next_nonce",
+		"FAKETCP_TOKEN_ARMED",
+		"FAKETCP_TOKEN_XOR_COMPLETE",
+		"__sync_val_compare_and_swap(&active->token_state",
+		"__builtin_memset(&slot->active, 0, sizeof(slot->active))",
+		"runtime_incarnation[16]",
+		"standard_wire",
+		"mixed_wire",
+		"xor_type_word_copy(current_wire, cipher) != admission->mixed_wire",
+		"current_wire != admission->standard_wire",
+		"wire_total_len",
+		"network_off",
+		"transport_off",
+		"payload_off",
+		"session_local_isn",
+		"session_remote_isn",
+		"profile_policy_flags",
 		"metadata->direction = FAKETCP_DIRECTION_INGRESS",
-		"metadata->generation_high = (__u32)(generation >> 32)",
-		"metadata->local_ipv4 = key.local_ipv4",
-		"metadata->generation_high != (__u32)(generation >> 32)",
-		"load_xor_context(skb, &proof)",
-		"proof.generation != generation",
+		"metadata->admission = admission",
+		"consumed = *metadata",
+		"metadata->magic = 0",
+		"faketcp_runtime_incarnation_matches(",
 		"FAKETCP_STAT_ADMISSION_BYPASS_REJECT",
 	} {
 		if !strings.Contains(text, want) {
@@ -113,5 +154,63 @@ func TestFakeTCPAdmissionProofBindsFullIdentityAndCapabilityStaysClosed(t *testi
 	}
 	if fakeTCPImplementedCapabilities&fakeTCPCapabilityAdmissionCheckpoint != 0 {
 		t.Fatal("AdmissionCheckpoint capability opened before unique review and required live evidence")
+	}
+
+	tcSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tc := string(tcSource)
+	cbWriter := sourceSection(t, tc, "static __always_inline void set_faketcp_xor_context", "static __always_inline int load_xor_context")
+	for _, want := range []string{
+		"skb->cb[0] = (__u32)nonce", "skb->cb[1] = (__u32)(nonce >> 32)",
+		"skb->cb[2] = 0", "skb->cb[3] = 0",
+	} {
+		if !strings.Contains(cbWriter, want) {
+			t.Fatalf("FakeTCP cb nonce/progress contract missing %q", want)
+		}
+	}
+	if strings.Contains(cbWriter, "generation") || strings.Contains(cbWriter, "cipher_id") ||
+		strings.Contains(cbWriter, "payload_off") || strings.Contains(cbWriter, "target") {
+		t.Fatal("FakeTCP cb writer regained policy/proof fields")
+	}
+
+	manifest, err := os.ReadFile("experimental_manifest_linux.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(manifest), `{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 144, maxEntries: 1, flags: unix.BPF_F_RDONLY}`) {
+		t.Fatal("fresh admission map manifest does not lock PinNone-compatible type, size and syscall-side read-only flag")
+	}
+}
+
+func TestFakeTCPAdmissionStatisticsAreMutuallyExclusive(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	tcSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	allSource := text + string(tcSource)
+	checkpoint := sourceSection(t, text,
+		"static __always_inline int faketcp_egress_admission_checkpoint(",
+		"static __always_inline __s64 faketcp_rotation_checksum")
+	xdpCheckpoint := sourceSection(t, text,
+		"static __always_inline int faketcp_xdp_admission_checkpoint(",
+		"SEC(\"xdp\")")
+	if strings.Contains(checkpoint, "FAKETCP_STAT_ADMISSION_ACCEPT") ||
+		strings.Contains(xdpCheckpoint, "FAKETCP_STAT_ADMISSION_ACCEPT") {
+		t.Fatal("early egress/XDP checkpoints must not count final admission acceptance")
+	}
+	if got := strings.Count(allSource, "inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT)"); got != 3 {
+		t.Fatalf("final egress-direct, egress-continuation and TC-ingress accept sites=%d, want 3", got)
+	}
+	gso := sourceSection(t, checkpoint, "if (skb->gso_segs || skb->gso_size)", "if (info->payload_len")
+	if strings.Contains(gso, "FAKETCP_STAT_BAD_PACKET") ||
+		strings.Count(gso, "inc_faketcp_stat(") != 1 {
+		t.Fatal("egress GSO rejection must have exactly one FakeTCP counter classification")
 	}
 }
