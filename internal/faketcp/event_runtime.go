@@ -24,6 +24,9 @@ var (
 type EventRecord struct {
 	RawSample   []byte
 	LostSamples uint64
+
+	ownedSample    ownedDecodedEvent
+	hasOwnedSample bool
 }
 
 // EventReader is the common boundary for BPF ring-buffer and perf-event-array
@@ -45,6 +48,8 @@ type EventController interface {
 	Tick(context.Context) ([]Action, error)
 	Close() error
 }
+
+type eventRecordHandler func(context.Context, EventRecord) ([]Action, error)
 
 // RuntimeService is the lifecycle contract a daemon or generation owner may
 // retain without depending on the concrete event-loop implementation.
@@ -78,6 +83,7 @@ type EventRuntime struct {
 
 	reader        EventReader
 	controller    EventController
+	handleRecord  eventRecordHandler
 	opts          EventRuntimeOptions
 	runDone       chan struct{}
 	closeDone     chan struct{}
@@ -101,11 +107,53 @@ func NewEventRuntime(
 	controller EventController,
 	options EventRuntimeOptions,
 ) (*EventRuntime, error) {
+	return newEventRuntime(
+		reader,
+		controller,
+		options,
+		func(ctx context.Context, record EventRecord) ([]Action, error) {
+			if len(record.RawSample) == 0 {
+				return nil, errors.New("faketcp event reader returned an empty sample")
+			}
+			return controller.HandleSample(ctx, record.RawSample)
+		},
+	)
+}
+
+// newOwnedEventRuntime selects the production-only decoded event boundary at
+// construction. Its loop never falls back to the public raw-sample decoder.
+func newOwnedEventRuntime(
+	reader EventReader,
+	controller *Controller,
+	options EventRuntimeOptions,
+) (*EventRuntime, error) {
+	return newEventRuntime(
+		reader,
+		controller,
+		options,
+		func(ctx context.Context, record EventRecord) ([]Action, error) {
+			if !record.hasOwnedSample {
+				return nil, errors.New("faketcp production event reader returned no owned sample")
+			}
+			return controller.handleOwnedEvent(ctx, record.ownedSample)
+		},
+	)
+}
+
+func newEventRuntime(
+	reader EventReader,
+	controller EventController,
+	options EventRuntimeOptions,
+	handleRecord eventRecordHandler,
+) (*EventRuntime, error) {
 	if eventReaderIsNil(reader) {
 		return nil, errors.New("faketcp event reader is nil")
 	}
 	if eventControllerIsNil(controller) {
 		return nil, errors.New("faketcp event controller is nil")
+	}
+	if handleRecord == nil {
+		return nil, errors.New("faketcp event record handler is nil")
 	}
 	if options.PollInterval <= 0 || options.TickInterval <= 0 {
 		return nil, errors.New("faketcp event runtime intervals must be positive")
@@ -114,12 +162,13 @@ func NewEventRuntime(
 		options.Now = time.Now
 	}
 	return &EventRuntime{
-		reader:     reader,
-		controller: controller,
-		opts:       options,
-		runDone:    make(chan struct{}),
-		closeDone:  make(chan struct{}),
-		readerDone: make(chan struct{}),
+		reader:       reader,
+		controller:   controller,
+		handleRecord: handleRecord,
+		opts:         options,
+		runDone:      make(chan struct{}),
+		closeDone:    make(chan struct{}),
+		readerDone:   make(chan struct{}),
 	}, nil
 }
 
@@ -143,10 +192,11 @@ func (runtime *EventRuntime) Run(ctx context.Context) error {
 		runtime.running = true
 		reader := runtime.reader
 		controller := runtime.controller
+		handleRecord := runtime.handleRecord
 		stopAsked := runtime.stopAsked
 		runtime.mu.Unlock()
 		defer runtime.finishRun()
-		if stopAsked || eventReaderIsNil(reader) {
+		if stopAsked || eventReaderIsNil(reader) || eventControllerIsNil(controller) || handleRecord == nil {
 			return nil
 		}
 
@@ -167,10 +217,7 @@ func (runtime *EventRuntime) Run(ctx context.Context) error {
 				if record.LostSamples != 0 {
 					return fmt.Errorf("%w: %d", ErrEventSamplesLost, record.LostSamples)
 				}
-				if len(record.RawSample) == 0 {
-					return errors.New("faketcp event reader returned an empty sample")
-				}
-				if _, err := controller.HandleSample(ctx, record.RawSample); err != nil {
+				if _, err := handleRecord(ctx, record); err != nil {
 					return fmt.Errorf("handle faketcp event sample: %w", err)
 				}
 			case errors.Is(err, os.ErrDeadlineExceeded):
@@ -281,6 +328,7 @@ func (runtime *EventRuntime) Close() error {
 	runtime.mu.Lock()
 	if controllerErr == nil {
 		runtime.controller = nil
+		runtime.handleRecord = nil
 	}
 	runtime.closeErr = closeErr
 	runtime.closed = eventReaderIsNil(runtime.reader) && eventControllerIsNil(runtime.controller)

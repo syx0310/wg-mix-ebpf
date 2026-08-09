@@ -318,10 +318,10 @@ func (backend *RawControllerBackend) initializedLocked() bool {
 }
 
 type reinjectFingerprint struct {
-	flow   abi.FakeTCPSessionKey
-	fwmark uint32
-	wgID   uint32
-	packet string
+	flow    abi.FakeTCPSessionKey
+	fwmark  uint32
+	wgID    uint32
+	capture [32]byte
 }
 
 type reinjectAttempt struct {
@@ -404,10 +404,10 @@ func (reinjector *onceReinjector) Reinject(
 		return err
 	}
 	fingerprint := reinjectFingerprint{
-		flow:   flow,
-		fwmark: packet.FWMark,
-		wgID:   packet.WGID,
-		packet: string(packet.Data),
+		flow:    flow,
+		fwmark:  packet.FWMark,
+		wgID:    packet.WGID,
+		capture: packet.captureFingerprint,
 	}
 
 	var attempt *reinjectAttempt

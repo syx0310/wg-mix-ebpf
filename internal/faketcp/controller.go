@@ -3,6 +3,7 @@ package faketcp
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -30,6 +31,16 @@ type DecodedEvent struct {
 type borrowedDecodedEvent struct {
 	Event  abi.FakeTCPEvent
 	packet []byte
+}
+
+// ownedDecodedEvent transfers one validated event to the production
+// controller. Packet is either empty or an owned, capacity-bounded view into
+// the sample allocation. Fingerprint binds the exact pre-materialization
+// sample and remains valid after checksum materialization mutates Packet.
+type ownedDecodedEvent struct {
+	Event       abi.FakeTCPEvent
+	Packet      []byte
+	Fingerprint [sha256.Size]byte
 }
 
 // DecodeEventSample accepts compact variable-size packet events and the
@@ -74,7 +85,7 @@ func decodeBorrowedEventSample(sample []byte) (borrowedDecodedEvent, error) {
 	if len(sample) != compactSize && len(sample) != fakeTCPPacketEventSize {
 		return borrowedDecodedEvent{}, fmt.Errorf("faketcp packet event sample has %d bytes, want compact %d or fixed %d", len(sample), compactSize, fakeTCPPacketEventSize)
 	}
-	packet := sample[fakeTCPEventSize:compactSize]
+	packet := sample[fakeTCPEventSize:compactSize:compactSize]
 	if event.Type == abi.FakeTCPEventNeedHandshake {
 		if err := validateCapturedIPv4UDP(event, packet); err != nil {
 			return borrowedDecodedEvent{}, err
@@ -362,19 +373,58 @@ func (c *Controller) HandleSample(ctx context.Context, sample []byte) ([]Action,
 	if err != nil {
 		return nil, err
 	}
+	return c.handleOwnedDecodedEvent(ctx, ownedDecodedEvent{
+		Event: decoded.Event, Packet: decoded.Packet,
+		Fingerprint: sha256.Sum256(sample),
+	})
+}
+
+// handleOwnedEvent is the private production boundary selected when the
+// controller runtime is constructed. The reader has already decoded and
+// validated the sample, and transfers Packet ownership with this call.
+func (c *Controller) handleOwnedEvent(
+	ctx context.Context,
+	decoded ownedDecodedEvent,
+) ([]Action, error) {
+	if err := c.beginSerializedOperation(); err != nil {
+		return nil, err
+	}
+	defer c.endSerializedOperation()
+	if ctx == nil {
+		return nil, errControllerContextNil
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return c.handleOwnedDecodedEvent(ctx, decoded)
+}
+
+// handleOwnedDecodedEvent runs with opMu held. Every packet reaching this
+// helper is owned by the call, so Engine may retain it without another copy.
+func (c *Controller) handleOwnedDecodedEvent(
+	ctx context.Context,
+	decoded ownedDecodedEvent,
+) ([]Action, error) {
 	if identity := runtimeIdentityFromEvent(decoded.Event); identity != c.engine.Identity() {
 		return nil, fmt.Errorf(
 			"faketcp event runtime identity does not match controller Engine: event=%x engine=%x",
 			identity.Incarnation, c.engine.Identity().Incarnation,
 		)
 	}
-	var actions []Action
+	var (
+		actions []Action
+		err     error
+	)
 	switch decoded.Event.Type {
 	case abi.FakeTCPEventNeedHandshake:
 		if err := MaterializeIPv4UDPChecksums(decoded.Packet); err != nil {
 			return nil, err
 		}
-		actions, err = c.engine.handleCapturedPacket(decoded.Event, decoded.Packet)
+		actions, err = c.engine.handleOwnedCapturedPacket(
+			decoded.Event,
+			decoded.Packet,
+			decoded.Fingerprint,
+		)
 	case abi.FakeTCPEventRST, abi.FakeTCPEventFIN:
 		actions, err = c.engine.InboundCapturedControl(decoded.Event, decoded.Packet)
 	default:

@@ -6,6 +6,7 @@ package faketcp
 
 import (
 	"container/list"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -113,11 +114,13 @@ type Action struct {
 // type-word/XOR/FakeTCP egress pipeline exactly once. CaptureID, not
 // CaptureNanos, is the once-only identity; the timestamp is diagnostic.
 type PendingPacket struct {
-	Data         []byte
-	FWMark       uint32
-	WGID         uint32
-	CaptureNanos uint64
-	CaptureID    CaptureIdentity
+	Data               []byte
+	FWMark             uint32
+	WGID               uint32
+	CaptureNanos       uint64
+	CaptureID          CaptureIdentity
+	captureFingerprint [sha256.Size]byte
+	dataOwned          bool
 }
 
 type SessionSnapshot struct {
@@ -287,12 +290,20 @@ func (e *Engine) HandlePacketEvent(event abi.FakeTCPPacketEvent) ([]Action, erro
 	if length <= 0 || length > len(event.Packet) {
 		return nil, fmt.Errorf("faketcp captured packet length %d is invalid", length)
 	}
-	return e.handleCapturedPacket(event.Event, event.Packet[:length])
+	// The fixed ABI value is caller-owned test input, unlike the production
+	// ring sample. Copy only its declared packet before transferring ownership.
+	packet := append([]byte(nil), event.Packet[:length]...)
+	return e.handleOwnedCapturedPacket(event.Event, packet, sha256.Sum256(packet))
 }
 
-// handleCapturedPacket avoids materializing the fixed maximum-size ABI record
-// when a ring-buffer reader already owns the compact packet sample.
-func (e *Engine) handleCapturedPacket(event abi.FakeTCPEvent, packet []byte) ([]Action, error) {
+// handleOwnedCapturedPacket accepts an owned packet view from the production
+// decoder. CaptureFingerprint was computed over the exact original sample
+// before Controller materialized its checksums.
+func (e *Engine) handleOwnedCapturedPacket(
+	event abi.FakeTCPEvent,
+	packet []byte,
+	fingerprint [sha256.Size]byte,
+) ([]Action, error) {
 	if event.Type != abi.FakeTCPEventNeedHandshake {
 		return nil, fmt.Errorf("faketcp packet event type %d is not NEED_HANDSHAKE", event.Type)
 	}
@@ -316,11 +327,13 @@ func (e *Engine) handleCapturedPacket(event abi.FakeTCPEvent, packet []byte) ([]
 		return nil, err
 	}
 	return e.outbound(event.Key, PendingPacket{
-		Data:         packet,
-		FWMark:       event.FWMark,
-		WGID:         event.WGID,
-		CaptureNanos: event.TimestampNanos,
-		CaptureID:    captureID,
+		Data:               packet,
+		FWMark:             event.FWMark,
+		WGID:               event.WGID,
+		CaptureNanos:       event.TimestampNanos,
+		CaptureID:          captureID,
+		captureFingerprint: fingerprint,
+		dataOwned:          true,
 	}, true)
 }
 
@@ -356,9 +369,10 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 		}
 		s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
 		if alreadyDropped {
-			copyPacket := packet
-			copyPacket.Data = append([]byte(nil), packet.Data...)
-			return []Action{{Kind: ActionReleasePending, Flow: flow, Packets: []PendingPacket{copyPacket}}}, nil
+			return []Action{{
+				Kind: ActionReleasePending, Flow: flow,
+				Packets: []PendingPacket{ownPendingPacket(packet)},
+			}}, nil
 		}
 		return []Action{{Kind: ActionForward, Flow: flow}}, nil
 	}
@@ -789,12 +803,19 @@ func (e *Engine) enqueue(s *session, packet PendingPacket) bool {
 		}
 		e.pendingFlows++
 	}
-	copyPacket := packet
-	copyPacket.Data = append([]byte(nil), packet.Data...)
-	s.pending = append(s.pending, copyPacket)
-	s.pendingBytes += len(copyPacket.Data)
-	e.pendingBytes += len(copyPacket.Data)
+	packet = ownPendingPacket(packet)
+	s.pending = append(s.pending, packet)
+	s.pendingBytes += len(packet.Data)
+	e.pendingBytes += len(packet.Data)
 	return true
+}
+
+func ownPendingPacket(packet PendingPacket) PendingPacket {
+	if !packet.dataOwned {
+		packet.Data = append([]byte(nil), packet.Data...)
+		packet.dataOwned = true
+	}
+	return packet
 }
 
 // observeSYN applies the O(1) global limiter before any source-ledger lookup,

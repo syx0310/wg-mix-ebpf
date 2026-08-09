@@ -257,7 +257,7 @@ func newOwnedControllerRuntime(
 			closeControllerRuntimeResource("controller backend", backend),
 		)
 	}
-	events, err := NewEventRuntime(reader, controller, EventRuntimeOptions{
+	events, err := newOwnedEventRuntime(reader, controller, EventRuntimeOptions{
 		PollInterval: claim.pollInterval,
 		TickInterval: claim.tickInterval,
 	})
