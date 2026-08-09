@@ -12,6 +12,7 @@ readonly GO_CACHE="${STAGE_ROOT}/go-cache"
 readonly GO_MOD_CACHE="${STAGE_ROOT}/go-mod-cache"
 readonly GO_PATH="${STAGE_ROOT}/go-path"
 readonly GO_TMP="${STAGE_ROOT}/go-tmp"
+readonly RUNTIME_TEMP="${STAGE_ROOT}/go-tmp-realhost"
 readonly EVIDENCE_ROOT="${STAGE_ROOT}/routed-evidence-${RESOURCE_ID}"
 readonly AUDIT_LOG="${EVIDENCE_ROOT}/audit.log"
 readonly OWNER_PHASE="${EVIDENCE_ROOT}/phase-owner.v1"
@@ -53,6 +54,7 @@ readonly ROUTED_TEST_RELATIVE='internal/dataplane/faketcp_routed_realhost_linux_
 readonly NEGATIVE_TEST_RELATIVE='internal/dataplane/faketcp_realhost_linux_test.go'
 readonly GSO_KFUNC_RELATIVE='kernel/faketcp_checksum/wg_mix_faketcp_checksum.c'
 readonly NEGATIVE_TEST='TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration'
+readonly PREFLIGHT_CONTRACT_TEST='TestFakeTCPRealHostRoutedHarnessSelectedBinaryContract'
 readonly -a POSITIVE_TESTS=(
   TestFakeTCPRealHostRoutedIPHdrInclNone
   TestFakeTCPRealHostRoutedUDPSocketPartial
@@ -170,6 +172,10 @@ valid_test_name() {
   return 1
 }
 
+valid_preflight_test_name() {
+  [[ "$1" == "${PREFLIGHT_CONTRACT_TEST}" ]] || valid_test_name "$1"
+}
+
 # Every external operation which can mutate state or execute a test is built
 # here. Callers never concatenate a shell command, use eval, or add free-form
 # remote argv.
@@ -179,6 +185,7 @@ build_argv() {
   OP_ARGV=()
   case "${operation}" in
     evidence-mkdir) OP_TARGET="${EVIDENCE_ROOT}"; OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${EVIDENCE_ROOT}") ;;
+    runtime-temp-mkdir) OP_TARGET="${RUNTIME_TEMP}"; OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${RUNTIME_TEMP}") ;;
     bpf-links) OP_TARGET='global-bpf-links'; OP_ARGV=(/usr/sbin/bpftool -j link show) ;;
     preflight-mod-verify) OP_TARGET="${GO_MOD_CACHE}"; OP_ARGV=("${GO_ENV[@]}" /usr/bin/timeout --signal=TERM --kill-after=10s 5m /usr/bin/go -C "${SOURCE}" mod verify) ;;
     preflight-build) OP_TARGET="${PREFLIGHT_BINARY}"; OP_ARGV=("${GO_ENV[@]}" /usr/bin/timeout --signal=TERM --kill-after=10s 10m /usr/bin/go -C "${SOURCE}" test -c -o "${PREFLIGHT_BINARY}" ./internal/dataplane) ;;
@@ -196,14 +203,18 @@ build_argv() {
     module-load) OP_TARGET="${MODULE_NAME}"; OP_ARGV=(/usr/sbin/insmod "${MODULE_OBJECT}") ;;
     module-unload) OP_TARGET="${MODULE_NAME}"; OP_ARGV=(/usr/sbin/rmmod "${MODULE_NAME}") ;;
     list:*)
-      name="${operation#list:}"; valid_test_name "${name}" || return 64
+      name="${operation#list:}"; valid_preflight_test_name "${name}" || return 64
       OP_TARGET="${name}"
       OP_ARGV=(/usr/bin/timeout --signal=TERM --kill-after=10s 1m "${PREFLIGHT_BINARY}" -test.list "^${name}$")
+      ;;
+    preflight-contract)
+      OP_TARGET="${PREFLIGHT_CONTRACT_TEST}"
+      OP_ARGV=(/usr/bin/timeout --signal=TERM --kill-after=10s 1m "${PREFLIGHT_BINARY}" -test.run "^${PREFLIGHT_CONTRACT_TEST}$" -test.count=1 -test.timeout=30s -test.v)
       ;;
     test:*)
       name="${operation#test:}"; valid_test_name "${name}" || return 64
       OP_TARGET="${name}"
-      OP_ARGV=(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C TMPDIR="${GO_TMP}" WG_MIX_FAKETCP_RUN_REALHOST_INTEGRATION=1 WG_MIX_FAKETCP_REALHOST_OBJECT="${EXPERIMENTAL_OBJECT}" WG_MIX_FAKETCP_REALHOST_BASELINE_OBJECT="${BASELINE_OBJECT}" WG_MIX_FAKETCP_REALHOST_IFINDEX="${VETH_A_IFINDEX}" WG_MIX_FAKETCP_REALHOST_PEER_IFINDEX="${VETH_B_IFINDEX}" WG_MIX_FAKETCP_REALHOST_XDP_MODE=generic WG_MIX_FAKETCP_REALHOST_RUN_ID="${RUN_ID}" WG_MIX_FAKETCP_ROUTED_LOCAL_IPV4="${LOCAL_IPV4}" WG_MIX_FAKETCP_ROUTED_REMOTE_IPV4="${REMOTE_IPV4}" WG_MIX_FAKETCP_ROUTED_PREFIX_BITS="${PREFIX_BITS}" WG_MIX_FAKETCP_ROUTED_ROUTE_MTU="${ROUTE_MTU}" /usr/bin/timeout --signal=TERM --kill-after=10s 3m "${PREFLIGHT_BINARY}" -test.run "^${name}$" -test.count=1 -test.timeout=2m -test.v)
+      OP_ARGV=(/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C TMPDIR="${RUNTIME_TEMP}" WG_MIX_FAKETCP_RUN_REALHOST_INTEGRATION=1 WG_MIX_FAKETCP_REALHOST_OBJECT="${EXPERIMENTAL_OBJECT}" WG_MIX_FAKETCP_REALHOST_BASELINE_OBJECT="${BASELINE_OBJECT}" WG_MIX_FAKETCP_REALHOST_IFINDEX="${VETH_A_IFINDEX}" WG_MIX_FAKETCP_REALHOST_PEER_IFINDEX="${VETH_B_IFINDEX}" WG_MIX_FAKETCP_REALHOST_XDP_MODE=generic WG_MIX_FAKETCP_REALHOST_RUN_ID="${RUN_ID}" WG_MIX_FAKETCP_ROUTED_LOCAL_IPV4="${LOCAL_IPV4}" WG_MIX_FAKETCP_ROUTED_REMOTE_IPV4="${REMOTE_IPV4}" WG_MIX_FAKETCP_ROUTED_PREFIX_BITS="${PREFIX_BITS}" WG_MIX_FAKETCP_ROUTED_ROUTE_MTU="${ROUTE_MTU}" /usr/bin/timeout --signal=TERM --kill-after=10s 3m "${PREFLIGHT_BINARY}" -test.run "^${name}$" -test.count=1 -test.timeout=2m -test.v)
       ;;
     neighbor-delete) OP_TARGET="${VETH_A}:${REMOTE_IPV4}"; OP_ARGV=(/usr/sbin/ip -4 neigh del "${REMOTE_IPV4}" lladdr "${VETH_B_MAC}" nud permanent dev "${VETH_A}") ;;
     route-delete) OP_TARGET="${REMOTE_IPV4}/${PREFIX_BITS}"; OP_ARGV=(/usr/sbin/ip -4 route del "${REMOTE_IPV4}/${PREFIX_BITS}" dev "${VETH_A}" src "${LOCAL_IPV4}" mtu "${ROUTE_MTU}" proto static scope link) ;;
@@ -234,9 +245,11 @@ render_plan() {
   plan_operation A.bpf bpf-links
   plan_operation P0 preflight-mod-verify
   plan_operation P1 preflight-build
-  for name in "${NEGATIVE_TEST}" "${POSITIVE_TESTS[@]}"; do
+  for name in "${PREFLIGHT_CONTRACT_TEST}" "${NEGATIVE_TEST}" "${POSITIVE_TESTS[@]}"; do
     plan_operation "P.${name}" "list:${name}"
   done
+  plan_operation P.contract preflight-contract
+  plan_operation B1 runtime-temp-mkdir
   for spec in \
     'N0|veth-add' 'N1|veth-alias-a' 'N2|veth-alias-b' \
     'N3|veth-up-a' 'N4|veth-up-b' 'N5|address-add' \
@@ -255,8 +268,8 @@ render_plan() {
     IFS='|' read -r label operation <<<"${spec}"
     plan_operation "${label}" "${operation}"
   done
-  printf 'B82_ROUTED_VETH_WRITE_SET filesystem=%s,%s,%s,%s,%s,%s network=veth:%s,%s,address:%s/%s,route:%s/%s,neighbor:%s,offload:%s:tso module=%s bpf=transient-unpinned-test-owned evidence_retained=1\n' \
-    "${EVIDENCE_ROOT}" "${PREFLIGHT_BINARY}" "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}" \
+  printf 'B82_ROUTED_VETH_WRITE_SET filesystem=%s,%s,%s,%s,%s,%s,%s network=veth:%s,%s,address:%s/%s,route:%s/%s,neighbor:%s,offload:%s:tso module=%s bpf=transient-unpinned-test-owned evidence_retained=1\n' \
+    "${EVIDENCE_ROOT}" "${PREFLIGHT_BINARY}" "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}" "${RUNTIME_TEMP}" \
     "${VETH_A}" "${VETH_B}" "${LOCAL_IPV4}" "${PREFIX_BITS}" "${REMOTE_IPV4}" \
     "${PREFIX_BITS}" "${REMOTE_IPV4}" "${VETH_A}" "${MODULE_NAME}"
   printf 'B82_ROUTED_VETH_RESTORE_ORDER cleanup-intent,bpf-baseline,module,offload,neighbor,route,address,veth,bpf-baseline,restored retryable=1 exact_reverse=1\n'
@@ -363,7 +376,7 @@ render_baseline() {
   printf '%s\n' \
     'format=wg-mix-ebpf-b82-routed-baseline-v1' \
     "run_id=${RUN_ID}" "resource_id=${RESOURCE_ID}" "boot_id=${BOOT_ID}" \
-    "netns=${INITIAL_NETNS}" 'veth=absent' 'address=absent' 'route=absent' \
+    "netns=${INITIAL_NETNS}" 'runtime_temp=absent' 'veth=absent' 'address=absent' 'route=absent' \
     'neighbor=absent' 'module=absent' \
     "bpf_links_sha256=$(sha256_file "${BPF_LINK_BASELINE}")"
 }
@@ -375,6 +388,7 @@ render_operation_intent() {
     "source=${SOURCE}" "commit=${COMMIT}" \
     "dependency_cache=${GO_MOD_CACHE},proxy=off,mode=readonly" \
     "preflight_binary=${PREFLIGHT_BINARY}" \
+    "runtime_temp=${RUNTIME_TEMP},baseline=absent,operation=create,owner=0:0,mode=0700,restore=retained" \
     "veth=${VETH_A},${VETH_B}" "address=${LOCAL_IPV4}/${PREFIX_BITS}" \
     "route=${REMOTE_IPV4}/${PREFIX_BITS},src=${LOCAL_IPV4},mtu=${ROUTE_MTU}" \
     "neighbor=${REMOTE_IPV4},lladdr=${VETH_B_MAC}" \
@@ -389,6 +403,7 @@ render_dependency_preflight() {
     "binary=${PREFLIGHT_BINARY}" "binary_sha256=$(sha256_file "${PREFLIGHT_BINARY}")" \
     "go_cache=${GO_CACHE}" "go_mod_cache=${GO_MOD_CACHE}" \
     'module_cache_verified=1' 'goproxy=off' 'go_mod=readonly' \
+    "contract_test=${PREFLIGHT_CONTRACT_TEST}:passed" \
     "tests=${NEGATIVE_TEST},${POSITIVE_TESTS[*]}"
 }
 
@@ -546,6 +561,7 @@ ensure_baseline() {
     return
   fi
   [[ ! -f "${OPERATION_PHASE}" ]] || fail 'operation-without-baseline' 79
+  [[ ! -e "${RUNTIME_TEMP}" && ! -L "${RUNTIME_TEMP}" ]] || fail 'runtime-temp-preexists' 79
   require_names_absent || fail 'veth-name-preexists' 79
   [[ ! -d "/sys/module/${MODULE_NAME}" ]] || fail 'module-preexists' 79
   conflicts="$(/usr/sbin/ip -4 -j address show to "${LOCAL_IPV4}/${PREFIX_BITS}")" || fail 'address-conflict-probe'
@@ -580,12 +596,20 @@ ensure_dependency_preflight() {
     run_operation P1 preflight-build || fail 'dependency-build-preflight' $?
   fi
   require_root_test_binary "${PREFLIGHT_BINARY}" || fail 'preflight-binary-identity' 79
-  for name in "${NEGATIVE_TEST}" "${POSITIVE_TESTS[@]}"; do
+  for name in "${PREFLIGHT_CONTRACT_TEST}" "${NEGATIVE_TEST}" "${POSITIVE_TESTS[@]}"; do
     output="$(run_operation "P.${name}" "list:${name}")" || fail "dependency-test-list:${name}" $?
     [[ "$(printf '%s\n' "${output}" | /usr/bin/grep -Fxc -- "${name}")" == 1 ]] || fail "dependency-test-definition:${name}" 79
   done
+  run_operation P.contract preflight-contract || fail 'dependency-contract-preflight' $?
   expected="$(render_dependency_preflight)" || fail 'preflight-render'
   write_phase "${DEPENDENCY_PHASE}" "${expected}" || fail 'preflight-phase-write' $?
+}
+
+ensure_runtime_temp() {
+  if [[ ! -e "${RUNTIME_TEMP}" && ! -L "${RUNTIME_TEMP}" ]]; then
+    run_operation B1 runtime-temp-mkdir || fail 'runtime-temp-create' $?
+  fi
+  require_root_directory "${RUNTIME_TEMP}" || fail 'runtime-temp-identity' 79
 }
 
 validate_dependency_preflight() {
@@ -873,11 +897,12 @@ assert_bpf_links_baseline() {
 
 render_cleanup_intent() {
   local owner baseline operation dependency veth_intent veth address route
-  local neighbor offload_baseline offload module tested
+  local runtime_temp neighbor offload_baseline offload module tested
   owner="$(sha256_file "${OWNER_PHASE}")" || return $?
   baseline="$(sha256_file "${BASELINE_PHASE}")" || return $?
   operation="$(sha256_file "${OPERATION_PHASE}")" || return $?
   dependency="$(phase_binding "${DEPENDENCY_PHASE}")" || return $?
+  runtime_temp="$(directory_binding "${RUNTIME_TEMP}")" || return $?
   veth_intent="$(phase_binding "${VETH_INTENT_PHASE}")" || return $?
   veth="$(phase_binding "${VETH_PHASE}")" || return $?
   address="$(phase_binding "${ADDRESS_PHASE}")" || return $?
@@ -892,11 +917,22 @@ render_cleanup_intent() {
     "resource_id=${RESOURCE_ID}" "boot_id=${BOOT_ID}" "netns=${INITIAL_NETNS}" \
     "owner_sha256=${owner}" "baseline_sha256=${baseline}" \
     "operation_sha256=${operation}" "dependency=${dependency}" \
+    "runtime_temp=${runtime_temp}" \
     "veth_intent=${veth_intent}" "veth=${veth}" "address=${address}" \
     "route=${route}" "neighbor=${neighbor}" \
     "offload_baseline=${offload_baseline}" "offload=${offload}" \
     "module=${module}" "tested=${tested}" \
     'reverse=module,offload,neighbor,route,address,veth'
+}
+
+directory_binding() {
+  local path="$1"
+  if [[ -e "${path}" || -L "${path}" ]]; then
+    require_root_directory "${path}" || return 79
+    /usr/bin/stat -Lc '%d:%i' -- "${path}"
+    return
+  fi
+  printf 'absent\n'
 }
 
 phase_binding() {
@@ -1005,8 +1041,17 @@ validate_receipt_prefix() {
   fi
 }
 
+validate_runtime_temp_for_restore() {
+  if [[ -e "${RUNTIME_TEMP}" || -L "${RUNTIME_TEMP}" ]]; then
+    require_root_directory "${RUNTIME_TEMP}" || fail 'restore-runtime-temp-identity' 79
+    return
+  fi
+  [[ ! -f "${VETH_INTENT_PHASE}" ]] || fail 'restore-runtime-temp-missing-after-veth-intent' 79
+}
+
 validate_partial_setup_for_restore() {
   local first names_present=1 baseline_sha existing live
+  validate_runtime_temp_for_restore
   validate_receipt_prefix || fail 'restore-receipt-prefix' 79
   first="$(first_missing_receipt)" || fail 'restore-first-missing' $?
 
@@ -1131,6 +1176,7 @@ run_state_machine() {
   [[ ! -f "${CLEANUP_PHASE}" && ! -f "${RESTORED_PHASE}" ]] || fail 'run-after-cleanup-intent' 79
   ensure_operation_intent
   ensure_dependency_preflight
+  ensure_runtime_temp
   ensure_veth_phase
   ensure_address_phase
   ensure_route_phase
@@ -1150,6 +1196,7 @@ restore_state_machine() {
   ensure_baseline
   ensure_operation_intent
   if [[ -f "${RESTORED_PHASE}" ]]; then
+    validate_runtime_temp_for_restore
     restored="$(render_fixed_phase restored 'result=restored,filesystem=retained')"
     phase_matches "${RESTORED_PHASE}" "${restored}" || fail 'restored-phase-drift' 79
     require_names_absent || fail 'restored-veth-drift' 79

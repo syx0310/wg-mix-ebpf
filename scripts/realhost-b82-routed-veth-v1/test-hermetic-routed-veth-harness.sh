@@ -80,6 +80,7 @@ for literal in \
   'N6 operation=route-add target=198.18.82.2/32 argv=/usr/sbin/ip -4 route add 198.18.82.2/32 dev wg7e42aa src 198.18.82.1 mtu 1500 proto static scope link' \
   'N7 operation=neighbor-add target=wg7e42aa:198.18.82.2 argv=/usr/sbin/ip -4 neigh add 198.18.82.2 lladdr 02:7e:42:a1:9c:0b nud permanent dev wg7e42aa' \
   'N9 operation=offload-tso-off target=wg7e42aa:tso=off argv=/usr/sbin/ethtool -K wg7e42aa tso off' \
+  'B1 operation=runtime-temp-mkdir target=/run/wg-mix-ebpf-source-stages/7e42a19c/go-tmp-realhost argv=/usr/bin/mkdir --mode=0700 -- /run/wg-mix-ebpf-source-stages/7e42a19c/go-tmp-realhost' \
   'R2 operation=offload-tso-restore target=wg7e42aa:tso=on argv=/usr/sbin/ethtool -K wg7e42aa tso on' \
   'R3 operation=neighbor-delete target=wg7e42aa:198.18.82.2 argv=/usr/sbin/ip -4 neigh del 198.18.82.2 lladdr 02:7e:42:a1:9c:0b nud permanent dev wg7e42aa' \
   'R4 operation=route-delete target=198.18.82.2/32 argv=/usr/sbin/ip -4 route del 198.18.82.2/32 dev wg7e42aa src 198.18.82.1 mtu 1500 proto static scope link' \
@@ -97,12 +98,20 @@ done
   fail 'runner plan is missing the pre-mutation compiled test binary'
 [[ "${PLAN_OUTPUT}" == *'GOMODCACHE=/run/wg-mix-ebpf-source-stages/7e42a19c/go-mod-cache'* ]] ||
   fail 'clean-stage fixture does not reuse the bound staged module cache'
+[[ "${PLAN_OUTPUT}" == *'GOTMPDIR=/run/wg-mix-ebpf-source-stages/7e42a19c/go-tmp TMPDIR=/run/wg-mix-ebpf-source-stages/7e42a19c/go-tmp'* ]] ||
+  fail 'Go preflight does not use the generic staged temp root'
 [[ "${PLAN_OUTPUT}" != *'go-mod-cache-routed'* && "${PLAN_OUTPUT}" != *'go-cache-routed'* ]] ||
   fail 'clean-stage fixture still depends on an empty routed-only cache'
-preflight_offset="${PLAN_OUTPUT%%P0 operation=preflight-mod-verify*}"
+preflight_offset="${PLAN_OUTPUT%%P.contract operation=preflight-contract*}"
+runtime_temp_offset="${PLAN_OUTPUT%%B1 operation=runtime-temp-mkdir*}"
 mutation_offset="${PLAN_OUTPUT%%N0 operation=veth-add*}"
-(( ${#preflight_offset} < ${#mutation_offset} )) ||
-  fail 'dependency/build preflight is not ordered before the first host mutation'
+(( ${#preflight_offset} < ${#runtime_temp_offset} && ${#runtime_temp_offset} < ${#mutation_offset} )) ||
+  fail 'contract preflight and runtime temp are not ordered before the first host mutation'
+
+[[ "${PLAN_OUTPUT}" == *'operation=list:TestFakeTCPRealHostRoutedHarnessSelectedBinaryContract target=TestFakeTCPRealHostRoutedHarnessSelectedBinaryContract argv='* ]] ||
+  fail 'runner plan is missing the selected-binary contract definition gate'
+[[ "${PLAN_OUTPUT}" == *'P.contract operation=preflight-contract target=TestFakeTCPRealHostRoutedHarnessSelectedBinaryContract argv='* ]] ||
+  fail 'runner plan is missing the selected-binary contract execution gate'
 
 for test_name in \
   TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration \
@@ -115,7 +124,16 @@ for test_name in \
     fail "clean-stage fixture does not list ${test_name} from the prebuilt binary"
   [[ "${PLAN_OUTPUT}" == *"operation=test:${test_name} target=${test_name} argv="* ]] ||
     fail "runner plan is missing test operation for ${test_name}"
+  test_line="$(printf '%s\n' "${PLAN_OUTPUT}" | /usr/bin/grep -F "operation=test:${test_name} ")" ||
+    fail "runner plan cannot isolate test operation for ${test_name}"
+  [[ "${test_line}" == *'TMPDIR=/run/wg-mix-ebpf-source-stages/7e42a19c/go-tmp-realhost'* ]] ||
+    fail "selected binary contract TMPDIR drifted for ${test_name}"
+  [[ "${test_line}" != *'TMPDIR=/run/wg-mix-ebpf-source-stages/7e42a19c/go-tmp '* ]] ||
+    fail "selected binary still receives the generic Go preflight TMPDIR for ${test_name}"
 done
+
+[[ "${PLAN_OUTPUT}" == *'B82_ROUTED_VETH_WRITE_SET filesystem='*'/run/wg-mix-ebpf-source-stages/7e42a19c/go-tmp-realhost network='* ]] ||
+  fail 'write set does not declare the retained real-host TMPDIR'
 
 for forbidden in \
   '/usr/bin/ssh' '/usr/bin/scp' '/usr/bin/sudo' 'credientials/' \

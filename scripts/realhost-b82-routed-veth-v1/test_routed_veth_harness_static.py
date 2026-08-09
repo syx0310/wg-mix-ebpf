@@ -49,6 +49,7 @@ class Lifecycle:
     dependencies_verified: bool = False
     dependency_binary: bool = False
     preflight: bool = False
+    runtime_temp: str = "absent"  # absent, exact, foreign
     veth_intent: bool = False
     receipts: set[str] = dataclasses.field(default_factory=set)
     veth: str = "absent"
@@ -99,6 +100,11 @@ def run_model(state: Lifecycle, cut_after: str | None = None) -> None:
     if not state.preflight:
         state.preflight = True
         checkpoint("dependency-receipt", cut_after)
+
+    require_exact_or_absent(state.runtime_temp, "runtime-temp")
+    if state.runtime_temp == "absent":
+        state.runtime_temp = "exact"
+        checkpoint("runtime-temp", cut_after)
 
     if not state.veth_intent:
         state.veth_intent = True
@@ -153,7 +159,9 @@ def run_model(state: Lifecycle, cut_after: str | None = None) -> None:
 def restore_model(state: Lifecycle, cut_after: str | None = None) -> None:
     if state.restored:
         if (
-            state.veth != "absent"
+            state.runtime_temp == "foreign"
+            or (state.veth_intent and state.runtime_temp != "exact")
+            or state.veth != "absent"
             or state.module != "absent"
             or not state.bpf_baseline
         ):
@@ -168,8 +176,12 @@ def restore_model(state: Lifecycle, cut_after: str | None = None) -> None:
     if receipt_prefix != SETUP[: len(receipt_prefix)]:
         raise Rejected("receipt-prefix")
     first_missing = SETUP[len(receipt_prefix)] if len(receipt_prefix) < len(SETUP) else None
+    if state.runtime_temp == "foreign":
+        raise Rejected("runtime-temp-identity")
     if state.veth_intent and not state.preflight:
         raise Rejected("veth-intent-without-preflight")
+    if state.veth_intent and state.runtime_temp != "exact":
+        raise Rejected("veth-intent-without-runtime-temp")
     if not state.veth_intent:
         if state.veth != "absent" or state.module != "absent" or state.receipts:
             raise Rejected("resource-without-veth-intent")
@@ -231,6 +243,7 @@ def exercise_lifecycle_model() -> None:
         "dependency-verify",
         "dependency-build",
         "dependency-receipt",
+        "runtime-temp",
         "veth-intent",
         "veth-add",
         "veth-alias-a",
@@ -259,18 +272,31 @@ def exercise_lifecycle_model() -> None:
         else:
             fail(f"setup cut {cut} did not fire")
         restore_model(state)
-        if not state.restored or state.veth != "absent" or state.module != "absent":
+        if (
+            not state.restored
+            or state.runtime_temp not in {"absent", "exact"}
+            or state.veth != "absent"
+            or state.module != "absent"
+        ):
             fail(f"setup cut {cut} did not restore directly from partial state: {state}")
 
     clean_stage = Lifecycle(dependencies_staged=True)
     run_model(clean_stage)
-    if not clean_stage.preflight or clean_stage.receipts != set(SETUP):
+    if (
+        not clean_stage.preflight
+        or clean_stage.runtime_temp != "exact"
+        or clean_stage.receipts != set(SETUP)
+    ):
         fail(f"clean-stage fixture did not use the bound staged dependencies: {clean_stage}")
     missing_dependencies = Lifecycle(dependencies_staged=False)
     try:
         run_model(missing_dependencies)
     except Rejected:
-        if missing_dependencies.veth != "absent" or missing_dependencies.receipts:
+        if (
+            missing_dependencies.runtime_temp != "absent"
+            or missing_dependencies.veth != "absent"
+            or missing_dependencies.receipts
+        ):
             fail("dependency preflight failure reached a host mutation")
     else:
         fail("clean-stage fixture accepted missing staged dependencies")
@@ -306,6 +332,7 @@ def exercise_lifecycle_model() -> None:
     for label, mutate in {
         "foreign-veth": lambda state: setattr(state, "veth", "foreign"),
         "foreign-veth-alias": lambda state: setattr(state, "veth", "foreign-alias"),
+        "foreign-runtime-temp": lambda state: setattr(state, "runtime_temp", "foreign"),
         "foreign-route": lambda state: setattr(state, "route", "foreign"),
         "foreign-offload": lambda state: setattr(state, "offload", "foreign"),
         "foreign-module": lambda state: setattr(state, "module", "foreign"),
@@ -375,6 +402,7 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         "readonly REMOTE_IPV4='198.18.82.2'",
         "readonly ROUTE_MTU='1500'",
         'readonly GO_MOD_CACHE="${STAGE_ROOT}/go-mod-cache"',
+        'readonly RUNTIME_TEMP="${STAGE_ROOT}/go-tmp-realhost"',
         "GOFLAGS=-mod=readonly",
         "WG_MIX_FAKETCP_ROUTED_LOCAL_IPV4=\"${LOCAL_IPV4}\"",
         "WG_MIX_FAKETCP_ROUTED_REMOTE_IPV4=\"${REMOTE_IPV4}\"",
@@ -386,8 +414,10 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         "GOPROXY=off",
         "preflight-mod-verify",
         "preflight-build",
+        "TestFakeTCPRealHostRoutedHarnessSelectedBinaryContract",
         "ensure_operation_intent",
         "ensure_dependency_preflight",
+        "ensure_runtime_temp",
         "ensure_veth_intent",
         "validate_partial_setup_for_restore",
         "unreceipted-reconcile=exact-pair-and-empty-or-owned-alias-only",
@@ -400,7 +430,7 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
     for literal in required:
         if literal not in runner:
             fail(f"runner is missing {literal!r}")
-    for stale_cache in ("go-cache-routed", "go-mod-cache-routed", "go-tmp-realhost"):
+    for stale_cache in ("go-cache-routed", "go-mod-cache-routed"):
         if stale_cache in runner:
             fail(f"runner still relies on empty harness-only cache {stale_cache!r}")
 
@@ -412,6 +442,7 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         'OP_ARGV=(/usr/sbin/ip -4 address del "${LOCAL_IPV4}/${PREFIX_BITS}" dev "${VETH_A}" scope global)',
         'OP_ARGV=(/usr/sbin/ethtool -K "${VETH_A}" tso on)',
         'OP_ARGV=(/usr/sbin/rmmod "${MODULE_NAME}")',
+        'OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${RUNTIME_TEMP}")',
     ):
         if literal not in builder:
             fail(f"argv builder is missing exact reverse operation {literal!r}")
@@ -420,6 +451,10 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         fail("runner has a destructive network/module argv outside the sole builder")
     if '"${PREFLIGHT_BINARY}" -test.run' not in builder:
         fail("post-mutation tests do not execute the preflight-bound binary")
+    if 'TMPDIR="${RUNTIME_TEMP}"' not in builder:
+        fail("selected binary does not receive the reviewed real-host TMPDIR")
+    if 'GOTMPDIR="${GO_TMP}" TMPDIR="${GO_TMP}"' not in runner:
+        fail("offline Go preflight does not retain the generic staged temp root")
     run_tests = function_body(runner, "run_tests")
     if "/usr/bin/go" in run_tests or "list:" in run_tests:
         fail("post-mutation test phase can rebuild or rediscover dependencies")
@@ -455,13 +490,22 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         "ensure_baseline",
         "ensure_operation_intent",
         "ensure_dependency_preflight",
+        "ensure_runtime_temp",
         "ensure_veth_phase",
     )
     positions = [run.index(item) for item in run_order]
     if positions != sorted(positions):
         fail("run did not finish dependency/build preflight before host mutation")
     preflight = function_body(runner, "ensure_dependency_preflight")
-    if not all(item in preflight for item in ("preflight-mod-verify", "preflight-build", "list:${name}")):
+    if not all(
+        item in preflight
+        for item in (
+            "preflight-mod-verify",
+            "preflight-build",
+            "list:${name}",
+            "preflight-contract",
+        )
+    ):
         fail("dependency preflight does not compile and bind every selected test")
     if "run_operation" in function_body(runner, "validate_dependency_preflight"):
         fail("restore dependency validation can execute a build")
@@ -494,6 +538,12 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
             fail(f"cleanup intent does not bind {receipt} receipt")
     if '"${OFFLOAD_BASELINE_A}"' not in cleanup:
         fail("cleanup intent does not bind the optional offload baseline")
+    if 'directory_binding "${RUNTIME_TEMP}"' not in cleanup:
+        fail("cleanup intent does not bind the retained real-host TMPDIR identity")
+
+    partial_restore = function_body(runner, "validate_partial_setup_for_restore")
+    if "validate_runtime_temp_for_restore" not in partial_restore:
+        fail("partial restore does not validate the retained real-host TMPDIR")
 
     for forbidden in ("ssh", "scp", "sudo", "credientials/", "192.168.10.28", "47.116.202.155"):
         if forbidden in seam:

@@ -21,14 +21,21 @@ import (
 )
 
 const (
-	fakeTCPRoutedCoreStatIngressRuleMiss = uint32(7)
-	fakeTCPRoutedCoreStatGSORewriteOK    = uint32(17)
-	fakeTCPRoutedFakeStatCount           = 19
-	fakeTCPRoutedCoreStatCount           = 36
-	fakeTCPRoutedMTUAuditStatCount       = 15
-	fakeTCPRoutedInitialSequence         = uint32(0x55667788)
-	fakeTCPRoutedAcknowledgement         = uint32(0x99aabbcc)
-	fakeTCPRoutedWindow                  = uint16(4096)
+	fakeTCPRoutedFakeStatEgressOK             = uint32(0)
+	fakeTCPRoutedFakeStatChecksumNoneAccepted = uint32(13)
+	fakeTCPRoutedFakeStatChecksumPartialReset = uint32(14)
+	fakeTCPRoutedFakeStatCount                = 19
+	fakeTCPRoutedCoreStatEgressRewriteOK      = uint32(0)
+	fakeTCPRoutedCoreStatIngressRuleMiss      = uint32(7)
+	fakeTCPRoutedCoreStatEgressGSOSeen        = uint32(15)
+	fakeTCPRoutedCoreStatEgressGSOManagedSeen = uint32(16)
+	fakeTCPRoutedCoreStatGSORewriteOK         = uint32(17)
+	fakeTCPRoutedCoreStatXOREgressOK          = uint32(24)
+	fakeTCPRoutedCoreStatCount                = 36
+	fakeTCPRoutedMTUAuditStatCount            = 15
+	fakeTCPRoutedInitialSequence              = uint32(0x55667788)
+	fakeTCPRoutedAcknowledgement              = uint32(0x99aabbcc)
+	fakeTCPRoutedWindow                       = uint16(4096)
 )
 
 type fakeTCPRoutedSocketMode uint8
@@ -124,20 +131,20 @@ func runFakeTCPRoutedSocketAcceptance(t *testing.T, mode fakeTCPRoutedSocketMode
 	)
 	assertFakeTCPRoutedSegments(t, mode, segments, wireImages)
 
-	fakeWant := map[uint32]uint64{fakeTCPRealHostStatEgressOK: 1}
+	fakeWant := map[uint32]uint64{fakeTCPRoutedFakeStatEgressOK: 1}
 	coreWant := map[uint32]uint64{
-		fakeTCPRealHostCoreStatEgressRewriteOK: 1,
-		fakeTCPRoutedCoreStatIngressRuleMiss:   uint64(wantSegments),
-		fakeTCPRealHostCoreStatXOREgressOK:     1,
+		fakeTCPRoutedCoreStatEgressRewriteOK: 1,
+		fakeTCPRoutedCoreStatIngressRuleMiss: uint64(wantSegments),
+		fakeTCPRoutedCoreStatXOREgressOK:     1,
 	}
 	switch mode {
 	case fakeTCPRoutedSocketIPHdrIncl:
-		fakeWant[fakeTCPRealHostStatChecksumNoneAccepted] = 1
+		fakeWant[fakeTCPRoutedFakeStatChecksumNoneAccepted] = 1
 	case fakeTCPRoutedSocketUDP:
-		fakeWant[fakeTCPRealHostStatChecksumPartialReset] = 1
+		fakeWant[fakeTCPRoutedFakeStatChecksumPartialReset] = 1
 	case fakeTCPRoutedSocketUDPSegment:
-		coreWant[fakeTCPRealHostCoreStatEgressGSOSeen] = 1
-		coreWant[fakeTCPRealHostCoreStatEgressGSOManagedSeen] = 1
+		coreWant[fakeTCPRoutedCoreStatEgressGSOSeen] = 1
+		coreWant[fakeTCPRoutedCoreStatEgressGSOManagedSeen] = 1
 		coreWant[fakeTCPRoutedCoreStatGSORewriteOK] = 1
 	default:
 		t.Fatalf("unsupported routed socket mode %d", mode)

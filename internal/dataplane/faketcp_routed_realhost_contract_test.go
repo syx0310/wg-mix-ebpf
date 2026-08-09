@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/netip"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -202,6 +203,38 @@ func TestParseFakeTCPRoutedRealHostContract(t *testing.T) {
 	}
 }
 
+func TestFakeTCPRealHostRoutedHarnessSelectedBinaryContract(t *testing.T) {
+	const (
+		runID     = "7e42a19c"
+		stageRoot = "/run/wg-mix-ebpf-source-stages/" + runID
+	)
+	values := validFakeTCPRealHostEnvironment()
+	values[fakeTCPRealHostObjectEnv] = stageRoot + "/source/build/wg_mix_faketcp_experimental.o"
+	values[fakeTCPRealHostBaselineObjectEnv] = stageRoot + "/source/build/wg_mix_tc.o"
+	values[fakeTCPRealHostRunIDEnv] = runID
+	values[fakeTCPRealHostTempRootEnv] = stageRoot + "/go-tmp-realhost"
+	for name, value := range validFakeTCPRoutedRealHostEnvironment() {
+		values[name] = value
+	}
+
+	base, err := parseFakeTCPRealHostContract(mapFakeTCPRealHostEnvironment(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	routed, err := parseFakeTCPRoutedRealHostContract(mapFakeTCPRealHostEnvironment(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if base.runID != runID || base.tempRoot != stageRoot+"/go-tmp-realhost" ||
+		base.vethName != "wg7e42aa" || base.peerVethName != "wg7e42ab" ||
+		routed.localIPv4.String() != fakeTCPRoutedLocalIPv4 ||
+		routed.remoteIPv4.String() != fakeTCPRoutedRemoteIPv4 ||
+		routed.prefixBits != fakeTCPRoutedPrefixBits ||
+		routed.routeMTU != fakeTCPRoutedRouteMTU {
+		t.Fatalf("base=%#v routed=%#v", base, routed)
+	}
+}
+
 func TestFakeTCPRoutedWireImageBindsTypewordXORAndRotation(t *testing.T) {
 	original := make([]byte, fakeTCPRoutedSegmentBytes)
 	binary.LittleEndian.PutUint32(original[:4], 4)
@@ -274,6 +307,28 @@ func TestFakeTCPRoutedRealHostLinuxStaticContract(t *testing.T) {
 		t.Fatal(err)
 	}
 	source := string(contents)
+	for name, value := range map[string]uint32{
+		"fakeTCPRoutedFakeStatEgressOK":             0,
+		"fakeTCPRoutedFakeStatChecksumNoneAccepted": 13,
+		"fakeTCPRoutedFakeStatChecksumPartialReset": 14,
+		"fakeTCPRoutedCoreStatEgressRewriteOK":      0,
+		"fakeTCPRoutedCoreStatIngressRuleMiss":      7,
+		"fakeTCPRoutedCoreStatEgressGSOSeen":        15,
+		"fakeTCPRoutedCoreStatEgressGSOManagedSeen": 16,
+		"fakeTCPRoutedCoreStatGSORewriteOK":         17,
+		"fakeTCPRoutedCoreStatXOREgressOK":          24,
+	} {
+		pattern := regexp.MustCompile(
+			`(?m)^\s*` + regexp.QuoteMeta(name) + `\s*=\s*uint32\(` +
+				strconv.FormatUint(uint64(value), 10) + `\)\s*$`,
+		)
+		if !pattern.MatchString(source) {
+			t.Fatalf("FakeTCP routed stat index %s=%d is not self-contained", name, value)
+		}
+	}
+	if !regexp.MustCompile(`(?m)^\s*fakeTCPRoutedFakeStatCount\s*=\s*19\s*$`).MatchString(source) {
+		t.Fatal("FakeTCP routed fake-stat manifest is not locked to 19 entries")
+	}
 	for _, required := range []string{
 		"func TestFakeTCPRealHostRoutedIPHdrInclNone(t *testing.T)",
 		"func TestFakeTCPRealHostRoutedUDPSocketPartial(t *testing.T)",
@@ -287,8 +342,8 @@ func TestFakeTCPRoutedRealHostLinuxStaticContract(t *testing.T) {
 		"unix.UDP_SEGMENT",
 		"faketcp_mtu_audit_map",
 		"fakeTCPRoutedMTUAuditStatCount",
-		"fakeTCPRealHostStatChecksumNoneAccepted",
-		"fakeTCPRealHostStatChecksumPartialReset",
+		"fakeTCPRoutedFakeStatChecksumNoneAccepted",
+		"fakeTCPRoutedFakeStatChecksumPartialReset",
 		"fakeTCPRoutedCoreStatGSORewriteOK",
 		"wireImages := fakeTCPRoutedExpectedWireSegments(",
 		"rule.SourcePort != fakeTCPRoutedSourcePort",
@@ -315,6 +370,13 @@ func TestFakeTCPRoutedRealHostLinuxStaticContract(t *testing.T) {
 		"netlink.NeighAdd(",
 		"netlink.NeighDel(",
 		"t.Parallel()",
+		"fakeTCPRealHostStatEgressOK",
+		"fakeTCPRealHostStatChecksumNoneAccepted",
+		"fakeTCPRealHostStatChecksumPartialReset",
+		"fakeTCPRealHostCoreStatEgressRewriteOK",
+		"fakeTCPRealHostCoreStatEgressGSOSeen",
+		"fakeTCPRealHostCoreStatEgressGSOManagedSeen",
+		"fakeTCPRealHostCoreStatXOREgressOK",
 	} {
 		if strings.Contains(source, forbidden) {
 			t.Fatalf("FakeTCP routed real-host Linux source contains forbidden operation %q", forbidden)
