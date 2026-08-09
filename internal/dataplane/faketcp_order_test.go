@@ -190,7 +190,7 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 
 	for _, want := range []string{
 		"bpf_tail_call(skb, &faketcp_egress_programs",
-		"return faketcp_encode_established(skb, &info, rule, generation,",
+		"return faketcp_encode_established(skb, info, rule, generation,",
 		"listener->transport_mode == TRANSPORT_FAKETCP",
 		"faketcp_consume_ingress_admission(skb, &info, listener,",
 		"faketcp_capture_first_packet(skb, info, l3, rule, &key)",
@@ -203,7 +203,7 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 			t.Fatalf("FakeTCP pipeline source missing %q", want)
 		}
 	}
-	if strings.Count(tc+fake, "faketcp_encode_established(skb, &info, rule, generation,") != 2 {
+	if strings.Count(tc+fake, "faketcp_encode_established(skb, info, rule, generation,") != 2 {
 		t.Fatal("direct and tail-call branches must converge on exactly one FakeTCP encoder")
 	}
 	if !strings.Contains(fake, "single encoder used by both") {
@@ -222,7 +222,7 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 	}
 	egress := tc[egressStart:]
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
-	typeWord := strings.Index(egress, "update_type_word(skb, &info, old_wire, new_wire, 1)")
+	typeWord := strings.Index(egress, "update_type_word(skb, info, old_wire, new_wire, 1)")
 	if checkpoint < 0 || typeWord < 0 || checkpoint >= typeWord {
 		t.Fatal("FakeTCP admission checkpoint must precede type-word and XOR mutation")
 	}
@@ -273,16 +273,17 @@ func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T
 		t.Fatal("egress entry point is missing")
 	}
 	egress := tc[egressStart:]
-	l3Gate := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	parse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
+	l3Gate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
 	gsoDispatch := strings.Index(egress, "return faketcp_encode_gso_segments(")
 	nonGSOPrepare := strings.Index(egress, "if (faketcp_prepare_udp(")
 	nonGSOCheckpoint := strings.Index(egress, "if (faketcp_egress_admission_checkpoint(")
 	nonGSOConsume := strings.Index(egress, "if (faketcp_consume_egress_admission(")
-	firstNonGSOType := strings.Index(egress, "rc = update_type_word(skb, &info, old_wire, new_wire, 1)")
-	directNonGSOType := strings.LastIndex(egress, "rc = update_type_word(skb, &info, old_wire, new_wire, 1)")
-	if l3Gate < 0 || gsoDispatch < 0 || nonGSOPrepare < 0 || nonGSOCheckpoint < 0 || nonGSOConsume < 0 ||
+	firstNonGSOType := strings.Index(egress, "rc = update_type_word(skb, info, old_wire, new_wire, 1)")
+	directNonGSOType := strings.LastIndex(egress, "rc = update_type_word(skb, info, old_wire, new_wire, 1)")
+	if parse < 0 || l3Gate < 0 || gsoDispatch < 0 || nonGSOPrepare < 0 || nonGSOCheckpoint < 0 || nonGSOConsume < 0 ||
 		firstNonGSOType < 0 || directNonGSOType < 0 ||
-		!(l3Gate < gsoDispatch && gsoDispatch < nonGSOPrepare && nonGSOPrepare < nonGSOCheckpoint &&
+		!(parse < l3Gate && l3Gate < gsoDispatch && gsoDispatch < nonGSOPrepare && nonGSOPrepare < nonGSOCheckpoint &&
 			nonGSOCheckpoint < firstNonGSOType && firstNonGSOType < nonGSOConsume &&
 			nonGSOConsume < directNonGSOType) {
 		t.Fatal("shared L3 gate and unified prepare must precede one non-GSO proof/consume and mutation")

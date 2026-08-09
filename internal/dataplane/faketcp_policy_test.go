@@ -571,9 +571,9 @@ func TestFakeTCPMimicTransformCompositionOrderContract(t *testing.T) {
 
 	egress := sourceSection(t, tc, "int wg_mix_egress(struct __sk_buff *skb)", "SEC(\"classifier/ingress\")")
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
-	typeWord := strings.Index(egress, "update_type_word(skb, &info, old_wire, new_wire, 1)")
+	typeWord := strings.Index(egress, "update_type_word(skb, info, old_wire, new_wire, 1)")
 	xorDispatch := strings.Index(egress, "bpf_tail_call(skb, &xor_egress_programs")
-	directFakeTCP := strings.Index(egress, "return faketcp_encode_established(skb, &info, rule, generation,")
+	directFakeTCP := strings.Index(egress, "return faketcp_encode_established(skb, info, rule, generation,")
 	if checkpoint < 0 || typeWord < 0 || xorDispatch < 0 || directFakeTCP < 0 ||
 		!(checkpoint < typeWord && typeWord < xorDispatch && typeWord < directFakeTCP) {
 		t.Fatal("egress must capture original UDP, rewrite type-word, apply XOR when configured, then encode FakeTCP")

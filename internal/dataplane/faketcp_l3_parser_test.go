@@ -110,7 +110,7 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 			t.Fatalf("obsolete independent parser path remains: %q", removed)
 		}
 	}
-	if !strings.Contains(tc, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3) != FAKETCP_L3_OK") {
+	if !strings.Contains(tc, "faketcp_revalidate_tc_ingress_l3(skb, &info, &faketcp_l3) !=") {
 		t.Fatal("TC ingress did not revalidate the XDP-decoded packet with the shared L3 contract")
 	}
 
@@ -120,11 +120,12 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		t.Fatal("FakeTCP egress boundaries are missing")
 	}
 	egress := tc[egressStart:egressEnd]
-	tcParse := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	tcParse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
+	tcGate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
 	prepare := strings.Index(egress, "if (faketcp_prepare_udp(")
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
-	if tcParse < 0 || prepare < 0 || checkpoint < 0 ||
-		!(tcParse < prepare && prepare < checkpoint) {
+	if tcParse < 0 || tcGate < 0 || prepare < 0 || checkpoint < 0 ||
+		!(tcParse < tcGate && tcGate < prepare && prepare < checkpoint) {
 		t.Fatal("fixed-header transform gate must precede the admission checkpoint")
 	}
 	checkpointBody := sourceSection(t, main,
@@ -138,7 +139,7 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		t.Fatal("TC ingress entry point is missing")
 	}
 	tcIngress := tc[tcIngressStart:]
-	tcIngressGate := strings.Index(tcIngress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	tcIngressGate := strings.Index(tcIngress, "faketcp_revalidate_tc_ingress_l3(skb, &info, &faketcp_l3)")
 	tcMutation := strings.Index(tcIngress, "update_type_word(skb, &info")
 	if tcIngressGate < 0 || tcMutation < 0 || tcIngressGate >= tcMutation {
 		t.Fatal("fixed-header transform gate must precede TC ingress mutation")
