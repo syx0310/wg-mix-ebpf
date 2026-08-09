@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import contextlib
+import copy
 import importlib.util
 import io
 import json
 import os
 import pathlib
+import select
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -2149,6 +2152,876 @@ class JournalDurabilityTests(unittest.TestCase):
                 with self.assertRaises(MODULE.HarnessError):
                     self.open_journal(path, create=False)
                 self.assertEqual(path.read_bytes(), original + bad_line)
+
+
+@contextlib.contextmanager
+def manifest_bound_capture_package():
+    """Create the exact caller-owned, inherited-GID package used by capture-local."""
+
+    seed = MODULE.sha256_bytes(f"{os.getpid()}:{time.time_ns()}".encode())
+    source_commit = seed[:40]
+    package_dir = pathlib.Path(f"{MODULE.LOCAL_PACKAGE_PREFIX}{source_commit[:12]}")
+    package_dir.mkdir(mode=0o700)
+    package_dir.chmod(0o700)
+    try:
+        publisher_payload = MODULE_PATH.read_bytes()
+        publisher_path = package_dir / MODULE.LOCAL_PUBLISHER_NAME
+        publisher_path.write_bytes(publisher_payload)
+        publisher_path.chmod(0o600)
+
+        traffic_oracle_sha256 = MODULE.sha256_bytes(b"manifest-bound-traffic-oracle")
+        filler_blob = "1234567890abcdef1234567890abcdef12345678"
+        filler_sha256 = "abcdef0123456789" * 4
+        values = {key: "fixture" for key in MODULE.PACKAGE_MANIFEST_KEYS}
+        for identity in MODULE.PACKAGE_MANIFEST_IDENTITY_KEYS:
+            values[f"{identity}_path"] = f"scripts/fixture/{identity}"
+            values[f"{identity}_blob"] = filler_blob
+            values[f"{identity}_sha256"] = filler_sha256
+        values.update(
+            {
+                "format": "wg-mix-ebpf-b82-v6-package-v4",
+                "run_id": "c8e41d73",
+                "package_id": "4f2a9b61",
+                "integration_ref": "refs/heads/codex/capture-local-fixture",
+                "integration_commit": source_commit,
+                "local_package_dir": str(package_dir),
+                "remote_source": "/run/wg-mix-ebpf-source-stages/c8e41d73/source",
+                "check_realhost_iperf_py_path": (
+                    "scripts/realhost-b82-c8e41d73/check-realhost-iperf.py"
+                ),
+                "check_realhost_iperf_py_sha256": traffic_oracle_sha256,
+                "realnic_acceptance_py_path": (
+                    "scripts/realhost-b82-acceptance-v1/realnic_acceptance.py"
+                ),
+                "realnic_acceptance_py_blob": MODULE.git_blob_oid(publisher_payload),
+                "realnic_acceptance_py_sha256": MODULE.sha256_bytes(publisher_payload),
+            }
+        )
+        manifest_payload = "".join(
+            f"{key}\t{values[key]}\n" for key in MODULE.PACKAGE_MANIFEST_KEYS
+        ).encode()
+        manifest_path = package_dir / MODULE.LOCAL_PACKAGE_MANIFEST
+        manifest_path.write_bytes(manifest_payload)
+        manifest_path.chmod(0o600)
+
+        directory_metadata = package_dir.stat()
+        manifest_metadata = manifest_path.stat()
+        publisher_metadata = publisher_path.stat()
+        if (
+            directory_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(directory_metadata.st_mode) != 0o700
+            or manifest_metadata.st_gid != directory_metadata.st_gid
+            or publisher_metadata.st_gid != directory_metadata.st_gid
+            or stat.S_IMODE(manifest_metadata.st_mode) != 0o600
+            or stat.S_IMODE(publisher_metadata.st_mode) != 0o600
+        ):
+            raise AssertionError("capture fixture did not preserve canonical inherited-GID shape")
+
+        controller_fixture = ControllerPlanTests.acceptance_fixture()
+        runner = FixtureRunner(controller_fixture)
+        spec, snapshot, commands = MODULE.collect_controller_plan_snapshot(
+            source_commit,
+            runner,
+        )
+        expected_oracle = {
+            "path": (
+                f'{values["remote_source"]}/{values["check_realhost_iperf_py_path"]}'
+            ),
+            "sha256": traffic_oracle_sha256,
+        }
+        plan = MODULE.build_plan(
+            spec,
+            snapshot,
+            commands,
+            traffic_oracle=expected_oracle,
+        )
+        MODULE.validate_plan_shape(plan, spec, expected_traffic_oracle=expected_oracle)
+        yield types.SimpleNamespace(
+            source_commit=source_commit,
+            package_dir=package_dir,
+            publisher_path=publisher_path,
+            manifest_path=manifest_path,
+            manifest_payload=manifest_payload,
+            manifest_sha256=MODULE.sha256_bytes(manifest_payload),
+            plan=plan,
+            plan_payload=MODULE.canonical_json(plan),
+        )
+    finally:
+        if package_dir.exists():
+            children = tuple(package_dir.iterdir())
+            for child in children:
+                if not child.is_file() and not child.is_symlink():
+                    raise AssertionError(f"unexpected capture fixture child: {child}")
+                child.unlink()
+            package_dir.rmdir()
+
+
+@contextlib.contextmanager
+def local_publisher_directory():
+    with tempfile.TemporaryDirectory() as temporary:
+        package_dir = pathlib.Path(temporary, "package")
+        package_dir.mkdir(mode=0o700)
+        package_dir.chmod(0o700)
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+        directory = os.open(package_dir, flags)
+        try:
+            metadata = os.fstat(directory)
+            yield package_dir, directory, (metadata.st_dev, metadata.st_ino)
+        finally:
+            os.close(directory)
+
+
+def local_publish_names(payload):
+    digest = MODULE.sha256_bytes(payload)
+    name = f"{MODULE.LOCAL_PLAN_PREFIX}{digest}.json"
+    return digest, name, f"{name}.pending"
+
+
+def write_mode_0600(path, payload):
+    path.write_bytes(payload)
+    path.chmod(0o600)
+
+
+class CaptureLocalPublisherTests(unittest.TestCase):
+    @staticmethod
+    def run_capture(package, payload):
+        command = [
+            "/usr/bin/python3",
+            "-B",
+            "-I",
+            str(package.publisher_path),
+            "capture-local",
+            "--source-commit",
+            package.source_commit,
+            "--manifest",
+            str(package.manifest_path),
+            "--manifest-sha256",
+            package.manifest_sha256,
+        ]
+        environment = dict(os.environ)
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        return subprocess.run(
+            command,
+            input=payload,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=package.package_dir,
+            env=environment,
+            timeout=30,
+            check=False,
+        )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and os.geteuid() != 0,
+        "capture-local is restricted to the non-root Darwin controller",
+    )
+    def test_actual_isolated_manifest_bound_copy_publishes_and_is_idempotent(self):
+        version = subprocess.run(
+            ["/usr/bin/python3", "--version"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=10,
+            check=False,
+            env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+        )
+        self.assertEqual(version.returncode, 0)
+        if sys.platform == "darwin":
+            self.assertRegex(
+                (version.stdout + version.stderr).decode("ascii", "strict"),
+                r"^Python 3\.9\.",
+            )
+        with manifest_bound_capture_package() as package:
+            payload = package.plan_payload
+            digest, name, pending_name = local_publish_names(payload)
+            final_path = package.package_dir / name
+            pending_path = package.package_dir / pending_name
+
+            first = self.run_capture(package, payload)
+            self.assertEqual(first.returncode, 0, first.stderr.decode("utf-8", "replace"))
+            self.assertEqual(first.stderr, b"")
+            self.assertNotIn(b"Traceback", first.stdout + first.stderr)
+            self.assertEqual(
+                first.stdout,
+                (
+                    "REALNIC_CAPTURE_LOCAL_PUBLISHED "
+                    f"path={final_path} sha256={digest} bytes={len(payload)} existing=0 "
+                    "approval_required=1 automatic_approval=0\n"
+                ).encode(),
+            )
+            self.assertEqual(final_path.read_bytes(), payload)
+            first_metadata = final_path.stat()
+            self.assertEqual(stat.S_IMODE(first_metadata.st_mode), 0o600)
+            self.assertEqual(first_metadata.st_uid, os.geteuid())
+            self.assertEqual(first_metadata.st_gid, package.package_dir.stat().st_gid)
+            if sys.platform == "darwin":
+                self.assertNotEqual(package.package_dir.stat().st_gid, os.getegid())
+                self.assertNotEqual(first_metadata.st_gid, os.getegid())
+            self.assertEqual(first_metadata.st_nlink, 1)
+            self.assertFalse(pending_path.exists())
+
+            second = self.run_capture(package, payload)
+            self.assertEqual(second.returncode, 0, second.stderr.decode("utf-8", "replace"))
+            self.assertIn(b" existing=1 ", second.stdout)
+            second_metadata = final_path.stat()
+            self.assertEqual(
+                (second_metadata.st_dev, second_metadata.st_ino),
+                (first_metadata.st_dev, first_metadata.st_ino),
+            )
+            self.assertEqual(final_path.read_bytes(), payload)
+            self.assertFalse(pending_path.exists())
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and os.geteuid() != 0,
+        "capture-local is restricted to the non-root Darwin controller",
+    )
+    def test_recursive_schema_key_and_type_failures_are_rc125_without_publish(self):
+        with manifest_bound_capture_package() as package:
+            original = package.plan
+            mutation_cell = next(
+                index
+                for index, cell in enumerate(original["cells"])
+                if cell["runnable"] and cell["mutation"]
+            )
+            traffic_cell = next(
+                index
+                for index, cell in enumerate(original["cells"])
+                if cell["runnable"] and cell["traffic"]
+            )
+
+            cases = (
+                ("root-array", lambda plan: []),
+                ("top-extra-key", lambda plan: plan.__setitem__("extra", True)),
+                ("top-missing-key", lambda plan: plan.__delitem__("safety_contract")),
+                ("spec-extra-key", lambda plan: plan["spec"].__setitem__("extra", 1)),
+                (
+                    "spec-missing-key",
+                    lambda plan: plan["spec"].__delitem__("expected_ifindex"),
+                ),
+                (
+                    "spec-wrong-type",
+                    lambda plan: plan["spec"].__setitem__("expected_ifindex", "2"),
+                ),
+                (
+                    "baseline-extra-key",
+                    lambda plan: plan["baseline"].__setitem__("extra", []),
+                ),
+                (
+                    "baseline-host-wrong-type",
+                    lambda plan: plan["baseline"].__setitem__("host", []),
+                ),
+                (
+                    "interface-missing-key",
+                    lambda plan: plan["baseline"]["interface_identity"].__delitem__("mac"),
+                ),
+                (
+                    "feature-enabled-wrong-type",
+                    lambda plan: plan["baseline"]["features"]["tx-checksumming"].__setitem__(
+                        "enabled", 1
+                    ),
+                ),
+                (
+                    "unreviewed-owned-child",
+                    lambda plan: plan["baseline"]["features"].__setitem__(
+                        "tx-checksum-unreviewed",
+                        {"enabled": True, "fixed": False, "parent": "tx-checksumming"},
+                    ),
+                ),
+                ("write-set-wrong-type", lambda plan: plan.__setitem__("write_set", [])),
+                (
+                    "filesystem-unhashable-item",
+                    lambda plan: plan["write_set"]["filesystem"].append({"path": "bad"}),
+                ),
+                ("cells-wrong-type", lambda plan: plan.__setitem__("cells", {})),
+                ("cell-wrong-type", lambda plan: plan["cells"].__setitem__(0, None)),
+                (
+                    "step-wrong-type",
+                    lambda plan: plan["cells"][mutation_cell]["mutation"].__setitem__(0, None),
+                ),
+                (
+                    "step-extra-key",
+                    lambda plan: plan["cells"][mutation_cell]["mutation"][0].__setitem__(
+                        "extra", True
+                    ),
+                ),
+                (
+                    "oracle-wrong-type",
+                    lambda plan: plan["cells"][traffic_cell]["traffic"][0].__setitem__(
+                        "oracle", []
+                    ),
+                ),
+                (
+                    "runtime-schedule-wrong-type",
+                    lambda plan: plan.__setitem__("runtime_snapshot_schedule", []),
+                ),
+                (
+                    "safety-extra-key",
+                    lambda plan: plan["safety_contract"].__setitem__("extra", True),
+                ),
+            )
+            for name, change in cases:
+                with self.subTest(name=name):
+                    candidate = copy.deepcopy(original)
+                    replacement = change(candidate)
+                    if name == "root-array":
+                        candidate = replacement
+                    else:
+                        self.assertIsNone(replacement)
+                    candidate_payload = MODULE.canonical_json(candidate)
+                    digest, final_name, pending_name = local_publish_names(candidate_payload)
+                    result = self.run_capture(package, candidate_payload)
+                    self.assertEqual(
+                        (
+                            result.returncode,
+                            result.stdout,
+                            b"Traceback" in result.stderr,
+                            (package.package_dir / final_name).exists(),
+                            (package.package_dir / pending_name).exists(),
+                        ),
+                        (125, b"", False, False, False),
+                        f"{name}: {result.stderr.decode('utf-8', 'replace')}",
+                    )
+                    self.assertIn(b"REALNIC_ACCEPTANCE_STOP reason=", result.stderr)
+                    self.assertNotIn(digest.encode(), result.stdout)
+
+    def test_owned_child_allowlist_and_foreign_feature_evidence_are_exact(self):
+        spec = fixture_spec()
+        runner = FixtureRunner(spec)
+        snapshot, commands = MODULE.collect_snapshot(spec, runner)
+        plan = MODULE.build_plan(spec, snapshot, commands)
+        self.assertIn("tx-checksum-ipv4", plan["baseline"]["features"])
+        self.assertIn("tx-checksum-ipv4", plan["owned_feature_closure"])
+        self.assertIn("foreign-offload", plan["baseline"]["features"])
+        self.assertNotIn("foreign-offload", plan["owned_feature_closure"])
+
+        features = {
+            name: {"enabled": True, "fixed": False, "parent": None}
+            for name in MODULE.FEATURE_ORDER
+        }
+        for parent, children in MODULE.OWNED_FEATURE_CHILDREN.items():
+            for child in children:
+                features[child] = {"enabled": True, "fixed": False, "parent": parent}
+        closure = MODULE.owned_feature_closure(features)
+        self.assertEqual(closure, sorted(features))
+        features["tx-checksum-unreviewed"] = {
+            "enabled": True,
+            "fixed": False,
+            "parent": "tx-checksumming",
+        }
+        with self.assertRaisesRegex(MODULE.HarnessError, "unreviewed owned child"):
+            MODULE.owned_feature_closure(features)
+
+    def test_live_snapshot_drift_precedes_run_root_journal_and_network_writes(self):
+        for feature in ("generic-segmentation-offload", "foreign-offload"):
+            with self.subTest(feature=feature):
+                spec = fixture_spec()
+                runner = SimulatedRunner(spec)
+                snapshot, commands = MODULE.collect_snapshot(spec, runner)
+                plan = MODULE.build_plan(spec, snapshot, commands)
+                payload = MODULE.canonical_json(plan)
+                digest = MODULE.sha256_bytes(payload)
+                runner.features[feature] = not runner.features[feature]
+                lease = types.SimpleNamespace(path="unused", expected_identity={})
+                with (
+                    mock.patch.object(MODULE, "create_run_root") as create_run_root,
+                    mock.patch.object(MODULE, "write_exclusive") as write_exclusive,
+                    mock.patch.object(MODULE, "Journal") as journal,
+                    self.assertRaisesRegex(
+                        MODULE.HarnessError,
+                        "current read-only snapshot no longer matches",
+                    ),
+                ):
+                    MODULE.run_with_interface_lease(
+                        spec,
+                        digest,
+                        runner,
+                        plan,
+                        payload,
+                        lease,
+                    )
+                create_run_root.assert_not_called()
+                write_exclusive.assert_not_called()
+                journal.assert_not_called()
+                self.assertEqual(runner.network_writes, 0)
+
+
+class LocalPlanPublisherStateMachineTests(unittest.TestCase):
+    payload = MODULE.canonical_json({"schema": "fixture", "value": "x" * 257})
+
+    def test_absent_and_partial_pending_states_converge_without_replacement(self):
+        sizes = (None, 0, 1, len(self.payload) // 2, len(self.payload) - 1, len(self.payload))
+        for size in sizes:
+            with self.subTest(size=size), local_publisher_directory() as fixture:
+                package_dir, directory, identity = fixture
+                digest, name, pending_name = local_publish_names(self.payload)
+                pending = package_dir / pending_name
+                initial_identity = None
+                if size is not None:
+                    write_mode_0600(pending, self.payload[:size])
+                    metadata = pending.stat()
+                    initial_identity = (metadata.st_dev, metadata.st_ino)
+                path, existing = MODULE.publish_local_plan(
+                    str(package_dir), directory, identity, self.payload, digest
+                )
+                self.assertEqual(path, str(package_dir / name))
+                self.assertFalse(existing)
+                final = package_dir / name
+                metadata = final.stat()
+                self.assertEqual(final.read_bytes(), self.payload)
+                self.assertEqual(stat.S_IMODE(metadata.st_mode), 0o600)
+                self.assertEqual(metadata.st_nlink, 1)
+                self.assertFalse(pending.exists())
+                if initial_identity is not None:
+                    self.assertEqual((metadata.st_dev, metadata.st_ino), initial_identity)
+
+    def test_final_only_and_post_link_states_are_idempotent(self):
+        with local_publisher_directory() as fixture:
+            package_dir, directory, identity = fixture
+            digest, name, pending_name = local_publish_names(self.payload)
+            first_path, first_existing = MODULE.publish_local_plan(
+                str(package_dir), directory, identity, self.payload, digest
+            )
+            first = pathlib.Path(first_path).stat()
+            self.assertFalse(first_existing)
+            second_path, second_existing = MODULE.publish_local_plan(
+                str(package_dir), directory, identity, self.payload, digest
+            )
+            second = pathlib.Path(second_path).stat()
+            self.assertTrue(second_existing)
+            self.assertEqual((first.st_dev, first.st_ino), (second.st_dev, second.st_ino))
+            self.assertFalse((package_dir / pending_name).exists())
+
+        with local_publisher_directory() as fixture:
+            package_dir, directory, identity = fixture
+            digest, name, pending_name = local_publish_names(self.payload)
+            pending = package_dir / pending_name
+            final = package_dir / name
+            write_mode_0600(pending, self.payload)
+            os.link(pending, final)
+            before = final.stat()
+            self.assertEqual(before.st_nlink, 2)
+            path, existing = MODULE.publish_local_plan(
+                str(package_dir), directory, identity, self.payload, digest
+            )
+            self.assertEqual(path, str(final))
+            self.assertTrue(existing)
+            after = final.stat()
+            self.assertEqual((after.st_dev, after.st_ino), (before.st_dev, before.st_ino))
+            self.assertEqual(after.st_nlink, 1)
+            self.assertFalse(pending.exists())
+
+    def test_unsafe_pending_and_split_inode_states_are_rejected_without_clobber(self):
+        def exact_directory_snapshot(package):
+            result = {}
+            for path in package.iterdir():
+                metadata = path.lstat()
+                shape = (
+                    metadata.st_mode,
+                    metadata.st_size,
+                    metadata.st_nlink,
+                    metadata.st_dev,
+                    metadata.st_ino,
+                )
+                symlink_target = os.readlink(path) if stat.S_ISLNK(metadata.st_mode) else None
+                payload = path.read_bytes() if stat.S_ISREG(metadata.st_mode) else None
+                result[path.name] = (shape, symlink_target, payload)
+            return result
+
+        def arrange_wrong_prefix(package, _final, pending, payload):
+            write_mode_0600(pending, b"!" + payload[1:])
+
+        def arrange_oversize(package, _final, pending, payload):
+            write_mode_0600(pending, payload + b"!")
+
+        def arrange_mode(package, _final, pending, payload):
+            write_mode_0600(pending, payload[:1])
+            pending.chmod(0o640)
+
+        def arrange_symlink(package, _final, pending, _payload):
+            pending.symlink_to(package / "missing")
+
+        def arrange_nlink(package, _final, pending, payload):
+            write_mode_0600(pending, payload[:1])
+            os.link(pending, package / "pending-extra-link")
+
+        def arrange_different_inode(package, final, pending, payload):
+            write_mode_0600(final, payload)
+            write_mode_0600(pending, payload)
+            os.link(final, package / "final-extra-link")
+            os.link(pending, package / "pending-extra-link")
+
+        cases = (
+            ("wrong-prefix", arrange_wrong_prefix),
+            ("oversize", arrange_oversize),
+            ("mode", arrange_mode),
+            ("symlink", arrange_symlink),
+            ("nlink", arrange_nlink),
+            ("different-inode", arrange_different_inode),
+        )
+        for case, arrange in cases:
+            with self.subTest(case=case), local_publisher_directory() as fixture:
+                package_dir, directory, identity = fixture
+                digest, name, pending_name = local_publish_names(self.payload)
+                final = package_dir / name
+                pending = package_dir / pending_name
+                arrange(package_dir, final, pending, self.payload)
+                before = exact_directory_snapshot(package_dir)
+                with self.assertRaises(MODULE.HarnessError):
+                    MODULE.publish_local_plan(
+                        str(package_dir), directory, identity, self.payload, digest
+                    )
+                after = exact_directory_snapshot(package_dir)
+                self.assertEqual(after, before)
+
+    def test_short_write_loop_and_two_directory_fsync_barriers_bracket_link_unlink(self):
+        with local_publisher_directory() as fixture:
+            package_dir, directory, identity = fixture
+            digest, name, pending_name = local_publish_names(self.payload)
+            original_write = os.write
+            original_fsync = os.fsync
+            original_link = os.link
+            original_unlink = os.unlink
+            events = []
+            write_calls = 0
+
+            def short_write(descriptor, data):
+                nonlocal write_calls
+                write_calls += 1
+                return original_write(descriptor, data[:7])
+
+            def record_fsync(descriptor):
+                kind = "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
+                events.append(("fsync", kind))
+                return original_fsync(descriptor)
+
+            def record_link(source, target, **kwargs):
+                events.append(("link", source, target))
+                return original_link(source, target, **kwargs)
+
+            def record_unlink(path, **kwargs):
+                events.append(("unlink", path))
+                return original_unlink(path, **kwargs)
+
+            with (
+                mock.patch.object(MODULE.os, "write", side_effect=short_write),
+                mock.patch.object(MODULE.os, "fsync", side_effect=record_fsync),
+                mock.patch.object(MODULE.os, "link", side_effect=record_link),
+                mock.patch.object(MODULE.os, "unlink", side_effect=record_unlink),
+            ):
+                MODULE.publish_local_plan(
+                    str(package_dir), directory, identity, self.payload, digest
+                )
+            self.assertGreater(write_calls, 1)
+            link_index = events.index(("link", pending_name, name))
+            unlink_index = events.index(("unlink", pending_name))
+            directory_fsyncs = [
+                index for index, event in enumerate(events) if event == ("fsync", "directory")
+            ]
+            file_fsyncs = [
+                index for index, event in enumerate(events) if event == ("fsync", "file")
+            ]
+            self.assertTrue(file_fsyncs)
+            self.assertTrue(any(index < link_index for index in file_fsyncs))
+            self.assertEqual(len(directory_fsyncs), 2)
+            self.assertLess(link_index, directory_fsyncs[0])
+            self.assertLess(directory_fsyncs[0], unlink_index)
+            self.assertLess(unlink_index, directory_fsyncs[1])
+
+    def test_link_and_fsync_failures_retain_replayable_exact_states(self):
+        with local_publisher_directory() as fixture:
+            package_dir, directory, identity = fixture
+            digest, name, pending_name = local_publish_names(self.payload)
+            original_link = os.link
+
+            def fail_link(source, target, **kwargs):
+                if source == pending_name and target == name:
+                    raise OSError("injected link failure")
+                return original_link(source, target, **kwargs)
+
+            with (
+                mock.patch.object(MODULE.os, "link", side_effect=fail_link),
+                self.assertRaisesRegex(MODULE.HarnessError, "no-clobber local plan link failed"),
+            ):
+                MODULE.publish_local_plan(
+                    str(package_dir), directory, identity, self.payload, digest
+                )
+            pending = package_dir / pending_name
+            final = package_dir / name
+            pending_metadata = pending.stat()
+            pending_identity = (pending_metadata.st_dev, pending_metadata.st_ino)
+            self.assertEqual(pending.read_bytes(), self.payload)
+            self.assertEqual(pending_metadata.st_nlink, 1)
+            self.assertFalse(final.exists())
+            _path, existing = MODULE.publish_local_plan(
+                str(package_dir), directory, identity, self.payload, digest
+            )
+            final_metadata = final.stat()
+            self.assertFalse(existing)
+            self.assertEqual((final_metadata.st_dev, final_metadata.st_ino), pending_identity)
+            self.assertEqual(final_metadata.st_nlink, 1)
+            self.assertFalse(pending.exists())
+
+        for cut in ("file-before-link", "directory-after-link", "directory-after-unlink"):
+            with self.subTest(cut=cut), local_publisher_directory() as fixture:
+                package_dir, directory, identity = fixture
+                digest, name, pending_name = local_publish_names(self.payload)
+                pending = package_dir / pending_name
+                final = package_dir / name
+                original_fsync = os.fsync
+                original_link = os.link
+                original_unlink = os.unlink
+                state = {"linked": False, "unlinked": False, "failed": False}
+
+                def track_link(source, target, **kwargs):
+                    result = original_link(source, target, **kwargs)
+                    if source == pending_name and target == name:
+                        state["linked"] = True
+                    return result
+
+                def track_unlink(path, **kwargs):
+                    result = original_unlink(path, **kwargs)
+                    if path == pending_name:
+                        state["unlinked"] = True
+                    return result
+
+                def fail_selected_fsync(descriptor):
+                    is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
+                    selected = (
+                        cut == "file-before-link" and not is_directory and not state["linked"]
+                        or cut == "directory-after-link"
+                        and is_directory
+                        and state["linked"]
+                        and not state["unlinked"]
+                        or cut == "directory-after-unlink" and is_directory and state["unlinked"]
+                    )
+                    if selected and not state["failed"]:
+                        state["failed"] = True
+                        raise OSError(f"injected {cut} fsync failure")
+                    return original_fsync(descriptor)
+
+                with (
+                    mock.patch.object(MODULE.os, "link", side_effect=track_link),
+                    mock.patch.object(MODULE.os, "unlink", side_effect=track_unlink),
+                    mock.patch.object(MODULE.os, "fsync", side_effect=fail_selected_fsync),
+                    self.assertRaises(OSError),
+                ):
+                    MODULE.publish_local_plan(
+                        str(package_dir), directory, identity, self.payload, digest
+                    )
+                self.assertTrue(state["failed"])
+
+                if cut == "file-before-link":
+                    retained = pending.stat()
+                    retained_identity = (retained.st_dev, retained.st_ino)
+                    self.assertEqual(retained.st_nlink, 1)
+                    self.assertEqual(pending.read_bytes(), self.payload)
+                    self.assertFalse(final.exists())
+                    expected_existing = False
+                elif cut == "directory-after-link":
+                    retained = final.stat()
+                    retained_identity = (retained.st_dev, retained.st_ino)
+                    self.assertEqual(retained.st_nlink, 2)
+                    self.assertEqual(pending.stat().st_ino, retained.st_ino)
+                    self.assertEqual(final.read_bytes(), self.payload)
+                    expected_existing = True
+                else:
+                    retained = final.stat()
+                    retained_identity = (retained.st_dev, retained.st_ino)
+                    self.assertEqual(retained.st_nlink, 1)
+                    self.assertFalse(pending.exists())
+                    self.assertEqual(final.read_bytes(), self.payload)
+                    expected_existing = True
+
+                _path, existing = MODULE.publish_local_plan(
+                    str(package_dir), directory, identity, self.payload, digest
+                )
+                converged = final.stat()
+                self.assertEqual(existing, expected_existing)
+                self.assertEqual((converged.st_dev, converged.st_ino), retained_identity)
+                self.assertEqual(converged.st_nlink, 1)
+                self.assertEqual(final.read_bytes(), self.payload)
+                self.assertFalse(pending.exists())
+
+    def test_directory_flock_blocks_a_second_open_description_until_release(self):
+        with local_publisher_directory() as fixture:
+            package_dir, _directory, _identity = fixture
+            child_script = (
+                "import fcntl,os,sys;"
+                "descriptor=os.open(sys.argv[1],os.O_RDONLY);"
+                "fcntl.flock(descriptor,fcntl.LOCK_EX);"
+                "sys.stdout.write('locked\\n');sys.stdout.flush();"
+                "sys.stdin.buffer.read(1);"
+                "fcntl.flock(descriptor,fcntl.LOCK_UN);"
+                "os.close(descriptor)"
+            )
+            child = subprocess.Popen(
+                ["/usr/bin/python3", "-B", "-I", "-c", child_script, str(package_dir)],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+            )
+            flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+            second = os.open(package_dir, flags)
+            try:
+                self.assertIsNotNone(child.stdout)
+                ready, _, _ = select.select([child.stdout], [], [], 5)
+                self.assertEqual(ready, [child.stdout], "lock-holder child did not become ready")
+                self.assertEqual(child.stdout.readline(), b"locked\n")
+                with self.assertRaisesRegex(MODULE.HarnessError, "publisher lock is busy"):
+                    MODULE.acquire_local_publish_lock(second, timeout_seconds=0.1)
+                self.assertIsNotNone(child.stdin)
+                child.stdin.write(b"x")
+                child.stdin.flush()
+                child.stdin.close()
+                child_rc = child.wait(timeout=5)
+                self.assertIsNotNone(child.stderr)
+                child_stderr = child.stderr.read()
+                self.assertEqual(child_rc, 0, child_stderr.decode())
+                MODULE.acquire_local_publish_lock(second, timeout_seconds=0.1)
+            finally:
+                MODULE.fcntl.flock(second, MODULE.fcntl.LOCK_UN)
+                os.close(second)
+                if child.poll() is None:
+                    if child.stdin is not None and not child.stdin.closed:
+                        child.stdin.close()
+                    try:
+                        child.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        child.kill()
+                        child.wait(timeout=5)
+                if child.stdout is not None:
+                    child.stdout.close()
+                if child.stderr is not None:
+                    child.stderr.close()
+
+    def test_directory_and_capture_binding_tamper_are_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            package = pathlib.Path(temporary, "package")
+            package.mkdir(mode=0o700)
+            package.chmod(0o700)
+            manifest = package / MODULE.LOCAL_PACKAGE_MANIFEST
+            publisher = package / MODULE.LOCAL_PUBLISHER_NAME
+            manifest_payload = b"manifest-binding"
+            publisher_payload = b"publisher-binding"
+            write_mode_0600(manifest, manifest_payload)
+            write_mode_0600(publisher, publisher_payload)
+            directory = os.open(package, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                directory_metadata = os.fstat(directory)
+                directory_identity = (directory_metadata.st_dev, directory_metadata.st_ino)
+                manifest_metadata = manifest.stat()
+                publisher_metadata = publisher.stat()
+                binding = {
+                    "manifest_identity": (manifest_metadata.st_dev, manifest_metadata.st_ino),
+                    "manifest_size": len(manifest_payload),
+                    "manifest_sha256": MODULE.sha256_bytes(manifest_payload),
+                    "publisher_identity": (publisher_metadata.st_dev, publisher_metadata.st_ino),
+                    "publisher_size": len(publisher_payload),
+                    "publisher_sha256": MODULE.sha256_bytes(publisher_payload),
+                }
+                MODULE.revalidate_local_capture_binding(
+                    str(package), directory, directory_identity, binding
+                )
+                manifest.write_bytes(b"M" * len(manifest_payload))
+                with self.assertRaisesRegex(MODULE.HarnessError, "binding content changed"):
+                    MODULE.revalidate_local_capture_binding(
+                        str(package), directory, directory_identity, binding
+                    )
+                manifest.write_bytes(manifest_payload)
+                publisher.write_bytes(b"P" * len(publisher_payload))
+                with self.assertRaisesRegex(MODULE.HarnessError, "binding content changed"):
+                    MODULE.revalidate_local_capture_binding(
+                        str(package), directory, directory_identity, binding
+                    )
+            finally:
+                os.close(directory)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            package = pathlib.Path(temporary, "package")
+            moved = pathlib.Path(temporary, "moved")
+            package.mkdir(mode=0o700)
+            package.chmod(0o700)
+            directory = os.open(package, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                metadata = os.fstat(directory)
+                identity = (metadata.st_dev, metadata.st_ino)
+                package.rename(moved)
+                package.mkdir(mode=0o700)
+                package.chmod(0o700)
+                with self.assertRaisesRegex(MODULE.HarnessError, "directory changed"):
+                    MODULE.validate_local_package_directory(str(package), directory, identity)
+            finally:
+                os.close(directory)
+
+    def test_plan_tamper_and_post_unlink_recreation_are_rejected(self):
+        with local_publisher_directory() as fixture:
+            package_dir, directory, identity = fixture
+            digest, name, pending_name = local_publish_names(self.payload)
+            original_link = os.link
+
+            def tamper_after_link(source, target, **kwargs):
+                result = original_link(source, target, **kwargs)
+                final = package_dir / target
+                final.write_bytes(b"!" * len(self.payload))
+                final.chmod(0o600)
+                return result
+
+            with (
+                mock.patch.object(MODULE.os, "link", side_effect=tamper_after_link),
+                self.assertRaisesRegex(MODULE.HarnessError, "differs from its content address"),
+            ):
+                MODULE.publish_local_plan(
+                    str(package_dir), directory, identity, self.payload, digest
+                )
+
+        with local_publisher_directory() as fixture:
+            package_dir, directory, identity = fixture
+            digest, _name, pending_name = local_publish_names(self.payload)
+            original_unlink = os.unlink
+
+            def recreate_after_unlink(path, **kwargs):
+                result = original_unlink(path, **kwargs)
+                if path == pending_name:
+                    recreated = package_dir / pending_name
+                    write_mode_0600(recreated, self.payload)
+                return result
+
+            with (
+                mock.patch.object(MODULE.os, "unlink", side_effect=recreate_after_unlink),
+                self.assertRaisesRegex(MODULE.HarnessError, "pending name remains"),
+            ):
+                MODULE.publish_local_plan(
+                    str(package_dir), directory, identity, self.payload, digest
+                )
+
+    def test_unlink_failure_retains_the_exact_pair_and_is_retryable(self):
+        with local_publisher_directory() as fixture:
+            package_dir, directory, identity = fixture
+            digest, name, pending_name = local_publish_names(self.payload)
+            original_unlink = os.unlink
+
+            def fail_exact_unlink(path, **kwargs):
+                if path == pending_name:
+                    raise OSError("injected unlink failure")
+                return original_unlink(path, **kwargs)
+
+            with (
+                mock.patch.object(MODULE.os, "unlink", side_effect=fail_exact_unlink),
+                self.assertRaisesRegex(MODULE.HarnessError, "pending unlink failed"),
+            ):
+                MODULE.publish_local_plan(
+                    str(package_dir), directory, identity, self.payload, digest
+                )
+            final = package_dir / name
+            pending = package_dir / pending_name
+            self.assertEqual(final.stat().st_nlink, 2)
+            self.assertEqual(pending.stat().st_ino, final.stat().st_ino)
+            _path, existing = MODULE.publish_local_plan(
+                str(package_dir), directory, identity, self.payload, digest
+            )
+            self.assertTrue(existing)
+            self.assertFalse(pending.exists())
+            self.assertEqual(final.stat().st_nlink, 1)
 
 
 if __name__ == "__main__":
