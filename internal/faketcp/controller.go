@@ -330,24 +330,8 @@ func NewRecoverableController(
 	return newRecoverableController(&singleEngineDispatcher{engine: engine}, backend, store)
 }
 
-// NewRecoverableRoutedController applies the same one-slot recovery protocol
-// to the immutable multi-WireGuard dispatcher. Durable store implementations
-// remain outside this slice; the Controller depends only on the existing store
-// contract.
-func NewRecoverableRoutedController(
-	router *EngineRouter,
-	backend ControllerBackend,
-	store ActionCheckpointStore,
-) (*Controller, error) {
-	if router == nil || validateRuntimeIdentity(router.Identity()) != nil ||
-		len(router.engines) == 0 || len(router.routes) == 0 || len(router.wgIDs) == 0 {
-		return nil, errors.New("faketcp recoverable routed controller requires an engine router")
-	}
-	return newRecoverableController(router, backend, store)
-}
-
 func newRecoverableController(
-	dispatcher controllerEngineDispatcher,
+	dispatcher *singleEngineDispatcher,
 	backend ControllerBackend,
 	store ActionCheckpointStore,
 ) (*Controller, error) {
@@ -453,7 +437,7 @@ func (c *Controller) handleOwnedDecodedEvent(
 			identity.Incarnation, c.dispatcher.Identity().Incarnation,
 		)
 	}
-	engine, err := c.dispatcher.selectEngine(decoded.Event)
+	selection, err := c.dispatcher.selectEngine(decoded.Event)
 	if err != nil {
 		return nil, err
 	}
@@ -466,15 +450,15 @@ func (c *Controller) handleOwnedDecodedEvent(
 		if err := MaterializeIPv4UDPChecksums(decoded.Packet); err != nil {
 			return nil, err
 		}
-		actions, engineErr = engine.handleOwnedCapturedPacket(
+		actions, engineErr = selection.engine.handleOwnedCapturedPacket(
 			decoded.Event,
 			decoded.Packet,
 			decoded.Fingerprint,
 		)
 	case abi.FakeTCPEventRST, abi.FakeTCPEventFIN:
-		actions, engineErr = engine.InboundCapturedControl(decoded.Event, decoded.Packet)
+		actions, engineErr = selection.engine.InboundCapturedControl(decoded.Event, decoded.Packet)
 	default:
-		actions, engineErr = engine.InboundWithWGID(decoded.Event.Key, Segment{
+		actions, engineErr = selection.engine.InboundWithWGID(decoded.Event.Key, Segment{
 			Flags:           decoded.Event.TCPFlags,
 			Sequence:        decoded.Event.Sequence,
 			Acknowledgement: decoded.Event.Acknowledgement,
@@ -484,7 +468,7 @@ func (c *Controller) handleOwnedDecodedEvent(
 	if engineErr != nil {
 		return actions, engineErr
 	}
-	if err := c.dispatcher.validateActions(actions); err != nil {
+	if err := c.dispatcher.validateActions(selection.wgID, actions); err != nil {
 		return actions, err
 	}
 	if err := c.executeActions(ctx, actions); err != nil {
@@ -505,9 +489,6 @@ func (c *Controller) Tick(ctx context.Context) ([]Action, error) {
 		return nil, err
 	}
 	actions, engineErr := c.dispatcher.Tick()
-	if routeErr := c.dispatcher.validateActions(actions); routeErr != nil {
-		return actions, errors.Join(engineErr, routeErr)
-	}
 	if executeErr := c.executeActions(ctx, actions); executeErr != nil {
 		return actions, errors.Join(engineErr, c.handleActionExecutionError(executeErr))
 	}

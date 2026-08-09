@@ -174,16 +174,16 @@ func (router *EngineRouter) Identity() RuntimeIdentity {
 	return router.identity
 }
 
-func (router *EngineRouter) selectEngine(event abi.FakeTCPEvent) (*Engine, error) {
+func (router *EngineRouter) selectEngine(event abi.FakeTCPEvent) (dispatchedEngine, error) {
 	if router == nil || len(router.engines) == 0 || len(router.routes) == 0 {
-		return nil, fmt.Errorf("%w: router is unavailable", ErrEngineRouteRejected)
+		return dispatchedEngine{}, fmt.Errorf("%w: router is unavailable", ErrEngineRouteRejected)
 	}
 	key := engineRouteKey{
 		generation: event.Key.Generation, underlayIndex: event.Key.UnderlayIndex, localPort: event.Key.LocalPort,
 	}
 	target, exists := router.routes[key]
 	if !exists {
-		return nil, fmt.Errorf(
+		return dispatchedEngine{}, fmt.Errorf(
 			"%w: generation=%d underlay=%d local-port=%d is unknown",
 			ErrEngineRouteRejected,
 			key.generation,
@@ -192,7 +192,7 @@ func (router *EngineRouter) selectEngine(event abi.FakeTCPEvent) (*Engine, error
 		)
 	}
 	if event.WGID != target.wgID {
-		return nil, fmt.Errorf(
+		return dispatchedEngine{}, fmt.Errorf(
 			"%w: event WGID %d does not match route WGID %d",
 			ErrEngineRouteRejected,
 			event.WGID,
@@ -201,7 +201,7 @@ func (router *EngineRouter) selectEngine(event abi.FakeTCPEvent) (*Engine, error
 	}
 	if event.Type == abi.FakeTCPEventNeedHandshake {
 		if event.FWMark != target.fwmark {
-			return nil, fmt.Errorf(
+			return dispatchedEngine{}, fmt.Errorf(
 				"%w: event mark %#x does not match route mark %#x",
 				ErrEngineRouteRejected,
 				event.FWMark,
@@ -209,13 +209,13 @@ func (router *EngineRouter) selectEngine(event abi.FakeTCPEvent) (*Engine, error
 			)
 		}
 	} else if event.FWMark != 0 {
-		return nil, fmt.Errorf(
+		return dispatchedEngine{}, fmt.Errorf(
 			"%w: inbound control event has mark %#x",
 			ErrEngineRouteRejected,
 			event.FWMark,
 		)
 	}
-	return router.engines[target.wgID], nil
+	return dispatchedEngine{engine: router.engines[target.wgID], wgID: target.wgID}, nil
 }
 
 func (router *EngineRouter) Tick() ([]Action, error) {
@@ -226,17 +226,21 @@ func (router *EngineRouter) Tick() ([]Action, error) {
 	var errs []error
 	for _, wgID := range router.wgIDs {
 		engineActions, err := router.engines[wgID].Tick()
-		actions = append(actions, engineActions...)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("tick faketcp WGID %d: %w", wgID, err))
 		}
+		if err := router.validateActions(wgID, engineActions); err != nil {
+			errs = append(errs, fmt.Errorf("validate faketcp WGID %d tick actions: %w", wgID, err))
+			continue
+		}
+		actions = append(actions, engineActions...)
 	}
 	return actions, errors.Join(errs...)
 }
 
 // validateActions fences every backend-visible action behind the same exact
 // immutable route that admitted its event or Tick owner.
-func (router *EngineRouter) validateActions(actions []Action) error {
+func (router *EngineRouter) validateActions(ownerWGID uint32, actions []Action) error {
 	for index, action := range actions {
 		key := engineRouteKey{
 			generation:    action.Flow.Generation,
@@ -246,6 +250,15 @@ func (router *EngineRouter) validateActions(actions []Action) error {
 		target, exists := router.routes[key]
 		if !exists {
 			return fmt.Errorf("%w: action[%d] flow is unknown", ErrEngineRouteRejected, index)
+		}
+		if target.wgID != ownerWGID {
+			return fmt.Errorf(
+				"%w: action[%d] route WGID %d does not match owner WGID %d",
+				ErrEngineRouteRejected,
+				index,
+				target.wgID,
+				ownerWGID,
+			)
 		}
 		switch action.Kind {
 		case ActionDrop, ActionForward, ActionClose:
@@ -280,11 +293,16 @@ func (router *EngineRouter) validateActions(actions []Action) error {
 	return nil
 }
 
+type dispatchedEngine struct {
+	engine *Engine
+	wgID   uint32
+}
+
 type controllerEngineDispatcher interface {
 	Identity() RuntimeIdentity
-	selectEngine(abi.FakeTCPEvent) (*Engine, error)
+	selectEngine(abi.FakeTCPEvent) (dispatchedEngine, error)
 	Tick() ([]Action, error)
-	validateActions([]Action) error
+	validateActions(uint32, []Action) error
 }
 
 type singleEngineDispatcher struct {
@@ -298,11 +316,11 @@ func (dispatcher *singleEngineDispatcher) Identity() RuntimeIdentity {
 	return dispatcher.engine.Identity()
 }
 
-func (dispatcher *singleEngineDispatcher) selectEngine(abi.FakeTCPEvent) (*Engine, error) {
+func (dispatcher *singleEngineDispatcher) selectEngine(abi.FakeTCPEvent) (dispatchedEngine, error) {
 	if dispatcher == nil || dispatcher.engine == nil {
-		return nil, errors.New("faketcp single-engine dispatcher is unavailable")
+		return dispatchedEngine{}, errors.New("faketcp single-engine dispatcher is unavailable")
 	}
-	return dispatcher.engine, nil
+	return dispatchedEngine{engine: dispatcher.engine}, nil
 }
 
 func (dispatcher *singleEngineDispatcher) Tick() ([]Action, error) {
@@ -312,4 +330,4 @@ func (dispatcher *singleEngineDispatcher) Tick() ([]Action, error) {
 	return dispatcher.engine.Tick()
 }
 
-func (*singleEngineDispatcher) validateActions([]Action) error { return nil }
+func (*singleEngineDispatcher) validateActions(uint32, []Action) error { return nil }
