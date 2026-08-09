@@ -59,8 +59,20 @@ type Options struct {
 type SessionStore interface {
 	InsertEstablished(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) error
 	LookupEstablished(abi.FakeTCPSessionKey) (abi.FakeTCPSessionValue, bool, error)
-	DeleteEstablishedIfUnchanged(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) (bool, error)
+	DeleteEstablishedIfUnchanged(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) (SessionDeleteResult, error)
 }
+
+// SessionDeleteResult distinguishes a completed exact removal from the only
+// two harmless compare misses. Absent is completion when retrying an uncertain
+// exact delete: production has one userspace owner, BPF cannot insert, and a
+// fresh runtime receives a fresh map identity and incarnation.
+type SessionDeleteResult uint8
+
+const (
+	SessionDeleteDifferent SessionDeleteResult = iota
+	SessionDeleteAbsent
+	SessionDeleteRemoved
+)
 
 type Segment struct {
 	Flags           uint8
@@ -134,6 +146,12 @@ type session struct {
 	halfOpenHeld  bool
 	synSource     synSourceKey
 	sessionID     uint64
+	pendingDelete *pendingSessionDelete
+}
+
+type pendingSessionDelete struct {
+	expected abi.FakeTCPSessionValue
+	reason   string
 }
 
 type synSourceKey struct {
@@ -402,6 +420,10 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32, v
 	now := e.opts.Now()
 	s := e.sessions[flow]
 	checkpoint := e.checkpoint(s)
+	if s != nil && s.pendingDelete != nil {
+		action, err := e.retryPendingDelete(flow, s)
+		return []Action{action}, err
+	}
 	var synSource synSourceKey
 	if seg.Flags&FlagSYN != 0 {
 		var rejection string
@@ -429,11 +451,14 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32, v
 				if value != validated.session {
 					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
 				}
-				deleted, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, validated.session)
+				result, err := e.compareDeleteEstablished(flow, s, pendingSessionDelete{
+					expected: validated.session,
+					reason:   "peer-close",
+				})
 				if err != nil {
 					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
 				}
-				if !deleted {
+				if result == SessionDeleteDifferent {
 					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
 				}
 			}
@@ -566,6 +591,14 @@ func (e *Engine) Tick() ([]Action, error) {
 			}
 			actions = append(actions, e.control(flow, s, flags, s.localISN, ack, "handshake-retry"))
 		case abi.FakeTCPStateEstablished:
+			if s.pendingDelete != nil {
+				action, err := e.retryPendingDelete(flow, s)
+				if err != nil {
+					errs = append(errs, err)
+				}
+				actions = append(actions, action)
+				continue
+			}
 			value, found, err := e.lookupEstablished(flow, s)
 			if err != nil {
 				errs = append(errs, err)
@@ -580,13 +613,16 @@ func (e *Engine) Tick() ([]Action, error) {
 			idle := nowMonotonic >= value.LastSeenNanos &&
 				nowMonotonic-value.LastSeenNanos >= uint64(e.opts.IdleTimeout)
 			if idle {
-				deleted, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, value)
+				result, err := e.compareDeleteEstablished(flow, s, pendingSessionDelete{
+					expected: value,
+					reason:   "idle-timeout",
+				})
 				if err != nil {
 					errs = append(errs, err)
 					actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"})
 					continue
 				}
-				if !deleted {
+				if result == SessionDeleteDifferent {
 					// BPF advanced the fast state after our lookup. A later tick
 					// re-reads LastSeenNanos; this session is demonstrably active.
 					continue
@@ -940,4 +976,48 @@ func (e *Engine) lookupEstablished(flow abi.FakeTCPSessionKey, s *session) (abi.
 	s.txSequence = value.TXSequence
 	s.rxSequence = value.RXSequence
 	return value, true, nil
+}
+
+// compareDeleteEstablished is the only transition into pending-delete. The
+// complete expected value is retained on every error because the kernel claim
+// may already have linearised even when userspace cannot observe the final
+// delete. The request remains immutable across retries.
+func (e *Engine) compareDeleteEstablished(
+	flow abi.FakeTCPSessionKey,
+	s *session,
+	request pendingSessionDelete,
+) (SessionDeleteResult, error) {
+	result, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, request.expected)
+	if err == nil && result > SessionDeleteRemoved {
+		err = fmt.Errorf("faketcp session store returned invalid delete result %d", result)
+	}
+	if err != nil {
+		pending := request
+		s.pendingDelete = &pending
+		return SessionDeleteDifferent, err
+	}
+	s.pendingDelete = nil
+	return result, nil
+}
+
+// retryPendingDelete runs before any ordinary established lookup. Removed and
+// absent are the same terminal state: under the production single-owner
+// lifecycle no same-key Insert can pass the store mutex, BPF never inserts,
+// and a fresh process receives a fresh map identity and runtime incarnation.
+// Different therefore identifies a foreign/new value, clears the stale claim
+// authority, preserves that value, and fails this packet/tick closed.
+func (e *Engine) retryPendingDelete(
+	flow abi.FakeTCPSessionKey,
+	s *session,
+) (Action, error) {
+	request := *s.pendingDelete
+	result, err := e.compareDeleteEstablished(flow, s, request)
+	if err != nil {
+		return Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}, err
+	}
+	if result == SessionDeleteDifferent {
+		return Action{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}, nil
+	}
+	e.remove(flow, s)
+	return Action{Kind: ActionClose, Flow: flow, Reason: request.reason}, nil
 }

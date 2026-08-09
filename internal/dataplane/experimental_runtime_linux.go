@@ -317,14 +317,14 @@ func (store *generationFencedSessionStore) LookupEstablished(
 func (store *generationFencedSessionStore) DeleteEstablishedIfUnchanged(
 	key abi.FakeTCPSessionKey,
 	value abi.FakeTCPSessionValue,
-) (bool, error) {
+) (faketcp.SessionDeleteResult, error) {
 	if store == nil {
-		return false, ErrExperimentalFakeTCPRuntimeClosed
+		return faketcp.SessionDeleteDifferent, ErrExperimentalFakeTCPRuntimeClosed
 	}
 	store.mu.RLock()
 	defer store.mu.RUnlock()
 	if err := store.validateLocked(key.Generation, value.Generation); err != nil {
-		return false, err
+		return faketcp.SessionDeleteDifferent, err
 	}
 	return store.backend.DeleteEstablishedIfUnchanged(key, value)
 }

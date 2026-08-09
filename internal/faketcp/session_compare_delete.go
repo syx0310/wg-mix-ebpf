@@ -61,52 +61,54 @@ func (deleter *LinuxAtomicSessionCompareDeleter) CompareDeleteEstablished(
 	identity SessionMapIdentity,
 	key abi.FakeTCPSessionKey,
 	expected abi.FakeTCPSessionValue,
-) (bool, error) {
+) (SessionDeleteResult, error) {
 	if deleter == nil || deleter.kernel == nil {
-		return false, errors.New("faketcp compare-delete backend is nil")
+		return SessionDeleteDifferent, errors.New("faketcp compare-delete backend is nil")
 	}
 	if identity != deleter.identity {
-		return false, fmt.Errorf(
+		return SessionDeleteDifferent, fmt.Errorf(
 			"%w for compare-delete: bound %#v, requested %#v",
 			ErrSessionMapIdentityChanged, deleter.identity, identity,
 		)
 	}
 	if err := validateBoundSessionKey(key, expected.Generation); err != nil {
-		return false, err
+		return SessionDeleteDifferent, err
 	}
 	if err := validateEstablishedSessionValue(expected, key.Generation); err != nil {
-		return false, err
+		return SessionDeleteDifferent, err
 	}
 	if err := deleter.validateBinding(); err != nil {
-		return false, err
+		return SessionDeleteDifferent, err
 	}
 
 	request, err := marshalFakeTCPSessionClaim(key, expected)
 	if err != nil {
-		return false, err
+		return SessionDeleteDifferent, err
 	}
 	result, err := deleter.kernel.RunClaim(request)
 	if err != nil {
-		return false, fmt.Errorf("run faketcp kernel compare-claim: %w", err)
+		return SessionDeleteDifferent, fmt.Errorf("run faketcp kernel compare-claim: %w", err)
 	}
 	switch result {
-	case fakeTCPSessionClaimAbsent, fakeTCPSessionClaimDifferent:
-		return false, nil
+	case fakeTCPSessionClaimAbsent:
+		return SessionDeleteAbsent, nil
+	case fakeTCPSessionClaimDifferent:
+		return SessionDeleteDifferent, nil
 	case fakeTCPSessionClaimMalformed:
-		return false, errors.New("faketcp kernel rejected a locally validated compare-claim")
+		return SessionDeleteDifferent, errors.New("faketcp kernel rejected a locally validated compare-claim")
 	case fakeTCPSessionClaimed:
 		// The ESTABLISHED -> DELETE_CLAIMED transition already linearised the
 		// operation. Revalidate both FDs before the non-conditional reclaim;
 		// any drift preserves the tombstone and fails closed.
 		if err := deleter.validateBinding(); err != nil {
-			return false, err
+			return SessionDeleteDifferent, err
 		}
 		if err := deleter.kernel.DeleteSession(key); err != nil {
-			return false, fmt.Errorf("delete claimed faketcp session: %w", err)
+			return SessionDeleteDifferent, fmt.Errorf("delete claimed faketcp session: %w", err)
 		}
-		return true, nil
+		return SessionDeleteRemoved, nil
 	default:
-		return false, fmt.Errorf("faketcp kernel compare-claim returned unknown status %d", result)
+		return SessionDeleteDifferent, fmt.Errorf("faketcp kernel compare-claim returned unknown status %d", result)
 	}
 }
 

@@ -172,19 +172,22 @@ func (store *fakeOwnedSessionStore) LookupEstablished(
 func (store *fakeOwnedSessionStore) DeleteEstablishedIfUnchanged(
 	key abi.FakeTCPSessionKey,
 	value abi.FakeTCPSessionValue,
-) (bool, error) {
+) (faketcp.SessionDeleteResult, error) {
 	store.waitIfBlocked()
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.closed {
-		return false, errors.New("fake session backend closed")
+		return faketcp.SessionDeleteDifferent, errors.New("fake session backend closed")
 	}
 	actual, exists := store.entries[key]
-	if !exists || actual != value {
-		return false, nil
+	if !exists {
+		return faketcp.SessionDeleteAbsent, nil
+	}
+	if actual != value {
+		return faketcp.SessionDeleteDifferent, nil
 	}
 	delete(store.entries, key)
-	return true, nil
+	return faketcp.SessionDeleteRemoved, nil
 }
 
 func (store *fakeOwnedSessionStore) waitIfBlocked() {
@@ -744,9 +747,9 @@ func TestGenerationFencedSessionStoreRejectsCrossGenerationWithoutBackendCall(t 
 	if _, _, err := store.LookupEstablished(key); !errors.Is(err, ErrExperimentalFakeTCPGenerationMismatch) {
 		t.Fatalf("cross-generation lookup error = %v", err)
 	}
-	if deleted, err := store.DeleteEstablishedIfUnchanged(key, value); deleted ||
+	if result, err := store.DeleteEstablishedIfUnchanged(key, value); result != faketcp.SessionDeleteDifferent ||
 		!errors.Is(err, ErrExperimentalFakeTCPGenerationMismatch) {
-		t.Fatalf("cross-generation delete=%t error=%v", deleted, err)
+		t.Fatalf("cross-generation result=%v error=%v", result, err)
 	}
 	if len(backend.entries) != 0 {
 		t.Fatalf("generation fence touched backend: %v", backend.entries)

@@ -69,11 +69,11 @@ func (deleter *memoryAtomicSessionCompareDeleter) CompareDeleteEstablished(
 	identity SessionMapIdentity,
 	key abi.FakeTCPSessionKey,
 	expected abi.FakeTCPSessionValue,
-) (bool, error) {
+) (SessionDeleteResult, error) {
 	deleter.calls++
 	deleter.lastIdentity = identity
 	if deleter.err != nil {
-		return false, deleter.err
+		return SessionDeleteDifferent, deleter.err
 	}
 	deleter.backend.mu.Lock()
 	defer deleter.backend.mu.Unlock()
@@ -81,11 +81,14 @@ func (deleter *memoryAtomicSessionCompareDeleter) CompareDeleteEstablished(
 		deleter.beforeDelete(deleter.backend, key)
 	}
 	actual, found := deleter.backend.values[key]
-	if !found || actual != expected {
-		return false, nil
+	if !found {
+		return SessionDeleteAbsent, nil
+	}
+	if actual != expected {
+		return SessionDeleteDifferent, nil
 	}
 	delete(deleter.backend.values, key)
-	return true, nil
+	return SessionDeleteRemoved, nil
 }
 
 func newMemorySessionMap() *memorySessionMap {
@@ -737,9 +740,9 @@ func TestLinuxSessionStoreCompareDeleteFailsClosedWithoutTOCTOU(t *testing.T) {
 	t.Run("equal value is preserved", func(t *testing.T) {
 		store, backend := newTestLinuxSessionStore(t)
 		backend.putFromBPF(key, expected)
-		deleted, err := store.DeleteEstablishedIfUnchanged(key, expected)
-		if deleted || !errors.Is(err, ErrSessionCompareDeleteUnavailable) {
-			t.Fatalf("deleted=%t err=%v", deleted, err)
+		result, err := store.DeleteEstablishedIfUnchanged(key, expected)
+		if result != SessionDeleteDifferent || !errors.Is(err, ErrSessionCompareDeleteUnavailable) {
+			t.Fatalf("result=%v err=%v", result, err)
 		}
 		if got, found := backend.value(key); !found || got != expected {
 			t.Fatalf("equal value was removed or changed: got=%#v found=%t", got, found)
@@ -756,9 +759,9 @@ func TestLinuxSessionStoreCompareDeleteFailsClosedWithoutTOCTOU(t *testing.T) {
 		backend.beforeLookup = func(locked *memorySessionMap, lookupKey abi.FakeTCPSessionKey) {
 			locked.values[lookupKey] = advanced
 		}
-		deleted, err := store.DeleteEstablishedIfUnchanged(key, expected)
-		if err != nil || deleted {
-			t.Fatalf("deleted=%t err=%v", deleted, err)
+		result, err := store.DeleteEstablishedIfUnchanged(key, expected)
+		if err != nil || result != SessionDeleteDifferent {
+			t.Fatalf("result=%v err=%v", result, err)
 		}
 		if got, found := backend.value(key); !found || got != advanced {
 			t.Fatalf("BPF advance was lost: got=%#v found=%t", got, found)
@@ -767,18 +770,18 @@ func TestLinuxSessionStoreCompareDeleteFailsClosedWithoutTOCTOU(t *testing.T) {
 
 	t.Run("already absent", func(t *testing.T) {
 		store, _ := newTestLinuxSessionStore(t)
-		deleted, err := store.DeleteEstablishedIfUnchanged(key, expected)
-		if err != nil || deleted {
-			t.Fatalf("deleted=%t err=%v", deleted, err)
+		result, err := store.DeleteEstablishedIfUnchanged(key, expected)
+		if err != nil || result != SessionDeleteAbsent {
+			t.Fatalf("result=%v err=%v", result, err)
 		}
 	})
 
 	t.Run("lookup failure", func(t *testing.T) {
 		store, backend := newTestLinuxSessionStore(t)
 		backend.lookupErr = errMemorySessionMapLookup
-		deleted, err := store.DeleteEstablishedIfUnchanged(key, expected)
-		if deleted || !errors.Is(err, errMemorySessionMapLookup) {
-			t.Fatalf("deleted=%t err=%v", deleted, err)
+		result, err := store.DeleteEstablishedIfUnchanged(key, expected)
+		if result != SessionDeleteDifferent || !errors.Is(err, errMemorySessionMapLookup) {
+			t.Fatalf("result=%v err=%v", result, err)
 		}
 	})
 }
@@ -806,9 +809,9 @@ func TestLinuxSessionStoreUsesOnlyExplicitAtomicCompareDeletePrimitive(t *testin
 		store, backend, deleter := newStore(t)
 		backend.putFromBPF(key, expected)
 		lookupsBefore := backend.lookupCalls
-		deleted, err := store.DeleteEstablishedIfUnchanged(key, expected)
-		if err != nil || !deleted {
-			t.Fatalf("deleted=%t err=%v", deleted, err)
+		result, err := store.DeleteEstablishedIfUnchanged(key, expected)
+		if err != nil || result != SessionDeleteRemoved {
+			t.Fatalf("result=%v err=%v", result, err)
 		}
 		if _, found := backend.value(key); found {
 			t.Fatal("equal value survived atomic compare-delete")
@@ -830,9 +833,9 @@ func TestLinuxSessionStoreUsesOnlyExplicitAtomicCompareDeletePrimitive(t *testin
 		deleter.beforeDelete = func(locked *memorySessionMap, deleteKey abi.FakeTCPSessionKey) {
 			locked.values[deleteKey] = advanced
 		}
-		deleted, err := store.DeleteEstablishedIfUnchanged(key, expected)
-		if err != nil || deleted {
-			t.Fatalf("deleted=%t err=%v", deleted, err)
+		result, err := store.DeleteEstablishedIfUnchanged(key, expected)
+		if err != nil || result != SessionDeleteDifferent {
+			t.Fatalf("result=%v err=%v", result, err)
 		}
 		if got, found := backend.value(key); !found || got != advanced {
 			t.Fatalf("advanced value got=%#v found=%t", got, found)
@@ -844,9 +847,9 @@ func TestLinuxSessionStoreUsesOnlyExplicitAtomicCompareDeletePrimitive(t *testin
 		backend.putFromBPF(key, expected)
 		wantErr := errors.New("atomic primitive failed")
 		deleter.err = wantErr
-		deleted, err := store.DeleteEstablishedIfUnchanged(key, expected)
-		if deleted || !errors.Is(err, wantErr) {
-			t.Fatalf("deleted=%t err=%v", deleted, err)
+		result, err := store.DeleteEstablishedIfUnchanged(key, expected)
+		if result != SessionDeleteDifferent || !errors.Is(err, wantErr) {
+			t.Fatalf("result=%v err=%v", result, err)
 		}
 		if got, found := backend.value(key); !found || got != expected {
 			t.Fatalf("failed primitive changed value got=%#v found=%t", got, found)
@@ -899,8 +902,8 @@ func TestLinuxSessionStoreCloseOwnsOnlyCloneAndFailsOperationsClosed(t *testing.
 		if _, found, err := store.LookupEstablished(key); !errors.Is(err, ErrSessionStoreClosed) || found {
 			t.Fatalf("closed lookup found=%t err=%v", found, err)
 		}
-		if deleted, err := store.DeleteEstablishedIfUnchanged(key, value); !errors.Is(err, ErrSessionStoreClosed) || deleted {
-			t.Fatalf("closed delete deleted=%t err=%v", deleted, err)
+		if result, err := store.DeleteEstablishedIfUnchanged(key, value); !errors.Is(err, ErrSessionStoreClosed) || result != SessionDeleteDifferent {
+			t.Fatalf("closed delete result=%v err=%v", result, err)
 		}
 		if backend.identityCalls != identityCalls || backend.insertCalls != insertCalls ||
 			backend.lookupCalls != lookupCalls {
@@ -1090,7 +1093,7 @@ func TestNilLinuxSessionStoreFailsClosed(t *testing.T) {
 	if _, found, err := store.LookupEstablished(key); err == nil || found {
 		t.Fatalf("nil store lookup found=%t err=%v", found, err)
 	}
-	if deleted, err := store.DeleteEstablishedIfUnchanged(key, value); err == nil || deleted {
-		t.Fatalf("nil store delete deleted=%t err=%v", deleted, err)
+	if result, err := store.DeleteEstablishedIfUnchanged(key, value); err == nil || result != SessionDeleteDifferent {
+		t.Fatalf("nil store delete result=%v err=%v", result, err)
 	}
 }

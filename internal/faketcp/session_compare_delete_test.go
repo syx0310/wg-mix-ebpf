@@ -173,9 +173,9 @@ func TestLinuxAtomicSessionCompareDeleteLinearization(t *testing.T) {
 	t.Run("equal value claims then deletes", func(t *testing.T) {
 		deleter, kernel := newModelSessionDeleter(t)
 		kernel.put(key, expected)
-		deleted, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected)
-		if err != nil || !deleted {
-			t.Fatalf("deleted=%t err=%v", deleted, err)
+		result, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected)
+		if err != nil || result != SessionDeleteRemoved {
+			t.Fatalf("result=%v err=%v", result, err)
 		}
 		if _, found := kernel.value(key); found {
 			t.Fatal("claimed value survived exact delete")
@@ -187,15 +187,15 @@ func TestLinuxAtomicSessionCompareDeleteLinearization(t *testing.T) {
 
 	t.Run("absent and different never delete", func(t *testing.T) {
 		deleter, kernel := newModelSessionDeleter(t)
-		if deleted, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); err != nil || deleted {
-			t.Fatalf("absent deleted=%t err=%v", deleted, err)
+		if result, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); err != nil || result != SessionDeleteAbsent {
+			t.Fatalf("absent result=%v err=%v", result, err)
 		}
 		advanced := expected
 		advanced.TXSequence++
 		advanced.Revision++
 		kernel.put(key, advanced)
-		if deleted, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); err != nil || deleted {
-			t.Fatalf("different deleted=%t err=%v", deleted, err)
+		if result, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); err != nil || result != SessionDeleteDifferent {
+			t.Fatalf("different result=%v err=%v", result, err)
 		}
 		if got, found := kernel.value(key); !found || got != advanced {
 			t.Fatalf("different value changed: got=%#v found=%t", got, found)
@@ -215,8 +215,8 @@ func TestLinuxAtomicSessionCompareDeleteLinearization(t *testing.T) {
 			t.Fatal("model writer was not admitted")
 		}
 		advanced, _ := kernel.value(key)
-		if deleted, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); err != nil || deleted {
-			t.Fatalf("advanced deleted=%t err=%v", deleted, err)
+		if result, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); err != nil || result != SessionDeleteDifferent {
+			t.Fatalf("advanced result=%v err=%v", result, err)
 		}
 		if got, found := kernel.value(key); !found || got != advanced {
 			t.Fatalf("writer update lost: got=%#v found=%t", got, found)
@@ -234,8 +234,8 @@ func TestLinuxAtomicSessionCompareDeleteLinearization(t *testing.T) {
 		}
 		deleteResult := make(chan error, 1)
 		go func() {
-			deleted, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected)
-			if err == nil && !deleted {
+			result, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected)
+			if err == nil && result != SessionDeleteRemoved {
 				err = errors.New("compare-delete returned false")
 			}
 			deleteResult <- err
@@ -270,20 +270,20 @@ func TestLinuxAtomicSessionCompareDeleteLinearization(t *testing.T) {
 			close(claimed)
 			<-finishRun
 		}
-		result := make(chan error, 1)
+		claimResult := make(chan error, 1)
 		go func() {
-			deleted, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected)
-			if err == nil && !deleted {
+			deleteResult, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected)
+			if err == nil && deleteResult != SessionDeleteRemoved {
 				err = errors.New("compare-delete returned false")
 			}
-			result <- err
+			claimResult <- err
 		}()
 		<-claimed
 		if kernel.write(key, func(value *abi.FakeTCPSessionValue) { value.RXSequence++ }) {
 			t.Fatal("post-claim writer mutated tombstone")
 		}
 		close(finishRun)
-		if err := <-result; err != nil {
+		if err := <-claimResult; err != nil {
 			t.Fatal(err)
 		}
 	})
@@ -296,8 +296,8 @@ func TestLinuxAtomicSessionCompareDeleteCrashRecoveryAndABA(t *testing.T) {
 	kernel.put(key, expected)
 	crash := errors.New("simulated crash before exact delete")
 	kernel.deleteErr = crash
-	if deleted, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); deleted || !errors.Is(err, crash) {
-		t.Fatalf("first delete deleted=%t err=%v", deleted, err)
+	if result, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); result != SessionDeleteDifferent || !errors.Is(err, crash) {
+		t.Fatalf("first delete result=%v err=%v", result, err)
 	}
 	claimed, found := kernel.value(key)
 	if !found || claimed.State != abi.FakeTCPStateDeleteClaimed {
@@ -306,16 +306,16 @@ func TestLinuxAtomicSessionCompareDeleteCrashRecoveryAndABA(t *testing.T) {
 
 	different := expected
 	different.SessionID++
-	if deleted, err := deleter.CompareDeleteEstablished(kernel.identity, key, different); err != nil || deleted {
-		t.Fatalf("different tombstone claimant deleted=%t err=%v", deleted, err)
+	if result, err := deleter.CompareDeleteEstablished(kernel.identity, key, different); err != nil || result != SessionDeleteDifferent {
+		t.Fatalf("different tombstone claimant result=%v err=%v", result, err)
 	}
 	if got, found := kernel.value(key); !found || got != claimed {
 		t.Fatalf("different claimant changed tombstone: got=%#v found=%t", got, found)
 	}
 
 	kernel.deleteErr = nil
-	if deleted, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); err != nil || !deleted {
-		t.Fatalf("idempotent crash retry deleted=%t err=%v", deleted, err)
+	if result, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); err != nil || result != SessionDeleteRemoved {
+		t.Fatalf("idempotent crash retry result=%v err=%v", result, err)
 	}
 
 	// A reinsert with otherwise identical transport fields has a fresh
@@ -324,8 +324,8 @@ func TestLinuxAtomicSessionCompareDeleteCrashRecoveryAndABA(t *testing.T) {
 	reinserted.SessionID++
 	reinserted.Revision++
 	kernel.put(key, reinserted)
-	if deleted, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); err != nil || deleted {
-		t.Fatalf("ABA reinsert deleted=%t err=%v", deleted, err)
+	if result, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); err != nil || result != SessionDeleteDifferent {
+		t.Fatalf("ABA reinsert result=%v err=%v", result, err)
 	}
 	if got, found := kernel.value(key); !found || got != reinserted {
 		t.Fatalf("ABA reinsert changed: got=%#v found=%t", got, found)
@@ -340,9 +340,9 @@ func TestLinuxAtomicSessionCompareDeleteIdentityDriftPreservesState(t *testing.T
 		deleter, kernel := newModelSessionDeleter(t)
 		kernel.put(key, expected)
 		kernel.identity.ID++
-		if deleted, err := deleter.CompareDeleteEstablished(deleter.identity, key, expected); deleted ||
+		if result, err := deleter.CompareDeleteEstablished(deleter.identity, key, expected); result != SessionDeleteDifferent ||
 			!errors.Is(err, ErrSessionMapIdentityChanged) {
-			t.Fatalf("deleted=%t err=%v", deleted, err)
+			t.Fatalf("result=%v err=%v", result, err)
 		}
 		if kernel.runCalls != 0 || kernel.deleteCalls != 0 {
 			t.Fatalf("identity drift reached run/delete: %d/%d", kernel.runCalls, kernel.deleteCalls)
@@ -357,9 +357,9 @@ func TestLinuxAtomicSessionCompareDeleteIdentityDriftPreservesState(t *testing.T
 			kernel.identity.ID++
 			kernel.mu.Unlock()
 		}
-		if deleted, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); deleted ||
+		if result, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); result != SessionDeleteDifferent ||
 			!errors.Is(err, ErrSessionMapIdentityChanged) {
-			t.Fatalf("deleted=%t err=%v", deleted, err)
+			t.Fatalf("result=%v err=%v", result, err)
 		}
 		if got, found := kernel.value(key); !found || got.State != abi.FakeTCPStateDeleteClaimed {
 			t.Fatalf("post-claim drift erased tombstone: got=%#v found=%t", got, found)
@@ -373,8 +373,8 @@ func TestLinuxAtomicSessionCompareDeleteIdentityDriftPreservesState(t *testing.T
 		deleter, kernel := newModelSessionDeleter(t)
 		kernel.put(key, expected)
 		kernel.programMaps = []uint32{kernel.identity.ID + 1}
-		if deleted, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); err == nil || deleted {
-			t.Fatalf("deleted=%t err=%v", deleted, err)
+		if result, err := deleter.CompareDeleteEstablished(kernel.identity, key, expected); err == nil || result != SessionDeleteDifferent {
+			t.Fatalf("result=%v err=%v", result, err)
 		}
 		if kernel.runCalls != 0 || kernel.deleteCalls != 0 {
 			t.Fatalf("program drift reached run/delete: %d/%d", kernel.runCalls, kernel.deleteCalls)
@@ -464,9 +464,9 @@ func TestLinuxSessionStoreCloseWaitsForAdmittedAtomicDelete(t *testing.T) {
 	if err := <-closeDone; err != nil {
 		t.Fatal(err)
 	}
-	if deleted, err := store.DeleteEstablishedIfUnchanged(key, expected); deleted ||
+	if result, err := store.DeleteEstablishedIfUnchanged(key, expected); result != SessionDeleteDifferent ||
 		!errors.Is(err, ErrSessionStoreClosed) {
-		t.Fatalf("post-close deleted=%t err=%v", deleted, err)
+		t.Fatalf("post-close result=%v err=%v", result, err)
 	}
 }
 
