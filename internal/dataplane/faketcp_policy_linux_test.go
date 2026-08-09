@@ -226,7 +226,7 @@ func TestStageFakeTCPPolicyGenerationRollsBackEveryWriteFailureInReverse(t *test
 	}
 }
 
-func TestStageFakeTCPPolicyGenerationCancellationModelNeverLeavesReachabilityLatch(t *testing.T) {
+func TestStageFakeTCPPolicyGenerationCancellationRetainsPolicyUntilBarrierRetry(t *testing.T) {
 	want := mustFakeTCPPolicySnapshot(t, 91)
 	totalWrites := len(want.ControlPolicies) + len(want.ManagedPorts) + len(want.ManagedInterfaces)
 	for cancelAt := 1; cancelAt <= totalWrites; cancelAt++ {
@@ -244,11 +244,11 @@ func TestStageFakeTCPPolicyGenerationCancellationModelNeverLeavesReachabilityLat
 			if stage == nil || !errors.Is(err, context.Canceled) {
 				t.Fatalf("canceled stage=%#v error=%v", stage, err)
 			}
-			if len(policyMaps.ManagedInterfaces.(*memoryFakeTCPPolicyMap).entries) != 0 {
-				t.Fatalf("canceled stage retained interface reachability latch: %#v", policyMaps.ManagedInterfaces)
-			}
 			if isolation.quiesced {
 				t.Fatal("canceled active context unexpectedly crossed the quiescence barrier")
+			}
+			if len(trace.deleteAttempts) != 0 {
+				t.Fatalf("canceled barrier proof deleted policy: %v", trace.deleteAttempts)
 			}
 			if err := transaction.Rollback(baseCtx, stage); err != nil {
 				t.Fatalf("cleanup canceled stage: %v", err)
@@ -324,8 +324,8 @@ func TestFakeTCPPolicyStageChangedValueIsRetryableAndNeverBlindDeleted(t *testin
 		t.Fatalf("disarm after incomplete rollback error = %v", err)
 	}
 
-	// Once the exact latch is restored, retry completes the latch phase,
-	// quiesces BPF, and only then removes ports and policies.
+	// Once the exact latch is restored, retry quiesces BPF before removing the
+	// interface, port, and control policy phases.
 	managedInterfaces.entries[changedKey] = inserted
 	if err := transaction.Rollback(ctx, stage); err != nil {
 		t.Fatalf("retry exact rollback: %v", err)
@@ -366,8 +366,8 @@ func TestFakeTCPPolicyRollbackStopsAtFailedInterfaceLatch(t *testing.T) {
 			if err == nil || !strings.Contains(err.Error(), "interface") {
 				t.Fatalf("interface-phase rollback error = %v", err)
 			}
-			if len(quiescer.calls) != 0 {
-				t.Fatalf("quiesce ran with an unconfirmed interface latch: %v", quiescer.calls)
+			if !slices.Equal(quiescer.calls, []uint64{snapshot.Generation}) {
+				t.Fatalf("interface rollback did not quiesce first: %v", quiescer.calls)
 			}
 			if slices.Contains(trace.deleteAttempts, fakeTCPManagedPortMapName) ||
 				slices.Contains(trace.deleteAttempts, fakeTCPControlPolicyMapName) {
@@ -398,13 +398,10 @@ func TestFakeTCPPolicyRollbackStopsAtFailedQuiescenceBarrier(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "injected quiescence failure") {
 		t.Fatalf("quiescence rollback error = %v", err)
 	}
-	if slices.Contains(trace.deleteAttempts, fakeTCPManagedPortMapName) ||
-		slices.Contains(trace.deleteAttempts, fakeTCPControlPolicyMapName) {
-		t.Fatalf("quiescence failure touched dependencies: %v", trace.deleteAttempts)
+	if len(trace.deleteAttempts) != 0 {
+		t.Fatalf("quiescence failure touched policy: %v", trace.deleteAttempts)
 	}
-	if len(policyMaps.ManagedInterfaces.(*memoryFakeTCPPolicyMap).entries) != 0 {
-		t.Fatal("quiescence ran before every interface latch was removed")
-	}
+	assertMemoryPolicyMapMatches(t, policyMaps.ManagedInterfaces, snapshot.ManagedInterfaces)
 	assertMemoryPolicyMapMatches(t, policyMaps.ManagedPorts, snapshot.ManagedPorts)
 	assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, snapshot.ControlPolicies)
 
@@ -627,12 +624,8 @@ func TestStageFakeTCPPolicyInternalFailureUsesLatchAndQuiescenceBarrier(t *testi
 		!strings.Contains(err.Error(), "injected internal rollback quiescence failure") {
 		t.Fatalf("internal stage failure handle=%v error=%v", stage, err)
 	}
-	if len(policyMaps.ManagedInterfaces.(*memoryFakeTCPPolicyMap).entries) != 0 {
-		t.Fatal("internal rollback left its partial interface latch reachable")
-	}
-	if slices.Contains(trace.deleteAttempts, fakeTCPManagedPortMapName) ||
-		slices.Contains(trace.deleteAttempts, fakeTCPControlPolicyMapName) {
-		t.Fatalf("internal quiescence failure touched dependencies: %v", trace.deleteAttempts)
+	if len(trace.deleteAttempts) != 0 {
+		t.Fatalf("internal quiescence failure touched policy: %v", trace.deleteAttempts)
 	}
 	assertMemoryPolicyMapMatches(t, policyMaps.ManagedPorts, snapshot.ManagedPorts)
 	assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, snapshot.ControlPolicies)
@@ -989,6 +982,8 @@ type memoryFakeTCPPolicyQuiescer struct {
 	inactiveCalls           []uint64
 	failInactive            error
 	inactive                bool
+	activateCalls           []uint64
+	failActivate            error
 	calls                   []uint64
 	fail                    error
 	quiesced                bool
@@ -1021,6 +1016,28 @@ func (quiescer *memoryFakeTCPPolicyQuiescer) AssertInactive(
 	return nil
 }
 
+func (quiescer *memoryFakeTCPPolicyQuiescer) Activate(
+	ctx context.Context,
+	generation uint64,
+) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	quiescer.activateCalls = append(quiescer.activateCalls, generation)
+	if quiescer.events != nil {
+		*quiescer.events = append(*quiescer.events, "activate")
+	}
+	if generation != quiescer.generation {
+		return fmt.Errorf("activate generation %d, want %d", generation, quiescer.generation)
+	}
+	if quiescer.failActivate != nil {
+		return quiescer.failActivate
+	}
+	quiescer.inactive = false
+	quiescer.quiesced = false
+	return nil
+}
+
 func (quiescer *memoryFakeTCPPolicyQuiescer) Quiesce(
 	ctx context.Context,
 	generation uint64,
@@ -1038,6 +1055,7 @@ func (quiescer *memoryFakeTCPPolicyQuiescer) Quiesce(
 	if quiescer.fail != nil {
 		return quiescer.fail
 	}
+	quiescer.inactive = true
 	quiescer.quiesced = true
 	return nil
 }

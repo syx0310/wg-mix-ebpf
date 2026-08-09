@@ -239,6 +239,7 @@ type runtimeTestFixture struct {
 	commitEngine    *faketcp.Engine
 	commitCalls     int
 	retainedRelease faketcp.LinuxFreshCollectionRelease
+	isolation       *memoryFakeTCPPolicyQuiescer
 	lastCoreStage   *fakeExperimentalCoreStage
 	lastTCStage     *fakeExperimentalTCStage
 	sessionMapArg   experimentalMapResource
@@ -444,6 +445,10 @@ func (fixture *runtimeTestFixture) buildOptions(
 	transaction *fakeTCPPolicyGenerationTransaction,
 ) experimentalFakeTCPRuntimeBuildOptions {
 	generation := transaction.policyGeneration()
+	if isolation, ok := transaction.isolation.(*memoryFakeTCPPolicyQuiescer); ok {
+		isolation.events = &fixture.activationTrace
+		fixture.isolation = isolation
+	}
 	attachState := fakeTCPPolicyTestState()
 	baseline, err := abi.FromStateWithGeneration(attachState, generation)
 	if err != nil {
@@ -545,6 +550,7 @@ func TestExperimentalFakeTCPRuntimeBuildsPolicyTailCallsXDPAndHandles(t *testing
 	xdpAttachIndex := slices.Index(fixture.activationTrace, "xdp-attach")
 	tcStageIndex := slices.Index(fixture.activationTrace, "tc-stage")
 	policyUpdateIndex := slices.Index(fixture.activationTrace, "policy:update:faketcp_control_policy_map")
+	activateIndex := slices.Index(fixture.activationTrace, "activate")
 	coreCommitIndex := slices.Index(fixture.activationTrace, "core-commit")
 	releaseIndex := slices.Index(fixture.activationTrace, "release")
 	coreCommitCount := 0
@@ -556,7 +562,8 @@ func TestExperimentalFakeTCPRuntimeBuildsPolicyTailCallsXDPAndHandles(t *testing
 	if len(fixture.activationTrace) < 2 || fixture.activationTrace[0] != "seed" ||
 		coreStageIndex <= 0 || programInsertIndex <= coreStageIndex ||
 		xdpAttachIndex <= programInsertIndex || tcStageIndex <= xdpAttachIndex ||
-		policyUpdateIndex <= tcStageIndex || coreCommitIndex <= policyUpdateIndex ||
+		policyUpdateIndex <= tcStageIndex || activateIndex <= policyUpdateIndex ||
+		coreCommitIndex <= activateIndex ||
 		releaseIndex <= coreCommitIndex || releaseIndex != len(fixture.activationTrace)-1 ||
 		coreCommitCount != 1 {
 		t.Fatalf("activation order = %v", fixture.activationTrace)
@@ -652,6 +659,38 @@ func TestExperimentalFakeTCPRuntimeBuildsPolicyTailCallsXDPAndHandles(t *testing
 	}
 }
 
+func TestExperimentalRuntimeActivationFailureQuiescesBeforePolicyRemoval(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	ctx, transaction, isolation := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+	wantErr := errors.New("injected generation activation failure")
+	options := fixture.buildOptions(transaction)
+	isolation.failActivate = wantErr
+
+	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
+	if runtime != nil || !errors.Is(err, wantErr) {
+		t.Fatalf("runtime=%#v error=%v", runtime, err)
+	}
+	policyUpdate := slices.Index(
+		fixture.activationTrace, "policy:update:faketcp_managed_if_map",
+	)
+	activate := slices.Index(fixture.activationTrace, "activate")
+	quiesce := slices.Index(fixture.activationTrace, "quiesce")
+	policyDelete := slices.Index(
+		fixture.activationTrace, "policy:delete:faketcp_managed_if_map",
+	)
+	xdpClose := slices.Index(fixture.activationTrace, "xdp-close")
+	if policyUpdate < 0 || activate <= policyUpdate || quiesce <= activate ||
+		policyDelete <= quiesce || xdpClose <= policyDelete ||
+		slices.Contains(fixture.activationTrace, "core-commit") {
+		t.Fatalf("activation failure order = %v", fixture.activationTrace)
+	}
+	if !transaction.isClosed() || !isolation.quiesced {
+		t.Fatalf("activation failure transaction closed=%t quiesced=%t",
+			transaction.isClosed(), isolation.quiesced)
+	}
+	assertNoMemoryPolicyGeneration(t, fixture.policyMaps, 91)
+}
+
 func TestExperimentalFakeTCPFreshClaimUsesPreResolvedCoreResourcesWithoutOwnerReentry(
 	t *testing.T,
 ) {
@@ -714,6 +753,7 @@ func TestExperimentalRuntimeCloseBlocksReachabilityBeforeDependentTeardown(t *te
 	want := []string{
 		"slow-close",
 		"core-deactivate",
+		"quiesce",
 		"xdp-close",
 		"xdp-close",
 		"tc-close",
@@ -758,6 +798,7 @@ func TestExperimentalRuntimeCloseWaitsForBlockedSlowPathWriterFence(t *testing.T
 	want := []string{
 		"slow-close",
 		"core-deactivate",
+		"quiesce",
 		"xdp-close",
 		"xdp-close",
 		"tc-close",
@@ -836,6 +877,7 @@ func TestExperimentalRuntimeSlowPathCloseFailureRetainsDataplaneForExactRetry(t 
 		"slow-close",
 		"slow-close",
 		"core-deactivate",
+		"quiesce",
 		"xdp-close",
 		"xdp-close",
 		"tc-close",
@@ -849,7 +891,59 @@ func TestExperimentalRuntimeSlowPathCloseFailureRetainsDataplaneForExactRetry(t 
 	}
 }
 
-func TestExperimentalRuntimeDeactivateFailureStillDetachesXDPAndTC(t *testing.T) {
+func TestExperimentalRuntimeQuiesceFailureRetainsAttachedOwnersForRetry(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	runtime, _, err := fixture.build(t, 91)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantErr := errors.New("injected generation quiescence failure")
+	fixture.isolation.fail = wantErr
+	ownedCore := runtime.state.core
+	ownedXDP := runtime.state.xdp
+	ownedTC := runtime.state.tc
+	ownedIsolation := runtime.state.isolation
+	ownedCollection := runtime.state.collection
+	closeStart := len(fixture.activationTrace)
+
+	if err := runtime.Close(); !errors.Is(err, wantErr) {
+		t.Fatalf("runtime Close error = %v", err)
+	}
+	if runtime.state.closed || runtime.state.core != ownedCore ||
+		runtime.state.xdp != ownedXDP || runtime.state.tc != ownedTC ||
+		runtime.state.isolation != ownedIsolation || runtime.state.collection != ownedCollection {
+		t.Fatalf("quiescence failure lost an attached owner: %#v", runtime.state)
+	}
+	if fixture.lastTCStage.closes != 0 || fixture.xdpRuntime.links[3].closes != 0 ||
+		fixture.xdpRuntime.links[9].closes != 0 {
+		t.Fatalf("quiescence failure detached tc=%d xdp3=%d xdp9=%d",
+			fixture.lastTCStage.closes,
+			fixture.xdpRuntime.links[3].closes,
+			fixture.xdpRuntime.links[9].closes,
+		)
+	}
+	if got, want := fixture.activationTrace[closeStart:], []string{
+		"slow-close", "core-deactivate", "quiesce",
+	}; !slices.Equal(got, want) {
+		t.Fatalf("failed quiescence trace = %v, want %v", got, want)
+	}
+
+	fixture.isolation.fail = nil
+	retryStart := len(fixture.activationTrace)
+	if err := runtime.Close(); err != nil {
+		t.Fatalf("retry retained generation owner: %v", err)
+	}
+	if got, want := fixture.activationTrace[retryStart:], []string{
+		"quiesce", "xdp-close", "xdp-close", "tc-close", "core-close",
+	}; !slices.Equal(got, want) {
+		t.Fatalf("quiescence retry trace = %v, want %v", got, want)
+	}
+	if !runtime.state.closed || runtime.state.collection != nil || runtime.state.isolation != nil {
+		t.Fatalf("quiescence retry did not converge: %#v", runtime.state)
+	}
+}
+
+func TestExperimentalRuntimeDeactivateFailureRetainsBarrierAndAttachments(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
 	runtime, _, err := fixture.build(t, 91)
 	if err != nil {
@@ -860,11 +954,11 @@ func TestExperimentalRuntimeDeactivateFailureStillDetachesXDPAndTC(t *testing.T)
 	if err := runtime.Close(); !errors.Is(err, deactivateErr) {
 		t.Fatalf("runtime Close error = %v", err)
 	}
-	if fixture.lastTCStage.closes != 1 ||
-		fixture.xdpRuntime.links[3].closes != 1 ||
-		fixture.xdpRuntime.links[9].closes != 1 {
+	if fixture.lastTCStage.closes != 0 ||
+		fixture.xdpRuntime.links[3].closes != 0 ||
+		fixture.xdpRuntime.links[9].closes != 0 {
 		t.Fatalf(
-			"deactivate failure teardown tc=%d xdp3=%d xdp9=%d",
+			"deactivate failure crossed barrier tc=%d xdp3=%d xdp9=%d",
 			fixture.lastTCStage.closes,
 			fixture.xdpRuntime.links[3].closes,
 			fixture.xdpRuntime.links[9].closes,
@@ -872,9 +966,10 @@ func TestExperimentalRuntimeDeactivateFailureStillDetachesXDPAndTC(t *testing.T)
 	}
 	slowIndex := slices.Index(fixture.activationTrace, "slow-close")
 	deactivateIndex := slices.Index(fixture.activationTrace, "core-deactivate")
-	xdpIndex := slices.Index(fixture.activationTrace, "xdp-close")
-	tcIndex := slices.Index(fixture.activationTrace, "tc-close")
-	if slowIndex < 0 || deactivateIndex <= slowIndex || xdpIndex <= deactivateIndex || tcIndex <= xdpIndex {
+	if slowIndex < 0 || deactivateIndex <= slowIndex ||
+		slices.Contains(fixture.activationTrace[deactivateIndex+1:], "quiesce") ||
+		slices.Contains(fixture.activationTrace[deactivateIndex+1:], "xdp-close") ||
+		slices.Contains(fixture.activationTrace[deactivateIndex+1:], "tc-close") {
 		t.Fatalf("deactivate failure dependency order = %v", fixture.activationTrace)
 	}
 	fixture.lastCoreStage.deactivateErr = nil
@@ -1276,7 +1371,10 @@ func TestExperimentalFakeTCPRuntimeReleaseFailureBeforeCommitRollsBack(t *testin
 	}
 	releaseIndex := slices.Index(fixture.activationTrace, "release-failure")
 	xdpIndex := slices.Index(fixture.activationTrace, "xdp-attach")
+	activateIndex := slices.Index(fixture.activationTrace, "activate")
+	coreCommitIndex := slices.Index(fixture.activationTrace, "core-commit")
 	deactivateIndex := slices.Index(fixture.activationTrace, "core-deactivate")
+	quiesceIndex := slices.Index(fixture.activationTrace, "quiesce")
 	xdpCloseIndex := slices.Index(fixture.activationTrace, "xdp-close")
 	tcCloseIndex := slices.Index(fixture.activationTrace, "tc-close")
 	slowCloseIndex := slices.Index(fixture.activationTrace, "slow-close")
@@ -1287,19 +1385,18 @@ func TestExperimentalFakeTCPRuntimeReleaseFailureBeforeCommitRollsBack(t *testin
 	programDeleteIndex := slices.Index(fixture.activationTrace, "program-delete")
 	coreCloseIndex := slices.Index(fixture.activationTrace, "core-close")
 	if len(fixture.activationTrace) == 0 || fixture.activationTrace[0] != "seed" ||
-		xdpIndex <= 0 || releaseIndex <= xdpIndex ||
+		xdpIndex <= 0 || activateIndex <= xdpIndex || coreCommitIndex <= activateIndex ||
+		releaseIndex <= coreCommitIndex ||
 		slowCloseIndex <= releaseIndex || deactivateIndex <= slowCloseIndex ||
-		xdpCloseIndex <= deactivateIndex || tcCloseIndex <= xdpCloseIndex ||
-		policyDeleteIndex <= tcCloseIndex || programDeleteIndex <= policyDeleteIndex ||
+		quiesceIndex <= deactivateIndex || policyDeleteIndex <= quiesceIndex ||
+		xdpCloseIndex <= policyDeleteIndex || tcCloseIndex <= xdpCloseIndex ||
+		programDeleteIndex <= tcCloseIndex ||
 		coreCloseIndex <= programDeleteIndex {
 		t.Fatalf("release failure order = %v", fixture.activationTrace)
 	}
 	if len(fixture.programArray.entries) != 0 || len(fixture.programArray.deletes) != 1 {
 		t.Fatalf("program rollback entries=%v deletes=%v",
 			fixture.programArray.entries, fixture.programArray.deletes)
-	}
-	if slices.Contains(fixture.activationTrace, "core-commit") {
-		t.Fatalf("canceled build published a partial generation: %v", fixture.activationTrace)
 	}
 	assertNoMemoryPolicyGeneration(t, fixture.policyMaps, 91)
 	if fixture.xdpRuntime.links[3].closes != 1 || fixture.xdpRuntime.links[9].closes != 1 {
@@ -1368,16 +1465,16 @@ func TestExperimentalBuildCleanupRetainsDataplaneUntilSlowPathRetry(t *testing.T
 	if err := runtime.Close(); err != nil {
 		t.Fatalf("retry failed-build owner: %v", err)
 	}
-	wantRetryPrefix := []string{
-		"slow-close",
-		"core-deactivate",
-		"xdp-close",
-		"xdp-close",
-		"tc-close",
-	}
 	retryTrace := fixture.activationTrace[retryStart:]
-	if len(retryTrace) < len(wantRetryPrefix) ||
-		!slices.Equal(retryTrace[:len(wantRetryPrefix)], wantRetryPrefix) {
+	deactivateIndex := slices.Index(retryTrace, "core-deactivate")
+	quiesceIndex := slices.Index(retryTrace, "quiesce")
+	policyDeleteIndex := slices.Index(retryTrace, "policy:delete:faketcp_managed_if_map")
+	xdpCloseIndex := slices.Index(retryTrace, "xdp-close")
+	tcCloseIndex := slices.Index(retryTrace, "tc-close")
+	if len(retryTrace) == 0 || retryTrace[0] != "slow-close" ||
+		deactivateIndex <= 0 || quiesceIndex <= deactivateIndex ||
+		policyDeleteIndex <= quiesceIndex || xdpCloseIndex <= policyDeleteIndex ||
+		tcCloseIndex <= xdpCloseIndex {
 		t.Fatalf("failed-build retry teardown order = %v", retryTrace)
 	}
 	if !runtime.state.closed || runtime.state.failedBuild != nil || !transaction.isClosed() {
@@ -2280,13 +2377,14 @@ func TestExperimentalRuntimeBuildFailureQuarantinesRetainedTCRollback(t *testing
 		)
 	}
 	if transaction.isClosed() || len(fixture.programArray.deletes) != 0 ||
-		len(fixture.policyTrace.deleteAttempts) != 0 {
+		len(fixture.policyTrace.deleteAttempts) == 0 || !fixture.isolation.quiesced {
 		t.Fatalf(
-			"quarantine transaction closed=%t programs=%v policy deletes=%v",
+			"quarantine transaction closed=%t programs=%v policy deletes=%v quiesced=%t",
 			transaction.isClosed(), fixture.programArray.deletes,
-			fixture.policyTrace.deleteAttempts,
+			fixture.policyTrace.deleteAttempts, fixture.isolation.quiesced,
 		)
 	}
+	assertNoMemoryPolicyGeneration(t, fixture.policyMaps, 91)
 	for name, resource := range fixture.mapResources {
 		if resource.closes != 0 {
 			t.Fatalf("live rollback dependency map %s closed=%d", name, resource.closes)

@@ -544,11 +544,9 @@ func TestFakeTCPXDPUsesSharedL3ParserBeforeManagedPortPolicy(t *testing.T) {
 			t.Fatalf("managed-port fail-closed source contract missing %q", want)
 		}
 	}
-	xdpStart := strings.Index(text, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
-	if xdpStart < 0 {
-		t.Fatal("FakeTCP XDP entry point is missing")
-	}
-	xdp := text[xdpStart:]
+	xdp := sourceSection(t, text,
+		"faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)",
+		"SEC(\"xdp\")")
 	parse := strings.Index(xdp, "parse_rc = faketcp_parse_l3")
 	lookup := strings.Index(xdp, "managed_listener = faketcp_xdp_managed_port")
 	unsupported := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")
@@ -628,21 +626,23 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 	continueStart := strings.Index(text, "faketcp_continue_egress(struct __sk_buff")
 	ingressConsumeStart := strings.Index(text, "faketcp_consume_ingress_admission(")
 	xdpCheckpointStart := strings.Index(text, "faketcp_xdp_admission_checkpoint(")
-	xdpStart := strings.Index(text, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
+	xdpBodyStart := strings.Index(text, "faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)")
 	if preflightStart < 0 || gsoStart < 0 || gsoEnd < 0 || encodeStart < 0 || continueStart < 0 ||
-		ingressConsumeStart < 0 || xdpCheckpointStart < 0 || xdpStart < 0 ||
+		ingressConsumeStart < 0 || xdpCheckpointStart < 0 || xdpBodyStart < 0 ||
 		!(preflightStart < gsoStart && gsoStart < gsoEnd && gsoEnd < encodeStart &&
 			encodeStart < continueStart &&
 			continueStart < ingressConsumeStart && ingressConsumeStart < xdpCheckpointStart &&
-			xdpCheckpointStart < xdpStart) {
+			xdpCheckpointStart < xdpBodyStart) {
 		t.Fatal("FakeTCP packet path functions are missing or reordered")
 	}
 	preflight := text[preflightStart:gsoStart]
 	gso := text[gsoStart:gsoEnd]
 	encode := text[encodeStart:continueStart]
 	ingressConsume := text[ingressConsumeStart:xdpCheckpointStart]
-	xdpCheckpoint := text[xdpCheckpointStart:xdpStart]
-	xdp := text[xdpStart:]
+	xdpCheckpoint := text[xdpCheckpointStart:xdpBodyStart]
+	xdp := sourceSection(t, text,
+		"faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)",
+		"SEC(\"xdp\")")
 	if strings.Count(preflight, "faketcp_session_snapshot_established(") != 1 ||
 		strings.Count(preflight, "bpf_map_lookup_elem(&faketcp_session_map") != 1 {
 		t.Fatal("TC checkpoint must take exactly one locked established snapshot")
@@ -918,12 +918,14 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 		}
 	}
 
-	admissionStart := strings.Index(text, "faketcp_admit_control_event(const struct faketcp_session_key")
+	admissionStart := strings.Index(text, "faketcp_admit_control_event_inner(const struct faketcp_session_key")
 	emitStart := strings.Index(text, "static __always_inline int faketcp_emit_event")
 	if admissionStart < 0 || emitStart < 0 || admissionStart >= emitStart {
 		t.Fatal("FakeTCP control admission helper is missing or misplaced")
 	}
-	admission := text[admissionStart:emitStart]
+	admission := sourceSection(t, text,
+		"faketcp_admit_control_event_inner(const struct faketcp_session_key",
+		"faketcp_admit_control_event(const struct faketcp_session_key")
 	policyLookup := strings.Index(admission, "bpf_map_lookup_elem(&faketcp_control_policy_map")
 	flowLookup := strings.Index(admission, "bpf_map_lookup_elem(&faketcp_control_flow_map")
 	budget := strings.Index(admission, "faketcp_take_control_budget(policy, now)")
@@ -961,8 +963,8 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 		t.Fatal("FakeTCP capture sequence must reject saturation before increment and never wrap")
 	}
 
-	if got := strings.Count(text, "bpf_ringbuf_output("); got != 2 {
-		t.Fatalf("FakeTCP source has %d ring-buffer output calls, want two enumerated calls", got)
+	if got := strings.Count(text, "bpf_ringbuf_output("); got != 3 {
+		t.Fatalf("FakeTCP source has %d ring-buffer output calls, want two events plus one generation wake", got)
 	}
 	if got := strings.Count(text, "bpf_ringbuf_output(&faketcp_events,"); got != 2 {
 		t.Fatalf("FakeTCP event ring has %d output sites, want two explicitly admitted sites", got)
@@ -972,6 +974,9 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 	}
 	if got := strings.Count(text, "bpf_ringbuf_output(&faketcp_events, record"); got != 1 {
 		t.Fatalf("FakeTCP shared packet ring output sites=%d, want exactly one", got)
+	}
+	if got := strings.Count(text, "bpf_ringbuf_output(&faketcp_gen_wk, &wake"); got != 1 {
+		t.Fatalf("FakeTCP generation wake output sites=%d, want exactly one", got)
 	}
 	for _, forbidden := range []string{"bpf_ringbuf_reserve(", "bpf_ringbuf_submit(", "bpf_ringbuf_discard("} {
 		if strings.Contains(text, forbidden) {
@@ -1136,12 +1141,14 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 	}
 	text := string(source)
 	checkpointStart := strings.Index(text, "static __always_inline int faketcp_xdp_admission_checkpoint")
-	xdpStart := strings.Index(text, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
-	if checkpointStart < 0 || xdpStart < 0 || checkpointStart >= xdpStart {
+	xdpBodyStart := strings.Index(text, "faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)")
+	if checkpointStart < 0 || xdpBodyStart < 0 || checkpointStart >= xdpBodyStart {
 		t.Fatal("FakeTCP XDP admission checkpoint is missing")
 	}
-	checkpoint := text[checkpointStart:xdpStart]
-	xdp := text[xdpStart:]
+	checkpoint := text[checkpointStart:xdpBodyStart]
+	xdp := sourceSection(t, text,
+		"faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)",
+		"SEC(\"xdp\")")
 	snapshot := strings.Index(checkpoint, "faketcp_session_snapshot_established(")
 	closeDecision := strings.Index(checkpoint, "return FAKETCP_ADMISSION_CLOSE")
 	fixedIPv4Gate := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")
@@ -1209,7 +1216,7 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 			t.Fatalf("close checksum helper missing %q", want)
 		}
 	}
-	captureHelper := text[captureStart:xdpStart]
+	captureHelper := text[captureStart:xdpBodyStart]
 	admit := strings.Index(captureHelper, "faketcp_admit_control_event(&admission->key, admission->wg_id")
 	write := strings.Index(captureHelper, "record->event = (struct faketcp_event)")
 	identity := strings.Index(captureHelper, "record->event.runtime_incarnation[i]")

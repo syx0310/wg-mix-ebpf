@@ -270,95 +270,36 @@ func (slowPath *fakeTCPRealHostSlowPath) Close() error {
 }
 
 type fakeTCPRealHostGenerationIsolation struct {
-	mu         sync.Mutex
-	owner      *experimentalCollectionOwner
-	generation uint64
-	ifindexes  []int
+	barrier *liveFakeTCPGenerationBarrier
 }
 
-func (isolation *fakeTCPRealHostGenerationIsolation) bind(owner *experimentalCollectionOwner) error {
-	if isolation == nil || owner == nil {
-		return errors.New("bind FakeTCP real-host generation isolation: owner is nil")
-	}
-	isolation.mu.Lock()
-	defer isolation.mu.Unlock()
-	if isolation.owner != nil && isolation.owner != owner {
-		return errors.New("bind FakeTCP real-host generation isolation: owner already bound")
-	}
-	isolation.owner = owner
-	return nil
+func (isolation *fakeTCPRealHostGenerationIsolation) BindCollection(
+	ctx context.Context,
+	owner *experimentalCollectionOwner,
+	identity faketcp.RuntimeIdentity,
+) error {
+	return isolation.barrier.BindCollection(ctx, owner, identity)
 }
 
 func (isolation *fakeTCPRealHostGenerationIsolation) AssertInactive(
 	ctx context.Context,
 	generation uint64,
 ) error {
-	if ctx == nil {
-		return errors.New("prove FakeTCP real-host generation inactive: context is nil")
-	}
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	if isolation == nil || generation == 0 || generation != isolation.generation {
-		return errors.New("prove FakeTCP real-host generation inactive: generation identity mismatch")
-	}
-	owner := isolation.boundOwner()
-	if owner == nil {
-		return errors.New("prove FakeTCP real-host generation inactive: collection owner is unbound")
-	}
-	controlMap, err := owner.mapResource("control_map")
-	if err != nil {
-		return err
-	}
-	var observed abi.ControlValue
-	if err := controlMap.Lookup(abi.ControlKeyGlobal, &observed); err != nil {
-		return fmt.Errorf("prove FakeTCP real-host generation inactive: read selector: %w", err)
-	}
-	if observed != (abi.ControlValue{}) {
-		return fmt.Errorf("prove FakeTCP real-host generation inactive: selector is %#v", observed)
-	}
-	return nil
+	return isolation.barrier.AssertInactive(ctx, generation)
+}
+
+func (isolation *fakeTCPRealHostGenerationIsolation) Activate(
+	ctx context.Context,
+	generation uint64,
+) error {
+	return isolation.barrier.Activate(ctx, generation)
 }
 
 func (isolation *fakeTCPRealHostGenerationIsolation) Quiesce(
 	ctx context.Context,
 	generation uint64,
 ) error {
-	if err := isolation.AssertInactive(ctx, generation); err != nil {
-		return err
-	}
-	for _, ifindex := range isolation.ifindexes {
-		probe, err := probeLiveFakeTCPXDP(ifindex)
-		if err != nil {
-			return fmt.Errorf("quiesce FakeTCP real-host generation: probe XDP ifindex %d: %w", ifindex, err)
-		}
-		if probe.Attached || probe.ProgramID != 0 {
-			return fmt.Errorf("quiesce FakeTCP real-host generation: XDP remains on ifindex %d", ifindex)
-		}
-		for _, attach := range []ebpf.AttachType{ebpf.AttachTCXIngress, ebpf.AttachTCXEgress} {
-			programs, err := queryFakeTCPRealHostTCX(ifindex, attach)
-			if err != nil {
-				return err
-			}
-			if len(programs) != 0 {
-				return fmt.Errorf(
-					"quiesce FakeTCP real-host generation: TCX %s remains on ifindex %d",
-					attach,
-					ifindex,
-				)
-			}
-		}
-	}
-	return nil
-}
-
-func (isolation *fakeTCPRealHostGenerationIsolation) boundOwner() *experimentalCollectionOwner {
-	if isolation == nil {
-		return nil
-	}
-	isolation.mu.Lock()
-	defer isolation.mu.Unlock()
-	return isolation.owner
+	return isolation.barrier.Quiesce(ctx, generation)
 }
 
 // TestExperimentalFakeTCPRealHostLifecycleIntegration is an explicitly gated
@@ -808,10 +749,11 @@ func buildFakeTCPRealHostRuntime(
 	if err != nil {
 		t.Fatalf("acquire run-owned FakeTCP lifecycle lease: %v", err)
 	}
-	isolation := &fakeTCPRealHostGenerationIsolation{
-		generation: generation,
-		ifindexes:  []int{prepared.contract.ifindex, prepared.contract.peerIfindex},
+	barrier, err := newLiveFakeTCPGenerationBarrier(generation)
+	if err != nil {
+		t.Fatal(err)
 	}
+	isolation := &fakeTCPRealHostGenerationIsolation{barrier: barrier}
 	transaction, err := newFakeTCPPolicyGenerationTransaction(leaseCtx, policyPlan, lease, isolation)
 	if err != nil {
 		closeErr := lease.Close()
@@ -822,21 +764,12 @@ func buildFakeTCPRealHostRuntime(
 		t.Fatalf("release caller copy of FakeTCP lifecycle lease: %v", errors.Join(err, transactionErr))
 	}
 
-	dependencies := liveExperimentalCollectionAcquisitionDependencies()
-	newOwner := dependencies.newOwner
-	dependencies.newOwner = func(collection *ebpf.Collection) (*experimentalCollectionOwner, error) {
-		owner, ownerErr := newOwner(collection)
-		if owner != nil {
-			ownerErr = errors.Join(ownerErr, isolation.bind(owner))
-		}
-		return owner, ownerErr
-	}
 	slowPath := newFakeTCPRealHostSlowPath()
 	runtime, err := acquireAndBuildExperimentalFakeTCPRuntime(
 		leaseCtx,
 		prepared.experimentalSpec.Copy(),
 		prepared.contract.experimentalObject,
-		dependencies,
+		liveExperimentalCollectionAcquisitionDependencies(),
 		experimentalFakeTCPRuntimeBuildOptions{
 			transaction:      transaction,
 			baselineSnapshot: baselineSnapshot,

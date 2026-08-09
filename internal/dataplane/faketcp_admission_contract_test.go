@@ -78,7 +78,9 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 		t.Fatal("FakeTCP continuation must consume and clear its token before exact comparison or encode")
 	}
 
-	xdp := sourceSection(t, fake, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)", "#endif")
+	xdp := sourceSection(t, fake,
+		"faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)",
+		"SEC(\"xdp\")")
 	xdpCheckpoint := strings.Index(xdp, "faketcp_xdp_admission_checkpoint(")
 	if xdpCheckpoint < 0 {
 		t.Fatal("XDP admission checkpoint is missing")
