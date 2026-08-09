@@ -286,7 +286,7 @@ func TestFakeTCPRuntimeSupervisorStopTimeoutRetainsOwnership(t *testing.T) {
 	}
 }
 
-func TestFakeTCPRuntimeSupervisorCloseFailureQuarantinesOwnerUntilRetry(t *testing.T) {
+func TestFakeTCPRuntimeSupervisorKeepsSYNQuotaOwnerUntilCloseCompletes(t *testing.T) {
 	supervisor := &fakeTCPRuntimeSupervisor{}
 	runtime := newControlledFakeTCPRuntime()
 	closeErr := errors.New("injected runtime close failure")
@@ -306,17 +306,21 @@ func TestFakeTCPRuntimeSupervisorCloseFailureQuarantinesOwnerUntilRetry(t *testi
 		t.Fatal("failed Close discarded the only runtime owner")
 	}
 	replacementBuilds := 0
-	if err := supervisor.Ensure(
-		t.Context(), fakeTCPRuntimeDesiredKey{2},
-		func(context.Context) (fakeTCPRuntimeService, error) {
-			replacementBuilds++
-			return newControlledFakeTCPRuntime(), nil
-		},
-	); !errors.Is(err, closeErr) {
-		t.Fatalf("Ensure during quarantine error = %v", err)
-	}
-	if replacementBuilds != 0 || supervisor.loadCurrent() == nil {
-		t.Fatalf("replacement builds=%d current=%#v", replacementBuilds, supervisor.loadCurrent())
+	restartKeys := []fakeTCPRuntimeDesiredKey{{1}, {2}, {3}, {255}}
+	for attempt, restartKey := range restartKeys {
+		if err := supervisor.Ensure(
+			t.Context(), restartKey,
+			func(context.Context) (fakeTCPRuntimeService, error) {
+				replacementBuilds++
+				return newControlledFakeTCPRuntime(), nil
+			},
+		); !errors.Is(err, closeErr) {
+			t.Fatalf("restart attempt %d during quota-owner quarantine error = %v", attempt, err)
+		}
+		if replacementBuilds != 0 || supervisor.loadCurrent() == nil {
+			t.Fatalf("restart attempt %d built overlapping quota owner: builds=%d current=%#v",
+				attempt, replacementBuilds, supervisor.loadCurrent())
+		}
 	}
 	runtime.setCloseError(nil)
 	if err := supervisor.Stop(t.Context()); err != nil {
@@ -326,8 +330,29 @@ func TestFakeTCPRuntimeSupervisorCloseFailureQuarantinesOwnerUntilRetry(t *testi
 		t.Fatal("successful retry retained quarantine owner")
 	}
 	_, closeCalls, _ := runtime.counts()
-	if closeCalls != 3 {
-		t.Fatalf("Close calls = %d, want Stop + Ensure retry + Stop retry", closeCalls)
+	wantCloseCalls := 2 + len(restartKeys)
+	if closeCalls != wantCloseCalls {
+		t.Fatalf("Close calls = %d, want initial Stop + %d restart attempts + final Stop",
+			closeCalls, len(restartKeys))
+	}
+
+	replacement := newControlledFakeTCPRuntime()
+	if err := supervisor.Ensure(
+		t.Context(), fakeTCPRuntimeDesiredKey{2},
+		func(context.Context) (fakeTCPRuntimeService, error) {
+			replacementBuilds++
+			return replacement, nil
+		},
+	); err != nil {
+		t.Fatalf("Ensure after old quota owner closed: %v", err)
+	}
+	<-replacement.runStarted
+	if replacementBuilds != 1 || !supervisor.Healthy(fakeTCPRuntimeDesiredKey{2}) {
+		t.Fatalf("replacement quota owner builds=%d healthy=%t",
+			replacementBuilds, supervisor.Healthy(fakeTCPRuntimeDesiredKey{2}))
+	}
+	if err := supervisor.Stop(t.Context()); err != nil {
+		t.Fatalf("replacement Stop: %v", err)
 	}
 }
 

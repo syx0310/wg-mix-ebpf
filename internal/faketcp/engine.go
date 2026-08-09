@@ -233,9 +233,10 @@ type Engine struct {
 	pendingBytes          int
 	halfOpen              int
 	globalSYNs            tokenBucket
-	// admissionEpoch is local to one Engine lifetime. New engines begin with
-	// zero tokens at this epoch; recreation can only discard accumulated
-	// budget and can never mint a fresh burst.
+	// admissionEpoch is local to one Engine quota-owner lifetime. New engines
+	// begin with zero tokens at this epoch; recreation can only discard
+	// accumulated budget and can never mint a fresh burst. Production runtime
+	// supervision fences owner lifetimes so two such quotas cannot overlap.
 	admissionEpoch time.Time
 	synSources     map[synSourceKey]*synSourceState
 	synSourceLRU   *list.List

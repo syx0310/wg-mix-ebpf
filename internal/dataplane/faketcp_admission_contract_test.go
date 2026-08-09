@@ -116,7 +116,7 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 	}
 }
 
-func TestFakeTCPAdmissionProofBindsFullIdentityAndCapabilityStaysClosed(t *testing.T) {
+func TestFakeTCPSingleUsePacketAdmissionProofBindsStableLifetimeAndCapabilityStaysClosed(t *testing.T) {
 	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
 	if err != nil {
 		t.Fatal(err)
@@ -163,8 +163,8 @@ func TestFakeTCPAdmissionProofBindsFullIdentityAndCapabilityStaysClosed(t *testi
 			t.Fatalf("admission identity/observability contract missing %q", want)
 		}
 	}
-	if fakeTCPImplementedCapabilities&fakeTCPCapabilityAdmissionCheckpoint != 0 {
-		t.Fatal("AdmissionCheckpoint capability opened before unique review and required live evidence")
+	if fakeTCPImplementedCapabilities&fakeTCPCapabilitySingleUsePacketAdmissionProof != 0 {
+		t.Fatal("single-use packet admission proof capability opened before unique review and required live evidence")
 	}
 
 	tcSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
