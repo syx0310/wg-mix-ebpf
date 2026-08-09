@@ -66,7 +66,6 @@ type fakeTCPPolicyGenerationTransaction struct {
 	identity            *fakeTCPPolicyGenerationIdentity
 	stage               *fakeTCPPolicyStage
 	runtimeClaim        *fakeTCPPolicyRuntimeBuildClaim
-	activated           bool
 	closed              bool
 }
 
@@ -331,11 +330,6 @@ func (claim *fakeTCPPolicyRuntimeBuildClaim) commitRuntimeBuild(
 		transaction.mu.Unlock()
 		return false, errors.New("commit FakeTCP runtime: program-array stage is not rollback-owned")
 	}
-	if !transaction.activated {
-		transaction.mu.Unlock()
-		return false, errors.New("commit FakeTCP runtime: generation barrier is not active")
-	}
-
 	policyStage.operations = nil
 	policyStage.state = fakeTCPPolicyStageDisarmed
 	programStage.state = fakeTCPProgramArrayStageDisarmed
@@ -380,9 +374,6 @@ func (transaction *fakeTCPPolicyGenerationTransaction) closeForRuntimeClaim(
 		(transaction.stage.state == fakeTCPPolicyStageActive ||
 			transaction.stage.state == fakeTCPPolicyStageRollbackPending) {
 		return errors.New("cannot close FakeTCP generation transaction with a live policy stage")
-	}
-	if transaction.activated {
-		return errors.New("cannot close FakeTCP generation transaction with an active barrier")
 	}
 	transaction.closed = true
 	transaction.runtimeClaim = nil
@@ -493,7 +484,6 @@ func (transaction *fakeTCPPolicyGenerationTransaction) stageForRuntimeClaim(
 	return stage, nil
 }
 
-// Activate opens a complete stage while the selector is still zero.
 func (claim *fakeTCPPolicyRuntimeBuildClaim) Activate(
 	ctx context.Context,
 	stage *fakeTCPPolicyStage,
@@ -510,9 +500,6 @@ func (claim *fakeTCPPolicyRuntimeBuildClaim) Activate(
 	if stage.state != fakeTCPPolicyStageActive {
 		return errors.New("activate FakeTCP policy generation: policy stage is not rollback-owned")
 	}
-	if transaction.activated {
-		return errors.New("activate FakeTCP policy generation: barrier is already active")
-	}
 	if err := transaction.isolation.Activate(ctx, transaction.plan.generation); err != nil {
 		return fmt.Errorf(
 			"activate FakeTCP policy generation %d: %w",
@@ -520,7 +507,6 @@ func (claim *fakeTCPPolicyRuntimeBuildClaim) Activate(
 			err,
 		)
 	}
-	transaction.activated = true
 	return nil
 }
 
@@ -544,8 +530,6 @@ type fakeTCPPolicyStage struct {
 	collectionOwner *experimentalCollectionOwner
 }
 
-// Rollback seals and drains before removing interface, port, and control keys.
-// Failure leaves the same stage and isolation owner retryable.
 func (transaction *fakeTCPPolicyGenerationTransaction) Rollback(
 	ctx context.Context,
 	stage *fakeTCPPolicyStage,
@@ -585,7 +569,6 @@ func (transaction *fakeTCPPolicyGenerationTransaction) rollbackForRuntimeClaim(
 	}
 	stage.operations = nil
 	stage.state = fakeTCPPolicyStageRolledBack
-	transaction.activated = false
 	return nil
 }
 
@@ -623,9 +606,6 @@ func (transaction *fakeTCPPolicyGenerationTransaction) disarmForRuntimeClaim(
 	}
 	switch stage.state {
 	case fakeTCPPolicyStageActive:
-		if transaction.activated {
-			return errors.New("cannot disarm FakeTCP policy stage outside the combined runtime commit")
-		}
 		stage.operations = nil
 		stage.state = fakeTCPPolicyStageDisarmed
 		return nil

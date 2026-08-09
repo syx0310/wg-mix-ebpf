@@ -86,13 +86,6 @@ func (barrier *liveFakeTCPGenerationBarrier) BindCollection(
 	if err := validateLiveFakeTCPGenerationControl(gate, wake, runtimeIdentity, control); err != nil {
 		return err
 	}
-	var initial abi.FakeTCPGenerationGateValue
-	if err := gate.Lookup(uint32(0), &initial); err != nil {
-		return fmt.Errorf("bind FakeTCP generation barrier: read fresh gate: %w", err)
-	}
-	if initial != (abi.FakeTCPGenerationGateValue{}) {
-		return fmt.Errorf("bind FakeTCP generation barrier: fresh gate is %#v", initial)
-	}
 	barrier.identity, barrier.gate, barrier.wake, barrier.control = identity, gate, wake, control
 	return nil
 }

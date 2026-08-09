@@ -875,7 +875,6 @@ struct {
 	__type(value, struct faketcp_runtime_identity_value);
 } faketcp_rt_id SEC(".maps");
 
-// Fresh PinNone gate; syscall writes are forbidden.
 struct {
 	__uint(type, BPF_MAP_TYPE_ARRAY);
 	__uint(map_flags, BPF_F_RDONLY);
@@ -1139,49 +1138,6 @@ static __always_inline void faketcp_generation_exit(__u64 generation)
 }
 
 static __always_inline int
-faketcp_generation_request_valid(
-	const struct faketcp_generation_control_request *request)
-{
-	struct faketcp_runtime_identity_value *identity;
-	__u8 difference = 0;
-
-	if (request->generation == 0 || request->reserved != 0 ||
-	    request->operation < FAKETCP_GENERATION_CONTROL_ASSERT_CLOSED ||
-	    request->operation > FAKETCP_GENERATION_CONTROL_CLOSE)
-		return 0;
-	identity = faketcp_runtime_identity(request->generation);
-	if (!identity)
-		return 0;
-#pragma unroll
-	for (int i = 0; i < 16; i++)
-		difference |= request->incarnation[i] ^ identity->incarnation[i];
-	return difference == 0;
-}
-
-static __always_inline int
-faketcp_generation_assert_closed(struct faketcp_generation_gate_value *gate,
-				 __u64 generation)
-{
-	__u64 bound = gate->generation;
-	__u64 state = gate->state;
-	__u64 count = state & FAKETCP_GENERATION_INFLIGHT_MASK;
-	__u64 flags = state & ~FAKETCP_GENERATION_INFLIGHT_MASK;
-
-	if (flags & FAKETCP_GENERATION_POISON)
-		return FAKETCP_GENERATION_RESULT_POISON;
-	if (bound != 0 && bound != generation)
-		return faketcp_generation_poison(gate);
-	if (state == 0)
-		return FAKETCP_GENERATION_RESULT_IDLE;
-	if (flags == FAKETCP_GENERATION_OPEN ||
-	    (flags == FAKETCP_GENERATION_SEALED && count == 0) ||
-	    flags == (FAKETCP_GENERATION_SEALED |
-		      FAKETCP_GENERATION_WAKE_ARMED))
-		return FAKETCP_GENERATION_RESULT_MISMATCH;
-	return faketcp_generation_poison(gate);
-}
-
-static __always_inline int
 faketcp_generation_open(struct faketcp_generation_gate_value *gate,
 			__u64 generation)
 {
@@ -1266,25 +1222,52 @@ faketcp_generation_close(struct faketcp_generation_gate_value *gate,
 	return FAKETCP_GENERATION_RESULT_MISMATCH;
 }
 
-// Never attached; MapIDs binds gate, wake, and runtime identity exactly.
 SEC("classifier/faketcp_generation_control")
 int wg_faketcp_generation_control(struct __sk_buff *skb)
 {
 	struct faketcp_generation_control_request request = {};
 	struct faketcp_generation_gate_value *gate;
+	struct faketcp_runtime_identity_value *identity;
 	__u32 zero = 0;
+	__u8 difference = 0;
+	__u64 state, count, flags, bound;
 
 	if (skb->len != sizeof(request) ||
 	    bpf_skb_load_bytes(skb, 0, &request, sizeof(request)) < 0 ||
 	    bpf_ringbuf_query(&faketcp_gen_wk, BPF_RB_RING_SIZE) != 4096 ||
-	    !faketcp_generation_request_valid(&request))
+	    request.generation == 0 || request.reserved != 0 ||
+	    request.operation < FAKETCP_GENERATION_CONTROL_ASSERT_CLOSED ||
+	    request.operation > FAKETCP_GENERATION_CONTROL_CLOSE)
+		return FAKETCP_GENERATION_RESULT_MALFORMED;
+	identity = faketcp_runtime_identity(request.generation);
+	if (!identity)
+		return FAKETCP_GENERATION_RESULT_MALFORMED;
+#pragma unroll
+	for (int i = 0; i < 16; i++)
+		difference |= request.incarnation[i] ^ identity->incarnation[i];
+	if (difference != 0)
 		return FAKETCP_GENERATION_RESULT_MALFORMED;
 	gate = bpf_map_lookup_elem(&faketcp_gen_gt, &zero);
 	if (!gate)
 		return FAKETCP_GENERATION_RESULT_MALFORMED;
 	switch (request.operation) {
 	case FAKETCP_GENERATION_CONTROL_ASSERT_CLOSED:
-		return faketcp_generation_assert_closed(gate, request.generation);
+		bound = gate->generation;
+		state = gate->state;
+		count = state & FAKETCP_GENERATION_INFLIGHT_MASK;
+		flags = state & ~FAKETCP_GENERATION_INFLIGHT_MASK;
+		if (flags & FAKETCP_GENERATION_POISON)
+			return FAKETCP_GENERATION_RESULT_POISON;
+		if (bound != 0 && bound != request.generation)
+			return faketcp_generation_poison(gate);
+		if (state == 0)
+			return FAKETCP_GENERATION_RESULT_IDLE;
+		if (flags == FAKETCP_GENERATION_OPEN ||
+		    (flags == FAKETCP_GENERATION_SEALED && count == 0) ||
+		    flags == (FAKETCP_GENERATION_SEALED |
+			      FAKETCP_GENERATION_WAKE_ARMED))
+			return FAKETCP_GENERATION_RESULT_MISMATCH;
+		return faketcp_generation_poison(gate);
 	case FAKETCP_GENERATION_CONTROL_OPEN:
 		return faketcp_generation_open(gate, request.generation);
 	case FAKETCP_GENERATION_CONTROL_CLOSE:
