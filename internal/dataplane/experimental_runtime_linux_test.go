@@ -807,6 +807,23 @@ func TestExperimentalRuntimeSlowPathCloseFailureRetainsDataplaneForExactRetry(t 
 			fixture.xdpRuntime.links[9].closes,
 		)
 	}
+	for name, resource := range fixture.mapResources {
+		if resource.closes != 0 {
+			t.Fatalf("failed slow-path fence closed retained map %s %d times", name, resource.closes)
+		}
+	}
+	for name, program := range fixture.programs {
+		if program.closes != 0 {
+			t.Fatalf("failed slow-path fence closed retained program %s %d times", name, program.closes)
+		}
+	}
+	wantPolicy := mustFakeTCPPolicySnapshot(t, 91)
+	assertMemoryPolicyMapMatches(t, fixture.policyMaps.ControlPolicies, wantPolicy.ControlPolicies)
+	assertMemoryPolicyMapMatches(t, fixture.policyMaps.ManagedPorts, wantPolicy.ManagedPorts)
+	assertMemoryPolicyMapMatches(t, fixture.policyMaps.ManagedInterfaces, wantPolicy.ManagedInterfaces)
+	if fixture.sessionClaimArg != fixture.programs[fakeTCPSessionClaimProgramName] {
+		t.Fatal("runtime did not retain the exact session claim program")
+	}
 	if got := fixture.activationTrace[closeStart:]; !slices.Equal(got, []string{"slow-close"}) {
 		t.Fatalf("failed slow-path fence trace = %v", got)
 	}
@@ -1293,12 +1310,11 @@ func TestExperimentalFakeTCPRuntimeReleaseFailureBeforeCommitRollsBack(t *testin
 
 func TestExperimentalBuildCleanupRetainsDataplaneUntilSlowPathRetry(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
 	releaseErr := errors.New("injected pre-commit release failure")
 	slowCloseErr := errors.New("injected failed-build slow-path close failure")
 	fixture.slowPath.closeErr = slowCloseErr
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	options.commitGeneration = func(
 		_ *faketcp.Engine,
 		claim faketcp.LinuxFreshCollectionClaim,
@@ -1853,9 +1869,8 @@ func TestExperimentalFakeTCPRuntimeRejectsXDPBackendModeMismatchBeforeMutation(
 	t *testing.T,
 ) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	for index := range options.xdpRequests {
 		options.xdpRequests[index].Mode = fakeTCPXDPAttachLibXDP
 	}
@@ -1877,9 +1892,8 @@ func TestExperimentalFakeTCPRuntimeRefusesDirectAllHooksRequirementBeforeMutatio
 	t *testing.T,
 ) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	options.xdpRequirement = fakeTCPXDPRequireAllHooksExclusive
 	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
 	if runtime != nil || err == nil || !strings.Contains(err.Error(), "all-hooks exclusive activation") {

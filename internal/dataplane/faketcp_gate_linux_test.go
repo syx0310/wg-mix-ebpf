@@ -70,6 +70,13 @@ func TestFakeTCPActivationCannotBeEnabledWithoutEveryAcceptanceCapability(t *tes
 	}
 }
 
+func TestFakeTCPImplementedCapabilityMaskRemainsEvidenceBound(t *testing.T) {
+	const want fakeTCPCapability = 0x2d
+	if got := fakeTCPImplementedCapabilities; got != want {
+		t.Fatalf("implemented capability mask=%#x, want %#x", got, want)
+	}
+}
+
 func TestFakeTCPKernelGateDoesNotBlockExistingTransports(t *testing.T) {
 	err := preflightFakeTCPKernelRequirements(&control.State{
 		WireGuards: []control.WireGuardState{{Name: "wg0", TransportMode: "udp"}},

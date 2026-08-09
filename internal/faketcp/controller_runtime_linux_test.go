@@ -12,6 +12,9 @@ import (
 
 func TestLinuxControllerStatsKernelNameIsExactTruncationContract(t *testing.T) {
 	const elfResourceName = "faketcp_stats_map"
+	if fakeTCPStatsCount != 19 {
+		t.Fatalf("controller stats entries=%d, want final BPF ABI size 19", fakeTCPStatsCount)
+	}
 	want := elfResourceName[:unix.BPF_OBJ_NAME_LEN-1]
 	if fakeTCPStatsKernelMapName != want || fakeTCPStatsKernelMapName == elfResourceName {
 		t.Fatalf(

@@ -141,9 +141,48 @@ func TestFixedControlMarksFailClosedOutsideFrozenGeneration(t *testing.T) {
 	}
 }
 
-func TestControllerRuntimeModelDropsProtocolReorderingAndReinjectsDuplicateCaptureOnce(t *testing.T) {
-	engine, _ := testEngine(t, nil)
+func TestControllerRuntimeModelCombinesV2CloseOrderingAndOnceOnlyReinjection(t *testing.T) {
+	store := newFakeSessionStore()
+	engine, _ := testEngine(t, func(options *Options) { options.Store = store })
 	identity := engine.Identity()
+	closeFlow := testFlow(31002)
+	if _, err := engine.outbound(
+		closeFlow,
+		PendingPacket{Data: []byte{9}, WGID: 77},
+		false,
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.InboundWithWGID(
+		closeFlow,
+		Segment{Flags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001},
+		77,
+	); err != nil {
+		t.Fatal(err)
+	}
+	closeState, found := store.values[closeFlow]
+	if !found {
+		t.Fatal("close integration fixture did not establish a session")
+	}
+	closeEvent, closePacket := capturedCloseEvent(
+		engine,
+		closeFlow,
+		closeState,
+		FlagRST|FlagACK,
+		77,
+	)
+	closeSample := testBoundEventSample(closeEvent, closePacket, false)
+	decodedClose, err := DecodeEventSample(closeSample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(closeSample) != abi.FakeTCPEventSize+len(closePacket) ||
+		decodedClose.Event.EventABIVersion != 2 ||
+		decodedClose.Event.SessionID != closeState.SessionID ||
+		decodedClose.Event.SessionRevision != closeState.Revision {
+		t.Fatalf("v2 close decode=%#v sample-size=%d", decodedClose.Event, len(closeSample))
+	}
+
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1, 2, 3})
 	packetEvent := abi.FakeTCPEvent{
@@ -160,7 +199,7 @@ func TestControllerRuntimeModelDropsProtocolReorderingAndReinjectsDuplicateCaptu
 	bindTestEvent(&outOfOrderACK, identity, 0)
 	synACK := abi.FakeTCPEvent{
 		Key: flow, WGID: 77, Type: abi.FakeTCPEventSYNACK,
-		TCPFlags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001,
+		TCPFlags: FlagSYN | FlagACK, Sequence: 10000, Acknowledgement: 2001,
 	}
 	bindTestEvent(&synACK, identity, 0)
 	source := &fakeEventReader{records: []EventRecord{
@@ -168,6 +207,7 @@ func TestControllerRuntimeModelDropsProtocolReorderingAndReinjectsDuplicateCaptu
 		{RawSample: testBoundEventSample(outOfOrderACK, nil, false)},
 		{RawSample: packetSample},
 		{RawSample: testBoundEventSample(synACK, nil, false)},
+		{RawSample: closeSample},
 		{LostSamples: 1},
 	}}
 	ordered, err := newProductionEventReader(
@@ -219,6 +259,13 @@ func TestControllerRuntimeModelDropsProtocolReorderingAndReinjectsDuplicateCaptu
 	}
 	if tcpWrites != 2 || udpWrites != 1 {
 		t.Fatalf("raw writes TCP=%d UDP=%d total=%d", tcpWrites, udpWrites, len(writes))
+	}
+	if _, found := store.values[closeFlow]; found || store.deleteAttempts != 1 {
+		t.Fatalf(
+			"v2 close retained session=%t compare-delete attempts=%d",
+			found,
+			store.deleteAttempts,
+		)
 	}
 	if err := runtime.Close(); err != nil {
 		t.Fatal(err)
