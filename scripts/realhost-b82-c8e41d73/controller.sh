@@ -407,8 +407,7 @@ verify_manifest_contract() {
     "${PHYSICAL_NIC_FORWARD_AUTHORITY}" == 'realnic-acceptance-v1' &&
     "${PHYSICAL_INTERFACE_LOCK}" == '/run/wg-mix-ebpf-realnic-physical-interface.v1.lock' &&
     "${LEGACY_MATRIX_MODE}" == 'restore-only' &&
-    "${REALNIC_PROFILE}" == 'acceptance' && "${REALNIC_TRAFFIC_SECONDS}" == '30' &&
-    "${TARGET_INTERFACE}" == 'ens33' && "${SESSION_SECONDS}" == '300' ]] || return 65
+    "${REALNIC_PROFILE}" == 'acceptance' && "${REALNIC_TRAFFIC_SECONDS}" == '30' ]] || return 65
   valid_commit "${INTEGRATION_COMMIT}" || return 65
   case "${WG_STATE}" in
     bound)

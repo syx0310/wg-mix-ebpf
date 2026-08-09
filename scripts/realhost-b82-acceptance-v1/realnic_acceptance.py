@@ -2169,31 +2169,14 @@ def execute_with_physical_authority(
         if mode not in {"run", "restore"} or approved_plan is None or approved_sha256 is None:
             raise HarnessError("physical authority mode arguments are incomplete")
         plan, plan_payload = read_approved_plan(approved_plan, approved_sha256, spec)
-        lease_contract = plan["interface_lease"]
-        with InterfaceLease(
-            lease_contract["path"],
-            spec.run_id,
+        return execute_validated_plan(
+            mode,
+            spec,
             approved_sha256,
-            lease_contract["identity"],
-        ) as lease:
-            if mode == "run":
-                lease.require_available_for_run()
-                return run_with_interface_lease(
-                    spec,
-                    approved_sha256,
-                    runner,
-                    plan,
-                    plan_payload,
-                    lease,
-                )
-            return restore_with_interface_lease(
-                spec,
-                approved_sha256,
-                runner,
-                plan,
-                plan_payload,
-                lease,
-            )
+            runner,
+            plan,
+            plan_payload,
+        )
 
 
 def plan_mode(spec: CoreSpec, runner: CommandRunner) -> int:
@@ -2268,6 +2251,43 @@ def read_approved_plan(path_value: str, expected_sha256: str, spec: CoreSpec) ->
     return plan, payload
 
 
+def execute_validated_plan(
+    mode: str,
+    spec: CoreSpec,
+    approved_sha256: str,
+    runner: CommandRunner,
+    plan: Mapping[str, Any],
+    plan_payload: bytes,
+) -> int:
+    if mode not in {"run", "restore"}:
+        raise HarnessError("validated plan execution mode is invalid")
+    lease_contract = plan["interface_lease"]
+    with InterfaceLease(
+        lease_contract["path"],
+        spec.run_id,
+        approved_sha256,
+        lease_contract["identity"],
+    ) as lease:
+        if mode == "run":
+            lease.require_available_for_run()
+            return run_with_interface_lease(
+                spec,
+                approved_sha256,
+                runner,
+                plan,
+                plan_payload,
+                lease,
+            )
+        return restore_with_interface_lease(
+            spec,
+            approved_sha256,
+            runner,
+            plan,
+            plan_payload,
+            lease,
+        )
+
+
 def controller_spec_from_plan(plan: Mapping[str, Any], source_commit: str) -> CoreSpec:
     raw_spec = plan.get("spec")
     names = {field.name for field in dataclasses.fields(CoreSpec)}
@@ -2328,31 +2348,14 @@ def controller_approved_mode(
             approved_sha256,
             source_commit,
         )
-        lease_contract = plan["interface_lease"]
-        with InterfaceLease(
-            lease_contract["path"],
-            spec.run_id,
+        return execute_validated_plan(
+            mode,
+            spec,
             approved_sha256,
-            lease_contract["identity"],
-        ) as lease:
-            if mode == "run":
-                lease.require_available_for_run()
-                return run_with_interface_lease(
-                    spec,
-                    approved_sha256,
-                    runner,
-                    plan,
-                    plan_payload,
-                    lease,
-                )
-            return restore_with_interface_lease(
-                spec,
-                approved_sha256,
-                runner,
-                plan,
-                plan_payload,
-                lease,
-            )
+            runner,
+            plan,
+            plan_payload,
+        )
 
 
 def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
