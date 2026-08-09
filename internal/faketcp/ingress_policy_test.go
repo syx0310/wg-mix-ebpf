@@ -90,11 +90,16 @@ func TestClassifyManagedIngressL3FailClosedMatrix(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if got := ClassifyManagedIngressL3(test.packet, test.policy); got != test.want {
+			if got := classifyManagedIngressL3ForTest(test.packet, test.policy); got != test.want {
 				t.Fatalf("disposition = %d, want %d", got, test.want)
 			}
 		})
 	}
+}
+
+func classifyManagedIngressL3ForTest(packet []byte, policy ManagedIngressPolicy) IngressDisposition {
+	info, status := ParseL3(packet)
+	return managedFakeTCPDisposition(packet, info, status, policy)
 }
 
 func TestManagedFakeTCPTransformStatusNarrowsGenericParser(t *testing.T) {
