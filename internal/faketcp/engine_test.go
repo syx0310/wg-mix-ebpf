@@ -61,14 +61,18 @@ type fakeSessionStore struct {
 	beforeDelete   func(abi.FakeTCPSessionKey)
 }
 
-// modelClaimSessionStore models the production ESTABLISHED -> DELETE_CLAIMED
-// protocol closely enough to exercise Engine recovery rather than a deleter
-// in isolation. A tombstone remains comparable only to the complete expected
-// value which created it.
+// modelClaimSessionStore embeds the production LinuxSessionStore. Only its
+// kernel compare-claim primitive is modeled, so these tests exercise the real
+// Engine/store integration rather than calling a deleter in isolation.
 type modelClaimSessionStore struct {
-	values         map[abi.FakeTCPSessionKey]abi.FakeTCPSessionValue
+	*LinuxSessionStore
+	backend *memorySessionMap
+	deleter *modelClaimCompareDeleter
+}
+
+type modelClaimCompareDeleter struct {
+	backend        *memorySessionMap
 	deleteFailures []modelClaimDeleteFailure
-	lookups        int
 	deleteAttempts int
 }
 
@@ -77,38 +81,41 @@ type modelClaimDeleteFailure struct {
 	deleteBeforeError bool
 }
 
-func newModelClaimSessionStore(failures ...modelClaimDeleteFailure) *modelClaimSessionStore {
-	return &modelClaimSessionStore{
-		values:         make(map[abi.FakeTCPSessionKey]abi.FakeTCPSessionValue),
+func newModelClaimSessionStore(
+	t *testing.T,
+	failures ...modelClaimDeleteFailure,
+) *modelClaimSessionStore {
+	t.Helper()
+	backend := newMemorySessionMap()
+	deleter := &modelClaimCompareDeleter{
+		backend:        backend,
 		deleteFailures: append([]modelClaimDeleteFailure(nil), failures...),
 	}
-}
-
-func (s *modelClaimSessionStore) InsertEstablished(
-	key abi.FakeTCPSessionKey,
-	value abi.FakeTCPSessionValue,
-) error {
-	if _, exists := s.values[key]; exists {
-		return errors.New("model claim store rejected overwrite")
+	store, err := newLinuxSessionStoreWithAtomicCompareDelete(
+		backend, 1, backend.identity, deleter,
+	)
+	if err != nil {
+		t.Fatal(err)
 	}
-	s.values[key] = value
-	return nil
+	return &modelClaimSessionStore{
+		LinuxSessionStore: store,
+		backend:           backend,
+		deleter:           deleter,
+	}
 }
 
-func (s *modelClaimSessionStore) LookupEstablished(
-	key abi.FakeTCPSessionKey,
-) (abi.FakeTCPSessionValue, bool, error) {
-	s.lookups++
-	value, found := s.values[key]
-	return value, found, nil
-}
-
-func (s *modelClaimSessionStore) DeleteEstablishedIfUnchanged(
+func (deleter *modelClaimCompareDeleter) CompareDeleteEstablished(
+	identity SessionMapIdentity,
 	key abi.FakeTCPSessionKey,
 	expected abi.FakeTCPSessionValue,
 ) (SessionDeleteResult, error) {
-	s.deleteAttempts++
-	actual, found := s.values[key]
+	deleter.backend.mu.Lock()
+	defer deleter.backend.mu.Unlock()
+	deleter.deleteAttempts++
+	if identity != deleter.backend.identity {
+		return SessionDeleteDifferent, ErrSessionMapIdentityChanged
+	}
+	actual, found := deleter.backend.values[key]
 	if !found {
 		return SessionDeleteAbsent, nil
 	}
@@ -121,17 +128,36 @@ func (s *modelClaimSessionStore) DeleteEstablishedIfUnchanged(
 		return SessionDeleteDifferent, nil
 	}
 	actual.State = abi.FakeTCPStateDeleteClaimed
-	s.values[key] = actual
-	if len(s.deleteFailures) != 0 {
-		failure := s.deleteFailures[0]
-		s.deleteFailures = s.deleteFailures[1:]
+	deleter.backend.values[key] = actual
+	if len(deleter.deleteFailures) != 0 {
+		failure := deleter.deleteFailures[0]
+		deleter.deleteFailures = deleter.deleteFailures[1:]
 		if failure.deleteBeforeError {
-			delete(s.values, key)
+			delete(deleter.backend.values, key)
 		}
 		return SessionDeleteDifferent, failure.err
 	}
-	delete(s.values, key)
+	delete(deleter.backend.values, key)
 	return SessionDeleteRemoved, nil
+}
+
+func (s *modelClaimSessionStore) value(
+	key abi.FakeTCPSessionKey,
+) (abi.FakeTCPSessionValue, bool) {
+	return s.backend.value(key)
+}
+
+func (s *modelClaimSessionStore) put(
+	key abi.FakeTCPSessionKey,
+	value abi.FakeTCPSessionValue,
+) {
+	s.backend.putFromBPF(key, value)
+}
+
+func (s *modelClaimSessionStore) counts() (int, int) {
+	s.backend.mu.Lock()
+	defer s.backend.mu.Unlock()
+	return s.backend.lookupCalls, s.deleter.deleteAttempts
 }
 
 func newFakeSessionStore() *fakeSessionStore {
@@ -228,7 +254,7 @@ func establishedModelClaimTestEngine(
 	}); err != nil {
 		t.Fatal(err)
 	}
-	expected, found := store.values[flow]
+	expected, found := store.value(flow)
 	if !found {
 		t.Fatal("model claim store did not receive established session")
 	}
@@ -238,7 +264,7 @@ func establishedModelClaimTestEngine(
 func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 	t.Run("claim then delete failure retries on Tick", func(t *testing.T) {
 		failure := errors.New("exact delete failed after claim")
-		store := newModelClaimSessionStore(modelClaimDeleteFailure{err: failure})
+		store := newModelClaimSessionStore(t, modelClaimDeleteFailure{err: failure})
 		engine, clock, flow, expected := establishedModelClaimTestEngine(t, store)
 		clock.Add(engine.opts.IdleTimeout)
 
@@ -246,26 +272,27 @@ func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 		if !errors.Is(err, failure) || len(actions) != 1 || actions[0].Reason != "session-store-unavailable" {
 			t.Fatalf("first Tick actions=%#v err=%v", actions, err)
 		}
-		claimed := store.values[flow]
+		claimed, _ := store.value(flow)
 		if claimed.State != abi.FakeTCPStateDeleteClaimed ||
 			engine.sessions[flow].pendingDelete == nil ||
 			engine.sessions[flow].pendingDelete.expected != expected {
 			t.Fatalf("claim recovery state=%#v pending=%#v", claimed, engine.sessions[flow].pendingDelete)
 		}
-		lookupsAfterClaim := store.lookups
+		lookupsAfterClaim, _ := store.counts()
 
 		actions, err = engine.Tick()
 		if err != nil || len(actions) != 1 || actions[0].Kind != ActionClose || actions[0].Reason != "idle-timeout" {
 			t.Fatalf("retry Tick actions=%#v err=%v", actions, err)
 		}
-		if store.lookups != lookupsAfterClaim || engine.sessions[flow] != nil {
-			t.Fatalf("retry performed ordinary lookup=%d/%d or kept slow state", store.lookups, lookupsAfterClaim)
+		lookups, _ := store.counts()
+		if lookups != lookupsAfterClaim || engine.sessions[flow] != nil {
+			t.Fatalf("retry performed ordinary lookup=%d/%d or kept slow state", lookups, lookupsAfterClaim)
 		}
 	})
 
 	t.Run("uncertain error after delete resolves absent", func(t *testing.T) {
 		failure := errors.New("delete completed but completion was uncertain")
-		store := newModelClaimSessionStore(modelClaimDeleteFailure{
+		store := newModelClaimSessionStore(t, modelClaimDeleteFailure{
 			err: failure, deleteBeforeError: true,
 		})
 		engine, clock, flow, expected := establishedModelClaimTestEngine(t, store)
@@ -274,22 +301,23 @@ func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 		if actions, err := engine.Tick(); !errors.Is(err, failure) || len(actions) != 1 || actions[0].Reason != "session-store-unavailable" {
 			t.Fatalf("uncertain Tick actions=%#v err=%v", actions, err)
 		}
-		if _, found := store.values[flow]; found || engine.sessions[flow].pendingDelete.expected != expected {
+		if _, found := store.value(flow); found || engine.sessions[flow].pendingDelete.expected != expected {
 			t.Fatalf("uncertain delete found=%t pending=%#v", found, engine.sessions[flow].pendingDelete)
 		}
-		lookupsAfterDelete := store.lookups
+		lookupsAfterDelete, _ := store.counts()
 		actions, err := engine.Tick()
 		if err != nil || len(actions) != 1 || actions[0].Kind != ActionClose || actions[0].Reason != "idle-timeout" {
 			t.Fatalf("absent retry actions=%#v err=%v", actions, err)
 		}
-		if store.lookups != lookupsAfterDelete || engine.sessions[flow] != nil {
-			t.Fatalf("absent retry performed lookup=%d/%d or kept slow state", store.lookups, lookupsAfterDelete)
+		lookups, _ := store.counts()
+		if lookups != lookupsAfterDelete || engine.sessions[flow] != nil {
+			t.Fatalf("absent retry performed lookup=%d/%d or kept slow state", lookups, lookupsAfterDelete)
 		}
 	})
 
 	t.Run("persistent failure retains one immutable request", func(t *testing.T) {
 		failure := errors.New("persistent exact delete failure")
-		store := newModelClaimSessionStore(
+		store := newModelClaimSessionStore(t,
 			modelClaimDeleteFailure{err: failure},
 			modelClaimDeleteFailure{err: failure},
 			modelClaimDeleteFailure{err: failure},
@@ -306,18 +334,19 @@ func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 			if pending == nil || pending.expected != expected || pending.reason != "idle-timeout" {
 				t.Fatalf("attempt %d pending=%#v", attempt, pending)
 			}
-			if got := store.values[flow]; got.State != abi.FakeTCPStateDeleteClaimed {
+			if got, _ := store.value(flow); got.State != abi.FakeTCPStateDeleteClaimed {
 				t.Fatalf("attempt %d lost tombstone: %#v", attempt, got)
 			}
 		}
-		if store.lookups != 1 || store.deleteAttempts != 3 {
-			t.Fatalf("persistent failure lookups=%d deletes=%d", store.lookups, store.deleteAttempts)
+		lookups, deletes := store.counts()
+		if lookups != 1 || deletes != 3 {
+			t.Fatalf("persistent failure lookups=%d deletes=%d", lookups, deletes)
 		}
 	})
 
 	t.Run("different ABA value is preserved and authority is dropped", func(t *testing.T) {
 		failure := errors.New("claim completed before delete failure")
-		store := newModelClaimSessionStore(modelClaimDeleteFailure{err: failure})
+		store := newModelClaimSessionStore(t, modelClaimDeleteFailure{err: failure})
 		engine, clock, flow, expected := establishedModelClaimTestEngine(t, store)
 		clock.Add(engine.opts.IdleTimeout)
 		if _, err := engine.Tick(); !errors.Is(err, failure) {
@@ -327,22 +356,24 @@ func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 		replacement := expected
 		replacement.SessionID++
 		replacement.Revision++
-		store.values[flow] = replacement
-		lookupsAfterClaim := store.lookups
+		store.put(flow, replacement)
+		lookupsAfterClaim, _ := store.counts()
 		actions, err := engine.Tick()
 		if err != nil || len(actions) != 1 || actions[0].Reason != "fast-session-raced" {
 			t.Fatalf("different retry actions=%#v err=%v", actions, err)
 		}
-		if store.values[flow] != replacement || engine.sessions[flow] == nil ||
-			engine.sessions[flow].pendingDelete != nil || store.lookups != lookupsAfterClaim {
+		actual, _ := store.value(flow)
+		lookups, _ := store.counts()
+		if actual != replacement || engine.sessions[flow] == nil ||
+			engine.sessions[flow].pendingDelete != nil || lookups != lookupsAfterClaim {
 			t.Fatalf("different retry value=%#v session=%#v lookups=%d/%d",
-				store.values[flow], engine.sessions[flow], store.lookups, lookupsAfterClaim)
+				actual, engine.sessions[flow], lookups, lookupsAfterClaim)
 		}
 	})
 
 	t.Run("same-flow Inbound retries peer close before lookup", func(t *testing.T) {
 		failure := errors.New("peer-close delete failed after claim")
-		store := newModelClaimSessionStore(modelClaimDeleteFailure{err: failure})
+		store := newModelClaimSessionStore(t, modelClaimDeleteFailure{err: failure})
 		engine, _, flow, expected := establishedModelClaimTestEngine(t, store)
 		packet := buildIPv4TCPControl(flow, expected, FlagRST|FlagACK, 0)
 		validated, err := ValidateIPv4TCPControl(packet, flow, expected)
@@ -354,13 +385,14 @@ func TestEnginePendingDeleteRecoveryPrecedesEstablishedLookup(t *testing.T) {
 		if !errors.Is(err, failure) || len(actions) != 1 || actions[0].Reason != "session-store-unavailable" {
 			t.Fatalf("first Inbound actions=%#v err=%v", actions, err)
 		}
-		lookupsAfterClaim := store.lookups
+		lookupsAfterClaim, _ := store.counts()
 		actions, err = engine.Inbound(flow, Segment{Flags: FlagACK})
 		if err != nil || len(actions) != 1 || actions[0].Kind != ActionClose || actions[0].Reason != "peer-close" {
 			t.Fatalf("retry Inbound actions=%#v err=%v", actions, err)
 		}
-		if store.lookups != lookupsAfterClaim || engine.sessions[flow] != nil {
-			t.Fatalf("Inbound retry performed lookup=%d/%d or kept slow state", store.lookups, lookupsAfterClaim)
+		lookups, _ := store.counts()
+		if lookups != lookupsAfterClaim || engine.sessions[flow] != nil {
+			t.Fatalf("Inbound retry performed lookup=%d/%d or kept slow state", lookups, lookupsAfterClaim)
 		}
 	})
 }
