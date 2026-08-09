@@ -1141,10 +1141,49 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 	}
 	checkpoint := text[checkpointStart:xdpStart]
 	xdp := text[xdpStart:]
-	closeDrop := strings.Index(checkpoint, "if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN))")
-	firstEvent := strings.Index(xdp, "faketcp_emit_event")
-	if closeDrop < 0 || firstEvent < 0 {
-		t.Fatal("RST/FIN can reach the ring before the unavailable BPF checksum/window validator")
+	snapshot := strings.Index(checkpoint, "faketcp_session_snapshot_established(")
+	closeDecision := strings.Index(checkpoint, "return FAKETCP_ADMISSION_CLOSE")
+	fixedIPv4Gate := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")
+	checkpointCall := strings.Index(xdp, "admission_decision = faketcp_xdp_admission_checkpoint(")
+	closePath := strings.Index(xdp, "if (admission_decision == FAKETCP_ADMISSION_CLOSE)")
+	canonical := strings.Index(xdp, "flags != (FAKETCP_FLAG_RST | FAKETCP_FLAG_ACK)")
+	sequence := strings.Index(xdp, "seq != admission.decision.close.rx_sequence")
+	window := strings.Index(xdp, "bpf_ntohs(tcp->window) != admission.session_projection.window")
+	checksum := strings.Index(xdp, "faketcp_close_checksums_valid(iph, tcp)")
+	capture := strings.Index(xdp, "faketcp_capture_close_packet(")
+	if snapshot < 0 || closeDecision < 0 || fixedIPv4Gate < 0 || checkpointCall < 0 ||
+		closePath < 0 || canonical < 0 || sequence < 0 || window < 0 || checksum < 0 || capture < 0 ||
+		snapshot >= closeDecision || fixedIPv4Gate >= checkpointCall || checkpointCall >= closePath ||
+		closePath >= canonical || canonical >= sequence || sequence >= window ||
+		window >= checksum || checksum >= capture {
+		t.Fatal("single admission CLOSE decision and exact packet authority checks are missing or out of order")
+	}
+	for _, want := range []string{
+		"close_control = flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)",
+		"if (!close_control && policy_listener->cipher_id != 0)",
+		"return close_control ? FAKETCP_ADMISSION_DROP :",
+		"admission->decision.close.session_revision = session_snapshot.revision",
+		"admission->decision.close.tx_sequence = session_snapshot.tx_sequence",
+		"admission->decision.close.rx_sequence = session_snapshot.rx_sequence",
+	} {
+		if !strings.Contains(checkpoint, want) {
+			t.Fatalf("single CLOSE checkpoint is missing %q", want)
+		}
+	}
+	keepalivePath := strings.Index(xdp, "if (admission_decision == FAKETCP_ADMISSION_KEEPALIVE)")
+	if keepalivePath < 0 || closePath >= keepalivePath {
+		t.Fatal("CLOSE decision does not terminate before ordinary admission decisions")
+	}
+	closeBlock := xdp[closePath:keepalivePath]
+	for _, forbidden := range []string{"faketcp_emit_event", "faketcp_session_mutate", "xor_", "FAKETCP_ADMISSION_TRANSFORM"} {
+		if strings.Contains(closeBlock, forbidden) {
+			t.Fatalf("CLOSE decision leaked into ordinary control/transform path through %q", forbidden)
+		}
+	}
+	if strings.Contains(checkpoint, "close topic") ||
+		strings.Contains(text, "faketcp_session_snapshot_close") ||
+		strings.Contains(text, "struct faketcp_close_snapshot") {
+		t.Fatal("validated close regained a parallel snapshot or pre-admission fallback")
 	}
 	if strings.Contains(xdp, "old_tcp.check == 0") {
 		t.Fatal("TCP checksum field zero is not independently invalid")
@@ -1170,7 +1209,7 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 		}
 	}
 	captureHelper := text[captureStart:xdpStart]
-	admit := strings.Index(captureHelper, "faketcp_admit_control_event(key, wg_id, event_type, now)")
+	admit := strings.Index(captureHelper, "faketcp_admit_control_event(&admission->key, admission->wg_id")
 	write := strings.Index(captureHelper, "record->event = (struct faketcp_event)")
 	identity := strings.Index(captureHelper, "record->event.runtime_incarnation[i]")
 	copyPacket := strings.Index(captureHelper, "bpf_xdp_load_bytes")
@@ -1180,10 +1219,10 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 		t.Fatal("validated close admission must dominate event writes, identity binding, packet copy, and shared output")
 	}
 	for _, want := range []string{
-		".session_revision = snapshot->revision",
-		".session_id = snapshot->session_id",
-		".sequence = snapshot->rx_sequence",
-		".acknowledgement = snapshot->tx_sequence",
+		".session_revision = admission->decision.close.session_revision",
+		".session_id = admission->session_authority.session_id",
+		".sequence = admission->decision.close.rx_sequence",
+		".acknowledgement = admission->decision.close.tx_sequence",
 		".event_abi_version = FAKETCP_EVENT_ABI_VERSION",
 	} {
 		if !strings.Contains(captureHelper, want) {
@@ -1194,24 +1233,49 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 		t.Fatal("close event must use the incarnation from its locked session snapshot")
 	}
 
-	snapshotStart := strings.Index(text, "static __always_inline int faketcp_session_snapshot_close(")
-	mutationStart := strings.Index(text, "static __always_inline int faketcp_session_mutate(")
-	if snapshotStart < 0 || mutationStart < 0 || snapshotStart >= mutationStart {
-		t.Fatal("locked close snapshot helper is missing or misplaced")
+	copyStart := strings.Index(text, "static __always_inline void faketcp_session_snapshot_locked(")
+	matchLockedStart := strings.Index(text, "static __always_inline int faketcp_session_authority_matches_locked(")
+	readerStart := strings.Index(text, "static __always_inline int faketcp_session_snapshot_established(")
+	authorityStart := strings.Index(text, "static __always_inline int faketcp_session_authority_matches(")
+	if copyStart < 0 || matchLockedStart < 0 || readerStart < 0 || authorityStart < 0 ||
+		!(copyStart < matchLockedStart && matchLockedStart < readerStart && readerStart < authorityStart) {
+		t.Fatal("unified locked session snapshot helpers are missing or misplaced")
 	}
-	snapshot := text[snapshotStart:mutationStart]
-	lock := strings.Index(snapshot, "bpf_spin_lock(&session->lock)")
-	validate := strings.Index(snapshot, "faketcp_session_metadata_valid_locked(session, generation)")
-	proof := strings.Index(snapshot, "snapshot->revision = session->revision")
-	incarnation := strings.Index(snapshot, "snapshot->runtime_incarnation[i]")
-	unlock := strings.Index(snapshot, "bpf_spin_unlock(&session->lock)")
-	if lock < 0 || validate < 0 || proof < 0 || incarnation < 0 || unlock < 0 ||
-		!(lock < validate && validate < proof && proof < incarnation && incarnation < unlock) {
-		t.Fatal("close authority is not copied from one validated locked snapshot")
+	copyHelper := text[copyStart:matchLockedStart]
+	for _, want := range []string{
+		"snapshot->revision = session->revision",
+		"snapshot->authority.session_id = session->session_id",
+		"snapshot->tx_sequence = session->tx_sequence",
+		"snapshot->rx_sequence = session->rx_sequence",
+	} {
+		if !strings.Contains(copyHelper, want) {
+			t.Fatalf("unified session snapshot is missing close authority %q", want)
+		}
+	}
+	reader := text[readerStart:authorityStart]
+	lock := strings.Index(reader, "bpf_spin_lock(&session->lock)")
+	validate := strings.Index(reader, "faketcp_session_metadata_valid_locked(session, generation)")
+	copyProof := strings.Index(reader, "faketcp_session_snapshot_locked(session, snapshot)")
+	unlock := strings.Index(reader, "bpf_spin_unlock(&session->lock)")
+	if lock < 0 || validate < 0 || copyProof < 0 || unlock < 0 ||
+		!(lock < validate && validate < copyProof && copyProof < unlock) {
+		t.Fatal("close authority is not copied from the admission checkpoint's one locked snapshot")
 	}
 	for _, forbidden := range []string{"bpf_ktime_get_ns", "bpf_xdp_", "bpf_csum_diff", "inc_faketcp_stat"} {
-		if strings.Contains(snapshot[lock:unlock], forbidden) {
+		if strings.Contains(reader[lock:unlock], forbidden) {
 			t.Fatalf("close snapshot critical section contains helper/stat call %q", forbidden)
 		}
+	}
+	for _, want := range []string{
+		"sizeof(struct faketcp_session_snapshot) == 56",
+		"sizeof(union faketcp_ingress_decision_projection) == 16",
+		"sizeof(struct faketcp_ingress_admission) == 136",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("close/admission stack contract missing %q", want)
+		}
+	}
+	if fakeTCPImplementedCapabilities&fakeTCPCapabilityValidatedCloseControl != 0 {
+		t.Fatal("ValidatedCloseControl capability opened before Linux verifier and live evidence")
 	}
 }

@@ -172,8 +172,10 @@ type fakeTCPAdmissionSessionProof struct {
 }
 
 type fakeTCPAdmissionLockedSnapshot struct {
-	proof    fakeTCPAdmissionSessionProof
-	revision uint64
+	proof      fakeTCPAdmissionSessionProof
+	revision   uint64
+	txSequence uint32
+	rxSequence uint32
 }
 
 type fakeTCPAdmissionSessionValue struct {
@@ -236,8 +238,19 @@ func (store *fakeTCPAdmissionSessionStore) snapshot() (fakeTCPAdmissionLockedSna
 			key: store.key, lifetime: store.value.lifetime,
 			projection: store.value.projection,
 		},
-		revision: store.value.revision,
+		revision:   store.value.revision,
+		txSequence: store.value.txSequence,
+		rxSequence: store.value.rxSequence,
 	}, true
+}
+
+func (store *fakeTCPAdmissionSessionStore) closeMatches(snapshot fakeTCPAdmissionLockedSnapshot) bool {
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	return store.matchesLocked(snapshot.proof) &&
+		store.value.revision == snapshot.revision &&
+		store.value.txSequence == snapshot.txSequence &&
+		store.value.rxSequence == snapshot.rxSequence
 }
 
 func (store *fakeTCPAdmissionSessionStore) matchesLocked(proof fakeTCPAdmissionSessionProof) bool {
@@ -322,6 +335,23 @@ func TestFakeTCPIngressProofSurvivesXDPRevisionMutation(t *testing.T) {
 	}
 	if store.value.revision == snapshot.revision || !store.matches(snapshot.proof) {
 		t.Fatal("TC rejected the same lifetime solely because XDP advanced revision")
+	}
+}
+
+func TestFakeTCPCloseProjectionRejectsMutableSnapshotReplay(t *testing.T) {
+	store := validFakeTCPAdmissionSessionStore()
+	snapshot, ok := store.snapshot()
+	if !ok || !store.closeMatches(snapshot) {
+		t.Fatal("fresh close snapshot was not authoritative")
+	}
+	if !store.mutateRX(snapshot.proof, snapshot.rxSequence+64) {
+		t.Fatal("same-lifetime RX mutation failed")
+	}
+	if !store.matches(snapshot.proof) {
+		t.Fatal("ordinary proof incorrectly used mutable close authority")
+	}
+	if store.closeMatches(snapshot) {
+		t.Fatal("stale close revision/sequence projection replayed")
 	}
 }
 
