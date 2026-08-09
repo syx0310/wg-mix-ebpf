@@ -286,7 +286,8 @@ load_manifest() {
     exec 3<&-
     return "${rc}"
   }
-  read_manifest_field format FORMAT &&
+  if ! {
+    read_manifest_field format FORMAT &&
     read_manifest_field run_id MANIFEST_RUN_ID &&
     read_manifest_field package_id MANIFEST_PACKAGE_ID &&
     read_manifest_field integration_ref INTEGRATION_REF &&
@@ -388,10 +389,11 @@ load_manifest() {
     read_manifest_field test_hermetic_routed_veth_harness_sh_sha256 TEST_HERMETIC_ROUTED_VETH_HARNESS_SH_SHA256 &&
     read_manifest_field test_routed_veth_harness_static_py_path TEST_ROUTED_VETH_HARNESS_STATIC_PY_PATH &&
     read_manifest_field test_routed_veth_harness_static_py_blob TEST_ROUTED_VETH_HARNESS_STATIC_PY_BLOB &&
-    read_manifest_field test_routed_veth_harness_static_py_sha256 TEST_ROUTED_VETH_HARNESS_STATIC_PY_SHA256 || {
-      exec 3<&-
-      return 65
-    }
+    read_manifest_field test_routed_veth_harness_static_py_sha256 TEST_ROUTED_VETH_HARNESS_STATIC_PY_SHA256
+  }; then
+    exec 3<&-
+    return 65
+  fi
   if IFS= read -r unexpected <&3 || [[ -n "${unexpected}" ]]; then
     exec 3<&-
     return 65
@@ -506,8 +508,8 @@ verify_manifest_contract() {
   esac
   valid_sha256 "${BUNDLE_SHA256}" || return 65
   valid_sha256 "${HISTORY_ROOTS_SHA256}" && valid_sha256 "${HISTORY_OBJECTS_SHA256}" || return 65
-  canonical_repository="$(CDPATH= cd -- "${LOCAL_REPOSITORY}" && pwd -P)" || return 66
-  canonical_package="$(CDPATH= cd -- "${LOCAL_PACKAGE_DIR}" && pwd -P)" || return 66
+  canonical_repository="$(CDPATH='' cd -- "${LOCAL_REPOSITORY}" && pwd -P)" || return 66
+  canonical_package="$(CDPATH='' cd -- "${LOCAL_PACKAGE_DIR}" && pwd -P)" || return 66
   canonical_manifest="${canonical_package}/package-manifest.v1"
   [[ "${canonical_repository}" == "${LOCAL_REPOSITORY}" &&
     "${canonical_package}" == "${LOCAL_PACKAGE_DIR}" &&
@@ -581,7 +583,7 @@ verify_local_approved_plan() {
   local canonical shape size package_shape caller_uid package_uid package_gid package_mode package_type
   [[ "${APPROVED_PLAN}" == "${LOCAL_PACKAGE_DIR}/realnic-plan.${APPROVED_PLAN_SHA256}.json" ]] || return 65
   [[ "${APPROVED_PLAN}" == /* && -f "${APPROVED_PLAN}" && ! -L "${APPROVED_PLAN}" ]] || return 66
-  canonical="$(CDPATH= cd -- "$(/usr/bin/dirname -- "${APPROVED_PLAN}")" && pwd -P)/${APPROVED_PLAN##*/}" || return 66
+  canonical="$(CDPATH='' cd -- "$(/usr/bin/dirname -- "${APPROVED_PLAN}")" && pwd -P)/${APPROVED_PLAN##*/}" || return 66
   [[ "${canonical}" == "${APPROVED_PLAN}" ]] || return 66
   caller_uid="$(/usr/bin/id -u)" || return 66
   if [[ "$(/usr/bin/uname -s)" == 'Darwin' ]]; then
@@ -696,6 +698,8 @@ readonly -a BOOTSTRAP_CREATE_OPERATIONS=(
   bootstrap-absent bootstrap-not-symlink bootstrap-create bootstrap-root-readlink bootstrap-root-stat
   bootstrap-install-provisioner bootstrap-install-stager
 )
+# This tuple is a source contract mirrored by the locked transport and static verifier.
+# shellcheck disable=SC2034
 readonly -a BOOTSTRAP_ROOT_VERIFY_OPERATIONS=(bootstrap-root-readlink bootstrap-root-stat)
 readonly -a PROVISIONER_VERIFY_OPERATIONS=(
   bootstrap-provisioner-readlink bootstrap-provisioner-stat bootstrap-provisioner-sha

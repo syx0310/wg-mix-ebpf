@@ -217,7 +217,8 @@ load_manifest() {
     exec 3<&-
     return "${rc}"
   }
-  read_manifest_field format FORMAT &&
+  if ! {
+    read_manifest_field format FORMAT &&
     read_manifest_field run_id MANIFEST_RUN_ID &&
     read_manifest_field package_id MANIFEST_PACKAGE_ID &&
     read_manifest_field integration_ref INTEGRATION_REF &&
@@ -319,10 +320,11 @@ load_manifest() {
     read_manifest_field test_hermetic_routed_veth_harness_sh_sha256 ROUTED_HERMETIC_SHA256 &&
     read_manifest_field test_routed_veth_harness_static_py_path ROUTED_STATIC_PATH &&
     read_manifest_field test_routed_veth_harness_static_py_blob ROUTED_STATIC_BLOB &&
-    read_manifest_field test_routed_veth_harness_static_py_sha256 ROUTED_STATIC_SHA256 || {
-      exec 3<&-
-      return 65
-    }
+    read_manifest_field test_routed_veth_harness_static_py_sha256 ROUTED_STATIC_SHA256
+  }; then
+    exec 3<&-
+    return 65
+  fi
   if IFS= read -r unexpected <&3 || [[ -n "${unexpected}" ]]; then
     exec 3<&-
     return 65

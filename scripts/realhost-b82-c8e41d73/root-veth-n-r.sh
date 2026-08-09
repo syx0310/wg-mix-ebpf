@@ -192,7 +192,12 @@ build_argv() {
   case "${operation}" in
     stage-mkdir) OP_TARGET="${VETH_STAGE_ROOT}"; OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${VETH_STAGE_ROOT}") ;;
     evidence-mkdir) OP_TARGET="${EVIDENCE_ROOT}"; OP_ARGV=(/usr/bin/mkdir --mode=0700 -- "${EVIDENCE_ROOT}") ;;
-    bundle-copy) OP_TARGET="${ROOT_BUNDLE}"; OP_ARGV=(/usr/bin/timeout --signal=TERM --kill-after=10s 2m /usr/bin/cp --no-clobber --no-preserve=mode,ownership,timestamps -- "${BUNDLE}" "${ROOT_BUNDLE}") ;;
+    bundle-copy)
+      OP_TARGET="${ROOT_BUNDLE}"
+      # GNU cp expects this comma-separated option as one literal shell word.
+      # shellcheck disable=SC2054
+      OP_ARGV=(/usr/bin/timeout --signal=TERM --kill-after=10s 2m /usr/bin/cp --no-clobber --no-preserve=mode,ownership,timestamps -- "${BUNDLE}" "${ROOT_BUNDLE}")
+      ;;
     bundle-mode) OP_TARGET="${ROOT_BUNDLE}"; OP_ARGV=(/usr/bin/chmod 0600 "${ROOT_BUNDLE}") ;;
     bundle-verify) OP_TARGET="${ROOT_BUNDLE}"; OP_ARGV=("${GIT_COMMAND[@]}" -C "${CONTROLLER_SOURCE}" bundle verify "${ROOT_BUNDLE}") ;;
     source-clone) OP_TARGET="${VETH_SOURCE}"; OP_ARGV=("${GIT_COMMAND[@]}" clone --no-local --no-checkout -- "${ROOT_BUNDLE}" "${VETH_SOURCE}") ;;
@@ -392,7 +397,7 @@ capture_operation() {
 write_noclobber_evidence() {
   local path="$1" rc
   shift
-  [[ "${path}" == "${EVIDENCE_ROOT}/"* && "${path#${EVIDENCE_ROOT}/}" != */* &&
+  [[ "${path}" == "${EVIDENCE_ROOT}/"* && "${path#"${EVIDENCE_ROOT}"/}" != */* &&
     ! -e "${path}" && ! -L "${path}" ]] || fail "evidence-write-scope:${path}" 78
   audit_line start evidence-write "${path}" not-run "shell-builtin:noclobber" || fail 'evidence-audit-start'
   set -o noclobber
@@ -405,7 +410,7 @@ write_noclobber_evidence() {
 write_phase() {
   local path="$1"
   shift
-  [[ "${path}" == "${EVIDENCE_ROOT}/phase-"* && "${path#${EVIDENCE_ROOT}/}" != */* ]] ||
+  [[ "${path}" == "${EVIDENCE_ROOT}/phase-"* && "${path#"${EVIDENCE_ROOT}"/}" != */* ]] ||
     fail "phase-write-scope:${path}" 78
   write_noclobber_evidence "${path}" "$@"
 }
@@ -469,7 +474,7 @@ validate_evidence_shapes() {
   for path in "${BASELINE_PHASE}" "${MUTATION_PHASE}" "${VETH_PHASE}" "${TCX_PHASE}" \
     "${MODULE_INTENT}" "${MODULE_OWNED}" "${MODULE_UNLOADED}" \
     "${CLEANUP_PHASE}" "${RESTORED_PHASE}" "${FILESYSTEM_PHASE}"; do
-    label="${path#${EVIDENCE_ROOT}/}"
+    label="${path#"${EVIDENCE_ROOT}"/}"
     validate_optional_evidence_file "${path}" "${label}"
   done
 }
@@ -508,7 +513,8 @@ validate_controller_identity() {
 }
 
 load_checksum_module_helper() {
-  # shellcheck source=checksum-module-lease.sh
+  # validate_controller_identity binds this dynamic path to the clean committed source.
+  # shellcheck disable=SC1090,SC1091
   source "${MODULE_LEASE_HELPER}" || fail 'module-lease-helper-source' $?
   [[ "${C8_CHECKSUM_MODULE_LOCK}" == "${MODULE_LEASE_LOCK}" &&
     "${C8_CHECKSUM_MODULE_STANDALONE_RESOURCE_ID}" == "${RESOURCE_ID}" &&

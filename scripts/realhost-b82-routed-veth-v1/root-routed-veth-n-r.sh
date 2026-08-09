@@ -397,7 +397,7 @@ capture_operation() {
   audit_line start "${label}" "${OP_TARGET}" not-run "${rendered}" || fail "capture-audit-start:${label}"
   output="$("${OP_ARGV[@]}" 2>&1)"; rc=$?
   printf '%s\n' "${output}" | /usr/bin/tee -a "${AUDIT_LOG}"
-  ((${PIPESTATUS[0]} == 0 && ${PIPESTATUS[1]} == 0)) || fail "capture-output:${label}"
+  ((PIPESTATUS[0] == 0 && PIPESTATUS[1] == 0)) || fail "capture-output:${label}"
   audit_line finish "${label}" "${OP_TARGET}" "${rc}" "${rendered}" || fail "capture-audit-finish:${label}"
   ((rc == 0)) || return "${rc}"
   set -o noclobber
@@ -674,7 +674,7 @@ verify_source_identity() {
   [[ "${BOOT_ID}" =~ ^[0-9a-f-]{36}$ ]] || fail 'boot-id-format' 77
   require_root_directory "${STAGE_ROOT}" || fail 'stage-root-identity' 79
   [[ -d "${SOURCE}/.git" && ! -L "${SOURCE}" ]] || fail 'source-identity' 79
-  head="$("${GIT_COMMAND[@]}" -C "${SOURCE}" rev-parse --verify HEAD^{commit})" || fail 'source-head'
+  head="$("${GIT_COMMAND[@]}" -C "${SOURCE}" rev-parse --verify 'HEAD^{commit}')" || fail 'source-head'
   [[ "${head}" == "${COMMIT}" ]] || fail 'source-commit' 79
   "${GIT_COMMAND[@]}" -C "${SOURCE}" diff --quiet "${COMMIT}" -- || fail 'tracked-worktree-drift' 79
   "${GIT_COMMAND[@]}" -C "${SOURCE}" diff --cached --quiet "${COMMIT}" -- || fail 'index-drift' 79
@@ -706,7 +706,8 @@ verify_source_identity() {
 }
 
 load_checksum_module_helper() {
-  # shellcheck source=../realhost-b82-c8e41d73/checksum-module-lease.sh
+  # verify_source_identity binds this dynamic path to the clean committed source.
+  # shellcheck disable=SC1090,SC1091
   source "${MODULE_LEASE_HELPER}" || fail 'module-lease-helper-source' $?
   [[ "${C8_CHECKSUM_MODULE_LOCK}" == "${MODULE_LEASE_LOCK}" ]] ||
     fail 'module-lease-helper-lock-contract' 79
@@ -993,9 +994,9 @@ ensure_veth_phase() {
   claim_veth_alias N1 veth-alias-a "${VETH_A}" "${VETH_A_ALIAS}"
   claim_veth_alias N2 veth-alias-b "${VETH_B}" "${VETH_B_ALIAS}"
   /usr/sbin/ip -j link show dev "${VETH_A}" | /usr/bin/jq -e '.[0].flags | index("UP") != null' >/dev/stdout
-  if ((${PIPESTATUS[0]} != 0 || ${PIPESTATUS[1]} != 0)); then run_operation N3 veth-up-a || fail 'veth-up-a' $?; fi
+  if ((PIPESTATUS[0] != 0 || PIPESTATUS[1] != 0)); then run_operation N3 veth-up-a || fail 'veth-up-a' $?; fi
   /usr/sbin/ip -j link show dev "${VETH_B}" | /usr/bin/jq -e '.[0].flags | index("UP") != null' >/dev/stdout
-  if ((${PIPESTATUS[0]} != 0 || ${PIPESTATUS[1]} != 0)); then run_operation N4 veth-up-b || fail 'veth-up-b' $?; fi
+  if ((PIPESTATUS[0] != 0 || PIPESTATUS[1] != 0)); then run_operation N4 veth-up-b || fail 'veth-up-b' $?; fi
   VETH_A_IFINDEX="${current_a}"; VETH_B_IFINDEX="${current_b}"
   VETH_A_SYSFS="$(sysfs_identity "${VETH_A}")" || fail 'veth-a-sysfs'
   VETH_B_SYSFS="$(sysfs_identity "${VETH_B}")" || fail 'veth-b-sysfs'
