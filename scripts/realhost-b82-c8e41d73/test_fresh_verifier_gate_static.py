@@ -94,6 +94,38 @@ EXPECTED_MANIFEST_KEYS = MANIFEST_PREFIX + tuple(
 if len(EXPECTED_MANIFEST_KEYS) != 103 or len(set(EXPECTED_MANIFEST_KEYS)) != 103:
     fail("test's exact manifest schema is not 103 unique keys")
 
+nul_helper_match = re.search(
+    r"(?ms)^(?P<function>require_manifest_fd_without_nul\(\) \{\n.*?^\})\n\nload_manifest_once\(\) \{",
+    source,
+)
+if nul_helper_match is None:
+    fail("could not isolate the manifest NUL pread helper")
+expected_nul_helper = '''require_manifest_fd_without_nul() {
+  /usr/bin/python3 -B -I -c '
+import os
+import sys
+
+try:
+    descriptor = int(sys.argv[1])
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 65536, offset)
+        if not chunk:
+            raise SystemExit(0)
+        if b"\\0" in chunk:
+            raise SystemExit(65)
+        offset += len(chunk)
+except (OSError, ValueError):
+    raise SystemExit(66)
+' "$1"
+}'''
+if nul_helper_match.group("function") != expected_nul_helper:
+    fail("manifest NUL helper drifted from the shared same-FD os.pread contract")
+manifest_nul_helper = nul_helper_match.group("function")
+for forbidden in ("os.read(", "os.lseek(", ".seek(", "print(", "sys.stdout", "os.write("):
+    if forbidden in manifest_nul_helper:
+        fail(f"manifest NUL helper advances or writes through its descriptor: {forbidden!r}")
+
 load_match = re.search(
     r"(?ms)^load_manifest_once\(\) \{\n(?P<body>.*?)^\}\n\nphase_value\(\) \{",
     source,
@@ -108,6 +140,22 @@ if loaded_keys != EXPECTED_MANIFEST_KEYS:
     fail("load_manifest_once does not consume the exact package-v4 103-key sequence")
 if len(set(loaded_keys)) != len(loaded_keys):
     fail("load_manifest_once contains duplicate manifest keys")
+manifest_open = 'exec {MANIFEST_FD}<"${SNAPSHOT_MANIFEST}" || return 66'
+nul_scan = 'require_manifest_fd_without_nul "${MANIFEST_FD}" || {'
+first_field = "read_manifest_field format FORMAT"
+loader_order = tuple(load_body.find(value) for value in (manifest_open, nul_scan, first_field))
+if (
+    min(loader_order) < 0
+    or tuple(sorted(loader_order)) != loader_order
+    or load_body.count(nul_scan) != 1
+):
+    fail("load_manifest_once does not scan its already-open manifest FD before field reads")
+if '''require_manifest_fd_without_nul "${MANIFEST_FD}" || {
+    rc=$?
+    exec {MANIFEST_FD}<&-
+    return "${rc}"
+  }''' not in load_body:
+    fail("load_manifest_once does not preserve NUL/pread failure rc while closing the same FD")
 if load_body.count('IFS= read -r -u "${MANIFEST_FD}" unexpected') != 1 or not re.search(
     r'''(?mx)
     if\ IFS=\ read\ -r\ -u\ "\$\{MANIFEST_FD\}"\ unexpected

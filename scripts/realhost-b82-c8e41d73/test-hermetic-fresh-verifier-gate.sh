@@ -44,6 +44,8 @@ TESTABLE_READER="${FIXTURE}/root-fresh-verifier-gate.reader-test.sh"
 TAIL_NEWLINE="${FIXTURE}/package-manifest.trailing-newline.v1"
 TAIL_NO_NEWLINE="${FIXTURE}/package-manifest.trailing-no-newline.v1"
 REORDERED_MANIFEST="${FIXTURE}/package-manifest.reordered.v1"
+NUL_FIELD_MANIFEST="${FIXTURE}/package-manifest.nul-field.v1"
+FINAL_LF_NUL_MANIFEST="${FIXTURE}/package-manifest.final-lf-nul.v1"
 
 /usr/bin/awk '
   /^load_manifest_once\(\) \{/ { in_loader = 1; next }
@@ -94,45 +96,145 @@ fi
   { print }
   in_loader && /^}/ { in_loader = 0 }
   END {
-    if (replacements != 1 || reader_opens != 1 || reader_closes != 3) exit 65
+    if (replacements != 1 || reader_opens != 1 || reader_closes != 4) exit 65
   }
 ' "${SCRIPT}" >"${TESTABLE_READER}" || fail 'prepare isolated manifest reader'
 /bin/chmod 0700 "${TESTABLE_READER}" || fail 'mode isolated manifest reader'
 
-run_manifest_reader() {
-  local manifest="$1" expected_rc="$2" label="$3" rc
+fixture_sha256() {
+  local line
+  if [[ -x /usr/bin/shasum ]]; then
+    line="$(/usr/bin/shasum -a 256 -- "$1")" || return $?
+  else
+    line="$(/usr/bin/sha256sum -- "$1")" || return $?
+  fi
+  line="${line%% *}"
+  [[ "${line}" =~ ^[0-9a-f]{64}$ ]] || return 65
+  printf '%s\n' "${line}"
+}
+
+run_manifest_offset_probe() {
+  local manifest="$1" rc
   FRESH_TEST_MANIFEST="${manifest}" /bin/bash -c '
+    source "$1" || exit $?
+    MANIFEST_FD=9
+    exec 9<"${FRESH_TEST_MANIFEST}" || exit 66
+    before="$(/usr/bin/python3 -B -I -c '\''import os, sys; print(os.lseek(int(sys.argv[1]), 0, os.SEEK_CUR))'\'' "${MANIFEST_FD}")" || exit 66
+    require_manifest_fd_without_nul "${MANIFEST_FD}"
+    rc=$?
+    after="$(/usr/bin/python3 -B -I -c '\''import os, sys; print(os.lseek(int(sys.argv[1]), 0, os.SEEK_CUR))'\'' "${MANIFEST_FD}")" || exit 66
+    ((rc == 0)) || exit "${rc}"
+    [[ "${before}" == 0 && "${after}" == 0 ]] || exit 78
+    read_manifest_field format probe_format || exit $?
+    [[ "${probe_format}" == "wg-mix-ebpf-b82-v6-package-v4" ]] || exit 79
+    exec 9<&-
+  ' fresh-manifest-offset-probe "${TESTABLE_READER}"
+  rc=$?
+  [[ "${rc}" == 0 ]] || fail "same-FD pread offset probe: expected rc=0, observed rc=${rc}"
+}
+
+run_manifest_reader() {
+  local manifest="$1" expected_sha="$2" expected_rc="$3" marker="$4" label="$5" rc
+  [[ ! -e "${marker}" && ! -L "${marker}" ]] || fail "${label}: post-load marker preexists"
+  FRESH_TEST_MANIFEST="${manifest}" FRESH_TEST_MANIFEST_SHA256="${expected_sha}" \
+    FRESH_TEST_POST_LOAD_MARKER="${marker}" /bin/bash -c '
+    if [[ -x /usr/bin/shasum ]]; then
+      actual_sha="$(/usr/bin/shasum -a 256 -- "${FRESH_TEST_MANIFEST}")" || exit $?
+    else
+      actual_sha="$(/usr/bin/sha256sum -- "${FRESH_TEST_MANIFEST}")" || exit $?
+    fi
+    actual_sha="${actual_sha%% *}"
+    [[ "${actual_sha}" == "${FRESH_TEST_MANIFEST_SHA256}" ]] || exit 80
     source "$1" || exit $?
     load_manifest_once
     rc=$?
     if ((rc == 0)); then
       [[ "${FORMAT}" == "wg-mix-ebpf-b82-v6-package-v4" ]] || exit 79
+      printf "post-load-evidence=created\n" >"${FRESH_TEST_POST_LOAD_MARKER}" || exit 74
     fi
     exit "${rc}"
   ' fresh-manifest-reader "${TESTABLE_READER}"
   rc=$?
   [[ "${rc}" == "${expected_rc}" ]] ||
     fail "${label}: expected rc=${expected_rc}, observed rc=${rc}"
+  if [[ "${expected_rc}" == 0 ]]; then
+    [[ -f "${marker}" && ! -L "${marker}" &&
+      "$(/bin/cat -- "${marker}")" == 'post-load-evidence=created' ]] ||
+      fail "${label}: successful load did not reach its post-load marker"
+  else
+    [[ ! -e "${marker}" && ! -L "${marker}" ]] ||
+      fail "${label}: rejected load reached a subsequent mutation/evidence marker"
+  fi
 }
 
-run_manifest_reader "${SYNTHETIC_MANIFEST}" 0 'valid package-v4 manifest'
+run_manifest_pread_error() {
+  local marker="${FIXTURE}/post-load-pread-error.evidence" rc
+  FRESH_TEST_MANIFEST="${SYNTHETIC_MANIFEST}" FRESH_TEST_POST_LOAD_MARKER="${marker}" \
+    /bin/bash -c '
+    source "$1" || exit $?
+    MANIFEST_FD=9
+    exec 9<"${FRESH_TEST_MANIFEST}" || exit 66
+    exec 9<&-
+    require_manifest_fd_without_nul "${MANIFEST_FD}"
+    rc=$?
+    if ((rc == 0)); then
+      printf "post-load-evidence=created\n" >"${FRESH_TEST_POST_LOAD_MARKER}" || exit 74
+    fi
+    exit "${rc}"
+  ' fresh-manifest-pread-error "${TESTABLE_READER}"
+  rc=$?
+  [[ "${rc}" == 66 ]] || fail "closed same-FD pread error: expected rc=66, observed rc=${rc}"
+  [[ ! -e "${marker}" && ! -L "${marker}" ]] ||
+    fail 'closed same-FD pread error reached a subsequent mutation/evidence marker'
+}
+
+SYNTHETIC_SHA="$(fixture_sha256 "${SYNTHETIC_MANIFEST}")" ||
+  fail 'hash valid package-v4 fixture'
+run_manifest_offset_probe "${SYNTHETIC_MANIFEST}"
+run_manifest_reader "${SYNTHETIC_MANIFEST}" "${SYNTHETIC_SHA}" 0 \
+  "${FIXTURE}/post-load-valid.evidence" 'valid package-v4 manifest'
+
+{
+  printf 'format\twg-mix-ebpf-b82-v6-package-v4'
+  printf '\0\n'
+  /usr/bin/tail -n +2 -- "${SYNTHETIC_MANIFEST}"
+} >"${NUL_FIELD_MANIFEST}" || fail 'create NUL-in-field fixture'
+NUL_FIELD_SHA="$(fixture_sha256 "${NUL_FIELD_MANIFEST}")" ||
+  fail 'hash NUL-in-field fixture'
+run_manifest_reader "${NUL_FIELD_MANIFEST}" "${NUL_FIELD_SHA}" 65 \
+  "${FIXTURE}/post-load-nul-field.evidence" 'NUL in field with recomputed SHA'
+
+/bin/cp -- "${SYNTHETIC_MANIFEST}" "${FINAL_LF_NUL_MANIFEST}" ||
+  fail 'copy final-LF NUL fixture'
+printf '\0' >>"${FINAL_LF_NUL_MANIFEST}" || fail 'append final-LF NUL fixture'
+FINAL_LF_NUL_SHA="$(fixture_sha256 "${FINAL_LF_NUL_MANIFEST}")" ||
+  fail 'hash final-LF NUL fixture'
+run_manifest_reader "${FINAL_LF_NUL_MANIFEST}" "${FINAL_LF_NUL_SHA}" 65 \
+  "${FIXTURE}/post-load-final-lf-nul.evidence" 'NUL after final LF with recomputed SHA'
+
+run_manifest_pread_error
+
 /bin/cp -- "${SYNTHETIC_MANIFEST}" "${TAIL_NEWLINE}" || fail 'copy newline-tail fixture'
 printf 'unexpected_tail\tfixture-extra\n' >>"${TAIL_NEWLINE}" ||
   fail 'append newline-tail fixture'
-run_manifest_reader "${TAIL_NEWLINE}" 65 '104th newline-terminated record'
+run_manifest_reader "${TAIL_NEWLINE}" "$(fixture_sha256 "${TAIL_NEWLINE}")" 65 \
+  "${FIXTURE}/post-load-tail-newline.evidence" '104th newline-terminated record'
 /bin/cp -- "${SYNTHETIC_MANIFEST}" "${TAIL_NO_NEWLINE}" ||
   fail 'copy unterminated-tail fixture'
 printf 'unexpected_tail\tfixture-extra' >>"${TAIL_NO_NEWLINE}" ||
   fail 'append unterminated-tail fixture'
-run_manifest_reader "${TAIL_NO_NEWLINE}" 65 '104th unterminated record'
+run_manifest_reader "${TAIL_NO_NEWLINE}" "$(fixture_sha256 "${TAIL_NO_NEWLINE}")" 65 \
+  "${FIXTURE}/post-load-tail-no-newline.evidence" '104th unterminated record'
 /usr/bin/awk '
   NR == 1 { first = $0; next }
   NR == 2 { print; print first; next }
   { print }
 ' "${SYNTHETIC_MANIFEST}" >"${REORDERED_MANIFEST}" || fail 'create reordered fixture'
-run_manifest_reader "${REORDERED_MANIFEST}" 65 'reordered manifest keys'
+run_manifest_reader "${REORDERED_MANIFEST}" "$(fixture_sha256 "${REORDERED_MANIFEST}")" 65 \
+  "${FIXTURE}/post-load-reordered.evidence" 'reordered manifest keys'
 if [[ -n "${MANIFEST_FIXTURE}" ]]; then
-  run_manifest_reader "${MANIFEST_FIXTURE}" 0 'provided package-v4 manifest'
+  run_manifest_reader "${MANIFEST_FIXTURE}" "$(fixture_sha256 "${MANIFEST_FIXTURE}")" 0 \
+    "${FIXTURE}/post-load-provided.evidence" 'provided package-v4 manifest'
 fi
 
 run_plan() {
