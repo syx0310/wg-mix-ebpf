@@ -7,6 +7,7 @@ import (
 	"fmt"
 
 	"github.com/cilium/ebpf"
+	"github.com/syx0310/wg-mix-ebpf/internal/faketcp"
 )
 
 const (
@@ -28,6 +29,7 @@ func experimentalMapDescriptors() []pinnedMapDescriptor {
 		{name: "faketcp_cap_seq", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 1},
 		{name: "faketcp_egress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: 2},
 		{name: "faketcp_stats_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 17},
+		{name: "faketcp_mtu_audit_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: faketcp.MTUAuditKeyCount},
 	}
 }
 

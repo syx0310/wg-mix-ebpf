@@ -76,6 +76,10 @@
 #define IP_MF 0x2000
 #endif
 
+#ifndef IP_DF
+#define IP_DF 0x4000
+#endif
+
 #ifndef IP_OFFSET
 #define IP_OFFSET 0x1fff
 #endif

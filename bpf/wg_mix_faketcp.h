@@ -350,6 +350,8 @@ static __always_inline void inc_faketcp_stat(__u32 key)
 		*value += 1;
 }
 
+#include "wg_mix_faketcp_mtu.h"
+
 static __always_inline int
 faketcp_inspect_and_reset_udp_checksum(struct __sk_buff *skb,
 					       __u32 network_offset,
@@ -714,27 +716,6 @@ static __always_inline __s64 faketcp_rotation_checksum(const __u8 head[FAKETCP_H
 			     (__be32 *)shifted, sizeof(shifted), seed);
 }
 
-// bpf_check_mtu interprets a non-zero mtu_len input as an L3 packet length.
-// Asking about the planned +12 byte transport-header growth gives the exact
-// pre-transform boundary: an input IPv4 packet must be no larger than the
-// current underlay MTU minus FAKETCP_HEADER_DELTA. Route-specific PMTU is not
-// exposed by this helper, so the activation gate still requires real-host PMTU
-// acceptance rather than claiming that this interface-MTU check is sufficient.
-static __always_inline int faketcp_mtu_allows_growth(struct __sk_buff *skb,
-						      __u16 old_total_len)
-{
-	__u32 mtu_len = old_total_len;
-	long rc;
-
-	rc = bpf_check_mtu(skb, 0, &mtu_len, FAKETCP_HEADER_DELTA, 0);
-	if (rc != 0 || mtu_len < FAKETCP_HEADER_DELTA ||
-	    old_total_len > mtu_len - FAKETCP_HEADER_DELTA) {
-		inc_faketcp_stat(FAKETCP_STAT_MTU_REJECT);
-		return 0;
-	}
-	return 1;
-}
-
 // TC's public __sk_buff ABI does not expose ip_summed, csum_start or
 // csum_offset. The required module kfunc accepts an already materialized
 // CHECKSUM_NONE skb or validates and clears exactly one non-GSO UDP
@@ -830,6 +811,7 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	struct faketcp_session_value *session;
 	struct udphdr old_udp;
 	struct tcphdr tcp = {};
+	struct faketcp_mtu_request mtu_request = {};
 	__u8 head[FAKETCP_HEADER_DELTA] = {};
 	__u16 old_total_len, new_total_len, udp_len;
 	__be32 source_ipv4, destination_ipv4;
@@ -874,7 +856,23 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return TC_ACT_SHOT;
 	}
-	if (!faketcp_mtu_allows_growth(skb, old_total_len))
+	mtu_request.input_l3_len = old_total_len;
+	mtu_request.input_segment_l3_len = old_total_len;
+	mtu_request.ifindex = skb->ifindex;
+	mtu_request.mark = skb->mark;
+	mtu_request.source_port = old_udp.source;
+	mtu_request.destination_port = old_udp.dest;
+	mtu_request.family = FAMILY_IPV4;
+	mtu_request.tos = iph->tos;
+	mtu_request.addresses.ipv4.source = iph->saddr;
+	mtu_request.addresses.ipv4.destination = iph->daddr;
+	if (bpf_ntohs(iph->frag_off) & IP_DF)
+		mtu_request.flags |= FAKETCP_MTU_F_IPV4_DF;
+	if (bpf_ntohs(iph->frag_off) & IP_MF)
+		mtu_request.flags |= FAKETCP_MTU_F_IPV4_MF;
+	if (bpf_ntohs(iph->frag_off) & IP_OFFSET)
+		mtu_request.flags |= FAKETCP_MTU_F_NONINITIAL;
+	if (!faketcp_mtu_admit(skb, &mtu_request))
 		return TC_ACT_SHOT;
 	source_ipv4 = iph->saddr;
 	destination_ipv4 = iph->daddr;
