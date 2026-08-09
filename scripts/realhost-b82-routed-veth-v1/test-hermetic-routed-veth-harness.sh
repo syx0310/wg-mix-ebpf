@@ -23,6 +23,9 @@ readonly LOCKED_STANDALONE='scripts/realhost-b82-c8e41d73/root-veth-n-r.sh'
 readonly STANDALONE_LEASE_SCOPE='1c4102b96d28657b60ee58314c7088069c59eea9'
 readonly STANDALONE_LEASE_ADAPTER='e5757dc8063aec13c3fb8793cb4bcb2ed14dcc1e'
 readonly STANDALONE_LEASE_RUNNER_BLOB='35d62e78f8bb9d410b22f86d734740fab1c36855'
+readonly STANDALONE_PREMUTATION_FIX_PARENT='2d3b95752aaf0d71cb17a0a3ad94d81d55208ec8'
+readonly STANDALONE_PREMUTATION_FIX='7a286559580e15ec0d89ed69f3130fe6894b5803'
+readonly STANDALONE_PREMUTATION_RUNNER_BLOB='99aea86c89e2069a3ff8acdd673b0222dc517e60'
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2
@@ -75,8 +78,25 @@ readonly ADAPTER_PATHS
   "${STANDALONE_LEASE_ADAPTER}:${LOCKED_STANDALONE}")" == "${STANDALONE_LEASE_RUNNER_BLOB}" ]] ||
   fail 'standalone lease adapter runner blob drifted'
 /usr/bin/git -C "${REPOSITORY}" diff --exit-code \
-  "${STANDALONE_LEASE_ADAPTER}" HEAD -- "${LOCKED_STANDALONE}" ||
-  fail 'standalone lease runner changed after its reviewed adapter commit'
+  "${STANDALONE_LEASE_ADAPTER}" "${STANDALONE_PREMUTATION_FIX}^" -- "${LOCKED_STANDALONE}" ||
+  fail 'standalone lease runner changed before its pre-mutation fix'
+FIX_PARENT="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P "${STANDALONE_PREMUTATION_FIX}")" ||
+  fail 'cannot read standalone pre-mutation fix parent'
+readonly FIX_PARENT
+[[ "${FIX_PARENT}" == "${STANDALONE_PREMUTATION_FIX_PARENT}" ]] ||
+  fail 'standalone pre-mutation fix does not have its exact parent'
+FIX_PATHS="$(/usr/bin/git -C "${REPOSITORY}" diff --name-only \
+  "${STANDALONE_PREMUTATION_FIX}^" "${STANDALONE_PREMUTATION_FIX}")" ||
+  fail 'cannot read standalone pre-mutation fix write set'
+readonly FIX_PATHS
+[[ "${FIX_PATHS}" == $'scripts/realhost-b82-c8e41d73/root-veth-n-r.sh\nscripts/realhost-b82-c8e41d73/test_veth_runner_static.py' ]] ||
+  fail 'standalone pre-mutation fix changed an unexpected path'
+[[ "$(/usr/bin/git -C "${REPOSITORY}" rev-parse \
+  "${STANDALONE_PREMUTATION_FIX}:${LOCKED_STANDALONE}")" == "${STANDALONE_PREMUTATION_RUNNER_BLOB}" ]] ||
+  fail 'standalone pre-mutation fix runner blob drifted'
+/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
+  "${STANDALONE_PREMUTATION_FIX}" HEAD -- "${LOCKED_STANDALONE}" ||
+  fail 'standalone lease runner changed after its reviewed pre-mutation fix'
 
 readonly -a RUNNER_ARGS=(
   --source "${SOURCE}"
