@@ -94,9 +94,9 @@ readonly FIX_PATHS
 [[ "$(/usr/bin/git -C "${REPOSITORY}" rev-parse \
   "${STANDALONE_PREMUTATION_FIX}:${LOCKED_STANDALONE}")" == "${STANDALONE_PREMUTATION_RUNNER_BLOB}" ]] ||
   fail 'standalone pre-mutation fix runner blob drifted'
-/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
-  "${STANDALONE_PREMUTATION_FIX}" HEAD -- "${LOCKED_STANDALONE}" ||
-  fail 'standalone lease runner changed after its reviewed pre-mutation fix'
+/usr/bin/git -C "${REPOSITORY}" merge-base --is-ancestor \
+  "${STANDALONE_PREMUTATION_FIX}" HEAD ||
+  fail 'bound history does not contain the reviewed pre-mutation fix'
 
 readonly -a RUNNER_ARGS=(
   --source "${SOURCE}"

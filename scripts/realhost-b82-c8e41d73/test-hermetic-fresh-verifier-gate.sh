@@ -13,7 +13,7 @@ STATIC_TEST="${3:-}"
   exit 64
 }
 /bin/bash -n "${SCRIPT}" "${HELPER}" || exit $?
-PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I "${STATIC_TEST}" "${SCRIPT}" "${HELPER}" ||
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B -I "${STATIC_TEST}" "${SCRIPT}" "${HELPER}" ||
   exit $?
 
 FIXTURE="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/wg-mix-fresh-verifier-plan.XXXXXXXX")" || exit $?

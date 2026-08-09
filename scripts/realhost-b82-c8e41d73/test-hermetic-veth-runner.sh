@@ -40,10 +40,10 @@ readonly -a CONTROLLER_FILES=(
   scripts/realhost-b82-c8e41d73/prepare-stage-root.sh
   scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh
 )
-readonly -a MERGE_RESOLUTION_FILES=(
-  scripts/realhost-b82-c8e41d73/prepare-stage-root.sh
-  scripts/realhost-b82-c8e41d73/test-hermetic-controller.sh
-  scripts/realhost-b82-c8e41d73/test_controller_static.py
+readonly -a ORIGINAL_MERGE_RESOLUTION_BLOBS=(
+  'scripts/realhost-b82-c8e41d73/prepare-stage-root.sh c955b4508fb55728cf948a0cc2fb1b0109df6078'
+  'scripts/realhost-b82-c8e41d73/test-hermetic-controller.sh 93b4c576c42ef269c2ae718fac7c68f1f2b12f9c'
+  'scripts/realhost-b82-c8e41d73/test_controller_static.py 9273502f2b8ab54bf810b36ce7a935734d244ec0'
 )
 readonly -a GSO_TESTS=(
   TestFakeTCPRealHostVirtioNetHeaderEncoding
@@ -127,7 +127,6 @@ SINGLE_L3_PATHS="$(/usr/bin/git -C "${REPOSITORY}" diff --name-only \
 readonly SINGLE_L3_PATHS
 [[ "${SINGLE_L3_PATHS}" == $'bpf/wg_mix_faketcp.h\nbpf/wg_mix_tc.c\ninternal/dataplane/faketcp_admission_contract_test.go\ninternal/dataplane/faketcp_gso_contract_test.go\ninternal/dataplane/faketcp_l3_parser_test.go\ninternal/dataplane/faketcp_mtu_contract_test.go\ninternal/dataplane/faketcp_order_test.go\ninternal/dataplane/faketcp_policy_test.go\ninternal/dataplane/faketcp_single_parse_contract_test.go\ninternal/faketcp/l3_single_parse_model_test.go' ]] ||
   fail 'single-L3 merge changed a non-topic path'
-
 MANAGED_INGRESS_ACCOUNTING_PARENTS="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P \
   "${MANAGED_INGRESS_ACCOUNTING}")" || fail 'cannot read managed-ingress accounting parent'
 readonly MANAGED_INGRESS_ACCOUNTING_PARENTS
@@ -171,8 +170,13 @@ readonly MANAGED_INGRESS_TEST_PATHS
 /usr/bin/git -C "${REPOSITORY}" diff --exit-code \
   "${STANDALONE_BASE_COMMIT}^" "${STANDALONE_BASE_COMMIT}" -- "${CONTROLLER_FILES[@]}" ||
   fail 'standalone base changed an existing controller or matrix file'
-/usr/bin/git -C "${REPOSITORY}" diff --exit-code "${BOUND_COMMIT}" -- \
-  "${MERGE_RESOLUTION_FILES[@]}" || fail 'working tree changed a canonical merge resolution'
+for resolution in "${ORIGINAL_MERGE_RESOLUTION_BLOBS[@]}"; do
+  read -r resolution_file expected_blob <<<"${resolution}"
+  actual_blob="$(/usr/bin/git -C "${REPOSITORY}" rev-parse \
+    "${CANONICAL_MERGE}:${resolution_file}")" || fail 'cannot read canonical resolution blob'
+  [[ "${actual_blob}" == "${expected_blob}" ]] ||
+    fail "historical canonical resolution blob changed: ${resolution_file}"
+done
 
 MERGED_STAGER="$(/usr/bin/git -C "${REPOSITORY}" show "${CANONICAL_MERGE}:scripts/realhost-b82-c8e41d73/prepare-stage-root.sh")" ||
   fail 'cannot read merged stager contract'

@@ -12,7 +12,8 @@ MODE=''
 MANIFEST=''
 MANIFEST_SHA256=''
 SUPPLIED_CREDENTIAL_PATH=''
-RESTORE_CELL='none'
+APPROVED_PLAN='none'
+APPROVED_PLAN_SHA256='none'
 
 FORMAT=''
 MANIFEST_RUN_ID=''
@@ -43,6 +44,11 @@ PEER_ADDRESS=''
 PEER_PORT=''
 SOAK_SECONDS=''
 SESSION_SECONDS=''
+PHYSICAL_NIC_FORWARD_AUTHORITY=''
+PHYSICAL_INTERFACE_LOCK=''
+LEGACY_MATRIX_MODE=''
+REALNIC_PROFILE=''
+REALNIC_TRAFFIC_SECONDS=''
 
 BIND_FINAL_PACKAGE_SH_PATH=''
 BIND_FINAL_PACKAGE_SH_BLOB=''
@@ -77,6 +83,15 @@ TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_SHA256=''
 TEST_FRESH_VERIFIER_GATE_STATIC_PY_PATH=''
 TEST_FRESH_VERIFIER_GATE_STATIC_PY_BLOB=''
 TEST_FRESH_VERIFIER_GATE_STATIC_PY_SHA256=''
+REALNIC_ACCEPTANCE_PY_PATH=''
+REALNIC_ACCEPTANCE_PY_BLOB=''
+REALNIC_ACCEPTANCE_PY_SHA256=''
+TEST_REALNIC_ACCEPTANCE_PY_PATH=''
+TEST_REALNIC_ACCEPTANCE_PY_BLOB=''
+TEST_REALNIC_ACCEPTANCE_PY_SHA256=''
+TEST_REALNIC_ACCEPTANCE_STATIC_PY_PATH=''
+TEST_REALNIC_ACCEPTANCE_STATIC_PY_BLOB=''
+TEST_REALNIC_ACCEPTANCE_STATIC_PY_SHA256=''
 PREPARE_STAGE_ROOT_SH_PATH=''
 PREPARE_STAGE_ROOT_SH_BLOB=''
 PREPARE_STAGE_ROOT_SH_SHA256=''
@@ -93,10 +108,10 @@ fail() {
 
 usage() {
   printf '%s\n' \
-    "usage: $0 {plan|preflight|prepare|provision-apply|matrix-plan|run|restore|fresh-plan|fresh-run|fresh-restore}" \
+    "usage: $0 {plan|preflight|prepare|provision-apply|fresh-plan|fresh-run|fresh-restore|realnic-plan|realnic-run|realnic-restore}" \
     '  --manifest ABSOLUTE_PACKAGE_MANIFEST --manifest-sha256 64-lowercase-hex' \
     "  --credential-path ${CREDENTIAL_PATH}" \
-    '  --restore-cell {none|tcx|original|all-on|all-off|tx-path|rx-path|mtu1492|mtu1500|soak}' >&2
+    '  --approved-plan {none|ABSOLUTE_LOCAL_FILE} --approved-plan-sha256 {none|64-lowercase-hex}' >&2
 }
 
 sha256_file() {
@@ -160,8 +175,8 @@ parse_arguments() {
   MODE="$1"
   shift
   case "${MODE}" in
-    plan | preflight | prepare | provision-apply | matrix-plan | run | restore | \
-      fresh-plan | fresh-run | fresh-restore) ;;
+    plan | preflight | prepare | provision-apply | \
+      fresh-plan | fresh-run | fresh-restore | realnic-plan | realnic-run | realnic-restore) ;;
     *) usage; return 64 ;;
   esac
   while (($# > 0)); do
@@ -170,19 +185,27 @@ parse_arguments() {
       --manifest) MANIFEST="$2" ;;
       --manifest-sha256) MANIFEST_SHA256="$2" ;;
       --credential-path) SUPPLIED_CREDENTIAL_PATH="$2" ;;
-      --restore-cell) RESTORE_CELL="$2" ;;
+      --approved-plan) APPROVED_PLAN="$2" ;;
+      --approved-plan-sha256) APPROVED_PLAN_SHA256="$2" ;;
       *) usage; return 64 ;;
     esac
     shift 2
   done
   [[ "${MANIFEST}" == /* && "${SUPPLIED_CREDENTIAL_PATH}" == "${CREDENTIAL_PATH}" ]] || return 65
   valid_sha256 "${MANIFEST_SHA256}" || return 65
-  case "${MODE}:${RESTORE_CELL}" in
-    plan:none | preflight:none | prepare:none | provision-apply:none | matrix-plan:none | run:none | \
-      fresh-plan:none | fresh-run:none | fresh-restore:none | \
-      restore:tcx | restore:original | restore:all-on | restore:all-off | \
-      restore:tx-path | restore:rx-path | restore:mtu1492 | restore:mtu1500 | restore:soak) ;;
-    *) return 65 ;;
+  case "${MODE}" in
+    realnic-run)
+      [[ "${APPROVED_PLAN}" == /* ]] && valid_sha256 "${APPROVED_PLAN_SHA256}" || return 65
+      ;;
+    realnic-restore)
+      [[ "${APPROVED_PLAN}" == 'none' ]] && valid_sha256 "${APPROVED_PLAN_SHA256}" || return 65
+      ;;
+    plan)
+      if [[ "${APPROVED_PLAN}" != 'none' || "${APPROVED_PLAN_SHA256}" != 'none' ]]; then
+        [[ "${APPROVED_PLAN}" == /* ]] && valid_sha256 "${APPROVED_PLAN_SHA256}" || return 65
+      fi
+      ;;
+    *) [[ "${APPROVED_PLAN}" == 'none' && "${APPROVED_PLAN_SHA256}" == 'none' ]] || return 65 ;;
   esac
 }
 
@@ -226,6 +249,11 @@ load_manifest() {
     read_manifest_field peer_port PEER_PORT &&
     read_manifest_field soak_seconds SOAK_SECONDS &&
     read_manifest_field session_seconds SESSION_SECONDS &&
+    read_manifest_field physical_nic_forward_authority PHYSICAL_NIC_FORWARD_AUTHORITY &&
+    read_manifest_field physical_interface_lock PHYSICAL_INTERFACE_LOCK &&
+    read_manifest_field legacy_matrix_mode LEGACY_MATRIX_MODE &&
+    read_manifest_field realnic_profile REALNIC_PROFILE &&
+    read_manifest_field realnic_traffic_seconds REALNIC_TRAFFIC_SECONDS &&
     read_manifest_field bind_final_package_sh_path BIND_FINAL_PACKAGE_SH_PATH &&
     read_manifest_field bind_final_package_sh_blob BIND_FINAL_PACKAGE_SH_BLOB &&
     read_manifest_field bind_final_package_sh_sha256 BIND_FINAL_PACKAGE_SH_SHA256 &&
@@ -262,6 +290,15 @@ load_manifest() {
     read_manifest_field prepare_stage_root_sh_path PREPARE_STAGE_ROOT_SH_PATH &&
     read_manifest_field prepare_stage_root_sh_blob PREPARE_STAGE_ROOT_SH_BLOB &&
     read_manifest_field prepare_stage_root_sh_sha256 PREPARE_STAGE_ROOT_SH_SHA256 &&
+    read_manifest_field realnic_acceptance_py_path REALNIC_ACCEPTANCE_PY_PATH &&
+    read_manifest_field realnic_acceptance_py_blob REALNIC_ACCEPTANCE_PY_BLOB &&
+    read_manifest_field realnic_acceptance_py_sha256 REALNIC_ACCEPTANCE_PY_SHA256 &&
+    read_manifest_field test_realnic_acceptance_py_path TEST_REALNIC_ACCEPTANCE_PY_PATH &&
+    read_manifest_field test_realnic_acceptance_py_blob TEST_REALNIC_ACCEPTANCE_PY_BLOB &&
+    read_manifest_field test_realnic_acceptance_py_sha256 TEST_REALNIC_ACCEPTANCE_PY_SHA256 &&
+    read_manifest_field test_realnic_acceptance_static_py_path TEST_REALNIC_ACCEPTANCE_STATIC_PY_PATH &&
+    read_manifest_field test_realnic_acceptance_static_py_blob TEST_REALNIC_ACCEPTANCE_STATIC_PY_BLOB &&
+    read_manifest_field test_realnic_acceptance_static_py_sha256 TEST_REALNIC_ACCEPTANCE_STATIC_PY_SHA256 &&
     read_manifest_field provision_ubuntu_test_host_sh_path PROVISION_UBUNTU_TEST_HOST_SH_PATH &&
     read_manifest_field provision_ubuntu_test_host_sh_blob PROVISION_UBUNTU_TEST_HOST_SH_BLOB &&
     read_manifest_field provision_ubuntu_test_host_sh_sha256 PROVISION_UBUNTU_TEST_HOST_SH_SHA256 || {
@@ -325,7 +362,7 @@ verify_bound_history() {
 
 verify_identity() {
   local path="$1" blob="$2" sha="$3" actual_blob actual_sha mapped_blob
-  [[ ("${path}" =~ ^scripts/realhost-b82-c8e41d73/[A-Za-z0-9_.-]+$ ||
+  [[ ("${path}" =~ ^scripts/realhost-b82-(c8e41d73|acceptance-v1)/[A-Za-z0-9_.-]+$ ||
       "${path}" == 'scripts/provision-ubuntu-test-host.sh') &&
     "${blob}" =~ ^[0-9a-f]{40}$ ]] || return 65
   valid_sha256 "${sha}" || return 65
@@ -341,7 +378,7 @@ verify_manifest_contract() {
   [[ -f "${MANIFEST}" && ! -L "${MANIFEST}" ]] || return 66
   [[ "$(sha256_file "${MANIFEST}")" == "${MANIFEST_SHA256}" ]] || return 67
   load_manifest || return $?
-  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v2' &&
+  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v3' &&
     "${MANIFEST_RUN_ID}" == "${RUN_ID}" && "${MANIFEST_PACKAGE_ID}" == "${PACKAGE_ID}" &&
     "${INTEGRATION_REF}" =~ ^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$ &&
     "${INTEGRATION_REF}" != *'..'* && "${INTEGRATION_REF}" != *'//'* &&
@@ -355,7 +392,11 @@ verify_manifest_contract() {
     "${TARGET_MACHINE_ID}" == '9db3fb717cc74974b2a6b243d67f67b9' &&
     "${TARGET_INTERFACE}" == 'ens33' && "${PEER_ADDRESS}" == '47.116.202.155' &&
     "${PEER_PORT}" == '5201' && "${SOAK_SECONDS}" == '3600' &&
-    "${SESSION_SECONDS}" == '300' ]] || return 65
+    "${SESSION_SECONDS}" == '300' &&
+    "${PHYSICAL_NIC_FORWARD_AUTHORITY}" == 'realnic-acceptance-v1' &&
+    "${PHYSICAL_INTERFACE_LOCK}" == '/run/wg-mix-ebpf-realnic-physical-interface.v1.lock' &&
+    "${LEGACY_MATRIX_MODE}" == 'retired' &&
+    "${REALNIC_PROFILE}" == 'acceptance' && "${REALNIC_TRAFFIC_SECONDS}" == '30' ]] || return 65
   valid_commit "${INTEGRATION_COMMIT}" || return 65
   case "${WG_STATE}" in
     bound)
@@ -395,13 +436,18 @@ verify_manifest_contract() {
     verify_identity "${TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_PATH}" "${TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_BLOB}" "${TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_SHA256}" &&
     verify_identity "${TEST_FRESH_VERIFIER_GATE_STATIC_PY_PATH}" "${TEST_FRESH_VERIFIER_GATE_STATIC_PY_BLOB}" "${TEST_FRESH_VERIFIER_GATE_STATIC_PY_SHA256}" &&
     verify_identity "${PREPARE_STAGE_ROOT_SH_PATH}" "${PREPARE_STAGE_ROOT_SH_BLOB}" "${PREPARE_STAGE_ROOT_SH_SHA256}" &&
+    verify_identity "${REALNIC_ACCEPTANCE_PY_PATH}" "${REALNIC_ACCEPTANCE_PY_BLOB}" "${REALNIC_ACCEPTANCE_PY_SHA256}" &&
+    verify_identity "${TEST_REALNIC_ACCEPTANCE_PY_PATH}" "${TEST_REALNIC_ACCEPTANCE_PY_BLOB}" "${TEST_REALNIC_ACCEPTANCE_PY_SHA256}" &&
+    verify_identity "${TEST_REALNIC_ACCEPTANCE_STATIC_PY_PATH}" "${TEST_REALNIC_ACCEPTANCE_STATIC_PY_BLOB}" "${TEST_REALNIC_ACCEPTANCE_STATIC_PY_SHA256}" &&
     verify_identity "${PROVISION_UBUNTU_TEST_HOST_SH_PATH}" "${PROVISION_UBUNTU_TEST_HOST_SH_BLOB}" \
       "${PROVISION_UBUNTU_TEST_HOST_SH_SHA256}" || return $?
 
   for name in bind-final-package.sh controller.sh root-matrix-n-r.sh check-realhost-iperf.py \
     test-hermetic-matrix.sh test_matrix_static.py checksum-module-lease.sh \
     root-fresh-verifier-gate.sh test-hermetic-fresh-verifier-gate.sh \
-    test_fresh_verifier_gate_static.py prepare-stage-root.sh provision-ubuntu-test-host.sh; do
+    test_fresh_verifier_gate_static.py prepare-stage-root.sh \
+    realnic_acceptance.py test_realnic_acceptance.py test_realnic_acceptance_static.py \
+    provision-ubuntu-test-host.sh; do
     [[ -f "${LOCAL_PACKAGE_DIR}/${name}" && ! -L "${LOCAL_PACKAGE_DIR}/${name}" ]] || return 66
     case "${name}" in
       bind-final-package.sh) sha="${BIND_FINAL_PACKAGE_SH_SHA256}" ;;
@@ -415,6 +461,9 @@ verify_manifest_contract() {
       test-hermetic-fresh-verifier-gate.sh) sha="${TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_SHA256}" ;;
       test_fresh_verifier_gate_static.py) sha="${TEST_FRESH_VERIFIER_GATE_STATIC_PY_SHA256}" ;;
       prepare-stage-root.sh) sha="${PREPARE_STAGE_ROOT_SH_SHA256}" ;;
+      realnic_acceptance.py) sha="${REALNIC_ACCEPTANCE_PY_SHA256}" ;;
+      test_realnic_acceptance.py) sha="${TEST_REALNIC_ACCEPTANCE_PY_SHA256}" ;;
+      test_realnic_acceptance_static.py) sha="${TEST_REALNIC_ACCEPTANCE_STATIC_PY_SHA256}" ;;
       provision-ubuntu-test-host.sh) sha="${PROVISION_UBUNTU_TEST_HOST_SH_SHA256}" ;;
     esac
     [[ "$(sha256_file "${LOCAL_PACKAGE_DIR}/${name}")" == "${sha}" ]] || return 67
@@ -427,13 +476,32 @@ verify_manifest_contract() {
   verify_bound_history || return $?
 }
 
+verify_local_approved_plan() {
+  local canonical shape size
+  [[ "${APPROVED_PLAN}" == /* && -f "${APPROVED_PLAN}" && ! -L "${APPROVED_PLAN}" ]] || return 66
+  canonical="$(CDPATH= cd -- "$(/usr/bin/dirname -- "${APPROVED_PLAN}")" && pwd -P)/${APPROVED_PLAN##*/}" || return 66
+  [[ "${canonical}" == "${APPROVED_PLAN}" ]] || return 66
+  if [[ "$(/usr/bin/uname -s)" == 'Darwin' ]]; then
+    shape="$(/usr/bin/stat -f '%Lp:%l:%HT' -- "${APPROVED_PLAN}")" || return 66
+    size="$(/usr/bin/stat -f '%z' -- "${APPROVED_PLAN}")" || return 66
+    [[ "${shape}" == '600:1:Regular File' ]] || return 66
+  else
+    shape="$(/usr/bin/stat -Lc '%a:%h:%F' -- "${APPROVED_PLAN}")" || return 66
+    size="$(/usr/bin/stat -Lc '%s' -- "${APPROVED_PLAN}")" || return 66
+    [[ "${shape}" == '600:1:regular file' ]] || return 66
+  fi
+  [[ "${size}" =~ ^[1-9][0-9]*$ &&
+    "${size}" -le 16777216 && "$(sha256_file "${APPROVED_PLAN}")" == "${APPROVED_PLAN_SHA256}" ]]
+}
+
 transport() {
   local action="$1" operation="$2"
   /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
     /usr/bin/expect "${LOCAL_REPOSITORY}/${LOCKED_TRANSPORT_EXP_PATH}" \
     --manifest "${MANIFEST}" --manifest-sha256 "${MANIFEST_SHA256}" \
     --credential-path "${SUPPLIED_CREDENTIAL_PATH}" --action "${action}" \
-    --operation "${operation}"
+    --operation "${operation}" --approved-plan "${APPROVED_PLAN}" \
+    --approved-plan-sha256 "${APPROVED_PLAN_SHA256}"
 }
 
 run_operation() {
@@ -463,7 +531,8 @@ readonly -a PACKAGE_NAMES=(
   provision-ubuntu-test-host.sh root-matrix-n-r.sh check-realhost-iperf.py
   test-hermetic-matrix.sh test_matrix_static.py checksum-module-lease.sh
   root-fresh-verifier-gate.sh test-hermetic-fresh-verifier-gate.sh
-  test_fresh_verifier_gate_static.py
+  test_fresh_verifier_gate_static.py realnic_acceptance.py
+  test_realnic_acceptance.py test_realnic_acceptance_static.py
 )
 readonly -a BOOTSTRAP_CREATE_OPERATIONS=(
   bootstrap-absent bootstrap-not-symlink bootstrap-create bootstrap-root-readlink bootstrap-root-stat
@@ -514,22 +583,20 @@ plan_all() {
   for operation in fresh-plan fresh-run fresh-restore; do
     run_operation plan "${operation}" || return $?
   done
-  if [[ "${WG_STATE}" == 'absent' ]]; then
-    printf 'B82_V6_MATRIX_BLOCKED reason=wireguard-topology-absent wg_active_scoped=not-covered pass=0\n'
-    printf 'B82_V6_CONTROLLER_PLAN_COMPLETE credential_read=0 network_operations=0 mutations=0 matrix_blocked=1\n'
-    return 0
+  run_operation plan realnic-plan || return $?
+  if [[ "${APPROVED_PLAN_SHA256}" != 'none' ]]; then
+    verify_local_approved_plan || return $?
+    for operation in scp-realnic-approved-plan verify-sha-realnic-approved-plan \
+      verify-stat-realnic-approved-plan stage-realnic-plan-snapshot realnic-run \
+      stage-realnic-plan-verify realnic-restore; do
+      run_operation plan "${operation}" || return $?
+    done
+  else
+    printf 'B82_V6_REALNIC_APPROVAL_REQUIRED local_plan=explicit approved_plan_sha256=explicit automatic_approval=0\n'
   fi
-  for operation in matrix-plan matrix-run; do
-    run_operation plan "${operation}" || return $?
-  done
-  for operation in tcx original all-on all-off tx-path rx-path mtu1492 mtu1500 soak; do
-    run_operation plan "matrix-restore-${operation}" || return $?
-  done
-  printf 'B82_V6_CONTROLLER_PLAN_COMPLETE credential_read=0 network_operations=0 mutations=0\n'
-}
-
-require_bound_wireguard() {
-  [[ "${WG_STATE}" == 'bound' ]] || fail 'wireguard-topology-absent' 78
+  printf '%s\n' \
+    'B82_V6_LEGACY_MATRIX_RETIRED controller_entries=0 historical_recovery=frozen-original-package-before-final-staging'
+  printf 'B82_V6_CONTROLLER_PLAN_COMPLETE credential_read=0 network_operations=0 mutations=0 legacy_forward=retired\n'
 }
 
 execute_preflight() {
@@ -666,6 +733,20 @@ execute_provision_apply() {
   execute_postflight
 }
 
+execute_realnic_run() {
+  local operation
+  verify_local_approved_plan || return $?
+  for operation in scp-realnic-approved-plan verify-sha-realnic-approved-plan \
+    verify-stat-realnic-approved-plan stage-realnic-plan-snapshot realnic-run; do
+    run_operation execute "${operation}" || return $?
+  done
+}
+
+execute_realnic_restore() {
+  run_operation execute stage-realnic-plan-verify || return $?
+  run_operation execute realnic-restore
+}
+
 main() {
   parse_arguments "$@" || fail 'arguments' $?
   verify_manifest_contract || fail 'manifest-contract' $?
@@ -674,18 +755,6 @@ main() {
     preflight) execute_preflight || fail 'preflight-operation' $? ;;
     prepare) execute_prepare || fail 'prepare-operation' $? ;;
     provision-apply) execute_provision_apply || fail 'provision-apply-operation' $? ;;
-    matrix-plan)
-      require_bound_wireguard
-      run_operation execute matrix-plan || fail 'matrix-plan-operation' $?
-      ;;
-    run)
-      require_bound_wireguard
-      run_operation execute matrix-run || fail 'matrix-run-operation' $?
-      ;;
-    restore)
-      require_bound_wireguard
-      run_operation execute "matrix-restore-${RESTORE_CELL}" || fail 'matrix-restore-operation' $?
-      ;;
     fresh-plan)
       run_operation execute fresh-plan || fail 'fresh-plan-operation' $?
       ;;
@@ -694,6 +763,15 @@ main() {
       ;;
     fresh-restore)
       run_operation execute fresh-restore || fail 'fresh-restore-operation' $?
+      ;;
+    realnic-plan)
+      run_operation execute realnic-plan || fail 'realnic-plan-operation' $?
+      ;;
+    realnic-run)
+      execute_realnic_run || fail 'realnic-run-operation' $?
+      ;;
+    realnic-restore)
+      execute_realnic_restore || fail 'realnic-restore-operation' $?
       ;;
   esac
 }

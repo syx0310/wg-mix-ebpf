@@ -11,6 +11,8 @@ readonly EXPECTED_OUTPUT_PREFIX="/private/tmp/wg-mix-b82-v6-${RUN_ID}-${PACKAGE_
 SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
 readonly SCRIPT_DIR
 readonly REPOSITORY_PATH_FROM_ROOT="scripts/realhost-b82-${RUN_ID}"
+readonly REALNIC_PATH_FROM_ROOT='scripts/realhost-b82-acceptance-v1'
+readonly PHYSICAL_INTERFACE_LOCK='/run/wg-mix-ebpf-realnic-physical-interface.v1.lock'
 
 MODE=''
 REPOSITORY=''
@@ -170,6 +172,9 @@ readonly -a PACKAGE_PATHS=(
   "${REPOSITORY_PATH_FROM_ROOT}/test-hermetic-fresh-verifier-gate.sh"
   "${REPOSITORY_PATH_FROM_ROOT}/test_fresh_verifier_gate_static.py"
   "${REPOSITORY_PATH_FROM_ROOT}/prepare-stage-root.sh"
+  "${REALNIC_PATH_FROM_ROOT}/realnic_acceptance.py"
+  "${REALNIC_PATH_FROM_ROOT}/test_realnic_acceptance.py"
+  "${REALNIC_PATH_FROM_ROOT}/test_realnic_acceptance_static.py"
   "scripts/provision-ubuntu-test-host.sh"
 )
 
@@ -229,6 +234,8 @@ plan_binding() {
     "${OUTPUT_DIR}" "${REMOTE_PACKAGE_DIR}" "${REMOTE_SOURCE}"
   printf 'wg_state=%s wg_interface=%s wg_local_address=%s wg_peer_address=%s\n' \
     "${WG_STATE}" "${WG_INTERFACE}" "${WG_LOCAL_ADDRESS}" "${WG_PEER_ADDRESS}"
+  printf '%s\n' \
+    'physical_nic_forward_authority=realnic-acceptance-v1 legacy_matrix_mode=retired'
   printf 'bundle_argv=/usr/bin/git bundle create %s %s\n' \
     "${OUTPUT_DIR}/source-${PACKAGE_ID}.bundle" "${SOURCE_REF}"
   printf 'repository_shallow=false history_verification=isolated-unbundle-rev-list-fsck-v1\n'
@@ -324,7 +331,7 @@ bind_package() {
 
   (set -o noclobber
     {
-      manifest_line format wg-mix-ebpf-b82-v6-package-v2
+      manifest_line format wg-mix-ebpf-b82-v6-package-v3
       manifest_line run_id "${RUN_ID}"
       manifest_line package_id "${PACKAGE_ID}"
       manifest_line integration_ref "${SOURCE_REF}"
@@ -353,6 +360,11 @@ bind_package() {
       manifest_line peer_port 5201
       manifest_line soak_seconds 3600
       manifest_line session_seconds 300
+      manifest_line physical_nic_forward_authority realnic-acceptance-v1
+      manifest_line physical_interface_lock "${PHYSICAL_INTERFACE_LOCK}"
+      manifest_line legacy_matrix_mode retired
+      manifest_line realnic_profile acceptance
+      manifest_line realnic_traffic_seconds 30
       for path in "${IDENTITY_PATHS[@]}"; do
         key="$(path_key "${path}")"
         blob="$(git_checked rev-parse "${COMMIT}:${path}")" || exit 68

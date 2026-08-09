@@ -84,7 +84,7 @@ def main() -> None:
         "manifest_line history_commit_count",
         "manifest_line history_roots_sha256",
         "manifest_line history_objects_sha256",
-        "wg-mix-ebpf-b82-v6-package-v2",
+        "wg-mix-ebpf-b82-v6-package-v3",
         "manifest_line wg_state",
         "absent)",
         '"${WG_INTERFACE}" == \'absent\'',
@@ -96,6 +96,14 @@ def main() -> None:
         "root-fresh-verifier-gate.sh",
         "test-hermetic-fresh-verifier-gate.sh",
         "test_fresh_verifier_gate_static.py",
+        "manifest_line physical_nic_forward_authority realnic-acceptance-v1",
+        'manifest_line physical_interface_lock "${PHYSICAL_INTERFACE_LOCK}"',
+        "manifest_line legacy_matrix_mode retired",
+        "manifest_line realnic_profile acceptance",
+        "manifest_line realnic_traffic_seconds 30",
+        '"${REALNIC_PATH_FROM_ROOT}/realnic_acceptance.py"',
+        '"${REALNIC_PATH_FROM_ROOT}/test_realnic_acceptance.py"',
+        '"${REALNIC_PATH_FROM_ROOT}/test_realnic_acceptance_static.py"',
     )
     for literal in required_binder:
         if literal not in binder:
@@ -110,9 +118,7 @@ def main() -> None:
         fail("binder contains package installation")
 
     required_controller = (
-        "B82_V6_MATRIX_BLOCKED reason=wireguard-topology-absent",
-        "require_bound_wireguard",
-        "fail 'wireguard-topology-absent' 78",
+        "B82_V6_LEGACY_MATRIX_RETIRED controller_entries=0 historical_recovery=frozen-original-package-before-final-staging",
         "identity-wg-interfaces",
         "identity-netns",
         "identity-driver",
@@ -145,6 +151,13 @@ def main() -> None:
         "run_operation execute fresh-restore",
         "CHECKSUM_MODULE_LEASE_SH_PATH",
         "ROOT_FRESH_VERIFIER_GATE_SH_PATH",
+        "realnic-plan | realnic-run | realnic-restore",
+        "verify_local_approved_plan",
+        "scp-realnic-approved-plan verify-sha-realnic-approved-plan",
+        "stage-realnic-plan-snapshot realnic-run",
+        "stage-realnic-plan-verify",
+        "run_operation execute realnic-restore",
+        "legacy_forward=retired",
     )
     for literal in required_controller:
         if literal not in controller:
@@ -158,6 +171,33 @@ def main() -> None:
             rf"{mode}\)\s+run_operation execute {mode}", controller, re.MULTILINE
         ):
             fail(f"controller {mode} is not an independent fixed operation")
+    for retired in ("matrix-plan", "matrix-run", "matrix-restore-", "--restore-cell"):
+        if retired in controller:
+            fail(f"controller still exposes retired physical-NIC mode {retired}")
+    if re.search(r"(?:^|[| {])restore(?:[| )}]|$)", controller):
+        fail("controller still exposes the legacy top-level restore mode")
+    if "hermetic-realnic-" in controller or "hermetic-realnic-" in transport:
+        fail("controller/transport runs realNIC tests from the flat package copy")
+    realnic_run = controller[
+        controller.index("execute_realnic_run() {") : controller.index(
+            "execute_realnic_restore() {"
+        )
+    ]
+    run_order = (
+        "verify_local_approved_plan",
+        "scp-realnic-approved-plan verify-sha-realnic-approved-plan",
+        "verify-stat-realnic-approved-plan stage-realnic-plan-snapshot realnic-run",
+    )
+    positions = [realnic_run.index(item) for item in run_order]
+    if positions != sorted(positions):
+        fail("realNIC run does not use the single fixed intake-before-run sequence")
+    realnic_restore = controller[
+        controller.index("execute_realnic_restore() {") : controller.index("main() {")
+    ]
+    if "scp-realnic-approved-plan" in realnic_restore or realnic_restore.count(
+        "stage-realnic-plan-verify"
+    ) != 1:
+        fail("realNIC restore recopies intake or lacks one root snapshot verification")
     prepare_body = controller[
         controller.index("execute_prepare() {") : controller.index("execute_provision_apply() {")
     ]
@@ -225,13 +265,20 @@ def main() -> None:
         "contains:v7.7.0",
         "contains:GNU Make 4.4.1",
         "set assertion empty",
-        "wireguard-topology-absent",
         "/usr/bin/test -r /sys/kernel/btf/vmlinux",
         "/usr/bin/findmnt --noheadings --raw --output FSTYPE,TARGET --target /sys/fs/bpf",
         "controller-shellcheck",
         "hermetic-fresh",
         "proc fresh_remote_argv",
         "fresh-plan - fresh-run - fresh-restore",
+        "proc realnic_remote_argv",
+        "realnic-plan - realnic-run - realnic-restore",
+        "/usr/bin/python3 -B -I",
+        "realnic-plan-snapshot",
+        "realnic-plan-verify",
+        "scp-realnic-approved-plan verify-sha-realnic-approved-plan",
+        "verify-stat-realnic-approved-plan",
+        "/run/wg-mix-ebpf-source-bootstrap-c8e41d73/realnic-approved-plan.json",
         "/root-fresh-verifier-gate.sh",
         "--controller-source $source",
         'set bootstrap_root "/run/wg-mix-ebpf-source-bootstrap-c8e41d73"',
@@ -285,6 +332,15 @@ def main() -> None:
         fail("transport accepts a caller-supplied remote argv")
     if "/usr/sbin/bpftool version" in transport:
         fail("transport retains the legacy bpftool version argv")
+    for retired in (
+        "matrix-plan - matrix-run",
+        '"matrix-plan"',
+        '"matrix-run"',
+        "matrix-restore-",
+        "proc matrix_remote_argv",
+    ):
+        if retired in transport:
+            fail(f"transport still exposes retired physical-NIC operation {retired}")
     fresh_argv_body = transport[
         transport.index("proc fresh_remote_argv") : transport.index("proc package_sha")
     ]
@@ -330,9 +386,9 @@ def main() -> None:
         "stage-exists",
         "clone --no-local",
         "checkout --detach",
-        "staged-script-hash",
+        "staged-content",
         "/usr/bin/shellcheck",
-        "status --porcelain=v1 --untracked-files=all",
+        "status --porcelain=v1",
         "noclobber",
         "retained=1",
         'readonly BOOTSTRAP_ROOT="/run/wg-mix-ebpf-source-bootstrap-${RUN_ID}"',
@@ -370,6 +426,37 @@ def main() -> None:
         "provision_ubuntu_test_host_sh_blob",
         "provision_ubuntu_test_host_sh_sha256",
         "${EXPECTED_SOURCE}/${PROVISION_PATH}",
+        'readonly USER_REALNIC_PLAN="${EXPECTED_REMOTE_PACKAGE}/realnic-approved-plan.json"',
+        'readonly ROOT_REALNIC_PLAN="${BOOTSTRAP_ROOT}/realnic-approved-plan.json"',
+        "realnic-plan-snapshot | realnic-plan-verify",
+        "require_completed_stage",
+        "open_approved_plan_intake",
+        'exec {APPROVED_PLAN_FD}<"${USER_REALNIC_PLAN}"',
+        '"/proc/self/fd/${APPROVED_PLAN_FD}"',
+        'APPROVED_PLAN_PENDING="${ROOT_REALNIC_PLAN}.pending.${APPROVED_PLAN_SHA256}"',
+        "create_approved_plan_pending",
+        "write_approved_plan_pending",
+        "require_approved_plan_pending_fd",
+        "fsync_exact_target",
+        '/bin/ln --no-target-directory --',
+        "held-fd-writeall-fsync-hardlink-noclobber",
+        "final-pending-same-inode",
+        "approved-plan-preexisting-differs",
+        "approved-plan-root-snapshot",
+        "verified-existing",
+        "verify_realnic_plan",
+        "root:root:600:1:regular file",
+        "siyixuan:siyixuan",
+        "realnic_acceptance_py_path",
+        "test_realnic_acceptance_py_path",
+        "test_realnic_acceptance_static_py_path",
+        "S6.realnic-unit",
+        "S6.realnic-static",
+        "PYTHONDONTWRITEBYTECODE=1",
+        '"${EXPECTED_SOURCE}/${REALNIC_TEST_PATH}"',
+        '"${EXPECTED_SOURCE}/${REALNIC_STATIC_PATH}"',
+        "realnic-hermetic-unit",
+        "realnic-hermetic-static",
     )
     for literal in required_stager:
         if literal not in stager:
@@ -398,8 +485,64 @@ def main() -> None:
         "write_binding_marker || fail 'binding-marker'"
     ):
         fail("root stager binds the stage before revalidating the shared module lock")
+    staged_gate_order = (
+        'checkout --detach "${INTEGRATION_COMMIT}"',
+        "require_staged_content || fail 'staged-content'",
+        "run_step S6.realnic-unit",
+        "run_step S6.realnic-static",
+        "require_staged_content || fail 'staged-content-postcheck'",
+        "write_binding_marker || fail 'binding-marker'",
+    )
+    positions = [stager.index(item) for item in staged_gate_order]
+    if positions != sorted(positions):
+        fail("realNIC tests do not gate the staged source before binding")
     if stager.count('readonly BOOTSTRAP_ROOT="/run/wg-mix-ebpf-source-bootstrap-${RUN_ID}"') != 1:
         fail("root stager has zero or multiple bootstrap roots")
+    if stager.count('readonly ROOT_REALNIC_PLAN="${BOOTSTRAP_ROOT}/realnic-approved-plan.json"') != 1:
+        fail("root stager has zero or multiple approved-plan authorities")
+    snapshot_body = stager[
+        stager.index("snapshot_realnic_plan() {") : stager.index("verify_realnic_plan() {")
+    ]
+    publish_order = (
+        "require_completed_stage",
+        "acquire_physical_interface_lock",
+        "open_approved_plan_intake",
+        "create_approved_plan_pending",
+        "write_approved_plan_pending",
+        'fsync_exact_target "${BOOTSTRAP_ROOT}" directory',
+        "require_approved_plan_pending_fd",
+        '/bin/ln --no-target-directory --',
+        'require_approved_plan_path "${ROOT_REALNIC_PLAN}"',
+        'fsync_exact_target "${BOOTSTRAP_ROOT}" directory',
+    )
+    remaining = snapshot_body
+    for literal in publish_order:
+        position = remaining.find(literal)
+        if position < 0:
+            fail(f"realNIC durable publish order is missing {literal!r}")
+        remaining = remaining[position + len(literal) :]
+    if snapshot_body.count('/bin/ln --no-target-directory --') != 1:
+        fail("realNIC durable publish has zero or multiple final link primitives")
+    if snapshot_body.count('fsync_exact_target "${BOOTSTRAP_ROOT}" directory') != 2:
+        fail("realNIC durable publish does not fsync the parent before and after link")
+    verify_body = stager[
+        stager.index("verify_realnic_plan() {") : stager.index("run_stage() {")
+    ]
+    if "USER_REALNIC_PLAN" in verify_body or "write_approved_plan_pending" in verify_body:
+        fail("realNIC restore verification reopens or recopies user intake")
+    if "published.v1" in stager or "publish-receipt" in stager:
+        fail("root stager introduced a second approved-plan terminal authority")
+    redundant_manifest_fields = (
+        "manifest_line physical_interface_lock_interface",
+        "manifest_line legacy_matrix_restore_cells",
+        "manifest_line legacy_retirement_reservation",
+        "manifest_line realnic_soak_window_seconds",
+        "manifest_line realnic_plan_intake_name",
+        "manifest_line realnic_root_plan",
+    )
+    for literal in redundant_manifest_fields:
+        if literal in binder:
+            fail(f"binder repeats derivable manifest field {literal}")
 
     required_provisioner = (
         "--check",
@@ -421,12 +564,24 @@ def main() -> None:
         "--privileged",
         "find -delete",
         "rm -rf",
+        "/usr/sbin/ethtool",
+        "/usr/sbin/ip",
+        "/usr/sbin/bpftool",
+        "/usr/bin/iperf3",
+        "--restore-cell",
     )
     for literal in matrix_forbidden:
         if literal in matrix:
             fail(f"existing matrix contains prohibited literal: {literal}")
     if "readonly RUN_ID='c8e41d73'" not in matrix:
         fail("existing matrix run identity changed")
+    for literal in (
+        "REALHOST_V6_LEGACY_CONTROLLER_AUTHORITY state=retired controller_entries=0 restore_entries=0",
+        "REALHOST_V6_HISTORICAL_RECOVERY package=frozen-original-package timing=before-final-staging",
+        "legacy-matrix-retired-use-frozen-original-package-before-final-staging",
+    ):
+        if literal not in matrix:
+            fail(f"retired matrix contract is missing {literal!r}")
 
     print("static v6 binder/controller/transport/stager safety contract: PASS")
 
