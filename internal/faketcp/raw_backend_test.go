@@ -92,6 +92,16 @@ func testPendingPacket(t testing.TB, flow abi.FakeTCPSessionKey, capture uint64)
 	}
 }
 
+func driftPendingPacketData(t testing.TB, packet PendingPacket) PendingPacket {
+	t.Helper()
+	packet.Data = append([]byte(nil), packet.Data...)
+	packet.Data[len(packet.Data)-1] ^= 1
+	if err := MaterializeIPv4UDPChecksums(packet.Data); err != nil {
+		t.Fatal(err)
+	}
+	return packet
+}
+
 func TestRawControllerBackendSendsControlWithExplicitRouteMark(t *testing.T) {
 	writer := &memoryRawIPv4Writer{}
 	flow := testFlow(31001)
@@ -160,6 +170,39 @@ func TestRawControllerBackendReinjectsMaterializedPacketThroughOriginalMark(t *t
 	}
 }
 
+func TestRawControllerBackendRejectsZeroCaptureFingerprint(t *testing.T) {
+	writer := &memoryRawIPv4Writer{}
+	backend, err := NewRawControllerBackend(RawControllerBackendOptions{
+		Writer: writer,
+		ControlMarks: ControlMarkResolverFunc(func(context.Context, abi.FakeTCPSessionKey, uint32) (uint32, error) {
+			return 0, nil
+		}),
+		RuntimeIdentity: testRuntimeIdentity(1), MaxReinjectStreams: 8,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow := testFlow(31001)
+	packet := testPendingPacket(t, flow, 123)
+	wantFingerprint := packet.CaptureFingerprint
+	packet.CaptureFingerprint = [32]byte{}
+	if err := backend.Reinject(context.Background(), flow, packet); err == nil ||
+		err.Error() != "faketcp captured packet has zero capture fingerprint" {
+		t.Fatalf("zero capture fingerprint error=%v", err)
+	}
+	if writes, _ := writer.snapshot(); len(writes) != 0 {
+		t.Fatalf("zero capture fingerprint wrote %d packets", len(writes))
+	}
+
+	packet.CaptureFingerprint = wantFingerprint
+	if err := backend.Reinject(context.Background(), flow, packet); err != nil {
+		t.Fatal(err)
+	}
+	if writes, _ := writer.snapshot(); len(writes) != 1 {
+		t.Fatalf("valid capture after rejection wrote %d packets", len(writes))
+	}
+}
+
 func TestOnceReinjectorAttemptsExactIdentityOnlyOnce(t *testing.T) {
 	wantErr := errors.New("ambiguous raw send failure")
 	writer := &memoryRawIPv4Writer{writeErr: wantErr}
@@ -177,6 +220,29 @@ func TestOnceReinjectorAttemptsExactIdentityOnlyOnce(t *testing.T) {
 	writes, _ := writer.snapshot()
 	if len(writes) != 1 {
 		t.Fatalf("raw attempts=%d, want one", len(writes))
+	}
+}
+
+func TestOnceReinjectorExactDuplicateDoesNotAllocate(t *testing.T) {
+	writer := &memoryRawIPv4Writer{}
+	reinjector, err := newOnceReinjector(writer, testRuntimeIdentity(1), 8)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow := testFlow(31001)
+	packet := testPendingPacket(t, flow, 123)
+	if err := reinjector.Reinject(context.Background(), flow, packet); err != nil {
+		t.Fatal(err)
+	}
+	var duplicateErr error
+	allocations := testing.AllocsPerRun(1000, func() {
+		duplicateErr = reinjector.Reinject(context.Background(), flow, packet)
+	})
+	if duplicateErr != nil {
+		t.Fatal(duplicateErr)
+	}
+	if allocations != 0 {
+		t.Fatalf("exact duplicate allocations=%v, want 0", allocations)
 	}
 }
 
@@ -232,14 +298,9 @@ func TestOnceReinjectorRejectsCaptureIdentityReuseWithDifferentMetadata(t *testi
 		t.Fatalf("capture identity conflict error=%v", err)
 	}
 	conflict = packet
-	conflict.Data = append([]byte(nil), packet.Data...)
-	conflict.Data[len(conflict.Data)-1] ^= 1
-	if err := MaterializeIPv4UDPChecksums(conflict.Data); err != nil {
-		t.Fatal(err)
-	}
-	conflict.CaptureFingerprint = sha256.Sum256(conflict.Data)
+	conflict = driftPendingPacketData(t, conflict)
 	if err := reinjector.Reinject(context.Background(), flow, conflict); !errors.Is(err, ErrCaptureIdentityConflict) {
-		t.Fatalf("capture packet fingerprint conflict error=%v", err)
+		t.Fatalf("materialized packet drift with unchanged capture fingerprint error=%v", err)
 	}
 	writes, _ := writer.snapshot()
 	if len(writes) != 1 {
