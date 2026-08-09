@@ -1338,11 +1338,11 @@ proc transaction_operation {operation} {
 }
 
 proc read_only_operation {operation} {
-    if {[regexp {^(identity-|tool-|kernel-|stale-)} $operation] ||
-        [regexp {^verify-(?:sha|stat)-} $operation]} {
+    if {[lsearch -exact [concat [base_identity_operations] [postflight_operations] \
+        [prepare_stale_operations]] $operation] >= 0} {
         return 1
     }
-    return [expr {$operation in {
+    if {$operation in {
         package-parent-stat bootstrap-absent bootstrap-not-symlink
         bootstrap-root-readlink bootstrap-root-stat bootstrap-stager-readlink
         bootstrap-stager-stat bootstrap-stager-sha bootstrap-provisioner-readlink
@@ -1350,7 +1350,14 @@ proc read_only_operation {operation} {
         stage-plan fresh-plan veth-plan routed-plan
         verify-sha-realnic-approved-plan verify-stat-realnic-approved-plan
         stage-realnic-plan-verify
-    }}]
+    }} {
+        return 1
+    }
+    if {[regexp {^verify-(?:sha|stat)-(.+)$} $operation -> name] &&
+        [lsearch -exact [package_names] $name] >= 0} {
+        return 1
+    }
+    return 0
 }
 
 proc operation_requires_approved_sha {operation} {
@@ -1825,14 +1832,20 @@ proc transport_main {arguments} {
         flush stdout
         exit 0
     }
+    set prebuilt_operation_spec {}
     if {[transaction_operation $operation]} {
         require_transaction_local_authority $values $manifest_sha $operation $approved_sha
+    } elseif {[catch {build_operation $values $manifest_sha $operation \
+        $approved_sha} prebuilt_operation_spec]} {
+        fail "policy" 66
     }
     set password [read_execute_credential $credential_path]
     if {[transaction_operation $operation]} {
         execute_transaction $values $manifest_sha $operation $approved_sha $password
     } else {
-        require_primitive_success [execute_primitive $values $manifest_sha $operation $approved_sha $password]
+        require_manifest_authority $values $manifest_sha
+        require_primitive_success [execute_operation_spec $operation \
+            $prebuilt_operation_spec $password]
     }
     set password ""
     exit 0
