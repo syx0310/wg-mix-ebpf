@@ -91,6 +91,8 @@ class SimulatedRunner(FixtureRunner):
         parsed = MODULE.parse_features(self.outputs[(MODULE.TOOLS["ethtool"], "-k", spec.interface)])
         self.features = {name: entry["enabled"] for name, entry in parsed.items()}
         self.fixed = {name: entry["fixed"] for name, entry in parsed.items()}
+        self.feature_parents = {name: entry["parent"] for name, entry in parsed.items()}
+        self.feature_names = tuple(parsed)
         self.mtu = spec.expected_mtu
         self.iperf_calls = 0
         self.fail_iperf_call = fail_iperf_call
@@ -104,9 +106,10 @@ class SimulatedRunner(FixtureRunner):
 
     def feature_output(self):
         lines = [f"Features for {self.spec.interface}:"]
-        for name in MODULE.FEATURE_ORDER:
+        for name in self.feature_names:
             fixed = " [fixed]" if self.fixed[name] else ""
-            lines.append(f"{name}: {'on' if self.features[name] else 'off'}{fixed}")
+            indentation = "    " if self.feature_parents[name] is not None else ""
+            lines.append(f"{indentation}{name}: {'on' if self.features[name] else 'off'}{fixed}")
         return ("\n".join(lines) + "\n").encode()
 
     def iperf_output(self, argv):
@@ -166,6 +169,8 @@ class SimulatedRunner(FixtureRunner):
             self.ethtool_writes += 1
             self.network_writes += 1
             self.features[name] = value == "on"
+            if name == "tx-checksumming":
+                self.features["tx-checksum-ipv4"] = value == "on"
             if self.fail_ethtool_write_call == self.ethtool_writes:
                 raise MODULE.HarnessError("injected post-ethtool failure")
             return 0, b"", b""
@@ -294,6 +299,9 @@ def fixture_outputs(spec, *, fixed=()):
     for name in MODULE.FEATURE_ORDER:
         suffix = " [fixed]" if name in fixed else ""
         features.append(f"{name}: {'on' if initial[name] else 'off'}{suffix}")
+        if name == "tx-checksumming":
+            features.append("    tx-checksum-ipv4: on")
+    features.append("foreign-offload: on")
     def json_bytes(value):
         return json.dumps(value).encode()
 
@@ -735,6 +743,8 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(plan["counter_failure_policy"], MODULE.counter_failure_policy())
         self.assertIn("failure", plan["counter_failure_policy"]["failure_tokens"])
         self.assertIn("no_buffer", plan["counter_failure_policy"]["failure_phrases"])
+        self.assertIn("tx-checksum-ipv4", plan["owned_feature_closure"])
+        self.assertNotIn("foreign-offload", plan["owned_feature_closure"])
         self.assertEqual(len(soak["traffic"]) - 1, 12)
         self.assertEqual(soak["counter_sample_schedule"]["expected_samples"], 360)
         self.assertEqual(soak["counter_sample_schedule"]["interval_seconds"], 10)
@@ -1055,6 +1065,7 @@ class HermeticStateMachineTests(unittest.TestCase):
                     MODULE.canonical_json([{"kind": "fq_codel", "handle": "0:"}])
                 )
                 runner.outputs[(MODULE.TOOLS["wg"], "show", "interfaces")] = b"wg0 wg-diagnostic\n"
+                runner.features["foreign-offload"] = False
                 peer_route_argv = (MODULE.TOOLS["ip"], "-j", "route", "get", spec.peer_address)
                 runner.read_failures.add(peer_route_argv)
 
@@ -1072,10 +1083,26 @@ class HermeticStateMachineTests(unittest.TestCase):
             self.assertGreaterEqual(len(diagnostics), 3)
             for event in diagnostics:
                 self.assertTrue(
-                    {"bpf_links", "peer_route", "qdisc", "routes", "wg_interfaces"}
+                    {"bpf_links", "features", "peer_route", "qdisc", "routes", "wg_interfaces"}
                     <= set(event["drift_labels"])
                 )
             self.assertEqual(diagnostics[0]["observations"]["peer_route"]["status"], "command-failed")
+            self.assertEqual(
+                diagnostics[0]["observations"]["features"]["foreign_changed"],
+                ["foreign-offload"],
+            )
+
+    def test_explicit_restore_requires_exact_owned_feature_dependency_closure(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=10)
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                with self.assertRaises(MODULE.HarnessError):
+                    MODULE.run_mode(spec, plan_path, digest, runner)
+                runner.features["tx-checksum-ipv4"] = False
+                with self.assertRaisesRegex(MODULE.HarnessError, "owned feature closure mismatch"):
+                    MODULE.restore_mode(spec, plan_path, digest, runner)
 
 
 class JournalDurabilityTests(unittest.TestCase):

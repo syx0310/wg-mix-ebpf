@@ -595,19 +595,43 @@ def parse_features(data: bytes) -> dict[str, dict[str, Any]]:
     lines = data.decode("utf-8").splitlines()
     if not lines or not lines[0].startswith("Features for "):
         raise HarnessError("ethtool feature output has no header")
-    pattern = re.compile(r"^\s*([a-z0-9][a-z0-9_-]*):\s+(on|off)(?:\s+\[fixed\])?\s*$")
+    pattern = re.compile(r"^(\s*)([a-z0-9][a-z0-9_-]*):\s+(on|off)(?:\s+\[fixed\])?\s*$")
+    parent: str | None = None
     for raw in lines[1:]:
         match = pattern.fullmatch(raw)
         if not match:
             raise HarnessError(f"unparsed ethtool feature line: {raw!r}")
-        name, value = match.groups()
+        indentation, name, value = match.groups()
         if name in features:
             raise HarnessError(f"duplicate ethtool feature: {name}")
-        features[name] = {"enabled": value == "on", "fixed": "[fixed]" in raw}
+        if not indentation:
+            parent = name
+            feature_parent = None
+        else:
+            if parent is None:
+                raise HarnessError("indented ethtool feature has no parent")
+            feature_parent = parent
+        features[name] = {
+            "enabled": value == "on",
+            "fixed": "[fixed]" in raw,
+            "parent": feature_parent,
+        }
     missing = sorted(set(FEATURE_ORDER) - set(features))
     if missing:
         raise HarnessError(f"required ethtool features are missing: {','.join(missing)}")
     return features
+
+
+def owned_feature_closure(features: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    if not isinstance(features, Mapping) or not all(
+        isinstance(name, str) and isinstance(entry, Mapping) for name, entry in features.items()
+    ):
+        raise HarnessError("feature snapshot is malformed")
+    return sorted(
+        name
+        for name, entry in features.items()
+        if name in FEATURE_ORDER or entry.get("parent") in FEATURE_ORDER
+    )
 
 
 def normalize_bpf(items: Any, kind: str) -> list[dict[str, Any]]:
@@ -861,6 +885,22 @@ def collect_restore_snapshot(
         allowed_mtu=allowed_mtu,
         require_peer_route=False,
     )
+    closure = set(owned_feature_closure(baseline["features"]))
+    feature_names = set(baseline["features"]) | set(snapshot["features"])
+    changed_features = sorted(
+        name
+        for name in feature_names
+        if baseline["features"].get(name) != snapshot["features"].get(name)
+    )
+    owned_feature_drift = [name for name in changed_features if name in closure]
+    foreign_feature_drift = [name for name in changed_features if name not in closure]
+    observations["features"] = {
+        "status": "baseline-match" if not changed_features else "feature-drift",
+        "baseline_sha256": sha256_bytes(canonical_json(baseline["features"])),
+        "normalized_sha256": sha256_bytes(canonical_json(snapshot["features"])),
+        "owned_changed": owned_feature_drift,
+        "foreign_changed": foreign_feature_drift,
+    }
     diagnostics = {
         "observations": observations,
         "drift_labels": sorted(
@@ -1586,6 +1626,7 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         "spec": spec.as_dict(),
         "execution_profile": spec.profile,
         "counter_failure_policy": counter_failure_policy(),
+        "owned_feature_closure": owned_feature_closure(snapshot["features"]),
         "snapshot_commands": snapshot_commands,
         "baseline": snapshot,
         "traffic_oracle": traffic_oracle,
@@ -1745,6 +1786,8 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
     baseline = plan.get("baseline")
     if not isinstance(baseline, dict):
         raise HarnessError("approved plan has no baseline")
+    if plan.get("owned_feature_closure") != owned_feature_closure(baseline.get("features", {})):
+        raise HarnessError("approved plan owned feature closure is not exact")
     oracle_contract = plan.get("traffic_oracle")
     if (
         not isinstance(oracle_contract, dict)
@@ -2955,6 +2998,7 @@ def validate_fully_restored(baseline: Mapping[str, Any], current: Mapping[str, A
 def validate_restore_owned_scope(
     baseline: Mapping[str, Any],
     current: Mapping[str, Any],
+    owned_features: Sequence[str],
     cell: Mapping[str, Any] | None = None,
 ) -> None:
     if current["host"] != baseline["host"]:
@@ -2971,14 +3015,24 @@ def validate_restore_owned_scope(
     target_mtu = baseline_mtu if cell is None else int(cell["expected_mtu"])
     if current_mtu not in {baseline_mtu, target_mtu}:
         raise HarnessError("restore MTU is outside its baseline/target receipt")
+    if set(FEATURE_ORDER) - set(owned_features):
+        raise HarnessError("restore owned feature closure omits a primary toggle")
     expected_features = None if cell is None else cell.get("expected_primary_features")
-    for name in FEATURE_ORDER:
+    for name in owned_features:
         baseline_entry = baseline["features"].get(name)
         current_entry = current["features"].get(name)
         if not isinstance(baseline_entry, dict) or not isinstance(current_entry, dict):
             raise HarnessError(f"restore feature receipt is absent for {name}")
+        if cell is None:
+            if current_entry != baseline_entry:
+                raise HarnessError(f"restore owned feature closure mismatch for {name}")
+            continue
         if current_entry.get("fixed") != baseline_entry.get("fixed"):
             raise HarnessError(f"restore feature fixed-state changed for {name}")
+        if current_entry.get("parent") != baseline_entry.get("parent"):
+            raise HarnessError(f"restore feature dependency changed for {name}")
+        if name not in FEATURE_ORDER:
+            continue
         baseline_enabled = bool(baseline_entry.get("enabled"))
         target_enabled = (
             baseline_enabled if expected_features is None else bool(expected_features[name])
@@ -3000,12 +3054,15 @@ def append_restore_diagnostics(
     )
 
 
-def restore_owned_evidence(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+def restore_owned_evidence(
+    snapshot: Mapping[str, Any],
+    owned_features: Sequence[str],
+) -> dict[str, Any]:
     return {
         "host": snapshot["host"],
         "interface_identity": snapshot["interface_identity"],
         "link": snapshot["link"],
-        "features": {name: snapshot["features"][name] for name in FEATURE_ORDER},
+        "features": {name: snapshot["features"][name] for name in owned_features},
     }
 
 
@@ -3236,7 +3293,7 @@ def restore_with_interface_lease(
             current, _, diagnostics = collect_restore_snapshot(spec, runner, baseline)
             if diagnostics["drift_labels"]:
                 append_restore_diagnostics(journal, "terminal-complete", diagnostics)
-            validate_restore_owned_scope(baseline, current)
+            validate_restore_owned_scope(baseline, current, plan["owned_feature_closure"])
             if release_needed:
                 lease.release()
                 journal.append("INTERFACE_LEASE_RELEASED", path=lease.path, terminal_restore=True)
@@ -3255,7 +3312,7 @@ def restore_with_interface_lease(
             current, _, diagnostics = collect_restore_snapshot(spec, runner, baseline)
             if diagnostics["drift_labels"]:
                 append_restore_diagnostics(journal, "terminal-explicit-restored", diagnostics)
-            validate_restore_owned_scope(baseline, current)
+            validate_restore_owned_scope(baseline, current, plan["owned_feature_closure"])
             if release_needed:
                 lease.release()
                 journal.append("INTERFACE_LEASE_RELEASED", path=lease.path, terminal_restore=True)
@@ -3278,7 +3335,7 @@ def restore_with_interface_lease(
         if active is None:
             current, _, diagnostics = collect_restore_snapshot(spec, runner, baseline)
             append_restore_diagnostics(journal, "explicit-restore-start", diagnostics)
-            validate_restore_owned_scope(baseline, current)
+            validate_restore_owned_scope(baseline, current, plan["owned_feature_closure"])
             journal.append("EXPLICIT_RESTORE_INTENT", attempt=attempt, cell=None, exact_reverse_argv=[])
         else:
             cell = plan_cell(plan, active)
@@ -3289,7 +3346,7 @@ def restore_with_interface_lease(
                 allowed_mtu=frozenset({spec.expected_mtu, int(cell["expected_mtu"])}),
             )
             append_restore_diagnostics(journal, "explicit-restore-start", diagnostics)
-            validate_restore_owned_scope(baseline, current, cell)
+            validate_restore_owned_scope(baseline, current, plan["owned_feature_closure"], cell)
             journal.append(
                 "EXPLICIT_RESTORE_INTENT",
                 attempt=attempt,
@@ -3309,10 +3366,10 @@ def restore_with_interface_lease(
                 journal.append("EXPLICIT_RESTORE_APPLIED", attempt=attempt, cell=active, index=index)
         restored, _, diagnostics = collect_restore_snapshot(spec, runner, baseline)
         append_restore_diagnostics(journal, "explicit-restore-finish", diagnostics)
-        validate_restore_owned_scope(baseline, restored)
+        validate_restore_owned_scope(baseline, restored, plan["owned_feature_closure"])
         write_idempotent_exact(
             f"{spec.run_root}/explicit-restored-snapshot.json",
-            canonical_json(restore_owned_evidence(restored)),
+            canonical_json(restore_owned_evidence(restored, plan["owned_feature_closure"])),
         )
         write_idempotent_exact(marker_path, marker_payload)
         if active is not None:
