@@ -77,7 +77,7 @@ verify_stage_identity() {
     -d "${SOURCE}" && ! -L "${SOURCE}" && -d "${SOURCE}/.git" ]] || fail 'source-path' 79
   shape="$(/usr/bin/stat -Lc '%u:%g:%a:%F' -- "${SOURCE}")" || fail 'source-stat'
   [[ "${shape}" == '0:0:700:directory' ]] || fail 'source-identity' 79
-  head="$("${GIT_COMMAND[@]}" -C "${SOURCE}" rev-parse --verify HEAD^{commit})" || fail 'source-head'
+  head="$("${GIT_COMMAND[@]}" -C "${SOURCE}" rev-parse --verify 'HEAD^{commit}')" || fail 'source-head'
   [[ "${head}" == "${COMMIT}" ]] || fail 'source-commit' 79
   "${GIT_COMMAND[@]}" -C "${SOURCE}" diff --quiet "${COMMIT}" -- || fail 'tracked-worktree-drift' 79
   "${GIT_COMMAND[@]}" -C "${SOURCE}" diff --cached --quiet "${COMMIT}" -- || fail 'index-drift' 79

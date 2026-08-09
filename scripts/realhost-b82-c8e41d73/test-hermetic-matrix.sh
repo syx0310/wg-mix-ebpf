@@ -3,7 +3,8 @@ set -u
 set -o pipefail
 umask 077
 
-readonly REVIEW_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+REVIEW_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
+readonly REVIEW_ROOT
 readonly MATRIX="${REVIEW_ROOT}/root-matrix-n-r.sh"
 readonly STAGER="${REVIEW_ROOT}/prepare-stage-root.sh"
 readonly STATIC_TEST="${REVIEW_ROOT}/test_matrix_static.py"

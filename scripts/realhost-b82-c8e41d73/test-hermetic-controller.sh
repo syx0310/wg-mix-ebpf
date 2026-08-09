@@ -3,9 +3,9 @@ set -u
 set -o pipefail
 umask 077
 
-REVIEW_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
+REVIEW_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
 readonly REVIEW_ROOT
-REPOSITORY="$(CDPATH= cd -- "${REVIEW_ROOT}/../.." && pwd -P)" || exit 70
+REPOSITORY="$(CDPATH='' cd -- "${REVIEW_ROOT}/../.." && pwd -P)" || exit 70
 readonly REPOSITORY
 readonly BINDER="${REVIEW_ROOT}/bind-final-package.sh"
 readonly CONTROLLER="${REVIEW_ROOT}/controller.sh"
@@ -412,6 +412,8 @@ for reader_spec in \
     "final-lf-nul:${MANIFEST_FINAL_LF_NUL}"; do
     manifest_name="${manifest_spec%%:*}"
     manifest_path="${manifest_spec#*:}"
+    # The child shell expands these positional parameters, not this harness.
+    # shellcheck disable=SC2016
     expect_exact_rc "${reader_name}-${manifest_name}" 65 /bin/bash -c '
       source "$1" || exit $?
       MANIFEST="$2"
@@ -426,6 +428,8 @@ for reader_spec in \
     [[ "${key}" == format && "${value}" == wg-mix-ebpf-b82-v6-package-v4 ]]
   ' manifest-pread-offset-zero "${reader_script}" "${BOUND_MANIFEST}" ||
     fail "${reader_name} NUL precheck advanced the manifest FD"
+  # The child shell expands these positional parameters, not this harness.
+  # shellcheck disable=SC2016
   expect_exact_rc "${reader_name}-nul-pread-error" 66 /bin/bash -c '
     source "$1" || exit $?
     : >"$2" || exit $?

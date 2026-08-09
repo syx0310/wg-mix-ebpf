@@ -167,6 +167,8 @@ done
 }
 
 apt_plan_has_forbidden_changes() {
+  # Dollar-prefixed fields belong to AWK and must remain single-quoted.
+  # shellcheck disable=SC2016
   "${CLEAN_ENV[@]}" /usr/bin/awk '
     function is_boot_package(package) {
       return package ~ /^(grub|initramfs-tools|linux-image-|linux-modules-|shim-signed|systemd-boot)/
@@ -200,6 +202,8 @@ apt_plan_has_forbidden_changes() {
 }
 
 dpkg_status_has_pending_work() {
+  # Dollar-prefixed fields belong to AWK and must remain single-quoted.
+  # shellcheck disable=SC2016
   "${CLEAN_ENV[@]}" /usr/bin/awk -F '\t' '
     {
       seen = 1
@@ -310,6 +314,8 @@ for path in /usr/bin/apt-get /usr/bin/awk /usr/bin/date /usr/bin/dpkg-query \
 done
 
 os_release_field() {
+  # Dollar-prefixed fields belong to AWK and must remain single-quoted.
+  # shellcheck disable=SC2016
   "${CLEAN_ENV[@]}" /usr/bin/awk -F= -v key="$1" '
     $1 == key {
       value = $2
@@ -322,6 +328,8 @@ os_release_field() {
   ' /etc/os-release
 }
 
+# Dollar-prefixed fields belong to AWK and must remain single-quoted.
+# shellcheck disable=SC2016
 if ! "${CLEAN_ENV[@]}" /usr/sbin/ip -o -4 address show dev "${EXPECTED_INTERFACE}" |
   "${CLEAN_ENV[@]}" /usr/bin/awk -v expected="${EXPECTED_ADDRESS}" '
     {
@@ -361,6 +369,8 @@ KERNEL_RELEASE="$("${CLEAN_ENV[@]}" /usr/bin/uname -r)"
 
 package_is_installed() {
   local status
+  # dpkg-query expands this format token; the shell must pass it literally.
+  # shellcheck disable=SC2016
   status="$("${CLEAN_ENV[@]}" /usr/bin/dpkg-query -W \
     -f='${db:Status-Abbrev}' "$1" 2>/dev/null)" || return 1
   [[ "${status}" == 'ii ' || "${status}" == 'hi ' ]]
@@ -415,8 +425,12 @@ service_snapshot() {
     --state=active --no-legend --no-pager --plain)" || return $?
   enabled="$("${CLEAN_ENV[@]}" /usr/bin/systemctl list-unit-files --type=service \
     --state=enabled,enabled-runtime --no-legend --no-pager)" || return $?
+  # Dollar-prefixed fields belong to AWK and must remain single-quoted.
+  # shellcheck disable=SC2016
   active="$("${CLEAN_ENV[@]}" /usr/bin/awk 'NF {print "active " $1}' \
     <<<"${active}")" || return $?
+  # Dollar-prefixed fields belong to AWK and must remain single-quoted.
+  # shellcheck disable=SC2016
   enabled="$("${CLEAN_ENV[@]}" /usr/bin/awk 'NF {print $2 " " $1}' \
     <<<"${enabled}")" || return $?
   printf '%s\n%s\n' "${active}" "${enabled}" |
@@ -464,6 +478,8 @@ run_logged_capture() {
 
 verify_clean_dpkg_state() {
   local states
+  # dpkg-query expands these format tokens; the shell must pass them literally.
+  # shellcheck disable=SC2016
   run_logged_capture states 'verify dpkg package states' \
     "${CLEAN_ENV[@]}" /usr/bin/dpkg-query -W \
     -f='${db:Status-Abbrev}\t${binary:Package}\n' || return $?

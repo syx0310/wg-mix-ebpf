@@ -8,7 +8,7 @@ readonly PACKAGE_ID='4f2a9b61'
 readonly REMOTE_PACKAGE_DIR="/home/siyixuan/wg-mix-ebpf-test/unpriv-${PACKAGE_ID}"
 readonly REMOTE_SOURCE="/run/wg-mix-ebpf-source-stages/${RUN_ID}/source"
 readonly EXPECTED_OUTPUT_PREFIX="/private/tmp/wg-mix-b82-v6-${RUN_ID}-${PACKAGE_ID}-"
-SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
 readonly SCRIPT_DIR
 readonly REPOSITORY_PATH_FROM_ROOT="scripts/realhost-b82-${RUN_ID}"
 readonly REALNIC_PATH_FROM_ROOT='scripts/realhost-b82-acceptance-v1'
@@ -148,7 +148,7 @@ git_checked() {
 
 require_repository_contract() {
   local canonical_repository canonical_script_root actual_commit
-  canonical_repository="$(CDPATH= cd -- "${REPOSITORY}" && pwd -P)" || return 66
+  canonical_repository="$(CDPATH='' cd -- "${REPOSITORY}" && pwd -P)" || return 66
   [[ "${canonical_repository}" == "${REPOSITORY}" ]] || return 66
   canonical_script_root="${REPOSITORY}/${REPOSITORY_PATH_FROM_ROOT}"
   [[ "${SCRIPT_DIR}" == "${canonical_script_root}" ]] || return 66
@@ -321,7 +321,7 @@ bind_package() {
   [[ ! -e "${OUTPUT_DIR}" && ! -L "${OUTPUT_DIR}" ]] || fail 'output-exists' 73
   /bin/mkdir -m 0700 -- "${OUTPUT_DIR}" || fail 'output-create' 73
   [[ -d "${OUTPUT_DIR}" && ! -L "${OUTPUT_DIR}" ]] || fail 'output-shape' 73
-  canonical_output="$(CDPATH= cd -- "${OUTPUT_DIR}" && pwd -P)" || fail 'output-canonical' 73
+  canonical_output="$(CDPATH='' cd -- "${OUTPUT_DIR}" && pwd -P)" || fail 'output-canonical' 73
   [[ "${canonical_output}" == "${OUTPUT_DIR}" ]] || fail 'output-canonical-mismatch' 73
   bundle="${OUTPUT_DIR}/source-${PACKAGE_ID}.bundle"
   manifest="${OUTPUT_DIR}/package-manifest.v1"

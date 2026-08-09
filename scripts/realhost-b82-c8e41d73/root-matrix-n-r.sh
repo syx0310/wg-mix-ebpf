@@ -2,6 +2,8 @@
 set -u
 set -o pipefail
 
+# The retirement identifier is a static cross-script contract, not executable authority.
+# shellcheck disable=SC2034
 readonly RUN_ID='c8e41d73'
 
 usage() {

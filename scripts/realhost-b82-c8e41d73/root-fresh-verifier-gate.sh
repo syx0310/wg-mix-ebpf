@@ -226,7 +226,8 @@ load_manifest_once() {
     exec {MANIFEST_FD}<&-
     return "${rc}"
   }
-  read_manifest_field format FORMAT &&
+  if ! {
+    read_manifest_field format FORMAT &&
     read_manifest_field run_id MANIFEST_RUN_ID &&
     read_manifest_field package_id MANIFEST_PACKAGE_ID &&
     read_manifest_field integration_ref INTEGRATION_REF &&
@@ -328,10 +329,11 @@ load_manifest_once() {
     read_manifest_field test_hermetic_routed_veth_harness_sh_sha256 discard &&
     read_manifest_field test_routed_veth_harness_static_py_path discard &&
     read_manifest_field test_routed_veth_harness_static_py_blob discard &&
-    read_manifest_field test_routed_veth_harness_static_py_sha256 discard || {
-      exec {MANIFEST_FD}<&-
-      return 65
-    }
+    read_manifest_field test_routed_veth_harness_static_py_sha256 discard
+  }; then
+    exec {MANIFEST_FD}<&-
+    return 65
+  fi
   if IFS= read -r -u "${MANIFEST_FD}" unexpected || [[ -n "${unexpected}" ]]; then
     exec {MANIFEST_FD}<&-
     return 65
@@ -417,7 +419,8 @@ validate_controller_source() {
 }
 
 load_module_lease_helper() {
-  # shellcheck source=checksum-module-lease.sh
+  # validate_controller_source binds this dynamic path to the exact committed blob.
+  # shellcheck disable=SC1090,SC1091
   source "${MODULE_LEASE_HELPER}" || return $?
   [[ "${C8_CHECKSUM_MODULE_RUN_ID}" == "${CONTROLLER_RUN_ID}" &&
     "${C8_CHECKSUM_MODULE_NAME}" == "${MODULE_NAME}" &&
@@ -666,7 +669,7 @@ run_step() {
 write_phase() {
   local path="$1" rendered rc
   shift
-  [[ "${path}" == "${EVIDENCE_ROOT}/"* && "${path#${EVIDENCE_ROOT}/}" != */* ]] ||
+  [[ "${path}" == "${EVIDENCE_ROOT}/"* && "${path#"${EVIDENCE_ROOT}"/}" != */* ]] ||
     fail "phase-scope:${path}" 65
   [[ ! -e "${path}" && ! -L "${path}" ]] || fail "phase-exists:${path}" 78
   rendered="$(quote_argv shell-builtin printf '%s\\n' "$@")>$(quote_argv "${path}")" ||
@@ -828,7 +831,7 @@ build_argv() {
     snapshot-links) OP_TARGET='kernel-bpf-links'; OP_ARGV=(/usr/sbin/bpftool -j link show) ;;
     snapshot-kernel-warnings)
       OP_TARGET='kernel-warning-log'
-      OP_ARGV=(/usr/bin/dmesg --level=emerg,alert,crit,err,warn --color=never)
+      OP_ARGV=(/usr/bin/dmesg '--level=emerg,alert,crit,err,warn' --color=never)
       ;;
     reserved-pin-absent) OP_TARGET="${RESERVED_PIN}"; OP_ARGV=(/usr/bin/test ! -e "${RESERVED_PIN}") ;;
     verifier)
