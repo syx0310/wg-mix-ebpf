@@ -33,6 +33,8 @@ readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-${RUN_ID}/checksum-m
 readonly MODULE_LEASE_HELPER="${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_RELATIVE}"
 readonly MODULE_LEASE_LOCK="${STAGE_ROOT}/checksum-module-lease.v1.lock"
 readonly MODULE_LEASE_ID="${RUN_ID}-${EVIDENCE_ID}"
+readonly PHYSICAL_INTERFACE_LOCK='/run/wg-mix-ebpf-realnic-physical-interface.v1.lock'
+readonly PHYSICAL_INTERFACE_LOCK_INTERFACE='ens33'
 readonly EXPECTED_HOSTNAME='ubuntu-2604-test'
 readonly EXPECTED_KERNEL='7.0.0-28-generic'
 readonly EXPECTED_MACHINE_ID='9db3fb717cc74974b2a6b243d67f67b9'
@@ -65,6 +67,7 @@ ORIGINAL_MTU=''
 VETH_A_IFINDEX=''
 VETH_B_IFINDEX=''
 INITIAL_NETNS=''
+PHYSICAL_INTERFACE_LOCK_FD=''
 
 readonly -a FEATURE_NAMES=(
   rx-checksumming
@@ -214,6 +217,8 @@ render_plan() {
   printf '%s\n' \
     'REALHOST_V6_FORWARD_AUTHORITY state=retired replacement=realnic-acceptance' \
     'REALHOST_V6_PLAN_SCOPE restore-only=1 network-writes-executed=0 filesystem-writes-executed=0'
+  printf 'REALHOST_V6_PHYSICAL_INTERFACE_LOCK path=%s interface=%s shape=root:root:600:1:0:regular-file order=physical-interface-before-checksum-module\n' \
+    "${PHYSICAL_INTERFACE_LOCK}" "${PHYSICAL_INTERFACE_LOCK_INTERFACE}"
   for cell in tcx original all-on all-off tx-path rx-path mtu1492 mtu1500 soak; do
     plan_command "restore-${cell}" /bin/bash -p \
       "${SOURCE}/scripts/realhost-b82-${RUN_ID}/root-matrix-n-r.sh" restore \
@@ -304,6 +309,35 @@ require_tooling() {
   for path in "${tools[@]}"; do
     [[ -x "${path}" ]] || fail "missing-tool:${path}" 69
   done
+}
+
+require_physical_interface_lock() {
+  [[ "${INTERFACE}" == "${PHYSICAL_INTERFACE_LOCK_INTERFACE}" ]] || fail 'physical-interface-lock-scope' 79
+  [[ -f "${PHYSICAL_INTERFACE_LOCK}" && ! -L "${PHYSICAL_INTERFACE_LOCK}" ]] ||
+    fail 'physical-interface-lock-shape' 79
+  [[ "$(/usr/bin/stat -Lc '%U:%G:%a:%h:%s:%F' -- "${PHYSICAL_INTERFACE_LOCK}")" == \
+    'root:root:600:1:0:regular file' ]] || fail 'physical-interface-lock-metadata' 79
+}
+
+acquire_physical_interface_lock() {
+  local descriptor_shape path_identity descriptor_identity
+  require_physical_interface_lock
+  exec {PHYSICAL_INTERFACE_LOCK_FD}<>"${PHYSICAL_INTERFACE_LOCK}" ||
+    fail 'physical-interface-lock-open' 79
+  descriptor_shape="$(/usr/bin/stat -Lc '%U:%G:%a:%h:%s:%F' -- \
+    "/proc/self/fd/${PHYSICAL_INTERFACE_LOCK_FD}")" || fail 'physical-interface-lock-fd-stat' 79
+  [[ "${descriptor_shape}" == 'root:root:600:1:0:regular file' ]] ||
+    fail 'physical-interface-lock-fd-metadata' 79
+  path_identity="$(/usr/bin/stat -Lc '%d:%i' -- "${PHYSICAL_INTERFACE_LOCK}")" ||
+    fail 'physical-interface-lock-path-identity' 79
+  descriptor_identity="$(/usr/bin/stat -Lc '%d:%i' -- "/proc/self/fd/${PHYSICAL_INTERFACE_LOCK_FD}")" ||
+    fail 'physical-interface-lock-fd-identity' 79
+  [[ "${path_identity}" == "${descriptor_identity}" ]] || fail 'physical-interface-lock-replaced' 79
+  /usr/bin/flock --exclusive --nonblock "${PHYSICAL_INTERFACE_LOCK_FD}" ||
+    fail 'physical-interface-authority-busy' 78
+  require_physical_interface_lock
+  [[ "$(/usr/bin/stat -Lc '%d:%i' -- "${PHYSICAL_INTERFACE_LOCK}")" == "${descriptor_identity}" ]] ||
+    fail 'physical-interface-lock-replaced-after-acquire' 79
 }
 
 read_single_line() {
@@ -678,6 +712,7 @@ validate_owner_marker() {
 }
 
 restore_after_failure() {
+  acquire_physical_interface_lock
   validate_common_identity
   load_checksum_module_helper
   validate_owner_marker

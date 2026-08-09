@@ -31,7 +31,22 @@ JOURNAL_SCHEMA = "wg-mix-ebpf-b82-realnic-acceptance-journal-v1"
 JOURNAL_TAIL_RECEIPT_SCHEMA = "wg-mix-ebpf-b82-realnic-journal-tail-receipt-v1"
 LEASE_SCHEMA = "wg-mix-ebpf-b82-realnic-interface-lease-v1"
 READ_ONLY_PEER = "47.116.202.155"
+PHYSICAL_INTERFACE = "ens33"
 RUN_ROOT_PREFIX = "/run/wg-mix-ebpf-realnic-acceptance-"
+PHYSICAL_INTERFACE_LOCK_BASENAME = "wg-mix-ebpf-realnic-physical-interface.v1.lock"
+PHYSICAL_INTERFACE_LOCK_UID = 0
+PHYSICAL_INTERFACE_LOCK_GID = 0
+LEGACY_RUN_ID = "c8e41d73"
+LEGACY_PACKAGE_ID = "4f2a9b61"
+LEGACY_EVIDENCE_ID = "6bd913ac"
+LEGACY_SOURCE = f"/run/wg-mix-ebpf-source-stages/{LEGACY_RUN_ID}/source"
+LEGACY_EVIDENCE_ROOT = (
+    f"/run/wg-mix-ebpf-source-stages/{LEGACY_RUN_ID}/realhost-v6-{LEGACY_EVIDENCE_ID}"
+)
+LEGACY_BUNDLE = (
+    f"/home/siyixuan/wg-mix-ebpf-test/unpriv-{LEGACY_PACKAGE_ID}/"
+    f"source-{LEGACY_PACKAGE_ID}.bundle"
+)
 RUN_ID_RE = re.compile(r"^[0-9a-f]{8,32}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -41,6 +56,7 @@ MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+UTC_RE = re.compile(r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$")
 
 TOOLS = {
     "bpftool": "/usr/sbin/bpftool",
@@ -170,6 +186,13 @@ def interface_lease_path(spec: "CoreSpec", netns: str) -> str:
     )
 
 
+def physical_interface_lock_path() -> str:
+    parent = os.path.dirname(RUN_ROOT_PREFIX)
+    if not parent or not os.path.isabs(parent):
+        raise HarnessError("run-root prefix has no stable absolute physical-lock directory")
+    return os.path.join(parent, PHYSICAL_INTERFACE_LOCK_BASENAME)
+
+
 @dataclasses.dataclass(frozen=True)
 class CoreSpec:
     run_id: str
@@ -204,6 +227,8 @@ class CoreSpec:
         nontrivial_hex(self.source_commit, COMMIT_RE, "source-commit")
         if not IFNAME_RE.fullmatch(self.interface) or self.interface in {"lo", ".", ".."}:
             raise HarnessError("interface is not a valid explicit real interface")
+        if self.interface != PHYSICAL_INTERFACE:
+            raise HarnessError(f"interface must be the reviewed physical interface {PHYSICAL_INTERFACE}")
         if self.expected_ifindex <= 0:
             raise HarnessError("expected-ifindex must be positive")
         if not MAC_RE.fullmatch(self.expected_mac):
@@ -943,6 +968,57 @@ def lease_identity(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any
         raise HarnessError("baseline interface lease identity does not match the exact specification")
     netns_number(str(result["netns"]))
     return result
+
+
+def physical_interface_lock_contract(
+    spec: CoreSpec,
+    snapshot: Mapping[str, Any],
+) -> dict[str, Any]:
+    return {
+        "path": physical_interface_lock_path(),
+        "interface_identity": lease_identity(spec, snapshot),
+        "metadata": {
+            "uid": PHYSICAL_INTERFACE_LOCK_UID,
+            "gid": PHYSICAL_INTERFACE_LOCK_GID,
+            "mode": "0600",
+            "nlink": 1,
+            "size": 0,
+            "type": "regular-file",
+        },
+        "authority": "ens33-physical-interface",
+        "held_for_entire_mode": True,
+        "shared_with": ["legacy-root-matrix-restore"],
+        "lock_order": ["physical-interface", "persistent-interface-owner"],
+    }
+
+
+def legacy_authority_contract(spec: CoreSpec) -> dict[str, Any]:
+    return {
+        "evidence_root": LEGACY_EVIDENCE_ROOT,
+        "owner": f"{LEGACY_EVIDENCE_ROOT}/owner.v1",
+        "bundle": LEGACY_BUNDLE,
+        "terminal_markers": [
+            f"{LEGACY_EVIDENCE_ROOT}/completed.v1",
+            f"{LEGACY_EVIDENCE_ROOT}/restored.v1",
+        ],
+        "required_state_for_new_run": "absent-or-verified-terminal",
+        "expected_owner": {
+            "format": "wg-mix-ebpf-realhost-v6-owner-v1",
+            "run_id": LEGACY_RUN_ID,
+            "package_id": LEGACY_PACKAGE_ID,
+            "evidence_id": LEGACY_EVIDENCE_ID,
+            "commit": spec.source_commit,
+            "boot_id": spec.expected_boot_id,
+            "source": LEGACY_SOURCE,
+            "interface": PHYSICAL_INTERFACE,
+            "bundle_sha256": "recompute-and-match-owner",
+        },
+    }
+
+
+def validate_legacy_authority_contract(value: Any, spec: CoreSpec) -> None:
+    if value != legacy_authority_contract(spec):
+        raise HarnessError("approved plan legacy authority gate is not exact")
 
 
 def write_guard_command_table(spec: CoreSpec) -> list[tuple[str, list[str]]]:
@@ -1886,6 +1962,8 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         "snapshot_commands": snapshot_commands,
         "baseline": snapshot,
         "traffic_oracle": traffic_oracle,
+        "physical_interface_lock": physical_interface_lock_contract(spec, snapshot),
+        "legacy_physical_authority": legacy_authority_contract(spec),
         "interface_lease": {
             "path": lease_path,
             "identity": identity,
@@ -1926,6 +2004,8 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
             "recursive_cleanup": False,
             "shell_evaluation": False,
             "run_requires_exact_plan_sha256": True,
+            "physical_interface_lock_is_outermost": True,
+            "legacy_nonterminal_evidence_blocks_new_run": True,
             "restore_is_a_separate_explicit_action": True,
             "artifacts_are_retained": True,
         },
@@ -1989,10 +2069,53 @@ def reject_ambiguous_cli(argv: Sequence[str]) -> None:
         seen.add(token)
 
 
+def execute_with_physical_authority(
+    mode: str,
+    spec: CoreSpec,
+    runner: CommandRunner,
+    approved_plan: str | None = None,
+    approved_sha256: str | None = None,
+) -> int:
+    with PhysicalInterfaceLock(physical_interface_lock_path()):
+        if mode == "plan":
+            validate_legacy_physical_authority(spec)
+            snapshot, commands = collect_snapshot(spec, runner)
+            sys.stdout.buffer.write(canonical_json(build_plan(spec, snapshot, commands)))
+            return 0
+        if mode not in {"run", "restore"} or approved_plan is None or approved_sha256 is None:
+            raise HarnessError("physical authority mode arguments are incomplete")
+        plan, plan_payload = read_approved_plan(approved_plan, approved_sha256, spec)
+        if mode == "run":
+            validate_legacy_physical_authority(spec)
+        lease_contract = plan["interface_lease"]
+        with InterfaceLease(
+            lease_contract["path"],
+            spec.run_id,
+            approved_sha256,
+            lease_contract["identity"],
+        ) as lease:
+            if mode == "run":
+                lease.require_available_for_run()
+                return run_with_interface_lease(
+                    spec,
+                    approved_sha256,
+                    runner,
+                    plan,
+                    plan_payload,
+                    lease,
+                )
+            return restore_with_interface_lease(
+                spec,
+                approved_sha256,
+                runner,
+                plan,
+                plan_payload,
+                lease,
+            )
+
+
 def plan_mode(spec: CoreSpec, runner: CommandRunner) -> int:
-    snapshot, commands = collect_snapshot(spec, runner)
-    sys.stdout.buffer.write(canonical_json(build_plan(spec, snapshot, commands)))
-    return 0
+    return execute_with_physical_authority("plan", spec, runner)
 
 
 def read_approved_plan(path_value: str, expected_sha256: str, spec: CoreSpec) -> tuple[dict[str, Any], bytes]:
@@ -2056,6 +2179,9 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
     ):
         raise HarnessError("approved plan traffic oracle contract is not exact")
     expected_identity = lease_identity(spec, baseline)
+    if plan.get("physical_interface_lock") != physical_interface_lock_contract(spec, baseline):
+        raise HarnessError("approved plan physical interface lock contract is not exact")
+    validate_legacy_authority_contract(plan.get("legacy_physical_authority"), spec)
     expected_lease_path = interface_lease_path(spec, expected_identity["netns"])
     expected_guard = [
         {"label": label, "argv": argv, "timeout_seconds": 20, "write_set": []}
@@ -2330,6 +2456,168 @@ def read_regular_file(path: str, maximum: int = 16 << 20) -> bytes:
         os.close(descriptor)
 
 
+def read_legacy_root_file(path: str, maximum: int = 1 << 20) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise HarnessError(f"legacy evidence open failed for {path}: {exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_uid != PHYSICAL_INTERFACE_LOCK_UID
+            or metadata.st_gid != PHYSICAL_INTERFACE_LOCK_GID
+            or metadata.st_size > maximum
+        ):
+            raise HarnessError(f"legacy evidence has an invalid root-owned shape: {path}")
+        payload = b""
+        while len(payload) < metadata.st_size:
+            chunk = os.read(descriptor, min(metadata.st_size - len(payload), 1 << 20))
+            if not chunk:
+                raise HarnessError(f"legacy evidence was truncated while reading: {path}")
+            payload += chunk
+        return payload
+    finally:
+        os.close(descriptor)
+
+
+def sha256_legacy_bundle(path: str) -> str:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise HarnessError(f"legacy bundle open failed: {exc}") from exc
+    digest = hashlib.sha256()
+    try:
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or not 0 < metadata.st_size <= 4 << 30
+        ):
+            raise HarnessError("legacy bundle has an invalid bounded 0600 shape")
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1 << 20))
+            if not chunk:
+                raise HarnessError("legacy bundle was truncated while hashing")
+            digest.update(chunk)
+            remaining -= len(chunk)
+        current = os.lstat(path)
+        if stat.S_ISLNK(current.st_mode) or (current.st_dev, current.st_ino) != (
+            metadata.st_dev,
+            metadata.st_ino,
+        ):
+            raise HarnessError("legacy bundle path changed while hashing")
+    finally:
+        os.close(descriptor)
+    return digest.hexdigest()
+
+
+def parse_ordered_key_file(
+    payload: bytes,
+    keys: Sequence[str],
+    label: str,
+) -> dict[str, str]:
+    try:
+        text = payload.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise HarnessError(f"{label} is not UTF-8") from exc
+    if not text.endswith("\n") or "\r" in text or "\x00" in text:
+        raise HarnessError(f"{label} is not canonical line evidence")
+    lines = text[:-1].split("\n")
+    if len(lines) != len(keys):
+        raise HarnessError(f"{label} has an unexpected field count")
+    result: dict[str, str] = {}
+    for expected, line in zip(keys, lines, strict=True):
+        key, separator, value = line.partition("=")
+        if key != expected or separator != "=" or not value:
+            raise HarnessError(f"{label} field order or value is invalid")
+        result[key] = value
+    return result
+
+
+def validate_legacy_physical_authority(spec: CoreSpec) -> None:
+    if not os.path.lexists(LEGACY_EVIDENCE_ROOT):
+        return
+    root = os.lstat(LEGACY_EVIDENCE_ROOT)
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or stat.S_ISLNK(root.st_mode)
+        or stat.S_IMODE(root.st_mode) != 0o700
+        or root.st_uid != PHYSICAL_INTERFACE_LOCK_UID
+        or root.st_gid != PHYSICAL_INTERFACE_LOCK_GID
+    ):
+        raise HarnessError("legacy physical evidence root has an invalid root-owned shape")
+    owner = parse_ordered_key_file(
+        read_legacy_root_file(f"{LEGACY_EVIDENCE_ROOT}/owner.v1"),
+        (
+            "format",
+            "run_id",
+            "package_id",
+            "evidence_id",
+            "commit",
+            "bundle_sha256",
+            "boot_id",
+            "source",
+            "interface",
+        ),
+        "legacy owner",
+    )
+    if (
+        owner["format"] != "wg-mix-ebpf-realhost-v6-owner-v1"
+        or owner["run_id"] != LEGACY_RUN_ID
+        or owner["package_id"] != LEGACY_PACKAGE_ID
+        or owner["evidence_id"] != LEGACY_EVIDENCE_ID
+        or owner["commit"] != spec.source_commit
+        or owner["boot_id"] != spec.expected_boot_id
+        or owner["source"] != LEGACY_SOURCE
+        or owner["interface"] != spec.interface
+    ):
+        raise HarnessError("legacy owner identity does not match this host/interface/commit")
+    nontrivial_hex(owner["commit"], COMMIT_RE, "legacy owner commit")
+    nontrivial_hex(owner["bundle_sha256"], SHA256_RE, "legacy owner bundle sha256")
+    if sha256_legacy_bundle(LEGACY_BUNDLE) != owner["bundle_sha256"]:
+        raise HarnessError("legacy owner bundle SHA-256 does not match the retained bundle")
+
+    markers: list[str] = []
+    completed_path = f"{LEGACY_EVIDENCE_ROOT}/completed.v1"
+    restored_path = f"{LEGACY_EVIDENCE_ROOT}/restored.v1"
+    if os.path.lexists(completed_path):
+        completed = parse_ordered_key_file(
+            read_legacy_root_file(completed_path),
+            ("run_id", "commit", "state", "utc"),
+            "legacy completed marker",
+        )
+        if (
+            completed["run_id"] != LEGACY_RUN_ID
+            or completed["commit"] != owner["commit"]
+            or completed["state"] != "complete"
+            or not UTC_RE.fullmatch(completed["utc"])
+        ):
+            raise HarnessError("legacy completed marker is invalid")
+        markers.append("completed")
+    if os.path.lexists(restored_path):
+        restored = parse_ordered_key_file(
+            read_legacy_root_file(restored_path),
+            ("run_id", "state", "utc"),
+            "legacy restored marker",
+        )
+        if (
+            restored["run_id"] != LEGACY_RUN_ID
+            or restored["state"] != "restored"
+            or not UTC_RE.fullmatch(restored["utc"])
+        ):
+            raise HarnessError("legacy restored marker is invalid")
+        markers.append("restored")
+    if not markers:
+        raise HarnessError("legacy physical evidence is nonterminal; run its exact restore entry first")
+
+
 class Journal:
     def __init__(self, path: str, run_id: str, plan_sha256: str, *, create: bool):
         self.path = path
@@ -2575,6 +2863,57 @@ class Journal:
             "event": event,
             **fields,
         })
+
+    def close(self) -> None:
+        fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        os.close(self.descriptor)
+
+
+class PhysicalInterfaceLock:
+    """Outermost non-mutating authority lock for the reviewed ens33 interface."""
+
+    def __init__(self, path: str):
+        if path != physical_interface_lock_path() or not os.path.isabs(path):
+            raise HarnessError("physical interface lock path is not the fixed reviewed path")
+        flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            self.descriptor = os.open(path, flags)
+        except OSError as exc:
+            raise HarnessError(f"physical interface lock open failed: {exc}") from exc
+        self.path = path
+        try:
+            metadata = os.fstat(self.descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_uid != PHYSICAL_INTERFACE_LOCK_UID
+                or metadata.st_gid != PHYSICAL_INTERFACE_LOCK_GID
+                or metadata.st_size != 0
+            ):
+                raise HarnessError(
+                    "physical interface lock must be the staged root:root 0600 empty single-link file"
+                )
+            fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            current = os.lstat(path)
+            if stat.S_ISLNK(current.st_mode) or (current.st_dev, current.st_ino) != (
+                metadata.st_dev,
+                metadata.st_ino,
+            ):
+                raise HarnessError("physical interface lock path changed while acquiring authority")
+        except BlockingIOError as exc:
+            os.close(self.descriptor)
+            raise HarnessError("reviewed physical interface authority is busy") from exc
+        except BaseException:
+            os.close(self.descriptor)
+            raise
+
+    def __enter__(self) -> "PhysicalInterfaceLock":
+        return self
+
+    def __exit__(self, _kind: Any, _error: Any, _traceback: Any) -> bool:
+        self.close()
+        return False
 
     def close(self) -> None:
         fcntl.flock(self.descriptor, fcntl.LOCK_UN)
@@ -3618,16 +3957,13 @@ def journal_active_cell(events: Sequence[Mapping[str, Any]]) -> tuple[str | None
 def run_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runner: CommandRunner) -> int:
     if os.geteuid() != 0:
         raise HarnessError("run mode requires root after explicit approval")
-    plan, plan_payload = read_approved_plan(approved_plan, approved_sha256, spec)
-    lease_contract = plan["interface_lease"]
-    with InterfaceLease(
-        lease_contract["path"],
-        spec.run_id,
+    return execute_with_physical_authority(
+        "run",
+        spec,
+        runner,
+        approved_plan,
         approved_sha256,
-        lease_contract["identity"],
-    ) as lease:
-        lease.require_available_for_run()
-        return run_with_interface_lease(spec, approved_sha256, runner, plan, plan_payload, lease)
+    )
 
 
 def run_with_interface_lease(
@@ -3654,6 +3990,8 @@ def run_with_interface_lease(
         "boot_id": spec.expected_boot_id,
         "interface_lease_path": lease.path,
         "interface_lease_identity": lease.expected_identity,
+        "physical_interface_lock": plan["physical_interface_lock"],
+        "legacy_physical_authority": legacy_authority_contract(spec),
         "run_root_identity": run_root_identity,
     }
     write_exclusive(f"{spec.run_root}/owner.json", canonical_json(owner))
@@ -3758,15 +4096,13 @@ def run_with_interface_lease(
 def restore_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runner: CommandRunner) -> int:
     if os.geteuid() != 0:
         raise HarnessError("restore mode requires root after separate explicit approval")
-    plan, plan_payload = read_approved_plan(approved_plan, approved_sha256, spec)
-    lease_contract = plan["interface_lease"]
-    with InterfaceLease(
-        lease_contract["path"],
-        spec.run_id,
+    return execute_with_physical_authority(
+        "restore",
+        spec,
+        runner,
+        approved_plan,
         approved_sha256,
-        lease_contract["identity"],
-    ) as lease:
-        return restore_with_interface_lease(spec, approved_sha256, runner, plan, plan_payload, lease)
+    )
 
 
 def restore_with_interface_lease(
@@ -3793,6 +4129,8 @@ def restore_with_interface_lease(
         or owner.get("source_commit") != spec.source_commit
         or owner.get("interface_lease_path") != lease.path
         or owner.get("interface_lease_identity") != lease.expected_identity
+        or owner.get("physical_interface_lock") != plan["physical_interface_lock"]
+        or owner.get("legacy_physical_authority") != plan["legacy_physical_authority"]
     ):
         raise HarnessError("run owner marker does not match restore argv")
     validate_run_root_identity(spec, owner.get("run_root_identity", {}))

@@ -17,6 +17,8 @@ readonly STAGE_ROOT="${STAGES_ROOT}/${RUN_ID}"
 readonly EXPECTED_SOURCE="${STAGE_ROOT}/source"
 readonly BINDING_MARKER="${STAGE_ROOT}/binding.v1"
 readonly MODULE_LEASE_LOCK="${STAGE_ROOT}/checksum-module-lease.v1.lock"
+readonly PHYSICAL_INTERFACE_LOCK='/run/wg-mix-ebpf-realnic-physical-interface.v1.lock'
+readonly PHYSICAL_INTERFACE_LOCK_INTERFACE='ens33'
 readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-${RUN_ID}/checksum-module-lease.sh"
 readonly EXPECTED_HOSTNAME='ubuntu-2604-test'
 readonly EXPECTED_KERNEL='7.0.0-28-generic'
@@ -264,6 +266,10 @@ render_plan() {
   plan_command S1 /usr/bin/sha256sum -- "${bundle}"
   plan_command S2 /usr/bin/mkdir --mode=0700 -- "${STAGES_ROOT}"
   plan_command S3 /usr/bin/mkdir --mode=0700 -- "${STAGE_ROOT}"
+  printf 'B82_V6_PHYSICAL_INTERFACE_LOCK path=%s interface=%s shape=root:root:600:1:regular-file create=atomic-open-if-absent\n' \
+    "${PHYSICAL_INTERFACE_LOCK}" "${PHYSICAL_INTERFACE_LOCK_INTERFACE}"
+  plan_command S3.physical-lock /usr/bin/flock --exclusive --nonblock \
+    --conflict-exit-code 78 "${PHYSICAL_INTERFACE_LOCK}" /usr/bin/true
   plan_command S3.lock /usr/bin/install --owner=root --group=root --mode=0600 \
     --no-target-directory -- /dev/null "${MODULE_LEASE_LOCK}"
   plan_command S4 /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
@@ -417,7 +423,24 @@ write_binding_marker() {
       "run_id=${RUN_ID}" "package_id=${PACKAGE_ID}" \
       "integration_ref=${INTEGRATION_REF}" "integration_commit=${INTEGRATION_COMMIT}" \
       "bundle_sha256=${BUNDLE_SHA256}" "manifest_sha256=${MANIFEST_SHA256}" \
-      "wg_state=${WG_STATE}" "module_lease_lock=${MODULE_LEASE_LOCK}" >"${BINDING_MARKER}")
+      "wg_state=${WG_STATE}" \
+      "physical_interface_lock=${PHYSICAL_INTERFACE_LOCK}" \
+      "physical_interface_lock_interface=${PHYSICAL_INTERFACE_LOCK_INTERFACE}" \
+      "module_lease_lock=${MODULE_LEASE_LOCK}" >"${BINDING_MARKER}")
+}
+
+require_physical_interface_lock() {
+  [[ -f "${PHYSICAL_INTERFACE_LOCK}" && ! -L "${PHYSICAL_INTERFACE_LOCK}" ]] || return 79
+  [[ "$(/usr/bin/stat -Lc '%U:%G:%a:%h:%s:%F' -- "${PHYSICAL_INTERFACE_LOCK}")" == \
+    'root:root:600:1:0:regular file' ]]
+}
+
+ensure_physical_interface_lock() {
+  if [[ ! -e "${PHYSICAL_INTERFACE_LOCK}" && ! -L "${PHYSICAL_INTERFACE_LOCK}" ]]; then
+    run_step S3.physical-lock /usr/bin/flock --exclusive --nonblock \
+      --conflict-exit-code 78 "${PHYSICAL_INTERFACE_LOCK}" /usr/bin/true || return $?
+  fi
+  require_physical_interface_lock
 }
 
 require_module_lease_lock() {
@@ -439,6 +462,7 @@ run_stage() {
   fi
   [[ ! -e "${STAGE_ROOT}" && ! -L "${STAGE_ROOT}" ]] || fail 'stage-exists' 73
   run_step S3 /usr/bin/mkdir --mode=0700 -- "${STAGE_ROOT}" || fail 'stage-create' $?
+  ensure_physical_interface_lock || fail 'physical-interface-lock' $?
   run_step S3.lock /usr/bin/install --owner=root --group=root --mode=0600 \
     --no-target-directory -- /dev/null "${MODULE_LEASE_LOCK}" || fail 'module-lease-lock-create' $?
   require_module_lease_lock || fail 'module-lease-lock-shape' $?
@@ -469,6 +493,7 @@ run_stage() {
     "${EXPECTED_SOURCE}/${PROVISION_PATH}" || fail 'shellcheck' $?
   stage_status="$(git_stage -C "${EXPECTED_SOURCE}" status --porcelain=v1 --untracked-files=all)" || fail 'stage-status'
   [[ -z "${stage_status}" ]] || fail 'stage-dirty' 79
+  require_physical_interface_lock || fail 'physical-interface-lock-drift' $?
   require_module_lease_lock || fail 'module-lease-lock-drift' $?
   write_binding_marker || fail 'binding-marker' $?
   printf 'B82_V6_STAGE_COMPLETE run_id=%s commit=%s source=%s binding=%s\n' \
