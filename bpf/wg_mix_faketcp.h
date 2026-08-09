@@ -1376,10 +1376,9 @@ static __always_inline __s64 faketcp_rotation_checksum(const __u8 head[FAKETCP_H
 
 // bpf_check_mtu interprets a non-zero mtu_len input as an L3 packet length.
 // Asking about the planned +12 byte transport-header growth gives the exact
-// pre-transform boundary: an input IPv4 packet must be no larger than the
-// current underlay MTU minus FAKETCP_HEADER_DELTA. Route-specific PMTU is not
-// exposed by this helper, so the activation gate still requires real-host PMTU
-// acceptance rather than claiming that this interface-MTU check is sufficient.
+// non-GSO device boundary. Route PMTU is deliberately not inferred here, so
+// the MTU capability remains closed until the unified skb prepare kfunc owns
+// both device and route admission.
 static __always_inline int faketcp_mtu_allows_growth(struct __sk_buff *skb,
 						      __u16 old_total_len)
 {
