@@ -10,10 +10,17 @@ import (
 )
 
 const (
-	experimentalFakeTCPKfuncModule = "wg_mix_faketcp_checksum"
-	experimentalFakeTCPKfuncName   = "wg_mix_faketcp_skb_normalize_udp_csum"
-	experimentalFakeTCPLicense     = "GPL"
+	experimentalFakeTCPKfuncModule        = "wg_mix_faketcp_checksum"
+	experimentalFakeTCPPrepareKfuncName   = "wg_mix_faketcp_skb_prepare_udp"
+	experimentalFakeTCPGSOCommitKfuncName = "wg_mix_faketcp_skb_commit_udp_gso"
+	experimentalFakeTCPMTUAuditKeyCount   = 15
+	experimentalFakeTCPLicense            = "GPL"
 )
+
+var experimentalFakeTCPKfuncNames = [...]string{
+	experimentalFakeTCPPrepareKfuncName,
+	experimentalFakeTCPGSOCommitKfuncName,
+}
 
 func experimentalMapDescriptors() []pinnedMapDescriptor {
 	return []pinnedMapDescriptor{
@@ -28,6 +35,7 @@ func experimentalMapDescriptors() []pinnedMapDescriptor {
 		{name: "faketcp_cap_seq", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 1},
 		{name: "faketcp_egress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: 2},
 		{name: "faketcp_stats_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 17},
+		{name: "faketcp_mtu_audit_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: experimentalFakeTCPMTUAuditKeyCount},
 	}
 }
 
@@ -105,7 +113,10 @@ func validateExperimentalExtensionManifest(spec *ebpf.CollectionSpec) error {
 }
 
 func validateExperimentalKfuncManifest(spec *ebpf.CollectionSpec) error {
-	kfuncCalls := 0
+	kfuncCalls := make(map[string]int, len(experimentalFakeTCPKfuncNames))
+	for _, name := range experimentalFakeTCPKfuncNames {
+		kfuncCalls[name] = 0
+	}
 	for programName, program := range spec.Programs {
 		if program == nil {
 			continue
@@ -120,21 +131,29 @@ func validateExperimentalKfuncManifest(spec *ebpf.CollectionSpec) error {
 			if !instruction.IsKfuncCall() {
 				continue
 			}
-			if programName != "wg_mix_egress" ||
-				instruction.Reference() != experimentalFakeTCPKfuncName {
+			name := instruction.Reference()
+			if programName != "wg_mix_egress" {
 				return fmt.Errorf(
 					"experimental program %q has unreviewed kfunc relocation %q",
-					programName, instruction.Reference(),
+					programName, name,
 				)
 			}
-			kfuncCalls++
+			if _, ok := kfuncCalls[name]; !ok {
+				return fmt.Errorf(
+					"experimental program %q has unreviewed kfunc relocation %q",
+					programName, name,
+				)
+			}
+			kfuncCalls[name]++
 		}
 	}
-	if kfuncCalls != 1 {
-		return fmt.Errorf(
-			"experimental object has %d %s relocations, want exactly one",
-			kfuncCalls, experimentalFakeTCPKfuncName,
-		)
+	for _, name := range experimentalFakeTCPKfuncNames {
+		if kfuncCalls[name] != 1 {
+			return fmt.Errorf(
+				"experimental object has %d %s relocations, want exactly one",
+				kfuncCalls[name], name,
+			)
+		}
 	}
 	return nil
 }

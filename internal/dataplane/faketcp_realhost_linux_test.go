@@ -34,17 +34,10 @@ import (
 const (
 	fakeTCPRealHostObjectSizeLimit              = 128 << 20
 	fakeTCPRealHostStatCount                    = 17
-	fakeTCPRealHostStatEgressOK                 = uint32(0)
-	fakeTCPRealHostStatIngressOK                = uint32(1)
-	fakeTCPRealHostStatGSOReject                = uint32(5)
-	fakeTCPRealHostStatChecksumNoneAccepted     = uint32(13)
-	fakeTCPRealHostStatChecksumPartialReset     = uint32(14)
-	fakeTCPRealHostCoreStatEgressRewriteOK      = uint32(0)
-	fakeTCPRealHostCoreStatIngressRewriteOK     = uint32(6)
+	fakeTCPRealHostStatMTUReject                = uint32(16)
+	fakeTCPRealHostMTURouteUnknownAuditKey      = uint32(3*3 + 2)
 	fakeTCPRealHostCoreStatEgressGSOSeen        = uint32(15)
 	fakeTCPRealHostCoreStatEgressGSOManagedSeen = uint32(16)
-	fakeTCPRealHostCoreStatXOREgressOK          = uint32(24)
-	fakeTCPRealHostCoreStatXORIngressOK         = uint32(25)
 	fakeTCPRealHostVirtioNetHeaderSize          = 10
 	fakeTCPRealHostEthernetHeaderSize           = 14
 	fakeTCPRealHostIPv4HeaderSize               = 20
@@ -54,7 +47,7 @@ const (
 	// Linux packet_snd requires hdr_len to cover the checksum field when
 	// NEEDS_CSUM is set: csum_start + csum_offset + sizeof(__sum16) = 42.
 	fakeTCPRealHostVirtioHeaderLength        = fakeTCPRealHostVirtioChecksumStart + fakeTCPRealHostUDPHeaderSize
-	fakeTCPRealHostVirtioGSOSize      uint16 = 32
+	fakeTCPRealHostVirtioGSOSize      uint16 = 64
 	fakeTCPRealHostGSOSourcePort      uint16 = 31101
 	fakeTCPRealHostGSODestinationPort uint16 = 31102
 )
@@ -113,7 +106,7 @@ func TestFakeTCPRealHostVirtioNetHeaderEncoding(t *testing.T) {
 		unix.VIRTIO_NET_HDR_F_NEEDS_CSUM,
 		unix.VIRTIO_NET_HDR_GSO_UDP_L4,
 		42, 0,
-		32, 0,
+		64, 0,
 		34, 0,
 		6, 0,
 	}; !bytes.Equal(got, want) {
@@ -415,13 +408,12 @@ func TestExperimentalFakeTCPRealHostLifecycleIntegration(t *testing.T) {
 	t.Logf("FAKETCP_REALHOST_LIFECYCLE_COMPLETE run_id=%s restored=1", prepared.contract.runID)
 }
 
-// TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration sends exact
-// Ethernet/IPv4/UDP frames through the controller-owned veth pair in three
-// checksum/offload states. A materialized CHECKSUM_NONE frame and a
-// PACKET_VNET_HDR CHECKSUM_PARTIAL frame must both complete the FakeTCP, XOR
-// and type-word round trip. A PACKET_VNET_HDR UDP GSO frame must be rejected
-// before mutation and produce no peer observation. Exact stats distinguish the
-// two checksum admissions and the GSO fail-closed path.
+// TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration keeps the legacy
+// AF_PACKET fixture as negative evidence only. Packet sockets select a device
+// but do not publish a route dst, so unified PMTU admission must reject
+// CHECKSUM_NONE, CHECKSUM_PARTIAL and a shape-valid UDP_L4 GSO aggregate before
+// any FakeTCP, type-word or XOR mutation. Positive evidence is intentionally
+// deferred to the separately reviewed routed-veth harness.
 func TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration(t *testing.T) {
 	prepared := requireFakeTCPRealHostPrepared(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
@@ -446,6 +438,7 @@ func TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration(t *testing.T) {
 	fakeStatsBefore := readFakeTCPRealHostStats(
 		t, runtime, "faketcp_stats_map", fakeTCPRealHostStatCount,
 	)
+	mtuAuditBefore := readFakeTCPRealHostStats(t, runtime, "faketcp_mtu_audit_map", 15)
 	coreStatsBefore := readFakeTCPRealHostStats(t, runtime, "stats_map", 36)
 
 	local, err := netlink.LinkByIndex(prepared.contract.ifindex)
@@ -465,57 +458,45 @@ func TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration(t *testing.T) {
 	destinationMAC := peer.Attrs().HardwareAddr
 	sourceMAC := local.Attrs().HardwareAddr
 
-	packetNone, payloadNone := buildFakeTCPRealHostProbePacket(
+	packetNone, _ := buildFakeTCPRealHostProbePacket(
 		t, destinationMAC, sourceMAC, 65,
 	)
-	sendFakeTCPRealHostPacket(t, sender, prepared.contract.ifindex, packetNone)
-	receivedNone := receiveFakeTCPRealHostProbePacket(t, ctx, receiver, len(payloadNone))
-	assertFakeTCPRealHostPipelineImage(t, receivedNone, payloadNone)
+	sendFakeTCPRealHostDropProbe(t, sender, prepared.contract.ifindex, packetNone)
 	waitForFakeTCPRealHostStat(
 		t,
 		runtime,
-		"faketcp_stats_map",
-		fakeTCPRealHostStatChecksumNoneAccepted,
-		fakeStatsBefore[fakeTCPRealHostStatChecksumNoneAccepted]+1,
+		"faketcp_mtu_audit_map",
+		fakeTCPRealHostMTURouteUnknownAuditKey,
+		mtuAuditBefore[fakeTCPRealHostMTURouteUnknownAuditKey]+1,
 	)
-	waitForFakeTCPRealHostStat(
-		t,
-		runtime,
-		"stats_map",
-		fakeTCPRealHostCoreStatXORIngressOK,
-		coreStatsBefore[fakeTCPRealHostCoreStatXORIngressOK]+1,
+	assertNoFakeTCPRealHostFlowPacket(
+		t, ctx, receiver, 31001, 31002,
 	)
 
-	packetPartial, payloadPartial := buildFakeTCPRealHostProbePacket(
+	packetPartial, _ := buildFakeTCPRealHostProbePacket(
 		t, destinationMAC, sourceMAC, 66,
 	)
-	sendFakeTCPRealHostPacket(
+	sendFakeTCPRealHostDropProbe(
 		t,
 		vnetSender,
 		prepared.contract.ifindex,
 		prependFakeTCPRealHostVirtioNetHeader(t, packetPartial, unix.VIRTIO_NET_HDR_GSO_NONE, 0),
 	)
-	receivedPartial := receiveFakeTCPRealHostProbePacket(t, ctx, receiver, len(payloadPartial))
-	assertFakeTCPRealHostPipelineImage(t, receivedPartial, payloadPartial)
 	waitForFakeTCPRealHostStat(
 		t,
 		runtime,
-		"faketcp_stats_map",
-		fakeTCPRealHostStatChecksumPartialReset,
-		fakeStatsBefore[fakeTCPRealHostStatChecksumPartialReset]+1,
+		"faketcp_mtu_audit_map",
+		fakeTCPRealHostMTURouteUnknownAuditKey,
+		mtuAuditBefore[fakeTCPRealHostMTURouteUnknownAuditKey]+2,
 	)
-	waitForFakeTCPRealHostStat(
-		t,
-		runtime,
-		"stats_map",
-		fakeTCPRealHostCoreStatXORIngressOK,
-		coreStatsBefore[fakeTCPRealHostCoreStatXORIngressOK]+2,
+	assertNoFakeTCPRealHostFlowPacket(
+		t, ctx, receiver, 31001, 31002,
 	)
 
-	packetGSO, _ := buildFakeTCPRealHostGSOProbePacket(
-		t, destinationMAC, sourceMAC, 67,
+	packetGSO := buildFakeTCPRealHostGSOProbePacket(
+		t, destinationMAC, sourceMAC,
 	)
-	sendFakeTCPRealHostGSOProbe(
+	sendFakeTCPRealHostDropProbe(
 		t,
 		vnetSender,
 		prepared.contract.ifindex,
@@ -526,30 +507,29 @@ func TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration(t *testing.T) {
 	waitForFakeTCPRealHostStat(
 		t,
 		runtime,
-		"faketcp_stats_map",
-		fakeTCPRealHostStatGSOReject,
-		fakeStatsBefore[fakeTCPRealHostStatGSOReject]+1,
+		"faketcp_mtu_audit_map",
+		fakeTCPRealHostMTURouteUnknownAuditKey,
+		mtuAuditBefore[fakeTCPRealHostMTURouteUnknownAuditKey]+3,
 	)
-	assertNoFakeTCPRealHostGSOProbePacket(t, receiver)
+	assertNoFakeTCPRealHostFlowPacket(
+		t, ctx, receiver,
+		fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort,
+	)
 
 	fakeStatsAfter := readFakeTCPRealHostStats(
 		t, runtime, "faketcp_stats_map", fakeTCPRealHostStatCount,
 	)
 	assertFakeTCPRealHostStatDeltas(t, "FakeTCP", fakeStatsBefore, fakeStatsAfter, map[uint32]uint64{
-		fakeTCPRealHostStatEgressOK:             2,
-		fakeTCPRealHostStatIngressOK:            2,
-		fakeTCPRealHostStatGSOReject:            1,
-		fakeTCPRealHostStatChecksumNoneAccepted: 1,
-		fakeTCPRealHostStatChecksumPartialReset: 1,
+		fakeTCPRealHostStatMTUReject: 3,
+	})
+	mtuAuditAfter := readFakeTCPRealHostStats(t, runtime, "faketcp_mtu_audit_map", 15)
+	assertFakeTCPRealHostStatDeltas(t, "PMTU audit", mtuAuditBefore, mtuAuditAfter, map[uint32]uint64{
+		fakeTCPRealHostMTURouteUnknownAuditKey: 3,
 	})
 	coreStatsAfter := readFakeTCPRealHostStats(t, runtime, "stats_map", 36)
 	assertFakeTCPRealHostStatDeltas(t, "core", coreStatsBefore, coreStatsAfter, map[uint32]uint64{
-		fakeTCPRealHostCoreStatEgressRewriteOK:      2,
-		fakeTCPRealHostCoreStatIngressRewriteOK:     2,
 		fakeTCPRealHostCoreStatEgressGSOSeen:        1,
 		fakeTCPRealHostCoreStatEgressGSOManagedSeen: 1,
-		fakeTCPRealHostCoreStatXOREgressOK:          2,
-		fakeTCPRealHostCoreStatXORIngressOK:         2,
 	})
 
 	if err := runtime.Close(); err != nil {
@@ -950,9 +930,9 @@ func fakeTCPRealHostState(
 		})
 	}
 	if withXOR {
-		// The GSO rejection probe is deliberately one-way. There is no peer
-		// listener for 31102, so an erroneous egress pass remains observable
-		// on the peer AF_PACKET socket before any inverse transform can hide it.
+		// The shape-valid GSO rejection probe is deliberately one-way. There is
+		// no peer listener for 31102, so any accidental AF_PACKET no-route pass
+		// remains directly observable before an inverse transform can hide it.
 		state.EgressRules = append(state.EgressRules, control.EgressRule{
 			Generation: generation, Family: "ipv4", SourcePort: fakeTCPRealHostGSOSourcePort,
 			UnderlayIfIndex: contract.ifindex, ProfileID: profileID, CipherID: selectedCipher,
@@ -1145,43 +1125,24 @@ func buildFakeTCPRealHostGSOProbePacket(
 	t *testing.T,
 	destinationMAC net.HardwareAddr,
 	sourceMAC net.HardwareAddr,
-	payloadLength int,
-) ([]byte, []byte) {
+) []byte {
 	t.Helper()
 	if len(destinationMAC) != 6 || len(sourceMAC) != 6 {
 		t.Fatalf("FakeTCP real-host GSO probe requires exact Ethernet addresses: destination=%x source=%x",
 			destinationMAC, sourceMAC)
 	}
+	payloadLength := int(fakeTCPRealHostVirtioGSOSize) * 2
 	packet, payload := buildFakeTCPProbeUDPPacket(
-		t, fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort, payloadLength,
+		t, fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort,
+		payloadLength,
 	)
+	for offset := 0; offset < payloadLength; offset += int(fakeTCPRealHostVirtioGSOSize) {
+		binary.LittleEndian.PutUint32(payload[offset:offset+4], 3)
+	}
+	copy(packet[len(packet)-payloadLength:], payload)
 	copy(packet[0:6], destinationMAC)
 	copy(packet[6:12], sourceMAC)
-	return packet, payload
-}
-
-func assertFakeTCPRealHostPipelineImage(t *testing.T, received, originalPayload []byte) {
-	t.Helper()
-	const payloadOffset = fakeTCPRealHostEthernetHeaderSize +
-		fakeTCPRealHostIPv4HeaderSize + fakeTCPRealHostUDPHeaderSize
-	if len(received) < payloadOffset+len(originalPayload) {
-		t.Fatalf("FakeTCP+XOR+type-word observation is short: %d", len(received))
-	}
-	encryptedPayload := append([]byte(nil), originalPayload...)
-	binary.LittleEndian.PutUint32(encryptedPayload[:4], 0x13dff06b)
-	for index := range encryptedPayload {
-		encryptedPayload[index] ^= byte(index*17 + 5)
-	}
-	observedPayload := received[payloadOffset : payloadOffset+len(originalPayload)]
-	// AF_PACKET taps are kernel-order dependent relative to clsact ingress.
-	// The encrypted image proves post-XDP/pre-TCX observation; the original
-	// image proves post-TCX observation. Exact success counters prove both
-	// pipeline halves completed in either case.
-	if !bytes.Equal(observedPayload, encryptedPayload) &&
-		!bytes.Equal(observedPayload, originalPayload) {
-		t.Fatalf("FakeTCP+XOR+type-word observation is neither reviewed pipeline image: got=%x encrypted=%x original=%x",
-			observedPayload, encryptedPayload, originalPayload)
-	}
+	return packet
 }
 
 func assertFakeTCPRealHostStatDeltas(
@@ -1341,17 +1302,7 @@ func prependFakeTCPRealHostVirtioNetHeader(
 	return append(header, packet...)
 }
 
-func sendFakeTCPRealHostPacket(t *testing.T, fd, ifindex int, packet []byte) {
-	t.Helper()
-	if err := unix.Sendto(fd, packet, 0, &unix.SockaddrLinklayer{
-		Protocol: fakeTCPRealHostHTONS(unix.ETH_P_IP),
-		Ifindex:  ifindex,
-	}); err != nil {
-		t.Fatalf("send run-owned veth frame: %v", err)
-	}
-}
-
-func sendFakeTCPRealHostGSOProbe(t *testing.T, fd, ifindex int, packet []byte) {
+func sendFakeTCPRealHostDropProbe(t *testing.T, fd, ifindex int, packet []byte) {
 	t.Helper()
 	err := unix.Sendto(fd, packet, 0, &unix.SockaddrLinklayer{
 		Protocol: fakeTCPRealHostHTONS(unix.ETH_P_IP),
@@ -1359,11 +1310,11 @@ func sendFakeTCPRealHostGSOProbe(t *testing.T, fd, ifindex int, packet []byte) {
 	})
 	switch {
 	case err == nil:
-		t.Log("FAKETCP_REALHOST_GSO_SEND result=nil")
+		t.Log("FAKETCP_REALHOST_AF_PACKET_DROP_SEND result=nil")
 	case errors.Is(err, unix.ENOBUFS):
-		t.Log("FAKETCP_REALHOST_GSO_SEND result=ENOBUFS")
+		t.Log("FAKETCP_REALHOST_AF_PACKET_DROP_SEND result=ENOBUFS")
 	default:
-		t.Fatalf("send run-owned veth GSO probe: %v", err)
+		t.Fatalf("send run-owned veth no-route probe: %v", err)
 	}
 }
 
@@ -1374,20 +1325,6 @@ func closeFakeTCPRealHostFD(t *testing.T, fd int, label string) {
 			t.Errorf("close %s: %v", label, err)
 		}
 	}
-}
-
-func receiveFakeTCPRealHostUDPPacket(
-	ctx context.Context,
-	fd int,
-	sourcePort uint16,
-	destinationPort uint16,
-	payloadLength int,
-) ([]byte, error) {
-	return receiveFakeTCPRealHostPacket(ctx, fd, func(frame []byte) bool {
-		return fakeTCPRealHostUDPFrameMatches(
-			frame, sourcePort, destinationPort, payloadLength,
-		)
-	})
 }
 
 func receiveFakeTCPRealHostFlowPacket(
@@ -1457,36 +1394,24 @@ func receiveFakeTCPRealHostPacket(
 	}
 }
 
-func receiveFakeTCPRealHostProbePacket(
+func assertNoFakeTCPRealHostFlowPacket(
 	t *testing.T,
 	parent context.Context,
 	fd int,
-	payloadLength int,
-) []byte {
+	sourcePort uint16,
+	destinationPort uint16,
+) {
 	t.Helper()
-	receiveCtx, stopReceive := context.WithTimeout(parent, 10*time.Second)
-	defer stopReceive()
-	received, err := receiveFakeTCPRealHostUDPPacket(
-		receiveCtx, fd, 31001, 31002, payloadLength,
-	)
-	if err != nil {
-		t.Fatalf("receive FakeTCP real-host payload length %d: %v", payloadLength, err)
-	}
-	return received
-}
-
-func assertNoFakeTCPRealHostGSOProbePacket(t *testing.T, fd int) {
-	t.Helper()
-	receiveCtx, stopReceive := context.WithTimeout(t.Context(), 750*time.Millisecond)
+	receiveCtx, stopReceive := context.WithTimeout(parent, 750*time.Millisecond)
 	defer stopReceive()
 	received, err := receiveFakeTCPRealHostFlowPacket(
-		receiveCtx, fd, fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort,
+		receiveCtx, fd, sourcePort, destinationPort,
 	)
 	if err == nil {
-		t.Fatalf("GSO-rejected FakeTCP flow reached peer: %x", received)
+		t.Fatalf("no-route FakeTCP flow reached peer: %x", received)
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("observe GSO-rejected FakeTCP frame: %v", err)
+		t.Fatalf("observe no-route FakeTCP flow: %v", err)
 	}
 }
 

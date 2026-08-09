@@ -242,19 +242,36 @@ func TestFakeTCPChecksumKfuncAndBPFReturnABIStayIdentical(t *testing.T) {
 		{name: "REJECT_PACKET", value: "-1", stat: "FAKETCP_STAT_BAD_PACKET"},
 		{name: "REJECT_STATE", value: "-2", stat: "FAKETCP_STAT_CHECKSUM_STATE_REJECT"},
 		{name: "REJECT_METADATA", value: "-3", stat: "FAKETCP_STAT_METADATA_ERROR"},
-		{name: "REJECT_GSO", value: "-4", stat: "FAKETCP_STAT_GSO_REJECT"},
+		{name: "REJECT_GSO_TYPE", value: "-4", stat: "FAKETCP_STAT_GSO_REJECT"},
 	}
 	for _, contract := range contracts {
-		if !strings.Contains(kernel, "WG_MIX_FAKETCP_CSUM_"+contract.name+" = "+contract.value) {
+		if !strings.Contains(kernel, "WG_MIX_FAKETCP_PREPARE_"+contract.name+" = "+contract.value) {
 			t.Fatalf("kernel checksum result ABI missing %s=%s", contract.name, contract.value)
 		}
-		if !strings.Contains(bpf, "FAKETCP_CSUM_"+contract.name) || !strings.Contains(bpf, contract.stat) {
+		if !strings.Contains(bpf, "FAKETCP_PREPARE_"+contract.name) || !strings.Contains(bpf, contract.stat) {
 			t.Fatalf("BPF checksum result/stat mapping missing %s -> %s", contract.name, contract.stat)
 		}
 	}
-	if !strings.Contains(bpf, "inc_faketcp_stat(FAKETCP_STAT_MTU_REJECT)") ||
-		!strings.Contains(bpf, "old_total_len > mtu_len - FAKETCP_HEADER_DELTA") {
-		t.Fatal("non-GSO device MTU growth rejection lost its dedicated aggregate counter")
+	for _, required := range []string{
+		"faketcp_mtu_audit_map SEC(\".maps\")",
+		"reason * FAKETCP_MTU_BOUNDARY_MAX + boundary",
+		"inc_faketcp_stat(FAKETCP_STAT_MTU_REJECT)",
+	} {
+		if !strings.Contains(bpf, required) {
+			t.Fatalf("BPF PMTU audit contract missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"#include <net/dst_metadata.h>",
+		"struct net_device *device = READ_ONCE(skb->dev)",
+		"device_mtu = READ_ONCE(device->mtu)",
+		"if (!skb_valid_dst(skb))",
+		"if (READ_ONCE(dst->dev) != device)",
+		"route_mtu = dst_mtu(dst)",
+	} {
+		if !strings.Contains(kernel, required) {
+			t.Fatalf("kernel PMTU admission contract missing %q", required)
+		}
 	}
 	resetOrder := []string{
 		"skb->csum = 0;",
@@ -263,7 +280,7 @@ func TestFakeTCPChecksumKfuncAndBPFReturnABIStayIdentical(t *testing.T) {
 		"skb->csum_level = 0;",
 		"skb_reset_csum_not_inet(skb);",
 		"skb->ip_summed = CHECKSUM_NONE;",
-		"return WG_MIX_FAKETCP_CSUM_ACCEPT_PARTIAL_RESET;",
+		"return WG_MIX_FAKETCP_PREPARE_ACCEPT_PARTIAL_RESET;",
 	}
 	position := -1
 	for _, fragment := range resetOrder {

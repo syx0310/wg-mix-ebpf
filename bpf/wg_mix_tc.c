@@ -1832,6 +1832,10 @@ int wg_mix_egress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	if (rule->action != ACTION_REWRITE)
 		return TC_ACT_OK;
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	if (rule->transport_mode == TRANSPORT_FAKETCP && gso_seen)
+		return faketcp_encode_gso_segments(skb, &info, rule, generation);
+#endif
 	if (bpf_skb_load_bytes(skb, info.payload_off, &old_wire, sizeof(old_wire)) < 0) {
 		inc_stat(STAT_SKB_LOAD_ERROR);
 		return TC_ACT_SHOT;
