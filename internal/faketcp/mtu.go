@@ -12,8 +12,8 @@ const (
 	FakeTCPHeaderDelta uint64 = 12
 )
 
-// MTUErrorCode is a stable, auditable rejection category. Callers should use
-// errors.As to inspect *MTUError and compare Code instead of parsing Error().
+// MTUErrorCode is the stable rejection axis used by the userspace audit
+// decoder and the test-only admission oracle.
 type MTUErrorCode string
 
 const (

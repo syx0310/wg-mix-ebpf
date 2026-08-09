@@ -68,22 +68,7 @@ func materializeFakeTCPTCPChecksumModel(_ uint16, tcp, wirePayload []byte) uint1
 }
 
 func testTransportChecksum(protocol byte, header, payload []byte) uint16 {
-	return testIPv4TransportChecksum(
-		[4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2}, protocol, header, payload,
-	)
-}
-
-func testIPv4TransportChecksum(
-	sourceIPv4 [4]byte,
-	destinationIPv4 [4]byte,
-	protocol byte,
-	header []byte,
-	payload []byte,
-) uint16 {
-	pseudo := make([]byte, 12)
-	copy(pseudo[0:4], sourceIPv4[:])
-	copy(pseudo[4:8], destinationIPv4[:])
-	pseudo[9] = protocol
+	pseudo := []byte{10, 0, 0, 1, 10, 0, 0, 2, 0, protocol, 0, 0}
 	binary.BigEndian.PutUint16(pseudo[10:12], uint16(len(header)+len(payload)))
 	data := append(append(append([]byte(nil), pseudo...), header...), payload...)
 	checksum := internetChecksum(data)
@@ -210,8 +195,6 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 		"faketcp_capture_first_packet(skb, info, rule, &key)",
 		"record_len = sizeof(record->event) + packet_len",
 		"faketcp_materialize_tcp_checksum",
-		"#include \"wg_mix_faketcp_mtu.h\"",
-		"faketcp_mtu_admit(skb, &mtu_request)",
 		"bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)",
 	} {
 		if !strings.Contains(tc, want) && !strings.Contains(fake, want) {
@@ -243,7 +226,7 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 	}
 }
 
-func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
+func TestFakeTCPChecksumNormalizationAndGSOStayHardGated(t *testing.T) {
 	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
 	if err != nil {
 		t.Fatal(err)
@@ -296,11 +279,10 @@ func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
 	}
 
 	encoder := text[encoderStart:continuationStart]
-	mtuCheck := strings.Index(encoder, "faketcp_mtu_admit(skb, &mtu_request)")
 	normalize := strings.Index(encoder, "bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)")
 	checksum := strings.Index(encoder, "faketcp_materialize_tcp_checksum(skb")
-	if mtuCheck < 0 || normalize < 0 || checksum < 0 || mtuCheck >= normalize || normalize >= checksum {
-		t.Fatal("MTU check, checksum-state normalization and full recompute are out of order")
+	if normalize < 0 || checksum < 0 || normalize >= checksum {
+		t.Fatal("checksum-state normalization and full recompute are out of order")
 	}
 	for _, want := range []string{
 		"old_total_len != sizeof(*iph) + udp_len",

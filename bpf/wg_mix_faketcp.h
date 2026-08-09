@@ -350,8 +350,6 @@ static __always_inline void inc_faketcp_stat(__u32 key)
 		*value += 1;
 }
 
-#include "wg_mix_faketcp_mtu.h"
-
 static __always_inline int
 faketcp_inspect_and_reset_udp_checksum(struct __sk_buff *skb,
 					       __u32 network_offset,
@@ -811,7 +809,6 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	struct faketcp_session_value *session;
 	struct udphdr old_udp;
 	struct tcphdr tcp = {};
-	struct faketcp_mtu_request mtu_request = {};
 	__u8 head[FAKETCP_HEADER_DELTA] = {};
 	__u16 old_total_len, new_total_len, udp_len;
 	__be32 source_ipv4, destination_ipv4;
@@ -856,24 +853,6 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return TC_ACT_SHOT;
 	}
-	mtu_request.input_l3_len = old_total_len;
-	mtu_request.input_segment_l3_len = old_total_len;
-	mtu_request.ifindex = skb->ifindex;
-	mtu_request.mark = skb->mark;
-	mtu_request.source_port = old_udp.source;
-	mtu_request.destination_port = old_udp.dest;
-	mtu_request.family = FAMILY_IPV4;
-	mtu_request.tos = iph->tos;
-	mtu_request.addresses.ipv4.source = iph->saddr;
-	mtu_request.addresses.ipv4.destination = iph->daddr;
-	if (bpf_ntohs(iph->frag_off) & IP_DF)
-		mtu_request.flags |= FAKETCP_MTU_F_IPV4_DF;
-	if (bpf_ntohs(iph->frag_off) & IP_MF)
-		mtu_request.flags |= FAKETCP_MTU_F_IPV4_MF;
-	if (bpf_ntohs(iph->frag_off) & IP_OFFSET)
-		mtu_request.flags |= FAKETCP_MTU_F_NONINITIAL;
-	if (!faketcp_mtu_admit(skb, &mtu_request))
-		return TC_ACT_SHOT;
 	source_ipv4 = iph->saddr;
 	destination_ipv4 = iph->daddr;
 	if (bpf_skb_load_bytes(skb, info->payload_off, head, sizeof(head)) < 0) {

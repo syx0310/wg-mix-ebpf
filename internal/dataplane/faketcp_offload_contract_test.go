@@ -230,12 +230,8 @@ func TestFakeTCPChecksumKfuncAndBPFReturnABIStayIdentical(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mtuSource, err := os.ReadFile("../../bpf/wg_mix_faketcp_mtu.h")
-	if err != nil {
-		t.Fatal(err)
-	}
 	kernel := string(kernelSource)
-	bpf := string(bpfSource) + string(mtuSource)
+	bpf := string(bpfSource)
 	contracts := []struct {
 		name  string
 		value string
@@ -255,10 +251,6 @@ func TestFakeTCPChecksumKfuncAndBPFReturnABIStayIdentical(t *testing.T) {
 		if !strings.Contains(bpf, "FAKETCP_CSUM_"+contract.name) || !strings.Contains(bpf, contract.stat) {
 			t.Fatalf("BPF checksum result/stat mapping missing %s -> %s", contract.name, contract.stat)
 		}
-	}
-	if !strings.Contains(bpf, "inc_faketcp_stat(FAKETCP_STAT_MTU_REJECT)") ||
-		!strings.Contains(bpf, "planned_l3_len = request->input_segment_l3_len + FAKETCP_HEADER_DELTA") {
-		t.Fatal("BPF MTU growth rejection is not classified by its dedicated counter")
 	}
 	resetOrder := []string{
 		"skb->csum = 0;",

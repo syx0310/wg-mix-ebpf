@@ -89,19 +89,47 @@ func TestAdmitMTUBoundaryTable(t *testing.T) {
 			wantCode: MTUErrorUnknown, wantBoundary: MTUBoundaryRoute,
 		},
 		{
-			name:     "IPv4 first fragment",
-			request:  mutateMTURequest(baseIPv4, func(request *MTURequest) { request.IPv4MoreFragments = true }),
+			name: "IPv4 first fragment",
+			request: mutateMTURequest(baseIPv4, func(request *MTURequest) {
+				request.IPv4DF = false
+				request.IPv4MoreFragments = true
+			}),
 			wantCode: MTUErrorFragmentationRejected, wantBoundary: MTUBoundaryInput,
 		},
 		{
-			name:     "IPv4 non-initial fragment",
-			request:  mutateMTURequest(baseIPv4, func(request *MTURequest) { request.FragmentOffsetBytes = 8 }),
+			name: "IPv4 non-initial fragment",
+			request: mutateMTURequest(baseIPv4, func(request *MTURequest) {
+				request.IPv4DF = false
+				request.FragmentOffsetBytes = 8
+			}),
 			wantCode: MTUErrorFragmentationRejected, wantBoundary: MTUBoundaryInput,
+		},
+		{
+			name: "IPv4 DF conflicts with fragments",
+			request: mutateMTURequest(baseIPv4, func(request *MTURequest) {
+				request.IPv4MoreFragments = true
+			}),
+			wantCode: MTUErrorInvalidInput, wantBoundary: MTUBoundaryInput,
 		},
 		{
 			name:     "IPv6 fragment header",
 			request:  mutateMTURequest(baseIPv6, func(request *MTURequest) { request.IPv6FragmentHeader = true }),
 			wantCode: MTUErrorFragmentationRejected, wantBoundary: MTUBoundaryInput,
+		},
+		{
+			name: "IPv6 non-initial fragment",
+			request: mutateMTURequest(baseIPv6, func(request *MTURequest) {
+				request.IPv6FragmentHeader = true
+				request.FragmentOffsetBytes = 8
+			}),
+			wantCode: MTUErrorFragmentationRejected, wantBoundary: MTUBoundaryInput,
+		},
+		{
+			name: "IPv6 offset without fragment header",
+			request: mutateMTURequest(baseIPv6, func(request *MTURequest) {
+				request.FragmentOffsetBytes = 8
+			}),
+			wantCode: MTUErrorInvalidInput, wantBoundary: MTUBoundaryInput,
 		},
 		{
 			name:     "unknown family",
@@ -121,6 +149,22 @@ func TestAdmitMTUBoundaryTable(t *testing.T) {
 				request.L3Length = 1
 			}),
 			wantCode: MTUErrorArithmeticOverflow, wantBoundary: MTUBoundaryInput,
+		},
+		{
+			name: "IPv6 maximum non-jumbogram output",
+			request: MTURequest{
+				Family: MTUFamilyIPv6, L3Length: 65563, L3HeaderLength: 40,
+				TransportPayloadLength: 65515, DeviceMTU: 65575, RouteMTU: 65575,
+			},
+			wantOutput: 65575,
+		},
+		{
+			name: "IPv6 post-transform jumbogram",
+			request: MTURequest{
+				Family: MTUFamilyIPv6, L3Length: 65564, L3HeaderLength: 40,
+				TransportPayloadLength: 65516, DeviceMTU: 65575, RouteMTU: 65575,
+			},
+			wantCode: MTUErrorInvalidInput, wantBoundary: MTUBoundaryInput,
 		},
 	}
 
@@ -190,6 +234,7 @@ func TestAdmitMTUGSOMaximumWireSegment(t *testing.T) {
 		{name: "missing segment count", mutate: func(request *MTURequest) { request.GSOSegments = 0 }, wantCode: MTUErrorInvalidInput, wantBoundary: MTUBoundaryInput},
 		{name: "missing segment size", mutate: func(request *MTURequest) { request.GSOSize = 0 }, wantCode: MTUErrorInvalidInput, wantBoundary: MTUBoundaryInput},
 		{name: "wrong segment count", mutate: func(request *MTURequest) { request.GSOSegments = 4 }, wantCode: MTUErrorInvalidInput, wantBoundary: MTUBoundaryInput},
+		{name: "single segment masquerading as GSO", mutate: func(request *MTURequest) { request.GSOSize = request.TransportPayloadLength; request.GSOSegments = 1 }, wantCode: MTUErrorInvalidInput, wantBoundary: MTUBoundaryInput},
 		{name: "per-segment route exceed", mutate: func(request *MTURequest) { request.RouteMTU = 1439 }, wantCode: MTUErrorExceeded, wantBoundary: MTUBoundaryRoute},
 		{name: "per-segment device exceed", mutate: func(request *MTURequest) { request.DeviceMTU = 1439 }, wantCode: MTUErrorExceeded, wantBoundary: MTUBoundaryDevice},
 	}
@@ -202,6 +247,14 @@ func TestAdmitMTUGSOMaximumWireSegment(t *testing.T) {
 				t.Fatalf("AdmitMTU() error = %v, want %s/%s", err, test.wantCode, test.wantBoundary)
 			}
 		})
+	}
+	dodgy := mutateMTURequest(base, func(request *MTURequest) {
+		request.GSOSegments = 0
+		request.GSODodgy = true
+	})
+	decision, err = AdmitMTU(dodgy)
+	if err != nil || !decision.GSO || decision.OutputSegmentL3Length != 1440 {
+		t.Fatalf("AdmitMTU(DODGY zero segments) = %+v, %v; want prepared 1440-byte segment", decision, err)
 	}
 }
 
