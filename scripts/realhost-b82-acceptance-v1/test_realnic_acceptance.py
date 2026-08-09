@@ -323,6 +323,9 @@ def fixture_outputs(spec, *, fixed=()):
         (MODULE.TOOLS["ip"], "-d", "-j", "link", "show", "dev", spec.interface): json_bytes(
             [{"ifindex": spec.expected_ifindex, "ifname": spec.interface, "mtu": spec.expected_mtu, "address": spec.expected_mac, "flags": ["UP", "LOWER_UP"]}]
         ),
+        (MODULE.TOOLS["ip"], "-s", "-j", "link", "show", "dev", spec.interface): json_bytes(
+            [{"ifindex": spec.expected_ifindex, "stats64": {"rx": {"bytes": 10, "errors": 0, "dropped": 0}, "tx": {"bytes": 20, "errors": 0, "dropped": 0}}}]
+        ),
         (MODULE.TOOLS["ip"], "-j", "address", "show", "dev", spec.interface): json_bytes(
             [{"ifindex": spec.expected_ifindex, "ifname": spec.interface, "addr_info": [{"family": "inet", "local": "192.168.10.82", "prefixlen": 24}]}]
         ),
@@ -613,6 +616,59 @@ class StrictIperfOracleTests(unittest.TestCase):
 
 
 class CounterGateTests(unittest.TestCase):
+    vmxnet3_stats = b"""NIC statistics:
+     Tx Queue#: 0
+       TSO pkts tx: 19
+       pkts tx: 20
+       pkts tx err: 0
+       tx ring full: 0
+     Tx Queue#: 1
+       TSO pkts tx: 29
+       pkts tx: 30
+       pkts tx err: 0
+       tx ring full: 0
+     Rx Queue#: 0
+       pkts rx: 40
+       pkts rx err: 0
+       rx buf alloc failure: 0
+"""
+
+    def test_vmxnet3_queue_statistics_are_unique_and_failure_gated(self):
+        before = MODULE.parse_nic_counters(self.vmxnet3_stats)
+        self.assertEqual(before["tx_queue_0.tso_pkts_tx"], 19)
+        self.assertEqual(before["tx_queue_1.tso_pkts_tx"], 29)
+        self.assertEqual(before["rx_queue_0.pkts_rx"], 40)
+        failure_keys = (
+            "tx_queue_0.pkts_tx_err",
+            "tx_queue_0.tx_ring_full",
+            "tx_queue_1.pkts_tx_err",
+            "tx_queue_1.tx_ring_full",
+            "rx_queue_0.pkts_rx_err",
+            "rx_queue_0.rx_buf_alloc_failure",
+        )
+        prefixed_before = {f"/usr/sbin/ethtool:{key}": value for key, value in before.items()}
+        for key in failure_keys:
+            with self.subTest(key=key), self.assertRaisesRegex(MODULE.HarnessError, "counters grew"):
+                after = dict(prefixed_before)
+                after[f"/usr/sbin/ethtool:{key}"] += 1
+                MODULE.counter_delta(prefixed_before, after)
+
+    def test_nic_statistics_parser_rejects_ambiguous_unknown_or_empty_shapes(self):
+        fixtures = {
+            "duplicate-counter": b"NIC statistics:\n rx errors: 0\n rx errors: 1\n",
+            "duplicate-queue": b"NIC statistics:\n Tx Queue#: 0\n  pkts tx: 1\n Tx Queue#: 0\n  pkts tx: 2\n",
+            "empty-queue": b"NIC statistics:\n Tx Queue#: 0\n",
+            "unknown": b"NIC statistics:\n this is not a counter\n",
+            "empty": b"NIC statistics:\n",
+        }
+        for name, payload in fixtures.items():
+            with self.subTest(name=name), self.assertRaises(MODULE.HarnessError):
+                MODULE.parse_nic_counters(payload)
+        with self.assertRaisesRegex(MODULE.HarnessError, "omit required fields"):
+            MODULE.parse_link_counters(
+                json.dumps([{"stats64": {"rx": {}, "tx": {}}}]).encode()
+            )
+
     def test_counter_gate_rejects_error_drop_checksum_growth_and_resets(self):
         baseline = {
             "/usr/sbin/ethtool:rx_errors": 0,
@@ -658,6 +714,23 @@ class CounterGateTests(unittest.TestCase):
 
 
 class PlannerTests(unittest.TestCase):
+    def test_plan_rejects_incomplete_or_non_failure_counter_schemas(self):
+        spec = fixture_spec()
+        runner = FixtureRunner(spec)
+        runner.outputs[(MODULE.TOOLS["ethtool"], "-S", spec.interface)] = (
+            b"NIC statistics:\n packets transmitted: 10\n"
+        )
+        snapshot, commands = MODULE.collect_snapshot(spec, runner)
+        with self.assertRaisesRegex(MODULE.HarnessError, "no reviewed failure-class"):
+            MODULE.build_plan(spec, snapshot, commands)
+
+        runner = FixtureRunner(spec)
+        runner.outputs[
+            (MODULE.TOOLS["ip"], "-s", "-j", "link", "show", "dev", spec.interface)
+        ] = json.dumps([{"stats64": {"rx": {"bytes": 1}, "tx": {"bytes": 2}}}]).encode()
+        with self.assertRaisesRegex(MODULE.HarnessError, "omit required fields"):
+            MODULE.collect_snapshot(spec, runner)
+
     def test_plan_is_deterministic_and_read_only(self):
         spec = fixture_spec()
         first_runner = FixtureRunner(spec)
@@ -745,6 +818,20 @@ class PlannerTests(unittest.TestCase):
         self.assertIn("no_buffer", plan["counter_failure_policy"]["failure_phrases"])
         self.assertIn("tx-checksum-ipv4", plan["owned_feature_closure"])
         self.assertNotIn("foreign-offload", plan["owned_feature_closure"])
+        self.assertEqual(plan["counter_gate"], MODULE.counter_gate_contract(plan["baseline"]))
+        self.assertIn(
+            f"{MODULE.TOOLS['ethtool']}:global.rx_errors",
+            plan["counter_gate"]["failure_counter_ids"],
+        )
+        self.assertEqual(
+            set(plan["counter_gate"]["required_link_counter_ids"]),
+            {
+                f"{MODULE.TOOLS['ip']}:rx_dropped",
+                f"{MODULE.TOOLS['ip']}:rx_errors",
+                f"{MODULE.TOOLS['ip']}:tx_dropped",
+                f"{MODULE.TOOLS['ip']}:tx_errors",
+            },
+        )
         self.assertEqual(len(soak["traffic"]) - 1, 12)
         self.assertEqual(soak["counter_sample_schedule"]["expected_samples"], 360)
         self.assertEqual(soak["counter_sample_schedule"]["interval_seconds"], 10)

@@ -488,6 +488,7 @@ def snapshot_command_table(spec: CoreSpec) -> list[tuple[str, list[str]]]:
         ("driver", [TOOLS["ethtool"], "-i", spec.interface]),
         ("features", [TOOLS["ethtool"], "-k", spec.interface]),
         ("link", [TOOLS["ip"], "-d", "-j", "link", "show", "dev", spec.interface]),
+        ("link_stats", [TOOLS["ip"], "-s", "-j", "link", "show", "dev", spec.interface]),
         ("addresses", [TOOLS["ip"], "-j", "address", "show", "dev", spec.interface]),
         ("routes", [TOOLS["ip"], "-j", "route", "show", "table", "all", "dev", spec.interface]),
         ("peer_route", [TOOLS["ip"], "-j", "route", "get", spec.peer_address]),
@@ -651,14 +652,7 @@ def normalize_bpf(items: Any, kind: str) -> list[dict[str, Any]]:
 
 
 def nic_stat_keys(data: bytes) -> list[str]:
-    keys: list[str] = []
-    for raw in data.decode("utf-8").splitlines()[1:]:
-        if ":" not in raw:
-            continue
-        key = raw.split(":", 1)[0].strip()
-        if key:
-            keys.append(key)
-    return sorted(set(keys))
+    return sorted(parse_nic_counters(data))
 
 
 def parse_owned_snapshot(spec: CoreSpec, raw: Mapping[str, bytes]) -> dict[str, Any]:
@@ -722,6 +716,7 @@ def collect_snapshot(
         "bpf_maps": normalize_bpf(parse_json_output(raw["bpf_maps"], "bpf maps"), "maps"),
         "wg_interfaces": sorted(raw["wg_interfaces"].decode("utf-8").split()),
         "nic_stat_keys": nic_stat_keys(raw["nic_stats"]),
+        "link_stat_keys": sorted(parse_link_counters(raw["link_stats"])),
     })
     validate_snapshot_identity(spec, snapshot, expected_mtu=expected_mtu, allowed_mtu=allowed_mtu)
     return snapshot, commands
@@ -805,6 +800,7 @@ RESTORE_DIAGNOSTIC_FIELDS = {
     "bpf_maps": "bpf_maps",
     "wg_interfaces": "wg_interfaces",
     "nic_stats": "nic_stat_keys",
+    "link_stats": "link_stat_keys",
 }
 
 
@@ -830,6 +826,8 @@ def parse_restore_diagnostic(label: str, payload: bytes) -> Any:
             return nic_stat_keys(payload)
         except UnicodeDecodeError as exc:
             raise HarnessError("NIC statistics output is not UTF-8") from exc
+    if label == "link_stats":
+        return sorted(parse_link_counters(payload))
     raise HarnessError(f"unknown restore diagnostic label: {label}")
 
 
@@ -1201,6 +1199,58 @@ def counter_failure_policy() -> dict[str, Any]:
                 "timeout",
                 "underflow",
             }
+        ),
+    }
+
+
+def counter_id_is_failure(counter_id: str) -> bool:
+    policy = counter_failure_policy()
+    name = counter_id.split(":", 1)[-1].lower()
+    tokens = tuple(filter(None, re.split(r"[^a-z0-9]+", name)))
+    phrases = {
+        "_".join(tokens[index : index + width])
+        for width in (2, 3)
+        for index in range(len(tokens) - width + 1)
+    }
+    return bool(
+        set(tokens) & set(policy["failure_tokens"])
+        or phrases & set(policy["failure_phrases"])
+        or any(token.startswith(tuple(policy["failure_token_prefixes"])) for token in tokens)
+    )
+
+
+def counter_gate_contract(snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    nic_keys = snapshot.get("nic_stat_keys")
+    link_keys = snapshot.get("link_stat_keys")
+    if (
+        not isinstance(nic_keys, list)
+        or not nic_keys
+        or not all(isinstance(key, str) and key for key in nic_keys)
+        or len(nic_keys) != len(set(nic_keys))
+    ):
+        raise HarnessError("baseline has no exact unique NIC counter schema")
+    required_link_keys = {"rx_errors", "rx_dropped", "tx_errors", "tx_dropped"}
+    if (
+        not isinstance(link_keys, list)
+        or not all(isinstance(key, str) and key for key in link_keys)
+        or not required_link_keys.issubset(link_keys)
+        or len(link_keys) != len(set(link_keys))
+    ):
+        raise HarnessError("baseline has no exact required ip link counter schema")
+    nic_ids = sorted(f"{TOOLS['ethtool']}:{key}" for key in nic_keys)
+    link_ids = sorted(f"{TOOLS['ip']}:{key}" for key in link_keys)
+    all_ids = sorted([*nic_ids, *link_ids])
+    failure_ids = [counter_id for counter_id in all_ids if counter_id_is_failure(counter_id)]
+    if not any(counter_id.startswith(f"{TOOLS['ethtool']}:") for counter_id in failure_ids):
+        raise HarnessError("NIC statistics expose no reviewed failure-class counter")
+    return {
+        "schema": "wg-mix-ebpf-realnic-counter-gate-v1",
+        "nic_counter_ids": nic_ids,
+        "link_counter_ids": link_ids,
+        "all_counter_ids": all_ids,
+        "failure_counter_ids": failure_ids,
+        "required_link_counter_ids": sorted(
+            f"{TOOLS['ip']}:{key}" for key in required_link_keys
         ),
     }
 
@@ -1626,6 +1676,7 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         "spec": spec.as_dict(),
         "execution_profile": spec.profile,
         "counter_failure_policy": counter_failure_policy(),
+        "counter_gate": counter_gate_contract(snapshot),
         "owned_feature_closure": owned_feature_closure(snapshot["features"]),
         "snapshot_commands": snapshot_commands,
         "baseline": snapshot,
@@ -1788,6 +1839,8 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
         raise HarnessError("approved plan has no baseline")
     if plan.get("owned_feature_closure") != owned_feature_closure(baseline.get("features", {})):
         raise HarnessError("approved plan owned feature closure is not exact")
+    if plan.get("counter_gate") != counter_gate_contract(baseline):
+        raise HarnessError("approved plan counter gate is not exact")
     oracle_contract = plan.get("traffic_oracle")
     if (
         not isinstance(oracle_contract, dict)
@@ -2697,14 +2750,51 @@ def ping_metrics(payload: bytes) -> dict[str, Any]:
 
 
 def parse_nic_counters(payload: bytes) -> dict[str, int]:
-    result: dict[str, int] = {}
-    for raw in payload.decode("utf-8", "replace").splitlines()[1:]:
-        if ":" not in raw:
+    try:
+        lines = payload.decode("utf-8").splitlines()
+    except UnicodeDecodeError as exc:
+        raise HarnessError("ethtool NIC statistics output is not UTF-8") from exc
+    if not lines or lines[0].strip() != "NIC statistics:":
+        raise HarnessError("ethtool NIC statistics output has no exact header")
+
+    queue_pattern = re.compile(r"^\s*(Tx|Rx) Queue#:\s*([0-9]+)\s*$")
+    counter_pattern = re.compile(r"^\s+([^:]+):\s*([0-9]+)\s*$")
+    counters: dict[str, int] = {}
+    seen_queues: set[str] = set()
+    queue: str | None = None
+    queue_counters = 0
+    for raw in lines[1:]:
+        if not raw.strip():
+            raise HarnessError("ethtool NIC statistics contains an empty record")
+        queue_match = queue_pattern.fullmatch(raw)
+        if queue_match:
+            if queue is not None and queue_counters == 0:
+                raise HarnessError(f"ethtool NIC statistics queue {queue} is empty")
+            direction, index = queue_match.groups()
+            queue = f"{direction.lower()}_queue_{int(index)}"
+            if queue in seen_queues:
+                raise HarnessError(f"duplicate ethtool NIC statistics queue: {queue}")
+            seen_queues.add(queue)
+            queue_counters = 0
             continue
-        name, value = (part.strip() for part in raw.split(":", 1))
-        if re.fullmatch(r"[A-Za-z0-9_.-]+", name) and re.fullmatch(r"[0-9]+", value):
-            result[name] = int(value)
-    return result
+        counter_match = counter_pattern.fullmatch(raw)
+        if not counter_match:
+            raise HarnessError(f"unparsed ethtool NIC statistics line: {raw!r}")
+        raw_name, raw_value = counter_match.groups()
+        name = re.sub(r"[^a-z0-9]+", "_", raw_name.strip().lower()).strip("_")
+        if not name:
+            raise HarnessError("ethtool NIC statistics counter name is empty after normalization")
+        key = f"{queue}.{name}" if queue is not None else f"global.{name}"
+        if key in counters:
+            raise HarnessError(f"duplicate ethtool NIC statistics counter: {key}")
+        counters[key] = int(raw_value)
+        if queue is not None:
+            queue_counters += 1
+    if queue is not None and queue_counters == 0:
+        raise HarnessError(f"ethtool NIC statistics queue {queue} is empty")
+    if not counters:
+        raise HarnessError("ethtool NIC statistics contains no counters")
+    return counters
 
 
 def parse_link_counters(payload: bytes) -> dict[str, int]:
@@ -2722,6 +2812,10 @@ def parse_link_counters(payload: bytes) -> dict[str, int]:
         for name, value in values.items():
             if isinstance(value, int) and value >= 0:
                 result[f"{direction}_{name}"] = value
+    required = {"rx_errors", "rx_dropped", "tx_errors", "tx_dropped"}
+    missing = sorted(required - set(result))
+    if missing:
+        raise HarnessError(f"ip link counters omit required fields: {','.join(missing)}")
     return result
 
 
@@ -2757,25 +2851,18 @@ def counter_delta(before: Mapping[str, int], after: Mapping[str, int]) -> dict[s
     decreased = [key for key, value in deltas.items() if value < 0]
     if decreased:
         raise HarnessError(f"NIC counters decreased during the traffic cell: {','.join(decreased)}")
-    policy = counter_failure_policy()
-    failure_tokens = set(policy["failure_tokens"])
-    failure_phrases = set(policy["failure_phrases"])
-    failure_prefixes = tuple(policy["failure_token_prefixes"])
     grew = []
     for key, value in deltas.items():
-        name = key.split(":", 1)[-1].lower()
-        tokens = tuple(filter(None, re.split(r"[^a-z0-9]+", name)))
-        phrases = {
-            "_".join(tokens[index : index + width])
-            for width in (2, 3)
-            for index in range(len(tokens) - width + 1)
-        }
-        suspicious_token = any(token.startswith(failure_prefixes) for token in tokens)
-        if value > 0 and (set(tokens) & failure_tokens or phrases & failure_phrases or suspicious_token):
+        if value > 0 and counter_id_is_failure(key):
             grew.append(f"{key}=+{value}")
     if grew:
         raise HarnessError(f"NIC error/drop/checksum counters grew: {','.join(grew)}")
     return deltas
+
+
+def validate_counter_gate_schema(contract: Mapping[str, Any], counters: Mapping[str, int]) -> None:
+    if sorted(counters) != contract.get("all_counter_ids"):
+        raise HarnessError("runtime counter schema differs from the approved plan")
 
 
 def run_traffic(
@@ -2964,6 +3051,7 @@ def validate_scoped_snapshot(
         "bpf_maps",
         "wg_interfaces",
         "nic_stat_keys",
+        "link_stat_keys",
     )
     for field in unchanged_fields:
         if current[field] != baseline[field]:
@@ -3167,6 +3255,7 @@ def run_with_interface_lease(
             write_exclusive(f"{spec.run_root}/active-{active_cell}.json", canonical_json(active_snapshot))
             journal.append("CELL_ACTIVE", cell=active_cell)
             counters_before = run_monitor(cell["monitor_before"], runner, journal)
+            validate_counter_gate_schema(plan["counter_gate"], counters_before)
             traffic_results = run_traffic(spec, cell, runner, journal, counters_before)
             counters_after = run_monitor(cell["monitor_after"], runner, journal)
             results.append(
