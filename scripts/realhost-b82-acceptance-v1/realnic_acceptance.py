@@ -39,6 +39,14 @@ PHYSICAL_INTERFACE_LOCK_GID = 0
 LEGACY_RETIREMENT_RESERVATION = (
     "/run/wg-mix-ebpf-source-stages/c8e41d73/realhost-v6-6bd913ac"
 )
+APPROVED_PLAN_PATH = "/run/wg-mix-ebpf-source-bootstrap-c8e41d73/realnic-approved-plan.json"
+EXPECTED_HOSTNAME = "ubuntu-2604-test"
+EXPECTED_KERNEL = "7.0.0-28-generic"
+EXPECTED_MACHINE_ID = "9db3fb717cc74974b2a6b243d67f67b9"
+CONTROLLER_PROFILE = "acceptance"
+CONTROLLER_TRAFFIC_SECONDS = 30
+CONTROLLER_SOAK_SECONDS = 3600
+CONTROLLER_SOAK_WINDOW_SECONDS = 300
 RUN_ID_RE = re.compile(r"^[0-9a-f]{8,32}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -183,6 +191,20 @@ def physical_interface_lock_path() -> str:
     if not parent or not os.path.isabs(parent):
         raise HarnessError("run-root prefix has no stable absolute physical-lock directory")
     return os.path.join(parent, PHYSICAL_INTERFACE_LOCK_BASENAME)
+
+
+def controller_run_id(
+    source_commit: str,
+    boot_id: str,
+    interface_identity: Mapping[str, Any],
+) -> str:
+    binding = {
+        "schema": "wg-mix-ebpf-b82-realnic-controller-run-id-v1",
+        "source_commit": source_commit,
+        "boot_id": boot_id,
+        "interface_identity": dict(interface_identity),
+    }
+    return sha256_bytes(canonical_json(binding))[:16]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -494,8 +516,10 @@ class RunningProcess:
                 signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
-def snapshot_command_table(spec: CoreSpec) -> list[tuple[str, list[str]]]:
-    sysfs = f"/sys/class/net/{spec.interface}"
+def snapshot_command_table(spec: CoreSpec | None) -> list[tuple[str, list[str]]]:
+    interface = PHYSICAL_INTERFACE if spec is None else spec.interface
+    peer_address = READ_ONLY_PEER if spec is None else spec.peer_address
+    sysfs = f"/sys/class/net/{interface}"
     return [
         ("hostname", [TOOLS["hostname"]]),
         ("kernel", [TOOLS["uname"], "-r"]),
@@ -507,21 +531,21 @@ def snapshot_command_table(spec: CoreSpec) -> list[tuple[str, list[str]]]:
         ("mtu", [TOOLS["cat"], f"{sysfs}/mtu"]),
         ("device_path", [TOOLS["readlink"], "-e", f"{sysfs}/device"]),
         ("device_stat", [TOOLS["stat"], "-Lc", "%d:%i", f"{sysfs}/device"]),
-        ("driver", [TOOLS["ethtool"], "-i", spec.interface]),
-        ("features", [TOOLS["ethtool"], "-k", spec.interface]),
-        ("link", [TOOLS["ip"], "-d", "-j", "link", "show", "dev", spec.interface]),
-        ("link_stats", [TOOLS["ip"], "-s", "-j", "link", "show", "dev", spec.interface]),
-        ("addresses", [TOOLS["ip"], "-j", "address", "show", "dev", spec.interface]),
-        ("routes", [TOOLS["ip"], "-j", "route", "show", "table", "all", "dev", spec.interface]),
-        ("peer_route", [TOOLS["ip"], "-j", "route", "get", spec.peer_address]),
-        ("qdisc", [TOOLS["tc"], "-j", "qdisc", "show", "dev", spec.interface]),
-        ("tc_ingress", [TOOLS["tc"], "-j", "filter", "show", "dev", spec.interface, "ingress"]),
-        ("tc_egress", [TOOLS["tc"], "-j", "filter", "show", "dev", spec.interface, "egress"]),
+        ("driver", [TOOLS["ethtool"], "-i", interface]),
+        ("features", [TOOLS["ethtool"], "-k", interface]),
+        ("link", [TOOLS["ip"], "-d", "-j", "link", "show", "dev", interface]),
+        ("link_stats", [TOOLS["ip"], "-s", "-j", "link", "show", "dev", interface]),
+        ("addresses", [TOOLS["ip"], "-j", "address", "show", "dev", interface]),
+        ("routes", [TOOLS["ip"], "-j", "route", "show", "table", "all", "dev", interface]),
+        ("peer_route", [TOOLS["ip"], "-j", "route", "get", peer_address]),
+        ("qdisc", [TOOLS["tc"], "-j", "qdisc", "show", "dev", interface]),
+        ("tc_ingress", [TOOLS["tc"], "-j", "filter", "show", "dev", interface, "ingress"]),
+        ("tc_egress", [TOOLS["tc"], "-j", "filter", "show", "dev", interface, "egress"]),
         ("bpf_links", [TOOLS["bpftool"], "-j", "link", "show"]),
         ("bpf_programs", [TOOLS["bpftool"], "-j", "prog", "show"]),
         ("bpf_maps", [TOOLS["bpftool"], "-j", "map", "show"]),
         ("wg_interfaces", [TOOLS["wg"], "show", "interfaces"]),
-        ("nic_stats", [TOOLS["ethtool"], "-S", spec.interface]),
+        ("nic_stats", [TOOLS["ethtool"], "-S", interface]),
     ]
 
 
@@ -677,44 +701,51 @@ def nic_stat_keys(data: bytes) -> list[str]:
     return sorted(parse_nic_counters(data))
 
 
-def parse_owned_snapshot(spec: CoreSpec, raw: Mapping[str, bytes]) -> dict[str, Any]:
+def parse_snapshot_identity(raw: Mapping[str, bytes]) -> tuple[dict[str, str], dict[str, Any]]:
     driver = parse_key_values(raw["driver"], "ethtool driver")
     stat_value = single_line(raw["device_stat"], "device-stat")
     try:
         device_dev, device_ino = (int(part) for part in stat_value.split(":"))
+        ifindex = int(single_line(raw["ifindex"], "ifindex"))
+        mtu = int(single_line(raw["mtu"], "mtu"))
     except (ValueError, TypeError) as exc:
-        raise HarnessError("device-stat is not decimal dev:inode") from exc
+        raise HarnessError("interface numeric identity is not canonical decimal") from exc
+    host = {
+        "hostname": single_line(raw["hostname"], "hostname"),
+        "kernel": single_line(raw["kernel"], "kernel"),
+        "machine_id": single_line(raw["machine_id"], "machine-id"),
+        "boot_id": single_line(raw["boot_id"], "boot-id"),
+        "netns": single_line(raw["netns"], "netns"),
+    }
+    identity = {
+        "name": PHYSICAL_INTERFACE,
+        "ifindex": ifindex,
+        "mac": single_line(raw["mac"], "mac"),
+        "mtu": mtu,
+        "driver": driver.get("driver", ""),
+        "bus_info": driver.get("bus-info", ""),
+        "device_path": single_line(raw["device_path"], "device-path"),
+        "device_dev": device_dev,
+        "device_ino": device_ino,
+    }
+    return host, identity
+
+
+def parse_owned_snapshot(spec: CoreSpec, raw: Mapping[str, bytes]) -> dict[str, Any]:
+    host, identity = parse_snapshot_identity(raw)
+    identity["name"] = spec.interface
     return {
-        "host": {
-            "hostname": single_line(raw["hostname"], "hostname"),
-            "kernel": single_line(raw["kernel"], "kernel"),
-            "machine_id": single_line(raw["machine_id"], "machine-id"),
-            "boot_id": single_line(raw["boot_id"], "boot-id"),
-            "netns": single_line(raw["netns"], "netns"),
-        },
-        "interface_identity": {
-            "name": spec.interface,
-            "ifindex": int(single_line(raw["ifindex"], "ifindex")),
-            "mac": single_line(raw["mac"], "mac"),
-            "mtu": int(single_line(raw["mtu"], "mtu")),
-            "driver": driver.get("driver", ""),
-            "bus_info": driver.get("bus-info", ""),
-            "device_path": single_line(raw["device_path"], "device-path"),
-            "device_dev": device_dev,
-            "device_ino": device_ino,
-        },
+        "host": host,
+        "interface_identity": identity,
         "features": parse_features(raw["features"]),
         "link": stable_sort(parse_json_output(raw["link"], "ip link")),
     }
 
 
-def collect_snapshot(
-    spec: CoreSpec,
+def capture_snapshot(
+    spec: CoreSpec | None,
     runner: CommandRunner,
-    *,
-    expected_mtu: int | None = None,
-    allowed_mtu: frozenset[int] | None = None,
-) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+) -> tuple[dict[str, bytes], list[dict[str, Any]]]:
     raw: dict[str, bytes] = {}
     commands: list[dict[str, Any]] = []
     for label, argv in snapshot_command_table(spec):
@@ -724,7 +755,10 @@ def collect_snapshot(
             detail = stderr.decode("utf-8", "replace").strip()
             raise HarnessError(f"read-only snapshot {label} failed rc={rc}: {detail}")
         raw[label] = stdout
+    return raw, commands
 
+
+def assemble_snapshot(spec: CoreSpec, raw: Mapping[str, bytes]) -> dict[str, Any]:
     snapshot = parse_owned_snapshot(spec, raw)
     snapshot.update({
         "addresses": normalize_addresses(parse_json_output(raw["addresses"], "ip address")),
@@ -740,8 +774,104 @@ def collect_snapshot(
         "nic_stat_keys": nic_stat_keys(raw["nic_stats"]),
         "link_stat_keys": sorted(parse_link_counters(raw["link_stats"])),
     })
+    return snapshot
+
+
+def derive_controller_spec(source_commit: str, raw: Mapping[str, bytes]) -> CoreSpec:
+    nontrivial_hex(source_commit, COMMIT_RE, "source-commit")
+    host, identity = parse_snapshot_identity(raw)
+    expected_host = {
+        "hostname": EXPECTED_HOSTNAME,
+        "kernel": EXPECTED_KERNEL,
+        "machine_id": EXPECTED_MACHINE_ID,
+    }
+    if any(host.get(key) != value for key, value in expected_host.items()):
+        raise HarnessError("controller plan host identity is outside the fixed target")
+    expected_mtu = int(identity["mtu"])
+    if expected_mtu < 1288:
+        raise HarnessError("controller plan MTU is too small for the reviewed boundary")
+    run_id = controller_run_id(source_commit, host["boot_id"], identity)
+    return CoreSpec(
+        run_id=run_id,
+        run_root=f"{RUN_ROOT_PREFIX}{run_id}",
+        source_commit=source_commit,
+        interface=PHYSICAL_INTERFACE,
+        expected_ifindex=int(identity["ifindex"]),
+        expected_mac=str(identity["mac"]),
+        expected_driver=str(identity["driver"]),
+        expected_bus_info=str(identity["bus_info"]),
+        expected_device_path=str(identity["device_path"]),
+        expected_device_dev=int(identity["device_dev"]),
+        expected_device_ino=int(identity["device_ino"]),
+        expected_mtu=expected_mtu,
+        expected_hostname=EXPECTED_HOSTNAME,
+        expected_kernel=EXPECTED_KERNEL,
+        expected_machine_id=EXPECTED_MACHINE_ID,
+        expected_boot_id=host["boot_id"],
+        peer_address=READ_ONLY_PEER,
+        peer_port=5201,
+        profile=CONTROLLER_PROFILE,
+        traffic_seconds=CONTROLLER_TRAFFIC_SECONDS,
+        soak_seconds=CONTROLLER_SOAK_SECONDS,
+        soak_window_seconds=CONTROLLER_SOAK_WINDOW_SECONDS,
+        mtu_low=expected_mtu - 8,
+    ).validate()
+
+
+def validate_controller_spec(spec: CoreSpec, source_commit: str) -> None:
+    expected_identity = {
+        "name": spec.interface,
+        "ifindex": spec.expected_ifindex,
+        "mac": spec.expected_mac,
+        "mtu": spec.expected_mtu,
+        "driver": spec.expected_driver,
+        "bus_info": spec.expected_bus_info,
+        "device_path": spec.expected_device_path,
+        "device_dev": spec.expected_device_dev,
+        "device_ino": spec.expected_device_ino,
+    }
+    expected_run_id = controller_run_id(source_commit, spec.expected_boot_id, expected_identity)
+    if (
+        spec.source_commit != source_commit
+        or spec.run_id != expected_run_id
+        or spec.run_root != f"{RUN_ROOT_PREFIX}{expected_run_id}"
+        or spec.interface != PHYSICAL_INTERFACE
+        or spec.expected_hostname != EXPECTED_HOSTNAME
+        or spec.expected_kernel != EXPECTED_KERNEL
+        or spec.expected_machine_id != EXPECTED_MACHINE_ID
+        or spec.peer_address != READ_ONLY_PEER
+        or spec.peer_port != 5201
+        or spec.profile != CONTROLLER_PROFILE
+        or spec.traffic_seconds != CONTROLLER_TRAFFIC_SECONDS
+        or spec.soak_seconds != CONTROLLER_SOAK_SECONDS
+        or spec.soak_window_seconds != CONTROLLER_SOAK_WINDOW_SECONDS
+        or spec.mtu_low != spec.expected_mtu - 8
+    ):
+        raise HarnessError("approved plan CoreSpec is outside the fixed controller contract")
+
+
+def collect_snapshot(
+    spec: CoreSpec,
+    runner: CommandRunner,
+    *,
+    expected_mtu: int | None = None,
+    allowed_mtu: frozenset[int] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    raw, commands = capture_snapshot(spec, runner)
+    snapshot = assemble_snapshot(spec, raw)
     validate_snapshot_identity(spec, snapshot, expected_mtu=expected_mtu, allowed_mtu=allowed_mtu)
     return snapshot, commands
+
+
+def collect_controller_plan_snapshot(
+    source_commit: str,
+    runner: CommandRunner,
+) -> tuple[CoreSpec, dict[str, Any], list[dict[str, Any]]]:
+    raw, commands = capture_snapshot(None, runner)
+    spec = derive_controller_spec(source_commit, raw)
+    snapshot = assemble_snapshot(spec, raw)
+    validate_snapshot_identity(spec, snapshot)
+    return spec, snapshot, commands
 
 
 def validate_snapshot_identity(
@@ -1997,43 +2127,12 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
     }
 
 
-def core_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--run-id", required=True)
-    parser.add_argument("--run-root", required=True)
-    parser.add_argument("--source-commit", required=True)
-    parser.add_argument("--interface", required=True)
-    parser.add_argument("--expected-ifindex", type=int, required=True)
-    parser.add_argument("--expected-mac", required=True)
-    parser.add_argument("--expected-driver", required=True)
-    parser.add_argument("--expected-bus-info", required=True)
-    parser.add_argument("--expected-device-path", required=True)
-    parser.add_argument("--expected-device-dev", type=int, required=True)
-    parser.add_argument("--expected-device-ino", type=int, required=True)
-    parser.add_argument("--expected-mtu", type=int, required=True)
-    parser.add_argument("--expected-hostname", required=True)
-    parser.add_argument("--expected-kernel", required=True)
-    parser.add_argument("--expected-machine-id", required=True)
-    parser.add_argument("--expected-boot-id", required=True)
-    parser.add_argument("--peer-address", required=True)
-    parser.add_argument("--peer-port", type=int, required=True)
-    parser.add_argument("--profile", choices=("smoke", "acceptance"), required=True)
-    parser.add_argument("--traffic-seconds", type=int, required=True)
-    parser.add_argument("--soak-seconds", type=int, required=True)
-    parser.add_argument("--soak-window-seconds", type=int, required=True)
-    parser.add_argument("--mtu-low", type=int, required=True)
-
-
-def spec_from_namespace(namespace: argparse.Namespace) -> CoreSpec:
-    names = {field.name for field in dataclasses.fields(CoreSpec)}
-    return CoreSpec(**{name: getattr(namespace, name) for name in names}).validate()
-
-
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     modes = result.add_subparsers(dest="mode", required=True)
     for mode in ("plan", "run", "restore"):
         child = modes.add_parser(mode)
-        core_arguments(child)
+        child.add_argument("--source-commit", required=True)
         if mode in {"run", "restore"}:
             child.add_argument("--approved-plan", required=True)
             child.add_argument("--approved-plan-sha256", required=True)
@@ -2101,7 +2200,12 @@ def plan_mode(spec: CoreSpec, runner: CommandRunner) -> int:
     return execute_with_physical_authority("plan", spec, runner)
 
 
-def read_approved_plan(path_value: str, expected_sha256: str, spec: CoreSpec) -> tuple[dict[str, Any], bytes]:
+def read_plan_document(
+    path_value: str,
+    expected_sha256: str,
+    *,
+    require_root_owned: bool = False,
+) -> tuple[dict[str, Any], bytes]:
     nontrivial_hex(expected_sha256, SHA256_RE, "approved-plan-sha256")
     path = Path(path_value)
     if not path.is_absolute() or os.path.normpath(path_value) != path_value:
@@ -2113,8 +2217,19 @@ def read_approved_plan(path_value: str, expected_sha256: str, spec: CoreSpec) ->
         raise HarnessError(f"cannot open approved plan: {exc}") from exc
     try:
         metadata = os.fstat(descriptor)
-        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > 16 << 20:
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_nlink != 1
+            or metadata.st_size > 16 << 20
+            or metadata.st_size == 0
+        ):
             raise HarnessError("approved plan must be a bounded single-link regular file")
+        if require_root_owned and (
+            metadata.st_uid != 0
+            or metadata.st_gid != 0
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise HarnessError("approved plan must be the root-owned 0600 stager snapshot")
         chunks: list[bytes] = []
         remaining = metadata.st_size
         while remaining:
@@ -2123,6 +2238,12 @@ def read_approved_plan(path_value: str, expected_sha256: str, spec: CoreSpec) ->
                 raise HarnessError("approved plan was truncated while reading")
             chunks.append(chunk)
             remaining -= len(chunk)
+        current = os.lstat(path_value)
+        if stat.S_ISLNK(current.st_mode) or (current.st_dev, current.st_ino) != (
+            metadata.st_dev,
+            metadata.st_ino,
+        ):
+            raise HarnessError("approved plan path changed while reading")
         payload = b"".join(chunks)
     finally:
         os.close(descriptor)
@@ -2134,10 +2255,104 @@ def read_approved_plan(path_value: str, expected_sha256: str, spec: CoreSpec) ->
         raise HarnessError("approved plan is not JSON") from exc
     if canonical_json(plan) != payload:
         raise HarnessError("approved plan is not canonical JSON")
+    if not isinstance(plan, dict):
+        raise HarnessError("approved plan root is not an object")
+    return plan, payload
+
+
+def read_approved_plan(path_value: str, expected_sha256: str, spec: CoreSpec) -> tuple[dict[str, Any], bytes]:
+    plan, payload = read_plan_document(path_value, expected_sha256)
     if plan.get("schema") != SCHEMA or plan.get("spec") != spec.as_dict():
         raise HarnessError("approved plan schema/spec does not match exact argv")
     validate_plan_shape(plan, spec)
     return plan, payload
+
+
+def controller_spec_from_plan(plan: Mapping[str, Any], source_commit: str) -> CoreSpec:
+    raw_spec = plan.get("spec")
+    names = {field.name for field in dataclasses.fields(CoreSpec)}
+    if not isinstance(raw_spec, dict) or set(raw_spec) != names:
+        raise HarnessError("approved plan has no exact CoreSpec")
+    try:
+        spec = CoreSpec(**raw_spec).validate()
+    except TypeError as exc:
+        raise HarnessError("approved plan CoreSpec types are invalid") from exc
+    validate_controller_spec(spec, source_commit)
+    return spec
+
+
+def read_controller_approved_plan(
+    path_value: str,
+    expected_sha256: str,
+    source_commit: str,
+) -> tuple[CoreSpec, dict[str, Any], bytes]:
+    if path_value != APPROVED_PLAN_PATH:
+        raise HarnessError("approved plan is not the fixed root-owned stager snapshot")
+    plan, payload = read_plan_document(
+        path_value,
+        expected_sha256,
+        require_root_owned=True,
+    )
+    spec = controller_spec_from_plan(plan, source_commit)
+    if plan.get("schema") != SCHEMA:
+        raise HarnessError("approved plan schema is not exact")
+    validate_plan_shape(plan, spec)
+    return spec, plan, payload
+
+
+def controller_plan_mode(source_commit: str, runner: CommandRunner) -> int:
+    nontrivial_hex(source_commit, COMMIT_RE, "source-commit")
+    with PhysicalInterfaceLock(physical_interface_lock_path()):
+        validate_legacy_retirement_reservation()
+        spec, snapshot, commands = collect_controller_plan_snapshot(source_commit, runner)
+        sys.stdout.buffer.write(canonical_json(build_plan(spec, snapshot, commands)))
+    return 0
+
+
+def controller_approved_mode(
+    mode: str,
+    source_commit: str,
+    approved_plan: str,
+    approved_sha256: str,
+    runner: CommandRunner,
+) -> int:
+    if mode not in {"run", "restore"}:
+        raise HarnessError("controller approved mode is invalid")
+    if os.geteuid() != 0:
+        raise HarnessError(f"{mode} mode requires root after explicit approval")
+    nontrivial_hex(source_commit, COMMIT_RE, "source-commit")
+    with PhysicalInterfaceLock(physical_interface_lock_path()):
+        validate_legacy_retirement_reservation()
+        spec, plan, plan_payload = read_controller_approved_plan(
+            approved_plan,
+            approved_sha256,
+            source_commit,
+        )
+        lease_contract = plan["interface_lease"]
+        with InterfaceLease(
+            lease_contract["path"],
+            spec.run_id,
+            approved_sha256,
+            lease_contract["identity"],
+        ) as lease:
+            if mode == "run":
+                lease.require_available_for_run()
+                return run_with_interface_lease(
+                    spec,
+                    approved_sha256,
+                    runner,
+                    plan,
+                    plan_payload,
+                    lease,
+                )
+            return restore_with_interface_lease(
+                spec,
+                approved_sha256,
+                runner,
+                plan,
+                plan_payload,
+                lease,
+            )
 
 
 def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
@@ -4117,13 +4332,16 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner | None = None)
         with TerminationBoundary():
             reject_ambiguous_cli(raw_argv)
             namespace = parser().parse_args(raw_argv)
-            spec = spec_from_namespace(namespace)
             actual_runner = runner or CommandRunner()
             if namespace.mode == "plan":
-                return plan_mode(spec, actual_runner)
-            if namespace.mode == "run":
-                return run_mode(spec, namespace.approved_plan, namespace.approved_plan_sha256, actual_runner)
-            return restore_mode(spec, namespace.approved_plan, namespace.approved_plan_sha256, actual_runner)
+                return controller_plan_mode(namespace.source_commit, actual_runner)
+            return controller_approved_mode(
+                namespace.mode,
+                namespace.source_commit,
+                namespace.approved_plan,
+                namespace.approved_plan_sha256,
+                actual_runner,
+            )
     except HarnessError as exc:
         print(f"REALNIC_ACCEPTANCE_STOP reason={exc}", file=sys.stderr)
         return 125
