@@ -55,6 +55,8 @@ const (
 	// NEEDS_CSUM is set: csum_start + csum_offset + sizeof(__sum16) = 42.
 	fakeTCPRealHostVirtioHeaderLength        = fakeTCPRealHostVirtioChecksumStart + fakeTCPRealHostUDPHeaderSize
 	fakeTCPRealHostVirtioGSOSize      uint16 = 32
+	fakeTCPRealHostGSOSourcePort      uint16 = 31101
+	fakeTCPRealHostGSODestinationPort uint16 = 31102
 )
 
 type fakeTCPRealHostPrepared struct {
@@ -121,24 +123,117 @@ func TestFakeTCPRealHostVirtioNetHeaderEncoding(t *testing.T) {
 		t.Fatal("UDP_L4 GSO virtio header changed frame bytes")
 	}
 
-	udpFrame, _ := buildFakeTCPProbeUDPPacket(t, 31001, 31002, 67)
-	if !fakeTCPRealHostFlowFrameMatches(udpFrame, 31001, 31002, 67) ||
-		fakeTCPRealHostFlowFrameMatches(udpFrame, 31001, 31002, 66) {
-		t.Fatal("UDP negative-output matcher did not bind the exact payload length")
+}
+
+func TestFakeTCPRealHostGSOOutputMatcher(t *testing.T) {
+	for _, protocol := range []byte{17, 6} {
+		for _, payloadLength := range []int{67, 32, 3} {
+			frame := buildFakeTCPRealHostFlowMatcherFrame(t, protocol, payloadLength)
+			if !fakeTCPRealHostFlowFrameMatches(
+				frame, fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort,
+			) {
+				t.Fatalf("protocol=%d payload=%d valid flow did not match", protocol, payloadLength)
+			}
+		}
 	}
-	tcpFrame := make([]byte, fakeTCPRealHostEthernetHeaderSize+
-		fakeTCPRealHostIPv4HeaderSize+20+67)
-	copy(tcpFrame[:fakeTCPRealHostEthernetHeaderSize], udpFrame[:fakeTCPRealHostEthernetHeaderSize])
-	copy(tcpFrame[fakeTCPRealHostEthernetHeaderSize:], udpFrame[fakeTCPRealHostEthernetHeaderSize:])
-	ip := tcpFrame[fakeTCPRealHostEthernetHeaderSize:]
-	ip[9] = 6
-	binary.BigEndian.PutUint16(ip[2:4], uint16(fakeTCPRealHostIPv4HeaderSize+20+67))
-	binary.BigEndian.PutUint16(ip[fakeTCPRealHostIPv4HeaderSize:], 31001)
-	binary.BigEndian.PutUint16(ip[fakeTCPRealHostIPv4HeaderSize+2:], 31002)
-	if !fakeTCPRealHostFlowFrameMatches(tcpFrame, 31001, 31002, 67) ||
-		fakeTCPRealHostFlowFrameMatches(tcpFrame, 31001, 31002, 65) {
-		t.Fatal("TCP negative-output matcher did not bind the exact payload length")
+	wrongFlow := buildFakeTCPRealHostFlowMatcherFrame(t, 17, 67)
+	binary.BigEndian.PutUint16(
+		wrongFlow[fakeTCPRealHostEthernetHeaderSize+fakeTCPRealHostIPv4HeaderSize:],
+		fakeTCPRealHostGSOSourcePort+1,
+	)
+	if fakeTCPRealHostFlowFrameMatches(
+		wrongFlow, fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort,
+	) {
+		t.Fatal("wrong GSO flow matched")
 	}
+	truncated := buildFakeTCPRealHostFlowMatcherFrame(t, 17, 32)
+	if fakeTCPRealHostFlowFrameMatches(
+		truncated[:len(truncated)-1], fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort,
+	) {
+		t.Fatal("truncated UDP segment matched")
+	}
+	for _, totalLength := range []uint16{20, 23} {
+		shortTotal := buildFakeTCPRealHostFlowMatcherFrame(t, 17, 32)
+		binary.BigEndian.PutUint16(
+			shortTotal[fakeTCPRealHostEthernetHeaderSize+2:], totalLength,
+		)
+		if fakeTCPRealHostFlowFrameMatches(
+			shortTotal, fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort,
+		) {
+			t.Fatalf("short IPv4 total length %d matched", totalLength)
+		}
+	}
+	badUDP := buildFakeTCPRealHostFlowMatcherFrame(t, 17, 32)
+	udp := badUDP[fakeTCPRealHostEthernetHeaderSize+fakeTCPRealHostIPv4HeaderSize:]
+	binary.BigEndian.PutUint16(udp[4:6], uint16(fakeTCPRealHostUDPHeaderSize+31))
+	if fakeTCPRealHostFlowFrameMatches(
+		badUDP, fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort,
+	) {
+		t.Fatal("UDP segment with inconsistent length matched")
+	}
+	badTCP := buildFakeTCPRealHostFlowMatcherFrame(t, 6, 32)
+	badTCP[fakeTCPRealHostEthernetHeaderSize+fakeTCPRealHostIPv4HeaderSize+12] = 4 << 4
+	if fakeTCPRealHostFlowFrameMatches(
+		badTCP, fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort,
+	) {
+		t.Fatal("TCP segment with short data offset matched")
+	}
+}
+
+func TestFakeTCPRealHostGSOProbeIsolationContract(t *testing.T) {
+	contract := fakeTCPRealHostContract{
+		ifindex: 101, peerIfindex: 102, vethName: "wgc8e41a", peerVethName: "wgc8e41b",
+	}
+	state := fakeTCPRealHostState(contract, 77, true)
+	localRules := 0
+	for _, rule := range state.EgressRules {
+		if rule.SourcePort != fakeTCPRealHostGSOSourcePort {
+			continue
+		}
+		if rule.UnderlayIfIndex != contract.ifindex || rule.TransportMode != "faketcp" {
+			t.Fatalf("GSO probe egress rule=%#v", rule)
+		}
+		localRules++
+	}
+	if localRules != 1 {
+		t.Fatalf("GSO probe local egress rules=%d, want 1", localRules)
+	}
+	for _, listener := range state.IngressListeners {
+		if listener.DestinationPort == fakeTCPRealHostGSODestinationPort {
+			t.Fatalf("GSO probe unexpectedly installed peer ingress listener %#v", listener)
+		}
+	}
+}
+
+func buildFakeTCPRealHostFlowMatcherFrame(t *testing.T, protocol byte, payloadLength int) []byte {
+	t.Helper()
+	if payloadLength < 0 {
+		t.Fatalf("negative matcher payload length %d", payloadLength)
+	}
+	transportHeaderLength := fakeTCPRealHostUDPHeaderSize
+	if protocol == 6 {
+		transportHeaderLength = 20
+	} else if protocol != 17 {
+		t.Fatalf("unsupported matcher protocol=%d", protocol)
+	}
+	ipv4Length := fakeTCPRealHostIPv4HeaderSize + transportHeaderLength + payloadLength
+	frame := make([]byte, fakeTCPRealHostEthernetHeaderSize+ipv4Length)
+	frame[12], frame[13] = 0x08, 0x00
+	ip := frame[fakeTCPRealHostEthernetHeaderSize:]
+	ip[0], ip[8], ip[9] = 0x45, 64, protocol
+	binary.BigEndian.PutUint16(ip[2:4], uint16(ipv4Length))
+	copy(ip[12:16], []byte{10, 0, 0, 1})
+	copy(ip[16:20], []byte{10, 0, 0, 2})
+	binary.BigEndian.PutUint16(ip[10:12], internetChecksum(ip[:fakeTCPRealHostIPv4HeaderSize]))
+	transport := ip[fakeTCPRealHostIPv4HeaderSize:]
+	binary.BigEndian.PutUint16(transport[0:2], fakeTCPRealHostGSOSourcePort)
+	binary.BigEndian.PutUint16(transport[2:4], fakeTCPRealHostGSODestinationPort)
+	if protocol == 17 {
+		binary.BigEndian.PutUint16(transport[4:6], uint16(transportHeaderLength+payloadLength))
+	} else {
+		transport[12] = 5 << 4
+	}
+	return frame
 }
 
 func newFakeTCPRealHostSlowPath() *fakeTCPRealHostSlowPath {
@@ -417,10 +512,10 @@ func TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration(t *testing.T) {
 		coreStatsBefore[fakeTCPRealHostCoreStatXORIngressOK]+2,
 	)
 
-	packetGSO, payloadGSO := buildFakeTCPRealHostProbePacket(
+	packetGSO, _ := buildFakeTCPRealHostGSOProbePacket(
 		t, destinationMAC, sourceMAC, 67,
 	)
-	sendFakeTCPRealHostPacket(
+	sendFakeTCPRealHostGSOProbe(
 		t,
 		vnetSender,
 		prepared.contract.ifindex,
@@ -435,7 +530,7 @@ func TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration(t *testing.T) {
 		fakeTCPRealHostStatGSOReject,
 		fakeStatsBefore[fakeTCPRealHostStatGSOReject]+1,
 	)
-	assertNoFakeTCPRealHostProbePacket(t, receiver, len(payloadGSO))
+	assertNoFakeTCPRealHostGSOProbePacket(t, receiver)
 
 	fakeStatsAfter := readFakeTCPRealHostStats(
 		t, runtime, "faketcp_stats_map", fakeTCPRealHostStatCount,
@@ -854,6 +949,16 @@ func fakeTCPRealHostState(
 			WGID: wgID, Action: "rewrite", TransportMode: "faketcp",
 		})
 	}
+	if withXOR {
+		// The GSO rejection probe is deliberately one-way. There is no peer
+		// listener for 31102, so an erroneous egress pass remains observable
+		// on the peer AF_PACKET socket before any inverse transform can hide it.
+		state.EgressRules = append(state.EgressRules, control.EgressRule{
+			Generation: generation, Family: "ipv4", SourcePort: fakeTCPRealHostGSOSourcePort,
+			UnderlayIfIndex: contract.ifindex, ProfileID: profileID, CipherID: selectedCipher,
+			WGID: wgID, Action: "rewrite", TransportMode: "faketcp",
+		})
+	}
 	return state
 }
 
@@ -994,6 +1099,19 @@ func installFakeTCPRealHostSessions(
 				Window: 4096, State: abi.FakeTCPStateEstablished,
 			},
 		},
+		{
+			// One-way local session only: never install the peer reverse session.
+			key: abi.FakeTCPSessionKey{
+				Generation: generation, LocalIPv4: localA, RemoteIPv4: localB,
+				UnderlayIndex: uint32(contract.ifindex),
+				LocalPort:     fakeTCPRealHostGSOSourcePort,
+				RemotePort:    fakeTCPRealHostGSODestinationPort,
+			},
+			value: abi.FakeTCPSessionValue{
+				Generation: generation, TXSequence: 0x55667788, RXSequence: 0x99aabbcc,
+				Window: 4096, State: abi.FakeTCPStateEstablished,
+			},
+		},
 	} {
 		if err := handles.SessionStore().InsertEstablished(session.key, session.value); err != nil {
 			t.Fatalf("insert FakeTCP real-host established session %#v: %v", session.key, err)
@@ -1013,6 +1131,25 @@ func buildFakeTCPRealHostProbePacket(
 			destinationMAC, sourceMAC)
 	}
 	packet, payload := buildFakeTCPProbeUDPPacket(t, 31001, 31002, payloadLength)
+	copy(packet[0:6], destinationMAC)
+	copy(packet[6:12], sourceMAC)
+	return packet, payload
+}
+
+func buildFakeTCPRealHostGSOProbePacket(
+	t *testing.T,
+	destinationMAC net.HardwareAddr,
+	sourceMAC net.HardwareAddr,
+	payloadLength int,
+) ([]byte, []byte) {
+	t.Helper()
+	if len(destinationMAC) != 6 || len(sourceMAC) != 6 {
+		t.Fatalf("FakeTCP real-host GSO probe requires exact Ethernet addresses: destination=%x source=%x",
+			destinationMAC, sourceMAC)
+	}
+	packet, payload := buildFakeTCPProbeUDPPacket(
+		t, fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort, payloadLength,
+	)
 	copy(packet[0:6], destinationMAC)
 	copy(packet[6:12], sourceMAC)
 	return packet, payload
@@ -1209,6 +1346,22 @@ func sendFakeTCPRealHostPacket(t *testing.T, fd, ifindex int, packet []byte) {
 	}
 }
 
+func sendFakeTCPRealHostGSOProbe(t *testing.T, fd, ifindex int, packet []byte) {
+	t.Helper()
+	err := unix.Sendto(fd, packet, 0, &unix.SockaddrLinklayer{
+		Protocol: fakeTCPRealHostHTONS(unix.ETH_P_IP),
+		Ifindex:  ifindex,
+	})
+	switch {
+	case err == nil:
+		t.Log("FAKETCP_REALHOST_GSO_SEND result=nil")
+	case errors.Is(err, unix.ENOBUFS):
+		t.Log("FAKETCP_REALHOST_GSO_SEND result=ENOBUFS")
+	default:
+		t.Fatalf("send run-owned veth GSO probe: %v", err)
+	}
+}
+
 func closeFakeTCPRealHostFD(t *testing.T, fd int, label string) {
 	t.Helper()
 	if fd >= 0 {
@@ -1237,12 +1390,9 @@ func receiveFakeTCPRealHostFlowPacket(
 	fd int,
 	sourcePort uint16,
 	destinationPort uint16,
-	payloadLength int,
 ) ([]byte, error) {
 	return receiveFakeTCPRealHostPacket(ctx, fd, func(frame []byte) bool {
-		return fakeTCPRealHostFlowFrameMatches(
-			frame, sourcePort, destinationPort, payloadLength,
-		)
+		return fakeTCPRealHostFlowFrameMatches(frame, sourcePort, destinationPort)
 	})
 }
 
@@ -1320,16 +1470,15 @@ func receiveFakeTCPRealHostProbePacket(
 	return received
 }
 
-func assertNoFakeTCPRealHostProbePacket(t *testing.T, fd, payloadLength int) {
+func assertNoFakeTCPRealHostGSOProbePacket(t *testing.T, fd int) {
 	t.Helper()
 	receiveCtx, stopReceive := context.WithTimeout(t.Context(), 750*time.Millisecond)
 	defer stopReceive()
 	received, err := receiveFakeTCPRealHostFlowPacket(
-		receiveCtx, fd, 31001, 31002, payloadLength,
+		receiveCtx, fd, fakeTCPRealHostGSOSourcePort, fakeTCPRealHostGSODestinationPort,
 	)
 	if err == nil {
-		t.Fatalf("GSO-rejected FakeTCP frame with input payload length %d reached peer: %x",
-			payloadLength, received)
+		t.Fatalf("GSO-rejected FakeTCP flow reached peer: %x", received)
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("observe GSO-rejected FakeTCP frame: %v", err)
@@ -1340,10 +1489,9 @@ func fakeTCPRealHostFlowFrameMatches(
 	frame []byte,
 	sourcePort uint16,
 	destinationPort uint16,
-	payloadLength int,
 ) bool {
-	if len(frame) < fakeTCPRealHostEthernetHeaderSize+fakeTCPRealHostIPv4HeaderSize+4 ||
-		frame[12] != 0x08 || frame[13] != 0x00 || payloadLength < 0 {
+	if len(frame) < fakeTCPRealHostEthernetHeaderSize+fakeTCPRealHostIPv4HeaderSize ||
+		frame[12] != 0x08 || frame[13] != 0x00 {
 		return false
 	}
 	ip := frame[fakeTCPRealHostEthernetHeaderSize:]
@@ -1352,18 +1500,30 @@ func fakeTCPRealHostFlowFrameMatches(
 		!bytes.Equal(ip[16:20], []byte{10, 0, 0, 2}) {
 		return false
 	}
-	transportHeaderLength := fakeTCPRealHostUDPHeaderSize
-	if ip[9] == 6 {
-		transportHeaderLength = 20
-	}
-	expectedIPv4Length := fakeTCPRealHostIPv4HeaderSize + transportHeaderLength + payloadLength
-	if int(binary.BigEndian.Uint16(ip[2:4])) != expectedIPv4Length ||
-		len(frame) < fakeTCPRealHostEthernetHeaderSize+expectedIPv4Length {
+	ipv4Length := int(binary.BigEndian.Uint16(ip[2:4]))
+	if ipv4Length < fakeTCPRealHostIPv4HeaderSize+4 ||
+		len(frame) < fakeTCPRealHostEthernetHeaderSize+ipv4Length {
 		return false
 	}
 	transport := ip[fakeTCPRealHostIPv4HeaderSize:]
-	return binary.BigEndian.Uint16(transport[0:2]) == sourcePort &&
-		binary.BigEndian.Uint16(transport[2:4]) == destinationPort
+	if binary.BigEndian.Uint16(transport[0:2]) != sourcePort ||
+		binary.BigEndian.Uint16(transport[2:4]) != destinationPort {
+		return false
+	}
+	if ip[9] == 17 {
+		if ipv4Length < fakeTCPRealHostIPv4HeaderSize+fakeTCPRealHostUDPHeaderSize {
+			return false
+		}
+		udpLength := int(binary.BigEndian.Uint16(transport[4:6]))
+		return udpLength >= fakeTCPRealHostUDPHeaderSize &&
+			udpLength == ipv4Length-fakeTCPRealHostIPv4HeaderSize
+	}
+	if ipv4Length < fakeTCPRealHostIPv4HeaderSize+20 {
+		return false
+	}
+	tcpHeaderLength := int(transport[12]>>4) * 4
+	return tcpHeaderLength >= 20 &&
+		tcpHeaderLength <= ipv4Length-fakeTCPRealHostIPv4HeaderSize
 }
 
 func fakeTCPRealHostUDPFrameMatches(

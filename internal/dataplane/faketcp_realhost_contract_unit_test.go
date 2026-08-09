@@ -226,7 +226,9 @@ func TestFakeTCPRealHostLinuxEntryPointStaticContract(t *testing.T) {
 		"unix.PACKET_VNET_HDR",
 		"unix.VIRTIO_NET_HDR_F_NEEDS_CSUM",
 		"unix.VIRTIO_NET_HDR_GSO_UDP_L4",
-		"assertNoFakeTCPRealHostProbePacket",
+		"sendFakeTCPRealHostGSOProbe",
+		"assertNoFakeTCPRealHostGSOProbePacket",
+		"TestFakeTCPRealHostGSOProbeIsolationContract",
 	} {
 		if !strings.Contains(source, required) {
 			t.Fatalf("FakeTCP real-host Linux test source is missing %q", required)
