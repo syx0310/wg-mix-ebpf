@@ -168,13 +168,14 @@ run_manifest_reader() {
 }
 
 run_manifest_pread_error() {
-  local marker="${FIXTURE}/post-load-pread-error.evidence" rc
-  FRESH_TEST_MANIFEST="${SYNTHETIC_MANIFEST}" FRESH_TEST_POST_LOAD_MARKER="${marker}" \
-    /bin/bash -c '
+  local unreadable="${FIXTURE}/manifest.write-only" \
+    marker="${FIXTURE}/post-load-pread-error.evidence" rc
+  : >"${unreadable}" || fail 'create write-only pread fixture'
+  FRESH_TEST_MANIFEST="${SYNTHETIC_MANIFEST}" FRESH_TEST_UNREADABLE="${unreadable}" \
+    FRESH_TEST_POST_LOAD_MARKER="${marker}" /bin/bash -c '
     source "$1" || exit $?
     MANIFEST_FD=9
-    exec 9<"${FRESH_TEST_MANIFEST}" || exit 66
-    exec 9<&-
+    exec 9>"${FRESH_TEST_UNREADABLE}" || exit 66
     require_manifest_fd_without_nul "${MANIFEST_FD}"
     rc=$?
     if ((rc == 0)); then
@@ -183,9 +184,9 @@ run_manifest_pread_error() {
     exit "${rc}"
   ' fresh-manifest-pread-error "${TESTABLE_READER}"
   rc=$?
-  [[ "${rc}" == 66 ]] || fail "closed same-FD pread error: expected rc=66, observed rc=${rc}"
+  [[ "${rc}" == 66 ]] || fail "write-only same-FD pread error: expected rc=66, observed rc=${rc}"
   [[ ! -e "${marker}" && ! -L "${marker}" ]] ||
-    fail 'closed same-FD pread error reached a subsequent mutation/evidence marker'
+    fail 'write-only same-FD pread error reached a subsequent mutation/evidence marker'
 }
 
 SYNTHETIC_SHA="$(fixture_sha256 "${SYNTHETIC_MANIFEST}")" ||
