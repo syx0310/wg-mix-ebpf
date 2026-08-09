@@ -20,8 +20,7 @@ for path in "${MATRIX}" "${CHECKER}" "${STATIC_TEST}"; do
 done
 
 /bin/bash -n "${MATRIX}" "$0" || fail 'bash syntax gate'
-/usr/bin/python3 -I -m py_compile "${CHECKER}" "${STATIC_TEST}" || fail 'Python syntax gate'
-/usr/bin/python3 -I "${STATIC_TEST}" "${MATRIX}" "${CHECKER}" || fail 'static safety contract'
+/usr/bin/python3 -B -I "${STATIC_TEST}" "${MATRIX}" "${CHECKER}" || fail 'static safety contract'
 
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck --norc --shell=bash -- "${MATRIX}" "$0" || fail 'ShellCheck gate'

@@ -1037,15 +1037,26 @@ def iperf_checker_contract() -> dict[str, str]:
     return {"path": path, "sha256": sha256_bytes(read_regular_file(path))}
 
 
+def iperf_session_contract(expected_seconds: int) -> dict[str, Any]:
+    return {
+        "schema": "wg-mix-ebpf-realnic-iperf-session-v1",
+        "expected_seconds": expected_seconds,
+        "maximum_duration_deviation_seconds": 0.5,
+        "minimum_delivery_ratio": 0.99,
+    }
+
+
 def attach_iperf_oracle(
     spec: CoreSpec,
     step: dict[str, Any],
     direction: str,
     streams: int,
+    expected_seconds: int,
     *,
     soak: bool,
     checker: Mapping[str, str],
 ) -> None:
+    session = iperf_session_contract(expected_seconds)
     oracle = command_step(
         spec.run_root,
         f"{step['label']}.oracle",
@@ -1065,6 +1076,12 @@ def attach_iperf_oracle(
             "0.90",
             "--maximum-retransmit-rate",
             "0.001" if soak else "0.0001",
+            "--expected-seconds",
+            str(session["expected_seconds"]),
+            "--maximum-duration-deviation",
+            str(session["maximum_duration_deviation_seconds"]),
+            "--minimum-delivery-ratio",
+            str(session["minimum_delivery_ratio"]),
         ],
         30,
         target=step["stdout"],
@@ -1076,6 +1093,7 @@ def attach_iperf_oracle(
             "streams": streams,
             "program_path": checker["path"],
             "program_sha256": checker["sha256"],
+            "session_contract": session,
         }
     )
     step["oracle"] = oracle
@@ -1088,6 +1106,7 @@ def soak_oracle_step(
 ) -> dict[str, Any] | None:
     if spec.profile != "acceptance":
         return None
+    session = iperf_session_contract(spec.soak_window_seconds)
     step = command_step(
         spec.run_root,
         "tcp-soak-all-on.aggregate-oracle",
@@ -1109,6 +1128,12 @@ def soak_oracle_step(
             "0.001",
             "--minimum-throughput-ratio",
             "0.70",
+            "--expected-seconds",
+            str(session["expected_seconds"]),
+            "--maximum-duration-deviation",
+            str(session["maximum_duration_deviation_seconds"]),
+            "--minimum-delivery-ratio",
+            str(session["minimum_delivery_ratio"]),
         ],
         60,
         target="first-hour-soak-window-set",
@@ -1118,6 +1143,7 @@ def soak_oracle_step(
             "kind": "iperf-soak-oracle",
             "program_path": checker["path"],
             "program_sha256": checker["sha256"],
+            "session_contract": session,
         }
     )
     return step
@@ -1402,7 +1428,15 @@ def iperf_steps(spec: CoreSpec, cell_name: str) -> list[dict[str, Any]]:
                 target=f"peer:{spec.peer_address}:{spec.peer_port}",
             )
             step.update({"kind": "iperf", "streams": streams, "direction": direction})
-            attach_iperf_oracle(spec, step, direction, streams, soak=False, checker=checker)
+            attach_iperf_oracle(
+                spec,
+                step,
+                direction,
+                streams,
+                spec.traffic_seconds,
+                soak=False,
+                checker=checker,
+            )
             steps.append(step)
     return steps
 
@@ -1656,7 +1690,15 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
             target=f"peer:{spec.peer_address}:{spec.peer_port}",
         )
         step.update({"kind": "iperf", "streams": 4, "direction": "bidir", "window": window})
-        attach_iperf_oracle(spec, step, "bidir", 4, soak=True, checker=checker)
+        attach_iperf_oracle(
+            spec,
+            step,
+            "bidir",
+            4,
+            spec.soak_window_seconds,
+            soak=True,
+            checker=checker,
+        )
         traffic.append(step)
     recovery_restore = recovery_steps_from_restore(restore)
     aggregate_oracle = soak_oracle_step(spec, traffic[1:], checker)
@@ -2037,6 +2079,11 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
                         expected_holder,
                         step.get("direction"),
                         step.get("streams"),
+                        (
+                            spec.soak_window_seconds
+                            if cell.get("kind") == "tcp-soak"
+                            else spec.traffic_seconds
+                        ),
                         soak=cell.get("kind") == "tcp-soak",
                         checker=oracle_contract,
                     )
@@ -2821,14 +2868,28 @@ def execute_recovery_step(
         raise HarnessError(f"recovery command {step['label']} failed rc={rc}")
 
 
-def iperf_oracle_metrics(payload: bytes, streams: int, direction: str) -> list[dict[str, Any]]:
+def iperf_oracle_metrics(
+    payload: bytes,
+    streams: int,
+    direction: str,
+    session: Mapping[str, Any],
+) -> list[dict[str, Any]]:
     groups = parse_json_output(payload, "strict iperf oracle")
     wanted_directions = {"forward", "reverse"} if direction == "bidir" else {direction}
     if not isinstance(groups, list) or len(groups) != len(wanted_directions):
         raise HarnessError("strict iperf oracle returned an incomplete direction set")
     observed: set[str] = set()
     normalized: list[dict[str, Any]] = []
+    expected_seconds = session["expected_seconds"]
+    maximum_deviation = session["maximum_duration_deviation_seconds"]
+    minimum_delivery_ratio = session["minimum_delivery_ratio"]
     for group in groups:
+        numeric = [
+            group.get("sent_duration_seconds") if isinstance(group, dict) else None,
+            group.get("received_duration_seconds") if isinstance(group, dict) else None,
+            group.get("delivery_ratio") if isinstance(group, dict) else None,
+            group.get("minimum_stream_delivery_ratio") if isinstance(group, dict) else None,
+        ]
         if (
             not isinstance(group, dict)
             or group.get("direction") not in wanted_directions
@@ -2840,8 +2901,19 @@ def iperf_oracle_metrics(payload: bytes, streams: int, direction: str) -> list[d
             or group["retransmits"] < 0
             or not isinstance(group.get("fairness"), (int, float))
             or not 0.90 <= group["fairness"] <= 1.0
+            or any(
+                isinstance(value, bool) or not isinstance(value, (int, float))
+                for value in numeric
+            )
         ):
             raise HarnessError("strict iperf oracle returned malformed metrics")
+        if (
+            abs(group["sent_duration_seconds"] - expected_seconds) > maximum_deviation
+            or abs(group["received_duration_seconds"] - expected_seconds) > maximum_deviation
+            or group["delivery_ratio"] < minimum_delivery_ratio
+            or group["minimum_stream_delivery_ratio"] < minimum_delivery_ratio
+        ):
+            raise HarnessError("strict iperf oracle metrics violate the reviewed session contract")
         observed.add(group["direction"])
         normalized.append({**group, "streams": streams})
     if observed != wanted_directions:
@@ -2855,7 +2927,12 @@ def run_iperf_step(
     rc, _, _ = execute_step(step, runner, journal)
     oracle = step["oracle"]
     _, oracle_stdout, _ = execute_step(oracle, runner, journal)
-    return rc, iperf_oracle_metrics(oracle_stdout, step["streams"], step["direction"])
+    return rc, iperf_oracle_metrics(
+        oracle_stdout,
+        step["streams"],
+        step["direction"],
+        oracle["session_contract"],
+    )
 
 
 def ping_metrics(payload: bytes) -> dict[str, Any]:
@@ -3153,7 +3230,12 @@ def run_traffic(
                     rc, _, _ = execute_started_result(step, iperf_process, journal)
                 oracle = step["oracle"]
                 _, oracle_stdout, _ = execute_step(oracle, runner, journal)
-                metrics = iperf_oracle_metrics(oracle_stdout, step["streams"], step["direction"])
+                metrics = iperf_oracle_metrics(
+                    oracle_stdout,
+                    step["streams"],
+                    step["direction"],
+                    oracle["session_contract"],
+                )
                 cadence.finish_window(window)
                 results.append(
                     {

@@ -117,6 +117,7 @@ class SimulatedRunner(FixtureRunner):
 
     def iperf_output(self, argv):
         streams = int(argv[argv.index("-P") + 1])
+        duration = int(argv[argv.index("-t") + 1])
         direction = "bidir" if "--bidir" in argv else "reverse" if "-R" in argv else "forward"
         markers = [True] * streams
         if direction == "reverse":
@@ -139,8 +140,12 @@ class SimulatedRunner(FixtureRunner):
             }
             for marker in markers
         ]
-        summary = {"bytes": 10_000_000 * streams, "seconds": 1.0}
-        sent_summary = {"bytes": 10_000_000 * streams, "seconds": 1.0, "retransmits": 0}
+        summary = {"bytes": 10_000_000 * streams, "seconds": float(duration)}
+        sent_summary = {
+            "bytes": 10_000_000 * streams,
+            "seconds": float(duration),
+            "retransmits": 0,
+        }
         document = {
             "start": {
                 "tcp_mss_default": 1448,
@@ -148,6 +153,7 @@ class SimulatedRunner(FixtureRunner):
                     "num_streams": streams,
                     "reverse": 1 if direction == "reverse" else 0,
                     "bidir": 1 if direction == "bidir" else 0,
+                    "duration": duration,
                 },
             },
             "end": {
@@ -216,6 +222,11 @@ class SimulatedRunner(FixtureRunner):
                         minimum_bytes=int(options["--minimum-bytes"]),
                         minimum_fairness=float(options["--minimum-fairness"]),
                         maximum_retransmit_rate=float(options["--maximum-retransmit-rate"]),
+                        expected_seconds=float(options["--expected-seconds"]),
+                        maximum_duration_deviation=float(
+                            options["--maximum-duration-deviation"]
+                        ),
+                        minimum_delivery_ratio=float(options["--minimum-delivery-ratio"]),
                     )
                     output = CHECKER_MODULE.check_one(args)
                 else:
@@ -233,6 +244,11 @@ class SimulatedRunner(FixtureRunner):
                             options["--maximum-overall-retransmit-rate"]
                         ),
                         minimum_throughput_ratio=float(options["--minimum-throughput-ratio"]),
+                        expected_seconds=float(options["--expected-seconds"]),
+                        maximum_duration_deviation=float(
+                            options["--maximum-duration-deviation"]
+                        ),
+                        minimum_delivery_ratio=float(options["--minimum-delivery-ratio"]),
                     )
                     output = CHECKER_MODULE.check_soak(args)
             except CHECKER_MODULE.CheckError as exc:
@@ -611,11 +627,26 @@ class StrictIperfOracleTests(unittest.TestCase):
             no_receive = json.loads(json.dumps(valid))
             no_receive["end"]["streams"][0]["receiver"]["bytes"] = 0
             no_receive["end"]["sum_received"]["bytes"] -= 10_000_000
-            cases["receiver"] = (no_receive, "Jain fairness")
+            cases["receiver"] = (no_receive, "delivery ratio")
 
             bad_summary = json.loads(json.dumps(valid))
             bad_summary["end"]["sum_received"]["bytes"] += 1
             cases["summary"] = (bad_summary, "summary mismatch")
+
+            bad_start_duration = json.loads(json.dumps(valid))
+            bad_start_duration["start"]["test_start"]["duration"] = 1
+            cases["start-duration"] = (bad_start_duration, "configured duration")
+
+            bidir_duration_mismatch = json.loads(json.dumps(valid))
+            bidir_duration_mismatch["end"]["sum_sent_bidir_reverse"]["seconds"] = 1.0
+            cases["bidir-duration"] = (bidir_duration_mismatch, "measured duration")
+
+            incomplete_delivery = json.loads(json.dumps(valid))
+            for stream in incomplete_delivery["end"]["streams"]:
+                stream["receiver"]["bytes"] = 2_000_000
+            incomplete_delivery["end"]["sum_received"]["bytes"] = 8_000_000
+            incomplete_delivery["end"]["sum_received_bidir_reverse"]["bytes"] = 8_000_000
+            cases["delivery"] = (incomplete_delivery, "delivery ratio")
 
             for name, (document, reason) in cases.items():
                 with self.subTest(name=name):
@@ -627,9 +658,50 @@ class StrictIperfOracleTests(unittest.TestCase):
             pathlib.Path(step["stdout"]).write_bytes(MODULE.canonical_json(valid))
             rc, stdout, stderr = MODULE.CommandRunner().capture(step["oracle"]["argv"], timeout=30)
             self.assertEqual((rc, stderr), (0, b""))
-            groups = MODULE.iperf_oracle_metrics(stdout, 4, "bidir")
+            groups = MODULE.iperf_oracle_metrics(
+                stdout,
+                4,
+                "bidir",
+                step["oracle"]["session_contract"],
+            )
             self.assertEqual({group["direction"] for group in groups}, {"forward", "reverse"})
             self.assertTrue(all(group["streams"] == 4 for group in groups))
+
+    def test_formal_30_and_300_second_sessions_reject_one_second_json(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = f"{temporary}/run-"
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix):
+                spec = fixture_spec(
+                    run_root=f"{prefix}a1b2c3d4",
+                    profile="acceptance",
+                    traffic_seconds=30,
+                    soak_seconds=3600,
+                    soak_window_seconds=300,
+                )
+                pathlib.Path(spec.run_root, "logs").mkdir(parents=True)
+                runner = SimulatedRunner(spec)
+                snapshot, _ = MODULE.collect_snapshot(spec, runner)
+                ordinary = MODULE.iperf_steps(spec, "formal")[0]
+                soak = MODULE.soak_cell(spec, snapshot)["traffic"][1]
+
+            for expected, step in ((30, ordinary), (300, soak)):
+                with self.subTest(expected=expected):
+                    self.assertEqual(
+                        step["oracle"]["session_contract"],
+                        MODULE.iperf_session_contract(expected),
+                    )
+                    document = json.loads(runner.iperf_output(step["argv"]))
+                    document["end"]["sum_sent"]["seconds"] = 1.0
+                    document["end"]["sum_received"]["seconds"] = 1.0
+                    if step["direction"] == "bidir":
+                        document["end"]["sum_sent_bidir_reverse"]["seconds"] = 1.0
+                        document["end"]["sum_received_bidir_reverse"]["seconds"] = 1.0
+                    pathlib.Path(step["stdout"]).write_bytes(MODULE.canonical_json(document))
+                    rc, _, stderr = MODULE.CommandRunner().capture(
+                        step["oracle"]["argv"], timeout=30
+                    )
+                    self.assertEqual(rc, 1)
+                    self.assertIn("measured duration", stderr.decode())
 
 
 class MTUNegativeOracleTests(unittest.TestCase):
@@ -917,8 +989,29 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(soak["counter_sample_schedule"]["maximum_interwindow_gap_seconds"], 2)
         self.assertEqual(soak["counter_sample_schedule"]["required_measured_seconds"], 3600)
         self.assertTrue(all("--omit" not in step["argv"] for step in soak["traffic"][1:]))
+        self.assertTrue(
+            all(
+                step["oracle"]["session_contract"] == MODULE.iperf_session_contract(300)
+                and step["oracle"]["argv"][
+                    step["oracle"]["argv"].index("--expected-seconds") + 1
+                ]
+                == "300"
+                for step in soak["traffic"][1:]
+            )
+        )
+        ordinary = next(cell for cell in plan["cells"] if cell["name"] == "tcp-original")
+        self.assertTrue(
+            all(
+                step["oracle"]["session_contract"] == MODULE.iperf_session_contract(30)
+                for step in ordinary["traffic"]
+            )
+        )
         self.assertIsNotNone(soak["soak_oracle"])
         self.assertIn("--minimum-throughput-ratio", soak["soak_oracle"]["argv"])
+        self.assertEqual(
+            soak["soak_oracle"]["session_contract"],
+            MODULE.iperf_session_contract(300),
+        )
         with self.assertRaisesRegex(MODULE.HarnessError, "acceptance profile requires exact"):
             fixture_spec(profile="acceptance")
 

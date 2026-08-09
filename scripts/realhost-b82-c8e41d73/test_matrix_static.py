@@ -37,12 +37,20 @@ def iperf_fixture(streams: int = 4) -> dict[str, object]:
             }
         )
     return {
-        "start": {"test_start": {"num_streams": streams, "reverse": 0, "bidir": 0}},
+        "start": {
+            "test_start": {
+                "num_streams": streams,
+                "reverse": 0,
+                "bidir": 0,
+                "duration": 10,
+            }
+        },
         "end": {
             "streams": rows,
             "sum_sent": {
                 "bytes": 14_480_000 * streams,
                 "retransmits": 0,
+                "seconds": 10.0,
             },
             "sum_received": {
                 "bytes": 14_480_000 * streams,
@@ -245,8 +253,8 @@ def main() -> None:
 
     checker_module = load_checker(checker_path)
     fixture = iperf_fixture()
-    checker_module.expected_direction(fixture, "forward", 4)
-    groups = checker_module.measured_groups(fixture, "forward", 4)
+    checker_module.expected_direction(fixture, "forward", 4, 10)
+    groups = checker_module.measured_groups(fixture, "forward", 4, 10, 0.5, 0.99)
     if (
         len(groups) != 1
         or groups[0]["sent_bytes"] != 57_920_000
@@ -255,7 +263,7 @@ def main() -> None:
         fail("iperf positive fixture was not measured exactly")
     fixture["end"]["streams"][0]["sender"]["retransmits"] = 1000  # type: ignore[index]
     fixture["end"]["sum_sent"]["retransmits"] = 1000  # type: ignore[index]
-    groups = checker_module.measured_groups(fixture, "forward", 4)
+    groups = checker_module.measured_groups(fixture, "forward", 4, 10, 0.5, 0.99)
     if groups[0]["retransmit_rate"] <= 0.0001:
         fail("iperf retransmit fixture did not exceed the acceptance threshold")
 
@@ -317,6 +325,7 @@ def main() -> None:
                 "received_bytes": 1_448,
                 "throughput_mbps": 1.0,
                 "retransmits": 5,
+                "minimum_stream_delivery_ratio": 0.1,
             }
         ]
     )

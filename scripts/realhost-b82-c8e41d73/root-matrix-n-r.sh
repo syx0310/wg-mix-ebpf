@@ -914,11 +914,13 @@ run_faketcp_tests() {
 }
 
 check_iperf() {
-  local step="$1" direction="$2" streams="$3"
+  local step="$1" direction="$2" streams="$3" expected_seconds="$4"
   run_step "${step}.check" "${STEP_LOG}" /usr/bin/python3 -I \
     "${SOURCE}/scripts/realhost-b82-${RUN_ID}/check-realhost-iperf.py" one "${STEP_LOG}" \
     --direction "${direction}" --streams "${streams}" --minimum-bytes 1048576 \
-    --minimum-fairness 0.90 --maximum-retransmit-rate 0.0001
+    --minimum-fairness 0.90 --maximum-retransmit-rate 0.0001 \
+    --expected-seconds "${expected_seconds}" --maximum-duration-deviation 0.5 \
+    --minimum-delivery-ratio 0.99
   require_zero "${step}.check"
 }
 
@@ -941,7 +943,7 @@ run_iperf_cell() {
         --json --omit 2 -t 30 -P "${streams}" "${direction_args[@]}"
       require_zero "${step}"
       json_path="${STEP_LOG}"
-      check_iperf "${step}" "${direction}" "${streams}"
+      check_iperf "${step}" "${direction}" "${streams}" 30
       [[ "${json_path}" == "${EVIDENCE_ROOT}/${step}.out" ]] || fail "iperf-log-path:${step}" 79
     done
   done
@@ -953,7 +955,7 @@ preflight_peer() {
     -c "${PEER_ADDRESS}" -p "${PEER_PORT}" --connect-timeout 5000 \
     --json --omit 1 -t 1 -P 1
   require_zero P0
-  check_iperf P0 forward 1
+  check_iperf P0 forward 1 1
 }
 
 scoped_cell_valid() {

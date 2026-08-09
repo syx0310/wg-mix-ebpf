@@ -179,7 +179,9 @@ def fairness(values: list[int]) -> float:
     return total * total / (len(values) * squares)
 
 
-def expected_direction(doc: dict[str, Any], direction: str, streams: int) -> None:
+def expected_direction(
+    doc: dict[str, Any], direction: str, streams: int, expected_seconds: float
+) -> None:
     start = doc.get("start")
     if not isinstance(start, dict) or not isinstance(start.get("test_start"), dict):
         raise CheckError("iperf start.test_start is missing")
@@ -192,10 +194,30 @@ def expected_direction(doc: dict[str, Any], direction: str, streams: int) -> Non
         raise CheckError("iperf reverse marker differs from the reviewed argv")
     if bidirectional != (1 if direction == "bidir" else 0):
         raise CheckError("iperf bidirectional marker differs from the reviewed argv")
+    if number(test_start.get("duration"), "test_start duration") != expected_seconds:
+        raise CheckError("iperf configured duration differs from the reviewed argv")
+
+
+def reviewed_session(args: argparse.Namespace) -> tuple[float, float, float]:
+    expected_seconds = number(args.expected_seconds, "expected seconds")
+    maximum_deviation = number(
+        args.maximum_duration_deviation, "maximum duration deviation"
+    )
+    minimum_delivery_ratio = number(
+        args.minimum_delivery_ratio, "minimum delivery ratio"
+    )
+    if expected_seconds <= 0 or not 0 < minimum_delivery_ratio <= 1:
+        raise CheckError("iperf session thresholds are outside the reviewed range")
+    return expected_seconds, maximum_deviation, minimum_delivery_ratio
 
 
 def measured_groups(
-    doc: dict[str, Any], direction: str, streams: int
+    doc: dict[str, Any],
+    direction: str,
+    streams: int,
+    expected_seconds: float,
+    maximum_duration_deviation: float,
+    minimum_delivery_ratio: float,
 ) -> list[dict[str, float | int]]:
     end = doc.get("end")
     if not isinstance(end, dict) or not isinstance(end.get("streams"), list):
@@ -242,6 +264,14 @@ def measured_groups(
             integer(item["sender"].get("bytes"), f"{label} sender bytes")
             for item in group
         ]
+        if any(value == 0 for value in sent):
+            raise CheckError(f"iperf {label} has an empty sender stream")
+        stream_delivery_ratios = [
+            received_value / sent_value
+            for sent_value, received_value in zip(sent, received)
+        ]
+        if min(stream_delivery_ratios) < minimum_delivery_ratio:
+            raise CheckError(f"iperf {label} stream delivery ratio is below minimum")
         retransmits = sum(
             integer(item["sender"].get("retransmits"), f"{label} retransmits")
             for item in group
@@ -257,19 +287,30 @@ def measured_groups(
             raise CheckError(f"iperf {label} sent-byte summary mismatch")
         if integer(sent_summary.get("retransmits"), f"{label} retransmit summary") != retransmits:
             raise CheckError(f"iperf {label} retransmit summary mismatch")
-        seconds = number(summary.get("seconds"), f"{label} seconds")
-        if seconds <= 0:
-            raise CheckError(f"iperf {label} duration must be positive")
+        received_seconds = number(summary.get("seconds"), f"{label} received seconds")
+        sent_seconds = number(sent_summary.get("seconds"), f"{label} sent seconds")
+        if (
+            abs(received_seconds - expected_seconds) > maximum_duration_deviation
+            or abs(sent_seconds - expected_seconds) > maximum_duration_deviation
+        ):
+            raise CheckError(f"iperf {label} measured duration differs from the reviewed argv")
+        delivery_ratio = sum(received) / sum(sent)
+        if delivery_ratio < minimum_delivery_ratio:
+            raise CheckError(f"iperf {label} aggregate delivery ratio is below minimum")
         estimated_segments = max(1, math.ceil(sum(sent) / MSS_ESTIMATE))
         result.append(
             {
                 "direction": label,
                 "sent_bytes": sum(sent),
                 "received_bytes": sum(received),
-                "throughput_mbps": sum(received) * 8 / seconds / 1_000_000,
+                "throughput_mbps": sum(received) * 8 / received_seconds / 1_000_000,
                 "retransmits": retransmits,
                 "retransmit_rate": retransmits / estimated_segments,
                 "fairness": fairness(received),
+                "sent_duration_seconds": sent_seconds,
+                "received_duration_seconds": received_seconds,
+                "delivery_ratio": delivery_ratio,
+                "minimum_stream_delivery_ratio": min(stream_delivery_ratios),
             }
         )
     return result
@@ -277,8 +318,16 @@ def measured_groups(
 
 def check_one(args: argparse.Namespace) -> list[dict[str, float | int]]:
     doc = document(args.path)
-    expected_direction(doc, args.direction, args.streams)
-    groups = measured_groups(doc, args.direction, args.streams)
+    expected_seconds, maximum_deviation, minimum_delivery_ratio = reviewed_session(args)
+    expected_direction(doc, args.direction, args.streams, expected_seconds)
+    groups = measured_groups(
+        doc,
+        args.direction,
+        args.streams,
+        expected_seconds,
+        maximum_deviation,
+        minimum_delivery_ratio,
+    )
     for group in groups:
         if int(group["received_bytes"]) < args.minimum_bytes:
             raise CheckError(f"received bytes below minimum: {group}")
@@ -303,6 +352,10 @@ def soak_group_totals(
         "retransmits": retransmits,
         "estimated_segments": segments,
         "retransmit_rate": retransmits / segments,
+        "delivery_ratio": received_bytes / sent_bytes,
+        "minimum_stream_delivery_ratio": min(
+            float(group["minimum_stream_delivery_ratio"]) for group in groups
+        ),
     }
 
 
@@ -322,6 +375,7 @@ def first_hour_throughput_baseline(
 
 
 def check_soak(args: argparse.Namespace) -> dict[str, Any]:
+    expected_seconds, maximum_deviation, minimum_delivery_ratio = reviewed_session(args)
     if args.expected_windows != 12:
         raise CheckError(
             f"reviewed first-hour soak requires 12 windows, got {args.expected_windows}"
@@ -336,8 +390,15 @@ def check_soak(args: argparse.Namespace) -> dict[str, Any]:
     total_retransmits = 0
     for path in args.paths:
         doc = document(path)
-        expected_direction(doc, "bidir", args.streams)
-        groups = measured_groups(doc, "bidir", args.streams)
+        expected_direction(doc, "bidir", args.streams, expected_seconds)
+        groups = measured_groups(
+            doc,
+            "bidir",
+            args.streams,
+            expected_seconds,
+            maximum_deviation,
+            minimum_delivery_ratio,
+        )
         totals = soak_group_totals(groups)
         if float(totals["retransmit_rate"]) > args.maximum_window_retransmit_rate:
             raise CheckError(
@@ -378,6 +439,9 @@ def parser() -> argparse.ArgumentParser:
     one.add_argument("--minimum-bytes", type=int, default=1_048_576)
     one.add_argument("--minimum-fairness", type=float, default=0.90)
     one.add_argument("--maximum-retransmit-rate", type=float, default=0.0001)
+    one.add_argument("--expected-seconds", type=float, required=True)
+    one.add_argument("--maximum-duration-deviation", type=float, required=True)
+    one.add_argument("--minimum-delivery-ratio", type=float, required=True)
 
     soak = subparsers.add_parser("soak")
     soak.add_argument("paths", nargs="+", type=Path)
@@ -387,6 +451,9 @@ def parser() -> argparse.ArgumentParser:
     soak.add_argument("--maximum-window-retransmit-rate", type=float, default=0.005)
     soak.add_argument("--maximum-overall-retransmit-rate", type=float, default=0.001)
     soak.add_argument("--minimum-throughput-ratio", type=float, default=0.70)
+    soak.add_argument("--expected-seconds", type=float, required=True)
+    soak.add_argument("--maximum-duration-deviation", type=float, required=True)
+    soak.add_argument("--minimum-delivery-ratio", type=float, required=True)
 
     stats_parser = subparsers.add_parser("stats")
     stats_parser.add_argument("before", type=Path)
