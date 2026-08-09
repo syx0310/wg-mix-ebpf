@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"math"
+	"reflect"
 	"slices"
 	"testing"
 
@@ -74,6 +75,165 @@ func TestMemoryActionCheckpointStoreFailsClosedOnRevisionExhaustion(t *testing.T
 	loaded, found, err := store.LoadActionCheckpoint()
 	if err != nil || !found || loaded.Revision != created.Revision {
 		t.Fatalf("checkpoint mutated on exhaustion: found=%t checkpoint=%#v err=%v", found, loaded, err)
+	}
+}
+
+func TestMemoryActionCheckpointTransitionPreservesImmutableCheckpoint(t *testing.T) {
+	store := NewMemoryActionCheckpointStore()
+	flow := testFlow(31001)
+	checkpoint := recoveryCheckpoint(t, 1, ActionCheckpointPrepared, 0, []ActionStep{
+		recoveryPacketStep(t, flow, 11),
+		recoveryPacketStep(t, flow, 12),
+	})
+	created, err := store.CreateActionCheckpoint(checkpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	attemptingRevision, err := store.TransitionActionCheckpoint(
+		created.Revision,
+		ActionCheckpointAttempting,
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if attemptingRevision == created.Revision {
+		t.Fatal("transition did not advance the checkpoint revision")
+	}
+	if _, err := store.TransitionActionCheckpoint(
+		created.Revision,
+		ActionCheckpointPrepared,
+		1,
+	); !errors.Is(err, ErrActionCheckpointConflict) {
+		t.Fatalf("stale transition error = %v", err)
+	}
+
+	beforeInvalidRevision := store.nextRevision
+	if _, err := store.TransitionActionCheckpoint(
+		attemptingRevision,
+		ActionCheckpointAttempting,
+		len(checkpoint.Steps),
+	); !errors.Is(err, ErrActionCheckpointCorrupt) {
+		t.Fatalf("invalid transition error = %v", err)
+	}
+	if store.nextRevision != beforeInvalidRevision {
+		t.Fatal("invalid transition consumed a revision")
+	}
+
+	loaded, found, err := store.LoadActionCheckpoint()
+	if err != nil || !found {
+		t.Fatalf("load after transition found=%t err=%v", found, err)
+	}
+	if loaded.Revision != attemptingRevision || loaded.Phase != ActionCheckpointAttempting || loaded.NextStep != 0 {
+		t.Fatalf("transitioned checkpoint = %#v", loaded)
+	}
+	if loaded.Operation != created.Operation || loaded.Identity != created.Identity ||
+		!reflect.DeepEqual(loaded.Steps, created.Steps) {
+		t.Fatal("transition changed immutable checkpoint fields")
+	}
+	loaded.Steps[0].Packet.Data[0] ^= 0xff
+	reloaded, _, err := store.LoadActionCheckpoint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if reloaded.Steps[0].Packet.Data[0] == loaded.Steps[0].Packet.Data[0] {
+		t.Fatal("transition load exposed the store packet backing array")
+	}
+	store.nextRevision = 0
+	if _, err := store.TransitionActionCheckpoint(
+		attemptingRevision,
+		ActionCheckpointPrepared,
+		1,
+	); !errors.Is(err, ErrActionCheckpointRevisionExhausted) {
+		t.Fatalf("transition revision exhaustion error = %v", err)
+	}
+	exhausted, _, err := store.LoadActionCheckpoint()
+	if err != nil || exhausted.Revision != attemptingRevision || exhausted.NextStep != 0 {
+		t.Fatalf("transition mutated checkpoint on revision exhaustion: %#v err=%v", exhausted, err)
+	}
+}
+
+type actionCheckpointUpdateOnlyStore struct {
+	ActionCheckpointStore
+	updates int
+}
+
+func (store *actionCheckpointUpdateOnlyStore) UpdateActionCheckpoint(
+	expectedRevision uint64,
+	checkpoint ActionCheckpoint,
+) (ActionCheckpoint, error) {
+	store.updates++
+	return store.ActionCheckpointStore.UpdateActionCheckpoint(expectedRevision, checkpoint)
+}
+
+func TestActionRecoveryRetainsBaseStoreUpdateContract(t *testing.T) {
+	store := &actionCheckpointUpdateOnlyStore{ActionCheckpointStore: NewMemoryActionCheckpointStore()}
+	recovery, err := NewActionRecovery(testRecoveryIdentity(), &fakeControllerBackend{}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions := []Action{{
+		Kind:    ActionSendControl,
+		Flow:    testFlow(31001),
+		WGID:    7,
+		Control: ControlPacket{Flags: FlagSYN},
+		Reason:  "base-store",
+	}}
+	if err := recovery.Execute(context.Background(), actions); err != nil {
+		t.Fatal(err)
+	}
+	if store.updates != 2 {
+		t.Fatalf("base store update calls=%d, want 2", store.updates)
+	}
+}
+
+type failingActionCheckpointTransitionStore struct {
+	ActionCheckpointStore
+	err         error
+	transitions int
+	updates     int
+}
+
+func (store *failingActionCheckpointTransitionStore) TransitionActionCheckpoint(
+	uint64,
+	ActionCheckpointPhase,
+	int,
+) (uint64, error) {
+	store.transitions++
+	return 0, store.err
+}
+
+func (store *failingActionCheckpointTransitionStore) UpdateActionCheckpoint(
+	expectedRevision uint64,
+	checkpoint ActionCheckpoint,
+) (ActionCheckpoint, error) {
+	store.updates++
+	return store.ActionCheckpointStore.UpdateActionCheckpoint(expectedRevision, checkpoint)
+}
+
+func TestActionRecoveryDoesNotFallBackAfterTransitionFailure(t *testing.T) {
+	wantErr := errors.New("transition unavailable")
+	store := &failingActionCheckpointTransitionStore{
+		ActionCheckpointStore: NewMemoryActionCheckpointStore(),
+		err:                   wantErr,
+	}
+	recovery, err := NewActionRecovery(testRecoveryIdentity(), &fakeControllerBackend{}, store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actions := []Action{{
+		Kind:    ActionSendControl,
+		Flow:    testFlow(31001),
+		WGID:    7,
+		Control: ControlPacket{Flags: FlagSYN},
+		Reason:  "transition-failure",
+	}}
+	if err := recovery.Execute(context.Background(), actions); !errors.Is(err, wantErr) {
+		t.Fatalf("Execute error = %v", err)
+	}
+	if store.transitions != 1 || store.updates != 0 {
+		t.Fatalf("transition calls=%d update calls=%d", store.transitions, store.updates)
 	}
 }
 
