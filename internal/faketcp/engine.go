@@ -427,7 +427,7 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 		s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
 		if alreadyDropped {
 			return []Action{{
-				Kind: ActionReleasePending, Flow: flow,
+				Kind: ActionReleasePending, Flow: flow, WGID: s.wgID,
 				Packets: []PendingPacket{ownPendingPacket(packet)},
 			}}, nil
 		}
@@ -1026,7 +1026,7 @@ func (e *Engine) release(flow abi.FakeTCPSessionKey, s *session) []Action {
 	e.pendingBytes -= s.pendingBytes
 	s.pending = nil
 	s.pendingBytes = 0
-	return []Action{{Kind: ActionReleasePending, Flow: flow, Packets: packets}}
+	return []Action{{Kind: ActionReleasePending, Flow: flow, WGID: s.wgID, Packets: packets}}
 }
 
 func (e *Engine) remove(flow abi.FakeTCPSessionKey, s *session) {
