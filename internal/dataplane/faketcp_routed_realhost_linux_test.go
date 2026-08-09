@@ -599,9 +599,22 @@ func fakeTCPRoutedExpectedWireSegments(
 	profile := state.Profiles[0]
 	wireGuard := state.WireGuards[0]
 	cipher := state.Ciphers[0]
+	matchedRules := 0
+	for _, rule := range state.EgressRules {
+		if rule.SourcePort != fakeTCPRoutedSourcePort ||
+			rule.UnderlayIfIndex != contract.ifindex {
+			continue
+		}
+		matchedRules++
+		if rule.ProfileID != profile.ID || rule.CipherID != cipher.ID ||
+			rule.WGID != wireGuard.ID || rule.TransportMode != "faketcp" ||
+			rule.Action != "rewrite" {
+			t.Fatalf("routed wire oracle egress rule is not bound to the active FakeTCP/XOR profile: %#v", rule)
+		}
+	}
 	if wireGuard.ProfileID != profile.ID || wireGuard.CipherID != cipher.ID ||
 		cipher.Mode != "xor" || cipher.Scope != "wg-payload-full" ||
-		cipher.KeyLen == 0 || cipher.KeyLen > uint32(len(cipher.Key)) {
+		cipher.KeyLen == 0 || cipher.KeyLen > uint32(len(cipher.Key)) || matchedRules != 1 {
 		t.Fatalf("routed wire oracle is not bound to the active full-payload XOR profile")
 	}
 	if len(payload) != segments*fakeTCPRoutedSegmentBytes {

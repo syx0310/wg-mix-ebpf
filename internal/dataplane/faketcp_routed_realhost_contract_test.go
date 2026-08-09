@@ -291,6 +291,8 @@ func TestFakeTCPRoutedRealHostLinuxStaticContract(t *testing.T) {
 		"fakeTCPRealHostStatChecksumPartialReset",
 		"fakeTCPRoutedCoreStatGSORewriteOK",
 		"wireImages := fakeTCPRoutedExpectedWireSegments(",
+		"rule.SourcePort != fakeTCPRoutedSourcePort",
+		"rule.ProfileID != profile.ID || rule.CipherID != cipher.ID",
 		"payload[offset:offset+fakeTCPRoutedSegmentBytes]",
 		"bytes.Equal(segment.payload, wantPayload)",
 		"internetChecksum",
