@@ -1,0 +1,678 @@
+#!/usr/bin/env python3
+"""Build a local, path-projected OSS repository without consulting remotes."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable, Sequence
+
+
+MANIFEST_FORMAT = "wg-mix-ebpf-oss-public-paths-v1"
+MANIFEST_KEYS = {
+    "format",
+    "main_commit",
+    "legacy_public_history_commit",
+    "public_paths",
+}
+OUTPUT_REFS = {
+    "main": "refs/heads/main",
+    "legacy-public-history": "refs/heads/legacy-public-history",
+}
+DENIED_EXACT = {
+    b"AGENTS.md",
+    b"docs",
+    b"refs",
+    b"credientials",
+    b".worktree",
+    b"scripts/private-release",
+}
+DENIED_PREFIXES = tuple(path + b"/" for path in DENIED_EXACT if path != b"AGENTS.md")
+OID_RE = re.compile(r"[0-9a-f]{40}\Z")
+
+
+class ReplayError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True, order=True)
+class TreeEntry:
+    path: bytes
+    mode: bytes
+    kind: bytes
+    oid: str
+    size: int | None
+
+
+@dataclass(frozen=True)
+class CommitRecord:
+    oid: str
+    parents: tuple[str, ...]
+    tree: str
+
+
+@dataclass
+class SourceHistory:
+    label: str
+    repo: "GitRepo"
+    tip: str
+    commits: list[CommitRecord]
+    trees: dict[str, tuple[TreeEntry, ...]]
+
+
+def git_environment(extra: dict[str, str] | None = None) -> dict[str, str]:
+    env = os.environ.copy()
+    for name in (
+        "GIT_DIR",
+        "GIT_WORK_TREE",
+        "GIT_INDEX_FILE",
+        "GIT_OBJECT_DIRECTORY",
+        "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        "GIT_COMMON_DIR",
+    ):
+        env.pop(name, None)
+    env.update(
+        {
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_NO_LAZY_FETCH": "1",
+            "GIT_NO_REPLACE_OBJECTS": "1",
+            "LC_ALL": "C",
+        }
+    )
+    if extra:
+        env.update(extra)
+    return env
+
+
+def run_command(
+    argv: Sequence[str],
+    *,
+    data: bytes | None = None,
+    extra_env: dict[str, str] | None = None,
+) -> bytes:
+    try:
+        completed = subprocess.run(
+            argv,
+            input=data,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+            env=git_environment(extra_env),
+        )
+    except OSError as exc:
+        raise ReplayError(f"cannot execute {argv[0]}: {exc}") from exc
+    if completed.returncode != 0:
+        detail = completed.stderr.decode("utf-8", "replace").strip()
+        raise ReplayError(
+            f"command failed ({completed.returncode}): {' '.join(argv)}: {detail}"
+        )
+    return completed.stdout
+
+
+class GitRepo:
+    def __init__(self, path: Path) -> None:
+        try:
+            self.path = path.resolve(strict=True)
+        except OSError as exc:
+            raise ReplayError(
+                f"repository path is not accessible: {path}: {exc}"
+            ) from exc
+        if not self.path.is_dir():
+            raise ReplayError(f"repository path is not a directory: {self.path}")
+        self.run_text("rev-parse", "--git-dir")
+        if self.run_text("rev-parse", "--show-object-format") != "sha1":
+            raise ReplayError(f"repository must use SHA-1 objects: {self.path}")
+        if self.run_text("rev-parse", "--is-shallow-repository") != "false":
+            raise ReplayError(f"shallow repositories are not accepted: {self.path}")
+
+    def run(
+        self,
+        *args: str,
+        data: bytes | None = None,
+        extra_env: dict[str, str] | None = None,
+    ) -> bytes:
+        return run_command(
+            ("git", "--no-replace-objects", "-C", str(self.path), *args),
+            data=data,
+            extra_env=extra_env,
+        )
+
+    def run_text(self, *args: str, extra_env: dict[str, str] | None = None) -> str:
+        return self.run(*args, extra_env=extra_env).decode("ascii").strip()
+
+    def require_commit(self, oid: str) -> None:
+        require_oid(oid)
+        if self.run_text("cat-file", "-t", oid) != "commit":
+            raise ReplayError(f"object is not a commit: {oid}")
+
+    def commits(self, tip: str) -> list[CommitRecord]:
+        self.require_commit(tip)
+        raw = self.run("rev-list", "--topo-order", "--reverse", "--parents", tip)
+        records: list[CommitRecord] = []
+        seen: set[str] = set()
+        for line in raw.decode("ascii").splitlines():
+            words = line.split()
+            oid = words[0]
+            parents = tuple(words[1:])
+            if any(parent not in seen for parent in parents):
+                raise ReplayError(f"history is not parent-first at {oid}")
+            tree = self.run_text("show", "--no-patch", "--format=%T", oid)
+            require_oid(tree)
+            records.append(CommitRecord(oid, parents, tree))
+            seen.add(oid)
+        if not records or records[-1].oid != tip:
+            raise ReplayError(f"history walk did not end at requested commit: {tip}")
+        return records
+
+    def entries(self, tree: str) -> tuple[TreeEntry, ...]:
+        raw = self.run("ls-tree", "-r", "-z", "-l", "--full-tree", tree)
+        entries: list[TreeEntry] = []
+        for record in raw.split(b"\0"):
+            if not record:
+                continue
+            try:
+                metadata, path = record.split(b"\t", 1)
+                mode, kind, oid_bytes, size_bytes = metadata.split()
+            except ValueError as exc:
+                raise ReplayError(f"invalid ls-tree record for tree {tree}") from exc
+            oid = oid_bytes.decode("ascii")
+            require_oid(oid)
+            if kind not in {b"blob", b"commit"}:
+                raise ReplayError(
+                    f"unsupported leaf kind {kind!r} at {display_path(path)}"
+                )
+            size = None if size_bytes == b"-" else int(size_bytes)
+            entries.append(TreeEntry(path, mode, kind, oid, size))
+        return tuple(sorted(entries))
+
+    def object_bytes(self, kind: str, oid: str) -> bytes:
+        return self.run("cat-file", kind, oid)
+
+    def write_object(self, kind: str, contents: bytes) -> str:
+        oid = (
+            self.run("hash-object", "-t", kind, "-w", "--stdin", data=contents)
+            .decode("ascii")
+            .strip()
+        )
+        require_oid(oid)
+        return oid
+
+
+def require_oid(oid: str) -> None:
+    if not OID_RE.fullmatch(oid):
+        raise ReplayError(
+            f"commit and object IDs must be literal lowercase 40hex: {oid!r}"
+        )
+
+
+def path_bytes(value: str) -> bytes:
+    try:
+        encoded = value.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError as exc:
+        raise ReplayError(
+            f"manifest path is not byte-representable: {value!r}"
+        ) from exc
+    validate_path(encoded)
+    return encoded
+
+
+def validate_path(path: bytes) -> None:
+    if not path or path.startswith(b"/") or path.endswith(b"/") or b"\0" in path:
+        raise ReplayError(f"invalid repository path: {display_path(path)}")
+    if any(part in {b"", b".", b".."} for part in path.split(b"/")):
+        raise ReplayError(f"non-normalized repository path: {display_path(path)}")
+
+
+def display_path(path: bytes) -> str:
+    return json.dumps(path.decode("utf-8", "surrogateescape"), ensure_ascii=True)
+
+
+def is_denied(path: bytes) -> bool:
+    return path in DENIED_EXACT or path.startswith(DENIED_PREFIXES)
+
+
+def load_manifest(path: Path, main_commit: str, legacy_commit: str) -> frozenset[bytes]:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReplayError(f"cannot read PUBLIC manifest {path}: {exc}") from exc
+    if not isinstance(value, dict) or set(value) != MANIFEST_KEYS:
+        raise ReplayError(
+            f"PUBLIC manifest must contain exactly: {sorted(MANIFEST_KEYS)}"
+        )
+    if value["format"] != MANIFEST_FORMAT:
+        raise ReplayError(f"unsupported PUBLIC manifest format: {value['format']!r}")
+    if value["main_commit"] != main_commit:
+        raise ReplayError(
+            "PUBLIC manifest main_commit does not match the explicit input commit"
+        )
+    if value["legacy_public_history_commit"] != legacy_commit:
+        raise ReplayError(
+            "PUBLIC manifest legacy commit does not match the explicit input commit"
+        )
+    raw_paths = value["public_paths"]
+    if not isinstance(raw_paths, list) or any(
+        not isinstance(item, str) for item in raw_paths
+    ):
+        raise ReplayError("PUBLIC manifest public_paths must be a JSON string array")
+    paths = [path_bytes(item) for item in raw_paths]
+    if paths != sorted(paths) or len(paths) != len(set(paths)):
+        raise ReplayError(
+            "PUBLIC manifest public_paths must be bytewise sorted and unique"
+        )
+    denied = [path for path in paths if is_denied(path)]
+    if denied:
+        raise ReplayError(
+            f"PUBLIC manifest attempts to allow a fixed-deny path: {display_path(denied[0])}"
+        )
+    return frozenset(paths)
+
+
+def scan_history(label: str, repo: GitRepo, tip: str) -> SourceHistory:
+    commits = repo.commits(tip)
+    trees: dict[str, tuple[TreeEntry, ...]] = {}
+    for record in commits:
+        if record.tree not in trees:
+            trees[record.tree] = repo.entries(record.tree)
+    return SourceHistory(label, repo, tip, commits, trees)
+
+
+def classify(
+    histories: Iterable[SourceHistory], public_paths: frozenset[bytes]
+) -> tuple[list[tuple[str, TreeEntry]], set[str], set[str]]:
+    unknown: set[tuple[str, TreeEntry]] = set()
+    private_blobs: set[str] = set()
+    public_blobs: set[str] = set()
+    seen_paths: set[bytes] = set()
+    for history in histories:
+        for entries in history.trees.values():
+            for entry in entries:
+                seen_paths.add(entry.path)
+                if is_denied(entry.path):
+                    if entry.kind == b"blob":
+                        private_blobs.add(entry.oid)
+                elif entry.path in public_paths:
+                    if entry.kind == b"blob":
+                        public_blobs.add(entry.oid)
+                else:
+                    unknown.add((history.label, entry))
+    unused = sorted(public_paths - seen_paths)
+    if unused:
+        raise ReplayError(
+            f"PUBLIC manifest contains a path absent from both histories: {display_path(unused[0])}"
+        )
+    return (
+        sorted(unknown, key=lambda item: (item[0], item[1])),
+        private_blobs,
+        public_blobs,
+    )
+
+
+def parse_commit(raw: bytes) -> tuple[list[list[bytes]], bytes]:
+    try:
+        header, message = raw.split(b"\n\n", 1)
+    except ValueError as exc:
+        raise ReplayError("commit object has no header/message separator") from exc
+    fields: list[list[bytes]] = []
+    for line in header.split(b"\n"):
+        if line.startswith(b" "):
+            if not fields:
+                raise ReplayError("commit object starts with a continuation header")
+            fields[-1].append(line)
+        else:
+            fields.append([line])
+    return fields, message
+
+
+def field_name(field: list[bytes]) -> bytes:
+    return field[0].partition(b" ")[0]
+
+
+def rewrite_commit(raw: bytes, tree: str, parents: tuple[str, ...]) -> bytes:
+    fields, message = parse_commit(raw)
+    rewritten: list[bytes] = []
+    parent_index = 0
+    tree_count = 0
+    for field in fields:
+        name = field_name(field)
+        if name == b"tree":
+            tree_count += 1
+            rewritten.append(b"tree " + tree.encode("ascii"))
+        elif name == b"parent":
+            if parent_index >= len(parents):
+                raise ReplayError(
+                    "commit has more parent headers than its history walk"
+                )
+            rewritten.append(b"parent " + parents[parent_index].encode("ascii"))
+            parent_index += 1
+        else:
+            rewritten.append(b"\n".join(field))
+    if tree_count != 1 or parent_index != len(parents):
+        raise ReplayError("commit tree/parent headers do not match its history walk")
+    return b"\n".join(rewritten) + b"\n\n" + message
+
+
+def graph_headers(raw: bytes) -> tuple[str, tuple[str, ...], tuple[bytes, ...], bytes]:
+    fields, message = parse_commit(raw)
+    tree = ""
+    parents: list[str] = []
+    metadata: list[bytes] = []
+    for field in fields:
+        name = field_name(field)
+        if name == b"tree":
+            tree = field[0].split(b" ", 1)[1].decode("ascii")
+        elif name == b"parent":
+            parents.append(field[0].split(b" ", 1)[1].decode("ascii"))
+        else:
+            metadata.append(b"\n".join(field))
+    require_oid(tree)
+    return tree, tuple(parents), tuple(metadata), message
+
+
+class ReplayEngine:
+    def __init__(
+        self,
+        histories: list[SourceHistory],
+        public_paths: frozenset[bytes],
+        private_blobs: set[str],
+        output: Path,
+    ) -> None:
+        self.histories = histories
+        self.public_paths = public_paths
+        self.private_blobs = private_blobs
+        self.output = output
+        self.destination: GitRepo | None = None
+        self.commit_maps: dict[str, dict[str, str]] = {
+            history.label: {} for history in histories
+        }
+        self.tree_maps: dict[tuple[str, str], str] = {}
+        self.copied_blobs: set[str] = set()
+
+    def run(self) -> list[tuple[str, str, str]]:
+        self._create_destination()
+        assert self.destination is not None
+        with tempfile.TemporaryDirectory(prefix="oss-replay-index-") as temp_dir:
+            for history in self.histories:
+                self._replay_history(history, Path(temp_dir))
+        self._publish_refs()
+        self._verify()
+        return [
+            (history.label, record.oid, self.commit_maps[history.label][record.oid])
+            for history in self.histories
+            for record in history.commits
+        ]
+
+    def _create_destination(self) -> None:
+        if os.path.lexists(self.output):
+            raise ReplayError(f"output path already exists: {self.output}")
+        try:
+            parent = self.output.parent.resolve(strict=True)
+        except OSError as exc:
+            raise ReplayError(
+                f"output parent is not accessible: {self.output.parent}: {exc}"
+            ) from exc
+        output = parent / self.output.name
+        for history in self.histories:
+            if output == history.repo.path or output.is_relative_to(history.repo.path):
+                raise ReplayError(
+                    f"output must not be inside an input repository: {output}"
+                )
+        run_command(
+            (
+                "git",
+                "-c",
+                "init.templateDir=",
+                "init",
+                "--bare",
+                "--object-format=sha1",
+                str(output),
+            )
+        )
+        self.output = output
+        self.destination = GitRepo(output)
+
+    def _project_tree(self, history: SourceHistory, tree: str, index_dir: Path) -> str:
+        cache_key = (history.label, tree)
+        cached = self.tree_maps.get(cache_key)
+        if cached:
+            return cached
+        assert self.destination is not None
+        entries = tuple(
+            entry for entry in history.trees[tree] if entry.path in self.public_paths
+        )
+        for entry in entries:
+            if entry.kind != b"blob" or entry.oid in self.copied_blobs:
+                continue
+            contents = history.repo.object_bytes("blob", entry.oid)
+            copied_oid = self.destination.write_object("blob", contents)
+            if copied_oid != entry.oid:
+                raise ReplayError(f"blob identity changed while copying {entry.oid}")
+            self.copied_blobs.add(entry.oid)
+        index_path = index_dir / f"index-{len(self.tree_maps)}"
+        index_env = {"GIT_INDEX_FILE": str(index_path)}
+        self.destination.run("read-tree", "--empty", extra_env=index_env)
+        index_data = b"".join(
+            entry.mode + b" " + entry.oid.encode("ascii") + b"\t" + entry.path + b"\0"
+            for entry in entries
+        )
+        if index_data:
+            self.destination.run(
+                "update-index",
+                "-z",
+                "--index-info",
+                data=index_data,
+                extra_env=index_env,
+            )
+        projected = self.destination.run_text("write-tree", extra_env=index_env)
+        require_oid(projected)
+        self.tree_maps[cache_key] = projected
+        return projected
+
+    def _replay_history(self, history: SourceHistory, index_dir: Path) -> None:
+        assert self.destination is not None
+        mapping = self.commit_maps[history.label]
+        for record in history.commits:
+            projected_tree = self._project_tree(history, record.tree, index_dir)
+            try:
+                projected_parents = tuple(mapping[parent] for parent in record.parents)
+            except KeyError as exc:
+                raise ReplayError(
+                    f"parent was not replayed before {record.oid}"
+                ) from exc
+            old_raw = history.repo.object_bytes("commit", record.oid)
+            old_tree, old_parents, _, _ = graph_headers(old_raw)
+            if old_tree != record.tree or old_parents != record.parents:
+                raise ReplayError(
+                    f"raw commit graph differs from history walk at {record.oid}"
+                )
+            new_raw = rewrite_commit(old_raw, projected_tree, projected_parents)
+            new_oid = self.destination.write_object("commit", new_raw)
+            mapping[record.oid] = new_oid
+
+    def _publish_refs(self) -> None:
+        assert self.destination is not None
+        tips = {
+            history.label: self.commit_maps[history.label][history.tip]
+            for history in self.histories
+        }
+        commands = ["start"]
+        for label, ref in OUTPUT_REFS.items():
+            commands.append(f"create {ref} {tips[label]}")
+        commands.extend(("prepare", "commit", ""))
+        self.destination.run(
+            "update-ref", "--stdin", data="\n".join(commands).encode("ascii")
+        )
+        self.destination.run("symbolic-ref", "HEAD", OUTPUT_REFS["main"])
+
+    def _verify(self) -> None:
+        assert self.destination is not None
+        expected_refs = sorted(OUTPUT_REFS.values())
+        actual_refs = self.destination.run_text(
+            "for-each-ref", "--format=%(refname)"
+        ).splitlines()
+        if actual_refs != expected_refs:
+            raise ReplayError(
+                f"output refs differ from the fixed allowlist: {actual_refs}"
+            )
+        if self.destination.run_text("symbolic-ref", "HEAD") != OUTPUT_REFS["main"]:
+            raise ReplayError("output HEAD does not name refs/heads/main")
+
+        output_blob_oids: set[str] = set()
+        for history in self.histories:
+            mapping = self.commit_maps[history.label]
+            for record in history.commits:
+                new_oid = mapping[record.oid]
+                old_raw = history.repo.object_bytes("commit", record.oid)
+                new_raw = self.destination.object_bytes("commit", new_oid)
+                old_tree, _, old_metadata, old_message = graph_headers(old_raw)
+                new_tree, new_parents, new_metadata, new_message = graph_headers(
+                    new_raw
+                )
+                expected_parents = tuple(mapping[parent] for parent in record.parents)
+                if new_parents != expected_parents:
+                    raise ReplayError(
+                        f"ordered parents changed while replaying {record.oid}"
+                    )
+                if new_metadata != old_metadata or new_message != old_message:
+                    raise ReplayError(
+                        f"commit metadata or message changed while replaying {record.oid}"
+                    )
+                expected_entries = tuple(
+                    entry
+                    for entry in history.trees[old_tree]
+                    if entry.path in self.public_paths
+                )
+                actual_entries = self.destination.entries(new_tree)
+                if actual_entries != expected_entries:
+                    raise ReplayError(f"tree projection differs at {record.oid}")
+                for entry in actual_entries:
+                    if is_denied(entry.path) or entry.path not in self.public_paths:
+                        raise ReplayError(
+                            f"output contains a denied or unclassified path: {display_path(entry.path)}"
+                        )
+                    if entry.kind == b"blob":
+                        output_blob_oids.add(entry.oid)
+
+        for label, ref in OUTPUT_REFS.items():
+            tip = self.destination.run_text("rev-parse", ref)
+            expected_tip = self.commit_maps[label][self._history(label).tip]
+            if tip != expected_tip:
+                raise ReplayError(f"output ref has the wrong tip: {ref}")
+        if output_blob_oids & self.private_blobs:
+            oid = sorted(output_blob_oids & self.private_blobs)[0]
+            raise ReplayError(
+                f"output shares a blob OID with fixed-deny content: {oid}"
+            )
+
+        fsck = self.destination.run(
+            "fsck",
+            "--strict",
+            "--full",
+            "--unreachable",
+            "--no-reflogs",
+            "--no-progress",
+        )
+        if fsck.strip():
+            raise ReplayError(
+                f"strict fsck reported unreachable output objects: {fsck.decode('utf-8', 'replace').strip()}"
+            )
+
+    def _history(self, label: str) -> SourceHistory:
+        return next(history for history in self.histories if history.label == label)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    subparsers = parser.add_subparsers(dest="operation", required=True)
+    for operation in ("inventory", "replay"):
+        command = subparsers.add_parser(operation)
+        command.add_argument("--main-repo", type=Path, required=True)
+        command.add_argument("--main-commit", required=True)
+        command.add_argument("--legacy-repo", type=Path, required=True)
+        command.add_argument("--legacy-commit", required=True)
+        if operation == "inventory":
+            command.add_argument("--public-manifest", type=Path)
+        else:
+            command.add_argument("--public-manifest", type=Path, required=True)
+            command.add_argument("--output", type=Path, required=True)
+    return parser
+
+
+def load_inputs(
+    args: argparse.Namespace,
+) -> tuple[list[SourceHistory], frozenset[bytes]]:
+    require_oid(args.main_commit)
+    require_oid(args.legacy_commit)
+    main_repo = GitRepo(args.main_repo)
+    legacy_repo = GitRepo(args.legacy_repo)
+    public_paths = (
+        load_manifest(args.public_manifest, args.main_commit, args.legacy_commit)
+        if args.public_manifest
+        else frozenset()
+    )
+    histories = [
+        scan_history("main", main_repo, args.main_commit),
+        scan_history("legacy-public-history", legacy_repo, args.legacy_commit),
+    ]
+    return histories, public_paths
+
+
+def inventory(args: argparse.Namespace) -> int:
+    histories, public_paths = load_inputs(args)
+    unknown, _, _ = classify(histories, public_paths)
+    for label, entry in unknown:
+        print(
+            json.dumps(
+                {
+                    "source": label,
+                    "path": entry.path.decode("utf-8", "surrogateescape"),
+                    "oid": entry.oid,
+                    "size": entry.size,
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
+    return 0
+
+
+def replay(args: argparse.Namespace) -> int:
+    histories, public_paths = load_inputs(args)
+    unknown, private_blobs, public_blobs = classify(histories, public_paths)
+    if unknown:
+        label, entry = unknown[0]
+        raise ReplayError(
+            "unclassified paths prevent replay; "
+            f"first={label}:{display_path(entry.path)} oid={entry.oid} size={entry.size} count={len(unknown)}"
+        )
+    overlap = private_blobs & public_blobs
+    if overlap:
+        raise ReplayError(
+            f"a PUBLIC path shares fixed-deny blob content: {sorted(overlap)[0]}"
+        )
+    engine = ReplayEngine(histories, public_paths, private_blobs, args.output)
+    for label, old_oid, new_oid in engine.run():
+        print(f"{label}\t{old_oid}\t{new_oid}")
+    return 0
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    try:
+        return inventory(args) if args.operation == "inventory" else replay(args)
+    except ReplayError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
