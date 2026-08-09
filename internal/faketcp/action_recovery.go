@@ -548,16 +548,7 @@ func validateActionCheckpoint(checkpoint ActionCheckpoint) error {
 }
 
 func validateCheckpointCaptureBindings(checkpoint ActionCheckpoint) error {
-	boundary := checkpoint.NextStep
-	if checkpoint.Phase == ActionCheckpointAttempting &&
-		checkpoint.Steps[checkpoint.NextStep].Kind == ActionStepReinject {
-		// Recovery treats an attempting reinjection as consumed because its send
-		// outcome is ambiguous, so later steps must not repeat its CaptureID.
-		boundary++
-	}
-
 	var bindings map[CaptureIdentity]capturedPacketBinding
-	var completed map[CaptureIdentity]struct{}
 	for index, step := range checkpoint.Steps {
 		if step.Kind != ActionStepReinject {
 			continue
@@ -575,26 +566,11 @@ func validateCheckpointCaptureBindings(checkpoint ActionCheckpoint) error {
 			)
 		}
 		if duplicate {
-			_, repeatsCompleted := completed[step.Packet.CaptureID]
-			if repeatsCompleted && index >= boundary {
-				return fmt.Errorf(
-					"%w: unfinished step %d repeats a capture completed before boundary %d",
-					ErrActionCheckpointCorrupt,
-					index,
-					boundary,
-				)
-			}
 			return fmt.Errorf(
 				"%w: duplicate capture identity at step %d",
 				ErrActionCheckpointCorrupt,
 				index,
 			)
-		}
-		if index < boundary {
-			if completed == nil {
-				completed = make(map[CaptureIdentity]struct{})
-			}
-			completed[step.Packet.CaptureID] = struct{}{}
 		}
 	}
 	return nil
