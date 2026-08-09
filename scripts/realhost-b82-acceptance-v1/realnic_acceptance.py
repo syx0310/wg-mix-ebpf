@@ -1780,7 +1780,9 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         f"{spec.run_root}/results.json",
         f"{spec.run_root}/complete.json",
         f"{spec.run_root}/explicit-restored.json",
+        f"{spec.run_root}/explicit-restored.json.pending",
         f"{spec.run_root}/explicit-restored-snapshot.json",
+        f"{spec.run_root}/explicit-restored-snapshot.json.pending",
     }
     for cell in cells:
         if cell["runnable"]:
@@ -2045,6 +2047,14 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
         raise HarnessError("approved plan has no cells")
     names: set[str] = set()
     filesystem_set = set(filesystem)
+    terminal_artifacts = {
+        f"{spec.run_root}/explicit-restored.json",
+        f"{spec.run_root}/explicit-restored.json.pending",
+        f"{spec.run_root}/explicit-restored-snapshot.json",
+        f"{spec.run_root}/explicit-restored-snapshot.json.pending",
+    }
+    if not terminal_artifacts <= filesystem_set:
+        raise HarnessError("explicit restore terminal receipt paths are not plan-bound")
     for cell in cells:
         if not isinstance(cell, dict) or cell.get("name") in names:
             raise HarnessError("approved plan cell is malformed or duplicated")
@@ -2186,6 +2196,61 @@ def write_idempotent_exact(path: str, payload: bytes, mode: int = 0o600) -> None
             raise HarnessError(f"existing idempotent evidence differs: {path}")
         return
     write_exclusive(path, payload, mode)
+
+
+def fsync_parent(path: str) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(os.path.dirname(path), flags)
+    except OSError as exc:
+        raise HarnessError(f"terminal evidence directory open failed for {path}: {exc}") from exc
+    try:
+        if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise HarnessError(f"terminal evidence parent is not a directory: {path}")
+        os.fsync(descriptor)
+    except OSError as exc:
+        raise HarnessError(f"terminal evidence directory fsync failed for {path}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+
+
+def write_terminal_exact(path: str, payload: bytes, mode: int = 0o600) -> None:
+    pending = f"{path}.pending"
+    if os.path.lexists(path):
+        if read_regular_file(path) != payload:
+            raise HarnessError(f"existing terminal evidence differs: {path}")
+        fsync_parent(path)
+        return
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(pending, flags, mode)
+    except OSError as exc:
+        raise HarnessError(f"terminal evidence staging open failed for {pending}: {exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+            raise HarnessError(f"terminal evidence staging has an invalid shape: {pending}")
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise HarnessError(f"terminal evidence staging write made no progress: {pending}")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    if os.path.lexists(path):
+        if read_regular_file(path) != payload:
+            raise HarnessError(f"concurrent terminal evidence differs: {path}")
+        fsync_parent(path)
+        return
+    try:
+        os.replace(pending, path)
+    except OSError as exc:
+        raise HarnessError(f"terminal evidence commit failed for {path}: {exc}") from exc
+    if read_regular_file(path) != payload:
+        raise HarnessError(f"committed terminal evidence differs: {path}")
+    fsync_parent(path)
 
 
 def read_regular_file(path: str, maximum: int = 16 << 20) -> bytes:
@@ -3446,6 +3511,21 @@ def restore_owned_evidence(
     }
 
 
+def commit_restore_artifact(
+    journal: Journal,
+    name: str,
+    path: str,
+    payload: bytes,
+) -> None:
+    write_terminal_exact(path, payload)
+    journal.append(
+        "EXPLICIT_RESTORE_ARTIFACT_COMMITTED",
+        artifact=name,
+        path=path,
+        payload_sha256=sha256_bytes(payload),
+    )
+
+
 def plan_cell(plan: Mapping[str, Any], name: str) -> Mapping[str, Any]:
     for cell in plan["cells"]:
         if cell["name"] == name:
@@ -3681,6 +3761,7 @@ def restore_with_interface_lease(
             print(f"REALNIC_RESTORE_NOT_NEEDED run_id={spec.run_id} state=complete")
             return 0
         marker_path = f"{spec.run_root}/explicit-restored.json"
+        snapshot_path = f"{spec.run_root}/explicit-restored-snapshot.json"
         marker = {"run_id": spec.run_id, "plan_sha256": approved_sha256, "state": "restored"}
         marker_payload = canonical_json(marker)
         explicit_complete = any(event.get("event") == "EXPLICIT_RESTORE_COMPLETE" for event in journal.events)
@@ -3694,6 +3775,11 @@ def restore_with_interface_lease(
             if diagnostics["drift_labels"]:
                 append_restore_diagnostics(journal, "terminal-explicit-restored", diagnostics)
             validate_restore_owned_scope(baseline, current, plan["owned_feature_closure"])
+            expected_snapshot = canonical_json(
+                restore_owned_evidence(current, plan["owned_feature_closure"])
+            )
+            if not os.path.lexists(snapshot_path) or read_regular_file(snapshot_path) != expected_snapshot:
+                raise HarnessError("completed explicit restore has no exact owned snapshot")
             if release_needed:
                 lease.release()
                 journal.append("INTERFACE_LEASE_RELEASED", path=lease.path, terminal_restore=True)
@@ -3748,11 +3834,13 @@ def restore_with_interface_lease(
         restored, _, diagnostics = collect_restore_snapshot(spec, runner, baseline)
         append_restore_diagnostics(journal, "explicit-restore-finish", diagnostics)
         validate_restore_owned_scope(baseline, restored, plan["owned_feature_closure"])
-        write_idempotent_exact(
-            f"{spec.run_root}/explicit-restored-snapshot.json",
+        commit_restore_artifact(
+            journal,
+            "owned-snapshot",
+            snapshot_path,
             canonical_json(restore_owned_evidence(restored, plan["owned_feature_closure"])),
         )
-        write_idempotent_exact(marker_path, marker_payload)
+        commit_restore_artifact(journal, "restored-marker", marker_path, marker_payload)
         if active is not None:
             journal.append("CELL_RESTORED", attempt=attempt, cell=active, explicit=True)
         journal.append("EXPLICIT_RESTORE_COMPLETE", attempt=attempt, cell=active)

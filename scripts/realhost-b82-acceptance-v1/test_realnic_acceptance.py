@@ -944,6 +944,14 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(plan["write_set"]["filesystem"].count(lease["path"]), 1)
         self.assertIn(f"{spec.run_root}/journal-tail-recovery.json", plan["write_set"]["filesystem"])
         self.assertIn(f"{spec.run_root}/journal-tail-recovery.pending", plan["write_set"]["filesystem"])
+        self.assertIn(
+            f"{spec.run_root}/explicit-restored-snapshot.json.pending",
+            plan["write_set"]["filesystem"],
+        )
+        self.assertIn(
+            f"{spec.run_root}/explicit-restored.json.pending",
+            plan["write_set"]["filesystem"],
+        )
         self.assertTrue(lease["held_for_entire_run_or_restore"])
         self.assertTrue(lease["persistent_active_owner"])
         self.assertEqual(
@@ -1432,6 +1440,115 @@ class HermeticStateMachineTests(unittest.TestCase):
                 {name: baseline[name]["enabled"] for name in approved["owned_feature_closure"]},
             )
 
+    def test_terminal_restore_artifacts_replay_every_commit_cut(self):
+        artifacts = ("explicit-restored-snapshot.json", "explicit-restored.json")
+        cutpoints = ("partial-write", "post-replace", "post-journal")
+        for artifact in artifacts:
+            for cutpoint in cutpoints:
+                with self.subTest(artifact=artifact, cutpoint=cutpoint), tempfile.TemporaryDirectory() as temporary:
+                    prefix, spec, runner, plan_path, digest = self.prepare(
+                        temporary,
+                        fail_iperf_call=10,
+                    )
+                    plan = json.loads(pathlib.Path(plan_path).read_bytes())
+                    marker_payload = MODULE.canonical_json(
+                        {"run_id": spec.run_id, "plan_sha256": digest, "state": "restored"}
+                    )
+                    snapshot_payload = MODULE.canonical_json(
+                        MODULE.restore_owned_evidence(
+                            plan["baseline"],
+                            plan["owned_feature_closure"],
+                        )
+                    )
+                    payload = (
+                        snapshot_payload
+                        if artifact == "explicit-restored-snapshot.json"
+                        else marker_payload
+                    )
+                    target = pathlib.Path(spec.run_root, artifact)
+                    pending = pathlib.Path(f"{target}.pending")
+                    with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                        MODULE.os, "geteuid", return_value=0
+                    ):
+                        with self.assertRaises(MODULE.HarnessError):
+                            MODULE.run_mode(spec, plan_path, digest, runner)
+
+                        if cutpoint == "partial-write":
+                            real_write = MODULE.os.write
+                            cut = False
+
+                            def partial_write(descriptor, chunk):
+                                nonlocal cut
+                                if not cut and bytes(chunk) == payload:
+                                    cut = True
+                                    real_write(descriptor, chunk[:7])
+                                    raise MODULE.HarnessAbort("injected terminal partial write")
+                                return real_write(descriptor, chunk)
+
+                            context = mock.patch.object(MODULE.os, "write", side_effect=partial_write)
+                        elif cutpoint == "post-replace":
+                            real_replace = MODULE.os.replace
+                            cut = False
+
+                            def replace_then_cut(source, destination):
+                                nonlocal cut
+                                result = real_replace(source, destination)
+                                if not cut and destination == str(target):
+                                    cut = True
+                                    raise MODULE.HarnessAbort("injected terminal post-replace cut")
+                                return result
+
+                            context = mock.patch.object(
+                                MODULE.os,
+                                "replace",
+                                side_effect=replace_then_cut,
+                            )
+                        else:
+                            real_append = MODULE.Journal.append
+                            cut = False
+                            wanted = (
+                                "owned-snapshot"
+                                if artifact == "explicit-restored-snapshot.json"
+                                else "restored-marker"
+                            )
+
+                            def append_then_cut(instance, event, **fields):
+                                nonlocal cut
+                                result = real_append(instance, event, **fields)
+                                if (
+                                    not cut
+                                    and event == "EXPLICIT_RESTORE_ARTIFACT_COMMITTED"
+                                    and fields.get("artifact") == wanted
+                                ):
+                                    cut = True
+                                    raise MODULE.HarnessAbort("injected terminal post-journal cut")
+                                return result
+
+                            context = mock.patch.object(MODULE.Journal, "append", new=append_then_cut)
+
+                        with context, self.assertRaises(MODULE.HarnessAbort):
+                            MODULE.restore_mode(spec, plan_path, digest, runner)
+                        self.assertTrue(cut)
+                        if cutpoint == "partial-write":
+                            self.assertFalse(target.exists())
+                            self.assertEqual(pending.read_bytes(), payload[:7])
+                        else:
+                            self.assertEqual(target.read_bytes(), payload)
+
+                        self.assertEqual(MODULE.restore_mode(spec, plan_path, digest, runner), 0)
+                        self.assertEqual(MODULE.restore_mode(spec, plan_path, digest, runner), 0)
+
+                    self.assertEqual(target.read_bytes(), payload)
+                    self.assertFalse(pending.exists())
+                    self.assertEqual(
+                        pathlib.Path(spec.run_root, "explicit-restored-snapshot.json").read_bytes(),
+                        snapshot_payload,
+                    )
+                    self.assertEqual(
+                        pathlib.Path(spec.run_root, "explicit-restored.json").read_bytes(),
+                        marker_payload,
+                    )
+
 
 class JournalDurabilityTests(unittest.TestCase):
     run_id = "a1b2c3d4"
@@ -1439,6 +1556,17 @@ class JournalDurabilityTests(unittest.TestCase):
 
     def open_journal(self, path, *, create):
         return MODULE.Journal(str(path), self.run_id, self.plan_sha256, create=create)
+
+    def test_terminal_writer_never_replaces_a_tampered_target(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            target = pathlib.Path(temporary, "explicit-restored.json")
+            pending = pathlib.Path(f"{target}.pending")
+            target.write_bytes(b"tampered")
+            pending.write_bytes(b"expected")
+            with self.assertRaisesRegex(MODULE.HarnessError, "terminal evidence differs"):
+                MODULE.write_terminal_exact(str(target), b"expected")
+            self.assertEqual(target.read_bytes(), b"tampered")
+            self.assertEqual(pending.read_bytes(), b"expected")
 
     def test_append_writes_all_short_chunks_before_fsync(self):
         with tempfile.TemporaryDirectory() as temporary:
