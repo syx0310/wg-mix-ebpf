@@ -80,16 +80,18 @@ func decodeEventHeader(header []byte) abi.FakeTCPEvent {
 		TimestampNanos:     native.Uint64(header[24:32]),
 		RuntimeIncarnation: [16]byte(header[32:48]),
 		CaptureSequence:    native.Uint64(header[48:56]),
-		CaptureCPU:         native.Uint32(header[56:60]),
-		Sequence:           native.Uint32(header[60:64]),
-		Acknowledgement:    native.Uint32(header[64:68]),
-		PayloadLength:      native.Uint32(header[68:72]),
-		FWMark:             native.Uint32(header[72:76]),
-		WGID:               native.Uint32(header[76:80]),
-		PacketLength:       native.Uint16(header[80:82]),
-		EventABIVersion:    native.Uint16(header[82:84]),
-		Type:               header[84],
-		TCPFlags:           header[85],
+		SessionRevision:    native.Uint64(header[56:64]),
+		SessionID:          native.Uint64(header[64:72]),
+		CaptureCPU:         native.Uint32(header[72:76]),
+		Sequence:           native.Uint32(header[76:80]),
+		Acknowledgement:    native.Uint32(header[80:84]),
+		PayloadLength:      native.Uint32(header[84:88]),
+		FWMark:             native.Uint32(header[88:92]),
+		WGID:               native.Uint32(header[92:96]),
+		PacketLength:       native.Uint16(header[96:98]),
+		EventABIVersion:    native.Uint16(header[98:100]),
+		Type:               header[100],
+		TCPFlags:           header[101],
 	}
 }
 
@@ -134,6 +136,14 @@ func validateEventType(event abi.FakeTCPEvent) error {
 		}
 	default:
 		return fmt.Errorf("unknown faketcp event type %d", event.Type)
+	}
+	closeEvent := event.Type == abi.FakeTCPEventRST || event.Type == abi.FakeTCPEventFIN
+	if closeEvent {
+		if event.SessionRevision == 0 || event.SessionID == 0 {
+			return errors.New("faketcp close event has no session identity")
+		}
+	} else if event.SessionRevision != 0 || event.SessionID != 0 {
+		return errors.New("faketcp non-close event contains a session identity")
 	}
 	if event.Type != abi.FakeTCPEventNeedHandshake &&
 		(event.CaptureSequence != 0 || event.CaptureCPU != 0) {

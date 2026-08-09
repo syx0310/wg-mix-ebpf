@@ -1045,11 +1045,46 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 	captureHelper := text[captureStart:xdpStart]
 	admit := strings.Index(captureHelper, "faketcp_admit_control_event(key, wg_id, event_type, now)")
 	write := strings.Index(captureHelper, "record->event = (struct faketcp_event)")
-	identity := strings.Index(captureHelper, "faketcp_bind_runtime_identity(key, &record->event)")
+	identity := strings.Index(captureHelper, "record->event.runtime_incarnation[i]")
 	copyPacket := strings.Index(captureHelper, "bpf_xdp_load_bytes")
 	output := strings.Index(captureHelper, "faketcp_output_packet_event(record, packet_len)")
 	if admit < 0 || write < 0 || identity < 0 || copyPacket < 0 || output < 0 ||
 		admit >= write || write >= identity || identity >= copyPacket || copyPacket >= output {
 		t.Fatal("validated close admission must dominate event writes, identity binding, packet copy, and shared output")
+	}
+	for _, want := range []string{
+		".session_revision = snapshot->revision",
+		".session_id = snapshot->session_id",
+		".sequence = snapshot->rx_sequence",
+		".acknowledgement = snapshot->tx_sequence",
+		".event_abi_version = FAKETCP_EVENT_ABI_VERSION",
+	} {
+		if !strings.Contains(captureHelper, want) {
+			t.Fatalf("close event snapshot binding missing %q", want)
+		}
+	}
+	if strings.Contains(captureHelper, "faketcp_bind_runtime_identity") {
+		t.Fatal("close event must use the incarnation from its locked session snapshot")
+	}
+
+	snapshotStart := strings.Index(text, "static __always_inline int faketcp_session_snapshot_close(")
+	mutationStart := strings.Index(text, "static __always_inline int faketcp_session_mutate(")
+	if snapshotStart < 0 || mutationStart < 0 || snapshotStart >= mutationStart {
+		t.Fatal("locked close snapshot helper is missing or misplaced")
+	}
+	snapshot := text[snapshotStart:mutationStart]
+	lock := strings.Index(snapshot, "bpf_spin_lock(&session->lock)")
+	validate := strings.Index(snapshot, "faketcp_session_metadata_valid_locked(session, generation)")
+	proof := strings.Index(snapshot, "snapshot->revision = session->revision")
+	incarnation := strings.Index(snapshot, "snapshot->runtime_incarnation[i]")
+	unlock := strings.Index(snapshot, "bpf_spin_unlock(&session->lock)")
+	if lock < 0 || validate < 0 || proof < 0 || incarnation < 0 || unlock < 0 ||
+		!(lock < validate && validate < proof && proof < incarnation && incarnation < unlock) {
+		t.Fatal("close authority is not copied from one validated locked snapshot")
+	}
+	for _, forbidden := range []string{"bpf_ktime_get_ns", "bpf_xdp_", "bpf_csum_diff", "inc_faketcp_stat"} {
+		if strings.Contains(snapshot[lock:unlock], forbidden) {
+			t.Fatalf("close snapshot critical section contains helper/stat call %q", forbidden)
+		}
 	}
 }

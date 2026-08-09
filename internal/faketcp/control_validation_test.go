@@ -132,7 +132,8 @@ func TestValidateIPv4TCPControlRejectsEveryDestructiveFieldMismatch(t *testing.T
 			engine, store, flow, state := establishedControlTestSession(t)
 			packet := buildIPv4TCPControl(flow, state, FlagRST|FlagACK)
 			test.mutate(packet, state)
-			_, validationErr := validateIPv4TCPControl(packet, flow, state, engine.Identity())
+			event := closeValidationEvent(flow, state, FlagRST|FlagACK, 7, engine.Identity())
+			validationErr := validateIPv4TCPControl(packet, event, state)
 			if validationErr == nil || !strings.Contains(validationErr.Error(), test.want) {
 				t.Fatalf("validation error=%v, want %q", validationErr, test.want)
 			}
@@ -177,7 +178,8 @@ func TestValidZeroTCPChecksumFieldIsAcceptedByResidual(t *testing.T) {
 	for attempts := 0; attempts <= 0xffff; attempts++ {
 		packet := buildIPv4TCPControl(flow, state, FlagRST|FlagACK)
 		if packet[36] == 0 && packet[37] == 0 {
-			if _, err := validateIPv4TCPControl(packet, flow, state, identity); err != nil {
+			event := closeValidationEvent(flow, state, FlagRST|FlagACK, 7, identity)
+			if err := validateIPv4TCPControl(packet, event, state); err != nil {
 				t.Fatalf("valid zero TCP checksum field rejected: %v", err)
 			}
 			return
@@ -248,6 +250,54 @@ func TestCapturedCloseCannotTearDownAnotherFlow(t *testing.T) {
 	}
 }
 
+func TestCapturedCloseRejectsEventFromOlderRevision(t *testing.T) {
+	engine, store, flow, state := establishedControlTestSession(t)
+	event, packet := capturedCloseEvent(engine, flow, state, FlagRST|FlagACK, 7)
+	advanced := state
+	advanced.LastSeenNanos++
+	advanced.Revision++
+	store.values[flow] = advanced
+
+	actions, err := engine.InboundCapturedControl(event, packet)
+	if err != nil || len(actions) != 1 || actions[0].Reason != "invalid-close-control" {
+		t.Fatalf("stale-revision close actions=%#v err=%v", actions, err)
+	}
+	if got, found := store.values[flow]; !found || got != advanced || store.deleteAttempts != 0 {
+		t.Fatalf("stale-revision close changed current state: found=%t value=%#v attempts=%d", found, got, store.deleteAttempts)
+	}
+}
+
+func TestCapturedCloseRejectsEventFromReplacedSession(t *testing.T) {
+	engine, store, flow, old := establishedControlTestSession(t)
+	event, packet := capturedCloseEvent(engine, flow, old, FlagFIN|FlagACK, 7)
+	delete(store.values, flow)
+	engine.remove(flow, engine.sessions[flow])
+	engine.opts.InitialSequence = func() uint32 { return old.LocalISN }
+	if _, err := engine.outbound(flow, PendingPacket{Data: []byte{2}, WGID: 7}, false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.InboundWithWGID(
+		flow,
+		Segment{Flags: FlagSYN | FlagACK, Sequence: old.RemoteISN, Acknowledgement: old.LocalISN + 1},
+		7,
+	); err != nil {
+		t.Fatal(err)
+	}
+	replacement := store.values[flow]
+	if replacement.SessionID == old.SessionID || replacement.TXSequence != old.TXSequence ||
+		replacement.RXSequence != old.RXSequence || replacement.Window != old.Window {
+		t.Fatalf("replacement session did not isolate only its identity: old=%#v new=%#v", old, replacement)
+	}
+
+	actions, err := engine.InboundCapturedControl(event, packet)
+	if err != nil || len(actions) != 1 || actions[0].Reason != "invalid-close-control" {
+		t.Fatalf("replaced-session close actions=%#v err=%v", actions, err)
+	}
+	if got, found := store.values[flow]; !found || got != replacement || store.deleteAttempts != 0 {
+		t.Fatalf("replaced-session close changed current state: found=%t value=%#v attempts=%d", found, got, store.deleteAttempts)
+	}
+}
+
 func TestValidatedCloseCannotDeleteAdvancedBPFState(t *testing.T) {
 	engine, store, flow, state := establishedControlTestSession(t)
 	event, packet := capturedCloseEvent(engine, flow, state, FlagRST|FlagACK, 7)
@@ -310,7 +360,8 @@ func TestCloseValidationBitFlipCorpusFailsClosed(t *testing.T) {
 		for bit := uint8(1); bit != 0; bit <<= 1 {
 			candidate := append([]byte(nil), valid...)
 			candidate[byteIndex] ^= bit
-			if _, err := validateIPv4TCPControl(candidate, flow, state, engine.Identity()); err == nil {
+			event := closeValidationEvent(flow, state, FlagRST|FlagACK, 7, engine.Identity())
+			if err := validateIPv4TCPControl(candidate, event, state); err == nil {
 				t.Fatalf("single bit mutation accepted at byte=%d bit=%#x", byteIndex, bit)
 			}
 		}
@@ -333,10 +384,11 @@ func BenchmarkValidateIPv4TCPControl(b *testing.B) {
 	}
 	identity := testRuntimeIdentity(flow.Generation)
 	packet := buildIPv4TCPControl(flow, state, FlagRST|FlagACK)
+	event := closeValidationEvent(flow, state, FlagRST|FlagACK, 7, identity)
 	b.ReportAllocs()
 	b.ResetTimer()
 	for range b.N {
-		if _, err := validateIPv4TCPControl(packet, flow, state, identity); err != nil {
+		if err := validateIPv4TCPControl(packet, event, state); err != nil {
 			b.Fatal(err)
 		}
 	}
@@ -392,21 +444,34 @@ func capturedCloseEvent(
 	wgID uint32,
 ) (abi.FakeTCPEvent, []byte) {
 	packet := buildIPv4TCPControl(flow, state, flags)
+	event := closeValidationEvent(flow, state, flags, wgID, engine.Identity())
+	return event, packet
+}
+
+func closeValidationEvent(
+	flow abi.FakeTCPSessionKey,
+	state abi.FakeTCPSessionValue,
+	flags uint8,
+	wgID uint32,
+	identity RuntimeIdentity,
+) abi.FakeTCPEvent {
 	eventType := abi.FakeTCPEventRST
 	if flags == FlagFIN|FlagACK {
 		eventType = abi.FakeTCPEventFIN
 	}
 	event := abi.FakeTCPEvent{
 		Key:             flow,
+		SessionRevision: state.Revision,
+		SessionID:       state.SessionID,
 		Sequence:        state.RXSequence,
 		Acknowledgement: state.TXSequence,
 		WGID:            wgID,
-		PacketLength:    uint16(len(packet)),
+		PacketLength:    controlPacketLength,
 		Type:            eventType,
 		TCPFlags:        flags,
 	}
-	bindTestEvent(&event, engine.Identity(), 0)
-	return event, packet
+	bindTestEvent(&event, identity, 0)
+	return event
 }
 
 func setIPv4Checksum(packet []byte) {

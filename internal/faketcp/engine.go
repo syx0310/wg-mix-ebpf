@@ -445,6 +445,10 @@ func (e *Engine) InboundCapturedControl(event abi.FakeTCPEvent, packet []byte) (
 	if event.WGID == 0 || s.wgID == 0 || event.WGID != s.wgID {
 		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
 	}
+	if s.pendingDelete != nil {
+		action, err := e.retryPendingDelete(flow, s)
+		return []Action{action}, err
+	}
 	if s.state != abi.FakeTCPStateEstablished {
 		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
 	}
@@ -455,11 +459,7 @@ func (e *Engine) InboundCapturedControl(event abi.FakeTCPEvent, packet []byte) (
 	if !found {
 		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-missing"}}, nil
 	}
-	segment, validationErr := validateIPv4TCPControl(packet, flow, value, identity)
-	if validationErr != nil || segment.Flags != event.TCPFlags ||
-		segment.Sequence != event.Sequence || segment.Acknowledgement != event.Acknowledgement ||
-		(event.Type == abi.FakeTCPEventRST && segment.Flags != FlagRST|FlagACK) ||
-		(event.Type == abi.FakeTCPEventFIN && segment.Flags != FlagFIN|FlagACK) {
+	if validationErr := validateIPv4TCPControl(packet, event, value); validationErr != nil {
 		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "invalid-close-control"}}, nil
 	}
 	result, err := e.compareDeleteEstablished(flow, s, pendingSessionDelete{

@@ -27,7 +27,7 @@
 #define FAKETCP_EVENT_ACK            4
 #define FAKETCP_EVENT_RST            5
 #define FAKETCP_EVENT_FIN            6
-#define FAKETCP_EVENT_ABI_VERSION    1
+#define FAKETCP_EVENT_ABI_VERSION    2
 
 #define FAKETCP_FLAG_FIN 0x01
 #define FAKETCP_FLAG_SYN 0x02
@@ -159,6 +159,9 @@ struct faketcp_close_snapshot {
 	__u8 runtime_incarnation[16];
 };
 
+_Static_assert(sizeof(struct faketcp_close_snapshot) == 48,
+	       "faketcp close snapshot stack budget drift");
+
 _Static_assert(sizeof(struct faketcp_session_key) == 24,
 	       "faketcp session key ABI drift");
 _Static_assert(sizeof(struct faketcp_session_value) == 80,
@@ -173,6 +176,8 @@ struct faketcp_event {
 	__u64 timestamp_nanos;
 	__u8 runtime_incarnation[16];
 	__u64 capture_sequence;
+	__u64 session_revision;
+	__u64 session_id;
 	__u32 capture_cpu;
 	__u32 sequence;
 	__u32 acknowledgement;
@@ -191,16 +196,20 @@ struct faketcp_packet_event {
 	__u8 packet[FAKETCP_MAX_CAPTURED_PACKET];
 };
 
-_Static_assert(sizeof(struct faketcp_event) == 88, "faketcp event ABI drift");
+_Static_assert(sizeof(struct faketcp_event) == 104, "faketcp event ABI drift");
 _Static_assert(__builtin_offsetof(struct faketcp_event, runtime_incarnation) == 32,
 	       "faketcp runtime incarnation ABI drift");
 _Static_assert(__builtin_offsetof(struct faketcp_event, capture_sequence) == 48,
 	       "faketcp capture sequence ABI drift");
-_Static_assert(__builtin_offsetof(struct faketcp_event, capture_cpu) == 56,
+_Static_assert(__builtin_offsetof(struct faketcp_event, session_revision) == 56,
+	       "faketcp session revision ABI drift");
+_Static_assert(__builtin_offsetof(struct faketcp_event, session_id) == 64,
+	       "faketcp session ID ABI drift");
+_Static_assert(__builtin_offsetof(struct faketcp_event, capture_cpu) == 72,
 	       "faketcp capture CPU ABI drift");
-_Static_assert(__builtin_offsetof(struct faketcp_event, event_abi_version) == 82,
+_Static_assert(__builtin_offsetof(struct faketcp_event, event_abi_version) == 98,
 	       "faketcp event version ABI drift");
-_Static_assert(sizeof(struct faketcp_packet_event) == 2392,
+_Static_assert(sizeof(struct faketcp_packet_event) == 2408,
 	       "faketcp packet event ABI drift");
 
 struct faketcp_runtime_identity_value {
@@ -1357,8 +1366,7 @@ static __always_inline __u8 faketcp_event_type(__u8 flags)
 // checksums in XDP before spending control-event budget; userspace repeats the
 // validation against a fresh complete-value snapshot before teardown
 // authority is granted. A mathematically valid zero TCP checksum field is
-// accepted because
-// only the complete one's-complement residual is authoritative.
+// accepted because only the complete one's-complement residual is authoritative.
 static __always_inline int
 faketcp_close_checksums_valid(const struct iphdr *iph,
 			      const struct tcphdr *tcp)
@@ -1386,13 +1394,14 @@ faketcp_capture_close_packet(struct xdp_md *xdp, __u32 packet_off,
 			     __u16 packet_len,
 			     const struct faketcp_session_key *key,
 			     __u32 wg_id, __u8 event_type, __u8 flags,
-			     __u32 seq, __u32 ack)
+			     const struct faketcp_close_snapshot *snapshot)
 {
 	struct faketcp_packet_event *record;
 	__u32 zero = 0;
 	__u64 now;
 
-	if (packet_len != sizeof(struct iphdr) + sizeof(struct tcphdr))
+	if (packet_len != sizeof(struct iphdr) + sizeof(struct tcphdr) ||
+	    !snapshot)
 		return -1;
 	record = bpf_map_lookup_elem(&faketcp_capture_scratch, &zero);
 	if (!record)
@@ -1403,17 +1412,20 @@ faketcp_capture_close_packet(struct xdp_md *xdp, __u32 packet_off,
 	record->event = (struct faketcp_event){
 		.key = *key,
 		.timestamp_nanos = now,
-		.sequence = seq,
-		.acknowledgement = ack,
+		.session_revision = snapshot->revision,
+		.session_id = snapshot->session_id,
+		.sequence = snapshot->rx_sequence,
+		.acknowledgement = snapshot->tx_sequence,
 		.wg_id = wg_id,
 		.packet_length = packet_len,
+		.event_abi_version = FAKETCP_EVENT_ABI_VERSION,
 		.type = event_type,
 		.tcp_flags = flags,
 	};
-	if (faketcp_bind_runtime_identity(key, &record->event) < 0) {
-		inc_faketcp_stat(FAKETCP_STAT_CAPTURE_ID_ERROR);
-		return -1;
-	}
+#pragma unroll
+	for (int i = 0; i < 16; i++)
+		record->event.runtime_incarnation[i] =
+			snapshot->runtime_incarnation[i];
 	if (bpf_xdp_load_bytes(xdp, packet_off, record->packet, packet_len) < 0)
 		return -1;
 	if (faketcp_output_packet_event(record, packet_len) < 0)
@@ -1436,7 +1448,6 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	struct faketcp_session_key key = {};
 	struct faketcp_session_value *session;
 	struct faketcp_metadata *metadata;
-	struct faketcp_close_snapshot close = {};
 	struct faketcp_pseudo_tail old_pseudo, new_pseudo;
 	struct tcphdr old_tcp;
 	struct udphdr udp = {};
@@ -1533,6 +1544,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
 	if (flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)) {
 		const __u8 *raw_tcp = (const __u8 *)tcp;
+		struct faketcp_close_snapshot close = {};
 
 		// Only the exact inbound direction of an existing established session
 		// can reach the packet-bearing close event. Every field is rechecked by
@@ -1559,7 +1571,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 		}
 		if (faketcp_capture_close_packet(
 			    xdp, (__u32)off, total_len, &key, listener->wg_id,
-			    faketcp_event_type(flags), flags, seq, ack) < 0)
+			    faketcp_event_type(flags), flags, &close) < 0)
 			inc_faketcp_stat(FAKETCP_STAT_EVENT_ERROR);
 		return XDP_DROP;
 	}

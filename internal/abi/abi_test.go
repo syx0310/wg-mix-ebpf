@@ -105,10 +105,16 @@ func TestStructSizesAreStable(t *testing.T) {
 	if got, want := unsafe.Offsetof(FakeTCPEvent{}.CaptureSequence), uintptr(48); got != want {
 		t.Fatalf("FakeTCPEvent.CaptureSequence offset = %d, want %d", got, want)
 	}
-	if got, want := unsafe.Offsetof(FakeTCPEvent{}.CaptureCPU), uintptr(56); got != want {
+	if got, want := unsafe.Offsetof(FakeTCPEvent{}.SessionRevision), uintptr(56); got != want {
+		t.Fatalf("FakeTCPEvent.SessionRevision offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPEvent{}.SessionID), uintptr(64); got != want {
+		t.Fatalf("FakeTCPEvent.SessionID offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPEvent{}.CaptureCPU), uintptr(72); got != want {
 		t.Fatalf("FakeTCPEvent.CaptureCPU offset = %d, want %d", got, want)
 	}
-	if got, want := unsafe.Offsetof(FakeTCPEvent{}.EventABIVersion), uintptr(82); got != want {
+	if got, want := unsafe.Offsetof(FakeTCPEvent{}.EventABIVersion), uintptr(98); got != want {
 		t.Fatalf("FakeTCPEvent.EventABIVersion offset = %d, want %d", got, want)
 	}
 	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.State), uintptr(34); got != want {

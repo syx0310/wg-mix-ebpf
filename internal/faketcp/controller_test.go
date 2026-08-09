@@ -1211,16 +1211,18 @@ func testEventSample(event abi.FakeTCPEvent, packet []byte, fixed bool) []byte {
 	native.PutUint64(sample[24:32], event.TimestampNanos)
 	copy(sample[32:48], event.RuntimeIncarnation[:])
 	native.PutUint64(sample[48:56], event.CaptureSequence)
-	native.PutUint32(sample[56:60], event.CaptureCPU)
-	native.PutUint32(sample[60:64], event.Sequence)
-	native.PutUint32(sample[64:68], event.Acknowledgement)
-	native.PutUint32(sample[68:72], event.PayloadLength)
-	native.PutUint32(sample[72:76], event.FWMark)
-	native.PutUint32(sample[76:80], event.WGID)
-	native.PutUint16(sample[80:82], event.PacketLength)
-	native.PutUint16(sample[82:84], event.EventABIVersion)
-	sample[84] = event.Type
-	sample[85] = event.TCPFlags
+	native.PutUint64(sample[56:64], event.SessionRevision)
+	native.PutUint64(sample[64:72], event.SessionID)
+	native.PutUint32(sample[72:76], event.CaptureCPU)
+	native.PutUint32(sample[76:80], event.Sequence)
+	native.PutUint32(sample[80:84], event.Acknowledgement)
+	native.PutUint32(sample[84:88], event.PayloadLength)
+	native.PutUint32(sample[88:92], event.FWMark)
+	native.PutUint32(sample[92:96], event.WGID)
+	native.PutUint16(sample[96:98], event.PacketLength)
+	native.PutUint16(sample[98:100], event.EventABIVersion)
+	sample[100] = event.Type
+	sample[101] = event.TCPFlags
 	copy(sample[fakeTCPEventSize:], packet)
 	return sample
 }
