@@ -198,9 +198,34 @@ read_manifest_field() {
   [[ "${destination}" == discard ]] || printf -v "${destination}" '%s' "${value}"
 }
 
+require_manifest_fd_without_nul() {
+  /usr/bin/python3 -B -I -c '
+import os
+import sys
+
+try:
+    descriptor = int(sys.argv[1])
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 65536, offset)
+        if not chunk:
+            raise SystemExit(0)
+        if b"\0" in chunk:
+            raise SystemExit(65)
+        offset += len(chunk)
+except (OSError, ValueError):
+    raise SystemExit(66)
+' "$1"
+}
+
 load_manifest_once() {
-  local unexpected
+  local unexpected='' rc
   exec {MANIFEST_FD}<"${SNAPSHOT_MANIFEST}" || return 66
+  require_manifest_fd_without_nul "${MANIFEST_FD}" || {
+    rc=$?
+    exec {MANIFEST_FD}<&-
+    return "${rc}"
+  }
   read_manifest_field format FORMAT &&
     read_manifest_field run_id MANIFEST_RUN_ID &&
     read_manifest_field package_id MANIFEST_PACKAGE_ID &&
@@ -282,11 +307,32 @@ load_manifest_once() {
     read_manifest_field test_realnic_acceptance_static_py_sha256 discard &&
     read_manifest_field provision_ubuntu_test_host_sh_path discard &&
     read_manifest_field provision_ubuntu_test_host_sh_blob discard &&
-    read_manifest_field provision_ubuntu_test_host_sh_sha256 discard || {
+    read_manifest_field provision_ubuntu_test_host_sh_sha256 discard &&
+    read_manifest_field root_veth_n_r_sh_path discard &&
+    read_manifest_field root_veth_n_r_sh_blob discard &&
+    read_manifest_field root_veth_n_r_sh_sha256 discard &&
+    read_manifest_field test_hermetic_veth_runner_sh_path discard &&
+    read_manifest_field test_hermetic_veth_runner_sh_blob discard &&
+    read_manifest_field test_hermetic_veth_runner_sh_sha256 discard &&
+    read_manifest_field test_veth_runner_static_py_path discard &&
+    read_manifest_field test_veth_runner_static_py_blob discard &&
+    read_manifest_field test_veth_runner_static_py_sha256 discard &&
+    read_manifest_field controller_seam_sh_path discard &&
+    read_manifest_field controller_seam_sh_blob discard &&
+    read_manifest_field controller_seam_sh_sha256 discard &&
+    read_manifest_field root_routed_veth_n_r_sh_path discard &&
+    read_manifest_field root_routed_veth_n_r_sh_blob discard &&
+    read_manifest_field root_routed_veth_n_r_sh_sha256 discard &&
+    read_manifest_field test_hermetic_routed_veth_harness_sh_path discard &&
+    read_manifest_field test_hermetic_routed_veth_harness_sh_blob discard &&
+    read_manifest_field test_hermetic_routed_veth_harness_sh_sha256 discard &&
+    read_manifest_field test_routed_veth_harness_static_py_path discard &&
+    read_manifest_field test_routed_veth_harness_static_py_blob discard &&
+    read_manifest_field test_routed_veth_harness_static_py_sha256 discard || {
       exec {MANIFEST_FD}<&-
       return 65
     }
-  if IFS= read -r -u "${MANIFEST_FD}" unexpected; then
+  if IFS= read -r -u "${MANIFEST_FD}" unexpected || [[ -n "${unexpected}" ]]; then
     exec {MANIFEST_FD}<&-
     return 65
   fi
@@ -409,7 +455,7 @@ validate_snapshot_contract() {
   [[ "$(sha256_file "${SNAPSHOT_MANIFEST}")" == "${MANIFEST_SHA256}" &&
     "$(sha256_file "${SNAPSHOT_BUNDLE}")" == "${BUNDLE_SHA256}" ]] || return 79
   load_manifest_once || return $?
-  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v3' &&
+  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v4' &&
     "${MANIFEST_RUN_ID}" == "${CONTROLLER_RUN_ID}" &&
     "${MANIFEST_PACKAGE_ID}" == "${PACKAGE_ID}" &&
     "${MANIFEST_COMMIT}" == "${COMMIT}" &&

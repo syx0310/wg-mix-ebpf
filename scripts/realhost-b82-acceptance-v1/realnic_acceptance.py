@@ -14,6 +14,7 @@ import fcntl
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import signal
@@ -40,6 +41,10 @@ LEGACY_RETIREMENT_RESERVATION = (
     "/run/wg-mix-ebpf-source-stages/c8e41d73/realhost-v6-6bd913ac"
 )
 APPROVED_PLAN_PATH = "/run/wg-mix-ebpf-source-bootstrap-c8e41d73/realnic-approved-plan.json"
+LOCAL_PACKAGE_PREFIX = "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-"
+LOCAL_PACKAGE_MANIFEST = "package-manifest.v1"
+LOCAL_PUBLISHER_NAME = "realnic_acceptance.py"
+LOCAL_PLAN_PREFIX = "realnic-plan."
 EXPECTED_HOSTNAME = "ubuntu-2604-test"
 EXPECTED_KERNEL = "7.0.0-28-generic"
 EXPECTED_MACHINE_ID = "9db3fb717cc74974b2a6b243d67f67b9"
@@ -56,6 +61,129 @@ MAC_RE = re.compile(r"^[0-9a-f]{2}(?::[0-9a-f]{2}){5}$")
 UUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
 )
+
+PACKAGE_MANIFEST_BASE_KEYS = (
+    "format",
+    "run_id",
+    "package_id",
+    "integration_ref",
+    "integration_commit",
+    "bundle_name",
+    "bundle_sha256",
+    "history_verification",
+    "history_commit_count",
+    "history_roots_sha256",
+    "history_objects_sha256",
+    "wg_state",
+    "wg_interface",
+    "wg_local_address",
+    "wg_peer_address",
+    "local_repository",
+    "local_package_dir",
+    "remote_package_dir",
+    "remote_source",
+    "target_user",
+    "target_host",
+    "target_hostname",
+    "target_kernel",
+    "target_machine_id",
+    "target_interface",
+    "peer_address",
+    "peer_port",
+    "soak_seconds",
+    "session_seconds",
+    "physical_nic_forward_authority",
+    "physical_interface_lock",
+    "legacy_matrix_mode",
+    "realnic_profile",
+    "realnic_traffic_seconds",
+)
+PACKAGE_MANIFEST_IDENTITY_KEYS = (
+    "bind_final_package_sh",
+    "controller_sh",
+    "locked_transport_exp",
+    "root_matrix_n_r_sh",
+    "check_realhost_iperf_py",
+    "test_hermetic_matrix_sh",
+    "test_matrix_static_py",
+    "checksum_module_lease_sh",
+    "root_fresh_verifier_gate_sh",
+    "test_hermetic_fresh_verifier_gate_sh",
+    "test_fresh_verifier_gate_static_py",
+    "prepare_stage_root_sh",
+    "realnic_acceptance_py",
+    "test_realnic_acceptance_py",
+    "test_realnic_acceptance_static_py",
+    "provision_ubuntu_test_host_sh",
+    "root_veth_n_r_sh",
+    "test_hermetic_veth_runner_sh",
+    "test_veth_runner_static_py",
+    "controller_seam_sh",
+    "root_routed_veth_n_r_sh",
+    "test_hermetic_routed_veth_harness_sh",
+    "test_routed_veth_harness_static_py",
+)
+PACKAGE_MANIFEST_KEYS = PACKAGE_MANIFEST_BASE_KEYS + tuple(
+    f"{identity}_{field}"
+    for identity in PACKAGE_MANIFEST_IDENTITY_KEYS
+    for field in ("path", "blob", "sha256")
+)
+
+PLAN_TOP_LEVEL_KEYS = frozenset(
+    {
+        "schema",
+        "spec",
+        "execution_profile",
+        "counter_failure_policy",
+        "counter_gate",
+        "owned_feature_closure",
+        "snapshot_commands",
+        "baseline",
+        "traffic_oracle",
+        "physical_interface_lock",
+        "legacy_retirement_reservation",
+        "interface_lease",
+        "cells",
+        "runtime_snapshot_schedule",
+        "write_set",
+        "safety_contract",
+    }
+)
+BASELINE_TOP_LEVEL_KEYS = frozenset(
+    {
+        "host",
+        "interface_identity",
+        "features",
+        "link",
+        "addresses",
+        "routes",
+        "peer_route",
+        "qdisc",
+        "tc_ingress",
+        "tc_egress",
+        "bpf_links",
+        "bpf_programs",
+        "bpf_maps",
+        "wg_interfaces",
+        "nic_stat_keys",
+        "link_stat_keys",
+    }
+)
+BASELINE_HOST_KEYS = frozenset({"hostname", "kernel", "machine_id", "boot_id", "netns"})
+BASELINE_INTERFACE_KEYS = frozenset(
+    {
+        "name",
+        "ifindex",
+        "mac",
+        "mtu",
+        "driver",
+        "bus_info",
+        "device_path",
+        "device_dev",
+        "device_ino",
+    }
+)
+BASELINE_FEATURE_KEYS = frozenset({"enabled", "fixed", "parent"})
 
 TOOLS = {
     "bpftool": "/usr/sbin/bpftool",
@@ -84,6 +212,30 @@ FEATURE_ORDER = (
     "tx-udp-segmentation",
     "rx-udp-gro-forwarding",
 )
+OWNED_FEATURE_CHILDREN = {
+    "rx-checksumming": frozenset(),
+    "tx-checksumming": frozenset(
+        {
+            "tx-checksum-ipv4",
+            "tx-checksum-ip-generic",
+            "tx-checksum-ipv6",
+            "tx-checksum-fcoe-crc",
+            "tx-checksum-sctp",
+        }
+    ),
+    "generic-segmentation-offload": frozenset(),
+    "generic-receive-offload": frozenset(),
+    "tcp-segmentation-offload": frozenset(
+        {
+            "tx-tcp-segmentation",
+            "tx-tcp-ecn-segmentation",
+            "tx-tcp-mangleid-segmentation",
+            "tx-tcp6-segmentation",
+        }
+    ),
+    "tx-udp-segmentation": frozenset(),
+    "rx-udp-gro-forwarding": frozenset(),
+}
 
 TX_FEATURES = frozenset(
     {
@@ -155,6 +307,10 @@ def canonical_json(value: Any) -> bytes:
 
 def sha256_bytes(value: bytes) -> str:
     return hashlib.sha256(value).hexdigest()
+
+
+def git_blob_oid(value: bytes) -> str:
+    return hashlib.sha1(f"blob {len(value)}\0".encode() + value).hexdigest()
 
 
 def nontrivial_hex(value: str, pattern: re.Pattern[str], label: str) -> str:
@@ -674,11 +830,16 @@ def owned_feature_closure(features: Mapping[str, Mapping[str, Any]]) -> list[str
         isinstance(name, str) and isinstance(entry, Mapping) for name, entry in features.items()
     ):
         raise HarnessError("feature snapshot is malformed")
-    return sorted(
-        name
-        for name, entry in features.items()
-        if name in FEATURE_ORDER or entry.get("parent") in FEATURE_ORDER
-    )
+    result: list[str] = []
+    for name, entry in features.items():
+        parent = entry.get("parent")
+        if name in FEATURE_ORDER:
+            result.append(name)
+        elif parent in FEATURE_ORDER:
+            if name not in OWNED_FEATURE_CHILDREN[parent]:
+                raise HarnessError("feature snapshot contains an unreviewed owned child")
+            result.append(name)
+    return sorted(result)
 
 
 def normalize_bpf(items: Any, kind: str) -> list[dict[str, Any]]:
@@ -1588,9 +1749,14 @@ def recovery_steps_from_restore(restore: Sequence[Mapping[str, Any]]) -> list[di
     return steps
 
 
-def iperf_steps(spec: CoreSpec, cell_name: str) -> list[dict[str, Any]]:
+def iperf_steps(
+    spec: CoreSpec,
+    cell_name: str,
+    checker: Mapping[str, str] | None = None,
+) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
-    checker = iperf_checker_contract()
+    if checker is None:
+        checker = iperf_checker_contract()
     for streams in (1, 4, 16):
         for direction in ("forward", "reverse", "bidir"):
             argv = [
@@ -1638,7 +1804,13 @@ def iperf_steps(spec: CoreSpec, cell_name: str) -> list[dict[str, Any]]:
     return steps
 
 
-def feature_cell(spec: CoreSpec, snapshot: Mapping[str, Any], name: str, policy: str) -> dict[str, Any]:
+def feature_cell(
+    spec: CoreSpec,
+    snapshot: Mapping[str, Any],
+    name: str,
+    policy: str,
+    checker: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     mutation, restore, expected, unsupported = ethtool_steps(spec, snapshot, policy, name)
     recovery_restore = recovery_steps_from_restore(restore)
     return {
@@ -1658,7 +1830,7 @@ def feature_cell(spec: CoreSpec, snapshot: Mapping[str, Any], name: str, policy:
         "expected_mtu": spec.expected_mtu,
         "monitor_before": monitor_steps(spec, name, "before"),
         "monitor_after": monitor_steps(spec, name, "after"),
-        "traffic": iperf_steps(spec, name),
+        "traffic": iperf_steps(spec, name, checker),
         "evidence_limits": [
             "real TCP traffic and NIC feature configuration only",
             "does not prove skb CHECKSUM_NONE/PARTIAL at the FakeTCP transform",
@@ -1815,7 +1987,12 @@ def ping_step(spec: CoreSpec, cell: str, mtu: int, positive: bool) -> dict[str, 
     return step
 
 
-def mtu_cell(spec: CoreSpec, name: str, target_mtu: int) -> dict[str, Any]:
+def mtu_cell(
+    spec: CoreSpec,
+    name: str,
+    target_mtu: int,
+    checker: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     mutation: list[dict[str, Any]] = []
     restore: list[dict[str, Any]] = []
     if target_mtu != spec.expected_mtu:
@@ -1838,7 +2015,7 @@ def mtu_cell(spec: CoreSpec, name: str, target_mtu: int) -> dict[str, Any]:
             )
         )
     traffic = [ping_step(spec, name, target_mtu, True), ping_step(spec, name, target_mtu, False)]
-    iperf = iperf_steps(spec, name)
+    iperf = iperf_steps(spec, name, checker)
     traffic.extend(step for step in iperf if step["streams"] == 4 and step["direction"] == "bidir")
     recovery_restore = recovery_steps_from_restore(restore)
     return {
@@ -1875,7 +2052,11 @@ def soak_timing_contract(spec: CoreSpec) -> dict[str, int]:
     }
 
 
-def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
+def soak_cell(
+    spec: CoreSpec,
+    snapshot: Mapping[str, Any],
+    checker: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
     name = "tcp-soak-all-on"
     mutation, restore, expected, unsupported = ethtool_steps(spec, snapshot, "all-on", name)
     windows = spec.soak_seconds // spec.soak_window_seconds
@@ -1904,7 +2085,8 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
     )
     ping.update({"kind": "ping-monitor", "parallel_group": name})
     traffic.append(ping)
-    checker = iperf_checker_contract()
+    if checker is None:
+        checker = iperf_checker_contract()
     for window in range(windows):
         argv = [
             TOOLS["timeout"],
@@ -2001,16 +2183,23 @@ def blocked_cells() -> list[dict[str, Any]]:
     ]
 
 
-def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: list[dict[str, Any]]) -> dict[str, Any]:
+def build_plan(
+    spec: CoreSpec,
+    snapshot: Mapping[str, Any],
+    snapshot_commands: list[dict[str, Any]],
+    *,
+    traffic_oracle: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    checker = dict(traffic_oracle) if traffic_oracle is not None else iperf_checker_contract()
     cells = [
-        feature_cell(spec, snapshot, "tcp-original", "original"),
-        feature_cell(spec, snapshot, "tcp-all-on", "all-on"),
-        feature_cell(spec, snapshot, "tcp-all-off", "all-off"),
-        feature_cell(spec, snapshot, "tcp-tx-path", "tx-path"),
-        feature_cell(spec, snapshot, "tcp-rx-path", "rx-path"),
-        mtu_cell(spec, "tcp-mtu-low", spec.mtu_low),
-        mtu_cell(spec, "tcp-mtu-original", spec.expected_mtu),
-        soak_cell(spec, snapshot),
+        feature_cell(spec, snapshot, "tcp-original", "original", checker),
+        feature_cell(spec, snapshot, "tcp-all-on", "all-on", checker),
+        feature_cell(spec, snapshot, "tcp-all-off", "all-off", checker),
+        feature_cell(spec, snapshot, "tcp-tx-path", "tx-path", checker),
+        feature_cell(spec, snapshot, "tcp-rx-path", "rx-path", checker),
+        mtu_cell(spec, "tcp-mtu-low", spec.mtu_low, checker),
+        mtu_cell(spec, "tcp-mtu-original", spec.expected_mtu, checker),
+        soak_cell(spec, snapshot, checker),
     ]
     cells.extend(blocked_cells())
     files = {
@@ -2064,7 +2253,7 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         entry["operations"] = [list(argv) for argv in entry["operations"]]
     identity = lease_identity(spec, snapshot)
     lease_path = interface_lease_path(spec, identity["netns"])
-    traffic_oracle = iperf_checker_contract()
+    traffic_oracle = checker
     guard_commands = [
         {"label": label, "argv": argv, "timeout_seconds": 20, "write_set": []}
         for label, argv in write_guard_command_table(spec)
@@ -2138,7 +2327,549 @@ def parser() -> argparse.ArgumentParser:
         if mode in {"run", "restore"}:
             child.add_argument("--approved-plan", required=True)
             child.add_argument("--approved-plan-sha256", required=True)
+    capture = modes.add_parser("capture-local")
+    capture.add_argument("--source-commit", required=True)
+    capture.add_argument("--manifest", required=True)
+    capture.add_argument("--manifest-sha256", required=True)
     return result
+
+
+def validate_local_package_directory(
+    path: str,
+    descriptor: int,
+    expected_identity: tuple[int, int] | None = None,
+) -> os.stat_result:
+    metadata = os.fstat(descriptor)
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o700
+    ):
+        raise HarnessError("local package directory must be caller-owned mode 0700")
+    current = os.lstat(path)
+    if stat.S_ISLNK(current.st_mode) or (current.st_dev, current.st_ino) != (
+        metadata.st_dev,
+        metadata.st_ino,
+    ):
+        raise HarnessError("local package directory changed while publishing")
+    if expected_identity is not None and (metadata.st_dev, metadata.st_ino) != expected_identity:
+        raise HarnessError("local package directory identity changed after manifest validation")
+    return metadata
+
+
+def read_exact_descriptor(descriptor: int, size: int, label: str) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = os.read(descriptor, min(remaining, 1 << 20))
+        if not chunk:
+            raise HarnessError(f"{label} was truncated while reading")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    if os.read(descriptor, 1):
+        raise HarnessError(f"{label} grew while reading")
+    return b"".join(chunks)
+
+
+def load_local_capture_manifest(
+    manifest_path: str,
+    manifest_sha256: str,
+    source_commit: str,
+) -> tuple[dict[str, str], str, int, tuple[int, int], dict[str, tuple[int, int] | int | str]]:
+    nontrivial_hex(source_commit, COMMIT_RE, "source-commit")
+    nontrivial_hex(manifest_sha256, SHA256_RE, "manifest-sha256")
+    if os.geteuid() == 0:
+        raise HarnessError("capture-local is prohibited for root or staged publishers")
+    package_dir = f"{LOCAL_PACKAGE_PREFIX}{source_commit[:12]}"
+    expected_manifest = f"{package_dir}/{LOCAL_PACKAGE_MANIFEST}"
+    expected_self = f"{package_dir}/{LOCAL_PUBLISHER_NAME}"
+    if manifest_path != expected_manifest or os.path.normpath(manifest_path) != manifest_path:
+        raise HarnessError("capture manifest is not the fixed local package manifest")
+    if os.path.realpath(package_dir) != package_dir:
+        raise HarnessError("local package directory is not canonical")
+    if os.path.abspath(__file__) != expected_self or os.path.realpath(__file__) != expected_self:
+        raise HarnessError("capture-local must execute the manifest-bound local package copy")
+
+    directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        directory = os.open(package_dir, directory_flags)
+    except OSError as exc:
+        raise HarnessError(f"cannot open local package directory: {exc}") from exc
+    keep_directory = False
+    try:
+        directory_metadata = validate_local_package_directory(package_dir, directory)
+        read_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            manifest = os.open(LOCAL_PACKAGE_MANIFEST, read_flags, dir_fd=directory)
+        except OSError as exc:
+            raise HarnessError(f"cannot open local package manifest: {exc}") from exc
+        try:
+            manifest_metadata = os.fstat(manifest)
+            if (
+                not stat.S_ISREG(manifest_metadata.st_mode)
+                or manifest_metadata.st_uid != os.geteuid()
+                or manifest_metadata.st_gid != directory_metadata.st_gid
+                or stat.S_IMODE(manifest_metadata.st_mode) != 0o600
+                or manifest_metadata.st_nlink != 1
+                or not 0 < manifest_metadata.st_size <= 1 << 20
+            ):
+                raise HarnessError("local package manifest has an invalid shape")
+            payload = read_exact_descriptor(
+                manifest,
+                manifest_metadata.st_size,
+                "local package manifest",
+            )
+            current_manifest = os.stat(
+                LOCAL_PACKAGE_MANIFEST,
+                dir_fd=directory,
+                follow_symlinks=False,
+            )
+            if (current_manifest.st_dev, current_manifest.st_ino) != (
+                manifest_metadata.st_dev,
+                manifest_metadata.st_ino,
+            ):
+                raise HarnessError("local package manifest changed while reading")
+        finally:
+            os.close(manifest)
+        if sha256_bytes(payload) != manifest_sha256:
+            raise HarnessError("local package manifest SHA-256 mismatch")
+        try:
+            text = payload.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HarnessError("local package manifest is not UTF-8") from exc
+        if not text.endswith("\n") or "\r" in text or "\x00" in text:
+            raise HarnessError("local package manifest encoding is not canonical")
+        lines = text[:-1].split("\n")
+        if len(lines) != len(PACKAGE_MANIFEST_KEYS):
+            raise HarnessError("local package manifest field count is not exact")
+        values: dict[str, str] = {}
+        for line, expected_key in zip(lines, PACKAGE_MANIFEST_KEYS):
+            fields = line.split("\t")
+            if len(fields) != 2 or fields[0] != expected_key or not fields[1]:
+                raise HarnessError(f"local package manifest field is not exact: {expected_key}")
+            values[expected_key] = fields[1]
+        if (
+            values["format"] != "wg-mix-ebpf-b82-v6-package-v4"
+            or values["run_id"] != "c8e41d73"
+            or values["package_id"] != "4f2a9b61"
+            or values["integration_commit"] != source_commit
+            or values["local_package_dir"] != package_dir
+            or values["remote_source"] != "/run/wg-mix-ebpf-source-stages/c8e41d73/source"
+            or values["check_realhost_iperf_py_path"]
+            != "scripts/realhost-b82-c8e41d73/check-realhost-iperf.py"
+            or values["realnic_acceptance_py_path"]
+            != "scripts/realhost-b82-acceptance-v1/realnic_acceptance.py"
+        ):
+            raise HarnessError("local package manifest capture binding is not exact")
+        nontrivial_hex(values["realnic_acceptance_py_blob"], COMMIT_RE, "publisher-blob")
+        nontrivial_hex(values["realnic_acceptance_py_sha256"], SHA256_RE, "publisher-sha256")
+        nontrivial_hex(
+            values["check_realhost_iperf_py_sha256"],
+            SHA256_RE,
+            "traffic-oracle-sha256",
+        )
+
+        try:
+            publisher = os.open(LOCAL_PUBLISHER_NAME, read_flags, dir_fd=directory)
+        except OSError as exc:
+            raise HarnessError(f"cannot open local capture publisher: {exc}") from exc
+        try:
+            publisher_metadata = os.fstat(publisher)
+            if (
+                not stat.S_ISREG(publisher_metadata.st_mode)
+                or publisher_metadata.st_uid != os.geteuid()
+                or publisher_metadata.st_gid != directory_metadata.st_gid
+                or stat.S_IMODE(publisher_metadata.st_mode) != 0o600
+                or publisher_metadata.st_nlink != 1
+                or not 0 < publisher_metadata.st_size <= 16 << 20
+            ):
+                raise HarnessError("local capture publisher has an invalid shape")
+            publisher_payload = read_exact_descriptor(
+                publisher,
+                publisher_metadata.st_size,
+                "local capture publisher",
+            )
+            current_publisher = os.stat(
+                LOCAL_PUBLISHER_NAME,
+                dir_fd=directory,
+                follow_symlinks=False,
+            )
+            if (current_publisher.st_dev, current_publisher.st_ino) != (
+                publisher_metadata.st_dev,
+                publisher_metadata.st_ino,
+            ):
+                raise HarnessError("local capture publisher changed while reading")
+        finally:
+            os.close(publisher)
+        if sha256_bytes(publisher_payload) != values["realnic_acceptance_py_sha256"]:
+            raise HarnessError("local capture publisher SHA-256 mismatch")
+        if git_blob_oid(publisher_payload) != values["realnic_acceptance_py_blob"]:
+            raise HarnessError("local capture publisher Git blob mismatch")
+        directory_identity = (directory_metadata.st_dev, directory_metadata.st_ino)
+        validate_local_package_directory(package_dir, directory, directory_identity)
+        binding: dict[str, tuple[int, int] | int | str] = {
+            "manifest_identity": (manifest_metadata.st_dev, manifest_metadata.st_ino),
+            "manifest_size": manifest_metadata.st_size,
+            "manifest_sha256": manifest_sha256,
+            "publisher_identity": (publisher_metadata.st_dev, publisher_metadata.st_ino),
+            "publisher_size": publisher_metadata.st_size,
+            "publisher_sha256": values["realnic_acceptance_py_sha256"],
+        }
+        keep_directory = True
+        return values, package_dir, directory, directory_identity, binding
+    finally:
+        if not keep_directory:
+            os.close(directory)
+
+
+def acquire_local_publish_lock(directory: int, timeout_seconds: float = 30.0) -> None:
+    deadline = time.monotonic() + timeout_seconds
+    while True:
+        try:
+            fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise HarnessError("local plan publisher lock is busy")
+            time.sleep(0.05)
+        except OSError as exc:
+            raise HarnessError(f"cannot acquire local plan publisher lock: {exc}") from exc
+
+
+def revalidate_local_capture_file(
+    directory: int,
+    name: str,
+    identity: tuple[int, int],
+    expected_size: int,
+    expected_sha256: str,
+) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory)
+    except OSError as exc:
+        raise HarnessError(f"cannot re-open local capture binding {name}: {exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        package_metadata = os.fstat(directory)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_gid != package_metadata.st_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or metadata.st_size != expected_size
+            or (metadata.st_dev, metadata.st_ino) != identity
+        ):
+            raise HarnessError(f"local capture binding changed shape: {name}")
+        payload = read_exact_descriptor(descriptor, metadata.st_size, f"local capture binding {name}")
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != identity:
+            raise HarnessError(f"local capture binding path changed: {name}")
+    finally:
+        os.close(descriptor)
+    if sha256_bytes(payload) != expected_sha256:
+        raise HarnessError(f"local capture binding content changed: {name}")
+
+
+def revalidate_local_capture_binding(
+    package_dir: str,
+    directory: int,
+    directory_identity: tuple[int, int],
+    binding: Mapping[str, tuple[int, int] | int | str],
+) -> None:
+    validate_local_package_directory(package_dir, directory, directory_identity)
+    manifest_identity = binding["manifest_identity"]
+    publisher_identity = binding["publisher_identity"]
+    if not isinstance(manifest_identity, tuple) or not isinstance(publisher_identity, tuple):
+        raise HarnessError("local capture binding identities are malformed")
+    revalidate_local_capture_file(
+        directory,
+        LOCAL_PACKAGE_MANIFEST,
+        manifest_identity,
+        int(binding["manifest_size"]),
+        str(binding["manifest_sha256"]),
+    )
+    revalidate_local_capture_file(
+        directory,
+        LOCAL_PUBLISHER_NAME,
+        publisher_identity,
+        int(binding["publisher_size"]),
+        str(binding["publisher_sha256"]),
+    )
+    validate_local_package_directory(package_dir, directory, directory_identity)
+
+
+def read_capture_candidate(maximum: int = 16 << 20) -> bytes:
+    chunks: list[bytes] = []
+    total = 0
+    while True:
+        chunk = sys.stdin.buffer.read(min(1 << 20, maximum + 1 - total))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > maximum:
+            raise HarnessError("captured plan exceeds the 16 MiB limit")
+    payload = b"".join(chunks)
+    if not payload:
+        raise HarnessError("captured plan is empty")
+    return payload
+
+
+def read_local_plan_at(
+    directory: int,
+    name: str,
+    expected_payload: bytes,
+    *,
+    expected_links: int = 1,
+) -> os.stat_result:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory)
+    except OSError as exc:
+        raise HarnessError(f"cannot open published local plan: {exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        package_metadata = os.fstat(directory)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_gid != package_metadata.st_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != expected_links
+            or metadata.st_size != len(expected_payload)
+        ):
+            raise HarnessError("published local plan has an invalid shape")
+        payload = read_exact_descriptor(descriptor, metadata.st_size, "published local plan")
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise HarnessError("published local plan changed while reading")
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+    if payload != expected_payload:
+        raise HarnessError("published local plan differs from its content address")
+    return metadata
+
+
+def local_lstat_at(directory: int, name: str) -> os.stat_result | None:
+    try:
+        return os.stat(name, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise HarnessError(f"cannot inspect local publish path {name}: {exc}") from exc
+
+
+def complete_local_plan_pending(directory: int, name: str, payload: bytes) -> os.stat_result:
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+    created = False
+    try:
+        descriptor = os.open(name, flags, dir_fd=directory)
+    except FileNotFoundError:
+        try:
+            descriptor = os.open(
+                name,
+                flags | os.O_CREAT | os.O_EXCL,
+                0o600,
+                dir_fd=directory,
+            )
+            created = True
+        except OSError as exc:
+            raise HarnessError(f"exclusive local plan pending create failed: {exc}") from exc
+    except OSError as exc:
+        raise HarnessError(f"cannot open local plan pending file: {exc}") from exc
+    try:
+        if created:
+            os.fchmod(descriptor, 0o600)
+        metadata = os.fstat(descriptor)
+        package_metadata = os.fstat(directory)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or metadata.st_gid != package_metadata.st_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+            or metadata.st_nlink != 1
+            or metadata.st_size > len(payload)
+        ):
+            raise HarnessError("local plan pending file has an invalid shape")
+        prefix = read_exact_descriptor(descriptor, metadata.st_size, "local plan pending prefix")
+        if prefix != payload[: metadata.st_size]:
+            raise HarnessError("local plan pending file is not an exact payload prefix")
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (current.st_dev, current.st_ino) != (metadata.st_dev, metadata.st_ino):
+            raise HarnessError("local plan pending path changed before completion")
+        os.lseek(descriptor, metadata.st_size, os.SEEK_SET)
+        offset = metadata.st_size
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise HarnessError("local plan pending completion made no progress")
+            offset += written
+        os.fsync(descriptor)
+        final = os.fstat(descriptor)
+        current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+        if (
+            final.st_nlink != 1
+            or final.st_size != len(payload)
+            or (current.st_dev, current.st_ino) != (final.st_dev, final.st_ino)
+        ):
+            raise HarnessError("local plan pending path changed during completion")
+        identity = (final.st_dev, final.st_ino)
+    finally:
+        os.close(descriptor)
+    verified = read_local_plan_at(directory, name, payload)
+    if (verified.st_dev, verified.st_ino) != identity:
+        raise HarnessError("local plan pending file was replaced after completion")
+    return verified
+
+
+def publish_local_plan(
+    package_dir: str,
+    directory: int,
+    directory_identity: tuple[int, int],
+    payload: bytes,
+    digest: str,
+) -> tuple[str, bool]:
+    nontrivial_hex(digest, SHA256_RE, "approved-plan-sha256")
+    name = f"{LOCAL_PLAN_PREFIX}{digest}.json"
+    pending_name = f"{name}.pending"
+    path = f"{package_dir}/{name}"
+    validate_local_package_directory(package_dir, directory, directory_identity)
+    final_state = local_lstat_at(directory, name)
+    pending_state = local_lstat_at(directory, pending_name)
+    if final_state is not None:
+        already_present = True
+        if pending_state is None:
+            final = read_local_plan_at(directory, name, payload)
+            identity = (final.st_dev, final.st_ino)
+            os.fsync(directory)
+            validate_local_package_directory(package_dir, directory, directory_identity)
+            final = read_local_plan_at(directory, name, payload)
+            if (final.st_dev, final.st_ino) != identity:
+                raise HarnessError("published local plan identity drifted")
+            return path, already_present
+        final = read_local_plan_at(directory, name, payload, expected_links=2)
+        pending = read_local_plan_at(directory, pending_name, payload, expected_links=2)
+        identity = (final.st_dev, final.st_ino)
+        if (pending.st_dev, pending.st_ino) != identity:
+            raise HarnessError("post-link local plan pending is not the final plan inode")
+    else:
+        already_present = False
+        pending = complete_local_plan_pending(directory, pending_name, payload)
+        identity = (pending.st_dev, pending.st_ino)
+        validate_local_package_directory(package_dir, directory, directory_identity)
+        try:
+            os.link(
+                pending_name,
+                name,
+                src_dir_fd=directory,
+                dst_dir_fd=directory,
+                follow_symlinks=False,
+            )
+        except FileExistsError:
+            final = read_local_plan_at(directory, name, payload, expected_links=2)
+            linked_pending = read_local_plan_at(
+                directory,
+                pending_name,
+                payload,
+                expected_links=2,
+            )
+            if (
+                (final.st_dev, final.st_ino) != identity
+                or (linked_pending.st_dev, linked_pending.st_ino) != identity
+            ):
+                raise HarnessError("concurrent local plan publish used a different inode")
+        except OSError as exc:
+            raise HarnessError(f"no-clobber local plan link failed: {exc}") from exc
+        final = read_local_plan_at(directory, name, payload, expected_links=2)
+        linked_pending = read_local_plan_at(
+            directory,
+            pending_name,
+            payload,
+            expected_links=2,
+        )
+        if (
+            (final.st_dev, final.st_ino) != identity
+            or (linked_pending.st_dev, linked_pending.st_ino) != identity
+        ):
+            raise HarnessError("local plan no-clobber link identity is invalid")
+
+    os.fsync(directory)
+    validate_local_package_directory(package_dir, directory, directory_identity)
+    final = read_local_plan_at(directory, name, payload, expected_links=2)
+    pending = read_local_plan_at(directory, pending_name, payload, expected_links=2)
+    if (final.st_dev, final.st_ino) != identity or (pending.st_dev, pending.st_ino) != identity:
+        raise HarnessError("local plan post-link identity drifted before pending removal")
+    try:
+        os.unlink(pending_name, dir_fd=directory)
+    except OSError as exc:
+        raise HarnessError(f"exact local plan pending unlink failed: {exc}") from exc
+    os.fsync(directory)
+    validate_local_package_directory(package_dir, directory, directory_identity)
+    if local_lstat_at(directory, pending_name) is not None:
+        raise HarnessError("local plan pending name remains after exact unlink")
+    final = read_local_plan_at(directory, name, payload)
+    if (final.st_dev, final.st_ino) != identity:
+        raise HarnessError("local plan final identity drifted after durable publication")
+    return path, already_present
+
+
+def capture_local_mode(
+    source_commit: str,
+    manifest_path: str,
+    manifest_sha256: str,
+) -> int:
+    values, package_dir, directory, directory_identity, binding = load_local_capture_manifest(
+        manifest_path,
+        manifest_sha256,
+        source_commit,
+    )
+    try:
+        payload = read_capture_candidate()
+        try:
+            plan = json.loads(payload)
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HarnessError("captured plan is not JSON") from exc
+        if not isinstance(plan, dict) or canonical_json(plan) != payload:
+            raise HarnessError("captured plan is not one canonical JSON object")
+        if plan.get("schema") != SCHEMA:
+            raise HarnessError("captured plan schema is not exact")
+        spec = controller_spec_from_plan(plan, source_commit)
+        expected_oracle = {
+            "path": f'{values["remote_source"]}/{values["check_realhost_iperf_py_path"]}',
+            "sha256": values["check_realhost_iperf_py_sha256"],
+        }
+        validate_plan_shape(plan, spec, expected_traffic_oracle=expected_oracle)
+        digest = sha256_bytes(payload)
+        acquire_local_publish_lock(directory)
+        revalidate_local_capture_binding(
+            package_dir,
+            directory,
+            directory_identity,
+            binding,
+        )
+        path, already_present = publish_local_plan(
+            package_dir,
+            directory,
+            directory_identity,
+            payload,
+            digest,
+        )
+        revalidate_local_capture_binding(
+            package_dir,
+            directory,
+            directory_identity,
+            binding,
+        )
+        print(
+            "REALNIC_CAPTURE_LOCAL_PUBLISHED "
+            f"path={path} sha256={digest} bytes={len(payload)} existing={int(already_present)} "
+            "approval_required=1 automatic_approval=0"
+        )
+        return 0
+    finally:
+        os.close(directory)
 
 
 def reject_ambiguous_cli(argv: Sequence[str]) -> None:
@@ -2367,7 +3098,9 @@ def controller_plan_mode(source_commit: str, runner: CommandRunner) -> int:
     with PhysicalInterfaceLock(physical_interface_lock_path()):
         validate_legacy_retirement_reservation()
         spec, snapshot, commands = collect_controller_plan_snapshot(source_commit, runner)
-        sys.stdout.buffer.write(canonical_json(build_plan(spec, snapshot, commands)))
+        plan = build_plan(spec, snapshot, commands)
+        validate_plan_shape(plan, spec)
+        sys.stdout.buffer.write(canonical_json(plan))
     return 0
 
 
@@ -2400,26 +3133,173 @@ def controller_approved_mode(
         )
 
 
-def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
+def validate_canonical_evidence(value: Any, label: str) -> None:
+    if value is None or isinstance(value, (bool, int)):
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise HarnessError(f"approved plan {label} contains a non-finite number")
+        return
+    if isinstance(value, str):
+        if "\x00" in value or "\r" in value:
+            raise HarnessError(f"approved plan {label} contains a prohibited string")
+        return
+    if isinstance(value, list):
+        for item in value:
+            validate_canonical_evidence(item, label)
+        return
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if not isinstance(key, str) or "\x00" in key or "\r" in key:
+                raise HarnessError(f"approved plan {label} contains a prohibited key")
+            validate_canonical_evidence(item, label)
+        return
+    raise HarnessError(f"approved plan {label} contains a non-JSON value")
+
+
+def validate_projected_baseline(snapshot: Mapping[str, Any]) -> None:
+    address_item_keys = {"ifindex", "ifname", "addr_info"}
+    address_entry_keys = {"family", "local", "prefixlen", "scope", "label", "flags", "broadcast"}
+    route_keys = {
+        "dst",
+        "gateway",
+        "dev",
+        "prefsrc",
+        "src",
+        "table",
+        "protocol",
+        "scope",
+        "type",
+        "metric",
+        "mtu",
+    }
+    bpf_keys = {
+        "bpf_links": {"id", "type", "prog_id", "ifindex", "attach_type", "netns_ino"},
+        "bpf_programs": {"id", "type", "name", "map_ids", "btf_id", "tag"},
+        "bpf_maps": {"id", "type", "name", "key", "value", "max_entries", "btf_id"},
+    }
+    for item in snapshot["addresses"]:
+        if not isinstance(item, dict) or "addr_info" not in item or not set(item) <= address_item_keys:
+            raise HarnessError("approved plan normalized address item is not exact")
+        if not isinstance(item["addr_info"], list):
+            raise HarnessError("approved plan normalized addr_info is not an array")
+        for address in item["addr_info"]:
+            if not isinstance(address, dict) or not set(address) <= address_entry_keys:
+                raise HarnessError("approved plan normalized address entry is not exact")
+    for field in ("routes", "peer_route"):
+        for item in snapshot[field]:
+            if not isinstance(item, dict) or not set(item) <= route_keys:
+                raise HarnessError(f"approved plan normalized {field} item is not exact")
+    for field, allowed_keys in bpf_keys.items():
+        for item in snapshot[field]:
+            if not isinstance(item, dict) or not set(item) <= allowed_keys:
+                raise HarnessError(f"approved plan normalized {field} item is not exact")
+    for field in ("addresses", "routes", "peer_route", *bpf_keys):
+        value = snapshot[field]
+        validate_canonical_evidence(value, field)
+        if stable_sort(value) != value:
+            raise HarnessError(f"approved plan normalized {field} order is not canonical")
+
+    wg_interfaces = snapshot["wg_interfaces"]
+    if (
+        not all(isinstance(name, str) and IFNAME_RE.fullmatch(name) for name in wg_interfaces)
+        or wg_interfaces != sorted(set(wg_interfaces))
+    ):
+        raise HarnessError("approved plan WireGuard interface evidence is not canonical")
+    nic_stat_keys = snapshot["nic_stat_keys"]
+    nic_key_re = re.compile(
+        r"^(?:global|(?:tx|rx)_queue_(?:0|[1-9][0-9]*))\.[a-z0-9]+(?:_[a-z0-9]+)*$"
+    )
+    if (
+        not nic_stat_keys
+        or not all(isinstance(name, str) and nic_key_re.fullmatch(name) for name in nic_stat_keys)
+        or nic_stat_keys != sorted(set(nic_stat_keys))
+    ):
+        raise HarnessError("approved plan NIC counter key evidence is not canonical")
+    link_stat_keys = snapshot["link_stat_keys"]
+    link_key_re = re.compile(r"^(?:rx|tx)_[a-z0-9]+(?:_[a-z0-9]+)*$")
+    if (
+        not link_stat_keys
+        or not all(isinstance(name, str) and link_key_re.fullmatch(name) for name in link_stat_keys)
+        or link_stat_keys != sorted(set(link_stat_keys))
+    ):
+        raise HarnessError("approved plan link counter key evidence is not canonical")
+
+    for field in ("link", "qdisc", "tc_ingress", "tc_egress"):
+        value = snapshot[field]
+        validate_canonical_evidence(value, field)
+        if stable_sort(value) != value:
+            raise HarnessError(f"approved plan opaque {field} evidence is not canonical")
+
+
+def validate_plan_baseline_shape(snapshot: Any, spec: CoreSpec) -> None:
+    if not isinstance(snapshot, dict) or set(snapshot) != BASELINE_TOP_LEVEL_KEYS:
+        raise HarnessError("approved plan baseline top-level contract is not exact")
+    host = snapshot.get("host")
+    identity = snapshot.get("interface_identity")
+    features = snapshot.get("features")
+    if not isinstance(host, dict) or set(host) != BASELINE_HOST_KEYS:
+        raise HarnessError("approved plan baseline host contract is not exact")
+    if not isinstance(identity, dict) or set(identity) != BASELINE_INTERFACE_KEYS:
+        raise HarnessError("approved plan baseline interface contract is not exact")
+    if not isinstance(features, dict) or not features:
+        raise HarnessError("approved plan baseline feature contract is not exact")
+    for name, feature in features.items():
+        if (
+            not isinstance(name, str)
+            or re.fullmatch(r"[a-z0-9][a-z0-9_-]*", name) is None
+            or not isinstance(feature, dict)
+            or set(feature) != BASELINE_FEATURE_KEYS
+            or not isinstance(feature["enabled"], bool)
+            or not isinstance(feature["fixed"], bool)
+            or feature["parent"] is not None
+            and not isinstance(feature["parent"], str)
+        ):
+            raise HarnessError("approved plan baseline feature entry is not exact")
+    if not set(FEATURE_ORDER) <= set(features):
+        raise HarnessError("approved plan baseline omits a required feature")
+    for feature in features.values():
+        parent = feature["parent"]
+        if parent is not None and (
+            parent not in features or features[parent]["parent"] is not None
+        ):
+            raise HarnessError("approved plan baseline feature parent is not exact")
+    for name, feature in features.items():
+        parent = feature["parent"]
+        if parent in FEATURE_ORDER and name not in OWNED_FEATURE_CHILDREN[parent]:
+            raise HarnessError("approved plan baseline owned feature child is not reviewed")
+    for field in BASELINE_TOP_LEVEL_KEYS - {"host", "interface_identity", "features"}:
+        if not isinstance(snapshot[field], list):
+            raise HarnessError(f"approved plan baseline {field} is not an array")
+    validate_projected_baseline(snapshot)
+    validate_snapshot_identity(spec, snapshot)
+
+
+def validate_plan_shape(
+    plan: Mapping[str, Any],
+    spec: CoreSpec,
+    *,
+    expected_traffic_oracle: Mapping[str, str] | None = None,
+) -> None:
+    if set(plan) != PLAN_TOP_LEVEL_KEYS:
+        raise HarnessError("approved plan top-level contract is not exact")
     if plan.get("execution_profile") != spec.profile:
         raise HarnessError("approved plan execution profile is not exact")
     if plan.get("counter_failure_policy") != counter_failure_policy():
         raise HarnessError("approved plan counter failure policy is not exact")
     baseline = plan.get("baseline")
-    if not isinstance(baseline, dict):
-        raise HarnessError("approved plan has no baseline")
+    validate_plan_baseline_shape(baseline, spec)
     if plan.get("owned_feature_closure") != owned_feature_closure(baseline.get("features", {})):
         raise HarnessError("approved plan owned feature closure is not exact")
     if plan.get("counter_gate") != counter_gate_contract(baseline):
         raise HarnessError("approved plan counter gate is not exact")
     oracle_contract = plan.get("traffic_oracle")
-    if (
-        not isinstance(oracle_contract, dict)
-        or oracle_contract.get("path") != iperf_checker_path()
-        or not isinstance(oracle_contract.get("sha256"), str)
-        or not SHA256_RE.fullmatch(oracle_contract["sha256"])
-        or set(oracle_contract) != {"path", "sha256"}
-    ):
+    expected_oracle = (
+        dict(expected_traffic_oracle)
+        if expected_traffic_oracle is not None
+        else iperf_checker_contract()
+    )
+    if oracle_contract != expected_oracle or set(expected_oracle) != {"path", "sha256"}:
         raise HarnessError("approved plan traffic oracle contract is not exact")
     expected_identity = lease_identity(spec, baseline)
     if plan.get("physical_interface_lock") != physical_interface_lock_contract(spec, baseline):
@@ -2446,7 +3326,11 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
         if write_set.get(field) != []:
             raise HarnessError(f"approved plan unexpectedly writes {field}")
     filesystem = write_set.get("filesystem")
-    if not isinstance(filesystem, list) or len(filesystem) != len(set(filesystem)):
+    if (
+        not isinstance(filesystem, list)
+        or not all(isinstance(path, str) for path in filesystem)
+        or len(filesystem) != len(set(filesystem))
+    ):
         raise HarnessError("filesystem write set is not a unique array")
     allowed_roots = {spec.run_root, f"{spec.run_root}/logs"}
     for path in filesystem:
@@ -2554,11 +3438,23 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
                 raise HarnessError("first-hour soak oracle is not exact")
             if expected_soak_oracle is not None:
                 validate_step(expected_soak_oracle, filesystem_set)
+    expected_commands = [
+        {"label": label, "argv": argv, "timeout_seconds": 20, "write_set": []}
+        for label, argv in snapshot_command_table(spec)
+    ]
+    expected_plan = build_plan(
+        spec,
+        baseline,
+        expected_commands,
+        traffic_oracle=expected_oracle,
+    )
+    if plan != expected_plan:
+        raise HarnessError("approved plan recursive contract is not exact")
 
 
 def validate_step(step: Mapping[str, Any], filesystem_set: set[str]) -> None:
     required = {"label", "argv", "timeout_seconds", "expect_rc", "stdout", "stderr", "target"}
-    if not required.issubset(step):
+    if not isinstance(step, Mapping) or not required.issubset(step):
         raise HarnessError("planned command is incomplete")
     argv = step["argv"]
     if not isinstance(argv, list) or not argv or not all(isinstance(value, str) for value in argv):
@@ -4377,6 +5273,12 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner | None = None)
         with TerminationBoundary():
             reject_ambiguous_cli(raw_argv)
             namespace = parser().parse_args(raw_argv)
+            if namespace.mode == "capture-local":
+                return capture_local_mode(
+                    namespace.source_commit,
+                    namespace.manifest,
+                    namespace.manifest_sha256,
+                )
             actual_runner = runner or CommandRunner()
             if namespace.mode == "plan":
                 return controller_plan_mode(namespace.source_commit, actual_runner)
@@ -4389,6 +5291,9 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner | None = None)
             )
     except HarnessError as exc:
         print(f"REALNIC_ACCEPTANCE_STOP reason={exc}", file=sys.stderr)
+        return 125
+    except OSError as exc:
+        print(f"REALNIC_ACCEPTANCE_STOP reason=local-io-error:{exc}", file=sys.stderr)
         return 125
 
 

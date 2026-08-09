@@ -64,6 +64,18 @@ proc load_manifest {path expected_sha} {
         test_realnic_acceptance_static_py_blob test_realnic_acceptance_static_py_sha256
         provision_ubuntu_test_host_sh_path
         provision_ubuntu_test_host_sh_blob provision_ubuntu_test_host_sh_sha256
+        root_veth_n_r_sh_path root_veth_n_r_sh_blob root_veth_n_r_sh_sha256
+        test_hermetic_veth_runner_sh_path test_hermetic_veth_runner_sh_blob
+        test_hermetic_veth_runner_sh_sha256 test_veth_runner_static_py_path
+        test_veth_runner_static_py_blob test_veth_runner_static_py_sha256
+        controller_seam_sh_path controller_seam_sh_blob controller_seam_sh_sha256
+        root_routed_veth_n_r_sh_path root_routed_veth_n_r_sh_blob
+        root_routed_veth_n_r_sh_sha256 test_hermetic_routed_veth_harness_sh_path
+        test_hermetic_routed_veth_harness_sh_blob
+        test_hermetic_routed_veth_harness_sh_sha256
+        test_routed_veth_harness_static_py_path
+        test_routed_veth_harness_static_py_blob
+        test_routed_veth_harness_static_py_sha256
     }
     set channel [open $path r]
     fconfigure $channel -encoding utf-8 -translation lf
@@ -72,7 +84,7 @@ proc load_manifest {path expected_sha} {
     if {[string first "\u0000" $payload] >= 0 || ![string match "*\n" $payload]} {
         return -code error "manifest-encoding"
     }
-    set lines [split [string trimright $payload "\n"] "\n"]
+    set lines [split [string range $payload 0 end-1] "\n"]
     if {[llength $lines] != [llength $expected_keys]} {
         return -code error "manifest-field-count"
     }
@@ -90,13 +102,15 @@ proc load_manifest {path expected_sha} {
 }
 
 proc validate_manifest_values {values} {
-    if {[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v3" ||
+    if {[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v4" ||
         [dict get $values run_id] ne "c8e41d73" ||
         [dict get $values package_id] ne "4f2a9b61" ||
         ![regexp {^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$} [dict get $values integration_ref]] ||
         [string first ".." [dict get $values integration_ref]] >= 0 ||
         [string first "//" [dict get $values integration_ref]] >= 0 ||
         ![regexp {^[0-9a-f]{40}$} [dict get $values integration_commit]] ||
+        [dict get $values local_package_dir] ne
+            "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-[string range [dict get $values integration_commit] 0 11]" ||
         [dict get $values bundle_name] ne "source-4f2a9b61.bundle" ||
         ![regexp {^[0-9a-f]{64}$} [dict get $values bundle_sha256]] ||
         [dict get $values history_verification] ne "isolated-unbundle-rev-list-fsck-v1" ||
@@ -134,7 +148,21 @@ proc validate_manifest_values {values} {
         [dict get $values test_realnic_acceptance_py_path] ne
             "scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py" ||
         [dict get $values test_realnic_acceptance_static_py_path] ne
-            "scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py"} {
+            "scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py" ||
+        [dict get $values root_veth_n_r_sh_path] ne
+            "scripts/realhost-b82-c8e41d73/root-veth-n-r.sh" ||
+        [dict get $values test_hermetic_veth_runner_sh_path] ne
+            "scripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh" ||
+        [dict get $values test_veth_runner_static_py_path] ne
+            "scripts/realhost-b82-c8e41d73/test_veth_runner_static.py" ||
+        [dict get $values controller_seam_sh_path] ne
+            "scripts/realhost-b82-routed-veth-v1/controller-seam.sh" ||
+        [dict get $values root_routed_veth_n_r_sh_path] ne
+            "scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh" ||
+        [dict get $values test_hermetic_routed_veth_harness_sh_path] ne
+            "scripts/realhost-b82-routed-veth-v1/test-hermetic-routed-veth-harness.sh" ||
+        [dict get $values test_routed_veth_harness_static_py_path] ne
+            "scripts/realhost-b82-routed-veth-v1/test_routed_veth_harness_static.py"} {
         return -code error "manifest-value"
     }
     set wg_state [dict get $values wg_state]
@@ -163,6 +191,10 @@ proc validate_manifest_values {values} {
         prepare_stage_root_sh_blob realnic_acceptance_py_blob
         test_realnic_acceptance_py_blob test_realnic_acceptance_static_py_blob
         provision_ubuntu_test_host_sh_blob
+        root_veth_n_r_sh_blob test_hermetic_veth_runner_sh_blob
+        test_veth_runner_static_py_blob controller_seam_sh_blob
+        root_routed_veth_n_r_sh_blob test_hermetic_routed_veth_harness_sh_blob
+        test_routed_veth_harness_static_py_blob
     } {
         if {![regexp {^[0-9a-f]{40}$} [dict get $values $key]]} {
             return -code error "blob-$key"
@@ -179,6 +211,10 @@ proc validate_manifest_values {values} {
         realnic_acceptance_py_sha256 test_realnic_acceptance_py_sha256
         test_realnic_acceptance_static_py_sha256
         provision_ubuntu_test_host_sh_sha256
+        root_veth_n_r_sh_sha256 test_hermetic_veth_runner_sh_sha256
+        test_veth_runner_static_py_sha256 controller_seam_sh_sha256
+        root_routed_veth_n_r_sh_sha256 test_hermetic_routed_veth_harness_sh_sha256
+        test_routed_veth_harness_static_py_sha256
     } {
         if {![regexp {^[0-9a-f]{64}$} [dict get $values $key]]} {
             return -code error "sha256-$key"
@@ -304,6 +340,27 @@ proc realnic_remote_argv {values mode approved_sha} {
     return $argv
 }
 
+proc veth_remote_argv {values mode bootstrap_root} {
+    if {[dict get $values wg_state] ne "absent"} {
+        return -code error "veth-wireguard-state"
+    }
+    set source [dict get $values remote_source]
+    set runner [dict get $values root_veth_n_r_sh_path]
+    return [list /bin/bash -p "${source}/${runner}" $mode \
+        --controller-source $source \
+        --commit [dict get $values integration_commit] \
+        --bundle "${bootstrap_root}/[dict get $values bundle_name]" \
+        --bundle-sha256 [dict get $values bundle_sha256] \
+        --wg-state absent]
+}
+
+proc routed_remote_argv {values mode} {
+    set source [dict get $values remote_source]
+    set seam [dict get $values controller_seam_sh_path]
+    return [list /bin/bash -p "${source}/${seam}" $mode \
+        --commit [dict get $values integration_commit]]
+}
+
 proc package_sha {values name} {
     switch -- $name {
         source-4f2a9b61.bundle { return [dict get $values bundle_sha256] }
@@ -327,7 +384,65 @@ proc package_sha {values name} {
     }
 }
 
-proc build_operation {values manifest_sha operation approved_plan approved_sha} {
+proc stale_fixed_path {operation} {
+    switch -- $operation {
+        stale-package-root { return "/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61" }
+        stale-bootstrap-root { return "/run/wg-mix-ebpf-source-bootstrap-c8e41d73" }
+        stale-alternate-bootstrap-root {
+            return "/run/wg-mix-ebpf-source-bootstrap/c8e41d73"
+        }
+        stale-stage-root { return "/run/wg-mix-ebpf-source-stages/c8e41d73" }
+        stale-fresh-root { return "/run/wg-mix-ebpf-faketcp-verifier/fresh-c8e41d73" }
+        stale-standalone-root { return "/run/wg-mix-ebpf-source-stages/a19f7c2e" }
+        stale-routed-evidence-root {
+            return "/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1"
+        }
+        stale-veth-wgc8e41a { return "/sys/class/net/wgc8e41a" }
+        stale-veth-wgc8e41b { return "/sys/class/net/wgc8e41b" }
+        stale-veth-wga19f7a { return "/sys/class/net/wga19f7a" }
+        stale-veth-wga19f7b { return "/sys/class/net/wga19f7b" }
+        stale-veth-wg5b8d3a { return "/sys/class/net/wg5b8d3a" }
+        stale-veth-wg5b8d3b { return "/sys/class/net/wg5b8d3b" }
+        stale-pin-fresh { return "/sys/fs/bpf/wg-mix-ebpf-fresh-c8e41d73" }
+        stale-pin-standalone { return "/sys/fs/bpf/wg-mix-ebpf-a19f7c2e-tcx" }
+        stale-pin-legacy-tcx { return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-tcx" }
+        stale-pin-legacy-nic-original {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-original"
+        }
+        stale-pin-legacy-nic-all-on {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-all-on"
+        }
+        stale-pin-legacy-nic-all-off {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-all-off"
+        }
+        stale-pin-legacy-nic-tx-path {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-tx-path"
+        }
+        stale-pin-legacy-nic-rx-path {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-rx-path"
+        }
+        stale-pin-legacy-nic-mtu1492 {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-mtu1492"
+        }
+        stale-pin-legacy-nic-mtu1500 {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-mtu1500"
+        }
+        stale-pin-legacy-nic-soak {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-soak"
+        }
+        stale-checksum-module { return "/sys/module/wg_mix_faketcp_checksum" }
+        stale-checksum-module-btf { return "/sys/kernel/btf/wg_mix_faketcp_checksum" }
+        stale-checksum-module-lock {
+            return "/run/wg-mix-ebpf-source-stages/c8e41d73/checksum-module-lease.v1.lock"
+        }
+        stale-physical-interface-lock {
+            return "/run/wg-mix-ebpf-realnic-physical-interface.v1.lock"
+        }
+        default { return -code error "stale-operation" }
+    }
+}
+
+proc build_operation {values manifest_sha operation approved_sha} {
     set target "[dict get $values target_user]@[dict get $values target_host]"
     set package [dict get $values remote_package_dir]
     set local_package [dict get $values local_package_dir]
@@ -336,6 +451,10 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
     set bootstrap_provisioner "${bootstrap_root}/provision-ubuntu-test-host.sh"
     set snapshot_manifest "${bootstrap_root}/package-manifest.v1"
     set user_realnic_plan "${package}/realnic-approved-plan.json"
+    set approved_plan none
+    if {$approved_sha ne "none"} {
+        set approved_plan "${local_package}/realnic-plan.${approved_sha}.json"
+    }
     set remote {}
     set tty 0
     set prompt_limit 1
@@ -385,6 +504,40 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
         package-parent-stat {
             set remote [list /usr/bin/stat -Lc %U:%G:%a:%F -- /home/siyixuan/wg-mix-ebpf-test]
             set assertion exact:siyixuan:siyixuan:700:directory
+        }
+        stale-package-root - stale-bootstrap-root - stale-alternate-bootstrap-root - stale-stage-root -
+        stale-fresh-root - stale-standalone-root - stale-routed-evidence-root -
+        stale-veth-wgc8e41a - stale-veth-wgc8e41b -
+        stale-veth-wga19f7a - stale-veth-wga19f7b -
+        stale-veth-wg5b8d3a - stale-veth-wg5b8d3b -
+        stale-pin-fresh - stale-pin-standalone - stale-pin-legacy-tcx -
+        stale-pin-legacy-nic-original - stale-pin-legacy-nic-all-on -
+        stale-pin-legacy-nic-all-off - stale-pin-legacy-nic-tx-path -
+        stale-pin-legacy-nic-rx-path - stale-pin-legacy-nic-mtu1492 -
+        stale-pin-legacy-nic-mtu1500 - stale-pin-legacy-nic-soak -
+        stale-checksum-module - stale-checksum-module-btf -
+        stale-checksum-module-lock - stale-physical-interface-lock {
+            set stale_path [stale_fixed_path $operation]
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/test ! -e $stale_path -a ! -L $stale_path]]
+            set tty 1
+            set prompt_limit 2
+        }
+        stale-realnic-run-roots {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/find /run -xdev -mindepth 1 -maxdepth 1 \
+                -name {wg-mix-ebpf-realnic-acceptance-\*} -print -quit]]
+            set assertion empty
+            set tty 1
+            set prompt_limit 2
+        }
+        stale-realnic-interface-leases {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/find /run -xdev -mindepth 1 -maxdepth 1 \
+                -name {wg-mix-ebpf-realnic-interface-\*.jsonl} -print -quit]]
+            set assertion empty
+            set tty 1
+            set prompt_limit 2
         }
         package-mkdir { set remote [list /usr/bin/mkdir --mode=0700 -- $package] }
         hermetic-matrix {
@@ -543,6 +696,22 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
             set prompt_limit 2
             set timeout_seconds [expr {$fresh_mode eq "run" ? 3600 : 2400}]
         }
+        veth-plan - veth-run - veth-restore {
+            set veth_mode [string range $operation 5 end]
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [veth_remote_argv $values $veth_mode $bootstrap_root]]
+            set tty 1
+            set prompt_limit 2
+            set timeout_seconds [expr {$veth_mode eq "run" ? 7200 : 2400}]
+        }
+        routed-plan - routed-run - routed-restore {
+            set routed_mode [string range $operation 7 end]
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [routed_remote_argv $values $routed_mode]]
+            set tty 1
+            set prompt_limit 2
+            set timeout_seconds [expr {$routed_mode eq "run" ? 7200 : 2400}]
+        }
         stage-realnic-plan-snapshot - stage-realnic-plan-verify {
             if {![regexp {^[0-9a-f]{64}$} $approved_sha]} {
                 return -code error "realnic-approved-plan-sha256"
@@ -559,7 +728,11 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
         }
         realnic-plan - realnic-run - realnic-restore {
             set realnic_mode [string range $operation 8 end]
-            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+            set sudo_prefix [list /usr/bin/sudo --]
+            if {$realnic_mode eq "plan"} {
+                set sudo_prefix [list /usr/bin/sudo -p B82_V6_SUDO_PASSWORD: --]
+            }
+            set remote [concat $sudo_prefix [env_argv] \
                 [list PYTHONDONTWRITEBYTECODE=1] \
                 [realnic_remote_argv $values $realnic_mode $approved_sha]]
             set tty 1
@@ -579,9 +752,14 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
                     return -code error "realnic-approved-plan-local"
                 }
                 file lstat $approved_plan approved_stat
+                file lstat $local_package package_stat
                 if {$approved_stat(type) ne "file" || $approved_stat(nlink) != 1 ||
                     $approved_stat(size) < 1 || $approved_stat(size) > 16777216 ||
-                    ($approved_stat(mode) & 0777) != 0600} {
+                    ($approved_stat(mode) & 07777) != 0600 ||
+                    $package_stat(type) ne "directory" ||
+                    ($package_stat(mode) & 07777) != 0700 ||
+                    $approved_stat(uid) != $package_stat(uid) ||
+                    $approved_stat(gid) != $package_stat(gid)} {
                     return -code error "realnic-approved-plan-shape"
                 }
                 if {$operation eq "scp-realnic-approved-plan"} {
@@ -603,7 +781,17 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
                 }
                 if {$family eq "scp"} {
                     set local_path "${local_package}/${name}"
-                    if {[file normalize $local_path] ne $local_path || [file type $local_path] ne "file"} {
+                    if {[file normalize $local_path] ne $local_path ||
+                        [catch {file lstat $local_path local_stat}] ||
+                        [catch {file lstat $local_package package_stat}] ||
+                        $local_stat(type) ne "file" || $local_stat(nlink) != 1 ||
+                        $local_stat(size) < 1 || $local_stat(size) > 16777216 ||
+                        ($local_stat(mode) & 07777) != 0600 ||
+                        $package_stat(type) ne "directory" ||
+                        ($package_stat(mode) & 07777) != 0700 ||
+                        $local_stat(uid) != $package_stat(uid) ||
+                        $local_stat(gid) != $package_stat(gid) ||
+                        [file_sha256 $local_path] ne $expected_sha} {
                         return -code error "scp-local-file"
                     }
                     set destination "${target}:${package}/${name}"
@@ -765,55 +953,422 @@ proc emit_safe {payload password} {
     flush stdout
 }
 
-proc transport_main {arguments} {
-    set argc [llength $arguments]
-    set argv $arguments
-    if {$argc != 14 ||
-        [lindex $argv 0] ne "--manifest" ||
-        [lindex $argv 2] ne "--manifest-sha256" ||
-        [lindex $argv 4] ne "--credential-path" ||
-        [lindex $argv 6] ne "--action" ||
-        [lindex $argv 8] ne "--operation" ||
-        [lindex $argv 10] ne "--approved-plan" ||
-        [lindex $argv 12] ne "--approved-plan-sha256"} {
-        fail "arguments" 64
+proc python_json_escape_utf8_content {value} {
+    binary scan $value cu* octets
+    set escaped ""
+    set index 0
+    set count [llength $octets]
+    while {$index < $count} {
+        set first [lindex $octets $index]
+        if {$first <= 0x7f} {
+            set codepoint $first
+            set width 1
+        } elseif {$first >= 0xc2 && $first <= 0xdf && $index + 1 < $count} {
+            set second [lindex $octets [expr {$index + 1}]]
+            if {$second < 0x80 || $second > 0xbf} {
+                return -code error "credential-utf8"
+            }
+            set codepoint [expr {(($first & 0x1f) << 6) | ($second & 0x3f)}]
+            set width 2
+        } elseif {$first >= 0xe0 && $first <= 0xef && $index + 2 < $count} {
+            set second [lindex $octets [expr {$index + 1}]]
+            set third [lindex $octets [expr {$index + 2}]]
+            if {$third < 0x80 || $third > 0xbf ||
+                ($first == 0xe0 && ($second < 0xa0 || $second > 0xbf)) ||
+                ($first == 0xed && ($second < 0x80 || $second > 0x9f)) ||
+                ($first != 0xe0 && $first != 0xed &&
+                 ($second < 0x80 || $second > 0xbf))} {
+                return -code error "credential-utf8"
+            }
+            set codepoint [expr {(($first & 0x0f) << 12) |
+                (($second & 0x3f) << 6) | ($third & 0x3f)}]
+            set width 3
+        } elseif {$first >= 0xf0 && $first <= 0xf4 && $index + 3 < $count} {
+            set second [lindex $octets [expr {$index + 1}]]
+            set third [lindex $octets [expr {$index + 2}]]
+            set fourth [lindex $octets [expr {$index + 3}]]
+            if {$third < 0x80 || $third > 0xbf ||
+                $fourth < 0x80 || $fourth > 0xbf ||
+                ($first == 0xf0 && ($second < 0x90 || $second > 0xbf)) ||
+                ($first == 0xf4 && ($second < 0x80 || $second > 0x8f)) ||
+                ($first != 0xf0 && $first != 0xf4 &&
+                 ($second < 0x80 || $second > 0xbf))} {
+                return -code error "credential-utf8"
+            }
+            set codepoint [expr {(($first & 0x07) << 18) |
+                (($second & 0x3f) << 12) | (($third & 0x3f) << 6) |
+                ($fourth & 0x3f)}]
+            set width 4
+        } else {
+            return -code error "credential-utf8"
+        }
+        switch -- $codepoint {
+            8 { append escaped {\b} }
+            9 { append escaped {\t} }
+            10 { append escaped {\n} }
+            12 { append escaped {\f} }
+            13 { append escaped {\r} }
+            34 { append escaped {\"} }
+            92 { append escaped {\\} }
+            default {
+                if {$codepoint >= 0x20 && $codepoint <= 0x7e} {
+                    append escaped [format %c $codepoint]
+                } elseif {$codepoint <= 0xffff} {
+                    append escaped [format {\u%04x} $codepoint]
+                } else {
+                    set scalar [expr {$codepoint - 0x10000}]
+                    append escaped [format {\u%04x\u%04x} \
+                        [expr {0xd800 + ($scalar >> 10)}] \
+                        [expr {0xdc00 + ($scalar & 0x3ff)}]]
+                }
+            }
+        }
+        incr index $width
     }
-    set manifest [lindex $argv 1]
-    set manifest_sha [lindex $argv 3]
-    set credential_path [lindex $argv 5]
-    set action [lindex $argv 7]
-    set operation [lindex $argv 9]
-    set approved_plan [lindex $argv 11]
-    set approved_sha [lindex $argv 13]
+    return $escaped
+}
 
-    if {![regexp {^[0-9a-f]{64}$} $manifest_sha] ||
-        $credential_path ne "/Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82" ||
-        $action ni {plan execute} ||
-        ![regexp {^[A-Za-z0-9_.-]+$} $operation] ||
-        !(($approved_plan eq "none" && $approved_sha eq "none") ||
-          [regexp {^[0-9a-f]{64}$} $approved_sha]) ||
-        ($approved_plan ne "none" &&
-          ([file pathtype $approved_plan] ne "absolute" ||
-           [file normalize $approved_plan] ne $approved_plan))} {
-        fail "argument-values" 65
+proc append_capture_output {variable_name chunk password password_json_escape} {
+    upvar 1 $variable_name captured
+    append captured $chunk
+    if {[string bytelength $captured] > 16777232} {
+        return -code error "candidate-too-large"
     }
-    if {[catch {load_manifest $manifest $manifest_sha} values] ||
-        [catch {validate_manifest_values $values} validation_message] ||
-        [catch {validate_self $values} self_message] ||
-        [catch {build_operation $values $manifest_sha $operation $approved_plan $approved_sha} operation_spec]} {
-        fail "policy" 66
+    if {$password ne "" && [string first $password $captured] >= 0} {
+        return -code error "credential-in-candidate"
     }
-    lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds
+    if {$password_json_escape ne "" &&
+        [string first $password_json_escape $captured] >= 0} {
+        return -code error "credential-json-escape-in-candidate"
+    }
+}
 
-    if {$action eq "plan"} {
-        puts "B82_V6_TRANSPORT_PLAN operation=$operation transport=$transport_type credential_read=0 network_operations=0"
-        puts "EXPECT_PROGRAM [info nameofexecutable] SCRIPT $::TRANSPORT_SCRIPT_PATH"
-        puts "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
-        puts "EXPECT_OUTPUT_ASSERTION [list $assertion]"
-        exit 0
+proc accept_capture_prompt {variable_name credential_sends buffer} {
+    upvar 1 $variable_name captured
+    if {$credential_sends == 0} {
+        set expected_prompt {siyixuan@192.168.10.82's password: }
+        if {$buffer ne $expected_prompt || $captured ne ""} {
+            return -code error "capture-ssh-prompt-frame"
+        }
+    } elseif {$credential_sends == 1} {
+        set expected_prompt B82_V6_SUDO_PASSWORD:
+        if {$buffer ne $expected_prompt || $captured ne "\r\n"} {
+            return -code error "capture-sudo-prompt-frame"
+        }
+    } else {
+        return -code error "capture-credential-frame-count"
     }
+}
 
-    set password ""
+proc canonical_capture_payload {raw credential_sends} {
+    if {$credential_sends < 1 || $credential_sends > 2 ||
+        [string first "\u0000" $raw] >= 0} {
+        return -code error "capture-prompt-or-nul"
+    }
+    set without_crlf [string map [list "\r\n" ""] $raw]
+    if {[string first "\r" $without_crlf] >= 0 ||
+        [string first "\n" $without_crlf] >= 0} {
+        return -code error "capture-non-crlf"
+    }
+    set normalized [string map [list "\r\n" "\n"] $raw]
+    set prefix [string repeat "\n" $credential_sends]
+    if {[string range $normalized 0 [expr {[string length $prefix] - 1}]] ne $prefix} {
+        return -code error "capture-leading-frame"
+    }
+    set payload [string range $normalized [string length $prefix] end]
+    if {[string bytelength $payload] < 3 || [string bytelength $payload] > 16777216 ||
+        [string index $payload 0] ne "{" || [string range $payload end-1 end] ne "}\n" ||
+        [string first "\n" [string range $payload 0 end-1]] >= 0 ||
+        [string first "\r" $payload] >= 0} {
+        return -code error "capture-payload-frame"
+    }
+    return $payload
+}
+
+proc read_capture_credential {path} {
+    if {[catch {open $path r} credential_file]} {
+        return -code error "credential-open"
+    }
+    fconfigure $credential_file -encoding binary -translation binary
+    if {[catch {read $credential_file 4097} payload]} {
+        close $credential_file
+        return -code error "credential-read"
+    }
+    close $credential_file
+    if {[string bytelength $payload] > 4096 || $payload eq ""} {
+        return -code error "credential-shape"
+    }
+    if {[string index $payload end] eq "\n"} {
+        set payload [string range $payload 0 end-1]
+    }
+    set boundary [string first "\n" $payload]
+    if {$boundary < 1 || [string first "\n" $payload [expr {$boundary + 1}]] >= 0} {
+        return -code error "credential-shape"
+    }
+    set ssh_line [string range $payload 0 [expr {$boundary - 1}]]
+    set password_bytes [string range $payload [expr {$boundary + 1}] end]
+    set payload ""
+    if {$ssh_line ne "ssh siyixuan@192.168.10.82" || $password_bytes eq "" ||
+        [string first "\u0000" $password_bytes] >= 0 ||
+        [string first "\r" $password_bytes] >= 0 ||
+        [string first "\n" $password_bytes] >= 0 ||
+        [catch {python_json_escape_utf8_content $password_bytes} escape_error]} {
+        set password_bytes ""
+        return -code error "credential-value"
+    }
+    return $password_bytes
+}
+
+proc clean_child_exit_status {wait_status} {
+    if {[llength $wait_status] != 4 || [lindex $wait_status 2] != 0 ||
+        ![string is integer -strict [lindex $wait_status 3]] ||
+        [lindex $wait_status 3] < 0 || [lindex $wait_status 3] > 255} {
+        return -code error "child-wait-status"
+    }
+    return [lindex $wait_status 3]
+}
+
+proc capture_payload_to_eof {child_id variable_name credential_sends password_bytes \
+    password_json_escape deadline_ms} {
+    upvar 1 $variable_name captured_output
+    set remaining_ms [expr {$deadline_ms - [clock milliseconds]}]
+    if {$remaining_ms < 1000} {
+        fail "timeout" 124
+    }
+    set timeout [expr {int($remaining_ms / 1000)}]
+    expect {
+        -i $child_id
+        timeout {
+            fail "timeout" 124
+        }
+        full_buffer {
+            fail "capture-full-buffer" 78
+        }
+        eof {
+            if {[info exists expect_out(buffer)] && $expect_out(buffer) ne ""} {
+                if {[catch {append_capture_output captured_output $expect_out(buffer) \
+                    $password_bytes $password_json_escape} capture_error]} {
+                    fail $capture_error 78
+                }
+            }
+            set wait_status [wait -i $child_id]
+            if {[catch {clean_child_exit_status $wait_status} child_rc]} {
+                fail "child-wait-status" 78
+            }
+            if {$child_rc != 0} {
+                exit $child_rc
+            }
+            if {[clock milliseconds] > $deadline_ms} {
+                fail "timeout" 124
+            }
+            if {($password_bytes ne "" &&
+                 [string first $password_bytes $captured_output] >= 0) ||
+                ($password_json_escape ne "" &&
+                 [string first $password_json_escape $captured_output] >= 0)} {
+                fail "credential-in-candidate" 78
+            }
+            if {[catch {canonical_capture_payload $captured_output $credential_sends} payload]} {
+                fail "capture-framing-$payload" 78
+            }
+            return [list $payload $credential_sends [string bytelength $captured_output]]
+        }
+    }
+}
+
+proc capture_child_payload {child_id password_bytes prompt_limit timeout_seconds} {
+    set timeout $timeout_seconds
+    set deadline_ms [expr {[clock milliseconds] + ($timeout_seconds * 1000)}]
+    set captured_output ""
+    set credential_sends 0
+    set password_json_escape [python_json_escape_utf8_content $password_bytes]
+    set credential_pattern {(?:siyixuan@192\.168\.10\.82's password: |B82_V6_SUDO_PASSWORD:)$}
+    fconfigure $child_id -encoding binary -translation binary
+    match_max -i $child_id 16781312
+    remove_nulls -i $child_id 0
+    expect {
+        -i $child_id
+        -re {^\r\n} {
+            if {[catch {append_capture_output captured_output $expect_out(buffer) \
+                $password_bytes $password_json_escape} capture_error]} {
+                set password_bytes ""
+                set password_json_escape ""
+                fail $capture_error 78
+            }
+            exp_continue -continue_timer
+        }
+        -re $credential_pattern {
+            if {[catch {accept_capture_prompt captured_output $credential_sends \
+                $expect_out(buffer)} capture_error]} {
+                set password_bytes ""
+                set password_json_escape ""
+                fail $capture_error 78
+            }
+            incr credential_sends
+            if {$credential_sends > $prompt_limit} {
+                set password_bytes ""
+                set password_json_escape ""
+                fail "credential-prompt-count" 77
+            }
+            send -i $child_id -- $password_bytes
+            send -i $child_id -- "\r"
+            exp_continue -continue_timer
+        }
+        -exact "\{" {
+            set expected_prefix [string repeat "\r\n" $credential_sends]
+            if {$credential_sends < 1 || $credential_sends > 2 ||
+                $expect_out(buffer) ne "\{" || $captured_output ne $expected_prefix} {
+                set password_bytes ""
+                set password_json_escape ""
+                fail "capture-payload-start-frame" 78
+            }
+            if {[catch {append_capture_output captured_output "\{" $password_bytes \
+                $password_json_escape} capture_error]} {
+                set password_bytes ""
+                set password_json_escape ""
+                fail $capture_error 78
+            }
+            set result [capture_payload_to_eof $child_id captured_output \
+                $credential_sends $password_bytes $password_json_escape $deadline_ms]
+            set password_bytes ""
+            set password_json_escape ""
+            return $result
+        }
+        timeout {
+            set password_bytes ""
+            set password_json_escape ""
+            fail "timeout" 124
+        }
+        full_buffer {
+            set password_bytes ""
+            set password_json_escape ""
+            fail "capture-full-buffer" 78
+        }
+        eof {
+            set wait_status [wait -i $child_id]
+            if {[catch {clean_child_exit_status $wait_status} child_rc]} {
+                set password_bytes ""
+                set password_json_escape ""
+                fail "child-wait-status" 78
+            }
+            if {$child_rc != 0} {
+                set password_bytes ""
+                set password_json_escape ""
+                exit $child_rc
+            }
+            set password_bytes ""
+            set password_json_escape ""
+            fail "capture-missing-payload" 78
+        }
+    }
+}
+
+proc base_identity_operations {} {
+    return {identity-hostname identity-kernel identity-machine identity-netns identity-interface}
+}
+
+proc postflight_operations {} {
+    return {
+        identity-driver identity-wg-interfaces
+        tool-go tool-clang tool-llvm tool-bpftool tool-make tool-gcc tool-iperf3
+        tool-shellcheck tool-jq tool-wireguard tool-ethtool tool-tc tool-ip
+        kernel-btf kernel-bpffs kernel-headers
+    }
+}
+
+proc prepare_stale_operations {} {
+    return {
+        stale-package-root stale-bootstrap-root stale-alternate-bootstrap-root
+        stale-stage-root stale-fresh-root stale-standalone-root
+        stale-routed-evidence-root stale-realnic-run-roots
+        stale-realnic-interface-leases stale-veth-wgc8e41a stale-veth-wgc8e41b
+        stale-veth-wga19f7a stale-veth-wga19f7b stale-veth-wg5b8d3a
+        stale-veth-wg5b8d3b stale-pin-fresh stale-pin-standalone
+        stale-pin-legacy-tcx stale-pin-legacy-nic-original
+        stale-pin-legacy-nic-all-on stale-pin-legacy-nic-all-off
+        stale-pin-legacy-nic-tx-path stale-pin-legacy-nic-rx-path
+        stale-pin-legacy-nic-mtu1492 stale-pin-legacy-nic-mtu1500
+        stale-pin-legacy-nic-soak stale-checksum-module
+        stale-checksum-module-btf stale-checksum-module-lock
+        stale-physical-interface-lock
+    }
+}
+
+proc package_names {} {
+    return {
+        source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh
+        controller.sh prepare-stage-root.sh provision-ubuntu-test-host.sh
+        root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh
+        test_matrix_static.py checksum-module-lease.sh root-fresh-verifier-gate.sh
+        test-hermetic-fresh-verifier-gate.sh test_fresh_verifier_gate_static.py
+        realnic_acceptance.py test_realnic_acceptance.py
+        test_realnic_acceptance_static.py
+    }
+}
+
+proc bootstrap_create_operations {} {
+    return {
+        bootstrap-absent bootstrap-not-symlink bootstrap-create
+        bootstrap-root-readlink bootstrap-root-stat
+        bootstrap-install-provisioner bootstrap-install-stager
+    }
+}
+
+proc bootstrap_verify_operations {} {
+    return {bootstrap-root-readlink bootstrap-root-stat}
+}
+
+proc provisioner_verify_operations {} {
+    return {
+        bootstrap-provisioner-readlink bootstrap-provisioner-stat
+        bootstrap-provisioner-sha
+    }
+}
+
+proc stager_verify_operations {} {
+    return {bootstrap-stager-readlink bootstrap-stager-stat bootstrap-stager-sha}
+}
+
+proc stage_operations {} { return {stage-snapshot stage-plan stage-run} }
+
+proc transaction_operation {operation} {
+    return [expr {$operation in {
+        prepare provision-apply fresh-run fresh-restore veth-run veth-restore
+        routed-run routed-restore realnic-run realnic-restore
+    }}]
+}
+
+proc read_only_operation {operation} {
+    if {[lsearch -exact [concat [base_identity_operations] [postflight_operations] \
+        [prepare_stale_operations]] $operation] >= 0} {
+        return 1
+    }
+    if {$operation in {
+        package-parent-stat bootstrap-absent bootstrap-not-symlink
+        bootstrap-root-readlink bootstrap-root-stat bootstrap-stager-readlink
+        bootstrap-stager-stat bootstrap-stager-sha bootstrap-provisioner-readlink
+        bootstrap-provisioner-stat bootstrap-provisioner-sha provision-check
+        stage-plan fresh-plan veth-plan routed-plan
+        verify-sha-realnic-approved-plan verify-stat-realnic-approved-plan
+        stage-realnic-plan-verify
+    }} {
+        return 1
+    }
+    if {[regexp {^verify-(?:sha|stat)-(.+)$} $operation -> name] &&
+        [lsearch -exact [package_names] $name] >= 0} {
+        return 1
+    }
+    return 0
+}
+
+proc operation_requires_approved_sha {operation} {
+    return [expr {$operation in {
+        scp-realnic-approved-plan verify-sha-realnic-approved-plan
+        verify-stat-realnic-approved-plan stage-realnic-plan-snapshot
+        realnic-run stage-realnic-plan-verify realnic-restore
+    }}]
+}
+
+proc read_execute_credential {credential_path} {
     if {[catch {open $credential_path r} credential_file]} {
         fail "credential-open" 65
     }
@@ -833,22 +1388,144 @@ proc transport_main {arguments} {
         set password ""
         fail "credential-value" 65
     }
+    return $password
+}
 
-    set timeout $timeout_seconds
-    set captured_output ""
-    set credential_sends 0
-    puts "B82_V6_TRANSPORT_EXECUTE operation=$operation transport=$transport_type credential_in_argv=0"
+proc require_manifest_authority {values manifest_sha} {
+    set manifest "[dict get $values local_package_dir]/package-manifest.v1"
+    if {[catch {load_manifest $manifest $manifest_sha} current] ||
+        $current ne $values ||
+        [catch {exec /usr/bin/id -u} caller_uid] ||
+        ![regexp {^[0-9]+$} $caller_uid] ||
+        [catch {file lstat $manifest manifest_stat}] ||
+        [catch {file lstat [dict get $values local_package_dir] package_stat}] ||
+        $manifest_stat(type) ne "file" || $manifest_stat(nlink) != 1 ||
+        ($manifest_stat(mode) & 07777) != 0600 ||
+        $package_stat(type) ne "directory" ||
+        ($package_stat(mode) & 07777) != 0700 ||
+        $package_stat(uid) != $caller_uid ||
+        $manifest_stat(uid) != $package_stat(uid) ||
+        $manifest_stat(gid) != $package_stat(gid)} {
+        fail "manifest-transaction-drift" 66
+    }
+}
+
+proc require_controller_verifier_authority {values} {
+    set repository [dict get $values local_repository]
+    set controller_path [dict get $values controller_sh_path]
+    set controller_source "${repository}/${controller_path}"
+    set package [dict get $values local_package_dir]
+    set controller_copy "${package}/controller.sh"
+    set expected_path "scripts/realhost-b82-c8e41d73/controller.sh"
+    set expected_sha [dict get $values controller_sh_sha256]
+    set expected_blob [dict get $values controller_sh_blob]
+    if {$controller_path ne $expected_path ||
+        [catch {file normalize $repository} normalized_repository] ||
+        $normalized_repository ne $repository ||
+        [catch {file normalize $controller_source} normalized_source] ||
+        $normalized_source ne $controller_source ||
+        [catch {file lstat $controller_source source_stat}] ||
+        [catch {file lstat $controller_copy copy_stat}] ||
+        [catch {file lstat $package package_stat}] ||
+        $source_stat(type) ne "file" || $source_stat(nlink) != 1 ||
+        $source_stat(size) < 1 || $source_stat(size) > 16777216 ||
+        ($source_stat(mode) & 07777) != 0755 ||
+        $copy_stat(type) ne "file" || $copy_stat(nlink) != 1 ||
+        $copy_stat(size) < 1 || $copy_stat(size) > 16777216 ||
+        ($copy_stat(mode) & 07777) != 0600 ||
+        $package_stat(type) ne "directory" ||
+        ($package_stat(mode) & 07777) != 0700 ||
+        $copy_stat(uid) != $package_stat(uid) ||
+        $copy_stat(gid) != $package_stat(gid) ||
+        [catch {file_sha256 $controller_source} source_sha] ||
+        $source_sha ne $expected_sha ||
+        [catch {file_sha256 $controller_copy} copy_sha] ||
+        $copy_sha ne $expected_sha} {
+        fail "controller-verifier-shape" 66
+    }
+    set git_prefix [list /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 \
+        /usr/bin/git --no-pager --no-replace-objects \
+        -c core.attributesFile=/dev/null -c core.fsmonitor=false \
+        -c core.hooksPath=/dev/null -C $repository]
+    set integration_commit [dict get $values integration_commit]
+    set integration_ref [dict get $values integration_ref]
+    if {[catch {exec {*}$git_prefix rev-parse --show-toplevel} top_level] ||
+        [string trim $top_level] ne $repository ||
+        [catch {exec {*}$git_prefix rev-parse --verify "${integration_ref}^{commit}"} ref_commit] ||
+        [string trim $ref_commit] ne $integration_commit ||
+        [catch {exec {*}$git_prefix hash-object -- $controller_source} source_blob] ||
+        [string trim $source_blob] ne $expected_blob ||
+        [catch {exec {*}$git_prefix rev-parse "${integration_commit}:${controller_path}"} commit_blob] ||
+        [string trim $commit_blob] ne $expected_blob ||
+        [catch {exec {*}$git_prefix ls-tree $integration_commit -- $controller_path} tree_entry] ||
+        [string trim $tree_entry] ne "100755 blob ${expected_blob}\t${controller_path}"} {
+        fail "controller-verifier-git-identity" 66
+    }
+}
+
+proc execute_controller_package_verifier {values manifest_sha} {
+    set package [dict get $values local_package_dir]
+    set controller "${package}/controller.sh"
+    set manifest "${package}/package-manifest.v1"
+    if {[catch {file lstat $package package_stat}]} {
+        fail "controller-package-verifier-shape" 66
+    }
+    set expected_marker "B82_V6_CONTROLLER_PACKAGE_VERIFIED manifest_sha256=$manifest_sha integration_commit=[dict get $values integration_commit] package_device_inode=$package_stat(dev):$package_stat(ino) credential_read=0 network_operations=0"
+    set verifier_argv [list /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+        /bin/bash $controller verify-package \
+        --manifest $manifest --manifest-sha256 $manifest_sha \
+        --credential-path /Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82 \
+        --approved-plan-sha256 none]
+    if {[catch {exec {*}$verifier_argv 2>@1} verifier_output]} {
+        fail "controller-package-verifier" 66
+    }
+    set normalized [output_value $verifier_output]
+    set lines [split $normalized "\n"]
+    if {[exact_line_count $lines $expected_marker] != 1 ||
+        [lindex $lines end] ne $expected_marker} {
+        fail "controller-package-verifier-marker" 66
+    }
+    puts "B82_V6_TRANSPORT_PACKAGE_AUTHORITY manifest_sha256=$manifest_sha integration_commit=[dict get $values integration_commit] package_device_inode=$package_stat(dev):$package_stat(ino) verifier=controller-read-only"
+}
+
+proc require_transaction_local_authority {values manifest_sha operation approved_sha} {
+    require_controller_verifier_authority $values
+    foreach name [package_names] {
+        if {[catch {build_operation $values $manifest_sha "scp-$name" none} \
+            package_copy_spec]} {
+            fail "local-package-artifact" 66
+        }
+    }
+    execute_controller_package_verifier $values $manifest_sha
+    if {$operation eq "realnic-run" &&
+        [catch {build_operation $values $manifest_sha scp-realnic-approved-plan \
+            $approved_sha} approved_plan_spec]} {
+        fail "realnic-approved-plan-local" 66
+    }
+}
+
+proc execute_operation_spec {operation operation_spec password} {
+    lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds
+    puts "B82_V6_TRANSPORT_EXECUTE operation=$operation transport=$transport_type credential_in_argv=0 channel=execute"
     puts "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
     log_user 0
     spawn -noecho {*}$spawn_argv
+    set child_id $spawn_id
+    set timeout $timeout_seconds
+    set captured_output ""
+    set credential_sends 0
+    set credential_pattern {(?i)(?:password|passphrase)[^:\r\n]*:[ \t]*$}
     expect {
-        -re {(?i)(?:password|passphrase)[^:\r\n]*:[ \t]*$} {
+        -i $child_id
+        -re $credential_pattern {
             incr credential_sends
             if {$credential_sends > $prompt_limit} {
                 set password ""
                 fail "credential-prompt-count" 77
             }
-            send -- "$password\r"
+            send -i $child_id -- "$password\r"
             exp_continue
         }
         -re {[^\r\n]*(?:\r\n|\n|\r)} {
@@ -865,34 +1542,319 @@ proc transport_main {arguments} {
                 append captured_output $expect_out(buffer)
                 emit_safe $expect_out(buffer) $password
             }
-            set password ""
-            set wait_status [wait]
-            set child_rc [lindex $wait_status 3]
+            if {[catch {wait -i $child_id} wait_status] ||
+                [catch {clean_child_exit_status $wait_status} child_rc]} {
+                set password ""
+                fail "child-wait-status" 78
+            }
             if {$child_rc != 0} {
+                set password ""
                 if {$assertion in {provision-check provision-apply}} {
                     puts "B82_V6_PROVISION_AUDIT operation=$assertion child_rc=$child_rc plan=unverified missing_set=unverified next_state=STOP"
                 }
-                exit $child_rc
+                return [list child-failure $child_rc $captured_output none]
             }
+            set policy_result none
             if {$assertion eq "provision-check"} {
-                if {[catch {provision_plan_policy $captured_output check} missing_class]} {
-                    puts "B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=rejected missing_set=unexpected next_state=STOP policy=$missing_class"
+                if {[catch {provision_plan_policy $captured_output check} policy_result]} {
+                    puts "B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=rejected missing_set=unexpected next_state=STOP policy=$policy_result"
                     fail "output-assertion" 78
                 }
-                set next_state [expr {$missing_class eq "none" ? "POSTFLIGHT" : "AWAIT_APPLY"}]
-                puts "B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=valid missing_set=$missing_class next_state=$next_state"
+                set next_state [expr {$policy_result eq "none" ? "POSTFLIGHT" : "AWAIT_APPLY"}]
+                puts "B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=valid missing_set=$policy_result next_state=$next_state"
             } elseif {$assertion eq "provision-apply"} {
-                if {[catch {provision_plan_policy $captured_output apply} missing_class]} {
-                    puts "B82_V6_PROVISION_AUDIT operation=provision-apply child_rc=0 plan=rejected missing_set=unexpected next_state=STOP policy=$missing_class"
+                if {[catch {provision_plan_policy $captured_output apply} policy_result]} {
+                    puts "B82_V6_PROVISION_AUDIT operation=provision-apply child_rc=0 plan=rejected missing_set=unexpected next_state=STOP policy=$policy_result"
                     fail "output-assertion" 78
                 }
-                puts "B82_V6_PROVISION_AUDIT operation=provision-apply child_rc=0 plan=valid missing_set=$missing_class next_state=POSTFLIGHT"
+                puts "B82_V6_PROVISION_AUDIT operation=provision-apply child_rc=0 plan=valid missing_set=$policy_result next_state=POSTFLIGHT"
             } elseif {[catch {assert_output $assertion $captured_output} assertion_message]} {
                 fail "output-assertion" 78
             }
-            exit 0
+            set password ""
+            return [list ok 0 $captured_output $policy_result]
         }
     }
+}
+
+proc execute_primitive {values manifest_sha operation approved_sha password} {
+    require_manifest_authority $values $manifest_sha
+    if {[catch {build_operation $values $manifest_sha $operation $approved_sha} operation_spec]} {
+        fail "policy" 66
+    }
+    return [execute_operation_spec $operation $operation_spec $password]
+}
+
+proc require_primitive_success {result} {
+    if {[lindex $result 0] ne "ok"} {
+        exit [lindex $result 1]
+    }
+    return $result
+}
+
+proc transaction_step {values manifest_sha operation approved_sha password} {
+    set result [execute_primitive $values $manifest_sha $operation $approved_sha $password]
+    require_primitive_success $result
+    puts "B82_V6_TRANSPORT_TRANSACTION_STEP operation=$operation rc=0"
+    return $result
+}
+
+proc execute_stale_transaction_gate {values manifest_sha password} {
+    set operations [prepare_stale_operations]
+    set total [llength $operations]
+    set ordinal 0
+    foreach operation $operations {
+        incr ordinal
+        set result [execute_primitive $values $manifest_sha $operation none $password]
+        set id [string range $operation 6 end]
+        if {[lindex $result 0] ne "ok"} {
+            set rc [lindex $result 1]
+            puts [format "B82_V6_STALE_ITEM_V1 ordinal=%02d id=%s class=STOP writes=0 cleanup=0 rc=%d" $ordinal $id $rc]
+            puts "B82_V6_STALE_SUMMARY_V1 profile=prepare-new items=$total checked=$ordinal absent=[expr {$ordinal - 1}] writes=0 cleanup=0 result=STOP rc=$rc"
+            exit $rc
+        }
+        puts [format "B82_V6_STALE_ITEM_V1 ordinal=%02d id=%s class=ABSENT writes=0 cleanup=0 rc=0" $ordinal $id]
+    }
+    puts "B82_V6_STALE_SUMMARY_V1 profile=prepare-new items=$total checked=$total absent=$total writes=0 cleanup=0 result=PASS rc=0"
+}
+
+proc verify_remote_package_transaction {values manifest_sha password} {
+    foreach name [package_names] {
+        transaction_step $values $manifest_sha "verify-sha-$name" none $password
+        transaction_step $values $manifest_sha "verify-stat-$name" none $password
+    }
+}
+
+proc verify_provisioner_transaction {values manifest_sha password} {
+    foreach operation [provisioner_verify_operations] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+}
+
+proc execute_postflight_transaction {values manifest_sha password} {
+    verify_remote_package_transaction $values $manifest_sha $password
+    foreach operation [concat [postflight_operations] {
+        controller-shellcheck hermetic-matrix hermetic-fresh
+    }] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    foreach operation [stager_verify_operations] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    foreach operation [stage_operations] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    puts "B82_V6_CONTROLLER_POSTFLIGHT_COMPLETE state=POSTFLIGHT"
+}
+
+proc execute_prepare_transaction {values manifest_sha password} {
+    foreach operation [base_identity_operations] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    execute_stale_transaction_gate $values $manifest_sha $password
+    transaction_step $values $manifest_sha package-parent-stat none $password
+    transaction_step $values $manifest_sha package-mkdir none $password
+    foreach name [package_names] {
+        transaction_step $values $manifest_sha "scp-$name" none $password
+        transaction_step $values $manifest_sha "verify-sha-$name" none $password
+        transaction_step $values $manifest_sha "verify-stat-$name" none $password
+    }
+    foreach operation [bootstrap_create_operations] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    puts "B82_V6_CONTROLLER_STATE from=PACKAGE_BOUND to=BOOTSTRAP_ONLY automatic_apply=0"
+    verify_provisioner_transaction $values $manifest_sha $password
+    puts "B82_V6_CONTROLLER_STATE from=BOOTSTRAP_ONLY to=PROVISION_CHECK automatic_apply=0"
+    set result [transaction_step $values $manifest_sha provision-check none $password]
+    set missing [lindex $result 3]
+    if {$missing eq "none"} {
+        puts "B82_V6_CONTROLLER_STATE from=PROVISION_CHECK to=POSTFLIGHT automatic_apply=0"
+        execute_postflight_transaction $values $manifest_sha $password
+        return POSTFLIGHT
+    }
+    if {$missing ni {initial iperf3}} { fail "provision-state" 78 }
+    puts "B82_V6_CONTROLLER_STATE from=PROVISION_CHECK to=AWAIT_APPLY automatic_apply=0"
+    puts "B82_V6_PROVISION_AWAIT_APPLY missing_set=$missing explicit_mode=provision-apply automatic_apply=0"
+    return AWAIT_APPLY
+}
+
+proc execute_provision_apply_transaction {values manifest_sha password} {
+    foreach operation [concat [base_identity_operations] [bootstrap_verify_operations]] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    verify_remote_package_transaction $values $manifest_sha $password
+    verify_provisioner_transaction $values $manifest_sha $password
+    puts "B82_V6_CONTROLLER_STATE from=BOOTSTRAP_ONLY to=PROVISION_CHECK automatic_apply=0"
+    set result [transaction_step $values $manifest_sha provision-check none $password]
+    set missing [lindex $result 3]
+    if {$missing eq "none"} {
+        puts "B82_V6_CONTROLLER_STATE from=PROVISION_CHECK to=POSTFLIGHT automatic_apply=0"
+        execute_postflight_transaction $values $manifest_sha $password
+        return POSTFLIGHT
+    }
+    if {$missing ni {initial iperf3}} { fail "provision-state" 78 }
+    puts "B82_V6_CONTROLLER_STATE from=PROVISION_CHECK to=AWAIT_APPLY automatic_apply=0"
+    puts "B82_V6_CONTROLLER_STATE from=AWAIT_APPLY to=PROVISION_APPLY automatic_apply=0"
+    verify_provisioner_transaction $values $manifest_sha $password
+    set apply_result [transaction_step $values $manifest_sha provision-apply none $password]
+    if {[lindex $apply_result 3] ne $missing} { fail "provision-apply-state" 78 }
+    verify_provisioner_transaction $values $manifest_sha $password
+    set post_result [transaction_step $values $manifest_sha provision-check none $password]
+    if {[lindex $post_result 3] ne "none"} { fail "provision-postcheck" 78 }
+    puts "B82_V6_CONTROLLER_STATE from=PROVISION_APPLY to=POSTFLIGHT automatic_apply=0"
+    execute_postflight_transaction $values $manifest_sha $password
+    return POSTFLIGHT
+}
+
+proc execute_transaction {values manifest_sha operation approved_sha password} {
+    puts "B82_V6_TRANSPORT_TRANSACTION_START operation=$operation sequence=fixed caller_argv=forbidden"
+    switch -- $operation {
+        prepare {
+            set result [execute_prepare_transaction $values $manifest_sha $password]
+        }
+        provision-apply {
+            set result [execute_provision_apply_transaction $values $manifest_sha $password]
+        }
+        fresh-run - fresh-restore - veth-run - veth-restore -
+        routed-run - routed-restore {
+            transaction_step $values $manifest_sha $operation none $password
+            set result COMPLETE
+        }
+        realnic-run {
+            foreach primitive {
+                scp-realnic-approved-plan verify-sha-realnic-approved-plan
+                verify-stat-realnic-approved-plan stage-realnic-plan-snapshot realnic-run
+            } {
+                transaction_step $values $manifest_sha $primitive $approved_sha $password
+            }
+            set result COMPLETE
+        }
+        realnic-restore {
+            foreach primitive {stage-realnic-plan-verify realnic-restore} {
+                transaction_step $values $manifest_sha $primitive $approved_sha $password
+            }
+            set result COMPLETE
+        }
+        default { fail "transaction-operation" 65 }
+    }
+    puts "B82_V6_TRANSPORT_TRANSACTION_COMPLETE operation=$operation result=$result"
+}
+
+proc transport_main {arguments} {
+    set argc [llength $arguments]
+    set argv $arguments
+    if {$argc != 12 ||
+        [lindex $argv 0] ne "--manifest" ||
+        [lindex $argv 2] ne "--manifest-sha256" ||
+        [lindex $argv 4] ne "--credential-path" ||
+        [lindex $argv 6] ne "--action" ||
+        [lindex $argv 8] ne "--operation" ||
+        [lindex $argv 10] ne "--approved-plan-sha256"} {
+        fail "arguments" 64
+    }
+    set manifest [lindex $argv 1]
+    set manifest_sha [lindex $argv 3]
+    set credential_path [lindex $argv 5]
+    set action [lindex $argv 7]
+    set operation [lindex $argv 9]
+    set approved_sha [lindex $argv 11]
+
+    if {![regexp {^[0-9a-f]{64}$} $manifest_sha] ||
+        $credential_path ne "/Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82" ||
+        $action ni {plan execute capture} ||
+        ![regexp {^[A-Za-z0-9_.-]+$} $operation] ||
+        !($approved_sha eq "none" || [regexp {^[0-9a-f]{64}$} $approved_sha])} {
+        fail "argument-values" 65
+    }
+    if {($action eq "capture" && $operation ne "realnic-plan") ||
+        ($action eq "execute" && ![transaction_operation $operation] &&
+         ![read_only_operation $operation])} {
+        fail "action-operation" 65
+    }
+    set sha_is_valid [expr {
+        [regexp {^[0-9a-f]{64}$} $approved_sha] &&
+        ![regexp {^0{64}$} $approved_sha] &&
+        ![regexp {^f{64}$} $approved_sha]
+    }]
+    if {([operation_requires_approved_sha $operation] && !$sha_is_valid) ||
+        (![operation_requires_approved_sha $operation] && $approved_sha ne "none")} {
+        fail "approved-plan-sha-operation" 65
+    }
+    if {[catch {load_manifest $manifest $manifest_sha} values] ||
+        $manifest ne "[dict get $values local_package_dir]/package-manifest.v1" ||
+        [catch {validate_manifest_values $values} validation_message] ||
+        [catch {validate_self $values} self_message]} {
+        fail "policy" 66
+    }
+    if {[catch {exec /usr/bin/id -u} caller_uid] ||
+        ![regexp {^[0-9]+$} $caller_uid] ||
+        [catch {file lstat $manifest manifest_stat}] ||
+        [catch {file lstat [dict get $values local_package_dir] package_stat}] ||
+        $manifest_stat(type) ne "file" || $manifest_stat(nlink) != 1 ||
+        ($manifest_stat(mode) & 07777) != 0600 ||
+        $package_stat(type) ne "directory" || ($package_stat(mode) & 07777) != 0700 ||
+        $package_stat(uid) != $caller_uid ||
+        $manifest_stat(uid) != $package_stat(uid) ||
+        $manifest_stat(gid) != $package_stat(gid)} {
+        fail "local-package-owner" 66
+    }
+    if {$action eq "plan"} {
+        if {[catch {build_operation $values $manifest_sha $operation $approved_sha} operation_spec]} {
+            fail "policy" 66
+        }
+        lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds
+        puts "B82_V6_TRANSPORT_PLAN operation=$operation transport=$transport_type credential_read=0 network_operations=0"
+        puts "EXPECT_PROGRAM [info nameofexecutable] SCRIPT $::TRANSPORT_SCRIPT_PATH"
+        puts "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
+        puts "EXPECT_OUTPUT_ASSERTION [list $assertion]"
+        exit 0
+    }
+
+    if {$action eq "capture"} {
+        if {[catch {build_operation $values $manifest_sha $operation $approved_sha} operation_spec]} {
+            fail "policy" 66
+        }
+        lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds
+        set password ""
+        if {[catch {read_capture_credential $credential_path} password]} {
+            set password ""
+            fail "credential-value" 65
+        }
+        puts stderr "B82_V6_TRANSPORT_EXECUTE operation=$operation transport=$transport_type credential_in_argv=0 channel=capture"
+        puts stderr "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
+        log_user 0
+        spawn -noecho {*}$spawn_argv
+        set child_id $spawn_id
+        if {[catch {capture_child_payload $child_id $password $prompt_limit \
+            $timeout_seconds} capture_result]} {
+            set password ""
+            fail "capture-expect" 78
+        }
+        set password ""
+        lassign $capture_result payload credential_sends raw_bytes
+        puts stderr "B82_V6_TRANSPORT_CAPTURE operation=$operation child_rc=0 prompts=$credential_sends raw_bytes=$raw_bytes payload_bytes=[string bytelength $payload] framing=canonical"
+        fconfigure stdout -encoding binary -translation binary
+        puts -nonewline stdout $payload
+        flush stdout
+        exit 0
+    }
+    set prebuilt_operation_spec {}
+    if {[transaction_operation $operation]} {
+        require_transaction_local_authority $values $manifest_sha $operation $approved_sha
+    } elseif {[catch {build_operation $values $manifest_sha $operation \
+        $approved_sha} prebuilt_operation_spec]} {
+        fail "policy" 66
+    }
+    set password [read_execute_credential $credential_path]
+    if {[transaction_operation $operation]} {
+        execute_transaction $values $manifest_sha $operation $approved_sha $password
+    } else {
+        require_manifest_authority $values $manifest_sha
+        require_primitive_success [execute_operation_spec $operation \
+            $prebuilt_operation_spec $password]
+    }
+    set password ""
+    exit 0
 }
 
 if {[info exists argv0] && [file normalize $argv0] eq $::TRANSPORT_SCRIPT_PATH} {

@@ -14,10 +14,7 @@ readonly MODULE_LEASE_HELPER="${REVIEW_ROOT}/../realhost-b82-c8e41d73/checksum-m
 readonly MODULE_LEASE_HERMETIC="${REVIEW_ROOT}/../realhost-b82-c8e41d73/test-hermetic-checksum-module-lease.sh"
 readonly SOURCE='/run/wg-mix-ebpf-source-stages/c8e41d73/source'
 readonly STAGE_ROOT='/run/wg-mix-ebpf-source-stages/c8e41d73'
-readonly COMMIT='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
-readonly EXPERIMENTAL_SHA='bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
-readonly BASELINE_SHA='cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc'
-readonly MODULE_SHA='dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd'
+COMMIT='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 readonly BASE_COMMIT='3ea1cf0272197d580e90d51c8997352e79c47ba9'
 readonly LOCKED_STANDALONE='scripts/realhost-b82-c8e41d73/root-veth-n-r.sh'
 readonly STANDALONE_LEASE_SCOPE='1c4102b96d28657b60ee58314c7088069c59eea9'
@@ -39,6 +36,15 @@ expect_failure() {
     fail "${label} unexpectedly succeeded"
   fi
   printf 'EXPECTED_FAILURE label=%s output=%q\n' "${label}" "${output}"
+}
+
+require_ordered_literals() {
+  local remaining="$1" marker
+  shift
+  for marker in "$@"; do
+    [[ "${remaining}" == *"${marker}"* ]] || fail "ordered plan marker missing: ${marker}"
+    remaining="${remaining#*"${marker}"}"
+  done
 }
 
 for path in "${RUNNER}" "${SEAM}" "${STATIC_TEST}" \
@@ -98,32 +104,46 @@ readonly FIX_PATHS
   "${STANDALONE_PREMUTATION_FIX}" HEAD ||
   fail 'bound history does not contain the reviewed pre-mutation fix'
 
+STAGED_CONTEXT='absent'
+if [[ -e "${STAGE_ROOT}" || -L "${STAGE_ROOT}" ]]; then
+  [[ "$EUID" == 0 &&
+    "$0" == "${SOURCE}/scripts/realhost-b82-routed-veth-v1/test-hermetic-routed-veth-harness.sh" &&
+    "$(/usr/bin/readlink -e -- "${STAGE_ROOT}")" == "${STAGE_ROOT}" &&
+    "$(/usr/bin/stat -Lc '%u:%g:%a:%F' -- "${STAGE_ROOT}")" == '0:0:700:directory' &&
+    "$(/usr/bin/readlink -e -- "${SOURCE}")" == "${SOURCE}" &&
+    "$(/usr/bin/stat -Lc '%u:%g:%a:%F' -- "${SOURCE}")" == '0:0:700:directory' ]] ||
+    fail 'pre-existing stage is not the exact root-owned staged test context'
+  COMMIT="$(/usr/bin/git -C "${SOURCE}" rev-parse --verify HEAD^{commit})" ||
+    fail 'cannot bind exact staged context commit'
+  STAGED_CONTEXT='exact'
+else
+  [[ ! -e "${STAGE_ROOT}" && ! -L "${STAGE_ROOT}" ]] ||
+    fail 'local absent-stage fixture is ambiguous'
+fi
+readonly COMMIT STAGED_CONTEXT
+
 readonly -a RUNNER_ARGS=(
   --source "${SOURCE}"
   --commit "${COMMIT}"
-  --experimental-sha256 "${EXPERIMENTAL_SHA}"
-  --baseline-sha256 "${BASELINE_SHA}"
-  --module-sha256 "${MODULE_SHA}"
 )
 readonly -a SEAM_ARGS=(
   --commit "${COMMIT}"
-  --experimental-sha256 "${EXPERIMENTAL_SHA}"
-  --baseline-sha256 "${BASELINE_SHA}"
-  --module-sha256 "${MODULE_SHA}"
 )
 
-[[ ! -e "${STAGE_ROOT}" && ! -L "${STAGE_ROOT}" ]] ||
-  fail 'hermetic plan refuses a pre-existing production stage path'
 PLAN_OUTPUT="$(/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /bin/bash "${RUNNER}" plan "${RUNNER_ARGS[@]}")" ||
   fail 'root runner plan'
 readonly PLAN_OUTPUT
-SEAM_OUTPUT="$(/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C /bin/bash "${SEAM}" plan "${SEAM_ARGS[@]}")" ||
-  fail 'controller seam plan'
+if [[ "${STAGED_CONTEXT}" == exact ]]; then
+  SEAM_OUTPUT="$(/usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+    /bin/bash "${SEAM}" plan "${SEAM_ARGS[@]}")" || fail 'controller seam exact-stage plan'
+else
+  SEAM_OUTPUT="$(/bin/cat -- "${SEAM}")" || fail 'controller seam absent-stage source fixture'
+fi
 readonly SEAM_OUTPUT
 
 for literal in \
   'B82_ROUTED_VETH_PLAN_ONLY run_id=c8e41d73 resource_id=5b8d30f1' \
-  'state_schema=owner,baseline,operation-intent,dependency-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module-intent,module,tested,cleanup-intent,restored' \
+  'state_schema=owner,baseline,operation-intent,dependency-intent,artifact-intent,artifacts,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module-intent,module,tested,cleanup-intent,restored' \
   'L0 operation=shared-module-lock target=/run/wg-mix-ebpf-source-stages/c8e41d73/checksum-module-lease.v1.lock helper=/run/wg-mix-ebpf-source-stages/c8e41d73/source/scripts/realhost-b82-c8e41d73/checksum-module-lease.sh argv=/usr/bin/flock --exclusive --nonblock MODULE_LEASE_FD' \
   'netns=initial veth=wg5b8d3a,wg5b8d3b sender=198.18.82.1/32 peer=wg5b8d3b/unnumbered route=198.18.82.2/32 mtu=1500 neighbor=02:5b:8d:30:f1:0b no_external_peer=1' \
   'N5 operation=address-add target=wg5b8d3a:198.18.82.1/32 argv=/usr/sbin/ip -4 address add 198.18.82.1/32 dev wg5b8d3a scope global' \
@@ -159,6 +179,26 @@ done
   fail 'runner plan is missing the offline produced-module verification'
 [[ "${PLAN_OUTPUT}" == *'P2 operation=preflight-build target=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/dataplane-preflight.test argv='* ]] ||
   fail 'runner plan is missing the pre-mutation compiled test binary'
+for artifact_step in \
+  'P.artifact-intent operation=artifact-intent target=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/phase-artifact-intent.v1 argv=internal:noclobber-phase-0600' \
+  'P.artifact-build operation=artifact-build target=/run/wg-mix-ebpf-source-stages/c8e41d73/source/build argv=' \
+  'P.artifact-mode operation=artifact-mode target=/run/wg-mix-ebpf-source-stages/c8e41d73/source/build/wg_mix_faketcp_experimental.o:/run/wg-mix-ebpf-source-stages/c8e41d73/source/build/wg_mix_tc.o:/run/wg-mix-ebpf-source-stages/c8e41d73/source/build/faketcp_checksum_kmod/wg_mix_faketcp_checksum.ko argv=' \
+  'P.artifact-receipt operation=artifact-receipt target=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/phase-artifacts.v1 argv=internal:noclobber-phase-0600'; do
+  [[ "${PLAN_OUTPUT}" == *"${artifact_step}"* ]] ||
+    fail "runner plan is missing artifact authority ${artifact_step}"
+done
+require_ordered_literals "${PLAN_OUTPUT}" \
+  'P0 operation=preflight-mod-download ' \
+  'P1 operation=preflight-mod-verify ' \
+  'P.artifact-intent operation=artifact-intent ' \
+  'P.artifact-build operation=artifact-build ' \
+  'P.artifact-mode operation=artifact-mode ' \
+  'P.artifact-receipt operation=artifact-receipt ' \
+  'P2 operation=preflight-build '
+artifact_build_line="$(printf '%s\n' "${PLAN_OUTPUT}" | /usr/bin/grep -F \
+  'P.artifact-build operation=artifact-build ')" || fail 'cannot isolate artifact build argv'
+[[ "${artifact_build_line}" == *'GOPROXY=off GOSUMDB=off'* ]] ||
+  fail 'artifact producer is not offline after the bounded dependency download'
 [[ "${PLAN_OUTPUT}" == *'GOMODCACHE=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-mod-cache'* ]] ||
   fail 'clean-stage producer does not use the routed evidence-owned module cache'
 [[ "${PLAN_OUTPUT}" == *'GOTMPDIR=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-tmp TMPDIR=/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-tmp'* ]] ||
@@ -208,8 +248,12 @@ for test_name in \
     fail "selected binary still receives the generic Go preflight TMPDIR for ${test_name}"
 done
 
-[[ "${PLAN_OUTPUT}" == *'B82_ROUTED_VETH_WRITE_SET filesystem='*'/run/wg-mix-ebpf-source-stages/c8e41d73/go-tmp-realhost-5b8d30f1 shared_lock='* ]] ||
-  fail 'write set does not declare the retained real-host TMPDIR'
+WRITE_SET_LINE="$(printf '%s\n' "${PLAN_OUTPUT}" | /usr/bin/grep -F \
+  'B82_ROUTED_VETH_WRITE_SET filesystem=')" || fail 'cannot isolate routed write set'
+readonly WRITE_SET_LINE
+readonly EXPECTED_FILESYSTEM_WRITE_SET='/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1,/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/dataplane-preflight.test,/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-cache,/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-mod-cache,/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-path,/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-tmp,/run/wg-mix-ebpf-source-stages/c8e41d73/go-tmp-realhost-5b8d30f1,/run/wg-mix-ebpf-source-stages/c8e41d73/source/build'
+[[ "${WRITE_SET_LINE}" == "B82_ROUTED_VETH_WRITE_SET filesystem=${EXPECTED_FILESYSTEM_WRITE_SET} shared_lock="* ]] ||
+  fail 'write set does not contain the exact eight retained filesystem authorities'
 [[ "${PLAN_OUTPUT}" == *'/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1/go-mod-cache'* ]] ||
   fail 'write set does not declare the routed dependency cache producer'
 [[ "${PLAN_OUTPUT}" == *'shared_lock=/run/wg-mix-ebpf-source-stages/c8e41d73/checksum-module-lease.v1.lock:advisory-only'* &&
@@ -236,23 +280,30 @@ for forbidden in \
   [[ "${SEAM_OUTPUT}" != *"${forbidden}"* ]] || fail "seam plan contains forbidden ${forbidden}"
 done
 
-[[ "${SEAM_OUTPUT}" == *'B82_ROUTED_CONTROLLER_SEAM_PLAN run_id=c8e41d73 target=192.168.10.82 credential_read=0 remote_connections=0 argv='* ]] ||
-  fail 'controller seam plan header'
-[[ "${SEAM_OUTPUT}" == *'/bin/bash -p /run/wg-mix-ebpf-source-stages/c8e41d73/source/scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh plan'* ]] ||
-  fail 'controller seam exact root-runner argv'
-[[ "${SEAM_OUTPUT}" == *'B82_ROUTED_CONTROLLER_SEAM_PLAN_COMPLETE transport_integration=pending no_commands_executed=1'* ]] ||
-  fail 'controller seam completion'
+if [[ "${STAGED_CONTEXT}" == exact ]]; then
+  [[ "${SEAM_OUTPUT}" == *"B82_ROUTED_VETH_PLAN_ONLY run_id=c8e41d73 resource_id=5b8d30f1 commit=${COMMIT}"* &&
+    "${SEAM_OUTPUT}" == *'B82_ROUTED_VETH_PLAN_COMPLETE commands_are_review_templates=1'* ]] ||
+    fail 'controller seam did not execute the exact staged runner plan'
+else
+  [[ "${SEAM_OUTPUT}" == *'/bin/bash -p "${ROOT_RUNNER}" "${MODE}"'* &&
+    "${SEAM_OUTPUT}" == *'--source "${SOURCE}"'* &&
+    "${SEAM_OUTPUT}" == *'--commit "${COMMIT}"'* &&
+    "${SEAM_OUTPUT}" == *'exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C "${RUNNER_ARGV[@]}"'* ]] ||
+    fail 'controller seam fixed exec authority'
+fi
 
 expect_failure invalid-mode /bin/bash "${RUNNER}" execute "${RUNNER_ARGS[@]}"
 expect_failure wrong-source /bin/bash "${RUNNER}" plan \
   --source /run/wg-mix-ebpf-source-stages/aaaaaaaa/source \
-  --commit "${COMMIT}" --experimental-sha256 "${EXPERIMENTAL_SHA}" \
-  --baseline-sha256 "${BASELINE_SHA}" --module-sha256 "${MODULE_SHA}"
+  --commit "${COMMIT}"
 expect_failure short-commit /bin/bash "${RUNNER}" plan \
-  --source "${SOURCE}" --commit aaaaaaaa --experimental-sha256 "${EXPERIMENTAL_SHA}" \
-  --baseline-sha256 "${BASELINE_SHA}" --module-sha256 "${MODULE_SHA}"
+  --source "${SOURCE}" --commit aaaaaaaa
 expect_failure duplicate-commit /bin/bash "${RUNNER}" plan "${RUNNER_ARGS[@]}" --commit "${COMMIT}"
 expect_failure extra-argv /bin/bash "${SEAM}" plan "${SEAM_ARGS[@]}" --remote-argv arbitrary
 
-[[ ! -e "${STAGE_ROOT}" && ! -L "${STAGE_ROOT}" ]] || fail 'plan or failure fixture mutated the stage root'
-printf 'hermetic routed-veth runner, executable empty-cache producer, controller seam, exact argv and lifecycle model: PASS\n'
+if [[ "${STAGED_CONTEXT}" == absent ]]; then
+  [[ ! -e "${STAGE_ROOT}" && ! -L "${STAGE_ROOT}" ]] ||
+    fail 'plan or failure fixture mutated the absent stage root'
+fi
+printf 'hermetic routed-veth runner, executable empty-cache producer, controller seam=%s, exact argv and lifecycle model: PASS\n' \
+  "${STAGED_CONTEXT}"

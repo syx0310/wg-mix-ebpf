@@ -12,8 +12,8 @@ def fail(message: str) -> None:
     raise SystemExit(f"fresh verifier static test failed: {message}")
 
 
-if len(sys.argv) != 3:
-    fail("expected root gate and shared module helper paths")
+if len(sys.argv) not in (3, 4):
+    fail("expected root gate, shared module helper, and optional manifest paths")
 
 path = pathlib.Path(sys.argv[1])
 helper_path = pathlib.Path(sys.argv[2])
@@ -25,9 +25,193 @@ if any(
 source = path.read_text(encoding="utf-8")
 helper = helper_path.read_text(encoding="utf-8")
 
+MANIFEST_PREFIX = (
+    "format",
+    "run_id",
+    "package_id",
+    "integration_ref",
+    "integration_commit",
+    "bundle_name",
+    "bundle_sha256",
+    "history_verification",
+    "history_commit_count",
+    "history_roots_sha256",
+    "history_objects_sha256",
+    "wg_state",
+    "wg_interface",
+    "wg_local_address",
+    "wg_peer_address",
+    "local_repository",
+    "local_package_dir",
+    "remote_package_dir",
+    "remote_source",
+    "target_user",
+    "target_host",
+    "target_hostname",
+    "target_kernel",
+    "target_machine_id",
+    "target_interface",
+    "peer_address",
+    "peer_port",
+    "soak_seconds",
+    "session_seconds",
+    "physical_nic_forward_authority",
+    "physical_interface_lock",
+    "legacy_matrix_mode",
+    "realnic_profile",
+    "realnic_traffic_seconds",
+)
+IDENTITY_KEYS = (
+    "bind_final_package_sh",
+    "controller_sh",
+    "locked_transport_exp",
+    "root_matrix_n_r_sh",
+    "check_realhost_iperf_py",
+    "test_hermetic_matrix_sh",
+    "test_matrix_static_py",
+    "checksum_module_lease_sh",
+    "root_fresh_verifier_gate_sh",
+    "test_hermetic_fresh_verifier_gate_sh",
+    "test_fresh_verifier_gate_static_py",
+    "prepare_stage_root_sh",
+    "realnic_acceptance_py",
+    "test_realnic_acceptance_py",
+    "test_realnic_acceptance_static_py",
+    "provision_ubuntu_test_host_sh",
+    "root_veth_n_r_sh",
+    "test_hermetic_veth_runner_sh",
+    "test_veth_runner_static_py",
+    "controller_seam_sh",
+    "root_routed_veth_n_r_sh",
+    "test_hermetic_routed_veth_harness_sh",
+    "test_routed_veth_harness_static_py",
+)
+EXPECTED_MANIFEST_KEYS = MANIFEST_PREFIX + tuple(
+    f"{key}_{suffix}"
+    for key in IDENTITY_KEYS
+    for suffix in ("path", "blob", "sha256")
+)
+if len(EXPECTED_MANIFEST_KEYS) != 103 or len(set(EXPECTED_MANIFEST_KEYS)) != 103:
+    fail("test's exact manifest schema is not 103 unique keys")
+
+nul_helper_match = re.search(
+    r"(?ms)^(?P<function>require_manifest_fd_without_nul\(\) \{\n.*?^\})\n\nload_manifest_once\(\) \{",
+    source,
+)
+if nul_helper_match is None:
+    fail("could not isolate the manifest NUL pread helper")
+expected_nul_helper = '''require_manifest_fd_without_nul() {
+  /usr/bin/python3 -B -I -c '
+import os
+import sys
+
+try:
+    descriptor = int(sys.argv[1])
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 65536, offset)
+        if not chunk:
+            raise SystemExit(0)
+        if b"\\0" in chunk:
+            raise SystemExit(65)
+        offset += len(chunk)
+except (OSError, ValueError):
+    raise SystemExit(66)
+' "$1"
+}'''
+if nul_helper_match.group("function") != expected_nul_helper:
+    fail("manifest NUL helper drifted from the shared same-FD os.pread contract")
+manifest_nul_helper = nul_helper_match.group("function")
+for forbidden in ("os.read(", "os.lseek(", ".seek(", "print(", "sys.stdout", "os.write("):
+    if forbidden in manifest_nul_helper:
+        fail(f"manifest NUL helper advances or writes through its descriptor: {forbidden!r}")
+
+load_match = re.search(
+    r"(?ms)^load_manifest_once\(\) \{\n(?P<body>.*?)^\}\n\nphase_value\(\) \{",
+    source,
+)
+if load_match is None:
+    fail("could not isolate load_manifest_once")
+load_body = load_match.group("body")
+loaded_keys = tuple(
+    re.findall(r"(?m)^\s*read_manifest_field\s+([a-z0-9_]+)\s+", load_body)
+)
+if loaded_keys != EXPECTED_MANIFEST_KEYS:
+    fail("load_manifest_once does not consume the exact package-v4 103-key sequence")
+if len(set(loaded_keys)) != len(loaded_keys):
+    fail("load_manifest_once contains duplicate manifest keys")
+manifest_open = 'exec {MANIFEST_FD}<"${SNAPSHOT_MANIFEST}" || return 66'
+nul_scan = 'require_manifest_fd_without_nul "${MANIFEST_FD}" || {'
+first_field = "read_manifest_field format FORMAT"
+loader_order = tuple(load_body.find(value) for value in (manifest_open, nul_scan, first_field))
+if (
+    min(loader_order) < 0
+    or tuple(sorted(loader_order)) != loader_order
+    or load_body.count(nul_scan) != 1
+):
+    fail("load_manifest_once does not scan its already-open manifest FD before field reads")
+if '''require_manifest_fd_without_nul "${MANIFEST_FD}" || {
+    rc=$?
+    exec {MANIFEST_FD}<&-
+    return "${rc}"
+  }''' not in load_body:
+    fail("load_manifest_once does not preserve NUL/pread failure rc while closing the same FD")
+if load_body.count('IFS= read -r -u "${MANIFEST_FD}" unexpected') != 1 or not re.search(
+    r'''(?mx)
+    if\ IFS=\ read\ -r\ -u\ "\$\{MANIFEST_FD\}"\ unexpected
+    \ \|\|\ \[\[\ -n\ "\$\{unexpected\}"\ \]\];\ then\n
+    \s*exec\ \{MANIFEST_FD\}<\&-\n
+    \s*return\ 65\n
+    \s*fi\n
+    \s*exec\ \{MANIFEST_FD\}<\&-
+    ''',
+    load_body,
+):
+    fail("load_manifest_once lacks the strict complete-line and unterminated-tail EOF gate")
+
+validation_start = source.find("validate_snapshot_contract() {")
+validation_end = source.find("\n}\n", validation_start)
+validation_body = source[validation_start:validation_end]
+format_check = "[[ \"${FORMAT}\" == 'wg-mix-ebpf-b82-v6-package-v4' &&"
+if (
+    validation_start < 0
+    or "load_manifest_once || return $?" not in validation_body
+    or format_check not in validation_body
+    or validation_body.find("load_manifest_once || return $?")
+    >= validation_body.find(format_check)
+):
+    fail("package-v4 validation is not immediately downstream of the one-pass reader")
+
+if len(sys.argv) == 4:
+    manifest_path = pathlib.Path(sys.argv[3])
+    if (
+        not manifest_path.is_absolute()
+        or not manifest_path.is_file()
+        or manifest_path.is_symlink()
+    ):
+        fail("optional manifest must be an absolute regular non-symlink file")
+    manifest_bytes = manifest_path.read_bytes()
+    if not manifest_bytes.endswith(b"\n"):
+        fail("manifest fixture must end in a newline")
+    try:
+        manifest_text = manifest_bytes.decode("utf-8")
+    except UnicodeDecodeError as error:
+        fail(f"manifest fixture is not UTF-8: {error}")
+    records = manifest_text.splitlines()
+    fields = [record.split("\t") for record in records]
+    if len(records) != 103 or any(
+        len(field) != 2 or not field[0] or not field[1] for field in fields
+    ):
+        fail("manifest fixture is not exactly 103 nonempty key/value records")
+    fixture_keys = tuple(field[0] for field in fields)
+    if fixture_keys != EXPECTED_MANIFEST_KEYS or len(set(fixture_keys)) != 103:
+        fail("manifest fixture does not use the exact unique production key sequence")
+    if fields[0][1] != "wg-mix-ebpf-b82-v6-package-v4":
+        fail("manifest fixture is not package-v4")
+
 required = (
     "case \"${MODE}\" in plan | run | restore)",
-    "wg-mix-ebpf-b82-v6-package-v3",
+    "wg-mix-ebpf-b82-v6-package-v4",
     "read_manifest_field physical_nic_forward_authority discard",
     "read_manifest_field physical_interface_lock discard",
     "read_manifest_field legacy_matrix_mode discard",
@@ -36,6 +220,13 @@ required = (
     "read_manifest_field realnic_acceptance_py_path discard",
     "read_manifest_field test_realnic_acceptance_py_path discard",
     "read_manifest_field test_realnic_acceptance_static_py_path discard",
+    "read_manifest_field root_veth_n_r_sh_path discard",
+    "read_manifest_field test_hermetic_veth_runner_sh_path discard",
+    "read_manifest_field test_veth_runner_static_py_path discard",
+    "read_manifest_field controller_seam_sh_path discard",
+    "read_manifest_field root_routed_veth_n_r_sh_path discard",
+    "read_manifest_field test_hermetic_routed_veth_harness_sh_path discard",
+    "read_manifest_field test_routed_veth_harness_static_py_path discard",
     "readonly STAGE_ROOT=\"${STAGING_PREFIX}/${GATE_ID}\"",
     "readonly SNAPSHOT_MANIFEST=\"${INTAKE_ROOT}/package-manifest.v1\"",
     "readonly SNAPSHOT_BUNDLE=\"${INTAKE_ROOT}/source-${PACKAGE_ID}.bundle\"",

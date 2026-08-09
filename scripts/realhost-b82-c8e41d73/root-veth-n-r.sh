@@ -10,7 +10,7 @@ readonly RESOURCE_ID='d34b8e65'
 readonly STATE_SCHEMA='owner,baseline,mutation-plan,veth,tcx,module-lease,cleanup-intent,restored|filesystem-retained'
 readonly STAGES_ROOT='/run/wg-mix-ebpf-source-stages'
 readonly EXPECTED_CONTROLLER_SOURCE="${STAGES_ROOT}/${CONTROLLER_RUN_ID}/source"
-readonly EXPECTED_BUNDLE="/home/siyixuan/wg-mix-ebpf-test/unpriv-${PACKAGE_ID}/source-${PACKAGE_ID}.bundle"
+readonly EXPECTED_BUNDLE="/run/wg-mix-ebpf-source-bootstrap-${CONTROLLER_RUN_ID}/source-${PACKAGE_ID}.bundle"
 readonly VETH_STAGE_ROOT="${STAGES_ROOT}/${VETH_RUN_ID}"
 readonly ROOT_BUNDLE="${VETH_STAGE_ROOT}/source-${PACKAGE_ID}-${RESOURCE_ID}.bundle"
 readonly VETH_SOURCE="${VETH_STAGE_ROOT}/source"
@@ -532,7 +532,7 @@ validate_package_bundle() {
   local canonical shape
   canonical="$(/usr/bin/readlink -e -- "${BUNDLE}")" || fail 'bundle-canonical'
   shape="$(/usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${BUNDLE}")" || fail 'bundle-stat'
-  [[ "${canonical}" == "${EXPECTED_BUNDLE}" && "${shape}" == 'siyixuan:siyixuan:600:1:regular file' && "$(sha256_file "${BUNDLE}")" == "${BUNDLE_SHA256}" ]] || fail 'bundle-identity' 79
+  [[ "${canonical}" == "${EXPECTED_BUNDLE}" && "${shape}" == 'root:root:600:1:regular file' && "$(sha256_file "${BUNDLE}")" == "${BUNDLE_SHA256}" ]] || fail 'bundle-identity' 79
 }
 
 create_roots() {

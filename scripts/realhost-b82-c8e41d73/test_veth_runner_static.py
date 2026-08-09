@@ -891,6 +891,11 @@ def check_shared_argv_and_parser(runner: str) -> None:
             fail(f"parser lacks duplicate guard for {option}")
     if parser.count("seen_commit == 0") != 1 or "seen_commit == 1" not in parser:
         fail("second --commit is not rejected and exactly one --commit required")
+    if (
+        '"${BUNDLE}" == "${EXPECTED_BUNDLE}"' not in parser
+        or '"${WG_STATE}" == \'absent\'' not in parser
+    ):
+        fail("parser does not bind the package bundle to the exact root-owned path")
 
 
 def check_self_and_tooling(runner: str) -> None:
@@ -909,6 +914,19 @@ def check_self_and_tooling(runner: str) -> None:
             '"${actual_sha}" == "${commit_sha}"',
         ),
         "runner self path/mode/blob/SHA identity",
+    )
+    bundle = function_body(runner, "validate_package_bundle")
+    require_literals(
+        bundle,
+        (
+            'canonical="$(/usr/bin/readlink -e -- "${BUNDLE}")"',
+            'shape="$(/usr/bin/stat -Lc \'%U:%G:%a:%h:%F\' -- "${BUNDLE}")"',
+            '"${canonical}" == "${EXPECTED_BUNDLE}"',
+            '"${shape}" == \'root:root:600:1:regular file\'',
+            '"$(sha256_file "${BUNDLE}")" == "${BUNDLE_SHA256}"',
+            "fail 'bundle-identity' 79",
+        ),
+        "root-owned package bundle identity",
     )
     run_all = function_body(runner, "run_all")
     restore_all = function_body(runner, "restore_all")
@@ -974,6 +992,7 @@ def main() -> None:
         (
             "readonly VETH_RUN_ID='a19f7c2e'",
             "readonly RESOURCE_ID='d34b8e65'",
+            'readonly EXPECTED_BUNDLE="/run/wg-mix-ebpf-source-bootstrap-${CONTROLLER_RUN_ID}/source-${PACKAGE_ID}.bundle"',
             'readonly VETH_STAGE_ROOT="${STAGES_ROOT}/${VETH_RUN_ID}"',
             'readonly ROOT_BUNDLE="${VETH_STAGE_ROOT}/source-${PACKAGE_ID}-${RESOURCE_ID}.bundle"',
             'readonly EVIDENCE_ROOT="${VETH_STAGE_ROOT}/veth-evidence-${RESOURCE_ID}"',
@@ -1008,6 +1027,8 @@ def main() -> None:
         fail("managed-ingress acceptance moved into OFFLOAD_TESTS")
     if re.search(r'clone[^\n]*"\$\{BUNDLE\}"', runner):
         fail("runner clones directly from the user-owned package bundle")
+    if "/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/source-4f2a9b61.bundle" in runner:
+        fail("standalone runner still accepts the user-owned bundle authority")
     if "MODULE_PHASE" in runner or "phase-module.v1" in runner:
         fail("standalone runner retains a second module authority marker")
     for literal in (

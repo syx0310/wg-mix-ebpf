@@ -55,6 +55,9 @@ class Lifecycle:
     dependency_caches: str = "absent"  # absent, exact, foreign
     dependencies_downloaded: bool = False
     dependencies_verified: bool = False
+    artifact_intent: str = "absent"  # absent, exact, foreign
+    artifact_receipt: str = "absent"  # absent, exact, foreign
+    artifact_root: str = "absent"  # absent, partial, exact, foreign
     dependency_binary: bool = False
     preflight: bool = False
     runtime_temp: str = "absent"  # absent, exact, foreign
@@ -95,7 +98,31 @@ def require_exact_or_absent(value: str, label: str) -> None:
         raise Rejected(label)
 
 
+def classify_artifact_retry_state_model(state: Lifecycle) -> str:
+    """Model the read-only classifier that runs before any bootstrap or P0 work."""
+    if state.artifact_receipt != "absent":
+        if (
+            state.artifact_intent != "exact"
+            or state.artifact_receipt != "exact"
+            or state.artifact_root != "exact"
+        ):
+            raise Rejected("artifact-receipt-drift")
+        return "receipt"
+    if state.artifact_intent != "absent":
+        if state.artifact_intent != "exact" or state.artifact_root not in {
+            "absent",
+            "partial",
+            "exact",
+        }:
+            raise Rejected("artifact-intent-drift")
+        raise Rejected("artifact-intent-without-receipt")
+    if state.artifact_root != "absent":
+        raise Rejected("artifact-root-without-intent")
+    return "absent"
+
+
 def run_model(state: Lifecycle, cut_after: str | None = None) -> None:
+    artifact_state = classify_artifact_retry_state_model(state)
     if not state.owner or not state.baseline or not state.operation:
         raise Rejected("foundation")
     if state.cleanup or state.restored or not state.bpf_baseline or not state.module_lock:
@@ -115,6 +142,15 @@ def run_model(state: Lifecycle, cut_after: str | None = None) -> None:
     if not state.dependencies_verified:
         state.dependencies_verified = True
         checkpoint("dependency-verify", cut_after)
+    if artifact_state == "absent":
+        state.artifact_intent = "exact"
+        checkpoint("artifact-intent", cut_after)
+        state.artifact_root = "partial"
+        checkpoint("artifact-build", cut_after)
+        state.artifact_root = "exact"
+        checkpoint("artifact-mode", cut_after)
+        state.artifact_receipt = "exact"
+        checkpoint("artifact-receipt", cut_after)
     if not state.dependency_binary:
         state.dependency_binary = True
         checkpoint("dependency-build", cut_after)
@@ -200,6 +236,7 @@ def restore_model(state: Lifecycle, cut_after: str | None = None) -> None:
         return
     if not state.owner or not state.baseline or not state.operation or not state.module_lock:
         raise Rejected("foundation")
+    artifact_state = classify_artifact_retry_state_model(state)
     if not state.bpf_baseline:
         raise Rejected("bpf-drift")
     if state.dependency_caches == "foreign":
@@ -212,6 +249,26 @@ def restore_model(state: Lifecycle, cut_after: str | None = None) -> None:
         or state.preflight
     ):
         raise Rejected("dependency-resource-without-intent")
+    if artifact_state == "absent":
+        if (
+            state.runtime_temp != "absent"
+            or state.veth_intent
+            or state.receipts
+            or state.veth != "absent"
+            or state.address != "absent"
+            or state.route != "absent"
+            or state.neighbor != "absent"
+            or state.offload != "baseline"
+            or state.module != "absent"
+            or state.module_intent
+        ):
+            raise Rejected("live-state-before-artifact-receipt")
+        if not state.cleanup:
+            state.cleanup = True
+            checkpoint("cleanup-intent", cut_after)
+        state.restored = True
+        checkpoint("restored", cut_after)
+        return
 
     receipt_prefix = tuple(name for name in SETUP if name in state.receipts)
     if receipt_prefix != SETUP[: len(receipt_prefix)]:
@@ -297,6 +354,7 @@ def exercise_lifecycle_model() -> None:
         "dependency-cache-create",
         "dependency-download",
         "dependency-verify",
+        "artifact-receipt",
         "dependency-build",
         "dependency-receipt",
         "runtime-temp",
@@ -336,6 +394,32 @@ def exercise_lifecycle_model() -> None:
             or state.module != "absent"
         ):
             fail(f"setup cut {cut} did not restore directly from partial state: {state}")
+
+    for cut in ("artifact-intent", "artifact-build", "artifact-mode"):
+        state = Lifecycle()
+        try:
+            run_model(state, cut)
+        except FailureCut:
+            pass
+        else:
+            fail(f"artifact producer cut {cut} did not fire")
+        retained = copy.deepcopy(state)
+        try:
+            run_model(state)
+        except Rejected:
+            pass
+        else:
+            fail(f"artifact intent-only retry after {cut} was accepted")
+        if state != retained:
+            fail(f"artifact intent-only retry after {cut} caused side effects")
+        try:
+            restore_model(state)
+        except Rejected:
+            pass
+        else:
+            fail(f"artifact intent-only restore after {cut} was accepted")
+        if state != retained:
+            fail(f"artifact intent-only restore after {cut} caused live-state changes")
 
     clean_stage = Lifecycle()
     run_model(clean_stage)
@@ -394,6 +478,9 @@ def exercise_lifecycle_model() -> None:
         "foreign-veth-alias": lambda state: setattr(state, "veth", "foreign-alias"),
         "foreign-runtime-temp": lambda state: setattr(state, "runtime_temp", "foreign"),
         "foreign-dependency-cache": lambda state: setattr(state, "dependency_caches", "foreign"),
+        "foreign-artifact-intent": lambda state: setattr(state, "artifact_intent", "foreign"),
+        "foreign-artifact-receipt": lambda state: setattr(state, "artifact_receipt", "foreign"),
+        "foreign-artifact-root": lambda state: setattr(state, "artifact_root", "foreign"),
         "foreign-route": lambda state: setattr(state, "route", "foreign"),
         "foreign-offload": lambda state: setattr(state, "offload", "foreign"),
         "foreign-module": lambda state: setattr(state, "module", "foreign"),
@@ -408,6 +495,22 @@ def exercise_lifecycle_model() -> None:
         except Rejected:
             continue
         fail(f"restore model accepted {label}")
+
+    for label, state in {
+        "receipt-without-intent": Lifecycle(
+            artifact_receipt="exact", artifact_root="exact"
+        ),
+        "root-without-intent": Lifecycle(artifact_root="exact"),
+    }.items():
+        before = copy.deepcopy(state)
+        try:
+            run_model(state)
+        except Rejected:
+            pass
+        else:
+            fail(f"run model accepted {label}")
+        if state != before:
+            fail(f"early artifact classifier mutated {label}")
 
     incomplete = Lifecycle(
         preflight=True,
@@ -462,7 +565,7 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
     required = (
         "readonly RUN_ID='c8e41d73'",
         "readonly RESOURCE_ID='5b8d30f1'",
-        "STATE_SCHEMA='owner,baseline,operation-intent,dependency-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module-intent,module,tested,cleanup-intent,restored'",
+        "STATE_SCHEMA='owner,baseline,operation-intent,dependency-intent,artifact-intent,artifacts,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module-intent,module,tested,cleanup-intent,restored'",
         "readonly LOCAL_IPV4='198.18.82.1'",
         "readonly REMOTE_IPV4='198.18.82.2'",
         "readonly ROUTE_MTU='1500'",
@@ -495,6 +598,8 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         "TestFakeTCPRealHostRoutedHarnessSelectedBinaryContract",
         "ensure_operation_intent",
         "ensure_dependency_intent",
+        "classify_artifact_retry_state",
+        "ensure_artifacts",
         "ensure_dependency_preflight",
         "ensure_runtime_temp",
         "ensure_veth_intent",
@@ -583,24 +688,56 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
 
     run = function_body(runner, "run_state_machine")
     run_order = (
+        "classify_artifact_retry_state",
+        "bootstrap_evidence",
         "c8_checksum_module_acquire",
-        "configure_checksum_module_lease",
         "ensure_owner",
         "ensure_baseline",
         "ensure_operation_intent",
         "ensure_dependency_intent",
         "ensure_dependency_preflight",
+        "configure_checksum_module_lease",
         "ensure_runtime_temp",
         "ensure_veth_phase",
     )
     positions = [run.index(item) for item in run_order]
     if positions != sorted(positions):
         fail("run did not finish dependency/build preflight before host mutation")
+    first_run_statement = next(
+        line.strip() for line in run.splitlines() if line.strip()
+    )
+    if first_run_statement != "classify_artifact_retry_state":
+        fail("artifact retry classifier is not the first run-state operation")
+    classifier = function_body(runner, "classify_artifact_retry_state")
+    for forbidden_classifier in (
+        "run_operation",
+        "write_phase",
+        "bootstrap_evidence",
+        "ensure_dependency_preflight",
+        "preflight-mod-download",
+        "/usr/bin/make",
+        "ensure_veth_phase",
+    ):
+        if forbidden_classifier in classifier:
+            fail(
+                "artifact retry classifier has a side-effect authority: "
+                f"{forbidden_classifier}"
+            )
+    for classifier_gate in (
+        "artifact-receipt-without-intent-preflight",
+        "artifact-intent-without-receipt-preflight",
+        "artifact-root-without-intent-preflight",
+        "validate_artifact_receipt",
+    ):
+        if classifier_gate not in classifier:
+            fail(f"artifact retry classifier is missing {classifier_gate!r}")
     restore_prefix = (
+        "bootstrap_evidence",
         "c8_checksum_module_acquire",
-        "configure_checksum_module_lease",
         "ensure_owner",
         "ensure_baseline",
+        "validate_dependency_caches_for_restore",
+        "configure_checksum_module_lease",
         "validate_partial_setup_for_restore",
     )
     positions = [restore.index(item) for item in restore_prefix]
@@ -618,6 +755,29 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
         )
     ):
         fail("dependency preflight does not compile and bind every selected test")
+    preflight_order = (
+        "preflight-mod-download",
+        "preflight-mod-verify",
+        "ensure_artifacts",
+        "preflight-build",
+    )
+    if [preflight.index(item) for item in preflight_order] != sorted(
+        preflight.index(item) for item in preflight_order
+    ):
+        fail("dependency download/artifact/preflight build order drifted")
+    artifacts = function_body(runner, "ensure_artifacts")
+    artifact_order = (
+        'write_phase "${ARTIFACT_INTENT_PHASE}"',
+        "run_operation P.artifact-build artifact-build",
+        "run_operation P.artifact-mode artifact-mode",
+        "load_artifact_identity",
+        'write_phase "${ARTIFACT_PHASE}"',
+        "validate_artifact_receipt || fail 'artifact-receipt-postwrite'",
+    )
+    if [artifacts.index(item) for item in artifact_order] != sorted(
+        artifacts.index(item) for item in artifact_order
+    ):
+        fail("artifact intent/build/mode/receipt order drifted")
     if "run_operation" in function_body(runner, "validate_dependency_preflight"):
         fail("restore dependency validation can execute a build")
 
@@ -637,6 +797,8 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
     cleanup = function_body(runner, "render_cleanup_intent")
     for receipt in (
         "DEPENDENCY_INTENT",
+        "ARTIFACT_INTENT",
+        "ARTIFACT",
         "DEPENDENCY",
         "VETH_INTENT",
         "VETH",
@@ -671,8 +833,7 @@ def inspect_sources(runner_path: pathlib.Path, runner: str, seam: str) -> None:
     for required_seam in (
         "build_runner_argv",
         "/bin/bash -p \"${ROOT_RUNNER}\"",
-        "credential_read=0 remote_connections=0",
-        "transport_integration=pending",
+        'exec /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C "${RUNNER_ARGV[@]}"',
     ):
         if required_seam not in seam:
             fail(f"controller seam is missing {required_seam!r}")

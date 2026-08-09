@@ -5,7 +5,7 @@ umask 077
 
 readonly RUN_ID='c8e41d73'
 readonly RESOURCE_ID='5b8d30f1'
-readonly STATE_SCHEMA='owner,baseline,operation-intent,dependency-intent,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module-intent,module,tested,cleanup-intent,restored'
+readonly STATE_SCHEMA='owner,baseline,operation-intent,dependency-intent,artifact-intent,artifacts,dependency-preflight,veth-intent,veth,address,route,neighbor,offload,module-intent,module,tested,cleanup-intent,restored'
 readonly STAGE_ROOT="/run/wg-mix-ebpf-source-stages/${RUN_ID}"
 readonly EXPECTED_SOURCE="${STAGE_ROOT}/source"
 readonly EVIDENCE_ROOT="${STAGE_ROOT}/routed-evidence-${RESOURCE_ID}"
@@ -19,6 +19,8 @@ readonly OWNER_PHASE="${EVIDENCE_ROOT}/phase-owner.v1"
 readonly BASELINE_PHASE="${EVIDENCE_ROOT}/phase-baseline.v1"
 readonly OPERATION_PHASE="${EVIDENCE_ROOT}/phase-operation-intent.v1"
 readonly DEPENDENCY_INTENT_PHASE="${EVIDENCE_ROOT}/phase-dependency-intent.v1"
+readonly ARTIFACT_INTENT_PHASE="${EVIDENCE_ROOT}/phase-artifact-intent.v1"
+readonly ARTIFACT_PHASE="${EVIDENCE_ROOT}/phase-artifacts.v1"
 readonly DEPENDENCY_PHASE="${EVIDENCE_ROOT}/phase-dependency-preflight.v1"
 readonly VETH_INTENT_PHASE="${EVIDENCE_ROOT}/phase-veth-intent.v1"
 readonly VETH_PHASE="${EVIDENCE_ROOT}/phase-veth.v1"
@@ -47,6 +49,7 @@ readonly REMOTE_IPV4='198.18.82.2'
 readonly PREFIX_BITS='32'
 readonly ROUTE_MTU='1500'
 readonly MODULE_NAME='wg_mix_faketcp_checksum'
+readonly ARTIFACT_ROOT="${EXPECTED_SOURCE}/build"
 readonly EXPERIMENTAL_OBJECT="${EXPECTED_SOURCE}/build/wg_mix_faketcp_experimental.o"
 readonly BASELINE_OBJECT="${EXPECTED_SOURCE}/build/wg_mix_tc.o"
 readonly MODULE_OBJECT="${EXPECTED_SOURCE}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko"
@@ -69,6 +72,10 @@ readonly -a POSITIVE_TESTS=(
 )
 readonly EXPECTED_HOSTNAME='ubuntu-2604-test'
 readonly EXPECTED_MACHINE_ID='9db3fb717cc74974b2a6b243d67f67b9'
+readonly EXPECTED_KERNEL_RELEASE='7.0.0-28-generic'
+readonly KERNEL_BUILD="/lib/modules/${EXPECTED_KERNEL_RELEASE}/build"
+readonly KERNEL_BUILD_CANONICAL="/usr/src/linux-headers-${EXPECTED_KERNEL_RELEASE}"
+readonly VMLINUX_BTF='/sys/kernel/btf/vmlinux'
 
 MODE=''
 SOURCE=''
@@ -76,6 +83,10 @@ COMMIT=''
 EXPERIMENTAL_SHA256=''
 BASELINE_SHA256=''
 MODULE_SHA256=''
+MODULE_SRCVERSION=''
+MODULE_VERMAGIC=''
+VMLINUX_BTF_SHA256=''
+ARTIFACT_STATE=''
 INITIAL_NETNS=''
 BOOT_ID=''
 VETH_A_IFINDEX=''
@@ -111,10 +122,7 @@ readonly -a GIT_COMMAND=(
 usage() {
   printf '%s\n' \
     "usage: $0 {plan|run|restore} --source ${EXPECTED_SOURCE}" \
-    '  --commit 40-lowercase-hex' \
-    '  --experimental-sha256 64-lowercase-hex' \
-    '  --baseline-sha256 64-lowercase-hex' \
-    '  --module-sha256 64-lowercase-hex' >&2
+    '  --commit 40-lowercase-hex' >&2
 }
 
 fail() {
@@ -132,7 +140,7 @@ valid_sha256() {
 }
 
 parse_arguments() {
-  local seen_source=0 seen_commit=0 seen_experimental=0 seen_baseline=0 seen_module=0
+  local seen_source=0 seen_commit=0
   (($# >= 1)) || { usage; return 64; }
   MODE="$1"
   shift
@@ -148,29 +156,13 @@ parse_arguments() {
         ((seen_commit == 0)) || return 65
         seen_commit=1; COMMIT="$2"
         ;;
-      --experimental-sha256)
-        ((seen_experimental == 0)) || return 65
-        seen_experimental=1; EXPERIMENTAL_SHA256="$2"
-        ;;
-      --baseline-sha256)
-        ((seen_baseline == 0)) || return 65
-        seen_baseline=1; BASELINE_SHA256="$2"
-        ;;
-      --module-sha256)
-        ((seen_module == 0)) || return 65
-        seen_module=1; MODULE_SHA256="$2"
-        ;;
       *) usage; return 64 ;;
     esac
     shift 2
   done
-  ((seen_source == 1 && seen_commit == 1 && seen_experimental == 1 &&
-    seen_baseline == 1 && seen_module == 1)) || return 65
+  ((seen_source == 1 && seen_commit == 1)) || return 65
   [[ "${SOURCE}" == "${EXPECTED_SOURCE}" ]] || return 65
   valid_commit "${COMMIT}" || return 65
-  valid_sha256 "${EXPERIMENTAL_SHA256}" || return 65
-  valid_sha256 "${BASELINE_SHA256}" || return 65
-  valid_sha256 "${MODULE_SHA256}" || return 65
 }
 
 quote_argv() { printf '%q ' "$@"; }
@@ -205,6 +197,20 @@ build_argv() {
     bpf-links) OP_TARGET='global-bpf-links'; OP_ARGV=(/usr/sbin/bpftool -j link show) ;;
     preflight-mod-download) OP_TARGET="${GO_MOD_CACHE}"; OP_ARGV=("${GO_DOWNLOAD_ENV[@]}" /usr/bin/timeout --signal=TERM --kill-after=10s 10m /usr/bin/go -C "${SOURCE}" mod download all) ;;
     preflight-mod-verify) OP_TARGET="${GO_MOD_CACHE}"; OP_ARGV=("${GO_OFFLINE_ENV[@]}" /usr/bin/timeout --signal=TERM --kill-after=10s 5m /usr/bin/go -C "${SOURCE}" mod verify) ;;
+    artifact-build)
+      OP_TARGET="${ARTIFACT_ROOT}"
+      OP_ARGV=("${GO_OFFLINE_ENV[@]}" GO=/usr/bin/go CLANG=/usr/bin/clang
+        BPF_OBJECT="${BASELINE_OBJECT}"
+        FAKETCP_EXPERIMENTAL_BPF_OBJECT="${EXPERIMENTAL_OBJECT}"
+        FAKETCP_CHECKSUM_KMOD_SOURCE="${SOURCE}/kernel/faketcp_checksum"
+        FAKETCP_CHECKSUM_KMOD_OUTPUT="${SOURCE}/build/faketcp_checksum_kmod"
+        FAKETCP_CHECKSUM_KMOD_OBJECT="${MODULE_OBJECT}"
+        KERNEL_RELEASE="${EXPECTED_KERNEL_RELEASE}" KERNEL_BUILD="${KERNEL_BUILD}"
+        /usr/bin/timeout --signal=TERM --kill-after=30s 30m
+        /usr/bin/make --no-print-directory -C "${SOURCE}"
+        build-faketcp-checksum-kmod test-bpf-object-manifests)
+      ;;
+    artifact-mode) OP_TARGET="${EXPERIMENTAL_OBJECT}:${BASELINE_OBJECT}:${MODULE_OBJECT}"; OP_ARGV=(/usr/bin/chmod 0600 -- "${EXPERIMENTAL_OBJECT}" "${BASELINE_OBJECT}" "${MODULE_OBJECT}") ;;
     preflight-build) OP_TARGET="${PREFLIGHT_BINARY}"; OP_ARGV=("${GO_OFFLINE_ENV[@]}" /usr/bin/timeout --signal=TERM --kill-after=10s 10m /usr/bin/go -C "${SOURCE}" test -c -o "${PREFLIGHT_BINARY}" ./internal/dataplane) ;;
     veth-add) OP_TARGET="${VETH_A}:${VETH_B}"; OP_ARGV=(/usr/sbin/ip link add "${VETH_A}" address "${VETH_A_MAC}" type veth peer name "${VETH_B}" address "${VETH_B_MAC}") ;;
     veth-alias-a) OP_TARGET="${VETH_A}"; OP_ARGV=(/usr/sbin/ip link set dev "${VETH_A}" alias "${VETH_A_ALIAS}") ;;
@@ -267,6 +273,10 @@ render_plan() {
   plan_operation C3 go-tmp-mkdir
   plan_operation P0 preflight-mod-download
   plan_operation P1 preflight-mod-verify
+  printf 'P.artifact-intent operation=artifact-intent target=%q argv=internal:noclobber-phase-0600\n' "${ARTIFACT_INTENT_PHASE}"
+  plan_operation P.artifact-build artifact-build
+  plan_operation P.artifact-mode artifact-mode
+  printf 'P.artifact-receipt operation=artifact-receipt target=%q argv=internal:noclobber-phase-0600\n' "${ARTIFACT_PHASE}"
   plan_operation P2 preflight-build
   for name in "${PREFLIGHT_CONTRACT_TEST}" "${NEGATIVE_TEST}" "${POSITIVE_TESTS[@]}"; do
     plan_operation "P.${name}" "list:${name}"
@@ -298,8 +308,9 @@ render_plan() {
     IFS='|' read -r label operation <<<"${spec}"
     plan_operation "${label}" "${operation}"
   done
-  printf 'B82_ROUTED_VETH_WRITE_SET filesystem=%s,%s,%s,%s,%s,%s,%s shared_lock=%s:advisory-only network=veth:%s,%s,address:%s/%s,route:%s/%s,neighbor:%s,offload:%s:tso module=%s,lease_id:%s bpf=transient-unpinned-test-owned evidence_retained=1\n' \
+  printf 'B82_ROUTED_VETH_WRITE_SET filesystem=%s,%s,%s,%s,%s,%s,%s,%s shared_lock=%s:advisory-only network=veth:%s,%s,address:%s/%s,route:%s/%s,neighbor:%s,offload:%s:tso module=%s,lease_id:%s bpf=transient-unpinned-test-owned evidence_retained=1\n' \
     "${EVIDENCE_ROOT}" "${PREFLIGHT_BINARY}" "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}" "${RUNTIME_TEMP}" \
+    "${ARTIFACT_ROOT}" \
     "${MODULE_LEASE_LOCK}" "${VETH_A}" "${VETH_B}" "${LOCAL_IPV4}" "${PREFIX_BITS}" "${REMOTE_IPV4}" \
     "${PREFIX_BITS}" "${REMOTE_IPV4}" "${VETH_A}" "${MODULE_NAME}" "${MODULE_LEASE_ID}"
   printf 'B82_ROUTED_VETH_RESTORE_ORDER cleanup-intent,bpf-baseline,module,offload,neighbor,route,address,veth,bpf-baseline,restored retryable=1 exact_reverse=1\n'
@@ -415,9 +426,7 @@ render_owner() {
   printf '%s\n' \
     'format=wg-mix-ebpf-b82-routed-owner-v1' \
     "run_id=${RUN_ID}" "resource_id=${RESOURCE_ID}" "boot_id=${BOOT_ID}" \
-    "netns=${INITIAL_NETNS}" "source=${SOURCE}" "commit=${COMMIT}" \
-    "experimental_sha256=${EXPERIMENTAL_SHA256}" \
-    "baseline_sha256=${BASELINE_SHA256}" "module_sha256=${MODULE_SHA256}"
+    "netns=${INITIAL_NETNS}" "source=${SOURCE}" "commit=${COMMIT}"
 }
 
 render_baseline() {
@@ -437,6 +446,8 @@ render_operation_intent() {
     "source=${SOURCE}" "commit=${COMMIT}" \
     "dependency_caches=${GO_CACHE},${GO_MOD_CACHE},${GO_PATH},${GO_TMP}" \
     'dependency_producer=bounded-go-module-proxy-then-offline,mode=readonly' \
+    "artifact_intent=${ARTIFACT_INTENT_PHASE}" "artifact_receipt=${ARTIFACT_PHASE}" \
+    "artifacts=${BASELINE_OBJECT},${EXPERIMENTAL_OBJECT},${MODULE_OBJECT}" \
     "preflight_binary=${PREFLIGHT_BINARY}" \
     "runtime_temp=${RUNTIME_TEMP},baseline=absent,operation=create,owner=0:0,mode=0700,restore=retained" \
     "veth=${VETH_A},${VETH_B}" "address=${LOCAL_IPV4}/${PREFIX_BITS}" \
@@ -467,10 +478,157 @@ render_dependency_preflight() {
     "go_mod_cache=${GO_MOD_CACHE},identity=$(directory_binding "${GO_MOD_CACHE}")" \
     "go_path=${GO_PATH},identity=$(directory_binding "${GO_PATH}")" \
     "go_tmp=${GO_TMP},identity=$(directory_binding "${GO_TMP}")" \
+    "artifact_receipt_sha256=$(sha256_file "${ARTIFACT_PHASE}")" \
     'module_cache_produced=1' 'module_cache_verified=1' \
     'producer_proxy=https://proxy.golang.org' 'consumer_proxy=off' 'go_mod=readonly' \
     "contract_test=${PREFLIGHT_CONTRACT_TEST}:passed" \
     "tests=${NEGATIVE_TEST},${POSITIVE_TESTS[*]}"
+}
+
+source_tree() {
+  "${GIT_COMMAND[@]}" -C "${SOURCE}" rev-parse --verify "${COMMIT}^{tree}"
+}
+
+makefile_blob() {
+  "${GIT_COMMAND[@]}" -C "${SOURCE}" rev-parse "${COMMIT}:Makefile"
+}
+
+artifact_identity() {
+  /usr/bin/stat -Lc '%d:%i:%u:%g:%a:%h:%F' -- "$1"
+}
+
+load_build_input_identity() {
+  local btf_identity
+  [[ -f "${SOURCE}/Makefile" && ! -L "${SOURCE}/Makefile" ]] || return 79
+  [[ "$(/usr/bin/readlink -e -- "${KERNEL_BUILD}")" == "${KERNEL_BUILD_CANONICAL}" ]] || return 79
+  [[ "$(/usr/bin/readlink -e -- "${VMLINUX_BTF}")" == "${VMLINUX_BTF}" ]] || return 79
+  btf_identity="$(artifact_identity "${VMLINUX_BTF}")" || return $?
+  [[ "${btf_identity}" =~ ^[0-9]+:[0-9]+:0:0:444:1:regular\ file$ ]] || return 79
+  VMLINUX_BTF_SHA256="$(sha256_file "${VMLINUX_BTF}")" || return $?
+  valid_sha256 "${VMLINUX_BTF_SHA256}"
+}
+
+render_artifact_intent() {
+  printf '%s\n' \
+    'format=wg-mix-ebpf-b82-routed-artifact-intent-v1' \
+    "run_id=${RUN_ID}" "resource_id=${RESOURCE_ID}" "commit=${COMMIT}" \
+    "tree=$(source_tree)" "makefile_blob=$(makefile_blob)" \
+    "makefile_sha256=$(sha256_file "${SOURCE}/Makefile")" \
+    "kernel_release=${EXPECTED_KERNEL_RELEASE}" "kernel_build=${KERNEL_BUILD}" \
+    "kernel_build_canonical=${KERNEL_BUILD_CANONICAL}" \
+    "vmlinux_btf=${VMLINUX_BTF}" "vmlinux_btf_identity=$(artifact_identity "${VMLINUX_BTF}")" \
+    "vmlinux_btf_sha256=${VMLINUX_BTF_SHA256}" \
+    'producer=/usr/bin/make:build-faketcp-checksum-kmod,test-bpf-object-manifests' \
+    'producer_network=off' \
+    "artifact_root=${ARTIFACT_ROOT}" 'artifact_root_baseline=absent' \
+    "baseline_path=${BASELINE_OBJECT}" "experimental_path=${EXPERIMENTAL_OBJECT}" \
+    "module_path=${MODULE_OBJECT}" 'retry=intent-only-reject'
+}
+
+load_artifact_identity() {
+  local path identity status_normal status_all
+  require_root_directory "${ARTIFACT_ROOT}" || return 79
+  for path in "${BASELINE_OBJECT}" "${EXPERIMENTAL_OBJECT}" "${MODULE_OBJECT}"; do
+    [[ -f "${path}" && ! -L "${path}" ]] || return 79
+    identity="$(artifact_identity "${path}")" || return $?
+    [[ "${identity}" =~ ^[0-9]+:[0-9]+:0:0:600:1:regular\ file$ ]] || return 79
+  done
+  BASELINE_SHA256="$(sha256_file "${BASELINE_OBJECT}")" || return $?
+  EXPERIMENTAL_SHA256="$(sha256_file "${EXPERIMENTAL_OBJECT}")" || return $?
+  MODULE_SHA256="$(sha256_file "${MODULE_OBJECT}")" || return $?
+  valid_sha256 "${BASELINE_SHA256}" && valid_sha256 "${EXPERIMENTAL_SHA256}" &&
+    valid_sha256 "${MODULE_SHA256}" || return 79
+  MODULE_SRCVERSION="$(/usr/sbin/modinfo -F srcversion "${MODULE_OBJECT}")" || return $?
+  MODULE_SRCVERSION="${MODULE_SRCVERSION^^}"
+  [[ "${MODULE_SRCVERSION}" =~ ^[0-9A-F]{8,64}$ ]] || return 79
+  MODULE_VERMAGIC="$(/usr/sbin/modinfo -F vermagic "${MODULE_OBJECT}")" || return $?
+  [[ "${MODULE_VERMAGIC}" == "${EXPECTED_KERNEL_RELEASE} "* &&
+    "${MODULE_VERMAGIC}" != *$'\n'* && "${MODULE_VERMAGIC}" != *$'\r'* ]] || return 79
+  status_normal="$("${GIT_COMMAND[@]}" -C "${SOURCE}" status --porcelain=v1 \
+    --untracked-files=normal --ignore-submodules=none)" || return $?
+  status_all="$("${GIT_COMMAND[@]}" -C "${SOURCE}" status --porcelain=v1 \
+    --untracked-files=all --ignore-submodules=none)" || return $?
+  [[ -z "${status_normal}" && -z "${status_all}" ]]
+}
+
+render_artifact_receipt() {
+  printf '%s\n' \
+    'format=wg-mix-ebpf-b82-routed-artifacts-v1' \
+    "run_id=${RUN_ID}" "resource_id=${RESOURCE_ID}" "commit=${COMMIT}" \
+    "tree=$(source_tree)" "makefile_blob=$(makefile_blob)" \
+    "makefile_sha256=$(sha256_file "${SOURCE}/Makefile")" \
+    "kernel_release=${EXPECTED_KERNEL_RELEASE}" "kernel_build=${KERNEL_BUILD}" \
+    "kernel_build_canonical=${KERNEL_BUILD_CANONICAL}" \
+    "vmlinux_btf=${VMLINUX_BTF}" "vmlinux_btf_identity=$(artifact_identity "${VMLINUX_BTF}")" \
+    "vmlinux_btf_sha256=${VMLINUX_BTF_SHA256}" \
+    "intent_sha256=$(sha256_file "${ARTIFACT_INTENT_PHASE}")" \
+    "artifact_root=${ARTIFACT_ROOT}" \
+    "artifact_root_identity=$(/usr/bin/stat -Lc '%d:%i:%u:%g:%a:%F' -- "${ARTIFACT_ROOT}")" \
+    "baseline_path=${BASELINE_OBJECT}" "baseline_identity=$(artifact_identity "${BASELINE_OBJECT}")" \
+    "baseline_sha256=${BASELINE_SHA256}" \
+    "experimental_path=${EXPERIMENTAL_OBJECT}" \
+    "experimental_identity=$(artifact_identity "${EXPERIMENTAL_OBJECT}")" \
+    "experimental_sha256=${EXPERIMENTAL_SHA256}" \
+    "module_path=${MODULE_OBJECT}" "module_identity=$(artifact_identity "${MODULE_OBJECT}")" \
+    "module_sha256=${MODULE_SHA256}" "module_srcversion=${MODULE_SRCVERSION}" \
+    "module_vermagic=${MODULE_VERMAGIC}"
+}
+
+validate_artifact_receipt() {
+  local expected
+  load_build_input_identity || return $?
+  phase_matches "${ARTIFACT_INTENT_PHASE}" "$(render_artifact_intent)" || return 79
+  load_artifact_identity || return $?
+  expected="$(render_artifact_receipt)" || return $?
+  phase_matches "${ARTIFACT_PHASE}" "${expected}"
+}
+
+classify_artifact_retry_state() {
+  local intent_present=0 receipt_present=0
+  [[ ! -e "${ARTIFACT_INTENT_PHASE}" && ! -L "${ARTIFACT_INTENT_PHASE}" ]] || intent_present=1
+  [[ ! -e "${ARTIFACT_PHASE}" && ! -L "${ARTIFACT_PHASE}" ]] || receipt_present=1
+  if ((receipt_present)); then
+    ((intent_present)) || fail 'artifact-receipt-without-intent-preflight' 79
+    [[ -f "${ARTIFACT_INTENT_PHASE}" && ! -L "${ARTIFACT_INTENT_PHASE}" &&
+      -f "${ARTIFACT_PHASE}" && ! -L "${ARTIFACT_PHASE}" ]] ||
+      fail 'artifact-receipt-shape-preflight' 79
+    validate_artifact_receipt || fail 'artifact-receipt-drift-preflight' 79
+    return
+  fi
+  if ((intent_present)); then
+    [[ -f "${ARTIFACT_INTENT_PHASE}" && ! -L "${ARTIFACT_INTENT_PHASE}" ]] ||
+      fail 'artifact-intent-shape-preflight' 79
+    load_build_input_identity || fail 'artifact-intent-build-input-preflight' 79
+    phase_matches "${ARTIFACT_INTENT_PHASE}" "$(render_artifact_intent)" ||
+      fail 'artifact-intent-drift-preflight' 79
+    fail 'artifact-intent-without-receipt-preflight' 78
+  fi
+  [[ ! -e "${ARTIFACT_ROOT}" && ! -L "${ARTIFACT_ROOT}" ]] ||
+    fail 'artifact-root-without-intent-preflight' 79
+}
+
+ensure_artifacts() {
+  load_build_input_identity || fail 'artifact-build-input-identity' $?
+  if [[ -e "${ARTIFACT_PHASE}" || -L "${ARTIFACT_PHASE}" ]]; then
+    validate_artifact_receipt || fail 'artifact-receipt-drift' 79
+    return
+  fi
+  [[ ! -L "${ARTIFACT_PHASE}" ]] || fail 'artifact-receipt-symlink' 79
+  if [[ -e "${ARTIFACT_INTENT_PHASE}" || -L "${ARTIFACT_INTENT_PHASE}" ]]; then
+    phase_matches "${ARTIFACT_INTENT_PHASE}" "$(render_artifact_intent)" ||
+      fail 'artifact-intent-drift' 79
+    fail 'artifact-intent-without-receipt' 78
+  fi
+  [[ ! -e "${ARTIFACT_ROOT}" && ! -L "${ARTIFACT_ROOT}" ]] ||
+    fail 'artifact-root-preexists' 79
+  write_phase "${ARTIFACT_INTENT_PHASE}" "$(render_artifact_intent)" ||
+    fail 'artifact-intent-write' $?
+  run_operation P.artifact-build artifact-build || fail 'artifact-build' $?
+  run_operation P.artifact-mode artifact-mode || fail 'artifact-mode' $?
+  load_artifact_identity || fail 'artifact-identity' $?
+  write_phase "${ARTIFACT_PHASE}" "$(render_artifact_receipt)" ||
+    fail 'artifact-receipt-write' $?
+  validate_artifact_receipt || fail 'artifact-receipt-postwrite' $?
 }
 
 render_veth_intent() {
@@ -504,12 +662,12 @@ phase_matches() {
   [[ "$(/usr/bin/cat -- "${path}")" == "${expected}" ]]
 }
 
-verify_source_and_artifacts() {
-  local actual head mapped self_blob actual_blob status line identity
+verify_source_identity() {
+  local head mapped self_blob actual_blob status line
   [[ "$EUID" == 0 ]] || fail 'root-required' 77
   [[ "$(/usr/bin/hostname)" == "${EXPECTED_HOSTNAME}" ]] || fail 'hostname' 77
   [[ "$(/usr/bin/cat /etc/machine-id)" == "${EXPECTED_MACHINE_ID}" ]] || fail 'machine-id' 77
-  [[ "$(/usr/bin/uname -r)" == 7.0.* ]] || fail 'kernel-release' 77
+  [[ "$(/usr/bin/uname -r)" == "${EXPECTED_KERNEL_RELEASE}" ]] || fail 'kernel-release' 77
   INITIAL_NETNS="$(/usr/bin/readlink /proc/self/ns/net)" || fail 'self-netns'
   [[ "${INITIAL_NETNS}" == "$(/usr/bin/readlink /proc/1/ns/net)" && "${INITIAL_NETNS}" == net:\[*\] ]] || fail 'initial-netns' 77
   BOOT_ID="$(/usr/bin/cat /proc/sys/kernel/random/boot_id)" || fail 'boot-id'
@@ -524,17 +682,6 @@ verify_source_and_artifacts() {
   while IFS= read -r line; do
     [[ -z "${line}" || "${line}" == '?? build/'* ]] || fail 'untracked-source-input' 79
   done <<<"${status}"
-  for spec in \
-    "${EXPERIMENTAL_OBJECT}|${EXPERIMENTAL_SHA256}" \
-    "${BASELINE_OBJECT}|${BASELINE_SHA256}" \
-    "${MODULE_OBJECT}|${MODULE_SHA256}"; do
-    IFS='|' read -r path expected <<<"${spec}"
-    [[ -f "${path}" && ! -L "${path}" ]] || fail "artifact-shape:${path}" 79
-    identity="$(/usr/bin/stat -Lc '%u:%g:%a:%h:%F' -- "${path}")" || fail "artifact-stat:${path}"
-    [[ "${identity}" == '0:0:600:1:regular file' || "${identity}" == '0:0:644:1:regular file' ]] || fail "artifact-owner:${path}" 79
-    actual="$(sha256_file "${path}")" || fail "artifact-sha-read:${path}"
-    [[ "${actual}" == "${expected}" ]] || fail "artifact-sha:${path}" 79
-  done
   for relative in "${SELF_RELATIVE}" "${SEAM_RELATIVE}" "${MODULE_LEASE_HELPER_RELATIVE}" \
     "${ROUTED_CONTRACT_RELATIVE}" "${ROUTED_TEST_RELATIVE}" \
     "${NEGATIVE_TEST_RELATIVE}" "${GSO_KFUNC_RELATIVE}"; do
@@ -691,9 +838,7 @@ ensure_dependency_intent() {
 ensure_dependency_preflight() {
   local name expected output
   if [[ -f "${DEPENDENCY_PHASE}" ]]; then
-    require_root_test_binary "${PREFLIGHT_BINARY}" || fail 'preflight-binary-identity' 79
-    expected="$(render_dependency_preflight)" || fail 'preflight-render'
-    phase_matches "${DEPENDENCY_PHASE}" "${expected}" || fail 'preflight-phase-drift' 79
+    validate_dependency_preflight || fail 'preflight-phase-drift' 79
     return
   fi
   ensure_dependency_intent
@@ -703,6 +848,7 @@ ensure_dependency_preflight() {
   ensure_dependency_directory C3 go-tmp-mkdir "${GO_TMP}"
   run_operation P0 preflight-mod-download || fail 'dependency-module-download' $?
   run_operation P1 preflight-mod-verify || fail 'dependency-module-verification' $?
+  ensure_artifacts
   if [[ ! -e "${PREFLIGHT_BINARY}" && ! -L "${PREFLIGHT_BINARY}" ]]; then
     run_operation P2 preflight-build || fail 'dependency-build-preflight' $?
   fi
@@ -726,6 +872,7 @@ ensure_runtime_temp() {
 validate_dependency_preflight() {
   local expected
   phase_matches "${DEPENDENCY_INTENT_PHASE}" "$(render_dependency_intent)" || return 79
+  validate_artifact_receipt || return $?
   for path in "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}"; do
     require_root_directory "${path}" || return 79
   done
@@ -997,13 +1144,16 @@ assert_bpf_links_baseline() {
 }
 
 render_cleanup_intent() {
-  local owner baseline operation dependency_intent dependency veth_intent veth address route
+  local owner baseline operation dependency_intent artifact_intent artifacts dependency
+  local veth_intent veth address route
   local go_cache go_mod_cache go_path go_tmp runtime_temp neighbor offload_baseline offload
   local module_intent module tested
   owner="$(sha256_file "${OWNER_PHASE}")" || return $?
   baseline="$(sha256_file "${BASELINE_PHASE}")" || return $?
   operation="$(sha256_file "${OPERATION_PHASE}")" || return $?
   dependency_intent="$(phase_binding "${DEPENDENCY_INTENT_PHASE}")" || return $?
+  artifact_intent="$(phase_binding "${ARTIFACT_INTENT_PHASE}")" || return $?
+  artifacts="$(phase_binding "${ARTIFACT_PHASE}")" || return $?
   dependency="$(phase_binding "${DEPENDENCY_PHASE}")" || return $?
   go_cache="$(directory_binding "${GO_CACHE}")" || return $?
   go_mod_cache="$(directory_binding "${GO_MOD_CACHE}")" || return $?
@@ -1025,7 +1175,7 @@ render_cleanup_intent() {
     "resource_id=${RESOURCE_ID}" "boot_id=${BOOT_ID}" "netns=${INITIAL_NETNS}" \
     "owner_sha256=${owner}" "baseline_sha256=${baseline}" \
     "operation_sha256=${operation}" "dependency_intent=${dependency_intent}" \
-    "dependency=${dependency}" \
+    "artifact_intent=${artifact_intent}" "artifacts=${artifacts}" "dependency=${dependency}" \
     "dependency_caches=${go_cache},${go_mod_cache},${go_path},${go_tmp}" \
     "runtime_temp=${runtime_temp}" \
     "veth_intent=${veth_intent}" "veth=${veth}" "address=${address}" \
@@ -1152,9 +1302,46 @@ validate_runtime_temp_for_restore() {
   [[ ! -f "${VETH_INTENT_PHASE}" ]] || fail 'restore-runtime-temp-missing-after-veth-intent' 79
 }
 
+validate_artifact_state_for_restore() {
+  local path identity
+  ARTIFACT_STATE=''
+  if [[ -e "${ARTIFACT_PHASE}" || -L "${ARTIFACT_PHASE}" ]]; then
+    [[ -e "${ARTIFACT_INTENT_PHASE}" || -L "${ARTIFACT_INTENT_PHASE}" ]] ||
+      fail 'restore-artifact-receipt-without-intent' 79
+    validate_artifact_receipt || fail 'restore-artifact-receipt' 79
+    ARTIFACT_STATE='receipt'
+    return
+  fi
+  [[ ! -L "${ARTIFACT_PHASE}" ]] || fail 'restore-artifact-receipt-symlink' 79
+  if [[ -e "${ARTIFACT_INTENT_PHASE}" || -L "${ARTIFACT_INTENT_PHASE}" ]]; then
+    load_build_input_identity || fail 'restore-artifact-build-input' $?
+    phase_matches "${ARTIFACT_INTENT_PHASE}" "$(render_artifact_intent)" ||
+      fail 'restore-artifact-intent' 79
+    if [[ -e "${ARTIFACT_ROOT}" || -L "${ARTIFACT_ROOT}" ]]; then
+      require_root_directory "${ARTIFACT_ROOT}" || fail 'restore-partial-artifact-root' 79
+    fi
+    for path in "${BASELINE_OBJECT}" "${EXPERIMENTAL_OBJECT}" "${MODULE_OBJECT}"; do
+      if [[ -e "${path}" || -L "${path}" ]]; then
+        [[ -f "${path}" && ! -L "${path}" ]] || fail "restore-partial-artifact-shape:${path}" 79
+        identity="$(artifact_identity "${path}")" || fail "restore-partial-artifact-stat:${path}"
+        [[ "${identity}" =~ ^[0-9]+:[0-9]+:0:0:(600|644):1:regular\ file$ ]] ||
+          fail "restore-partial-artifact-identity:${path}" 79
+      fi
+    done
+    ARTIFACT_STATE='intent'
+    return
+  fi
+  [[ ! -L "${ARTIFACT_INTENT_PHASE}" ]] || fail 'restore-artifact-intent-symlink' 79
+  [[ ! -e "${ARTIFACT_ROOT}" && ! -L "${ARTIFACT_ROOT}" ]] ||
+    fail 'restore-artifact-root-without-intent' 79
+  ARTIFACT_STATE='absent'
+}
+
 validate_dependency_caches_for_restore() {
   local path
+  validate_artifact_state_for_restore
   if [[ ! -e "${DEPENDENCY_INTENT_PHASE}" && ! -L "${DEPENDENCY_INTENT_PHASE}" ]]; then
+    [[ "${ARTIFACT_STATE}" == absent ]] || fail 'restore-artifact-without-dependency-intent' 79
     for path in "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}"; do
       [[ ! -e "${path}" && ! -L "${path}" ]] || fail "restore-dependency-cache-without-intent:${path}" 79
     done
@@ -1168,8 +1355,56 @@ validate_dependency_caches_for_restore() {
     fi
   done
   if [[ -e "${DEPENDENCY_PHASE}" || -L "${DEPENDENCY_PHASE}" ]]; then
+    [[ "${ARTIFACT_STATE}" == receipt ]] || fail 'restore-dependency-receipt-without-artifacts' 79
     validate_dependency_preflight || fail 'restore-dependency-preflight' 79
+  elif [[ "${ARTIFACT_STATE}" != receipt ]]; then
+    [[ ! -e "${PREFLIGHT_BINARY}" && ! -L "${PREFLIGHT_BINARY}" ]] ||
+      fail 'restore-preflight-binary-before-artifact-receipt' 79
+  elif [[ -e "${PREFLIGHT_BINARY}" || -L "${PREFLIGHT_BINARY}" ]]; then
+    require_root_test_binary "${PREFLIGHT_BINARY}" || fail 'restore-partial-preflight-binary' 79
   fi
+}
+
+validate_no_live_before_artifact_receipt() {
+  local path existing
+  for path in "${RUNTIME_TEMP}" "${PREFLIGHT_BINARY}" "${VETH_INTENT_PHASE}" \
+    "${VETH_PHASE}" "${ADDRESS_PHASE}" "${ROUTE_PHASE}" "${NEIGHBOR_PHASE}" \
+    "${OFFLOAD_BASELINE_A}" "${OFFLOAD_PHASE}" "${MODULE_INTENT_PHASE}" \
+    "${MODULE_PHASE}" "${MODULE_UNLOADED_PHASE}" "${TESTED_PHASE}"; do
+    [[ ! -e "${path}" && ! -L "${path}" ]] ||
+      fail "restore-live-state-before-artifact-receipt:${path}" 79
+  done
+  require_names_absent || fail 'restore-veth-before-artifact-receipt' 79
+  existing="$(/usr/sbin/ip -4 -j address show to "${LOCAL_IPV4}/${PREFIX_BITS}")" ||
+    fail 'restore-address-before-artifact-receipt-probe'
+  [[ "${existing}" == '[]' ]] || fail 'restore-address-before-artifact-receipt' 79
+  existing="$(/usr/sbin/ip -4 -j route show table all exact "${REMOTE_IPV4}/${PREFIX_BITS}")" ||
+    fail 'restore-route-before-artifact-receipt-probe'
+  [[ "${existing}" == '[]' ]] || fail 'restore-route-before-artifact-receipt' 79
+  [[ ! -d "/sys/module/${MODULE_NAME}" && ! -e "/sys/kernel/btf/${MODULE_NAME}" &&
+    ! -L "/sys/kernel/btf/${MODULE_NAME}" ]] || fail 'restore-module-before-artifact-receipt' 79
+  assert_bpf_links_baseline
+}
+
+complete_no_artifact_restore() {
+  local restored already=0
+  validate_no_live_before_artifact_receipt
+  if [[ "${ARTIFACT_STATE}" == intent ]]; then
+    fail 'restore-artifact-intent-without-receipt-no-live-mutation' 78
+  fi
+  [[ "${ARTIFACT_STATE}" == absent ]] || fail 'restore-artifact-state-unexpected' 79
+  [[ ! -f "${RESTORED_PHASE}" ]] || already=1
+  ensure_cleanup_intent
+  restored="$(render_fixed_phase restored 'result=restored,filesystem=retained')"
+  if ((already)); then
+    phase_matches "${RESTORED_PHASE}" "${restored}" || fail 'restored-phase-drift' 79
+    printf 'B82_ROUTED_VETH_ALREADY_RESTORED run_id=%s resource_id=%s evidence=%s\n' \
+      "${RUN_ID}" "${RESOURCE_ID}" "${EVIDENCE_ROOT}"
+    return
+  fi
+  write_phase "${RESTORED_PHASE}" "${restored}" || fail 'restored-phase-write' $?
+  printf 'B82_ROUTED_VETH_RESTORE_COMPLETE run_id=%s resource_id=%s restored=1 filesystem_retained=1 artifact_state=absent evidence=%s\n' \
+    "${RUN_ID}" "${RESOURCE_ID}" "${EVIDENCE_ROOT}"
 }
 
 validate_module_for_restore() {
@@ -1307,15 +1542,16 @@ validate_partial_setup_for_restore() {
 }
 
 run_state_machine() {
+  classify_artifact_retry_state
   bootstrap_evidence
   c8_checksum_module_acquire L0.run
-  configure_checksum_module_lease
   ensure_owner
   ensure_baseline
   [[ ! -f "${CLEANUP_PHASE}" && ! -f "${RESTORED_PHASE}" ]] || fail 'run-after-cleanup-intent' 79
   ensure_operation_intent
   ensure_dependency_intent
   ensure_dependency_preflight
+  configure_checksum_module_lease
   ensure_runtime_temp
   ensure_veth_phase
   ensure_address_phase
@@ -1332,13 +1568,17 @@ restore_state_machine() {
   local restored module_state
   bootstrap_evidence
   c8_checksum_module_acquire L0.restore
-  configure_checksum_module_lease
   ensure_owner
   [[ -f "${BASELINE_PHASE}" && -f "${OPERATION_PHASE}" ]] || fail 'restore-state-incomplete' 79
   ensure_baseline
   ensure_operation_intent
+  validate_dependency_caches_for_restore
+  if [[ "${ARTIFACT_STATE}" != receipt ]]; then
+    complete_no_artifact_restore
+    return
+  fi
+  configure_checksum_module_lease
   if [[ -f "${RESTORED_PHASE}" ]]; then
-    validate_dependency_caches_for_restore
     validate_runtime_temp_for_restore
     restored="$(render_fixed_phase restored 'result=restored,filesystem=retained')"
     phase_matches "${RESTORED_PHASE}" "${restored}" || fail 'restored-phase-drift' 79
@@ -1369,7 +1609,7 @@ main() {
     render_plan
     return
   fi
-  verify_source_and_artifacts
+  verify_source_identity
   load_checksum_module_helper
   case "${MODE}" in
     run) run_state_machine ;;
