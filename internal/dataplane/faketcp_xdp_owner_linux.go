@@ -370,11 +370,13 @@ func mustLiveFakeTCPXDPRuntime() fakeTCPXDPRuntime {
 		probeLiveFakeTCPXDP,
 		func(
 			request fakeTCPXDPAttachRequest,
-			expected fakeTCPXDPProbe,
+			snapshot fakeTCPXDPProbe,
 			program experimentalProgramResource,
 		) (fakeTCPXDPLink, error) {
-			if expected.Attached || expected.ProgramID != 0 {
-				return nil, errors.New("live XDP attach received an occupied expected hook")
+			// This is only a compatibility guard. AttachXDP atomically owns the
+			// requested mode, but does not bind other XDP modes to this snapshot.
+			if snapshot.Attached || snapshot.ProgramID != 0 {
+				return nil, errors.New("live XDP attach received an occupied compatibility snapshot")
 			}
 			if program == nil || program.kernelProgram() == nil {
 				return nil, errors.New("live XDP attach requires a kernel program")
@@ -550,9 +552,10 @@ func stageFakeTCPXDPAttachments(
 		return nil, err
 	}
 	planned := make([]fakeTCPXDPPlannedAttachment, 0, len(ordered))
-	// Probe every hook exactly once before the first mutation. The exact probe
-	// is passed into Attach so an adapter can reject a changed dispatcher in
-	// the same operation that registers the component.
+	// Probe every hook exactly once before the first mutation. A libxdp adapter
+	// receives the snapshot for its same-operation dispatcher CAS. Direct
+	// backends use it only as a compatibility observation; their selected-mode
+	// ownership contract makes no atomic claim about other XDP modes.
 	for _, request := range ordered {
 		if err := ctx.Err(); err != nil {
 			return nil, err
