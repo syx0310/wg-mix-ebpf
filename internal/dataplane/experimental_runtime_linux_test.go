@@ -412,18 +412,18 @@ func (fixture *runtimeTestFixture) commitGeneration(
 }
 
 func (fixture *runtimeTestFixture) buildOptions(
-	snapshot *fakeTCPPolicySnapshot,
 	transaction *fakeTCPPolicyGenerationTransaction,
 ) experimentalFakeTCPRuntimeBuildOptions {
+	generation := transaction.policyGeneration()
 	attachState := fakeTCPPolicyTestState()
-	baseline, err := abi.FromStateWithGeneration(attachState, snapshot.Generation)
+	baseline, err := abi.FromStateWithGeneration(attachState, generation)
 	if err != nil {
 		panic(fmt.Sprintf("build runtime test baseline: %v", err))
 	}
 	return experimentalFakeTCPRuntimeBuildOptions{
 		collection: fixture.collection, transaction: transaction,
-		baselineSnapshot: baseline, snapshot: snapshot,
-		attachState: attachState,
+		baselineSnapshot: baseline,
+		attachState:      attachState,
 		xdpRequests: []fakeTCPXDPAttachRequest{
 			{IfIndex: 3, Mode: fakeTCPXDPAttachNative},
 			{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
@@ -434,7 +434,7 @@ func (fixture *runtimeTestFixture) buildOptions(
 		},
 		eventSource:      fixture.eventSource,
 		programArray:     fixture.programArray,
-		engineOptions:    runtimeTestEngineOptions(snapshot.Generation),
+		engineOptions:    runtimeTestEngineOptions(generation),
 		slowPathFactory:  fixture.slowPathFactory,
 		commitGeneration: fixture.commitGeneration,
 		coreStageFactory: func(
@@ -470,11 +470,10 @@ func (fixture *runtimeTestFixture) build(
 	generation uint64,
 ) (*ExperimentalFakeTCPRuntime, ExperimentalFakeTCPRuntimeHandles, error) {
 	t.Helper()
-	snapshot := mustFakeTCPPolicySnapshot(t, generation)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, generation)
 	runtime, err := buildExperimentalFakeTCPRuntime(
 		ctx,
-		fixture.buildOptions(snapshot, transaction),
+		fixture.buildOptions(transaction),
 	)
 	if err != nil {
 		return nil, ExperimentalFakeTCPRuntimeHandles{}, err
@@ -510,11 +509,18 @@ func TestExperimentalFakeTCPRuntimeBuildsPolicyTailCallsXDPAndHandles(t *testing
 	policyUpdateIndex := slices.Index(fixture.activationTrace, "policy:update:faketcp_control_policy_map")
 	coreCommitIndex := slices.Index(fixture.activationTrace, "core-commit")
 	releaseIndex := slices.Index(fixture.activationTrace, "release")
+	coreCommitCount := 0
+	for _, event := range fixture.activationTrace {
+		if event == "core-commit" {
+			coreCommitCount++
+		}
+	}
 	if len(fixture.activationTrace) < 2 || fixture.activationTrace[0] != "seed" ||
 		coreStageIndex <= 0 || programInsertIndex <= coreStageIndex ||
 		xdpAttachIndex <= programInsertIndex || tcStageIndex <= xdpAttachIndex ||
 		policyUpdateIndex <= tcStageIndex || coreCommitIndex <= policyUpdateIndex ||
-		releaseIndex <= coreCommitIndex || releaseIndex != len(fixture.activationTrace)-1 {
+		releaseIndex <= coreCommitIndex || releaseIndex != len(fixture.activationTrace)-1 ||
+		coreCommitCount != 1 {
 		t.Fatalf("activation order = %v", fixture.activationTrace)
 	}
 	if lateErr := fixture.retainedRelease(); !errors.Is(lateErr, errExperimentalFreshCollectionReleaseConsumed) {
@@ -607,9 +613,8 @@ func TestExperimentalFakeTCPFreshClaimUsesPreResolvedCoreResourcesWithoutOwnerRe
 	t *testing.T,
 ) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	options.coreStageFactory = func(
 		_ context.Context,
 		resources experimentalCoreResources,
@@ -1011,7 +1016,7 @@ func TestExperimentalFakeTCPRuntimeRejectsEngineMismatchAndPrebuiltStoreBeforeFr
 			mutate: func(_ *runtimeTestFixture, options *experimentalFakeTCPRuntimeBuildOptions) {
 				options.engineOptions.Generation++
 			},
-			match: "does not match snapshot generation",
+			match: "does not match policy plan generation",
 		},
 		{
 			name: "prebuilt store",
@@ -1023,9 +1028,8 @@ func TestExperimentalFakeTCPRuntimeRejectsEngineMismatchAndPrebuiltStoreBeforeFr
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newRuntimeTestFixture(t)
-			snapshot := mustFakeTCPPolicySnapshot(t, 91)
 			ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
-			options := fixture.buildOptions(snapshot, transaction)
+			options := fixture.buildOptions(transaction)
 			test.mutate(fixture, &options)
 			runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
 			if runtime != nil || err == nil || !strings.Contains(err.Error(), test.match) {
@@ -1050,11 +1054,10 @@ func TestExperimentalFakeTCPRuntimeMapMismatchConsumesFreshCollectionWithoutReac
 ) {
 	fixture := newRuntimeTestFixture(t)
 	fixture.mapResources[fakeTCPRuntimeIDMapName].bpfMap = nil
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
 	runtime, err := buildExperimentalFakeTCPRuntime(
 		ctx,
-		fixture.buildOptions(snapshot, transaction),
+		fixture.buildOptions(transaction),
 	)
 	if runtime != nil || err == nil || !strings.Contains(err.Error(), "identity resource") {
 		t.Fatalf("runtime=%#v error=%v", runtime, err)
@@ -1074,11 +1077,10 @@ func TestExperimentalFakeTCPRuntimeMapMismatchConsumesFreshCollectionWithoutReac
 
 func TestExperimentalFakeTCPRuntimeReleaseFailureBeforeCommitRollsBack(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
 	wantErr := errors.New("injected release-before-commit failure")
 	var retainedRelease faketcp.LinuxFreshCollectionRelease
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	options.commitGeneration = func(
 		_ *faketcp.Engine,
 		claim faketcp.LinuxFreshCollectionClaim,
@@ -1127,6 +1129,9 @@ func TestExperimentalFakeTCPRuntimeReleaseFailureBeforeCommitRollsBack(t *testin
 		t.Fatalf("program rollback entries=%v deletes=%v",
 			fixture.programArray.entries, fixture.programArray.deletes)
 	}
+	if slices.Contains(fixture.activationTrace, "core-commit") {
+		t.Fatalf("canceled build published a partial generation: %v", fixture.activationTrace)
+	}
 	assertNoMemoryPolicyGeneration(t, fixture.policyMaps, 91)
 	if fixture.xdpRuntime.links[3].closes != 1 || fixture.xdpRuntime.links[9].closes != 1 {
 		t.Fatalf("XDP closes 3=%d 9=%d",
@@ -1138,7 +1143,6 @@ func TestExperimentalFakeTCPRuntimeCommittedLeaseCloseFailureTearsDownWithoutRol
 	t *testing.T,
 ) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
 	wantErr := errors.New("injected committed lifecycle close failure")
 	closeCalls := 0
@@ -1148,7 +1152,7 @@ func TestExperimentalFakeTCPRuntimeCommittedLeaseCloseFailureTearsDownWithoutRol
 	}
 	runtime, err := buildExperimentalFakeTCPRuntime(
 		ctx,
-		fixture.buildOptions(snapshot, transaction),
+		fixture.buildOptions(transaction),
 	)
 	if runtime != nil || !errors.Is(err, wantErr) {
 		t.Fatalf("runtime=%#v error=%v", runtime, err)
@@ -1180,9 +1184,8 @@ func TestExperimentalFakeTCPRuntimeCommittedLeaseCloseFailureTearsDownWithoutRol
 
 func TestExperimentalFakeTCPRuntimeDoubleReleaseCommitsOnceThenTearsDown(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	options.commitGeneration = func(
 		_ *faketcp.Engine,
 		claim faketcp.LinuxFreshCollectionClaim,
@@ -1217,15 +1220,15 @@ func TestExperimentalFakeTCPRuntimeRejectsPreStagedTransactionWithoutOwnershipTr
 	t *testing.T,
 ) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
-	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
-	stage, err := transaction.Stage(ctx, fixture.policyMaps, snapshot)
+	wantSnapshot := mustFakeTCPPolicySnapshot(t, 91)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, wantSnapshot.Generation)
+	stage, err := transaction.Stage(ctx, fixture.policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}
 	updatesBefore := len(fixture.policyTrace.updateAttempts)
 	deletesBefore := len(fixture.policyTrace.deleteAttempts)
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
 	if runtime != nil || err == nil || !strings.Contains(err.Error(), "not fresh") {
 		t.Fatalf("pre-staged runtime=%#v error=%v", runtime, err)
@@ -1252,9 +1255,9 @@ func TestExperimentalFakeTCPRuntimeRejectsPreStagedTransactionWithoutOwnershipTr
 			t.Fatalf("rejected build closed caller-owned program %s %d times", name, program.closes)
 		}
 	}
-	assertMemoryPolicyMapMatches(t, fixture.policyMaps.ControlPolicies, snapshot.ControlPolicies)
-	assertMemoryPolicyMapMatches(t, fixture.policyMaps.ManagedPorts, snapshot.ManagedPorts)
-	assertMemoryPolicyMapMatches(t, fixture.policyMaps.ManagedInterfaces, snapshot.ManagedInterfaces)
+	assertMemoryPolicyMapMatches(t, fixture.policyMaps.ControlPolicies, wantSnapshot.ControlPolicies)
+	assertMemoryPolicyMapMatches(t, fixture.policyMaps.ManagedPorts, wantSnapshot.ManagedPorts)
+	assertMemoryPolicyMapMatches(t, fixture.policyMaps.ManagedInterfaces, wantSnapshot.ManagedInterfaces)
 
 	if err := transaction.Rollback(ctx, stage); err != nil {
 		t.Fatalf("caller rollback after rejected build: %v", err)
@@ -1446,7 +1449,7 @@ func TestFakeTCPRuntimeBuildClaimIsExclusiveAndFencesCallerMutation(t *testing.T
 		t.Fatalf("claim successes=%d failures=%d", successes, failures)
 	}
 	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
-	stage, err := transaction.Stage(ctx, policyMaps, mustFakeTCPPolicySnapshot(t, 91))
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if stage != nil || err == nil || !strings.Contains(err.Error(), "exclusively claimed") {
 		t.Fatalf("caller stage during build claim=%#v error=%v", stage, err)
 	}
@@ -1473,7 +1476,6 @@ func TestFakeTCPRuntimeBuildClaimIsExclusiveAndFencesCallerMutation(t *testing.T
 
 func TestExperimentalFakeTCPRuntimeCancellationAfterMutationUsesCleanupContext(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	baseCtx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
 	activeCtx, cancel := context.WithCancel(baseCtx)
 	xdpRuntime := fixture.xdpRuntime.backend()
@@ -1489,7 +1491,7 @@ func TestExperimentalFakeTCPRuntimeCancellationAfterMutationUsesCleanupContext(t
 		return owned, err
 	}
 
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	options.xdpRuntime = xdpRuntime
 	runtime, err := buildExperimentalFakeTCPRuntime(activeCtx, options)
 	if runtime != nil || !errors.Is(err, context.Canceled) {
@@ -1520,13 +1522,12 @@ func TestExperimentalFakeTCPRuntimeCancellationAfterMutationUsesCleanupContext(t
 
 func TestExperimentalFakeTCPRuntimeCommitBoundaryIgnoresLaterCancellation(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	activeCtx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
 	claim, err := transaction.claimRuntimeBuild(activeCtx)
 	if err != nil {
 		t.Fatal(err)
 	}
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	build := &experimentalRuntimeBuild{
 		options:    options,
 		claim:      claim,
@@ -1569,7 +1570,7 @@ func TestExperimentalFakeTCPRuntimeCommitBoundaryIgnoresLaterCancellation(t *tes
 	}
 	runtime := &ExperimentalFakeTCPRuntime{
 		state: &experimentalFakeTCPRuntimeState{
-			generation: snapshot.Generation,
+			generation: build.policyPlan.generation,
 			identity:   build.engine.Identity(),
 			engine:     build.engine,
 			collection: fixture.collection,
@@ -1578,7 +1579,7 @@ func TestExperimentalFakeTCPRuntimeCommitBoundaryIgnoresLaterCancellation(t *tes
 			xdp:        build.xdpStage,
 			slowPath:   build.slowPath,
 			handles: ExperimentalFakeTCPRuntimeHandles{
-				generation: snapshot.Generation,
+				generation: build.policyPlan.generation,
 				identity:   build.engine.Identity(),
 				sessions:   build.sessions,
 				events:     build.events,
@@ -1593,9 +1594,8 @@ func TestExperimentalFakeTCPRuntimeCommitBoundaryIgnoresLaterCancellation(t *tes
 
 func TestExperimentalFakeTCPRuntimeValidatesXDPPolicySetBeforeMutation(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	options.xdpRequests = []fakeTCPXDPAttachRequest{{IfIndex: 3, Mode: fakeTCPXDPAttachNative}}
 	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
 	if runtime != nil || err == nil || !strings.Contains(err.Error(), "do not match managed interfaces") {
@@ -1652,7 +1652,7 @@ func TestExperimentalFakeTCPRuntimeBindsCanonicalInterfacesBeforeMutation(t *tes
 		{
 			name: "unrelated baseline profile",
 			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
-				generation := options.snapshot.Generation
+				generation := options.transaction.policyGeneration()
 				options.baselineSnapshot.Profiles[abi.ProfileKey{
 					Generation: generation, ProfileID: 99,
 				}] = abi.ProfileValue{Generation: generation}
@@ -1662,7 +1662,7 @@ func TestExperimentalFakeTCPRuntimeBindsCanonicalInterfacesBeforeMutation(t *tes
 		{
 			name: "unrelated baseline cipher",
 			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
-				generation := options.snapshot.Generation
+				generation := options.transaction.policyGeneration()
 				options.baselineSnapshot.Ciphers[abi.CipherKey{
 					Generation: generation, CipherID: 99,
 				}] = abi.CipherValue{Generation: generation}
@@ -1672,7 +1672,7 @@ func TestExperimentalFakeTCPRuntimeBindsCanonicalInterfacesBeforeMutation(t *tes
 		{
 			name: "unrelated baseline managed fwmark",
 			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
-				generation := options.snapshot.Generation
+				generation := options.transaction.policyGeneration()
 				options.baselineSnapshot.ManagedFwmarks[abi.ManagedFwmarkKey{
 					Generation: generation, FwMark: 99, UnderlayIndex: 3,
 				}] = abi.ManagedFwmarkValue{Generation: generation}
@@ -1682,7 +1682,7 @@ func TestExperimentalFakeTCPRuntimeBindsCanonicalInterfacesBeforeMutation(t *tes
 		{
 			name: "unrelated baseline egress rule",
 			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
-				generation := options.snapshot.Generation
+				generation := options.transaction.policyGeneration()
 				options.baselineSnapshot.EgressRules[abi.EgressRuleKey{
 					Generation: generation, FwMark: 99, UnderlayIndex: 3,
 				}] = abi.EgressRuleValue{Generation: generation}
@@ -1703,7 +1703,7 @@ func TestExperimentalFakeTCPRuntimeBindsCanonicalInterfacesBeforeMutation(t *tes
 		{
 			name: "unrelated baseline ICMP listener",
 			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
-				generation := options.snapshot.Generation
+				generation := options.transaction.policyGeneration()
 				options.baselineSnapshot.ICMPListeners[abi.ICMPListenerKey{
 					Generation: generation, UnderlayIndex: 3, ICMPID: 99,
 				}] = abi.ICMPListenerValue{Generation: generation}
@@ -1713,23 +1713,14 @@ func TestExperimentalFakeTCPRuntimeBindsCanonicalInterfacesBeforeMutation(t *tes
 		{
 			name: "stale FakeTCP managed port",
 			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
-				for key, value := range options.snapshot.ManagedPorts {
-					delete(options.snapshot.ManagedPorts, key)
-					key.DestinationPort++
-					options.snapshot.ManagedPorts[key] = value
-					break
-				}
+				options.transaction.plan.managedPorts[0].Key.DestinationPort++
 			},
 			match: "managed ports are stale or unrelated",
 		},
 		{
 			name: "stale FakeTCP control policy",
 			mutate: func(_ *testing.T, options *experimentalFakeTCPRuntimeBuildOptions) {
-				for key, value := range options.snapshot.ControlPolicies {
-					value.Burst++
-					options.snapshot.ControlPolicies[key] = value
-					break
-				}
+				options.transaction.plan.controlPolicies[0].Value.Burst++
 			},
 			match: "control policies are stale or unrelated",
 		},
@@ -1739,7 +1730,10 @@ func TestExperimentalFakeTCPRuntimeBindsCanonicalInterfacesBeforeMutation(t *tes
 				state := fakeTCPPolicyTestState()
 				state.Underlays[1].IfIndex = 11
 				state.IngressListeners[1].UnderlayIfIndex = 11
-				baseline, err := abi.FromStateWithGeneration(state, options.snapshot.Generation)
+				baseline, err := abi.FromStateWithGeneration(
+					state,
+					options.transaction.policyGeneration(),
+				)
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -1751,9 +1745,8 @@ func TestExperimentalFakeTCPRuntimeBindsCanonicalInterfacesBeforeMutation(t *tes
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			fixture := newRuntimeTestFixture(t)
-			snapshot := mustFakeTCPPolicySnapshot(t, 91)
 			ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
-			options := fixture.buildOptions(snapshot, transaction)
+			options := fixture.buildOptions(transaction)
 			test.mutate(t, &options)
 			runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
 			if runtime != nil || err == nil || !strings.Contains(err.Error(), test.match) {
@@ -1823,11 +1816,10 @@ func TestExperimentalRuntimeCloseQuarantinesFailedDetachesUntilRetry(t *testing.
 
 func TestExperimentalRuntimeBuildFailureQuarantinesRetainedTCRollback(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
 	commitErr := errors.New("injected core commit failure")
 	tcCloseErr := errors.New("injected retained TC rollback failure")
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	options.coreStageFactory = func(
 		context.Context,
 		experimentalCoreResources,
@@ -1903,12 +1895,11 @@ func TestExperimentalRuntimeBuildFailureQuarantinesRetainedTCRollback(t *testing
 
 func TestExperimentalSlowPathConstructionFailureQuarantinesPartialOwner(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
 	factoryErr := errors.New("injected slow-path factory failure")
 	closeErr := errors.New("injected partial slow-path close failure")
 	fixture.slowPath.closeErr = closeErr
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	options.slowPathFactory = func(*faketcp.Engine, *ebpf.Map) (experimentalSlowPath, error) {
 		return fixture.slowPath, factoryErr
 	}
@@ -1940,9 +1931,8 @@ func TestExperimentalSlowPathConstructionFailureQuarantinesPartialOwner(t *testi
 
 func TestExperimentalSlowPathTypedNilFailsClosed(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
-	options := fixture.buildOptions(snapshot, transaction)
+	options := fixture.buildOptions(transaction)
 	options.slowPathFactory = func(*faketcp.Engine, *ebpf.Map) (experimentalSlowPath, error) {
 		var typedNil *fakeExperimentalSlowPath
 		return typedNil, nil
@@ -1955,13 +1945,12 @@ func TestExperimentalSlowPathTypedNilFailsClosed(t *testing.T) {
 
 func TestExperimentalEventCloneCloseFailureClosesConstructedSlowPath(t *testing.T) {
 	fixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
 	wantErr := errors.New("injected slow-path constructor clone close failure")
 	fixture.eventSource.closeErr = wantErr
 	runtime, err := buildExperimentalFakeTCPRuntime(
 		ctx,
-		fixture.buildOptions(snapshot, transaction),
+		fixture.buildOptions(transaction),
 	)
 	if runtime != nil || !errors.Is(err, wantErr) {
 		t.Fatalf("runtime=%#v error=%v", runtime, err)
@@ -2078,10 +2067,9 @@ func TestExperimentalRuntimeCloseWaitsForEventMapConstructor(t *testing.T) {
 }
 
 func TestFakeTCPPolicyFailureReleaseRequiresExactClosedCollectionOwner(t *testing.T) {
-	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
 	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}

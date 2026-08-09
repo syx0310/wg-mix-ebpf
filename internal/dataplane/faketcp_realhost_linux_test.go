@@ -805,7 +805,7 @@ func buildFakeTCPRealHostRuntime(
 	if err != nil {
 		t.Fatal(err)
 	}
-	fakeSnapshot, err := buildFakeTCPPolicySnapshot(state, generation)
+	policyPlan, err := buildFakeTCPPolicyGenerationPlan(state, generation)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -824,7 +824,7 @@ func buildFakeTCPRealHostRuntime(
 		generation: generation,
 		ifindexes:  []int{prepared.contract.ifindex, prepared.contract.peerIfindex},
 	}
-	transaction, err := newFakeTCPPolicyGenerationTransaction(leaseCtx, generation, lease, isolation)
+	transaction, err := newFakeTCPPolicyGenerationTransaction(leaseCtx, policyPlan, lease, isolation)
 	if err != nil {
 		closeErr := lease.Close()
 		t.Fatalf("create FakeTCP real-host generation transaction: %v", errors.Join(err, closeErr))
@@ -852,7 +852,6 @@ func buildFakeTCPRealHostRuntime(
 		experimentalFakeTCPRuntimeBuildOptions{
 			transaction:      transaction,
 			baselineSnapshot: baselineSnapshot,
-			snapshot:         fakeSnapshot,
 			attachState:      state,
 			xdpRequests: []fakeTCPXDPAttachRequest{
 				{IfIndex: prepared.contract.ifindex, Mode: fakeTCPXDPAttachGeneric},

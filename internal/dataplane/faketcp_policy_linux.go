@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
-	"sort"
 	"sync"
 
 	"github.com/cilium/ebpf"
@@ -63,7 +62,7 @@ type fakeTCPPolicyGenerationIdentity struct {
 // must either Rollback or Disarm its stage before Close can release the lease.
 type fakeTCPPolicyGenerationTransaction struct {
 	mu                  sync.Mutex
-	generation          uint64
+	plan                *fakeTCPPolicyGenerationPlan
 	lifecyclePath       string
 	lifecycleLease      *lockfile.LifecycleLease
 	closeLifecycleLease func(*lockfile.LifecycleLease) error
@@ -86,7 +85,7 @@ type fakeTCPPolicyRuntimeBuildClaim struct {
 
 func newFakeTCPPolicyGenerationTransaction(
 	ctx context.Context,
-	generation uint64,
+	plan *fakeTCPPolicyGenerationPlan,
 	lifecycleLease *lockfile.LifecycleLease,
 	isolation fakeTCPPolicyGenerationIsolationBackend,
 ) (*fakeTCPPolicyGenerationTransaction, error) {
@@ -96,8 +95,9 @@ func newFakeTCPPolicyGenerationTransaction(
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if generation == 0 {
-		return nil, fmt.Errorf("%w: generation is zero", errFakeTCPPolicyGenerationLeaseRequired)
+	ownedPlan := plan.clone()
+	if err := validateFakeTCPPolicyGenerationPlan(ownedPlan); err != nil {
+		return nil, fmt.Errorf("%w: invalid generation plan: %v", errFakeTCPPolicyGenerationLeaseRequired, err)
 	}
 	if fakeTCPPolicyGenerationIsolationBackendIsNil(isolation) {
 		return nil, fmt.Errorf("%w: generation isolation backend is nil", errFakeTCPPolicyGenerationLeaseRequired)
@@ -128,7 +128,7 @@ func newFakeTCPPolicyGenerationTransaction(
 		)
 	}
 	return &fakeTCPPolicyGenerationTransaction{
-		generation:     generation,
+		plan:           ownedPlan,
 		lifecyclePath:  lifecyclePath,
 		lifecycleLease: retained,
 		isolation:      isolation,
@@ -180,7 +180,7 @@ func (transaction *fakeTCPPolicyGenerationTransaction) assertHeldLocked(ctx cont
 	}
 	if transaction.identity == nil ||
 		fakeTCPPolicyGenerationIsolationBackendIsNil(transaction.isolation) ||
-		transaction.generation == 0 {
+		transaction.plan == nil || transaction.plan.generation == 0 {
 		return fmt.Errorf("%w: transaction identity is incomplete", errFakeTCPPolicyGenerationLeaseRequired)
 	}
 	return nil
@@ -250,17 +250,26 @@ func (claim *fakeTCPPolicyRuntimeBuildClaim) assertHeld(ctx context.Context) err
 }
 
 func (claim *fakeTCPPolicyRuntimeBuildClaim) policyGeneration() uint64 {
-	if claim == nil || claim.transaction == nil {
+	if claim == nil || claim.transaction == nil || claim.transaction.plan == nil {
 		return 0
 	}
-	return claim.transaction.generation
+	return claim.transaction.plan.generation
 }
 
 func (transaction *fakeTCPPolicyGenerationTransaction) policyGeneration() uint64 {
-	if transaction == nil {
+	if transaction == nil || transaction.plan == nil {
 		return 0
 	}
-	return transaction.generation
+	return transaction.plan.generation
+}
+
+func (claim *fakeTCPPolicyRuntimeBuildClaim) policyPlan() *fakeTCPPolicyGenerationPlan {
+	if claim == nil || claim.transaction == nil {
+		return nil
+	}
+	claim.transaction.mu.Lock()
+	defer claim.transaction.mu.Unlock()
+	return claim.transaction.plan.clone()
 }
 
 // Close releases the transaction's retained lifecycle lease. It refuses to
@@ -388,32 +397,29 @@ func (transaction *fakeTCPPolicyGenerationTransaction) closeForRuntimeClaim(
 // Stage stages one previously absent generation while retaining the generation
 // transaction lease. The interface marker is the XDP reachability latch and is
 // therefore always written last. This helper deliberately does not commit
-// control_map or attach a program; those remain responsibilities of a future
-// owner transaction.
+// control_map or attach a program; the outer runtime transaction publishes the
+// fully staged generation once through experimentalCoreStage.CommitControl.
 func (transaction *fakeTCPPolicyGenerationTransaction) Stage(
 	ctx context.Context,
 	maps fakeTCPPolicyMaps,
-	snapshot *fakeTCPPolicySnapshot,
 ) (*fakeTCPPolicyStage, error) {
-	return transaction.stageForRuntimeClaim(ctx, nil, maps, snapshot)
+	return transaction.stageForRuntimeClaim(ctx, nil, maps)
 }
 
 func (claim *fakeTCPPolicyRuntimeBuildClaim) Stage(
 	ctx context.Context,
 	maps fakeTCPPolicyMaps,
-	snapshot *fakeTCPPolicySnapshot,
 ) (*fakeTCPPolicyStage, error) {
 	if claim == nil || claim.transaction == nil {
 		return nil, fmt.Errorf("stage FakeTCP policy: %w", errFakeTCPPolicyGenerationLeaseRequired)
 	}
-	return claim.transaction.stageForRuntimeClaim(ctx, claim, maps, snapshot)
+	return claim.transaction.stageForRuntimeClaim(ctx, claim, maps)
 }
 
 func (transaction *fakeTCPPolicyGenerationTransaction) stageForRuntimeClaim(
 	ctx context.Context,
 	claim *fakeTCPPolicyRuntimeBuildClaim,
 	maps fakeTCPPolicyMaps,
-	snapshot *fakeTCPPolicySnapshot,
 ) (*fakeTCPPolicyStage, error) {
 	if transaction == nil {
 		return nil, fmt.Errorf("stage FakeTCP policy: %w", errFakeTCPPolicyGenerationLeaseRequired)
@@ -423,35 +429,29 @@ func (transaction *fakeTCPPolicyGenerationTransaction) stageForRuntimeClaim(
 	if err := transaction.assertAccessLocked(ctx, claim); err != nil {
 		return nil, fmt.Errorf("stage FakeTCP policy: %w", err)
 	}
-	if err := validateFakeTCPPolicySnapshot(snapshot); err != nil {
-		return nil, fmt.Errorf("stage FakeTCP policy: %w", err)
-	}
-	if snapshot.Generation != transaction.generation {
-		return nil, fmt.Errorf(
-			"stage FakeTCP policy: snapshot generation %d does not match transaction generation %d",
-			snapshot.Generation,
-			transaction.generation,
-		)
-	}
 	if transaction.stage != nil {
 		return nil, errors.New("stage FakeTCP policy: generation transaction is single-use")
 	}
 	if maps.ControlPolicies == nil || maps.ManagedPorts == nil || maps.ManagedInterfaces == nil {
 		return nil, errors.New("stage FakeTCP policy: all three experimental policy maps are required")
 	}
-	if err := transaction.isolation.AssertInactive(ctx, transaction.generation); err != nil {
+	generation := transaction.plan.generation
+	if err := transaction.isolation.AssertInactive(ctx, generation); err != nil {
 		return nil, fmt.Errorf(
 			"stage FakeTCP policy: prove generation %d is inactive: %w",
-			transaction.generation,
+			generation,
 			err,
 		)
 	}
 
-	operations := fakeTCPPolicyOperations(maps, snapshot)
+	operations := fakeTCPPolicyOperations(maps, transaction.plan)
 	// Reject the whole target generation before the first write if any exact
 	// key already exists. In particular, this prevents a reload from resetting
 	// the BPF-owned virtual_time_nanos cursor.
 	for _, operation := range operations {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
 		if err := operation.requireAbsent(); err != nil {
 			return nil, fmt.Errorf("stage FakeTCP policy preflight %s: %w", operation.label, err)
 		}
@@ -459,6 +459,9 @@ func (transaction *fakeTCPPolicyGenerationTransaction) stageForRuntimeClaim(
 
 	applied := make([]fakeTCPPolicyOperation, 0, len(operations))
 	for _, operation := range operations {
+		if err := ctx.Err(); err != nil {
+			return transaction.failStageLocked(ctx, err, applied)
+		}
 		if err := operation.insert(); err != nil {
 			return transaction.failStageLocked(
 				ctx,
@@ -474,6 +477,9 @@ func (transaction *fakeTCPPolicyGenerationTransaction) stageForRuntimeClaim(
 				applied,
 			)
 		}
+	}
+	if err := ctx.Err(); err != nil {
+		return transaction.failStageLocked(ctx, err, applied)
 	}
 	stage := &fakeTCPPolicyStage{
 		operations: applied,
@@ -736,63 +742,39 @@ type fakeTCPPolicyOperation struct {
 
 func fakeTCPPolicyOperations(
 	maps fakeTCPPolicyMaps,
-	snapshot *fakeTCPPolicySnapshot,
+	plan *fakeTCPPolicyGenerationPlan,
 ) []fakeTCPPolicyOperation {
 	operations := make([]fakeTCPPolicyOperation, 0,
-		len(snapshot.ControlPolicies)+len(snapshot.ManagedPorts)+len(snapshot.ManagedInterfaces))
+		len(plan.controlPolicies)+len(plan.managedPorts)+len(plan.managedInterfaces))
 
-	policyKeys := make([]abi.FakeTCPControlPolicyKey, 0, len(snapshot.ControlPolicies))
-	for key := range snapshot.ControlPolicies {
-		policyKeys = append(policyKeys, key)
-	}
-	sort.Slice(policyKeys, func(i, j int) bool {
-		return policyKeys[i].WGID < policyKeys[j].WGID
-	})
-	for _, key := range policyKeys {
+	for _, entry := range plan.controlPolicies {
 		operations = append(operations, newFakeTCPPolicyOperationWithComparator(
 			maps.ControlPolicies,
 			fakeTCPControlPolicyMapName,
 			fakeTCPPolicyPhaseControl,
-			key,
-			snapshot.ControlPolicies[key],
+			entry.Key,
+			entry.Value,
 			fakeTCPControlPolicyRollbackMatches,
 		))
 	}
 
-	portKeys := make([]abi.FakeTCPManagedPortKey, 0, len(snapshot.ManagedPorts))
-	for key := range snapshot.ManagedPorts {
-		portKeys = append(portKeys, key)
-	}
-	sort.Slice(portKeys, func(i, j int) bool {
-		if portKeys[i].UnderlayIndex != portKeys[j].UnderlayIndex {
-			return portKeys[i].UnderlayIndex < portKeys[j].UnderlayIndex
-		}
-		return portKeys[i].DestinationPort < portKeys[j].DestinationPort
-	})
-	for _, key := range portKeys {
+	for _, entry := range plan.managedPorts {
 		operations = append(operations, newFakeTCPPolicyOperation(
 			maps.ManagedPorts,
 			fakeTCPManagedPortMapName,
 			fakeTCPPolicyPhasePort,
-			key,
-			snapshot.ManagedPorts[key],
+			entry.Key,
+			entry.Value,
 		))
 	}
 
-	interfaceKeys := make([]abi.FakeTCPManagedIfKey, 0, len(snapshot.ManagedInterfaces))
-	for key := range snapshot.ManagedInterfaces {
-		interfaceKeys = append(interfaceKeys, key)
-	}
-	sort.Slice(interfaceKeys, func(i, j int) bool {
-		return interfaceKeys[i].UnderlayIndex < interfaceKeys[j].UnderlayIndex
-	})
-	for _, key := range interfaceKeys {
+	for _, entry := range plan.managedInterfaces {
 		operations = append(operations, newFakeTCPPolicyOperation(
 			maps.ManagedInterfaces,
 			fakeTCPManagedIfMapName,
 			fakeTCPPolicyPhaseInterface,
-			key,
-			snapshot.ManagedInterfaces[key],
+			entry.Key,
+			entry.Value,
 		))
 	}
 	return operations
@@ -944,10 +926,10 @@ func rollbackFakeTCPPolicyOperationsLocked(
 	if err := transaction.assertHeldLocked(ctx); err != nil {
 		return err
 	}
-	if err := transaction.isolation.Quiesce(ctx, transaction.generation); err != nil {
+	if err := transaction.isolation.Quiesce(ctx, transaction.plan.generation); err != nil {
 		return fmt.Errorf(
 			"quiesce FakeTCP policy generation %d after removing interface latches: %w",
-			transaction.generation,
+			transaction.plan.generation,
 			err,
 		)
 	}

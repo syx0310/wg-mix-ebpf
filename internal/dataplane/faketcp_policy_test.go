@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -137,6 +138,102 @@ func TestBuildFakeTCPPolicySnapshotIsInputOrderIndependentAndGenerationIsolated(
 		if _, collision := next.ControlPolicies[key]; collision {
 			t.Fatalf("target generations share control-policy key %#v", key)
 		}
+	}
+}
+
+func TestFakeTCPPolicyGenerationPlanOwnsCanonicalImmutableProjection(t *testing.T) {
+	state := fakeTCPPolicyTestState()
+	snapshot, err := buildFakeTCPPolicySnapshot(state, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := newFakeTCPPolicyGenerationPlan(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := plan.clone()
+
+	// Neither mutable input remains an owner after plan construction.
+	state.IngressListeners[0].DestinationPort++
+	snapshot.Generation++
+	for key := range snapshot.ManagedPorts {
+		delete(snapshot.ManagedPorts, key)
+	}
+	if !plan.equal(want) {
+		t.Fatal("policy plan changed after its mutable inputs were modified")
+	}
+	if err := validateFakeTCPPolicyGenerationPlan(plan); err != nil {
+		t.Fatalf("validate immutable policy plan: %v", err)
+	}
+
+	for index := 1; index < len(plan.controlPolicies); index++ {
+		if plan.controlPolicies[index-1].Key.WGID >= plan.controlPolicies[index].Key.WGID {
+			t.Fatal("control policy plan is not strictly ordered")
+		}
+	}
+	for index := 1; index < len(plan.managedPorts); index++ {
+		previous := plan.managedPorts[index-1].Key
+		current := plan.managedPorts[index].Key
+		if previous.UnderlayIndex > current.UnderlayIndex ||
+			(previous.UnderlayIndex == current.UnderlayIndex &&
+				previous.DestinationPort >= current.DestinationPort) {
+			t.Fatal("managed port plan is not strictly ordered")
+		}
+	}
+}
+
+func TestFakeTCPPolicyGenerationPlanConcurrentReadersSeeOneValue(t *testing.T) {
+	plan, err := buildFakeTCPPolicyGenerationPlan(fakeTCPPolicyTestState(), 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := plan.clone()
+	const readers = 16
+	const readsPerReader = 500
+	errCh := make(chan string, readers)
+	var wait sync.WaitGroup
+	wait.Add(readers)
+	for range readers {
+		go func() {
+			defer wait.Done()
+			for range readsPerReader {
+				observed := plan.clone()
+				if !observed.equal(want) || observed.snapshot().Generation != 101 {
+					errCh <- "immutable plan reader observed drift"
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
+	close(errCh)
+	for message := range errCh {
+		t.Fatal(message)
+	}
+}
+
+func BenchmarkBuildFakeTCPPolicyGenerationPlan(b *testing.B) {
+	state := fakeTCPPolicyTestState()
+	b.ReportAllocs()
+	for range b.N {
+		if _, err := buildFakeTCPPolicyGenerationPlan(state, 101); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkCloneFakeTCPPolicyGenerationPlan(b *testing.B) {
+	plan, err := buildFakeTCPPolicyGenerationPlan(fakeTCPPolicyTestState(), 101)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	var cloned *fakeTCPPolicyGenerationPlan
+	for range b.N {
+		cloned = plan.clone()
+	}
+	if cloned == nil {
+		b.Fatal("clone returned nil")
 	}
 }
 

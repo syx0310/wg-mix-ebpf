@@ -576,7 +576,6 @@ type experimentalFakeTCPRuntimeBuildOptions struct {
 	collection       *experimentalCollectionOwner
 	transaction      *fakeTCPPolicyGenerationTransaction
 	baselineSnapshot *abi.Snapshot
-	snapshot         *fakeTCPPolicySnapshot
 	attachState      *control.State
 	xdpRequests      []fakeTCPXDPAttachRequest
 	xdpRuntime       fakeTCPXDPRuntime
@@ -636,9 +635,10 @@ func buildExperimentalFakeTCPRuntime(
 }
 
 func (build *experimentalRuntimeBuild) runtimeOwner() *ExperimentalFakeTCPRuntime {
+	generation := build.policyPlan.generation
 	return &ExperimentalFakeTCPRuntime{
 		state: &experimentalFakeTCPRuntimeState{
-			generation: build.options.snapshot.Generation,
+			generation: generation,
 			identity:   build.engine.Identity(),
 			engine:     build.engine,
 			collection: build.options.collection,
@@ -647,7 +647,7 @@ func (build *experimentalRuntimeBuild) runtimeOwner() *ExperimentalFakeTCPRuntim
 			xdp:        build.xdpStage,
 			slowPath:   build.slowPath,
 			handles: ExperimentalFakeTCPRuntimeHandles{
-				generation: build.options.snapshot.Generation,
+				generation: generation,
 				identity:   build.engine.Identity(),
 				sessions:   build.sessions,
 				events:     build.events,
@@ -659,8 +659,8 @@ func (build *experimentalRuntimeBuild) runtimeOwner() *ExperimentalFakeTCPRuntim
 
 func (build *experimentalRuntimeBuild) failedBuildOwner() *ExperimentalFakeTCPRuntime {
 	var generation uint64
-	if build != nil && build.options.snapshot != nil {
-		generation = build.options.snapshot.Generation
+	if build != nil && build.policyPlan != nil {
+		generation = build.policyPlan.generation
 	}
 	var identity faketcp.RuntimeIdentity
 	if build != nil && build.engine != nil {
@@ -680,6 +680,7 @@ type experimentalRuntimeBuild struct {
 	claim      *fakeTCPPolicyRuntimeBuildClaim
 	activeCtx  context.Context
 	cleanupCtx context.Context
+	policyPlan *fakeTCPPolicyGenerationPlan
 
 	sessions          *generationFencedSessionStore
 	events            *generationFencedEventMap
@@ -715,24 +716,20 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if err := build.claim.assertHeld(build.activeCtx); err != nil {
 		return fmt.Errorf("build experimental FakeTCP runtime: %w", err)
 	}
-	if err := validateFakeTCPPolicySnapshot(options.snapshot); err != nil {
-		return fmt.Errorf("build experimental FakeTCP runtime snapshot: %w", err)
+	build.policyPlan = build.claim.policyPlan()
+	if err := validateFakeTCPPolicyGenerationPlan(build.policyPlan); err != nil {
+		return fmt.Errorf("build experimental FakeTCP runtime policy plan: %w", err)
 	}
-	if options.snapshot.Generation != options.transaction.generation {
-		return fmt.Errorf(
-			"build experimental FakeTCP runtime: snapshot generation %d does not match transaction generation %d",
-			options.snapshot.Generation, options.transaction.generation,
-		)
-	}
+	generation := build.policyPlan.generation
 	if options.baselineSnapshot == nil {
 		return errors.New("build experimental FakeTCP runtime: baseline snapshot is nil")
 	}
 	baselineControl, ok := options.baselineSnapshot.Control[abi.ControlKeyGlobal]
-	if !ok || baselineControl.ActiveGeneration != options.snapshot.Generation {
+	if !ok || baselineControl.ActiveGeneration != generation {
 		return fmt.Errorf(
 			"build experimental FakeTCP runtime: baseline generation %d does not match FakeTCP generation %d",
 			baselineControl.ActiveGeneration,
-			options.snapshot.Generation,
+			generation,
 		)
 	}
 	if options.attachState == nil {
@@ -740,7 +737,7 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	}
 	if err := validateExperimentalRuntimeCanonicalInterfaces(
 		options.baselineSnapshot,
-		options.snapshot,
+		build.policyPlan,
 		options.attachState,
 		options.xdpRequests,
 	); err != nil {
@@ -749,10 +746,10 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if options.xdpRuntime.probe == nil || options.xdpRuntime.attach == nil {
 		return errors.New("build experimental FakeTCP runtime: XDP probe and attach backends are required")
 	}
-	if options.engineOptions.Generation != options.snapshot.Generation {
+	if options.engineOptions.Generation != generation {
 		return fmt.Errorf(
-			"build experimental FakeTCP runtime: Engine generation %d does not match snapshot generation %d",
-			options.engineOptions.Generation, options.snapshot.Generation,
+			"build experimental FakeTCP runtime: Engine generation %d does not match policy plan generation %d",
+			options.engineOptions.Generation, generation,
 		)
 	}
 	if options.engineOptions.Store != nil {
@@ -834,11 +831,11 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		return err
 	}
 
-	ownedStore, err := options.sessionFactory(sessionMap, options.snapshot.Generation)
+	ownedStore, err := options.sessionFactory(sessionMap, generation)
 	if err != nil {
 		return build.prepareError(fmt.Errorf("build experimental FakeTCP runtime session handle: %w", err))
 	}
-	build.sessions, err = newGenerationFencedSessionStore(options.snapshot.Generation, ownedStore)
+	build.sessions, err = newGenerationFencedSessionStore(generation, ownedStore)
 	if err != nil {
 		if ownedFakeTCPSessionStoreIsNil(ownedStore) {
 			return err
@@ -859,7 +856,7 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		}
 		eventSource = liveExperimentalEventMapSource{bpfMap: bpfMap}
 	}
-	build.events, err = newGenerationFencedEventMap(options.snapshot.Generation, eventSource)
+	build.events, err = newGenerationFencedEventMap(generation, eventSource)
 	if err != nil {
 		return err
 	}
@@ -992,7 +989,6 @@ func (build *experimentalRuntimeBuild) commitAttachedCore(
 	build.policyStage, err = build.claim.Stage(
 		build.activeCtx,
 		build.policyMaps,
-		build.options.snapshot,
 	)
 	if build.policyStage != nil {
 		bindErr := build.claim.bindStageCollectionOwner(
@@ -1190,15 +1186,15 @@ func (build *experimentalRuntimeBuild) failCommitted(
 }
 
 func validateFakeTCPXDPRequests(
-	snapshot *fakeTCPPolicySnapshot,
+	plan *fakeTCPPolicyGenerationPlan,
 	requests []fakeTCPXDPAttachRequest,
 ) error {
-	if snapshot == nil {
-		return errors.New("build experimental FakeTCP runtime: snapshot is nil")
+	if plan == nil {
+		return errors.New("build experimental FakeTCP runtime: policy plan is nil")
 	}
-	want := make(map[uint32]struct{}, len(snapshot.ManagedInterfaces))
-	for key := range snapshot.ManagedInterfaces {
-		want[key.UnderlayIndex] = struct{}{}
+	want := make(map[uint32]struct{}, len(plan.managedInterfaces))
+	for _, entry := range plan.managedInterfaces {
+		want[entry.Key.UnderlayIndex] = struct{}{}
 	}
 	if len(requests) != len(want) {
 		return fmt.Errorf(
@@ -1238,14 +1234,14 @@ func validateFakeTCPXDPRequests(
 // FakeTCP policy map must be an exact projection of the same control.State.
 func validateExperimentalRuntimeCanonicalInterfaces(
 	baseline *abi.Snapshot,
-	fakeSnapshot *fakeTCPPolicySnapshot,
+	fakePlan *fakeTCPPolicyGenerationPlan,
 	attachState *control.State,
 	xdpRequests []fakeTCPXDPAttachRequest,
 ) error {
-	if baseline == nil || fakeSnapshot == nil || attachState == nil {
+	if baseline == nil || fakePlan == nil || attachState == nil {
 		return errors.New("build experimental FakeTCP runtime: canonical interface inputs are incomplete")
 	}
-	generation := fakeSnapshot.Generation
+	generation := fakePlan.generation
 	projectedBaseline, err := abi.FromStateWithGeneration(attachState, generation)
 	if err != nil {
 		return fmt.Errorf("build experimental FakeTCP runtime: project canonical baseline state: %w", err)
@@ -1300,20 +1296,20 @@ func validateExperimentalRuntimeCanonicalInterfaces(
 			)
 		}
 	}
-	projectedFake, err := buildFakeTCPPolicySnapshot(attachState, generation)
+	projectedFake, err := buildFakeTCPPolicyGenerationPlan(attachState, generation)
 	if err != nil {
 		return fmt.Errorf("build experimental FakeTCP runtime: project canonical FakeTCP policy: %w", err)
 	}
-	if !reflect.DeepEqual(fakeSnapshot.ManagedInterfaces, projectedFake.ManagedInterfaces) {
+	if !reflect.DeepEqual(fakePlan.managedInterfaces, projectedFake.managedInterfaces) {
 		return errors.New("build experimental FakeTCP runtime: FakeTCP managed interfaces are stale or unrelated to TC attach state")
 	}
-	if !reflect.DeepEqual(fakeSnapshot.ManagedPorts, projectedFake.ManagedPorts) {
+	if !reflect.DeepEqual(fakePlan.managedPorts, projectedFake.managedPorts) {
 		return errors.New("build experimental FakeTCP runtime: FakeTCP managed ports are stale or unrelated to TC attach state")
 	}
-	if !reflect.DeepEqual(fakeSnapshot.ControlPolicies, projectedFake.ControlPolicies) {
+	if !reflect.DeepEqual(fakePlan.controlPolicies, projectedFake.controlPolicies) {
 		return errors.New("build experimental FakeTCP runtime: FakeTCP control policies are stale or unrelated to TC attach state")
 	}
-	if err := validateFakeTCPXDPRequests(fakeSnapshot, xdpRequests); err != nil {
+	if err := validateFakeTCPXDPRequests(fakePlan, xdpRequests); err != nil {
 		return err
 	}
 	return nil
