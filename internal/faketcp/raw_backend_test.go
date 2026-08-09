@@ -101,7 +101,7 @@ func TestRawControllerBackendSendsControlWithExplicitRouteMark(t *testing.T) {
 			resolvedFlow, resolvedWGID = gotFlow, wgID
 			return 0xa1230009, nil
 		}),
-		MaxRememberedReinjections: 8,
+		RuntimeIdentity: testRuntimeIdentity(1), MaxReinjectStreams: 8,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -138,7 +138,7 @@ func TestRawControllerBackendReinjectsMaterializedPacketThroughOriginalMark(t *t
 		ControlMarks: ControlMarkResolverFunc(func(context.Context, abi.FakeTCPSessionKey, uint32) (uint32, error) {
 			return 0, nil
 		}),
-		MaxRememberedReinjections: 8,
+		RuntimeIdentity: testRuntimeIdentity(1), MaxReinjectStreams: 8,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -161,7 +161,7 @@ func TestRawControllerBackendReinjectsMaterializedPacketThroughOriginalMark(t *t
 func TestOnceReinjectorAttemptsExactIdentityOnlyOnce(t *testing.T) {
 	wantErr := errors.New("ambiguous raw send failure")
 	writer := &memoryRawIPv4Writer{writeErr: wantErr}
-	reinjector, err := NewOnceReinjector(writer, 8)
+	reinjector, err := newOnceReinjector(writer, testRuntimeIdentity(1), 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -178,9 +178,9 @@ func TestOnceReinjectorAttemptsExactIdentityOnlyOnce(t *testing.T) {
 	}
 }
 
-func TestOnceReinjectorUsesCaptureSequenceAndIncarnationNotTimestamp(t *testing.T) {
+func TestOnceReinjectorKeepsOneMonotonicAttemptPerCaptureCPU(t *testing.T) {
 	writer := &memoryRawIPv4Writer{}
-	reinjector, err := NewOnceReinjector(writer, 8)
+	reinjector, err := newOnceReinjector(writer, testRuntimeIdentity(1), 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,32 +190,32 @@ func TestOnceReinjectorUsesCaptureSequenceAndIncarnationNotTimestamp(t *testing.
 	second := first
 	second.Data = append([]byte(nil), first.Data...)
 	second.CaptureID.Sequence = 2
-	third := first
-	third.Data = append([]byte(nil), first.Data...)
-	third.CaptureID.Runtime.Incarnation[0] = 2
-	fourth := first
-	fourth.Data = append([]byte(nil), first.Data...)
-	fourth.CaptureID.CPU = 4
-	for _, packet := range []PendingPacket{first, second, third, fourth} {
+	otherCPU := first
+	otherCPU.Data = append([]byte(nil), first.Data...)
+	otherCPU.CaptureID.CPU = 4
+	for _, packet := range []PendingPacket{first, first, second, second, otherCPU, otherCPU} {
 		if err := reinjector.Reinject(context.Background(), flow, packet); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// Exact replay of each identity is coalesced independently.
-	for _, packet := range []PendingPacket{first, second, third, fourth} {
-		if err := reinjector.Reinject(context.Background(), flow, packet); err != nil {
-			t.Fatal(err)
-		}
+	if err := reinjector.Reinject(context.Background(), flow, first); !errors.Is(err, ErrReinjectOutOfOrder) {
+		t.Fatalf("stale per-CPU capture error=%v", err)
+	}
+	wrongRuntime := second
+	wrongRuntime.Data = append([]byte(nil), second.Data...)
+	wrongRuntime.CaptureID.Runtime.Incarnation[0] ^= 0xff
+	if err := reinjector.Reinject(context.Background(), flow, wrongRuntime); err == nil {
+		t.Fatal("capture from another runtime incarnation was accepted")
 	}
 	writes, _ := writer.snapshot()
-	if len(writes) != 4 {
-		t.Fatalf("raw attempts=%d, want one per capture identity", len(writes))
+	if len(writes) != 3 {
+		t.Fatalf("raw attempts=%d, want one per monotonic capture identity", len(writes))
 	}
 }
 
 func TestOnceReinjectorRejectsCaptureIdentityReuseWithDifferentMetadata(t *testing.T) {
 	writer := &memoryRawIPv4Writer{}
-	reinjector, err := NewOnceReinjector(writer, 8)
+	reinjector, err := newOnceReinjector(writer, testRuntimeIdentity(1), 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -238,7 +238,7 @@ func TestOnceReinjectorRejectsCaptureIdentityReuseWithDifferentMetadata(t *testi
 func TestOnceReinjectorCoalescesConcurrentDuplicate(t *testing.T) {
 	release := make(chan struct{})
 	writer := &memoryRawIPv4Writer{entered: make(chan struct{}), release: release}
-	reinjector, err := NewOnceReinjector(writer, 8)
+	reinjector, err := newOnceReinjector(writer, testRuntimeIdentity(1), 8)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -278,7 +278,7 @@ func TestOnceReinjectorCoalescesConcurrentDuplicate(t *testing.T) {
 
 func TestOnceReinjectorBoundsLedgerAndValidatesBeforeClaim(t *testing.T) {
 	writer := &memoryRawIPv4Writer{}
-	reinjector, err := NewOnceReinjector(writer, 1)
+	reinjector, err := newOnceReinjector(writer, testRuntimeIdentity(1), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -295,12 +295,43 @@ func TestOnceReinjectorBoundsLedgerAndValidatesBeforeClaim(t *testing.T) {
 	if err := reinjector.Reinject(context.Background(), flow, testPendingPacket(t, flow, 1)); err != nil {
 		t.Fatal(err)
 	}
-	if err := reinjector.Reinject(context.Background(), flow, testPendingPacket(t, flow, 2)); !errors.Is(err, ErrReinjectLedgerCapacity) {
+	if err := reinjector.Reinject(context.Background(), flow, testPendingPacket(t, flow, 2)); err != nil {
+		t.Fatalf("same capture stream did not advance in constant space: %v", err)
+	}
+	differentCPU := testPendingPacket(t, flow, 1)
+	differentCPU.CaptureID.CPU++
+	if err := reinjector.Reinject(context.Background(), flow, differentCPU); !errors.Is(err, ErrReinjectLedgerCapacity) {
 		t.Fatalf("capacity error=%v", err)
 	}
 	writes, _ := writer.snapshot()
-	if len(writes) != 1 {
-		t.Fatalf("raw attempts=%d, want one", len(writes))
+	if len(writes) != 2 {
+		t.Fatalf("raw attempts=%d, want two monotonic attempts on one stream", len(writes))
+	}
+}
+
+func TestOnceReinjectorUsesConstantSpaceAcrossLongMonotonicStream(t *testing.T) {
+	writer := &memoryRawIPv4Writer{}
+	reinjector, err := newOnceReinjector(writer, testRuntimeIdentity(1), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	flow := testFlow(31001)
+	const attempts = 4096
+	for sequence := uint64(1); sequence <= attempts; sequence++ {
+		if err := reinjector.Reinject(
+			context.Background(),
+			flow,
+			testPendingPacket(t, flow, sequence),
+		); err != nil {
+			t.Fatalf("sequence %d: %v", sequence, err)
+		}
+	}
+	if len(reinjector.lastByCPU) != 1 {
+		t.Fatalf("stream ledger entries=%d, want 1", len(reinjector.lastByCPU))
+	}
+	writes, _ := writer.snapshot()
+	if len(writes) != attempts {
+		t.Fatalf("raw writes=%d, want %d", len(writes), attempts)
 	}
 }
 
@@ -312,7 +343,7 @@ func TestRawControllerBackendCloseWaitsForReinjectionAndClosesWriterOnce(t *test
 		ControlMarks: ControlMarkResolverFunc(func(context.Context, abi.FakeTCPSessionKey, uint32) (uint32, error) {
 			return 0, nil
 		}),
-		MaxRememberedReinjections: 8,
+		RuntimeIdentity: testRuntimeIdentity(1), MaxReinjectStreams: 8,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -385,7 +416,7 @@ func TestRawControllerBackendExternalCallsRunOutsideStateLock(t *testing.T) {
 			assertUnlocked("control mark resolution")
 			return 9, nil
 		}),
-		MaxRememberedReinjections: 2,
+		RuntimeIdentity: testRuntimeIdentity(1), MaxReinjectStreams: 2,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -408,7 +439,7 @@ func TestRawControllerBackendCloseFencesAdmittedResolver(t *testing.T) {
 			<-resolverRelease
 			return 9, nil
 		}),
-		MaxRememberedReinjections: 1,
+		RuntimeIdentity: testRuntimeIdentity(1), MaxReinjectStreams: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -462,7 +493,7 @@ func TestRawControllerBackendFailsBeforeWriterOnMarkError(t *testing.T) {
 		ControlMarks: ControlMarkResolverFunc(func(context.Context, abi.FakeTCPSessionKey, uint32) (uint32, error) {
 			return 0, wantErr
 		}),
-		MaxRememberedReinjections: 1,
+		RuntimeIdentity: testRuntimeIdentity(1), MaxReinjectStreams: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -489,7 +520,7 @@ func TestRawControllerBackendConcurrentCloseCoalescesWriterErrorAndRetries(t *te
 		ControlMarks: ControlMarkResolverFunc(func(context.Context, abi.FakeTCPSessionKey, uint32) (uint32, error) {
 			return 0, nil
 		}),
-		MaxRememberedReinjections: 1,
+		RuntimeIdentity: testRuntimeIdentity(1), MaxReinjectStreams: 1,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -548,18 +579,25 @@ func TestNewRawControllerBackendRejectsNilResourcesAndCapacity(t *testing.T) {
 	resolver := ControlMarkResolverFunc(func(context.Context, abi.FakeTCPSessionKey, uint32) (uint32, error) {
 		return 0, nil
 	})
-	if _, err := NewRawControllerBackend(RawControllerBackendOptions{ControlMarks: resolver, MaxRememberedReinjections: 1}); err == nil {
+	if _, err := NewRawControllerBackend(RawControllerBackendOptions{ControlMarks: resolver, MaxReinjectStreams: 1}); err == nil {
 		t.Fatal("nil writer accepted")
 	}
 	writer := &memoryRawIPv4Writer{}
-	if _, err := NewRawControllerBackend(RawControllerBackendOptions{Writer: writer, MaxRememberedReinjections: 1}); err == nil {
+	if _, err := NewRawControllerBackend(RawControllerBackendOptions{Writer: writer, MaxReinjectStreams: 1}); err == nil {
 		t.Fatal("nil resolver accepted")
 	}
-	if _, err := NewRawControllerBackend(RawControllerBackendOptions{Writer: writer, ControlMarks: resolver}); err == nil {
+	if _, err := NewRawControllerBackend(RawControllerBackendOptions{
+		Writer: writer, ControlMarks: resolver, RuntimeIdentity: testRuntimeIdentity(1),
+	}); err == nil {
 		t.Fatal("zero capacity accepted")
 	}
+	if _, err := NewRawControllerBackend(RawControllerBackendOptions{
+		Writer: writer, ControlMarks: resolver, MaxReinjectStreams: 1,
+	}); err == nil {
+		t.Fatal("zero runtime identity accepted")
+	}
 	var typedNilWriter *memoryRawIPv4Writer
-	if _, err := NewOnceReinjector(typedNilWriter, 1); err == nil {
+	if _, err := newOnceReinjector(typedNilWriter, testRuntimeIdentity(1), 1); err == nil {
 		t.Fatal("typed-nil writer accepted")
 	}
 }
