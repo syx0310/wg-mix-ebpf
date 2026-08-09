@@ -62,6 +62,9 @@ STATIC_SHA256=''
 PREPARE_PATH=''
 PREPARE_BLOB=''
 PREPARE_SHA256=''
+PROVISION_PATH=''
+PROVISION_BLOB=''
+PROVISION_SHA256=''
 
 fail() {
   printf 'B82_V6_STAGE_STOP mode=%s reason=%s rc=%s snapshot=%s stage=%s; retained=1\n' \
@@ -168,7 +171,10 @@ load_manifest() {
     read_manifest_field test_matrix_static_py_sha256 STATIC_SHA256 &&
     read_manifest_field prepare_stage_root_sh_path PREPARE_PATH &&
     read_manifest_field prepare_stage_root_sh_blob PREPARE_BLOB &&
-    read_manifest_field prepare_stage_root_sh_sha256 PREPARE_SHA256 || {
+    read_manifest_field prepare_stage_root_sh_sha256 PREPARE_SHA256 &&
+    read_manifest_field provision_ubuntu_test_host_sh_path PROVISION_PATH &&
+    read_manifest_field provision_ubuntu_test_host_sh_blob PROVISION_BLOB &&
+    read_manifest_field provision_ubuntu_test_host_sh_sha256 PROVISION_SHA256 || {
       exec 3<&-
       return 65
     }
@@ -196,15 +202,18 @@ validate_manifest() {
     "${SOAK_SECONDS}" == '3600' && "${SESSION_SECONDS}" == '300' ]] || return 65
   valid_sha256 "${BUNDLE_SHA256}" && valid_sha256 "${ROOT_MATRIX_SHA256}" &&
     valid_sha256 "${CHECKER_SHA256}" && valid_sha256 "${HERMETIC_SHA256}" &&
-    valid_sha256 "${STATIC_SHA256}" && valid_sha256 "${PREPARE_SHA256}" || return 65
+    valid_sha256 "${STATIC_SHA256}" && valid_sha256 "${PREPARE_SHA256}" &&
+    valid_sha256 "${PROVISION_SHA256}" || return 65
   [[ "${ROOT_MATRIX_BLOB}" =~ ^[0-9a-f]{40}$ && "${CHECKER_BLOB}" =~ ^[0-9a-f]{40}$ &&
     "${HERMETIC_BLOB}" =~ ^[0-9a-f]{40}$ && "${STATIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
-    "${PREPARE_BLOB}" =~ ^[0-9a-f]{40}$ && -n "${IGNORED}" ]] || return 65
+    "${PREPARE_BLOB}" =~ ^[0-9a-f]{40}$ && "${PROVISION_BLOB}" =~ ^[0-9a-f]{40}$ &&
+    -n "${IGNORED}" ]] || return 65
   [[ "${ROOT_MATRIX_PATH}" == "scripts/realhost-b82-${RUN_ID}/root-matrix-n-r.sh" &&
     "${CHECKER_PATH}" == "scripts/realhost-b82-${RUN_ID}/check-realhost-iperf.py" &&
     "${HERMETIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test-hermetic-matrix.sh" &&
     "${STATIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test_matrix_static.py" &&
-    "${PREPARE_PATH}" == "scripts/realhost-b82-${RUN_ID}/prepare-stage-root.sh" ]] || return 65
+    "${PREPARE_PATH}" == "scripts/realhost-b82-${RUN_ID}/prepare-stage-root.sh" &&
+    "${PROVISION_PATH}" == 'scripts/provision-ubuntu-test-host.sh' ]] || return 65
   case "${WG_STATE}" in
     bound) [[ "${WG_INTERFACE}" != 'absent' && "${WG_LOCAL_ADDRESS}" != 'absent' && "${WG_PEER_ADDRESS}" != 'absent' ]] ;;
     absent) [[ "${WG_INTERFACE}" == 'absent' && "${WG_LOCAL_ADDRESS}" == 'absent' && "${WG_PEER_ADDRESS}" == 'absent' ]] ;;
@@ -262,10 +271,11 @@ render_plan() {
     /usr/bin/git -c core.hooksPath=/dev/null -C "${EXPECTED_SOURCE}" \
     checkout --detach "${INTEGRATION_COMMIT}"
   plan_command S6 /bin/bash -n "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" \
-    "${EXPECTED_SOURCE}/${HERMETIC_PATH}" "${EXPECTED_SOURCE}/${PREPARE_PATH}"
+    "${EXPECTED_SOURCE}/${HERMETIC_PATH}" "${EXPECTED_SOURCE}/${PREPARE_PATH}" \
+    "${EXPECTED_SOURCE}/${PROVISION_PATH}"
   plan_command S7 /usr/bin/shellcheck --norc --shell=bash -- \
     "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" "${EXPECTED_SOURCE}/${HERMETIC_PATH}" \
-    "${EXPECTED_SOURCE}/${PREPARE_PATH}"
+    "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${PROVISION_PATH}"
   plan_command S8 shell-builtin noclobber-write "${BINDING_MARKER}"
   printf 'B82_V6_STAGE_PLAN_COMPLETE no_commands_executed=1 no_cleanup=1\n'
 }
@@ -431,13 +441,15 @@ run_stage() {
     "$(sha256_file "${EXPECTED_SOURCE}/${CHECKER_PATH}")" == "${CHECKER_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${HERMETIC_PATH}")" == "${HERMETIC_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${STATIC_PATH}")" == "${STATIC_SHA256}" &&
-    "$(sha256_file "${EXPECTED_SOURCE}/${PREPARE_PATH}")" == "${PREPARE_SHA256}" ]] ||
+    "$(sha256_file "${EXPECTED_SOURCE}/${PREPARE_PATH}")" == "${PREPARE_SHA256}" &&
+    "$(sha256_file "${EXPECTED_SOURCE}/${PROVISION_PATH}")" == "${PROVISION_SHA256}" ]] ||
     fail 'staged-script-hash' 79
   run_step S6 /bin/bash -n "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" \
-    "${EXPECTED_SOURCE}/${HERMETIC_PATH}" "${EXPECTED_SOURCE}/${PREPARE_PATH}" || fail 'bash-syntax' $?
+    "${EXPECTED_SOURCE}/${HERMETIC_PATH}" "${EXPECTED_SOURCE}/${PREPARE_PATH}" \
+    "${EXPECTED_SOURCE}/${PROVISION_PATH}" || fail 'bash-syntax' $?
   run_step S7 /usr/bin/shellcheck --norc --shell=bash -- \
     "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" "${EXPECTED_SOURCE}/${HERMETIC_PATH}" \
-    "${EXPECTED_SOURCE}/${PREPARE_PATH}" || fail 'shellcheck' $?
+    "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${PROVISION_PATH}" || fail 'shellcheck' $?
   stage_status="$(git_stage -C "${EXPECTED_SOURCE}" status --porcelain=v1 --untracked-files=all)" || fail 'stage-status'
   [[ -z "${stage_status}" ]] || fail 'stage-dirty' 79
   write_binding_marker || fail 'binding-marker' $?
