@@ -55,6 +55,17 @@ def require_literals(source: str, literals: tuple[str, ...], contract: str) -> N
             fail(f"{contract} is missing {literal!r}")
 
 
+def readonly_array(source: str, name: str) -> tuple[str, ...]:
+    match = re.search(
+        rf"^readonly -a {re.escape(name)}=\(\n(?P<body>(?:  [A-Za-z0-9_]+\n)+)\)$",
+        source,
+        re.MULTILINE,
+    )
+    if match is None:
+        fail(f"cannot isolate runner array {name}")
+    return tuple(line.strip() for line in match.group("body").splitlines())
+
+
 def modeled_self_contract(
     invoked: pathlib.Path,
     expected: pathlib.Path,
@@ -980,6 +991,7 @@ def main() -> None:
             "TestExperimentalFakeTCPRealHostLifecycleIntegration",
             "TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration",
             "TestBaselineExperimentalRealHostMutualExclusionIntegration",
+            "TestFakeTCPRealHostManagedIngressAcceptance",
             "TestFakeTCPRealHostVirtioNetHeaderEncoding",
             "TestFakeTCPRealHostGSOOutputMatcher",
             "TestFakeTCPRealHostGSOProbeIsolationContract",
@@ -989,6 +1001,11 @@ def main() -> None:
         ),
         "standalone runner contract",
     )
+    managed_test = "TestFakeTCPRealHostManagedIngressAcceptance"
+    if readonly_array(runner, "REALHOST_TESTS").count(managed_test) != 1:
+        fail("managed-ingress acceptance is not one exact REALHOST_TESTS member")
+    if managed_test in readonly_array(runner, "OFFLOAD_TESTS"):
+        fail("managed-ingress acceptance moved into OFFLOAD_TESTS")
     if re.search(r'clone[^\n]*"\$\{BUNDLE\}"', runner):
         fail("runner clones directly from the user-owned package bundle")
     if "MODULE_PHASE" in runner or "phase-module.v1" in runner:
