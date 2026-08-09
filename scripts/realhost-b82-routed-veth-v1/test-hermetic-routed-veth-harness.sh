@@ -87,7 +87,7 @@ for literal in \
   'R6 operation=veth-delete target=wg7e42aa argv=/usr/sbin/ip link delete dev wg7e42aa' \
   'B82_ROUTED_VETH_RESTORE_ORDER cleanup-intent,bpf-baseline,module,offload,neighbor,route,address,veth,bpf-baseline,restored retryable=1 exact_reverse=1' \
   'af_packet=none,partial,gso:route-unknown-negative routed=iphdrincl-none,udp-partial,udp-segment-gso:positive capability_bits_changed=0' \
-  'B82_ROUTED_VETH_PLAN_COMPLETE commands_are_review_templates=1 no_commands_executed=1 credential_read=0 remote_connections=0 network_operations=0'; do
+  'B82_ROUTED_VETH_PLAN_COMPLETE commands_are_review_templates=1 preflight_before_host_mutation=1 network_downloads=0 no_commands_executed=1 credential_read=0 remote_connections=0 network_operations=0'; do
   [[ "${PLAN_OUTPUT}" == *"${literal}"* ]] || fail "runner plan is missing ${literal}"
 done
 

@@ -614,7 +614,8 @@ func fakeTCPRoutedExpectedWireSegments(
 	}
 	if wireGuard.ProfileID != profile.ID || wireGuard.CipherID != cipher.ID ||
 		cipher.Mode != "xor" || cipher.Scope != "wg-payload-full" ||
-		cipher.KeyLen == 0 || cipher.KeyLen > uint32(len(cipher.Key)) || matchedRules != 1 {
+		cipher.KeyLen == 0 || cipher.KeyLen > uint32(len(cipher.Key)) ||
+		cipher.MaxBytes < fakeTCPRoutedSegmentBytes || matchedRules != 1 {
 		t.Fatalf("routed wire oracle is not bound to the active full-payload XOR profile")
 	}
 	if len(payload) != segments*fakeTCPRoutedSegmentBytes {

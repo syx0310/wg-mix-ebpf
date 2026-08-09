@@ -255,13 +255,13 @@ render_plan() {
     IFS='|' read -r label operation <<<"${spec}"
     plan_operation "${label}" "${operation}"
   done
-  printf 'B82_ROUTED_VETH_WRITE_SET filesystem=%s,%s,%s,%s,%s network=veth:%s,%s,address:%s/%s,route:%s/%s,neighbor:%s,offload:%s:tso module=%s bpf=transient-unpinned-test-owned evidence_retained=1\n' \
-    "${EVIDENCE_ROOT}" "${PREFLIGHT_BINARY}" "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_TMP}" \
+  printf 'B82_ROUTED_VETH_WRITE_SET filesystem=%s,%s,%s,%s,%s,%s network=veth:%s,%s,address:%s/%s,route:%s/%s,neighbor:%s,offload:%s:tso module=%s bpf=transient-unpinned-test-owned evidence_retained=1\n' \
+    "${EVIDENCE_ROOT}" "${PREFLIGHT_BINARY}" "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}" \
     "${VETH_A}" "${VETH_B}" "${LOCAL_IPV4}" "${PREFIX_BITS}" "${REMOTE_IPV4}" \
     "${PREFIX_BITS}" "${REMOTE_IPV4}" "${VETH_A}" "${MODULE_NAME}"
   printf 'B82_ROUTED_VETH_RESTORE_ORDER cleanup-intent,bpf-baseline,module,offload,neighbor,route,address,veth,bpf-baseline,restored retryable=1 exact_reverse=1\n'
   printf 'B82_ROUTED_VETH_COVERAGE af_packet=none,partial,gso:route-unknown-negative routed=iphdrincl-none,udp-partial,udp-segment-gso:positive capability_bits_changed=0\n'
-  printf 'B82_ROUTED_VETH_PLAN_COMPLETE commands_are_review_templates=1 no_commands_executed=1 credential_read=0 remote_connections=0 network_operations=0\n'
+  printf 'B82_ROUTED_VETH_PLAN_COMPLETE commands_are_review_templates=1 preflight_before_host_mutation=1 network_downloads=0 no_commands_executed=1 credential_read=0 remote_connections=0 network_operations=0\n'
 }
 
 utc_now() { /bin/date -u '+%Y-%m-%dT%H:%M:%SZ'; }
