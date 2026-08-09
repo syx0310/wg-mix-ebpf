@@ -27,6 +27,9 @@ readonly STANDALONE_SCOPE_COMMIT='1c4102b96d28657b60ee58314c7088069c59eea9'
 readonly SINGLE_L3_PARENT='cecf74ceded6b13a770d7b02283abe45de2faedb'
 readonly SINGLE_L3_FINAL='ad31ae79af828b756c884ae342f8e4f51a6bacf7'
 readonly SINGLE_L3_MERGE='15e2122a74738ed1904465e1f1e8e75f4892c4b2'
+readonly MANAGED_INGRESS_BASE='d28585bfaaefe44c0e71d2cbbced494da96dd7fa'
+readonly MANAGED_INGRESS_ACCOUNTING='eb1b90ec4d73267e2eaebc313e82cfd81351fe23'
+readonly MANAGED_INGRESS_PRODUCTION='829e6f2e5664207cecb52ccb0b55e4ed9f9533ff'
 
 readonly -a CONTROLLER_FILES=(
   scripts/realhost-b82-c8e41d73/bind-final-package.sh
@@ -40,22 +43,15 @@ readonly -a MERGE_RESOLUTION_FILES=(
   scripts/realhost-b82-c8e41d73/test-hermetic-controller.sh
   scripts/realhost-b82-c8e41d73/test_controller_static.py
 )
-readonly -a SINGLE_L3_FILES=(
-  bpf/wg_mix_faketcp.h
-  bpf/wg_mix_tc.c
-  internal/dataplane/faketcp_admission_contract_test.go
-  internal/dataplane/faketcp_gso_contract_test.go
-  internal/dataplane/faketcp_l3_parser_test.go
-  internal/dataplane/faketcp_mtu_contract_test.go
-  internal/dataplane/faketcp_order_test.go
-  internal/dataplane/faketcp_policy_test.go
-  internal/dataplane/faketcp_single_parse_contract_test.go
-  internal/faketcp/l3_single_parse_model_test.go
-)
 readonly -a GSO_TESTS=(
   TestFakeTCPRealHostVirtioNetHeaderEncoding
   TestFakeTCPRealHostGSOOutputMatcher
   TestFakeTCPRealHostGSOProbeIsolationContract
+)
+readonly -a WORKTREE_BOUND_FILES=(
+  scripts/realhost-b82-c8e41d73/root-veth-n-r.sh
+  scripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh
+  scripts/realhost-b82-c8e41d73/test_veth_runner_static.py
 )
 
 fail() {
@@ -91,6 +87,8 @@ BOUND_COMMIT="$(/usr/bin/git -C "${REPOSITORY}" rev-parse --verify HEAD^{commit}
   fail 'cannot bind the hermetic fixture to HEAD'
 readonly BOUND_COMMIT
 [[ "${BOUND_COMMIT}" =~ ^[0-9a-f]{40}$ ]] || fail 'bound commit is malformed'
+/usr/bin/git -C "${REPOSITORY}" diff --exit-code "${BOUND_COMMIT}" -- \
+  "${WORKTREE_BOUND_FILES[@]}" || fail 'runner/static/hermetic working tree drifted from HEAD'
 
 MERGE_PARENTS="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P "${INTEGRATION_MERGE_COMMIT}")" ||
   fail 'cannot read integration merge parents'
@@ -127,9 +125,38 @@ SINGLE_L3_PATHS="$(/usr/bin/git -C "${REPOSITORY}" diff --name-only \
 readonly SINGLE_L3_PATHS
 [[ "${SINGLE_L3_PATHS}" == $'bpf/wg_mix_faketcp.h\nbpf/wg_mix_tc.c\ninternal/dataplane/faketcp_admission_contract_test.go\ninternal/dataplane/faketcp_gso_contract_test.go\ninternal/dataplane/faketcp_l3_parser_test.go\ninternal/dataplane/faketcp_mtu_contract_test.go\ninternal/dataplane/faketcp_order_test.go\ninternal/dataplane/faketcp_policy_test.go\ninternal/dataplane/faketcp_single_parse_contract_test.go\ninternal/faketcp/l3_single_parse_model_test.go' ]] ||
   fail 'single-L3 merge changed a non-topic path'
+
+MANAGED_INGRESS_ACCOUNTING_PARENTS="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P \
+  "${MANAGED_INGRESS_ACCOUNTING}")" || fail 'cannot read managed-ingress accounting parent'
+readonly MANAGED_INGRESS_ACCOUNTING_PARENTS
+[[ "${MANAGED_INGRESS_ACCOUNTING_PARENTS}" == "${MANAGED_INGRESS_BASE}" ]] ||
+  fail 'managed-ingress accounting commit is not based on the exact canonical commit'
+MANAGED_INGRESS_PRODUCTION_PARENTS="$(/usr/bin/git -C "${REPOSITORY}" show -s --format=%P \
+  "${MANAGED_INGRESS_PRODUCTION}")" || fail 'cannot read managed-ingress production parent'
+readonly MANAGED_INGRESS_PRODUCTION_PARENTS
+[[ "${MANAGED_INGRESS_PRODUCTION_PARENTS}" == "${MANAGED_INGRESS_ACCOUNTING}" ]] ||
+  fail 'managed-ingress typeword fix is not directly append-only after accounting'
+/usr/bin/git -C "${REPOSITORY}" merge-base --is-ancestor \
+  "${SINGLE_L3_MERGE}" "${MANAGED_INGRESS_BASE}" ||
+  fail 'managed-ingress base lost the reviewed single-L3 merge'
+/usr/bin/git -C "${REPOSITORY}" merge-base --is-ancestor \
+  "${MANAGED_INGRESS_PRODUCTION}" "${BOUND_COMMIT}" ||
+  fail 'bound commit does not contain managed-ingress production accounting'
+MANAGED_INGRESS_PRODUCTION_PATHS="$(/usr/bin/git -C "${REPOSITORY}" diff --name-only \
+  "${MANAGED_INGRESS_BASE}" "${MANAGED_INGRESS_PRODUCTION}")" ||
+  fail 'cannot read managed-ingress production write set'
+readonly MANAGED_INGRESS_PRODUCTION_PATHS
+[[ "${MANAGED_INGRESS_PRODUCTION_PATHS}" == 'bpf/wg_mix_faketcp.h' ]] ||
+  fail 'managed-ingress production commit changed a non-topic path'
+MANAGED_INGRESS_TEST_PATHS="$(/usr/bin/git -C "${REPOSITORY}" diff --name-only \
+  "${MANAGED_INGRESS_PRODUCTION}" "${BOUND_COMMIT}")" ||
+  fail 'cannot read managed-ingress acceptance write set'
+readonly MANAGED_INGRESS_TEST_PATHS
+[[ "${MANAGED_INGRESS_TEST_PATHS}" == $'internal/dataplane/faketcp_managed_ingress_contract_test.go\ninternal/dataplane/faketcp_managed_ingress_realhost_linux_test.go\nscripts/realhost-b82-c8e41d73/root-veth-n-r.sh\nscripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh\nscripts/realhost-b82-c8e41d73/test_veth_runner_static.py' ]] ||
+  fail 'managed-ingress acceptance changed a non-topic path'
 /usr/bin/git -C "${REPOSITORY}" diff --exit-code \
-  "${SINGLE_L3_MERGE}" "${BOUND_COMMIT}" -- "${SINGLE_L3_FILES[@]}" ||
-  fail 'reviewed single-L3 topic drifted after its explicit merge'
+  "${MANAGED_INGRESS_PRODUCTION}" "${BOUND_COMMIT}" -- bpf/wg_mix_faketcp.h ||
+  fail 'managed-ingress production accounting drifted after its dedicated commit'
 
 # The original standalone commit itself remained isolated from the controller.
 /usr/bin/git -C "${REPOSITORY}" diff --exit-code \
@@ -165,6 +192,48 @@ for test_name in "${GSO_TESTS[@]}"; do
   [[ "${definition_count}" == 1 ]] ||
     fail "bound commit must define exactly one real ${test_name} test function"
 done
+
+MANAGED_INGRESS_SOURCE="$(/usr/bin/git -C "${REPOSITORY}" show \
+  "${BOUND_COMMIT}:internal/dataplane/faketcp_managed_ingress_realhost_linux_test.go")" ||
+  fail 'cannot read managed-ingress acceptance from the bound commit tree'
+readonly MANAGED_INGRESS_SOURCE
+managed_ingress_definition_count="$(printf '%s\n' "${MANAGED_INGRESS_SOURCE}" | /usr/bin/grep -Ec \
+  '^func TestFakeTCPRealHostManagedIngressAcceptance\(t \*testing\.T\) \{$')"
+[[ "${managed_ingress_definition_count}" == 1 ]] ||
+  fail 'bound commit must define exactly one managed-ingress real-host test'
+for literal in \
+  'faketcp.ClassifyManagedIngressFrame' \
+  'faketcp.ParseL3' \
+  'fakeTCPManagedIngressFakeStatCount    = 19' \
+  'fakeTCPManagedIngressCoreStatCount    = 36' \
+  'fakeTCPRoutedExactStatDeltas' \
+  'fakeTCPManagedIngressInvalidWireWord' \
+  'canonicalPayload[12:16]' \
+  'name: "managed canonical decode"' \
+  'name: "unmanaged native UDP pass"' \
+  'name: "managed IPv4 options drop"' \
+  'name: "unmanaged TCP options pass"' \
+  'name: "managed IPv6 extension drop"' \
+  'name: "unmanaged IPv6 extension pass"' \
+  'name: "managed IPv4 first fragment drop"' \
+  'name: "unmanaged IPv4 noninitial fragment pass"' \
+  'name: "managed IPv6 first fragment drop"' \
+  'name: "managed IPv6 noninitial fragment drop"' \
+  'name: "unmanaged IPv6 noninitial fragment pass"' \
+  'name: "managed truncation drop"' \
+  'name: "unmanaged truncation pass"' \
+  'name: "ICMP safe bypass"' \
+  'name: "ICMPv6 safe bypass"' \
+  'FAKETCP_MANAGED_INGRESS_COMPLETE'; do
+  [[ "${MANAGED_INGRESS_SOURCE}" == *"${literal}"* ]] ||
+    fail "managed-ingress acceptance source is missing ${literal}"
+done
+managed_ingress_cell_count="$(printf '%s\n' "${MANAGED_INGRESS_SOURCE}" | /usr/bin/grep -Ec \
+  '^[[:space:]]+name: "')"
+[[ "${managed_ingress_cell_count}" == 22 ]] ||
+  fail 'managed-ingress acceptance must retain exactly 22 matrix cells'
+[[ "${MANAGED_INGRESS_SOURCE}" != *'t.Parallel('* ]] ||
+  fail 'managed-ingress live matrix must remain serial'
 
 [[ ! -e "${VETH_STAGE}" && ! -L "${VETH_STAGE}" ]] ||
   fail 'local fixture refuses a pre-existing production veth stage path'
@@ -230,6 +299,15 @@ for literal in \
   'TestBaselineExperimentalRealHostMutualExclusionIntegration'; do
   [[ "${PLAN_OUTPUT}" == *"${literal}"* ]] || fail "plan is missing ${literal}"
 done
+
+for operation in list realhost; do
+  managed_operation_count="$(printf '%s\n' "${PLAN_OUTPUT}" | /usr/bin/grep -Foc -- \
+    "operation=${operation}:TestFakeTCPRealHostManagedIngressAcceptance target=TestFakeTCPRealHostManagedIngressAcceptance argv=")"
+  [[ "${managed_operation_count}" == 1 ]] ||
+    fail "plan must contain exactly one managed-ingress ${operation} operation"
+done
+[[ "${PLAN_OUTPUT}" != *'operation=offload:TestFakeTCPRealHostManagedIngressAcceptance '* ]] ||
+  fail 'managed-ingress acceptance moved into the offload phase'
 
 for forbidden in \
   '/usr/bin/ssh' '/usr/bin/scp' '/usr/bin/sudo' 'credientials/' \
