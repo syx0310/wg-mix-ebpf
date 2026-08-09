@@ -223,19 +223,23 @@ func (router *EngineRouter) Tick() ([]Action, error) {
 		return nil, fmt.Errorf("%w: router is unavailable", ErrEngineRouteRejected)
 	}
 	var actions []Action
-	var errs []error
+	var engineErrs []error
+	var routeErrs []error
 	for _, wgID := range router.wgIDs {
 		engineActions, err := router.engines[wgID].Tick()
 		if err != nil {
-			errs = append(errs, fmt.Errorf("tick faketcp WGID %d: %w", wgID, err))
+			engineErrs = append(engineErrs, fmt.Errorf("tick faketcp WGID %d: %w", wgID, err))
 		}
 		if err := router.validateActions(wgID, engineActions); err != nil {
-			errs = append(errs, fmt.Errorf("validate faketcp WGID %d tick actions: %w", wgID, err))
+			routeErrs = append(routeErrs, fmt.Errorf("validate faketcp WGID %d tick actions: %w", wgID, err))
 			continue
 		}
 		actions = append(actions, engineActions...)
 	}
-	return actions, errors.Join(errs...)
+	if routeErr := errors.Join(routeErrs...); routeErr != nil {
+		return nil, errors.Join(errors.Join(engineErrs...), routeErr)
+	}
+	return actions, errors.Join(engineErrs...)
 }
 
 // validateActions fences every backend-visible action behind the same exact
