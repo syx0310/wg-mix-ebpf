@@ -609,6 +609,15 @@ class CounterGateTests(unittest.TestCase):
         baseline = {
             "/usr/sbin/ethtool:rx_errors": 0,
             "/usr/sbin/ethtool:checksum_error": 7,
+            "/usr/sbin/ethtool:rx_bad_packet": 0,
+            "/usr/sbin/ethtool:rx_badpacket": 0,
+            "/usr/sbin/ethtool:rx_allocfail": 0,
+            "/usr/sbin/ethtool:rx_buf_alloc_failure": 0,
+            "/usr/sbin/ethtool:rx_nobuf": 0,
+            "/usr/sbin/ethtool:rx_no_buffer": 0,
+            "/usr/sbin/ethtool:rx_overflow": 0,
+            "/usr/sbin/ethtool:rx_ring_full": 0,
+            "/usr/sbin/ethtool:rx_lost": 0,
             "/usr/sbin/ip:rx_dropped": 2,
             "/usr/sbin/ip:rx_bytes": 100,
         }
@@ -621,6 +630,15 @@ class CounterGateTests(unittest.TestCase):
         for key in (
             "/usr/sbin/ethtool:rx_errors",
             "/usr/sbin/ethtool:checksum_error",
+            "/usr/sbin/ethtool:rx_bad_packet",
+            "/usr/sbin/ethtool:rx_badpacket",
+            "/usr/sbin/ethtool:rx_allocfail",
+            "/usr/sbin/ethtool:rx_buf_alloc_failure",
+            "/usr/sbin/ethtool:rx_nobuf",
+            "/usr/sbin/ethtool:rx_no_buffer",
+            "/usr/sbin/ethtool:rx_overflow",
+            "/usr/sbin/ethtool:rx_ring_full",
+            "/usr/sbin/ethtool:rx_lost",
             "/usr/sbin/ip:rx_dropped",
         ):
             with self.subTest(key=key), self.assertRaisesRegex(MODULE.HarnessError, "counters grew"):
@@ -714,6 +732,9 @@ class PlannerTests(unittest.TestCase):
         plan = MODULE.build_plan(spec, snapshot, commands)
         soak = next(cell for cell in plan["cells"] if cell["kind"] == "tcp-soak")
         self.assertEqual(plan["execution_profile"], "acceptance")
+        self.assertEqual(plan["counter_failure_policy"], MODULE.counter_failure_policy())
+        self.assertIn("failure", plan["counter_failure_policy"]["failure_tokens"])
+        self.assertIn("no_buffer", plan["counter_failure_policy"]["failure_phrases"])
         self.assertEqual(len(soak["traffic"]) - 1, 12)
         self.assertEqual(soak["counter_sample_schedule"]["expected_samples"], 360)
         self.assertEqual(soak["counter_sample_schedule"]["interval_seconds"], 10)

@@ -1087,6 +1087,84 @@ def monitor_command_table(spec: CoreSpec) -> list[tuple[str, list[str]]]:
     ]
 
 
+def counter_failure_policy() -> dict[str, Any]:
+    return {
+        "schema": "wg-mix-ebpf-realnic-counter-failure-policy-v1",
+        "scope": "all ethtool -S and ip -s link counters",
+        "growth_action": "reject",
+        "name_normalization": "lowercase ASCII alphanumeric tokens split on non-alphanumeric bytes",
+        "failure_tokens": sorted(
+            {
+                "abort",
+                "aborted",
+                "bad",
+                "checksum",
+                "crc",
+                "csum",
+                "discard",
+                "discards",
+                "drop",
+                "dropped",
+                "drops",
+                "err",
+                "error",
+                "errors",
+                "fail",
+                "failed",
+                "failure",
+                "failures",
+                "fault",
+                "faults",
+                "fifo",
+                "full",
+                "loss",
+                "lost",
+                "missed",
+                "overflow",
+                "overrun",
+                "overruns",
+                "timeout",
+                "timeouts",
+            }
+        ),
+        "failure_phrases": sorted(
+            {
+                "alloc_fail",
+                "alloc_failure",
+                "no_buf",
+                "no_buffer",
+                "no_desc",
+                "no_descriptor",
+                "out_of_buf",
+                "out_of_buffer",
+                "ring_full",
+            }
+        ),
+        "failure_token_prefixes": sorted(
+            {
+                "allocfail",
+                "bad",
+                "checksum",
+                "crc",
+                "csum",
+                "discard",
+                "drop",
+                "err",
+                "fail",
+                "fault",
+                "lost",
+                "nobuf",
+                "nobuffer",
+                "nohandler",
+                "overflow",
+                "overrun",
+                "timeout",
+                "underflow",
+            }
+        ),
+    }
+
+
 def monitor_steps(spec: CoreSpec, cell_name: str, phase: str) -> list[dict[str, Any]]:
     return [
         command_step(
@@ -1507,6 +1585,7 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         "schema": SCHEMA,
         "spec": spec.as_dict(),
         "execution_profile": spec.profile,
+        "counter_failure_policy": counter_failure_policy(),
         "snapshot_commands": snapshot_commands,
         "baseline": snapshot,
         "traffic_oracle": traffic_oracle,
@@ -1661,6 +1740,8 @@ def read_approved_plan(path_value: str, expected_sha256: str, spec: CoreSpec) ->
 def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
     if plan.get("execution_profile") != spec.profile:
         raise HarnessError("approved plan execution profile is not exact")
+    if plan.get("counter_failure_policy") != counter_failure_policy():
+        raise HarnessError("approved plan counter failure policy is not exact")
     baseline = plan.get("baseline")
     if not isinstance(baseline, dict):
         raise HarnessError("approved plan has no baseline")
@@ -2633,34 +2714,21 @@ def counter_delta(before: Mapping[str, int], after: Mapping[str, int]) -> dict[s
     decreased = [key for key, value in deltas.items() if value < 0]
     if decreased:
         raise HarnessError(f"NIC counters decreased during the traffic cell: {','.join(decreased)}")
-    hard_tokens = {
-        "abort",
-        "aborted",
-        "checksum",
-        "crc",
-        "csum",
-        "discard",
-        "discards",
-        "drop",
-        "dropped",
-        "drops",
-        "err",
-        "error",
-        "errors",
-        "fault",
-        "faults",
-        "fifo",
-        "missed",
-        "overrun",
-        "overruns",
-        "timeout",
-        "timeouts",
-    }
+    policy = counter_failure_policy()
+    failure_tokens = set(policy["failure_tokens"])
+    failure_phrases = set(policy["failure_phrases"])
+    failure_prefixes = tuple(policy["failure_token_prefixes"])
     grew = []
     for key, value in deltas.items():
         name = key.split(":", 1)[-1].lower()
-        tokens = set(filter(None, re.split(r"[^a-z0-9]+", name)))
-        if value > 0 and tokens & hard_tokens:
+        tokens = tuple(filter(None, re.split(r"[^a-z0-9]+", name)))
+        phrases = {
+            "_".join(tokens[index : index + width])
+            for width in (2, 3)
+            for index in range(len(tokens) - width + 1)
+        }
+        suspicious_token = any(token.startswith(failure_prefixes) for token in tokens)
+        if value > 0 and (set(tokens) & failure_tokens or phrases & failure_phrases or suspicious_token):
             grew.append(f"{key}=+{value}")
     if grew:
         raise HarnessError(f"NIC error/drop/checksum counters grew: {','.join(grew)}")
