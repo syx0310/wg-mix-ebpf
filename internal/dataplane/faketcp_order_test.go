@@ -193,7 +193,7 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 		"return faketcp_encode_established(skb, &info, rule, generation);",
 		"listener->transport_mode == TRANSPORT_FAKETCP",
 		"!faketcp_metadata_valid(skb, generation)",
-		"faketcp_capture_first_packet(skb, info, rule, &key)",
+		"faketcp_capture_first_packet(skb, info, &l3, rule, &key)",
 		"record_len = sizeof(record->event) + packet_len",
 		"faketcp_materialize_tcp_checksum",
 		"bpf_check_mtu(skb, 0, &mtu_len, FAKETCP_HEADER_DELTA, 0)",
@@ -248,7 +248,7 @@ func TestFakeTCPChecksumNormalizationMTUAndGSOStayHardGated(t *testing.T) {
 
 	preflight := text[preflightStart:checksumCommentStart]
 	gsoReject := strings.Index(preflight, "if (skb->gso_segs || skb->gso_size)")
-	flowLookup := strings.Index(preflight, "faketcp_tc_key(skb, info, generation, &key)")
+	flowLookup := strings.Index(preflight, "faketcp_tc_key(skb, info, &l3, generation, &key)")
 	if gsoReject < 0 || flowLookup < 0 || gsoReject >= flowLookup {
 		t.Fatal("aggregate GSO must be rejected before flow lookup, capture, type-word and XOR mutation")
 	}
@@ -462,7 +462,7 @@ func fakeTCPChecksumMetadataAccepted(
 	}
 }
 
-func TestFakeTCPXDPManagedPortLookupPrecedesUnsupportedHeaderExit(t *testing.T) {
+func TestFakeTCPXDPUsesSharedL3ParserBeforeManagedPortPolicy(t *testing.T) {
 	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
 	if err != nil {
 		t.Fatal(err)
@@ -471,12 +471,12 @@ func TestFakeTCPXDPManagedPortLookupPrecedesUnsupportedHeaderExit(t *testing.T) 
 	for _, want := range []string{
 		"faketcp_managed_if_map SEC(\".maps\")",
 		"faketcp_managed_port_map SEC(\".maps\")",
-		"faketcp_xdp_ipv6_policy",
-		"for (int vlan_depth = 0; vlan_depth < 2; vlan_depth++)",
-		"return managed_interface ? XDP_DROP : XDP_PASS",
-		"AH, ESP and unknown extension/transport values",
-		"next_header == IPPROTO_TCP || next_header == IPPROTO_UDP",
-		"A managed packet can only PASS after successful FakeTCP decoding",
+		"faketcp_xdp_l3_start",
+		"parser_mode != PARSER_ETHERNET",
+		"parse_rc = faketcp_parse_l3",
+		"parse_rc == FAKETCP_L3_SAFE_BYPASS",
+		"faketcp_managed_transform_status(&l3, l3.transport_protocol)",
+		"before native-UDP handling, event capture or any packet mutation",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("managed-port fail-closed source contract missing %q", want)
@@ -487,10 +487,11 @@ func TestFakeTCPXDPManagedPortLookupPrecedesUnsupportedHeaderExit(t *testing.T) 
 		t.Fatal("FakeTCP XDP entry point is missing")
 	}
 	xdp := text[xdpStart:]
+	parse := strings.Index(xdp, "parse_rc = faketcp_parse_l3")
 	lookup := strings.Index(xdp, "listener = faketcp_xdp_managed_port")
-	unsupported := strings.Index(xdp, "if ((fragment_offset & IP_MF) || iph->ihl != 5 || tcp->doff != 5)")
-	if lookup < 0 || unsupported < 0 || lookup >= unsupported {
-		t.Fatal("managed-port lookup must precede IPv4 options/fragment rejection")
+	unsupported := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")
+	if parse < 0 || lookup < 0 || unsupported < 0 || parse >= lookup || lookup >= unsupported {
+		t.Fatal("shared L3 validation must precede managed-port lookup and the single transform gate")
 	}
 }
 

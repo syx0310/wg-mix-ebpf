@@ -526,7 +526,7 @@ func TestFakeTCPMimicTransformCompositionOrderContract(t *testing.T) {
 	}
 
 	xdp := sourceSection(t, fake, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)", "#endif")
-	udpRestore := strings.Index(xdp, "bpf_xdp_store_bytes(xdp, off + sizeof(*iph), &udp")
+	udpRestore := strings.Index(xdp, "bpf_xdp_store_bytes(xdp, l3.l4_off, &udp")
 	tailShrink := strings.Index(xdp, "bpf_xdp_adjust_tail(xdp, -FAKETCP_HEADER_DELTA)")
 	xdpPass := strings.LastIndex(xdp, "return XDP_PASS")
 	if udpRestore < 0 || tailShrink < 0 || xdpPass < 0 || !(udpRestore < tailShrink && tailShrink < xdpPass) {
