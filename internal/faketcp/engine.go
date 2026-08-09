@@ -127,6 +127,46 @@ type PendingPacket struct {
 	dataOwned          bool
 }
 
+// capturedPacketBinding is the complete immutable value associated with one
+// CaptureID. It stays comparable so both durable checkpoint validation and the
+// in-process reinjection ledger use the same conflict definition.
+type capturedPacketBinding struct {
+	flow               abi.FakeTCPSessionKey
+	fwmark             uint32
+	wgID               uint32
+	captureNanos       uint64
+	captureFingerprint [32]byte
+	dataFingerprint    [32]byte
+}
+
+func bindCapturedPacket(flow abi.FakeTCPSessionKey, packet PendingPacket) capturedPacketBinding {
+	return capturedPacketBinding{
+		flow:               flow,
+		fwmark:             packet.FWMark,
+		wgID:               packet.WGID,
+		captureNanos:       packet.CaptureNanos,
+		captureFingerprint: packet.CaptureFingerprint,
+		dataFingerprint:    sha256.Sum256(packet.Data),
+	}
+}
+
+func observeCapturedPacket(
+	bindings map[CaptureIdentity]capturedPacketBinding,
+	flow abi.FakeTCPSessionKey,
+	packet PendingPacket,
+) (bool, error) {
+	binding := bindCapturedPacket(flow, packet)
+	previous, found := bindings[packet.CaptureID]
+	if !found {
+		bindings[packet.CaptureID] = binding
+		return false, nil
+	}
+	if previous != binding {
+		return false, ErrCaptureIdentityConflict
+	}
+	return true, nil
+}
+
 type SessionSnapshot struct {
 	State          uint8
 	TXSequence     uint32

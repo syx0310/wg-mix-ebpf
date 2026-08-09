@@ -456,30 +456,43 @@ func (recovery *ActionRecovery) continueLocked(
 
 func actionSteps(actions []Action) ([]ActionStep, error) {
 	steps := make([]ActionStep, 0, len(actions))
+	var captureBindings map[CaptureIdentity]capturedPacketBinding
 	for _, action := range actions {
 		switch action.Kind {
 		case ActionDrop, ActionForward, ActionClose:
 		case ActionSendControl:
-			steps = append(steps, ActionStep{
+			step := ActionStep{
 				Kind: ActionStepSendControl, Flow: action.Flow, WGID: action.WGID,
 				Control: action.Control, Reason: action.Reason,
-			})
+			}
+			if err := validateActionStep(step); err != nil {
+				return nil, err
+			}
+			steps = append(steps, step)
 		case ActionReleasePending:
 			for _, packet := range action.Packets {
-				copyPacket := packet
-				copyPacket.Data = append([]byte(nil), packet.Data...)
-				steps = append(steps, ActionStep{
-					Kind: ActionStepReinject, Flow: action.Flow, Packet: copyPacket,
+				step := ActionStep{
+					Kind: ActionStepReinject, Flow: action.Flow, Packet: packet,
 					Reason: action.Reason,
-				})
+				}
+				if err := validateActionStep(step); err != nil {
+					return nil, err
+				}
+				if captureBindings == nil {
+					captureBindings = make(map[CaptureIdentity]capturedPacketBinding)
+				}
+				duplicate, err := observeCapturedPacket(captureBindings, action.Flow, packet)
+				if err != nil {
+					return nil, fmt.Errorf("canonicalize faketcp captured packet: %w", err)
+				}
+				if duplicate {
+					continue
+				}
+				step.Packet.Data = append([]byte(nil), packet.Data...)
+				steps = append(steps, step)
 			}
 		default:
 			return nil, fmt.Errorf("unknown faketcp action kind %d", action.Kind)
-		}
-	}
-	for _, step := range steps {
-		if err := validateActionStep(step); err != nil {
-			return nil, err
 		}
 	}
 	return steps, nil
@@ -526,6 +539,62 @@ func validateActionCheckpoint(checkpoint ActionCheckpoint) error {
 				"%w: captured packet identity does not match checkpoint Engine identity",
 				ErrActionCheckpointCorrupt,
 			)
+		}
+	}
+	if err := validateCheckpointCaptureBindings(checkpoint); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateCheckpointCaptureBindings(checkpoint ActionCheckpoint) error {
+	boundary := checkpoint.NextStep
+	if checkpoint.Phase == ActionCheckpointAttempting &&
+		checkpoint.Steps[checkpoint.NextStep].Kind == ActionStepReinject {
+		// Recovery treats an attempting reinjection as consumed because its send
+		// outcome is ambiguous, so later steps must not repeat its CaptureID.
+		boundary++
+	}
+
+	var bindings map[CaptureIdentity]capturedPacketBinding
+	var completed map[CaptureIdentity]struct{}
+	for index, step := range checkpoint.Steps {
+		if step.Kind != ActionStepReinject {
+			continue
+		}
+		if bindings == nil {
+			bindings = make(map[CaptureIdentity]capturedPacketBinding)
+		}
+		duplicate, err := observeCapturedPacket(bindings, step.Flow, step.Packet)
+		if err != nil {
+			return fmt.Errorf(
+				"%w: capture binding at step %d: %w",
+				ErrActionCheckpointCorrupt,
+				index,
+				err,
+			)
+		}
+		if duplicate {
+			_, repeatsCompleted := completed[step.Packet.CaptureID]
+			if repeatsCompleted && index >= boundary {
+				return fmt.Errorf(
+					"%w: unfinished step %d repeats a capture completed before boundary %d",
+					ErrActionCheckpointCorrupt,
+					index,
+					boundary,
+				)
+			}
+			return fmt.Errorf(
+				"%w: duplicate capture identity at step %d",
+				ErrActionCheckpointCorrupt,
+				index,
+			)
+		}
+		if index < boundary {
+			if completed == nil {
+				completed = make(map[CaptureIdentity]struct{})
+			}
+			completed[step.Packet.CaptureID] = struct{}{}
 		}
 	}
 	return nil

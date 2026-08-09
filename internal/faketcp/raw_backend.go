@@ -2,7 +2,6 @@ package faketcp
 
 import (
 	"context"
-	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -318,19 +317,11 @@ func (backend *RawControllerBackend) initializedLocked() bool {
 		backend.closeDone != nil
 }
 
-type reinjectFingerprint struct {
-	flow         abi.FakeTCPSessionKey
-	fwmark       uint32
-	wgID         uint32
-	capture      [32]byte
-	materialized [32]byte
-}
-
 type reinjectAttempt struct {
-	identity    CaptureIdentity
-	fingerprint reinjectFingerprint
-	done        chan struct{}
-	err         error
+	identity CaptureIdentity
+	binding  capturedPacketBinding
+	done     chan struct{}
+	err      error
 }
 
 // onceReinjector is deliberately package-private: RawControllerBackend is the
@@ -408,13 +399,7 @@ func (reinjector *onceReinjector) Reinject(
 	if err := ValidateMaterializedIPv4UDP(packet.Data, flow); err != nil {
 		return err
 	}
-	fingerprint := reinjectFingerprint{
-		flow:         flow,
-		fwmark:       packet.FWMark,
-		wgID:         packet.WGID,
-		capture:      packet.CaptureFingerprint,
-		materialized: sha256.Sum256(packet.Data),
-	}
+	binding := bindCapturedPacket(flow, packet)
 
 	var attempt *reinjectAttempt
 	for {
@@ -445,7 +430,7 @@ func (reinjector *onceReinjector) Reinject(
 					previous.identity.Sequence,
 				)
 			case packet.CaptureID.Sequence == previous.identity.Sequence:
-				if previous.fingerprint != fingerprint {
+				if previous.binding != binding {
 					reinjector.mu.Unlock()
 					return ErrCaptureIdentityConflict
 				}
@@ -476,9 +461,7 @@ func (reinjector *onceReinjector) Reinject(
 				}
 			}
 		}
-		attempt = &reinjectAttempt{
-			identity: packet.CaptureID, fingerprint: fingerprint, done: make(chan struct{}),
-		}
+		attempt = &reinjectAttempt{identity: packet.CaptureID, binding: binding, done: make(chan struct{})}
 		reinjector.lastByCPU[packet.CaptureID.CPU] = attempt
 		reinjector.mu.Unlock()
 		break
