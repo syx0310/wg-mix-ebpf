@@ -584,6 +584,38 @@ readonly -a POSTFLIGHT_OPERATIONS=(
   tool-shellcheck tool-jq tool-wireguard tool-ethtool tool-tc tool-ip
   kernel-btf kernel-bpffs kernel-headers
 )
+readonly -a PREPARE_NEW_STALE_OPERATIONS=(
+  stale-package-root
+  stale-bootstrap-root
+  stale-alternate-bootstrap-root
+  stale-stage-root
+  stale-fresh-root
+  stale-standalone-root
+  stale-routed-evidence-root
+  stale-realnic-run-roots
+  stale-realnic-interface-leases
+  stale-veth-wgc8e41a
+  stale-veth-wgc8e41b
+  stale-veth-wga19f7a
+  stale-veth-wga19f7b
+  stale-veth-wg5b8d3a
+  stale-veth-wg5b8d3b
+  stale-pin-fresh
+  stale-pin-standalone
+  stale-pin-legacy-tcx
+  stale-pin-legacy-nic-original
+  stale-pin-legacy-nic-all-on
+  stale-pin-legacy-nic-all-off
+  stale-pin-legacy-nic-tx-path
+  stale-pin-legacy-nic-rx-path
+  stale-pin-legacy-nic-mtu1492
+  stale-pin-legacy-nic-mtu1500
+  stale-pin-legacy-nic-soak
+  stale-checksum-module
+  stale-checksum-module-btf
+  stale-checksum-module-lock
+  stale-physical-interface-lock
+)
 readonly -a PACKAGE_NAMES=(
   source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh controller.sh prepare-stage-root.sh
   provision-ubuntu-test-host.sh root-matrix-n-r.sh check-realhost-iperf.py
@@ -609,10 +641,43 @@ state_transition() {
   printf 'B82_V6_CONTROLLER_STATE from=%s to=%s automatic_apply=0\n' "$1" "$2"
 }
 
+run_prepare_new_stale_gate() {
+  local action="$1" operation id class rc ordinal=0 absent=0
+  local total="${#PREPARE_NEW_STALE_OPERATIONS[@]}"
+  for operation in "${PREPARE_NEW_STALE_OPERATIONS[@]}"; do
+    ((ordinal += 1))
+    id="${operation#stale-}"
+    run_operation "${action}" "${operation}"
+    rc=$?
+    if ((rc != 0)); then
+      printf 'B82_V6_STALE_ITEM_V1 ordinal=%02d id=%s class=STOP writes=0 cleanup=0 rc=%d\n' \
+        "${ordinal}" "${id}" "${rc}"
+      printf 'B82_V6_STALE_SUMMARY_V1 profile=prepare-new items=%d checked=%d absent=%d writes=0 cleanup=0 result=STOP rc=%d\n' \
+        "${total}" "${ordinal}" "${absent}" "${rc}"
+      return "${rc}"
+    fi
+    if [[ "${action}" == plan ]]; then
+      class='PLANNED'
+    else
+      class='ABSENT'
+      ((absent += 1))
+    fi
+    printf 'B82_V6_STALE_ITEM_V1 ordinal=%02d id=%s class=%s writes=0 cleanup=0 rc=0\n' \
+      "${ordinal}" "${id}" "${class}"
+  done
+  if [[ "${action}" == plan ]]; then class='PLANNED'; else class='PASS'; fi
+  printf 'B82_V6_STALE_SUMMARY_V1 profile=prepare-new items=%d checked=%d absent=%d writes=0 cleanup=0 result=%s rc=0\n' \
+    "${total}" "${total}" "${absent}" "${class}"
+}
+
 plan_all() {
   local operation name
   printf 'B82_V6_CONTROLLER_STATE current=PACKAGE_BOUND automatic_apply=0\n'
-  for operation in "${BASE_IDENTITY_OPERATIONS[@]}" package-parent-stat package-mkdir; do
+  for operation in "${BASE_IDENTITY_OPERATIONS[@]}"; do
+    run_operation plan "${operation}" || return $?
+  done
+  run_prepare_new_stale_gate plan || return $?
+  for operation in package-parent-stat package-mkdir; do
     run_operation plan "${operation}" || return $?
   done
   for name in "${PACKAGE_NAMES[@]}"; do
@@ -672,6 +737,7 @@ execute_preflight() {
   for operation in "${BASE_IDENTITY_OPERATIONS[@]}" "${POSTFLIGHT_OPERATIONS[@]}"; do
     run_operation execute "${operation}" || return $?
   done
+  run_prepare_new_stale_gate execute
 }
 
 verify_remote_package() {
@@ -742,6 +808,7 @@ execute_prepare() {
   for operation in "${BASE_IDENTITY_OPERATIONS[@]}"; do
     run_operation execute "${operation}" || return $?
   done
+  run_prepare_new_stale_gate execute || return $?
   run_operation execute package-parent-stat || return $?
   run_operation execute package-mkdir || return $?
   for name in "${PACKAGE_NAMES[@]}"; do

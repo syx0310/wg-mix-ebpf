@@ -382,6 +382,64 @@ proc package_sha {values name} {
     }
 }
 
+proc stale_fixed_path {operation} {
+    switch -- $operation {
+        stale-package-root { return "/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61" }
+        stale-bootstrap-root { return "/run/wg-mix-ebpf-source-bootstrap-c8e41d73" }
+        stale-alternate-bootstrap-root {
+            return "/run/wg-mix-ebpf-source-bootstrap/c8e41d73"
+        }
+        stale-stage-root { return "/run/wg-mix-ebpf-source-stages/c8e41d73" }
+        stale-fresh-root { return "/run/wg-mix-ebpf-faketcp-verifier/fresh-c8e41d73" }
+        stale-standalone-root { return "/run/wg-mix-ebpf-source-stages/a19f7c2e" }
+        stale-routed-evidence-root {
+            return "/run/wg-mix-ebpf-source-stages/c8e41d73/routed-evidence-5b8d30f1"
+        }
+        stale-veth-wgc8e41a { return "/sys/class/net/wgc8e41a" }
+        stale-veth-wgc8e41b { return "/sys/class/net/wgc8e41b" }
+        stale-veth-wga19f7a { return "/sys/class/net/wga19f7a" }
+        stale-veth-wga19f7b { return "/sys/class/net/wga19f7b" }
+        stale-veth-wg5b8d3a { return "/sys/class/net/wg5b8d3a" }
+        stale-veth-wg5b8d3b { return "/sys/class/net/wg5b8d3b" }
+        stale-pin-fresh { return "/sys/fs/bpf/wg-mix-ebpf-fresh-c8e41d73" }
+        stale-pin-standalone { return "/sys/fs/bpf/wg-mix-ebpf-a19f7c2e-tcx" }
+        stale-pin-legacy-tcx { return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-tcx" }
+        stale-pin-legacy-nic-original {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-original"
+        }
+        stale-pin-legacy-nic-all-on {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-all-on"
+        }
+        stale-pin-legacy-nic-all-off {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-all-off"
+        }
+        stale-pin-legacy-nic-tx-path {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-tx-path"
+        }
+        stale-pin-legacy-nic-rx-path {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-rx-path"
+        }
+        stale-pin-legacy-nic-mtu1492 {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-mtu1492"
+        }
+        stale-pin-legacy-nic-mtu1500 {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-mtu1500"
+        }
+        stale-pin-legacy-nic-soak {
+            return "/sys/fs/bpf/wg-mix-ebpf-c8e41d73-nic-soak"
+        }
+        stale-checksum-module { return "/sys/module/wg_mix_faketcp_checksum" }
+        stale-checksum-module-btf { return "/sys/kernel/btf/wg_mix_faketcp_checksum" }
+        stale-checksum-module-lock {
+            return "/run/wg-mix-ebpf-source-stages/c8e41d73/checksum-module-lease.v1.lock"
+        }
+        stale-physical-interface-lock {
+            return "/run/wg-mix-ebpf-realnic-physical-interface.v1.lock"
+        }
+        default { return -code error "stale-operation" }
+    }
+}
+
 proc build_operation {values manifest_sha operation approved_plan approved_sha} {
     set target "[dict get $values target_user]@[dict get $values target_host]"
     set package [dict get $values remote_package_dir]
@@ -440,6 +498,40 @@ proc build_operation {values manifest_sha operation approved_plan approved_sha} 
         package-parent-stat {
             set remote [list /usr/bin/stat -Lc %U:%G:%a:%F -- /home/siyixuan/wg-mix-ebpf-test]
             set assertion exact:siyixuan:siyixuan:700:directory
+        }
+        stale-package-root - stale-bootstrap-root - stale-alternate-bootstrap-root - stale-stage-root -
+        stale-fresh-root - stale-standalone-root - stale-routed-evidence-root -
+        stale-veth-wgc8e41a - stale-veth-wgc8e41b -
+        stale-veth-wga19f7a - stale-veth-wga19f7b -
+        stale-veth-wg5b8d3a - stale-veth-wg5b8d3b -
+        stale-pin-fresh - stale-pin-standalone - stale-pin-legacy-tcx -
+        stale-pin-legacy-nic-original - stale-pin-legacy-nic-all-on -
+        stale-pin-legacy-nic-all-off - stale-pin-legacy-nic-tx-path -
+        stale-pin-legacy-nic-rx-path - stale-pin-legacy-nic-mtu1492 -
+        stale-pin-legacy-nic-mtu1500 - stale-pin-legacy-nic-soak -
+        stale-checksum-module - stale-checksum-module-btf -
+        stale-checksum-module-lock - stale-physical-interface-lock {
+            set stale_path [stale_fixed_path $operation]
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/test ! -e $stale_path -a ! -L $stale_path]]
+            set tty 1
+            set prompt_limit 2
+        }
+        stale-realnic-run-roots {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/find /run -xdev -mindepth 1 -maxdepth 1 \
+                -name {wg-mix-ebpf-realnic-acceptance-\*} -print -quit]]
+            set assertion empty
+            set tty 1
+            set prompt_limit 2
+        }
+        stale-realnic-interface-leases {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/find /run -xdev -mindepth 1 -maxdepth 1 \
+                -name {wg-mix-ebpf-realnic-interface-\*.jsonl} -print -quit]]
+            set assertion empty
+            set tty 1
+            set prompt_limit 2
         }
         package-mkdir { set remote [list /usr/bin/mkdir --mode=0700 -- $package] }
         hermetic-matrix {
