@@ -1069,6 +1069,7 @@ func installFakeTCPRealHostSessions(
 	contract fakeTCPRealHostContract,
 ) {
 	t.Helper()
+	runtimeIncarnation := [16]byte(handles.Identity().Incarnation)
 	localA, err := faketcp.RawIPv4BE32(netip.MustParseAddr("10.0.0.1"))
 	if err != nil {
 		t.Fatal(err)
@@ -1077,7 +1078,7 @@ func installFakeTCPRealHostSessions(
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, session := range []struct {
+	for index, session := range []struct {
 		key   abi.FakeTCPSessionKey
 		value abi.FakeTCPSessionValue
 	}{
@@ -1088,7 +1089,8 @@ func installFakeTCPRealHostSessions(
 			},
 			value: abi.FakeTCPSessionValue{
 				Generation: generation, TXSequence: 0x01020304, RXSequence: 0x11223344,
-				Window: 4096, State: abi.FakeTCPStateEstablished,
+				Window: 4096, State: abi.FakeTCPStateEstablished, Revision: 1,
+				RuntimeIncarnation: runtimeIncarnation,
 			},
 		},
 		{
@@ -1098,7 +1100,8 @@ func installFakeTCPRealHostSessions(
 			},
 			value: abi.FakeTCPSessionValue{
 				Generation: generation, TXSequence: 0x11223344, RXSequence: 0x01020304,
-				Window: 4096, State: abi.FakeTCPStateEstablished,
+				Window: 4096, State: abi.FakeTCPStateEstablished, Revision: 1,
+				RuntimeIncarnation: runtimeIncarnation,
 			},
 		},
 		{
@@ -1111,10 +1114,12 @@ func installFakeTCPRealHostSessions(
 			},
 			value: abi.FakeTCPSessionValue{
 				Generation: generation, TXSequence: 0x55667788, RXSequence: 0x99aabbcc,
-				Window: 4096, State: abi.FakeTCPStateEstablished,
+				Window: 4096, State: abi.FakeTCPStateEstablished, Revision: 1,
+				RuntimeIncarnation: runtimeIncarnation,
 			},
 		},
 	} {
+		session.value.SessionID = uint64(index + 1)
 		if err := handles.SessionStore().InsertEstablished(session.key, session.value); err != nil {
 			t.Fatalf("insert FakeTCP real-host established session %#v: %v", session.key, err)
 		}
