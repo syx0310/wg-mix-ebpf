@@ -220,14 +220,25 @@ type tokenBucket struct {
 	initialized bool
 }
 
+// engineInstanceToken identifies the mutable state allocated by one Engine
+// construction. It is deliberately non-zero-sized so distinct allocations
+// have distinct addresses; copying an Engine value preserves the pointer.
+type engineInstanceToken struct {
+	marker byte
+}
+
 type Engine struct {
 	mu       sync.Mutex
 	opts     Options
 	identity RuntimeIdentity
+	domain   *runtimeDomainState
+	instance *engineInstanceToken
 	// One RuntimeIdentity may seed exactly one kernel collection. Reusing the
-	// Engine with fresh maps would restart every per-CPU capture sequence and
-	// collide with identities emitted by its first collection.
+	// domain with fresh maps would restart every per-CPU capture sequence and
+	// collide with identities emitted by its first collection. Every Engine in
+	// one RuntimeDomain therefore shares this capability.
 	runtimeIdentityCommit *runtimeIdentityCommitState
+	sessionIDs            *sessionIDAllocator
 	sessions              map[abi.FakeTCPSessionKey]*session
 	pendingFlows          int
 	pendingBytes          int
@@ -243,10 +254,6 @@ type Engine struct {
 	// Counted under mu and used by complexity-contract tests. It also makes
 	// accidental replacement of bounded pruning with a full scan observable.
 	synSourcePruneVisits uint64
-	// nextSessionID is monotonic for this Engine incarnation and deliberately
-	// never rolled back. A failed insert therefore cannot make a later session
-	// reuse delete authority from an earlier attempt.
-	nextSessionID uint64
 }
 
 type engineCheckpoint struct {
@@ -259,6 +266,21 @@ type engineCheckpoint struct {
 func New(options Options) (*Engine, error) {
 	if options.Generation == 0 {
 		return nil, errors.New("faketcp generation must be non-zero")
+	}
+	domain, err := NewRuntimeDomain(options.Generation)
+	if err != nil {
+		return nil, err
+	}
+	return domain.NewEngine(options)
+}
+
+func newEngine(options Options, domain *runtimeDomainState) (*Engine, error) {
+	if options.Generation == 0 {
+		return nil, errors.New("faketcp generation must be non-zero")
+	}
+	if domain == nil || domain.identity.Generation != options.Generation ||
+		domain.runtimeIdentityCommit == nil || domain.sessionIDs == nil {
+		return nil, errors.New("faketcp Engine options do not match a complete runtime domain")
 	}
 	if options.SessionCapacity <= 0 || options.MaxPendingFlows <= 0 ||
 		options.MaxPendingFlows > options.SessionCapacity ||
@@ -295,15 +317,14 @@ func New(options Options) (*Engine, error) {
 	if options.Window == 0 {
 		options.Window = 65535
 	}
-	incarnation, err := newRuntimeIncarnation()
-	if err != nil {
-		return nil, err
-	}
 	admissionEpoch := options.Now()
 	return &Engine{
 		opts:                  options,
-		identity:              RuntimeIdentity{Generation: options.Generation, Incarnation: incarnation},
-		runtimeIdentityCommit: &runtimeIdentityCommitState{},
+		identity:              domain.identity,
+		domain:                domain,
+		instance:              &engineInstanceToken{},
+		runtimeIdentityCommit: domain.runtimeIdentityCommit,
+		sessionIDs:            domain.sessionIDs,
 		sessions:              make(map[abi.FakeTCPSessionKey]*session),
 		globalSYNs:            tokenBucket{lastRefill: admissionEpoch, initialized: true},
 		admissionEpoch:        admissionEpoch,
@@ -415,7 +436,7 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 		s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
 		if alreadyDropped {
 			return []Action{{
-				Kind: ActionReleasePending, Flow: flow,
+				Kind: ActionReleasePending, Flow: flow, WGID: s.wgID,
 				Packets: []PendingPacket{ownPendingPacket(packet)},
 			}}, nil
 		}
@@ -1014,7 +1035,7 @@ func (e *Engine) release(flow abi.FakeTCPSessionKey, s *session) []Action {
 	e.pendingBytes -= s.pendingBytes
 	s.pending = nil
 	s.pendingBytes = 0
-	return []Action{{Kind: ActionReleasePending, Flow: flow, Packets: packets}}
+	return []Action{{Kind: ActionReleasePending, Flow: flow, WGID: s.wgID, Packets: packets}}
 }
 
 func (e *Engine) remove(flow abi.FakeTCPSessionKey, s *session) {
@@ -1057,11 +1078,10 @@ func (e *Engine) insertEstablished(flow abi.FakeTCPSessionKey, s *session) error
 		return fmt.Errorf("read faketcp %s clock for established insert: %w", BPFMonotonicClockDomain, err)
 	}
 	if s.sessionID == 0 {
-		if e.nextSessionID == ^uint64(0) {
-			return errors.New("faketcp session ID space is exhausted")
+		s.sessionID, err = e.sessionIDs.allocate()
+		if err != nil {
+			return err
 		}
-		e.nextSessionID++
-		s.sessionID = e.nextSessionID
 	}
 	return e.opts.Store.InsertEstablished(flow, abi.FakeTCPSessionValue{
 		Generation:         flow.Generation,
