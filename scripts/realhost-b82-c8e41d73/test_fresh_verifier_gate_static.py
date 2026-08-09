@@ -12,16 +12,22 @@ def fail(message: str) -> None:
     raise SystemExit(f"fresh verifier static test failed: {message}")
 
 
-if len(sys.argv) != 2:
-    fail("expected exactly one script path")
+if len(sys.argv) != 3:
+    fail("expected root gate and shared module helper paths")
 
 path = pathlib.Path(sys.argv[1])
-if not path.is_absolute() or not path.is_file() or path.is_symlink():
-    fail("script must be an absolute regular non-symlink file")
+helper_path = pathlib.Path(sys.argv[2])
+if any(
+    not candidate.is_absolute() or not candidate.is_file() or candidate.is_symlink()
+    for candidate in (path, helper_path)
+):
+    fail("inputs must be absolute regular non-symlink files")
 source = path.read_text(encoding="utf-8")
+helper = helper_path.read_text(encoding="utf-8")
 
 required = (
     "case \"${MODE}\" in plan | run | restore)",
+    "wg-mix-ebpf-b82-v6-package-v2",
     "readonly STAGE_ROOT=\"${STAGING_PREFIX}/${GATE_ID}\"",
     "readonly SNAPSHOT_MANIFEST=\"${INTAKE_ROOT}/package-manifest.v1\"",
     "readonly SNAPSHOT_BUNDLE=\"${INTAKE_ROOT}/source-${PACKAGE_ID}.bundle\"",
@@ -58,22 +64,41 @@ required = (
     "--binary-sha256 \"${BINARY_SHA256}\"",
     "--object-sha256 \"${EXPERIMENTAL_SHA256}\"",
     "persistent_bpf_delta=zero",
-    "restore=explicit-only",
+    "readonly MODULE_RESOURCE_ID='f3e5c8a1'",
+    'readonly MODULE_LEASE_ID="${CONTROLLER_RUN_ID}-${MODULE_RESOURCE_ID}"',
+    "checksum-module-lease.v1.lock",
+    'source "${MODULE_LEASE_HELPER}"',
+    "c8_checksum_module_acquire L0",
+    'c8_checksum_module_configure "${CONTROLLER_RUN_ID}" "${MODULE_RESOURCE_ID}"',
+    "c8_checksum_module_load M",
+    "c8_checksum_module_restore R.module",
+    "module_state=shared-owned-loaded",
     "phase-restore-intent.v1",
     'ensure_phase "${RESTORE_INTENT_PHASE}"',
     'ensure_phase "${RESTORED_PHASE}"',
     'ensure_phase "${FILESYSTEM_PHASE}"',
-    "reverse_argv=/usr/sbin/rmmod wg_mix_faketcp_checksum",
+    "reverse_helper=c8_checksum_module_restore",
     "automatic_cleanup=0",
     "noclobber create ${STEP_LOG}",
     "/usr/bin/tee -a \"${STEP_LOG}\"",
-    'restore_module_transition "${live}${loaded_receipt}"',
-    "01 | 00) printf '%s\\n' already-absent ;;",
     "assert_bpf_baseline_convergent R.final",
 )
 for value in required:
     if value not in source:
         fail(f"missing required contract {value!r}")
+
+for value in (
+    "readonly C8_CHECKSUM_MODULE_FRESH_RESOURCE_ID='f3e5c8a1'",
+    'readonly C8_CHECKSUM_MODULE_FRESH_OBJECT="${C8_CHECKSUM_MODULE_FRESH_ROOT}/source/build/faketcp_checksum_kmod/${C8_CHECKSUM_MODULE_NAME}.ko"',
+    'readonly C8_CHECKSUM_MODULE_FRESH_EVIDENCE="${C8_CHECKSUM_MODULE_FRESH_ROOT}/evidence"',
+    "c8_checksum_module_acquire()",
+    "c8_checksum_module_configure()",
+    "c8_checksum_module_load()",
+    "c8_checksum_module_restore()",
+    '"${C8_CHECKSUM_MODULE_PARAMETER}=${C8_CHECKSUM_MODULE_LEASE_ID}"',
+):
+    if value not in helper:
+        fail(f"shared helper missing fresh contract {value!r}")
 
 for forbidden in (
     "rm -rf",
@@ -104,8 +129,17 @@ if re.search(r"(?m)^\s*trap(?:\s|$)", source):
 if re.search(r"(?:>|2>|&>)\s*/dev/null", source):
     fail("output or errors must not be discarded to /dev/null")
 
-if source.count("module-unload) OP_TARGET") != 1:
-    fail("module unload operation must have one argv authority")
+for legacy in (
+    "MODULE_INTENT_PHASE",
+    "MODULE_LOADED_PHASE",
+    "restore_module_transition",
+    "module-load) OP_TARGET",
+    "module-unload) OP_TARGET",
+    "run_operation M.load module-load",
+    "run_convergent_operation R.module module-unload",
+):
+    if legacy in source:
+        fail(f"fresh gate retained a second module authority: {legacy!r}")
 run_start = source.find("run_gate() {")
 run_end = source.find("validate_restore_state() {", run_start)
 restore_start = source.find("restore_gate() {", run_end)
@@ -114,32 +148,58 @@ if min(run_start, run_end, restore_start, main_start) < 0:
     fail("could not identify run/restore state-machine bodies")
 run_body = source[run_start:run_end]
 restore_body = source[restore_start:main_start]
-if "module-unload" in run_body or "restore_gate" in run_body:
+if "c8_checksum_module_restore" in run_body or "restore_gate" in run_body:
     fail("run path contains automatic module cleanup")
-if "run_convergent_operation R.module module-unload" not in restore_body:
-    fail("explicit restore does not use the sole module-unload authority")
 if "fail 'already-restored'" in restore_body:
     fail("restore still rejects its replayable terminal state")
-intent_index = restore_body.find('ensure_phase "${RESTORE_INTENT_PHASE}"')
-state_index = restore_body.find('restore_module_transition "${live}${loaded_receipt}"')
-unload_index = restore_body.find("run_convergent_operation R.module module-unload")
-if min(intent_index, state_index, unload_index) < 0 or not intent_index < state_index < unload_index:
-    fail("restore intent is not durable before state inspection and module mutation")
+restore_order = tuple(
+    restore_body.find(value)
+    for value in (
+        "c8_checksum_module_acquire R.lease",
+        'c8_checksum_module_configure "${CONTROLLER_RUN_ID}"',
+        'ensure_phase "${RESTORE_INTENT_PHASE}"',
+        "c8_checksum_module_restore R.module",
+        "assert_bpf_baseline_convergent R.final",
+    )
+)
+if min(restore_order) < 0 or tuple(sorted(restore_order)) != restore_order:
+    fail("shared restore lock/configure/intent/restore/baseline order drifted")
 
 if "manifest_value()" in source or "manifest_value " in source:
     fail("manifest is reparsed by key instead of consumed exactly once")
 snapshot_index = source.find("snapshot_held_inputs", run_start)
 audit_index = source.find("create_audit_log", source.find("run_gate() {"))
+lock_index = source.find("c8_checksum_module_acquire L0", run_start)
+absent_index = source.find("L1.module-absent", run_start)
 clone_index = source.find("create_fresh_source", source.find("run_gate() {"))
-if min(snapshot_index, audit_index, clone_index) < 0 or not snapshot_index < audit_index < clone_index:
-    fail("stable input snapshots are not sealed before clone/build")
+build_index = source.find("build_fresh_artifacts", run_start)
+load_index = source.find("load_shared_module", run_start)
+run_order = (snapshot_index, audit_index, lock_index, absent_index, clone_index, build_index, load_index)
+if min(run_order) < 0 or tuple(sorted(run_order)) != run_order:
+    fail("snapshot/audit/shared-lock/absence/clone/build/load order drifted")
 
+load_start = source.find("load_shared_module() {")
+load_end = source.find("run_verifier_and_test_run() {", load_start)
+load_body = source[load_start:load_end]
 warning_index = source.find(
-    '/usr/bin/cmp -s "${EVIDENCE_ROOT}/A.kwarn.out" "${EVIDENCE_ROOT}/M.kwarn.out"'
+    '/usr/bin/cmp -s "${EVIDENCE_ROOT}/A.kwarn.out" "${EVIDENCE_ROOT}/M.kwarn.out"',
+    load_start,
 )
-loaded_index = source.find('write_phase "${MODULE_LOADED_PHASE}"')
-if min(warning_index, loaded_index) < 0 or warning_index > loaded_index:
-    fail("module warning delta is not checked before publishing the loaded receipt")
+helper_load_index = load_body.find("c8_checksum_module_load M")
+warning_capture_index = load_body.find("run_operation M.kwarn")
+warning_compare_index = load_body.find('/usr/bin/cmp -s "${EVIDENCE_ROOT}/A.kwarn.out"')
+if min(helper_load_index, warning_capture_index, warning_compare_index, warning_index) < 0 or not (
+    helper_load_index < warning_capture_index < warning_compare_index
+):
+    fail("module warning zero-delta gate does not immediately follow shared load")
+
+callback_start = source.find("run_module_lease_argv() {")
+callback_end = source.find("c8_checksum_module_run()", callback_start)
+callback_body = source[callback_start:callback_end]
+if min(callback_start, callback_end) < 0 or "run_step" in callback_body or not all(
+    value in callback_body for value in ("audit_line start", "/usr/bin/tee -a", "audit_line finish")
+):
+    fail("module callback is not replayable audit-only execution")
 
 if source.count("/usr/bin/mkdir --mode=0700 --") < 7:
     fail("fresh stage/cache directories are not exact mkdir operations")

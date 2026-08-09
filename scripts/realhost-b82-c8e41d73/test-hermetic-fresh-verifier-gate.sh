@@ -4,10 +4,13 @@ set -o pipefail
 umask 077
 
 SCRIPT="${1:-}"
-[[ "${SCRIPT}" == /* && -f "${SCRIPT}" && ! -L "${SCRIPT}" ]] || {
-  printf 'usage: %s ABSOLUTE_ROOT_FRESH_VERIFIER_GATE\n' "$0" >&2
+HELPER="${2:-}"
+[[ "${SCRIPT}" == /* && -f "${SCRIPT}" && ! -L "${SCRIPT}" &&
+  "${HELPER}" == /* && -f "${HELPER}" && ! -L "${HELPER}" ]] || {
+  printf 'usage: %s ABSOLUTE_ROOT_FRESH_VERIFIER_GATE ABSOLUTE_MODULE_LEASE_HELPER\n' "$0" >&2
   exit 64
 }
+/bin/bash -n "${SCRIPT}" "${HELPER}" || exit $?
 
 FIXTURE="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/wg-mix-fresh-verifier-plan.XXXXXXXX")" || exit $?
 OUTPUT="${FIXTURE}/plan.out"
@@ -29,11 +32,6 @@ run_plan() {
     --commit "${COMMIT}" \
     --manifest "${MANIFEST}" --manifest-sha256 "${MANIFEST_SHA}" \
     --bundle "${BUNDLE}" --bundle-sha256 "${BUNDLE_SHA}"
-}
-
-restore_transition() {
-  /bin/bash -c 'source "$1"; restore_module_transition "$2"' \
-    fresh-verifier-transition "${SCRIPT}" "$1"
 }
 
 run_plan >"${OUTPUT}" || fail 'plan returned nonzero'
@@ -71,7 +69,12 @@ for expected in \
   'run-faketcp-verifier-only.py' \
   'operation=packet-test-run' \
   'TestFakeTCPBPFPacketProbe' \
-  'EXPLICIT_RESTORE_ONLY.R.module operation=module-unload' \
+  'L0 operation=shared-module-lock target=/run/wg-mix-ebpf-source-stages/c8e41d73/checksum-module-lease.v1.lock' \
+  'M.load operation=shared-module-load target=wg_mix_faketcp_checksum helper=c8_checksum_module_load' \
+  'lease_id=c8e41d73-f3e5c8a1' \
+  'EXPLICIT_RESTORE_ONLY.R.lease operation=shared-module-lock' \
+  'EXPLICIT_RESTORE_ONLY.R.module operation=shared-module-restore' \
+  'helper=c8_checksum_module_restore' \
   'transient_bpf=unpinned' \
   'automatic_cleanup=0' \
   'network_state_mutations=0 dependency_fetch=proxy-only' \
@@ -79,8 +82,9 @@ for expected in \
   [[ "${PLAN}" == *"${expected}"* ]] || fail "plan missing ${expected}"
 done
 
-[[ "$(/usr/bin/grep -c 'operation=module-unload' "${OUTPUT}")" == 1 ]] ||
-  fail 'module unload is not a single explicit restore operation'
+[[ "$(/usr/bin/grep -c 'operation=shared-module-load' "${OUTPUT}")" == 1 &&
+  "$(/usr/bin/grep -c 'operation=shared-module-restore' "${OUTPUT}")" == 1 ]] ||
+  fail 'shared helper module operations are not singular'
 [[ "${PLAN}" != *'rm -rf'* && "${PLAN}" != *'find -delete'* &&
   "${PLAN}" != *'chroot'* && "${PLAN}" != *'nsenter'* &&
   "${PLAN}" != *'/usr/sbin/ip '* && "${PLAN}" != *'/usr/sbin/tc '* ]] ||
@@ -108,19 +112,6 @@ if /bin/bash "${SCRIPT}" plan \
   --manifest "${MANIFEST}" --manifest-sha256 "${MANIFEST_SHA}" \
   --bundle "${BUNDLE}" --bundle-sha256 "${BUNDLE_SHA}" >"${FIXTURE}/order.out" 2>&1; then
   fail 'reordered authority arguments were accepted'
-fi
-
-for transition in \
-  '11|unload-receipted-generation' \
-  '10|require-exact-generation-receipt' \
-  '01|already-absent' \
-  '00|already-absent'; do
-  IFS='|' read -r cut expected <<<"${transition}"
-  [[ "$(restore_transition "${cut}")" == "${expected}" ]] ||
-    fail "restore failure-cut ${cut} did not select ${expected}"
-done
-if restore_transition 12 >"${FIXTURE}/invalid-transition.out" 2>&1; then
-  fail 'invalid restore transition was accepted'
 fi
 
 printf 'fresh verifier hermetic plan test passed; retained=%s\n' "${FIXTURE}"
