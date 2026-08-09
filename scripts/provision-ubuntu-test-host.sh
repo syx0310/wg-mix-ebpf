@@ -164,8 +164,50 @@ done
 }
 
 apt_plan_has_forbidden_changes() {
-  /usr/bin/grep -Eq \
-    '^(Remv|Purg) |^Inst [^ ]+ \[[^]]+\]|^Inst (grub[^ ]*|initramfs-tools[^ ]*|linux-image-[^ ]*|linux-modules-[^ ]*|shim-signed[^ ]*|systemd-boot[^ ]*) '
+  "${CLEAN_ENV[@]}" /usr/bin/awk '
+    function is_boot_package(package) {
+      return package ~ /^(grub|initramfs-tools|linux-image-|linux-modules-|shim-signed|systemd-boot)/
+    }
+    $1 == "Remv" || $1 == "Purg" { unsafe = 1 }
+    $1 == "Inst" {
+      package = $2
+      if ($0 ~ /^Inst [^ ]+ \[[^]]+\]/ || is_boot_package(package) ||
+          $0 !~ /^Inst [^ ]+ \(/) {
+        unsafe = 1
+      } else {
+        fresh[package] = 1
+      }
+    }
+    $1 == "Conf" {
+      package = $2
+      configured[package] = 1
+      if (is_boot_package(package) || $0 !~ /^Conf [^ ]+ \(/) {
+        unsafe = 1
+      }
+    }
+    END {
+      for (package in configured) {
+        if (!(package in fresh)) unsafe = 1
+      }
+      exit !unsafe
+    }
+  '
+}
+
+dpkg_status_has_pending_work() {
+  "${CLEAN_ENV[@]}" /usr/bin/awk -F '\t' '
+    {
+      seen = 1
+      status = $1
+      if (NF != 2 || length(status) != 3 ||
+          index("uihrp", substr(status, 1, 1)) == 0 ||
+          index("nci", substr(status, 2, 1)) == 0 ||
+          substr(status, 3, 1) != " ") {
+        dirty = 1
+      }
+    }
+    END { exit !(dirty || !seen) }
+  '
 }
 
 if [[ "${MODE}" == "self-test" ]]; then
@@ -329,14 +371,17 @@ render_plan() {
 }
 
 service_snapshot() {
-  {
-    "${CLEAN_ENV[@]}" /usr/bin/systemctl list-units --type=service \
-      --state=active --no-legend --no-pager --plain |
-      "${CLEAN_ENV[@]}" /usr/bin/awk '{print "active " $1}'
-    "${CLEAN_ENV[@]}" /usr/bin/systemctl list-unit-files --type=service \
-      --state=enabled --no-legend --no-pager |
-      "${CLEAN_ENV[@]}" /usr/bin/awk '{print "enabled " $1}'
-  } | "${CLEAN_ENV[@]}" /usr/bin/sort
+  local active enabled
+  active="$("${CLEAN_ENV[@]}" /usr/bin/systemctl list-units --type=service \
+    --state=active --no-legend --no-pager --plain)" || return $?
+  enabled="$("${CLEAN_ENV[@]}" /usr/bin/systemctl list-unit-files --type=service \
+    --state=enabled,enabled-runtime --no-legend --no-pager)" || return $?
+  active="$("${CLEAN_ENV[@]}" /usr/bin/awk 'NF {print "active " $1}' \
+    <<<"${active}")" || return $?
+  enabled="$("${CLEAN_ENV[@]}" /usr/bin/awk 'NF {print $2 " " $1}' \
+    <<<"${enabled}")" || return $?
+  printf '%s\n%s\n' "${active}" "${enabled}" |
+    "${CLEAN_ENV[@]}" /usr/bin/sort
 }
 
 run_logged_write() {
@@ -376,6 +421,18 @@ run_logged_capture() {
   fi
   printf -v "${destination}" '%s' "${output}"
   return "${status}"
+}
+
+verify_clean_dpkg_state() {
+  local states
+  run_logged_capture states 'verify dpkg package states' \
+    "${CLEAN_ENV[@]}" /usr/bin/dpkg-query -W \
+    -f='${db:Status-Abbrev}\t${binary:Package}\n' || return $?
+  if dpkg_status_has_pending_work <<<"${states}"; then
+    echo 'error: dpkg has an unpacked, half-configured, trigger-pending, or otherwise incomplete package' >&2
+    return 1
+  fi
+  printf 'verified_dpkg_state=clean\n'
 }
 
 verify_installed_toolchain() {
@@ -442,6 +499,7 @@ printf '\n'
 
 declare -a missing=()
 collect_missing_packages
+verify_clean_dpkg_state
 printf 'missing_packages='
 if ((${#missing[@]} > 0)); then
   quote_argv "${missing[@]}"
