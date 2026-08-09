@@ -19,6 +19,7 @@ FAKETCP_VERIFIER_LAUNCHER_AMD64 ?= bin/faketcp-verifier-launcher-linux-amd64
 FAKETCP_VERIFIER_LAUNCHER_ARM64 ?= bin/faketcp-verifier-launcher-linux-arm64
 FAKETCP_VERIFIER_LAUNCHER_TEST_AMD64 ?= build/verifierlauncher-linux-amd64.test
 FAKETCP_VERIFIER_LAUNCHER_TEST_ARM64 ?= build/verifierlauncher-linux-arm64.test
+FAKETCP_DATAPLANE_TEST_AMD64 ?= build/dataplane-linux-amd64.test
 EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 override BUILD_SOURCE_COMMIT := $(shell ./scripts/source-commit.sh)
 override BUILD_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/buildinfo.sourceCommit=$(BUILD_SOURCE_COMMIT)
@@ -80,6 +81,9 @@ test-b82-fresh-verifier-gate:
 	PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
 		scripts/realhost-b82-c8e41d73/test_fresh_verifier_gate_static.py \
 		"$(CURDIR)/scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh"
+	@mkdir -p $(dir $(FAKETCP_DATAPLANE_TEST_AMD64))
+	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
+		$(GO) test -c -o $(FAKETCP_DATAPLANE_TEST_AMD64) ./internal/dataplane
 
 build-bpf:
 	@mkdir -p $(dir $(BPF_OBJECT))
