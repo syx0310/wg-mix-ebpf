@@ -33,6 +33,34 @@ sys.modules[CHECKER_SPEC.name] = CHECKER_MODULE
 CHECKER_SPEC.loader.exec_module(CHECKER_MODULE)
 
 
+@contextlib.contextmanager
+def runtime_contract(prefix):
+    parent = pathlib.Path(prefix).parent
+    with (
+        mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix),
+        mock.patch.object(MODULE, "PHYSICAL_INTERFACE_LOCK_UID", os.getuid()),
+        mock.patch.object(MODULE, "PHYSICAL_INTERFACE_LOCK_GID", os.getgid()),
+        mock.patch.object(
+            MODULE,
+            "LEGACY_RETIREMENT_RESERVATION",
+            str(parent / "legacy-retirement-reservation"),
+        ),
+    ):
+        yield
+
+
+def create_runtime_authorities(prefix):
+    with runtime_contract(prefix):
+        paths = (
+            pathlib.Path(MODULE.physical_interface_lock_path()),
+            pathlib.Path(MODULE.LEGACY_RETIREMENT_RESERVATION),
+        )
+        for path in paths:
+            path.touch(mode=0o600, exist_ok=False)
+            path.chmod(0o600)
+        return paths
+
+
 class FixtureRunner(MODULE.CommandRunner):
     def __init__(self, spec, *, fixed=()):
         self.calls = []
@@ -603,7 +631,7 @@ class StrictIperfOracleTests(unittest.TestCase):
     def test_bidir_requires_2p_directions_receivers_and_summaries(self):
         with tempfile.TemporaryDirectory() as temporary:
             prefix = f"{temporary}/run-"
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix):
+            with runtime_contract(prefix):
                 spec = fixture_spec(run_root=f"{prefix}a1b2c3d4")
                 pathlib.Path(spec.run_root, "logs").mkdir(parents=True)
                 step = next(
@@ -676,7 +704,7 @@ class StrictIperfOracleTests(unittest.TestCase):
     def test_one_tiny_stream_cannot_hide_inside_a_sixteen_stream_group(self):
         with tempfile.TemporaryDirectory() as temporary:
             prefix = f"{temporary}/run-"
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix):
+            with runtime_contract(prefix):
                 spec = fixture_spec(run_root=f"{prefix}a1b2c3d4")
                 pathlib.Path(spec.run_root, "logs").mkdir(parents=True)
                 step = next(
@@ -698,7 +726,7 @@ class StrictIperfOracleTests(unittest.TestCase):
     def test_formal_30_and_300_second_sessions_reject_one_second_json(self):
         with tempfile.TemporaryDirectory() as temporary:
             prefix = f"{temporary}/run-"
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix):
+            with runtime_contract(prefix):
                 spec = fixture_spec(
                     run_root=f"{prefix}a1b2c3d4",
                     profile="acceptance",
@@ -926,6 +954,126 @@ class CounterGateTests(unittest.TestCase):
                 self.assertTrue(MODULE.counter_id_is_failure(key))
                 with self.assertRaisesRegex(MODULE.HarnessError, "counters grew"):
                     MODULE.counter_delta(baseline, {**baseline, key: 1})
+
+
+class PhysicalAuthorityTests(unittest.TestCase):
+    @staticmethod
+    def create_physical_lock_only(prefix):
+        with runtime_contract(prefix):
+            path = pathlib.Path(MODULE.physical_interface_lock_path())
+            path.touch(mode=0o600, exist_ok=False)
+            path.chmod(0o600)
+            return path
+
+    def test_exact_reservation_is_plan_bound_and_accepted(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = f"{temporary}/run-"
+            create_runtime_authorities(prefix)
+            with runtime_contract(prefix):
+                MODULE.validate_legacy_retirement_reservation()
+                contract = MODULE.legacy_retirement_contract()
+                self.assertEqual(contract["path"], MODULE.LEGACY_RETIREMENT_RESERVATION)
+                self.assertEqual(
+                    contract["metadata"],
+                    {
+                        "uid": os.getuid(),
+                        "gid": os.getgid(),
+                        "mode": "0600",
+                        "nlink": 1,
+                        "size": 0,
+                        "type": "regular-file",
+                    },
+                )
+                self.assertEqual(contract["accepted_state"], "exact-empty-sentinel-only")
+
+    def test_missing_or_drifted_reservation_blocks_all_modes_before_mode_work(self):
+        for state in ("absent", "nonempty"):
+            for mode in ("plan", "run", "restore"):
+                with self.subTest(state=state, mode=mode), tempfile.TemporaryDirectory() as temporary:
+                    prefix = f"{temporary}/run-"
+                    self.create_physical_lock_only(prefix)
+                    with runtime_contract(prefix):
+                        if state == "nonempty":
+                            reservation = pathlib.Path(MODULE.LEGACY_RETIREMENT_RESERVATION)
+                            reservation.write_bytes(b"drift")
+                            reservation.chmod(0o600)
+                        spec = fixture_spec(run_root=f"{prefix}a1b2c3d4")
+                        runner = SimulatedRunner(spec)
+                        snapshot, commands = MODULE.collect_snapshot(spec, runner)
+                        plan_payload = MODULE.canonical_json(MODULE.build_plan(spec, snapshot, commands))
+                        plan_path = pathlib.Path(temporary, "approved-plan.json")
+                        plan_path.write_bytes(plan_payload)
+                        runner.calls.clear()
+                        lease_path = MODULE.interface_lease_path(spec, snapshot["host"]["netns"])
+                        error = "root stager must create" if state == "absent" else "must be the staged"
+                        with mock.patch.object(MODULE.os, "geteuid", return_value=0):
+                            with self.assertRaisesRegex(MODULE.HarnessError, error):
+                                if mode == "plan":
+                                    MODULE.plan_mode(spec, runner)
+                                elif mode == "run":
+                                    MODULE.run_mode(
+                                        spec,
+                                        str(plan_path),
+                                        MODULE.sha256_bytes(plan_payload),
+                                        runner,
+                                    )
+                                else:
+                                    MODULE.restore_mode(
+                                        spec,
+                                        str(plan_path),
+                                        MODULE.sha256_bytes(plan_payload),
+                                        runner,
+                                    )
+                        self.assertEqual(runner.calls, [])
+                        self.assertEqual(runner.network_writes, 0)
+                        self.assertFalse(pathlib.Path(spec.run_root).exists())
+                        self.assertFalse(pathlib.Path(lease_path).exists())
+
+    def test_directory_symlink_nonempty_mode_and_inode_drift_are_rejected(self):
+        variants = ("directory", "symlink", "nonempty", "mode", "inode")
+        for variant in variants:
+            with self.subTest(variant=variant), tempfile.TemporaryDirectory() as temporary:
+                prefix = f"{temporary}/run-"
+                self.create_physical_lock_only(prefix)
+                with runtime_contract(prefix):
+                    path = pathlib.Path(MODULE.LEGACY_RETIREMENT_RESERVATION)
+                    if variant == "directory":
+                        path.mkdir(mode=0o700)
+                    elif variant == "symlink":
+                        target = pathlib.Path(temporary, "sentinel-target")
+                        target.touch(mode=0o600)
+                        path.symlink_to(target)
+                    else:
+                        path.touch(mode=0o600)
+                        path.chmod(0o600)
+                        if variant == "nonempty":
+                            path.write_bytes(b"not-empty")
+                        elif variant == "mode":
+                            path.chmod(0o644)
+                    if variant == "inode":
+                        actual = os.lstat(path)
+                        replacement = types.SimpleNamespace(
+                            st_mode=actual.st_mode,
+                            st_dev=actual.st_dev,
+                            st_ino=actual.st_ino + 1,
+                        )
+                        context = mock.patch.object(MODULE.os, "lstat", return_value=replacement)
+                    else:
+                        context = contextlib.nullcontext()
+                    with context, self.assertRaises(MODULE.HarnessError):
+                        MODULE.validate_legacy_retirement_reservation()
+
+    def test_physical_lock_is_exclusive_and_requires_exact_shape(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = f"{temporary}/run-"
+            physical, _ = create_runtime_authorities(prefix)
+            with runtime_contract(prefix):
+                with MODULE.PhysicalInterfaceLock(str(physical)):
+                    with self.assertRaisesRegex(MODULE.HarnessError, "authority is busy"):
+                        MODULE.PhysicalInterfaceLock(str(physical))
+                physical.write_bytes(b"drift")
+                with self.assertRaisesRegex(MODULE.HarnessError, "must be the staged"):
+                    MODULE.PhysicalInterfaceLock(str(physical))
 
 
 class PlannerTests(unittest.TestCase):
@@ -1185,17 +1333,21 @@ class PlannerTests(unittest.TestCase):
         )
 
     def test_plan_mode_outputs_canonical_json_only(self):
-        spec = fixture_spec()
-        runner = FixtureRunner(spec)
-        stdout = io.BytesIO()
-        wrapper = io.TextIOWrapper(stdout, encoding="utf-8")
-        with contextlib.redirect_stdout(wrapper):
-            rc = MODULE.plan_mode(spec, runner)
-            wrapper.flush()
-        self.assertEqual(rc, 0)
-        payload = stdout.getvalue()
-        self.assertTrue(payload.endswith(b"\n"))
-        self.assertEqual(payload, MODULE.canonical_json(json.loads(payload)))
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix = f"{temporary}/run-"
+            create_runtime_authorities(prefix)
+            with runtime_contract(prefix):
+                spec = fixture_spec(run_root=f"{prefix}a1b2c3d4")
+                runner = FixtureRunner(spec)
+                stdout = io.BytesIO()
+                wrapper = io.TextIOWrapper(stdout, encoding="utf-8")
+                with contextlib.redirect_stdout(wrapper):
+                    rc = MODULE.plan_mode(spec, runner)
+                    wrapper.flush()
+                self.assertEqual(rc, 0)
+                payload = stdout.getvalue()
+                self.assertTrue(payload.endswith(b"\n"))
+                self.assertEqual(payload, MODULE.canonical_json(json.loads(payload)))
 
     def test_identity_mismatch_fails_closed(self):
         spec = fixture_spec(expected_ifindex=9)
@@ -1220,11 +1372,12 @@ class HermeticStateMachineTests(unittest.TestCase):
     def prepare(self, temporary, *, fail_iperf_call=None, spec_changes=None):
         prefix = f"{temporary}/run-"
         changes = {"run_root": f"{prefix}a1b2c3d4", **(spec_changes or {})}
-        with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix):
+        with runtime_contract(prefix):
             spec = fixture_spec(**changes)
             runner = SimulatedRunner(spec, fail_iperf_call=fail_iperf_call)
             snapshot, commands = MODULE.collect_snapshot(spec, runner)
             plan_payload = MODULE.canonical_json(MODULE.build_plan(spec, snapshot, commands))
+        create_runtime_authorities(prefix)
         plan_path = f"{temporary}/approved-plan.json"
         pathlib.Path(plan_path).write_bytes(plan_payload)
         return prefix, spec, runner, plan_path, MODULE.sha256_bytes(plan_payload)
@@ -1233,7 +1386,7 @@ class HermeticStateMachineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             prefix, spec, runner, plan_path, _ = self.prepare(temporary)
             wrong = "abcdef0123456789" * 4
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 with self.assertRaisesRegex(MODULE.HarnessError, "SHA-256 mismatch"):
@@ -1243,7 +1396,7 @@ class HermeticStateMachineTests(unittest.TestCase):
     def test_complete_characterization_restores_every_cell_and_stays_incomplete(self):
         with tempfile.TemporaryDirectory() as temporary:
             prefix, spec, runner, plan_path, digest = self.prepare(temporary)
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 rc = MODULE.run_mode(spec, plan_path, digest, runner)
@@ -1286,7 +1439,7 @@ class HermeticStateMachineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             prefix, spec, runner, plan_path, digest = self.prepare(temporary)
             runner.counter_command_seconds = 1.5
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 with self.assertRaisesRegex(MODULE.HarnessError, "sample lateness"):
@@ -1296,7 +1449,7 @@ class HermeticStateMachineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             prefix, spec, runner, plan_path, digest = self.prepare(temporary)
             runner.oracle_command_seconds = 3
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 with self.assertRaisesRegex(MODULE.HarnessError, "interwindow gap"):
@@ -1313,7 +1466,7 @@ class HermeticStateMachineTests(unittest.TestCase):
                     "soak_window_seconds": 300,
                 },
             )
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 self.assertEqual(MODULE.run_mode(spec, plan_path, digest, runner), 3)
@@ -1332,7 +1485,7 @@ class HermeticStateMachineTests(unittest.TestCase):
     def test_active_interface_owner_blocks_a_different_run_id(self):
         with tempfile.TemporaryDirectory() as temporary:
             prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=10)
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 with self.assertRaises(MODULE.HarnessError):
@@ -1361,13 +1514,13 @@ class HermeticStateMachineTests(unittest.TestCase):
                 identity["ifindex"] = 99
                 return identity
 
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ), mock.patch.object(MODULE, "collect_write_guard_identity", side_effect=drifted_identity):
                 with self.assertRaisesRegex(MODULE.HarnessError, "network-write interface identity changed"):
                     MODULE.run_mode(spec, plan_path, digest, runner)
                 self.assertEqual(runner.network_writes, 0)
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 self.assertEqual(MODULE.restore_mode(spec, plan_path, digest, runner), 0)
@@ -1375,7 +1528,7 @@ class HermeticStateMachineTests(unittest.TestCase):
     def test_failure_retains_mutation_until_separately_invoked_restore(self):
         with tempfile.TemporaryDirectory() as temporary:
             prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=10)
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 with self.assertRaisesRegex(MODULE.HarnessError, "command tcp-all-on"):
@@ -1399,7 +1552,7 @@ class HermeticStateMachineTests(unittest.TestCase):
     def test_explicit_restore_replays_idempotently_after_nth_step_cut(self):
         with tempfile.TemporaryDirectory() as temporary:
             prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=10)
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 with self.assertRaises(MODULE.HarnessError):
@@ -1425,7 +1578,7 @@ class HermeticStateMachineTests(unittest.TestCase):
     def test_mutated_interface_restores_after_unterminated_journal_tail(self):
         with tempfile.TemporaryDirectory() as temporary:
             prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=10)
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 with self.assertRaises(MODULE.HarnessError):
@@ -1444,7 +1597,7 @@ class HermeticStateMachineTests(unittest.TestCase):
     def test_explicit_restore_audits_but_ignores_unrelated_host_drift(self):
         with tempfile.TemporaryDirectory() as temporary:
             prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=10)
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 with self.assertRaises(MODULE.HarnessError):
@@ -1493,7 +1646,7 @@ class HermeticStateMachineTests(unittest.TestCase):
     def test_explicit_restore_requires_exact_owned_feature_dependency_closure(self):
         with tempfile.TemporaryDirectory() as temporary:
             prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=10)
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 with self.assertRaises(MODULE.HarnessError):
@@ -1521,7 +1674,7 @@ class HermeticStateMachineTests(unittest.TestCase):
             )
             self.assertEqual(child_index, parent_index + 1)
 
-            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+            with runtime_contract(prefix), mock.patch.object(
                 MODULE.os, "geteuid", return_value=0
             ):
                 with self.assertRaises(MODULE.HarnessError):
@@ -1565,7 +1718,7 @@ class HermeticStateMachineTests(unittest.TestCase):
                     )
                     target = pathlib.Path(spec.run_root, artifact)
                     pending = pathlib.Path(f"{target}.pending")
-                    with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                    with runtime_contract(prefix), mock.patch.object(
                         MODULE.os, "geteuid", return_value=0
                     ):
                         with self.assertRaises(MODULE.HarnessError):

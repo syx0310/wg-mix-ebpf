@@ -57,6 +57,41 @@ class StaticSafetyTests(unittest.TestCase):
         self.assertIn("EXPLICIT_RESTORE_INTENT", self.source)
         self.assertIn("exact_reverse_argv", self.source)
 
+    def test_single_staged_retirement_sentinel_is_the_only_legacy_gate(self):
+        self.assertIn(
+            'LEGACY_RETIREMENT_RESERVATION = (\n'
+            '    "/run/wg-mix-ebpf-source-stages/c8e41d73/realhost-v6-6bd913ac"',
+            self.source,
+        )
+        self.assertIn('"accepted_state": "exact-empty-sentinel-only"', self.source)
+        self.assertIn('"creator": "root-stager-o-creat-o-excl"', self.source)
+        self.assertIn("metadata.st_nlink != 1", self.source)
+        self.assertIn("metadata.st_size != 0", self.source)
+        self.assertIn("current.st_ino", self.source)
+        for retired in (
+            "legacy_git_argv",
+            "legacy owner",
+            "legacy bundle",
+            "legacy completed marker",
+            "legacy restored marker",
+            "LEGACY_SOURCE",
+        ):
+            self.assertNotIn(retired, self.source)
+
+    def test_retirement_sentinel_is_checked_inside_the_outer_lock_before_all_modes(self):
+        start = self.source.index("def execute_with_physical_authority(")
+        end = self.source.index("\ndef plan_mode(", start)
+        body = self.source[start:end]
+        lock = body.index("with PhysicalInterfaceLock(physical_interface_lock_path()):")
+        reservation = body.index("validate_legacy_retirement_reservation()")
+        mode = body.index('if mode == "plan":')
+        plan_read = body.index("read_approved_plan(")
+        lease = body.index("with InterfaceLease(")
+        self.assertLess(lock, reservation)
+        self.assertLess(reservation, mode)
+        self.assertLess(reservation, plan_read)
+        self.assertLess(reservation, lease)
+
 
 if __name__ == "__main__":
     unittest.main()
