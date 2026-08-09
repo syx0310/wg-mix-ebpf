@@ -58,10 +58,13 @@ type ActionCheckpoint struct {
 // ActionCheckpointStore is a one-slot atomic CAS store. A daemon may back it
 // with durable state; the in-memory implementation is suitable for one
 // process lifetime. Implementations must deep-copy packet bytes on ingress and
-// egress and must never report a successful CAS before the new value is
-// recoverable. A returned conflict must mean no mutation occurred; any other
-// write error is treated as an unrecoverable store fault by Controller because
-// its commit outcome cannot be inferred safely.
+// egress and preserve each reinjection step's CaptureFingerprint exactly across
+// create, load, update, and transition operations. The fingerprint covers the
+// pre-materialization capture sample and must never be reconstructed from the
+// stored packet bytes. Implementations must never report a successful CAS
+// before the new value is recoverable. A returned conflict must mean no mutation
+// occurred; any other write error is treated as an unrecoverable store fault by
+// Controller because its commit outcome cannot be inferred safely.
 type ActionCheckpointStore interface {
 	LoadActionCheckpoint() (ActionCheckpoint, bool, error)
 	CreateActionCheckpoint(ActionCheckpoint) (ActionCheckpoint, error)
@@ -71,8 +74,9 @@ type ActionCheckpointStore interface {
 
 // ActionCheckpointTransitionStore optionally advances only checkpoint
 // execution progress. It must durably CAS Phase, NextStep, and Revision while
-// leaving Identity, Operation, and Steps unchanged. NewActionRecovery binds
-// this contract or the base update contract once for its entire lifetime.
+// leaving Identity, Operation, Steps, and every CaptureFingerprint unchanged.
+// NewActionRecovery binds this contract or the base update contract once for
+// its entire lifetime.
 type ActionCheckpointTransitionStore interface {
 	ActionCheckpointStore
 	TransitionActionCheckpoint(
@@ -567,6 +571,9 @@ func validateActionStep(step ActionStep) error {
 		}
 		if err := validateCaptureIdentity(step.Packet.CaptureID, step.Flow.Generation); err != nil {
 			return fmt.Errorf("faketcp reinjection action step identity: %w", err)
+		}
+		if step.Packet.CaptureFingerprint == ([32]byte{}) {
+			return errors.New("faketcp reinjection action step has no capture fingerprint")
 		}
 	default:
 		return fmt.Errorf("unknown faketcp action step kind %d", step.Kind)

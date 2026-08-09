@@ -113,15 +113,17 @@ type Action struct {
 // FWMark on Flow.UnderlayIndex so it traverses the ordinary
 // type-word/XOR/FakeTCP egress pipeline exactly once. CaptureID, not
 // CaptureNanos, is the once-only identity; the timestamp is diagnostic.
-// CaptureFingerprint binds the exact pre-materialization event sample and is
-// part of any durable action checkpoint.
+// CaptureFingerprint is the SHA-256 digest of the exact event sample before
+// Controller materializes packet checksums. Captured packets must carry the
+// non-zero digest unchanged into every durable action checkpoint; it cannot be
+// reconstructed from Data after checksum materialization.
 type PendingPacket struct {
 	Data               []byte
 	FWMark             uint32
 	WGID               uint32
 	CaptureNanos       uint64
 	CaptureID          CaptureIdentity
-	CaptureFingerprint [sha256.Size]byte
+	CaptureFingerprint [32]byte
 	dataOwned          bool
 }
 
