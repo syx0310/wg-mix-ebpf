@@ -781,7 +781,17 @@ proc build_operation {values manifest_sha operation approved_sha} {
                 }
                 if {$family eq "scp"} {
                     set local_path "${local_package}/${name}"
-                    if {[file normalize $local_path] ne $local_path || [file type $local_path] ne "file"} {
+                    if {[file normalize $local_path] ne $local_path ||
+                        [catch {file lstat $local_path local_stat}] ||
+                        [catch {file lstat $local_package package_stat}] ||
+                        $local_stat(type) ne "file" || $local_stat(nlink) != 1 ||
+                        $local_stat(size) < 1 || $local_stat(size) > 16777216 ||
+                        ($local_stat(mode) & 07777) != 0600 ||
+                        $package_stat(type) ne "directory" ||
+                        ($package_stat(mode) & 07777) != 0700 ||
+                        $local_stat(uid) != $package_stat(uid) ||
+                        $local_stat(gid) != $package_stat(gid) ||
+                        [file_sha256 $local_path] ne $expected_sha} {
                         return -code error "scp-local-file"
                     }
                     set destination "${target}:${package}/${name}"
@@ -1252,12 +1262,469 @@ proc capture_child_payload {child_id password_bytes prompt_limit timeout_seconds
     }
 }
 
+proc base_identity_operations {} {
+    return {identity-hostname identity-kernel identity-machine identity-netns identity-interface}
+}
+
+proc postflight_operations {} {
+    return {
+        identity-driver identity-wg-interfaces
+        tool-go tool-clang tool-llvm tool-bpftool tool-make tool-gcc tool-iperf3
+        tool-shellcheck tool-jq tool-wireguard tool-ethtool tool-tc tool-ip
+        kernel-btf kernel-bpffs kernel-headers
+    }
+}
+
+proc prepare_stale_operations {} {
+    return {
+        stale-package-root stale-bootstrap-root stale-alternate-bootstrap-root
+        stale-stage-root stale-fresh-root stale-standalone-root
+        stale-routed-evidence-root stale-realnic-run-roots
+        stale-realnic-interface-leases stale-veth-wgc8e41a stale-veth-wgc8e41b
+        stale-veth-wga19f7a stale-veth-wga19f7b stale-veth-wg5b8d3a
+        stale-veth-wg5b8d3b stale-pin-fresh stale-pin-standalone
+        stale-pin-legacy-tcx stale-pin-legacy-nic-original
+        stale-pin-legacy-nic-all-on stale-pin-legacy-nic-all-off
+        stale-pin-legacy-nic-tx-path stale-pin-legacy-nic-rx-path
+        stale-pin-legacy-nic-mtu1492 stale-pin-legacy-nic-mtu1500
+        stale-pin-legacy-nic-soak stale-checksum-module
+        stale-checksum-module-btf stale-checksum-module-lock
+        stale-physical-interface-lock
+    }
+}
+
+proc package_names {} {
+    return {
+        source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh
+        controller.sh prepare-stage-root.sh provision-ubuntu-test-host.sh
+        root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh
+        test_matrix_static.py checksum-module-lease.sh root-fresh-verifier-gate.sh
+        test-hermetic-fresh-verifier-gate.sh test_fresh_verifier_gate_static.py
+        realnic_acceptance.py test_realnic_acceptance.py
+        test_realnic_acceptance_static.py
+    }
+}
+
+proc bootstrap_create_operations {} {
+    return {
+        bootstrap-absent bootstrap-not-symlink bootstrap-create
+        bootstrap-root-readlink bootstrap-root-stat
+        bootstrap-install-provisioner bootstrap-install-stager
+    }
+}
+
+proc bootstrap_verify_operations {} {
+    return {bootstrap-root-readlink bootstrap-root-stat}
+}
+
+proc provisioner_verify_operations {} {
+    return {
+        bootstrap-provisioner-readlink bootstrap-provisioner-stat
+        bootstrap-provisioner-sha
+    }
+}
+
+proc stager_verify_operations {} {
+    return {bootstrap-stager-readlink bootstrap-stager-stat bootstrap-stager-sha}
+}
+
+proc stage_operations {} { return {stage-snapshot stage-plan stage-run} }
+
+proc transaction_operation {operation} {
+    return [expr {$operation in {
+        prepare provision-apply fresh-run fresh-restore veth-run veth-restore
+        routed-run routed-restore realnic-run realnic-restore
+    }}]
+}
+
+proc read_only_operation {operation} {
+    if {[regexp {^(identity-|tool-|kernel-|stale-)} $operation] ||
+        [regexp {^verify-(?:sha|stat)-} $operation]} {
+        return 1
+    }
+    return [expr {$operation in {
+        package-parent-stat bootstrap-absent bootstrap-not-symlink
+        bootstrap-root-readlink bootstrap-root-stat bootstrap-stager-readlink
+        bootstrap-stager-stat bootstrap-stager-sha bootstrap-provisioner-readlink
+        bootstrap-provisioner-stat bootstrap-provisioner-sha provision-check
+        stage-plan fresh-plan veth-plan routed-plan
+        verify-sha-realnic-approved-plan verify-stat-realnic-approved-plan
+        stage-realnic-plan-verify
+    }}]
+}
+
 proc operation_requires_approved_sha {operation} {
     return [expr {$operation in {
         scp-realnic-approved-plan verify-sha-realnic-approved-plan
         verify-stat-realnic-approved-plan stage-realnic-plan-snapshot
         realnic-run stage-realnic-plan-verify realnic-restore
     }}]
+}
+
+proc read_execute_credential {credential_path} {
+    if {[catch {open $credential_path r} credential_file]} {
+        fail "credential-open" 65
+    }
+    fconfigure $credential_file -encoding utf-8 -translation lf
+    if {[gets $credential_file ssh_line] < 0 || [gets $credential_file password] < 0 ||
+        [gets $credential_file unexpected] >= 0} {
+        close $credential_file
+        set password ""
+        fail "credential-shape" 65
+    }
+    close $credential_file
+    set ssh_parts [split [string trim $ssh_line]]
+    set ssh_line ""
+    if {$ssh_parts ne [list ssh siyixuan@192.168.10.82] || $password eq "" ||
+        [string first "\u0000" $password] >= 0 || [string first "\r" $password] >= 0 ||
+        [string first "\n" $password] >= 0} {
+        set password ""
+        fail "credential-value" 65
+    }
+    return $password
+}
+
+proc require_manifest_authority {values manifest_sha} {
+    set manifest "[dict get $values local_package_dir]/package-manifest.v1"
+    if {[catch {load_manifest $manifest $manifest_sha} current] ||
+        $current ne $values ||
+        [catch {exec /usr/bin/id -u} caller_uid] ||
+        ![regexp {^[0-9]+$} $caller_uid] ||
+        [catch {file lstat $manifest manifest_stat}] ||
+        [catch {file lstat [dict get $values local_package_dir] package_stat}] ||
+        $manifest_stat(type) ne "file" || $manifest_stat(nlink) != 1 ||
+        ($manifest_stat(mode) & 07777) != 0600 ||
+        $package_stat(type) ne "directory" ||
+        ($package_stat(mode) & 07777) != 0700 ||
+        $package_stat(uid) != $caller_uid ||
+        $manifest_stat(uid) != $package_stat(uid) ||
+        $manifest_stat(gid) != $package_stat(gid)} {
+        fail "manifest-transaction-drift" 66
+    }
+}
+
+proc require_controller_verifier_authority {values} {
+    set repository [dict get $values local_repository]
+    set controller_path [dict get $values controller_sh_path]
+    set controller_source "${repository}/${controller_path}"
+    set package [dict get $values local_package_dir]
+    set controller_copy "${package}/controller.sh"
+    set expected_path "scripts/realhost-b82-c8e41d73/controller.sh"
+    set expected_sha [dict get $values controller_sh_sha256]
+    set expected_blob [dict get $values controller_sh_blob]
+    if {$controller_path ne $expected_path ||
+        [catch {file normalize $repository} normalized_repository] ||
+        $normalized_repository ne $repository ||
+        [catch {file normalize $controller_source} normalized_source] ||
+        $normalized_source ne $controller_source ||
+        [catch {file lstat $controller_source source_stat}] ||
+        [catch {file lstat $controller_copy copy_stat}] ||
+        [catch {file lstat $package package_stat}] ||
+        $source_stat(type) ne "file" || $source_stat(nlink) != 1 ||
+        $source_stat(size) < 1 || $source_stat(size) > 16777216 ||
+        ($source_stat(mode) & 07777) != 0755 ||
+        $copy_stat(type) ne "file" || $copy_stat(nlink) != 1 ||
+        $copy_stat(size) < 1 || $copy_stat(size) > 16777216 ||
+        ($copy_stat(mode) & 07777) != 0600 ||
+        $package_stat(type) ne "directory" ||
+        ($package_stat(mode) & 07777) != 0700 ||
+        $copy_stat(uid) != $package_stat(uid) ||
+        $copy_stat(gid) != $package_stat(gid) ||
+        [catch {file_sha256 $controller_source} source_sha] ||
+        $source_sha ne $expected_sha ||
+        [catch {file_sha256 $controller_copy} copy_sha] ||
+        $copy_sha ne $expected_sha} {
+        fail "controller-verifier-shape" 66
+    }
+    set git_prefix [list /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 \
+        /usr/bin/git --no-pager --no-replace-objects \
+        -c core.attributesFile=/dev/null -c core.fsmonitor=false \
+        -c core.hooksPath=/dev/null -C $repository]
+    set integration_commit [dict get $values integration_commit]
+    set integration_ref [dict get $values integration_ref]
+    if {[catch {exec {*}$git_prefix rev-parse --show-toplevel} top_level] ||
+        [string trim $top_level] ne $repository ||
+        [catch {exec {*}$git_prefix rev-parse --verify "${integration_ref}^{commit}"} ref_commit] ||
+        [string trim $ref_commit] ne $integration_commit ||
+        [catch {exec {*}$git_prefix hash-object -- $controller_source} source_blob] ||
+        [string trim $source_blob] ne $expected_blob ||
+        [catch {exec {*}$git_prefix rev-parse "${integration_commit}:${controller_path}"} commit_blob] ||
+        [string trim $commit_blob] ne $expected_blob ||
+        [catch {exec {*}$git_prefix ls-tree $integration_commit -- $controller_path} tree_entry] ||
+        [string trim $tree_entry] ne "100755 blob ${expected_blob}\t${controller_path}"} {
+        fail "controller-verifier-git-identity" 66
+    }
+}
+
+proc execute_controller_package_verifier {values manifest_sha} {
+    set package [dict get $values local_package_dir]
+    set controller "${package}/controller.sh"
+    set manifest "${package}/package-manifest.v1"
+    if {[catch {file lstat $package package_stat}]} {
+        fail "controller-package-verifier-shape" 66
+    }
+    set expected_marker "B82_V6_CONTROLLER_PACKAGE_VERIFIED manifest_sha256=$manifest_sha integration_commit=[dict get $values integration_commit] package_device_inode=$package_stat(dev):$package_stat(ino) credential_read=0 network_operations=0"
+    set verifier_argv [list /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+        /bin/bash $controller verify-package \
+        --manifest $manifest --manifest-sha256 $manifest_sha \
+        --credential-path /Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82 \
+        --approved-plan-sha256 none]
+    if {[catch {exec {*}$verifier_argv 2>@1} verifier_output]} {
+        fail "controller-package-verifier" 66
+    }
+    set normalized [output_value $verifier_output]
+    set lines [split $normalized "\n"]
+    if {[exact_line_count $lines $expected_marker] != 1 ||
+        [lindex $lines end] ne $expected_marker} {
+        fail "controller-package-verifier-marker" 66
+    }
+    puts "B82_V6_TRANSPORT_PACKAGE_AUTHORITY manifest_sha256=$manifest_sha integration_commit=[dict get $values integration_commit] package_device_inode=$package_stat(dev):$package_stat(ino) verifier=controller-read-only"
+}
+
+proc require_transaction_local_authority {values manifest_sha operation approved_sha} {
+    require_controller_verifier_authority $values
+    execute_controller_package_verifier $values $manifest_sha
+    if {$operation eq "realnic-run" &&
+        [catch {build_operation $values $manifest_sha scp-realnic-approved-plan \
+            $approved_sha} approved_plan_spec]} {
+        fail "realnic-approved-plan-local" 66
+    }
+}
+
+proc execute_operation_spec {operation operation_spec password} {
+    lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds
+    puts "B82_V6_TRANSPORT_EXECUTE operation=$operation transport=$transport_type credential_in_argv=0 channel=execute"
+    puts "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
+    log_user 0
+    spawn -noecho {*}$spawn_argv
+    set child_id $spawn_id
+    set timeout $timeout_seconds
+    set captured_output ""
+    set credential_sends 0
+    set credential_pattern {(?i)(?:password|passphrase)[^:\r\n]*:[ \t]*$}
+    expect {
+        -i $child_id
+        -re $credential_pattern {
+            incr credential_sends
+            if {$credential_sends > $prompt_limit} {
+                set password ""
+                fail "credential-prompt-count" 77
+            }
+            send -i $child_id -- "$password\r"
+            exp_continue
+        }
+        -re {[^\r\n]*(?:\r\n|\n|\r)} {
+            append captured_output $expect_out(buffer)
+            emit_safe $expect_out(buffer) $password
+            exp_continue
+        }
+        timeout {
+            set password ""
+            fail "timeout" 124
+        }
+        eof {
+            if {[info exists expect_out(buffer)] && $expect_out(buffer) ne ""} {
+                append captured_output $expect_out(buffer)
+                emit_safe $expect_out(buffer) $password
+            }
+            if {[catch {wait -i $child_id} wait_status] ||
+                [catch {clean_child_exit_status $wait_status} child_rc]} {
+                set password ""
+                fail "child-wait-status" 78
+            }
+            if {$child_rc != 0} {
+                set password ""
+                if {$assertion in {provision-check provision-apply}} {
+                    puts "B82_V6_PROVISION_AUDIT operation=$assertion child_rc=$child_rc plan=unverified missing_set=unverified next_state=STOP"
+                }
+                return [list child-failure $child_rc $captured_output none]
+            }
+            set policy_result none
+            if {$assertion eq "provision-check"} {
+                if {[catch {provision_plan_policy $captured_output check} policy_result]} {
+                    puts "B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=rejected missing_set=unexpected next_state=STOP policy=$policy_result"
+                    fail "output-assertion" 78
+                }
+                set next_state [expr {$policy_result eq "none" ? "POSTFLIGHT" : "AWAIT_APPLY"}]
+                puts "B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=valid missing_set=$policy_result next_state=$next_state"
+            } elseif {$assertion eq "provision-apply"} {
+                if {[catch {provision_plan_policy $captured_output apply} policy_result]} {
+                    puts "B82_V6_PROVISION_AUDIT operation=provision-apply child_rc=0 plan=rejected missing_set=unexpected next_state=STOP policy=$policy_result"
+                    fail "output-assertion" 78
+                }
+                puts "B82_V6_PROVISION_AUDIT operation=provision-apply child_rc=0 plan=valid missing_set=$policy_result next_state=POSTFLIGHT"
+            } elseif {[catch {assert_output $assertion $captured_output} assertion_message]} {
+                fail "output-assertion" 78
+            }
+            set password ""
+            return [list ok 0 $captured_output $policy_result]
+        }
+    }
+}
+
+proc execute_primitive {values manifest_sha operation approved_sha password} {
+    require_manifest_authority $values $manifest_sha
+    if {[catch {build_operation $values $manifest_sha $operation $approved_sha} operation_spec]} {
+        fail "policy" 66
+    }
+    return [execute_operation_spec $operation $operation_spec $password]
+}
+
+proc require_primitive_success {result} {
+    if {[lindex $result 0] ne "ok"} {
+        exit [lindex $result 1]
+    }
+    return $result
+}
+
+proc transaction_step {values manifest_sha operation approved_sha password} {
+    set result [execute_primitive $values $manifest_sha $operation $approved_sha $password]
+    require_primitive_success $result
+    puts "B82_V6_TRANSPORT_TRANSACTION_STEP operation=$operation rc=0"
+    return $result
+}
+
+proc execute_stale_transaction_gate {values manifest_sha password} {
+    set operations [prepare_stale_operations]
+    set total [llength $operations]
+    set ordinal 0
+    foreach operation $operations {
+        incr ordinal
+        set result [execute_primitive $values $manifest_sha $operation none $password]
+        set id [string range $operation 6 end]
+        if {[lindex $result 0] ne "ok"} {
+            set rc [lindex $result 1]
+            puts [format "B82_V6_STALE_ITEM_V1 ordinal=%02d id=%s class=STOP writes=0 cleanup=0 rc=%d" $ordinal $id $rc]
+            puts "B82_V6_STALE_SUMMARY_V1 profile=prepare-new items=$total checked=$ordinal absent=[expr {$ordinal - 1}] writes=0 cleanup=0 result=STOP rc=$rc"
+            exit $rc
+        }
+        puts [format "B82_V6_STALE_ITEM_V1 ordinal=%02d id=%s class=ABSENT writes=0 cleanup=0 rc=0" $ordinal $id]
+    }
+    puts "B82_V6_STALE_SUMMARY_V1 profile=prepare-new items=$total checked=$total absent=$total writes=0 cleanup=0 result=PASS rc=0"
+}
+
+proc verify_remote_package_transaction {values manifest_sha password} {
+    foreach name [package_names] {
+        transaction_step $values $manifest_sha "verify-sha-$name" none $password
+        transaction_step $values $manifest_sha "verify-stat-$name" none $password
+    }
+}
+
+proc verify_provisioner_transaction {values manifest_sha password} {
+    foreach operation [provisioner_verify_operations] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+}
+
+proc execute_postflight_transaction {values manifest_sha password} {
+    verify_remote_package_transaction $values $manifest_sha $password
+    foreach operation [concat [postflight_operations] {
+        controller-shellcheck hermetic-matrix hermetic-fresh
+    }] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    foreach operation [stager_verify_operations] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    foreach operation [stage_operations] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    puts "B82_V6_CONTROLLER_POSTFLIGHT_COMPLETE state=POSTFLIGHT"
+}
+
+proc execute_prepare_transaction {values manifest_sha password} {
+    foreach operation [base_identity_operations] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    execute_stale_transaction_gate $values $manifest_sha $password
+    transaction_step $values $manifest_sha package-parent-stat none $password
+    transaction_step $values $manifest_sha package-mkdir none $password
+    foreach name [package_names] {
+        transaction_step $values $manifest_sha "scp-$name" none $password
+        transaction_step $values $manifest_sha "verify-sha-$name" none $password
+        transaction_step $values $manifest_sha "verify-stat-$name" none $password
+    }
+    foreach operation [bootstrap_create_operations] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    puts "B82_V6_CONTROLLER_STATE from=PACKAGE_BOUND to=BOOTSTRAP_ONLY automatic_apply=0"
+    verify_provisioner_transaction $values $manifest_sha $password
+    puts "B82_V6_CONTROLLER_STATE from=BOOTSTRAP_ONLY to=PROVISION_CHECK automatic_apply=0"
+    set result [transaction_step $values $manifest_sha provision-check none $password]
+    set missing [lindex $result 3]
+    if {$missing eq "none"} {
+        puts "B82_V6_CONTROLLER_STATE from=PROVISION_CHECK to=POSTFLIGHT automatic_apply=0"
+        execute_postflight_transaction $values $manifest_sha $password
+        return POSTFLIGHT
+    }
+    if {$missing ni {initial iperf3}} { fail "provision-state" 78 }
+    puts "B82_V6_CONTROLLER_STATE from=PROVISION_CHECK to=AWAIT_APPLY automatic_apply=0"
+    puts "B82_V6_PROVISION_AWAIT_APPLY missing_set=$missing explicit_mode=provision-apply automatic_apply=0"
+    return AWAIT_APPLY
+}
+
+proc execute_provision_apply_transaction {values manifest_sha password} {
+    foreach operation [concat [base_identity_operations] [bootstrap_verify_operations]] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    verify_remote_package_transaction $values $manifest_sha $password
+    verify_provisioner_transaction $values $manifest_sha $password
+    puts "B82_V6_CONTROLLER_STATE from=BOOTSTRAP_ONLY to=PROVISION_CHECK automatic_apply=0"
+    set result [transaction_step $values $manifest_sha provision-check none $password]
+    set missing [lindex $result 3]
+    if {$missing eq "none"} {
+        puts "B82_V6_CONTROLLER_STATE from=PROVISION_CHECK to=POSTFLIGHT automatic_apply=0"
+        execute_postflight_transaction $values $manifest_sha $password
+        return POSTFLIGHT
+    }
+    if {$missing ni {initial iperf3}} { fail "provision-state" 78 }
+    puts "B82_V6_CONTROLLER_STATE from=PROVISION_CHECK to=AWAIT_APPLY automatic_apply=0"
+    puts "B82_V6_CONTROLLER_STATE from=AWAIT_APPLY to=PROVISION_APPLY automatic_apply=0"
+    verify_provisioner_transaction $values $manifest_sha $password
+    set apply_result [transaction_step $values $manifest_sha provision-apply none $password]
+    if {[lindex $apply_result 3] ne $missing} { fail "provision-apply-state" 78 }
+    verify_provisioner_transaction $values $manifest_sha $password
+    set post_result [transaction_step $values $manifest_sha provision-check none $password]
+    if {[lindex $post_result 3] ne "none"} { fail "provision-postcheck" 78 }
+    puts "B82_V6_CONTROLLER_STATE from=PROVISION_APPLY to=POSTFLIGHT automatic_apply=0"
+    execute_postflight_transaction $values $manifest_sha $password
+    return POSTFLIGHT
+}
+
+proc execute_transaction {values manifest_sha operation approved_sha password} {
+    puts "B82_V6_TRANSPORT_TRANSACTION_START operation=$operation sequence=fixed caller_argv=forbidden"
+    switch -- $operation {
+        prepare {
+            set result [execute_prepare_transaction $values $manifest_sha $password]
+        }
+        provision-apply {
+            set result [execute_provision_apply_transaction $values $manifest_sha $password]
+        }
+        fresh-run - fresh-restore - veth-run - veth-restore -
+        routed-run - routed-restore {
+            transaction_step $values $manifest_sha $operation none $password
+            set result COMPLETE
+        }
+        realnic-run {
+            foreach primitive {
+                scp-realnic-approved-plan verify-sha-realnic-approved-plan
+                verify-stat-realnic-approved-plan stage-realnic-plan-snapshot realnic-run
+            } {
+                transaction_step $values $manifest_sha $primitive $approved_sha $password
+            }
+            set result COMPLETE
+        }
+        realnic-restore {
+            foreach primitive {stage-realnic-plan-verify realnic-restore} {
+                transaction_step $values $manifest_sha $primitive $approved_sha $password
+            }
+            set result COMPLETE
+        }
+        default { fail "transaction-operation" 65 }
+    }
+    puts "B82_V6_TRANSPORT_TRANSACTION_COMPLETE operation=$operation result=$result"
 }
 
 proc transport_main {arguments} {
@@ -1287,7 +1754,8 @@ proc transport_main {arguments} {
         fail "argument-values" 65
     }
     if {($action eq "capture" && $operation ne "realnic-plan") ||
-        ($action eq "execute" && $operation eq "realnic-plan")} {
+        ($action eq "execute" && ![transaction_operation $operation] &&
+         ![read_only_operation $operation])} {
         fail "action-operation" 65
     }
     set sha_is_valid [expr {
@@ -1317,12 +1785,11 @@ proc transport_main {arguments} {
         $manifest_stat(gid) != $package_stat(gid)} {
         fail "local-package-owner" 66
     }
-    if {[catch {build_operation $values $manifest_sha $operation $approved_sha} operation_spec]} {
-        fail "policy" 66
-    }
-    lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds
-
     if {$action eq "plan"} {
+        if {[catch {build_operation $values $manifest_sha $operation $approved_sha} operation_spec]} {
+            fail "policy" 66
+        }
+        lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds
         puts "B82_V6_TRANSPORT_PLAN operation=$operation transport=$transport_type credential_read=0 network_operations=0"
         puts "EXPECT_PROGRAM [info nameofexecutable] SCRIPT $::TRANSPORT_SCRIPT_PATH"
         puts "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
@@ -1330,40 +1797,20 @@ proc transport_main {arguments} {
         exit 0
     }
 
-    set password ""
     if {$action eq "capture"} {
+        if {[catch {build_operation $values $manifest_sha $operation $approved_sha} operation_spec]} {
+            fail "policy" 66
+        }
+        lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds
+        set password ""
         if {[catch {read_capture_credential $credential_path} password]} {
             set password ""
             fail "credential-value" 65
         }
-    } else {
-        if {[catch {open $credential_path r} credential_file]} {
-            fail "credential-open" 65
-        }
-        fconfigure $credential_file -encoding utf-8 -translation lf
-        if {[gets $credential_file ssh_line] < 0 || [gets $credential_file password] < 0 ||
-            [gets $credential_file unexpected] >= 0} {
-            close $credential_file
-            set password ""
-            fail "credential-shape" 65
-        }
-        close $credential_file
-        set ssh_parts [split [string trim $ssh_line]]
-        set ssh_line ""
-        if {$ssh_parts ne [list ssh siyixuan@192.168.10.82] || $password eq "" ||
-            [string first "\u0000" $password] >= 0 || [string first "\r" $password] >= 0 ||
-            [string first "\n" $password] >= 0} {
-            set password ""
-            fail "credential-value" 65
-        }
-    }
-
-    set audit_channel [expr {$action eq "capture" ? "stderr" : "stdout"}]
-    puts $audit_channel "B82_V6_TRANSPORT_EXECUTE operation=$operation transport=$transport_type credential_in_argv=0 channel=$action"
-    puts $audit_channel "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
-    log_user 0
-    spawn -noecho {*}$spawn_argv
-    if {$action eq "capture"} {
+        puts stderr "B82_V6_TRANSPORT_EXECUTE operation=$operation transport=$transport_type credential_in_argv=0 channel=capture"
+        puts stderr "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
+        log_user 0
+        spawn -noecho {*}$spawn_argv
         set child_id $spawn_id
         if {[catch {capture_child_payload $child_id $password $prompt_limit \
             $timeout_seconds} capture_result]} {
@@ -1378,70 +1825,17 @@ proc transport_main {arguments} {
         flush stdout
         exit 0
     }
-
-    set timeout $timeout_seconds
-    set captured_output ""
-    set credential_sends 0
-    set credential_pattern {(?i)(?:password|passphrase)[^:\r\n]*:[ \t]*$}
-    expect {
-        -re $credential_pattern {
-            incr credential_sends
-            if {$credential_sends > $prompt_limit} {
-                set password ""
-                fail "credential-prompt-count" 77
-            }
-            send -- "$password\r"
-            exp_continue
-        }
-        -re {[^\r\n]*(?:\r\n|\n|\r)} {
-            append captured_output $expect_out(buffer)
-            emit_safe $expect_out(buffer) $password
-            exp_continue
-        }
-        timeout {
-            set password ""
-            fail "timeout" 124
-        }
-        eof {
-            if {[info exists expect_out(buffer)] && $expect_out(buffer) ne ""} {
-                append captured_output $expect_out(buffer)
-                emit_safe $expect_out(buffer) $password
-            }
-            if {[catch {wait -i $spawn_id} wait_status]} {
-                set password ""
-                fail "child-wait-status" 78
-            }
-            if {[catch {clean_child_exit_status $wait_status} child_rc]} {
-                set password ""
-                fail "child-wait-status" 78
-            }
-            if {$child_rc != 0} {
-                set password ""
-                if {$assertion in {provision-check provision-apply}} {
-                    puts "B82_V6_PROVISION_AUDIT operation=$assertion child_rc=$child_rc plan=unverified missing_set=unverified next_state=STOP"
-                }
-                exit $child_rc
-            }
-            set password ""
-            if {$assertion eq "provision-check"} {
-                if {[catch {provision_plan_policy $captured_output check} missing_class]} {
-                    puts "B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=rejected missing_set=unexpected next_state=STOP policy=$missing_class"
-                    fail "output-assertion" 78
-                }
-                set next_state [expr {$missing_class eq "none" ? "POSTFLIGHT" : "AWAIT_APPLY"}]
-                puts "B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=valid missing_set=$missing_class next_state=$next_state"
-            } elseif {$assertion eq "provision-apply"} {
-                if {[catch {provision_plan_policy $captured_output apply} missing_class]} {
-                    puts "B82_V6_PROVISION_AUDIT operation=provision-apply child_rc=0 plan=rejected missing_set=unexpected next_state=STOP policy=$missing_class"
-                    fail "output-assertion" 78
-                }
-                puts "B82_V6_PROVISION_AUDIT operation=provision-apply child_rc=0 plan=valid missing_set=$missing_class next_state=POSTFLIGHT"
-            } elseif {[catch {assert_output $assertion $captured_output} assertion_message]} {
-                fail "output-assertion" 78
-            }
-            exit 0
-        }
+    if {[transaction_operation $operation]} {
+        require_transaction_local_authority $values $manifest_sha $operation $approved_sha
     }
+    set password [read_execute_credential $credential_path]
+    if {[transaction_operation $operation]} {
+        execute_transaction $values $manifest_sha $operation $approved_sha $password
+    } else {
+        require_primitive_success [execute_primitive $values $manifest_sha $operation $approved_sha $password]
+    }
+    set password ""
+    exit 0
 }
 
 if {[info exists argv0] && [file normalize $argv0] eq $::TRANSPORT_SCRIPT_PATH} {

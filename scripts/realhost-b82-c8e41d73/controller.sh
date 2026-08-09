@@ -119,8 +119,6 @@ TEST_HERMETIC_ROUTED_VETH_HARNESS_SH_SHA256=''
 TEST_ROUTED_VETH_HARNESS_STATIC_PY_PATH=''
 TEST_ROUTED_VETH_HARNESS_STATIC_PY_BLOB=''
 TEST_ROUTED_VETH_HARNESS_STATIC_PY_SHA256=''
-PROVISION_RESULT=''
-
 fail() {
   printf 'B82_V6_CONTROLLER_STOP mode=%s reason=%s rc=%s; no automatic cleanup\n' \
     "${MODE:-unparsed}" "$1" "${2:-125}" >&2
@@ -129,7 +127,7 @@ fail() {
 
 usage() {
   printf '%s\n' \
-    "usage: $0 {plan|preflight|prepare|provision-apply|fresh-plan|fresh-run|fresh-restore|veth-plan|veth-run|veth-restore|routed-plan|routed-run|routed-restore|realnic-plan|realnic-run|realnic-restore}" \
+    "usage: $0 {verify-package|plan|preflight|prepare|provision-apply|fresh-plan|fresh-run|fresh-restore|veth-plan|veth-run|veth-restore|routed-plan|routed-run|routed-restore|realnic-plan|realnic-run|realnic-restore}" \
     '  --manifest ABSOLUTE_PACKAGE_MANIFEST --manifest-sha256 64-lowercase-hex' \
     "  --credential-path ${CREDENTIAL_PATH}" \
     '  --approved-plan-sha256 {none|64-lowercase-hex}' >&2
@@ -161,6 +159,14 @@ sha256_stream() {
   line="${line%% *}"
   [[ "${line}" =~ ^[0-9a-f]{64}$ ]] || return 65
   printf '%s\n' "${line}"
+}
+
+path_device_inode() {
+  if [[ "$(/usr/bin/uname -s)" == 'Darwin' ]]; then
+    /usr/bin/stat -f '%d:%i' -- "$1"
+  else
+    /usr/bin/stat -Lc '%d:%i' -- "$1"
+  fi
 }
 
 valid_sha256() {
@@ -198,7 +204,7 @@ parse_arguments() {
   MODE="$1"
   shift
   case "${MODE}" in
-    plan | preflight | prepare | provision-apply | \
+    verify-package | plan | preflight | prepare | provision-apply | \
       fresh-plan | fresh-run | fresh-restore | \
       veth-plan | veth-run | veth-restore | routed-plan | routed-run | routed-restore | \
       realnic-plan | realnic-run | realnic-restore) ;;
@@ -252,9 +258,34 @@ read_manifest_field() {
   printf -v "${destination}" '%s' "${value}"
 }
 
+require_manifest_fd_without_nul() {
+  /usr/bin/python3 -B -I -c '
+import os
+import sys
+
+try:
+    descriptor = int(sys.argv[1])
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 65536, offset)
+        if not chunk:
+            raise SystemExit(0)
+        if b"\0" in chunk:
+            raise SystemExit(65)
+        offset += len(chunk)
+except (OSError, ValueError):
+    raise SystemExit(66)
+' "$1"
+}
+
 load_manifest() {
-  local unexpected=''
+  local unexpected='' rc
   exec 3<"${MANIFEST}" || return 66
+  require_manifest_fd_without_nul 3 || {
+    rc=$?
+    exec 3<&-
+    return "${rc}"
+  }
   read_manifest_field format FORMAT &&
     read_manifest_field run_id MANIFEST_RUN_ID &&
     read_manifest_field package_id MANIFEST_PACKAGE_ID &&
@@ -778,141 +809,17 @@ execute_preflight() {
   run_prepare_new_stale_gate execute
 }
 
-verify_remote_package() {
-  local name
-  for name in "${PACKAGE_NAMES[@]}"; do
-    run_operation execute "verify-sha-${name}" || return $?
-    run_operation execute "verify-stat-${name}" || return $?
-  done
-}
-
-verify_provisioner() {
-  local operation
-  for operation in "${PROVISIONER_VERIFY_OPERATIONS[@]}"; do
-    run_operation execute "${operation}" || return $?
-  done
-}
-
-verify_stager() {
-  local operation
-  for operation in "${STAGER_VERIFY_OPERATIONS[@]}"; do
-    run_operation execute "${operation}" || return $?
-  done
-}
-
-run_provision_check() {
-  local output rc started finished marker
-  PROVISION_RESULT=''
-  started="$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" || return 70
-  printf 'B82_V6_CONTROLLER_EVENT utc=%s event=start mode=%s operation=provision-check target=%s\n' \
-    "${started}" "${MODE}" "${TARGET_HOST}"
-  output="$(transport execute provision-check 2>&1)"
-  rc=$?
-  printf '%s\n' "${output}"
-  finished="$(/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" || return 70
-  printf 'B82_V6_CONTROLLER_EVENT utc=%s event=finish mode=%s operation=provision-check target=%s rc=%s\n' \
-    "${finished}" "${MODE}" "${TARGET_HOST}" "${rc}"
-  ((rc == 0)) || return "${rc}"
-  marker="$(printf '%s\n' "${output}" | /usr/bin/awk '
-    /^B82_V6_PROVISION_AUDIT operation=provision-check child_rc=0 plan=valid missing_set=(none|initial|iperf3) next_state=(POSTFLIGHT|AWAIT_APPLY)$/ {
-      if (++seen > 1) exit 65
-      value = $0
-    }
-    END { if (seen != 1) exit 65; print value }
-  ')" || return 78
-  case "${marker}" in
-    *' missing_set=none next_state=POSTFLIGHT') PROVISION_RESULT='none' ;;
-    *' missing_set=initial next_state=AWAIT_APPLY') PROVISION_RESULT='initial' ;;
-    *' missing_set=iperf3 next_state=AWAIT_APPLY') PROVISION_RESULT='iperf3' ;;
-    *) return 78 ;;
-  esac
-}
-
-execute_postflight() {
-  local operation
-  verify_remote_package || return $?
-  for operation in "${POSTFLIGHT_OPERATIONS[@]}" controller-shellcheck hermetic-matrix hermetic-fresh; do
-    run_operation execute "${operation}" || return $?
-  done
-  verify_stager || return $?
-  for operation in "${STAGE_OPERATIONS[@]}"; do
-    run_operation execute "${operation}" || return $?
-  done
-  printf 'B82_V6_CONTROLLER_POSTFLIGHT_COMPLETE state=POSTFLIGHT\n'
-}
-
 execute_prepare() {
-  local operation name
-  for operation in "${BASE_IDENTITY_OPERATIONS[@]}"; do
-    run_operation execute "${operation}" || return $?
-  done
-  run_prepare_new_stale_gate execute || return $?
-  run_operation execute package-parent-stat || return $?
-  run_operation execute package-mkdir || return $?
-  for name in "${PACKAGE_NAMES[@]}"; do
-    run_operation execute "scp-${name}" || return $?
-    run_operation execute "verify-sha-${name}" || return $?
-    run_operation execute "verify-stat-${name}" || return $?
-  done
-  for operation in "${BOOTSTRAP_CREATE_OPERATIONS[@]}"; do
-    run_operation execute "${operation}" || return $?
-  done
-  state_transition PACKAGE_BOUND BOOTSTRAP_ONLY
-  verify_provisioner || return $?
-  state_transition BOOTSTRAP_ONLY PROVISION_CHECK
-  run_provision_check || return $?
-  case "${PROVISION_RESULT}" in
-    none)
-      state_transition PROVISION_CHECK POSTFLIGHT
-      execute_postflight
-      ;;
-    initial | iperf3)
-      state_transition PROVISION_CHECK AWAIT_APPLY
-      printf 'B82_V6_PROVISION_AWAIT_APPLY missing_set=%s explicit_mode=provision-apply automatic_apply=0\n' \
-        "${PROVISION_RESULT}"
-      ;;
-    *) return 78 ;;
-  esac
+  run_operation execute prepare
 }
 
 execute_provision_apply() {
-  local operation expected_missing
-  for operation in "${BASE_IDENTITY_OPERATIONS[@]}" "${BOOTSTRAP_ROOT_VERIFY_OPERATIONS[@]}"; do
-    run_operation execute "${operation}" || return $?
-  done
-  verify_remote_package || return $?
-  verify_provisioner || return $?
-  state_transition BOOTSTRAP_ONLY PROVISION_CHECK
-  run_provision_check || return $?
-  if [[ "${PROVISION_RESULT}" == 'none' ]]; then
-    state_transition PROVISION_CHECK POSTFLIGHT
-    execute_postflight
-    return $?
-  fi
-  [[ "${PROVISION_RESULT}" == 'initial' || "${PROVISION_RESULT}" == 'iperf3' ]] || return 78
-  expected_missing="${PROVISION_RESULT}"
-  state_transition PROVISION_CHECK AWAIT_APPLY
-  state_transition AWAIT_APPLY PROVISION_APPLY
-  verify_provisioner || return $?
-  run_operation execute provision-apply || return $?
-  verify_provisioner || return $?
-  run_provision_check || return $?
-  [[ "${PROVISION_RESULT}" == 'none' ]] || {
-    printf 'B82_V6_PROVISION_POSTCHECK_STOP expected_before=%s actual_after=%s\n' \
-      "${expected_missing}" "${PROVISION_RESULT}" >&2
-    return 78
-  }
-  state_transition PROVISION_APPLY POSTFLIGHT
-  execute_postflight
+  run_operation execute provision-apply
 }
 
 execute_realnic_run() {
-  local operation
   verify_local_approved_plan || return $?
-  for operation in scp-realnic-approved-plan verify-sha-realnic-approved-plan \
-    verify-stat-realnic-approved-plan stage-realnic-plan-snapshot realnic-run; do
-    run_operation execute "${operation}" || return $?
-  done
+  run_operation execute realnic-run
 }
 
 execute_realnic_plan_capture() {
@@ -937,11 +844,11 @@ execute_realnic_plan_capture() {
 }
 
 execute_realnic_restore() {
-  run_operation execute stage-realnic-plan-verify || return $?
   run_operation execute realnic-restore
 }
 
 main() {
+  local package_device_inode
   parse_arguments "$@" || fail 'arguments' $?
   verify_manifest_contract || fail 'manifest-contract' $?
   derive_approved_plan_path || fail 'approved-plan-binding' $?
@@ -951,6 +858,12 @@ main() {
       ;;
   esac
   case "${MODE}" in
+    verify-package)
+      package_device_inode="$(path_device_inode "${LOCAL_PACKAGE_DIR}")" ||
+        fail 'package-device-inode' $?
+      printf 'B82_V6_CONTROLLER_PACKAGE_VERIFIED manifest_sha256=%s integration_commit=%s package_device_inode=%s credential_read=0 network_operations=0\n' \
+        "${MANIFEST_SHA256}" "${INTEGRATION_COMMIT}" "${package_device_inode}"
+      ;;
     plan) plan_all || fail 'plan-operation' $? ;;
     preflight) execute_preflight || fail 'preflight-operation' $? ;;
     prepare) execute_prepare || fail 'prepare-operation' $? ;;
