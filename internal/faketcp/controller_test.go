@@ -135,6 +135,48 @@ func TestControllerHandshakeSendsControlAndReinjectsFirstPacketOnce(t *testing.T
 	}
 }
 
+func TestControllerCapturedOutboundRetriesPendingDeleteBeforeLookup(t *testing.T) {
+	failure := errors.New("exact delete failed after claim")
+	store := newModelClaimSessionStore(t, modelClaimDeleteFailure{err: failure})
+	engine, clock, flow, _ := establishedModelClaimTestEngine(t, store)
+	clock.Add(engine.opts.IdleTimeout)
+	if actions, err := engine.Tick(); !errors.Is(err, failure) ||
+		len(actions) != 1 || actions[0].Reason != "session-store-unavailable" {
+		t.Fatalf("initial claim actions=%#v err=%v", actions, err)
+	}
+	lookupsBefore, deletesBefore := store.counts()
+
+	backend := &fakeControllerBackend{}
+	controller, err := NewController(engine, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := testIPv4UDPPacket(t, flow, []byte{1, 2, 3, 4})
+	event := abi.FakeTCPEvent{
+		Key: flow, Type: abi.FakeTCPEventNeedHandshake,
+		PacketLength: uint16(len(packet)), PayloadLength: 4, WGID: 77,
+	}
+	bindTestEvent(&event, engine.Identity(), 2)
+	actions, err := controller.HandleSample(
+		context.Background(),
+		testEventSample(event, packet, false),
+	)
+	if err != nil || len(actions) != 1 ||
+		actions[0].Kind != ActionClose || actions[0].Reason != "idle-timeout" {
+		t.Fatalf("captured retry actions=%#v err=%v", actions, err)
+	}
+	lookupsAfter, deletesAfter := store.counts()
+	if lookupsAfter != lookupsBefore || deletesAfter != deletesBefore+1 {
+		t.Fatalf("captured retry lookups=%d/%d deletes=%d/%d",
+			lookupsAfter, lookupsBefore, deletesAfter, deletesBefore+1)
+	}
+	if engine.sessions[flow] != nil || len(backend.packets) != 0 ||
+		len(backend.sent) != 0 || len(backend.operations) != 0 {
+		t.Fatalf("captured packet escaped drop or slow state survived: session=%#v backend=%#v",
+			engine.sessions[flow], backend)
+	}
+}
+
 func TestDecodeEventSampleRejectsUnversionedOrAmbiguousIdentity(t *testing.T) {
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1})

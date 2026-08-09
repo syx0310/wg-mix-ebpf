@@ -10,7 +10,16 @@
 #define FAKETCP_STATE_SYN_SENT    1
 #define FAKETCP_STATE_SYN_RECV    2
 #define FAKETCP_STATE_ESTABLISHED 3
-#define FAKETCP_STATE_CLOSING     4
+#define FAKETCP_STATE_DELETE_CLAIMED 4
+
+#define FAKETCP_CLAIM_MALFORMED 0
+#define FAKETCP_CLAIM_ABSENT    1
+#define FAKETCP_CLAIM_DIFFERENT 2
+#define FAKETCP_CLAIMED         3
+
+#define FAKETCP_SESSION_MUTATE_TX    1
+#define FAKETCP_SESSION_MUTATE_RX    2
+#define FAKETCP_SESSION_MUTATE_TOUCH 3
 
 #define FAKETCP_EVENT_NEED_HANDSHAKE 1
 #define FAKETCP_EVENT_SYN            2
@@ -137,12 +146,57 @@ struct faketcp_session_value {
 	__u8 state;
 	__u8 flags;
 	__u8 pad[4];
+	// This lock is deliberately embedded in each hash value: unrelated
+	// sessions never share a serialisation point. Every packet-path read which
+	// admits work, every mutable writer, and the userspace-triggered delete
+	// claim use this exact lock.
+	struct bpf_spin_lock lock;
+	__u32 kernel_reserved;
+	__u64 revision;
+	__u64 session_id;
+	__u8 runtime_incarnation[16];
+};
+
+// A claim request has the exact userspace value layout, but represents the
+// kernel lock as an ordinary zero word: struct bpf_spin_lock is forbidden on
+// the BPF stack. All other bytes participate in the comparison.
+struct faketcp_session_expected_value {
+	__u64 generation;
+	__u64 last_seen_nanos;
+	__u32 tx_sequence;
+	__u32 rx_sequence;
+	__u32 local_isn;
+	__u32 remote_isn;
+	__u16 window;
+	__u8 state;
+	__u8 flags;
+	__u8 pad[4];
+	__u32 kernel_lock;
+	__u32 kernel_reserved;
+	__u64 revision;
+	__u64 session_id;
+	__u8 runtime_incarnation[16];
+};
+
+struct faketcp_session_claim_request {
+	struct faketcp_session_key key;
+	struct faketcp_session_expected_value expected;
+};
+
+struct faketcp_session_mutation_result {
+	__u32 sequence;
+	__u32 acknowledgement;
+	__u16 window;
 };
 
 _Static_assert(sizeof(struct faketcp_session_key) == 24,
 	       "faketcp session key ABI drift");
-_Static_assert(sizeof(struct faketcp_session_value) == 40,
+_Static_assert(sizeof(struct faketcp_session_value) == 80,
 	       "faketcp session value ABI drift");
+_Static_assert(sizeof(struct faketcp_session_expected_value) == 80,
+	       "faketcp expected session value ABI drift");
+_Static_assert(sizeof(struct faketcp_session_claim_request) == 104,
+	       "faketcp session claim request ABI drift");
 
 struct faketcp_event {
 	struct faketcp_session_key key;
@@ -290,6 +344,165 @@ struct {
 	__type(key, struct faketcp_session_key);
 	__type(value, struct faketcp_session_value);
 } faketcp_session_map SEC(".maps");
+
+static __always_inline int faketcp_nonzero_incarnation(const __u8 incarnation[16])
+{
+	__u8 aggregate = 0;
+
+#pragma unroll
+	for (int i = 0; i < 16; i++)
+		aggregate |= incarnation[i];
+	return aggregate != 0;
+}
+
+static __always_inline int faketcp_session_metadata_valid_locked(
+	const struct faketcp_session_value *session, __u64 generation)
+{
+	__u8 pad = 0;
+
+#pragma unroll
+	for (int i = 0; i < 4; i++)
+		pad |= session->pad[i];
+	return session->generation == generation &&
+	       session->state == FAKETCP_STATE_ESTABLISHED &&
+	       session->flags == 0 && pad == 0 &&
+	       session->kernel_reserved == 0 && session->revision != 0 &&
+	       session->session_id != 0 &&
+	       faketcp_nonzero_incarnation(session->runtime_incarnation);
+}
+
+// A successful return is the read-side linearisation point for packet paths:
+// tombstone can only be installed under the same per-value lock. Work admitted
+// here is ordered before a later claim even if checksum/rewrite work completes
+// after the short critical section.
+static __always_inline int faketcp_session_admit_established(
+	struct faketcp_session_value *session, __u64 generation)
+{
+	int admitted;
+
+	bpf_spin_lock(&session->lock);
+	admitted = faketcp_session_metadata_valid_locked(session, generation);
+	bpf_spin_unlock(&session->lock);
+	return admitted;
+}
+
+// Every mutable TC/XDP path converges here. Packet work and time helpers run
+// before this function; the per-session lock covers only state revalidation,
+// the required field update, one revision increment, and the tiny TX snapshot.
+static __always_inline int faketcp_session_mutate(
+	struct faketcp_session_value *session, __u64 generation, __u64 now,
+	__u32 operation, __u32 argument,
+	struct faketcp_session_mutation_result *result)
+{
+	int admitted;
+
+	if (operation < FAKETCP_SESSION_MUTATE_TX ||
+	    operation > FAKETCP_SESSION_MUTATE_TOUCH ||
+	    (operation == FAKETCP_SESSION_MUTATE_TX && !result))
+		return 0;
+	bpf_spin_lock(&session->lock);
+	admitted = faketcp_session_metadata_valid_locked(session, generation) &&
+		   session->revision != ~0ULL;
+	if (admitted) {
+		if (operation == FAKETCP_SESSION_MUTATE_TX) {
+			result->sequence = session->tx_sequence;
+			result->acknowledgement = session->rx_sequence;
+			result->window = session->window;
+			session->tx_sequence += argument;
+		} else if (operation == FAKETCP_SESSION_MUTATE_RX &&
+			   (__s32)(argument - session->rx_sequence) > 0) {
+			session->rx_sequence = argument;
+		}
+		if (now > session->last_seen_nanos)
+			session->last_seen_nanos = now;
+		session->revision++;
+	}
+	bpf_spin_unlock(&session->lock);
+	return admitted;
+}
+
+static __always_inline int faketcp_session_matches_expected_locked(
+	const struct faketcp_session_value *session,
+	const struct faketcp_session_expected_value *expected,
+	int permit_claimed_state)
+{
+	__u8 difference = 0;
+
+	if (session->generation != expected->generation ||
+	    session->last_seen_nanos != expected->last_seen_nanos ||
+	    session->tx_sequence != expected->tx_sequence ||
+	    session->rx_sequence != expected->rx_sequence ||
+	    session->local_isn != expected->local_isn ||
+	    session->remote_isn != expected->remote_isn ||
+	    session->window != expected->window ||
+	    session->flags != expected->flags ||
+	    session->kernel_reserved != expected->kernel_reserved ||
+	    session->revision != expected->revision ||
+	    session->session_id != expected->session_id)
+		return 0;
+	if (session->state != expected->state &&
+	    !(permit_claimed_state &&
+	      session->state == FAKETCP_STATE_DELETE_CLAIMED &&
+	      expected->state == FAKETCP_STATE_ESTABLISHED))
+		return 0;
+#pragma unroll
+	for (int i = 0; i < 4; i++)
+		difference |= session->pad[i] ^ expected->pad[i];
+#pragma unroll
+	for (int i = 0; i < 16; i++)
+		difference |= session->runtime_incarnation[i] ^
+			      expected->runtime_incarnation[i];
+	return difference == 0;
+}
+
+static __always_inline int faketcp_claim_request_valid(
+	const struct faketcp_session_claim_request *request)
+{
+	const struct faketcp_session_expected_value *expected = &request->expected;
+	__u8 pad = 0;
+
+#pragma unroll
+	for (int i = 0; i < 4; i++)
+		pad |= expected->pad[i];
+	return request->key.generation != 0 &&
+	       request->key.generation == expected->generation &&
+	       expected->state == FAKETCP_STATE_ESTABLISHED &&
+	       expected->flags == 0 && pad == 0 && expected->kernel_lock == 0 &&
+	       expected->kernel_reserved == 0 && expected->revision != 0 &&
+	       expected->session_id != 0 &&
+	       faketcp_nonzero_incarnation(expected->runtime_incarnation);
+}
+
+// This program is never attached. Userspace invokes it with BPF_PROG_TEST_RUN
+// after proving from ProgramInfo.MapIDs that its sole map is the exact session
+// map bound to the store. ESTABLISHED -> DELETE_CLAIMED under the per-session
+// lock is the compare-delete linearisation point. Repeating the same complete
+// expected value after a crash between claim and delete is idempotent; a
+// different revision/incarnation/value never inherits that authority.
+SEC("classifier/faketcp_session_claim")
+int wg_faketcp_session_claim(struct __sk_buff *skb)
+{
+	struct faketcp_session_claim_request request = {};
+	struct faketcp_session_value *session;
+	int result = FAKETCP_CLAIM_DIFFERENT;
+
+	if (skb->len != sizeof(request) ||
+	    bpf_skb_load_bytes(skb, 0, &request, sizeof(request)) < 0 ||
+	    !faketcp_claim_request_valid(&request))
+		return FAKETCP_CLAIM_MALFORMED;
+	session = bpf_map_lookup_elem(&faketcp_session_map, &request.key);
+	if (!session)
+		return FAKETCP_CLAIM_ABSENT;
+
+	bpf_spin_lock(&session->lock);
+	if (faketcp_session_matches_expected_locked(session, &request.expected, 1)) {
+		if (session->state == FAKETCP_STATE_ESTABLISHED)
+			session->state = FAKETCP_STATE_DELETE_CLAIMED;
+		result = FAKETCP_CLAIMED;
+	}
+	bpf_spin_unlock(&session->lock);
+	return result;
+}
 
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
@@ -777,8 +990,7 @@ static __always_inline int faketcp_preflight_egress(struct __sk_buff *skb,
 	if (faketcp_tc_key(skb, info, &l3, generation, &key) < 0)
 		return -1;
 	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
-	if (session && session->generation == generation &&
-	    session->state == FAKETCP_STATE_ESTABLISHED) {
+	if (session && faketcp_session_admit_established(session, generation)) {
 		if (faketcp_prepare_udp(skb, info->ip_off, info->udp_off,
 					 info->payload_len + sizeof(struct udphdr),
 					 0) < 0)
@@ -1187,7 +1399,8 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	__u8 head[FAKETCP_HEADER_DELTA] = {};
 	__u16 old_total_len, new_total_len, udp_len;
 	__be32 source_ipv4, destination_ipv4;
-	__u32 seq;
+	__u64 now;
+	struct faketcp_session_mutation_result mutation = {};
 
 	if (rule->transport_mode != TRANSPORT_FAKETCP ||
 	    faketcp_parse_tc_l3(skb, info, &l3) != FAKETCP_L3_OK ||
@@ -1205,16 +1418,12 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		return TC_ACT_SHOT;
 	}
 	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
-	if (!session || session->generation != generation) {
+	if (!session) {
 		// The preflight hook is the only place allowed to emit the handshake request
 		// because it still owns the unmodified first packet. A map eviction in
 		// this narrow post-transform race is a deliberate drop; WireGuard/QUIC
 		// retransmission re-enters preflight with a capturable packet.
 		inc_faketcp_stat(FAKETCP_STAT_SESSION_MISS);
-		return TC_ACT_SHOT;
-	}
-	if (session->state != FAKETCP_STATE_ESTABLISHED) {
-		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 		return TC_ACT_SHOT;
 	}
 	old_udp = *udp;
@@ -1248,16 +1457,25 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 		return TC_ACT_SHOT;
 	}
 
-	seq = __sync_fetch_and_add(&session->tx_sequence, info->payload_len);
-	session->last_seen_nanos = bpf_ktime_get_ns();
+	// No session field is consumed before this call. Helpers and packet rewrite
+	// stay outside the critical section; this single short region both admits
+	// the established value and linearises its update. A delete claim which
+	// wins the same per-session lock drops the rewritten skb before emission.
+	now = bpf_ktime_get_ns();
+	if (!faketcp_session_mutate(session, generation, now,
+				    FAKETCP_SESSION_MUTATE_TX,
+				    info->payload_len, &mutation)) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+		return TC_ACT_SHOT;
+	}
 	tcp.source = old_udp.source;
 	tcp.dest = old_udp.dest;
-	tcp.seq = bpf_htonl(seq);
-	tcp.ack_seq = bpf_htonl(session->rx_sequence);
+	tcp.seq = bpf_htonl(mutation.sequence);
+	tcp.ack_seq = bpf_htonl(mutation.acknowledgement);
 	tcp.doff = 5;
 	tcp.ack = 1;
 	tcp.psh = 1;
-	tcp.window = bpf_htons(session->window ? session->window : 65535);
+	tcp.window = bpf_htons(mutation.window ? mutation.window : 65535);
 	if (faketcp_materialize_tcp_checksum(skb, source_ipv4, destination_ipv4,
 					       &tcp,
 					       info->udp_off + sizeof(tcp),
@@ -1465,6 +1683,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	__u8 parser_mode;
 	__u16 total_len, tcp_len, payload_len, new_total_len;
 	__u32 frame_len, l3_off = 0, seq, next_seq;
+	__u64 now;
 	__u64 generation = 0;
 	__s64 sum;
 	int managed_interface, parse_rc;
@@ -1530,8 +1749,8 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	key.local_port = bpf_ntohs(tcp->dest);
 	key.remote_port = bpf_ntohs(tcp->source);
 	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
-	if (!session || session->generation != generation ||
-	    session->state != FAKETCP_STATE_ESTABLISHED) {
+	if (!session ||
+	    !faketcp_session_admit_established(session, generation)) {
 		faketcp_emit_event(&key, faketcp_event_type(flags), flags, seq,
 				   bpf_ntohl(tcp->ack_seq), payload_len, 0,
 				   listener->wg_id);
@@ -1546,7 +1765,12 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	if (payload_len == 0 && flags == FAKETCP_FLAG_ACK) {
 		// A userspace keepalive has no UDP image. Consume it before GRO and
 		// refresh only the peer session's idle clock.
-		session->last_seen_nanos = bpf_ktime_get_ns();
+		now = bpf_ktime_get_ns();
+		if (!faketcp_session_mutate(session, generation, now,
+					    FAKETCP_SESSION_MUTATE_TOUCH, 0, 0)) {
+			inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+			return XDP_DROP;
+		}
 		return XDP_DROP;
 	}
 	if (!(flags & FAKETCP_FLAG_ACK) || payload_len < FAKETCP_HEADER_DELTA) {
@@ -1623,10 +1847,12 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 		return XDP_DROP;
 
 	next_seq = seq + payload_len;
-	if ((__s32)(next_seq - session->rx_sequence) > 0)
-		__sync_val_compare_and_swap(&session->rx_sequence,
-					    session->rx_sequence, next_seq);
-	session->last_seen_nanos = bpf_ktime_get_ns();
+	now = bpf_ktime_get_ns();
+	if (!faketcp_session_mutate(session, generation, now,
+				    FAKETCP_SESSION_MUTATE_RX, next_seq, 0)) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+		return XDP_DROP;
+	}
 	inc_faketcp_stat(FAKETCP_STAT_INGRESS_OK);
 	return XDP_PASS;
 }

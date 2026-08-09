@@ -24,7 +24,7 @@ var experimentalFakeTCPKfuncNames = [...]string{
 
 func experimentalMapDescriptors() []pinnedMapDescriptor {
 	return []pinnedMapDescriptor{
-		{name: "faketcp_session_map", mapType: ebpf.Hash, keySize: 24, valueSize: 40, maxEntries: 16384},
+		{name: "faketcp_session_map", mapType: ebpf.Hash, keySize: 24, valueSize: 80, maxEntries: 16384},
 		{name: "faketcp_managed_if_map", mapType: ebpf.Hash, keySize: 16, valueSize: 8, maxEntries: 512},
 		{name: "faketcp_managed_port_map", mapType: ebpf.Hash, keySize: 16, valueSize: 16, maxEntries: 2048},
 		{name: "faketcp_control_policy_map", mapType: ebpf.Hash, keySize: 16, valueSize: 32, maxEntries: 512},
@@ -48,6 +48,10 @@ func experimentalProgramDescriptors() []baselineProgramDescriptor {
 		{
 			name: "wg_mix_faketcp_ingress", sectionName: "xdp",
 			programType: ebpf.XDP, attachType: ebpf.AttachXDP, license: experimentalFakeTCPLicense,
+		},
+		{
+			name: "wg_faketcp_session_claim", sectionName: "classifier/faketcp_session_claim",
+			programType: ebpf.SchedCLS, license: experimentalFakeTCPLicense,
 		},
 	}
 }

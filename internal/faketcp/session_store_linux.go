@@ -14,7 +14,7 @@ import (
 type ciliumSessionMapAPI interface {
 	Info() (*ebpf.MapInfo, error)
 	Update(key, value any, flags ebpf.MapUpdateFlags) error
-	Lookup(key, valueOut any) error
+	LookupWithFlags(key, valueOut any, flags ebpf.MapLookupFlags) error
 	Close() error
 }
 
@@ -173,14 +173,14 @@ func (sessionMap *ciliumSessionMap) InsertNoExist(
 	key abi.FakeTCPSessionKey,
 	value abi.FakeTCPSessionValue,
 ) error {
-	return sessionMap.bpfMap.Update(key, value, ebpf.UpdateNoExist)
+	return sessionMap.bpfMap.Update(key, value, ebpf.UpdateNoExist|ebpf.UpdateLock)
 }
 
 func (sessionMap *ciliumSessionMap) Lookup(
 	key abi.FakeTCPSessionKey,
 	value *abi.FakeTCPSessionValue,
 ) error {
-	err := sessionMap.bpfMap.Lookup(key, value)
+	err := sessionMap.bpfMap.LookupWithFlags(key, value, ebpf.LookupLock)
 	if errors.Is(err, ebpf.ErrKeyNotExist) {
 		return fmt.Errorf("%w: %w", errSessionMapKeyNotExist, err)
 	}

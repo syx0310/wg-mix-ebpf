@@ -12,6 +12,7 @@ import (
 
 type fakeCiliumSessionMap struct {
 	updateFlags ebpf.MapUpdateFlags
+	lookupFlags ebpf.MapLookupFlags
 	updateErr   error
 	lookupErr   error
 	lookupValue abi.FakeTCPSessionValue
@@ -34,7 +35,11 @@ func (sessionMap *fakeCiliumSessionMap) Update(
 	return sessionMap.updateErr
 }
 
-func (sessionMap *fakeCiliumSessionMap) Lookup(_, valueOut any) error {
+func (sessionMap *fakeCiliumSessionMap) LookupWithFlags(
+	_, valueOut any,
+	flags ebpf.MapLookupFlags,
+) error {
+	sessionMap.lookupFlags = flags
 	if sessionMap.lookupErr != nil {
 		return sessionMap.lookupErr
 	}
@@ -59,13 +64,16 @@ func TestCiliumSessionMapUsesNoExistAndMapsOnlyNotFound(t *testing.T) {
 	if err := adapter.InsertNoExist(key, value); err != nil {
 		t.Fatal(err)
 	}
-	if raw.updateFlags != ebpf.UpdateNoExist {
-		t.Fatalf("update flags = %d, want BPF_NOEXIST", raw.updateFlags)
+	if raw.updateFlags != ebpf.UpdateNoExist|ebpf.UpdateLock {
+		t.Fatalf("update flags = %d, want BPF_NOEXIST|BPF_F_LOCK", raw.updateFlags)
 	}
 
 	var got abi.FakeTCPSessionValue
 	if err := adapter.Lookup(key, &got); err != nil || got != value {
 		t.Fatalf("lookup got=%#v err=%v", got, err)
+	}
+	if raw.lookupFlags != ebpf.LookupLock {
+		t.Fatalf("lookup flags = %d, want BPF_F_LOCK", raw.lookupFlags)
 	}
 	raw.lookupErr = ebpf.ErrKeyNotExist
 	if err := adapter.Lookup(key, &got); !errors.Is(err, errSessionMapKeyNotExist) ||
