@@ -240,7 +240,7 @@ if [[ "${MODE}" == "self-test" ]]; then
     'Conf linux-image-7.0.0-29-generic (1.0 repository)' \
     'Conf linux-modules-extra-7.0.0-29-generic (1.0 repository)' \
     'Conf shim-signed (1.0 repository)' \
-    'Conf systemd-boot-efi (1.0 repository)'; do
+    'Conf systemd-boot-efi (1.0 repository)' ''; do
     if ! apt_plan_has_forbidden_changes <<<"${fixture}"; then
       echo "error: unsafe package fixture was accepted: ${fixture}" >&2
       exit 1
@@ -252,12 +252,27 @@ if [[ "${MODE}" == "self-test" ]]; then
   fi
   for fixture in $'iU \tunpacked-package' $'iF \thalf-configured-package' \
     $'it \ttriggers-pending-package' $'iW \ttriggers-awaited-package' \
-    $'iH \thalf-installed-package' $'iiR\treinst-required-package' ''; do
+    $'iH \thalf-installed-package' $'iiR\treinst-required-package' \
+    $'ri \tremove-pending-package' $'pi \tpurge-pending-package' \
+    $'in \tinstall-pending-package' $'uc \tunknown-config-package' ''; do
     if ! dpkg_status_has_pending_work <<<"${fixture}"; then
       echo "error: incomplete dpkg status fixture was accepted: ${fixture}" >&2
       exit 1
     fi
   done
+  if [[ "${BPFTOOL_VERSION_COMMAND[*]}" != \
+    '/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C /usr/sbin/bpftool -V' ]]; then
+    echo 'error: bpftool version probe argv drifted' >&2
+    exit 1
+  fi
+  run_required_probe /usr/bin/true || {
+    echo 'error: successful required probe was rejected' >&2
+    exit 1
+  }
+  if run_required_probe /usr/bin/false; then
+    echo 'error: failed required probe was accepted' >&2
+    exit 1
+  fi
   echo "APT/dpkg safety gate self-test passed"
   exit 0
 fi
