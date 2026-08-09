@@ -28,6 +28,7 @@ from typing import Any, Mapping, Sequence
 
 SCHEMA = "wg-mix-ebpf-b82-realnic-acceptance-plan-v1"
 JOURNAL_SCHEMA = "wg-mix-ebpf-b82-realnic-acceptance-journal-v1"
+LEASE_SCHEMA = "wg-mix-ebpf-b82-realnic-interface-lease-v1"
 READ_ONLY_PEER = "47.116.202.155"
 RUN_ROOT_PREFIX = "/run/wg-mix-ebpf-realnic-acceptance-"
 RUN_ID_RE = re.compile(r"^[0-9a-f]{8,32}$")
@@ -148,6 +149,23 @@ def clean_single_line(value: str, label: str) -> str:
     if not value or value.strip() != value or "\n" in value or "\r" in value or "\x00" in value:
         raise HarnessError(f"{label} must be one canonical nonempty line")
     return value
+
+
+def netns_number(value: str) -> int:
+    match = re.fullmatch(r"net:\[([1-9][0-9]*)\]", value)
+    if not match:
+        raise HarnessError("network namespace identity is invalid")
+    return int(match.group(1))
+
+
+def interface_lease_path(spec: "CoreSpec", netns: str) -> str:
+    parent = os.path.dirname(RUN_ROOT_PREFIX)
+    if not parent or not os.path.isabs(parent):
+        raise HarnessError("run-root prefix has no stable absolute lease directory")
+    return (
+        f"{parent}/wg-mix-ebpf-realnic-interface-{netns_number(netns)}-"
+        f"{spec.expected_ifindex}-{spec.expected_device_dev}-{spec.expected_device_ino}.jsonl"
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -701,6 +719,78 @@ def validate_snapshot_identity(
         raise HarnessError("peer route does not use the reviewed interface")
 
 
+def lease_identity(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
+    try:
+        identity = snapshot["interface_identity"]
+        result = {
+            "netns": snapshot["host"]["netns"],
+            "name": identity["name"],
+            "ifindex": identity["ifindex"],
+            "mac": identity["mac"],
+            "driver": identity["driver"],
+            "bus_info": identity["bus_info"],
+            "device_path": identity["device_path"],
+            "device_dev": identity["device_dev"],
+            "device_ino": identity["device_ino"],
+        }
+    except (KeyError, TypeError) as exc:
+        raise HarnessError("baseline has no complete interface lease identity") from exc
+    expected = {
+        "name": spec.interface,
+        "ifindex": spec.expected_ifindex,
+        "mac": spec.expected_mac,
+        "driver": spec.expected_driver,
+        "bus_info": spec.expected_bus_info,
+        "device_path": spec.expected_device_path,
+        "device_dev": spec.expected_device_dev,
+        "device_ino": spec.expected_device_ino,
+    }
+    if any(result.get(key) != value for key, value in expected.items()):
+        raise HarnessError("baseline interface lease identity does not match the exact specification")
+    netns_number(str(result["netns"]))
+    return result
+
+
+def write_guard_command_table(spec: CoreSpec) -> list[tuple[str, list[str]]]:
+    sysfs = f"/sys/class/net/{spec.interface}"
+    return [
+        ("netns", [TOOLS["readlink"], "/proc/self/ns/net"]),
+        ("ifindex", [TOOLS["cat"], f"{sysfs}/ifindex"]),
+        ("mac", [TOOLS["cat"], f"{sysfs}/address"]),
+        ("device_path", [TOOLS["readlink"], "-e", f"{sysfs}/device"]),
+        ("device_stat", [TOOLS["stat"], "-Lc", "%d:%i", f"{sysfs}/device"]),
+        ("driver", [TOOLS["ethtool"], "-i", spec.interface]),
+    ]
+
+
+def collect_write_guard_identity(spec: CoreSpec, runner: CommandRunner) -> dict[str, Any]:
+    raw: dict[str, bytes] = {}
+    for label, argv in write_guard_command_table(spec):
+        rc, stdout, stderr = runner.capture(argv, timeout=20)
+        if rc != 0:
+            reason = stderr.decode("utf-8", "replace").strip()
+            raise HarnessError(f"network-write identity guard {label} failed rc={rc}: {reason}")
+        raw[label] = stdout
+    driver = parse_key_values(raw["driver"], "network-write driver")
+    try:
+        device_dev, device_ino = (
+            int(part) for part in single_line(raw["device_stat"], "network-write device-stat").split(":")
+        )
+    except ValueError as exc:
+        raise HarnessError("network-write device-stat is not decimal dev:inode") from exc
+    return {
+        "netns": single_line(raw["netns"], "network-write netns"),
+        "name": spec.interface,
+        "ifindex": int(single_line(raw["ifindex"], "network-write ifindex")),
+        "mac": single_line(raw["mac"], "network-write mac"),
+        "driver": driver.get("driver", ""),
+        "bus_info": driver.get("bus-info", ""),
+        "device_path": single_line(raw["device_path"], "network-write device-path"),
+        "device_dev": device_dev,
+        "device_ino": device_ino,
+    }
+
+
 def feature_target(features: Mapping[str, Mapping[str, Any]], policy: str) -> dict[str, bool]:
     original = {name: bool(features[name]["enabled"]) for name in FEATURE_ORDER}
     if policy == "original":
@@ -1134,11 +1224,24 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
     ]
     for entry in network_write_set:
         entry["operations"] = [list(argv) for argv in entry["operations"]]
+    identity = lease_identity(spec, snapshot)
+    lease_path = interface_lease_path(spec, identity["netns"])
+    guard_commands = [
+        {"label": label, "argv": argv, "timeout_seconds": 20, "write_set": []}
+        for label, argv in write_guard_command_table(spec)
+    ]
     return {
         "schema": SCHEMA,
         "spec": spec.as_dict(),
         "snapshot_commands": snapshot_commands,
         "baseline": snapshot,
+        "interface_lease": {
+            "path": lease_path,
+            "identity": identity,
+            "held_for_entire_run_or_restore": True,
+            "persistent_active_owner": True,
+            "guard_before_each_network_write": guard_commands,
+        },
         "cells": cells,
         "runtime_snapshot_schedule": {
             "commands": snapshot_commands,
@@ -1155,7 +1258,7 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
             ],
         },
         "write_set": {
-            "filesystem": [spec.run_root, f"{spec.run_root}/logs", *sorted(files)],
+            "filesystem": [spec.run_root, f"{spec.run_root}/logs", lease_path, *sorted(files)],
             "network": network_write_set,
             "peer": [],
             "qdisc": [],
@@ -1280,6 +1383,24 @@ def read_approved_plan(path_value: str, expected_sha256: str, spec: CoreSpec) ->
 
 
 def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
+    baseline = plan.get("baseline")
+    if not isinstance(baseline, dict):
+        raise HarnessError("approved plan has no baseline")
+    expected_identity = lease_identity(spec, baseline)
+    expected_lease_path = interface_lease_path(spec, expected_identity["netns"])
+    expected_guard = [
+        {"label": label, "argv": argv, "timeout_seconds": 20, "write_set": []}
+        for label, argv in write_guard_command_table(spec)
+    ]
+    expected_lease = {
+        "path": expected_lease_path,
+        "identity": expected_identity,
+        "held_for_entire_run_or_restore": True,
+        "persistent_active_owner": True,
+        "guard_before_each_network_write": expected_guard,
+    }
+    if plan.get("interface_lease") != expected_lease:
+        raise HarnessError("approved plan interface lease contract is not exact")
     write_set = plan.get("write_set")
     if not isinstance(write_set, dict):
         raise HarnessError("approved plan has no write set")
@@ -1291,10 +1412,17 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
         raise HarnessError("filesystem write set is not a unique array")
     allowed_roots = {spec.run_root, f"{spec.run_root}/logs"}
     for path in filesystem:
-        if not isinstance(path, str) or not path.startswith(f"{spec.run_root}/") and path not in allowed_roots:
+        if (
+            not isinstance(path, str)
+            or not path.startswith(f"{spec.run_root}/")
+            and path not in allowed_roots
+            and path != expected_lease_path
+        ):
             raise HarnessError("filesystem write escaped the run-owned root")
         if os.path.normpath(path) != path:
             raise HarnessError("filesystem write path is not normalized")
+    if filesystem.count(expected_lease_path) != 1:
+        raise HarnessError("filesystem write set must contain the exact stable interface lease")
     cells = plan.get("cells")
     if not isinstance(cells, list) or not cells:
         raise HarnessError("approved plan has no cells")
@@ -1314,6 +1442,8 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
                 raise HarnessError(f"cell {cell['name']} has invalid {group}")
             for step in steps:
                 validate_step(step, filesystem_set)
+                if looks_like_network_write(step["argv"]) and not is_owned_network_write(step["argv"], spec):
+                    raise HarnessError("planned network write is outside the exact owned interface knobs")
         recovery_steps = cell.get("recovery_restore")
         if not isinstance(recovery_steps, list):
             raise HarnessError(f"cell {cell['name']} has invalid recovery_restore")
@@ -1517,6 +1647,237 @@ class Journal:
         os.close(self.descriptor)
 
 
+class InterfaceLease:
+    """Persistent active owner plus an exclusive lock for one physical interface."""
+
+    def __init__(
+        self,
+        path: str,
+        run_id: str,
+        plan_sha256: str,
+        expected_identity: Mapping[str, Any],
+    ):
+        self.path = path
+        self.run_id = run_id
+        self.plan_sha256 = plan_sha256
+        self.expected_identity = dict(expected_identity)
+        self._poisoned = False
+        flags = os.O_RDWR | os.O_APPEND | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0)
+        try:
+            self.descriptor = os.open(path, flags, 0o600)
+        except OSError as exc:
+            raise HarnessError(f"interface lease open failed: {exc}") from exc
+        try:
+            metadata = os.fstat(self.descriptor)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_uid != os.getuid()
+            ):
+                raise HarnessError("interface lease must be an owned 0600 single-link regular file")
+            fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.events = self._read_events()
+            self.active_owner, self.last_owner = self._replay_state()
+        except BlockingIOError as exc:
+            os.close(self.descriptor)
+            raise HarnessError("reviewed interface is locked by another harness process") from exc
+        except BaseException:
+            os.close(self.descriptor)
+            raise
+
+    def __enter__(self) -> "InterfaceLease":
+        return self
+
+    def __exit__(self, _kind: Any, _error: Any, _traceback: Any) -> bool:
+        self.close()
+        return False
+
+    def _read_events(self) -> list[dict[str, Any]]:
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        size = os.fstat(self.descriptor).st_size
+        if size > 8 << 20:
+            raise HarnessError("interface lease history exceeds the reviewed size")
+        payload = b""
+        while len(payload) < size:
+            chunk = os.read(self.descriptor, min(size - len(payload), 1 << 20))
+            if not chunk:
+                raise HarnessError("interface lease was truncated while reading")
+            payload += chunk
+        complete = payload
+        fragment = b""
+        if payload and not payload.endswith(b"\n"):
+            boundary = payload.rfind(b"\n") + 1
+            complete, fragment = payload[:boundary], payload[boundary:]
+        events: list[dict[str, Any]] = []
+        for sequence, raw in enumerate(complete.splitlines(), start=1):
+            try:
+                event = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise HarnessError("interface lease contains an invalid complete line") from exc
+            if canonical_json(event).rstrip(b"\n") != raw:
+                raise HarnessError("interface lease line is not canonical")
+            if event.get("schema") != LEASE_SCHEMA or event.get("sequence") != sequence:
+                raise HarnessError("interface lease schema or sequence is invalid")
+            events.append(event)
+        if fragment:
+            os.ftruncate(self.descriptor, len(complete))
+            os.fsync(self.descriptor)
+            self.events = events
+            self._append(
+                "TAIL_TRUNCATED",
+                run_id=self.run_id,
+                plan_sha256=self.plan_sha256,
+                removed_bytes=len(fragment),
+                removed_sha256=sha256_bytes(fragment),
+            )
+            events = self.events
+        return events
+
+    def _owner(self, event: Mapping[str, Any]) -> dict[str, Any]:
+        owner = {
+            "run_id": event.get("run_id"),
+            "plan_sha256": event.get("plan_sha256"),
+            "identity": event.get("identity"),
+        }
+        identity = owner["identity"]
+        required_identity = {
+            "netns",
+            "name",
+            "ifindex",
+            "mac",
+            "driver",
+            "bus_info",
+            "device_path",
+            "device_dev",
+            "device_ino",
+        }
+        if (
+            not isinstance(owner["run_id"], str)
+            or not RUN_ID_RE.fullmatch(owner["run_id"])
+            or not isinstance(owner["plan_sha256"], str)
+            or not SHA256_RE.fullmatch(owner["plan_sha256"])
+            or not isinstance(identity, dict)
+            or set(identity) != required_identity
+        ):
+            raise HarnessError("interface lease owner record is malformed")
+        try:
+            netns_number(str(identity["netns"]))
+        except HarnessError as exc:
+            raise HarnessError("interface lease owner identity is malformed") from exc
+        return owner
+
+    def _replay_state(self) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+        active: dict[str, Any] | None = None
+        last: dict[str, Any] | None = None
+        for event in self.events:
+            kind = event.get("event")
+            if kind == "CLAIM":
+                if active is not None:
+                    raise HarnessError("interface lease contains overlapping claims")
+                active = self._owner(event)
+                last = active
+            elif kind == "RELEASE":
+                owner = self._owner(event)
+                if active != owner:
+                    raise HarnessError("interface lease release does not match its active claim")
+                active = None
+                last = owner
+            elif kind != "TAIL_TRUNCATED":
+                raise HarnessError("interface lease contains an unknown event")
+        return active, last
+
+    def _append(self, event: str, **fields: Any) -> None:
+        if self._poisoned:
+            raise HarnessError("interface lease is poisoned after an incomplete append")
+        record = {
+            "schema": LEASE_SCHEMA,
+            "sequence": len(self.events) + 1,
+            "monotonic_ns": time.monotonic_ns(),
+            "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": event,
+            **fields,
+        }
+        payload = canonical_json(record)
+        try:
+            offset = 0
+            while offset < len(payload):
+                written = os.write(self.descriptor, payload[offset:])
+                if written <= 0:
+                    raise HarnessError("interface lease append made no progress")
+                offset += written
+            os.fsync(self.descriptor)
+        except (HarnessError, OSError) as exc:
+            self._poisoned = True
+            if isinstance(exc, HarnessError):
+                raise
+            raise HarnessError(f"interface lease append failed: {exc}") from exc
+        self.events.append(record)
+
+    def _wanted_owner(self) -> dict[str, Any]:
+        return {
+            "run_id": self.run_id,
+            "plan_sha256": self.plan_sha256,
+            "identity": self.expected_identity,
+        }
+
+    def require_available_for_run(self) -> None:
+        if self.active_owner is not None:
+            raise HarnessError(
+                f"interface has an active run owner {self.active_owner.get('run_id')}; explicit restore is required"
+            )
+
+    def claim(self) -> None:
+        self.require_available_for_run()
+        owner = self._wanted_owner()
+        self._append("CLAIM", **owner)
+        self.active_owner = owner
+        self.last_owner = owner
+
+    def require_restore_owner(self) -> None:
+        if self.active_owner != self._wanted_owner():
+            raise HarnessError("interface lease is not actively owned by this exact restore")
+
+    def same_owner_released(self) -> bool:
+        return self.active_owner is None and self.last_owner == self._wanted_owner()
+
+    def assert_owned_for_write(
+        self,
+        spec: CoreSpec,
+        runner: CommandRunner,
+        journal: Journal,
+        argv: Sequence[str],
+    ) -> None:
+        self.require_restore_owner()
+        actual = collect_write_guard_identity(spec, runner)
+        if actual != self.expected_identity:
+            different = sorted(key for key in self.expected_identity if actual.get(key) != self.expected_identity[key])
+            raise HarnessError(f"network-write interface identity changed: {','.join(different)}")
+        self.require_restore_owner()
+        journal.append(
+            "NETWORK_WRITE_GUARD_VERIFIED",
+            argv=list(argv),
+            lease_path=self.path,
+            identity_sha256=sha256_bytes(canonical_json(actual)),
+        )
+
+    def release(self) -> None:
+        wanted = self._wanted_owner()
+        if self.active_owner is None:
+            if self.last_owner == wanted:
+                return
+            raise HarnessError("interface lease has no matching owner to release")
+        if self.active_owner != wanted:
+            raise HarnessError("interface lease owner changed before release")
+        self._append("RELEASE", **wanted)
+        self.active_owner = None
+        self.last_owner = wanted
+
+    def close(self) -> None:
+        fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        os.close(self.descriptor)
+
+
 def directory_identity(path: str) -> dict[str, int]:
     metadata = os.lstat(path)
     if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
@@ -1556,8 +1917,37 @@ def validate_run_root_identity(spec: CoreSpec, expected: Mapping[str, Any]) -> N
         raise HarnessError("run-owned directory identity changed")
 
 
-def execute_step(step: Mapping[str, Any], runner: CommandRunner, journal: Journal) -> tuple[int, bytes, bytes]:
+def is_owned_network_write(argv: Sequence[str], spec: CoreSpec) -> bool:
+    return (
+        len(argv) == 5
+        and list(argv[:3]) == [TOOLS["ethtool"], "-K", spec.interface]
+        or len(argv) == 7
+        and list(argv[:6]) == [TOOLS["ip"], "link", "set", "dev", spec.interface, "mtu"]
+    )
+
+
+def looks_like_network_write(argv: Sequence[str]) -> bool:
+    return (
+        len(argv) >= 2
+        and list(argv[:2]) == [TOOLS["ethtool"], "-K"]
+        or len(argv) >= 3
+        and list(argv[:3]) == [TOOLS["ip"], "link", "set"]
+    )
+
+
+def execute_step(
+    step: Mapping[str, Any],
+    runner: CommandRunner,
+    journal: Journal,
+    *,
+    spec: CoreSpec | None = None,
+    lease: InterfaceLease | None = None,
+) -> tuple[int, bytes, bytes]:
     journal.append("COMMAND_START", label=step["label"], argv=step["argv"], target=step["target"])
+    if looks_like_network_write(step["argv"]):
+        if spec is None or lease is None or not is_owned_network_write(step["argv"], spec):
+            raise HarnessError("network write has no exact interface lease")
+        lease.assert_owned_for_write(spec, runner, journal, step["argv"])
     try:
         rc, stdout, stderr = runner.capture(step["argv"], timeout=step["timeout_seconds"])
     except HarnessError as exc:
@@ -1623,6 +2013,8 @@ def execute_recovery_step(
     *,
     attempt: int,
     index: int,
+    spec: CoreSpec,
+    lease: InterfaceLease,
 ) -> None:
     audit = {
         "attempt": attempt,
@@ -1632,6 +2024,9 @@ def execute_recovery_step(
         "target": step["target"],
     }
     journal.append("RECOVERY_COMMAND_START", **audit)
+    if not is_owned_network_write(step["argv"], spec):
+        raise HarnessError("recovery command is not an exact owned network write")
+    lease.assert_owned_for_write(spec, runner, journal, step["argv"])
     try:
         rc, stdout, stderr = runner.capture(step["argv"], timeout=step["timeout_seconds"])
     except HarnessError as exc:
@@ -1923,6 +2318,25 @@ def run_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runner: C
     if os.geteuid() != 0:
         raise HarnessError("run mode requires root after explicit approval")
     plan, plan_payload = read_approved_plan(approved_plan, approved_sha256, spec)
+    lease_contract = plan["interface_lease"]
+    with InterfaceLease(
+        lease_contract["path"],
+        spec.run_id,
+        approved_sha256,
+        lease_contract["identity"],
+    ) as lease:
+        lease.require_available_for_run()
+        return run_with_interface_lease(spec, approved_sha256, runner, plan, plan_payload, lease)
+
+
+def run_with_interface_lease(
+    spec: CoreSpec,
+    approved_sha256: str,
+    runner: CommandRunner,
+    plan: Mapping[str, Any],
+    plan_payload: bytes,
+    lease: InterfaceLease,
+) -> int:
     current, commands = collect_snapshot(spec, runner)
     rebuilt = canonical_json(build_plan(spec, current, commands))
     if rebuilt != plan_payload:
@@ -1937,6 +2351,8 @@ def run_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runner: C
         "source_commit": spec.source_commit,
         "interface_identity": current["interface_identity"],
         "boot_id": spec.expected_boot_id,
+        "interface_lease_path": lease.path,
+        "interface_lease_identity": lease.expected_identity,
         "run_root_identity": run_root_identity,
     }
     write_exclusive(f"{spec.run_root}/owner.json", canonical_json(owner))
@@ -1945,6 +2361,8 @@ def run_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runner: C
     active_cell: str | None = None
     try:
         journal.append("BASELINE_CAPTURED", baseline_sha256=sha256_bytes(canonical_json(current)))
+        lease.claim()
+        journal.append("INTERFACE_LEASE_CLAIMED", path=lease.path, identity=lease.expected_identity)
         for cell in plan["cells"]:
             if not cell["runnable"]:
                 results.append(
@@ -1963,7 +2381,7 @@ def run_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runner: C
                 exact_reverse_argv=[step["argv"] for step in cell["restore"]],
             )
             for index, step in enumerate(cell["mutation"]):
-                execute_step(step, runner, journal)
+                execute_step(step, runner, journal, spec=spec, lease=lease)
                 journal.append("MUTATION_APPLIED", cell=active_cell, index=index)
             active_snapshot, _ = collect_snapshot(spec, runner, expected_mtu=cell["expected_mtu"])
             validate_scoped_snapshot(current, active_snapshot, cell)
@@ -1991,7 +2409,7 @@ def run_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runner: C
                 exact_reverse_argv=[step["argv"] for step in cell["restore"]],
             )
             for index, step in enumerate(cell["restore"]):
-                execute_step(step, runner, journal)
+                execute_step(step, runner, journal, spec=spec, lease=lease)
                 journal.append("RESTORE_APPLIED", cell=active_cell, index=index)
             restored, _ = collect_snapshot(spec, runner)
             validate_fully_restored(current, restored)
@@ -2018,6 +2436,8 @@ def run_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runner: C
             canonical_json({"run_id": spec.run_id, "overall": outcome["overall"], "plan_sha256": approved_sha256}),
         )
         journal.append("COMPLETE", overall=outcome["overall"])
+        lease.release()
+        journal.append("INTERFACE_LEASE_RELEASED", path=lease.path)
         print(
             f"REALNIC_CHARACTERIZATION_COMPLETE run_id={spec.run_id} overall={outcome['overall']} "
             f"evidence={spec.run_root}"
@@ -2034,6 +2454,24 @@ def restore_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runne
     if os.geteuid() != 0:
         raise HarnessError("restore mode requires root after separate explicit approval")
     plan, plan_payload = read_approved_plan(approved_plan, approved_sha256, spec)
+    lease_contract = plan["interface_lease"]
+    with InterfaceLease(
+        lease_contract["path"],
+        spec.run_id,
+        approved_sha256,
+        lease_contract["identity"],
+    ) as lease:
+        return restore_with_interface_lease(spec, approved_sha256, runner, plan, plan_payload, lease)
+
+
+def restore_with_interface_lease(
+    spec: CoreSpec,
+    approved_sha256: str,
+    runner: CommandRunner,
+    plan: Mapping[str, Any],
+    plan_payload: bytes,
+    lease: InterfaceLease,
+) -> int:
     for path in (spec.run_root, f"{spec.run_root}/owner.json", f"{spec.run_root}/approved-plan.json"):
         if not os.path.lexists(path):
             raise HarnessError(f"restore ownership path is absent: {path}")
@@ -2048,6 +2486,8 @@ def restore_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runne
         owner.get("run_id") != spec.run_id
         or owner.get("plan_sha256") != approved_sha256
         or owner.get("source_commit") != spec.source_commit
+        or owner.get("interface_lease_path") != lease.path
+        or owner.get("interface_lease_identity") != lease.expected_identity
     ):
         raise HarnessError("run owner marker does not match restore argv")
     validate_run_root_identity(spec, owner.get("run_root_identity", {}))
@@ -2065,8 +2505,14 @@ def restore_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runne
             raise HarnessError("owner/baseline interface identity mismatch")
         active, complete = journal_active_cell(journal.events)
         if complete:
+            release_needed = not lease.same_owner_released()
+            if release_needed:
+                lease.require_restore_owner()
             current, _ = collect_snapshot(spec, runner)
             validate_fully_restored(baseline, current)
+            if release_needed:
+                lease.release()
+                journal.append("INTERFACE_LEASE_RELEASED", path=lease.path, terminal_restore=True)
             print(f"REALNIC_RESTORE_NOT_NEEDED run_id={spec.run_id} state=complete")
             return 0
         marker_path = f"{spec.run_root}/explicit-restored.json"
@@ -2074,14 +2520,31 @@ def restore_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runne
         marker_payload = canonical_json(marker)
         explicit_complete = any(event.get("event") == "EXPLICIT_RESTORE_COMPLETE" for event in journal.events)
         if explicit_complete:
+            release_needed = not lease.same_owner_released()
+            if release_needed:
+                lease.require_restore_owner()
             if not os.path.lexists(marker_path) or read_regular_file(marker_path) != marker_payload:
                 raise HarnessError("completed explicit restore has no exact marker")
             current, _ = collect_snapshot(spec, runner)
             validate_fully_restored(baseline, current)
+            if release_needed:
+                lease.release()
+                journal.append("INTERFACE_LEASE_RELEASED", path=lease.path, terminal_restore=True)
             print(f"REALNIC_RESTORE_NOT_NEEDED run_id={spec.run_id} state=explicit-restored")
             return 0
         if os.path.lexists(marker_path) and read_regular_file(marker_path) != marker_payload:
             raise HarnessError("existing explicit restore marker differs")
+        if lease.active_owner is None and not any(
+            event.get("event") == "CELL_MUTATION_INTENT" for event in journal.events
+        ):
+            lease.claim()
+            journal.append(
+                "INTERFACE_LEASE_CLAIMED",
+                path=lease.path,
+                identity=lease.expected_identity,
+                restore_handoff=True,
+            )
+        lease.require_restore_owner()
         attempt = 1 + sum(event.get("event") == "EXPLICIT_RESTORE_INTENT" for event in journal.events)
         if active is None:
             current, _ = collect_snapshot(spec, runner)
@@ -2102,7 +2565,15 @@ def restore_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runne
                 exact_reverse_argv=[step["argv"] for step in cell["recovery_restore"]],
             )
             for index, step in enumerate(cell["recovery_restore"]):
-                execute_recovery_step(step, runner, journal, attempt=attempt, index=index)
+                execute_recovery_step(
+                    step,
+                    runner,
+                    journal,
+                    attempt=attempt,
+                    index=index,
+                    spec=spec,
+                    lease=lease,
+                )
                 journal.append("EXPLICIT_RESTORE_APPLIED", attempt=attempt, cell=active, index=index)
         restored, _ = collect_snapshot(spec, runner)
         validate_fully_restored(baseline, restored)
@@ -2111,6 +2582,8 @@ def restore_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runne
         if active is not None:
             journal.append("CELL_RESTORED", attempt=attempt, cell=active, explicit=True)
         journal.append("EXPLICIT_RESTORE_COMPLETE", attempt=attempt, cell=active)
+        lease.release()
+        journal.append("INTERFACE_LEASE_RELEASED", path=lease.path, terminal_restore=True)
         print(f"REALNIC_EXPLICIT_RESTORE_COMPLETE run_id={spec.run_id} evidence={spec.run_root}")
         return 0
     except BaseException as exc:

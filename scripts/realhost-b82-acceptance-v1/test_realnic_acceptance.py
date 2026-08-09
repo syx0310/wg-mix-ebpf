@@ -86,7 +86,10 @@ class SimulatedRunner(FixtureRunner):
         self.iperf_calls = 0
         self.fail_iperf_call = fail_iperf_call
         self.ethtool_writes = 0
+        self.network_writes = 0
         self.fail_ethtool_write_call = None
+        self.ifindex_reads = 0
+        self.fail_ifindex_read = None
         self.started = []
 
     def feature_output(self):
@@ -119,6 +122,7 @@ class SimulatedRunner(FixtureRunner):
             if self.fixed.get(name):
                 return 1, b"", b"fixed\n"
             self.ethtool_writes += 1
+            self.network_writes += 1
             self.features[name] = value == "on"
             if self.fail_ethtool_write_call == self.ethtool_writes:
                 raise MODULE.HarnessError("injected post-ethtool failure")
@@ -127,7 +131,12 @@ class SimulatedRunner(FixtureRunner):
             return 0, self.feature_output(), b""
         if argv[:6] == [MODULE.TOOLS["ip"], "link", "set", "dev", self.spec.interface, "mtu"]:
             self.mtu = int(argv[6])
+            self.network_writes += 1
             return 0, b"", b""
+        if argv == [MODULE.TOOLS["cat"], f"/sys/class/net/{self.spec.interface}/ifindex"]:
+            self.ifindex_reads += 1
+            value = 99 if self.ifindex_reads == self.fail_ifindex_read else self.spec.expected_ifindex
+            return 0, f"{value}\n".encode(), b""
         if argv == [MODULE.TOOLS["cat"], f"/sys/class/net/{self.spec.interface}/mtu"]:
             return 0, f"{self.mtu}\n".encode(), b""
         if argv == [MODULE.TOOLS["ip"], "-d", "-j", "link", "show", "dev", self.spec.interface]:
@@ -470,6 +479,23 @@ class PlannerTests(unittest.TestCase):
         self.assertFalse(plan["safety_contract"]["implemented_capability_bits_changed"])
         self.assertFalse(plan["safety_contract"]["af_packet_no_dst_positive_pmtu"])
 
+    def test_plan_has_one_stable_interface_lease_and_per_write_guard(self):
+        spec = fixture_spec()
+        runner = FixtureRunner(spec)
+        snapshot, commands = MODULE.collect_snapshot(spec, runner)
+        plan = MODULE.build_plan(spec, snapshot, commands)
+        lease = plan["interface_lease"]
+        self.assertEqual(lease["identity"], MODULE.lease_identity(spec, snapshot))
+        self.assertEqual(lease["path"], MODULE.interface_lease_path(spec, snapshot["host"]["netns"]))
+        self.assertFalse(lease["path"].startswith(f"{spec.run_root}/"))
+        self.assertEqual(plan["write_set"]["filesystem"].count(lease["path"]), 1)
+        self.assertTrue(lease["held_for_entire_run_or_restore"])
+        self.assertTrue(lease["persistent_active_owner"])
+        self.assertEqual(
+            [entry["argv"] for entry in lease["guard_before_each_network_write"]],
+            [argv for _, argv in MODULE.write_guard_command_table(spec)],
+        )
+
     def test_recovery_evidence_is_append_only_journal_not_fixed_output_files(self):
         spec = fixture_spec()
         runner = FixtureRunner(spec)
@@ -565,9 +591,9 @@ class HermeticStateMachineTests(unittest.TestCase):
         prefix = f"{temporary}/run-"
         with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix):
             spec = fixture_spec(run_root=f"{prefix}a1b2c3d4")
-        runner = SimulatedRunner(spec, fail_iperf_call=fail_iperf_call)
-        snapshot, commands = MODULE.collect_snapshot(spec, runner)
-        plan_payload = MODULE.canonical_json(MODULE.build_plan(spec, snapshot, commands))
+            runner = SimulatedRunner(spec, fail_iperf_call=fail_iperf_call)
+            snapshot, commands = MODULE.collect_snapshot(spec, runner)
+            plan_payload = MODULE.canonical_json(MODULE.build_plan(spec, snapshot, commands))
         plan_path = f"{temporary}/approved-plan.json"
         pathlib.Path(plan_path).write_bytes(plan_payload)
         return prefix, spec, runner, plan_path, MODULE.sha256_bytes(plan_payload)
@@ -599,7 +625,8 @@ class HermeticStateMachineTests(unittest.TestCase):
             self.assertEqual(outcome["classification_counts"]["passed"], 8)
             self.assertEqual(outcome["classification_counts"]["not-covered"], 6)
             events = [json.loads(line) for line in pathlib.Path(spec.run_root, "journal.jsonl").read_bytes().splitlines()]
-            self.assertEqual(events[-1]["event"], "COMPLETE")
+            self.assertEqual(events[-2]["event"], "COMPLETE")
+            self.assertEqual(events[-1]["event"], "INTERFACE_LEASE_RELEASED")
             self.assertEqual(
                 sum(event["event"] == "CELL_MUTATION_INTENT" for event in events),
                 8,
@@ -608,6 +635,53 @@ class HermeticStateMachineTests(unittest.TestCase):
                 sum(event["event"] == "RESTORE_INTENT" for event in events),
                 8,
             )
+            self.assertEqual(
+                sum(event["event"] == "NETWORK_WRITE_GUARD_VERIFIED" for event in events),
+                runner.network_writes,
+            )
+
+    def test_active_interface_owner_blocks_a_different_run_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=10)
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                with self.assertRaises(MODULE.HarnessError):
+                    MODULE.run_mode(spec, plan_path, digest, runner)
+                second = fixture_spec(run_id="b1b2c3d4", run_root=f"{prefix}b1b2c3d4")
+                second_snapshot, commands = MODULE.collect_snapshot(
+                    second,
+                    runner,
+                    allowed_mtu=frozenset({second.expected_mtu, runner.mtu}),
+                )
+                second_payload = MODULE.canonical_json(MODULE.build_plan(second, second_snapshot, commands))
+                second_path = pathlib.Path(temporary, "second-plan.json")
+                second_path.write_bytes(second_payload)
+                with self.assertRaisesRegex(MODULE.HarnessError, "active run owner a1b2c3d4"):
+                    MODULE.run_mode(second, str(second_path), MODULE.sha256_bytes(second_payload), runner)
+                self.assertFalse(pathlib.Path(second.run_root).exists())
+                self.assertEqual(MODULE.restore_mode(spec, plan_path, digest, runner), 0)
+
+    def test_each_network_write_rechecks_identity_before_mutation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, digest = self.prepare(temporary)
+            real_guard = MODULE.collect_write_guard_identity
+
+            def drifted_identity(wanted_spec, wanted_runner):
+                identity = real_guard(wanted_spec, wanted_runner)
+                identity["ifindex"] = 99
+                return identity
+
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ), mock.patch.object(MODULE, "collect_write_guard_identity", side_effect=drifted_identity):
+                with self.assertRaisesRegex(MODULE.HarnessError, "network-write interface identity changed"):
+                    MODULE.run_mode(spec, plan_path, digest, runner)
+                self.assertEqual(runner.network_writes, 0)
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                self.assertEqual(MODULE.restore_mode(spec, plan_path, digest, runner), 0)
 
     def test_failure_retains_mutation_until_separately_invoked_restore(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -630,7 +704,8 @@ class HermeticStateMachineTests(unittest.TestCase):
             failed_index = next(index for index, event in enumerate(events) if event["event"] == "FAILED")
             intent_index = next(index for index, event in enumerate(events) if event["event"] == "EXPLICIT_RESTORE_INTENT")
             self.assertGreater(intent_index, failed_index)
-            self.assertEqual(events[-1]["event"], "EXPLICIT_RESTORE_COMPLETE")
+            self.assertIn("EXPLICIT_RESTORE_COMPLETE", [event["event"] for event in events])
+            self.assertEqual(events[-1]["event"], "INTERFACE_LEASE_RELEASED")
 
     def test_explicit_restore_replays_idempotently_after_nth_step_cut(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -655,7 +730,8 @@ class HermeticStateMachineTests(unittest.TestCase):
             self.assertEqual([event["attempt"] for event in intents], [1, 2])
             starts = [event for event in events if event["event"] == "RECOVERY_COMMAND_START"]
             self.assertEqual([event["attempt"] for event in starts], [1, 2, 2])
-            self.assertEqual(events[-1]["event"], "EXPLICIT_RESTORE_COMPLETE")
+            self.assertIn("EXPLICIT_RESTORE_COMPLETE", [event["event"] for event in events])
+            self.assertEqual(events[-1]["event"], "INTERFACE_LEASE_RELEASED")
 
     def test_mutated_interface_restores_after_unterminated_journal_tail(self):
         with tempfile.TemporaryDirectory() as temporary:
