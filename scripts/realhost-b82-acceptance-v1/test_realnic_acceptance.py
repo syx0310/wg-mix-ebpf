@@ -9,8 +9,10 @@ import json
 import os
 import pathlib
 import signal
+import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest import mock
 
@@ -42,17 +44,22 @@ class FakeRunningProcess:
         self.waited = False
         self.pid = 10001
         self.pgid = 10001
+        self.proven_absent = False
+        self.convergence_attempted = False
 
     def wait(self, timeout):
         del timeout
         self.waited = True
         rc = -15 if self.terminated else 0
+        self.proven_absent = True
         return rc, b"60 packets transmitted, 60 received, 0% packet loss\n", b""
 
     def converge(self, *, term_timeout=5.0, kill_timeout=5.0):
         del term_timeout, kill_timeout
         self.terminated = True
         self.waited = True
+        self.convergence_attempted = True
+        self.proven_absent = True
         return (
             -15,
             b"60 packets transmitted, 60 received, 0% packet loss\n",
@@ -238,6 +245,43 @@ def fixture_outputs(spec, *, fixed=()):
 
 
 class ProcessGroupTests(unittest.TestCase):
+    @staticmethod
+    def stubborn_wrapper(metadata_path):
+        grandchild = (
+            "import signal,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "signal.signal(signal.SIGINT,signal.SIG_IGN);"
+            "signal.signal(signal.SIGHUP,signal.SIG_IGN);"
+            "time.sleep(30)"
+        )
+        return (
+            "import json,os,pathlib,signal,subprocess,sys,time;"
+            "signal.signal(signal.SIGTERM,signal.SIG_IGN);"
+            "signal.signal(signal.SIGINT,signal.SIG_IGN);"
+            "signal.signal(signal.SIGHUP,signal.SIG_IGN);"
+            f"child=subprocess.Popen([sys.executable,'-c',{grandchild!r}]);"
+            f"pathlib.Path({str(metadata_path)!r}).write_text(json.dumps({{'pgid':os.getpgrp(),'child':child.pid}}));"
+            "time.sleep(30)"
+        )
+
+    @staticmethod
+    def wait_metadata(path):
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if path.exists():
+                return json.loads(path.read_text())
+            time.sleep(0.02)
+        raise AssertionError("owned-process fixture did not publish its process group")
+
+    @staticmethod
+    def exact_group_cleanup(pgid):
+        if pgid is None:
+            return
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+
     def test_stubborn_wrapper_and_grandchild_are_killed_as_one_owned_group(self):
         grandchild = (
             "import os,signal,time;"
@@ -272,6 +316,62 @@ class ProcessGroupTests(unittest.TestCase):
         self.assertTrue(report["group_absent"])
         with self.assertRaises(ProcessLookupError):
             os.killpg(pgid, 0)
+
+    def test_foreground_timeout_converges_wrapper_and_grandchild(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            metadata_path = pathlib.Path(temporary, "owned.json")
+            wrapper = self.stubborn_wrapper(metadata_path)
+            pgid = None
+            try:
+                with self.assertRaisesRegex(MODULE.HarnessError, "reviewed timeout"):
+                    MODULE.CommandRunner().capture([sys.executable, "-c", wrapper], timeout=0.1)
+                metadata = self.wait_metadata(metadata_path)
+                pgid = metadata["pgid"]
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(pgid, 0)
+            finally:
+                self.exact_group_cleanup(pgid)
+
+    def test_parent_sigterm_unwinds_and_converges_owned_group(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            metadata_path = pathlib.Path(temporary, "owned.json")
+            wrapper = self.stubborn_wrapper(metadata_path)
+            module_path = str(MODULE_PATH)
+            harness = (
+                "import importlib.util,sys;"
+                f"spec=importlib.util.spec_from_file_location('signal_fixture',{module_path!r});"
+                "module=importlib.util.module_from_spec(spec);"
+                "sys.modules[spec.name]=module;"
+                "spec.loader.exec_module(module);"
+                "rc=0;"
+                "boundary=module.TerminationBoundary();"
+                "boundary.__enter__();"
+                "\ntry:\n"
+                f" module.CommandRunner().capture([sys.executable,'-c',{wrapper!r}],timeout=30)\n"
+                "except module.HarnessError:\n rc=125\n"
+                "finally:\n boundary.__exit__(None,None,None)\n"
+                "raise SystemExit(rc)"
+            )
+            parent = subprocess.Popen([sys.executable, "-c", harness], start_new_session=True)
+            pgid = None
+            try:
+                metadata = self.wait_metadata(metadata_path)
+                pgid = metadata["pgid"]
+                os.kill(parent.pid, signal.SIGTERM)
+                self.assertEqual(parent.wait(timeout=8), 125)
+                with self.assertRaises(ProcessLookupError):
+                    os.killpg(pgid, 0)
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait(timeout=5)
+                self.exact_group_cleanup(pgid)
+
+    def test_boundary_covers_term_int_and_hup(self):
+        wanted = {signal.SIGTERM, signal.SIGINT}
+        if hasattr(signal, "SIGHUP"):
+            wanted.add(signal.SIGHUP)
+        self.assertEqual(set(MODULE.termination_signals()), wanted)
 
     def test_term_signal_error_does_not_skip_kill_or_proof(self):
         process = object.__new__(MODULE.RunningProcess)

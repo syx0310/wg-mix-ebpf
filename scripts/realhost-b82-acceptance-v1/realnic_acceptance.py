@@ -93,6 +93,43 @@ class HarnessError(RuntimeError):
     """Fail-closed harness error."""
 
 
+class HarnessAbort(HarnessError):
+    """Catchable process-level termination request."""
+
+
+def termination_signals() -> tuple[int, ...]:
+    values = [signal.SIGTERM, signal.SIGINT]
+    if hasattr(signal, "SIGHUP"):
+        values.append(signal.SIGHUP)
+    return tuple(values)
+
+
+class TerminationBoundary:
+    """Turns catchable termination signals into ordinary stack unwinding."""
+
+    def __init__(self) -> None:
+        self._previous: dict[int, Any] = {}
+        self._triggered: int | None = None
+
+    def _handle(self, signum: int, _frame: Any) -> None:
+        if self._triggered is None:
+            self._triggered = signum
+            raise HarnessAbort(f"termination signal {signal.Signals(signum).name}")
+
+    def __enter__(self) -> "TerminationBoundary":
+        if threading.current_thread() is not threading.main_thread():
+            raise HarnessError("termination boundary requires the main thread")
+        for signum in termination_signals():
+            self._previous[signum] = signal.getsignal(signum)
+            signal.signal(signum, self._handle)
+        return self
+
+    def __exit__(self, _kind: Any, _error: Any, _traceback: Any) -> bool:
+        for signum, previous in self._previous.items():
+            signal.signal(signum, previous)
+        return False
+
+
 def canonical_json(value: Any) -> bytes:
     return (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
 
@@ -197,37 +234,75 @@ class CommandRunner:
     """Runs fixed argv only; shell evaluation is deliberately unavailable."""
 
     def capture(self, argv: Sequence[str], timeout: int = 20) -> tuple[int, bytes, bytes]:
-        if not argv or not os.path.isabs(argv[0]):
-            raise HarnessError("every command must use an absolute executable path")
-        try:
-            result = subprocess.run(
-                list(argv),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                check=False,
-                timeout=timeout,
-                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
-            )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise HarnessError(f"command did not complete: {argv!r}: {exc}") from exc
-        return result.returncode, result.stdout, result.stderr
+        with OwnedProcessScope(self, argv) as process:
+            return process.wait(timeout)
 
     def start(self, argv: Sequence[str]) -> "RunningProcess":
         if not argv or not os.path.isabs(argv[0]):
             raise HarnessError("every command must use an absolute executable path")
+        previous_mask: set[signal.Signals] | None = None
+        if hasattr(signal, "pthread_sigmask"):
+            previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, termination_signals())
+        owned: RunningProcess | None = None
         try:
-            process = subprocess.Popen(
-                list(argv),
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
-                start_new_session=True,
-            )
-        except OSError as exc:
-            raise HarnessError(f"command did not start: {argv!r}: {exc}") from exc
-        return RunningProcess(process)
+            try:
+                process = subprocess.Popen(
+                    list(argv),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+                    start_new_session=True,
+                )
+            except OSError as exc:
+                raise HarnessError(f"command did not start: {argv!r}: {exc}") from exc
+            owned = RunningProcess(process)
+        finally:
+            if previous_mask is not None:
+                try:
+                    signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+                except BaseException as abort_error:
+                    if owned is not None:
+                        try:
+                            owned.converge()
+                        except BaseException as cleanup_error:
+                            raise HarnessError(
+                                f"start interruption ({abort_error}); process-group convergence failure ({cleanup_error})"
+                            ) from cleanup_error
+                    raise
+        if owned is None:
+            raise HarnessError("command start produced no owned process")
+        return owned
+
+
+class OwnedProcessScope:
+    """Guarantees one bounded convergence attempt for an owned process group."""
+
+    def __init__(self, runner: CommandRunner, argv: Sequence[str]):
+        self.runner = runner
+        self.argv = argv
+        self.process: RunningProcess | None = None
+
+    def __enter__(self) -> "RunningProcess":
+        self.process = self.runner.start(self.argv)
+        return self.process
+
+    def __exit__(self, kind: Any, error: Any, _traceback: Any) -> bool:
+        if self.process is None or self.process.proven_absent:
+            return False
+        if self.process.convergence_attempted:
+            return False
+        try:
+            self.process.converge()
+        except BaseException as cleanup_error:
+            if error is not None:
+                raise HarnessError(
+                    f"command failure ({error}); process-group convergence failure ({cleanup_error})"
+                ) from cleanup_error
+            raise
+        if kind is None:
+            raise HarnessError("owned process scope exited before its process group was reaped")
+        return False
 
 
 class RunningProcess:
@@ -235,6 +310,8 @@ class RunningProcess:
         self._process = process
         self.pid = process.pid
         self.pgid = process.pid
+        self.proven_absent = False
+        self.convergence_attempted = False
         try:
             actual_pgid = os.getpgid(process.pid)
         except ProcessLookupError:
@@ -313,6 +390,7 @@ class RunningProcess:
         stdout, stderr = self._collect_output()
         if self._group_exists():
             raise HarnessError("owned process group remains after wrapper exit")
+        self.proven_absent = True
         return rc, stdout, stderr
 
     def converge(
@@ -321,6 +399,7 @@ class RunningProcess:
         term_timeout: float = 5.0,
         kill_timeout: float = 5.0,
     ) -> tuple[int, bytes, bytes, dict[str, Any]]:
+        self.convergence_attempted = True
         report: dict[str, Any] = {
             "pid": self.pid,
             "pgid": self.pgid,
@@ -346,6 +425,7 @@ class RunningProcess:
             raise HarnessError("owned wrapper has no terminal return code")
         report["group_absent"] = True
         report["wrapper_rc"] = rc
+        self.proven_absent = True
         return rc, stdout, stderr, report
 
 
@@ -1697,59 +1777,59 @@ def run_traffic(
 
     monitor = steps[0]
     journal.append("COMMAND_START", label=monitor["label"], argv=monitor["argv"], target=monitor["target"])
-    process = runner.start(monitor["argv"])
-    journal.append(
-        "OWNED_PROCESS_GROUP_BOUND",
-        label=monitor["label"],
-        pid=process.pid,
-        pgid=process.pgid,
-    )
-    try:
-        for step in steps[1:]:
-            rc, stdout, _ = execute_step(step, runner, journal)
-            results.append(
-                {
-                    "label": step["label"],
-                    "rc": rc,
-                    "metrics": iperf_metrics(stdout, step["streams"], soak=True),
-                }
-            )
-        rc, stdout, _ = execute_started_result(monitor, process, journal)
-        metrics = ping_metrics(stdout)
-        if metrics["packet_loss_percent"] > 0.01:
-            raise HarnessError("soak ping loss exceeds 0.01%")
-        results.insert(0, {"label": monitor["label"], "rc": rc, "metrics": metrics})
-    except BaseException as primary_error:
+    with OwnedProcessScope(runner, monitor["argv"]) as process:
         journal.append(
-            "OWNED_PROCESS_GROUP_STOP_INTENT",
+            "OWNED_PROCESS_GROUP_BOUND",
             label=monitor["label"],
             pid=process.pid,
             pgid=process.pgid,
-            reason=str(primary_error),
         )
         try:
-            rc, stdout, stderr, report = process.converge()
-            write_idempotent_exact(monitor["stdout"], stdout)
-            write_idempotent_exact(monitor["stderr"], stderr)
+            for step in steps[1:]:
+                rc, stdout, _ = execute_step(step, runner, journal)
+                results.append(
+                    {
+                        "label": step["label"],
+                        "rc": rc,
+                        "metrics": iperf_metrics(stdout, step["streams"], soak=True),
+                    }
+                )
+            rc, stdout, _ = execute_started_result(monitor, process, journal)
+            metrics = ping_metrics(stdout)
+            if metrics["packet_loss_percent"] > 0.01:
+                raise HarnessError("soak ping loss exceeds 0.01%")
+            results.insert(0, {"label": monitor["label"], "rc": rc, "metrics": metrics})
+        except BaseException as primary_error:
             journal.append(
-                "OWNED_PROCESS_GROUP_STOPPED",
-                label=monitor["label"],
-                rc=rc,
-                report=report,
-            )
-        except BaseException as stop_error:
-            journal.append(
-                "OWNED_PROCESS_GROUP_STOP_FAILED",
+                "OWNED_PROCESS_GROUP_STOP_INTENT",
                 label=monitor["label"],
                 pid=process.pid,
                 pgid=process.pgid,
-                primary_reason=str(primary_error),
-                convergence_reason=str(stop_error),
+                reason=str(primary_error),
             )
-            raise HarnessError(
-                f"traffic failure ({primary_error}); owned process-group convergence failure ({stop_error})"
-            ) from stop_error
-        raise
+            try:
+                rc, stdout, stderr, report = process.converge()
+                write_idempotent_exact(monitor["stdout"], stdout)
+                write_idempotent_exact(monitor["stderr"], stderr)
+                journal.append(
+                    "OWNED_PROCESS_GROUP_STOPPED",
+                    label=monitor["label"],
+                    rc=rc,
+                    report=report,
+                )
+            except BaseException as stop_error:
+                journal.append(
+                    "OWNED_PROCESS_GROUP_STOP_FAILED",
+                    label=monitor["label"],
+                    pid=process.pid,
+                    pgid=process.pgid,
+                    primary_reason=str(primary_error),
+                    convergence_reason=str(stop_error),
+                )
+                raise HarnessError(
+                    f"traffic failure ({primary_error}); owned process-group convergence failure ({stop_error})"
+                ) from stop_error
+            raise
     return results
 
 
@@ -2043,15 +2123,16 @@ def restore_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runne
 def main(argv: Sequence[str] | None = None, runner: CommandRunner | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     try:
-        reject_ambiguous_cli(raw_argv)
-        namespace = parser().parse_args(raw_argv)
-        spec = spec_from_namespace(namespace)
-        actual_runner = runner or CommandRunner()
-        if namespace.mode == "plan":
-            return plan_mode(spec, actual_runner)
-        if namespace.mode == "run":
-            return run_mode(spec, namespace.approved_plan, namespace.approved_plan_sha256, actual_runner)
-        return restore_mode(spec, namespace.approved_plan, namespace.approved_plan_sha256, actual_runner)
+        with TerminationBoundary():
+            reject_ambiguous_cli(raw_argv)
+            namespace = parser().parse_args(raw_argv)
+            spec = spec_from_namespace(namespace)
+            actual_runner = runner or CommandRunner()
+            if namespace.mode == "plan":
+                return plan_mode(spec, actual_runner)
+            if namespace.mode == "run":
+                return run_mode(spec, namespace.approved_plan, namespace.approved_plan_sha256, actual_runner)
+            return restore_mode(spec, namespace.approved_plan, namespace.approved_plan_sha256, actual_runner)
     except HarnessError as exc:
         print(f"REALNIC_ACCEPTANCE_STOP reason={exc}", file=sys.stderr)
         return 125
