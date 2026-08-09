@@ -8,6 +8,10 @@ readonly PACKAGE_ID='4f2a9b61'
 readonly EXPECTED_REMOTE_PACKAGE="/home/siyixuan/wg-mix-ebpf-test/unpriv-${PACKAGE_ID}"
 readonly BOOTSTRAP_ROOT="/run/wg-mix-ebpf-source-bootstrap-${RUN_ID}"
 readonly EXPECTED_SELF="${BOOTSTRAP_ROOT}/prepare-stage-root.sh"
+readonly USER_MANIFEST="${EXPECTED_REMOTE_PACKAGE}/package-manifest.v1"
+readonly USER_BUNDLE="${EXPECTED_REMOTE_PACKAGE}/source-${PACKAGE_ID}.bundle"
+readonly SNAPSHOT_MANIFEST="${BOOTSTRAP_ROOT}/package-manifest.v1"
+readonly SNAPSHOT_BUNDLE="${BOOTSTRAP_ROOT}/source-${PACKAGE_ID}.bundle"
 readonly STAGES_ROOT='/run/wg-mix-ebpf-source-stages'
 readonly STAGE_ROOT="${STAGES_ROOT}/${RUN_ID}"
 readonly EXPECTED_SOURCE="${STAGE_ROOT}/source"
@@ -60,13 +64,13 @@ PREPARE_BLOB=''
 PREPARE_SHA256=''
 
 fail() {
-  printf 'B82_V6_STAGE_STOP mode=%s reason=%s rc=%s stage=%s; retained=1\n' \
-    "${MODE:-unparsed}" "$1" "${2:-125}" "${STAGE_ROOT}" >&2
+  printf 'B82_V6_STAGE_STOP mode=%s reason=%s rc=%s snapshot=%s stage=%s; retained=1\n' \
+    "${MODE:-unparsed}" "$1" "${2:-125}" "${BOOTSTRAP_ROOT}" "${STAGE_ROOT}" >&2
   exit "${2:-125}"
 }
 
 usage() {
-  printf 'usage: %s {plan|run} --manifest ABSOLUTE --manifest-sha256 64-lowercase-hex\n' "$0" >&2
+  printf 'usage: %s {snapshot-plan|snapshot|plan|run} --manifest ABSOLUTE --manifest-sha256 64-lowercase-hex\n' "$0" >&2
 }
 
 sha256_file() {
@@ -91,7 +95,10 @@ parse_arguments() {
   (($# == 5)) || { usage; return 64; }
   MODE="$1"
   shift
-  [[ "${MODE}" == 'plan' || "${MODE}" == 'run' ]] || return 64
+  case "${MODE}" in
+    snapshot-plan | snapshot | plan | run) ;;
+    *) return 64 ;;
+  esac
   [[ "$1" == '--manifest' && "$3" == '--manifest-sha256' ]] || return 64
   MANIFEST="$2"
   MANIFEST_SHA256="$4"
@@ -173,8 +180,6 @@ load_manifest() {
 }
 
 validate_manifest() {
-  [[ -f "${MANIFEST}" && ! -L "${MANIFEST}" ]] || return 66
-  [[ "$(sha256_file "${MANIFEST}")" == "${MANIFEST_SHA256}" ]] || return 67
   load_manifest || return $?
   [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v1' &&
     "${MANIFEST_RUN_ID}" == "${RUN_ID}" && "${MANIFEST_PACKAGE_ID}" == "${PACKAGE_ID}" &&
@@ -219,11 +224,32 @@ plan_command() {
   printf '\n'
 }
 
+render_snapshot_plan() {
+  printf 'B82_V6_SNAPSHOT_PLAN run_id=%s manifest_sha256=%s source_parent=%s destination_parent=%s\n' \
+    "${RUN_ID}" "${MANIFEST_SHA256}" "${EXPECTED_REMOTE_PACKAGE}" "${BOOTSTRAP_ROOT}"
+  plan_command C0 /usr/bin/readlink -e -- "${BOOTSTRAP_ROOT}"
+  plan_command C1 /usr/bin/stat -Lc '%U:%G:%a:%F' -- "${BOOTSTRAP_ROOT}"
+  plan_command C2 /usr/bin/test ! -e "${SNAPSHOT_MANIFEST}"
+  plan_command C3 /usr/bin/test ! -L "${SNAPSHOT_MANIFEST}"
+  plan_command C4 shell-builtin noclobber-copy "${USER_MANIFEST}" "${SNAPSHOT_MANIFEST}"
+  plan_command C5 /usr/bin/test ! -e "${SNAPSHOT_BUNDLE}"
+  plan_command C6 /usr/bin/test ! -L "${SNAPSHOT_BUNDLE}"
+  plan_command C7 shell-builtin noclobber-copy "${USER_BUNDLE}" "${SNAPSHOT_BUNDLE}"
+  plan_command C8 /usr/bin/readlink -e -- "${SNAPSHOT_MANIFEST}"
+  plan_command C9 /usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${SNAPSHOT_MANIFEST}"
+  plan_command C10 /usr/bin/sha256sum -- "${SNAPSHOT_MANIFEST}"
+  plan_command C11 shell-builtin parse-verified-root-manifest "${SNAPSHOT_MANIFEST}"
+  plan_command C12 /usr/bin/readlink -e -- "${SNAPSHOT_BUNDLE}"
+  plan_command C13 /usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${SNAPSHOT_BUNDLE}"
+  plan_command C14 /usr/bin/sha256sum -- "${SNAPSHOT_BUNDLE}"
+  printf 'B82_V6_SNAPSHOT_PLAN_COMPLETE no_commands_executed=1 no_cleanup=1 failure_resources_retained=1\n'
+}
+
 render_plan() {
-  local bundle="${EXPECTED_REMOTE_PACKAGE}/${BUNDLE_NAME}" branch="${INTEGRATION_REF#refs/heads/}"
+  local bundle="${SNAPSHOT_BUNDLE}" branch="${INTEGRATION_REF#refs/heads/}"
   printf 'B82_V6_STAGE_PLAN run_id=%s commit=%s manifest_sha256=%s wg_state=%s\n' \
     "${RUN_ID}" "${INTEGRATION_COMMIT}" "${MANIFEST_SHA256}" "${WG_STATE}"
-  plan_command S0 /usr/bin/sha256sum -- "${MANIFEST}"
+  plan_command S0 /usr/bin/sha256sum -- "${SNAPSHOT_MANIFEST}"
   plan_command S1 /usr/bin/sha256sum -- "${bundle}"
   plan_command S2 /usr/bin/mkdir --mode=0700 -- "${STAGES_ROOT}"
   plan_command S3 /usr/bin/mkdir --mode=0700 -- "${STAGE_ROOT}"
@@ -258,12 +284,31 @@ run_step() {
   return "${rc}"
 }
 
-require_package_file() {
-  local name="$1" expected_sha="$2" path="${EXPECTED_REMOTE_PACKAGE}/$1" shape
-  [[ -f "${path}" && ! -L "${path}" ]] || return 66
-  shape="$(/usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${path}")" || return 66
-  [[ "${shape}" == 'siyixuan:siyixuan:600:1:regular file' ]] || return 67
-  [[ "$(sha256_file "${path}")" == "${expected_sha}" ]] || return 67
+copy_noclobber() {
+  local source="$1" destination="$2"
+  case "${source}:${destination}" in
+    "${USER_MANIFEST}:${SNAPSHOT_MANIFEST}" | "${USER_BUNDLE}:${SNAPSHOT_BUNDLE}") ;;
+    *) return 65 ;;
+  esac
+  [[ ! -e "${destination}" && ! -L "${destination}" ]] || return 73
+  (umask 077
+    set -o noclobber
+    /usr/bin/cat -- "${source}" >"${destination}")
+}
+
+run_copy_step() {
+  local label="$1" source="$2" destination="$3" rc started finished
+  started="$(/usr/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" || return 70
+  printf 'B82_V6_STAGE_EVENT utc=%s event=start step=%s argv=shell-builtin noclobber-copy ' \
+    "${started}" "${label}"
+  quote_argv "${source}" "${destination}"
+  printf '\n'
+  copy_noclobber "${source}" "${destination}"
+  rc=$?
+  finished="$(/usr/bin/date -u '+%Y-%m-%dT%H:%M:%SZ')" || return 70
+  printf 'B82_V6_STAGE_EVENT utc=%s event=finish step=%s target=%s rc=%s\n' \
+    "${finished}" "${label}" "${destination}" "${rc}"
+  return "${rc}"
 }
 
 git_stage() {
@@ -281,19 +326,72 @@ verify_host() {
   [[ "$(/usr/bin/cat /etc/machine-id)" == "${EXPECTED_MACHINE_ID}" ]] || return 78
 }
 
-require_plan_self() {
-  [[ "$0" == /* && -f "$0" && ! -L "$0" ]] || return 66
-  [[ "$(sha256_file "$0")" == "${PREPARE_SHA256}" ]] || return 67
+require_bootstrap_root() {
+  local canonical_root root_shape
+  canonical_root="$(/usr/bin/readlink -e -- "${BOOTSTRAP_ROOT}")" || return 78
+  [[ "${canonical_root}" == "${BOOTSTRAP_ROOT}" && -d "${BOOTSTRAP_ROOT}" &&
+    ! -L "${BOOTSTRAP_ROOT}" ]] || return 78
+  root_shape="$(/usr/bin/stat -Lc '%U:%G:%a:%F' -- "${BOOTSTRAP_ROOT}")" || return 78
+  [[ "${root_shape}" == 'root:root:700:directory' ]] || return 78
 }
 
-require_root_owned_self() {
+require_root_owned_self_shape() {
   local canonical_self self_shape
   [[ "$(/usr/bin/id -u)" == '0' ]] || return 77
   canonical_self="$(/usr/bin/readlink -e -- "$0")" || return 78
   [[ "${canonical_self}" == "${EXPECTED_SELF}" && -f "${EXPECTED_SELF}" && ! -L "${EXPECTED_SELF}" ]] || return 78
   self_shape="$(/usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${EXPECTED_SELF}")" || return 78
   [[ "${self_shape}" == 'root:root:700:1:regular file' ]] || return 78
+}
+
+require_root_owned_self() {
+  require_root_owned_self_shape || return $?
   [[ "$(sha256_file "${EXPECTED_SELF}")" == "${PREPARE_SHA256}" ]] || return 78
+}
+
+require_snapshot_file() {
+  local path="$1" expected_sha="$2" canonical_path file_shape
+  case "${path}" in
+    "${SNAPSHOT_MANIFEST}" | "${SNAPSHOT_BUNDLE}") ;;
+    *) return 65 ;;
+  esac
+  canonical_path="$(/usr/bin/readlink -e -- "${path}")" || return 78
+  [[ "${canonical_path}" == "${path}" && -f "${path}" && ! -L "${path}" ]] || return 78
+  file_shape="$(/usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${path}")" || return 78
+  [[ "${file_shape}" == 'root:root:600:1:regular file' ]] || return 78
+  [[ "$(sha256_file "${path}")" == "${expected_sha}" ]] || return 67
+}
+
+snapshot_package() {
+  [[ "$(/usr/bin/id -u)" == '0' ]] || fail 'root-required' 77
+  require_root_owned_self_shape || fail 'root-owned-self-shape' $?
+  require_bootstrap_root || fail 'bootstrap-root' $?
+  [[ "${MANIFEST}" == "${USER_MANIFEST}" ]] || fail 'snapshot-source-manifest-path' 65
+  verify_host || fail 'host-identity' $?
+  [[ ! -e "${SNAPSHOT_MANIFEST}" && ! -L "${SNAPSHOT_MANIFEST}" &&
+    ! -e "${SNAPSHOT_BUNDLE}" && ! -L "${SNAPSHOT_BUNDLE}" ]] ||
+    fail 'snapshot-destination-exists' 73
+  run_copy_step C4 "${USER_MANIFEST}" "${SNAPSHOT_MANIFEST}" || fail 'manifest-copy' $?
+  run_copy_step C7 "${USER_BUNDLE}" "${SNAPSHOT_BUNDLE}" || fail 'bundle-copy' $?
+  require_snapshot_file "${SNAPSHOT_MANIFEST}" "${MANIFEST_SHA256}" || fail 'snapshot-manifest' $?
+  MANIFEST="${SNAPSHOT_MANIFEST}"
+  validate_manifest || fail 'manifest-contract' $?
+  require_root_owned_self || fail 'root-owned-self' $?
+  require_snapshot_file "${SNAPSHOT_BUNDLE}" "${BUNDLE_SHA256}" || fail 'snapshot-bundle' $?
+  printf 'B82_V6_SNAPSHOT_COMPLETE run_id=%s manifest=%s bundle=%s retained=1\n' \
+    "${RUN_ID}" "${SNAPSHOT_MANIFEST}" "${SNAPSHOT_BUNDLE}"
+}
+
+load_root_snapshot_contract() {
+  [[ "$(/usr/bin/id -u)" == '0' ]] || fail 'root-required' 77
+  require_root_owned_self_shape || fail 'root-owned-self-shape' $?
+  require_bootstrap_root || fail 'bootstrap-root' $?
+  [[ "${MANIFEST}" == "${SNAPSHOT_MANIFEST}" ]] || fail 'snapshot-manifest-path' 65
+  verify_host || fail 'host-identity' $?
+  require_snapshot_file "${SNAPSHOT_MANIFEST}" "${MANIFEST_SHA256}" || fail 'snapshot-manifest' $?
+  validate_manifest || fail 'manifest-contract' $?
+  require_root_owned_self || fail 'root-owned-self' $?
+  require_snapshot_file "${SNAPSHOT_BUNDLE}" "${BUNDLE_SHA256}" || fail 'snapshot-bundle' $?
 }
 
 write_binding_marker() {
@@ -307,19 +405,8 @@ write_binding_marker() {
 }
 
 run_stage() {
-  local bundle="${EXPECTED_REMOTE_PACKAGE}/${BUNDLE_NAME}" branch="${INTEGRATION_REF#refs/heads/}"
+  local bundle="${SNAPSHOT_BUNDLE}" branch="${INTEGRATION_REF#refs/heads/}"
   local parent_shape stage_head stage_status
-  [[ "$(/usr/bin/id -u)" == '0' ]] || fail 'root-required' 77
-  require_root_owned_self || fail 'root-owned-self' $?
-  [[ "${MANIFEST}" == "${EXPECTED_REMOTE_PACKAGE}/package-manifest.v1" ]] || fail 'remote-manifest-path' 65
-  verify_host || fail 'host-identity' $?
-  require_package_file package-manifest.v1 "${MANIFEST_SHA256}" || fail 'manifest-file' $?
-  require_package_file "${BUNDLE_NAME}" "${BUNDLE_SHA256}" || fail 'bundle-file' $?
-  require_package_file root-matrix-n-r.sh "${ROOT_MATRIX_SHA256}" || fail 'matrix-file' $?
-  require_package_file check-realhost-iperf.py "${CHECKER_SHA256}" || fail 'checker-file' $?
-  require_package_file test-hermetic-matrix.sh "${HERMETIC_SHA256}" || fail 'hermetic-file' $?
-  require_package_file test_matrix_static.py "${STATIC_SHA256}" || fail 'static-file' $?
-  require_package_file prepare-stage-root.sh "${PREPARE_SHA256}" || fail 'prepare-file' $?
 
   if [[ -e "${STAGES_ROOT}" || -L "${STAGES_ROOT}" ]]; then
     [[ -d "${STAGES_ROOT}" && ! -L "${STAGES_ROOT}" ]] || fail 'stages-root-shape' 79
@@ -360,17 +447,23 @@ run_stage() {
 
 main() {
   parse_arguments "$@" || fail 'arguments' $?
-  validate_manifest || fail 'manifest-contract' $?
-  if [[ "${MODE}" == 'plan' ]]; then
-    if [[ "$(/usr/bin/id -u)" == '0' ]]; then
-      require_root_owned_self || fail 'root-owned-self' $?
-    else
-      require_plan_self || fail 'plan-self' $?
-    fi
-    render_plan
-  else
-    run_stage
-  fi
+  case "${MODE}" in
+    snapshot-plan)
+      [[ "${MANIFEST}" == "${USER_MANIFEST}" ]] || fail 'snapshot-source-manifest-path' 65
+      render_snapshot_plan
+      ;;
+    snapshot)
+      snapshot_package
+      ;;
+    plan)
+      load_root_snapshot_contract
+      render_plan
+      ;;
+    run)
+      load_root_snapshot_contract
+      run_stage
+      ;;
+  esac
 }
 
 main "$@"

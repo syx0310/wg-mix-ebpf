@@ -418,6 +418,7 @@ readonly -a BOOTSTRAP_OPERATIONS=(
   bootstrap-install-stager
   bootstrap-stager-readlink bootstrap-stager-sha bootstrap-stager-stat
 )
+readonly -a STAGE_OPERATIONS=(stage-snapshot stage-plan stage-run)
 
 plan_all() {
   local operation name
@@ -429,7 +430,7 @@ plan_all() {
     run_operation plan "verify-sha-${name}" || return $?
     run_operation plan "verify-stat-${name}" || return $?
   done
-  for operation in controller-shellcheck hermetic-matrix "${BOOTSTRAP_OPERATIONS[@]}" stage-plan stage-run; do
+  for operation in controller-shellcheck hermetic-matrix "${BOOTSTRAP_OPERATIONS[@]}" "${STAGE_OPERATIONS[@]}"; do
     run_operation plan "${operation}" || return $?
   done
   if [[ "${WG_STATE}" == 'absent' ]]; then
@@ -467,7 +468,7 @@ execute_prepare() {
     run_operation execute "verify-sha-${name}" || return $?
     run_operation execute "verify-stat-${name}" || return $?
   done
-  for operation in controller-shellcheck hermetic-matrix "${BOOTSTRAP_OPERATIONS[@]}" stage-plan stage-run; do
+  for operation in controller-shellcheck hermetic-matrix "${BOOTSTRAP_OPERATIONS[@]}" "${STAGE_OPERATIONS[@]}"; do
     run_operation execute "${operation}" || return $?
   done
 }

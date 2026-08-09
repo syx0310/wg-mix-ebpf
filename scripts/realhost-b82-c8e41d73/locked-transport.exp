@@ -270,6 +270,7 @@ proc build_operation {values manifest_sha operation} {
     set local_package [dict get $values local_package_dir]
     set bootstrap_root "/run/wg-mix-ebpf-source-bootstrap-c8e41d73"
     set bootstrap_stager "${bootstrap_root}/prepare-stage-root.sh"
+    set snapshot_manifest "${bootstrap_root}/package-manifest.v1"
     set remote {}
     set tty 0
     set prompt_limit 1
@@ -394,11 +395,20 @@ proc build_operation {values manifest_sha operation} {
             set tty 1
             set prompt_limit 2
         }
+        stage-snapshot {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /bin/bash -p $bootstrap_stager \
+                snapshot --manifest "${package}/package-manifest.v1" \
+                --manifest-sha256 $manifest_sha]]
+            set tty 1
+            set prompt_limit 2
+            set timeout_seconds 2400
+        }
         stage-plan - stage-run {
             set stage_mode [expr {$operation eq "stage-plan" ? "plan" : "run"}]
             set remote [concat [list /usr/bin/sudo --] [env_argv] \
                 [list /bin/bash -p $bootstrap_stager \
-                $stage_mode --manifest "${package}/package-manifest.v1" \
+                $stage_mode --manifest $snapshot_manifest \
                 --manifest-sha256 $manifest_sha]]
             set tty 1
             set prompt_limit 2

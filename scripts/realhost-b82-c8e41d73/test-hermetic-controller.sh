@@ -180,7 +180,10 @@ for literal in \
   'operation=bootstrap-stager-readlink transport=ssh credential_read=0 network_operations=0' \
   'operation=bootstrap-stager-sha transport=ssh credential_read=0 network_operations=0' \
   'operation=bootstrap-stager-stat transport=ssh credential_read=0 network_operations=0' \
-  '/bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh run' \
+  'operation=stage-snapshot transport=ssh credential_read=0 network_operations=0' \
+  '/bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh snapshot --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1' \
+  '/bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh plan --manifest /run/wg-mix-ebpf-source-bootstrap-c8e41d73/package-manifest.v1' \
+  '/bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh run --manifest /run/wg-mix-ebpf-source-bootstrap-c8e41d73/package-manifest.v1' \
   'operation=matrix-run transport=ssh credential_read=0 network_operations=0' \
   '--wg-interface wg0 --wg-local-address 10.200.0.1 --wg-peer-address 10.200.0.2' \
   'B82_V6_CONTROLLER_PLAN_COMPLETE credential_read=0 network_operations=0 mutations=0'; do
@@ -189,6 +192,10 @@ done
 [[ "${CONTROLLER_PLAN}" != *'B82_V6_MATRIX_BLOCKED'* ]] || fail 'bound plan was blocked'
 [[ "${CONTROLLER_PLAN}" != *'/bin/bash -p /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/prepare-stage-root.sh'* ]] ||
   fail 'controller plan executes user-writable package stager'
+[[ "${CONTROLLER_PLAN}" != *'prepare-stage-root.sh plan --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1'* ]] ||
+  fail 'controller stage plan reopens the user-owned manifest'
+[[ "${CONTROLLER_PLAN}" != *'prepare-stage-root.sh run --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1'* ]] ||
+  fail 'controller stage run reopens the user-owned manifest'
 require_ordered_literals "${CONTROLLER_PLAN}" \
   'operation=bootstrap-absent ' \
   'operation=bootstrap-not-symlink ' \
@@ -199,6 +206,7 @@ require_ordered_literals "${CONTROLLER_PLAN}" \
   'operation=bootstrap-stager-readlink ' \
   'operation=bootstrap-stager-sha ' \
   'operation=bootstrap-stager-stat ' \
+  'operation=stage-snapshot ' \
   'operation=stage-plan ' \
   'operation=stage-run '
 
@@ -219,16 +227,76 @@ if /bin/test ! -L "${BOOTSTRAP_SYMLINK_FIXTURE}"; then
 fi
 printf 'HERMETIC_BOOTSTRAP first_run_reachable=1 preexisting_rejected=1 retained=%s\n' "${BOOTSTRAP_FIXTURE}"
 
-STAGE_PLAN="$(/bin/bash "${BOUND_OUTPUT}/prepare-stage-root.sh" plan \
-  --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}")" ||
-  fail 'root stage plan'
+IMMUTABLE_FIXTURE="${TEST_ROOT}/immutable-intake-c8e41d73"
+/bin/mkdir -m 0700 -- "${IMMUTABLE_FIXTURE}" || fail 'immutable intake fixture creation'
+MANIFEST_GOOD="${IMMUTABLE_FIXTURE}/manifest-good.v1"
+MANIFEST_EVIL="${IMMUTABLE_FIXTURE}/manifest-evil.v1"
+MANIFEST_SOURCE="${IMMUTABLE_FIXTURE}/manifest-source.v1"
+MANIFEST_SNAPSHOT="${IMMUTABLE_FIXTURE}/manifest-snapshot.v1"
+printf 'decision\ttrusted\n' >"${MANIFEST_GOOD}" || fail 'trusted manifest fixture'
+printf 'decision\tuntrusted\n' >"${MANIFEST_EVIL}" || fail 'untrusted manifest fixture'
+/bin/cp -- "${MANIFEST_GOOD}" "${MANIFEST_SOURCE}" || fail 'old manifest source setup'
+OLD_MANIFEST_SHA="$(sha256_file "${MANIFEST_SOURCE}")" || fail 'old manifest hash gate'
+/bin/cp -- "${MANIFEST_EVIL}" "${MANIFEST_SOURCE}" || fail 'old manifest evil swap'
+OLD_MANIFEST_VALUE="$(/usr/bin/awk -F '\t' '$1 == "decision" { print $2 }' "${MANIFEST_SOURCE}")" ||
+  fail 'old manifest reopen'
+[[ "${OLD_MANIFEST_SHA}" == "$(sha256_file "${MANIFEST_GOOD}")" &&
+  "${OLD_MANIFEST_VALUE}" == 'untrusted' ]] || fail 'old manifest TOCTOU was not reproduced'
+/bin/cp -- "${MANIFEST_GOOD}" "${MANIFEST_SOURCE}" || fail 'manifest source good restore'
+(umask 077
+  set -o noclobber
+  /bin/cat -- "${MANIFEST_SOURCE}" >"${MANIFEST_SNAPSHOT}") || fail 'manifest intake copy'
+/bin/cp -- "${MANIFEST_EVIL}" "${MANIFEST_SOURCE}" || fail 'manifest post-copy evil swap'
+/bin/cp -- "${MANIFEST_GOOD}" "${MANIFEST_SOURCE}" || fail 'manifest post-copy good restore'
+[[ "$(sha256_file "${MANIFEST_SNAPSHOT}")" == "$(sha256_file "${MANIFEST_GOOD}")" &&
+  "$(/usr/bin/awk -F '\t' '$1 == "decision" { print $2 }' "${MANIFEST_SNAPSHOT}")" == 'trusted' ]] ||
+  fail 'immutable manifest copy changed after source replacement'
+if (set -o noclobber
+  /bin/cat -- "${MANIFEST_EVIL}" >"${MANIFEST_SNAPSHOT}") \
+  2>"${IMMUTABLE_FIXTURE}/manifest-noclobber.err"; then
+  fail 'immutable manifest destination was clobbered'
+fi
+
+BUNDLE_SOURCE="${IMMUTABLE_FIXTURE}/bundle-source.bundle"
+BUNDLE_SNAPSHOT="${IMMUTABLE_FIXTURE}/bundle-snapshot.bundle"
+/bin/cp -- "${BOUND_OUTPUT}/source-4f2a9b61.bundle" "${BUNDLE_SOURCE}" || fail 'old bundle source setup'
+/usr/bin/git -C "${FIXTURE_REPOSITORY}" bundle verify "${BUNDLE_SOURCE}" || fail 'old bundle verify gate'
+printf 'replacement-after-verify\n' >"${BUNDLE_SOURCE}" || fail 'old bundle replacement'
+if /usr/bin/git -C "${FIXTURE_REPOSITORY}" bundle verify "${BUNDLE_SOURCE}" \
+  >"${IMMUTABLE_FIXTURE}/old-bundle-reopen.log" 2>&1; then
+  fail 'old bundle reopen unexpectedly consumed the verified bytes'
+fi
+/bin/cp -- "${BOUND_OUTPUT}/source-4f2a9b61.bundle" "${BUNDLE_SOURCE}" || fail 'bundle source restore'
+(umask 077
+  set -o noclobber
+  /bin/cat -- "${BUNDLE_SOURCE}" >"${BUNDLE_SNAPSHOT}") || fail 'bundle intake copy'
+printf 'replacement-after-copy\n' >"${BUNDLE_SOURCE}" || fail 'bundle post-copy replacement'
+[[ "$(sha256_file "${BUNDLE_SNAPSHOT}")" == \
+  "$(manifest_value bundle_sha256 "${BOUND_MANIFEST}")" ]] || fail 'immutable bundle digest'
+/usr/bin/git -C "${FIXTURE_REPOSITORY}" bundle verify "${BUNDLE_SNAPSHOT}" ||
+  fail 'immutable bundle verify'
+IMMUTABLE_CLONE="${IMMUTABLE_FIXTURE}/source"
+/usr/bin/git clone --no-local --no-checkout --single-branch --branch "${FIXTURE_BRANCH}" -- \
+  "${BUNDLE_SNAPSHOT}" "${IMMUTABLE_CLONE}" || fail 'immutable bundle clone'
+/usr/bin/git -C "${IMMUTABLE_CLONE}" checkout --detach "${FIXTURE_COMMIT}" ||
+  fail 'immutable bundle checkout'
+[[ "$(/usr/bin/git -C "${IMMUTABLE_CLONE}" rev-parse HEAD)" == "${FIXTURE_COMMIT}" ]] ||
+  fail 'immutable clone commit mismatch'
+printf 'HERMETIC_IMMUTABLE_INTAKE old_manifest_reopen=failed old_bundle_reopen=failed root_copy_only=pass retained=%s\n' \
+  "${IMMUTABLE_FIXTURE}"
+
+STAGE_PLAN="$(/bin/bash "${BOUND_OUTPUT}/prepare-stage-root.sh" snapshot-plan \
+  --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1 \
+  --manifest-sha256 "${BOUND_MANIFEST_SHA}")" || fail 'root snapshot plan'
 for literal in \
-  'B82_V6_STAGE_PLAN run_id=c8e41d73' \
-  'git -c core.hooksPath=/dev/null clone --no-local --no-checkout' \
-  "checkout --detach ${FIXTURE_COMMIT}" \
-  'B82_V6_STAGE_PLAN_COMPLETE no_commands_executed=1 no_cleanup=1'; do
-  [[ "${STAGE_PLAN}" == *"${literal}"* ]] || fail "stage plan missing ${literal}"
+  'B82_V6_SNAPSHOT_PLAN run_id=c8e41d73' \
+  'shell-builtin noclobber-copy /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1 /run/wg-mix-ebpf-source-bootstrap-c8e41d73/package-manifest.v1' \
+  'shell-builtin noclobber-copy /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/source-4f2a9b61.bundle /run/wg-mix-ebpf-source-bootstrap-c8e41d73/source-4f2a9b61.bundle' \
+  'shell-builtin parse-verified-root-manifest /run/wg-mix-ebpf-source-bootstrap-c8e41d73/package-manifest.v1' \
+  'B82_V6_SNAPSHOT_PLAN_COMPLETE no_commands_executed=1 no_cleanup=1 failure_resources_retained=1'; do
+  [[ "${STAGE_PLAN}" == *"${literal}"* ]] || fail "snapshot plan missing ${literal}"
 done
+require_ordered_literals "${STAGE_PLAN}" 'C4 argv=' 'C7 argv=' 'C8 argv=' 'C11 argv=' 'C14 argv='
 
 expect_failure wrong-manifest-sha /bin/bash "${FIXTURE_REVIEW}/controller.sh" plan \
   --manifest "${BOUND_MANIFEST}" \
@@ -308,5 +376,5 @@ expect_failure absent-matrix-run /bin/bash "${FIXTURE_REVIEW}/controller.sh" run
 
 printf '%s\n' \
   'hermetic v6 full-history binder, root-owned bootstrap, SSH/SCP/Expect plan,' \
-  'shallow/failure paths and WireGuard absence: PASS'
+  'immutable-intake/shallow/failure paths and WireGuard absence: PASS'
 printf 'RETAINED_HERMETIC_ROOT path=%s reason=auditable-no-cleanup-test-policy\n' "${TEST_ROOT}"

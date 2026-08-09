@@ -89,11 +89,12 @@ Files added by this framework:
   It has separate `preflight`, `prepare`, `matrix-plan`, `run`, and explicit
   `restore` modes and stops on the first failure without cleanup.
 * `prepare-stage-root.sh`: the versioned high-privilege preparation content. It
-  verifies host/package identity and hashes plus its own canonical path,
-  root:root ownership, mode 0700, link count, regular-file type, and manifest
-  SHA-256. It creates only the fixed run-owned source stage when absent, clones
-  the bound bundle, checks out the exact commit, runs Bash/ShellCheck gates, and
-  writes a noclobber binding marker.
+  copies the fixed manifest and bundle once into the run-unique root-owned
+  bootstrap, verifies the two mode-0600 single-link copies, and thereafter
+  parses and clones only those copies. It also verifies its own canonical path,
+  root:root ownership, mode 0700, link count, regular-file type, and SHA-256.
+  It creates only the fixed run-owned source stage when absent, checks out the
+  exact commit, runs Bash/ShellCheck gates, and writes a noclobber binding marker.
   It has no inline SSH body, recursive deletion, trap, package installation,
   container, mount, chroot, or namespace operation.
 
@@ -115,8 +116,12 @@ any privileged script execution, the fixed transport operation chain is:
    0700 with `--no-target-directory`.
 4. Revalidate the installed path, SHA-256, root:root ownership, mode, link
    count, and type in separate fixed argv operations.
-5. Execute both stage `plan` and `run` only from that installed path. The script
-   repeats its own identity checks on every root invocation.
+5. Invoke its single `snapshot` intake: noclobber-copy the fixed user-owned
+   manifest and bundle to fixed mode-0600 files in the bootstrap, then verify
+   canonical path, root:root ownership, mode, link count, manifest argv SHA,
+   and the manifest-bound bundle SHA.
+6. Execute stage `plan` and `run` only from the installed stager and pass only
+   the root-owned manifest path. Git clone opens only the root-owned bundle.
 
 An existing bootstrap path, install/hash/stat mismatch, or any interrupted step
 stops the controller and retains the exact resources. No automatic cleanup or
@@ -223,8 +228,9 @@ before the matrix is limited to:
   `/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61` and its nine fixed SCP
   destinations;
 * the new root-owned mode-0700 directory
-  `/run/wg-mix-ebpf-source-bootstrap-c8e41d73` and its single installed
-  `prepare-stage-root.sh` file;
+  `/run/wg-mix-ebpf-source-bootstrap-c8e41d73`, its installed
+  `prepare-stage-root.sh`, and fixed root-owned mode-0600 single-link copies of
+  `package-manifest.v1` and `source-4f2a9b61.bundle`;
 * if absent, the root-owned mode-0700 parent
   `/run/wg-mix-ebpf-source-stages`;
 * the new root-owned mode-0700 stage
@@ -242,6 +248,15 @@ The two bootstrap write argv are exactly:
 
 They are preceded by exact root absence and non-symlink checks and followed by exact
 readlink/SHA/stat checks. There is no shared bootstrap parent and no `mkdir -p`.
+The subsequent fixed root stager invocation is:
+
+    /bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh \
+      snapshot --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1 \
+      --manifest-sha256 FINAL_MANIFEST_SHA256
+
+Its only writes are noclobber copies to the two fixed bootstrap destinations.
+Both copies complete before manifest parsing. Any copy, shape, or hash failure
+retains the bootstrap and stops; there is no fallback to a user-owned source.
 
 If a later reviewed controller invokes `run`, its write set is limited to:
 
@@ -291,7 +306,7 @@ It must report both:
     hermetic matrix argv and failure-path tests: PASS
     static v6 binder/controller/transport/stager safety contract: PASS
     hermetic v6 full-history binder, root-owned bootstrap, SSH/SCP/Expect plan,
-    shallow/failure paths and WireGuard absence: PASS
+    immutable-intake/shallow/failure paths and WireGuard absence: PASS
 
 ShellCheck is mandatory on .82 before any later sudo phase; its absence on the
 local macOS host is an explicit skip, not a remote pass. The old v5 package must

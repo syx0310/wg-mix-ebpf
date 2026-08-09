@@ -118,6 +118,7 @@ def main() -> None:
         "BOOTSTRAP_OPERATIONS",
         "bootstrap-absent bootstrap-not-symlink bootstrap-create bootstrap-root-readlink bootstrap-root-stat",
         "bootstrap-stager-readlink bootstrap-stager-sha bootstrap-stager-stat",
+        "STAGE_OPERATIONS=(stage-snapshot stage-plan stage-run)",
     )
     for literal in required_controller:
         if literal not in controller:
@@ -169,6 +170,10 @@ def main() -> None:
         "bootstrap-stager-readlink",
         "bootstrap-stager-sha",
         "bootstrap-stager-stat",
+        "stage-snapshot",
+        'set snapshot_manifest "${bootstrap_root}/package-manifest.v1"',
+        'snapshot --manifest "${package}/package-manifest.v1"',
+        "$stage_mode --manifest $snapshot_manifest",
         'set assertion exact:root:root:700:1:regular\\ file',
         "/usr/bin/test -d /usr/src/linux-headers-7.0.0-28-generic",
     )
@@ -197,6 +202,7 @@ def main() -> None:
         "bootstrap-stager-readlink",
         "bootstrap-stager-sha",
         "bootstrap-stager-stat",
+        "stage-snapshot",
         "stage-plan - stage-run",
     )
     positions = [transport.index(item) for item in bootstrap_order]
@@ -206,7 +212,7 @@ def main() -> None:
     required_stager = (
         "root-required",
         "host-identity",
-        "bundle-file",
+        "snapshot-bundle",
         "stage-exists",
         "clone --no-local",
         "checkout --detach",
@@ -217,6 +223,17 @@ def main() -> None:
         "retained=1",
         'readonly BOOTSTRAP_ROOT="/run/wg-mix-ebpf-source-bootstrap-${RUN_ID}"',
         'readonly EXPECTED_SELF="${BOOTSTRAP_ROOT}/prepare-stage-root.sh"',
+        'readonly USER_MANIFEST="${EXPECTED_REMOTE_PACKAGE}/package-manifest.v1"',
+        'readonly USER_BUNDLE="${EXPECTED_REMOTE_PACKAGE}/source-${PACKAGE_ID}.bundle"',
+        'readonly SNAPSHOT_MANIFEST="${BOOTSTRAP_ROOT}/package-manifest.v1"',
+        'readonly SNAPSHOT_BUNDLE="${BOOTSTRAP_ROOT}/source-${PACKAGE_ID}.bundle"',
+        "snapshot-plan | snapshot | plan | run",
+        "copy_noclobber",
+        '/usr/bin/cat -- "${source}" >"${destination}"',
+        "snapshot-destination-exists",
+        "root:root:600:1:regular file",
+        'local bundle="${SNAPSHOT_BUNDLE}"',
+        '[[ "${MANIFEST}" == "${SNAPSHOT_MANIFEST}" ]]',
         "require_root_owned_self",
         "root:root:700:1:regular file",
         'canonical_self="$(/usr/bin/readlink -e -- "$0")"',
@@ -229,6 +246,20 @@ def main() -> None:
         fail("root stager contains package installation")
     if "${EXPECTED_SOURCE}" not in stager or "${STAGE_ROOT}" not in stager:
         fail("root stager does not use the fixed run-owned stage")
+    if "require_package_file" in stager:
+        fail("root stager still revalidates user-owned package scripts")
+    if 'local bundle="${EXPECTED_REMOTE_PACKAGE}/${BUNDLE_NAME}"' in stager:
+        fail("root stager clones by reopening the user-owned bundle")
+    if stager.index('run_copy_step C7 "${USER_BUNDLE}"') > stager.index(
+        'require_snapshot_file "${SNAPSHOT_MANIFEST}"'
+    ):
+        fail("root stager parses or validates the manifest before both intake copies complete")
+    if stager.index('run_copy_step C7 "${USER_BUNDLE}"') > stager.index(
+        'MANIFEST="${SNAPSHOT_MANIFEST}"'
+    ):
+        fail("root stager parses the manifest before the bundle intake copy completes")
+    if stager.count("validate_manifest || fail 'manifest-contract'") != 2:
+        fail("root stager manifest parsing escaped the two root-snapshot consumers")
 
     matrix_forbidden = (
         "chroot",
