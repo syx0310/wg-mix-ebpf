@@ -1934,10 +1934,14 @@ int wg_mix_egress(struct __sk_buff *skb)
 	// normalized only after that proof and still before any packet-byte write.
 	if (rule->transport_mode == TRANSPORT_FAKETCP) {
 		if (faketcp_parse_tc_l3(skb, &info, &faketcp_l3) !=
+		    FAKETCP_L3_OK ||
+		    faketcp_managed_transform_status(&faketcp_l3, IPPROTO_UDP) !=
 		    FAKETCP_L3_OK) {
 			inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 			return TC_ACT_SHOT;
 		}
+		if (!faketcp_mtu_allows_growth(skb, faketcp_l3.l3_len))
+			return TC_ACT_SHOT;
 		if (faketcp_egress_admission_checkpoint(
 			    skb, &info, &faketcp_l3, managed, rule, profile,
 			    generation, rc,
@@ -1977,7 +1981,6 @@ int wg_mix_egress(struct __sk_buff *skb)
 			inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 			return TC_ACT_SHOT;
 		}
-		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT);
 		rc = update_type_word(skb, &info, old_wire, new_wire, 1);
 		if (rc < 0) {
 			inc_stat(rc == -2 ? STAT_SKB_STORE_ERROR :
