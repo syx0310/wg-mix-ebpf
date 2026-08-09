@@ -189,6 +189,36 @@ func (reader repeatingEventReader) Read() (EventRecord, error) {
 func (repeatingEventReader) SetDeadline(time.Time) {}
 func (repeatingEventReader) Close() error          { return nil }
 
+func TestProductionEventReaderExactDuplicateDoesNotAllocate(t *testing.T) {
+	sample := testProductionPacketSample(t, 1, 1)
+	reader, err := newProductionEventReader(
+		repeatingEventReader{sample: sample},
+		testRuntimeIdentity(1),
+		4,
+		&memoryEventLossCounter{},
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reader.Read(); err != nil {
+		t.Fatal(err)
+	}
+	var got EventRecord
+	allocs := testing.AllocsPerRun(1000, func() {
+		got, err = reader.Read()
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.RawSample) != len(sample) {
+		t.Fatalf("duplicate sample size=%d, want %d", len(got.RawSample), len(sample))
+	}
+	if allocs != 0 {
+		t.Fatalf("exact duplicate allocated %.2f objects per read", allocs)
+	}
+}
+
 func BenchmarkProductionEventReaderExactDuplicate(b *testing.B) {
 	sample := testProductionPacketSample(b, 1, 1)
 	reader, err := newProductionEventReader(
