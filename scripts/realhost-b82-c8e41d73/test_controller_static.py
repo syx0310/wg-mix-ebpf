@@ -30,11 +30,11 @@ def bash_function(payload: str, name: str) -> str:
 
 def bash_array(payload: str, name: str) -> str:
     match = re.search(
-        rf"(?ms)^readonly -a {re.escape(name)}=\(\n(?P<body>.*?)^\)\n", payload
+        rf"(?ms)^readonly -a {re.escape(name)}=\((?P<body>.*?)\)\n", payload
     )
     if not match:
         fail(f"cannot isolate Bash array {name}")
-    return match.group("body")
+    return match.group("body").strip("\n")
 
 
 def tcl_proc(payload: str, name: str) -> str:
@@ -45,6 +45,16 @@ def tcl_proc(payload: str, name: str) -> str:
     if not match:
         fail(f"cannot isolate Tcl procedure {name}")
     return match.group("body")
+
+
+def tcl_return_words(payload: str, name: str) -> tuple[str, ...]:
+    match = re.search(
+        rf"(?ms)^proc {re.escape(name)} \{{[^\n]*\}} \{{\s*return \{{(.*?)\}}\s*\}}\n",
+        payload,
+    )
+    if not match:
+        fail(f"cannot isolate fixed Tcl list {name}")
+    return tuple(match.group(1).split())
 
 
 def ordered(body: str, literals: tuple[str, ...], contract: str) -> None:
@@ -324,6 +334,39 @@ def main() -> None:
             fail(
                 f"{name} EOF guard does not reject a 104th line both with and without newline"
             )
+    nul_helpers = tuple(
+        bash_function(payload, "require_manifest_fd_without_nul")
+        for payload in (controller, stager, fresh)
+    )
+    if len(set(nul_helpers)) != 1:
+        fail("Bash manifest consumers do not share one identical NUL precheck")
+    nul_helper = nul_helpers[0]
+    ordered(
+        nul_helper,
+        (
+            "/usr/bin/python3 -B -I -c '",
+            "descriptor = int(sys.argv[1])",
+            "offset = 0",
+            "chunk = os.pread(descriptor, 65536, offset)",
+            'if b"\\0" in chunk:',
+            "raise SystemExit(65)",
+            "offset += len(chunk)",
+            "except (OSError, ValueError):",
+            "raise SystemExit(66)",
+        ),
+        "same-FD manifest NUL precheck",
+    )
+    if re.search(r"os\.(?:read|lseek)\(|print\(|sys\.(?:stdout|stderr)", nul_helper):
+        fail("manifest NUL helper consumes the parser FD or emits file bytes")
+    for name, load, open_fd, scan_fd in (
+        ("controller", bash_function(controller, "load_manifest"), 'exec 3<"${MANIFEST}"', "require_manifest_fd_without_nul 3"),
+        ("root-stager", bash_function(stager, "load_manifest"), 'exec 3<"${MANIFEST}"', "require_manifest_fd_without_nul 3"),
+        ("root-fresh", bash_function(fresh, "load_manifest_once"), 'exec {MANIFEST_FD}<"${SNAPSHOT_MANIFEST}"', 'require_manifest_fd_without_nul "${MANIFEST_FD}"'),
+    ):
+        prefix = load[: load.index("read_manifest_field format FORMAT")]
+        ordered(prefix, (open_fd, scan_fd, "rc=$?", 'return "${rc}"'), f"{name} NUL gate")
+        if prefix.count(scan_fd) != 1:
+            fail(f"{name} does not scan its already-open parser FD exactly once")
     required_transport_eof = (
         'set payload [read $channel]',
         '![string match "*\\n" $payload]',
@@ -390,6 +433,8 @@ def main() -> None:
 
     required_controller = (
         "B82_V6_LEGACY_MATRIX_RETIRED controller_entries=0 historical_recovery=frozen-original-package-before-final-staging",
+        "verify-package|plan|preflight|prepare|provision-apply",
+        "B82_V6_CONTROLLER_PACKAGE_VERIFIED",
         "identity-wg-interfaces",
         "identity-netns",
         "identity-driver",
@@ -404,17 +449,12 @@ def main() -> None:
         "BOOTSTRAP_CREATE_OPERATIONS",
         "bootstrap-absent bootstrap-not-symlink bootstrap-create bootstrap-root-readlink bootstrap-root-stat",
         "bootstrap-install-provisioner bootstrap-install-stager",
-        "bootstrap-provisioner-readlink bootstrap-provisioner-stat bootstrap-provisioner-sha",
-        "bootstrap-stager-readlink bootstrap-stager-stat bootstrap-stager-sha",
+        "BOOTSTRAP_ROOT_VERIFY_OPERATIONS=(bootstrap-root-readlink bootstrap-root-stat)",
+        "PROVISIONER_VERIFY_OPERATIONS",
+        "STAGER_VERIFY_OPERATIONS",
         "STAGE_OPERATIONS=(stage-snapshot stage-plan stage-run)",
-        "state_transition PACKAGE_BOUND BOOTSTRAP_ONLY",
-        "state_transition BOOTSTRAP_ONLY PROVISION_CHECK",
-        "state_transition PROVISION_CHECK AWAIT_APPLY",
-        "state_transition AWAIT_APPLY PROVISION_APPLY",
-        "state_transition PROVISION_APPLY POSTFLIGHT",
+        "run_operation execute prepare",
         "run_operation execute provision-apply",
-        "B82_V6_PROVISION_AWAIT_APPLY",
-        "automatic_apply=0",
         "fresh-plan | fresh-run | fresh-restore",
         "veth-plan | veth-run | veth-restore",
         "routed-plan | routed-run | routed-restore",
@@ -436,8 +476,9 @@ def main() -> None:
         "realnic-plan.${APPROVED_PLAN_SHA256}.json",
         "verify_local_approved_plan",
         "scp-realnic-approved-plan verify-sha-realnic-approved-plan",
-        "stage-realnic-plan-snapshot realnic-run",
+        "verify-stat-realnic-approved-plan stage-realnic-plan-snapshot realnic-run",
         "stage-realnic-plan-verify",
+        "run_operation execute realnic-run",
         "run_operation execute realnic-restore",
         "legacy_forward=retired",
     )
@@ -560,7 +601,7 @@ def main() -> None:
     stale_calls = tuple(
         re.findall(r"(?m)^\s*run_prepare_new_stale_gate (plan|execute)(?: \|\| return \$\?)?$", controller)
     )
-    if stale_calls != ("plan", "execute", "execute"):
+    if stale_calls != ("plan", "execute"):
         fail("prepare-new stale gate call sites or action order changed")
     ordered(
         bash_function(controller, "plan_all"),
@@ -571,16 +612,23 @@ def main() -> None:
         ),
         "plan prepare-new stale gate",
     )
-    ordered(
-        bash_function(controller, "execute_prepare"),
-        (
-            'for operation in "${BASE_IDENTITY_OPERATIONS[@]}"; do',
-            "run_prepare_new_stale_gate execute || return $?",
-            "run_operation execute package-parent-stat || return $?",
-            "run_operation execute package-mkdir || return $?",
+    controller_transactions = {
+        "execute_prepare": ("run_operation execute prepare",),
+        "execute_provision_apply": ("run_operation execute provision-apply",),
+        "execute_realnic_run": (
+            "verify_local_approved_plan || return $?",
+            "run_operation execute realnic-run",
         ),
-        "execute prepare-new stale gate",
-    )
+        "execute_realnic_restore": ("run_operation execute realnic-restore",),
+    }
+    for name, expected in controller_transactions.items():
+        lines = tuple(
+            line.strip()
+            for line in bash_function(controller, name).splitlines()
+            if line.strip()
+        )
+        if lines != expected:
+            fail(f"controller {name} is not one fixed high-level transaction")
     for mode in (
         "fresh-plan",
         "fresh-run",
@@ -603,74 +651,30 @@ def main() -> None:
         fail("controller still exposes the legacy top-level restore mode")
     if "hermetic-realnic-" in controller or "hermetic-realnic-" in transport:
         fail("controller/transport runs realNIC tests from the flat package copy")
-    realnic_run = controller[
-        controller.index("execute_realnic_run() {") : controller.index(
-            "execute_realnic_restore() {"
-        )
-    ]
-    run_order = (
-        "verify_local_approved_plan",
-        "scp-realnic-approved-plan verify-sha-realnic-approved-plan",
-        "verify-stat-realnic-approved-plan stage-realnic-plan-snapshot realnic-run",
+    literal_executes = re.findall(r"run_operation execute ([a-z][a-z0-9-]+)", controller)
+    allowed_executes = {
+        "prepare", "provision-apply", "realnic-run", "realnic-restore",
+        "fresh-plan", "fresh-run", "fresh-restore", "veth-plan", "veth-run",
+        "veth-restore", "routed-plan", "routed-run", "routed-restore",
+    }
+    if set(literal_executes) != allowed_executes or len(literal_executes) != len(allowed_executes):
+        fail("controller retains direct primitive mutation sequencing")
+    verify_arm = re.search(
+        r"(?ms)^\s*verify-package\)\n(.*?)^\s*;;$", bash_function(controller, "main")
     )
-    positions = [realnic_run.index(item) for item in run_order]
-    if positions != sorted(positions):
-        fail("realNIC run does not use the single fixed intake-before-run sequence")
-    realnic_restore = controller[
-        controller.index("execute_realnic_restore() {") : controller.index("main() {")
-    ]
-    if "scp-realnic-approved-plan" in realnic_restore or realnic_restore.count(
-        "stage-realnic-plan-verify"
-    ) != 1:
-        fail("realNIC restore recopies intake or lacks one root snapshot verification")
-    prepare_body = controller[
-        controller.index("execute_prepare() {") : controller.index("execute_provision_apply() {")
-    ]
-    if "run_operation execute provision-apply" in prepare_body:
-        fail("prepare can trigger provisioning apply")
-    apply_body = controller[
-        controller.index("execute_provision_apply() {") : controller.index("main() {")
-    ]
-    if apply_body.count("run_operation execute provision-apply") != 1:
-        fail("explicit apply path does not contain exactly one fixed apply operation")
-    apply_order = (
-        "verify_remote_package || return $?",
-        "run_provision_check || return $?",
-        "state_transition PROVISION_CHECK AWAIT_APPLY",
-        "state_transition AWAIT_APPLY PROVISION_APPLY",
-        "verify_provisioner || return $?",
-        "run_operation execute provision-apply",
-        "verify_provisioner || return $?",
-        "run_provision_check || return $?",
-        "state_transition PROVISION_APPLY POSTFLIGHT",
-        "execute_postflight",
-    )
-    remaining = apply_body
-    for literal in apply_order:
-        position = remaining.find(literal)
-        if position < 0:
-            fail(f"explicit apply order is missing {literal!r}")
-        remaining = remaining[position + len(literal) :]
-    postflight_body = controller[
-        controller.index("execute_postflight() {") : controller.index("execute_prepare() {")
-    ]
-    postflight_order = (
-        "verify_remote_package || return $?",
-        '"${POSTFLIGHT_OPERATIONS[@]}" controller-shellcheck hermetic-matrix',
-        "verify_stager || return $?",
-        '"${STAGE_OPERATIONS[@]}"',
-        "B82_V6_CONTROLLER_POSTFLIGHT_COMPLETE",
-    )
-    positions = [postflight_body.index(item) for item in postflight_order]
-    if positions != sorted(positions):
-        fail("postflight no longer performs full preflight before staging")
+    if (
+        not verify_arm
+        or "B82_V6_CONTROLLER_PACKAGE_VERIFIED" not in verify_arm.group(1)
+        or any(word in verify_arm.group(1) for word in ("run_operation", "transport "))
+    ):
+        fail("controller verify-package seam is not read-only")
 
     required_transport = (
         'set action [lindex $argv 7]',
         'if {$action eq "plan"}',
         "credential_read=0 network_operations=0",
         'if {[catch {open $credential_path r} credential_file]}',
-        'send -- "$password\\r"',
+        'send -i $child_id -- "$password\\r"',
         'spawn -noecho {*}$spawn_argv',
         "B82_V6_TRANSPORT_EXECUTE operation=$operation",
         "credential_in_argv=0",
@@ -711,6 +715,14 @@ def main() -> None:
         "proc capture_child_payload",
         "capture-payload-frame",
         "operation_requires_approved_sha",
+        "proc transaction_operation",
+        "proc read_only_operation",
+        "proc require_controller_verifier_authority",
+        "proc execute_controller_package_verifier",
+        "proc require_transaction_local_authority",
+        "proc execute_transaction",
+        "B82_V6_TRANSPORT_TRANSACTION_START",
+        "B82_V6_TRANSPORT_TRANSACTION_COMPLETE",
         "/root-fresh-verifier-gate.sh",
         "--controller-source $source",
         'set bootstrap_root "/run/wg-mix-ebpf-source-bootstrap-c8e41d73"',
@@ -790,10 +802,127 @@ def main() -> None:
         fail("transport_main does not bind all six values from the exact odd positions")
     required_action_guard = (
         'if {($action eq "capture" && $operation ne "realnic-plan") ||',
-        '($action eq "execute" && $operation eq "realnic-plan")}',
+        '($action eq "execute" && ![transaction_operation $operation] &&',
+        '![read_only_operation $operation])}',
         'fail "action-operation" 65',
     )
     ordered(transport_main, required_action_guard, "transport action/operation gate")
+    action_guard = transport_main[
+        transport_main.index('if {($action eq "capture"') : transport_main.index(
+            "set sha_is_valid"
+        )
+    ]
+    if '$action eq "plan"' in action_guard:
+        fail("transport blocks fixed mutation leaves from credential-free planning")
+
+    transaction_match = re.search(
+        r"(?ms)\$operation in \{(.*?)\}",
+        tcl_proc(transport, "transaction_operation"),
+    )
+    expected_transactions = tuple(
+        "prepare provision-apply fresh-run fresh-restore veth-run veth-restore "
+        "routed-run routed-restore realnic-run realnic-restore".split()
+    )
+    if not transaction_match or tuple(transaction_match.group(1).split()) != expected_transactions:
+        fail("transport high-level transaction set is not exact")
+    read_only = tcl_proc(transport, "read_only_operation")
+    read_only_match = re.search(r"(?ms)if \{\$operation in \{(.*?)\}\} \{", read_only)
+    expected_read_only = tuple(
+        "package-parent-stat bootstrap-absent bootstrap-not-symlink "
+        "bootstrap-root-readlink bootstrap-root-stat bootstrap-stager-readlink "
+        "bootstrap-stager-stat bootstrap-stager-sha bootstrap-provisioner-readlink "
+        "bootstrap-provisioner-stat bootstrap-provisioner-sha provision-check stage-plan "
+        "fresh-plan veth-plan routed-plan verify-sha-realnic-approved-plan "
+        "verify-stat-realnic-approved-plan stage-realnic-plan-verify".split()
+    )
+    if not read_only_match or tuple(read_only_match.group(1).split()) != expected_read_only:
+        fail("transport explicit read-only operation set is not exact")
+    ordered(
+        read_only,
+        (
+            "[lsearch -exact [concat [base_identity_operations] [postflight_operations]",
+            "[prepare_stale_operations]] $operation] >= 0",
+            r"[regexp {^verify-(?:sha|stat)-(.+)$} $operation -> name]",
+            "[lsearch -exact [package_names] $name] >= 0",
+            "return 0",
+        ),
+        "transport closed read-only operation set",
+    )
+    if "{^(identity-|tool-|kernel-|stale-)}" in read_only:
+        fail("transport read-only authority accepts an open-ended operation prefix")
+
+    list_pairs = (
+        ("BASE_IDENTITY_OPERATIONS", "base_identity_operations"),
+        ("POSTFLIGHT_OPERATIONS", "postflight_operations"),
+        ("PREPARE_NEW_STALE_OPERATIONS", "prepare_stale_operations"),
+        ("PACKAGE_NAMES", "package_names"),
+        ("BOOTSTRAP_CREATE_OPERATIONS", "bootstrap_create_operations"),
+        ("BOOTSTRAP_ROOT_VERIFY_OPERATIONS", "bootstrap_verify_operations"),
+        ("PROVISIONER_VERIFY_OPERATIONS", "provisioner_verify_operations"),
+        ("STAGER_VERIFY_OPERATIONS", "stager_verify_operations"),
+        ("STAGE_OPERATIONS", "stage_operations"),
+    )
+    for bash_name, tcl_name in list_pairs:
+        if tuple(bash_array(controller, bash_name).split()) != tcl_return_words(
+            transport, tcl_name
+        ):
+            fail(f"controller/transport fixed list mismatch: {bash_name}")
+
+    verifier_authority = tcl_proc(transport, "require_controller_verifier_authority")
+    for literal in (
+        'set controller_source "${repository}/${controller_path}"',
+        'set controller_copy "${package}/controller.sh"',
+        '$source_stat(type) ne "file" || $source_stat(nlink) != 1',
+        '$source_stat(size) < 1 || $source_stat(size) > 16777216',
+        "($source_stat(mode) & 07777) != 0755",
+        '$copy_stat(type) ne "file" || $copy_stat(nlink) != 1',
+        '$copy_stat(size) < 1 || $copy_stat(size) > 16777216',
+        "($copy_stat(mode) & 07777) != 0600",
+        "file_sha256 $controller_source",
+        "file_sha256 $controller_copy",
+        "hash-object -- $controller_source",
+        'rev-parse "${integration_commit}:${controller_path}"',
+        "ls-tree $integration_commit -- $controller_path",
+        '100755 blob ${expected_blob}\\t${controller_path}',
+    ):
+        if literal not in verifier_authority:
+            fail(f"controller source/tree/flat authority is missing {literal!r}")
+    package_verifier = tcl_proc(transport, "execute_controller_package_verifier")
+    local_authority = tcl_proc(transport, "require_transaction_local_authority")
+    ordered(
+        local_authority,
+        (
+            "require_controller_verifier_authority $values",
+            "foreach name [package_names]",
+            'build_operation $values $manifest_sha "scp-$name" none',
+            "execute_controller_package_verifier $values $manifest_sha",
+            'if {$operation eq "realnic-run"',
+            "build_operation $values $manifest_sha scp-realnic-approved-plan",
+        ),
+        "pre-credential transaction authority",
+    )
+    ordered(
+        package_verifier,
+        (
+            'set controller "${package}/controller.sh"',
+            "/bin/bash $controller verify-package",
+            "B82_V6_TRANSPORT_PACKAGE_AUTHORITY",
+        ),
+        "flat controller verify-package seam",
+    )
+    ordered(
+        transport_main,
+        (
+            'if {$action eq "plan"}',
+            'if {$action eq "capture"}',
+            "set prebuilt_operation_spec {}",
+            "require_transaction_local_authority $values $manifest_sha $operation $approved_sha",
+            "build_operation $values $manifest_sha $operation",
+            "set password [read_execute_credential $credential_path]",
+            "execute_transaction $values $manifest_sha $operation $approved_sha $password",
+        ),
+        "credential-front transaction/prebuild seam",
+    )
 
     approved_proc = tcl_proc(transport, "operation_requires_approved_sha")
     approved_match = re.search(r"(?ms)\$operation in \{(?P<body>.*?)\}", approved_proc)
@@ -813,6 +942,61 @@ def main() -> None:
     ):
         fail("transport does not implement exactly the controller's 30 stale operations")
 
+    prepare_transaction = tcl_proc(transport, "execute_prepare_transaction")
+    ordered(
+        prepare_transaction,
+        (
+            "execute_stale_transaction_gate $values $manifest_sha $password",
+            "transaction_step $values $manifest_sha package-mkdir none $password",
+            "foreach name [package_names]",
+            'transaction_step $values $manifest_sha "scp-$name" none $password',
+            'transaction_step $values $manifest_sha "verify-sha-$name" none $password',
+            'transaction_step $values $manifest_sha "verify-stat-$name" none $password',
+            "foreach operation [bootstrap_create_operations]",
+        ),
+        "atomic prepare transaction copy/verify sequence",
+    )
+    ordered(
+        tcl_proc(transport, "verify_remote_package_transaction"),
+        (
+            "foreach name [package_names]",
+            'transaction_step $values $manifest_sha "verify-sha-$name" none $password',
+            'transaction_step $values $manifest_sha "verify-stat-$name" none $password',
+        ),
+        "remote package verification transaction",
+    )
+    execute_transaction = tcl_proc(transport, "execute_transaction")
+    for operation, expected in (
+        ("realnic-run", "scp-realnic-approved-plan verify-sha-realnic-approved-plan verify-stat-realnic-approved-plan stage-realnic-plan-snapshot realnic-run"),
+        ("realnic-restore", "stage-realnic-plan-verify realnic-restore"),
+    ):
+        match = re.search(
+            rf"(?ms)^\s*{operation} \{{\s*foreach primitive \{{(.*?)\}} \{{",
+            execute_transaction,
+        )
+        if not match or tuple(match.group(1).split()) != tuple(expected.split()):
+            fail(f"transport {operation} transaction leaf sequence is not exact")
+
+    generic_package = build_operation[build_operation.index(
+        '} elseif {[regexp {^(scp|verify-sha|verify-stat)-(.+)$} $operation'
+    ) :]
+    ordered(
+        generic_package,
+        (
+            "set expected_sha [package_sha $values $name]",
+            'if {$family eq "scp"}',
+            "file lstat $local_path local_stat",
+            "$local_stat(size) < 1 || $local_stat(size) > 16777216",
+            "[file_sha256 $local_path] ne $expected_sha",
+            'return -code error "scp-local-file"',
+            "return [list scp $spawn_argv",
+            '} elseif {$family eq "verify-sha"}',
+            "/usr/bin/sha256sum",
+            "/usr/bin/stat -Lc %U:%G:%a:%h:%F",
+        ),
+        "bounded manifest-bound generic SCP",
+    )
+
     clean_status = tcl_proc(transport, "clean_child_exit_status")
     clean_status_contract = (
         "[llength $wait_status] != 4",
@@ -826,21 +1010,25 @@ def main() -> None:
     ordered(clean_status, clean_status_contract, "clean child exit status")
     if transport.count("clean_child_exit_status $wait_status") != 3:
         fail("not every capture/ordinary child wait uses the signal-rejecting status parser")
-    ordinary_execute = transport_main[transport_main.index("set timeout $timeout_seconds") :]
+    ordinary_execute = tcl_proc(transport, "execute_operation_spec")
     ordered(
         ordinary_execute,
         (
-            "if {[catch {wait -i $spawn_id} wait_status]}",
-            'fail "child-wait-status" 78',
-            "if {[catch {clean_child_exit_status $wait_status} child_rc]}",
+            "spawn -noecho {*}$spawn_argv",
+            "set child_id $spawn_id",
+            "wait -i $child_id",
+            "clean_child_exit_status $wait_status",
             'fail "child-wait-status" 78',
             "if {$child_rc != 0}",
+            "return [list child-failure $child_rc $captured_output none]",
             "if {$assertion eq \"provision-check\"}",
             "assert_output $assertion $captured_output",
         ),
         "ordinary execute signal fail-closed path",
     )
-    if transport.index('if {$action eq "plan"}') > transport.index("open $credential_path r"):
+    if transport_main.index('if {$action eq "plan"}') > transport_main.index(
+        "read_execute_credential $credential_path"
+    ):
         fail("transport opens credentials before the plan-mode exit")
     if re.search(r"puts[^\n]*\$password", transport):
         fail("transport prints the credential variable")
