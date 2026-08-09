@@ -1,0 +1,9 @@
+{
+  "format": "wg-mix-ebpf-oss-public-paths-v1",
+  "legacy_public_history_commit": "aae3e6e79ce8820b2846ea4b645faba01d9af303",
+  "main_commit": "3bb5568b435a5d3b96a1376f6e87b7c56b44f4c9",
+  "public_paths": [
+    "app.txt",
+    "lib.txt"
+  ]
+}
