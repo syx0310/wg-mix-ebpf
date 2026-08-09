@@ -469,7 +469,7 @@ func (c *Controller) handleOwnedDecodedEvent(
 		return actions, engineErr
 	}
 	if err := c.dispatcher.validateActions(selection.wgID, actions); err != nil {
-		return actions, err
+		return actions, c.markFailed(err)
 	}
 	if err := c.executeActions(ctx, actions); err != nil {
 		return actions, c.handleActionExecutionError(err)
@@ -489,6 +489,9 @@ func (c *Controller) Tick(ctx context.Context) ([]Action, error) {
 		return nil, err
 	}
 	actions, engineErr := c.dispatcher.Tick()
+	if errors.Is(engineErr, ErrEngineRouteRejected) {
+		return actions, c.markFailed(engineErr)
+	}
 	if executeErr := c.executeActions(ctx, actions); executeErr != nil {
 		return actions, errors.Join(engineErr, c.handleActionExecutionError(executeErr))
 	}
