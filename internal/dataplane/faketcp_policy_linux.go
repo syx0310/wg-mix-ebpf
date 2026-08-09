@@ -36,9 +36,7 @@ var errFakeTCPPolicyGenerationLeaseRequired = errors.New(
 	"FakeTCP policy mutation requires a held generation transaction lease",
 )
 
-// fakeTCPPolicyGenerationIsolationBackend proves both sides of the generation
-// lifecycle: Stage requires a closed gate, Activate precedes selector commit,
-// and Quiesce seals and drains before policy removal.
+// Barrier transitions are the sole generation lifecycle authority.
 type fakeTCPPolicyGenerationIsolationBackend interface {
 	AssertInactive(context.Context, uint64) error
 	Activate(context.Context, uint64) error

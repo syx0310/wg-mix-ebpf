@@ -60,6 +60,9 @@ func (barrier *liveFakeTCPGenerationBarrier) BindCollection(
 
 	barrier.mu.Lock()
 	defer barrier.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if barrier.gate != nil {
 		return errors.New("bind FakeTCP generation barrier: already bound")
 	}

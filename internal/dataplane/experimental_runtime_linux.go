@@ -1167,7 +1167,6 @@ func (build *experimentalRuntimeBuild) cleanupUncommitted() (bool, error) {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("deactivate FakeTCP baseline core: %w", err))
 		}
 	}
-	// Seal and drain while both packet programs and their maps are still owned.
 	if coreInactive && build.policyStage != nil {
 		if err := build.claim.Rollback(build.cleanupCtx, build.policyStage); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("rollback FakeTCP policy stage: %w", err))
