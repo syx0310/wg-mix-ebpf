@@ -37,15 +37,11 @@ var errFakeTCPPolicyGenerationLeaseRequired = errors.New(
 )
 
 // fakeTCPPolicyGenerationIsolationBackend proves both sides of the generation
-// lifecycle. AssertInactive must prove that no dataplane selector currently
-// reaches the target generation before Stage performs its first map lookup.
-// The retained lifecycle lease then prevents cooperating userspace from
-// selecting it during staging. Quiesce is called only after every interface
-// reachability latch has been confirmed absent; a successful return must also
-// guarantee that all BPF executions which could have observed those latches
-// have exited.
+// lifecycle: Stage requires a closed gate, Activate precedes selector commit,
+// and Quiesce seals and drains before policy removal.
 type fakeTCPPolicyGenerationIsolationBackend interface {
 	AssertInactive(context.Context, uint64) error
+	Activate(context.Context, uint64) error
 	Quiesce(context.Context, uint64) error
 }
 
@@ -70,6 +66,7 @@ type fakeTCPPolicyGenerationTransaction struct {
 	identity            *fakeTCPPolicyGenerationIdentity
 	stage               *fakeTCPPolicyStage
 	runtimeClaim        *fakeTCPPolicyRuntimeBuildClaim
+	activated           bool
 	closed              bool
 }
 
@@ -334,6 +331,10 @@ func (claim *fakeTCPPolicyRuntimeBuildClaim) commitRuntimeBuild(
 		transaction.mu.Unlock()
 		return false, errors.New("commit FakeTCP runtime: program-array stage is not rollback-owned")
 	}
+	if !transaction.activated {
+		transaction.mu.Unlock()
+		return false, errors.New("commit FakeTCP runtime: generation barrier is not active")
+	}
 
 	policyStage.operations = nil
 	policyStage.state = fakeTCPPolicyStageDisarmed
@@ -379,6 +380,9 @@ func (transaction *fakeTCPPolicyGenerationTransaction) closeForRuntimeClaim(
 		(transaction.stage.state == fakeTCPPolicyStageActive ||
 			transaction.stage.state == fakeTCPPolicyStageRollbackPending) {
 		return errors.New("cannot close FakeTCP generation transaction with a live policy stage")
+	}
+	if transaction.activated {
+		return errors.New("cannot close FakeTCP generation transaction with an active barrier")
 	}
 	transaction.closed = true
 	transaction.runtimeClaim = nil
@@ -489,6 +493,37 @@ func (transaction *fakeTCPPolicyGenerationTransaction) stageForRuntimeClaim(
 	return stage, nil
 }
 
+// Activate opens a complete stage while the selector is still zero.
+func (claim *fakeTCPPolicyRuntimeBuildClaim) Activate(
+	ctx context.Context,
+	stage *fakeTCPPolicyStage,
+) error {
+	if claim == nil || claim.transaction == nil {
+		return fmt.Errorf("activate FakeTCP policy generation: %w", errFakeTCPPolicyGenerationLeaseRequired)
+	}
+	transaction := claim.transaction
+	transaction.mu.Lock()
+	defer transaction.mu.Unlock()
+	if err := transaction.assertStageLocked(ctx, claim, stage); err != nil {
+		return fmt.Errorf("activate FakeTCP policy generation: %w", err)
+	}
+	if stage.state != fakeTCPPolicyStageActive {
+		return errors.New("activate FakeTCP policy generation: policy stage is not rollback-owned")
+	}
+	if transaction.activated {
+		return errors.New("activate FakeTCP policy generation: barrier is already active")
+	}
+	if err := transaction.isolation.Activate(ctx, transaction.plan.generation); err != nil {
+		return fmt.Errorf(
+			"activate FakeTCP policy generation %d: %w",
+			transaction.plan.generation,
+			err,
+		)
+	}
+	transaction.activated = true
+	return nil
+}
+
 const (
 	fakeTCPPolicyStageActive uint8 = iota
 	fakeTCPPolicyStageRollbackPending
@@ -509,10 +544,8 @@ type fakeTCPPolicyStage struct {
 	collectionOwner *experimentalCollectionOwner
 }
 
-// Rollback is idempotent after a complete rollback or Disarm. It first removes
-// every interface latch, then executes the mandatory BPF quiescence barrier,
-// then removes ports, and only then removes control policies. A failure in any
-// layer stops before its dependencies and leaves the same handle retryable.
+// Rollback seals and drains before removing interface, port, and control keys.
+// Failure leaves the same stage and isolation owner retryable.
 func (transaction *fakeTCPPolicyGenerationTransaction) Rollback(
 	ctx context.Context,
 	stage *fakeTCPPolicyStage,
@@ -552,6 +585,7 @@ func (transaction *fakeTCPPolicyGenerationTransaction) rollbackForRuntimeClaim(
 	}
 	stage.operations = nil
 	stage.state = fakeTCPPolicyStageRolledBack
+	transaction.activated = false
 	return nil
 }
 
@@ -589,6 +623,9 @@ func (transaction *fakeTCPPolicyGenerationTransaction) disarmForRuntimeClaim(
 	}
 	switch stage.state {
 	case fakeTCPPolicyStageActive:
+		if transaction.activated {
+			return errors.New("cannot disarm FakeTCP policy stage outside the combined runtime commit")
+		}
 		stage.operations = nil
 		stage.state = fakeTCPPolicyStageDisarmed
 		return nil
@@ -860,8 +897,7 @@ func newFakeTCPPolicyOperationWithComparator[K comparable, V comparable](
 			}
 			// Lookup+Delete is not an atomic kernel operation. Safety comes
 			// from the retained lifecycle lease excluding userspace writers;
-			// control policies are reached only after interface latches are
-			// absent and the BPF quiescence barrier has succeeded.
+			// rollback begins only after the gate is sealed and drained.
 			if err := m.Delete(key); err != nil {
 				if errors.Is(err, ebpf.ErrKeyNotExist) {
 					return nil
@@ -884,7 +920,7 @@ func newFakeTCPPolicyOperationWithComparator[K comparable, V comparable](
 // fakeTCPControlPolicyRollbackMatches accepts only the cursor drift owned by
 // BPF. Struct equality after normalizing virtual_time_nanos keeps generation,
 // interval, burst, and all reserved bytes strict. The caller enables this
-// comparator only after interface latches are absent and Quiesce succeeds.
+// comparator only after Quiesce succeeds.
 func fakeTCPControlPolicyRollbackMatches(
 	actual abi.FakeTCPControlPolicyValue,
 	inserted abi.FakeTCPControlPolicyValue,
@@ -916,22 +952,25 @@ func rollbackFakeTCPPolicyOperationsLocked(
 	transaction *fakeTCPPolicyGenerationTransaction,
 	applied []fakeTCPPolicyOperation,
 ) error {
+	if err := transaction.assertHeldLocked(ctx); err != nil {
+		return err
+	}
+	if err := transaction.isolation.Quiesce(ctx, transaction.plan.generation); err != nil {
+		return fmt.Errorf(
+			"quiesce FakeTCP policy generation %d before removing policy: %w",
+			transaction.plan.generation,
+			err,
+		)
+	}
+	if err := transaction.assertHeldLocked(ctx); err != nil {
+		return err
+	}
 	if err := rollbackFakeTCPPolicyPhase(
 		applied,
 		fakeTCPPolicyPhaseInterface,
 		fakeTCPPolicyRollbackExact,
 	); err != nil {
 		return fmt.Errorf("remove FakeTCP interface reachability latches: %w", err)
-	}
-	if err := transaction.assertHeldLocked(ctx); err != nil {
-		return err
-	}
-	if err := transaction.isolation.Quiesce(ctx, transaction.plan.generation); err != nil {
-		return fmt.Errorf(
-			"quiesce FakeTCP policy generation %d after removing interface latches: %w",
-			transaction.plan.generation,
-			err,
-		)
 	}
 	if err := transaction.assertHeldLocked(ctx); err != nil {
 		return err

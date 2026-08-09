@@ -33,6 +33,8 @@ func experimentalMapDescriptors() []pinnedMapDescriptor {
 		{name: "faketcp_events", mapType: ebpf.RingBuf, maxEntries: 1 << 20},
 		{name: "faketcp_capture_scratch", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 2408, maxEntries: 1},
 		{name: "faketcp_rt_id", mapType: ebpf.Array, keySize: 4, valueSize: 32, maxEntries: 1},
+		{name: "faketcp_gen_gt", mapType: ebpf.Array, keySize: 4, valueSize: 16, maxEntries: 1, flags: unix.BPF_F_RDONLY},
+		{name: "faketcp_gen_wk", mapType: ebpf.RingBuf, maxEntries: 4096},
 		{name: "faketcp_cap_seq", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 1},
 		{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 176, maxEntries: 1, flags: unix.BPF_F_RDONLY},
 		{name: "faketcp_egress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: 2},
@@ -53,6 +55,10 @@ func experimentalProgramDescriptors() []baselineProgramDescriptor {
 		},
 		{
 			name: "wg_faketcp_session_claim", sectionName: "classifier/faketcp_session_claim",
+			programType: ebpf.SchedCLS, license: experimentalFakeTCPLicense,
+		},
+		{
+			name: "wg_faketcp_generation_control", sectionName: "classifier/faketcp_generation_control",
 			programType: ebpf.SchedCLS, license: experimentalFakeTCPLicense,
 		},
 	}
