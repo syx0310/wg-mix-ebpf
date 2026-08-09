@@ -130,11 +130,22 @@ for literal in \
   'WG_MIX_EBPF_TEST_ACTION=restore' \
   'M.load operation=module-load target=wg_mix_faketcp_checksum argv=/usr/sbin/insmod' \
   'R.module operation=module-unload target=wg_mix_faketcp_checksum argv=/usr/sbin/rmmod wg_mix_faketcp_checksum' \
-  'R.veth operation=veth-delete target=wga19f7a argv=/usr/sbin/ip link delete dev wga19f7a' \
+  'R.veth-a operation=veth-delete target=wga19f7a argv=/usr/sbin/ip link delete dev wga19f7a' \
+  'R.veth-b operation=veth-delete-b target=wga19f7b argv=/usr/sbin/ip link delete dev wga19f7b' \
   'B82_VETH_V6_WRITE_SET stage=/run/wg-mix-ebpf-source-stages/a19f7c2e' \
   'B82_VETH_V6_PLAN_COMPLETE argv_builder=shared commands_are_review_templates=1 no_commands_executed=1 credential_read=0 network_operations=0 capability_bits_changed=0'; do
   [[ "${PLAN_OUTPUT}" == *"${literal}"* ]] || fail "plan is missing ${literal}"
 done
+
+# Both independently conditional cleanup builders must remain visible exactly once.
+for exact_line in \
+  'R.veth-a operation=veth-delete target=wga19f7a argv=/usr/sbin/ip link delete dev wga19f7a ' \
+  'R.veth-b operation=veth-delete-b target=wga19f7b argv=/usr/sbin/ip link delete dev wga19f7b '; do
+  line_count="$(printf '%s\n' "${PLAN_OUTPUT}" | /usr/bin/grep -Fxc -- "${exact_line}")"
+  [[ "${line_count}" == 1 ]] || fail "plan must contain exactly one ${exact_line}"
+done
+[[ "${PLAN_OUTPUT}" != *$'\nR.veth operation='* ]] ||
+  fail 'plan retains the obsolete single-delete operation'
 
 for test_name in "${GSO_TESTS[@]}"; do
   [[ "${PLAN_OUTPUT}" == *"operation=list:${test_name} target=${test_name} argv="* ]] ||

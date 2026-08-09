@@ -144,11 +144,57 @@ class RestoreState:
     module_phase: bool = True
     cleanup: bool = False
     terminal: str | None = None
-    veth: str = "owned"  # absent, owned, partial, unowned
+    receipt_a_ifindex: int = 101
+    receipt_b_ifindex: int = 102
+    receipt_a_sysfs: int = 1001
+    receipt_b_sysfs: int = 1002
+    veth_a_ifindex: int | None = 101
+    veth_b_ifindex: int | None = 102
+    veth_a_sysfs: int | None = 1001
+    veth_b_sysfs: int | None = 1002
+    veth_pair_identity: bool = True
     module: str = "owned"  # absent, owned, unowned
     pin_present: bool = False
     final_matches_baseline: bool = True
     writes: int = 0
+
+
+def veth_absent(state: RestoreState) -> bool:
+    return all(
+        value is None
+        for value in (
+            state.veth_a_ifindex,
+            state.veth_b_ifindex,
+            state.veth_a_sysfs,
+            state.veth_b_sysfs,
+        )
+    )
+
+
+def validate_receipted_veth(state: RestoreState) -> None:
+    endpoints = (
+        (
+            state.veth_a_ifindex,
+            state.veth_a_sysfs,
+            state.receipt_a_ifindex,
+            state.receipt_a_sysfs,
+        ),
+        (
+            state.veth_b_ifindex,
+            state.veth_b_sysfs,
+            state.receipt_b_ifindex,
+            state.receipt_b_sysfs,
+        ),
+    )
+    for live_ifindex, live_sysfs, receipt_ifindex, receipt_sysfs in endpoints:
+        if (live_ifindex is None) != (live_sysfs is None):
+            raise ModelRejected("veth-partial-endpoint-identity")
+        if live_ifindex is not None and live_ifindex != receipt_ifindex:
+            raise ModelRejected("veth-ifindex-drift")
+        if live_sysfs is not None and live_sysfs != receipt_sysfs:
+            raise ModelRejected("veth-kernel-identity-drift")
+    if not veth_absent(state) and not state.veth_pair_identity:
+        raise ModelRejected("veth-pair-identity")
 
 
 def checkpoint(state: RestoreState, name: str, cut_after: str | None) -> None:
@@ -162,7 +208,7 @@ def restore_model(state: RestoreState, cut_after: str | None = None) -> str:
     if not state.owner:
         raise ModelRejected("owner")
     if state.terminal == "restored":
-        if not state.baseline or state.veth != "absent" or state.module != "absent":
+        if not state.baseline or not veth_absent(state) or state.module != "absent":
             raise ModelRejected("restored-drift")
         if state.pin_present or not state.final_matches_baseline:
             raise ModelRejected("restored-drift")
@@ -179,7 +225,7 @@ def restore_model(state: RestoreState, cut_after: str | None = None) -> str:
     if not state.baseline:
         if any((state.mutation, state.veth_phase, state.module_phase, state.cleanup)):
             raise ModelRejected("filesystem-with-mutation")
-        if state.tcx != "none" or state.veth != "absent" or state.module != "absent":
+        if state.tcx != "none" or not veth_absent(state) or state.module != "absent":
             raise ModelRejected("filesystem-with-resource")
         state.terminal = "filesystem-retained"
         checkpoint(state, "filesystem-retained", cut_after)
@@ -188,21 +234,35 @@ def restore_model(state: RestoreState, cut_after: str | None = None) -> str:
     if not state.mutation:
         if state.veth_phase or state.module_phase or state.tcx != "none":
             raise ModelRejected("resource-without-mutation-plan")
-        if state.veth != "absent" or state.module != "absent" or state.pin_present:
+        if not veth_absent(state) or state.module != "absent" or state.pin_present:
             raise ModelRejected("resource-without-mutation-plan")
     else:
-        if state.veth in {"partial", "unowned"}:
-            raise ModelRejected("veth-identity")
         if state.module == "unowned":
             raise ModelRejected("module-identity")
-        if not state.cleanup:
-            if state.veth_phase and state.veth == "absent":
+        if state.veth_phase:
+            validate_receipted_veth(state)
+            partial = (state.veth_a_ifindex is None) != (
+                state.veth_b_ifindex is None
+            )
+            if not state.cleanup and (partial or veth_absent(state)):
                 raise ModelRejected("veth-absent-before-cleanup-intent")
-            if state.module_phase and state.module == "absent":
-                raise ModelRejected("module-absent-before-cleanup-intent")
-        if not state.veth_phase and state.veth == "owned":
+        elif not veth_absent(state):
+            if (
+                state.veth_a_ifindex is None
+                or state.veth_b_ifindex is None
+                or state.veth_a_sysfs is None
+                or state.veth_b_sysfs is None
+                or not state.veth_pair_identity
+            ):
+                raise ModelRejected("unreceipted-veth-identity")
+            state.receipt_a_ifindex = state.veth_a_ifindex
+            state.receipt_b_ifindex = state.veth_b_ifindex
+            state.receipt_a_sysfs = state.veth_a_sysfs
+            state.receipt_b_sysfs = state.veth_b_sysfs
             state.veth_phase = True
             checkpoint(state, "veth-phase", cut_after)
+        if not state.cleanup and state.module_phase and state.module == "absent":
+            raise ModelRejected("module-absent-before-cleanup-intent")
         if not state.module_phase and state.module == "owned":
             state.module_phase = True
             checkpoint(state, "module-phase", cut_after)
@@ -237,12 +297,14 @@ def restore_model(state: RestoreState, cut_after: str | None = None) -> str:
         raise ModelRejected("unowned-module")
 
     if state.veth_phase:
-        if state.veth == "owned":
-            state.veth = "absent"
+        validate_receipted_veth(state)
+        if not veth_absent(state):
+            state.veth_a_ifindex = None
+            state.veth_b_ifindex = None
+            state.veth_a_sysfs = None
+            state.veth_b_sysfs = None
             checkpoint(state, "veth-delete", cut_after)
-        elif state.veth != "absent":
-            raise ModelRejected("veth-cleanup")
-    elif state.veth != "absent":
+    elif not veth_absent(state):
         raise ModelRejected("unowned-veth")
 
     if state.pin_present or not state.final_matches_baseline:
@@ -261,15 +323,24 @@ def expect_model_rejection(label: str, state: RestoreState) -> None:
     fail(f"modeled restore accepted {label}")
 
 
+def state_without_veth(**values: object) -> RestoreState:
+    return RestoreState(
+        veth_a_ifindex=None,
+        veth_b_ifindex=None,
+        veth_a_sysfs=None,
+        veth_b_sysfs=None,
+        **values,
+    )
+
+
 def exercise_failure_cut_model() -> None:
     scenarios = {
-        "filesystem-retained": RestoreState(
+        "filesystem-retained": state_without_veth(
             baseline=False,
             mutation=False,
             veth_phase=False,
             tcx="none",
             module_phase=False,
-            veth="absent",
             module="absent",
         ),
         "veth-phase": RestoreState(veth_phase=False),
@@ -281,8 +352,8 @@ def exercise_failure_cut_model() -> None:
         "cleanup-intent": RestoreState(),
         "module-delete": RestoreState(cleanup=True),
         "veth-delete": RestoreState(cleanup=True, module="absent"),
-        "final-verify": RestoreState(cleanup=True, module="absent", veth="absent"),
-        "restored": RestoreState(cleanup=True, module="absent", veth="absent"),
+        "final-verify": state_without_veth(cleanup=True, module="absent"),
+        "restored": state_without_veth(cleanup=True, module="absent"),
     }
     for cut, state in scenarios.items():
         try:
@@ -299,8 +370,8 @@ def exercise_failure_cut_model() -> None:
         elif state.terminal != "restored":
             fail(f"modeled cut {cut} did not converge to restored")
 
-    restored = RestoreState(
-        cleanup=True, module="absent", veth="absent", terminal="restored"
+    restored = state_without_veth(
+        cleanup=True, module="absent", terminal="restored"
     )
     writes = restored.writes
     if restore_model(restored) != "already-restored" or restored.writes != writes:
@@ -311,21 +382,71 @@ def exercise_failure_cut_model() -> None:
             baseline=True, terminal="filesystem-retained"
         ),
         "mutation without baseline": RestoreState(baseline=False),
-        "partial veth pair": RestoreState(veth="partial"),
-        "unowned veth pair": RestoreState(veth="unowned"),
+        "a ifindex drift": RestoreState(veth_a_ifindex=201),
+        "b ifindex drift": RestoreState(veth_b_ifindex=202),
+        "same-name rebuilt pair": RestoreState(
+            veth_a_ifindex=201,
+            veth_b_ifindex=202,
+            veth_a_sysfs=2001,
+            veth_b_sysfs=2002,
+        ),
+        "ifindex reuse after rebuild": RestoreState(
+            veth_a_sysfs=2001, veth_b_sysfs=2002
+        ),
+        "one reused ifindex": RestoreState(
+            veth_a_ifindex=101,
+            veth_b_ifindex=202,
+            veth_a_sysfs=2001,
+            veth_b_sysfs=2002,
+        ),
+        "partial absent before cleanup": RestoreState(
+            veth_b_ifindex=None, veth_b_sysfs=None
+        ),
+        "partial present endpoint drift": RestoreState(
+            cleanup=True,
+            veth_a_ifindex=201,
+            veth_b_ifindex=None,
+            veth_b_sysfs=None,
+        ),
+        "MAC/alias cannot replace kernel identity": RestoreState(
+            veth_a_sysfs=2001,
+            veth_b_sysfs=2002,
+            veth_pair_identity=True,
+        ),
         "unowned module": RestoreState(module="unowned"),
-        "unreceipted veth": RestoreState(veth_phase=False, veth="unowned"),
+        "unreceipted veth": RestoreState(
+            veth_phase=False, veth_pair_identity=False
+        ),
         "unreceipted module": RestoreState(module_phase=False, module="unowned"),
         "module absent before cleanup intent": RestoreState(module="absent"),
-        "veth absent before cleanup intent": RestoreState(veth="absent"),
-        "final baseline drift": RestoreState(
+        "veth absent before cleanup intent": state_without_veth(),
+        "final baseline drift": state_without_veth(
             cleanup=True,
             module="absent",
-            veth="absent",
             final_matches_baseline=False,
         ),
     }.items():
         expect_model_rejection(label, state)
+
+    for label, state in {
+        "a already absent": RestoreState(
+            cleanup=True,
+            module="absent",
+            veth_a_ifindex=None,
+            veth_a_sysfs=None,
+        ),
+        "b already absent": RestoreState(
+            cleanup=True,
+            module="absent",
+            veth_b_ifindex=None,
+            veth_b_sysfs=None,
+        ),
+        "both already absent": state_without_veth(
+            cleanup=True, module="absent"
+        ),
+    }.items():
+        if restore_model(state) != "restored" or state.terminal != "restored":
+            fail(f"modeled partial/both-absent state did not converge: {label}")
 
 
 def check_forbidden_operations(runner_path: pathlib.Path, runner: str) -> None:
@@ -407,6 +528,18 @@ def check_state_machine(runner: str) -> None:
     if found != expected_phases:
         fail(f"runner phase files are not the exact state schema: {found!r}")
 
+    require_literals(
+        function_body(runner, "render_veth_phase"),
+        (
+            "format=wg-mix-ebpf-b82-veth-resource-v3",
+            '"a_ifindex=${VETH_A_IFINDEX}"',
+            '"a_sysfs_identity=${VETH_A_SYSFS_IDENTITY}"',
+            '"b_ifindex=${VETH_B_IFINDEX}"',
+            '"b_sysfs_identity=${VETH_B_SYSFS_IDENTITY}"',
+        ),
+        "immutable veth receipt",
+    )
+
     cleanup = function_body(runner, "render_cleanup_intent")
     require_literals(
         cleanup,
@@ -472,12 +605,19 @@ def check_state_machine(runner: str) -> None:
         "already-restored chain validation",
     )
     for function, required in {
-        "ensure_veth_phase": ("CLEANUP_PHASE", "partial-veth-pair", "veth-identity-drift"),
+        "ensure_veth_phase": (
+            "CLEANUP_PHASE",
+            "require_receipted_veth_pair",
+            "require_receipted_veth_endpoint",
+            "partial-veth-before-cleanup-intent",
+        ),
         "ensure_module_phase": ("CLEANUP_PHASE", "module-identity-drift"),
         "converge_veth_absent": (
             "VETH_PHASE",
-            "cleanup-veth-identity",
-            "cleanup-partial-veth",
+            "require_receipted_veth_pair",
+            "require_receipted_veth_endpoint",
+            "run_convergent_operation R.veth veth-delete",
+            "run_convergent_operation R.veth-peer veth-delete-b",
             "unowned-veth-present",
         ),
         "converge_module_absent": (
@@ -487,6 +627,49 @@ def check_state_machine(runner: str) -> None:
         ),
     }.items():
         require_literals(function_body(runner, function), required, function)
+    receipt_pair = function_body(runner, "require_receipted_veth_pair")
+    require_literals(
+        receipt_pair,
+        (
+            '"${VETH_A_IFINDEX}" "${VETH_B_IFINDEX}"',
+            '"${VETH_A_SYSFS_IDENTITY}" "${VETH_B_SYSFS_IDENTITY}"',
+            "ifindex-drift",
+            "kernel-identity-drift",
+        ),
+        "receipted veth pair identity",
+    )
+    receipt_endpoint = function_body(runner, "require_receipted_veth_endpoint")
+    require_literals(
+        receipt_endpoint,
+        (
+            'a "${VETH_A_IFINDEX}" "${VETH_A_SYSFS_IDENTITY}"',
+            'b "${VETH_B_IFINDEX}" "${VETH_B_SYSFS_IDENTITY}"',
+            "ifindex-drift",
+            "kernel-identity-drift",
+        ),
+        "receipted partial veth identity",
+    )
+    cleanup_veth = function_body(runner, "converge_veth_absent")
+    for exact_arm in (
+        "11) require_receipted_veth_pair 1 cleanup-veth; "
+        "run_convergent_operation R.veth veth-delete ;;",
+        "10) require_receipted_veth_endpoint a cleanup-veth-a; "
+        "run_convergent_operation R.veth veth-delete ;;",
+        "01) require_receipted_veth_endpoint b cleanup-veth-b; "
+        "run_convergent_operation R.veth-peer veth-delete-b ;;",
+    ):
+        if exact_arm not in cleanup_veth:
+            fail(f"veth deletion is not preceded by exact receipt identity: {exact_arm}")
+    create_veth = function_body(runner, "create_veth")
+    for label in ("N.alias-a-pre", "N.alias-b-pre", "N.up-a-pre", "N.up-b-pre"):
+        if f"require_receipted_veth_pair" not in create_veth or label not in create_veth:
+            fail(f"created veth is not receipt-checked before {label}")
+    if "require_receipted_veth_pair 0 T.pre" not in function_body(runner, "run_tcx"):
+        fail("TCX run is not preceded by exact receipt identity")
+    if 'require_receipted_veth_pair 0 "F.realhost${index}-pre"' not in function_body(
+        runner, "run_faketcp_tests"
+    ):
+        fail("FakeTCP real-host operation is not preceded by exact receipt identity")
     tcx = function_body(runner, "converge_tcx")
     require_literals(
         tcx,
@@ -538,6 +721,7 @@ def check_shared_argv_and_parser(runner: str) -> None:
         "run_convergent_operation R.tcx tcx-restore",
         "run_convergent_operation R.module module-unload",
         "run_convergent_operation R.veth veth-delete",
+        "run_convergent_operation R.veth-peer veth-delete-b",
     ):
         if call not in runner:
             fail(f"dangerous reverse operation is not retry-safe: {call}")
@@ -563,6 +747,8 @@ def check_shared_argv_and_parser(runner: str) -> None:
             'OP_ARGV=(/usr/sbin/rmmod "${MODULE_NAME}")',
             "veth-delete)",
             'OP_ARGV=(/usr/sbin/ip link delete dev "${VETH_A}")',
+            "veth-delete-b)",
+            'OP_ARGV=(/usr/sbin/ip link delete dev "${VETH_B}")',
         ),
         "shared argv/timeouts",
     )
@@ -589,7 +775,8 @@ def check_shared_argv_and_parser(runner: str) -> None:
         (
             "plan_operation R.tcx tcx-restore",
             "plan_operation R.module module-unload",
-            "plan_operation R.veth veth-delete",
+            "plan_operation R.veth-a veth-delete",
+            "plan_operation R.veth-b veth-delete-b",
             'for spec in "${FINAL_SPECS[@]}"',
             "argv_builder=shared",
             "commands_are_review_templates=1 no_commands_executed=1",
@@ -714,7 +901,7 @@ def main() -> None:
         fail(f"standalone veth identity leaked into existing matrix {matrix_path}")
     print(
         "static standalone veth runner: PASS "
-        "state_positions=8 failure_cut_fixtures=12"
+        "state_positions=8 failure_cut_fixtures=12 veth_identity_fixtures=11"
     )
 
 

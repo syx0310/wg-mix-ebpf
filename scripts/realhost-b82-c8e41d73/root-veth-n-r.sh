@@ -96,6 +96,8 @@ INITIAL_NETNS=''
 ORIGINAL_BOOT_ID=''
 VETH_A_IFINDEX=''
 VETH_B_IFINDEX=''
+VETH_A_SYSFS_IDENTITY=''
+VETH_B_SYSFS_IDENTITY=''
 MODULE_SHA256=''
 MODULE_SRCVERSION=''
 OP_TARGET=''
@@ -215,6 +217,7 @@ build_argv() {
     veth-up-a) OP_TARGET="${VETH_A}"; OP_ARGV=(/usr/sbin/ip link set dev "${VETH_A}" up) ;;
     veth-up-b) OP_TARGET="${VETH_B}"; OP_ARGV=(/usr/sbin/ip link set dev "${VETH_B}" up) ;;
     veth-delete) OP_TARGET="${VETH_A}"; OP_ARGV=(/usr/sbin/ip link delete dev "${VETH_A}") ;;
+    veth-delete-b) OP_TARGET="${VETH_B}"; OP_ARGV=(/usr/sbin/ip link delete dev "${VETH_B}") ;;
     list:*) name="${operation#list:}"; valid_test_name "${name}" || return 64; OP_TARGET="${name}"; OP_ARGV=("${GO_ENV[@]}" /usr/bin/timeout --signal=TERM --kill-after=10s 5m /usr/bin/go -C "${VETH_SOURCE}" test ./internal/dataplane -list "^${name}$") ;;
     tcx-run | tcx-restore)
       action=run; outer=3m; inner=2m
@@ -262,7 +265,8 @@ render_plan() {
   for name in "${REALHOST_TESTS[@]}"; do plan_operation "F.${name}" "realhost:${name}"; done
   plan_operation R.tcx tcx-restore
   plan_operation R.module module-unload
-  plan_operation R.veth veth-delete
+  plan_operation R.veth-a veth-delete
+  plan_operation R.veth-b veth-delete-b
   for spec in "${FINAL_SPECS[@]}"; do IFS='|' read -r label operation <<<"${spec}"; plan_operation "Z.${label}" "${operation}"; done
   printf 'B82_VETH_V6_WRITE_SET stage=%s evidence=%s source=%s root_bundle=%s pin=%s veth=%s,%s module=%s phases=%s retained=1\n' "${VETH_STAGE_ROOT}" "${EVIDENCE_ROOT}" "${VETH_SOURCE}" "${ROOT_BUNDLE}" "${PIN_PATH}" "${VETH_A}" "${VETH_B}" "${MODULE_NAME}" "${STATE_SCHEMA}"
   printf 'B82_VETH_V6_PLAN_COMPLETE argv_builder=shared commands_are_review_templates=1 no_commands_executed=1 credential_read=0 network_operations=0 capability_bits_changed=0\n'
@@ -551,17 +555,33 @@ veth_presence() {
   printf '%s%s\n' "${a}" "${b}"
 }
 
+veth_sysfs_identity() {
+  local name="$1" canonical
+  canonical="$(/usr/bin/readlink -e -- "/sys/class/net/${name}")" || return $?
+  [[ "${canonical}" == "/sys/devices/virtual/net/${name}" && -d "${canonical}" && ! -L "${canonical}" ]] || return 79
+  /usr/bin/stat -Lc '%d:%i:%u:%g' -- "${canonical}"
+}
+
 verify_veth() {
-  local allow_partial="$1" a_index b_index a_link b_link a_mac b_mac a_alias b_alias
+  local allow_partial="$1" expected_a="${2:-}" expected_b="${3:-}" expected_a_sysfs="${4:-}" expected_b_sysfs="${5:-}"
+  local a_index b_index a_sysfs b_sysfs a_link b_link a_mac b_mac a_alias b_alias
   a_index="$(read_single_line "/sys/class/net/${VETH_A}/ifindex")" || return $?
   b_index="$(read_single_line "/sys/class/net/${VETH_B}/ifindex")" || return $?
+  a_sysfs="$(veth_sysfs_identity "${VETH_A}")" || return $?
+  b_sysfs="$(veth_sysfs_identity "${VETH_B}")" || return $?
   a_link="$(read_single_line "/sys/class/net/${VETH_A}/iflink")" || return $?
   b_link="$(read_single_line "/sys/class/net/${VETH_B}/iflink")" || return $?
   a_mac="$(read_single_line "/sys/class/net/${VETH_A}/address")" || return $?
   b_mac="$(read_single_line "/sys/class/net/${VETH_B}/address")" || return $?
   a_alias="$(read_optional_line "/sys/class/net/${VETH_A}/ifalias")" || return $?
   b_alias="$(read_optional_line "/sys/class/net/${VETH_B}/ifalias")" || return $?
-  [[ "${a_index}" =~ ^[1-9][0-9]*$ && "${b_index}" =~ ^[1-9][0-9]*$ && "${a_link}" == "${b_index}" && "${b_link}" == "${a_index}" && "${a_mac}" == "${VETH_A_MAC}" && "${b_mac}" == "${VETH_B_MAC}" ]] || return 79
+  [[ "${a_index}" =~ ^[1-9][0-9]*$ && "${b_index}" =~ ^[1-9][0-9]*$ ]] || return 79
+  if [[ -n "${expected_a}" || -n "${expected_b}" ]]; then
+    [[ -n "${expected_a}" && -n "${expected_b}" && -n "${expected_a_sysfs}" && -n "${expected_b_sysfs}" ]] || return 79
+    [[ "${a_index}" == "${expected_a}" && "${b_index}" == "${expected_b}" ]] || return 80
+    [[ "${a_sysfs}" == "${expected_a_sysfs}" && "${b_sysfs}" == "${expected_b_sysfs}" ]] || return 81
+  fi
+  [[ "${a_link}" == "${b_index}" && "${b_link}" == "${a_index}" && "${a_mac}" == "${VETH_A_MAC}" && "${b_mac}" == "${VETH_B_MAC}" ]] || return 79
   if [[ "${allow_partial}" == 1 ]]; then
     [[ -z "${a_alias}" || "${a_alias}" == "${VETH_A_ALIAS}" ]] || return 79
     [[ -z "${b_alias}" || "${b_alias}" == "${VETH_B_ALIAS}" ]] || return 79
@@ -569,10 +589,53 @@ verify_veth() {
     [[ "${a_alias}" == "${VETH_A_ALIAS}" && "${b_alias}" == "${VETH_B_ALIAS}" ]] || return 79
   fi
   VETH_A_IFINDEX="${a_index}"; VETH_B_IFINDEX="${b_index}"
+  VETH_A_SYSFS_IDENTITY="${a_sysfs}"; VETH_B_SYSFS_IDENTITY="${b_sysfs}"
+}
+
+verify_veth_endpoint() {
+  local side="$1" expected_index="$2" expected_sysfs="$3" allow_partial="$4"
+  local name expected_mac expected_alias live_index live_sysfs live_mac live_alias
+  case "${side}" in
+    a) name="${VETH_A}"; expected_mac="${VETH_A_MAC}"; expected_alias="${VETH_A_ALIAS}" ;;
+    b) name="${VETH_B}"; expected_mac="${VETH_B_MAC}"; expected_alias="${VETH_B_ALIAS}" ;;
+    *) return 79 ;;
+  esac
+  live_index="$(read_single_line "/sys/class/net/${name}/ifindex")" || return $?
+  live_sysfs="$(veth_sysfs_identity "${name}")" || return $?
+  live_mac="$(read_single_line "/sys/class/net/${name}/address")" || return $?
+  live_alias="$(read_optional_line "/sys/class/net/${name}/ifalias")" || return $?
+  [[ "${live_index}" =~ ^[1-9][0-9]*$ && "${live_index}" == "${expected_index}" ]] || return 80
+  [[ "${live_sysfs}" == "${expected_sysfs}" ]] || return 81
+  [[ "${live_mac}" == "${expected_mac}" ]] || return 79
+  if [[ "${allow_partial}" == 1 ]]; then
+    [[ -z "${live_alias}" || "${live_alias}" == "${expected_alias}" ]] || return 79
+  else
+    [[ "${live_alias}" == "${expected_alias}" ]] || return 79
+  fi
+}
+
+require_receipted_veth_pair() {
+  local allow_partial="$1" label="$2" rc
+  verify_veth "${allow_partial}" "${VETH_A_IFINDEX}" "${VETH_B_IFINDEX}" "${VETH_A_SYSFS_IDENTITY}" "${VETH_B_SYSFS_IDENTITY}"; rc=$?
+  ((rc != 80)) || fail "${label}:ifindex-drift" 79
+  ((rc != 81)) || fail "${label}:kernel-identity-drift" 79
+  ((rc == 0)) || fail "${label}:identity-drift" 79
+}
+
+require_receipted_veth_endpoint() {
+  local side="$1" label="$2" rc
+  case "${side}" in
+    a) verify_veth_endpoint a "${VETH_A_IFINDEX}" "${VETH_A_SYSFS_IDENTITY}" 1; rc=$? ;;
+    b) verify_veth_endpoint b "${VETH_B_IFINDEX}" "${VETH_B_SYSFS_IDENTITY}" 1; rc=$? ;;
+    *) fail "${label}:endpoint" 79 ;;
+  esac
+  ((rc != 80)) || fail "${label}:ifindex-drift" 79
+  ((rc != 81)) || fail "${label}:kernel-identity-drift" 79
+  ((rc == 0)) || fail "${label}:identity-drift" 79
 }
 
 render_veth_phase() {
-  printf '%s\n' 'format=wg-mix-ebpf-b82-veth-resource-v2' "run_id=${VETH_RUN_ID}" "resource_id=${RESOURCE_ID}" "a=${VETH_A}" "a_ifindex=${VETH_A_IFINDEX}" "a_mac=${VETH_A_MAC}" "a_alias=${VETH_A_ALIAS}" "b=${VETH_B}" "b_ifindex=${VETH_B_IFINDEX}" "b_mac=${VETH_B_MAC}" "b_alias=${VETH_B_ALIAS}"
+  printf '%s\n' 'format=wg-mix-ebpf-b82-veth-resource-v3' "run_id=${VETH_RUN_ID}" "resource_id=${RESOURCE_ID}" "a=${VETH_A}" "a_ifindex=${VETH_A_IFINDEX}" "a_sysfs_identity=${VETH_A_SYSFS_IDENTITY}" "a_mac=${VETH_A_MAC}" "a_alias=${VETH_A_ALIAS}" "b=${VETH_B}" "b_ifindex=${VETH_B_IFINDEX}" "b_sysfs_identity=${VETH_B_SYSFS_IDENTITY}" "b_mac=${VETH_B_MAC}" "b_alias=${VETH_B_ALIAS}"
 }
 
 ensure_veth_phase() {
@@ -581,12 +644,16 @@ ensure_veth_phase() {
   if [[ -f "${VETH_PHASE}" && ! -L "${VETH_PHASE}" ]]; then
     VETH_A_IFINDEX="$(/usr/bin/awk -F= '$1 == "a_ifindex" {print $2}' "${VETH_PHASE}")"
     VETH_B_IFINDEX="$(/usr/bin/awk -F= '$1 == "b_ifindex" {print $2}' "${VETH_PHASE}")"
+    VETH_A_SYSFS_IDENTITY="$(/usr/bin/awk -F= '$1 == "a_sysfs_identity" {print $2}' "${VETH_PHASE}")"
+    VETH_B_SYSFS_IDENTITY="$(/usr/bin/awk -F= '$1 == "b_sysfs_identity" {print $2}' "${VETH_PHASE}")"
     expected="$(render_veth_phase)"; actual="$(/usr/bin/cat "${VETH_PHASE}")"
-    [[ "${VETH_A_IFINDEX}" =~ ^[1-9][0-9]*$ && "${VETH_B_IFINDEX}" =~ ^[1-9][0-9]*$ && "${expected}" == "${actual}" ]] || fail 'veth-phase-mismatch' 79
+    [[ "${VETH_A_IFINDEX}" =~ ^[1-9][0-9]*$ && "${VETH_B_IFINDEX}" =~ ^[1-9][0-9]*$ && "${VETH_A_SYSFS_IDENTITY}" =~ ^[0-9]+:[0-9]+:0:0$ && "${VETH_B_SYSFS_IDENTITY}" =~ ^[0-9]+:[0-9]+:0:0$ && "${expected}" == "${actual}" ]] || fail 'veth-phase-mismatch' 79
     case "${presence}" in
-      11) verify_veth 1 || fail 'veth-identity-drift' 79 ;;
+      11) require_receipted_veth_pair 1 veth-phase ;;
       00) [[ -f "${CLEANUP_PHASE}" && ! -L "${CLEANUP_PHASE}" ]] || fail 'veth-missing-before-cleanup-intent' 79 ;;
-      *) fail 'partial-veth-pair' 79 ;;
+      10) [[ -f "${CLEANUP_PHASE}" && ! -L "${CLEANUP_PHASE}" ]] || fail 'partial-veth-before-cleanup-intent' 79; require_receipted_veth_endpoint a veth-phase-a ;;
+      01) [[ -f "${CLEANUP_PHASE}" && ! -L "${CLEANUP_PHASE}" ]] || fail 'partial-veth-before-cleanup-intent' 79; require_receipted_veth_endpoint b veth-phase-b ;;
+      *) fail 'veth-presence-shape' 79 ;;
     esac
     return
   fi
@@ -601,9 +668,11 @@ create_veth() {
   run_operation N.pre-a veth-show-a 1; run_operation N.pre-b veth-show-b 1
   run_operation N.add veth-add
   ensure_veth_phase
-  run_operation N.alias-a veth-alias-a; run_operation N.alias-b veth-alias-b
-  run_operation N.up-a veth-up-a; run_operation N.up-b veth-up-b
-  verify_veth 0 || fail 'veth-final-identity' 79
+  require_receipted_veth_pair 1 N.alias-a-pre; run_operation N.alias-a veth-alias-a
+  require_receipted_veth_pair 1 N.alias-b-pre; run_operation N.alias-b veth-alias-b
+  require_receipted_veth_pair 0 N.up-a-pre; run_operation N.up-a veth-up-a
+  require_receipted_veth_pair 0 N.up-b-pre; run_operation N.up-b veth-up-b
+  require_receipted_veth_pair 0 veth-final
 }
 
 render_tcx_phase() { printf '%s\n' 'format=wg-mix-ebpf-b82-veth-tcx-v2' "run_id=${VETH_RUN_ID}" "resource_id=${RESOURCE_ID}" "pin=${PIN_PATH}" "runtime=${TCX_RUNTIME_ROOT}" "outcome=$1"; }
@@ -638,6 +707,7 @@ assert_bpf_baseline() {
 }
 
 run_tcx() {
+  require_receipted_veth_pair 0 T.pre
   run_operation C.tcx-list list:TestBPFFSPinLifecycleIntegration
   /usr/bin/grep -Fxq TestBPFFSPinLifecycleIntegration "${STEP_LOG}" || fail 'tcx-test-definition' 79
   run_operation T.run tcx-run
@@ -707,7 +777,7 @@ run_faketcp_tests() {
   index=1
   for name in "${OFFLOAD_TESTS[@]}"; do run_operation "F.offload${index}" "offload:${name}"; ((index++)); done
   index=1
-  for name in "${REALHOST_TESTS[@]}"; do run_operation "F.realhost${index}" "realhost:${name}"; assert_bpf_baseline "F.realhost${index}-after"; ((index++)); done
+  for name in "${REALHOST_TESTS[@]}"; do require_receipted_veth_pair 0 "F.realhost${index}-pre"; run_operation "F.realhost${index}" "realhost:${name}"; assert_bpf_baseline "F.realhost${index}-after"; ((index++)); done
 }
 
 render_cleanup_intent() {
@@ -739,7 +809,13 @@ converge_veth_absent() {
   local presence
   ensure_veth_phase; presence="$(veth_presence)"
   if [[ -f "${VETH_PHASE}" ]]; then
-    case "${presence}" in 11) verify_veth 1 || fail 'cleanup-veth-identity' 79; run_convergent_operation R.veth veth-delete ;; 00) ;; *) fail 'cleanup-partial-veth' 79 ;; esac
+    case "${presence}" in
+      11) require_receipted_veth_pair 1 cleanup-veth; run_convergent_operation R.veth veth-delete ;;
+      10) require_receipted_veth_endpoint a cleanup-veth-a; run_convergent_operation R.veth veth-delete ;;
+      01) require_receipted_veth_endpoint b cleanup-veth-b; run_convergent_operation R.veth-peer veth-delete-b ;;
+      00) ;;
+      *) fail 'cleanup-veth-presence-shape' 79 ;;
+    esac
     [[ "$(veth_presence)" == 00 ]] || fail 'veth-remove-incomplete' 79
   else
     [[ "${presence}" == 00 ]] || fail 'unowned-veth-present' 79
