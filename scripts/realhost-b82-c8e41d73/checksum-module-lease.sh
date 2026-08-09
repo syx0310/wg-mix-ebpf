@@ -10,6 +10,7 @@ readonly C8_CHECKSUM_MODULE_STAGE_ROOT='/run/wg-mix-ebpf-source-stages/c8e41d73'
 readonly C8_CHECKSUM_MODULE_LOCK="${C8_CHECKSUM_MODULE_STAGE_ROOT}/checksum-module-lease.v1.lock"
 readonly C8_CHECKSUM_MODULE_CENTRAL_OBJECT="${C8_CHECKSUM_MODULE_STAGE_ROOT}/source/build/faketcp_checksum_kmod/${C8_CHECKSUM_MODULE_NAME}.ko"
 readonly C8_CHECKSUM_MODULE_FRESH_ROOT='/run/wg-mix-ebpf-faketcp-verifier/fresh-c8e41d73'
+readonly C8_CHECKSUM_MODULE_FRESH_RESOURCE_ID='f3e5c8a1'
 readonly C8_CHECKSUM_MODULE_FRESH_OBJECT="${C8_CHECKSUM_MODULE_FRESH_ROOT}/source/build/faketcp_checksum_kmod/${C8_CHECKSUM_MODULE_NAME}.ko"
 readonly C8_CHECKSUM_MODULE_FRESH_EVIDENCE="${C8_CHECKSUM_MODULE_FRESH_ROOT}/evidence"
 readonly C8_CHECKSUM_MODULE_SYSFS="/sys/module/${C8_CHECKSUM_MODULE_NAME}"
@@ -84,8 +85,10 @@ c8_checksum_module_require_evidence_root() {
   local shape
   case "${C8_CHECKSUM_MODULE_OBJECT}|${C8_CHECKSUM_MODULE_EVIDENCE_ROOT}" in
     "${C8_CHECKSUM_MODULE_CENTRAL_OBJECT}|${C8_CHECKSUM_MODULE_STAGE_ROOT}/realhost-v6-${C8_CHECKSUM_MODULE_RESOURCE_ID}" | \
-      "${C8_CHECKSUM_MODULE_CENTRAL_OBJECT}|${C8_CHECKSUM_MODULE_STAGE_ROOT}/routed-evidence-${C8_CHECKSUM_MODULE_RESOURCE_ID}" | \
-      "${C8_CHECKSUM_MODULE_FRESH_OBJECT}|${C8_CHECKSUM_MODULE_FRESH_EVIDENCE}") ;;
+      "${C8_CHECKSUM_MODULE_CENTRAL_OBJECT}|${C8_CHECKSUM_MODULE_STAGE_ROOT}/routed-evidence-${C8_CHECKSUM_MODULE_RESOURCE_ID}") ;;
+    "${C8_CHECKSUM_MODULE_FRESH_OBJECT}|${C8_CHECKSUM_MODULE_FRESH_EVIDENCE}")
+      [[ "${C8_CHECKSUM_MODULE_RESOURCE_ID}" == "${C8_CHECKSUM_MODULE_FRESH_RESOURCE_ID}" ]] || return 65
+      ;;
     *) return 65 ;;
   esac
   [[ -d "${C8_CHECKSUM_MODULE_EVIDENCE_ROOT}" &&
@@ -326,6 +329,35 @@ c8_checksum_module_current_state() {
   c8_checksum_module_classify "${intent}" "${owned}" "${unloaded}" "${live}"
 }
 
+c8_checksum_module_validate_restore_state() {
+  local state expected
+  state="$(c8_checksum_module_current_state)" || return $?
+  case "${state}" in
+    00-clean) ;;
+    00-intent-no-live | 10-unreceipted-live | 11-owned-live | 01-owned-live-absent | 00-restored)
+      expected="$(c8_checksum_module_render_intent)" || return $?
+      c8_checksum_module_phase_matches "${C8_CHECKSUM_MODULE_INTENT}" "${expected}" || return 79
+      ;;
+    *) return 79 ;;
+  esac
+  case "${state}" in
+    10-unreceipted-live) c8_checksum_module_read_live || return 79 ;;
+    11-owned-live)
+      c8_checksum_module_read_live || return 79
+      expected="$(c8_checksum_module_render_owned)" || return $?
+      c8_checksum_module_phase_matches "${C8_CHECKSUM_MODULE_OWNED}" "${expected}" || return 79
+      ;;
+    01-owned-live-absent) c8_checksum_module_validate_owned_receipt || return 79 ;;
+    00-restored)
+      if [[ -e "${C8_CHECKSUM_MODULE_OWNED}" || -L "${C8_CHECKSUM_MODULE_OWNED}" ]]; then
+        c8_checksum_module_validate_owned_receipt || return 79
+      fi
+      c8_checksum_module_validate_unloaded_receipt || return 79
+      ;;
+  esac
+  printf '%s\n' "${state}"
+}
+
 c8_checksum_module_load() {
   local prefix="$1" state expected rc
   c8_checksum_module_require_lock || c8_checksum_module_stop 'load-without-lock' 79 || return $?
@@ -371,23 +403,13 @@ c8_checksum_module_restore() {
   local owned_sha='absent' generation_sha='absent' reason
   c8_checksum_module_require_lock || c8_checksum_module_stop 'restore-without-lock' 79 || return $?
   c8_checksum_module_require_evidence_root || c8_checksum_module_stop 'restore-evidence-root' 79 || return $?
-  state="$(c8_checksum_module_current_state)" || c8_checksum_module_stop 'restore-state' 79 || return $?
+  state="$(c8_checksum_module_validate_restore_state)" || c8_checksum_module_stop 'restore-state' 79 || return $?
   case "${state}" in
     00-clean) return ;;
-    00-restored)
-      expected="$(c8_checksum_module_render_intent)" || c8_checksum_module_stop 'restore-intent-render' 79 || return $?
-      c8_checksum_module_phase_matches "${C8_CHECKSUM_MODULE_INTENT}" "${expected}" || c8_checksum_module_stop 'restore-intent-drift' 79 || return $?
-      if [[ -e "${C8_CHECKSUM_MODULE_OWNED}" || -L "${C8_CHECKSUM_MODULE_OWNED}" ]]; then
-        c8_checksum_module_validate_owned_receipt || c8_checksum_module_stop 'restore-owned-receipt' 79 || return $?
-      fi
-      c8_checksum_module_validate_unloaded_receipt || c8_checksum_module_stop 'restore-unloaded-receipt' 79 || return $?
-      return
-      ;;
+    00-restored) return ;;
     00-intent-no-live | 10-unreceipted-live | 11-owned-live | 01-owned-live-absent) ;;
     *) c8_checksum_module_stop "restore-invalid-state:${state}" 79; return $? ;;
   esac
-  expected="$(c8_checksum_module_render_intent)" || c8_checksum_module_stop 'restore-intent-render' 79 || return $?
-  c8_checksum_module_phase_matches "${C8_CHECKSUM_MODULE_INTENT}" "${expected}" || c8_checksum_module_stop 'restore-intent-drift' 79 || return $?
 
   case "${state}" in
     00-intent-no-live) reason='load-not-observed' ;;

@@ -178,6 +178,7 @@ def inspect(helper: str, module: str) -> None:
         "C8_CHECKSUM_MODULE_CENTRAL_OBJECT",
         "C8_CHECKSUM_MODULE_FRESH_OBJECT",
         "C8_CHECKSUM_MODULE_FRESH_EVIDENCE",
+        "C8_CHECKSUM_MODULE_FRESH_RESOURCE_ID='f3e5c8a1'",
         'C8_CHECKSUM_MODULE_STAGE_ROOT}/realhost-v6-${C8_CHECKSUM_MODULE_RESOURCE_ID}',
         'C8_CHECKSUM_MODULE_STAGE_ROOT}/routed-evidence-${C8_CHECKSUM_MODULE_RESOURCE_ID}',
         "/run/wg-mix-ebpf-faketcp-verifier/fresh-c8e41d73",
@@ -189,6 +190,7 @@ def inspect(helper: str, module: str) -> None:
         "01-owned-live-absent",
         "c8_checksum_module_validate_owned_receipt",
         "c8_checksum_module_validate_unloaded_receipt",
+        "c8_checksum_module_validate_restore_state",
         "btf_sha256=",
         "restore-generation-changed",
     ):
