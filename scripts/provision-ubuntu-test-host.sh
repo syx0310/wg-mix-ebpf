@@ -519,7 +519,7 @@ verify_installed_toolchain() {
   fi
   "${CLEAN_ENV[@]}" /usr/bin/go version
   "${CLEAN_ENV[@]}" /usr/bin/clang --version | "${CLEAN_ENV[@]}" /usr/bin/sed -n '1p'
-  run_required_probe "${BPFTOOL_VERSION_COMMAND[@]}" || {
+  "${BPFTOOL_VERSION_COMMAND[@]}" || {
     echo 'error: bpftool fixed version probe failed' >&2
     return 1
   }
