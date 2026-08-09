@@ -623,9 +623,11 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 		t.Fatal("prepare/proof/consume/segment rewrites must precede one stable-lifetime writer and GSO commit")
 	}
 	egress := sourceSection(t, tc, "int wg_mix_egress(struct __sk_buff *skb)", "SEC(\"classifier/ingress\")")
-	parseGate := strings.Index(egress, "faketcp_parse_tc_l3(skb, &info, &faketcp_l3)")
+	parseGate := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
+	fixedGate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
 	dispatch := strings.Index(egress, "return faketcp_encode_gso_segments(")
-	if parseGate < 0 || dispatch < 0 || parseGate >= dispatch {
+	if parseGate < 0 || fixedGate < 0 || dispatch < 0 ||
+		!(parseGate < fixedGate && fixedGate < dispatch) {
 		t.Fatal("shared fixed-IPv4 gate must dominate the GSO encoder")
 	}
 	for _, field := range []string{"mutation.sequence", "mutation.acknowledgement", "mutation.window"} {
