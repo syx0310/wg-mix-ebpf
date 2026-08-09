@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -513,7 +514,8 @@ func TestFakeTCPEstablishedMapCannotLRUEvictUnderSYNPressure(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Only established sessions enter this map",
-		"session->state != FAKETCP_STATE_ESTABLISHED",
+		"session->state == FAKETCP_STATE_ESTABLISHED",
+		"struct bpf_spin_lock lock",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("established-only fast-map contract missing %q", want)
@@ -521,6 +523,203 @@ func TestFakeTCPEstablishedMapCannotLRUEvictUnderSYNPressure(t *testing.T) {
 	}
 	if !strings.Contains(sessionMap, "__uint(type, BPF_MAP_TYPE_HASH)") {
 		t.Fatal("FakeTCP established session map must remain a non-evicting HASH")
+	}
+}
+
+func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, want := range []string{
+		"struct bpf_spin_lock lock",
+		"SEC(\"classifier/faketcp_session_claim\")",
+		"int wg_faketcp_session_claim(struct __sk_buff *skb)",
+		"session->state = FAKETCP_STATE_DELETE_CLAIMED",
+		"faketcp_session_matches_expected_locked(session, &request.expected, 1)",
+		"expected->revision != 0",
+		"expected->session_id != 0",
+		"expected->runtime_incarnation",
+		"session->revision != ~0ULL",
+		"if (now > session->last_seen_nanos)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("established compare-claim source contract missing %q", want)
+		}
+	}
+	if strings.Contains(text, "bpf_map_update_elem(&faketcp_session_map") {
+		t.Fatal("BPF must never insert or replace an established session")
+	}
+	if strings.Contains(text, "bpf_map_delete_elem(&faketcp_session_map") {
+		t.Fatal("packet programs must never bypass the userspace exact-delete finalizer")
+	}
+	if got := strings.Count(text, "bpf_map_lookup_elem(&faketcp_session_map"); got != 4 {
+		t.Fatalf("session-map lookup sites=%d, want claim plus three packet paths", got)
+	}
+
+	preflightStart := strings.Index(text, "faketcp_preflight_egress(struct __sk_buff")
+	encodeStart := strings.Index(text, "faketcp_encode_established(struct __sk_buff")
+	xdpStart := strings.Index(text, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
+	if preflightStart < 0 || encodeStart < 0 || xdpStart < 0 ||
+		!(preflightStart < encodeStart && encodeStart < xdpStart) {
+		t.Fatal("FakeTCP packet path functions are missing or reordered")
+	}
+	preflight := text[preflightStart:encodeStart]
+	encode := text[encodeStart:xdpStart]
+	xdp := text[xdpStart:]
+	if !strings.Contains(preflight,
+		"faketcp_session_admit_established(session, generation)") {
+		t.Fatal("TC preflight admits established state without the per-value lock")
+	}
+	if strings.Contains(encode,
+		"faketcp_session_admit_established(session, generation)") ||
+		strings.Count(encode, "FAKETCP_SESSION_MUTATE_TX") != 1 {
+		t.Fatal("TC encoder regained a redundant admission lock or lost its mutation")
+	}
+	encoderMutation := strings.Index(encode, "faketcp_session_mutate(session, generation, now,")
+	if encoderMutation < 0 || strings.Contains(encode[:encoderMutation], "session->") {
+		t.Fatal("TC encoder consumed a session field before its sole locked mutation snapshot")
+	}
+	if strings.Count(xdp,
+		"faketcp_session_admit_established(session, generation)") != 1 ||
+		strings.Count(xdp, "FAKETCP_SESSION_MUTATE_TOUCH") != 1 ||
+		strings.Count(xdp, "FAKETCP_SESSION_MUTATE_RX") != 1 {
+		t.Fatal("XDP reader/keepalive/payload writer lock or revision contract drifted")
+	}
+
+	// Packet helpers and rewrite are deliberately outside the tiny writer
+	// critical sections. A source-level regression that places a BPF helper
+	// between lock/unlock would be rejected by the verifier and extend latency.
+	mutationStart := strings.Index(text, "static __always_inline int faketcp_session_mutate(")
+	if mutationStart < 0 {
+		t.Fatal("shared FakeTCP session mutation helper is missing")
+	}
+	mutationEnd := strings.Index(text[mutationStart:], "\n}\n\nstatic __always_inline int faketcp_session_matches_expected_locked")
+	if mutationEnd < 0 {
+		t.Fatal("shared FakeTCP session mutation helper end is missing")
+	}
+	mutation := text[mutationStart : mutationStart+mutationEnd]
+	if strings.Count(mutation, "bpf_spin_lock(&session->lock)") != 1 ||
+		strings.Count(mutation, "bpf_spin_unlock(&session->lock)") != 1 ||
+		strings.Count(mutation, "session->revision++") != 1 {
+		t.Fatal("all packet writers must converge on one value-lock/revision path")
+	}
+	lockMutation := strings.Index(mutation, "bpf_spin_lock(&session->lock)")
+	unlockMutation := strings.Index(mutation, "bpf_spin_unlock(&session->lock)")
+	critical := mutation[lockMutation:unlockMutation]
+	for _, forbidden := range []string{
+		"bpf_ktime_get_ns", "bpf_skb_", "bpf_xdp_", "bpf_csum_diff",
+		"inc_faketcp_stat", "inc_stat(",
+	} {
+		if strings.Contains(critical, forbidden) {
+			t.Fatalf("shared mutation critical section contains helper/stat call %q", forbidden)
+		}
+	}
+
+	claimStart := strings.Index(text, "int wg_faketcp_session_claim(struct __sk_buff *skb)")
+	if claimStart < 0 {
+		t.Fatal("FakeTCP session claim function bounds are missing")
+	}
+	claimEnd := strings.Index(text[claimStart:], "\n}\n\nstruct {")
+	if claimEnd < 0 {
+		t.Fatal("FakeTCP session claim function end is missing")
+	}
+	claim := text[claimStart : claimStart+claimEnd]
+	lock := strings.Index(claim, "bpf_spin_lock(&session->lock)")
+	compare := strings.Index(claim, "faketcp_session_matches_expected_locked")
+	tombstone := strings.Index(claim, "session->state = FAKETCP_STATE_DELETE_CLAIMED")
+	unlock := strings.Index(claim, "bpf_spin_unlock(&session->lock)")
+	if lock < 0 || compare < 0 || tombstone < 0 || unlock < 0 ||
+		!(lock < compare && compare < tombstone && tombstone < unlock) {
+		t.Fatal("claim compare/tombstone linearisation is not wholly under the value lock")
+	}
+	if strings.Count(claim, "session->state = FAKETCP_STATE_DELETE_CLAIMED") != 1 {
+		t.Fatal("claim program must have exactly one tombstone write site")
+	}
+}
+
+type establishedEncoderLockModel struct {
+	mu       sync.Mutex
+	state    uint8
+	sequence uint32
+	locks    uint64
+}
+
+func (model *establishedEncoderLockModel) admit() bool {
+	model.mu.Lock()
+	defer model.mu.Unlock()
+	model.locks++
+	return model.state == 3
+}
+
+func (model *establishedEncoderLockModel) mutate(payload uint32) bool {
+	model.mu.Lock()
+	defer model.mu.Unlock()
+	model.locks++
+	if model.state != 3 {
+		return false
+	}
+	model.sequence += payload
+	return true
+}
+
+func (model *establishedEncoderLockModel) encodeWithRedundantAdmission(payload uint32) bool {
+	return model.admit() && model.mutate(payload)
+}
+
+func (model *establishedEncoderLockModel) encodeWithSingleMutation(payload uint32) bool {
+	return model.mutate(payload)
+}
+
+func TestFakeTCPEncoderSingleMutationPreservesClaimOrdering(t *testing.T) {
+	oldPath := &establishedEncoderLockModel{state: 3, sequence: 100}
+	newPath := &establishedEncoderLockModel{state: 3, sequence: 100}
+	if !oldPath.encodeWithRedundantAdmission(32) || !newPath.encodeWithSingleMutation(32) ||
+		oldPath.sequence != newPath.sequence {
+		t.Fatalf("established results differ: old=%#v new=%#v", oldPath, newPath)
+	}
+	if oldPath.locks != 2 || newPath.locks != 1 {
+		t.Fatalf("value locks per packet old=%d new=%d", oldPath.locks, newPath.locks)
+	}
+
+	// A claim which wins before mutation is rejected by both paths. A claim
+	// which wins after mutation is ordered after that packet in both paths;
+	// the removed admission lock was never a packet-emission snapshot.
+	oldClaimed := &establishedEncoderLockModel{state: 4, sequence: 100}
+	newClaimed := &establishedEncoderLockModel{state: 4, sequence: 100}
+	if oldClaimed.encodeWithRedundantAdmission(32) || newClaimed.encodeWithSingleMutation(32) ||
+		oldClaimed.sequence != 100 || newClaimed.sequence != 100 {
+		t.Fatalf("claimed session was consumed: old=%#v new=%#v", oldClaimed, newClaimed)
+	}
+	if oldClaimed.locks != 1 || newClaimed.locks != 1 {
+		t.Fatalf("claimed value locks old=%d new=%d", oldClaimed.locks, newClaimed.locks)
+	}
+}
+
+func BenchmarkFakeTCPEncoderValueLocks(b *testing.B) {
+	for _, benchmark := range []struct {
+		name   string
+		encode func(*establishedEncoderLockModel) bool
+	}{
+		{"redundant-admission", func(model *establishedEncoderLockModel) bool {
+			return model.encodeWithRedundantAdmission(1)
+		}},
+		{"single-mutation", func(model *establishedEncoderLockModel) bool {
+			return model.encodeWithSingleMutation(1)
+		}},
+	} {
+		b.Run(benchmark.name, func(b *testing.B) {
+			model := &establishedEncoderLockModel{state: 3}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				if !benchmark.encode(model) {
+					b.Fatal("established model rejected packet")
+				}
+			}
+			b.StopTimer()
+			b.ReportMetric(float64(model.locks)/float64(b.N), "value-locks/op")
+		})
 	}
 }
 

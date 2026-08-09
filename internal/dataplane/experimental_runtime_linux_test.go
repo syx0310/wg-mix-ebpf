@@ -172,19 +172,22 @@ func (store *fakeOwnedSessionStore) LookupEstablished(
 func (store *fakeOwnedSessionStore) DeleteEstablishedIfUnchanged(
 	key abi.FakeTCPSessionKey,
 	value abi.FakeTCPSessionValue,
-) (bool, error) {
+) (faketcp.SessionDeleteResult, error) {
 	store.waitIfBlocked()
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if store.closed {
-		return false, errors.New("fake session backend closed")
+		return faketcp.SessionDeleteDifferent, errors.New("fake session backend closed")
 	}
 	actual, exists := store.entries[key]
-	if !exists || actual != value {
-		return false, nil
+	if !exists {
+		return faketcp.SessionDeleteAbsent, nil
+	}
+	if actual != value {
+		return faketcp.SessionDeleteDifferent, nil
 	}
 	delete(store.entries, key)
-	return true, nil
+	return faketcp.SessionDeleteRemoved, nil
 }
 
 func (store *fakeOwnedSessionStore) waitIfBlocked() {
@@ -227,6 +230,9 @@ type runtimeTestFixture struct {
 	retainedRelease faketcp.LinuxFreshCollectionRelease
 	lastCoreStage   *fakeExperimentalCoreStage
 	lastTCStage     *fakeExperimentalTCStage
+	sessionMapArg   experimentalMapResource
+	sessionClaimArg experimentalProgramResource
+	sessionGenArg   uint64
 }
 
 type fakeExperimentalCoreStage struct {
@@ -323,10 +329,11 @@ func newRuntimeTestFixture(t *testing.T) *runtimeTestFixture {
 		collectionMaps[name] = resource
 	}
 	for name, id := range map[string]uint32{
-		fakeTCPEgressProgramName: 8001,
-		fakeTCPXDPProgramName:    8002,
-		ingressFilterName:        8003,
-		egressFilterName:         8004,
+		fakeTCPEgressProgramName:       8001,
+		fakeTCPXDPProgramName:          8002,
+		fakeTCPSessionClaimProgramName: 8005,
+		ingressFilterName:              8003,
+		egressFilterName:               8004,
 	} {
 		program := &fakeExperimentalOwnedProgram{
 			name: name, id: id, closeLog: &fixture.closeLog,
@@ -429,7 +436,10 @@ func (fixture *runtimeTestFixture) buildOptions(
 			{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
 		},
 		xdpRuntime: fixture.xdpRuntime.backend(),
-		sessionFactory: func(experimentalMapResource, uint64) (ownedFakeTCPSessionStore, error) {
+		sessionFactory: func(sessionMap experimentalMapResource, claimProgram experimentalProgramResource, generation uint64) (ownedFakeTCPSessionStore, error) {
+			fixture.sessionMapArg = sessionMap
+			fixture.sessionClaimArg = claimProgram
+			fixture.sessionGenArg = generation
 			return fixture.sessionStore, nil
 		},
 		eventSource:      fixture.eventSource,
@@ -491,6 +501,12 @@ func TestExperimentalFakeTCPRuntimeBuildsPolicyTailCallsXDPAndHandles(t *testing
 	if runtime.Generation() != 91 || handles.Generation() != 91 || handles.SessionStore() == nil {
 		t.Fatalf("runtime generation=%d handles=%d store=%v",
 			runtime.Generation(), handles.Generation(), handles.SessionStore())
+	}
+	if fixture.sessionMapArg != fixture.mapResources[fakeTCPSessionMapName] ||
+		fixture.sessionClaimArg != fixture.programs[fakeTCPSessionClaimProgramName] ||
+		fixture.sessionGenArg != 91 {
+		t.Fatalf("session factory map=%v claim=%v generation=%d",
+			fixture.sessionMapArg, fixture.sessionClaimArg, fixture.sessionGenArg)
 	}
 	if runtime.Identity() != handles.Identity() || runtime.Identity().Generation != 91 {
 		t.Fatalf("runtime identity=%#v handles identity=%#v", runtime.Identity(), handles.Identity())
@@ -571,6 +587,11 @@ func TestExperimentalFakeTCPRuntimeBuildsPolicyTailCallsXDPAndHandles(t *testing
 	}
 	if len(fixture.closeLog) == 0 || fixture.closeLog[0] != "slow-path" {
 		t.Fatalf("runtime close order = %v", fixture.closeLog)
+	}
+	sessionClose := slices.Index(fixture.closeLog, "session")
+	claimClose := slices.Index(fixture.closeLog, "program:"+fakeTCPSessionClaimProgramName)
+	if sessionClose < 0 || claimClose < 0 || sessionClose >= claimClose {
+		t.Fatalf("session store must close before borrowed claim program: %v", fixture.closeLog)
 	}
 	if runtime.state.engine != nil || runtime.state.slowPath != nil {
 		t.Fatalf("closed runtime retained Engine=%p slowPath=%v",
@@ -731,9 +752,9 @@ func TestGenerationFencedSessionStoreRejectsCrossGenerationWithoutBackendCall(t 
 	if _, _, err := store.LookupEstablished(key); !errors.Is(err, ErrExperimentalFakeTCPGenerationMismatch) {
 		t.Fatalf("cross-generation lookup error = %v", err)
 	}
-	if deleted, err := store.DeleteEstablishedIfUnchanged(key, value); deleted ||
+	if result, err := store.DeleteEstablishedIfUnchanged(key, value); result != faketcp.SessionDeleteDifferent ||
 		!errors.Is(err, ErrExperimentalFakeTCPGenerationMismatch) {
-		t.Fatalf("cross-generation delete=%t error=%v", deleted, err)
+		t.Fatalf("cross-generation result=%v error=%v", result, err)
 	}
 	if len(backend.entries) != 0 {
 		t.Fatalf("generation fence touched backend: %v", backend.entries)
