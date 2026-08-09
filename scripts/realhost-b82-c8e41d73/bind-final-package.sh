@@ -165,6 +165,10 @@ readonly -a PACKAGE_PATHS=(
   "${REPOSITORY_PATH_FROM_ROOT}/check-realhost-iperf.py"
   "${REPOSITORY_PATH_FROM_ROOT}/test-hermetic-matrix.sh"
   "${REPOSITORY_PATH_FROM_ROOT}/test_matrix_static.py"
+  "${REPOSITORY_PATH_FROM_ROOT}/checksum-module-lease.sh"
+  "${REPOSITORY_PATH_FROM_ROOT}/root-fresh-verifier-gate.sh"
+  "${REPOSITORY_PATH_FROM_ROOT}/test-hermetic-fresh-verifier-gate.sh"
+  "${REPOSITORY_PATH_FROM_ROOT}/test_fresh_verifier_gate_static.py"
   "${REPOSITORY_PATH_FROM_ROOT}/prepare-stage-root.sh"
   "scripts/provision-ubuntu-test-host.sh"
 )
@@ -320,7 +324,7 @@ bind_package() {
 
   (set -o noclobber
     {
-      manifest_line format wg-mix-ebpf-b82-v6-package-v1
+      manifest_line format wg-mix-ebpf-b82-v6-package-v2
       manifest_line run_id "${RUN_ID}"
       manifest_line package_id "${PACKAGE_ID}"
       manifest_line integration_ref "${SOURCE_REF}"

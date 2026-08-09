@@ -310,7 +310,7 @@ require_tools() {
     /usr/bin/sha256sum /usr/bin/shellcheck /usr/bin/stat /usr/bin/tee
     /usr/bin/test /usr/bin/timeout /usr/bin/uname
     /usr/bin/clang /usr/bin/gcc
-    /usr/sbin/bpftool /usr/sbin/insmod /usr/sbin/modinfo /usr/sbin/rmmod
+    /usr/sbin/bpftool /usr/sbin/modinfo
   )
   for tool in "${tools[@]}"; do
     [[ -x "${tool}" ]] || fail "missing-tool:${tool}" 69
@@ -813,17 +813,13 @@ plan_module_load() {
   printf '\nM.intent-baseline operation=shared-module-precondition target=%q helper=c8_checksum_module_load argv=' \
     "${MODULE_NAME}"
   quote_argv /usr/bin/test ! -e "/sys/module/${MODULE_NAME}"
-  printf '\nM.load operation=shared-module-load target=%q helper=c8_checksum_module_load argv=' \
-    "${MODULE_NAME}"
-  quote_argv /usr/sbin/insmod "${MODULE_OBJECT}" "lease_id=${MODULE_LEASE_ID}"
-  printf '\n'
+  printf '\nM.load operation=shared-module-load target=%q helper=c8_checksum_module_load object=%q lease_id=%s mutation_argv=bound-by-helper\n' \
+    "${MODULE_NAME}" "${MODULE_OBJECT}" "${MODULE_LEASE_ID}"
 }
 
 plan_module_restore() {
-  printf 'EXPLICIT_RESTORE_ONLY.R.module operation=shared-module-restore target=%q helper=c8_checksum_module_restore argv=' \
-    "${MODULE_NAME}"
-  quote_argv /usr/sbin/rmmod "${MODULE_NAME}"
-  printf '\n'
+  printf 'EXPLICIT_RESTORE_ONLY.R.module operation=shared-module-restore target=%q helper=c8_checksum_module_restore lease_id=%s mutation_argv=bound-by-helper\n' \
+    "${MODULE_NAME}" "${MODULE_LEASE_ID}"
 }
 
 run_operation() {

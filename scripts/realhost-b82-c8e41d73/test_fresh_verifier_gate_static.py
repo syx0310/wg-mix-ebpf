@@ -137,6 +137,8 @@ for legacy in (
     "module-unload) OP_TARGET",
     "run_operation M.load module-load",
     "run_convergent_operation R.module module-unload",
+    "/usr/sbin/insmod",
+    "/usr/sbin/rmmod",
 ):
     if legacy in source:
         fail(f"fresh gate retained a second module authority: {legacy!r}")

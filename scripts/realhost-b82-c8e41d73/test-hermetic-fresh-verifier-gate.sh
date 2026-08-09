@@ -5,12 +5,16 @@ umask 077
 
 SCRIPT="${1:-}"
 HELPER="${2:-}"
+STATIC_TEST="${3:-}"
 [[ "${SCRIPT}" == /* && -f "${SCRIPT}" && ! -L "${SCRIPT}" &&
-  "${HELPER}" == /* && -f "${HELPER}" && ! -L "${HELPER}" ]] || {
-  printf 'usage: %s ABSOLUTE_ROOT_FRESH_VERIFIER_GATE ABSOLUTE_MODULE_LEASE_HELPER\n' "$0" >&2
+  "${HELPER}" == /* && -f "${HELPER}" && ! -L "${HELPER}" &&
+  "${STATIC_TEST}" == /* && -f "${STATIC_TEST}" && ! -L "${STATIC_TEST}" ]] || {
+  printf 'usage: %s ABSOLUTE_ROOT_FRESH_VERIFIER_GATE ABSOLUTE_MODULE_LEASE_HELPER ABSOLUTE_STATIC_TEST\n' "$0" >&2
   exit 64
 }
 /bin/bash -n "${SCRIPT}" "${HELPER}" || exit $?
+PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I "${STATIC_TEST}" "${SCRIPT}" "${HELPER}" ||
+  exit $?
 
 FIXTURE="$(/usr/bin/mktemp -d "${TMPDIR:-/tmp}/wg-mix-fresh-verifier-plan.XXXXXXXX")" || exit $?
 OUTPUT="${FIXTURE}/plan.out"

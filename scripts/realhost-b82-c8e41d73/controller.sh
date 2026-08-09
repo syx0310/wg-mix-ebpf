@@ -65,6 +65,18 @@ TEST_HERMETIC_MATRIX_SH_SHA256=''
 TEST_MATRIX_STATIC_PY_PATH=''
 TEST_MATRIX_STATIC_PY_BLOB=''
 TEST_MATRIX_STATIC_PY_SHA256=''
+CHECKSUM_MODULE_LEASE_SH_PATH=''
+CHECKSUM_MODULE_LEASE_SH_BLOB=''
+CHECKSUM_MODULE_LEASE_SH_SHA256=''
+ROOT_FRESH_VERIFIER_GATE_SH_PATH=''
+ROOT_FRESH_VERIFIER_GATE_SH_BLOB=''
+ROOT_FRESH_VERIFIER_GATE_SH_SHA256=''
+TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_PATH=''
+TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_BLOB=''
+TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_SHA256=''
+TEST_FRESH_VERIFIER_GATE_STATIC_PY_PATH=''
+TEST_FRESH_VERIFIER_GATE_STATIC_PY_BLOB=''
+TEST_FRESH_VERIFIER_GATE_STATIC_PY_SHA256=''
 PREPARE_STAGE_ROOT_SH_PATH=''
 PREPARE_STAGE_ROOT_SH_BLOB=''
 PREPARE_STAGE_ROOT_SH_SHA256=''
@@ -81,7 +93,7 @@ fail() {
 
 usage() {
   printf '%s\n' \
-    "usage: $0 {plan|preflight|prepare|provision-apply|matrix-plan|run|restore}" \
+    "usage: $0 {plan|preflight|prepare|provision-apply|matrix-plan|run|restore|fresh-plan|fresh-run|fresh-restore}" \
     '  --manifest ABSOLUTE_PACKAGE_MANIFEST --manifest-sha256 64-lowercase-hex' \
     "  --credential-path ${CREDENTIAL_PATH}" \
     '  --restore-cell {none|tcx|original|all-on|all-off|tx-path|rx-path|mtu1492|mtu1500|soak}' >&2
@@ -148,7 +160,8 @@ parse_arguments() {
   MODE="$1"
   shift
   case "${MODE}" in
-    plan | preflight | prepare | provision-apply | matrix-plan | run | restore) ;;
+    plan | preflight | prepare | provision-apply | matrix-plan | run | restore | \
+      fresh-plan | fresh-run | fresh-restore) ;;
     *) usage; return 64 ;;
   esac
   while (($# > 0)); do
@@ -166,6 +179,7 @@ parse_arguments() {
   valid_sha256 "${MANIFEST_SHA256}" || return 65
   case "${MODE}:${RESTORE_CELL}" in
     plan:none | preflight:none | prepare:none | provision-apply:none | matrix-plan:none | run:none | \
+      fresh-plan:none | fresh-run:none | fresh-restore:none | \
       restore:tcx | restore:original | restore:all-on | restore:all-off | \
       restore:tx-path | restore:rx-path | restore:mtu1492 | restore:mtu1500 | restore:soak) ;;
     *) return 65 ;;
@@ -233,6 +247,18 @@ load_manifest() {
     read_manifest_field test_matrix_static_py_path TEST_MATRIX_STATIC_PY_PATH &&
     read_manifest_field test_matrix_static_py_blob TEST_MATRIX_STATIC_PY_BLOB &&
     read_manifest_field test_matrix_static_py_sha256 TEST_MATRIX_STATIC_PY_SHA256 &&
+    read_manifest_field checksum_module_lease_sh_path CHECKSUM_MODULE_LEASE_SH_PATH &&
+    read_manifest_field checksum_module_lease_sh_blob CHECKSUM_MODULE_LEASE_SH_BLOB &&
+    read_manifest_field checksum_module_lease_sh_sha256 CHECKSUM_MODULE_LEASE_SH_SHA256 &&
+    read_manifest_field root_fresh_verifier_gate_sh_path ROOT_FRESH_VERIFIER_GATE_SH_PATH &&
+    read_manifest_field root_fresh_verifier_gate_sh_blob ROOT_FRESH_VERIFIER_GATE_SH_BLOB &&
+    read_manifest_field root_fresh_verifier_gate_sh_sha256 ROOT_FRESH_VERIFIER_GATE_SH_SHA256 &&
+    read_manifest_field test_hermetic_fresh_verifier_gate_sh_path TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_PATH &&
+    read_manifest_field test_hermetic_fresh_verifier_gate_sh_blob TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_BLOB &&
+    read_manifest_field test_hermetic_fresh_verifier_gate_sh_sha256 TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_SHA256 &&
+    read_manifest_field test_fresh_verifier_gate_static_py_path TEST_FRESH_VERIFIER_GATE_STATIC_PY_PATH &&
+    read_manifest_field test_fresh_verifier_gate_static_py_blob TEST_FRESH_VERIFIER_GATE_STATIC_PY_BLOB &&
+    read_manifest_field test_fresh_verifier_gate_static_py_sha256 TEST_FRESH_VERIFIER_GATE_STATIC_PY_SHA256 &&
     read_manifest_field prepare_stage_root_sh_path PREPARE_STAGE_ROOT_SH_PATH &&
     read_manifest_field prepare_stage_root_sh_blob PREPARE_STAGE_ROOT_SH_BLOB &&
     read_manifest_field prepare_stage_root_sh_sha256 PREPARE_STAGE_ROOT_SH_SHA256 &&
@@ -315,7 +341,7 @@ verify_manifest_contract() {
   [[ -f "${MANIFEST}" && ! -L "${MANIFEST}" ]] || return 66
   [[ "$(sha256_file "${MANIFEST}")" == "${MANIFEST_SHA256}" ]] || return 67
   load_manifest || return $?
-  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v1' &&
+  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v2' &&
     "${MANIFEST_RUN_ID}" == "${RUN_ID}" && "${MANIFEST_PACKAGE_ID}" == "${PACKAGE_ID}" &&
     "${INTEGRATION_REF}" =~ ^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$ &&
     "${INTEGRATION_REF}" != *'..'* && "${INTEGRATION_REF}" != *'//'* &&
@@ -364,12 +390,18 @@ verify_manifest_contract() {
     verify_identity "${CHECK_REALHOST_IPERF_PY_PATH}" "${CHECK_REALHOST_IPERF_PY_BLOB}" "${CHECK_REALHOST_IPERF_PY_SHA256}" &&
     verify_identity "${TEST_HERMETIC_MATRIX_SH_PATH}" "${TEST_HERMETIC_MATRIX_SH_BLOB}" "${TEST_HERMETIC_MATRIX_SH_SHA256}" &&
     verify_identity "${TEST_MATRIX_STATIC_PY_PATH}" "${TEST_MATRIX_STATIC_PY_BLOB}" "${TEST_MATRIX_STATIC_PY_SHA256}" &&
+    verify_identity "${CHECKSUM_MODULE_LEASE_SH_PATH}" "${CHECKSUM_MODULE_LEASE_SH_BLOB}" "${CHECKSUM_MODULE_LEASE_SH_SHA256}" &&
+    verify_identity "${ROOT_FRESH_VERIFIER_GATE_SH_PATH}" "${ROOT_FRESH_VERIFIER_GATE_SH_BLOB}" "${ROOT_FRESH_VERIFIER_GATE_SH_SHA256}" &&
+    verify_identity "${TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_PATH}" "${TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_BLOB}" "${TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_SHA256}" &&
+    verify_identity "${TEST_FRESH_VERIFIER_GATE_STATIC_PY_PATH}" "${TEST_FRESH_VERIFIER_GATE_STATIC_PY_BLOB}" "${TEST_FRESH_VERIFIER_GATE_STATIC_PY_SHA256}" &&
     verify_identity "${PREPARE_STAGE_ROOT_SH_PATH}" "${PREPARE_STAGE_ROOT_SH_BLOB}" "${PREPARE_STAGE_ROOT_SH_SHA256}" &&
     verify_identity "${PROVISION_UBUNTU_TEST_HOST_SH_PATH}" "${PROVISION_UBUNTU_TEST_HOST_SH_BLOB}" \
       "${PROVISION_UBUNTU_TEST_HOST_SH_SHA256}" || return $?
 
   for name in bind-final-package.sh controller.sh root-matrix-n-r.sh check-realhost-iperf.py \
-    test-hermetic-matrix.sh test_matrix_static.py prepare-stage-root.sh provision-ubuntu-test-host.sh; do
+    test-hermetic-matrix.sh test_matrix_static.py checksum-module-lease.sh \
+    root-fresh-verifier-gate.sh test-hermetic-fresh-verifier-gate.sh \
+    test_fresh_verifier_gate_static.py prepare-stage-root.sh provision-ubuntu-test-host.sh; do
     [[ -f "${LOCAL_PACKAGE_DIR}/${name}" && ! -L "${LOCAL_PACKAGE_DIR}/${name}" ]] || return 66
     case "${name}" in
       bind-final-package.sh) sha="${BIND_FINAL_PACKAGE_SH_SHA256}" ;;
@@ -378,6 +410,10 @@ verify_manifest_contract() {
       check-realhost-iperf.py) sha="${CHECK_REALHOST_IPERF_PY_SHA256}" ;;
       test-hermetic-matrix.sh) sha="${TEST_HERMETIC_MATRIX_SH_SHA256}" ;;
       test_matrix_static.py) sha="${TEST_MATRIX_STATIC_PY_SHA256}" ;;
+      checksum-module-lease.sh) sha="${CHECKSUM_MODULE_LEASE_SH_SHA256}" ;;
+      root-fresh-verifier-gate.sh) sha="${ROOT_FRESH_VERIFIER_GATE_SH_SHA256}" ;;
+      test-hermetic-fresh-verifier-gate.sh) sha="${TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_SHA256}" ;;
+      test_fresh_verifier_gate_static.py) sha="${TEST_FRESH_VERIFIER_GATE_STATIC_PY_SHA256}" ;;
       prepare-stage-root.sh) sha="${PREPARE_STAGE_ROOT_SH_SHA256}" ;;
       provision-ubuntu-test-host.sh) sha="${PROVISION_UBUNTU_TEST_HOST_SH_SHA256}" ;;
     esac
@@ -425,7 +461,9 @@ readonly -a POSTFLIGHT_OPERATIONS=(
 readonly -a PACKAGE_NAMES=(
   source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh controller.sh prepare-stage-root.sh
   provision-ubuntu-test-host.sh root-matrix-n-r.sh check-realhost-iperf.py
-  test-hermetic-matrix.sh test_matrix_static.py
+  test-hermetic-matrix.sh test_matrix_static.py checksum-module-lease.sh
+  root-fresh-verifier-gate.sh test-hermetic-fresh-verifier-gate.sh
+  test_fresh_verifier_gate_static.py
 )
 readonly -a BOOTSTRAP_CREATE_OPERATIONS=(
   bootstrap-absent bootstrap-not-symlink bootstrap-create bootstrap-root-readlink bootstrap-root-stat
@@ -469,8 +507,11 @@ plan_all() {
   for operation in "${PROVISIONER_VERIFY_OPERATIONS[@]}" provision-apply; do
     run_operation plan "${operation}" || return $?
   done
-  for operation in "${POSTFLIGHT_OPERATIONS[@]}" controller-shellcheck hermetic-matrix \
+  for operation in "${POSTFLIGHT_OPERATIONS[@]}" controller-shellcheck hermetic-matrix hermetic-fresh \
     "${STAGER_VERIFY_OPERATIONS[@]}" "${STAGE_OPERATIONS[@]}"; do
+    run_operation plan "${operation}" || return $?
+  done
+  for operation in fresh-plan fresh-run fresh-restore; do
     run_operation plan "${operation}" || return $?
   done
   if [[ "${WG_STATE}" == 'absent' ]]; then
@@ -551,7 +592,7 @@ run_provision_check() {
 execute_postflight() {
   local operation
   verify_remote_package || return $?
-  for operation in "${POSTFLIGHT_OPERATIONS[@]}" controller-shellcheck hermetic-matrix; do
+  for operation in "${POSTFLIGHT_OPERATIONS[@]}" controller-shellcheck hermetic-matrix hermetic-fresh; do
     run_operation execute "${operation}" || return $?
   done
   verify_stager || return $?
@@ -644,6 +685,15 @@ main() {
     restore)
       require_bound_wireguard
       run_operation execute "matrix-restore-${RESTORE_CELL}" || fail 'matrix-restore-operation' $?
+      ;;
+    fresh-plan)
+      run_operation execute fresh-plan || fail 'fresh-plan-operation' $?
+      ;;
+    fresh-run)
+      run_operation execute fresh-run || fail 'fresh-run-operation' $?
+      ;;
+    fresh-restore)
+      run_operation execute fresh-restore || fail 'fresh-restore-operation' $?
       ;;
   esac
 }

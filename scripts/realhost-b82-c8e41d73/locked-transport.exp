@@ -45,6 +45,15 @@ proc load_manifest {path expected_sha} {
         test_hermetic_matrix_sh_path test_hermetic_matrix_sh_blob
         test_hermetic_matrix_sh_sha256 test_matrix_static_py_path
         test_matrix_static_py_blob test_matrix_static_py_sha256
+        checksum_module_lease_sh_path checksum_module_lease_sh_blob
+        checksum_module_lease_sh_sha256 root_fresh_verifier_gate_sh_path
+        root_fresh_verifier_gate_sh_blob root_fresh_verifier_gate_sh_sha256
+        test_hermetic_fresh_verifier_gate_sh_path
+        test_hermetic_fresh_verifier_gate_sh_blob
+        test_hermetic_fresh_verifier_gate_sh_sha256
+        test_fresh_verifier_gate_static_py_path
+        test_fresh_verifier_gate_static_py_blob
+        test_fresh_verifier_gate_static_py_sha256
         prepare_stage_root_sh_path prepare_stage_root_sh_blob
         prepare_stage_root_sh_sha256 provision_ubuntu_test_host_sh_path
         provision_ubuntu_test_host_sh_blob provision_ubuntu_test_host_sh_sha256
@@ -74,7 +83,7 @@ proc load_manifest {path expected_sha} {
 }
 
 proc validate_manifest_values {values} {
-    if {[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v1" ||
+    if {[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v2" ||
         [dict get $values run_id] ne "c8e41d73" ||
         [dict get $values package_id] ne "4f2a9b61" ||
         ![regexp {^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$} [dict get $values integration_ref]] ||
@@ -95,6 +104,14 @@ proc validate_manifest_values {values} {
         [dict get $values target_kernel] ne "7.0.0-28-generic" ||
         [dict get $values target_machine_id] ne "9db3fb717cc74974b2a6b243d67f67b9" ||
         [dict get $values target_interface] ne "ens33" ||
+        [dict get $values checksum_module_lease_sh_path] ne
+            "scripts/realhost-b82-c8e41d73/checksum-module-lease.sh" ||
+        [dict get $values root_fresh_verifier_gate_sh_path] ne
+            "scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh" ||
+        [dict get $values test_hermetic_fresh_verifier_gate_sh_path] ne
+            "scripts/realhost-b82-c8e41d73/test-hermetic-fresh-verifier-gate.sh" ||
+        [dict get $values test_fresh_verifier_gate_static_py_path] ne
+            "scripts/realhost-b82-c8e41d73/test_fresh_verifier_gate_static.py" ||
         [dict get $values peer_address] ne "47.116.202.155" ||
         [dict get $values peer_port] ne "5201" ||
         [dict get $values soak_seconds] ne "3600" ||
@@ -121,6 +138,9 @@ proc validate_manifest_values {values} {
         bind_final_package_sh_blob controller_sh_blob locked_transport_exp_blob
         root_matrix_n_r_sh_blob check_realhost_iperf_py_blob
         test_hermetic_matrix_sh_blob test_matrix_static_py_blob
+        checksum_module_lease_sh_blob root_fresh_verifier_gate_sh_blob
+        test_hermetic_fresh_verifier_gate_sh_blob
+        test_fresh_verifier_gate_static_py_blob
         prepare_stage_root_sh_blob provision_ubuntu_test_host_sh_blob
     } {
         if {![regexp {^[0-9a-f]{40}$} [dict get $values $key]]} {
@@ -131,7 +151,10 @@ proc validate_manifest_values {values} {
         bind_final_package_sh_sha256 controller_sh_sha256
         locked_transport_exp_sha256 root_matrix_n_r_sh_sha256
         check_realhost_iperf_py_sha256 test_hermetic_matrix_sh_sha256
-        test_matrix_static_py_sha256 prepare_stage_root_sh_sha256
+        test_matrix_static_py_sha256 checksum_module_lease_sh_sha256
+        root_fresh_verifier_gate_sh_sha256
+        test_hermetic_fresh_verifier_gate_sh_sha256
+        test_fresh_verifier_gate_static_py_sha256 prepare_stage_root_sh_sha256
         provision_ubuntu_test_host_sh_sha256
     } {
         if {![regexp {^[0-9a-f]{64}$} [dict get $values $key]]} {
@@ -253,6 +276,18 @@ proc matrix_remote_argv {values mode restore_cell} {
     return $argv
 }
 
+proc fresh_remote_argv {values manifest_sha mode bootstrap_root} {
+    set source [dict get $values remote_source]
+    set script_path [dict get $values root_fresh_verifier_gate_sh_path]
+    return [list /bin/bash -p "${source}/${script_path}" $mode \
+        --controller-source $source \
+        --commit [dict get $values integration_commit] \
+        --manifest "${bootstrap_root}/package-manifest.v1" \
+        --manifest-sha256 $manifest_sha \
+        --bundle "${bootstrap_root}/[dict get $values bundle_name]" \
+        --bundle-sha256 [dict get $values bundle_sha256]]
+}
+
 proc package_sha {values name} {
     switch -- $name {
         source-4f2a9b61.bundle { return [dict get $values bundle_sha256] }
@@ -265,6 +300,10 @@ proc package_sha {values name} {
         check-realhost-iperf.py { return [dict get $values check_realhost_iperf_py_sha256] }
         test-hermetic-matrix.sh { return [dict get $values test_hermetic_matrix_sh_sha256] }
         test_matrix_static.py { return [dict get $values test_matrix_static_py_sha256] }
+        checksum-module-lease.sh { return [dict get $values checksum_module_lease_sh_sha256] }
+        root-fresh-verifier-gate.sh { return [dict get $values root_fresh_verifier_gate_sh_sha256] }
+        test-hermetic-fresh-verifier-gate.sh { return [dict get $values test_hermetic_fresh_verifier_gate_sh_sha256] }
+        test_fresh_verifier_gate_static.py { return [dict get $values test_fresh_verifier_gate_static_py_sha256] }
         default { return -code error "package-name" }
     }
 }
@@ -333,12 +372,23 @@ proc build_operation {values manifest_sha operation} {
                 /bin/bash "${package}/test-hermetic-matrix.sh"]]
             set timeout_seconds 660
         }
+        hermetic-fresh {
+            set remote [concat [env_argv] [list /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
+                /bin/bash "${package}/test-hermetic-fresh-verifier-gate.sh" \
+                "${package}/root-fresh-verifier-gate.sh" \
+                "${package}/checksum-module-lease.sh" \
+                "${package}/test_fresh_verifier_gate_static.py"]]
+            set timeout_seconds 660
+        }
         controller-shellcheck {
             set remote [concat [env_argv] [list /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
                 /usr/bin/shellcheck --norc --shell=bash -- \
                 "${package}/bind-final-package.sh" "${package}/controller.sh" \
                 "${package}/prepare-stage-root.sh" "${package}/root-matrix-n-r.sh" \
                 "${package}/test-hermetic-matrix.sh" \
+                "${package}/checksum-module-lease.sh" \
+                "${package}/root-fresh-verifier-gate.sh" \
+                "${package}/test-hermetic-fresh-verifier-gate.sh" \
                 "${package}/provision-ubuntu-test-host.sh"]]
             set timeout_seconds 660
         }
@@ -472,6 +522,14 @@ proc build_operation {values manifest_sha operation} {
             set tty 1
             set prompt_limit 2
             set timeout_seconds [expr {$matrix_mode eq "run" ? 20000 : 600}]
+        }
+        fresh-plan - fresh-run - fresh-restore {
+            set fresh_mode [string range $operation 6 end]
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [fresh_remote_argv $values $manifest_sha $fresh_mode $bootstrap_root]]
+            set tty 1
+            set prompt_limit 2
+            set timeout_seconds [expr {$fresh_mode eq "run" ? 3600 : 2400}]
         }
         default {
             if {[regexp {^matrix-restore-(tcx|original|all-on|all-off|tx-path|rx-path|mtu1492|mtu1500|soak)$} $operation -> cell]} {

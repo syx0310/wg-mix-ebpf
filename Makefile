@@ -79,11 +79,8 @@ test-b82-fresh-verifier-gate:
 	scripts/realhost-b82-c8e41d73/test-hermetic-checksum-module-lease.sh
 	scripts/realhost-b82-c8e41d73/test-hermetic-fresh-verifier-gate.sh \
 		"$(CURDIR)/scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh" \
-		"$(CURDIR)/scripts/realhost-b82-c8e41d73/checksum-module-lease.sh"
-	PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
-		scripts/realhost-b82-c8e41d73/test_fresh_verifier_gate_static.py \
-		"$(CURDIR)/scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh" \
-		"$(CURDIR)/scripts/realhost-b82-c8e41d73/checksum-module-lease.sh"
+		"$(CURDIR)/scripts/realhost-b82-c8e41d73/checksum-module-lease.sh" \
+		"$(CURDIR)/scripts/realhost-b82-c8e41d73/test_fresh_verifier_gate_static.py"
 	@mkdir -p $(dir $(FAKETCP_DATAPLANE_TEST_AMD64))
 	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
 		$(GO) test -c -o $(FAKETCP_DATAPLANE_TEST_AMD64) ./internal/dataplane

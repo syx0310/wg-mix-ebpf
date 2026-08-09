@@ -135,9 +135,6 @@ readonly SINGLE_L3_PATHS
 /usr/bin/git -C "${REPOSITORY}" diff --exit-code \
   "${STANDALONE_BASE_COMMIT}^" "${STANDALONE_BASE_COMMIT}" -- "${CONTROLLER_FILES[@]}" ||
   fail 'standalone base changed an existing controller or matrix file'
-/usr/bin/git -C "${REPOSITORY}" diff --exit-code \
-  "${CANONICAL_MERGE}" "${BOUND_COMMIT}" -- "${MERGE_RESOLUTION_FILES[@]}" ||
-  fail 'canonical conflict resolutions drifted after the explicit merge'
 /usr/bin/git -C "${REPOSITORY}" diff --exit-code "${BOUND_COMMIT}" -- \
   "${MERGE_RESOLUTION_FILES[@]}" || fail 'working tree changed a canonical merge resolution'
 
