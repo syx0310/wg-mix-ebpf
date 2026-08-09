@@ -71,18 +71,18 @@ func TestFakeTCPSKBContextLayout(t *testing.T) {
 // TestFakeTCPBPFPacketProbe verifier-loads the separately built experimental
 // object, populates only in-memory maps, and invokes the TC egress program with
 // BPF_PROG_TEST_RUN. It never attaches or pins a program. The test-run ABI
-// cannot synthesize ip_summed/csum_start/csum_offset, so its default skb covers
-// only the CHECKSUM_NONE path used after raw/IP_HDRINCL reinjection has already
-// materialized the UDP checksum. A successful cell is never evidence that the
-// real-TC CHECKSUM_PARTIAL path works. This probe covers verifier loading,
-// CHECKSUM_NONE transformation, GSO rejection and frame boundaries. Run
+// cannot synthesize ip_summed/csum_start/csum_offset or skb_dst. The unified
+// prepare contract must therefore reject its otherwise materialized
+// CHECKSUM_NONE skb as route-PMTU-unknown before mutation. Success belongs only
+// to routed real-TC evidence. This probe covers verifier loading, the no-route
+// fail-closed boundary, synthetic unsupported-GSO metadata and frame caps. Run
 // explicitly on a Linux test host as:
 //
 //	WG_MIX_FAKETCP_PACKET_TEST_OBJECT=/absolute/wg_mix_faketcp_experimental.o \
 //	  go test ./internal/dataplane -run '^TestFakeTCPBPFPacketProbe$' -v
 //
-// CHECKSUM_PARTIAL normalization remains a separately reviewed real-TC/NIC
-// acceptance requirement.
+// CHECKSUM_PARTIAL normalization and successful PMTU admission remain
+// separately reviewed real-TC/NIC acceptance requirements.
 func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	objectPath := os.Getenv(fakeTCPPacketProbeObjectEnv)
 	if objectPath == "" {
@@ -134,8 +134,9 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	populateFakeTCPPacketProbeTailCalls(t, collection, generation)
 
 	const (
-		fakeTCPStatBadPacket = uint32(4)
-		fakeTCPStatGSOReject = uint32(5)
+		fakeTCPStatBadPacket           = uint32(4)
+		fakeTCPStatGSOReject           = uint32(5)
+		fakeTCPMTURouteUnknownAuditKey = uint32(3*3 + 2)
 	)
 	for _, xorEnabled := range []bool{false, true} {
 		for _, payloadLength := range []int{32, 33, 1459, 1460} {
@@ -144,10 +145,13 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 				name += "-xor"
 			}
 			t.Run(name, func(t *testing.T) {
-				xorKey := populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
+				populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
 					ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, xorEnabled)
-				packet, originalPayload := buildFakeTCPProbeUDPPacket(
+				packet, _ := buildFakeTCPProbeUDPPacket(
 					t, sourcePort, remotePort, payloadLength,
+				)
+				before := readFakeTCPPacketProbeMapCounter(
+					t, collection, "faketcp_mtu_audit_map", fakeTCPMTURouteUnknownAuditKey,
 				)
 				context := fakeTCPSKBContext{Ifindex: ifindex}
 				result, output, err := runFakeTCPPacketProbe(
@@ -156,12 +160,18 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 				if err != nil {
 					t.Fatalf("BPF_PROG_TEST_RUN materialized packet: %v", err)
 				}
-				if result != 0 {
-					t.Fatalf("CHECKSUM_NONE packet action=%d, want TC_ACT_OK", result)
+				if result != 2 {
+					t.Fatalf("no-route CHECKSUM_NONE packet action=%d, want TC_ACT_SHOT", result)
 				}
-				verifyFakeTCPProbeOutput(
-					t, output, packet, originalPayload, sourcePort, remotePort, xorKey,
+				if !bytes.Equal(output, packet) {
+					t.Fatal("no-route CHECKSUM_NONE packet mutated before PMTU rejection")
+				}
+				after := readFakeTCPPacketProbeMapCounter(
+					t, collection, "faketcp_mtu_audit_map", fakeTCPMTURouteUnknownAuditKey,
 				)
+				if after != before+1 {
+					t.Fatalf("route-unknown audit delta=%d, want 1", after-before)
+				}
 			})
 		}
 	}
@@ -169,19 +179,28 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	t.Run("frame-cap-exact-materialized", func(t *testing.T) {
 		populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
 			ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, false)
-		packet, originalPayload := buildFakeTCPProbeUDPPacket(t, sourcePort, remotePort, 2276)
+		packet, _ := buildFakeTCPProbeUDPPacket(t, sourcePort, remotePort, 2276)
+		before := readFakeTCPPacketProbeMapCounter(
+			t, collection, "faketcp_mtu_audit_map", fakeTCPMTURouteUnknownAuditKey,
+		)
 		result, output, err := runFakeTCPPacketProbe(
 			program, packet, fakeTCPSKBContext{Ifindex: ifindex}, len(packet)+64,
 		)
 		if err != nil {
 			t.Fatalf("BPF_PROG_TEST_RUN exact frame boundary: %v", err)
 		}
-		if result != 0 {
-			t.Fatalf("exact frame-boundary packet action=%d, want TC_ACT_OK", result)
+		if result != 2 {
+			t.Fatalf("no-route exact frame-boundary action=%d, want TC_ACT_SHOT", result)
 		}
-		verifyFakeTCPProbeOutput(
-			t, output, packet, originalPayload, sourcePort, remotePort, nil,
+		if !bytes.Equal(output, packet) {
+			t.Fatal("no-route exact frame-boundary packet mutated before PMTU rejection")
+		}
+		after := readFakeTCPPacketProbeMapCounter(
+			t, collection, "faketcp_mtu_audit_map", fakeTCPMTURouteUnknownAuditKey,
 		)
+		if after != before+1 {
+			t.Fatalf("route-unknown audit delta=%d, want 1", after-before)
+		}
 	})
 
 	t.Run("frame-cap-one-over-hard-reject", func(t *testing.T) {
@@ -245,17 +264,27 @@ func readFakeTCPPacketProbeStat(
 	key uint32,
 ) uint64 {
 	t.Helper()
-	stats := collection.Maps["faketcp_stats_map"]
-	if stats == nil {
-		t.Fatal("experimental object has no faketcp_stats_map")
+	return readFakeTCPPacketProbeMapCounter(t, collection, "faketcp_stats_map", key)
+}
+
+func readFakeTCPPacketProbeMapCounter(
+	t *testing.T,
+	collection *ebpf.Collection,
+	mapName string,
+	key uint32,
+) uint64 {
+	t.Helper()
+	counters := collection.Maps[mapName]
+	if counters == nil {
+		t.Fatalf("experimental object has no %s", mapName)
 	}
 	possibleCPUs, err := ebpf.PossibleCPU()
 	if err != nil {
 		t.Fatalf("read possible CPU count: %v", err)
 	}
 	values := make([]uint64, possibleCPUs)
-	if err := stats.Lookup(&key, &values); err != nil {
-		t.Fatalf("read faketcp_stats_map[%d]: %v", key, err)
+	if err := counters.Lookup(&key, &values); err != nil {
+		t.Fatalf("read %s[%d]: %v", mapName, key, err)
 	}
 	var total uint64
 	for _, value := range values {

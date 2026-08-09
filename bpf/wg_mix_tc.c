@@ -1897,7 +1897,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 		inc_stat(STAT_EGRESS_BAD_TYPE);
 		return TC_ACT_SHOT;
 	}
-	if (!validate_len(kind, info.payload_len)) {
+	if (!gso_seen && !validate_len(kind, info.payload_len)) {
 		inc_stat(STAT_EGRESS_BAD_LENGTH);
 		return TC_ACT_SHOT;
 	}
@@ -1909,7 +1909,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 	cipher_id = rule->cipher_id;
-	if (cipher_id != 0) {
+	if (cipher_id != 0 && !gso_seen) {
 		if (rule->transport_mode != TRANSPORT_UDP
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
 		    && rule->transport_mode != TRANSPORT_FAKETCP
@@ -1929,18 +1929,22 @@ int wg_mix_egress(struct __sk_buff *skb)
 		}
 	}
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
-	// The single admission checkpoint validates the unmodified packet and the
-	// complete managed type-word/XOR/FakeTCP composition. Checksum metadata is
-	// normalized only after that proof and still before any packet-byte write.
+	// One shared fixed-IPv4 gate and one unified prepare precede the single
+	// checkpoint. The admitted path then closes over exactly one direct/XOR or
+	// aggregate transform; no FakeTCP packet falls back into generic UDP logic.
 	if (rule->transport_mode == TRANSPORT_FAKETCP) {
 		if (faketcp_parse_tc_l3(skb, &info, &faketcp_l3) !=
-		    FAKETCP_L3_OK ||
-		    faketcp_managed_transform_status(&faketcp_l3, IPPROTO_UDP) !=
 		    FAKETCP_L3_OK) {
 			inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 			return TC_ACT_SHOT;
 		}
-		if (!faketcp_mtu_allows_growth(skb, faketcp_l3.l3_len))
+		if (gso_seen)
+			return faketcp_encode_gso_segments(
+				skb, &info, &faketcp_l3, managed, rule, profile,
+				generation, rc, kind, old_wire, new_wire);
+		if (faketcp_prepare_udp(
+			    skb, info.ip_off, info.udp_off,
+			    info.payload_len + sizeof(struct udphdr), 0) < 0)
 			return TC_ACT_SHOT;
 		if (faketcp_egress_admission_checkpoint(
 			    skb, &info, &faketcp_l3, managed, rule, profile,
@@ -1948,13 +1952,6 @@ int wg_mix_egress(struct __sk_buff *skb)
 			    kind, old_wire, new_wire, xor_checksum_mode,
 			    &faketcp_admission) != FAKETCP_ADMISSION_TRANSFORM)
 			return TC_ACT_SHOT;
-		if (faketcp_inspect_and_reset_udp_checksum(
-			    skb, info.ip_off, info.udp_off,
-			    info.payload_len + sizeof(struct udphdr)) < 0) {
-			faketcp_consume_egress_admission(
-				faketcp_admission.nonce, 0);
-			return TC_ACT_SHOT;
-		}
 		if (cipher_id != 0) {
 			set_faketcp_xor_context(skb, faketcp_admission.nonce);
 			rc = update_type_word(skb, &info, old_wire, new_wire, 1);
