@@ -2185,6 +2185,40 @@ def plan_mode(spec: CoreSpec, runner: CommandRunner) -> int:
     return execute_with_physical_authority("plan", spec, runner)
 
 
+def validate_controller_plan_publish(
+    path_value: str,
+    expected_sha256: str,
+    final_metadata: os.stat_result,
+) -> None:
+    pending_path = f"{path_value}.pending.{expected_sha256}"
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(pending_path, flags)
+    except OSError as exc:
+        raise HarnessError(f"approved plan durable pending is unavailable: {exc}") from exc
+    try:
+        pending = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(pending.st_mode)
+            or pending.st_uid != 0
+            or pending.st_gid != 0
+            or stat.S_IMODE(pending.st_mode) != 0o600
+            or pending.st_nlink != 2
+            or pending.st_size != final_metadata.st_size
+            or (pending.st_dev, pending.st_ino)
+            != (final_metadata.st_dev, final_metadata.st_ino)
+        ):
+            raise HarnessError("approved plan durable publish identity is invalid")
+        current = os.lstat(pending_path)
+        if stat.S_ISLNK(current.st_mode) or (current.st_dev, current.st_ino) != (
+            pending.st_dev,
+            pending.st_ino,
+        ):
+            raise HarnessError("approved plan durable pending path changed while reading")
+    finally:
+        os.close(descriptor)
+
+
 def read_plan_document(
     path_value: str,
     expected_sha256: str,
@@ -2202,19 +2236,23 @@ def read_plan_document(
         raise HarnessError(f"cannot open approved plan: {exc}") from exc
     try:
         metadata = os.fstat(descriptor)
+        expected_links = 2 if require_root_owned else 1
         if (
             not stat.S_ISREG(metadata.st_mode)
-            or metadata.st_nlink != 1
+            or metadata.st_nlink != expected_links
             or metadata.st_size > 16 << 20
             or metadata.st_size == 0
         ):
-            raise HarnessError("approved plan must be a bounded single-link regular file")
+            shape = "durable-published" if require_root_owned else "single-link"
+            raise HarnessError(f"approved plan must be a bounded {shape} regular file")
         if require_root_owned and (
             metadata.st_uid != 0
             or metadata.st_gid != 0
             or stat.S_IMODE(metadata.st_mode) != 0o600
         ):
             raise HarnessError("approved plan must be the root-owned 0600 stager snapshot")
+        if require_root_owned:
+            validate_controller_plan_publish(path_value, expected_sha256, metadata)
         chunks: list[bytes] = []
         remaining = metadata.st_size
         while remaining:
@@ -2229,6 +2267,8 @@ def read_plan_document(
             metadata.st_ino,
         ):
             raise HarnessError("approved plan path changed while reading")
+        if require_root_owned:
+            validate_controller_plan_publish(path_value, expected_sha256, metadata)
         payload = b"".join(chunks)
     finally:
         os.close(descriptor)

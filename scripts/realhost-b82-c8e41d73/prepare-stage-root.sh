@@ -102,6 +102,8 @@ PROVISION_SHA256=''
 PHYSICAL_INTERFACE_LOCK_FD=''
 APPROVED_PLAN_SHA256=''
 APPROVED_PLAN_FD=''
+APPROVED_PLAN_PENDING=''
+APPROVED_PLAN_PENDING_FD=''
 
 fail() {
   printf 'B82_V6_STAGE_STOP mode=%s reason=%s rc=%s snapshot=%s stage=%s; retained=1\n' \
@@ -153,6 +155,7 @@ parse_arguments() {
     [[ "$5" == '--approved-plan-sha256' ]] || return 64
     APPROVED_PLAN_SHA256="$6"
     valid_sha256 "${APPROVED_PLAN_SHA256}" || return 65
+    APPROVED_PLAN_PENDING="${ROOT_REALNIC_PLAN}.pending.${APPROVED_PLAN_SHA256}"
   fi
   [[ "${MANIFEST}" == /* ]] || return 65
   valid_sha256 "${MANIFEST_SHA256}" || return 65
@@ -398,7 +401,7 @@ render_plan() {
     "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PROVISION_PATH}"
   plan_command S8 shell-builtin noclobber-write "${BINDING_MARKER}"
-  printf 'B82_V6_REALNIC_AUTHORITY script=%s profile=%s traffic_seconds=%s soak_seconds=%s soak_window_seconds=%s approved_plan=%s snapshot=held-fd-noclobber verify=exact-root-owned\n' \
+  printf 'B82_V6_REALNIC_AUTHORITY script=%s profile=%s traffic_seconds=%s soak_seconds=%s soak_window_seconds=%s approved_plan=%s snapshot=held-fd-writeall-fsync-hardlink-noclobber verify=final-pending-same-inode\n' \
     "${EXPECTED_SOURCE}/${REALNIC_PATH}" "${REALNIC_PROFILE}" "${REALNIC_TRAFFIC_SECONDS}" \
     "${SOAK_SECONDS}" "${SESSION_SECONDS}" "${ROOT_REALNIC_PLAN}"
   printf 'B82_V6_STAGE_PLAN_COMPLETE no_commands_executed=1 no_cleanup=1\n'
@@ -655,24 +658,41 @@ require_completed_stage() {
 }
 
 require_approved_plan_object() {
-  local object="$1" owner="$2" expected_sha="$3" shape size
+  local object="$1" owner="$2" expected_sha="$3" expected_links="$4" shape size
   shape="$(/usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${object}")" || return 79
   size="$(/usr/bin/stat -Lc '%s' -- "${object}")" || return 79
-  [[ "${shape}" == "${owner}:600:1:regular file" && "${size}" =~ ^[1-9][0-9]*$ &&
+  [[ "${shape}" == "${owner}:600:${expected_links}:regular file" && "${size}" =~ ^[1-9][0-9]*$ &&
     "${size}" -le 16777216 && "$(sha256_file "${object}")" == "${expected_sha}" ]]
 }
+
+require_approved_plan_publish() (
+  local final_identity pending_identity path canonical
+  [[ "${APPROVED_PLAN_PENDING}" == \
+    "${ROOT_REALNIC_PLAN}.pending.${APPROVED_PLAN_SHA256}" ]] || return 65
+  for path in "${ROOT_REALNIC_PLAN}" "${APPROVED_PLAN_PENDING}"; do
+    canonical="$(/usr/bin/readlink -e -- "${path}")" || return 79
+    [[ "${canonical}" == "${path}" && -f "${path}" && ! -L "${path}" ]] || return 79
+    require_approved_plan_object "${path}" 'root:root' \
+      "${APPROVED_PLAN_SHA256}" 2 || return $?
+  done
+  final_identity="$(/usr/bin/stat -Lc '%d:%i' -- "${ROOT_REALNIC_PLAN}")" || return 79
+  pending_identity="$(/usr/bin/stat -Lc '%d:%i' -- "${APPROVED_PLAN_PENDING}")" || return 79
+  [[ "${final_identity}" == "${pending_identity}" ]]
+)
 
 require_approved_plan_path() (
   local path="$1" owner="$2" expected_sha="$3" canonical descriptor
   local descriptor_identity path_identity
-  case "${path}:${owner}" in
-    "${USER_REALNIC_PLAN}:siyixuan:siyixuan" | "${ROOT_REALNIC_PLAN}:root:root") ;;
-    *) return 65 ;;
-  esac
+  if [[ "${path}:${owner}" == "${ROOT_REALNIC_PLAN}:root:root" ]]; then
+    require_approved_plan_publish
+    return $?
+  fi
+  [[ "${path}:${owner}" == "${USER_REALNIC_PLAN}:siyixuan:siyixuan" ]] || return 65
   canonical="$(/usr/bin/readlink -e -- "${path}")" || return 79
   [[ "${canonical}" == "${path}" && -f "${path}" && ! -L "${path}" ]] || return 79
   exec {descriptor}<"${path}" || return 79
-  require_approved_plan_object "/proc/self/fd/${descriptor}" "${owner}" "${expected_sha}" || return $?
+  require_approved_plan_object "/proc/self/fd/${descriptor}" "${owner}" \
+    "${expected_sha}" 1 || return $?
   descriptor_identity="$(/usr/bin/stat -Lc '%d:%i' -- "/proc/self/fd/${descriptor}")" || return 79
   path_identity="$(/usr/bin/stat -Lc '%d:%i' -- "${path}")" || return 79
   [[ "${descriptor_identity}" == "${path_identity}" && ! -L "${path}" ]]
@@ -684,24 +704,92 @@ open_approved_plan_intake() {
     "${APPROVED_PLAN_SHA256}" || return $?
   exec {APPROVED_PLAN_FD}<"${USER_REALNIC_PLAN}" || return 79
   require_approved_plan_object "/proc/self/fd/${APPROVED_PLAN_FD}" \
-    'siyixuan:siyixuan' "${APPROVED_PLAN_SHA256}" || return $?
+    'siyixuan:siyixuan' "${APPROVED_PLAN_SHA256}" 1 || return $?
   descriptor_identity="$(/usr/bin/stat -Lc '%d:%i' -- \
     "/proc/self/fd/${APPROVED_PLAN_FD}")" || return 79
   path_identity="$(/usr/bin/stat -Lc '%d:%i' -- "${USER_REALNIC_PLAN}")" || return 79
   [[ "${descriptor_identity}" == "${path_identity}" ]]
 }
 
-copy_approved_plan_noclobber() {
-  [[ "${APPROVED_PLAN_FD}" =~ ^[0-9]+$ && ! -e "${ROOT_REALNIC_PLAN}" && \
-    ! -L "${ROOT_REALNIC_PLAN}" ]] || return 73
+create_approved_plan_pending() {
+  [[ ! -e "${APPROVED_PLAN_PENDING}" && ! -L "${APPROVED_PLAN_PENDING}" ]] || return 73
   (umask 077
     set -o noclobber
-    /usr/bin/cat -- "/proc/self/fd/${APPROVED_PLAN_FD}" >"${ROOT_REALNIC_PLAN}")
+    : >"${APPROVED_PLAN_PENDING}")
+}
+
+require_approved_plan_pending_shape() {
+  local canonical shape size
+  canonical="$(/usr/bin/readlink -e -- "${APPROVED_PLAN_PENDING}")" || return 79
+  [[ "${canonical}" == "${APPROVED_PLAN_PENDING}" && \
+    -f "${APPROVED_PLAN_PENDING}" && ! -L "${APPROVED_PLAN_PENDING}" ]] || return 79
+  shape="$(/usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${APPROVED_PLAN_PENDING}")" || return 79
+  size="$(/usr/bin/stat -Lc '%s' -- "${APPROVED_PLAN_PENDING}")" || return 79
+  [[ "${shape}" == 'root:root:600:1:regular file' && "${size}" =~ ^[0-9]+$ && \
+    "${size}" -le 16777216 ]]
+}
+
+fsync_exact_target() {
+  local target="$1" kind="$2"
+  case "${target}:${kind}" in
+    "${APPROVED_PLAN_PENDING_FD}:file" | "${BOOTSTRAP_ROOT}:directory") ;;
+    *) return 65 ;;
+  esac
+  /usr/bin/python3 -B -I -c \
+    'import os, stat, sys
+target, kind = sys.argv[1:]
+opened = kind == "directory"
+fd = os.open(target, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_DIRECTORY", 0)) if opened else int(target)
+try:
+    mode = os.fstat(fd).st_mode
+    if (kind == "file" and not stat.S_ISREG(mode)) or (kind == "directory" and not stat.S_ISDIR(mode)):
+        raise OSError("fsync target type changed")
+    os.fsync(fd)
+finally:
+    if opened:
+        os.close(fd)' "${target}" "${kind}"
+}
+
+write_approved_plan_pending() {
+  local descriptor_identity path_identity
+  [[ "${APPROVED_PLAN_FD}" =~ ^[0-9]+$ ]] || return 65
+  require_approved_plan_pending_shape || return $?
+  exec {APPROVED_PLAN_PENDING_FD}<>"${APPROVED_PLAN_PENDING}" || return 79
+  require_approved_plan_pending_shape || return $?
+  descriptor_identity="$(/usr/bin/stat -Lc '%d:%i' -- \
+    "/proc/self/fd/${APPROVED_PLAN_PENDING_FD}")" || return 79
+  path_identity="$(/usr/bin/stat -Lc '%d:%i' -- "${APPROVED_PLAN_PENDING}")" || return 79
+  [[ "${descriptor_identity}" == "${path_identity}" && \
+    ! -L "${APPROVED_PLAN_PENDING}" ]] || return 79
+  /usr/bin/cat -- "/proc/self/fd/${APPROVED_PLAN_FD}" \
+    >"/proc/self/fd/${APPROVED_PLAN_PENDING_FD}" || return $?
+  fsync_exact_target "${APPROVED_PLAN_PENDING_FD}" file || return $?
+  [[ "$(/usr/bin/stat -Lc '%d:%i' -- "${APPROVED_PLAN_PENDING}")" == \
+    "${descriptor_identity}" ]] || return 79
+  require_approved_plan_object "/proc/self/fd/${APPROVED_PLAN_PENDING_FD}" \
+    'root:root' "${APPROVED_PLAN_SHA256}" 1 || return $?
+  require_approved_plan_object "${APPROVED_PLAN_PENDING}" 'root:root' \
+    "${APPROVED_PLAN_SHA256}" 1
+}
+
+require_approved_plan_pending_fd() {
+  local descriptor_identity path_identity
+  [[ "${APPROVED_PLAN_PENDING_FD}" =~ ^[0-9]+$ ]] || return 65
+  require_approved_plan_pending_shape || return $?
+  descriptor_identity="$(/usr/bin/stat -Lc '%d:%i' -- \
+    "/proc/self/fd/${APPROVED_PLAN_PENDING_FD}")" || return 79
+  path_identity="$(/usr/bin/stat -Lc '%d:%i' -- "${APPROVED_PLAN_PENDING}")" || return 79
+  [[ "${descriptor_identity}" == "${path_identity}" && \
+    ! -L "${APPROVED_PLAN_PENDING}" ]] || return 79
+  require_approved_plan_object "/proc/self/fd/${APPROVED_PLAN_PENDING_FD}" \
+    'root:root' "${APPROVED_PLAN_SHA256}" 1
 }
 
 snapshot_realnic_plan() {
   local descriptor_identity path_identity disposition='created'
   require_completed_stage || fail 'completed-stage-contract' $?
+  require_bootstrap_root || fail 'bootstrap-root-drift' $?
+  acquire_physical_interface_lock || fail 'physical-interface-lock' $?
   open_approved_plan_intake || fail 'approved-plan-intake' $?
   descriptor_identity="$(/usr/bin/stat -Lc '%d:%i' -- \
     "/proc/self/fd/${APPROVED_PLAN_FD}")" || fail 'approved-plan-intake-fd-identity' 79
@@ -710,10 +798,23 @@ snapshot_realnic_plan() {
       "${APPROVED_PLAN_SHA256}" || fail 'approved-plan-preexisting-differs' $?
     disposition='verified-existing'
   else
-    run_step RP1 copy_approved_plan_noclobber || fail 'approved-plan-snapshot-copy' $?
+    if [[ ! -e "${APPROVED_PLAN_PENDING}" && ! -L "${APPROVED_PLAN_PENDING}" ]]; then
+      run_step RP1 create_approved_plan_pending || fail 'approved-plan-pending-create' $?
+    fi
+    require_approved_plan_pending_shape || fail 'approved-plan-pending-shape' $?
+    run_step RP2 write_approved_plan_pending || fail 'approved-plan-pending-write' $?
+    run_step RP2.parent fsync_exact_target "${BOOTSTRAP_ROOT}" directory ||
+      fail 'approved-plan-pending-parent-fsync' $?
+    require_approved_plan_pending_fd || fail 'approved-plan-pending-prepublish-drift' $?
+    run_step RP3 /bin/ln --no-target-directory -- \
+      "${APPROVED_PLAN_PENDING}" "${ROOT_REALNIC_PLAN}" ||
+      fail 'approved-plan-publish' $?
   fi
   require_approved_plan_path "${ROOT_REALNIC_PLAN}" 'root:root' \
     "${APPROVED_PLAN_SHA256}" || fail 'approved-plan-root-snapshot' $?
+  run_step RP4 fsync_exact_target "${BOOTSTRAP_ROOT}" directory ||
+    fail 'approved-plan-parent-fsync' $?
+  require_bootstrap_root || fail 'bootstrap-root-postpublish-drift' $?
   path_identity="$(/usr/bin/stat -Lc '%d:%i' -- "${USER_REALNIC_PLAN}")" ||
     fail 'approved-plan-intake-path-identity' 79
   [[ "${descriptor_identity}" == "${path_identity}" ]] ||
