@@ -704,14 +704,15 @@ class StrictIperfOracleTests(unittest.TestCase):
                     self.assertIn("measured duration", stderr.decode())
 
 
-class MTUNegativeOracleTests(unittest.TestCase):
+class MTUOutcomeOracleTests(unittest.TestCase):
     def setUp(self):
         self.spec = fixture_spec()
-        self.contract = MODULE.mtu_negative_contract(self.spec, 1492)
+        self.negative = MODULE.mtu_outcome_contract(self.spec, 1492, False)
+        self.positive = MODULE.mtu_outcome_contract(self.spec, 1492, True)
 
     def test_exact_local_emsgsize_is_structured_boundary_evidence(self):
-        outcome = MODULE.mtu_negative_oracle(
-            self.contract,
+        outcome = MODULE.mtu_outcome_oracle(
+            self.negative,
             1,
             (
                 b"PING 47.116.202.155 (47.116.202.155) 1465 data bytes\n"
@@ -735,17 +736,50 @@ class MTUNegativeOracleTests(unittest.TestCase):
         }
         for name, (rc, stdout, stderr) in cases.items():
             with self.subTest(name=name), self.assertRaises(MODULE.HarnessError):
-                MODULE.mtu_negative_oracle(self.contract, rc, stdout, stderr)
+                MODULE.mtu_outcome_oracle(self.negative, rc, stdout, stderr)
 
     def test_wrong_reported_mtu_or_return_code_is_rejected(self):
         for rc, mtu in ((1, 1500), (124, 1492)):
             with self.subTest(rc=rc, mtu=mtu), self.assertRaises(MODULE.HarnessError):
-                MODULE.mtu_negative_oracle(
-                    self.contract,
+                MODULE.mtu_outcome_oracle(
+                    self.negative,
                     rc,
                     f"ping: local error: message too long, mtu={mtu}\n".encode(),
                     b"",
                 )
+
+    def test_positive_boundary_requires_exact_three_of_three_zero_loss(self):
+        outcome = MODULE.mtu_outcome_oracle(
+            self.positive,
+            0,
+            b"3 packets transmitted, 3 received, 0% packet loss, time 2001ms\n",
+            b"",
+        )
+        self.assertEqual(outcome.boundary, "positive")
+        self.assertEqual((outcome.transmitted, outcome.received), (3, 3))
+        self.assertEqual(outcome.loss_percent, 0.0)
+        self.assertEqual(outcome.packet_bytes, 1492)
+        self.assertIsNone(outcome.local_errno)
+
+    def test_positive_rc_zero_with_partial_receive_is_rejected(self):
+        with self.assertRaisesRegex(MODULE.HarnessError, "exact 3/3 zero-loss"):
+            MODULE.mtu_outcome_oracle(
+                self.positive,
+                0,
+                b"3 packets transmitted, 1 received, 66.7% packet loss, time 2001ms\n",
+                b"",
+            )
+
+    def test_positive_boundary_rejects_local_remote_and_timeout_errors(self):
+        summary = b"3 packets transmitted, 3 received, 0% packet loss\n"
+        errors = (
+            b"ping: local error: message too long, mtu=1492\n",
+            b"From 192.168.10.1 Destination Host Unreachable\n",
+            b"timeout: sending signal TERM\n",
+        )
+        for error in errors:
+            with self.subTest(error=error), self.assertRaises(MODULE.HarnessError):
+                MODULE.mtu_outcome_oracle(self.positive, 0, summary, error)
 
 
 class CounterGateTests(unittest.TestCase):
@@ -935,16 +969,22 @@ class PlannerTests(unittest.TestCase):
         self.assertFalse(plan["safety_contract"]["implemented_capability_bits_changed"])
         self.assertFalse(plan["safety_contract"]["af_packet_no_dst_positive_pmtu"])
 
-    def test_mtu_negative_step_binds_the_local_emsgsize_oracle(self):
+    def test_mtu_steps_bind_exact_positive_and_negative_outcome_oracles(self):
         spec = fixture_spec()
         runner = FixtureRunner(spec)
         snapshot, commands = MODULE.collect_snapshot(spec, runner)
         plan = MODULE.build_plan(spec, snapshot, commands)
         cell = next(item for item in plan["cells"] if item["name"] == "tcp-mtu-low")
+        positive = next(item for item in cell["traffic"] if item["kind"] == "mtu-positive")
         negative = next(item for item in cell["traffic"] if item["kind"] == "mtu-negative")
         self.assertEqual(
+            positive["outcome_oracle"],
+            MODULE.mtu_outcome_contract(spec, cell["expected_mtu"], True),
+        )
+        self.assertEqual(positive["outcome_oracle"]["packet_bytes"], cell["expected_mtu"])
+        self.assertEqual(
             negative["outcome_oracle"],
-            MODULE.mtu_negative_contract(spec, cell["expected_mtu"]),
+            MODULE.mtu_outcome_contract(spec, cell["expected_mtu"], False),
         )
         self.assertEqual(negative["outcome_oracle"]["packet_bytes"], cell["expected_mtu"] + 1)
 

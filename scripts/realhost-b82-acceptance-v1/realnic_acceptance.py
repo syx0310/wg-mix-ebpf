@@ -1471,70 +1471,117 @@ def feature_cell(spec: CoreSpec, snapshot: Mapping[str, Any], name: str, policy:
     }
 
 
-def mtu_negative_contract(spec: CoreSpec, mtu: int) -> dict[str, Any]:
-    payload = mtu - 28 + 1
+def mtu_outcome_contract(spec: CoreSpec, mtu: int, positive: bool) -> dict[str, Any]:
+    payload = mtu - 28 + (0 if positive else 1)
     return {
-        "schema": "wg-mix-ebpf-realnic-local-emsgsize-oracle-v1",
+        "schema": "wg-mix-ebpf-realnic-mtu-outcome-oracle-v2",
         "interface": spec.interface,
+        "boundary": "positive" if positive else "negative",
         "expected_mtu": mtu,
         "payload_bytes": payload,
         "ipv4_header_bytes": 20,
         "icmp_header_bytes": 8,
         "packet_bytes": payload + 28,
-        "expected_rc": 1,
-        "required_local_error": "message too long",
+        "expected_rc": 0 if positive else 1,
+        "expected_summary": (
+            {"transmitted": 3, "received": 3, "loss_percent": 0.0} if positive else None
+        ),
+        "required_local_error": None if positive else "message too long",
     }
 
 
 @dataclasses.dataclass(frozen=True)
-class MTUNegativeOutcome:
+class MTUOutcome:
     schema: str
+    boundary: str
     rc: int
     expected_mtu: int
-    reported_mtu: int
+    reported_mtu: int | None
     payload_bytes: int
     packet_bytes: int
-    local_errno: str
+    transmitted: int | None
+    received: int | None
+    loss_percent: float | None
+    local_errno: str | None
     local_error_count: int
 
 
-def mtu_negative_oracle(
+def mtu_outcome_oracle(
     contract: Mapping[str, Any],
     rc: int,
     stdout: bytes,
     stderr: bytes,
-) -> MTUNegativeOutcome:
+) -> MTUOutcome:
     try:
         text = (stdout + b"\n" + stderr).decode("utf-8")
     except UnicodeDecodeError as exc:
-        raise HarnessError("MTU negative ping output is not UTF-8") from exc
-    matches = re.findall(
+        raise HarnessError("MTU ping output is not UTF-8") from exc
+    local_matches = re.findall(
         r"^(?:ping: )?local error: message too long, mtu=([0-9]+)\s*$",
         text,
         flags=re.MULTILINE,
     )
-    forbidden = re.search(
-        r"destination .*unreachable|from .*unreachable|time(?:d)? out|frag needed|time to live exceeded",
+    remote_error = re.search(
+        r"destination .*unreachable|from .*unreachable|\btimeout\b|\btimed out\b|frag needed|time to live exceeded",
         text,
         flags=re.IGNORECASE,
     )
-    if rc != contract.get("expected_rc") or not matches or forbidden is not None:
-        raise HarnessError("MTU negative ping lacks an exact local EMSGSIZE outcome")
+    summaries = re.findall(
+        r"^([0-9]+) packets transmitted, ([0-9]+) received(?:, \+([0-9]+) errors)?, "
+        r"([0-9]+(?:\.[0-9]+)?)% packet loss(?:,.*)?$",
+        text,
+        flags=re.MULTILINE,
+    )
+    if rc != contract.get("expected_rc") or remote_error is not None or len(summaries) > 1:
+        raise HarnessError("MTU ping does not match its exact local outcome contract")
     expected_mtu = int(contract["expected_mtu"])
-    reported_mtus = {int(value) for value in matches}
     payload_bytes = int(contract["payload_bytes"])
     packet_bytes = int(contract["packet_bytes"])
-    if reported_mtus != {expected_mtu} or packet_bytes != expected_mtu + 1 or payload_bytes + 28 != packet_bytes:
-        raise HarnessError("MTU negative ping outcome does not match its exact boundary contract")
-    return MTUNegativeOutcome(
-        schema="wg-mix-ebpf-realnic-local-emsgsize-outcome-v1",
+    boundary = contract.get("boundary")
+    boundary_offset = 0 if boundary == "positive" else 1
+    if boundary not in {"positive", "negative"} or packet_bytes != expected_mtu + boundary_offset or payload_bytes + 28 != packet_bytes:
+        raise HarnessError("MTU ping packet size does not match its exact boundary contract")
+    summary = summaries[0] if summaries else None
+    transmitted = int(summary[0]) if summary else None
+    received = int(summary[1]) if summary else None
+    summary_errors = int(summary[2]) if summary and summary[2] else 0
+    loss_percent = float(summary[3]) if summary else None
+    if boundary == "positive":
+        expected_summary = contract.get("expected_summary")
+        if (
+            local_matches
+            or re.search(r"\blocal error\b", text, flags=re.IGNORECASE)
+            or summary is None
+            or summary_errors != 0
+            or expected_summary
+            != {
+                "transmitted": transmitted,
+                "received": received,
+                "loss_percent": loss_percent,
+            }
+        ):
+            raise HarnessError("MTU positive ping is not an exact 3/3 zero-loss outcome")
+        reported_mtu = None
+        local_errno = None
+    else:
+        reported_mtus = {int(value) for value in local_matches}
+        if not local_matches or reported_mtus != {expected_mtu}:
+            raise HarnessError("MTU negative ping lacks exact local EMSGSIZE evidence")
+        reported_mtu = expected_mtu
+        local_errno = "EMSGSIZE"
+    return MTUOutcome(
+        schema="wg-mix-ebpf-realnic-mtu-outcome-v2",
+        boundary=boundary,
         rc=rc,
         expected_mtu=expected_mtu,
-        reported_mtu=expected_mtu,
+        reported_mtu=reported_mtu,
         payload_bytes=payload_bytes,
         packet_bytes=packet_bytes,
-        local_errno="EMSGSIZE",
-        local_error_count=len(matches),
+        transmitted=transmitted,
+        received=received,
+        loss_percent=loss_percent,
+        local_errno=local_errno,
+        local_error_count=len(local_matches),
     )
 
 
@@ -1568,8 +1615,7 @@ def ping_step(spec: CoreSpec, cell: str, mtu: int, positive: bool) -> dict[str, 
         target=f"peer:{spec.peer_address}",
     )
     step["kind"] = "mtu-positive" if positive else "mtu-negative"
-    if not positive:
-        step["outcome_oracle"] = mtu_negative_contract(spec, mtu)
+    step["outcome_oracle"] = mtu_outcome_contract(spec, mtu, positive)
     return step
 
 
@@ -2103,12 +2149,16 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
                 elif oracle is not None:
                     raise HarnessError("non-iperf step unexpectedly has a traffic oracle")
                 outcome_oracle = step.get("outcome_oracle")
-                if step.get("kind") == "mtu-negative":
-                    expected_outcome_oracle = mtu_negative_contract(spec, int(cell["expected_mtu"]))
+                if step.get("kind") in {"mtu-positive", "mtu-negative"}:
+                    expected_outcome_oracle = mtu_outcome_contract(
+                        spec,
+                        int(cell["expected_mtu"]),
+                        step.get("kind") == "mtu-positive",
+                    )
                     if outcome_oracle != expected_outcome_oracle:
-                        raise HarnessError("MTU negative outcome oracle is not exact")
+                        raise HarnessError("MTU outcome oracle is not exact")
                 elif outcome_oracle is not None:
-                    raise HarnessError("non-negative-MTU step unexpectedly has an outcome oracle")
+                    raise HarnessError("non-MTU step unexpectedly has an outcome oracle")
         recovery_steps = cell.get("recovery_restore")
         if not isinstance(recovery_steps, list):
             raise HarnessError(f"cell {cell['name']} has invalid recovery_restore")
@@ -3231,12 +3281,10 @@ def run_traffic(
             else:
                 rc, stdout, stderr = execute_step(step, runner, journal)
                 result = {"label": step["label"], "rc": rc}
-                if step.get("kind") == "mtu-negative":
+                if step.get("kind") in {"mtu-positive", "mtu-negative"}:
                     result["metrics"] = dataclasses.asdict(
-                        mtu_negative_oracle(step["outcome_oracle"], rc, stdout, stderr)
+                        mtu_outcome_oracle(step["outcome_oracle"], rc, stdout, stderr)
                     )
-            if step.get("kind") != "iperf" and step["argv"][-1] == READ_ONLY_PEER and TOOLS["ping"] in step["argv"] and rc == 0:
-                result["metrics"] = ping_metrics(stdout)
             results.append(result)
         return results
 
