@@ -2996,6 +2996,30 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 	return FAKETCP_ADMISSION_TRANSFORM;
 }
 
+// ParseL3 is the sole authority for traffic whose port is not yet proven.
+// A managed interface therefore has one mutually exclusive early-drop
+// classification: malformed/truncated input is BAD_PACKET; every other
+// unsupported managed shape is an admission-bypass rejection.
+static __always_inline int faketcp_xdp_l3_action(int parse_rc,
+						 int managed_interface)
+{
+	if (parse_rc == FAKETCP_L3_OK)
+		return 0;
+	if (parse_rc == FAKETCP_L3_SAFE_BYPASS || !managed_interface)
+		return XDP_PASS;
+	inc_faketcp_stat(parse_rc == FAKETCP_L3_TRUNCATED ||
+			  parse_rc == FAKETCP_L3_MALFORMED ?
+			  FAKETCP_STAT_BAD_PACKET :
+			  FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
+	return XDP_DROP;
+}
+
+static __always_inline int faketcp_xdp_reject(__u32 stat)
+{
+	inc_faketcp_stat(stat);
+	return XDP_DROP;
+}
+
 SEC("xdp")
 int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 {
@@ -3024,7 +3048,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	__u64 now;
 	__u64 generation = 0;
 	__s64 sum;
-	int managed_interface, parse_rc, admission_decision;
+	int managed_interface, parse_rc, parse_action, admission_decision;
 
 	if (!active_generation(&generation))
 		return XDP_PASS;
@@ -3034,16 +3058,17 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	parser_mode = lookup_parser_mode(xdp->ingress_ifindex, generation);
 	parse_rc = faketcp_xdp_l3_start(data, data_end, parser_mode, &l3_off,
 					       &family);
-	if (parse_rc != FAKETCP_L3_OK)
-		return parse_rc == FAKETCP_L3_SAFE_BYPASS ? XDP_PASS :
-		       (managed_interface ? XDP_DROP : XDP_PASS);
+	parse_action = faketcp_xdp_l3_action(parse_rc, managed_interface);
+	if (parse_action)
+		return parse_action;
 	parse_rc = faketcp_parse_l3(data, data_end, frame_len, l3_off, family, &l3);
-	if (parse_rc != FAKETCP_L3_OK)
-		return parse_rc == FAKETCP_L3_SAFE_BYPASS ? XDP_PASS :
-		       (managed_interface ? XDP_DROP : XDP_PASS);
+	parse_action = faketcp_xdp_l3_action(parse_rc, managed_interface);
+	if (parse_action)
+		return parse_action;
 	wire_ports = data + l3.l4_off;
 	if ((void *)(wire_ports + 1) > data_end)
-		return managed_interface ? XDP_DROP : XDP_PASS;
+		return managed_interface ?
+		       faketcp_xdp_reject(FAKETCP_STAT_BAD_PACKET) : XDP_PASS;
 	managed_listener = faketcp_xdp_managed_port(
 		xdp->ingress_ifindex, bpf_ntohs(wire_ports->dest), generation);
 	if (!managed_listener)
@@ -3053,18 +3078,20 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 	// before native-UDP handling, event capture or any packet mutation.
 	if (faketcp_managed_transform_status(&l3, l3.transport_protocol) !=
 	    FAKETCP_L3_OK)
-		return XDP_DROP;
+		return faketcp_xdp_reject(
+			FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 	// Native UDP to a FakeTCP port is a transport-bypass attempt. Decoded
 	// packets do not re-enter XDP, so this cannot catch the valid TCP-to-UDP
 	// result produced later by this program.
 	if (l3.transport_protocol == IPPROTO_UDP)
-		return XDP_DROP;
+		return faketcp_xdp_reject(
+			FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 	tcp = (struct tcphdr *)wire_ports;
 	if ((void *)(tcp + 1) > data_end)
-		return XDP_DROP;
+		return faketcp_xdp_reject(FAKETCP_STAT_BAD_PACKET);
 	iph = data + l3.l3_off;
 	if ((void *)(iph + 1) > data_end)
-		return XDP_DROP;
+		return faketcp_xdp_reject(FAKETCP_STAT_BAD_PACKET);
 	policy_listener = lookup_ingress_listener(
 		xdp->ingress_ifindex, bpf_ntohs(tcp->dest), FAMILY_IPV4,
 		generation);
