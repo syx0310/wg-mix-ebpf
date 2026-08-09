@@ -116,8 +116,9 @@ type fakeTCPXDPLinkIdentity struct {
 }
 
 type fakeTCPXDPReleaseResult struct {
-	Observed fakeTCPXDPLinkIdentity
-	Released bool
+	Observed     fakeTCPXDPLinkIdentity
+	AutoDetached bool
+	Released     bool
 }
 
 // fakeTCPXDPLink is the exact capability returned by one successful backend
@@ -225,9 +226,24 @@ func validateFakeTCPXDPActivationRequirement(
 }
 
 type liveFakeTCPXDPLink struct {
-	mu   sync.Mutex
-	mode fakeTCPXDPAttachMode
-	link link.Link
+	mu sync.Mutex
+
+	inspect  func() (fakeTCPXDPLinkIdentity, error)
+	close    func() error
+	identity fakeTCPXDPLinkIdentity
+	adopted  bool
+}
+
+func newLiveFakeTCPXDPLink(
+	mode fakeTCPXDPAttachMode,
+	attached link.Link,
+) *liveFakeTCPXDPLink {
+	return &liveFakeTCPXDPLink{
+		inspect: func() (fakeTCPXDPLinkIdentity, error) {
+			return inspectLiveFakeTCPXDPLink(mode, attached)
+		},
+		close: attached.Close,
+	}
 }
 
 func (owned *liveFakeTCPXDPLink) Identity() (fakeTCPXDPLinkIdentity, error) {
@@ -236,26 +252,53 @@ func (owned *liveFakeTCPXDPLink) Identity() (fakeTCPXDPLinkIdentity, error) {
 	}
 	owned.mu.Lock()
 	defer owned.mu.Unlock()
-	return owned.identityLocked()
+	identity, err := owned.identityLocked()
+	if err != nil {
+		return fakeTCPXDPLinkIdentity{}, err
+	}
+	if identity.IfIndex == 0 {
+		return fakeTCPXDPLinkIdentity{}, errors.New(
+			"owned XDP link has no interface identity before adoption",
+		)
+	}
+	if !owned.adopted {
+		owned.identity = identity
+		owned.adopted = true
+	}
+	return identity, nil
 }
 
 func (owned *liveFakeTCPXDPLink) identityLocked() (fakeTCPXDPLinkIdentity, error) {
-	if owned.link == nil {
+	if owned.inspect == nil || owned.close == nil {
 		return fakeTCPXDPLinkIdentity{}, errors.New("owned XDP link is released")
 	}
-	info, err := owned.link.Info()
+	identity, err := owned.inspect()
 	if err != nil {
 		return fakeTCPXDPLinkIdentity{}, fmt.Errorf("inspect owned XDP link: %w", err)
 	}
+	return identity, nil
+}
+
+func inspectLiveFakeTCPXDPLink(
+	mode fakeTCPXDPAttachMode,
+	attached link.Link,
+) (fakeTCPXDPLinkIdentity, error) {
+	if attached == nil {
+		return fakeTCPXDPLinkIdentity{}, errors.New("owned XDP link is nil")
+	}
+	info, err := attached.Info()
+	if err != nil {
+		return fakeTCPXDPLinkIdentity{}, err
+	}
 	xdp := info.XDP()
-	if xdp == nil || xdp.Ifindex == 0 || info.Program == 0 || info.ID == 0 {
+	if xdp == nil || info.Program == 0 || info.ID == 0 {
 		return fakeTCPXDPLinkIdentity{}, errors.New(
-			"owned XDP link has incomplete interface/program/link identity",
+			"owned XDP link has incomplete program/link identity",
 		)
 	}
 	return fakeTCPXDPLinkIdentity{
 		Family:    fakeTCPXDPBackendDirect,
-		Mode:      owned.mode,
+		Mode:      mode,
 		IfIndex:   int(xdp.Ifindex),
 		ProgramID: uint32(info.Program),
 		OwnerID:   uint64(info.ID),
@@ -270,12 +313,24 @@ func (owned *liveFakeTCPXDPLink) Release(
 	}
 	owned.mu.Lock()
 	defer owned.mu.Unlock()
+	if !owned.adopted {
+		return fakeTCPXDPReleaseResult{}, errors.New(
+			"release owned XDP link: owner identity was not adopted",
+		)
+	}
+	if expected != owned.identity {
+		return fakeTCPXDPReleaseResult{Observed: owned.identity}, fmt.Errorf(
+			"release owned XDP link: expected identity does not match adopted owner: got %+v, owner %+v",
+			expected, owned.identity,
+		)
+	}
 	observed, err := owned.identityLocked()
 	result := fakeTCPXDPReleaseResult{Observed: observed}
 	if err != nil {
 		return result, err
 	}
-	if observed != expected {
+	result.AutoDetached = fakeTCPXDPAutoDetachedIdentity(expected, observed)
+	if observed != expected && !result.AutoDetached {
 		return result, fmt.Errorf(
 			"release owned XDP link: stale identity: observed %+v, expected %+v",
 			observed, expected,
@@ -284,10 +339,23 @@ func (owned *liveFakeTCPXDPLink) Release(
 	// cilium/ebpf consumes its FD even when close(2) reports an error. Record
 	// Released=true and clear the handle in both cases; retrying a recycled FD
 	// would be unsafe.
-	err = owned.link.Close()
-	owned.link = nil
+	err = owned.close()
+	owned.inspect = nil
+	owned.close = nil
 	result.Released = true
 	return result, err
+}
+
+func fakeTCPXDPAutoDetachedIdentity(
+	expected fakeTCPXDPLinkIdentity,
+	observed fakeTCPXDPLinkIdentity,
+) bool {
+	if expected.Family != fakeTCPXDPBackendDirect || expected.IfIndex == 0 ||
+		observed.IfIndex != 0 {
+		return false
+	}
+	observed.IfIndex = expected.IfIndex
+	return observed == expected
 }
 
 func mustLiveFakeTCPXDPRuntime() fakeTCPXDPRuntime {
@@ -326,7 +394,7 @@ func mustLiveFakeTCPXDPRuntime() fakeTCPXDPRuntime {
 			if err != nil {
 				return nil, err
 			}
-			return &liveFakeTCPXDPLink{mode: request.Mode, link: attached}, nil
+			return newLiveFakeTCPXDPLink(request.Mode, attached), nil
 		},
 	)
 	if err != nil {
@@ -410,7 +478,14 @@ func (attachment *fakeTCPXDPAttachment) release() (bool, error) {
 		return false, fmt.Errorf("release refused: invalid XDP ownership state %d", attachment.state)
 	}
 	result, err := attachment.link.Release(attachment.identity)
-	if result.Observed != attachment.identity {
+	identityMatches := result.Observed == attachment.identity
+	if result.AutoDetached {
+		identityMatches = fakeTCPXDPAutoDetachedIdentity(
+			attachment.identity,
+			result.Observed,
+		)
+	}
+	if !identityMatches {
 		if result.Released {
 			return true, errors.Join(err, errors.New(
 				"XDP backend released an owner after observing stale identity",

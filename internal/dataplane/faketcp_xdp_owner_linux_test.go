@@ -15,6 +15,7 @@ type fakeOwnedXDPLink struct {
 
 	identity      fakeTCPXDPLinkIdentity
 	identityErr   error
+	autoDetached  bool
 	releaseErrs   []error
 	retainOnError []bool
 	identityCalls int
@@ -37,11 +38,15 @@ func (owned *fakeOwnedXDPLink) Release(
 	owned.mu.Lock()
 	defer owned.mu.Unlock()
 	owned.releaseCalls++
-	result := fakeTCPXDPReleaseResult{Observed: owned.identity}
+	result := fakeTCPXDPReleaseResult{
+		Observed:     owned.identity,
+		AutoDetached: owned.autoDetached,
+	}
 	if owned.identityErr != nil {
 		return result, owned.identityErr
 	}
-	if owned.identity != expected {
+	if owned.identity != expected &&
+		!(owned.autoDetached && fakeTCPXDPAutoDetachedIdentity(expected, owned.identity)) {
 		return result, errors.New("injected stale XDP owner identity")
 	}
 	if owned.closeEvents != nil {
@@ -68,6 +73,13 @@ func (owned *fakeOwnedXDPLink) Release(
 func (owned *fakeOwnedXDPLink) setIdentity(identity fakeTCPXDPLinkIdentity) {
 	owned.mu.Lock()
 	owned.identity = identity
+	owned.mu.Unlock()
+}
+
+func (owned *fakeOwnedXDPLink) markAutoDetached() {
+	owned.mu.Lock()
+	owned.identity.IfIndex = 0
+	owned.autoDetached = true
 	owned.mu.Unlock()
 }
 
@@ -181,6 +193,44 @@ func directXDPIdentity(ifindex int, mode fakeTCPXDPAttachMode) fakeTCPXDPLinkIde
 	return fakeTCPXDPLinkIdentity{
 		Family: fakeTCPXDPBackendDirect, Mode: mode, IfIndex: ifindex,
 		ProgramID: 8001, OwnerID: uint64(100000 + ifindex),
+	}
+}
+
+func TestLiveFakeTCPXDPLinkAutoDetachConsumesExactHandleOnce(t *testing.T) {
+	for _, test := range []struct {
+		name     string
+		closeErr error
+	}{
+		{name: "success"},
+		{name: "close error", closeErr: errors.New("injected close error")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			observed := directXDPIdentity(7, fakeTCPXDPAttachNative)
+			closeCalls := 0
+			owned := &liveFakeTCPXDPLink{
+				inspect: func() (fakeTCPXDPLinkIdentity, error) { return observed, nil },
+				close: func() error {
+					closeCalls++
+					return test.closeErr
+				},
+			}
+			expected, err := owned.Identity()
+			if err != nil {
+				t.Fatal(err)
+			}
+			observed.IfIndex = 0
+			result, err := owned.Release(expected)
+			if !errors.Is(err, test.closeErr) || !result.AutoDetached || !result.Released ||
+				result.Observed.IfIndex != 0 {
+				t.Fatalf("result=%+v error=%v", result, err)
+			}
+			if _, err := owned.Release(expected); err == nil || !strings.Contains(err.Error(), "released") {
+				t.Fatalf("repeated release error = %v", err)
+			}
+			if closeCalls != 1 {
+				t.Fatalf("exact handle close calls = %d", closeCalls)
+			}
+		})
 	}
 }
 
@@ -550,6 +600,92 @@ func TestFakeTCPXDPStageConsumedReleaseErrorConvergesWithoutRetryingFD(t *testin
 	}
 }
 
+func TestFakeTCPXDPStageNamespaceDeletionConvergesAutoDetachedOwners(t *testing.T) {
+	runtime := newMemoryFakeTCPXDPRuntime()
+	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
+		[]fakeTCPXDPAttachRequest{
+			{IfIndex: 7, Mode: fakeTCPXDPAttachNative},
+			{IfIndex: 11, Mode: fakeTCPXDPAttachGeneric},
+		},
+		&fakeExperimentalOwnedProgram{id: 8001}, runtime.backend(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, owned := range runtime.links {
+		owned.markAutoDetached()
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatalf("repeated Close = %v", err)
+	}
+	for ifindex, owned := range runtime.links {
+		if owned.releaseCalls != 1 || owned.closes != 1 {
+			t.Fatalf("ifindex %d releases=%d closes=%d",
+				ifindex, owned.releaseCalls, owned.closes)
+		}
+	}
+}
+
+func TestFakeTCPXDPStageAutoDetachedConsumedErrorConverges(t *testing.T) {
+	runtime := newMemoryFakeTCPXDPRuntime()
+	wantErr := errors.New("injected auto-detached close error")
+	runtime.links[7] = &fakeOwnedXDPLink{
+		identity:    directXDPIdentity(7, fakeTCPXDPAttachNative),
+		releaseErrs: []error{wantErr}, retainOnError: []bool{false},
+	}
+	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
+		[]fakeTCPXDPAttachRequest{{IfIndex: 7, Mode: fakeTCPXDPAttachNative}},
+		&fakeExperimentalOwnedProgram{id: 8001}, runtime.backend(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.links[7].markAutoDetached()
+	if err := stage.Close(); !errors.Is(err, wantErr) {
+		t.Fatalf("first Close = %v", err)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatalf("converged Close = %v", err)
+	}
+	if runtime.links[7].releaseCalls != 1 || runtime.links[7].closes != 1 {
+		t.Fatalf("releases=%d closes=%d",
+			runtime.links[7].releaseCalls, runtime.links[7].closes)
+	}
+}
+
+func TestFakeTCPXDPStageRetriesRetainedAutoDetachedOwner(t *testing.T) {
+	runtime := newMemoryFakeTCPXDPRuntime()
+	wantErr := errors.New("injected retained auto-detached owner")
+	runtime.links[7] = &fakeOwnedXDPLink{
+		identity:    directXDPIdentity(7, fakeTCPXDPAttachNative),
+		releaseErrs: []error{wantErr}, retainOnError: []bool{true},
+	}
+	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
+		[]fakeTCPXDPAttachRequest{{IfIndex: 7, Mode: fakeTCPXDPAttachNative}},
+		&fakeExperimentalOwnedProgram{id: 8001}, runtime.backend(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.links[7].markAutoDetached()
+	if err := stage.Close(); !errors.Is(err, wantErr) {
+		t.Fatalf("first Close = %v", err)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatalf("retry Close = %v", err)
+	}
+	if runtime.links[7].releaseCalls != 2 || runtime.links[7].closes != 2 {
+		t.Fatalf("releases=%d closes=%d",
+			runtime.links[7].releaseCalls, runtime.links[7].closes)
+	}
+}
+
 func TestFakeTCPXDPStageIdentityFailureQuarantinesWithoutRelease(t *testing.T) {
 	runtime := newMemoryFakeTCPXDPRuntime()
 	runtime.links[7] = &fakeOwnedXDPLink{
@@ -603,6 +739,29 @@ func TestFakeTCPXDPStageRejectsStaleIdentityBeforeDestructiveRelease(t *testing.
 	}
 	if runtime.links[7].releaseCalls != 1 || runtime.links[7].closes != 0 {
 		t.Fatalf("stale retries release calls=%d closes=%d",
+			runtime.links[7].releaseCalls, runtime.links[7].closes)
+	}
+}
+
+func TestFakeTCPXDPStageRejectsForeignAutoDetachClaim(t *testing.T) {
+	runtime := newMemoryFakeTCPXDPRuntime()
+	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
+		[]fakeTCPXDPAttachRequest{{IfIndex: 7, Mode: fakeTCPXDPAttachNative}},
+		&fakeExperimentalOwnedProgram{id: 8001}, runtime.backend(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foreign := directXDPIdentity(7, fakeTCPXDPAttachNative)
+	foreign.OwnerID++
+	runtime.links[7].setIdentity(foreign)
+	runtime.links[7].markAutoDetached()
+	if err := stage.Close(); err == nil || !strings.Contains(err.Error(), "identity changed") {
+		t.Fatalf("foreign auto-detach Close = %v", err)
+	}
+	if runtime.links[7].releaseCalls != 1 || runtime.links[7].closes != 0 {
+		t.Fatalf("foreign releases=%d closes=%d",
 			runtime.links[7].releaseCalls, runtime.links[7].closes)
 	}
 }
