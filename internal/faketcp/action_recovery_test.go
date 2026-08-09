@@ -16,11 +16,13 @@ func TestMemoryActionCheckpointStoreCopiesAndComparesRevision(t *testing.T) {
 	checkpoint := recoveryCheckpoint(t, 1, ActionCheckpointPrepared, 0, []ActionStep{
 		recoveryPacketStep(t, testFlow(31001), 11),
 	})
+	wantFingerprint := checkpoint.Steps[0].Packet.CaptureFingerprint
 	created, err := store.CreateActionCheckpoint(checkpoint)
 	if err != nil {
 		t.Fatal(err)
 	}
 	checkpoint.Steps[0].Packet.Data[0] ^= 0xff
+	checkpoint.Steps[0].Packet.CaptureFingerprint[0] ^= 0xff
 	loaded, found, err := store.LoadActionCheckpoint()
 	if err != nil || !found {
 		t.Fatalf("LoadActionCheckpoint found=%t err=%v", found, err)
@@ -28,13 +30,20 @@ func TestMemoryActionCheckpointStoreCopiesAndComparesRevision(t *testing.T) {
 	if loaded.Steps[0].Packet.Data[0] == checkpoint.Steps[0].Packet.Data[0] {
 		t.Fatal("store retained caller packet backing array")
 	}
+	if loaded.Steps[0].Packet.CaptureFingerprint != wantFingerprint {
+		t.Fatal("store changed the captured sample fingerprint on ingress")
+	}
 	loaded.Steps[0].Packet.Data[0] ^= 0xff
+	loaded.Steps[0].Packet.CaptureFingerprint[0] ^= 0xff
 	reloaded, _, err := store.LoadActionCheckpoint()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if reloaded.Steps[0].Packet.Data[0] == loaded.Steps[0].Packet.Data[0] {
 		t.Fatal("load exposed stored packet backing array")
+	}
+	if reloaded.Steps[0].Packet.CaptureFingerprint != wantFingerprint {
+		t.Fatal("load changed the captured sample fingerprint")
 	}
 
 	stale := created
@@ -89,6 +98,7 @@ func TestMemoryActionCheckpointTransitionPreservesImmutableCheckpoint(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
+	wantFingerprint := created.Steps[0].Packet.CaptureFingerprint
 
 	attemptingRevision, err := store.TransitionActionCheckpoint(
 		created.Revision,
@@ -131,6 +141,9 @@ func TestMemoryActionCheckpointTransitionPreservesImmutableCheckpoint(t *testing
 	if loaded.Operation != created.Operation || loaded.Identity != created.Identity ||
 		!reflect.DeepEqual(loaded.Steps, created.Steps) {
 		t.Fatal("transition changed immutable checkpoint fields")
+	}
+	if loaded.Steps[0].Packet.CaptureFingerprint != wantFingerprint {
+		t.Fatal("transition changed the captured sample fingerprint")
 	}
 	loaded.Steps[0].Packet.Data[0] ^= 0xff
 	reloaded, _, err := store.LoadActionCheckpoint()
@@ -432,6 +445,36 @@ func TestNewActionRecoveryRejectsCorruptStoredCheckpoint(t *testing.T) {
 		checkpoint: checkpoint, found: true,
 	}); err == nil || recovery != nil || !errors.Is(err, ErrActionCheckpointCorrupt) {
 		t.Fatalf("recovery=%#v err=%v", recovery, err)
+	}
+}
+
+func TestNewActionRecoveryRejectsStoredCheckpointWithoutCaptureFingerprint(t *testing.T) {
+	checkpoint := recoveryCheckpoint(t, 1, ActionCheckpointPrepared, 0, []ActionStep{
+		recoveryPacketStep(t, testFlow(31001), 11),
+	})
+	checkpoint.Revision = 1
+	checkpoint.Steps[0].Packet.CaptureFingerprint = [32]byte{}
+	backend := &fakeControllerBackend{}
+	recovery, err := NewActionRecovery(testRecoveryIdentity(), backend, &staticCheckpointStore{
+		checkpoint: checkpoint, found: true,
+	})
+	if recovery != nil || !errors.Is(err, ErrActionCheckpointCorrupt) {
+		t.Fatalf("recovery=%#v err=%v", recovery, err)
+	}
+	if len(backend.operations) != 0 {
+		t.Fatalf("checkpoint without fingerprint reached backend: %v", backend.operations)
+	}
+}
+
+func TestActionStepsRejectReinjectionWithoutCaptureFingerprint(t *testing.T) {
+	flow := testFlow(31001)
+	packet := recoveryPacket(t, flow, 11)
+	packet.CaptureFingerprint = [32]byte{}
+	steps, err := actionSteps([]Action{{
+		Kind: ActionReleasePending, Flow: flow, Packets: []PendingPacket{packet},
+	}})
+	if err == nil || len(steps) != 0 {
+		t.Fatalf("steps=%#v err=%v", steps, err)
 	}
 }
 

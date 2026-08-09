@@ -123,10 +123,37 @@ func TestProductionEventReaderRestartFailsClosedOnMidstreamCapture(t *testing.T)
 }
 
 func TestOwnedCaptureFingerprintSurvivesCheckpointReload(t *testing.T) {
-	packet := testPendingPacket(t, testFlow(31001), 1)
-	want := packet.CaptureFingerprint
+	engine, _ := testEngine(t, nil)
+	sample := testProductionPacketSample(t, 1, 1)
+	reader, err := newProductionEventReader(
+		&fakeEventReader{records: []EventRecord{{RawSample: sample}}},
+		engine.Identity(),
+		4,
+		&memoryEventLossCounter{},
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller, err := NewController(engine, &fakeControllerBackend{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := reader.Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := controller.handleOwnedEvent(context.Background(), record.ownedSample); err != nil {
+		t.Fatal(err)
+	}
+	flow := record.ownedSample.Event.Key
+	packet := engine.sessions[flow].pending[0]
+	want := sha256.Sum256(sample)
+	if packet.CaptureFingerprint != want {
+		t.Fatalf("checkpoint input fingerprint=%x want exact sample digest=%x", packet.CaptureFingerprint, want)
+	}
 	steps, err := actionSteps([]Action{{
-		Kind: ActionReleasePending, Flow: testFlow(31001),
+		Kind: ActionReleasePending, Flow: flow,
 		Packets: []PendingPacket{packet}, Reason: "fingerprint-reload",
 	}})
 	if err != nil {
@@ -140,12 +167,20 @@ func TestOwnedCaptureFingerprintSurvivesCheckpointReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	transitionedRevision, err := store.TransitionActionCheckpoint(
+		created.Revision,
+		ActionCheckpointAttempting,
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
 	packet.CaptureFingerprint[0] ^= 0xff
 	loaded, found, err := store.LoadActionCheckpoint()
 	if err != nil || !found {
 		t.Fatalf("checkpoint reload found=%t err=%v", found, err)
 	}
-	if loaded.Revision != created.Revision || loaded.Steps[0].Packet.CaptureFingerprint != want {
+	if loaded.Revision != transitionedRevision || loaded.Steps[0].Packet.CaptureFingerprint != want {
 		t.Fatalf("checkpoint fingerprint=%x want=%x", loaded.Steps[0].Packet.CaptureFingerprint, want)
 	}
 }
