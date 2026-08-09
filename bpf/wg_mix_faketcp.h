@@ -1318,7 +1318,7 @@ int wg_mix_faketcp_ingress(struct xdp_md *xdp)
 				   listener->wg_id);
 		return XDP_DROP;
 	}
-	if (flags & (FAKETCP_FLAG_SYN | FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)) {
+	if (flags & FAKETCP_FLAG_SYN) {
 		faketcp_emit_event(&key, faketcp_event_type(flags), flags, seq,
 				   ack, payload_len, 0,
 				   listener->wg_id);
