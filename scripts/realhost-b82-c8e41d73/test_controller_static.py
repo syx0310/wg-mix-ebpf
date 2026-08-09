@@ -152,6 +152,7 @@ def main() -> None:
     if apply_body.count("run_operation execute provision-apply") != 1:
         fail("explicit apply path does not contain exactly one fixed apply operation")
     apply_order = (
+        "verify_remote_package || return $?",
         "run_provision_check || return $?",
         "state_transition PROVISION_CHECK AWAIT_APPLY",
         "state_transition AWAIT_APPLY PROVISION_APPLY",
