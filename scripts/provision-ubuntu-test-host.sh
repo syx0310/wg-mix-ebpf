@@ -49,6 +49,9 @@ readonly -a APT_COMMAND=(
   -o APT::Get::List-Cleanup=0
 )
 readonly -a APT_INSTALL_FLAGS=(--no-install-recommends --no-remove --no-upgrade)
+readonly -a BPFTOOL_VERSION_COMMAND=(
+  "${CLEAN_ENV[@]}" /usr/sbin/bpftool -V
+)
 readonly -a PACKAGES=(
   binutils
   bpftool
@@ -176,6 +179,7 @@ apt_plan_has_forbidden_changes() {
         unsafe = 1
       } else {
         fresh[package] = 1
+        saw_fresh = 1
       }
     }
     $1 == "Conf" {
@@ -189,6 +193,7 @@ apt_plan_has_forbidden_changes() {
       for (package in configured) {
         if (!(package in fresh)) unsafe = 1
       }
+      if (!saw_fresh) unsafe = 1
       exit !unsafe
     }
   '
@@ -199,15 +204,17 @@ dpkg_status_has_pending_work() {
     {
       seen = 1
       status = $1
-      if (NF != 2 || length(status) != 3 ||
-          index("uihrp", substr(status, 1, 1)) == 0 ||
-          index("nci", substr(status, 2, 1)) == 0 ||
-          substr(status, 3, 1) != " ") {
+      if (NF != 2 || (status != "ii " && status != "hi " &&
+          status != "rc " && status != "pn " && status != "un ")) {
         dirty = 1
       }
     }
     END { exit !(dirty || !seen) }
   '
+}
+
+run_required_probe() {
+  "$@"
 }
 
 if [[ "${MODE}" == "self-test" ]]; then
@@ -344,7 +351,7 @@ package_is_installed() {
   local status
   status="$("${CLEAN_ENV[@]}" /usr/bin/dpkg-query -W \
     -f='${db:Status-Abbrev}' "$1" 2>/dev/null)" || return 1
-  [[ "${status}" == 'ii ' ]]
+  [[ "${status}" == 'ii ' || "${status}" == 'hi ' ]]
 }
 
 collect_missing_packages() {
@@ -497,7 +504,10 @@ verify_installed_toolchain() {
   fi
   "${CLEAN_ENV[@]}" /usr/bin/go version
   "${CLEAN_ENV[@]}" /usr/bin/clang --version | "${CLEAN_ENV[@]}" /usr/bin/sed -n '1p'
-  "${CLEAN_ENV[@]}" /usr/sbin/bpftool version
+  run_required_probe "${BPFTOOL_VERSION_COMMAND[@]}" || {
+    echo 'error: bpftool fixed version probe failed' >&2
+    return 1
+  }
   printf 'verified_header_dir=/usr/src/linux-headers-%s verified_build_link=%s verified_btf=/sys/kernel/btf/vmlinux\n' \
     "${SUPPORTED_KERNEL}" "${build_target}"
 }
