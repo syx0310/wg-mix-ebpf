@@ -6,10 +6,10 @@ import (
 	"net/netip"
 )
 
-// WireHeaderOverhead is the additional outer-packet size when an 8-byte UDP
-// header becomes a 20-byte TCP header. A deployment must lower the MTU used by
-// the otherwise-equivalent UDP transport by this amount before activation.
-const WireHeaderOverhead = 12
+// WireHeaderOverhead is retained for callers of AdjustTransportMTU. Packet
+// admission uses FakeTCPHeaderDelta so userspace and BPF name the same exact
+// UDP-to-TCP growth contract.
+const WireHeaderOverhead = int(FakeTCPHeaderDelta)
 
 func AdjustTransportMTU(udpTransportMTU int) (int, error) {
 	if udpTransportMTU <= WireHeaderOverhead {

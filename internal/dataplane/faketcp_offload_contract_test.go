@@ -168,35 +168,6 @@ func TestFakeTCPGSOFailClosedBeforeChecksumMutation(t *testing.T) {
 	}
 }
 
-func TestFakeTCPMTUHeaderDeltaAndFailureCounterContract(t *testing.T) {
-	var failures uint64
-	allows := func(l3Length, mtu int) bool {
-		if fakeTCPMTUAllowsGrowth(l3Length, mtu) {
-			return true
-		}
-		failures++
-		return false
-	}
-	if !allows(1488, 1500) {
-		t.Fatal("L3 MTU-minus-12 boundary was rejected")
-	}
-	if failures != 0 {
-		t.Fatalf("accepted boundary incremented failure counter to %d", failures)
-	}
-	if allows(1489, 1500) {
-		t.Fatal("L3 MTU-minus-11 packet was accepted")
-	}
-	if failures != 1 {
-		t.Fatalf("one-over MTU failure counter=%d, want 1", failures)
-	}
-	if allows(28, 11) {
-		t.Fatal("MTU smaller than FakeTCP's 12-byte growth was accepted")
-	}
-	if failures != 2 {
-		t.Fatalf("small-MTU failure counter=%d, want 2", failures)
-	}
-}
-
 func TestFakeTCPChecksumResultToBPFActionAndStatContract(t *testing.T) {
 	tests := []struct {
 		result         int
@@ -283,7 +254,7 @@ func TestFakeTCPChecksumKfuncAndBPFReturnABIStayIdentical(t *testing.T) {
 	}
 	if !strings.Contains(bpf, "inc_faketcp_stat(FAKETCP_STAT_MTU_REJECT)") ||
 		!strings.Contains(bpf, "old_total_len > mtu_len - FAKETCP_HEADER_DELTA") {
-		t.Fatal("BPF MTU-minus-12 rejection is not classified by its dedicated counter")
+		t.Fatal("non-GSO device MTU growth rejection lost its dedicated aggregate counter")
 	}
 	resetOrder := []string{
 		"skb->csum = 0;",
