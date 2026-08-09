@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
+	"sort"
 	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
@@ -23,14 +25,173 @@ const (
 	fakeTCPControlMaxInterval = 10 * time.Second
 )
 
-// fakeTCPPolicySnapshot is deliberately separate from abi.Snapshot. It is an
-// unpinned experimental extension and must not silently enlarge the canonical
-// ABI-v10 owner set.
+// fakeTCPPolicySnapshot is the mutable construction form, deliberately
+// separate from abi.Snapshot. It is validated and frozen into a generation
+// plan before a transaction can retain it, and it must not silently enlarge
+// the canonical ABI-v10 owner set.
 type fakeTCPPolicySnapshot struct {
 	Generation        uint64
 	ControlPolicies   map[abi.FakeTCPControlPolicyKey]abi.FakeTCPControlPolicyValue
 	ManagedPorts      map[abi.FakeTCPManagedPortKey]abi.FakeTCPManagedPortValue
 	ManagedInterfaces map[abi.FakeTCPManagedIfKey]abi.FakeTCPManagedIfValue
+}
+
+type fakeTCPControlPolicyPlanEntry struct {
+	Key   abi.FakeTCPControlPolicyKey
+	Value abi.FakeTCPControlPolicyValue
+}
+
+type fakeTCPManagedPortPlanEntry struct {
+	Key   abi.FakeTCPManagedPortKey
+	Value abi.FakeTCPManagedPortValue
+}
+
+type fakeTCPManagedInterfacePlanEntry struct {
+	Key   abi.FakeTCPManagedIfKey
+	Value abi.FakeTCPManagedIfValue
+}
+
+// fakeTCPPolicyGenerationPlan is the immutable input to one generation
+// transaction. The mutable projection maps never cross the transaction
+// boundary: construction validates them and copies every key/value into a
+// deterministic slice. A transaction takes one more private copy, so callers
+// cannot change either generation identity or staged policy after creation.
+type fakeTCPPolicyGenerationPlan struct {
+	generation        uint64
+	controlPolicies   []fakeTCPControlPolicyPlanEntry
+	managedPorts      []fakeTCPManagedPortPlanEntry
+	managedInterfaces []fakeTCPManagedInterfacePlanEntry
+}
+
+func buildFakeTCPPolicyGenerationPlan(
+	state *control.State,
+	generation uint64,
+) (*fakeTCPPolicyGenerationPlan, error) {
+	snapshot, err := buildFakeTCPPolicySnapshot(state, generation)
+	if err != nil {
+		return nil, err
+	}
+	return freezeFakeTCPPolicyGenerationPlan(snapshot), nil
+}
+
+func newFakeTCPPolicyGenerationPlan(
+	snapshot *fakeTCPPolicySnapshot,
+) (*fakeTCPPolicyGenerationPlan, error) {
+	plan := freezeFakeTCPPolicyGenerationPlan(snapshot)
+	if err := validateFakeTCPPolicyGenerationPlan(plan); err != nil {
+		return nil, fmt.Errorf("build FakeTCP policy generation plan: %w", err)
+	}
+	return plan, nil
+}
+
+func freezeFakeTCPPolicyGenerationPlan(
+	snapshot *fakeTCPPolicySnapshot,
+) *fakeTCPPolicyGenerationPlan {
+	if snapshot == nil {
+		return nil
+	}
+	plan := &fakeTCPPolicyGenerationPlan{generation: snapshot.Generation}
+	plan.controlPolicies = make(
+		[]fakeTCPControlPolicyPlanEntry, 0, len(snapshot.ControlPolicies),
+	)
+	for key, value := range snapshot.ControlPolicies {
+		plan.controlPolicies = append(plan.controlPolicies, fakeTCPControlPolicyPlanEntry{
+			Key: key, Value: value,
+		})
+	}
+	sort.Slice(plan.controlPolicies, func(left, right int) bool {
+		return plan.controlPolicies[left].Key.WGID < plan.controlPolicies[right].Key.WGID
+	})
+
+	plan.managedPorts = make([]fakeTCPManagedPortPlanEntry, 0, len(snapshot.ManagedPorts))
+	for key, value := range snapshot.ManagedPorts {
+		plan.managedPorts = append(plan.managedPorts, fakeTCPManagedPortPlanEntry{
+			Key: key, Value: value,
+		})
+	}
+	sort.Slice(plan.managedPorts, func(left, right int) bool {
+		leftKey := plan.managedPorts[left].Key
+		rightKey := plan.managedPorts[right].Key
+		if leftKey.UnderlayIndex != rightKey.UnderlayIndex {
+			return leftKey.UnderlayIndex < rightKey.UnderlayIndex
+		}
+		return leftKey.DestinationPort < rightKey.DestinationPort
+	})
+
+	plan.managedInterfaces = make(
+		[]fakeTCPManagedInterfacePlanEntry, 0, len(snapshot.ManagedInterfaces),
+	)
+	for key, value := range snapshot.ManagedInterfaces {
+		plan.managedInterfaces = append(
+			plan.managedInterfaces,
+			fakeTCPManagedInterfacePlanEntry{Key: key, Value: value},
+		)
+	}
+	sort.Slice(plan.managedInterfaces, func(left, right int) bool {
+		return plan.managedInterfaces[left].Key.UnderlayIndex <
+			plan.managedInterfaces[right].Key.UnderlayIndex
+	})
+	return plan
+}
+
+func validateFakeTCPPolicyGenerationPlan(plan *fakeTCPPolicyGenerationPlan) error {
+	if plan == nil {
+		return errors.New("plan is nil")
+	}
+	snapshot := plan.snapshot()
+	if len(snapshot.ControlPolicies) != len(plan.controlPolicies) ||
+		len(snapshot.ManagedPorts) != len(plan.managedPorts) ||
+		len(snapshot.ManagedInterfaces) != len(plan.managedInterfaces) {
+		return errors.New("plan contains duplicate keys")
+	}
+	if err := validateFakeTCPPolicySnapshot(snapshot); err != nil {
+		return err
+	}
+	if !plan.equal(freezeFakeTCPPolicyGenerationPlan(snapshot)) {
+		return errors.New("plan entries are not in canonical order")
+	}
+	return nil
+}
+
+func (plan *fakeTCPPolicyGenerationPlan) clone() *fakeTCPPolicyGenerationPlan {
+	if plan == nil {
+		return nil
+	}
+	return &fakeTCPPolicyGenerationPlan{
+		generation:        plan.generation,
+		controlPolicies:   slices.Clone(plan.controlPolicies),
+		managedPorts:      slices.Clone(plan.managedPorts),
+		managedInterfaces: slices.Clone(plan.managedInterfaces),
+	}
+}
+
+func (plan *fakeTCPPolicyGenerationPlan) snapshot() *fakeTCPPolicySnapshot {
+	if plan == nil {
+		return nil
+	}
+	snapshot := &fakeTCPPolicySnapshot{
+		Generation:        plan.generation,
+		ControlPolicies:   make(map[abi.FakeTCPControlPolicyKey]abi.FakeTCPControlPolicyValue, len(plan.controlPolicies)),
+		ManagedPorts:      make(map[abi.FakeTCPManagedPortKey]abi.FakeTCPManagedPortValue, len(plan.managedPorts)),
+		ManagedInterfaces: make(map[abi.FakeTCPManagedIfKey]abi.FakeTCPManagedIfValue, len(plan.managedInterfaces)),
+	}
+	for _, entry := range plan.controlPolicies {
+		snapshot.ControlPolicies[entry.Key] = entry.Value
+	}
+	for _, entry := range plan.managedPorts {
+		snapshot.ManagedPorts[entry.Key] = entry.Value
+	}
+	for _, entry := range plan.managedInterfaces {
+		snapshot.ManagedInterfaces[entry.Key] = entry.Value
+	}
+	return snapshot
+}
+
+func (plan *fakeTCPPolicyGenerationPlan) equal(other *fakeTCPPolicyGenerationPlan) bool {
+	return plan != nil && other != nil && plan.generation == other.generation &&
+		slices.Equal(plan.controlPolicies, other.controlPolicies) &&
+		slices.Equal(plan.managedPorts, other.managedPorts) &&
+		slices.Equal(plan.managedInterfaces, other.managedInterfaces)
 }
 
 func buildFakeTCPPolicySnapshot(

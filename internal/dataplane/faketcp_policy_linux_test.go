@@ -24,7 +24,7 @@ func TestStageFakeTCPPolicyGenerationWritesReachabilityLatchLast(t *testing.T) {
 	ctx, transaction, isolation := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
 	isolation.events = &trace.events
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -60,6 +60,37 @@ func TestStageFakeTCPPolicyGenerationWritesReachabilityLatchLast(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, snapshot.ControlPolicies)
+}
+
+func TestFakeTCPPolicyGenerationTransactionOwnsImmutablePlan(t *testing.T) {
+	plan := mustFakeTCPPolicyGenerationPlan(t, 91)
+	want := plan.snapshot()
+	ctx, transaction, isolation := newTestFakeTCPPolicyGenerationTransactionFromPlan(t, plan)
+
+	plan.generation = 92
+	plan.controlPolicies[0].Key.Generation = 92
+	plan.controlPolicies[0].Value.Generation = 92
+	plan.managedPorts[0].Key.DestinationPort++
+	plan.managedInterfaces = nil
+
+	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
+	stage, err := transaction.Stage(ctx, policyMaps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if transaction.policyGeneration() != want.Generation ||
+		!slices.Equal(isolation.inactiveCalls, []uint64{want.Generation}) {
+		t.Fatalf(
+			"transaction generation=%d inactive checks=%v, want immutable generation %d",
+			transaction.policyGeneration(), isolation.inactiveCalls, want.Generation,
+		)
+	}
+	assertMemoryPolicyMapMatches(t, policyMaps.ControlPolicies, want.ControlPolicies)
+	assertMemoryPolicyMapMatches(t, policyMaps.ManagedPorts, want.ManagedPorts)
+	assertMemoryPolicyMapMatches(t, policyMaps.ManagedInterfaces, want.ManagedInterfaces)
+	if err := transaction.Rollback(ctx, stage); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestStageFakeTCPPolicyGenerationRequiresInactiveBeforeMapAccess(t *testing.T) {
@@ -98,7 +129,7 @@ func TestStageFakeTCPPolicyGenerationRequiresInactiveBeforeMapAccess(t *testing.
 			isolation.events = &trace.events
 			test.configure(isolation)
 
-			stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+			stage, err := transaction.Stage(ctx, policyMaps)
 			if stage != nil || err == nil || !strings.Contains(err.Error(), test.wantError) {
 				t.Fatalf("inactive-gated stage handle=%v error=%v, want %q", stage, err, test.wantError)
 			}
@@ -129,7 +160,7 @@ func TestFakeTCPPolicyGenerationTransactionRejectsMismatchedLifecycleContext(t *
 		filepath.Join(wrongRoot, "other-maintenance.gate"),
 	)
 
-	stage, err := transaction.Stage(wrongCtx, policyMaps, snapshot)
+	stage, err := transaction.Stage(wrongCtx, policyMaps)
 	if stage != nil || err == nil || !strings.Contains(err.Error(), "does not match transaction path") {
 		t.Fatalf("mismatched-context stage handle=%v error=%v", stage, err)
 	}
@@ -142,7 +173,7 @@ func TestFakeTCPPolicyGenerationTransactionRejectsMismatchedLifecycleContext(t *
 		)
 	}
 
-	stage, err = transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err = transaction.Stage(ctx, policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,7 +207,7 @@ func TestStageFakeTCPPolicyGenerationRollsBackEveryWriteFailureInReverse(t *test
 			policyMaps, trace := newMemoryFakeTCPPolicyMaps()
 			old := seedOldFakeTCPPolicyGeneration(policyMaps, 90)
 			trace.failUpdateAt = failAt
-			stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+			stage, err := transaction.Stage(ctx, policyMaps)
 			if stage != nil {
 				t.Fatal("failed stage returned a rollback handle")
 			}
@@ -195,12 +226,47 @@ func TestStageFakeTCPPolicyGenerationRollsBackEveryWriteFailureInReverse(t *test
 	}
 }
 
+func TestStageFakeTCPPolicyGenerationCancellationModelNeverLeavesReachabilityLatch(t *testing.T) {
+	want := mustFakeTCPPolicySnapshot(t, 91)
+	totalWrites := len(want.ControlPolicies) + len(want.ManagedPorts) + len(want.ManagedInterfaces)
+	for cancelAt := 1; cancelAt <= totalWrites; cancelAt++ {
+		t.Run(fmt.Sprintf("cancel-after-write-%d", cancelAt), func(t *testing.T) {
+			baseCtx, transaction, isolation := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+			activeCtx, cancel := context.WithCancel(baseCtx)
+			policyMaps, trace := newMemoryFakeTCPPolicyMaps()
+			trace.afterUpdate = func(completed int) {
+				if completed == cancelAt {
+					cancel()
+				}
+			}
+
+			stage, err := transaction.Stage(activeCtx, policyMaps)
+			if stage == nil || !errors.Is(err, context.Canceled) {
+				t.Fatalf("canceled stage=%#v error=%v", stage, err)
+			}
+			if len(policyMaps.ManagedInterfaces.(*memoryFakeTCPPolicyMap).entries) != 0 {
+				t.Fatalf("canceled stage retained interface reachability latch: %#v", policyMaps.ManagedInterfaces)
+			}
+			if isolation.quiesced {
+				t.Fatal("canceled active context unexpectedly crossed the quiescence barrier")
+			}
+			if err := transaction.Rollback(baseCtx, stage); err != nil {
+				t.Fatalf("cleanup canceled stage: %v", err)
+			}
+			assertNoMemoryPolicyGeneration(t, policyMaps, want.Generation)
+			if !isolation.quiesced {
+				t.Fatal("cleanup did not quiesce before reclaiming dependent policy")
+			}
+		})
+	}
+}
+
 func TestFakeTCPPolicyStageRollsBackLaterTransactionFailureAndIsIdempotent(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
 	old := seedOldFakeTCPPolicyGeneration(policyMaps, 90)
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +296,7 @@ func TestFakeTCPPolicyStageChangedValueIsRetryableAndNeverBlindDeleted(t *testin
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -290,7 +356,7 @@ func TestFakeTCPPolicyRollbackStopsAtFailedInterfaceLatch(t *testing.T) {
 			snapshot := mustFakeTCPPolicySnapshot(t, 91)
 			ctx, transaction, quiescer := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 			policyMaps, trace := newMemoryFakeTCPPolicyMaps()
-			stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+			stage, err := transaction.Stage(ctx, policyMaps)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -322,7 +388,7 @@ func TestFakeTCPPolicyRollbackStopsAtFailedQuiescenceBarrier(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, quiescer := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +419,7 @@ func TestFakeTCPPolicyRollbackStopsAtFailedPortBeforePolicies(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -379,7 +445,7 @@ func TestFakeTCPPolicyRollbackQuiescesBPFBeforeCursorCompareDeleteWindow(t *test
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, quiescer := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -412,7 +478,7 @@ func TestFakeTCPPolicyRollbackAcceptsOnlyPreexistingBPFControlCursorDrift(t *tes
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, isolation := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +505,7 @@ func TestFakeTCPPolicyRollbackRejectsManagedPortReservedDrift(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -508,7 +574,7 @@ func TestFakeTCPPolicyRollbackRejectsNonCursorControlPolicyDrift(t *testing.T) {
 			snapshot := mustFakeTCPPolicySnapshot(t, 91)
 			ctx, transaction, isolation := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 			policyMaps, _ := newMemoryFakeTCPPolicyMaps()
-			stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+			stage, err := transaction.Stage(ctx, policyMaps)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -556,7 +622,7 @@ func TestStageFakeTCPPolicyInternalFailureUsesLatchAndQuiescenceBarrier(t *testi
 		len(snapshot.ManagedInterfaces)
 	quiescer.fail = errors.New("injected internal rollback quiescence failure")
 
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if stage == nil || err == nil ||
 		!strings.Contains(err.Error(), "injected internal rollback quiescence failure") {
 		t.Fatalf("internal stage failure handle=%v error=%v", stage, err)
@@ -585,8 +651,12 @@ func TestFakeTCPPolicyGenerationTransactionRequiresHeldLeaseAndBarrier(t *testin
 		filepath.Join(root, "daemon.lease"),
 		filepath.Join(root, "maintenance.gate"),
 	)
+	plan := mustFakeTCPPolicyGenerationPlan(t, 91)
 	isolation := &memoryFakeTCPPolicyQuiescer{generation: 91, inactive: true}
-	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, nil, isolation); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
+	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, nil, nil, isolation); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
+		t.Fatalf("transaction without plan = %v, error = %v", transaction, err)
+	}
+	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, plan, nil, isolation); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
 		t.Fatalf("transaction without lease = %v, error = %v", transaction, err)
 	}
 	lease, err := lockfile.AcquireLifecycle(
@@ -596,17 +666,17 @@ func TestFakeTCPPolicyGenerationTransactionRequiresHeldLeaseAndBarrier(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, lease, nil); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
+	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, plan, lease, nil); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
 		t.Fatalf("transaction without isolation backend = %v, error = %v", transaction, err)
 	}
 	var typedNilIsolation *memoryFakeTCPPolicyQuiescer
-	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, lease, typedNilIsolation); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
+	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, plan, lease, typedNilIsolation); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
 		t.Fatalf("transaction with typed-nil isolation backend = %v, error = %v", transaction, err)
 	}
 	if err := lease.Close(); err != nil {
 		t.Fatal(err)
 	}
-	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, 91, lease, isolation); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
+	if transaction, err := newFakeTCPPolicyGenerationTransaction(ctx, plan, lease, isolation); transaction != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
 		t.Fatalf("transaction with closed lease = %v, error = %v", transaction, err)
 	}
 }
@@ -615,7 +685,7 @@ func TestFakeTCPPolicyGenerationTransactionRetainsLeaseUntilTerminalStage(t *tes
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -649,20 +719,12 @@ func TestFakeTCPPolicyGenerationTransactionRetainsLeaseUntilTerminalStage(t *tes
 	}
 }
 
-func TestFakeTCPPolicyStageRejectsWrongGenerationTransactionAndOwner(t *testing.T) {
+func TestFakeTCPPolicyStageRejectsForeignTransactionOwner(t *testing.T) {
 	snapshot := mustFakeTCPPolicySnapshot(t, 91)
 	wrongCtx, wrongTransaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 92)
 	policyMaps, trace := newMemoryFakeTCPPolicyMaps()
-	stage, err := wrongTransaction.Stage(wrongCtx, policyMaps, snapshot)
-	if stage != nil || err == nil || !strings.Contains(err.Error(), "does not match transaction") {
-		t.Fatalf("wrong-generation stage handle=%v error=%v", stage, err)
-	}
-	if len(trace.updateAttempts) != 0 || len(trace.deleteAttempts) != 0 {
-		t.Fatalf("wrong-generation transaction mutated maps: %#v", trace)
-	}
-
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
-	stage, err = transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -728,7 +790,7 @@ func TestStageFakeTCPPolicyGenerationRejectsExistingKeyWithoutResettingCursor(t 
 			memoryMap, key, existing := test.seed(policyMaps, snapshot)
 			memoryMap.entries[key] = existing
 
-			stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+			stage, err := transaction.Stage(ctx, policyMaps)
 			if stage != nil {
 				t.Fatal("existing-key stage returned a rollback handle")
 			}
@@ -750,7 +812,7 @@ func TestStageFakeTCPPolicyGenerationReadbackMismatchRollsBack(t *testing.T) {
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 	policyMaps, _ := newMemoryFakeTCPPolicyMaps()
 	policyMaps.ManagedPorts.(*memoryFakeTCPPolicyMap).corruptNextSuccessfulReadback = true
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if stage != nil {
 		t.Fatal("readback mismatch returned a rollback handle")
 	}
@@ -770,7 +832,7 @@ func TestStageFakeTCPPolicyGenerationNeverDeletesChangedRollbackValue(t *testing
 		changed.WGID++
 		return changed
 	}
-	stage, err := transaction.Stage(ctx, policyMaps, snapshot)
+	stage, err := transaction.Stage(ctx, policyMaps)
 	if stage == nil {
 		t.Fatal("incomplete internal rollback did not return a retryable rollback handle")
 	}
@@ -804,7 +866,7 @@ func TestStageFakeTCPPolicyGenerationNeverDeletesChangedRollbackValue(t *testing
 	assertNoMemoryPolicyGeneration(t, policyMaps, snapshot.Generation)
 }
 
-func TestStageFakeTCPPolicyGenerationRejectsMalformedSnapshotBeforeWrites(t *testing.T) {
+func TestFakeTCPPolicyGenerationPlanRejectsMalformedProjectionBeforeTransaction(t *testing.T) {
 	tests := []struct {
 		name    string
 		mutate  func(*fakeTCPPolicySnapshot)
@@ -878,26 +940,21 @@ func TestStageFakeTCPPolicyGenerationRejectsMalformedSnapshotBeforeWrites(t *tes
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
 			snapshot := mustFakeTCPPolicySnapshot(t, 91)
-			ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, snapshot.Generation)
 			test.mutate(snapshot)
-			policyMaps, trace := newMemoryFakeTCPPolicyMaps()
-			stage, err := transaction.Stage(ctx, policyMaps, snapshot)
-			if stage != nil {
-				t.Fatal("malformed snapshot returned a rollback handle")
+			plan, err := newFakeTCPPolicyGenerationPlan(snapshot)
+			if plan != nil {
+				t.Fatal("malformed projection returned a generation plan")
 			}
 			if err == nil || !strings.Contains(err.Error(), test.wantErr) {
-				t.Fatalf("malformed snapshot error = %v, want %q", err, test.wantErr)
-			}
-			if len(trace.updateAttempts) != 0 || len(trace.deletes) != 0 {
-				t.Fatalf("malformed snapshot mutated maps: %#v", trace)
+				t.Fatalf("malformed projection error = %v, want %q", err, test.wantErr)
 			}
 		})
 	}
 }
 
-func TestFakeTCPPolicyPrimitiveDoesNotClaimActivationCapability(t *testing.T) {
+func TestFakeTCPManagedPolicyCapabilityRemainsClosedPendingAcceptance(t *testing.T) {
 	if fakeTCPImplementedCapabilities&fakeTCPCapabilityManagedPolicyPopulation != 0 {
-		t.Fatal("policy staging primitive claimed managed population before loader/XDP transaction integration")
+		t.Fatal("managed policy capability opened before review and live Linux acceptance")
 	}
 	if !strings.Contains(strings.Join(missingFakeTCPCapabilities(), "\n"),
 		"atomic managed-interface/port policy population") {
@@ -1000,6 +1057,17 @@ func newTestFakeTCPPolicyGenerationTransaction(
 	generation uint64,
 ) (context.Context, *fakeTCPPolicyGenerationTransaction, *memoryFakeTCPPolicyQuiescer) {
 	t.Helper()
+	return newTestFakeTCPPolicyGenerationTransactionFromPlan(
+		t,
+		mustFakeTCPPolicyGenerationPlan(t, generation),
+	)
+}
+
+func newTestFakeTCPPolicyGenerationTransactionFromPlan(
+	t *testing.T,
+	plan *fakeTCPPolicyGenerationPlan,
+) (context.Context, *fakeTCPPolicyGenerationTransaction, *memoryFakeTCPPolicyQuiescer) {
+	t.Helper()
 	root := t.TempDir()
 	ctx := lockfile.WithLifecyclePathsForTest(
 		t.Context(),
@@ -1013,10 +1081,10 @@ func newTestFakeTCPPolicyGenerationTransaction(
 	if err != nil {
 		t.Fatal(err)
 	}
-	quiescer := &memoryFakeTCPPolicyQuiescer{generation: generation, inactive: true}
+	quiescer := &memoryFakeTCPPolicyQuiescer{generation: plan.generation, inactive: true}
 	transaction, err := newFakeTCPPolicyGenerationTransaction(
 		ctx,
-		generation,
+		plan,
 		lease,
 		quiescer,
 	)
@@ -1046,6 +1114,7 @@ type memoryFakeTCPPolicyTrace struct {
 	deletes           []string
 	deleteAttempts    []string
 	failUpdateAt      int
+	afterUpdate       func(int)
 }
 
 func (trace *memoryFakeTCPPolicyTrace) addEvent(event string) {
@@ -1104,6 +1173,9 @@ func (m *memoryFakeTCPPolicyMap) Update(key, value any, flags ebpf.MapUpdateFlag
 	}
 	m.entries[key] = stored
 	m.trace.successfulUpdates = append(m.trace.successfulUpdates, m.name)
+	if m.trace.afterUpdate != nil {
+		m.trace.afterUpdate(len(m.trace.successfulUpdates))
+	}
 	return nil
 }
 
@@ -1249,4 +1321,13 @@ func mustFakeTCPPolicySnapshot(t *testing.T, generation uint64) *fakeTCPPolicySn
 		t.Fatal(err)
 	}
 	return snapshot
+}
+
+func mustFakeTCPPolicyGenerationPlan(t *testing.T, generation uint64) *fakeTCPPolicyGenerationPlan {
+	t.Helper()
+	plan, err := buildFakeTCPPolicyGenerationPlan(fakeTCPPolicyTestState(), generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return plan
 }
