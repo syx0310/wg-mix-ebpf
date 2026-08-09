@@ -547,7 +547,8 @@ func TestFakeTCPEstablishedMapCannotLRUEvictUnderSYNPressure(t *testing.T) {
 	}
 	for _, want := range []string{
 		"Only established sessions enter this map",
-		"session->state != FAKETCP_STATE_ESTABLISHED",
+		"session->state == FAKETCP_STATE_ESTABLISHED",
+		"struct bpf_spin_lock lock",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("established-only fast-map contract missing %q", want)
@@ -555,6 +556,114 @@ func TestFakeTCPEstablishedMapCannotLRUEvictUnderSYNPressure(t *testing.T) {
 	}
 	if !strings.Contains(sessionMap, "__uint(type, BPF_MAP_TYPE_HASH)") {
 		t.Fatal("FakeTCP established session map must remain a non-evicting HASH")
+	}
+}
+
+func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, want := range []string{
+		"struct bpf_spin_lock lock",
+		"SEC(\"classifier/faketcp_session_claim\")",
+		"int wg_faketcp_session_claim(struct __sk_buff *skb)",
+		"session->state = FAKETCP_STATE_DELETE_CLAIMED",
+		"faketcp_session_matches_expected(session, &request.expected, 1)",
+		"expected->revision != 0",
+		"expected->session_id != 0",
+		"expected->runtime_incarnation",
+		"session->revision != ~0ULL",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("established compare-claim source contract missing %q", want)
+		}
+	}
+	if strings.Contains(text, "bpf_map_update_elem(&faketcp_session_map") {
+		t.Fatal("BPF must never insert or replace an established session")
+	}
+	if strings.Contains(text, "bpf_map_delete_elem(&faketcp_session_map") {
+		t.Fatal("packet programs must never bypass the userspace exact-delete finalizer")
+	}
+	if got := strings.Count(text, "bpf_map_lookup_elem(&faketcp_session_map"); got != 4 {
+		t.Fatalf("session-map lookup sites=%d, want claim plus three packet paths", got)
+	}
+
+	preflightStart := strings.Index(text, "faketcp_preflight_egress(struct __sk_buff")
+	encodeStart := strings.Index(text, "faketcp_encode_established(struct __sk_buff")
+	xdpStart := strings.Index(text, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)")
+	if preflightStart < 0 || encodeStart < 0 || xdpStart < 0 ||
+		!(preflightStart < encodeStart && encodeStart < xdpStart) {
+		t.Fatal("FakeTCP packet path functions are missing or reordered")
+	}
+	preflight := text[preflightStart:encodeStart]
+	encode := text[encodeStart:xdpStart]
+	xdp := text[xdpStart:]
+	if !strings.Contains(preflight,
+		"faketcp_session_admit_established(session, generation)") {
+		t.Fatal("TC preflight admits established state without the per-value lock")
+	}
+	if strings.Count(encode,
+		"faketcp_session_admit_established(session, generation)") != 1 ||
+		strings.Count(encode, "FAKETCP_SESSION_MUTATE_TX") != 1 {
+		t.Fatal("TC encoder reader/writer lock or revision contract drifted")
+	}
+	if strings.Count(xdp,
+		"faketcp_session_admit_established(session, generation)") != 1 ||
+		strings.Count(xdp, "FAKETCP_SESSION_MUTATE_TOUCH") != 1 ||
+		strings.Count(xdp, "FAKETCP_SESSION_MUTATE_RX") != 1 {
+		t.Fatal("XDP reader/keepalive/payload writer lock or revision contract drifted")
+	}
+
+	// Packet helpers and rewrite are deliberately outside the tiny writer
+	// critical sections. A source-level regression that places a BPF helper
+	// between lock/unlock would be rejected by the verifier and extend latency.
+	mutationStart := strings.Index(text, "static __always_inline int faketcp_session_mutate(")
+	if mutationStart < 0 {
+		t.Fatal("shared FakeTCP session mutation helper is missing")
+	}
+	mutationEnd := strings.Index(text[mutationStart:], "\n}\n\nstatic __always_inline int faketcp_session_matches_expected")
+	if mutationEnd < 0 {
+		t.Fatal("shared FakeTCP session mutation helper end is missing")
+	}
+	mutation := text[mutationStart : mutationStart+mutationEnd]
+	if strings.Count(mutation, "bpf_spin_lock(&session->lock)") != 1 ||
+		strings.Count(mutation, "bpf_spin_unlock(&session->lock)") != 1 ||
+		strings.Count(mutation, "session->revision++") != 1 {
+		t.Fatal("all packet writers must converge on one value-lock/revision path")
+	}
+	lockMutation := strings.Index(mutation, "bpf_spin_lock(&session->lock)")
+	unlockMutation := strings.Index(mutation, "bpf_spin_unlock(&session->lock)")
+	critical := mutation[lockMutation:unlockMutation]
+	for _, forbidden := range []string{
+		"bpf_ktime_get_ns", "bpf_skb_", "bpf_xdp_", "bpf_csum_diff",
+		"inc_faketcp_stat", "inc_stat(",
+	} {
+		if strings.Contains(critical, forbidden) {
+			t.Fatalf("shared mutation critical section contains helper/stat call %q", forbidden)
+		}
+	}
+
+	claimStart := strings.Index(text, "int wg_faketcp_session_claim(struct __sk_buff *skb)")
+	if claimStart < 0 {
+		t.Fatal("FakeTCP session claim function bounds are missing")
+	}
+	claimEnd := strings.Index(text[claimStart:], "\n}\n\nstruct {")
+	if claimEnd < 0 {
+		t.Fatal("FakeTCP session claim function end is missing")
+	}
+	claim := text[claimStart : claimStart+claimEnd]
+	lock := strings.Index(claim, "bpf_spin_lock(&session->lock)")
+	compare := strings.Index(claim, "faketcp_session_matches_expected")
+	tombstone := strings.Index(claim, "session->state = FAKETCP_STATE_DELETE_CLAIMED")
+	unlock := strings.Index(claim, "bpf_spin_unlock(&session->lock)")
+	if lock < 0 || compare < 0 || tombstone < 0 || unlock < 0 ||
+		!(lock < compare && compare < tombstone && tombstone < unlock) {
+		t.Fatal("claim compare/tombstone linearisation is not wholly under the value lock")
+	}
+	if strings.Count(claim, "session->state = FAKETCP_STATE_DELETE_CLAIMED") != 1 {
+		t.Fatal("claim program must have exactly one tombstone write site")
 	}
 }
 

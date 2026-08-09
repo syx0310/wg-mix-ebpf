@@ -333,14 +333,17 @@ func sessionStoreTestKey(generation uint64) abi.FakeTCPSessionKey {
 
 func sessionStoreTestValue(generation uint64) abi.FakeTCPSessionValue {
 	return abi.FakeTCPSessionValue{
-		Generation:    generation,
-		LastSeenNanos: 123456,
-		TXSequence:    1001,
-		RXSequence:    9001,
-		LocalISN:      1000,
-		RemoteISN:     9000,
-		Window:        65535,
-		State:         abi.FakeTCPStateEstablished,
+		Generation:         generation,
+		LastSeenNanos:      123456,
+		TXSequence:         1001,
+		RXSequence:         9001,
+		LocalISN:           1000,
+		RemoteISN:          9000,
+		Window:             65535,
+		State:              abi.FakeTCPStateEstablished,
+		Revision:           1,
+		SessionID:          9,
+		RuntimeIncarnation: [16]byte{1},
 	}
 }
 
@@ -606,6 +609,11 @@ func TestLinuxSessionStoreRejectsInvalidInsertBeforeMapAccess(t *testing.T) {
 		{name: "state", mutate: func(_ *abi.FakeTCPSessionKey, value *abi.FakeTCPSessionValue) { value.State = abi.FakeTCPStateSynSent }},
 		{name: "flags", mutate: func(_ *abi.FakeTCPSessionKey, value *abi.FakeTCPSessionValue) { value.Flags = 1 }},
 		{name: "reserved", mutate: func(_ *abi.FakeTCPSessionKey, value *abi.FakeTCPSessionValue) { value.Reserved[2] = 1 }},
+		{name: "kernel lock", mutate: func(_ *abi.FakeTCPSessionKey, value *abi.FakeTCPSessionValue) { value.KernelLock = 1 }},
+		{name: "kernel reserved", mutate: func(_ *abi.FakeTCPSessionKey, value *abi.FakeTCPSessionValue) { value.KernelReserved = 1 }},
+		{name: "revision", mutate: func(_ *abi.FakeTCPSessionKey, value *abi.FakeTCPSessionValue) { value.Revision = 0 }},
+		{name: "session ID", mutate: func(_ *abi.FakeTCPSessionKey, value *abi.FakeTCPSessionValue) { value.SessionID = 0 }},
+		{name: "runtime incarnation", mutate: func(_ *abi.FakeTCPSessionKey, value *abi.FakeTCPSessionValue) { value.RuntimeIncarnation = [16]byte{} }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -633,6 +641,11 @@ func TestLinuxSessionStoreRejectsInvalidValuesReadFromMap(t *testing.T) {
 		{name: "state", mutate: func(value *abi.FakeTCPSessionValue) { value.State = abi.FakeTCPStateClosing }},
 		{name: "flags", mutate: func(value *abi.FakeTCPSessionValue) { value.Flags = 1 }},
 		{name: "reserved", mutate: func(value *abi.FakeTCPSessionValue) { value.Reserved[0] = 1 }},
+		{name: "kernel lock", mutate: func(value *abi.FakeTCPSessionValue) { value.KernelLock = 1 }},
+		{name: "kernel reserved", mutate: func(value *abi.FakeTCPSessionValue) { value.KernelReserved = 1 }},
+		{name: "revision", mutate: func(value *abi.FakeTCPSessionValue) { value.Revision = 0 }},
+		{name: "session ID", mutate: func(value *abi.FakeTCPSessionValue) { value.SessionID = 0 }},
+		{name: "runtime incarnation", mutate: func(value *abi.FakeTCPSessionValue) { value.RuntimeIncarnation = [16]byte{} }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

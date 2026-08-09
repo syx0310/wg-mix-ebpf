@@ -15,7 +15,7 @@ const (
 	fakeTCPSessionKernelMapName = "faketcp_session"
 	fakeTCPSessionMapTypeHash   = uint32(1)
 	fakeTCPSessionMapKeySize    = uint32(24)
-	fakeTCPSessionMapValueSize  = uint32(40)
+	fakeTCPSessionMapValueSize  = uint32(80)
 	fakeTCPSessionMapMaxEntries = uint32(16384)
 )
 
@@ -441,6 +441,18 @@ func validateEstablishedSessionValue(value abi.FakeTCPSessionValue, generation u
 	}
 	if value.Reserved != ([4]byte{}) {
 		return errors.New("faketcp session has nonzero reserved bytes")
+	}
+	if value.KernelLock != 0 || value.KernelReserved != 0 {
+		return errors.New("faketcp session has nonzero kernel lock or reserved bytes")
+	}
+	if value.Revision == 0 {
+		return errors.New("faketcp session revision is zero")
+	}
+	if value.SessionID == 0 {
+		return errors.New("faketcp session ID is zero")
+	}
+	if value.RuntimeIncarnation == ([16]byte{}) {
+		return errors.New("faketcp session runtime incarnation is zero")
 	}
 	return nil
 }

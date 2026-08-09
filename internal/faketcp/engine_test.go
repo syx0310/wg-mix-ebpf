@@ -820,9 +820,14 @@ func TestEstablishedStateReadsBPFAdvanceAndNeverOverwritesOrRacyDeletes(t *testi
 	// turns. Tick must build keepalive from these current sequences and must
 	// not write its stale in-memory copy back over them.
 	value := store.values[flow]
+	if value.Revision != 1 || value.SessionID != 1 ||
+		value.RuntimeIncarnation != [16]byte(engine.Identity().Incarnation) {
+		t.Fatalf("established value lacks ABA identity: %#v", value)
+	}
 	value.TXSequence += 4096
 	value.RXSequence += 2048
 	value.LastSeenNanos = clock.monotonic
+	value.Revision++
 	store.values[flow] = value
 	clock.Add(5 * time.Second)
 	actions, err := engine.Tick()
@@ -846,6 +851,7 @@ func TestEstablishedStateReadsBPFAdvanceAndNeverOverwritesOrRacyDeletes(t *testi
 	advanced.TXSequence += 128
 	advanced.RXSequence += 64
 	advanced.LastSeenNanos = clock.monotonic
+	advanced.Revision++
 	store.beforeDelete = func(key abi.FakeTCPSessionKey) {
 		store.values[key] = advanced
 		store.beforeDelete = nil

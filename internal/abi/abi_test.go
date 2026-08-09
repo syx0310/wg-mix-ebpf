@@ -51,7 +51,7 @@ func TestStructSizesAreStable(t *testing.T) {
 		{"ICMPListenerKey", unsafe.Sizeof(ICMPListenerKey{}), 16},
 		{"ICMPListenerValue", unsafe.Sizeof(ICMPListenerValue{}), 24},
 		{"FakeTCPSessionKey", unsafe.Sizeof(FakeTCPSessionKey{}), 24},
-		{"FakeTCPSessionValue", unsafe.Sizeof(FakeTCPSessionValue{}), 40},
+		{"FakeTCPSessionValue", unsafe.Sizeof(FakeTCPSessionValue{}), 80},
 		{"FakeTCPManagedIfKey", unsafe.Sizeof(FakeTCPManagedIfKey{}), 16},
 		{"FakeTCPManagedIfValue", unsafe.Sizeof(FakeTCPManagedIfValue{}), 8},
 		{"FakeTCPManagedPortKey", unsafe.Sizeof(FakeTCPManagedPortKey{}), 16},
@@ -119,6 +119,21 @@ func TestStructSizesAreStable(t *testing.T) {
 	}
 	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Reserved), uintptr(36); got != want {
 		t.Fatalf("FakeTCPSessionValue.Reserved offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.KernelLock), uintptr(40); got != want {
+		t.Fatalf("FakeTCPSessionValue.KernelLock offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.KernelReserved), uintptr(44); got != want {
+		t.Fatalf("FakeTCPSessionValue.KernelReserved offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Revision), uintptr(48); got != want {
+		t.Fatalf("FakeTCPSessionValue.Revision offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.SessionID), uintptr(56); got != want {
+		t.Fatalf("FakeTCPSessionValue.SessionID offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.RuntimeIncarnation), uintptr(64); got != want {
+		t.Fatalf("FakeTCPSessionValue.RuntimeIncarnation offset = %d, want %d", got, want)
 	}
 	if got, want := unsafe.Offsetof(FakeTCPManagedPortKey{}.DestinationPort), uintptr(12); got != want {
 		t.Fatalf("FakeTCPManagedPortKey.DestinationPort offset = %d, want %d", got, want)

@@ -41,7 +41,10 @@ const (
 	FakeTCPStateSynSent     uint8 = 1
 	FakeTCPStateSynReceived uint8 = 2
 	FakeTCPStateEstablished uint8 = 3
-	FakeTCPStateClosing     uint8 = 4
+	// FakeTCPStateDeleteClaimed is a kernel-owned tombstone. Packet programs
+	// may observe it, but userspace must never insert it as live state.
+	FakeTCPStateDeleteClaimed uint8 = 4
+	FakeTCPStateClosing             = FakeTCPStateDeleteClaimed
 
 	FakeTCPEventNeedHandshake uint8 = 1
 	FakeTCPEventSYN           uint8 = 2
@@ -220,6 +223,22 @@ type FakeTCPSessionValue struct {
 	State         uint8
 	Flags         uint8
 	Reserved      [4]byte // Must stay zero; maps exactly to the C ABI pad bytes.
+	// KernelLock is a top-level struct bpf_spin_lock in the C map ABI. Kernel
+	// lookup never copies its contents to userspace and userspace must keep the
+	// corresponding bytes zero on update. Packet writers and the delete-claim
+	// program use it as the per-session linearisation domain.
+	KernelLock uint32
+	// KernelReserved keeps the following 64-bit fields naturally aligned and
+	// is part of the exact compare contract. It must remain zero.
+	KernelReserved uint32
+	// Revision starts at one and advances exactly once for every admitted BPF
+	// mutation. It prevents a stale snapshot from matching after field ABA.
+	Revision uint64
+	// SessionID is never reused within one Engine incarnation. Together with
+	// RuntimeIncarnation it prevents delete authority crossing a reinsert or
+	// process restart even if the five-tuple and sequence fields recur.
+	SessionID          uint64
+	RuntimeIncarnation [16]byte
 }
 
 func (v FakeTCPSessionValue) MapGeneration() uint64 { return v.Generation }

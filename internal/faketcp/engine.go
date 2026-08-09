@@ -133,6 +133,7 @@ type session struct {
 	pendingBytes  int
 	halfOpenHeld  bool
 	synSource     synSourceKey
+	sessionID     uint64
 }
 
 type synSourceKey struct {
@@ -175,6 +176,10 @@ type Engine struct {
 	// Counted under mu and used by complexity-contract tests. It also makes
 	// accidental replacement of bounded pruning with a full scan observable.
 	synSourcePruneVisits uint64
+	// nextSessionID is monotonic for this Engine incarnation and deliberately
+	// never rolled back. A failed insert therefore cannot make a later session
+	// reuse delete authority from an earlier attempt.
+	nextSessionID uint64
 }
 
 type engineCheckpoint struct {
@@ -892,15 +897,25 @@ func (e *Engine) insertEstablished(flow abi.FakeTCPSessionKey, s *session) error
 	if err != nil {
 		return fmt.Errorf("read faketcp %s clock for established insert: %w", BPFMonotonicClockDomain, err)
 	}
+	if s.sessionID == 0 {
+		if e.nextSessionID == ^uint64(0) {
+			return errors.New("faketcp session ID space is exhausted")
+		}
+		e.nextSessionID++
+		s.sessionID = e.nextSessionID
+	}
 	return e.opts.Store.InsertEstablished(flow, abi.FakeTCPSessionValue{
-		Generation:    flow.Generation,
-		LastSeenNanos: nowMonotonic,
-		TXSequence:    s.txSequence,
-		RXSequence:    s.rxSequence,
-		LocalISN:      s.localISN,
-		RemoteISN:     s.remoteISN,
-		Window:        e.opts.Window,
-		State:         s.state,
+		Generation:         flow.Generation,
+		LastSeenNanos:      nowMonotonic,
+		TXSequence:         s.txSequence,
+		RXSequence:         s.rxSequence,
+		LocalISN:           s.localISN,
+		RemoteISN:          s.remoteISN,
+		Window:             e.opts.Window,
+		State:              s.state,
+		Revision:           1,
+		SessionID:          s.sessionID,
+		RuntimeIncarnation: [16]byte(e.identity.Incarnation),
 	})
 }
 
@@ -914,6 +929,10 @@ func (e *Engine) lookupEstablished(flow abi.FakeTCPSessionKey, s *session) (abi.
 	}
 	if value.LocalISN != s.localISN || value.RemoteISN != s.remoteISN {
 		return abi.FakeTCPSessionValue{}, false, errors.New("faketcp fast session identity changed")
+	}
+	if value.SessionID != s.sessionID ||
+		value.RuntimeIncarnation != [16]byte(e.identity.Incarnation) {
+		return abi.FakeTCPSessionValue{}, false, errors.New("faketcp fast session incarnation changed")
 	}
 	// BPF is the sole writer after insertion. These assignments only refresh
 	// the userspace snapshot used for observability; no whole-value write API

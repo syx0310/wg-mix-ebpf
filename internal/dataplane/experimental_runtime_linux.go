@@ -18,12 +18,13 @@ import (
 )
 
 const (
-	fakeTCPSessionMapName    = "faketcp_session_map"
-	fakeTCPEventsMapName     = "faketcp_events"
-	fakeTCPRuntimeIDMapName  = "faketcp_rt_id"
-	fakeTCPCaptureSeqMapName = "faketcp_cap_seq"
-	fakeTCPEgressProgramName = "wg_faketcp_egress"
-	fakeTCPXDPProgramName    = "wg_mix_faketcp_ingress"
+	fakeTCPSessionMapName          = "faketcp_session_map"
+	fakeTCPEventsMapName           = "faketcp_events"
+	fakeTCPRuntimeIDMapName        = "faketcp_rt_id"
+	fakeTCPCaptureSeqMapName       = "faketcp_cap_seq"
+	fakeTCPEgressProgramName       = "wg_faketcp_egress"
+	fakeTCPXDPProgramName          = "wg_mix_faketcp_ingress"
+	fakeTCPSessionClaimProgramName = "wg_faketcp_session_claim"
 )
 
 var (
@@ -38,6 +39,7 @@ type ownedFakeTCPSessionStore interface {
 
 type experimentalSessionStoreFactory func(
 	experimentalMapResource,
+	experimentalProgramResource,
 	uint64,
 ) (ownedFakeTCPSessionStore, error)
 
@@ -110,17 +112,29 @@ func (source liveExperimentalEventMapSource) Clone() (*experimentalEventMapClone
 
 func newLiveExperimentalSessionStore(
 	resource experimentalMapResource,
+	claimResource experimentalProgramResource,
 	generation uint64,
 ) (ownedFakeTCPSessionStore, error) {
 	bpfMap, ok := resource.(*ebpf.Map)
 	if !ok || bpfMap == nil {
 		return nil, errors.New("experimental FakeTCP session resource is not a live eBPF map")
 	}
+	if claimResource == nil || claimResource.kernelProgram() == nil {
+		return nil, errors.New("experimental FakeTCP session claim resource is not a live eBPF program")
+	}
 	identity, err := faketcp.InspectLinuxSessionMapIdentity(bpfMap)
 	if err != nil {
 		return nil, fmt.Errorf("inspect experimental FakeTCP session map: %w", err)
 	}
-	store, err := faketcp.NewLinuxSessionStore(bpfMap, generation, identity)
+	compareDelete, err := faketcp.NewLinuxAtomicSessionCompareDeleter(
+		bpfMap, claimResource.kernelProgram(), identity,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("bind experimental FakeTCP session claim program: %w", err)
+	}
+	store, err := faketcp.NewLinuxSessionStoreWithAtomicCompareDelete(
+		bpfMap, generation, identity, compareDelete,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("own experimental FakeTCP session map: %w", err)
 	}
@@ -805,6 +819,10 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if err != nil {
 		return err
 	}
+	sessionClaimProgram, err := options.collection.programResource(fakeTCPSessionClaimProgramName)
+	if err != nil {
+		return err
+	}
 	eventsMap, err := options.collection.mapResource(fakeTCPEventsMapName)
 	if err != nil {
 		return err
@@ -834,7 +852,9 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		return err
 	}
 
-	ownedStore, err := options.sessionFactory(sessionMap, options.snapshot.Generation)
+	ownedStore, err := options.sessionFactory(
+		sessionMap, sessionClaimProgram, options.snapshot.Generation,
+	)
 	if err != nil {
 		return build.prepareError(fmt.Errorf("build experimental FakeTCP runtime session handle: %w", err))
 	}
