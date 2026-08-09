@@ -29,7 +29,8 @@ proc load_manifest {path expected_sha} {
     }
     set expected_keys {
         format run_id package_id integration_ref integration_commit
-        bundle_name bundle_sha256 wg_state wg_interface wg_local_address
+        bundle_name bundle_sha256 history_verification history_commit_count
+        history_roots_sha256 history_objects_sha256 wg_state wg_interface wg_local_address
         wg_peer_address local_repository local_package_dir remote_package_dir
         remote_source target_user target_host target_hostname target_kernel
         target_machine_id target_interface peer_address peer_port soak_seconds
@@ -79,6 +80,10 @@ proc validate_manifest_values {values} {
         ![regexp {^[0-9a-f]{40}$} [dict get $values integration_commit]] ||
         [dict get $values bundle_name] ne "source-4f2a9b61.bundle" ||
         ![regexp {^[0-9a-f]{64}$} [dict get $values bundle_sha256]] ||
+        [dict get $values history_verification] ne "isolated-unbundle-rev-list-fsck-v1" ||
+        ![regexp {^[1-9][0-9]*$} [dict get $values history_commit_count]] ||
+        ![regexp {^[0-9a-f]{64}$} [dict get $values history_roots_sha256]] ||
+        ![regexp {^[0-9a-f]{64}$} [dict get $values history_objects_sha256]] ||
         [dict get $values remote_package_dir] ne "/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61" ||
         [dict get $values remote_source] ne "/run/wg-mix-ebpf-source-stages/c8e41d73/source" ||
         [dict get $values target_user] ne "siyixuan" ||
@@ -263,6 +268,8 @@ proc build_operation {values manifest_sha operation} {
     set target "[dict get $values target_user]@[dict get $values target_host]"
     set package [dict get $values remote_package_dir]
     set local_package [dict get $values local_package_dir]
+    set bootstrap_root "/run/wg-mix-ebpf-source-bootstrap-c8e41d73"
+    set bootstrap_stager "${bootstrap_root}/prepare-stage-root.sh"
     set remote {}
     set tty 0
     set prompt_limit 1
@@ -327,15 +334,75 @@ proc build_operation {values manifest_sha operation} {
                 "${package}/test-hermetic-matrix.sh"]]
             set timeout_seconds 660
         }
+        bootstrap-absent {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/test ! -e $bootstrap_root]]
+            set tty 1
+            set prompt_limit 2
+        }
+        bootstrap-not-symlink {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/test ! -L $bootstrap_root]]
+            set tty 1
+            set prompt_limit 2
+        }
+        bootstrap-create {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/mkdir --mode=0700 -- $bootstrap_root]]
+            set tty 1
+            set prompt_limit 2
+        }
+        bootstrap-root-readlink {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/readlink -e -- $bootstrap_root]]
+            set assertion "exact:${bootstrap_root}"
+            set tty 1
+            set prompt_limit 2
+        }
+        bootstrap-root-stat {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/stat -Lc %U:%G:%a:%F -- $bootstrap_root]]
+            set assertion exact:root:root:700:directory
+            set tty 1
+            set prompt_limit 2
+        }
+        bootstrap-install-stager {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/install --owner=root --group=root --mode=0700 --no-target-directory -- \
+                "${package}/prepare-stage-root.sh" $bootstrap_stager]]
+            set tty 1
+            set prompt_limit 2
+        }
+        bootstrap-stager-readlink {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/readlink -e -- $bootstrap_stager]]
+            set assertion "exact:${bootstrap_stager}"
+            set tty 1
+            set prompt_limit 2
+        }
+        bootstrap-stager-sha {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/sha256sum -- $bootstrap_stager]]
+            set assertion "exact:[dict get $values prepare_stage_root_sh_sha256]  ${bootstrap_stager}"
+            set tty 1
+            set prompt_limit 2
+        }
+        bootstrap-stager-stat {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- $bootstrap_stager]]
+            set assertion exact:root:root:700:1:regular\ file
+            set tty 1
+            set prompt_limit 2
+        }
         stage-plan - stage-run {
             set stage_mode [expr {$operation eq "stage-plan" ? "plan" : "run"}]
-            set remote [concat [env_argv] [list /bin/bash -p "${package}/prepare-stage-root.sh" \
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /bin/bash -p $bootstrap_stager \
                 $stage_mode --manifest "${package}/package-manifest.v1" \
                 --manifest-sha256 $manifest_sha]]
+            set tty 1
+            set prompt_limit 2
             if {$stage_mode eq "run"} {
-                set remote [concat [list /usr/bin/sudo --] $remote]
-                set tty 1
-                set prompt_limit 2
                 set timeout_seconds 2400
             }
         }
@@ -491,6 +558,8 @@ if {$ssh_parts ne [list ssh siyixuan@192.168.10.82] || $password eq "" ||
 set timeout $timeout_seconds
 set captured_output ""
 set credential_sends 0
+puts "B82_V6_TRANSPORT_EXECUTE operation=$operation transport=$transport_type credential_in_argv=0"
+puts "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
 log_user 0
 spawn -noecho {*}$spawn_argv
 expect {

@@ -30,6 +30,13 @@ sha256_file() {
   printf '%s\n' "${line%% *}"
 }
 
+manifest_value() {
+  local key="$1" manifest="$2"
+  /usr/bin/awk -F '\t' -v expected="${key}" \
+    '$1 == expected { if (++seen > 1 || NF != 2) exit 65; value=$2 } END { if (seen != 1) exit 65; print value }' \
+    "${manifest}"
+}
+
 expect_failure() {
   local label="$1" output
   shift
@@ -37,6 +44,15 @@ expect_failure() {
     fail "${label} unexpectedly succeeded"
   fi
   printf 'EXPECTED_FAILURE label=%s output=%q\n' "${label}" "${output}"
+}
+
+require_ordered_literals() {
+  local remaining="$1" marker
+  shift
+  for marker in "$@"; do
+    [[ "${remaining}" == *"${marker}"* ]] || fail "ordered plan marker missing: ${marker}"
+    remaining="${remaining#*"${marker}"}"
+  done
 }
 
 for path in "${BINDER}" "${CONTROLLER}" "${TRANSPORT}" "${STAGER}" "${MATRIX}" "${STATIC_TEST}"; do
@@ -70,6 +86,10 @@ FIXTURE_REVIEW="${FIXTURE_REPOSITORY}/scripts/realhost-b82-c8e41d73"
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" init || fail 'fixture Git init'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" config user.name 'Hermetic Controller Test' || fail 'fixture Git name'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" config user.email 'hermetic-controller@example.invalid' || fail 'fixture Git email'
+printf 'history-root=%s\n' "${TEST_ROOT##*/}" >"${FIXTURE_REPOSITORY}/history-root.v1" ||
+  fail 'fixture history root'
+/usr/bin/git -C "${FIXTURE_REPOSITORY}" add -- history-root.v1 || fail 'fixture history root add'
+/usr/bin/git -C "${FIXTURE_REPOSITORY}" commit -m 'Hermetic history root' || fail 'fixture history root commit'
 /bin/mkdir -p -- "${FIXTURE_REVIEW}" || fail 'fixture review directory creation'
 for name in \
   bind-final-package.sh controller.sh locked-transport.exp prepare-stage-root.sh \
@@ -99,12 +119,34 @@ BIND_PLAN="$(/bin/bash "${FIXTURE_REVIEW}/bind-final-package.sh" plan "${BIND_AR
   fail 'binding plan'
 [[ "${BIND_PLAN}" == *'no_files_created=1 credential_read=0 network_operations=0'* ]] ||
   fail 'binding plan side-effect fence'
+[[ "${BIND_PLAN}" == *'repository_shallow=false history_verification=isolated-unbundle-rev-list-fsck-v1'* ]] ||
+  fail 'binding plan full-history fence'
 [[ ! -e "${BOUND_OUTPUT}" && ! -L "${BOUND_OUTPUT}" ]] || fail 'binding plan created output'
 BIND_RESULT="$(/bin/bash "${FIXTURE_REVIEW}/bind-final-package.sh" bind "${BIND_ARGS[@]}")" ||
   fail 'package binding'
 [[ "${BIND_RESULT}" == *'B82_V6_BIND_COMPLETE'* ]] || fail 'binding completion marker'
 BOUND_MANIFEST="${BOUND_OUTPUT}/package-manifest.v1"
 BOUND_MANIFEST_SHA="$(sha256_file "${BOUND_MANIFEST}")" || fail 'manifest digest'
+[[ -d "${BOUND_OUTPUT}/history-verification.git" && ! -L "${BOUND_OUTPUT}/history-verification.git" &&
+  -f "${BOUND_OUTPUT}/history-objects.v1" && -f "${BOUND_OUTPUT}/history-roots.v1" ]] ||
+  fail 'isolated history evidence shape'
+[[ "$(manifest_value history_verification "${BOUND_MANIFEST}")" == 'isolated-unbundle-rev-list-fsck-v1' ]] ||
+  fail 'history method manifest binding'
+[[ "$(manifest_value history_commit_count "${BOUND_MANIFEST}")" == '2' ]] ||
+  fail 'full fixture history count'
+[[ "$(sha256_file "${BOUND_OUTPUT}/history-objects.v1")" == \
+  "$(manifest_value history_objects_sha256 "${BOUND_MANIFEST}")" ]] || fail 'history objects digest'
+[[ "$(sha256_file "${BOUND_OUTPUT}/history-roots.v1")" == \
+  "$(manifest_value history_roots_sha256 "${BOUND_MANIFEST}")" ]] || fail 'history roots digest'
+/usr/bin/git -C "${BOUND_OUTPUT}/history-verification.git" fsck --full --strict --no-dangling \
+  "${FIXTURE_COMMIT}" || fail 'isolated history fsck'
+/usr/bin/grep -E '^\?' -- "${BOUND_OUTPUT}/history-objects.v1"
+HISTORY_MISSING_RC=$?
+case "${HISTORY_MISSING_RC}" in
+  1) ;;
+  0) fail 'history evidence contains a missing object' ;;
+  *) fail 'history evidence scan failed' ;;
+esac
 
 CONTROLLER_ARGS=(
   --manifest "${BOUND_MANIFEST}"
@@ -125,12 +167,57 @@ for literal in \
   'siyixuan@192.168.10.82:/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/source-4f2a9b61.bundle' \
   'operation=stage-run transport=ssh credential_read=0 network_operations=0' \
   '/usr/bin/sudo -- /usr/bin/env -i' \
+  'operation=bootstrap-absent transport=ssh credential_read=0 network_operations=0' \
+  '/usr/bin/test ! -e /run/wg-mix-ebpf-source-bootstrap-c8e41d73' \
+  'operation=bootstrap-not-symlink transport=ssh credential_read=0 network_operations=0' \
+  '/usr/bin/test ! -L /run/wg-mix-ebpf-source-bootstrap-c8e41d73' \
+  'operation=bootstrap-create transport=ssh credential_read=0 network_operations=0' \
+  '/usr/bin/mkdir --mode=0700 -- /run/wg-mix-ebpf-source-bootstrap-c8e41d73' \
+  'operation=bootstrap-root-readlink transport=ssh credential_read=0 network_operations=0' \
+  'operation=bootstrap-root-stat transport=ssh credential_read=0 network_operations=0' \
+  'operation=bootstrap-install-stager transport=ssh credential_read=0 network_operations=0' \
+  '/usr/bin/install --owner=root --group=root --mode=0700 --no-target-directory -- /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/prepare-stage-root.sh /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh' \
+  'operation=bootstrap-stager-readlink transport=ssh credential_read=0 network_operations=0' \
+  'operation=bootstrap-stager-sha transport=ssh credential_read=0 network_operations=0' \
+  'operation=bootstrap-stager-stat transport=ssh credential_read=0 network_operations=0' \
+  '/bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh run' \
   'operation=matrix-run transport=ssh credential_read=0 network_operations=0' \
   '--wg-interface wg0 --wg-local-address 10.200.0.1 --wg-peer-address 10.200.0.2' \
   'B82_V6_CONTROLLER_PLAN_COMPLETE credential_read=0 network_operations=0 mutations=0'; do
   [[ "${CONTROLLER_PLAN}" == *"${literal}"* ]] || fail "controller plan missing ${literal}"
 done
 [[ "${CONTROLLER_PLAN}" != *'B82_V6_MATRIX_BLOCKED'* ]] || fail 'bound plan was blocked'
+[[ "${CONTROLLER_PLAN}" != *'/bin/bash -p /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/prepare-stage-root.sh'* ]] ||
+  fail 'controller plan executes user-writable package stager'
+require_ordered_literals "${CONTROLLER_PLAN}" \
+  'operation=bootstrap-absent ' \
+  'operation=bootstrap-not-symlink ' \
+  'operation=bootstrap-create ' \
+  'operation=bootstrap-root-readlink ' \
+  'operation=bootstrap-root-stat ' \
+  'operation=bootstrap-install-stager ' \
+  'operation=bootstrap-stager-readlink ' \
+  'operation=bootstrap-stager-sha ' \
+  'operation=bootstrap-stager-stat ' \
+  'operation=stage-plan ' \
+  'operation=stage-run '
+
+BOOTSTRAP_FIXTURE="${TEST_ROOT}/bootstrap-first-run-c8e41d73"
+[[ ! -e "${BOOTSTRAP_FIXTURE}" && ! -L "${BOOTSTRAP_FIXTURE}" ]] || fail 'bootstrap fixture was not fresh'
+/bin/test ! -e "${BOOTSTRAP_FIXTURE}" || fail 'bootstrap first-run absence gate'
+/bin/test ! -L "${BOOTSTRAP_FIXTURE}" || fail 'bootstrap first-run symlink gate'
+/bin/mkdir -m 0700 -- "${BOOTSTRAP_FIXTURE}" || fail 'bootstrap first-run creation'
+if /bin/test ! -e "${BOOTSTRAP_FIXTURE}"; then
+  fail 'pre-existing bootstrap passed the absence gate'
+fi
+BOOTSTRAP_SYMLINK_FIXTURE="${TEST_ROOT}/bootstrap-dangling-symlink-c8e41d73"
+/bin/ln -s "${TEST_ROOT}/missing-bootstrap-target" "${BOOTSTRAP_SYMLINK_FIXTURE}" ||
+  fail 'bootstrap dangling symlink fixture'
+/bin/test ! -e "${BOOTSTRAP_SYMLINK_FIXTURE}" || fail 'dangling symlink fixture unexpectedly exists'
+if /bin/test ! -L "${BOOTSTRAP_SYMLINK_FIXTURE}"; then
+  fail 'dangling bootstrap symlink passed the symlink gate'
+fi
+printf 'HERMETIC_BOOTSTRAP first_run_reachable=1 preexisting_rejected=1 retained=%s\n' "${BOOTSTRAP_FIXTURE}"
 
 STAGE_PLAN="$(/bin/bash "${BOUND_OUTPUT}/prepare-stage-root.sh" plan \
   --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}")" ||
@@ -163,6 +250,36 @@ expect_failure invalid-transport-operation /usr/bin/expect "${FIXTURE_REVIEW}/lo
 expect_failure credential-path-before-spawn /usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
   --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
   --credential-path /private/tmp/not-a-credential --action execute --operation identity-hostname
+expect_failure package-stager-root-run /bin/bash "${BOUND_OUTPUT}/prepare-stage-root.sh" run \
+  --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}"
+
+SHALLOW_REPOSITORY="${TEST_ROOT}/shallow-repository"
+/usr/bin/git clone --depth 1 --branch "${FIXTURE_BRANCH}" \
+  "file://${FIXTURE_REPOSITORY}" "${SHALLOW_REPOSITORY}" || fail 'shallow fixture clone'
+[[ "$(/usr/bin/git -C "${SHALLOW_REPOSITORY}" rev-parse --is-shallow-repository)" == 'true' ]] ||
+  fail 'shallow fixture is not shallow'
+/usr/bin/git -C "${SHALLOW_REPOSITORY}" config user.name 'Hermetic Shallow Test' || fail 'shallow Git name'
+/usr/bin/git -C "${SHALLOW_REPOSITORY}" config user.email 'hermetic-shallow@example.invalid' || fail 'shallow Git email'
+printf 'shallow-child=%s\n' "${TEST_ROOT##*/}" >"${SHALLOW_REPOSITORY}/shallow-child.v1" ||
+  fail 'shallow child fixture'
+/usr/bin/git -C "${SHALLOW_REPOSITORY}" add -- shallow-child.v1 || fail 'shallow child add'
+/usr/bin/git -C "${SHALLOW_REPOSITORY}" commit -m 'Hermetic shallow child' || fail 'shallow child commit'
+SHALLOW_COMMIT="$(/usr/bin/git -C "${SHALLOW_REPOSITORY}" rev-parse HEAD)" || fail 'shallow fixture commit'
+SHALLOW_OUTPUT="/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-${SHALLOW_COMMIT:0:12}"
+SHALLOW_ARGS=(
+  --repository "${SHALLOW_REPOSITORY}" --source-ref "${FIXTURE_REF}" --commit "${SHALLOW_COMMIT}"
+  --wg-state bound --wg-interface wg0 --wg-local-address 10.200.0.1 --wg-peer-address 10.200.0.2
+  --output-dir "${SHALLOW_OUTPUT}"
+)
+expect_failure shallow-plan /bin/bash \
+  "${SHALLOW_REPOSITORY}/scripts/realhost-b82-c8e41d73/bind-final-package.sh" plan "${SHALLOW_ARGS[@]}"
+expect_failure shallow-bind /bin/bash \
+  "${SHALLOW_REPOSITORY}/scripts/realhost-b82-c8e41d73/bind-final-package.sh" bind "${SHALLOW_ARGS[@]}"
+[[ ! -e "${SHALLOW_OUTPUT}" && ! -L "${SHALLOW_OUTPUT}" ]] || fail 'shallow bind created output'
+
+printf '?ffffffffffffffffffffffffffffffffffffffff\n' >>"${BOUND_OUTPUT}/history-objects.v1" ||
+  fail 'history evidence tamper fixture'
+expect_failure tampered-history-evidence /bin/bash "${FIXTURE_REVIEW}/controller.sh" plan "${CONTROLLER_ARGS[@]}"
 
 printf 'fixture-absent=%s\n' "${TEST_ROOT##*/}" >>"${FIXTURE_REPOSITORY}/fixture-token.v1" ||
   fail 'absent fixture token'
@@ -189,5 +306,7 @@ ABSENT_PLAN="$(/bin/bash "${FIXTURE_REVIEW}/controller.sh" plan "${ABSENT_CONTRO
 [[ "${ABSENT_PLAN}" != *'operation=matrix-run'* ]] || fail 'absent plan rendered matrix execution'
 expect_failure absent-matrix-run /bin/bash "${FIXTURE_REVIEW}/controller.sh" run "${ABSENT_CONTROLLER_ARGS[@]}"
 
-printf 'hermetic v6 binder, SSH/SCP/Expect plan, failure paths and WireGuard absence: PASS\n'
+printf '%s\n' \
+  'hermetic v6 full-history binder, root-owned bootstrap, SSH/SCP/Expect plan,' \
+  'shallow/failure paths and WireGuard absence: PASS'
 printf 'RETAINED_HERMETIC_ROOT path=%s reason=auditable-no-cleanup-test-policy\n' "${TEST_ROOT}"

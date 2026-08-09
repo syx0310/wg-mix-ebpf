@@ -74,6 +74,15 @@ def main() -> None:
         'source_ref_after="$(git_checked rev-parse --verify "${SOURCE_REF}^{commit}")"',
         "git_checked bundle create",
         "git_checked bundle verify",
+        "git_checked rev-parse --is-shallow-repository",
+        "[[ \"${shallow_state}\" == 'false' ]]",
+        "isolated-unbundle-rev-list-fsck-v1",
+        "bundle unbundle",
+        "rev-list --parents --objects --missing=print",
+        "fsck --full --strict --no-dangling",
+        "manifest_line history_commit_count",
+        "manifest_line history_roots_sha256",
+        "manifest_line history_objects_sha256",
         "manifest_line wg_state",
         "absent)",
         '"${WG_INTERFACE}" == \'absent\'',
@@ -86,6 +95,10 @@ def main() -> None:
             fail(f"binder contract is missing {literal!r}")
     if re.search(r"rev-parse(?:\s+--verify)?\s+HEAD", binder):
         fail("binder defaults or resolves the package from HEAD")
+    if binder.index("require_full_repository || fail 'repository-became-shallow'") > binder.index(
+        "git_checked bundle create"
+    ):
+        fail("binder checks shallow state after bundle creation")
     if re.search(r"\b(?:apt|apt-get)\b", binder):
         fail("binder contains package installation")
 
@@ -102,6 +115,9 @@ def main() -> None:
         "--manifest-sha256",
         "--credential-path",
         "credential_read=0 network_operations=0 mutations=0",
+        "BOOTSTRAP_OPERATIONS",
+        "bootstrap-absent bootstrap-not-symlink bootstrap-create bootstrap-root-readlink bootstrap-root-stat",
+        "bootstrap-stager-readlink bootstrap-stager-sha bootstrap-stager-stat",
     )
     for literal in required_controller:
         if literal not in controller:
@@ -118,6 +134,8 @@ def main() -> None:
         'if {[catch {open $credential_path r} credential_file]}',
         'send -- "$password\\r"',
         'spawn -noecho {*}$spawn_argv',
+        "B82_V6_TRANSPORT_EXECUTE operation=$operation",
+        "credential_in_argv=0",
         "/usr/bin/ssh",
         "/usr/bin/scp",
         "StrictHostKeyChecking=yes",
@@ -137,6 +155,21 @@ def main() -> None:
         "/usr/bin/test -r /sys/kernel/btf/vmlinux",
         "/usr/bin/findmnt --noheadings --raw --output FSTYPE,TARGET --target /sys/fs/bpf",
         "controller-shellcheck",
+        'set bootstrap_root "/run/wg-mix-ebpf-source-bootstrap-c8e41d73"',
+        "bootstrap-absent",
+        "/usr/bin/test ! -e $bootstrap_root",
+        "bootstrap-not-symlink",
+        "/usr/bin/test ! -L $bootstrap_root",
+        "bootstrap-create",
+        "/usr/bin/mkdir --mode=0700 -- $bootstrap_root",
+        "bootstrap-root-readlink",
+        "bootstrap-root-stat",
+        "bootstrap-install-stager",
+        "/usr/bin/install --owner=root --group=root --mode=0700 --no-target-directory --",
+        "bootstrap-stager-readlink",
+        "bootstrap-stager-sha",
+        "bootstrap-stager-stat",
+        'set assertion exact:root:root:700:1:regular\\ file',
         "/usr/bin/test -d /usr/src/linux-headers-7.0.0-28-generic",
     )
     for literal in required_transport:
@@ -150,6 +183,25 @@ def main() -> None:
         fail("transport places the password in child argv")
     if "lrange $argv 2 end" in transport or "--remote-argv" in transport:
         fail("transport accepts a caller-supplied remote argv")
+    if re.search(
+        r'/bin/bash\s+-p\s+"?\$\{package\}/prepare-stage-root\.sh', transport
+    ):
+        fail("transport executes the user-writable package stager")
+    bootstrap_order = (
+        "bootstrap-absent",
+        "bootstrap-not-symlink",
+        "bootstrap-create",
+        "bootstrap-root-readlink",
+        "bootstrap-root-stat",
+        "bootstrap-install-stager",
+        "bootstrap-stager-readlink",
+        "bootstrap-stager-sha",
+        "bootstrap-stager-stat",
+        "stage-plan - stage-run",
+    )
+    positions = [transport.index(item) for item in bootstrap_order]
+    if positions != sorted(positions):
+        fail("root-owned bootstrap operation order changed")
 
     required_stager = (
         "root-required",
@@ -163,6 +215,12 @@ def main() -> None:
         "status --porcelain=v1 --untracked-files=all",
         "noclobber",
         "retained=1",
+        'readonly BOOTSTRAP_ROOT="/run/wg-mix-ebpf-source-bootstrap-${RUN_ID}"',
+        'readonly EXPECTED_SELF="${BOOTSTRAP_ROOT}/prepare-stage-root.sh"',
+        "require_root_owned_self",
+        "root:root:700:1:regular file",
+        'canonical_self="$(/usr/bin/readlink -e -- "$0")"',
+        '[[ "$(sha256_file "${EXPECTED_SELF}")" == "${PREPARE_SHA256}" ]]',
     )
     for literal in required_stager:
         if literal not in stager:

@@ -21,6 +21,9 @@ WG_INTERFACE=''
 WG_LOCAL_ADDRESS=''
 WG_PEER_ADDRESS=''
 OUTPUT_DIR=''
+HISTORY_COMMIT_COUNT=''
+HISTORY_ROOTS_SHA256=''
+HISTORY_OBJECTS_SHA256=''
 
 fail() {
   printf 'B82_V6_BIND_STOP reason=%s rc=%s; retained=1\n' "$1" "${2:-125}" >&2
@@ -151,6 +154,12 @@ require_repository_contract() {
   git_checked cat-file -e "${COMMIT}^{commit}" || return 67
 }
 
+require_full_repository() {
+  local shallow_state
+  shallow_state="$(git_checked rev-parse --is-shallow-repository)" || return 66
+  [[ "${shallow_state}" == 'false' ]] || return 76
+}
+
 readonly -a PACKAGE_PATHS=(
   "${REPOSITORY_PATH_FROM_ROOT}/root-matrix-n-r.sh"
   "${REPOSITORY_PATH_FROM_ROOT}/check-realhost-iperf.py"
@@ -217,12 +226,67 @@ plan_binding() {
     "${WG_STATE}" "${WG_INTERFACE}" "${WG_LOCAL_ADDRESS}" "${WG_PEER_ADDRESS}"
   printf 'bundle_argv=/usr/bin/git bundle create %s %s\n' \
     "${OUTPUT_DIR}/source-${PACKAGE_ID}.bundle" "${SOURCE_REF}"
+  printf 'repository_shallow=false history_verification=isolated-unbundle-rev-list-fsck-v1\n'
   printf 'no_files_created=1 credential_read=0 network_operations=0\n'
 }
 
 manifest_line() {
   [[ "$1" != *$'\t'* && "$1" != *$'\n'* && "$2" != *$'\t'* && "$2" != *$'\n'* && -n "$2" ]] || return 65
   printf '%s\t%s\n' "$1" "$2"
+}
+
+git_history() {
+  local history_repository="$1"
+  shift
+  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 \
+    /usr/bin/git --no-pager --no-replace-objects \
+    -c core.attributesFile=/dev/null -c core.fsmonitor=false \
+    -c core.hooksPath=/dev/null -C "${history_repository}" "$@"
+}
+
+verify_bundle_history() {
+  local bundle="$1" history_repository history_objects history_roots
+  local source_count isolated_count source_roots missing_rc
+  history_repository="${OUTPUT_DIR}/history-verification.git"
+  history_objects="${OUTPUT_DIR}/history-objects.v1"
+  history_roots="${OUTPUT_DIR}/history-roots.v1"
+  [[ ! -e "${history_repository}" && ! -L "${history_repository}" &&
+    ! -e "${history_objects}" && ! -L "${history_objects}" &&
+    ! -e "${history_roots}" && ! -L "${history_roots}" ]] || return 73
+  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 \
+    /usr/bin/git --no-pager --no-replace-objects \
+    -c core.attributesFile=/dev/null -c core.fsmonitor=false \
+    -c core.hooksPath=/dev/null init --bare -- "${history_repository}" || return 74
+  git_history "${history_repository}" bundle unbundle "${bundle}" || return 74
+  git_history "${history_repository}" update-ref refs/heads/history-verified "${COMMIT}" || return 74
+  git_history "${history_repository}" cat-file -e "${COMMIT}^{commit}" || return 74
+  (set -o noclobber
+    git_history "${history_repository}" rev-list --parents --objects --missing=print \
+      "${COMMIT}" >"${history_objects}") || return 74
+  /usr/bin/grep -E '^\?' -- "${history_objects}"
+  missing_rc=$?
+  case "${missing_rc}" in
+    1) ;;
+    0) return 76 ;;
+    *) return 74 ;;
+  esac
+  (set -o noclobber
+    git_history "${history_repository}" rev-list --max-parents=0 --reverse \
+      "${COMMIT}" >"${history_roots}") || return 74
+  source_count="$(git_checked rev-list --count "${COMMIT}")" || return 74
+  isolated_count="$(git_history "${history_repository}" rev-list --count "${COMMIT}")" || return 74
+  [[ "${source_count}" =~ ^[1-9][0-9]*$ && "${isolated_count}" == "${source_count}" ]] || return 76
+  source_roots="$(git_checked rev-list --max-parents=0 --reverse "${COMMIT}")" || return 74
+  [[ "$(<"${history_roots}")" == "${source_roots}" && -n "${source_roots}" ]] || return 76
+  git_history "${history_repository}" fsck --full --strict --no-dangling "${COMMIT}" || return 76
+  HISTORY_COMMIT_COUNT="${isolated_count}"
+  HISTORY_ROOTS_SHA256="$(sha256_file "${history_roots}")" || return 74
+  HISTORY_OBJECTS_SHA256="$(sha256_file "${history_objects}")" || return 74
+  valid_sha256 "${HISTORY_ROOTS_SHA256}" && valid_sha256 "${HISTORY_OBJECTS_SHA256}"
 }
 
 bind_package() {
@@ -235,12 +299,14 @@ bind_package() {
   bundle="${OUTPUT_DIR}/source-${PACKAGE_ID}.bundle"
   manifest="${OUTPUT_DIR}/package-manifest.v1"
 
+  require_full_repository || fail 'repository-became-shallow' $?
   git_checked bundle create "${bundle}" "${SOURCE_REF}" || fail 'bundle-create' 74
   bundle_head="$(git_checked bundle list-heads "${bundle}" "${SOURCE_REF}")" || fail 'bundle-head' 74
   [[ "${bundle_head}" == "${COMMIT} ${SOURCE_REF}" ]] || fail 'bundle-head-mismatch' 74
   git_checked bundle verify "${bundle}" || fail 'bundle-verify' 74
   source_ref_after="$(git_checked rev-parse --verify "${SOURCE_REF}^{commit}")" || fail 'source-ref-after' 74
   [[ "${source_ref_after}" == "${COMMIT}" ]] || fail 'source-ref-drift' 75
+  verify_bundle_history "${bundle}" || fail 'bundle-history-connectivity' $?
 
   for path in "${TRANSFER_PATHS[@]}"; do
     name="${path##*/}"
@@ -260,6 +326,10 @@ bind_package() {
       manifest_line integration_commit "${COMMIT}"
       manifest_line bundle_name "source-${PACKAGE_ID}.bundle"
       manifest_line bundle_sha256 "$(sha256_file "${bundle}")"
+      manifest_line history_verification isolated-unbundle-rev-list-fsck-v1
+      manifest_line history_commit_count "${HISTORY_COMMIT_COUNT}"
+      manifest_line history_roots_sha256 "${HISTORY_ROOTS_SHA256}"
+      manifest_line history_objects_sha256 "${HISTORY_OBJECTS_SHA256}"
       manifest_line wg_state "${WG_STATE}"
       manifest_line wg_interface "${WG_INTERFACE}"
       manifest_line wg_local_address "${WG_LOCAL_ADDRESS}"
@@ -295,6 +365,7 @@ bind_package() {
 main() {
   parse_arguments "$@" || fail 'arguments' $?
   require_repository_contract || fail 'repository-contract' $?
+  require_full_repository || fail 'repository-shallow' $?
   require_committed_identity || fail 'committed-identity' $?
   if [[ "${MODE}" == 'plan' ]]; then
     plan_binding

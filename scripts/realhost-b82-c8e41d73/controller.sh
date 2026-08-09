@@ -21,6 +21,10 @@ INTEGRATION_REF=''
 INTEGRATION_COMMIT=''
 BUNDLE_NAME=''
 BUNDLE_SHA256=''
+HISTORY_VERIFICATION=''
+HISTORY_COMMIT_COUNT=''
+HISTORY_ROOTS_SHA256=''
+HISTORY_OBJECTS_SHA256=''
 WG_STATE=''
 WG_INTERFACE=''
 WG_LOCAL_ADDRESS=''
@@ -85,6 +89,20 @@ sha256_file() {
     line="$(/usr/bin/shasum -a 256 -- "${path}")" || return $?
   elif [[ -x /usr/bin/sha256sum ]]; then
     line="$(/usr/bin/sha256sum -- "${path}")" || return $?
+  else
+    return 69
+  fi
+  line="${line%% *}"
+  [[ "${line}" =~ ^[0-9a-f]{64}$ ]] || return 65
+  printf '%s\n' "${line}"
+}
+
+sha256_stream() {
+  local line
+  if [[ -x /usr/bin/shasum ]]; then
+    line="$(/usr/bin/shasum -a 256)" || return $?
+  elif [[ -x /usr/bin/sha256sum ]]; then
+    line="$(/usr/bin/sha256sum)" || return $?
   else
     return 69
   fi
@@ -168,6 +186,10 @@ load_manifest() {
     read_manifest_field integration_commit INTEGRATION_COMMIT &&
     read_manifest_field bundle_name BUNDLE_NAME &&
     read_manifest_field bundle_sha256 BUNDLE_SHA256 &&
+    read_manifest_field history_verification HISTORY_VERIFICATION &&
+    read_manifest_field history_commit_count HISTORY_COMMIT_COUNT &&
+    read_manifest_field history_roots_sha256 HISTORY_ROOTS_SHA256 &&
+    read_manifest_field history_objects_sha256 HISTORY_OBJECTS_SHA256 &&
     read_manifest_field wg_state WG_STATE &&
     read_manifest_field wg_interface WG_INTERFACE &&
     read_manifest_field wg_local_address WG_LOCAL_ADDRESS &&
@@ -229,6 +251,45 @@ git_checked() {
     -c core.hooksPath=/dev/null -C "${LOCAL_REPOSITORY}" "$@"
 }
 
+git_history() {
+  local history_repository="$1"
+  shift
+  /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+    GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+    GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 \
+    /usr/bin/git --no-pager --no-replace-objects \
+    -c core.attributesFile=/dev/null -c core.fsmonitor=false \
+    -c core.hooksPath=/dev/null -C "${history_repository}" "$@"
+}
+
+verify_bound_history() {
+  local history_repository="${LOCAL_PACKAGE_DIR}/history-verification.git"
+  local history_objects="${LOCAL_PACKAGE_DIR}/history-objects.v1"
+  local history_roots="${LOCAL_PACKAGE_DIR}/history-roots.v1"
+  local isolated_count missing_rc actual_roots
+  [[ -d "${history_repository}" && ! -L "${history_repository}" &&
+    -f "${history_objects}" && ! -L "${history_objects}" &&
+    -f "${history_roots}" && ! -L "${history_roots}" ]] || return 66
+  [[ "$(sha256_file "${history_objects}")" == "${HISTORY_OBJECTS_SHA256}" &&
+    "$(sha256_file "${history_roots}")" == "${HISTORY_ROOTS_SHA256}" ]] || return 67
+  /usr/bin/grep -E '^\?' -- "${history_objects}"
+  missing_rc=$?
+  case "${missing_rc}" in
+    1) ;;
+    0) return 76 ;;
+    *) return 67 ;;
+  esac
+  git_history "${history_repository}" cat-file -e "${INTEGRATION_COMMIT}^{commit}" || return 76
+  git_history "${history_repository}" fsck --full --strict --no-dangling "${INTEGRATION_COMMIT}" || return 76
+  isolated_count="$(git_history "${history_repository}" rev-list --count "${INTEGRATION_COMMIT}")" || return 76
+  [[ "${isolated_count}" == "${HISTORY_COMMIT_COUNT}" ]] || return 76
+  actual_roots="$(git_history "${history_repository}" rev-list --max-parents=0 --reverse \
+    "${INTEGRATION_COMMIT}")" || return 76
+  [[ "$(<"${history_roots}")" == "${actual_roots}" && -n "${actual_roots}" ]] || return 76
+  [[ "$(git_history "${history_repository}" rev-list --parents --objects --missing=print \
+    "${INTEGRATION_COMMIT}" | sha256_stream)" == "${HISTORY_OBJECTS_SHA256}" ]] || return 76
+}
+
 verify_identity() {
   local path="$1" blob="$2" sha="$3" actual_blob actual_sha mapped_blob
   [[ "${path}" =~ ^scripts/realhost-b82-c8e41d73/[A-Za-z0-9_.-]+$ &&
@@ -242,7 +303,7 @@ verify_identity() {
 }
 
 verify_manifest_contract() {
-  local canonical_repository canonical_package canonical_manifest actual_commit bundle_head name sha
+  local canonical_repository canonical_package canonical_manifest actual_commit bundle_head name sha shallow_state
   [[ -f "${MANIFEST}" && ! -L "${MANIFEST}" ]] || return 66
   [[ "$(sha256_file "${MANIFEST}")" == "${MANIFEST_SHA256}" ]] || return 67
   load_manifest || return $?
@@ -251,6 +312,8 @@ verify_manifest_contract() {
     "${INTEGRATION_REF}" =~ ^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$ &&
     "${INTEGRATION_REF}" != *'..'* && "${INTEGRATION_REF}" != *'//'* &&
     "${BUNDLE_NAME}" == "source-${PACKAGE_ID}.bundle" &&
+    "${HISTORY_VERIFICATION}" == 'isolated-unbundle-rev-list-fsck-v1' &&
+    "${HISTORY_COMMIT_COUNT}" =~ ^[1-9][0-9]*$ &&
     "${REMOTE_PACKAGE_DIR}" == "/home/siyixuan/wg-mix-ebpf-test/unpriv-${PACKAGE_ID}" &&
     "${REMOTE_SOURCE}" == "/run/wg-mix-ebpf-source-stages/${RUN_ID}/source" &&
     "${TARGET_USER}" == 'siyixuan' && "${TARGET_HOST}" == '192.168.10.82' &&
@@ -273,6 +336,7 @@ verify_manifest_contract() {
     *) return 65 ;;
   esac
   valid_sha256 "${BUNDLE_SHA256}" || return 65
+  valid_sha256 "${HISTORY_ROOTS_SHA256}" && valid_sha256 "${HISTORY_OBJECTS_SHA256}" || return 65
   canonical_repository="$(CDPATH= cd -- "${LOCAL_REPOSITORY}" && pwd -P)" || return 66
   canonical_package="$(CDPATH= cd -- "${LOCAL_PACKAGE_DIR}" && pwd -P)" || return 66
   canonical_manifest="${canonical_package}/package-manifest.v1"
@@ -282,6 +346,8 @@ verify_manifest_contract() {
     "${LOCAL_PACKAGE_DIR}" == "${EXPECTED_OUTPUT_PREFIX}${INTEGRATION_COMMIT:0:12}" ]] || return 65
   actual_commit="$(git_checked rev-parse --verify "${INTEGRATION_REF}^{commit}")" || return 67
   [[ "${actual_commit}" == "${INTEGRATION_COMMIT}" ]] || return 67
+  shallow_state="$(git_checked rev-parse --is-shallow-repository)" || return 67
+  [[ "${shallow_state}" == 'false' ]] || return 76
 
   verify_identity "${BIND_FINAL_PACKAGE_SH_PATH}" "${BIND_FINAL_PACKAGE_SH_BLOB}" "${BIND_FINAL_PACKAGE_SH_SHA256}" &&
     verify_identity "${CONTROLLER_SH_PATH}" "${CONTROLLER_SH_BLOB}" "${CONTROLLER_SH_SHA256}" &&
@@ -311,6 +377,7 @@ verify_manifest_contract() {
   git_checked bundle verify "${LOCAL_PACKAGE_DIR}/${BUNDLE_NAME}" || return 67
   bundle_head="$(git_checked bundle list-heads "${LOCAL_PACKAGE_DIR}/${BUNDLE_NAME}" "${INTEGRATION_REF}")" || return 67
   [[ "${bundle_head}" == "${INTEGRATION_COMMIT} ${INTEGRATION_REF}" ]] || return 67
+  verify_bound_history || return $?
 }
 
 transport() {
@@ -346,6 +413,11 @@ readonly -a PACKAGE_NAMES=(
   source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh controller.sh prepare-stage-root.sh
   root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh test_matrix_static.py
 )
+readonly -a BOOTSTRAP_OPERATIONS=(
+  bootstrap-absent bootstrap-not-symlink bootstrap-create bootstrap-root-readlink bootstrap-root-stat
+  bootstrap-install-stager
+  bootstrap-stager-readlink bootstrap-stager-sha bootstrap-stager-stat
+)
 
 plan_all() {
   local operation name
@@ -357,7 +429,7 @@ plan_all() {
     run_operation plan "verify-sha-${name}" || return $?
     run_operation plan "verify-stat-${name}" || return $?
   done
-  for operation in controller-shellcheck hermetic-matrix stage-plan stage-run; do
+  for operation in controller-shellcheck hermetic-matrix "${BOOTSTRAP_OPERATIONS[@]}" stage-plan stage-run; do
     run_operation plan "${operation}" || return $?
   done
   if [[ "${WG_STATE}" == 'absent' ]]; then
@@ -395,7 +467,7 @@ execute_prepare() {
     run_operation execute "verify-sha-${name}" || return $?
     run_operation execute "verify-stat-${name}" || return $?
   done
-  for operation in controller-shellcheck hermetic-matrix stage-plan stage-run; do
+  for operation in controller-shellcheck hermetic-matrix "${BOOTSTRAP_OPERATIONS[@]}" stage-plan stage-run; do
     run_operation execute "${operation}" || return $?
   done
 }

@@ -16,8 +16,10 @@ The executable local gates are `test-hermetic-matrix.sh` and
 `test-hermetic-controller.sh`. The latter builds a fresh fixture Git history
 and bundle under `/private/tmp`, binds both present and absent WireGuard
 manifests, invokes the actual Expect policy in plan mode, and exercises failure
-paths. It retains its unique fixture tree rather than performing automatic
-cleanup.
+paths. It also creates a multi-commit shallow clone that both binder modes must
+reject, unbundles the accepted bundle into an isolated bare repository, and
+models the bootstrap first-run/pre-existing states. It retains its unique
+fixture tree rather than performing automatic cleanup.
 
 The following values intentionally remain unbound until the final integration
 commit is selected and reviewed:
@@ -36,6 +38,12 @@ closed when they are absent or malformed. `bind-final-package.sh` never uses
 equality before and after bundle creation, and records Git blob and SHA-256
 identities for every privileged or transport-relevant script. The generated
 bundle contains the selected ref's history rather than a source-only archive.
+Both `plan` and `bind` require `rev-parse --is-shallow-repository` to be exactly
+`false`. After bundle creation, `bind` unbundles it into a fresh isolated bare
+repository, traverses all parents/trees/blobs with `rev-list
+--parents --objects --missing=print`, compares full commit counts and root
+commits, and runs strict full `git fsck`. The manifest binds the traversal and
+root evidence SHA-256 values and commit count.
 
 A later main-Agent binding step must select and review those exact values. This
 controller commit must not be interpreted as authorization to read credentials,
@@ -76,13 +84,16 @@ Files added by this framework:
   only the exact two-line credential file in memory, never places the password
   in argv or logs, and redacts it from child output.
 * `controller.sh`: verifies the manifest, bundle, Git blobs, local file hashes,
-  and controller/transport identity before rendering or executing an operation.
+  isolated history evidence, and controller/transport identity before rendering
+  or executing an operation.
   It has separate `preflight`, `prepare`, `matrix-plan`, `run`, and explicit
   `restore` modes and stops on the first failure without cleanup.
 * `prepare-stage-root.sh`: the versioned high-privilege preparation content. It
-  verifies host/package identity and hashes, creates only the fixed run-owned
-  source stage when absent, clones the bound bundle, checks out the exact
-  commit, runs Bash/ShellCheck gates, and writes a noclobber binding marker.
+  verifies host/package identity and hashes plus its own canonical path,
+  root:root ownership, mode 0700, link count, regular-file type, and manifest
+  SHA-256. It creates only the fixed run-owned source stage when absent, clones
+  the bound bundle, checks out the exact commit, runs Bash/ShellCheck gates, and
+  writes a noclobber binding marker.
   It has no inline SSH body, recursive deletion, trap, package installation,
   container, mount, chroot, or namespace operation.
 
@@ -91,6 +102,25 @@ or presence checks for Go, clang/LLVM, bpftool, make, GCC, iperf3, ShellCheck,
 jq, WireGuard tools, ethtool, tc/iproute2, kernel BTF, bpffs, and the exact
 kernel header directory. Missing tools stop the flow; any future installation
 must be a separately versioned and reviewed phase.
+
+The transferred package copy of `prepare-stage-root.sh` is data only. Before
+any privileged script execution, the fixed transport operation chain is:
+
+1. As root, require `/run/wg-mix-ebpf-source-bootstrap-c8e41d73` to be absent
+   and not a symlink, including a dangling symlink.
+2. Create that exact directory once with mode 0700, without `-p`, then verify
+   its canonical path and exact root:root mode/type.
+3. Install the package stager to the exact root-owned path
+   `/run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh` with mode
+   0700 with `--no-target-directory`.
+4. Revalidate the installed path, SHA-256, root:root ownership, mode, link
+   count, and type in separate fixed argv operations.
+5. Execute both stage `plan` and `run` only from that installed path. The script
+   repeats its own identity checks on every root invocation.
+
+An existing bootstrap path, install/hash/stat mismatch, or any interrupted step
+stops the controller and retains the exact resources. No automatic cleanup or
+fallback to the user-writable package script is allowed.
 
 The final binder argv remains unbound and must be supplied in this exact shape:
 
@@ -186,6 +216,33 @@ all-interface and secret-bearing WireGuard commands.
 Write set and failure policy
 ----------------------------
 
+If a later reviewed controller invokes `prepare`, its complete remote write set
+before the matrix is limited to:
+
+* the new user-owned mode-0700 directory
+  `/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61` and its nine fixed SCP
+  destinations;
+* the new root-owned mode-0700 directory
+  `/run/wg-mix-ebpf-source-bootstrap-c8e41d73` and its single installed
+  `prepare-stage-root.sh` file;
+* if absent, the root-owned mode-0700 parent
+  `/run/wg-mix-ebpf-source-stages`;
+* the new root-owned mode-0700 stage
+  `/run/wg-mix-ebpf-source-stages/c8e41d73`, its `source` Git checkout, and its
+  single noclobber `binding.v1` marker.
+
+The two bootstrap write argv are exactly:
+
+    /usr/bin/sudo -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+      /usr/bin/mkdir --mode=0700 -- /run/wg-mix-ebpf-source-bootstrap-c8e41d73
+    /usr/bin/sudo -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+      /usr/bin/install --owner=root --group=root --mode=0700 --no-target-directory -- \
+      /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/prepare-stage-root.sh \
+      /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh
+
+They are preceded by exact root absence and non-symlink checks and followed by exact
+readlink/SHA/stat checks. There is no shared bootstrap parent and no `mkdir -p`.
+
 If a later reviewed controller invokes `run`, its write set is limited to:
 
 * `/run/wg-mix-ebpf-source-stages/c8e41d73/realhost-v6-6bd913ac`;
@@ -233,7 +290,8 @@ It must report both:
     static real-host safety and checker fixtures: PASS
     hermetic matrix argv and failure-path tests: PASS
     static v6 binder/controller/transport/stager safety contract: PASS
-    hermetic v6 binder, SSH/SCP/Expect plan, failure paths and WireGuard absence: PASS
+    hermetic v6 full-history binder, root-owned bootstrap, SSH/SCP/Expect plan,
+    shallow/failure paths and WireGuard absence: PASS
 
 ShellCheck is mandatory on .82 before any later sudo phase; its absence on the
 local macOS host is an explicit skip, not a remote pass. The old v5 package must

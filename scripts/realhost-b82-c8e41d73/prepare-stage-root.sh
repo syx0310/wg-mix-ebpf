@@ -6,6 +6,8 @@ umask 077
 readonly RUN_ID='c8e41d73'
 readonly PACKAGE_ID='4f2a9b61'
 readonly EXPECTED_REMOTE_PACKAGE="/home/siyixuan/wg-mix-ebpf-test/unpriv-${PACKAGE_ID}"
+readonly BOOTSTRAP_ROOT="/run/wg-mix-ebpf-source-bootstrap-${RUN_ID}"
+readonly EXPECTED_SELF="${BOOTSTRAP_ROOT}/prepare-stage-root.sh"
 readonly STAGES_ROOT='/run/wg-mix-ebpf-source-stages'
 readonly STAGE_ROOT="${STAGES_ROOT}/${RUN_ID}"
 readonly EXPECTED_SOURCE="${STAGE_ROOT}/source"
@@ -114,6 +116,10 @@ load_manifest() {
     read_manifest_field integration_commit INTEGRATION_COMMIT &&
     read_manifest_field bundle_name BUNDLE_NAME &&
     read_manifest_field bundle_sha256 BUNDLE_SHA256 &&
+    read_manifest_field history_verification IGNORED &&
+    read_manifest_field history_commit_count IGNORED &&
+    read_manifest_field history_roots_sha256 IGNORED &&
+    read_manifest_field history_objects_sha256 IGNORED &&
     read_manifest_field wg_state WG_STATE &&
     read_manifest_field wg_interface WG_INTERFACE &&
     read_manifest_field wg_local_address WG_LOCAL_ADDRESS &&
@@ -275,6 +281,21 @@ verify_host() {
   [[ "$(/usr/bin/cat /etc/machine-id)" == "${EXPECTED_MACHINE_ID}" ]] || return 78
 }
 
+require_plan_self() {
+  [[ "$0" == /* && -f "$0" && ! -L "$0" ]] || return 66
+  [[ "$(sha256_file "$0")" == "${PREPARE_SHA256}" ]] || return 67
+}
+
+require_root_owned_self() {
+  local canonical_self self_shape
+  [[ "$(/usr/bin/id -u)" == '0' ]] || return 77
+  canonical_self="$(/usr/bin/readlink -e -- "$0")" || return 78
+  [[ "${canonical_self}" == "${EXPECTED_SELF}" && -f "${EXPECTED_SELF}" && ! -L "${EXPECTED_SELF}" ]] || return 78
+  self_shape="$(/usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${EXPECTED_SELF}")" || return 78
+  [[ "${self_shape}" == 'root:root:700:1:regular file' ]] || return 78
+  [[ "$(sha256_file "${EXPECTED_SELF}")" == "${PREPARE_SHA256}" ]] || return 78
+}
+
 write_binding_marker() {
   (set -o noclobber
     printf '%s\n' \
@@ -289,6 +310,7 @@ run_stage() {
   local bundle="${EXPECTED_REMOTE_PACKAGE}/${BUNDLE_NAME}" branch="${INTEGRATION_REF#refs/heads/}"
   local parent_shape stage_head stage_status
   [[ "$(/usr/bin/id -u)" == '0' ]] || fail 'root-required' 77
+  require_root_owned_self || fail 'root-owned-self' $?
   [[ "${MANIFEST}" == "${EXPECTED_REMOTE_PACKAGE}/package-manifest.v1" ]] || fail 'remote-manifest-path' 65
   verify_host || fail 'host-identity' $?
   require_package_file package-manifest.v1 "${MANIFEST_SHA256}" || fail 'manifest-file' $?
@@ -340,6 +362,11 @@ main() {
   parse_arguments "$@" || fail 'arguments' $?
   validate_manifest || fail 'manifest-contract' $?
   if [[ "${MODE}" == 'plan' ]]; then
+    if [[ "$(/usr/bin/id -u)" == '0' ]]; then
+      require_root_owned_self || fail 'root-owned-self' $?
+    else
+      require_plan_self || fail 'plan-self' $?
+    fi
     render_plan
   else
     run_stage
