@@ -47,20 +47,21 @@ class FixtureRunner(MODULE.CommandRunner):
 
 
 class FakeRunningProcess:
-    def __init__(self):
+    def __init__(self, stdout=b"60 packets transmitted, 60 received, 0% packet loss\n"):
         self.terminated = False
         self.waited = False
         self.pid = 10001
         self.pgid = 10001
         self.proven_absent = False
         self.convergence_attempted = False
+        self.stdout = stdout
 
     def wait(self, timeout):
         del timeout
         self.waited = True
         rc = -15 if self.terminated else 0
         self.proven_absent = True
-        return rc, b"60 packets transmitted, 60 received, 0% packet loss\n", b""
+        return rc, self.stdout, b""
 
     def converge(self, *, term_timeout=5.0, kill_timeout=5.0):
         del term_timeout, kill_timeout
@@ -70,7 +71,7 @@ class FakeRunningProcess:
         self.proven_absent = True
         return (
             -15,
-            b"60 packets transmitted, 60 received, 0% packet loss\n",
+            self.stdout,
             b"",
             {
                 "pid": self.pid,
@@ -193,17 +194,35 @@ class SimulatedRunner(FixtureRunner):
                 return 1, b'{"error":"injected failure"}\n', b""
             return 0, self.iperf_output(argv), b""
         if argv[:3] == [MODULE.TOOLS["python3"], "-I", MODULE.iperf_checker_path()]:
-            options = dict(zip(argv[5::2], argv[6::2]))
-            args = types.SimpleNamespace(
-                path=pathlib.Path(argv[4]),
-                direction=options["--direction"],
-                streams=int(options["--streams"]),
-                minimum_bytes=int(options["--minimum-bytes"]),
-                minimum_fairness=float(options["--minimum-fairness"]),
-                maximum_retransmit_rate=float(options["--maximum-retransmit-rate"]),
-            )
             try:
-                output = CHECKER_MODULE.check_one(args)
+                if argv[3] == "one":
+                    options = dict(zip(argv[5::2], argv[6::2]))
+                    args = types.SimpleNamespace(
+                        path=pathlib.Path(argv[4]),
+                        direction=options["--direction"],
+                        streams=int(options["--streams"]),
+                        minimum_bytes=int(options["--minimum-bytes"]),
+                        minimum_fairness=float(options["--minimum-fairness"]),
+                        maximum_retransmit_rate=float(options["--maximum-retransmit-rate"]),
+                    )
+                    output = CHECKER_MODULE.check_one(args)
+                else:
+                    options_start = argv.index("--expected-windows")
+                    options = dict(zip(argv[options_start::2], argv[options_start + 1 :: 2]))
+                    args = types.SimpleNamespace(
+                        paths=[pathlib.Path(value) for value in argv[4:options_start]],
+                        expected_windows=int(options["--expected-windows"]),
+                        streams=int(options["--streams"]),
+                        minimum_fairness=float(options["--minimum-fairness"]),
+                        maximum_window_retransmit_rate=float(
+                            options["--maximum-window-retransmit-rate"]
+                        ),
+                        maximum_overall_retransmit_rate=float(
+                            options["--maximum-overall-retransmit-rate"]
+                        ),
+                        minimum_throughput_ratio=float(options["--minimum-throughput-ratio"]),
+                    )
+                    output = CHECKER_MODULE.check_soak(args)
             except CHECKER_MODULE.CheckError as exc:
                 return 1, b"", f"FAIL: {exc}\n".encode()
             return 0, MODULE.canonical_json(output), b""
@@ -219,7 +238,12 @@ class SimulatedRunner(FixtureRunner):
 
     def start(self, argv):
         self.started.append(list(argv))
+        if MODULE.TOOLS["iperf3"] in argv:
+            return FakeRunningProcess(stdout=self.iperf_output(argv))
         return FakeRunningProcess()
+
+    def wait_until(self, deadline):
+        del deadline
 
 
 def fixture_spec(**changes):
@@ -242,6 +266,7 @@ def fixture_spec(**changes):
         expected_boot_id="12345678-1234-4234-9234-1234567890ab",
         peer_address=MODULE.READ_ONLY_PEER,
         peer_port=5201,
+        profile="smoke",
         traffic_seconds=5,
         soak_seconds=60,
         soak_window_seconds=10,
@@ -532,6 +557,33 @@ class StrictIperfOracleTests(unittest.TestCase):
             self.assertTrue(all(group["streams"] == 4 for group in groups))
 
 
+class CounterGateTests(unittest.TestCase):
+    def test_counter_gate_rejects_error_drop_checksum_growth_and_resets(self):
+        baseline = {
+            "/usr/sbin/ethtool:rx_errors": 0,
+            "/usr/sbin/ethtool:checksum_error": 7,
+            "/usr/sbin/ip:rx_dropped": 2,
+            "/usr/sbin/ip:rx_bytes": 100,
+        }
+        self.assertEqual(
+            MODULE.counter_delta(baseline, {**baseline, "/usr/sbin/ip:rx_bytes": 200})[
+                "/usr/sbin/ip:rx_bytes"
+            ],
+            100,
+        )
+        for key in (
+            "/usr/sbin/ethtool:rx_errors",
+            "/usr/sbin/ethtool:checksum_error",
+            "/usr/sbin/ip:rx_dropped",
+        ):
+            with self.subTest(key=key), self.assertRaisesRegex(MODULE.HarnessError, "counters grew"):
+                MODULE.counter_delta(baseline, {**baseline, key: baseline[key] + 1})
+        with self.assertRaisesRegex(MODULE.HarnessError, "decreased"):
+            MODULE.counter_delta(baseline, {**baseline, "/usr/sbin/ip:rx_bytes": 99})
+        with self.assertRaisesRegex(MODULE.HarnessError, "schema changed"):
+            MODULE.counter_delta(baseline, {key: value for key, value in baseline.items() if key != "/usr/sbin/ip:rx_bytes"})
+
+
 class PlannerTests(unittest.TestCase):
     def test_plan_is_deterministic_and_read_only(self):
         spec = fixture_spec()
@@ -600,6 +652,26 @@ class PlannerTests(unittest.TestCase):
             [entry["argv"] for entry in lease["guard_before_each_network_write"]],
             [argv for _, argv in MODULE.write_guard_command_table(spec)],
         )
+
+    def test_acceptance_profile_locks_formal_durations_and_soak_gates(self):
+        spec = fixture_spec(
+            profile="acceptance",
+            traffic_seconds=30,
+            soak_seconds=3600,
+            soak_window_seconds=300,
+        )
+        runner = FixtureRunner(spec)
+        snapshot, commands = MODULE.collect_snapshot(spec, runner)
+        plan = MODULE.build_plan(spec, snapshot, commands)
+        soak = next(cell for cell in plan["cells"] if cell["kind"] == "tcp-soak")
+        self.assertEqual(plan["execution_profile"], "acceptance")
+        self.assertEqual(len(soak["traffic"]) - 1, 12)
+        self.assertEqual(soak["counter_sample_schedule"]["expected_samples"], 360)
+        self.assertEqual(soak["counter_sample_schedule"]["interval_seconds"], 10)
+        self.assertIsNotNone(soak["soak_oracle"])
+        self.assertIn("--minimum-throughput-ratio", soak["soak_oracle"]["argv"])
+        with self.assertRaisesRegex(MODULE.HarnessError, "acceptance profile requires exact"):
+            fixture_spec(profile="acceptance")
 
     def test_recovery_evidence_is_append_only_journal_not_fixed_output_files(self):
         spec = fixture_spec()
@@ -692,10 +764,11 @@ class PlannerTests(unittest.TestCase):
 
 
 class HermeticStateMachineTests(unittest.TestCase):
-    def prepare(self, temporary, *, fail_iperf_call=None):
+    def prepare(self, temporary, *, fail_iperf_call=None, spec_changes=None):
         prefix = f"{temporary}/run-"
+        changes = {"run_root": f"{prefix}a1b2c3d4", **(spec_changes or {})}
         with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix):
-            spec = fixture_spec(run_root=f"{prefix}a1b2c3d4")
+            spec = fixture_spec(**changes)
             runner = SimulatedRunner(spec, fail_iperf_call=fail_iperf_call)
             snapshot, commands = MODULE.collect_snapshot(spec, runner)
             plan_payload = MODULE.canonical_json(MODULE.build_plan(spec, snapshot, commands))
@@ -727,7 +800,8 @@ class HermeticStateMachineTests(unittest.TestCase):
             self.assertEqual(runner.features, {name: entry["enabled"] for name, entry in baseline.items()})
             outcome = json.loads(pathlib.Path(spec.run_root, "results.json").read_bytes())
             self.assertEqual(outcome["overall"], "incomplete")
-            self.assertEqual(outcome["classification_counts"]["passed"], 8)
+            self.assertEqual(outcome["profile"], "smoke")
+            self.assertEqual(outcome["classification_counts"]["smoke-passed"], 8)
             self.assertEqual(outcome["classification_counts"]["not-covered"], 6)
             events = [json.loads(line) for line in pathlib.Path(spec.run_root, "journal.jsonl").read_bytes().splitlines()]
             self.assertEqual(events[-2]["event"], "COMPLETE")
@@ -744,6 +818,38 @@ class HermeticStateMachineTests(unittest.TestCase):
                 sum(event["event"] == "NETWORK_WRITE_GUARD_VERIFIED" for event in events),
                 runner.network_writes,
             )
+            samples = json.loads(
+                pathlib.Path(spec.run_root, "tcp-soak-all-on.counter-samples.json").read_bytes()
+            )
+            self.assertEqual(samples["expected_samples"], 6)
+            self.assertEqual(len(samples["samples"]), 6)
+
+    def test_acceptance_profile_executes_360_samples_and_first_hour_oracle(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, digest = self.prepare(
+                temporary,
+                spec_changes={
+                    "profile": "acceptance",
+                    "traffic_seconds": 30,
+                    "soak_seconds": 3600,
+                    "soak_window_seconds": 300,
+                },
+            )
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                self.assertEqual(MODULE.run_mode(spec, plan_path, digest, runner), 3)
+            samples = json.loads(
+                pathlib.Path(spec.run_root, "tcp-soak-all-on.counter-samples.json").read_bytes()
+            )
+            self.assertEqual(len(samples["samples"]), 360)
+            result = json.loads(pathlib.Path(spec.run_root, "results.json").read_bytes())
+            self.assertEqual(result["profile"], "acceptance")
+            soak = next(cell for cell in result["cells"] if cell["cell"] == "tcp-soak-all-on")
+            aggregate = next(
+                item for item in soak["traffic"] if item["label"] == "tcp-soak-all-on.aggregate-oracle"
+            )
+            self.assertEqual(len(aggregate["metrics"]["windows"]), 12)
 
     def test_active_interface_owner_blocks_a_different_run_id(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -189,6 +189,7 @@ class CoreSpec:
     expected_boot_id: str
     peer_address: str
     peer_port: int
+    profile: str
     traffic_seconds: int
     soak_seconds: int
     soak_window_seconds: int
@@ -235,6 +236,12 @@ class CoreSpec:
             raise HarnessError(f"peer-address must be the read-only endpoint {READ_ONLY_PEER}")
         if self.peer_port != 5201:
             raise HarnessError("peer-port must be 5201")
+        if self.profile not in {"smoke", "acceptance"}:
+            raise HarnessError("profile must be smoke or acceptance")
+        if self.profile == "acceptance" and (
+            self.traffic_seconds != 30 or self.soak_seconds != 3600 or self.soak_window_seconds != 300
+        ):
+            raise HarnessError("acceptance profile requires exact 30s traffic and 12x300s first-hour soak")
         if not 5 <= self.traffic_seconds <= 60:
             raise HarnessError("traffic-seconds must be in [5,60]")
         if not 60 <= self.soak_seconds <= 3600:
@@ -255,6 +262,11 @@ class CommandRunner:
     def capture(self, argv: Sequence[str], timeout: int = 20) -> tuple[int, bytes, bytes]:
         with OwnedProcessScope(self, argv) as process:
             return process.wait(timeout)
+
+    def wait_until(self, deadline: float) -> None:
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
 
     def start(self, argv: Sequence[str]) -> "RunningProcess":
         if not argv or not os.path.isabs(argv[0]):
@@ -888,22 +900,65 @@ def attach_iperf_oracle(
     step["oracle"] = oracle
 
 
+def soak_oracle_step(
+    spec: CoreSpec,
+    iperf: Sequence[Mapping[str, Any]],
+    checker: Mapping[str, str],
+) -> dict[str, Any] | None:
+    if spec.profile != "acceptance":
+        return None
+    step = command_step(
+        spec.run_root,
+        "tcp-soak-all-on.aggregate-oracle",
+        [
+            TOOLS["python3"],
+            "-I",
+            checker["path"],
+            "soak",
+            *[item["stdout"] for item in iperf],
+            "--expected-windows",
+            "12",
+            "--streams",
+            "4",
+            "--minimum-fairness",
+            "0.90",
+            "--maximum-window-retransmit-rate",
+            "0.005",
+            "--maximum-overall-retransmit-rate",
+            "0.001",
+            "--minimum-throughput-ratio",
+            "0.70",
+        ],
+        60,
+        target="first-hour-soak-window-set",
+    )
+    step.update(
+        {
+            "kind": "iperf-soak-oracle",
+            "program_path": checker["path"],
+            "program_sha256": checker["sha256"],
+        }
+    )
+    return step
+
+
+def monitor_command_table(spec: CoreSpec) -> list[tuple[str, list[str]]]:
+    return [
+        ("nic", [TOOLS["ethtool"], "-S", spec.interface]),
+        ("link", [TOOLS["ip"], "-s", "-j", "link", "show", "dev", spec.interface]),
+    ]
+
+
 def monitor_steps(spec: CoreSpec, cell_name: str, phase: str) -> list[dict[str, Any]]:
     return [
         command_step(
             spec.run_root,
-            f"{cell_name}.monitor.{phase}.nic",
-            [TOOLS["ethtool"], "-S", spec.interface],
+            f"{cell_name}.monitor.{phase}.{label}",
+            argv,
             20,
             target=f"netdev:{spec.interface}",
-        ),
-        command_step(
-            spec.run_root,
-            f"{cell_name}.monitor.{phase}.link",
-            [TOOLS["ip"], "-s", "-j", "link", "show", "dev", spec.interface],
-            20,
-            target=f"netdev:{spec.interface}",
-        ),
+        )
+        for label, argv in monitor_command_table(spec)
     ]
 
 
@@ -1186,6 +1241,7 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
         attach_iperf_oracle(spec, step, "bidir", 4, soak=True, checker=checker)
         traffic.append(step)
     recovery_restore = recovery_steps_from_restore(restore)
+    aggregate_oracle = soak_oracle_step(spec, traffic[1:], checker)
     return {
         "name": name,
         "kind": "tcp-soak",
@@ -1204,6 +1260,13 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
         "monitor_before": monitor_steps(spec, name, "before"),
         "monitor_after": monitor_steps(spec, name, "after"),
         "traffic": traffic,
+        "soak_oracle": aggregate_oracle,
+        "counter_sample_schedule": {
+            "interval_seconds": 10,
+            "expected_samples": spec.soak_seconds // 10,
+            "commands": [argv for _, argv in monitor_command_table(spec)],
+            "evidence": f"{spec.run_root}/tcp-soak-all-on.counter-samples.json",
+        },
         "windows": windows,
         "evidence_limits": ["soak covers raw TCP only until the FakeTCP real-NIC path is admitted"],
     }
@@ -1270,6 +1333,13 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
                 if isinstance(oracle, dict):
                     files.add(oracle["stdout"])
                     files.add(oracle["stderr"])
+        soak_oracle = cell.get("soak_oracle")
+        if isinstance(soak_oracle, dict):
+            files.add(soak_oracle["stdout"])
+            files.add(soak_oracle["stderr"])
+        sample_schedule = cell.get("counter_sample_schedule")
+        if isinstance(sample_schedule, dict):
+            files.add(sample_schedule["evidence"])
     network_write_set = [
         {
             "target": f"netdev:{spec.interface}:features",
@@ -1296,6 +1366,7 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
     return {
         "schema": SCHEMA,
         "spec": spec.as_dict(),
+        "execution_profile": spec.profile,
         "snapshot_commands": snapshot_commands,
         "baseline": snapshot,
         "traffic_oracle": traffic_oracle,
@@ -1364,6 +1435,7 @@ def core_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--expected-boot-id", required=True)
     parser.add_argument("--peer-address", required=True)
     parser.add_argument("--peer-port", type=int, required=True)
+    parser.add_argument("--profile", choices=("smoke", "acceptance"), required=True)
     parser.add_argument("--traffic-seconds", type=int, required=True)
     parser.add_argument("--soak-seconds", type=int, required=True)
     parser.add_argument("--soak-window-seconds", type=int, required=True)
@@ -1447,6 +1519,8 @@ def read_approved_plan(path_value: str, expected_sha256: str, spec: CoreSpec) ->
 
 
 def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
+    if plan.get("execution_profile") != spec.profile:
+        raise HarnessError("approved plan execution profile is not exact")
     baseline = plan.get("baseline")
     if not isinstance(baseline, dict):
         raise HarnessError("approved plan has no baseline")
@@ -1519,24 +1593,26 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
                     raise HarnessError("planned network write is outside the exact owned interface knobs")
                 oracle = step.get("oracle")
                 if step.get("kind") == "iperf":
-                    if not isinstance(oracle, dict):
+                    if (
+                        not isinstance(oracle, dict)
+                        or not isinstance(step.get("direction"), str)
+                        or not isinstance(step.get("streams"), int)
+                    ):
                         raise HarnessError("iperf step has no strict oracle")
                     validate_step(oracle, filesystem_set)
-                    if (
-                        oracle.get("kind") != "iperf-oracle"
-                        or oracle.get("direction") != step.get("direction")
-                        or oracle.get("streams") != step.get("streams")
-                        or oracle.get("program_path") != oracle_contract["path"]
-                        or oracle.get("program_sha256") != oracle_contract["sha256"]
-                        or oracle["argv"][:5]
-                        != [
-                            TOOLS["python3"],
-                            "-I",
-                            oracle_contract["path"],
-                            "one",
-                            step["stdout"],
-                        ]
-                    ):
+                    expected_holder: dict[str, Any] = {
+                        "label": step["label"],
+                        "stdout": step["stdout"],
+                    }
+                    attach_iperf_oracle(
+                        spec,
+                        expected_holder,
+                        step.get("direction"),
+                        step.get("streams"),
+                        soak=cell.get("kind") == "tcp-soak",
+                        checker=oracle_contract,
+                    )
+                    if oracle != expected_holder["oracle"]:
                         raise HarnessError("iperf oracle does not match its exact traffic step")
                 elif oracle is not None:
                     raise HarnessError("non-iperf step unexpectedly has a traffic oracle")
@@ -1549,6 +1625,21 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
         recovery = [step["argv"] for step in recovery_steps]
         if normal != recovery:
             raise HarnessError(f"cell {cell['name']} recovery restore is not exact")
+        if cell.get("kind") == "tcp-soak":
+            schedule = cell.get("counter_sample_schedule")
+            expected_schedule = {
+                "interval_seconds": 10,
+                "expected_samples": spec.soak_seconds // 10,
+                "commands": [argv for _, argv in monitor_command_table(spec)],
+                "evidence": f"{spec.run_root}/tcp-soak-all-on.counter-samples.json",
+            }
+            if schedule != expected_schedule or schedule["evidence"] not in filesystem_set:
+                raise HarnessError("soak counter sample schedule is not exact")
+            expected_soak_oracle = soak_oracle_step(spec, cell["traffic"][1:], oracle_contract)
+            if cell.get("soak_oracle") != expected_soak_oracle:
+                raise HarnessError("first-hour soak oracle is not exact")
+            if expected_soak_oracle is not None:
+                validate_step(expected_soak_oracle, filesystem_set)
 
 
 def validate_step(step: Mapping[str, Any], filesystem_set: set[str]) -> None:
@@ -2235,12 +2326,66 @@ def run_monitor(
     return combined
 
 
+def capture_counter_sample(spec: CoreSpec, runner: CommandRunner) -> dict[str, int]:
+    combined: dict[str, int] = {}
+    for _, argv in monitor_command_table(spec):
+        rc, stdout, stderr = runner.capture(argv, timeout=20)
+        if rc != 0:
+            reason = stderr.decode("utf-8", "replace").strip()
+            raise HarnessError(f"soak counter sample failed rc={rc}: {reason}")
+        parser_fn = parse_nic_counters if argv[:2] == [TOOLS["ethtool"], "-S"] else parse_link_counters
+        for key, value in parser_fn(stdout).items():
+            combined[f"{argv[0]}:{key}"] = value
+    return combined
+
+
 def counter_delta(before: Mapping[str, int], after: Mapping[str, int]) -> dict[str, int]:
-    return {key: after[key] - before[key] for key in sorted(before.keys() & after.keys())}
+    if set(before) != set(after):
+        raise HarnessError("NIC counter schema changed during the traffic cell")
+    deltas = {key: after[key] - before[key] for key in sorted(before)}
+    decreased = [key for key, value in deltas.items() if value < 0]
+    if decreased:
+        raise HarnessError(f"NIC counters decreased during the traffic cell: {','.join(decreased)}")
+    hard_tokens = {
+        "abort",
+        "aborted",
+        "checksum",
+        "crc",
+        "csum",
+        "discard",
+        "discards",
+        "drop",
+        "dropped",
+        "drops",
+        "err",
+        "error",
+        "errors",
+        "fault",
+        "faults",
+        "fifo",
+        "missed",
+        "overrun",
+        "overruns",
+        "timeout",
+        "timeouts",
+    }
+    grew = []
+    for key, value in deltas.items():
+        name = key.split(":", 1)[-1].lower()
+        tokens = set(filter(None, re.split(r"[^a-z0-9]+", name)))
+        if value > 0 and tokens & hard_tokens:
+            grew.append(f"{key}=+{value}")
+    if grew:
+        raise HarnessError(f"NIC error/drop/checksum counters grew: {','.join(grew)}")
+    return deltas
 
 
 def run_traffic(
-    cell: Mapping[str, Any], runner: CommandRunner, journal: Journal
+    spec: CoreSpec,
+    cell: Mapping[str, Any],
+    runner: CommandRunner,
+    journal: Journal,
+    counter_baseline: Mapping[str, int],
 ) -> list[dict[str, Any]]:
     steps = cell["traffic"]
     results: list[dict[str, Any]] = []
@@ -2258,6 +2403,17 @@ def run_traffic(
         return results
 
     monitor = steps[0]
+    schedule = cell["counter_sample_schedule"]
+    samples: list[dict[str, Any]] = []
+    previous_counters = dict(counter_baseline)
+    sample_index = 0
+    sample_origin = time.monotonic()
+    journal.append(
+        "SOAK_COUNTER_SAMPLING_START",
+        commands=schedule["commands"],
+        interval_seconds=schedule["interval_seconds"],
+        expected_samples=schedule["expected_samples"],
+    )
     journal.append("COMMAND_START", label=monitor["label"], argv=monitor["argv"], target=monitor["target"])
     with OwnedProcessScope(runner, monitor["argv"]) as process:
         journal.append(
@@ -2268,7 +2424,41 @@ def run_traffic(
         )
         try:
             for step in steps[1:]:
-                rc, metrics = run_iperf_step(step, runner, journal)
+                journal.append("COMMAND_START", label=step["label"], argv=step["argv"], target=step["target"])
+                with OwnedProcessScope(runner, step["argv"]) as iperf_process:
+                    journal.append(
+                        "OWNED_PROCESS_GROUP_BOUND",
+                        label=step["label"],
+                        pid=iperf_process.pid,
+                        pgid=iperf_process.pgid,
+                    )
+                    samples_this_window = spec.soak_window_seconds // schedule["interval_seconds"]
+                    for _ in range(samples_this_window):
+                        runner.wait_until(
+                            sample_origin + (sample_index + 1) * schedule["interval_seconds"]
+                        )
+                        counters = capture_counter_sample(spec, runner)
+                        delta = counter_delta(previous_counters, counters)
+                        sample_index += 1
+                        record = {
+                            "index": sample_index,
+                            "scheduled_elapsed_seconds": sample_index * schedule["interval_seconds"],
+                            "observed_monotonic_offset_seconds": round(time.monotonic() - sample_origin, 6),
+                            "counters": counters,
+                            "delta": delta,
+                        }
+                        samples.append(record)
+                        journal.append(
+                            "SOAK_COUNTER_SAMPLE",
+                            index=sample_index,
+                            counters_sha256=sha256_bytes(canonical_json(counters)),
+                            delta_sha256=sha256_bytes(canonical_json(delta)),
+                        )
+                        previous_counters = counters
+                    rc, _, _ = execute_started_result(step, iperf_process, journal)
+                oracle = step["oracle"]
+                _, oracle_stdout, _ = execute_step(oracle, runner, journal)
+                metrics = iperf_oracle_metrics(oracle_stdout, step["streams"], step["direction"])
                 results.append(
                     {
                         "label": step["label"],
@@ -2276,11 +2466,42 @@ def run_traffic(
                         "metrics": metrics,
                     }
                 )
+            if sample_index != schedule["expected_samples"]:
+                raise HarnessError(
+                    f"soak counter sample count={sample_index}, want {schedule['expected_samples']}"
+                )
+            sample_evidence = {
+                "schema": "wg-mix-ebpf-b82-realnic-soak-counters-v1",
+                "run_id": spec.run_id,
+                "interval_seconds": schedule["interval_seconds"],
+                "expected_samples": schedule["expected_samples"],
+                "samples": samples,
+            }
+            write_exclusive(schedule["evidence"], canonical_json(sample_evidence))
+            journal.append(
+                "SOAK_COUNTER_SAMPLING_COMPLETE",
+                samples=sample_index,
+                evidence=schedule["evidence"],
+                evidence_sha256=sha256_bytes(canonical_json(sample_evidence)),
+            )
             rc, stdout, _ = execute_started_result(monitor, process, journal)
             metrics = ping_metrics(stdout)
             if metrics["packet_loss_percent"] > 0.01:
                 raise HarnessError("soak ping loss exceeds 0.01%")
             results.insert(0, {"label": monitor["label"], "rc": rc, "metrics": metrics})
+            aggregate_oracle = cell.get("soak_oracle")
+            if aggregate_oracle is not None:
+                _, aggregate_stdout, _ = execute_step(aggregate_oracle, runner, journal)
+                aggregate = parse_json_output(aggregate_stdout, "first-hour soak oracle")
+                if not isinstance(aggregate, dict) or len(aggregate.get("windows", [])) != 12:
+                    raise HarnessError("first-hour soak oracle returned malformed metrics")
+                results.append(
+                    {
+                        "label": aggregate_oracle["label"],
+                        "rc": 0,
+                        "metrics": aggregate,
+                    }
+                )
         except BaseException as primary_error:
             journal.append(
                 "OWNED_PROCESS_GROUP_STOP_INTENT",
@@ -2475,13 +2696,15 @@ def run_with_interface_lease(
             write_exclusive(f"{spec.run_root}/active-{active_cell}.json", canonical_json(active_snapshot))
             journal.append("CELL_ACTIVE", cell=active_cell)
             counters_before = run_monitor(cell["monitor_before"], runner, journal)
-            traffic_results = run_traffic(cell, runner, journal)
+            traffic_results = run_traffic(spec, cell, runner, journal, counters_before)
             counters_after = run_monitor(cell["monitor_after"], runner, journal)
             results.append(
                 {
                     "cell": active_cell,
                     "classification": (
-                        "passed" if cell["classification"] in {"eligible", "characterization"} else cell["classification"]
+                        ("passed" if spec.profile == "acceptance" else "smoke-passed")
+                        if cell["classification"] in {"eligible", "characterization"}
+                        else cell["classification"]
                     ),
                     "plan_classification": cell["classification"],
                     "traffic": traffic_results,
@@ -2513,6 +2736,7 @@ def run_with_interface_lease(
             "run_id": spec.run_id,
             "source_commit": spec.source_commit,
             "plan_sha256": approved_sha256,
+            "profile": spec.profile,
             "overall": "incomplete" if counts.get("not-covered", 0) else "passed",
             "classification_counts": counts,
             "cells": results,
