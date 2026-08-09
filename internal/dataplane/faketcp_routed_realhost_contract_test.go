@@ -1,6 +1,8 @@
 package dataplane
 
 import (
+	"bytes"
+	"encoding/binary"
 	"fmt"
 	"net/netip"
 	"os"
@@ -23,6 +25,7 @@ const (
 	fakeTCPRoutedDestinationPort = uint16(31102)
 	fakeTCPRoutedSegmentBytes    = 64
 	fakeTCPRoutedGSOSegments     = 3
+	fakeTCPRoutedRotationBytes   = 12
 )
 
 type fakeTCPRoutedRealHostContract struct {
@@ -30,6 +33,35 @@ type fakeTCPRoutedRealHostContract struct {
 	remoteIPv4 netip.Addr
 	prefixBits int
 	routeMTU   int
+}
+
+func fakeTCPRoutedWireImage(
+	original []byte,
+	mixedType uint32,
+	key []byte,
+	keyMask uint32,
+	maxBytes int,
+) ([]byte, error) {
+	if len(original) < fakeTCPRoutedRotationBytes {
+		return nil, fmt.Errorf("FakeTCP routed segment is too short: %d", len(original))
+	}
+	if binary.LittleEndian.Uint32(original[:4]) != 4 {
+		return nil, fmt.Errorf("FakeTCP routed segment typeword is not data")
+	}
+	if len(key) == 0 || keyMask >= uint32(len(key)) || maxBytes <= 0 {
+		return nil, fmt.Errorf("FakeTCP routed XOR contract is invalid")
+	}
+
+	encrypted := append([]byte(nil), original...)
+	binary.LittleEndian.PutUint32(encrypted[:4], mixedType)
+	target := min(len(encrypted), maxBytes)
+	for offset := range target {
+		encrypted[offset] ^= key[uint32(offset)&keyMask]
+	}
+	wire := make([]byte, 0, len(encrypted))
+	wire = append(wire, encrypted[fakeTCPRoutedRotationBytes:]...)
+	wire = append(wire, encrypted[:fakeTCPRoutedRotationBytes]...)
+	return wire, nil
 }
 
 func parseFakeTCPRoutedRealHostContract(
@@ -170,6 +202,63 @@ func TestParseFakeTCPRoutedRealHostContract(t *testing.T) {
 	}
 }
 
+func TestFakeTCPRoutedWireImageBindsTypewordXORAndRotation(t *testing.T) {
+	original := make([]byte, fakeTCPRoutedSegmentBytes)
+	binary.LittleEndian.PutUint32(original[:4], 4)
+	for offset := 4; offset < len(original); offset++ {
+		original[offset] = byte(offset*29 + 7)
+	}
+	key := make([]byte, 256)
+	for offset := range key {
+		key[offset] = byte(offset*17 + 5)
+	}
+
+	wire, err := fakeTCPRoutedWireImage(original, 0x13dff06b, key, 255, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(wire) != len(original) || bytes.Equal(wire, original) {
+		t.Fatalf("FakeTCP routed wire image length/content=%d/%x", len(wire), wire)
+	}
+	encrypted := append(append([]byte(nil), wire[len(wire)-fakeTCPRoutedRotationBytes:]...),
+		wire[:len(wire)-fakeTCPRoutedRotationBytes]...)
+	for offset := range encrypted {
+		encrypted[offset] ^= key[offset&255]
+	}
+	if binary.LittleEndian.Uint32(encrypted[:4]) != 0x13dff06b {
+		t.Fatalf("FakeTCP routed mixed typeword=%#x", binary.LittleEndian.Uint32(encrypted[:4]))
+	}
+	binary.LittleEndian.PutUint32(encrypted[:4], 4)
+	if !bytes.Equal(encrypted, original) {
+		t.Fatal("FakeTCP routed typeword/XOR/rotation oracle did not recover the source segment")
+	}
+
+	for _, test := range []struct {
+		name     string
+		original []byte
+		key      []byte
+		mask     uint32
+		maxBytes int
+	}{
+		{name: "short", original: original[:fakeTCPRoutedRotationBytes-1], key: key, mask: 255, maxBytes: 2048},
+		{name: "non-data", original: append([]byte(nil), original...), key: key, mask: 255, maxBytes: 2048},
+		{name: "empty-key", original: original, key: nil, mask: 0, maxBytes: 2048},
+		{name: "mask-outside-key", original: original, key: key[:16], mask: 255, maxBytes: 2048},
+		{name: "zero-max", original: original, key: key, mask: 255, maxBytes: 0},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			if test.name == "non-data" {
+				binary.LittleEndian.PutUint32(test.original[:4], 3)
+			}
+			if _, err := fakeTCPRoutedWireImage(
+				test.original, 0x13dff06b, test.key, test.mask, test.maxBytes,
+			); err == nil {
+				t.Fatal("invalid FakeTCP routed wire-image input was accepted")
+			}
+		})
+	}
+}
+
 func validFakeTCPRoutedRealHostEnvironment() map[string]string {
 	return map[string]string{
 		fakeTCPRoutedLocalIPv4Env:  fakeTCPRoutedLocalIPv4,
@@ -201,6 +290,9 @@ func TestFakeTCPRoutedRealHostLinuxStaticContract(t *testing.T) {
 		"fakeTCPRealHostStatChecksumNoneAccepted",
 		"fakeTCPRealHostStatChecksumPartialReset",
 		"fakeTCPRoutedCoreStatGSORewriteOK",
+		"wireImages := fakeTCPRoutedExpectedWireSegments(",
+		"payload[offset:offset+fakeTCPRoutedSegmentBytes]",
+		"bytes.Equal(segment.payload, wantPayload)",
 		"internetChecksum",
 		"assertFakeTCPRealHostKernelEmpty(t, prepared.contract)",
 	} {

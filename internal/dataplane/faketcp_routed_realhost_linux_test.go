@@ -119,7 +119,10 @@ func runFakeTCPRoutedSocketAcceptance(t *testing.T, mode fakeTCPRoutedSocketMode
 	segments := receiveFakeTCPRoutedSegments(
 		t, ctx, receiver, routed, wantSegments,
 	)
-	assertFakeTCPRoutedSegments(t, mode, segments)
+	wireImages := fakeTCPRoutedExpectedWireSegments(
+		t, prepared.contract, runtime.Generation(), payload, wantSegments,
+	)
+	assertFakeTCPRoutedSegments(t, mode, segments, wireImages)
 
 	fakeWant := map[uint32]uint64{fakeTCPRealHostStatEgressOK: 1}
 	coreWant := map[uint32]uint64{
@@ -547,28 +550,79 @@ func assertFakeTCPRoutedSegments(
 	t *testing.T,
 	mode fakeTCPRoutedSocketMode,
 	segments []fakeTCPRoutedTCPSegment,
+	wireImages [][]byte,
 ) {
 	t.Helper()
 	want := 1
 	if mode == fakeTCPRoutedSocketUDPSegment {
 		want = fakeTCPRoutedGSOSegments
 	}
-	if len(segments) != want {
-		t.Fatalf("routed TCP segment count=%d, want %d", len(segments), want)
+	if len(segments) != want || len(wireImages) != want {
+		t.Fatalf("routed TCP segment/oracle count=%d/%d, want %d",
+			len(segments), len(wireImages), want)
 	}
 	for index, segment := range segments {
-		if segment.sequence != fakeTCPRoutedInitialSequence+uint32(index*fakeTCPRoutedSegmentBytes) {
-			t.Fatalf("routed TCP segment %d sequence=%#x", index, segment.sequence)
+		payloadOffset := index * fakeTCPRoutedSegmentBytes
+		if segment.sequence != fakeTCPRoutedInitialSequence+uint32(payloadOffset) {
+			t.Fatalf("routed TCP segment %d source offset=%d sequence=%#x",
+				index, payloadOffset, segment.sequence)
 		}
 		wantFlags := byte(0x10)
 		if index == len(segments)-1 {
 			wantFlags = 0x18
 		}
+		wantPayload := wireImages[index]
 		if segment.flags != wantFlags || len(segment.payload) != fakeTCPRoutedSegmentBytes {
 			t.Fatalf("routed TCP segment %d flags=%#x payload=%d, want flags=%#x payload=%d",
 				index, segment.flags, len(segment.payload), wantFlags, fakeTCPRoutedSegmentBytes)
 		}
+		if !bytes.Equal(segment.payload, wantPayload) {
+			t.Fatalf("routed TCP segment %d source offset=%d wire image mismatch: got=%x want=%x",
+				index, payloadOffset, segment.payload, wantPayload)
+		}
 	}
+}
+
+func fakeTCPRoutedExpectedWireSegments(
+	t *testing.T,
+	contract fakeTCPRealHostContract,
+	generation uint64,
+	payload []byte,
+	segments int,
+) [][]byte {
+	t.Helper()
+	state := fakeTCPRealHostState(contract, generation, true)
+	if len(state.Profiles) != 1 || len(state.WireGuards) != 1 || len(state.Ciphers) != 1 {
+		t.Fatalf("routed wire oracle profile/wg/cipher cardinality=%d/%d/%d",
+			len(state.Profiles), len(state.WireGuards), len(state.Ciphers))
+	}
+	profile := state.Profiles[0]
+	wireGuard := state.WireGuards[0]
+	cipher := state.Ciphers[0]
+	if wireGuard.ProfileID != profile.ID || wireGuard.CipherID != cipher.ID ||
+		cipher.Mode != "xor" || cipher.Scope != "wg-payload-full" ||
+		cipher.KeyLen == 0 || cipher.KeyLen > uint32(len(cipher.Key)) {
+		t.Fatalf("routed wire oracle is not bound to the active full-payload XOR profile")
+	}
+	if len(payload) != segments*fakeTCPRoutedSegmentBytes {
+		t.Fatalf("routed wire oracle payload=%d, want %d segments x %d",
+			len(payload), segments, fakeTCPRoutedSegmentBytes)
+	}
+
+	wireImages := make([][]byte, segments)
+	for index := range segments {
+		offset := index * fakeTCPRoutedSegmentBytes
+		wire, err := fakeTCPRoutedWireImage(
+			payload[offset:offset+fakeTCPRoutedSegmentBytes],
+			profile.StandardToMixed[3], cipher.Key[:cipher.KeyLen],
+			cipher.KeyMask, int(cipher.MaxBytes),
+		)
+		if err != nil {
+			t.Fatalf("build routed wire oracle segment %d source offset=%d: %v", index, offset, err)
+		}
+		wireImages[index] = wire
+	}
+	return wireImages
 }
 
 type fakeTCPRoutedStatExpectation struct {
