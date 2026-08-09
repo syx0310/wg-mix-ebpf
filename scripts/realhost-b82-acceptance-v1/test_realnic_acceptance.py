@@ -59,6 +59,8 @@ class SimulatedRunner(FixtureRunner):
         self.mtu = spec.expected_mtu
         self.iperf_calls = 0
         self.fail_iperf_call = fail_iperf_call
+        self.ethtool_writes = 0
+        self.fail_ethtool_write_call = None
         self.started = []
 
     def feature_output(self):
@@ -90,7 +92,10 @@ class SimulatedRunner(FixtureRunner):
             name, value = argv[3:5]
             if self.fixed.get(name):
                 return 1, b"", b"fixed\n"
+            self.ethtool_writes += 1
             self.features[name] = value == "on"
+            if self.fail_ethtool_write_call == self.ethtool_writes:
+                raise MODULE.HarnessError("injected post-ethtool failure")
             return 0, b"", b""
         if argv == [MODULE.TOOLS["ethtool"], "-k", self.spec.interface]:
             return 0, self.feature_output(), b""
@@ -265,6 +270,19 @@ class PlannerTests(unittest.TestCase):
         self.assertFalse(plan["safety_contract"]["implemented_capability_bits_changed"])
         self.assertFalse(plan["safety_contract"]["af_packet_no_dst_positive_pmtu"])
 
+    def test_recovery_evidence_is_append_only_journal_not_fixed_output_files(self):
+        spec = fixture_spec()
+        runner = FixtureRunner(spec)
+        snapshot, commands = MODULE.collect_snapshot(spec, runner)
+        plan = MODULE.build_plan(spec, snapshot, commands)
+        filesystem = set(plan["write_set"]["filesystem"])
+        for cell in plan["cells"]:
+            for step in cell["recovery_restore"]:
+                self.assertEqual(step["evidence"], "append-only-journal")
+                self.assertNotIn("stdout", step)
+                self.assertNotIn("stderr", step)
+                self.assertFalse(any(step["label"] in path for path in filesystem))
+
     def test_fixed_feature_is_unsupported_not_silently_toggled(self):
         spec = fixture_spec()
         runner = FixtureRunner(spec, fixed={"tx-udp-segmentation"})
@@ -412,6 +430,31 @@ class HermeticStateMachineTests(unittest.TestCase):
             failed_index = next(index for index, event in enumerate(events) if event["event"] == "FAILED")
             intent_index = next(index for index, event in enumerate(events) if event["event"] == "EXPLICIT_RESTORE_INTENT")
             self.assertGreater(intent_index, failed_index)
+            self.assertEqual(events[-1]["event"], "EXPLICIT_RESTORE_COMPLETE")
+
+    def test_explicit_restore_replays_idempotently_after_nth_step_cut(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=10)
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                with self.assertRaises(MODULE.HarnessError):
+                    MODULE.run_mode(spec, plan_path, digest, runner)
+                runner.fail_ethtool_write_call = runner.ethtool_writes + 1
+                with self.assertRaisesRegex(MODULE.HarnessError, "post-ethtool failure"):
+                    MODULE.restore_mode(spec, plan_path, digest, runner)
+                self.assertFalse(runner.features["rx-udp-gro-forwarding"])
+                self.assertTrue(runner.features["tx-udp-segmentation"])
+                runner.fail_ethtool_write_call = None
+                self.assertEqual(MODULE.restore_mode(spec, plan_path, digest, runner), 0)
+                self.assertEqual(MODULE.restore_mode(spec, plan_path, digest, runner), 0)
+            self.assertFalse(runner.features["rx-udp-gro-forwarding"])
+            self.assertFalse(runner.features["tx-udp-segmentation"])
+            events = [json.loads(line) for line in pathlib.Path(spec.run_root, "journal.jsonl").read_bytes().splitlines()]
+            intents = [event for event in events if event["event"] == "EXPLICIT_RESTORE_INTENT"]
+            self.assertEqual([event["attempt"] for event in intents], [1, 2])
+            starts = [event for event in events if event["event"] == "RECOVERY_COMMAND_START"]
+            self.assertEqual([event["attempt"] for event in starts], [1, 2, 2])
             self.assertEqual(events[-1]["event"], "EXPLICIT_RESTORE_COMPLETE")
 
 

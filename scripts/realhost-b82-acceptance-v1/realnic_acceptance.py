@@ -660,6 +660,22 @@ def ethtool_steps(
     return mutation, restore, expected, unsupported
 
 
+def recovery_steps_from_restore(restore: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    steps: list[dict[str, Any]] = []
+    for step in restore:
+        steps.append(
+            {
+                "label": step["label"].replace(".restore.", ".explicit-restore."),
+                "argv": list(step["argv"]),
+                "timeout_seconds": step["timeout_seconds"],
+                "expect_rc": step["expect_rc"],
+                "target": step["target"],
+                "evidence": "append-only-journal",
+            }
+        )
+    return steps
+
+
 def iperf_steps(spec: CoreSpec, cell_name: str) -> list[dict[str, Any]]:
     steps: list[dict[str, Any]] = []
     for streams in (1, 4, 16):
@@ -702,12 +718,7 @@ def iperf_steps(spec: CoreSpec, cell_name: str) -> list[dict[str, Any]]:
 
 def feature_cell(spec: CoreSpec, snapshot: Mapping[str, Any], name: str, policy: str) -> dict[str, Any]:
     mutation, restore, expected, unsupported = ethtool_steps(spec, snapshot, policy, name)
-    recovery_restore = [
-        {**step, "label": step["label"].replace(".restore.", ".explicit-restore.")}
-        for step in restore
-    ]
-    for step in recovery_restore:
-        step["stdout"], step["stderr"] = output_paths(spec.run_root, step["label"])
+    recovery_restore = recovery_steps_from_restore(restore)
     return {
         "name": name,
         "kind": "tcp-offload",
@@ -790,12 +801,7 @@ def mtu_cell(spec: CoreSpec, name: str, target_mtu: int) -> dict[str, Any]:
     traffic = [ping_step(spec, name, target_mtu, True), ping_step(spec, name, target_mtu, False)]
     iperf = iperf_steps(spec, name)
     traffic.extend(step for step in iperf if step["streams"] == 4 and step["direction"] == "bidir")
-    recovery_restore = [
-        {**step, "label": step["label"].replace(".restore.", ".explicit-restore.")}
-        for step in restore
-    ]
-    for step in recovery_restore:
-        step["stdout"], step["stderr"] = output_paths(spec.run_root, step["label"])
+    recovery_restore = recovery_steps_from_restore(restore)
     return {
         "name": name,
         "kind": "tcp-mtu-boundary",
@@ -873,12 +879,7 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
         )
         step.update({"kind": "iperf", "streams": 4, "direction": "bidir", "window": window})
         traffic.append(step)
-    recovery_restore = [
-        {**step, "label": step["label"].replace(".restore.", ".explicit-restore.")}
-        for step in restore
-    ]
-    for step in recovery_restore:
-        step["stdout"], step["stderr"] = output_paths(spec.run_root, step["label"])
+    recovery_restore = recovery_steps_from_restore(restore)
     return {
         "name": name,
         "kind": "tcp-soak",
@@ -955,7 +956,7 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         if cell["runnable"]:
             files.add(f"{spec.run_root}/active-{cell['name']}.json")
             files.add(f"{spec.run_root}/restored-{cell['name']}.json")
-        for group in ("mutation", "monitor_before", "traffic", "monitor_after", "restore", "recovery_restore"):
+        for group in ("mutation", "monitor_before", "traffic", "monitor_after", "restore"):
             for step in cell.get(group, []):
                 files.add(step["stdout"])
                 files.add(step["stderr"])
@@ -1149,14 +1150,19 @@ def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
             if any(cell.get(group) for group in ("mutation", "restore", "recovery_restore", "traffic")):
                 raise HarnessError("non-runnable cell contains executable work")
             continue
-        for group in ("mutation", "monitor_before", "traffic", "monitor_after", "restore", "recovery_restore"):
+        for group in ("mutation", "monitor_before", "traffic", "monitor_after", "restore"):
             steps = cell.get(group)
             if not isinstance(steps, list):
                 raise HarnessError(f"cell {cell['name']} has invalid {group}")
             for step in steps:
                 validate_step(step, filesystem_set)
+        recovery_steps = cell.get("recovery_restore")
+        if not isinstance(recovery_steps, list):
+            raise HarnessError(f"cell {cell['name']} has invalid recovery_restore")
+        for step in recovery_steps:
+            validate_recovery_step(step)
         normal = [step["argv"] for step in cell["restore"]]
-        recovery = [step["argv"] for step in cell["recovery_restore"]]
+        recovery = [step["argv"] for step in recovery_steps]
         if normal != recovery:
             raise HarnessError(f"cell {cell['name']} recovery restore is not exact")
 
@@ -1180,6 +1186,21 @@ def validate_step(step: Mapping[str, Any], filesystem_set: set[str]) -> None:
         raise HarnessError("planned command output is absent from the write set")
 
 
+def validate_recovery_step(step: Mapping[str, Any]) -> None:
+    required = {"label", "argv", "timeout_seconds", "expect_rc", "target", "evidence"}
+    if set(step) != required or step.get("evidence") != "append-only-journal":
+        raise HarnessError("recovery command must use only append-only journal evidence")
+    argv = step["argv"]
+    if not isinstance(argv, list) or not argv or not all(isinstance(value, str) for value in argv):
+        raise HarnessError("recovery argv is invalid")
+    if not os.path.isabs(argv[0]) or not isinstance(step["target"], str) or not step["target"]:
+        raise HarnessError("recovery executable/target is invalid")
+    if step["expect_rc"] != "zero":
+        raise HarnessError("recovery command must require zero")
+    if not isinstance(step["timeout_seconds"], int) or not 1 <= step["timeout_seconds"] <= 60:
+        raise HarnessError("recovery timeout is outside the reviewed bound")
+
+
 def ensure_absent(path: str) -> None:
     if os.path.lexists(path):
         raise HarnessError(f"run-owned path already exists: {path}")
@@ -1201,6 +1222,14 @@ def write_exclusive(path: str, payload: bytes, mode: int = 0o600) -> None:
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+
+
+def write_idempotent_exact(path: str, payload: bytes, mode: int = 0o600) -> None:
+    if os.path.lexists(path):
+        if read_regular_file(path) != payload:
+            raise HarnessError(f"existing idempotent evidence differs: {path}")
+        return
+    write_exclusive(path, payload, mode)
 
 
 def read_regular_file(path: str, maximum: int = 16 << 20) -> bytes:
@@ -1390,6 +1419,48 @@ def execute_started_result(
     if rc != 0:
         raise HarnessError(f"command {step['label']} failed rc={rc}")
     return rc, stdout, stderr
+
+
+def recovery_output(payload: bytes) -> dict[str, Any]:
+    if len(payload) > 65536:
+        raise HarnessError("recovery command output exceeds 64 KiB")
+    return {
+        "length": len(payload),
+        "sha256": sha256_bytes(payload),
+        "text": payload.decode("utf-8", "backslashreplace"),
+    }
+
+
+def execute_recovery_step(
+    step: Mapping[str, Any],
+    runner: CommandRunner,
+    journal: Journal,
+    *,
+    attempt: int,
+    index: int,
+) -> None:
+    audit = {
+        "attempt": attempt,
+        "index": index,
+        "label": step["label"],
+        "argv": step["argv"],
+        "target": step["target"],
+    }
+    journal.append("RECOVERY_COMMAND_START", **audit)
+    try:
+        rc, stdout, stderr = runner.capture(step["argv"], timeout=step["timeout_seconds"])
+    except HarnessError as exc:
+        journal.append("RECOVERY_COMMAND_ERROR", **audit, rc="exception", reason=str(exc))
+        raise
+    journal.append(
+        "RECOVERY_COMMAND_FINISH",
+        **audit,
+        rc=rc,
+        stdout=recovery_output(stdout),
+        stderr=recovery_output(stderr),
+    )
+    if rc != 0:
+        raise HarnessError(f"recovery command {step['label']} failed rc={rc}")
 
 
 def jain_fairness(values: Sequence[float]) -> float:
@@ -1788,12 +1859,24 @@ def restore_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runne
             validate_fully_restored(baseline, current)
             print(f"REALNIC_RESTORE_NOT_NEEDED run_id={spec.run_id} state=complete")
             return 0
-        if os.path.lexists(f"{spec.run_root}/explicit-restored.json"):
-            raise HarnessError("explicit restore marker already exists without a complete journal")
+        marker_path = f"{spec.run_root}/explicit-restored.json"
+        marker = {"run_id": spec.run_id, "plan_sha256": approved_sha256, "state": "restored"}
+        marker_payload = canonical_json(marker)
+        explicit_complete = any(event.get("event") == "EXPLICIT_RESTORE_COMPLETE" for event in journal.events)
+        if explicit_complete:
+            if not os.path.lexists(marker_path) or read_regular_file(marker_path) != marker_payload:
+                raise HarnessError("completed explicit restore has no exact marker")
+            current, _ = collect_snapshot(spec, runner)
+            validate_fully_restored(baseline, current)
+            print(f"REALNIC_RESTORE_NOT_NEEDED run_id={spec.run_id} state=explicit-restored")
+            return 0
+        if os.path.lexists(marker_path) and read_regular_file(marker_path) != marker_payload:
+            raise HarnessError("existing explicit restore marker differs")
+        attempt = 1 + sum(event.get("event") == "EXPLICIT_RESTORE_INTENT" for event in journal.events)
         if active is None:
             current, _ = collect_snapshot(spec, runner)
             validate_fully_restored(baseline, current)
-            journal.append("EXPLICIT_RESTORE_INTENT", cell=None, exact_reverse_argv=[])
+            journal.append("EXPLICIT_RESTORE_INTENT", attempt=attempt, cell=None, exact_reverse_argv=[])
         else:
             cell = plan_cell(plan, active)
             current, _ = collect_snapshot(
@@ -1804,20 +1887,20 @@ def restore_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runne
             validate_scoped_snapshot(baseline, current, cell, allow_partial=True)
             journal.append(
                 "EXPLICIT_RESTORE_INTENT",
+                attempt=attempt,
                 cell=active,
                 exact_reverse_argv=[step["argv"] for step in cell["recovery_restore"]],
             )
             for index, step in enumerate(cell["recovery_restore"]):
-                execute_step(step, runner, journal)
-                journal.append("EXPLICIT_RESTORE_APPLIED", cell=active, index=index)
+                execute_recovery_step(step, runner, journal, attempt=attempt, index=index)
+                journal.append("EXPLICIT_RESTORE_APPLIED", attempt=attempt, cell=active, index=index)
         restored, _ = collect_snapshot(spec, runner)
         validate_fully_restored(baseline, restored)
-        write_exclusive(f"{spec.run_root}/explicit-restored-snapshot.json", canonical_json(restored))
-        marker = {"run_id": spec.run_id, "plan_sha256": approved_sha256, "state": "restored"}
-        write_exclusive(f"{spec.run_root}/explicit-restored.json", canonical_json(marker))
+        write_idempotent_exact(f"{spec.run_root}/explicit-restored-snapshot.json", canonical_json(restored))
+        write_idempotent_exact(marker_path, marker_payload)
         if active is not None:
-            journal.append("CELL_RESTORED", cell=active, explicit=True)
-        journal.append("EXPLICIT_RESTORE_COMPLETE", cell=active)
+            journal.append("CELL_RESTORED", attempt=attempt, cell=active, explicit=True)
+        journal.append("EXPLICIT_RESTORE_COMPLETE", attempt=attempt, cell=active)
         print(f"REALNIC_EXPLICIT_RESTORE_COMPLETE run_id={spec.run_id} evidence={spec.run_root}")
         return 0
     except BaseException as exc:
