@@ -405,37 +405,27 @@ func legacyTwoParserModel(packet []byte) (L3Info, tcUDPProjection, tcPacketParse
 	return l3, projection, result
 }
 
-func singleDescriptorBenchmarkModel(packet []byte) (L3Info, tcUDPProjection, tcPacketParseResult) {
-	descriptor := singleTCDescriptorIPv4UDP(packet)
-	if descriptor.FakeTCPStatus != L3ParseOK || !fixedIPv4UDPGate(descriptor.L3) {
-		return descriptor.L3, descriptor.Info, tcPacketParseShort
-	}
-	return descriptor.L3, descriptor.Info, descriptor.GenericStatus
-}
-
 var (
 	benchmarkSingleL3         L3Info
 	benchmarkSingleProjection tcUDPProjection
 	benchmarkSingleResult     tcPacketParseResult
+	benchmarkSingleDescriptor tcPacketDescriptorModel
 )
 
 func BenchmarkTCFakeTCPSingleAuthoritativeParseModel(b *testing.B) {
 	packet := testIPv4(5, L3ProtocolUDP, 0, testUDP(31001, 443, make([]byte, 148)))
-	benchmarks := []struct {
-		name   string
-		parses float64
-		parse  func([]byte) (L3Info, tcUDPProjection, tcPacketParseResult)
-	}{
-		{name: "legacy-generic-plus-shared", parses: 2, parse: legacyTwoParserModel},
-		{name: "single-authoritative-descriptor", parses: 1, parse: singleDescriptorBenchmarkModel},
-	}
-	for _, benchmark := range benchmarks {
-		b.Run(benchmark.name, func(b *testing.B) {
-			b.ReportAllocs()
-			b.ReportMetric(benchmark.parses, "l3-l4-parses/op")
-			for i := 0; i < b.N; i++ {
-				benchmarkSingleL3, benchmarkSingleProjection, benchmarkSingleResult = benchmark.parse(packet)
-			}
-		})
-	}
+	b.Run("legacy-generic-plus-shared", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ReportMetric(2, "l3-l4-parses/op")
+		for i := 0; i < b.N; i++ {
+			benchmarkSingleL3, benchmarkSingleProjection, benchmarkSingleResult = legacyTwoParserModel(packet)
+		}
+	})
+	b.Run("single-authoritative-descriptor", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ReportMetric(1, "l3-l4-parses/op")
+		for i := 0; i < b.N; i++ {
+			benchmarkSingleDescriptor = singleTCDescriptorIPv4UDP(packet)
+		}
+	})
 }
