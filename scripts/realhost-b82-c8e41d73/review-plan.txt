@@ -4,26 +4,145 @@ wg-mix-ebpf .82 real-host v6 local-only contract
 Status
 ------
 
-This directory is a local review artifact. It contains no SSH/SCP/Expect
-transport and no credential handling. Nothing in this directory has been run
-on 192.168.10.82. The only executable local gate is
-`test-hermetic-matrix.sh`; it runs syntax/static fixtures and the matrix's
-side-effect-free `plan` mode.
+This directory is a local review artifact. It now includes a versioned package
+binder, an operation-locked Expect SSH/SCP transport, a controller, and a
+separate root source-staging script. None of those files has been bound to a
+final integration commit or executed against 192.168.10.82. Development and
+acceptance of this controller commit are local-only: the transport's `plan`
+action renders its exact SSH/SCP spawn argv and exits before opening the
+credential file or spawning a child.
+
+The executable local gates are `test-hermetic-matrix.sh` and
+`test-hermetic-controller.sh`. The latter builds a fresh fixture Git history
+and bundle under `/private/tmp`, binds both present and absent WireGuard
+manifests, invokes the actual Expect policy in plan mode, and exercises failure
+paths. It also creates a multi-commit shallow clone that both binder modes must
+reject, unbundles the accepted bundle into an isolated bare repository, and
+models the bootstrap first-run/pre-existing states. It retains its unique
+fixture tree rather than performing automatic cleanup.
 
 The following values intentionally remain unbound until the final integration
 commit is selected and reviewed:
 
 * FINAL_INTEGRATION_COMMIT=<exact nonzero/non-ffff 40-lowercase-hex commit>
 * FINAL_INTEGRATION_BUNDLE_SHA256=<exact nonzero/non-ffff 64-lowercase-hex SHA-256>
+* FINAL_INTEGRATION_REF=<exact refs/heads/... whose commit equals FINAL_INTEGRATION_COMMIT>
+* FINAL_PACKAGE_MANIFEST_SHA256=<exact generated manifest SHA-256>
 * FINAL_WG_INTERFACE=<exact interface name observed by read-only preflight>
 * FINAL_WG_LOCAL_ADDRESS=<exact IPv4 address observed by read-only preflight>
 * FINAL_WG_PEER_ADDRESS=<exact routed peer IPv4 observed by read-only preflight>
 
-`root-matrix-n-r.sh` requires all five values as argv and fails closed when
-they are absent or malformed. A separate, later commit must provide a reviewed
-transport/controller and bind its exact argv. This local-only commit must not
-be interpreted as authorization to read credentials, connect to either host,
-install packages, use sudo, or run the matrix.
+`root-matrix-n-r.sh` requires all five topology/bundle values as argv and fails
+closed when they are absent or malformed. `bind-final-package.sh` never uses
+`HEAD` as a default: it requires both an exact ref and commit, checks their
+equality before and after bundle creation, and records Git blob and SHA-256
+identities for every privileged or transport-relevant script. The generated
+bundle contains the selected ref's history rather than a source-only archive.
+Both `plan` and `bind` require `rev-parse --is-shallow-repository` to be exactly
+`false`. After bundle creation, `bind` unbundles it into a fresh isolated bare
+repository, traverses all parents/trees/blobs with `rev-list
+--parents --objects --missing=print`, compares full commit counts and root
+commits, and runs strict full `git fsck`. The manifest binds the traversal and
+root evidence SHA-256 values and commit count.
+
+A later main-Agent binding step must select and review those exact values. This
+controller commit must not be interpreted as authorization to read credentials,
+connect to either host, use sudo, stage source, or run the matrix.
+
+Current WireGuard preflight result
+----------------------------------
+
+The main Agent's read-only 192.168.10.82 preflight found that `wg show
+interfaces` is empty. There is currently no real WireGuard interface, local
+address, or WireGuard-routed peer address to bind. No placeholder topology may
+be substituted.
+
+The binder therefore supports an explicit `--wg-state absent` contract only
+when all three topology values are the literal `absent`. Such a manifest can
+be used to review package creation and source staging. The controller reports
+`wg_active_scoped=not-covered pass=0` in plan mode, and rejects matrix-plan,
+run, and restore before invoking Expect. A `bound` manifest remains available
+only after a later read-only preflight observes and reviews all three real
+values.
+
+The existing monolithic root matrix is intentionally unchanged in this commit.
+The minimum safe follow-up is an independent reviewed change that exposes
+non-WireGuard veth/FakeTCP and bare-ens33 baseline phases separately, while
+classifying every WG-active scoped phase as `not-covered` when WireGuard is
+absent. Those baseline phases must not be promoted to a WG dataplane pass.
+
+Controller and package binding contract
+---------------------------------------
+
+Files added by this framework:
+
+* `bind-final-package.sh`: exact ref/commit/WireGuard binding, full-history Git
+  bundle creation, package extraction from the selected commit, and immutable
+  tab-separated manifest generation in a fresh `/private/tmp` directory.
+* `locked-transport.exp`: fixed operation-name to argv mapping. Callers cannot
+  supply a remote argv. `plan` exits before credential access; `execute` reads
+  only the exact two-line credential file in memory, never places the password
+  in argv or logs, and redacts it from child output.
+* `controller.sh`: verifies the manifest, bundle, Git blobs, local file hashes,
+  isolated history evidence, and controller/transport identity before rendering
+  or executing an operation.
+  It has separate `preflight`, `prepare`, `matrix-plan`, `run`, and explicit
+  `restore` modes and stops on the first failure without cleanup.
+* `prepare-stage-root.sh`: the versioned high-privilege preparation content. It
+  copies the fixed manifest and bundle once into the run-unique root-owned
+  bootstrap, verifies the two mode-0600 single-link copies, and thereafter
+  parses and clones only those copies. It also verifies its own canonical path,
+  root:root ownership, mode 0700, link count, regular-file type, and SHA-256.
+  It creates only the fixed run-owned source stage when absent, checks out the
+  exact commit, runs Bash/ShellCheck gates, and writes a noclobber binding marker.
+  It has no inline SSH body, recursive deletion, trap, package installation,
+  container, mount, chroot, or namespace operation.
+
+The controller has no APT action. Its read-only preflight renders exact version
+or presence checks for Go, clang/LLVM, bpftool, make, GCC, iperf3, ShellCheck,
+jq, WireGuard tools, ethtool, tc/iproute2, kernel BTF, bpffs, and the exact
+kernel header directory. Missing tools stop the flow; any future installation
+must be a separately versioned and reviewed phase.
+
+The transferred package copy of `prepare-stage-root.sh` is data only. Before
+any privileged script execution, the fixed transport operation chain is:
+
+1. As root, require `/run/wg-mix-ebpf-source-bootstrap-c8e41d73` to be absent
+   and not a symlink, including a dangling symlink.
+2. Create that exact directory once with mode 0700, without `-p`, then verify
+   its canonical path and exact root:root mode/type.
+3. Install the package stager to the exact root-owned path
+   `/run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh` with mode
+   0700 with `--no-target-directory`.
+4. Revalidate the installed path, SHA-256, root:root ownership, mode, link
+   count, and type in separate fixed argv operations.
+5. Invoke its single `snapshot` intake: noclobber-copy the fixed user-owned
+   manifest and bundle to fixed mode-0600 files in the bootstrap, then verify
+   canonical path, root:root ownership, mode, link count, manifest argv SHA,
+   and the manifest-bound bundle SHA.
+6. Execute stage `plan` and `run` only from the installed stager and pass only
+   the root-owned manifest path. Git clone opens only the root-owned bundle.
+
+An existing bootstrap path, install/hash/stat mismatch, or any interrupted step
+stops the controller and retains the exact resources. No automatic cleanup or
+fallback to the user-writable package script is allowed.
+
+The final binder argv remains unbound and must be supplied in this exact shape:
+
+    /bin/bash scripts/realhost-b82-c8e41d73/bind-final-package.sh bind \
+      --repository FINAL_CANONICAL_WORKTREE \
+      --source-ref FINAL_INTEGRATION_REF \
+      --commit FINAL_INTEGRATION_COMMIT \
+      --wg-state FINAL_WG_STATE \
+      --wg-interface FINAL_WG_INTERFACE \
+      --wg-local-address FINAL_WG_LOCAL_ADDRESS \
+      --wg-peer-address FINAL_WG_PEER_ADDRESS \
+      --output-dir /private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-<first12commit>
+
+Before any execute action, the main Agent must record the resulting manifest
+path/SHA-256, bundle SHA-256, selected ref/commit, Git blob and SHA-256 of
+`prepare-stage-root.sh` and `root-matrix-n-r.sh`, complete controller argv, and
+the write set. A reviewer must accept that exact content and argv.
 
 Scope and topology
 ------------------
@@ -102,6 +221,43 @@ all-interface and secret-bearing WireGuard commands.
 Write set and failure policy
 ----------------------------
 
+If a later reviewed controller invokes `prepare`, its complete remote write set
+before the matrix is limited to:
+
+* the new user-owned mode-0700 directory
+  `/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61` and its nine fixed SCP
+  destinations;
+* the new root-owned mode-0700 directory
+  `/run/wg-mix-ebpf-source-bootstrap-c8e41d73`, its installed
+  `prepare-stage-root.sh`, and fixed root-owned mode-0600 single-link copies of
+  `package-manifest.v1` and `source-4f2a9b61.bundle`;
+* if absent, the root-owned mode-0700 parent
+  `/run/wg-mix-ebpf-source-stages`;
+* the new root-owned mode-0700 stage
+  `/run/wg-mix-ebpf-source-stages/c8e41d73`, its `source` Git checkout, and its
+  single noclobber `binding.v1` marker.
+
+The two bootstrap write argv are exactly:
+
+    /usr/bin/sudo -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+      /usr/bin/mkdir --mode=0700 -- /run/wg-mix-ebpf-source-bootstrap-c8e41d73
+    /usr/bin/sudo -- /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C \
+      /usr/bin/install --owner=root --group=root --mode=0700 --no-target-directory -- \
+      /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/prepare-stage-root.sh \
+      /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh
+
+They are preceded by exact root absence and non-symlink checks and followed by exact
+readlink/SHA/stat checks. There is no shared bootstrap parent and no `mkdir -p`.
+The subsequent fixed root stager invocation is:
+
+    /bin/bash -p /run/wg-mix-ebpf-source-bootstrap-c8e41d73/prepare-stage-root.sh \
+      snapshot --manifest /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61/package-manifest.v1 \
+      --manifest-sha256 FINAL_MANIFEST_SHA256
+
+Its only writes are noclobber copies to the two fixed bootstrap destinations.
+Both copies complete before manifest parsing. Any copy, shape, or hash failure
+retains the bootstrap and stops; there is no fallback to a user-owned source.
+
 If a later reviewed controller invokes `run`, its write set is limited to:
 
 * `/run/wg-mix-ebpf-source-stages/c8e41d73/realhost-v6-6bd913ac`;
@@ -142,11 +298,15 @@ Local acceptance
 From the repository worktree, the local-only acceptance command is:
 
     /bin/bash scripts/realhost-b82-c8e41d73/test-hermetic-matrix.sh
+    /bin/bash scripts/realhost-b82-c8e41d73/test-hermetic-controller.sh
 
 It must report both:
 
     static real-host safety and checker fixtures: PASS
     hermetic matrix argv and failure-path tests: PASS
+    static v6 binder/controller/transport/stager safety contract: PASS
+    hermetic v6 full-history binder, root-owned bootstrap, SSH/SCP/Expect plan,
+    immutable-intake/shallow/failure paths and WireGuard absence: PASS
 
 ShellCheck is mandatory on .82 before any later sudo phase; its absence on the
 local macOS host is an explicit skip, not a remote pass. The old v5 package must
