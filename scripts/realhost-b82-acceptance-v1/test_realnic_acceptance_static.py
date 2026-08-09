@@ -48,10 +48,14 @@ class StaticSafetyTests(unittest.TestCase):
     def test_only_read_only_peer_has_peer_write_set(self):
         self.assertIn('READ_ONLY_PEER = "47.116.202.155"', self.source)
         self.assertIn('"peer": []', self.source)
+        self.assertNotIn("192.168.10.28", self.source)
 
-    def test_run_and_restore_are_closed_in_first_commit(self):
-        self.assertIn("run mode is closed in the planner-only revision", self.source)
-        self.assertIn("restore mode is closed in the planner-only revision", self.source)
+    def test_run_and_restore_require_review_gates(self):
+        self.assertIn("current read-only snapshot no longer matches the approved plan", self.source)
+        self.assertIn("run mode requires root after explicit approval", self.source)
+        self.assertIn("restore mode requires root after separate explicit approval", self.source)
+        self.assertIn("EXPLICIT_RESTORE_INTENT", self.source)
+        self.assertIn("exact_reverse_argv", self.source)
 
 
 if __name__ == "__main__":

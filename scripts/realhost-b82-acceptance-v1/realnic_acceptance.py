@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import fcntl
 import hashlib
 import ipaddress
 import json
@@ -18,9 +19,10 @@ import re
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 
 SCHEMA = "wg-mix-ebpf-b82-realnic-acceptance-plan-v1"
@@ -74,6 +76,16 @@ TX_FEATURES = frozenset(
 RX_FEATURES = frozenset(
     {"rx-checksumming", "generic-receive-offload", "rx-udp-gro-forwarding"}
 )
+FEATURE_DISABLE_ORDER = (
+    "tx-udp-segmentation",
+    "tcp-segmentation-offload",
+    "generic-segmentation-offload",
+    "rx-udp-gro-forwarding",
+    "generic-receive-offload",
+    "tx-checksumming",
+    "rx-checksumming",
+)
+FEATURE_ENABLE_ORDER = FEATURE_ORDER
 
 
 class HarnessError(RuntimeError):
@@ -200,6 +212,64 @@ class CommandRunner:
             raise HarnessError(f"command did not complete: {argv!r}: {exc}") from exc
         return result.returncode, result.stdout, result.stderr
 
+    def start(self, argv: Sequence[str]) -> "RunningProcess":
+        if not argv or not os.path.isabs(argv[0]):
+            raise HarnessError("every command must use an absolute executable path")
+        try:
+            process = subprocess.Popen(
+                list(argv),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+            )
+        except OSError as exc:
+            raise HarnessError(f"command did not start: {argv!r}: {exc}") from exc
+        return RunningProcess(process)
+
+
+class RunningProcess:
+    def __init__(self, process: subprocess.Popen[bytes]):
+        self._process = process
+        self._stdout = bytearray()
+        self._stderr = bytearray()
+        self._overflow = False
+        self._threads = [
+            threading.Thread(target=self._drain, args=(process.stdout, self._stdout), daemon=True),
+            threading.Thread(target=self._drain, args=(process.stderr, self._stderr), daemon=True),
+        ]
+        for thread in self._threads:
+            thread.start()
+
+    def _drain(self, stream: Any, destination: bytearray) -> None:
+        if stream is None:
+            return
+        while True:
+            chunk = stream.read(65536)
+            if not chunk:
+                break
+            if len(destination) + len(chunk) <= 8 << 20:
+                destination.extend(chunk)
+            else:
+                self._overflow = True
+
+    def wait(self, timeout: int) -> tuple[int, bytes, bytes]:
+        try:
+            rc = self._process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            raise HarnessError("background command exceeded its reviewed timeout") from exc
+        for thread in self._threads:
+            thread.join(timeout=5)
+        if any(thread.is_alive() for thread in self._threads):
+            raise HarnessError("background command output drain did not converge")
+        if self._overflow:
+            raise HarnessError("background command output exceeded 8 MiB")
+        return rc, bytes(self._stdout), bytes(self._stderr)
+
+    def terminate(self) -> None:
+        if self._process.poll() is None:
+            self._process.terminate()
+
 
 def snapshot_command_table(spec: CoreSpec) -> list[tuple[str, list[str]]]:
     sysfs = f"/sys/class/net/{spec.interface}"
@@ -255,6 +325,53 @@ def stable_sort(value: Any) -> Any:
         normalized = [stable_sort(item) for item in value]
         return sorted(normalized, key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
     return value
+
+
+def normalize_addresses(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        raise HarnessError("ip address output is not an array")
+    normalized: list[dict[str, Any]] = []
+    address_keys = ("family", "local", "prefixlen", "scope", "label", "flags", "broadcast")
+    for item in items:
+        if not isinstance(item, dict):
+            raise HarnessError("ip address item is not an object")
+        entry = {key: stable_sort(item[key]) for key in ("ifindex", "ifname") if key in item}
+        addr_info = item.get("addr_info", [])
+        if not isinstance(addr_info, list):
+            raise HarnessError("ip addr_info is not an array")
+        entry["addr_info"] = stable_sort(
+            [
+                {key: stable_sort(address[key]) for key in address_keys if key in address}
+                for address in addr_info
+                if isinstance(address, dict)
+            ]
+        )
+        normalized.append(entry)
+    return stable_sort(normalized)
+
+
+def normalize_routes(items: Any) -> list[dict[str, Any]]:
+    if not isinstance(items, list):
+        raise HarnessError("ip route output is not an array")
+    keys = (
+        "dst",
+        "gateway",
+        "dev",
+        "prefsrc",
+        "src",
+        "table",
+        "protocol",
+        "scope",
+        "type",
+        "metric",
+        "mtu",
+    )
+    result = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise HarnessError("ip route item is not an object")
+        result.append({key: stable_sort(item[key]) for key in keys if key in item})
+    return stable_sort(result)
 
 
 def parse_key_values(data: bytes, label: str) -> dict[str, str]:
@@ -319,7 +436,13 @@ def nic_stat_keys(data: bytes) -> list[str]:
     return sorted(set(keys))
 
 
-def collect_snapshot(spec: CoreSpec, runner: CommandRunner) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+def collect_snapshot(
+    spec: CoreSpec,
+    runner: CommandRunner,
+    *,
+    expected_mtu: int | None = None,
+    allowed_mtu: frozenset[int] | None = None,
+) -> tuple[dict[str, Any], list[dict[str, Any]]]:
     raw: dict[str, bytes] = {}
     commands: list[dict[str, Any]] = []
     for label, argv in snapshot_command_table(spec):
@@ -358,9 +481,9 @@ def collect_snapshot(spec: CoreSpec, runner: CommandRunner) -> tuple[dict[str, A
         },
         "features": parse_features(raw["features"]),
         "link": stable_sort(parse_json_output(raw["link"], "ip link")),
-        "addresses": stable_sort(parse_json_output(raw["addresses"], "ip address")),
-        "routes": stable_sort(parse_json_output(raw["routes"], "ip routes")),
-        "peer_route": stable_sort(parse_json_output(raw["peer_route"], "peer route")),
+        "addresses": normalize_addresses(parse_json_output(raw["addresses"], "ip address")),
+        "routes": normalize_routes(parse_json_output(raw["routes"], "ip routes")),
+        "peer_route": normalize_routes(parse_json_output(raw["peer_route"], "peer route")),
         "qdisc": stable_sort(parse_json_output(raw["qdisc"], "tc qdisc")),
         "tc_ingress": stable_sort(parse_json_output(raw["tc_ingress"], "tc ingress")),
         "tc_egress": stable_sort(parse_json_output(raw["tc_egress"], "tc egress")),
@@ -370,11 +493,17 @@ def collect_snapshot(spec: CoreSpec, runner: CommandRunner) -> tuple[dict[str, A
         "wg_interfaces": sorted(raw["wg_interfaces"].decode("utf-8").split()),
         "nic_stat_keys": nic_stat_keys(raw["nic_stats"]),
     }
-    validate_snapshot_identity(spec, snapshot)
+    validate_snapshot_identity(spec, snapshot, expected_mtu=expected_mtu, allowed_mtu=allowed_mtu)
     return snapshot, commands
 
 
-def validate_snapshot_identity(spec: CoreSpec, snapshot: Mapping[str, Any]) -> None:
+def validate_snapshot_identity(
+    spec: CoreSpec,
+    snapshot: Mapping[str, Any],
+    *,
+    expected_mtu: int | None = None,
+    allowed_mtu: frozenset[int] | None = None,
+) -> None:
     expected_host = {
         "hostname": spec.expected_hostname,
         "kernel": spec.expected_kernel,
@@ -392,15 +521,20 @@ def validate_snapshot_identity(spec: CoreSpec, snapshot: Mapping[str, Any]) -> N
         "name": spec.interface,
         "ifindex": spec.expected_ifindex,
         "mac": spec.expected_mac,
-        "mtu": spec.expected_mtu,
         "driver": spec.expected_driver,
         "bus_info": spec.expected_bus_info,
         "device_path": spec.expected_device_path,
         "device_dev": spec.expected_device_dev,
         "device_ino": spec.expected_device_ino,
     }
-    if identity != expected_identity:
-        mismatches = [key for key, value in expected_identity.items() if identity.get(key) != value]
+    mismatches = [key for key, value in expected_identity.items() if identity.get(key) != value]
+    wanted_mtu = spec.expected_mtu if expected_mtu is None else expected_mtu
+    if allowed_mtu is not None:
+        if identity.get("mtu") not in allowed_mtu:
+            mismatches.append("mtu")
+    elif identity.get("mtu") != wanted_mtu:
+        mismatches.append("mtu")
+    if mismatches:
         raise HarnessError(f"interface identity mismatch: {','.join(mismatches)}")
     peer_routes = snapshot.get("peer_route")
     if not isinstance(peer_routes, list) or not peer_routes:
@@ -431,7 +565,15 @@ def output_paths(root: str, label: str) -> tuple[str, str]:
     return f"{base}.stdout", f"{base}.stderr"
 
 
-def command_step(root: str, label: str, argv: Sequence[str], timeout: int, expect: str = "zero") -> dict[str, Any]:
+def command_step(
+    root: str,
+    label: str,
+    argv: Sequence[str],
+    timeout: int,
+    expect: str = "zero",
+    *,
+    target: str | None = None,
+) -> dict[str, Any]:
     stdout_path, stderr_path = output_paths(root, label)
     return {
         "label": label,
@@ -440,7 +582,27 @@ def command_step(root: str, label: str, argv: Sequence[str], timeout: int, expec
         "expect_rc": expect,
         "stdout": stdout_path,
         "stderr": stderr_path,
+        "target": target if target is not None else argv[-1],
     }
+
+
+def monitor_steps(spec: CoreSpec, cell_name: str, phase: str) -> list[dict[str, Any]]:
+    return [
+        command_step(
+            spec.run_root,
+            f"{cell_name}.monitor.{phase}.nic",
+            [TOOLS["ethtool"], "-S", spec.interface],
+            20,
+            target=f"netdev:{spec.interface}",
+        ),
+        command_step(
+            spec.run_root,
+            f"{cell_name}.monitor.{phase}.link",
+            [TOOLS["ip"], "-s", "-j", "link", "show", "dev", spec.interface],
+            20,
+            target=f"netdev:{spec.interface}",
+        ),
+    ]
 
 
 def ethtool_steps(
@@ -463,8 +625,17 @@ def ethtool_steps(
                 unsupported.append(name)
             continue
         expected[name] = desired
-        if original[name] == desired:
-            continue
+    mutation_order = [
+        name
+        for name in FEATURE_DISABLE_ORDER
+        if not bool(features[name]["fixed"]) and original[name] and not requested[name]
+    ] + [
+        name
+        for name in FEATURE_ENABLE_ORDER
+        if not bool(features[name]["fixed"]) and not original[name] and requested[name]
+    ]
+    for name in mutation_order:
+        desired = requested[name]
         changed.append(name)
         mutation.append(
             command_step(
@@ -472,6 +643,7 @@ def ethtool_steps(
                 f"{cell_name}.mutate.{len(mutation):02d}.{name}",
                 [TOOLS["ethtool"], "-K", spec.interface, name, "on" if desired else "off"],
                 20,
+                target=f"netdev:{spec.interface}",
             )
         )
     restore: list[dict[str, Any]] = []
@@ -482,6 +654,7 @@ def ethtool_steps(
                 f"{cell_name}.restore.{len(restore):02d}.{name}",
                 [TOOLS["ethtool"], "-K", spec.interface, name, "on" if original[name] else "off"],
                 20,
+                target=f"netdev:{spec.interface}",
             )
         )
     return mutation, restore, expected, unsupported
@@ -520,6 +693,7 @@ def iperf_steps(spec: CoreSpec, cell_name: str) -> list[dict[str, Any]]:
                 f"{cell_name}.tcp.p{streams}.{direction}",
                 argv,
                 spec.traffic_seconds + 35,
+                target=f"peer:{spec.peer_address}:{spec.peer_port}",
             )
             step.update({"kind": "iperf", "streams": streams, "direction": direction})
             steps.append(step)
@@ -528,6 +702,12 @@ def iperf_steps(spec: CoreSpec, cell_name: str) -> list[dict[str, Any]]:
 
 def feature_cell(spec: CoreSpec, snapshot: Mapping[str, Any], name: str, policy: str) -> dict[str, Any]:
     mutation, restore, expected, unsupported = ethtool_steps(spec, snapshot, policy, name)
+    recovery_restore = [
+        {**step, "label": step["label"].replace(".restore.", ".explicit-restore.")}
+        for step in restore
+    ]
+    for step in recovery_restore:
+        step["stdout"], step["stderr"] = output_paths(spec.run_root, step["label"])
     return {
         "name": name,
         "kind": "tcp-offload",
@@ -540,8 +720,11 @@ def feature_cell(spec: CoreSpec, snapshot: Mapping[str, Any], name: str, policy:
         ),
         "mutation": mutation,
         "restore": restore,
+        "recovery_restore": recovery_restore,
         "expected_primary_features": expected,
         "expected_mtu": spec.expected_mtu,
+        "monitor_before": monitor_steps(spec, name, "before"),
+        "monitor_after": monitor_steps(spec, name, "after"),
         "traffic": iperf_steps(spec, name),
         "evidence_limits": [
             "real TCP traffic and NIC feature configuration only",
@@ -578,6 +761,7 @@ def ping_step(spec: CoreSpec, cell: str, mtu: int, positive: bool) -> dict[str, 
         ],
         20,
         "zero" if positive else "nonzero",
+        target=f"peer:{spec.peer_address}",
     )
 
 
@@ -591,6 +775,7 @@ def mtu_cell(spec: CoreSpec, name: str, target_mtu: int) -> dict[str, Any]:
                 f"{name}.mutate.mtu",
                 [TOOLS["ip"], "link", "set", "dev", spec.interface, "mtu", str(target_mtu)],
                 20,
+                target=f"netdev:{spec.interface}",
             )
         )
         restore.append(
@@ -599,11 +784,18 @@ def mtu_cell(spec: CoreSpec, name: str, target_mtu: int) -> dict[str, Any]:
                 f"{name}.restore.mtu",
                 [TOOLS["ip"], "link", "set", "dev", spec.interface, "mtu", str(spec.expected_mtu)],
                 20,
+                target=f"netdev:{spec.interface}",
             )
         )
     traffic = [ping_step(spec, name, target_mtu, True), ping_step(spec, name, target_mtu, False)]
     iperf = iperf_steps(spec, name)
     traffic.extend(step for step in iperf if step["streams"] == 4 and step["direction"] == "bidir")
+    recovery_restore = [
+        {**step, "label": step["label"].replace(".restore.", ".explicit-restore.")}
+        for step in restore
+    ]
+    for step in recovery_restore:
+        step["stdout"], step["stderr"] = output_paths(spec.run_root, step["label"])
     return {
         "name": name,
         "kind": "tcp-mtu-boundary",
@@ -612,8 +804,11 @@ def mtu_cell(spec: CoreSpec, name: str, target_mtu: int) -> dict[str, Any]:
         "classification_reason": "validates local real-NIC IPv4 MTU boundary and TCP transfer, not FakeTCP +12 PMTU",
         "mutation": mutation,
         "restore": restore,
+        "recovery_restore": recovery_restore,
         "expected_primary_features": None,
         "expected_mtu": target_mtu,
+        "monitor_before": monitor_steps(spec, name, "before"),
+        "monitor_after": monitor_steps(spec, name, "after"),
         "traffic": traffic,
         "evidence_limits": ["AF_PACKET/no-dst evidence is never used as positive PMTU evidence"],
     }
@@ -643,6 +838,7 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
             spec.peer_address,
         ],
         spec.soak_seconds + 15,
+        target=f"peer:{spec.peer_address}",
     )
     ping.update({"kind": "ping-monitor", "parallel_group": name})
     traffic.append(ping)
@@ -673,9 +869,16 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
             f"{name}.window.{window:03d}",
             argv,
             spec.soak_window_seconds + 35,
+            target=f"peer:{spec.peer_address}:{spec.peer_port}",
         )
         step.update({"kind": "iperf", "streams": 4, "direction": "bidir", "window": window})
         traffic.append(step)
+    recovery_restore = [
+        {**step, "label": step["label"].replace(".restore.", ".explicit-restore.")}
+        for step in restore
+    ]
+    for step in recovery_restore:
+        step["stdout"], step["stderr"] = output_paths(spec.run_root, step["label"])
     return {
         "name": name,
         "kind": "tcp-soak",
@@ -688,8 +891,11 @@ def soak_cell(spec: CoreSpec, snapshot: Mapping[str, Any]) -> dict[str, Any]:
         ),
         "mutation": mutation,
         "restore": restore,
+        "recovery_restore": recovery_restore,
         "expected_primary_features": expected,
         "expected_mtu": spec.expected_mtu,
+        "monitor_before": monitor_steps(spec, name, "before"),
+        "monitor_after": monitor_steps(spec, name, "after"),
         "traffic": traffic,
         "windows": windows,
         "evidence_limits": ["soak covers raw TCP only until the FakeTCP real-NIC path is admitted"],
@@ -714,6 +920,9 @@ def blocked_cells() -> list[dict[str, Any]]:
             "classification_reason": reason,
             "mutation": [],
             "restore": [],
+            "recovery_restore": [],
+            "monitor_before": [],
+            "monitor_after": [],
             "traffic": [],
         }
         for name, reason in reasons.items()
@@ -740,9 +949,13 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         f"{spec.run_root}/results.json",
         f"{spec.run_root}/complete.json",
         f"{spec.run_root}/explicit-restored.json",
+        f"{spec.run_root}/explicit-restored-snapshot.json",
     }
     for cell in cells:
-        for group in ("mutation", "traffic", "restore"):
+        if cell["runnable"]:
+            files.add(f"{spec.run_root}/active-{cell['name']}.json")
+            files.add(f"{spec.run_root}/restored-{cell['name']}.json")
+        for group in ("mutation", "monitor_before", "traffic", "monitor_after", "restore", "recovery_restore"):
             for step in cell.get(group, []):
                 files.add(step["stdout"])
                 files.add(step["stderr"])
@@ -768,6 +981,20 @@ def build_plan(spec: CoreSpec, snapshot: Mapping[str, Any], snapshot_commands: l
         "snapshot_commands": snapshot_commands,
         "baseline": snapshot,
         "cells": cells,
+        "runtime_snapshot_schedule": {
+            "commands": snapshot_commands,
+            "points": [
+                "run-start",
+                *[
+                    point
+                    for cell in cells
+                    if cell["runnable"]
+                    for point in (f"active:{cell['name']}", f"restored:{cell['name']}")
+                ],
+                "explicit-restore-start",
+                "explicit-restore-finish",
+            ],
+        },
         "write_set": {
             "filesystem": [spec.run_root, f"{spec.run_root}/logs", *sorted(files)],
             "network": network_write_set,
@@ -834,15 +1061,777 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def reject_ambiguous_cli(argv: Sequence[str]) -> None:
+    if not argv:
+        raise HarnessError("mode and exact arguments are required")
+    seen: set[str] = set()
+    for token in argv[1:]:
+        if not token.startswith("--"):
+            continue
+        if "=" in token:
+            raise HarnessError("option=value syntax is prohibited; use one exact argv element per value")
+        if token in seen:
+            raise HarnessError(f"duplicate option is prohibited: {token}")
+        seen.add(token)
+
+
 def plan_mode(spec: CoreSpec, runner: CommandRunner) -> int:
     snapshot, commands = collect_snapshot(spec, runner)
     sys.stdout.buffer.write(canonical_json(build_plan(spec, snapshot, commands)))
     return 0
 
 
-def main(argv: Sequence[str] | None = None, runner: CommandRunner | None = None) -> int:
-    namespace = parser().parse_args(argv)
+def read_approved_plan(path_value: str, expected_sha256: str, spec: CoreSpec) -> tuple[dict[str, Any], bytes]:
+    nontrivial_hex(expected_sha256, SHA256_RE, "approved-plan-sha256")
+    path = Path(path_value)
+    if not path.is_absolute() or os.path.normpath(path_value) != path_value:
+        raise HarnessError("approved-plan must be a normalized absolute path")
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
     try:
+        descriptor = os.open(path_value, flags)
+    except OSError as exc:
+        raise HarnessError(f"cannot open approved plan: {exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > 16 << 20:
+            raise HarnessError("approved plan must be a bounded single-link regular file")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1 << 20))
+            if not chunk:
+                raise HarnessError("approved plan was truncated while reading")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+    finally:
+        os.close(descriptor)
+    if not payload or sha256_bytes(payload) != expected_sha256:
+        raise HarnessError("approved plan SHA-256 mismatch")
+    try:
+        plan = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HarnessError("approved plan is not JSON") from exc
+    if canonical_json(plan) != payload:
+        raise HarnessError("approved plan is not canonical JSON")
+    if plan.get("schema") != SCHEMA or plan.get("spec") != spec.as_dict():
+        raise HarnessError("approved plan schema/spec does not match exact argv")
+    validate_plan_shape(plan, spec)
+    return plan, payload
+
+
+def validate_plan_shape(plan: Mapping[str, Any], spec: CoreSpec) -> None:
+    write_set = plan.get("write_set")
+    if not isinstance(write_set, dict):
+        raise HarnessError("approved plan has no write set")
+    for field in ("peer", "qdisc", "routes", "firewall", "bpf"):
+        if write_set.get(field) != []:
+            raise HarnessError(f"approved plan unexpectedly writes {field}")
+    filesystem = write_set.get("filesystem")
+    if not isinstance(filesystem, list) or len(filesystem) != len(set(filesystem)):
+        raise HarnessError("filesystem write set is not a unique array")
+    allowed_roots = {spec.run_root, f"{spec.run_root}/logs"}
+    for path in filesystem:
+        if not isinstance(path, str) or not path.startswith(f"{spec.run_root}/") and path not in allowed_roots:
+            raise HarnessError("filesystem write escaped the run-owned root")
+        if os.path.normpath(path) != path:
+            raise HarnessError("filesystem write path is not normalized")
+    cells = plan.get("cells")
+    if not isinstance(cells, list) or not cells:
+        raise HarnessError("approved plan has no cells")
+    names: set[str] = set()
+    filesystem_set = set(filesystem)
+    for cell in cells:
+        if not isinstance(cell, dict) or cell.get("name") in names:
+            raise HarnessError("approved plan cell is malformed or duplicated")
+        names.add(cell["name"])
+        if not cell.get("runnable"):
+            if any(cell.get(group) for group in ("mutation", "restore", "recovery_restore", "traffic")):
+                raise HarnessError("non-runnable cell contains executable work")
+            continue
+        for group in ("mutation", "monitor_before", "traffic", "monitor_after", "restore", "recovery_restore"):
+            steps = cell.get(group)
+            if not isinstance(steps, list):
+                raise HarnessError(f"cell {cell['name']} has invalid {group}")
+            for step in steps:
+                validate_step(step, filesystem_set)
+        normal = [step["argv"] for step in cell["restore"]]
+        recovery = [step["argv"] for step in cell["recovery_restore"]]
+        if normal != recovery:
+            raise HarnessError(f"cell {cell['name']} recovery restore is not exact")
+
+
+def validate_step(step: Mapping[str, Any], filesystem_set: set[str]) -> None:
+    required = {"label", "argv", "timeout_seconds", "expect_rc", "stdout", "stderr", "target"}
+    if not required.issubset(step):
+        raise HarnessError("planned command is incomplete")
+    argv = step["argv"]
+    if not isinstance(argv, list) or not argv or not all(isinstance(value, str) for value in argv):
+        raise HarnessError("planned argv is invalid")
+    if not os.path.isabs(argv[0]):
+        raise HarnessError("planned executable is not absolute")
+    if not isinstance(step["target"], str) or not step["target"]:
+        raise HarnessError("planned command target is invalid")
+    if step["expect_rc"] not in {"zero", "nonzero"}:
+        raise HarnessError("planned command has invalid return-code expectation")
+    if not isinstance(step["timeout_seconds"], int) or not 1 <= step["timeout_seconds"] <= 3700:
+        raise HarnessError("planned command timeout is outside the bound")
+    if step["stdout"] not in filesystem_set or step["stderr"] not in filesystem_set:
+        raise HarnessError("planned command output is absent from the write set")
+
+
+def ensure_absent(path: str) -> None:
+    if os.path.lexists(path):
+        raise HarnessError(f"run-owned path already exists: {path}")
+
+
+def write_exclusive(path: str, payload: bytes, mode: int = 0o600) -> None:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags, mode)
+    except OSError as exc:
+        raise HarnessError(f"exclusive evidence create failed for {path}: {exc}") from exc
+    try:
+        offset = 0
+        while offset < len(payload):
+            written = os.write(descriptor, payload[offset:])
+            if written <= 0:
+                raise HarnessError(f"short evidence write for {path}")
+            offset += written
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def read_regular_file(path: str, maximum: int = 16 << 20) -> bytes:
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise HarnessError(f"cannot open run-owned evidence {path}: {exc}") from exc
+    try:
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or metadata.st_size > maximum:
+            raise HarnessError(f"run-owned evidence has an invalid shape: {path}")
+        chunks: list[bytes] = []
+        remaining = metadata.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(remaining, 1 << 20))
+            if not chunk:
+                raise HarnessError(f"run-owned evidence was truncated: {path}")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        return b"".join(chunks)
+    finally:
+        os.close(descriptor)
+
+
+class Journal:
+    def __init__(self, path: str, run_id: str, plan_sha256: str, *, create: bool):
+        self.path = path
+        self.run_id = run_id
+        self.plan_sha256 = plan_sha256
+        flags = os.O_RDWR | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+        if create:
+            flags |= os.O_CREAT | os.O_EXCL
+        try:
+            self.descriptor = os.open(path, flags, 0o600)
+        except OSError as exc:
+            raise HarnessError(f"journal open failed: {exc}") from exc
+        try:
+            metadata = os.fstat(self.descriptor)
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1:
+                raise HarnessError("journal must be a single-link regular file")
+            fcntl.flock(self.descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.events = [] if create else self._read_events()
+        except BaseException:
+            os.close(self.descriptor)
+            raise
+
+    def _read_events(self) -> list[dict[str, Any]]:
+        os.lseek(self.descriptor, 0, os.SEEK_SET)
+        size = os.fstat(self.descriptor).st_size
+        if size >= 8 << 20:
+            raise HarnessError("journal exceeds the reviewed size")
+        chunks: list[bytes] = []
+        remaining = size
+        while remaining:
+            chunk = os.read(self.descriptor, min(remaining, 1 << 20))
+            if not chunk:
+                raise HarnessError("journal was truncated while reading")
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        payload = b"".join(chunks)
+        events: list[dict[str, Any]] = []
+        for index, raw in enumerate(payload.splitlines(), start=1):
+            try:
+                event = json.loads(raw)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise HarnessError("journal contains an invalid line") from exc
+            if canonical_json(event).rstrip(b"\n") != raw:
+                raise HarnessError("journal line is not canonical")
+            if (
+                event.get("schema") != JOURNAL_SCHEMA
+                or event.get("run_id") != self.run_id
+                or event.get("plan_sha256") != self.plan_sha256
+                or event.get("sequence") != index
+            ):
+                raise HarnessError("journal identity or sequence is invalid")
+            events.append(event)
+        return events
+
+    def append(self, event: str, **fields: Any) -> None:
+        record = {
+            "schema": JOURNAL_SCHEMA,
+            "run_id": self.run_id,
+            "plan_sha256": self.plan_sha256,
+            "sequence": len(self.events) + 1,
+            "monotonic_ns": time.monotonic_ns(),
+            "utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "event": event,
+            **fields,
+        }
+        payload = canonical_json(record)
+        written = os.write(self.descriptor, payload)
+        if written != len(payload):
+            raise HarnessError("journal append was short")
+        os.fsync(self.descriptor)
+        self.events.append(record)
+
+    def close(self) -> None:
+        fcntl.flock(self.descriptor, fcntl.LOCK_UN)
+        os.close(self.descriptor)
+
+
+def directory_identity(path: str) -> dict[str, int]:
+    metadata = os.lstat(path)
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise HarnessError(f"run-owned directory identity is invalid: {path}")
+    return {
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "mode": stat.S_IMODE(metadata.st_mode),
+    }
+
+
+def create_run_root(spec: CoreSpec) -> dict[str, dict[str, int]]:
+    ensure_absent(spec.run_root)
+    try:
+        os.mkdir(spec.run_root, 0o700)
+        os.mkdir(f"{spec.run_root}/logs", 0o700)
+    except OSError as exc:
+        raise HarnessError(f"cannot create exact run-owned directories: {exc}") from exc
+    for path in (spec.run_root, f"{spec.run_root}/logs"):
+        metadata = os.lstat(path)
+        if not stat.S_ISDIR(metadata.st_mode) or stat.S_IMODE(metadata.st_mode) != 0o700:
+            raise HarnessError(f"run-owned directory has unexpected identity: {path}")
+    return {
+        "root": directory_identity(spec.run_root),
+        "logs": directory_identity(f"{spec.run_root}/logs"),
+    }
+
+
+def validate_run_root_identity(spec: CoreSpec, expected: Mapping[str, Any]) -> None:
+    actual = {
+        "root": directory_identity(spec.run_root),
+        "logs": directory_identity(f"{spec.run_root}/logs"),
+    }
+    if actual != expected:
+        raise HarnessError("run-owned directory identity changed")
+
+
+def execute_step(step: Mapping[str, Any], runner: CommandRunner, journal: Journal) -> tuple[int, bytes, bytes]:
+    journal.append("COMMAND_START", label=step["label"], argv=step["argv"], target=step["target"])
+    try:
+        rc, stdout, stderr = runner.capture(step["argv"], timeout=step["timeout_seconds"])
+    except HarnessError as exc:
+        journal.append(
+            "COMMAND_ERROR",
+            label=step["label"],
+            argv=step["argv"],
+            target=step["target"],
+            rc="exception",
+            reason=str(exc),
+        )
+        raise
+    write_exclusive(step["stdout"], stdout)
+    write_exclusive(step["stderr"], stderr)
+    journal.append(
+        "COMMAND_FINISH",
+        label=step["label"],
+        argv=step["argv"],
+        target=step["target"],
+        rc=rc,
+    )
+    if step["expect_rc"] == "zero" and rc != 0:
+        raise HarnessError(f"command {step['label']} failed rc={rc}")
+    if step["expect_rc"] == "nonzero" and rc == 0:
+        raise HarnessError(f"negative command {step['label']} unexpectedly succeeded")
+    return rc, stdout, stderr
+
+
+def execute_started_result(
+    step: Mapping[str, Any],
+    process: RunningProcess,
+    journal: Journal,
+) -> tuple[int, bytes, bytes]:
+    rc, stdout, stderr = process.wait(step["timeout_seconds"])
+    write_exclusive(step["stdout"], stdout)
+    write_exclusive(step["stderr"], stderr)
+    journal.append(
+        "COMMAND_FINISH",
+        label=step["label"],
+        argv=step["argv"],
+        target=step["target"],
+        rc=rc,
+    )
+    if rc != 0:
+        raise HarnessError(f"command {step['label']} failed rc={rc}")
+    return rc, stdout, stderr
+
+
+def jain_fairness(values: Sequence[float]) -> float:
+    positives = [value for value in values if value > 0]
+    if not positives:
+        return 0.0
+    return sum(positives) ** 2 / (len(positives) * sum(value * value for value in positives))
+
+
+def iperf_metrics(payload: bytes, streams: int, *, soak: bool) -> dict[str, Any]:
+    document = parse_json_output(payload, "iperf3")
+    if not isinstance(document, dict) or document.get("error"):
+        raise HarnessError(f"iperf3 JSON reports an error: {document.get('error') if isinstance(document, dict) else 'invalid'}")
+    end = document.get("end")
+    if not isinstance(end, dict):
+        raise HarnessError("iperf3 JSON has no end object")
+    raw_streams = end.get("streams", [])
+    rates: list[float] = []
+    total_bytes = 0
+    retransmits = 0
+    if isinstance(raw_streams, list):
+        for stream in raw_streams:
+            if not isinstance(stream, dict):
+                continue
+            sender = stream.get("sender")
+            if not isinstance(sender, dict):
+                continue
+            rate = sender.get("bits_per_second")
+            byte_count = sender.get("bytes")
+            if isinstance(rate, (int, float)) and rate > 0:
+                rates.append(float(rate))
+            if isinstance(byte_count, int) and byte_count > 0:
+                total_bytes += byte_count
+            retransmit = sender.get("retransmits", 0)
+            if isinstance(retransmit, int) and retransmit >= 0:
+                retransmits += retransmit
+    if len(rates) < streams or total_bytes <= 0:
+        raise HarnessError("iperf3 did not report nonzero data for every requested stream")
+    groups = [rates[index : index + streams] for index in range(0, len(rates), streams)]
+    fairness = min(jain_fairness(group) for group in groups if group)
+    if streams > 1 and fairness < 0.90:
+        raise HarnessError(f"iperf3 Jain fairness {fairness:.6f} is below 0.90")
+    start = document.get("start", {})
+    mss = start.get("tcp_mss_default", 1448) if isinstance(start, dict) else 1448
+    if not isinstance(mss, int) or mss <= 0:
+        mss = 1448
+    estimated_segments = max(1.0, total_bytes / mss)
+    retransmit_rate = retransmits / estimated_segments
+    limit = 0.001 if soak else 0.0001
+    if retransmit_rate > limit:
+        raise HarnessError(f"iperf3 estimated retransmit rate {retransmit_rate:.8f} exceeds {limit:.4f}")
+    return {
+        "bytes": total_bytes,
+        "sender_streams": len(rates),
+        "jain_fairness": fairness,
+        "retransmits": retransmits,
+        "estimated_retransmit_rate": retransmit_rate,
+    }
+
+
+def ping_metrics(payload: bytes) -> dict[str, Any]:
+    text = payload.decode("utf-8", "replace")
+    match = re.search(r"([0-9]+(?:\.[0-9]+)?)% packet loss", text)
+    if not match:
+        raise HarnessError("ping output has no packet-loss summary")
+    return {"packet_loss_percent": float(match.group(1))}
+
+
+def parse_nic_counters(payload: bytes) -> dict[str, int]:
+    result: dict[str, int] = {}
+    for raw in payload.decode("utf-8", "replace").splitlines()[1:]:
+        if ":" not in raw:
+            continue
+        name, value = (part.strip() for part in raw.split(":", 1))
+        if re.fullmatch(r"[A-Za-z0-9_.-]+", name) and re.fullmatch(r"[0-9]+", value):
+            result[name] = int(value)
+    return result
+
+
+def parse_link_counters(payload: bytes) -> dict[str, int]:
+    items = parse_json_output(payload, "ip link counters")
+    if not isinstance(items, list) or len(items) != 1 or not isinstance(items[0], dict):
+        raise HarnessError("ip link counter output has an unexpected shape")
+    stats = items[0].get("stats64", items[0].get("stats", {}))
+    if not isinstance(stats, dict):
+        raise HarnessError("ip link counter output has no stats")
+    result: dict[str, int] = {}
+    for direction in ("rx", "tx"):
+        values = stats.get(direction, {})
+        if not isinstance(values, dict):
+            continue
+        for name, value in values.items():
+            if isinstance(value, int) and value >= 0:
+                result[f"{direction}_{name}"] = value
+    return result
+
+
+def run_monitor(
+    steps: Sequence[Mapping[str, Any]], runner: CommandRunner, journal: Journal
+) -> dict[str, int]:
+    combined: dict[str, int] = {}
+    for step in steps:
+        _, stdout, _ = execute_step(step, runner, journal)
+        parser_fn = parse_nic_counters if step["argv"][:2] == [TOOLS["ethtool"], "-S"] else parse_link_counters
+        for key, value in parser_fn(stdout).items():
+            combined[f"{step['argv'][0]}:{key}"] = value
+    return combined
+
+
+def counter_delta(before: Mapping[str, int], after: Mapping[str, int]) -> dict[str, int]:
+    return {key: after[key] - before[key] for key in sorted(before.keys() & after.keys())}
+
+
+def run_traffic(
+    cell: Mapping[str, Any], runner: CommandRunner, journal: Journal
+) -> list[dict[str, Any]]:
+    steps = cell["traffic"]
+    results: list[dict[str, Any]] = []
+    if cell["kind"] != "tcp-soak":
+        for step in steps:
+            rc, stdout, _ = execute_step(step, runner, journal)
+            result: dict[str, Any] = {"label": step["label"], "rc": rc}
+            if step.get("kind") == "iperf":
+                result["metrics"] = iperf_metrics(stdout, step["streams"], soak=False)
+            elif step["argv"][-1] == READ_ONLY_PEER and TOOLS["ping"] in step["argv"] and rc == 0:
+                result["metrics"] = ping_metrics(stdout)
+            results.append(result)
+        return results
+
+    monitor = steps[0]
+    journal.append("COMMAND_START", label=monitor["label"], argv=monitor["argv"], target=monitor["target"])
+    process = runner.start(monitor["argv"])
+    try:
+        for step in steps[1:]:
+            rc, stdout, _ = execute_step(step, runner, journal)
+            results.append(
+                {
+                    "label": step["label"],
+                    "rc": rc,
+                    "metrics": iperf_metrics(stdout, step["streams"], soak=True),
+                }
+            )
+        rc, stdout, _ = execute_started_result(monitor, process, journal)
+        metrics = ping_metrics(stdout)
+        if metrics["packet_loss_percent"] > 0.01:
+            raise HarnessError("soak ping loss exceeds 0.01%")
+        results.insert(0, {"label": monitor["label"], "rc": rc, "metrics": metrics})
+    except BaseException:
+        process.terminate()
+        journal.append("OWNED_MONITOR_TERMINATE", label=monitor["label"])
+        try:
+            rc, stdout, stderr = process.wait(10)
+            if not os.path.lexists(monitor["stdout"]):
+                write_exclusive(monitor["stdout"], stdout)
+                write_exclusive(monitor["stderr"], stderr)
+            journal.append("OWNED_MONITOR_STOPPED", label=monitor["label"], rc=rc)
+        except HarnessError as stop_error:
+            journal.append("OWNED_MONITOR_STOP_ERROR", label=monitor["label"], reason=str(stop_error))
+        raise
+    return results
+
+
+def scrub_key(value: Any, key_to_remove: str) -> Any:
+    if isinstance(value, dict):
+        return {key: scrub_key(item, key_to_remove) for key, item in value.items() if key != key_to_remove}
+    if isinstance(value, list):
+        return [scrub_key(item, key_to_remove) for item in value]
+    return value
+
+
+def validate_scoped_snapshot(
+    baseline: Mapping[str, Any],
+    current: Mapping[str, Any],
+    cell: Mapping[str, Any],
+    *,
+    allow_partial: bool = False,
+) -> None:
+    unchanged_fields = (
+        "host",
+        "addresses",
+        "routes",
+        "peer_route",
+        "qdisc",
+        "tc_ingress",
+        "tc_egress",
+        "bpf_links",
+        "bpf_programs",
+        "bpf_maps",
+        "wg_interfaces",
+        "nic_stat_keys",
+    )
+    for field in unchanged_fields:
+        if current[field] != baseline[field]:
+            raise HarnessError(f"unexpected drift in {field}")
+    if scrub_key(current["link"], "mtu") != scrub_key(baseline["link"], "mtu"):
+        raise HarnessError("interface link identity changed outside MTU")
+    wanted_mtu = int(cell["expected_mtu"])
+    actual_mtu = int(current["interface_identity"]["mtu"])
+    if allow_partial:
+        if actual_mtu not in {int(baseline["interface_identity"]["mtu"]), wanted_mtu}:
+            raise HarnessError("MTU is neither baseline nor the cell target")
+    elif actual_mtu != wanted_mtu:
+        raise HarnessError("cell MTU does not match the exact target")
+    expected_features = cell.get("expected_primary_features")
+    if expected_features is not None:
+        for name, expected in expected_features.items():
+            actual = bool(current["features"][name]["enabled"])
+            if allow_partial:
+                original = bool(baseline["features"][name]["enabled"])
+                if actual not in {original, bool(expected)}:
+                    raise HarnessError(f"feature {name} is outside baseline/target")
+            elif actual != bool(expected):
+                raise HarnessError(f"feature {name} did not reach the exact target")
+
+
+def validate_fully_restored(baseline: Mapping[str, Any], current: Mapping[str, Any]) -> None:
+    if current != baseline:
+        different = [key for key in baseline if baseline.get(key) != current.get(key)]
+        raise HarnessError(f"full baseline restoration mismatch: {','.join(different)}")
+
+
+def plan_cell(plan: Mapping[str, Any], name: str) -> Mapping[str, Any]:
+    for cell in plan["cells"]:
+        if cell["name"] == name:
+            return cell
+    raise HarnessError(f"journal references an unknown cell: {name}")
+
+
+def journal_active_cell(events: Sequence[Mapping[str, Any]]) -> tuple[str | None, bool]:
+    active: str | None = None
+    complete = False
+    for event in events:
+        kind = event["event"]
+        if kind == "CELL_MUTATION_INTENT":
+            if active is not None:
+                raise HarnessError("journal starts a second cell before restoration")
+            active = event.get("cell")
+        elif kind == "CELL_RESTORED":
+            if active != event.get("cell"):
+                raise HarnessError("journal restored a different cell")
+            active = None
+        elif kind == "COMPLETE":
+            if active is not None:
+                raise HarnessError("journal completed with an active cell")
+            complete = True
+    return active, complete
+
+
+def run_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runner: CommandRunner) -> int:
+    if os.geteuid() != 0:
+        raise HarnessError("run mode requires root after explicit approval")
+    plan, plan_payload = read_approved_plan(approved_plan, approved_sha256, spec)
+    current, commands = collect_snapshot(spec, runner)
+    rebuilt = canonical_json(build_plan(spec, current, commands))
+    if rebuilt != plan_payload:
+        raise HarnessError("current read-only snapshot no longer matches the approved plan")
+    run_root_identity = create_run_root(spec)
+    write_exclusive(f"{spec.run_root}/approved-plan.json", plan_payload)
+    write_exclusive(f"{spec.run_root}/baseline.json", canonical_json(current))
+    owner = {
+        "schema": "wg-mix-ebpf-b82-realnic-owner-v1",
+        "run_id": spec.run_id,
+        "plan_sha256": approved_sha256,
+        "source_commit": spec.source_commit,
+        "interface_identity": current["interface_identity"],
+        "boot_id": spec.expected_boot_id,
+        "run_root_identity": run_root_identity,
+    }
+    write_exclusive(f"{spec.run_root}/owner.json", canonical_json(owner))
+    journal = Journal(f"{spec.run_root}/journal.jsonl", spec.run_id, approved_sha256, create=True)
+    results: list[dict[str, Any]] = []
+    active_cell: str | None = None
+    try:
+        journal.append("BASELINE_CAPTURED", baseline_sha256=sha256_bytes(canonical_json(current)))
+        for cell in plan["cells"]:
+            if not cell["runnable"]:
+                results.append(
+                    {
+                        "cell": cell["name"],
+                        "classification": cell["classification"],
+                        "reason": cell["classification_reason"],
+                    }
+                )
+                continue
+            active_cell = cell["name"]
+            journal.append(
+                "CELL_MUTATION_INTENT",
+                cell=active_cell,
+                mutation_argv=[step["argv"] for step in cell["mutation"]],
+                exact_reverse_argv=[step["argv"] for step in cell["restore"]],
+            )
+            for index, step in enumerate(cell["mutation"]):
+                execute_step(step, runner, journal)
+                journal.append("MUTATION_APPLIED", cell=active_cell, index=index)
+            active_snapshot, _ = collect_snapshot(spec, runner, expected_mtu=cell["expected_mtu"])
+            validate_scoped_snapshot(current, active_snapshot, cell)
+            write_exclusive(f"{spec.run_root}/active-{active_cell}.json", canonical_json(active_snapshot))
+            journal.append("CELL_ACTIVE", cell=active_cell)
+            counters_before = run_monitor(cell["monitor_before"], runner, journal)
+            traffic_results = run_traffic(cell, runner, journal)
+            counters_after = run_monitor(cell["monitor_after"], runner, journal)
+            results.append(
+                {
+                    "cell": active_cell,
+                    "classification": (
+                        "passed" if cell["classification"] in {"eligible", "characterization"} else cell["classification"]
+                    ),
+                    "plan_classification": cell["classification"],
+                    "traffic": traffic_results,
+                    "counter_delta": counter_delta(counters_before, counters_after),
+                    "evidence_limits": cell.get("evidence_limits", []),
+                }
+            )
+            journal.append("TRAFFIC_COMPLETE", cell=active_cell)
+            journal.append(
+                "RESTORE_INTENT",
+                cell=active_cell,
+                exact_reverse_argv=[step["argv"] for step in cell["restore"]],
+            )
+            for index, step in enumerate(cell["restore"]):
+                execute_step(step, runner, journal)
+                journal.append("RESTORE_APPLIED", cell=active_cell, index=index)
+            restored, _ = collect_snapshot(spec, runner)
+            validate_fully_restored(current, restored)
+            write_exclusive(f"{spec.run_root}/restored-{active_cell}.json", canonical_json(restored))
+            journal.append("CELL_RESTORED", cell=active_cell)
+            active_cell = None
+
+        counts: dict[str, int] = {}
+        for result in results:
+            classification = result["classification"]
+            counts[classification] = counts.get(classification, 0) + 1
+        outcome = {
+            "schema": "wg-mix-ebpf-b82-realnic-result-v1",
+            "run_id": spec.run_id,
+            "source_commit": spec.source_commit,
+            "plan_sha256": approved_sha256,
+            "overall": "incomplete" if counts.get("not-covered", 0) else "passed",
+            "classification_counts": counts,
+            "cells": results,
+        }
+        write_exclusive(f"{spec.run_root}/results.json", canonical_json(outcome))
+        write_exclusive(
+            f"{spec.run_root}/complete.json",
+            canonical_json({"run_id": spec.run_id, "overall": outcome["overall"], "plan_sha256": approved_sha256}),
+        )
+        journal.append("COMPLETE", overall=outcome["overall"])
+        print(
+            f"REALNIC_CHARACTERIZATION_COMPLETE run_id={spec.run_id} overall={outcome['overall']} "
+            f"evidence={spec.run_root}"
+        )
+        return 3 if outcome["overall"] == "incomplete" else 0
+    except BaseException as exc:
+        journal.append("FAILED", cell=active_cell, reason=str(exc))
+        raise
+    finally:
+        journal.close()
+
+
+def restore_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runner: CommandRunner) -> int:
+    if os.geteuid() != 0:
+        raise HarnessError("restore mode requires root after separate explicit approval")
+    plan, plan_payload = read_approved_plan(approved_plan, approved_sha256, spec)
+    for path in (spec.run_root, f"{spec.run_root}/owner.json", f"{spec.run_root}/approved-plan.json"):
+        if not os.path.lexists(path):
+            raise HarnessError(f"restore ownership path is absent: {path}")
+    stored_plan = read_regular_file(f"{spec.run_root}/approved-plan.json")
+    if stored_plan != plan_payload:
+        raise HarnessError("run-owned approved plan bytes changed")
+    owner_payload = read_regular_file(f"{spec.run_root}/owner.json")
+    owner = json.loads(owner_payload)
+    if canonical_json(owner) != owner_payload:
+        raise HarnessError("run owner marker is not canonical")
+    if (
+        owner.get("run_id") != spec.run_id
+        or owner.get("plan_sha256") != approved_sha256
+        or owner.get("source_commit") != spec.source_commit
+    ):
+        raise HarnessError("run owner marker does not match restore argv")
+    validate_run_root_identity(spec, owner.get("run_root_identity", {}))
+    baseline_payload = read_regular_file(f"{spec.run_root}/baseline.json")
+    baseline = json.loads(baseline_payload)
+    if canonical_json(baseline) != baseline_payload:
+        raise HarnessError("run baseline is not canonical")
+    journal = Journal(f"{spec.run_root}/journal.jsonl", spec.run_id, approved_sha256, create=False)
+    try:
+        if not journal.events or journal.events[0].get("event") != "BASELINE_CAPTURED":
+            raise HarnessError("journal has no baseline-captured origin")
+        if journal.events[0].get("baseline_sha256") != sha256_bytes(baseline_payload):
+            raise HarnessError("journal baseline SHA-256 mismatch")
+        if owner.get("interface_identity") != baseline.get("interface_identity"):
+            raise HarnessError("owner/baseline interface identity mismatch")
+        active, complete = journal_active_cell(journal.events)
+        if complete:
+            current, _ = collect_snapshot(spec, runner)
+            validate_fully_restored(baseline, current)
+            print(f"REALNIC_RESTORE_NOT_NEEDED run_id={spec.run_id} state=complete")
+            return 0
+        if os.path.lexists(f"{spec.run_root}/explicit-restored.json"):
+            raise HarnessError("explicit restore marker already exists without a complete journal")
+        if active is None:
+            current, _ = collect_snapshot(spec, runner)
+            validate_fully_restored(baseline, current)
+            journal.append("EXPLICIT_RESTORE_INTENT", cell=None, exact_reverse_argv=[])
+        else:
+            cell = plan_cell(plan, active)
+            current, _ = collect_snapshot(
+                spec,
+                runner,
+                allowed_mtu=frozenset({spec.expected_mtu, int(cell["expected_mtu"])}),
+            )
+            validate_scoped_snapshot(baseline, current, cell, allow_partial=True)
+            journal.append(
+                "EXPLICIT_RESTORE_INTENT",
+                cell=active,
+                exact_reverse_argv=[step["argv"] for step in cell["recovery_restore"]],
+            )
+            for index, step in enumerate(cell["recovery_restore"]):
+                execute_step(step, runner, journal)
+                journal.append("EXPLICIT_RESTORE_APPLIED", cell=active, index=index)
+        restored, _ = collect_snapshot(spec, runner)
+        validate_fully_restored(baseline, restored)
+        write_exclusive(f"{spec.run_root}/explicit-restored-snapshot.json", canonical_json(restored))
+        marker = {"run_id": spec.run_id, "plan_sha256": approved_sha256, "state": "restored"}
+        write_exclusive(f"{spec.run_root}/explicit-restored.json", canonical_json(marker))
+        if active is not None:
+            journal.append("CELL_RESTORED", cell=active, explicit=True)
+        journal.append("EXPLICIT_RESTORE_COMPLETE", cell=active)
+        print(f"REALNIC_EXPLICIT_RESTORE_COMPLETE run_id={spec.run_id} evidence={spec.run_root}")
+        return 0
+    except BaseException as exc:
+        journal.append("EXPLICIT_RESTORE_FAILED", reason=str(exc))
+        raise
+    finally:
+        journal.close()
+
+
+def main(argv: Sequence[str] | None = None, runner: CommandRunner | None = None) -> int:
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    try:
+        reject_ambiguous_cli(raw_argv)
+        namespace = parser().parse_args(raw_argv)
         spec = spec_from_namespace(namespace)
         actual_runner = runner or CommandRunner()
         if namespace.mode == "plan":
@@ -853,18 +1842,6 @@ def main(argv: Sequence[str] | None = None, runner: CommandRunner | None = None)
     except HarnessError as exc:
         print(f"REALNIC_ACCEPTANCE_STOP reason={exc}", file=sys.stderr)
         return 125
-
-
-# Implemented in the second, independently reviewable commit.  Keeping these
-# entry points fail-closed makes the initial planner commit safe on its own.
-def run_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runner: CommandRunner) -> int:
-    del spec, approved_plan, approved_sha256, runner
-    raise HarnessError("run mode is closed in the planner-only revision")
-
-
-def restore_mode(spec: CoreSpec, approved_plan: str, approved_sha256: str, runner: CommandRunner) -> int:
-    del spec, approved_plan, approved_sha256, runner
-    raise HarnessError("restore mode is closed in the planner-only revision")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,9 @@ import io
 import json
 import pathlib
 import sys
+import tempfile
 import unittest
+from unittest import mock
 
 
 MODULE_PATH = pathlib.Path(__file__).with_name("realnic_acceptance.py")
@@ -30,6 +32,99 @@ class FixtureRunner(MODULE.CommandRunner):
         if key not in self.outputs:
             raise AssertionError(f"unexpected command {argv!r}")
         return 0, self.outputs[key], b""
+
+
+class FakeRunningProcess:
+    def __init__(self):
+        self.terminated = False
+        self.waited = False
+
+    def wait(self, timeout):
+        del timeout
+        self.waited = True
+        rc = -15 if self.terminated else 0
+        return rc, b"60 packets transmitted, 60 received, 0% packet loss\n", b""
+
+    def terminate(self):
+        self.terminated = True
+
+
+class SimulatedRunner(FixtureRunner):
+    def __init__(self, spec, *, fail_iperf_call=None):
+        super().__init__(spec)
+        self.spec = spec
+        parsed = MODULE.parse_features(self.outputs[(MODULE.TOOLS["ethtool"], "-k", spec.interface)])
+        self.features = {name: entry["enabled"] for name, entry in parsed.items()}
+        self.fixed = {name: entry["fixed"] for name, entry in parsed.items()}
+        self.mtu = spec.expected_mtu
+        self.iperf_calls = 0
+        self.fail_iperf_call = fail_iperf_call
+        self.started = []
+
+    def feature_output(self):
+        lines = [f"Features for {self.spec.interface}:"]
+        for name in MODULE.FEATURE_ORDER:
+            fixed = " [fixed]" if self.fixed[name] else ""
+            lines.append(f"{name}: {'on' if self.features[name] else 'off'}{fixed}")
+        return ("\n".join(lines) + "\n").encode()
+
+    def iperf_output(self, argv):
+        streams = int(argv[argv.index("-P") + 1])
+        count = streams * (2 if "--bidir" in argv else 1)
+        document = {
+            "start": {"tcp_mss_default": 1448},
+            "end": {
+                "streams": [
+                    {"sender": {"bytes": 10_000_000, "bits_per_second": 80_000_000, "retransmits": 0}}
+                    for _ in range(count)
+                ]
+            },
+        }
+        return MODULE.canonical_json(document)
+
+    def capture(self, argv, timeout=20):
+        del timeout
+        argv = list(argv)
+        self.calls.append((argv, 0))
+        if argv[:3] == [MODULE.TOOLS["ethtool"], "-K", self.spec.interface]:
+            name, value = argv[3:5]
+            if self.fixed.get(name):
+                return 1, b"", b"fixed\n"
+            self.features[name] = value == "on"
+            return 0, b"", b""
+        if argv == [MODULE.TOOLS["ethtool"], "-k", self.spec.interface]:
+            return 0, self.feature_output(), b""
+        if argv[:6] == [MODULE.TOOLS["ip"], "link", "set", "dev", self.spec.interface, "mtu"]:
+            self.mtu = int(argv[6])
+            return 0, b"", b""
+        if argv == [MODULE.TOOLS["cat"], f"/sys/class/net/{self.spec.interface}/mtu"]:
+            return 0, f"{self.mtu}\n".encode(), b""
+        if argv == [MODULE.TOOLS["ip"], "-d", "-j", "link", "show", "dev", self.spec.interface]:
+            return 0, json.dumps(
+                [{"ifindex": self.spec.expected_ifindex, "ifname": self.spec.interface, "mtu": self.mtu, "address": self.spec.expected_mac, "flags": ["UP", "LOWER_UP"]}]
+            ).encode(), b""
+        if argv == [MODULE.TOOLS["ip"], "-s", "-j", "link", "show", "dev", self.spec.interface]:
+            return 0, json.dumps(
+                [{"ifindex": self.spec.expected_ifindex, "stats64": {"rx": {"bytes": 10, "errors": 0, "dropped": 0}, "tx": {"bytes": 20, "errors": 0, "dropped": 0}}}]
+            ).encode(), b""
+        if MODULE.TOOLS["iperf3"] in argv:
+            self.iperf_calls += 1
+            if self.fail_iperf_call == self.iperf_calls:
+                return 1, b'{"error":"injected failure"}\n', b""
+            return 0, self.iperf_output(argv), b""
+        if MODULE.TOOLS["ping"] in argv:
+            payload = int(argv[argv.index("-s") + 1]) if "-s" in argv else 56
+            if payload > self.mtu - 28:
+                return 1, b"1 packets transmitted, 0 received, 100% packet loss\n", b""
+            return 0, b"3 packets transmitted, 3 received, 0% packet loss\n", b""
+        key = tuple(argv)
+        if key not in self.outputs:
+            raise AssertionError(f"unexpected command {argv!r}")
+        return 0, self.outputs[key], b""
+
+    def start(self, argv):
+        self.started.append(list(argv))
+        return FakeRunningProcess()
 
 
 def fixture_spec(**changes):
@@ -76,7 +171,9 @@ def fixture_outputs(spec, *, fixed=()):
     for name in MODULE.FEATURE_ORDER:
         suffix = " [fixed]" if name in fixed else ""
         features.append(f"{name}: {'on' if initial[name] else 'off'}{suffix}")
-    json_bytes = lambda value: json.dumps(value).encode()
+    def json_bytes(value):
+        return json.dumps(value).encode()
+
     result = {
         (MODULE.TOOLS["hostname"],): f"{spec.expected_hostname}\n".encode(),
         (MODULE.TOOLS["uname"], "-r"): f"{spec.expected_kernel}\n".encode(),
@@ -199,6 +296,20 @@ class PlannerTests(unittest.TestCase):
             mtu_restores = [step for step in cell["restore"] if step["argv"][0] == MODULE.TOOLS["ip"]]
             self.assertEqual(bool(mtu_mutations), bool(mtu_restores), cell["name"])
 
+    def test_offload_dependency_order_is_reversible(self):
+        spec = fixture_spec()
+        runner = FixtureRunner(spec)
+        snapshot, commands = MODULE.collect_snapshot(spec, runner)
+        plan = MODULE.build_plan(spec, snapshot, commands)
+        all_off = next(cell for cell in plan["cells"] if cell["name"] == "tcp-all-off")
+        names = [step["argv"][-2] for step in all_off["mutation"]]
+        expected = [name for name in MODULE.FEATURE_DISABLE_ORDER if snapshot["features"][name]["enabled"]]
+        self.assertEqual(names, expected)
+        self.assertEqual(
+            [step["argv"][-2] for step in all_off["restore"]],
+            list(reversed(expected)),
+        )
+
     def test_plan_mode_outputs_canonical_json_only(self):
         spec = fixture_spec()
         runner = FixtureRunner(spec)
@@ -223,6 +334,85 @@ class PlannerTests(unittest.TestCase):
             fixture_spec(peer_address="192.0.2.1")
         with self.assertRaises(MODULE.HarnessError):
             fixture_spec(run_root="/run/wrong")
+
+    def test_duplicate_or_compound_options_are_rejected(self):
+        with self.assertRaises(MODULE.HarnessError):
+            MODULE.reject_ambiguous_cli(["plan", "--run-id", "a1b2c3d4", "--run-id", "b1b2c3d4"])
+        with self.assertRaises(MODULE.HarnessError):
+            MODULE.reject_ambiguous_cli(["plan", "--run-id=a1b2c3d4"])
+
+
+class HermeticStateMachineTests(unittest.TestCase):
+    def prepare(self, temporary, *, fail_iperf_call=None):
+        prefix = f"{temporary}/run-"
+        with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix):
+            spec = fixture_spec(run_root=f"{prefix}a1b2c3d4")
+        runner = SimulatedRunner(spec, fail_iperf_call=fail_iperf_call)
+        snapshot, commands = MODULE.collect_snapshot(spec, runner)
+        plan_payload = MODULE.canonical_json(MODULE.build_plan(spec, snapshot, commands))
+        plan_path = f"{temporary}/approved-plan.json"
+        pathlib.Path(plan_path).write_bytes(plan_payload)
+        return prefix, spec, runner, plan_path, MODULE.sha256_bytes(plan_payload)
+
+    def test_wrong_plan_hash_stops_before_run_root_creation(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, _ = self.prepare(temporary)
+            wrong = "abcdef0123456789" * 4
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                with self.assertRaisesRegex(MODULE.HarnessError, "SHA-256 mismatch"):
+                    MODULE.run_mode(spec, plan_path, wrong, runner)
+            self.assertFalse(pathlib.Path(spec.run_root).exists())
+
+    def test_complete_characterization_restores_every_cell_and_stays_incomplete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, digest = self.prepare(temporary)
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                rc = MODULE.run_mode(spec, plan_path, digest, runner)
+            self.assertEqual(rc, 3)
+            self.assertEqual(runner.mtu, spec.expected_mtu)
+            baseline = MODULE.parse_features(fixture_outputs(spec)[(MODULE.TOOLS["ethtool"], "-k", spec.interface)])
+            self.assertEqual(runner.features, {name: entry["enabled"] for name, entry in baseline.items()})
+            outcome = json.loads(pathlib.Path(spec.run_root, "results.json").read_bytes())
+            self.assertEqual(outcome["overall"], "incomplete")
+            self.assertEqual(outcome["classification_counts"]["passed"], 8)
+            self.assertEqual(outcome["classification_counts"]["not-covered"], 6)
+            events = [json.loads(line) for line in pathlib.Path(spec.run_root, "journal.jsonl").read_bytes().splitlines()]
+            self.assertEqual(events[-1]["event"], "COMPLETE")
+            self.assertEqual(
+                sum(event["event"] == "CELL_MUTATION_INTENT" for event in events),
+                8,
+            )
+            self.assertEqual(
+                sum(event["event"] == "RESTORE_INTENT" for event in events),
+                8,
+            )
+
+    def test_failure_retains_mutation_until_separately_invoked_restore(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prefix, spec, runner, plan_path, digest = self.prepare(temporary, fail_iperf_call=10)
+            with mock.patch.object(MODULE, "RUN_ROOT_PREFIX", prefix), mock.patch.object(
+                MODULE.os, "geteuid", return_value=0
+            ):
+                with self.assertRaisesRegex(MODULE.HarnessError, "command tcp-all-on"):
+                    MODULE.run_mode(spec, plan_path, digest, runner)
+                self.assertTrue(runner.features["tx-udp-segmentation"])
+                self.assertTrue(runner.features["rx-udp-gro-forwarding"])
+                rc = MODULE.restore_mode(spec, plan_path, digest, runner)
+            self.assertEqual(rc, 0)
+            self.assertFalse(runner.features["tx-udp-segmentation"])
+            self.assertFalse(runner.features["rx-udp-gro-forwarding"])
+            self.assertEqual(runner.mtu, spec.expected_mtu)
+            marker = json.loads(pathlib.Path(spec.run_root, "explicit-restored.json").read_bytes())
+            self.assertEqual(marker["state"], "restored")
+            events = [json.loads(line) for line in pathlib.Path(spec.run_root, "journal.jsonl").read_bytes().splitlines()]
+            failed_index = next(index for index, event in enumerate(events) if event["event"] == "FAILED")
+            intent_index = next(index for index, event in enumerate(events) if event["event"] == "EXPLICIT_RESTORE_INTENT")
+            self.assertGreater(intent_index, failed_index)
+            self.assertEqual(events[-1]["event"], "EXPLICIT_RESTORE_COMPLETE")
 
 
 if __name__ == "__main__":
