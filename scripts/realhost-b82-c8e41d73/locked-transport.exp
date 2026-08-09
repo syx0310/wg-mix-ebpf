@@ -1,0 +1,531 @@
+#!/usr/bin/expect -f
+
+proc fail {message code} {
+    puts stderr "B82_V6_TRANSPORT_STOP reason=$message rc=$code"
+    exit $code
+}
+
+proc file_sha256 {path} {
+    if {[catch {exec /usr/bin/shasum -a 256 -- $path} output]} {
+        return -code error "sha256-command"
+    }
+    set digest [lindex $output 0]
+    if {![regexp {^[0-9a-f]{64}$} $digest]} {
+        return -code error "sha256-shape"
+    }
+    return $digest
+}
+
+proc load_manifest {path expected_sha} {
+    if {[file normalize $path] ne $path || [file type $path] ne "file"} {
+        return -code error "manifest-path"
+    }
+    file lstat $path stat_data
+    if {$stat_data(type) ne "file" || $stat_data(nlink) != 1} {
+        return -code error "manifest-shape"
+    }
+    if {[file_sha256 $path] ne $expected_sha} {
+        return -code error "manifest-sha256"
+    }
+    set expected_keys {
+        format run_id package_id integration_ref integration_commit
+        bundle_name bundle_sha256 wg_state wg_interface wg_local_address
+        wg_peer_address local_repository local_package_dir remote_package_dir
+        remote_source target_user target_host target_hostname target_kernel
+        target_machine_id target_interface peer_address peer_port soak_seconds
+        session_seconds bind_final_package_sh_path bind_final_package_sh_blob
+        bind_final_package_sh_sha256 controller_sh_path controller_sh_blob
+        controller_sh_sha256 locked_transport_exp_path locked_transport_exp_blob
+        locked_transport_exp_sha256 root_matrix_n_r_sh_path root_matrix_n_r_sh_blob
+        root_matrix_n_r_sh_sha256 check_realhost_iperf_py_path
+        check_realhost_iperf_py_blob check_realhost_iperf_py_sha256
+        test_hermetic_matrix_sh_path test_hermetic_matrix_sh_blob
+        test_hermetic_matrix_sh_sha256 test_matrix_static_py_path
+        test_matrix_static_py_blob test_matrix_static_py_sha256
+        prepare_stage_root_sh_path prepare_stage_root_sh_blob
+        prepare_stage_root_sh_sha256
+    }
+    set channel [open $path r]
+    fconfigure $channel -encoding utf-8 -translation lf
+    set payload [read $channel]
+    close $channel
+    if {[string first "\u0000" $payload] >= 0 || ![string match "*\n" $payload]} {
+        return -code error "manifest-encoding"
+    }
+    set lines [split [string trimright $payload "\n"] "\n"]
+    if {[llength $lines] != [llength $expected_keys]} {
+        return -code error "manifest-field-count"
+    }
+    set values [dict create]
+    for {set index 0} {$index < [llength $expected_keys]} {incr index} {
+        set fields [split [lindex $lines $index] "\t"]
+        set expected [lindex $expected_keys $index]
+        if {[llength $fields] != 2 || [lindex $fields 0] ne $expected ||
+            [lindex $fields 1] eq ""} {
+            return -code error "manifest-field-$expected"
+        }
+        dict set values $expected [lindex $fields 1]
+    }
+    return $values
+}
+
+proc validate_manifest_values {values} {
+    if {[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v1" ||
+        [dict get $values run_id] ne "c8e41d73" ||
+        [dict get $values package_id] ne "4f2a9b61" ||
+        ![regexp {^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$} [dict get $values integration_ref]] ||
+        [string first ".." [dict get $values integration_ref]] >= 0 ||
+        [string first "//" [dict get $values integration_ref]] >= 0 ||
+        ![regexp {^[0-9a-f]{40}$} [dict get $values integration_commit]] ||
+        [dict get $values bundle_name] ne "source-4f2a9b61.bundle" ||
+        ![regexp {^[0-9a-f]{64}$} [dict get $values bundle_sha256]] ||
+        [dict get $values remote_package_dir] ne "/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61" ||
+        [dict get $values remote_source] ne "/run/wg-mix-ebpf-source-stages/c8e41d73/source" ||
+        [dict get $values target_user] ne "siyixuan" ||
+        [dict get $values target_host] ne "192.168.10.82" ||
+        [dict get $values target_hostname] ne "ubuntu-2604-test" ||
+        [dict get $values target_kernel] ne "7.0.0-28-generic" ||
+        [dict get $values target_machine_id] ne "9db3fb717cc74974b2a6b243d67f67b9" ||
+        [dict get $values target_interface] ne "ens33" ||
+        [dict get $values peer_address] ne "47.116.202.155" ||
+        [dict get $values peer_port] ne "5201" ||
+        [dict get $values soak_seconds] ne "3600" ||
+        [dict get $values session_seconds] ne "300"} {
+        return -code error "manifest-value"
+    }
+    set wg_state [dict get $values wg_state]
+    if {$wg_state eq "absent"} {
+        foreach key {wg_interface wg_local_address wg_peer_address} {
+            if {[dict get $values $key] ne "absent"} {
+                return -code error "wireguard-absent-binding"
+            }
+        }
+    } elseif {$wg_state eq "bound"} {
+        foreach key {wg_interface wg_local_address wg_peer_address} {
+            if {[dict get $values $key] eq "absent"} {
+                return -code error "wireguard-bound-binding"
+            }
+        }
+    } else {
+        return -code error "wireguard-state"
+    }
+    foreach key {
+        bind_final_package_sh_blob controller_sh_blob locked_transport_exp_blob
+        root_matrix_n_r_sh_blob check_realhost_iperf_py_blob
+        test_hermetic_matrix_sh_blob test_matrix_static_py_blob
+        prepare_stage_root_sh_blob
+    } {
+        if {![regexp {^[0-9a-f]{40}$} [dict get $values $key]]} {
+            return -code error "blob-$key"
+        }
+    }
+    foreach key {
+        bind_final_package_sh_sha256 controller_sh_sha256
+        locked_transport_exp_sha256 root_matrix_n_r_sh_sha256
+        check_realhost_iperf_py_sha256 test_hermetic_matrix_sh_sha256
+        test_matrix_static_py_sha256 prepare_stage_root_sh_sha256
+    } {
+        if {![regexp {^[0-9a-f]{64}$} [dict get $values $key]]} {
+            return -code error "sha256-$key"
+        }
+    }
+}
+
+proc validate_self {values} {
+    set repository [dict get $values local_repository]
+    set repository_path [dict get $values locked_transport_exp_path]
+    set script_path "${repository}/${repository_path}"
+    if {[file normalize [info script]] ne $script_path || [file type $script_path] ne "file" ||
+        [file_sha256 $script_path] ne [dict get $values locked_transport_exp_sha256]} {
+        return -code error "transport-self"
+    }
+    set git_prefix [list /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 \
+        /usr/bin/git --no-pager --no-replace-objects \
+        -c core.attributesFile=/dev/null -c core.fsmonitor=false \
+        -c core.hooksPath=/dev/null -C $repository]
+    if {[catch {exec {*}$git_prefix hash-object -- $script_path} actual_blob] ||
+        [string trim $actual_blob] ne [dict get $values locked_transport_exp_blob] ||
+        [catch {exec {*}$git_prefix rev-parse \
+            "[dict get $values integration_commit]:${repository_path}"} mapped_blob] ||
+        [string trim $mapped_blob] ne [dict get $values locked_transport_exp_blob]} {
+        return -code error "transport-git-identity"
+    }
+}
+
+proc ssh_options {tty} {
+    set terminal [expr {$tty ? "-tt" : "-T"}]
+    return [list -F /dev/null $terminal \
+        -o BatchMode=no \
+        -o PasswordAuthentication=yes \
+        -o PreferredAuthentications=password \
+        -o PubkeyAuthentication=no \
+        -o KbdInteractiveAuthentication=no \
+        -o IdentitiesOnly=yes \
+        -o NumberOfPasswordPrompts=1 \
+        -o StrictHostKeyChecking=yes \
+        -o CheckHostIP=yes \
+        -o UpdateHostKeys=no \
+        -o VerifyHostKeyDNS=no \
+        -o ConnectTimeout=15 \
+        -o ConnectionAttempts=1 \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=2 \
+        -o ClearAllForwardings=yes \
+        -o ForwardAgent=no \
+        -o ForwardX11=no \
+        -o PermitLocalCommand=no \
+        -o LocalCommand=none \
+        -o ProxyCommand=none \
+        -o ControlMaster=no \
+        -o ControlPath=none \
+        -o ControlPersist=no \
+        -o CanonicalizeHostname=no \
+        -o Compression=no \
+        -o LogLevel=ERROR]
+}
+
+proc scp_options {} {
+    return [list -F /dev/null -q \
+        -o BatchMode=no \
+        -o PasswordAuthentication=yes \
+        -o PreferredAuthentications=password \
+        -o PubkeyAuthentication=no \
+        -o KbdInteractiveAuthentication=no \
+        -o IdentitiesOnly=yes \
+        -o NumberOfPasswordPrompts=1 \
+        -o StrictHostKeyChecking=yes \
+        -o CheckHostIP=yes \
+        -o UpdateHostKeys=no \
+        -o VerifyHostKeyDNS=no \
+        -o ConnectTimeout=15 \
+        -o ConnectionAttempts=1 \
+        -o ServerAliveInterval=15 \
+        -o ServerAliveCountMax=2 \
+        -o ClearAllForwardings=yes \
+        -o ForwardAgent=no \
+        -o ForwardX11=no \
+        -o PermitLocalCommand=no \
+        -o LocalCommand=none \
+        -o ProxyCommand=none \
+        -o ControlMaster=no \
+        -o ControlPath=none \
+        -o ControlPersist=no \
+        -o CanonicalizeHostname=no \
+        -o Compression=no \
+        -o LogLevel=ERROR]
+}
+
+proc env_argv {} {
+    return [list /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C]
+}
+
+proc matrix_remote_argv {values mode restore_cell} {
+    if {[dict get $values wg_state] ne "bound"} {
+        return -code error "wireguard-topology-absent"
+    }
+    set source [dict get $values remote_source]
+    set package [dict get $values remote_package_dir]
+    set argv [list /bin/bash -p \
+        "${source}/scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh" $mode \
+        --source $source --commit [dict get $values integration_commit] \
+        --bundle "${package}/[dict get $values bundle_name]" \
+        --bundle-sha256 [dict get $values bundle_sha256] \
+        --interface [dict get $values target_interface] \
+        --peer-address [dict get $values peer_address] \
+        --peer-port [dict get $values peer_port] \
+        --soak-seconds [dict get $values soak_seconds] \
+        --session-seconds [dict get $values session_seconds] \
+        --wg-interface [dict get $values wg_interface] \
+        --wg-local-address [dict get $values wg_local_address] \
+        --wg-peer-address [dict get $values wg_peer_address] \
+        --restore-cell $restore_cell]
+    return $argv
+}
+
+proc package_sha {values name} {
+    switch -- $name {
+        source-4f2a9b61.bundle { return [dict get $values bundle_sha256] }
+        package-manifest.v1 { return "MANIFEST_SHA256" }
+        bind-final-package.sh { return [dict get $values bind_final_package_sh_sha256] }
+        controller.sh { return [dict get $values controller_sh_sha256] }
+        prepare-stage-root.sh { return [dict get $values prepare_stage_root_sh_sha256] }
+        root-matrix-n-r.sh { return [dict get $values root_matrix_n_r_sh_sha256] }
+        check-realhost-iperf.py { return [dict get $values check_realhost_iperf_py_sha256] }
+        test-hermetic-matrix.sh { return [dict get $values test_hermetic_matrix_sh_sha256] }
+        test_matrix_static.py { return [dict get $values test_matrix_static_py_sha256] }
+        default { return -code error "package-name" }
+    }
+}
+
+proc build_operation {values manifest_sha operation} {
+    set target "[dict get $values target_user]@[dict get $values target_host]"
+    set package [dict get $values remote_package_dir]
+    set local_package [dict get $values local_package_dir]
+    set remote {}
+    set tty 0
+    set prompt_limit 1
+    set assertion none
+    set timeout_seconds 600
+
+    switch -- $operation {
+        identity-hostname { set remote [list /usr/bin/hostname]; set assertion "exact:[dict get $values target_hostname]" }
+        identity-kernel { set remote [list /usr/bin/uname -r]; set assertion "exact:[dict get $values target_kernel]" }
+        identity-machine { set remote [list /usr/bin/cat /etc/machine-id]; set assertion "exact:[dict get $values target_machine_id]" }
+        identity-netns { set remote [list /usr/bin/readlink /proc/self/ns/net]; set assertion "contains:net:\[" }
+        identity-interface {
+            set remote [list /usr/sbin/ip -j address show dev [dict get $values target_interface]]
+            set assertion "contains:\"ifname\":\"ens33\""
+        }
+        identity-driver {
+            set remote [list /usr/sbin/ethtool -i [dict get $values target_interface]]
+            set assertion "contains:driver: vmxnet3"
+        }
+        identity-wg-interfaces {
+            set remote [list /usr/bin/wg show interfaces]
+            if {[dict get $values wg_state] eq "absent"} {
+                set assertion empty
+            } else {
+                set assertion "word:[dict get $values wg_interface]"
+            }
+        }
+        tool-go { set remote [list /usr/bin/go version]; set assertion "contains:go1.26.0" }
+        tool-clang { set remote [list /usr/bin/clang --version]; set assertion "contains:21.1.8" }
+        tool-llvm { set remote [list /usr/bin/llvm-config --version]; set assertion "exact:21.1.8" }
+        tool-bpftool { set remote [list /usr/sbin/bpftool version]; set assertion "contains:v7.7.0" }
+        tool-make { set remote [list /usr/bin/make --version]; set assertion "contains:GNU Make 4.4.1" }
+        tool-gcc { set remote [list /usr/bin/gcc --version]; set assertion "contains:15.2" }
+        tool-iperf3 { set remote [list /usr/bin/iperf3 --version]; set assertion "contains:iperf 3.20" }
+        tool-shellcheck { set remote [list /usr/bin/shellcheck --version]; set assertion "contains:version: 0.11.0" }
+        tool-jq { set remote [list /usr/bin/jq --version]; set assertion "exact:jq-1.8.1" }
+        tool-wireguard { set remote [list /usr/bin/wg --version]; set assertion "contains:wireguard-tools" }
+        tool-ethtool { set remote [list /usr/sbin/ethtool --version]; set assertion "contains:6.19" }
+        tool-tc { set remote [list /usr/sbin/tc -V]; set assertion "contains:iproute2-6.19" }
+        tool-ip { set remote [list /usr/sbin/ip -V]; set assertion "contains:iproute2-6.19" }
+        kernel-btf { set remote [list /usr/bin/test -r /sys/kernel/btf/vmlinux] }
+        kernel-bpffs {
+            set remote [list /usr/bin/findmnt --noheadings --raw --output FSTYPE,TARGET --target /sys/fs/bpf]
+            set assertion "exact:bpf /sys/fs/bpf"
+        }
+        kernel-headers { set remote [list /usr/bin/test -d /usr/src/linux-headers-7.0.0-28-generic] }
+        package-parent-stat {
+            set remote [list /usr/bin/stat -Lc %U:%G:%a:%F -- /home/siyixuan/wg-mix-ebpf-test]
+            set assertion exact:siyixuan:siyixuan:700:directory
+        }
+        package-mkdir { set remote [list /usr/bin/mkdir --mode=0700 -- $package] }
+        hermetic-matrix {
+            set remote [concat [env_argv] [list /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
+                /bin/bash "${package}/test-hermetic-matrix.sh"]]
+            set timeout_seconds 660
+        }
+        controller-shellcheck {
+            set remote [concat [env_argv] [list /usr/bin/timeout --signal=TERM --kill-after=10s 10m \
+                /usr/bin/shellcheck --norc --shell=bash -- \
+                "${package}/bind-final-package.sh" "${package}/controller.sh" \
+                "${package}/prepare-stage-root.sh" "${package}/root-matrix-n-r.sh" \
+                "${package}/test-hermetic-matrix.sh"]]
+            set timeout_seconds 660
+        }
+        stage-plan - stage-run {
+            set stage_mode [expr {$operation eq "stage-plan" ? "plan" : "run"}]
+            set remote [concat [env_argv] [list /bin/bash -p "${package}/prepare-stage-root.sh" \
+                $stage_mode --manifest "${package}/package-manifest.v1" \
+                --manifest-sha256 $manifest_sha]]
+            if {$stage_mode eq "run"} {
+                set remote [concat [list /usr/bin/sudo --] $remote]
+                set tty 1
+                set prompt_limit 2
+                set timeout_seconds 2400
+            }
+        }
+        matrix-plan - matrix-run {
+            set matrix_mode [expr {$operation eq "matrix-plan" ? "plan" : "run"}]
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [matrix_remote_argv $values $matrix_mode none]]
+            set tty 1
+            set prompt_limit 2
+            set timeout_seconds [expr {$matrix_mode eq "run" ? 20000 : 600}]
+        }
+        default {
+            if {[regexp {^matrix-restore-(tcx|original|all-on|all-off|tx-path|rx-path|mtu1492|mtu1500|soak)$} $operation -> cell]} {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [matrix_remote_argv $values restore $cell]]
+                set tty 1
+                set prompt_limit 2
+                set timeout_seconds 2400
+            } elseif {[regexp {^(scp|verify-sha|verify-stat)-(.+)$} $operation -> family name]} {
+                set expected_sha [package_sha $values $name]
+                if {$expected_sha eq "MANIFEST_SHA256"} {
+                    set expected_sha $manifest_sha
+                }
+                if {$family eq "scp"} {
+                    set local_path "${local_package}/${name}"
+                    if {[file normalize $local_path] ne $local_path || [file type $local_path] ne "file"} {
+                        return -code error "scp-local-file"
+                    }
+                    set destination "${target}:${package}/${name}"
+                    set spawn_argv [concat [list /usr/bin/scp] [scp_options] [list -- $local_path $destination]]
+                    return [list scp $spawn_argv $prompt_limit $assertion $timeout_seconds]
+                } elseif {$family eq "verify-sha"} {
+                    set remote [list /usr/bin/sha256sum -- "${package}/${name}"]
+                    set assertion "exact:${expected_sha}  ${package}/${name}"
+                } else {
+                    set remote [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- "${package}/${name}"]
+                    set assertion exact:siyixuan:siyixuan:600:1:regular\ file
+                }
+            } else {
+                return -code error "operation"
+            }
+        }
+    }
+    set spawn_argv [concat [list /usr/bin/ssh] [ssh_options $tty] [list -- $target] $remote]
+    return [list ssh $spawn_argv $prompt_limit $assertion $timeout_seconds]
+}
+
+proc output_value {payload} {
+    set value [string map [list "\r" ""] $payload]
+    return [string trim $value "\n"]
+}
+
+proc assert_output {assertion payload} {
+    set value [output_value $payload]
+    if {$assertion eq "none"} {
+        return
+    }
+    if {$assertion eq "empty"} {
+        if {$value ne ""} {
+            return -code error "expected-empty-output"
+        }
+        return
+    }
+    if {[string first "exact:" $assertion] == 0} {
+        if {$value ne [string range $assertion 6 end]} {
+            return -code error "exact-output-mismatch"
+        }
+        return
+    }
+    if {[string first "word:" $assertion] == 0} {
+        set expected [string range $assertion 5 end]
+        if {[lsearch -exact [split $value] $expected] < 0} {
+            return -code error "word-output-missing"
+        }
+        return
+    }
+    if {[string first "contains:" $assertion] == 0} {
+        set expected [string range $assertion 9 end]
+        if {[string first $expected $value] < 0} {
+            return -code error "required-output-fragment-missing"
+        }
+        return
+    }
+    return -code error "unknown-assertion"
+}
+
+proc emit_safe {payload password} {
+    if {$password ne ""} {
+        set payload [string map [list $password "<credential-redacted>"] $payload]
+    }
+    puts -nonewline $payload
+    flush stdout
+}
+
+if {$argc != 10 ||
+    [lindex $argv 0] ne "--manifest" ||
+    [lindex $argv 2] ne "--manifest-sha256" ||
+    [lindex $argv 4] ne "--credential-path" ||
+    [lindex $argv 6] ne "--action" ||
+    [lindex $argv 8] ne "--operation"} {
+    fail "arguments" 64
+}
+set manifest [lindex $argv 1]
+set manifest_sha [lindex $argv 3]
+set credential_path [lindex $argv 5]
+set action [lindex $argv 7]
+set operation [lindex $argv 9]
+set argv {}
+
+if {![regexp {^[0-9a-f]{64}$} $manifest_sha] ||
+    $credential_path ne "/Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82" ||
+    $action ni {plan execute} ||
+    ![regexp {^[A-Za-z0-9_.-]+$} $operation]} {
+    fail "argument-values" 65
+}
+if {[catch {load_manifest $manifest $manifest_sha} values] ||
+    [catch {validate_manifest_values $values} validation_message] ||
+    [catch {validate_self $values} self_message] ||
+    [catch {build_operation $values $manifest_sha $operation} operation_spec]} {
+    fail "policy" 66
+}
+lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds
+
+if {$action eq "plan"} {
+    puts "B82_V6_TRANSPORT_PLAN operation=$operation transport=$transport_type credential_read=0 network_operations=0"
+    puts "EXPECT_PROGRAM [info nameofexecutable] SCRIPT [file normalize [info script]]"
+    puts "EXPECT_SPAWN_ARGV [list {*}$spawn_argv]"
+    puts "EXPECT_OUTPUT_ASSERTION [list $assertion]"
+    exit 0
+}
+
+set password ""
+if {[catch {open $credential_path r} credential_file]} {
+    fail "credential-open" 65
+}
+fconfigure $credential_file -encoding utf-8 -translation lf
+if {[gets $credential_file ssh_line] < 0 || [gets $credential_file password] < 0 ||
+    [gets $credential_file unexpected] >= 0} {
+    close $credential_file
+    set password ""
+    fail "credential-shape" 65
+}
+close $credential_file
+set ssh_parts [split [string trim $ssh_line]]
+set ssh_line ""
+if {$ssh_parts ne [list ssh siyixuan@192.168.10.82] || $password eq "" ||
+    [string first "\u0000" $password] >= 0 || [string first "\r" $password] >= 0 ||
+    [string first "\n" $password] >= 0} {
+    set password ""
+    fail "credential-value" 65
+}
+
+set timeout $timeout_seconds
+set captured_output ""
+set credential_sends 0
+log_user 0
+spawn -noecho {*}$spawn_argv
+expect {
+    -re {(?i)(?:password|passphrase)[^:\r\n]*:[ \t]*$} {
+        incr credential_sends
+        if {$credential_sends > $prompt_limit} {
+            set password ""
+            fail "credential-prompt-count" 77
+        }
+        send -- "$password\r"
+        exp_continue
+    }
+    -re {[^\r\n]*(?:\r\n|\n|\r)} {
+        append captured_output $expect_out(buffer)
+        emit_safe $expect_out(buffer) $password
+        exp_continue
+    }
+    timeout {
+        set password ""
+        fail "timeout" 124
+    }
+    eof {
+        if {[info exists expect_out(buffer)] && $expect_out(buffer) ne ""} {
+            append captured_output $expect_out(buffer)
+            emit_safe $expect_out(buffer) $password
+        }
+        set password ""
+        set wait_status [wait]
+        set child_rc [lindex $wait_status 3]
+        if {$child_rc != 0} {
+            exit $child_rc
+        }
+        if {[catch {assert_output $assertion $captured_output} assertion_message]} {
+            fail "output-assertion" 78
+        }
+        exit 0
+    }
+}

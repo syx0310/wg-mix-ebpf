@@ -4,26 +4,110 @@ wg-mix-ebpf .82 real-host v6 local-only contract
 Status
 ------
 
-This directory is a local review artifact. It contains no SSH/SCP/Expect
-transport and no credential handling. Nothing in this directory has been run
-on 192.168.10.82. The only executable local gate is
-`test-hermetic-matrix.sh`; it runs syntax/static fixtures and the matrix's
-side-effect-free `plan` mode.
+This directory is a local review artifact. It now includes a versioned package
+binder, an operation-locked Expect SSH/SCP transport, a controller, and a
+separate root source-staging script. None of those files has been bound to a
+final integration commit or executed against 192.168.10.82. Development and
+acceptance of this controller commit are local-only: the transport's `plan`
+action renders its exact SSH/SCP spawn argv and exits before opening the
+credential file or spawning a child.
+
+The executable local gates are `test-hermetic-matrix.sh` and
+`test-hermetic-controller.sh`. The latter builds a fresh fixture Git history
+and bundle under `/private/tmp`, binds both present and absent WireGuard
+manifests, invokes the actual Expect policy in plan mode, and exercises failure
+paths. It retains its unique fixture tree rather than performing automatic
+cleanup.
 
 The following values intentionally remain unbound until the final integration
 commit is selected and reviewed:
 
 * FINAL_INTEGRATION_COMMIT=<exact nonzero/non-ffff 40-lowercase-hex commit>
 * FINAL_INTEGRATION_BUNDLE_SHA256=<exact nonzero/non-ffff 64-lowercase-hex SHA-256>
+* FINAL_INTEGRATION_REF=<exact refs/heads/... whose commit equals FINAL_INTEGRATION_COMMIT>
+* FINAL_PACKAGE_MANIFEST_SHA256=<exact generated manifest SHA-256>
 * FINAL_WG_INTERFACE=<exact interface name observed by read-only preflight>
 * FINAL_WG_LOCAL_ADDRESS=<exact IPv4 address observed by read-only preflight>
 * FINAL_WG_PEER_ADDRESS=<exact routed peer IPv4 observed by read-only preflight>
 
-`root-matrix-n-r.sh` requires all five values as argv and fails closed when
-they are absent or malformed. A separate, later commit must provide a reviewed
-transport/controller and bind its exact argv. This local-only commit must not
-be interpreted as authorization to read credentials, connect to either host,
-install packages, use sudo, or run the matrix.
+`root-matrix-n-r.sh` requires all five topology/bundle values as argv and fails
+closed when they are absent or malformed. `bind-final-package.sh` never uses
+`HEAD` as a default: it requires both an exact ref and commit, checks their
+equality before and after bundle creation, and records Git blob and SHA-256
+identities for every privileged or transport-relevant script. The generated
+bundle contains the selected ref's history rather than a source-only archive.
+
+A later main-Agent binding step must select and review those exact values. This
+controller commit must not be interpreted as authorization to read credentials,
+connect to either host, use sudo, stage source, or run the matrix.
+
+Current WireGuard preflight result
+----------------------------------
+
+The main Agent's read-only 192.168.10.82 preflight found that `wg show
+interfaces` is empty. There is currently no real WireGuard interface, local
+address, or WireGuard-routed peer address to bind. No placeholder topology may
+be substituted.
+
+The binder therefore supports an explicit `--wg-state absent` contract only
+when all three topology values are the literal `absent`. Such a manifest can
+be used to review package creation and source staging. The controller reports
+`wg_active_scoped=not-covered pass=0` in plan mode, and rejects matrix-plan,
+run, and restore before invoking Expect. A `bound` manifest remains available
+only after a later read-only preflight observes and reviews all three real
+values.
+
+The existing monolithic root matrix is intentionally unchanged in this commit.
+The minimum safe follow-up is an independent reviewed change that exposes
+non-WireGuard veth/FakeTCP and bare-ens33 baseline phases separately, while
+classifying every WG-active scoped phase as `not-covered` when WireGuard is
+absent. Those baseline phases must not be promoted to a WG dataplane pass.
+
+Controller and package binding contract
+---------------------------------------
+
+Files added by this framework:
+
+* `bind-final-package.sh`: exact ref/commit/WireGuard binding, full-history Git
+  bundle creation, package extraction from the selected commit, and immutable
+  tab-separated manifest generation in a fresh `/private/tmp` directory.
+* `locked-transport.exp`: fixed operation-name to argv mapping. Callers cannot
+  supply a remote argv. `plan` exits before credential access; `execute` reads
+  only the exact two-line credential file in memory, never places the password
+  in argv or logs, and redacts it from child output.
+* `controller.sh`: verifies the manifest, bundle, Git blobs, local file hashes,
+  and controller/transport identity before rendering or executing an operation.
+  It has separate `preflight`, `prepare`, `matrix-plan`, `run`, and explicit
+  `restore` modes and stops on the first failure without cleanup.
+* `prepare-stage-root.sh`: the versioned high-privilege preparation content. It
+  verifies host/package identity and hashes, creates only the fixed run-owned
+  source stage when absent, clones the bound bundle, checks out the exact
+  commit, runs Bash/ShellCheck gates, and writes a noclobber binding marker.
+  It has no inline SSH body, recursive deletion, trap, package installation,
+  container, mount, chroot, or namespace operation.
+
+The controller has no APT action. Its read-only preflight renders exact version
+or presence checks for Go, clang/LLVM, bpftool, make, GCC, iperf3, ShellCheck,
+jq, WireGuard tools, ethtool, tc/iproute2, kernel BTF, bpffs, and the exact
+kernel header directory. Missing tools stop the flow; any future installation
+must be a separately versioned and reviewed phase.
+
+The final binder argv remains unbound and must be supplied in this exact shape:
+
+    /bin/bash scripts/realhost-b82-c8e41d73/bind-final-package.sh bind \
+      --repository FINAL_CANONICAL_WORKTREE \
+      --source-ref FINAL_INTEGRATION_REF \
+      --commit FINAL_INTEGRATION_COMMIT \
+      --wg-state FINAL_WG_STATE \
+      --wg-interface FINAL_WG_INTERFACE \
+      --wg-local-address FINAL_WG_LOCAL_ADDRESS \
+      --wg-peer-address FINAL_WG_PEER_ADDRESS \
+      --output-dir /private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-<first12commit>
+
+Before any execute action, the main Agent must record the resulting manifest
+path/SHA-256, bundle SHA-256, selected ref/commit, Git blob and SHA-256 of
+`prepare-stage-root.sh` and `root-matrix-n-r.sh`, complete controller argv, and
+the write set. A reviewer must accept that exact content and argv.
 
 Scope and topology
 ------------------
@@ -142,11 +226,14 @@ Local acceptance
 From the repository worktree, the local-only acceptance command is:
 
     /bin/bash scripts/realhost-b82-c8e41d73/test-hermetic-matrix.sh
+    /bin/bash scripts/realhost-b82-c8e41d73/test-hermetic-controller.sh
 
 It must report both:
 
     static real-host safety and checker fixtures: PASS
     hermetic matrix argv and failure-path tests: PASS
+    static v6 binder/controller/transport/stager safety contract: PASS
+    hermetic v6 binder, SSH/SCP/Expect plan, failure paths and WireGuard absence: PASS
 
 ShellCheck is mandatory on .82 before any later sudo phase; its absence on the
 local macOS host is an explicit skip, not a remote pass. The old v5 package must
