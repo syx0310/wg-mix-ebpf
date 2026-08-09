@@ -241,7 +241,15 @@ class SimulatedRunner(FixtureRunner):
         if MODULE.TOOLS["ping"] in argv:
             payload = int(argv[argv.index("-s") + 1]) if "-s" in argv else 56
             if payload > self.mtu - 28:
-                return 1, b"1 packets transmitted, 0 received, 100% packet loss\n", b""
+                return (
+                    1,
+                    (
+                        f"PING {self.spec.peer_address} ({self.spec.peer_address}) {payload} data bytes\n"
+                        + 3 * f"ping: local error: message too long, mtu={self.mtu}\n"
+                        + "3 packets transmitted, 0 received, +3 errors, 100% packet loss\n"
+                    ).encode(),
+                    b"",
+                )
             return 0, b"3 packets transmitted, 3 received, 0% packet loss\n", b""
         key = tuple(argv)
         if key in self.read_failures:
@@ -624,6 +632,50 @@ class StrictIperfOracleTests(unittest.TestCase):
             self.assertTrue(all(group["streams"] == 4 for group in groups))
 
 
+class MTUNegativeOracleTests(unittest.TestCase):
+    def setUp(self):
+        self.spec = fixture_spec()
+        self.contract = MODULE.mtu_negative_contract(self.spec, 1492)
+
+    def test_exact_local_emsgsize_is_structured_boundary_evidence(self):
+        outcome = MODULE.mtu_negative_oracle(
+            self.contract,
+            1,
+            (
+                b"PING 47.116.202.155 (47.116.202.155) 1465 data bytes\n"
+                b"ping: local error: message too long, mtu=1492\n"
+                b"ping: local error: message too long, mtu=1492\n"
+                b"3 packets transmitted, 0 received, +3 errors, 100% packet loss\n"
+            ),
+            b"ping: local error: message too long, mtu=1492\n",
+        )
+        self.assertEqual(outcome.local_errno, "EMSGSIZE")
+        self.assertEqual(outcome.reported_mtu, 1492)
+        self.assertEqual(outcome.packet_bytes, 1493)
+        self.assertEqual(outcome.local_error_count, 3)
+
+    def test_non_local_failures_never_prove_the_mtu_boundary(self):
+        cases = {
+            "loss": (1, b"3 packets transmitted, 0 received, 100% packet loss\n", b""),
+            "unreachable": (1, b"From 192.168.10.1 Destination Host Unreachable\n", b""),
+            "timeout": (124, b"", b"timeout: sending signal TERM\n"),
+            "remote-pmtu": (1, b"From 192.168.10.1 icmp_seq=1 Frag needed and DF set\n", b""),
+        }
+        for name, (rc, stdout, stderr) in cases.items():
+            with self.subTest(name=name), self.assertRaises(MODULE.HarnessError):
+                MODULE.mtu_negative_oracle(self.contract, rc, stdout, stderr)
+
+    def test_wrong_reported_mtu_or_return_code_is_rejected(self):
+        for rc, mtu in ((1, 1500), (124, 1492)):
+            with self.subTest(rc=rc, mtu=mtu), self.assertRaises(MODULE.HarnessError):
+                MODULE.mtu_negative_oracle(
+                    self.contract,
+                    rc,
+                    f"ping: local error: message too long, mtu={mtu}\n".encode(),
+                    b"",
+                )
+
+
 class CounterGateTests(unittest.TestCase):
     vmxnet3_stats = b"""NIC statistics:
      Tx Queue#: 0
@@ -790,6 +842,23 @@ class PlannerTests(unittest.TestCase):
             self.assertEqual(by_name[name]["mutation"], [])
         self.assertFalse(plan["safety_contract"]["implemented_capability_bits_changed"])
         self.assertFalse(plan["safety_contract"]["af_packet_no_dst_positive_pmtu"])
+
+    def test_mtu_negative_step_binds_the_local_emsgsize_oracle(self):
+        spec = fixture_spec()
+        runner = FixtureRunner(spec)
+        snapshot, commands = MODULE.collect_snapshot(spec, runner)
+        plan = MODULE.build_plan(spec, snapshot, commands)
+        cell = next(item for item in plan["cells"] if item["name"] == "tcp-mtu-low")
+        negative = next(item for item in cell["traffic"] if item["kind"] == "mtu-negative")
+        self.assertEqual(
+            negative["outcome_oracle"],
+            MODULE.mtu_negative_contract(spec, cell["expected_mtu"]),
+        )
+        self.assertEqual(negative["outcome_oracle"]["packet_bytes"], cell["expected_mtu"] + 1)
+
+        negative["outcome_oracle"]["expected_mtu"] += 1
+        with self.assertRaisesRegex(MODULE.HarnessError, "outcome oracle is not exact"):
+            MODULE.validate_plan_shape(plan, spec)
 
     def test_plan_has_one_stable_interface_lease_and_per_write_guard(self):
         spec = fixture_spec()
