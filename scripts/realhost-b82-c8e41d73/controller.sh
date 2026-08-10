@@ -7,6 +7,15 @@ readonly RUN_ID='c8e41d73'
 readonly PACKAGE_ID='4f2a9b61'
 readonly CREDENTIAL_PATH='/Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82'
 readonly EXPECTED_OUTPUT_PREFIX="/private/tmp/wg-mix-b82-v6-${RUN_ID}-${PACKAGE_ID}-"
+readonly R2_PREDECESSOR_COMMIT='f75fe7678cfdecf08173fd201be5c055417d6e11'
+readonly R2_PREDECESSOR_REF='refs/heads/codex/tcx-faketcp-final-v2'
+readonly R2_PREDECESSOR_PACKAGE='/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-f75fe7678cfd'
+readonly R2_PREDECESSOR_MANIFEST="${R2_PREDECESSOR_PACKAGE}/package-manifest.v1"
+readonly R2_PREDECESSOR_MANIFEST_SHA256='2d6c6caac080b599fbfa0f73c64f6976cf30d1504fc506ebd39c638b2f9449e3'
+readonly R2_PREDECESSOR_BUNDLE_SHA256='b74811808e0413714dcf20b8292fe68631f603c0b9a68bc9951af481477b413b'
+readonly R2_PREDECESSOR_HISTORY_ROOTS_SHA256='9356df63b3d4c4c362912b14ab8ee5cb54d12cd1f14be9aa1fe8e18adbad6f05'
+readonly R2_PREDECESSOR_HISTORY_OBJECTS_SHA256='21647f92e57f9dbb8e15707699f632544d6dfcf2e1b4279d775cce1fb82163f3'
+R2_PREDECESSOR_DEVICE_INODE=''
 
 MODE=''
 MANIFEST=''
@@ -136,7 +145,7 @@ fail() {
 
 usage() {
   printf '%s\n' \
-    "usage: $0 {verify-package|plan|preflight|prepare|provision-apply|fresh-plan|fresh-run|fresh-restore|veth-plan|veth-run|veth-restore|routed-plan|routed-run|routed-restore|realnic-plan|realnic-run|realnic-restore}" \
+    "usage: $0 {verify-package|verify-r2-predecessor-package|plan|preflight|prepare|provision-apply|fresh-plan|fresh-run|fresh-restore|veth-plan|veth-run|veth-restore|routed-plan|routed-run|routed-restore|realnic-plan|realnic-run|realnic-restore|retire-postflight-f75fe7678cfd-r2|verify-postflight-retirement-r2}" \
     '  --manifest ABSOLUTE_PACKAGE_MANIFEST --manifest-sha256 64-lowercase-hex' \
     "  --credential-path ${CREDENTIAL_PATH}" \
     '  --approved-plan-sha256 {none|64-lowercase-hex}' >&2
@@ -213,10 +222,11 @@ parse_arguments() {
   MODE="$1"
   shift
   case "${MODE}" in
-    verify-package | plan | preflight | prepare | provision-apply | \
+    verify-package | verify-r2-predecessor-package | plan | preflight | prepare | provision-apply | \
       fresh-plan | fresh-run | fresh-restore | \
       veth-plan | veth-run | veth-restore | routed-plan | routed-run | routed-restore | \
-      realnic-plan | realnic-run | realnic-restore) ;;
+      realnic-plan | realnic-run | realnic-restore | \
+      retire-postflight-f75fe7678cfd-r2 | verify-postflight-retirement-r2) ;;
     *) usage; return 64 ;;
   esac
   while (($# > 0)); do
@@ -443,7 +453,7 @@ verify_bound_history() {
   local history_repository="${LOCAL_PACKAGE_DIR}/history-verification.git"
   local history_objects="${LOCAL_PACKAGE_DIR}/history-objects.v1"
   local history_roots="${LOCAL_PACKAGE_DIR}/history-roots.v1"
-  local isolated_count missing_rc actual_roots
+  local isolated_count missing_rc actual_roots actual_objects_sha
   [[ -d "${history_repository}" && ! -L "${history_repository}" &&
     -f "${history_objects}" && ! -L "${history_objects}" &&
     -f "${history_roots}" && ! -L "${history_roots}" ]] || return 66
@@ -463,8 +473,9 @@ verify_bound_history() {
   actual_roots="$(git_history "${history_repository}" rev-list --max-parents=0 --reverse \
     "${INTEGRATION_COMMIT}")" || return 76
   [[ "$(<"${history_roots}")" == "${actual_roots}" && -n "${actual_roots}" ]] || return 76
-  [[ "$(git_history "${history_repository}" rev-list --parents --objects --missing=print \
-    "${INTEGRATION_COMMIT}" | sha256_stream)" == "${HISTORY_OBJECTS_SHA256}" ]] || return 76
+  actual_objects_sha="$(git_history "${history_repository}" rev-list --parents --objects \
+    --missing=print "${INTEGRATION_COMMIT}" | sha256_stream)" || return 76
+  [[ "${actual_objects_sha}" == "${HISTORY_OBJECTS_SHA256}" ]] || return 76
 }
 
 verify_identity() {
@@ -607,6 +618,538 @@ verify_manifest_contract() {
   bundle_head="$(git_checked bundle list-heads "${LOCAL_PACKAGE_DIR}/${BUNDLE_NAME}" "${INTEGRATION_REF}")" || return 67
   [[ "${bundle_head}" == "${INTEGRATION_COMMIT} ${INTEGRATION_REF}" ]] || return 67
   verify_bound_history || return $?
+}
+
+verify_r2_predecessor_manifest_contract() {
+  /usr/bin/python3 -B -I -c '
+import hashlib
+import os
+import stat
+import subprocess
+import sys
+
+(
+    manifest_name,
+    package_name,
+    manifest_sha,
+    bundle_sha,
+    roots_sha,
+    objects_sha,
+    integration_commit,
+    integration_ref,
+) = sys.argv[1:]
+expected_manifest = sys.stdin.buffer.read()
+if (manifest_name != os.path.join(package_name, "package-manifest.v1") or
+        package_name !=
+        "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-f75fe7678cfd" or
+        integration_commit != "f75fe7678cfdecf08173fd201be5c055417d6e11" or
+        integration_ref != "refs/heads/codex/tcx-faketcp-final-v2"):
+    raise SystemExit(66)
+if (not expected_manifest.endswith(b"\n") or expected_manifest.endswith(b"\n\n") or
+        b"\0" in expected_manifest or b"\r" in expected_manifest):
+    raise SystemExit(70)
+expected_lines = expected_manifest[:-1].split(b"\n")
+expected_pairs = [line.split(b"\t") for line in expected_lines]
+if (len(expected_lines) != 103 or any(len(pair) != 2 or not pair[0] or not pair[1]
+                                      for pair in expected_pairs) or
+        len({pair[0] for pair in expected_pairs}) != 103):
+    raise SystemExit(70)
+expected_values = dict(expected_pairs)
+if (expected_values.get(b"local_package_dir") != package_name.encode("utf-8") or
+        expected_values.get(b"integration_commit") != integration_commit.encode("ascii") or
+        expected_values.get(b"integration_ref") != integration_ref.encode("ascii")):
+    raise SystemExit(70)
+
+expected_files = {
+    "source-4f2a9b61.bundle": (bundle_sha, 2469874),
+    "package-manifest.v1": (manifest_sha, 7315),
+    "bind-final-package.sh": (
+        "a808a7879ef64190eff9e81e6b694acea7bc04b1b74ffad44109b237a5eb14ca", 17015),
+    "controller.sh": (
+        "fb8a7a685b5a6b73de851ee9a3396f4154cc4ae083a7c36f3b3128b2b9a2e77d", 43303),
+    "prepare-stage-root.sh": (
+        "1bcb8db91d976d2a1d95f7d87223a2dac4a1678f74c1c25542e54b01ee10eeea", 54230),
+    "provision-ubuntu-test-host.sh": (
+        "078d191b0edbafe27e9f684d3fa495e04d7217a01d0ec1fd32eaede211178c8f", 19437),
+    "root-matrix-n-r.sh": (
+        "9ec125c2933866431779b760d41c6484cc0fbb9e5e9f3b5431c4a56fbab63e07", 1101),
+    "check-realhost-iperf.py": (
+        "9a52378b8a1ef6043d4d5792471c8239a0392a80da72f5c00846dd89e88ccd67", 21027),
+    "test-hermetic-matrix.sh": (
+        "9b81949416a1b4df91fee0e7d31a3de2c6ba9b474dc9c0f4dbbb1cc609207499", 6694),
+    "test_matrix_static.py": (
+        "8de2dcdc866938da0502f1ad73ac9b38c9b6ff4066c76e9cbc946c9ca30a53f8", 5656),
+    "checksum-module-lease.sh": (
+        "4ab9a22910e8d597cc04bb4fdde9e1b32d37a1bb2c6ad7b76f52d576b5a9adb2", 23755),
+    "root-fresh-verifier-gate.sh": (
+        "4c2cf85b7e571df9b7ed4a77fa720c9f5e35950d44af5a39499a7ad700fe6a27", 65201),
+    "test-hermetic-fresh-verifier-gate.sh": (
+        "c9b5b1f954c794c5c986214777727a76579f670db9587f319ac148fc0c2a05f3", 14628),
+    "test_fresh_verifier_gate_static.py": (
+        "ace6951027788e82ad879caf285316af4e6ee81fdb6746f569cd7c22b9f80bf3", 17307),
+    "realnic_acceptance.py": (
+        "a88100b2a23ad41dd3e644c3ba1c7a722d58c8184a997aabf0ceab78552c6339", 216405),
+    "test_realnic_acceptance.py": (
+        "fcb3d0dadee6da6e0ad67d028f268ebe43575287f555cd8100d279f8a3b0b79c", 148160),
+    "test_realnic_acceptance_static.py": (
+        "ba8aef3219a0cf2a5c6b5058b245f64eb828a08bb532d2aa0291f51ee7206ad2", 14894),
+}
+history_files = {
+    "history-roots.v1": (roots_sha, 41),
+    "history-objects.v1": (objects_sha, 351103),
+}
+expected_tree = (
+    ("scripts/realhost-b82-c8e41d73/bind-final-package.sh",
+     "13ec99ddafb7452c98f05bf4855ef52c3f54b185",
+     "a808a7879ef64190eff9e81e6b694acea7bc04b1b74ffad44109b237a5eb14ca"),
+    ("scripts/realhost-b82-c8e41d73/controller.sh",
+     "8371e5492c4e88f3e855fa3c7edfbff15bcf3a5f",
+     "fb8a7a685b5a6b73de851ee9a3396f4154cc4ae083a7c36f3b3128b2b9a2e77d"),
+    ("scripts/realhost-b82-c8e41d73/locked-transport.exp",
+     "264f0cf74e6ff53d0cbee2688faa5d886898d22f",
+     "c70e4f040dc082c4f286c237bda32fe2a60b3e5f6300ec57734645a0be12abec"),
+    ("scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh",
+     "d2b2d473afb79c4463fd6c712d4eda3faeed5c7e",
+     "9ec125c2933866431779b760d41c6484cc0fbb9e5e9f3b5431c4a56fbab63e07"),
+    ("scripts/realhost-b82-c8e41d73/check-realhost-iperf.py",
+     "765871ef3af87cd8a101a42e71ea97c1245dc9da",
+     "9a52378b8a1ef6043d4d5792471c8239a0392a80da72f5c00846dd89e88ccd67"),
+    ("scripts/realhost-b82-c8e41d73/test-hermetic-matrix.sh",
+     "81f7cd86d8dc5a93133ea755311ba57aa66e4c76",
+     "9b81949416a1b4df91fee0e7d31a3de2c6ba9b474dc9c0f4dbbb1cc609207499"),
+    ("scripts/realhost-b82-c8e41d73/test_matrix_static.py",
+     "0a2b1538d3127e8bae8953b0dff59d60cc379f39",
+     "8de2dcdc866938da0502f1ad73ac9b38c9b6ff4066c76e9cbc946c9ca30a53f8"),
+    ("scripts/realhost-b82-c8e41d73/checksum-module-lease.sh",
+     "c2e6077005e046eef0e1186c26cdaaf29c780f98",
+     "4ab9a22910e8d597cc04bb4fdde9e1b32d37a1bb2c6ad7b76f52d576b5a9adb2"),
+    ("scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh",
+     "48dd5e68071798c3d25daf0051cbf54f8cd3297e",
+     "4c2cf85b7e571df9b7ed4a77fa720c9f5e35950d44af5a39499a7ad700fe6a27"),
+    ("scripts/realhost-b82-c8e41d73/test-hermetic-fresh-verifier-gate.sh",
+     "f3f7367d28253ebae746eb0e225c11f90eaa8305",
+     "c9b5b1f954c794c5c986214777727a76579f670db9587f319ac148fc0c2a05f3"),
+    ("scripts/realhost-b82-c8e41d73/test_fresh_verifier_gate_static.py",
+     "f86736b1c4a5b884814f062edbb2d652172f024f",
+     "ace6951027788e82ad879caf285316af4e6ee81fdb6746f569cd7c22b9f80bf3"),
+    ("scripts/realhost-b82-c8e41d73/prepare-stage-root.sh",
+     "057db657b0ba096a4f660eedda2e0a4242af7de5",
+     "1bcb8db91d976d2a1d95f7d87223a2dac4a1678f74c1c25542e54b01ee10eeea"),
+    ("scripts/realhost-b82-acceptance-v1/realnic_acceptance.py",
+     "e1edba5c9dd62c8c169d7129e8b376d4ce7d1168",
+     "a88100b2a23ad41dd3e644c3ba1c7a722d58c8184a997aabf0ceab78552c6339"),
+    ("scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py",
+     "e92f8f7db9733eb3f655b388f1efd685f738c2c4",
+     "fcb3d0dadee6da6e0ad67d028f268ebe43575287f555cd8100d279f8a3b0b79c"),
+    ("scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py",
+     "b0dd244937b9139fe8c8548d6c046b76d9f611e9",
+     "ba8aef3219a0cf2a5c6b5058b245f64eb828a08bb532d2aa0291f51ee7206ad2"),
+    ("scripts/provision-ubuntu-test-host.sh",
+     "143eb89a2e4bbbf548b510bcc2fd9f66184d3d76",
+     "078d191b0edbafe27e9f684d3fa495e04d7217a01d0ec1fd32eaede211178c8f"),
+    ("scripts/realhost-b82-c8e41d73/root-veth-n-r.sh",
+     "a72f7f2eebe765bc7fa8a5352c134233b30ac8aa",
+     "fbb8779039137383df6f51f05319faea966c69a80001da837dee22d04d8f7a70"),
+    ("scripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh",
+     "ae0c74eefe33cf6afda681ba6fca17b54700108f",
+     "939c3b28310596ed6bada0eb3ccdd5ebbb7eeebeaf959504c7d468b929f8174c"),
+    ("scripts/realhost-b82-c8e41d73/test_veth_runner_static.py",
+     "5bc3d0ac0ac48c3adc0cd86166f533edc676c712",
+     "e40da6b1a6541a9b8b6c56d9277d4d73838e037876180e479b5af5d64a4edc90"),
+    ("scripts/realhost-b82-routed-veth-v1/controller-seam.sh",
+     "18d9e4d72a0b9022019e738d9de4fd4e23bc4903",
+     "2bd7b65c3e770ff53445cbc7c195e741e8fff5eeef9e51bd6fcaa2f513d1f251"),
+    ("scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh",
+     "9d30910b692b2d42c1528c75c2a3ba0a5d0a11cb",
+     "5af8b848c9fc5f915b25c6c03822622f2ac75996a54ebf8172c7c5391c9f3485"),
+    ("scripts/realhost-b82-routed-veth-v1/test-hermetic-routed-veth-harness.sh",
+     "253c7b0b4d4c2d065475a82742418446146d0a0a",
+     "674f96665eb26f879eae08936683fdac2beb974841ed99f9021abe9e04752032"),
+    ("scripts/realhost-b82-routed-veth-v1/test_routed_veth_harness_static.py",
+     "06e0fa14779ce778440250f4a437426017754cd4",
+     "5bb678726ecc6bcc946233ae138d541fc50dc9f6ec40ddf139350863690d88c1"),
+)
+directory_flags = (os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+                   getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0) |
+                   getattr(os, "O_NONBLOCK", 0))
+file_flags = (os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) |
+              getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NONBLOCK", 0))
+expected_package_entries = (
+    set(expected_files) | set(history_files) | {"history-verification.git"}
+)
+expected_history_entries = {"HEAD", "config", "description", "hooks", "info", "objects", "refs"}
+
+
+def directory_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def file_identity(metadata):
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_uid,
+        metadata.st_gid,
+        stat.S_IMODE(metadata.st_mode),
+        metadata.st_nlink,
+        metadata.st_size,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+package_fd = -1
+history_fd = -1
+bundle_fd = -1
+try:
+    try:
+        package_fd = os.open(package_name, directory_flags)
+        held_package = os.fstat(package_fd)
+        named_package = os.stat(package_name, follow_symlinks=False)
+    except OSError:
+        raise SystemExit(66)
+    if (not stat.S_ISDIR(held_package.st_mode) or
+            not stat.S_ISDIR(named_package.st_mode) or
+            directory_identity(held_package) != directory_identity(named_package) or
+            os.path.realpath(package_name) != package_name or
+            held_package.st_uid != os.getuid() or
+            stat.S_IMODE(held_package.st_mode) != 0o700 or
+            set(os.listdir(package_fd)) != expected_package_entries):
+        raise SystemExit(66)
+    package_identity = directory_identity(held_package)
+
+    def read_exact_regular(name, expected_sha, expected_size, keep_open=False):
+        descriptor = -1
+        try:
+            descriptor = os.open(name, file_flags, dir_fd=package_fd)
+            held = os.fstat(descriptor)
+            named = os.stat(name, dir_fd=package_fd, follow_symlinks=False)
+            if (not stat.S_ISREG(held.st_mode) or not stat.S_ISREG(named.st_mode) or
+                    file_identity(held) != file_identity(named) or
+                    held.st_uid != held_package.st_uid or
+                    held.st_gid != held_package.st_gid or
+                    stat.S_IMODE(held.st_mode) != 0o600 or held.st_nlink != 1 or
+                    held.st_size != expected_size or
+                    not (1 <= held.st_size <= 16777216)):
+                raise SystemExit(66)
+            payload = b""
+            offset = 0
+            while True:
+                chunk = os.pread(descriptor, 65536, offset)
+                if not chunk:
+                    break
+                payload += chunk
+                offset += len(chunk)
+            after = os.fstat(descriptor)
+            if file_identity(held) != file_identity(after):
+                raise SystemExit(66)
+            if (len(payload) != expected_size or
+                    hashlib.sha256(payload).hexdigest() != expected_sha):
+                raise SystemExit(67)
+            identity = file_identity(held)
+            if keep_open:
+                kept_descriptor = descriptor
+                descriptor = -1
+                return payload, identity, kept_descriptor
+            return payload, identity, -1
+        except OSError:
+            raise SystemExit(66)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+
+    payloads = {}
+    initial_file_identities = {}
+    for entry_name, (expected_sha, expected_size) in expected_files.items():
+        keep_open = entry_name == "source-4f2a9b61.bundle"
+        payload, identity, kept_descriptor = read_exact_regular(
+            entry_name, expected_sha, expected_size, keep_open=keep_open
+        )
+        payloads[entry_name] = payload
+        initial_file_identities[entry_name] = identity
+        if keep_open:
+            bundle_fd = kept_descriptor
+    history_payloads = {}
+    for entry_name, (expected_sha, expected_size) in history_files.items():
+        payload, identity, _ = read_exact_regular(entry_name, expected_sha, expected_size)
+        history_payloads[entry_name] = payload
+        initial_file_identities[entry_name] = identity
+
+    if (payloads["package-manifest.v1"] != expected_manifest or
+            hashlib.sha256(expected_manifest).hexdigest() != manifest_sha):
+        raise SystemExit(67)
+    if any(line.startswith(b"?") for line in history_payloads["history-objects.v1"].splitlines()):
+        raise SystemExit(76)
+
+    try:
+        history_fd = os.open("history-verification.git", directory_flags, dir_fd=package_fd)
+        held_history = os.fstat(history_fd)
+        named_history = os.stat(
+            "history-verification.git", dir_fd=package_fd, follow_symlinks=False
+        )
+    except OSError:
+        raise SystemExit(66)
+    if (not stat.S_ISDIR(held_history.st_mode) or
+            not stat.S_ISDIR(named_history.st_mode) or
+            directory_identity(held_history) != directory_identity(named_history) or
+            held_history.st_uid != held_package.st_uid or
+            held_history.st_gid != held_package.st_gid or
+            stat.S_IMODE(held_history.st_mode) != 0o700 or
+            set(os.listdir(history_fd)) != expected_history_entries):
+        raise SystemExit(66)
+    history_identity = directory_identity(held_history)
+
+    git_environment = {
+        "PATH": "/usr/bin:/bin",
+        "LC_ALL": "C",
+        "GIT_CONFIG_GLOBAL": "/dev/null",
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_NO_REPLACE_OBJECTS": "1",
+        "GIT_OPTIONAL_LOCKS": "0",
+    }
+    git_prefix = [
+        "/usr/bin/git",
+        "--no-pager",
+        "--no-replace-objects",
+        "-c", "core.attributesFile=/dev/null",
+        "-c", "core.fsmonitor=false",
+        "-c", "core.hooksPath=/dev/null",
+    ]
+
+    def enter_held_history():
+        os.fchdir(history_fd)
+
+    def run_git(arguments, failure_rc=76):
+        try:
+            result = subprocess.run(
+                git_prefix + list(arguments),
+                env=git_environment,
+                pass_fds=(history_fd, bundle_fd),
+                preexec_fn=enter_held_history,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                timeout=120,
+                check=False,
+            )
+        except (OSError, subprocess.SubprocessError):
+            raise SystemExit(failure_rc)
+        if result.returncode != 0:
+            raise SystemExit(failure_rc)
+        return result.stdout
+
+    if run_git(("rev-parse", f"{integration_commit}^{{commit}}")) != (
+            integration_commit + "\n").encode("ascii"):
+        raise SystemExit(76)
+    if run_git(("rev-parse", "--is-shallow-repository")) != b"false\n":
+        raise SystemExit(76)
+    run_git(("fsck", "--full", "--strict", "--no-dangling", integration_commit))
+    if run_git(("rev-list", "--count", integration_commit)) != b"668\n":
+        raise SystemExit(76)
+    actual_roots = run_git(("rev-list", "--max-parents=0", "--reverse", integration_commit))
+    if not actual_roots or actual_roots != history_payloads["history-roots.v1"]:
+        raise SystemExit(76)
+    actual_objects = run_git(
+        ("rev-list", "--parents", "--objects", "--missing=print", integration_commit)
+    )
+    if hashlib.sha256(actual_objects).hexdigest() != objects_sha:
+        raise SystemExit(76)
+
+    bundle_argument = f"/dev/fd/{bundle_fd}"
+    try:
+        os.lseek(bundle_fd, 0, os.SEEK_SET)
+    except OSError:
+        raise SystemExit(67)
+    run_git(("bundle", "verify", bundle_argument), failure_rc=67)
+    try:
+        os.lseek(bundle_fd, 0, os.SEEK_SET)
+    except OSError:
+        raise SystemExit(67)
+    bundle_heads = run_git(
+        ("bundle", "list-heads", bundle_argument, integration_ref), failure_rc=67
+    )
+    if bundle_heads != f"{integration_commit} {integration_ref}\n".encode("ascii"):
+        raise SystemExit(67)
+
+    if len(expected_tree) != 23:
+        raise SystemExit(70)
+    for repository_file, expected_blob, expected_sha in expected_tree:
+        expected_listing = (
+            f"100755 blob {expected_blob}\t{repository_file}\n".encode("utf-8")
+        )
+        if run_git(("ls-tree", integration_commit, "--", repository_file)) != expected_listing:
+            raise SystemExit(76)
+        blob_payload = run_git(("cat-file", "blob", expected_blob))
+        if hashlib.sha256(blob_payload).hexdigest() != expected_sha:
+            raise SystemExit(76)
+
+    for entry_name, (expected_sha, expected_size) in expected_files.items():
+        payload, identity, _ = read_exact_regular(entry_name, expected_sha, expected_size)
+        if (identity != initial_file_identities[entry_name] or
+                payload != payloads[entry_name]):
+            raise SystemExit(66)
+    for entry_name, (expected_sha, expected_size) in history_files.items():
+        payload, identity, _ = read_exact_regular(entry_name, expected_sha, expected_size)
+        if (identity != initial_file_identities[entry_name] or
+                payload != history_payloads[entry_name]):
+            raise SystemExit(66)
+    if file_identity(os.fstat(bundle_fd)) != initial_file_identities[
+            "source-4f2a9b61.bundle"]:
+        raise SystemExit(66)
+
+    held_history_after = os.fstat(history_fd)
+    named_history_after = os.stat(
+        "history-verification.git", dir_fd=package_fd, follow_symlinks=False
+    )
+    if (directory_identity(held_history_after) != history_identity or
+            directory_identity(named_history_after) != history_identity or
+            set(os.listdir(history_fd)) != expected_history_entries):
+        raise SystemExit(66)
+    held_package_after = os.fstat(package_fd)
+    named_package_after = os.stat(package_name, follow_symlinks=False)
+    if (directory_identity(held_package_after) != package_identity or
+            directory_identity(named_package_after) != package_identity or
+            os.path.realpath(package_name) != package_name or
+            set(os.listdir(package_fd)) != expected_package_entries):
+        raise SystemExit(66)
+    print(f"{held_package_after.st_dev}:{held_package_after.st_ino}")
+except OSError:
+    raise SystemExit(66)
+finally:
+    if bundle_fd >= 0:
+        os.close(bundle_fd)
+    if history_fd >= 0:
+        os.close(history_fd)
+    if package_fd >= 0:
+        os.close(package_fd)
+' "${R2_PREDECESSOR_MANIFEST}" "${R2_PREDECESSOR_PACKAGE}" \
+    "${R2_PREDECESSOR_MANIFEST_SHA256}" "${R2_PREDECESSOR_BUNDLE_SHA256}" \
+    "${R2_PREDECESSOR_HISTORY_ROOTS_SHA256}" \
+    "${R2_PREDECESSOR_HISTORY_OBJECTS_SHA256}" "${R2_PREDECESSOR_COMMIT}" \
+    "${R2_PREDECESSOR_REF}" <<'R2_PREDECESSOR_MANIFEST_V4' || return $?
+format	wg-mix-ebpf-b82-v6-package-v4
+run_id	c8e41d73
+package_id	4f2a9b61
+integration_ref	refs/heads/codex/tcx-faketcp-final-v2
+integration_commit	f75fe7678cfdecf08173fd201be5c055417d6e11
+bundle_name	source-4f2a9b61.bundle
+bundle_sha256	b74811808e0413714dcf20b8292fe68631f603c0b9a68bc9951af481477b413b
+history_verification	isolated-unbundle-rev-list-fsck-v1
+history_commit_count	668
+history_roots_sha256	9356df63b3d4c4c362912b14ab8ee5cb54d12cd1f14be9aa1fe8e18adbad6f05
+history_objects_sha256	21647f92e57f9dbb8e15707699f632544d6dfcf2e1b4279d775cce1fb82163f3
+wg_state	absent
+wg_interface	absent
+wg_local_address	absent
+wg_peer_address	absent
+local_repository	/Users/siyixuan/codes-2/wg-mix-ebpf/.worktree/tcx-faketcp-final-v2
+local_package_dir	/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-f75fe7678cfd
+remote_package_dir	/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61
+remote_source	/run/wg-mix-ebpf-source-stages/c8e41d73/source
+target_user	siyixuan
+target_host	192.168.10.82
+target_hostname	ubuntu-2604-test
+target_kernel	7.0.0-28-generic
+target_machine_id	9db3fb717cc74974b2a6b243d67f67b9
+target_interface	ens33
+peer_address	47.116.202.155
+peer_port	5201
+soak_seconds	3600
+session_seconds	300
+physical_nic_forward_authority	realnic-acceptance-v1
+physical_interface_lock	/run/wg-mix-ebpf-realnic-physical-interface.v1.lock
+legacy_matrix_mode	retired
+realnic_profile	acceptance
+realnic_traffic_seconds	30
+bind_final_package_sh_path	scripts/realhost-b82-c8e41d73/bind-final-package.sh
+bind_final_package_sh_blob	13ec99ddafb7452c98f05bf4855ef52c3f54b185
+bind_final_package_sh_sha256	a808a7879ef64190eff9e81e6b694acea7bc04b1b74ffad44109b237a5eb14ca
+controller_sh_path	scripts/realhost-b82-c8e41d73/controller.sh
+controller_sh_blob	8371e5492c4e88f3e855fa3c7edfbff15bcf3a5f
+controller_sh_sha256	fb8a7a685b5a6b73de851ee9a3396f4154cc4ae083a7c36f3b3128b2b9a2e77d
+locked_transport_exp_path	scripts/realhost-b82-c8e41d73/locked-transport.exp
+locked_transport_exp_blob	264f0cf74e6ff53d0cbee2688faa5d886898d22f
+locked_transport_exp_sha256	c70e4f040dc082c4f286c237bda32fe2a60b3e5f6300ec57734645a0be12abec
+root_matrix_n_r_sh_path	scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh
+root_matrix_n_r_sh_blob	d2b2d473afb79c4463fd6c712d4eda3faeed5c7e
+root_matrix_n_r_sh_sha256	9ec125c2933866431779b760d41c6484cc0fbb9e5e9f3b5431c4a56fbab63e07
+check_realhost_iperf_py_path	scripts/realhost-b82-c8e41d73/check-realhost-iperf.py
+check_realhost_iperf_py_blob	765871ef3af87cd8a101a42e71ea97c1245dc9da
+check_realhost_iperf_py_sha256	9a52378b8a1ef6043d4d5792471c8239a0392a80da72f5c00846dd89e88ccd67
+test_hermetic_matrix_sh_path	scripts/realhost-b82-c8e41d73/test-hermetic-matrix.sh
+test_hermetic_matrix_sh_blob	81f7cd86d8dc5a93133ea755311ba57aa66e4c76
+test_hermetic_matrix_sh_sha256	9b81949416a1b4df91fee0e7d31a3de2c6ba9b474dc9c0f4dbbb1cc609207499
+test_matrix_static_py_path	scripts/realhost-b82-c8e41d73/test_matrix_static.py
+test_matrix_static_py_blob	0a2b1538d3127e8bae8953b0dff59d60cc379f39
+test_matrix_static_py_sha256	8de2dcdc866938da0502f1ad73ac9b38c9b6ff4066c76e9cbc946c9ca30a53f8
+checksum_module_lease_sh_path	scripts/realhost-b82-c8e41d73/checksum-module-lease.sh
+checksum_module_lease_sh_blob	c2e6077005e046eef0e1186c26cdaaf29c780f98
+checksum_module_lease_sh_sha256	4ab9a22910e8d597cc04bb4fdde9e1b32d37a1bb2c6ad7b76f52d576b5a9adb2
+root_fresh_verifier_gate_sh_path	scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh
+root_fresh_verifier_gate_sh_blob	48dd5e68071798c3d25daf0051cbf54f8cd3297e
+root_fresh_verifier_gate_sh_sha256	4c2cf85b7e571df9b7ed4a77fa720c9f5e35950d44af5a39499a7ad700fe6a27
+test_hermetic_fresh_verifier_gate_sh_path	scripts/realhost-b82-c8e41d73/test-hermetic-fresh-verifier-gate.sh
+test_hermetic_fresh_verifier_gate_sh_blob	f3f7367d28253ebae746eb0e225c11f90eaa8305
+test_hermetic_fresh_verifier_gate_sh_sha256	c9b5b1f954c794c5c986214777727a76579f670db9587f319ac148fc0c2a05f3
+test_fresh_verifier_gate_static_py_path	scripts/realhost-b82-c8e41d73/test_fresh_verifier_gate_static.py
+test_fresh_verifier_gate_static_py_blob	f86736b1c4a5b884814f062edbb2d652172f024f
+test_fresh_verifier_gate_static_py_sha256	ace6951027788e82ad879caf285316af4e6ee81fdb6746f569cd7c22b9f80bf3
+prepare_stage_root_sh_path	scripts/realhost-b82-c8e41d73/prepare-stage-root.sh
+prepare_stage_root_sh_blob	057db657b0ba096a4f660eedda2e0a4242af7de5
+prepare_stage_root_sh_sha256	1bcb8db91d976d2a1d95f7d87223a2dac4a1678f74c1c25542e54b01ee10eeea
+realnic_acceptance_py_path	scripts/realhost-b82-acceptance-v1/realnic_acceptance.py
+realnic_acceptance_py_blob	e1edba5c9dd62c8c169d7129e8b376d4ce7d1168
+realnic_acceptance_py_sha256	a88100b2a23ad41dd3e644c3ba1c7a722d58c8184a997aabf0ceab78552c6339
+test_realnic_acceptance_py_path	scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py
+test_realnic_acceptance_py_blob	e92f8f7db9733eb3f655b388f1efd685f738c2c4
+test_realnic_acceptance_py_sha256	fcb3d0dadee6da6e0ad67d028f268ebe43575287f555cd8100d279f8a3b0b79c
+test_realnic_acceptance_static_py_path	scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py
+test_realnic_acceptance_static_py_blob	b0dd244937b9139fe8c8548d6c046b76d9f611e9
+test_realnic_acceptance_static_py_sha256	ba8aef3219a0cf2a5c6b5058b245f64eb828a08bb532d2aa0291f51ee7206ad2
+provision_ubuntu_test_host_sh_path	scripts/provision-ubuntu-test-host.sh
+provision_ubuntu_test_host_sh_blob	143eb89a2e4bbbf548b510bcc2fd9f66184d3d76
+provision_ubuntu_test_host_sh_sha256	078d191b0edbafe27e9f684d3fa495e04d7217a01d0ec1fd32eaede211178c8f
+root_veth_n_r_sh_path	scripts/realhost-b82-c8e41d73/root-veth-n-r.sh
+root_veth_n_r_sh_blob	a72f7f2eebe765bc7fa8a5352c134233b30ac8aa
+root_veth_n_r_sh_sha256	fbb8779039137383df6f51f05319faea966c69a80001da837dee22d04d8f7a70
+test_hermetic_veth_runner_sh_path	scripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh
+test_hermetic_veth_runner_sh_blob	ae0c74eefe33cf6afda681ba6fca17b54700108f
+test_hermetic_veth_runner_sh_sha256	939c3b28310596ed6bada0eb3ccdd5ebbb7eeebeaf959504c7d468b929f8174c
+test_veth_runner_static_py_path	scripts/realhost-b82-c8e41d73/test_veth_runner_static.py
+test_veth_runner_static_py_blob	5bc3d0ac0ac48c3adc0cd86166f533edc676c712
+test_veth_runner_static_py_sha256	e40da6b1a6541a9b8b6c56d9277d4d73838e037876180e479b5af5d64a4edc90
+controller_seam_sh_path	scripts/realhost-b82-routed-veth-v1/controller-seam.sh
+controller_seam_sh_blob	18d9e4d72a0b9022019e738d9de4fd4e23bc4903
+controller_seam_sh_sha256	2bd7b65c3e770ff53445cbc7c195e741e8fff5eeef9e51bd6fcaa2f513d1f251
+root_routed_veth_n_r_sh_path	scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh
+root_routed_veth_n_r_sh_blob	9d30910b692b2d42c1528c75c2a3ba0a5d0a11cb
+root_routed_veth_n_r_sh_sha256	5af8b848c9fc5f915b25c6c03822622f2ac75996a54ebf8172c7c5391c9f3485
+test_hermetic_routed_veth_harness_sh_path	scripts/realhost-b82-routed-veth-v1/test-hermetic-routed-veth-harness.sh
+test_hermetic_routed_veth_harness_sh_blob	253c7b0b4d4c2d065475a82742418446146d0a0a
+test_hermetic_routed_veth_harness_sh_sha256	674f96665eb26f879eae08936683fdac2beb974841ed99f9021abe9e04752032
+test_routed_veth_harness_static_py_path	scripts/realhost-b82-routed-veth-v1/test_routed_veth_harness_static.py
+test_routed_veth_harness_static_py_blob	06e0fa14779ce778440250f4a437426017754cd4
+test_routed_veth_harness_static_py_sha256	5bb678726ecc6bcc946233ae138d541fc50dc9f6ec40ddf139350863690d88c1
+R2_PREDECESSOR_MANIFEST_V4
+}
+
+verify_r2_local_authorities() {
+  printf 'B82_V6_R2_CURRENT_LOCAL_AUTHORITY manifest_sha256=%s integration_commit=%s format=v5 fields=112 package_files=20 credential_read=0 network_operations=0\n' \
+    "${MANIFEST_SHA256}" "${INTEGRATION_COMMIT}"
+  R2_PREDECESSOR_DEVICE_INODE="$(verify_r2_predecessor_manifest_contract)" || return $?
+  [[ "${R2_PREDECESSOR_DEVICE_INODE}" =~ ^[0-9]+:[0-9]+$ ]] || return 70
+  printf 'B82_V6_R2_PREDECESSOR_LOCAL_AUTHORITY predecessor_package=%s predecessor_package_device_inode=%s predecessor_manifest_sha256=%s predecessor_commit=%s predecessor_bundle_sha256=%s format=v4 fields=103 package_files=17 credential_read=0 network_operations=0\n' \
+    "${R2_PREDECESSOR_PACKAGE}" "${R2_PREDECESSOR_DEVICE_INODE}" \
+    "${R2_PREDECESSOR_MANIFEST_SHA256}" "${R2_PREDECESSOR_COMMIT}" \
+    "${R2_PREDECESSOR_BUNDLE_SHA256}"
 }
 
 verify_local_approved_plan() {
@@ -889,6 +1432,12 @@ main() {
   verify_manifest_contract || fail 'manifest-contract' $?
   derive_approved_plan_path || fail 'approved-plan-binding' $?
   case "${MODE}" in
+    verify-r2-predecessor-package | \
+      retire-postflight-f75fe7678cfd-r2 | verify-postflight-retirement-r2)
+      verify_r2_local_authorities || fail 'r2-local-authority' $?
+      ;;
+  esac
+  case "${MODE}" in
     veth-plan | veth-run | veth-restore)
       [[ "${WG_STATE}" == absent ]] || fail 'veth-wireguard-state' 65
       ;;
@@ -899,6 +1448,11 @@ main() {
         fail 'package-device-inode' $?
       printf 'B82_V6_CONTROLLER_PACKAGE_VERIFIED manifest_sha256=%s integration_commit=%s package_device_inode=%s credential_read=0 network_operations=0\n' \
         "${MANIFEST_SHA256}" "${INTEGRATION_COMMIT}" "${package_device_inode}"
+      ;;
+    verify-r2-predecessor-package)
+      printf 'B82_V6_CONTROLLER_R2_PREDECESSOR_VERIFIED predecessor_manifest_sha256=%s predecessor_commit=%s package_device_inode=%s credential_read=0 network_operations=0\n' \
+        "${R2_PREDECESSOR_MANIFEST_SHA256}" "${R2_PREDECESSOR_COMMIT}" \
+        "${R2_PREDECESSOR_DEVICE_INODE}"
       ;;
     plan) plan_all || fail 'plan-operation' $? ;;
     preflight) execute_preflight || fail 'preflight-operation' $? ;;
@@ -939,6 +1493,14 @@ main() {
       ;;
     realnic-restore)
       execute_realnic_restore || fail 'realnic-restore-operation' $?
+      ;;
+    retire-postflight-f75fe7678cfd-r2)
+      run_operation execute retire-postflight-f75fe7678cfd-r2 ||
+        fail 'retire-postflight-f75fe7678cfd-r2-operation' $?
+      ;;
+    verify-postflight-retirement-r2)
+      run_operation execute verify-postflight-retirement-r2 ||
+        fail 'verify-postflight-retirement-r2-operation' $?
       ;;
   esac
 }

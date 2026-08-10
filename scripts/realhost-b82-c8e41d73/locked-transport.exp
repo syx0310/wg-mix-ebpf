@@ -30,6 +30,32 @@ set ::RETIREMENT_RECEIPT_PENDING \
     "${::RETIREMENT_RUN_QROOT}/retirement-complete.v1.pending"
 set ::RETIREMENT_RECEIPT_FINAL \
     "${::RETIREMENT_RUN_QROOT}/retirement-complete.v1"
+set ::R2_RETIRE_ID "c8e41d73-f75fe7678cfd-r2"
+set ::R2_PREDECESSOR_COMMIT \
+    "f75fe7678cfdecf08173fd201be5c055417d6e11"
+set ::R2_PREDECESSOR_MANIFEST_SHA256 \
+    "2d6c6caac080b599fbfa0f73c64f6976cf30d1504fc506ebd39c638b2f9449e3"
+set ::R2_PREDECESSOR_BUNDLE_SHA256 \
+    "b74811808e0413714dcf20b8292fe68631f603c0b9a68bc9951af481477b413b"
+set ::R2_PREDECESSOR_LOCAL_PACKAGE \
+    "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-f75fe7678cfd"
+set ::R2_USER_INTAKE \
+    "/home/siyixuan/wg-mix-ebpf-test/retire-postflight-${::R2_RETIRE_ID}.intake"
+set ::R2_USER_INTAKE_PARENT "/home/siyixuan/wg-mix-ebpf-test"
+set ::R2_HOME_QROOT "/home/.wg-mix-ebpf-retirement-${::R2_RETIRE_ID}"
+set ::R2_AUTH_ROOT "${::R2_HOME_QROOT}/authority"
+set ::R2_AUTH_MANIFEST "${::R2_AUTH_ROOT}/package-manifest.v1"
+set ::R2_AUTH_MANIFEST_PENDING "${::R2_AUTH_MANIFEST}.pending"
+set ::R2_AUTH_SELF "${::R2_AUTH_ROOT}/prepare-stage-root.sh"
+set ::R2_AUTH_SELF_PENDING "${::R2_AUTH_SELF}.pending"
+set ::R2_Q_INTAKE "${::R2_HOME_QROOT}/intake"
+set ::R2_Q_PACKAGE "${::R2_HOME_QROOT}/package"
+set ::R2_RUN_QROOT "/run/wg-mix-ebpf-retirement-${::R2_RETIRE_ID}"
+set ::R2_Q_BOOTSTRAP "${::R2_RUN_QROOT}/bootstrap"
+set ::R2_LOCK "${::R2_RUN_QROOT}/retirement.v1.lock"
+set ::R2_RECEIPT_PENDING \
+    "${::R2_RUN_QROOT}/retirement-complete.v1.pending"
+set ::R2_RECEIPT_FINAL "${::R2_RUN_QROOT}/retirement-complete.v1"
 
 proc fail {message code} {
     puts stderr "B82_V6_TRANSPORT_STOP reason=$message rc=$code"
@@ -45,6 +71,177 @@ proc file_sha256 {path} {
         return -code error "sha256-shape"
     }
     return $digest
+}
+
+proc r2_file_prefix_sha256 {path length} {
+    if {![string is integer -strict $length] || $length < 0 ||
+        $length > 16777216 || [file normalize $path] ne $path ||
+        [file type $path] ne "file"} {
+        return -code error "r2-sha256-prefix-arguments"
+    }
+    set channel [open $path r]
+    fconfigure $channel -encoding binary -translation binary
+    if {[catch {read $channel $length} payload]} {
+        close $channel
+        return -code error "r2-sha256-prefix-read"
+    }
+    close $channel
+    if {[string bytelength $payload] != $length ||
+        [catch {exec /usr/bin/shasum -a 256 << $payload} output]} {
+        set payload ""
+        return -code error "r2-sha256-prefix-command"
+    }
+    set payload ""
+    set digest [lindex $output 0]
+    if {![regexp {^[0-9a-f]{64}$} $digest]} {
+        return -code error "r2-sha256-prefix-shape"
+    }
+    return $digest
+}
+
+# This is the complete, ordered 103-field v4 authority.  It deliberately does
+# not share the current v5 parser, validator, or package lists.
+proc r2_predecessor_manifest_oracle {} {
+    return {
+        format wg-mix-ebpf-b82-v6-package-v4
+        run_id c8e41d73
+        package_id 4f2a9b61
+        integration_ref refs/heads/codex/tcx-faketcp-final-v2
+        integration_commit f75fe7678cfdecf08173fd201be5c055417d6e11
+        bundle_name source-4f2a9b61.bundle
+        bundle_sha256 b74811808e0413714dcf20b8292fe68631f603c0b9a68bc9951af481477b413b
+        history_verification isolated-unbundle-rev-list-fsck-v1
+        history_commit_count 668
+        history_roots_sha256 9356df63b3d4c4c362912b14ab8ee5cb54d12cd1f14be9aa1fe8e18adbad6f05
+        history_objects_sha256 21647f92e57f9dbb8e15707699f632544d6dfcf2e1b4279d775cce1fb82163f3
+        wg_state absent
+        wg_interface absent
+        wg_local_address absent
+        wg_peer_address absent
+        local_repository /Users/siyixuan/codes-2/wg-mix-ebpf/.worktree/tcx-faketcp-final-v2
+        local_package_dir /private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-f75fe7678cfd
+        remote_package_dir /home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61
+        remote_source /run/wg-mix-ebpf-source-stages/c8e41d73/source
+        target_user siyixuan
+        target_host 192.168.10.82
+        target_hostname ubuntu-2604-test
+        target_kernel 7.0.0-28-generic
+        target_machine_id 9db3fb717cc74974b2a6b243d67f67b9
+        target_interface ens33
+        peer_address 47.116.202.155
+        peer_port 5201
+        soak_seconds 3600
+        session_seconds 300
+        physical_nic_forward_authority realnic-acceptance-v1
+        physical_interface_lock /run/wg-mix-ebpf-realnic-physical-interface.v1.lock
+        legacy_matrix_mode retired
+        realnic_profile acceptance
+        realnic_traffic_seconds 30
+        bind_final_package_sh_path scripts/realhost-b82-c8e41d73/bind-final-package.sh
+        bind_final_package_sh_blob 13ec99ddafb7452c98f05bf4855ef52c3f54b185
+        bind_final_package_sh_sha256 a808a7879ef64190eff9e81e6b694acea7bc04b1b74ffad44109b237a5eb14ca
+        controller_sh_path scripts/realhost-b82-c8e41d73/controller.sh
+        controller_sh_blob 8371e5492c4e88f3e855fa3c7edfbff15bcf3a5f
+        controller_sh_sha256 fb8a7a685b5a6b73de851ee9a3396f4154cc4ae083a7c36f3b3128b2b9a2e77d
+        locked_transport_exp_path scripts/realhost-b82-c8e41d73/locked-transport.exp
+        locked_transport_exp_blob 264f0cf74e6ff53d0cbee2688faa5d886898d22f
+        locked_transport_exp_sha256 c70e4f040dc082c4f286c237bda32fe2a60b3e5f6300ec57734645a0be12abec
+        root_matrix_n_r_sh_path scripts/realhost-b82-c8e41d73/root-matrix-n-r.sh
+        root_matrix_n_r_sh_blob d2b2d473afb79c4463fd6c712d4eda3faeed5c7e
+        root_matrix_n_r_sh_sha256 9ec125c2933866431779b760d41c6484cc0fbb9e5e9f3b5431c4a56fbab63e07
+        check_realhost_iperf_py_path scripts/realhost-b82-c8e41d73/check-realhost-iperf.py
+        check_realhost_iperf_py_blob 765871ef3af87cd8a101a42e71ea97c1245dc9da
+        check_realhost_iperf_py_sha256 9a52378b8a1ef6043d4d5792471c8239a0392a80da72f5c00846dd89e88ccd67
+        test_hermetic_matrix_sh_path scripts/realhost-b82-c8e41d73/test-hermetic-matrix.sh
+        test_hermetic_matrix_sh_blob 81f7cd86d8dc5a93133ea755311ba57aa66e4c76
+        test_hermetic_matrix_sh_sha256 9b81949416a1b4df91fee0e7d31a3de2c6ba9b474dc9c0f4dbbb1cc609207499
+        test_matrix_static_py_path scripts/realhost-b82-c8e41d73/test_matrix_static.py
+        test_matrix_static_py_blob 0a2b1538d3127e8bae8953b0dff59d60cc379f39
+        test_matrix_static_py_sha256 8de2dcdc866938da0502f1ad73ac9b38c9b6ff4066c76e9cbc946c9ca30a53f8
+        checksum_module_lease_sh_path scripts/realhost-b82-c8e41d73/checksum-module-lease.sh
+        checksum_module_lease_sh_blob c2e6077005e046eef0e1186c26cdaaf29c780f98
+        checksum_module_lease_sh_sha256 4ab9a22910e8d597cc04bb4fdde9e1b32d37a1bb2c6ad7b76f52d576b5a9adb2
+        root_fresh_verifier_gate_sh_path scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh
+        root_fresh_verifier_gate_sh_blob 48dd5e68071798c3d25daf0051cbf54f8cd3297e
+        root_fresh_verifier_gate_sh_sha256 4c2cf85b7e571df9b7ed4a77fa720c9f5e35950d44af5a39499a7ad700fe6a27
+        test_hermetic_fresh_verifier_gate_sh_path scripts/realhost-b82-c8e41d73/test-hermetic-fresh-verifier-gate.sh
+        test_hermetic_fresh_verifier_gate_sh_blob f3f7367d28253ebae746eb0e225c11f90eaa8305
+        test_hermetic_fresh_verifier_gate_sh_sha256 c9b5b1f954c794c5c986214777727a76579f670db9587f319ac148fc0c2a05f3
+        test_fresh_verifier_gate_static_py_path scripts/realhost-b82-c8e41d73/test_fresh_verifier_gate_static.py
+        test_fresh_verifier_gate_static_py_blob f86736b1c4a5b884814f062edbb2d652172f024f
+        test_fresh_verifier_gate_static_py_sha256 ace6951027788e82ad879caf285316af4e6ee81fdb6746f569cd7c22b9f80bf3
+        prepare_stage_root_sh_path scripts/realhost-b82-c8e41d73/prepare-stage-root.sh
+        prepare_stage_root_sh_blob 057db657b0ba096a4f660eedda2e0a4242af7de5
+        prepare_stage_root_sh_sha256 1bcb8db91d976d2a1d95f7d87223a2dac4a1678f74c1c25542e54b01ee10eeea
+        realnic_acceptance_py_path scripts/realhost-b82-acceptance-v1/realnic_acceptance.py
+        realnic_acceptance_py_blob e1edba5c9dd62c8c169d7129e8b376d4ce7d1168
+        realnic_acceptance_py_sha256 a88100b2a23ad41dd3e644c3ba1c7a722d58c8184a997aabf0ceab78552c6339
+        test_realnic_acceptance_py_path scripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py
+        test_realnic_acceptance_py_blob e92f8f7db9733eb3f655b388f1efd685f738c2c4
+        test_realnic_acceptance_py_sha256 fcb3d0dadee6da6e0ad67d028f268ebe43575287f555cd8100d279f8a3b0b79c
+        test_realnic_acceptance_static_py_path scripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py
+        test_realnic_acceptance_static_py_blob b0dd244937b9139fe8c8548d6c046b76d9f611e9
+        test_realnic_acceptance_static_py_sha256 ba8aef3219a0cf2a5c6b5058b245f64eb828a08bb532d2aa0291f51ee7206ad2
+        provision_ubuntu_test_host_sh_path scripts/provision-ubuntu-test-host.sh
+        provision_ubuntu_test_host_sh_blob 143eb89a2e4bbbf548b510bcc2fd9f66184d3d76
+        provision_ubuntu_test_host_sh_sha256 078d191b0edbafe27e9f684d3fa495e04d7217a01d0ec1fd32eaede211178c8f
+        root_veth_n_r_sh_path scripts/realhost-b82-c8e41d73/root-veth-n-r.sh
+        root_veth_n_r_sh_blob a72f7f2eebe765bc7fa8a5352c134233b30ac8aa
+        root_veth_n_r_sh_sha256 fbb8779039137383df6f51f05319faea966c69a80001da837dee22d04d8f7a70
+        test_hermetic_veth_runner_sh_path scripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh
+        test_hermetic_veth_runner_sh_blob ae0c74eefe33cf6afda681ba6fca17b54700108f
+        test_hermetic_veth_runner_sh_sha256 939c3b28310596ed6bada0eb3ccdd5ebbb7eeebeaf959504c7d468b929f8174c
+        test_veth_runner_static_py_path scripts/realhost-b82-c8e41d73/test_veth_runner_static.py
+        test_veth_runner_static_py_blob 5bc3d0ac0ac48c3adc0cd86166f533edc676c712
+        test_veth_runner_static_py_sha256 e40da6b1a6541a9b8b6c56d9277d4d73838e037876180e479b5af5d64a4edc90
+        controller_seam_sh_path scripts/realhost-b82-routed-veth-v1/controller-seam.sh
+        controller_seam_sh_blob 18d9e4d72a0b9022019e738d9de4fd4e23bc4903
+        controller_seam_sh_sha256 2bd7b65c3e770ff53445cbc7c195e741e8fff5eeef9e51bd6fcaa2f513d1f251
+        root_routed_veth_n_r_sh_path scripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh
+        root_routed_veth_n_r_sh_blob 9d30910b692b2d42c1528c75c2a3ba0a5d0a11cb
+        root_routed_veth_n_r_sh_sha256 5af8b848c9fc5f915b25c6c03822622f2ac75996a54ebf8172c7c5391c9f3485
+        test_hermetic_routed_veth_harness_sh_path scripts/realhost-b82-routed-veth-v1/test-hermetic-routed-veth-harness.sh
+        test_hermetic_routed_veth_harness_sh_blob 253c7b0b4d4c2d065475a82742418446146d0a0a
+        test_hermetic_routed_veth_harness_sh_sha256 674f96665eb26f879eae08936683fdac2beb974841ed99f9021abe9e04752032
+        test_routed_veth_harness_static_py_path scripts/realhost-b82-routed-veth-v1/test_routed_veth_harness_static.py
+        test_routed_veth_harness_static_py_blob 06e0fa14779ce778440250f4a437426017754cd4
+        test_routed_veth_harness_static_py_sha256 5bb678726ecc6bcc946233ae138d541fc50dc9f6ec40ddf139350863690d88c1
+    }
+}
+
+proc r2_load_predecessor_manifest {path} {
+    if {$path ne "${::R2_PREDECESSOR_LOCAL_PACKAGE}/package-manifest.v1" ||
+        [file normalize $path] ne $path ||
+        [catch {file lstat $path file_stat}] ||
+        $file_stat(type) ne "file" || $file_stat(nlink) != 1 ||
+        [file_sha256 $path] ne $::R2_PREDECESSOR_MANIFEST_SHA256} {
+        return -code error "r2-predecessor-manifest-path"
+    }
+    set channel [open $path r]
+    fconfigure $channel -encoding utf-8 -translation lf
+    set payload [read $channel]
+    close $channel
+    if {[string first "\u0000" $payload] >= 0 || ![string match "*\n" $payload]} {
+        return -code error "r2-predecessor-manifest-encoding"
+    }
+    set lines [split [string range $payload 0 end-1] "\n"]
+    set oracle [r2_predecessor_manifest_oracle]
+    if {[llength $lines] != 103 || [llength $oracle] != 206} {
+        return -code error "r2-predecessor-manifest-cardinality"
+    }
+    set values [dict create]
+    set index 0
+    foreach {expected_key expected_value} $oracle {
+        set fields [split [lindex $lines $index] "\t"]
+        if {[llength $fields] != 2 ||
+            [lindex $fields 0] ne $expected_key ||
+            [lindex $fields 1] ne $expected_value} {
+            return -code error "r2-predecessor-manifest-field-$expected_key"
+        }
+        dict set values $expected_key $expected_value
+        incr index
+    }
+    return $values
 }
 
 proc load_manifest {path expected_sha} {
@@ -359,6 +556,35 @@ proc scp_options {} {
 
 proc env_argv {} {
     return [list /usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C]
+}
+
+proc r2_helper_remote_argv {manifest_sha mode} {
+    if {$mode ni {
+        retire-postflight-f75fe7678cfd-r2 verify-postflight-retirement-r2
+    } || ![regexp {^[0-9a-f]{64}$} $manifest_sha]} {
+        return -code error "r2-helper-mode"
+    }
+    return [list /bin/bash -p $::R2_AUTH_SELF $mode \
+        --manifest $::R2_AUTH_MANIFEST --manifest-sha256 $manifest_sha]
+}
+
+proc r2_fixed_path {name} {
+    switch -- $name {
+        home-qroot { return $::R2_HOME_QROOT }
+        auth-root { return $::R2_AUTH_ROOT }
+        run-qroot { return $::R2_RUN_QROOT }
+        auth-manifest-pending { return $::R2_AUTH_MANIFEST_PENDING }
+        auth-manifest { return $::R2_AUTH_MANIFEST }
+        auth-self-pending { return $::R2_AUTH_SELF_PENDING }
+        auth-self { return $::R2_AUTH_SELF }
+        quarantine-intake { return $::R2_Q_INTAKE }
+        quarantine-package { return $::R2_Q_PACKAGE }
+        quarantine-bootstrap { return $::R2_Q_BOOTSTRAP }
+        lock { return $::R2_LOCK }
+        receipt-pending { return $::R2_RECEIPT_PENDING }
+        receipt-final { return $::R2_RECEIPT_FINAL }
+        default { return -code error "r2-fixed-path" }
+    }
 }
 
 proc retained_retirement_helper_remote_argv {} {
@@ -1060,6 +1286,409 @@ proc build_retirement_lineage_operation {values operation} {
     return [list ssh $spawn_argv $prompt_limit $assertion $timeout_seconds]
 }
 
+proc r2_entry_assertion {names} {
+    set assertion [list exact-entry-set]
+    foreach name $names {
+        lappend assertion "${name}\tf"
+    }
+    return $assertion
+}
+
+# Private R2 leaves are never admitted by transport_main.  This builder owns a
+# separate frozen predecessor namespace and does not call build_operation for
+# any predecessor package or bootstrap observation.
+proc build_r2_operation {values manifest_sha predecessor_values operation} {
+    if {[dict size $predecessor_values] != 103 ||
+        [dict get $predecessor_values integration_commit] ne
+            $::R2_PREDECESSOR_COMMIT} {
+        return -code error "r2-predecessor-values"
+    }
+    set target "[dict get $values target_user]@[dict get $values target_host]"
+    set old_package "/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61"
+    set old_bootstrap "/run/wg-mix-ebpf-source-bootstrap-c8e41d73"
+    set old_provisioner "${old_bootstrap}/provision-ubuntu-test-host.sh"
+    set old_stager "${old_bootstrap}/prepare-stage-root.sh"
+    set remote {}
+    set tty 1
+    set prompt_limit 2
+    set assertion none
+    set timeout_seconds 600
+
+    if {[regexp {^r2-ro-exists-(.+)$} $operation -> path_name]} {
+        set fixed_path [r2_fixed_path $path_name]
+        set remote [concat [list /usr/bin/sudo --] [env_argv] \
+            [list /usr/bin/test -e $fixed_path -o -L $fixed_path]]
+    } elseif {[regexp {^r2-ro-old-package-(sha|stat)-(.+)$} \
+        $operation -> family name]} {
+        if {[lsearch -exact [r2_predecessor_package_names] $name] < 0} {
+            return -code error "r2-old-package-name"
+        }
+        set artifact "${old_package}/${name}"
+        if {$family eq "sha"} {
+            set expected_sha [r2_predecessor_package_sha $name]
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/sha256sum -- $artifact]]
+            set assertion "exact:${expected_sha}  ${artifact}"
+        } else {
+            set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- $artifact]]
+            set assertion exact:siyixuan:siyixuan:600:1:regular\ file
+        }
+    } else {
+        switch -- $operation {
+            r2-ro-user-intake-exists {
+                set remote [list /usr/bin/test -e $::R2_USER_INTAKE -o -L \
+                    $::R2_USER_INTAKE]
+                set tty 0
+                set prompt_limit 1
+            }
+            r2-ro-old-package-readlink {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/readlink -e -- $old_package]]
+                set assertion "exact:${old_package}"
+            }
+            r2-ro-old-package-stat {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%F -- $old_package]]
+                set assertion exact:siyixuan:siyixuan:700:directory
+            }
+            r2-ro-old-package-entries {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/find $old_package -xdev -mindepth 1 \
+                    -maxdepth 1 -printf {'%f\t%y\n'}]]
+                set assertion [r2_entry_assertion \
+                    [r2_predecessor_package_names]]
+            }
+            r2-ro-old-bootstrap-root-readlink {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/readlink -e -- $old_bootstrap]]
+                set assertion "exact:${old_bootstrap}"
+            }
+            r2-ro-old-bootstrap-root-stat {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%F -- $old_bootstrap]]
+                set assertion exact:root:root:700:directory
+            }
+            r2-ro-old-bootstrap-provisioner-readlink -
+            r2-ro-old-bootstrap-stager-readlink {
+                set artifact [expr {$operation eq
+                    "r2-ro-old-bootstrap-provisioner-readlink" ?
+                    $old_provisioner : $old_stager}]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/readlink -e -- $artifact]]
+                set assertion "exact:${artifact}"
+            }
+            r2-ro-old-bootstrap-provisioner-stat -
+            r2-ro-old-bootstrap-stager-stat {
+                set artifact [expr {$operation eq
+                    "r2-ro-old-bootstrap-provisioner-stat" ?
+                    $old_provisioner : $old_stager}]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- $artifact]]
+                set assertion exact:root:root:700:1:regular\ file
+            }
+            r2-ro-old-bootstrap-provisioner-sha -
+            r2-ro-old-bootstrap-stager-sha {
+                if {$operation eq "r2-ro-old-bootstrap-provisioner-sha"} {
+                    set artifact $old_provisioner
+                    set expected_sha \
+                        078d191b0edbafe27e9f684d3fa495e04d7217a01d0ec1fd32eaede211178c8f
+                } else {
+                    set artifact $old_stager
+                    set expected_sha \
+                        1bcb8db91d976d2a1d95f7d87223a2dac4a1678f74c1c25542e54b01ee10eeea
+                }
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sha256sum -- $artifact]]
+                set assertion "exact:${expected_sha}  ${artifact}"
+            }
+            r2-ro-old-bootstrap-entries {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/find $old_bootstrap -xdev -mindepth 1 \
+                    -maxdepth 1 -printf {'%f\t%y\n'}]]
+                set assertion [r2_entry_assertion \
+                    {prepare-stage-root.sh provision-ubuntu-test-host.sh}]
+            }
+            r2-ro-old-provision-check {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /bin/bash -p $old_provisioner --check \
+                    --expected-address 192.168.10.82 \
+                    --expected-interface ens33 \
+                    --expected-hostname ubuntu-2604-test \
+                    --expected-kernel 7.0.0-28-generic \
+                    --expected-machine-id \
+                    9db3fb717cc74974b2a6b243d67f67b9]]
+                set assertion provision-check
+            }
+            r2-ro-intake-readlink {
+                set remote [list /usr/bin/readlink -e -- $::R2_USER_INTAKE]
+                set assertion "exact:$::R2_USER_INTAKE"
+                set tty 0
+                set prompt_limit 1
+            }
+            r2-ro-intake-stat {
+                set remote [list /usr/bin/stat -Lc %U:%G:%a:%F -- \
+                    $::R2_USER_INTAKE]
+                set assertion exact:siyixuan:siyixuan:700:directory
+                set tty 0
+                set prompt_limit 1
+            }
+            r2-ro-intake-entries {
+                set remote [list /usr/bin/find $::R2_USER_INTAKE -xdev \
+                    -mindepth 1 -maxdepth 1 -printf {'%f\t%y\n'}]
+                set tty 0
+                set prompt_limit 1
+            }
+            r2-ro-intake-manifest-stat - r2-ro-intake-self-stat {
+                set name [expr {$operation eq "r2-ro-intake-manifest-stat" ?
+                    "package-manifest.v1" : "prepare-stage-root.sh"}]
+                set remote [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- \
+                    "${::R2_USER_INTAKE}/${name}"]
+                set assertion exact:siyixuan:siyixuan:600:1:regular\ file
+                set tty 0
+                set prompt_limit 1
+            }
+            r2-ro-intake-manifest-shape - r2-ro-intake-self-shape {
+                set name [expr {$operation eq "r2-ro-intake-manifest-shape" ?
+                    "package-manifest.v1" : "prepare-stage-root.sh"}]
+                set remote [list /usr/bin/stat -Lc %U:%G:%a:%h:%s:%F -- \
+                    "${::R2_USER_INTAKE}/${name}"]
+                set tty 0
+                set prompt_limit 1
+            }
+            r2-ro-intake-manifest-sha - r2-ro-intake-self-sha {
+                set name [expr {$operation eq "r2-ro-intake-manifest-sha" ?
+                    "package-manifest.v1" : "prepare-stage-root.sh"}]
+                set expected_sha [expr {$name eq "package-manifest.v1" ?
+                    $manifest_sha :
+                    [dict get $values prepare_stage_root_sh_sha256]}]
+                set artifact "${::R2_USER_INTAKE}/${name}"
+                set remote [list /usr/bin/sha256sum -- $artifact]
+                set assertion "exact:${expected_sha}  ${artifact}"
+                set tty 0
+                set prompt_limit 1
+            }
+            r2-ro-intake-manifest-sha-observe -
+            r2-ro-intake-self-sha-observe {
+                set name [expr {$operation eq
+                    "r2-ro-intake-manifest-sha-observe" ?
+                    "package-manifest.v1" : "prepare-stage-root.sh"}]
+                set remote [list /usr/bin/sha256sum -- \
+                    "${::R2_USER_INTAKE}/${name}"]
+                set tty 0
+                set prompt_limit 1
+            }
+            r2-raw-intake-mkdir {
+                set remote [list /usr/bin/mkdir --mode=0700 -- $::R2_USER_INTAKE]
+                set tty 0
+                set prompt_limit 1
+            }
+            r2-raw-scp-manifest - r2-raw-scp-self {
+                set name [expr {$operation eq "r2-raw-scp-manifest" ?
+                    "package-manifest.v1" : "prepare-stage-root.sh"}]
+                lassign [r2_local_delivery_file $values $manifest_sha $name] \
+                    local_artifact expected_sha
+                set destination "${target}:${::R2_USER_INTAKE}/${name}"
+                set spawn_argv [concat [list /usr/bin/scp] [scp_options] \
+                    [list -- $local_artifact $destination]]
+                return [list scp $spawn_argv 1 none $timeout_seconds]
+            }
+            r2-raw-sync-intake-manifest - r2-raw-sync-intake-self -
+            r2-raw-sync-intake-directory - r2-raw-sync-intake-parent {
+                switch -- $operation {
+                    r2-raw-sync-intake-manifest {
+                        set sync_path \
+                            "${::R2_USER_INTAKE}/package-manifest.v1"
+                    }
+                    r2-raw-sync-intake-self {
+                        set sync_path \
+                            "${::R2_USER_INTAKE}/prepare-stage-root.sh"
+                    }
+                    r2-raw-sync-intake-directory {
+                        set sync_path $::R2_USER_INTAKE
+                    }
+                    r2-raw-sync-intake-parent {
+                        set sync_path $::R2_USER_INTAKE_PARENT
+                    }
+                }
+                set remote [list /usr/bin/sync -- $sync_path]
+                set tty 0
+                set prompt_limit 1
+            }
+            r2-ro-home-qroot-readlink - r2-ro-auth-root-readlink -
+            r2-ro-run-qroot-readlink {
+                switch -- $operation {
+                    r2-ro-home-qroot-readlink { set fixed_path $::R2_HOME_QROOT }
+                    r2-ro-auth-root-readlink { set fixed_path $::R2_AUTH_ROOT }
+                    r2-ro-run-qroot-readlink { set fixed_path $::R2_RUN_QROOT }
+                }
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/readlink -e -- $fixed_path]]
+                set assertion "exact:${fixed_path}"
+            }
+            r2-ro-home-qroot-stat - r2-ro-auth-root-stat -
+            r2-ro-run-qroot-stat {
+                switch -- $operation {
+                    r2-ro-home-qroot-stat { set fixed_path $::R2_HOME_QROOT }
+                    r2-ro-auth-root-stat { set fixed_path $::R2_AUTH_ROOT }
+                    r2-ro-run-qroot-stat { set fixed_path $::R2_RUN_QROOT }
+                }
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%F -- $fixed_path]]
+                set assertion exact:root:root:700:directory
+            }
+            r2-ro-home-qroot-entries - r2-ro-auth-root-entries -
+            r2-ro-run-qroot-entries {
+                switch -- $operation {
+                    r2-ro-home-qroot-entries { set fixed_path $::R2_HOME_QROOT }
+                    r2-ro-auth-root-entries { set fixed_path $::R2_AUTH_ROOT }
+                    r2-ro-run-qroot-entries { set fixed_path $::R2_RUN_QROOT }
+                }
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/find $fixed_path -xdev -mindepth 1 \
+                    -maxdepth 1 -printf {'%f\t%y\n'}]]
+            }
+            r2-raw-home-qroot-create - r2-raw-auth-root-create -
+            r2-raw-run-qroot-create {
+                switch -- $operation {
+                    r2-raw-home-qroot-create { set fixed_path $::R2_HOME_QROOT }
+                    r2-raw-auth-root-create { set fixed_path $::R2_AUTH_ROOT }
+                    r2-raw-run-qroot-create { set fixed_path $::R2_RUN_QROOT }
+                }
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/mkdir --mode=0700 -- $fixed_path]]
+            }
+            r2-raw-auth-manifest-install {
+                set source "${::R2_USER_INTAKE}/package-manifest.v1"
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/install --owner=root --group=root --mode=0600 \
+                    --no-target-directory -- $source \
+                    $::R2_AUTH_MANIFEST_PENDING]]
+            }
+            r2-raw-auth-self-install {
+                set source "${::R2_USER_INTAKE}/prepare-stage-root.sh"
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/install --owner=root --group=root --mode=0700 \
+                    --no-target-directory -- $source $::R2_AUTH_SELF_PENDING]]
+            }
+            r2-ro-auth-manifest-pending-shape -
+            r2-ro-auth-self-pending-shape {
+                if {$operation eq "r2-ro-auth-manifest-pending-shape"} {
+                    set artifact $::R2_AUTH_MANIFEST_PENDING
+                } else {
+                    set artifact $::R2_AUTH_SELF_PENDING
+                }
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%h:%s:%F -- $artifact]]
+            }
+            r2-ro-auth-manifest-pending-sha-observe -
+            r2-ro-auth-self-pending-sha-observe {
+                set artifact [expr {$operation eq
+                    "r2-ro-auth-manifest-pending-sha-observe" ?
+                    $::R2_AUTH_MANIFEST_PENDING : $::R2_AUTH_SELF_PENDING}]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sha256sum -- $artifact]]
+            }
+            r2-ro-auth-manifest-pending-sha - r2-ro-auth-manifest-sha {
+                set artifact [expr {$operation eq
+                    "r2-ro-auth-manifest-pending-sha" ?
+                    $::R2_AUTH_MANIFEST_PENDING : $::R2_AUTH_MANIFEST}]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sha256sum -- $artifact]]
+                set assertion "exact:${manifest_sha}  ${artifact}"
+            }
+            r2-ro-auth-self-pending-sha - r2-ro-auth-self-sha {
+                set artifact [expr {$operation eq "r2-ro-auth-self-pending-sha" ?
+                    $::R2_AUTH_SELF_PENDING : $::R2_AUTH_SELF}]
+                set expected_sha [dict get $values prepare_stage_root_sh_sha256]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sha256sum -- $artifact]]
+                set assertion "exact:${expected_sha}  ${artifact}"
+            }
+            r2-ro-auth-manifest-pending-stat {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- \
+                    $::R2_AUTH_MANIFEST_PENDING]]
+                set assertion exact:root:root:600:1:regular\ file
+            }
+            r2-ro-auth-self-pending-stat {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- \
+                    $::R2_AUTH_SELF_PENDING]]
+                set assertion exact:root:root:700:1:regular\ file
+            }
+            r2-ro-auth-manifest-stat {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- \
+                    $::R2_AUTH_MANIFEST]]
+                set assertion exact:root:root:600:2:regular\ file
+            }
+            r2-ro-auth-self-stat {
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %U:%G:%a:%h:%F -- \
+                    $::R2_AUTH_SELF]]
+                set assertion exact:root:root:700:2:regular\ file
+            }
+            r2-ro-auth-manifest-pair - r2-ro-auth-self-pair {
+                if {$operation eq "r2-ro-auth-manifest-pair"} {
+                    set first $::R2_AUTH_MANIFEST_PENDING
+                    set second $::R2_AUTH_MANIFEST
+                } else {
+                    set first $::R2_AUTH_SELF_PENDING
+                    set second $::R2_AUTH_SELF
+                }
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/stat -Lc %d:%i -- $first $second]]
+                set assertion same-two-inodes
+            }
+            r2-raw-sync-auth-manifest-pending -
+            r2-raw-sync-auth-self-pending {
+                set artifact [expr {$operation eq
+                    "r2-raw-sync-auth-manifest-pending" ?
+                    $::R2_AUTH_MANIFEST_PENDING : $::R2_AUTH_SELF_PENDING}]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sync -- $artifact]]
+            }
+            r2-raw-link-auth-manifest - r2-raw-link-auth-self {
+                if {$operation eq "r2-raw-link-auth-manifest"} {
+                    set first $::R2_AUTH_MANIFEST_PENDING
+                    set second $::R2_AUTH_MANIFEST
+                } else {
+                    set first $::R2_AUTH_SELF_PENDING
+                    set second $::R2_AUTH_SELF
+                }
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/ln --no-target-directory -- $first $second]]
+            }
+            r2-raw-sync-auth-root - r2-raw-sync-home-parent -
+            r2-raw-sync-home-qroot - r2-raw-sync-run-parent {
+                switch -- $operation {
+                    r2-raw-sync-auth-root { set sync_path $::R2_AUTH_ROOT }
+                    r2-raw-sync-home-parent { set sync_path /home }
+                    r2-raw-sync-home-qroot { set sync_path $::R2_HOME_QROOT }
+                    r2-raw-sync-run-parent { set sync_path /run }
+                }
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [list /usr/bin/sync -- $sync_path]]
+            }
+            r2-raw-helper-mutate - r2-ro-helper-verify {
+                set helper_mode [expr {$operation eq "r2-raw-helper-mutate" ?
+                    "retire-postflight-f75fe7678cfd-r2" :
+                    "verify-postflight-retirement-r2"}]
+                set remote [concat [list /usr/bin/sudo --] [env_argv] \
+                    [r2_helper_remote_argv $manifest_sha $helper_mode]]
+                set assertion [expr {$operation eq "r2-raw-helper-mutate" ?
+                    "r2-helper-mutate" : "r2-helper-verify"}]
+                set timeout_seconds 2400
+            }
+            default { return -code error "r2-operation" }
+        }
+    }
+    set spawn_argv [concat [list /usr/bin/ssh] [ssh_options $tty] \
+        [list -- $target] $remote]
+    return [list ssh $spawn_argv $prompt_limit $assertion $timeout_seconds]
+}
+
 proc output_value {payload} {
     set value [string map [list "\r" ""] $payload]
     return [string trim $value "\n"]
@@ -1161,6 +1790,20 @@ proc provision_plan_policy {payload expected_mode} {
 proc assert_output {assertion payload} {
     set value [output_value $payload]
     if {$assertion eq "none"} {
+        return
+    }
+    if {$assertion eq "r2-helper-verify"} {
+        set expected "B82_V6_RETIREMENT_VERIFIED state=T namespace_writes=0 same_boot=1 receipt=$::R2_RECEIPT_FINAL"
+        if {$value ne $expected} {
+            return -code error "r2-helper-verify-output-mismatch"
+        }
+        return
+    }
+    if {$assertion eq "r2-helper-mutate"} {
+        if {![regexp {^B82_V6_RETIREMENT_COMPLETE state=T disposition=advanced namespace_writes=[1-6] same_boot=1$} $value] &&
+            $value ne "B82_V6_RETIREMENT_COMPLETE state=T disposition=verified-existing namespace_writes=0 same_boot=1"} {
+            return -code error "r2-helper-mutate-output-mismatch"
+        }
         return
     }
     if {[string first "exact-entry-set" $assertion] == 0} {
@@ -1575,6 +2218,415 @@ proc package_names {} {
     }
 }
 
+proc r2_predecessor_package_names {} {
+    return {
+        source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh
+        controller.sh prepare-stage-root.sh provision-ubuntu-test-host.sh
+        root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh
+        test_matrix_static.py checksum-module-lease.sh root-fresh-verifier-gate.sh
+        test-hermetic-fresh-verifier-gate.sh test_fresh_verifier_gate_static.py
+        realnic_acceptance.py test_realnic_acceptance.py
+        test_realnic_acceptance_static.py
+    }
+}
+
+proc r2_mutation_operations {} {
+    return {
+        r2-raw-intake-mkdir
+        r2-raw-scp-manifest
+        r2-raw-scp-self
+        r2-raw-sync-intake-manifest
+        r2-raw-sync-intake-self
+        r2-raw-sync-intake-directory
+        r2-raw-sync-intake-parent
+        r2-raw-home-qroot-create
+        r2-raw-auth-root-create
+        r2-raw-run-qroot-create
+        r2-raw-auth-manifest-install
+        r2-raw-auth-self-install
+        r2-raw-sync-auth-manifest-pending
+        r2-raw-sync-auth-self-pending
+        r2-raw-link-auth-manifest
+        r2-raw-link-auth-self
+        r2-raw-sync-auth-root
+        r2-raw-sync-home-parent
+        r2-raw-sync-home-qroot
+        r2-raw-sync-run-parent
+        r2-raw-helper-mutate
+    }
+}
+
+proc r2_validate_mutation_prefix {trace} {
+    set expected [r2_mutation_operations]
+    set previous -1
+    foreach operation $trace {
+        set index [lsearch -exact $expected $operation]
+        if {$index < 0 || $index <= $previous} {
+            return -code error "r2-mutation-order"
+        }
+        set previous $index
+    }
+    return
+}
+
+proc r2_validate_mutation_trace {trace require_full} {
+    if {$require_full ni {0 1}} {
+        return -code error "r2-mutation-trace-mode"
+    }
+    r2_validate_mutation_prefix $trace
+    if {$trace eq {}} {
+        if {$require_full} {
+            return -code error "r2-mutation-count"
+        }
+        return empty
+    }
+    if {[lindex $trace end] ne "r2-raw-helper-mutate"} {
+        return -code error "r2-mutation-completion"
+    }
+    if {$require_full} {
+        set expected [r2_mutation_operations]
+        if {[llength $trace] != [llength $expected] ||
+            [lrange $trace 0 end] ne [lrange $expected 0 end]} {
+            return -code error "r2-mutation-count"
+        }
+    }
+    return [expr {$require_full ? "full" : "subsequence"}]
+}
+
+proc r2_mutation_trace_start {initial_phase} {
+    if {[info exists ::R2_MUTATION_TRACE_ACTIVE] &&
+        $::R2_MUTATION_TRACE_ACTIVE} {
+        fail "r2-mutation-trace-nested" 78
+    }
+    set ::R2_MUTATION_TRACE_ACTIVE 1
+    set ::R2_MUTATION_TRACE {}
+    set ::R2_MUTATION_INITIAL_PHASE $initial_phase
+    set ::R2_MUTATION_INTAKE_CREATED 0
+}
+
+proc r2_mutation_trace_record {operation} {
+    if {![info exists ::R2_MUTATION_TRACE_ACTIVE] ||
+        !$::R2_MUTATION_TRACE_ACTIVE} {
+        fail "r2-mutation-trace-inactive" 78
+    }
+    set candidate [concat $::R2_MUTATION_TRACE [list $operation]]
+    if {[catch {r2_validate_mutation_prefix $candidate}]} {
+        fail "r2-mutation-order" 78
+    }
+    set ::R2_MUTATION_TRACE $candidate
+}
+
+proc r2_mutation_trace_intake_created {} {
+    if {![info exists ::R2_MUTATION_TRACE_ACTIVE] ||
+        !$::R2_MUTATION_TRACE_ACTIVE ||
+        $::R2_MUTATION_TRACE ne {r2-raw-intake-mkdir}} {
+        fail "r2-mutation-intake-trace" 78
+    }
+    set ::R2_MUTATION_INTAKE_CREATED 1
+}
+
+proc r2_mutation_trace_finish {} {
+    if {![info exists ::R2_MUTATION_TRACE_ACTIVE] ||
+        !$::R2_MUTATION_TRACE_ACTIVE} {
+        fail "r2-mutation-trace-inactive" 78
+    }
+    set require_full [expr {
+        $::R2_MUTATION_INITIAL_PHASE eq "absent" &&
+        $::R2_MUTATION_INTAKE_CREATED
+    }]
+    if {[catch {r2_validate_mutation_trace $::R2_MUTATION_TRACE \
+        $require_full} trace_class]} {
+        fail $trace_class 78
+    }
+    set count [llength $::R2_MUTATION_TRACE]
+    set ::R2_MUTATION_TRACE_ACTIVE 0
+    set ::R2_MUTATION_TRACE {}
+    puts "B82_V6_R2_MUTATION_AUDIT class=$trace_class raw_calls=$count fixed_surface=21 result=PASS"
+    return $trace_class
+}
+
+proc r2_predecessor_package_sha {name} {
+    switch -- $name {
+        source-4f2a9b61.bundle {
+            return b74811808e0413714dcf20b8292fe68631f603c0b9a68bc9951af481477b413b
+        }
+        package-manifest.v1 {
+            return 2d6c6caac080b599fbfa0f73c64f6976cf30d1504fc506ebd39c638b2f9449e3
+        }
+        bind-final-package.sh {
+            return a808a7879ef64190eff9e81e6b694acea7bc04b1b74ffad44109b237a5eb14ca
+        }
+        controller.sh {
+            return fb8a7a685b5a6b73de851ee9a3396f4154cc4ae083a7c36f3b3128b2b9a2e77d
+        }
+        prepare-stage-root.sh {
+            return 1bcb8db91d976d2a1d95f7d87223a2dac4a1678f74c1c25542e54b01ee10eeea
+        }
+        provision-ubuntu-test-host.sh {
+            return 078d191b0edbafe27e9f684d3fa495e04d7217a01d0ec1fd32eaede211178c8f
+        }
+        root-matrix-n-r.sh {
+            return 9ec125c2933866431779b760d41c6484cc0fbb9e5e9f3b5431c4a56fbab63e07
+        }
+        check-realhost-iperf.py {
+            return 9a52378b8a1ef6043d4d5792471c8239a0392a80da72f5c00846dd89e88ccd67
+        }
+        test-hermetic-matrix.sh {
+            return 9b81949416a1b4df91fee0e7d31a3de2c6ba9b474dc9c0f4dbbb1cc609207499
+        }
+        test_matrix_static.py {
+            return 8de2dcdc866938da0502f1ad73ac9b38c9b6ff4066c76e9cbc946c9ca30a53f8
+        }
+        checksum-module-lease.sh {
+            return 4ab9a22910e8d597cc04bb4fdde9e1b32d37a1bb2c6ad7b76f52d576b5a9adb2
+        }
+        root-fresh-verifier-gate.sh {
+            return 4c2cf85b7e571df9b7ed4a77fa720c9f5e35950d44af5a39499a7ad700fe6a27
+        }
+        test-hermetic-fresh-verifier-gate.sh {
+            return c9b5b1f954c794c5c986214777727a76579f670db9587f319ac148fc0c2a05f3
+        }
+        test_fresh_verifier_gate_static.py {
+            return ace6951027788e82ad879caf285316af4e6ee81fdb6746f569cd7c22b9f80bf3
+        }
+        realnic_acceptance.py {
+            return a88100b2a23ad41dd3e644c3ba1c7a722d58c8184a997aabf0ceab78552c6339
+        }
+        test_realnic_acceptance.py {
+            return fcb3d0dadee6da6e0ad67d028f268ebe43575287f555cd8100d279f8a3b0b79c
+        }
+        test_realnic_acceptance_static.py {
+            return ba8aef3219a0cf2a5c6b5058b245f64eb828a08bb532d2aa0291f51ee7206ad2
+        }
+        default { return -code error "r2-predecessor-package-name" }
+    }
+}
+
+proc r2_predecessor_package_size {name} {
+    switch -- $name {
+        source-4f2a9b61.bundle { return 2469874 }
+        package-manifest.v1 { return 7315 }
+        bind-final-package.sh { return 17015 }
+        controller.sh { return 43303 }
+        prepare-stage-root.sh { return 54230 }
+        provision-ubuntu-test-host.sh { return 19437 }
+        root-matrix-n-r.sh { return 1101 }
+        check-realhost-iperf.py { return 21027 }
+        test-hermetic-matrix.sh { return 6694 }
+        test_matrix_static.py { return 5656 }
+        checksum-module-lease.sh { return 23755 }
+        root-fresh-verifier-gate.sh { return 65201 }
+        test-hermetic-fresh-verifier-gate.sh { return 14628 }
+        test_fresh_verifier_gate_static.py { return 17307 }
+        realnic_acceptance.py { return 216405 }
+        test_realnic_acceptance.py { return 148160 }
+        test_realnic_acceptance_static.py { return 14894 }
+        default { return -code error "r2-predecessor-package-size-name" }
+    }
+}
+
+proc r2_git_history_prefix {history_git} {
+    if {$history_git ne
+        "${::R2_PREDECESSOR_LOCAL_PACKAGE}/history-verification.git"} {
+        return -code error "r2-history-git-path"
+    }
+    return [list /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+        GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 \
+        GIT_NO_REPLACE_OBJECTS=1 GIT_OPTIONAL_LOCKS=0 \
+        /usr/bin/git --no-pager --no-replace-objects \
+        -c core.attributesFile=/dev/null -c core.fsmonitor=false \
+        -c core.hooksPath=/dev/null --git-dir $history_git]
+}
+
+proc r2_verify_predecessor_history {values package package_stat_data} {
+    upvar 1 $package_stat_data package_stat
+    set roots "${package}/history-roots.v1"
+    set objects "${package}/history-objects.v1"
+    set history_git "${package}/history-verification.git"
+    foreach {artifact expected_size expected_sha} [list \
+        $roots 41 [dict get $values history_roots_sha256] \
+        $objects 351103 [dict get $values history_objects_sha256]] {
+        if {[catch {file lstat $artifact before_stat}] ||
+            $before_stat(type) ne "file" || $before_stat(nlink) != 1 ||
+            $before_stat(size) != $expected_size ||
+            ($before_stat(mode) & 07777) != 0600 ||
+            $before_stat(uid) != $package_stat(uid) ||
+            $before_stat(gid) != $package_stat(gid) ||
+            [file_sha256 $artifact] ne $expected_sha ||
+            [catch {file lstat $artifact after_stat}]} {
+            return -code error "r2-history-file"
+        }
+        foreach field {dev ino size mode nlink uid gid type mtime} {
+            if {$after_stat($field) ne $before_stat($field)} {
+                return -code error "r2-history-file-drift"
+            }
+        }
+    }
+    if {[catch {file lstat $history_git history_before}] ||
+        $history_before(type) ne "directory" ||
+        ($history_before(mode) & 07777) != 0700 ||
+        $history_before(uid) != $package_stat(uid) ||
+        $history_before(gid) != $package_stat(gid)} {
+        return -code error "r2-history-git"
+    }
+    set prefix [r2_git_history_prefix $history_git]
+    set commit $::R2_PREDECESSOR_COMMIT
+    if {[catch {exec {*}$prefix cat-file -e "${commit}^{commit}"}]} {
+        return -code error "r2-history-commit"
+    }
+    if {[catch {exec {*}$prefix fsck --full --strict --no-dangling \
+        $commit 2>@1}]} {
+        return -code error "r2-history-fsck"
+    }
+    if {[catch {exec {*}$prefix rev-list --count $commit} count] ||
+        [string trim $count] ne "668"} {
+        return -code error "r2-history-count"
+    }
+    if {[catch {exec {*}$prefix rev-list --max-parents=0 --reverse \
+        $commit} roots_output] ||
+        [catch {open $roots r} roots_channel]} {
+        return -code error "r2-history-roots"
+    }
+    fconfigure $roots_channel -encoding binary -translation binary
+    set roots_payload [read $roots_channel]
+    close $roots_channel
+    if {$roots_payload ne "${roots_output}\n" || $roots_output eq ""} {
+        return -code error "r2-history-roots-content"
+    }
+    if {[catch {exec {*}$prefix rev-list --parents --objects \
+        --missing=print $commit} objects_output] ||
+        [regexp -line {^\?} $objects_output] ||
+        [catch {open $objects r} objects_channel]} {
+        return -code error "r2-history-objects"
+    }
+    fconfigure $objects_channel -encoding binary -translation binary
+    set objects_payload [read $objects_channel]
+    close $objects_channel
+    if {$objects_payload ne "${objects_output}\n"} {
+        return -code error "r2-history-objects-content"
+    }
+    set bundle "${package}/source-4f2a9b61.bundle"
+    if {[catch {exec {*}$prefix bundle verify $bundle 2>@1}]} {
+        return -code error "r2-history-bundle-verify"
+    }
+    if {[catch {exec {*}$prefix bundle list-heads $bundle \
+        refs/heads/codex/tcx-faketcp-final-v2} bundle_head] ||
+        [string trim $bundle_head] ne
+            "$commit refs/heads/codex/tcx-faketcp-final-v2"} {
+        return -code error "r2-history-bundle-head"
+    }
+    if {[catch {file lstat $history_git history_after}]} {
+        return -code error "r2-history-git-drift"
+    }
+    foreach field {dev ino mode uid gid type mtime} {
+        if {$history_after($field) ne $history_before($field)} {
+            return -code error "r2-history-git-drift"
+        }
+    }
+}
+
+proc r2_stale_operations {} {
+    set operations {
+        stale-alternate-bootstrap-root stale-stage-root stale-fresh-root
+        stale-standalone-root stale-routed-evidence-root stale-realnic-run-roots
+        stale-realnic-interface-leases stale-veth-wgc8e41a stale-veth-wgc8e41b
+        stale-veth-wga19f7a stale-veth-wga19f7b stale-veth-wg5b8d3a
+        stale-veth-wg5b8d3b stale-pin-fresh stale-pin-standalone
+        stale-pin-legacy-tcx stale-pin-legacy-nic-original
+        stale-pin-legacy-nic-all-on stale-pin-legacy-nic-all-off
+        stale-pin-legacy-nic-tx-path stale-pin-legacy-nic-rx-path
+        stale-pin-legacy-nic-mtu1492 stale-pin-legacy-nic-mtu1500
+        stale-pin-legacy-nic-soak stale-checksum-module
+        stale-checksum-module-btf stale-checksum-module-lock
+        stale-physical-interface-lock
+    }
+    if {[llength $operations] != 28} {
+        return -code error "r2-stale-cardinality"
+    }
+    return $operations
+}
+
+proc r2_require_predecessor_authority {} {
+    set package $::R2_PREDECESSOR_LOCAL_PACKAGE
+    set manifest "${package}/package-manifest.v1"
+    if {[catch {r2_load_predecessor_manifest $manifest} values] ||
+        [catch {exec /usr/bin/id -u} caller_uid] ||
+        ![regexp {^[0-9]+$} $caller_uid] ||
+        [catch {file lstat $package package_stat}] ||
+        $package_stat(type) ne "directory" ||
+        ($package_stat(mode) & 07777) != 0700 ||
+        $package_stat(uid) != $caller_uid} {
+        fail "r2-predecessor-authority" 66
+    }
+    set actual_names {}
+    foreach pattern [list * .*] {
+        foreach candidate [glob -nocomplain -directory $package $pattern] {
+            set name [file tail $candidate]
+            if {$name ni {. ..} && [lsearch -exact $actual_names $name] < 0} {
+                lappend actual_names $name
+            }
+        }
+    }
+    set expected_names [r2_predecessor_package_names]
+    set expected_local_names [concat $expected_names {
+        history-roots.v1 history-objects.v1 history-verification.git
+    }]
+    if {[llength $actual_names] != 20 ||
+        [lsort -ascii $actual_names] ne [lsort -ascii $expected_local_names]} {
+        fail "r2-predecessor-entry-set" 66
+    }
+    foreach name $expected_names {
+        set artifact "${package}/${name}"
+        set expected_sha [r2_predecessor_package_sha $name]
+        set expected_size [r2_predecessor_package_size $name]
+        if {[file normalize $artifact] ne $artifact ||
+            [catch {file lstat $artifact artifact_stat}] ||
+            $artifact_stat(type) ne "file" || $artifact_stat(nlink) != 1 ||
+            $artifact_stat(size) != $expected_size ||
+            ($artifact_stat(mode) & 07777) != 0600 ||
+            $artifact_stat(uid) != $package_stat(uid) ||
+            $artifact_stat(gid) != $package_stat(gid) ||
+            [file_sha256 $artifact] ne $expected_sha} {
+            fail "r2-predecessor-artifact-$name" 66
+        }
+    }
+    if {[catch {r2_verify_predecessor_history $values $package package_stat}]} {
+        fail "r2-predecessor-history" 66
+    }
+    if {[dict get $values integration_commit] ne $::R2_PREDECESSOR_COMMIT ||
+        [dict get $values bundle_sha256] ne $::R2_PREDECESSOR_BUNDLE_SHA256} {
+        fail "r2-predecessor-binding" 66
+    }
+    puts "B82_V6_R2_PREDECESSOR_AUTHORITY predecessor_commit=$::R2_PREDECESSOR_COMMIT predecessor_manifest_sha256=$::R2_PREDECESSOR_MANIFEST_SHA256 package_files=17 credential_read=0 network_operations=0"
+    return $values
+}
+
+proc r2_local_delivery_file {values manifest_sha name} {
+    set package [dict get $values local_package_dir]
+    switch -- $name {
+        package-manifest.v1 { set expected_sha $manifest_sha }
+        prepare-stage-root.sh {
+            set expected_sha [dict get $values prepare_stage_root_sh_sha256]
+        }
+        default { return -code error "r2-delivery-name" }
+    }
+    set artifact "${package}/${name}"
+    if {[file normalize $artifact] ne $artifact ||
+        [catch {file lstat $artifact artifact_stat}] ||
+        [catch {file lstat $package package_stat}] ||
+        $artifact_stat(type) ne "file" || $artifact_stat(nlink) != 1 ||
+        $artifact_stat(size) < 1 || $artifact_stat(size) > 16777216 ||
+        ($artifact_stat(mode) & 07777) != 0600 ||
+        $package_stat(type) ne "directory" ||
+        ($package_stat(mode) & 07777) != 0700 ||
+        $artifact_stat(uid) != $package_stat(uid) ||
+        $artifact_stat(gid) != $package_stat(gid) ||
+        [file_sha256 $artifact] ne $expected_sha} {
+        return -code error "r2-delivery-local-file"
+    }
+    return [list $artifact $expected_sha]
+}
+
 proc bootstrap_create_operations {} {
     return {
         bootstrap-absent bootstrap-not-symlink bootstrap-create
@@ -1600,14 +2652,26 @@ proc stager_verify_operations {} {
 
 proc stage_operations {} { return {stage-snapshot stage-plan stage-run} }
 
+proc r2_mutation_operation {operation} {
+    return [expr {$operation eq "retire-postflight-f75fe7678cfd-r2"}]
+}
+
+proc r2_read_only_operation {operation} {
+    return [expr {$operation eq "verify-postflight-retirement-r2"}]
+}
+
 proc transaction_operation {operation} {
     return [expr {$operation in {
         prepare provision-apply fresh-run fresh-restore veth-run veth-restore
         routed-run routed-restore realnic-run realnic-restore
+        retire-postflight-f75fe7678cfd-r2
     }}]
 }
 
 proc read_only_operation {operation} {
+    if {[r2_read_only_operation $operation]} {
+        return 1
+    }
     if {[lsearch -exact [concat [base_identity_operations] [postflight_operations] \
         [prepare_stale_operations]] $operation] >= 0} {
         return 1
@@ -1759,6 +2823,32 @@ proc execute_controller_package_verifier {values manifest_sha} {
         fail "controller-package-verifier-marker" 66
     }
     puts "B82_V6_TRANSPORT_PACKAGE_AUTHORITY manifest_sha256=$manifest_sha integration_commit=[dict get $values integration_commit] package_device_inode=$package_stat(dev):$package_stat(ino) verifier=controller-read-only"
+}
+
+proc execute_r2_predecessor_controller_verifier {values manifest_sha} {
+    set package [dict get $values local_package_dir]
+    set controller "${package}/controller.sh"
+    set manifest "${package}/package-manifest.v1"
+    if {[catch {file lstat $::R2_PREDECESSOR_LOCAL_PACKAGE predecessor_stat}] ||
+        $predecessor_stat(type) ne "directory"} {
+        fail "r2-controller-predecessor-shape" 66
+    }
+    set expected_marker "B82_V6_CONTROLLER_R2_PREDECESSOR_VERIFIED predecessor_manifest_sha256=$::R2_PREDECESSOR_MANIFEST_SHA256 predecessor_commit=$::R2_PREDECESSOR_COMMIT package_device_inode=$predecessor_stat(dev):$predecessor_stat(ino) credential_read=0 network_operations=0"
+    set verifier_argv [list /usr/bin/env -i PATH=/usr/bin:/bin LC_ALL=C \
+        /bin/bash $controller verify-r2-predecessor-package \
+        --manifest $manifest --manifest-sha256 $manifest_sha \
+        --credential-path \
+        /Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82 \
+        --approved-plan-sha256 none]
+    if {[catch {exec {*}$verifier_argv 2>@1} verifier_output]} {
+        fail "r2-controller-predecessor-verifier" 66
+    }
+    set lines [split [output_value $verifier_output] "\n"]
+    if {[exact_line_count $lines $expected_marker] != 1 ||
+        [lindex $lines end] ne $expected_marker} {
+        fail "r2-controller-predecessor-marker" 66
+    }
+    puts "B82_V6_R2_LOCAL_AUTHORITIES current_manifest_sha256=$manifest_sha predecessor_manifest_sha256=$::R2_PREDECESSOR_MANIFEST_SHA256 credential_read=0 network_operations=0"
 }
 
 proc require_transaction_local_authority {values manifest_sha operation approved_sha} {
@@ -1963,6 +3053,936 @@ proc execute_retirement_lineage_gate {values manifest_sha password} {
     return TERMINAL
 }
 
+proc execute_r2_primitive {
+    values manifest_sha predecessor_values operation password
+} {
+    require_manifest_authority $values $manifest_sha
+    if {[catch {r2_load_predecessor_manifest \
+        "${::R2_PREDECESSOR_LOCAL_PACKAGE}/package-manifest.v1"} \
+        current_predecessor]} {
+        fail "r2-predecessor-manifest-drift" 66
+    }
+    if {$current_predecessor ne $predecessor_values ||
+        [catch {build_r2_operation $values $manifest_sha $predecessor_values \
+            $operation} operation_spec]} {
+        fail "r2-policy" 66
+    }
+    return [execute_operation_spec $operation $operation_spec $password]
+}
+
+proc r2_step {values manifest_sha predecessor_values operation password} {
+    if {[string first "r2-raw-" $operation] == 0} {
+        r2_mutation_trace_record $operation
+    }
+    set result [execute_r2_primitive $values $manifest_sha \
+        $predecessor_values $operation $password]
+    require_primitive_success $result
+    puts "B82_V6_R2_STEP operation=$operation rc=0"
+    return $result
+}
+
+proc r2_path_exists {
+    values manifest_sha predecessor_values path_name password
+} {
+    set operation "r2-ro-exists-${path_name}"
+    set result [execute_r2_primitive $values $manifest_sha \
+        $predecessor_values $operation $password]
+    if {[lindex $result 0] eq "ok"} {
+        return 1
+    }
+    if {[lindex $result 0] eq "child-failure" && [lindex $result 1] == 1} {
+        return 0
+    }
+    exit [lindex $result 1]
+}
+
+proc r2_user_intake_exists {
+    values manifest_sha predecessor_values password
+} {
+    set result [execute_r2_primitive $values $manifest_sha \
+        $predecessor_values r2-ro-user-intake-exists $password]
+    if {[lindex $result 0] eq "ok"} {
+        return 1
+    }
+    if {[lindex $result 0] eq "child-failure" && [lindex $result 1] == 1} {
+        return 0
+    }
+    exit [lindex $result 1]
+}
+
+proc r2_try_intake_mkdir {
+    values manifest_sha predecessor_values password
+} {
+    r2_mutation_trace_record r2-raw-intake-mkdir
+    set result [execute_r2_primitive $values $manifest_sha \
+        $predecessor_values r2-raw-intake-mkdir $password]
+    if {[lindex $result 0] eq "ok"} {
+        r2_mutation_trace_intake_created
+        puts "B82_V6_R2_STEP operation=r2-raw-intake-mkdir rc=0 created=1"
+        return
+    }
+    if {[lindex $result 0] ne "child-failure" || [lindex $result 1] != 1 ||
+        ![r2_user_intake_exists $values $manifest_sha $predecessor_values \
+            $password]} {
+        exit [lindex $result 1]
+    }
+    puts "B82_V6_R2_STEP operation=r2-raw-intake-mkdir rc=0 created=0 convergence=existing"
+}
+
+proc r2_read_entries {
+    values manifest_sha predecessor_values operation password
+} {
+    set result [r2_step $values $manifest_sha $predecessor_values \
+        $operation $password]
+    set value [output_value [lindex $result 2]]
+    if {$value eq ""} {
+        return {}
+    }
+    if {[string first "\u0000" $value] >= 0 ||
+        [string first "\r" $value] >= 0} {
+        fail "r2-entry-framing" 78
+    }
+    return [split $value "\n"]
+}
+
+proc r2_require_entries {actual expected reason} {
+    if {[llength $actual] != [llength $expected] ||
+        [lsort -ascii $actual] ne [lsort -ascii $expected]} {
+        fail $reason 78
+    }
+}
+
+proc r2_observe_sha {
+    values manifest_sha predecessor_values operation artifact password
+} {
+    set result [r2_step $values $manifest_sha $predecessor_values \
+        $operation $password]
+    set value [output_value [lindex $result 2]]
+    set digest [string range $value 0 63]
+    if {![regexp {^[0-9a-f]{64}$} $digest] ||
+        [string range $value 64 end] ne "  ${artifact}"} {
+        fail "r2-sha-output" 78
+    }
+    return $digest
+}
+
+proc r2_observe_intake_size {
+    values manifest_sha predecessor_values operation password
+} {
+    set result [r2_step $values $manifest_sha $predecessor_values \
+        $operation $password]
+    set value [output_value [lindex $result 2]]
+    if {![regexp {^siyixuan:siyixuan:600:1:([0-9]+):regular file$} \
+        $value -> size] || ![string is integer -strict $size] ||
+        $size < 0 || $size > 16777216} {
+        fail "r2-intake-file-shape" 78
+    }
+    return $size
+}
+
+proc r2_observe_auth_pending_size {
+    values manifest_sha predecessor_values name operation password
+} {
+    set result [r2_step $values $manifest_sha $predecessor_values \
+        $operation $password]
+    set value [output_value [lindex $result 2]]
+    switch -- $name {
+        package-manifest.v1 { set expected_mode 600 }
+        prepare-stage-root.sh { set expected_mode 700 }
+        default { fail "r2-auth-pending-size-name" 78 }
+    }
+    set pattern [format {^root:root:%s:1:([0-9]+):regular file$} \
+        $expected_mode]
+    if {![regexp $pattern $value -> size] ||
+        ![string is integer -strict $size] || $size < 0 ||
+        $size > 16777216} {
+        fail "r2-auth-pending-file-shape" 78
+    }
+    return $size
+}
+
+proc r2_require_auth_pending_prefix {
+    values manifest_sha predecessor_values name password
+} {
+    switch -- $name {
+        package-manifest.v1 {
+            set shape_operation r2-ro-auth-manifest-pending-shape
+            set sha_operation r2-ro-auth-manifest-pending-sha-observe
+            set remote_artifact $::R2_AUTH_MANIFEST_PENDING
+        }
+        prepare-stage-root.sh {
+            set shape_operation r2-ro-auth-self-pending-shape
+            set sha_operation r2-ro-auth-self-pending-sha-observe
+            set remote_artifact $::R2_AUTH_SELF_PENDING
+        }
+        default { fail "r2-auth-pending-prefix-name" 78 }
+    }
+    if {[catch {r2_local_delivery_file $values $manifest_sha $name} \
+        local_authority]} {
+        fail "r2-auth-pending-local-authority" 66
+    }
+    lassign $local_authority local_artifact expected_sha
+    if {[catch {file lstat $local_artifact local_stat}]} {
+        fail "r2-auth-pending-local-stat" 66
+    }
+    set remote_size [r2_observe_auth_pending_size $values $manifest_sha \
+        $predecessor_values $name $shape_operation $password]
+    set remote_sha [r2_observe_sha $values $manifest_sha $predecessor_values \
+        $sha_operation $remote_artifact $password]
+    if {$remote_size > $local_stat(size)} {
+        fail "r2-auth-pending-oversize" 78
+    }
+    if {$remote_size == $local_stat(size) && $remote_sha eq $expected_sha} {
+        set prefix_class exact
+    } elseif {[catch {r2_file_prefix_sha256 $local_artifact $remote_size} \
+        prefix_sha] || $remote_sha ne $prefix_sha} {
+        fail "r2-auth-pending-nonprefix" 78
+    } elseif {$remote_size == 0} {
+        set prefix_class empty
+    } else {
+        set prefix_class prefix
+    }
+    if {[catch {r2_local_delivery_file $values $manifest_sha $name} \
+        rechecked_authority]} {
+        fail "r2-auth-pending-local-drift" 66
+    }
+    lassign $rechecked_authority rechecked_artifact rechecked_sha
+    if {$rechecked_artifact ne $local_artifact ||
+        $rechecked_sha ne $expected_sha ||
+        [catch {file lstat $rechecked_artifact rechecked_stat}]} {
+        fail "r2-auth-pending-local-drift" 66
+    }
+    foreach field {dev ino size mode nlink uid gid type} {
+        if {$rechecked_stat($field) ne $local_stat($field)} {
+            fail "r2-auth-pending-local-drift" 66
+        }
+    }
+    return $prefix_class
+}
+
+proc r2_require_intake_prefix {
+    values manifest_sha predecessor_values name password
+} {
+    switch -- $name {
+        package-manifest.v1 {
+            set shape_operation r2-ro-intake-manifest-shape
+            set sha_operation r2-ro-intake-manifest-sha-observe
+        }
+        prepare-stage-root.sh {
+            set shape_operation r2-ro-intake-self-shape
+            set sha_operation r2-ro-intake-self-sha-observe
+        }
+        default { fail "r2-intake-prefix-name" 78 }
+    }
+    if {[catch {r2_local_delivery_file $values $manifest_sha $name} \
+        local_authority]} {
+        fail "r2-intake-local-authority" 66
+    }
+    lassign $local_authority local_artifact expected_sha
+    if {[catch {file lstat $local_artifact local_stat}]} {
+        fail "r2-intake-local-stat" 66
+    }
+    set remote_artifact "${::R2_USER_INTAKE}/${name}"
+    set remote_size [r2_observe_intake_size $values $manifest_sha \
+        $predecessor_values $shape_operation $password]
+    set remote_sha [r2_observe_sha $values $manifest_sha $predecessor_values \
+        $sha_operation $remote_artifact $password]
+    if {$remote_sha eq $expected_sha} {
+        return exact
+    }
+    if {$remote_size > $local_stat(size) ||
+        [catch {r2_file_prefix_sha256 $local_artifact $remote_size} prefix_sha] ||
+        $remote_sha ne $prefix_sha} {
+        fail "r2-intake-nonprefix" 78
+    }
+    if {[catch {r2_local_delivery_file $values $manifest_sha $name} \
+        rechecked_authority]} {
+        fail "r2-intake-local-drift" 66
+    }
+    lassign $rechecked_authority rechecked_artifact rechecked_sha
+    if {$rechecked_artifact ne $local_artifact ||
+        $rechecked_sha ne $expected_sha ||
+        [catch {file lstat $rechecked_artifact rechecked_stat}]} {
+        fail "r2-intake-local-drift" 66
+    }
+    foreach field {dev ino size mode nlink uid gid type} {
+        if {$rechecked_stat($field) ne $local_stat($field)} {
+            fail "r2-intake-local-drift" 66
+        }
+    }
+    return prefix
+}
+
+proc r2_verify_manifest_pair {
+    values manifest_sha predecessor_values password
+} {
+    foreach operation {
+        r2-ro-auth-manifest-pending-sha r2-ro-auth-manifest-sha
+        r2-ro-auth-manifest-stat r2-ro-auth-manifest-pair
+    } {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+    }
+}
+
+proc r2_verify_self_pair {
+    values manifest_sha predecessor_values password
+} {
+    foreach operation {
+        r2-ro-auth-self-pending-sha r2-ro-auth-self-sha
+        r2-ro-auth-self-stat r2-ro-auth-self-pair
+    } {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+    }
+}
+
+proc r2_authority_state {
+    values manifest_sha predecessor_values password
+} {
+    set names {
+        home-qroot auth-root run-qroot auth-manifest-pending auth-manifest
+        auth-self-pending auth-self quarantine-intake quarantine-package
+        quarantine-bootstrap lock receipt-pending receipt-final
+    }
+    set present [dict create]
+    foreach name $names {
+        dict set present $name [r2_path_exists $values $manifest_sha \
+            $predecessor_values $name $password]
+    }
+    if {[dict size $present] != 13} {
+        fail "r2-existence-cardinality" 78
+    }
+
+    set home [dict get $present home-qroot]
+    set auth [dict get $present auth-root]
+    set run [dict get $present run-qroot]
+    set manifest_pending [dict get $present auth-manifest-pending]
+    set manifest_final [dict get $present auth-manifest]
+    set self_pending [dict get $present auth-self-pending]
+    set self_final [dict get $present auth-self]
+    set complete [expr {$home && $auth && $run && $manifest_pending &&
+        $manifest_final && $self_pending && $self_final}]
+
+    if {$complete} {
+        foreach operation {
+            r2-ro-home-qroot-readlink r2-ro-home-qroot-stat
+            r2-ro-auth-root-readlink r2-ro-auth-root-stat
+            r2-ro-run-qroot-readlink r2-ro-run-qroot-stat
+        } {
+            r2_step $values $manifest_sha $predecessor_values \
+                $operation $password
+        }
+        set home_entries [list "authority\td"]
+        foreach {present_name entry} {
+            quarantine-intake "intake\td"
+            quarantine-package "package\td"
+        } {
+            if {[dict get $present $present_name]} {
+                lappend home_entries $entry
+            }
+        }
+        set run_entries {}
+        foreach {present_name entry} {
+            quarantine-bootstrap "bootstrap\td"
+            lock "retirement.v1.lock\tf"
+            receipt-pending "retirement-complete.v1.pending\tf"
+            receipt-final "retirement-complete.v1\tf"
+        } {
+            if {[dict get $present $present_name]} {
+                lappend run_entries $entry
+            }
+        }
+        r2_require_entries \
+            [r2_read_entries $values $manifest_sha $predecessor_values \
+                r2-ro-home-qroot-entries $password] $home_entries \
+            "r2-home-complete-entry-set"
+        r2_require_entries \
+            [r2_read_entries $values $manifest_sha $predecessor_values \
+                r2-ro-run-qroot-entries $password] $run_entries \
+            "r2-run-complete-entry-set"
+        r2_require_entries \
+            [r2_read_entries $values $manifest_sha $predecessor_values \
+                r2-ro-auth-root-entries $password] \
+            [list "package-manifest.v1.pending\tf" \
+                "package-manifest.v1\tf" \
+                "prepare-stage-root.sh.pending\tf" \
+                "prepare-stage-root.sh\tf"] \
+            "r2-authority-entry-set"
+        r2_verify_manifest_pair $values $manifest_sha $predecessor_values \
+            $password
+        r2_verify_self_pair $values $manifest_sha $predecessor_values $password
+        return [dict create phase complete present $present]
+    }
+
+    foreach name {
+        quarantine-intake quarantine-package quarantine-bootstrap lock
+        receipt-pending receipt-final
+    } {
+        if {[dict get $present $name]} {
+            fail "r2-prefix-before-authority" 78
+        }
+    }
+    if {!$home} {
+        foreach name {
+            auth-root run-qroot auth-manifest-pending auth-manifest
+            auth-self-pending auth-self
+        } {
+            if {[dict get $present $name]} {
+                fail "r2-prefix-parent-order" 78
+            }
+        }
+        return [dict create phase absent present $present]
+    }
+
+    foreach operation {r2-ro-home-qroot-readlink r2-ro-home-qroot-stat} {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+    }
+    if {!$auth} {
+        foreach name {
+            run-qroot auth-manifest-pending auth-manifest
+            auth-self-pending auth-self
+        } {
+            if {[dict get $present $name]} {
+                fail "r2-prefix-auth-order" 78
+            }
+        }
+        r2_require_entries \
+            [r2_read_entries $values $manifest_sha $predecessor_values \
+                r2-ro-home-qroot-entries $password] {} \
+            "r2-home-prefix-entries"
+        return [dict create phase home-qroot present $present]
+    }
+
+    foreach operation {r2-ro-auth-root-readlink r2-ro-auth-root-stat} {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+    }
+    r2_require_entries \
+        [r2_read_entries $values $manifest_sha $predecessor_values \
+            r2-ro-home-qroot-entries $password] [list "authority\td"] \
+        "r2-home-prefix-entries"
+    if {!$run} {
+        foreach name {
+            auth-manifest-pending auth-manifest auth-self-pending auth-self
+        } {
+            if {[dict get $present $name]} {
+                fail "r2-prefix-run-order" 78
+            }
+        }
+        r2_require_entries \
+            [r2_read_entries $values $manifest_sha $predecessor_values \
+                r2-ro-auth-root-entries $password] {} \
+            "r2-auth-prefix-entries"
+        return [dict create phase auth-root present $present]
+    }
+
+    foreach operation {r2-ro-run-qroot-readlink r2-ro-run-qroot-stat} {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+    }
+    r2_require_entries \
+        [r2_read_entries $values $manifest_sha $predecessor_values \
+            r2-ro-run-qroot-entries $password] {} "r2-run-prefix-entries"
+    if {!$manifest_pending && !$manifest_final &&
+        !$self_pending && !$self_final} {
+        r2_require_entries \
+            [r2_read_entries $values $manifest_sha $predecessor_values \
+                r2-ro-auth-root-entries $password] {} \
+            "r2-auth-prefix-entries"
+        return [dict create phase run-qroot present $present]
+    }
+    if {$manifest_pending && !$manifest_final &&
+        !$self_pending && !$self_final} {
+        r2_require_entries \
+            [r2_read_entries $values $manifest_sha $predecessor_values \
+                r2-ro-auth-root-entries $password] \
+            [list "package-manifest.v1.pending\tf"] \
+            "r2-auth-prefix-entries"
+        foreach operation {
+            r2-ro-auth-manifest-pending-stat
+        } {
+            r2_step $values $manifest_sha $predecessor_values \
+                $operation $password
+        }
+        return [dict create phase manifest-pending present $present]
+    }
+    if {$manifest_pending && !$manifest_final && $self_pending && !$self_final} {
+        r2_require_entries \
+            [r2_read_entries $values $manifest_sha $predecessor_values \
+                r2-ro-auth-root-entries $password] \
+            [list "package-manifest.v1.pending\tf" \
+                "prepare-stage-root.sh.pending\tf"] \
+            "r2-auth-prefix-entries"
+        foreach operation {
+            r2-ro-auth-manifest-pending-stat
+            r2-ro-auth-self-pending-stat
+        } {
+            r2_step $values $manifest_sha $predecessor_values \
+                $operation $password
+        }
+        # Both unpublished pending files remain within the single frozen
+        # manifest-pending prefix until the manifest hardlink is published.
+        return [dict create phase manifest-pending present $present]
+    }
+    if {$manifest_pending && $manifest_final && !$self_pending && !$self_final} {
+        r2_require_entries \
+            [r2_read_entries $values $manifest_sha $predecessor_values \
+                r2-ro-auth-root-entries $password] \
+            [list "package-manifest.v1.pending\tf" \
+                "package-manifest.v1\tf"] "r2-auth-prefix-entries"
+        r2_verify_manifest_pair $values $manifest_sha $predecessor_values \
+            $password
+        return [dict create phase manifest-pair present $present]
+    }
+    if {$manifest_pending && $manifest_final && $self_pending && !$self_final} {
+        r2_require_entries \
+            [r2_read_entries $values $manifest_sha $predecessor_values \
+                r2-ro-auth-root-entries $password] \
+            [list "package-manifest.v1.pending\tf" \
+                "package-manifest.v1\tf" \
+                "prepare-stage-root.sh.pending\tf"] \
+            "r2-auth-prefix-entries"
+        r2_verify_manifest_pair $values $manifest_sha $predecessor_values \
+            $password
+        foreach operation {
+            r2-ro-auth-self-pending-stat
+        } {
+            r2_step $values $manifest_sha $predecessor_values \
+                $operation $password
+        }
+        return [dict create phase self-pending present $present]
+    }
+    fail "r2-authority-prefix" 78
+}
+
+proc r2_ensure_delivery {
+    values manifest_sha predecessor_values password
+} {
+    # Deliberately make the no-replace mkdir the first mutation primitive.  On
+    # a resumed run, rc=1 is accepted only after exact read-only validation.
+    r2_try_intake_mkdir $values $manifest_sha $predecessor_values $password
+    foreach operation {r2-ro-intake-readlink r2-ro-intake-stat} {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+    }
+
+    set manifest_entry "package-manifest.v1\tf"
+    set self_entry "prepare-stage-root.sh\tf"
+    set entries [r2_read_entries $values $manifest_sha $predecessor_values \
+        r2-ro-intake-entries $password]
+    if {$entries eq {}} {
+        r2_step $values $manifest_sha $predecessor_values \
+            r2-raw-scp-manifest $password
+    } elseif {[llength $entries] == 1 &&
+        [lindex $entries 0] eq $manifest_entry} {
+        if {[r2_require_intake_prefix $values $manifest_sha \
+            $predecessor_values package-manifest.v1 $password] eq "prefix"} {
+            r2_step $values $manifest_sha $predecessor_values \
+                r2-raw-scp-manifest $password
+        }
+    } elseif {[llength $entries] == 2 &&
+        [lsort -ascii $entries] eq
+            [lsort -ascii [list $manifest_entry $self_entry]]} {
+        if {[r2_require_intake_prefix $values $manifest_sha \
+            $predecessor_values package-manifest.v1 $password] ne "exact"} {
+            fail "r2-intake-earlier-prefix" 78
+        }
+    } else {
+        fail "r2-intake-prefix" 78
+    }
+    foreach operation {r2-ro-intake-manifest-stat r2-ro-intake-manifest-sha} {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+    }
+
+    set entries [r2_read_entries $values $manifest_sha $predecessor_values \
+        r2-ro-intake-entries $password]
+    if {[llength $entries] == 1 && [lindex $entries 0] eq $manifest_entry} {
+        r2_step $values $manifest_sha $predecessor_values \
+            r2-raw-scp-self $password
+    } elseif {[llength $entries] == 2 &&
+        [lsort -ascii $entries] eq
+            [lsort -ascii [list $manifest_entry $self_entry]]} {
+        if {[r2_require_intake_prefix $values $manifest_sha \
+            $predecessor_values prepare-stage-root.sh $password] eq "prefix"} {
+            r2_step $values $manifest_sha $predecessor_values \
+                r2-raw-scp-self $password
+        }
+    } else {
+        fail "r2-intake-self-prefix" 78
+    }
+    foreach operation {r2-ro-intake-self-stat r2-ro-intake-self-sha} {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+    }
+    r2_require_entries \
+        [r2_read_entries $values $manifest_sha $predecessor_values \
+            r2-ro-intake-entries $password] \
+        [list $manifest_entry $self_entry] "r2-intake-final-entries"
+
+    foreach operation {
+        r2-raw-sync-intake-manifest r2-raw-sync-intake-self
+        r2-raw-sync-intake-directory r2-raw-sync-intake-parent
+    } {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+    }
+    foreach operation {
+        r2-ro-intake-readlink r2-ro-intake-stat
+        r2-ro-intake-manifest-stat r2-ro-intake-manifest-sha
+        r2-ro-intake-self-stat r2-ro-intake-self-sha
+    } {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+    }
+    r2_require_entries \
+        [r2_read_entries $values $manifest_sha $predecessor_values \
+            r2-ro-intake-entries $password] \
+        [list $manifest_entry $self_entry] "r2-intake-postsync-entries"
+    puts "B82_V6_R2_INTAKE_DURABLE files=2 directories=2 postcheck=exact"
+}
+
+proc r2_expect_phase {state expected reason} {
+    set actual [dict get $state phase]
+    if {$actual ne $expected} {
+        fail "$reason-$actual" 78
+    }
+}
+
+proc r2_ensure_authority {
+    values manifest_sha predecessor_values initial_state password
+} {
+    set state $initial_state
+    set phase [dict get $state phase]
+    set pending_pair_synced 0
+    set manifest_installed_here 0
+    set self_installed_here 0
+    if {$phase eq "absent"} {
+        r2_step $values $manifest_sha $predecessor_values \
+            r2-raw-home-qroot-create $password
+        set state [r2_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        r2_expect_phase $state home-qroot r2-home-create-state
+        set phase home-qroot
+    }
+    if {$phase eq "home-qroot"} {
+        r2_step $values $manifest_sha $predecessor_values \
+            r2-raw-auth-root-create $password
+        set state [r2_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        r2_expect_phase $state auth-root r2-auth-create-state
+        set phase auth-root
+    }
+    if {$phase eq "auth-root"} {
+        r2_step $values $manifest_sha $predecessor_values \
+            r2-raw-run-qroot-create $password
+        set state [r2_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        r2_expect_phase $state run-qroot r2-run-create-state
+        set phase run-qroot
+    }
+    if {$phase eq "run-qroot"} {
+        r2_step $values $manifest_sha $predecessor_values \
+            r2-raw-auth-manifest-install $password
+        set state [r2_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        r2_expect_phase $state manifest-pending r2-manifest-install-state
+        set phase manifest-pending
+        set manifest_installed_here 1
+    }
+    if {$phase eq "manifest-pending"} {
+        set self_present [dict get [dict get $state present] auth-self-pending]
+        if {!$self_present} {
+            if {!$manifest_installed_here} {
+                set manifest_prefix_class [r2_require_auth_pending_prefix \
+                    $values $manifest_sha $predecessor_values \
+                    package-manifest.v1 $password]
+                if {$manifest_prefix_class ne "exact"} {
+                    r2_step $values $manifest_sha $predecessor_values \
+                        r2-raw-auth-manifest-install $password
+                }
+                set manifest_installed_here 1
+            }
+            r2_step $values $manifest_sha $predecessor_values \
+                r2-ro-auth-manifest-pending-sha $password
+            r2_step $values $manifest_sha $predecessor_values \
+                r2-raw-auth-self-install $password
+            set self_installed_here 1
+            set state [r2_authority_state $values $manifest_sha \
+                $predecessor_values $password]
+            r2_expect_phase $state manifest-pending r2-self-install-state
+        } elseif {!$manifest_installed_here || !$self_installed_here} {
+            if {!$manifest_installed_here} {
+                set manifest_prefix_class [r2_require_auth_pending_prefix \
+                    $values $manifest_sha $predecessor_values \
+                    package-manifest.v1 $password]
+            }
+            if {!$self_installed_here} {
+                set self_prefix_class [r2_require_auth_pending_prefix \
+                    $values $manifest_sha $predecessor_values \
+                    prepare-stage-root.sh $password]
+            }
+            if {!$manifest_installed_here &&
+                $manifest_prefix_class ne "exact"} {
+                r2_step $values $manifest_sha $predecessor_values \
+                    r2-raw-auth-manifest-install $password
+            }
+            if {!$self_installed_here && $self_prefix_class ne "exact"} {
+                r2_step $values $manifest_sha $predecessor_values \
+                    r2-raw-auth-self-install $password
+            }
+            set manifest_installed_here 1
+            set self_installed_here 1
+        }
+        foreach operation {
+            r2-ro-auth-manifest-pending-sha
+            r2-ro-auth-self-pending-sha
+        } {
+            r2_step $values $manifest_sha $predecessor_values \
+                $operation $password
+        }
+        r2_step $values $manifest_sha $predecessor_values \
+            r2-raw-sync-auth-manifest-pending $password
+        set state [r2_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        r2_expect_phase $state manifest-pending r2-manifest-sync-state
+        r2_step $values $manifest_sha $predecessor_values \
+            r2-raw-sync-auth-self-pending $password
+        set state [r2_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        r2_expect_phase $state manifest-pending r2-self-sync-state
+        r2_step $values $manifest_sha $predecessor_values \
+            r2-raw-link-auth-manifest $password
+        set state [r2_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        r2_expect_phase $state self-pending r2-manifest-link-state
+        set phase self-pending
+        set pending_pair_synced 1
+    }
+    if {$phase eq "manifest-pair"} {
+        r2_step $values $manifest_sha $predecessor_values \
+            r2-raw-auth-self-install $password
+        set self_installed_here 1
+        r2_step $values $manifest_sha $predecessor_values \
+            r2-ro-auth-self-pending-sha $password
+        set state [r2_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        r2_expect_phase $state self-pending r2-self-install-state
+        set phase self-pending
+    }
+    if {$phase eq "self-pending"} {
+        if {!$self_installed_here && !$pending_pair_synced} {
+            set self_prefix_class [r2_require_auth_pending_prefix \
+                $values $manifest_sha $predecessor_values \
+                prepare-stage-root.sh $password]
+            if {$self_prefix_class ne "exact"} {
+                r2_step $values $manifest_sha $predecessor_values \
+                    r2-raw-auth-self-install $password
+            }
+            set self_installed_here 1
+            r2_step $values $manifest_sha $predecessor_values \
+                r2-ro-auth-self-pending-sha $password
+        }
+        # Re-sync both held inodes on convergence; neither operation can change
+        # namespace topology.
+        if {!$pending_pair_synced} {
+            foreach operation {
+                r2-raw-sync-auth-manifest-pending
+                r2-raw-sync-auth-self-pending
+            } {
+                r2_step $values $manifest_sha $predecessor_values \
+                    $operation $password
+                set state [r2_authority_state $values $manifest_sha \
+                    $predecessor_values $password]
+                r2_expect_phase $state self-pending r2-pending-sync-state
+            }
+        }
+        r2_step $values $manifest_sha $predecessor_values \
+            r2-raw-link-auth-self $password
+        set state [r2_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        r2_expect_phase $state complete r2-self-link-state
+        set phase complete
+    }
+    if {$phase ne "complete"} {
+        fail "r2-authority-state-$phase" 78
+    }
+    foreach operation {
+        r2-raw-sync-auth-root r2-raw-sync-home-parent
+        r2-raw-sync-home-qroot r2-raw-sync-run-parent
+    } {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+        set state [r2_authority_state $values $manifest_sha \
+            $predecessor_values $password]
+        r2_expect_phase $state complete r2-authority-sync-state
+    }
+    return $state
+}
+
+proc r2_require_r1_terminal {values manifest_sha password position} {
+    set state [execute_retirement_lineage_gate $values $manifest_sha $password]
+    if {$state ne "TERMINAL"} {
+        fail "r2-r1-$position-not-terminal" 78
+    }
+    puts "B82_V6_R2_R1_GATE position=$position state=TERMINAL writes=0"
+}
+
+proc r2_execute_common_gate {values manifest_sha password} {
+    foreach operation [base_identity_operations] {
+        transaction_step $values $manifest_sha $operation none $password
+    }
+    set operations [r2_stale_operations]
+    set ordinal 0
+    foreach operation $operations {
+        incr ordinal
+        set result [execute_primitive $values $manifest_sha $operation none \
+            $password]
+        if {[lindex $result 0] ne "ok"} {
+            set rc [lindex $result 1]
+            puts [format "B82_V6_R2_STALE_ITEM ordinal=%02d operation=%s class=STOP writes=0 rc=%d" $ordinal $operation $rc]
+            puts "B82_V6_R2_STALE_SUMMARY items=28 checked=$ordinal result=STOP writes=0 rc=$rc"
+            exit $rc
+        }
+        puts [format "B82_V6_R2_STALE_ITEM ordinal=%02d operation=%s class=ABSENT writes=0 rc=0" $ordinal $operation]
+    }
+    puts "B82_V6_R2_COMMON_GATE identities=5 stale_absent=28 writes=0 result=PASS"
+}
+
+proc r2_execute_predecessor_gate {
+    values manifest_sha predecessor_values password
+} {
+    transaction_step $values $manifest_sha package-parent-stat none $password
+    foreach operation {
+        r2-ro-old-package-readlink r2-ro-old-package-stat
+        r2-ro-old-package-entries
+    } {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+    }
+    foreach name [r2_predecessor_package_names] {
+        foreach family {sha stat} {
+            r2_step $values $manifest_sha $predecessor_values \
+                "r2-ro-old-package-${family}-${name}" $password
+        }
+    }
+    foreach operation {
+        r2-ro-old-bootstrap-root-readlink r2-ro-old-bootstrap-root-stat
+        r2-ro-old-bootstrap-provisioner-readlink
+        r2-ro-old-bootstrap-provisioner-stat
+        r2-ro-old-bootstrap-provisioner-sha
+        r2-ro-old-bootstrap-stager-readlink
+        r2-ro-old-bootstrap-stager-stat r2-ro-old-bootstrap-stager-sha
+        r2-ro-old-bootstrap-entries
+    } {
+        r2_step $values $manifest_sha $predecessor_values $operation $password
+    }
+    set result [r2_step $values $manifest_sha $predecessor_values \
+        r2-ro-old-provision-check $password]
+    if {[lindex $result 3] ne "none"} {
+        fail "r2-predecessor-provision-check" 78
+    }
+    puts "B82_V6_R2_PREDECESSOR_GATE package_files=17 bootstrap_files=2 provision_missing=none primitives=48 writes=0 result=PASS"
+}
+
+proc r2_postflight_presence {state} {
+    set present [dict get $state present]
+    foreach name {
+        quarantine-intake quarantine-package quarantine-bootstrap lock
+        receipt-pending receipt-final
+    } {
+        if {[dict get $present $name]} {
+            return 1
+        }
+    }
+    return 0
+}
+
+proc r2_terminal_presence {state} {
+    if {[dict get $state phase] ne "complete"} {
+        return 0
+    }
+    set present [dict get $state present]
+    foreach name {
+        quarantine-intake quarantine-package quarantine-bootstrap lock
+        receipt-final
+    } {
+        if {![dict get $present $name]} {
+            return 0
+        }
+    }
+    return [expr {![dict get $present receipt-pending]}]
+}
+
+proc r2_exact_verify {
+    values manifest_sha predecessor_values password
+} {
+    r2_step $values $manifest_sha $predecessor_values \
+        r2-ro-helper-verify $password
+    set state [r2_authority_state $values $manifest_sha \
+        $predecessor_values $password]
+    if {![r2_terminal_presence $state]} {
+        fail "r2-terminal-presence" 78
+    }
+    puts "B82_V6_R2_VERIFY state=TERMINAL receipt_sha256=derived-by-authority-helper mutations=0"
+    return $state
+}
+
+proc execute_r2_transaction {
+    values manifest_sha predecessor_values password
+} {
+    puts "B82_V6_R2_TRANSACTION_START retire_id=$::R2_RETIRE_ID operation=retire-postflight-f75fe7678cfd-r2 sequence=fixed caller_argv=forbidden"
+    # On the pristine path these are exactly primitives 1..44 and 45..57.
+    r2_require_r1_terminal $values $manifest_sha $password preflight
+    set state [r2_authority_state $values $manifest_sha \
+        $predecessor_values $password]
+    set phase [dict get $state phase]
+    r2_mutation_trace_start $phase
+    if {$phase ne "complete"} {
+        # Exactly primitives 58..90 and 91..138 precede the first write.
+        r2_execute_common_gate $values $manifest_sha $password
+        r2_execute_predecessor_gate $values $manifest_sha \
+            $predecessor_values $password
+        r2_ensure_delivery $values $manifest_sha $predecessor_values $password
+        set state [r2_ensure_authority $values $manifest_sha \
+            $predecessor_values $state $password]
+    } elseif {![r2_postflight_presence $state]} {
+        r2_execute_common_gate $values $manifest_sha $password
+        r2_execute_predecessor_gate $values $manifest_sha \
+            $predecessor_values $password
+        r2_ensure_delivery $values $manifest_sha $predecessor_values $password
+        set state [r2_ensure_authority $values $manifest_sha \
+            $predecessor_values $state $password]
+    }
+
+    if {[r2_terminal_presence $state]} {
+        r2_exact_verify $values $manifest_sha $predecessor_values $password
+        r2_require_r1_terminal $values $manifest_sha $password postflight
+        r2_mutation_trace_finish
+        puts "B82_V6_R2_TRANSACTION_COMPLETE retire_id=$::R2_RETIRE_ID state=TERMINAL mutation=already-complete automatic_cleanup=0 retention=quarantine"
+        return TERMINAL
+    }
+
+    # Re-establish every read-only property that still has an original source
+    # immediately before invoking the sole root mutation helper.
+    set state [r2_authority_state $values $manifest_sha \
+        $predecessor_values $password]
+    r2_expect_phase $state complete r2-prehelper-authority
+    r2_require_r1_terminal $values $manifest_sha $password pre-helper
+    r2_execute_common_gate $values $manifest_sha $password
+    if {![r2_postflight_presence $state]} {
+        r2_execute_predecessor_gate $values $manifest_sha \
+            $predecessor_values $password
+    }
+    r2_step $values $manifest_sha $predecessor_values \
+        r2-raw-helper-mutate $password
+    r2_exact_verify $values $manifest_sha $predecessor_values $password
+    r2_require_r1_terminal $values $manifest_sha $password postflight
+    r2_mutation_trace_finish
+    puts "B82_V6_R2_TRANSACTION_COMPLETE retire_id=$::R2_RETIRE_ID state=TERMINAL mutation_surface=21 automatic_cleanup=0 retention=quarantine"
+    return TERMINAL
+}
+
+proc execute_r2_verify_transaction {
+    values manifest_sha predecessor_values password
+} {
+    set state [r2_exact_verify $values $manifest_sha $predecessor_values \
+        $password]
+    r2_require_r1_terminal $values $manifest_sha $password verify-postflight
+    puts "B82_V6_R2_VERIFY_COMPLETE retire_id=$::R2_RETIRE_ID state=TERMINAL mutations=0"
+    return $state
+}
+
 proc execute_stale_transaction_gate {values manifest_sha password} {
     set operations [prepare_stale_operations]
     set total [llength $operations]
@@ -2131,6 +4151,9 @@ proc transport_main {arguments} {
         !($approved_sha eq "none" || [regexp {^[0-9a-f]{64}$} $approved_sha])} {
         fail "argument-values" 65
     }
+    if {[regexp {^(?:r2-(?:ro|raw)-|lineage-)} $operation]} {
+        fail "private-operation" 65
+    }
     if {($action eq "capture" && $operation ne "realnic-plan") ||
         ($action eq "execute" && ![transaction_operation $operation] &&
          ![read_only_operation $operation])} {
@@ -2164,6 +4187,17 @@ proc transport_main {arguments} {
         fail "local-package-owner" 66
     }
     if {$action eq "plan"} {
+        if {[r2_mutation_operation $operation] ||
+            [r2_read_only_operation $operation]} {
+            set helper_mode [expr {[r2_mutation_operation $operation] ?
+                "retire-postflight-f75fe7678cfd-r2" :
+                "verify-postflight-retirement-r2"}]
+            puts "B82_V6_TRANSPORT_PLAN operation=$operation transport=high-level-fixed credential_read=0 network_operations=0 raw_leaves=unreachable predecessor_format=v4 predecessor_fields=103 predecessor_package_files=17"
+            puts "EXPECT_PROGRAM [info nameofexecutable] SCRIPT $::TRANSPORT_SCRIPT_PATH"
+            puts "R2_AUTH_SELF_ARGV [list {*}[r2_helper_remote_argv \
+                $manifest_sha $helper_mode]]"
+            exit 0
+        }
         if {[catch {build_operation $values $manifest_sha $operation $approved_sha} operation_spec]} {
             fail "policy" 66
         }
@@ -2204,14 +4238,28 @@ proc transport_main {arguments} {
         exit 0
     }
     set prebuilt_operation_spec {}
-    if {[transaction_operation $operation]} {
+    set predecessor_values {}
+    if {[r2_mutation_operation $operation] ||
+        [r2_read_only_operation $operation]} {
+        # The order is frozen: current v5/112 authority, independent frozen
+        # predecessor v4/103 authority, then and only then credential access.
+        require_transaction_local_authority $values $manifest_sha \
+            $operation $approved_sha
+        set predecessor_values [r2_require_predecessor_authority]
+        execute_r2_predecessor_controller_verifier $values $manifest_sha
+    } elseif {[transaction_operation $operation]} {
         require_transaction_local_authority $values $manifest_sha $operation $approved_sha
     } elseif {[catch {build_operation $values $manifest_sha $operation \
         $approved_sha} prebuilt_operation_spec]} {
         fail "policy" 66
     }
     set password [read_execute_credential $credential_path]
-    if {[transaction_operation $operation]} {
+    if {[r2_mutation_operation $operation]} {
+        execute_r2_transaction $values $manifest_sha $predecessor_values $password
+    } elseif {[r2_read_only_operation $operation]} {
+        execute_r2_verify_transaction $values $manifest_sha \
+            $predecessor_values $password
+    } elseif {[transaction_operation $operation]} {
         execute_transaction $values $manifest_sha $operation $approved_sha $password
     } else {
         require_manifest_authority $values $manifest_sha
