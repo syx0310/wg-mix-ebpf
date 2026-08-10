@@ -5,6 +5,9 @@ umask 077
 
 readonly RUN_ID='c8e41d73'
 readonly PACKAGE_ID='4f2a9b61'
+readonly RETIRE_ID='c8e41d73-2c690050ae1d-r1'
+readonly PREDECESSOR_COMMIT='2c690050ae1d69dbd074acfd612faa2b80e29f8a'
+readonly PREDECESSOR_MANIFEST_SHA256='21f14e1f7e646649fdad864dce23dce2055585962d92bfaba6e71158372c1ebe'
 readonly EXPECTED_REMOTE_PACKAGE="/home/siyixuan/wg-mix-ebpf-test/unpriv-${PACKAGE_ID}"
 readonly BOOTSTRAP_ROOT="/run/wg-mix-ebpf-source-bootstrap-${RUN_ID}"
 readonly EXPECTED_SELF="${BOOTSTRAP_ROOT}/prepare-stage-root.sh"
@@ -27,6 +30,20 @@ readonly MODULE_LEASE_HELPER_RELATIVE="scripts/realhost-b82-${RUN_ID}/checksum-m
 readonly EXPECTED_HOSTNAME='ubuntu-2604-test'
 readonly EXPECTED_KERNEL='7.0.0-28-generic'
 readonly EXPECTED_MACHINE_ID='9db3fb717cc74974b2a6b243d67f67b9'
+readonly RETIREMENT_USER_INTAKE="/home/siyixuan/wg-mix-ebpf-test/retire-prestage-${RETIRE_ID}.intake"
+readonly RETIREMENT_HOME_QROOT="/home/.wg-mix-ebpf-retirement-${RETIRE_ID}"
+readonly RETIREMENT_AUTH_ROOT="${RETIREMENT_HOME_QROOT}/authority"
+readonly RETIREMENT_AUTH_MANIFEST="${RETIREMENT_AUTH_ROOT}/package-manifest.v1"
+readonly RETIREMENT_AUTH_MANIFEST_PENDING="${RETIREMENT_AUTH_MANIFEST}.pending"
+readonly RETIREMENT_AUTH_SELF="${RETIREMENT_AUTH_ROOT}/prepare-stage-root.sh"
+readonly RETIREMENT_AUTH_SELF_PENDING="${RETIREMENT_AUTH_SELF}.pending"
+readonly RETIREMENT_Q_INTAKE="${RETIREMENT_HOME_QROOT}/intake"
+readonly RETIREMENT_Q_PACKAGE="${RETIREMENT_HOME_QROOT}/package"
+readonly RETIREMENT_RUN_QROOT="/run/wg-mix-ebpf-retirement-${RETIRE_ID}"
+readonly RETIREMENT_Q_BOOTSTRAP="${RETIREMENT_RUN_QROOT}/bootstrap"
+readonly RETIREMENT_LOCK="${RETIREMENT_RUN_QROOT}/retirement.v1.lock"
+readonly RETIREMENT_RECEIPT_PENDING="${RETIREMENT_RUN_QROOT}/retirement-complete.v1.pending"
+readonly RETIREMENT_RECEIPT_FINAL="${RETIREMENT_RUN_QROOT}/retirement-complete.v1"
 
 MODE=''
 MANIFEST=''
@@ -135,7 +152,8 @@ fail() {
 usage() {
   printf '%s\n' \
     "usage: $0 {snapshot-plan|snapshot|plan|run} --manifest ABSOLUTE --manifest-sha256 64-lowercase-hex" \
-    "       $0 {realnic-plan-snapshot|realnic-plan-verify} --manifest ABSOLUTE --manifest-sha256 64-lowercase-hex --approved-plan-sha256 64-lowercase-hex" >&2
+    "       $0 {realnic-plan-snapshot|realnic-plan-verify} --manifest ABSOLUTE --manifest-sha256 64-lowercase-hex --approved-plan-sha256 64-lowercase-hex" \
+    "       $0 {retire-prestage-2c690050|verify-retirement} --manifest ${RETIREMENT_AUTH_MANIFEST} --manifest-sha256 64-lowercase-hex" >&2
 }
 
 sha256_file() {
@@ -161,7 +179,7 @@ parse_arguments() {
   MODE="$1"
   shift
   case "${MODE}" in
-    snapshot-plan | snapshot | plan | run)
+    snapshot-plan | snapshot | plan | run | retire-prestage-2c690050 | verify-retirement)
       (($# == 4)) || { usage; return 64; }
       ;;
     realnic-plan-snapshot | realnic-plan-verify)
@@ -633,6 +651,29 @@ load_root_snapshot_contract() {
   require_snapshot_file "${SNAPSHOT_BUNDLE}" "${BUNDLE_SHA256}" || fail 'snapshot-bundle' $?
 }
 
+load_retirement_authority_contract() {
+  local canonical_self self_shape
+  [[ "$(/usr/bin/id -u)" == '0' ]] || fail 'root-required' 77
+  [[ "${MANIFEST}" == "${RETIREMENT_AUTH_MANIFEST}" ]] ||
+    fail 'retirement-authority-manifest-path' 65
+  [[ "$(sha256_file "${MANIFEST}")" == "${MANIFEST_SHA256}" ]] ||
+    fail 'retirement-authority-manifest-sha' 67
+  validate_manifest || fail 'retirement-authority-manifest-contract' $?
+  [[ "${INTEGRATION_COMMIT}" != "${PREDECESSOR_COMMIT}" &&
+    "${PREPARE_PATH}" == "scripts/realhost-b82-${RUN_ID}/prepare-stage-root.sh" ]] ||
+    fail 'retirement-authority-generation' 65
+  canonical_self="$(/usr/bin/readlink -e -- "$0")" ||
+    fail 'retirement-authority-self-readlink' 78
+  [[ "${canonical_self}" == "${RETIREMENT_AUTH_SELF}" &&
+    -f "${RETIREMENT_AUTH_SELF}" && ! -L "${RETIREMENT_AUTH_SELF}" ]] ||
+    fail 'retirement-authority-self-path' 78
+  self_shape="$(/usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${RETIREMENT_AUTH_SELF}")" ||
+    fail 'retirement-authority-self-stat' 78
+  [[ "${self_shape}" == 'root:root:700:2:regular file' &&
+    "$(sha256_file "${RETIREMENT_AUTH_SELF}")" == "${PREPARE_SHA256}" ]] ||
+    fail 'retirement-authority-self-contract' 78
+}
+
 render_binding_marker() {
   printf '%s\n' \
     'format=wg-mix-ebpf-b82-v6-stage-binding-v1' \
@@ -958,6 +999,1035 @@ verify_realnic_plan() {
     "${ROOT_REALNIC_PLAN}" "${APPROVED_PLAN_SHA256}"
 }
 
+run_retirement_engine() {
+  /usr/bin/python3 -B -I - "${MODE}" "${MANIFEST}" "${MANIFEST_SHA256}" \
+    "${RETIREMENT_AUTH_MANIFEST_PENDING}" "${RETIREMENT_AUTH_SELF}" \
+    "${RETIREMENT_AUTH_SELF_PENDING}" "${PREPARE_SHA256}" \
+    "${RETIREMENT_USER_INTAKE}" "${RETIREMENT_HOME_QROOT}" \
+    "${RETIREMENT_AUTH_ROOT}" "${RETIREMENT_Q_INTAKE}" \
+    "${RETIREMENT_Q_PACKAGE}" "${EXPECTED_REMOTE_PACKAGE}" "${BOOTSTRAP_ROOT}" \
+    "${RETIREMENT_RUN_QROOT}" "${RETIREMENT_Q_BOOTSTRAP}" "${RETIREMENT_LOCK}" \
+    "${RETIREMENT_RECEIPT_PENDING}" "${RETIREMENT_RECEIPT_FINAL}" \
+    "${PREDECESSOR_COMMIT}" "${PREDECESSOR_MANIFEST_SHA256}" \
+    "${EXPECTED_HOSTNAME}" "${EXPECTED_KERNEL}" "${EXPECTED_MACHINE_ID}" <<'PY'
+import ctypes
+import fcntl
+import hashlib
+import os
+import pwd
+import re
+import stat
+import sys
+
+
+class RetirementStop(Exception):
+    def __init__(self, reason, code=79):
+        super().__init__(reason)
+        self.reason = reason
+        self.code = code
+
+
+def stop(reason, code=79):
+    raise RetirementStop(reason, code)
+
+
+if len(sys.argv) != 25:
+    stop("engine-arguments", 64)
+
+(mode, current_manifest, current_manifest_sha, current_manifest_pending,
+ current_self, current_self_pending, current_self_sha, user_intake, home_qroot,
+ auth_root, q_intake, q_package, source_package, source_bootstrap, run_qroot,
+ q_bootstrap, lock_path, receipt_pending, receipt_final, predecessor_commit,
+ predecessor_manifest_sha, expected_hostname, expected_kernel,
+ expected_machine_id) = sys.argv[1:]
+
+if mode not in {"retire-prestage-2c690050", "verify-retirement"}:
+    stop("engine-mode", 64)
+
+if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC")):
+    stop("open-flags-unavailable", 69)
+O_DIRECTORY = os.O_DIRECTORY
+O_NOFOLLOW = os.O_NOFOLLOW
+O_CLOEXEC = os.O_CLOEXEC
+DIR_FLAGS = os.O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC
+RENAME_NOREPLACE = 1
+ROOT_UID = 0
+ROOT_GID = 0
+
+
+def require_absolute(path, label):
+    if (not path.startswith("/") or path == "/" or "//" in path or
+            any(part in {"", ".", ".."} for part in path.split("/")[1:])):
+        stop(label + "-path", 65)
+
+
+for fixed_path in (
+        current_manifest, current_manifest_pending, current_self,
+        current_self_pending, user_intake, home_qroot, auth_root, q_intake,
+        q_package, source_package, source_bootstrap, run_qroot, q_bootstrap,
+        lock_path, receipt_pending, receipt_final):
+    require_absolute(fixed_path, "fixed")
+
+
+def open_abs_dir(path):
+    require_absolute(path, "directory")
+    descriptor = os.open("/", DIR_FLAGS)
+    try:
+        for component in path.split("/")[1:]:
+            next_descriptor = os.open(component, DIR_FLAGS, dir_fd=descriptor)
+            os.close(descriptor)
+            descriptor = next_descriptor
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def open_parent(path):
+    parent, name = os.path.split(path)
+    if not name or "/" in name or name in {".", ".."}:
+        stop("leaf-path", 65)
+    return open_abs_dir(parent), name
+
+
+def fd_mnt_id(descriptor):
+    value = None
+    with open(f"/proc/self/fdinfo/{descriptor}", "r", encoding="ascii") as stream:
+        for line in stream:
+            if line.startswith("mnt_id:\t"):
+                value = line.split("\t", 1)[1].strip()
+                break
+    if value is None or not value.isdecimal():
+        stop("mount-id")
+    return value
+
+
+def require_dir_fd(descriptor, uid, gid, mode_bits, label):
+    metadata = os.fstat(descriptor)
+    if (not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != uid or
+            metadata.st_gid != gid or stat.S_IMODE(metadata.st_mode) != mode_bits):
+        stop(label + "-metadata")
+    return metadata
+
+
+def names_at(descriptor):
+    return set(os.listdir(descriptor))
+
+
+def entry_stat(parent_descriptor, name):
+    try:
+        return os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+    except FileNotFoundError:
+        return None
+
+
+def entry_is_directory(parent_descriptor, name, label):
+    metadata = entry_stat(parent_descriptor, name)
+    if metadata is None:
+        return False
+    if not stat.S_ISDIR(metadata.st_mode):
+        stop(label + "-not-directory")
+    return True
+
+
+def read_all(descriptor, maximum=16777216):
+    metadata = os.fstat(descriptor)
+    if metadata.st_size < 0 or metadata.st_size > maximum:
+        stop("file-size")
+    chunks = []
+    offset = 0
+    while offset < metadata.st_size:
+        chunk = os.pread(descriptor, min(65536, metadata.st_size - offset), offset)
+        if not chunk:
+            stop("short-read")
+        chunks.append(chunk)
+        offset += len(chunk)
+    return b"".join(chunks)
+
+
+def sha256_fd(descriptor):
+    digest = hashlib.sha256()
+    offset = 0
+    while True:
+        chunk = os.pread(descriptor, 65536, offset)
+        if not chunk:
+            break
+        digest.update(chunk)
+        offset += len(chunk)
+    return digest.hexdigest()
+
+
+def require_file_at(parent_descriptor, name, uid, gid, mode_bits, links,
+                    expected_sha, label, writable=False):
+    flags = (os.O_RDWR if writable else os.O_RDONLY) | O_NOFOLLOW | O_CLOEXEC
+    descriptor = os.open(name, flags, dir_fd=parent_descriptor)
+    try:
+        metadata = os.fstat(descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != uid or
+                metadata.st_gid != gid or stat.S_IMODE(metadata.st_mode) != mode_bits or
+                metadata.st_nlink != links):
+            stop(label + "-metadata")
+        os.fsync(descriptor)
+        if expected_sha is not None and sha256_fd(descriptor) != expected_sha:
+            stop(label + "-sha256", 67)
+        path_metadata = os.stat(name, dir_fd=parent_descriptor, follow_symlinks=False)
+        if (path_metadata.st_dev, path_metadata.st_ino) != (metadata.st_dev, metadata.st_ino):
+            stop(label + "-replaced")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def parse_manifest(payload, label):
+    if not payload.endswith(b"\n") or b"\0" in payload or b"\r" in payload:
+        stop(label + "-encoding", 65)
+    try:
+        lines = payload[:-1].decode("utf-8", "strict").split("\n")
+    except UnicodeDecodeError:
+        stop(label + "-encoding", 65)
+    values = {}
+    for line in lines:
+        fields = line.split("\t")
+        if len(fields) != 2 or not fields[0] or not fields[1] or fields[0] in values:
+            stop(label + "-field", 65)
+        values[fields[0]] = fields[1]
+    return values
+
+
+def require_pair(directory_descriptor, pending_name, final_name, mode_bits,
+                 expected_sha, label):
+    pending_descriptor = require_file_at(
+        directory_descriptor, pending_name, ROOT_UID, ROOT_GID, mode_bits, 2,
+        expected_sha, label + "-pending")
+    try:
+        final_descriptor = require_file_at(
+            directory_descriptor, final_name, ROOT_UID, ROOT_GID, mode_bits, 2,
+            expected_sha, label + "-final")
+        try:
+            first = os.fstat(pending_descriptor)
+            second = os.fstat(final_descriptor)
+            if (first.st_dev, first.st_ino) != (second.st_dev, second.st_ino):
+                stop(label + "-inode")
+            return read_all(final_descriptor)
+        finally:
+            os.close(final_descriptor)
+    finally:
+        os.close(pending_descriptor)
+
+
+def same_open_inode(first_descriptor, second_descriptor, label):
+    first = os.fstat(first_descriptor)
+    second = os.fstat(second_descriptor)
+    if ((first.st_dev, first.st_ino) != (second.st_dev, second.st_ino) or
+            fd_mnt_id(first_descriptor) != fd_mnt_id(second_descriptor)):
+        stop(label + "-inode")
+
+
+def require_host_identity():
+    if os.geteuid() != ROOT_UID or os.getegid() != ROOT_GID:
+        stop("root-required", 77)
+    if (os.uname().nodename != expected_hostname or
+            os.uname().release != expected_kernel):
+        stop("host-identity", 78)
+    with open("/etc/machine-id", "r", encoding="ascii") as machine_stream:
+        if machine_stream.read().strip() != expected_machine_id:
+            stop("machine-identity", 78)
+
+
+def require_exact_names(descriptor, expected, label):
+    actual = names_at(descriptor)
+    if actual != set(expected):
+        stop(label + "-entries")
+
+
+def open_child_dir(parent_descriptor, name, uid, gid, mode_bits, label):
+    descriptor = os.open(name, DIR_FLAGS, dir_fd=parent_descriptor)
+    try:
+        require_dir_fd(descriptor, uid, gid, mode_bits, label)
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def validate_current_authority(auth_descriptor):
+    require_exact_names(auth_descriptor, {
+        os.path.basename(current_manifest), os.path.basename(current_manifest_pending),
+        os.path.basename(current_self), os.path.basename(current_self_pending),
+    }, "authority")
+    manifest_payload = require_pair(
+        auth_descriptor, os.path.basename(current_manifest_pending),
+        os.path.basename(current_manifest), 0o600, current_manifest_sha,
+        "authority-manifest")
+    self_payload = require_pair(
+        auth_descriptor, os.path.basename(current_self_pending),
+        os.path.basename(current_self), 0o700, current_self_sha,
+        "authority-self")
+    values = parse_manifest(manifest_payload, "authority-manifest")
+    if (values.get("format") != "wg-mix-ebpf-b82-v6-package-v4" or
+            values.get("run_id") != "c8e41d73" or
+            values.get("package_id") != "4f2a9b61" or
+            values.get("remote_package_dir") != source_package or
+            values.get("prepare_stage_root_sh_path") !=
+            "scripts/realhost-b82-c8e41d73/prepare-stage-root.sh" or
+            values.get("prepare_stage_root_sh_sha256") != current_self_sha or
+            not re.fullmatch(r"[0-9a-f]{40}", values.get("integration_commit", "")) or
+            values.get("integration_commit") == predecessor_commit or
+            hashlib.sha256(self_payload).hexdigest() != current_self_sha):
+        stop("authority-manifest-contract", 65)
+    return values
+
+
+def fsync_current_authority(auth_descriptor):
+    for name in (os.path.basename(current_manifest), os.path.basename(current_self)):
+        descriptor = os.open(name, os.O_RDONLY | O_NOFOLLOW | O_CLOEXEC,
+                             dir_fd=auth_descriptor)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    os.fsync(auth_descriptor)
+
+
+def validate_intake(descriptor, user_uid, user_gid):
+    require_dir_fd(descriptor, user_uid, user_gid, 0o700, "intake")
+    require_exact_names(descriptor, {"package-manifest.v1", "prepare-stage-root.sh"},
+                        "intake")
+    manifest_descriptor = require_file_at(
+        descriptor, "package-manifest.v1", user_uid, user_gid, 0o600, 1,
+        current_manifest_sha, "intake-manifest")
+    self_descriptor = require_file_at(
+        descriptor, "prepare-stage-root.sh", user_uid, user_gid, 0o600, 1,
+        current_self_sha, "intake-self")
+    try:
+        values = parse_manifest(read_all(manifest_descriptor), "intake-manifest")
+        if values.get("prepare_stage_root_sh_sha256") != current_self_sha:
+            stop("intake-manifest-contract")
+    finally:
+        os.close(manifest_descriptor)
+        os.close(self_descriptor)
+    os.fsync(descriptor)
+    manifest_descriptor = require_file_at(
+        descriptor, "package-manifest.v1", user_uid, user_gid, 0o600, 1,
+        current_manifest_sha, "intake-manifest-postfsync")
+    self_descriptor = require_file_at(
+        descriptor, "prepare-stage-root.sh", user_uid, user_gid, 0o600, 1,
+        current_self_sha, "intake-self-postfsync")
+    try:
+        if parse_manifest(read_all(manifest_descriptor), "intake-manifest-postfsync").get(
+                "prepare_stage_root_sh_sha256") != current_self_sha:
+            stop("intake-manifest-postfsync-contract")
+    finally:
+        os.close(manifest_descriptor)
+        os.close(self_descriptor)
+
+
+OLD_PACKAGE_DIGEST_FIELDS = {
+    "source-4f2a9b61.bundle": "bundle_sha256",
+    "package-manifest.v1": None,
+    "bind-final-package.sh": "bind_final_package_sh_sha256",
+    "controller.sh": "controller_sh_sha256",
+    "prepare-stage-root.sh": "prepare_stage_root_sh_sha256",
+    "provision-ubuntu-test-host.sh": "provision_ubuntu_test_host_sh_sha256",
+    "root-matrix-n-r.sh": "root_matrix_n_r_sh_sha256",
+    "check-realhost-iperf.py": "check_realhost_iperf_py_sha256",
+    "test-hermetic-matrix.sh": "test_hermetic_matrix_sh_sha256",
+    "test_matrix_static.py": "test_matrix_static_py_sha256",
+    "checksum-module-lease.sh": "checksum_module_lease_sh_sha256",
+    "root-fresh-verifier-gate.sh": "root_fresh_verifier_gate_sh_sha256",
+    "test-hermetic-fresh-verifier-gate.sh":
+        "test_hermetic_fresh_verifier_gate_sh_sha256",
+    "test_fresh_verifier_gate_static.py": "test_fresh_verifier_gate_static_py_sha256",
+    "realnic_acceptance.py": "realnic_acceptance_py_sha256",
+    "test_realnic_acceptance.py": "test_realnic_acceptance_py_sha256",
+    "test_realnic_acceptance_static.py": "test_realnic_acceptance_static_py_sha256",
+}
+
+
+def validate_old_package(descriptor, user_uid, user_gid):
+    require_dir_fd(descriptor, user_uid, user_gid, 0o700, "predecessor-package")
+    require_exact_names(descriptor, OLD_PACKAGE_DIGEST_FIELDS, "predecessor-package")
+    manifest_descriptor = require_file_at(
+        descriptor, "package-manifest.v1", user_uid, user_gid, 0o600, 1,
+        predecessor_manifest_sha, "predecessor-manifest")
+    try:
+        values = parse_manifest(read_all(manifest_descriptor), "predecessor-manifest")
+    finally:
+        os.close(manifest_descriptor)
+    if (values.get("format") != "wg-mix-ebpf-b82-v6-package-v4" or
+            values.get("run_id") != "c8e41d73" or
+            values.get("package_id") != "4f2a9b61" or
+            values.get("integration_commit") != predecessor_commit or
+            values.get("remote_package_dir") != source_package or
+            values.get("bundle_name") != "source-4f2a9b61.bundle"):
+        stop("predecessor-manifest-contract", 65)
+    for name, field in OLD_PACKAGE_DIGEST_FIELDS.items():
+        expected_sha = predecessor_manifest_sha if field is None else values.get(field, "")
+        if not re.fullmatch(r"[0-9a-f]{64}", expected_sha):
+            stop("predecessor-digest-contract", 65)
+        file_descriptor = require_file_at(
+            descriptor, name, user_uid, user_gid, 0o600, 1, expected_sha,
+            "predecessor-package-" + name)
+        os.close(file_descriptor)
+    os.fsync(descriptor)
+    for name, field in OLD_PACKAGE_DIGEST_FIELDS.items():
+        expected_sha = predecessor_manifest_sha if field is None else values[field]
+        file_descriptor = require_file_at(
+            descriptor, name, user_uid, user_gid, 0o600, 1, expected_sha,
+            "predecessor-package-postfsync-" + name)
+        os.close(file_descriptor)
+    return values
+
+
+def validate_old_bootstrap(descriptor, predecessor_values):
+    require_dir_fd(descriptor, ROOT_UID, ROOT_GID, 0o700, "predecessor-bootstrap")
+    require_exact_names(descriptor,
+                        {"prepare-stage-root.sh", "provision-ubuntu-test-host.sh"},
+                        "predecessor-bootstrap")
+    for name, field in (
+            ("prepare-stage-root.sh", "prepare_stage_root_sh_sha256"),
+            ("provision-ubuntu-test-host.sh", "provision_ubuntu_test_host_sh_sha256")):
+        file_descriptor = require_file_at(
+            descriptor, name, ROOT_UID, ROOT_GID, 0o700, 1,
+            predecessor_values[field], "predecessor-bootstrap-" + name)
+        os.close(file_descriptor)
+    os.fsync(descriptor)
+    for name, field in (
+            ("prepare-stage-root.sh", "prepare_stage_root_sh_sha256"),
+            ("provision-ubuntu-test-host.sh", "provision_ubuntu_test_host_sh_sha256")):
+        file_descriptor = require_file_at(
+            descriptor, name, ROOT_UID, ROOT_GID, 0o700, 1,
+            predecessor_values[field], "predecessor-bootstrap-postfsync-" + name)
+        os.close(file_descriptor)
+
+
+def directory_location(path, uid, gid, mode_bits, label):
+    parent_descriptor, name = open_parent(path)
+    present = entry_is_directory(parent_descriptor, name, label)
+    if not present:
+        os.close(parent_descriptor)
+        return None, None
+    descriptor = open_child_dir(parent_descriptor, name, uid, gid, mode_bits, label)
+    os.close(parent_descriptor)
+    return descriptor, os.fstat(descriptor)
+
+
+def regular_present(parent_descriptor, name, label):
+    metadata = entry_stat(parent_descriptor, name)
+    if metadata is None:
+        return False
+    if not stat.S_ISREG(metadata.st_mode):
+        stop(label + "-not-regular")
+    return True
+
+
+def classify_state(home_descriptor, run_descriptor, user_uid, user_gid,
+                   allow_lockless_d=False):
+    source_intake_parent, source_intake_name = open_parent(user_intake)
+    source_package_parent, source_package_name = open_parent(source_package)
+    source_bootstrap_parent, source_bootstrap_name = open_parent(source_bootstrap)
+    try:
+        source_bits = (
+            entry_is_directory(source_intake_parent, source_intake_name, "source-intake"),
+            entry_is_directory(source_package_parent, source_package_name, "source-package"),
+            entry_is_directory(source_bootstrap_parent, source_bootstrap_name,
+                               "source-bootstrap"),
+        )
+    finally:
+        os.close(source_intake_parent)
+        os.close(source_package_parent)
+        os.close(source_bootstrap_parent)
+    destination_bits = (
+        entry_is_directory(home_descriptor, os.path.basename(q_intake), "q-intake"),
+        entry_is_directory(home_descriptor, os.path.basename(q_package), "q-package"),
+        entry_is_directory(run_descriptor, os.path.basename(q_bootstrap), "q-bootstrap"),
+    )
+    final_present = regular_present(
+        run_descriptor, os.path.basename(receipt_final), "receipt-final")
+    pending_present = regular_present(
+        run_descriptor, os.path.basename(receipt_pending), "receipt-pending")
+    signature = source_bits + destination_bits + (final_present,)
+    states = {
+        (True, True, True, False, False, False, False): "D",
+        (False, True, True, True, False, False, False): "I",
+        (False, False, True, True, True, False, False): "S1",
+        (False, False, False, True, True, True, False): "S2",
+        (False, False, False, True, True, True, True): "T_CANDIDATE",
+    }
+    state = states.get(signature)
+    if state is None and ((destination_bits[0] or destination_bits[1]) and
+                          not source_bits[2] and not destination_bits[2]):
+        stop("same-boot-residual")
+    if state == "S2" and pending_present:
+        state = "S2P"
+    elif pending_present:
+        stop("retirement-state")
+    if state is None:
+        stop("retirement-state")
+    expected_home = {"authority"}
+    if state in {"I", "S1", "S2", "S2P", "T_CANDIDATE"}:
+        expected_home.add(os.path.basename(q_intake))
+    if state in {"S1", "S2", "S2P", "T_CANDIDATE"}:
+        expected_home.add(os.path.basename(q_package))
+    expected_run = set() if allow_lockless_d and state == "D" else {
+        os.path.basename(lock_path)}
+    if state in {"S2", "S2P", "T_CANDIDATE"}:
+        expected_run.add(os.path.basename(q_bootstrap))
+    if state == "S2P":
+        expected_run.add(os.path.basename(receipt_pending))
+    if state == "T_CANDIDATE":
+        expected_run.add(os.path.basename(receipt_final))
+    require_exact_names(home_descriptor, expected_home, "home-qroot")
+    require_exact_names(run_descriptor, expected_run, "run-qroot")
+    return state, pending_present
+
+
+def boot_identity():
+    with open("/proc/sys/kernel/random/boot_id", "r", encoding="ascii") as stream:
+        value = stream.read().strip()
+    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+                        value):
+        stop("boot-id")
+    return value
+
+
+def write_all(descriptor, payload):
+    offset = 0
+    while offset < len(payload):
+        written = os.write(descriptor, payload[offset:])
+        if written <= 0:
+            stop("short-write")
+        offset += written
+
+
+def acquire_retirement_lock(home_descriptor, run_descriptor, user_uid, user_gid):
+    writable = mode == "retire-prestage-2c690050"
+    lock_name = os.path.basename(lock_path)
+    created = False
+    if entry_stat(run_descriptor, lock_name) is None:
+        if not writable:
+            stop("retirement-lock-absent", 78)
+        provisional_state, provisional_pending = classify_state(
+            home_descriptor, run_descriptor, user_uid, user_gid,
+            allow_lockless_d=True)
+        if provisional_state != "D" or provisional_pending:
+            stop("lockless-state-not-delivered")
+        try:
+            lock_descriptor = os.open(
+                lock_name, os.O_RDWR | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                0o600, dir_fd=run_descriptor)
+        except FileExistsError:
+            stop("retirement-lock-create-race", 73)
+        created = True
+        metadata = os.fstat(lock_descriptor)
+        named = os.stat(lock_name, dir_fd=run_descriptor, follow_symlinks=False)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != ROOT_UID or
+                metadata.st_gid != ROOT_GID or stat.S_IMODE(metadata.st_mode) != 0o600 or
+                metadata.st_nlink != 1 or
+                (metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino)):
+            os.close(lock_descriptor)
+            stop("retirement-lock-created-metadata")
+        os.fsync(lock_descriptor)
+        os.fsync(run_descriptor)
+    else:
+        lock_descriptor = require_file_at(
+            run_descriptor, lock_name, ROOT_UID, ROOT_GID, 0o600, 1,
+            None, "retirement-lock", writable=writable)
+    try:
+        lock_mode = fcntl.LOCK_EX if writable else fcntl.LOCK_SH
+        try:
+            fcntl.flock(lock_descriptor, lock_mode | fcntl.LOCK_NB)
+        except BlockingIOError:
+            stop("retirement-lock-busy", 78)
+        return lock_descriptor, created
+    except BaseException:
+        os.close(lock_descriptor)
+        raise
+
+
+def initialize_or_verify_boot_marker(lock_descriptor, run_descriptor, state, boot_id):
+    writable = mode == "retire-prestage-2c690050"
+    expected = f"boot_id\t{boot_id}\n".encode("ascii")
+    existing = read_all(lock_descriptor, 256)
+    if existing == expected:
+        os.fsync(lock_descriptor)
+        os.fsync(run_descriptor)
+        if read_all(lock_descriptor, 256) != expected:
+            stop("boot-marker-convergence-drift")
+        return
+    if (state != "D" or not writable or not expected.startswith(existing)):
+        stop("same-boot-residual")
+    os.ftruncate(lock_descriptor, 0)
+    os.lseek(lock_descriptor, 0, os.SEEK_SET)
+    write_all(lock_descriptor, expected)
+    os.fsync(lock_descriptor)
+    os.fsync(run_descriptor)
+    if read_all(lock_descriptor, 256) != expected:
+        stop("boot-marker-postwrite")
+
+
+def receipt_bytes(predecessor_values, current_values):
+    bundle_sha = predecessor_values.get("bundle_sha256", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", bundle_sha):
+        stop("receipt-bundle-digest")
+    lines = (
+        ("format", "wg-mix-ebpf-b82-prestage-retirement-terminal-v1"),
+        ("retire_id", "c8e41d73-2c690050ae1d-r1"),
+        ("state", "TERMINAL"),
+        ("predecessor_commit", predecessor_commit),
+        ("predecessor_manifest_sha256", predecessor_manifest_sha),
+        ("predecessor_bundle_sha256", bundle_sha),
+        ("authority_manifest_sha256", current_manifest_sha),
+        ("authority_prepare_stage_root_sha256", current_self_sha),
+        ("authority_integration_commit", current_values["integration_commit"]),
+        ("source_intake", user_intake),
+        ("source_package", source_package),
+        ("source_bootstrap", source_bootstrap),
+        ("quarantine_intake", q_intake),
+        ("quarantine_package", q_package),
+        ("quarantine_bootstrap", q_bootstrap),
+        ("rename_order", "intake,package,bootstrap"),
+        ("rename_primitive", "renameat2-RENAME_NOREPLACE-dirfd-v1"),
+        ("retention", "no-unlink-no-rmdir-no-copy-fallback"),
+    )
+    if len(lines) != 18:
+        stop("receipt-line-count")
+    return ("".join(f"{key}\t{value}\n" for key, value in lines)).encode("utf-8")
+
+
+def validate_receipt(run_descriptor, payload):
+    descriptor = require_file_at(
+        run_descriptor, os.path.basename(receipt_final), ROOT_UID, ROOT_GID, 0o600,
+        1, hashlib.sha256(payload).hexdigest(), "receipt-final")
+    try:
+        if read_all(descriptor, 8192) != payload:
+            stop("receipt-content")
+        return descriptor
+    except BaseException:
+        os.close(descriptor)
+        raise
+
+
+def validate_pending_receipt(run_descriptor, expected_payload):
+    descriptor = require_file_at(
+        run_descriptor, os.path.basename(receipt_pending), ROOT_UID, ROOT_GID,
+        0o600, 1, None, "receipt-pending", writable=True)
+    existing = read_all(descriptor, 8192)
+    if not expected_payload.startswith(existing):
+        os.close(descriptor)
+        stop("receipt-pending-not-owned-prefix")
+    return descriptor
+
+
+def validate_state_objects(state, pending_present, home_descriptor, run_descriptor,
+                           user_uid, user_gid, current_values, boot_id):
+    intake_path = user_intake if state == "D" else q_intake
+    package_path = source_package if state in {"D", "I"} else q_package
+    bootstrap_path = source_bootstrap if state in {"D", "I", "S1"} else q_bootstrap
+    intake_descriptor = open_abs_dir(intake_path)
+    package_descriptor = open_abs_dir(package_path)
+    bootstrap_descriptor = open_abs_dir(bootstrap_path)
+    try:
+        validate_intake(intake_descriptor, user_uid, user_gid)
+        predecessor_values = validate_old_package(
+            package_descriptor, user_uid, user_gid)
+        validate_old_bootstrap(bootstrap_descriptor, predecessor_values)
+    finally:
+        os.close(intake_descriptor)
+        os.close(package_descriptor)
+        os.close(bootstrap_descriptor)
+    payload = receipt_bytes(predecessor_values, current_values)
+    if state == "T_CANDIDATE":
+        receipt_descriptor = validate_receipt(run_descriptor, payload)
+        os.close(receipt_descriptor)
+    elif state == "S2P" and pending_present:
+        pending_descriptor = validate_pending_receipt(run_descriptor, payload)
+        os.close(pending_descriptor)
+    return predecessor_values, payload
+
+
+try:
+    libc = ctypes.CDLL("libc.so.6", use_errno=True)
+    libc_renameat2 = libc.renameat2
+except (OSError, AttributeError):
+    stop("glibc-renameat2-unavailable", 69)
+libc_renameat2.argtypes = [ctypes.c_int, ctypes.c_char_p,
+                           ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+libc_renameat2.restype = ctypes.c_int
+
+
+def renameat2_noreplace(source_parent, source_name, destination_parent,
+                        destination_name):
+    result = libc_renameat2(source_parent, os.fsencode(source_name),
+                            destination_parent, os.fsencode(destination_name),
+                            RENAME_NOREPLACE)
+    if result != 0:
+        error_number = ctypes.get_errno()
+        raise OSError(error_number, os.strerror(error_number))
+
+
+def rename_directory_noreplace(source, destination, uid, gid, validator, label):
+    source_parent, source_name = open_parent(source)
+    destination_parent, destination_name = open_parent(destination)
+    held_descriptor = None
+    destination_descriptor = None
+    try:
+        source_parent_metadata = os.fstat(source_parent)
+        destination_parent_metadata = os.fstat(destination_parent)
+        if (source_parent_metadata.st_dev != destination_parent_metadata.st_dev or
+                fd_mnt_id(source_parent) != fd_mnt_id(destination_parent)):
+            stop(label + "-cross-mount")
+        if entry_stat(destination_parent, destination_name) is not None:
+            stop(label + "-destination-exists", 73)
+        held_descriptor = open_child_dir(
+            source_parent, source_name, uid, gid, 0o700, label + "-source")
+        validator(held_descriptor)
+        held_identity = os.fstat(held_descriptor)
+        held_mount = fd_mnt_id(held_descriptor)
+        if (held_identity.st_dev != source_parent_metadata.st_dev or
+                held_mount != fd_mnt_id(source_parent)):
+            stop(label + "-source-mount")
+        renameat2_noreplace(source_parent, source_name,
+                            destination_parent, destination_name)
+        destination_descriptor = open_child_dir(
+            destination_parent, destination_name, uid, gid, 0o700,
+            label + "-destination")
+        same_open_inode(held_descriptor, destination_descriptor, label + "-held")
+        if ((held_identity.st_dev, held_identity.st_ino) !=
+                (os.fstat(destination_descriptor).st_dev,
+                 os.fstat(destination_descriptor).st_ino) or
+                held_mount != fd_mnt_id(destination_descriptor)):
+            stop(label + "-postrename-identity")
+        validator(destination_descriptor)
+        if entry_stat(source_parent, source_name) is not None:
+            stop(label + "-source-still-present")
+        os.fsync(source_parent)
+        os.fsync(destination_parent)
+        validator(held_descriptor)
+    finally:
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        if held_descriptor is not None:
+            os.close(held_descriptor)
+        os.close(source_parent)
+        os.close(destination_parent)
+
+
+def publish_receipt(run_descriptor, payload, pending_present):
+    pending_name = os.path.basename(receipt_pending)
+    final_name = os.path.basename(receipt_final)
+    namespace_writes = 0
+    if pending_present:
+        pending_descriptor = validate_pending_receipt(run_descriptor, payload)
+    else:
+        try:
+            pending_descriptor = os.open(
+                pending_name, os.O_RDWR | os.O_CREAT | os.O_EXCL | O_NOFOLLOW | O_CLOEXEC,
+                0o600, dir_fd=run_descriptor)
+        except FileExistsError:
+            stop("receipt-pending-race", 73)
+        namespace_writes += 1
+        metadata = os.fstat(pending_descriptor)
+        if (not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != ROOT_UID or
+                metadata.st_gid != ROOT_GID or stat.S_IMODE(metadata.st_mode) != 0o600 or
+                metadata.st_nlink != 1):
+            os.close(pending_descriptor)
+            stop("receipt-pending-created-metadata")
+        os.fsync(run_descriptor)
+    try:
+        if entry_stat(run_descriptor, final_name) is not None:
+            stop("receipt-final-exists", 73)
+        pending_identity = os.fstat(pending_descriptor)
+        os.ftruncate(pending_descriptor, 0)
+        os.lseek(pending_descriptor, 0, os.SEEK_SET)
+        write_all(pending_descriptor, payload)
+        os.fsync(pending_descriptor)
+        path_identity = os.stat(
+            pending_name, dir_fd=run_descriptor, follow_symlinks=False)
+        if ((pending_identity.st_dev, pending_identity.st_ino) !=
+                (path_identity.st_dev, path_identity.st_ino) or
+                read_all(pending_descriptor, 8192) != payload):
+            stop("receipt-pending-postwrite")
+        renameat2_noreplace(run_descriptor, pending_name, run_descriptor, final_name)
+        namespace_writes += 1
+    finally:
+        os.close(pending_descriptor)
+    final_descriptor = validate_receipt(run_descriptor, payload)
+    try:
+        os.fsync(final_descriptor)
+        os.fsync(run_descriptor)
+    finally:
+        os.close(final_descriptor)
+    return namespace_writes
+
+
+def converge_completed_rename(source, destination, uid, gid, label):
+    source_parent, source_name = open_parent(source)
+    destination_parent, destination_name = open_parent(destination)
+    destination_descriptor = None
+    try:
+        source_parent_metadata = os.fstat(source_parent)
+        destination_parent_metadata = os.fstat(destination_parent)
+        if (source_parent_metadata.st_dev != destination_parent_metadata.st_dev or
+                fd_mnt_id(source_parent) != fd_mnt_id(destination_parent)):
+            stop(label + "-cross-mount")
+        if entry_stat(source_parent, source_name) is not None:
+            stop(label + "-source-present")
+        destination_descriptor = open_child_dir(
+            destination_parent, destination_name, uid, gid, 0o700,
+            label + "-destination")
+        destination_identity = os.fstat(destination_descriptor)
+        destination_mount = fd_mnt_id(destination_descriptor)
+        if (destination_identity.st_dev != destination_parent_metadata.st_dev or
+                destination_mount != fd_mnt_id(destination_parent)):
+            stop(label + "-destination-mount")
+        os.fsync(source_parent)
+        os.fsync(destination_parent)
+        if entry_stat(source_parent, source_name) is not None:
+            stop(label + "-source-postfsync")
+        named = os.stat(
+            destination_name, dir_fd=destination_parent, follow_symlinks=False)
+        if ((named.st_dev, named.st_ino) !=
+                (destination_identity.st_dev, destination_identity.st_ino) or
+                fd_mnt_id(destination_descriptor) != destination_mount):
+            stop(label + "-destination-postfsync")
+        require_dir_fd(destination_descriptor, uid, gid, 0o700,
+                       label + "-destination-postfsync")
+    finally:
+        if destination_descriptor is not None:
+            os.close(destination_descriptor)
+        os.close(source_parent)
+        os.close(destination_parent)
+
+
+def converge_completed_rename_parents(state, user_uid, user_gid):
+    completed = []
+    if state in {"I", "S1", "S2", "S2P", "T_CANDIDATE"}:
+        completed.append((user_intake, q_intake, user_uid, user_gid,
+                          "converge-intake"))
+    if state in {"S1", "S2", "S2P", "T_CANDIDATE"}:
+        completed.append((source_package, q_package, user_uid, user_gid,
+                          "converge-package"))
+    if state in {"S2", "S2P", "T_CANDIDATE"}:
+        completed.append((source_bootstrap, q_bootstrap, ROOT_UID, ROOT_GID,
+                          "converge-bootstrap"))
+    for source, destination, uid, gid, label in completed:
+        converge_completed_rename(source, destination, uid, gid, label)
+
+
+def converge_resumed_state(expected_state, expected_pending, home_descriptor,
+                           run_descriptor, user_uid, user_gid, current_values,
+                           boot_id):
+    if expected_state not in {"I", "S1", "S2", "S2P"}:
+        stop("resume-state")
+    converge_completed_rename_parents(expected_state, user_uid, user_gid)
+    visible_state, visible_pending = classify_state(
+        home_descriptor, run_descriptor, user_uid, user_gid)
+    if (visible_state != expected_state or
+            visible_pending != expected_pending):
+        stop("resume-reclassification")
+    predecessor_values, payload = validate_state_objects(
+        visible_state, visible_pending, home_descriptor, run_descriptor,
+        user_uid, user_gid, current_values, boot_id)
+    final_state, final_pending = classify_state(
+        home_descriptor, run_descriptor, user_uid, user_gid)
+    if final_state != expected_state or final_pending != expected_pending:
+        stop("resume-postvalidation-state")
+    return predecessor_values, payload
+
+
+def converge_terminal(home_descriptor, run_descriptor, user_uid, user_gid,
+                      current_values, boot_id, payload):
+    converge_completed_rename_parents("T_CANDIDATE", user_uid, user_gid)
+    final_descriptor = validate_receipt(run_descriptor, payload)
+    try:
+        os.fsync(final_descriptor)
+    finally:
+        os.close(final_descriptor)
+    os.fsync(run_descriptor)
+    visible_state, visible_pending = classify_state(
+        home_descriptor, run_descriptor, user_uid, user_gid)
+    validate_state_objects(
+        visible_state, visible_pending, home_descriptor, run_descriptor,
+        user_uid, user_gid, current_values, boot_id)
+    if visible_state != "T_CANDIDATE":
+        stop("terminal-reclassification")
+    final_state, final_pending = classify_state(
+        home_descriptor, run_descriptor, user_uid, user_gid)
+    if final_state != "T_CANDIDATE" or final_pending:
+        stop("terminal-postvalidation-state")
+    return "T"
+
+
+def engine_main():
+    require_host_identity()
+    if (not re.fullmatch(r"[0-9a-f]{64}", current_manifest_sha) or
+            not re.fullmatch(r"[0-9a-f]{64}", current_self_sha) or
+            not re.fullmatch(r"[0-9a-f]{64}", predecessor_manifest_sha) or
+            predecessor_commit != "2c690050ae1d69dbd074acfd612faa2b80e29f8a"):
+        stop("digest-authority", 65)
+    if (os.path.dirname(current_manifest) != auth_root or
+            os.path.dirname(current_manifest_pending) != auth_root or
+            os.path.dirname(current_self) != auth_root or
+            os.path.dirname(current_self_pending) != auth_root or
+            os.path.dirname(q_intake) != home_qroot or
+            os.path.dirname(q_package) != home_qroot or
+            os.path.dirname(q_bootstrap) != run_qroot or
+            os.path.dirname(lock_path) != run_qroot or
+            os.path.dirname(receipt_pending) != run_qroot or
+            os.path.dirname(receipt_final) != run_qroot):
+        stop("path-topology", 65)
+    user = pwd.getpwnam("siyixuan")
+    home_descriptor = open_abs_dir(home_qroot)
+    run_descriptor = open_abs_dir(run_qroot)
+    auth_descriptor = None
+    lock_descriptor = None
+    try:
+        require_dir_fd(home_descriptor, ROOT_UID, ROOT_GID, 0o700, "home-qroot")
+        require_dir_fd(run_descriptor, ROOT_UID, ROOT_GID, 0o700, "run-qroot")
+        auth_descriptor = open_child_dir(
+            home_descriptor, os.path.basename(auth_root), ROOT_UID, ROOT_GID,
+            0o700, "authority-root")
+        current_values = validate_current_authority(auth_descriptor)
+        fsync_current_authority(auth_descriptor)
+        if validate_current_authority(auth_descriptor) != current_values:
+            stop("authority-postfsync-drift")
+        lock_descriptor, lock_created = acquire_retirement_lock(
+            home_descriptor, run_descriptor, user.pw_uid, user.pw_gid)
+        state, pending_present = classify_state(
+            home_descriptor, run_descriptor, user.pw_uid, user.pw_gid)
+        boot_id = boot_identity()
+        initialize_or_verify_boot_marker(lock_descriptor, run_descriptor, state, boot_id)
+        state_after_lock, pending_after_lock = classify_state(
+            home_descriptor, run_descriptor, user.pw_uid, user.pw_gid)
+        if state_after_lock != state or pending_after_lock != pending_present:
+            stop("post-lock-state-drift")
+        predecessor_values, payload = validate_state_objects(
+            state, pending_present, home_descriptor, run_descriptor,
+            user.pw_uid, user.pw_gid, current_values, boot_id)
+
+        if state in {"I", "S1", "S2", "S2P"}:
+            predecessor_values, payload = converge_resumed_state(
+                state, pending_present, home_descriptor, run_descriptor,
+                user.pw_uid, user.pw_gid, current_values, boot_id)
+
+        if mode == "verify-retirement":
+            if state != "T_CANDIDATE":
+                stop("retirement-not-terminal", 78)
+            terminal_state = converge_terminal(
+                home_descriptor, run_descriptor, user.pw_uid, user.pw_gid,
+                current_values, boot_id, payload)
+            if terminal_state != "T":
+                stop("verify-terminal-state")
+            print("B82_V6_RETIREMENT_VERIFIED state=T namespace_writes=0 "
+                  f"same_boot=1 receipt={receipt_final}")
+            return
+
+        if state == "T_CANDIDATE":
+            terminal_state = converge_terminal(
+                home_descriptor, run_descriptor, user.pw_uid, user.pw_gid,
+                current_values, boot_id, payload)
+            if terminal_state != "T":
+                stop("retire-terminal-state")
+            print("B82_V6_RETIREMENT_COMPLETE state=T disposition=verified-existing "
+                  "namespace_writes=0 same_boot=1")
+            return
+
+        namespace_writes = 1 if lock_created else 0
+        if state == "D":
+            rename_directory_noreplace(
+                user_intake, q_intake, user.pw_uid, user.pw_gid,
+                lambda descriptor: validate_intake(
+                    descriptor, user.pw_uid, user.pw_gid), "retire-intake")
+            namespace_writes += 1
+            state, pending_present = classify_state(
+                home_descriptor, run_descriptor, user.pw_uid, user.pw_gid)
+            if state != "I":
+                stop("post-intake-state")
+            predecessor_values, payload = validate_state_objects(
+                state, pending_present, home_descriptor, run_descriptor,
+                user.pw_uid, user.pw_gid, current_values, boot_id)
+            confirmed_state, confirmed_pending = classify_state(
+                home_descriptor, run_descriptor, user.pw_uid, user.pw_gid)
+            if confirmed_state != state or confirmed_pending != pending_present:
+                stop("post-intake-validation-state")
+        if state == "I":
+            rename_directory_noreplace(
+                source_package, q_package, user.pw_uid, user.pw_gid,
+                lambda descriptor: validate_old_package(
+                    descriptor, user.pw_uid, user.pw_gid), "retire-package")
+            namespace_writes += 1
+            state, pending_present = classify_state(
+                home_descriptor, run_descriptor, user.pw_uid, user.pw_gid)
+            if state != "S1":
+                stop("post-package-state")
+            predecessor_values, payload = validate_state_objects(
+                state, pending_present, home_descriptor, run_descriptor,
+                user.pw_uid, user.pw_gid, current_values, boot_id)
+            confirmed_state, confirmed_pending = classify_state(
+                home_descriptor, run_descriptor, user.pw_uid, user.pw_gid)
+            if confirmed_state != state or confirmed_pending != pending_present:
+                stop("post-package-validation-state")
+        if state == "S1":
+            rename_directory_noreplace(
+                source_bootstrap, q_bootstrap, ROOT_UID, ROOT_GID,
+                lambda descriptor: validate_old_bootstrap(
+                    descriptor, predecessor_values), "retire-bootstrap")
+            namespace_writes += 1
+            state, pending_present = classify_state(
+                home_descriptor, run_descriptor, user.pw_uid, user.pw_gid)
+            if state != "S2":
+                stop("post-bootstrap-state")
+            predecessor_values, payload = validate_state_objects(
+                state, pending_present, home_descriptor, run_descriptor,
+                user.pw_uid, user.pw_gid, current_values, boot_id)
+            confirmed_state, confirmed_pending = classify_state(
+                home_descriptor, run_descriptor, user.pw_uid, user.pw_gid)
+            if confirmed_state != state or confirmed_pending != pending_present:
+                stop("post-bootstrap-validation-state")
+        if state not in {"S2", "S2P"}:
+            stop("pre-receipt-state")
+        namespace_writes += publish_receipt(
+            run_descriptor, payload, state == "S2P" and pending_present)
+        state, pending_present = classify_state(
+            home_descriptor, run_descriptor, user.pw_uid, user.pw_gid)
+        if state != "T_CANDIDATE":
+            stop("post-receipt-visible-state")
+        terminal_state = converge_terminal(
+            home_descriptor, run_descriptor, user.pw_uid, user.pw_gid,
+            current_values, boot_id, payload)
+        if terminal_state != "T":
+            stop("post-receipt-terminal-state")
+        print("B82_V6_RETIREMENT_COMPLETE state=T disposition=advanced "
+              f"namespace_writes={namespace_writes} same_boot=1")
+    finally:
+        if lock_descriptor is not None:
+            os.close(lock_descriptor)
+        if auth_descriptor is not None:
+            os.close(auth_descriptor)
+        os.close(home_descriptor)
+        os.close(run_descriptor)
+
+
+try:
+    engine_main()
+except RetirementStop as error:
+    print(f"B82_V6_RETIREMENT_ENGINE_STOP reason={error.reason} rc={error.code} "
+          "cleanup=0 retained=1", file=sys.stderr)
+    raise SystemExit(error.code)
+except KeyError:
+    print("B82_V6_RETIREMENT_ENGINE_STOP reason=manifest-key rc=65 cleanup=0 retained=1",
+          file=sys.stderr)
+    raise SystemExit(65)
+except OSError as error:
+    error_number = error.errno if error.errno is not None else 79
+    print(f"B82_V6_RETIREMENT_ENGINE_STOP reason=oserror-{error_number} rc=79 "
+          "cleanup=0 retained=1", file=sys.stderr)
+    raise SystemExit(79)
+PY
+}
+
 run_stage() {
   local bundle="${SNAPSHOT_BUNDLE}" branch="${INTEGRATION_REF#refs/heads/}"
   local parent_shape
@@ -1063,6 +2133,10 @@ main() {
     realnic-plan-verify)
       load_root_snapshot_contract
       verify_realnic_plan
+      ;;
+    retire-prestage-2c690050 | verify-retirement)
+      load_retirement_authority_contract
+      run_retirement_engine || fail 'retirement-engine' $?
       ;;
   esac
 }

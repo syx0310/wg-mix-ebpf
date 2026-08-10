@@ -356,6 +356,87 @@ BIND_RESULT="$(/bin/bash "${FIXTURE_REVIEW}/bind-final-package.sh" bind "${BIND_
 [[ "${BIND_RESULT}" == *'B82_V6_BIND_COMPLETE'* ]] || fail 'binding completion marker'
 BOUND_MANIFEST="${BOUND_OUTPUT}/package-manifest.v1"
 BOUND_MANIFEST_SHA="$(sha256_file "${BOUND_MANIFEST}")" || fail 'manifest digest'
+PREDECESSOR_PACKAGE="${TEST_ROOT}/predecessor-package"
+PREDECESSOR_MANIFEST="${PREDECESSOR_PACKAGE}/package-manifest.v1"
+/bin/mkdir -m 0700 -- "${PREDECESSOR_PACKAGE}" ||
+  fail 'predecessor package fixture directory'
+/usr/bin/python3 -B -I - "${PREDECESSOR_MANIFEST}" "${PREDECESSOR_PACKAGE}" <<'PY'
+import base64
+import hashlib
+import pathlib
+import sys
+import zlib
+
+target = pathlib.Path(sys.argv[1])
+fixture_package = sys.argv[2].encode()
+encoded = b"""
+    eNqlWdt24kgSfIZ/Ea775UP2mVOVlWVY28CRhKf99xslIdp2g5fenZ6ZdiMyq/IWGaGux/4tjat/nru3/a+O86l2Oaju3XWn
+    RC/pmbt3s+7Ph+2+rCiwkcXr9eVR+8xUlWJ2cr0/jPzcp3F/PGx7riv8NzztOJXhiY6Ffz2N9Kur6YVHOnV1f0iv3bv6YkXH
+    t7f9uFLkohBWJJbFxZKL8CZRLU6qmpLKQbCKNaR1Ph/KK28P6Y1Xw/HcE3fLbTbzs+Urwy4p61aWrE6FyQbtNJOq1coSc7GF
+    imfjfPCGgo74JX0wUZI3WboUKNaoFK13+2E89h/bd+73dU/TtVf74fiaRi7d+TAf1/X83r3iq10d6KV7l1e7OUL8dj6MK2fj
+    9UF/PI7Dcs2orSvV6ayLIUPaqShVliblwGwpW1OkoiKrNJljSrJyYBlSyam4KuzV6zH/m+m33xBzyoKq1VUFUZJK2VdrQkRS
+    vcgisHWWrY5BpxyJfI3eVZVVqFIEqdb/PG+HEaGuUh74MLY/t/r1NdHnz16PlF63qZSeh+HT5yfm/vvH83d7Ph2Hfbvz6ulf
+    A/fD07D/2P86p8PUO0Onnj416NPmn2P/MvbMt3tq9rn0aNn3q6dTv3/HxZ/Gt9Pi6dLlS09fW6f73H/rnt+OI391tju+8e8L
+    fp6ckYfx6Xxop139LS7mDl09YZa+2Fw6F4l9ZozK5TpP88frMfXPPG7PSMpqOXL5cHccxpWMaiNd2EixCerzk2kszujI8dwp
+    J8x0ueULL9wf+HXlN2IjOhW6Zz6gpWl5/JZotz9M840B1DV76dEPJmIeVHJZGV2cr87nuJj8bgQ+DBoQ8bnYxm+kdBslcFdr
+    52enYz+urBJyPRzTy3ZgOh7KsNJOiPUAo4YI1w/x2Wn3MexbYQ972tZj/0/qyzadx92x348fgJv0iiddIuLTmA5IKQbvanS9
+    XuvOlz+rsJgvBt3VYPMuN81m/crPiT6Qm7Hf/9q+oS9x6LjvuXXJZL099ce6f8UsXC9xfTT2qQIyPoW0zvtD2U5de+2vYYcf
+    x91qoH5/GoenZt2KOXXrtTea4aXdL4abYXfHXX495hWT00qI6nJlr7SLJGXIJmjUNAQpNQfLEchx28cFP6ROMqA8wTkF2MgS
+    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
+    g20HBxYuSgCtXf8HLUKfqg==
+"""
+payload = zlib.decompress(base64.b64decode(encoded))
+canonical_package = (
+    b"/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-2c690050ae1d"
+)
+if hashlib.sha256(payload).hexdigest() != (
+    "21f14e1f7e646649fdad864dce23dce2055585962d92bfaba6e71158372c1ebe"
+):
+    raise SystemExit(65)
+git_object = b"blob " + str(len(payload)).encode() + b"\0" + payload
+if hashlib.sha1(git_object).hexdigest() != (
+    "95cc3d5bbf7e27b07584debbaa1e43c3fbb28c00"
+):
+    raise SystemExit(65)
+needle = b"local_package_dir\t" + canonical_package + b"\n"
+replacement = b"local_package_dir\t" + fixture_package + b"\n"
+if payload.count(needle) != 1:
+    raise SystemExit(65)
+target.write_bytes(payload.replace(needle, replacement, 1))
+PY
+[[ -f "${PREDECESSOR_MANIFEST}" && ! -L "${PREDECESSOR_MANIFEST}" ]] ||
+  fail 'predecessor manifest fixture creation'
+/bin/chmod 0600 "${PREDECESSOR_MANIFEST}" ||
+  fail 'predecessor manifest fixture mode'
+PREDECESSOR_MANIFEST_SHA="$(sha256_file "${PREDECESSOR_MANIFEST}")" ||
+  fail 'predecessor manifest fixture digest'
 CONTROLLER_READER_ONLY="${TEST_ROOT}/controller.manifest-reader.sh"
 STAGER_READER_ONLY="${TEST_ROOT}/stager.manifest-reader.sh"
 for source_only_spec in \
@@ -700,6 +781,411 @@ switch -- $mode {
         }
         puts "HARNESS_SCP_BUILD expectation=$expected_result result=PASS"
     }
+    retirement-precredential {
+        if {[llength $arguments] != 5} {
+            harness_die "retirement-precredential-arguments"
+        }
+        lassign $arguments manifest manifest_sha predecessor_package \
+            predecessor_manifest_sha variant
+        if {$variant ni {exact bad-predecessor-sha}} {
+            harness_die "retirement-precredential-variant"
+        }
+        set ::PREDECESSOR_LOCAL_PACKAGE $predecessor_package
+        set ::PREDECESSOR_MANIFEST_SHA256 $predecessor_manifest_sha
+        set ::authority_trace {}
+        set ::credential_reads 0
+        set ::spawns 0
+        set ::transaction_calls 0
+        rename fail transport_original_fail
+        proc fail {message code} {
+            return -code error -errorcode [list B82FAIL $code] $message
+        }
+        rename exit harness_real_exit
+        proc exit {{code 0}} {
+            return -code error -errorcode [list TRANSPORT_EXIT $code] "exit-$code"
+        }
+        rename require_transaction_local_authority \
+            transport_original_require_transaction_local_authority
+        proc require_transaction_local_authority args {
+            set result [transport_original_require_transaction_local_authority {*}$args]
+            lappend ::authority_trace current
+            return $result
+        }
+        rename require_retirement_predecessor_authority \
+            transport_original_require_retirement_predecessor_authority
+        proc require_retirement_predecessor_authority {} {
+            set result [transport_original_require_retirement_predecessor_authority]
+            lappend ::authority_trace predecessor
+            return $result
+        }
+        rename validate_manifest_values transport_original_validate_manifest_values
+        proc validate_manifest_values {values} {
+            if {[dict get $values integration_commit] eq $::PREDECESSOR_COMMIT &&
+                [dict get $values local_package_dir] eq
+                    $::PREDECESSOR_LOCAL_PACKAGE} {
+                set canonical_values $values
+                dict set canonical_values local_package_dir \
+                    "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-[string range $::PREDECESSOR_COMMIT 0 11]"
+                return [transport_original_validate_manifest_values $canonical_values]
+            }
+            return [transport_original_validate_manifest_values $values]
+        }
+        rename read_execute_credential transport_original_read_execute_credential
+        proc read_execute_credential {path} {
+            incr ::credential_reads
+            lappend ::authority_trace credential
+            return fixture-password
+        }
+        rename execute_operation_spec transport_original_execute_operation_spec
+        proc execute_operation_spec {operation operation_spec password} {
+            incr ::spawns
+            return [list ok 0 "" none]
+        }
+        rename execute_retirement_transaction transport_original_execute_retirement_transaction
+        proc execute_retirement_transaction args {
+            incr ::transaction_calls
+            lappend ::authority_trace transaction
+        }
+        if {$variant eq "bad-predecessor-sha"} {
+            set ::PREDECESSOR_MANIFEST_SHA256 [string repeat a 64]
+        }
+        set invocation [list \
+            --manifest $manifest --manifest-sha256 $manifest_sha \
+            --credential-path /Users/siyixuan/codes-2/wg-mix-ebpf/credientials/192.168.10.82 \
+            --action execute --operation retire-prestage-2c690050 \
+            --approved-plan-sha256 none]
+        set caught [catch {transport_main $invocation} message options]
+        if {!$caught || ![dict exists $options -errorcode]} {
+            harness_die "retirement-precredential-returned"
+        }
+        set errorcode [dict get $options -errorcode]
+        if {$variant eq "exact"} {
+            if {$errorcode ne {TRANSPORT_EXIT 0} ||
+                $::authority_trace ne {current predecessor credential transaction} ||
+                $::credential_reads != 1 || $::transaction_calls != 1 ||
+                $::spawns != 0} {
+                harness_die "retirement-precredential-exact trace=$::authority_trace error=$errorcode credential=$::credential_reads transaction=$::transaction_calls spawns=$::spawns"
+            }
+        } elseif {$errorcode ne {B82FAIL 66} ||
+            $::authority_trace ne {current} || $::credential_reads != 0 ||
+            $::transaction_calls != 0 || $::spawns != 0 ||
+            $message ne "retirement-predecessor-manifest"} {
+            harness_die "retirement-precredential-bad trace=$::authority_trace error=$errorcode reason=$message credential=$::credential_reads transaction=$::transaction_calls spawns=$::spawns"
+        }
+        puts "HARNESS_RETIREMENT_PRECREDENTIAL variant=$variant trace=$::authority_trace credential_reads=$::credential_reads transaction_calls=$::transaction_calls spawns=$::spawns result=PASS"
+        harness_real_exit 0
+    }
+    retirement-sequence {
+        set ::observed {}
+        set ::authority_state absent
+        rename require_manifest_authority transport_original_require_manifest_authority
+        proc require_manifest_authority args { return }
+        rename retirement_authority_state transport_original_retirement_authority_state
+        proc retirement_authority_state args {
+            lappend ::observed STATE
+            return $::authority_state
+        }
+        rename execute_primitive transport_original_execute_primitive
+        proc execute_primitive {values manifest_sha operation approved_sha password} {
+            lappend ::observed $operation
+            return [list ok 0 "" none]
+        }
+        rename execute_retirement_primitive transport_original_execute_retirement_primitive
+        proc execute_retirement_primitive {values manifest_sha predecessor_values operation password} {
+            lappend ::observed $operation
+            return [list ok 0 "" none]
+        }
+        rename retirement_ensure_delivery transport_original_retirement_ensure_delivery
+        proc retirement_ensure_delivery args { lappend ::observed FIRST_DELIVERY_WRITE }
+        rename retirement_converge_delivery_durability \
+            transport_original_retirement_converge_delivery_durability
+        proc retirement_converge_delivery_durability args {
+            lappend ::observed DELIVERY_DURABLE
+        }
+        rename retirement_ensure_authority transport_original_retirement_ensure_authority
+        proc retirement_ensure_authority args { lappend ::observed AUTHORITY }
+
+        set common {
+            identity-hostname identity-kernel identity-machine identity-netns
+            identity-interface stale-alternate-bootstrap-root stale-stage-root
+            stale-fresh-root stale-standalone-root stale-routed-evidence-root
+            stale-realnic-run-roots stale-realnic-interface-leases
+            stale-veth-wgc8e41a stale-veth-wgc8e41b stale-veth-wga19f7a
+            stale-veth-wga19f7b stale-veth-wg5b8d3a stale-veth-wg5b8d3b
+            stale-pin-fresh stale-pin-standalone stale-pin-legacy-tcx
+            stale-pin-legacy-nic-original stale-pin-legacy-nic-all-on
+            stale-pin-legacy-nic-all-off stale-pin-legacy-nic-tx-path
+            stale-pin-legacy-nic-rx-path stale-pin-legacy-nic-mtu1492
+            stale-pin-legacy-nic-mtu1500 stale-pin-legacy-nic-soak
+            stale-checksum-module stale-checksum-module-btf
+            stale-checksum-module-lock stale-physical-interface-lock
+        }
+        set predecessor {
+            package-parent-stat retire-ro-old-package-readlink
+            retire-ro-old-package-stat retire-ro-old-package-entries
+        }
+        set predecessor_package_names {
+            source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh
+            controller.sh prepare-stage-root.sh provision-ubuntu-test-host.sh
+            root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh
+            test_matrix_static.py checksum-module-lease.sh
+            root-fresh-verifier-gate.sh test-hermetic-fresh-verifier-gate.sh
+            test_fresh_verifier_gate_static.py realnic_acceptance.py
+            test_realnic_acceptance.py test_realnic_acceptance_static.py
+        }
+        foreach name $predecessor_package_names {
+            lappend predecessor "verify-sha-$name" "verify-stat-$name"
+        }
+        lappend predecessor \
+            bootstrap-root-readlink bootstrap-root-stat \
+            bootstrap-provisioner-readlink bootstrap-provisioner-stat \
+            bootstrap-provisioner-sha bootstrap-stager-readlink \
+            bootstrap-stager-stat bootstrap-stager-sha \
+            retire-ro-old-bootstrap-entries provision-check
+        set expected [concat [list STATE] $common $predecessor \
+            [list FIRST_DELIVERY_WRITE DELIVERY_DURABLE AUTHORITY] $common \
+            [list retire-raw-helper-mutate retire-ro-helper-verify]]
+        execute_retirement_transaction {} [string repeat a 64] {} fixture-password
+        if {[lrange $::observed 0 end] ne [lrange $expected 0 end] ||
+            [lsearch -exact $::observed FIRST_DELIVERY_WRITE] != 82} {
+            harness_die "retirement-initial-sequence observed=$::observed expected=$expected"
+        }
+        set initial_steps [llength $::observed]
+
+        set ::authority_state complete
+        set ::observed {}
+        set expected [concat [list STATE AUTHORITY] $common \
+            [list retire-raw-helper-mutate retire-ro-helper-verify]]
+        execute_retirement_transaction {} [string repeat a 64] {} fixture-password
+        if {[lrange $::observed 0 end] ne [lrange $expected 0 end] ||
+            [lindex $::observed end-2] ne [lindex $common end] ||
+            [lindex $::observed end-1] ne "retire-raw-helper-mutate"} {
+            harness_die "retirement-complete-sequence observed=$::observed expected=$expected"
+        }
+        puts "HARNESS_RETIREMENT_SEQUENCE initial_steps=$initial_steps first_delivery_index=82 initial_common=33 predecessor_checks=48 complete_retry_common=33 helper_adjacent=1 result=PASS"
+    }
+    retirement-delivery-durability {
+        set ::observed {}
+        rename retirement_step transport_original_retirement_step
+        proc retirement_step {values manifest_sha predecessor_values operation password} {
+            lappend ::observed $operation
+            return [list ok 0 "" none]
+        }
+        rename transaction_step transport_original_transaction_step
+        proc transaction_step {values manifest_sha operation approved_sha password} {
+            lappend ::observed "transaction:$operation"
+            return [list ok 0 "" none]
+        }
+        rename retirement_read_entries transport_original_retirement_read_entries
+        proc retirement_read_entries args {
+            lappend ::observed entries
+            return [list "package-manifest.v1\tf" "prepare-stage-root.sh\tf"]
+        }
+        retirement_converge_delivery_durability {} [string repeat a 64] {} fixture-password
+        set expected {
+            retire-raw-sync-intake-manifest retire-raw-sync-intake-self
+            retire-raw-sync-intake-directory retire-raw-sync-intake-parent
+            transaction:package-parent-stat retire-ro-intake-readlink
+            retire-ro-intake-stat retire-ro-intake-manifest-stat
+            retire-ro-intake-manifest-sha retire-ro-intake-self-stat
+            retire-ro-intake-self-sha entries
+        }
+        if {[lrange $::observed 0 end] ne [lrange $expected 0 end]} {
+            harness_die "retirement-delivery-durability observed=$::observed"
+        }
+        puts "HARNESS_RETIREMENT_DELIVERY_DURABILITY files=2 directories=2 postchecks=8 order=sync-then-postcheck result=PASS"
+    }
+    retirement-authority-prefixes {
+        if {[llength $arguments] != 0} {
+            harness_die "retirement-authority-prefixes-arguments"
+        }
+        set ::authority_case absent
+        set ::authority_override {}
+        rename fail transport_original_fail
+        proc fail {message code} {
+            return -code error -errorcode [list B82FAIL $code] $message
+        }
+        proc harness_authority_names {state} {
+            switch -- $state {
+                absent { return {} }
+                home-qroot { return {home-qroot} }
+                auth-root { return {home-qroot auth-root} }
+                run-qroot {
+                    return {home-qroot auth-root run-qroot}
+                }
+                manifest-pending {
+                    return {home-qroot auth-root run-qroot auth-manifest-pending}
+                }
+                manifest-pair {
+                    return {home-qroot auth-root run-qroot auth-manifest-pending auth-manifest}
+                }
+                self-pending {
+                    return {home-qroot auth-root run-qroot auth-manifest-pending auth-manifest auth-self-pending}
+                }
+                complete {
+                    return {home-qroot auth-root run-qroot auth-manifest-pending auth-manifest auth-self-pending auth-self}
+                }
+                default { harness_die "authority-case-$state" }
+            }
+        }
+        rename retirement_path_exists transport_original_retirement_path_exists
+        proc retirement_path_exists {values manifest_sha predecessor_values path_name password} {
+            set present $::authority_override
+            if {$present eq {}} {
+                set present [harness_authority_names $::authority_case]
+            }
+            return [expr {[lsearch -exact $present $path_name] >= 0}]
+        }
+        rename retirement_step transport_original_retirement_step
+        proc retirement_step args { return [list ok 0 "" none] }
+        rename retirement_read_entries transport_original_retirement_read_entries
+        proc retirement_read_entries {values manifest_sha predecessor_values operation password} {
+            switch -- $operation {
+                retire-ro-home-qroot-entries {
+                    if {$::authority_case eq "home-qroot"} { return {} }
+                    return [list "authority\td"]
+                }
+                retire-ro-run-qroot-entries { return {} }
+                retire-ro-auth-root-entries {
+                    switch -- $::authority_case {
+                        auth-root - run-qroot { return {} }
+                        manifest-pending {
+                            return [list "package-manifest.v1.pending\tf"]
+                        }
+                        manifest-pair {
+                            return [list "package-manifest.v1.pending\tf" \
+                                "package-manifest.v1\tf"]
+                        }
+                        self-pending {
+                            return [list "package-manifest.v1.pending\tf" \
+                                "package-manifest.v1\tf" \
+                                "prepare-stage-root.sh.pending\tf"]
+                        }
+                        complete {
+                            return [list "package-manifest.v1.pending\tf" \
+                                "package-manifest.v1\tf" \
+                                "prepare-stage-root.sh.pending\tf" \
+                                "prepare-stage-root.sh\tf"]
+                        }
+                        default { harness_die "authority-entries-$::authority_case" }
+                    }
+                }
+                default { harness_die "authority-entry-operation-$operation" }
+            }
+        }
+        set states {
+            absent home-qroot auth-root run-qroot manifest-pending
+            manifest-pair self-pending complete
+        }
+        foreach expected $states {
+            set ::authority_case $expected
+            set actual [retirement_authority_state {} [string repeat a 64] \
+                {} fixture-password]
+            if {$actual ne $expected} {
+                harness_die "authority-prefix expected=$expected actual=$actual"
+            }
+        }
+        set ::authority_case absent
+        set ::authority_override {home-qroot run-qroot}
+        set caught [catch {
+            retirement_authority_state {} [string repeat a 64] \
+                {} fixture-password
+        } message options]
+        if {!$caught || ![dict exists $options -errorcode] ||
+            [dict get $options -errorcode] ne {B82FAIL 78} ||
+            $message ne "retirement-prefix-auth-order"} {
+            harness_die "authority-invalid-prefix message=$message options=$options"
+        }
+        puts "HARNESS_RETIREMENT_AUTHORITY_PREFIXES states=[join $states ,] invalid=STOP result=PASS"
+    }
+    retirement-intake-prefixes {
+        if {[llength $arguments] != 2} {
+            harness_die "retirement-intake-prefixes-arguments"
+        }
+        lassign $arguments manifest manifest_sha
+        set values [load_manifest $manifest $manifest_sha]
+        rename fail transport_original_fail
+        proc fail {message code} {
+            return -code error -errorcode [list B82FAIL $code] $message
+        }
+        rename retirement_observe_user_file_size \
+            transport_original_retirement_observe_user_file_size
+        proc retirement_observe_user_file_size args { return $::remote_size }
+        rename retirement_observe_sha transport_original_retirement_observe_sha
+        proc retirement_observe_sha args { return $::remote_sha }
+        proc harness_prefix_sha256 {path length} {
+            set digest [exec /usr/bin/python3 -B -I -c {
+import hashlib
+import pathlib
+import sys
+payload = pathlib.Path(sys.argv[1]).read_bytes()
+length = int(sys.argv[2])
+if length < 0 or length > len(payload):
+    raise SystemExit(65)
+print(hashlib.sha256(payload[:length]).hexdigest())
+            } $path $length]
+            if {![regexp {^[0-9a-f]{64}$} $digest]} {
+                harness_die "independent-prefix-sha"
+            }
+            return $digest
+        }
+        set checked 0
+        foreach name {package-manifest.v1 prepare-stage-root.sh} {
+            lassign [retirement_local_delivery_file $values $manifest_sha $name] \
+                local_path expected_sha
+            file lstat $local_path before_stat
+            set before_sha [harness_prefix_sha256 $local_path $before_stat(size)]
+            foreach variant {exact empty partial nonprefix} {
+                switch -- $variant {
+                    exact {
+                        set ::remote_size $before_stat(size)
+                        set ::remote_sha $expected_sha
+                        set expected exact
+                    }
+                    empty {
+                        set ::remote_size 0
+                        set ::remote_sha [harness_prefix_sha256 $local_path 0]
+                        set expected prefix
+                    }
+                    partial {
+                        set ::remote_size 17
+                        set ::remote_sha [harness_prefix_sha256 $local_path 17]
+                        set expected prefix
+                    }
+                    nonprefix {
+                        set ::remote_size 1
+                        set ::remote_sha [string repeat f 64]
+                        set expected STOP
+                    }
+                }
+                set caught [catch {
+                    retirement_require_intake_prefix $values $manifest_sha \
+                        {} $name fixture-password
+                } result options]
+                if {$expected eq "STOP"} {
+                    if {!$caught || ![dict exists $options -errorcode] ||
+                        [dict get $options -errorcode] ne {B82FAIL 78} ||
+                        $result ne "retirement-intake-nonprefix"} {
+                        harness_die "intake-nonprefix-$name result=$result options=$options"
+                    }
+                } elseif {$caught || $result ne $expected} {
+                    harness_die "intake-prefix-$name-$variant result=$result options=$options"
+                }
+                file lstat $local_path after_stat
+                foreach field {dev ino size mode nlink uid gid type} {
+                    if {$after_stat($field) ne $before_stat($field)} {
+                        harness_die "intake-retained-stat-$name-$variant-$field"
+                    }
+                }
+                if {[harness_prefix_sha256 $local_path $after_stat(size)] ne
+                    $before_sha} {
+                    harness_die "intake-retained-sha-$name-$variant"
+                }
+                incr checked
+            }
+        }
+        puts "HARNESS_RETIREMENT_INTAKE_PREFIXES files=2 variants=exact,empty,partial,nonprefix retained=$checked result=PASS"
+    }
     default { harness_die "mode-$mode" }
 }
 EXPECT_HARNESS
@@ -746,6 +1232,19 @@ readonly -a RAW_MUTATION_PACKAGE_NAMES=(
   test-hermetic-fresh-verifier-gate.sh test_fresh_verifier_gate_static.py
   realnic_acceptance.py test_realnic_acceptance.py test_realnic_acceptance_static.py
 )
+readonly -a RETIREMENT_PRIVATE_OPERATIONS=(
+  retire-raw-auth-manifest-install retire-raw-auth-root-create
+  retire-raw-auth-self-install retire-raw-helper-mutate
+  retire-raw-home-qroot-create retire-raw-intake-mkdir
+  retire-raw-link-auth-manifest retire-raw-link-auth-self
+  retire-raw-run-qroot-create retire-raw-scp-manifest retire-raw-scp-self
+  retire-raw-sync-auth-manifest-pending retire-raw-sync-auth-root
+  retire-raw-sync-auth-self-pending retire-raw-sync-home-parent
+  retire-raw-sync-home-qroot retire-raw-sync-intake-directory
+  retire-raw-sync-intake-manifest retire-raw-sync-intake-parent
+  retire-raw-sync-intake-self retire-raw-sync-run-parent
+  retire-ro-helper-verify retire-ro-intake-stat
+)
 RAW_DIRECT_COUNT=0
 for operation in "${RAW_MUTATION_OPERATIONS[@]}"; do
   operation_approved_sha='none'
@@ -774,6 +1273,39 @@ expect_precredential_fence raw-scp-realnic-approved-plan \
 ((RAW_DIRECT_COUNT += 1))
 [[ "${RAW_DIRECT_COUNT}" -eq 28 ]] || fail 'raw mutation direct-call cardinality'
 
+RETIREMENT_PRIVATE_REJECTIONS=0
+for operation in "${RETIREMENT_PRIVATE_OPERATIONS[@]}"; do
+  private_output="$(/usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
+    --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
+    --credential-path "${CREDENTIAL_PATH}" --action plan --operation "${operation}" \
+    --approved-plan-sha256 none 2>&1)"
+  private_rc=$?
+  [[ "${private_rc}" -eq 66 && "${private_output}" == *'reason=policy rc=66'* ]] ||
+    fail "retirement private plan leaf became reachable: ${operation}: ${private_output}"
+  private_output="$(/usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
+    --manifest /private/tmp/nonexistent-b82-retirement-private-manifest \
+    --manifest-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+    --credential-path "${CREDENTIAL_PATH}" --action execute --operation "${operation}" \
+    --approved-plan-sha256 none 2>&1)"
+  private_rc=$?
+  [[ "${private_rc}" -eq 65 && "${private_output}" == *'reason=action-operation rc=65'* ]] ||
+    fail "retirement private execute leaf passed the precredential action gate: ${operation}: ${private_output}"
+  ((RETIREMENT_PRIVATE_REJECTIONS += 2))
+done
+[[ "${RETIREMENT_PRIVATE_REJECTIONS}" -eq 46 ]] ||
+  fail 'retirement private plan/execute rejection cardinality'
+for operation in retire-prestage-2c690050 verify-retirement; do
+  retirement_plan="$(/usr/bin/expect "${FIXTURE_REVIEW}/locked-transport.exp" \
+    --manifest "${BOUND_MANIFEST}" --manifest-sha256 "${BOUND_MANIFEST_SHA}" \
+    --credential-path "${CREDENTIAL_PATH}" --action plan --operation "${operation}" \
+    --approved-plan-sha256 none)" || fail "retirement high-level plan: ${operation}"
+  [[ "${retirement_plan}" == *"B82_V6_TRANSPORT_PLAN operation=${operation} transport=high-level-fixed credential_read=0 network_operations=0 raw_leaves=unreachable"* &&
+    "${retirement_plan}" == *"/bin/bash -p /home/.wg-mix-ebpf-retirement-c8e41d73-2c690050ae1d-r1/authority/prepare-stage-root.sh ${operation} --manifest /home/.wg-mix-ebpf-retirement-c8e41d73-2c690050ae1d-r1/authority/package-manifest.v1 --manifest-sha256 ${BOUND_MANIFEST_SHA}"* ]] ||
+    fail "retirement fixed helper plan drifted: ${operation}: ${retirement_plan}"
+done
+printf 'HERMETIC_RETIREMENT_CLI private_plan_execute_rejections=%s high_level_modes=2 credential_reads=0 network_operations=0\n' \
+  "${RETIREMENT_PRIVATE_REJECTIONS}"
+
 PREPARE_SEQUENCE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   "${FIXTURE_REVIEW}/locked-transport.exp" prepare-sequence)" ||
   fail 'fixed prepare transaction sequence'
@@ -796,6 +1328,526 @@ CHILD_NONZERO_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   fail 'transport child nonzero marker'
 expect_exact_rc transport-child-signal 78 /usr/bin/expect "${TRANSPORT_HARNESS}" \
   "${FIXTURE_REVIEW}/locked-transport.exp" child-signal
+RETIREMENT_PRECREDENTIAL_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
+  "${FIXTURE_REVIEW}/locked-transport.exp" retirement-precredential \
+  "${BOUND_MANIFEST}" "${BOUND_MANIFEST_SHA}" \
+  "${PREDECESSOR_PACKAGE}" "${PREDECESSOR_MANIFEST_SHA}" exact)" ||
+  fail 'retirement exact current+predecessor precredential authority'
+[[ "${RETIREMENT_PRECREDENTIAL_OUTPUT}" == *'HARNESS_RETIREMENT_PRECREDENTIAL variant=exact trace=current predecessor credential transaction credential_reads=1 transaction_calls=1 spawns=0 result=PASS'* ]] ||
+  fail "retirement exact precredential marker: ${RETIREMENT_PRECREDENTIAL_OUTPUT}"
+RETIREMENT_BAD_PREDECESSOR_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
+  "${FIXTURE_REVIEW}/locked-transport.exp" retirement-precredential \
+  "${BOUND_MANIFEST}" "${BOUND_MANIFEST_SHA}" \
+  "${PREDECESSOR_PACKAGE}" "${PREDECESSOR_MANIFEST_SHA}" bad-predecessor-sha)" ||
+  fail 'retirement bad predecessor precredential authority'
+[[ "${RETIREMENT_BAD_PREDECESSOR_OUTPUT}" == *'HARNESS_RETIREMENT_PRECREDENTIAL variant=bad-predecessor-sha trace=current credential_reads=0 transaction_calls=0 spawns=0 result=PASS'* ]] ||
+  fail "retirement bad predecessor precredential marker: ${RETIREMENT_BAD_PREDECESSOR_OUTPUT}"
+RETIREMENT_SEQUENCE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
+  "${FIXTURE_REVIEW}/locked-transport.exp" retirement-sequence)" ||
+  fail 'retirement initial and complete-retry sequence'
+[[ "${RETIREMENT_SEQUENCE_OUTPUT}" == *'HARNESS_RETIREMENT_SEQUENCE initial_steps=120 first_delivery_index=82 initial_common=33 predecessor_checks=48 complete_retry_common=33 helper_adjacent=1 result=PASS'* ]] ||
+  fail "retirement sequence marker: ${RETIREMENT_SEQUENCE_OUTPUT}"
+RETIREMENT_DURABILITY_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
+  "${FIXTURE_REVIEW}/locked-transport.exp" retirement-delivery-durability)" ||
+  fail 'retirement delivery durability sequence'
+[[ "${RETIREMENT_DURABILITY_OUTPUT}" == *'HARNESS_RETIREMENT_DELIVERY_DURABILITY files=2 directories=2 postchecks=8 order=sync-then-postcheck result=PASS'* ]] ||
+  fail "retirement delivery durability marker: ${RETIREMENT_DURABILITY_OUTPUT}"
+RETIREMENT_AUTHORITY_PREFIX_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
+  "${FIXTURE_REVIEW}/locked-transport.exp" retirement-authority-prefixes)" ||
+  fail 'retirement authority prefix classifier matrix'
+[[ "${RETIREMENT_AUTHORITY_PREFIX_OUTPUT}" == *'HARNESS_RETIREMENT_AUTHORITY_PREFIXES states=absent,home-qroot,auth-root,run-qroot,manifest-pending,manifest-pair,self-pending,complete invalid=STOP result=PASS'* ]] ||
+  fail "retirement authority prefix marker: ${RETIREMENT_AUTHORITY_PREFIX_OUTPUT}"
+RETIREMENT_INTAKE_PREFIX_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
+  "${FIXTURE_REVIEW}/locked-transport.exp" retirement-intake-prefixes \
+  "${BOUND_MANIFEST}" "${BOUND_MANIFEST_SHA}")" ||
+  fail 'retirement intake prefix proof matrix'
+[[ "${RETIREMENT_INTAKE_PREFIX_OUTPUT}" == *'HARNESS_RETIREMENT_INTAKE_PREFIXES files=2 variants=exact,empty,partial,nonprefix retained=8 result=PASS'* ]] ||
+  fail "retirement intake prefix marker: ${RETIREMENT_INTAKE_PREFIX_OUTPUT}"
+RETIREMENT_ENGINE_HARNESS="${TEST_ROOT}/retirement-engine-fault-harness.py"
+(umask 077
+  /usr/bin/tee "${RETIREMENT_ENGINE_HARNESS}" >/dev/null <<'RETIREMENT_ENGINE_HARNESS_PY'
+"""Unprivileged, local-only fault-cut harness for the embedded retirement engine."""
+
+import ast
+import fcntl
+import hashlib
+import os
+import pathlib
+import re
+import signal
+import stat
+import subprocess
+import sys
+import tempfile
+import types
+
+
+PAYLOAD = b"format\tstub-receipt\nstate\tTERMINAL\n"
+SELECTED = {
+    "RetirementStop", "stop", "require_absolute", "open_abs_dir", "open_parent",
+    "fd_mnt_id", "require_dir_fd", "names_at", "entry_stat",
+    "entry_is_directory", "read_all", "sha256_fd", "require_file_at",
+    "same_open_inode", "require_exact_names", "open_child_dir", "regular_present",
+    "classify_state", "write_all", "validate_receipt",
+    "validate_pending_receipt", "rename_directory_noreplace", "publish_receipt",
+    "converge_completed_rename", "converge_completed_rename_parents",
+    "converge_resumed_state", "converge_terminal",
+    "acquire_retirement_lock", "initialize_or_verify_boot_marker",
+    "engine_main",
+}
+
+
+def load_engine(stager):
+    shell = pathlib.Path(stager).read_text(encoding="utf-8")
+    marker = "<<'PY'\n"
+    start = shell.index(marker) + len(marker)
+    engine = shell[start:shell.index("\nPY\n", start)]
+    tree = ast.parse(engine, filename="retirement-engine")
+    selected = [
+        node for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.ClassDef)) and node.name in SELECTED
+    ]
+    namespace = {
+        "fcntl": fcntl,
+        "hashlib": hashlib,
+        "os": os,
+        "re": re,
+        "stat": stat,
+        "O_DIRECTORY": getattr(os, "O_DIRECTORY", 0),
+        "O_NOFOLLOW": getattr(os, "O_NOFOLLOW", 0),
+        "O_CLOEXEC": getattr(os, "O_CLOEXEC", 0),
+        "DIR_FLAGS": (
+            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) |
+            getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+        ),
+        "ROOT_UID": os.getuid(),
+        "ROOT_GID": os.getgid(),
+        "mode": "retire-prestage-2c690050",
+    }
+    exec(
+        compile(ast.Module(body=selected, type_ignores=[]),
+                "retirement-engine-selected", "exec"),
+        namespace,
+    )
+    # Darwin has no Linux fdinfo. st_dev is sufficient for this local namespace stub.
+    namespace["fd_mnt_id"] = lambda descriptor: str(os.fstat(descriptor).st_dev)
+    return namespace
+
+
+def exact_mkdir(path):
+    os.mkdir(path, 0o700)
+    os.chmod(path, 0o700)
+
+
+def exact_file(path, payload=b""):
+    descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        if payload:
+            os.write(descriptor, payload)
+    finally:
+        os.close(descriptor)
+    os.chmod(path, 0o600)
+
+
+def overwrite(path, payload):
+    descriptor = os.open(path, os.O_WRONLY | os.O_TRUNC)
+    try:
+        if payload:
+            os.write(descriptor, payload)
+    finally:
+        os.close(descriptor)
+
+
+def paths(raw_root):
+    root = pathlib.Path(os.path.realpath(raw_root))
+    source_parent = root / "source-parent"
+    package_parent = root / "package-parent"
+    bootstrap_parent = root / "bootstrap-parent"
+    home = root / "home-qroot"
+    run = root / "run-qroot"
+    return {
+        "root": str(root),
+        "user_intake": str(source_parent / "intake"),
+        "source_package": str(package_parent / "package"),
+        "source_bootstrap": str(bootstrap_parent / "bootstrap"),
+        "home_qroot": str(home),
+        "run_qroot": str(run),
+        "auth_root": str(home / "authority"),
+        "q_intake": str(home / "intake"),
+        "q_package": str(home / "package"),
+        "q_bootstrap": str(run / "bootstrap"),
+        "lock_path": str(run / "retirement.v1.lock"),
+        "receipt_pending": str(run / "retirement-complete.v1.pending"),
+        "receipt_final": str(run / "retirement-complete.v1"),
+    }
+
+
+def initialize_fixture(raw_root):
+    value = paths(raw_root)
+    for name in ("source-parent", "package-parent", "bootstrap-parent",
+                 "home-qroot", "run-qroot"):
+        exact_mkdir(pathlib.Path(value["root"]) / name)
+    exact_mkdir(value["auth_root"])
+    for name in ("user_intake", "source_package", "source_bootstrap"):
+        exact_mkdir(value[name])
+    exact_file(value["lock_path"],
+               b"boot_id\t11111111-1111-1111-1111-111111111111\n")
+    return value
+
+
+def configure(namespace, value):
+    namespace.update(value)
+    namespace.update({
+        "current_manifest_sha": "a" * 64,
+        "current_self_sha": "b" * 64,
+        "predecessor_commit": "2c690050ae1d69dbd074acfd612faa2b80e29f8a",
+        "predecessor_manifest_sha": "c" * 64,
+        "current_manifest": str(pathlib.Path(value["auth_root"]) /
+                                "package-manifest.v1"),
+        "current_manifest_pending": str(pathlib.Path(value["auth_root"]) /
+                                        "package-manifest.v1.pending"),
+        "current_self": str(pathlib.Path(value["auth_root"]) /
+                            "prepare-stage-root.sh"),
+        "current_self_pending": str(pathlib.Path(value["auth_root"]) /
+                                    "prepare-stage-root.sh.pending"),
+    })
+    namespace["require_host_identity"] = lambda: None
+    namespace["pwd"] = types.SimpleNamespace(
+        getpwnam=lambda unused: types.SimpleNamespace(
+            pw_uid=os.getuid(), pw_gid=os.getgid()))
+    namespace["validate_current_authority"] = (
+        lambda unused: {"integration_commit": "e" * 40}
+    )
+    namespace["fsync_current_authority"] = lambda unused: None
+    namespace["boot_identity"] = (
+        lambda: "11111111-1111-1111-1111-111111111111"
+    )
+    namespace["validate_intake"] = lambda *unused: None
+    namespace["validate_old_package"] = (
+        lambda *unused: {"bundle_sha256": "d" * 64}
+    )
+    namespace["validate_old_bootstrap"] = lambda *unused: None
+    namespace["validate_state_objects"] = (
+        lambda state, pending, *unused:
+        ({"bundle_sha256": "d" * 64}, PAYLOAD)
+    )
+
+
+def open_roots(namespace, value):
+    return (
+        os.open(value["home_qroot"], namespace["DIR_FLAGS"]),
+        os.open(value["run_qroot"], namespace["DIR_FLAGS"]),
+    )
+
+
+def classify(namespace, value):
+    home, run = open_roots(namespace, value)
+    try:
+        return namespace["classify_state"](
+            home, run, os.getuid(), os.getgid())
+    finally:
+        os.close(home)
+        os.close(run)
+
+
+def rename_noreplace(source_parent, source_name, destination_parent,
+                     destination_name):
+    try:
+        os.stat(destination_name, dir_fd=destination_parent,
+                follow_symlinks=False)
+    except FileNotFoundError:
+        pass
+    else:
+        raise FileExistsError(destination_name)
+    os.rename(source_name, destination_name,
+              src_dir_fd=source_parent, dst_dir_fd=destination_parent)
+
+
+def trigger_cut(cut):
+    if cut == "signal":
+        os.kill(os.getpid(), signal.SIGTERM)
+    if cut == "nonzero":
+        raise SystemExit(91)
+    raise AssertionError("unknown cut")
+
+
+def run_child(stager, raw_root, operation, cut, engine_mode):
+    namespace = load_engine(stager)
+    value = paths(raw_root)
+    configure(namespace, value)
+    namespace["mode"] = engine_mode
+
+    cut_destinations = {
+        "intake": os.path.basename(value["q_intake"]),
+        "package": os.path.basename(value["q_package"]),
+        "bootstrap": os.path.basename(value["q_bootstrap"]),
+        "receipt-final": os.path.basename(value["receipt_final"]),
+    }
+
+    def rename_with_cut(source_parent, source_name, destination_parent,
+                        destination_name):
+        if (operation == "receipt-pending" and
+                source_name == os.path.basename(value["receipt_pending"]) and
+                destination_name == os.path.basename(value["receipt_final"])):
+            trigger_cut(cut)
+        rename_noreplace(source_parent, source_name, destination_parent,
+                         destination_name)
+        if operation in cut_destinations and (
+                destination_name == cut_destinations[operation]):
+            trigger_cut(cut)
+
+    namespace["renameat2_noreplace"] = (
+        rename_noreplace if operation == "none" else rename_with_cut
+    )
+    namespace["engine_main"]()
+    if operation != "none":
+        raise AssertionError("engine_main returned before requested cut")
+
+
+def child_result(stager, raw_root, operation, cut):
+    result = subprocess.run(
+        [sys.executable, "-B", "-I", os.path.realpath(__file__),
+         "--child", stager, raw_root, operation, cut,
+         "retire-prestage-2c690050"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+             "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    expected = -signal.SIGTERM if cut == "signal" else 91
+    if result.returncode != expected:
+        raise AssertionError(
+            f"{operation}:{cut} rc={result.returncode} "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+    return result.returncode
+
+
+def engine_result(stager, raw_root, engine_mode="retire-prestage-2c690050"):
+    result = subprocess.run(
+        [sys.executable, "-B", "-I", os.path.realpath(__file__),
+         "--child", stager, raw_root, "none", "none", engine_mode],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env={"PATH": "/usr/bin:/bin", "LC_ALL": "C",
+             "PYTHONDONTWRITEBYTECODE": "1"},
+    )
+    if result.returncode != 0:
+        raise AssertionError(
+            f"engine:{engine_mode} rc={result.returncode} "
+            f"stdout={result.stdout!r} stderr={result.stderr!r}")
+    return result.stdout.decode("utf-8", "strict")
+
+
+def prepare_for_operation(value, operation):
+    if operation in {"package", "bootstrap", "receipt-pending", "receipt-final"}:
+        os.rename(value["user_intake"], value["q_intake"])
+    if operation in {"bootstrap", "receipt-pending", "receipt-final"}:
+        os.rename(value["source_package"], value["q_package"])
+    if operation in {"receipt-pending", "receipt-final"}:
+        os.rename(value["source_bootstrap"], value["q_bootstrap"])
+    if operation == "receipt-final":
+        exact_file(value["receipt_pending"], PAYLOAD)
+
+
+def test_all_failure_cuts(stager):
+    observed = []
+    expected_states = {
+        "intake": ("I", False),
+        "package": ("S1", False),
+        "bootstrap": ("S2", False),
+        "receipt-pending": ("S2P", True),
+        "receipt-final": ("T_CANDIDATE", False),
+    }
+    for operation in expected_states:
+        for cut in ("nonzero", "signal"):
+            with tempfile.TemporaryDirectory(
+                    prefix="retirement-each-cut-stub-") as raw_root:
+                value = initialize_fixture(raw_root)
+                prepare_for_operation(value, operation)
+                result = child_result(stager, value["root"], operation, cut)
+                namespace = load_engine(stager)
+                configure(namespace, value)
+                assert classify(namespace, value) == expected_states[operation]
+                observed.append(f"{operation}:{cut}:{result}")
+    assert len(observed) == 10
+    print("each-rename-receipt-nonzero-signal=" + ",".join(observed))
+
+
+def drive_fault_matrix(stager):
+    transitions = []
+    cuts = []
+    with tempfile.TemporaryDirectory(prefix="retirement-fault-stub-") as raw_root:
+        value = initialize_fixture(raw_root)
+        namespace = load_engine(stager)
+        configure(namespace, value)
+        transitions.append(classify(namespace, value)[0])
+
+        cuts.append(child_result(stager, value["root"], "intake", "nonzero"))
+        assert classify(namespace, value) == ("I", False)
+        transitions.append("I")
+
+        cuts.append(child_result(stager, value["root"], "package", "signal"))
+        assert classify(namespace, value) == ("S1", False)
+        transitions.append("S1")
+
+        cuts.append(child_result(stager, value["root"], "bootstrap", "nonzero"))
+        assert classify(namespace, value) == ("S2", False)
+        transitions.append("S2")
+
+        cuts.append(child_result(stager, value["root"],
+                                 "receipt-pending", "nonzero"))
+        assert classify(namespace, value) == ("S2P", True)
+        transitions.append("S2P")
+
+        cuts.append(child_result(stager, value["root"],
+                                 "receipt-final", "signal"))
+        assert classify(namespace, value) == ("T_CANDIDATE", False)
+        transitions.append("T_CANDIDATE")
+        terminal_output = engine_result(stager, value["root"])
+        assert (
+            "B82_V6_RETIREMENT_COMPLETE state=T "
+            "disposition=verified-existing namespace_writes=0 same_boot=1"
+        ) in terminal_output
+        transitions.append("T")
+        verify_output = engine_result(
+            stager, value["root"], "verify-retirement")
+        assert (
+            "B82_V6_RETIREMENT_VERIFIED state=T namespace_writes=0 "
+            "same_boot=1"
+        ) in verify_output
+
+    assert transitions == ["D", "I", "S1", "S2", "S2P", "T_CANDIDATE", "T"]
+    assert cuts == [91, -signal.SIGTERM, 91, 91, -signal.SIGTERM]
+    print("fault-cut-transitions=" + ",".join(transitions))
+    print("fault-cut-exits=" + ",".join(str(value) for value in cuts))
+    print("terminal-repeat-verify-namespace-writes=0")
+
+
+def test_lock_and_boot_zero_write(stager):
+    with tempfile.TemporaryDirectory(prefix="retirement-lockless-stub-") as raw_root:
+        value = initialize_fixture(raw_root)
+        os.unlink(value["lock_path"])
+        os.rename(value["user_intake"], value["q_intake"])
+        namespace = load_engine(stager)
+        configure(namespace, value)
+        home, run = open_roots(namespace, value)
+        before_home = sorted(os.listdir(value["home_qroot"]))
+        before_run = sorted(os.listdir(value["run_qroot"]))
+        try:
+            try:
+                namespace["acquire_retirement_lock"](
+                    home, run, os.getuid(), os.getgid())
+            except namespace["RetirementStop"]:
+                pass
+            else:
+                raise AssertionError("lockless residual acquired a new lock")
+        finally:
+            os.close(home)
+            os.close(run)
+        assert sorted(os.listdir(value["home_qroot"])) == before_home
+        assert sorted(os.listdir(value["run_qroot"])) == before_run
+        assert not os.path.lexists(value["lock_path"])
+
+    with tempfile.TemporaryDirectory(prefix="retirement-same-boot-stub-") as raw_root:
+        value = initialize_fixture(raw_root)
+        namespace = load_engine(stager)
+        configure(namespace, value)
+        home, run = open_roots(namespace, value)
+        before = pathlib.Path(value["lock_path"]).read_bytes()
+        lock = None
+        try:
+            lock, created = namespace["acquire_retirement_lock"](
+                home, run, os.getuid(), os.getgid())
+            assert not created
+            try:
+                namespace["initialize_or_verify_boot_marker"](
+                    lock, run, "D",
+                    "22222222-2222-2222-2222-222222222222")
+            except namespace["RetirementStop"]:
+                pass
+            else:
+                raise AssertionError("different boot marker was accepted")
+        finally:
+            if lock is not None:
+                os.close(lock)
+            os.close(home)
+            os.close(run)
+        assert pathlib.Path(value["lock_path"]).read_bytes() == before
+    print("lockless-residual-zero-write=PASS same-boot-zero-write=PASS")
+
+
+def test_pending_prefix_policy(stager):
+    with tempfile.TemporaryDirectory(prefix="retirement-prefix-stub-") as raw_root:
+        value = initialize_fixture(raw_root)
+        namespace = load_engine(stager)
+        configure(namespace, value)
+        os.rename(value["user_intake"], value["q_intake"])
+        os.rename(value["source_package"], value["q_package"])
+        os.rename(value["source_bootstrap"], value["q_bootstrap"])
+        exact_file(value["receipt_pending"])
+        home, run = open_roots(namespace, value)
+        try:
+            for candidate in (b"", PAYLOAD[:7], PAYLOAD):
+                overwrite(value["receipt_pending"], candidate)
+                descriptor = namespace["validate_pending_receipt"](run, PAYLOAD)
+                os.close(descriptor)
+            overwrite(value["receipt_pending"], b"not-a-prefix")
+            before = pathlib.Path(value["receipt_pending"]).read_bytes()
+            try:
+                namespace["validate_pending_receipt"](run, PAYLOAD)
+            except namespace["RetirementStop"]:
+                pass
+            else:
+                raise AssertionError("non-prefix pending receipt accepted")
+            assert pathlib.Path(value["receipt_pending"]).read_bytes() == before
+        finally:
+            os.close(home)
+            os.close(run)
+    print("receipt-pending-empty-prefix-exact=PASS nonprefix-zero-write=PASS")
+
+
+def main(arguments):
+    if arguments and arguments[0] == "--child":
+        if len(arguments) != 6:
+            return 64
+        run_child(*arguments[1:])
+        return 0
+    if len(arguments) != 1:
+        print("usage: b82-retirement-engine-fault-stub.py PREPARE_STAGE_ROOT",
+              file=sys.stderr)
+        return 64
+    stager = os.path.realpath(arguments[0])
+    test_all_failure_cuts(stager)
+    drive_fault_matrix(stager)
+    test_lock_and_boot_zero_write(stager)
+    test_pending_prefix_policy(stager)
+    print("retirement-extracted-engine-fault-stub=PASS")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+
+RETIREMENT_ENGINE_HARNESS_PY
+) || fail 'retirement extracted engine harness fixture'
+RETIREMENT_ENGINE_OUTPUT="$(PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B -I \
+  "${RETIREMENT_ENGINE_HARNESS}" "${FIXTURE_REVIEW}/prepare-stage-root.sh")" ||
+  fail 'retirement extracted production engine fault matrix'
+for marker in \
+  'each-rename-receipt-nonzero-signal=' \
+  'fault-cut-transitions=D,I,S1,S2,S2P,T_CANDIDATE,T' \
+  'terminal-repeat-verify-namespace-writes=0' \
+  'lockless-residual-zero-write=PASS same-boot-zero-write=PASS' \
+  'receipt-pending-empty-prefix-exact=PASS nonprefix-zero-write=PASS' \
+  'retirement-extracted-engine-fault-stub=PASS'; do
+  [[ "${RETIREMENT_ENGINE_OUTPUT}" == *"${marker}"* ]] ||
+    fail "retirement engine marker missing: ${marker}: ${RETIREMENT_ENGINE_OUTPUT}"
+done
+printf '%s\n' "${RETIREMENT_ENGINE_OUTPUT}"
 
 SCP_BUILD_FIXTURE="${TEST_ROOT}/generic-scp-build"
 /bin/mkdir -m 0700 -- "${SCP_BUILD_FIXTURE}" || fail 'generic SCP build fixture directory'
@@ -950,6 +2002,40 @@ CONTROLLER_TRANSACTION_SEAM="$(/bin/bash -c '
   fail 'controller high-level transaction seam'
 [[ "${CONTROLLER_TRANSACTION_SEAM}" == $'execute:prepare\nexecute:provision-apply\nexecute:realnic-run\nexecute:realnic-restore' ]] ||
   fail "controller emitted primitive mutation sequence: ${CONTROLLER_TRANSACTION_SEAM}"
+CONTROLLER_RETIREMENT_SEAM="$(/bin/bash -c '
+  source "$1" || exit $?
+  verify_manifest_contract() { return 0; }
+  derive_approved_plan_path() { return 0; }
+  verify_retirement_local_authority() {
+    printf "authority:%s\n" "${MODE}"
+  }
+  run_operation() { printf "operation:%s:%s\n" "$1" "$2"; }
+  shift
+  main "$@"
+' controller-retirement-seam "${CONTROLLER_READER_ONLY}" \
+  retire-prestage-2c690050 \
+  --manifest /fixed/current/package-manifest.v1 \
+  --manifest-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --credential-path "${CREDENTIAL_PATH}" --approved-plan-sha256 none
+/bin/bash -c '
+  source "$1" || exit $?
+  verify_manifest_contract() { return 0; }
+  derive_approved_plan_path() { return 0; }
+  verify_retirement_local_authority() {
+    printf "authority:%s\n" "${MODE}"
+  }
+  run_operation() { printf "operation:%s:%s\n" "$1" "$2"; }
+  shift
+  main "$@"
+' controller-retirement-seam "${CONTROLLER_READER_ONLY}" \
+  verify-retirement \
+  --manifest /fixed/current/package-manifest.v1 \
+  --manifest-sha256 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa \
+  --credential-path "${CREDENTIAL_PATH}" --approved-plan-sha256 none)" ||
+  fail 'controller retirement high-level seam'
+[[ "${CONTROLLER_RETIREMENT_SEAM}" == \
+  $'authority:retire-prestage-2c690050\noperation:execute:retire-prestage-2c690050\nauthority:verify-retirement\noperation:execute:verify-retirement' ]] ||
+  fail "controller retirement emitted anything but one fixed high-level operation: ${CONTROLLER_RETIREMENT_SEAM}"
 printf 'HERMETIC_VERIFY_ONLY controller=pass transport=pass credential_reads=0 spawns=0 controller_transactions=single-call\n'
 
 MANIFEST_AUTHORITY_BACKUP="${TEST_ROOT}/package-manifest.authority-backup.v1"
