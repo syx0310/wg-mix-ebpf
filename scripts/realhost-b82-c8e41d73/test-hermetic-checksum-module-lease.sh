@@ -3,13 +3,17 @@ set -u
 set -o pipefail
 umask 077
 
-REVIEW_ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd -P)" || exit 70
-readonly REVIEW_ROOT
-readonly HELPER="${REVIEW_ROOT}/checksum-module-lease.sh"
-readonly STATIC_TEST="${REVIEW_ROOT}/test_checksum_module_lease_static.py"
-REPOSITORY="$(CDPATH='' cd -- "${REVIEW_ROOT}/../.." && pwd -P)" || exit 70
-readonly REPOSITORY
-readonly MODULE_SOURCE="${REPOSITORY}/kernel/faketcp_checksum/wg_mix_faketcp_checksum.c"
+HELPER="${1:-}"
+STATIC_TEST="${2:-}"
+MODULE_SOURCE="${3:-}"
+readonly HELPER STATIC_TEST MODULE_SOURCE
+
+if (($# != 3)) || [[ "${HELPER}" != /* || "${STATIC_TEST}" != /* ||
+  "${MODULE_SOURCE}" != /* ]]; then
+  printf 'usage: %s ABSOLUTE_MODULE_LEASE_HELPER ABSOLUTE_STATIC_TEST ABSOLUTE_MODULE_SOURCE\n' \
+    "$0" >&2
+  exit 64
+fi
 
 fail() {
   printf 'FAIL: %s\n' "$1" >&2

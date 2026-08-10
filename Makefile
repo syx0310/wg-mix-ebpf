@@ -76,7 +76,10 @@ test-faketcp-verifier-only: test-faketcp-verifier-launcher
 		"$(CURDIR)/scripts/run-faketcp-verifier-only.py"
 
 test-b82-fresh-verifier-gate:
-	scripts/realhost-b82-c8e41d73/test-hermetic-checksum-module-lease.sh
+	scripts/realhost-b82-c8e41d73/test-hermetic-checksum-module-lease.sh \
+		"$(CURDIR)/scripts/realhost-b82-c8e41d73/checksum-module-lease.sh" \
+		"$(CURDIR)/scripts/realhost-b82-c8e41d73/test_checksum_module_lease_static.py" \
+		"$(CURDIR)/kernel/faketcp_checksum/wg_mix_faketcp_checksum.c"
 	scripts/realhost-b82-c8e41d73/test-hermetic-fresh-verifier-gate.sh \
 		"$(CURDIR)/scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh" \
 		"$(CURDIR)/scripts/realhost-b82-c8e41d73/checksum-module-lease.sh" \

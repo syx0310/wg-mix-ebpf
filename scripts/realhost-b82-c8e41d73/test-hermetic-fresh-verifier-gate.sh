@@ -52,28 +52,28 @@ FINAL_LF_NUL_MANIFEST="${FIXTURE}/package-manifest.final-lf-nul.v1"
   in_loader && /^}/ { exit }
   in_loader && $1 == "read_manifest_field" { print $2 }
 ' "${SCRIPT}" >"${MANIFEST_KEYS}" || fail 'extract production manifest keys'
-[[ "$(/usr/bin/wc -l <"${MANIFEST_KEYS}" | /usr/bin/tr -d ' ')" == 103 &&
+[[ "$(/usr/bin/wc -l <"${MANIFEST_KEYS}" | /usr/bin/tr -d ' ')" == 112 &&
   "$(LC_ALL=C /usr/bin/sort -- "${MANIFEST_KEYS}" | /usr/bin/uniq | /usr/bin/wc -l |
-    /usr/bin/tr -d ' ')" == 103 ]] ||
-  fail 'production manifest reader is not exactly 103 unique keys'
+    /usr/bin/tr -d ' ')" == 112 ]] ||
+  fail 'production manifest reader is not exactly 112 unique keys'
 
 while IFS= read -r key; do
   [[ -n "${key}" ]] || fail 'empty manifest key extracted'
   if [[ "${key}" == format ]]; then
-    value='wg-mix-ebpf-b82-v6-package-v4'
+    value='wg-mix-ebpf-b82-v6-package-v5'
   else
     value="fixture-${key}"
   fi
   printf '%s\t%s\n' "${key}" "${value}"
-done <"${MANIFEST_KEYS}" >"${SYNTHETIC_MANIFEST}" || fail 'create package-v4 fixture'
+done <"${MANIFEST_KEYS}" >"${SYNTHETIC_MANIFEST}" || fail 'create package-v5 fixture'
 
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B -I "${STATIC_TEST}" \
   "${SCRIPT}" "${HELPER}" "${SYNTHETIC_MANIFEST}" ||
-  fail 'package-v4 fixture does not match the static 103-key schema'
+  fail 'package-v5 fixture does not match the static 112-key schema'
 if [[ -n "${MANIFEST_FIXTURE}" ]]; then
   PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B -I "${STATIC_TEST}" \
     "${SCRIPT}" "${HELPER}" "${MANIFEST_FIXTURE}" ||
-    fail 'provided package manifest does not match the package-v4 103-key schema'
+    fail 'provided package manifest does not match the package-v5 112-key schema'
 fi
 
 /usr/bin/awk '
@@ -126,7 +126,7 @@ run_manifest_offset_probe() {
     ((rc == 0)) || exit "${rc}"
     [[ "${before}" == 0 && "${after}" == 0 ]] || exit 78
     read_manifest_field format probe_format || exit $?
-    [[ "${probe_format}" == "wg-mix-ebpf-b82-v6-package-v4" ]] || exit 79
+    [[ "${probe_format}" == "wg-mix-ebpf-b82-v6-package-v5" ]] || exit 79
     exec 9<&-
   ' fresh-manifest-offset-probe "${TESTABLE_READER}"
   rc=$?
@@ -149,7 +149,7 @@ run_manifest_reader() {
     load_manifest_once
     rc=$?
     if ((rc == 0)); then
-      [[ "${FORMAT}" == "wg-mix-ebpf-b82-v6-package-v4" ]] || exit 79
+      [[ "${FORMAT}" == "wg-mix-ebpf-b82-v6-package-v5" ]] || exit 79
       printf "post-load-evidence=created\n" >"${FRESH_TEST_POST_LOAD_MARKER}" || exit 74
     fi
     exit "${rc}"
@@ -190,13 +190,13 @@ run_manifest_pread_error() {
 }
 
 SYNTHETIC_SHA="$(fixture_sha256 "${SYNTHETIC_MANIFEST}")" ||
-  fail 'hash valid package-v4 fixture'
+  fail 'hash valid package-v5 fixture'
 run_manifest_offset_probe "${SYNTHETIC_MANIFEST}"
 run_manifest_reader "${SYNTHETIC_MANIFEST}" "${SYNTHETIC_SHA}" 0 \
-  "${FIXTURE}/post-load-valid.evidence" 'valid package-v4 manifest'
+  "${FIXTURE}/post-load-valid.evidence" 'valid package-v5 manifest'
 
 {
-  printf 'format\twg-mix-ebpf-b82-v6-package-v4'
+  printf 'format\twg-mix-ebpf-b82-v6-package-v5'
   printf '\0\n'
   /usr/bin/tail -n +2 -- "${SYNTHETIC_MANIFEST}"
 } >"${NUL_FIELD_MANIFEST}" || fail 'create NUL-in-field fixture'
@@ -219,13 +219,13 @@ run_manifest_pread_error
 printf 'unexpected_tail\tfixture-extra\n' >>"${TAIL_NEWLINE}" ||
   fail 'append newline-tail fixture'
 run_manifest_reader "${TAIL_NEWLINE}" "$(fixture_sha256 "${TAIL_NEWLINE}")" 65 \
-  "${FIXTURE}/post-load-tail-newline.evidence" '104th newline-terminated record'
+  "${FIXTURE}/post-load-tail-newline.evidence" '113th newline-terminated record'
 /bin/cp -- "${SYNTHETIC_MANIFEST}" "${TAIL_NO_NEWLINE}" ||
   fail 'copy unterminated-tail fixture'
 printf 'unexpected_tail\tfixture-extra' >>"${TAIL_NO_NEWLINE}" ||
   fail 'append unterminated-tail fixture'
 run_manifest_reader "${TAIL_NO_NEWLINE}" "$(fixture_sha256 "${TAIL_NO_NEWLINE}")" 65 \
-  "${FIXTURE}/post-load-tail-no-newline.evidence" '104th unterminated record'
+  "${FIXTURE}/post-load-tail-no-newline.evidence" '113th unterminated record'
 /usr/bin/awk '
   NR == 1 { first = $0; next }
   NR == 2 { print; print first; next }
@@ -235,7 +235,7 @@ run_manifest_reader "${REORDERED_MANIFEST}" "$(fixture_sha256 "${REORDERED_MANIF
   "${FIXTURE}/post-load-reordered.evidence" 'reordered manifest keys'
 if [[ -n "${MANIFEST_FIXTURE}" ]]; then
   run_manifest_reader "${MANIFEST_FIXTURE}" "$(fixture_sha256 "${MANIFEST_FIXTURE}")" 0 \
-    "${FIXTURE}/post-load-provided.evidence" 'provided package-v4 manifest'
+    "${FIXTURE}/post-load-provided.evidence" 'provided package-v5 manifest'
 fi
 
 run_plan() {
@@ -330,5 +330,5 @@ if /bin/bash "${SCRIPT}" plan \
   fail 'reordered authority arguments were accepted'
 fi
 
-printf 'fresh verifier hermetic plan and exact package-v4 manifest test passed; retained=%s\n' \
+printf 'fresh verifier hermetic plan and exact package-v5 manifest test passed; retained=%s\n' \
   "${FIXTURE}"

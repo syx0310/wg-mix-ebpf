@@ -107,6 +107,18 @@ def main() -> None:
             "S3.physical-lock-hold",
             "legacy-retirement-reservation-create",
             "legacy-retirement-reservation-drift",
+            '"${MODULE_SOURCE_PATH}" == \'kernel/faketcp_checksum/wg_mix_faketcp_checksum.c\'',
+        ),
+    )
+    staged_content = function_body(stager, "require_staged_content")
+    require_literals(
+        staged_content,
+        "root stager checksum C identity",
+        (
+            '"$(sha256_file "${EXPECTED_SOURCE}/${MODULE_SOURCE_PATH}")" == '
+            '"${MODULE_SOURCE_SHA256}"',
+            'require_staged_identity "${MODULE_SOURCE_PATH}" "${MODULE_SOURCE_BLOB}"',
+            '"${MODULE_SOURCE_SHA256}" 100644 600',
         ),
     )
     create = function_body(stager, "create_legacy_retirement_reservation")

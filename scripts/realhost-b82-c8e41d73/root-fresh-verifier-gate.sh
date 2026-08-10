@@ -285,6 +285,15 @@ load_manifest_once() {
     read_manifest_field checksum_module_lease_sh_path MANIFEST_MODULE_LEASE_HELPER_PATH &&
     read_manifest_field checksum_module_lease_sh_blob MANIFEST_MODULE_LEASE_HELPER_BLOB &&
     read_manifest_field checksum_module_lease_sh_sha256 MANIFEST_MODULE_LEASE_HELPER_SHA256 &&
+    read_manifest_field test_hermetic_checksum_module_lease_sh_path discard &&
+    read_manifest_field test_hermetic_checksum_module_lease_sh_blob discard &&
+    read_manifest_field test_hermetic_checksum_module_lease_sh_sha256 discard &&
+    read_manifest_field test_checksum_module_lease_static_py_path discard &&
+    read_manifest_field test_checksum_module_lease_static_py_blob discard &&
+    read_manifest_field test_checksum_module_lease_static_py_sha256 discard &&
+    read_manifest_field wg_mix_faketcp_checksum_c_path discard &&
+    read_manifest_field wg_mix_faketcp_checksum_c_blob discard &&
+    read_manifest_field wg_mix_faketcp_checksum_c_sha256 discard &&
     read_manifest_field root_fresh_verifier_gate_sh_path MANIFEST_ROOT_FRESH_PATH &&
     read_manifest_field root_fresh_verifier_gate_sh_blob MANIFEST_ROOT_FRESH_BLOB &&
     read_manifest_field root_fresh_verifier_gate_sh_sha256 MANIFEST_ROOT_FRESH_SHA256 &&
@@ -458,7 +467,7 @@ validate_snapshot_contract() {
   [[ "$(sha256_file "${SNAPSHOT_MANIFEST}")" == "${MANIFEST_SHA256}" &&
     "$(sha256_file "${SNAPSHOT_BUNDLE}")" == "${BUNDLE_SHA256}" ]] || return 79
   load_manifest_once || return $?
-  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v4' &&
+  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v5' &&
     "${MANIFEST_RUN_ID}" == "${CONTROLLER_RUN_ID}" &&
     "${MANIFEST_PACKAGE_ID}" == "${PACKAGE_ID}" &&
     "${MANIFEST_COMMIT}" == "${COMMIT}" &&

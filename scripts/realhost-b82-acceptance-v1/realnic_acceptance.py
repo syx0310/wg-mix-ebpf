@@ -107,6 +107,9 @@ PACKAGE_MANIFEST_IDENTITY_KEYS = (
     "test_hermetic_matrix_sh",
     "test_matrix_static_py",
     "checksum_module_lease_sh",
+    "test_hermetic_checksum_module_lease_sh",
+    "test_checksum_module_lease_static_py",
+    "wg_mix_faketcp_checksum_c",
     "root_fresh_verifier_gate_sh",
     "test_hermetic_fresh_verifier_gate_sh",
     "test_fresh_verifier_gate_static_py",
@@ -2449,7 +2452,7 @@ def load_local_capture_manifest(
                 raise HarnessError(f"local package manifest field is not exact: {expected_key}")
             values[expected_key] = fields[1]
         if (
-            values["format"] != "wg-mix-ebpf-b82-v6-package-v4"
+            values["format"] != "wg-mix-ebpf-b82-v6-package-v5"
             or values["run_id"] != "c8e41d73"
             or values["package_id"] != "4f2a9b61"
             or values["integration_commit"] != source_commit

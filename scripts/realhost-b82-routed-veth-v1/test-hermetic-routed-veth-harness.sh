@@ -12,6 +12,8 @@ readonly SEAM="${REVIEW_ROOT}/controller-seam.sh"
 readonly STATIC_TEST="${REVIEW_ROOT}/test_routed_veth_harness_static.py"
 readonly MODULE_LEASE_HELPER="${REVIEW_ROOT}/../realhost-b82-c8e41d73/checksum-module-lease.sh"
 readonly MODULE_LEASE_HERMETIC="${REVIEW_ROOT}/../realhost-b82-c8e41d73/test-hermetic-checksum-module-lease.sh"
+readonly MODULE_LEASE_STATIC="${REVIEW_ROOT}/../realhost-b82-c8e41d73/test_checksum_module_lease_static.py"
+readonly MODULE_SOURCE="${REPOSITORY}/kernel/faketcp_checksum/wg_mix_faketcp_checksum.c"
 readonly SOURCE='/run/wg-mix-ebpf-source-stages/c8e41d73/source'
 readonly STAGE_ROOT='/run/wg-mix-ebpf-source-stages/c8e41d73'
 COMMIT='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
@@ -48,7 +50,8 @@ require_ordered_literals() {
 }
 
 for path in "${RUNNER}" "${SEAM}" "${STATIC_TEST}" \
-  "${MODULE_LEASE_HELPER}" "${MODULE_LEASE_HERMETIC}"; do
+  "${MODULE_LEASE_HELPER}" "${MODULE_LEASE_HERMETIC}" \
+  "${MODULE_LEASE_STATIC}" "${MODULE_SOURCE}"; do
   [[ -f "${path}" && ! -L "${path}" ]] || fail "fixture is not a regular file: ${path}"
 done
 
@@ -56,7 +59,9 @@ done
   "${MODULE_LEASE_HERMETIC}" "$0" || fail 'Bash syntax gate'
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I "${STATIC_TEST}" "${RUNNER}" "${SEAM}" ||
   fail 'static safety and lifecycle model'
-/bin/bash "${MODULE_LEASE_HERMETIC}" || fail 'shared checksum-module lease contract'
+/bin/bash "${MODULE_LEASE_HERMETIC}" "${MODULE_LEASE_HELPER}" \
+  "${MODULE_LEASE_STATIC}" "${MODULE_SOURCE}" ||
+  fail 'shared checksum-module lease contract'
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck --norc --shell=bash -- "${RUNNER}" "${SEAM}" \
     "${MODULE_LEASE_HELPER}" "${MODULE_LEASE_HERMETIC}" "$0" || fail 'ShellCheck gate'
