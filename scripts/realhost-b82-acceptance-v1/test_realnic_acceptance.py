@@ -35,6 +35,81 @@ CHECKER_MODULE = importlib.util.module_from_spec(CHECKER_SPEC)
 sys.modules[CHECKER_SPEC.name] = CHECKER_MODULE
 CHECKER_SPEC.loader.exec_module(CHECKER_MODULE)
 
+EXPECTED_PACKAGE_MANIFEST_BASE_KEYS = (
+    "format",
+    "run_id",
+    "package_id",
+    "integration_ref",
+    "integration_commit",
+    "bundle_name",
+    "bundle_sha256",
+    "history_verification",
+    "history_commit_count",
+    "history_roots_sha256",
+    "history_objects_sha256",
+    "wg_state",
+    "wg_interface",
+    "wg_local_address",
+    "wg_peer_address",
+    "local_repository",
+    "local_package_dir",
+    "remote_package_dir",
+    "remote_source",
+    "target_user",
+    "target_host",
+    "target_hostname",
+    "target_kernel",
+    "target_machine_id",
+    "target_interface",
+    "peer_address",
+    "peer_port",
+    "soak_seconds",
+    "session_seconds",
+    "physical_nic_forward_authority",
+    "physical_interface_lock",
+    "legacy_matrix_mode",
+    "realnic_profile",
+    "realnic_traffic_seconds",
+)
+EXPECTED_PACKAGE_MANIFEST_IDENTITY_KEYS = (
+    "bind_final_package_sh",
+    "controller_sh",
+    "locked_transport_exp",
+    "root_matrix_n_r_sh",
+    "check_realhost_iperf_py",
+    "test_hermetic_matrix_sh",
+    "test_matrix_static_py",
+    "checksum_module_lease_sh",
+    "test_hermetic_checksum_module_lease_sh",
+    "test_checksum_module_lease_static_py",
+    "wg_mix_faketcp_checksum_c",
+    "root_fresh_verifier_gate_sh",
+    "test_hermetic_fresh_verifier_gate_sh",
+    "test_fresh_verifier_gate_static_py",
+    "prepare_stage_root_sh",
+    "realnic_acceptance_py",
+    "test_realnic_acceptance_py",
+    "test_realnic_acceptance_static_py",
+    "provision_ubuntu_test_host_sh",
+    "root_veth_n_r_sh",
+    "test_hermetic_veth_runner_sh",
+    "test_veth_runner_static_py",
+    "controller_seam_sh",
+    "root_routed_veth_n_r_sh",
+    "test_hermetic_routed_veth_harness_sh",
+    "test_routed_veth_harness_static_py",
+)
+EXPECTED_PACKAGE_MANIFEST_KEYS = EXPECTED_PACKAGE_MANIFEST_BASE_KEYS + tuple(
+    f"{identity}_{field}"
+    for identity in EXPECTED_PACKAGE_MANIFEST_IDENTITY_KEYS
+    for field in ("path", "blob", "sha256")
+)
+NEW_CHECKSUM_IDENTITY_KEYS = (
+    "test_hermetic_checksum_module_lease_sh",
+    "test_checksum_module_lease_static_py",
+    "wg_mix_faketcp_checksum_c",
+)
+
 
 @contextlib.contextmanager
 def runtime_contract(prefix):
@@ -2172,14 +2247,14 @@ def manifest_bound_capture_package():
         traffic_oracle_sha256 = MODULE.sha256_bytes(b"manifest-bound-traffic-oracle")
         filler_blob = "1234567890abcdef1234567890abcdef12345678"
         filler_sha256 = "abcdef0123456789" * 4
-        values = {key: "fixture" for key in MODULE.PACKAGE_MANIFEST_KEYS}
-        for identity in MODULE.PACKAGE_MANIFEST_IDENTITY_KEYS:
+        values = {key: "fixture" for key in EXPECTED_PACKAGE_MANIFEST_KEYS}
+        for identity in EXPECTED_PACKAGE_MANIFEST_IDENTITY_KEYS:
             values[f"{identity}_path"] = f"scripts/fixture/{identity}"
             values[f"{identity}_blob"] = filler_blob
             values[f"{identity}_sha256"] = filler_sha256
         values.update(
             {
-                "format": "wg-mix-ebpf-b82-v6-package-v4",
+                "format": "wg-mix-ebpf-b82-v6-package-v5",
                 "run_id": "c8e41d73",
                 "package_id": "4f2a9b61",
                 "integration_ref": "refs/heads/codex/capture-local-fixture",
@@ -2190,6 +2265,17 @@ def manifest_bound_capture_package():
                     "scripts/realhost-b82-c8e41d73/check-realhost-iperf.py"
                 ),
                 "check_realhost_iperf_py_sha256": traffic_oracle_sha256,
+                "test_hermetic_checksum_module_lease_sh_path": (
+                    "scripts/realhost-b82-c8e41d73/"
+                    "test-hermetic-checksum-module-lease.sh"
+                ),
+                "test_checksum_module_lease_static_py_path": (
+                    "scripts/realhost-b82-c8e41d73/"
+                    "test_checksum_module_lease_static.py"
+                ),
+                "wg_mix_faketcp_checksum_c_path": (
+                    "kernel/faketcp_checksum/wg_mix_faketcp_checksum.c"
+                ),
                 "realnic_acceptance_py_path": (
                     "scripts/realhost-b82-acceptance-v1/realnic_acceptance.py"
                 ),
@@ -2198,7 +2284,7 @@ def manifest_bound_capture_package():
             }
         )
         manifest_payload = "".join(
-            f"{key}\t{values[key]}\n" for key in MODULE.PACKAGE_MANIFEST_KEYS
+            f"{key}\t{values[key]}\n" for key in EXPECTED_PACKAGE_MANIFEST_KEYS
         ).encode()
         manifest_path = package_dir / MODULE.LOCAL_PACKAGE_MANIFEST
         manifest_path.write_bytes(manifest_payload)
@@ -2310,6 +2396,52 @@ class CaptureLocalPublisherTests(unittest.TestCase):
             timeout=30,
             check=False,
         )
+
+    def test_package_v5_manifest_schema_is_independent_exact_112_key_oracle(self):
+        self.assertEqual(len(EXPECTED_PACKAGE_MANIFEST_KEYS), 112)
+        self.assertEqual(len(set(EXPECTED_PACKAGE_MANIFEST_KEYS)), 112)
+        self.assertEqual(
+            tuple(MODULE.PACKAGE_MANIFEST_BASE_KEYS),
+            EXPECTED_PACKAGE_MANIFEST_BASE_KEYS,
+        )
+        self.assertEqual(
+            tuple(MODULE.PACKAGE_MANIFEST_IDENTITY_KEYS),
+            EXPECTED_PACKAGE_MANIFEST_IDENTITY_KEYS,
+        )
+        self.assertEqual(
+            tuple(MODULE.PACKAGE_MANIFEST_KEYS),
+            EXPECTED_PACKAGE_MANIFEST_KEYS,
+        )
+
+    @unittest.skipUnless(
+        sys.platform == "darwin" and os.geteuid() != 0,
+        "capture-local is restricted to the non-root Darwin controller",
+    )
+    def test_each_new_checksum_identity_key_is_required_before_publish(self):
+        for identity in NEW_CHECKSUM_IDENTITY_KEYS:
+            with self.subTest(identity=identity), manifest_bound_capture_package() as package:
+                missing_key = f"{identity}_path"
+                records = package.manifest_payload.decode("utf-8").splitlines()
+                self.assertEqual(len(records), 112)
+                mutated_records = [
+                    record for record in records if not record.startswith(f"{missing_key}\t")
+                ]
+                self.assertEqual(len(mutated_records), 111)
+                mutated = ("\n".join(mutated_records) + "\n").encode()
+                package.manifest_path.write_bytes(mutated)
+                package.manifest_path.chmod(0o600)
+                package.manifest_sha256 = MODULE.sha256_bytes(mutated)
+                digest, final_name, pending_name = local_publish_names(package.plan_payload)
+
+                result = self.run_capture(package, package.plan_payload)
+
+                self.assertEqual(result.returncode, 125, result.stderr.decode("utf-8", "replace"))
+                self.assertEqual(result.stdout, b"")
+                self.assertNotIn(b"Traceback", result.stderr)
+                self.assertIn(b"REALNIC_ACCEPTANCE_STOP reason=", result.stderr)
+                self.assertNotIn(digest.encode(), result.stdout)
+                self.assertFalse((package.package_dir / final_name).exists())
+                self.assertFalse((package.package_dir / pending_name).exists())
 
     @unittest.skipUnless(
         sys.platform == "darwin" and os.geteuid() != 0,

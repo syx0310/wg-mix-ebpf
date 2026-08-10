@@ -70,6 +70,9 @@ IDENTITY_KEYS = (
     "test_hermetic_matrix_sh",
     "test_matrix_static_py",
     "checksum_module_lease_sh",
+    "test_hermetic_checksum_module_lease_sh",
+    "test_checksum_module_lease_static_py",
+    "wg_mix_faketcp_checksum_c",
     "root_fresh_verifier_gate_sh",
     "test_hermetic_fresh_verifier_gate_sh",
     "test_fresh_verifier_gate_static_py",
@@ -91,8 +94,8 @@ EXPECTED_MANIFEST_KEYS = MANIFEST_PREFIX + tuple(
     for key in IDENTITY_KEYS
     for suffix in ("path", "blob", "sha256")
 )
-if len(EXPECTED_MANIFEST_KEYS) != 103 or len(set(EXPECTED_MANIFEST_KEYS)) != 103:
-    fail("test's exact manifest schema is not 103 unique keys")
+if len(EXPECTED_MANIFEST_KEYS) != 112 or len(set(EXPECTED_MANIFEST_KEYS)) != 112:
+    fail("test's exact manifest schema is not 112 unique keys")
 
 nul_helper_match = re.search(
     r"(?ms)^(?P<function>require_manifest_fd_without_nul\(\) \{\n.*?^\})\n\nload_manifest_once\(\) \{",
@@ -137,7 +140,7 @@ loaded_keys = tuple(
     re.findall(r"(?m)^\s*read_manifest_field\s+([a-z0-9_]+)\s+", load_body)
 )
 if loaded_keys != EXPECTED_MANIFEST_KEYS:
-    fail("load_manifest_once does not consume the exact package-v4 103-key sequence")
+    fail("load_manifest_once does not consume the exact package-v5 112-key sequence")
 if len(set(loaded_keys)) != len(loaded_keys):
     fail("load_manifest_once contains duplicate manifest keys")
 manifest_open = 'exec {MANIFEST_FD}<"${SNAPSHOT_MANIFEST}" || return 66'
@@ -172,7 +175,7 @@ if load_body.count('IFS= read -r -u "${MANIFEST_FD}" unexpected') != 1 or not re
 validation_start = source.find("validate_snapshot_contract() {")
 validation_end = source.find("\n}\n", validation_start)
 validation_body = source[validation_start:validation_end]
-format_check = "[[ \"${FORMAT}\" == 'wg-mix-ebpf-b82-v6-package-v4' &&"
+format_check = "[[ \"${FORMAT}\" == 'wg-mix-ebpf-b82-v6-package-v5' &&"
 if (
     validation_start < 0
     or "load_manifest_once || return $?" not in validation_body
@@ -180,7 +183,7 @@ if (
     or validation_body.find("load_manifest_once || return $?")
     >= validation_body.find(format_check)
 ):
-    fail("package-v4 validation is not immediately downstream of the one-pass reader")
+    fail("package-v5 validation is not immediately downstream of the one-pass reader")
 
 if len(sys.argv) == 4:
     manifest_path = pathlib.Path(sys.argv[3])
@@ -199,19 +202,19 @@ if len(sys.argv) == 4:
         fail(f"manifest fixture is not UTF-8: {error}")
     records = manifest_text.splitlines()
     fields = [record.split("\t") for record in records]
-    if len(records) != 103 or any(
+    if len(records) != 112 or any(
         len(field) != 2 or not field[0] or not field[1] for field in fields
     ):
-        fail("manifest fixture is not exactly 103 nonempty key/value records")
+        fail("manifest fixture is not exactly 112 nonempty key/value records")
     fixture_keys = tuple(field[0] for field in fields)
-    if fixture_keys != EXPECTED_MANIFEST_KEYS or len(set(fixture_keys)) != 103:
+    if fixture_keys != EXPECTED_MANIFEST_KEYS or len(set(fixture_keys)) != 112:
         fail("manifest fixture does not use the exact unique production key sequence")
-    if fields[0][1] != "wg-mix-ebpf-b82-v6-package-v4":
-        fail("manifest fixture is not package-v4")
+    if fields[0][1] != "wg-mix-ebpf-b82-v6-package-v5":
+        fail("manifest fixture is not package-v5")
 
 required = (
     "case \"${MODE}\" in plan | run | restore)",
-    "wg-mix-ebpf-b82-v6-package-v4",
+    "wg-mix-ebpf-b82-v6-package-v5",
     "read_manifest_field physical_nic_forward_authority discard",
     "read_manifest_field physical_interface_lock discard",
     "read_manifest_field legacy_matrix_mode discard",

@@ -292,6 +292,7 @@ FIXTURE_REPOSITORY="${TEST_ROOT}/repository"
 FIXTURE_REVIEW="${FIXTURE_REPOSITORY}/scripts/realhost-b82-c8e41d73"
 FIXTURE_REALNIC="${FIXTURE_REPOSITORY}/scripts/realhost-b82-acceptance-v1"
 FIXTURE_ROUTED="${FIXTURE_REPOSITORY}/scripts/realhost-b82-routed-veth-v1"
+FIXTURE_CHECKSUM_KERNEL="${FIXTURE_REPOSITORY}/kernel/faketcp_checksum"
 /bin/mkdir -m 0700 -- "${FIXTURE_REPOSITORY}" || fail 'fixture repository creation'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" init || fail 'fixture Git init'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" config user.name 'Hermetic Controller Test' || fail 'fixture Git name'
@@ -300,7 +301,8 @@ printf 'history-root=%s\n' "${TEST_ROOT##*/}" >"${FIXTURE_REPOSITORY}/history-ro
   fail 'fixture history root'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" add -- history-root.v1 || fail 'fixture history root add'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" commit -m 'Hermetic history root' || fail 'fixture history root commit'
-/bin/mkdir -p -- "${FIXTURE_REVIEW}" "${FIXTURE_REALNIC}" "${FIXTURE_ROUTED}" ||
+/bin/mkdir -p -- "${FIXTURE_REVIEW}" "${FIXTURE_REALNIC}" "${FIXTURE_ROUTED}" \
+  "${FIXTURE_CHECKSUM_KERNEL}" ||
   fail 'fixture review directory creation'
 for name in \
   bind-final-package.sh controller.sh locked-transport.exp prepare-stage-root.sh \
@@ -312,6 +314,11 @@ for name in \
   test_checksum_module_lease_static.py test_provision_policy.tcl; do
   /bin/cp -- "${REVIEW_ROOT}/${name}" "${FIXTURE_REVIEW}/${name}" || fail "fixture copy ${name}"
 done
+/bin/cp -- "${REPOSITORY}/kernel/faketcp_checksum/wg_mix_faketcp_checksum.c" \
+  "${FIXTURE_CHECKSUM_KERNEL}/wg_mix_faketcp_checksum.c" ||
+  fail 'fixture copy checksum module source'
+/bin/chmod 0600 "${FIXTURE_CHECKSUM_KERNEL}/wg_mix_faketcp_checksum.c" ||
+  fail 'fixture checksum module source mode'
 for name in controller-seam.sh root-routed-veth-n-r.sh \
   test-hermetic-routed-veth-harness.sh test_routed_veth_harness_static.py; do
   /bin/cp -- "${REPOSITORY}/scripts/realhost-b82-routed-veth-v1/${name}" \
@@ -326,7 +333,8 @@ done
 /bin/cp -- "${PROVISIONER}" "${FIXTURE_REPOSITORY}/scripts/provision-ubuntu-test-host.sh" ||
   fail 'fixture copy provisioner'
 printf 'fixture=%s\n' "${TEST_ROOT##*/}" >"${FIXTURE_REPOSITORY}/fixture-token.v1" || fail 'fixture token'
-/usr/bin/git -C "${FIXTURE_REPOSITORY}" add -- scripts fixture-token.v1 || fail 'fixture Git add'
+/usr/bin/git -C "${FIXTURE_REPOSITORY}" add -- scripts kernel fixture-token.v1 ||
+  fail 'fixture Git add'
 /usr/bin/git -C "${FIXTURE_REPOSITORY}" commit -m 'Hermetic binding fixture' || fail 'fixture Git commit'
 FIXTURE_COMMIT="$(/usr/bin/git -C "${FIXTURE_REPOSITORY}" rev-parse HEAD)" || fail 'fixture commit'
 FIXTURE_BRANCH="$(/usr/bin/git -C "${FIXTURE_REPOSITORY}" symbolic-ref --short HEAD)" || fail 'fixture branch'
@@ -356,6 +364,39 @@ BIND_RESULT="$(/bin/bash "${FIXTURE_REVIEW}/bind-final-package.sh" bind "${BIND_
 [[ "${BIND_RESULT}" == *'B82_V6_BIND_COMPLETE'* ]] || fail 'binding completion marker'
 BOUND_MANIFEST="${BOUND_OUTPUT}/package-manifest.v1"
 BOUND_MANIFEST_SHA="$(sha256_file "${BOUND_MANIFEST}")" || fail 'manifest digest'
+BOUND_MATRIX_OUTPUT="$(/bin/bash "${BOUND_OUTPUT}/test-hermetic-matrix.sh")" ||
+  fail 'bound flat matrix dependency closure'
+[[ "${BOUND_MATRIX_OUTPUT}" == \
+  *'hermetic shared checksum-module exact scopes, ABI and failure-cut classifier: PASS'* &&
+  "${BOUND_MATRIX_OUTPUT}" == *'hermetic retired matrix and root-stager reservation cuts: PASS'* ]] ||
+  fail 'bound flat matrix dependency closure markers'
+BOUND_CLOSURE_MISSING_CUTS=0
+for name in test-hermetic-checksum-module-lease.sh \
+  test_checksum_module_lease_static.py wg_mix_faketcp_checksum.c; do
+  bound_file="${BOUND_OUTPUT}/${name}"
+  bound_backup="${TEST_ROOT}/bound-closure-${name}.backup"
+  /bin/mv -- "${bound_file}" "${bound_backup}" ||
+    fail "${name}: create bound closure missing fixture"
+  bound_missing_output="$(/bin/bash "${BOUND_OUTPUT}/test-hermetic-matrix.sh" 2>&1)"
+  bound_missing_rc=$?
+  if [[ "${bound_missing_rc}" -eq 0 ||
+    "${bound_missing_output}" != *"review input is not a regular file: ${bound_file}"* ]]; then
+    /bin/mv -- "${bound_backup}" "${bound_file}" ||
+      fail "${name}: restore after unexpected bound closure result"
+    fail "${name}: bound flat closure missing artifact did not fail closed: rc=${bound_missing_rc} output=${bound_missing_output}"
+  fi
+  /bin/mv -- "${bound_backup}" "${bound_file}" ||
+    fail "${name}: restore bound closure artifact"
+  key="${name//-/_}"
+  key="${key//./_}"
+  [[ -f "${bound_file}" && ! -L "${bound_file}" &&
+    "$(sha256_file "${bound_file}")" == "$(manifest_value "${key}_sha256" "${BOUND_MANIFEST}")" ]] ||
+    fail "${name}: restored bound closure identity drifted"
+  ((BOUND_CLOSURE_MISSING_CUTS += 1))
+done
+[[ "${BOUND_CLOSURE_MISSING_CUTS}" -eq 3 ]] ||
+  fail 'bound flat closure missing-cut cardinality'
+printf 'HERMETIC_BOUND_FLAT_CLOSURE package=v5 current_files=20 checksum_dependencies=3 missing_cuts=3 result=PASS\n'
 CONTROLLER_READER_ONLY="${TEST_ROOT}/controller.manifest-reader.sh"
 STAGER_READER_ONLY="${TEST_ROOT}/stager.manifest-reader.sh"
 for source_only_spec in \
@@ -390,7 +431,7 @@ import sys
 
 source, field_target, tail_target = map(pathlib.Path, sys.argv[1:])
 payload = source.read_bytes()
-needle = b"format\twg-mix-ebpf-b82-v6-package-v4\n"
+needle = b"format\twg-mix-ebpf-b82-v6-package-v5\n"
 if payload.count(needle) != 1:
     raise SystemExit(65)
 field_target.write_bytes(payload.replace(needle, needle.replace(b"wg-mix", b"wg\0mix"), 1))
@@ -425,7 +466,7 @@ for reader_spec in \
     exec 8<"$2" || exit $?
     require_manifest_fd_without_nul 8 || exit $?
     IFS=$'"'"'\t'"'"' read -r key value <&8 || exit $?
-    [[ "${key}" == format && "${value}" == wg-mix-ebpf-b82-v6-package-v4 ]]
+    [[ "${key}" == format && "${value}" == wg-mix-ebpf-b82-v6-package-v5 ]]
   ' manifest-pread-offset-zero "${reader_script}" "${BOUND_MANIFEST}" ||
     fail "${reader_name} NUL precheck advanced the manifest FD"
   # The child shell expands these positional parameters, not this harness.
@@ -441,7 +482,7 @@ done
   "${FIXTURE_REVIEW}/root-fresh-verifier-gate.sh" \
   "${FIXTURE_REVIEW}/checksum-module-lease.sh" \
   "${FIXTURE_REVIEW}/test_fresh_verifier_gate_static.py" "${BOUND_MANIFEST}" ||
-  fail 'fresh verifier exact package-v4 reader target'
+  fail 'fresh verifier exact package-v5 reader target'
 for manifest_spec in \
   "newline-tail:${MANIFEST_TAIL_NEWLINE}" \
   "unterminated-tail:${MANIFEST_TAIL_NO_NEWLINE}" \
@@ -517,7 +558,9 @@ proc expected_prepare_sequence {} {
         source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh
         controller.sh prepare-stage-root.sh provision-ubuntu-test-host.sh
         root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh
-        test_matrix_static.py checksum-module-lease.sh root-fresh-verifier-gate.sh
+        test_matrix_static.py checksum-module-lease.sh
+        test-hermetic-checksum-module-lease.sh test_checksum_module_lease_static.py
+        wg_mix_faketcp_checksum.c root-fresh-verifier-gate.sh
         test-hermetic-fresh-verifier-gate.sh test_fresh_verifier_gate_static.py
         realnic_acceptance.py test_realnic_acceptance.py
         test_realnic_acceptance_static.py
@@ -1726,7 +1769,9 @@ readonly -a RAW_MUTATION_PACKAGE_NAMES=(
   source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh
   controller.sh prepare-stage-root.sh provision-ubuntu-test-host.sh
   root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh
-  test_matrix_static.py checksum-module-lease.sh root-fresh-verifier-gate.sh
+  test_matrix_static.py checksum-module-lease.sh
+  test-hermetic-checksum-module-lease.sh test_checksum_module_lease_static.py
+  wg_mix_faketcp_checksum.c root-fresh-verifier-gate.sh
   test-hermetic-fresh-verifier-gate.sh test_fresh_verifier_gate_static.py
   realnic_acceptance.py test_realnic_acceptance.py test_realnic_acceptance_static.py
 )
@@ -1760,7 +1805,7 @@ expect_precredential_fence raw-scp-realnic-approved-plan \
   abababababababababababababababababababababababababababababababab \
   65 action-operation
 ((RAW_DIRECT_COUNT += 1))
-[[ "${RAW_DIRECT_COUNT}" -eq 28 ]] || fail 'raw mutation direct-call cardinality'
+[[ "${RAW_DIRECT_COUNT}" -eq 31 ]] || fail 'raw mutation direct-call cardinality'
 
 RETIRED_OPERATION_REJECTIONS=0
 for operation in "${RETIRED_PUBLIC_AND_PRIVATE_OPERATIONS[@]}"; do
@@ -1789,7 +1834,7 @@ printf 'HERMETIC_RETIRED_OPERATION_SURFACE plan_execute_rejections=%s credential
 PREPARE_SEQUENCE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   "${FIXTURE_REVIEW}/locked-transport.exp" prepare-sequence)" ||
   fail 'fixed prepare transaction sequence'
-[[ "${PREPARE_SEQUENCE_OUTPUT}" == *'HARNESS_PREPARE_SEQUENCE steps=102 state=AWAIT_APPLY result=PASS'* ]] ||
+[[ "${PREPARE_SEQUENCE_OUTPUT}" == *'HARNESS_PREPARE_SEQUENCE steps=111 state=AWAIT_APPLY result=PASS'* ]] ||
   fail "fixed prepare transaction marker: ${PREPARE_SEQUENCE_OUTPUT}"
 PREWRITE_CUTS_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   "${FIXTURE_REVIEW}/locked-transport.exp" prewrite-cuts 2>&1)" ||
@@ -1845,7 +1890,7 @@ SCP_BUILD_SHA="$(sha256_file "${SCP_BUILD_FILE}")" || fail 'generic SCP oversize
 /usr/bin/expect "${TRANSPORT_HARNESS}" "${FIXTURE_REVIEW}/locked-transport.exp" \
   scp-build "${SCP_BUILD_FIXTURE}" "${SCP_BUILD_SHA}" reject ||
   fail 'generic SCP oversize artifact was accepted'
-printf 'HERMETIC_TRANSPORT_TRANSACTION raw_direct=28 prepare_steps=102 prewrite_cuts=36 mutation_trace=0 mkdir_failure_scp=0 child_nonzero=stop child_signal=stop generic_scp_bounds=pass\n'
+printf 'HERMETIC_TRANSPORT_TRANSACTION raw_direct=31 prepare_steps=111 prewrite_cuts=36 mutation_trace=0 mkdir_failure_scp=0 child_nonzero=stop child_signal=stop generic_scp_bounds=pass\n'
 
 [[ -d "${BOUND_OUTPUT}/history-verification.git" && ! -L "${BOUND_OUTPUT}/history-verification.git" &&
   -f "${BOUND_OUTPUT}/history-objects.v1" && -f "${BOUND_OUTPUT}/history-roots.v1" ]] ||
@@ -1863,6 +1908,41 @@ printf 'HERMETIC_TRANSPORT_TRANSACTION raw_direct=28 prepare_steps=102 prewrite_
 [[ "$(sha256_file "${BOUND_OUTPUT}/provision-ubuntu-test-host.sh")" == \
   "$(manifest_value provision_ubuntu_test_host_sh_sha256 "${BOUND_MANIFEST}")" ]] ||
   fail 'provisioner package digest binding'
+[[ "$(/usr/bin/wc -l <"${BOUND_MANIFEST}" | /usr/bin/tr -d ' ')" == 112 ]] ||
+  fail 'package-v5 manifest does not contain exactly 112 records'
+FIXTURE_C_SOURCE_RELATIVE='kernel/faketcp_checksum/wg_mix_faketcp_checksum.c'
+FIXTURE_C_SOURCE_BLOB="$(/usr/bin/git -C "${FIXTURE_REPOSITORY}" rev-parse \
+  "${FIXTURE_COMMIT}:${FIXTURE_C_SOURCE_RELATIVE}")" ||
+  fail 'checksum C source blob lookup'
+FIXTURE_C_TREE_ENTRY="$(/usr/bin/git -C "${FIXTURE_REPOSITORY}" ls-tree \
+  "${FIXTURE_COMMIT}" -- "${FIXTURE_C_SOURCE_RELATIVE}")" ||
+  fail 'checksum C source tree mode lookup'
+[[ "$(manifest_value wg_mix_faketcp_checksum_c_path "${BOUND_MANIFEST}")" == \
+    "${FIXTURE_C_SOURCE_RELATIVE}" &&
+  "$(manifest_value wg_mix_faketcp_checksum_c_blob "${BOUND_MANIFEST}")" == \
+    "${FIXTURE_C_SOURCE_BLOB}" &&
+  "$(manifest_value wg_mix_faketcp_checksum_c_sha256 "${BOUND_MANIFEST}")" == \
+    "$(sha256_file "${FIXTURE_REPOSITORY}/${FIXTURE_C_SOURCE_RELATIVE}")" &&
+  "$(sha256_file "${BOUND_OUTPUT}/wg_mix_faketcp_checksum.c")" == \
+    "$(manifest_value wg_mix_faketcp_checksum_c_sha256 "${BOUND_MANIFEST}")" &&
+  "${FIXTURE_C_TREE_ENTRY}" == \
+    "100644 blob ${FIXTURE_C_SOURCE_BLOB}"$'\t'"${FIXTURE_C_SOURCE_RELATIVE}" ]] ||
+  fail 'checksum C source path/blob/SHA/tree-mode binding'
+/usr/bin/python3 -B -I -c '
+import os
+import stat
+import sys
+
+value = os.lstat(sys.argv[1])
+if (
+    not stat.S_ISREG(value.st_mode)
+    or stat.S_ISLNK(value.st_mode)
+    or stat.S_IMODE(value.st_mode) != 0o600
+    or value.st_nlink != 1
+):
+    raise SystemExit(65)
+' "${BOUND_OUTPUT}/wg_mix_faketcp_checksum.c" ||
+  fail 'checksum C flat artifact mode/nlink binding'
 readonly -a REALNIC_MANIFEST_KEYS=(
   realnic_acceptance_py
   test_realnic_acceptance_py
@@ -1921,7 +2001,7 @@ for index in 0 1 2 3 4 5 6; do
     ! -e "${BOUND_OUTPUT}/${package_name}" && ! -L "${BOUND_OUTPUT}/${package_name}" ]] ||
     fail "staged-only manifest triplet or flat-package exclusion drifted: ${source_file}"
 done
-[[ "$(manifest_value format "${BOUND_MANIFEST}")" == 'wg-mix-ebpf-b82-v6-package-v4' &&
+[[ "$(manifest_value format "${BOUND_MANIFEST}")" == 'wg-mix-ebpf-b82-v6-package-v5' &&
   "$(manifest_value physical_nic_forward_authority "${BOUND_MANIFEST}")" == \
     'realnic-acceptance-v1' &&
   "$(manifest_value physical_interface_lock "${BOUND_MANIFEST}")" == \
@@ -2032,7 +2112,7 @@ for name in "${RAW_MUTATION_PACKAGE_NAMES[@]}"; do
   ((PACKAGE_TAMPER_CUTS += 1))
   /bin/chmod 0600 "${FLAT_PACKAGE_FILE}" || fail "${name}: flat package mode restore"
 done
-[[ "${PACKAGE_TAMPER_CUTS}" -eq 34 ]] || fail 'flat package tamper cut cardinality'
+[[ "${PACKAGE_TAMPER_CUTS}" -eq 40 ]] || fail 'flat package tamper cut cardinality'
 [[ "$(sha256_file "${BOUND_MANIFEST}")" == "${BOUND_MANIFEST_SHA}" ]] ||
   fail 'flat package matrix did not restore the manifest'
 
@@ -2068,7 +2148,7 @@ expect_precredential_fence history-evidence "${BOUND_MANIFEST}" \
 [[ "$(sha256_file "${HISTORY_AUTHORITY_FILE}")" == \
   "$(manifest_value history_objects_sha256 "${BOUND_MANIFEST}")" ]] ||
   fail 'history authority restore digest'
-printf 'HERMETIC_LOCAL_AUTHORITY package_names=17 package_tamper_cuts=34 forged_triplet=blocked flat_sha=blocked flat_mode=blocked flat_nlink=blocked history=blocked credential_reads=0 spawns=0\n'
+printf 'HERMETIC_LOCAL_AUTHORITY package_names=20 package_tamper_cuts=40 forged_triplet=blocked flat_sha=blocked flat_mode=blocked flat_nlink=blocked history=blocked credential_reads=0 spawns=0\n'
 
 CONTROLLER_ARGS=(
   --manifest "${BOUND_MANIFEST}"

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import pathlib
 import re
 import sys
@@ -71,6 +72,25 @@ def python_function(payload: str, name: str) -> str:
     return payload[start:end]
 
 
+def python_string_tuple(payload: str, name: str) -> tuple[str, ...]:
+    tree = ast.parse(payload)
+    matches = [
+        node.value
+        for node in tree.body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == name for target in node.targets)
+    ]
+    if len(matches) != 1:
+        fail(f"cannot isolate Python tuple {name}")
+    try:
+        value = ast.literal_eval(matches[0])
+    except (TypeError, ValueError) as exc:
+        fail(f"Python tuple {name} is not literal: {exc}")
+    if not isinstance(value, tuple) or not all(isinstance(item, str) for item in value):
+        fail(f"Python tuple {name} is not an exact string tuple")
+    return value
+
+
 def tcl_return_words(payload: str, name: str) -> tuple[str, ...]:
     match = re.search(
         rf"(?ms)^proc {re.escape(name)} \{{[^\n]*\}} \{{\s*return \{{(.*?)\}}\s*\}}\n",
@@ -115,6 +135,13 @@ def main() -> None:
     provisioner_path, provisioner = read_regular(sys.argv[6])
     fresh_path, fresh = read_regular(
         str(controller_path.with_name("root-fresh-verifier-gate.sh"))
+    )
+    realnic_path, realnic = read_regular(
+        str(
+            controller_path.parent.parent
+            / "realhost-b82-acceptance-v1"
+            / "realnic_acceptance.py"
+        )
     )
     hermetic_path, hermetic = read_regular(
         str(controller_path.with_name("test-hermetic-controller.sh"))
@@ -265,6 +292,9 @@ def main() -> None:
         "test-hermetic-matrix.sh",
         "test_matrix_static.py",
         "checksum-module-lease.sh",
+        "test-hermetic-checksum-module-lease.sh",
+        "test_checksum_module_lease_static.py",
+        "wg_mix_faketcp_checksum.c",
         "root-fresh-verifier-gate.sh",
         "test-hermetic-fresh-verifier-gate.sh",
         "test_fresh_verifier_gate_static.py",
@@ -296,16 +326,16 @@ def main() -> None:
         for key in identity_keys
         for suffix in ("path", "blob", "sha256")
     )
-    if len(expected_manifest_keys) != 103 or len(set(expected_manifest_keys)) != 103:
-        fail("test fixture no longer defines one unique package-v4/103 schema")
+    if len(expected_manifest_keys) != 112 or len(set(expected_manifest_keys)) != 112:
+        fail("test fixture no longer defines one unique package-v5/112 schema")
 
     package_array = bash_array(binder, "PACKAGE_PATHS")
     staged_array = bash_array(binder, "STAGED_IDENTITY_PATHS")
     identity_array = bash_array(binder, "IDENTITY_PATHS")
     if array_path_basenames(package_array) != package_identity_names:
-        fail("binder package identities do not match the exact package-v4 schema")
+        fail("binder package identities do not match the exact package-v5 schema")
     if array_path_basenames(staged_array) != staged_identity_names:
-        fail("binder staged identities do not match the exact package-v4 schema")
+        fail("binder staged identities do not match the exact package-v5 schema")
     expected_identity_lines = (
         '"${REPOSITORY_PATH_FROM_ROOT}/bind-final-package.sh"',
         '"${REPOSITORY_PATH_FROM_ROOT}/controller.sh"',
@@ -331,7 +361,7 @@ def main() -> None:
         re.findall(r"(?m)^\s*manifest_line ([a-z0-9_]+) ", bind_body)
     )
     if binder_prefix != manifest_prefix:
-        fail("binder package-v4 manifest prefix changed order or cardinality")
+        fail("binder package-v5 manifest prefix changed order or cardinality")
     ordered(
         bind_body,
         (
@@ -363,48 +393,61 @@ def main() -> None:
         transport_load,
     )
     if not expected_keys_match:
-        fail("cannot isolate transport package-v4 expected_keys")
+        fail("cannot isolate transport package-v5 expected_keys")
     transport_manifest_keys = tuple(expected_keys_match.group("body").split())
+    realnic_manifest_keys = python_string_tuple(
+        realnic, "PACKAGE_MANIFEST_BASE_KEYS"
+    ) + tuple(
+        f"{key}_{suffix}"
+        for key in python_string_tuple(realnic, "PACKAGE_MANIFEST_IDENTITY_KEYS")
+        for suffix in ("path", "blob", "sha256")
+    )
     consumer_keys = {
         "binder": binder_manifest_keys,
         "controller": manifest_reader_keys(controller, "load_manifest"),
         "root-stager": manifest_reader_keys(stager, "load_manifest"),
         "root-fresh": manifest_reader_keys(fresh, "load_manifest_once"),
         "transport": transport_manifest_keys,
+        "realnic-capture": realnic_manifest_keys,
     }
     for name, keys in consumer_keys.items():
-        if keys != expected_manifest_keys or len(keys) != 103 or len(set(keys)) != 103:
-            fail(f"{name} does not consume the exact unique package-v4/103 key sequence")
+        if keys != expected_manifest_keys or len(keys) != 112 or len(set(keys)) != 112:
+            fail(f"{name} does not consume the exact unique package-v5/112 key sequence")
     version_contracts = (
         (
             "binder",
             bind_body,
-            "manifest_line format wg-mix-ebpf-b82-v6-package-v4",
+            "manifest_line format wg-mix-ebpf-b82-v6-package-v5",
         ),
         (
             "controller",
             bash_function(controller, "verify_manifest_contract"),
-            '"${FORMAT}" == \'wg-mix-ebpf-b82-v6-package-v4\'',
+            '"${FORMAT}" == \'wg-mix-ebpf-b82-v6-package-v5\'',
         ),
         (
             "root-stager",
             bash_function(stager, "validate_manifest"),
-            '"${FORMAT}" == \'wg-mix-ebpf-b82-v6-package-v4\'',
+            '"${FORMAT}" == \'wg-mix-ebpf-b82-v6-package-v5\'',
         ),
         (
             "root-fresh",
             bash_function(fresh, "validate_snapshot_contract"),
-            '"${FORMAT}" == \'wg-mix-ebpf-b82-v6-package-v4\'',
+            '"${FORMAT}" == \'wg-mix-ebpf-b82-v6-package-v5\'',
         ),
         (
             "transport",
             tcl_proc(transport, "validate_manifest_values"),
-            '[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v4"',
+            '[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v5"',
+        ),
+        (
+            "realnic-capture",
+            python_function(realnic, "load_local_capture_manifest"),
+            'values["format"] != "wg-mix-ebpf-b82-v6-package-v5"',
         ),
     )
     for name, body, version_literal in version_contracts:
         if body.count(version_literal) != 1:
-            fail(f"{name} does not bind exactly one package-v4 format value")
+            fail(f"{name} does not bind exactly one package-v5 format value")
 
     bash_eof_contracts = (
         (
@@ -426,7 +469,7 @@ def main() -> None:
     for name, body, eof_guard in bash_eof_contracts:
         if body.count("local unexpected=''") != 1 or body.count(eof_guard) != 1:
             fail(
-                f"{name} EOF guard does not reject a 104th line both with and without newline"
+                f"{name} EOF guard does not reject a 113th line both with and without newline"
             )
     nul_helpers = tuple(
         bash_function(payload, "require_manifest_fd_without_nul")
@@ -488,7 +531,7 @@ def main() -> None:
         "manifest_line history_commit_count",
         "manifest_line history_roots_sha256",
         "manifest_line history_objects_sha256",
-        "wg-mix-ebpf-b82-v6-package-v4",
+        "wg-mix-ebpf-b82-v6-package-v5",
         "manifest_line wg_state",
         "absent)",
         '"${WG_INTERFACE}" == \'absent\'',
@@ -497,6 +540,9 @@ def main() -> None:
         "locked-transport.exp",
         "controller.sh",
         "checksum-module-lease.sh",
+        "test-hermetic-checksum-module-lease.sh",
+        "test_checksum_module_lease_static.py",
+        "kernel/faketcp_checksum/wg_mix_faketcp_checksum.c",
         "root-fresh-verifier-gate.sh",
         "test-hermetic-fresh-verifier-gate.sh",
         "test_fresh_verifier_gate_static.py",
@@ -1046,6 +1092,96 @@ def main() -> None:
         if mutable_argv in lineage_builder:
             fail(f"private lineage builder contains mutation argv {mutable_argv!r}")
 
+    expected_current_package_names = (
+        "source-4f2a9b61.bundle",
+        "package-manifest.v1",
+        "bind-final-package.sh",
+        "controller.sh",
+        "prepare-stage-root.sh",
+        "provision-ubuntu-test-host.sh",
+        "root-matrix-n-r.sh",
+        "check-realhost-iperf.py",
+        "test-hermetic-matrix.sh",
+        "test_matrix_static.py",
+        "checksum-module-lease.sh",
+        "test-hermetic-checksum-module-lease.sh",
+        "test_checksum_module_lease_static.py",
+        "wg_mix_faketcp_checksum.c",
+        "root-fresh-verifier-gate.sh",
+        "test-hermetic-fresh-verifier-gate.sh",
+        "test_fresh_verifier_gate_static.py",
+        "realnic_acceptance.py",
+        "test_realnic_acceptance.py",
+        "test_realnic_acceptance_static.py",
+    )
+    if len(expected_current_package_names) != 20:
+        fail("test current package oracle is not the fixed 20-file tuple")
+    if tcl_return_words(transport, "package_names") != expected_current_package_names:
+        fail("transport current package identity is not the fixed 20-file tuple")
+    if tuple(bash_array(controller, "PACKAGE_NAMES").split()) != expected_current_package_names:
+        fail("controller current package identity is not the fixed 20-file tuple")
+    raw_package_match = re.search(
+        r"(?ms)^readonly -a RAW_MUTATION_PACKAGE_NAMES=\((?P<body>.*?)^\)\n",
+        hermetic,
+    )
+    if (
+        not raw_package_match
+        or tuple(raw_package_match.group("body").split())
+        != expected_current_package_names
+    ):
+        fail("hermetic current package oracle is not the fixed 20-file tuple")
+    ordered(
+        hermetic,
+        (
+            'BOUND_MATRIX_OUTPUT="$(/bin/bash "${BOUND_OUTPUT}/test-hermetic-matrix.sh")"',
+            "for name in test-hermetic-checksum-module-lease.sh",
+            "test_checksum_module_lease_static.py wg_mix_faketcp_checksum.c; do",
+            '/bin/mv -- "${bound_file}" "${bound_backup}"',
+            'bound_missing_output="$(/bin/bash "${BOUND_OUTPUT}/test-hermetic-matrix.sh" 2>&1)"',
+            '[[ "${bound_missing_rc}" -eq 0 ||',
+            '"${bound_missing_output}" != *"review input is not a regular file: ${bound_file}"*',
+            '/bin/mv -- "${bound_backup}" "${bound_file}"',
+            '"$(sha256_file "${bound_file}")" == "$(manifest_value "${key}_sha256" "${BOUND_MANIFEST}")"',
+            '[[ "${BOUND_CLOSURE_MISSING_CUTS}" -eq 3 ]]',
+        ),
+        "bound flat checksum dependency closure gate",
+    )
+    c_source_path = "kernel/faketcp_checksum/wg_mix_faketcp_checksum.c"
+    if package_array.count(f'"{c_source_path}"') != 1:
+        fail("binder does not bind exactly one fixed checksum C source path")
+    for name, body, path_literal in (
+        (
+            "controller",
+            bash_function(controller, "verify_manifest_contract"),
+            '"${WG_MIX_FAKETCP_CHECKSUM_C_PATH}" == '
+            f"'{c_source_path}'",
+        ),
+        (
+            "transport",
+            tcl_proc(transport, "validate_manifest_values"),
+            "[dict get $values wg_mix_faketcp_checksum_c_path] ne\n"
+            f'            "{c_source_path}"',
+        ),
+        (
+            "root-stager",
+            bash_function(stager, "validate_manifest"),
+            f'"${{MODULE_SOURCE_PATH}}" == \'{c_source_path}\'',
+        ),
+    ):
+        if body.count(path_literal) != 1:
+            fail(f"{name} does not bind the exact checksum C source path")
+    staged_identity_gate = bash_function(stager, "require_staged_content")
+    ordered(
+        staged_identity_gate,
+        (
+            '"$(sha256_file "${EXPECTED_SOURCE}/${MODULE_SOURCE_PATH}")" == '
+            '"${MODULE_SOURCE_SHA256}"',
+            'require_staged_identity "${MODULE_SOURCE_PATH}" "${MODULE_SOURCE_BLOB}"',
+            '"${MODULE_SOURCE_SHA256}" 100644 600',
+        ),
+        "checksum C source blob/SHA/tree/file mode gate",
+    )
+
     expected_retained_package_names = (
         "source-4f2a9b61.bundle",
         "package-manifest.v1",
@@ -1591,9 +1727,12 @@ def main() -> None:
         or tuple(expected_prefix_match.group("body").split()) != fixed_prepare_prefix
         or not expected_package_match
         or tuple(expected_package_match.group("body").split())
-        != expected_retained_package_names
+        != expected_current_package_names
     ):
-        fail("hermetic prepare oracle is not the independent 5+30+parent+lineage tuple")
+        fail(
+            "hermetic prepare oracle is not the independent "
+            "5+30+parent+lineage+20 package tuple"
+        )
     for production_oracle in (
         "[base_identity_operations]",
         "[prepare_stale_operations]",
@@ -1947,9 +2086,12 @@ def main() -> None:
         '"${FIXTURE_REVIEW}/locked-transport.exp" prepare-lineage)',
         'controller-retired-mode-${retired_mode}" 64',
         'stager-retired-mode-${retired_mode}" 64',
-        "HARNESS_PREPARE_SEQUENCE steps=102",
+        "HARNESS_PREPARE_SEQUENCE steps=111",
         "HARNESS_MKDIR_FAILURE rc=73 steps=40",
-        "prepare_steps=102 prewrite_cuts=36",
+        "prepare_steps=111 prewrite_cuts=36",
+        "HERMETIC_BOUND_FLAT_CLOSURE package=v5 current_files=20 "
+        "checksum_dependencies=3 missing_cuts=3 result=PASS",
+        "HERMETIC_LOCAL_AUTHORITY package_names=20 package_tamper_cuts=40",
     ):
         if hermetic.count(marker) != 1:
             fail(f"hermetic F-lineage outer contract drifted: {marker!r}")
