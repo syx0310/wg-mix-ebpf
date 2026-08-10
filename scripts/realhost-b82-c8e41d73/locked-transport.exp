@@ -1933,18 +1933,57 @@ proc provision_plan_policy {payload expected_mode} {
     return $missing_class
 }
 
-proc assert_output {assertion payload} {
+proc strict_single_line_body {payload credential_sends} {
+    if {![string is integer -strict $credential_sends] ||
+        $credential_sends < 0 || $credential_sends > 2} {
+        return -code error "strict-line-credential-sends"
+    }
+    set endings [list "\r\r\r\n" "\r\r\n" "\r\n" "\n"]
+    set remaining $payload
+    set leading_frames 0
+    while {$leading_frames < $credential_sends} {
+        set matched 0
+        foreach ending $endings {
+            set width [string length $ending]
+            if {[string range $remaining 0 [expr {$width - 1}]] eq $ending} {
+                set remaining [string range $remaining $width end]
+                incr leading_frames
+                set matched 1
+                break
+            }
+        }
+        if {!$matched} {
+            break
+        }
+    }
+    set body ""
+    set matched 0
+    foreach ending $endings {
+        set width [string length $ending]
+        if {[string length $remaining] >= $width &&
+            [string range $remaining end-[expr {$width - 1}] end] eq $ending} {
+            set body [string range $remaining 0 end-$width]
+            set matched 1
+            break
+        }
+    }
+    if {!$matched || [string first "\r" $body] >= 0 ||
+        [string first "\n" $body] >= 0} {
+        return -code error "strict-line-framing"
+    }
+    return $body
+}
+
+proc assert_output {assertion payload {credential_sends 0}} {
     set value [output_value $payload]
     if {$assertion eq "none"} {
         return
     }
     if {$assertion eq "boot-uuid-line"} {
-        set normalized [string map [list "\r\r\n" "\n" "\r\n" "\n"] $payload]
-        if {[string first "\r" $normalized] >= 0 ||
-            [string length $normalized] != 37 ||
-            [string index $normalized end] ne "\n" || ![regexp \
+        if {[catch {strict_single_line_body $payload $credential_sends} body] ||
+            [string length $body] != 36 || ![regexp \
             {^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$} \
-            [string range $normalized 0 end-1]]} {
+            $body]} {
             return -code error "boot-uuid-output-mismatch"
         }
         return
@@ -1958,12 +1997,11 @@ proc assert_output {assertion payload} {
     }
     if {[string first "r1-lock-content:" $assertion] == 0} {
         set expected_boot_id [string range $assertion 16 end]
-        set normalized [string map [list "\r\r\n" "\n" "\r\n" "\n"] $payload]
-        if {![regexp \
+        if {[catch {strict_single_line_body $payload $credential_sends} body] ||
+            ![regexp \
                 {^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$} \
                 $expected_boot_id] ||
-            [string first "\r" $normalized] >= 0 ||
-            $normalized ne "boot_id\t${expected_boot_id}\n"} {
+            $body ne "boot_id\t${expected_boot_id}"} {
             return -code error "r1-lock-content-output-mismatch"
         }
         return
@@ -3105,7 +3143,8 @@ proc execute_operation_spec {operation operation_spec password} {
                     fail "output-assertion" 78
                 }
                 puts "B82_V6_PROVISION_AUDIT operation=provision-apply child_rc=0 plan=valid missing_set=$policy_result next_state=POSTFLIGHT"
-            } elseif {[catch {assert_output $assertion $captured_output} assertion_message]} {
+            } elseif {[catch {assert_output $assertion $captured_output \
+                $credential_sends} assertion_message]} {
                 fail "output-assertion" 78
             }
             set password ""
