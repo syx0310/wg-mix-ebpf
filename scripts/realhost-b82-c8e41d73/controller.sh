@@ -453,7 +453,7 @@ verify_bound_history() {
   local history_repository="${LOCAL_PACKAGE_DIR}/history-verification.git"
   local history_objects="${LOCAL_PACKAGE_DIR}/history-objects.v1"
   local history_roots="${LOCAL_PACKAGE_DIR}/history-roots.v1"
-  local isolated_count missing_rc actual_roots actual_objects_sha
+  local isolated_count missing_rc actual_roots actual_objects_sha history_refs
   [[ -d "${history_repository}" && ! -L "${history_repository}" &&
     -f "${history_objects}" && ! -L "${history_objects}" &&
     -f "${history_roots}" && ! -L "${history_roots}" ]] || return 66
@@ -466,6 +466,9 @@ verify_bound_history() {
     0) return 76 ;;
     *) return 67 ;;
   esac
+  history_refs="$(git_history "${history_repository}" for-each-ref \
+    '--format=%(objectname) %(refname)')" || return 76
+  [[ "${history_refs}" == "${INTEGRATION_COMMIT} refs/heads/history-verified" ]] || return 76
   git_history "${history_repository}" cat-file -e "${INTEGRATION_COMMIT}^{commit}" || return 76
   git_history "${history_repository}" fsck --full --strict --no-dangling "${INTEGRATION_COMMIT}" || return 76
   isolated_count="$(git_history "${history_repository}" rev-list --count "${INTEGRATION_COMMIT}")" || return 76
@@ -950,6 +953,10 @@ try:
             integration_commit + "\n").encode("ascii"):
         raise SystemExit(76)
     if run_git(("rev-parse", "--is-shallow-repository")) != b"false\n":
+        raise SystemExit(76)
+    if run_git((
+            "for-each-ref", "--format=%(objectname) %(refname)")) != (
+            integration_commit + " refs/heads/history-verified\n").encode("ascii"):
         raise SystemExit(76)
     run_git(("fsck", "--full", "--strict", "--no-dangling", integration_commit))
     if run_git(("rev-list", "--count", integration_commit)) != b"668\n":
