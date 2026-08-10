@@ -1939,7 +1939,7 @@ proc assert_output {assertion payload} {
         return
     }
     if {$assertion eq "boot-uuid-line"} {
-        set normalized [string map [list "\r\n" "\n"] $payload]
+        set normalized [string map [list "\r\r\n" "\n" "\r\n" "\n"] $payload]
         if {[string first "\r" $normalized] >= 0 ||
             [string length $normalized] != 37 ||
             [string index $normalized end] ne "\n" || ![regexp \
@@ -1958,7 +1958,7 @@ proc assert_output {assertion payload} {
     }
     if {[string first "r1-lock-content:" $assertion] == 0} {
         set expected_boot_id [string range $assertion 16 end]
-        set normalized [string map [list "\r\n" "\n"] $payload]
+        set normalized [string map [list "\r\r\n" "\n" "\r\n" "\n"] $payload]
         if {![regexp \
                 {^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$} \
                 $expected_boot_id] ||
