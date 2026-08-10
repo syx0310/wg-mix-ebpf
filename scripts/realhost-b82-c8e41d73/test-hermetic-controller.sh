@@ -1771,32 +1771,45 @@ switch -- $mode {
             lappend ::line_ending_spawns $args
             return [uplevel 1 [list transport_original_spawn {*}$args]]
         }
-        proc line_ending_assert_or_stop {assertion payload} {
-            if {[catch {assert_output $assertion $payload}]} {
+        proc line_ending_assert_or_stop {
+            assertion payload credential_sends
+        } {
+            if {[catch {
+                assert_output $assertion $payload $credential_sends
+            }]} {
                 fail "output-assertion" 78
             }
         }
-        proc line_ending_require_accept {family assertion label payload} {
+        proc line_ending_require_accept {
+            family assertion label credential_sends payload
+        } {
             if {[catch {
-                line_ending_assert_or_stop $assertion $payload
+                line_ending_assert_or_stop $assertion $payload \
+                    $credential_sends
             } message options]} {
-                harness_die "line-ending-positive family=$family label=$label message=$message options=$options"
+                harness_die "line-ending-positive family=$family label=$label credential_sends=$credential_sends message=$message options=$options"
             }
         }
-        proc line_ending_require_stop {family assertion label payload} {
+        proc line_ending_require_stop {
+            family assertion label credential_sends payload
+        } {
             set caught [catch {
-                line_ending_assert_or_stop $assertion $payload
+                line_ending_assert_or_stop $assertion $payload \
+                    $credential_sends
             } message options]
             if {!$caught || ![dict exists $options -errorcode] ||
                 [dict get $options -errorcode] ne {B82FAIL 78} ||
                 $message ne "output-assertion"} {
-                harness_die "line-ending-negative family=$family label=$label message=$message options=$options"
+                harness_die "line-ending-negative family=$family label=$label credential_sends=$credential_sends message=$message options=$options"
             }
         }
-        proc line_ending_execute_expect_stop {label spawn_argv assertion} {
+        proc line_ending_execute_expect_stop {
+            label spawn_argv prompt_limit assertion password
+        } {
             set caught [catch {
                 execute_operation_spec "line-ending-$label" \
-                    [list local $spawn_argv 0 $assertion 10] ""
+                    [list local $spawn_argv $prompt_limit $assertion 10] \
+                    $password
             } message options]
             if {!$caught || ![dict exists $options -errorcode] ||
                 [dict get $options -errorcode] ne {B82FAIL 78} ||
@@ -1804,64 +1817,239 @@ switch -- $mode {
                 harness_die "line-ending-pty-stop label=$label message=$message options=$options"
             }
         }
+        proc line_ending_relay_script {body prompt_count framing} {
+            if {![string is integer -strict $prompt_count] ||
+                $prompt_count < 0 || $prompt_count > 2 ||
+                $framing ni {none frameless coalesced separated overcount} ||
+                ($prompt_count == 0 && $framing ne "none") ||
+                ($prompt_count > 0 && $framing eq "none")} {
+                harness_die "line-ending-relay-arguments"
+            }
+            set leaf_script "[list set leaf_body $body]\n"
+            append leaf_script {
+                log_user 0
+                spawn -noecho /usr/bin/printf -- "%s\n" $leaf_body
+                expect {
+                    -re {.+} {
+                        send_user -- $expect_out(buffer)
+                        exp_continue
+                    }
+                    eof { wait }
+                }
+            }
+            set relay_script \
+                "[list set child_prompt_count $prompt_count]\n"
+            append relay_script "[list set child_framing $framing]\n"
+            append relay_script \
+                "[list set child_leaf_script $leaf_script]\n"
+            append relay_script {
+                log_user 0
+                if {$child_prompt_count > 0} {
+                    stty -echo
+                    for {set prompt_index 1} {
+                        $prompt_index <= $child_prompt_count
+                    } {incr prompt_index} {
+                        send_user -- "Password: "
+                        expect_user -re {\r|\n}
+                        if {$child_framing eq "separated" ||
+                            $child_framing eq "overcount" ||
+                            ($child_framing eq "coalesced" &&
+                             $prompt_index == $child_prompt_count)} {
+                            send_user -- "\n"
+                        }
+                        if {$child_framing eq "separated" &&
+                            $prompt_index < $child_prompt_count} {
+                            after 100
+                        }
+                    }
+                    if {$child_framing eq "overcount"} {
+                        send_user -- "\n"
+                    }
+                    stty echo
+                }
+                spawn -noecho /usr/bin/expect -c $child_leaf_script
+                expect {
+                    -re {.+} {
+                        send_user -- $expect_out(buffer)
+                        exp_continue
+                    }
+                    eof { wait }
+                }
+            }
+            return $relay_script
+        }
+        proc line_ending_require_result {label result expected_payload} {
+            if {[lindex $result 0] ne "ok" ||
+                [lindex $result 1] != 0 ||
+                [lindex $result 2] ne $expected_payload} {
+                binary scan [lindex $result 2] H* payload_hex
+                binary scan $expected_payload H* expected_hex
+                harness_die "line-ending-result label=$label result=$result payload_hex=$payload_hex expected_hex=$expected_hex"
+            }
+        }
         set boot_id 01234567-89ab-cdef-0123-456789abcdef
         set lock_assertion "r1-lock-content:${boot_id}"
         set boot_positive [list \
-            [list lf "${boot_id}\n"] \
-            [list crlf "${boot_id}\r\n"] \
-            [list crcrlf "${boot_id}\r\r\n"]]
+            [list no-leading-lf 0 "${boot_id}\n"] \
+            [list no-leading-crlf 0 "${boot_id}\r\n"] \
+            [list no-leading-crcrlf 0 "${boot_id}\r\r\n"] \
+            [list no-leading-crcrcrlf 0 "${boot_id}\r\r\r\n"] \
+            [list one-leading-lf-tail-lf 1 "\n${boot_id}\n"] \
+            [list one-leading-lf-tail-crlf 1 "\n${boot_id}\r\n"] \
+            [list one-leading-lf-tail-crcrlf 1 \
+                "\n${boot_id}\r\r\n"] \
+            [list one-leading-lf-tail-crcrcrlf 1 \
+                "\n${boot_id}\r\r\r\n"] \
+            [list one-prompt-frameless 1 "${boot_id}\r\r\r\n"] \
+            [list two-prompts-frameless 2 "${boot_id}\r\r\r\n"] \
+            [list two-prompts-coalesced 2 "\n${boot_id}\r\r\r\n"] \
+            [list two-prompts-separated 2 \
+                "\n\n${boot_id}\r\r\r\n"]]
         set lock_positive [list \
-            [list lf "boot_id\t${boot_id}\n"] \
-            [list crlf "boot_id\t${boot_id}\r\n"] \
-            [list crcrlf "boot_id\t${boot_id}\r\r\n"]]
+            [list no-leading-lf 0 "boot_id\t${boot_id}\n"] \
+            [list no-leading-crlf 0 "boot_id\t${boot_id}\r\n"] \
+            [list no-leading-crcrlf 0 "boot_id\t${boot_id}\r\r\n"] \
+            [list no-leading-crcrcrlf 0 \
+                "boot_id\t${boot_id}\r\r\r\n"] \
+            [list one-leading-lf-tail-lf 1 \
+                "\nboot_id\t${boot_id}\n"] \
+            [list one-leading-lf-tail-crlf 1 \
+                "\nboot_id\t${boot_id}\r\n"] \
+            [list one-leading-lf-tail-crcrlf 1 \
+                "\nboot_id\t${boot_id}\r\r\n"] \
+            [list one-leading-lf-tail-crcrcrlf 1 \
+                "\nboot_id\t${boot_id}\r\r\r\n"] \
+            [list one-prompt-frameless 1 \
+                "boot_id\t${boot_id}\r\r\r\n"] \
+            [list two-prompts-frameless 2 \
+                "boot_id\t${boot_id}\r\r\r\n"] \
+            [list two-prompts-coalesced 2 \
+                "\nboot_id\t${boot_id}\r\r\r\n"] \
+            [list two-prompts-separated 2 \
+                "\n\nboot_id\t${boot_id}\r\r\r\n"]]
         set boot_negative [list \
-            [list embedded-cr "01234567-89ab-cdef\r-0123-456789abcdef\n"] \
-            [list triple-cr "${boot_id}\r\r\r\n"] \
-            [list extra-line "${boot_id}\nextra\n"] \
-            [list missing-newline "${boot_id}"] \
-            [list extra-final-newline "${boot_id}\n\n"] \
-            [list wrong-uuid "01234567-89ab-cdef-0123-456789abcdeG\n"]]
+            [list sends-zero-one-leading 0 "\n${boot_id}\n"] \
+            [list sends-one-two-leading 1 "\n\n${boot_id}\n"] \
+            [list sends-two-three-leading 2 "\n\n\n${boot_id}\n"] \
+            [list four-cr-tail 0 "${boot_id}\r\r\r\r\n"] \
+            [list embedded-cr 0 \
+                "01234567-89ab-cdef\r-0123-456789abcdef\n"] \
+            [list multiline 0 "${boot_id}\nextra\n"] \
+            [list missing-newline 0 "${boot_id}"] \
+            [list extra-final-newline 0 "${boot_id}\n\n"] \
+            [list wrong-uuid 0 \
+                "01234567-89ab-cdef-0123-456789abcdeG\n"]]
         set lock_negative [list \
-            [list embedded-cr "boot_id\t01234567-89ab-cdef\r-0123-456789abcdef\n"] \
-            [list triple-cr "boot_id\t${boot_id}\r\r\r\n"] \
-            [list extra-line "boot_id\t${boot_id}\nextra\n"] \
-            [list missing-newline "boot_id\t${boot_id}"] \
-            [list extra-final-newline "boot_id\t${boot_id}\n\n"] \
-            [list wrong-body "boot_id\t11234567-89ab-cdef-0123-456789abcdef\n"]]
+            [list sends-zero-one-leading 0 \
+                "\nboot_id\t${boot_id}\n"] \
+            [list sends-one-two-leading 1 \
+                "\n\nboot_id\t${boot_id}\n"] \
+            [list sends-two-three-leading 2 \
+                "\n\n\nboot_id\t${boot_id}\n"] \
+            [list four-cr-tail 0 \
+                "boot_id\t${boot_id}\r\r\r\r\n"] \
+            [list embedded-cr 0 \
+                "boot_id\t01234567-89ab-cdef\r-0123-456789abcdef\n"] \
+            [list multiline 0 "boot_id\t${boot_id}\nextra\n"] \
+            [list missing-newline 0 "boot_id\t${boot_id}"] \
+            [list extra-final-newline 0 \
+                "boot_id\t${boot_id}\n\n"] \
+            [list wrong-body 0 \
+                "boot_id\t11234567-89ab-cdef-0123-456789abcdef\n"]]
         foreach test_case $boot_positive {
-            lassign $test_case label payload
-            line_ending_require_accept boot boot-uuid-line $label $payload
+            lassign $test_case label credential_sends payload
+            line_ending_require_accept boot boot-uuid-line $label \
+                $credential_sends $payload
         }
         foreach test_case $lock_positive {
-            lassign $test_case label payload
-            line_ending_require_accept lock $lock_assertion $label $payload
+            lassign $test_case label credential_sends payload
+            line_ending_require_accept lock $lock_assertion $label \
+                $credential_sends $payload
         }
         foreach test_case $boot_negative {
-            lassign $test_case label payload
-            line_ending_require_stop boot boot-uuid-line $label $payload
+            lassign $test_case label credential_sends payload
+            line_ending_require_stop boot boot-uuid-line $label \
+                $credential_sends $payload
         }
         foreach test_case $lock_negative {
-            lassign $test_case label payload
-            line_ending_require_stop lock $lock_assertion $label $payload
+            lassign $test_case label credential_sends payload
+            line_ending_require_stop lock $lock_assertion $label \
+                $credential_sends $payload
         }
+        set boot_no_prompt_child \
+            [line_ending_relay_script $boot_id 0 none]
+        set lock_no_prompt_child \
+            [line_ending_relay_script "boot_id\t${boot_id}" 0 none]
+        set boot_one_prompt_child \
+            [line_ending_relay_script $boot_id 1 separated]
+        set lock_one_prompt_child \
+            [line_ending_relay_script "boot_id\t${boot_id}" 1 separated]
+        set boot_two_coalesced_child \
+            [line_ending_relay_script $boot_id 2 coalesced]
+        set lock_two_separated_child \
+            [line_ending_relay_script "boot_id\t${boot_id}" 2 separated]
+        set boot_one_frameless_child \
+            [line_ending_relay_script $boot_id 1 frameless]
+        set boot_one_overcount_child \
+            [line_ending_relay_script $boot_id 1 overcount]
         set boot_result [execute_operation_spec line-ending-boot-pty \
-            [list local \
-                [list /usr/bin/printf "%s\r\n" $boot_id] \
+            [list local [list /usr/bin/expect -c $boot_no_prompt_child] \
                 0 boot-uuid-line 10] ""]
         set lock_result [execute_operation_spec line-ending-lock-pty \
-            [list local \
-                [list /usr/bin/printf "boot_id\t%s\r\n" $boot_id] \
+            [list local [list /usr/bin/expect -c $lock_no_prompt_child] \
                 0 $lock_assertion 10] ""]
-        line_ending_execute_expect_stop invalid-extra-char \
-            [list /usr/bin/printf "%s\r\n" "${boot_id}x"] \
-            boot-uuid-line
+        set boot_one_prompt_result [execute_operation_spec \
+            line-ending-boot-one-prompt-pty \
+            [list local [list /usr/bin/expect -c $boot_one_prompt_child] \
+                1 boot-uuid-line 10] fixture-password]
+        set lock_one_prompt_result [execute_operation_spec \
+            line-ending-lock-one-prompt-pty \
+            [list local [list /usr/bin/expect -c $lock_one_prompt_child] \
+                1 $lock_assertion 10] fixture-password]
+        set boot_two_coalesced_result [execute_operation_spec \
+            line-ending-boot-two-coalesced-pty \
+            [list local \
+                [list /usr/bin/expect -c $boot_two_coalesced_child] \
+                2 boot-uuid-line 10] fixture-password]
+        set lock_two_separated_result [execute_operation_spec \
+            line-ending-lock-two-separated-pty \
+            [list local \
+                [list /usr/bin/expect -c $lock_two_separated_child] \
+                2 $lock_assertion 10] fixture-password]
+        set boot_one_frameless_result [execute_operation_spec \
+            line-ending-boot-one-frameless-pty \
+            [list local \
+                [list /usr/bin/expect -c $boot_one_frameless_child] \
+                1 boot-uuid-line 10] fixture-password]
+        line_ending_require_result boot-no-prompt $boot_result \
+            "${boot_id}\r\r\r\n"
+        line_ending_require_result lock-no-prompt $lock_result \
+            "boot_id\t${boot_id}\r\r\r\n"
+        line_ending_require_result boot-one-prompt \
+            $boot_one_prompt_result "\r\n${boot_id}\r\r\r\n"
+        line_ending_require_result lock-one-prompt \
+            $lock_one_prompt_result \
+            "\r\nboot_id\t${boot_id}\r\r\r\n"
+        line_ending_require_result boot-two-coalesced \
+            $boot_two_coalesced_result "\r\n${boot_id}\r\r\r\n"
+        line_ending_require_result lock-two-separated \
+            $lock_two_separated_result \
+            "\r\n\r\nboot_id\t${boot_id}\r\r\r\n"
+        line_ending_require_result boot-one-frameless \
+            $boot_one_frameless_result "${boot_id}\r\r\r\n"
+        line_ending_execute_expect_stop prompt-one-overcount \
+            [list /usr/bin/expect -c $boot_one_overcount_child] \
+            1 boot-uuid-line fixture-password
+        line_ending_execute_expect_stop invalid-four-cr \
+            [list /usr/bin/printf "%s\r\r\r\n" $boot_id] \
+            0 boot-uuid-line ""
         line_ending_execute_expect_stop invalid-embedded-cr \
             [list /usr/bin/printf "%s\r\n" \
                 "01234567-89ab-cdef\r-0123-456789abcdef"] \
-            boot-uuid-line
+            0 boot-uuid-line ""
         line_ending_execute_expect_stop invalid-multiline \
             [list /usr/bin/printf "%s\r\n%s\r\n" $boot_id extra] \
-            boot-uuid-line
+            0 boot-uuid-line ""
         set child_nonzero [execute_operation_spec line-ending-child-nonzero \
             [list local [list /usr/bin/python3 -B -I -c \
                 {import sys; sys.exit(23)}] 0 none 10] ""]
@@ -1872,9 +2060,15 @@ switch -- $mode {
                     0 none 10] ""
         } signal_message signal_options]
         set expected_spawns [list \
-            [list -noecho /usr/bin/printf "%s\r\n" $boot_id] \
-            [list -noecho /usr/bin/printf "boot_id\t%s\r\n" $boot_id] \
-            [list -noecho /usr/bin/printf "%s\r\n" "${boot_id}x"] \
+            [list -noecho /usr/bin/expect -c $boot_no_prompt_child] \
+            [list -noecho /usr/bin/expect -c $lock_no_prompt_child] \
+            [list -noecho /usr/bin/expect -c $boot_one_prompt_child] \
+            [list -noecho /usr/bin/expect -c $lock_one_prompt_child] \
+            [list -noecho /usr/bin/expect -c $boot_two_coalesced_child] \
+            [list -noecho /usr/bin/expect -c $lock_two_separated_child] \
+            [list -noecho /usr/bin/expect -c $boot_one_frameless_child] \
+            [list -noecho /usr/bin/expect -c $boot_one_overcount_child] \
+            [list -noecho /usr/bin/printf "%s\r\r\r\n" $boot_id] \
             [list -noecho /usr/bin/printf "%s\r\n" \
                 "01234567-89ab-cdef\r-0123-456789abcdef"] \
             [list -noecho /usr/bin/printf "%s\r\n%s\r\n" $boot_id extra] \
@@ -1882,25 +2076,17 @@ switch -- $mode {
                 {import sys; sys.exit(23)}] \
             [list -noecho /usr/bin/python3 -B -I -c \
                 {import os, signal; os.kill(os.getpid(), signal.SIGTERM)}]]
-        if {[lindex $boot_result 0] ne "ok" ||
-            [lindex $boot_result 1] != 0 ||
-            [lindex $boot_result 2] ne "${boot_id}\r\r\n" ||
-            [lindex $lock_result 0] ne "ok" ||
-            [lindex $lock_result 1] != 0 ||
-            [lindex $lock_result 2] ne "boot_id\t${boot_id}\r\r\n" ||
-            [lrange $child_nonzero 0 1] ne {child-failure 23} ||
+        if {[lrange $child_nonzero 0 1] ne {child-failure 23} ||
             !$signal_caught ||
             ![dict exists $signal_options -errorcode] ||
             [dict get $signal_options -errorcode] ne {B82FAIL 78} ||
             $signal_message ne "child-wait-status" ||
             $::line_ending_spawns ne $expected_spawns ||
             $::credential_reads != 0} {
-            binary scan [lindex $boot_result 2] H* boot_hex
-            binary scan [lindex $lock_result 2] H* lock_hex
-            harness_die "line-ending-pty boot=$boot_result boot_hex=$boot_hex lock=$lock_result lock_hex=$lock_hex child_nonzero=$child_nonzero signal_caught=$signal_caught signal_message=$signal_message signal_options=$signal_options spawns=$::line_ending_spawns expected_spawns=$expected_spawns credential_reads=$::credential_reads"
+            harness_die "line-ending-pty child_nonzero=$child_nonzero signal_caught=$signal_caught signal_message=$signal_message signal_options=$signal_options spawns=$::line_ending_spawns expected_spawns=$expected_spawns credential_reads=$::credential_reads"
         }
-        puts "HARNESS_LINEAGE_OUTPUT_PTY cases=7 boot=PASS lock=PASS invalid_stops=3 child_nonzero=23 signal=STOP raw_suffix=0d0d0a credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS"
-        puts "HARNESS_LINE_ENDING_ASSERTIONS boot_positive=3 boot_stops=6 lock_positive=3 lock_stops=6 pty_children=7 raw_suffix=0d0d0a credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS"
+        puts "HARNESS_LINEAGE_OUTPUT_PTY cases=13 boot=PASS lock=PASS prompt1_zero_frames=PASS prompt1_one_frame=PASS prompt2_coalesced_frames=1 prompt2_separated_frames=2 prompt_policy_stops=1 invalid_stops=3 child_nonzero=23 signal=STOP raw_suffix=0d0d0d0a credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS"
+        puts "HARNESS_LINE_ENDING_ASSERTIONS boot_positive=12 boot_stops=9 lock_positive=12 lock_stops=9 credential_sends=bounded leading_frames=zero-to-sends tail_endings=4 pty_children=13 raw_suffix=0d0d0d0a credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS"
     }
     precredential {
         if {[llength $arguments] != 4} { harness_die "precredential-arguments" }
@@ -4105,8 +4291,8 @@ LINEAGE_GATE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
 LINEAGE_OUTPUT_PTY="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   "${FIXTURE_REVIEW}/locked-transport.exp" lineage-output-pty 2>&1)" ||
   fail 'retained retirement lineage output PTY regression'
-[[ "${LINEAGE_OUTPUT_PTY}" == *'HARNESS_LINEAGE_OUTPUT_PTY cases=7 boot=PASS lock=PASS invalid_stops=3 child_nonzero=23 signal=STOP raw_suffix=0d0d0a credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS'* &&
-  "${LINEAGE_OUTPUT_PTY}" == *'HARNESS_LINE_ENDING_ASSERTIONS boot_positive=3 boot_stops=6 lock_positive=3 lock_stops=6 pty_children=7 raw_suffix=0d0d0a credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS'* ]] ||
+[[ "${LINEAGE_OUTPUT_PTY}" == *'HARNESS_LINEAGE_OUTPUT_PTY cases=13 boot=PASS lock=PASS prompt1_zero_frames=PASS prompt1_one_frame=PASS prompt2_coalesced_frames=1 prompt2_separated_frames=2 prompt_policy_stops=1 invalid_stops=3 child_nonzero=23 signal=STOP raw_suffix=0d0d0d0a credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS'* &&
+  "${LINEAGE_OUTPUT_PTY}" == *'HARNESS_LINE_ENDING_ASSERTIONS boot_positive=12 boot_stops=9 lock_positive=12 lock_stops=9 credential_sends=bounded leading_frames=zero-to-sends tail_endings=4 pty_children=13 raw_suffix=0d0d0d0a credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS'* ]] ||
   fail "retained retirement lineage output PTY marker: ${LINEAGE_OUTPUT_PTY}"
 R1_SOURCE_REUSE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   "${FIXTURE_REVIEW}/locked-transport.exp" r1-source-reuse \

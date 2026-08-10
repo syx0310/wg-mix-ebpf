@@ -512,7 +512,7 @@ def main() -> None:
     )
     hermetic_bytes = hermetic_path.read_bytes()
     expected_hermetic_sha256 = (
-        "bad098d34d4445d72ddee69928d0baa3fc4da75ac87385df4a6ea3ae9c3f5f54"
+        "3c3ba84d8cdc9e91da3ffee169a308029aa67a592a8fb973ebcec5382686b47a"
     )
     if hashlib.sha256(hermetic_bytes).hexdigest() != expected_hermetic_sha256:
         fail("hermetic controller exact bytes drifted")
@@ -2092,6 +2092,70 @@ def main() -> None:
         or "/bin/bash" in retained_boot_lock_builder
     ):
         fail("transport bounded lock-content/inode-recheck builder argv is not exact")
+    strict_line_body = tcl_proc(transport, "strict_single_line_body")
+    ordered(
+        strict_line_body,
+        (
+            "![string is integer -strict $credential_sends]",
+            "$credential_sends < 0",
+            "$credential_sends > 2",
+            'return -code error "strict-line-credential-sends"',
+            'set endings [list "\\r\\r\\r\\n" "\\r\\r\\n" "\\r\\n" "\\n"]',
+            "set remaining $payload",
+            "set leading_frames 0",
+            "while {$leading_frames < $credential_sends}",
+            "set matched 0",
+            "foreach ending $endings",
+            "set width [string length $ending]",
+            "[string range $remaining 0 [expr {$width - 1}]] eq $ending",
+            "set remaining [string range $remaining $width end]",
+            "incr leading_frames",
+            "set matched 1",
+            "break",
+            "if {!$matched}",
+            "break",
+            'set body ""',
+            "set matched 0",
+            "foreach ending $endings",
+            "set width [string length $ending]",
+            "[string length $remaining] >= $width",
+            "[string range $remaining end-[expr {$width - 1}] end] eq $ending",
+            "set body [string range $remaining 0 end-$width]",
+            "set matched 1",
+            "break",
+            "if {!$matched",
+            '[string first "\\r" $body] >= 0',
+            '[string first "\\n" $body] >= 0',
+            'return -code error "strict-line-framing"',
+            "return $body",
+        ),
+        "transport bounded credential-frame and exact terminal-line parser",
+    )
+    if (
+        transport.count(
+            "proc strict_single_line_body {payload credential_sends} {"
+        )
+        != 1
+        or strict_line_body.count("foreach ending $endings") != 2
+        or strict_line_body.count("while {$leading_frames < $credential_sends}")
+        != 1
+        or strict_line_body.count("incr leading_frames") != 1
+        or strict_line_body.count("return $body") != 1
+        or strict_line_body.count("string map") != 0
+        or strict_line_body.count("output_value") != 0
+        or any(
+            relaxed in strict_line_body
+            for relaxed in (
+                "string trim",
+                "regsub",
+                "[split ",
+                "[join ",
+                "prompt_limit",
+            )
+        )
+    ):
+        fail("transport strict single-line framing parser is not exact and bounded")
+
     lineage_assert_output = tcl_proc(transport, "assert_output")
     boot_uuid_branch = lineage_assert_output[
         lineage_assert_output.index('if {$assertion eq "boot-uuid-line"} {') :
@@ -2102,20 +2166,14 @@ def main() -> None:
             'if {[string first "r1-lock-content:" $assertion] == 0} {'
         ) : lineage_assert_output.index('if {$assertion eq "r2-helper-verify"} {')
     ]
-    framing_normalizer = (
-        'set normalized [string map [list "\\r\\r\\n" "\\n" '
-        '"\\r\\n" "\\n"] $payload]'
-    )
     ordered(
         boot_uuid_branch,
         (
             'if {$assertion eq "boot-uuid-line"}',
-            framing_normalizer,
-            'if {[string first "\\r" $normalized] >= 0',
-            "[string length $normalized] != 37",
-            '[string index $normalized end] ne "\\n"',
+            "[catch {strict_single_line_body $payload $credential_sends} body]",
+            "[string length $body] != 36",
             "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
-            "[string range $normalized 0 end-1]",
+            "$body",
             'return -code error "boot-uuid-output-mismatch"',
             "return",
         ),
@@ -2126,11 +2184,10 @@ def main() -> None:
         (
             'if {[string first "r1-lock-content:" $assertion] == 0}',
             "set expected_boot_id [string range $assertion 16 end]",
-            framing_normalizer,
+            "[catch {strict_single_line_body $payload $credential_sends} body]",
             "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
             "$expected_boot_id",
-            '[string first "\\r" $normalized] >= 0',
-            '$normalized ne "boot_id\\t${expected_boot_id}\\n"',
+            '$body ne "boot_id\\t${expected_boot_id}"',
             'return -code error "r1-lock-content-output-mismatch"',
             "return",
         ),
@@ -2150,7 +2207,15 @@ def main() -> None:
         "transport framed boot assertions and generic output separation",
     )
     if (
-        lineage_assert_output.count('if {$assertion eq "boot-uuid-line"}') != 1
+        transport.count(
+            "proc assert_output {assertion payload {credential_sends 0}} {"
+        )
+        != 1
+        or lineage_assert_output.count(
+            "strict_single_line_body $payload $credential_sends"
+        )
+        != 2
+        or lineage_assert_output.count('if {$assertion eq "boot-uuid-line"}') != 1
         or lineage_assert_output.count(
             'if {$assertion eq "r1-lock-identity"}'
         )
@@ -2166,21 +2231,22 @@ def main() -> None:
         (
             "boot UUID",
             boot_uuid_branch,
-            ("map", "first", "length", "index", "range"),
-            ("normalized",),
+            ("length",),
+            (),
         ),
         (
             "R1 lock content",
             lock_content_branch,
-            ("first", "range", "map", "first"),
-            ("expected_boot_id", "normalized"),
+            ("first", "range"),
+            ("expected_boot_id",),
         ),
     ):
         if (
-            branch.count(framing_normalizer) != 1
-            or branch.count("string map") != 1
+            branch.count(
+                "strict_single_line_body $payload $credential_sends"
+            )
+            != 1
             or branch.count("$payload") != 1
-            or branch.count('[string first "\\r" $normalized]') != 1
             or tuple(re.findall(r"\[string ([a-z]+)", branch))
             != expected_string_commands
             or tuple(
@@ -2196,23 +2262,16 @@ def main() -> None:
             or "[join " in branch
         ):
             fail(
-                f"transport {branch_name} framing is not one ordered, residual-CR "
-                "rejecting normalization"
+                f"transport {branch_name} does not use the sole bounded framing parser"
             )
     if (
-        boot_uuid_branch.count('[string length $normalized] != 37') != 1
-        or boot_uuid_branch.count('[string index $normalized end] ne "\\n"') != 1
-        or boot_uuid_branch.count("[string range $normalized 0 end-1]") != 1
-        or boot_uuid_branch.count('"\\n"') != 3
+        boot_uuid_branch.count("[string length $body] != 36") != 1
         or boot_uuid_branch.count("boot-uuid-output-mismatch") != 1
-        or lock_content_branch.count(
-            '$normalized ne "boot_id\\t${expected_boot_id}\\n"'
-        )
+        or lock_content_branch.count('$body ne "boot_id\\t${expected_boot_id}"')
         != 1
-        or lock_content_branch.count('"\\n"') != 2
         or lock_content_branch.count("r1-lock-content-output-mismatch") != 1
     ):
-        fail("transport boot/lock framing does not require one exact LF-terminated body")
+        fail("transport boot/lock assertions do not require an exact framed body")
 
     lineage_lock_stat_case = lineage_builder[
         lineage_builder.index("lineage-lock-stat {") : lineage_builder.index(
@@ -3667,8 +3726,16 @@ def main() -> None:
     ordered(
         ordinary_execute,
         (
+            "lassign $operation_spec transport_type spawn_argv prompt_limit assertion timeout_seconds",
             "spawn -noecho {*}$spawn_argv",
             "set child_id $spawn_id",
+            'set captured_output ""',
+            "set credential_sends 0",
+            "set credential_pattern",
+            "incr credential_sends",
+            "if {$credential_sends > $prompt_limit}",
+            'fail "credential-prompt-count" 77',
+            'send -i $child_id -- "$password\\r"',
             "wait -i $child_id",
             "clean_child_exit_status $wait_status",
             'fail "child-wait-status" 78',
@@ -3676,9 +3743,21 @@ def main() -> None:
             "return [list child-failure $child_rc $captured_output none]",
             "if {$assertion eq \"provision-check\"}",
             "assert_output $assertion $captured_output",
+            "$credential_sends",
         ),
-        "ordinary execute signal fail-closed path",
+        "ordinary execute credential-count and signal fail-closed path",
     )
+    if (
+        ordinary_execute.count("set credential_sends 0") != 1
+        or ordinary_execute.count("incr credential_sends") != 1
+        or ordinary_execute.count(
+            "assert_output $assertion $captured_output \\\n                $credential_sends"
+        )
+        != 1
+        or "assert_output $assertion $captured_output $prompt_limit"
+        in ordinary_execute
+    ):
+        fail("ordinary execute does not pass the observed credential count once")
     if transport_main.index('if {$action eq "plan"}') > transport_main.index(
         "read_execute_credential $credential_path"
     ):
@@ -4572,12 +4651,12 @@ def main() -> None:
         expect_harness_end + len("\nEXPECT_HARNESS\n") :
     ]
     if (
-        len(transport_harness.encode("utf-8")) != 161316
+        len(transport_harness.encode("utf-8")) != 170427
         or hashlib.sha256(transport_harness.encode("utf-8")).hexdigest()
-        != "efcac792a8cc0902a6e06d69a0b1c1a6af145d467b8db4bdb480a9aeb43205b6"
-        or len(transport_harness_outer.encode("utf-8")) != 160900
+        != "87aac5360847930214010612f9c15216a1c8e9ca5cc46c68228ed9e5c1dd5ddc"
+        or len(transport_harness_outer.encode("utf-8")) != 161101
         or hashlib.sha256(transport_harness_outer.encode("utf-8")).hexdigest()
-        != "9c777ff73dfcd4efe575d61ec3ae50599e03fb3d88150349fa37a7005421dcb0"
+        != "9847a2408a75dc60dead9aef0a0ffc8cc9c8abaa1535d297950d3e1e550665f7"
     ):
         fail("hermetic transport harness or direct outer runners bytes drifted")
     ordered(
@@ -4650,6 +4729,7 @@ def main() -> None:
     for protected_procedure in (
         "execute_operation_spec",
         "assert_output",
+        "strict_single_line_body",
         "output_value",
         "clean_child_exit_status",
         "expect",
@@ -4682,13 +4762,18 @@ def main() -> None:
     ):
         fail("hermetic PTY spawn observer does not directly delegate to real spawn")
     lineage_output_marker = (
-        "HARNESS_LINEAGE_OUTPUT_PTY cases=7 boot=PASS lock=PASS "
-        "invalid_stops=3 child_nonzero=23 signal=STOP raw_suffix=0d0d0a "
+        "HARNESS_LINEAGE_OUTPUT_PTY cases=13 boot=PASS lock=PASS "
+        "prompt1_zero_frames=PASS prompt1_one_frame=PASS "
+        "prompt2_coalesced_frames=1 prompt2_separated_frames=2 "
+        "prompt_policy_stops=1 invalid_stops=3 child_nonzero=23 signal=STOP "
+        "raw_suffix=0d0d0d0a "
         "credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS"
     )
     line_ending_marker = (
-        "HARNESS_LINE_ENDING_ASSERTIONS boot_positive=3 boot_stops=6 "
-        "lock_positive=3 lock_stops=6 pty_children=7 raw_suffix=0d0d0a "
+        "HARNESS_LINE_ENDING_ASSERTIONS boot_positive=12 boot_stops=9 "
+        "lock_positive=12 lock_stops=9 credential_sends=bounded "
+        "leading_frames=zero-to-sends tail_endings=4 pty_children=13 "
+        "raw_suffix=0d0d0d0a "
         "credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS"
     )
     ordered(
@@ -4708,52 +4793,122 @@ def main() -> None:
             "proc spawn {args}",
             "lappend ::line_ending_spawns $args",
             "transport_original_spawn {*}$args",
-            "proc line_ending_assert_or_stop {assertion payload}",
-            "assert_output $assertion $payload",
+            "proc line_ending_assert_or_stop {",
+            "assertion payload credential_sends",
+            "assert_output $assertion $payload $credential_sends",
             'fail "output-assertion" 78',
-            "proc line_ending_require_accept {family assertion label payload}",
-            "proc line_ending_require_stop {family assertion label payload}",
+            "proc line_ending_require_accept {",
+            "family assertion label credential_sends payload",
+            "proc line_ending_require_stop {",
+            "family assertion label credential_sends payload",
             "[dict get $options -errorcode] ne {B82FAIL 78}",
-            "proc line_ending_execute_expect_stop {label spawn_argv assertion}",
+            "proc line_ending_execute_expect_stop {",
+            "label spawn_argv prompt_limit assertion password",
             'execute_operation_spec "line-ending-$label"',
+            "[list local $spawn_argv $prompt_limit $assertion 10]",
+            "proc line_ending_relay_script {body prompt_count framing}",
+            "$framing ni {none frameless coalesced separated overcount}",
+            "spawn -noecho /usr/bin/printf -- \"%s\\n\" $leaf_body",
+            "send_user -- $expect_out(buffer)",
+            "set child_prompt_count $prompt_count",
+            "set child_framing $framing",
+            "set child_leaf_script $leaf_script",
+            "send_user -- \"Password: \"",
+            "expect_user -re {\\r|\\n}",
+            '$child_framing eq "separated"',
+            '$child_framing eq "overcount"',
+            '$child_framing eq "coalesced"',
+            'send_user -- "\\n"',
+            "after 100",
+            "spawn -noecho /usr/bin/expect -c $child_leaf_script",
+            "return $relay_script",
+            "proc line_ending_require_result {label result expected_payload}",
             "set boot_positive [list",
-            '[list lf "${boot_id}\\n"]',
-            '[list crlf "${boot_id}\\r\\n"]',
-            '[list crcrlf "${boot_id}\\r\\r\\n"]',
+            '[list no-leading-lf 0 "${boot_id}\\n"]',
+            '[list no-leading-crlf 0 "${boot_id}\\r\\n"]',
+            '[list no-leading-crcrlf 0 "${boot_id}\\r\\r\\n"]',
+            '[list no-leading-crcrcrlf 0 "${boot_id}\\r\\r\\r\\n"]',
+            "one-leading-lf-tail-lf",
+            "one-leading-lf-tail-crlf",
+            "one-leading-lf-tail-crcrlf",
+            "one-leading-lf-tail-crcrcrlf",
+            "one-prompt-frameless",
+            "two-prompts-frameless",
+            "two-prompts-coalesced",
+            "two-prompts-separated",
             "set lock_positive [list",
-            '[list lf "boot_id\\t${boot_id}\\n"]',
-            '[list crlf "boot_id\\t${boot_id}\\r\\n"]',
-            '[list crcrlf "boot_id\\t${boot_id}\\r\\r\\n"]',
+            "no-leading-lf",
+            "no-leading-crlf",
+            "no-leading-crcrlf",
+            "no-leading-crcrcrlf",
+            "one-leading-lf-tail-lf",
+            "one-leading-lf-tail-crlf",
+            "one-leading-lf-tail-crcrlf",
+            "one-leading-lf-tail-crcrcrlf",
+            "one-prompt-frameless",
+            "two-prompts-frameless",
+            "two-prompts-coalesced",
+            "two-prompts-separated",
             "set boot_negative [list",
+            "sends-zero-one-leading",
+            "sends-one-two-leading",
+            "sends-two-three-leading",
+            "four-cr-tail",
             "embedded-cr",
-            "triple-cr",
-            "extra-line",
+            "multiline",
             "missing-newline",
             "extra-final-newline",
             "wrong-uuid",
             "set lock_negative [list",
+            "sends-zero-one-leading",
+            "sends-one-two-leading",
+            "sends-two-three-leading",
+            "four-cr-tail",
             "embedded-cr",
-            "triple-cr",
-            "extra-line",
+            "multiline",
             "missing-newline",
             "extra-final-newline",
             "wrong-body",
             "foreach test_case $boot_positive",
+            "lassign $test_case label credential_sends payload",
             "line_ending_require_accept boot boot-uuid-line",
             "foreach test_case $lock_positive",
+            "lassign $test_case label credential_sends payload",
             "line_ending_require_accept lock $lock_assertion",
             "foreach test_case $boot_negative",
+            "lassign $test_case label credential_sends payload",
             "line_ending_require_stop boot boot-uuid-line",
             "foreach test_case $lock_negative",
+            "lassign $test_case label credential_sends payload",
             "line_ending_require_stop lock $lock_assertion",
+            "set boot_no_prompt_child",
+            "set lock_no_prompt_child",
+            "set boot_one_prompt_child",
+            "set lock_one_prompt_child",
+            "set boot_two_coalesced_child",
+            "set lock_two_separated_child",
+            "set boot_one_frameless_child",
+            "set boot_one_overcount_child",
             "set boot_result [execute_operation_spec line-ending-boot-pty",
-            '[list /usr/bin/printf "%s\\r\\n" $boot_id]',
-            "0 boot-uuid-line 10",
             "set lock_result [execute_operation_spec line-ending-lock-pty",
-            '[list /usr/bin/printf "boot_id\\t%s\\r\\n" $boot_id]',
-            "0 $lock_assertion 10",
-            "line_ending_execute_expect_stop invalid-extra-char",
-            '[list /usr/bin/printf "%s\\r\\n" "${boot_id}x"]',
+            "set boot_one_prompt_result [execute_operation_spec",
+            "set lock_one_prompt_result [execute_operation_spec",
+            "set boot_two_coalesced_result [execute_operation_spec",
+            "set lock_two_separated_result [execute_operation_spec",
+            "set boot_one_frameless_result [execute_operation_spec",
+            "line_ending_require_result boot-no-prompt",
+            '"${boot_id}\\r\\r\\r\\n"',
+            "line_ending_require_result lock-no-prompt",
+            "line_ending_require_result boot-one-prompt",
+            '"\\r\\n${boot_id}\\r\\r\\r\\n"',
+            "line_ending_require_result lock-one-prompt",
+            "line_ending_require_result boot-two-coalesced",
+            "line_ending_require_result lock-two-separated",
+            '"\\r\\n\\r\\nboot_id\\t${boot_id}\\r\\r\\r\\n"',
+            "line_ending_require_result boot-one-frameless",
+            "line_ending_execute_expect_stop prompt-one-overcount",
+            "line_ending_execute_expect_stop invalid-four-cr",
+            '[list /usr/bin/printf "%s\\r\\r\\r\\n" $boot_id]',
             "line_ending_execute_expect_stop invalid-embedded-cr",
             '"01234567-89ab-cdef\\r-0123-456789abcdef"',
             "line_ending_execute_expect_stop invalid-multiline",
@@ -4764,8 +4919,6 @@ def main() -> None:
             "execute_operation_spec line-ending-child-signal",
             "{import os, signal; os.kill(os.getpid(), signal.SIGTERM)}",
             "set expected_spawns [list",
-            "[lindex $boot_result 2] ne \"${boot_id}\\r\\r\\n\"",
-            "[lindex $lock_result 2] ne \"boot_id\\t${boot_id}\\r\\r\\n\"",
             "[lrange $child_nonzero 0 1] ne {child-failure 23}",
             "[dict get $signal_options -errorcode] ne {B82FAIL 78}",
             '$signal_message ne "child-wait-status"',
@@ -4778,7 +4931,7 @@ def main() -> None:
     )
     expected_spawns_start = lineage_output_case.index("set expected_spawns [list")
     expected_spawns_end = lineage_output_case.index(
-        "        if {[lindex $boot_result", expected_spawns_start
+        "        if {[lrange $child_nonzero", expected_spawns_start
     )
     expected_spawns_oracle = lineage_output_case[
         expected_spawns_start:expected_spawns_end
@@ -4786,9 +4939,15 @@ def main() -> None:
     ordered(
         expected_spawns_oracle,
         (
-            '[list -noecho /usr/bin/printf "%s\\r\\n" $boot_id]',
-            '[list -noecho /usr/bin/printf "boot_id\\t%s\\r\\n" $boot_id]',
-            '[list -noecho /usr/bin/printf "%s\\r\\n" "${boot_id}x"]',
+            "[list -noecho /usr/bin/expect -c $boot_no_prompt_child]",
+            "[list -noecho /usr/bin/expect -c $lock_no_prompt_child]",
+            "[list -noecho /usr/bin/expect -c $boot_one_prompt_child]",
+            "[list -noecho /usr/bin/expect -c $lock_one_prompt_child]",
+            "[list -noecho /usr/bin/expect -c $boot_two_coalesced_child]",
+            "[list -noecho /usr/bin/expect -c $lock_two_separated_child]",
+            "[list -noecho /usr/bin/expect -c $boot_one_frameless_child]",
+            "[list -noecho /usr/bin/expect -c $boot_one_overcount_child]",
+            '[list -noecho /usr/bin/printf "%s\\r\\r\\r\\n" $boot_id]',
             '[list -noecho /usr/bin/printf "%s\\r\\n"',
             '"01234567-89ab-cdef\\r-0123-456789abcdef"]',
             '[list -noecho /usr/bin/printf "%s\\r\\n%s\\r\\n" $boot_id extra]',
@@ -4797,10 +4956,13 @@ def main() -> None:
             "[list -noecho /usr/bin/python3 -B -I -c",
             "{import os, signal; os.kill(os.getpid(), signal.SIGTERM)}]",
         ),
-        "hermetic independent exact seven-child spawn oracle",
+        "hermetic independent exact thirteen-child spawn oracle",
     )
     if (
-        expected_spawns_oracle.count("[list -noecho ") != 7
+        expected_spawns_oracle.count("[list -noecho ") != 13
+        or expected_spawns_oracle.count("/usr/bin/expect -c") != 8
+        or expected_spawns_oracle.count("/usr/bin/printf") != 3
+        or expected_spawns_oracle.count("/usr/bin/python3 -B -I -c") != 2
         or any(
             executable in expected_spawns_oracle
             for executable in (
@@ -4811,29 +4973,61 @@ def main() -> None:
             )
         )
     ):
-        fail("hermetic PTY child oracle is not exactly seven local processes")
+        fail("hermetic PTY child oracle is not exactly thirteen local processes")
     matrix_sections = {
-        "boot_positive": ("lf", "crlf", "crcrlf"),
-        "lock_positive": ("lf", "crlf", "crcrlf"),
+        "boot_positive": (
+            ("no-leading-lf", "0", '"${boot_id}\\n"'),
+            ("no-leading-crlf", "0", '"${boot_id}\\r\\n"'),
+            ("no-leading-crcrlf", "0", '"${boot_id}\\r\\r\\n"'),
+            ("no-leading-crcrcrlf", "0", '"${boot_id}\\r\\r\\r\\n"'),
+            ("one-leading-lf-tail-lf", "1", '"\\n${boot_id}\\n"'),
+            ("one-leading-lf-tail-crlf", "1", '"\\n${boot_id}\\r\\n"'),
+            ("one-leading-lf-tail-crcrlf", "1", '"\\n${boot_id}\\r\\r\\n"'),
+            ("one-leading-lf-tail-crcrcrlf", "1", '"\\n${boot_id}\\r\\r\\r\\n"'),
+            ("one-prompt-frameless", "1", '"${boot_id}\\r\\r\\r\\n"'),
+            ("two-prompts-frameless", "2", '"${boot_id}\\r\\r\\r\\n"'),
+            ("two-prompts-coalesced", "2", '"\\n${boot_id}\\r\\r\\r\\n"'),
+            ("two-prompts-separated", "2", '"\\n\\n${boot_id}\\r\\r\\r\\n"'),
+        ),
+        "lock_positive": (
+            ("no-leading-lf", "0", '"boot_id\\t${boot_id}\\n"'),
+            ("no-leading-crlf", "0", '"boot_id\\t${boot_id}\\r\\n"'),
+            ("no-leading-crcrlf", "0", '"boot_id\\t${boot_id}\\r\\r\\n"'),
+            ("no-leading-crcrcrlf", "0", '"boot_id\\t${boot_id}\\r\\r\\r\\n"'),
+            ("one-leading-lf-tail-lf", "1", '"\\nboot_id\\t${boot_id}\\n"'),
+            ("one-leading-lf-tail-crlf", "1", '"\\nboot_id\\t${boot_id}\\r\\n"'),
+            ("one-leading-lf-tail-crcrlf", "1", '"\\nboot_id\\t${boot_id}\\r\\r\\n"'),
+            ("one-leading-lf-tail-crcrcrlf", "1", '"\\nboot_id\\t${boot_id}\\r\\r\\r\\n"'),
+            ("one-prompt-frameless", "1", '"boot_id\\t${boot_id}\\r\\r\\r\\n"'),
+            ("two-prompts-frameless", "2", '"boot_id\\t${boot_id}\\r\\r\\r\\n"'),
+            ("two-prompts-coalesced", "2", '"\\nboot_id\\t${boot_id}\\r\\r\\r\\n"'),
+            ("two-prompts-separated", "2", '"\\n\\nboot_id\\t${boot_id}\\r\\r\\r\\n"'),
+        ),
         "boot_negative": (
-            "embedded-cr",
-            "triple-cr",
-            "extra-line",
-            "missing-newline",
-            "extra-final-newline",
-            "wrong-uuid",
+            ("sends-zero-one-leading", "0", '"\\n${boot_id}\\n"'),
+            ("sends-one-two-leading", "1", '"\\n\\n${boot_id}\\n"'),
+            ("sends-two-three-leading", "2", '"\\n\\n\\n${boot_id}\\n"'),
+            ("four-cr-tail", "0", '"${boot_id}\\r\\r\\r\\r\\n"'),
+            ("embedded-cr", "0", '"01234567-89ab-cdef\\r-0123-456789abcdef\\n"'),
+            ("multiline", "0", '"${boot_id}\\nextra\\n"'),
+            ("missing-newline", "0", '"${boot_id}"'),
+            ("extra-final-newline", "0", '"${boot_id}\\n\\n"'),
+            ("wrong-uuid", "0", '"01234567-89ab-cdef-0123-456789abcdeG\\n"'),
         ),
         "lock_negative": (
-            "embedded-cr",
-            "triple-cr",
-            "extra-line",
-            "missing-newline",
-            "extra-final-newline",
-            "wrong-body",
+            ("sends-zero-one-leading", "0", '"\\nboot_id\\t${boot_id}\\n"'),
+            ("sends-one-two-leading", "1", '"\\n\\nboot_id\\t${boot_id}\\n"'),
+            ("sends-two-three-leading", "2", '"\\n\\n\\nboot_id\\t${boot_id}\\n"'),
+            ("four-cr-tail", "0", '"boot_id\\t${boot_id}\\r\\r\\r\\r\\n"'),
+            ("embedded-cr", "0", '"boot_id\\t01234567-89ab-cdef\\r-0123-456789abcdef\\n"'),
+            ("multiline", "0", '"boot_id\\t${boot_id}\\nextra\\n"'),
+            ("missing-newline", "0", '"boot_id\\t${boot_id}"'),
+            ("extra-final-newline", "0", '"boot_id\\t${boot_id}\\n\\n"'),
+            ("wrong-body", "0", '"boot_id\\t11234567-89ab-cdef-0123-456789abcdef\\n"'),
         ),
     }
     matrix_names = tuple(matrix_sections)
-    for index, (matrix_name, expected_labels) in enumerate(matrix_sections.items()):
+    for index, (matrix_name, expected_entries) in enumerate(matrix_sections.items()):
         section_start = lineage_output_case.index(f"set {matrix_name} [list")
         section_end = lineage_output_case.index(
             f"set {matrix_names[index + 1]} [list",
@@ -4841,24 +5035,103 @@ def main() -> None:
         ) if index + 1 < len(matrix_names) else lineage_output_case.index(
             "foreach test_case $boot_positive", section_start
         )
-        labels = tuple(
-            re.findall(r"\[list ([a-z][a-z-]+) ", lineage_output_case[section_start:section_end])
+        matrix_body = re.sub(
+            r"\\\n\s*", " ", lineage_output_case[section_start:section_end]
         )
-        if labels != expected_labels:
+        entries = tuple(
+            re.findall(
+                r'\[list\s+([a-z][a-z-]+)\s+([0-2])\s+'
+                r'("(?:[^"\\]|\\.)*")\]',
+                matrix_body,
+            )
+        )
+        if entries != expected_entries:
             fail(f"hermetic line-ending matrix is not literal and exact: {matrix_name}")
+    flat_lineage_output = re.sub(r"\\\n\s*", " ", lineage_output_case)
+    flat_lineage_output = re.sub(r"\s+", " ", flat_lineage_output)
+    relay_assignments = tuple(
+        re.findall(
+            r'(?ms)^\s*set ([a-z_]+_child) \\\n+\s*\[line_ending_relay_script (\$boot_id|"boot_id\\t\$\{boot_id\}") '
+            r'([0-2]) (none|frameless|coalesced|separated|overcount)\]',
+            lineage_output_case,
+        )
+    )
+    if relay_assignments != (
+        ("boot_no_prompt_child", "$boot_id", "0", "none"),
+        ("lock_no_prompt_child", '"boot_id\\t${boot_id}"', "0", "none"),
+        ("boot_one_prompt_child", "$boot_id", "1", "separated"),
+        ("lock_one_prompt_child", '"boot_id\\t${boot_id}"', "1", "separated"),
+        ("boot_two_coalesced_child", "$boot_id", "2", "coalesced"),
+        ("lock_two_separated_child", '"boot_id\\t${boot_id}"', "2", "separated"),
+        ("boot_one_frameless_child", "$boot_id", "1", "frameless"),
+        ("boot_one_overcount_child", "$boot_id", "1", "overcount"),
+    ):
+        fail("hermetic prompt relay child assignments are not the exact eight cases")
+    positive_execute_specs = tuple(
+        re.findall(
+            r'set ([a-z_]+_result|boot_result|lock_result) '
+            r'\[execute_operation_spec\s+([a-z0-9-]+)\s+'
+            r'\[list local\s+\[list /usr/bin/expect -c \$([a-z_]+_child)\]\s+'
+            r'([0-2]) (boot-uuid-line|\$lock_assertion) 10\]\s+'
+            r'(""|fixture-password)\]',
+            flat_lineage_output,
+        )
+    )
+    if positive_execute_specs != (
+        ("boot_result", "line-ending-boot-pty", "boot_no_prompt_child", "0", "boot-uuid-line", '""'),
+        ("lock_result", "line-ending-lock-pty", "lock_no_prompt_child", "0", "$lock_assertion", '""'),
+        ("boot_one_prompt_result", "line-ending-boot-one-prompt-pty", "boot_one_prompt_child", "1", "boot-uuid-line", "fixture-password"),
+        ("lock_one_prompt_result", "line-ending-lock-one-prompt-pty", "lock_one_prompt_child", "1", "$lock_assertion", "fixture-password"),
+        ("boot_two_coalesced_result", "line-ending-boot-two-coalesced-pty", "boot_two_coalesced_child", "2", "boot-uuid-line", "fixture-password"),
+        ("lock_two_separated_result", "line-ending-lock-two-separated-pty", "lock_two_separated_child", "2", "$lock_assertion", "fixture-password"),
+        ("boot_one_frameless_result", "line-ending-boot-one-frameless-pty", "boot_one_frameless_child", "1", "boot-uuid-line", "fixture-password"),
+    ):
+        fail("hermetic prompt framing positive execute specs are not exact")
+    actual_payloads = tuple(
+        re.findall(
+            r'line_ending_require_result ([a-z-]+)\s+'
+            r'\$([a-z_]+_result|boot_result|lock_result)\s+'
+            r'("(?:[^"\\]|\\.)*")',
+            flat_lineage_output,
+        )
+    )
+    if actual_payloads != (
+        ("boot-no-prompt", "boot_result", '"${boot_id}\\r\\r\\r\\n"'),
+        ("lock-no-prompt", "lock_result", '"boot_id\\t${boot_id}\\r\\r\\r\\n"'),
+        ("boot-one-prompt", "boot_one_prompt_result", '"\\r\\n${boot_id}\\r\\r\\r\\n"'),
+        ("lock-one-prompt", "lock_one_prompt_result", '"\\r\\nboot_id\\t${boot_id}\\r\\r\\r\\n"'),
+        ("boot-two-coalesced", "boot_two_coalesced_result", '"\\r\\n${boot_id}\\r\\r\\r\\n"'),
+        ("lock-two-separated", "lock_two_separated_result", '"\\r\\n\\r\\nboot_id\\t${boot_id}\\r\\r\\r\\n"'),
+        ("boot-one-frameless", "boot_one_frameless_result", '"${boot_id}\\r\\r\\r\\n"'),
+    ):
+        fail("hermetic prompt framing actual raw payloads are not exact")
+    exact_stop_specs = (
+        "line_ending_execute_expect_stop prompt-one-overcount [list /usr/bin/expect -c $boot_one_overcount_child] 1 boot-uuid-line fixture-password",
+        'line_ending_execute_expect_stop invalid-four-cr [list /usr/bin/printf "%s\\r\\r\\r\\n" $boot_id] 0 boot-uuid-line ""',
+        'line_ending_execute_expect_stop invalid-embedded-cr [list /usr/bin/printf "%s\\r\\n" "01234567-89ab-cdef\\r-0123-456789abcdef"] 0 boot-uuid-line ""',
+        'line_ending_execute_expect_stop invalid-multiline [list /usr/bin/printf "%s\\r\\n%s\\r\\n" $boot_id extra] 0 boot-uuid-line ""',
+    )
+    if any(flat_lineage_output.count(spec) != 1 for spec in exact_stop_specs):
+        fail("hermetic prompt framing stop specs are not the exact four cases")
     if (
-        lineage_output_case.count("assert_output $assertion $payload") != 1
-        or lineage_output_case.count("execute_operation_spec") != 5
+        lineage_output_case.count(
+            "assert_output $assertion $payload $credential_sends"
+        )
+        != 1
+        or lineage_output_case.count("execute_operation_spec") != 10
         or lineage_output_case.count("line_ending_execute_expect_stop invalid-") != 3
+        or lineage_output_case.count("line_ending_execute_expect_stop prompt-") != 1
         or lineage_output_case.count("foreach test_case $") != 4
         or lineage_output_case.count("{B82FAIL 78}") != 3
-        or lineage_output_case.count("/usr/bin/printf") != 10
+        or lineage_output_case.count("/usr/bin/printf") != 7
+        or lineage_output_case.count("/usr/bin/expect -c") != 17
         or lineage_output_case.count("/usr/bin/python3 -B -I -c") != 4
         or lineage_output_case.count("line-ending-credential-read") != 1
         or lineage_output_case.count("incr ::credential_reads") != 1
         or lineage_output_case.count("$::credential_reads != 0") != 1
         or lineage_output_case.count("string map") != 0
         or lineage_output_case.count("output_value") != 0
+        or lineage_output_case.count("strict_single_line_body") != 0
         or lineage_output_case.count(lineage_output_marker) != 1
         or lineage_output_case.count(line_ending_marker) != 1
     ):
