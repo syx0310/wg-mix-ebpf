@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import pathlib
 import re
 import sys
@@ -91,6 +92,24 @@ def python_string_tuple(payload: str, name: str) -> tuple[str, ...]:
     return value
 
 
+def bash_function_until(payload: str, name: str, next_name: str) -> str:
+    start_marker = f"{name}() {{\n"
+    end_marker = f"\n\n{next_name}() {{\n"
+    if payload.count(start_marker) != 1 or payload.count(end_marker) != 1:
+        fail(f"cannot isolate Bash function {name} before {next_name}")
+    start = payload.index(start_marker) + len(start_marker)
+    end = payload.index(end_marker, start)
+    body = payload[start:end]
+    closing = re.search(r"\n}\n?$", body)
+    if not closing:
+        fail(f"Bash function {name} has no exact closing brace before {next_name}")
+    return body[: closing.start()]
+
+
+def ordered_unique(values: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(values))
+
+
 def tcl_return_words(payload: str, name: str) -> tuple[str, ...]:
     match = re.search(
         rf"(?ms)^proc {re.escape(name)} \{{[^\n]*\}} \{{\s*return \{{(.*?)\}}\s*\}}\n",
@@ -101,6 +120,18 @@ def tcl_return_words(payload: str, name: str) -> tuple[str, ...]:
     return tuple(match.group(1).split())
 
 
+def tcl_literal_return_words(payload: str, name: str) -> tuple[str, ...]:
+    """Return a Tcl proc's sole literal list, permitting only comments around it."""
+    body = tcl_proc(payload, name)
+    uncommented = "\n".join(
+        line for line in body.splitlines() if not line.lstrip().startswith("#")
+    ).strip()
+    match = re.fullmatch(r"return \{(?P<body>.*)\}", uncommented, re.DOTALL)
+    if not match:
+        fail(f"Tcl procedure {name} is not a sole fixed literal list")
+    return tuple(match.group("body").split())
+
+
 def ordered(body: str, literals: tuple[str, ...], contract: str) -> None:
     remaining = body
     for literal in literals:
@@ -108,6 +139,250 @@ def ordered(body: str, literals: tuple[str, ...], contract: str) -> None:
         if position < 0:
             fail(f"{contract} is missing ordered literal {literal!r}")
         remaining = remaining[position + len(literal) :]
+
+
+def validate_engine_harness_execution_ast(payload: str) -> None:
+    """Bind the actual engine child dispatch, output oracle and rc controls."""
+    try:
+        tree = ast.parse(payload)
+    except SyntaxError as exc:
+        fail(f"hermetic R2 engine harness is not valid Python: {exc}")
+
+    def one_function(name: str) -> ast.FunctionDef:
+        matches = [
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == name
+        ]
+        if len(matches) != 1:
+            fail(f"hermetic R2 engine harness function is not unique: {name}")
+        return matches[0]
+
+    def dump_expression(source: str) -> str:
+        return ast.dump(
+            ast.parse(source, mode="eval").body, include_attributes=False
+        )
+
+    module_main_calls = [
+        node
+        for node in tree.body
+        if isinstance(node, ast.Expr)
+        and isinstance(node.value, ast.Call)
+        and isinstance(node.value.func, ast.Name)
+        and node.value.func.id == "main"
+    ]
+    if (
+        len(module_main_calls) != 1
+        or tree.body[-1] is not module_main_calls[0]
+        or module_main_calls[0].value.args
+        or module_main_calls[0].value.keywords
+    ):
+        fail("hermetic R2 engine harness does not end in one direct main() dispatch")
+
+    main_node = one_function("main")
+    if (
+        len(main_node.body) != 3
+        or not isinstance(main_node.body[0], ast.If)
+        or not isinstance(main_node.body[1], ast.If)
+        or not isinstance(main_node.body[2], ast.Expr)
+    ):
+        fail("hermetic R2 engine harness main dispatch shape drifted")
+    child_branch = main_node.body[0]
+    if ast.dump(child_branch.test, include_attributes=False) != dump_expression(
+        'len(sys.argv) >= 2 and sys.argv[1] == "child"'
+    ) or tuple(type(node) for node in child_branch.body) != (
+        ast.If,
+        ast.Assign,
+        ast.Assign,
+        ast.Assign,
+        ast.Assign,
+        ast.If,
+        ast.Assign,
+        ast.Expr,
+        ast.Return,
+    ):
+        fail("hermetic R2 engine child branch is not exact and reachable")
+    expected_child_argc_gate = ast.parse(
+        "if len(sys.argv) != 12:\n"
+        "    raise SystemExit(64)\n"
+    ).body[0]
+    expected_child_cut_gate = ast.parse(
+        "if (expected_renames < -1 or expected_renames > 4 or\n"
+        "        cut_call not in {0, 1, 2, 3, 4} or\n"
+        "        cut_phase not in {'none', 'pre', 'post'} or\n"
+        "        cut_kind not in {'none', 'exit91', 'sigterm'} or\n"
+        "        ((cut_call == 0) != (cut_phase == 'none')) or\n"
+        "        ((cut_call == 0) != (cut_kind == 'none'))):\n"
+        "    raise SystemExit(64)\n"
+    ).body[0]
+    if (
+        ast.dump(child_branch.body[0], include_attributes=False)
+        != ast.dump(expected_child_argc_gate, include_attributes=False)
+        or ast.dump(child_branch.body[5], include_attributes=False)
+        != ast.dump(expected_child_cut_gate, include_attributes=False)
+    ):
+        fail("hermetic R2 engine child argc/cut coupling gates are not exact")
+    expected_child_bindings = (
+        "expected_renames = int(sys.argv[8])",
+        "cut_call = int(sys.argv[9])",
+        "cut_phase = sys.argv[10]",
+        "cut_kind = sys.argv[11]",
+        "manifest_sha = digest(sys.argv[3])",
+    )
+    actual_child_bindings = (
+        *child_branch.body[1:5],
+        child_branch.body[6],
+    )
+    if tuple(
+        ast.dump(node, include_attributes=False) for node in actual_child_bindings
+    ) != tuple(
+        ast.dump(ast.parse(source).body[0], include_attributes=False)
+        for source in expected_child_bindings
+    ):
+        fail("hermetic R2 engine child argv bindings drifted")
+    child_call_statement = child_branch.body[-2]
+    expected_child_call = dump_expression(
+        "execute_engine_child(sys.argv[2], sys.argv[6], sys.argv[7], "
+        "manifest_sha, expected_renames, cut_call, cut_phase, cut_kind)"
+    )
+    if (
+        not isinstance(child_call_statement, ast.Expr)
+        or ast.dump(child_call_statement.value, include_attributes=False)
+        != expected_child_call
+        or not isinstance(child_branch.body[-1], ast.Return)
+        or child_branch.body[-1].value is not None
+    ):
+        fail("hermetic R2 engine child branch omits actual execute_engine_child")
+    execute_child_calls = [
+        node
+        for node in ast.walk(main_node)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "execute_engine_child"
+    ]
+    driver_calls = [
+        node
+        for node in ast.walk(main_node)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "driver"
+    ]
+    expected_nonchild_argc_gate = ast.parse(
+        "if len(sys.argv) != 6:\n"
+        "    raise SystemExit(64)\n"
+    ).body[0]
+    if (
+        len(execute_child_calls) != 1
+        or len(driver_calls) != 1
+        or ast.dump(main_node.body[1], include_attributes=False)
+        != ast.dump(expected_nonchild_argc_gate, include_attributes=False)
+        or ast.dump(driver_calls[0], include_attributes=False)
+        != dump_expression(
+            "driver(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], "
+            "sys.argv[5])"
+        )
+        or main_node.body[2].value is not driver_calls[0]
+    ):
+        fail("hermetic R2 engine main child/non-child dispatch is not exact")
+
+    exact_line_node = one_function("exact_line")
+    expected_exact_line = ast.parse(
+        "def exact_line(output, expected):\n"
+        "    if output.splitlines().count(expected) != 1:\n"
+        "        raise AssertionError(\"exact-output-line:%s:%s\" % "
+        "(expected, output))\n"
+    ).body[0]
+    if ast.dump(exact_line_node, include_attributes=False) != ast.dump(
+        expected_exact_line, include_attributes=False
+    ):
+        fail("hermetic R2 engine exact_line is not a real exact-once assertion")
+
+    driver_node = one_function("driver")
+    actual_exact_calls = sorted(
+        (
+            node
+            for node in ast.walk(driver_node)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "exact_line"
+        ),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+    expected_exact_calls = (
+        "exact_line(result.stdout, "
+        "'B82_V6_RETIREMENT_COMPLETE state=T disposition=advanced "
+        "namespace_writes=6 same_boot=1')",
+        "exact_line(verify.stdout, "
+        "'B82_V6_RETIREMENT_VERIFIED state=T namespace_writes=0 same_boot=1 "
+        "receipt=' + PATHS['receipt_final'])",
+        "exact_line(resumed.stdout, "
+        "'B82_V6_RETIREMENT_COMPLETE state=T disposition=verified-existing "
+        "namespace_writes=0 same_boot=1')",
+        "exact_line(resumed.stdout, "
+        "'B82_V6_RETIREMENT_COMPLETE state=T disposition=advanced "
+        "namespace_writes=%s same_boot=1' % resume_writes)",
+        "exact_line(verified.stdout, "
+        "'B82_V6_RETIREMENT_VERIFIED state=T namespace_writes=0 same_boot=1 "
+        "receipt=' + PATHS['receipt_final'])",
+        "exact_line(failed.stdout, "
+        "'B82_V6_RETIREMENT_ENGINE_STOP reason=%s rc=79 cleanup=0 retained=1' "
+        "% reason)",
+    )
+    if tuple(
+        ast.dump(node, include_attributes=False) for node in actual_exact_calls
+    ) != tuple(dump_expression(source) for source in expected_exact_calls):
+        fail("hermetic R2 engine driver does not route six outputs through exact_line")
+
+    returncode_ifs = sorted(
+        (
+            node
+            for node in ast.walk(driver_node)
+            if isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.Attribute) and child.attr == "returncode"
+                for child in ast.walk(node.test)
+            )
+        ),
+        key=lambda node: (node.lineno, node.col_offset),
+    )
+    expected_returncode_tests = (
+        "result.returncode != 0",
+        "verify.returncode != 0",
+        "interrupted.returncode != expected_rc",
+        "resumed.returncode != 0",
+        "verified.returncode != 0",
+        "failed.returncode != 79 or elapsed >= 5.0",
+    )
+    if (
+        tuple(
+            ast.dump(node.test, include_attributes=False)
+            for node in returncode_ifs
+        )
+        != tuple(dump_expression(source) for source in expected_returncode_tests)
+        or any(
+            len(node.body) != 1
+            or not isinstance(node.body[0], ast.Raise)
+            or node.orelse
+            for node in returncode_ifs
+        )
+    ):
+        fail("hermetic R2 engine returncode results are not six direct fail-closed gates")
+
+    run_process_node = one_function("run_engine_process")
+    execute_child_node = one_function("execute_engine_child")
+    run_returns = [
+        node for node in ast.walk(run_process_node) if isinstance(node, ast.Return)
+    ]
+    if (
+        tuple(type(node) for node in run_process_node.body) != (ast.Assign, ast.Try)
+        or len(run_returns) != 1
+        or not run_process_node.body[1].body
+        or run_process_node.body[1].body[0] is not run_returns[0]
+        or any(isinstance(node, ast.Return) for node in ast.walk(execute_child_node))
+        or tuple(type(node) for node in execute_child_node.body)
+        != (ast.Assign, ast.Assign, ast.Assign, ast.Expr, ast.If, ast.Expr)
+    ):
+        fail("hermetic R2 engine process/child execution contains an early return")
 
 
 def manifest_reader_keys(payload: str, function_name: str) -> tuple[str, ...]:
@@ -164,6 +439,334 @@ def main() -> None:
     retained_retirement_receipt_sha = (
         "4c3e9bfd3d4e64f6626abaa43e20cf5e4df6b193395cee6a39953b1c4da7d188"
     )
+    r2_predecessor_commit = "f75fe7678cfdecf08173fd201be5c055417d6e11"
+    r2_predecessor_manifest_sha = (
+        "2d6c6caac080b599fbfa0f73c64f6976cf30d1504fc506ebd39c638b2f9449e3"
+    )
+    r2_predecessor_bundle_sha = (
+        "b74811808e0413714dcf20b8292fe68631f603c0b9a68bc9951af481477b413b"
+    )
+    r2_predecessor_package = (
+        "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-f75fe7678cfd"
+    )
+    r2_predecessor_remote_package = (
+        "/home/siyixuan/wg-mix-ebpf-test/unpriv-4f2a9b61"
+    )
+    r2_predecessor_bootstrap = "/run/wg-mix-ebpf-source-bootstrap-c8e41d73"
+    r2_retire_id = "c8e41d73-f75fe7678cfd-r2"
+    r2_user_intake = (
+        "/home/siyixuan/wg-mix-ebpf-test/"
+        "retire-postflight-c8e41d73-f75fe7678cfd-r2.intake"
+    )
+    r2_home_qroot = "/home/.wg-mix-ebpf-retirement-c8e41d73-f75fe7678cfd-r2"
+    r2_run_qroot = "/run/wg-mix-ebpf-retirement-c8e41d73-f75fe7678cfd-r2"
+    r2_predecessor_package_contract = (
+        ("source-4f2a9b61.bundle", r2_predecessor_bundle_sha, 2469874),
+        ("package-manifest.v1", r2_predecessor_manifest_sha, 7315),
+        ("bind-final-package.sh", "a808a7879ef64190eff9e81e6b694acea7bc04b1b74ffad44109b237a5eb14ca", 17015),
+        ("controller.sh", "fb8a7a685b5a6b73de851ee9a3396f4154cc4ae083a7c36f3b3128b2b9a2e77d", 43303),
+        ("prepare-stage-root.sh", "1bcb8db91d976d2a1d95f7d87223a2dac4a1678f74c1c25542e54b01ee10eeea", 54230),
+        ("provision-ubuntu-test-host.sh", "078d191b0edbafe27e9f684d3fa495e04d7217a01d0ec1fd32eaede211178c8f", 19437),
+        ("root-matrix-n-r.sh", "9ec125c2933866431779b760d41c6484cc0fbb9e5e9f3b5431c4a56fbab63e07", 1101),
+        ("check-realhost-iperf.py", "9a52378b8a1ef6043d4d5792471c8239a0392a80da72f5c00846dd89e88ccd67", 21027),
+        ("test-hermetic-matrix.sh", "9b81949416a1b4df91fee0e7d31a3de2c6ba9b474dc9c0f4dbbb1cc609207499", 6694),
+        ("test_matrix_static.py", "8de2dcdc866938da0502f1ad73ac9b38c9b6ff4066c76e9cbc946c9ca30a53f8", 5656),
+        ("checksum-module-lease.sh", "4ab9a22910e8d597cc04bb4fdde9e1b32d37a1bb2c6ad7b76f52d576b5a9adb2", 23755),
+        ("root-fresh-verifier-gate.sh", "4c2cf85b7e571df9b7ed4a77fa720c9f5e35950d44af5a39499a7ad700fe6a27", 65201),
+        ("test-hermetic-fresh-verifier-gate.sh", "c9b5b1f954c794c5c986214777727a76579f670db9587f319ac148fc0c2a05f3", 14628),
+        ("test_fresh_verifier_gate_static.py", "ace6951027788e82ad879caf285316af4e6ee81fdb6746f569cd7c22b9f80bf3", 17307),
+        ("realnic_acceptance.py", "a88100b2a23ad41dd3e644c3ba1c7a722d58c8184a997aabf0ceab78552c6339", 216405),
+        ("test_realnic_acceptance.py", "fcb3d0dadee6da6e0ad67d028f268ebe43575287f555cd8100d279f8a3b0b79c", 148160),
+        ("test_realnic_acceptance_static.py", "ba8aef3219a0cf2a5c6b5058b245f64eb828a08bb532d2aa0291f51ee7206ad2", 14894),
+    )
+    r2_predecessor_package_names = tuple(
+        item[0] for item in r2_predecessor_package_contract
+    )
+    if len(r2_predecessor_package_names) != 17:
+        fail("test R2 predecessor package oracle is not the fixed 17-file tuple")
+    r2_authority_phases = (
+        "absent",
+        "home-qroot",
+        "auth-root",
+        "run-qroot",
+        "manifest-pending",
+        "manifest-pair",
+        "self-pending",
+        "complete",
+    )
+    r2_stale_operations = (
+        "stale-alternate-bootstrap-root",
+        "stale-stage-root",
+        "stale-fresh-root",
+        "stale-standalone-root",
+        "stale-routed-evidence-root",
+        "stale-realnic-run-roots",
+        "stale-realnic-interface-leases",
+        "stale-veth-wgc8e41a",
+        "stale-veth-wgc8e41b",
+        "stale-veth-wga19f7a",
+        "stale-veth-wga19f7b",
+        "stale-veth-wg5b8d3a",
+        "stale-veth-wg5b8d3b",
+        "stale-pin-fresh",
+        "stale-pin-standalone",
+        "stale-pin-legacy-tcx",
+        "stale-pin-legacy-nic-original",
+        "stale-pin-legacy-nic-all-on",
+        "stale-pin-legacy-nic-all-off",
+        "stale-pin-legacy-nic-tx-path",
+        "stale-pin-legacy-nic-rx-path",
+        "stale-pin-legacy-nic-mtu1492",
+        "stale-pin-legacy-nic-mtu1500",
+        "stale-pin-legacy-nic-soak",
+        "stale-checksum-module",
+        "stale-checksum-module-btf",
+        "stale-checksum-module-lock",
+        "stale-physical-interface-lock",
+    )
+    r2_raw_operations = (
+        "r2-raw-intake-mkdir",
+        "r2-raw-scp-manifest",
+        "r2-raw-scp-self",
+        "r2-raw-sync-intake-manifest",
+        "r2-raw-sync-intake-self",
+        "r2-raw-sync-intake-directory",
+        "r2-raw-sync-intake-parent",
+        "r2-raw-home-qroot-create",
+        "r2-raw-auth-root-create",
+        "r2-raw-run-qroot-create",
+        "r2-raw-auth-manifest-install",
+        "r2-raw-auth-self-install",
+        "r2-raw-sync-auth-manifest-pending",
+        "r2-raw-sync-auth-self-pending",
+        "r2-raw-link-auth-manifest",
+        "r2-raw-link-auth-self",
+        "r2-raw-sync-auth-root",
+        "r2-raw-sync-home-parent",
+        "r2-raw-sync-home-qroot",
+        "r2-raw-sync-run-parent",
+        "r2-raw-helper-mutate",
+    )
+    r2_ro_operations = (
+        "r2-ro-exists-home-qroot",
+        "r2-ro-exists-auth-root",
+        "r2-ro-exists-run-qroot",
+        "r2-ro-exists-auth-manifest-pending",
+        "r2-ro-exists-auth-manifest",
+        "r2-ro-exists-auth-self-pending",
+        "r2-ro-exists-auth-self",
+        "r2-ro-exists-quarantine-intake",
+        "r2-ro-exists-quarantine-package",
+        "r2-ro-exists-quarantine-bootstrap",
+        "r2-ro-exists-lock",
+        "r2-ro-exists-receipt-pending",
+        "r2-ro-exists-receipt-final",
+        "r2-ro-old-package-sha-source-4f2a9b61.bundle",
+        "r2-ro-old-package-stat-source-4f2a9b61.bundle",
+        "r2-ro-old-package-sha-package-manifest.v1",
+        "r2-ro-old-package-stat-package-manifest.v1",
+        "r2-ro-old-package-sha-bind-final-package.sh",
+        "r2-ro-old-package-stat-bind-final-package.sh",
+        "r2-ro-old-package-sha-controller.sh",
+        "r2-ro-old-package-stat-controller.sh",
+        "r2-ro-old-package-sha-prepare-stage-root.sh",
+        "r2-ro-old-package-stat-prepare-stage-root.sh",
+        "r2-ro-old-package-sha-provision-ubuntu-test-host.sh",
+        "r2-ro-old-package-stat-provision-ubuntu-test-host.sh",
+        "r2-ro-old-package-sha-root-matrix-n-r.sh",
+        "r2-ro-old-package-stat-root-matrix-n-r.sh",
+        "r2-ro-old-package-sha-check-realhost-iperf.py",
+        "r2-ro-old-package-stat-check-realhost-iperf.py",
+        "r2-ro-old-package-sha-test-hermetic-matrix.sh",
+        "r2-ro-old-package-stat-test-hermetic-matrix.sh",
+        "r2-ro-old-package-sha-test_matrix_static.py",
+        "r2-ro-old-package-stat-test_matrix_static.py",
+        "r2-ro-old-package-sha-checksum-module-lease.sh",
+        "r2-ro-old-package-stat-checksum-module-lease.sh",
+        "r2-ro-old-package-sha-root-fresh-verifier-gate.sh",
+        "r2-ro-old-package-stat-root-fresh-verifier-gate.sh",
+        "r2-ro-old-package-sha-test-hermetic-fresh-verifier-gate.sh",
+        "r2-ro-old-package-stat-test-hermetic-fresh-verifier-gate.sh",
+        "r2-ro-old-package-sha-test_fresh_verifier_gate_static.py",
+        "r2-ro-old-package-stat-test_fresh_verifier_gate_static.py",
+        "r2-ro-old-package-sha-realnic_acceptance.py",
+        "r2-ro-old-package-stat-realnic_acceptance.py",
+        "r2-ro-old-package-sha-test_realnic_acceptance.py",
+        "r2-ro-old-package-stat-test_realnic_acceptance.py",
+        "r2-ro-old-package-sha-test_realnic_acceptance_static.py",
+        "r2-ro-old-package-stat-test_realnic_acceptance_static.py",
+        "r2-ro-user-intake-exists",
+        "r2-ro-old-package-readlink",
+        "r2-ro-old-package-stat",
+        "r2-ro-old-package-entries",
+        "r2-ro-old-bootstrap-root-readlink",
+        "r2-ro-old-bootstrap-root-stat",
+        "r2-ro-old-bootstrap-provisioner-readlink",
+        "r2-ro-old-bootstrap-provisioner-stat",
+        "r2-ro-old-bootstrap-provisioner-sha",
+        "r2-ro-old-bootstrap-stager-readlink",
+        "r2-ro-old-bootstrap-stager-stat",
+        "r2-ro-old-bootstrap-stager-sha",
+        "r2-ro-old-bootstrap-entries",
+        "r2-ro-old-provision-check",
+        "r2-ro-intake-readlink",
+        "r2-ro-intake-stat",
+        "r2-ro-intake-entries",
+        "r2-ro-intake-manifest-stat",
+        "r2-ro-intake-manifest-shape",
+        "r2-ro-intake-manifest-sha",
+        "r2-ro-intake-manifest-sha-observe",
+        "r2-ro-intake-self-stat",
+        "r2-ro-intake-self-shape",
+        "r2-ro-intake-self-sha",
+        "r2-ro-intake-self-sha-observe",
+        "r2-ro-home-qroot-readlink",
+        "r2-ro-home-qroot-stat",
+        "r2-ro-home-qroot-entries",
+        "r2-ro-auth-root-readlink",
+        "r2-ro-auth-root-stat",
+        "r2-ro-auth-root-entries",
+        "r2-ro-run-qroot-readlink",
+        "r2-ro-run-qroot-stat",
+        "r2-ro-run-qroot-entries",
+        "r2-ro-auth-manifest-pending-shape",
+        "r2-ro-auth-self-pending-shape",
+        "r2-ro-auth-manifest-pending-sha-observe",
+        "r2-ro-auth-self-pending-sha-observe",
+        "r2-ro-auth-manifest-pending-sha",
+        "r2-ro-auth-manifest-sha",
+        "r2-ro-auth-manifest-pending-stat",
+        "r2-ro-auth-manifest-stat",
+        "r2-ro-auth-manifest-pair",
+        "r2-ro-auth-self-pending-sha",
+        "r2-ro-auth-self-sha",
+        "r2-ro-auth-self-pending-stat",
+        "r2-ro-auth-self-stat",
+        "r2-ro-auth-self-pair",
+        "r2-ro-helper-verify",
+    )
+    if (
+        len(r2_raw_operations) != 21
+        or len(set(r2_raw_operations)) != 21
+        or len(r2_ro_operations) != 96
+        or len(set(r2_ro_operations)) != 96
+    ):
+        fail("test R2 private operation oracle cardinality drifted")
+    r2_predecessor_manifest_lines = (
+        "format\twg-mix-ebpf-b82-v6-package-v4",
+        "run_id\tc8e41d73",
+        "package_id\t4f2a9b61",
+        "integration_ref\trefs/heads/codex/tcx-faketcp-final-v2",
+        f"integration_commit\t{r2_predecessor_commit}",
+        "bundle_name\tsource-4f2a9b61.bundle",
+        f"bundle_sha256\t{r2_predecessor_bundle_sha}",
+        "history_verification\tisolated-unbundle-rev-list-fsck-v1",
+        "history_commit_count\t668",
+        "history_roots_sha256\t9356df63b3d4c4c362912b14ab8ee5cb54d12cd1f14be9aa1fe8e18adbad6f05",
+        "history_objects_sha256\t21647f92e57f9dbb8e15707699f632544d6dfcf2e1b4279d775cce1fb82163f3",
+        "wg_state\tabsent",
+        "wg_interface\tabsent",
+        "wg_local_address\tabsent",
+        "wg_peer_address\tabsent",
+        "local_repository\t/Users/siyixuan/codes-2/wg-mix-ebpf/.worktree/tcx-faketcp-final-v2",
+        f"local_package_dir\t{r2_predecessor_package}",
+        f"remote_package_dir\t{r2_predecessor_remote_package}",
+        "remote_source\t/run/wg-mix-ebpf-source-stages/c8e41d73/source",
+        "target_user\tsiyixuan",
+        "target_host\t192.168.10.82",
+        "target_hostname\tubuntu-2604-test",
+        "target_kernel\t7.0.0-28-generic",
+        "target_machine_id\t9db3fb717cc74974b2a6b243d67f67b9",
+        "target_interface\tens33",
+        "peer_address\t47.116.202.155",
+        "peer_port\t5201",
+        "soak_seconds\t3600",
+        "session_seconds\t300",
+        "physical_nic_forward_authority\trealnic-acceptance-v1",
+        "physical_interface_lock\t/run/wg-mix-ebpf-realnic-physical-interface.v1.lock",
+        "legacy_matrix_mode\tretired",
+        "realnic_profile\tacceptance",
+        "realnic_traffic_seconds\t30",
+        "bind_final_package_sh_path\tscripts/realhost-b82-c8e41d73/bind-final-package.sh",
+        "bind_final_package_sh_blob\t13ec99ddafb7452c98f05bf4855ef52c3f54b185",
+        "bind_final_package_sh_sha256\ta808a7879ef64190eff9e81e6b694acea7bc04b1b74ffad44109b237a5eb14ca",
+        "controller_sh_path\tscripts/realhost-b82-c8e41d73/controller.sh",
+        "controller_sh_blob\t8371e5492c4e88f3e855fa3c7edfbff15bcf3a5f",
+        "controller_sh_sha256\tfb8a7a685b5a6b73de851ee9a3396f4154cc4ae083a7c36f3b3128b2b9a2e77d",
+        "locked_transport_exp_path\tscripts/realhost-b82-c8e41d73/locked-transport.exp",
+        "locked_transport_exp_blob\t264f0cf74e6ff53d0cbee2688faa5d886898d22f",
+        "locked_transport_exp_sha256\tc70e4f040dc082c4f286c237bda32fe2a60b3e5f6300ec57734645a0be12abec",
+        "root_matrix_n_r_sh_path\tscripts/realhost-b82-c8e41d73/root-matrix-n-r.sh",
+        "root_matrix_n_r_sh_blob\td2b2d473afb79c4463fd6c712d4eda3faeed5c7e",
+        "root_matrix_n_r_sh_sha256\t9ec125c2933866431779b760d41c6484cc0fbb9e5e9f3b5431c4a56fbab63e07",
+        "check_realhost_iperf_py_path\tscripts/realhost-b82-c8e41d73/check-realhost-iperf.py",
+        "check_realhost_iperf_py_blob\t765871ef3af87cd8a101a42e71ea97c1245dc9da",
+        "check_realhost_iperf_py_sha256\t9a52378b8a1ef6043d4d5792471c8239a0392a80da72f5c00846dd89e88ccd67",
+        "test_hermetic_matrix_sh_path\tscripts/realhost-b82-c8e41d73/test-hermetic-matrix.sh",
+        "test_hermetic_matrix_sh_blob\t81f7cd86d8dc5a93133ea755311ba57aa66e4c76",
+        "test_hermetic_matrix_sh_sha256\t9b81949416a1b4df91fee0e7d31a3de2c6ba9b474dc9c0f4dbbb1cc609207499",
+        "test_matrix_static_py_path\tscripts/realhost-b82-c8e41d73/test_matrix_static.py",
+        "test_matrix_static_py_blob\t0a2b1538d3127e8bae8953b0dff59d60cc379f39",
+        "test_matrix_static_py_sha256\t8de2dcdc866938da0502f1ad73ac9b38c9b6ff4066c76e9cbc946c9ca30a53f8",
+        "checksum_module_lease_sh_path\tscripts/realhost-b82-c8e41d73/checksum-module-lease.sh",
+        "checksum_module_lease_sh_blob\tc2e6077005e046eef0e1186c26cdaaf29c780f98",
+        "checksum_module_lease_sh_sha256\t4ab9a22910e8d597cc04bb4fdde9e1b32d37a1bb2c6ad7b76f52d576b5a9adb2",
+        "root_fresh_verifier_gate_sh_path\tscripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh",
+        "root_fresh_verifier_gate_sh_blob\t48dd5e68071798c3d25daf0051cbf54f8cd3297e",
+        "root_fresh_verifier_gate_sh_sha256\t4c2cf85b7e571df9b7ed4a77fa720c9f5e35950d44af5a39499a7ad700fe6a27",
+        "test_hermetic_fresh_verifier_gate_sh_path\tscripts/realhost-b82-c8e41d73/test-hermetic-fresh-verifier-gate.sh",
+        "test_hermetic_fresh_verifier_gate_sh_blob\tf3f7367d28253ebae746eb0e225c11f90eaa8305",
+        "test_hermetic_fresh_verifier_gate_sh_sha256\tc9b5b1f954c794c5c986214777727a76579f670db9587f319ac148fc0c2a05f3",
+        "test_fresh_verifier_gate_static_py_path\tscripts/realhost-b82-c8e41d73/test_fresh_verifier_gate_static.py",
+        "test_fresh_verifier_gate_static_py_blob\tf86736b1c4a5b884814f062edbb2d652172f024f",
+        "test_fresh_verifier_gate_static_py_sha256\tace6951027788e82ad879caf285316af4e6ee81fdb6746f569cd7c22b9f80bf3",
+        "prepare_stage_root_sh_path\tscripts/realhost-b82-c8e41d73/prepare-stage-root.sh",
+        "prepare_stage_root_sh_blob\t057db657b0ba096a4f660eedda2e0a4242af7de5",
+        "prepare_stage_root_sh_sha256\t1bcb8db91d976d2a1d95f7d87223a2dac4a1678f74c1c25542e54b01ee10eeea",
+        "realnic_acceptance_py_path\tscripts/realhost-b82-acceptance-v1/realnic_acceptance.py",
+        "realnic_acceptance_py_blob\te1edba5c9dd62c8c169d7129e8b376d4ce7d1168",
+        "realnic_acceptance_py_sha256\ta88100b2a23ad41dd3e644c3ba1c7a722d58c8184a997aabf0ceab78552c6339",
+        "test_realnic_acceptance_py_path\tscripts/realhost-b82-acceptance-v1/test_realnic_acceptance.py",
+        "test_realnic_acceptance_py_blob\te92f8f7db9733eb3f655b388f1efd685f738c2c4",
+        "test_realnic_acceptance_py_sha256\tfcb3d0dadee6da6e0ad67d028f268ebe43575287f555cd8100d279f8a3b0b79c",
+        "test_realnic_acceptance_static_py_path\tscripts/realhost-b82-acceptance-v1/test_realnic_acceptance_static.py",
+        "test_realnic_acceptance_static_py_blob\tb0dd244937b9139fe8c8548d6c046b76d9f611e9",
+        "test_realnic_acceptance_static_py_sha256\tba8aef3219a0cf2a5c6b5058b245f64eb828a08bb532d2aa0291f51ee7206ad2",
+        "provision_ubuntu_test_host_sh_path\tscripts/provision-ubuntu-test-host.sh",
+        "provision_ubuntu_test_host_sh_blob\t143eb89a2e4bbbf548b510bcc2fd9f66184d3d76",
+        "provision_ubuntu_test_host_sh_sha256\t078d191b0edbafe27e9f684d3fa495e04d7217a01d0ec1fd32eaede211178c8f",
+        "root_veth_n_r_sh_path\tscripts/realhost-b82-c8e41d73/root-veth-n-r.sh",
+        "root_veth_n_r_sh_blob\ta72f7f2eebe765bc7fa8a5352c134233b30ac8aa",
+        "root_veth_n_r_sh_sha256\tfbb8779039137383df6f51f05319faea966c69a80001da837dee22d04d8f7a70",
+        "test_hermetic_veth_runner_sh_path\tscripts/realhost-b82-c8e41d73/test-hermetic-veth-runner.sh",
+        "test_hermetic_veth_runner_sh_blob\tae0c74eefe33cf6afda681ba6fca17b54700108f",
+        "test_hermetic_veth_runner_sh_sha256\t939c3b28310596ed6bada0eb3ccdd5ebbb7eeebeaf959504c7d468b929f8174c",
+        "test_veth_runner_static_py_path\tscripts/realhost-b82-c8e41d73/test_veth_runner_static.py",
+        "test_veth_runner_static_py_blob\t5bc3d0ac0ac48c3adc0cd86166f533edc676c712",
+        "test_veth_runner_static_py_sha256\te40da6b1a6541a9b8b6c56d9277d4d73838e037876180e479b5af5d64a4edc90",
+        "controller_seam_sh_path\tscripts/realhost-b82-routed-veth-v1/controller-seam.sh",
+        "controller_seam_sh_blob\t18d9e4d72a0b9022019e738d9de4fd4e23bc4903",
+        "controller_seam_sh_sha256\t2bd7b65c3e770ff53445cbc7c195e741e8fff5eeef9e51bd6fcaa2f513d1f251",
+        "root_routed_veth_n_r_sh_path\tscripts/realhost-b82-routed-veth-v1/root-routed-veth-n-r.sh",
+        "root_routed_veth_n_r_sh_blob\t9d30910b692b2d42c1528c75c2a3ba0a5d0a11cb",
+        "root_routed_veth_n_r_sh_sha256\t5af8b848c9fc5f915b25c6c03822622f2ac75996a54ebf8172c7c5391c9f3485",
+        "test_hermetic_routed_veth_harness_sh_path\tscripts/realhost-b82-routed-veth-v1/test-hermetic-routed-veth-harness.sh",
+        "test_hermetic_routed_veth_harness_sh_blob\t253c7b0b4d4c2d065475a82742418446146d0a0a",
+        "test_hermetic_routed_veth_harness_sh_sha256\t674f96665eb26f879eae08936683fdac2beb974841ed99f9021abe9e04752032",
+        "test_routed_veth_harness_static_py_path\tscripts/realhost-b82-routed-veth-v1/test_routed_veth_harness_static.py",
+        "test_routed_veth_harness_static_py_blob\t06e0fa14779ce778440250f4a437426017754cd4",
+        "test_routed_veth_harness_static_py_sha256\t5bb678726ecc6bcc946233ae138d541fc50dc9f6ec40ddf139350863690d88c1",
+    )
+    if (
+        len(r2_predecessor_manifest_lines) != 103
+        or len({line.split("\t", 1)[0] for line in r2_predecessor_manifest_lines})
+        != 103
+        or any(line.count("\t") != 1 for line in r2_predecessor_manifest_lines)
+    ):
+        fail("test R2 predecessor manifest oracle is not exact v4/103")
+    r2_predecessor_manifest_payload = (
+        "\n".join(r2_predecessor_manifest_lines) + "\n"
+    )
     retained_retirement_constants = (
         'set ::RETAINED_RETIREMENT_COMMIT \\\n'
         f'    "{retained_retirement_commit}"',
@@ -183,21 +786,25 @@ def main() -> None:
     for literal in retained_retirement_constants:
         if transport.count(literal) != 1:
             fail(f"transport retained retirement constant drifted: {literal!r}")
+    retained_constants_end = transport.index("set ::R2_RETIRE_ID")
     literal_digests = re.findall(
-        r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])", transport
+        r"(?<![0-9a-f])[0-9a-f]{64}(?![0-9a-f])",
+        transport[:retained_constants_end],
     )
     if literal_digests != [
         retained_retirement_manifest_sha,
         retained_retirement_helper_sha,
         retained_retirement_receipt_sha,
     ]:
-        fail("transport retained retirement digest set is not exact")
+        fail("transport retained R1 retirement digest preamble is not exact")
 
     retired_predecessor_literals = (
-        "PREDECESSOR_COMMIT",
-        "PREDECESSOR_PACKAGE",
-        "PREDECESSOR_MANIFEST",
-        "PREDECESSOR_LOCAL_PACKAGE",
+        "set ::PREDECESSOR_COMMIT ",
+        "set ::PREDECESSOR_PACKAGE ",
+        "set ::PREDECESSOR_MANIFEST ",
+        "readonly PREDECESSOR_COMMIT=",
+        "readonly PREDECESSOR_PACKAGE=",
+        "readonly PREDECESSOR_MANIFEST=",
         "require_retirement_predecessor_authority",
         "verify_predecessor_manifest_contract",
         "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-2c690050ae1d",
@@ -573,7 +1180,7 @@ def main() -> None:
 
     required_controller = (
         "B82_V6_LEGACY_MATRIX_RETIRED controller_entries=0 historical_recovery=frozen-original-package-before-final-staging",
-        "verify-package|plan|preflight|prepare|provision-apply",
+        "verify-package|verify-r2-predecessor-package|plan|preflight|prepare|provision-apply",
         "B82_V6_CONTROLLER_PACKAGE_VERIFIED",
         "identity-wg-interfaces",
         "identity-netns",
@@ -631,6 +1238,50 @@ def main() -> None:
         fail("controller directly reads the credential file")
     if re.search(r"--approved-plan(?!-sha256)", controller):
         fail("controller exposes the removed public approved-plan path argument")
+
+    # The current package's isolated Git repository must expose exactly one
+    # name, and that name must bind the manifest commit.  Object reachability
+    # alone is insufficient because an injected or retargeted ref would escape
+    # the package's frozen history namespace.
+    current_history_verifier = bash_function(controller, "verify_bound_history")
+    current_ref_gate = (
+        'history_refs="$(git_history "${history_repository}" for-each-ref \\\n'
+        "    '--format=%(objectname) %(refname)')\" || return 76\n"
+        '  [[ "${history_refs}" == "${INTEGRATION_COMMIT} '
+        'refs/heads/history-verified" ]] || return 76'
+    )
+    if (
+        current_history_verifier.count(current_ref_gate) != 1
+        or current_history_verifier.count("for-each-ref") != 1
+        or current_history_verifier.count(
+            "--format=%(objectname) %(refname)"
+        )
+        != 1
+        or current_history_verifier.count("refs/heads/history-verified") != 1
+    ):
+        fail("controller current Bash history ref/commit gate is not exact and unique")
+    current_ref_slice = current_history_verifier[
+        current_history_verifier.index('history_refs="$(git_history') :
+        current_history_verifier.index(
+            'git_history "${history_repository}" cat-file',
+            current_history_verifier.index('history_refs="$(git_history'),
+        )
+    ]
+    if (
+        current_ref_slice.count("|| return 76") != 2
+        or any(
+            fallback in current_ref_slice
+            for fallback in (
+                "show-ref",
+                "symbolic-ref",
+                "rev-parse",
+                "/usr/bin/git",
+                "git_checked",
+                "|| true",
+            )
+        )
+    ):
+        fail("controller current Bash history ref gate has a fallback or wrong rc")
 
     approved_operations = (
         "scp-realnic-approved-plan",
@@ -796,6 +1447,7 @@ def main() -> None:
         "prepare", "provision-apply", "realnic-run", "realnic-restore",
         "fresh-plan", "fresh-run", "fresh-restore", "veth-plan", "veth-run",
         "veth-restore", "routed-plan", "routed-run", "routed-restore",
+        "retire-postflight-f75fe7678cfd-r2", "verify-postflight-retirement-r2",
     }
     if set(literal_executes) != allowed_executes or len(literal_executes) != len(allowed_executes):
         fail("controller retains direct primitive mutation sequencing")
@@ -970,7 +1622,8 @@ def main() -> None:
     )
     expected_transactions = tuple(
         "prepare provision-apply fresh-run fresh-restore veth-run veth-restore "
-        "routed-run routed-restore realnic-run realnic-restore".split()
+        "routed-run routed-restore realnic-run realnic-restore "
+        "retire-postflight-f75fe7678cfd-r2".split()
     )
     if not transaction_match or tuple(transaction_match.group(1).split()) != expected_transactions:
         fail("transport high-level transaction set is not exact")
@@ -1045,6 +1698,16 @@ def main() -> None:
             transport_main,
         )
     )
+    private_operation_guard = (
+        'if {[regexp {^(?:r2-(?:ro|raw)-|lineage-)} $operation]} {\n'
+        '        fail "private-operation" 65\n'
+        "    }"
+    )
+    if transport_main.count(private_operation_guard) != 1:
+        fail("transport does not reject the exact private R1/R2 namespace before policy")
+    public_transport_surface_without_guard = public_transport_surface.replace(
+        private_operation_guard, ""
+    )
     for private_literal in (
         "retire-prestage",
         "verify-retirement",
@@ -1052,7 +1715,7 @@ def main() -> None:
         "lineage-",
         "retirement_lineage",
     ):
-        if private_literal in public_transport_surface:
+        if private_literal in public_transport_surface_without_guard:
             fail(f"transport CLI surface exposes private lineage literal {private_literal!r}")
 
     lineage_builder = tcl_proc(transport, "build_retirement_lineage_operation")
@@ -1207,6 +1870,754 @@ def main() -> None:
     ):
         fail("retained retirement package identity is not the fixed 17-file tuple")
 
+    # R2 is a third, independent authority.  These expectations are deliberately
+    # literal and are not derived from any production parser or package helper.
+    r2_controller_constants = (
+        f"readonly R2_PREDECESSOR_COMMIT='{r2_predecessor_commit}'",
+        "readonly R2_PREDECESSOR_REF='refs/heads/codex/tcx-faketcp-final-v2'",
+        f"readonly R2_PREDECESSOR_PACKAGE='{r2_predecessor_package}'",
+        'readonly R2_PREDECESSOR_MANIFEST="${R2_PREDECESSOR_PACKAGE}/package-manifest.v1"',
+        f"readonly R2_PREDECESSOR_MANIFEST_SHA256='{r2_predecessor_manifest_sha}'",
+        f"readonly R2_PREDECESSOR_BUNDLE_SHA256='{r2_predecessor_bundle_sha}'",
+        "readonly R2_PREDECESSOR_HISTORY_ROOTS_SHA256='9356df63b3d4c4c362912b14ab8ee5cb54d12cd1f14be9aa1fe8e18adbad6f05'",
+        "readonly R2_PREDECESSOR_HISTORY_OBJECTS_SHA256='21647f92e57f9dbb8e15707699f632544d6dfcf2e1b4279d775cce1fb82163f3'",
+    )
+    for literal in r2_controller_constants:
+        if controller.count(literal) != 1:
+            fail(f"controller R2 fixed authority constant drifted: {literal!r}")
+    for override in (
+        "R2_PREDECESSOR_PACKAGE:-",
+        "R2_PREDECESSOR_PACKAGE:=",
+        "R2_PREDECESSOR_PACKAGE?",
+        "getenv(\"R2_PREDECESSOR_PACKAGE\"",
+        "os.environ",
+    ):
+        if override in controller:
+            fail(f"controller permits an R2 predecessor path override: {override!r}")
+    if controller.count("set -o pipefail") != 1:
+        fail("controller does not preserve pipeline status explicitly")
+
+    controller_r2_verifier = bash_function_until(
+        controller,
+        "verify_r2_predecessor_manifest_contract",
+        "verify_r2_local_authorities",
+    )
+    controller_r2_manifest_match = re.search(
+        r"(?ms)<<'R2_PREDECESSOR_MANIFEST_V4' \|\| return \$\?\n"
+        r"(?P<payload>.*?)^R2_PREDECESSOR_MANIFEST_V4$",
+        controller_r2_verifier,
+    )
+    if (
+        not controller_r2_manifest_match
+        or controller_r2_manifest_match.group("payload")
+        != r2_predecessor_manifest_payload
+    ):
+        fail("controller predecessor manifest is not the independent canonical v4/103 bytes")
+    controller_r2_required = (
+        'getattr(os, "O_NONBLOCK", 0)',
+        "package_fd = os.open(package_name, directory_flags)",
+        "bundle_fd = kept_descriptor",
+        "history_fd = os.open(\"history-verification.git\", directory_flags, dir_fd=package_fd)",
+        "def enter_held_history():",
+        "os.fchdir(history_fd)",
+        "pass_fds=(history_fd, bundle_fd)",
+        "preexec_fn=enter_held_history",
+        "if result.returncode != 0:",
+        'actual_objects = run_git(\n        ("rev-list", "--parents", "--objects", "--missing=print", integration_commit)',
+        "file_identity(os.fstat(bundle_fd)) != initial_file_identities[",
+        "directory_identity(held_package_after) != package_identity",
+    )
+    ordered(
+        controller_r2_verifier,
+        controller_r2_required,
+        "controller held-FD predecessor verifier",
+    )
+    r2_history_ref_gate = (
+        'if run_git((\n'
+        '            "for-each-ref", "--format=%(objectname) %(refname)")) != (\n'
+        '            integration_commit + " refs/heads/history-verified\\n").encode("ascii"):\n'
+        "        raise SystemExit(76)"
+    )
+    if (
+        controller_r2_verifier.count(r2_history_ref_gate) != 1
+        or controller_r2_verifier.count("for-each-ref") != 1
+        or controller_r2_verifier.count(
+            "--format=%(objectname) %(refname)"
+        )
+        != 1
+        or controller_r2_verifier.count("refs/heads/history-verified") != 1
+    ):
+        fail("controller held-FD predecessor history ref/commit gate is not exact")
+    held_ref_slice = controller_r2_verifier[
+        controller_r2_verifier.index('if run_git((\n            "for-each-ref"') :
+        controller_r2_verifier.index(
+            'run_git(("fsck"',
+            controller_r2_verifier.index('if run_git((\n            "for-each-ref"'),
+        )
+    ]
+    if (
+        held_ref_slice.count("raise SystemExit(76)") != 1
+        or controller_r2_verifier.count("subprocess.run(") != 1
+        or any(
+            fallback in held_ref_slice
+            for fallback in (
+                "package_name",
+                "history_repository",
+                "history-verification.git",
+                "cwd=",
+                '"-C"',
+                "show-ref",
+                "symbolic-ref",
+                "rev-parse",
+            )
+        )
+    ):
+        fail("controller predecessor ref gate escapes held-FD Git or lacks rc 76")
+    if controller_r2_verifier.count("O_NONBLOCK") != 2:
+        fail("controller predecessor verifier does not nonblock both file and directory opens")
+    if any(
+        forbidden in controller_r2_verifier
+        for forbidden in (
+            "shell=True",
+            "os.chdir(",
+            "cwd=package_name",
+            '"rev-parse", "HEAD"',
+        )
+    ):
+        fail("controller predecessor verifier escapes its held history/package authority")
+
+    controller_r2_transport_modes = (
+        "retire-postflight-f75fe7678cfd-r2",
+        "verify-postflight-retirement-r2",
+    )
+    for mode in controller_r2_transport_modes:
+        if controller_main.count(f"run_operation execute {mode}") != 1:
+            fail(f"controller R2 public mode is not one high-level call: {mode}")
+    r2_verify_arm = re.search(
+        r"(?ms)^\s*verify-r2-predecessor-package\)\n(?P<body>.*?)^\s*;;$",
+        controller_main,
+    )
+    if not r2_verify_arm:
+        fail("cannot isolate controller local-only R2 predecessor verifier arm")
+    r2_verify_arm_body = r2_verify_arm.group("body")
+    r2_verify_marker_prefix = (
+        "B82_V6_CONTROLLER_R2_PREDECESSOR_VERIFIED "
+        "predecessor_manifest_sha256=%s predecessor_commit=%s "
+        "package_device_inode=%s credential_read=0 network_operations=0"
+    )
+    if (
+        r2_verify_arm_body.count(r2_verify_marker_prefix) != 1
+        or any(
+            token in r2_verify_arm_body
+            for token in (
+                "run_operation",
+                "transport ",
+                "CREDENTIAL",
+                "/usr/bin/expect",
+                "/usr/bin/ssh",
+                "/usr/bin/scp",
+            )
+        )
+        or not r2_verify_arm_body.rstrip().endswith('"${R2_PREDECESSOR_DEVICE_INODE}"')
+    ):
+        fail("controller local-only R2 verifier is not the exact-last no-network marker seam")
+    r2_outer_authority = controller_main[: controller_main.index('case "${MODE}" in\n    veth-plan')]
+    ordered(
+        r2_outer_authority,
+        (
+            "verify_manifest_contract || fail 'manifest-contract' $?",
+            "verify-r2-predecessor-package | \\",
+            "retire-postflight-f75fe7678cfd-r2 | verify-postflight-retirement-r2)",
+            "verify_r2_local_authorities || fail 'r2-local-authority' $?",
+        ),
+        "controller R2 current/predecessor local authority order",
+    )
+    r2_local_authorities = bash_function(controller, "verify_r2_local_authorities")
+    ordered(
+        r2_local_authorities,
+        (
+            "format=v5 fields=112 package_files=20 credential_read=0 network_operations=0",
+            'R2_PREDECESSOR_DEVICE_INODE="$(verify_r2_predecessor_manifest_contract)"',
+            "format=v4 fields=103 package_files=17 credential_read=0 network_operations=0",
+        ),
+        "controller independent current/predecessor authority seam",
+    )
+
+    transport_r2_oracle_words = tcl_return_words(
+        transport, "r2_predecessor_manifest_oracle"
+    )
+    if len(transport_r2_oracle_words) != 206:
+        fail("transport R2 predecessor oracle is not 103 key/value pairs")
+    transport_r2_manifest_lines = tuple(
+        f"{transport_r2_oracle_words[index]}\t{transport_r2_oracle_words[index + 1]}"
+        for index in range(0, len(transport_r2_oracle_words), 2)
+    )
+    if transport_r2_manifest_lines != r2_predecessor_manifest_lines:
+        fail("transport predecessor parser does not bind the independent canonical v4/103")
+    r2_load_predecessor = tcl_proc(transport, "r2_load_predecessor_manifest")
+    ordered(
+        r2_load_predecessor,
+        (
+            "r2_predecessor_manifest_oracle",
+            "[llength $lines] != 103",
+            "[llength $oracle] != 206",
+            "foreach {expected_key expected_value} $oracle",
+            "[lindex $fields 0] ne $expected_key",
+            "[lindex $fields 1] ne $expected_value",
+        ),
+        "transport separate v4/103 predecessor parser",
+    )
+    for current_authority in ("load_manifest ", "package_names", "validate_manifest_values"):
+        if current_authority in r2_load_predecessor:
+            fail(f"transport predecessor parser reuses current authority: {current_authority}")
+
+    if (
+        tcl_return_words(transport, "r2_predecessor_package_names")
+        != r2_predecessor_package_names
+    ):
+        fail("transport R2 predecessor package identity is not the fixed 17-file tuple")
+    if tcl_return_words(transport, "r2_mutation_operations") != r2_raw_operations:
+        fail("transport R2 raw mutation surface/order is not the fixed 21-item tuple")
+    r2_stale_body = tcl_proc(transport, "r2_stale_operations")
+    r2_stale_match = re.search(
+        r"(?ms)^\s*set operations \{(?P<body>.*?)\}", r2_stale_body
+    )
+    if (
+        not r2_stale_match
+        or tuple(r2_stale_match.group("body").split()) != r2_stale_operations
+        or "prepare_stale_operations" in r2_stale_body
+    ):
+        fail("transport R2 stale oracle is not the independent fixed 28-item tuple")
+    r2_sha_body = tcl_proc(transport, "r2_predecessor_package_sha")
+    r2_size_body = tcl_proc(transport, "r2_predecessor_package_size")
+    for name, expected_sha, expected_size in r2_predecessor_package_contract:
+        sha_case = rf"(?ms)^\s*{re.escape(name)} \{{\s*return {expected_sha}\s*\}}"
+        size_case = rf"(?m)^\s*{re.escape(name)} \{{ return {expected_size} \}}$"
+        if not re.search(sha_case, r2_sha_body) or not re.search(size_case, r2_size_body):
+            fail(f"transport R2 predecessor SHA/size contract drifted: {name}")
+    for producer_body, producer_name in (
+        (tcl_proc(transport, "package_names"), "current package list"),
+        (tcl_proc(transport, "retained_retirement_package_names"), "R1 package list"),
+        (tcl_proc(transport, "r2_predecessor_package_names"), "R2 package list"),
+    ):
+        if any(
+            other in producer_body
+            for other in (
+                "package_names]",
+                "retained_retirement_package_names]",
+                "r2_predecessor_package_names]",
+            )
+        ):
+            fail(f"transport {producer_name} is derived from another package authority")
+
+    r2_mutation_classifier = tcl_proc(transport, "r2_mutation_operation")
+    r2_read_classifier = tcl_proc(transport, "r2_read_only_operation")
+    if (
+        tuple(re.findall(r'"([a-z0-9-]+)"', r2_mutation_classifier))
+        != (controller_r2_transport_modes[0],)
+        or tuple(re.findall(r'"([a-z0-9-]+)"', r2_read_classifier))
+        != (controller_r2_transport_modes[1],)
+    ):
+        fail("transport R2 public surface is not exactly one mutation plus one verifier")
+    build_r2 = tcl_proc(transport, "build_r2_operation")
+
+    # Close the private RO surface in both directions.  The test owns the 96
+    # literal names above; production must make exactly 13 fixed-path probes,
+    # 17 x 2 frozen predecessor probes, and 49 explicit switch leaves
+    # reachable.  Merely finding all 96 strings somewhere in the builder would
+    # permit dead labels or an unreviewed generated family.
+    r2_fixed_path = tcl_proc(transport, "r2_fixed_path")
+    expected_fixed_paths = (
+        ("home-qroot", "$::R2_HOME_QROOT"),
+        ("auth-root", "$::R2_AUTH_ROOT"),
+        ("run-qroot", "$::R2_RUN_QROOT"),
+        ("auth-manifest-pending", "$::R2_AUTH_MANIFEST_PENDING"),
+        ("auth-manifest", "$::R2_AUTH_MANIFEST"),
+        ("auth-self-pending", "$::R2_AUTH_SELF_PENDING"),
+        ("auth-self", "$::R2_AUTH_SELF"),
+        ("quarantine-intake", "$::R2_Q_INTAKE"),
+        ("quarantine-package", "$::R2_Q_PACKAGE"),
+        ("quarantine-bootstrap", "$::R2_Q_BOOTSTRAP"),
+        ("lock", "$::R2_LOCK"),
+        ("receipt-pending", "$::R2_RECEIPT_PENDING"),
+        ("receipt-final", "$::R2_RECEIPT_FINAL"),
+    )
+    actual_fixed_paths = tuple(
+        re.findall(
+            r"(?m)^\s{8}([a-z0-9-]+) \{ return (\$::R2_[A-Z_]+) \}$",
+            r2_fixed_path,
+        )
+    )
+    if (
+        actual_fixed_paths != expected_fixed_paths
+        or r2_fixed_path.count(
+            'default { return -code error "r2-fixed-path" }'
+        )
+        != 1
+    ):
+        fail("transport R2 fixed-path resolver is not the exact 13-path map")
+    generated_exists = tuple(
+        f"r2-ro-exists-{name}" for name, _ in expected_fixed_paths
+    )
+    generated_old_package = tuple(
+        f"r2-ro-old-package-{family}-{name}"
+        for name in r2_predecessor_package_names
+        for family in ("sha", "stat")
+    )
+    dynamic_ro_families = tuple(
+        re.findall(
+            r"(?ms)\[regexp \{\^(r2-ro-[^}]*)\}\s*(?:\\\n\s*)?"
+            r"\$operation -> ([^\]]+)\]",
+            build_r2,
+        )
+    )
+    if (
+        dynamic_ro_families
+        != (
+            ("r2-ro-exists-(.+)$", "path_name"),
+            ("r2-ro-old-package-(sha|stat)-(.+)$", "family name"),
+        )
+        or
+        build_r2.count(r"[regexp {^r2-ro-exists-(.+)$} $operation -> path_name]")
+        != 1
+        or build_r2.count("set fixed_path [r2_fixed_path $path_name]") != 1
+        or build_r2.count(
+            "[regexp {^r2-ro-old-package-(sha|stat)-(.+)$} \\\n"
+            "        $operation -> family name]"
+        )
+        != 1
+        or build_r2.count(
+            "[lsearch -exact [r2_predecessor_package_names] $name] < 0"
+        )
+        != 1
+    ):
+        fail("transport R2 generated RO families are not exact and closed")
+    explicit_switch_start = build_r2.index(
+        "    } else {\n        switch -- $operation {"
+    )
+    explicit_switch_end = build_r2.index(
+        '\n            default { return -code error "r2-operation" }',
+        explicit_switch_start,
+    )
+    explicit_switch = build_r2[explicit_switch_start:explicit_switch_end]
+    explicit_case_labels = tuple(
+        label
+        for line in explicit_switch.splitlines()
+        if line.startswith("            r2-")
+        for label in re.findall(r"r2-(?:ro|raw)-[a-z0-9.-]+", line)
+    )
+    explicit_ro = tuple(
+        label for label in explicit_case_labels if label.startswith("r2-ro-")
+    )
+    explicit_raw = tuple(
+        label for label in explicit_case_labels if label.startswith("r2-raw-")
+    )
+    effective_ro = (*generated_exists, *generated_old_package, *explicit_ro)
+    actual_ro_literals = ordered_unique(
+        tuple(re.findall(r"r2-ro-[a-z0-9.-]+", build_r2))
+    )
+    if (
+        len(generated_exists) != 13
+        or set(generated_exists) != set(r2_ro_operations[:13])
+        or len(generated_old_package) != 34
+        or set(generated_old_package) != set(r2_ro_operations[13:47])
+        or len(explicit_ro) != 49
+        or len(set(explicit_ro)) != 49
+        or set(explicit_ro) != set(r2_ro_operations[47:])
+        or len(effective_ro) != 96
+        or len(set(effective_ro)) != 96
+        or set(effective_ro) != set(r2_ro_operations)
+        or actual_ro_literals
+        != ("r2-ro-exists-", "r2-ro-old-package-", *explicit_ro)
+        or explicit_raw != r2_raw_operations
+    ):
+        fail("transport R2 builder effective private surface is not 13+34+49 RO/21 raw")
+    actual_raw_literals = ordered_unique(
+        tuple(re.findall(r"r2-raw-[a-z0-9-]+", build_r2))
+    )
+    if actual_raw_literals != r2_raw_operations:
+        fail("transport R2 builder raw leaf set/order is not exact 21")
+    for prohibited_mutation in (
+        "/bin/rm",
+        "/usr/bin/rm",
+        "/bin/rmdir",
+        "/usr/bin/rmdir",
+        "/bin/mv",
+        "/usr/bin/cp",
+        "--delete",
+        "-p $::R2_",
+    ):
+        if prohibited_mutation in build_r2:
+            fail(f"transport R2 builder contains prohibited mutation fallback: {prohibited_mutation}")
+    ordered(
+        build_r2,
+        (
+            "r2-raw-intake-mkdir",
+            "/usr/bin/mkdir --mode=0700 -- $::R2_USER_INTAKE",
+            "r2-raw-scp-manifest",
+            "r2-raw-scp-self",
+            "r2-raw-home-qroot-create",
+            "r2-raw-home-qroot-create { set fixed_path $::R2_HOME_QROOT }",
+            "/usr/bin/mkdir --mode=0700 -- $fixed_path",
+            "r2-raw-auth-manifest-install",
+            "/usr/bin/install --owner=root --group=root --mode=0600",
+            "--no-target-directory -- $source",
+            "r2-raw-link-auth-manifest",
+            "/usr/bin/ln --no-target-directory --",
+            "r2-raw-helper-mutate",
+            "r2_helper_remote_argv $manifest_sha",
+        ),
+        "transport fixed R2 mutation argv surface",
+    )
+
+    # A resumable authority install may overwrite only bytes that were first
+    # proved to be an exact prefix of the still-bound local artifact.  Keep the
+    # four observation leaves explicit so the private RO surface cannot grow by
+    # hiding an unreviewed write-adjacent probe behind a generic operation.
+    pending_shape_arm = build_r2[
+        build_r2.index("r2-ro-auth-manifest-pending-shape -") :
+        build_r2.index("r2-ro-auth-manifest-pending-sha-observe -")
+    ]
+    pending_sha_arm = build_r2[
+        build_r2.index("r2-ro-auth-manifest-pending-sha-observe -") :
+        build_r2.index("r2-ro-auth-manifest-pending-sha -")
+    ]
+    if ordered_unique(
+        tuple(re.findall(r"r2-ro-auth-[a-z-]+", pending_shape_arm))
+    ) != (
+        "r2-ro-auth-manifest-pending-shape",
+        "r2-ro-auth-self-pending-shape",
+    ):
+        fail("transport R2 pending shape operation labels are not exact")
+    ordered(
+        pending_shape_arm,
+        (
+            "r2-ro-auth-manifest-pending-shape",
+            "set artifact $::R2_AUTH_MANIFEST_PENDING",
+            "set artifact $::R2_AUTH_SELF_PENDING",
+            "/usr/bin/stat -Lc %U:%G:%a:%h:%s:%F -- $artifact",
+        ),
+        "transport R2 pending shape operation argv",
+    )
+    if ordered_unique(
+        tuple(re.findall(r"r2-ro-auth-[a-z-]+", pending_sha_arm))
+    ) != (
+        "r2-ro-auth-manifest-pending-sha-observe",
+        "r2-ro-auth-self-pending-sha-observe",
+    ):
+        fail("transport R2 pending observed-SHA operation labels are not exact")
+    ordered(
+        pending_sha_arm,
+        (
+            "r2-ro-auth-manifest-pending-sha-observe",
+            "$::R2_AUTH_MANIFEST_PENDING : $::R2_AUTH_SELF_PENDING",
+            "/usr/bin/sha256sum -- $artifact",
+        ),
+        "transport R2 pending observed-SHA operation argv",
+    )
+    if "set assertion" in pending_shape_arm or "set assertion" in pending_sha_arm:
+        fail("transport R2 pending observations are not raw observed values")
+
+    r2_local_delivery = tcl_proc(transport, "r2_local_delivery_file")
+    ordered(
+        r2_local_delivery,
+        (
+            "set package [dict get $values local_package_dir]",
+            "package-manifest.v1 { set expected_sha $manifest_sha }",
+            "prepare-stage-root.sh {",
+            "[dict get $values prepare_stage_root_sh_sha256]",
+            'default { return -code error "r2-delivery-name" }',
+            'set artifact "${package}/${name}"',
+            "[file normalize $artifact] ne $artifact",
+            "file lstat $artifact artifact_stat",
+            "file lstat $package package_stat",
+            '$artifact_stat(type) ne "file"',
+            "$artifact_stat(nlink) != 1",
+            "$artifact_stat(size) < 1",
+            "$artifact_stat(size) > 16777216",
+            "($artifact_stat(mode) & 07777) != 0600",
+            '$package_stat(type) ne "directory"',
+            "($package_stat(mode) & 07777) != 0700",
+            "$artifact_stat(uid) != $package_stat(uid)",
+            "$artifact_stat(gid) != $package_stat(gid)",
+            "[file_sha256 $artifact] ne $expected_sha",
+            "return [list $artifact $expected_sha]",
+        ),
+        "transport R2 local delivery authority",
+    )
+    r2_prefix_sha = tcl_proc(transport, "r2_file_prefix_sha256")
+    ordered(
+        r2_prefix_sha,
+        (
+            "[string is integer -strict $length]",
+            "$length < 0",
+            "$length > 16777216",
+            "[file normalize $path] ne $path",
+            '[file type $path] ne "file"',
+            "set channel [open $path r]",
+            "fconfigure $channel -encoding binary -translation binary",
+            "read $channel $length",
+            "[string bytelength $payload] != $length",
+            "exec /usr/bin/shasum -a 256 << $payload",
+            "^[0-9a-f]{64}$",
+        ),
+        "transport local held-authority prefix digest",
+    )
+    r2_pending_size = tcl_proc(transport, "r2_observe_auth_pending_size")
+    if re.search(r'(?m)^\s*set pattern "[^"\n]*\[0-9\]', r2_pending_size):
+        fail("transport R2 pending size regexp permits Tcl command substitution")
+    if (
+        "set pattern [format {" not in r2_pending_size
+        or "([0-9]+):regular file$}" not in r2_pending_size
+        or "$expected_mode]" not in r2_pending_size
+    ):
+        fail("transport R2 pending size regexp is not brace/format safe")
+    ordered(
+        r2_pending_size,
+        (
+            "r2_step $values $manifest_sha $predecessor_values",
+            "package-manifest.v1 { set expected_mode 600 }",
+            "prepare-stage-root.sh { set expected_mode 700 }",
+            "set pattern [format {",
+            "([0-9]+):regular file$}",
+            "$expected_mode]",
+            "$size < 0",
+            "$size > 16777216",
+        ),
+        "transport root-owned pending shape observation",
+    )
+    r2_observe_sha = tcl_proc(transport, "r2_observe_sha")
+    ordered(
+        r2_observe_sha,
+        (
+            "r2_step $values $manifest_sha $predecessor_values",
+            "$operation $password",
+            "output_value [lindex $result 2]",
+            "set digest [string range $value 0 63]",
+            "^[0-9a-f]{64}$",
+            '[string range $value 64 end] ne "  ${artifact}"',
+            'fail "r2-sha-output" 78',
+            "return $digest",
+        ),
+        "transport R2 observed remote SHA parser",
+    )
+    r2_pending_prefix = tcl_proc(transport, "r2_require_auth_pending_prefix")
+    ordered(
+        r2_pending_prefix,
+        (
+            "package-manifest.v1 {",
+            "set shape_operation r2-ro-auth-manifest-pending-shape",
+            "set sha_operation r2-ro-auth-manifest-pending-sha-observe",
+            "set remote_artifact $::R2_AUTH_MANIFEST_PENDING",
+            "prepare-stage-root.sh {",
+            "set shape_operation r2-ro-auth-self-pending-shape",
+            "set sha_operation r2-ro-auth-self-pending-sha-observe",
+            "set remote_artifact $::R2_AUTH_SELF_PENDING",
+            "r2_local_delivery_file $values $manifest_sha $name",
+            "file lstat $local_artifact local_stat",
+            "r2_observe_auth_pending_size $values $manifest_sha",
+            "r2_observe_sha $values $manifest_sha $predecessor_values",
+            "$remote_size > $local_stat(size)",
+            'fail "r2-auth-pending-oversize" 78',
+            "$remote_size == $local_stat(size) && $remote_sha eq $expected_sha",
+            "set prefix_class exact",
+            "r2_file_prefix_sha256 $local_artifact $remote_size",
+            "$remote_sha ne $prefix_sha",
+            'fail "r2-auth-pending-nonprefix" 78',
+            "$remote_size == 0",
+            "set prefix_class empty",
+            "set prefix_class prefix",
+            "r2_local_delivery_file $values $manifest_sha $name",
+            "$rechecked_artifact ne $local_artifact",
+            "$rechecked_sha ne $expected_sha",
+            "file lstat $rechecked_artifact rechecked_stat",
+            "foreach field {dev ino size mode nlink uid gid type}",
+            "return $prefix_class",
+        ),
+        "transport resumable authority prefix proof",
+    )
+    if (
+        r2_pending_prefix.count("r2_local_delivery_file") != 2
+        or r2_pending_prefix.count("r2_observe_auth_pending_size") != 1
+        or r2_pending_prefix.count("r2_observe_sha") != 1
+        or r2_pending_prefix.count("r2_file_prefix_sha256") != 1
+        or r2_pending_prefix.count("return $prefix_class") != 1
+    ):
+        fail("transport R2 pending-prefix proof cardinality drifted")
+    if (
+        r2_pending_prefix.count("set prefix_class exact") != 1
+        or r2_pending_prefix.count("set prefix_class empty") != 1
+        or r2_pending_prefix.count("set prefix_class prefix") != 1
+        or r2_pending_prefix.count(
+            "$rechecked_stat($field) ne $local_stat($field)"
+        )
+        != 1
+    ):
+        fail("transport R2 pending-prefix classification/recheck drifted")
+
+    r2_ensure_authority = tcl_proc(transport, "r2_ensure_authority")
+    if r2_ensure_authority.count("r2_require_auth_pending_prefix") != 4:
+        fail("transport R2 authority resume does not prove every existing pending file")
+    manifest_resume = r2_ensure_authority[
+        r2_ensure_authority.index('if {$phase eq "manifest-pending"}') :
+        r2_ensure_authority.index('if {$phase eq "manifest-pair"}')
+    ]
+    ordered(
+        manifest_resume,
+        (
+            "set self_present [dict get [dict get $state present] auth-self-pending]",
+            "r2_require_auth_pending_prefix",
+            "package-manifest.v1 $password",
+            '$manifest_prefix_class ne "exact"',
+            "r2-raw-auth-manifest-install",
+            "r2-ro-auth-manifest-pending-sha",
+            "r2-raw-auth-self-install",
+            "elseif {!$manifest_installed_here || !$self_installed_here}",
+            "r2_require_auth_pending_prefix",
+            "package-manifest.v1 $password",
+            "r2_require_auth_pending_prefix",
+            "prepare-stage-root.sh $password",
+            '$manifest_prefix_class ne "exact"',
+            "r2-raw-auth-manifest-install",
+            '$self_prefix_class ne "exact"',
+            "r2-raw-auth-self-install",
+        ),
+        "transport manifest-pending no-blind-overwrite resume",
+    )
+    if (
+        manifest_resume.count("r2-raw-auth-manifest-install") != 2
+        or manifest_resume.count("r2-raw-auth-self-install") != 2
+    ):
+        fail("transport manifest-pending resume has an unproved install path")
+    self_resume = r2_ensure_authority[
+        r2_ensure_authority.index('if {$phase eq "self-pending"}') :
+        r2_ensure_authority.index('if {$phase ne "complete"}')
+    ]
+    ordered(
+        self_resume,
+        (
+            "r2_require_auth_pending_prefix",
+            "prepare-stage-root.sh $password",
+            '$self_prefix_class ne "exact"',
+            "r2-raw-auth-self-install",
+            "r2-ro-auth-self-pending-sha",
+        ),
+        "transport self-pending no-blind-overwrite resume",
+    )
+    if self_resume.count("r2-raw-auth-self-install") != 1:
+        fail("transport self-pending resume has an unproved install path")
+    for resume_flag in (
+        "pending_pair_synced",
+        "manifest_installed_here",
+        "self_installed_here",
+    ):
+        flag_values = re.findall(
+            rf"(?m)^\s*set {re.escape(resume_flag)} ([^\s]+)$",
+            r2_ensure_authority,
+        )
+        if not flag_values or flag_values[0] != "0" or set(flag_values) - {"0", "1"}:
+            fail(f"transport R2 resume flag is not monotone 0-to-1: {resume_flag}")
+
+    r2_authority_state = tcl_proc(transport, "r2_authority_state")
+    authority_names_match = re.search(
+        r"(?ms)^\s*set names \{(?P<body>.*?)\}", r2_authority_state
+    )
+    expected_authority_names = (
+        "home-qroot",
+        "auth-root",
+        "run-qroot",
+        "auth-manifest-pending",
+        "auth-manifest",
+        "auth-self-pending",
+        "auth-self",
+        "quarantine-intake",
+        "quarantine-package",
+        "quarantine-bootstrap",
+        "lock",
+        "receipt-pending",
+        "receipt-final",
+    )
+    if (
+        not authority_names_match
+        or tuple(authority_names_match.group("body").split())
+        != expected_authority_names
+    ):
+        fail("transport R2 authority state does not probe exactly 13 fixed paths")
+    actual_authority_phases = ordered_unique(
+        tuple(
+            re.findall(
+                r"(?:set phase|return \[dict create phase) ([A-Za-z0-9_-]+)",
+                r2_authority_state,
+            )
+        )
+    )
+    if (
+        set(actual_authority_phases) != set(r2_authority_phases)
+        or len(actual_authority_phases) != len(r2_authority_phases)
+        or r2_authority_state.count("phase manifest-pending present") != 2
+        or any(
+            r2_authority_state.count(f"phase {phase} present") != 1
+            for phase in r2_authority_phases
+            if phase != "manifest-pending"
+        )
+    ):
+        fail("transport R2 authority classifier phase set/cardinality is not exact")
+    if "pending-pair" in r2_authority_state:
+        fail("transport R2 authority classifier introduces an unowned pending-pair phase")
+
+    ordered(
+        transport_main,
+        (
+            "require_transaction_local_authority $values $manifest_sha",
+            "set predecessor_values [r2_require_predecessor_authority]",
+            "execute_r2_predecessor_controller_verifier $values $manifest_sha",
+            "set password [read_execute_credential $credential_path]",
+        ),
+        "transport R2 precredential current/predecessor/controller order",
+    )
+    private_guard_index = transport_main.index(private_operation_guard)
+    manifest_load_index = transport_main.index("load_manifest $manifest $manifest_sha")
+    credential_index = transport_main.index("set password [read_execute_credential")
+    if not private_guard_index < manifest_load_index < credential_index:
+        fail("transport private operation rejection is not before manifest and credential access")
+    postcredential = transport_main[credential_index:]
+    ordered(
+        postcredential,
+        (
+            "set password [read_execute_credential $credential_path]",
+            "if {[r2_mutation_operation $operation]}",
+            "execute_r2_transaction",
+            "elseif {[r2_read_only_operation $operation]}",
+            "execute_r2_verify_transaction",
+        ),
+        "transport R2 high-level dispatch after credential",
+    )
+
+    r2_transaction = tcl_proc(transport, "execute_r2_transaction")
+    ordered(
+        r2_transaction,
+        (
+            "r2_require_r1_terminal $values $manifest_sha $password preflight",
+            "r2_authority_state",
+            "r2_execute_common_gate",
+            "r2_execute_predecessor_gate",
+            "r2_ensure_delivery",
+            "r2_ensure_authority",
+            "r2-raw-helper-mutate",
+            "r2_exact_verify",
+            "r2_require_r1_terminal $values $manifest_sha $password postflight",
+            "B82_V6_R2_TRANSACTION_COMPLETE",
+        ),
+        "transport R2 transaction pre/post lineage and sole helper seam",
+    )
+    r2_verify_transaction = tcl_proc(transport, "execute_r2_verify_transaction")
+    if (
+        "r2_exact_verify" not in r2_verify_transaction
+        or "r2_require_r1_terminal" not in r2_verify_transaction
+        or "r2-raw-" in r2_verify_transaction
+    ):
+        fail("transport R2 verify transaction is not a read-only terminal check")
+
     expected_lineage_deep_operations = (
         "lineage-home-readlink",
         "lineage-home-stat",
@@ -1243,6 +2654,136 @@ def main() -> None:
         "lineage-lock-stat",
         "lineage-receipt-stat",
         "lineage-receipt-sha",
+    )
+    r2_r1_terminal_prewrite = (
+        "lineage-exists-user-intake",
+        "lineage-exists-home-qroot",
+        "lineage-exists-run-qroot",
+        "lineage-exists-receipt-pending",
+        *expected_lineage_deep_operations,
+        "lineage-exists-user-intake",
+        "lineage-exists-home-qroot",
+        "lineage-exists-run-qroot",
+        "lineage-exists-receipt-pending",
+        "lineage-retained-helper-verify",
+    )
+    r2_fresh_authority_prewrite = r2_ro_operations[:13]
+    r2_common_prewrite = (
+        "identity-hostname",
+        "identity-kernel",
+        "identity-machine",
+        "identity-netns",
+        "identity-interface",
+        *r2_stale_operations,
+    )
+    r2_predecessor_prewrite = (
+        "package-parent-stat",
+        "r2-ro-old-package-readlink",
+        "r2-ro-old-package-stat",
+        "r2-ro-old-package-entries",
+        *tuple(
+            operation
+            for name in r2_predecessor_package_names
+            for operation in (
+                f"r2-ro-old-package-sha-{name}",
+                f"r2-ro-old-package-stat-{name}",
+            )
+        ),
+        "r2-ro-old-bootstrap-root-readlink",
+        "r2-ro-old-bootstrap-root-stat",
+        "r2-ro-old-bootstrap-provisioner-readlink",
+        "r2-ro-old-bootstrap-provisioner-stat",
+        "r2-ro-old-bootstrap-provisioner-sha",
+        "r2-ro-old-bootstrap-stager-readlink",
+        "r2-ro-old-bootstrap-stager-stat",
+        "r2-ro-old-bootstrap-stager-sha",
+        "r2-ro-old-bootstrap-entries",
+        "r2-ro-old-provision-check",
+    )
+    expected_r2_prewrite_sequence = (
+        *r2_r1_terminal_prewrite,
+        *r2_fresh_authority_prewrite,
+        *r2_common_prewrite,
+        *r2_predecessor_prewrite,
+    )
+    if (
+        tuple(
+            len(group)
+            for group in (
+                r2_r1_terminal_prewrite,
+                r2_fresh_authority_prewrite,
+                r2_common_prewrite,
+                r2_predecessor_prewrite,
+            )
+        )
+        != (44, 13, 33, 48)
+        or len(expected_r2_prewrite_sequence) != 138
+        or expected_r2_prewrite_sequence[63] != "stale-stage-root"
+        or expected_r2_prewrite_sequence[-1] != "r2-ro-old-provision-check"
+    ):
+        fail("test R2 prewrite oracle is not exact 44+13+33+48=138")
+
+    r2_common_gate = tcl_proc(transport, "r2_execute_common_gate")
+    ordered(
+        r2_common_gate,
+        (
+            "foreach operation [base_identity_operations]",
+            "set operations [r2_stale_operations]",
+            "items=28",
+            "identities=5 stale_absent=28 writes=0 result=PASS",
+        ),
+        "transport R2 fixed 5+28 common prewrite gate",
+    )
+    r2_predecessor_gate = tcl_proc(transport, "r2_execute_predecessor_gate")
+    ordered(
+        r2_predecessor_gate,
+        (
+            "transaction_step $values $manifest_sha package-parent-stat none $password",
+            "r2-ro-old-package-readlink r2-ro-old-package-stat",
+            "r2-ro-old-package-entries",
+            "foreach name [r2_predecessor_package_names]",
+            "foreach family {sha stat}",
+            '"r2-ro-old-package-${family}-${name}"',
+            "r2-ro-old-bootstrap-root-readlink r2-ro-old-bootstrap-root-stat",
+            "r2-ro-old-bootstrap-provisioner-readlink",
+            "r2-ro-old-bootstrap-provisioner-stat",
+            "r2-ro-old-bootstrap-provisioner-sha",
+            "r2-ro-old-bootstrap-stager-readlink",
+            "r2-ro-old-bootstrap-stager-stat r2-ro-old-bootstrap-stager-sha",
+            "r2-ro-old-bootstrap-entries",
+            "r2-ro-old-provision-check",
+            '[lindex $result 3] ne "none"',
+            "package_files=17 bootstrap_files=2 provision_missing=none primitives=48 writes=0 result=PASS",
+        ),
+        "transport R2 exact 48-primitive predecessor prewrite gate",
+    )
+    if "--apply" in r2_predecessor_gate or r2_predecessor_gate.count(
+        "r2-ro-old-provision-check"
+    ) != 1:
+        fail("transport R2 predecessor gate is not one frozen --check-only proof")
+    r2_delivery = tcl_proc(transport, "r2_ensure_delivery")
+    delivery_first_mutation = r2_delivery.index("r2_try_intake_mkdir")
+    if "r2-raw-" in r2_delivery[:delivery_first_mutation]:
+        fail("transport R2 delivery mutates before the fixed intake mkdir seam")
+    r2_try_mkdir = tcl_proc(transport, "r2_try_intake_mkdir")
+    if (
+        r2_try_mkdir.count("execute_r2_primitive") != 1
+        or r2_try_mkdir.count("r2_mutation_trace_record r2-raw-intake-mkdir") != 1
+        or "r2-raw-scp-" in r2_try_mkdir
+    ):
+        fail("transport R2 first write is not the sole intake mkdir operation")
+    intake_mkdir_case = build_r2[
+        build_r2.index("r2-raw-intake-mkdir {") : build_r2.index(
+            "r2-raw-scp-manifest", build_r2.index("r2-raw-intake-mkdir {")
+        )
+    ]
+    ordered(
+        intake_mkdir_case,
+        (
+            "r2-raw-intake-mkdir",
+            "/usr/bin/mkdir --mode=0700 -- $::R2_USER_INTAKE",
+        ),
+        "transport R2 0-based first-write index 138 exact argv",
     )
     for operation in expected_lineage_deep_operations:
         if operation not in lineage_builder:
@@ -1622,26 +3163,662 @@ def main() -> None:
         "run_retirement_engine",
         "retire-prestage-2c690050",
         "verify-retirement",
-        "RETIRE_ID",
-        "RETIREMENT_USER_INTAKE",
-        "RETIREMENT_HOME_QROOT",
-        "RETIREMENT_AUTH_ROOT",
-        "RETIREMENT_AUTH_MANIFEST",
-        "RETIREMENT_AUTH_SELF",
-        "RETIREMENT_Q_INTAKE",
-        "RETIREMENT_Q_PACKAGE",
-        "RETIREMENT_RUN_QROOT",
-        "RETIREMENT_Q_BOOTSTRAP",
-        "RETIREMENT_RECEIPT_FINAL",
-        "T_CANDIDATE",
-        "classify_state",
-        "namespace_writes",
+        "readonly RETIRE_ID=",
+        '"${RETIREMENT_USER_INTAKE}"',
+        '"${RETIREMENT_HOME_QROOT}"',
+        '"${RETIREMENT_AUTH_ROOT}"',
+        '"${RETIREMENT_AUTH_MANIFEST}"',
+        '"${RETIREMENT_AUTH_SELF}"',
+        '"${RETIREMENT_Q_INTAKE}"',
+        '"${RETIREMENT_Q_PACKAGE}"',
+        '"${RETIREMENT_RUN_QROOT}"',
+        '"${RETIREMENT_Q_BOOTSTRAP}"',
+        '"${RETIREMENT_RECEIPT_FINAL}"',
     ):
         if removed_engine_literal in stager:
             fail(
                 "root stager retains embedded retirement engine literal "
                 f"{removed_engine_literal!r}"
             )
+
+    r2_engine_shell = bash_function_until(
+        stager, "run_r2_retirement_engine", "run_stage"
+    )
+    r2_engine_match = re.search(r"(?ms)<<'PY'\n(?P<payload>.*?)^PY$", r2_engine_shell)
+    if not r2_engine_match or r2_engine_shell.count("<<'PY'") != 1:
+        fail("root stager does not embed exactly one R2 retirement engine")
+    r2_engine = r2_engine_match.group("payload")
+    try:
+        r2_engine_tree = ast.parse(r2_engine)
+    except SyntaxError as exc:
+        fail(f"root stager R2 engine is not valid Python: {exc}")
+    engine_function_nodes = tuple(
+        node for node in r2_engine_tree.body if isinstance(node, ast.FunctionDef)
+    )
+    expected_engine_functions = (
+        "stop",
+        "require_absolute",
+        "open_abs_dir",
+        "open_parent",
+        "fd_mnt_id",
+        "require_dir_fd",
+        "names_at",
+        "entry_stat",
+        "entry_is_directory",
+        "read_all",
+        "sha256_fd",
+        "require_file_at",
+        "require_sized_file_at",
+        "parse_manifest_ordered",
+        "require_pair",
+        "same_open_inode",
+        "require_host_identity",
+        "require_exact_names",
+        "open_child_dir",
+        "require_path_absent",
+        "r1_receipt_bytes",
+        "validate_r1_retained_entries",
+        "validate_r1_terminal",
+        "validate_current_manifest_payload",
+        "validate_current_authority",
+        "converge_current_authority",
+        "validate_intake",
+        "validate_old_package",
+        "validate_old_bootstrap",
+        "verify_old_provisioner_check",
+        "regular_present",
+        "classify_state",
+        "boot_identity",
+        "write_all",
+        "acquire_retirement_lock",
+        "initialize_or_verify_boot_marker",
+        "receipt_bytes",
+        "validate_receipt",
+        "validate_pending_receipt",
+        "validate_state_objects",
+        "renameat2_noreplace",
+        "rename_directory_noreplace",
+        "publish_receipt",
+        "converge_completed_rename",
+        "converge_completed_rename_parents",
+        "converge_resumed_state",
+        "converge_terminal",
+        "engine_main",
+    )
+    if tuple(node.name for node in engine_function_nodes) != expected_engine_functions:
+        fail("root stager R2 engine function surface/order drifted")
+    engine_functions = {
+        node.name: ast.get_source_segment(r2_engine, node) or ""
+        for node in engine_function_nodes
+    }
+    if r2_engine.count("engine_main()") != 2 or not re.search(
+        r"(?ms)^try:\n    engine_main\(\)\nexcept RetirementStop", r2_engine
+    ):
+        fail("root stager does not invoke its actual R2 engine_main exactly once")
+
+    engine_assignments: dict[str, ast.AST] = {}
+    for node in r2_engine_tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name):
+                    engine_assignments[target.id] = node.value
+    for required_assignment in (
+        "CURRENT_KEYS",
+        "OLD_MANIFEST_BYTES",
+        "OLD_PACKAGE_FILES",
+        "OLD_BOOTSTRAP_FILES",
+    ):
+        if required_assignment not in engine_assignments:
+            fail(f"root stager R2 engine omits {required_assignment}")
+    try:
+        engine_current_keys = ast.literal_eval(engine_assignments["CURRENT_KEYS"])
+        engine_old_package = ast.literal_eval(engine_assignments["OLD_PACKAGE_FILES"])
+        engine_old_bootstrap = ast.literal_eval(engine_assignments["OLD_BOOTSTRAP_FILES"])
+    except (TypeError, ValueError) as exc:
+        fail(f"root stager R2 package authority is not literal: {exc}")
+    expected_old_package = {
+        name: (size, digest)
+        for name, digest, size in r2_predecessor_package_contract
+    }
+    expected_old_bootstrap = {
+        "prepare-stage-root.sh": (
+            54230,
+            "1bcb8db91d976d2a1d95f7d87223a2dac4a1678f74c1c25542e54b01ee10eeea",
+        ),
+        "provision-ubuntu-test-host.sh": (
+            19437,
+            "078d191b0edbafe27e9f684d3fa495e04d7217a01d0ec1fd32eaede211178c8f",
+        ),
+    }
+    if engine_current_keys != expected_manifest_keys:
+        fail("root stager R2 current authority is not independent v5/112")
+    if engine_old_package != expected_old_package or tuple(
+        engine_old_package
+    ) != r2_predecessor_package_names:
+        fail("root stager R2 predecessor authority is not independent v4/103/17")
+    if engine_old_bootstrap != expected_old_bootstrap:
+        fail("root stager R2 predecessor bootstrap is not the fixed two-file tuple")
+    old_manifest_node = engine_assignments["OLD_MANIFEST_BYTES"]
+    if (
+        not isinstance(old_manifest_node, ast.Call)
+        or not isinstance(old_manifest_node.func, ast.Attribute)
+        or old_manifest_node.func.attr != "encode"
+        or not isinstance(old_manifest_node.func.value, ast.Constant)
+        or old_manifest_node.func.value.value != r2_predecessor_manifest_payload
+    ):
+        fail("root stager R2 predecessor manifest is not canonical v4/103 bytes")
+    for old_authority in (
+        "CURRENT_KEYS",
+        "validate_current_manifest_payload",
+        "validate_current_authority",
+    ):
+        if old_authority in engine_functions["validate_old_package"]:
+            fail(f"root stager predecessor parser reuses current authority: {old_authority}")
+    for predecessor_authority in (
+        "OLD_MANIFEST_BYTES",
+        "OLD_PACKAGE_FILES",
+        "validate_old_package",
+    ):
+        if predecessor_authority in engine_functions["validate_current_authority"]:
+            fail(
+                "root stager current parser reuses predecessor authority: "
+                f"{predecessor_authority}"
+            )
+
+    ordered(
+        r2_engine_shell,
+        (
+            '"${MODE}" "${MANIFEST}" "${MANIFEST_SHA256}"',
+            '"${R2_AUTH_MANIFEST_PENDING}" "${R2_AUTH_SELF}"',
+            '"${R2_AUTH_SELF_PENDING}"',
+            '"${R2_USER_INTAKE}" "${R2_HOME_QROOT}"',
+            '"${R2_AUTH_ROOT}" "${R2_Q_INTAKE}"',
+            '"${R2_Q_PACKAGE}" "${EXPECTED_REMOTE_PACKAGE}" "${BOOTSTRAP_ROOT}"',
+            '"${R2_RUN_QROOT}" "${R2_Q_BOOTSTRAP}" "${R2_LOCK}"',
+            '"${R2_RECEIPT_PENDING}" "${R2_RECEIPT_FINAL}"',
+            '"${R2_PREDECESSOR_COMMIT}" "${R2_PREDECESSOR_MANIFEST_SHA256}"',
+            '"${EXPECTED_HOSTNAME}" "${EXPECTED_KERNEL}" "${EXPECTED_MACHINE_ID}"',
+        ),
+        "root stager fixed R2 engine argv",
+    )
+    ordered(
+        r2_engine,
+        (
+            "if len(sys.argv) != 24:",
+            'stop("engine-arguments", 64)',
+            "(mode, current_manifest, current_manifest_sha, current_manifest_pending,",
+            "current_self, current_self_pending, user_intake, home_qroot,",
+            "expected_machine_id) = sys.argv[1:]",
+            "current_self_sha = None",
+        ),
+        "root stager exact 24-argument held-authority engine interface",
+    )
+    if "PREPARE_SHA256" in r2_engine_shell or "prepare_sha" in r2_engine:
+        fail("root stager passes an independently trusted self SHA into the R2 engine")
+    if r2_engine.count('mode not in {"retire-postflight-f75fe7678cfd-r2", "verify-postflight-retirement-r2"}') != 1:
+        fail("root stager R2 engine mode surface is not exact")
+    stager_main = bash_function(stager, "main")
+    if (
+        stager_main.count(
+            "retire-postflight-f75fe7678cfd-r2 | verify-postflight-retirement-r2)"
+        )
+        != 1
+        or stager_main.count("load_r2_retirement_authority_contract") != 1
+        or stager_main.count("run_r2_retirement_engine") != 1
+    ):
+        fail("root stager exposes anything other than the two fixed R2 engine modes")
+    r2_authority_loader = bash_function(stager, "load_r2_retirement_authority_contract")
+    ordered(
+        r2_authority_loader,
+        (
+            '[[ "$(/usr/bin/id -u)" == \'0\' ]]',
+            '"${MANIFEST}" == "${R2_AUTH_MANIFEST}"',
+            '[[ "$0" == "${R2_AUTH_SELF}" ]]',
+        ),
+        "root stager pre-engine fixed-path-only authority gate",
+    )
+    if any(
+        forbidden_loader_io in r2_authority_loader
+        for forbidden_loader_io in (
+            "sha256_file",
+            "validate_manifest",
+            "read_manifest_field",
+            "readlink",
+            "stat ",
+            "exec {",
+            "<\"",
+        )
+    ):
+        fail("root stager reopens or parses current authority before the held-FD engine")
+
+    validate_current_authority = engine_functions["validate_current_authority"]
+    ordered(
+        validate_current_authority,
+        (
+            "require_exact_names(auth_descriptor, {",
+            "os.path.basename(current_manifest)",
+            "os.path.basename(current_manifest_pending)",
+            "os.path.basename(current_self)",
+            "os.path.basename(current_self_pending)",
+            '"authority-manifest-pending"',
+            '"authority-manifest-final"',
+            "require_file_at(",
+            "same_open_inode(descriptors[0], descriptors[1]",
+            "manifest_payload = read_all(descriptors[1])",
+            "values = validate_current_manifest_payload(",
+            'authority_self_sha = values["prepare_stage_root_sh_sha256"]',
+            '"authority-self-pending"',
+            '"authority-self-final"',
+            "require_file_at(",
+            "same_open_inode(descriptors[2], descriptors[3]",
+            "hashlib.sha256(read_all(descriptors[3])).hexdigest()",
+            "return values, authority_self_sha, tuple(descriptors)",
+        ),
+        "root stager current manifest-pair-derived held self authority",
+    )
+    if (
+        validate_current_authority.count("require_file_at(") != 2
+        or validate_current_authority.count("descriptors.append") != 2
+        or 'expected_sha = current_self_sha' in validate_current_authority
+    ):
+        fail("root stager current authority does not hold exactly four manifest-derived FDs")
+    converge_current_authority = engine_functions["converge_current_authority"]
+    ordered(
+        converge_current_authority,
+        (
+            "if len(descriptors) != 4:",
+            'stop("authority-held-count", 65)',
+            "for descriptor in descriptors:",
+            "os.fsync(descriptor)",
+            "os.fsync(auth_descriptor)",
+            "require_exact_names(auth_descriptor",
+            "for descriptor, (name, mode_bits, expected_sha, label) in zip(",
+            "metadata = os.fstat(descriptor)",
+            "named = os.stat(name, dir_fd=auth_descriptor, follow_symlinks=False)",
+            "(metadata.st_dev, metadata.st_ino) != (named.st_dev, named.st_ino)",
+            "sha256_fd(descriptor) != expected_sha",
+            "same_open_inode(descriptors[0], descriptors[1]",
+            "same_open_inode(descriptors[2], descriptors[3]",
+            "validate_current_manifest_payload(",
+            'post_values["prepare_stage_root_sh_sha256"] != authority_self_sha',
+            "hashlib.sha256(read_all(descriptors[3])).hexdigest() != authority_self_sha",
+        ),
+        "root stager held current authority post-fsync convergence",
+    )
+
+    # Opening an attacker-controlled FIFO must never block before the regular
+    # file check.  O_NONBLOCK is harmless for the required regular files.
+    for literal in (
+        '"O_DIRECTORY", "O_NOFOLLOW", "O_CLOEXEC", "O_NONBLOCK"',
+        "O_NONBLOCK = os.O_NONBLOCK",
+    ):
+        if r2_engine.count(literal) != 1:
+            fail(f"root stager R2 FIFO/nonblocking gate drifted: {literal!r}")
+    for function_name in (
+        "require_file_at",
+        "acquire_retirement_lock",
+        "publish_receipt",
+    ):
+        function_body = engine_functions[function_name]
+        if function_body.count("O_NONBLOCK") != 1 or "os.open(" not in function_body:
+            fail(f"root stager R2 {function_name} can block on a FIFO before fstat")
+
+    prohibited_engine_calls = []
+    for node in ast.walk(r2_engine_tree):
+        if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and isinstance(node.func.value, ast.Name)
+            and (
+                (node.func.value.id == "os" and node.func.attr in {
+                    "unlink",
+                    "remove",
+                    "rmdir",
+                    "removedirs",
+                    "rename",
+                    "renames",
+                    "replace",
+                })
+                or (node.func.value.id in {"shutil", "pathlib"} and node.func.attr in {
+                    "copy",
+                    "copy2",
+                    "copyfile",
+                    "copytree",
+                    "move",
+                    "rmtree",
+                    "rename",
+                    "replace",
+                    "unlink",
+                    "rmdir",
+                })
+            )
+        ):
+            prohibited_engine_calls.append(
+                f"{node.func.value.id}.{node.func.attr}"
+            )
+    if prohibited_engine_calls:
+        fail(f"root stager R2 engine has destructive/copy fallback: {prohibited_engine_calls}")
+    if "import shutil" in r2_engine or "from shutil" in r2_engine:
+        fail("root stager R2 engine imports a copy/move fallback")
+
+    classify_state = engine_functions["classify_state"]
+    classify_node = next(node for node in engine_function_nodes if node.name == "classify_state")
+    state_assignments = [
+        node.value
+        for node in ast.walk(classify_node)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "states" for target in node.targets)
+    ]
+    if len(state_assignments) != 1:
+        fail("root stager R2 engine does not have one literal state classifier")
+    try:
+        actual_state_matrix = ast.literal_eval(state_assignments[0])
+    except (TypeError, ValueError) as exc:
+        fail(f"root stager R2 state matrix is not literal: {exc}")
+    expected_state_matrix = {
+        (True, True, True, False, False, False, False, False): "D",
+        (False, True, True, True, False, False, False, False): "I",
+        (False, False, True, True, True, False, False, False): "S1",
+        (False, False, False, True, True, True, False, False): "S2",
+        (False, False, False, True, True, True, True, False): "S2P",
+        (False, False, False, True, True, True, False, True): "T_CANDIDATE",
+    }
+    if actual_state_matrix != expected_state_matrix:
+        fail("root stager R2 engine state classifier is not D/I/S1/S2/S2P/T_CANDIDATE")
+    if 'return "T"' not in engine_functions["converge_terminal"]:
+        fail("root stager R2 engine lacks the separately verified T convergence")
+
+    rename_directory = engine_functions["rename_directory_noreplace"]
+    ordered(
+        rename_directory,
+        (
+            "source_parent, source_name = open_parent(source)",
+            "destination_parent, destination_name = open_parent(destination)",
+            "source_parent_metadata = os.fstat(source_parent)",
+            "destination_parent_metadata = os.fstat(destination_parent)",
+            "fd_mnt_id(source_parent) != fd_mnt_id(destination_parent)",
+            "held_descriptor = open_child_dir(",
+            "held_identity = os.fstat(held_descriptor)",
+            "held_mount = fd_mnt_id(held_descriptor)",
+            "renameat2_noreplace(source_parent, source_name,",
+            "destination_descriptor = open_child_dir(",
+            "same_open_inode(held_descriptor, destination_descriptor",
+            "held_mount != fd_mnt_id(destination_descriptor)",
+            "os.fsync(source_parent)",
+            "os.fsync(destination_parent)",
+            "same_open_inode(held_descriptor, destination_descriptor",
+            "validator(destination_descriptor)",
+            "validator(held_descriptor)",
+        ),
+        "root stager held-inode/mount rename transaction",
+    )
+    if (
+        rename_directory.count("os.fsync(source_parent)") != 1
+        or rename_directory.count("os.fsync(destination_parent)") != 1
+        or r2_engine.count("libc.renameat2") != 1
+        or r2_engine.count("RENAME_NOREPLACE = 1") != 1
+    ):
+        fail("root stager R2 rename primitive/double-parent durability drifted")
+    engine_main_body = engine_functions["engine_main"]
+    ordered(
+        engine_main_body,
+        (
+            'if state == "D":',
+            "rename_directory_noreplace(\n                user_intake, q_intake",
+            'if state != "I":',
+            'if state == "I":',
+            "rename_directory_noreplace(\n                source_package, q_package",
+            'if state != "S1":',
+            'if state == "S1":',
+            "rename_directory_noreplace(\n                source_bootstrap, q_bootstrap",
+            'if state != "S2":',
+            'if state not in {"S2", "S2P"}:',
+            "publish_receipt(",
+            'if state != "T_CANDIDATE":',
+            "converge_terminal(",
+        ),
+        "root stager exact D/I/S1/S2/S2P/T_CANDIDATE/T transition order",
+    )
+    verify_branch = engine_main_body[
+        engine_main_body.index('if mode == "verify-postflight-retirement-r2":') :
+        engine_main_body.index('if state == "T_CANDIDATE":')
+    ]
+    if (
+        "namespace_writes=0" not in verify_branch
+        or any(
+            mutation in verify_branch
+            for mutation in (
+                "rename_directory_noreplace",
+                "publish_receipt",
+                "write_all",
+                "os.ftruncate",
+                "os.write",
+            )
+        )
+    ):
+        fail("root stager R2 verify mode is not namespace-write-free")
+    acquire_lock = engine_functions["acquire_retirement_lock"]
+    initialize_lock = engine_functions["initialize_or_verify_boot_marker"]
+    ordered(
+        acquire_lock,
+        (
+            'writable = mode == "retire-postflight-f75fe7678cfd-r2"',
+            "if not writable:",
+            'stop("retirement-lock-absent", 78)',
+            "os.O_CREAT | os.O_EXCL",
+            "fcntl.LOCK_EX if writable else fcntl.LOCK_SH",
+            "fcntl.LOCK_NB",
+        ),
+        "root stager same-boot lock mode/create gate",
+    )
+    ordered(
+        initialize_lock,
+        (
+            'writable = mode == "retire-postflight-f75fe7678cfd-r2"',
+            'expected = f"boot_id\\t{boot_id}\\n".encode("ascii")',
+            "if existing == expected:",
+            'if (state != "D" or not writable or not expected.startswith(existing)):',
+            'stop("same-boot-residual")',
+            "os.ftruncate(lock_descriptor, 0)",
+            "write_all(lock_descriptor, expected)",
+            "os.fsync(lock_descriptor)",
+            "os.fsync(run_descriptor)",
+        ),
+        "root stager same-boot marker convergence",
+    )
+
+    provision_check = engine_functions["verify_old_provisioner_check"]
+    ordered(
+        provision_check,
+        (
+            '"provision-ubuntu-test-host.sh"',
+            '["/bin/bash", "-p", f"/proc/self/fd/{provisioner}", "--check"',
+            '"--expected-address", "192.168.10.82"',
+            '"--expected-interface", "ens33"',
+            "timeout=600",
+            "pass_fds=(provisioner,)",
+            "if result.returncode != 0:",
+            '"mode=check"',
+            '"missing_packages="',
+            '"plan_complete planned_commands_executed=0 writes=0 automatic_cleanup=0"',
+            "held = os.fstat(provisioner)",
+            'named = os.stat("provision-ubuntu-test-host.sh"',
+            "sha256_fd(provisioner)",
+            'return ("none", "0")',
+        ),
+        "root stager frozen predecessor provision --check self-verification",
+    )
+    if '"--apply"' in provision_check or "shell=True" in provision_check:
+        fail("root stager predecessor provision proof can apply or invoke a shell string")
+
+    receipt_function_node = next(
+        node for node in engine_function_nodes if node.name == "receipt_bytes"
+    )
+    receipt_line_assignments = [
+        node.value
+        for node in ast.walk(receipt_function_node)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id == "lines" for target in node.targets)
+    ]
+    if len(receipt_line_assignments) != 1 or not isinstance(
+        receipt_line_assignments[0], ast.Tuple
+    ):
+        fail("root stager R2 receipt does not have one literal ordered tuple")
+    receipt_environment = {
+        "current_manifest_sha": "a" * 64,
+        "current_self_sha": "b" * 64,
+        "source_package": r2_predecessor_remote_package,
+        "source_bootstrap": r2_predecessor_bootstrap,
+        "user_intake": r2_user_intake,
+        "q_intake": f"{r2_home_qroot}/intake",
+        "q_package": f"{r2_home_qroot}/package",
+        "q_bootstrap": f"{r2_run_qroot}/bootstrap",
+    }
+
+    def receipt_value(node: ast.AST) -> str:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in receipt_environment:
+            return receipt_environment[node.id]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return receipt_value(node.left) + receipt_value(node.right)
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and node.value.id == "current_values"
+            and isinstance(node.slice, ast.Constant)
+            and node.slice.value == "integration_commit"
+        ):
+            return "c" * 40
+        fail(f"root stager R2 receipt has a non-contract expression: {ast.dump(node)}")
+        raise AssertionError
+
+    actual_receipt_pairs = []
+    for item in receipt_line_assignments[0].elts:
+        if not isinstance(item, ast.Tuple) or len(item.elts) != 2:
+            fail("root stager R2 receipt entry is not one key/value pair")
+        actual_receipt_pairs.append(
+            (receipt_value(item.elts[0]), receipt_value(item.elts[1]))
+        )
+    expected_receipt_pairs = (
+        ("format", "wg-mix-ebpf-b82-postflight-retirement-terminal-v1"),
+        ("retire_id", r2_retire_id),
+        ("state", "TERMINAL"),
+        ("predecessor_commit", r2_predecessor_commit),
+        ("predecessor_manifest_sha256", r2_predecessor_manifest_sha),
+        ("predecessor_bundle_sha256", r2_predecessor_bundle_sha),
+        ("predecessor_package_format", "wg-mix-ebpf-b82-v6-package-v4"),
+        ("predecessor_manifest_field_count", "103"),
+        ("predecessor_package_entry_count", "17"),
+        ("predecessor_bootstrap_entry_count", "2"),
+        ("authority_manifest_sha256", "a" * 64),
+        ("authority_prepare_stage_root_sha256", "b" * 64),
+        ("authority_integration_commit", "c" * 40),
+        ("authority_package_format", "wg-mix-ebpf-b82-v6-package-v5"),
+        ("authority_manifest_field_count", "112"),
+        ("authority_transfer_entry_count", "20"),
+        ("prior_retirement_id", "c8e41d73-2c690050ae1d-r1"),
+        ("prior_retirement_receipt_sha256", retained_retirement_receipt_sha),
+        ("failure_cut", "postflight-hermetic-matrix-before-stage-snapshot"),
+        ("failure_point", "hermetic-matrix"),
+        ("failure_reason", "review-input-is-not-a-regular-file"),
+        (
+            "failure_path",
+            f"{r2_predecessor_remote_package}/test-hermetic-checksum-module-lease.sh",
+        ),
+        ("failure_rc", "1"),
+        ("provision_check", "missing_set=none,writes=0"),
+        ("bootstrap_snapshot_state", "absent"),
+        ("stage_root_state", "absent"),
+        ("source_intake", r2_user_intake),
+        ("source_package", r2_predecessor_remote_package),
+        ("source_bootstrap", r2_predecessor_bootstrap),
+        ("quarantine_intake", f"{r2_home_qroot}/intake"),
+        ("quarantine_package", f"{r2_home_qroot}/package"),
+        ("quarantine_bootstrap", f"{r2_run_qroot}/bootstrap"),
+        ("rename_order", "intake,package,bootstrap"),
+        ("rename_primitive", "renameat2-RENAME_NOREPLACE-dirfd-v1"),
+        ("retention", "no-unlink-no-rmdir-no-copy-fallback"),
+    )
+    if tuple(actual_receipt_pairs) != expected_receipt_pairs:
+        fail("root stager R2 receipt is not the exact independently fixed 35-key order")
+    expected_receipt_payload = "".join(
+        f"{key}\t{value}\n" for key, value in expected_receipt_pairs
+    ).encode("ascii")
+    if (
+        len(expected_receipt_pairs) != 35
+        or len({key for key, _ in expected_receipt_pairs}) != 35
+        or len(expected_receipt_payload) != 1998
+        or expected_receipt_payload.count(b"\n") != 35
+        or b"\0" in expected_receipt_payload
+        or b"\r" in expected_receipt_payload
+        or not expected_receipt_payload.endswith(b"\n")
+    ):
+        fail("test R2 receipt oracle is not exact 35-key/1998-byte canonical bytes")
+    receipt_body = engine_functions["receipt_bytes"]
+    ordered(
+        receipt_body,
+        (
+            're.fullmatch(r"[0-9a-f]{64}", current_manifest_sha)',
+            're.fullmatch(r"[0-9a-f]{64}", current_self_sha)',
+            're.fullmatch(r"[0-9a-f]{40}"',
+            'payload = ("".join(f"{key}\\t{value}\\n" for key, value in lines)).encode("ascii")',
+            "len(lines) != 35",
+            "len(payload) != 1998",
+        ),
+        "root stager deterministic R2 receipt construction",
+    )
+    if re.search(r"(?i)R2_[A-Z_]*RECEIPT_SHA", r2_engine):
+        fail("root stager hardcodes a live R2 receipt SHA self-reference")
+
+    publish_receipt = engine_functions["publish_receipt"]
+    ordered(
+        publish_receipt,
+        (
+            "os.O_RDWR | os.O_CREAT | os.O_EXCL",
+            "os.fsync(run_descriptor)",
+            "os.ftruncate(pending_descriptor, 0)",
+            "write_all(pending_descriptor, payload)",
+            "os.fsync(pending_descriptor)",
+            "read_all(pending_descriptor, 8192) != payload",
+            "renameat2_noreplace(run_descriptor, pending_name, run_descriptor, final_name)",
+            "final_descriptor = validate_receipt(run_descriptor, payload)",
+            "os.fsync(final_descriptor)",
+            "os.fsync(run_descriptor)",
+        ),
+        "root stager S2/S2P receipt durability transaction",
+    )
+    if publish_receipt.count("renameat2_noreplace(") != 1:
+        fail("root stager receipt publication is not one NOREPLACE rename")
+
+    r1_validation_surface = "\n".join(
+        engine_functions[name]
+        for name in (
+            "r1_receipt_bytes",
+            "validate_r1_retained_entries",
+            "validate_r1_terminal",
+        )
+    )
+    for r1_literal in (
+        'R1_ID = "c8e41d73-2c690050ae1d-r1"',
+        f'R1_AUTH_MANIFEST_SHA = "{retained_retirement_manifest_sha}"',
+        f'R1_AUTH_SELF_SHA = "{retained_retirement_helper_sha}"',
+        f'R1_RECEIPT_SHA = "{retained_retirement_receipt_sha}"',
+        "validate_r1_terminal(boot_id, user_uid, user_gid)",
+    ):
+        if r1_literal not in r2_engine:
+            fail(f"root stager dropped read-only R1 terminal binding: {r1_literal!r}")
+    if any(
+        token in r1_validation_surface
+        for token in (
+            "os.write",
+            "write_all",
+            "os.ftruncate",
+            "renameat2_noreplace",
+            "os.O_CREAT",
+        )
+    ):
+        fail("root stager R1 terminal verifier is not strictly read-only")
     expect_harness_marker = "<<'EXPECT_HARNESS'\n"
     if hermetic.count(expect_harness_marker) != 1:
         fail("hermetic test does not define one transport transaction harness")
@@ -1660,6 +3837,13 @@ def main() -> None:
         "lineage-existence",
         "lineage-gate",
         "prepare-lineage",
+        "r2-prewrite-cuts",
+        "r2-first-write",
+        "r2-provision-cuts",
+        "r2-private-surface",
+        "r2-precredential",
+        "r2-authority-prefixes",
+        "r2-raw-sequence",
     )
     harness_cases: dict[str, str] = {}
     for index, case_name in enumerate(harness_case_names):
@@ -1673,6 +3857,1944 @@ def main() -> None:
         end = transport_harness.index(end_marker, start)
         harness_cases[case_name] = transport_harness[start:end]
 
+    # The R2 expected sequences must be flat test literals.  Comparing a
+    # production builder with a second call to that same builder would only
+    # prove internal consistency, so reject every production-derived oracle.
+    hermetic_r2_prewrite = tcl_literal_return_words(
+        transport_harness, "r2_test_prewrite_sequence"
+    )
+    hermetic_r2_raw = tcl_literal_return_words(
+        transport_harness, "r2_test_raw_sequence"
+    )
+    hermetic_r2_ro = tcl_literal_return_words(
+        transport_harness, "r2_test_private_read_only"
+    )
+    hermetic_r2_package_names = tcl_literal_return_words(
+        transport_harness, "r2_test_package_names"
+    )
+    if hermetic_r2_prewrite != expected_r2_prewrite_sequence:
+        fail("hermetic R2 prewrite oracle is not the independent flat 138 tuple")
+    if hermetic_r2_raw != r2_raw_operations:
+        fail("hermetic R2 mutation oracle is not the independent ordered 21 tuple")
+    if (
+        len(hermetic_r2_ro) != 96
+        or len(set(hermetic_r2_ro)) != 96
+        or set(hermetic_r2_ro) != set(r2_ro_operations)
+    ):
+        fail("hermetic R2 private read-only oracle is not the independent flat 96 set")
+    if hermetic_r2_package_names != r2_predecessor_package_names:
+        fail("hermetic R2 predecessor package oracle is not the independent 17 tuple")
+    r2_oracle_procs = "\n".join(
+        tcl_proc(transport_harness, name)
+        for name in (
+            "r2_test_prewrite_sequence",
+            "r2_test_raw_sequence",
+            "r2_test_private_read_only",
+            "r2_test_package_names",
+        )
+    )
+    for production_oracle in (
+        "[build_r2_operation",
+        "[r2_mutation_operations",
+        "[r2_stale_operations",
+        "[r2_predecessor_package_names",
+        "[retained_retirement_package_names",
+        "[package_names",
+        "[base_identity_operations",
+        "[execute_retirement_lineage_gate",
+    ):
+        if production_oracle in r2_oracle_procs:
+            fail(f"hermetic R2 expected tuple is production-derived: {production_oracle}")
+
+    r2_case_names = harness_case_names[harness_case_names.index("r2-prewrite-cuts") :]
+    r2_cases = "\n".join(harness_cases[name] for name in r2_case_names)
+    for protected_procedure in (
+        "r2_authority_state",
+        "r2_require_auth_pending_prefix",
+        "execute_retirement_lineage_gate",
+        "r2_execute_common_gate",
+        "r2_execute_predecessor_gate",
+        "build_r2_operation",
+        "execute_r2_primitive",
+        "execute_r2_transaction",
+        "execute_r2_verify_transaction",
+    ):
+        if f"rename {protected_procedure} " in r2_cases or re.search(
+            rf"(?m)^\s*proc {re.escape(protected_procedure)}\s", r2_cases
+        ):
+            fail(
+                "hermetic R2 harness replaces production control logic: "
+                f"{protected_procedure}"
+            )
+
+    r2_prewrite_case = harness_cases["r2-prewrite-cuts"]
+    ordered(
+        r2_prewrite_case,
+        (
+            "set ::r2_expected [r2_test_prewrite_sequence]",
+            "[llength $::r2_expected] != 138",
+            '[lindex $::r2_expected 137] ne "r2-ro-old-provision-check"',
+            "rename execute_operation_spec transport_original_execute_operation_spec",
+            "proc execute_operation_spec {operation operation_spec password}",
+            "set ordinal [llength $::r2_observed]",
+            "set expected_operation [lindex $::r2_expected $ordinal]",
+            "if {$operation ne $expected_operation}",
+            "lappend ::r2_observed $operation",
+            "if {$ordinal == $::r2_cut}",
+            "foreach cut_kind {child-nonzero signal}",
+            "for {set cut 0} {$cut < 138} {incr cut}",
+            "unset -nocomplain ::R2_MUTATION_TRACE_ACTIVE",
+            "::R2_MUTATION_INTAKE_CREATED",
+            "execute_r2_transaction $values $manifest_sha",
+            '$cut_kind eq "signal" || $cut < 44 ? 78 : 73',
+            "[llength $::r2_mutations] != 0",
+            "HARNESS_R2_PREWRITE_CUTS primitives=138 cuts=138 mutations=0",
+            "child_nonzero=138 child_signal=138 result=PASS",
+        ),
+        "hermetic actual R2 138-prewrite cut harness",
+    )
+    if (
+        r2_prewrite_case.count("execute_r2_transaction") != 1
+        or r2_prewrite_case.count("rename execute_operation_spec ") != 1
+        or "lappend ::r2_expected" in r2_prewrite_case
+    ):
+        fail("hermetic R2 prewrite harness does not instrument one actual transaction")
+
+    r2_first_write_case = harness_cases["r2-first-write"]
+    ordered(
+        r2_first_write_case,
+        (
+            "set ::r2_expected [r2_test_prewrite_sequence]",
+            "rename execute_operation_spec transport_original_execute_operation_spec",
+            "set ordinal [llength $::r2_observed]",
+            "if {$ordinal < 138}",
+            "set expected_operation r2-raw-intake-mkdir",
+            "if {$ordinal == 138}",
+            "/usr/bin/mkdir --mode=0700 --",
+            "/home/siyixuan/wg-mix-ebpf-test/retire-postflight-c8e41d73-f75fe7678cfd-r2.intake",
+            "return [list child-failure 73",
+            "execute_r2_transaction $values $manifest_sha",
+            "HARNESS_R2_FIRST_WRITE index=138 operation=r2-raw-intake-mkdir",
+            "rc=73 scp=0 result=PASS",
+        ),
+        "hermetic actual R2 first-write harness",
+    )
+    if (
+        r2_first_write_case.count("execute_r2_transaction") != 1
+        or r2_first_write_case.count("rename execute_operation_spec ") != 1
+    ):
+        fail("hermetic R2 first-write harness does not instrument one actual transaction")
+
+    r2_provision_case = harness_cases["r2-provision-cuts"]
+    provision_payload_oracle = tcl_proc(
+        transport_harness, "r2_test_provision_payload"
+    )
+    if any(
+        production_oracle in provision_payload_oracle
+        for production_oracle in (
+            "[provision_plan_policy",
+            "[build_r2_operation",
+            "[execute_r2_primitive",
+        )
+    ):
+        fail("hermetic R2 provision expected payload is production-derived")
+    ordered(
+        provision_payload_oracle,
+        (
+            "initial {",
+            "missing_packages= clang gcc golang-go iperf3 libbpf-dev llvm make pkg-config shellcheck wireguard-tools",
+            "plan_complete planned_commands_executed=0 writes=0 automatic_cleanup=0",
+            "iperf3 {",
+            "missing_packages= iperf3",
+            "plan_complete planned_commands_executed=0 writes=0 automatic_cleanup=0",
+            "malformed {",
+            "plan_apt_commands=skipped reason=fixed-package-set-already-installed",
+            "writes1 {",
+            "plan_complete planned_commands_executed=0 writes=1 automatic_cleanup=0",
+        ),
+        "hermetic independent R2 provision result oracle",
+    )
+    ordered(
+        r2_provision_case,
+        (
+            "set ::r2_expected [r2_test_prewrite_sequence]",
+            "rename execute_operation_spec transport_original_execute_operation_spec",
+            'if {$operation eq "stale-stage-root"',
+            "$::r2_scenario in {stage-present stage-symlink}",
+            "/run/wg-mix-ebpf-source-stages/c8e41d73",
+            "[lrange $spawn_argv 0 end] ne [lrange $expected 0 end]",
+            'if {$operation eq "r2-ro-old-provision-check"}',
+            "/bin/bash -p $provisioner --check",
+            "--expected-address 192.168.10.82",
+            "--expected-interface ens33",
+            "--expected-hostname ubuntu-2604-test",
+            "--expected-kernel 7.0.0-28-generic",
+            "--expected-machine-id",
+            "9db3fb717cc74974b2a6b243d67f67b9",
+            "[lrange $spawn_argv 0 end] ne [lrange $expected 0 end]",
+            "child-nonzero {",
+            "signal { fail \"child-wait-status\" 78 }",
+            "initial - iperf3 - malformed - writes1",
+            "foreach scenario {",
+            "stage-present stage-symlink initial iperf3 malformed writes1",
+            "child-nonzero signal",
+            "execute_r2_transaction $values $manifest_sha",
+            "[llength $::r2_mutations] != 0",
+            "[llength $trace] != 0",
+            "$::r2_scp != 0",
+            "HARNESS_R2_PROVISION_CUTS stage_present_symlink=2",
+            "provision_initial_iperf3_malformed_writes1_nonzero_signal=6",
+            "prewrite_mutations=0 scp=0 result=PASS",
+        ),
+        "hermetic actual R2 stage/provision prewrite cuts",
+    )
+    if (
+        r2_provision_case.count("execute_r2_transaction") != 1
+        or r2_provision_case.count("rename execute_operation_spec ") != 1
+        or r2_provision_case.count("--apply") != 1
+        or re.search(r"\[list[^\n]*--apply", r2_provision_case)
+    ):
+        fail("hermetic R2 provision cuts do not instrument one check-only transaction")
+
+    r2_private_case = harness_cases["r2-private-surface"]
+    ordered(
+        r2_private_case,
+        (
+            "set private_ro [r2_test_private_read_only]",
+            "set private_raw [r2_test_raw_sequence]",
+            "[llength $private_ro] != 96",
+            "[llength $private_raw] != 21",
+            "foreach operation [concat $private_ro $private_raw]",
+            "foreach action {plan execute}",
+            "transport_main $invocation",
+            "{B82FAIL 65}",
+            '$message ne "private-operation"',
+            "$rejections != 234",
+            "$::credential_reads != 0",
+            "$::spawns != 0",
+            "HERMETIC_R2_PRIVATE_SURFACE public=2 ro=96 raw=21",
+            "plan_execute_rejections=234 credential_reads=0 spawns=0 result=PASS",
+        ),
+        "hermetic R2 closed private surface",
+    )
+
+    r2_precredential_case = harness_cases["r2-precredential"]
+    ordered(
+        r2_precredential_case,
+        (
+            "production_require_transaction_local_authority",
+            "lappend ::r2_authority_trace current",
+            "production_r2_require_predecessor_authority",
+            "lappend ::r2_authority_trace predecessor",
+            "production_execute_r2_predecessor_controller_verifier",
+            "lappend ::r2_authority_trace controller-seam",
+            "rename read_execute_credential production_read_execute_credential",
+            "lappend ::r2_authority_trace credential",
+            "transport_main $invocation",
+            "{current predecessor controller-seam credential}",
+            "$::r2_credential_reads != 1",
+            "$::r2_remote_spawns != 0",
+            "HERMETIC_R2_PRECREDENTIAL current=v5/112/20 predecessor=v4/103/17",
+            "order=current,predecessor,credential controller_seam=before-credential",
+            "credential_reads=1 remote_spawns=0 result=PASS",
+        ),
+        "hermetic R2 actual precredential authority order",
+    )
+
+    r2_authority_case = harness_cases["r2-authority-prefixes"]
+    authority_fixture_names = re.search(
+        r"(?ms)^\s*set names \{(?P<body>.*?)^\s*\}\n\s*set legal ",
+        r2_authority_case,
+    )
+    if (
+        not authority_fixture_names
+        or tuple(authority_fixture_names.group("body").split())
+        != expected_authority_names
+    ):
+        fail("hermetic R2 authority fixture does not own the literal 13-path matrix")
+    ordered(
+        r2_authority_case,
+        (
+            "set legal [list",
+            "[list absent {}]",
+            "[list home-qroot {home-qroot}]",
+            "[list auth-root {home-qroot auth-root}]",
+            "[list run-qroot {home-qroot auth-root run-qroot}]",
+            "[list manifest-pending",
+            "{home-qroot auth-root run-qroot auth-manifest-pending}",
+            "[list manifest-pair",
+            "{home-qroot auth-root run-qroot auth-manifest-pending auth-manifest}",
+            "[list self-pending",
+            "{home-qroot auth-root run-qroot auth-manifest-pending auth-manifest auth-self-pending}",
+            "[list complete",
+            "{home-qroot auth-root run-qroot auth-manifest-pending auth-manifest auth-self-pending auth-self}",
+            "set state [r2_authority_state",
+            "[dict get $state phase] ne $expected_phase",
+            "{home-qroot auth-root run-qroot auth-manifest-pending auth-self-pending}",
+            '[dict get $pending_pair phase] ne "manifest-pending"',
+            "HARNESS_R2_AUTHORITY_PREFIXES legal=8 both_pending=manifest-pending",
+            "invalid=5 foreign=STOP complete_unknown_type_rejects=6",
+            "pending_accepts=6 pending_rejects=4 result=PASS",
+        ),
+        "hermetic R2 literal authority prefix matrix",
+    )
+    invalid_authority = r2_authority_case[
+        r2_authority_case.index("        set invalid [list \\\n") :
+        r2_authority_case.index("        set complete_names {")
+    ]
+    ordered(
+        invalid_authority,
+        (
+            "[list auth-without-home {auth-root} none]",
+            "[list run-without-auth {home-qroot run-qroot} none]",
+            "[list final-without-pending",
+            "{home-qroot auth-root run-qroot auth-manifest} none]",
+            "[list quarantine-before-authority {quarantine-package} none]",
+            "[list foreign-auth {home-qroot auth-root} auth]",
+            "set invalid_count 0",
+            "foreach scenario $invalid",
+            "r2_authority_state $values $manifest_sha $predecessor_values",
+            "[dict get $options -errorcode] ne {B82FAIL 78}",
+            "incr invalid_count",
+        ),
+        "hermetic R2 actual invalid authority matrix",
+    )
+    if (
+        len(re.findall(r"(?m)^\s{12}\[list ", invalid_authority)) != 5
+        or invalid_authority.count("r2_authority_state ") != 1
+        or invalid_authority.count("{B82FAIL 78}") != 1
+        or invalid_authority.count("incr invalid_count") != 1
+    ):
+        fail("hermetic R2 invalid authority matrix is not five actual rc78 calls")
+
+    complete_authority = r2_authority_case[
+        r2_authority_case.index("        set complete_names {") :
+        r2_authority_case.index("        set prefix_accepts 0")
+    ]
+    complete_names_match = re.search(
+        r"(?ms)^\s*set complete_names \{(?P<body>.*?)^\s*\}",
+        complete_authority,
+    )
+    foreign_complete_match = re.search(
+        r"(?ms)^\s*foreach foreign \{(?P<body>.*?)^\s*\} \{",
+        complete_authority,
+    )
+    if (
+        not complete_names_match
+        or tuple(complete_names_match.group("body").split())
+        != (
+            "home-qroot",
+            "auth-root",
+            "run-qroot",
+            "auth-manifest-pending",
+            "auth-manifest",
+            "auth-self-pending",
+            "auth-self",
+            "quarantine-intake",
+            "quarantine-package",
+            "quarantine-bootstrap",
+            "lock",
+            "receipt-final",
+        )
+        or not foreign_complete_match
+        or tuple(foreign_complete_match.group("body").split())
+        != ("home", "auth", "run", "home-type", "auth-type", "run-type")
+    ):
+        fail("hermetic R2 complete-state invalid entry matrix is not literal 6")
+    ordered(
+        complete_authority,
+        (
+            "set complete_entry_rejects 0",
+            "foreach foreign {",
+            "r2_authority_state $values $manifest_sha $predecessor_values",
+            "[dict get $options -errorcode] ne {B82FAIL 78}",
+            "incr complete_entry_rejects",
+        ),
+        "hermetic R2 actual complete-state entry rejects",
+    )
+    if (
+        complete_authority.count("r2_authority_state ") != 1
+        or complete_authority.count("{B82FAIL 78}") != 1
+        or complete_authority.count("incr complete_entry_rejects") != 1
+    ):
+        fail("hermetic R2 complete-state matrix is not six actual rc78 calls")
+
+    prefix_authority = r2_authority_case[
+        r2_authority_case.index("        set prefix_accepts 0") :
+        r2_authority_case.index(
+            "        if {$legal_count != 8 || $invalid_count != 5"
+        )
+    ]
+    accept_prefix = prefix_authority[
+        : prefix_authority.index("            foreach {label pending_size pending_sha}")
+    ]
+    reject_prefix = prefix_authority[
+        prefix_authority.index("            foreach {label pending_size pending_sha}") :
+    ]
+    ordered(
+        accept_prefix,
+        (
+            "foreach {name local_name full_sha} [list",
+            "package-manifest.v1 package-manifest.v1 $manifest_sha",
+            "prepare-stage-root.sh prepare-stage-root.sh $::r2_self_sha",
+            'set local_file "[dict get $values local_package_dir]/${local_name}"',
+            "file lstat $local_file local_stat",
+            "foreach {expected_class pending_size pending_sha} [list",
+            "empty 0",
+            "prefix 17 [r2_test_file_prefix_sha $local_file 17]",
+            "exact $local_stat(size) $full_sha",
+            "set observed_class [r2_require_auth_pending_prefix $values",
+            "$observed_class ne $expected_class",
+            "incr prefix_accepts",
+        ),
+        "hermetic R2 actual pending-prefix accepts",
+    )
+    ordered(
+        reject_prefix,
+        (
+            "foreach {label pending_size pending_sha} [list",
+            "nonprefix 17 [string repeat a 64]",
+            "oversize [expr {$local_stat(size) + 1}] [string repeat b 64]",
+            "r2_require_auth_pending_prefix $values $manifest_sha",
+            "[dict get $options -errorcode] ne {B82FAIL 78}",
+            "incr prefix_rejects",
+        ),
+        "hermetic R2 actual pending-prefix rejects",
+    )
+    if (
+        accept_prefix.count("r2_require_auth_pending_prefix ") != 1
+        or accept_prefix.count("incr prefix_accepts") != 1
+        or reject_prefix.count("r2_require_auth_pending_prefix ") != 1
+        or reject_prefix.count("{B82FAIL 78}") != 1
+        or reject_prefix.count("incr prefix_rejects") != 1
+    ):
+        fail("hermetic R2 pending-prefix matrix is not 6 accepts/4 actual rc78 rejects")
+    authority_summary = r2_authority_case[
+        r2_authority_case.index(
+            "        if {$legal_count != 8 || $invalid_count != 5"
+        ) :
+    ]
+    ordered(
+        authority_summary,
+        (
+            "$legal_count != 8",
+            "$invalid_count != 5",
+            "$complete_entry_rejects != 6",
+            "$prefix_accepts != 6",
+            "$prefix_rejects != 4",
+            "HARNESS_R2_AUTHORITY_PREFIXES legal=8",
+        ),
+        "hermetic R2 authority actual counter summary",
+    )
+    if (
+        r2_authority_case.count("r2_authority_state $values $manifest_sha") != 4
+        or r2_authority_case.count(
+            "r2_require_auth_pending_prefix $values"
+        )
+        != 2
+        or r2_authority_case.count("{B82FAIL 78}") != 3
+    ):
+        fail("hermetic R2 authority matrix does not call only the actual 8/5/6/6/4 paths")
+
+    # Exercise the real controller verifier through a copied reader.  Bind the
+    # copy transformation and every tamper family, rather than accepting its
+    # aggregate marker as proof of the 68 artifact and 22 history cuts.
+    controller_matrix_start = (
+        'R2_CONTROLLER_COPY_BUILDER="${TEST_ROOT}/r2-controller-copy-builder.py"\n'
+    )
+    controller_matrix_end = 'R2_RECEIPT_TEST_OUTPUT="$(/usr/bin/python3 -B -I -c \'\n'
+    if (
+        hermetic.count(controller_matrix_start) != 1
+        or hermetic.count(controller_matrix_end) != 1
+    ):
+        fail("cannot isolate hermetic R2 controller tamper matrix")
+    controller_matrix = hermetic[
+        hermetic.index(controller_matrix_start) : hermetic.index(
+            controller_matrix_end, hermetic.index(controller_matrix_start)
+        )
+    ]
+    copy_builder_open = (
+        "/bin/cat >\"${R2_CONTROLLER_COPY_BUILDER}\" "
+        "<<'R2_CONTROLLER_COPY_BUILDER'\n"
+    )
+    copy_builder_close = "\nR2_CONTROLLER_COPY_BUILDER\n"
+    if (
+        controller_matrix.count(copy_builder_open) != 1
+        or controller_matrix.count(copy_builder_close) != 1
+    ):
+        fail("cannot isolate hermetic R2 controller copy builder")
+    copy_builder_start = controller_matrix.index(copy_builder_open) + len(
+        copy_builder_open
+    )
+    copy_builder_end = controller_matrix.index(
+        copy_builder_close, copy_builder_start
+    )
+    copy_builder = controller_matrix[copy_builder_start:copy_builder_end]
+    try:
+        ast.parse(copy_builder)
+    except SyntaxError as exc:
+        fail(f"hermetic R2 controller copy builder is not Python: {exc}")
+    ordered(
+        copy_builder,
+        (
+            "source_path = pathlib.Path(sys.argv[1])",
+            "physical_package = pathlib.Path(sys.argv[2])",
+            'dispatch_tail = \'main "$@"\\n\'',
+            'canonical_package = "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-f75fe7678cfd"',
+            "source.count(canonical_assignment) != 1",
+            "source.count(canonical_package) != 3",
+            "source.count(canonical_manifest_record) != 1",
+            'tuple_anchor = ") = sys.argv[1:]\\nexpected_manifest = sys.stdin.buffer.read()\\n"',
+            "_r2_test_physical_package = __PHYSICAL_PACKAGE__",
+            "_r2_test_canonical_package = package_name",
+            "def _r2_test_map_path(path):",
+            "def _r2_test_mapped_open(path, flags, mode=0o777, *, dir_fd=None):",
+            "def _r2_test_mapped_stat(path, *, dir_fd=None, follow_symlinks=True):",
+            "def _r2_test_mapped_realpath(path, *args, **kwargs):",
+            "os.open = _r2_test_mapped_open",
+            "os.stat = _r2_test_mapped_stat",
+            "os.path.realpath = _r2_test_mapped_realpath",
+            "source = source.replace(tuple_anchor, mapping, 1)",
+            "git_anchor =",
+            'if scenario == "baseline":',
+            'elif scenario == "package-swap":',
+            "os.rename(",
+            'os.fspath(_r2_test_physical_package) + ".held"',
+            "os.mkdir(os.fspath(_r2_test_physical_package), 0o700)",
+            'elif scenario == "git-child-failure":',
+            '\'    git_prefix[0] = "/usr/bin/false"\\n\' + git_anchor',
+            'elif scenario == "bundle-child-failure":',
+            '\'    run_git(("bundle", "verify", bundle_argument), failure_rc=67)\\n\'',
+            "source.count(canonical_assignment) != 1",
+            "source.count(canonical_package) != 3",
+            "source.count(canonical_manifest_record) != 1",
+            'source.count("_r2_test_physical_package = ") != 1',
+            '"R2_CONTROLLER_COPY replacements=0 physical_open_injections=1 "',
+            '"canonical_manifest_replacements=0 logical_fixed_occurrences=3"',
+        ),
+        "hermetic actual controller physical-open copy seam",
+    )
+    if (
+        tuple(
+            re.findall(
+                r'(?m)^(?:if|elif) scenario == "([a-z-]+)":$', copy_builder
+            )
+        )
+        != (
+            "baseline",
+            "package-swap",
+            "git-child-failure",
+            "bundle-child-failure",
+        )
+        or copy_builder.count("source = source.replace(") != 4
+        or copy_builder.count("os.open = _r2_test_mapped_open") != 1
+        or copy_builder.count("os.stat = _r2_test_mapped_stat") != 1
+        or copy_builder.count("os.path.realpath = _r2_test_mapped_realpath") != 1
+        or any(
+            name in copy_builder
+            for name in (
+                "verify_r2_predecessor_manifest_contract",
+                "verify_r2_predecessor_tree_mapping",
+                "verify_r2_predecessor_history",
+                "verify_r2_local_authorities",
+            )
+        )
+    ):
+        fail("hermetic R2 controller copy seam replaces verifier control logic")
+
+    local_runner_open = (
+        "/bin/cat >\"${R2_CONTROLLER_LOCAL_RUNNER}\" "
+        "<<'R2_CONTROLLER_LOCAL_RUNNER'\n"
+    )
+    local_runner_close = "\nR2_CONTROLLER_LOCAL_RUNNER\n"
+    if (
+        controller_matrix.count(local_runner_open) != 1
+        or controller_matrix.count(local_runner_close) != 1
+    ):
+        fail("cannot isolate hermetic R2 controller local runner")
+    local_runner_start = controller_matrix.index(local_runner_open) + len(
+        local_runner_open
+    )
+    local_runner_end = controller_matrix.index(
+        local_runner_close, local_runner_start
+    )
+    local_runner = controller_matrix[local_runner_start:local_runner_end]
+    ordered(
+        local_runner,
+        (
+            "set -o pipefail",
+            'source "${reader}" || exit $?',
+            "parse_arguments() {",
+            "[[ \"$1\" == verify-r2-predecessor-package ]] || return 64",
+            'SUPPLIED_CREDENTIAL_PATH="${credential_path}"',
+            "verify_manifest_contract() { return 0; }",
+            "transport() { printf 'R2_CONTROLLER_NETWORK_TRIPWIRE",
+            "run_operation() { printf 'R2_CONTROLLER_OPERATION_TRIPWIRE",
+            "main verify-r2-predecessor-package",
+        ),
+        "hermetic actual controller local-only runner",
+    )
+    if any(
+        f"{name}()" in local_runner
+        for name in (
+            "verify_r2_local_authorities",
+            "verify_r2_predecessor_manifest_contract",
+            "verify_r2_predecessor_tree_mapping",
+            "verify_r2_predecessor_history",
+        )
+    ):
+        fail("hermetic controller local runner replaces predecessor verifier")
+    make_controller_reader = bash_function(
+        controller_matrix, "make_r2_controller_reader"
+    )
+    ordered(
+        make_controller_reader,
+        (
+            '/usr/bin/python3 -B -I "${R2_CONTROLLER_COPY_BUILDER}"',
+            '"${FIXTURE_REVIEW}/controller.sh" "${physical_package}" "${target}"',
+            '"${scenario}"',
+            "R2_CONTROLLER_COPY replacements=0 physical_open_injections=1",
+            "canonical_manifest_replacements=0 logical_fixed_occurrences=3",
+            '/bin/chmod 0600 "${target}"',
+            '/bin/bash -n "${target}"',
+        ),
+        "hermetic controller reader is copied from actual production",
+    )
+    run_controller_reader = bash_function(
+        controller_matrix, "run_r2_controller_reader"
+    )
+    ordered(
+        run_controller_reader,
+        (
+            "process = subprocess.Popen(",
+            "sys.argv[1:]",
+            "stdin=subprocess.DEVNULL",
+            "stdout=subprocess.PIPE",
+            "stderr=subprocess.STDOUT",
+            "start_new_session=True",
+            "process.communicate(timeout=4)",
+            "except subprocess.TimeoutExpired:",
+            "os.killpg(process.pid, signal.SIGTERM)",
+            "process.communicate(timeout=2)",
+            "raise SystemExit(124)",
+            '/bin/bash "${R2_CONTROLLER_LOCAL_RUNNER}" "$1"',
+            '"${BOUND_MANIFEST_SHA}" "${FIXTURE_COMMIT}" "$2"',
+        ),
+        "hermetic controller FIFO-bounded reader",
+    )
+
+    controller_positive = controller_matrix[
+        controller_matrix.index('R2_CONTROLLER_CREDENTIAL_FIFO="') :
+        controller_matrix.index(
+            "readonly -a R2_CONTROLLER_PREDECESSOR_FILES=("
+        )
+    ]
+    ordered(
+        controller_positive,
+        (
+            '/usr/bin/mkfifo -m 0600 -- "${R2_CONTROLLER_CREDENTIAL_FIFO}"',
+            'make_r2_controller_reader "${R2_PREDECESSOR_CLONE}" baseline',
+            "R2_CONTROLLER_CLONE_OUTPUT=\"$(run_r2_controller_reader",
+            '"${R2_CONTROLLER_CLONE_READER}" "${R2_CONTROLLER_CREDENTIAL_FIFO}"',
+            '"${R2_CONTROLLER_CLONE_OUTPUT##*$\'\\n\'}" ==',
+            '/usr/bin/grep -Fxc -- "${R2_CONTROLLER_CLONE_MARKER}"',
+            "R2_CONTROLLER_MISSING_CREDENTIAL_OUTPUT=\"$(run_r2_controller_reader",
+            '"${R2_CONTROLLER_MISSING_CREDENTIAL}"',
+            '"${R2_CONTROLLER_MISSING_CREDENTIAL_OUTPUT##*$\'\\n\'}" ==',
+            'R2_CONTROLLER_PACKAGE_FIFO="${TEST_ROOT}/r2-controller-package.fifo"',
+            '/usr/bin/mkfifo -m 0600 -- "${R2_CONTROLLER_PACKAGE_FIFO}"',
+            'make_r2_controller_reader "${R2_CONTROLLER_PACKAGE_FIFO}" baseline',
+            '"${R2_CONTROLLER_FIFO_READER}" "${R2_CONTROLLER_CREDENTIAL_FIFO}"',
+            '"${R2_CONTROLLER_FIFO_RC}" -eq 66',
+            "reason=r2-local-authority rc=66",
+            'make_r2_controller_reader "${R2_CONTROLLER_SWAP_PACKAGE}" package-swap',
+            '"${R2_CONTROLLER_SWAP_READER}" "${R2_CONTROLLER_CREDENTIAL_FIFO}"',
+            '"${R2_CONTROLLER_SWAP_RC}" -eq 66',
+            '-d "${R2_CONTROLLER_SWAP_PACKAGE}"',
+            '-d "${R2_CONTROLLER_SWAP_PACKAGE}.held"',
+        ),
+        "hermetic controller clone/FIFO/path-swap scenarios",
+    )
+    if (
+        controller_positive.count("run_r2_controller_reader") != 4
+        or controller_positive.count("R2_CONTROLLER_NETWORK_TRIPWIRE*") != 4
+        or controller_positive.count("R2_CONTROLLER_OPERATION_TRIPWIRE*") != 4
+        or controller_positive.count("/usr/bin/mkfifo -m 0600") != 2
+    ):
+        fail("hermetic controller positive/FIFO/path-swap cardinality drifted")
+
+    controller_predecessor_files = tuple(
+        bash_array(hermetic, "R2_CONTROLLER_PREDECESSOR_FILES").split()
+    )
+    if controller_predecessor_files != r2_predecessor_package_names:
+        fail("hermetic controller tamper oracle is not the independent 17 files")
+    make_artifact_case = bash_function(
+        controller_matrix, "make_r2_controller_artifact_case"
+    )
+    ordered(
+        make_artifact_case,
+        (
+            "((R2_CONTROLLER_ARTIFACT_ORDINAL += 1))",
+            'R2_CONTROLLER_CASE_PACKAGE="${R2_CONTROLLER_ARTIFACT_CASE_ROOT}/$(printf \'%03d\'',
+            '/bin/cp -R -- "${R2_PREDECESSOR_FIXED_PACKAGE}"',
+            '"${R2_CONTROLLER_CASE_PACKAGE}"',
+        ),
+        "hermetic controller isolated artifact fixture",
+    )
+    expect_artifact_rc = bash_function(
+        controller_matrix, "expect_r2_controller_artifact_rc"
+    )
+    ordered(
+        expect_artifact_rc,
+        (
+            'make_r2_controller_reader "${R2_CONTROLLER_CASE_PACKAGE}" baseline',
+            'output="$(run_r2_controller_reader "${R2_CONTROLLER_CASE_READER}"',
+            '"${R2_CONTROLLER_CREDENTIAL_FIFO}" 2>&1)"',
+            '"${rc}" -eq "${expected_rc}"',
+            'reason=r2-local-authority rc=${expected_rc}',
+            '"${output}" != *R2_CONTROLLER_NETWORK_TRIPWIRE*',
+            '"${output}" != *R2_CONTROLLER_OPERATION_TRIPWIRE*',
+            "((R2_CONTROLLER_ARTIFACT_CUTS += 1))",
+        ),
+        "hermetic controller actual artifact cut runner",
+    )
+    artifact_loop = controller_matrix[
+        controller_matrix.index(
+            'for predecessor_name in "${R2_CONTROLLER_PREDECESSOR_FILES[@]}"; do'
+        ) :
+        controller_matrix.index("expect_r2_controller_history_rc() {")
+    ]
+    artifact_rc_matrix = tuple(
+        re.findall(
+            r"expect_r2_controller_artifact_rc\s+(?:\\\s*)?"
+            r'"\$\{predecessor_name\}-(content|mode|nlink|symlink)"\s+(\d+)',
+            artifact_loop,
+        )
+    )
+    if artifact_rc_matrix != (
+        ("content", "67"),
+        ("mode", "66"),
+        ("nlink", "66"),
+        ("symlink", "66"),
+    ):
+        fail("hermetic controller artifact tamper rc matrix is not exact 17x4")
+    ordered(
+        artifact_loop,
+        (
+            "path.write_bytes(bytes((payload[0] ^ 1,)) + payload[1:])",
+            'expect_r2_controller_artifact_rc \\\n    "${predecessor_name}-content" 67',
+            '/bin/chmod 0644 \\\n    "${R2_CONTROLLER_CASE_PACKAGE}/${predecessor_name}"',
+            'expect_r2_controller_artifact_rc "${predecessor_name}-mode" 66',
+            '/bin/ln "${R2_CONTROLLER_CASE_PACKAGE}/${predecessor_name}"',
+            '"${R2_CONTROLLER_CASE_PACKAGE}.external-hardlink"',
+            'expect_r2_controller_artifact_rc "${predecessor_name}-nlink" 66',
+            '/bin/mv -- "${R2_CONTROLLER_CASE_PACKAGE}/${predecessor_name}"',
+            '"${R2_CONTROLLER_CASE_PACKAGE}.symlink-target"',
+            '/bin/ln -s "${R2_CONTROLLER_CASE_PACKAGE}.symlink-target"',
+            'expect_r2_controller_artifact_rc "${predecessor_name}-symlink" 66',
+            '"${R2_CONTROLLER_ARTIFACT_CUTS}" -eq 68',
+            "HERMETIC_R2_CONTROLLER_FILES files=17 content_mode_nlink_symlink_cuts=68",
+            "credential_fifo=unread network_tripwire=0 result=PASS",
+        ),
+        "hermetic controller real 68 artifact cuts",
+    )
+
+    expect_history_rc = bash_function(
+        controller_matrix, "expect_r2_controller_history_rc"
+    )
+    ordered(
+        expect_history_rc,
+        (
+            'make_r2_controller_reader "${R2_CONTROLLER_CASE_PACKAGE}" "${scenario}"',
+            'output="$(run_r2_controller_reader "${R2_CONTROLLER_CASE_READER}"',
+            '"${R2_CONTROLLER_CREDENTIAL_FIFO}" 2>&1)"',
+            '"${rc}" -eq "${expected_rc}"',
+            'reason=r2-local-authority rc=${expected_rc}',
+            '"${output}" != *R2_CONTROLLER_NETWORK_TRIPWIRE*',
+            '"${output}" != *R2_CONTROLLER_OPERATION_TRIPWIRE*',
+        ),
+        "hermetic controller actual history cut runner",
+    )
+    history_section = controller_matrix[
+        controller_matrix.index("R2_CONTROLLER_HISTORY_REF_CUTS=0") :
+        controller_matrix.index('CONTROLLER_TRANSACTION_SEAM="')
+    ]
+    history_file_loop = history_section[
+        history_section.index("R2_CONTROLLER_HISTORY_FILE_CUTS=0") :
+        history_section.index(
+            "make_r2_controller_artifact_case history-git-mode"
+        )
+    ]
+    history_file_rc_matrix = tuple(
+        re.findall(
+            r'expect_r2_controller_history_rc\s+"\$\{history_name\}-'
+            r'(content|mode|nlink|symlink)"\s+(\d+)',
+            history_file_loop,
+        )
+    )
+    if (
+        "for history_name in history-roots.v1 history-objects.v1; do"
+        not in history_file_loop
+        or history_file_rc_matrix
+        != (
+            ("content", "67"),
+            ("mode", "66"),
+            ("nlink", "66"),
+            ("symlink", "66"),
+        )
+        or history_file_loop.count(
+            "((R2_CONTROLLER_HISTORY_FILE_CUTS += 1))"
+        )
+        != 4
+    ):
+        fail("hermetic controller history-file matrix is not actual 2x4")
+    ordered(
+        history_file_loop,
+        (
+            "path.write_bytes(bytes((payload[0] ^ 1,)) + payload[1:])",
+            'expect_r2_controller_history_rc "${history_name}-content" 67',
+            '/bin/chmod 0644 "${R2_CONTROLLER_CASE_PACKAGE}/${history_name}"',
+            'expect_r2_controller_history_rc "${history_name}-mode" 66',
+            '/bin/ln "${R2_CONTROLLER_CASE_PACKAGE}/${history_name}"',
+            'external-hardlink"',
+            'expect_r2_controller_history_rc "${history_name}-nlink" 66',
+            '/bin/mv -- "${R2_CONTROLLER_CASE_PACKAGE}/${history_name}"',
+            'symlink-target"',
+            "/bin/ln -s",
+            'expect_r2_controller_history_rc "${history_name}-symlink" 66',
+        ),
+        "hermetic controller history content/mode/nlink/symlink cuts",
+    )
+    history_shape = history_section[
+        history_section.index("R2_CONTROLLER_HISTORY_SHAPE_CUTS=0") :
+        history_section.index(
+            '[[ "${R2_CONTROLLER_HISTORY_FILE_CUTS}" -eq 8'
+        )
+    ]
+    history_shape_calls = tuple(
+        re.findall(
+            r"(?m)^expect_r2_controller_history_rc\s+([^\n]+)$",
+            history_shape,
+        )
+    )
+    if history_shape_calls != (
+        "package-extra 66",
+        "package-missing 66",
+        "package-mode 66",
+        "package-symlink 66",
+        "history-git-mode 66",
+        "history-git-extra 66",
+        "history-git-symlink 66",
+        "history-git-missing 66",
+        "history-git-object 76",
+        "history-git-child 76 git-child-failure",
+        "bundle-child 67 bundle-child-failure",
+    ) or history_shape.count("((R2_CONTROLLER_HISTORY_SHAPE_CUTS += 1))") != 11:
+        fail("hermetic controller history shape matrix is not actual 11 cuts")
+    ordered(
+        history_shape,
+        (
+            '/usr/bin/touch "${R2_CONTROLLER_CASE_PACKAGE}/unexpected-entry"',
+            '/bin/mv -- "${R2_CONTROLLER_CASE_PACKAGE}/controller.sh"',
+            '/bin/chmod 0755 "${R2_CONTROLLER_CASE_PACKAGE}"',
+            '/bin/ln -s "${R2_CONTROLLER_CASE_PACKAGE}.symlink-target"',
+            '/bin/chmod 0755 \\\n  "${R2_CONTROLLER_CASE_PACKAGE}/history-verification.git"',
+            "history-verification.git/unexpected-entry",
+            "history-git-symlink-target",
+            "history-git-missing",
+            "missing-pack-object",
+            "history-git-child 76 git-child-failure",
+            "bundle-child 67 bundle-child-failure",
+        ),
+        "hermetic controller history shape mutations",
+    )
+    if (
+        history_section.count("((R2_CONTROLLER_HISTORY_REF_CUTS += 1))") != 3
+        or history_section.count("refs/heads/history-verified") != 2
+        or history_section.count("update-ref refs/heads/foreign") != 1
+    ):
+        fail("hermetic controller ref tamper matrix is not exact three cuts")
+    ordered(
+        history_section,
+        (
+            'rev-parse \\\n  "${R2_PREDECESSOR_COMMIT}^"',
+            'update-ref refs/heads/history-verified "${R2_CONTROLLER_HISTORY_PARENT}"',
+            "expect_r2_controller_history_rc history-ref-ancestor 76",
+            'update-ref refs/heads/foreign "${R2_PREDECESSOR_COMMIT}"',
+            "expect_r2_controller_history_rc history-ref-extra 76",
+            'rev-parse \\\n  "${FIXTURE_COMMIT}^"',
+            'update-ref refs/heads/history-verified "${R2_CURRENT_HISTORY_PARENT}"',
+            "verify_manifest_contract || exit $?",
+            'LOCAL_PACKAGE_DIR="$4"',
+            "verify_bound_history",
+            '"${R2_CURRENT_HISTORY_REF_RC}" -eq 76',
+            '"${R2_CONTROLLER_HISTORY_REF_CUTS}" -eq 3',
+            "HERMETIC_R2_CONTROLLER_HISTORY_REFS predecessor_ancestor=STOP",
+            "predecessor_extra=STOP current_ancestor=STOP cuts=3 rc=76",
+            "credential_reads=0 network_operations=0 result=PASS",
+        ),
+        "hermetic actual current/predecessor exact-ref cuts",
+    )
+    controller_summary = (
+        "HERMETIC_R2_CONTROLLER_SEAMS public_modes=2 high_level_calls=2 "
+        "local_only=PASS fixed_positive=1 clone_positive=2 package_fifo=1 "
+        "artifact_cuts=68 history_cuts=22 path_swaps=1 replacements=0 "
+        "physical_open_injections=1 canonical_manifest_replacements=0 "
+        "network_tripwire=0 result=PASS"
+    )
+    if controller_matrix.count(controller_summary) != 1:
+        fail("hermetic R2 controller matrix summary is not exact")
+
+    engine_harness_open = (
+        "/bin/cat >\"${R2_ENGINE_HARNESS}\" <<'R2_ENGINE_HARNESS'\n"
+    )
+    engine_harness_close = "R2_ENGINE_HARNESS\n"
+    if (
+        hermetic.count(engine_harness_open) != 1
+        or hermetic.count(engine_harness_close) != 1
+    ):
+        fail("cannot isolate hermetic actual R2 engine harness")
+    engine_harness_start = hermetic.index(engine_harness_open) + len(
+        engine_harness_open
+    )
+    engine_harness_end = hermetic.index(
+        engine_harness_close, engine_harness_start
+    )
+    engine_harness = hermetic[engine_harness_start:engine_harness_end]
+    if hashlib.sha256(engine_harness.encode("utf-8")).hexdigest() != (
+        "1e3d1a6fb66a2b60e2fdb67e66f0e27b5dbcd1fa707ce59d0dda323c74e8aecb"
+    ):
+        fail("hermetic actual R2 engine harness bytes drifted")
+    try:
+        engine_harness_tree = ast.parse(engine_harness)
+    except SyntaxError as exc:
+        fail(f"hermetic R2 engine harness is not valid Python: {exc}")
+    validate_engine_harness_execution_ast(engine_harness)
+    harness_assignments: dict[str, ast.AST] = {}
+    for assignment_name in (
+        "EXPECTED_ENGINE_FUNCTIONS",
+        "EXPECTED_ENGINE_PAYLOAD_SHA256",
+        "EXPECTED_ENGINE_MAIN_SHA256",
+        "PREDECESSOR_COMMIT",
+        "PREDECESSOR_MANIFEST_SHA256",
+        "R1_MANIFEST_SHA256",
+        "R1_SELF_SHA256",
+        "R1_RECEIPT_SHA256",
+        "R1_ID",
+        "BOOT_ID",
+        "HOSTNAME",
+        "KERNEL",
+        "MACHINE_ID",
+        "PATHS",
+        "PACKAGE_NAMES",
+        "BOOTSTRAP_NAMES",
+        "STATE_SIGNATURES",
+    ):
+        matches = [
+            node.value
+            for node in engine_harness_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == assignment_name
+                for target in node.targets
+            )
+        ]
+        if len(matches) != 1:
+            fail(f"hermetic R2 engine harness assignment is not unique: {assignment_name}")
+        harness_assignments[assignment_name] = matches[0]
+    try:
+        harness_engine_functions = ast.literal_eval(
+            harness_assignments["EXPECTED_ENGINE_FUNCTIONS"]
+        )
+        harness_payload_sha = ast.literal_eval(
+            harness_assignments["EXPECTED_ENGINE_PAYLOAD_SHA256"]
+        )
+        harness_main_sha = ast.literal_eval(
+            harness_assignments["EXPECTED_ENGINE_MAIN_SHA256"]
+        )
+        harness_paths = ast.literal_eval(harness_assignments["PATHS"])
+        harness_package_names = ast.literal_eval(
+            harness_assignments["PACKAGE_NAMES"]
+        )
+        harness_bootstrap_names = ast.literal_eval(
+            harness_assignments["BOOTSTRAP_NAMES"]
+        )
+        harness_state_signatures = ast.literal_eval(
+            harness_assignments["STATE_SIGNATURES"]
+        )
+        harness_constants = {
+            name: ast.literal_eval(harness_assignments[name])
+            for name in (
+                "PREDECESSOR_COMMIT",
+                "PREDECESSOR_MANIFEST_SHA256",
+                "R1_MANIFEST_SHA256",
+                "R1_SELF_SHA256",
+                "R1_RECEIPT_SHA256",
+                "R1_ID",
+                "BOOT_ID",
+                "HOSTNAME",
+                "KERNEL",
+                "MACHINE_ID",
+            )
+        }
+    except (TypeError, ValueError) as exc:
+        fail(f"hermetic R2 engine harness authority is not literal: {exc}")
+    expected_harness_paths = {
+        "current_manifest": f"{r2_home_qroot}/authority/package-manifest.v1",
+        "current_manifest_pending": (
+            f"{r2_home_qroot}/authority/package-manifest.v1.pending"
+        ),
+        "current_self": f"{r2_home_qroot}/authority/prepare-stage-root.sh",
+        "current_self_pending": (
+            f"{r2_home_qroot}/authority/prepare-stage-root.sh.pending"
+        ),
+        "user_intake": r2_user_intake,
+        "home_qroot": r2_home_qroot,
+        "auth_root": f"{r2_home_qroot}/authority",
+        "q_intake": f"{r2_home_qroot}/intake",
+        "q_package": f"{r2_home_qroot}/package",
+        "source_package": r2_predecessor_remote_package,
+        "source_bootstrap": r2_predecessor_bootstrap,
+        "run_qroot": r2_run_qroot,
+        "q_bootstrap": f"{r2_run_qroot}/bootstrap",
+        "lock": f"{r2_run_qroot}/retirement.v1.lock",
+        "receipt_pending": f"{r2_run_qroot}/retirement-complete.v1.pending",
+        "receipt_final": f"{r2_run_qroot}/retirement-complete.v1",
+    }
+    expected_harness_constants = {
+        "PREDECESSOR_COMMIT": r2_predecessor_commit,
+        "PREDECESSOR_MANIFEST_SHA256": r2_predecessor_manifest_sha,
+        "R1_MANIFEST_SHA256": retained_retirement_manifest_sha,
+        "R1_SELF_SHA256": retained_retirement_helper_sha,
+        "R1_RECEIPT_SHA256": retained_retirement_receipt_sha,
+        "R1_ID": "c8e41d73-2c690050ae1d-r1",
+        "BOOT_ID": "01234567-89ab-cdef-0123-456789abcdef",
+        "HOSTNAME": "ubuntu-2604-test",
+        "KERNEL": "7.0.0-28-generic",
+        "MACHINE_ID": "9db3fb717cc74974b2a6b243d67f67b9",
+    }
+    expected_harness_state_signatures = {
+        state: tuple(int(flag) for flag in signature)
+        for signature, state in expected_state_matrix.items()
+    }
+    if (
+        harness_engine_functions != expected_engine_functions
+        or len(harness_engine_functions) != 48
+        or harness_constants != expected_harness_constants
+        or harness_paths != expected_harness_paths
+        or harness_package_names != r2_predecessor_package_names
+        or harness_bootstrap_names
+        != ("prepare-stage-root.sh", "provision-ubuntu-test-host.sh")
+        or harness_state_signatures != expected_harness_state_signatures
+        or not r2_engine.endswith("\n")
+        or hashlib.sha256(r2_engine[:-1].encode("utf-8")).hexdigest()
+        != harness_payload_sha
+        or hashlib.sha256(engine_functions["engine_main"].encode("utf-8")).hexdigest()
+        != harness_main_sha
+    ):
+        fail("hermetic R2 harness is not bound to the actual 48-function engine")
+    ordered(
+        engine_harness,
+        (
+            'R1_RETAINED_PACKAGE = Path(\n    "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-2c690050ae1d"',
+            'R1_AUTHORITY_PACKAGE = Path(\n    "/private/tmp/wg-mix-b82-v6-c8e41d73-4f2a9b61-4bdfdfd90756"',
+        ),
+        "hermetic fixed retained R1 fixture authorities",
+    )
+
+    # Compare the complete embedded module, not just its FunctionDef surface.
+    # The hermetic executor may change only the two top-level root-id values;
+    # imports, all other constants and the final engine_main dispatch remain
+    # byte-for-byte equivalent at the AST level.
+    full_engine_before = ast.parse(r2_engine[:-1])
+    full_engine_after = ast.parse(r2_engine[:-1])
+    full_before_nodes = tuple(
+        ast.dump(node, include_attributes=False) for node in full_engine_before.body
+    )
+    root_id_changes = []
+    for index, node in enumerate(full_engine_after.body):
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if not isinstance(target, ast.Name) or target.id not in {
+            "ROOT_UID",
+            "ROOT_GID",
+        }:
+            continue
+        if (
+            not isinstance(node.value, ast.Constant)
+            or type(node.value.value) is not int
+            or node.value.value != 0
+        ):
+            fail(f"embedded engine {target.id} is not one top-level zero constant")
+        node.value = ast.Constant(1001 + len(root_id_changes))
+        root_id_changes.append((index, target.id))
+    full_after_nodes = tuple(
+        ast.dump(node, include_attributes=False) for node in full_engine_after.body
+    )
+    full_module_differences = tuple(
+        index
+        for index, (before_node, after_node) in enumerate(
+            zip(full_before_nodes, full_after_nodes)
+        )
+        if before_node != after_node
+    )
+    if (
+        tuple(name for _, name in root_id_changes) != ("ROOT_UID", "ROOT_GID")
+        or full_module_differences
+        != tuple(index for index, _ in root_id_changes)
+        or len(full_before_nodes) != len(full_after_nodes)
+        or full_module_differences[-1] == len(full_before_nodes) - 1
+    ):
+        fail("embedded engine full module differs beyond ROOT_UID/ROOT_GID values")
+    final_dispatch = full_engine_before.body[-1]
+    if (
+        not isinstance(final_dispatch, ast.Try)
+        or len(final_dispatch.body) != 1
+        or not isinstance(final_dispatch.body[0], ast.Expr)
+        or not isinstance(final_dispatch.body[0].value, ast.Call)
+        or not isinstance(final_dispatch.body[0].value.func, ast.Name)
+        or final_dispatch.body[0].value.func.id != "engine_main"
+        or final_dispatch.body[0].value.args
+        or final_dispatch.body[0].value.keywords
+        or tuple(
+            handler.type.id
+            for handler in final_dispatch.handlers
+            if isinstance(handler.type, ast.Name)
+        )
+        != ("RetirementStop", "KeyError", "OSError")
+        or final_dispatch.orelse
+        or final_dispatch.finalbody
+    ):
+        fail("embedded engine final engine_main dispatch is not exact and unchanged")
+
+    extract_engine = python_function(
+        engine_harness, "extract_and_transform_engine"
+    )
+    ordered(
+        extract_engine,
+        (
+            'shell = Path(stager).read_text(encoding="utf-8")',
+            'anchor = shell.index("run_r2_retirement_engine() {")',
+            'function_end = shell.index("\\nrun_stage() {", anchor)',
+            'function.count("<<\'PY\'\\n") != 1',
+            'payload = function[begin:end]',
+            "hashlib.sha256(payload.encode(\"utf-8\")).hexdigest() !=",
+            "EXPECTED_ENGINE_PAYLOAD_SHA256",
+            "original = ast.parse(payload",
+            "transformed = ast.parse(payload",
+            "tuple(node.name for node in original_functions) != EXPECTED_ENGINE_FUNCTIONS",
+            "tuple(node.name for node in transformed_functions) != EXPECTED_ENGINE_FUNCTIONS",
+            "engine_main_node = original_functions[-1]",
+            "ast.get_source_segment(payload, engine_main_node)",
+            "EXPECTED_ENGINE_MAIN_SHA256",
+            "function_names = set(EXPECTED_ENGINE_FUNCTIONS)",
+            'pending = ["engine_main"]',
+            "if closure != function_names:",
+            'values = {"ROOT_UID": os.geteuid(), "ROOT_GID": os.getegid()}',
+            "target.id in values",
+            "node.value.value != 0",
+            "node.value = ast.copy_location(ast.Constant(values[target.id]), node.value)",
+            'replacements != ["ROOT_UID", "ROOT_GID"]',
+            "if len(original.body) != len(transformed.body):",
+            'raise AssertionError("embedded-engine-module-body-cardinality")',
+            "top_level_differences = []",
+            "for original_node, transformed_node in zip(original.body, transformed.body):",
+            "target_name = original_node.targets[0].id",
+            "top_level_differences.append(target_name)",
+            "ast.dump(original_node, include_attributes=False) !=",
+            "ast.dump(transformed_node, include_attributes=False)",
+            'raise AssertionError("production-module-rewrite")',
+            'top_level_differences != ["ROOT_UID", "ROOT_GID"]',
+            'raise AssertionError("production-module-difference-cardinality")',
+            "after = {",
+            "if after != before:",
+            'return compile(transformed, str(stager) + ":embedded-r2", "exec")',
+        ),
+        "hermetic extraction of actual R2 engine_main closure",
+    )
+    if (
+        extract_engine.count("ast.parse(payload") != 2
+        or extract_engine.count("node.value = ") != 1
+        or extract_engine.count("compile(transformed") != 1
+        or extract_engine.count("for original_node, transformed_node in zip(") != 1
+        or extract_engine.count("top_level_differences.append(target_name)") != 1
+        or any(
+            forbidden in extract_engine
+            for forbidden in (
+                "ast.NodeTransformer",
+                "payload.replace(",
+                "source.replace(",
+                'namespace["engine_main"]',
+                "namespace['engine_main']",
+                "setattr(",
+            )
+        )
+    ):
+        fail("hermetic R2 engine AST transform is not UID/GID-only")
+    extract_engine_node = next(
+        node
+        for node in engine_harness_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "extract_and_transform_engine"
+    )
+    attribute_write_targets = tuple(
+        ast.get_source_segment(engine_harness, target) or ""
+        for node in ast.walk(extract_engine_node)
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+        for target in (
+            node.targets
+            if isinstance(node, ast.Assign)
+            else (node.target,)
+        )
+        if isinstance(target, ast.Attribute)
+    )
+    if attribute_write_targets != ("node.value",):
+        fail("hermetic R2 engine AST mutates more than the two root-id values")
+
+    engine_argv_source = python_function(engine_harness, "engine_argv")
+    engine_argv_node = next(
+        node
+        for node in engine_harness_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "engine_argv"
+    )
+    argv_assignments = [
+        node.value
+        for node in ast.walk(engine_argv_node)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "argv"
+            for target in node.targets
+        )
+    ]
+    if (
+        len(argv_assignments) != 1
+        or not isinstance(argv_assignments[0], ast.List)
+        or len(argv_assignments[0].elts) != 24
+    ):
+        fail("hermetic actual R2 engine argv is not one 24-item list")
+    ordered(
+        engine_argv_source,
+        (
+            '"embedded-r2-engine", mode, PATHS["current_manifest"], manifest_sha',
+            'PATHS["current_manifest_pending"], PATHS["current_self"]',
+            'PATHS["current_self_pending"], PATHS["user_intake"]',
+            'PATHS["home_qroot"], PATHS["auth_root"], PATHS["q_intake"]',
+            'PATHS["q_package"], PATHS["source_package"]',
+            'PATHS["source_bootstrap"], PATHS["run_qroot"]',
+            'PATHS["q_bootstrap"], PATHS["lock"], PATHS["receipt_pending"]',
+            'PATHS["receipt_final"], PREDECESSOR_COMMIT',
+            "PREDECESSOR_MANIFEST_SHA256, HOSTNAME, KERNEL, MACHINE_ID",
+            "if len(argv) != 24:",
+            "return argv",
+        ),
+        "hermetic actual R2 engine fixed argv",
+    )
+    if any(
+        mutation in engine_argv_source
+        for mutation in ("argv.append", "argv.extend", "argv.insert", "argv +=")
+    ):
+        fail("hermetic R2 engine argv is mutable after its 24-item authority")
+    execute_engine_child = python_function(
+        engine_harness, "execute_engine_child"
+    )
+    ordered(
+        execute_engine_child,
+        (
+            "code = extract_and_transform_engine(stager)",
+            "install_engine_boundaries(",
+            "sys.argv = engine_argv(mode, manifest_sha)",
+            'exec(code, {"__name__": "__main__", "__file__": "<embedded-r2-engine>"})',
+            "renameat2.calls != expected_renames",
+            "HERMETIC_R2_ENGINE_CHILD functions=48 closure=48 argv=24",
+            "root_id_assignments=2",
+        ),
+        "hermetic execution of actual embedded engine_main",
+    )
+    if any(
+        override in engine_harness
+        for override in (
+            'namespace["engine_main"] =',
+            "namespace['engine_main'] =",
+            "globals()[\"engine_main\"] =",
+            "globals()['engine_main'] =",
+        )
+    ):
+        fail("hermetic R2 harness replaces actual engine_main")
+
+    harness_receipt_node = next(
+        node
+        for node in engine_harness_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "independent_r2_receipt"
+    )
+    harness_receipt_source = ast.get_source_segment(
+        engine_harness, harness_receipt_node
+    ) or ""
+    harness_receipt_lines = [
+        node.value
+        for node in ast.walk(harness_receipt_node)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "lines"
+            for target in node.targets
+        )
+    ]
+    if len(harness_receipt_lines) != 1 or not isinstance(
+        harness_receipt_lines[0], ast.Tuple
+    ):
+        fail("hermetic R2 engine receipt oracle is not one ordered tuple")
+    harness_receipt_environment = {
+        "PREDECESSOR_COMMIT": r2_predecessor_commit,
+        "PREDECESSOR_MANIFEST_SHA256": r2_predecessor_manifest_sha,
+        "R1_ID": "c8e41d73-2c690050ae1d-r1",
+        "R1_RECEIPT_SHA256": retained_retirement_receipt_sha,
+        "manifest_sha": "a" * 64,
+        "self_sha": "b" * 64,
+    }
+
+    def harness_receipt_value(node: ast.AST) -> str:
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.Name) and node.id in harness_receipt_environment:
+            return harness_receipt_environment[node.id]
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            return harness_receipt_value(node.left) + harness_receipt_value(node.right)
+        if (
+            isinstance(node, ast.Subscript)
+            and isinstance(node.value, ast.Name)
+            and isinstance(node.slice, ast.Constant)
+            and isinstance(node.slice.value, str)
+        ):
+            if node.value.id == "PATHS" and node.slice.value in harness_paths:
+                return harness_paths[node.slice.value]
+            if node.value.id == "values" and node.slice.value == "integration_commit":
+                return "c" * 40
+        fail(
+            "hermetic R2 engine receipt contains a production-derived/non-contract "
+            f"expression: {ast.dump(node)}"
+        )
+        raise AssertionError
+
+    harness_receipt_pairs = []
+    for item in harness_receipt_lines[0].elts:
+        if not isinstance(item, ast.Tuple) or len(item.elts) != 2:
+            fail("hermetic R2 engine receipt entry is not a key/value pair")
+        harness_receipt_pairs.append(
+            (
+                harness_receipt_value(item.elts[0]),
+                harness_receipt_value(item.elts[1]),
+            )
+        )
+    if tuple(harness_receipt_pairs) != expected_receipt_pairs:
+        fail("hermetic R2 engine receipt oracle is not the independent exact 35 pairs")
+    ordered(
+        harness_receipt_source,
+        (
+            "manifest_payload, values = manifest_values(current_manifest)",
+            "manifest_sha = hashlib.sha256(manifest_payload).hexdigest()",
+            "self_sha = digest(current_self)",
+            'values.get("prepare_stage_root_sh_sha256") != self_sha',
+            'payload = b"".join(',
+            'key.encode("ascii") + b"\\t" + value.encode("ascii") + b"\\n"',
+            "len(lines) != 35",
+            "len(set(keys)) != 35",
+            "len(payload) != 1998",
+            'payload.count(b"\\n") != 35',
+            'b"\\r" in payload',
+            'b"\\0" in payload',
+            "return manifest_sha, payload",
+        ),
+        "hermetic independent exact R2 receipt bytes",
+    )
+    if any(
+        production_receipt in harness_receipt_source
+        for production_receipt in (
+            "receipt_bytes(",
+            "validate_receipt(",
+            "EXPECTED_RECEIPT_SHA",
+            "R2_RECEIPT_SHA",
+        )
+    ):
+        fail("hermetic R2 engine computes expected receipt with production logic")
+
+    make_pair_source = python_function(engine_harness, "make_pair")
+    ordered(
+        make_pair_source,
+        (
+            "if fifo:",
+            "os.mkfifo(final, mode)",
+            "else:",
+            "copy_mode(source, final, mode)",
+            "os.link(final, pending)",
+            "first = os.lstat(final)",
+            "second = os.lstat(pending)",
+            "expected_type = stat.S_ISFIFO if fifo else stat.S_ISREG",
+            "(first.st_dev, first.st_ino, first.st_nlink) !=",
+            "(second.st_dev, second.st_ino, 2)",
+        ),
+        "hermetic R2 authority regular/FIFO held-pair fixture",
+    )
+    tree_snapshot_source = python_function(engine_harness, "tree_snapshot")
+    ordered(
+        tree_snapshot_source,
+        (
+            "metadata = os.lstat(path)",
+            'kind = "d"',
+            "names = tuple(sorted(os.listdir(path)))",
+            'kind = "f"',
+            "content = digest(path)",
+            'kind = "p"',
+            'kind = "l"',
+            "content = os.readlink(path)",
+            "relative, kind, metadata.st_dev, metadata.st_ino",
+            "stat.S_IMODE(metadata.st_mode), metadata.st_uid, metadata.st_gid",
+            "metadata.st_nlink, metadata.st_size, content",
+            "return tuple(result)",
+        ),
+        "hermetic exact inode/type/mode/content tree snapshot",
+    )
+    r1_snapshot_source = python_function(engine_harness, "r1_snapshot")
+    if (
+        r1_snapshot_source.count("tree_snapshot(root, R1_HOME_QROOT)") != 1
+        or r1_snapshot_source.count("tree_snapshot(root, R1_RUN_QROOT)") != 1
+        or "PATHS[" in r1_snapshot_source
+    ):
+        fail("hermetic R1 snapshot is not independently scoped to both retained roots")
+    observe_state_source = python_function(engine_harness, "observe_state")
+    ordered(
+        observe_state_source,
+        (
+            "STATE_SIGNATURES.items()",
+            "len(matches) != 1",
+            'state == "S2P"',
+            'PATHS["receipt_pending"]',
+            ".read_bytes() != expected_receipt",
+            'state == "T_CANDIDATE"',
+            'PATHS["receipt_final"]',
+            ".read_bytes() != expected_receipt",
+        ),
+        "hermetic state oracle binds exact pending/final receipt bytes",
+    )
+
+    engine_boundaries = python_function(
+        engine_harness, "install_engine_boundaries"
+    )
+    ordered(
+        engine_boundaries,
+        (
+            "real_os_open = os.open",
+            "real_os_rename = os.rename",
+            "real_os_stat = os.stat",
+            "real_builtin_open = builtins.open",
+            "def mapped_os_open(path, flags, mode=0o777, *, dir_fd=None):",
+            'os.fsdecode(os.fspath(path)) == "/"',
+            "return real_os_open(mapped, flags, mode)",
+            "return real_os_open(mapped, flags, mode, dir_fd=dir_fd)",
+            "def synthetic_open(path, mode=\"r\", *args, **kwargs):",
+            'decoded == "/etc/machine-id"',
+            'decoded == "/proc/sys/kernel/random/boot_id"',
+            're.fullmatch(r"/proc/self/fdinfo/([0-9]+)", decoded)',
+            "def fixed_subprocess_run(argv, **kwargs):",
+            '"pass_fds"',
+            '"/proc/self/fd/%s" % provisioner',
+            '"--check"',
+            "def fixed_cdll(name, *args, **kwargs):",
+            'name != "libc.so.6"',
+            "os.open = mapped_os_open",
+            "os.uname = lambda:",
+            "builtins.open = synthetic_open",
+            "pwd.getpwnam = lambda name:",
+            "subprocess.run = fixed_subprocess_run",
+            "ctypes.CDLL = fixed_cdll",
+        ),
+        "hermetic engine low-level path/identity/provision/rename seams",
+    )
+    boundary_assignments = tuple(
+        re.findall(
+            r"(?m)^    ((?:os\.(?:open|uname)|builtins\.open|pwd\.getpwnam|"
+            r"subprocess\.run|ctypes\.CDLL)) = ",
+            engine_boundaries,
+        )
+    )
+    if boundary_assignments != (
+        "os.open",
+        "os.uname",
+        "builtins.open",
+        "pwd.getpwnam",
+        "subprocess.run",
+        "ctypes.CDLL",
+    ):
+        fail("hermetic engine installs a non-low-level execution seam")
+    for protected_engine_function in expected_engine_functions:
+        if re.search(
+            rf"(?m)^\s*(?:def\s+{re.escape(protected_engine_function)}\s*\(|"
+            rf"{re.escape(protected_engine_function)}\s*=)",
+            engine_harness,
+        ):
+            fail(
+                "hermetic harness replaces production engine function: "
+                f"{protected_engine_function}"
+            )
+
+    independent_r1_receipt = python_function(
+        engine_harness, "independent_r1_receipt"
+    )
+    ordered(
+        independent_r1_receipt,
+        (
+            'lines = (\n        ("format", "wg-mix-ebpf-b82-prestage-retirement-terminal-v1")',
+            '("retire_id", R1_ID)',
+            '("state", "TERMINAL")',
+            '("authority_manifest_sha256", R1_MANIFEST_SHA256)',
+            '("authority_prepare_stage_root_sha256", R1_SELF_SHA256)',
+            '("rename_order", "intake,package,bootstrap")',
+            '("rename_primitive", "renameat2-RENAME_NOREPLACE-dirfd-v1")',
+            '("retention", "no-unlink-no-rmdir-no-copy-fallback")',
+            'payload = b"".join(',
+            "len(lines) != 18",
+            "len(payload) != 1211",
+            "hashlib.sha256(payload).hexdigest() != R1_RECEIPT_SHA256",
+            "return payload",
+        ),
+        "hermetic independent retained R1 receipt",
+    )
+    if "r1_receipt_bytes(" in independent_r1_receipt:
+        fail("hermetic R1 expected receipt is production-derived")
+    setup_engine_fixture = python_function(
+        engine_harness, "setup_engine_fixture"
+    )
+    ordered(
+        setup_engine_fixture,
+        (
+            'authority_fifo not in {"none", "manifest", "self"}',
+            'digest(Path(predecessor) / "package-manifest.v1") != PREDECESSOR_MANIFEST_SHA256',
+            "digest(R1_RETAINED_PACKAGE / \"package-manifest.v1\")",
+            "digest(R1_AUTHORITY_PACKAGE / \"package-manifest.v1\")",
+            "digest(R1_AUTHORITY_PACKAGE / \"prepare-stage-root.sh\")",
+            "manifest_sha, receipt = independent_r2_receipt(current_manifest, current_self)",
+            'mkdir_logical(root, PATHS["home_qroot"])',
+            'mkdir_logical(root, PATHS["auth_root"])',
+            'mkdir_logical(root, PATHS["run_qroot"])',
+            'fifo=authority_fifo == "manifest"',
+            'fifo=authority_fifo == "self"',
+            "copy_exact_set(\n        predecessor",
+            "PACKAGE_NAMES, 0o600",
+            "for name in BOOTSTRAP_NAMES:",
+            "mkdir_logical(root, R1_HOME_QROOT)",
+            "copy_exact_set(\n        R1_RETAINED_PACKAGE",
+            "mkdir_logical(root, R1_RUN_QROOT)",
+            'make_pair(\n        R1_AUTHORITY_PACKAGE / "package-manifest.v1"',
+            'make_pair(\n        R1_AUTHORITY_PACKAGE / "prepare-stage-root.sh"',
+            "copy_mode(R1_RETAINED_PACKAGE / name",
+            "r1_final.write_bytes(independent_r1_receipt())",
+            "chown_tree_current(root)",
+            "return manifest_sha, receipt",
+        ),
+        "hermetic actual engine fixture with independent current/R1 authority",
+    )
+
+    run_engine_process = python_function(engine_harness, "run_engine_process")
+    ordered(
+        run_engine_process,
+        (
+            'sys.executable, "-B", "-I", str(Path(__file__).resolve()), "child"',
+            "str(stager), str(current_manifest), str(current_self), str(predecessor)",
+            "str(root), mode, str(expected_renames), str(cut_call), cut_phase, cut_kind",
+            "return subprocess.run(",
+            "stdin=subprocess.DEVNULL",
+            "stdout=subprocess.PIPE",
+            "stderr=subprocess.STDOUT",
+            "check=False",
+            "timeout=timeout",
+            "except subprocess.TimeoutExpired",
+            'raise AssertionError(\n            "engine-child-timeout:',
+        ),
+        "hermetic bounded actual engine child execution",
+    )
+    driver_node = next(
+        node
+        for node in engine_harness_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "driver"
+    )
+    driver_source = ast.get_source_segment(engine_harness, driver_node) or ""
+    cut_point_assignments = [
+        node.value
+        for node in ast.walk(driver_node)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "cut_points"
+            for target in node.targets
+        )
+    ]
+    if len(cut_point_assignments) != 1:
+        fail("hermetic actual engine cut matrix is not unique")
+    try:
+        harness_cut_points = ast.literal_eval(cut_point_assignments[0])
+    except (TypeError, ValueError) as exc:
+        fail(f"hermetic actual engine cut matrix is not literal: {exc}")
+    if harness_cut_points != (
+        (1, "post", "I", 3, 4),
+        (2, "post", "S1", 2, 3),
+        (3, "post", "S2", 1, 2),
+        (4, "pre", "S2P", 1, 1),
+        (4, "post", "T_CANDIDATE", 0, 0),
+    ):
+        fail("hermetic actual engine cut/reentry states are not exact five-by-two")
+    ordered(
+        driver_source,
+        (
+            "extract_and_transform_engine(stager)",
+            "manifest_sha, expected_receipt = independent_r2_receipt(",
+            'baseline = new_case("baseline")',
+            "baseline_r1 = r1_snapshot(baseline)",
+            "baseline_inodes = source_directory_identities(baseline)",
+            'observe_state(baseline, expected_receipt, allow_lockless_d=True) != "D"',
+            '"retire-postflight-f75fe7678cfd-r2", 4)',
+            "result.returncode != 0",
+            "B82_V6_RETIREMENT_COMPLETE state=T disposition=advanced",
+            "namespace_writes=6 same_boot=1",
+            'observe_state(baseline, expected_receipt) != "T_CANDIDATE"',
+            '"verify-postflight-retirement-r2", 0)',
+            "verify.returncode != 0",
+            "B82_V6_RETIREMENT_VERIFIED state=T namespace_writes=0 same_boot=1",
+            "complete_snapshot(baseline) != baseline_terminal",
+            'for kind in ("exit91", "sigterm"):',
+            '"retire-postflight-f75fe7678cfd-r2", -1, call, phase, kind)',
+            'expected_rc = 91 if kind == "exit91" else -signal.SIGTERM',
+            "interrupted.returncode != expected_rc",
+            "observe_state(root, expected_receipt) != observed_state",
+            "assert_completed_move_identities(root, initial_inodes, observed_state)",
+            "r1_snapshot(root) != before_r1",
+            '"retire-postflight-f75fe7678cfd-r2", resume_renames)',
+            "resumed.returncode != 0",
+            'if observed_state == "T_CANDIDATE":',
+            "disposition=verified-existing namespace_writes=0 same_boot=1",
+            'observe_state(root, expected_receipt) != "T_CANDIDATE"',
+            "terminal_snapshot = complete_snapshot(root)",
+            '"verify-postflight-retirement-r2", 0)',
+            "verified.returncode != 0",
+            "complete_snapshot(root) != terminal_snapshot",
+            "cut_count += 1",
+            "resume_count += 1",
+            'if kind == "exit91":',
+            "exit_count += 1",
+            "signal_count += 1",
+            'for fifo, reason in (\n            ("manifest", "authority-manifest-pending-metadata")',
+            '("self", "authority-self-pending-metadata")):',
+            'new_case("authority-%s-fifo" % fifo, fifo=fifo)',
+            '"retire-postflight-f75fe7678cfd-r2", 0, timeout=5.0)',
+            "failed.returncode != 79 or elapsed >= 5.0",
+            "B82_V6_RETIREMENT_ENGINE_STOP reason=%s rc=79 cleanup=0 retained=1",
+            'observe_state(root, expected_receipt, allow_lockless_d=True) != "D"',
+            'os.path.lexists(virtual(root, PATHS["lock"]))',
+            "complete_snapshot(root) != before",
+            "r1_snapshot(root) != before_r1",
+            "fifo_count += 1",
+            "r1_comparisons) != (10, 5, 5, 10, 2, 34)",
+        ),
+        "hermetic actual engine cut/reentry/verify/FIFO/R1 matrix",
+    )
+    if (
+        driver_source.count("run_engine_process(") != 6
+        or driver_source.count("r1_comparisons += 1") != 6
+        or driver_source.count("complete_snapshot(") != 6
+        or driver_source.count("verify-postflight-retirement-r2") != 2
+    ):
+        fail("hermetic actual engine matrix call/counter structure drifted")
+
+    engine_marker = (
+        "HERMETIC_R2_ENGINE states=7 functions=48 argv=24 cuts=10 "
+        "exit91=5 sigterm=5 resumes=10 verify_namespace_writes=0 "
+        "authority_fifos=2 result=PASS"
+    )
+    r1_engine_marker = (
+        "HERMETIC_R2_R1_INVARIANCE result=PASS snapshots=34 "
+        "objects=authority,intake,package,bootstrap,lock,receipt"
+    )
+    driver_string_constants = tuple(
+        node.value
+        for node in ast.walk(driver_node)
+        if isinstance(node, ast.Constant) and isinstance(node.value, str)
+    )
+    if (
+        driver_string_constants.count(engine_marker) != 1
+        or driver_string_constants.count(r1_engine_marker) != 1
+    ):
+        fail("hermetic actual engine/R1 markers are not exact-once")
+    engine_harness_outer = hermetic[
+        engine_harness_end + len(engine_harness_close) :
+        hermetic.index(
+            "for retired_mode in retire-prestage-2c690050 verify-retirement; do",
+            engine_harness_end,
+        )
+    ]
+    ordered(
+        engine_harness_outer,
+        (
+            '/bin/chmod 0600 "${R2_ENGINE_HARNESS}"',
+            'R2_ENGINE_TEST_OUTPUT="$(/usr/bin/python3 -B -I "${R2_ENGINE_HARNESS}"',
+            '"${STAGER}" "${BOUND_MANIFEST}" "${BOUND_OUTPUT}/prepare-stage-root.sh"',
+            '"${R2_PREDECESSOR_CLONE}" "${TEST_ROOT}/r2-engine-cases")"',
+            "fail 'actual embedded R2 engine harness'",
+            "HERMETIC_R2_ENGINE ",
+            "states=7 functions=48 argv=24 cuts=10 exit91=5 sigterm=5 resumes=10",
+            "verify_namespace_writes=0 authority_fifos=2 result=PASS",
+            "HERMETIC_R2_R1_INVARIANCE ",
+            "result=PASS snapshots=34",
+            'printf \'%s\\n\' "${R2_ENGINE_TEST_OUTPUT}"',
+        ),
+        "hermetic invocation of actual frozen stager engine harness",
+    )
+
+    r2_raw_case = harness_cases["r2-raw-sequence"]
+    ordered(
+        r2_raw_case,
+        (
+            "rename execute_operation_spec transport_original_execute_operation_spec",
+            "proc execute_operation_spec {operation operation_spec password}",
+            "[lsearch -exact [r2_test_raw_sequence] $operation] >= 0",
+            "r2_test_validate_raw_spec $operation $operation_spec",
+            "lappend ::r2_raw_observed $operation",
+            "execute_r2_transaction $values $manifest_sha",
+            "set expected [r2_test_raw_sequence]",
+            "[llength $::r2_raw_observed] != 21",
+            "HARNESS_R2_RAW_SEQUENCE leaves=21 order=exact helper=last",
+            "terminal=PASS result=PASS",
+        ),
+        "hermetic actual R2 raw mutation sequence",
+    )
+    if (
+        r2_raw_case.count("execute_r2_transaction") != 1
+        or r2_raw_case.count("rename execute_operation_spec ") != 1
+    ):
+        fail("hermetic R2 raw harness does not instrument one actual transaction")
+
+    raw_ssh_prefix = tcl_proc(transport_harness, "r2_test_exact_ssh_prefix")
+    raw_scp_prefix = tcl_proc(transport_harness, "r2_test_exact_scp_prefix")
+    raw_spec_oracle = tcl_proc(transport_harness, "r2_test_validate_raw_spec")
+    if any(
+        production_options in raw_ssh_prefix + raw_scp_prefix + raw_spec_oracle
+        for production_options in (
+            "[ssh_options",
+            "[scp_options",
+            "[env_argv",
+            "[build_r2_operation",
+            "[r2_helper_remote_argv",
+        )
+    ):
+        fail("hermetic R2 raw argv oracle is production-derived")
+    raw_ssh_return = re.search(
+        r"(?ms)return \[list (?P<body>/usr/bin/ssh.*?)\]\s*$", raw_ssh_prefix
+    )
+    raw_scp_return = re.search(
+        r"(?ms)return \[list (?P<body>/usr/bin/scp.*?)\]\s*$", raw_scp_prefix
+    )
+    if not raw_ssh_return or not raw_scp_return:
+        fail("hermetic R2 raw argv oracle lacks flat SSH/SCP prefixes")
+
+    def fixed_tcl_words(body: str) -> tuple[str, ...]:
+        return tuple(body.replace("\\\n", " ").split())
+
+    expected_raw_transport_options = (
+        "-o",
+        "BatchMode=no",
+        "-o",
+        "PasswordAuthentication=yes",
+        "-o",
+        "PreferredAuthentications=password",
+        "-o",
+        "PubkeyAuthentication=no",
+        "-o",
+        "KbdInteractiveAuthentication=no",
+        "-o",
+        "IdentitiesOnly=yes",
+        "-o",
+        "NumberOfPasswordPrompts=1",
+        "-o",
+        "StrictHostKeyChecking=yes",
+        "-o",
+        "CheckHostIP=yes",
+        "-o",
+        "UpdateHostKeys=no",
+        "-o",
+        "VerifyHostKeyDNS=no",
+        "-o",
+        "ConnectTimeout=15",
+        "-o",
+        "ConnectionAttempts=1",
+        "-o",
+        "ServerAliveInterval=15",
+        "-o",
+        "ServerAliveCountMax=2",
+        "-o",
+        "ClearAllForwardings=yes",
+        "-o",
+        "ForwardAgent=no",
+        "-o",
+        "ForwardX11=no",
+        "-o",
+        "PermitLocalCommand=no",
+        "-o",
+        "LocalCommand=none",
+        "-o",
+        "ProxyCommand=none",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ControlPersist=no",
+        "-o",
+        "CanonicalizeHostname=no",
+        "-o",
+        "Compression=no",
+        "-o",
+        "LogLevel=ERROR",
+    )
+    expected_raw_ssh_prefix = (
+        "/usr/bin/ssh",
+        "-F",
+        "/dev/null",
+        "$terminal",
+        *expected_raw_transport_options,
+        "--",
+        "siyixuan@192.168.10.82",
+    )
+    # The lineage prefix is fixed `-tt`; the raw oracle independently chooses
+    # exactly `-tt` or `-T` at the single terminal slot.
+    if (
+        'set terminal [expr {$tty ? "-tt" : "-T"}]' not in raw_ssh_prefix
+        or fixed_tcl_words(raw_ssh_return.group("body"))
+        != expected_raw_ssh_prefix
+    ):
+        fail("hermetic R2 raw SSH prefix is not complete and independent")
+    expected_raw_scp_prefix = (
+        "/usr/bin/scp",
+        "-F",
+        "/dev/null",
+        "-q",
+        *expected_raw_transport_options,
+    )
+    if fixed_tcl_words(raw_scp_return.group("body")) != expected_raw_scp_prefix:
+        fail("hermetic R2 raw SCP prefix is not complete and independent")
+    raw_case_headers = re.findall(
+        r"(?m)^\s+(r2-raw-[a-z0-9-]+(?:\s+-\s+r2-raw-[a-z0-9-]+)*)\s+\{",
+        raw_spec_oracle,
+    )
+    raw_case_operations = tuple(
+        operation
+        for header in raw_case_headers
+        for operation in re.findall(r"r2-raw-[a-z0-9-]+", header)
+    )
+    if (
+        len(raw_case_operations) != 21
+        or len(set(raw_case_operations)) != 21
+        or set(raw_case_operations) != set(r2_raw_operations)
+    ):
+        fail("hermetic R2 raw argv oracle does not cover exactly 21 leaves")
+    ordered(
+        raw_spec_oracle,
+        (
+            "set expected [concat [r2_test_exact_scp_prefix]",
+            "[lrange $spawn_argv 0 end] ne [lrange $expected 0 end]",
+            "r2-raw-intake-mkdir",
+            "/usr/bin/mkdir --mode=0700 -- $intake",
+            "r2-raw-auth-manifest-install",
+            "/usr/bin/install --owner=root --group=root",
+            "--mode=0600 --no-target-directory --",
+            "r2-raw-link-auth-manifest",
+            "/usr/bin/ln --no-target-directory --",
+            "r2-raw-helper-mutate",
+            "/bin/bash -p ${auth}/prepare-stage-root.sh",
+            "retire-postflight-f75fe7678cfd-r2 --manifest",
+            "${auth}/package-manifest.v1 --manifest-sha256",
+            "$::r2_manifest_sha",
+            "/usr/bin/sudo -- /usr/bin/env -i",
+            "PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C",
+            "set expected [concat [r2_test_exact_ssh_prefix $tty] $remote]",
+            "[lrange $spawn_argv 0 end] ne [lrange $expected 0 end]",
+        ),
+        "hermetic R2 independent whole raw argv oracle",
+    )
+    if raw_spec_oracle.count(
+        "[lrange $spawn_argv 0 end] ne [lrange $expected 0 end]"
+    ) != 2:
+        fail("hermetic R2 raw oracle does not compare both whole SSH/SCP argv")
+
+    receipt_script_match = re.search(
+        r"(?ms)^R2_RECEIPT_TEST_OUTPUT=\"\$\(/usr/bin/python3 -B -I -c '\n"
+        r"(?P<body>.*?)\n'\)\" \|\| fail 'independent R2 receipt oracle'",
+        hermetic,
+    )
+    if not receipt_script_match:
+        fail("cannot isolate hermetic independent R2 receipt oracle")
+    hermetic_receipt = receipt_script_match.group("body")
+    try:
+        hermetic_receipt_tree = ast.parse(hermetic_receipt)
+    except SyntaxError as exc:
+        fail(f"hermetic independent R2 receipt oracle is not Python: {exc}")
+    receipt_line_nodes = [
+        node.value
+        for node in hermetic_receipt_tree.body
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "lines"
+            for target in node.targets
+        )
+    ]
+    if len(receipt_line_nodes) != 1 or not isinstance(receipt_line_nodes[0], ast.Tuple):
+        fail("hermetic R2 receipt oracle does not own one literal ordered tuple")
+    receipt_dynamic_values = {
+        "authority_manifest": "a" * 64,
+        "authority_helper": "b" * 64,
+        "authority_commit": "c" * 40,
+    }
+    hermetic_receipt_pairs = []
+    for item in receipt_line_nodes[0].elts:
+        if not isinstance(item, ast.Tuple) or len(item.elts) != 2:
+            fail("hermetic R2 receipt oracle entry is not a key/value pair")
+        key_node, value_node = item.elts
+        if not isinstance(key_node, ast.Constant) or not isinstance(key_node.value, str):
+            fail("hermetic R2 receipt oracle key is not literal")
+        if isinstance(value_node, ast.Constant) and isinstance(value_node.value, str):
+            value = value_node.value
+        elif isinstance(value_node, ast.Name) and value_node.id in receipt_dynamic_values:
+            value = receipt_dynamic_values[value_node.id]
+        else:
+            fail("hermetic R2 receipt oracle value is production-derived")
+        hermetic_receipt_pairs.append((key_node.value, value))
+    if tuple(hermetic_receipt_pairs) != expected_receipt_pairs:
+        fail("hermetic R2 receipt oracle is not the independent exact 35-key order")
+    ordered(
+        hermetic_receipt,
+        (
+            'authority_manifest = "a" * 64',
+            'authority_helper = "b" * 64',
+            'authority_commit = "c" * 40',
+            'payload = b"".join(',
+            'key.encode("ascii") + b"\\t" + value.encode("ascii") + b"\\n"',
+            "len(lines) != 35",
+            "len(set(keys)) != 35",
+            "len(payload) != 1998",
+            'payload.count(b"\\n") != 35',
+            'not payload.endswith(b"\\n")',
+            'b"\\r" in payload',
+            'b"\\0" in payload',
+            "tamper_rejections != 35",
+            "prefix_accepts != 3",
+            "prefix_rejects != 2",
+            "HERMETIC_R2_RECEIPT keys=35 bytes=1998 dynamic=3",
+            "hashlib.sha256(payload).hexdigest()",
+        ),
+        "hermetic independent R2 canonical receipt bytes",
+    )
+    if (
+        re.search(r"\breceipt_bytes\s*\(", hermetic_receipt)
+        or "prepare-stage-root.py" in hermetic_receipt
+        or re.search(r"sha256=[0-9a-f]{64}", hermetic_receipt)
+    ):
+        fail("hermetic R2 receipt expected bytes/hash are production-derived or hardcoded")
+
     for removed_case in (
         "retirement-precredential",
         "retirement-sequence",
@@ -1681,8 +5803,8 @@ def main() -> None:
         "retirement-intake-prefixes",
         "RETIREMENT_ENGINE_HARNESS",
         "HARNESS_RETIREMENT_",
-        "PREDECESSOR_PACKAGE",
-        "PREDECESSOR_MANIFEST",
+        "set ::PREDECESSOR_PACKAGE ",
+        "set ::PREDECESSOR_MANIFEST ",
     ):
         if removed_case in hermetic:
             fail(f"hermetic test retains obsolete retirement harness {removed_case!r}")
@@ -2077,6 +6199,9 @@ def main() -> None:
         or tuple(retired_surface_match.group("body").split())
         != expected_retired_surface
         or "RETIRED_OPERATION_REJECTIONS=0" not in hermetic
+        or 'if [[ "${operation}" == lineage-home-stat ]]' not in hermetic
+        or "plan_reason=private-operation" not in hermetic
+        or "execute_reason=private-operation" not in hermetic
         or '[[ "${RETIRED_OPERATION_REJECTIONS}" -eq 10 ]]' not in hermetic
     ):
         fail("hermetic retired public/private operation surface is not closed")
