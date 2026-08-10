@@ -589,11 +589,51 @@ proc r2_test_prewrite_sequence {} {
         lineage-lock-stat
         lineage-receipt-stat
         lineage-receipt-sha
+        lineage-q-package-stat-source-4f2a9b61.bundle
+        lineage-q-package-sha-source-4f2a9b61.bundle
+        lineage-q-package-stat-package-manifest.v1
+        lineage-q-package-sha-package-manifest.v1
+        lineage-q-package-stat-bind-final-package.sh
+        lineage-q-package-sha-bind-final-package.sh
+        lineage-q-package-stat-controller.sh
+        lineage-q-package-sha-controller.sh
+        lineage-q-package-stat-prepare-stage-root.sh
+        lineage-q-package-sha-prepare-stage-root.sh
+        lineage-q-package-stat-provision-ubuntu-test-host.sh
+        lineage-q-package-sha-provision-ubuntu-test-host.sh
+        lineage-q-package-stat-root-matrix-n-r.sh
+        lineage-q-package-sha-root-matrix-n-r.sh
+        lineage-q-package-stat-check-realhost-iperf.py
+        lineage-q-package-sha-check-realhost-iperf.py
+        lineage-q-package-stat-test-hermetic-matrix.sh
+        lineage-q-package-sha-test-hermetic-matrix.sh
+        lineage-q-package-stat-test_matrix_static.py
+        lineage-q-package-sha-test_matrix_static.py
+        lineage-q-package-stat-checksum-module-lease.sh
+        lineage-q-package-sha-checksum-module-lease.sh
+        lineage-q-package-stat-root-fresh-verifier-gate.sh
+        lineage-q-package-sha-root-fresh-verifier-gate.sh
+        lineage-q-package-stat-test-hermetic-fresh-verifier-gate.sh
+        lineage-q-package-sha-test-hermetic-fresh-verifier-gate.sh
+        lineage-q-package-stat-test_fresh_verifier_gate_static.py
+        lineage-q-package-sha-test_fresh_verifier_gate_static.py
+        lineage-q-package-stat-realnic_acceptance.py
+        lineage-q-package-sha-realnic_acceptance.py
+        lineage-q-package-stat-test_realnic_acceptance.py
+        lineage-q-package-sha-test_realnic_acceptance.py
+        lineage-q-package-stat-test_realnic_acceptance_static.py
+        lineage-q-package-sha-test_realnic_acceptance_static.py
+        lineage-q-bootstrap-stat-prepare-stage-root.sh
+        lineage-q-bootstrap-sha-prepare-stage-root.sh
+        lineage-q-bootstrap-stat-provision-ubuntu-test-host.sh
+        lineage-q-bootstrap-sha-provision-ubuntu-test-host.sh
+        lineage-boot-id-read
+        lineage-lock-content-read
+        lineage-lock-stat-recheck
         lineage-exists-user-intake
         lineage-exists-home-qroot
         lineage-exists-run-qroot
         lineage-exists-receipt-pending
-        lineage-retained-helper-verify
         r2-ro-exists-home-qroot
         r2-ro-exists-auth-root
         r2-ro-exists-run-qroot
@@ -932,6 +972,121 @@ proc r2_test_r1_package_entries {} {
     return [join $entries "\n"]
 }
 
+proc r2_test_r1_deep_operations {} {
+    # Frozen independently from the production lineage builder.  Keep the
+    # operation names and order literal so production cannot define its own
+    # test oracle.
+    return {
+        lineage-q-package-stat-source-4f2a9b61.bundle
+        lineage-q-package-sha-source-4f2a9b61.bundle
+        lineage-q-package-stat-package-manifest.v1
+        lineage-q-package-sha-package-manifest.v1
+        lineage-q-package-stat-bind-final-package.sh
+        lineage-q-package-sha-bind-final-package.sh
+        lineage-q-package-stat-controller.sh
+        lineage-q-package-sha-controller.sh
+        lineage-q-package-stat-prepare-stage-root.sh
+        lineage-q-package-sha-prepare-stage-root.sh
+        lineage-q-package-stat-provision-ubuntu-test-host.sh
+        lineage-q-package-sha-provision-ubuntu-test-host.sh
+        lineage-q-package-stat-root-matrix-n-r.sh
+        lineage-q-package-sha-root-matrix-n-r.sh
+        lineage-q-package-stat-check-realhost-iperf.py
+        lineage-q-package-sha-check-realhost-iperf.py
+        lineage-q-package-stat-test-hermetic-matrix.sh
+        lineage-q-package-sha-test-hermetic-matrix.sh
+        lineage-q-package-stat-test_matrix_static.py
+        lineage-q-package-sha-test_matrix_static.py
+        lineage-q-package-stat-checksum-module-lease.sh
+        lineage-q-package-sha-checksum-module-lease.sh
+        lineage-q-package-stat-root-fresh-verifier-gate.sh
+        lineage-q-package-sha-root-fresh-verifier-gate.sh
+        lineage-q-package-stat-test-hermetic-fresh-verifier-gate.sh
+        lineage-q-package-sha-test-hermetic-fresh-verifier-gate.sh
+        lineage-q-package-stat-test_fresh_verifier_gate_static.py
+        lineage-q-package-sha-test_fresh_verifier_gate_static.py
+        lineage-q-package-stat-realnic_acceptance.py
+        lineage-q-package-sha-realnic_acceptance.py
+        lineage-q-package-stat-test_realnic_acceptance.py
+        lineage-q-package-sha-test_realnic_acceptance.py
+        lineage-q-package-stat-test_realnic_acceptance_static.py
+        lineage-q-package-sha-test_realnic_acceptance_static.py
+        lineage-q-bootstrap-stat-prepare-stage-root.sh
+        lineage-q-bootstrap-sha-prepare-stage-root.sh
+        lineage-q-bootstrap-stat-provision-ubuntu-test-host.sh
+        lineage-q-bootstrap-sha-provision-ubuntu-test-host.sh
+        lineage-boot-id-read
+        lineage-lock-content-read
+        lineage-lock-stat-recheck
+    }
+}
+
+proc r2_test_r1_file_oracle {scope name} {
+    # Literal retained-R1 byte counts and digests.  These values are not read
+    # from the current or predecessor manifests and are not copied from a
+    # production Tcl data structure at runtime.
+    switch -- "${scope}/${name}" {
+        package/source-4f2a9b61.bundle {
+            return {2404122 5c53adec58363ec2ff51d9bd5dcd7e467874c839393178491c74b16a8c9f922c}
+        }
+        package/package-manifest.v1 {
+            return {7315 21f14e1f7e646649fdad864dce23dce2055585962d92bfaba6e71158372c1ebe}
+        }
+        package/bind-final-package.sh {
+            return {17009 13a186008662548b191c8e18a3cf764597504451a30e50cd3c7e7cd9d98dfc6e}
+        }
+        package/controller.sh {
+            return {43170 ff315162affccc51454f3f9a0c80f9c7412291581a9a2abc03ed1df46a266a1c}
+        }
+        package/prepare-stage-root.sh {
+            return {54217 cc8e0e82c369ff9983600879827d350ea3b2da13d4d3315b309ea0924e911a95}
+        }
+        package/provision-ubuntu-test-host.sh {
+            return {18613 01aaf3767d9e048f11ca21f35cadba063f355c3c9e94aadd606734d02c260388}
+        }
+        package/root-matrix-n-r.sh {
+            return {984 d0d0f6f532516e16d98239e5ad79963c2c70bc8bd682a3f6439b4479e7b60fb3}
+        }
+        package/check-realhost-iperf.py {
+            return {21027 9a52378b8a1ef6043d4d5792471c8239a0392a80da72f5c00846dd89e88ccd67}
+        }
+        package/test-hermetic-matrix.sh {
+            return {6669 be011f72367b6b383ece727f1048db992b9068db224109ee2f60ed5a6ce0c891}
+        }
+        package/test_matrix_static.py {
+            return {5656 8de2dcdc866938da0502f1ad73ac9b38c9b6ff4066c76e9cbc946c9ca30a53f8}
+        }
+        package/checksum-module-lease.sh {
+            return {23755 4ab9a22910e8d597cc04bb4fdde9e1b32d37a1bb2c6ad7b76f52d576b5a9adb2}
+        }
+        package/root-fresh-verifier-gate.sh {
+            return {65112 762502215e1138b53a656fd085b1718b867a3cc488a5c5bd874a04561cf10e9d}
+        }
+        package/test-hermetic-fresh-verifier-gate.sh {
+            return {14628 c9b5b1f954c794c5c986214777727a76579f670db9587f319ac148fc0c2a05f3}
+        }
+        package/test_fresh_verifier_gate_static.py {
+            return {17307 ace6951027788e82ad879caf285316af4e6ee81fdb6746f569cd7c22b9f80bf3}
+        }
+        package/realnic_acceptance.py {
+            return {216405 a88100b2a23ad41dd3e644c3ba1c7a722d58c8184a997aabf0ceab78552c6339}
+        }
+        package/test_realnic_acceptance.py {
+            return {148160 fcb3d0dadee6da6e0ad67d028f268ebe43575287f555cd8100d279f8a3b0b79c}
+        }
+        package/test_realnic_acceptance_static.py {
+            return {14894 ba8aef3219a0cf2a5c6b5058b245f64eb828a08bb532d2aa0291f51ee7206ad2}
+        }
+        bootstrap/prepare-stage-root.sh {
+            return {54217 cc8e0e82c369ff9983600879827d350ea3b2da13d4d3315b309ea0924e911a95}
+        }
+        bootstrap/provision-ubuntu-test-host.sh {
+            return {18613 01aaf3767d9e048f11ca21f35cadba063f355c3c9e94aadd606734d02c260388}
+        }
+        default { harness_die "r2-test-r1-file-oracle-${scope}-${name}" }
+    }
+}
+
 proc r2_test_r1_payload {operation} {
     set home /home/.wg-mix-ebpf-retirement-c8e41d73-2c690050ae1d-r1
     set auth ${home}/authority
@@ -946,6 +1101,18 @@ proc r2_test_r1_payload {operation} {
         a4a1c89dcd9f087b79149f52a01346ed6db5c209ad4985bdbb8c9132276c0077
     set receipt_sha \
         4c3e9bfd3d4e64f6626abaa43e20cf5e4df6b193395cee6a39953b1c4da7d188
+    set boot_id 01234567-89ab-cdef-0123-456789abcdef
+    if {[regexp {^lineage-q-(package|bootstrap)-(stat|sha)-(.+)$} \
+            $operation -> scope family name]} {
+        lassign [r2_test_r1_file_oracle $scope $name] size sha
+        set root [expr {$scope eq "package" ? $package : $bootstrap}]
+        if {$family eq "stat"} {
+            set identity [expr {$scope eq "package" ?
+                "siyixuan:siyixuan:600" : "root:root:700"}]
+            return "${identity}:1:${size}:regular file"
+        }
+        return "${sha}  ${root}/${name}"
+    }
     switch -- $operation {
         lineage-exists-user-intake - lineage-exists-receipt-pending {
             return ""
@@ -1009,12 +1176,15 @@ proc r2_test_r1_payload {operation} {
         lineage-q-intake-self-sha {
             return "${helper_sha}  ${intake}/prepare-stage-root.sh"
         }
-        lineage-lock-stat - lineage-receipt-stat {
-            return root:root:600:1:regular\ file
+        lineage-lock-stat {
+            return 71:113:root:root:600:1:45:regular\ file
         }
+        lineage-receipt-stat { return root:root:600:1:regular\ file }
         lineage-receipt-sha { return "${receipt_sha}  ${receipt}" }
-        lineage-retained-helper-verify {
-            return "B82_V6_RETIREMENT_VERIFIED state=T namespace_writes=0 same_boot=1 receipt=${receipt}"
+        lineage-boot-id-read { return "${boot_id}\n" }
+        lineage-lock-content-read { return "boot_id\t${boot_id}\n" }
+        lineage-lock-stat-recheck {
+            return 71:113:root:root:600:1:45:regular\ file
         }
         default { harness_die "r2-test-r1-payload-$operation" }
     }
@@ -1845,6 +2015,7 @@ switch -- $mode {
         set ::credential_reads 0
         set ::lineage_operations {}
         set ::lineage_mutation_spawns 0
+        set ::lineage_legacy_helper_calls 0
         set ::lineage_scenario fresh
         set ::lineage_fail_operation none
         set ::lineage_fail_kind none
@@ -1921,6 +2092,10 @@ switch -- $mode {
                 a4a1c89dcd9f087b79149f52a01346ed6db5c209ad4985bdbb8c9132276c0077
             set receipt_sha \
                 4c3e9bfd3d4e64f6626abaa43e20cf5e4df6b193395cee6a39953b1c4da7d188
+            if {[regexp {^lineage-q-(package|bootstrap)-(stat|sha)-(.+)$} \
+                    $operation]} {
+                return [r2_test_r1_payload $operation]
+            }
             switch -- $operation {
                 lineage-home-readlink { return $::test_home_qroot }
                 lineage-auth-readlink { return $::test_auth_root }
@@ -1985,14 +2160,18 @@ switch -- $mode {
                 lineage-q-intake-self-sha {
                     return "$helper_sha  $::test_q_intake/prepare-stage-root.sh"
                 }
-                lineage-lock-stat - lineage-receipt-stat {
+                lineage-lock-stat {
+                    return "71:113:root:root:600:1:45:regular file"
+                }
+                lineage-receipt-stat {
                     return "root:root:600:1:regular file"
                 }
                 lineage-receipt-sha {
                     return "$receipt_sha  $::test_receipt_final"
                 }
-                lineage-retained-helper-verify {
-                    return "B82_V6_RETIREMENT_VERIFIED state=T namespace_writes=0 same_boot=1 receipt=$::test_receipt_final"
+                lineage-boot-id-read - lineage-lock-content-read -
+                lineage-lock-stat-recheck {
+                    return [r2_test_r1_payload $operation]
                 }
                 default { harness_die "lineage-test-payload-$operation" }
             }
@@ -2004,6 +2183,18 @@ switch -- $mode {
                 a4a1c89dcd9f087b79149f52a01346ed6db5c209ad4985bdbb8c9132276c0077
             set receipt_sha \
                 4c3e9bfd3d4e64f6626abaa43e20cf5e4df6b193395cee6a39953b1c4da7d188
+            if {[regexp {^lineage-q-(package|bootstrap)-(stat|sha)-(.+)$} \
+                    $operation -> scope family name]} {
+                lassign [r2_test_r1_file_oracle $scope $name] size sha
+                set root [expr {$scope eq "package" ?
+                    $::test_q_package : $::test_q_bootstrap}]
+                if {$family eq "stat"} {
+                    set identity [expr {$scope eq "package" ?
+                        "siyixuan:siyixuan:600" : "root:root:700"}]
+                    return "exact:${identity}:1:${size}:regular file"
+                }
+                return "exact:${sha}  ${root}/${name}"
+            }
             switch -- $operation {
                 lineage-exists-user-intake - lineage-exists-home-qroot -
                 lineage-exists-run-qroot -
@@ -2098,14 +2289,21 @@ switch -- $mode {
                 lineage-q-intake-self-sha {
                     return "exact:$helper_sha  $::test_q_intake/prepare-stage-root.sh"
                 }
-                lineage-lock-stat - lineage-receipt-stat {
+                lineage-lock-stat {
+                    return r1-lock-identity
+                }
+                lineage-receipt-stat {
                     return "exact:root:root:600:1:regular file"
                 }
                 lineage-receipt-sha {
                     return "exact:$receipt_sha  $::test_receipt_final"
                 }
-                lineage-retained-helper-verify {
-                    return "exact:B82_V6_RETIREMENT_VERIFIED state=T namespace_writes=0 same_boot=1 receipt=$::test_receipt_final"
+                lineage-boot-id-read { return boot-uuid-line }
+                lineage-lock-content-read {
+                    return "r1-lock-content:01234567-89ab-cdef-0123-456789abcdef"
+                }
+                lineage-lock-stat-recheck {
+                    return "exact:71:113:root:root:600:1:45:regular file"
                 }
                 default { harness_die "lineage-test-assertion-$operation" }
             }
@@ -2174,6 +2372,40 @@ switch -- $mode {
                 set remote [concat $env_prefix [list /usr/bin/find $parent \
                     -xdev -mindepth 1 -maxdepth 1 -name $leaf -print]]
                 return [concat [lineage_test_ssh_prefix] $remote]
+            }
+            if {[regexp {^lineage-q-(package|bootstrap)-(stat|sha)-(.+)$} \
+                    $operation -> scope family name]} {
+                set root [expr {$scope eq "package" ?
+                    $::test_q_package : $::test_q_bootstrap}]
+                set fixed_path "${root}/${name}"
+                if {$family eq "stat"} {
+                    set remote [concat $env_prefix [list /usr/bin/stat -Lc \
+                        %U:%G:%a:%h:%s:%F -- $fixed_path]]
+                } else {
+                    set remote [concat $env_prefix \
+                        [list /usr/bin/sha256sum -- $fixed_path]]
+                }
+                return [concat [lineage_test_ssh_prefix] $remote]
+            }
+            switch -- $operation {
+                lineage-boot-id-read {
+                    set remote [concat $env_prefix [list /usr/bin/cat -- \
+                        /proc/sys/kernel/random/boot_id]]
+                    return [concat [lineage_test_ssh_prefix] $remote]
+                }
+                lineage-lock-content-read {
+                    set lock "$::test_run_qroot/retirement.v1.lock"
+                    set remote [concat $env_prefix [list /usr/bin/dd \
+                        "if=${lock}" iflag=nonblock,nofollow,fullblock \
+                        bs=46 count=1 status=none]]
+                    return [concat [lineage_test_ssh_prefix] $remote]
+                }
+                lineage-lock-stat-recheck {
+                    set lock "$::test_run_qroot/retirement.v1.lock"
+                    set remote [concat $env_prefix [list /usr/bin/stat -Lc \
+                        %d:%i:%U:%G:%a:%h:%s:%F -- $lock]]
+                    return [concat [lineage_test_ssh_prefix] $remote]
+                }
             }
             switch -- $operation {
                 lineage-home-readlink { set fixed_path $::test_home_qroot }
@@ -2250,7 +2482,7 @@ switch -- $mode {
                 }
                 lineage-lock-stat {
                     set fixed_path "$::test_run_qroot/retirement.v1.lock"
-                    set format %U:%G:%a:%h:%F
+                    set format %d:%i:%U:%G:%a:%h:%s:%F
                 }
                 lineage-receipt-stat {
                     set fixed_path $::test_receipt_final
@@ -2304,15 +2536,6 @@ switch -- $mode {
             if {$first ne ""} {
                 set remote [concat $env_prefix [list /usr/bin/stat -Lc \
                     %d:%i -- $first $second]]
-                return [concat [lineage_test_ssh_prefix] $remote]
-            }
-            if {$operation eq "lineage-retained-helper-verify"} {
-                set remote [concat $env_prefix [list /bin/bash -p \
-                    "$::test_auth_root/prepare-stage-root.sh" \
-                    verify-retirement --manifest \
-                    "$::test_auth_root/package-manifest.v1" \
-                    --manifest-sha256 \
-                    c4532671304d30755b1c42bb55f82186d96df3f6c84af73078ca16c3fddfe4e6]]
                 return [concat [lineage_test_ssh_prefix] $remote]
             }
             harness_die "lineage-test-spawn-argv-$operation"
@@ -2388,6 +2611,10 @@ switch -- $mode {
         rename execute_operation_spec transport_original_execute_operation_spec
         proc execute_operation_spec {operation operation_spec password} {
             lappend ::lineage_operations $operation
+            if {$operation eq "lineage-retained-helper-verify"} {
+                incr ::lineage_legacy_helper_calls
+                harness_die "lineage-legacy-helper-reachable"
+            }
             if {[lindex $operation_spec 0] ne "ssh" ||
                 [llength $operation_spec] != 5} {
                 harness_die "lineage-operation-spec-$operation"
@@ -2395,12 +2622,10 @@ switch -- $mode {
             set actual_spawn_argv [lindex $operation_spec 1]
             set expected_spawn_argv \
                 [lineage_test_expected_spawn_argv $operation]
-            set expected_timeout [expr {$operation eq
-                "lineage-retained-helper-verify" ? 2400 : 600}]
             if {[lrange $actual_spawn_argv 0 end] ne
                     [lrange $expected_spawn_argv 0 end] ||
                 [lindex $operation_spec 2] != 2 ||
-                [lindex $operation_spec 4] != $expected_timeout} {
+                [lindex $operation_spec 4] != 600} {
                 harness_die "lineage-spawn-argv operation=$operation actual=$actual_spawn_argv expected=$expected_spawn_argv prompt=[lindex $operation_spec 2] timeout=[lindex $operation_spec 4]"
             }
             if {![string match "lineage-*" $operation]} {
@@ -2462,12 +2687,14 @@ switch -- $mode {
         set terminal_expected [concat {
             lineage-exists-user-intake lineage-exists-home-qroot
             lineage-exists-run-qroot lineage-exists-receipt-pending
-        } [lineage_test_terminal_operations] {
+        } [lineage_test_terminal_operations] \
+            [r2_test_r1_deep_operations] {
             lineage-exists-user-intake lineage-exists-home-qroot
             lineage-exists-run-qroot lineage-exists-receipt-pending
-            lineage-retained-helper-verify
         }]
-        if {$terminal_state ne "TERMINAL" ||
+        if {[llength [r2_test_r1_deep_operations]] != 41 ||
+            [llength $terminal_expected] != 84 ||
+            $terminal_state ne "TERMINAL" ||
             [lrange $::lineage_operations 0 end] ne
                 [lrange $terminal_expected 0 end]} {
             harness_die "lineage-terminal state=$terminal_state operations=$::lineage_operations expected=$terminal_expected"
@@ -2526,7 +2753,7 @@ switch -- $mode {
                 default { harness_die "lineage-recheck-scenario-$scenario" }
             }
             set expected_recheck_prefix [concat \
-                [lrange $terminal_expected 0 38] \
+                [lrange $terminal_expected 0 79] \
                 [lrange {
                     lineage-exists-user-intake
                     lineage-exists-home-qroot
@@ -2541,10 +2768,27 @@ switch -- $mode {
             }
             incr recheck_drifts
         }
+        proc lineage_test_failure_prefix {operation} {
+            set base [lineage_test_terminal_operations]
+            set retained [r2_test_r1_deep_operations]
+            set base_index [lsearch -exact $base $operation]
+            if {$base_index >= 0} {
+                return [concat {
+                    lineage-exists-user-intake lineage-exists-home-qroot
+                    lineage-exists-run-qroot lineage-exists-receipt-pending
+                } [lrange $base 0 $base_index]]
+            }
+            set retained_index [lsearch -exact $retained $operation]
+            if {$retained_index >= 0} {
+                return [concat {
+                    lineage-exists-user-intake lineage-exists-home-qroot
+                    lineage-exists-run-qroot lineage-exists-receipt-pending
+                } $base [lrange $retained 0 $retained_index]]
+            }
+            harness_die "lineage-failure-prefix-$operation"
+        }
         set deep_missing 0
-        foreach operation [concat [lineage_test_terminal_operations] {
-            lineage-retained-helper-verify
-        }] {
+        foreach operation [lineage_test_terminal_operations] {
             set ::lineage_scenario terminal-cut
             set ::lineage_fail_operation $operation
             set ::lineage_fail_kind missing
@@ -2554,16 +2798,8 @@ switch -- $mode {
                 execute_retirement_lineage_gate $values \
                     [string repeat a 64] $password
             } message options]
-            if {$operation eq "lineage-retained-helper-verify"} {
-                set expected_failure_prefix $terminal_expected
-            } else {
-                set operation_index [lsearch -exact \
-                    [lineage_test_terminal_operations] $operation]
-                set expected_failure_prefix [concat \
-                    [lrange $terminal_expected 0 3] \
-                    [lrange [lineage_test_terminal_operations] \
-                        0 $operation_index]]
-            }
+            set expected_failure_prefix \
+                [lineage_test_failure_prefix $operation]
             if {!$caught || ![dict exists $options -errorcode] ||
                 [dict get $options -errorcode] ne {B82FAIL 78} ||
                 [lrange $::lineage_operations 0 end] ne
@@ -2573,7 +2809,8 @@ switch -- $mode {
             incr deep_missing
         }
         set deep_nonzero 0
-        foreach operation [lineage_test_terminal_operations] {
+        foreach operation [concat [lineage_test_terminal_operations] \
+                [r2_test_r1_deep_operations]] {
             set ::lineage_scenario terminal-cut
             set ::lineage_fail_operation $operation
             set ::lineage_fail_kind child-nonzero
@@ -2583,12 +2820,8 @@ switch -- $mode {
                 execute_retirement_lineage_gate $values \
                     [string repeat a 64] $password
             } message options]
-            set operation_index [lsearch -exact \
-                [lineage_test_terminal_operations] $operation]
-            set expected_failure_prefix [concat \
-                [lrange $terminal_expected 0 3] \
-                [lrange [lineage_test_terminal_operations] \
-                    0 $operation_index]]
+            set expected_failure_prefix \
+                [lineage_test_failure_prefix $operation]
             if {!$caught || ![dict exists $options -errorcode] ||
                 [dict get $options -errorcode] ne {B82FAIL 78} ||
                 [lrange $::lineage_operations 0 end] ne
@@ -2598,11 +2831,10 @@ switch -- $mode {
             incr deep_nonzero
         }
         set assertion_malformed 0
-        foreach operation {
+        foreach operation [concat {
             lineage-home-readlink lineage-home-stat lineage-home-entries
             lineage-auth-manifest-sha lineage-auth-manifest-pair
-            lineage-retained-helper-verify
-        } {
+        } [r2_test_r1_deep_operations]] {
             set ::lineage_scenario terminal-cut
             set ::lineage_fail_operation $operation
             set ::lineage_fail_kind malformed
@@ -2612,16 +2844,8 @@ switch -- $mode {
                 execute_retirement_lineage_gate $values \
                     [string repeat a 64] $password
             } message options]
-            if {$operation eq "lineage-retained-helper-verify"} {
-                set expected_failure_prefix $terminal_expected
-            } else {
-                set operation_index [lsearch -exact \
-                    [lineage_test_terminal_operations] $operation]
-                set expected_failure_prefix [concat \
-                    [lrange $terminal_expected 0 3] \
-                    [lrange [lineage_test_terminal_operations] \
-                        0 $operation_index]]
-            }
+            set expected_failure_prefix \
+                [lineage_test_failure_prefix $operation]
             if {!$caught || ![dict exists $options -errorcode] ||
                 [dict get $options -errorcode] ne {B82FAIL 78} ||
                 [lrange $::lineage_operations 0 end] ne
@@ -2630,32 +2854,117 @@ switch -- $mode {
             }
             incr assertion_malformed
         }
-        set helper_failures 0
-        foreach failure {child-nonzero signal} {
+        set retained_signals 0
+        foreach operation [r2_test_r1_deep_operations] {
             set ::lineage_scenario terminal-cut
-            set ::lineage_fail_operation lineage-retained-helper-verify
-            set ::lineage_fail_kind $failure
+            set ::lineage_fail_operation $operation
+            set ::lineage_fail_kind signal
             set ::lineage_operations {}
             set ::lineage_presence_calls [dict create]
             set caught [catch {
                 execute_retirement_lineage_gate $values \
                     [string repeat a 64] $password
             } message options]
+            set expected_failure_prefix \
+                [lineage_test_failure_prefix $operation]
             if {!$caught || ![dict exists $options -errorcode] ||
                 [dict get $options -errorcode] ne {B82FAIL 78} ||
                 [lrange $::lineage_operations 0 end] ne
-                    [lrange $terminal_expected 0 end]} {
-                harness_die "lineage-helper-failure=$failure message=$message options=$options operations=$::lineage_operations"
+                    [lrange $expected_failure_prefix 0 end]} {
+                harness_die "lineage-retained-signal operation=$operation message=$message options=$options operations=$::lineage_operations expected=$expected_failure_prefix"
             }
-            incr helper_failures
+            incr retained_signals
         }
-        if {$deep_missing != 36 || $deep_nonzero != 35 ||
-            $assertion_malformed != 6 || $helper_failures != 2 ||
+        if {$deep_missing != 35 || $deep_nonzero != 76 ||
+            $assertion_malformed != 46 || $retained_signals != 41 ||
             $recheck_drifts != 4 || $partial_count != 6 ||
+            $::lineage_legacy_helper_calls != 0 ||
             $::credential_reads != 1 || $::lineage_mutation_spawns != 0} {
-            harness_die "lineage-summary missing=$deep_missing nonzero=$deep_nonzero malformed=$assertion_malformed helper=$helper_failures recheck=$recheck_drifts partial=$partial_count credential_reads=$::credential_reads mutation_spawns=$::lineage_mutation_spawns"
+            harness_die "lineage-summary missing=$deep_missing nonzero=$deep_nonzero malformed=$assertion_malformed retained_signals=$retained_signals legacy_helper_calls=$::lineage_legacy_helper_calls recheck=$recheck_drifts partial=$partial_count credential_reads=$::credential_reads mutation_spawns=$::lineage_mutation_spawns"
         }
-        puts "HARNESS_LINEAGE_GATE fresh=PASS terminal=PASS partial_states=6 receipt_pending=STOP recheck_drifts=4 deep_missing=36 deep_nonzero=35 assertion_malformed=6 helper_failures=2 credential_reads=1 mutation_spawns=0 result=PASS"
+        puts "HARNESS_LINEAGE_GATE fresh=PASS terminal=PASS primitives=84 retained_files=19 retained_ops=41 lock_inode_stable=1 partial_states=6 receipt_pending=STOP recheck_drifts=4 deep_missing=35 deep_nonzero=76 retained_malformed=41 retained_signals=41 legacy_helper_calls=0 credential_reads=1 mutation_spawns=0 result=PASS"
+    }
+    r1-source-reuse {
+        if {[llength $arguments] != 3} {
+            harness_die "r1-source-reuse-arguments"
+        }
+        lassign $arguments manifest manifest_sha predecessor_package
+        set ::R2_PREDECESSOR_LOCAL_PACKAGE $predecessor_package
+        if {[catch {load_manifest $manifest $manifest_sha} values] ||
+            [catch {validate_manifest_values $values}] ||
+            [catch {r2_load_predecessor_manifest \
+                "${predecessor_package}/package-manifest.v1"} \
+                predecessor_values]} {
+            harness_die "r1-source-reuse-local-authority"
+        }
+        set full_prewrite [r2_test_prewrite_sequence]
+        set r1_expected [lrange $full_prewrite 0 83]
+        set predecessor_expected [lrange $full_prewrite 130 177]
+        if {[llength $full_prewrite] != 178 ||
+            [llength $r1_expected] != 84 ||
+            [llength $predecessor_expected] != 48 ||
+            [lindex $r1_expected 0] ne "lineage-exists-user-intake" ||
+            [lindex $r1_expected 83] ne "lineage-exists-receipt-pending" ||
+            [lindex $predecessor_expected 0] ne "package-parent-stat" ||
+            [lindex $predecessor_expected 47] ne \
+                "r2-ro-old-provision-check"} {
+            harness_die "r1-source-reuse-literal-oracle"
+        }
+        set ::reuse_expected [concat $r1_expected $predecessor_expected]
+        set ::reuse_observed {}
+        set ::reuse_legacy_helper_calls 0
+        set ::reuse_qpackage_deep 0
+        set ::reuse_qbootstrap_deep 0
+        rename fail transport_original_fail
+        proc fail {message code} {
+            return -code error -errorcode [list B82FAIL $code] $message
+        }
+        rename execute_operation_spec transport_original_execute_operation_spec
+        proc execute_operation_spec {operation operation_spec password} {
+            if {$operation eq "lineage-retained-helper-verify"} {
+                incr ::reuse_legacy_helper_calls
+                return [list child-failure 79 \
+                    {B82_V6_RETIREMENT_ENGINE_STOP reason=retirement-state rc=79 cleanup=0 retained=1} none]
+            }
+            set ordinal [llength $::reuse_observed]
+            set expected [lindex $::reuse_expected $ordinal]
+            set expected_prompt [expr {$operation eq "package-parent-stat" ?
+                1 : 2}]
+            if {$operation ne $expected || [llength $operation_spec] != 5 ||
+                [lindex $operation_spec 0] ne "ssh" ||
+                [lindex $operation_spec 2] != $expected_prompt ||
+                [lindex $operation_spec 4] != 600} {
+                harness_die "r1-source-reuse-order ordinal=$ordinal operation=$operation expected=$expected spec=$operation_spec"
+            }
+            lappend ::reuse_observed $operation
+            if {[string match "lineage-q-package-*-*" $operation]} {
+                incr ::reuse_qpackage_deep
+            }
+            if {[string match "lineage-q-bootstrap-*-*" $operation]} {
+                incr ::reuse_qbootstrap_deep
+            }
+            lassign [r2_test_remote_payload $operation] disposition payload policy
+            if {$disposition eq "absent"} {
+                return [list child-failure 1 "" none]
+            }
+            set assertion [lindex $operation_spec 3]
+            if {$operation ne "r2-ro-old-provision-check" &&
+                [catch {assert_output $assertion $payload} reason]} {
+                harness_die "r1-source-reuse-output operation=$operation assertion=$assertion payload=$payload reason=$reason"
+            }
+            return [list ok 0 $payload $policy]
+        }
+        r2_require_r1_terminal $values $manifest_sha fixture-password \
+            source-reuse
+        r2_execute_predecessor_gate $values $manifest_sha $predecessor_values \
+            fixture-password
+        if {$::reuse_observed ne $::reuse_expected ||
+            $::reuse_legacy_helper_calls != 0 ||
+            $::reuse_qpackage_deep != 34 ||
+            $::reuse_qbootstrap_deep != 4} {
+            harness_die "r1-source-reuse-summary observed=$::reuse_observed legacy=$::reuse_legacy_helper_calls qpackage=$::reuse_qpackage_deep qbootstrap=$::reuse_qbootstrap_deep"
+        }
+        puts "HARNESS_R1_SOURCE_REUSE r1_gate=84 qpackage=present qbootstrap=present source_package=present source_bootstrap=present retained_file_checks=38 lock_inode_stable=1 predecessor_deep=48 legacy_helper_calls=0 result=PASS"
     }
     prepare-lineage {
         set ::credential_reads 0
@@ -2743,8 +3052,8 @@ switch -- $mode {
             harness_die "r2-prewrite-local-authority"
         }
         set ::r2_expected [r2_test_prewrite_sequence]
-        if {[llength $::r2_expected] != 138 ||
-            [lindex $::r2_expected 137] ne "r2-ro-old-provision-check"} {
+        if {[llength $::r2_expected] != 178 ||
+            [lindex $::r2_expected 177] ne "r2-ro-old-provision-check"} {
             harness_die "r2-prewrite-literal-cardinality"
         }
         set ::r2_raw [r2_test_raw_sequence]
@@ -2817,7 +3126,7 @@ switch -- $mode {
         set child_signal 0
         foreach cut_kind {child-nonzero signal} {
             set ::r2_cut_kind $cut_kind
-            for {set cut 0} {$cut < 138} {incr cut} {
+            for {set cut 0} {$cut < 178} {incr cut} {
                 set ::r2_cut $cut
                 set ::r2_observed {}
                 set ::r2_mutations {}
@@ -2829,7 +3138,7 @@ switch -- $mode {
                         $predecessor_values fixture-password
                 } message options]
                 set expected_rc [expr {
-                    $cut_kind eq "signal" || $cut < 44 ? 78 : 73
+                    $cut_kind eq "signal" || $cut < 84 ? 78 : 73
                 }]
                 set expected_prefix [lrange $::r2_expected 0 $cut]
                 if {!$caught || ![dict exists $options -errorcode] ||
@@ -2849,10 +3158,10 @@ switch -- $mode {
                 }
             }
         }
-        if {$child_nonzero != 138 || $child_signal != 138} {
+        if {$child_nonzero != 178 || $child_signal != 178} {
             harness_die "r2-prewrite-summary nonzero=$child_nonzero signal=$child_signal"
         }
-        puts "HARNESS_R2_PREWRITE_CUTS primitives=138 cuts=138 mutations=0 child_nonzero=138 child_signal=138 result=PASS"
+        puts "HARNESS_R2_PREWRITE_CUTS primitives=178 cuts=356 mutations=0 child_nonzero=178 child_signal=178 r1_gate=84 authority=13 common=33 predecessor=48 result=PASS"
         harness_real_exit 0
     }
     r2-first-write {
@@ -2879,7 +3188,7 @@ switch -- $mode {
         rename execute_operation_spec transport_original_execute_operation_spec
         proc execute_operation_spec {operation operation_spec password} {
             set ordinal [llength $::r2_observed]
-            if {$ordinal < 138} {
+            if {$ordinal < 178} {
                 set expected_operation [lindex $::r2_expected $ordinal]
             } else {
                 set expected_operation r2-raw-intake-mkdir
@@ -2893,7 +3202,7 @@ switch -- $mode {
                 [lsearch -exact $spawn_argv /usr/bin/scp] >= 0} {
                 incr ::r2_scp
             }
-            if {$ordinal == 138} {
+            if {$ordinal == 178} {
                 set expected_tail [list /usr/bin/mkdir --mode=0700 -- \
                     /home/siyixuan/wg-mix-ebpf-test/retire-postflight-c8e41d73-f75fe7678cfd-r2.intake]
                 if {[lrange $spawn_argv end-3 end] ne $expected_tail ||
@@ -2936,7 +3245,7 @@ switch -- $mode {
             }
             harness_die "r2-first-write rc=$errorcode caught=$caught observed_equal=[expr {$::r2_observed eq $expected}] observed_count=[llength $::r2_observed] expected_count=[llength $expected] mismatch=$mismatch mutation_equal=[expr {$::r2_mutations eq {r2-raw-intake-mkdir}}] scp=$::r2_scp message=$message"
         }
-        puts "HARNESS_R2_FIRST_WRITE index=138 operation=r2-raw-intake-mkdir rc=73 scp=0 result=PASS"
+        puts "HARNESS_R2_FIRST_WRITE index=178 ordinal=179 operation=r2-raw-intake-mkdir rc=73 scp=0 result=PASS"
         harness_real_exit 0
     }
     r2-provision-cuts {
@@ -3072,7 +3381,7 @@ switch -- $mode {
                 set expected_error {R2_TRANSACTION_EXIT 1}
                 incr stage_count
             } else {
-                set final_index 137
+                set final_index 177
                 set expected_error [expr {$scenario eq "child-nonzero" ?
                     [list R2_TRANSACTION_EXIT 73] : [list B82FAIL 78]}]
                 incr provision_count
@@ -3639,8 +3948,16 @@ LINEAGE_EXISTENCE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
 LINEAGE_GATE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   "${FIXTURE_REVIEW}/locked-transport.exp" lineage-gate)" ||
   fail 'retained retirement lineage gate matrix'
-[[ "${LINEAGE_GATE_OUTPUT}" == *'HARNESS_LINEAGE_GATE fresh=PASS terminal=PASS partial_states=6 receipt_pending=STOP recheck_drifts=4 deep_missing=36 deep_nonzero=35 assertion_malformed=6 helper_failures=2 credential_reads=1 mutation_spawns=0 result=PASS'* ]] ||
+[[ "${LINEAGE_GATE_OUTPUT}" == *'HARNESS_LINEAGE_GATE fresh=PASS terminal=PASS primitives=84 retained_files=19 retained_ops=41 lock_inode_stable=1 partial_states=6 receipt_pending=STOP recheck_drifts=4 deep_missing=35 deep_nonzero=76 retained_malformed=41 retained_signals=41 legacy_helper_calls=0 credential_reads=1 mutation_spawns=0 result=PASS'* ]] ||
   fail "retained retirement lineage gate marker: ${LINEAGE_GATE_OUTPUT}"
+R1_SOURCE_REUSE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
+  "${FIXTURE_REVIEW}/locked-transport.exp" r1-source-reuse \
+  "${BOUND_MANIFEST}" "${BOUND_MANIFEST_SHA}" \
+  "${R2_PREDECESSOR_CLONE}" 2>&1)" ||
+  fail 'R1 terminal and successor source-path reuse regression'
+[[ "${R1_SOURCE_REUSE_OUTPUT}" == \
+  *'HARNESS_R1_SOURCE_REUSE r1_gate=84 qpackage=present qbootstrap=present source_package=present source_bootstrap=present retained_file_checks=38 lock_inode_stable=1 predecessor_deep=48 legacy_helper_calls=0 result=PASS'* ]] ||
+  fail "R1 terminal and successor source-path reuse marker: ${R1_SOURCE_REUSE_OUTPUT}"
 PREPARE_LINEAGE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   "${FIXTURE_REVIEW}/locked-transport.exp" prepare-lineage)" ||
   fail 'prepare lineage placement and first mutation'
@@ -3651,14 +3968,14 @@ R2_PREWRITE_CUTS_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   "${BOUND_MANIFEST}" "${BOUND_MANIFEST_SHA}" "${R2_PREDECESSOR_CLONE}" 2>&1)" ||
   fail 'R2 actual transaction prewrite cut matrix'
 [[ "${R2_PREWRITE_CUTS_OUTPUT}" == \
-  *'HARNESS_R2_PREWRITE_CUTS primitives=138 cuts=138 mutations=0 child_nonzero=138 child_signal=138 result=PASS'* ]] ||
+  *'HARNESS_R2_PREWRITE_CUTS primitives=178 cuts=356 mutations=0 child_nonzero=178 child_signal=178 r1_gate=84 authority=13 common=33 predecessor=48 result=PASS'* ]] ||
   fail "R2 actual transaction prewrite marker: ${R2_PREWRITE_CUTS_OUTPUT}"
 R2_FIRST_WRITE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   "${FIXTURE_REVIEW}/locked-transport.exp" r2-first-write \
   "${BOUND_MANIFEST}" "${BOUND_MANIFEST_SHA}" "${R2_PREDECESSOR_CLONE}" 2>&1)" ||
   fail 'R2 first mutation failure harness'
 [[ "${R2_FIRST_WRITE_OUTPUT}" == \
-  *'HARNESS_R2_FIRST_WRITE index=138 operation=r2-raw-intake-mkdir rc=73 scp=0 result=PASS'* ]] ||
+  *'HARNESS_R2_FIRST_WRITE index=178 ordinal=179 operation=r2-raw-intake-mkdir rc=73 scp=0 result=PASS'* ]] ||
   fail "R2 first mutation marker: ${R2_FIRST_WRITE_OUTPUT}"
 R2_PROVISION_CUTS_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   "${FIXTURE_REVIEW}/locked-transport.exp" r2-provision-cuts \
@@ -4625,6 +4942,7 @@ import ast
 import builtins
 import ctypes
 import errno
+import fcntl
 import hashlib
 import io
 import os
@@ -4664,6 +4982,46 @@ EXPECTED_ENGINE_PAYLOAD_SHA256 = (
 )
 EXPECTED_ENGINE_MAIN_SHA256 = (
     "f21d81838d8a18912d140b97ef74ca746bf99bc1152eb027e2c82d4e354e748d"
+)
+EXPECTED_LEGACY_ENGINE_FUNCTIONS = (
+    "stop", "require_absolute", "open_abs_dir", "open_parent", "fd_mnt_id",
+    "require_dir_fd", "names_at", "entry_stat", "entry_is_directory",
+    "read_all", "sha256_fd", "require_file_at", "parse_manifest",
+    "require_pair", "same_open_inode", "require_host_identity",
+    "require_exact_names", "open_child_dir", "validate_current_authority",
+    "fsync_current_authority", "validate_intake", "validate_old_package",
+    "validate_old_bootstrap", "directory_location", "regular_present",
+    "classify_state", "boot_identity", "write_all",
+    "acquire_retirement_lock", "initialize_or_verify_boot_marker",
+    "receipt_bytes", "validate_receipt", "validate_pending_receipt",
+    "validate_state_objects", "renameat2_noreplace",
+    "rename_directory_noreplace", "publish_receipt",
+    "converge_completed_rename", "converge_completed_rename_parents",
+    "converge_resumed_state", "converge_terminal", "engine_main",
+)
+EXPECTED_LEGACY_ENGINE_MAIN_CLOSURE = (
+    "stop", "require_absolute", "open_abs_dir", "open_parent", "fd_mnt_id",
+    "require_dir_fd", "names_at", "entry_stat", "entry_is_directory",
+    "read_all", "sha256_fd", "require_file_at", "parse_manifest",
+    "require_pair", "same_open_inode", "require_host_identity",
+    "require_exact_names", "open_child_dir", "validate_current_authority",
+    "fsync_current_authority", "validate_intake", "validate_old_package",
+    "validate_old_bootstrap", "regular_present", "classify_state",
+    "boot_identity", "write_all", "acquire_retirement_lock",
+    "initialize_or_verify_boot_marker", "receipt_bytes", "validate_receipt",
+    "validate_pending_receipt", "validate_state_objects",
+    "renameat2_noreplace", "rename_directory_noreplace", "publish_receipt",
+    "converge_completed_rename", "converge_completed_rename_parents",
+    "converge_resumed_state", "converge_terminal", "engine_main",
+)
+EXPECTED_LEGACY_ENGINE_ORPHAN_CALLERS = {
+    "directory_location": (),
+}
+EXPECTED_LEGACY_ENGINE_PAYLOAD_SHA256 = (
+    "03ff972e4d1e40ff83d683091f392be4519ba81f9020af8851007fa0f74fabfc"
+)
+EXPECTED_LEGACY_ENGINE_MAIN_SHA256 = (
+    "9183ac32c570ba2b7f4e6816c9856d3c124adc221bec9c49506a9f16551fc266"
 )
 PREDECESSOR_COMMIT = "f75fe7678cfdecf08173fd201be5c055417d6e11"
 PREDECESSOR_MANIFEST_SHA256 = (
@@ -4737,6 +5095,20 @@ BOOTSTRAP_NAMES = ("prepare-stage-root.sh", "provision-ubuntu-test-host.sh")
 R1_ID = "c8e41d73-2c690050ae1d-r1"
 R1_HOME_QROOT = "/home/.wg-mix-ebpf-retirement-" + R1_ID
 R1_RUN_QROOT = "/run/wg-mix-ebpf-retirement-" + R1_ID
+R1_USER_INTAKE = (
+    "/home/siyixuan/wg-mix-ebpf-test/retire-prestage-" + R1_ID + ".intake"
+)
+R1_AUTH_ROOT = R1_HOME_QROOT + "/authority"
+R1_Q_INTAKE = R1_HOME_QROOT + "/intake"
+R1_Q_PACKAGE = R1_HOME_QROOT + "/package"
+R1_Q_BOOTSTRAP = R1_RUN_QROOT + "/bootstrap"
+R1_LOCK = R1_RUN_QROOT + "/retirement.v1.lock"
+R1_RECEIPT_PENDING = R1_RUN_QROOT + "/retirement-complete.v1.pending"
+R1_RECEIPT_FINAL = R1_RUN_QROOT + "/retirement-complete.v1"
+R1_PREDECESSOR_COMMIT = "2c690050ae1d69dbd074acfd612faa2b80e29f8a"
+R1_PREDECESSOR_MANIFEST_SHA256 = (
+    "21f14e1f7e646649fdad864dce23dce2055585962d92bfaba6e71158372c1ebe"
+)
 
 
 def digest(path):
@@ -4856,6 +5228,114 @@ def extract_and_transform_engine(stager):
     return compile(transformed, str(stager) + ":embedded-r2", "exec")
 
 
+def extract_and_transform_legacy_engine(stager):
+    shell = Path(stager).read_text(encoding="utf-8")
+    anchor = shell.index("run_retirement_engine() {")
+    function_end = shell.index("\nrun_stage() {", anchor)
+    function = shell[anchor:function_end]
+    if function.count("<<'PY'\n") != 1:
+        raise AssertionError("legacy-embedded-engine-cardinality")
+    begin = function.index("<<'PY'\n") + len("<<'PY'\n")
+    end = function.index("\nPY\n", begin)
+    payload = function[begin:end]
+    if (hashlib.sha256(payload.encode("utf-8")).hexdigest() !=
+            EXPECTED_LEGACY_ENGINE_PAYLOAD_SHA256):
+        raise AssertionError("legacy-embedded-engine-payload-sha256")
+    original = ast.parse(payload, filename=str(stager) + ":embedded-r1")
+    transformed = ast.parse(payload, filename=str(stager) + ":embedded-r1")
+    original_functions = tuple(
+        node for node in original.body if isinstance(node, ast.FunctionDef)
+    )
+    transformed_functions = tuple(
+        node for node in transformed.body if isinstance(node, ast.FunctionDef)
+    )
+    if (tuple(node.name for node in original_functions) !=
+            EXPECTED_LEGACY_ENGINE_FUNCTIONS or
+            tuple(node.name for node in transformed_functions) !=
+            EXPECTED_LEGACY_ENGINE_FUNCTIONS):
+        raise AssertionError("legacy-embedded-engine-function-surface")
+    engine_main_node = original_functions[-1]
+    engine_main_source = ast.get_source_segment(payload, engine_main_node)
+    if (engine_main_source is None or
+            hashlib.sha256(engine_main_source.encode("utf-8")).hexdigest() !=
+            EXPECTED_LEGACY_ENGINE_MAIN_SHA256):
+        raise AssertionError("legacy-embedded-engine-main-sha256")
+    function_names = set(EXPECTED_LEGACY_ENGINE_FUNCTIONS)
+    graph = {}
+    for node in original_functions:
+        graph[node.name] = {
+            call.func.id
+            for call in ast.walk(node)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+            and call.func.id in function_names
+        }
+    closure = set()
+    pending = ["engine_main"]
+    while pending:
+        name = pending.pop()
+        if name in closure:
+            continue
+        closure.add(name)
+        pending.extend(graph[name] - closure)
+    reachable_surface = tuple(
+        name for name in EXPECTED_LEGACY_ENGINE_FUNCTIONS if name in closure
+    )
+    if reachable_surface != EXPECTED_LEGACY_ENGINE_MAIN_CLOSURE:
+        raise AssertionError("legacy-embedded-engine-main-closure")
+    orphan_callers = {
+        orphan: tuple(sorted(
+            name for name, callees in graph.items() if orphan in callees
+        ))
+        for orphan in function_names - closure
+    }
+    if orphan_callers != EXPECTED_LEGACY_ENGINE_ORPHAN_CALLERS:
+        raise AssertionError("legacy-embedded-engine-orphan-callers")
+    values = {"ROOT_UID": os.geteuid(), "ROOT_GID": os.getegid()}
+    replacements = []
+    for node in transformed.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if isinstance(target, ast.Name) and target.id in values:
+            if (not isinstance(node.value, ast.Constant) or
+                    type(node.value.value) is not int or node.value.value != 0):
+                raise AssertionError("legacy-root-id-assignment-shape")
+            node.value = ast.copy_location(
+                ast.Constant(values[target.id]), node.value)
+            replacements.append(target.id)
+    if replacements != ["ROOT_UID", "ROOT_GID"]:
+        raise AssertionError("legacy-root-id-assignment-cardinality")
+    ast.fix_missing_locations(transformed)
+    if len(original.body) != len(transformed.body):
+        raise AssertionError("legacy-embedded-engine-module-cardinality")
+    allowed_differences = []
+    for original_node, transformed_node in zip(original.body, transformed.body):
+        if (isinstance(original_node, ast.Assign) and
+                isinstance(transformed_node, ast.Assign) and
+                len(original_node.targets) == 1 and
+                len(transformed_node.targets) == 1 and
+                isinstance(original_node.targets[0], ast.Name) and
+                isinstance(transformed_node.targets[0], ast.Name) and
+                original_node.targets[0].id == transformed_node.targets[0].id and
+                original_node.targets[0].id in values):
+            target_name = original_node.targets[0].id
+            if (not isinstance(original_node.value, ast.Constant) or
+                    type(original_node.value.value) is not int or
+                    original_node.value.value != 0 or
+                    not isinstance(transformed_node.value, ast.Constant) or
+                    type(transformed_node.value.value) is not int or
+                    transformed_node.value.value != values[target_name]):
+                raise AssertionError("legacy-production-module-rewrite")
+            allowed_differences.append(target_name)
+            continue
+        if (ast.dump(original_node, include_attributes=False) !=
+                ast.dump(transformed_node, include_attributes=False)):
+            raise AssertionError("legacy-production-module-rewrite")
+    if allowed_differences != ["ROOT_UID", "ROOT_GID"]:
+        raise AssertionError("legacy-production-module-differences")
+    return compile(transformed, str(stager) + ":embedded-r1", "exec")
+
+
 def engine_argv(mode, manifest_sha):
     argv = [
         "embedded-r2-engine", mode, PATHS["current_manifest"], manifest_sha,
@@ -4870,6 +5350,24 @@ def engine_argv(mode, manifest_sha):
     ]
     if len(argv) != 24:
         raise AssertionError("engine-argv-cardinality")
+    return argv
+
+
+def legacy_engine_argv():
+    argv = [
+        "embedded-r1-engine", "verify-retirement",
+        R1_AUTH_ROOT + "/package-manifest.v1", R1_MANIFEST_SHA256,
+        R1_AUTH_ROOT + "/package-manifest.v1.pending",
+        R1_AUTH_ROOT + "/prepare-stage-root.sh",
+        R1_AUTH_ROOT + "/prepare-stage-root.sh.pending", R1_SELF_SHA256,
+        R1_USER_INTAKE, R1_HOME_QROOT, R1_AUTH_ROOT, R1_Q_INTAKE,
+        R1_Q_PACKAGE, PATHS["source_package"], PATHS["source_bootstrap"],
+        R1_RUN_QROOT, R1_Q_BOOTSTRAP, R1_LOCK, R1_RECEIPT_PENDING,
+        R1_RECEIPT_FINAL, R1_PREDECESSOR_COMMIT,
+        R1_PREDECESSOR_MANIFEST_SHA256, HOSTNAME, KERNEL, MACHINE_ID,
+    ]
+    if len(argv) != 25:
+        raise AssertionError("legacy-engine-argv-cardinality")
     return argv
 
 
@@ -5031,6 +5529,18 @@ def execute_engine_child(stager, root, mode, manifest_sha, expected_renames,
         "HERMETIC_R2_ENGINE_CHILD functions=48 closure=48 argv=24 "
         "root_id_assignments=2 renames=%s provision_checks=%s" %
         (renameat2.calls, provision_calls["count"]), flush=True)
+
+
+def execute_legacy_engine_child(root):
+    legacy_stager = R1_AUTHORITY_PACKAGE / "prepare-stage-root.sh"
+    code = extract_and_transform_legacy_engine(legacy_stager)
+    renameat2, provision_calls = install_engine_boundaries(
+        Path(root).resolve(), 0, "none", "none")
+    sys.argv = legacy_engine_argv()
+    exec(code, {"__name__": "__main__", "__file__": "<embedded-r1-engine>"})
+    raise AssertionError(
+        "legacy-engine-unexpected-return:%s:%s" %
+        (renameat2.calls, provision_calls["count"]))
 
 
 def manifest_values(path):
@@ -5445,6 +5955,19 @@ def run_engine_process(stager, current_manifest, current_self, predecessor,
             "engine-child-timeout:%s:%s" % (mode, error.stdout))
 
 
+def run_legacy_engine_process(root, timeout=12.0):
+    command = [
+        sys.executable, "-B", "-I", str(Path(__file__).resolve()),
+        "legacy-child", str(root),
+    ]
+    try:
+        return subprocess.run(
+            command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT, text=True, check=False, timeout=timeout)
+    except subprocess.TimeoutExpired as error:
+        raise AssertionError("legacy-engine-child-timeout:%s" % error.stdout)
+
+
 def driver(stager, current_manifest, current_self, predecessor, case_root):
     stager = Path(stager)
     current_manifest = Path(current_manifest)
@@ -5471,6 +5994,53 @@ def driver(stager, current_manifest, current_self, predecessor, case_root):
         return root
 
     r1_comparisons = 0
+    legacy_collision_count = 0
+    current_precheck_count = 0
+    collision = new_case("legacy-source-reuse-collision")
+    collision_before = complete_snapshot(collision)
+    collision_r1 = r1_snapshot(collision)
+    collision_sources = source_directory_identities(collision)
+    legacy = run_legacy_engine_process(collision)
+    if legacy.returncode != 79:
+        raise AssertionError(
+            "legacy-collision-return:%s:%s" %
+            (legacy.returncode, legacy.stdout))
+    exact_line(
+        legacy.stdout,
+        "B82_V6_RETIREMENT_ENGINE_STOP reason=retirement-state rc=79 "
+        "cleanup=0 retained=1")
+    if complete_snapshot(collision) != collision_before:
+        raise AssertionError("legacy-collision-tree-write")
+    if r1_snapshot(collision) != collision_r1:
+        raise AssertionError("legacy-collision-r1-drift")
+    r1_comparisons += 1
+    legacy_collision_count += 1
+    collision_lock_fd = os.open(
+        virtual(collision, R1_LOCK), os.O_RDONLY | os.O_NOFOLLOW)
+    try:
+        fcntl.flock(
+            collision_lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+        current_precheck = run_engine_process(
+            stager, current_manifest, current_self, predecessor, collision,
+            "retire-postflight-f75fe7678cfd-r2", -1, 1, "pre", "exit91")
+    finally:
+        try:
+            fcntl.flock(collision_lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(collision_lock_fd)
+    if current_precheck.returncode != 91:
+        raise AssertionError(
+            "current-precheck-return:%s:%s" %
+            (current_precheck.returncode, current_precheck.stdout))
+    if observe_state(collision, expected_receipt) != "D":
+        raise AssertionError("current-precheck-state")
+    if source_directory_identities(collision) != collision_sources:
+        raise AssertionError("current-precheck-source-identity")
+    if r1_snapshot(collision) != collision_r1:
+        raise AssertionError("current-precheck-r1-drift")
+    r1_comparisons += 1
+    current_precheck_count += 1
+
     baseline = new_case("baseline")
     baseline_r1 = r1_snapshot(baseline)
     baseline_inodes = source_directory_identities(baseline)
@@ -5615,18 +6185,30 @@ def driver(stager, current_manifest, current_self, predecessor, case_root):
         fifo_count += 1
 
     if (cut_count, exit_count, signal_count, resume_count, fifo_count,
-            r1_comparisons) != (10, 5, 5, 10, 2, 34):
+            legacy_collision_count, current_precheck_count,
+            r1_comparisons) != (10, 5, 5, 10, 2, 1, 1, 36):
         raise AssertionError("engine-matrix-cardinality")
+    print(
+        "HERMETIC_R1_SOURCE_REUSE_COLLISION legacy_functions=42 "
+        "legacy_argv=25 legacy_rc=79 reason=retirement-state "
+        "tree_unchanged=1 "
+        "current_r2=pre-rename-concurrent-shared-lock-pass "
+        "result=PASS")
     print(
         "HERMETIC_R2_ENGINE states=7 functions=48 argv=24 cuts=10 "
         "exit91=5 sigterm=5 resumes=10 verify_namespace_writes=0 "
         "authority_fifos=2 result=PASS")
     print(
-        "HERMETIC_R2_R1_INVARIANCE result=PASS snapshots=34 "
+        "HERMETIC_R2_R1_INVARIANCE result=PASS snapshots=36 "
         "objects=authority,intake,package,bootstrap,lock,receipt")
 
 
 def main():
+    if len(sys.argv) >= 2 and sys.argv[1] == "legacy-child":
+        if len(sys.argv) != 3:
+            raise SystemExit(64)
+        execute_legacy_engine_child(sys.argv[2])
+        return
     if len(sys.argv) >= 2 and sys.argv[1] == "child":
         if len(sys.argv) != 12:
             raise SystemExit(64)
@@ -5659,9 +6241,11 @@ R2_ENGINE_TEST_OUTPUT="$(/usr/bin/python3 -B -I "${R2_ENGINE_HARNESS}" \
   "${R2_PREDECESSOR_CLONE}" "${TEST_ROOT}/r2-engine-cases")" ||
   fail 'actual embedded R2 engine harness'
 [[ "${R2_ENGINE_TEST_OUTPUT}" == \
+  *'HERMETIC_R1_SOURCE_REUSE_COLLISION legacy_functions=42 legacy_argv=25 legacy_rc=79 reason=retirement-state tree_unchanged=1 current_r2=pre-rename-concurrent-shared-lock-pass result=PASS'* &&
+  "${R2_ENGINE_TEST_OUTPUT}" == \
   *'HERMETIC_R2_ENGINE '*'states=7 functions=48 argv=24 cuts=10 exit91=5 sigterm=5 resumes=10 verify_namespace_writes=0 authority_fifos=2 result=PASS'* &&
   "${R2_ENGINE_TEST_OUTPUT}" == \
-  *'HERMETIC_R2_R1_INVARIANCE '*'result=PASS snapshots=34'* ]] ||
+  *'HERMETIC_R2_R1_INVARIANCE '*'result=PASS snapshots=36'* ]] ||
   fail "actual embedded R2 engine markers: ${R2_ENGINE_TEST_OUTPUT}"
 printf '%s\n' "${R2_ENGINE_TEST_OUTPUT}"
 for retired_mode in retire-prestage-2c690050 verify-retirement; do

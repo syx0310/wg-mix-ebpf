@@ -41,7 +41,8 @@ def bash_array(payload: str, name: str) -> str:
 
 def tcl_proc(payload: str, name: str) -> str:
     match = re.search(
-        rf"(?ms)^proc {re.escape(name)} \{{[^}}]*\}} \{{\n(?P<body>.*?)^\}}\n",
+        rf"(?ms)^proc {re.escape(name)} "
+        rf"\{{(?:[^{{}}]|\{{[^{{}}]*\}})*\}} \{{\n(?P<body>.*?)^\}}\n",
         payload,
     )
     if not match:
@@ -52,7 +53,8 @@ def tcl_proc(payload: str, name: str) -> str:
 def indented_tcl_proc(payload: str, name: str) -> str:
     match = re.search(
         rf"(?ms)^(?P<indent>[ \t]+)proc {re.escape(name)} "
-        rf"\{{[^}}]*\}} \{{\n(?P<body>.*?)^(?P=indent)\}}\n",
+        rf"\{{(?:[^{{}}]|\{{[^{{}}]*\}})*\}} \{{\n"
+        rf"(?P<body>.*?)^(?P=indent)\}}\n",
         payload,
     )
     if not match:
@@ -132,6 +134,31 @@ def tcl_literal_return_words(payload: str, name: str) -> tuple[str, ...]:
     return tuple(match.group("body").split())
 
 
+def tcl_literal_return_file_contract(
+    payload: str, name: str
+) -> tuple[tuple[str, int, str], ...]:
+    """Return a sole literal Tcl name -> {size sha256} dictionary."""
+    body = tcl_proc(payload, name)
+    uncommented = "\n".join(
+        line for line in body.splitlines() if not line.lstrip().startswith("#")
+    ).strip()
+    match = re.fullmatch(r"return \{(?P<body>.*)\}", uncommented, re.DOTALL)
+    if not match:
+        fail(f"Tcl procedure {name} is not a sole fixed literal dictionary")
+    dictionary = match.group("body")
+    entry_pattern = re.compile(
+        r"(?P<name>[^\s{}]+)\s+\{\s*(?P<size>[0-9]+)\s+"
+        r"(?P<sha>[0-9a-f]{64})\s*\}"
+    )
+    entries = tuple(
+        (item.group("name"), int(item.group("size")), item.group("sha"))
+        for item in entry_pattern.finditer(dictionary)
+    )
+    if not entries or entry_pattern.sub("", dictionary).strip():
+        fail(f"Tcl procedure {name} contains a nonliteral file contract")
+    return entries
+
+
 def ordered(body: str, literals: tuple[str, ...], contract: str) -> None:
     remaining = body
     for literal in literals:
@@ -181,13 +208,37 @@ def validate_engine_harness_execution_ast(payload: str) -> None:
 
     main_node = one_function("main")
     if (
-        len(main_node.body) != 3
+        len(main_node.body) != 4
         or not isinstance(main_node.body[0], ast.If)
         or not isinstance(main_node.body[1], ast.If)
-        or not isinstance(main_node.body[2], ast.Expr)
+        or not isinstance(main_node.body[2], ast.If)
+        or not isinstance(main_node.body[3], ast.Expr)
     ):
         fail("hermetic R2 engine harness main dispatch shape drifted")
-    child_branch = main_node.body[0]
+    legacy_branch = main_node.body[0]
+    if ast.dump(legacy_branch.test, include_attributes=False) != dump_expression(
+        'len(sys.argv) >= 2 and sys.argv[1] == "legacy-child"'
+    ) or tuple(type(node) for node in legacy_branch.body) != (
+        ast.If,
+        ast.Expr,
+        ast.Return,
+    ):
+        fail("hermetic legacy R1 engine child branch is not exact and reachable")
+    expected_legacy_argc_gate = ast.parse(
+        "if len(sys.argv) != 3:\n"
+        "    raise SystemExit(64)\n"
+    ).body[0]
+    if (
+        ast.dump(legacy_branch.body[0], include_attributes=False)
+        != ast.dump(expected_legacy_argc_gate, include_attributes=False)
+        or ast.dump(legacy_branch.body[1].value, include_attributes=False)
+        != dump_expression("execute_legacy_engine_child(sys.argv[2])")
+        or not isinstance(legacy_branch.body[2], ast.Return)
+        or legacy_branch.body[2].value is not None
+    ):
+        fail("hermetic legacy R1 child argc/call/return path drifted")
+
+    child_branch = main_node.body[1]
     if ast.dump(child_branch.test, include_attributes=False) != dump_expression(
         'len(sys.argv) >= 2 and sys.argv[1] == "child"'
     ) or tuple(type(node) for node in child_branch.body) != (
@@ -260,6 +311,13 @@ def validate_engine_harness_execution_ast(payload: str) -> None:
         and isinstance(node.func, ast.Name)
         and node.func.id == "execute_engine_child"
     ]
+    execute_legacy_child_calls = [
+        node
+        for node in ast.walk(main_node)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "execute_legacy_engine_child"
+    ]
     driver_calls = [
         node
         for node in ast.walk(main_node)
@@ -273,17 +331,18 @@ def validate_engine_harness_execution_ast(payload: str) -> None:
     ).body[0]
     if (
         len(execute_child_calls) != 1
+        or len(execute_legacy_child_calls) != 1
         or len(driver_calls) != 1
-        or ast.dump(main_node.body[1], include_attributes=False)
+        or ast.dump(main_node.body[2], include_attributes=False)
         != ast.dump(expected_nonchild_argc_gate, include_attributes=False)
         or ast.dump(driver_calls[0], include_attributes=False)
         != dump_expression(
             "driver(sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4], "
             "sys.argv[5])"
         )
-        or main_node.body[2].value is not driver_calls[0]
+        or main_node.body[3].value is not driver_calls[0]
     ):
-        fail("hermetic R2 engine main child/non-child dispatch is not exact")
+        fail("hermetic R1/R2 engine main child/non-child dispatch is not exact")
 
     exact_line_node = one_function("exact_line")
     expected_exact_line = ast.parse(
@@ -309,6 +368,9 @@ def validate_engine_harness_execution_ast(payload: str) -> None:
         key=lambda node: (node.lineno, node.col_offset),
     )
     expected_exact_calls = (
+        "exact_line(legacy.stdout, "
+        "'B82_V6_RETIREMENT_ENGINE_STOP reason=retirement-state rc=79 "
+        "cleanup=0 retained=1')",
         "exact_line(result.stdout, "
         "'B82_V6_RETIREMENT_COMPLETE state=T disposition=advanced "
         "namespace_writes=6 same_boot=1')",
@@ -331,7 +393,7 @@ def validate_engine_harness_execution_ast(payload: str) -> None:
     if tuple(
         ast.dump(node, include_attributes=False) for node in actual_exact_calls
     ) != tuple(dump_expression(source) for source in expected_exact_calls):
-        fail("hermetic R2 engine driver does not route six outputs through exact_line")
+        fail("hermetic R1/R2 engine driver does not route seven outputs through exact_line")
 
     returncode_ifs = sorted(
         (
@@ -346,6 +408,8 @@ def validate_engine_harness_execution_ast(payload: str) -> None:
         key=lambda node: (node.lineno, node.col_offset),
     )
     expected_returncode_tests = (
+        "legacy.returncode != 79",
+        "current_precheck.returncode != 91",
         "result.returncode != 0",
         "verify.returncode != 0",
         "interrupted.returncode != expected_rc",
@@ -366,23 +430,48 @@ def validate_engine_harness_execution_ast(payload: str) -> None:
             for node in returncode_ifs
         )
     ):
-        fail("hermetic R2 engine returncode results are not six direct fail-closed gates")
+        fail("hermetic R1/R2 engine returncode results are not eight direct fail-closed gates")
 
     run_process_node = one_function("run_engine_process")
+    run_legacy_process_node = one_function("run_legacy_engine_process")
     execute_child_node = one_function("execute_engine_child")
+    execute_legacy_child_node = one_function("execute_legacy_engine_child")
     run_returns = [
         node for node in ast.walk(run_process_node) if isinstance(node, ast.Return)
     ]
+    legacy_run_returns = [
+        node
+        for node in ast.walk(run_legacy_process_node)
+        if isinstance(node, ast.Return)
+    ]
     if (
         tuple(type(node) for node in run_process_node.body) != (ast.Assign, ast.Try)
+        or tuple(type(node) for node in run_legacy_process_node.body)
+        != (ast.Assign, ast.Try)
         or len(run_returns) != 1
+        or len(legacy_run_returns) != 1
         or not run_process_node.body[1].body
         or run_process_node.body[1].body[0] is not run_returns[0]
+        or not run_legacy_process_node.body[1].body
+        or run_legacy_process_node.body[1].body[0] is not legacy_run_returns[0]
         or any(isinstance(node, ast.Return) for node in ast.walk(execute_child_node))
         or tuple(type(node) for node in execute_child_node.body)
         != (ast.Assign, ast.Assign, ast.Assign, ast.Expr, ast.If, ast.Expr)
+        or any(
+            isinstance(node, ast.Return)
+            for node in ast.walk(execute_legacy_child_node)
+        )
+        or tuple(type(node) for node in execute_legacy_child_node.body)
+        != (
+            ast.Assign,
+            ast.Assign,
+            ast.Assign,
+            ast.Assign,
+            ast.Expr,
+            ast.Raise,
+        )
     ):
-        fail("hermetic R2 engine process/child execution contains an early return")
+        fail("hermetic R1/R2 engine process/child execution contains an early return")
 
 
 def manifest_reader_keys(payload: str, function_name: str) -> tuple[str, ...]:
@@ -421,6 +510,61 @@ def main() -> None:
     hermetic_path, hermetic = read_regular(
         str(controller_path.with_name("test-hermetic-controller.sh"))
     )
+    hermetic_bytes = hermetic_path.read_bytes()
+    expected_hermetic_sha256 = (
+        "d273ebab959606594552248a33b5debe2a0495cfb594ab4dfbe75e74b0eb12ea"
+    )
+    if hashlib.sha256(hermetic_bytes).hexdigest() != expected_hermetic_sha256:
+        fail("hermetic controller exact bytes drifted")
+    hermetic_mutations = (
+        ("source-reassign", b"source $transport", b"source /tmp/fixture-transport"),
+        (
+            "global-proc-override",
+            b"switch -- $mode {",
+            b"proc execute_r2_transaction args { return }\nswitch -- $mode {",
+        ),
+        (
+            "prewrite-if-false",
+            b"    r2-prewrite-cuts {",
+            b"    r2-prewrite-cuts {\n        if {0} { return }",
+        ),
+        (
+            "comment-result-gate",
+            b"                if {!$caught || ![dict exists $options -errorcode] ||",
+            b"                # if {!$caught || ![dict exists $options -errorcode] ||",
+        ),
+        (
+            "neutralize-outer-fail",
+            b"  fail \"R2 actual transaction prewrite marker:",
+            b"  : # fail \"R2 actual transaction prewrite marker:",
+        ),
+        (
+            "shorten-178-cuts",
+            b"for {set cut 0} {$cut < 178} {incr cut}",
+            b"for {set cut 0} {$cut < 177} {incr cut}",
+        ),
+        (
+            "break-cut-loop",
+            b"            for {set cut 0} {$cut < 178} {incr cut} {",
+            b"            for {set cut 0} {$cut < 178} {incr cut} {\n                break",
+        ),
+        (
+            "delete-prewrite-observation",
+            b"            lappend ::r2_observed $operation\n",
+            b"",
+        ),
+        (
+            "outer-runner-bypass",
+            b")\" ||\n  fail 'R2 actual transaction prewrite cut matrix'",
+            b")\" || : #\n  fail 'R2 actual transaction prewrite cut matrix'",
+        ),
+    )
+    for mutation_name, anchor, replacement in hermetic_mutations:
+        if anchor not in hermetic_bytes:
+            fail(f"hermetic mutation-resistance anchor drifted: {mutation_name}")
+        mutant = hermetic_bytes.replace(anchor, replacement, 1)
+        if hashlib.sha256(mutant).hexdigest() == expected_hermetic_sha256:
+            fail(f"hermetic bytes guard accepts mutant: {mutation_name}")
 
     production = {
         binder_path.name: binder,
@@ -439,6 +583,112 @@ def main() -> None:
     retained_retirement_receipt_sha = (
         "4c3e9bfd3d4e64f6626abaa43e20cf5e4df6b193395cee6a39953b1c4da7d188"
     )
+    retained_retirement_package_contract = (
+        (
+            "source-4f2a9b61.bundle",
+            2404122,
+            "5c53adec58363ec2ff51d9bd5dcd7e467874c839393178491c74b16a8c9f922c",
+        ),
+        (
+            "package-manifest.v1",
+            7315,
+            "21f14e1f7e646649fdad864dce23dce2055585962d92bfaba6e71158372c1ebe",
+        ),
+        (
+            "bind-final-package.sh",
+            17009,
+            "13a186008662548b191c8e18a3cf764597504451a30e50cd3c7e7cd9d98dfc6e",
+        ),
+        (
+            "controller.sh",
+            43170,
+            "ff315162affccc51454f3f9a0c80f9c7412291581a9a2abc03ed1df46a266a1c",
+        ),
+        (
+            "prepare-stage-root.sh",
+            54217,
+            "cc8e0e82c369ff9983600879827d350ea3b2da13d4d3315b309ea0924e911a95",
+        ),
+        (
+            "provision-ubuntu-test-host.sh",
+            18613,
+            "01aaf3767d9e048f11ca21f35cadba063f355c3c9e94aadd606734d02c260388",
+        ),
+        (
+            "root-matrix-n-r.sh",
+            984,
+            "d0d0f6f532516e16d98239e5ad79963c2c70bc8bd682a3f6439b4479e7b60fb3",
+        ),
+        (
+            "check-realhost-iperf.py",
+            21027,
+            "9a52378b8a1ef6043d4d5792471c8239a0392a80da72f5c00846dd89e88ccd67",
+        ),
+        (
+            "test-hermetic-matrix.sh",
+            6669,
+            "be011f72367b6b383ece727f1048db992b9068db224109ee2f60ed5a6ce0c891",
+        ),
+        (
+            "test_matrix_static.py",
+            5656,
+            "8de2dcdc866938da0502f1ad73ac9b38c9b6ff4066c76e9cbc946c9ca30a53f8",
+        ),
+        (
+            "checksum-module-lease.sh",
+            23755,
+            "4ab9a22910e8d597cc04bb4fdde9e1b32d37a1bb2c6ad7b76f52d576b5a9adb2",
+        ),
+        (
+            "root-fresh-verifier-gate.sh",
+            65112,
+            "762502215e1138b53a656fd085b1718b867a3cc488a5c5bd874a04561cf10e9d",
+        ),
+        (
+            "test-hermetic-fresh-verifier-gate.sh",
+            14628,
+            "c9b5b1f954c794c5c986214777727a76579f670db9587f319ac148fc0c2a05f3",
+        ),
+        (
+            "test_fresh_verifier_gate_static.py",
+            17307,
+            "ace6951027788e82ad879caf285316af4e6ee81fdb6746f569cd7c22b9f80bf3",
+        ),
+        (
+            "realnic_acceptance.py",
+            216405,
+            "a88100b2a23ad41dd3e644c3ba1c7a722d58c8184a997aabf0ceab78552c6339",
+        ),
+        (
+            "test_realnic_acceptance.py",
+            148160,
+            "fcb3d0dadee6da6e0ad67d028f268ebe43575287f555cd8100d279f8a3b0b79c",
+        ),
+        (
+            "test_realnic_acceptance_static.py",
+            14894,
+            "ba8aef3219a0cf2a5c6b5058b245f64eb828a08bb532d2aa0291f51ee7206ad2",
+        ),
+    )
+    retained_retirement_bootstrap_contract = (
+        (
+            "prepare-stage-root.sh",
+            54217,
+            "cc8e0e82c369ff9983600879827d350ea3b2da13d4d3315b309ea0924e911a95",
+        ),
+        (
+            "provision-ubuntu-test-host.sh",
+            18613,
+            "01aaf3767d9e048f11ca21f35cadba063f355c3c9e94aadd606734d02c260388",
+        ),
+    )
+    if (
+        len(retained_retirement_package_contract) != 17
+        or len({item[0] for item in retained_retirement_package_contract}) != 17
+        or len(retained_retirement_bootstrap_contract) != 2
+        or len({item[0] for item in retained_retirement_bootstrap_contract}) != 2
+    ):
+        fail("test retained R1 file oracle is not the independent 17+2 tuple")
     r2_predecessor_commit = "f75fe7678cfdecf08173fd201be5c055417d6e11"
     r2_predecessor_manifest_sha = (
         "2d6c6caac080b599fbfa0f73c64f6976cf30d1504fc506ebd39c638b2f9449e3"
@@ -1676,20 +1926,16 @@ def main() -> None:
     if "retire-raw-" in transport:
         fail("transport retains a private retirement mutation leaf")
 
-    retained_helper = tcl_proc(transport, "retained_retirement_helper_remote_argv")
-    retained_helper_lines = tuple(
-        line.strip() for line in retained_helper.splitlines() if line.strip()
-    )
-    if retained_helper_lines != (
-        "return [list /bin/bash -p $::RETIREMENT_AUTH_SELF verify-retirement \\",
-        "--manifest $::RETIREMENT_AUTH_MANIFEST \\",
-        "--manifest-sha256 $::RETAINED_RETIREMENT_MANIFEST_SHA256]",
+    for retired_successor_helper_literal in (
+        "retained_retirement_helper_remote_argv",
+        "lineage-retained-helper-verify",
+        "verify-retirement",
     ):
-        fail("retained retirement helper argv is not the fixed verifier-only form")
-    if "$mode" in retained_helper or "?" in retained_helper:
-        fail("retained retirement helper argv still selects a caller-supplied mode")
-    if transport.count("verify-retirement") != 1:
-        fail("verify-retirement escaped the private retained-helper argv")
+        if retired_successor_helper_literal in transport:
+            fail(
+                "transport successor gate retains obsolete R1 helper surface: "
+                f"{retired_successor_helper_literal!r}"
+            )
 
     public_transport_surface = "\n".join(
         (
@@ -1754,6 +2000,162 @@ def main() -> None:
     ):
         if mutable_argv in lineage_builder:
             fail(f"private lineage builder contains mutation argv {mutable_argv!r}")
+
+    retained_file_builder_start = lineage_builder.index(
+        "^lineage-q-(package|bootstrap)-(stat|sha)-(.+)$"
+    )
+    retained_file_builder_end = lineage_builder.index(
+        "switch -- $operation", retained_file_builder_start
+    )
+    retained_file_builder = lineage_builder[
+        retained_file_builder_start:retained_file_builder_end
+    ]
+    ordered(
+        retained_file_builder,
+        (
+            "^lineage-q-(package|bootstrap)-(stat|sha)-(.+)$",
+            "$operation -> namespace family name",
+            'if {$namespace eq "package"}',
+            "set retained_files [retained_retirement_package_files]",
+            'set fixed_path "${::RETIREMENT_Q_PACKAGE}/${name}"',
+            "set stat_prefix siyixuan:siyixuan:600",
+            "set retained_files [retained_retirement_bootstrap_files]",
+            'set fixed_path "${::RETIREMENT_Q_BOOTSTRAP}/${name}"',
+            "set stat_prefix root:root:700",
+            "![dict exists $retained_files $name]",
+            'return -code error "retirement-lineage-retained-name"',
+            "lassign [dict get $retained_files $name] expected_size expected_sha",
+            'if {$family eq "stat"}',
+            "/usr/bin/stat -Lc %U:%G:%a:%h:%s:%F -- $fixed_path",
+            '"exact:${stat_prefix}:1:${expected_size}:regular file"',
+            "/usr/bin/sha256sum -- $fixed_path",
+            '"exact:${expected_sha}  ${fixed_path}"',
+        ),
+        "transport retained R1 17+2 stat/SHA builder",
+    )
+    if (
+        retained_file_builder.count("retained_retirement_package_files") != 1
+        or retained_file_builder.count("retained_retirement_bootstrap_files") != 1
+        or retained_file_builder.count("/usr/bin/stat") != 1
+        or retained_file_builder.count("/usr/bin/sha256sum") != 1
+        or any(
+            authority in retained_file_builder
+            for authority in (
+                "r2_predecessor_",
+                "R2_PREDECESSOR",
+                "package_names",
+                "source_package",
+                "source_bootstrap",
+            )
+        )
+    ):
+        fail("transport retained R1 file builder reuses a successor authority")
+
+    retained_boot_lock_builder = lineage_builder[
+        lineage_builder.index("lineage-boot-id-read {") : lineage_builder.index(
+            "lineage-home-readlink", lineage_builder.index("lineage-boot-id-read {")
+        )
+    ]
+    ordered(
+        retained_boot_lock_builder,
+        (
+            "lineage-boot-id-read",
+            "/usr/bin/sudo --",
+            "[env_argv]",
+            "/usr/bin/cat -- /proc/sys/kernel/random/boot_id",
+            "set assertion boot-uuid-line",
+            "lineage-lock-content-read",
+            "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            "$boot_id",
+            'return -code error "retirement-lineage-boot-id"',
+            "/usr/bin/dd \"if=$::RETIREMENT_LOCK\"",
+            "iflag=nonblock,nofollow,fullblock bs=46 count=1",
+            "status=none",
+            'set assertion "r1-lock-content:${boot_id}"',
+            "lineage-lock-stat-recheck",
+            "^[0-9]+:[0-9]+:root:root:600:1:45:regular file$",
+            "$lock_identity",
+            'return -code error "retirement-lineage-lock-identity"',
+            "/usr/bin/stat -Lc %d:%i:%U:%G:%a:%h:%s:%F --",
+            "$::RETIREMENT_LOCK",
+            'set assertion "exact:${lock_identity}"',
+        ),
+        "transport same-boot/bounded-lock-read/inode-recheck argv builder",
+    )
+    if (
+        retained_boot_lock_builder.count("/usr/bin/cat") != 1
+        or retained_boot_lock_builder.count("/usr/bin/dd") != 1
+        or retained_boot_lock_builder.count("/usr/bin/stat") != 1
+        or retained_boot_lock_builder.count("$::RETIREMENT_LOCK") != 2
+        or "/usr/bin/flock" in lineage_builder
+        or "/usr/bin/true" in retained_boot_lock_builder
+        or "/bin/bash" in retained_boot_lock_builder
+    ):
+        fail("transport bounded lock-content/inode-recheck builder argv is not exact")
+    lineage_assert_output = tcl_proc(transport, "assert_output")
+    ordered(
+        lineage_assert_output,
+        (
+            "set value [output_value $payload]",
+            'if {$assertion eq "boot-uuid-line"}',
+            'set normalized [string map [list "\\r\\n" "\\n"] $payload]',
+            'if {[string first "\\r" $normalized] >= 0',
+            "[string length $normalized] != 37",
+            '[string index $normalized end] ne "\\n"',
+            "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+            "[string range $normalized 0 end-1]",
+            'return -code error "boot-uuid-output-mismatch"',
+            'if {$assertion eq "r1-lock-identity"}',
+            "^[0-9]+:[0-9]+:root:root:600:1:45:regular file$",
+            "$value",
+            'return -code error "r1-lock-identity-output-mismatch"',
+            'if {[string first "r1-lock-content:" $assertion] == 0}',
+            "set expected_boot_id [string range $assertion 16 end]",
+            'set normalized [string map [list "\\r\\n" "\\n"] $payload]',
+            "$expected_boot_id",
+            '[string first "\\r" $normalized] >= 0',
+            '$normalized ne "boot_id\\t${expected_boot_id}\\n"',
+            'return -code error "r1-lock-content-output-mismatch"',
+        ),
+        "transport exact boot UUID and lock-content byte assertions",
+    )
+    if (
+        lineage_assert_output.count('if {$assertion eq "boot-uuid-line"}') != 1
+        or lineage_assert_output.count(
+            'if {$assertion eq "r1-lock-identity"}'
+        )
+        != 1
+        or lineage_assert_output.count(
+            'if {[string first "r1-lock-content:" $assertion] == 0}'
+        )
+        != 1
+        or lineage_assert_output.count(
+            'set normalized [string map [list "\\r\\n" "\\n"] $payload]'
+        )
+        != 2
+        or lineage_assert_output.count("output_value $payload") != 1
+    ):
+        fail("transport dynamic boot/lock assertion is not exact and unique")
+
+    lineage_lock_stat_case = lineage_builder[
+        lineage_builder.index("lineage-lock-stat {") : lineage_builder.index(
+            "lineage-receipt-stat", lineage_builder.index("lineage-lock-stat {")
+        )
+    ]
+    ordered(
+        lineage_lock_stat_case,
+        (
+            "/usr/bin/stat -Lc %d:%i:%U:%G:%a:%h:%s:%F --",
+            "$::RETIREMENT_LOCK",
+            "set assertion r1-lock-identity",
+        ),
+        "transport retained R1 lock inode/shape oracle",
+    )
+    if (
+        lineage_lock_stat_case.count("/usr/bin/stat") != 1
+        or lineage_lock_stat_case.count("r1-lock-identity") != 1
+    ):
+        fail("transport retained R1 lock inode/shape probe is not unique")
 
     expected_current_package_names = (
         "source-4f2a9b61.bundle",
@@ -1845,30 +2247,49 @@ def main() -> None:
         "checksum C source blob/SHA/tree/file mode gate",
     )
 
-    expected_retained_package_names = (
-        "source-4f2a9b61.bundle",
-        "package-manifest.v1",
-        "bind-final-package.sh",
-        "controller.sh",
-        "prepare-stage-root.sh",
-        "provision-ubuntu-test-host.sh",
-        "root-matrix-n-r.sh",
-        "check-realhost-iperf.py",
-        "test-hermetic-matrix.sh",
-        "test_matrix_static.py",
-        "checksum-module-lease.sh",
-        "root-fresh-verifier-gate.sh",
-        "test-hermetic-fresh-verifier-gate.sh",
-        "test_fresh_verifier_gate_static.py",
-        "realnic_acceptance.py",
-        "test_realnic_acceptance.py",
-        "test_realnic_acceptance_static.py",
+    expected_retained_package_names = tuple(
+        item[0] for item in retained_retirement_package_contract
+    )
+    expected_retained_bootstrap_names = tuple(
+        item[0] for item in retained_retirement_bootstrap_contract
     )
     if (
         tcl_return_words(transport, "retained_retirement_package_names")
         != expected_retained_package_names
     ):
         fail("retained retirement package identity is not the fixed 17-file tuple")
+    if (
+        tcl_literal_return_file_contract(
+            transport, "retained_retirement_package_files"
+        )
+        != retained_retirement_package_contract
+        or tcl_literal_return_file_contract(
+            transport, "retained_retirement_bootstrap_files"
+        )
+        != retained_retirement_bootstrap_contract
+    ):
+        fail("transport retained R1 size/SHA authority is not the fixed 17+2 tuple")
+    for producer_body, producer_name in (
+        (
+            tcl_proc(transport, "retained_retirement_package_files"),
+            "R1 package file contract",
+        ),
+        (
+            tcl_proc(transport, "retained_retirement_bootstrap_files"),
+            "R1 bootstrap file contract",
+        ),
+    ):
+        if any(
+            authority in producer_body
+            for authority in (
+                "retained_retirement_package_names",
+                "r2_predecessor_package_names",
+                "r2_predecessor_package_sha",
+                "r2_predecessor_package_size",
+                "package_names",
+            )
+        ):
+            fail(f"transport {producer_name} is derived from another authority")
 
     # R2 is a third, independent authority.  These expectations are deliberately
     # literal and are not derived from any production parser or package helper.
@@ -2610,6 +3031,20 @@ def main() -> None:
         ),
         "transport R2 transaction pre/post lineage and sole helper seam",
     )
+    ordered(
+        r2_transaction,
+        (
+            "exactly primitives 1..84 and 85..97",
+            "r2_require_r1_terminal $values $manifest_sha $password preflight",
+            "r2_authority_state",
+            "Exactly primitives 98..130 and 131..178 precede the first write",
+            "zero-based trace index is 178 (one-based primitive #179)",
+            "r2_execute_common_gate",
+            "r2_execute_predecessor_gate",
+            "r2_ensure_delivery",
+        ),
+        "transport R2 178-read first-write ordinal contract",
+    )
     r2_verify_transaction = tcl_proc(transport, "execute_r2_verify_transaction")
     if (
         "r2_exact_verify" not in r2_verify_transaction
@@ -2655,17 +3090,99 @@ def main() -> None:
         "lineage-receipt-stat",
         "lineage-receipt-sha",
     )
+    expected_successor_lineage_operations = (
+        *tuple(
+            operation
+            for name in expected_retained_package_names
+            for operation in (
+                f"lineage-q-package-stat-{name}",
+                f"lineage-q-package-sha-{name}",
+            )
+        ),
+        *tuple(
+            operation
+            for name in expected_retained_bootstrap_names
+            for operation in (
+                f"lineage-q-bootstrap-stat-{name}",
+                f"lineage-q-bootstrap-sha-{name}",
+            )
+        ),
+        "lineage-boot-id-read",
+        "lineage-lock-content-read",
+        "lineage-lock-stat-recheck",
+    )
+    if (
+        len(expected_successor_lineage_operations) != 41
+        or len(set(expected_successor_lineage_operations)) != 41
+    ):
+        fail("test successor-aware R1 operation oracle is not the fixed 41 tuple")
+    retained_readonly_operations = tcl_proc(
+        transport, "retained_retirement_readonly_operations"
+    )
+    ordered(
+        retained_readonly_operations,
+        (
+            "set package_files [retained_retirement_package_files]",
+            "set package_names [retained_retirement_package_names]",
+            "set bootstrap_files [retained_retirement_bootstrap_files]",
+            "set bootstrap_names {",
+            "prepare-stage-root.sh provision-ubuntu-test-host.sh",
+            "[dict size $package_files] != 17",
+            "[lsort -ascii [dict keys $package_files]] ne",
+            "[lsort -ascii $package_names]",
+            "[dict size $bootstrap_files] != 2",
+            "[lsort -ascii [dict keys $bootstrap_files]] ne",
+            "[lsort -ascii $bootstrap_names]",
+            'return -code error "retirement-lineage-retained-cardinality"',
+            "set operations {}",
+            "foreach name $package_names",
+            'lappend operations "lineage-q-package-stat-${name}"',
+            '"lineage-q-package-sha-${name}"',
+            "foreach name $bootstrap_names",
+            'lappend operations "lineage-q-bootstrap-stat-${name}"',
+            '"lineage-q-bootstrap-sha-${name}"',
+            "lappend operations lineage-boot-id-read lineage-lock-content-read",
+            "lineage-lock-stat-recheck",
+            "[llength $operations] != 41",
+            'return -code error "retirement-lineage-readonly-cardinality"',
+            "return $operations",
+        ),
+        "transport successor-aware retained R1 operation generator",
+    )
+    if (
+        retained_readonly_operations.count("retained_retirement_package_files")
+        != 1
+        or retained_readonly_operations.count(
+            "retained_retirement_bootstrap_files"
+        )
+        != 1
+        or retained_readonly_operations.count(
+            "retained_retirement_package_names"
+        )
+        != 1
+        or retained_readonly_operations.count("lappend operations") != 3
+        or any(
+            forbidden in retained_readonly_operations
+            for forbidden in (
+                "[r2_predecessor_",
+                "[package_names]",
+                "build_retirement_lineage_operation",
+                "execute_retirement_lineage",
+            )
+        )
+    ):
+        fail("transport retained R1 operation generator is not independently closed")
     r2_r1_terminal_prewrite = (
         "lineage-exists-user-intake",
         "lineage-exists-home-qroot",
         "lineage-exists-run-qroot",
         "lineage-exists-receipt-pending",
         *expected_lineage_deep_operations,
+        *expected_successor_lineage_operations,
         "lineage-exists-user-intake",
         "lineage-exists-home-qroot",
         "lineage-exists-run-qroot",
         "lineage-exists-receipt-pending",
-        "lineage-retained-helper-verify",
     )
     r2_fresh_authority_prewrite = r2_ro_operations[:13]
     r2_common_prewrite = (
@@ -2716,12 +3233,12 @@ def main() -> None:
                 r2_predecessor_prewrite,
             )
         )
-        != (44, 13, 33, 48)
-        or len(expected_r2_prewrite_sequence) != 138
-        or expected_r2_prewrite_sequence[63] != "stale-stage-root"
+        != (84, 13, 33, 48)
+        or len(expected_r2_prewrite_sequence) != 178
+        or expected_r2_prewrite_sequence[103] != "stale-stage-root"
         or expected_r2_prewrite_sequence[-1] != "r2-ro-old-provision-check"
     ):
-        fail("test R2 prewrite oracle is not exact 44+13+33+48=138")
+        fail("test R2 prewrite oracle is not exact 84+13+33+48=178")
 
     r2_common_gate = tcl_proc(transport, "r2_execute_common_gate")
     ordered(
@@ -2783,7 +3300,7 @@ def main() -> None:
             "r2-raw-intake-mkdir",
             "/usr/bin/mkdir --mode=0700 -- $::R2_USER_INTAKE",
         ),
-        "transport R2 0-based first-write index 138 exact argv",
+        "transport R2 0-based first-write index 178 exact argv",
     )
     for operation in expected_lineage_deep_operations:
         if operation not in lineage_builder:
@@ -2797,12 +3314,26 @@ def main() -> None:
         (
             "require_manifest_authority $values $manifest_sha",
             "build_retirement_lineage_operation $values $operation",
+            "$boot_id $lock_identity",
             'fail "retirement-lineage-policy" 66',
             "execute_operation_spec $operation $operation_spec $password",
         ),
         "private lineage primitive authority/execution seam",
     )
-    if transport.count("build_retirement_lineage_operation") != 2:
+    if (
+        transport.count("build_retirement_lineage_operation") != 2
+        or transport.count(
+            "proc build_retirement_lineage_operation {\n"
+            "    values operation {boot_id \"\"} {lock_identity \"\"}\n}"
+        )
+        != 1
+        or transport.count(
+            "proc execute_retirement_lineage_primitive {\n"
+            "    values manifest_sha operation password {boot_id \"\"} "
+            "{lock_identity \"\"}\n}"
+        )
+        != 1
+    ):
         fail("private lineage builder is reachable outside its sole executor")
 
     lineage_exists = tcl_proc(transport, "retirement_lineage_path_exists")
@@ -2834,17 +3365,25 @@ def main() -> None:
         lineage_step,
         (
             "execute_retirement_lineage_primitive",
+            "$operation $password $boot_id $lock_identity",
             'if {[lindex $result 0] ne "ok"}',
             'fail "retirement-lineage-partial-$operation" 78',
             "writes=0",
+            "return $result",
         ),
         "retirement lineage fail-stop step",
     )
+    if transport.count(
+        "proc retirement_lineage_step {\n"
+        "    values manifest_sha operation password {boot_id \"\"} "
+        "{lock_identity \"\"}\n}"
+    ) != 1:
+        fail("retirement lineage step does not carry boot/lock identity exactly")
 
     lineage_gate = tcl_proc(transport, "execute_retirement_lineage_gate")
     deep_match = re.search(
-        r"(?ms)foreach operation \{(?P<body>.*?)\} \{\s*"
-        r"retirement_lineage_step \$values \$manifest_sha \$operation \$password",
+        r'(?ms)set retained_lock_identity ""\s*'
+        r"foreach operation \{(?P<body>.*?)\} \{",
         lineage_gate,
     )
     if (
@@ -2867,25 +3406,83 @@ def main() -> None:
             'fail "retirement-lineage-partial-state" 78',
             "lineage-exists-receipt-pending $password",
             'fail "retirement-lineage-receipt-pending" 78',
+            'set retained_lock_identity ""',
             "foreach operation {",
             "lineage-exists-user-intake $password",
             "lineage-exists-home-qroot $password",
             "lineage-exists-run-qroot $password",
             "lineage-exists-receipt-pending $password",
             'fail "retirement-lineage-terminal-recheck" 78',
-            "lineage-retained-helper-verify $password",
             "state=TERMINAL",
             "retained_commit=$::RETAINED_RETIREMENT_COMMIT",
             "retained_manifest_sha256=$::RETAINED_RETIREMENT_MANIFEST_SHA256",
             "retained_helper_sha256=$::RETAINED_RETIREMENT_HELPER_SHA256",
             "receipt_sha256=$::RETAINED_RETIREMENT_RECEIPT_SHA256",
-            "namespace_writes=0",
+            "package_files=17 bootstrap_files=2 primitives=84",
+            "same_boot=1 lock_inode_stable=1 namespace_writes=0",
             "return TERMINAL",
         ),
         "fresh/terminal retirement lineage classifier",
     )
-    if lineage_gate.count("lineage-retained-helper-verify") != 1:
-        fail("terminal lineage verifier is not one final fail-stop step")
+    ordered(
+        lineage_gate,
+        (
+            'set retained_lock_identity ""',
+            "foreach operation {",
+            "set result [retirement_lineage_step $values $manifest_sha",
+            "$operation $password]",
+            'if {$operation eq "lineage-lock-stat"}',
+            "set retained_lock_identity [output_value [lindex $result 2]]",
+            "[catch {retained_retirement_readonly_operations} readonly_operations]",
+            "[llength $readonly_operations] != 41",
+            'fail "retirement-lineage-readonly-cardinality" 66',
+            'set retained_boot_id ""',
+            "foreach operation $readonly_operations",
+            'if {$operation eq "lineage-lock-content-read"}',
+            'if {$retained_boot_id eq ""}',
+            'fail "retirement-lineage-boot-order" 66',
+            "retirement_lineage_step $values $manifest_sha $operation $password",
+            "$retained_boot_id",
+            '} elseif {$operation eq "lineage-lock-stat-recheck"}',
+            'if {$retained_lock_identity eq ""}',
+            'fail "retirement-lineage-lock-order" 66',
+            "retirement_lineage_step $values $manifest_sha $operation $password",
+            "$retained_boot_id $retained_lock_identity",
+            "set result [retirement_lineage_step $values $manifest_sha",
+            "$operation $password]",
+            'if {$operation eq "lineage-boot-id-read"}',
+            "set retained_boot_id [output_value [lindex $result 2]]",
+            "lineage-exists-user-intake $password",
+            "lineage-exists-home-qroot $password",
+            "lineage-exists-run-qroot $password",
+            "lineage-exists-receipt-pending $password",
+            'fail "retirement-lineage-terminal-recheck" 78',
+        ),
+        "successor-aware retained R1 boot/inode comparison and final recheck",
+    )
+    if (
+        lineage_gate.count("retained_retirement_readonly_operations") != 1
+        or lineage_gate.count("foreach operation $readonly_operations") != 1
+        or lineage_gate.count('if {$operation eq "lineage-boot-id-read"}') != 1
+        or lineage_gate.count('if {$operation eq "lineage-lock-content-read"}')
+        != 1
+        or lineage_gate.count('if {$operation eq "lineage-lock-stat"}') != 1
+        or lineage_gate.count(
+            '} elseif {$operation eq "lineage-lock-stat-recheck"}'
+        )
+        != 1
+        or lineage_gate.count("output_value [lindex $result 2]") != 2
+        or lineage_gate.count("$retained_boot_id $retained_lock_identity") != 1
+        or any(
+            old_helper in lineage_gate
+            for old_helper in (
+                "lineage-retained-helper-verify",
+                "retained_retirement_helper_remote_argv",
+                "verify-retirement",
+            )
+        )
+    ):
+        fail("terminal lineage successor loop is not exact or retains the old helper")
 
     approved_proc = tcl_proc(transport, "operation_requires_approved_sha")
     approved_match = re.search(r"(?ms)\$operation in \{(?P<body>.*?)\}", approved_proc)
@@ -3799,6 +4396,73 @@ def main() -> None:
             "validate_r1_terminal",
         )
     )
+    r1_terminal_validator = engine_functions["validate_r1_terminal"]
+    r1_terminal_node = next(
+        node
+        for node in engine_function_nodes
+        if node.name == "validate_r1_terminal"
+    )
+    r1_terminal_ast = ast.dump(r1_terminal_node, include_attributes=False)
+    if (
+        len(r1_terminal_ast.encode("utf-8")) != 11156
+        or hashlib.sha256(r1_terminal_ast.encode("utf-8")).hexdigest()
+        != "17129afdd09a6e054d6bc5fc65afbcf5d29546860931b0ba753cdf724dd5de17"
+    ):
+        fail("root stager retained R1 validator AST drifted")
+    expected_r1_flock_try = ast.parse(
+        "try:\n"
+        "    fcntl.flock(\n"
+        "        r1_lock_descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)\n"
+        "except BlockingIOError:\n"
+        '    stop("r1-lock-busy", 78)\n'
+    ).body[0]
+    r1_outer_tries = tuple(
+        node for node in r1_terminal_node.body if isinstance(node, ast.Try)
+    )
+    r1_flock_tries = tuple(
+        node
+        for node in ast.walk(r1_terminal_node)
+        if isinstance(node, ast.Try)
+        and ast.dump(node, include_attributes=False)
+        == ast.dump(expected_r1_flock_try, include_attributes=False)
+    )
+    r1_live_flock_calls = tuple(
+        node
+        for node in ast.walk(r1_terminal_node)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "fcntl"
+        and node.func.attr == "flock"
+    )
+    if (
+        len(r1_outer_tries) != 1
+        or len(r1_flock_tries) != 1
+        or r1_flock_tries[0] not in r1_outer_tries[0].body
+        or len(r1_live_flock_calls) != 1
+    ):
+        fail("root stager retained R1 shared NB flock is not one live direct try")
+    ordered(
+        r1_terminal_validator,
+        (
+            "validate_r1_retained_entries(",
+            'run_descriptor, "retirement.v1.lock", ROOT_UID, ROOT_GID, 0o600, 1',
+            "fcntl.flock(r1_lock_descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)",
+            "except BlockingIOError:",
+            'stop("r1-lock-busy", 78)',
+            'read_all(r1_lock_descriptor, 256) != f"boot_id\\t{boot_id}\\n".encode("ascii")',
+            'stop("r1-lock-boot")',
+        ),
+        "root stager retained R1 shared/nonblocking lock validation",
+    )
+    if (
+        r1_terminal_validator.count(
+            "fcntl.flock(r1_lock_descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)"
+        )
+        != 1
+        or "fcntl.LOCK_EX" in r1_terminal_validator
+    ):
+        fail("root stager retained R1 verifier does not use one shared NB lock")
     for r1_literal in (
         'R1_ID = "c8e41d73-2c690050ae1d-r1"',
         f'R1_AUTH_MANIFEST_SHA = "{retained_retirement_manifest_sha}"',
@@ -3827,6 +4491,43 @@ def main() -> None:
     )
     expect_harness_end = hermetic.index("\nEXPECT_HARNESS\n", expect_harness_start)
     transport_harness = hermetic[expect_harness_start:expect_harness_end]
+    transport_harness_outer = hermetic[
+        expect_harness_end + len("\nEXPECT_HARNESS\n") :
+    ]
+    if (
+        len(transport_harness.encode("utf-8")) != 153263
+        or hashlib.sha256(transport_harness.encode("utf-8")).hexdigest()
+        != "79609a500a11a3755d3a17ca28add31e26f5ceac1699345d4d6e8a28c7e90770"
+        or len(transport_harness_outer.encode("utf-8")) != 160172
+        or hashlib.sha256(transport_harness_outer.encode("utf-8")).hexdigest()
+        != "9724edb388b3479c0c1ebefb2f6a02e2021034334ac7f50073aaf11ab32953cf"
+    ):
+        fail("hermetic transport harness or direct outer runners bytes drifted")
+    ordered(
+        transport_harness,
+        (
+            "set transport [file normalize [lindex $argv 0]]",
+            "set mode [lindex $argv 1]",
+            "set arguments [lrange $argv 2 end]",
+            "set argv0 [file normalize [info script]]",
+            "source $transport",
+            "proc harness_die {message}",
+            "switch -- $mode {",
+        ),
+        "hermetic exact production transport source/dispatch",
+    )
+    if (
+        transport_harness.count(
+            "set transport [file normalize [lindex $argv 0]]"
+        )
+        != 1
+        or tuple(
+            re.findall(r"(?m)^source[ \t]+([^\n]+)$", transport_harness)
+        )
+        != ("$transport",)
+        or transport_harness.count("switch -- $mode {") != 1
+    ):
+        fail("hermetic harness does not source the exact argv transport once")
     harness_case_names = (
         "prepare-sequence",
         "prewrite-cuts",
@@ -3836,6 +4537,7 @@ def main() -> None:
         "scp-build",
         "lineage-existence",
         "lineage-gate",
+        "r1-source-reuse",
         "prepare-lineage",
         "r2-prewrite-cuts",
         "r2-first-write",
@@ -3872,8 +4574,11 @@ def main() -> None:
     hermetic_r2_package_names = tcl_literal_return_words(
         transport_harness, "r2_test_package_names"
     )
+    hermetic_r1_successor_operations = tcl_literal_return_words(
+        transport_harness, "r2_test_r1_deep_operations"
+    )
     if hermetic_r2_prewrite != expected_r2_prewrite_sequence:
-        fail("hermetic R2 prewrite oracle is not the independent flat 138 tuple")
+        fail("hermetic R2 prewrite oracle is not the independent flat 178 tuple")
     if hermetic_r2_raw != r2_raw_operations:
         fail("hermetic R2 mutation oracle is not the independent ordered 21 tuple")
     if (
@@ -3884,6 +4589,43 @@ def main() -> None:
         fail("hermetic R2 private read-only oracle is not the independent flat 96 set")
     if hermetic_r2_package_names != r2_predecessor_package_names:
         fail("hermetic R2 predecessor package oracle is not the independent 17 tuple")
+    if hermetic_r1_successor_operations != expected_successor_lineage_operations:
+        fail("hermetic successor-aware R1 oracle is not the independent 41 tuple")
+    hermetic_r1_file_oracle = tcl_proc(
+        transport_harness, "r2_test_r1_file_oracle"
+    )
+    hermetic_r1_file_entries = tuple(
+        (scope, name, int(size), sha)
+        for scope, name, size, sha in re.findall(
+            r"(?ms)^\s*(package|bootstrap)/([^\s{}]+)\s+\{\s*"
+            r"return \{([0-9]+) ([0-9a-f]{64})\}\s*\}",
+            hermetic_r1_file_oracle,
+        )
+    )
+    expected_hermetic_r1_file_entries = tuple(
+        ("package", name, size, sha)
+        for name, size, sha in retained_retirement_package_contract
+    ) + tuple(
+        ("bootstrap", name, size, sha)
+        for name, size, sha in retained_retirement_bootstrap_contract
+    )
+    if (
+        hermetic_r1_file_entries != expected_hermetic_r1_file_entries
+        or hermetic_r1_file_oracle.count(
+            'default { harness_die "r2-test-r1-file-oracle-${scope}-${name}" }'
+        )
+        != 1
+        or any(
+            production_oracle in hermetic_r1_file_oracle
+            for production_oracle in (
+                "retained_retirement_",
+                "r2_predecessor_",
+                "build_retirement_lineage_operation",
+                "package-manifest.v1]",
+            )
+        )
+    ):
+        fail("hermetic retained R1 17+2 size/SHA oracle is not independent")
     r2_oracle_procs = "\n".join(
         tcl_proc(transport_harness, name)
         for name in (
@@ -3891,6 +4633,8 @@ def main() -> None:
             "r2_test_raw_sequence",
             "r2_test_private_read_only",
             "r2_test_package_names",
+            "r2_test_r1_deep_operations",
+            "r2_test_r1_file_oracle",
         )
     )
     for production_oracle in (
@@ -3906,24 +4650,25 @@ def main() -> None:
         if production_oracle in r2_oracle_procs:
             fail(f"hermetic R2 expected tuple is production-derived: {production_oracle}")
 
-    r2_case_names = harness_case_names[harness_case_names.index("r2-prewrite-cuts") :]
-    r2_cases = "\n".join(harness_cases[name] for name in r2_case_names)
     for protected_procedure in (
         "r2_authority_state",
         "r2_require_auth_pending_prefix",
         "execute_retirement_lineage_gate",
+        "r2_require_r1_terminal",
         "r2_execute_common_gate",
         "r2_execute_predecessor_gate",
+        "retained_retirement_readonly_operations",
+        "build_retirement_lineage_operation",
         "build_r2_operation",
         "execute_r2_primitive",
         "execute_r2_transaction",
         "execute_r2_verify_transaction",
     ):
-        if f"rename {protected_procedure} " in r2_cases or re.search(
-            rf"(?m)^\s*proc {re.escape(protected_procedure)}\s", r2_cases
+        if f"rename {protected_procedure} " in transport_harness or re.search(
+            rf"(?m)^\s*proc {re.escape(protected_procedure)}\s", transport_harness
         ):
             fail(
-                "hermetic R2 harness replaces production control logic: "
+                "hermetic harness globally replaces production control logic: "
                 f"{protected_procedure}"
             )
 
@@ -3932,8 +4677,8 @@ def main() -> None:
         r2_prewrite_case,
         (
             "set ::r2_expected [r2_test_prewrite_sequence]",
-            "[llength $::r2_expected] != 138",
-            '[lindex $::r2_expected 137] ne "r2-ro-old-provision-check"',
+            "[llength $::r2_expected] != 178",
+            '[lindex $::r2_expected 177] ne "r2-ro-old-provision-check"',
             "rename execute_operation_spec transport_original_execute_operation_spec",
             "proc execute_operation_spec {operation operation_spec password}",
             "set ordinal [llength $::r2_observed]",
@@ -3942,23 +4687,117 @@ def main() -> None:
             "lappend ::r2_observed $operation",
             "if {$ordinal == $::r2_cut}",
             "foreach cut_kind {child-nonzero signal}",
-            "for {set cut 0} {$cut < 138} {incr cut}",
+            "for {set cut 0} {$cut < 178} {incr cut}",
             "unset -nocomplain ::R2_MUTATION_TRACE_ACTIVE",
             "::R2_MUTATION_INTAKE_CREATED",
+            "set caught [catch {",
             "execute_r2_transaction $values $manifest_sha",
-            '$cut_kind eq "signal" || $cut < 44 ? 78 : 73',
+            '$cut_kind eq "signal" || $cut < 84 ? 78 : 73',
+            "set expected_prefix [lrange $::r2_expected 0 $cut]",
+            "if {!$caught || ![dict exists $options -errorcode]",
+            "[dict get $options -errorcode] ne",
+            "[list R2_TRANSACTION_EXIT $expected_rc]",
+            "[lrange $::r2_observed 0 end] ne",
+            "[lrange $expected_prefix 0 end]",
             "[llength $::r2_mutations] != 0",
-            "HARNESS_R2_PREWRITE_CUTS primitives=138 cuts=138 mutations=0",
-            "child_nonzero=138 child_signal=138 result=PASS",
+            'harness_die "r2-prewrite-cut=$cut kind=$cut_kind',
+            "if {$child_nonzero != 178 || $child_signal != 178}",
+            "HARNESS_R2_PREWRITE_CUTS primitives=178 cuts=356 mutations=0",
+            "child_nonzero=178 child_signal=178 r1_gate=84 authority=13",
+            "common=33 predecessor=48 result=PASS",
         ),
-        "hermetic actual R2 138-prewrite cut harness",
+        "hermetic actual R2 178-by-two prewrite cut harness",
     )
     if (
         r2_prewrite_case.count("execute_r2_transaction") != 1
         or r2_prewrite_case.count("rename execute_operation_spec ") != 1
         or "lappend ::r2_expected" in r2_prewrite_case
+        or r2_prewrite_case.count(
+            "foreach cut_kind {child-nonzero signal}"
+        )
+        != 1
+        or r2_prewrite_case.count(
+            "for {set cut 0} {$cut < 178} {incr cut}"
+        )
+        != 1
+        or r2_prewrite_case.count("incr child_nonzero") != 1
+        or r2_prewrite_case.count("incr child_signal") != 1
+        or r2_prewrite_case.count(
+            "[list R2_TRANSACTION_EXIT $expected_rc]"
+        )
+        != 1
+        or r2_prewrite_case.count("harness_die \"r2-prewrite-cut=") != 1
+        or r2_prewrite_case.count("cuts=356") != 1
     ):
         fail("hermetic R2 prewrite harness does not instrument one actual transaction")
+
+    r1_source_reuse_case = harness_cases["r1-source-reuse"]
+    ordered(
+        r1_source_reuse_case,
+        (
+            "set full_prewrite [r2_test_prewrite_sequence]",
+            "set r1_expected [lrange $full_prewrite 0 83]",
+            "set predecessor_expected [lrange $full_prewrite 130 177]",
+            "[llength $full_prewrite] != 178",
+            "[llength $r1_expected] != 84",
+            "[llength $predecessor_expected] != 48",
+            '[lindex $r1_expected 0] ne "lineage-exists-user-intake"',
+            '[lindex $r1_expected 83] ne "lineage-exists-receipt-pending"',
+            '[lindex $predecessor_expected 0] ne "package-parent-stat"',
+            '"r2-ro-old-provision-check"',
+            "set ::reuse_expected [concat $r1_expected $predecessor_expected]",
+            "rename execute_operation_spec transport_original_execute_operation_spec",
+            "proc execute_operation_spec {operation operation_spec password}",
+            'if {$operation eq "lineage-retained-helper-verify"}',
+            "incr ::reuse_legacy_helper_calls",
+            "return [list child-failure 79",
+            "B82_V6_RETIREMENT_ENGINE_STOP reason=retirement-state rc=79",
+            "set ordinal [llength $::reuse_observed]",
+            "set expected [lindex $::reuse_expected $ordinal]",
+            "if {$operation ne $expected",
+            "lappend ::reuse_observed $operation",
+            'if {[string match "lineage-q-package-*-*" $operation]}',
+            "incr ::reuse_qpackage_deep",
+            'if {[string match "lineage-q-bootstrap-*-*" $operation]}',
+            "incr ::reuse_qbootstrap_deep",
+            "[r2_test_remote_payload $operation]",
+            "[catch {assert_output $assertion $payload} reason]",
+            "r2_require_r1_terminal $values $manifest_sha fixture-password",
+            "source-reuse",
+            "r2_execute_predecessor_gate $values $manifest_sha $predecessor_values",
+            "$::reuse_observed ne $::reuse_expected",
+            "$::reuse_legacy_helper_calls != 0",
+            "$::reuse_qpackage_deep != 34",
+            "$::reuse_qbootstrap_deep != 4",
+            "HARNESS_R1_SOURCE_REUSE r1_gate=84 qpackage=present",
+            "qbootstrap=present source_package=present source_bootstrap=present",
+            "retained_file_checks=38 lock_inode_stable=1 predecessor_deep=48",
+            "legacy_helper_calls=0 result=PASS",
+        ),
+        "hermetic actual successor-source-reuse R1/predecessor gates",
+    )
+    for protected_procedure in (
+        "r2_require_r1_terminal",
+        "execute_retirement_lineage_gate",
+        "r2_execute_predecessor_gate",
+        "retained_retirement_readonly_operations",
+        "build_retirement_lineage_operation",
+    ):
+        if f"rename {protected_procedure} " in r1_source_reuse_case or re.search(
+            rf"(?m)^\s*proc {re.escape(protected_procedure)}\s",
+            r1_source_reuse_case,
+        ):
+            fail(
+                "hermetic source-reuse case replaces production control logic: "
+                f"{protected_procedure}"
+            )
+    if (
+        r1_source_reuse_case.count("r2_require_r1_terminal ") != 1
+        or r1_source_reuse_case.count("r2_execute_predecessor_gate ") != 1
+        or r1_source_reuse_case.count("rename execute_operation_spec ") != 1
+        or r1_source_reuse_case.count("HARNESS_R1_SOURCE_REUSE") != 1
+    ):
+        fail("hermetic source-reuse case does not execute each actual gate once")
 
     r2_first_write_case = harness_cases["r2-first-write"]
     ordered(
@@ -3967,14 +4806,23 @@ def main() -> None:
             "set ::r2_expected [r2_test_prewrite_sequence]",
             "rename execute_operation_spec transport_original_execute_operation_spec",
             "set ordinal [llength $::r2_observed]",
-            "if {$ordinal < 138}",
+            "if {$ordinal < 178}",
             "set expected_operation r2-raw-intake-mkdir",
-            "if {$ordinal == 138}",
+            "if {$ordinal == 178}",
             "/usr/bin/mkdir --mode=0700 --",
             "/home/siyixuan/wg-mix-ebpf-test/retire-postflight-c8e41d73-f75fe7678cfd-r2.intake",
             "return [list child-failure 73",
+            "set caught [catch {",
             "execute_r2_transaction $values $manifest_sha",
-            "HARNESS_R2_FIRST_WRITE index=138 operation=r2-raw-intake-mkdir",
+            "set expected [concat $::r2_expected {r2-raw-intake-mkdir}]",
+            "if {!$caught || ![dict exists $options -errorcode]",
+            "[dict get $options -errorcode] ne {R2_TRANSACTION_EXIT 73}",
+            "[lrange $::r2_observed 0 end] ne [lrange $expected 0 end]",
+            "$::r2_mutations ne {r2-raw-intake-mkdir}",
+            "$::r2_scp != 0",
+            'harness_die "r2-first-write rc=$errorcode caught=$caught',
+            "HARNESS_R2_FIRST_WRITE index=178 ordinal=179",
+            "operation=r2-raw-intake-mkdir",
             "rc=73 scp=0 result=PASS",
         ),
         "hermetic actual R2 first-write harness",
@@ -3982,8 +4830,56 @@ def main() -> None:
     if (
         r2_first_write_case.count("execute_r2_transaction") != 1
         or r2_first_write_case.count("rename execute_operation_spec ") != 1
+        or r2_first_write_case.count("{R2_TRANSACTION_EXIT 73}") != 1
+        or r2_first_write_case.count("harness_die \"r2-first-write rc=") != 1
     ):
         fail("hermetic R2 first-write harness does not instrument one actual transaction")
+
+    ordered(
+        transport_harness_outer,
+        (
+            'R1_SOURCE_REUSE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}"',
+            '"${FIXTURE_REVIEW}/locked-transport.exp" r1-source-reuse',
+            '"${BOUND_MANIFEST}" "${BOUND_MANIFEST_SHA}"',
+            '"${R2_PREDECESSOR_CLONE}" 2>&1)"',
+            "fail 'R1 terminal and successor source-path reuse regression'",
+            '[[ "${R1_SOURCE_REUSE_OUTPUT}" ==',
+            "HARNESS_R1_SOURCE_REUSE r1_gate=84 qpackage=present",
+            "retained_file_checks=38 lock_inode_stable=1 predecessor_deep=48",
+            "legacy_helper_calls=0 result=PASS",
+            'R2_PREWRITE_CUTS_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}"',
+            '"${FIXTURE_REVIEW}/locked-transport.exp" r2-prewrite-cuts',
+            '"${BOUND_MANIFEST}" "${BOUND_MANIFEST_SHA}" "${R2_PREDECESSOR_CLONE}"',
+            "fail 'R2 actual transaction prewrite cut matrix'",
+            '[[ "${R2_PREWRITE_CUTS_OUTPUT}" ==',
+            "HARNESS_R2_PREWRITE_CUTS primitives=178 cuts=356 mutations=0",
+            "child_nonzero=178 child_signal=178 r1_gate=84 authority=13",
+            "common=33 predecessor=48 result=PASS",
+            'R2_FIRST_WRITE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}"',
+            '"${FIXTURE_REVIEW}/locked-transport.exp" r2-first-write',
+            '"${BOUND_MANIFEST}" "${BOUND_MANIFEST_SHA}" "${R2_PREDECESSOR_CLONE}"',
+            "fail 'R2 first mutation failure harness'",
+            '[[ "${R2_FIRST_WRITE_OUTPUT}" ==',
+            "HARNESS_R2_FIRST_WRITE index=178 ordinal=179",
+            "operation=r2-raw-intake-mkdir rc=73 scp=0 result=PASS",
+        ),
+        "hermetic outer execution of successor/prewrite/first-write regressions",
+    )
+    for output_name, marker in (
+        ("R1_SOURCE_REUSE_OUTPUT", "HARNESS_R1_SOURCE_REUSE"),
+        ("R2_PREWRITE_CUTS_OUTPUT", "HARNESS_R2_PREWRITE_CUTS"),
+        ("R2_FIRST_WRITE_OUTPUT", "HARNESS_R2_FIRST_WRITE"),
+    ):
+        if (
+            transport_harness_outer.count(
+                f'{output_name}="$(/usr/bin/expect "${{TRANSPORT_HARNESS}}"'
+            )
+            != 1
+            or transport_harness_outer.count(f'[[ "${{{output_name}}}" ==')
+            != 1
+            or transport_harness_outer.count(marker) != 1
+        ):
+            fail(f"hermetic outer regression is not executed/asserted once: {marker}")
 
     r2_provision_case = harness_cases["r2-provision-cuts"]
     provision_payload_oracle = tcl_proc(
@@ -4761,8 +5657,11 @@ def main() -> None:
         engine_harness_close, engine_harness_start
     )
     engine_harness = hermetic[engine_harness_start:engine_harness_end]
-    if hashlib.sha256(engine_harness.encode("utf-8")).hexdigest() != (
-        "1e3d1a6fb66a2b60e2fdb67e66f0e27b5dbcd1fa707ce59d0dda323c74e8aecb"
+    if (
+        not engine_harness.endswith("\n")
+        or len(engine_harness[:-1].encode("utf-8")) != 56982
+        or hashlib.sha256(engine_harness[:-1].encode("utf-8")).hexdigest()
+        != "fc3c253d2a526bd501160b6e043308b2cad6cf6619c9a037e9d689575e5adec2"
     ):
         fail("hermetic actual R2 engine harness bytes drifted")
     try:
@@ -4770,16 +5669,67 @@ def main() -> None:
     except SyntaxError as exc:
         fail(f"hermetic R2 engine harness is not valid Python: {exc}")
     validate_engine_harness_execution_ast(engine_harness)
+    expected_legacy_engine_functions = (
+        "stop",
+        "require_absolute",
+        "open_abs_dir",
+        "open_parent",
+        "fd_mnt_id",
+        "require_dir_fd",
+        "names_at",
+        "entry_stat",
+        "entry_is_directory",
+        "read_all",
+        "sha256_fd",
+        "require_file_at",
+        "parse_manifest",
+        "require_pair",
+        "same_open_inode",
+        "require_host_identity",
+        "require_exact_names",
+        "open_child_dir",
+        "validate_current_authority",
+        "fsync_current_authority",
+        "validate_intake",
+        "validate_old_package",
+        "validate_old_bootstrap",
+        "directory_location",
+        "regular_present",
+        "classify_state",
+        "boot_identity",
+        "write_all",
+        "acquire_retirement_lock",
+        "initialize_or_verify_boot_marker",
+        "receipt_bytes",
+        "validate_receipt",
+        "validate_pending_receipt",
+        "validate_state_objects",
+        "renameat2_noreplace",
+        "rename_directory_noreplace",
+        "publish_receipt",
+        "converge_completed_rename",
+        "converge_completed_rename_parents",
+        "converge_resumed_state",
+        "converge_terminal",
+        "engine_main",
+    )
     harness_assignments: dict[str, ast.AST] = {}
     for assignment_name in (
         "EXPECTED_ENGINE_FUNCTIONS",
         "EXPECTED_ENGINE_PAYLOAD_SHA256",
         "EXPECTED_ENGINE_MAIN_SHA256",
+        "EXPECTED_LEGACY_ENGINE_FUNCTIONS",
+        "EXPECTED_LEGACY_ENGINE_MAIN_CLOSURE",
+        "EXPECTED_LEGACY_ENGINE_ORPHAN_CALLERS",
+        "EXPECTED_LEGACY_ENGINE_PAYLOAD_SHA256",
+        "EXPECTED_LEGACY_ENGINE_MAIN_SHA256",
         "PREDECESSOR_COMMIT",
         "PREDECESSOR_MANIFEST_SHA256",
         "R1_MANIFEST_SHA256",
         "R1_SELF_SHA256",
         "R1_RECEIPT_SHA256",
+        "R1_PREDECESSOR_COMMIT",
+        "R1_PREDECESSOR_MANIFEST_SHA256",
         "R1_ID",
         "BOOT_ID",
         "HOSTNAME",
@@ -4812,6 +5762,21 @@ def main() -> None:
         harness_main_sha = ast.literal_eval(
             harness_assignments["EXPECTED_ENGINE_MAIN_SHA256"]
         )
+        harness_legacy_engine_functions = ast.literal_eval(
+            harness_assignments["EXPECTED_LEGACY_ENGINE_FUNCTIONS"]
+        )
+        harness_legacy_main_closure = ast.literal_eval(
+            harness_assignments["EXPECTED_LEGACY_ENGINE_MAIN_CLOSURE"]
+        )
+        harness_legacy_orphan_callers = ast.literal_eval(
+            harness_assignments["EXPECTED_LEGACY_ENGINE_ORPHAN_CALLERS"]
+        )
+        harness_legacy_payload_sha = ast.literal_eval(
+            harness_assignments["EXPECTED_LEGACY_ENGINE_PAYLOAD_SHA256"]
+        )
+        harness_legacy_main_sha = ast.literal_eval(
+            harness_assignments["EXPECTED_LEGACY_ENGINE_MAIN_SHA256"]
+        )
         harness_paths = ast.literal_eval(harness_assignments["PATHS"])
         harness_package_names = ast.literal_eval(
             harness_assignments["PACKAGE_NAMES"]
@@ -4830,6 +5795,8 @@ def main() -> None:
                 "R1_MANIFEST_SHA256",
                 "R1_SELF_SHA256",
                 "R1_RECEIPT_SHA256",
+                "R1_PREDECESSOR_COMMIT",
+                "R1_PREDECESSOR_MANIFEST_SHA256",
                 "R1_ID",
                 "BOOT_ID",
                 "HOSTNAME",
@@ -4867,6 +5834,10 @@ def main() -> None:
         "R1_MANIFEST_SHA256": retained_retirement_manifest_sha,
         "R1_SELF_SHA256": retained_retirement_helper_sha,
         "R1_RECEIPT_SHA256": retained_retirement_receipt_sha,
+        "R1_PREDECESSOR_COMMIT": "2c690050ae1d69dbd074acfd612faa2b80e29f8a",
+        "R1_PREDECESSOR_MANIFEST_SHA256": (
+            "21f14e1f7e646649fdad864dce23dce2055585962d92bfaba6e71158372c1ebe"
+        ),
         "R1_ID": "c8e41d73-2c690050ae1d-r1",
         "BOOT_ID": "01234567-89ab-cdef-0123-456789abcdef",
         "HOSTNAME": "ubuntu-2604-test",
@@ -4880,6 +5851,20 @@ def main() -> None:
     if (
         harness_engine_functions != expected_engine_functions
         or len(harness_engine_functions) != 48
+        or harness_legacy_engine_functions != expected_legacy_engine_functions
+        or len(harness_legacy_engine_functions) != 42
+        or harness_legacy_main_closure
+        != tuple(
+            name
+            for name in expected_legacy_engine_functions
+            if name != "directory_location"
+        )
+        or len(harness_legacy_main_closure) != 41
+        or harness_legacy_orphan_callers != {"directory_location": ()}
+        or harness_legacy_payload_sha
+        != "03ff972e4d1e40ff83d683091f392be4519ba81f9020af8851007fa0f74fabfc"
+        or harness_legacy_main_sha
+        != "9183ac32c570ba2b7f4e6816c9856d3c124adc221bec9c49506a9f16551fc266"
         or harness_constants != expected_harness_constants
         or harness_paths != expected_harness_paths
         or harness_package_names != r2_predecessor_package_names
@@ -5032,6 +6017,82 @@ def main() -> None:
         )
     ):
         fail("hermetic R2 engine AST transform is not UID/GID-only")
+    extract_legacy_engine = python_function(
+        engine_harness, "extract_and_transform_legacy_engine"
+    )
+    ordered(
+        extract_legacy_engine,
+        (
+            'shell = Path(stager).read_text(encoding="utf-8")',
+            'anchor = shell.index("run_retirement_engine() {")',
+            'function_end = shell.index("\\nrun_stage() {", anchor)',
+            'function.count("<<\'PY\'\\n") != 1',
+            "hashlib.sha256(payload.encode(\"utf-8\")).hexdigest() !=",
+            "EXPECTED_LEGACY_ENGINE_PAYLOAD_SHA256",
+            "original = ast.parse(payload",
+            "transformed = ast.parse(payload",
+            "tuple(node.name for node in original_functions) !=",
+            "EXPECTED_LEGACY_ENGINE_FUNCTIONS",
+            "tuple(node.name for node in transformed_functions) !=",
+            "EXPECTED_LEGACY_ENGINE_FUNCTIONS",
+            "engine_main_node = original_functions[-1]",
+            "ast.get_source_segment(payload, engine_main_node)",
+            "EXPECTED_LEGACY_ENGINE_MAIN_SHA256",
+            "function_names = set(EXPECTED_LEGACY_ENGINE_FUNCTIONS)",
+            "graph = {}",
+            "for node in original_functions:",
+            "call.func.id in function_names",
+            "closure = set()",
+            'pending = ["engine_main"]',
+            "reachable_surface = tuple(",
+            "name for name in EXPECTED_LEGACY_ENGINE_FUNCTIONS if name in closure",
+            "if reachable_surface != EXPECTED_LEGACY_ENGINE_MAIN_CLOSURE:",
+            "orphan_callers = {",
+            "name for name, callees in graph.items() if orphan in callees",
+            "for orphan in function_names - closure",
+            "if orphan_callers != EXPECTED_LEGACY_ENGINE_ORPHAN_CALLERS:",
+            'values = {"ROOT_UID": os.geteuid(), "ROOT_GID": os.getegid()}',
+            "target.id in values",
+            "node.value.value != 0",
+            "node.value = ast.copy_location(",
+            "ast.Constant(values[target.id]), node.value)",
+            'replacements != ["ROOT_UID", "ROOT_GID"]',
+            "if len(original.body) != len(transformed.body):",
+            "for original_node, transformed_node in zip(original.body, transformed.body):",
+            "ast.dump(original_node, include_attributes=False) !=",
+            "ast.dump(transformed_node, include_attributes=False)",
+            'raise AssertionError("legacy-production-module-rewrite")',
+            'allowed_differences != ["ROOT_UID", "ROOT_GID"]',
+            'raise AssertionError("legacy-production-module-differences")',
+            'return compile(transformed, str(stager) + ":embedded-r1", "exec")',
+        ),
+        "hermetic extraction of actual historical R1 engine_main closure",
+    )
+    if (
+        extract_legacy_engine.count("ast.parse(payload") != 2
+        or extract_legacy_engine.count("node.value = ") != 1
+        or extract_legacy_engine.count("compile(transformed") != 1
+        or extract_legacy_engine.count(
+            "for original_node, transformed_node in zip("
+        )
+        != 1
+        or extract_legacy_engine.count("graph = {}") != 1
+        or extract_legacy_engine.count("reachable_surface = tuple(") != 1
+        or extract_legacy_engine.count("orphan_callers = {") != 1
+        or extract_legacy_engine.count("function_names - closure") != 1
+        or any(
+            forbidden in extract_legacy_engine
+            for forbidden in (
+                "ast.NodeTransformer",
+                "payload.replace(",
+                "source.replace(",
+                'namespace["engine_main"]',
+                "namespace['engine_main']",
+                "setattr(",
+            )
+        )
+    ):
+        fail("hermetic historical R1 engine AST transform is not UID/GID-only")
     extract_engine_node = next(
         node
         for node in engine_harness_tree.body
@@ -5051,6 +6112,23 @@ def main() -> None:
     )
     if attribute_write_targets != ("node.value",):
         fail("hermetic R2 engine AST mutates more than the two root-id values")
+    extract_legacy_engine_node = next(
+        node
+        for node in engine_harness_tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "extract_and_transform_legacy_engine"
+    )
+    legacy_attribute_write_targets = tuple(
+        ast.get_source_segment(engine_harness, target) or ""
+        for node in ast.walk(extract_legacy_engine_node)
+        if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+        for target in (
+            node.targets if isinstance(node, ast.Assign) else (node.target,)
+        )
+        if isinstance(target, ast.Attribute)
+    )
+    if legacy_attribute_write_targets != ("node.value",):
+        fail("hermetic historical R1 AST mutates beyond its two root-id values")
 
     engine_argv_source = python_function(engine_harness, "engine_argv")
     engine_argv_node = next(
@@ -5095,6 +6173,52 @@ def main() -> None:
         for mutation in ("argv.append", "argv.extend", "argv.insert", "argv +=")
     ):
         fail("hermetic R2 engine argv is mutable after its 24-item authority")
+    legacy_engine_argv_source = python_function(
+        engine_harness, "legacy_engine_argv"
+    )
+    legacy_engine_argv_node = next(
+        node
+        for node in engine_harness_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "legacy_engine_argv"
+    )
+    legacy_argv_assignments = [
+        node.value
+        for node in ast.walk(legacy_engine_argv_node)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "argv"
+            for target in node.targets
+        )
+    ]
+    if (
+        len(legacy_argv_assignments) != 1
+        or not isinstance(legacy_argv_assignments[0], ast.List)
+        or len(legacy_argv_assignments[0].elts) != 25
+    ):
+        fail("hermetic historical R1 engine argv is not one 25-item list")
+    ordered(
+        legacy_engine_argv_source,
+        (
+            '"embedded-r1-engine", "verify-retirement"',
+            'R1_AUTH_ROOT + "/package-manifest.v1", R1_MANIFEST_SHA256',
+            'R1_AUTH_ROOT + "/package-manifest.v1.pending"',
+            'R1_AUTH_ROOT + "/prepare-stage-root.sh"',
+            'R1_AUTH_ROOT + "/prepare-stage-root.sh.pending", R1_SELF_SHA256',
+            "R1_USER_INTAKE, R1_HOME_QROOT, R1_AUTH_ROOT, R1_Q_INTAKE",
+            'R1_Q_PACKAGE, PATHS["source_package"], PATHS["source_bootstrap"]',
+            "R1_RUN_QROOT, R1_Q_BOOTSTRAP, R1_LOCK, R1_RECEIPT_PENDING",
+            "R1_RECEIPT_FINAL, R1_PREDECESSOR_COMMIT",
+            "R1_PREDECESSOR_MANIFEST_SHA256, HOSTNAME, KERNEL, MACHINE_ID",
+            "if len(argv) != 25:",
+            "return argv",
+        ),
+        "hermetic exact historical R1 verify-retirement argv",
+    )
+    if any(
+        mutation in legacy_engine_argv_source
+        for mutation in ("argv.append", "argv.extend", "argv.insert", "argv +=")
+    ):
+        fail("hermetic historical R1 argv is mutable after its 25-item authority")
     execute_engine_child = python_function(
         engine_harness, "execute_engine_child"
     )
@@ -5111,6 +6235,34 @@ def main() -> None:
         ),
         "hermetic execution of actual embedded engine_main",
     )
+    execute_legacy_engine_child = python_function(
+        engine_harness, "execute_legacy_engine_child"
+    )
+    ordered(
+        execute_legacy_engine_child,
+        (
+            'legacy_stager = R1_AUTHORITY_PACKAGE / "prepare-stage-root.sh"',
+            "code = extract_and_transform_legacy_engine(legacy_stager)",
+            "renameat2, provision_calls = install_engine_boundaries(",
+            'Path(root).resolve(), 0, "none", "none")',
+            "sys.argv = legacy_engine_argv()",
+            'exec(code, {"__name__": "__main__", "__file__": "<embedded-r1-engine>"})',
+            'raise AssertionError(\n        "legacy-engine-unexpected-return:',
+            "renameat2.calls, provision_calls[\"count\"]",
+        ),
+        "hermetic direct execution of actual historical R1 engine_main",
+    )
+    if any(
+        bypass in execute_legacy_engine_child
+        for bypass in (
+            "subprocess.run",
+            "engine_main =",
+            'namespace["engine_main"]',
+            "namespace['engine_main']",
+            "return ",
+        )
+    ):
+        fail("hermetic historical R1 engine child bypasses direct actual execution")
     if any(
         override in engine_harness
         for override in (
@@ -5411,11 +6563,95 @@ def main() -> None:
         ),
         "hermetic bounded actual engine child execution",
     )
+    run_legacy_engine_process = python_function(
+        engine_harness, "run_legacy_engine_process"
+    )
+    ordered(
+        run_legacy_engine_process,
+        (
+            'sys.executable, "-B", "-I", str(Path(__file__).resolve())',
+            '"legacy-child", str(root)',
+            "return subprocess.run(",
+            "stdin=subprocess.DEVNULL",
+            "stdout=subprocess.PIPE",
+            "stderr=subprocess.STDOUT",
+            "text=True",
+            "check=False",
+            "timeout=timeout",
+            "except subprocess.TimeoutExpired",
+            'raise AssertionError("legacy-engine-child-timeout:',
+        ),
+        "hermetic bounded historical R1 engine subprocess",
+    )
+    if (
+        run_legacy_engine_process.count("subprocess.run(") != 1
+        or run_legacy_engine_process.count("return subprocess.run(") != 1
+        or "shell=True" in run_legacy_engine_process
+    ):
+        fail("hermetic historical R1 subprocess is indirect or unbounded")
     driver_node = next(
         node
         for node in engine_harness_tree.body
         if isinstance(node, ast.FunctionDef) and node.name == "driver"
     )
+    collision_lock_indices = tuple(
+        index
+        for index, node in enumerate(driver_node.body)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name) and target.id == "collision_lock_fd"
+            for target in node.targets
+        )
+    )
+    expected_collision_lock_region = ast.parse(
+        "collision_lock_fd = os.open(\n"
+        "    virtual(collision, R1_LOCK), os.O_RDONLY | os.O_NOFOLLOW)\n"
+        "try:\n"
+        "    fcntl.flock(\n"
+        "        collision_lock_fd, fcntl.LOCK_SH | fcntl.LOCK_NB)\n"
+        "    current_precheck = run_engine_process(\n"
+        "        stager, current_manifest, current_self, predecessor, collision,\n"
+        '        "retire-postflight-f75fe7678cfd-r2", -1, 1, "pre", "exit91")\n'
+        "finally:\n"
+        "    try:\n"
+        "        fcntl.flock(collision_lock_fd, fcntl.LOCK_UN)\n"
+        "    finally:\n"
+        "        os.close(collision_lock_fd)\n"
+    ).body
+    if len(collision_lock_indices) != 1:
+        fail("hermetic concurrent retained-R1 shared-lock region is not unique")
+    collision_lock_index = collision_lock_indices[0]
+    actual_collision_lock_region = driver_node.body[
+        collision_lock_index : collision_lock_index + 2
+    ]
+    if tuple(
+        ast.dump(node, include_attributes=False)
+        for node in actual_collision_lock_region
+    ) != tuple(
+        ast.dump(node, include_attributes=False)
+        for node in expected_collision_lock_region
+    ):
+        fail("hermetic current child is not enclosed by the exact shared NB lock")
+
+    run_engine_process_node = next(
+        node
+        for node in engine_harness_tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == "run_engine_process"
+    )
+    run_engine_defaults = dict(
+        zip(
+            tuple(argument.arg for argument in run_engine_process_node.args.args)[
+                -len(run_engine_process_node.args.defaults) :
+            ],
+            run_engine_process_node.args.defaults,
+        )
+    )
+    if (
+        set(run_engine_defaults) != {"cut_call", "cut_phase", "cut_kind", "timeout"}
+        or ast.dump(run_engine_defaults["timeout"], include_attributes=False)
+        != ast.dump(ast.Constant(12.0), include_attributes=False)
+    ):
+        fail("hermetic current engine child default timeout is not bounded at 12s")
     driver_source = ast.get_source_segment(engine_harness, driver_node) or ""
     cut_point_assignments = [
         node.value
@@ -5445,6 +6681,27 @@ def main() -> None:
         (
             "extract_and_transform_engine(stager)",
             "manifest_sha, expected_receipt = independent_r2_receipt(",
+            "r1_comparisons = 0",
+            "legacy_collision_count = 0",
+            "current_precheck_count = 0",
+            'collision = new_case("legacy-source-reuse-collision")',
+            "collision_before = complete_snapshot(collision)",
+            "collision_r1 = r1_snapshot(collision)",
+            "collision_sources = source_directory_identities(collision)",
+            "legacy = run_legacy_engine_process(collision)",
+            "legacy.returncode != 79",
+            "B82_V6_RETIREMENT_ENGINE_STOP reason=retirement-state rc=79",
+            "cleanup=0 retained=1",
+            "complete_snapshot(collision) != collision_before",
+            "r1_snapshot(collision) != collision_r1",
+            "legacy_collision_count += 1",
+            "current_precheck = run_engine_process(",
+            '"retire-postflight-f75fe7678cfd-r2", -1, 1, "pre", "exit91")',
+            "current_precheck.returncode != 91",
+            'observe_state(collision, expected_receipt) != "D"',
+            "source_directory_identities(collision) != collision_sources",
+            "r1_snapshot(collision) != collision_r1",
+            "current_precheck_count += 1",
             'baseline = new_case("baseline")',
             "baseline_r1 = r1_snapshot(baseline)",
             "baseline_inodes = source_directory_identities(baseline)",
@@ -5490,14 +6747,21 @@ def main() -> None:
             "complete_snapshot(root) != before",
             "r1_snapshot(root) != before_r1",
             "fifo_count += 1",
-            "r1_comparisons) != (10, 5, 5, 10, 2, 34)",
+            "legacy_collision_count, current_precheck_count",
+            "r1_comparisons) != (10, 5, 5, 10, 2, 1, 1, 36)",
+            "HERMETIC_R1_SOURCE_REUSE_COLLISION legacy_functions=42",
+            "legacy_argv=25 legacy_rc=79 reason=retirement-state",
+            '"tree_unchanged=1 "',
+            '"current_r2=pre-rename-concurrent-shared-lock-pass "',
+            '"result=PASS"',
         ),
-        "hermetic actual engine cut/reentry/verify/FIFO/R1 matrix",
+        "hermetic actual legacy-collision/current-acceptance/R2 engine matrix",
     )
     if (
-        driver_source.count("run_engine_process(") != 6
-        or driver_source.count("r1_comparisons += 1") != 6
-        or driver_source.count("complete_snapshot(") != 6
+        driver_source.count("run_legacy_engine_process(") != 1
+        or driver_source.count("run_engine_process(") != 7
+        or driver_source.count("r1_comparisons += 1") != 8
+        or driver_source.count("complete_snapshot(") != 8
         or driver_source.count("verify-postflight-retirement-r2") != 2
     ):
         fail("hermetic actual engine matrix call/counter structure drifted")
@@ -5508,8 +6772,13 @@ def main() -> None:
         "authority_fifos=2 result=PASS"
     )
     r1_engine_marker = (
-        "HERMETIC_R2_R1_INVARIANCE result=PASS snapshots=34 "
+        "HERMETIC_R2_R1_INVARIANCE result=PASS snapshots=36 "
         "objects=authority,intake,package,bootstrap,lock,receipt"
+    )
+    legacy_engine_marker = (
+        "HERMETIC_R1_SOURCE_REUSE_COLLISION legacy_functions=42 "
+        "legacy_argv=25 legacy_rc=79 reason=retirement-state "
+        "tree_unchanged=1 current_r2=pre-rename-concurrent-shared-lock-pass result=PASS"
     )
     driver_string_constants = tuple(
         node.value
@@ -5519,8 +6788,9 @@ def main() -> None:
     if (
         driver_string_constants.count(engine_marker) != 1
         or driver_string_constants.count(r1_engine_marker) != 1
+        or driver_string_constants.count(legacy_engine_marker) != 1
     ):
-        fail("hermetic actual engine/R1 markers are not exact-once")
+        fail("hermetic actual legacy/current/R1/R2 markers are not exact-once")
     engine_harness_outer = hermetic[
         engine_harness_end + len(engine_harness_close) :
         hermetic.index(
@@ -5536,11 +6806,14 @@ def main() -> None:
             '"${STAGER}" "${BOUND_MANIFEST}" "${BOUND_OUTPUT}/prepare-stage-root.sh"',
             '"${R2_PREDECESSOR_CLONE}" "${TEST_ROOT}/r2-engine-cases")"',
             "fail 'actual embedded R2 engine harness'",
+            "HERMETIC_R1_SOURCE_REUSE_COLLISION legacy_functions=42",
+            "legacy_argv=25 legacy_rc=79 reason=retirement-state",
+            "tree_unchanged=1 current_r2=pre-rename-concurrent-shared-lock-pass result=PASS",
             "HERMETIC_R2_ENGINE ",
             "states=7 functions=48 argv=24 cuts=10 exit91=5 sigterm=5 resumes=10",
             "verify_namespace_writes=0 authority_fifos=2 result=PASS",
             "HERMETIC_R2_R1_INVARIANCE ",
-            "result=PASS snapshots=34",
+            "result=PASS snapshots=36",
             'printf \'%s\\n\' "${R2_ENGINE_TEST_OUTPUT}"',
         ),
         "hermetic invocation of actual frozen stager engine harness",
@@ -6015,8 +7288,13 @@ def main() -> None:
         "lineage-exists-home-qroot",
         "lineage-exists-run-qroot",
         "lineage-exists-receipt-pending",
-    ) + expected_lineage_deep_operations + ("lineage-retained-helper-verify",)
-    for operation in expected_spawn_operations:
+    ) + expected_lineage_deep_operations + expected_successor_lineage_operations
+    for operation in (
+        *expected_spawn_operations[: 4 + len(expected_lineage_deep_operations)],
+        "lineage-boot-id-read",
+        "lineage-lock-content-read",
+        "lineage-lock-stat-recheck",
+    ):
         if operation not in spawn_oracle:
             fail(f"hermetic full-argv oracle omits fixed operation {operation}")
     for production_oracle in (
@@ -6033,7 +7311,8 @@ def main() -> None:
                 f"{production_oracle}"
             )
     expected_remote_executables = {
-        "/bin/bash",
+        "/usr/bin/cat",
+        "/usr/bin/dd",
         "/usr/bin/env",
         "/usr/bin/find",
         "/usr/bin/readlink",
@@ -6083,6 +7362,27 @@ def main() -> None:
             "set leaf retirement-complete.v1.pending",
             "[list /usr/bin/find $parent",
             "-xdev -mindepth 1 -maxdepth 1 -name $leaf -print]",
+            "^lineage-q-(package|bootstrap)-(stat|sha)-(.+)$",
+            "$operation -> scope family name",
+            'set root [expr {$scope eq "package"',
+            "$::test_q_package : $::test_q_bootstrap}]",
+            'set fixed_path "${root}/${name}"',
+            'if {$family eq "stat"}',
+            "[list /usr/bin/stat -Lc",
+            "%U:%G:%a:%h:%s:%F -- $fixed_path]",
+            "[list /usr/bin/sha256sum -- $fixed_path]",
+            "lineage-boot-id-read",
+            "[list /usr/bin/cat --",
+            "/proc/sys/kernel/random/boot_id]",
+            "lineage-lock-content-read",
+            'set lock "$::test_run_qroot/retirement.v1.lock"',
+            "[list /usr/bin/dd",
+            '"if=${lock}" iflag=nonblock,nofollow,fullblock',
+            "bs=46 count=1 status=none]",
+            "lineage-lock-stat-recheck",
+            'set lock "$::test_run_qroot/retirement.v1.lock"',
+            "[list /usr/bin/stat -Lc",
+            "%d:%i:%U:%G:%a:%h:%s:%F -- $lock]",
             "[list /usr/bin/readlink -e -- $fixed_path]",
             "[list /usr/bin/stat -Lc",
             "%U:%G:%a:%F -- $fixed_path]",
@@ -6092,11 +7392,6 @@ def main() -> None:
             "[list /usr/bin/sha256sum -- $fixed_path]",
             "[list /usr/bin/stat -Lc",
             "%d:%i -- $first $second]",
-            "if {$operation eq \"lineage-retained-helper-verify\"}",
-            "[list /bin/bash -p",
-            "verify-retirement --manifest",
-            "--manifest-sha256",
-            retained_retirement_manifest_sha,
         ),
         "independent complete retirement-lineage spawn argv oracle",
     )
@@ -6119,6 +7414,9 @@ def main() -> None:
         (
             "proc lineage_test_payload {operation}",
             "proc lineage_test_assertion {operation}",
+            'if {$operation eq "lineage-retained-helper-verify"}',
+            "incr ::lineage_legacy_helper_calls",
+            'harness_die "lineage-legacy-helper-reachable"',
             "set actual_spawn_argv [lindex $operation_spec 1]",
             "set expected_spawn_argv",
             "[lineage_test_expected_spawn_argv $operation]",
@@ -6130,23 +7428,50 @@ def main() -> None:
             "assert_output $actual_assertion $payload",
             "set fresh_state [execute_retirement_lineage_gate",
             "set terminal_state [execute_retirement_lineage_gate",
+            "[lineage_test_terminal_operations]",
+            "[r2_test_r1_deep_operations]",
+            "[llength [r2_test_r1_deep_operations]] != 41",
+            "[llength $terminal_expected] != 84",
+            "$terminal_state ne \"TERMINAL\"",
+            "[lrange $::lineage_operations 0 end] ne",
+            "[lrange $terminal_expected 0 end]",
             "partial-run partial-home partial-user partial-user-run",
             "partial-user-home partial-all",
             "set ::lineage_scenario receipt-pending",
             "recheck-user recheck-home recheck-run recheck-receipt",
+            "[lrange $terminal_expected 0 79]",
+            "proc lineage_test_failure_prefix {operation}",
             "set ::lineage_fail_kind missing",
             "set ::lineage_fail_kind child-nonzero",
             "lineage-home-readlink lineage-home-stat lineage-home-entries",
             "lineage-auth-manifest-sha lineage-auth-manifest-pair",
             "set ::lineage_fail_kind malformed",
-            "foreach failure {child-nonzero signal}",
-            "HARNESS_LINEAGE_GATE fresh=PASS terminal=PASS partial_states=6",
-            "receipt_pending=STOP recheck_drifts=4 deep_missing=36",
-            "deep_nonzero=35 assertion_malformed=6 helper_failures=2",
+            "set retained_signals 0",
+            "foreach operation [r2_test_r1_deep_operations]",
+            "set ::lineage_fail_kind signal",
+            "$deep_missing != 35",
+            "$deep_nonzero != 76",
+            "$assertion_malformed != 46",
+            "$retained_signals != 41",
+            "$::lineage_legacy_helper_calls != 0",
+            "HARNESS_LINEAGE_GATE fresh=PASS terminal=PASS primitives=84",
+            "retained_files=19 retained_ops=41 lock_inode_stable=1",
+            "partial_states=6",
+            "receipt_pending=STOP recheck_drifts=4 deep_missing=35",
+            "deep_nonzero=76 retained_malformed=41 retained_signals=41",
+            "legacy_helper_calls=0",
             "credential_reads=1 mutation_spawns=0 result=PASS",
         ),
         "independent fresh/terminal lineage matrix",
     )
+    if (
+        gate_case.count("execute_retirement_lineage_gate $values") != 9
+        or gate_case.count("foreach operation [r2_test_r1_deep_operations]")
+        != 1
+        or gate_case.count("lineage-legacy-helper-reachable") != 1
+        or gate_case.count("HARNESS_LINEAGE_GATE") != 1
+    ):
+        fail("hermetic lineage 84-primitive failure matrix is not structurally exact")
     for mutable_argv in (
         "/usr/bin/mkdir",
         "/usr/bin/install",
