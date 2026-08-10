@@ -1750,6 +1750,158 @@ proc expected_prepare_sequence {} {
 }
 
 switch -- $mode {
+    lineage-output-pty {
+        if {[llength $arguments] != 0} {
+            harness_die "lineage-output-pty-arguments"
+        }
+        set ::credential_reads 0
+        rename read_execute_credential \
+            transport_original_read_execute_credential
+        proc read_execute_credential {path} {
+            incr ::credential_reads
+            harness_die "line-ending-credential-read"
+        }
+        rename fail transport_original_fail
+        proc fail {message code} {
+            return -code error -errorcode [list B82FAIL $code] $message
+        }
+        set ::line_ending_spawns {}
+        rename spawn transport_original_spawn
+        proc spawn {args} {
+            lappend ::line_ending_spawns $args
+            return [uplevel 1 [list transport_original_spawn {*}$args]]
+        }
+        proc line_ending_assert_or_stop {assertion payload} {
+            if {[catch {assert_output $assertion $payload}]} {
+                fail "output-assertion" 78
+            }
+        }
+        proc line_ending_require_accept {family assertion label payload} {
+            if {[catch {
+                line_ending_assert_or_stop $assertion $payload
+            } message options]} {
+                harness_die "line-ending-positive family=$family label=$label message=$message options=$options"
+            }
+        }
+        proc line_ending_require_stop {family assertion label payload} {
+            set caught [catch {
+                line_ending_assert_or_stop $assertion $payload
+            } message options]
+            if {!$caught || ![dict exists $options -errorcode] ||
+                [dict get $options -errorcode] ne {B82FAIL 78} ||
+                $message ne "output-assertion"} {
+                harness_die "line-ending-negative family=$family label=$label message=$message options=$options"
+            }
+        }
+        proc line_ending_execute_expect_stop {label spawn_argv assertion} {
+            set caught [catch {
+                execute_operation_spec "line-ending-$label" \
+                    [list local $spawn_argv 0 $assertion 10] ""
+            } message options]
+            if {!$caught || ![dict exists $options -errorcode] ||
+                [dict get $options -errorcode] ne {B82FAIL 78} ||
+                $message ne "output-assertion"} {
+                harness_die "line-ending-pty-stop label=$label message=$message options=$options"
+            }
+        }
+        set boot_id 01234567-89ab-cdef-0123-456789abcdef
+        set lock_assertion "r1-lock-content:${boot_id}"
+        set boot_positive [list \
+            [list lf "${boot_id}\n"] \
+            [list crlf "${boot_id}\r\n"] \
+            [list crcrlf "${boot_id}\r\r\n"]]
+        set lock_positive [list \
+            [list lf "boot_id\t${boot_id}\n"] \
+            [list crlf "boot_id\t${boot_id}\r\n"] \
+            [list crcrlf "boot_id\t${boot_id}\r\r\n"]]
+        set boot_negative [list \
+            [list embedded-cr "01234567-89ab-cdef\r-0123-456789abcdef\n"] \
+            [list triple-cr "${boot_id}\r\r\r\n"] \
+            [list extra-line "${boot_id}\nextra\n"] \
+            [list missing-newline "${boot_id}"] \
+            [list extra-final-newline "${boot_id}\n\n"] \
+            [list wrong-uuid "01234567-89ab-cdef-0123-456789abcdeG\n"]]
+        set lock_negative [list \
+            [list embedded-cr "boot_id\t01234567-89ab-cdef\r-0123-456789abcdef\n"] \
+            [list triple-cr "boot_id\t${boot_id}\r\r\r\n"] \
+            [list extra-line "boot_id\t${boot_id}\nextra\n"] \
+            [list missing-newline "boot_id\t${boot_id}"] \
+            [list extra-final-newline "boot_id\t${boot_id}\n\n"] \
+            [list wrong-body "boot_id\t11234567-89ab-cdef-0123-456789abcdef\n"]]
+        foreach test_case $boot_positive {
+            lassign $test_case label payload
+            line_ending_require_accept boot boot-uuid-line $label $payload
+        }
+        foreach test_case $lock_positive {
+            lassign $test_case label payload
+            line_ending_require_accept lock $lock_assertion $label $payload
+        }
+        foreach test_case $boot_negative {
+            lassign $test_case label payload
+            line_ending_require_stop boot boot-uuid-line $label $payload
+        }
+        foreach test_case $lock_negative {
+            lassign $test_case label payload
+            line_ending_require_stop lock $lock_assertion $label $payload
+        }
+        set boot_result [execute_operation_spec line-ending-boot-pty \
+            [list local \
+                [list /usr/bin/printf "%s\r\n" $boot_id] \
+                0 boot-uuid-line 10] ""]
+        set lock_result [execute_operation_spec line-ending-lock-pty \
+            [list local \
+                [list /usr/bin/printf "boot_id\t%s\r\n" $boot_id] \
+                0 $lock_assertion 10] ""]
+        line_ending_execute_expect_stop invalid-extra-char \
+            [list /usr/bin/printf "%s\r\n" "${boot_id}x"] \
+            boot-uuid-line
+        line_ending_execute_expect_stop invalid-embedded-cr \
+            [list /usr/bin/printf "%s\r\n" \
+                "01234567-89ab-cdef\r-0123-456789abcdef"] \
+            boot-uuid-line
+        line_ending_execute_expect_stop invalid-multiline \
+            [list /usr/bin/printf "%s\r\n%s\r\n" $boot_id extra] \
+            boot-uuid-line
+        set child_nonzero [execute_operation_spec line-ending-child-nonzero \
+            [list local [list /usr/bin/python3 -B -I -c \
+                {import sys; sys.exit(23)}] 0 none 10] ""]
+        set signal_caught [catch {
+            execute_operation_spec line-ending-child-signal \
+                [list local [list /usr/bin/python3 -B -I -c \
+                    {import os, signal; os.kill(os.getpid(), signal.SIGTERM)}] \
+                    0 none 10] ""
+        } signal_message signal_options]
+        set expected_spawns [list \
+            [list -noecho /usr/bin/printf "%s\r\n" $boot_id] \
+            [list -noecho /usr/bin/printf "boot_id\t%s\r\n" $boot_id] \
+            [list -noecho /usr/bin/printf "%s\r\n" "${boot_id}x"] \
+            [list -noecho /usr/bin/printf "%s\r\n" \
+                "01234567-89ab-cdef\r-0123-456789abcdef"] \
+            [list -noecho /usr/bin/printf "%s\r\n%s\r\n" $boot_id extra] \
+            [list -noecho /usr/bin/python3 -B -I -c \
+                {import sys; sys.exit(23)}] \
+            [list -noecho /usr/bin/python3 -B -I -c \
+                {import os, signal; os.kill(os.getpid(), signal.SIGTERM)}]]
+        if {[lindex $boot_result 0] ne "ok" ||
+            [lindex $boot_result 1] != 0 ||
+            [lindex $boot_result 2] ne "${boot_id}\r\r\n" ||
+            [lindex $lock_result 0] ne "ok" ||
+            [lindex $lock_result 1] != 0 ||
+            [lindex $lock_result 2] ne "boot_id\t${boot_id}\r\r\n" ||
+            [lrange $child_nonzero 0 1] ne {child-failure 23} ||
+            !$signal_caught ||
+            ![dict exists $signal_options -errorcode] ||
+            [dict get $signal_options -errorcode] ne {B82FAIL 78} ||
+            $signal_message ne "child-wait-status" ||
+            $::line_ending_spawns ne $expected_spawns ||
+            $::credential_reads != 0} {
+            binary scan [lindex $boot_result 2] H* boot_hex
+            binary scan [lindex $lock_result 2] H* lock_hex
+            harness_die "line-ending-pty boot=$boot_result boot_hex=$boot_hex lock=$lock_result lock_hex=$lock_hex child_nonzero=$child_nonzero signal_caught=$signal_caught signal_message=$signal_message signal_options=$signal_options spawns=$::line_ending_spawns expected_spawns=$expected_spawns credential_reads=$::credential_reads"
+        }
+        puts "HARNESS_LINEAGE_OUTPUT_PTY cases=7 boot=PASS lock=PASS invalid_stops=3 child_nonzero=23 signal=STOP raw_suffix=0d0d0a credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS"
+        puts "HARNESS_LINE_ENDING_ASSERTIONS boot_positive=3 boot_stops=6 lock_positive=3 lock_stops=6 pty_children=7 raw_suffix=0d0d0a credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS"
+    }
     precredential {
         if {[llength $arguments] != 4} { harness_die "precredential-arguments" }
         lassign $arguments manifest manifest_sha operation approved_sha
@@ -3950,6 +4102,12 @@ LINEAGE_GATE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   fail 'retained retirement lineage gate matrix'
 [[ "${LINEAGE_GATE_OUTPUT}" == *'HARNESS_LINEAGE_GATE fresh=PASS terminal=PASS primitives=84 retained_files=19 retained_ops=41 lock_inode_stable=1 partial_states=6 receipt_pending=STOP recheck_drifts=4 deep_missing=35 deep_nonzero=76 retained_malformed=41 retained_signals=41 legacy_helper_calls=0 credential_reads=1 mutation_spawns=0 result=PASS'* ]] ||
   fail "retained retirement lineage gate marker: ${LINEAGE_GATE_OUTPUT}"
+LINEAGE_OUTPUT_PTY="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
+  "${FIXTURE_REVIEW}/locked-transport.exp" lineage-output-pty 2>&1)" ||
+  fail 'retained retirement lineage output PTY regression'
+[[ "${LINEAGE_OUTPUT_PTY}" == *'HARNESS_LINEAGE_OUTPUT_PTY cases=7 boot=PASS lock=PASS invalid_stops=3 child_nonzero=23 signal=STOP raw_suffix=0d0d0a credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS'* &&
+  "${LINEAGE_OUTPUT_PTY}" == *'HARNESS_LINE_ENDING_ASSERTIONS boot_positive=3 boot_stops=6 lock_positive=3 lock_stops=6 pty_children=7 raw_suffix=0d0d0a credential_reads=0 network_operations=0 mutation_spawns=0 result=PASS'* ]] ||
+  fail "retained retirement lineage output PTY marker: ${LINEAGE_OUTPUT_PTY}"
 R1_SOURCE_REUSE_OUTPUT="$(/usr/bin/expect "${TRANSPORT_HARNESS}" \
   "${FIXTURE_REVIEW}/locked-transport.exp" r1-source-reuse \
   "${BOUND_MANIFEST}" "${BOUND_MANIFEST_SHA}" \
