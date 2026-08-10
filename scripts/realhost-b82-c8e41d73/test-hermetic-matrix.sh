@@ -10,6 +10,8 @@ readonly STAGER="${REVIEW_ROOT}/prepare-stage-root.sh"
 readonly STATIC_TEST="${REVIEW_ROOT}/test_matrix_static.py"
 readonly MODULE_LEASE_HELPER="${REVIEW_ROOT}/checksum-module-lease.sh"
 readonly MODULE_LEASE_HERMETIC="${REVIEW_ROOT}/test-hermetic-checksum-module-lease.sh"
+readonly MODULE_LEASE_STATIC="${REVIEW_ROOT}/test_checksum_module_lease_static.py"
+readonly MODULE_SOURCE="${REVIEW_ROOT}/wg_mix_faketcp_checksum.c"
 readonly COMMIT_FIXTURE='77a15cfa34c10546a9a703596d9dee0deff91a48'
 readonly BUNDLE_FIXTURE='aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 
@@ -19,7 +21,8 @@ fail() {
 }
 
 for path in "${MATRIX}" "${STAGER}" "${STATIC_TEST}" \
-  "${MODULE_LEASE_HELPER}" "${MODULE_LEASE_HERMETIC}"; do
+  "${MODULE_LEASE_HELPER}" "${MODULE_LEASE_HERMETIC}" \
+  "${MODULE_LEASE_STATIC}" "${MODULE_SOURCE}"; do
   [[ -f "${path}" && ! -L "${path}" ]] || fail "review input is not a regular file: ${path}"
 done
 
@@ -27,7 +30,9 @@ done
   "${MODULE_LEASE_HERMETIC}" "$0" || fail 'bash syntax gate'
 PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -B -I "${STATIC_TEST}" "${MATRIX}" "${STAGER}" ||
   fail 'static retirement contract'
-/bin/bash "${MODULE_LEASE_HERMETIC}" || fail 'shared checksum-module lease contract'
+/bin/bash "${MODULE_LEASE_HERMETIC}" "${MODULE_LEASE_HELPER}" \
+  "${MODULE_LEASE_STATIC}" "${MODULE_SOURCE}" ||
+  fail 'shared checksum-module lease contract'
 
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck --norc --shell=bash -- "${MATRIX}" "${STAGER}" "${MODULE_LEASE_HELPER}" \
@@ -51,7 +56,7 @@ readonly -a MATRIX_ARGS=(
   --wg-peer-address 10.200.0.2
 )
 
-plan_output="$("${MATRIX}" plan)" || fail 'retired plan expansion'
+plan_output="$(/bin/bash "${MATRIX}" plan)" || fail 'retired plan expansion'
 [[ "${plan_output}" == *'REALHOST_V6_FORWARD_AUTHORITY state=retired replacement=realnic-acceptance-v1'* ]] ||
   fail 'forward retirement marker missing'
 [[ "${plan_output}" == *'REALHOST_V6_LEGACY_CONTROLLER_AUTHORITY state=retired controller_entries=0 restore_entries=0'* ]] ||
@@ -66,7 +71,8 @@ for forbidden in '/usr/bin/iperf3' '/usr/sbin/ethtool -K' '/usr/sbin/ip link set
 done
 
 for retired_mode in run restore; do
-  retired_output="$("${MATRIX}" "${retired_mode}" "${MATRIX_ARGS[@]}" --restore-cell tcx 2>&1)"
+  retired_output="$(/bin/bash "${MATRIX}" "${retired_mode}" \
+    "${MATRIX_ARGS[@]}" --restore-cell tcx 2>&1)"
   retired_rc=$?
   [[ "${retired_rc}" -eq 78 ]] ||
     fail "retired ${retired_mode} returned ${retired_rc}, expected 78"

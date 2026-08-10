@@ -77,7 +77,15 @@ proc load_manifest {path expected_sha} {
         test_hermetic_matrix_sh_sha256 test_matrix_static_py_path
         test_matrix_static_py_blob test_matrix_static_py_sha256
         checksum_module_lease_sh_path checksum_module_lease_sh_blob
-        checksum_module_lease_sh_sha256 root_fresh_verifier_gate_sh_path
+        checksum_module_lease_sh_sha256
+        test_hermetic_checksum_module_lease_sh_path
+        test_hermetic_checksum_module_lease_sh_blob
+        test_hermetic_checksum_module_lease_sh_sha256
+        test_checksum_module_lease_static_py_path
+        test_checksum_module_lease_static_py_blob
+        test_checksum_module_lease_static_py_sha256
+        wg_mix_faketcp_checksum_c_path wg_mix_faketcp_checksum_c_blob
+        wg_mix_faketcp_checksum_c_sha256 root_fresh_verifier_gate_sh_path
         root_fresh_verifier_gate_sh_blob root_fresh_verifier_gate_sh_sha256
         test_hermetic_fresh_verifier_gate_sh_path
         test_hermetic_fresh_verifier_gate_sh_blob
@@ -131,7 +139,7 @@ proc load_manifest {path expected_sha} {
 }
 
 proc validate_manifest_values {values} {
-    if {[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v4" ||
+    if {[dict get $values format] ne "wg-mix-ebpf-b82-v6-package-v5" ||
         [dict get $values run_id] ne "c8e41d73" ||
         [dict get $values package_id] ne "4f2a9b61" ||
         ![regexp {^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$} [dict get $values integration_ref]] ||
@@ -156,6 +164,12 @@ proc validate_manifest_values {values} {
         [dict get $values target_interface] ne "ens33" ||
         [dict get $values checksum_module_lease_sh_path] ne
             "scripts/realhost-b82-c8e41d73/checksum-module-lease.sh" ||
+        [dict get $values test_hermetic_checksum_module_lease_sh_path] ne
+            "scripts/realhost-b82-c8e41d73/test-hermetic-checksum-module-lease.sh" ||
+        [dict get $values test_checksum_module_lease_static_py_path] ne
+            "scripts/realhost-b82-c8e41d73/test_checksum_module_lease_static.py" ||
+        [dict get $values wg_mix_faketcp_checksum_c_path] ne
+            "kernel/faketcp_checksum/wg_mix_faketcp_checksum.c" ||
         [dict get $values root_fresh_verifier_gate_sh_path] ne
             "scripts/realhost-b82-c8e41d73/root-fresh-verifier-gate.sh" ||
         [dict get $values test_hermetic_fresh_verifier_gate_sh_path] ne
@@ -214,7 +228,10 @@ proc validate_manifest_values {values} {
         bind_final_package_sh_blob controller_sh_blob locked_transport_exp_blob
         root_matrix_n_r_sh_blob check_realhost_iperf_py_blob
         test_hermetic_matrix_sh_blob test_matrix_static_py_blob
-        checksum_module_lease_sh_blob root_fresh_verifier_gate_sh_blob
+        checksum_module_lease_sh_blob
+        test_hermetic_checksum_module_lease_sh_blob
+        test_checksum_module_lease_static_py_blob wg_mix_faketcp_checksum_c_blob
+        root_fresh_verifier_gate_sh_blob
         test_hermetic_fresh_verifier_gate_sh_blob
         test_fresh_verifier_gate_static_py_blob
         prepare_stage_root_sh_blob realnic_acceptance_py_blob
@@ -234,6 +251,9 @@ proc validate_manifest_values {values} {
         locked_transport_exp_sha256 root_matrix_n_r_sh_sha256
         check_realhost_iperf_py_sha256 test_hermetic_matrix_sh_sha256
         test_matrix_static_py_sha256 checksum_module_lease_sh_sha256
+        test_hermetic_checksum_module_lease_sh_sha256
+        test_checksum_module_lease_static_py_sha256
+        wg_mix_faketcp_checksum_c_sha256
         root_fresh_verifier_gate_sh_sha256
         test_hermetic_fresh_verifier_gate_sh_sha256
         test_fresh_verifier_gate_static_py_sha256 prepare_stage_root_sh_sha256
@@ -409,6 +429,15 @@ proc package_sha {values name} {
         test-hermetic-matrix.sh { return [dict get $values test_hermetic_matrix_sh_sha256] }
         test_matrix_static.py { return [dict get $values test_matrix_static_py_sha256] }
         checksum-module-lease.sh { return [dict get $values checksum_module_lease_sh_sha256] }
+        test-hermetic-checksum-module-lease.sh {
+            return [dict get $values test_hermetic_checksum_module_lease_sh_sha256]
+        }
+        test_checksum_module_lease_static.py {
+            return [dict get $values test_checksum_module_lease_static_py_sha256]
+        }
+        wg_mix_faketcp_checksum.c {
+            return [dict get $values wg_mix_faketcp_checksum_c_sha256]
+        }
         root-fresh-verifier-gate.sh { return [dict get $values root_fresh_verifier_gate_sh_sha256] }
         test-hermetic-fresh-verifier-gate.sh { return [dict get $values test_hermetic_fresh_verifier_gate_sh_sha256] }
         test_fresh_verifier_gate_static.py { return [dict get $values test_fresh_verifier_gate_static_py_sha256] }
@@ -595,6 +624,7 @@ proc build_operation {values manifest_sha operation approved_sha} {
                 "${package}/prepare-stage-root.sh" "${package}/root-matrix-n-r.sh" \
                 "${package}/test-hermetic-matrix.sh" \
                 "${package}/checksum-module-lease.sh" \
+                "${package}/test-hermetic-checksum-module-lease.sh" \
                 "${package}/root-fresh-verifier-gate.sh" \
                 "${package}/test-hermetic-fresh-verifier-gate.sh" \
                 "${package}/provision-ubuntu-test-host.sh"]]
@@ -1535,7 +1565,10 @@ proc package_names {} {
         source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh
         controller.sh prepare-stage-root.sh provision-ubuntu-test-host.sh
         root-matrix-n-r.sh check-realhost-iperf.py test-hermetic-matrix.sh
-        test_matrix_static.py checksum-module-lease.sh root-fresh-verifier-gate.sh
+        test_matrix_static.py checksum-module-lease.sh
+        test-hermetic-checksum-module-lease.sh test_checksum_module_lease_static.py
+        wg_mix_faketcp_checksum.c
+        root-fresh-verifier-gate.sh
         test-hermetic-fresh-verifier-gate.sh test_fresh_verifier_gate_static.py
         realnic_acceptance.py test_realnic_acceptance.py
         test_realnic_acceptance_static.py

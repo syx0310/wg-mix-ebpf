@@ -74,6 +74,15 @@ TEST_MATRIX_STATIC_PY_SHA256=''
 CHECKSUM_MODULE_LEASE_SH_PATH=''
 CHECKSUM_MODULE_LEASE_SH_BLOB=''
 CHECKSUM_MODULE_LEASE_SH_SHA256=''
+TEST_HERMETIC_CHECKSUM_MODULE_LEASE_SH_PATH=''
+TEST_HERMETIC_CHECKSUM_MODULE_LEASE_SH_BLOB=''
+TEST_HERMETIC_CHECKSUM_MODULE_LEASE_SH_SHA256=''
+TEST_CHECKSUM_MODULE_LEASE_STATIC_PY_PATH=''
+TEST_CHECKSUM_MODULE_LEASE_STATIC_PY_BLOB=''
+TEST_CHECKSUM_MODULE_LEASE_STATIC_PY_SHA256=''
+WG_MIX_FAKETCP_CHECKSUM_C_PATH=''
+WG_MIX_FAKETCP_CHECKSUM_C_BLOB=''
+WG_MIX_FAKETCP_CHECKSUM_C_SHA256=''
 ROOT_FRESH_VERIFIER_GATE_SH_PATH=''
 ROOT_FRESH_VERIFIER_GATE_SH_BLOB=''
 ROOT_FRESH_VERIFIER_GATE_SH_SHA256=''
@@ -345,6 +354,15 @@ load_manifest() {
     read_manifest_field checksum_module_lease_sh_path CHECKSUM_MODULE_LEASE_SH_PATH &&
     read_manifest_field checksum_module_lease_sh_blob CHECKSUM_MODULE_LEASE_SH_BLOB &&
     read_manifest_field checksum_module_lease_sh_sha256 CHECKSUM_MODULE_LEASE_SH_SHA256 &&
+    read_manifest_field test_hermetic_checksum_module_lease_sh_path TEST_HERMETIC_CHECKSUM_MODULE_LEASE_SH_PATH &&
+    read_manifest_field test_hermetic_checksum_module_lease_sh_blob TEST_HERMETIC_CHECKSUM_MODULE_LEASE_SH_BLOB &&
+    read_manifest_field test_hermetic_checksum_module_lease_sh_sha256 TEST_HERMETIC_CHECKSUM_MODULE_LEASE_SH_SHA256 &&
+    read_manifest_field test_checksum_module_lease_static_py_path TEST_CHECKSUM_MODULE_LEASE_STATIC_PY_PATH &&
+    read_manifest_field test_checksum_module_lease_static_py_blob TEST_CHECKSUM_MODULE_LEASE_STATIC_PY_BLOB &&
+    read_manifest_field test_checksum_module_lease_static_py_sha256 TEST_CHECKSUM_MODULE_LEASE_STATIC_PY_SHA256 &&
+    read_manifest_field wg_mix_faketcp_checksum_c_path WG_MIX_FAKETCP_CHECKSUM_C_PATH &&
+    read_manifest_field wg_mix_faketcp_checksum_c_blob WG_MIX_FAKETCP_CHECKSUM_C_BLOB &&
+    read_manifest_field wg_mix_faketcp_checksum_c_sha256 WG_MIX_FAKETCP_CHECKSUM_C_SHA256 &&
     read_manifest_field root_fresh_verifier_gate_sh_path ROOT_FRESH_VERIFIER_GATE_SH_PATH &&
     read_manifest_field root_fresh_verifier_gate_sh_blob ROOT_FRESH_VERIFIER_GATE_SH_BLOB &&
     read_manifest_field root_fresh_verifier_gate_sh_sha256 ROOT_FRESH_VERIFIER_GATE_SH_SHA256 &&
@@ -452,7 +470,8 @@ verify_bound_history() {
 verify_identity() {
   local path="$1" blob="$2" sha="$3" actual_blob actual_sha mapped_blob
   [[ ("${path}" =~ ^scripts/realhost-b82-(c8e41d73|acceptance-v1|routed-veth-v1)/[A-Za-z0-9_.-]+$ ||
-      "${path}" == 'scripts/provision-ubuntu-test-host.sh') &&
+      "${path}" == 'scripts/provision-ubuntu-test-host.sh' ||
+      "${path}" == 'kernel/faketcp_checksum/wg_mix_faketcp_checksum.c') &&
     "${blob}" =~ ^[0-9a-f]{40}$ ]] || return 65
   valid_sha256 "${sha}" || return 65
   [[ -f "${LOCAL_REPOSITORY}/${path}" && ! -L "${LOCAL_REPOSITORY}/${path}" ]] || return 66
@@ -467,7 +486,7 @@ verify_manifest_contract() {
   [[ -f "${MANIFEST}" && ! -L "${MANIFEST}" ]] || return 66
   [[ "$(sha256_file "${MANIFEST}")" == "${MANIFEST_SHA256}" ]] || return 67
   load_manifest || return $?
-  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v4' &&
+  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v5' &&
     "${MANIFEST_RUN_ID}" == "${RUN_ID}" && "${MANIFEST_PACKAGE_ID}" == "${PACKAGE_ID}" &&
     "${INTEGRATION_REF}" =~ ^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$ &&
     "${INTEGRATION_REF}" != *'..'* && "${INTEGRATION_REF}" != *'//'* &&
@@ -486,6 +505,9 @@ verify_manifest_contract() {
     "${PHYSICAL_INTERFACE_LOCK}" == '/run/wg-mix-ebpf-realnic-physical-interface.v1.lock' &&
     "${LEGACY_MATRIX_MODE}" == 'retired' &&
     "${REALNIC_PROFILE}" == 'acceptance' && "${REALNIC_TRAFFIC_SECONDS}" == '30' &&
+    "${TEST_HERMETIC_CHECKSUM_MODULE_LEASE_SH_PATH}" == "scripts/realhost-b82-${RUN_ID}/test-hermetic-checksum-module-lease.sh" &&
+    "${TEST_CHECKSUM_MODULE_LEASE_STATIC_PY_PATH}" == "scripts/realhost-b82-${RUN_ID}/test_checksum_module_lease_static.py" &&
+    "${WG_MIX_FAKETCP_CHECKSUM_C_PATH}" == 'kernel/faketcp_checksum/wg_mix_faketcp_checksum.c' &&
     "${ROOT_VETH_N_R_SH_PATH}" == "scripts/realhost-b82-${RUN_ID}/root-veth-n-r.sh" &&
     "${TEST_HERMETIC_VETH_RUNNER_SH_PATH}" == "scripts/realhost-b82-${RUN_ID}/test-hermetic-veth-runner.sh" &&
     "${TEST_VETH_RUNNER_STATIC_PY_PATH}" == "scripts/realhost-b82-${RUN_ID}/test_veth_runner_static.py" &&
@@ -528,6 +550,9 @@ verify_manifest_contract() {
     verify_identity "${TEST_HERMETIC_MATRIX_SH_PATH}" "${TEST_HERMETIC_MATRIX_SH_BLOB}" "${TEST_HERMETIC_MATRIX_SH_SHA256}" &&
     verify_identity "${TEST_MATRIX_STATIC_PY_PATH}" "${TEST_MATRIX_STATIC_PY_BLOB}" "${TEST_MATRIX_STATIC_PY_SHA256}" &&
     verify_identity "${CHECKSUM_MODULE_LEASE_SH_PATH}" "${CHECKSUM_MODULE_LEASE_SH_BLOB}" "${CHECKSUM_MODULE_LEASE_SH_SHA256}" &&
+    verify_identity "${TEST_HERMETIC_CHECKSUM_MODULE_LEASE_SH_PATH}" "${TEST_HERMETIC_CHECKSUM_MODULE_LEASE_SH_BLOB}" "${TEST_HERMETIC_CHECKSUM_MODULE_LEASE_SH_SHA256}" &&
+    verify_identity "${TEST_CHECKSUM_MODULE_LEASE_STATIC_PY_PATH}" "${TEST_CHECKSUM_MODULE_LEASE_STATIC_PY_BLOB}" "${TEST_CHECKSUM_MODULE_LEASE_STATIC_PY_SHA256}" &&
+    verify_identity "${WG_MIX_FAKETCP_CHECKSUM_C_PATH}" "${WG_MIX_FAKETCP_CHECKSUM_C_BLOB}" "${WG_MIX_FAKETCP_CHECKSUM_C_SHA256}" &&
     verify_identity "${ROOT_FRESH_VERIFIER_GATE_SH_PATH}" "${ROOT_FRESH_VERIFIER_GATE_SH_BLOB}" "${ROOT_FRESH_VERIFIER_GATE_SH_SHA256}" &&
     verify_identity "${TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_PATH}" "${TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_BLOB}" "${TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_SHA256}" &&
     verify_identity "${TEST_FRESH_VERIFIER_GATE_STATIC_PY_PATH}" "${TEST_FRESH_VERIFIER_GATE_STATIC_PY_BLOB}" "${TEST_FRESH_VERIFIER_GATE_STATIC_PY_SHA256}" &&
@@ -547,6 +572,8 @@ verify_manifest_contract() {
 
   for name in bind-final-package.sh controller.sh root-matrix-n-r.sh check-realhost-iperf.py \
     test-hermetic-matrix.sh test_matrix_static.py checksum-module-lease.sh \
+    test-hermetic-checksum-module-lease.sh test_checksum_module_lease_static.py \
+    wg_mix_faketcp_checksum.c \
     root-fresh-verifier-gate.sh test-hermetic-fresh-verifier-gate.sh \
     test_fresh_verifier_gate_static.py prepare-stage-root.sh \
     realnic_acceptance.py test_realnic_acceptance.py test_realnic_acceptance_static.py \
@@ -560,6 +587,9 @@ verify_manifest_contract() {
       test-hermetic-matrix.sh) sha="${TEST_HERMETIC_MATRIX_SH_SHA256}" ;;
       test_matrix_static.py) sha="${TEST_MATRIX_STATIC_PY_SHA256}" ;;
       checksum-module-lease.sh) sha="${CHECKSUM_MODULE_LEASE_SH_SHA256}" ;;
+      test-hermetic-checksum-module-lease.sh) sha="${TEST_HERMETIC_CHECKSUM_MODULE_LEASE_SH_SHA256}" ;;
+      test_checksum_module_lease_static.py) sha="${TEST_CHECKSUM_MODULE_LEASE_STATIC_PY_SHA256}" ;;
+      wg_mix_faketcp_checksum.c) sha="${WG_MIX_FAKETCP_CHECKSUM_C_SHA256}" ;;
       root-fresh-verifier-gate.sh) sha="${ROOT_FRESH_VERIFIER_GATE_SH_SHA256}" ;;
       test-hermetic-fresh-verifier-gate.sh) sha="${TEST_HERMETIC_FRESH_VERIFIER_GATE_SH_SHA256}" ;;
       test_fresh_verifier_gate_static.py) sha="${TEST_FRESH_VERIFIER_GATE_STATIC_PY_SHA256}" ;;
@@ -690,6 +720,8 @@ readonly -a PACKAGE_NAMES=(
   source-4f2a9b61.bundle package-manifest.v1 bind-final-package.sh controller.sh prepare-stage-root.sh
   provision-ubuntu-test-host.sh root-matrix-n-r.sh check-realhost-iperf.py
   test-hermetic-matrix.sh test_matrix_static.py checksum-module-lease.sh
+  test-hermetic-checksum-module-lease.sh test_checksum_module_lease_static.py
+  wg_mix_faketcp_checksum.c
   root-fresh-verifier-gate.sh test-hermetic-fresh-verifier-gate.sh
   test_fresh_verifier_gate_static.py realnic_acceptance.py
   test_realnic_acceptance.py test_realnic_acceptance_static.py

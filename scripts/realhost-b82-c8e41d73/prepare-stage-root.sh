@@ -75,6 +75,15 @@ STATIC_SHA256=''
 MODULE_LEASE_HELPER_PATH=''
 MODULE_LEASE_HELPER_BLOB=''
 MODULE_LEASE_HELPER_SHA256=''
+MODULE_LEASE_HERMETIC_PATH=''
+MODULE_LEASE_HERMETIC_BLOB=''
+MODULE_LEASE_HERMETIC_SHA256=''
+MODULE_LEASE_STATIC_PATH=''
+MODULE_LEASE_STATIC_BLOB=''
+MODULE_LEASE_STATIC_SHA256=''
+MODULE_SOURCE_PATH=''
+MODULE_SOURCE_BLOB=''
+MODULE_SOURCE_SHA256=''
 ROOT_FRESH_PATH=''
 ROOT_FRESH_BLOB=''
 ROOT_FRESH_SHA256=''
@@ -276,6 +285,15 @@ load_manifest() {
     read_manifest_field checksum_module_lease_sh_path MODULE_LEASE_HELPER_PATH &&
     read_manifest_field checksum_module_lease_sh_blob MODULE_LEASE_HELPER_BLOB &&
     read_manifest_field checksum_module_lease_sh_sha256 MODULE_LEASE_HELPER_SHA256 &&
+    read_manifest_field test_hermetic_checksum_module_lease_sh_path MODULE_LEASE_HERMETIC_PATH &&
+    read_manifest_field test_hermetic_checksum_module_lease_sh_blob MODULE_LEASE_HERMETIC_BLOB &&
+    read_manifest_field test_hermetic_checksum_module_lease_sh_sha256 MODULE_LEASE_HERMETIC_SHA256 &&
+    read_manifest_field test_checksum_module_lease_static_py_path MODULE_LEASE_STATIC_PATH &&
+    read_manifest_field test_checksum_module_lease_static_py_blob MODULE_LEASE_STATIC_BLOB &&
+    read_manifest_field test_checksum_module_lease_static_py_sha256 MODULE_LEASE_STATIC_SHA256 &&
+    read_manifest_field wg_mix_faketcp_checksum_c_path MODULE_SOURCE_PATH &&
+    read_manifest_field wg_mix_faketcp_checksum_c_blob MODULE_SOURCE_BLOB &&
+    read_manifest_field wg_mix_faketcp_checksum_c_sha256 MODULE_SOURCE_SHA256 &&
     read_manifest_field root_fresh_verifier_gate_sh_path ROOT_FRESH_PATH &&
     read_manifest_field root_fresh_verifier_gate_sh_blob ROOT_FRESH_BLOB &&
     read_manifest_field root_fresh_verifier_gate_sh_sha256 ROOT_FRESH_SHA256 &&
@@ -334,7 +352,7 @@ load_manifest() {
 
 validate_manifest() {
   load_manifest || return $?
-  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v4' &&
+  [[ "${FORMAT}" == 'wg-mix-ebpf-b82-v6-package-v5' &&
     "${MANIFEST_RUN_ID}" == "${RUN_ID}" && "${MANIFEST_PACKAGE_ID}" == "${PACKAGE_ID}" &&
     "${INTEGRATION_REF}" =~ ^refs/heads/[A-Za-z0-9][A-Za-z0-9._/-]{0,180}$ &&
     "${INTEGRATION_REF}" != *'..'* && "${INTEGRATION_REF}" != *'//'* &&
@@ -356,6 +374,8 @@ validate_manifest() {
   valid_sha256 "${BUNDLE_SHA256}" && valid_sha256 "${ROOT_MATRIX_SHA256}" &&
     valid_sha256 "${CHECKER_SHA256}" && valid_sha256 "${HERMETIC_SHA256}" &&
     valid_sha256 "${STATIC_SHA256}" && valid_sha256 "${MODULE_LEASE_HELPER_SHA256}" &&
+    valid_sha256 "${MODULE_LEASE_HERMETIC_SHA256}" &&
+    valid_sha256 "${MODULE_LEASE_STATIC_SHA256}" && valid_sha256 "${MODULE_SOURCE_SHA256}" &&
     valid_sha256 "${ROOT_FRESH_SHA256}" && valid_sha256 "${FRESH_HERMETIC_SHA256}" &&
     valid_sha256 "${FRESH_STATIC_SHA256}" && valid_sha256 "${PREPARE_SHA256}" &&
     valid_sha256 "${REALNIC_SHA256}" && valid_sha256 "${REALNIC_TEST_SHA256}" &&
@@ -367,6 +387,9 @@ validate_manifest() {
   [[ "${ROOT_MATRIX_BLOB}" =~ ^[0-9a-f]{40}$ && "${CHECKER_BLOB}" =~ ^[0-9a-f]{40}$ &&
     "${HERMETIC_BLOB}" =~ ^[0-9a-f]{40}$ && "${STATIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
     "${MODULE_LEASE_HELPER_BLOB}" =~ ^[0-9a-f]{40}$ &&
+    "${MODULE_LEASE_HERMETIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
+    "${MODULE_LEASE_STATIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
+    "${MODULE_SOURCE_BLOB}" =~ ^[0-9a-f]{40}$ &&
     "${ROOT_FRESH_BLOB}" =~ ^[0-9a-f]{40}$ &&
     "${FRESH_HERMETIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
     "${FRESH_STATIC_BLOB}" =~ ^[0-9a-f]{40}$ &&
@@ -383,6 +406,9 @@ validate_manifest() {
     "${HERMETIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test-hermetic-matrix.sh" &&
     "${STATIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test_matrix_static.py" &&
     "${MODULE_LEASE_HELPER_PATH}" == "${MODULE_LEASE_HELPER_RELATIVE}" &&
+    "${MODULE_LEASE_HERMETIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test-hermetic-checksum-module-lease.sh" &&
+    "${MODULE_LEASE_STATIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test_checksum_module_lease_static.py" &&
+    "${MODULE_SOURCE_PATH}" == 'kernel/faketcp_checksum/wg_mix_faketcp_checksum.c' &&
     "${ROOT_FRESH_PATH}" == "scripts/realhost-b82-${RUN_ID}/root-fresh-verifier-gate.sh" &&
     "${FRESH_HERMETIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test-hermetic-fresh-verifier-gate.sh" &&
     "${FRESH_STATIC_PATH}" == "scripts/realhost-b82-${RUN_ID}/test_fresh_verifier_gate_static.py" &&
@@ -469,6 +495,7 @@ render_plan() {
   plan_command S6 /bin/bash -n "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" \
     "${EXPECTED_SOURCE}/${HERMETIC_PATH}" "${EXPECTED_SOURCE}/${PREPARE_PATH}" \
     "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
+    "${EXPECTED_SOURCE}/${MODULE_LEASE_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PROVISION_PATH}" "${EXPECTED_SOURCE}/${ROOT_VETH_PATH}" \
     "${EXPECTED_SOURCE}/${VETH_HERMETIC_PATH}" "${EXPECTED_SOURCE}/${ROUTED_SEAM_PATH}" \
@@ -498,6 +525,7 @@ render_plan() {
   plan_command S7 /usr/bin/shellcheck --norc --shell=bash -- \
     "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" "${EXPECTED_SOURCE}/${HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
+    "${EXPECTED_SOURCE}/${MODULE_LEASE_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PROVISION_PATH}" "${EXPECTED_SOURCE}/${ROOT_VETH_PATH}" \
     "${EXPECTED_SOURCE}/${VETH_HERMETIC_PATH}" "${EXPECTED_SOURCE}/${ROUTED_SEAM_PATH}" \
@@ -722,17 +750,19 @@ require_module_lease_lock() {
 }
 
 require_staged_identity() {
-  local relative="$1" expected_blob="$2" expected_sha="$3" path canonical shape
+  local relative="$1" expected_blob="$2" expected_sha="$3"
+  local expected_tree_mode="${4:-100755}" expected_file_mode="${5:-700}"
+  local path canonical shape
   local mapped actual_blob tree_entry
   path="${EXPECTED_SOURCE}/${relative}"
   canonical="$(/usr/bin/readlink -e -- "${path}")" || return 79
   [[ "${canonical}" == "${path}" && -f "${path}" && ! -L "${path}" ]] || return 79
   shape="$(/usr/bin/stat -Lc '%U:%G:%a:%h:%F' -- "${path}")" || return 79
-  [[ "${shape}" == 'root:root:700:1:regular file' ]] || return 79
+  [[ "${shape}" == "root:root:${expected_file_mode}:1:regular file" ]] || return 79
   mapped="$(git_stage -C "${EXPECTED_SOURCE}" rev-parse "${INTEGRATION_COMMIT}:${relative}")" || return 79
   tree_entry="$(git_stage -C "${EXPECTED_SOURCE}" ls-tree "${INTEGRATION_COMMIT}" -- "${relative}")" || return 79
   actual_blob="$(git_stage -C "${EXPECTED_SOURCE}" hash-object -- "${path}")" || return 79
-  [[ "${tree_entry}" == $'100755 blob '"${expected_blob}"$'\t'"${relative}" &&
+  [[ "${tree_entry}" == "${expected_tree_mode}"$' blob '"${expected_blob}"$'\t'"${relative}" &&
     "${mapped}" == "${expected_blob}" && "${actual_blob}" == "${expected_blob}" &&
     "$(sha256_file "${path}")" == "${expected_sha}" ]]
 }
@@ -758,6 +788,9 @@ require_staged_content() {
     "$(sha256_file "${EXPECTED_SOURCE}/${HERMETIC_PATH}")" == "${HERMETIC_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${STATIC_PATH}")" == "${STATIC_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}")" == "${MODULE_LEASE_HELPER_SHA256}" &&
+    "$(sha256_file "${EXPECTED_SOURCE}/${MODULE_LEASE_HERMETIC_PATH}")" == "${MODULE_LEASE_HERMETIC_SHA256}" &&
+    "$(sha256_file "${EXPECTED_SOURCE}/${MODULE_LEASE_STATIC_PATH}")" == "${MODULE_LEASE_STATIC_SHA256}" &&
+    "$(sha256_file "${EXPECTED_SOURCE}/${MODULE_SOURCE_PATH}")" == "${MODULE_SOURCE_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}")" == "${ROOT_FRESH_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}")" == "${FRESH_HERMETIC_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${FRESH_STATIC_PATH}")" == "${FRESH_STATIC_SHA256}" &&
@@ -766,7 +799,13 @@ require_staged_content() {
     "$(sha256_file "${EXPECTED_SOURCE}/${REALNIC_TEST_PATH}")" == "${REALNIC_TEST_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${REALNIC_STATIC_PATH}")" == "${REALNIC_STATIC_SHA256}" &&
     "$(sha256_file "${EXPECTED_SOURCE}/${PROVISION_PATH}")" == "${PROVISION_SHA256}" ]] || return 79
-  require_staged_identity "${ROOT_VETH_PATH}" "${ROOT_VETH_BLOB}" "${ROOT_VETH_SHA256}" &&
+  require_staged_identity "${MODULE_LEASE_HERMETIC_PATH}" "${MODULE_LEASE_HERMETIC_BLOB}" \
+      "${MODULE_LEASE_HERMETIC_SHA256}" &&
+    require_staged_identity "${MODULE_LEASE_STATIC_PATH}" "${MODULE_LEASE_STATIC_BLOB}" \
+      "${MODULE_LEASE_STATIC_SHA256}" &&
+    require_staged_identity "${MODULE_SOURCE_PATH}" "${MODULE_SOURCE_BLOB}" \
+      "${MODULE_SOURCE_SHA256}" 100644 600 &&
+    require_staged_identity "${ROOT_VETH_PATH}" "${ROOT_VETH_BLOB}" "${ROOT_VETH_SHA256}" &&
     require_staged_identity "${VETH_HERMETIC_PATH}" "${VETH_HERMETIC_BLOB}" "${VETH_HERMETIC_SHA256}" &&
     require_staged_identity "${VETH_STATIC_PATH}" "${VETH_STATIC_BLOB}" "${VETH_STATIC_SHA256}" &&
     require_staged_identity "${ROUTED_SEAM_PATH}" "${ROUTED_SEAM_BLOB}" "${ROUTED_SEAM_SHA256}" &&
@@ -992,6 +1031,7 @@ run_stage() {
   run_step S6 /bin/bash -n "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" \
     "${EXPECTED_SOURCE}/${HERMETIC_PATH}" "${EXPECTED_SOURCE}/${PREPARE_PATH}" \
     "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
+    "${EXPECTED_SOURCE}/${MODULE_LEASE_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PROVISION_PATH}" "${EXPECTED_SOURCE}/${ROOT_VETH_PATH}" \
     "${EXPECTED_SOURCE}/${VETH_HERMETIC_PATH}" "${EXPECTED_SOURCE}/${ROUTED_SEAM_PATH}" \
@@ -1026,6 +1066,7 @@ run_stage() {
   run_step S7 /usr/bin/shellcheck --norc --shell=bash -- \
     "${EXPECTED_SOURCE}/${ROOT_MATRIX_PATH}" "${EXPECTED_SOURCE}/${HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PREPARE_PATH}" "${EXPECTED_SOURCE}/${MODULE_LEASE_HELPER_PATH}" \
+    "${EXPECTED_SOURCE}/${MODULE_LEASE_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${ROOT_FRESH_PATH}" "${EXPECTED_SOURCE}/${FRESH_HERMETIC_PATH}" \
     "${EXPECTED_SOURCE}/${PROVISION_PATH}" "${EXPECTED_SOURCE}/${ROOT_VETH_PATH}" \
     "${EXPECTED_SOURCE}/${VETH_HERMETIC_PATH}" "${EXPECTED_SOURCE}/${ROUTED_SEAM_PATH}" \
