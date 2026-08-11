@@ -268,6 +268,18 @@ def stage_recovery_binary(
     size = binary.stat().st_size
 
     intake_entries = remote_directory_entries(remote, intake)
+    expected_intake_entries = {
+        "intake-owner.json",
+        "root-endpoint.py",
+        "traffic.py",
+        "wg-mix-ebpf",
+        "wg_mix_tc.o",
+    }
+    if set(intake_entries) not in (
+        expected_intake_entries,
+        expected_intake_entries | {name},
+    ) or any(kind != "f" for kind in intake_entries.values()):
+        stop("recovery-intake-foreign", 79)
     if name in intake_entries:
         if intake_entries[name] != "f":
             stop("recovery-intake-entry", 79)
