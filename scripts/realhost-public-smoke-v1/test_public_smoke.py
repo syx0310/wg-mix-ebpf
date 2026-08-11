@@ -73,6 +73,16 @@ class PublicSmokeTest(unittest.TestCase):
             "other-stderr",
             self.root.command_error_class(b"untrusted path /secret/private.key\n"),
         )
+        self.assertEqual(
+            "pin-path-tcx-not-supported",
+            self.root.agent_error_class(
+                b"validate BPF pin path /secret: TCX operation not supported\n"
+            ),
+        )
+        self.assertEqual(
+            "other-stderr",
+            self.root.agent_error_class(b"untrusted path /secret/private.key\n"),
+        )
 
     def test_report_accepts_only_fresh_bidirectional_zero_error_growth(self) -> None:
         document = {

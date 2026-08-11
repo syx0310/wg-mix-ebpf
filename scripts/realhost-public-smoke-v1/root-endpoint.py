@@ -112,6 +112,36 @@ def command_error_class(stderr: bytes) -> str:
     return "other-stderr"
 
 
+def agent_error_class(stderr: bytes) -> str:
+    lowered = stderr.lower()
+    if not lowered:
+        return "empty-stderr"
+    categories = (
+        (b"source commit", "build-identity"),
+        (b"load config", "config-load"),
+        (b"wireguard", "wireguard-runtime"),
+        (b"validate bpf object", "bpf-object"),
+        (b"preflight bpf collection", "bpf-preflight"),
+        (b"validate bpf pin path", "pin-path"),
+        (b"persistent bpf pin owner", "pin-owner"),
+        (b"bpf owner", "pin-owner"),
+        (b"create bpf collection", "bpf-load"),
+        (b"tcx", "tcx"),
+        (b"attach state", "attach-state"),
+        (b"maintenance", "maintenance"),
+        (b"lease", "lease"),
+        (b"operation not supported", "not-supported"),
+        (b"invalid argument", "invalid-argument"),
+        (b"permission denied", "permission-denied"),
+        (b"memlock", "memlock"),
+    )
+    matched = []
+    for pattern, label in categories:
+        if pattern in lowered and label not in matched:
+            matched.append(label)
+    return "-".join(matched[:3]) if matched else "other-stderr"
+
+
 def command(
     argv: list[str],
     *,
@@ -676,7 +706,8 @@ def binary_command(root: Path, argv: list[str], timeout: int = 120) -> bytes:
     except (OSError, subprocess.TimeoutExpired) as error:
         stop(f"agent:{type(error).__name__}")
     if completed.returncode != 0:
-        stop(f"agent:rc{completed.returncode}", 77)
+        detail = agent_error_class(completed.stderr)
+        stop(f"agent:{detail}:rc{completed.returncode}", 77)
     return completed.stdout
 
 
