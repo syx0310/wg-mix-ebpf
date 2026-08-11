@@ -285,6 +285,7 @@ validate_private_mountns_launch "$@"
 shift
 
 OUTER_FAMILY="${OUTER_FAMILY:-ipv4}"
+ATTACHMENT_BACKEND="${ATTACHMENT_BACKEND:-auto}"
 XOR_SCOPE="${XOR_SCOPE:-wg-payload-full}"
 XOR_MAX_BYTES="${XOR_MAX_BYTES:-2048}"
 XOR_GENERATION_CHECKS="${XOR_GENERATION_CHECKS:-off}"
@@ -308,6 +309,12 @@ NETNS_ANCHOR_TTL_SECONDS="${NETNS_ANCHOR_TTL_SECONDS:-28800}"
 
 if [[ "${OUTER_FAMILY}" != "ipv4" && "${OUTER_FAMILY}" != "ipv6" ]]; then
   echo "error: OUTER_FAMILY must be ipv4 or ipv6" >&2
+  exit 1
+fi
+if [[ "${ATTACHMENT_BACKEND}" != "auto" &&
+  "${ATTACHMENT_BACKEND}" != "tcx" &&
+  "${ATTACHMENT_BACKEND}" != "classic_tc" ]]; then
+  echo "error: ATTACHMENT_BACKEND must be auto, tcx, or classic_tc" >&2
   exit 1
 fi
 if [[ "${XOR_SCOPE}" != "wg-payload-prefix" && "${XOR_SCOPE}" != "wg-payload-full" ]]; then
@@ -2489,6 +2496,7 @@ startup_guard:
   mode: none
 
 runtime:
+  attachment_backend: ${ATTACHMENT_BACKEND}
   require_nonzero_fwmark: true
   strict_runtime_fwmark: true
   allow_zero_fwmark_fallback: false
@@ -3895,7 +3903,7 @@ fi
 explicit_teardown
 
 if ((XOR_ENABLED)); then
-  echo "netns WireGuard + eBPF ${OUTER_FAMILY} xor smoke passed (${XOR_SCOPE}, max_bytes=${XOR_MAX_BYTES})"
+  echo "netns WireGuard + eBPF ${OUTER_FAMILY} xor smoke passed (backend=${ATTACHMENT_BACKEND}, ${XOR_SCOPE}, max_bytes=${XOR_MAX_BYTES})"
 else
-  echo "netns WireGuard + eBPF ${OUTER_FAMILY} smoke passed"
+  echo "netns WireGuard + eBPF ${OUTER_FAMILY} smoke passed (backend=${ATTACHMENT_BACKEND})"
 fi
