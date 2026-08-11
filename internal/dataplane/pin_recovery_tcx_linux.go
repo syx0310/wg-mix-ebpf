@@ -954,7 +954,7 @@ func recoverExactDetachingPinOwnerTransaction(
 	case pinOwnerStepStaging:
 		pins, err := inspectPinnedMapSetWithPolicy(
 			handle,
-			record.ActiveGeneration != 0,
+			false,
 			record.ActiveGeneration != 0,
 			false,
 		)
@@ -965,11 +965,8 @@ func recoverExactDetachingPinOwnerTransaction(
 			returnErr = errors.Join(returnErr, closePinnedMapPins(pins))
 		}()
 		if err := validateOwnerPins(
-			handle, record, pins, record.ActiveGeneration != 0,
+			handle, record, pins, false,
 		); err != nil {
-			return nil, err
-		}
-		if err := validateOwnerControlGeneration(pins, record.ActiveGeneration); err != nil {
 			return nil, err
 		}
 		if err := validateJournaledAttachedOrDetachedExactTCXLinks(handle, record.ActiveLinks, runtime); err != nil {

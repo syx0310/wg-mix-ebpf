@@ -239,6 +239,31 @@ func stageOwnerMaps(
 	for _, pin := range canonical {
 		canonicalByName[pin.descriptor.name] = pin
 	}
+	stageExists := make(map[string]bool, len(record.MapStages))
+	validateAuthority := func(pin pinnedMapPin) error {
+		if pin.observation == nil {
+			return fmt.Errorf("owner map authority %s has no observation", pin.descriptor.name)
+		}
+		if pin.descriptor.name == "owner_map" {
+			if err := validateOwnerSentinel(
+				pin.observation.owner,
+				pin.observation.ownerSeen,
+				record,
+				handleResource(handle),
+			); err != nil {
+				return err
+			}
+		}
+		if pin.descriptor.name == "control_map" {
+			if err := validateOwnerControlGeneration(
+				[]pinnedMapPin{pin}, record.ActiveGeneration,
+			); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	// Preflight every canonical-or-staged authority before the first rename.
 	for _, stage := range record.MapStages {
 		descriptor, err := ownerMapDescriptor(stage.Name)
 		if err != nil {
@@ -261,20 +286,14 @@ func stageOwnerMaps(
 			if err != nil {
 				return err
 			}
-			if descriptor.name == "owner_map" {
-				if err := validateOwnerSentinel(
-					pin.observation.owner,
-					pin.observation.ownerSeen,
-					record,
-					handleResource(handle),
-				); err != nil {
-					_ = pin.observation.Close()
-					return err
-				}
+			if err := validateAuthority(*pin); err != nil {
+				_ = pin.observation.Close()
+				return err
 			}
 			if err := pin.observation.Close(); err != nil {
 				return err
 			}
+			stageExists[stage.Name] = true
 			continue
 		}
 		if !errors.Is(err, unix.ENOENT) {
@@ -293,6 +312,27 @@ func stageOwnerMaps(
 				stage.Name,
 			)
 		}
+		if err := validateAuthority(source); err != nil {
+			return err
+		}
+	}
+
+	for _, stage := range record.MapStages {
+		if stageExists[stage.Name] {
+			continue
+		}
+		descriptor, err := ownerMapDescriptor(stage.Name)
+		if err != nil {
+			return err
+		}
+		source, ok := canonicalByName[stage.Name]
+		if !ok || source.observation == nil || source.observation.pin == nil ||
+			source.observation.id != stage.MapID {
+			if record.ActiveGeneration == 0 {
+				continue
+			}
+			return fmt.Errorf("canonical owner map %s is unavailable for staging", stage.Name)
+		}
 		if err := source.observation.pin(
 			filepath.Join(handle.procPath(), stage.FileName),
 		); err != nil {
@@ -307,16 +347,9 @@ func stageOwnerMaps(
 		if err != nil {
 			return err
 		}
-		if descriptor.name == "owner_map" {
-			if err := validateOwnerSentinel(
-				pin.observation.owner,
-				pin.observation.ownerSeen,
-				record,
-				handleResource(handle),
-			); err != nil {
-				_ = pin.observation.Close()
-				return err
-			}
+		if err := validateAuthority(*pin); err != nil {
+			_ = pin.observation.Close()
+			return err
 		}
 		if err := pin.observation.Close(); err != nil {
 			return err

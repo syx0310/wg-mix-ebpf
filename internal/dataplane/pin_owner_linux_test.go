@@ -1037,6 +1037,13 @@ func TestOwnerDirectoryCoversExactTCXLinkPinsAcrossPhases(t *testing.T) {
 			pinOwnerPhaseDetaching,
 			pinOwnerStepMutatingTC,
 		)
+		for _, stage := range mutating.MapStages {
+			if err := os.WriteFile(
+				filepath.Join(fixture.handle.pinPath, stage.FileName), nil, 0o600,
+			); err != nil {
+				t.Fatal(err)
+			}
+		}
 		if err := validateOwnerDirectoryEntries(fixture.handle, mutating); err != nil {
 			t.Fatal(err)
 		}
@@ -4216,7 +4223,6 @@ func TestOwnerMapUnlinkFailureAtEveryPositionRestoresCanonicalSet(t *testing.T) 
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer closePinnedMapPins(pins)
 			var token [32]byte
 			for index := range token {
 				token[index] = byte(index + 1)
@@ -4241,6 +4247,14 @@ func TestOwnerMapUnlinkFailureAtEveryPositionRestoresCanonicalSet(t *testing.T) 
 			ownerObservation.owner = sentinel
 			ownerObservation.ownerSeen = true
 			mapStore.observations["owner_map"] = ownerObservation
+			if err := closePinnedMapPins(pins); err != nil {
+				t.Fatal(err)
+			}
+			pins, err = inspectPinnedMapSet(handle, true)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer closePinnedMapPins(pins)
 			detaching, err := newDetachingPinOwnerRecord(
 				active,
 				time.Date(2026, 7, 29, 1, 2, 4, 0, time.UTC),

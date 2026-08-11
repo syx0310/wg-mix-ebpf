@@ -453,10 +453,29 @@ func validateOwnerDirectoryEntries(
 		}
 		return nil
 	}
+	wantCanonical := len(canonical)
+	requireCanonicalOrStagedMaps := func(label string) error {
+		if len(record.MapStages) != wantCanonical {
+			return fmt.Errorf(
+				"%s owner record has %d map stages, want %d",
+				label, len(record.MapStages), wantCanonical,
+			)
+		}
+		for _, stage := range record.MapStages {
+			_, canonicalPresent := seen[stage.Name]
+			_, stagePresent := seen[stage.FileName]
+			if !canonicalPresent && !stagePresent {
+				return fmt.Errorf(
+					"%s owner map %s has canonical=%t staged=%t; want at least one exact authority",
+					label, stage.Name, canonicalPresent, stagePresent,
+				)
+			}
+		}
+		return nil
+	}
 	if len(seenLinks) > len(linkNames) {
 		return errors.New("owner directory contains an unjournaled exact TCX pin")
 	}
-	wantCanonical := len(canonical)
 	switch {
 	case record.Phase == pinOwnerPhaseActive:
 		requiredActive := make([]exactTCXBinding, 0, len(record.ActiveLinks))
@@ -528,11 +547,10 @@ func validateOwnerDirectoryEntries(
 		}
 	case record.Phase == pinOwnerPhaseDetaching &&
 		record.Step == pinOwnerStepStaging:
-		if record.ActiveGeneration != 0 && canonicalCount != wantCanonical {
-			return fmt.Errorf(
-				"detaching owner directory has %d canonical maps before unlink, want %d",
-				canonicalCount, wantCanonical,
-			)
+		if record.ActiveGeneration != 0 {
+			if err := requireCanonicalOrStagedMaps("detaching staging"); err != nil {
+				return err
+			}
 		}
 		if err := requireLinks(record.ActiveLinks, "detaching staging"); err != nil {
 			return err
@@ -540,15 +558,19 @@ func validateOwnerDirectoryEntries(
 	case record.Phase == pinOwnerPhaseDetaching &&
 		record.Step == pinOwnerStepMutatingTC:
 		// Once mutating_tc is durable, all exact stage pins are the recovery
-		// authority.  Canonical pins may already be partly or fully gone at a
-		// crash boundary; the recovery path validates every staged map ID before
-		// its first link mutation and removes any surviving canonical pins later.
-		if record.ActiveGeneration != 0 &&
-			(mapStageCount != len(record.MapStages) || len(record.MapStages) != wantCanonical) {
-			return fmt.Errorf(
-				"detaching owner directory has %d map stages during TC mutation, want %d",
-				mapStageCount, wantCanonical,
-			)
+		// authority. Canonical pins may coexist (duplicate-pin implementation) or
+		// be partly/fully gone (rename implementation); every existing authority
+		// is ID-validated before the first link mutation.
+		if record.ActiveGeneration != 0 {
+			if err := requireCanonicalOrStagedMaps("detaching mutation"); err != nil {
+				return err
+			}
+			if mapStageCount != wantCanonical {
+				return fmt.Errorf(
+					"detaching owner directory has %d canonical maps and %d map stages during TC mutation, want %d stages",
+					canonicalCount, mapStageCount, wantCanonical,
+				)
+			}
 		}
 	case record.Phase == pinOwnerPhaseDetaching &&
 		record.Step == pinOwnerStepUnlinkingMaps:

@@ -119,6 +119,27 @@ func newExactTCXOwnerTestFixture(t *testing.T) *exactTCXOwnerTestFixture {
 	return fixture
 }
 
+func installMovingMapPinBehavior(
+	t *testing.T,
+	fixture *exactTCXOwnerTestFixture,
+	failAfter *int,
+) *int {
+	t.Helper()
+	moves := 0
+	for name, observation := range fixture.mapStore.observations {
+		name := name
+		observation.pin = func(path string) error {
+			if failAfter != nil && *failAfter >= 0 && moves == *failAfter {
+				return errors.New("injected crash during owner map staging")
+			}
+			moves++
+			return os.Rename(filepath.Join(fixture.handle.procPath(), name), path)
+		}
+		fixture.mapStore.observations[name] = observation
+	}
+	return &moves
+}
+
 func (fixture *exactTCXOwnerTestFixture) mutatingRecord(
 	t *testing.T,
 	active []exactTCXBinding,
@@ -1890,6 +1911,7 @@ func TestRemoveOwnedExactTCXRecoversDetachedPinnedBoundary(t *testing.T) {
 
 func TestRecoverDetachingExactTCXWithCanonicalMapsAlreadyUnlinked(t *testing.T) {
 	fixture := newExactTCXOwnerTestFixture(t)
+	installMovingMapPinBehavior(t, fixture, nil)
 	kernel := newFakeExactTCXKernel()
 	kernel.materializePins = true
 	journal := &fakeExactTCXJournal{events: &kernel.events}
@@ -1953,17 +1975,6 @@ func TestRecoverDetachingExactTCXWithCanonicalMapsAlreadyUnlinked(t *testing.T) 
 	if err := fixture.store.Persist(mutating, detaching, fixture.handle.mountID); err != nil {
 		t.Fatal(err)
 	}
-	stages, err := loadOwnerMapStages(fixture.handle, mutating)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := removeCanonicalOwnerMaps(fixture.handle, mutating, stages); err != nil {
-		_ = stages.Close()
-		t.Fatal(err)
-	}
-	if err := stages.Close(); err != nil {
-		t.Fatal(err)
-	}
 	if err := validateOwnerDirectoryEntries(fixture.handle, mutating); err != nil {
 		t.Fatalf("canonical-unlinked detaching directory: %v", err)
 	}
@@ -1984,6 +1995,84 @@ func TestRecoverDetachingExactTCXWithCanonicalMapsAlreadyUnlinked(t *testing.T) 
 		if kernel.links[binding.LinkID].attached {
 			t.Fatalf("recovered detach retained link %d", binding.LinkID)
 		}
+	}
+}
+
+func TestRecoverDetachingExactTCXFromPartialMapStageMoves(t *testing.T) {
+	for _, completedMoves := range []int{1, 6, 11} {
+		t.Run(fmt.Sprintf("moves-%d", completedMoves), func(t *testing.T) {
+			fixture := newExactTCXOwnerTestFixture(t)
+			failAfter := completedMoves
+			moves := installMovingMapPinBehavior(t, fixture, &failAfter)
+			kernel := newFakeExactTCXKernel()
+			kernel.materializePins = true
+			journal := &fakeExactTCXJournal{events: &kernel.events}
+			owner, _ := stageTestExactTCXAtPath(
+				t, kernel, testExactTCXBinding(25, exactTCXIngress, 721),
+				journal, fixture.handle.procPath(),
+			)
+			binding := owner.binding
+			if err := owner.Release(); err != nil {
+				t.Fatal(err)
+			}
+			active, err := newActivePinOwnerRecord(
+				fixture.parent,
+				fixture.token,
+				"12345678-1234-1234-1234-123456789abc",
+				fixture.now,
+				7,
+				fixture.maps,
+				[]exactTCXBinding{binding},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := fixture.store.Persist(active, nil, fixture.handle.mountID); err != nil {
+				t.Fatal(err)
+			}
+			detaching, err := newDetachingPinOwnerRecord(
+				active, fixture.now.Add(time.Second),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			observeOwnerMount(detaching, fixture.handle.mountID)
+			if err := fixture.store.Persist(detaching, active, fixture.handle.mountID); err != nil {
+				t.Fatal(err)
+			}
+			pins, err := inspectPinnedMapSetWithPolicy(fixture.handle, false, true, false)
+			if err != nil {
+				t.Fatal(err)
+			}
+			err = stageOwnerMaps(fixture.handle, detaching, pins)
+			closeErr := closePinnedMapPins(pins)
+			if err == nil || !strings.Contains(err.Error(), "injected crash") {
+				t.Fatalf("partial stage error = %v", err)
+			}
+			if closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			if *moves != completedMoves {
+				t.Fatalf("completed moves = %d, want %d", *moves, completedMoves)
+			}
+			if err := validateOwnerDirectoryEntries(fixture.handle, detaching); err != nil {
+				t.Fatalf("partial staging directory: %v", err)
+			}
+
+			failAfter = -1
+			recovered, err := recoverExactPinOwnerTransaction(
+				t.Context(), fixture.handle, fixture.store, detaching, kernel.runtime(),
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if recovered == nil || !recovered.directoryRemoved {
+				t.Fatalf("recovery result = %+v", recovered)
+			}
+			if kernel.links[binding.LinkID].attached {
+				t.Fatalf("partial-stage recovery retained link %d", binding.LinkID)
+			}
+		})
 	}
 }
 
