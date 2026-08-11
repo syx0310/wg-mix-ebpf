@@ -77,7 +77,7 @@ readonly actual_entries="$(/usr/bin/find "${stage}" -mindepth 1 -maxdepth 1 -pri
 
 [[ -f "${owner_marker}" && ! -L "${owner_marker}" &&
   "$(/usr/bin/stat -Lc '%U:%G:%a:%h:%s:%F' -- "${owner_marker}")" == \
-    'siyixuan:siyixuan:600:1:0:regular file' ]] || {
+    'siyixuan:siyixuan:600:1:0:regular empty file' ]] || {
   printf 'error: CI test stage ownership marker is invalid\n' >&2
   exit 66
 }
