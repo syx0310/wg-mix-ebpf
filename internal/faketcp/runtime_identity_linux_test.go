@@ -210,7 +210,8 @@ func TestSeedLinuxRuntimeIdentityReadsFreshGuardThenCommitsIdentityLast(t *testi
 		t.Fatal(err)
 	}
 	want := []string{
-		"lookup-identity", "lookup-sequence", "disable", "reset:4", "commit:7:1",
+		"lookup-identity", "lookup-sequence", "disable", "reset:4",
+		fmt.Sprintf("commit:7:%d", abi.FakeTCPEventABIVersion),
 	}
 	if got := trace.snapshot(); !slices.Equal(got, want) {
 		t.Fatalf("seed operations=%v want=%v", got, want)

@@ -176,7 +176,7 @@ func TestExperimentalRuntimeFactoryBuilderPreClaimFailureClosesBothOwners(t *tes
 
 func TestExperimentalRuntimeFactoryQuarantinesClaimedPrepareCleanupFailure(t *testing.T) {
 	fixture := newExperimentalRuntimeFactoryFixture(t, 91)
-	prepareErr := "does not match snapshot generation"
+	prepareErr := "does not match policy plan generation"
 	collectionErr := errors.New("injected collection close failure")
 	transactionErr := errors.New("injected claimed transaction close failure")
 	fixture.options.engineOptions.Generation++
@@ -480,6 +480,8 @@ func TestExperimentalRuntimeFactoryClosesUnexpectedRuntimeReturnedWithError(t *t
 			return &ExperimentalFakeTCPRuntime{
 				state: &experimentalFakeTCPRuntimeState{
 					collection: options.collection,
+					generation: options.transaction.policyGeneration(),
+					isolation:  options.transaction.isolation,
 					closeDone:  make(chan struct{}),
 				},
 			}, wantErr
@@ -503,15 +505,17 @@ func TestExperimentalRuntimeFactoryClosesUnexpectedRuntimeReturnedWithError(t *t
 func TestExperimentalRuntimeFactoryRequiresExactAcquiredOwner(t *testing.T) {
 	for _, test := range []struct {
 		name        string
-		result      func(*experimentalCollectionOwner, *experimentalCollectionOwner) *ExperimentalFakeTCPRuntime
+		result      func(*experimentalCollectionOwner, *experimentalCollectionOwner, *fakeTCPPolicyGenerationTransaction) *ExperimentalFakeTCPRuntime
 		wantSuccess bool
 		usesOther   bool
 	}{
 		{
 			name: "exact owner",
-			result: func(acquired, _ *experimentalCollectionOwner) *ExperimentalFakeTCPRuntime {
+			result: func(acquired, _ *experimentalCollectionOwner, transaction *fakeTCPPolicyGenerationTransaction) *ExperimentalFakeTCPRuntime {
 				return &ExperimentalFakeTCPRuntime{state: &experimentalFakeTCPRuntimeState{
 					collection: acquired,
+					generation: transaction.policyGeneration(),
+					isolation:  transaction.isolation,
 					closeDone:  make(chan struct{}),
 				}}
 			},
@@ -519,23 +523,27 @@ func TestExperimentalRuntimeFactoryRequiresExactAcquiredOwner(t *testing.T) {
 		},
 		{
 			name: "nil state",
-			result: func(_, _ *experimentalCollectionOwner) *ExperimentalFakeTCPRuntime {
+			result: func(_, _ *experimentalCollectionOwner, _ *fakeTCPPolicyGenerationTransaction) *ExperimentalFakeTCPRuntime {
 				return &ExperimentalFakeTCPRuntime{}
 			},
 		},
 		{
 			name: "nil collection",
-			result: func(_, _ *experimentalCollectionOwner) *ExperimentalFakeTCPRuntime {
+			result: func(_, _ *experimentalCollectionOwner, transaction *fakeTCPPolicyGenerationTransaction) *ExperimentalFakeTCPRuntime {
 				return &ExperimentalFakeTCPRuntime{state: &experimentalFakeTCPRuntimeState{
-					closeDone: make(chan struct{}),
+					generation: transaction.policyGeneration(),
+					isolation:  transaction.isolation,
+					closeDone:  make(chan struct{}),
 				}}
 			},
 		},
 		{
 			name: "other owner",
-			result: func(_, other *experimentalCollectionOwner) *ExperimentalFakeTCPRuntime {
+			result: func(_, other *experimentalCollectionOwner, transaction *fakeTCPPolicyGenerationTransaction) *ExperimentalFakeTCPRuntime {
 				return &ExperimentalFakeTCPRuntime{state: &experimentalFakeTCPRuntimeState{
 					collection: other,
+					generation: transaction.policyGeneration(),
+					isolation:  transaction.isolation,
 					closeDone:  make(chan struct{}),
 				}}
 			},
@@ -571,7 +579,7 @@ func TestExperimentalRuntimeFactoryRequiresExactAcquiredOwner(t *testing.T) {
 					if err := options.transaction.Close(); err != nil {
 						return nil, err
 					}
-					return test.result(options.collection, otherOwner), nil
+					return test.result(options.collection, otherOwner, options.transaction), nil
 				},
 			)
 			if test.wantSuccess {
@@ -615,6 +623,8 @@ func TestExperimentalRuntimeExactOwnerCheckIsConcurrentWithClose(t *testing.T) {
 	fixture := newExperimentalRuntimeFactoryFixture(t, 91)
 	runtime := &ExperimentalFakeTCPRuntime{state: &experimentalFakeTCPRuntimeState{
 		collection: fixture.runtime.collection,
+		generation: fixture.transaction.policyGeneration(),
+		isolation:  fixture.transaction.isolation,
 		closeDone:  make(chan struct{}),
 	}}
 	if !experimentalFakeTCPRuntimeOwnsExactCollection(runtime, fixture.runtime.collection) {

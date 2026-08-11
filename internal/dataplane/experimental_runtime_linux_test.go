@@ -1922,6 +1922,7 @@ func TestExperimentalFakeTCPRuntimeCommitBoundaryIgnoresLaterCancellation(t *tes
 			generation: build.policyPlan.generation,
 			identity:   build.engine.Identity(),
 			engine:     build.engine,
+			isolation:  build.isolation,
 			collection: fixture.collection,
 			core:       build.coreStage,
 			tc:         build.tcStage,
