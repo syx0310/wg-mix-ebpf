@@ -122,11 +122,13 @@ if {$operation eq "ssh"} {
 }
 
 set timeout 1900
+set capture_limit 16777216
 set captured ""
 set credential_sends 0
 log_user 0
 spawn -noecho {*}$spawn_argv
 set child_id $spawn_id
+match_max -i $child_id $capture_limit
 expect {
     -i $child_id -re {(?i)[^\r\n]*(?:password|passphrase)[^\r\n]*:[ ]*$} {
         append_without_match captured $expect_out(buffer) $expect_out(0,string)
@@ -141,6 +143,15 @@ expect {
     -i $child_id -re {(?i)are you sure you want to continue connecting} {
         set password ""
         stop host-key 78
+    }
+    -i $child_id full_buffer {
+        append captured $expect_out(buffer)
+        emit_complete_child_diagnostics \
+            $captured $password [list capture-limit $capture_limit]
+        set password ""
+        catch {close -i $child_id}
+        catch {wait -i $child_id}
+        stop child-output-limit 77
     }
     -i $child_id eof {
         append captured $expect_out(buffer)

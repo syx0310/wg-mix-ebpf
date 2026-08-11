@@ -22,6 +22,9 @@ HOLDER_PATH = pathlib.Path(__file__).with_name(
     "hold-isolated-lifecycle-lease.py"
 )
 ANCHOR_PACKAGE = SCRIPT_PATH.parent.parent / "internal" / "netnsanchor"
+FAILED_RUN_RECOVERY_PATH = pathlib.Path(__file__).with_name(
+    "recover-smoke-netns-wg-failed-run.py"
+)
 
 
 class SmokeNetNSWGStaticTests(unittest.TestCase):
@@ -34,6 +37,9 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         cls.go_mod_source = GO_MOD_PATH.read_text(encoding="utf-8")
         cls.go_sum_source = GO_SUM_PATH.read_text(encoding="utf-8")
         cls.holder_source = HOLDER_PATH.read_text(encoding="utf-8")
+        cls.failed_run_recovery = FAILED_RUN_RECOVERY_PATH.read_text(
+            encoding="utf-8"
+        )
         cls.anchor_linux_source = (ANCHOR_PACKAGE / "run_linux.go").read_text(
             encoding="utf-8"
         )
@@ -2078,6 +2084,22 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         ):
             self.assertIn(stat, matrix)
 
+        ipv4_isolation = self.source.index(
+            'sysctl -qw net.ipv6.conf.all.disable_ipv6=1'
+        )
+        ipv4_default_isolation = self.source.index(
+            'sysctl -qw net.ipv6.conf.default.disable_ipv6=1'
+        )
+        first_underlay_up = self.source.index(
+            'run_in_owned_netns "${NSA}" ip link set under0 up'
+        )
+        self.assertLess(ipv4_isolation, ipv4_default_isolation)
+        self.assertLess(ipv4_default_isolation, first_underlay_up)
+        self.assertIn(
+            'for ipv4_netns in "${NSA}" "${NSR}" "${NSB}"; do',
+            self.source,
+        )
+
         evidence = self.source[
             self.source.index("capture_tcp_link_evidence() {") :
             self.source.index("\ntcp_server_listening() {")
@@ -2281,6 +2303,36 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             5,
         )
         self.assertIn("manifest changed while acquiring lifecycle lease", self.holder_source)
+
+    def test_failed_run_recovery_is_owner_bound_retryable_and_non_networking(
+        self,
+    ) -> None:
+        recovery = self.failed_run_recovery
+        for required in (
+            'parser.add_argument("mode", choices=("plan", "run"))',
+            '"wg-mix-ebpf-failed-run-recovery-v1"',
+            "assert_no_live_mount(root)",
+            "assert_no_run_network(args.run_id)",
+            'status.get("source_commit") != args.failed_source_commit',
+            "fcntl.LOCK_EX | fcntl.LOCK_NB",
+            "publish_receipt(receipt_payload, args.run_id)",
+            'f"SMOKE_RECOVERY_COMPLETE run_id={args.run_id}',
+        ):
+            self.assertIn(required, recovery)
+        self.assertLess(
+            recovery.index("validate_tree(root, manifest, initial=True)"),
+            recovery.index("publish_receipt(receipt_payload, args.run_id)"),
+        )
+        for forbidden in (
+            "shutil.rmtree",
+            "os.system",
+            "subprocess",
+            "ip link delete",
+            "bpftool",
+            "rm -rf",
+            "find -delete",
+        ):
+            self.assertNotIn(forbidden, recovery)
 
 
 if __name__ == "__main__":

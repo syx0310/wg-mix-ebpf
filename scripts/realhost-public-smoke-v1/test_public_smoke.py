@@ -707,6 +707,10 @@ class PublicSmokeTest(unittest.TestCase):
         self.assertIn("PUBLIC_TRANSPORT_CHILD_DIAGNOSTIC_BEGIN", transport)
         self.assertIn("PUBLIC_TRANSPORT_CHILD_DIAGNOSTIC_END", transport)
         self.assertIn("PUBLIC_TRANSPORT_CHILD_WAIT result=$wait_result", transport)
+        self.assertIn("set capture_limit 16777216", transport)
+        self.assertIn("match_max -i $child_id $capture_limit", transport)
+        self.assertIn("-i $child_id full_buffer", transport)
+        self.assertIn("stop child-output-limit 77", transport)
         self.assertLess(
             transport.index("emit_complete_child_diagnostics $captured $password $wait_result"),
             transport.index('set password ""', transport.index("set wait_failed")),

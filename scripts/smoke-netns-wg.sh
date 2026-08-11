@@ -3611,6 +3611,16 @@ run_in_owned_netns "${NSR}" ip link set ra0 mtu "${UNDERLAY_MTU}"
 run_in_owned_netns "${NSR}" ip link set rb0 mtu "${UNDERLAY_MTU}"
 
 if [[ "${OUTER_FAMILY}" == "ipv4" ]]; then
+  # Keep the IPv4 performance interval free of kernel-generated IPv6 MLD
+  # frames.  Those frames legitimately contain Hop-by-Hop extensions and can
+  # otherwise advance the dataplane's IPv6-extension observation counter
+  # during longer TCP runs even though the measured flow is IPv4.
+  for ipv4_netns in "${NSA}" "${NSR}" "${NSB}"; do
+    run_in_owned_netns "${ipv4_netns}" \
+      sysctl -qw net.ipv6.conf.all.disable_ipv6=1
+    run_in_owned_netns "${ipv4_netns}" \
+      sysctl -qw net.ipv6.conf.default.disable_ipv6=1
+  done
   A_UNDER="192.0.2.1"
   A_GW="192.0.2.254"
   B_UNDER="198.51.100.1"
