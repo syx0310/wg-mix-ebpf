@@ -55,6 +55,25 @@ class PublicSmokeTest(unittest.TestCase):
         )
         self.assertEqual(15, len(self.root.staging_wg_name("a" * 64, "public")))
 
+    def test_command_error_class_is_bounded_and_redacted(self) -> None:
+        self.assertEqual("empty-stderr", self.root.command_error_class(b""))
+        self.assertEqual(
+            "key-format",
+            self.root.command_error_class(
+                b"Key is not the correct length or format: `/secret/private.key'\n"
+            ),
+        )
+        self.assertEqual(
+            "netlink-not-supported",
+            self.root.command_error_class(
+                b"Unable to modify interface: Operation not supported\n"
+            ),
+        )
+        self.assertEqual(
+            "other-stderr",
+            self.root.command_error_class(b"untrusted path /secret/private.key\n"),
+        )
+
     def test_report_accepts_only_fresh_bidirectional_zero_error_growth(self) -> None:
         document = {
             "run_id": "0123456789ab",

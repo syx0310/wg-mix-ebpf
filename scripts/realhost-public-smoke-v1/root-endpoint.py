@@ -88,6 +88,26 @@ def stop(reason: str, rc: int = 78) -> NoReturn:
     raise SystemExit(rc)
 
 
+def command_error_class(stderr: bytes) -> str:
+    if not stderr:
+        return "empty-stderr"
+    if b"Key is not the correct length or format" in stderr:
+        return "key-format"
+    if b"Unable to open" in stderr or b"No such file or directory" in stderr:
+        return "file-open"
+    if b"Unable to modify interface: Operation not supported" in stderr:
+        return "netlink-not-supported"
+    if b"Unable to modify interface: Invalid argument" in stderr:
+        return "netlink-invalid"
+    if b"Unable to modify interface: Operation not permitted" in stderr:
+        return "netlink-not-permitted"
+    if b"Unable to modify interface: Address already in use" in stderr:
+        return "netlink-address-in-use"
+    if b"Unable to modify interface" in stderr:
+        return "netlink-other"
+    return "other-stderr"
+
+
 def command(
     argv: list[str],
     *,
@@ -110,7 +130,8 @@ def command(
         stop(f"command:{label}:{type(error).__name__}")
     if completed.returncode != 0:
         label = stop_label or Path(argv[0]).name
-        stop(f"command:{label}:rc{completed.returncode}", 77)
+        detail = command_error_class(completed.stderr)
+        stop(f"command:{label}:{detail}:rc{completed.returncode}", 77)
     return completed.stdout
 
 
