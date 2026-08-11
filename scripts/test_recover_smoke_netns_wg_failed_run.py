@@ -459,51 +459,52 @@ class FailedSmokeRecoveryTest(unittest.TestCase):
             root, _manifest, plan_argv = self.build_run_fixture(parent)
             run_argv = list(plan_argv)
             run_argv[1] = "run"
-            real_open = os.open
-            real_close = os.close
             real_unlink = os.unlink
             real_rmdir = os.rmdir
-            lease_fd: int | None = None
-            lease_closed = False
+            contender_fd = os.open(
+                root / "lifecycle.lease", os.O_RDONLY | os.O_CLOEXEC
+            )
             observed_unlink_locked = False
             observed_rmdir_locked = False
 
-            def tracked_open(path, flags, *args, **kwargs):
-                nonlocal lease_fd
-                descriptor = real_open(path, flags, *args, **kwargs)
-                if pathlib.Path(path) == root / "lifecycle.lease":
-                    lease_fd = descriptor
-                return descriptor
-
-            def tracked_close(descriptor: int):
-                nonlocal lease_closed
-                if lease_fd is not None and descriptor == lease_fd:
-                    lease_closed = True
-                return real_close(descriptor)
+            def recovery_holds_lock() -> bool:
+                try:
+                    RECOVERY.fcntl.flock(
+                        contender_fd,
+                        RECOVERY.fcntl.LOCK_EX | RECOVERY.fcntl.LOCK_NB,
+                    )
+                except BlockingIOError:
+                    return True
+                RECOVERY.fcntl.flock(contender_fd, RECOVERY.fcntl.LOCK_UN)
+                return False
 
             def tracked_unlink(path, *args, **kwargs):
                 nonlocal observed_unlink_locked
                 if pathlib.Path(path) == root / "lifecycle.lease":
-                    observed_unlink_locked = lease_fd is not None and not lease_closed
+                    observed_unlink_locked = recovery_holds_lock()
                 return real_unlink(path, *args, **kwargs)
 
             def tracked_rmdir(path, *args, **kwargs):
                 nonlocal observed_rmdir_locked
                 if pathlib.Path(path) == root:
-                    observed_rmdir_locked = lease_fd is not None and not lease_closed
+                    observed_rmdir_locked = recovery_holds_lock()
                 return real_rmdir(path, *args, **kwargs)
 
-            with mock.patch.object(RECOVERY.os, "open", tracked_open), mock.patch.object(
-                RECOVERY.os, "close", tracked_close
-            ), mock.patch.object(RECOVERY.os, "unlink", tracked_unlink), mock.patch.object(
-                RECOVERY.os, "rmdir", tracked_rmdir
-            ):
-                stdout, stderr = self.run_main(run_argv)
+            try:
+                with mock.patch.object(
+                    RECOVERY.os, "unlink", tracked_unlink
+                ), mock.patch.object(RECOVERY.os, "rmdir", tracked_rmdir):
+                    stdout, stderr = self.run_main(run_argv)
+                lock_released = not recovery_holds_lock()
+                if not lock_released:
+                    RECOVERY.fcntl.flock(contender_fd, RECOVERY.fcntl.LOCK_UN)
+            finally:
+                os.close(contender_fd)
             self.assertEqual(stderr, "")
             self.assertIn("SMOKE_RECOVERY_COMPLETE", stdout)
             self.assertTrue(observed_unlink_locked)
             self.assertTrue(observed_rmdir_locked)
-            self.assertTrue(lease_closed)
+            self.assertTrue(lock_released)
 
 
 if __name__ == "__main__":
