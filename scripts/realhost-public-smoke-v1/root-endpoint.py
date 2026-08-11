@@ -682,18 +682,18 @@ def apply_endpoint(args: argparse.Namespace) -> None:
         ]
     )
     command([TOOLS["ip"], "link", "set", "dev", staging_name, "name", wg_name])
-    wg_interface_argv = [
-        TOOLS["wg"],
-        "set",
-        wg_name,
-        "private-key",
-        str(root / "private.key"),
-        "listen-port",
-        str(spec["listen_port"]),
-        "fwmark",
-        spec["fwmark"],
-    ]
-    command(wg_interface_argv, stop_label="wg-interface")
+    command(
+        [TOOLS["wg"], "set", wg_name, "private-key", str(root / "private.key")],
+        stop_label="wg-private-key",
+    )
+    command(
+        [TOOLS["wg"], "set", wg_name, "listen-port", str(spec["listen_port"])],
+        stop_label="wg-listen-port",
+    )
+    command(
+        [TOOLS["wg"], "set", wg_name, "fwmark", spec["fwmark"]],
+        stop_label="wg-fwmark",
+    )
     wg_peer_argv = [
         TOOLS["wg"],
         "set",
