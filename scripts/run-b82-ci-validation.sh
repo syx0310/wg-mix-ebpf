@@ -62,6 +62,15 @@ done
   printf 'error: CI validation source commit drifted\n' >&2
   exit 66
 }
+readonly stage_device="$(/usr/bin/stat -c '%d' -- "${stage}")"
+[[ -z "$(/usr/bin/find "${source}" -xdev \
+  \( ! -user siyixuan -o ! -group siyixuan \) -print -quit)" &&
+  -z "$(/usr/bin/find "${source}" -xdev -type d \
+    -exec /usr/bin/stat -c '%d' -- '{}' + |
+    /usr/bin/grep -Fvx "${stage_device}" | /usr/bin/head -n 1)" ]] || {
+  printf 'error: CI validation source ownership or filesystem drifted\n' >&2
+  exit 66
+}
 [[ ! -e "${log}" && ! -L "${log}" &&
   ! -e "${result}" && ! -L "${result}" &&
   ! -e "${result_pending}" && ! -L "${result_pending}" ]] || {
@@ -74,6 +83,10 @@ exec 9>"${lock_dir}/runner.lock"
   printf 'error: CI validation runner is already active\n' >&2
   exit 73
 }
+/usr/bin/find "${source}" -xdev -type d \
+  -exec /usr/bin/chmod go-w -- '{}' +
+/usr/bin/find "${source}" -xdev -type f \
+  -exec /usr/bin/chmod go-w -- '{}' +
 
 readonly gocache="${stage}/go-cache"
 readonly gomodcache="${stage}/go-mod-cache"
@@ -93,7 +106,7 @@ export GOFLAGS=''
 export GO111MODULE=on
 export PYTHONDONTWRITEBYTECODE=1
 
-exec >"${log}" 2>&1
+/usr/bin/touch -- "${log}"
 /usr/bin/chmod 0600 -- "${log}"
 
 gate_results=()
@@ -113,18 +126,28 @@ render_argv() {
 run_gate() {
   local label="$1"
   shift
-  local started finished rc
+  local started finished rc tee_rc
+  local -a pipeline_status
   started="$(timestamp)"
-  printf 'B82_CI_GATE_BEGIN label=%s timestamp=%s argv=' "${label}" "${started}"
-  render_argv "$@"
-  printf '\n'
+  {
+    printf 'B82_CI_GATE_BEGIN label=%s timestamp=%s argv=' "${label}" "${started}"
+    render_argv "$@"
+    printf '\n'
+  } >>"${log}"
   set +e
-  "$@"
-  rc=$?
+  "$@" 2>&1 | /usr/bin/tee -a "${log}" >/dev/null
+  pipeline_status=("${PIPESTATUS[@]}")
+  rc="${pipeline_status[0]}"
+  tee_rc="${pipeline_status[1]}"
   set -e
+  if ((tee_rc != 0)); then
+    printf 'error: CI validation evidence write failed: label=%s tee_rc=%d\n' \
+      "${label}" "${tee_rc}" >&2
+    exit 74
+  fi
   finished="$(timestamp)"
   printf 'B82_CI_GATE_END label=%s timestamp=%s rc=%d\n' \
-    "${label}" "${finished}" "${rc}"
+    "${label}" "${finished}" "${rc}" >>"${log}"
   gate_results+=("${label}:${rc}")
   if ((rc != 0)); then
     overall_rc=1
@@ -135,7 +158,7 @@ validate_identity() {
   local binary="${source}/bin/wg-mix-ebpf-linux-amd64"
   local identity_json="${runtime}/wg-mix-ebpf-version.json"
   "${binary}" version --json >"${identity_json}"
-  /usr/bin/python3 -I - "${identity_json}" "${source}" "${commit}" <<'PY'
+  /usr/bin/python3 -I -S - "${identity_json}" "${source}" "${commit}" <<'PY'
 import hashlib
 import json
 import re
@@ -172,9 +195,20 @@ PY
 }
 
 dump_abi() {
-  "${source}/bin/wg-mix-ebpf-linux-amd64" dump-abi \
-    --config "${source}/configs/example.yaml" --offline \
-    >"${runtime}/wg-mix-ebpf-abi.json"
+  (
+    cd "${source}"
+    "${source}/bin/wg-mix-ebpf-linux-amd64" dump-abi \
+      --config configs/example.yaml --offline \
+      >"${runtime}/wg-mix-ebpf-abi.json"
+  )
+}
+
+offline_validate() {
+  (
+    cd "${source}"
+    "${source}/bin/wg-mix-ebpf-linux-amd64" validate \
+      --config configs/example.yaml --offline
+  )
 }
 
 package_artifact() {
@@ -191,7 +225,7 @@ package_artifact() {
 }
 
 printf 'B82_CI_VALIDATION_BEGIN run_id=%s commit=%s timestamp=%s\n' \
-  "${run_id}" "${commit}" "$(timestamp)"
+  "${run_id}" "${commit}" "$(timestamp)" >>"${log}"
 run_gate diff-check /usr/bin/git -C "${source}" diff --check HEAD
 run_gate bpf-manifests /usr/bin/env CGO_ENABLED=0 \
   /usr/bin/make -C "${source}" test-bpf-object-manifests
@@ -204,14 +238,14 @@ run_gate race /usr/bin/env CGO_ENABLED=1 \
 run_gate build-amd64 /usr/bin/make -C "${source}" build-linux-amd64
 run_gate identity validate_identity
 run_gate build-arm64 /usr/bin/make -C "${source}" build-linux-arm64
-run_gate offline-validate "${source}/bin/wg-mix-ebpf-linux-amd64" validate \
-  --config "${source}/configs/example.yaml" --offline
+run_gate offline-validate offline_validate
 run_gate offline-dump-abi dump_abi
 run_gate package package_artifact
 
 summary="$(IFS=,; printf '%s' "${gate_results[*]}")"
 printf 'B82_CI_VALIDATION_END run_id=%s commit=%s timestamp=%s rc=%d gates=%s\n' \
-  "${run_id}" "${commit}" "$(timestamp)" "${overall_rc}" "${summary}"
+  "${run_id}" "${commit}" "$(timestamp)" "${overall_rc}" "${summary}" \
+  >>"${log}"
 printf 'run_id=%s\ncommit=%s\nrc=%d\ngates=%s\n' \
   "${run_id}" "${commit}" "${overall_rc}" "${summary}" >"${result_pending}"
 /usr/bin/chmod 0600 -- "${result_pending}"
