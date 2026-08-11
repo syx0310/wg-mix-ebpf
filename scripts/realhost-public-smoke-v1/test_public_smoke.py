@@ -130,6 +130,7 @@ class PublicSmokeTest(unittest.TestCase):
             ownership_token="5" * 32,
             binary="/bin/echo",
             binary_sha256="6" * 64,
+            operation="recover",
             role="b82",
             tcx_ingress_link_id=5,
             tcx_ingress_program_id=444,
@@ -137,9 +138,11 @@ class PublicSmokeTest(unittest.TestCase):
             tcx_egress_program_id=448,
         )
         digest = "7" * 64
-        argv = self.recovery.recover_argv(
+        argv = self.recovery.execute_argv(
             args, digest, {"recovery": HERE / "recover-classic-journal.py"}
         )
+        self.assertEqual("recover", argv[2])
+        self.assertEqual("recover", argv[argv.index("--operation") + 1])
         self.assertEqual(1, argv.count(digest))
         self.assertNotIn(args.ownership_token, argv)
         self.assertEqual("<redacted>", argv[argv.index("--ownership-token") + 1])
@@ -153,6 +156,8 @@ class PublicSmokeTest(unittest.TestCase):
         common = [
             "recover-classic-journal.py",
             "plan",
+            "--operation",
+            "recover",
             "--recovery-id",
             "0123456789ab",
             "--old-run-id",
@@ -265,6 +270,142 @@ class PublicSmokeTest(unittest.TestCase):
                     args, {"transport": HERE / "transport.exp"}
                 )
             self.assertEqual(["precheck", "detach", "postcheck", "remove"], events)
+
+    def test_staged_cleanup_validates_both_claims_before_exact_removal(self) -> None:
+        args = SimpleNamespace(
+            contract_sha256="contract",
+            role="b82",
+            old_run_id="0123456789abcdef",
+            old_commit="1" * 40,
+            new_commit="2" * 40,
+            ownership_token="5" * 32,
+            recovery_id="0123456789ab",
+        )
+        events: list[str] = []
+
+        def intake(*_args: object) -> None:
+            events.append("intake-claim")
+
+        def root(*_args: object) -> None:
+            events.append("root-claim")
+
+        def remove(*_args: object) -> None:
+            events.append("remove")
+
+        with mock.patch.multiple(
+            self.recovery,
+            contract=mock.Mock(return_value={}),
+            contract_sha256=mock.Mock(return_value="contract"),
+            Remote=mock.Mock(return_value=object()),
+            old_artifacts=mock.Mock(return_value={}),
+            verify_intake_claim=mock.Mock(side_effect=intake),
+            verify_root_claim=mock.Mock(side_effect=root),
+            remove_recovery_binary=mock.Mock(side_effect=remove),
+        ), mock.patch("builtins.print"):
+            self.recovery.execute_cleanup_staged(
+                args, {"transport": HERE / "transport.exp"}
+            )
+        self.assertEqual(["intake-claim", "root-claim", "remove"], events)
+
+    def test_recovery_binary_removal_preflights_and_retries_each_copy(self) -> None:
+        args = SimpleNamespace(
+            binary="/bin/echo",
+            binary_sha256="6" * 64,
+            old_run_id="0123456789abcdef",
+            recovery_id="0123456789ab",
+            role="b82",
+        )
+        intake, root, intake_binary, root_binary = self.recovery.recovery_names(args)
+
+        class Remote:
+            def __init__(self, present: set[str], interrupt_root: bool = False) -> None:
+                self.present = present
+                self.interrupt_root = interrupt_root
+                self.events: list[str] = []
+
+            def ssh(self, *argv: str) -> str:
+                path = argv[-1]
+                self.events.append(f"unlink:{path}")
+                self.present.remove(path)
+                if path == root_binary and self.interrupt_root:
+                    self.interrupt_root = False
+                    raise ConnectionError("simulated post-unlink disconnect")
+                return ""
+
+        def run_case(initial: set[str], interrupt_root: bool = False) -> list[str]:
+            remote = Remote(set(initial), interrupt_root)
+
+            def present(
+                _remote: object, parent: str, name: str, *, privileged: bool
+            ) -> bool:
+                del privileged
+                return f"{parent}/{name}" in remote.present
+
+            def exact(
+                _remote: object,
+                path: str,
+                _digest: str,
+                _size: int,
+                *,
+                root_owned: bool,
+                expected_owner: tuple[str, str] | None = None,
+            ) -> None:
+                if path not in remote.present:
+                    raise AssertionError(f"preflight missing {path}")
+                if root_owned:
+                    self.assertIsNone(expected_owner)
+                else:
+                    self.assertEqual(("1000", "1000"), expected_owner)
+                remote.events.append(f"preflight:{path}")
+
+            patches = mock.patch.multiple(
+                self.recovery,
+                named_entry=mock.Mock(side_effect=present),
+                exact_file=mock.Mock(side_effect=exact),
+                intake_owner=mock.Mock(return_value=("1000", "1000")),
+            )
+            with patches:
+                if interrupt_root:
+                    with self.assertRaises(ConnectionError):
+                        self.recovery.remove_recovery_binary(
+                            remote, args, intake_binary, root_binary
+                        )
+                self.recovery.remove_recovery_binary(
+                    remote, args, intake_binary, root_binary
+                )
+                self.recovery.remove_recovery_binary(
+                    remote, args, intake_binary, root_binary
+                )
+            self.assertEqual(set(), remote.present)
+            return remote.events
+
+        both_events = run_case({root_binary, intake_binary}, interrupt_root=True)
+        self.assertLess(
+            both_events.index(f"preflight:{intake_binary}"),
+            both_events.index(f"unlink:{root_binary}"),
+        )
+        self.assertIn(f"unlink:{intake_binary}", both_events)
+        self.assertEqual([f"preflight:{root_binary}", f"unlink:{root_binary}"], run_case({root_binary}))
+        self.assertEqual([f"preflight:{intake_binary}", f"unlink:{intake_binary}"], run_case({intake_binary}))
+        self.assertEqual([], run_case(set()))
+
+    def test_intake_recovery_binary_owner_must_match_claimed_directory(self) -> None:
+        class Remote:
+            def ssh(self, *argv: str) -> str:
+                if argv[-3:-1] == ("-c", "%u:%g:%a:%h:%s:%F"):
+                    return "1001:1001:700:1:5:regular file"
+                raise AssertionError(argv)
+
+        with self.assertRaises(SystemExit) as caught:
+            self.recovery.exact_file(
+                Remote(),
+                "/tmp/intake/recovery",
+                "6" * 64,
+                5,
+                root_owned=False,
+                expected_owner=("1000", "1000"),
+            )
+        self.assertEqual(79, caught.exception.code)
 
     def test_canonical_resource_names_and_bounds(self) -> None:
         self.assertEqual(

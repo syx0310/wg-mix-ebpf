@@ -141,8 +141,32 @@ def contract(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]
             f"egress-link{args.tcx_egress_link_id}-program{args.tcx_egress_program_id}"
         )
     )
+    owned_recovery = [
+        pin_path,
+        backend_resource,
+        "/var/lib/wg-mix-ebpf/pin-owners/instances.v2.json",
+        "/var/lib/wg-mix-ebpf/pin-owners/<owned-resource-files>",
+        "/run/wg-mix-ebpf/pin-locks/<owned-resource-key>.lock",
+    ]
+    shared_lifecycle_and_lock = [
+        "/run/.wg-mix-ebpf-daemon.lease.maintenance",
+        "/run/wg-mix-ebpf/daemon.lease",
+        f"{root}/runtime/lock",
+    ]
+    preserved = [
+        root,
+        intake,
+        f"wireguard:{role['wg']}",
+        f"qdisc:{role['interface']}:clsact",
+        "firewall",
+        "offload",
+        "mtu",
+        f"{root}/state/attach-state.json",
+        f"absent:{recovery_state_dir(args)}",
+    ]
     return {
         "schema": "wg-mix-public-owned-journal-recovery-v1",
+        "operation": args.operation,
         "recovery_id": args.recovery_id,
         "old_run_id": args.old_run_id,
         "old_commit": args.old_commit,
@@ -166,7 +190,7 @@ def contract(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]
         "old_claim_size": len(claim),
         "expected_tcx_links": (
             []
-            if args.role == "public"
+            if args.role == "public" or args.operation == "cleanup-staged"
             else [
                 {
                     "direction": "ingress",
@@ -180,33 +204,20 @@ def contract(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]
                 },
             ]
         ),
-        "detach_argv": detach_argv(args),
-        "write_set": {
-            "temporary": [intake_binary, root_binary],
-            "owned_recovery": [
-                pin_path,
-                backend_resource,
-                "/var/lib/wg-mix-ebpf/pin-owners/instances.v2.json",
-                "/var/lib/wg-mix-ebpf/pin-owners/<owned-resource-files>",
-                "/run/wg-mix-ebpf/pin-locks/<owned-resource-key>.lock",
-            ],
-            "shared_lifecycle_and_lock": [
-                "/run/.wg-mix-ebpf-daemon.lease.maintenance",
-                "/run/wg-mix-ebpf/daemon.lease",
-                f"{root}/runtime/lock",
-            ],
-            "preserved": [
-                root,
-                intake,
-                f"wireguard:{role['wg']}",
-                f"qdisc:{role['interface']}:clsact",
-                "firewall",
-                "offload",
-                "mtu",
-                f"{root}/state/attach-state.json",
-                f"absent:{recovery_state_dir(args)}",
-            ],
-        },
+        "detach_argv": detach_argv(args) if args.operation == "recover" else [],
+        "write_set": (
+            {
+                "temporary": [intake_binary, root_binary],
+                "owned_recovery": owned_recovery,
+                "shared_lifecycle_and_lock": shared_lifecycle_and_lock,
+                "preserved": preserved,
+            }
+            if args.operation == "recover"
+            else {
+                "removed": [intake_binary, root_binary],
+                "preserved": [*preserved, *owned_recovery, *shared_lifecycle_and_lock],
+            }
+        ),
     }
 
 
@@ -215,13 +226,15 @@ def contract_sha256(value: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def recover_argv(
+def execute_argv(
     args: argparse.Namespace, digest: str, paths: dict[str, Path]
 ) -> list[str]:
     return [
         "/usr/bin/python3",
         str(paths["recovery"]),
-        "recover",
+        args.operation,
+        "--operation",
+        args.operation,
         "--recovery-id",
         args.recovery_id,
         "--old-run-id",
@@ -262,6 +275,7 @@ def exact_file(
     size: int,
     *,
     root_owned: bool,
+    expected_owner: tuple[str, str] | None = None,
 ) -> None:
     prefix = (
         ("/usr/bin/sudo", "-S", "-p", "PUBLIC_SUDO_PASSWORD:") if root_owned else ()
@@ -272,11 +286,20 @@ def exact_file(
         len(parts) != 6
         or parts[2:] != ["700", "1", str(size), "regular file"]
         or (root_owned and parts[:2] != ["0", "0"])
+        or (not root_owned and (expected_owner is None or parts[:2] != list(expected_owner)))
     ):
         stop(f"recovery-file-shape:{'root' if root_owned else 'intake'}", 79)
     observed = remote.ssh(*prefix, "/usr/bin/sha256sum", "--", path)
     if observed != f"{digest}  {path}":
         stop(f"recovery-file-sha256:{'root' if root_owned else 'intake'}", 79)
+
+
+def intake_owner(remote: Remote, intake: str) -> tuple[str, str]:
+    shape = remote.ssh("/usr/bin/stat", "-c", "%u:%g:%a:%F", intake)
+    parts = shape.split(":")
+    if len(parts) != 4 or parts[2:] != ["700", "directory"]:
+        stop("recovery-intake-shape", 79)
+    return parts[0], parts[1]
 
 
 def named_entry(remote: Remote, parent: str, name: str, *, privileged: bool) -> bool:
@@ -428,6 +451,7 @@ def stage_recovery_binary(
     verify_intake_claim(remote, old_claim_args(args), artifacts)
     verify_root_claim(remote, old_claim_args(args), artifacts)
     intake, root, intake_binary, root_binary = recovery_names(args)
+    expected_intake_owner = intake_owner(remote, intake)
     name = intake_binary.rsplit("/", 1)[1]
     binary = Path(args.binary).resolve(strict=True)
     size = binary.stat().st_size
@@ -448,11 +472,25 @@ def stage_recovery_binary(
     if name in intake_entries:
         if intake_entries[name] != "f":
             stop("recovery-intake-entry", 79)
-        exact_file(remote, intake_binary, args.binary_sha256, size, root_owned=False)
+        exact_file(
+            remote,
+            intake_binary,
+            args.binary_sha256,
+            size,
+            root_owned=False,
+            expected_owner=expected_intake_owner,
+        )
     else:
         remote.scp(binary, intake_binary)
         remote.ssh("/usr/bin/chmod", "0700", "--", intake_binary)
-        exact_file(remote, intake_binary, args.binary_sha256, size, root_owned=False)
+        exact_file(
+            remote,
+            intake_binary,
+            args.binary_sha256,
+            size,
+            root_owned=False,
+            expected_owner=expected_intake_owner,
+        )
 
     root_entries = remote_directory_entries(remote, root, privileged=True)
     if name in root_entries:
@@ -484,20 +522,34 @@ def remove_recovery_binary(
     root_binary: str,
 ) -> None:
     size = Path(args.binary).resolve(strict=True).stat().st_size
-    exact_file(remote, root_binary, args.binary_sha256, size, root_owned=True)
-    remote.ssh(
-        "/usr/bin/sudo",
-        "-S",
-        "-p",
-        "PUBLIC_SUDO_PASSWORD:",
-        "/usr/bin/unlink",
-        "--",
-        root_binary,
-    )
-    exact_file(remote, intake_binary, args.binary_sha256, size, root_owned=False)
-    remote.ssh("/usr/bin/unlink", "--", intake_binary)
     intake, root, _, _ = recovery_names(args)
     name = intake_binary.rsplit("/", 1)[1]
+    expected_intake_owner = intake_owner(remote, intake)
+    root_present = named_entry(remote, root, name, privileged=True)
+    intake_present = named_entry(remote, intake, name, privileged=False)
+    if root_present:
+        exact_file(remote, root_binary, args.binary_sha256, size, root_owned=True)
+    if intake_present:
+        exact_file(
+            remote,
+            intake_binary,
+            args.binary_sha256,
+            size,
+            root_owned=False,
+            expected_owner=expected_intake_owner,
+        )
+    if root_present:
+        remote.ssh(
+            "/usr/bin/sudo",
+            "-S",
+            "-p",
+            "PUBLIC_SUDO_PASSWORD:",
+            "/usr/bin/unlink",
+            "--",
+            root_binary,
+        )
+    if intake_present:
+        remote.ssh("/usr/bin/unlink", "--", intake_binary)
     if named_entry(remote, root, name, privileged=True) or named_entry(
         remote, intake, name, privileged=False
     ):
@@ -533,9 +585,30 @@ def execute_recovery(args: argparse.Namespace, paths: dict[str, Path]) -> None:
     )
 
 
+def execute_cleanup_staged(
+    args: argparse.Namespace, paths: dict[str, Path]
+) -> None:
+    value = contract(args, paths)
+    digest = contract_sha256(value)
+    if args.contract_sha256 != digest:
+        stop("contract-sha256", 66)
+    remote = Remote(paths["transport"], args.role)
+    artifacts = old_artifacts(args, paths)
+    verify_intake_claim(remote, old_claim_args(args), artifacts)
+    verify_root_claim(remote, old_claim_args(args), artifacts)
+    _, _, intake_binary, root_binary = recovery_names(args)
+    remove_recovery_binary(remote, args, intake_binary, root_binary)
+    print(
+        "PUBLIC_RECOVERY_FILES_REMOVED "
+        f"old_run_id={args.old_run_id} recovery_id={args.recovery_id} "
+        f"role={args.role} owner_journal=preserved pin=preserved result=PASS"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("mode", choices=("plan", "recover"))
+    parser.add_argument("mode", choices=("plan", "recover", "cleanup-staged"))
+    parser.add_argument("--operation", choices=("recover", "cleanup-staged"), required=True)
     parser.add_argument("--recovery-id", required=True)
     parser.add_argument("--old-run-id", required=True)
     parser.add_argument("--old-commit", required=True)
@@ -572,7 +645,9 @@ def parse_args() -> argparse.Namespace:
             and not SHA256_RE.fullmatch(args.contract_sha256)
         )
         or (args.mode == "recover" and args.contract_sha256 is None)
+        or (args.mode == "cleanup-staged" and args.contract_sha256 is None)
         or (args.mode == "plan" and args.contract_sha256 is not None)
+        or (args.mode != "plan" and args.mode != args.operation)
         or (args.role == "public" and tcx_values != (0, 0, 0, 0))
         or (
             args.role == "b82"
@@ -597,7 +672,7 @@ def main() -> None:
             json.dumps(
                 {
                     "contract_sha256": digest,
-                    "recover_argv": recover_argv(args, digest, paths),
+                    "execute_argv": execute_argv(args, digest, paths),
                     "ownership_token_redacted": 1,
                     "remote_writes": 0,
                     "credential_read": 0,
@@ -607,7 +682,10 @@ def main() -> None:
             )
         )
         return
-    execute_recovery(args, paths)
+    if args.mode == "recover":
+        execute_recovery(args, paths)
+    else:
+        execute_cleanup_staged(args, paths)
 
 
 if __name__ == "__main__":
