@@ -368,6 +368,7 @@ func validateOwnerDirectoryEntries(
 	}
 
 	canonical := make(map[string]struct{}, len(pinnedMapDescriptors()))
+	mapStageNames := make(map[string]struct{}, len(record.MapStages))
 	linkNames := make(map[string]struct{}, len(record.ActiveLinks)+len(record.DesiredLinks))
 	allowed := make(map[string]struct{}, len(entries))
 	for _, descriptor := range pinnedMapDescriptors() {
@@ -381,6 +382,7 @@ func validateOwnerDirectoryEntries(
 		}
 	}
 	for _, stage := range record.MapStages {
+		mapStageNames[stage.FileName] = struct{}{}
 		allowed[stage.FileName] = struct{}{}
 		for _, name := range ownerMapRetiredNames(record, stage.FileName) {
 			allowed[name] = struct{}{}
@@ -401,6 +403,7 @@ func validateOwnerDirectoryEntries(
 	seen := make(map[string]struct{}, len(entries))
 	seenLinks := make(map[string]struct{}, len(linkNames))
 	canonicalCount := 0
+	mapStageCount := 0
 	for _, entry := range entries {
 		name := entry.Name()
 		if _, duplicate := seen[name]; duplicate {
@@ -415,6 +418,9 @@ func validateOwnerDirectoryEntries(
 		}
 		if _, ok := canonical[name]; ok {
 			canonicalCount++
+		}
+		if _, ok := mapStageNames[name]; ok {
+			mapStageCount++
 		}
 		if _, _, ok := parseExactTCXPinName(name); ok {
 			seenLinks[name] = struct{}{}
@@ -533,10 +539,15 @@ func validateOwnerDirectoryEntries(
 		}
 	case record.Phase == pinOwnerPhaseDetaching &&
 		record.Step == pinOwnerStepMutatingTC:
-		if record.ActiveGeneration != 0 && canonicalCount != wantCanonical {
+		// Once mutating_tc is durable, all exact stage pins are the recovery
+		// authority.  Canonical pins may already be partly or fully gone at a
+		// crash boundary; the recovery path validates every staged map ID before
+		// its first link mutation and removes any surviving canonical pins later.
+		if record.ActiveGeneration != 0 &&
+			(mapStageCount != len(record.MapStages) || len(record.MapStages) != wantCanonical) {
 			return fmt.Errorf(
-				"detaching owner directory has %d canonical maps before unlink, want %d",
-				canonicalCount, wantCanonical,
+				"detaching owner directory has %d map stages during TC mutation, want %d",
+				mapStageCount, wantCanonical,
 			)
 		}
 	case record.Phase == pinOwnerPhaseDetaching &&

@@ -1888,6 +1888,105 @@ func TestRemoveOwnedExactTCXRecoversDetachedPinnedBoundary(t *testing.T) {
 	}
 }
 
+func TestRecoverDetachingExactTCXWithCanonicalMapsAlreadyUnlinked(t *testing.T) {
+	fixture := newExactTCXOwnerTestFixture(t)
+	kernel := newFakeExactTCXKernel()
+	kernel.materializePins = true
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+
+	ingressOwner, _ := stageTestExactTCXAtPath(
+		t, kernel, testExactTCXBinding(24, exactTCXIngress, 711),
+		journal, fixture.handle.procPath(),
+	)
+	egressOwner, _ := stageTestExactTCXAtPath(
+		t, kernel, testExactTCXBinding(24, exactTCXEgress, 712),
+		journal, fixture.handle.procPath(),
+	)
+	activeLinks := []exactTCXBinding{ingressOwner.binding, egressOwner.binding}
+	if err := ingressOwner.Release(); err != nil {
+		t.Fatal(err)
+	}
+	if err := egressOwner.Release(); err != nil {
+		t.Fatal(err)
+	}
+	active, err := newActivePinOwnerRecord(
+		fixture.parent,
+		fixture.token,
+		"12345678-1234-1234-1234-123456789abc",
+		fixture.now,
+		7,
+		fixture.maps,
+		activeLinks,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := fixture.store.Persist(active, nil, fixture.handle.mountID); err != nil {
+		t.Fatal(err)
+	}
+	detaching, err := newDetachingPinOwnerRecord(active, fixture.now.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	observeOwnerMount(detaching, fixture.handle.mountID)
+	if err := fixture.store.Persist(detaching, active, fixture.handle.mountID); err != nil {
+		t.Fatal(err)
+	}
+	pins, err := inspectPinnedMapSet(fixture.handle, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := stageOwnerMaps(fixture.handle, detaching, pins); err != nil {
+		_ = closePinnedMapPins(pins)
+		t.Fatal(err)
+	}
+	if err := closePinnedMapPins(pins); err != nil {
+		t.Fatal(err)
+	}
+	mutating := advancePinOwnerRecord(
+		detaching,
+		fixture.now.Add(2*time.Second),
+		pinOwnerPhaseDetaching,
+		pinOwnerStepMutatingTC,
+	)
+	observeOwnerMount(mutating, fixture.handle.mountID)
+	if err := fixture.store.Persist(mutating, detaching, fixture.handle.mountID); err != nil {
+		t.Fatal(err)
+	}
+	stages, err := loadOwnerMapStages(fixture.handle, mutating)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := removeCanonicalOwnerMaps(fixture.handle, mutating, stages); err != nil {
+		_ = stages.Close()
+		t.Fatal(err)
+	}
+	if err := stages.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateOwnerDirectoryEntries(fixture.handle, mutating); err != nil {
+		t.Fatalf("canonical-unlinked detaching directory: %v", err)
+	}
+
+	recovered, err := recoverExactPinOwnerTransaction(
+		t.Context(), fixture.handle, fixture.store, mutating, kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered == nil || !recovered.directoryRemoved {
+		t.Fatalf("recovery result = %+v", recovered)
+	}
+	if _, err := os.Lstat(fixture.handle.pinPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("recovered detach retained pin directory: %v", err)
+	}
+	for _, binding := range activeLinks {
+		if kernel.links[binding.LinkID].attached {
+			t.Fatalf("recovered detach retained link %d", binding.LinkID)
+		}
+	}
+}
+
 func TestReconcileDetachedActiveExactTCXPersistsTruthWithForeignSlotReuse(t *testing.T) {
 	fixture := newExactTCXOwnerTestFixture(t)
 	kernel := newFakeExactTCXKernel()

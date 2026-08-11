@@ -992,6 +992,16 @@ func recoverExactDetachingPinOwnerTransaction(
 		return recoverExactPinOwnerTransaction(ctx, handle, store, mutating, runtime)
 
 	case pinOwnerStepMutatingTC:
+		// Validate the complete staged map authority before the first link
+		// mutation.  This also makes a crash after partial/complete canonical-map
+		// unlink recoverable without trusting directory names alone.
+		mapStages, err := loadOwnerMapStages(handle, record)
+		if err != nil {
+			return nil, err
+		}
+		if err := mapStages.Close(); err != nil {
+			return nil, err
+		}
 		if err := removeAllOwnerExactTCXLinks(handle, record.ActiveLinks, runtime); err != nil {
 			return nil, err
 		}
