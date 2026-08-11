@@ -15,7 +15,10 @@ const (
 	fakeTCPCapabilityManagedIngressParser
 	fakeTCPCapabilitySingleWriterState
 	fakeTCPCapabilityHalfOpenProtection
-	fakeTCPCapabilityAdmissionCheckpoint
+	// This capability is packet-local: the proof is single-use and binds the
+	// packet to one established session lifetime. It promises no durable SYN
+	// state and no reload recovery.
+	fakeTCPCapabilitySingleUsePacketAdmissionProof
 	fakeTCPCapabilityBPFControlAdmission
 	fakeTCPCapabilityValidatedCloseControl
 	fakeTCPCapabilityL3Parser
@@ -35,7 +38,7 @@ const fakeTCPRequiredCapabilities = fakeTCPCapabilityBaselineIsolation |
 	fakeTCPCapabilityManagedIngressParser |
 	fakeTCPCapabilitySingleWriterState |
 	fakeTCPCapabilityHalfOpenProtection |
-	fakeTCPCapabilityAdmissionCheckpoint |
+	fakeTCPCapabilitySingleUsePacketAdmissionProof |
 	fakeTCPCapabilityBPFControlAdmission |
 	fakeTCPCapabilityValidatedCloseControl |
 	fakeTCPCapabilityL3Parser |
@@ -65,8 +68,8 @@ var fakeTCPRequirements = []struct {
 	{fakeTCPCapabilityBaselineIsolation, "baseline/experimental BPF object isolation"},
 	{fakeTCPCapabilityManagedIngressParser, "managed-port IPv4/IPv6 fail-closed parser"},
 	{fakeTCPCapabilitySingleWriterState, "single-writer established session state"},
-	{fakeTCPCapabilityHalfOpenProtection, "bounded and rate-limited userspace half-open state"},
-	{fakeTCPCapabilityAdmissionCheckpoint, "persistent/reload-safe SYN admission checkpoint backend"},
+	{fakeTCPCapabilityHalfOpenProtection, "bounded and rate-limited userspace half-open quota with zero-credit restart"},
+	{fakeTCPCapabilitySingleUsePacketAdmissionProof, "single-use packet admission proof with stable-lifetime binding"},
 	{fakeTCPCapabilityBPFControlAdmission, "BPF control-event admission/coalescing under SYN flood"},
 	{fakeTCPCapabilityValidatedCloseControl, "RST/FIN full IPv4/TCP checksum and receive-window validation"},
 	{fakeTCPCapabilityL3Parser, "parser:l3 FakeTCP policy and attachment support"},

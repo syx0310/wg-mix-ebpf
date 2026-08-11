@@ -6,6 +6,7 @@ package faketcp
 
 import (
 	"container/list"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"sync"
@@ -59,8 +60,20 @@ type Options struct {
 type SessionStore interface {
 	InsertEstablished(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) error
 	LookupEstablished(abi.FakeTCPSessionKey) (abi.FakeTCPSessionValue, bool, error)
-	DeleteEstablishedIfUnchanged(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) (bool, error)
+	DeleteEstablishedIfUnchanged(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) (SessionDeleteResult, error)
 }
+
+// SessionDeleteResult distinguishes a completed exact removal from the only
+// two harmless compare misses. Absent is completion when retrying an uncertain
+// exact delete: production has one userspace owner, BPF cannot insert, and a
+// fresh runtime receives a fresh map identity and incarnation.
+type SessionDeleteResult uint8
+
+const (
+	SessionDeleteDifferent SessionDeleteResult = iota
+	SessionDeleteAbsent
+	SessionDeleteRemoved
+)
 
 type Segment struct {
 	Flags           uint8
@@ -100,12 +113,58 @@ type Action struct {
 // FWMark on Flow.UnderlayIndex so it traverses the ordinary
 // type-word/XOR/FakeTCP egress pipeline exactly once. CaptureID, not
 // CaptureNanos, is the once-only identity; the timestamp is diagnostic.
+// CaptureFingerprint is the SHA-256 digest of the exact event sample before
+// Controller materializes packet checksums. Captured packets must carry the
+// non-zero digest unchanged into every durable action checkpoint; it cannot be
+// reconstructed from Data after checksum materialization.
 type PendingPacket struct {
-	Data         []byte
-	FWMark       uint32
-	WGID         uint32
-	CaptureNanos uint64
-	CaptureID    CaptureIdentity
+	Data               []byte
+	FWMark             uint32
+	WGID               uint32
+	CaptureNanos       uint64
+	CaptureID          CaptureIdentity
+	CaptureFingerprint [32]byte
+	dataOwned          bool
+}
+
+// capturedPacketBinding is the complete immutable value associated with one
+// CaptureID. It stays comparable so both durable checkpoint validation and the
+// in-process reinjection ledger use the same conflict definition.
+type capturedPacketBinding struct {
+	flow               abi.FakeTCPSessionKey
+	fwmark             uint32
+	wgID               uint32
+	captureNanos       uint64
+	captureFingerprint [32]byte
+	dataFingerprint    [32]byte
+}
+
+func bindCapturedPacket(flow abi.FakeTCPSessionKey, packet PendingPacket) capturedPacketBinding {
+	return capturedPacketBinding{
+		flow:               flow,
+		fwmark:             packet.FWMark,
+		wgID:               packet.WGID,
+		captureNanos:       packet.CaptureNanos,
+		captureFingerprint: packet.CaptureFingerprint,
+		dataFingerprint:    sha256.Sum256(packet.Data),
+	}
+}
+
+func observeCapturedPacket(
+	bindings map[CaptureIdentity]capturedPacketBinding,
+	flow abi.FakeTCPSessionKey,
+	packet PendingPacket,
+) (bool, error) {
+	binding := bindCapturedPacket(flow, packet)
+	previous, found := bindings[packet.CaptureID]
+	if !found {
+		bindings[packet.CaptureID] = binding
+		return false, nil
+	}
+	if previous != binding {
+		return false, ErrCaptureIdentityConflict
+	}
+	return true, nil
 }
 
 type SessionSnapshot struct {
@@ -113,6 +172,7 @@ type SessionSnapshot struct {
 	TXSequence     uint32
 	RXSequence     uint32
 	LastSeenNanos  uint64
+	PendingDelete  bool
 	PendingPackets int
 	PendingBytes   int
 	LastActivity   time.Time
@@ -133,6 +193,13 @@ type session struct {
 	pendingBytes  int
 	halfOpenHeld  bool
 	synSource     synSourceKey
+	sessionID     uint64
+	pendingDelete *pendingSessionDelete
+}
+
+type pendingSessionDelete struct {
+	expected abi.FakeTCPSessionValue
+	reason   string
 }
 
 type synSourceKey struct {
@@ -153,22 +220,34 @@ type tokenBucket struct {
 	initialized bool
 }
 
+// engineInstanceToken identifies the mutable state allocated by one Engine
+// construction. It is deliberately non-zero-sized so distinct allocations
+// have distinct addresses; copying an Engine value preserves the pointer.
+type engineInstanceToken struct {
+	marker byte
+}
+
 type Engine struct {
 	mu       sync.Mutex
 	opts     Options
 	identity RuntimeIdentity
+	domain   *runtimeDomainState
+	instance *engineInstanceToken
 	// One RuntimeIdentity may seed exactly one kernel collection. Reusing the
-	// Engine with fresh maps would restart every per-CPU capture sequence and
-	// collide with identities emitted by its first collection.
+	// domain with fresh maps would restart every per-CPU capture sequence and
+	// collide with identities emitted by its first collection. Every Engine in
+	// one RuntimeDomain therefore shares this capability.
 	runtimeIdentityCommit *runtimeIdentityCommitState
+	sessionIDs            *sessionIDAllocator
 	sessions              map[abi.FakeTCPSessionKey]*session
 	pendingFlows          int
 	pendingBytes          int
 	halfOpen              int
 	globalSYNs            tokenBucket
-	// admissionEpoch is local to one Engine lifetime. New engines begin with
-	// zero tokens at this epoch; recreation can only discard accumulated
-	// budget and can never mint a fresh burst.
+	// admissionEpoch is local to one Engine quota-owner lifetime. New engines
+	// begin with zero tokens at this epoch; recreation can only discard
+	// accumulated budget and can never mint a fresh burst. Production runtime
+	// supervision fences owner lifetimes so two such quotas cannot overlap.
 	admissionEpoch time.Time
 	synSources     map[synSourceKey]*synSourceState
 	synSourceLRU   *list.List
@@ -187,6 +266,21 @@ type engineCheckpoint struct {
 func New(options Options) (*Engine, error) {
 	if options.Generation == 0 {
 		return nil, errors.New("faketcp generation must be non-zero")
+	}
+	domain, err := NewRuntimeDomain(options.Generation)
+	if err != nil {
+		return nil, err
+	}
+	return domain.NewEngine(options)
+}
+
+func newEngine(options Options, domain *runtimeDomainState) (*Engine, error) {
+	if options.Generation == 0 {
+		return nil, errors.New("faketcp generation must be non-zero")
+	}
+	if domain == nil || domain.identity.Generation != options.Generation ||
+		domain.runtimeIdentityCommit == nil || domain.sessionIDs == nil {
+		return nil, errors.New("faketcp Engine options do not match a complete runtime domain")
 	}
 	if options.SessionCapacity <= 0 || options.MaxPendingFlows <= 0 ||
 		options.MaxPendingFlows > options.SessionCapacity ||
@@ -223,15 +317,14 @@ func New(options Options) (*Engine, error) {
 	if options.Window == 0 {
 		options.Window = 65535
 	}
-	incarnation, err := newRuntimeIncarnation()
-	if err != nil {
-		return nil, err
-	}
 	admissionEpoch := options.Now()
 	return &Engine{
 		opts:                  options,
-		identity:              RuntimeIdentity{Generation: options.Generation, Incarnation: incarnation},
-		runtimeIdentityCommit: &runtimeIdentityCommitState{},
+		identity:              domain.identity,
+		domain:                domain,
+		instance:              &engineInstanceToken{},
+		runtimeIdentityCommit: domain.runtimeIdentityCommit,
+		sessionIDs:            domain.sessionIDs,
 		sessions:              make(map[abi.FakeTCPSessionKey]*session),
 		globalSYNs:            tokenBucket{lastRefill: admissionEpoch, initialized: true},
 		admissionEpoch:        admissionEpoch,
@@ -263,12 +356,20 @@ func (e *Engine) HandlePacketEvent(event abi.FakeTCPPacketEvent) ([]Action, erro
 	if length <= 0 || length > len(event.Packet) {
 		return nil, fmt.Errorf("faketcp captured packet length %d is invalid", length)
 	}
-	return e.handleCapturedPacket(event.Event, event.Packet[:length])
+	// The fixed ABI value is caller-owned test input, unlike the production
+	// ring sample. Copy only its declared packet before transferring ownership.
+	packet := append([]byte(nil), event.Packet[:length]...)
+	return e.handleOwnedCapturedPacket(event.Event, packet, sha256.Sum256(packet))
 }
 
-// handleCapturedPacket avoids materializing the fixed maximum-size ABI record
-// when a ring-buffer reader already owns the compact packet sample.
-func (e *Engine) handleCapturedPacket(event abi.FakeTCPEvent, packet []byte) ([]Action, error) {
+// handleOwnedCapturedPacket accepts an owned packet view from the production
+// decoder. CaptureFingerprint was computed over the exact original sample
+// before Controller materialized its checksums.
+func (e *Engine) handleOwnedCapturedPacket(
+	event abi.FakeTCPEvent,
+	packet []byte,
+	fingerprint [sha256.Size]byte,
+) ([]Action, error) {
 	if event.Type != abi.FakeTCPEventNeedHandshake {
 		return nil, fmt.Errorf("faketcp packet event type %d is not NEED_HANDSHAKE", event.Type)
 	}
@@ -292,11 +393,13 @@ func (e *Engine) handleCapturedPacket(event abi.FakeTCPEvent, packet []byte) ([]
 		return nil, err
 	}
 	return e.outbound(event.Key, PendingPacket{
-		Data:         packet,
-		FWMark:       event.FWMark,
-		WGID:         event.WGID,
-		CaptureNanos: event.TimestampNanos,
-		CaptureID:    captureID,
+		Data:               packet,
+		FWMark:             event.FWMark,
+		WGID:               event.WGID,
+		CaptureNanos:       event.TimestampNanos,
+		CaptureID:          captureID,
+		CaptureFingerprint: fingerprint,
+		dataOwned:          true,
 	}, true)
 }
 
@@ -306,9 +409,16 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 	if err := e.validateFlow(flow); err != nil {
 		return nil, err
 	}
-	now := e.opts.Now()
 	s := e.sessions[flow]
 	if s != nil && s.state == abi.FakeTCPStateEstablished {
+		if s.pendingDelete != nil {
+			action, err := e.retryPendingDelete(flow, s)
+			// ActionClose authorizes neither forwarding nor reinjection. A
+			// captured packet therefore remains BPF-dropped, while a direct
+			// outbound packet is likewise terminal for this Engine turn.
+			return []Action{action}, err
+		}
+		now := e.opts.Now()
 		if packet.WGID != 0 && s.wgID != 0 && packet.WGID != s.wgID {
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
 		}
@@ -325,12 +435,14 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 		}
 		s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
 		if alreadyDropped {
-			copyPacket := packet
-			copyPacket.Data = append([]byte(nil), packet.Data...)
-			return []Action{{Kind: ActionReleasePending, Flow: flow, Packets: []PendingPacket{copyPacket}}}, nil
+			return []Action{{
+				Kind: ActionReleasePending, Flow: flow, WGID: s.wgID,
+				Packets: []PendingPacket{ownPendingPacket(packet)},
+			}}, nil
 		}
 		return []Action{{Kind: ActionForward, Flow: flow}}, nil
 	}
+	now := e.opts.Now()
 	created := false
 	if s == nil {
 		if len(e.sessions) >= e.opts.SessionCapacity {
@@ -371,24 +483,80 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 }
 
 func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, error) {
-	return e.inbound(flow, seg, 0, nil)
+	return e.inbound(flow, seg, 0)
 }
 
 // InboundWithWGID preserves the listener identity carried by the BPF event so
 // retries and replies are sent through the same configured WireGuard path.
 func (e *Engine) InboundWithWGID(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) ([]Action, error) {
-	return e.inbound(flow, seg, wgID, nil)
+	return e.inbound(flow, seg, wgID)
 }
 
-// InboundValidatedControl is the only path that may remove an established
-// session in response to peer RST/FIN. The opaque value can only be produced
-// by ValidateIPv4TCPControl from the complete packet and the exact BPF-owned
-// session snapshot used for its sequence/window checks.
-func (e *Engine) InboundValidatedControl(control ValidatedControl, wgID uint32) ([]Action, error) {
-	return e.inbound(control.flow, control.segment, wgID, &control)
+// InboundCapturedControl is the production close-control boundary. It binds a
+// packet-bearing BPF event to this Engine incarnation, re-reads the current
+// established value, validates the complete packet independently of BPF, and
+// only then requests an atomic compare-delete. Malformed peer input is an
+// ordinary fail-closed drop rather than a runtime-fatal error.
+func (e *Engine) InboundCapturedControl(event abi.FakeTCPEvent, packet []byte) ([]Action, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	flow := event.Key
+	if err := e.validateFlow(flow); err != nil {
+		return nil, err
+	}
+	identity := runtimeIdentityFromEvent(event)
+	if identity != e.identity || event.EventABIVersion != abi.FakeTCPEventABIVersion {
+		return nil, errors.New("faketcp close event does not match the active runtime identity")
+	}
+	if event.Type != abi.FakeTCPEventRST && event.Type != abi.FakeTCPEventFIN {
+		return nil, errors.New("faketcp captured control event is not RST or FIN")
+	}
+	if event.PacketLength != uint16(len(packet)) || len(packet) != controlPacketLength ||
+		event.PayloadLength != 0 || event.CaptureSequence != 0 || event.CaptureCPU != 0 ||
+		event.FWMark != 0 {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "invalid-close-envelope"}}, nil
+	}
+
+	s := e.sessions[flow]
+	if s == nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-close"}}, nil
+	}
+	if event.WGID == 0 || s.wgID == 0 || event.WGID != s.wgID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+	}
+	if s.pendingDelete != nil {
+		action, err := e.retryPendingDelete(flow, s)
+		return []Action{action}, err
+	}
+	if s.state != abi.FakeTCPStateEstablished {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
+	}
+	value, found, err := e.lookupEstablished(flow, s)
+	if err != nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+	}
+	if !found {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-missing"}}, nil
+	}
+	if validationErr := validateIPv4TCPControl(packet, event, value); validationErr != nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "invalid-close-control"}}, nil
+	}
+	result, err := e.compareDeleteEstablished(flow, s, pendingSessionDelete{
+		expected: value,
+		reason:   "peer-close",
+	})
+	if err != nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+	}
+	if result == SessionDeleteDifferent {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
+	}
+	e.remove(flow, s)
+	return []Action{{Kind: ActionClose, Flow: flow, Reason: "peer-close"}}, nil
 }
 
-func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32, validated *ValidatedControl) ([]Action, error) {
+func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) ([]Action, error) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if err := e.validateFlow(flow); err != nil {
@@ -397,6 +565,10 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32, v
 	now := e.opts.Now()
 	s := e.sessions[flow]
 	checkpoint := e.checkpoint(s)
+	if s != nil && s.pendingDelete != nil {
+		action, err := e.retryPendingDelete(flow, s)
+		return []Action{action}, err
+	}
 	var synSource synSourceKey
 	if seg.Flags&FlagSYN != 0 {
 		var rejection string
@@ -413,25 +585,7 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32, v
 			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-close"}}, nil
 		}
 		if s.state == abi.FakeTCPStateEstablished {
-			if validated == nil || validated.flow != flow || validated.segment != seg {
-				return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
-			}
-			value, found, err := e.lookupEstablished(flow, s)
-			if err != nil {
-				return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
-			}
-			if found {
-				if value != validated.session {
-					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
-				}
-				deleted, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, validated.session)
-				if err != nil {
-					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
-				}
-				if !deleted {
-					return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
-				}
-			}
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
 		}
 		e.remove(flow, s)
 		return []Action{{Kind: ActionClose, Flow: flow, Reason: "peer-close"}}, nil
@@ -561,6 +715,14 @@ func (e *Engine) Tick() ([]Action, error) {
 			}
 			actions = append(actions, e.control(flow, s, flags, s.localISN, ack, "handshake-retry"))
 		case abi.FakeTCPStateEstablished:
+			if s.pendingDelete != nil {
+				action, err := e.retryPendingDelete(flow, s)
+				if err != nil {
+					errs = append(errs, err)
+				}
+				actions = append(actions, action)
+				continue
+			}
 			value, found, err := e.lookupEstablished(flow, s)
 			if err != nil {
 				errs = append(errs, err)
@@ -575,13 +737,16 @@ func (e *Engine) Tick() ([]Action, error) {
 			idle := nowMonotonic >= value.LastSeenNanos &&
 				nowMonotonic-value.LastSeenNanos >= uint64(e.opts.IdleTimeout)
 			if idle {
-				deleted, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, value)
+				result, err := e.compareDeleteEstablished(flow, s, pendingSessionDelete{
+					expected: value,
+					reason:   "idle-timeout",
+				})
 				if err != nil {
 					errs = append(errs, err)
 					actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"})
 					continue
 				}
-				if !deleted {
+				if result == SessionDeleteDifferent {
 					// BPF advanced the fast state after our lookup. A later tick
 					// re-reads LastSeenNanos; this session is demonstrably active.
 					continue
@@ -627,21 +792,34 @@ func (e *Engine) Snapshot(flow abi.FakeTCPSessionKey) (SessionSnapshot, bool, er
 		return SessionSnapshot{}, false, nil
 	}
 	lastSeenNanos := uint64(0)
+	txSequence, rxSequence := s.txSequence, s.rxSequence
+	pendingDelete := s.pendingDelete != nil
 	if s.state == abi.FakeTCPStateEstablished {
-		value, found, err := e.lookupEstablished(flow, s)
-		if err != nil {
-			return SessionSnapshot{}, true, err
+		if pendingDelete {
+			// Snapshot is observability-only: report the complete cached delete
+			// candidate without looking up its possible kernel tombstone or
+			// creating another retry/delete entry point.
+			value := s.pendingDelete.expected
+			lastSeenNanos = value.LastSeenNanos
+			txSequence, rxSequence = value.TXSequence, value.RXSequence
+		} else {
+			value, found, err := e.lookupEstablished(flow, s)
+			if err != nil {
+				return SessionSnapshot{}, true, err
+			}
+			if !found {
+				return SessionSnapshot{}, false, nil
+			}
+			lastSeenNanos = value.LastSeenNanos
+			txSequence, rxSequence = value.TXSequence, value.RXSequence
 		}
-		if !found {
-			return SessionSnapshot{}, false, nil
-		}
-		lastSeenNanos = value.LastSeenNanos
 	}
 	return SessionSnapshot{
 		State:          s.state,
-		TXSequence:     s.txSequence,
-		RXSequence:     s.rxSequence,
+		TXSequence:     txSequence,
+		RXSequence:     rxSequence,
 		LastSeenNanos:  lastSeenNanos,
+		PendingDelete:  pendingDelete,
 		PendingPackets: len(s.pending),
 		PendingBytes:   s.pendingBytes,
 		LastActivity:   s.lastActivity,
@@ -691,12 +869,19 @@ func (e *Engine) enqueue(s *session, packet PendingPacket) bool {
 		}
 		e.pendingFlows++
 	}
-	copyPacket := packet
-	copyPacket.Data = append([]byte(nil), packet.Data...)
-	s.pending = append(s.pending, copyPacket)
-	s.pendingBytes += len(copyPacket.Data)
-	e.pendingBytes += len(copyPacket.Data)
+	packet = ownPendingPacket(packet)
+	s.pending = append(s.pending, packet)
+	s.pendingBytes += len(packet.Data)
+	e.pendingBytes += len(packet.Data)
 	return true
+}
+
+func ownPendingPacket(packet PendingPacket) PendingPacket {
+	if !packet.dataOwned {
+		packet.Data = append([]byte(nil), packet.Data...)
+		packet.dataOwned = true
+	}
+	return packet
 }
 
 // observeSYN applies the O(1) global limiter before any source-ledger lookup,
@@ -850,7 +1035,7 @@ func (e *Engine) release(flow abi.FakeTCPSessionKey, s *session) []Action {
 	e.pendingBytes -= s.pendingBytes
 	s.pending = nil
 	s.pendingBytes = 0
-	return []Action{{Kind: ActionReleasePending, Flow: flow, Packets: packets}}
+	return []Action{{Kind: ActionReleasePending, Flow: flow, WGID: s.wgID, Packets: packets}}
 }
 
 func (e *Engine) remove(flow abi.FakeTCPSessionKey, s *session) {
@@ -892,15 +1077,24 @@ func (e *Engine) insertEstablished(flow abi.FakeTCPSessionKey, s *session) error
 	if err != nil {
 		return fmt.Errorf("read faketcp %s clock for established insert: %w", BPFMonotonicClockDomain, err)
 	}
+	if s.sessionID == 0 {
+		s.sessionID, err = e.sessionIDs.allocate()
+		if err != nil {
+			return err
+		}
+	}
 	return e.opts.Store.InsertEstablished(flow, abi.FakeTCPSessionValue{
-		Generation:    flow.Generation,
-		LastSeenNanos: nowMonotonic,
-		TXSequence:    s.txSequence,
-		RXSequence:    s.rxSequence,
-		LocalISN:      s.localISN,
-		RemoteISN:     s.remoteISN,
-		Window:        e.opts.Window,
-		State:         s.state,
+		Generation:         flow.Generation,
+		LastSeenNanos:      nowMonotonic,
+		TXSequence:         s.txSequence,
+		RXSequence:         s.rxSequence,
+		LocalISN:           s.localISN,
+		RemoteISN:          s.remoteISN,
+		Window:             e.opts.Window,
+		State:              s.state,
+		Revision:           1,
+		SessionID:          s.sessionID,
+		RuntimeIncarnation: [16]byte(e.identity.Incarnation),
 	})
 }
 
@@ -915,10 +1109,58 @@ func (e *Engine) lookupEstablished(flow abi.FakeTCPSessionKey, s *session) (abi.
 	if value.LocalISN != s.localISN || value.RemoteISN != s.remoteISN {
 		return abi.FakeTCPSessionValue{}, false, errors.New("faketcp fast session identity changed")
 	}
+	if value.SessionID != s.sessionID ||
+		value.RuntimeIncarnation != [16]byte(e.identity.Incarnation) {
+		return abi.FakeTCPSessionValue{}, false, errors.New("faketcp fast session incarnation changed")
+	}
 	// BPF is the sole writer after insertion. These assignments only refresh
 	// the userspace snapshot used for observability; no whole-value write API
 	// exists on SessionStore.
 	s.txSequence = value.TXSequence
 	s.rxSequence = value.RXSequence
 	return value, true, nil
+}
+
+// compareDeleteEstablished is the only transition into pending-delete. The
+// complete expected value is retained on every error because the kernel claim
+// may already have linearised even when userspace cannot observe the final
+// delete. The request remains immutable across retries.
+func (e *Engine) compareDeleteEstablished(
+	flow abi.FakeTCPSessionKey,
+	s *session,
+	request pendingSessionDelete,
+) (SessionDeleteResult, error) {
+	result, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, request.expected)
+	if err == nil && result > SessionDeleteRemoved {
+		err = fmt.Errorf("faketcp session store returned invalid delete result %d", result)
+	}
+	if err != nil {
+		pending := request
+		s.pendingDelete = &pending
+		return SessionDeleteDifferent, err
+	}
+	s.pendingDelete = nil
+	return result, nil
+}
+
+// retryPendingDelete runs before any ordinary established lookup. Removed and
+// absent are the same terminal state: under the production single-owner
+// lifecycle no same-key Insert can pass the store mutex, BPF never inserts,
+// and a fresh process receives a fresh map identity and runtime incarnation.
+// Different therefore identifies a foreign/new value, clears the stale claim
+// authority, preserves that value, and fails this packet/tick closed.
+func (e *Engine) retryPendingDelete(
+	flow abi.FakeTCPSessionKey,
+	s *session,
+) (Action, error) {
+	request := *s.pendingDelete
+	result, err := e.compareDeleteEstablished(flow, s, request)
+	if err != nil {
+		return Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}, err
+	}
+	if result == SessionDeleteDifferent {
+		return Action{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}, nil
+	}
+	e.remove(flow, s)
+	return Action{Kind: ActionClose, Flow: flow, Reason: request.reason}, nil
 }

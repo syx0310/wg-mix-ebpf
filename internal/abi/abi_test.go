@@ -51,7 +51,7 @@ func TestStructSizesAreStable(t *testing.T) {
 		{"ICMPListenerKey", unsafe.Sizeof(ICMPListenerKey{}), 16},
 		{"ICMPListenerValue", unsafe.Sizeof(ICMPListenerValue{}), 24},
 		{"FakeTCPSessionKey", unsafe.Sizeof(FakeTCPSessionKey{}), 24},
-		{"FakeTCPSessionValue", unsafe.Sizeof(FakeTCPSessionValue{}), 40},
+		{"FakeTCPSessionValue", unsafe.Sizeof(FakeTCPSessionValue{}), 80},
 		{"FakeTCPManagedIfKey", unsafe.Sizeof(FakeTCPManagedIfKey{}), 16},
 		{"FakeTCPManagedIfValue", unsafe.Sizeof(FakeTCPManagedIfValue{}), 8},
 		{"FakeTCPManagedPortKey", unsafe.Sizeof(FakeTCPManagedPortKey{}), 16},
@@ -61,6 +61,9 @@ func TestStructSizesAreStable(t *testing.T) {
 		{"FakeTCPControlFlowKey", unsafe.Sizeof(FakeTCPControlFlowKey{}), 32},
 		{"FakeTCPControlFlowValue", unsafe.Sizeof(FakeTCPControlFlowValue{}), 16},
 		{"FakeTCPRuntimeIdentityValue", unsafe.Sizeof(FakeTCPRuntimeIdentityValue{}), 32},
+		{"FakeTCPGenerationGateValue", unsafe.Sizeof(FakeTCPGenerationGateValue{}), 16},
+		{"FakeTCPGenerationControlRequest", unsafe.Sizeof(FakeTCPGenerationControlRequest{}), 32},
+		{"FakeTCPGenerationWake", unsafe.Sizeof(FakeTCPGenerationWake{}), 32},
 		{"FakeTCPEvent", unsafe.Sizeof(FakeTCPEvent{}), FakeTCPEventSize},
 		{"FakeTCPPacketEvent", unsafe.Sizeof(FakeTCPPacketEvent{}), FakeTCPPacketEventSize},
 	}
@@ -77,6 +80,15 @@ func TestStructSizesAreStable(t *testing.T) {
 	}
 	if got, want := unsafe.Offsetof(FakeTCPManagedIfKey{}.UnderlayIndex), uintptr(8); got != want {
 		t.Fatalf("FakeTCPManagedIfKey.UnderlayIndex offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPGenerationGateValue{}.State), uintptr(8); got != want {
+		t.Fatalf("FakeTCPGenerationGateValue.State offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPGenerationControlRequest{}.Operation), uintptr(24); got != want {
+		t.Fatalf("FakeTCPGenerationControlRequest.Operation offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPGenerationWake{}.State), uintptr(24); got != want {
+		t.Fatalf("FakeTCPGenerationWake.State offset = %d, want %d", got, want)
 	}
 	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Generation), uintptr(0); got != want {
 		t.Fatalf("FakeTCPSessionValue.Generation offset = %d, want %d", got, want)
@@ -105,10 +117,16 @@ func TestStructSizesAreStable(t *testing.T) {
 	if got, want := unsafe.Offsetof(FakeTCPEvent{}.CaptureSequence), uintptr(48); got != want {
 		t.Fatalf("FakeTCPEvent.CaptureSequence offset = %d, want %d", got, want)
 	}
-	if got, want := unsafe.Offsetof(FakeTCPEvent{}.CaptureCPU), uintptr(56); got != want {
+	if got, want := unsafe.Offsetof(FakeTCPEvent{}.SessionRevision), uintptr(56); got != want {
+		t.Fatalf("FakeTCPEvent.SessionRevision offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPEvent{}.SessionID), uintptr(64); got != want {
+		t.Fatalf("FakeTCPEvent.SessionID offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPEvent{}.CaptureCPU), uintptr(72); got != want {
 		t.Fatalf("FakeTCPEvent.CaptureCPU offset = %d, want %d", got, want)
 	}
-	if got, want := unsafe.Offsetof(FakeTCPEvent{}.EventABIVersion), uintptr(82); got != want {
+	if got, want := unsafe.Offsetof(FakeTCPEvent{}.EventABIVersion), uintptr(98); got != want {
 		t.Fatalf("FakeTCPEvent.EventABIVersion offset = %d, want %d", got, want)
 	}
 	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.State), uintptr(34); got != want {
@@ -119,6 +137,21 @@ func TestStructSizesAreStable(t *testing.T) {
 	}
 	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Reserved), uintptr(36); got != want {
 		t.Fatalf("FakeTCPSessionValue.Reserved offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.KernelLock), uintptr(40); got != want {
+		t.Fatalf("FakeTCPSessionValue.KernelLock offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.KernelReserved), uintptr(44); got != want {
+		t.Fatalf("FakeTCPSessionValue.KernelReserved offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.Revision), uintptr(48); got != want {
+		t.Fatalf("FakeTCPSessionValue.Revision offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.SessionID), uintptr(56); got != want {
+		t.Fatalf("FakeTCPSessionValue.SessionID offset = %d, want %d", got, want)
+	}
+	if got, want := unsafe.Offsetof(FakeTCPSessionValue{}.RuntimeIncarnation), uintptr(64); got != want {
+		t.Fatalf("FakeTCPSessionValue.RuntimeIncarnation offset = %d, want %d", got, want)
 	}
 	if got, want := unsafe.Offsetof(FakeTCPManagedPortKey{}.DestinationPort), uintptr(12); got != want {
 		t.Fatalf("FakeTCPManagedPortKey.DestinationPort offset = %d, want %d", got, want)

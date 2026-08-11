@@ -34,6 +34,55 @@ EXPECTED_HOSTNAME=""
 EXPECTED_KERNEL=""
 EXPECTED_MACHINE_ID=""
 
+readonly SUPPORTED_KERNEL='7.0.0-28-generic'
+readonly -a CLEAN_ENV=(
+  /usr/bin/env -i
+  PATH=/usr/sbin:/usr/bin:/sbin:/bin
+  LC_ALL=C
+)
+readonly -a APT_COMMAND=(
+  "${CLEAN_ENV[@]}" APT_LISTCHANGES_FRONTEND=none
+  DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=l
+  /usr/bin/apt-get
+  -o Acquire::Retries=2 -o Acquire::http::Timeout=30
+  -o Acquire::https::Timeout=30
+  -o APT::Get::List-Cleanup=0
+)
+readonly -a APT_INSTALL_FLAGS=(--no-install-recommends --no-remove --no-upgrade)
+readonly -a BPFTOOL_VERSION_COMMAND=(
+  "${CLEAN_ENV[@]}" /usr/sbin/bpftool -V
+)
+readonly -a PACKAGES=(
+  binutils
+  bpftool
+  ca-certificates
+  clang
+  dwarves
+  ethtool
+  gcc
+  git
+  golang-go
+  iperf3
+  iproute2
+  iputils-ping
+  jq
+  kmod
+  libbpf-dev
+  libc6-dev
+  "linux-headers-${SUPPORTED_KERNEL}"
+  linux-libc-dev
+  llvm
+  make
+  nftables
+  pkg-config
+  procps
+  python3
+  shellcheck
+  tcpdump
+  util-linux
+  wireguard-tools
+)
+
 while (($# > 0)); do
   case "$1" in
   --self-test-apt-gate)
@@ -118,31 +167,114 @@ done
 }
 
 apt_plan_has_forbidden_changes() {
-  grep -Eq '^(Remv|Purg) |^Inst [^ ]+ \[[^]]+\]'
+  # Dollar-prefixed fields belong to AWK and must remain single-quoted.
+  # shellcheck disable=SC2016
+  "${CLEAN_ENV[@]}" /usr/bin/awk '
+    function is_boot_package(package) {
+      return package ~ /^(grub|initramfs-tools|linux-image-|linux-modules-|shim-signed|systemd-boot)/
+    }
+    $1 == "Remv" || $1 == "Purg" { unsafe = 1 }
+    $1 == "Inst" {
+      package = $2
+      if ($0 ~ /^Inst [^ ]+ \[[^]]+\]/ || is_boot_package(package) ||
+          $0 !~ /^Inst [^ ]+ \(/) {
+        unsafe = 1
+      } else {
+        fresh[package] = 1
+        saw_fresh = 1
+      }
+    }
+    $1 == "Conf" {
+      package = $2
+      configured[package] = 1
+      if (is_boot_package(package) || $0 !~ /^Conf [^ ]+ \(/) {
+        unsafe = 1
+      }
+    }
+    END {
+      for (package in configured) {
+        if (!(package in fresh)) unsafe = 1
+      }
+      if (!saw_fresh) unsafe = 1
+      exit !unsafe
+    }
+  '
+}
+
+dpkg_status_has_pending_work() {
+  # Dollar-prefixed fields belong to AWK and must remain single-quoted.
+  # shellcheck disable=SC2016
+  "${CLEAN_ENV[@]}" /usr/bin/awk -F '\t' '
+    {
+      seen = 1
+      status = $1
+      if (NF != 2 || (status != "ii " && status != "hi " &&
+          status != "rc " && status != "pn " && status != "un ")) {
+        dirty = 1
+      }
+    }
+    END { exit !(dirty || !seen) }
+  '
 }
 
 if [[ "${MODE}" == "self-test" ]]; then
-  if printf '%s\n' 'Inst new-package (1.0 repository)' |
-    apt_plan_has_forbidden_changes; then
-    echo "error: fresh package install was rejected" >&2
+  for fixture in 'Inst new-package (1.0 repository)' \
+    'Inst linux-headers-7.0.0-28-generic (1.0 repository)' \
+    $'Inst clang (1.0 repository)\nConf clang (1.0 repository)'; do
+    if apt_plan_has_forbidden_changes <<<"${fixture}"; then
+      echo "error: safe package fixture was rejected: ${fixture}" >&2
+      exit 1
+    fi
+  done
+  for fixture in 'Inst existing-package [1.0] (1.1 repository)' \
+    'Remv existing-package [1.0]' 'Purg existing-package [1.0]' \
+    'Inst grub-pc (1.0 repository)' \
+    'Inst initramfs-tools-core (1.0 repository)' \
+    'Inst linux-image-7.0.0-29-generic (1.0 repository)' \
+    'Inst linux-modules-extra-7.0.0-29-generic (1.0 repository)' \
+    'Inst shim-signed (1.0 repository)' \
+    'Inst systemd-boot-efi (1.0 repository)' \
+    'Conf existing-package (1.1 repository)' \
+    'Conf grub-pc (1.0 repository)' \
+    'Conf initramfs-tools-core (1.0 repository)' \
+    'Conf linux-image-7.0.0-29-generic (1.0 repository)' \
+    'Conf linux-modules-extra-7.0.0-29-generic (1.0 repository)' \
+    'Conf shim-signed (1.0 repository)' \
+    'Conf systemd-boot-efi (1.0 repository)' ''; do
+    if ! apt_plan_has_forbidden_changes <<<"${fixture}"; then
+      echo "error: unsafe package fixture was accepted: ${fixture}" >&2
+      exit 1
+    fi
+  done
+  if dpkg_status_has_pending_work <<< $'ii \tbase-files\nhi \theld-package\nrc \tremoved-package\npn \tpurged-package\nun \tunknown-package'; then
+    echo 'error: stable dpkg status fixture was rejected' >&2
     exit 1
   fi
-  if ! printf '%s\n' 'Inst existing-package [1.0] (1.1 repository)' |
-    apt_plan_has_forbidden_changes; then
-    echo "error: package upgrade fixture was accepted" >&2
+  for fixture in $'iU \tunpacked-package' $'iF \thalf-configured-package' \
+    $'it \ttriggers-pending-package' $'iW \ttriggers-awaited-package' \
+    $'iH \thalf-installed-package' $'iiR\treinst-required-package' \
+    $'ri \tremove-pending-package' $'pi \tpurge-pending-package' \
+    $'in \tinstall-pending-package' $'uc \tunknown-config-package' ''; do
+    if ! dpkg_status_has_pending_work <<<"${fixture}"; then
+      echo "error: incomplete dpkg status fixture was accepted: ${fixture}" >&2
+      exit 1
+    fi
+  done
+  expected_bpftool_version_command=(
+    "${CLEAN_ENV[@]}" /usr/sbin/bpftool -V
+  )
+  if ((${#BPFTOOL_VERSION_COMMAND[@]} != ${#expected_bpftool_version_command[@]})); then
+    echo 'error: bpftool probe must be CLEAN_ENV plus /usr/sbin/bpftool -V only' >&2
     exit 1
   fi
-  if ! printf '%s\n' 'Remv existing-package [1.0]' |
-    apt_plan_has_forbidden_changes; then
-    echo "error: package removal fixture was accepted" >&2
-    exit 1
-  fi
-  if ! printf '%s\n' 'Purg existing-package [1.0]' |
-    apt_plan_has_forbidden_changes; then
-    echo "error: package purge fixture was accepted" >&2
-    exit 1
-  fi
-  echo "APT simulation gate self-test passed"
+  for index in "${!expected_bpftool_version_command[@]}"; do
+    [[ "${BPFTOOL_VERSION_COMMAND[index]}" == \
+      "${expected_bpftool_version_command[index]}" ]] || {
+      echo 'error: bpftool probe must not use legacy version or a fallback argv' >&2
+      exit 1
+    }
+  done
+  echo "APT/dpkg safety gate self-test passed"
   exit 0
 fi
 
@@ -162,13 +294,44 @@ fi
   echo "error: a literal --expected-kernel is required" >&2
   exit 2
 }
+[[ "${EXPECTED_KERNEL}" == "${SUPPORTED_KERNEL}" ]] || {
+  echo "error: this locked provisioner only supports kernel ${SUPPORTED_KERNEL}" >&2
+  exit 2
+}
 [[ "${EXPECTED_MACHINE_ID}" =~ ^[0-9a-f]{32}$ ]] || {
   echo "error: --expected-machine-id must be exactly 32 lowercase hex characters" >&2
   exit 2
 }
 
-if ! ip -o -4 address show dev "${EXPECTED_INTERFACE}" |
-  awk -v expected="${EXPECTED_ADDRESS}" '
+for path in /usr/bin/apt-get /usr/bin/awk /usr/bin/date /usr/bin/dpkg-query \
+  /usr/bin/env /usr/bin/grep /usr/bin/hostname /usr/bin/id /usr/bin/readlink \
+  /usr/bin/sed /usr/bin/sort /usr/bin/stat /usr/bin/systemctl /usr/bin/uname \
+  /usr/sbin/ip; do
+  [[ -x "${path}" ]] || {
+    echo "error: required fixed base command is missing: ${path}" >&2
+    exit 1
+  }
+done
+
+os_release_field() {
+  # Dollar-prefixed fields belong to AWK and must remain single-quoted.
+  # shellcheck disable=SC2016
+  "${CLEAN_ENV[@]}" /usr/bin/awk -F= -v key="$1" '
+    $1 == key {
+      value = $2
+      sub(/^"/, "", value)
+      sub(/"$/, "", value)
+      print value
+      found = 1
+    }
+    END { if (!found) exit 1 }
+  ' /etc/os-release
+}
+
+# Dollar-prefixed fields belong to AWK and must remain single-quoted.
+# shellcheck disable=SC2016
+if ! "${CLEAN_ENV[@]}" /usr/sbin/ip -o -4 address show dev "${EXPECTED_INTERFACE}" |
+  "${CLEAN_ENV[@]}" /usr/bin/awk -v expected="${EXPECTED_ADDRESS}" '
     {
       split($4, address, "/")
       if (address[1] == expected) {
@@ -181,7 +344,8 @@ if ! ip -o -4 address show dev "${EXPECTED_INTERFACE}" |
   exit 1
 fi
 
-[[ "$(hostname)" == "${EXPECTED_HOSTNAME}" ]] || {
+HOSTNAME_VALUE="$("${CLEAN_ENV[@]}" /usr/bin/hostname)"
+[[ "${HOSTNAME_VALUE}" == "${EXPECTED_HOSTNAME}" ]] || {
   echo "error: hostname identity mismatch" >&2
   exit 1
 }
@@ -190,98 +354,221 @@ fi
   exit 1
 }
 
-# shellcheck source=/dev/null
-. /etc/os-release
-
-[[ "${ID:-}" == "ubuntu" && "${VERSION_ID:-}" == "26.04" ]] || {
-  echo "error: expected Ubuntu 26.04, got ${ID:-unknown} ${VERSION_ID:-unknown}" >&2
+OS_ID="$(os_release_field ID)"
+OS_VERSION="$(os_release_field VERSION_ID)"
+[[ "${OS_ID}" == "ubuntu" && "${OS_VERSION}" == "26.04" ]] || {
+  echo "error: expected Ubuntu 26.04, got ${OS_ID:-unknown} ${OS_VERSION:-unknown}" >&2
   exit 1
 }
 
-KERNEL_RELEASE="$(uname -r)"
+KERNEL_RELEASE="$("${CLEAN_ENV[@]}" /usr/bin/uname -r)"
 [[ "${KERNEL_RELEASE}" == "${EXPECTED_KERNEL}" ]] || {
   echo "error: expected kernel ${EXPECTED_KERNEL}, got ${KERNEL_RELEASE}" >&2
   exit 1
 }
 
-PACKAGES=(
-  bpftool
-  ca-certificates
-  clang
-  ethtool
-  gcc
-  git
-  golang-go
-  iproute2
-  iperf3
-  jq
-  libbpf-dev
-  linux-libc-dev
-  llvm
-  make
-  nftables
-  pkg-config
-  python3
-  shellcheck
-  tcpdump
-  wireguard-tools
-)
-EXPECTED_FRESH_MISSING=(
-  clang
-  gcc
-  golang-go
-  iperf3
-  libbpf-dev
-  llvm
-  make
-  pkg-config
-  shellcheck
-  wireguard-tools
-)
-EXPECTED_IPERF_ONLY_MISSING=(
-  iperf3
-)
+package_is_installed() {
+  local status
+  # dpkg-query expands this format token; the shell must pass it literally.
+  # shellcheck disable=SC2016
+  status="$("${CLEAN_ENV[@]}" /usr/bin/dpkg-query -W \
+    -f='${db:Status-Abbrev}' "$1" 2>/dev/null)" || return 1
+  [[ "${status}" == 'ii ' || "${status}" == 'hi ' ]]
+}
 
-printf 'timestamp=%s\n' "$(date --iso-8601=seconds)"
-printf 'hostname=%s\n' "$(hostname)"
-printf 'identity=%s\n' "$(id)"
+collect_missing_packages() {
+  local package
+  missing=()
+  for package in "${PACKAGES[@]}"; do
+    package_is_installed "${package}" || missing+=("${package}")
+  done
+}
+
+quote_argv() {
+  printf ' %q' "$@"
+}
+
+plan_command() {
+  local label="$1"
+  shift
+  printf 'plan_command=%s argv=' "${label}"
+  quote_argv "$@"
+  printf '\n'
+}
+
+render_plan() {
+  printf 'plan_packages_count=%d plan_packages=' "${#PACKAGES[@]}"
+  quote_argv "${PACKAGES[@]}"
+  printf '\n'
+  printf '%s\n' \
+    'write_scope=/var/lib/apt/lists /var/cache/apt (no explicit list/cache cleanup)' \
+    'write_scope=/var/lib/dpkg /var/log/apt /var/log/dpkg.log /var/cache/debconf' \
+    'write_scope=fixed-package-owned/generated files under /usr /etc /var/lib /lib/modules' \
+    "write_scope=/usr/src/linux-headers-${SUPPORTED_KERNEL} and /lib/modules/${SUPPORTED_KERNEL}/build" \
+    'excluded_write_scope=/etc/apt/sources.list /etc/apt/sources.list.d /boot bootloader initramfs running-kernel network-state'
+  if ((${#missing[@]} > 0)); then
+    plan_command A0 "${APT_COMMAND[@]}" update
+    plan_command A1 "${APT_COMMAND[@]}" --simulate "${APT_INSTALL_FLAGS[@]}" \
+      install "${missing[@]}"
+    plan_command A2 "${APT_COMMAND[@]}" --assume-yes "${APT_INSTALL_FLAGS[@]}" \
+      install "${missing[@]}"
+  else
+    printf 'plan_apt_commands=skipped reason=fixed-package-set-already-installed\n'
+  fi
+  printf 'postcheck=packages; executables; exact headers/build link; BTF; libbpf metadata; clang BPF target\n'
+  printf 'plan_complete planned_commands_executed=0 writes=0 automatic_cleanup=0\n'
+}
+
+service_snapshot() {
+  local active enabled
+  active="$("${CLEAN_ENV[@]}" /usr/bin/systemctl list-units --type=service \
+    --state=active --no-legend --no-pager --plain)" || return $?
+  enabled="$("${CLEAN_ENV[@]}" /usr/bin/systemctl list-unit-files --type=service \
+    --state=enabled,enabled-runtime --no-legend --no-pager)" || return $?
+  # Dollar-prefixed fields belong to AWK and must remain single-quoted.
+  # shellcheck disable=SC2016
+  active="$("${CLEAN_ENV[@]}" /usr/bin/awk 'NF {print "active " $1}' \
+    <<<"${active}")" || return $?
+  # Dollar-prefixed fields belong to AWK and must remain single-quoted.
+  # shellcheck disable=SC2016
+  enabled="$("${CLEAN_ENV[@]}" /usr/bin/awk 'NF {print $2 " " $1}' \
+    <<<"${enabled}")" || return $?
+  printf '%s\n%s\n' "${active}" "${enabled}" |
+    "${CLEAN_ENV[@]}" /usr/bin/sort
+}
+
+run_logged_write() {
+  local description="$1" targets="$2" status
+  shift 2
+  printf 'write_start timestamp=%s description=%q targets=%q argv=' \
+    "$(/usr/bin/date --iso-8601=seconds)" "${description}" "${targets}"
+  quote_argv "$@"
+  printf '\n'
+  if "$@"; then
+    status=0
+  else
+    status=$?
+  fi
+  printf 'write_finish timestamp=%s description=%q exit=%d\n' \
+    "$(/usr/bin/date --iso-8601=seconds)" "${description}" "${status}"
+  return "${status}"
+}
+
+run_logged_capture() {
+  local destination="$1" description="$2" output status
+  shift 2
+  printf 'command_start timestamp=%s description=%q argv=' \
+    "$(/usr/bin/date --iso-8601=seconds)" "${description}"
+  quote_argv "$@"
+  printf '\n'
+  if output="$("$@" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  printf 'command_finish timestamp=%s description=%q exit=%d\n' \
+    "$(/usr/bin/date --iso-8601=seconds)" "${description}" "${status}"
+  if ((status != 0)); then
+    printf 'command_output_begin description=%q\n%s\ncommand_output_end\n' \
+      "${description}" "${output}" >&2
+  fi
+  printf -v "${destination}" '%s' "${output}"
+  return "${status}"
+}
+
+verify_clean_dpkg_state() {
+  local states
+  # dpkg-query expands these format tokens; the shell must pass them literally.
+  # shellcheck disable=SC2016
+  run_logged_capture states 'verify dpkg package states' \
+    "${CLEAN_ENV[@]}" /usr/bin/dpkg-query -W \
+    -f='${db:Status-Abbrev}\t${binary:Package}\n' || return $?
+  if dpkg_status_has_pending_work <<<"${states}"; then
+    echo 'error: dpkg has an unpacked, half-configured, trigger-pending, or otherwise incomplete package' >&2
+    return 1
+  fi
+  printf 'verified_dpkg_state=clean\n'
+}
+
+verify_installed_toolchain() {
+  local executable build_target clang_targets
+  collect_missing_packages
+  if ((${#missing[@]} > 0)); then
+    printf 'error: fixed package set remains incomplete:' >&2
+    quote_argv "${missing[@]}" >&2
+    printf '\n' >&2
+    return 1
+  fi
+  for executable in \
+    /usr/bin/clang /usr/bin/gcc /usr/bin/git /usr/bin/go /usr/bin/iperf3 \
+    /usr/bin/findmnt /usr/bin/jq /usr/bin/ld /usr/bin/llvm-config /usr/bin/make \
+    /usr/bin/nsenter /usr/bin/objdump /usr/bin/pahole /usr/bin/ping \
+    /usr/bin/pkg-config /usr/bin/python3 /usr/bin/readelf /usr/bin/shellcheck \
+    /usr/bin/tcpdump /usr/bin/unshare /usr/bin/wg /usr/sbin/bpftool \
+    /usr/sbin/ethtool /usr/sbin/insmod /usr/sbin/ip /usr/sbin/lsmod \
+    /usr/sbin/nft /usr/sbin/rmmod /usr/sbin/sysctl /usr/sbin/tc; do
+    [[ -x "${executable}" ]] || {
+      echo "error: required executable is missing: ${executable}" >&2
+      return 1
+    }
+  done
+  if [[ ! -r /usr/include/bpf/bpf_helpers.h || ! -r /sys/kernel/btf/vmlinux ||
+    ! -d "/usr/src/linux-headers-${SUPPORTED_KERNEL}" ]]; then
+    echo 'error: libbpf headers, running-kernel BTF, or exact kernel headers are unavailable' >&2
+    return 1
+  fi
+  build_target="$("${CLEAN_ENV[@]}" /usr/bin/readlink -e -- \
+    "/lib/modules/${SUPPORTED_KERNEL}/build")" || return 1
+  [[ "${build_target}" == "/usr/src/linux-headers-${SUPPORTED_KERNEL}" ]] || {
+    echo "error: running-kernel build link resolves to ${build_target}" >&2
+    return 1
+  }
+  "${CLEAN_ENV[@]}" /usr/bin/pkg-config --exists libbpf || return 1
+  clang_targets="$("${CLEAN_ENV[@]}" /usr/bin/clang --print-targets)" || return 1
+  if ! "${CLEAN_ENV[@]}" /usr/bin/grep -Eq \
+    '(^|[[:space:]])bpf([[:space:]-]|$)' <<<"${clang_targets}"; then
+    echo 'error: clang does not advertise the BPF target' >&2
+    return 1
+  fi
+  "${CLEAN_ENV[@]}" /usr/bin/go version
+  "${CLEAN_ENV[@]}" /usr/bin/clang --version | "${CLEAN_ENV[@]}" /usr/bin/sed -n '1p'
+  "${BPFTOOL_VERSION_COMMAND[@]}" || {
+    echo 'error: bpftool fixed version probe failed' >&2
+    return 1
+  }
+  printf 'verified_header_dir=/usr/src/linux-headers-%s verified_build_link=%s verified_btf=/sys/kernel/btf/vmlinux\n' \
+    "${SUPPORTED_KERNEL}" "${build_target}"
+}
+
+printf 'timestamp=%s\n' "$(/usr/bin/date --iso-8601=seconds)"
+printf 'hostname=%s\n' "${HOSTNAME_VALUE}"
+printf 'identity=%s\n' "$("${CLEAN_ENV[@]}" /usr/bin/id)"
 printf 'expected_address=%s\n' "${EXPECTED_ADDRESS}"
 printf 'expected_interface=%s\n' "${EXPECTED_INTERFACE}"
 printf 'expected_hostname=%s\n' "${EXPECTED_HOSTNAME}"
 printf 'expected_kernel=%s\n' "${EXPECTED_KERNEL}"
 printf 'expected_machine_id=%s\n' "${EXPECTED_MACHINE_ID}"
-printf 'os=%s %s\n' "${ID}" "${VERSION_ID}"
+printf 'os=%s %s\n' "${OS_ID}" "${OS_VERSION}"
 printf 'kernel=%s\n' "${KERNEL_RELEASE}"
 printf 'mode=%s\n' "${MODE}"
 printf 'packages='
-printf ' %q' "${PACKAGES[@]}"
+quote_argv "${PACKAGES[@]}"
 printf '\n'
 
-missing=()
-for package in "${PACKAGES[@]}"; do
-  if ! dpkg-query -W -f='${db:Status-Abbrev}\n' "${package}" 2>/dev/null |
-    grep -qx 'ii '; then
-    missing+=("${package}")
-  fi
-done
+declare -a missing=()
+collect_missing_packages
+verify_clean_dpkg_state
 printf 'missing_packages='
 if ((${#missing[@]} > 0)); then
-  printf ' %q' "${missing[@]}"
+  quote_argv "${missing[@]}"
 fi
 printf '\n'
-if ((${#missing[@]} > 0)); then
-  if [[ "${missing[*]}" != "${EXPECTED_FRESH_MISSING[*]}" &&
-    "${missing[*]}" != "${EXPECTED_IPERF_ONLY_MISSING[*]}" ]]; then
-    printf 'error: package state drifted; allowed missing sets are fresh=' >&2
-    printf ' %q' "${EXPECTED_FRESH_MISSING[@]}" >&2
-    printf ' or post-toolchain=' >&2
-    printf ' %q' "${EXPECTED_IPERF_ONLY_MISSING[@]}" >&2
-    printf '\n' >&2
-    exit 1
-  fi
-fi
+render_plan
 
 if [[ "${MODE}" == "check" ]]; then
+  if ((${#missing[@]} == 0)); then
+    verify_installed_toolchain
+  fi
   exit 0
 fi
 
@@ -290,48 +577,8 @@ if [[ "${EUID}" -ne 0 ]]; then
   exit 1
 fi
 
-for command in apt-get awk grep sort systemctl; do
-  command -v "${command}" >/dev/null || {
-    echo "error: required provisioning command is missing: ${command}" >&2
-    exit 1
-  }
-done
-
-export DEBIAN_FRONTEND=noninteractive
-export LC_ALL=C
-
-service_snapshot() {
-  {
-    systemctl list-units --type=service --state=active \
-      --no-legend --no-pager --plain |
-      awk '{print "active " $1}'
-    systemctl list-unit-files --type=service --state=enabled \
-      --no-legend --no-pager |
-      awk '{print "enabled " $1}'
-  } | sort
-}
-
-run_logged_write() {
-  local description="$1"
-  local targets="$2"
-  local status
-  shift 2
-
-  printf 'write_start timestamp=%s description=%q targets=%q argv=' \
-    "$(date --iso-8601=seconds)" "${description}" "${targets}"
-  printf ' %q' "$@"
-  printf '\n'
-  if "$@"; then
-    status=0
-  else
-    status=$?
-  fi
-  printf 'write_finish timestamp=%s description=%q exit=%d\n' \
-    "$(date --iso-8601=seconds)" "${description}" "${status}"
-  return "${status}"
-}
-
 if ((${#missing[@]} == 0)); then
+  verify_installed_toolchain
   echo "provisioning already satisfied; no writes performed"
   exit 0
 fi
@@ -340,22 +587,21 @@ services_before="$(service_snapshot)"
 run_logged_write \
   "refresh APT package metadata" \
   "/var/lib/apt/lists and /var/cache/apt" \
-  apt-get update
+  "${APT_COMMAND[@]}" update
 
-simulation="$(
-  apt-get --simulate --no-remove --no-upgrade --no-install-recommends \
-    install "${missing[@]}"
-)"
+simulation=''
+run_logged_capture simulation 'simulate fixed missing package installation' \
+  "${APT_COMMAND[@]}" --simulate "${APT_INSTALL_FLAGS[@]}" \
+  install "${missing[@]}"
 printf 'apt_simulation_begin\n%s\napt_simulation_end\n' "${simulation}"
 if apt_plan_has_forbidden_changes <<<"${simulation}"; then
   echo "error: APT simulation includes a package removal or upgrade" >&2
   exit 1
 fi
-
 run_logged_write \
   "install fixed missing CLI/build packages" \
-  "/var/lib/dpkg, /var/lib/apt, /var/cache/apt and package-owned files" \
-  apt-get install -y --no-remove --no-upgrade --no-install-recommends \
+  "/var/lib/dpkg, /var/lib/apt, /var/cache/apt and fixed-package-owned/generated files" \
+  "${APT_COMMAND[@]}" --assume-yes "${APT_INSTALL_FLAGS[@]}" install \
   "${missing[@]}"
 
 services_after="$(service_snapshot)"
@@ -366,20 +612,5 @@ if [[ "${services_after}" != "${services_before}" ]]; then
   exit 1
 fi
 
-for package in "${missing[@]}"; do
-  if ! dpkg-query -W -f='${db:Status-Abbrev}\n' "${package}" 2>/dev/null |
-    grep -qx 'ii '; then
-    echo "error: package was not installed successfully: ${package}" >&2
-    exit 1
-  fi
-done
-
-for command in bpftool clang ethtool gcc git go ip iperf3 jq make nft \
-  python3 shellcheck tc tcpdump wg; do
-  printf '%s=%s\n' "${command}" "$(command -v "${command}")"
-done
-
-go version
-clang --version | sed -n '1p'
-bpftool version
+verify_installed_toolchain
 echo "provisioning completed"

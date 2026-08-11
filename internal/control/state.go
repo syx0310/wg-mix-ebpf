@@ -253,11 +253,8 @@ func validateFakeTCPUnderlayParsers(state *State) error {
 		if candidate.Role == "parse_only" || candidate.Role == "disabled" {
 			continue
 		}
-		if candidate.Parser == "l3" {
-			return fmt.Errorf("faketcp cannot attach to underlay %q with parser:l3; only the ethernet parser is implemented", candidate.Name)
-		}
-		if candidate.Resolved && candidate.Parser != "ethernet" {
-			return fmt.Errorf("faketcp cannot attach to resolved underlay %q with parser %q; only the ethernet parser is implemented", candidate.Name, candidate.Parser)
+		if candidate.Resolved && candidate.Parser != "ethernet" && candidate.Parser != "l3" {
+			return fmt.Errorf("faketcp underlay %q must select parser:ethernet or parser:l3; parser %q is ambiguous", candidate.Name, candidate.Parser)
 		}
 	}
 	return nil

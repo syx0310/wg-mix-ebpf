@@ -7,27 +7,39 @@ import (
 	"fmt"
 
 	"github.com/cilium/ebpf"
+	"golang.org/x/sys/unix"
 )
 
 const (
-	experimentalFakeTCPKfuncModule = "wg_mix_faketcp_checksum"
-	experimentalFakeTCPKfuncName   = "wg_mix_faketcp_skb_normalize_udp_csum"
-	experimentalFakeTCPLicense     = "GPL"
+	experimentalFakeTCPKfuncModule        = "wg_mix_faketcp_checksum"
+	experimentalFakeTCPPrepareKfuncName   = "wg_mix_faketcp_skb_prepare_udp"
+	experimentalFakeTCPGSOCommitKfuncName = "wg_mix_faketcp_skb_commit_udp_gso"
+	experimentalFakeTCPMTUAuditKeyCount   = 15
+	experimentalFakeTCPLicense            = "GPL"
 )
+
+var experimentalFakeTCPKfuncNames = [...]string{
+	experimentalFakeTCPPrepareKfuncName,
+	experimentalFakeTCPGSOCommitKfuncName,
+}
 
 func experimentalMapDescriptors() []pinnedMapDescriptor {
 	return []pinnedMapDescriptor{
-		{name: "faketcp_session_map", mapType: ebpf.Hash, keySize: 24, valueSize: 40, maxEntries: 16384},
+		{name: "faketcp_session_map", mapType: ebpf.Hash, keySize: 24, valueSize: 80, maxEntries: 16384},
 		{name: "faketcp_managed_if_map", mapType: ebpf.Hash, keySize: 16, valueSize: 8, maxEntries: 512},
 		{name: "faketcp_managed_port_map", mapType: ebpf.Hash, keySize: 16, valueSize: 16, maxEntries: 2048},
 		{name: "faketcp_control_policy_map", mapType: ebpf.Hash, keySize: 16, valueSize: 32, maxEntries: 512},
 		{name: "faketcp_control_flow_map", mapType: ebpf.LRUHash, keySize: 32, valueSize: 16, maxEntries: 16384},
 		{name: "faketcp_events", mapType: ebpf.RingBuf, maxEntries: 1 << 20},
-		{name: "faketcp_capture_scratch", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 2392, maxEntries: 1},
+		{name: "faketcp_capture_scratch", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 2408, maxEntries: 1},
 		{name: "faketcp_rt_id", mapType: ebpf.Array, keySize: 4, valueSize: 32, maxEntries: 1},
+		{name: "faketcp_gen_gt", mapType: ebpf.Array, keySize: 4, valueSize: 16, maxEntries: 1, flags: unix.BPF_F_RDONLY},
+		{name: "faketcp_gen_wk", mapType: ebpf.RingBuf, maxEntries: 4096},
 		{name: "faketcp_cap_seq", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 1},
+		{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 176, maxEntries: 1, flags: unix.BPF_F_RDONLY},
 		{name: "faketcp_egress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: 2},
-		{name: "faketcp_stats_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 17},
+		{name: "faketcp_stats_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 19},
+		{name: "faketcp_mtu_audit_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: experimentalFakeTCPMTUAuditKeyCount},
 	}
 }
 
@@ -40,6 +52,14 @@ func experimentalProgramDescriptors() []baselineProgramDescriptor {
 		{
 			name: "wg_mix_faketcp_ingress", sectionName: "xdp",
 			programType: ebpf.XDP, attachType: ebpf.AttachXDP, license: experimentalFakeTCPLicense,
+		},
+		{
+			name: "wg_faketcp_session_claim", sectionName: "classifier/faketcp_session_claim",
+			programType: ebpf.SchedCLS, license: experimentalFakeTCPLicense,
+		},
+		{
+			name: "wg_faketcp_generation_control", sectionName: "classifier/faketcp_generation_control",
+			programType: ebpf.SchedCLS, license: experimentalFakeTCPLicense,
 		},
 	}
 }
@@ -101,7 +121,10 @@ func validateExperimentalExtensionManifest(spec *ebpf.CollectionSpec) error {
 }
 
 func validateExperimentalKfuncManifest(spec *ebpf.CollectionSpec) error {
-	kfuncCalls := 0
+	kfuncCalls := make(map[string]int, len(experimentalFakeTCPKfuncNames))
+	for _, name := range experimentalFakeTCPKfuncNames {
+		kfuncCalls[name] = 0
+	}
 	for programName, program := range spec.Programs {
 		if program == nil {
 			continue
@@ -116,21 +139,29 @@ func validateExperimentalKfuncManifest(spec *ebpf.CollectionSpec) error {
 			if !instruction.IsKfuncCall() {
 				continue
 			}
-			if programName != "wg_mix_egress" ||
-				instruction.Reference() != experimentalFakeTCPKfuncName {
+			name := instruction.Reference()
+			if programName != "wg_mix_egress" {
 				return fmt.Errorf(
 					"experimental program %q has unreviewed kfunc relocation %q",
-					programName, instruction.Reference(),
+					programName, name,
 				)
 			}
-			kfuncCalls++
+			if _, ok := kfuncCalls[name]; !ok {
+				return fmt.Errorf(
+					"experimental program %q has unreviewed kfunc relocation %q",
+					programName, name,
+				)
+			}
+			kfuncCalls[name]++
 		}
 	}
-	if kfuncCalls != 1 {
-		return fmt.Errorf(
-			"experimental object has %d %s relocations, want exactly one",
-			kfuncCalls, experimentalFakeTCPKfuncName,
-		)
+	for _, name := range experimentalFakeTCPKfuncNames {
+		if kfuncCalls[name] != 1 {
+			return fmt.Errorf(
+				"experimental object has %d %s relocations, want exactly one",
+				kfuncCalls[name], name,
+			)
+		}
 	}
 	return nil
 }

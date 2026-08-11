@@ -5,6 +5,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -59,6 +60,38 @@ func TestBuildFakeTCPPolicySnapshotProjectsExactManagedPolicy(t *testing.T) {
 		if policy.VirtualTimeNanos != 0 {
 			t.Fatalf("control policy %d minted reload budget: %#v", want.wgID, policy)
 		}
+	}
+}
+
+func TestBuildFakeTCPPolicySnapshotAcceptsExactUnderlayParserAllowlist(t *testing.T) {
+	for _, test := range []struct {
+		parser string
+		want   uint8
+	}{
+		{parser: "ethernet", want: abi.ParserEthernet},
+		{parser: "l3", want: abi.ParserL3},
+	} {
+		t.Run(test.parser, func(t *testing.T) {
+			state := fakeTCPPolicyTestState()
+			state.Underlays[0].Parser = test.parser
+			snapshot, err := buildFakeTCPPolicySnapshot(state, 91)
+			if err != nil {
+				t.Fatal(err)
+			}
+			key := abi.FakeTCPManagedIfKey{Generation: 91, UnderlayIndex: 3}
+			if got, ok := snapshot.ManagedInterfaces[key]; !ok || got.Generation != 91 {
+				t.Fatalf("managed interface = %#v, present=%t", got, ok)
+			}
+
+			baseline, err := abi.FromStateWithGeneration(state, 91)
+			if err != nil {
+				t.Fatal(err)
+			}
+			underlayKey := abi.UnderlayConfigKey{Generation: 91, UnderlayIndex: 3}
+			if got := baseline.Underlays[underlayKey].ParserMode; got != test.want {
+				t.Fatalf("canonical parser mode = %d, want %d", got, test.want)
+			}
+		})
 	}
 }
 
@@ -200,6 +233,102 @@ func TestBuildFakeTCPPolicySnapshotIsInputOrderIndependentAndGenerationIsolated(
 	}
 }
 
+func TestFakeTCPPolicyGenerationPlanOwnsCanonicalImmutableProjection(t *testing.T) {
+	state := fakeTCPPolicyTestState()
+	snapshot, err := buildFakeTCPPolicySnapshot(state, 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := newFakeTCPPolicyGenerationPlan(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := plan.clone()
+
+	// Neither mutable input remains an owner after plan construction.
+	state.IngressListeners[0].DestinationPort++
+	snapshot.Generation++
+	for key := range snapshot.ManagedPorts {
+		delete(snapshot.ManagedPorts, key)
+	}
+	if !plan.equal(want) {
+		t.Fatal("policy plan changed after its mutable inputs were modified")
+	}
+	if err := validateFakeTCPPolicyGenerationPlan(plan); err != nil {
+		t.Fatalf("validate immutable policy plan: %v", err)
+	}
+
+	for index := 1; index < len(plan.controlPolicies); index++ {
+		if plan.controlPolicies[index-1].Key.WGID >= plan.controlPolicies[index].Key.WGID {
+			t.Fatal("control policy plan is not strictly ordered")
+		}
+	}
+	for index := 1; index < len(plan.managedPorts); index++ {
+		previous := plan.managedPorts[index-1].Key
+		current := plan.managedPorts[index].Key
+		if previous.UnderlayIndex > current.UnderlayIndex ||
+			(previous.UnderlayIndex == current.UnderlayIndex &&
+				previous.DestinationPort >= current.DestinationPort) {
+			t.Fatal("managed port plan is not strictly ordered")
+		}
+	}
+}
+
+func TestFakeTCPPolicyGenerationPlanConcurrentReadersSeeOneValue(t *testing.T) {
+	plan, err := buildFakeTCPPolicyGenerationPlan(fakeTCPPolicyTestState(), 101)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := plan.clone()
+	const readers = 16
+	const readsPerReader = 500
+	errCh := make(chan string, readers)
+	var wait sync.WaitGroup
+	wait.Add(readers)
+	for range readers {
+		go func() {
+			defer wait.Done()
+			for range readsPerReader {
+				observed := plan.clone()
+				if !observed.equal(want) || observed.snapshot().Generation != 101 {
+					errCh <- "immutable plan reader observed drift"
+					return
+				}
+			}
+		}()
+	}
+	wait.Wait()
+	close(errCh)
+	for message := range errCh {
+		t.Fatal(message)
+	}
+}
+
+func BenchmarkBuildFakeTCPPolicyGenerationPlan(b *testing.B) {
+	state := fakeTCPPolicyTestState()
+	b.ReportAllocs()
+	for range b.N {
+		if _, err := buildFakeTCPPolicyGenerationPlan(state, 101); err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+func BenchmarkCloneFakeTCPPolicyGenerationPlan(b *testing.B) {
+	plan, err := buildFakeTCPPolicyGenerationPlan(fakeTCPPolicyTestState(), 101)
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	var cloned *fakeTCPPolicyGenerationPlan
+	for range b.N {
+		cloned = plan.clone()
+	}
+	if cloned == nil {
+		b.Fatal("clone returned nil")
+	}
+}
+
 func TestBuildFakeTCPPolicySnapshotSharesOneInterfaceLatchAcrossDistinctPorts(t *testing.T) {
 	state := fakeTCPPolicyTestState()
 	state.IngressListeners[1].UnderlayIfIndex = state.IngressListeners[0].UnderlayIfIndex
@@ -292,11 +421,25 @@ func TestBuildFakeTCPPolicySnapshotRejectsInvalidSourceState(t *testing.T) {
 			wantErr: "not a resolved transform attachment",
 		},
 		{
-			name: "l3 parser",
+			name: "empty parser",
 			mutate: func(state *control.State) {
-				state.Underlays[0].Parser = "l3"
+				state.Underlays[0].Parser = ""
 			},
-			wantErr: "want ethernet",
+			wantErr: "want ethernet or l3",
+		},
+		{
+			name: "auto parser",
+			mutate: func(state *control.State) {
+				state.Underlays[0].Parser = "auto"
+			},
+			wantErr: "want ethernet or l3",
+		},
+		{
+			name: "unknown parser",
+			mutate: func(state *control.State) {
+				state.Underlays[0].Parser = "raw"
+			},
+			wantErr: "want ethernet or l3",
 		},
 		{
 			name: "unknown WireGuard",
@@ -473,12 +616,12 @@ func TestFakeTCPMimicTransformCompositionOrderContract(t *testing.T) {
 	fake := string(fakeBytes)
 
 	egress := sourceSection(t, tc, "int wg_mix_egress(struct __sk_buff *skb)", "SEC(\"classifier/ingress\")")
-	preflight := strings.Index(egress, "faketcp_preflight_egress(skb, &info, rule, generation)")
-	typeWord := strings.Index(egress, "update_type_word(skb, &info, old_wire, new_wire, 1)")
+	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
+	typeWord := strings.Index(egress, "update_type_word(skb, info, old_wire, new_wire, 1)")
 	xorDispatch := strings.Index(egress, "bpf_tail_call(skb, &xor_egress_programs")
-	directFakeTCP := strings.Index(egress, "return faketcp_encode_established(skb, &info, rule, generation)")
-	if preflight < 0 || typeWord < 0 || xorDispatch < 0 || directFakeTCP < 0 ||
-		!(preflight < typeWord && typeWord < xorDispatch && typeWord < directFakeTCP) {
+	directFakeTCP := strings.Index(egress, "return faketcp_encode_established(skb, info, rule, generation,")
+	if checkpoint < 0 || typeWord < 0 || xorDispatch < 0 || directFakeTCP < 0 ||
+		!(checkpoint < typeWord && typeWord < xorDispatch && typeWord < directFakeTCP) {
 		t.Fatal("egress must capture original UDP, rewrite type-word, apply XOR when configured, then encode FakeTCP")
 	}
 	xorContinuation := sourceSection(t, tc,
@@ -488,15 +631,17 @@ func TestFakeTCPMimicTransformCompositionOrderContract(t *testing.T) {
 		t.Fatal("XOR egress completion must precede the FakeTCP encoder tail call")
 	}
 
-	xdp := sourceSection(t, fake, "int wg_mix_faketcp_ingress(struct xdp_md *xdp)", "#endif")
-	udpRestore := strings.Index(xdp, "bpf_xdp_store_bytes(xdp, off + sizeof(*iph), &udp")
+	xdp := sourceSection(t, fake,
+		"faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)",
+		"SEC(\"xdp\")")
+	udpRestore := strings.Index(xdp, "bpf_xdp_store_bytes(xdp, l3.l4_off, &udp")
 	tailShrink := strings.Index(xdp, "bpf_xdp_adjust_tail(xdp, -FAKETCP_HEADER_DELTA)")
 	xdpPass := strings.LastIndex(xdp, "return XDP_PASS")
 	if udpRestore < 0 || tailShrink < 0 || xdpPass < 0 || !(udpRestore < tailShrink && tailShrink < xdpPass) {
 		t.Fatal("XDP must decode the FakeTCP header back to UDP before passing to TC ingress")
 	}
 	ingress := sourceSection(t, tc, "int wg_mix_ingress(struct __sk_buff *skb)", "char LICENSE[]")
-	metadataGate := strings.Index(ingress, "!faketcp_metadata_valid(skb, generation)")
+	metadataGate := strings.Index(ingress, "faketcp_consume_ingress_admission(skb, &info, listener,")
 	xorMetadata := strings.Index(ingress, "load_xor_ingress_metadata")
 	restoreTypeWord := strings.Index(ingress, "update_type_word(skb, &info, encrypted_wire, new_wire, 0)")
 	xorRestore := strings.Index(ingress, "bpf_tail_call(skb, &xor_ingress_programs")

@@ -58,15 +58,32 @@ type ActionCheckpoint struct {
 // ActionCheckpointStore is a one-slot atomic CAS store. A daemon may back it
 // with durable state; the in-memory implementation is suitable for one
 // process lifetime. Implementations must deep-copy packet bytes on ingress and
-// egress and must never report a successful CAS before the new value is
-// recoverable. A returned conflict must mean no mutation occurred; any other
-// write error is treated as an unrecoverable store fault by Controller because
-// its commit outcome cannot be inferred safely.
+// egress and preserve each reinjection step's CaptureFingerprint exactly across
+// create, load, update, and transition operations. The fingerprint covers the
+// pre-materialization capture sample and must never be reconstructed from the
+// stored packet bytes. Implementations must never report a successful CAS
+// before the new value is recoverable. A returned conflict must mean no mutation
+// occurred; any other write error is treated as an unrecoverable store fault by
+// Controller because its commit outcome cannot be inferred safely.
 type ActionCheckpointStore interface {
 	LoadActionCheckpoint() (ActionCheckpoint, bool, error)
 	CreateActionCheckpoint(ActionCheckpoint) (ActionCheckpoint, error)
 	UpdateActionCheckpoint(uint64, ActionCheckpoint) (ActionCheckpoint, error)
 	DeleteActionCheckpoint(uint64) error
+}
+
+// ActionCheckpointTransitionStore optionally advances only checkpoint
+// execution progress. It must durably CAS Phase, NextStep, and Revision while
+// leaving Identity, Operation, Steps, and every CaptureFingerprint unchanged.
+// NewActionRecovery binds this contract or the base update contract once for
+// its entire lifetime.
+type ActionCheckpointTransitionStore interface {
+	ActionCheckpointStore
+	TransitionActionCheckpoint(
+		expectedRevision uint64,
+		phase ActionCheckpointPhase,
+		nextStep int,
+	) (newRevision uint64, err error)
 }
 
 // MemoryActionCheckpointStore provides the exact CAS semantics used by tests
@@ -155,6 +172,35 @@ func (store *MemoryActionCheckpointStore) UpdateActionCheckpoint(
 	return cloneActionCheckpoint(copyCheckpoint), nil
 }
 
+func (store *MemoryActionCheckpointStore) TransitionActionCheckpoint(
+	expectedRevision uint64,
+	phase ActionCheckpointPhase,
+	nextStep int,
+) (uint64, error) {
+	if store == nil {
+		return 0, errors.New("faketcp action checkpoint store is nil")
+	}
+	if expectedRevision == 0 {
+		return 0, fmt.Errorf("%w: expected revision is zero", ErrActionCheckpointCorrupt)
+	}
+	store.mu.Lock()
+	defer store.mu.Unlock()
+	if store.checkpoint == nil || store.checkpoint.Revision != expectedRevision {
+		return 0, ErrActionCheckpointConflict
+	}
+	if err := validateActionCheckpointPosition(phase, nextStep, len(store.checkpoint.Steps)); err != nil {
+		return 0, err
+	}
+	revision, err := store.allocateRevisionLocked()
+	if err != nil {
+		return 0, err
+	}
+	store.checkpoint.Phase = phase
+	store.checkpoint.NextStep = nextStep
+	store.checkpoint.Revision = revision
+	return revision, nil
+}
+
 func (store *MemoryActionCheckpointStore) DeleteActionCheckpoint(expectedRevision uint64) error {
 	if store == nil {
 		return errors.New("faketcp action checkpoint store is nil")
@@ -195,10 +241,11 @@ type RecoveryReport struct {
 type ActionRecovery struct {
 	mu sync.Mutex
 
-	backend       ControllerBackend
-	store         ActionCheckpointStore
-	identity      RuntimeIdentity
-	nextOperation uint64
+	backend          ControllerBackend
+	store            ActionCheckpointStore
+	updateCheckpoint func(ActionCheckpoint) (ActionCheckpoint, error)
+	identity         RuntimeIdentity
+	nextOperation    uint64
 }
 
 func NewActionRecovery(
@@ -227,8 +274,28 @@ func NewActionRecovery(
 		nextOperation = checkpoint.Operation + 1
 	}
 	return &ActionRecovery{
-		backend: backend, store: store, identity: identity, nextOperation: nextOperation,
+		backend: backend, store: store, updateCheckpoint: bindActionCheckpointUpdate(store),
+		identity: identity, nextOperation: nextOperation,
 	}, nil
+}
+
+func bindActionCheckpointUpdate(
+	store ActionCheckpointStore,
+) func(ActionCheckpoint) (ActionCheckpoint, error) {
+	if transitionStore, ok := store.(ActionCheckpointTransitionStore); ok {
+		return func(checkpoint ActionCheckpoint) (ActionCheckpoint, error) {
+			revision, err := transitionStore.TransitionActionCheckpoint(
+				checkpoint.Revision,
+				checkpoint.Phase,
+				checkpoint.NextStep,
+			)
+			checkpoint.Revision = revision
+			return checkpoint, err
+		}
+	}
+	return func(checkpoint ActionCheckpoint) (ActionCheckpoint, error) {
+		return store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+	}
 }
 
 func (recovery *ActionRecovery) Execute(ctx context.Context, actions []Action) error {
@@ -341,7 +408,7 @@ func (recovery *ActionRecovery) continueLocked(
 		if step.Kind == ActionStepReinject {
 			checkpoint.Phase = ActionCheckpointPrepared
 			checkpoint.NextStep++
-			updated, err := recovery.store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+			updated, err := recovery.updateCheckpoint(checkpoint)
 			if err != nil {
 				return report, fmt.Errorf("%w: checkpoint ambiguous faketcp reinjection as skipped: %w", ErrActionRecoveryRequired, err)
 			}
@@ -349,7 +416,7 @@ func (recovery *ActionRecovery) continueLocked(
 			report.SkippedAmbiguousReinjections++
 		} else {
 			checkpoint.Phase = ActionCheckpointPrepared
-			updated, err := recovery.store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+			updated, err := recovery.updateCheckpoint(checkpoint)
 			if err != nil {
 				return report, fmt.Errorf("%w: checkpoint faketcp control replay: %w", ErrActionRecoveryRequired, err)
 			}
@@ -363,7 +430,7 @@ func (recovery *ActionRecovery) continueLocked(
 			return report, fmt.Errorf("%w: %w", ErrActionRecoveryRequired, err)
 		}
 		checkpoint.Phase = ActionCheckpointAttempting
-		updated, err := recovery.store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+		updated, err := recovery.updateCheckpoint(checkpoint)
 		if err != nil {
 			return report, fmt.Errorf("%w: mark faketcp action step attempting: %w", ErrActionRecoveryRequired, err)
 		}
@@ -374,7 +441,7 @@ func (recovery *ActionRecovery) continueLocked(
 		}
 		checkpoint.Phase = ActionCheckpointPrepared
 		checkpoint.NextStep++
-		updated, err = recovery.store.UpdateActionCheckpoint(checkpoint.Revision, checkpoint)
+		updated, err = recovery.updateCheckpoint(checkpoint)
 		if err != nil {
 			return report, fmt.Errorf("%w: checkpoint completed faketcp action step: %w", ErrActionRecoveryRequired, err)
 		}
@@ -389,30 +456,43 @@ func (recovery *ActionRecovery) continueLocked(
 
 func actionSteps(actions []Action) ([]ActionStep, error) {
 	steps := make([]ActionStep, 0, len(actions))
+	var captureBindings map[CaptureIdentity]capturedPacketBinding
 	for _, action := range actions {
 		switch action.Kind {
 		case ActionDrop, ActionForward, ActionClose:
 		case ActionSendControl:
-			steps = append(steps, ActionStep{
+			step := ActionStep{
 				Kind: ActionStepSendControl, Flow: action.Flow, WGID: action.WGID,
 				Control: action.Control, Reason: action.Reason,
-			})
+			}
+			if err := validateActionStep(step); err != nil {
+				return nil, err
+			}
+			steps = append(steps, step)
 		case ActionReleasePending:
 			for _, packet := range action.Packets {
-				copyPacket := packet
-				copyPacket.Data = append([]byte(nil), packet.Data...)
-				steps = append(steps, ActionStep{
-					Kind: ActionStepReinject, Flow: action.Flow, Packet: copyPacket,
+				step := ActionStep{
+					Kind: ActionStepReinject, Flow: action.Flow, Packet: packet,
 					Reason: action.Reason,
-				})
+				}
+				if err := validateActionStep(step); err != nil {
+					return nil, err
+				}
+				if captureBindings == nil {
+					captureBindings = make(map[CaptureIdentity]capturedPacketBinding)
+				}
+				duplicate, err := observeCapturedPacket(captureBindings, action.Flow, packet)
+				if err != nil {
+					return nil, fmt.Errorf("canonicalize faketcp captured packet: %w", err)
+				}
+				if duplicate {
+					continue
+				}
+				step.Packet.Data = append([]byte(nil), packet.Data...)
+				steps = append(steps, step)
 			}
 		default:
 			return nil, fmt.Errorf("unknown faketcp action kind %d", action.Kind)
-		}
-	}
-	for _, step := range steps {
-		if err := validateActionStep(step); err != nil {
-			return nil, err
 		}
 	}
 	return steps, nil
@@ -438,14 +518,8 @@ func validateActionCheckpoint(checkpoint ActionCheckpoint) error {
 	if checkpoint.Operation == 0 || len(checkpoint.Steps) == 0 {
 		return fmt.Errorf("%w: zero operation or empty steps", ErrActionCheckpointCorrupt)
 	}
-	if checkpoint.NextStep < 0 || checkpoint.NextStep > len(checkpoint.Steps) {
-		return fmt.Errorf("%w: next step %d of %d", ErrActionCheckpointCorrupt, checkpoint.NextStep, len(checkpoint.Steps))
-	}
-	if checkpoint.Phase != ActionCheckpointPrepared && checkpoint.Phase != ActionCheckpointAttempting {
-		return fmt.Errorf("%w: phase %d", ErrActionCheckpointCorrupt, checkpoint.Phase)
-	}
-	if checkpoint.Phase == ActionCheckpointAttempting && checkpoint.NextStep == len(checkpoint.Steps) {
-		return fmt.Errorf("%w: attempting after final step", ErrActionCheckpointCorrupt)
+	if err := validateActionCheckpointPosition(checkpoint.Phase, checkpoint.NextStep, len(checkpoint.Steps)); err != nil {
+		return err
 	}
 	if err := validateRuntimeIdentity(checkpoint.Identity); err != nil {
 		return fmt.Errorf("%w: %v", ErrActionCheckpointCorrupt, err)
@@ -466,6 +540,51 @@ func validateActionCheckpoint(checkpoint ActionCheckpoint) error {
 				ErrActionCheckpointCorrupt,
 			)
 		}
+	}
+	if err := validateCheckpointCaptureBindings(checkpoint); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateCheckpointCaptureBindings(checkpoint ActionCheckpoint) error {
+	var bindings map[CaptureIdentity]capturedPacketBinding
+	for index, step := range checkpoint.Steps {
+		if step.Kind != ActionStepReinject {
+			continue
+		}
+		if bindings == nil {
+			bindings = make(map[CaptureIdentity]capturedPacketBinding)
+		}
+		duplicate, err := observeCapturedPacket(bindings, step.Flow, step.Packet)
+		if err != nil {
+			return fmt.Errorf(
+				"%w: capture binding at step %d: %w",
+				ErrActionCheckpointCorrupt,
+				index,
+				err,
+			)
+		}
+		if duplicate {
+			return fmt.Errorf(
+				"%w: duplicate capture identity at step %d",
+				ErrActionCheckpointCorrupt,
+				index,
+			)
+		}
+	}
+	return nil
+}
+
+func validateActionCheckpointPosition(phase ActionCheckpointPhase, nextStep, stepCount int) error {
+	if nextStep < 0 || nextStep > stepCount {
+		return fmt.Errorf("%w: next step %d of %d", ErrActionCheckpointCorrupt, nextStep, stepCount)
+	}
+	if phase != ActionCheckpointPrepared && phase != ActionCheckpointAttempting {
+		return fmt.Errorf("%w: phase %d", ErrActionCheckpointCorrupt, phase)
+	}
+	if phase == ActionCheckpointAttempting && nextStep == stepCount {
+		return fmt.Errorf("%w: attempting after final step", ErrActionCheckpointCorrupt)
 	}
 	return nil
 }
@@ -497,6 +616,9 @@ func validateActionStep(step ActionStep) error {
 		}
 		if err := validateCaptureIdentity(step.Packet.CaptureID, step.Flow.Generation); err != nil {
 			return fmt.Errorf("faketcp reinjection action step identity: %w", err)
+		}
+		if step.Packet.CaptureFingerprint == ([32]byte{}) {
+			return errors.New("faketcp reinjection action step has no capture fingerprint")
 		}
 	default:
 		return fmt.Errorf("unknown faketcp action step kind %d", step.Kind)

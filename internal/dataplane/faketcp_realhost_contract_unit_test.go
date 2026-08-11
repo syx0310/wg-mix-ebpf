@@ -48,6 +48,7 @@ func TestParseFakeTCPRealHostContract(t *testing.T) {
 		contract.baselineObject != "/run/wg-mix-ebpf-source-stages/c8e41d73/source/build/wg_mix_tc.o" ||
 		contract.ifindex != 101 || contract.peerIfindex != 102 ||
 		contract.xdpMode != fakeTCPRealHostXDPGeneric || contract.runID != "c8e41d73" ||
+		contract.resourceID != "c8e41d73" ||
 		contract.tempRoot != "/run/wg-mix-ebpf-source-stages/c8e41d73/go-tmp-realhost" ||
 		contract.vethName != "wgc8e41a" || contract.peerVethName != "wgc8e41b" ||
 		contract.vethAlias != "wg-mix-ebpf:c8e41d73:a" ||
@@ -56,6 +57,24 @@ func TestParseFakeTCPRealHostContract(t *testing.T) {
 	}
 	if _, err := parseFakeTCPRealHostContract(nil); err == nil {
 		t.Fatal("nil environment lookup was accepted")
+	}
+}
+
+func TestParseFakeTCPRealHostContractWithDistinctResourceIdentity(t *testing.T) {
+	values := validFakeTCPRealHostEnvironment()
+	values[fakeTCPRealHostResourceIDEnv] = "5b8d30f1"
+	values[fakeTCPRealHostTempRootEnv] =
+		"/run/wg-mix-ebpf-source-stages/c8e41d73/go-tmp-realhost-5b8d30f1"
+	contract, err := parseFakeTCPRealHostContract(mapFakeTCPRealHostEnvironment(values))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if contract.runID != "c8e41d73" || contract.resourceID != "5b8d30f1" ||
+		contract.tempRoot != values[fakeTCPRealHostTempRootEnv] ||
+		contract.vethName != "wg5b8d3a" || contract.peerVethName != "wg5b8d3b" ||
+		contract.vethAlias != "wg-mix-ebpf:c8e41d73:5b8d30f1:a" ||
+		contract.peerVethAlias != "wg-mix-ebpf:c8e41d73:5b8d30f1:b" {
+		t.Fatalf("parsed resource-scoped contract = %#v", contract)
 	}
 }
 
@@ -173,6 +192,34 @@ func TestParseFakeTCPRealHostContractRejectsDriftBeforeMutation(t *testing.T) {
 			match: "lower-case nonzero hexadecimal",
 		},
 		{
+			name: "empty resource ID",
+			mutate: func(values map[string]string) {
+				values[fakeTCPRealHostResourceIDEnv] = ""
+			},
+			match: "is required",
+		},
+		{
+			name: "uppercase resource ID",
+			mutate: func(values map[string]string) {
+				values[fakeTCPRealHostResourceIDEnv] = "5B8D30F1"
+			},
+			match: "lower-case nonzero hexadecimal",
+		},
+		{
+			name: "resource ID reuses stage run ID",
+			mutate: func(values map[string]string) {
+				values[fakeTCPRealHostResourceIDEnv] = values[fakeTCPRealHostRunIDEnv]
+			},
+			match: "distinct from",
+		},
+		{
+			name: "resource ID without resource temp root",
+			mutate: func(values map[string]string) {
+				values[fakeTCPRealHostResourceIDEnv] = "5b8d30f1"
+			},
+			match: "reviewed v6 temporary directory",
+		},
+		{
 			name: "foreign temp root",
 			mutate: func(values map[string]string) {
 				values[fakeTCPRealHostTempRootEnv] = "/tmp"
@@ -221,13 +268,15 @@ func TestFakeTCPRealHostLinuxEntryPointStaticContract(t *testing.T) {
 		"validateFakeTCPRealHostOwnedVethPair(t, contract)",
 		"assertFakeTCPRealHostKernelEmpty(t, contract)",
 		"fakeTCPRealHostStatCount",
-		"fakeTCPRealHostStatChecksumNoneAccepted",
-		"fakeTCPRealHostStatChecksumPartialReset",
+		"fakeTCPRealHostStatMTUReject",
+		"fakeTCPRealHostMTURouteUnknownAuditKey",
 		"unix.PACKET_VNET_HDR",
 		"unix.VIRTIO_NET_HDR_F_NEEDS_CSUM",
 		"unix.VIRTIO_NET_HDR_GSO_UDP_L4",
-		"sendFakeTCPRealHostGSOProbe",
-		"assertNoFakeTCPRealHostGSOProbePacket",
+		"sendFakeTCPRealHostDropProbe",
+		"assertNoFakeTCPRealHostFlowPacket",
+		"faketcp_mtu_audit_map",
+		"deferred to the separately reviewed routed-veth harness",
 		"TestFakeTCPRealHostGSOProbeIsolationContract",
 	} {
 		if !strings.Contains(source, required) {

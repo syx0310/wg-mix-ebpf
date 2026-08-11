@@ -135,6 +135,48 @@ func TestControllerHandshakeSendsControlAndReinjectsFirstPacketOnce(t *testing.T
 	}
 }
 
+func TestControllerCapturedOutboundRetriesPendingDeleteBeforeLookup(t *testing.T) {
+	failure := errors.New("exact delete failed after claim")
+	store := newModelClaimSessionStore(t, modelClaimDeleteFailure{err: failure})
+	engine, clock, flow, _ := establishedModelClaimTestEngine(t, store)
+	clock.Add(engine.opts.IdleTimeout)
+	if actions, err := engine.Tick(); !errors.Is(err, failure) ||
+		len(actions) != 1 || actions[0].Reason != "session-store-unavailable" {
+		t.Fatalf("initial claim actions=%#v err=%v", actions, err)
+	}
+	lookupsBefore, deletesBefore := store.counts()
+
+	backend := &fakeControllerBackend{}
+	controller, err := NewController(engine, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	packet := testIPv4UDPPacket(t, flow, []byte{1, 2, 3, 4})
+	event := abi.FakeTCPEvent{
+		Key: flow, Type: abi.FakeTCPEventNeedHandshake,
+		PacketLength: uint16(len(packet)), PayloadLength: 4, WGID: 77,
+	}
+	bindTestEvent(&event, engine.Identity(), 2)
+	actions, err := controller.HandleSample(
+		context.Background(),
+		testEventSample(event, packet, false),
+	)
+	if err != nil || len(actions) != 1 ||
+		actions[0].Kind != ActionClose || actions[0].Reason != "idle-timeout" {
+		t.Fatalf("captured retry actions=%#v err=%v", actions, err)
+	}
+	lookupsAfter, deletesAfter := store.counts()
+	if lookupsAfter != lookupsBefore || deletesAfter != deletesBefore+1 {
+		t.Fatalf("captured retry lookups=%d/%d deletes=%d/%d",
+			lookupsAfter, lookupsBefore, deletesAfter, deletesBefore+1)
+	}
+	if engine.sessions[flow] != nil || len(backend.packets) != 0 ||
+		len(backend.sent) != 0 || len(backend.operations) != 0 {
+		t.Fatalf("captured packet escaped drop or slow state survived: session=%#v backend=%#v",
+			engine.sessions[flow], backend)
+	}
+}
+
 func TestDecodeEventSampleRejectsUnversionedOrAmbiguousIdentity(t *testing.T) {
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1})
@@ -216,6 +258,91 @@ func TestDecodeEventSampleAcceptsCompactAndFixedPacketRecords(t *testing.T) {
 		if decoded.Event != event || !bytes.Equal(decoded.Packet, packet) {
 			t.Fatalf("fixed=%t decoded=%#v", fixed, decoded)
 		}
+	}
+}
+
+func TestDecodeEventSampleOwnsPacket(t *testing.T) {
+	flow := testFlow(31001)
+	packet := testIPv4UDPPacket(t, flow, []byte{9, 8, 7})
+	event := abi.FakeTCPEvent{
+		Key: flow, PayloadLength: 3, PacketLength: uint16(len(packet)),
+		Type: abi.FakeTCPEventNeedHandshake,
+	}
+	bindTestEvent(&event, testRuntimeIdentity(flow.Generation), 1)
+	sample := testBoundEventSample(event, packet, false)
+	decoded, err := DecodeEventSample(sample)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := decoded.Packet[0]
+	sample[fakeTCPEventSize] ^= 0xff
+	if decoded.Packet[0] != want {
+		t.Fatal("decoded packet aliases its input sample")
+	}
+}
+
+func TestDecodeEventSampleAcceptsCompactAndFixedCloseRecords(t *testing.T) {
+	engine, _, flow, state := establishedControlTestSession(t)
+	for _, flags := range []uint8{FlagRST | FlagACK, FlagFIN | FlagACK} {
+		event, packet := capturedCloseEvent(engine, flow, state, flags, 7)
+		for _, fixed := range []bool{false, true} {
+			decoded, err := DecodeEventSample(testBoundEventSample(event, packet, fixed))
+			if err != nil {
+				t.Fatalf("flags=%#x fixed=%t: %v", flags, fixed, err)
+			}
+			if decoded.Event != event || !bytes.Equal(decoded.Packet, packet) {
+				t.Fatalf("flags=%#x fixed=%t decoded=%#v", flags, fixed, decoded)
+			}
+		}
+	}
+}
+
+func TestControllerCloseValidationDropsForgeryThenAcceptsExactPacket(t *testing.T) {
+	engine, store, flow, state := establishedControlTestSession(t)
+	backend := &fakeControllerBackend{}
+	controller, err := NewController(engine, backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	event, packet := capturedCloseEvent(engine, flow, state, FlagRST|FlagACK, 7)
+	mismatched := event
+	mismatched.Sequence++
+	actions, err := controller.HandleSample(
+		context.Background(), testBoundEventSample(mismatched, packet, false),
+	)
+	if err != nil || len(actions) != 1 || actions[0].Reason != "invalid-close-control" {
+		t.Fatalf("mismatched close actions=%#v err=%v", actions, err)
+	}
+	forged := append([]byte(nil), packet...)
+	forged[36] ^= 1
+	actions, err = controller.HandleSample(
+		context.Background(), testBoundEventSample(event, forged, false),
+	)
+	if err != nil || len(actions) != 1 || actions[0].Reason != "invalid-close-control" {
+		t.Fatalf("forged close actions=%#v err=%v", actions, err)
+	}
+	if _, found := store.values[flow]; !found || store.deleteAttempts != 0 {
+		t.Fatalf("forged close touched session: found=%t attempts=%d", found, store.deleteAttempts)
+	}
+
+	actions, err = controller.HandleSample(
+		context.Background(), testBoundEventSample(event, packet, false),
+	)
+	if err != nil || len(actions) != 1 || actions[0].Reason != "peer-close" {
+		t.Fatalf("exact close actions=%#v err=%v", actions, err)
+	}
+	if _, found := store.values[flow]; found || store.deleteAttempts != 1 {
+		t.Fatalf("exact close result: found=%t attempts=%d", found, store.deleteAttempts)
+	}
+	if len(backend.operations) != 0 {
+		t.Fatalf("peer close unexpectedly reached packet/control backend: %v", backend.operations)
+	}
+
+	actions, err = controller.HandleSample(
+		context.Background(), testBoundEventSample(event, packet, false),
+	)
+	if err != nil || len(actions) != 1 || actions[0].Reason != "unknown-close" {
+		t.Fatalf("replayed close actions=%#v err=%v", actions, err)
 	}
 }
 
@@ -1090,7 +1217,7 @@ func testBoundEventSample(event abi.FakeTCPEvent, packet []byte, fixed bool) []b
 // hidden by a shared helper.
 func testEventSample(event abi.FakeTCPEvent, packet []byte, fixed bool) []byte {
 	size := fakeTCPEventSize + len(packet)
-	if fixed && event.Type == abi.FakeTCPEventNeedHandshake {
+	if fixed && fakeTCPEventCarriesPacket(event.Type) {
 		size = fakeTCPPacketEventSize
 	}
 	sample := make([]byte, size)
@@ -1104,16 +1231,18 @@ func testEventSample(event abi.FakeTCPEvent, packet []byte, fixed bool) []byte {
 	native.PutUint64(sample[24:32], event.TimestampNanos)
 	copy(sample[32:48], event.RuntimeIncarnation[:])
 	native.PutUint64(sample[48:56], event.CaptureSequence)
-	native.PutUint32(sample[56:60], event.CaptureCPU)
-	native.PutUint32(sample[60:64], event.Sequence)
-	native.PutUint32(sample[64:68], event.Acknowledgement)
-	native.PutUint32(sample[68:72], event.PayloadLength)
-	native.PutUint32(sample[72:76], event.FWMark)
-	native.PutUint32(sample[76:80], event.WGID)
-	native.PutUint16(sample[80:82], event.PacketLength)
-	native.PutUint16(sample[82:84], event.EventABIVersion)
-	sample[84] = event.Type
-	sample[85] = event.TCPFlags
+	native.PutUint64(sample[56:64], event.SessionRevision)
+	native.PutUint64(sample[64:72], event.SessionID)
+	native.PutUint32(sample[72:76], event.CaptureCPU)
+	native.PutUint32(sample[76:80], event.Sequence)
+	native.PutUint32(sample[80:84], event.Acknowledgement)
+	native.PutUint32(sample[84:88], event.PayloadLength)
+	native.PutUint32(sample[88:92], event.FWMark)
+	native.PutUint32(sample[92:96], event.WGID)
+	native.PutUint16(sample[96:98], event.PacketLength)
+	native.PutUint16(sample[98:100], event.EventABIVersion)
+	sample[100] = event.Type
+	sample[101] = event.TCPFlags
 	copy(sample[fakeTCPEventSize:], packet)
 	return sample
 }
@@ -1131,7 +1260,7 @@ func bindTestEvent(event *abi.FakeTCPEvent, identity RuntimeIdentity, captureSeq
 	}
 }
 
-func testIPv4UDPPacket(t *testing.T, flow abi.FakeTCPSessionKey, payload []byte) []byte {
+func testIPv4UDPPacket(t testing.TB, flow abi.FakeTCPSessionKey, payload []byte) []byte {
 	t.Helper()
 	packet := make([]byte, 20+8+len(payload))
 	packet[0] = 0x45

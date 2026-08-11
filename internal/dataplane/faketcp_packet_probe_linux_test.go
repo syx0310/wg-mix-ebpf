@@ -62,27 +62,42 @@ type fakeTCPSKBContext struct {
 	HardwareStamp  uint64
 }
 
+type fakeTCPXDPContext struct {
+	Data           uint32
+	DataEnd        uint32
+	DataMeta       uint32
+	IngressIfindex uint32
+	RXQueueIndex   uint32
+	EgressIfindex  uint32
+}
+
 func TestFakeTCPSKBContextLayout(t *testing.T) {
 	if got, want := binary.Size(fakeTCPSKBContext{}), 192; got != want {
 		t.Fatalf("serialized __sk_buff context size=%d, want %d", got, want)
 	}
 }
 
+func TestFakeTCPXDPContextLayout(t *testing.T) {
+	if got, want := binary.Size(fakeTCPXDPContext{}), 24; got != want {
+		t.Fatalf("serialized xdp_md context size=%d, want %d", got, want)
+	}
+}
+
 // TestFakeTCPBPFPacketProbe verifier-loads the separately built experimental
-// object, populates only in-memory maps, and invokes the TC egress program with
-// BPF_PROG_TEST_RUN. It never attaches or pins a program. The test-run ABI
-// cannot synthesize ip_summed/csum_start/csum_offset, so its default skb covers
-// only the CHECKSUM_NONE path used after raw/IP_HDRINCL reinjection has already
-// materialized the UDP checksum. A successful cell is never evidence that the
-// real-TC CHECKSUM_PARTIAL path works. This probe covers verifier loading,
-// CHECKSUM_NONE transformation, GSO rejection and frame boundaries. Run
+// object, populates only in-memory maps, and invokes the TC egress and XDP
+// ingress programs with BPF_PROG_TEST_RUN. It never attaches or pins a program.
+// The test-run ABI cannot synthesize ip_summed/csum_start/csum_offset or skb_dst. The unified
+// prepare contract must therefore reject its otherwise materialized
+// CHECKSUM_NONE skb as route-PMTU-unknown before mutation. Success belongs only
+// to routed real-TC evidence. This probe covers verifier loading, the no-route
+// fail-closed boundary, synthetic unsupported-GSO metadata and frame caps. Run
 // explicitly on a Linux test host as:
 //
 //	WG_MIX_FAKETCP_PACKET_TEST_OBJECT=/absolute/wg_mix_faketcp_experimental.o \
 //	  go test ./internal/dataplane -run '^TestFakeTCPBPFPacketProbe$' -v
 //
-// CHECKSUM_PARTIAL normalization remains a separately reviewed real-TC/NIC
-// acceptance requirement.
+// CHECKSUM_PARTIAL normalization and successful PMTU admission remain
+// separately reviewed real-TC/NIC acceptance requirements.
 func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	objectPath := os.Getenv(fakeTCPPacketProbeObjectEnv)
 	if objectPath == "" {
@@ -109,7 +124,7 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	if err != nil {
 		t.Fatalf("load experimental object %s (%s): %v", identity.Source, identity.SHA256, err)
 	}
-	defer collection.Close()
+	t.Cleanup(collection.Close)
 
 	const (
 		generation = uint64(91)
@@ -119,6 +134,15 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 		sourcePort = uint16(31001)
 		remotePort = uint16(443)
 	)
+	incarnation := faketcp.RuntimeIncarnation{1}
+	openFakeTCPPacketProbeGenerationGate(
+		t, collection, generation, incarnation, ifindex, remotePort,
+	)
+	t.Run("generation poison fails closed", func(t *testing.T) {
+		probeFakeTCPPacketProbePoisonFailClosed(
+			t, spec.Copy(), generation, incarnation, ifindex, remotePort,
+		)
+	})
 	localIPv4, err := faketcp.RawIPv4BE32(netip.MustParseAddr("10.0.0.1"))
 	if err != nil {
 		t.Fatal(err)
@@ -132,10 +156,15 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 		t.Fatal("experimental object has no wg_mix_egress program")
 	}
 	populateFakeTCPPacketProbeTailCalls(t, collection, generation)
+	probeFakeTCPXDPParserModes(t, collection, generation, wgID, ifindex, remotePort)
+	// The following TC matrix retains its original Ethernet-first parser:auto
+	// contract. A leaked ParserL3 entry changes its first action and fails it.
+	requireFakeTCPPacketProbeUnderlayAbsent(t, collection, generation, ifindex)
 
 	const (
-		fakeTCPStatBadPacket = uint32(4)
-		fakeTCPStatGSOReject = uint32(5)
+		fakeTCPStatBadPacket           = uint32(4)
+		fakeTCPStatGSOReject           = uint32(5)
+		fakeTCPMTURouteUnknownAuditKey = uint32(3*3 + 2)
 	)
 	for _, xorEnabled := range []bool{false, true} {
 		for _, payloadLength := range []int{32, 33, 1459, 1460} {
@@ -144,10 +173,13 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 				name += "-xor"
 			}
 			t.Run(name, func(t *testing.T) {
-				xorKey := populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
+				populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
 					ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, xorEnabled)
-				packet, originalPayload := buildFakeTCPProbeUDPPacket(
+				packet, _ := buildFakeTCPProbeUDPPacket(
 					t, sourcePort, remotePort, payloadLength,
+				)
+				before := readFakeTCPPacketProbeMapCounter(
+					t, collection, "faketcp_mtu_audit_map", fakeTCPMTURouteUnknownAuditKey,
 				)
 				context := fakeTCPSKBContext{Ifindex: ifindex}
 				result, output, err := runFakeTCPPacketProbe(
@@ -156,12 +188,18 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 				if err != nil {
 					t.Fatalf("BPF_PROG_TEST_RUN materialized packet: %v", err)
 				}
-				if result != 0 {
-					t.Fatalf("CHECKSUM_NONE packet action=%d, want TC_ACT_OK", result)
+				if result != 2 {
+					t.Fatalf("no-route CHECKSUM_NONE packet action=%d, want TC_ACT_SHOT", result)
 				}
-				verifyFakeTCPProbeOutput(
-					t, output, packet, originalPayload, sourcePort, remotePort, xorKey,
+				if !bytes.Equal(output, packet) {
+					t.Fatal("no-route CHECKSUM_NONE packet mutated before PMTU rejection")
+				}
+				after := readFakeTCPPacketProbeMapCounter(
+					t, collection, "faketcp_mtu_audit_map", fakeTCPMTURouteUnknownAuditKey,
 				)
+				if after != before+1 {
+					t.Fatalf("route-unknown audit delta=%d, want 1", after-before)
+				}
 			})
 		}
 	}
@@ -169,19 +207,28 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	t.Run("frame-cap-exact-materialized", func(t *testing.T) {
 		populateFakeTCPPacketProbeMaps(t, collection, generation, profileID, wgID,
 			ifindex, sourcePort, remotePort, localIPv4, remoteIPv4, false)
-		packet, originalPayload := buildFakeTCPProbeUDPPacket(t, sourcePort, remotePort, 2276)
+		packet, _ := buildFakeTCPProbeUDPPacket(t, sourcePort, remotePort, 2276)
+		before := readFakeTCPPacketProbeMapCounter(
+			t, collection, "faketcp_mtu_audit_map", fakeTCPMTURouteUnknownAuditKey,
+		)
 		result, output, err := runFakeTCPPacketProbe(
 			program, packet, fakeTCPSKBContext{Ifindex: ifindex}, len(packet)+64,
 		)
 		if err != nil {
 			t.Fatalf("BPF_PROG_TEST_RUN exact frame boundary: %v", err)
 		}
-		if result != 0 {
-			t.Fatalf("exact frame-boundary packet action=%d, want TC_ACT_OK", result)
+		if result != 2 {
+			t.Fatalf("no-route exact frame-boundary action=%d, want TC_ACT_SHOT", result)
 		}
-		verifyFakeTCPProbeOutput(
-			t, output, packet, originalPayload, sourcePort, remotePort, nil,
+		if !bytes.Equal(output, packet) {
+			t.Fatal("no-route exact frame-boundary packet mutated before PMTU rejection")
+		}
+		after := readFakeTCPPacketProbeMapCounter(
+			t, collection, "faketcp_mtu_audit_map", fakeTCPMTURouteUnknownAuditKey,
 		)
+		if after != before+1 {
+			t.Fatalf("route-unknown audit delta=%d, want 1", after-before)
+		}
 	})
 
 	t.Run("frame-cap-one-over-hard-reject", func(t *testing.T) {
@@ -239,23 +286,344 @@ func TestFakeTCPBPFPacketProbe(t *testing.T) {
 	})
 }
 
+func openFakeTCPPacketProbeGenerationGate(
+	t *testing.T,
+	collection *ebpf.Collection,
+	generation uint64,
+	incarnation faketcp.RuntimeIncarnation,
+	ifindex uint32,
+	destinationPort uint16,
+) {
+	t.Helper()
+	gate := collection.Maps[fakeTCPGenerationGateMapName]
+	wake := collection.Maps[fakeTCPGenerationWakeMapName]
+	runtimeIdentity := collection.Maps[fakeTCPRuntimeIDMapName]
+	control := collection.Programs[fakeTCPGenerationControlProgramName]
+	xdp := collection.Programs[fakeTCPXDPProgramName]
+	if gate == nil || wake == nil || runtimeIdentity == nil || control == nil || xdp == nil {
+		t.Fatal("experimental object has an incomplete generation barrier")
+	}
+	if err := validateLiveFakeTCPGenerationControl(gate, wake, runtimeIdentity, control); err != nil {
+		t.Fatalf("validate packet-probe generation control identity: %v", err)
+	}
+	if err := gate.Update(uint32(0), abi.FakeTCPGenerationGateValue{
+		Generation: generation,
+		State:      abi.FakeTCPGenerationStateOpen,
+	}, ebpf.UpdateAny); !errors.Is(err, unix.EPERM) {
+		t.Fatalf("syscall write to BPF_F_RDONLY generation gate error=%v, want EPERM", err)
+	}
+	updateFakeTCPPacketProbeRuntimeIdentity(t, runtimeIdentity, generation, incarnation)
+	if result, err := runFakeTCPPacketProbeGenerationControl(
+		control, generation, incarnation, abi.FakeTCPGenerationControlAssertClosed,
+	); err != nil || result != abi.FakeTCPGenerationResultIdle {
+		t.Fatalf("ASSERT_CLOSED result=%d error=%v", result, err)
+	}
+
+	controlMap := collection.Maps["control_map"]
+	if controlMap == nil {
+		t.Fatal("experimental object has no control_map")
+	}
+	if err := controlMap.Update(abi.ControlKeyGlobal, abi.ControlValue{
+		ActiveGeneration: generation,
+		ABIVersion:       abi.Version,
+	}, ebpf.UpdateAny); err != nil {
+		t.Fatalf("publish unopened packet-probe selector: %v", err)
+	}
+	packet, _ := buildFakeTCPProbeUDPPacket(t, 31001, destinationPort, 32)
+	result, output, err := runFakeTCPPacketProbe(
+		xdp, packet, fakeTCPXDPContext{IngressIfindex: ifindex}, len(packet)+64,
+	)
+	if err != nil || result != uint32(1) || !bytes.Equal(output, packet) {
+		t.Fatalf("unopened generation action=%d error=%v mutated=%t",
+			result, err, !bytes.Equal(output, packet))
+	}
+
+	if result, err := runFakeTCPPacketProbeGenerationControl(
+		control, generation, incarnation, abi.FakeTCPGenerationControlOpen,
+	); err != nil || result != abi.FakeTCPGenerationResultOpen {
+		t.Fatalf("OPEN result=%d error=%v", result, err)
+	}
+	t.Cleanup(func() {
+		result, err := runFakeTCPPacketProbeGenerationControl(
+			control, generation, incarnation, abi.FakeTCPGenerationControlClose,
+		)
+		if err != nil || result != abi.FakeTCPGenerationResultIdle {
+			t.Errorf("CLOSE result=%d error=%v", result, err)
+			return
+		}
+		var observed abi.FakeTCPGenerationGateValue
+		if err := gate.Lookup(uint32(0), &observed); err != nil {
+			t.Errorf("reread closed generation gate: %v", err)
+		} else if observed.Generation != generation ||
+			observed.State != abi.FakeTCPGenerationStateSealed {
+			t.Errorf("closed generation gate=%#v, want sealed idle", observed)
+		}
+	})
+}
+
+func probeFakeTCPPacketProbePoisonFailClosed(
+	t *testing.T,
+	spec *ebpf.CollectionSpec,
+	generation uint64,
+	incarnation faketcp.RuntimeIncarnation,
+	ifindex uint32,
+	destinationPort uint16,
+) {
+	t.Helper()
+	collection, err := ebpf.NewCollection(spec)
+	if err != nil {
+		t.Fatalf("load poison-negative experimental collection: %v", err)
+	}
+	defer collection.Close()
+	gate := collection.Maps[fakeTCPGenerationGateMapName]
+	runtimeIdentity := collection.Maps[fakeTCPRuntimeIDMapName]
+	control := collection.Programs[fakeTCPGenerationControlProgramName]
+	xdp := collection.Programs[fakeTCPXDPProgramName]
+	if gate == nil || runtimeIdentity == nil || control == nil || xdp == nil {
+		t.Fatal("poison-negative collection has an incomplete generation barrier")
+	}
+	updateFakeTCPPacketProbeRuntimeIdentity(t, runtimeIdentity, generation, incarnation)
+	wrongIncarnation := incarnation
+	wrongIncarnation[1] = 1
+	if result, err := runFakeTCPPacketProbeGenerationControl(
+		control, generation, wrongIncarnation, abi.FakeTCPGenerationControlAssertClosed,
+	); err != nil || result != abi.FakeTCPGenerationResultMalformed {
+		t.Fatalf("wrong-incarnation result=%d error=%v", result, err)
+	}
+	var observed abi.FakeTCPGenerationGateValue
+	if err := gate.Lookup(uint32(0), &observed); err != nil || observed != (abi.FakeTCPGenerationGateValue{}) {
+		t.Fatalf("wrong incarnation changed fresh gate=%#v error=%v", observed, err)
+	}
+	if result, err := runFakeTCPPacketProbeGenerationControl(
+		control, generation, incarnation, abi.FakeTCPGenerationControlClose,
+	); err != nil || result != abi.FakeTCPGenerationResultIdle {
+		t.Fatalf("terminal CLOSE-before-OPEN result=%d error=%v", result, err)
+	}
+
+	wrongGeneration := generation + 1
+	wrongGenerationIncarnation := faketcp.RuntimeIncarnation{2}
+	updateFakeTCPPacketProbeRuntimeIdentity(
+		t, runtimeIdentity, wrongGeneration, wrongGenerationIncarnation,
+	)
+	if result, err := runFakeTCPPacketProbeGenerationControl(
+		control, wrongGeneration, wrongGenerationIncarnation, abi.FakeTCPGenerationControlOpen,
+	); err != nil || result != abi.FakeTCPGenerationResultPoison {
+		t.Fatalf("wrong-generation OPEN result=%d error=%v", result, err)
+	}
+	if err := gate.Lookup(uint32(0), &observed); err != nil ||
+		observed.Generation != generation ||
+		observed.State&abi.FakeTCPGenerationStatePoison == 0 {
+		t.Fatalf("wrong generation did not stick poison: gate=%#v error=%v", observed, err)
+	}
+
+	controlMap := collection.Maps["control_map"]
+	if controlMap == nil {
+		t.Fatal("poison-negative collection has no control_map")
+	}
+	if err := controlMap.Update(abi.ControlKeyGlobal, abi.ControlValue{
+		ActiveGeneration: generation,
+		ABIVersion:       abi.Version,
+	}, ebpf.UpdateAny); err != nil {
+		t.Fatalf("publish poison-negative selector: %v", err)
+	}
+	packet, _ := buildFakeTCPProbeUDPPacket(t, 31001, destinationPort, 32)
+	result, output, err := runFakeTCPPacketProbe(
+		xdp, packet, fakeTCPXDPContext{IngressIfindex: ifindex}, len(packet)+64,
+	)
+	if err != nil || result != uint32(1) || !bytes.Equal(output, packet) {
+		t.Fatalf("poisoned generation action=%d error=%v mutated=%t",
+			result, err, !bytes.Equal(output, packet))
+	}
+}
+
+func updateFakeTCPPacketProbeRuntimeIdentity(
+	t *testing.T,
+	runtimeIdentity *ebpf.Map,
+	generation uint64,
+	incarnation faketcp.RuntimeIncarnation,
+) {
+	t.Helper()
+	value := abi.FakeTCPRuntimeIdentityValue{
+		Generation:      generation,
+		Incarnation:     [16]byte(incarnation),
+		EventABIVersion: abi.FakeTCPEventABIVersion,
+	}
+	if err := runtimeIdentity.Update(uint32(0), value, ebpf.UpdateAny); err != nil {
+		t.Fatalf("populate packet-probe runtime identity: %v", err)
+	}
+}
+
+func runFakeTCPPacketProbeGenerationControl(
+	control *ebpf.Program,
+	generation uint64,
+	incarnation faketcp.RuntimeIncarnation,
+	operation uint32,
+) (uint32, error) {
+	request := make([]byte, 32)
+	binary.NativeEndian.PutUint64(request[0:8], generation)
+	copy(request[8:24], incarnation[:])
+	binary.NativeEndian.PutUint32(request[24:28], operation)
+	return control.Run(&ebpf.RunOptions{Data: request})
+}
+
+func probeFakeTCPXDPParserModes(
+	t *testing.T,
+	collection *ebpf.Collection,
+	generation uint64,
+	wgID uint32,
+	ifindex uint32,
+	destinationPort uint16,
+) {
+	t.Helper()
+	program := collection.Programs["wg_mix_faketcp_ingress"]
+	if program == nil {
+		t.Fatal("experimental object has no wg_mix_faketcp_ingress program")
+	}
+	for _, update := range []struct {
+		mapName string
+		key     any
+		value   any
+	}{
+		{
+			mapName: "control_map",
+			key:     abi.ControlKeyGlobal,
+			value: abi.ControlValue{
+				ActiveGeneration: generation,
+				ABIVersion:       abi.Version,
+			},
+		},
+		{
+			mapName: "faketcp_managed_if_map",
+			key: abi.FakeTCPManagedIfKey{
+				Generation: generation, UnderlayIndex: ifindex,
+			},
+			value: abi.FakeTCPManagedIfValue{Generation: generation},
+		},
+		{
+			mapName: "faketcp_managed_port_map",
+			key: abi.FakeTCPManagedPortKey{
+				Generation: generation, UnderlayIndex: ifindex,
+				DestinationPort: destinationPort,
+			},
+			value: abi.FakeTCPManagedPortValue{
+				Generation: generation, WGID: wgID, Action: abi.ActionRewrite,
+			},
+		},
+	} {
+		m := collection.Maps[update.mapName]
+		if m == nil {
+			t.Fatalf("experimental object has no %s map", update.mapName)
+		}
+		if err := m.Update(update.key, update.value, ebpf.UpdateAny); err != nil {
+			t.Fatalf("populate %s: %v", update.mapName, err)
+		}
+	}
+	underlayMap := collection.Maps["underlay_config_map"]
+	if underlayMap == nil {
+		t.Fatal("experimental object has no underlay_config_map")
+	}
+	underlayKey := abi.UnderlayConfigKey{
+		Generation: generation, UnderlayIndex: ifindex,
+	}
+	requireFakeTCPPacketProbeUnderlayAbsent(t, collection, generation, ifindex)
+	defer func() {
+		if err := underlayMap.Delete(underlayKey); err != nil &&
+			!errors.Is(err, ebpf.ErrKeyNotExist) {
+			t.Errorf("delete XDP parser probe underlay: %v", err)
+		}
+		requireFakeTCPPacketProbeUnderlayAbsent(t, collection, generation, ifindex)
+	}()
+
+	ethernet, _ := buildFakeTCPProbeUDPPacket(t, 31001, destinationPort, 32)
+	rawL3 := append([]byte(nil), ethernet[14:]...)
+	const (
+		xdpDrop = uint32(1)
+		xdpPass = uint32(2)
+	)
+	for _, test := range []struct {
+		name   string
+		parser uint8
+		packet []byte
+		want   uint32
+	}{
+		{name: "ethernet/ethernet", parser: abi.ParserEthernet, packet: ethernet, want: xdpDrop},
+		{name: "ethernet/raw-l3", parser: abi.ParserEthernet, packet: rawL3, want: xdpPass},
+		{name: "l3/raw-l3", parser: abi.ParserL3, packet: rawL3, want: xdpDrop},
+		{name: "l3/ethernet", parser: abi.ParserL3, packet: ethernet, want: xdpDrop},
+	} {
+		t.Run("XDP parser "+test.name, func(t *testing.T) {
+			value := abi.UnderlayConfigValue{Generation: generation, ParserMode: test.parser}
+			if err := underlayMap.Update(underlayKey, value, ebpf.UpdateAny); err != nil {
+				t.Fatalf("select parser mode %d: %v", test.parser, err)
+			}
+			result, output, err := runFakeTCPPacketProbe(
+				program,
+				test.packet,
+				fakeTCPXDPContext{IngressIfindex: ifindex},
+				len(test.packet)+64,
+			)
+			if err != nil {
+				t.Fatalf("BPF_PROG_TEST_RUN parser mode %d: %v", test.parser, err)
+			}
+			if result != test.want {
+				t.Fatalf("XDP action=%d, want %d", result, test.want)
+			}
+			if !bytes.Equal(output, test.packet) {
+				t.Fatal("parser-policy probe mutated the packet")
+			}
+		})
+	}
+}
+
+func requireFakeTCPPacketProbeUnderlayAbsent(
+	t *testing.T,
+	collection *ebpf.Collection,
+	generation uint64,
+	ifindex uint32,
+) {
+	t.Helper()
+	underlayMap := collection.Maps["underlay_config_map"]
+	if underlayMap == nil {
+		t.Fatal("experimental object has no underlay_config_map")
+	}
+	key := abi.UnderlayConfigKey{Generation: generation, UnderlayIndex: ifindex}
+	var value abi.UnderlayConfigValue
+	err := underlayMap.Lookup(key, &value)
+	if err == nil {
+		t.Fatalf("unexpected retained underlay parser policy: key=%#v value=%#v", key, value)
+	}
+	if !errors.Is(err, ebpf.ErrKeyNotExist) {
+		t.Fatalf("check underlay parser policy absence: %v", err)
+	}
+}
+
 func readFakeTCPPacketProbeStat(
 	t *testing.T,
 	collection *ebpf.Collection,
 	key uint32,
 ) uint64 {
 	t.Helper()
-	stats := collection.Maps["faketcp_stats_map"]
-	if stats == nil {
-		t.Fatal("experimental object has no faketcp_stats_map")
+	return readFakeTCPPacketProbeMapCounter(t, collection, "faketcp_stats_map", key)
+}
+
+func readFakeTCPPacketProbeMapCounter(
+	t *testing.T,
+	collection *ebpf.Collection,
+	mapName string,
+	key uint32,
+) uint64 {
+	t.Helper()
+	counters := collection.Maps[mapName]
+	if counters == nil {
+		t.Fatalf("experimental object has no %s", mapName)
 	}
 	possibleCPUs, err := ebpf.PossibleCPU()
 	if err != nil {
 		t.Fatalf("read possible CPU count: %v", err)
 	}
 	values := make([]uint64, possibleCPUs)
-	if err := stats.Lookup(&key, &values); err != nil {
-		t.Fatalf("read faketcp_stats_map[%d]: %v", key, err)
+	if err := counters.Lookup(&key, &values); err != nil {
+		t.Fatalf("read %s[%d]: %v", mapName, key, err)
 	}
 	var total uint64
 	for _, value := range values {
@@ -347,11 +715,14 @@ func populateFakeTCPPacketProbeMaps(
 				RemotePort:    remotePort,
 			},
 			value: abi.FakeTCPSessionValue{
-				Generation: generation,
-				TXSequence: 0x01020304,
-				RXSequence: 0x11223344,
-				Window:     4096,
-				State:      abi.FakeTCPStateEstablished,
+				Generation:         generation,
+				TXSequence:         0x01020304,
+				RXSequence:         0x11223344,
+				Window:             4096,
+				State:              abi.FakeTCPStateEstablished,
+				Revision:           1,
+				SessionID:          1,
+				RuntimeIncarnation: [16]byte{1},
 			},
 		},
 	}

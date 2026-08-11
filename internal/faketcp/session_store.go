@@ -15,7 +15,7 @@ const (
 	fakeTCPSessionKernelMapName = "faketcp_session"
 	fakeTCPSessionMapTypeHash   = uint32(1)
 	fakeTCPSessionMapKeySize    = uint32(24)
-	fakeTCPSessionMapValueSize  = uint32(40)
+	fakeTCPSessionMapValueSize  = uint32(80)
 	fakeTCPSessionMapMaxEntries = uint32(16384)
 )
 
@@ -59,15 +59,16 @@ type SessionMapIdentity struct {
 //
 // The map identity is supplied on every call so an implementation backed by a
 // dedicated BPF operation or a generation-quiescence lease can reject a stale
-// or foreign target. Implementations must return (false, nil) when the key is
-// absent or its value differs. They must not delete, replace, or otherwise
-// mutate a differing value.
+// or foreign target. Implementations distinguish an absent key from a
+// different value so a caller can resolve an uncertain prior exact delete
+// without first looking up a tombstone. They must not delete, replace, or
+// otherwise mutate a differing value.
 type AtomicSessionCompareDeleter interface {
 	CompareDeleteEstablished(
 		SessionMapIdentity,
 		abi.FakeTCPSessionKey,
 		abi.FakeTCPSessionValue,
-	) (bool, error)
+	) (SessionDeleteResult, error)
 }
 
 // sessionMapBackend is deliberately narrower than ebpf.Map. In particular it
@@ -288,50 +289,53 @@ func (store *LinuxSessionStore) LookupEstablished(
 func (store *LinuxSessionStore) DeleteEstablishedIfUnchanged(
 	key abi.FakeTCPSessionKey,
 	expected abi.FakeTCPSessionValue,
-) (bool, error) {
+) (SessionDeleteResult, error) {
 	if store == nil {
-		return false, errors.New("faketcp session store is nil")
+		return SessionDeleteDifferent, errors.New("faketcp session store is nil")
 	}
 
 	store.mu.Lock()
 	defer store.mu.Unlock()
 	if err := store.requireOpenLocked(); err != nil {
-		return false, err
+		return SessionDeleteDifferent, err
 	}
 	if err := validateBoundSessionKey(key, store.generation); err != nil {
-		return false, err
+		return SessionDeleteDifferent, err
 	}
 	if err := validateEstablishedSessionValue(expected, store.generation); err != nil {
-		return false, err
+		return SessionDeleteDifferent, err
 	}
 
 	if err := store.validateMapBindingLocked(); err != nil {
-		return false, err
+		return SessionDeleteDifferent, err
 	}
 	if store.compareDelete != nil {
-		deleted, err := store.compareDelete.CompareDeleteEstablished(
+		result, err := store.compareDelete.CompareDeleteEstablished(
 			store.identity,
 			key,
 			expected,
 		)
 		if err != nil {
-			return false, fmt.Errorf("atomically compare-delete established faketcp session: %w", err)
+			return SessionDeleteDifferent, fmt.Errorf("atomically compare-delete established faketcp session: %w", err)
 		}
-		return deleted, nil
+		return result, nil
 	}
 	actual, found, err := store.lookupEstablishedLocked(key)
-	if err != nil || !found {
-		return false, err
+	if err != nil {
+		return SessionDeleteDifferent, err
+	}
+	if !found {
+		return SessionDeleteAbsent, nil
 	}
 	if actual != expected {
-		return false, nil
+		return SessionDeleteDifferent, nil
 	}
 
 	// Do not add backend.Delete here. The comparison above cannot exclude a
 	// BPF write between lookup and deletion, and LookupAndDelete would remove
 	// the entry before comparison. A future implementation needs a concrete
 	// quiescence/ownership primitive or a kernel-side atomic operation.
-	return false, fmt.Errorf(
+	return SessionDeleteDifferent, fmt.Errorf(
 		"%w for map ID %d generation %d; entry was preserved",
 		ErrSessionCompareDeleteUnavailable,
 		store.identity.ID,
@@ -441,6 +445,18 @@ func validateEstablishedSessionValue(value abi.FakeTCPSessionValue, generation u
 	}
 	if value.Reserved != ([4]byte{}) {
 		return errors.New("faketcp session has nonzero reserved bytes")
+	}
+	if value.KernelLock != 0 || value.KernelReserved != 0 {
+		return errors.New("faketcp session has nonzero kernel lock or reserved bytes")
+	}
+	if value.Revision == 0 {
+		return errors.New("faketcp session revision is zero")
+	}
+	if value.SessionID == 0 {
+		return errors.New("faketcp session ID is zero")
+	}
+	if value.RuntimeIncarnation == ([16]byte{}) {
+		return errors.New("faketcp session runtime incarnation is zero")
 	}
 	return nil
 }

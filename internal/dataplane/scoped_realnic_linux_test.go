@@ -1267,7 +1267,7 @@ func executeScopedTraffic(
 						return fmt.Errorf("revalidate iperf checker before %s: %w", label, err)
 					}
 					if err := runScopedChecker(trafficCtx, config.Traffic.CheckerPath,
-						[]string{"one", iperfPath, "--direction", direction, "--streams", strconv.Itoa(streams)},
+						scopedOneCheckerArgs(iperfPath, direction, streams, config.Traffic.SessionSeconds),
 						filepath.Join(config.Common.EvidenceRoot, label+".check.json")); err != nil {
 						cancelTraffic()
 						return fmt.Errorf("%s acceptance: %w", label, err)
@@ -1288,10 +1288,11 @@ func executeScopedTraffic(
 		if err := recheckScopedFile(checkerIdentity); err != nil {
 			return fmt.Errorf("revalidate iperf checker before soak summary: %w", err)
 		}
-		args := append([]string{"soak"}, soakPaths...)
-		args = append(args,
-			"--expected-windows", strconv.Itoa(config.Traffic.SoakWindows),
-			"--streams", strconv.Itoa(config.Traffic.Streams[0]),
+		args := scopedSoakCheckerArgs(
+			soakPaths,
+			config.Traffic.SoakWindows,
+			config.Traffic.Streams[0],
+			config.Traffic.SessionSeconds,
 		)
 		if err := runScopedChecker(trafficCtx, config.Traffic.CheckerPath, args,
 			filepath.Join(config.Common.EvidenceRoot, "soak-check.json")); err != nil {

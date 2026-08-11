@@ -41,7 +41,9 @@ const (
 	FakeTCPStateSynSent     uint8 = 1
 	FakeTCPStateSynReceived uint8 = 2
 	FakeTCPStateEstablished uint8 = 3
-	FakeTCPStateClosing     uint8 = 4
+	// FakeTCPStateDeleteClaimed is a kernel-owned tombstone. Packet programs
+	// may observe it, but userspace must never insert it as live state.
+	FakeTCPStateDeleteClaimed uint8 = 4
 
 	FakeTCPEventNeedHandshake uint8 = 1
 	FakeTCPEventSYN           uint8 = 2
@@ -50,10 +52,27 @@ const (
 	FakeTCPEventRST           uint8 = 5
 	FakeTCPEventFIN           uint8 = 6
 
-	FakeTCPEventABIVersion   uint16 = 1
-	FakeTCPEventSize                = 88
+	FakeTCPEventABIVersion   uint16 = 2
+	FakeTCPEventSize                = 104
 	FakeTCPMaxCapturedPacket        = 2304
 	FakeTCPPacketEventSize          = FakeTCPEventSize + FakeTCPMaxCapturedPacket
+
+	FakeTCPGenerationStateOpen      uint64 = 1 << 63
+	FakeTCPGenerationStateSealed    uint64 = 1 << 62
+	FakeTCPGenerationStatePoison    uint64 = 1 << 61
+	FakeTCPGenerationStateWakeArmed uint64 = 1 << 60
+	FakeTCPGenerationInflightMask   uint64 = FakeTCPGenerationStateWakeArmed - 1
+
+	FakeTCPGenerationControlAssertClosed uint32 = 1
+	FakeTCPGenerationControlOpen         uint32 = 2
+	FakeTCPGenerationControlClose        uint32 = 3
+
+	FakeTCPGenerationResultMalformed uint32 = 0
+	FakeTCPGenerationResultIdle      uint32 = 1
+	FakeTCPGenerationResultOpen      uint32 = 2
+	FakeTCPGenerationResultWait      uint32 = 3
+	FakeTCPGenerationResultPoison    uint32 = 4
+	FakeTCPGenerationResultMismatch  uint32 = 5
 )
 
 type ControlKey uint32
@@ -220,6 +239,22 @@ type FakeTCPSessionValue struct {
 	State         uint8
 	Flags         uint8
 	Reserved      [4]byte // Must stay zero; maps exactly to the C ABI pad bytes.
+	// KernelLock is a top-level struct bpf_spin_lock in the C map ABI. Kernel
+	// lookup never copies its contents to userspace and userspace must keep the
+	// corresponding bytes zero on update. Packet writers and the delete-claim
+	// program use it as the per-session linearisation domain.
+	KernelLock uint32
+	// KernelReserved keeps the following 64-bit fields naturally aligned and
+	// is part of the exact compare contract. It must remain zero.
+	KernelReserved uint32
+	// Revision starts at one and advances exactly once for every admitted BPF
+	// mutation. It prevents a stale snapshot from matching after field ABA.
+	Revision uint64
+	// SessionID is never reused within one Engine incarnation. Together with
+	// RuntimeIncarnation it prevents delete authority crossing a reinsert or
+	// process restart even if the five-tuple and sequence fields recur.
+	SessionID          uint64
+	RuntimeIncarnation [16]byte
 }
 
 func (v FakeTCPSessionValue) MapGeneration() uint64 { return v.Generation }
@@ -304,11 +339,31 @@ type FakeTCPRuntimeIdentityValue struct {
 	_               [6]byte
 }
 
+type FakeTCPGenerationGateValue struct {
+	Generation uint64
+	State      uint64
+}
+
+type FakeTCPGenerationControlRequest struct {
+	Generation  uint64
+	Incarnation [16]byte
+	Operation   uint32
+	_           uint32
+}
+
+type FakeTCPGenerationWake struct {
+	Generation  uint64
+	Incarnation [16]byte
+	State       uint64
+}
+
 type FakeTCPEvent struct {
 	Key                FakeTCPSessionKey
 	TimestampNanos     uint64
 	RuntimeIncarnation [16]byte
 	CaptureSequence    uint64
+	SessionRevision    uint64
+	SessionID          uint64
 	CaptureCPU         uint32
 	Sequence           uint32
 	Acknowledgement    uint32
@@ -322,9 +377,10 @@ type FakeTCPEvent struct {
 	_                  [2]byte
 }
 
-// FakeTCPPacketEvent carries the exact pre-transform IPv4 packet for the
-// bounded userspace first-packet queue. Consumers must use PacketLength and
-// ignore the unused tail of Packet.
+// FakeTCPPacketEvent carries either the exact pre-transform IPv4/UDP packet
+// for the bounded userspace first-packet queue or a complete inbound IPv4/TCP
+// RST/FIN candidate for independent userspace validation. Consumers must use
+// PacketLength and ignore the unused tail of Packet.
 type FakeTCPPacketEvent struct {
 	Event  FakeTCPEvent
 	Packet [FakeTCPMaxCapturedPacket]byte

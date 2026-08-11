@@ -168,35 +168,6 @@ func TestFakeTCPGSOFailClosedBeforeChecksumMutation(t *testing.T) {
 	}
 }
 
-func TestFakeTCPMTUHeaderDeltaAndFailureCounterContract(t *testing.T) {
-	var failures uint64
-	allows := func(l3Length, mtu int) bool {
-		if fakeTCPMTUAllowsGrowth(l3Length, mtu) {
-			return true
-		}
-		failures++
-		return false
-	}
-	if !allows(1488, 1500) {
-		t.Fatal("L3 MTU-minus-12 boundary was rejected")
-	}
-	if failures != 0 {
-		t.Fatalf("accepted boundary incremented failure counter to %d", failures)
-	}
-	if allows(1489, 1500) {
-		t.Fatal("L3 MTU-minus-11 packet was accepted")
-	}
-	if failures != 1 {
-		t.Fatalf("one-over MTU failure counter=%d, want 1", failures)
-	}
-	if allows(28, 11) {
-		t.Fatal("MTU smaller than FakeTCP's 12-byte growth was accepted")
-	}
-	if failures != 2 {
-		t.Fatalf("small-MTU failure counter=%d, want 2", failures)
-	}
-}
-
 func TestFakeTCPChecksumResultToBPFActionAndStatContract(t *testing.T) {
 	tests := []struct {
 		result         int
@@ -271,19 +242,36 @@ func TestFakeTCPChecksumKfuncAndBPFReturnABIStayIdentical(t *testing.T) {
 		{name: "REJECT_PACKET", value: "-1", stat: "FAKETCP_STAT_BAD_PACKET"},
 		{name: "REJECT_STATE", value: "-2", stat: "FAKETCP_STAT_CHECKSUM_STATE_REJECT"},
 		{name: "REJECT_METADATA", value: "-3", stat: "FAKETCP_STAT_METADATA_ERROR"},
-		{name: "REJECT_GSO", value: "-4", stat: "FAKETCP_STAT_GSO_REJECT"},
+		{name: "REJECT_GSO_TYPE", value: "-4", stat: "FAKETCP_STAT_GSO_REJECT"},
 	}
 	for _, contract := range contracts {
-		if !strings.Contains(kernel, "WG_MIX_FAKETCP_CSUM_"+contract.name+" = "+contract.value) {
+		if !strings.Contains(kernel, "WG_MIX_FAKETCP_PREPARE_"+contract.name+" = "+contract.value) {
 			t.Fatalf("kernel checksum result ABI missing %s=%s", contract.name, contract.value)
 		}
-		if !strings.Contains(bpf, "FAKETCP_CSUM_"+contract.name) || !strings.Contains(bpf, contract.stat) {
+		if !strings.Contains(bpf, "FAKETCP_PREPARE_"+contract.name) || !strings.Contains(bpf, contract.stat) {
 			t.Fatalf("BPF checksum result/stat mapping missing %s -> %s", contract.name, contract.stat)
 		}
 	}
-	if !strings.Contains(bpf, "inc_faketcp_stat(FAKETCP_STAT_MTU_REJECT)") ||
-		!strings.Contains(bpf, "old_total_len > mtu_len - FAKETCP_HEADER_DELTA") {
-		t.Fatal("BPF MTU-minus-12 rejection is not classified by its dedicated counter")
+	for _, required := range []string{
+		"faketcp_mtu_audit_map SEC(\".maps\")",
+		"reason * FAKETCP_MTU_BOUNDARY_MAX + boundary",
+		"inc_faketcp_stat(FAKETCP_STAT_MTU_REJECT)",
+	} {
+		if !strings.Contains(bpf, required) {
+			t.Fatalf("BPF PMTU audit contract missing %q", required)
+		}
+	}
+	for _, required := range []string{
+		"#include <net/dst_metadata.h>",
+		"struct net_device *device = READ_ONCE(skb->dev)",
+		"device_mtu = READ_ONCE(device->mtu)",
+		"if (!skb_valid_dst(skb))",
+		"if (READ_ONCE(dst->dev) != device)",
+		"route_mtu = dst_mtu(dst)",
+	} {
+		if !strings.Contains(kernel, required) {
+			t.Fatalf("kernel PMTU admission contract missing %q", required)
+		}
 	}
 	resetOrder := []string{
 		"skb->csum = 0;",
@@ -292,7 +280,7 @@ func TestFakeTCPChecksumKfuncAndBPFReturnABIStayIdentical(t *testing.T) {
 		"skb->csum_level = 0;",
 		"skb_reset_csum_not_inet(skb);",
 		"skb->ip_summed = CHECKSUM_NONE;",
-		"return WG_MIX_FAKETCP_CSUM_ACCEPT_PARTIAL_RESET;",
+		"return WG_MIX_FAKETCP_PREPARE_ACCEPT_PARTIAL_RESET;",
 	}
 	position := -1
 	for _, fragment := range resetOrder {

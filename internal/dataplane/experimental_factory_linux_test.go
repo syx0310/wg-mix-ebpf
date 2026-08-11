@@ -32,7 +32,6 @@ func newExperimentalRuntimeFactoryFixture(
 ) *experimentalRuntimeFactoryFixture {
 	t.Helper()
 	runtimeFixture := newRuntimeTestFixture(t)
-	snapshot := mustFakeTCPPolicySnapshot(t, generation)
 	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, generation)
 	acquisition := newExperimentalAcquisitionFixture()
 	dependencies := acquisition.dependencies(t)
@@ -43,7 +42,7 @@ func newExperimentalRuntimeFactoryFixture(
 		}
 		return runtimeFixture.collection, nil
 	}
-	options := runtimeFixture.buildOptions(snapshot, transaction)
+	options := runtimeFixture.buildOptions(transaction)
 	options.collection = nil
 	return &experimentalRuntimeFactoryFixture{
 		ctx:          ctx,
