@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Recover one owned classic-TC journal with a newer, locally bound binary."""
+"""Recover one owned classic-TC or exact-TCX journal with a newer binary."""
 
 from __future__ import annotations
 
@@ -28,8 +28,20 @@ RUN_ID_RE = re.compile(r"^[0-9a-f]{12,24}$")
 COMMIT_RE = re.compile(r"^[0-9a-f]{40}$")
 SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 TOKEN_RE = re.compile(r"^[0-9a-f]{32}$")
-ROLE = "public"
-INTERFACE = "eth0"
+ROLE = {
+    "public": {
+        "host": "47.116.202.155",
+        "interface": "eth0",
+        "backend": "classic_tc",
+        "wg": "wgps47",
+    },
+    "b82": {
+        "host": "192.168.10.82",
+        "interface": "ens33",
+        "backend": "tcx",
+        "wg": "wgps82",
+    },
+}
 
 
 def stop(reason: str, rc: int = 78) -> NoReturn:
@@ -77,19 +89,19 @@ def old_claim_args(args: argparse.Namespace) -> SimpleNamespace:
 
 
 def recovery_names(args: argparse.Namespace) -> tuple[str, str, str, str]:
-    intake, root = remote_layout(args.old_run_id, ROLE)
+    intake, root = remote_layout(args.old_run_id, args.role)
     name = f"wg-mix-ebpf-recovery-{args.recovery_id}"
     return intake, root, f"{intake}/{name}", f"{root}/{name}"
 
 
 def recovery_state_dir(args: argparse.Namespace) -> str:
-    _, root = remote_layout(args.old_run_id, ROLE)
+    _, root = remote_layout(args.old_run_id, args.role)
     return f"{root}/recovery-state-{args.recovery_id}"
 
 
 def detach_argv(args: argparse.Namespace) -> list[str]:
     _, old_root, _, recovery_binary = recovery_names(args)
-    pin_path = f"/sys/fs/bpf/wg-mix-ebpf-public-smoke-{args.old_run_id}-public"
+    pin_path = f"/sys/fs/bpf/wg-mix-ebpf-public-smoke-{args.old_run_id}-{args.role}"
     return [
         "/usr/bin/sudo",
         "-S",
@@ -116,18 +128,29 @@ def contract(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]
     if safe_local_file(binary, executable=True) != args.binary_sha256:
         stop("binary-sha256", 66)
     artifacts = old_artifacts(args, paths)
-    claim = intake_claim_bytes(old_claim_args(args), ROLE, artifacts)
+    claim = intake_claim_bytes(old_claim_args(args), args.role, artifacts)
     intake, root, intake_binary, root_binary = recovery_names(args)
-    pin_path = f"/sys/fs/bpf/wg-mix-ebpf-public-smoke-{args.old_run_id}-public"
+    role = ROLE[args.role]
+    pin_path = f"/sys/fs/bpf/wg-mix-ebpf-public-smoke-{args.old_run_id}-{args.role}"
+    backend_resource = (
+        "classic_tc:eth0:priority49152:handles0x10001+0x10002"
+        if args.role == "public"
+        else (
+            "tcx:ens33:"
+            f"ingress-link{args.tcx_ingress_link_id}-program{args.tcx_ingress_program_id}+"
+            f"egress-link{args.tcx_egress_link_id}-program{args.tcx_egress_program_id}"
+        )
+    )
     return {
-        "schema": "wg-mix-public-classic-journal-recovery-v1",
+        "schema": "wg-mix-public-owned-journal-recovery-v1",
         "recovery_id": args.recovery_id,
         "old_run_id": args.old_run_id,
         "old_commit": args.old_commit,
         "new_commit": args.new_commit,
-        "role": ROLE,
-        "host": "47.116.202.155",
-        "interface": INTERFACE,
+        "role": args.role,
+        "host": role["host"],
+        "interface": role["interface"],
+        "attachment_backend": role["backend"],
         "source": source_contract(args.new_commit, paths),
         "artifacts": {
             "recovery": sha256_file(paths["recovery"]),
@@ -141,12 +164,28 @@ def contract(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]
         },
         "old_claim_sha256": hashlib.sha256(claim).hexdigest(),
         "old_claim_size": len(claim),
+        "expected_tcx_links": (
+            []
+            if args.role == "public"
+            else [
+                {
+                    "direction": "ingress",
+                    "link_id": args.tcx_ingress_link_id,
+                    "program_id": args.tcx_ingress_program_id,
+                },
+                {
+                    "direction": "egress",
+                    "link_id": args.tcx_egress_link_id,
+                    "program_id": args.tcx_egress_program_id,
+                },
+            ]
+        ),
         "detach_argv": detach_argv(args),
         "write_set": {
             "temporary": [intake_binary, root_binary],
             "owned_recovery": [
                 pin_path,
-                "classic_tc:eth0:priority49152:handles0x10001+0x10002",
+                backend_resource,
                 "/var/lib/wg-mix-ebpf/pin-owners/instances.v2.json",
                 "/var/lib/wg-mix-ebpf/pin-owners/<owned-resource-files>",
                 "/run/wg-mix-ebpf/pin-locks/<owned-resource-key>.lock",
@@ -159,8 +198,8 @@ def contract(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]
             "preserved": [
                 root,
                 intake,
-                "wireguard:wgps47",
-                "qdisc:eth0:clsact",
+                f"wireguard:{role['wg']}",
+                f"qdisc:{role['interface']}:clsact",
                 "firewall",
                 "offload",
                 "mtu",
@@ -196,11 +235,21 @@ def recover_argv(
         "--object-sha256",
         args.object_sha256,
         "--ownership-token",
-        args.ownership_token,
+        "<redacted>",
         "--binary",
         str(Path(args.binary).resolve(strict=True)),
         "--binary-sha256",
         args.binary_sha256,
+        "--role",
+        args.role,
+        "--tcx-ingress-link-id",
+        str(args.tcx_ingress_link_id),
+        "--tcx-ingress-program-id",
+        str(args.tcx_ingress_program_id),
+        "--tcx-egress-link-id",
+        str(args.tcx_egress_link_id),
+        "--tcx-egress-program-id",
+        str(args.tcx_egress_program_id),
         "--contract-sha256",
         digest,
     ]
@@ -250,18 +299,93 @@ def named_entry(remote: Remote, parent: str, name: str, *, privileged: bool) -> 
     return output == name
 
 
-def verify_classic_removed(remote: Remote, args: argparse.Namespace) -> None:
-    for direction in ("ingress", "egress"):
-        output = remote.ssh(
-            "/usr/sbin/tc", "-j", "filter", "show", "dev", INTERFACE, direction
-        )
-        try:
-            filters = json.loads(output)
-        except ValueError:
-            stop(f"filter-json:{direction}", 79)
-        if filters != []:
-            stop(f"filter-remains:{direction}", 79)
-    pin_name = f"wg-mix-ebpf-public-smoke-{args.old_run_id}-public"
+def bpftool_links(remote: Remote) -> list[dict[str, Any]]:
+    output = remote.ssh(
+        "/usr/bin/sudo",
+        "-S",
+        "-p",
+        "PUBLIC_SUDO_PASSWORD:",
+        "/usr/sbin/bpftool",
+        "-j",
+        "link",
+        "show",
+    )
+    try:
+        links = json.loads(output)
+    except ValueError:
+        stop("tcx-link-json", 79)
+    if not isinstance(links, list) or any(not isinstance(item, dict) for item in links):
+        stop("tcx-link-json", 79)
+    return links
+
+
+def interface_ifindex(remote: Remote, args: argparse.Namespace) -> int:
+    interface = ROLE[args.role]["interface"]
+    output = remote.ssh("/usr/sbin/ip", "-j", "link", "show", "dev", interface)
+    try:
+        links = json.loads(output)
+    except ValueError:
+        stop("interface-json", 79)
+    if (
+        not isinstance(links, list)
+        or len(links) != 1
+        or not isinstance(links[0], dict)
+        or links[0].get("ifname") != interface
+        or not isinstance(links[0].get("ifindex"), int)
+        or links[0]["ifindex"] <= 0
+    ):
+        stop("interface-identity", 79)
+    return links[0]["ifindex"]
+
+
+def matching_tcx_link_ids(remote: Remote, args: argparse.Namespace) -> set[int]:
+    expected = {
+        args.tcx_ingress_link_id: (args.tcx_ingress_program_id, "tcx_ingress"),
+        args.tcx_egress_link_id: (args.tcx_egress_program_id, "tcx_egress"),
+    }
+    ifindex = interface_ifindex(remote, args)
+    observed = {item.get("id"): item for item in bpftool_links(remote)}
+    matching: set[int] = set()
+    for link_id, (program_id, attach_type) in expected.items():
+        item = observed.get(link_id)
+        if item is None:
+            continue
+        if (
+            item.get("type") != "tcx"
+            or item.get("ifindex") != ifindex
+            or item.get("attach_type") != attach_type
+            or item.get("prog_id") != program_id
+        ):
+            stop(f"tcx-link-identity:{link_id}", 79)
+        matching.add(link_id)
+    return matching
+
+
+def verify_tcx_links(remote: Remote, args: argparse.Namespace, *, present: bool) -> None:
+    matching = matching_tcx_link_ids(remote, args)
+    expected = {args.tcx_ingress_link_id, args.tcx_egress_link_id}
+    if present and matching != expected:
+        stop("tcx-links-incomplete", 79)
+    if not present and matching:
+        stop(f"tcx-link-remains:{min(matching)}", 79)
+
+
+def verify_backend_removed(remote: Remote, args: argparse.Namespace) -> None:
+    if args.role == "b82":
+        verify_tcx_links(remote, args, present=False)
+    else:
+        interface = ROLE[args.role]["interface"]
+        for direction in ("ingress", "egress"):
+            output = remote.ssh(
+                "/usr/sbin/tc", "-j", "filter", "show", "dev", interface, direction
+            )
+            try:
+                filters = json.loads(output)
+            except ValueError:
+                stop(f"filter-json:{direction}", 79)
+            if filters != []:
+                stop(f"filter-remains:{direction}", 79)
+    pin_name = f"wg-mix-ebpf-public-smoke-{args.old_run_id}-{args.role}"
     if named_entry(remote, "/sys/fs/bpf", pin_name, privileged=True):
         stop("pin-remains", 79)
 
@@ -269,7 +393,7 @@ def verify_classic_removed(remote: Remote, args: argparse.Namespace) -> None:
 def attach_state_snapshot(
     remote: Remote, args: argparse.Namespace
 ) -> tuple[str, str] | None:
-    _, root = remote_layout(args.old_run_id, ROLE)
+    _, root = remote_layout(args.old_run_id, args.role)
     state_dir = f"{root}/state"
     entries = remote_directory_entries(remote, state_dir, privileged=True)
     if entries not in ({}, {"attach-state.json": "f"}):
@@ -385,24 +509,27 @@ def execute_recovery(args: argparse.Namespace, paths: dict[str, Path]) -> None:
     digest = contract_sha256(value)
     if args.contract_sha256 != digest:
         stop("contract-sha256", 66)
-    remote = Remote(paths["transport"], ROLE)
+    remote = Remote(paths["transport"], args.role)
     intake_binary, root_binary = stage_recovery_binary(remote, args, paths)
-    _, root = remote_layout(args.old_run_id, ROLE)
+    _, root = remote_layout(args.old_run_id, args.role)
     recovery_state_name = recovery_state_dir(args).rsplit("/", 1)[1]
     if named_entry(remote, root, recovery_state_name, privileged=True):
         stop("recovery-state-exists", 79)
     before_state = attach_state_snapshot(remote, args)
+    if args.role == "b82":
+        matching_tcx_link_ids(remote, args)
     remote.ssh(*detach_argv(args))
-    verify_classic_removed(remote, args)
+    verify_backend_removed(remote, args)
     if named_entry(remote, root, recovery_state_name, privileged=True):
         stop("recovery-state-created", 79)
     if attach_state_snapshot(remote, args) != before_state:
         stop("attach-state-changed", 79)
     remove_recovery_binary(remote, args, intake_binary, root_binary)
     print(
-        "PUBLIC_CLASSIC_JOURNAL_RECOVERED "
+        "PUBLIC_OWNED_JOURNAL_RECOVERED "
         f"old_run_id={args.old_run_id} new_commit={args.new_commit} "
-        "filters=0 pin=absent recovery_files=absent result=PASS"
+        f"role={args.role} backend={ROLE[args.role]['backend']} "
+        "owned_links=absent pin=absent recovery_files=absent result=PASS"
     )
 
 
@@ -418,8 +545,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ownership-token", required=True)
     parser.add_argument("--binary", required=True)
     parser.add_argument("--binary-sha256", required=True)
+    parser.add_argument("--role", choices=tuple(ROLE), default="public")
+    parser.add_argument("--tcx-ingress-link-id", type=int, default=0)
+    parser.add_argument("--tcx-ingress-program-id", type=int, default=0)
+    parser.add_argument("--tcx-egress-link-id", type=int, default=0)
+    parser.add_argument("--tcx-egress-program-id", type=int, default=0)
     parser.add_argument("--contract-sha256")
     args = parser.parse_args()
+    tcx_values = (
+        args.tcx_ingress_link_id,
+        args.tcx_ingress_program_id,
+        args.tcx_egress_link_id,
+        args.tcx_egress_program_id,
+    )
     if (
         not RUN_ID_RE.fullmatch(args.recovery_id)
         or not RUN_ID_RE.fullmatch(args.old_run_id)
@@ -435,6 +573,14 @@ def parse_args() -> argparse.Namespace:
         )
         or (args.mode == "recover" and args.contract_sha256 is None)
         or (args.mode == "plan" and args.contract_sha256 is not None)
+        or (args.role == "public" and tcx_values != (0, 0, 0, 0))
+        or (
+            args.role == "b82"
+            and (
+                any(value <= 0 for value in tcx_values)
+                or args.tcx_ingress_link_id == args.tcx_egress_link_id
+            )
+        )
     ):
         stop("arguments", 64)
     return args
@@ -452,6 +598,7 @@ def main() -> None:
                 {
                     "contract_sha256": digest,
                     "recover_argv": recover_argv(args, digest, paths),
+                    "ownership_token_redacted": 1,
                     "remote_writes": 0,
                     "credential_read": 0,
                     "network_operations": 0,

@@ -37,9 +37,234 @@ class PublicSmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
         cls.controller = load("public_controller", "controller.py")
+        sys.modules["controller"] = cls.controller
         cls.root = load("public_root_endpoint", "root-endpoint.py")
         cls.traffic = load("public_traffic", "traffic.py")
         cls.report = load("public_report", "report.py")
+        cls.recovery = load("public_recovery", "recover-classic-journal.py")
+
+    def test_tcx_recovery_binds_exact_live_link_identities(self) -> None:
+        args = SimpleNamespace(
+            role="b82",
+            tcx_ingress_link_id=5,
+            tcx_ingress_program_id=444,
+            tcx_egress_link_id=4,
+            tcx_egress_program_id=448,
+        )
+
+        class Remote:
+            def __init__(self, links: list[dict[str, object]]) -> None:
+                self.links = links
+
+            def ssh(self, *argv: str) -> str:
+                if argv == ("/usr/sbin/ip", "-j", "link", "show", "dev", "ens33"):
+                    return json.dumps([{"ifindex": 2, "ifname": "ens33"}])
+                self.assert_bpftool_argv(argv)
+                return json.dumps(self.links)
+
+            @staticmethod
+            def assert_bpftool_argv(argv: tuple[str, ...]) -> None:
+                if argv != (
+                    "/usr/bin/sudo",
+                    "-S",
+                    "-p",
+                    "PUBLIC_SUDO_PASSWORD:",
+                    "/usr/sbin/bpftool",
+                    "-j",
+                    "link",
+                    "show",
+                ):
+                    raise AssertionError(argv)
+
+        exact = [
+            {
+                "id": 4,
+                "type": "tcx",
+                "prog_id": 448,
+                "ifindex": 2,
+                "attach_type": "tcx_egress",
+            },
+            {
+                "id": 5,
+                "type": "tcx",
+                "prog_id": 444,
+                "ifindex": 2,
+                "attach_type": "tcx_ingress",
+            },
+        ]
+        self.recovery.verify_tcx_links(Remote(exact), args, present=True)
+        self.recovery.verify_tcx_links(Remote([]), args, present=False)
+        self.assertEqual(
+            {4}, self.recovery.matching_tcx_link_ids(Remote(exact[:1]), args)
+        )
+        with self.assertRaises(SystemExit) as caught:
+            self.recovery.verify_tcx_links(Remote(exact[:1]), args, present=True)
+        self.assertEqual(79, caught.exception.code)
+
+        for field, value in (
+            ("prog_id", 999),
+            ("ifindex", 9),
+            ("type", "xdp"),
+            ("attach_type", "tcx_ingress"),
+        ):
+            wrong = [dict(item) for item in exact]
+            wrong[0][field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(SystemExit) as caught:
+                    self.recovery.matching_tcx_link_ids(Remote(wrong), args)
+                self.assertEqual(79, caught.exception.code)
+
+        foreign = [{"id": 99, "type": "tcx", "prog_id": 1, "ifindex": 2}]
+        self.assertEqual(
+            set(), self.recovery.matching_tcx_link_ids(Remote(foreign), args)
+        )
+
+    def test_recovery_argv_preserves_role_and_tcx_identity(self) -> None:
+        args = SimpleNamespace(
+            recovery_id="0123456789ab",
+            old_run_id="0123456789abcdef",
+            old_commit="1" * 40,
+            new_commit="2" * 40,
+            old_binary_sha256="3" * 64,
+            object_sha256="4" * 64,
+            ownership_token="5" * 32,
+            binary="/bin/echo",
+            binary_sha256="6" * 64,
+            role="b82",
+            tcx_ingress_link_id=5,
+            tcx_ingress_program_id=444,
+            tcx_egress_link_id=4,
+            tcx_egress_program_id=448,
+        )
+        digest = "7" * 64
+        argv = self.recovery.recover_argv(
+            args, digest, {"recovery": HERE / "recover-classic-journal.py"}
+        )
+        self.assertEqual(1, argv.count(digest))
+        self.assertNotIn(args.ownership_token, argv)
+        self.assertEqual("<redacted>", argv[argv.index("--ownership-token") + 1])
+        self.assertEqual("b82", argv[argv.index("--role") + 1])
+        self.assertEqual("5", argv[argv.index("--tcx-ingress-link-id") + 1])
+        self.assertEqual("444", argv[argv.index("--tcx-ingress-program-id") + 1])
+        self.assertEqual("4", argv[argv.index("--tcx-egress-link-id") + 1])
+        self.assertEqual("448", argv[argv.index("--tcx-egress-program-id") + 1])
+
+    def test_recovery_role_rejects_unbound_tcx_identity(self) -> None:
+        common = [
+            "recover-classic-journal.py",
+            "plan",
+            "--recovery-id",
+            "0123456789ab",
+            "--old-run-id",
+            "0123456789abcdef",
+            "--old-commit",
+            "1" * 40,
+            "--new-commit",
+            "2" * 40,
+            "--old-binary-sha256",
+            "3" * 64,
+            "--object-sha256",
+            "4" * 64,
+            "--ownership-token",
+            "5" * 32,
+            "--binary",
+            "/bin/echo",
+            "--binary-sha256",
+            "6" * 64,
+        ]
+        with mock.patch.object(sys, "argv", common):
+            args = self.recovery.parse_args()
+        self.assertEqual("public", args.role)
+        self.assertEqual(0, args.tcx_ingress_link_id)
+
+        with mock.patch.object(sys, "argv", [*common, "--role", "b82"]):
+            with self.assertRaises(SystemExit) as caught:
+                self.recovery.parse_args()
+        self.assertEqual(64, caught.exception.code)
+
+        exact = [
+            *common,
+            "--role",
+            "b82",
+            "--tcx-ingress-link-id",
+            "5",
+            "--tcx-ingress-program-id",
+            "444",
+            "--tcx-egress-link-id",
+            "4",
+            "--tcx-egress-program-id",
+            "448",
+        ]
+        with mock.patch.object(sys, "argv", exact):
+            args = self.recovery.parse_args()
+        self.assertEqual("b82", args.role)
+        self.assertEqual(
+            (5, 444, 4, 448),
+            (
+                args.tcx_ingress_link_id,
+                args.tcx_ingress_program_id,
+                args.tcx_egress_link_id,
+                args.tcx_egress_program_id,
+            ),
+        )
+
+    def test_tcx_recovery_retries_partial_and_fully_detached_journal(self) -> None:
+        args = SimpleNamespace(
+            contract_sha256="contract",
+            role="b82",
+            old_run_id="0123456789abcdef",
+            new_commit="2" * 40,
+            recovery_id="0123456789ab",
+            tcx_ingress_link_id=5,
+            tcx_ingress_program_id=444,
+            tcx_egress_link_id=4,
+            tcx_egress_program_id=448,
+        )
+
+        for preexisting in ({5}, set()):
+            events: list[str] = []
+
+            class Remote:
+                def __init__(self, _transport: Path, role: str) -> None:
+                    self.role = role
+
+                def ssh(self, *argv: str) -> str:
+                    self.assert_argv(argv)
+                    events.append("detach")
+                    return ""
+
+                @staticmethod
+                def assert_argv(argv: tuple[str, ...]) -> None:
+                    if argv != ("detach",):
+                        raise AssertionError(argv)
+
+            def precheck(_remote: Remote, _args: SimpleNamespace) -> set[int]:
+                events.append("precheck")
+                return set(preexisting)
+
+            def postcheck(_remote: Remote, _args: SimpleNamespace) -> None:
+                events.append("postcheck")
+
+            def remove(*_args: object) -> None:
+                events.append("remove")
+
+            with self.subTest(preexisting=preexisting), mock.patch.multiple(
+                self.recovery,
+                contract=mock.Mock(return_value={}),
+                contract_sha256=mock.Mock(return_value="contract"),
+                Remote=Remote,
+                stage_recovery_binary=mock.Mock(return_value=("intake-bin", "root-bin")),
+                named_entry=mock.Mock(return_value=False),
+                attach_state_snapshot=mock.Mock(return_value=None),
+                matching_tcx_link_ids=mock.Mock(side_effect=precheck),
+                detach_argv=mock.Mock(return_value=["detach"]),
+                verify_backend_removed=mock.Mock(side_effect=postcheck),
+                remove_recovery_binary=mock.Mock(side_effect=remove),
+            ), mock.patch("builtins.print"):
+                self.recovery.execute_recovery(
+                    args, {"transport": HERE / "transport.exp"}
+                )
+            self.assertEqual(["precheck", "detach", "postcheck", "remove"], events)
 
     def test_canonical_resource_names_and_bounds(self) -> None:
         self.assertEqual(
