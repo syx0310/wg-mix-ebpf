@@ -125,6 +125,10 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertNotIn("XOR_PASSWORD", child_environment)
         self.assertIn("WG_MIX_EBPF_SMOKE_MOUNTNS_XOR_SECRET_FD", child_environment)
         self.assertIn("ATTACHMENT_BACKEND", child_environment)
+        self.assertIn(
+            '"ATTACHMENT_BACKEND",',
+            self.anchor_staged_launch_source,
+        )
 
         reviewed = self.anchor_reviewed_tool_source
         for path in (

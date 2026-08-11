@@ -57,6 +57,7 @@ var requiredPrivateMountNSChildEnvironment = []string{
 }
 
 var optionalPrivateMountNSChildEnvironment = []string{
+	"ATTACHMENT_BACKEND",
 	"NETNS_ANCHOR_TTL_SECONDS",
 	"OUTER_FAMILY",
 	"RUN_ID",
