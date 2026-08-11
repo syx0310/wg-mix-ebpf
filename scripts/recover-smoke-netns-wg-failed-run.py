@@ -515,6 +515,62 @@ def inventory_entry(root: Path, path: Path) -> dict[str, object]:
     return common
 
 
+def held_inventory_entry(root: Path, path: Path, descriptor: int) -> dict[str, object]:
+    before = os.fstat(descriptor)
+    if (
+        not stat.S_ISREG(before.st_mode)
+        or before.st_nlink != 1
+        or before.st_size < 0
+        or before.st_size > 8 * 1024 * 1024
+    ):
+        stop("held-file-shape")
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < before.st_size:
+        chunk = os.pread(descriptor, min(65536, before.st_size - offset), offset)
+        if not chunk:
+            stop("held-file-short")
+        digest.update(chunk)
+        offset += len(chunk)
+    if os.pread(descriptor, 1, before.st_size):
+        stop("held-file-long")
+    after = os.fstat(descriptor)
+    identity = (
+        before.st_dev,
+        before.st_ino,
+        before.st_uid,
+        before.st_gid,
+        before.st_mode,
+        before.st_nlink,
+        before.st_size,
+        before.st_mtime_ns,
+    )
+    if (
+        after.st_dev,
+        after.st_ino,
+        after.st_uid,
+        after.st_gid,
+        after.st_mode,
+        after.st_nlink,
+        after.st_size,
+        after.st_mtime_ns,
+    ) != identity:
+        stop("held-file-drift")
+    relative = str(path.relative_to(root))
+    return {
+        "path": relative,
+        "device": before.st_dev,
+        "inode": before.st_ino,
+        "uid": before.st_uid,
+        "gid": before.st_gid,
+        "mode": stat.S_IMODE(before.st_mode),
+        "type": "regular",
+        "nlink": before.st_nlink,
+        "size": before.st_size,
+        "sha256": digest.hexdigest(),
+    }
+
+
 def tree_inventory(root: Path, files: list[Path]) -> list[dict[str, object]]:
     paths = [root]
     for entry in os.scandir(root):
@@ -598,6 +654,26 @@ def recheck_recorded_path(
         stop("inventory-unrecorded")
     if inventory_entry(root, path) != recorded_by_path[relative]:
         stop("inventory-recheck")
+
+
+def recheck_held_recorded_path(
+    root: Path,
+    path: Path,
+    descriptor: int,
+    recorded_by_path: dict[str, dict[str, object]],
+) -> None:
+    relative = str(path.relative_to(root))
+    recorded = recorded_by_path.get(relative)
+    if recorded is None:
+        stop("held-file-unrecorded")
+    recheck_recorded_path(root, path, recorded_by_path)
+    held = held_inventory_entry(root, path, descriptor)
+    if held != recorded:
+        stop("held-file-inventory")
+    named = path.lstat()
+    described = os.fstat(descriptor)
+    if (named.st_dev, named.st_ino) != (described.st_dev, described.st_ino):
+        stop("held-file-path-identity")
 
 
 def main() -> None:
@@ -776,10 +852,28 @@ def main() -> None:
     if lease_path.exists():
         lease_fd = os.open(lease_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
         try:
-            fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            os.close(lease_fd)
-            stop("lifecycle-busy")
+            recheck_held_recorded_path(
+                root, lease_path, lease_fd, recorded_by_path
+            )
+            try:
+                fcntl.flock(lease_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                stop("lifecycle-busy")
+            locked_files = validate_tree(root, manifest, initial=False)
+            recorded_by_path = preflight_inventory(
+                root, locked_files, recorded_inventory
+            )
+            recheck_held_recorded_path(
+                root, lease_path, lease_fd, recorded_by_path
+            )
+            assert_no_live_mount(root, manifest["bpffs_source"])
+            assert_no_live_netns(manifest)
+            assert_no_run_network(args.run_id)
+        except BaseException:
+            closing_fd = lease_fd
+            lease_fd = None
+            os.close(closing_fd)
+            raise
     protected = {
         root / ".wg-mix-ebpf-test-owner",
         root / "manifest",
@@ -806,14 +900,18 @@ def main() -> None:
             if path.exists():
                 recheck_recorded_path(root, path, recorded_by_path)
                 os.unlink(path)
-        if lease_fd is not None:
-            os.close(lease_fd)
-            lease_fd = None
         if lease_path.exists():
-            recheck_recorded_path(root, lease_path, recorded_by_path)
+            if lease_fd is None:
+                stop("lease-lock-missing")
+            recheck_held_recorded_path(
+                root, lease_path, lease_fd, recorded_by_path
+            )
             os.unlink(lease_path)
         recheck_recorded_path(root, root, recorded_by_path)
         os.rmdir(root)
+        if lease_fd is not None:
+            os.close(lease_fd)
+            lease_fd = None
         parent_fd = os.open(TEST_PARENT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             os.fsync(parent_fd)

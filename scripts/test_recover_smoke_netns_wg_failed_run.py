@@ -403,6 +403,108 @@ class FailedSmokeRecoveryTest(unittest.TestCase):
             self.assertIn("SMOKE_RECOVERY_COMPLETE", stdout)
             self.assertFalse(root.exists())
 
+    def test_main_lock_contention_preserves_root_and_receipt_for_retry(self) -> None:
+        with self.recovery_parent() as parent:
+            root, _manifest, plan_argv = self.build_run_fixture(parent)
+            run_argv = list(plan_argv)
+            run_argv[1] = "run"
+            lease_fd = os.open(root / "lifecycle.lease", os.O_RDONLY | os.O_CLOEXEC)
+            try:
+                RECOVERY.fcntl.flock(
+                    lease_fd, RECOVERY.fcntl.LOCK_EX | RECOVERY.fcntl.LOCK_NB
+                )
+                root_before = self.snapshot(root)
+                with self.assertRaises(SystemExit) as stopped:
+                    self.run_main(run_argv)
+                self.assertEqual(stopped.exception.code, 79)
+                self.assertEqual(self.snapshot(root), root_before)
+                _pending, final = RECOVERY.receipt_paths("0123abcd")
+                self.assertTrue(final.exists())
+            finally:
+                RECOVERY.fcntl.flock(lease_fd, RECOVERY.fcntl.LOCK_UN)
+                os.close(lease_fd)
+            stdout, stderr = self.run_main(run_argv)
+            self.assertEqual(stderr, "")
+            self.assertIn("SMOKE_RECOVERY_COMPLETE", stdout)
+
+    def test_main_revalidates_after_lock_before_first_root_unlink(self) -> None:
+        with self.recovery_parent() as parent:
+            root, _manifest, plan_argv = self.build_run_fixture(parent)
+            run_argv = list(plan_argv)
+            run_argv[1] = "run"
+            original_flock = RECOVERY.fcntl.flock
+            injected = root / "evidence" / "foreign-after-lock.txt"
+
+            def flock_then_inject(descriptor: int, operation: int):
+                result = original_flock(descriptor, operation)
+                if operation & RECOVERY.fcntl.LOCK_EX and not injected.exists():
+                    self.write_file(injected, b"foreign-after-lock\n")
+                return result
+
+            with mock.patch.object(RECOVERY.fcntl, "flock", flock_then_inject):
+                with self.assertRaises(SystemExit) as stopped:
+                    self.run_main(run_argv)
+            self.assertEqual(stopped.exception.code, 79)
+            self.assertTrue((root / "secrets" / "wg-b.conf").exists())
+            self.assertTrue((root / "manifest").exists())
+            self.assertTrue(injected.exists())
+
+            injected.unlink()
+            stdout, stderr = self.run_main(run_argv)
+            self.assertEqual(stderr, "")
+            self.assertIn("SMOKE_RECOVERY_COMPLETE", stdout)
+
+    def test_main_holds_lease_through_lease_unlink_and_root_rmdir(self) -> None:
+        with self.recovery_parent() as parent:
+            root, _manifest, plan_argv = self.build_run_fixture(parent)
+            run_argv = list(plan_argv)
+            run_argv[1] = "run"
+            real_open = os.open
+            real_close = os.close
+            real_unlink = os.unlink
+            real_rmdir = os.rmdir
+            lease_fd: int | None = None
+            lease_closed = False
+            observed_unlink_locked = False
+            observed_rmdir_locked = False
+
+            def tracked_open(path, flags, *args, **kwargs):
+                nonlocal lease_fd
+                descriptor = real_open(path, flags, *args, **kwargs)
+                if pathlib.Path(path) == root / "lifecycle.lease":
+                    lease_fd = descriptor
+                return descriptor
+
+            def tracked_close(descriptor: int):
+                nonlocal lease_closed
+                if lease_fd is not None and descriptor == lease_fd:
+                    lease_closed = True
+                return real_close(descriptor)
+
+            def tracked_unlink(path, *args, **kwargs):
+                nonlocal observed_unlink_locked
+                if pathlib.Path(path) == root / "lifecycle.lease":
+                    observed_unlink_locked = lease_fd is not None and not lease_closed
+                return real_unlink(path, *args, **kwargs)
+
+            def tracked_rmdir(path, *args, **kwargs):
+                nonlocal observed_rmdir_locked
+                if pathlib.Path(path) == root:
+                    observed_rmdir_locked = lease_fd is not None and not lease_closed
+                return real_rmdir(path, *args, **kwargs)
+
+            with mock.patch.object(RECOVERY.os, "open", tracked_open), mock.patch.object(
+                RECOVERY.os, "close", tracked_close
+            ), mock.patch.object(RECOVERY.os, "unlink", tracked_unlink), mock.patch.object(
+                RECOVERY.os, "rmdir", tracked_rmdir
+            ):
+                stdout, stderr = self.run_main(run_argv)
+            self.assertEqual(stderr, "")
+            self.assertIn("SMOKE_RECOVERY_COMPLETE", stdout)
+            self.assertTrue(observed_unlink_locked)
+            self.assertTrue(observed_rmdir_locked)
+            self.assertTrue(lease_closed)
+
 
 if __name__ == "__main__":
     unittest.main()

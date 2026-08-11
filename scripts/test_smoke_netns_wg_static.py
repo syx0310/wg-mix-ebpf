@@ -2355,6 +2355,9 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             "test_main_plan_is_no_write_and_run_recovers_after_interruption",
             "test_main_plan_accepts_non_xor_secret_set_without_writing",
             "test_main_retry_rejects_new_allowed_name_before_another_write",
+            "test_main_lock_contention_preserves_root_and_receipt_for_retry",
+            "test_main_revalidates_after_lock_before_first_root_unlink",
+            "test_main_holds_lease_through_lease_unlink_and_root_rmdir",
         ):
             self.assertIn(required, regression)
 
