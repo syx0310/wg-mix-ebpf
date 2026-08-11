@@ -1735,6 +1735,10 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             self.source.index("run_agent_in_netns() {") :
             self.source.index("\nteardown_step() {")
         ]
+        self.assertIn(
+            "reload | status | detach) isolated_args=(--isolated-netns-test)",
+            runner,
+        )
         first_exec = runner.index("run_bounded_in_owned_netns")
         self.assertLess(
             runner.index(

@@ -95,9 +95,9 @@ func isolatedNetNSTestPaths(
 	stateDir string,
 	pinPath string,
 ) (isolatedNetNSTestLayout, error) {
-	if cmd != "reload" && cmd != "detach" && cmd != isolatedPinOwnershipCommand {
+	if cmd != "reload" && cmd != "status" && cmd != "detach" && cmd != isolatedPinOwnershipCommand {
 		return isolatedNetNSTestLayout{}, fmt.Errorf(
-			"--isolated-netns-test is only valid for reload, detach, and the isolated ownership bridge",
+			"--isolated-netns-test is only valid for reload, status, detach, and the isolated ownership bridge",
 		)
 	}
 	for name, path := range map[string]string{

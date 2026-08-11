@@ -1972,7 +1972,7 @@ run_agent_in_netns() {
   validate_manifest || return 1
   validate_private_bpffs_mount || return 1
   case "${1:-}" in
-    reload | detach) isolated_args=(--isolated-netns-test) ;;
+    reload | status | detach) isolated_args=(--isolated-netns-test) ;;
   esac
   printf 'agent command: timestamp=%s netns=%s pin=%s run_dir=%s state_dir=%s argv=' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${ns}" "${pin}" "${run_dir}" "${state_dir}" >&2

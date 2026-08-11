@@ -193,6 +193,19 @@ func TestIsolatedNetNSTestPaths(t *testing.T) {
 	}
 }
 
+func TestIsolatedNetNSTestPathsAcceptsReadOnlyStatus(t *testing.T) {
+	base := filepath.Join(isolatedNetNSTestRoot, "0123456789abcdef")
+	if _, err := isolatedNetNSTestPaths(
+		"status",
+		filepath.Join(base, "secrets", "agent-a.yaml"),
+		filepath.Join(base, "run-a"),
+		filepath.Join(base, "state-a"),
+		filepath.Join(base, "bpffs", "wg-mix-ebpf-a"),
+	); err != nil {
+		t.Fatalf("isolated status paths: %v", err)
+	}
+}
+
 func TestIsolatedNetNSTestRolesShareLifecycleLease(t *testing.T) {
 	base := filepath.Join(isolatedNetNSTestRoot, "0123456789abcdef")
 	layouts := make([]isolatedNetNSTestLayout, 0, 2)
@@ -261,7 +274,7 @@ func TestIsolatedNetNSTestPathsRejectsEscapesAndMismatches(t *testing.T) {
 		state  string
 		pin    string
 	}{
-		{name: "read-only command", cmd: "status", config: validConfig, run: validRun, state: validState, pin: validPin},
+		{name: "unsupported read-only command", cmd: "validate", config: validConfig, run: validRun, state: validState, pin: validPin},
 		{name: "short run id", cmd: "reload", config: validConfig, run: filepath.Join(isolatedNetNSTestRoot, "1234", "run-a"), state: validState, pin: validPin},
 		{name: "invalid role", cmd: "reload", config: filepath.Join(base, "secrets", "agent-BAD.yaml"), run: filepath.Join(base, "run-BAD"), state: filepath.Join(base, "state-BAD"), pin: filepath.Join(base, "bpffs", "wg-mix-ebpf-BAD")},
 		{name: "state role mismatch", cmd: "reload", config: validConfig, run: validRun, state: filepath.Join(base, "state-b"), pin: validPin},
