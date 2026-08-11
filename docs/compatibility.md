@@ -102,6 +102,8 @@ sudo make test-netns-xor-smoke
 sudo make test-netns-xor-full-smoke
 sudo make test-netns-icmp-smoke
 sudo make test-netns-tcp
+sudo make test-netns-tcp-pmtu-positive
+sudo make test-netns-tcp-outer-gso-observe
 sudo make test-netns-full
 sudo NEGATIVE_CHECKS=xfail scripts/smoke-netns-icmp.sh
 sudo NEGATIVE_CHECKS=enforce scripts/smoke-netns-icmp.sh
@@ -116,30 +118,76 @@ paths, ICMP IPv4, and the TCP MTU matrix.
 
 The TCP matrix is opt-in so the lightweight smoke targets do not require
 `iperf3`. `test-netns-tcp` runs type-word-only UDP, XOR prefix, and XOR full
-modes. In each mode it runs a single TCP flow and four parallel flows at
-WireGuard MTUs 1419, 1420, and 1421. Every receiver stream must transfer at
-least 1 MiB, and the aggregate receive count must be at least 1 MiB multiplied
-by the requested stream count. Dataplane type, length, checksum, load/store,
-and XOR error counters must remain unchanged. The TCP load starts only after
-packet-capture validation finishes, avoiding high-volume pcap artifacts.
+modes. In each mode it runs 1, 4, and 16 TCP flows in forward, reverse, and
+simultaneous bidirectional directions at WireGuard MTUs 1419, 1420, 1421, and
+1422. These four values are the XOR tail-alignment matrix, not a physical-link
+PMTU claim. `test-netns-tcp-pmtu-positive` uses a 1500-byte underlay and checks
+the positive IPv4 WireGuard MTUs 1439/1440 and IPv6 MTUs 1419/1420. Every
+receiver stream in every direction must transfer at least 1 MiB.
+The iperf summary must match the per-stream records, retransmits must remain
+zero, multi-flow Jain fairness must be at least 0.90, and both peers' WireGuard
+receive and transmit counters must increase for every tested MTU. Dataplane
+type, length, fragment, IPv6 extension, checksum, load/store, rule-miss, and
+XOR error counters must remain unchanged. These are the correctness gates.
+
+GSO evidence is deliberately split from correctness. The matrix records the
+inner TCP GSO capabilities advertised by both `wg0` devices, and separately
+records the outer UDP GSO/GRO capabilities and dataplane counter deltas on the
+underlay path. Linux WireGuard can segment an inner TCP GSO skb before
+encryption, so a valid TCP-over-WireGuard run does not necessarily present an
+outer UDP GSO skb to the underlay TC programs. Consequently, a missing outer
+GSO observation is reported as `not-covered` (or `unsupported` when the link
+capabilities are absent), never as a correctness pass or failure. The focused
+`test-netns-tcp-outer-gso-observe` target runs 16 simultaneous bidirectional
+flows for 30 seconds to maximize the opportunity to observe those counters on
+the Linux 7.0 test host. It remains an observation target, not proof of outer
+GSO coverage. A dedicated outer-UDP `UDP_SEGMENT` sender and GRO receiver must
+be validated separately before outer GSO/GRO can be marked passed.
+
+The TCP load starts only after the initial packet-capture validation finishes.
+Every MTU, stream-count, and direction cell has separate router-side captures
+for `ra0` and `rb0`.
+Each capture is limited to 4096 packets with a 192-byte snap length and a
+timeout derived from that cell's duration. The checker validates each
+interface and expected underlay flow independently. A bidirectional cell must
+show both A-to-B and B-to-A transport packets in both `ra0` and `rb0` captures,
+so one interface, one direction, or an earlier cell cannot satisfy another
+cell's transport type-word requirement.
 
 Direct script callers can select the same gate and tune it for slower test
 hosts:
 
 ```bash
 sudo TCP_CHECKS=enforce \
-  TCP_MTUS="1420 1419 1421" \
+  TCP_MTUS="1419 1420 1421 1422" \
+  TCP_STREAMS="1 4 16" \
+  TCP_DIRECTIONS="forward reverse bidir" \
   TCP_DURATION=2 \
-  TCP_PARALLEL_STREAMS=4 \
   TCP_MIN_BYTES=1048576 \
+  TCP_MAX_RETRANSMITS=0 \
+  TCP_MIN_FAIRNESS=0.90 \
+  TCP_INNER_GSO_CHECKS=report \
+  TCP_OUTER_GSO_CHECKS=observe \
+  TCP_CAPTURE_PACKETS=4096 \
   scripts/smoke-netns-wg.sh
 ```
 
-`TCP_MIN_BYTES` is a per-receiver-stream threshold; the aggregate threshold is
-`TCP_MIN_BYTES * stream_count`. `TCP_CHECKS=off` is the default. The 1420 case
-covers the normal full-sized TCP boundary, while 1419 and 1421 force
-non-four-byte-aligned full-payload XOR targets. `iperf3` is checked as a
-dependency only when the TCP gate is enabled.
+`TCP_MIN_BYTES` is a per-receiver-stream and per-direction threshold.
+`TCP_CHECKS=off` is the default. MTUs 1419 through 1422 cover four adjacent
+XOR byte-tail alignments. They run over a deliberately larger 2200-byte
+underlay; use the positive PMTU target for the 1500-byte boundary.
+`iperf3` is checked as a dependency only when the TCP gate is enabled.
+`TCP_INNER_GSO_CHECKS` accepts `off`, `report`, or `enforce`; only the explicit
+`enforce` value makes missing `wg0` TX checksum, scatter-gather, TCP
+segmentation, or generic segmentation capability fail the run.
+`TCP_OUTER_GSO_CHECKS` accepts `off` or `observe`. Observation mode records TX
+checksum, scatter-gather, GSO, GRO, and UDP segmentation capability on
+`under0`, `ra0`, and `rb0`, then classifies actual managed/listener GSO counter
+deltas without changing the correctness exit status. A missing or malformed
+observation counter is reported as `not-covered`; it does not silently turn
+into either a pass or a correctness failure. Successful runs end with separate
+machine-readable `summary=inner-tcp-gso`, `summary=outer-udp-gso`, and
+`summary=correctness` records; only the last record reports TCP correctness.
 
 The ICMP smoke test is IPv4-only. Its pcap check requires ICMP Echo Request and
 Reply records, valid ICMP checksums, mixed initiation/response/transport payload

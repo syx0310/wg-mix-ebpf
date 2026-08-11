@@ -1,0 +1,17 @@
+version=1
+bootstrap_prefix=/run/wg-mix-ebpf-source-bootstrap
+launcher_file=stage-root-owned-test-source.sh
+launcher_mode=0500
+launcher_sha256=cb22948b1c426515cb094bcade2ed01c08fea3a2e09b3fa603d7f58e9c33308f
+helper_file=stage-root-owned-test-source.py
+helper_mode=0400
+helper_sha256=b4b435b1a4d26f32b93e459585ed090e4a6838e076e88c7dc339c3ad39f53067
+manifest_file=stage-root-owned-test-source.bootstrap
+manifest_mode=0400
+manifest_scope=root-copy-consistency-only
+authenticity_root=external-approved-postcopy-sha256
+direct_user_checkout_sudo=forbidden
+runner_file=run-root-owned-test-source-stage.sh
+runner_mode=0500
+runner_authenticity=external-approved-postcopy-sha256-argument
+runner_entry=env-i-fixed-path-lc-bash-root-copy

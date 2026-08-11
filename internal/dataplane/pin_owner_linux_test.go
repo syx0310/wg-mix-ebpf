@@ -105,8 +105,8 @@ func TestPinOwnerJSONFieldOrderAndCanonicalUTC(t *testing.T) {
 		`"active_generation":`,
 		`"next_generation":`,
 		`"maps":`,
-		`"active_filters":`,
-		`"desired_filters":`,
+		`"active_links":`,
+		`"desired_links":`,
 		`"program_stages":`,
 		`"map_stages":`,
 		`"retired_from_resource_key":`,
@@ -131,6 +131,330 @@ func TestPinOwnerJSONFieldOrderAndCanonicalUTC(t *testing.T) {
 	}
 }
 
+func TestPinOwnerV3ClassicSchemaIsDecodedThenExplicitlyRefused(t *testing.T) {
+	_, parent, current := testPinOwnerRecord(t, t.TempDir())
+	legacy := clonePinOwnerRecord(current)
+	legacy.Version = pinOwnerLegacyClassicVersion
+	legacy.ActiveLinks = nil
+	legacy.DesiredLinks = nil
+	legacy.ActiveFilters = []tcFilterBinding{
+		{
+			IfIndex:   11,
+			Direction: "ingress",
+			Parent:    0xfffffff2,
+			Handle:    0x10001,
+			Priority:  49152,
+			ProgramID: 77,
+		},
+	}
+	normalizePinOwnerRecord(legacy)
+	data, err := marshalPinOwnerRecord(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "legacy-v3-owner.json")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	decoded, err := readPinOwnerRecord(file)
+	if err != nil {
+		t.Fatalf("v3 schema must remain decodable for an explicit compatibility error: %v", err)
+	}
+	if err := validatePinOwnerRecord(decoded, parent.resource, parent.mountID); !errors.Is(err, errLegacyClassicOwnerRequiresMigration) {
+		t.Fatalf("legacy v3 validation error = %v", err)
+	}
+}
+
+func TestPinOwnerV4ExactLinkIdentityAndTransitionValidation(t *testing.T) {
+	_, parent, base := testPinOwnerRecord(t, t.TempDir())
+	active := testExactTCXBinding(31, exactTCXIngress, 801)
+	active.LinkID = 901
+	record, err := newActivePinOwnerRecord(
+		parent,
+		mustPinOwnerToken(t, base),
+		base.BootID,
+		time.Date(2026, 7, 29, 1, 2, 4, 0, time.UTC),
+		base.ActiveGeneration,
+		base.Maps,
+		[]exactTCXBinding{active},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if record.Version != pinOwnerRecordVersion || len(record.ActiveLinks) != 1 {
+		t.Fatalf("v4 exact owner = %#v", record)
+	}
+
+	badAttach := clonePinOwnerRecord(record)
+	badAttach.ActiveLinks[0].AttachType++
+	if err := validatePinOwnerRecord(badAttach, parent.resource, parent.mountID); err == nil {
+		t.Fatal("owner accepted a direction/attach-type mismatch")
+	}
+
+	desired := active
+	desired.ProgramID++
+	applying, err := newApplyingPinOwnerRecord(
+		parent,
+		mustPinOwnerToken(t, record),
+		record.BootID,
+		time.Date(2026, 7, 29, 1, 2, 5, 0, time.UTC),
+		record.ActiveGeneration,
+		record.ActiveGeneration+1,
+		record.Maps,
+		record.ActiveLinks,
+		[]exactTCXBinding{desired},
+		record,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedID := clonePinOwnerRecord(applying)
+	changedID.DesiredLinks[0].LinkID++
+	if err := validatePinOwnerRecord(changedID, parent.resource, parent.mountID); err == nil ||
+		!strings.Contains(err.Error(), "changes link ID") {
+		t.Fatalf("same-slot link-ID change error = %v", err)
+	}
+	replacing := clonePinOwnerRecord(applying)
+	replacing.DesiredLinks[0].LinkID = 0
+	replacing.DesiredLinks[0].ReplacesLinkID = active.LinkID
+	if err := validatePinOwnerRecord(replacing, parent.resource, parent.mountID); err != nil {
+		t.Fatalf("explicit detached-link replacement intent: %v", err)
+	}
+	publishedReplacement := clonePinOwnerRecord(replacing)
+	publishedReplacement.DesiredLinks[0].LinkID = active.LinkID + 100
+	if err := validatePinOwnerRecord(publishedReplacement, parent.resource, parent.mountID); err != nil {
+		t.Fatalf("published detached-link replacement identity: %v", err)
+	}
+	rollingBackReplacement := advancePinOwnerRecord(
+		publishedReplacement,
+		time.Date(2026, 7, 29, 1, 2, 5, 250, time.UTC),
+		pinOwnerPhaseApplying,
+		pinOwnerStepRollingBack,
+	)
+	rollingBackReplacement.ActiveLinks[0].LinkID = active.LinkID + 200
+	rollingBackReplacement.ActiveLinks[0].ReplacesLinkID = active.LinkID
+	if err := validatePinOwnerRecord(
+		rollingBackReplacement, parent.resource, parent.mountID,
+	); err != nil {
+		t.Fatalf("rollback detached-link replacement lineage: %v", err)
+	}
+	wrongRollbackLineage := clonePinOwnerRecord(rollingBackReplacement)
+	wrongRollbackLineage.DesiredLinks[0].ReplacesLinkID =
+		wrongRollbackLineage.ActiveLinks[0].LinkID
+	if err := validatePinOwnerRecord(
+		wrongRollbackLineage, parent.resource, parent.mountID,
+	); err == nil || !strings.Contains(err.Error(), "rollback active lineage") {
+		t.Fatalf("rollback replacement accepted new-link lineage: %v", err)
+	}
+	sharedRollbackIdentity := clonePinOwnerRecord(rollingBackReplacement)
+	sharedRollbackIdentity.DesiredLinks[0].LinkID =
+		sharedRollbackIdentity.ActiveLinks[0].LinkID
+	if err := validatePinOwnerRecord(
+		sharedRollbackIdentity, parent.resource, parent.mountID,
+	); err == nil || !strings.Contains(err.Error(), "reuses rollback active link ID") {
+		t.Fatalf("failed target reused rollback identity: %v", err)
+	}
+	reusedRetiredRollbackID := clonePinOwnerRecord(rollingBackReplacement)
+	reusedRetiredRollbackID.DesiredLinks[0].LinkID = active.LinkID
+	if err := validatePinOwnerRecord(
+		reusedRetiredRollbackID, parent.resource, parent.mountID,
+	); err == nil || !strings.Contains(err.Error(), "rollback active lineage") {
+		t.Fatalf("rollback detached replacement reused retired link ID: %v", err)
+	}
+	sameLinkRollback := advancePinOwnerRecord(
+		applying,
+		time.Date(2026, 7, 29, 1, 2, 5, 300, time.UTC),
+		pinOwnerPhaseApplying,
+		pinOwnerStepRollingBack,
+	)
+	if err := validatePinOwnerRecord(sameLinkRollback, parent.resource, parent.mountID); err != nil {
+		t.Fatalf("same-link CAS rollback: %v", err)
+	}
+	detachedSameLinkRollback := clonePinOwnerRecord(sameLinkRollback)
+	detachedSameLinkRollback.ActiveLinks[0].LinkID = active.LinkID + 300
+	detachedSameLinkRollback.ActiveLinks[0].ReplacesLinkID = active.LinkID
+	if err := validatePinOwnerRecord(
+		detachedSameLinkRollback, parent.resource, parent.mountID,
+	); err != nil {
+		t.Fatalf("detached same-link CAS rollback lineage: %v", err)
+	}
+	badReplacement := clonePinOwnerRecord(replacing)
+	badReplacement.DesiredLinks[0].ReplacesLinkID++
+	if err := validatePinOwnerRecord(badReplacement, parent.resource, parent.mountID); err == nil ||
+		!strings.Contains(err.Error(), "active is") {
+		t.Fatalf("mismatched detached-link replacement error = %v", err)
+	}
+	completedReplacement := completeApplyingPinOwnerRecord(
+		publishedReplacement,
+		time.Date(2026, 7, 29, 1, 2, 5, 500, time.UTC),
+	)
+	if len(completedReplacement.ActiveLinks) != 1 ||
+		completedReplacement.ActiveLinks[0].ReplacesLinkID != 0 ||
+		completedReplacement.ActiveLinks[0].LinkID != active.LinkID+100 {
+		t.Fatalf("completed replacement retained transient marker: %+v", completedReplacement.ActiveLinks)
+	}
+	cleanup := advancePinOwnerRecord(
+		applying,
+		time.Date(2026, 7, 29, 1, 2, 6, 0, time.UTC),
+		pinOwnerPhaseApplying,
+		pinOwnerStepCleanup,
+	)
+	cleanup.DesiredLinks[0].LinkID = 0
+	if err := validatePinOwnerRecord(cleanup, parent.resource, parent.mountID); err == nil ||
+		!strings.Contains(err.Error(), "changes link ID") {
+		t.Fatalf("cleanup unpublished link-ID error = %v", err)
+	}
+}
+
+func TestValidateRollingBackOwnerLinkMatrix(t *testing.T) {
+	stable := testExactTCXBinding(71, exactTCXIngress, 901)
+	stable.LinkID = 1001
+	desiredCAS := stable
+	desiredCAS.ProgramID = 902
+	desiredReplacement := desiredCAS
+	desiredReplacement.LinkID = 1002
+	desiredReplacement.ReplacesLinkID = stable.LinkID
+	rollbackReplacement := stable
+	rollbackReplacement.LinkID = 1003
+	rollbackReplacement.ReplacesLinkID = stable.LinkID
+	pendingRollbackReplacement := rollbackReplacement
+	pendingRollbackReplacement.LinkID = 0
+	targetOnly := testExactTCXBinding(72, exactTCXEgress, 903)
+	targetOnly.LinkID = 1004
+
+	tests := []struct {
+		name      string
+		active    []exactTCXBinding
+		desired   []exactTCXBinding
+		wantError string
+	}{
+		{
+			name:   "same-link-CAS",
+			active: []exactTCXBinding{stable}, desired: []exactTCXBinding{desiredCAS},
+		},
+		{
+			name:   "detached-forward-pending",
+			active: []exactTCXBinding{stable},
+			desired: []exactTCXBinding{{
+				Backend: stable.Backend, IfIndex: stable.IfIndex,
+				Direction: stable.Direction, AttachType: stable.AttachType,
+				PinName: stable.PinName, ProgramID: desiredCAS.ProgramID,
+				ReplacesLinkID: stable.LinkID,
+			}},
+		},
+		{
+			name:   "detached-forward-published",
+			active: []exactTCXBinding{stable}, desired: []exactTCXBinding{desiredReplacement},
+		},
+		{
+			name:   "rollback-replacement-pending",
+			active: []exactTCXBinding{pendingRollbackReplacement},
+			desired: []exactTCXBinding{{
+				Backend: stable.Backend, IfIndex: stable.IfIndex,
+				Direction: stable.Direction, AttachType: stable.AttachType,
+				PinName: stable.PinName, ProgramID: desiredCAS.ProgramID,
+				ReplacesLinkID: stable.LinkID,
+			}},
+		},
+		{
+			name:    "rollback-replacement-detached-forward",
+			active:  []exactTCXBinding{rollbackReplacement},
+			desired: []exactTCXBinding{desiredReplacement},
+		},
+		{
+			name:   "rollback-replacement-same-link-CAS",
+			active: []exactTCXBinding{rollbackReplacement}, desired: []exactTCXBinding{desiredCAS},
+		},
+		{
+			name:    "target-only-slot",
+			desired: []exactTCXBinding{targetOnly},
+		},
+		{
+			name:   "stable-different-link-without-lineage",
+			active: []exactTCXBinding{stable},
+			desired: []exactTCXBinding{func() exactTCXBinding {
+				binding := desiredCAS
+				binding.LinkID = 1002
+				return binding
+			}()},
+			wantError: "without replacement lineage",
+		},
+		{
+			name:   "stable-zero-link-without-lineage",
+			active: []exactTCXBinding{stable},
+			desired: []exactTCXBinding{func() exactTCXBinding {
+				binding := desiredCAS
+				binding.LinkID = 0
+				return binding
+			}()},
+			wantError: "without replacement lineage",
+		},
+		{
+			name: "rollback-replacement-retiring",
+			active: []exactTCXBinding{func() exactTCXBinding {
+				binding := rollbackReplacement
+				binding.Retiring = true
+				return binding
+			}()},
+			desired:   []exactTCXBinding{desiredReplacement},
+			wantError: "cannot be retiring",
+		},
+		{
+			name:   "failed-target-reuses-rollback-link",
+			active: []exactTCXBinding{rollbackReplacement},
+			desired: []exactTCXBinding{func() exactTCXBinding {
+				binding := desiredReplacement
+				binding.LinkID = rollbackReplacement.LinkID
+				return binding
+			}()},
+			wantError: "reuses rollback active link ID",
+		},
+		{
+			name:   "failed-target-wrong-lineage",
+			active: []exactTCXBinding{rollbackReplacement},
+			desired: []exactTCXBinding{func() exactTCXBinding {
+				binding := desiredReplacement
+				binding.ReplacesLinkID = rollbackReplacement.LinkID
+				return binding
+			}()},
+			wantError: "rollback active lineage",
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateOwnerLinks(test.active, "rollback active", false)
+			if err == nil {
+				err = validateOwnerLinks(test.desired, "desired", false)
+			}
+			if err == nil {
+				err = validateRollingBackOwnerLinks(test.active, test.desired)
+			}
+			if test.wantError == "" && err != nil {
+				t.Fatalf("legal rolling-back lineage rejected: %v", err)
+			}
+			if test.wantError != "" &&
+				(err == nil || !strings.Contains(err.Error(), test.wantError)) {
+				t.Fatalf("rolling-back lineage error=%v, want %q", err, test.wantError)
+			}
+		})
+	}
+}
+
+func mustPinOwnerToken(t *testing.T, record *pinOwnerRecord) [32]byte {
+	t.Helper()
+	token, err := tokenFromOwnerRecord(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return token
+}
+
 func TestPinOwnerPhaseStepMatrix(t *testing.T) {
 	_, parent, active := testPinOwnerRecord(t, t.TempDir())
 	var token [32]byte
@@ -146,8 +470,8 @@ func TestPinOwnerPhaseStepMatrix(t *testing.T) {
 		active.ActiveGeneration,
 		active.ActiveGeneration+1,
 		active.Maps,
-		active.ActiveFilters,
-		active.ActiveFilters,
+		active.ActiveLinks,
+		active.ActiveLinks,
 		active,
 	)
 	if err != nil {
@@ -164,6 +488,8 @@ func TestPinOwnerPhaseStepMatrix(t *testing.T) {
 		pinOwnerPhaseApplying: {
 			pinOwnerStepStaging,
 			pinOwnerStepMutating,
+			pinOwnerStepRollingBack,
+			pinOwnerStepRollbackCleanup,
 			pinOwnerStepCleanup,
 		},
 		pinOwnerPhaseDetaching: {
@@ -180,8 +506,11 @@ func TestPinOwnerPhaseStepMatrix(t *testing.T) {
 	}
 	allSteps := []string{
 		pinOwnerStepReady,
+		pinOwnerStepRetiring,
 		pinOwnerStepStaging,
 		pinOwnerStepMutating,
+		pinOwnerStepRollingBack,
+		pinOwnerStepRollbackCleanup,
 		pinOwnerStepMutatingTC,
 		pinOwnerStepUnlinkingMaps,
 		pinOwnerStepCleanup,
@@ -210,6 +539,214 @@ func TestPinOwnerPhaseStepMatrix(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestOwnerDirectoryCoversExactTCXLinkPinsAcrossPhases(t *testing.T) {
+	type fixture struct {
+		handle *pinPathHandle
+		parent *pinPathParent
+		active *pinOwnerRecord
+	}
+	setup := func(t *testing.T, activeLinks []exactTCXBinding, present ...string) fixture {
+		t.Helper()
+		bpffsRoot, validator := newTestBPFFS(t)
+		pinPath := filepath.Join(bpffsRoot, "wg-mix-ebpf-owner-links")
+		mapStore := writeCanonicalMockPins(t, pinPath)
+		runtime := newTestPinPathRuntime(t, validator, mapStore)
+		validated, err := validatePinPath(pinPath, validator)
+		if err != nil {
+			t.Fatal(err)
+		}
+		parent, err := openPinPathParent(pinPath, validated, runtime)
+		if err != nil {
+			t.Fatal(err)
+		}
+		handle, _, err := openPinPathHandleFromParent(parent, validated, false)
+		if err != nil {
+			_ = parent.Close()
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			_ = handle.Close()
+			_ = parent.Close()
+		})
+		pins, err := inspectPinnedMapSet(handle, true)
+		if err != nil {
+			t.Fatal(err)
+		}
+		ownerMaps := ownerMapsFromPins(pins)
+		if err := closePinnedMapPins(pins); err != nil {
+			t.Fatal(err)
+		}
+		var token [32]byte
+		for index := range token {
+			token[index] = byte(index + 1)
+		}
+		active, err := newActivePinOwnerRecord(
+			parent,
+			token,
+			"12345678-1234-1234-1234-123456789abc",
+			time.Date(2026, 8, 8, 1, 2, 3, 0, time.UTC),
+			7,
+			ownerMaps,
+			activeLinks,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, name := range present {
+			if err := os.WriteFile(filepath.Join(pinPath, name), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return fixture{handle: handle, parent: parent, active: active}
+	}
+	link := func(ifindex int, direction exactTCXDirection, programID, linkID uint32) exactTCXBinding {
+		binding := testExactTCXBinding(ifindex, direction, programID)
+		binding.LinkID = linkID
+		return binding
+	}
+
+	t.Run("active exact set", func(t *testing.T) {
+		links := []exactTCXBinding{
+			link(41, exactTCXIngress, 1001, 2001),
+			link(41, exactTCXEgress, 1002, 2002),
+		}
+		fixture := setup(t, links, links[0].PinName, links[1].PinName)
+		if err := validateOwnerDirectoryEntries(fixture.handle, fixture.active); err != nil {
+			t.Fatal(err)
+		}
+		state, err := classifyCanonicalPinDirectory(fixture.handle)
+		if err != nil || state != canonicalPinsOwnedTCX {
+			t.Fatalf("canonical state = %v, error=%v", state, err)
+		}
+	})
+
+	t.Run("active missing and unjournaled fail closed", func(t *testing.T) {
+		owned := link(42, exactTCXIngress, 1003, 2003)
+		foreign := link(42, exactTCXEgress, 1004, 2004)
+		fixture := setup(t, []exactTCXBinding{owned}, foreign.PinName)
+		if err := validateOwnerDirectoryEntries(fixture.handle, fixture.active); err == nil ||
+			!strings.Contains(err.Error(), "not covered") {
+			t.Fatalf("unjournaled exact pin error = %v", err)
+		}
+	})
+
+	t.Run("applying mutation covers unpublished deterministic pin", func(t *testing.T) {
+		activeLink := link(43, exactTCXIngress, 1005, 2005)
+		newLink := testExactTCXBinding(44, exactTCXEgress, 1006)
+		fixture := setup(t, []exactTCXBinding{activeLink}, activeLink.PinName, newLink.PinName)
+		applying, err := newApplyingPinOwnerRecord(
+			fixture.parent,
+			mustPinOwnerToken(t, fixture.active),
+			fixture.active.BootID,
+			time.Date(2026, 8, 8, 1, 2, 4, 0, time.UTC),
+			fixture.active.ActiveGeneration,
+			fixture.active.ActiveGeneration+1,
+			fixture.active.Maps,
+			fixture.active.ActiveLinks,
+			[]exactTCXBinding{activeLink, newLink},
+			fixture.active,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mutating := advancePinOwnerRecord(
+			applying,
+			time.Date(2026, 8, 8, 1, 2, 5, 0, time.UTC),
+			pinOwnerPhaseApplying,
+			pinOwnerStepMutating,
+		)
+		if err := validateOwnerDirectoryEntries(fixture.handle, mutating); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("applying staging rejects a pre-mutation desired pin", func(t *testing.T) {
+		newLink := testExactTCXBinding(49, exactTCXIngress, 1011)
+		fixture := setup(t, nil, newLink.PinName)
+		applying, err := newApplyingPinOwnerRecord(
+			fixture.parent,
+			mustPinOwnerToken(t, fixture.active),
+			fixture.active.BootID,
+			time.Date(2026, 8, 8, 1, 2, 4, 0, time.UTC),
+			fixture.active.ActiveGeneration,
+			fixture.active.ActiveGeneration+1,
+			fixture.active.Maps,
+			fixture.active.ActiveLinks,
+			[]exactTCXBinding{newLink},
+			fixture.active,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := validateOwnerDirectoryEntries(fixture.handle, applying); err == nil ||
+			!strings.Contains(err.Error(), "unexpected exact TCX pin") {
+			t.Fatalf("staging desired pin error = %v", err)
+		}
+	})
+
+	t.Run("applying cleanup permits already removed stale active pin", func(t *testing.T) {
+		retained := link(45, exactTCXIngress, 1007, 2007)
+		stale := link(46, exactTCXEgress, 1008, 2008)
+		fixture := setup(t, []exactTCXBinding{retained, stale}, retained.PinName)
+		applying, err := newApplyingPinOwnerRecord(
+			fixture.parent,
+			mustPinOwnerToken(t, fixture.active),
+			fixture.active.BootID,
+			time.Date(2026, 8, 8, 1, 2, 4, 0, time.UTC),
+			fixture.active.ActiveGeneration,
+			fixture.active.ActiveGeneration+1,
+			fixture.active.Maps,
+			fixture.active.ActiveLinks,
+			[]exactTCXBinding{retained},
+			fixture.active,
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		cleanup := advancePinOwnerRecord(
+			applying,
+			time.Date(2026, 8, 8, 1, 2, 5, 0, time.UTC),
+			pinOwnerPhaseApplying,
+			pinOwnerStepCleanup,
+		)
+		if err := validateOwnerDirectoryEntries(fixture.handle, cleanup); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	t.Run("detaching mutation permits exact progress but unlinking requires none", func(t *testing.T) {
+		first := link(47, exactTCXIngress, 1009, 2009)
+		second := link(47, exactTCXEgress, 1010, 2010)
+		fixture := setup(t, []exactTCXBinding{first, second}, second.PinName)
+		detaching, err := newDetachingPinOwnerRecord(
+			fixture.active,
+			time.Date(2026, 8, 8, 1, 2, 4, 0, time.UTC),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		mutating := advancePinOwnerRecord(
+			detaching,
+			time.Date(2026, 8, 8, 1, 2, 5, 0, time.UTC),
+			pinOwnerPhaseDetaching,
+			pinOwnerStepMutatingTC,
+		)
+		if err := validateOwnerDirectoryEntries(fixture.handle, mutating); err != nil {
+			t.Fatal(err)
+		}
+		unlinking := advancePinOwnerRecord(
+			mutating,
+			time.Date(2026, 8, 8, 1, 2, 6, 0, time.UTC),
+			pinOwnerPhaseDetaching,
+			pinOwnerStepUnlinkingMaps,
+		)
+		if err := validateOwnerDirectoryEntries(fixture.handle, unlinking); err == nil ||
+			!strings.Contains(err.Error(), "still has exact TCX") {
+			t.Fatalf("unlinking exact pin error = %v", err)
+		}
+	})
 }
 
 func TestPinOwnerDescriptorRecoveryPublishesOnlyNextSequence(t *testing.T) {
@@ -2307,7 +2844,7 @@ func TestRekeyRebootedOwnerPreservesOldRecordAndRetiresIndex(t *testing.T) {
 		entry,
 		currentBoot,
 		runtime.now(),
-		tcRuntime{},
+		exactTCXRuntime{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -2316,7 +2853,7 @@ func TestRekeyRebootedOwnerPreservesOldRecordAndRetiresIndex(t *testing.T) {
 		rekeyed.RetiredFromResourceKey != oldResource.key ||
 		rekeyed.RetiredFromBootID != oldRecord.BootID ||
 		rekeyed.BootID != currentBoot ||
-		len(rekeyed.ActiveFilters) != 0 {
+		len(rekeyed.ActiveLinks) != 0 {
 		t.Fatalf("rekeyed owner = %#v", rekeyed)
 	}
 	if _, err := os.Stat(filepath.Join(
@@ -2531,7 +3068,7 @@ func TestRekeyRebootedOwnerWithSameResourceKeyAndOlderHistory(t *testing.T) {
 		rekeySource,
 		currentBoot,
 		runtime.now(),
-		tcRuntime{},
+		exactTCXRuntime{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -3006,15 +3543,14 @@ func TestInspectPinOwnershipDoesNotMutateOwnerIndexOrPins(t *testing.T) {
 	runtime.beforePinUnlink = func(name string) error {
 		return fmt.Errorf("read-only inspection attempted to unlink %s", name)
 	}
-	// The internal API still requires a complete TC dependency set. Since this
-	// owner has no filters, the fake runtime must remain entirely untouched.
-	tcKernel := newFakeTCKernel()
+	// This owner has no exact TCX links, so inspection must not touch the
+	// deliberately empty runtime.
 	status, err := inspectPinOwnershipWithRuntime(
 		t.Context(),
 		pinPath,
 		false,
 		runtime,
-		tcKernel.runtime(),
+		exactTCXRuntime{},
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -3040,16 +3576,6 @@ func TestInspectPinOwnershipDoesNotMutateOwnerIndexOrPins(t *testing.T) {
 			"pin files changed during inspection:\nbefore=%#v\nafter=%#v",
 			pinsBefore,
 			pinsAfter,
-		)
-	}
-	if len(tcKernel.filterLists) != 0 ||
-		len(tcKernel.writes) != 0 ||
-		len(tcKernel.retained) != 0 {
-		t.Fatalf(
-			"read-only inspection touched TC state: lists=%v writes=%v retained=%v",
-			tcKernel.filterLists,
-			tcKernel.writes,
-			tcKernel.retained,
 		)
 	}
 	lockEntries, err := os.ReadDir(runtime.lockRoot)
@@ -3203,7 +3729,7 @@ func TestMissingPinDirectoryPreservesAndReportsOwnershipEvidence(
 				pinPath,
 				false,
 				runtime,
-				tcRuntime{},
+				exactTCXRuntime{},
 			)
 			if err != nil {
 				t.Fatal(err)
