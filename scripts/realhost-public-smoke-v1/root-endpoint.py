@@ -682,7 +682,7 @@ def apply_endpoint(args: argparse.Namespace) -> None:
         ]
     )
     command([TOOLS["ip"], "link", "set", "dev", staging_name, "name", wg_name])
-    wg_argv = [
+    wg_interface_argv = [
         TOOLS["wg"],
         "set",
         wg_name,
@@ -692,6 +692,12 @@ def apply_endpoint(args: argparse.Namespace) -> None:
         str(spec["listen_port"]),
         "fwmark",
         spec["fwmark"],
+    ]
+    command(wg_interface_argv, stop_label="wg-interface")
+    wg_peer_argv = [
+        TOOLS["wg"],
+        "set",
+        wg_name,
         "peer",
         args.peer_public_key,
         "allowed-ips",
@@ -699,7 +705,7 @@ def apply_endpoint(args: argparse.Namespace) -> None:
         "persistent-keepalive",
         "15",
     ]
-    command(wg_argv, stop_label="wg-base")
+    command(wg_peer_argv, stop_label="wg-peer")
     if args.role == "b82":
         command(
             [

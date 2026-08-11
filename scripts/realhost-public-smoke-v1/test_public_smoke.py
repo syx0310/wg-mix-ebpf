@@ -535,9 +535,11 @@ class PublicSmokeTest(unittest.TestCase):
             for item in command_calls
             if item[0][:2] == [self.root.TOOLS["wg"], "set"]
         ]
-        self.assertEqual(2, len(wg_calls))
-        self.assertEqual("wg-base", wg_calls[0][1].get("stop_label"))
+        self.assertEqual(3, len(wg_calls))
+        self.assertEqual("wg-interface", wg_calls[0][1].get("stop_label"))
+        self.assertEqual("wg-peer", wg_calls[1][1].get("stop_label"))
         self.assertNotIn("endpoint", wg_calls[0][0])
+        self.assertNotIn("endpoint", wg_calls[1][0])
         self.assertEqual(
             [
                 self.root.TOOLS["wg"],
@@ -548,9 +550,9 @@ class PublicSmokeTest(unittest.TestCase):
                 "endpoint",
                 "47.116.202.155:31155",
             ],
-            wg_calls[1][0],
+            wg_calls[2][0],
         )
-        self.assertEqual("wg-endpoint", wg_calls[1][1].get("stop_label"))
+        self.assertEqual("wg-endpoint", wg_calls[2][1].get("stop_label"))
 
     def test_local_evidence_export_resumes_partial_and_linked_publish(self) -> None:
         payload = b"bounded-evidence-payload\n"
