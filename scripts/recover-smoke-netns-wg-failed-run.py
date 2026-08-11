@@ -849,8 +849,20 @@ def main() -> None:
         return
     lease_fd = None
     lease_path = root / "lifecycle.lease"
-    if lease_path.exists():
+    try:
         lease_fd = os.open(lease_path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        unlocked_files = validate_tree(root, manifest, initial=False)
+        recorded_by_path = preflight_inventory(
+            root, unlocked_files, recorded_inventory
+        )
+        unlocked_inventory = tree_inventory(root, unlocked_files)
+        if unlocked_inventory != [recorded_by_path["."]]:
+            stop("lifecycle-missing")
+        files = unlocked_files
+    except OSError:
+        stop("lifecycle-open")
+    else:
         try:
             recheck_held_recorded_path(
                 root, lease_path, lease_fd, recorded_by_path

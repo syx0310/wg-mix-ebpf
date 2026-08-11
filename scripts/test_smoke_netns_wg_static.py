@@ -2358,6 +2358,9 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             "test_main_lock_contention_preserves_root_and_receipt_for_retry",
             "test_main_revalidates_after_lock_before_first_root_unlink",
             "test_main_holds_lease_through_lease_unlink_and_root_rmdir",
+            "test_main_rejects_missing_lease_with_recorded_entries_before_unlink",
+            "test_main_rejects_lease_removed_after_preflight_before_unlink",
+            "test_main_retries_only_legal_root_only_missing_lease_state",
         ):
             self.assertIn(required, regression)
 

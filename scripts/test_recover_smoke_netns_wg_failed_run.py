@@ -506,6 +506,93 @@ class FailedSmokeRecoveryTest(unittest.TestCase):
             self.assertTrue(observed_rmdir_locked)
             self.assertTrue(lock_released)
 
+    def test_main_rejects_missing_lease_with_recorded_entries_before_unlink(self) -> None:
+        with self.recovery_parent() as parent:
+            root, _manifest, plan_argv = self.build_run_fixture(parent)
+            run_argv = list(plan_argv)
+            run_argv[1] = "run"
+            original_flock = RECOVERY.fcntl.flock
+
+            def busy_flock(descriptor: int, operation: int):
+                if operation & RECOVERY.fcntl.LOCK_EX:
+                    raise BlockingIOError
+                return original_flock(descriptor, operation)
+
+            with mock.patch.object(RECOVERY.fcntl, "flock", busy_flock):
+                with self.assertRaises(SystemExit) as stopped:
+                    self.run_main(run_argv)
+            self.assertEqual(stopped.exception.code, 79)
+            root.joinpath("lifecycle.lease").unlink()
+            root_before = self.snapshot(root)
+
+            with self.assertRaises(SystemExit) as stopped:
+                self.run_main(run_argv)
+            self.assertEqual(stopped.exception.code, 79)
+            self.assertEqual(self.snapshot(root), root_before)
+            self.assertTrue((root / "manifest").exists())
+            self.assertTrue((root / "secrets" / "wg-b.conf").exists())
+
+    def test_main_rejects_lease_removed_after_preflight_before_unlink(self) -> None:
+        with self.recovery_parent() as parent:
+            root, _manifest, plan_argv = self.build_run_fixture(parent)
+            run_argv = list(plan_argv)
+            run_argv[1] = "run"
+            original_preflight = RECOVERY.preflight_inventory
+            injected = False
+            injected_snapshot: list[tuple[object, ...]] | None = None
+
+            def preflight_then_remove_lease(*args, **kwargs):
+                nonlocal injected, injected_snapshot
+                result = original_preflight(*args, **kwargs)
+                if not injected:
+                    root.joinpath("lifecycle.lease").unlink()
+                    injected_snapshot = self.snapshot(root)
+                    injected = True
+                return result
+
+            with mock.patch.object(
+                RECOVERY, "preflight_inventory", preflight_then_remove_lease
+            ):
+                with self.assertRaises(SystemExit) as stopped:
+                    self.run_main(run_argv)
+            self.assertEqual(stopped.exception.code, 79)
+            self.assertTrue(injected)
+            self.assertIsNotNone(injected_snapshot)
+            self.assertEqual(self.snapshot(root), injected_snapshot)
+            self.assertTrue((root / "manifest").exists())
+            self.assertTrue((root / "secrets" / "wg-b.conf").exists())
+
+    def test_main_retries_only_legal_root_only_missing_lease_state(self) -> None:
+        with self.recovery_parent() as parent:
+            root, _manifest, plan_argv = self.build_run_fixture(parent)
+            run_argv = list(plan_argv)
+            run_argv[1] = "run"
+            original_rmdir = os.rmdir
+            interrupted = False
+
+            def interrupt_before_root_rmdir(path, *args, **kwargs):
+                nonlocal interrupted
+                if pathlib.Path(path) == root and not interrupted:
+                    interrupted = True
+                    raise RuntimeError("injected-before-root-rmdir")
+                return original_rmdir(path, *args, **kwargs)
+
+            with mock.patch.object(RECOVERY.os, "rmdir", interrupt_before_root_rmdir):
+                with self.assertRaisesRegex(
+                    RuntimeError, "injected-before-root-rmdir"
+                ):
+                    self.run_main(run_argv)
+            _pending, final = RECOVERY.receipt_paths("0123abcd")
+            self.assertTrue(interrupted)
+            self.assertEqual(list(root.iterdir()), [])
+            self.assertTrue(final.exists())
+
+            stdout, stderr = self.run_main(run_argv)
+            self.assertEqual(stderr, "")
+            self.assertIn("SMOKE_RECOVERY_COMPLETE", stdout)
+            self.assertFalse(root.exists())
+            self.assertFalse(final.exists())
+
 
 if __name__ == "__main__":
     unittest.main()
