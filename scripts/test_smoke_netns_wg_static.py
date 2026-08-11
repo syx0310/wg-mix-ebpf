@@ -2353,6 +2353,7 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             "test_recorded_inventory_allows_only_missing_not_new_or_replaced",
             "test_proc_wide_mount_and_netns_scans_reject_live_resources",
             "test_main_plan_is_no_write_and_run_recovers_after_interruption",
+            "test_main_plan_accepts_non_xor_secret_set_without_writing",
             "test_main_retry_rejects_new_allowed_name_before_another_write",
         ):
             self.assertIn(required, regression)

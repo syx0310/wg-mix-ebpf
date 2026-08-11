@@ -456,7 +456,11 @@ def validate_tree(root: Path, manifest: dict[str, str], *, initial: bool) -> lis
                 stop("evidence-name")
         else:
             allowed = fixed_names[dirname]
-            if initial and set(child_entries) != allowed:
+            if dirname == "secrets":
+                allowed_initial_sets = (allowed, allowed - {"xor-password"})
+                if initial and set(child_entries) not in allowed_initial_sets:
+                    stop("secrets-entries")
+            elif initial and set(child_entries) != allowed:
                 stop(f"{dirname}-entries")
             if not set(child_entries).issubset(allowed):
                 stop(f"{dirname}-extra")

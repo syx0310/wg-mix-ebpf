@@ -35,7 +35,7 @@ class FailedSmokeRecoveryTest(unittest.TestCase):
         path.chmod(mode)
 
     def build_run_fixture(
-        self, parent: pathlib.Path
+        self, parent: pathlib.Path, *, include_xor_password: bool = True
     ) -> tuple[pathlib.Path, dict[str, str], list[str]]:
         run_id = "0123abcd"
         failed_commit = "2" * 40
@@ -116,9 +116,8 @@ class FailedSmokeRecoveryTest(unittest.TestCase):
                 root / dirname / ".wg-mix-ebpf-test-owner", owner(role)
             )
 
-        for name in (
+        secret_names = [
             "netns-anchor-token",
-            "xor-password",
             "a.key",
             "a.pub",
             "b.key",
@@ -127,7 +126,10 @@ class FailedSmokeRecoveryTest(unittest.TestCase):
             "wg-b.conf",
             "agent-a.yaml",
             "agent-b.yaml",
-        ):
+        ]
+        if include_xor_password:
+            secret_names.append("xor-password")
+        for name in secret_names:
             self.write_file(root / "secrets" / name, f"unit-{name}\n".encode())
         for role in ("a", "b"):
             self.write_file(root / f"state-{role}" / "attach-state.json", b"{}\n")
@@ -352,6 +354,17 @@ class FailedSmokeRecoveryTest(unittest.TestCase):
             self.assertIn("SMOKE_RECOVERY_COMPLETE", stdout)
             self.assertFalse(root.exists())
             self.assertFalse(final.exists())
+
+    def test_main_plan_accepts_non_xor_secret_set_without_writing(self) -> None:
+        with self.recovery_parent() as parent:
+            _root, _manifest, plan_argv = self.build_run_fixture(
+                parent, include_xor_password=False
+            )
+            before = self.snapshot(parent)
+            stdout, stderr = self.run_main(plan_argv)
+            self.assertEqual(stderr, "")
+            self.assertIn("SMOKE_RECOVERY_PLAN", stdout)
+            self.assertEqual(self.snapshot(parent), before)
 
     def test_main_retry_rejects_new_allowed_name_before_another_write(self) -> None:
         with self.recovery_parent() as parent:
