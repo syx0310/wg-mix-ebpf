@@ -124,6 +124,7 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         ]
         self.assertNotIn("XOR_PASSWORD", child_environment)
         self.assertIn("WG_MIX_EBPF_SMOKE_MOUNTNS_XOR_SECRET_FD", child_environment)
+        self.assertIn("ATTACHMENT_BACKEND", child_environment)
 
         reviewed = self.anchor_reviewed_tool_source
         for path in (
@@ -2032,6 +2033,23 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertIn(
             "TCP_GSO_CHECKS was split into TCP_INNER_GSO_CHECKS",
             self.source,
+        )
+
+        self.assertIn(
+            'ATTACHMENT_BACKEND="${ATTACHMENT_BACKEND:-auto}"',
+            self.source,
+        )
+        self.assertIn(
+            "ATTACHMENT_BACKEND must be auto, tcx, or classic_tc",
+            self.source,
+        )
+        config = self.source[
+            self.source.index("make_agent_config() {") :
+            self.source.index("\nmake_wg_config_stub() {")
+        ]
+        self.assertEqual(
+            config.count("attachment_backend: ${ATTACHMENT_BACKEND}"),
+            1,
         )
 
         run = self.source[
