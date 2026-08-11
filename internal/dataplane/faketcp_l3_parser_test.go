@@ -83,15 +83,15 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 	for _, want := range []string{
 		"#include \"wg_mix_faketcp_l3.h\"",
 		"rc = faketcp_parse_l3(data, data_end, skb->len, info->ip_off",
-		"parse_rc = faketcp_parse_l3(data, data_end, frame_len, l3_off, family, &l3)",
+		"parse_rc = faketcp_parse_l3(data, data_end, frame_len, l3_off, family, l3)",
 		"parser_mode == PARSER_L3",
 		"parser_mode != PARSER_ETHERNET",
 		"rc = faketcp_managed_transform_status(l3, IPPROTO_UDP)",
-		"faketcp_managed_transform_status(&l3, l3.transport_protocol)",
+		"faketcp_managed_transform_status(l3, l3->transport_protocol)",
 		"sizeof(struct iphdr) + sizeof(struct udphdr)",
-		"l3.l4_off + sizeof(udp)",
+		"l3->l4_off + sizeof(*udp)",
 		"struct iphdr new_ip;",
-		"bpf_xdp_store_bytes(xdp, l3.l3_off, &new_ip, sizeof(new_ip))",
+		"bpf_xdp_store_bytes(xdp, l3->l3_off, new_ip, sizeof(*new_ip))",
 	} {
 		if !strings.Contains(main, want) && !strings.Contains(tc, want) {
 			t.Fatalf("TC/XDP shared parser integration missing %q", want)
@@ -120,8 +120,8 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		t.Fatal("FakeTCP egress boundaries are missing")
 	}
 	egress := tc[egressStart:egressEnd]
-	tcParse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
-	tcGate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
+	tcParse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, faketcp_packet)")
+	tcGate := strings.Index(egress, "faketcp_tc_fixed_udp_status(faketcp_packet)")
 	prepare := strings.Index(egress, "if (faketcp_prepare_udp(")
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
 	if tcParse < 0 || tcGate < 0 || prepare < 0 || checkpoint < 0 ||
@@ -150,9 +150,9 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		"SEC(\"xdp\")")
 	parse := strings.Index(xdp, "parse_rc = faketcp_parse_l3")
 	lookup := strings.Index(xdp, "managed_listener = faketcp_xdp_managed_port")
-	xdpGate := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")
-	event := strings.Index(xdp, "faketcp_emit_event(&key")
-	mutation := strings.Index(xdp, "bpf_xdp_store_bytes(xdp, l3.l4_off")
+	xdpGate := strings.Index(xdp, "faketcp_managed_transform_status(l3, l3->transport_protocol)")
+	event := strings.Index(xdp, "faketcp_emit_event(&admission->key")
+	mutation := strings.Index(xdp, "bpf_xdp_store_bytes(xdp, l3->l4_off")
 	if parse < 0 || lookup < 0 || xdpGate < 0 || event < 0 || mutation < 0 ||
 		parse >= lookup || lookup >= xdpGate || xdpGate >= event || xdpGate >= mutation {
 		t.Fatal("ParseL3, managed-port lookup and the sole transform gate must precede XDP capture/mutation")

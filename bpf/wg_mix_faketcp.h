@@ -316,7 +316,10 @@ struct faketcp_egress_admission {
 	__u32 mixed_wire;
 	__u32 profile_policy_flags;
 	__u32 xor_target;
-	__u32 token_state;
+	// BPF supports compare-and-swap on naturally aligned 64-bit words. Keep the
+	// single-use proof state in that native width instead of relying on a
+	// compiler-specific 32-bit atomic lowering.
+	__u64 token_state;
 	struct faketcp_gso_projection gso;
 	struct faketcp_session_projection session_projection;
 	__u8 managed_action;
@@ -485,9 +488,9 @@ struct faketcp_metadata {
 	struct faketcp_ingress_admission admission;
 };
 
-_Static_assert(sizeof(struct faketcp_egress_admission) == 168,
+_Static_assert(sizeof(struct faketcp_egress_admission) == 176,
 	       "faketcp egress admission ABI drift");
-_Static_assert(sizeof(struct faketcp_egress_admission_slot) == 176,
+_Static_assert(sizeof(struct faketcp_egress_admission_slot) == 184,
 	       "faketcp egress admission slot ABI drift");
 _Static_assert(sizeof(struct faketcp_ingress_admission) == 136,
 	       "faketcp ingress admission ABI drift");
@@ -1516,6 +1519,55 @@ struct faketcp_tc_packet_descriptor {
 _Static_assert(sizeof(struct faketcp_tc_packet_descriptor) == 64,
 	       "FakeTCP TC packet descriptor layout drift");
 
+// Large packet proofs must not share the 512-byte BPF stack with the parser,
+// session and checksum state in the same program. Networking programs execute
+// to completion on one CPU, so this collection-local per-CPU slot safely owns
+// the one live proof for the current invocation. The TC pair coexists because
+// the packet descriptor is still needed while its admission is consumed; the
+// ingress variants are mutually exclusive program stages and share storage.
+struct faketcp_runtime_scratch {
+	union {
+		struct {
+			struct faketcp_tc_packet_descriptor packet;
+			struct faketcp_egress_admission admission;
+			struct faketcp_session_key key;
+			struct faketcp_gso_projection gso;
+			struct faketcp_session_snapshot session_snapshot;
+		} tc;
+		struct {
+			struct faketcp_ingress_admission admission;
+			struct faketcp_session_snapshot session_snapshot;
+			struct packet_info xor_info;
+			struct faketcp_l3_info l3;
+			struct iphdr new_ip;
+			struct tcphdr old_tcp;
+			struct udphdr udp;
+			__u8 tail[FAKETCP_HEADER_DELTA];
+			struct faketcp_pseudo_tail old_pseudo;
+			struct faketcp_pseudo_tail new_pseudo;
+		} ingress;
+		struct faketcp_metadata metadata;
+	};
+};
+
+_Static_assert(sizeof(struct faketcp_runtime_scratch) == 344,
+	       "FakeTCP runtime scratch layout drift");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct faketcp_runtime_scratch);
+} faketcp_runtime_scratch_map SEC(".maps");
+
+static __always_inline struct faketcp_runtime_scratch *
+faketcp_runtime_scratch(void)
+{
+	__u32 zero = 0;
+
+	return bpf_map_lookup_elem(&faketcp_runtime_scratch_map, &zero);
+}
+
 static __always_inline int
 faketcp_tc_status_from_generic(int status)
 {
@@ -1815,7 +1867,7 @@ static __always_inline int faketcp_consume_egress_admission(
 static __always_inline int faketcp_complete_egress_xor(__u64 nonce)
 {
 	struct faketcp_egress_admission *active;
-	__u32 previous;
+	__u64 previous;
 
 	active = faketcp_active_egress_admission(nonce);
 	if (!active ||
@@ -1903,8 +1955,9 @@ static __always_inline int faketcp_egress_admission_matches(
 	void *data_end = (void *)(long)skb->data_end;
 	struct iphdr *iph = data + info->ip_off;
 	struct udphdr *udp = data + info->udp_off;
-	struct faketcp_session_key key = {};
-	struct faketcp_gso_projection observed_gso = {};
+	struct faketcp_runtime_scratch *scratch;
+	struct faketcp_session_key *key;
+	struct faketcp_gso_projection *observed_gso;
 	struct cipher_value *cipher = 0;
 	__u32 xor_target = 0;
 	__u32 required_features;
@@ -1914,6 +1967,14 @@ static __always_inline int faketcp_egress_admission_matches(
 	__u32 wire_len;
 	__u8 expected_xor_checksum_mode = XOR_CSUM_NONE;
 	int is_gso = skb->gso_segs || skb->gso_size;
+
+	scratch = faketcp_runtime_scratch();
+	if (!scratch)
+		return 0;
+	key = &scratch->tc.key;
+	observed_gso = &scratch->tc.gso;
+	__builtin_memset(key, 0, sizeof(*key));
+	__builtin_memset(observed_gso, 0, sizeof(*observed_gso));
 
 	if (!l3 || faketcp_managed_transform_status(l3, IPPROTO_UDP) !=
 			   FAKETCP_L3_OK ||
@@ -1966,12 +2027,12 @@ static __always_inline int faketcp_egress_admission_matches(
 		generation,
 		admission->session_authority.runtime_incarnation))
 		return 0;
-	if (faketcp_tc_key(skb, info, l3, generation, &key) < 0 ||
-	    key.local_ipv4 != admission->key.local_ipv4 ||
-	    key.remote_ipv4 != admission->key.remote_ipv4 ||
-	    key.underlay_index != admission->key.underlay_index ||
-	    key.local_port != admission->key.local_port ||
-	    key.remote_port != admission->key.remote_port)
+	if (faketcp_tc_key(skb, info, l3, generation, key) < 0 ||
+	    key->local_ipv4 != admission->key.local_ipv4 ||
+	    key->remote_ipv4 != admission->key.remote_ipv4 ||
+	    key->underlay_index != admission->key.underlay_index ||
+	    key->local_port != admission->key.local_port ||
+	    key->remote_port != admission->key.remote_port)
 		return 0;
 	if (rule->cipher_id != 0) {
 		cipher = lookup_cipher(rule->cipher_id, generation);
@@ -1980,9 +2041,9 @@ static __always_inline int faketcp_egress_admission_matches(
 	}
 	if (is_gso) {
 		if (faketcp_gso_build_projection(skb, info, profile, cipher,
-						 &observed_gso, &xor_target) < 0 ||
+						 observed_gso, &xor_target) < 0 ||
 		    !faketcp_gso_projection_matches(&admission->gso,
-						     &observed_gso) ||
+						     observed_gso) ||
 		    current_wire != admission->standard_wire ||
 		    xor_target != admission->xor_target ||
 		    admission->xor_checksum_mode != XOR_CSUM_NONE)
@@ -2046,10 +2107,11 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 	void *data_end = (void *)(long)skb->data_end;
 	struct iphdr *iph = data + info->ip_off;
 	struct udphdr *udp = data + info->udp_off;
-	struct faketcp_session_key key = {};
-	struct faketcp_gso_projection gso = {};
+	struct faketcp_runtime_scratch *scratch;
+	struct faketcp_session_key *key;
+	struct faketcp_gso_projection *gso;
 	struct faketcp_session_value *session;
-	struct faketcp_session_snapshot session_snapshot = {};
+	struct faketcp_session_snapshot *session_snapshot;
 	struct faketcp_runtime_identity_value *identity;
 	struct faketcp_egress_admission_slot *slot;
 	struct cipher_value *cipher = 0;
@@ -2060,6 +2122,17 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 	__u16 udp_len;
 	int is_gso = skb->gso_segs || skb->gso_size;
 
+	scratch = faketcp_runtime_scratch();
+	if (!scratch) {
+		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
+		return FAKETCP_ADMISSION_DROP;
+	}
+	key = &scratch->tc.key;
+	gso = &scratch->tc.gso;
+	session_snapshot = &scratch->tc.session_snapshot;
+	__builtin_memset(key, 0, sizeof(*key));
+	__builtin_memset(gso, 0, sizeof(*gso));
+	__builtin_memset(session_snapshot, 0, sizeof(*session_snapshot));
 	__builtin_memset(admission, 0, sizeof(*admission));
 	if (parser_classification != PARSE_OK || !l3 ||
 	    l3->l3_off != info->ip_off || l3->l4_off != info->udp_off ||
@@ -2091,7 +2164,7 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 		feature_mask |= FAKETCP_ADMISSION_F_GSO;
 		if (xor_checksum_mode != XOR_CSUM_NONE ||
 		    faketcp_gso_build_projection(skb, info, profile, cipher,
-						 &gso, &xor_target) < 0) {
+						 gso, &xor_target) < 0) {
 			inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
 			return FAKETCP_ADMISSION_DROP;
 		}
@@ -2119,18 +2192,18 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
 	}
-	if (faketcp_tc_key(skb, info, l3, generation, &key) < 0) {
+	if (faketcp_tc_key(skb, info, l3, generation, key) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
 	}
-	session = bpf_map_lookup_elem(&faketcp_session_map, &key);
+	session = bpf_map_lookup_elem(&faketcp_session_map, key);
 	if (faketcp_session_snapshot_established(
-		    session, generation, &session_snapshot)) {
+		    session, generation, session_snapshot)) {
 		identity = faketcp_runtime_identity(generation);
 		slot = bpf_map_lookup_elem(&faketcp_egress_admission_map, &zero);
 		if (!identity ||
 		    !faketcp_incarnations_equal(identity->incarnation,
-					       session_snapshot.authority.runtime_incarnation) ||
+					       session_snapshot->authority.runtime_incarnation) ||
 		    !slot || slot->active.nonce != 0 ||
 		    slot->next_nonce == ~0ULL) {
 			if (slot && slot->active.nonce != 0)
@@ -2144,37 +2217,38 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 			inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 			return FAKETCP_ADMISSION_DROP;
 		}
-		*admission = (struct faketcp_egress_admission){
-			.key = key,
-			.nonce = slot->next_nonce,
-			.session_authority = session_snapshot.authority,
-			.fwmark = skb->mark,
-			.wg_id = rule->wg_id,
-			.profile_id = rule->profile_id,
-			.cipher_id = rule->cipher_id,
-			.feature_mask = feature_mask,
-			.network_off = info->ip_off,
-			.transport_off = info->udp_off,
-			.payload_off = info->payload_off,
-			.payload_len = info->payload_len,
-			.ip_total_len = old_total_len,
-			.wire_len = udp_len,
-			.skb_len = skb->len,
-			.standard_wire = standard_wire,
-			.mixed_wire = mixed_wire,
-			.profile_policy_flags = profile->policy_flags,
-			.xor_target = xor_target,
-			.token_state = FAKETCP_TOKEN_ARMED,
-			.gso = gso,
-			.session_projection = session_snapshot.projection,
-			.managed_action = managed->action_on_miss,
-			.rule_action = rule->action,
-			.transport_mode = rule->transport_mode,
-			.direction = FAKETCP_DIRECTION_EGRESS,
-			.xor_checksum_mode = rule->cipher_id && !is_gso ?
-					     xor_checksum_mode : XOR_CSUM_NONE,
-			.type_kind = type_kind,
-		};
+		// Populate the map-backed admission in place. A whole-struct compound
+		// literal makes Clang materialise a second 176-byte copy on the BPF
+		// stack even though the destination already lives in per-CPU scratch.
+		admission->key = *key;
+		admission->nonce = slot->next_nonce;
+		admission->session_authority = session_snapshot->authority;
+		admission->fwmark = skb->mark;
+		admission->wg_id = rule->wg_id;
+		admission->profile_id = rule->profile_id;
+		admission->cipher_id = rule->cipher_id;
+		admission->feature_mask = feature_mask;
+		admission->network_off = info->ip_off;
+		admission->transport_off = info->udp_off;
+		admission->payload_off = info->payload_off;
+		admission->payload_len = info->payload_len;
+		admission->ip_total_len = old_total_len;
+		admission->wire_len = udp_len;
+		admission->skb_len = skb->len;
+		admission->standard_wire = standard_wire;
+		admission->mixed_wire = mixed_wire;
+		admission->profile_policy_flags = profile->policy_flags;
+		admission->xor_target = xor_target;
+		admission->token_state = FAKETCP_TOKEN_ARMED;
+		admission->gso = *gso;
+		admission->session_projection = session_snapshot->projection;
+		admission->managed_action = managed->action_on_miss;
+		admission->rule_action = rule->action;
+		admission->transport_mode = rule->transport_mode;
+		admission->direction = FAKETCP_DIRECTION_EGRESS;
+		admission->xor_checksum_mode = rule->cipher_id && !is_gso ?
+					       xor_checksum_mode : XOR_CSUM_NONE;
+		admission->type_kind = type_kind;
 		slot->active = *admission;
 		return FAKETCP_ADMISSION_TRANSFORM;
 	}
@@ -2186,7 +2260,7 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 	}
 	if (is_gso)
 		return FAKETCP_ADMISSION_DROP;
-	if (faketcp_capture_first_packet(skb, info, l3, rule, &key) < 0)
+	if (faketcp_capture_first_packet(skb, info, l3, rule, key) < 0)
 		inc_faketcp_stat(FAKETCP_STAT_EVENT_ERROR);
 	return FAKETCP_ADMISSION_DROP;
 }
@@ -2390,9 +2464,9 @@ static long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 	}
 #pragma unroll
 	for (int byte = 0; byte < FAKETCP_GSO_XOR_CHUNK_BYTES; byte++) {
-		if (byte >= chunk_length)
-			break;
-		chunk[byte] ^= xor_key_byte(context->cipher, chunk_offset + byte);
+		if (byte < chunk_length)
+			chunk[byte] ^=
+				xor_key_byte(context->cipher, chunk_offset + byte);
 	}
 	if (bpf_skb_store_bytes(context->skb,
 				context->payload_offset + segment_offset +
@@ -2428,7 +2502,8 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 		.payload_length = info->payload_len,
 		.gso_size = skb->gso_size,
 	};
-	struct faketcp_egress_admission admission = {};
+	struct faketcp_runtime_scratch *scratch;
+	struct faketcp_egress_admission *admission;
 	struct faketcp_session_value *session;
 	struct faketcp_session_mutation_result mutation = {};
 	__u32 xor_chunks;
@@ -2447,6 +2522,10 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
 		return TC_ACT_SHOT;
 	}
+	scratch = faketcp_runtime_scratch();
+	if (!scratch)
+		return TC_ACT_SHOT;
+	admission = &scratch->tc.admission;
 	// Unified prepare is the sole checksum/GSO/PMTU/writability admission and
 	// runs exactly once before the proof is formed or any packet byte changes.
 	if (faketcp_prepare_udp(skb, info->ip_off, info->udp_off,
@@ -2455,17 +2534,17 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 	if (faketcp_egress_admission_checkpoint(
 		    skb, info, l3, managed, rule, profile, generation,
 		    parser_classification, type_kind, standard_wire, mixed_wire,
-		    XOR_CSUM_NONE, &admission) != FAKETCP_ADMISSION_TRANSFORM)
+		    XOR_CSUM_NONE, admission) != FAKETCP_ADMISSION_TRANSFORM)
 		return TC_ACT_SHOT;
-	if (faketcp_consume_egress_admission(admission.nonce, &admission) < 0 ||
+	if (faketcp_consume_egress_admission(admission->nonce, admission) < 0 ||
 	    !faketcp_egress_admission_matches(
 		    skb, info, l3, managed, rule, profile, generation,
-		    FAKETCP_TOKEN_ARMED, &admission)) {
+		    FAKETCP_TOKEN_ARMED, admission)) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
 	}
-	context.gso_size = admission.gso.gso_size;
-	context.gso_segments = admission.gso.logical_segments;
+	context.gso_size = admission->gso.gso_size;
+	context.gso_segments = admission->gso.logical_segments;
 #pragma unroll
 	for (int kind = 0; kind < 4; kind++)
 		context.mixed_type[kind] = profile->standard_to_mixed[kind];
@@ -2502,7 +2581,7 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 		}
 		inc_stat(STAT_XOR_EGRESS_OK);
 	}
-	session = bpf_map_lookup_elem(&faketcp_session_map, &admission.key);
+	session = bpf_map_lookup_elem(&faketcp_session_map, &admission->key);
 	if (!session) {
 		inc_faketcp_stat(FAKETCP_STAT_SESSION_MISS);
 		return TC_ACT_SHOT;
@@ -2516,8 +2595,8 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 	if (!faketcp_session_mutate(session, generation, now,
 				    FAKETCP_SESSION_MUTATE_TX,
 				    context.payload_length,
-				    &admission.session_authority,
-				    &admission.session_projection,
+				    &admission->session_authority,
+				    &admission->session_projection,
 				    &mutation)) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 		return TC_ACT_SHOT;
@@ -2762,37 +2841,45 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 
 static __always_inline int faketcp_continue_egress(struct __sk_buff *skb)
 {
-	struct faketcp_tc_packet_descriptor packet = {};
-	struct packet_info *info = &packet.info;
+	struct faketcp_runtime_scratch *scratch;
+	struct faketcp_tc_packet_descriptor *packet;
+	struct packet_info *info;
 	struct egress_rule_key key = {};
 	struct egress_rule_value *rule;
 	struct managed_fwmark_value *managed;
 	struct profile_key profile_key = {};
 	struct profile_value *profile;
-	struct faketcp_egress_admission admission = {};
+	struct faketcp_egress_admission *admission;
 	struct xor_context progress = {};
 	__u64 generation = 0;
 	int context_ok;
 	int consume_rc;
 
+	scratch = faketcp_runtime_scratch();
+	if (!scratch)
+		return TC_ACT_SHOT;
+	packet = &scratch->tc.packet;
+	admission = &scratch->tc.admission;
+	info = &packet->info;
+	__builtin_memset(packet, 0, sizeof(*packet));
 	context_ok = load_xor_context(skb, &progress) == 0 &&
 		     progress.continue_faketcp;
 	// Consume is deliberately first. It copies then clears the per-CPU active
 	// token before cb cleanup, projection, lookup or comparison, so an independent
 	// call and every malformed/residual cb path are single-use failures.
 	consume_rc = faketcp_consume_egress_admission(
-		progress.admission_nonce, &admission);
+		progress.admission_nonce, admission);
 	clear_xor_context(skb);
 	if (!context_ok || consume_rc < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
 	}
 	if (!active_generation(&generation) ||
-	    faketcp_tc_current_admission_coherent(skb, &admission) < 0) {
+	    faketcp_tc_current_admission_coherent(skb, admission) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
 	}
-	faketcp_tc_descriptor_from_admission(&admission, &packet);
+	faketcp_tc_descriptor_from_admission(admission, packet);
 	managed = lookup_managed_fwmark(skb->mark, skb->ifindex, generation);
 	key.generation = generation;
 	key.fwmark = skb->mark;
@@ -2813,13 +2900,13 @@ static __always_inline int faketcp_continue_egress(struct __sk_buff *skb)
 	profile = bpf_map_lookup_elem(&profile_map, &profile_key);
 	if (!profile ||
 	    !faketcp_egress_admission_matches(
-		    skb, info, &packet.shape.l3, managed, rule, profile, generation,
-		    FAKETCP_TOKEN_XOR_COMPLETE, &admission)) {
+		    skb, info, &packet->shape.l3, managed, rule, profile, generation,
+		    FAKETCP_TOKEN_XOR_COMPLETE, admission)) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
 	}
 	return faketcp_encode_established(skb, info, rule, generation,
-					  &admission);
+					  admission);
 }
 
 SEC("classifier/faketcp_egress")
@@ -2839,8 +2926,9 @@ static __always_inline int faketcp_consume_ingress_admission(
 	void *data_end = (void *)(long)skb->data_end;
 	void *meta = (void *)(long)skb->data_meta;
 	struct faketcp_metadata *metadata = meta;
-	struct faketcp_metadata consumed = {};
-	const struct faketcp_ingress_admission *admission = &consumed.admission;
+	struct faketcp_runtime_scratch *scratch;
+	struct faketcp_metadata *consumed;
+	const struct faketcp_ingress_admission *admission;
 	struct faketcp_session_value *session;
 	struct cipher_value *cipher = 0;
 	struct iphdr *iph = data + info->ip_off;
@@ -2855,13 +2943,19 @@ static __always_inline int faketcp_consume_ingress_admission(
 		inc_faketcp_stat(FAKETCP_STAT_METADATA_ERROR);
 		return -1;
 	}
+	scratch = faketcp_runtime_scratch();
+	if (!scratch)
+		return -1;
+	consumed = &scratch->metadata;
+	admission = &consumed->admission;
 	// The metadata is single-use even when malformed: copy every field needed by
 	// this consumer, then clear magic before the first policy/GSO comparison.
-	consumed = *metadata;
+	*consumed = *metadata;
 	metadata->magic = 0;
-	if (consumed.magic != FAKETCP_METADATA_MAGIC ||
-	    consumed.direction != FAKETCP_DIRECTION_INGRESS ||
-	    consumed.pad[0] != 0 || consumed.pad[1] != 0 || consumed.pad[2] != 0) {
+	if (consumed->magic != FAKETCP_METADATA_MAGIC ||
+	    consumed->direction != FAKETCP_DIRECTION_INGRESS ||
+	    consumed->pad[0] != 0 || consumed->pad[1] != 0 ||
+	    consumed->pad[2] != 0) {
 		inc_faketcp_stat(FAKETCP_STAT_METADATA_ERROR);
 		return -1;
 	}
@@ -3151,13 +3245,14 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 	struct faketcp_ingress_admission *admission,
 	struct faketcp_session_value **established_session)
 {
+	struct faketcp_runtime_scratch *scratch;
 	struct faketcp_session_value *session;
-	struct faketcp_session_snapshot session_snapshot = {};
+	struct faketcp_session_snapshot *session_snapshot;
 	struct faketcp_runtime_identity_value *identity;
 	struct profile_key profile_key = {};
 	struct profile_value *profile;
 	struct cipher_value *cipher = 0;
-	struct packet_info xor_info = {};
+	struct packet_info *xor_info;
 	__u32 feature_mask = FAKETCP_ADMISSION_XDP_FEATURES;
 	__u32 xor_target = 0;
 	__u32 input_wire = 0;
@@ -3167,6 +3262,12 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 	__u8 close_control;
 	int type_kind = -1;
 
+	scratch = faketcp_runtime_scratch();
+	if (!scratch)
+		return FAKETCP_ADMISSION_DROP;
+	session_snapshot = &scratch->ingress.session_snapshot;
+	xor_info = &scratch->ingress.xor_info;
+	__builtin_memset(xor_info, 0, sizeof(*xor_info));
 	__builtin_memset(admission, 0, sizeof(*admission));
 	*established_session = 0;
 	if (!managed_interface || !managed_listener || !policy_listener ||
@@ -3229,10 +3330,10 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 		return FAKETCP_ADMISSION_DROP;
 	}
 	if (!close_control && policy_listener->cipher_id != 0) {
-		xor_info.payload_off = admission->payload_off;
-		xor_info.payload_len = admission->payload_len;
+		xor_info->payload_off = admission->payload_off;
+		xor_info->payload_len = admission->payload_len;
 		cipher = lookup_cipher(policy_listener->cipher_id, generation);
-		if (!cipher || xor_payload_target(&xor_info, cipher, &xor_target) < 0) {
+		if (!cipher || xor_payload_target(xor_info, cipher, &xor_target) < 0) {
 			inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 			return FAKETCP_ADMISSION_DROP;
 		}
@@ -3246,7 +3347,7 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 	admission->decision.transform.xor_target = xor_target;
 	session = bpf_map_lookup_elem(&faketcp_session_map, &admission->key);
 	if (!faketcp_session_snapshot_established(
-		    session, generation, &session_snapshot)) {
+		    session, generation, session_snapshot)) {
 		if (session)
 			inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 		else
@@ -3257,17 +3358,17 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 	identity = faketcp_runtime_identity(generation);
 	if (!identity ||
 	    !faketcp_incarnations_equal(identity->incarnation,
-				       session_snapshot.authority.runtime_incarnation)) {
+				       session_snapshot->authority.runtime_incarnation)) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 		return FAKETCP_ADMISSION_DROP;
 	}
-	admission->session_authority = session_snapshot.authority;
-	admission->session_projection = session_snapshot.projection;
+	admission->session_authority = session_snapshot->authority;
+	admission->session_projection = session_snapshot->projection;
 	*established_session = session;
 	if (close_control) {
-		admission->decision.close.session_revision = session_snapshot.revision;
-		admission->decision.close.tx_sequence = session_snapshot.tx_sequence;
-		admission->decision.close.rx_sequence = session_snapshot.rx_sequence;
+		admission->decision.close.session_revision = session_snapshot->revision;
+		admission->decision.close.tx_sequence = session_snapshot->tx_sequence;
+		admission->decision.close.rx_sequence = session_snapshot->rx_sequence;
 		return FAKETCP_ADMISSION_CLOSE;
 	}
 	if (flags & FAKETCP_FLAG_SYN)
@@ -3343,18 +3444,19 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	struct iphdr *iph;
 	struct tcphdr *tcp;
 	struct udphdr *wire_ports;
-	struct faketcp_l3_info l3;
+	struct faketcp_l3_info *l3;
 	struct faketcp_managed_port_value *managed_listener = 0;
 	struct ingress_listener_value *policy_listener = 0;
-	struct faketcp_session_key key = {};
 	struct faketcp_session_value *session;
-	struct faketcp_ingress_admission admission = {};
+	struct faketcp_runtime_scratch *scratch;
+	struct faketcp_ingress_admission *admission;
 	struct faketcp_metadata *metadata;
-	struct faketcp_pseudo_tail old_pseudo, new_pseudo;
-	struct iphdr new_ip;
-	struct tcphdr old_tcp;
-	struct udphdr udp = {};
-	__u8 tail[FAKETCP_HEADER_DELTA] = {};
+	struct faketcp_pseudo_tail *old_pseudo;
+	struct faketcp_pseudo_tail *new_pseudo;
+	struct iphdr *new_ip;
+	struct tcphdr *old_tcp;
+	struct udphdr *udp;
+	__u8 *tail;
 	__u8 flags;
 	__u8 family = 0;
 	__u8 parser_mode;
@@ -3364,6 +3466,20 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	__s64 sum;
 	int managed_interface, parse_rc, parse_action, admission_decision;
 
+	scratch = faketcp_runtime_scratch();
+	if (!scratch)
+		return XDP_DROP;
+	admission = &scratch->ingress.admission;
+	l3 = &scratch->ingress.l3;
+	new_ip = &scratch->ingress.new_ip;
+	old_tcp = &scratch->ingress.old_tcp;
+	udp = &scratch->ingress.udp;
+	tail = scratch->ingress.tail;
+	old_pseudo = &scratch->ingress.old_pseudo;
+	new_pseudo = &scratch->ingress.new_pseudo;
+	__builtin_memset(l3, 0, sizeof(*l3));
+	__builtin_memset(udp, 0, sizeof(*udp));
+	__builtin_memset(tail, 0, FAKETCP_HEADER_DELTA);
 	managed_interface = faketcp_xdp_managed_interface(xdp->ingress_ifindex,
 							 generation);
 	frame_len = (__u32)((long)data_end - (long)data);
@@ -3373,11 +3489,11 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	parse_action = faketcp_xdp_l3_action(parse_rc, managed_interface);
 	if (parse_action)
 		return parse_action;
-	parse_rc = faketcp_parse_l3(data, data_end, frame_len, l3_off, family, &l3);
+	parse_rc = faketcp_parse_l3(data, data_end, frame_len, l3_off, family, l3);
 	parse_action = faketcp_xdp_l3_action(parse_rc, managed_interface);
 	if (parse_action)
 		return parse_action;
-	wire_ports = data + l3.l4_off;
+	wire_ports = data + l3->l4_off;
 	if ((void *)(wire_ports + 1) > data_end)
 		return managed_interface ?
 		       faketcp_xdp_reject(FAKETCP_STAT_BAD_PACKET) : XDP_PASS;
@@ -3388,20 +3504,20 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	// ParseL3 can classify IPv4 options, IPv6 and TCP options, but the current
 	// checksum/session ABI transforms only fixed-header IPv4. Reject once,
 	// before native-UDP handling, event capture or any packet mutation.
-	if (faketcp_managed_transform_status(&l3, l3.transport_protocol) !=
+	if (faketcp_managed_transform_status(l3, l3->transport_protocol) !=
 	    FAKETCP_L3_OK)
 		return faketcp_xdp_reject(
 			FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 	// Native UDP to a FakeTCP port is a transport-bypass attempt. Decoded
 	// packets do not re-enter XDP, so this cannot catch the valid TCP-to-UDP
 	// result produced later by this program.
-	if (l3.transport_protocol == IPPROTO_UDP)
+	if (l3->transport_protocol == IPPROTO_UDP)
 		return faketcp_xdp_reject(
 			FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 	tcp = (struct tcphdr *)wire_ports;
 	if ((void *)(tcp + 1) > data_end)
 		return faketcp_xdp_reject(FAKETCP_STAT_BAD_PACKET);
-	iph = data + l3.l3_off;
+	iph = data + l3->l3_off;
 	if ((void *)(iph + 1) > data_end)
 		return faketcp_xdp_reject(FAKETCP_STAT_BAD_PACKET);
 	policy_listener = lookup_ingress_listener(
@@ -3410,20 +3526,19 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	// The policy lookup deliberately precedes the single admission checkpoint.
 	// A managed packet can only PASS after that checkpoint and full decoding.
 	admission_decision = faketcp_xdp_admission_checkpoint(
-		xdp, data, data_end, l3.l3_off, iph, tcp, &l3, managed_listener,
-		policy_listener, managed_interface, generation, &admission,
+		xdp, data, data_end, l3->l3_off, iph, tcp, l3, managed_listener,
+		policy_listener, managed_interface, generation, admission,
 		&session);
 	if (admission_decision == FAKETCP_ADMISSION_DROP)
 		return XDP_DROP;
-	key = admission.key;
-	total_len = admission.wire_total_len;
+	total_len = admission->wire_total_len;
 	tcp_len = total_len - sizeof(*iph);
-	payload_len = admission.payload_len;
-	flags = admission.tcp_flags;
-	seq = admission.sequence;
+	payload_len = admission->payload_len;
+	flags = admission->tcp_flags;
+	seq = admission->sequence;
 	if (admission_decision == FAKETCP_ADMISSION_CONTROL) {
-		faketcp_emit_event(&key, faketcp_event_type(flags), flags, seq,
-				   admission.acknowledgement, payload_len, 0,
+		faketcp_emit_event(&admission->key, faketcp_event_type(flags), flags, seq,
+				   admission->acknowledgement, payload_len, 0,
 				   managed_listener->wg_id);
 		return XDP_DROP;
 	}
@@ -3434,7 +3549,7 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	if (admission_decision == FAKETCP_ADMISSION_CLOSE) {
 		const __u8 *raw_tcp = (const __u8 *)tcp;
 
-		if (admission.session_projection.window == 0) {
+		if (admission->session_projection.window == 0) {
 			inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 			return XDP_DROP;
 		}
@@ -3442,10 +3557,10 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 		    raw_tcp[12] != (sizeof(*tcp) / 4) << 4 ||
 		    (flags != (FAKETCP_FLAG_RST | FAKETCP_FLAG_ACK) &&
 		     flags != (FAKETCP_FLAG_FIN | FAKETCP_FLAG_ACK)) ||
-		    seq != admission.decision.close.rx_sequence ||
-		    admission.acknowledgement !=
-			admission.decision.close.tx_sequence ||
-		    bpf_ntohs(tcp->window) != admission.session_projection.window ||
+		    seq != admission->decision.close.rx_sequence ||
+		    admission->acknowledgement !=
+			admission->decision.close.tx_sequence ||
+		    bpf_ntohs(tcp->window) != admission->session_projection.window ||
 		    tcp->urg_ptr != 0) {
 			inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 			return XDP_DROP;
@@ -3455,7 +3570,7 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 			return XDP_DROP;
 		}
 		if (faketcp_capture_close_packet(
-			    xdp, l3.l3_off, total_len, &admission) < 0)
+			    xdp, l3->l3_off, total_len, admission) < 0)
 			inc_faketcp_stat(FAKETCP_STAT_EVENT_ERROR);
 		return XDP_DROP;
 	}
@@ -3465,8 +3580,8 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 		now = bpf_ktime_get_ns();
 		if (!faketcp_session_mutate(session, generation, now,
 					    FAKETCP_SESSION_MUTATE_TOUCH, 0,
-					    &admission.session_authority,
-					    &admission.session_projection, 0)) {
+					    &admission->session_authority,
+					    &admission->session_projection, 0)) {
 			inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 			return XDP_DROP;
 		}
@@ -3476,32 +3591,33 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return XDP_DROP;
 	}
-	old_tcp = *tcp;
-	if (bpf_xdp_load_bytes(xdp, l3.l3_off + total_len - FAKETCP_HEADER_DELTA,
-			       tail, sizeof(tail)) < 0) {
+	*old_tcp = *tcp;
+	if (bpf_xdp_load_bytes(xdp,
+			       l3->l3_off + total_len - FAKETCP_HEADER_DELTA,
+			       tail, FAKETCP_HEADER_DELTA) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
 		return XDP_DROP;
 	}
-	udp.source = old_tcp.source;
-	udp.dest = old_tcp.dest;
-	udp.len = bpf_htons(payload_len + sizeof(udp));
-	udp.check = 0;
-	old_pseudo = (struct faketcp_pseudo_tail){
+	udp->source = old_tcp->source;
+	udp->dest = old_tcp->dest;
+	udp->len = bpf_htons(payload_len + sizeof(*udp));
+	udp->check = 0;
+	*old_pseudo = (struct faketcp_pseudo_tail){
 		.protocol = IPPROTO_TCP,
 		.length = bpf_htons(tcp_len),
 	};
-	new_pseudo = (struct faketcp_pseudo_tail){
+	*new_pseudo = (struct faketcp_pseudo_tail){
 		.protocol = IPPROTO_UDP,
-		.length = udp.len,
+		.length = udp->len,
 	};
-	sum = (~bpf_ntohs(old_tcp.check)) & 0xffff;
-	old_tcp.check = 0;
-	sum = bpf_csum_diff((__be32 *)&old_pseudo, sizeof(old_pseudo),
-			     (__be32 *)&new_pseudo, sizeof(new_pseudo), sum);
+	sum = (~bpf_ntohs(old_tcp->check)) & 0xffff;
+	old_tcp->check = 0;
+	sum = bpf_csum_diff((__be32 *)old_pseudo, sizeof(*old_pseudo),
+			     (__be32 *)new_pseudo, sizeof(*new_pseudo), sum);
 	if (sum < 0)
 		return XDP_DROP;
-	sum = bpf_csum_diff((__be32 *)&old_tcp, sizeof(old_tcp),
-			     (__be32 *)&udp, sizeof(udp), sum);
+	sum = bpf_csum_diff((__be32 *)old_tcp, sizeof(*old_tcp),
+			     (__be32 *)udp, sizeof(*udp), sum);
 	if (sum < 0)
 		return XDP_DROP;
 	if (payload_len & 1) {
@@ -3509,9 +3625,9 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 		if (sum < 0)
 			return XDP_DROP;
 	}
-	udp.check = bpf_htons(fold_csum(sum));
-	if (udp.check == 0)
-		udp.check = bpf_htons(0xffff);
+	udp->check = bpf_htons(fold_csum(sum));
+	if (udp->check == 0)
+		udp->check = bpf_htons(0xffff);
 
 	new_total_len = total_len - FAKETCP_HEADER_DELTA;
 	if (bpf_xdp_adjust_meta(xdp, -(int)sizeof(struct faketcp_metadata)) < 0)
@@ -3526,26 +3642,26 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	metadata->pad[0] = 0;
 	metadata->pad[1] = 0;
 	metadata->pad[2] = 0;
-	metadata->admission = admission;
-	if (bpf_xdp_store_bytes(xdp, l3.l4_off, &udp, sizeof(udp)) < 0 ||
-	    bpf_xdp_store_bytes(xdp, l3.l4_off + sizeof(udp), tail,
-			       sizeof(tail)) < 0)
+	metadata->admission = *admission;
+	if (bpf_xdp_store_bytes(xdp, l3->l4_off, udp, sizeof(*udp)) < 0 ||
+	    bpf_xdp_store_bytes(xdp, l3->l4_off + sizeof(*udp), tail,
+			       FAKETCP_HEADER_DELTA) < 0)
 		return XDP_DROP;
 
 	// The integration gate accepts only a fixed 20-byte IPv4 header, so one
 	// bounded full-header checksum recomputation covers every transformed byte.
-	iph = data + l3.l3_off;
+	iph = data + l3->l3_off;
 	if ((void *)(iph + 1) > data_end)
 		return XDP_DROP;
-	new_ip = *iph;
-	new_ip.protocol = IPPROTO_UDP;
-	new_ip.tot_len = bpf_htons(new_total_len);
-	new_ip.check = 0;
-	sum = bpf_csum_diff(0, 0, (__be32 *)&new_ip, sizeof(new_ip), 0);
+	*new_ip = *iph;
+	new_ip->protocol = IPPROTO_UDP;
+	new_ip->tot_len = bpf_htons(new_total_len);
+	new_ip->check = 0;
+	sum = bpf_csum_diff(0, 0, (__be32 *)new_ip, sizeof(*new_ip), 0);
 	if (sum < 0)
 		return XDP_DROP;
-	new_ip.check = bpf_htons(fold_csum(sum));
-	if (bpf_xdp_store_bytes(xdp, l3.l3_off, &new_ip, sizeof(new_ip)) < 0 ||
+	new_ip->check = bpf_htons(fold_csum(sum));
+	if (bpf_xdp_store_bytes(xdp, l3->l3_off, new_ip, sizeof(*new_ip)) < 0 ||
 	    bpf_xdp_adjust_tail(xdp, -FAKETCP_HEADER_DELTA) < 0)
 		return XDP_DROP;
 
@@ -3553,8 +3669,8 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	now = bpf_ktime_get_ns();
 	if (!faketcp_session_mutate(session, generation, now,
 				    FAKETCP_SESSION_MUTATE_RX, next_seq,
-				    &admission.session_authority,
-				    &admission.session_projection, 0)) {
+				    &admission->session_authority,
+				    &admission->session_projection, 0)) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 		return XDP_DROP;
 	}

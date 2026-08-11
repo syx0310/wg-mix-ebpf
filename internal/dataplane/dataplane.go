@@ -33,9 +33,9 @@ type AttachStateLoader interface {
 }
 
 type LoaderOptions struct {
-	// Deprecated: v4 refuses classic pin/filter adoption because those records
-	// do not carry exact bpf_link identity. The field remains for API
-	// compatibility and causes Apply to return an explicit migration error.
+	// AdoptLegacyPins permits the classic_tc backend to adopt a complete legacy
+	// map/filter set into the persistent schema-v3 owner journal. TCX never
+	// adopts classic filters because they do not carry exact bpf_link identity.
 	AdoptLegacyPins bool
 }
 

@@ -93,10 +93,10 @@ func TestFakeTCPManagedIngressEarlyDropSourceOrderAndABI(t *testing.T) {
 		"parse_rc = faketcp_xdp_l3_start",
 		"parse_action = faketcp_xdp_l3_action",
 		"parse_rc = faketcp_parse_l3",
-		"wire_ports = data + l3.l4_off",
+		"wire_ports = data + l3->l4_off",
 		"managed_listener = faketcp_xdp_managed_port",
-		"faketcp_managed_transform_status(&l3, l3.transport_protocol)",
-		"l3.transport_protocol == IPPROTO_UDP",
+		"faketcp_managed_transform_status(l3, l3->transport_protocol)",
+		"l3->transport_protocol == IPPROTO_UDP",
 		"policy_listener = lookup_ingress_listener",
 	}
 	position := -1
@@ -110,8 +110,9 @@ func TestFakeTCPManagedIngressEarlyDropSourceOrderAndABI(t *testing.T) {
 	if strings.Count(xdp, "parse_action = faketcp_xdp_l3_action") != 2 {
 		t.Fatal("managed-ingress XDP path does not use exactly two parser action mappings")
 	}
-	if strings.Contains(xdp, "return XDP_DROP;") {
-		t.Fatal("early managed-ingress path bypasses the single accounting helpers")
+	if strings.Count(xdp, "return XDP_DROP;") != 1 ||
+		!strings.Contains(xdp, "if (!scratch)\n\t\treturn XDP_DROP;") {
+		t.Fatal("early managed-ingress path has a direct drop outside the per-CPU scratch fail-closed gate")
 	}
 	if fakeTCPImplementedCapabilities&fakeTCPCapabilityManagedIngressParser != 0 {
 		t.Fatal("managed-ingress capability opened before .82 live evidence")

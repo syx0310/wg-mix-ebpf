@@ -32,6 +32,7 @@ def load(name: str, filename: str):
 class PublicSmokeTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
+        cls.controller = load("public_controller", "controller.py")
         cls.root = load("public_root_endpoint", "root-endpoint.py")
         cls.traffic = load("public_traffic", "traffic.py")
         cls.report = load("public_report", "report.py")
@@ -135,6 +136,19 @@ class PublicSmokeTest(unittest.TestCase):
         plan = json.loads(completed.stdout)
         self.assertEqual(0, plan["credential_read"])
         self.assertEqual(0, plan["network_operations"])
+
+    def test_hosts_use_the_production_backends_for_their_kernel_generation(self) -> None:
+        self.assertEqual("tcx", self.controller.ROLES["b82"]["attachment_backend"])
+        self.assertEqual(
+            "classic_tc", self.controller.ROLES["public"]["attachment_backend"]
+        )
+        self.assertNotIn("bpftool", " ".join(self.controller.REMOTE_TOOLS))
+        for role, backend in (("b82", "tcx"), ("public", "classic_tc")):
+            _, agent = self.root.config_bytes(Path("/run/wg-mix-ebpf-test"), role)
+            self.assertIn(
+                f"  attachment_backend: {backend}\n".encode(),
+                agent,
+            )
 
     def test_sources_exclude_broad_cleanup_and_unreviewed_network_changes(self) -> None:
         sources = "\n".join(

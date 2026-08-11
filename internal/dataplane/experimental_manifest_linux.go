@@ -23,6 +23,15 @@ var experimentalFakeTCPKfuncNames = [...]string{
 	experimentalFakeTCPGSOCommitKfuncName,
 }
 
+// The unified prepare wrapper has one reviewed call site in each mutually
+// exclusive non-GSO and GSO branch. The commit kfunc is GSO-only. Keep the
+// exact compiled relocation cardinality explicit instead of relying on a
+// compiler version to merge equivalent branch-local calls.
+var experimentalFakeTCPKfuncRelocationCounts = map[string]int{
+	experimentalFakeTCPPrepareKfuncName:   2,
+	experimentalFakeTCPGSOCommitKfuncName: 1,
+}
+
 func experimentalMapDescriptors() []pinnedMapDescriptor {
 	return []pinnedMapDescriptor{
 		{name: "faketcp_session_map", mapType: ebpf.Hash, keySize: 24, valueSize: 80, maxEntries: 16384},
@@ -32,11 +41,12 @@ func experimentalMapDescriptors() []pinnedMapDescriptor {
 		{name: "faketcp_control_flow_map", mapType: ebpf.LRUHash, keySize: 32, valueSize: 16, maxEntries: 16384},
 		{name: "faketcp_events", mapType: ebpf.RingBuf, maxEntries: 1 << 20},
 		{name: "faketcp_capture_scratch", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 2408, maxEntries: 1},
+		{name: "faketcp_runtime_scratch_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 344, maxEntries: 1},
 		{name: "faketcp_rt_id", mapType: ebpf.Array, keySize: 4, valueSize: 32, maxEntries: 1},
 		{name: "faketcp_gen_gt", mapType: ebpf.Array, keySize: 4, valueSize: 16, maxEntries: 1, flags: unix.BPF_F_RDONLY},
 		{name: "faketcp_gen_wk", mapType: ebpf.RingBuf, maxEntries: 4096},
 		{name: "faketcp_cap_seq", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 1},
-		{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 176, maxEntries: 1, flags: unix.BPF_F_RDONLY},
+		{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 184, maxEntries: 1, flags: unix.BPF_F_RDONLY},
 		{name: "faketcp_egress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: 2},
 		{name: "faketcp_stats_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 19},
 		{name: "faketcp_mtu_audit_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: experimentalFakeTCPMTUAuditKeyCount},
@@ -156,10 +166,11 @@ func validateExperimentalKfuncManifest(spec *ebpf.CollectionSpec) error {
 		}
 	}
 	for _, name := range experimentalFakeTCPKfuncNames {
-		if kfuncCalls[name] != 1 {
+		expected := experimentalFakeTCPKfuncRelocationCounts[name]
+		if kfuncCalls[name] != expected {
 			return fmt.Errorf(
-				"experimental object has %d %s relocations, want exactly one",
-				kfuncCalls[name], name,
+				"experimental object has %d %s relocations, want exactly %d",
+				kfuncCalls[name], name, expected,
 			)
 		}
 	}

@@ -33,6 +33,8 @@ ROLES = {
         ),
         "interface": "ens33",
         "expected_hostname": "ubuntu-2604-test",
+        "attachment_backend": "tcx",
+        "minimum_kernel": (6, 6),
     },
     "public": {
         "host": "47.116.202.155",
@@ -41,6 +43,8 @@ ROLES = {
         ),
         "interface": "eth0",
         "expected_hostname": None,
+        "attachment_backend": "classic_tc",
+        "minimum_kernel": (5, 15),
     },
 }
 REMOTE_TOOLS = (
@@ -52,7 +56,6 @@ REMOTE_TOOLS = (
     "/usr/bin/tcpdump",
     "/usr/bin/timeout",
     "/usr/bin/uname",
-    "/usr/sbin/bpftool",
     "/usr/sbin/ip",
     "/usr/bin/wg",
 )
@@ -188,7 +191,7 @@ def probe_one(remote: Remote) -> dict[str, Any]:
         and not missing
         and bpffs
         and parsed_kernel is not None
-        and parsed_kernel >= (6, 6)
+        and parsed_kernel >= spec["minimum_kernel"]
     )
     return {
         "role": remote.role,
@@ -199,7 +202,10 @@ def probe_one(remote: Remote) -> dict[str, Any]:
         "ifindex": link[0].get("ifindex") if isinstance(link, list) and len(link) == 1 else None,
         "bpffs": bpffs,
         "tools_missing": missing,
-        "tcx_kernel_floor": parsed_kernel is not None and parsed_kernel >= (6, 6),
+        "attachment_backend": spec["attachment_backend"],
+        "minimum_kernel": ".".join(str(value) for value in spec["minimum_kernel"]),
+        "kernel_floor_ok": parsed_kernel is not None
+        and parsed_kernel >= spec["minimum_kernel"],
         "host_identity_ok": host_ok,
         "eligible": eligible,
     }

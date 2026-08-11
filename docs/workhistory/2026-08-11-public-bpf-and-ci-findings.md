@@ -14,11 +14,10 @@ host.
   conservative TCX floor.
 
 The public two-host BPF run therefore stopped with zero remote writes. The
-current product has no reviewed classic-TC fallback; loading a different
-backend would not test the current production path. The next public run
-requires upgrading the public endpoint to a TCX-capable kernel and making the
-fixed tools available, followed by a fresh read-only probe and a new frozen
-execution packet.
+follow-up development adds a production `classic_tc` backend for the 5.15
+endpoint while retaining exact TCX on newer kernels. A new run still requires a
+fresh read-only probe and a newly frozen execution packet; the earlier stopped
+run is not reused as evidence.
 
 ## B82 performance readiness
 
@@ -53,5 +52,70 @@ error. The helper was introduced by commit
 The failure is a compile-time feature-guard mismatch, not a BPF verifier or
 real-host failure. All later unit, static, race, architecture-build, offline
 validation, and packaging steps were skipped, so that run provides no evidence
-about them. Per instruction, this task did not edit the helper, rerun/cancel the
-workflow, or otherwise fix CI.
+about them. The baseline-only build now appends the explicitly approved
+`-Wno-unused-function`; the experimental object retains the full
+`-Wall -Werror` policy. The helper and runtime feature guards were not changed.
+
+Reproducing the next build step with the workflow's Ubuntu 24.04 and Clang 18
+also exposed stale FakeTCP GSO ABI constants: Clang reports the egress
+admission and its map slot as 176 and 184 bytes, while the merge that added the
+24-byte GSO projection had retained 168/176 assertions. The compile-time
+assertions, experimental manifest, and source contract now agree on 176/184;
+the pinned baseline ABI is unaffected because this map exists only in the
+separately built experimental object.
+
+The same compiler then exposed three verifier-facing implementation issues
+that the earlier toolchain did not reject:
+
+* FakeTCP admission used a 32-bit atomic compare-and-swap operand. The state is
+  now a 64-bit value, matching the native BPF atomic width accepted by Clang
+  18 and preserving the single-use transition semantics.
+* several egress, GSO, continuation, XDP, and ingress proof objects could exist
+  simultaneously on the BPF stack. They now live in a dedicated per-CPU
+  runtime scratch map. Its experimental ABI value is 344 bytes and is locked
+  by the source and object-manifest tests. Large objects are addressed through
+  scratch pointers; the egress admission is populated field by field so Clang
+  cannot synthesize another stack-sized compound temporary.
+* the variable-bound GSO XOR loop could not be fully unrolled. It is now a
+  verifier-friendly fixed-bound loop with an explicit active-range guard.
+
+Clang emits two mutually exclusive static call-site relocations for the
+FakeTCP prepare kfunc (GSO and non-GSO) and one relocation for the commit
+kfunc. The experimental manifest therefore requires exact counts 2 and 1;
+this is a static object property, not a claim that both prepare branches run
+for one packet.
+
+After these changes, the exact workflow-equivalent Ubuntu 24.04, Clang 18 and
+Go 1.25 invocation of `make test-bpf-object-manifests` passes for both the
+baseline and experimental objects. The baseline retains its pinned map and
+program ABI; the new scratch map and changed FakeTCP structures are confined
+to the explicitly experimental object.
+
+## Classic TC compatibility implementation
+
+The production loader now supports two durable attachment backends:
+
+* `tcx`, using the existing exact-link schema-v4 ownership record;
+* `classic_tc`, using fixed clsact ingress/egress filter slots and the existing
+  schema-v3 ownership wire format.
+
+`runtime.attachment_backend` accepts `auto`, `tcx`, or `classic_tc`. Auto mode
+is sticky to an existing durable owner, probes TCX before any owner mutation
+when targets exist, and falls back only for classified unsupported-kernel
+errors. Permission, malformed-state, and other ambiguous failures remain
+fail-closed. A fresh idle configuration remains a true no-op, while explicit
+legacy adoption selects the classic backend and retains its existing integrity
+checks.
+
+Classic TC uses the same staged owner journal, crash recovery, reboot rekey,
+status, and detach lifecycle as TCX, but records exact classic filter program
+IDs instead of TCX link IDs. Schema-v3 serialization is canonicalized to the
+historical field set and ordering, including required empty filter arrays, so
+old active and archived owner digests remain readable. Schema-aware comparison
+is also used by cleanup CAS checks.
+
+The Linux fake runtime now covers applying and detaching recovery phases,
+top-level backend-specific detach dispatch, prior-boot classic rekey, and the
+production-constructor fresh-idle auto path. These tests do not substitute for
+the planned real 5.15 verifier/load test, which remains gated on a committed,
+reviewed script and exact host execution packet.

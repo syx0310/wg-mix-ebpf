@@ -30,6 +30,13 @@ func recoverExactPinOwnerTransaction(
 	if handle == nil || store == nil || record == nil {
 		return nil, errors.New("exact owner recovery requires a handle, store, and record")
 	}
+	if record.Version != pinOwnerRecordVersion {
+		return nil, fmt.Errorf(
+			"exact TCX owner recovery requires schema %d, got %d",
+			pinOwnerRecordVersion,
+			record.Version,
+		)
+	}
 	if err := validatePinOwnerRecord(record, handle.resource, handle.mountID); err != nil {
 		return nil, err
 	}

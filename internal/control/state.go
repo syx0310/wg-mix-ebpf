@@ -28,16 +28,17 @@ type BuildOptions struct {
 type WGConfigLoader func(path string) (*wgconfig.Interface, error)
 
 type State struct {
-	Generation       uint64              `json:"generation"`
-	Profiles         []ProfileState      `json:"profiles"`
-	Ciphers          []CipherState       `json:"ciphers,omitempty"`
-	WireGuards       []WireGuardState    `json:"wireguards"`
-	Underlays        []UnderlayState     `json:"underlays"`
-	ManagedFwmarks   []ManagedFwmarkRule `json:"managed_fwmarks"`
-	EgressRules      []EgressRule        `json:"egress_rules"`
-	IngressListeners []IngressListener   `json:"ingress_listeners"`
-	ICMPListeners    []ICMPListener      `json:"icmp_listeners,omitempty"`
-	Warnings         []string            `json:"warnings,omitempty"`
+	Generation        uint64              `json:"generation"`
+	AttachmentBackend string              `json:"attachment_backend"`
+	Profiles          []ProfileState      `json:"profiles"`
+	Ciphers           []CipherState       `json:"ciphers,omitempty"`
+	WireGuards        []WireGuardState    `json:"wireguards"`
+	Underlays         []UnderlayState     `json:"underlays"`
+	ManagedFwmarks    []ManagedFwmarkRule `json:"managed_fwmarks"`
+	EgressRules       []EgressRule        `json:"egress_rules"`
+	IngressListeners  []IngressListener   `json:"ingress_listeners"`
+	ICMPListeners     []ICMPListener      `json:"icmp_listeners,omitempty"`
+	Warnings          []string            `json:"warnings,omitempty"`
 }
 
 type ProfileState struct {
@@ -190,7 +191,10 @@ func BuildState(ctx context.Context, cfg *config.Config, rt runtime.Provider, re
 		return nil, err
 	}
 
-	state := &State{Generation: 1}
+	state := &State{
+		Generation:        1,
+		AttachmentBackend: cfg.Runtime.AttachmentBackend,
+	}
 	profileIDs := assignProfileIDs(compiledProfiles)
 	for _, name := range sortedProfileNames(compiledProfiles) {
 		compiled := compiledProfiles[name]

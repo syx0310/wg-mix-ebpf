@@ -47,10 +47,6 @@ const (
 	pinOwnerProgramStageNext    = "desired"
 )
 
-var errLegacyClassicOwnerRequiresMigration = errors.New(
-	"pin owner schema v3 uses non-exact classic TC filters; detach it with a trusted legacy build before upgrading",
-)
-
 var bootIDPattern = regexp.MustCompile(
 	`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`,
 )
@@ -95,6 +91,37 @@ type pinOwnerRecord struct {
 	DesiredFilters         []tcFilterBinding      `json:"desired_filters,omitempty"`
 	ActiveLinks            []exactTCXBinding      `json:"active_links"`
 	DesiredLinks           []exactTCXBinding      `json:"desired_links"`
+	ProgramStages          []pinOwnerProgramStage `json:"program_stages"`
+	MapStages              []pinOwnerMapStage     `json:"map_stages"`
+	RetiredFromResourceKey string                 `json:"retired_from_resource_key"`
+	RetiredFromBootID      string                 `json:"retired_from_boot_id"`
+}
+
+// pinOwnerRecordV3Wire is the durable schema written by the classic TC
+// implementation before exact TCX links were introduced. Keep this as an
+// explicit wire type: archived owner digests and older binaries both depend on
+// the exact field set, field order, and empty-array representation.
+type pinOwnerRecordV3Wire struct {
+	Version                int                    `json:"version"`
+	Sequence               uint64                 `json:"sequence"`
+	ResourceKey            string                 `json:"resource_key"`
+	ParentDevice           uint64                 `json:"parent_device"`
+	ParentInode            uint64                 `json:"parent_inode"`
+	PinBaseName            string                 `json:"pin_basename"`
+	PinPath                string                 `json:"pin_path"`
+	BPFFSRootPath          string                 `json:"bpffs_root_path"`
+	BPFFSMountIDs          []uint64               `json:"bpffs_mount_ids"`
+	BootID                 string                 `json:"boot_id"`
+	Token                  string                 `json:"token"`
+	CreatedAt              string                 `json:"created_at"`
+	UpdatedAt              string                 `json:"updated_at"`
+	Phase                  string                 `json:"phase"`
+	Step                   string                 `json:"step"`
+	ActiveGeneration       uint64                 `json:"active_generation"`
+	NextGeneration         uint64                 `json:"next_generation"`
+	Maps                   []pinOwnerMapIdentity  `json:"maps"`
+	ActiveFilters          []tcFilterBinding      `json:"active_filters"`
+	DesiredFilters         []tcFilterBinding      `json:"desired_filters"`
 	ProgramStages          []pinOwnerProgramStage `json:"program_stages"`
 	MapStages              []pinOwnerMapStage     `json:"map_stages"`
 	RetiredFromResourceKey string                 `json:"retired_from_resource_key"`
@@ -222,6 +249,9 @@ func validateOwnerDirectoryEntries(
 	handle *pinPathHandle,
 	record *pinOwnerRecord,
 ) error {
+	if record != nil && record.Version == pinOwnerLegacyClassicVersion {
+		return validateClassicOwnerDirectoryEntries(handle, record)
+	}
 	if handle == nil || record == nil {
 		return errors.New("owner directory validation requires a handle and record")
 	}
@@ -677,12 +707,17 @@ func completeApplyingPinOwnerRecord(
 	)
 	next.ActiveGeneration = current.NextGeneration
 	next.NextGeneration = 0
-	next.ActiveFilters = []tcFilterBinding{}
-	next.ActiveLinks = slices.Clone(current.DesiredLinks)
-	for index := range next.ActiveLinks {
-		next.ActiveLinks[index].ReplacesLinkID = 0
-		next.ActiveLinks[index].PinPending = false
-		next.ActiveLinks[index].Retiring = false
+	if current.Version == pinOwnerLegacyClassicVersion {
+		next.ActiveFilters = slices.Clone(current.DesiredFilters)
+		next.ActiveLinks = []exactTCXBinding{}
+	} else {
+		next.ActiveFilters = []tcFilterBinding{}
+		next.ActiveLinks = slices.Clone(current.DesiredLinks)
+		for index := range next.ActiveLinks {
+			next.ActiveLinks[index].ReplacesLinkID = 0
+			next.ActiveLinks[index].PinPending = false
+			next.ActiveLinks[index].Retiring = false
+		}
 	}
 	next.DesiredFilters = []tcFilterBinding{}
 	next.DesiredLinks = []exactTCXBinding{}
@@ -745,7 +780,16 @@ func newDetachingPinOwnerRecord(
 	)
 	next.DesiredFilters = []tcFilterBinding{}
 	next.DesiredLinks = []exactTCXBinding{}
-	next.ProgramStages = []pinOwnerProgramStage{}
+	if current.Version == pinOwnerLegacyClassicVersion {
+		next.ProgramStages = buildClassicOwnerProgramStages(
+			next.ResourceKey,
+			token,
+			next.ActiveFilters,
+			nil,
+		)
+	} else {
+		next.ProgramStages = []pinOwnerProgramStage{}
+	}
 	next.MapStages = buildOwnerMapStages(next.ResourceKey, token, next.Maps)
 	normalizePinOwnerRecord(next)
 	if err := validatePinOwnerRecord(next, pinResourceIdentity{
@@ -859,6 +903,8 @@ func normalizePinOwnerRecord(record *pinOwnerRecord) {
 	sort.Slice(record.Maps, func(i, j int) bool {
 		return record.Maps[i].Name < record.Maps[j].Name
 	})
+	sortTCFilterBindings(record.ActiveFilters)
+	sortTCFilterBindings(record.DesiredFilters)
 	sortExactTCXBindings(record.ActiveLinks)
 	sortExactTCXBindings(record.DesiredLinks)
 	sort.Slice(record.ProgramStages, func(i, j int) bool {
@@ -945,7 +991,7 @@ func validatePinOwnerRecord(
 		return errors.New("pin owner record is nil")
 	}
 	if record.Version == pinOwnerLegacyClassicVersion {
-		return errLegacyClassicOwnerRequiresMigration
+		return validateClassicPinOwnerRecord(record, resource, currentMountID)
 	}
 	if record.Version != pinOwnerRecordVersion {
 		return fmt.Errorf("pin owner record version = %d, want %d", record.Version, pinOwnerRecordVersion)
@@ -2024,7 +2070,42 @@ func readPinOwnerRecord(file *os.File) (*pinOwnerRecord, error) {
 }
 
 func marshalPinOwnerRecord(record *pinOwnerRecord) ([]byte, error) {
-	data, err := json.Marshal(record)
+	if record == nil {
+		return nil, errors.New("pin owner record is nil")
+	}
+	var wire any = record
+	if record.Version == pinOwnerLegacyClassicVersion {
+		if len(record.ActiveLinks) != 0 || len(record.DesiredLinks) != 0 {
+			return nil, errors.New("classic pin owner record must not contain TCX links")
+		}
+		wire = pinOwnerRecordV3Wire{
+			Version:                record.Version,
+			Sequence:               record.Sequence,
+			ResourceKey:            record.ResourceKey,
+			ParentDevice:           record.ParentDevice,
+			ParentInode:            record.ParentInode,
+			PinBaseName:            record.PinBaseName,
+			PinPath:                record.PinPath,
+			BPFFSRootPath:          record.BPFFSRootPath,
+			BPFFSMountIDs:          record.BPFFSMountIDs,
+			BootID:                 record.BootID,
+			Token:                  record.Token,
+			CreatedAt:              record.CreatedAt,
+			UpdatedAt:              record.UpdatedAt,
+			Phase:                  record.Phase,
+			Step:                   record.Step,
+			ActiveGeneration:       record.ActiveGeneration,
+			NextGeneration:         record.NextGeneration,
+			Maps:                   record.Maps,
+			ActiveFilters:          record.ActiveFilters,
+			DesiredFilters:         record.DesiredFilters,
+			ProgramStages:          record.ProgramStages,
+			MapStages:              record.MapStages,
+			RetiredFromResourceKey: record.RetiredFromResourceKey,
+			RetiredFromBootID:      record.RetiredFromBootID,
+		}
+	}
+	data, err := json.Marshal(wire)
 	if err != nil {
 		return nil, err
 	}
@@ -2311,8 +2392,12 @@ func sameExpectedOwnerRecord(left, right *pinOwnerRecord) bool {
 	if left == nil || right == nil {
 		return left == right
 	}
-	leftData, leftErr := json.Marshal(left)
-	rightData, rightErr := json.Marshal(right)
+	leftCanonical := clonePinOwnerRecord(left)
+	rightCanonical := clonePinOwnerRecord(right)
+	normalizePinOwnerRecord(leftCanonical)
+	normalizePinOwnerRecord(rightCanonical)
+	leftData, leftErr := marshalPinOwnerRecord(leftCanonical)
+	rightData, rightErr := marshalPinOwnerRecord(rightCanonical)
 	return leftErr == nil && rightErr == nil && bytes.Equal(leftData, rightData)
 }
 

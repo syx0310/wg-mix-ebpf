@@ -33,11 +33,11 @@ The public test may create only:
 * bounded traffic/capture processes whose PIDs and `/proc` identities are
   recorded in the run directory.
 
-It does not install packages, edit firewall/routing policy, change MTU or
-offloads, delete/recreate qdiscs, touch `idxhy_v4`, or adopt foreign TC/BPF
-objects. The current loader requires exact TCX ownership. A host without TCX
-support stops during the read-only `probe` phase; there is no classic-TC
-fallback.
+It does not edit firewall/routing policy, change MTU or offloads, touch
+`idxhy_v4`, or adopt foreign TC/BPF objects. The production loader uses exact
+TCX ownership on B82 and the journaled classic-TC backend on the 5.15 public
+host. Both backends share the same map owner, recovery, status, and detach
+lifecycle; backend switching with an existing owner is rejected until detach.
 
 The B82 performance test may create only the resources already declared by the
 reviewed private-mountns smoke harness. It does not touch `ens33` or any
@@ -89,7 +89,7 @@ Before any host mutation:
    exact write set;
 4. obtain an independent review of the frozen scripts;
 5. run read-only host probes and bind their hostname/kernel/interface/bpffs/
-   TCX results into the execution packet;
+   selected attachment-backend results into the execution packet;
 6. re-hash every remote artifact immediately before execution.
 
 If a probe, identity check, traffic gate, or restore check fails, stop. Do not

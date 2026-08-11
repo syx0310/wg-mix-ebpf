@@ -193,7 +193,7 @@ func TestFakeTCPBothEgressBranchesShareEncoderAndIngressMetadataGate(t *testing.
 		"return faketcp_encode_established(skb, info, rule, generation,",
 		"listener->transport_mode == TRANSPORT_FAKETCP",
 		"faketcp_consume_ingress_admission(skb, &info, listener,",
-		"faketcp_capture_first_packet(skb, info, l3, rule, &key)",
+		"faketcp_capture_first_packet(skb, info, l3, rule, key)",
 		"record_len = sizeof(record->event) + packet_len",
 		"faketcp_materialize_tcp_checksum",
 		"faketcp_prepare_udp(skb, info->ip_off, info->udp_off",
@@ -254,13 +254,13 @@ func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T
 
 	preflight := text[preflightStart : strings.Index(text[preflightStart:], "struct faketcp_gso_loop_context")+preflightStart]
 	gsoProjection := strings.Index(preflight, "faketcp_gso_build_projection(skb, info, profile, cipher")
-	flowLookup := strings.Index(preflight, "faketcp_tc_key(skb, info, l3, generation, &key)")
+	flowLookup := strings.Index(preflight, "faketcp_tc_key(skb, info, l3, generation, key)")
 	if gsoProjection < 0 || flowLookup < 0 || gsoProjection >= flowLookup {
 		t.Fatal("aggregate geometry and every segment contract must be proven before flow/session admission")
 	}
 	for _, want := range []string{
 		"feature_mask |= FAKETCP_ADMISSION_F_GSO",
-		".gso = gso",
+		"admission->gso = *gso",
 		"if (is_gso)",
 		"FAKETCP_STAT_GSO_REJECT",
 	} {
@@ -273,8 +273,8 @@ func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T
 		t.Fatal("egress entry point is missing")
 	}
 	egress := tc[egressStart:]
-	parse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
-	l3Gate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
+	parse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, faketcp_packet)")
+	l3Gate := strings.Index(egress, "faketcp_tc_fixed_udp_status(faketcp_packet)")
 	gsoDispatch := strings.Index(egress, "return faketcp_encode_gso_segments(")
 	nonGSOPrepare := strings.Index(egress, "if (faketcp_prepare_udp(")
 	nonGSOCheckpoint := strings.Index(egress, "if (faketcp_egress_admission_checkpoint(")
@@ -537,7 +537,7 @@ func TestFakeTCPXDPUsesSharedL3ParserBeforeManagedPortPolicy(t *testing.T) {
 		"parser_mode != PARSER_ETHERNET",
 		"parse_rc = faketcp_parse_l3",
 		"parse_rc == FAKETCP_L3_SAFE_BYPASS",
-		"faketcp_managed_transform_status(&l3, l3.transport_protocol)",
+		"faketcp_managed_transform_status(l3, l3->transport_protocol)",
 		"before native-UDP handling, event capture or any packet mutation",
 	} {
 		if !strings.Contains(text, want) {
@@ -549,7 +549,7 @@ func TestFakeTCPXDPUsesSharedL3ParserBeforeManagedPortPolicy(t *testing.T) {
 		"SEC(\"xdp\")")
 	parse := strings.Index(xdp, "parse_rc = faketcp_parse_l3")
 	lookup := strings.Index(xdp, "managed_listener = faketcp_xdp_managed_port")
-	unsupported := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")
+	unsupported := strings.Index(xdp, "faketcp_managed_transform_status(l3, l3->transport_protocol)")
 	if parse < 0 || lookup < 0 || unsupported < 0 || parse >= lookup || lookup >= unsupported {
 		t.Fatal("shared L3 validation must precede managed-port lookup and the single transform gate")
 	}
@@ -1151,12 +1151,12 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 		"SEC(\"xdp\")")
 	snapshot := strings.Index(checkpoint, "faketcp_session_snapshot_established(")
 	closeDecision := strings.Index(checkpoint, "return FAKETCP_ADMISSION_CLOSE")
-	fixedIPv4Gate := strings.Index(xdp, "faketcp_managed_transform_status(&l3, l3.transport_protocol)")
+	fixedIPv4Gate := strings.Index(xdp, "faketcp_managed_transform_status(l3, l3->transport_protocol)")
 	checkpointCall := strings.Index(xdp, "admission_decision = faketcp_xdp_admission_checkpoint(")
 	closePath := strings.Index(xdp, "if (admission_decision == FAKETCP_ADMISSION_CLOSE)")
 	canonical := strings.Index(xdp, "flags != (FAKETCP_FLAG_RST | FAKETCP_FLAG_ACK)")
-	sequence := strings.Index(xdp, "seq != admission.decision.close.rx_sequence")
-	window := strings.Index(xdp, "bpf_ntohs(tcp->window) != admission.session_projection.window")
+	sequence := strings.Index(xdp, "seq != admission->decision.close.rx_sequence")
+	window := strings.Index(xdp, "bpf_ntohs(tcp->window) != admission->session_projection.window")
 	checksum := strings.Index(xdp, "faketcp_close_checksums_valid(iph, tcp)")
 	capture := strings.Index(xdp, "faketcp_capture_close_packet(")
 	if snapshot < 0 || closeDecision < 0 || fixedIPv4Gate < 0 || checkpointCall < 0 ||
@@ -1170,9 +1170,9 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 		"close_control = flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)",
 		"if (!close_control && policy_listener->cipher_id != 0)",
 		"return close_control ? FAKETCP_ADMISSION_DROP :",
-		"admission->decision.close.session_revision = session_snapshot.revision",
-		"admission->decision.close.tx_sequence = session_snapshot.tx_sequence",
-		"admission->decision.close.rx_sequence = session_snapshot.rx_sequence",
+		"admission->decision.close.session_revision = session_snapshot->revision",
+		"admission->decision.close.tx_sequence = session_snapshot->tx_sequence",
+		"admission->decision.close.rx_sequence = session_snapshot->rx_sequence",
 	} {
 		if !strings.Contains(checkpoint, want) {
 			t.Fatalf("single CLOSE checkpoint is missing %q", want)

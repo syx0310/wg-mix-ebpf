@@ -22,10 +22,10 @@ func TestFakeTCPEgressUsesOneAuthoritativePacketDescriptor(t *testing.T) {
 		"int wg_mix_egress(struct __sk_buff *skb)",
 		"SEC(\"classifier/ingress\")")
 	parse := strings.Index(egress,
-		"faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
+		"faketcp_parse_tc_egress_packet(skb, generation, faketcp_packet)")
 	lookup := strings.Index(egress, "rule = bpf_map_lookup_elem(&egress_rule_map, &key)")
 	fakeTCPRule := strings.Index(egress, "if (rule->transport_mode == TRANSPORT_FAKETCP)")
-	fixedGate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
+	fixedGate := strings.Index(egress, "faketcp_tc_fixed_udp_status(faketcp_packet)")
 	prepare := strings.Index(egress, "faketcp_prepare_udp(")
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
 	if parse < 0 || lookup < 0 || fakeTCPRule < 0 || fixedGate < 0 || prepare < 0 || checkpoint < 0 ||
@@ -36,10 +36,12 @@ func TestFakeTCPEgressUsesOneAuthoritativePacketDescriptor(t *testing.T) {
 		t.Fatalf("authoritative egress descriptor parses=%d, want 1", got)
 	}
 	for _, want := range []string{
-		"struct faketcp_tc_packet_descriptor faketcp_packet = {}",
-		"struct packet_info *info = &faketcp_packet.info",
-		"faketcp_encode_gso_segments(\n\t\t\t\tskb, info, &faketcp_packet.shape.l3",
-		"skb, info, &faketcp_packet.shape.l3, managed, rule, profile",
+		"struct faketcp_tc_packet_descriptor *faketcp_packet",
+		"faketcp_packet = &faketcp_scratch->tc.packet",
+		"struct packet_info *info",
+		"info = &faketcp_packet->info",
+		"faketcp_encode_gso_segments(\n\t\t\t\tskb, info, &faketcp_packet->shape.l3",
+		"skb, info, &faketcp_packet->shape.l3, managed, rule, profile",
 	} {
 		if !strings.Contains(egress, want) {
 			t.Fatalf("egress descriptor projection missing %q", want)

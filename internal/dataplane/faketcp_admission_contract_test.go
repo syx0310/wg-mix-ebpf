@@ -26,8 +26,8 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 	if got := strings.Count(egress, "faketcp_egress_admission_checkpoint("); got != 1 {
 		t.Fatalf("TC non-GSO checkpoint calls=%d, want exactly one", got)
 	}
-	egressParse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
-	l3Gate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
+	egressParse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, faketcp_packet)")
+	l3Gate := strings.Index(egress, "faketcp_tc_fixed_udp_status(faketcp_packet)")
 	prepare := strings.Index(egress, "if (faketcp_prepare_udp(")
 	checkpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
 	typeWord := strings.Index(egress, "update_type_word(skb, info, old_wire, new_wire, 1)")
@@ -155,7 +155,7 @@ func TestFakeTCPSingleUsePacketAdmissionProofBindsStableLifetimeAndCapabilitySta
 		"remote_isn",
 		"profile_policy_flags",
 		"metadata->direction = FAKETCP_DIRECTION_INGRESS",
-		"metadata->admission = admission",
+		"metadata->admission = *admission",
 		"consumed = *metadata",
 		"metadata->magic = 0",
 		"faketcp_runtime_incarnation_matches(",
@@ -192,7 +192,7 @@ func TestFakeTCPSingleUsePacketAdmissionProofBindsStableLifetimeAndCapabilitySta
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(manifest), `{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 176, maxEntries: 1, flags: unix.BPF_F_RDONLY}`) {
+	if !strings.Contains(string(manifest), `{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 184, maxEntries: 1, flags: unix.BPF_F_RDONLY}`) {
 		t.Fatal("fresh admission map manifest does not lock PinNone-compatible type, size and syscall-side read-only flag")
 	}
 
@@ -216,6 +216,51 @@ func TestFakeTCPSingleUsePacketAdmissionProofBindsStableLifetimeAndCapabilitySta
 		!strings.Contains(text, "close decision") ||
 		!strings.Contains(text, "never become ordinary admission equality") {
 		t.Fatal("locked close snapshot and transform lifetime authority are no longer explicitly separated")
+	}
+}
+
+func TestFakeTCPRuntimeScratchKeepsLargeProofsOffTheBPFStack(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	for _, want := range []string{
+		"struct faketcp_runtime_scratch",
+		"faketcp_runtime_scratch_map SEC(\".maps\")",
+		"_Static_assert(sizeof(struct faketcp_runtime_scratch) == 344",
+		"key = &scratch->tc.key",
+		"gso = &scratch->tc.gso",
+		"session_snapshot = &scratch->tc.session_snapshot",
+		"admission = &scratch->ingress.admission",
+		"l3 = &scratch->ingress.l3",
+		"consumed = &scratch->metadata",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("runtime scratch contract missing %q", want)
+		}
+	}
+	checkpoint := sourceSection(t, text,
+		"static __always_inline int faketcp_egress_admission_checkpoint(",
+		"struct faketcp_gso_loop_context {")
+	for _, forbidden := range []string{
+		"struct faketcp_session_key key = {}",
+		"struct faketcp_gso_projection gso = {}",
+		"struct faketcp_session_snapshot session_snapshot = {}",
+		"*admission = (struct faketcp_egress_admission)",
+	} {
+		if strings.Contains(checkpoint, forbidden) {
+			t.Fatalf("egress checkpoint rematerialized a large stack object through %q", forbidden)
+		}
+	}
+	manifest, err := os.ReadFile("experimental_manifest_linux.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(manifest),
+		`{name: "faketcp_runtime_scratch_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 344, maxEntries: 1}`,
+	) {
+		t.Fatal("experimental manifest does not bind the exact runtime scratch map ABI")
 	}
 }
 

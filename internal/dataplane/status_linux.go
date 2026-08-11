@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"slices"
 
 	"github.com/cilium/ebpf"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
@@ -25,13 +24,9 @@ func inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
 		return nil, errors.New("inspect control state is nil")
 	}
 	status := &KernelStatus{PinPath: pinPathFromEnv("")}
-	activeLinks, mapErr := inspectPinnedMaps(ctx, status)
+	owner, mapErr := inspectPinnedMaps(ctx, status)
 	if mapErr != nil {
 		status.MapError = mapErr.Error()
-	}
-	linksBySlot := make(map[string]exactTCXBinding, len(activeLinks))
-	for _, binding := range activeLinks {
-		linksBySlot[exactTCXOwnerKey(binding)] = binding
 	}
 	for _, u := range state.Underlays {
 		if !u.Resolved || u.IfIndex == 0 || u.Role == "disabled" {
@@ -42,23 +37,11 @@ func inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
 			IfIndex: u.IfIndex,
 			IfName:  u.IfName,
 		}
-		for _, direction := range []exactTCXDirection{exactTCXIngress, exactTCXEgress} {
-			key := exactTCXOwnerKey(exactTCXBinding{IfIndex: u.IfIndex, Direction: direction})
-			binding, exists := linksBySlot[key]
-			if !exists {
-				continue
-			}
-			entry.Filters = append(entry.Filters, FilterStatus{
-				Direction:  string(direction),
-				Name:       binding.PinName,
-				Backend:    binding.Backend,
-				AttachType: binding.AttachType,
-				LinkID:     binding.LinkID,
-				ProgramID:  binding.ProgramID,
-			})
-			if direction == exactTCXIngress {
+		entry.Filters = attachmentStatusesForIfindex(owner, u.IfIndex)
+		for _, filter := range entry.Filters {
+			if filter.Direction == string(exactTCXIngress) {
 				entry.IngressAttached = true
-			} else {
+			} else if filter.Direction == string(exactTCXEgress) {
 				entry.EgressAttached = true
 			}
 		}
@@ -67,7 +50,57 @@ func inspect(ctx context.Context, state *control.State) (*KernelStatus, error) {
 	return status, nil
 }
 
-func inspectPinnedMaps(ctx context.Context, status *KernelStatus) ([]exactTCXBinding, error) {
+func attachmentStatusesForIfindex(
+	record *pinOwnerRecord,
+	ifindex int,
+) []FilterStatus {
+	if record == nil || ifindex <= 0 {
+		return nil
+	}
+	linksByDirection := make(map[exactTCXDirection]exactTCXBinding)
+	for _, binding := range record.ActiveLinks {
+		if binding.IfIndex == ifindex {
+			linksByDirection[binding.Direction] = binding
+		}
+	}
+	filtersByDirection := make(map[string]tcFilterBinding)
+	for _, binding := range record.ActiveFilters {
+		if binding.IfIndex == ifindex {
+			filtersByDirection[binding.Direction] = binding
+		}
+	}
+	var statuses []FilterStatus
+	for _, direction := range []exactTCXDirection{exactTCXIngress, exactTCXEgress} {
+		if binding, exists := linksByDirection[direction]; exists {
+			statuses = append(statuses, FilterStatus{
+				Direction:  string(direction),
+				Name:       binding.PinName,
+				Backend:    binding.Backend,
+				AttachType: binding.AttachType,
+				LinkID:     binding.LinkID,
+				ProgramID:  binding.ProgramID,
+			})
+			continue
+		}
+		if binding, exists := filtersByDirection[string(direction)]; exists {
+			name := ingressFilterName
+			if direction == exactTCXEgress {
+				name = egressFilterName
+			}
+			statuses = append(statuses, FilterStatus{
+				Direction: string(direction),
+				Name:      name,
+				Handle:    binding.Handle,
+				Priority:  binding.Priority,
+				Backend:   classicTCBackend,
+				ProgramID: binding.ProgramID,
+			})
+		}
+	}
+	return statuses
+}
+
+func inspectPinnedMaps(ctx context.Context, status *KernelStatus) (*pinOwnerRecord, error) {
 	runtime := LinuxLoader{}.pinRuntime(ctx)
 	validated, err := validatePinPath(status.PinPath, runtime.validator)
 	if err != nil {
@@ -144,12 +177,17 @@ func inspectPinnedMaps(ctx context.Context, status *KernelStatus) ([]exactTCXBin
 	); err != nil {
 		return nil, err
 	}
-	if err := validateOwnerExactTCXLinks(
-		handle,
-		record.ActiveLinks,
-		liveExactTCXRuntime,
-	); err != nil {
-		return nil, err
+	switch record.Version {
+	case pinOwnerLegacyClassicVersion:
+		if err := validateOwnerTCExact(record.ActiveFilters, record.ActiveFilters, runtime.classicTC); err != nil {
+			return nil, err
+		}
+	case pinOwnerRecordVersion:
+		if err := validateOwnerExactTCXLinks(handle, record.ActiveLinks, runtime.exactTCX); err != nil {
+			return nil, err
+		}
+	default:
+		return nil, fmt.Errorf("unsupported BPF owner schema %d", record.Version)
 	}
 	status.ActiveGeneration = controlValue.ActiveGeneration
 	status.ABIVersion = controlValue.ABIVersion
@@ -157,9 +195,9 @@ func inspectPinnedMaps(ctx context.Context, status *KernelStatus) ([]exactTCXBin
 	stats, err := ebpf.LoadPinnedMap(filepath.Join(handle.procPath(), "stats_map"), nil)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
-			return slices.Clone(record.ActiveLinks), nil
+			return clonePinOwnerRecord(record), nil
 		}
-		return slices.Clone(record.ActiveLinks), fmt.Errorf("load pinned stats_map: %w", err)
+		return clonePinOwnerRecord(record), fmt.Errorf("load pinned stats_map: %w", err)
 	}
 	defer stats.Close()
 
@@ -170,7 +208,7 @@ func inspectPinnedMaps(ctx context.Context, status *KernelStatus) ([]exactTCXBin
 			if errors.Is(err, ebpf.ErrKeyNotExist) {
 				continue
 			}
-			return slices.Clone(record.ActiveLinks), fmt.Errorf("lookup stats_map[%s]: %w", name, err)
+			return clonePinOwnerRecord(record), fmt.Errorf("lookup stats_map[%s]: %w", name, err)
 		}
 		var total uint64
 		for _, value := range values {
@@ -178,7 +216,7 @@ func inspectPinnedMaps(ctx context.Context, status *KernelStatus) ([]exactTCXBin
 		}
 		status.Stats[name] = total
 	}
-	return slices.Clone(record.ActiveLinks), nil
+	return clonePinOwnerRecord(record), nil
 }
 
 var statNames = []string{

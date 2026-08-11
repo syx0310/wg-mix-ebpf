@@ -25,11 +25,14 @@ scripts/realhost-public-smoke-v1/controller.py run \
   --seconds 120
 ```
 
-`run` refuses to start unless both read-only probes report a kernel capable of
-the loader's exact TCX backend, bpffs, the fixed physical interface, and all
-fixed tools. There is no classic-TC fallback. A failed run never performs
-automatic privileged cleanup. After reviewing the retained ownership state,
-use the exact same run ID and commit:
+`run` uses the same production loader in two explicit modes: `tcx` on the B82
+kernel and `classic_tc` on the 5.15 public endpoint. It refuses to start unless
+both read-only probes report the role's minimum kernel, bpffs, the fixed
+physical interface, and all fixed tools. This is not a smoke-only attach
+implementation: both modes use the production owner journal, recovery, status,
+and detach paths. A failed run never performs automatic privileged cleanup.
+After reviewing the retained ownership state, use the exact same run ID and
+commit:
 
 ```sh
 scripts/realhost-public-smoke-v1/controller.py cleanup \

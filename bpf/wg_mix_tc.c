@@ -1871,9 +1871,10 @@ int wg_mix_egress(struct __sk_buff *skb)
 	struct profile_key profile_key = {};
 	struct profile_value *profile;
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
-	struct faketcp_tc_packet_descriptor faketcp_packet = {};
-	struct packet_info *info = &faketcp_packet.info;
-	struct faketcp_egress_admission faketcp_admission = {};
+	struct faketcp_runtime_scratch *faketcp_scratch;
+	struct faketcp_tc_packet_descriptor *faketcp_packet;
+	struct faketcp_egress_admission *faketcp_admission;
+	struct packet_info *info;
 #else
 	struct packet_info packet_info;
 	struct packet_info *info = &packet_info;
@@ -1889,6 +1890,15 @@ int wg_mix_egress(struct __sk_buff *skb)
 
 	if (!active_generation(&generation))
 		return TC_ACT_OK;
+#ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	faketcp_scratch = faketcp_runtime_scratch();
+	if (!faketcp_scratch)
+		return TC_ACT_SHOT;
+	faketcp_packet = &faketcp_scratch->tc.packet;
+	faketcp_admission = &faketcp_scratch->tc.admission;
+	info = &faketcp_packet->info;
+	__builtin_memset(faketcp_packet, 0, sizeof(*faketcp_packet));
+#endif
 	if (skb->gso_segs || skb->gso_size) {
 		gso_seen = 1;
 		inc_stat(STAT_EGRESS_GSO_SEEN);
@@ -1900,7 +1910,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 	if (gso_seen)
 		inc_stat(STAT_EGRESS_GSO_MANAGED_SEEN);
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
-	rc = faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet);
+	rc = faketcp_parse_tc_egress_packet(skb, generation, faketcp_packet);
 #else
 	rc = parse_packet(skb, info, generation);
 #endif
@@ -1979,30 +1989,30 @@ int wg_mix_egress(struct __sk_buff *skb)
 	// precede the checkpoint. The admitted path then closes over exactly one
 	// direct/XOR or aggregate transform; there is no parser fallback.
 	if (rule->transport_mode == TRANSPORT_FAKETCP) {
-		if (faketcp_tc_fixed_udp_status(&faketcp_packet) != FAKETCP_L3_OK) {
+		if (faketcp_tc_fixed_udp_status(faketcp_packet) != FAKETCP_L3_OK) {
 			inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 			return TC_ACT_SHOT;
 		}
 		if (gso_seen)
 			return faketcp_encode_gso_segments(
-				skb, info, &faketcp_packet.shape.l3, managed, rule, profile,
+				skb, info, &faketcp_packet->shape.l3, managed, rule, profile,
 				generation, rc, kind, old_wire, new_wire);
 		if (faketcp_prepare_udp(
 			    skb, info->ip_off, info->udp_off,
 			    info->payload_len + sizeof(struct udphdr), 0) < 0)
 			return TC_ACT_SHOT;
 		if (faketcp_egress_admission_checkpoint(
-			    skb, info, &faketcp_packet.shape.l3, managed, rule, profile,
+			    skb, info, &faketcp_packet->shape.l3, managed, rule, profile,
 			    generation, rc,
 			    kind, old_wire, new_wire, xor_checksum_mode,
-			    &faketcp_admission) != FAKETCP_ADMISSION_TRANSFORM)
+			    faketcp_admission) != FAKETCP_ADMISSION_TRANSFORM)
 			return TC_ACT_SHOT;
 		if (cipher_id != 0) {
-			set_faketcp_xor_context(skb, faketcp_admission.nonce);
+			set_faketcp_xor_context(skb, faketcp_admission->nonce);
 			rc = update_type_word(skb, info, old_wire, new_wire, 1);
 			if (rc < 0) {
 				faketcp_consume_egress_admission(
-					faketcp_admission.nonce, 0);
+					faketcp_admission->nonce, 0);
 				clear_xor_context(skb);
 				inc_stat(rc == -2 ? STAT_XOR_STORE_ERROR :
 						    STAT_CHECKSUM_ERROR);
@@ -2011,16 +2021,16 @@ int wg_mix_egress(struct __sk_buff *skb)
 			bpf_tail_call(skb, &xor_egress_programs,
 				      xor_program_index(generation, 0));
 			faketcp_consume_egress_admission(
-				faketcp_admission.nonce, 0);
+				faketcp_admission->nonce, 0);
 			return xor_dispatch_fail(
 				skb, STAT_XOR_EGRESS_DISPATCH_ERROR);
 		}
 		if (faketcp_consume_egress_admission(
-			    faketcp_admission.nonce, &faketcp_admission) < 0 ||
+			    faketcp_admission->nonce, faketcp_admission) < 0 ||
 		    !faketcp_egress_admission_matches(
-			    skb, info, &faketcp_packet.shape.l3, managed, rule, profile,
+			    skb, info, &faketcp_packet->shape.l3, managed, rule, profile,
 			    generation,
-			    FAKETCP_TOKEN_ARMED, &faketcp_admission)) {
+			    FAKETCP_TOKEN_ARMED, faketcp_admission)) {
 			inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 			return TC_ACT_SHOT;
 		}
@@ -2031,7 +2041,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 			return TC_ACT_SHOT;
 		}
 		return faketcp_encode_established(skb, info, rule, generation,
-						  &faketcp_admission);
+						  faketcp_admission);
 	}
 #endif
 	if (rule->transport_mode == TRANSPORT_ICMP) {

@@ -138,6 +138,7 @@ type FwmarkPolicy struct {
 
 type Runtime struct {
 	PollInterval            Duration `yaml:"poll_interval"`
+	AttachmentBackend       string   `yaml:"attachment_backend"`
 	RequireNonzeroFwmark    bool     `yaml:"require_nonzero_fwmark"`
 	StrictRuntimeFwmark     bool     `yaml:"strict_runtime_fwmark"`
 	AllowZeroFwmarkFallback bool     `yaml:"allow_zero_fwmark_fallback"`
@@ -158,7 +159,7 @@ func (r *Runtime) UnmarshalYAML(value *yaml.Node) error {
 			out.requireNonzeroFwmarkSet = true
 		case "strict_runtime_fwmark":
 			out.strictRuntimeFwmarkSet = true
-		case "poll_interval", "allow_zero_fwmark_fallback":
+		case "poll_interval", "attachment_backend", "allow_zero_fwmark_fallback":
 		default:
 			return fmt.Errorf("field %q not found in type config.Runtime", value.Content[i].Value)
 		}
@@ -333,6 +334,7 @@ func SafeTemplate() *Config {
 		FwmarkPolicy: FwmarkPolicy{Mode: "config-required"},
 		Runtime: Runtime{
 			PollInterval:            Duration{Duration: 5 * time.Second},
+			AttachmentBackend:       "auto",
 			RequireNonzeroFwmark:    true,
 			StrictRuntimeFwmark:     true,
 			AllowZeroFwmarkFallback: false,
@@ -367,6 +369,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Runtime.PollInterval.Duration == 0 {
 		c.Runtime.PollInterval.Duration = 5 * time.Second
+	}
+	if c.Runtime.AttachmentBackend == "" {
+		c.Runtime.AttachmentBackend = "auto"
 	}
 	if !c.Runtime.AllowZeroFwmarkFallback && !c.Runtime.requireNonzeroFwmarkSet {
 		c.Runtime.RequireNonzeroFwmark = true
@@ -526,6 +531,14 @@ func (c *Config) ValidateStatic() error {
 	}
 	if c.Runtime.PollInterval.Duration < MinimumPollInterval {
 		return fmt.Errorf("runtime.poll_interval must be at least %s", MinimumPollInterval)
+	}
+	switch c.Runtime.AttachmentBackend {
+	case "auto", "tcx", "classic_tc":
+	default:
+		return fmt.Errorf(
+			"runtime.attachment_backend %q is unsupported (want auto, tcx, or classic_tc)",
+			c.Runtime.AttachmentBackend,
+		)
 	}
 	if err := validateUniqueUnderlays(c.Underlays); err != nil {
 		return err

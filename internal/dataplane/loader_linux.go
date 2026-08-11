@@ -26,14 +26,19 @@ import (
 )
 
 const (
-	ingressFilterName = "wg_mix_ingress"
-	egressFilterName  = "wg_mix_egress"
-	xorSegmentCount   = 8
-	pinPathPrefix     = "wg-mix-ebpf"
-	maxPinPathSuffix  = 64
-	pinPathLockRoot   = "/run/wg-mix-ebpf/pin-locks"
-	pinOwnerRoot      = "/var/lib/wg-mix-ebpf/pin-owners"
-	pinPathOwnerV2    = 2
+	ingressFilterName     = "wg_mix_ingress"
+	egressFilterName      = "wg_mix_egress"
+	filterPriority        = 49152
+	ingressHandle         = 0x10001
+	egressHandle          = 0x10002
+	xorSegmentCount       = 8
+	pinPathPrefix         = "wg-mix-ebpf"
+	maxPinPathSuffix      = 64
+	pinPathLockRoot       = "/run/wg-mix-ebpf/pin-locks"
+	pinOwnerRoot          = "/var/lib/wg-mix-ebpf/pin-owners"
+	pinPathOwnerV2        = 2
+	attachmentBackendAuto = "auto"
+	classicTCBackend      = "classic_tc"
 )
 
 type pinPathFilesystem struct {
@@ -79,6 +84,7 @@ type pinPathRuntime struct {
 	bootID               func() (string, error)
 	pinProgram           func(uint32, string) error
 	loadPinnedProgram    func(string) (*pinnedProgramObservation, error)
+	classicTC            tcRuntime
 	exactTCX             exactTCXRuntime
 	beforeOwnerExchange  func()
 	beforePinQuarantine  func(string) error
@@ -211,6 +217,7 @@ var livePinPathRuntime = pinPathRuntime{
 	bootID:            readLinuxBootID,
 	pinProgram:        pinProgramByID,
 	loadPinnedProgram: loadPinnedProgramObservation,
+	classicTC:         liveTCRuntime,
 	exactTCX:          liveExactTCXRuntime,
 }
 
@@ -328,7 +335,236 @@ func preflightUnpinnedCollection(spec *ebpf.CollectionSpec, source string) error
 	return nil
 }
 
-func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr error) {
+func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
+	if ctx == nil {
+		return errors.New("apply context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if state == nil {
+		return errors.New("apply control state is nil")
+	}
+	if err := preflightFakeTCPKernelRequirements(state); err != nil {
+		return err
+	}
+
+	runtime := l.pinRuntime(ctx)
+	configured := state.AttachmentBackend
+	if configured == "" {
+		configured = attachmentBackendAuto
+	}
+	if configured == attachmentBackendAuto {
+		ifindexes, err := activeAttachIfindexes(state)
+		if err != nil {
+			return err
+		}
+		backend, exists, err := l.durableAutoBackend(ctx, runtime)
+		if err != nil {
+			return err
+		}
+		if exists {
+			switch backend {
+			case exactTCXBackend:
+				if len(ifindexes) != 0 {
+					if err := preflightExactTCXCapabilities(state, runtime.exactTCX); err != nil {
+						return err
+					}
+				}
+				return l.applyExactTCX(ctx, state)
+			case classicTCBackend:
+				return l.applyClassicTC(ctx, state)
+			default:
+				return fmt.Errorf("stored attachment backend %q is unsupported", backend)
+			}
+		}
+		if len(ifindexes) == 0 {
+			return nil
+		}
+	}
+	backend, err := resolveAttachmentBackend(state, runtime.exactTCX)
+	if err != nil {
+		return err
+	}
+	switch backend {
+	case exactTCXBackend:
+		return l.applyExactTCX(ctx, state)
+	case classicTCBackend:
+		return l.applyClassicTC(ctx, state)
+	default:
+		return fmt.Errorf("resolved attachment backend %q is unsupported", backend)
+	}
+}
+
+func attachmentBackendForOwnerVersion(version int) (string, error) {
+	switch version {
+	case pinOwnerLegacyClassicVersion:
+		return classicTCBackend, nil
+	case pinOwnerRecordVersion:
+		return exactTCXBackend, nil
+	default:
+		return "", fmt.Errorf("unsupported BPF owner schema %d", version)
+	}
+}
+
+// durableAutoBackend keeps an existing durable owner on its original
+// attachment backend. A fresh idle config is a no-op, while the first config
+// with an attachable underlay performs a real TCX capability probe.
+func (l LinuxLoader) durableAutoBackend(
+	ctx context.Context,
+	runtime pinPathRuntime,
+) (backend string, exists bool, returnErr error) {
+	pinPath := pinPathFromEnv(l.PinPath)
+	validated, err := validatePinPath(pinPath, runtime.validator)
+	if err != nil {
+		return "", false, err
+	}
+	_, pinErr := os.Lstat(pinPath)
+	_, ownerErr := os.Lstat(runtime.ownerRoot)
+	if errors.Is(pinErr, unix.ENOENT) && errors.Is(ownerErr, unix.ENOENT) {
+		return "", false, nil
+	}
+	parent, err := openPinPathParent(pinPath, validated, runtime)
+	if err != nil {
+		return "", false, err
+	}
+	defer parent.Close()
+	lock, err := acquirePinPathLock(ctx, parent.resource, "resolve-auto", runtime)
+	if err != nil {
+		return "", false, err
+	}
+	defer lock.Close()
+	validated, err = validatePinPath(pinPath, runtime.validator)
+	if err != nil {
+		return "", false, err
+	}
+	handle, _, err := openPinPathHandleFromParent(parent, validated, false)
+	if err != nil {
+		return "", false, err
+	}
+	if handle != nil {
+		defer handle.Close()
+	}
+	store, err := openPinOwnerStore(runtime, parent.resource, false)
+	if errors.Is(err, unix.ENOENT) {
+		if handle == nil {
+			return "", false, nil
+		}
+		state, classifyErr := classifyCanonicalPinDirectory(handle)
+		if classifyErr != nil {
+			return "", false, classifyErr
+		}
+		if state == canonicalPinsEmpty {
+			return "", false, nil
+		}
+		if l.AdoptLegacyPins &&
+			(state == canonicalPinsLegacy || state == canonicalPinsOwned) {
+			return classicTCBackend, true, nil
+		}
+		return "", false, errors.New(
+			"BPF pins are present without durable ownership; refusing automatic backend selection",
+		)
+	}
+	if err != nil {
+		return "", false, err
+	}
+	defer store.Close()
+	record, recordExists, err := store.LoadOptional(parent.mountID)
+	if err != nil {
+		return "", false, err
+	}
+	if recordExists {
+		backend, err := attachmentBackendForOwnerVersion(record.Version)
+		return backend, err == nil, err
+	}
+	indexed, err := conflictingActiveOwnerIndexEntry(
+		indexStoreFromOwner(store),
+		parent.resource,
+		filepath.Dir(parent.pinPath),
+	)
+	if err != nil {
+		return "", false, err
+	}
+	if indexed != nil {
+		historical, _, err := inspectIndexedOwnerEvidenceReadOnly(
+			indexStoreFromOwner(store),
+			*indexed,
+		)
+		if err != nil {
+			return "", false, err
+		}
+		backend, err := attachmentBackendForOwnerVersion(historical.Version)
+		return backend, err == nil, err
+	}
+	if handle == nil {
+		return "", false, nil
+	}
+	directoryState, err := classifyCanonicalPinDirectory(handle)
+	if err != nil {
+		return "", false, err
+	}
+	if directoryState == canonicalPinsEmpty {
+		return "", false, nil
+	}
+	if l.AdoptLegacyPins &&
+		(directoryState == canonicalPinsLegacy || directoryState == canonicalPinsOwned) {
+		return classicTCBackend, true, nil
+	}
+	return "", false, errors.New(
+		"BPF pins are present without durable ownership; refusing automatic backend selection",
+	)
+}
+
+func resolveAttachmentBackend(
+	state *control.State,
+	runtime exactTCXRuntime,
+) (string, error) {
+	if state == nil {
+		return "", errors.New("resolve attachment backend: control state is nil")
+	}
+	configured := state.AttachmentBackend
+	if configured == "" {
+		configured = attachmentBackendAuto
+	}
+	switch configured {
+	case classicTCBackend:
+		return classicTCBackend, nil
+	case exactTCXBackend:
+		if err := preflightExactTCXCapabilities(state, runtime); err != nil {
+			return "", err
+		}
+		return exactTCXBackend, nil
+	case attachmentBackendAuto:
+		ifindexes, err := activeAttachIfindexes(state)
+		if err != nil {
+			return "", err
+		}
+		if len(ifindexes) == 0 {
+			return "", errors.New(
+				"attachment backend auto requires at least one attachable underlay; set runtime.attachment_backend explicitly when staging an empty or parse-only state",
+			)
+		}
+		err = preflightExactTCXCapabilities(state, runtime)
+		if err == nil {
+			return exactTCXBackend, nil
+		}
+		if isExactTCXUnsupported(err) {
+			return classicTCBackend, nil
+		}
+		return "", err
+	default:
+		return "", fmt.Errorf("attachment backend %q is unsupported", configured)
+	}
+}
+
+func isExactTCXUnsupported(err error) bool {
+	return errors.Is(err, unix.EOPNOTSUPP) ||
+		errors.Is(err, unix.ENOTSUP) ||
+		errors.Is(err, unix.ENOSYS) ||
+		errors.Is(err, unix.EINVAL)
+}
+
+func (l LinuxLoader) applyExactTCX(ctx context.Context, state *control.State) (returnErr error) {
 	if ctx == nil {
 		return errors.New("apply context is nil")
 	}
@@ -354,12 +590,6 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	pinPath := pinPathFromEnv(l.PinPath)
 	validated, err := validatePinPath(pinPath, runtime.validator)
 	if err != nil {
-		return err
-	}
-	// This read-only feature/revision probe is deliberately before BPF object
-	// loading, owner intent, map pinning, or any TCX kernel write. Production
-	// never falls back to non-exact classic TC after this point.
-	if err := preflightExactTCXCapabilities(state, runtime.exactTCX); err != nil {
 		return err
 	}
 	parent, err := openPinPathParent(pinPath, validated, runtime)
@@ -438,6 +668,12 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) (returnErr
 	ownerRecord, ownerExists, err := store.LoadOptional(handle.mountID)
 	if err != nil {
 		return fmt.Errorf("load persistent BPF pin owner: %w", err)
+	}
+	if ownerExists && ownerRecord.Version != pinOwnerRecordVersion {
+		return fmt.Errorf(
+			"configured tcx backend found owner schema %d; detach the existing backend before switching",
+			ownerRecord.Version,
+		)
 	}
 	if ownerExists && ownerRecord.BootID == bootID {
 		rollbackFreshPins = false
@@ -906,8 +1142,9 @@ func (l LinuxLoader) DetachStale(ctx context.Context, previous *control.State, c
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	// Apply now includes owner-recorded stale exact TCX links in the same global
-	// preflight, rollback, and journal transaction as replacements/additions.
+	// Apply includes owner-recorded stale attachments for the selected backend
+	// in the same preflight, rollback, and journal transaction as replacements
+	// and additions.
 	// Keep this compatibility hook side-effect free for older reconcile callers.
 	return nil
 }
@@ -993,30 +1230,56 @@ func (l LinuxLoader) Detach(ctx context.Context, state *control.State) error {
 			record.BootID, bootID,
 		)
 	}
-	recovered, err := recoverExactPinOwnerTransaction(
-		ctx,
-		handle,
-		store,
-		record,
-		runtime.exactTCX,
-	)
-	if err != nil {
-		return fmt.Errorf("recover BPF owner before detach: %w", err)
+	switch record.Version {
+	case pinOwnerLegacyClassicVersion:
+		recovered, err := recoverPinOwnerTransaction(
+			handle,
+			store,
+			record,
+			runtime.classicTC,
+		)
+		if err != nil {
+			return fmt.Errorf("recover classic TC owner before detach: %w", err)
+		}
+		if recovered.directoryRemoved {
+			return nil
+		}
+		if recovered.record == nil || recovered.record.Phase != pinOwnerPhaseActive {
+			return errors.New("classic TC owner recovery did not reach an active state")
+		}
+		return executeOwnerDetachTransaction(
+			handle,
+			store,
+			recovered.record,
+			runtime.classicTC,
+		)
+	case pinOwnerRecordVersion:
+		recovered, err := recoverExactPinOwnerTransaction(
+			ctx,
+			handle,
+			store,
+			record,
+			runtime.exactTCX,
+		)
+		if err != nil {
+			return fmt.Errorf("recover TCX owner before detach: %w", err)
+		}
+		if recovered.directoryRemoved {
+			return nil
+		}
+		if recovered.record == nil || recovered.record.Phase != pinOwnerPhaseActive {
+			return errors.New("TCX owner recovery did not reach an active state")
+		}
+		return executeExactOwnerDetachTransaction(
+			ctx,
+			handle,
+			store,
+			recovered.record,
+			runtime.exactTCX,
+		)
+	default:
+		return fmt.Errorf("unsupported BPF owner schema %d", record.Version)
 	}
-	if recovered.directoryRemoved {
-		return nil
-	}
-	if recovered.record == nil ||
-		recovered.record.Phase != pinOwnerPhaseActive {
-		return errors.New("BPF owner recovery did not reach an active state")
-	}
-	return executeExactOwnerDetachTransaction(
-		ctx,
-		handle,
-		store,
-		recovered.record,
-		runtime.exactTCX,
-	)
 }
 
 func pinPathFromEnv(explicit string) string {
@@ -1027,6 +1290,16 @@ func pinPathFromEnv(explicit string) string {
 		return path
 	}
 	return DefaultPinPath
+}
+
+func isNotFound(err error) bool {
+	if err == nil {
+		return false
+	}
+	lower := strings.ToLower(err.Error())
+	return errors.Is(err, os.ErrNotExist) ||
+		strings.Contains(lower, "no such file") ||
+		strings.Contains(lower, "not found")
 }
 
 func validatePinPath(pinPath string, validator pinPathValidator) (validatedPinPath, error) {

@@ -573,7 +573,7 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 		"bpf_loop(context.gso_segments, faketcp_gso_validate_segment",
 		"struct faketcp_gso_projection",
 		"faketcp_gso_build_projection(skb, info, profile, cipher",
-		"faketcp_consume_egress_admission(admission.nonce, &admission)",
+		"faketcp_consume_egress_admission(admission->nonce, admission)",
 		"segment_index = index / context->xor_chunks_per_segment",
 		"target_length = segment_length < context->cipher->max_bytes",
 		"faketcp_session_mutate(session, generation, now,",
@@ -612,7 +612,7 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 	gso := bpf[gsoStart:gsoEnd]
 	prepare := strings.Index(gso, "faketcp_prepare_udp(skb, info->ip_off, info->udp_off")
 	checkpoint := strings.Index(gso, "faketcp_egress_admission_checkpoint(")
-	consume := strings.Index(gso, "faketcp_consume_egress_admission(admission.nonce, &admission)")
+	consume := strings.Index(gso, "faketcp_consume_egress_admission(admission->nonce, admission)")
 	rewrite := strings.Index(gso, "bpf_loop(context.gso_segments, faketcp_gso_rewrite_type")
 	sessionMutation := strings.Index(gso, "faketcp_session_mutate(session, generation, now,")
 	commitCall := strings.Index(gso, "wg_mix_faketcp_skb_commit_udp_gso(")
@@ -623,8 +623,8 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 		t.Fatal("prepare/proof/consume/segment rewrites must precede one stable-lifetime writer and GSO commit")
 	}
 	egress := sourceSection(t, tc, "int wg_mix_egress(struct __sk_buff *skb)", "SEC(\"classifier/ingress\")")
-	parseGate := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
-	fixedGate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
+	parseGate := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, faketcp_packet)")
+	fixedGate := strings.Index(egress, "faketcp_tc_fixed_udp_status(faketcp_packet)")
 	dispatch := strings.Index(egress, "return faketcp_encode_gso_segments(")
 	if parseGate < 0 || fixedGate < 0 || dispatch < 0 ||
 		!(parseGate < fixedGate && fixedGate < dispatch) {

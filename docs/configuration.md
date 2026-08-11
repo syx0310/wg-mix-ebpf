@@ -64,6 +64,7 @@ fwmark_policy:
 
 runtime:
   poll_interval: 5s
+  attachment_backend: auto
   require_nonzero_fwmark: true
   strict_runtime_fwmark: true
   allow_zero_fwmark_fallback: false
@@ -568,6 +569,16 @@ Supported value:
 ```yaml
 underlay_overlap_policy: reject
 ```
+
+`runtime.attachment_backend` accepts `auto`, `tcx`, or `classic_tc`. `auto`
+performs a read-only TCX query on every attachable underlay and falls back to
+classic TC only when the kernel reports that TCX is unsupported. Permission,
+malformed-query, or ownership errors do not trigger fallback. With no
+attachable underlay and no durable owner, `auto` is an idle no-op and does not
+persist an unprobed owner schema. Once an owner exists, `auto` remains on that
+owner's schema-v3 classic or schema-v4 TCX backend across reloads and kernel
+upgrades. Select a different backend explicitly only after detaching the old
+owner.
 
 This rejects duplicate underlay names. More advanced path-overlap detection is platform-specific and must be validated externally.
 

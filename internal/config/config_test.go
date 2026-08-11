@@ -37,6 +37,24 @@ profiles:
 	if !cfg.Runtime.RequireNonzeroFwmark {
 		t.Fatal("require nonzero fwmark default not enabled")
 	}
+	if cfg.Runtime.AttachmentBackend != "auto" {
+		t.Fatalf("attachment backend default = %q", cfg.Runtime.AttachmentBackend)
+	}
+}
+
+func TestRuntimeAttachmentBackends(t *testing.T) {
+	for _, backend := range []string{"auto", "tcx", "classic_tc"} {
+		cfg, err := Load([]byte("version: 1\nunderlays: []\nwireguards: []\nprofiles: {}\nruntime:\n  attachment_backend: " + backend + "\n"))
+		if err != nil {
+			t.Fatalf("load backend %s: %v", backend, err)
+		}
+		if cfg.Runtime.AttachmentBackend != backend {
+			t.Fatalf("attachment backend = %q, want %q", cfg.Runtime.AttachmentBackend, backend)
+		}
+	}
+	if _, err := Load([]byte("version: 1\nunderlays: []\nwireguards: []\nprofiles: {}\nruntime:\n  attachment_backend: legacy\n")); err == nil {
+		t.Fatal("expected unsupported attachment backend rejection")
+	}
 }
 
 func TestRejectUnknownUnderlayType(t *testing.T) {

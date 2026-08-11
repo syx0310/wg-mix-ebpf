@@ -118,6 +118,7 @@ func requireIngressListener(t *testing.T, state *State, family string, port uint
 
 func TestBuildStateOfflineParsesConfigFwMark(t *testing.T) {
 	cfg := testConfig(t)
+	cfg.Runtime.AttachmentBackend = "classic_tc"
 	state, err := BuildState(context.Background(), cfg, runtime.StaticProvider{}, underlay.StaticResolver{}, func(string) (*wgconfig.Interface, error) {
 		mark := uint32(0x10000002)
 		return &wgconfig.Interface{FwMark: &mark}, nil
@@ -127,6 +128,9 @@ func TestBuildStateOfflineParsesConfigFwMark(t *testing.T) {
 	}
 	if len(state.WireGuards) != 1 {
 		t.Fatalf("wireguards = %d", len(state.WireGuards))
+	}
+	if state.AttachmentBackend != "classic_tc" {
+		t.Fatalf("attachment backend = %q", state.AttachmentBackend)
 	}
 	if state.WireGuards[0].ConfigFwMark != 0x10000002 {
 		t.Fatalf("config fwmark = 0x%x", state.WireGuards[0].ConfigFwMark)

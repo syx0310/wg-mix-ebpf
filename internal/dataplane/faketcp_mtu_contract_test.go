@@ -60,8 +60,8 @@ func TestFakeTCPMTUIntegrationUsesUnifiedPrepareOnly(t *testing.T) {
 		t.Fatal("unified prepare must have one wrapper and exactly one call in each non-GSO/GSO branch")
 	}
 	egress := sourceSection(t, tc, "int wg_mix_egress(struct __sk_buff *skb)", "SEC(\"classifier/ingress\")")
-	parse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, &faketcp_packet)")
-	l3Gate := strings.Index(egress, "faketcp_tc_fixed_udp_status(&faketcp_packet)")
+	parse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, faketcp_packet)")
+	l3Gate := strings.Index(egress, "faketcp_tc_fixed_udp_status(faketcp_packet)")
 	gsoDispatch := strings.Index(egress, "return faketcp_encode_gso_segments(")
 	nonGSOPrepare := strings.Index(egress, "if (faketcp_prepare_udp(")
 	nonGSOCheckpoint := strings.Index(egress, "if (faketcp_egress_admission_checkpoint(")

@@ -10,7 +10,7 @@ import (
 // This source contract runs on every host OS. The behavior it protects lives
 // behind //go:build linux, so a Darwin test run must not be able to silently
 // cross-compile a merge that dropped the pre-mutation production defenses.
-func TestLinuxLoaderRetainsGateAndExactManifestCallers(t *testing.T) {
+func TestLinuxLoaderRetainsGateManifestAndDualBackendCallers(t *testing.T) {
 	fileSet := token.NewFileSet()
 	file, err := parser.ParseFile(fileSet, "loader_linux.go", nil, 0)
 	if err != nil {
@@ -34,11 +34,36 @@ func TestLinuxLoaderRetainsGateAndExactManifestCallers(t *testing.T) {
 	apply := linuxLoaderFunction(t, file, "Apply", true)
 	assertLinuxLoaderCallOrder(t, apply,
 		"preflightFakeTCPKernelRequirements",
+		"durableAutoBackend",
+		"preflightExactTCXCapabilities",
+		"applyExactTCX",
+		"applyClassicTC",
+	)
+
+	exactApply := linuxLoaderFunction(t, file, "applyExactTCX", true)
+	assertLinuxLoaderCallOrder(t, exactApply,
+		"preflightFakeTCPKernelRequirements",
 		"validatePinPath",
 		"loadCollectionSpec",
 		"validateBaselineLoaderCollectionSpec",
 		"validateAndSetPinnedMaps",
 		"removeMemlockLimit",
+	)
+
+	classicFile, err := parser.ParseFile(fileSet, "loader_classic_linux.go", nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	classicApply := linuxLoaderFunction(t, classicFile, "applyClassicTC", true)
+	assertLinuxLoaderCallOrder(t, classicApply,
+		"preflightFakeTCPKernelRequirements",
+		"validateTCRuntime",
+		"validatePinPath",
+		"loadCollectionSpec",
+		"validateBaselineLoaderCollectionSpec",
+		"validateAndSetPinnedMaps",
+		"removeMemlockLimit",
+		"prepareTCAttachPlan",
 	)
 }
 

@@ -225,13 +225,26 @@ func inspectPinOwnershipWithRuntime(
 				record.BootID, currentBootID,
 			)
 		}
-		recovered, err := recoverExactPinOwnerTransaction(
-			ctx,
-			handle,
-			store,
-			record,
-			tcxRuntime,
-		)
+		var recovered *pinOwnerRecoveryResult
+		switch record.Version {
+		case pinOwnerLegacyClassicVersion:
+			recovered, err = recoverPinOwnerTransaction(
+				handle,
+				store,
+				record,
+				runtime.classicTC,
+			)
+		case pinOwnerRecordVersion:
+			recovered, err = recoverExactPinOwnerTransaction(
+				ctx,
+				handle,
+				store,
+				record,
+				tcxRuntime,
+			)
+		default:
+			err = fmt.Errorf("unsupported BPF owner schema %d", record.Version)
+		}
 		if err != nil {
 			return status, err
 		}
@@ -268,8 +281,17 @@ func inspectPinOwnershipWithRuntime(
 	); err != nil {
 		return status, err
 	}
-	if err := validateOwnerExactTCXLinks(handle, record.ActiveLinks, tcxRuntime); err != nil {
-		return status, err
+	switch record.Version {
+	case pinOwnerLegacyClassicVersion:
+		if err := validateOwnerTCExact(record.ActiveFilters, record.ActiveFilters, runtime.classicTC); err != nil {
+			return status, err
+		}
+	case pinOwnerRecordVersion:
+		if err := validateOwnerExactTCXLinks(handle, record.ActiveLinks, tcxRuntime); err != nil {
+			return status, err
+		}
+	default:
+		return status, fmt.Errorf("unsupported BPF owner schema %d", record.Version)
 	}
 	return status, nil
 }
@@ -638,9 +660,15 @@ func setPinOwnershipStatusRecord(
 	status.ActiveGeneration = record.ActiveGeneration
 	status.NextGeneration = record.NextGeneration
 	status.MapCount = len(record.Maps)
-	status.ActiveFilterCount = len(record.ActiveLinks)
-	status.ActiveLinkCount = len(record.ActiveLinks)
-	status.AttachmentBackend = exactTCXBackend
+	if record.Version == pinOwnerLegacyClassicVersion {
+		status.ActiveFilterCount = len(record.ActiveFilters)
+		status.ActiveLinkCount = 0
+		status.AttachmentBackend = classicTCBackend
+	} else {
+		status.ActiveFilterCount = len(record.ActiveLinks)
+		status.ActiveLinkCount = len(record.ActiveLinks)
+		status.AttachmentBackend = exactTCXBackend
+	}
 	status.RecoveryRequired = record.Phase != pinOwnerPhaseActive ||
 		record.Step != pinOwnerStepReady
 }

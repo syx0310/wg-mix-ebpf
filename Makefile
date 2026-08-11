@@ -8,6 +8,7 @@ override WG_NETNS_SMOKE_LAUNCHER := scripts/run-smoke-netns-wg-private-mountns.s
 CLANG ?= clang
 BPF_MULTIARCH ?= $(shell gcc -print-multiarch 2>/dev/null)
 BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/include/$(BPF_MULTIARCH),)
+BPF_BASELINE_CFLAGS ?= $(BPF_CFLAGS) -Wno-unused-function
 BPF_OBJECT ?= build/wg_mix_tc.o
 FAKETCP_EXPERIMENTAL_BPF_OBJECT ?= build/wg_mix_faketcp_experimental.o
 FAKETCP_CHECKSUM_KMOD_SOURCE ?= $(CURDIR)/kernel/faketcp_checksum
@@ -90,7 +91,7 @@ test-b82-fresh-verifier-gate:
 
 build-bpf:
 	@mkdir -p $(dir $(BPF_OBJECT))
-	$(CLANG) $(BPF_CFLAGS) -c bpf/wg_mix_tc.c -o $(BPF_OBJECT)
+	$(CLANG) $(BPF_BASELINE_CFLAGS) -c bpf/wg_mix_tc.c -o $(BPF_OBJECT)
 
 # The Mimic-style FakeTCP wire path is a separate, deliberately unembedded
 # experiment. The ordinary loader only accepts the baseline object above.

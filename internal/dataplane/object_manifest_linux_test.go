@@ -331,11 +331,13 @@ func canonicalExperimentalCollectionSpec() *ebpf.CollectionSpec {
 			ByteOrder:     binary.LittleEndian,
 		}
 	}
-	instructions := make(asm.Instructions, 0, len(experimentalFakeTCPKfuncNames)+1)
+	instructions := make(asm.Instructions, 0, 4)
 	for _, name := range experimentalFakeTCPKfuncNames {
-		call := asm.Call.Label(name)
-		call.Src = asm.PseudoKfuncCall
-		instructions = append(instructions, call)
+		for range experimentalFakeTCPKfuncRelocationCounts[name] {
+			call := asm.Call.Label(name)
+			call.Src = asm.PseudoKfuncCall
+			instructions = append(instructions, call)
+		}
 	}
 	spec.Programs["wg_mix_egress"].Instructions = append(instructions, asm.Return())
 	return spec

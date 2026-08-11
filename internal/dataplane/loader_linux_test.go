@@ -18,11 +18,349 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/pinidentity"
+	"golang.org/x/sys/unix"
 )
+
+func backendTestState(backend string) *control.State {
+	return &control.State{
+		AttachmentBackend: backend,
+		Underlays: []control.UnderlayState{{
+			Name: "eth0", IfIndex: 7, Role: "underlay", Resolved: true,
+		}},
+	}
+}
+
+func TestResolveAttachmentBackend(t *testing.T) {
+	validQuery := exactTCXQuery{Revision: 1}
+	tests := []struct {
+		name        string
+		configured  string
+		query       exactTCXQuery
+		queryErr    error
+		want        string
+		wantErr     string
+		wantQueries int
+	}{
+		{name: "explicit classic does not probe TCX", configured: classicTCBackend, want: classicTCBackend},
+		{name: "explicit TCX", configured: exactTCXBackend, query: validQuery, want: exactTCXBackend, wantQueries: 2},
+		{name: "auto prefers TCX", configured: attachmentBackendAuto, query: validQuery, want: exactTCXBackend, wantQueries: 2},
+		{name: "empty is auto", configured: "", query: validQuery, want: exactTCXBackend, wantQueries: 2},
+		{name: "auto falls back on unsupported", configured: attachmentBackendAuto, queryErr: unix.EOPNOTSUPP, want: classicTCBackend, wantQueries: 1},
+		{name: "auto falls back on old-kernel EINVAL", configured: attachmentBackendAuto, queryErr: unix.EINVAL, want: classicTCBackend, wantQueries: 1},
+		{name: "explicit TCX does not fall back", configured: exactTCXBackend, queryErr: unix.EOPNOTSUPP, wantErr: "preflight exact TCX", wantQueries: 1},
+		{name: "auto rejects query transport failure", configured: attachmentBackendAuto, queryErr: unix.EPERM, wantErr: "operation not permitted", wantQueries: 1},
+		{name: "auto rejects malformed query", configured: attachmentBackendAuto, query: exactTCXQuery{}, wantErr: "no revision fence", wantQueries: 1},
+		{name: "invalid configuration", configured: "legacy", wantErr: "unsupported"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			queries := 0
+			runtime := exactTCXRuntime{
+				query: func(int, ebpf.AttachType) (exactTCXQuery, error) {
+					queries++
+					return tt.query, tt.queryErr
+				},
+				attach: func(int, ebpf.AttachType, uint64, exactTCXProgram) (exactTCXKernelLink, error) {
+					return nil, errors.New("unexpected attach")
+				},
+				loadPinned: func(string) (exactTCXKernelLink, error) {
+					return nil, errors.New("unexpected load")
+				},
+			}
+			got, err := resolveAttachmentBackend(backendTestState(tt.configured), runtime)
+			if tt.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tt.wantErr) {
+					t.Fatalf("resolve error = %v, want containing %q", err, tt.wantErr)
+				}
+			} else if err != nil {
+				t.Fatalf("resolve backend: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("resolved backend = %q, want %q", got, tt.want)
+			}
+			if queries != tt.wantQueries {
+				t.Fatalf("TCX queries = %d, want %d", queries, tt.wantQueries)
+			}
+		})
+	}
+}
+
+func TestResolveAttachmentBackendAutoRejectsNoAttachableUnderlay(t *testing.T) {
+	runtime := exactTCXRuntime{
+		query: func(int, ebpf.AttachType) (exactTCXQuery, error) {
+			t.Fatal("auto must not pretend TCX is available without a probe target")
+			return exactTCXQuery{}, nil
+		},
+		attach: func(int, ebpf.AttachType, uint64, exactTCXProgram) (exactTCXKernelLink, error) {
+			return nil, errors.New("unexpected attach")
+		},
+		loadPinned: func(string) (exactTCXKernelLink, error) {
+			return nil, errors.New("unexpected load")
+		},
+	}
+	_, err := resolveAttachmentBackend(&control.State{
+		AttachmentBackend: attachmentBackendAuto,
+		Underlays: []control.UnderlayState{{
+			Name: "parser", IfIndex: 7, Role: "parse_only", Resolved: true,
+		}},
+	}, runtime)
+	if err == nil || !strings.Contains(err.Error(), "requires at least one attachable underlay") {
+		t.Fatalf("resolve error = %v, want explicit empty-state rejection", err)
+	}
+}
+
+func TestAutoBackendFreshIdleStateIsNoOp(t *testing.T) {
+	bpffsRoot, validator := newTestBPFFS(t)
+	pinPath := filepath.Join(bpffsRoot, pinPathPrefix)
+	runtime := newTestPinPathRuntime(t, validator, newFakePinnedMapStore())
+	t.Setenv(EnvPinPath, pinPath)
+	t.Setenv(EnvObjectPath, filepath.Join(t.TempDir(), "must-not-be-opened.o"))
+
+	coordinator, ok := NewLoader().(*fakeTCPProductionCoordinator)
+	if !ok {
+		t.Fatalf("NewLoader returned %T, want production coordinator", NewLoader())
+	}
+	loader, ok := coordinator.baseline.(LinuxLoader)
+	if !ok {
+		t.Fatalf("production baseline = %T, want LinuxLoader", coordinator.baseline)
+	}
+	loader.runtime = &runtime
+	if loader.PinPath != pinPath || !loader.objectPathFrozen {
+		t.Fatalf("production constructor did not freeze selectors: %#v", loader)
+	}
+
+	if err := loader.Apply(context.Background(), &control.State{
+		AttachmentBackend: attachmentBackendAuto,
+	}); err != nil {
+		t.Fatalf("fresh idle auto apply: %v", err)
+	}
+	if _, err := os.Lstat(runtime.lockRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fresh idle auto created a lock root: %v", err)
+	}
+	if _, err := os.Lstat(runtime.ownerRoot); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fresh idle auto created an owner root: %v", err)
+	}
+	if _, err := os.Lstat(pinPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fresh idle auto created a pin directory: %v", err)
+	}
+}
+
+func TestDurableAutoBackendKeepsClassicOwner(t *testing.T) {
+	bpffsRoot, validator := newTestBPFFS(t)
+	pinPath := filepath.Join(bpffsRoot, pinPathPrefix)
+	mapStore := writeCanonicalMockPins(t, pinPath)
+	runtime := newTestPinPathRuntime(t, validator, mapStore)
+	validated, err := validatePinPath(pinPath, runtime.validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := openPinPathParent(pinPath, validated, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerMaps := make([]pinOwnerMapIdentity, 0, len(pinnedMapDescriptors()))
+	for _, descriptor := range pinnedMapDescriptors() {
+		ownerMaps = append(ownerMaps, pinOwnerMapIdentity{
+			Name: descriptor.name,
+			ID:   mapStore.observations[descriptor.name].id,
+		})
+	}
+	record, err := newClassicActivePinOwnerRecord(
+		parent,
+		[32]byte{1},
+		"12345678-1234-1234-1234-123456789abc",
+		time.Date(2026, 8, 11, 1, 2, 3, 0, time.UTC),
+		1,
+		ownerMaps,
+		nil,
+	)
+	if err != nil {
+		_ = parent.Close()
+		t.Fatal(err)
+	}
+	store, err := openPinOwnerStore(runtime, parent.resource, true)
+	if err != nil {
+		_ = parent.Close()
+		t.Fatal(err)
+	}
+	if err := store.Persist(record, nil, parent.mountID); err != nil {
+		_ = store.Close()
+		_ = parent.Close()
+		t.Fatal(err)
+	}
+	loaded, err := store.Load(parent.mountID)
+	if err != nil {
+		_ = store.Close()
+		_ = parent.Close()
+		t.Fatal(err)
+	}
+	if !sameExpectedOwnerRecord(loaded, record) {
+		_ = store.Close()
+		_ = parent.Close()
+		t.Fatalf("persisted classic owner changed across load: got=%#v want=%#v", loaded, record)
+	}
+	if err := store.Close(); err != nil {
+		_ = parent.Close()
+		t.Fatal(err)
+	}
+	if err := parent.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	loader := LinuxLoader{PinPath: pinPath, runtime: &runtime}
+	backend, exists, err := loader.durableAutoBackend(context.Background(), runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || backend != classicTCBackend {
+		t.Fatalf("durable auto backend = %q exists=%v, want classic owner", backend, exists)
+	}
+}
+
+func TestDurableAutoBackendHonorsExplicitLegacyAdoption(t *testing.T) {
+	bpffsRoot, validator := newTestBPFFS(t)
+	pinPath := filepath.Join(bpffsRoot, pinPathPrefix)
+	writeCanonicalMockPins(t, pinPath)
+	runtime := newTestPinPathRuntime(t, validator, newFakePinnedMapStore())
+	loader := LinuxLoader{
+		PinPath:         pinPath,
+		AdoptLegacyPins: true,
+		runtime:         &runtime,
+	}
+	backend, exists, err := loader.durableAutoBackend(context.Background(), runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !exists || backend != classicTCBackend {
+		t.Fatalf("legacy adoption backend = %q exists=%v, want classic", backend, exists)
+	}
+}
+
+func TestDurableAutoTCXOwnerStillPreflightsBeforeObjectLoad(t *testing.T) {
+	bpffsRoot, validator := newTestBPFFS(t)
+	pinPath := filepath.Join(bpffsRoot, pinPathPrefix)
+	mapStore := writeCanonicalMockPins(t, pinPath)
+	runtime := newTestPinPathRuntime(t, validator, mapStore)
+	validated, err := validatePinPath(pinPath, runtime.validator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parent, err := openPinPathParent(pinPath, validated, runtime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ownerMaps := make([]pinOwnerMapIdentity, 0, len(pinnedMapDescriptors()))
+	for _, descriptor := range pinnedMapDescriptors() {
+		ownerMaps = append(ownerMaps, pinOwnerMapIdentity{
+			Name: descriptor.name,
+			ID:   mapStore.observations[descriptor.name].id,
+		})
+	}
+	record, err := newActivePinOwnerRecord(
+		parent,
+		[32]byte{2},
+		"12345678-1234-1234-1234-123456789abc",
+		time.Date(2026, 8, 11, 1, 2, 3, 0, time.UTC),
+		1,
+		ownerMaps,
+		nil,
+	)
+	if err != nil {
+		_ = parent.Close()
+		t.Fatal(err)
+	}
+	store, err := openPinOwnerStore(runtime, parent.resource, true)
+	if err != nil {
+		_ = parent.Close()
+		t.Fatal(err)
+	}
+	if err := store.Persist(record, nil, parent.mountID); err != nil {
+		_ = store.Close()
+		_ = parent.Close()
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		_ = parent.Close()
+		t.Fatal(err)
+	}
+	if err := parent.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	queries := 0
+	runtime.exactTCX = exactTCXRuntime{
+		query: func(int, ebpf.AttachType) (exactTCXQuery, error) {
+			queries++
+			return exactTCXQuery{}, unix.EOPNOTSUPP
+		},
+		attach: func(int, ebpf.AttachType, uint64, exactTCXProgram) (exactTCXKernelLink, error) {
+			return nil, errors.New("unexpected attach")
+		},
+		loadPinned: func(string) (exactTCXKernelLink, error) {
+			return nil, errors.New("unexpected load")
+		},
+	}
+	loader := LinuxLoader{
+		PinPath:    pinPath,
+		ObjectPath: filepath.Join(t.TempDir(), "must-not-be-loaded.o"),
+		runtime:    &runtime,
+	}
+	err = loader.Apply(context.Background(), backendTestState(attachmentBackendAuto))
+	if err == nil || !strings.Contains(err.Error(), "preflight exact TCX") {
+		t.Fatalf("durable TCX preflight error = %v", err)
+	}
+	if queries != 1 {
+		t.Fatalf("durable TCX preflight queries = %d, want 1", queries)
+	}
+}
+
+func TestAttachmentBackendForOwnerVersion(t *testing.T) {
+	for version, want := range map[int]string{
+		pinOwnerLegacyClassicVersion: classicTCBackend,
+		pinOwnerRecordVersion:        exactTCXBackend,
+	} {
+		got, err := attachmentBackendForOwnerVersion(version)
+		if err != nil || got != want {
+			t.Fatalf("owner schema %d backend = %q, %v; want %q", version, got, err, want)
+		}
+	}
+	if _, err := attachmentBackendForOwnerVersion(99); err == nil {
+		t.Fatal("unsupported owner schema was accepted")
+	}
+}
+
+func TestResolveAttachmentBackendRejectsDuplicateTCXIdentity(t *testing.T) {
+	queries := 0
+	runtime := exactTCXRuntime{
+		query: func(int, ebpf.AttachType) (exactTCXQuery, error) {
+			queries++
+			return exactTCXQuery{
+				Revision: 1,
+				Programs: []exactTCXQueryProgram{
+					{LinkID: 41, ProgramID: 51},
+					{LinkID: 41, ProgramID: 52},
+				},
+			}, nil
+		},
+		attach: func(int, ebpf.AttachType, uint64, exactTCXProgram) (exactTCXKernelLink, error) {
+			return nil, errors.New("unexpected attach")
+		},
+		loadPinned: func(string) (exactTCXKernelLink, error) {
+			return nil, errors.New("unexpected load")
+		},
+	}
+	got, err := resolveAttachmentBackend(backendTestState(attachmentBackendAuto), runtime)
+	if err == nil || !strings.Contains(err.Error(), "repeats link ID") {
+		t.Fatalf("resolve error = %v, want duplicate identity rejection", err)
+	}
+	if got != "" || queries != 1 {
+		t.Fatalf("resolved backend/queries = %q/%d, want empty/1", got, queries)
+	}
+}
 
 func TestApplyRefusesLegacyAdoptionBeforeRuntimeAccess(t *testing.T) {
 	loader := LinuxLoader{AdoptLegacyPins: true}
-	err := loader.Apply(context.Background(), &control.State{})
+	err := loader.Apply(context.Background(), &control.State{AttachmentBackend: exactTCXBackend})
 	if err == nil || !strings.Contains(err.Error(), "detach with a trusted legacy build") {
 		t.Fatalf("legacy adoption error = %v", err)
 	}

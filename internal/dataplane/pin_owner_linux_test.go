@@ -4,11 +4,14 @@ package dataplane
 
 import (
 	"bytes"
+	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"maps"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -131,7 +134,7 @@ func TestPinOwnerJSONFieldOrderAndCanonicalUTC(t *testing.T) {
 	}
 }
 
-func TestPinOwnerV3ClassicSchemaIsDecodedThenExplicitlyRefused(t *testing.T) {
+func TestPinOwnerV3ClassicSchemaIsDecodedAndValidated(t *testing.T) {
 	_, parent, current := testPinOwnerRecord(t, t.TempDir())
 	legacy := clonePinOwnerRecord(current)
 	legacy.Version = pinOwnerLegacyClassicVersion
@@ -165,8 +168,213 @@ func TestPinOwnerV3ClassicSchemaIsDecodedThenExplicitlyRefused(t *testing.T) {
 	if err != nil {
 		t.Fatalf("v3 schema must remain decodable for an explicit compatibility error: %v", err)
 	}
-	if err := validatePinOwnerRecord(decoded, parent.resource, parent.mountID); !errors.Is(err, errLegacyClassicOwnerRequiresMigration) {
-		t.Fatalf("legacy v3 validation error = %v", err)
+	if err := validatePinOwnerRecord(decoded, parent.resource, parent.mountID); err != nil {
+		t.Fatalf("classic v3 validation error = %v", err)
+	}
+	withLink := clonePinOwnerRecord(decoded)
+	withLink.ActiveLinks = []exactTCXBinding{testExactTCXBinding(11, exactTCXIngress, 77)}
+	withLink.ActiveLinks[0].LinkID = 99
+	if err := validatePinOwnerRecord(withLink, parent.resource, parent.mountID); err == nil ||
+		!strings.Contains(err.Error(), "must not contain TCX links") {
+		t.Fatalf("classic v3 accepted a TCX link: %v", err)
+	}
+	withClassicFilter := clonePinOwnerRecord(current)
+	withClassicFilter.ActiveFilters = slices.Clone(decoded.ActiveFilters)
+	if err := validatePinOwnerRecord(withClassicFilter, parent.resource, parent.mountID); err == nil ||
+		!strings.Contains(err.Error(), "must not contain classic TC filters") {
+		t.Fatalf("TCX v4 accepted a classic filter: %v", err)
+	}
+}
+
+func TestHistoricalPinOwnerV3WireAndIndexDigestRemainStable(t *testing.T) {
+	const historical = "{\"version\":3,\"sequence\":7,\"resource_key\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"parent_device\":1,\"parent_inode\":2,\"pin_basename\":\"wg-mix-ebpf\",\"pin_path\":\"/sys/fs/bpf/wg-mix-ebpf\",\"bpffs_root_path\":\"/sys/fs/bpf\",\"bpffs_mount_ids\":[101],\"boot_id\":\"12345678-1234-1234-1234-123456789abc\",\"token\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"created_at\":\"2026-01-02T03:04:05Z\",\"updated_at\":\"2026-01-02T03:04:06Z\",\"phase\":\"active\",\"step\":\"ready\",\"active_generation\":1,\"next_generation\":0,\"maps\":[],\"active_filters\":[],\"desired_filters\":[],\"program_stages\":[],\"map_stages\":[],\"retired_from_resource_key\":\"\",\"retired_from_boot_id\":\"\"}\n"
+	const historicalDigest = "fa07f5169d4d5001afe832330247a2792192ab5397e5901dbe1042ae6d551896"
+
+	path := filepath.Join(t.TempDir(), "historical-v3.owner.json")
+	if err := os.WriteFile(path, []byte(historical), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := readPinOwnerRecord(file)
+	closeErr := file.Close()
+	if err != nil || closeErr != nil {
+		t.Fatalf("read historical v3 owner: %v / close: %v", err, closeErr)
+	}
+	remarshaled, err := marshalPinOwnerRecord(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(remarshaled, []byte(historical)) {
+		t.Fatalf("historical v3 owner wire drifted:\n got %s\nwant %s", remarshaled, historical)
+	}
+	sum := fmt.Sprintf("%x", sha256.Sum256(remarshaled))
+	if sum != historicalDigest {
+		t.Fatalf("historical v3 digest = %s, want %s", sum, historicalDigest)
+	}
+	entry := pinOwnerIndexEntry{
+		ResourceKey:    record.ResourceKey,
+		ParentDevice:   record.ParentDevice,
+		ParentInode:    record.ParentInode,
+		PinBaseName:    record.PinBaseName,
+		BPFFSRootPath:  record.BPFFSRootPath,
+		BPFFSMountIDs:  slices.Clone(record.BPFFSMountIDs),
+		BootID:         record.BootID,
+		RecordFileName: record.ResourceKey + ".owner.json",
+		OwnerDigest:    historicalDigest,
+		Status:         pinOwnerIndexActive,
+	}
+	index := &pinOwnerIndex{
+		Version: pinOwnerIndexVersion,
+		Active:  []pinOwnerIndexActivePointer{activePointerFromEntry(entry)},
+		Entries: []pinOwnerIndexEntry{entry},
+	}
+	if _, err := activeIndexedOwnerForRecordInIndex(index, record); err != nil {
+		t.Fatalf("historical v3 owner no longer matches its durable index: %v", err)
+	}
+}
+
+func TestOwnerRecoveryEntrypointsRejectTheOtherBackend(t *testing.T) {
+	_, _, tcx := testPinOwnerRecord(t, t.TempDir())
+	classic := clonePinOwnerRecord(tcx)
+	classic.Version = pinOwnerLegacyClassicVersion
+	if _, err := recoverPinOwnerTransaction(
+		&pinPathHandle{},
+		&pinOwnerStore{},
+		tcx,
+		tcRuntime{},
+	); err == nil || !strings.Contains(err.Error(), "requires schema 3") {
+		t.Fatalf("classic recovery accepted TCX owner: %v", err)
+	}
+	if _, err := recoverExactPinOwnerTransaction(
+		context.Background(),
+		&pinPathHandle{},
+		&pinOwnerStore{},
+		classic,
+		exactTCXRuntime{},
+	); err == nil || !strings.Contains(err.Error(), "requires schema 4") {
+		t.Fatalf("TCX recovery accepted classic owner: %v", err)
+	}
+}
+
+func TestClassicPinOwnerApplyAndDetachTransitions(t *testing.T) {
+	_, parent, base := testPinOwnerRecord(t, t.TempDir())
+	token := mustPinOwnerToken(t, base)
+	activeFilters := []tcFilterBinding{
+		{
+			IfIndex: 11, Direction: "ingress", Parent: canonicalTCFilterSlots()[0].parent,
+			Handle: ingressHandle, Priority: filterPriority, ProgramID: 701,
+		},
+		{
+			IfIndex: 11, Direction: "egress", Parent: canonicalTCFilterSlots()[1].parent,
+			Handle: egressHandle, Priority: filterPriority, ProgramID: 702,
+		},
+	}
+	active, err := newClassicActivePinOwnerRecord(
+		parent,
+		token,
+		base.BootID,
+		time.Date(2026, 8, 11, 1, 2, 3, 0, time.UTC),
+		base.ActiveGeneration,
+		base.Maps,
+		activeFilters,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if active.Version != pinOwnerLegacyClassicVersion ||
+		!slices.Equal(active.ActiveFilters, activeFilters) ||
+		len(active.ActiveLinks) != 0 {
+		t.Fatalf("classic active owner = %#v", active)
+	}
+
+	desiredFilters := slices.Clone(activeFilters)
+	desiredFilters[0].ProgramID = 801
+	desiredFilters[1].ProgramID = 802
+	applying, err := newClassicApplyingPinOwnerRecord(
+		parent,
+		token,
+		active.BootID,
+		time.Date(2026, 8, 11, 1, 2, 4, 0, time.UTC),
+		active.ActiveGeneration,
+		active.ActiveGeneration+1,
+		active.Maps,
+		active.ActiveFilters,
+		desiredFilters,
+		active,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(applying.ProgramStages) != 4 {
+		t.Fatalf("classic applying program stages = %d, want 4", len(applying.ProgramStages))
+	}
+	completed := completeApplyingPinOwnerRecord(
+		applying,
+		time.Date(2026, 8, 11, 1, 2, 5, 0, time.UTC),
+	)
+	if err := validatePinOwnerRecord(completed, parent.resource, parent.mountID); err != nil {
+		t.Fatalf("validate completed classic owner: %v", err)
+	}
+	if !slices.Equal(completed.ActiveFilters, desiredFilters) ||
+		len(completed.DesiredFilters) != 0 ||
+		len(completed.ProgramStages) != 0 ||
+		completed.ActiveGeneration != applying.NextGeneration {
+		t.Fatalf("completed classic owner = %#v", completed)
+	}
+
+	detaching, err := newDetachingPinOwnerRecord(
+		completed,
+		time.Date(2026, 8, 11, 1, 2, 6, 0, time.UTC),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(detaching.ProgramStages) != 2 ||
+		len(detaching.MapStages) != len(pinnedMapDescriptors()) {
+		t.Fatalf(
+			"classic detach stages = programs:%d maps:%d",
+			len(detaching.ProgramStages), len(detaching.MapStages),
+		)
+	}
+	if err := validatePinOwnerRecord(detaching, parent.resource, parent.mountID); err != nil {
+		t.Fatalf("validate classic detach: %v", err)
+	}
+}
+
+func TestClassicPinOwnerAbortPreservesActiveFilters(t *testing.T) {
+	_, parent, base := testPinOwnerRecord(t, t.TempDir())
+	token := mustPinOwnerToken(t, base)
+	activeFilters := []tcFilterBinding{{
+		IfIndex: 19, Direction: "ingress", Parent: canonicalTCFilterSlots()[0].parent,
+		Handle: ingressHandle, Priority: filterPriority, ProgramID: 901,
+	}}
+	active, err := newClassicActivePinOwnerRecord(
+		parent, token, base.BootID, time.Now().UTC(), 7, base.Maps, activeFilters,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	desired := slices.Clone(activeFilters)
+	desired[0].ProgramID = 902
+	applying, err := newClassicApplyingPinOwnerRecord(
+		parent, token, active.BootID, time.Now().UTC(), 7, 8,
+		active.Maps, active.ActiveFilters, desired, active,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	aborted, err := abortApplyingPinOwnerRecord(applying, time.Now().UTC())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(aborted.ActiveFilters, activeFilters) ||
+		len(aborted.DesiredFilters) != 0 ||
+		len(aborted.ProgramStages) != 0 ||
+		aborted.ActiveGeneration != active.ActiveGeneration {
+		t.Fatalf("aborted classic owner = %#v", aborted)
 	}
 }
 

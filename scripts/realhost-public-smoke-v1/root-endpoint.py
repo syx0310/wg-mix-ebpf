@@ -32,6 +32,8 @@ ROLE = {
         "peer_address": "10.203.82.2",
         "listen_port": 31882,
         "fwmark": "0x51820001",
+        "attachment_backend": "tcx",
+        "minimum_kernel": (6, 6),
     },
     "public": {
         "host": None,
@@ -41,10 +43,11 @@ ROLE = {
         "peer_address": "10.203.82.1",
         "listen_port": 31155,
         "fwmark": "0x51820002",
+        "attachment_backend": "classic_tc",
+        "minimum_kernel": (5, 15),
     },
 }
 TOOLS = {
-    "bpftool": "/usr/sbin/bpftool",
     "ip": "/usr/sbin/ip",
     "ping": "/usr/bin/ping",
     "python": "/usr/bin/python3",
@@ -256,7 +259,7 @@ def probe(role: str) -> dict[str, Any]:
         pass
     expected_host = spec["host"]
     host_ok = expected_host is None or hostname == expected_host
-    kernel_ok = kernel_tuple(release) >= (6, 6)
+    kernel_ok = kernel_tuple(release) >= spec["minimum_kernel"]
     return {
         "schema": "wg-mix-public-endpoint-probe-v1",
         "role": role,
@@ -268,7 +271,9 @@ def probe(role: str) -> dict[str, Any]:
         "host_identity_ok": host_ok,
         "tools_missing": missing,
         "bpffs": bpffs,
-        "tcx_kernel_floor": kernel_ok,
+        "attachment_backend": spec["attachment_backend"],
+        "minimum_kernel": ".".join(str(value) for value in spec["minimum_kernel"]),
+        "kernel_floor_ok": kernel_ok,
         "eligible": host_ok and not missing and bpffs and kernel_ok and link is not None,
     }
 
@@ -343,6 +348,7 @@ def prepare(args: argparse.Namespace) -> None:
         "kernel": current_probe["kernel"],
         "interface": ROLE[args.role]["interface"],
         "ifindex": current_probe["ifindex"],
+        "attachment_backend": current_probe["attachment_backend"],
         "script_sha256": args.script_sha256,
         "binary_sha256": args.binary_sha256,
         "object_sha256": args.object_sha256,
@@ -409,6 +415,7 @@ fwmark_policy:
   mode: config-required
 runtime:
   poll_interval: 5s
+  attachment_backend: {spec['attachment_backend']}
   require_nonzero_fwmark: true
   strict_runtime_fwmark: true
   allow_zero_fwmark_fallback: false
@@ -452,7 +459,7 @@ def binary_command(root: Path, argv: list[str], timeout: int = 120) -> bytes:
 
 def verify_host(owner: dict[str, Any]) -> None:
     current = probe(owner["role"])
-    for key in ("hostname", "kernel", "interface", "ifindex"):
+    for key in ("hostname", "kernel", "interface", "ifindex", "attachment_backend"):
         if current.get(key) != owner.get(key):
             stop(f"host-drift:{key}", 79)
     if not current["eligible"]:
@@ -485,6 +492,7 @@ def apply_endpoint(args: argparse.Namespace) -> None:
         "alias": f"wg-mix-public-smoke:{args.run_id}:{args.role}",
         "pin_path": str(pin_path),
         "peer_public_key": args.peer_public_key,
+        "attachment_backend": spec["attachment_backend"],
     }
     write_new(root / "intent.json", (json.dumps(intent, sort_keys=True) + "\n").encode(), 0o600)
     command([TOOLS["ip"], "link", "add", "dev", wg_name, "type", "wireguard"])
@@ -547,9 +555,13 @@ def apply_endpoint(args: argparse.Namespace) -> None:
         or len(underlays) != 1
         or not underlays[0].get("ingress_attached")
         or not underlays[0].get("egress_attached")
-        or any(item.get("backend") != "tcx" for item in underlays[0].get("filters", []))
+        or len(underlays[0].get("filters", [])) != 2
+        or any(
+            item.get("backend") != spec["attachment_backend"]
+            for item in underlays[0].get("filters", [])
+        )
     ):
-        stop("tcx-postcondition", 79)
+        stop("attachment-postcondition", 79)
     write_new(
         root / "applied.json",
         (json.dumps({"status": "applied", **intent}, sort_keys=True) + "\n").encode(),
@@ -753,6 +765,7 @@ def sample(args: argparse.Namespace) -> None:
         "wg_rx": int(transfer[1]),
         "wg_tx": int(transfer[2]),
         "latest_handshake": int(handshake[1]),
+        "attachment_backend": spec["attachment_backend"],
         "rewrite_success": int(stats.get("egress_rewrite_ok", 0))
         + int(stats.get("ingress_rewrite_ok", 0)),
         "error_total": sum(int(stats.get(name, 0)) for name in error_names),
