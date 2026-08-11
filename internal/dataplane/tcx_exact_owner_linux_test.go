@@ -528,7 +528,6 @@ func TestExactTCXPinFailureRetiresJournaledUnpinnedLink(t *testing.T) {
 	}
 	wantTail := []string{
 		"pin",
-		fmt.Sprintf("detach:%d", kernel.nextID),
 		fmt.Sprintf("close:%d", kernel.nextID),
 		"query",
 	}
@@ -537,18 +536,15 @@ func TestExactTCXPinFailureRetiresJournaledUnpinnedLink(t *testing.T) {
 	}
 }
 
-func TestExactTCXPinDetachCloseFailureRetainsOwnerAndBlocksDuplicate(t *testing.T) {
+func TestExactTCXPinCloseFailureRetainsOwnerAndBlocksDuplicate(t *testing.T) {
 	kernel := newFakeExactTCXKernel()
 	binding := testExactTCXBinding(111, exactTCXIngress, 45)
 	pinPath := "/sys/fs/bpf/wg-mix-ebpf-retained/" + binding.PinName
 	pinErr := errors.New("injected pin failure")
-	detachOne := errors.New("injected first detach failure")
-	detachTwo := errors.New("injected retained detach failure")
 	closeOne := errors.New("injected first close failure")
 	closeTwo := errors.New("injected retained close failure")
 	kernel.pinErr = pinErr
 	failedID := kernel.nextID + 1
-	kernel.detachErrs[failedID] = []error{detachOne, detachTwo}
 	kernel.closeErrs[failedID] = []error{closeOne, closeTwo}
 	journal := &fakeExactTCXJournal{events: &kernel.events}
 
@@ -556,8 +552,7 @@ func TestExactTCXPinDetachCloseFailureRetainsOwnerAndBlocksDuplicate(t *testing.
 		t.Context(), binding, pinPath,
 		exactTCXProgram{id: binding.ProgramID}, journal.callbacks(), kernel.runtime(),
 	)
-	if owner != nil || !errors.Is(err, pinErr) ||
-		!errors.Is(err, detachOne) || !errors.Is(err, closeOne) {
+	if owner != nil || !errors.Is(err, pinErr) || !errors.Is(err, closeOne) {
 		t.Fatalf("first failed stage owner=%#v error=%v", owner, err)
 	}
 	if state := kernel.links[failedID]; state == nil || !state.attached || state.fdRefs != 1 {
@@ -569,7 +564,7 @@ func TestExactTCXPinDetachCloseFailureRetainsOwnerAndBlocksDuplicate(t *testing.
 		t.Context(), binding, pinPath,
 		exactTCXProgram{id: binding.ProgramID}, journal.callbacks(), kernel.runtime(),
 	)
-	if owner != nil || !errors.Is(err, detachTwo) || !errors.Is(err, closeTwo) {
+	if owner != nil || !errors.Is(err, closeTwo) {
 		t.Fatalf("retained retry owner=%#v error=%v", owner, err)
 	}
 	if len(kernel.links) != 1 || !kernel.links[failedID].attached {
@@ -617,35 +612,30 @@ func TestExactTCXRollbackPreservesConcurrentForeignLink(t *testing.T) {
 	}
 }
 
-func TestExactTCXRollbackFallsBackWhenLinkDetachIsUnsupported(t *testing.T) {
-	for _, detachErr := range []error{unix.EINVAL, ciliumlink.ErrNotSupported} {
-		t.Run(detachErr.Error(), func(t *testing.T) {
-			kernel := newFakeExactTCXKernel()
-			journal := &fakeExactTCXJournal{events: &kernel.events}
-			binding := testExactTCXBinding(12, exactTCXIngress, 51)
-			owner, _ := stageTestExactTCX(t, kernel, binding, journal)
-			ownedID := owner.binding.LinkID
-			foreignID := kernel.addLink(12, ebpf.AttachTCXIngress, 999)
-			kernel.detachErrs[ownedID] = []error{detachErr}
+func TestExactTCXRollbackUsesVerifiedUnpinCloseWithoutLinkDetach(t *testing.T) {
+	kernel := newFakeExactTCXKernel()
+	journal := &fakeExactTCXJournal{events: &kernel.events}
+	binding := testExactTCXBinding(12, exactTCXIngress, 51)
+	owner, _ := stageTestExactTCX(t, kernel, binding, journal)
+	ownedID := owner.binding.LinkID
+	foreignID := kernel.addLink(12, ebpf.AttachTCXIngress, 999)
+	kernel.detachErrs[ownedID] = []error{errors.New("detach must not be called")}
 
-			if err := owner.Rollback(); err != nil {
-				t.Fatal(err)
-			}
-			if kernel.links[ownedID].attached {
-				t.Fatal("exact owned link remains attached after unpin-close fallback")
-			}
-			if !kernel.links[foreignID].attached {
-				t.Fatal("fallback detached the concurrent foreign link")
-			}
-			wantTail := []string{
-				fmt.Sprintf("detach:%d", ownedID),
-				fmt.Sprintf("unpin:%d", ownedID),
-				fmt.Sprintf("close:%d", ownedID),
-			}
-			if !slices.Equal(kernel.events[len(kernel.events)-len(wantTail):], wantTail) {
-				t.Fatalf("event tail=%v want=%v", kernel.events, wantTail)
-			}
-		})
+	if err := owner.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if kernel.links[ownedID].attached {
+		t.Fatal("exact owned link remains attached after unpin-close")
+	}
+	if !kernel.links[foreignID].attached {
+		t.Fatal("unpin-close detached the concurrent foreign link")
+	}
+	wantTail := []string{
+		fmt.Sprintf("unpin:%d", ownedID),
+		fmt.Sprintf("close:%d", ownedID),
+	}
+	if !slices.Equal(kernel.events[len(kernel.events)-len(wantTail):], wantTail) {
+		t.Fatalf("event tail=%v want=%v", kernel.events, wantTail)
 	}
 }
 
@@ -656,31 +646,30 @@ func TestExactTCXRollbackRetriesOnlyUnfinishedExactOperations(t *testing.T) {
 		t, kernel, testExactTCXBinding(13, exactTCXEgress, 61), journal,
 	)
 	id := owner.binding.LinkID
-	detachErr := errors.New("injected exact detach failure")
 	unpinErr := errors.New("injected exact unpin failure")
-	kernel.detachErrs[id] = []error{detachErr}
+	closeErr := errors.New("injected exact close failure")
 	kernel.unpinErrs[id] = []error{unpinErr}
+	kernel.closeErrs[id] = []error{closeErr}
 
-	if err := owner.Rollback(); !errors.Is(err, detachErr) {
+	if err := owner.Rollback(); !errors.Is(err, unpinErr) {
 		t.Fatalf("first rollback=%v", err)
 	}
 	if !owner.pinned || owner.detached || !kernel.links[id].attached {
-		t.Fatalf("owner after detach failure=%+v link=%+v", owner, kernel.links[id])
+		t.Fatalf("owner after unpin failure=%+v link=%+v", owner, kernel.links[id])
 	}
-	if err := owner.Rollback(); !errors.Is(err, unpinErr) {
+	if err := owner.Rollback(); !errors.Is(err, closeErr) {
 		t.Fatalf("second rollback=%v", err)
 	}
-	if !owner.pinned || !owner.detached || kernel.links[id].attached {
-		t.Fatalf("owner after unpin failure=%+v link=%+v", owner, kernel.links[id])
+	if owner.pinned || owner.detached || !kernel.links[id].attached {
+		t.Fatalf("owner after close failure=%+v link=%+v", owner, kernel.links[id])
 	}
 	if err := owner.Rollback(); err != nil {
 		t.Fatalf("third rollback=%v", err)
 	}
 	wantTail := []string{
-		fmt.Sprintf("detach:%d", id),
-		fmt.Sprintf("detach:%d", id),
 		fmt.Sprintf("unpin:%d", id),
 		fmt.Sprintf("unpin:%d", id),
+		fmt.Sprintf("close:%d", id),
 		fmt.Sprintf("close:%d", id),
 	}
 	if !slices.Equal(kernel.events[len(kernel.events)-len(wantTail):], wantTail) {

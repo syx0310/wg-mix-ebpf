@@ -846,10 +846,6 @@ func (owner *exactTCXAttachment) closeUnpinnedAfterFailure() (bool, error) {
 	if owner.pinned || owner.link == nil || owner.binding.LinkID == 0 {
 		return false, errors.New("failed exact TCX owner is not an identifiable unpinned link")
 	}
-	var detachErr error
-	if !owner.detached {
-		owner.detached, detachErr = detachExactTCXLinkIfSupported(owner.link)
-	}
 	closeErr := owner.link.Close()
 	if closeErr == nil {
 		owner.link = nil
@@ -863,7 +859,6 @@ func (owner *exactTCXAttachment) closeUnpinnedAfterFailure() (bool, error) {
 	}
 	complete := owner.closed && queryErr == nil
 	return complete, errors.Join(
-		wrapExactTCXCleanupError("detach failed unpinned exact TCX link", detachErr),
 		wrapExactTCXCleanupError("close failed unpinned exact TCX link", closeErr),
 		queryErr,
 	)
@@ -876,27 +871,10 @@ func wrapExactTCXCleanupError(operation string, err error) error {
 	return fmt.Errorf("%s: %w", operation, err)
 }
 
-func detachExactTCXLinkIfSupported(link exactTCXKernelLink) (bool, error) {
-	if link == nil {
-		return false, errors.New("exact TCX link is nil")
-	}
-	if err := link.Detach(); err != nil {
-		// BPF_LINK_DETACH is not implemented for every bpf_link type on every
-		// kernel which supports TCX. After the exact pin identity is checked,
-		// unpinning and closing our held FD drops the last reference to this
-		// exact link without addressing a shared TC slot or a foreign link.
-		if errors.Is(err, ciliumlink.ErrNotSupported) || errors.Is(err, unix.EINVAL) {
-			return false, nil
-		}
-		return false, err
-	}
-	return true, nil
-}
-
 // Rollback retires the exact bpf_link through its held FD and verified pin. It
-// prefers BPF_LINK_DETACH, but kernels which reject that command for TCX fall
-// back to unpin plus close. Neither path addresses a TC slot by
-// ifindex/priority/handle, so a foreign link in the same direction is safe.
+// removes that pin and closes the held FD, which is the bpf_link lifecycle
+// operation guaranteed to break an unpinned link. It never addresses a TC slot
+// by ifindex/priority/handle, so a foreign link in the same direction is safe.
 // TCX rollback also never touches clsact.
 func (owner *exactTCXAttachment) Rollback() error {
 	if owner == nil {
@@ -912,15 +890,8 @@ func (owner *exactTCXAttachment) Rollback() error {
 	}
 	if owner.pinned && owner.recheckPin != nil {
 		if err := owner.recheckPin(); err != nil {
-			return fmt.Errorf("recheck exact TCX pin %d before detach: %w", owner.binding.LinkID, err)
+			return fmt.Errorf("recheck exact TCX pin %d before retirement: %w", owner.binding.LinkID, err)
 		}
-	}
-	if !owner.detached {
-		detached, err := detachExactTCXLinkIfSupported(owner.link)
-		if err != nil {
-			return fmt.Errorf("detach exact TCX link %d: %w", owner.binding.LinkID, err)
-		}
-		owner.detached = detached
 	}
 	if owner.pinned {
 		if owner.recheckPin != nil {
@@ -929,12 +900,12 @@ func (owner *exactTCXAttachment) Rollback() error {
 			}
 		}
 		if err := owner.link.Unpin(); err != nil {
-			return fmt.Errorf("unpin detached exact TCX link %d: %w", owner.binding.LinkID, err)
+			return fmt.Errorf("unpin exact TCX link %d: %w", owner.binding.LinkID, err)
 		}
 		owner.pinned = false
 	}
 	if err := owner.link.Close(); err != nil {
-		return fmt.Errorf("close detached exact TCX link %d: %w", owner.binding.LinkID, err)
+		return fmt.Errorf("close unpinned exact TCX link %d: %w", owner.binding.LinkID, err)
 	}
 	owner.detached = true
 	owner.link = nil

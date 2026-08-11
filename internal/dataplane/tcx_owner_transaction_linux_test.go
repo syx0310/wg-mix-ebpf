@@ -201,6 +201,20 @@ func retainedUnpinnedExactTCXOwnerCount(pinPath string) int {
 	return len(retainedUnpinnedExactTCXOwners.byPinPath[pinPath])
 }
 
+func forceDetachedPinnedExactTCXForTest(
+	t *testing.T,
+	owner *exactTCXAttachment,
+) {
+	t.Helper()
+	if owner == nil || owner.link == nil || !owner.pinned {
+		t.Fatal("test requires a live pinned exact TCX owner")
+	}
+	if err := owner.link.Detach(); err != nil {
+		t.Fatal(err)
+	}
+	owner.detached = true
+}
+
 func persistDetachedDesiredExactTCX(
 	t *testing.T,
 	fixture *exactTCXOwnerTestFixture,
@@ -220,6 +234,7 @@ func persistDetachedDesiredExactTCX(
 	if err := fixture.store.Persist(published, record, fixture.handle.mountID); err != nil {
 		t.Fatal(err)
 	}
+	forceDetachedPinnedExactTCXForTest(t, owner)
 	injected := errors.New("hold detached exact TCX pin")
 	kernel.unpinErrs[owner.binding.LinkID] = []error{injected}
 	if err := owner.Rollback(); !errors.Is(err, injected) {
@@ -249,6 +264,7 @@ func persistDetachedActiveReplacementExactTCX(
 	record := fixture.mutatingRecord(
 		t, []exactTCXBinding{active}, []exactTCXBinding{desired},
 	)
+	forceDetachedPinnedExactTCXForTest(t, owner)
 	injected := errors.New("hold detached active exact TCX pin")
 	kernel.unpinErrs[active.LinkID] = []error{injected}
 	if err := owner.Rollback(); !errors.Is(err, injected) {
@@ -507,6 +523,7 @@ func TestConvergeOwnerExactTCXReattachesAfterRecordedLinkDetachedBeforeUnpin(t *
 		t.Fatal(err)
 	}
 	record = published
+	forceDetachedPinnedExactTCXForTest(t, owner)
 	injected := errors.New("injected crash after detach before unpin")
 	kernel.unpinErrs[oldLinkID] = []error{injected}
 	if err := owner.Rollback(); !errors.Is(err, injected) {
@@ -553,6 +570,7 @@ func TestConvergeOwnerExactTCXReplacesDetachedActiveWithoutTouchingReusedSlot(t 
 	record := fixture.mutatingRecord(
 		t, []exactTCXBinding{active}, []exactTCXBinding{desired},
 	)
+	forceDetachedPinnedExactTCXForTest(t, owner)
 	unpinErr := errors.New("injected crash after active detach")
 	kernel.unpinErrs[active.LinkID] = []error{unpinErr}
 	if err := owner.Rollback(); !errors.Is(err, unpinErr) {
@@ -1607,17 +1625,15 @@ func TestRollbackExactOwnerApplyRetriesRetainedTargetOnlyOwner(t *testing.T) {
 	mutating := fixture.mutatingRecord(t, nil, []exactTCXBinding{target})
 	failedID := kernel.nextID + 1
 	pinErr := errors.New("injected target-only pin failure")
-	detachErr := errors.New("injected target-only detach failure")
 	closeErr := errors.New("injected target-only close failure")
 	kernel.pinErr = pinErr
-	kernel.detachErrs[failedID] = []error{detachErr}
 	kernel.closeErrs[failedID] = []error{closeErr}
 
 	failed, err := convergeOwnerApplyExactTCXLinks(
 		t.Context(), fixture.handle, fixture.store, mutating,
 		fakeLoadedOwnerPrograms(target.ProgramID), kernel.runtime(),
 	)
-	if !errors.Is(err, pinErr) || !errors.Is(err, detachErr) || !errors.Is(err, closeErr) {
+	if !errors.Is(err, pinErr) || !errors.Is(err, closeErr) {
 		t.Fatalf("target-only failed stage error=%v", err)
 	}
 	target = failed.DesiredLinks[0]
@@ -1673,19 +1689,16 @@ func TestRollbackExactOwnerApplyRetainedTargetOnlyRetryFailureFailsClosed(t *tes
 	mutating := fixture.mutatingRecord(t, nil, []exactTCXBinding{target})
 	failedID := kernel.nextID + 1
 	pinErr := errors.New("injected target-only pin failure")
-	firstDetachErr := errors.New("injected first target-only detach failure")
-	retryDetachErr := errors.New("injected retry target-only detach failure")
 	firstCloseErr := errors.New("injected first target-only close failure")
 	retryCloseErr := errors.New("injected retry target-only close failure")
 	kernel.pinErr = pinErr
-	kernel.detachErrs[failedID] = []error{firstDetachErr, retryDetachErr}
 	kernel.closeErrs[failedID] = []error{firstCloseErr, retryCloseErr}
 
 	failed, err := convergeOwnerApplyExactTCXLinks(
 		t.Context(), fixture.handle, fixture.store, mutating,
 		fakeLoadedOwnerPrograms(target.ProgramID), kernel.runtime(),
 	)
-	if !errors.Is(err, pinErr) || !errors.Is(err, firstDetachErr) || !errors.Is(err, firstCloseErr) {
+	if !errors.Is(err, pinErr) || !errors.Is(err, firstCloseErr) {
 		t.Fatalf("target-only failed stage error=%v", err)
 	}
 	target = failed.DesiredLinks[0]
@@ -1709,11 +1722,10 @@ func TestRollbackExactOwnerApplyRetainedTargetOnlyRetryFailureFailsClosed(t *tes
 		t.Context(), fixture.handle, rollingBack,
 		fakeLoadedOwnerPrograms(target.ProgramID), faults, kernel.runtime(),
 	)
-	if !errors.Is(err, retryDetachErr) || !errors.Is(err, retryCloseErr) {
+	if !errors.Is(err, retryCloseErr) {
 		t.Fatalf("retained target-only retry error=%v", err)
 	}
 	wantEvents := []string{
-		fmt.Sprintf("detach:%d", failedID),
 		fmt.Sprintf("close:%d", failedID),
 		"query",
 	}
@@ -1846,6 +1858,7 @@ func TestRemoveOwnedExactTCXRecoversDetachedPinnedBoundary(t *testing.T) {
 	journal := &fakeExactTCXJournal{events: &kernel.events}
 	owner, _ := stageTestExactTCXAtPath(t, kernel, intent, journal, fixture.handle.procPath())
 	binding := owner.binding
+	forceDetachedPinnedExactTCXForTest(t, owner)
 	injected := errors.New("injected crash before exact unpin")
 	kernel.unpinErrs[binding.LinkID] = []error{injected}
 	if err := owner.Rollback(); !errors.Is(err, injected) {
@@ -1900,6 +1913,7 @@ func TestReconcileDetachedActiveExactTCXPersistsTruthWithForeignSlotReuse(t *tes
 	if err := fixture.store.Persist(record, nil, fixture.handle.mountID); err != nil {
 		t.Fatal(err)
 	}
+	forceDetachedPinnedExactTCXForTest(t, owner)
 	unpinErr := errors.New("injected active detach crash boundary")
 	kernel.unpinErrs[active.LinkID] = []error{unpinErr}
 	if err := owner.Rollback(); !errors.Is(err, unpinErr) {
@@ -2001,6 +2015,7 @@ func TestReconcileDetachedActiveExactTCXPersistsRetiringBeforeUnpin(t *testing.T
 	if err := fixture.store.Persist(record, nil, fixture.handle.mountID); err != nil {
 		t.Fatal(err)
 	}
+	forceDetachedPinnedExactTCXForTest(t, owner)
 	injectedUnpin := errors.New("hold detached active pin")
 	kernel.unpinErrs[active.LinkID] = []error{injectedUnpin}
 	if err := owner.Rollback(); !errors.Is(err, injectedUnpin) {
@@ -2059,6 +2074,7 @@ func TestReconcileDetachedActiveExactTCXRecoversAfterTruthPersistFailure(t *test
 	if err := fixture.store.Persist(record, nil, fixture.handle.mountID); err != nil {
 		t.Fatal(err)
 	}
+	forceDetachedPinnedExactTCXForTest(t, owner)
 	injectedUnpin := errors.New("hold active pin before reconciliation")
 	kernel.unpinErrs[active.LinkID] = []error{injectedUnpin}
 	if err := owner.Rollback(); !errors.Is(err, injectedUnpin) {
@@ -2138,7 +2154,7 @@ func TestObserveExactTCXPinRejectsInodeReplacementWithoutKernelMutation(t *testi
 	}
 }
 
-func TestRollbackExactTCXRechecksAnchoredPinBeforeDetachAndUnpin(t *testing.T) {
+func TestRollbackExactTCXRechecksAnchoredPinBeforeUnpinAndClose(t *testing.T) {
 	fixture := newExactTCXOwnerTestFixture(t)
 	kernel := newFakeExactTCXKernel()
 	kernel.materializePins = true
