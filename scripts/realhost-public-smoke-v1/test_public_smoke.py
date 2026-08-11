@@ -16,6 +16,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 HERE = Path(__file__).resolve().parent
@@ -42,12 +43,17 @@ class PublicSmokeTest(unittest.TestCase):
 
     def test_canonical_resource_names_and_bounds(self) -> None:
         self.assertEqual(
-            "/run/wg-mix-ebpf-public-smoke-0123456789ab-b82",
+            "/var/tmp/wg-mix-ebpf-public-smoke-0123456789ab-b82",
             str(self.root.canonical_run_root("0123456789ab", "b82")),
         )
         with self.assertRaises(SystemExit) as caught:
             self.root.canonical_run_root("../bad", "b82")
         self.assertEqual(64, caught.exception.code)
+        self.assertEqual("wmbaaaaaaaaaaaa", self.root.staging_wg_name("a" * 64, "b82"))
+        self.assertEqual(
+            "wmpaaaaaaaaaaaa", self.controller.staging_wg_name("a" * 64, "public")
+        )
+        self.assertEqual(15, len(self.root.staging_wg_name("a" * 64, "public")))
 
     def test_report_accepts_only_fresh_bidirectional_zero_error_growth(self) -> None:
         document = {
@@ -202,7 +208,7 @@ class PublicSmokeTest(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, sources)
         endpoint = (HERE / "root-endpoint.py").read_text(encoding="utf-8")
-        self.assertIn('if verify_owned_link(root, args.run_id, args.role):', endpoint)
+        self.assertIn("owned_link, preserve_fixed = classify_owned_link(", endpoint)
         self.assertIn('command([TOOLS["ip"], "link", "delete", "dev"', endpoint)
         self.assertIn('os.unlink(root / "root-endpoint.py")', endpoint)
 
@@ -228,10 +234,15 @@ class PublicSmokeTest(unittest.TestCase):
         self.assertNotIn("subprocess.Popen", endpoint)
         self.assertNotIn("server.pid.json", endpoint)
         self.assertNotIn("capture.pid.json", endpoint)
-        self.assertIn('"alias",\n            intent["alias"],\n            "type"', endpoint)
-        self.assertNotIn(
-            '"link", "set", "dev", wg_name, "alias"', endpoint
+        add_staging = endpoint.index('"add",\n            "dev",\n            staging_name')
+        alias_staging = endpoint.index('"dev",\n            staging_name,\n            "alias"')
+        rename_fixed = endpoint.index(
+            '[TOOLS["ip"], "link", "set", "dev", staging_name, "name", wg_name]'
         )
+        configure_fixed = endpoint.index('TOOLS["wg"],\n        "set",\n        wg_name')
+        self.assertLess(add_staging, alias_staging)
+        self.assertLess(alias_staging, rename_fixed)
+        self.assertLess(rename_fixed, configure_fixed)
         self.assertIn("write_owner_new", endpoint)
         self.assertIn('"owner.pending.json"', endpoint)
         self.assertIn("acquire_service_lock(root, exclusive=True)", endpoint)
@@ -264,10 +275,7 @@ class PublicSmokeTest(unittest.TestCase):
             ),
             controller.index("return True", claimed_root),
         )
-        self.assertIn(
-            'if not partial and (\n        Path(f"/sys/class/net/{ROLE[args.role][\'wg\']}"',
-            endpoint,
-        )
+        self.assertIn("staging_name = staging_wg_name(args.claim_sha256", endpoint)
         run_start = controller.index("def run_test(")
         local_reserve = controller.index(
             "local_evidence = create_local_evidence(args.run_id)", run_start
@@ -312,6 +320,169 @@ class PublicSmokeTest(unittest.TestCase):
                 return f"{digest}  {intake}/intake-owner.json"
 
         self.controller.verify_intake_claim(Remote(), args, artifacts)
+
+    def test_pristine_unaliased_wireguard_is_recoverable_before_configuration(
+        self,
+    ) -> None:
+        claim_sha256 = "a" * 64
+        staging_name = self.root.staging_wg_name(claim_sha256, "public")
+        responses = [
+            json.dumps(
+                [
+                    {
+                        "ifname": staging_name,
+                        "flags": ["POINTOPOINT", "NOARP"],
+                        "operstate": "DOWN",
+                        "linkinfo": {"info_kind": "wireguard"},
+                    }
+                ]
+            ).encode(),
+            json.dumps([{"ifname": staging_name, "addr_info": []}]).encode(),
+            b"",
+            b"0\n",
+            b"off\n",
+        ]
+        staging_path = f"/sys/class/net/{staging_name}"
+
+        def exists(path: Path) -> bool:
+            return str(path) == staging_path
+
+        with mock.patch.object(Path, "exists", exists), mock.patch.object(
+            self.root, "command", side_effect=responses
+        ):
+            owned, preserve_fixed = self.root.classify_owned_link(
+                Path("/var/tmp/wg-mix-ebpf-public-smoke-test-public"),
+                "0123456789ab",
+                "public",
+                claim_sha256,
+            )
+        self.assertEqual(staging_name, owned)
+        self.assertFalse(preserve_fixed)
+
+    def test_fixed_name_collision_preserves_foreign_and_selects_staging(self) -> None:
+        claim_sha256 = "a" * 64
+        run_id = "0123456789ab"
+        staging_name = self.root.staging_wg_name(claim_sha256, "public")
+        expected_alias = f"wg-mix-public-smoke:{run_id}:public"
+        links = {
+            staging_name: {
+                "ifname": staging_name,
+                "ifalias": expected_alias,
+                "flags": ["POINTOPOINT", "NOARP"],
+                "operstate": "DOWN",
+                "linkinfo": {"info_kind": "wireguard"},
+            },
+            "wgps47": {
+                "ifname": "wgps47",
+                "ifalias": "foreign-service",
+                "flags": ["UP"],
+                "operstate": "UP",
+                "linkinfo": {"info_kind": "wireguard"},
+            },
+        }
+
+        def exists(path: Path) -> bool:
+            return str(path) in {
+                f"/sys/class/net/{staging_name}",
+                "/sys/class/net/wgps47",
+            }
+
+        def command(argv: list[str], **_kwargs: object) -> bytes:
+            return json.dumps([links[argv[-1]]]).encode()
+
+        with mock.patch.object(Path, "exists", exists), mock.patch.object(
+            self.root, "command", side_effect=command
+        ):
+            owned, preserve_fixed = self.root.classify_owned_link(
+                Path("/var/tmp/wg-mix-ebpf-public-smoke-test-public"),
+                run_id,
+                "public",
+                claim_sha256,
+            )
+        self.assertEqual(staging_name, owned)
+        self.assertTrue(preserve_fixed)
+
+    def test_apply_aliases_unique_staging_link_before_fixed_name(self) -> None:
+        claim_sha256 = "b" * 64
+        staging_name = self.root.staging_wg_name(claim_sha256, "public")
+        args = SimpleNamespace(
+            run_id="0123456789ab",
+            role="public",
+            commit="1" * 40,
+            claim_sha256=claim_sha256,
+            peer_public_key=base64.b64encode(b"p" * 32).decode("ascii"),
+        )
+        command_calls: list[list[str]] = []
+
+        def command(argv: list[str], **_kwargs: object) -> bytes:
+            command_calls.append(argv)
+            return b""
+
+        status = json.dumps(
+            {
+                "dataplane": {
+                    "underlays": [
+                        {
+                            "ingress_attached": True,
+                            "egress_attached": True,
+                            "filters": [
+                                {"backend": "classic_tc"},
+                                {"backend": "classic_tc"},
+                            ],
+                        }
+                    ]
+                }
+            }
+        ).encode()
+        with (
+            mock.patch.object(self.root, "require_root_directory"),
+            mock.patch.object(
+                self.root, "load_owner", return_value={"script_sha256": "c" * 64}
+            ),
+            mock.patch.object(self.root, "self_check"),
+            mock.patch.object(self.root, "artifact_check"),
+            mock.patch.object(self.root, "verify_host"),
+            mock.patch.object(Path, "exists", return_value=False),
+            mock.patch.object(self.root, "write_new"),
+            mock.patch.object(self.root, "command", side_effect=command),
+            mock.patch.object(
+                self.root, "config_bytes", return_value=(b"wg", b"agent")
+            ),
+            mock.patch.object(self.root, "binary_command", side_effect=(b"", status)),
+        ):
+            self.root.apply_endpoint(args)
+        self.assertEqual(
+            [
+                [
+                    self.root.TOOLS["ip"],
+                    "link",
+                    "add",
+                    "dev",
+                    staging_name,
+                    "type",
+                    "wireguard",
+                ],
+                [
+                    self.root.TOOLS["ip"],
+                    "link",
+                    "set",
+                    "dev",
+                    staging_name,
+                    "alias",
+                    "wg-mix-public-smoke:0123456789ab:public",
+                ],
+                [
+                    self.root.TOOLS["ip"],
+                    "link",
+                    "set",
+                    "dev",
+                    staging_name,
+                    "name",
+                    "wgps47",
+                ],
+            ],
+            command_calls[:3],
+        )
 
     def test_local_evidence_export_resumes_partial_and_linked_publish(self) -> None:
         payload = b"bounded-evidence-payload\n"

@@ -242,8 +242,15 @@ def probe_one(remote: Remote) -> dict[str, Any]:
 def remote_layout(run_id: str, role: str) -> tuple[str, str]:
     return (
         f"/tmp/wg-mix-public-smoke-{run_id}-{role}-intake",
-        f"/run/wg-mix-ebpf-public-smoke-{run_id}-{role}",
+        f"/var/tmp/wg-mix-ebpf-public-smoke-{run_id}-{role}",
     )
+
+
+def staging_wg_name(claim_sha256: str, role: str) -> str:
+    if not SHA256_RE.fullmatch(claim_sha256) or role not in ROLES:
+        stop("staging-wg", 64)
+    prefix = "wmb" if role == "b82" else "wmp"
+    return f"{prefix}{claim_sha256[:12]}"
 
 
 def sudo_endpoint(
@@ -361,11 +368,13 @@ def execution_contract(
     args: argparse.Namespace, paths: dict[str, Path], artifacts: dict[str, Any]
 ) -> dict[str, Any]:
     operations: dict[str, dict[str, list[str]]] = {}
+    claim_sha256_by_role = {
+        role: hashlib.sha256(intake_claim_bytes(args, role, artifacts)).hexdigest()
+        for role in ROLES
+    }
     for role in ROLES:
         intake, _ = remote_layout(args.run_id, role)
-        claim_sha256 = hashlib.sha256(
-            intake_claim_bytes(args, role, artifacts)
-        ).hexdigest()
+        claim_sha256 = claim_sha256_by_role[role]
         operations[role] = {
             "prepare": endpoint_argv(
                 args.run_id,
@@ -452,10 +461,12 @@ def execution_contract(
         "host_write_set": {
             "run_owned": [
                 "/tmp/wg-mix-public-smoke-<run-id>-<role>-intake",
-                "/run/wg-mix-ebpf-public-smoke-<run-id>-<role>",
+                "/var/tmp/wg-mix-ebpf-public-smoke-<run-id>-<role>",
                 "/sys/fs/bpf/wg-mix-ebpf-public-smoke-<run-id>-<role>",
                 "wireguard:wgps82",
                 "wireguard:wgps47",
+                f"wireguard:{staging_wg_name(claim_sha256_by_role['b82'], 'b82')}",
+                f"wireguard:{staging_wg_name(claim_sha256_by_role['public'], 'public')}",
                 "address:10.203.82.1/30",
                 "address:10.203.82.2/30",
                 "tcx:ens33:ingress+egress",

@@ -19,10 +19,11 @@ UDP type-word dataplane on both endpoints.
 ## Fixed safety boundary
 
 Both suites are fail-closed and use a caller-selected 12-24 lowercase hex run
-ID. Every created name contains that run ID. The root runner accepts only an
-absolute, root-owned, non-symlink copy of itself and exact artifact SHA-256
-values. It refuses pre-existing run paths, WireGuard names, BPF pin paths, or
-foreign interface state.
+ID. Every created path contains that run ID; the 15-byte staging-interface
+limit is handled with a role prefix plus a contract-bound claim digest. The
+root runner accepts only an absolute, root-owned, non-symlink copy of itself
+and exact artifact SHA-256 values. It refuses pre-existing run paths,
+WireGuard names, BPF pin paths, or foreign interface state.
 
 The public test may create only:
 
@@ -30,8 +31,9 @@ The public test may create only:
   `/private/tmp/wg-mix-public-smoke-evidence-*`;
 * one non-root intake directory per host under
   `/tmp/wg-mix-public-smoke-*-intake`;
-* one run directory per host under `/run/wg-mix-ebpf-public-smoke-*`;
-* one temporary WireGuard interface per host (`wgps82` or `wgps47`);
+* one executable run directory per host under `/var/tmp/wg-mix-ebpf-public-smoke-*`;
+* one claim-derived staging WireGuard name per host, renamed to the fixed test
+  name (`wgps82` or `wgps47`) only after its ownership alias is installed;
 * one run-owned BPF pin directory immediately below the host bpffs mount;
 * one run-owned attach-state directory;
 * bounded foreground traffic/capture commands; their SSH calls remain open,

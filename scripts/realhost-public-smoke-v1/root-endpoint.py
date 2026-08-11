@@ -111,7 +111,14 @@ def command(
 def canonical_run_root(run_id: str, role: str) -> Path:
     if not RUN_ID_RE.fullmatch(run_id) or role not in ROLE:
         stop("arguments", 64)
-    return Path(f"/run/wg-mix-ebpf-public-smoke-{run_id}-{role}")
+    return Path(f"/var/tmp/wg-mix-ebpf-public-smoke-{run_id}-{role}")
+
+
+def staging_wg_name(claim_sha256: str, role: str) -> str:
+    if not SHA256_RE.fullmatch(claim_sha256) or role not in ROLE:
+        stop("staging-wg", 64)
+    prefix = "wmb" if role == "b82" else "wmp"
+    return f"{prefix}{claim_sha256[:12]}"
 
 
 def sha256_fd(fd: int) -> str:
@@ -626,14 +633,20 @@ def apply_endpoint(args: argparse.Namespace) -> None:
         stop("peer-public-key", 64)
     spec = ROLE[args.role]
     wg_name = spec["wg"]
+    staging_name = staging_wg_name(args.claim_sha256, args.role)
     pin_path = Path(f"/sys/fs/bpf/{root.name}")
-    if Path(f"/sys/class/net/{wg_name}").exists() or pin_path.exists():
+    if (
+        Path(f"/sys/class/net/{wg_name}").exists()
+        or Path(f"/sys/class/net/{staging_name}").exists()
+        or pin_path.exists()
+    ):
         stop("apply-resource-exists", 79)
     intent = {
         "schema": "wg-mix-public-endpoint-intent-v1",
         "run_id": args.run_id,
         "role": args.role,
         "wg": wg_name,
+        "staging_wg": staging_name,
         "alias": f"wg-mix-public-smoke:{args.run_id}:{args.role}",
         "pin_path": str(pin_path),
         "peer_public_key": args.peer_public_key,
@@ -646,13 +659,23 @@ def apply_endpoint(args: argparse.Namespace) -> None:
             "link",
             "add",
             "dev",
-            wg_name,
-            "alias",
-            intent["alias"],
+            staging_name,
             "type",
             "wireguard",
         ]
     )
+    command(
+        [
+            TOOLS["ip"],
+            "link",
+            "set",
+            "dev",
+            staging_name,
+            "alias",
+            intent["alias"],
+        ]
+    )
+    command([TOOLS["ip"], "link", "set", "dev", staging_name, "name", wg_name])
     wg_argv = [
         TOOLS["wg"],
         "set",
@@ -1012,19 +1035,79 @@ def export_evidence(args: argparse.Namespace) -> None:
     )
 
 
-def verify_owned_link(root: Path, run_id: str, role: str) -> bool:
-    name = ROLE[role]["wg"]
+def read_link(name: str) -> dict[str, Any] | None:
     if not Path(f"/sys/class/net/{name}").exists():
-        return False
-    raw = command([TOOLS["ip"], "-j", "-d", "link", "show", "dev", name])
-    links = json.loads(raw)
-    if (
-        not isinstance(links, list)
-        or len(links) != 1
-        or links[0].get("ifalias") != f"wg-mix-public-smoke:{run_id}:{role}"
-    ):
+        return None
+    try:
+        links = json.loads(
+            command([TOOLS["ip"], "-j", "-d", "link", "show", "dev", name])
+        )
+    except ValueError:
         stop("restore-link-foreign", 79)
-    return True
+    if not isinstance(links, list) or len(links) != 1:
+        stop("restore-link-foreign", 79)
+    link = links[0]
+    if not isinstance(link, dict) or link.get("ifname") != name:
+        stop("restore-link-foreign", 79)
+    return link
+
+
+def pristine_unaliased_staging_link(name: str, link: dict[str, Any]) -> bool:
+    linkinfo = link.get("linkinfo")
+    flags = link.get("flags")
+    if (
+        "ifalias" in link
+        or not isinstance(linkinfo, dict)
+        or linkinfo.get("info_kind") != "wireguard"
+        or not isinstance(flags, list)
+        or any(not isinstance(flag, str) for flag in flags)
+        or "UP" in flags
+        or link.get("operstate") not in {"DOWN", "UNKNOWN"}
+    ):
+        return False
+    try:
+        addresses = json.loads(
+            command([TOOLS["ip"], "-j", "address", "show", "dev", name])
+        )
+    except ValueError:
+        return False
+    return not (
+        not isinstance(addresses, list)
+        or len(addresses) != 1
+        or not isinstance(addresses[0], dict)
+        or addresses[0].get("addr_info") not in (None, [])
+        or command([TOOLS["wg"], "show", name, "peers"]).strip()
+        or command([TOOLS["wg"], "show", name, "listen-port"]).strip() != b"0"
+        or command([TOOLS["wg"], "show", name, "fwmark"]).strip() != b"off"
+    )
+
+
+def classify_owned_link(
+    root: Path, run_id: str, role: str, claim_sha256: str
+) -> tuple[str | None, bool]:
+    fixed_name = ROLE[role]["wg"]
+    staging_name = staging_wg_name(claim_sha256, role)
+    expected_alias = f"wg-mix-public-smoke:{run_id}:{role}"
+    staging = read_link(staging_name)
+    fixed = read_link(fixed_name)
+    if staging is not None:
+        staging_owned = staging.get("ifalias") == expected_alias
+        if not staging_owned and not pristine_unaliased_staging_link(staging_name, staging):
+            stop("restore-staging-link-foreign", 79)
+        if (root / "applied.json").exists() or Path(
+            f"/sys/fs/bpf/{root.name}"
+        ).exists():
+            stop("restore-staging-state", 79)
+        if fixed is not None and fixed.get("ifalias") == expected_alias:
+            stop("restore-link-duplicate", 79)
+        return staging_name, fixed is not None
+    if fixed is None:
+        return None, False
+    if fixed.get("ifalias") == expected_alias:
+        return fixed_name, False
+    if Path(f"/sys/fs/bpf/{root.name}").exists() or (root / "applied.json").exists():
+        stop("restore-link-foreign", 79)
+    return None, True
 
 
 def restore(args: argparse.Namespace) -> None:
@@ -1063,6 +1146,13 @@ def restore(args: argparse.Namespace) -> None:
         return
     service_lock_fd = acquire_service_lock(root, exclusive=True)
     pin_path = Path(f"/sys/fs/bpf/{root.name}")
+    owned_link, preserve_fixed = classify_owned_link(
+        root, args.run_id, args.role, args.claim_sha256
+    )
+    fixed_name = ROLE[args.role]["wg"]
+    staging_name = staging_wg_name(args.claim_sha256, args.role)
+    if pin_path.exists() and (preserve_fixed or owned_link == staging_name):
+        stop("restore-resource-collision", 79)
     if pin_path.exists():
         binary_command(
             root,
@@ -1076,9 +1166,16 @@ def restore(args: argparse.Namespace) -> None:
                 str(root / "state"),
             ],
         )
-    if verify_owned_link(root, args.run_id, args.role):
-        command([TOOLS["ip"], "link", "delete", "dev", ROLE[args.role]["wg"]])
-    if pin_path.exists() or Path(f"/sys/class/net/{ROLE[args.role]['wg']}").exists():
+    if owned_link is not None:
+        command([TOOLS["ip"], "link", "delete", "dev", owned_link])
+    if (
+        pin_path.exists()
+        or Path(f"/sys/class/net/{staging_name}").exists()
+        or (
+            Path(f"/sys/class/net/{fixed_name}").exists()
+            and not preserve_fixed
+        )
+    ):
         stop("restore-postcondition", 79)
     if args.role == "public":
         baseline = probe(args.role).get("classic_tc_baseline")
@@ -1087,7 +1184,18 @@ def restore(args: argparse.Namespace) -> None:
     if not (root / "restored.json").exists():
         write_new(
             root / "restored.json",
-            (json.dumps({"status": "restored", "run_id": args.run_id, "role": args.role}, sort_keys=True) + "\n").encode(),
+            (
+                json.dumps(
+                    {
+                        "status": "restored",
+                        "run_id": args.run_id,
+                        "role": args.role,
+                        "preserved_foreign_fixed": preserve_fixed,
+                    },
+                    sort_keys=True,
+                )
+                + "\n"
+            ).encode(),
             0o600,
         )
     os.close(service_lock_fd)
@@ -1106,11 +1214,16 @@ def purge(args: argparse.Namespace) -> None:
     purge_service_fd = -1
     if not partial:
         purge_service_fd = acquire_service_lock(root, exclusive=True)
-    if not partial and (
-        Path(f"/sys/class/net/{ROLE[args.role]['wg']}").exists()
-        or Path(f"/sys/fs/bpf/{root.name}").exists()
-    ):
-        stop("purge-live-resource", 79)
+    if not partial:
+        staging_name = staging_wg_name(args.claim_sha256, args.role)
+        fixed = read_link(ROLE[args.role]["wg"])
+        expected_alias = f"wg-mix-public-smoke:{args.run_id}:{args.role}"
+        if (
+            Path(f"/sys/class/net/{staging_name}").exists()
+            or Path(f"/sys/fs/bpf/{root.name}").exists()
+            or (fixed is not None and fixed.get("ifalias") == expected_alias)
+        ):
+            stop("purge-live-resource", 79)
     intent = root / "intent.json"
     if intent.exists():
         os.unlink(intent)
