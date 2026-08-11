@@ -114,9 +114,16 @@ if /usr/bin/find "${stage}" -xdev -mindepth 1 -type d \
   printf 'error: CI test stage crosses a filesystem boundary\n' >&2
   exit 66
 fi
+[[ -z "$(/usr/bin/find "${stage}" -xdev \
+  \( ! -user siyixuan -o ! -group siyixuan \) -print -quit)" ]] || {
+  printf 'error: CI test stage contains a foreign-owned entry\n' >&2
+  exit 66
+}
 
 printf 'B82_CI_STAGE_CLEANUP_PREFLIGHT run_id=%s commit=%s stage=%s\n' \
   "${run_id}" "${commit}" "${stage}"
+/usr/bin/find "${stage}" -xdev -type d \
+  -exec /usr/bin/chmod u+rwx -- '{}' +
 /usr/bin/find "${stage}" -xdev -depth -delete
 [[ ! -e "${stage}" && ! -L "${stage}" ]] || {
   printf 'error: CI test stage cleanup did not converge: %s\n' "${stage}" >&2
