@@ -1,0 +1,139 @@
+#!/usr/bin/expect -f
+
+# Minimal password transport for the standalone public-host smoke controller.
+# It deliberately accepts only fixed-host SSH and single-file SCP operations.
+
+proc stop {reason {rc 78}} {
+    puts stderr "PUBLIC_TRANSPORT_STOP reason=$reason rc=$rc"
+    exit $rc
+}
+
+proc append_without_match {variable buffer matched} {
+    upvar 1 $variable output
+    set prefix_length [expr {[string length $buffer] - [string length $matched]}]
+    if {$prefix_length > 0} {
+        append output [string range $buffer 0 [expr {$prefix_length - 1}]]
+    }
+}
+
+if {[llength $argv] < 4} {
+    stop arguments 64
+}
+lassign $argv credential_path expected_host operation
+set operation_args [lrange $argv 3 end]
+if {$expected_host ni {192.168.10.82 47.116.202.155} ||
+    $credential_path ne "/Users/siyixuan/codes-2/wg-mix-ebpf/credientials/$expected_host" ||
+    $operation ni {ssh scp-put} || [llength $operation_args] < 1} {
+    stop arguments 64
+}
+if {[catch {file normalize $credential_path} normalized_credential] ||
+    $normalized_credential ne $credential_path ||
+    [catch {file lstat $credential_path credential_stat}] ||
+    $credential_stat(type) ne "file" || $credential_stat(nlink) != 1 ||
+    ($credential_stat(mode) & 0022) != 0} {
+    stop credential-shape 65
+}
+if {[catch {open $credential_path r} credential_file]} {
+    stop credential-open 65
+}
+fconfigure $credential_file -encoding utf-8 -translation lf
+if {[gets $credential_file ssh_line] < 0 ||
+    [gets $credential_file password] < 0 ||
+    [gets $credential_file unexpected] >= 0} {
+    close $credential_file
+    set password ""
+    stop credential-shape 65
+}
+close $credential_file
+set ssh_parts [split [string trim $ssh_line]]
+set ssh_line ""
+set parsed_user ""
+set parsed_host ""
+if {[llength $ssh_parts] != 2 || [lindex $ssh_parts 0] ne "ssh" ||
+    ![regexp {^([A-Za-z_][A-Za-z0-9_.-]{0,31})@([0-9.]+)$} \
+        [lindex $ssh_parts 1] -> parsed_user parsed_host] ||
+    $parsed_host ne $expected_host ||
+    $password eq "" || [string first "\u0000" $password] >= 0 ||
+    [string first "\r" $password] >= 0 ||
+    [string first "\n" $password] >= 0} {
+    set password ""
+    stop credential-value 65
+}
+set target [lindex $ssh_parts 1]
+set ssh_parts {}
+
+set common_options [list \
+    -o BatchMode=no \
+    -o StrictHostKeyChecking=yes \
+    -o PasswordAuthentication=yes \
+    -o KbdInteractiveAuthentication=yes \
+    -o NumberOfPasswordPrompts=2 \
+    -o ConnectTimeout=15 \
+    -o ServerAliveInterval=10 \
+    -o ServerAliveCountMax=3 \
+    -o LogLevel=ERROR]
+
+if {$operation eq "ssh"} {
+    foreach item $operation_args {
+        if {![regexp {^[A-Za-z0-9_./:=+@,%,-]+$} $item]} {
+            set password ""
+            stop remote-argument 64
+        }
+    }
+    set spawn_argv [list /usr/bin/ssh {*}$common_options -tt $target {*}$operation_args]
+} else {
+    if {[llength $operation_args] != 2} {
+        set password ""
+        stop scp-arguments 64
+    }
+    lassign $operation_args local_source remote_path
+    if {![string match "/*" $local_source] || ![file isfile $local_source] ||
+        [file type $local_source] ne "file" ||
+        ![regexp {^/tmp/wg-mix-public-smoke-[0-9a-f]{12,24}-(?:b82|public)-intake/[A-Za-z0-9_.-]+$} $remote_path]} {
+        set password ""
+        stop scp-path 64
+    }
+    set spawn_argv [list /usr/bin/scp {*}$common_options -- $local_source "$target:$remote_path"]
+}
+
+set timeout 1900
+set captured ""
+set credential_sends 0
+log_user 0
+spawn -noecho {*}$spawn_argv
+set child_id $spawn_id
+expect {
+    -i $child_id -re {(?i)[^\r\n]*(?:password|passphrase)[^\r\n]*:[ ]*$} {
+        append_without_match captured $expect_out(buffer) $expect_out(0,string)
+        incr credential_sends
+        if {$credential_sends > 2} {
+            set password ""
+            stop credential-prompts 78
+        }
+        send -i $child_id -- "$password\r"
+        exp_continue
+    }
+    -i $child_id -re {(?i)are you sure you want to continue connecting} {
+        set password ""
+        stop host-key 78
+    }
+    -i $child_id eof {
+        append captured $expect_out(buffer)
+    }
+    timeout {
+        set password ""
+        catch {close -i $child_id}
+        catch {wait -i $child_id}
+        stop timeout 78
+    }
+}
+set password ""
+if {[catch {wait -i $child_id} wait_result] ||
+    [llength $wait_result] < 4 || [lindex $wait_result 2] != 0 ||
+    [lindex $wait_result 3] != 0} {
+    stop child-failure 77
+}
+fconfigure stdout -encoding binary -translation binary
+puts -nonewline stdout $captured
+flush stdout
+exit 0
