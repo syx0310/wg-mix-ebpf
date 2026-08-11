@@ -848,10 +848,7 @@ func (owner *exactTCXAttachment) closeUnpinnedAfterFailure() (bool, error) {
 	}
 	var detachErr error
 	if !owner.detached {
-		detachErr = owner.link.Detach()
-		if detachErr == nil {
-			owner.detached = true
-		}
+		owner.detached, detachErr = detachExactTCXLinkIfSupported(owner.link)
 	}
 	closeErr := owner.link.Close()
 	if closeErr == nil {
@@ -879,10 +876,28 @@ func wrapExactTCXCleanupError(operation string, err error) error {
 	return fmt.Errorf("%s: %w", operation, err)
 }
 
-// Rollback detaches the exact bpf_link FD before removing its pin. It never
-// addresses a TC slot by ifindex/priority/handle and therefore cannot delete a
-// foreign link which raced into the same TCX direction. It also never touches
-// clsact, which is not used by TCX.
+func detachExactTCXLinkIfSupported(link exactTCXKernelLink) (bool, error) {
+	if link == nil {
+		return false, errors.New("exact TCX link is nil")
+	}
+	if err := link.Detach(); err != nil {
+		// BPF_LINK_DETACH is not implemented for every bpf_link type on every
+		// kernel which supports TCX. After the exact pin identity is checked,
+		// unpinning and closing our held FD drops the last reference to this
+		// exact link without addressing a shared TC slot or a foreign link.
+		if errors.Is(err, ciliumlink.ErrNotSupported) || errors.Is(err, unix.EINVAL) {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
+}
+
+// Rollback retires the exact bpf_link through its held FD and verified pin. It
+// prefers BPF_LINK_DETACH, but kernels which reject that command for TCX fall
+// back to unpin plus close. Neither path addresses a TC slot by
+// ifindex/priority/handle, so a foreign link in the same direction is safe.
+// TCX rollback also never touches clsact.
 func (owner *exactTCXAttachment) Rollback() error {
 	if owner == nil {
 		return nil
@@ -901,10 +916,11 @@ func (owner *exactTCXAttachment) Rollback() error {
 		}
 	}
 	if !owner.detached {
-		if err := owner.link.Detach(); err != nil {
+		detached, err := detachExactTCXLinkIfSupported(owner.link)
+		if err != nil {
 			return fmt.Errorf("detach exact TCX link %d: %w", owner.binding.LinkID, err)
 		}
-		owner.detached = true
+		owner.detached = detached
 	}
 	if owner.pinned {
 		if owner.recheckPin != nil {
@@ -920,6 +936,7 @@ func (owner *exactTCXAttachment) Rollback() error {
 	if err := owner.link.Close(); err != nil {
 		return fmt.Errorf("close detached exact TCX link %d: %w", owner.binding.LinkID, err)
 	}
+	owner.detached = true
 	owner.link = nil
 	owner.closed = true
 	return nil

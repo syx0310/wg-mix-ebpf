@@ -617,6 +617,38 @@ func TestExactTCXRollbackPreservesConcurrentForeignLink(t *testing.T) {
 	}
 }
 
+func TestExactTCXRollbackFallsBackWhenLinkDetachIsUnsupported(t *testing.T) {
+	for _, detachErr := range []error{unix.EINVAL, ciliumlink.ErrNotSupported} {
+		t.Run(detachErr.Error(), func(t *testing.T) {
+			kernel := newFakeExactTCXKernel()
+			journal := &fakeExactTCXJournal{events: &kernel.events}
+			binding := testExactTCXBinding(12, exactTCXIngress, 51)
+			owner, _ := stageTestExactTCX(t, kernel, binding, journal)
+			ownedID := owner.binding.LinkID
+			foreignID := kernel.addLink(12, ebpf.AttachTCXIngress, 999)
+			kernel.detachErrs[ownedID] = []error{detachErr}
+
+			if err := owner.Rollback(); err != nil {
+				t.Fatal(err)
+			}
+			if kernel.links[ownedID].attached {
+				t.Fatal("exact owned link remains attached after unpin-close fallback")
+			}
+			if !kernel.links[foreignID].attached {
+				t.Fatal("fallback detached the concurrent foreign link")
+			}
+			wantTail := []string{
+				fmt.Sprintf("detach:%d", ownedID),
+				fmt.Sprintf("unpin:%d", ownedID),
+				fmt.Sprintf("close:%d", ownedID),
+			}
+			if !slices.Equal(kernel.events[len(kernel.events)-len(wantTail):], wantTail) {
+				t.Fatalf("event tail=%v want=%v", kernel.events, wantTail)
+			}
+		})
+	}
+}
+
 func TestExactTCXRollbackRetriesOnlyUnfinishedExactOperations(t *testing.T) {
 	kernel := newFakeExactTCXKernel()
 	journal := &fakeExactTCXJournal{events: &kernel.events}
