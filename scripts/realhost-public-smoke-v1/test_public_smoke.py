@@ -15,6 +15,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 
 HERE = Path(__file__).resolve().parent
@@ -252,6 +253,10 @@ class PublicSmokeTest(unittest.TestCase):
             r"PUBLIC_ENDPOINT_STOP reason=[A-Za-z0-9_.:-]+ rc=[0-9]+",
             transport,
         )
+        self.assertNotIn("claim_path, claim_sha256 = claim_files[role]", controller)
+        self.assertIn(
+            "claim_path, role_claim_sha256 = claim_files[role]", controller
+        )
         claimed_root = controller.index('if "owner.json" in entries:')
         self.assertLess(
             controller.index(
@@ -276,6 +281,37 @@ class PublicSmokeTest(unittest.TestCase):
             cleanup_start,
         )
         self.assertLess(first_restore, cleanup_evidence)
+
+    def test_intake_claim_accepts_the_actual_six_field_stat_shape(self) -> None:
+        args = SimpleNamespace(
+            run_id="0123456789ab",
+            commit="1" * 40,
+            ownership_token="2" * 32,
+        )
+        artifacts = {
+            name: {"sha256": character * 64}
+            for name, character in (
+                ("binary", "3"),
+                ("endpoint", "4"),
+                ("object", "5"),
+                ("traffic", "6"),
+            )
+        }
+        expected = self.controller.intake_claim_bytes(args, "b82", artifacts)
+        digest = self.controller.hashlib.sha256(expected).hexdigest()
+        intake, _ = self.controller.remote_layout(args.run_id, "b82")
+
+        class Remote:
+            role = "b82"
+
+            def ssh(self, *argv: str) -> str:
+                if argv[0] == "/usr/bin/stat" and argv[-1] == intake:
+                    return "1000:1000:700:directory"
+                if argv[0] == "/usr/bin/stat":
+                    return f"1000:1000:600:1:{len(expected)}:regular file"
+                return f"{digest}  {intake}/intake-owner.json"
+
+        self.controller.verify_intake_claim(Remote(), args, artifacts)
 
     def test_local_evidence_export_resumes_partial_and_linked_publish(self) -> None:
         payload = b"bounded-evidence-payload\n"

@@ -741,7 +741,7 @@ def verify_intake_claim(
     marker_parts = shape.split(":")
     if (
         len(directory_parts) != 4
-        or len(marker_parts) != 7
+        or len(marker_parts) != 6
         or directory_parts[0:2] != marker_parts[0:2]
         or directory_parts[2:] != ["700", "directory"]
         or marker_parts[2:] != ["600", "1", str(len(expected)), "regular file"]
@@ -1096,14 +1096,14 @@ def run_test(
     claim_sha256 = {role: item[1] for role, item in claim_files.items()}
     keys: dict[str, str] = {}
     for role in ("public", "b82"):
-        claim_path, claim_sha256 = claim_files[role]
+        claim_path, role_claim_sha256 = claim_files[role]
         keys[role] = stage_one(
             remotes[role],
             args.run_id,
             args.commit,
             artifacts,
             claim_path,
-            claim_sha256,
+            role_claim_sha256,
         )
     sudo_endpoint(
         remotes["public"],
