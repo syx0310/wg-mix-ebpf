@@ -570,7 +570,9 @@ def execute_recovery(args: argparse.Namespace, paths: dict[str, Path]) -> None:
     before_state = attach_state_snapshot(remote, args)
     if args.role == "b82":
         matching_tcx_link_ids(remote, args)
+    print("PUBLIC_RECOVERY_STAGE stage=detach", flush=True)
     remote.ssh(*detach_argv(args))
+    print("PUBLIC_RECOVERY_STAGE stage=post-detach-verify", flush=True)
     verify_backend_removed(remote, args)
     if named_entry(remote, root, recovery_state_name, privileged=True):
         stop("recovery-state-created", 79)

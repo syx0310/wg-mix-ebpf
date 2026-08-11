@@ -659,6 +659,15 @@ class PublicSmokeTest(unittest.TestCase):
             controller,
         )
         self.assertIn("emit_safe_endpoint_stops $captured", transport)
+        self.assertIn("emit_complete_child_diagnostics $captured $password $wait_result", transport)
+        self.assertIn("PUBLIC_TRANSPORT_CHILD_DIAGNOSTIC_BEGIN", transport)
+        self.assertIn("PUBLIC_TRANSPORT_CHILD_DIAGNOSTIC_END", transport)
+        self.assertIn("PUBLIC_TRANSPORT_CHILD_WAIT result=$wait_result", transport)
+        self.assertLess(
+            transport.index("emit_complete_child_diagnostics $captured $password $wait_result"),
+            transport.index('set password ""', transport.index("set wait_failed")),
+        )
+        self.assertNotIn("puts stderr $captured", transport)
         self.assertIn(
             r"PUBLIC_ENDPOINT_STOP reason=[A-Za-z0-9_.:-]+ rc=[0-9]+",
             transport,

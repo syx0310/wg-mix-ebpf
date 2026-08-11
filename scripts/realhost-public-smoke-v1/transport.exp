@@ -23,6 +23,24 @@ proc emit_safe_endpoint_stops {captured} {
     }
 }
 
+proc emit_complete_child_diagnostics {captured password wait_result} {
+    # The password prompt itself is excluded from captured.  Redact the exact
+    # password as a second, independent guard in case a remote terminal echoes
+    # input unexpectedly; preserve every other byte of the child diagnostic.
+    set safe_captured $captured
+    if {$password ne ""} {
+        set safe_captured [string map [list $password "<redacted-password>"] \
+            $safe_captured]
+    }
+    puts stderr "PUBLIC_TRANSPORT_CHILD_DIAGNOSTIC_BEGIN"
+    puts -nonewline stderr $safe_captured
+    if {![string match "*\n" $safe_captured]} {
+        puts stderr ""
+    }
+    puts stderr "PUBLIC_TRANSPORT_CHILD_DIAGNOSTIC_END"
+    puts stderr "PUBLIC_TRANSPORT_CHILD_WAIT result=$wait_result"
+}
+
 if {[llength $argv] < 4} {
     stop arguments 64
 }
@@ -134,13 +152,16 @@ expect {
         stop timeout 78
     }
 }
-set password ""
-if {[catch {wait -i $child_id} wait_result] ||
+set wait_failed [catch {wait -i $child_id} wait_result]
+if {$wait_failed ||
     [llength $wait_result] < 4 || [lindex $wait_result 2] != 0 ||
     [lindex $wait_result 3] != 0} {
     emit_safe_endpoint_stops $captured
+    emit_complete_child_diagnostics $captured $password $wait_result
+    set password ""
     stop child-failure 77
 }
+set password ""
 fconfigure stdout -encoding binary -translation binary
 puts -nonewline stdout $captured
 flush stdout
