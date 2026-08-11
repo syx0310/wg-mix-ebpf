@@ -461,6 +461,11 @@ class PublicSmokeTest(unittest.TestCase):
             mock.patch.object(self.root, "self_check"),
             mock.patch.object(self.root, "artifact_check"),
             mock.patch.object(self.root, "verify_host"),
+            mock.patch.object(
+                self.root,
+                "load_private_key",
+                return_value=b"A" * 43 + b"=\n",
+            ),
             mock.patch.object(Path, "exists", return_value=False),
             mock.patch.object(self.root, "write_new"),
             mock.patch.object(self.root, "command", side_effect=command),
@@ -539,6 +544,11 @@ class PublicSmokeTest(unittest.TestCase):
             mock.patch.object(self.root, "self_check"),
             mock.patch.object(self.root, "artifact_check"),
             mock.patch.object(self.root, "verify_host"),
+            mock.patch.object(
+                self.root,
+                "load_private_key",
+                return_value=b"A" * 43 + b"=\n",
+            ),
             mock.patch.object(Path, "exists", return_value=False),
             mock.patch.object(self.root, "write_new"),
             mock.patch.object(self.root, "command", side_effect=command),
@@ -556,6 +566,11 @@ class PublicSmokeTest(unittest.TestCase):
         ]
         self.assertEqual(5, len(wg_calls))
         self.assertEqual("wg-private-key", wg_calls[0][1].get("stop_label"))
+        self.assertEqual(
+            [self.root.TOOLS["wg"], "set", "wgps82", "private-key", "/dev/stdin"],
+            wg_calls[0][0],
+        )
+        self.assertEqual(b"A" * 43 + b"=\n", wg_calls[0][1].get("input_bytes"))
         self.assertEqual("wg-listen-port", wg_calls[1][1].get("stop_label"))
         self.assertEqual("wg-fwmark", wg_calls[2][1].get("stop_label"))
         self.assertEqual("wg-peer", wg_calls[3][1].get("stop_label"))

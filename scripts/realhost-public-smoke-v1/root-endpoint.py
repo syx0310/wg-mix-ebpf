@@ -93,7 +93,11 @@ def command_error_class(stderr: bytes) -> str:
         return "empty-stderr"
     if b"Key is not the correct length or format" in stderr:
         return "key-format"
-    if b"Unable to open" in stderr or b"No such file or directory" in stderr:
+    if (
+        stderr.startswith(b"fopen:")
+        or b"Unable to open" in stderr
+        or b"No such file or directory" in stderr
+    ):
         return "file-open"
     if b"Unable to modify interface: Operation not supported" in stderr:
         return "netlink-not-supported"
@@ -139,6 +143,48 @@ def canonical_run_root(run_id: str, role: str) -> Path:
     if not RUN_ID_RE.fullmatch(run_id) or role not in ROLE:
         stop("arguments", 64)
     return Path(f"/var/tmp/wg-mix-ebpf-public-smoke-{run_id}-{role}")
+
+
+def read_root_key(path: Path) -> bytes:
+    flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        stop(f"key-open:{path.name}", 79)
+    try:
+        opened = os.fstat(descriptor)
+        named = path.lstat()
+        data = os.pread(descriptor, 46, 0)
+        if (
+            not stat.S_ISREG(opened.st_mode)
+            or opened.st_uid != 0
+            or opened.st_gid != 0
+            or opened.st_nlink != 1
+            or stat.S_IMODE(opened.st_mode) != 0o600
+            or opened.st_size != 45
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+            or len(data) != 45
+            or not data.endswith(b"\n")
+        ):
+            stop(f"key-shape:{path.name}", 79)
+        try:
+            encoded = data[:-1].decode("ascii")
+        except UnicodeDecodeError:
+            stop(f"key-encoding:{path.name}", 79)
+        if not PUBKEY_RE.fullmatch(encoded):
+            stop(f"key-format:{path.name}", 79)
+        return data
+    finally:
+        os.close(descriptor)
+
+
+def load_private_key(root: Path) -> bytes:
+    private = read_root_key(root / "private.key")
+    public = read_root_key(root / "public.key")
+    derived = command([TOOLS["wg"], "pubkey"], input_bytes=private)
+    if derived != public:
+        stop("key-pair-mismatch", 79)
+    return private
 
 
 def staging_wg_name(claim_sha256: str, role: str) -> str:
@@ -668,6 +714,7 @@ def apply_endpoint(args: argparse.Namespace) -> None:
         or pin_path.exists()
     ):
         stop("apply-resource-exists", 79)
+    private_key = load_private_key(root)
     intent = {
         "schema": "wg-mix-public-endpoint-intent-v1",
         "run_id": args.run_id,
@@ -704,7 +751,8 @@ def apply_endpoint(args: argparse.Namespace) -> None:
     )
     command([TOOLS["ip"], "link", "set", "dev", staging_name, "name", wg_name])
     command(
-        [TOOLS["wg"], "set", wg_name, "private-key", str(root / "private.key")],
+        [TOOLS["wg"], "set", wg_name, "private-key", "/dev/stdin"],
+        input_bytes=private_key,
         stop_label="wg-private-key",
     )
     command(
