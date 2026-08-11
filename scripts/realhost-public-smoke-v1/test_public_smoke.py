@@ -43,6 +43,45 @@ class PublicSmokeTest(unittest.TestCase):
         cls.report = load("public_report", "report.py")
         cls.recovery = load("public_recovery", "recover-classic-journal.py")
 
+    def test_client_failure_preserves_complete_stdout_and_stderr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "evidence").mkdir()
+            (root / "applied.json").write_text("{}\n", encoding="utf-8")
+            lock_fd = os.open("/dev/null", os.O_RDONLY)
+
+            def fail_client(argv, **kwargs):
+                self.assertEqual(["/usr/bin/python3", "traffic.py"], argv)
+                kwargs["stdout"].write(b"complete client stdout\n")
+                kwargs["stderr"].write(b"complete client stderr: connection timed out\n")
+                return SimpleNamespace(returncode=23)
+
+            with mock.patch.object(
+                self.root, "acquire_service_lock", return_value=lock_fd
+            ), mock.patch.object(self.root.subprocess, "run", side_effect=fail_client):
+                with self.assertRaises(SystemExit) as caught:
+                    self.root.run_recorded_command(
+                        root,
+                        "udp-client",
+                        ["/usr/bin/python3", "traffic.py"],
+                        timeout=5,
+                    )
+            self.assertEqual(77, caught.exception.code)
+            self.assertEqual(
+                b"complete client stdout\n",
+                (root / "evidence/udp-client.stdout").read_bytes(),
+            )
+            self.assertEqual(
+                b"complete client stderr: connection timed out\n",
+                (root / "evidence/udp-client.stderr").read_bytes(),
+            )
+            self.assertEqual(
+                0o600,
+                (root / "evidence/udp-client.stderr").stat().st_mode & 0o777,
+            )
+            self.assertTrue(self.root.KNOWN_EVIDENCE_RE.fullmatch("udp-client.stdout"))
+            self.assertTrue(self.root.KNOWN_EVIDENCE_RE.fullmatch("tcp-client.stderr"))
+
     def test_tcx_recovery_binds_exact_live_link_identities(self) -> None:
         args = SimpleNamespace(
             role="b82",
@@ -633,6 +672,11 @@ class PublicSmokeTest(unittest.TestCase):
         self.assertNotIn("subprocess.Popen", endpoint)
         self.assertNotIn("server.pid.json", endpoint)
         self.assertNotIn("capture.pid.json", endpoint)
+        self.assertIn('"-Z",\n        "root",', endpoint)
+        self.assertIn(
+            "output = run_recorded_command(root, mode, argv, timeout=args.seconds + 15)",
+            endpoint,
+        )
         add_staging = endpoint.index('"add",\n            "dev",\n            staging_name')
         alias_staging = endpoint.index('"dev",\n            staging_name,\n            "alias"')
         rename_fixed = endpoint.index(

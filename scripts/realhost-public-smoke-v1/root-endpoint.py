@@ -78,7 +78,8 @@ KNOWN_ROOT_FILES = frozenset(
     }
 )
 KNOWN_EVIDENCE_RE = re.compile(
-    r"^(?:server|capture)\.(?:stdout|stderr|pcap)|sample\.[0-9]{6}\.json|"
+    r"^(?:server|capture|udp-client|tcp-client)\.(?:stdout|stderr)|"
+    r"capture\.pcap|sample\.[0-9]{6}\.json|"
     r"(?:ping|udp|tcp)\.[a-z0-9_-]+\.(?:json|txt)$"
 )
 
@@ -940,13 +941,15 @@ def apply_endpoint(args: argparse.Namespace) -> None:
 
 def run_recorded_command(
     root: Path, name: str, argv: list[str], *, timeout: int
-) -> None:
+) -> bytes:
     lock_fd = acquire_service_lock(root, exclusive=False)
     try:
         if not (root / "applied.json").is_file() or (root / "restored.json").exists():
             stop(f"recorded-command-state:{name}", 79)
-        with open(root / f"evidence/{name}.stdout", "xb", buffering=0) as stdout:
-            with open(root / f"evidence/{name}.stderr", "xb", buffering=0) as stderr:
+        with open(root / f"evidence/{name}.stdout", "x+b", buffering=0) as stdout:
+            os.fchmod(stdout.fileno(), 0o600)
+            with open(root / f"evidence/{name}.stderr", "x+b", buffering=0) as stderr:
+                os.fchmod(stderr.fileno(), 0o600)
                 completed = subprocess.run(
                     argv,
                     stdin=subprocess.DEVNULL,
@@ -957,12 +960,15 @@ def run_recorded_command(
                     env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
                     pass_fds=(lock_fd,),
                 )
+                stdout.seek(0)
+                output = stdout.read()
     except (OSError, subprocess.TimeoutExpired) as error:
         stop(f"recorded-command:{name}:{type(error).__name__}", 77)
     finally:
         os.close(lock_fd)
     if completed.returncode != 0:
         stop(f"recorded-command:{name}:rc{completed.returncode}", 77)
+    return output
 
 
 def acquire_service_lock(root: Path, *, exclusive: bool) -> int:
@@ -1042,6 +1048,8 @@ def start_capture(args: argparse.Namespace) -> None:
         "-nn",
         "-s",
         "128",
+        "-Z",
+        "root",
         "-c",
         "2048",
         "-w",
@@ -1076,7 +1084,7 @@ def client(args: argparse.Namespace) -> None:
         argv += ["--seconds", str(args.seconds), "--bits-per-second", str(args.bits_per_second)]
     else:
         argv += ["--bytes", str(args.bytes)]
-    output = command(argv, timeout=args.seconds + 15)
+    output = run_recorded_command(root, mode, argv, timeout=args.seconds + 15)
     print(output.decode("utf-8"), end="")
 
 
