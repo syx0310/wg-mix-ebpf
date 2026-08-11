@@ -68,6 +68,26 @@ type pinOwnerMapStage struct {
 	MapID    uint32 `json:"map_id"`
 }
 
+func ownerProgramRetiredName(record *pinOwnerRecord, fileName string) string {
+	suffix := ".retired"
+	if record != nil && record.Version == pinOwnerLegacyClassicVersion {
+		suffix = "-retired"
+	}
+	return fileName + suffix
+}
+
+func ownerMapRetiredName(record *pinOwnerRecord, fileName string) string {
+	return ownerProgramRetiredName(record, fileName)
+}
+
+func ownerCanonicalMapRetiredName(record *pinOwnerRecord, fileName string) string {
+	suffix := ".canonical-retired"
+	if record != nil && record.Version == pinOwnerLegacyClassicVersion {
+		suffix = "-canonical-retired"
+	}
+	return fileName + suffix
+}
+
 type pinOwnerRecord struct {
 	Version                int                    `json:"version"`
 	Sequence               uint64                 `json:"sequence"`
@@ -289,12 +309,12 @@ func validateOwnerDirectoryEntries(
 	}
 	for _, stage := range record.ProgramStages {
 		allowed[stage.FileName] = struct{}{}
-		allowed[stage.FileName+".retired"] = struct{}{}
+		allowed[ownerProgramRetiredName(record, stage.FileName)] = struct{}{}
 	}
 	for _, stage := range record.MapStages {
 		allowed[stage.FileName] = struct{}{}
-		allowed[stage.FileName+".retired"] = struct{}{}
-		allowed[stage.FileName+".canonical-retired"] = struct{}{}
+		allowed[ownerMapRetiredName(record, stage.FileName)] = struct{}{}
+		allowed[ownerCanonicalMapRetiredName(record, stage.FileName)] = struct{}{}
 	}
 	for _, binding := range record.ActiveLinks {
 		allowed[binding.PinName] = struct{}{}
@@ -1672,7 +1692,7 @@ func removeOwnerProgramStages(
 	record *pinOwnerRecord,
 ) error {
 	for _, stage := range record.ProgramStages {
-		retiredName := stage.FileName + ".retired"
+		retiredName := ownerProgramRetiredName(record, stage.FileName)
 		var retiredStat unix.Stat_t
 		retiredErr := unix.Fstatat(
 			handle.targetFD,

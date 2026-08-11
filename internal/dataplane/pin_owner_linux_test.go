@@ -236,6 +236,41 @@ func TestHistoricalPinOwnerV3WireAndIndexDigestRemainStable(t *testing.T) {
 	}
 }
 
+func TestPinOwnerQuarantineNamesAreSchemaAware(t *testing.T) {
+	classic := &pinOwnerRecord{Version: pinOwnerLegacyClassicVersion}
+	classicNames := []string{
+		ownerProgramRetiredName(classic, "program-stage"),
+		ownerMapRetiredName(classic, "map-stage"),
+		ownerCanonicalMapRetiredName(classic, "map-stage"),
+	}
+	if want := []string{
+		"program-stage-retired",
+		"map-stage-retired",
+		"map-stage-canonical-retired",
+	}; !slices.Equal(classicNames, want) {
+		t.Fatalf("classic quarantine names = %v, want %v", classicNames, want)
+	}
+	for _, name := range classicNames {
+		if strings.Contains(name, ".") {
+			t.Fatalf("classic bpffs quarantine name contains a dot: %q", name)
+		}
+	}
+
+	tcx := &pinOwnerRecord{Version: pinOwnerRecordVersion}
+	tcxNames := []string{
+		ownerProgramRetiredName(tcx, "program-stage"),
+		ownerMapRetiredName(tcx, "map-stage"),
+		ownerCanonicalMapRetiredName(tcx, "map-stage"),
+	}
+	if want := []string{
+		"program-stage.retired",
+		"map-stage.retired",
+		"map-stage.canonical-retired",
+	}; !slices.Equal(tcxNames, want) {
+		t.Fatalf("TCX quarantine names = %v, want %v", tcxNames, want)
+	}
+}
+
 func TestOwnerRecoveryEntrypointsRejectTheOtherBackend(t *testing.T) {
 	_, _, tcx := testPinOwnerRecord(t, t.TempDir())
 	classic := clonePinOwnerRecord(tcx)

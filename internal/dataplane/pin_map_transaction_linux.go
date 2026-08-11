@@ -417,7 +417,7 @@ func removeCanonicalOwnerMaps(
 		if err != nil {
 			return err
 		}
-		retiredName := stage.FileName + ".canonical-retired"
+		retiredName := ownerCanonicalMapRetiredName(record, stage.FileName)
 		var canonicalStat unix.Stat_t
 		canonicalErr := unix.Fstatat(
 			handle.targetFD,
@@ -489,7 +489,7 @@ func removeCanonicalOwnerMaps(
 		if err != nil {
 			return err
 		}
-		retiredName := stage.FileName + ".canonical-retired"
+		retiredName := ownerCanonicalMapRetiredName(record, stage.FileName)
 		var retiredStat unix.Stat_t
 		retiredErr := unix.Fstatat(
 			handle.targetFD,
@@ -673,7 +673,7 @@ func restoreCanonicalOwnerMaps(
 			continue
 		}
 
-		retiredName := stage.FileName + ".canonical-retired"
+		retiredName := ownerCanonicalMapRetiredName(record, stage.FileName)
 		var retiredStat unix.Stat_t
 		err = unix.Fstatat(
 			handle.targetFD,
@@ -716,7 +716,7 @@ func removeOwnerMapStages(
 		if err != nil {
 			return err
 		}
-		retiredName := stage.FileName + ".retired"
+		retiredName := ownerMapRetiredName(record, stage.FileName)
 		var stageStat unix.Stat_t
 		stageErr := unix.Fstatat(
 			handle.targetFD,

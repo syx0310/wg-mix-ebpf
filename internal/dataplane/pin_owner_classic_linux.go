@@ -57,12 +57,12 @@ func validateClassicOwnerDirectoryEntries(
 	}
 	for _, stage := range record.ProgramStages {
 		allowed[stage.FileName] = struct{}{}
-		allowed[stage.FileName+".retired"] = struct{}{}
+		allowed[ownerProgramRetiredName(record, stage.FileName)] = struct{}{}
 	}
 	for _, stage := range record.MapStages {
 		allowed[stage.FileName] = struct{}{}
-		allowed[stage.FileName+".retired"] = struct{}{}
-		allowed[stage.FileName+".canonical-retired"] = struct{}{}
+		allowed[ownerMapRetiredName(record, stage.FileName)] = struct{}{}
+		allowed[ownerCanonicalMapRetiredName(record, stage.FileName)] = struct{}{}
 	}
 
 	seen := make(map[string]struct{}, len(entries))
