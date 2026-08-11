@@ -4,7 +4,7 @@ set -euo pipefail
 
 readonly PATH='/usr/bin:/bin'
 readonly LC_ALL='C'
-readonly STAGE_PREFIX='/var/tmp/wg-mix-ci-test'
+readonly STAGE_PREFIX='/home/siyixuan/.wg-mix-ci-test'
 
 export PATH LC_ALL
 umask 077
@@ -103,14 +103,14 @@ done
   exit 66
 }
 
-readonly var_tmp_device="$(/usr/bin/stat -c '%d' -- /var/tmp)"
-[[ "$(/usr/bin/stat -c '%d' -- "${stage}")" == "${var_tmp_device}" ]] || {
-  printf 'error: CI test stage is outside the /var/tmp filesystem\n' >&2
+readonly home_device="$(/usr/bin/stat -c '%d' -- /home/siyixuan)"
+[[ "$(/usr/bin/stat -c '%d' -- "${stage}")" == "${home_device}" ]] || {
+  printf 'error: CI test stage is outside the test user home filesystem\n' >&2
   exit 66
 }
 if /usr/bin/find "${stage}" -xdev -mindepth 1 -type d \
     -exec /usr/bin/stat -c '%d' -- '{}' + |
-    /usr/bin/grep -Fvxq "${var_tmp_device}"; then
+    /usr/bin/grep -Fvxq "${home_device}"; then
   printf 'error: CI test stage crosses a filesystem boundary\n' >&2
   exit 66
 fi

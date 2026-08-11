@@ -4,7 +4,7 @@ set -euo pipefail
 
 readonly PATH='/usr/local/go/bin:/usr/bin:/bin'
 readonly LC_ALL='C'
-readonly STAGE_PREFIX='/var/tmp/wg-mix-ci-test'
+readonly STAGE_PREFIX='/home/siyixuan/.wg-mix-ci-test'
 
 export PATH LC_ALL
 umask 077
