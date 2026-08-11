@@ -139,7 +139,73 @@ def agent_error_class(stderr: bytes) -> str:
     for pattern, label in categories:
         if pattern in lowered and label not in matched:
             matched.append(label)
-    return "-".join(matched[:3]) if matched else "other-stderr"
+    if matched:
+        return "-".join(matched[:3])
+    safe_words = {
+        b"abi",
+        b"archive",
+        b"attach",
+        b"btf",
+        b"busy",
+        b"call",
+        b"changed",
+        b"collection",
+        b"config",
+        b"control",
+        b"create",
+        b"denied",
+        b"exists",
+        b"failed",
+        b"generation",
+        b"index",
+        b"interface",
+        b"kernel",
+        b"lease",
+        b"limit",
+        b"link",
+        b"load",
+        b"lock",
+        b"maintenance",
+        b"map",
+        b"memory",
+        b"missing",
+        b"mount",
+        b"object",
+        b"open",
+        b"operation",
+        b"owner",
+        b"path",
+        b"persist",
+        b"pin",
+        b"preflight",
+        b"program",
+        b"query",
+        b"read",
+        b"recover",
+        b"rekey",
+        b"relocation",
+        b"revision",
+        b"rlimit",
+        b"runtime",
+        b"section",
+        b"state",
+        b"supported",
+        b"symbol",
+        b"tail",
+        b"tcx",
+        b"underlay",
+        b"unexpected",
+        b"unknown",
+        b"validate",
+        b"verifier",
+        b"wireguard",
+        b"write",
+    }
+    keywords = []
+    for word in re.findall(rb"[a-z]+", lowered):
+        if word in safe_words and word not in keywords:
+            keywords.append(word)
+    return "keywords-" + "-".join(item.decode() for item in keywords[:8]) if keywords else "other-stderr"
 
 
 def command(

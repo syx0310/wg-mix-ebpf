@@ -80,8 +80,12 @@ class PublicSmokeTest(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            "other-stderr",
+            "keywords-path",
             self.root.agent_error_class(b"untrusted path /secret/private.key\n"),
+        )
+        self.assertEqual(
+            "keywords-failed-load-program",
+            self.root.agent_error_class(b"failed to load program: bad descriptor\n"),
         )
 
     def test_report_accepts_only_fresh_bidirectional_zero_error_growth(self) -> None:
