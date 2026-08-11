@@ -16,6 +16,13 @@ proc append_without_match {variable buffer matched} {
     }
 }
 
+proc emit_safe_endpoint_stops {captured} {
+    foreach marker [regexp -all -inline \
+        {PUBLIC_ENDPOINT_STOP reason=[A-Za-z0-9_.:-]+ rc=[0-9]+} $captured] {
+        puts stderr $marker
+    }
+}
+
 if {[llength $argv] < 4} {
     stop arguments 64
 }
@@ -131,6 +138,7 @@ set password ""
 if {[catch {wait -i $child_id} wait_result] ||
     [llength $wait_result] < 4 || [lindex $wait_result 2] != 0 ||
     [lindex $wait_result 3] != 0} {
+    emit_safe_endpoint_stops $captured
     stop child-failure 77
 }
 fconfigure stdout -encoding binary -translation binary

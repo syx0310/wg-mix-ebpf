@@ -259,6 +259,7 @@ def sudo_endpoint(
         "-S",
         "-p",
         "PUBLIC_SUDO_PASSWORD:",
+        "/usr/bin/python3",
         f"{root}/root-endpoint.py",
         *argv,
         "--role",
@@ -309,6 +310,7 @@ def endpoint_argv(
 ) -> list[str]:
     _, root = remote_layout(run_id, role)
     return [
+        "/usr/bin/python3",
         f"{root}/root-endpoint.py",
         mode,
         *argv,
@@ -692,8 +694,16 @@ def remote_named_entry_exists(remote: Remote, parent: str, name: str) -> bool:
     return observed == name
 
 
-def remote_directory_entries(remote: Remote, directory: str) -> dict[str, str]:
+def remote_directory_entries(
+    remote: Remote, directory: str, *, privileged: bool = False
+) -> dict[str, str]:
+    prefix = (
+        ("/usr/bin/sudo", "-S", "-p", "PUBLIC_SUDO_PASSWORD:")
+        if privileged
+        else ()
+    )
     observed = remote.ssh(
+        *prefix,
         "/usr/bin/find",
         directory,
         "-mindepth",
@@ -750,13 +760,16 @@ def verify_root_claim(
         intake_claim_bytes(args, remote.role, artifacts)
     ).hexdigest()
     marker = f"{root}/root-claim.json"
-    shape = remote.ssh("/usr/bin/stat", "-c", "%u:%g:%a:%h:%s:%F", marker)
+    sudo = ("/usr/bin/sudo", "-S", "-p", "PUBLIC_SUDO_PASSWORD:")
+    shape = remote.ssh(
+        *sudo, "/usr/bin/stat", "-c", "%u:%g:%a:%h:%s:%F", marker
+    )
     if shape != (
         f"0:0:600:1:{len(intake_claim_bytes(args, remote.role, artifacts))}:"
         "regular file"
     ):
         stop(f"root-claim-shape:{remote.role}", 79)
-    digest = remote.ssh("/usr/bin/sha256sum", "--", marker)
+    digest = remote.ssh(*sudo, "/usr/bin/sha256sum", "--", marker)
     if digest != f"{expected_sha256}  {marker}":
         stop(f"root-claim-digest:{remote.role}", 79)
     return expected_sha256
@@ -1272,7 +1285,7 @@ def cleanup_unclaimed_root(
     parent, name = root.rsplit("/", 1)
     if not remote_named_entry_exists(remote, parent, name):
         return False
-    entries = remote_directory_entries(remote, root)
+    entries = remote_directory_entries(remote, root, privileged=True)
     if "owner.json" in entries:
         verify_intake_claim(remote, args, artifacts)
         verify_root_claim(remote, args, artifacts)

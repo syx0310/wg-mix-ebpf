@@ -208,6 +208,7 @@ class PublicSmokeTest(unittest.TestCase):
     def test_prepare_claim_and_cleanup_retry_contracts_are_structural(self) -> None:
         controller = (HERE / "controller.py").read_text(encoding="utf-8")
         endpoint = (HERE / "root-endpoint.py").read_text(encoding="utf-8")
+        transport = (HERE / "transport.exp").read_text(encoding="utf-8")
         self.assertLess(
             endpoint.index("write_owner_new(root,"),
             endpoint.index('copy_new(source, root / name'),
@@ -235,6 +236,22 @@ class PublicSmokeTest(unittest.TestCase):
         self.assertIn("acquire_service_lock(root, exclusive=True)", endpoint)
         self.assertIn("verify_intake_claim(remote, args, artifacts)", controller)
         self.assertIn('"claim_sha256": claim_sha256', endpoint)
+        self.assertIn(
+            '"/usr/bin/python3",\n        f"{root}/root-endpoint.py"', controller
+        )
+        self.assertIn(
+            "entries = remote_directory_entries(remote, root, privileged=True)",
+            controller,
+        )
+        self.assertIn(
+            'sudo = ("/usr/bin/sudo", "-S", "-p", "PUBLIC_SUDO_PASSWORD:")',
+            controller,
+        )
+        self.assertIn("emit_safe_endpoint_stops $captured", transport)
+        self.assertIn(
+            r"PUBLIC_ENDPOINT_STOP reason=[A-Za-z0-9_.:-]+ rc=[0-9]+",
+            transport,
+        )
         claimed_root = controller.index('if "owner.json" in entries:')
         self.assertLess(
             controller.index(
