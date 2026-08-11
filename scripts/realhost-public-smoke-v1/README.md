@@ -76,3 +76,6 @@ and pin ownership also update project lock/audit records under `/run/wg-mix-ebpf
 `/run/.wg-mix-ebpf-daemon.lease.maintenance`, and
 `/var/lib/wg-mix-ebpf/pin-owners`. Those records are retained as recovery
 history rather than byte-restored; they are not active network/BPF resources.
+On a host where the product state root has not been initialized yet, the
+loader securely creates `/var/lib/wg-mix-ebpf` and its `pin-owners` child;
+these product-owned directories are likewise retained.

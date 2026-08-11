@@ -1965,6 +1965,31 @@ func openPinOwnerStoreWithPolicy(
 	if fileName != resource.key+".owner.json" {
 		return nil, errors.New("pin owner identity helper returned an inconsistent filename")
 	}
+	if createRoot {
+		parentPath := filepath.Dir(runtime.ownerRoot)
+		parent, _, parentErr := openAnchoredDirectoryPath(
+			parentPath,
+			false,
+			0,
+			runtime.expectedUID,
+			runtime.allowUnsafeAncestors,
+		)
+		if errors.Is(parentErr, unix.ENOENT) {
+			parent, _, parentErr = openAnchoredDirectoryPath(
+				parentPath,
+				true,
+				0o755,
+				runtime.expectedUID,
+				runtime.allowUnsafeAncestors,
+			)
+		}
+		if parentErr != nil {
+			return nil, fmt.Errorf("open pin owner parent %s: %w", parentPath, parentErr)
+		}
+		if err := parent.Close(); err != nil {
+			return nil, fmt.Errorf("close pin owner parent %s: %w", parentPath, err)
+		}
+	}
 	root, _, err := openAnchoredDirectoryPath(
 		runtime.ownerRoot,
 		createRoot,

@@ -134,6 +134,33 @@ func TestPinOwnerJSONFieldOrderAndCanonicalUTC(t *testing.T) {
 	}
 }
 
+func TestOpenPinOwnerStoreCreatesMissingManagedParent(t *testing.T) {
+	root := t.TempDir()
+	runtime, parent, _ := testPinOwnerRecord(t, root)
+	runtime.ownerRoot = filepath.Join(root, "state", "pin-owners")
+	parent.runtime = runtime
+
+	store, err := openPinOwnerStore(runtime, parent.resource, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for path, wantMode := range map[string]os.FileMode{
+		filepath.Dir(runtime.ownerRoot): 0o755,
+		runtime.ownerRoot:               0o700,
+	} {
+		info, err := os.Lstat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !info.IsDir() || info.Mode().Perm() != wantMode {
+			t.Fatalf("managed owner directory %s mode = %v, want directory %v", path, info.Mode(), wantMode)
+		}
+	}
+}
+
 func TestPinOwnerV3ClassicSchemaIsDecodedAndValidated(t *testing.T) {
 	_, parent, current := testPinOwnerRecord(t, t.TempDir())
 	legacy := clonePinOwnerRecord(current)

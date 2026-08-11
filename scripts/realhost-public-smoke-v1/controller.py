@@ -476,6 +476,8 @@ def execution_contract(
                 "/run/wg-mix-ebpf/daemon.lease",
                 "/run/.wg-mix-ebpf-daemon.lease.maintenance",
                 "/run/wg-mix-ebpf/pin-locks/<resource-key>.lock",
+                "/var/lib/wg-mix-ebpf",
+                "/var/lib/wg-mix-ebpf/pin-owners",
                 "/var/lib/wg-mix-ebpf/pin-owners/instances.v2.json",
                 "/var/lib/wg-mix-ebpf/pin-owners/<resource-owner-and-history-files>",
             ],
