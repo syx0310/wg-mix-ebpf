@@ -1650,10 +1650,18 @@ func openPinPathParent(
 	if runtime.mountIDAt == nil {
 		return nil, errors.New("pin-path mount-ID-at validator is unavailable")
 	}
+	anchorMode := runtime.bpffsRootMode
+	if anchorMode == 0o700 {
+		// A private bpffs mount may expose its root with the sticky bit set
+		// even when it was mounted with mode=0700.  Open it under the strict
+		// owner-rwx/no-group-or-other-write policy, then immediately narrow
+		// the accepted modes to exactly 0700 or 01700 below.
+		anchorMode = 0
+	}
 	parentPath, _, err := openAnchoredDirectoryPath(
 		validated.bpffsRoot,
 		false,
-		runtime.bpffsRootMode,
+		anchorMode,
 		runtime.expectedUID,
 		runtime.allowUnsafeAncestors,
 	)
@@ -1664,6 +1672,16 @@ func openPinPathParent(
 		_ = parentPath.Close()
 	}
 	parentIdentity := parentPath.Identity()
+	if runtime.bpffsRootMode == 0o700 {
+		permissions := parentIdentity.mode & 0o7777
+		if !isolatedBPFFSRootModeAllowed(permissions) {
+			closeOnError()
+			return nil, fmt.Errorf(
+				"refuse unsafe isolated bpffs root %s: mode=%#o, want 0700 or kernel sticky 01700",
+				validated.bpffsRoot, permissions,
+			)
+		}
+	}
 	if !samePinPathInode(parentIdentity, validated.parentInode) {
 		closeOnError()
 		return nil, fmt.Errorf("bpffs mount root %s changed after validation", validated.bpffsRoot)
@@ -1701,6 +1719,10 @@ func openPinPathParent(
 		},
 		runtime: runtime,
 	}, nil
+}
+
+func isolatedBPFFSRootModeAllowed(mode uint32) bool {
+	return mode == 0o700 || mode == 0o1700
 }
 
 func openPinPathHandleFromParent(

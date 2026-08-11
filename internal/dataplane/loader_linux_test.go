@@ -1360,6 +1360,19 @@ func TestPinRuntimeDerivesLockRootFromIsolatedLifecycleContext(t *testing.T) {
 	}
 }
 
+func TestIsolatedBPFFSRootModeAcceptsOnlyKernelStickyVariant(t *testing.T) {
+	for _, mode := range []uint32{0o700, 0o1700} {
+		if !isolatedBPFFSRootModeAllowed(mode) {
+			t.Fatalf("isolated bpffs mode rejected = %#o", mode)
+		}
+	}
+	for _, mode := range []uint32{0o600, 0o770, 0o2700, 0o4700, 0o3700} {
+		if isolatedBPFFSRootModeAllowed(mode) {
+			t.Fatalf("unsafe isolated bpffs mode accepted = %#o", mode)
+		}
+	}
+}
+
 func TestPinPathLockRejectsSymlinksAndHardlinks(t *testing.T) {
 	pinPath := "/sys/fs/bpf/" + pinPathPrefix + "-unsafe-lock"
 	resource := newTestPinResource(t, pinPath)
