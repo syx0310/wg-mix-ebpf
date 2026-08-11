@@ -301,6 +301,37 @@ func TestPinOwnerQuarantineNamesAreSchemaAware(t *testing.T) {
 	}
 }
 
+func TestExistingOwnerRetiredNameEnumeratesCompatibleNames(t *testing.T) {
+	directory := t.TempDir()
+	directoryFD, err := unix.Open(
+		directory,
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC,
+		0,
+	)
+	if err != nil {
+		t.Fatalf("open test directory: %v", err)
+	}
+	defer unix.Close(directoryFD)
+	names := []string{"program-stage-retired", "program-stage.retired"}
+	if name, exists, err := existingOwnerRetiredName(directoryFD, names); err != nil || exists || name != "" {
+		t.Fatalf("empty retired lookup = (%q, %t, %v), want empty", name, exists, err)
+	}
+	legacy := filepath.Join(directory, names[1])
+	if err := os.WriteFile(legacy, []byte("legacy"), 0o600); err != nil {
+		t.Fatalf("write legacy retired entry: %v", err)
+	}
+	if name, exists, err := existingOwnerRetiredName(directoryFD, names); err != nil || !exists || name != names[1] {
+		t.Fatalf("legacy retired lookup = (%q, %t, %v), want %q", name, exists, err, names[1])
+	}
+	canonical := filepath.Join(directory, names[0])
+	if err := os.WriteFile(canonical, []byte("canonical"), 0o600); err != nil {
+		t.Fatalf("write canonical retired entry: %v", err)
+	}
+	if _, _, err := existingOwnerRetiredName(directoryFD, names); err == nil || !strings.Contains(err.Error(), "multiple retired") {
+		t.Fatalf("ambiguous retired lookup error = %v", err)
+	}
+}
+
 func TestOwnerRecoveryEntrypointsRejectTheOtherBackend(t *testing.T) {
 	_, _, tcx := testPinOwnerRecord(t, t.TempDir())
 	classic := clonePinOwnerRecord(tcx)

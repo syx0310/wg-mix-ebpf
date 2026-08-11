@@ -104,20 +104,45 @@ func existingOwnerRetiredName(
 	directoryFD int,
 	names []string,
 ) (string, bool, error) {
-	found := ""
+	// Some bpffs kernels reject even a lookup of an absent name containing a
+	// dot. Enumerate the anchored directory so a legacy dotted name is only
+	// looked up later when it actually exists.
+	directoryEntryFD, err := unix.Openat(
+		directoryFD,
+		".",
+		unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0,
+	)
+	if err != nil {
+		return "", false, fmt.Errorf("open BPF pin directory for retired entry lookup: %w", err)
+	}
+	directory := os.NewFile(uintptr(directoryEntryFD), "BPF pin directory")
+	entries, readErr := directory.ReadDir(257)
+	closeErr := directory.Close()
+	if readErr != nil && !errors.Is(readErr, io.EOF) {
+		return "", false, fmt.Errorf("list BPF pin directory for retired entry lookup: %w", readErr)
+	}
+	if closeErr != nil {
+		return "", false, fmt.Errorf("close BPF pin directory retired entry lookup: %w", closeErr)
+	}
+	if len(entries) > 256 {
+		return "", false, errors.New("BPF pin directory has more than 256 entries")
+	}
+	wanted := make(map[string]struct{}, len(names))
 	for _, name := range names {
-		var observed unix.Stat_t
-		err := unix.Fstatat(
-			directoryFD,
-			name,
-			&observed,
-			unix.AT_SYMLINK_NOFOLLOW,
-		)
-		if errors.Is(err, unix.ENOENT) {
-			continue
+		if name == "" {
+			return "", false, errors.New("retired BPF pin entry name is empty")
 		}
-		if err != nil {
-			return "", false, err
+		if _, duplicate := wanted[name]; duplicate {
+			return "", false, fmt.Errorf("retired BPF pin entry name %q is duplicated", name)
+		}
+		wanted[name] = struct{}{}
+	}
+	found := ""
+	for _, entry := range entries {
+		name := entry.Name()
+		if _, requested := wanted[name]; !requested {
+			continue
 		}
 		if found != "" {
 			return "", false, fmt.Errorf(
