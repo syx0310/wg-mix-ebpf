@@ -50,10 +50,24 @@ readonly owner_marker="${stage}/.owner-${commit}-${bundle_sha256}"
   exit 66
 }
 
-readonly expected_entries="$(/usr/bin/printf '%s\n' \
+expected_entries="$(/usr/bin/printf '%s\n' \
   ".owner-${commit}-${bundle_sha256}" \
   'candidate.bundle' 'go-cache' 'go-mod-cache' 'go-path' 'go-tmp' 'source' |
   /usr/bin/sort)"
+if [[ -e "${stage}/.config" || -L "${stage}/.config" ]]; then
+  [[ -d "${stage}/.config" && ! -L "${stage}/.config" &&
+    "$(/usr/bin/stat -Lc '%U:%G:%F' -- "${stage}/.config")" == \
+      'siyixuan:siyixuan:directory' &&
+    -z "$(/usr/bin/find "${stage}/.config" -xdev \
+      \( -type l -o \( ! -type d ! -type f \) -o \
+      ! -user siyixuan -o ! -group siyixuan \) -print -quit)" ]] || {
+    printf 'error: CI test stage Go config tree is invalid\n' >&2
+    exit 66
+  }
+  expected_entries="$(/usr/bin/printf '%s\n%s\n' '.config' "${expected_entries}" |
+    /usr/bin/sort)"
+fi
+readonly expected_entries
 readonly actual_entries="$(/usr/bin/find "${stage}" -mindepth 1 -maxdepth 1 -printf '%f\n' |
   /usr/bin/sort)"
 [[ "${actual_entries}" == "${expected_entries}" ]] || {
