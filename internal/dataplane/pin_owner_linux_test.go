@@ -290,11 +290,14 @@ func TestPinOwnerQuarantineNamesAreSchemaAware(t *testing.T) {
 		ownerCanonicalMapRetiredName(tcx, "map-stage"),
 	}
 	if want := []string{
-		"program-stage.retired",
-		"map-stage.retired",
-		"map-stage.canonical-retired",
+		"program-stage-retired",
+		"map-stage-retired",
+		"map-stage-canonical-retired",
 	}; !slices.Equal(tcxNames, want) {
 		t.Fatalf("TCX quarantine names = %v, want %v", tcxNames, want)
+	}
+	if want := []string{"program-stage-retired", "program-stage.retired"}; !slices.Equal(ownerProgramRetiredNames(tcx, "program-stage"), want) {
+		t.Fatalf("TCX compatible program quarantine names = %v, want %v", ownerProgramRetiredNames(tcx, "program-stage"), want)
 	}
 }
 

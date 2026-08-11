@@ -417,7 +417,13 @@ func removeCanonicalOwnerMaps(
 		if err != nil {
 			return err
 		}
-		retiredName := ownerCanonicalMapRetiredName(record, stage.FileName)
+		retiredName, retiredExists, err := existingOwnerRetiredName(
+			handle.targetFD,
+			ownerCanonicalMapRetiredNames(record, stage.FileName),
+		)
+		if err != nil {
+			return err
+		}
 		var canonicalStat unix.Stat_t
 		canonicalErr := unix.Fstatat(
 			handle.targetFD,
@@ -425,14 +431,7 @@ func removeCanonicalOwnerMaps(
 			&canonicalStat,
 			unix.AT_SYMLINK_NOFOLLOW,
 		)
-		var retiredStat unix.Stat_t
-		retiredErr := unix.Fstatat(
-			handle.targetFD,
-			retiredName,
-			&retiredStat,
-			unix.AT_SYMLINK_NOFOLLOW,
-		)
-		if canonicalErr == nil && retiredErr == nil {
+		if canonicalErr == nil && retiredExists {
 			return fmt.Errorf(
 				"both canonical and retired owner map %s exist",
 				stage.Name,
@@ -441,15 +440,12 @@ func removeCanonicalOwnerMaps(
 		if canonicalErr != nil && !errors.Is(canonicalErr, unix.ENOENT) {
 			return canonicalErr
 		}
-		if retiredErr != nil && !errors.Is(retiredErr, unix.ENOENT) {
-			return retiredErr
-		}
 		stageObservation := stages.byName[stage.Name]
 		if stageObservation == nil ||
 			stageObservation.id != stage.MapID {
 			if record.ActiveGeneration == 0 &&
 				errors.Is(canonicalErr, unix.ENOENT) &&
-				errors.Is(retiredErr, unix.ENOENT) {
+				!retiredExists {
 				continue
 			}
 			return fmt.Errorf("owner map stage %s is unavailable", stage.Name)
@@ -468,7 +464,7 @@ func removeCanonicalOwnerMaps(
 			if err := pin.observation.Close(); err != nil {
 				return err
 			}
-		case retiredErr == nil:
+		case retiredExists:
 			pin, err := validatePinnedMapAt(
 				handle,
 				descriptor,
@@ -489,15 +485,15 @@ func removeCanonicalOwnerMaps(
 		if err != nil {
 			return err
 		}
-		retiredName := ownerCanonicalMapRetiredName(record, stage.FileName)
-		var retiredStat unix.Stat_t
-		retiredErr := unix.Fstatat(
+		retiredNames := ownerCanonicalMapRetiredNames(record, stage.FileName)
+		retiredName, retiredExists, retiredErr := existingOwnerRetiredName(
 			handle.targetFD,
-			retiredName,
-			&retiredStat,
-			unix.AT_SYMLINK_NOFOLLOW,
+			retiredNames,
 		)
-		if retiredErr == nil {
+		if retiredErr != nil {
+			return retiredErr
+		}
+		if retiredExists {
 			if err := unlinkValidatedOwnerMap(
 				handle,
 				descriptor,
@@ -507,9 +503,6 @@ func removeCanonicalOwnerMaps(
 				return err
 			}
 			continue
-		}
-		if !errors.Is(retiredErr, unix.ENOENT) {
-			return retiredErr
 		}
 		var canonicalStat unix.Stat_t
 		canonicalErr := unix.Fstatat(
@@ -558,6 +551,7 @@ func removeCanonicalOwnerMaps(
 		if err := pin.observation.Close(); err != nil {
 			return err
 		}
+		retiredName = retiredNames[0]
 		if err := unix.Renameat2(
 			handle.targetFD,
 			stage.Name,
@@ -673,15 +667,13 @@ func restoreCanonicalOwnerMaps(
 			continue
 		}
 
-		retiredName := ownerCanonicalMapRetiredName(record, stage.FileName)
-		var retiredStat unix.Stat_t
-		err = unix.Fstatat(
+		retiredName, retiredExists, retiredErr := existingOwnerRetiredName(
 			handle.targetFD,
-			retiredName,
-			&retiredStat,
-			unix.AT_SYMLINK_NOFOLLOW,
+			ownerCanonicalMapRetiredNames(record, stage.FileName),
 		)
-		if err == nil {
+		if retiredErr != nil {
+			errs = append(errs, retiredErr)
+		} else if retiredExists {
 			if err := unlinkValidatedOwnerMap(
 				handle,
 				descriptor,
@@ -690,8 +682,6 @@ func restoreCanonicalOwnerMaps(
 			); err != nil {
 				errs = append(errs, err)
 			}
-		} else if !errors.Is(err, unix.ENOENT) {
-			errs = append(errs, err)
 		}
 	}
 	return errors.Join(errs...)
@@ -716,7 +706,7 @@ func removeOwnerMapStages(
 		if err != nil {
 			return err
 		}
-		retiredName := ownerMapRetiredName(record, stage.FileName)
+		retiredNames := ownerMapRetiredNames(record, stage.FileName)
 		var stageStat unix.Stat_t
 		stageErr := unix.Fstatat(
 			handle.targetFD,
@@ -724,14 +714,14 @@ func removeOwnerMapStages(
 			&stageStat,
 			unix.AT_SYMLINK_NOFOLLOW,
 		)
-		var retiredStat unix.Stat_t
-		retiredErr := unix.Fstatat(
+		retiredName, retiredExists, retiredErr := existingOwnerRetiredName(
 			handle.targetFD,
-			retiredName,
-			&retiredStat,
-			unix.AT_SYMLINK_NOFOLLOW,
+			retiredNames,
 		)
-		if stageErr == nil && retiredErr == nil {
+		if retiredErr != nil {
+			return retiredErr
+		}
+		if stageErr == nil && retiredExists {
 			return fmt.Errorf(
 				"both active and retired map stage %s exist",
 				stage.FileName,
@@ -740,10 +730,7 @@ func removeOwnerMapStages(
 		if stageErr != nil && !errors.Is(stageErr, unix.ENOENT) {
 			return stageErr
 		}
-		if retiredErr != nil && !errors.Is(retiredErr, unix.ENOENT) {
-			return retiredErr
-		}
-		if retiredErr == nil {
+		if retiredExists {
 			if err := unlinkValidatedOwnerMap(
 				handle,
 				descriptor,
@@ -791,6 +778,7 @@ func removeOwnerMapStages(
 		if err := pin.observation.Close(); err != nil {
 			return err
 		}
+		retiredName = retiredNames[0]
 		if err := unix.Renameat2(
 			handle.targetFD,
 			stage.FileName,

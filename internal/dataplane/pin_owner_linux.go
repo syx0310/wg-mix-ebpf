@@ -69,11 +69,7 @@ type pinOwnerMapStage struct {
 }
 
 func ownerProgramRetiredName(record *pinOwnerRecord, fileName string) string {
-	suffix := ".retired"
-	if record != nil && record.Version == pinOwnerLegacyClassicVersion {
-		suffix = "-retired"
-	}
-	return fileName + suffix
+	return fileName + "-retired"
 }
 
 func ownerMapRetiredName(record *pinOwnerRecord, fileName string) string {
@@ -81,11 +77,57 @@ func ownerMapRetiredName(record *pinOwnerRecord, fileName string) string {
 }
 
 func ownerCanonicalMapRetiredName(record *pinOwnerRecord, fileName string) string {
-	suffix := ".canonical-retired"
-	if record != nil && record.Version == pinOwnerLegacyClassicVersion {
-		suffix = "-canonical-retired"
+	return fileName + "-canonical-retired"
+}
+
+func ownerProgramRetiredNames(record *pinOwnerRecord, fileName string) []string {
+	names := []string{ownerProgramRetiredName(record, fileName)}
+	if record != nil && record.Version == pinOwnerRecordVersion {
+		names = append(names, fileName+".retired")
 	}
-	return fileName + suffix
+	return names
+}
+
+func ownerMapRetiredNames(record *pinOwnerRecord, fileName string) []string {
+	return ownerProgramRetiredNames(record, fileName)
+}
+
+func ownerCanonicalMapRetiredNames(record *pinOwnerRecord, fileName string) []string {
+	names := []string{ownerCanonicalMapRetiredName(record, fileName)}
+	if record != nil && record.Version == pinOwnerRecordVersion {
+		names = append(names, fileName+".canonical-retired")
+	}
+	return names
+}
+
+func existingOwnerRetiredName(
+	directoryFD int,
+	names []string,
+) (string, bool, error) {
+	found := ""
+	for _, name := range names {
+		var observed unix.Stat_t
+		err := unix.Fstatat(
+			directoryFD,
+			name,
+			&observed,
+			unix.AT_SYMLINK_NOFOLLOW,
+		)
+		if errors.Is(err, unix.ENOENT) {
+			continue
+		}
+		if err != nil {
+			return "", false, err
+		}
+		if found != "" {
+			return "", false, fmt.Errorf(
+				"multiple retired BPF pin entries exist: %s and %s",
+				found, name,
+			)
+		}
+		found = name
+	}
+	return found, found != "", nil
 }
 
 type pinOwnerRecord struct {
@@ -309,12 +351,18 @@ func validateOwnerDirectoryEntries(
 	}
 	for _, stage := range record.ProgramStages {
 		allowed[stage.FileName] = struct{}{}
-		allowed[ownerProgramRetiredName(record, stage.FileName)] = struct{}{}
+		for _, name := range ownerProgramRetiredNames(record, stage.FileName) {
+			allowed[name] = struct{}{}
+		}
 	}
 	for _, stage := range record.MapStages {
 		allowed[stage.FileName] = struct{}{}
-		allowed[ownerMapRetiredName(record, stage.FileName)] = struct{}{}
-		allowed[ownerCanonicalMapRetiredName(record, stage.FileName)] = struct{}{}
+		for _, name := range ownerMapRetiredNames(record, stage.FileName) {
+			allowed[name] = struct{}{}
+		}
+		for _, name := range ownerCanonicalMapRetiredNames(record, stage.FileName) {
+			allowed[name] = struct{}{}
+		}
 	}
 	for _, binding := range record.ActiveLinks {
 		allowed[binding.PinName] = struct{}{}
@@ -1692,15 +1740,15 @@ func removeOwnerProgramStages(
 	record *pinOwnerRecord,
 ) error {
 	for _, stage := range record.ProgramStages {
-		retiredName := ownerProgramRetiredName(record, stage.FileName)
-		var retiredStat unix.Stat_t
-		retiredErr := unix.Fstatat(
+		retiredNames := ownerProgramRetiredNames(record, stage.FileName)
+		retiredName, retiredExists, retiredErr := existingOwnerRetiredName(
 			handle.targetFD,
-			retiredName,
-			&retiredStat,
-			unix.AT_SYMLINK_NOFOLLOW,
+			retiredNames,
 		)
-		if retiredErr == nil {
+		if retiredErr != nil {
+			return retiredErr
+		}
+		if retiredExists {
 			var stageStat unix.Stat_t
 			if err := unix.Fstatat(
 				handle.targetFD,
@@ -1742,9 +1790,6 @@ func removeOwnerProgramStages(
 			}
 			continue
 		}
-		if !errors.Is(retiredErr, unix.ENOENT) {
-			return retiredErr
-		}
 		var stat unix.Stat_t
 		err := unix.Fstatat(
 			handle.targetFD,
@@ -1784,6 +1829,7 @@ func removeOwnerProgramStages(
 		) {
 			return fmt.Errorf("program stage %s changed before quarantine", stage.FileName)
 		}
+		retiredName = retiredNames[0]
 		if err := unix.Renameat2(
 			handle.targetFD,
 			stage.FileName,
