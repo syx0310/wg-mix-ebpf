@@ -10,6 +10,7 @@ import socket
 import sys
 import time
 from dataclasses import dataclass
+from typing import NoReturn
 
 
 MAX_SECONDS = 1800
@@ -18,7 +19,7 @@ MAX_UDP_BPS = 1_000_000
 PAYLOAD_SIZE = 768
 
 
-def die(message: str) -> "NoReturn":
+def die(message: str) -> NoReturn:
     raise SystemExit(f"public-traffic: {message}")
 
 

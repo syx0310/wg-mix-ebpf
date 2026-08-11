@@ -119,3 +119,30 @@ top-level backend-specific detach dispatch, prior-boot classic rekey, and the
 production-constructor fresh-idle auto path. These tests do not substitute for
 the planned real 5.15 verifier/load test, which remains gated on a committed,
 reviewed script and exact host execution packet.
+
+## Public execution-controller hardening
+
+The first independent review of the standalone public controller stopped the
+live run before any write. The execution path now binds controller, transport,
+endpoint, traffic, report, binary, object, source HEAD/tree/cleanliness,
+traffic bounds, remote layout, write set, and expanded endpoint argv into one
+plan SHA-256 that both `run` and `cleanup` must reproduce.
+
+Remote run roots use fresh `mkdir` plus no-target endpoint installation. The
+endpoint publishes its owner record before copying artifacts; an exact
+unclaimed-root abort and partial-prepare restore/export/purge path cover the
+earlier failure window. Local evidence export and remote cleanup are
+idempotent, so qualification failure or an interrupted restore can be resumed
+with the frozen cleanup argv. The 5.15 gate also records that `eth0` had one
+pre-existing shared `clsact` and no ingress/egress filters, and restore requires
+that exact filter baseline again.
+
+The final execution review additionally made the owner record an atomic
+pending-to-final publication, bound each non-root intake to a deterministic
+contract claim before creating the root run directory, and made the WG alias
+part of the single link-create operation. Server and capture commands now stay
+in bounded foreground SSH calls instead of detached child processes; they hold
+a shared service lock that restore must acquire exclusively. Local endpoint
+evidence uses resumable pending files and a complete manifest binding each
+file's size and digest, while remote purge retains recovery markers until its
+last three unlink operations.

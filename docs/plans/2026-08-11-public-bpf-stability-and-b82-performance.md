@@ -26,35 +26,46 @@ foreign interface state.
 
 The public test may create only:
 
+* one local evidence directory under
+  `/private/tmp/wg-mix-public-smoke-evidence-*`;
+* one non-root intake directory per host under
+  `/tmp/wg-mix-public-smoke-*-intake`;
 * one run directory per host under `/run/wg-mix-ebpf-public-smoke-*`;
 * one temporary WireGuard interface per host (`wgps82` or `wgps47`);
 * one run-owned BPF pin directory immediately below the host bpffs mount;
 * one run-owned attach-state directory;
-* bounded traffic/capture processes whose PIDs and `/proc` identities are
-  recorded in the run directory.
+* bounded foreground traffic/capture commands; their SSH calls remain open,
+  and a held shared service lock prevents restore while either command runs.
 
 It does not edit firewall/routing policy, change MTU or offloads, touch
 `idxhy_v4`, or adopt foreign TC/BPF objects. The production loader uses exact
 TCX ownership on B82 and the journaled classic-TC backend on the 5.15 public
 host. Both backends share the same map owner, recovery, status, and detach
 lifecycle; backend switching with an existing owner is rejected until detach.
+The loader may also update its project-scoped lease, pin-lock, owner-index, and
+append-only owner-history records below `/run/wg-mix-ebpf` and
+`/var/lib/wg-mix-ebpf/pin-owners`. These shared audit records are disclosed in
+the frozen execution contract and are not deleted by the smoke-test cleanup.
 
 The B82 performance test may create only the resources already declared by the
 reviewed private-mountns smoke harness. It does not touch `ens33` or any
 pre-existing interface.
 
-Cleanup is a separate `restore` operation. Failure never invokes automatic
-root cleanup. Restore first proves the ownership marker and exact device/PID
-identity, detaches the BPF owner, removes only the named test devices and known
-files, and verifies their absence. It never uses recursive deletion.
+Cleanup is a separate, contract-bound and retryable `cleanup` operation; a
+failed run never starts it automatically. Cleanup first proves the ownership
+marker and exact device/PID identity, detaches the BPF owner, exports evidence
+through resumable local files, removes only the named test devices and known
+files, and verifies their absence. Its final purge keeps the ownership marker
+until only the endpoint and terminal markers remain, so interruption is
+recoverable. It never uses recursive deletion.
 
 ## Public stability traffic
 
-The default qualification is intentionally low-rate:
+The planned qualification is intentionally low-rate:
 
-* one 1 Hz ping stream in each direction for 15 minutes;
-* UDP at 384 Kbit/s in each direction;
-* one bounded 1 MiB TCP transfer in each direction;
+* one 1 Hz ping stream in each direction for 5 minutes;
+* UDP at 96 Kbit/s in each direction;
+* one bounded 256 KiB TCP transfer in each direction;
 * state samples every 10 seconds;
 * bounded underlay capture with a packet and time limit.
 

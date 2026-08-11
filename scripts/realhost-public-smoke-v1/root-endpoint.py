@@ -5,11 +5,11 @@ from __future__ import annotations
 
 import argparse
 import base64
+import fcntl
 import hashlib
 import json
 import os
 import re
-import signal
 import stat
 import subprocess
 import sys
@@ -53,6 +53,7 @@ TOOLS = {
     "python": "/usr/bin/python3",
     "sha256sum": "/usr/bin/sha256sum",
     "tcpdump": "/usr/bin/tcpdump",
+    "tc": "/usr/sbin/tc",
     "timeout": "/usr/bin/timeout",
     "uname": "/usr/bin/uname",
     "wg": "/usr/bin/wg",
@@ -60,7 +61,9 @@ TOOLS = {
 KNOWN_ROOT_FILES = frozenset(
     {
         "root-endpoint.py",
+        "root-claim.json",
         "owner.json",
+        "owner.pending.json",
         "intent.json",
         "wg-mix-ebpf",
         "wg_mix_tc.o",
@@ -70,9 +73,8 @@ KNOWN_ROOT_FILES = frozenset(
         "wg-interface.conf",
         "agent.yaml",
         "applied.json",
-        "server.pid.json",
-        "capture.pid.json",
         "restored.json",
+        "services.lock",
     }
 )
 KNOWN_EVIDENCE_RE = re.compile(
@@ -169,6 +171,26 @@ def write_new(path: Path, data: bytes, mode: int) -> None:
         os.close(fd)
 
 
+def write_owner_new(root: Path, data: bytes) -> None:
+    pending = root / "owner.pending.json"
+    final = root / "owner.json"
+    if pending.exists() or final.exists():
+        stop("owner-create", 79)
+    write_new(pending, data, 0o600)
+    try:
+        os.rename(pending, final)
+        directory_fd = os.open(
+            root,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_DIRECTORY | os.O_NOFOLLOW,
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    except OSError:
+        stop("owner-publish", 79)
+
+
 def copy_new(source: Path, target: Path, expected_sha256: str, mode: int) -> None:
     secure_regular(source, expected_sha256, root_owned=False)
     source_fd = os.open(
@@ -260,6 +282,51 @@ def probe(role: str) -> dict[str, Any]:
     expected_host = spec["host"]
     host_ok = expected_host is None or hostname == expected_host
     kernel_ok = kernel_tuple(release) >= spec["minimum_kernel"]
+    classic_baseline: dict[str, Any] | None = None
+    classic_ok = True
+    if role == "public":
+        try:
+            qdiscs_run = subprocess.run(
+                [TOOLS["tc"], "-j", "qdisc", "show", "dev", interface],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=5,
+                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+            )
+            ingress_run = subprocess.run(
+                [TOOLS["tc"], "-j", "filter", "show", "dev", interface, "ingress"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=5,
+                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+            )
+            egress_run = subprocess.run(
+                [TOOLS["tc"], "-j", "filter", "show", "dev", interface, "egress"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=5,
+                env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+            )
+            qdiscs = json.loads(qdiscs_run.stdout) if qdiscs_run.returncode == 0 else None
+            ingress = json.loads(ingress_run.stdout) if ingress_run.returncode == 0 else None
+            egress = json.loads(egress_run.stdout) if egress_run.returncode == 0 else None
+        except (OSError, ValueError, subprocess.TimeoutExpired):
+            qdiscs, ingress, egress = None, None, None
+        clsact_count = (
+            sum(1 for item in qdiscs if isinstance(item, dict) and item.get("kind") == "clsact")
+            if isinstance(qdiscs, list)
+            else -1
+        )
+        classic_ok = clsact_count == 1 and ingress == [] and egress == []
+        classic_baseline = {
+            "clsact_count": clsact_count,
+            "ingress_filters": len(ingress) if isinstance(ingress, list) else None,
+            "egress_filters": len(egress) if isinstance(egress, list) else None,
+            "clean": classic_ok,
+        }
     return {
         "schema": "wg-mix-public-endpoint-probe-v1",
         "role": role,
@@ -274,11 +341,18 @@ def probe(role: str) -> dict[str, Any]:
         "attachment_backend": spec["attachment_backend"],
         "minimum_kernel": ".".join(str(value) for value in spec["minimum_kernel"]),
         "kernel_floor_ok": kernel_ok,
-        "eligible": host_ok and not missing and bpffs and kernel_ok and link is not None,
+        "classic_tc_baseline": classic_baseline,
+        "eligible": host_ok and not missing and bpffs and kernel_ok and link is not None and classic_ok,
     }
 
 
-def load_owner(root: Path, run_id: str, role: str, commit: str) -> dict[str, Any]:
+def load_owner(
+    root: Path,
+    run_id: str,
+    role: str,
+    commit: str,
+    claim_sha256: str,
+) -> dict[str, Any]:
     owner_path = root / "owner.json"
     fd = -1
     try:
@@ -313,6 +387,7 @@ def load_owner(root: Path, run_id: str, role: str, commit: str) -> dict[str, Any
         "role": role,
         "commit": commit,
         "run_root": str(root),
+        "claim_sha256": claim_sha256,
     }
     if not isinstance(owner, dict) or any(owner.get(k) != v for k, v in expected.items()):
         stop("owner-drift", 79)
@@ -325,19 +400,29 @@ def prepare(args: argparse.Namespace) -> None:
     self_check(root, args.script_sha256)
     if not COMMIT_RE.fullmatch(args.commit):
         stop("commit", 64)
+    if not args.claim_sha256 or not SHA256_RE.fullmatch(args.claim_sha256):
+        stop("claim-sha256", 64)
     entries = sorted(path.name for path in root.iterdir())
-    if entries != ["root-endpoint.py"]:
+    if entries != ["root-claim.json", "root-endpoint.py"]:
         stop("prepare-root-not-empty", 79)
+    for name in (
+        "script_sha256",
+        "claim_sha256",
+        "binary_sha256",
+        "object_sha256",
+        "traffic_sha256",
+    ):
+        if not SHA256_RE.fullmatch(getattr(args, name)):
+            stop(f"prepare-{name}", 64)
+    claim = secure_regular(root / "root-claim.json", args.claim_sha256, root_owned=True)
+    if stat.S_IMODE(claim.st_mode) != 0o600:
+        stop("prepare-claim-mode", 79)
     current_probe = probe(args.role)
-    if not current_probe["eligible"]:
-        stop("probe-ineligible", 77)
     artifacts = {
         "binary": (Path(args.binary_source), "wg-mix-ebpf", args.binary_sha256, 0o700),
         "object": (Path(args.object_source), "wg_mix_tc.o", args.object_sha256, 0o600),
         "traffic": (Path(args.traffic_source), "traffic.py", args.traffic_sha256, 0o700),
     }
-    for source, name, digest, mode in artifacts.values():
-        copy_new(source, root / name, digest, mode)
     owner = {
         "schema": SCHEMA,
         "run_id": args.run_id,
@@ -350,14 +435,20 @@ def prepare(args: argparse.Namespace) -> None:
         "ifindex": current_probe["ifindex"],
         "attachment_backend": current_probe["attachment_backend"],
         "script_sha256": args.script_sha256,
+        "claim_sha256": args.claim_sha256,
         "binary_sha256": args.binary_sha256,
         "object_sha256": args.object_sha256,
         "traffic_sha256": args.traffic_sha256,
     }
-    write_new(root / "owner.json", (json.dumps(owner, sort_keys=True) + "\n").encode(), 0o600)
+    write_owner_new(root, (json.dumps(owner, sort_keys=True) + "\n").encode())
+    if not current_probe["eligible"]:
+        stop("probe-ineligible", 77)
+    for source, name, digest, mode in artifacts.values():
+        copy_new(source, root / name, digest, mode)
     (root / "state").mkdir(mode=0o700)
     (root / "runtime").mkdir(mode=0o700)
     (root / "evidence").mkdir(mode=0o700)
+    write_new(root / "services.lock", b"", 0o600)
     private = command([TOOLS["wg"], "genkey"])
     if len(private) != 45 or not private.endswith(b"\n"):
         stop("private-key-shape")
@@ -379,16 +470,68 @@ def prepare(args: argparse.Namespace) -> None:
     )
 
 
-def artifact_check(root: Path, owner: dict[str, Any]) -> None:
+def artifact_check(
+    root: Path, owner: dict[str, Any], *, allow_missing: bool = False
+) -> None:
     for name, key, mode in (
         ("root-endpoint.py", "script_sha256", 0o700),
+        ("root-claim.json", "claim_sha256", 0o600),
         ("wg-mix-ebpf", "binary_sha256", 0o700),
         ("wg_mix_tc.o", "object_sha256", 0o600),
         ("traffic.py", "traffic_sha256", 0o700),
     ):
-        observed = secure_regular(root / name, owner[key], root_owned=True)
+        path = root / name
+        if allow_missing and name not in {"root-endpoint.py", "root-claim.json"}:
+            if not path.exists():
+                continue
+            try:
+                observed = os.stat(path, follow_symlinks=False)
+            except OSError:
+                stop(f"artifact-partial:{name}", 79)
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != 0
+                or observed.st_gid != 0
+                or observed.st_nlink != 1
+                or stat.S_IMODE(observed.st_mode) != mode
+            ):
+                stop(f"artifact-partial:{name}", 79)
+            continue
+        observed = secure_regular(path, owner[key], root_owned=True)
         if stat.S_IMODE(observed.st_mode) != mode:
             stop(f"artifact-mode:{name}", 79)
+
+
+def abort_unclaimed(args: argparse.Namespace) -> None:
+    root = canonical_run_root(args.run_id, args.role)
+    require_root_directory(root)
+    self_check(root, args.script_sha256)
+    entries = sorted(path.name for path in root.iterdir())
+    if entries not in (
+        ["root-claim.json", "root-endpoint.py"],
+        ["owner.pending.json", "root-claim.json", "root-endpoint.py"],
+    ):
+        stop("abort-unclaimed-foreign", 79)
+    claim = secure_regular(root / "root-claim.json", args.claim_sha256, root_owned=True)
+    if stat.S_IMODE(claim.st_mode) != 0o600:
+        stop("abort-unclaimed-claim", 79)
+    pending = root / "owner.pending.json"
+    if pending.exists():
+        observed = pending.lstat()
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid != 0
+            or observed.st_gid != 0
+            or observed.st_nlink != 1
+            or stat.S_IMODE(observed.st_mode) != 0o600
+            or observed.st_size > 16 * 1024
+        ):
+            stop("abort-unclaimed-owner-pending", 79)
+        os.unlink(pending)
+    os.unlink(root / "root-claim.json")
+    os.unlink(root / "root-endpoint.py")
+    os.rmdir(root)
+    print(json.dumps({"status": "aborted-unclaimed", "run_id": args.run_id, "role": args.role}))
 
 
 def config_bytes(root: Path, role: str) -> tuple[bytes, bytes]:
@@ -469,7 +612,9 @@ def verify_host(owner: dict[str, Any]) -> None:
 def apply_endpoint(args: argparse.Namespace) -> None:
     root = canonical_run_root(args.run_id, args.role)
     require_root_directory(root)
-    owner = load_owner(root, args.run_id, args.role, args.commit)
+    owner = load_owner(
+        root, args.run_id, args.role, args.commit, args.claim_sha256
+    )
     self_check(root, owner["script_sha256"])
     artifact_check(root, owner)
     verify_host(owner)
@@ -495,8 +640,19 @@ def apply_endpoint(args: argparse.Namespace) -> None:
         "attachment_backend": spec["attachment_backend"],
     }
     write_new(root / "intent.json", (json.dumps(intent, sort_keys=True) + "\n").encode(), 0o600)
-    command([TOOLS["ip"], "link", "add", "dev", wg_name, "type", "wireguard"])
-    command([TOOLS["ip"], "link", "set", "dev", wg_name, "alias", intent["alias"]])
+    command(
+        [
+            TOOLS["ip"],
+            "link",
+            "add",
+            "dev",
+            wg_name,
+            "alias",
+            intent["alias"],
+            "type",
+            "wireguard",
+        ]
+    )
     wg_argv = [
         TOOLS["wg"],
         "set",
@@ -570,39 +726,72 @@ def apply_endpoint(args: argparse.Namespace) -> None:
     print(json.dumps({"status": "applied", "role": args.role, "run_id": args.run_id}))
 
 
-def process_start_time(pid: int) -> str:
+def run_recorded_command(
+    root: Path, name: str, argv: list[str], *, timeout: int
+) -> None:
+    lock_fd = acquire_service_lock(root, exclusive=False)
     try:
-        raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+        if not (root / "applied.json").is_file() or (root / "restored.json").exists():
+            stop(f"recorded-command-state:{name}", 79)
+        with open(root / f"evidence/{name}.stdout", "xb", buffering=0) as stdout:
+            with open(root / f"evidence/{name}.stderr", "xb", buffering=0) as stderr:
+                completed = subprocess.run(
+                    argv,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stdout,
+                    stderr=stderr,
+                    check=False,
+                    timeout=timeout,
+                    env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
+                    pass_fds=(lock_fd,),
+                )
+    except (OSError, subprocess.TimeoutExpired) as error:
+        stop(f"recorded-command:{name}:{type(error).__name__}", 77)
+    finally:
+        os.close(lock_fd)
+    if completed.returncode != 0:
+        stop(f"recorded-command:{name}:rc{completed.returncode}", 77)
+
+
+def acquire_service_lock(root: Path, *, exclusive: bool) -> int:
+    path = root / "services.lock"
+    try:
+        fd = os.open(
+            path,
+            os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
+        )
+        observed = os.fstat(fd)
+        named = os.stat(path, follow_symlinks=False)
+        if (
+            not stat.S_ISREG(observed.st_mode)
+            or observed.st_uid != 0
+            or observed.st_gid != 0
+            or observed.st_nlink != 1
+            or observed.st_size != 0
+            or stat.S_IMODE(observed.st_mode) != 0o600
+            or (observed.st_dev, observed.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            stop("services-lock-shape", 79)
+        operation = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(fd, operation | fcntl.LOCK_NB)
+        return fd
+    except BlockingIOError:
+        if "fd" in locals():
+            os.close(fd)
+        stop("services-active", 78)
     except OSError:
-        stop("process-stat", 79)
-    closing = raw.rfind(")")
-    if closing < 1:
-        stop("process-stat-shape", 79)
-    tail = raw[closing + 2 :].split()
-    # tail[0] is field 3 (state); starttime is field 22.
-    if len(tail) < 20 or not tail[19].isdigit():
-        stop("process-stat-shape", 79)
-    return tail[19]
-
-
-def save_process(root: Path, name: str, process: subprocess.Popen[bytes], argv: list[str]) -> None:
-    record = {
-        "pid": process.pid,
-        "start_time": process_start_time(process.pid),
-        "argv": argv,
-    }
-    write_new(
-        root / f"{name}.pid.json",
-        (json.dumps(record, sort_keys=True) + "\n").encode(),
-        0o600,
-    )
+        if "fd" in locals():
+            os.close(fd)
+        stop("services-lock", 79)
 
 
 def start_server(args: argparse.Namespace) -> None:
     root = canonical_run_root(args.run_id, args.role)
-    owner = load_owner(root, args.run_id, args.role, args.commit)
+    owner = load_owner(
+        root, args.run_id, args.role, args.commit, args.claim_sha256
+    )
     artifact_check(root, owner)
-    if not (root / "applied.json").is_file() or (root / "server.pid.json").exists():
+    if not (root / "applied.json").is_file():
         stop("server-state", 79)
     spec = ROLE[args.role]
     argv = [
@@ -616,27 +805,24 @@ def start_server(args: argparse.Namespace) -> None:
         "--seconds",
         str(args.seconds),
     ]
-    stdout = open(root / "evidence/server.stdout", "xb", buffering=0)
-    stderr = open(root / "evidence/server.stderr", "xb", buffering=0)
-    try:
-        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=stdout, stderr=stderr, start_new_session=True)
-    finally:
-        stdout.close()
-        stderr.close()
-    save_process(root, "server", process, argv)
-    print(json.dumps({"status": "server-started", "pid": process.pid}))
+    run_recorded_command(root, "server", argv, timeout=args.seconds + 15)
+    print(json.dumps({"status": "server-complete", "role": args.role}))
 
 
 def start_capture(args: argparse.Namespace) -> None:
     root = canonical_run_root(args.run_id, args.role)
-    owner = load_owner(root, args.run_id, args.role, args.commit)
+    owner = load_owner(
+        root, args.run_id, args.role, args.commit, args.claim_sha256
+    )
     artifact_check(root, owner)
-    if not (root / "applied.json").is_file() or (root / "capture.pid.json").exists():
+    if not (root / "applied.json").is_file():
         stop("capture-state", 79)
     listen_port = str(ROLE[args.role]["listen_port"])
     argv = [
         TOOLS["timeout"],
         "--signal=INT",
+        "--kill-after=5s",
+        "--preserve-status",
         str(args.seconds),
         TOOLS["tcpdump"],
         "-i",
@@ -652,26 +838,15 @@ def start_capture(args: argparse.Namespace) -> None:
         "port",
         listen_port,
     ]
-    stdout = open(root / "evidence/capture.stdout", "xb", buffering=0)
-    stderr = open(root / "evidence/capture.stderr", "xb", buffering=0)
-    try:
-        process = subprocess.Popen(
-            argv,
-            stdin=subprocess.DEVNULL,
-            stdout=stdout,
-            stderr=stderr,
-            start_new_session=True,
-        )
-    finally:
-        stdout.close()
-        stderr.close()
-    save_process(root, "capture", process, argv)
-    print(json.dumps({"status": "capture-started", "pid": process.pid}))
+    run_recorded_command(root, "capture", argv, timeout=args.seconds + 15)
+    print(json.dumps({"status": "capture-complete", "role": args.role}))
 
 
 def client(args: argparse.Namespace) -> None:
     root = canonical_run_root(args.run_id, args.role)
-    owner = load_owner(root, args.run_id, args.role, args.commit)
+    owner = load_owner(
+        root, args.run_id, args.role, args.commit, args.claim_sha256
+    )
     artifact_check(root, owner)
     if not (root / "applied.json").is_file():
         stop("client-state", 79)
@@ -695,7 +870,9 @@ def client(args: argparse.Namespace) -> None:
 
 def ping_peer(args: argparse.Namespace) -> None:
     root = canonical_run_root(args.run_id, args.role)
-    owner = load_owner(root, args.run_id, args.role, args.commit)
+    owner = load_owner(
+        root, args.run_id, args.role, args.commit, args.claim_sha256
+    )
     artifact_check(root, owner)
     if not (root / "applied.json").is_file():
         stop("ping-state", 79)
@@ -720,7 +897,9 @@ def ping_peer(args: argparse.Namespace) -> None:
 
 def sample(args: argparse.Namespace) -> None:
     root = canonical_run_root(args.run_id, args.role)
-    owner = load_owner(root, args.run_id, args.role, args.commit)
+    owner = load_owner(
+        root, args.run_id, args.role, args.commit, args.claim_sha256
+    )
     artifact_check(root, owner)
     spec = ROLE[args.role]
     transfer = command([TOOLS["wg"], "show", spec["wg"], "transfer"]).decode().strip().split("\t")
@@ -776,15 +955,24 @@ def sample(args: argparse.Namespace) -> None:
 
 def export_evidence(args: argparse.Namespace) -> None:
     root = canonical_run_root(args.run_id, args.role)
-    owner = load_owner(root, args.run_id, args.role, args.commit)
-    artifact_check(root, owner)
+    owner = load_owner(
+        root, args.run_id, args.role, args.commit, args.claim_sha256
+    )
+    partial = not (root / "intent.json").exists()
+    artifact_check(root, owner, allow_missing=partial)
     if not (root / "restored.json").is_file():
         stop("export-before-restore", 79)
     evidence = root / "evidence"
-    require_root_directory(evidence)
     encoded: dict[str, str] = {}
     total = 0
-    for entry in sorted(os.scandir(evidence), key=lambda item: item.name):
+    if not evidence.exists():
+        if not partial:
+            stop("export-evidence-missing", 79)
+        entries: list[os.DirEntry[str]] = []
+    else:
+        require_root_directory(evidence)
+        entries = sorted(os.scandir(evidence), key=lambda item: item.name)
+    for entry in entries:
         if (
             not KNOWN_EVIDENCE_RE.fullmatch(entry.name)
             or not entry.is_file(follow_symlinks=False)
@@ -824,46 +1012,6 @@ def export_evidence(args: argparse.Namespace) -> None:
     )
 
 
-def verify_process(record_path: Path) -> tuple[int, dict[str, Any]]:
-    try:
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-        pid = int(record["pid"])
-        argv = record["argv"]
-    except (OSError, ValueError, KeyError, TypeError):
-        stop(f"process-record:{record_path.name}", 79)
-    if pid < 2 or not isinstance(argv, list) or not all(isinstance(item, str) for item in argv):
-        stop(f"process-record-shape:{record_path.name}", 79)
-    if process_start_time(pid) != record.get("start_time"):
-        stop(f"process-identity:{record_path.name}", 79)
-    try:
-        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
-    except OSError:
-        stop(f"process-cmdline:{record_path.name}", 79)
-    if raw.rstrip(b"\0").split(b"\0") != [item.encode() for item in argv]:
-        stop(f"process-argv:{record_path.name}", 79)
-    return pid, record
-
-
-def stop_process(root: Path, name: str) -> None:
-    record_path = root / f"{name}.pid.json"
-    if not record_path.exists():
-        return
-    try:
-        record = json.loads(record_path.read_text(encoding="utf-8"))
-        recorded_pid = int(record["pid"])
-    except (OSError, ValueError, KeyError, TypeError):
-        stop(f"process-record:{record_path.name}", 79)
-    if not Path(f"/proc/{recorded_pid}").exists():
-        return
-    pid, _ = verify_process(record_path)
-    os.kill(pid, signal.SIGTERM)
-    deadline = time.monotonic() + 8
-    while time.monotonic() < deadline and Path(f"/proc/{pid}").exists():
-        time.sleep(0.1)
-    if Path(f"/proc/{pid}").exists():
-        stop(f"process-did-not-stop:{name}", 79)
-
-
 def verify_owned_link(root: Path, run_id: str, role: str) -> bool:
     name = ROLE[role]["wg"]
     if not Path(f"/sys/class/net/{name}").exists():
@@ -881,10 +1029,39 @@ def verify_owned_link(root: Path, run_id: str, role: str) -> bool:
 
 def restore(args: argparse.Namespace) -> None:
     root = canonical_run_root(args.run_id, args.role)
-    owner = load_owner(root, args.run_id, args.role, args.commit)
-    artifact_check(root, owner)
-    stop_process(root, "server")
-    stop_process(root, "capture")
+    owner = load_owner(
+        root, args.run_id, args.role, args.commit, args.claim_sha256
+    )
+    partial = not (root / "intent.json").exists()
+    artifact_check(root, owner, allow_missing=partial)
+    if partial:
+        if not (root / "restored.json").exists():
+            write_new(
+                root / "restored.json",
+                (
+                    json.dumps(
+                        {
+                            "status": "restored-partial-prepare",
+                            "run_id": args.run_id,
+                            "role": args.role,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n"
+                ).encode(),
+                0o600,
+            )
+        print(
+            json.dumps(
+                {
+                    "status": "restored-partial-prepare",
+                    "run_id": args.run_id,
+                    "role": args.role,
+                }
+            )
+        )
+        return
+    service_lock_fd = acquire_service_lock(root, exclusive=True)
     pin_path = Path(f"/sys/fs/bpf/{root.name}")
     if pin_path.exists():
         binary_command(
@@ -903,23 +1080,40 @@ def restore(args: argparse.Namespace) -> None:
         command([TOOLS["ip"], "link", "delete", "dev", ROLE[args.role]["wg"]])
     if pin_path.exists() or Path(f"/sys/class/net/{ROLE[args.role]['wg']}").exists():
         stop("restore-postcondition", 79)
+    if args.role == "public":
+        baseline = probe(args.role).get("classic_tc_baseline")
+        if not isinstance(baseline, dict) or not baseline.get("clean"):
+            stop("restore-classic-tc-postcondition", 79)
     if not (root / "restored.json").exists():
         write_new(
             root / "restored.json",
             (json.dumps({"status": "restored", "run_id": args.run_id, "role": args.role}, sort_keys=True) + "\n").encode(),
             0o600,
         )
+    os.close(service_lock_fd)
     print(json.dumps({"status": "restored", "run_id": args.run_id, "role": args.role}))
 
 
 def purge(args: argparse.Namespace) -> None:
     root = canonical_run_root(args.run_id, args.role)
-    owner = load_owner(root, args.run_id, args.role, args.commit)
-    artifact_check(root, owner)
+    owner = load_owner(
+        root, args.run_id, args.role, args.commit, args.claim_sha256
+    )
+    partial = not (root / "intent.json").exists()
+    artifact_check(root, owner, allow_missing=partial)
     if not (root / "restored.json").is_file():
         stop("purge-before-restore", 79)
-    if Path(f"/sys/class/net/{ROLE[args.role]['wg']}").exists() or Path(f"/sys/fs/bpf/{root.name}").exists():
+    purge_service_fd = -1
+    if not partial:
+        purge_service_fd = acquire_service_lock(root, exclusive=True)
+    if not partial and (
+        Path(f"/sys/class/net/{ROLE[args.role]['wg']}").exists()
+        or Path(f"/sys/fs/bpf/{root.name}").exists()
+    ):
         stop("purge-live-resource", 79)
+    intent = root / "intent.json"
+    if intent.exists():
+        os.unlink(intent)
     evidence = root / "evidence"
     state_dir = root / "state"
     runtime_dir = root / "runtime"
@@ -943,12 +1137,19 @@ def purge(args: argparse.Namespace) -> None:
     for entry in os.scandir(root):
         if entry.name not in KNOWN_ROOT_FILES or not entry.is_file(follow_symlinks=False):
             stop(f"purge-foreign:root:{entry.name}", 79)
-    for name in sorted(KNOWN_ROOT_FILES - {"root-endpoint.py"}):
+    terminal_files = {"root-endpoint.py", "owner.json", "restored.json"}
+    for name in sorted(KNOWN_ROOT_FILES - terminal_files - {"intent.json"}):
         path = root / name
         if path.exists():
             os.unlink(path)
+    restored = root / "restored.json"
+    if restored.exists():
+        os.unlink(restored)
+    os.unlink(root / "owner.json")
     os.unlink(root / "root-endpoint.py")
     os.rmdir(root)
+    if purge_service_fd >= 0:
+        os.close(purge_service_fd)
     print(json.dumps({"status": "purged", "run_id": args.run_id, "role": args.role}))
 
 
@@ -958,6 +1159,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "mode",
         choices=(
             "probe",
+            "abort-unclaimed",
             "prepare",
             "apply",
             "server",
@@ -974,6 +1176,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--run-id")
     parser.add_argument("--commit")
     parser.add_argument("--script-sha256")
+    parser.add_argument("--claim-sha256")
     parser.add_argument("--binary-source")
     parser.add_argument("--binary-sha256")
     parser.add_argument("--object-source")
@@ -997,6 +1200,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.mode == "prepare":
         prepare_required = (
             "script_sha256",
+            "claim_sha256",
             "binary_source",
             "binary_sha256",
             "object_source",
@@ -1006,6 +1210,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         )
         if any(not getattr(args, name) for name in prepare_required):
             stop("prepare-arguments", 64)
+    if args.mode == "abort-unclaimed" and (
+        not args.script_sha256 or not args.claim_sha256
+    ):
+        stop("abort-unclaimed-arguments", 64)
     if args.mode == "apply" and not args.peer_public_key:
         stop("apply-arguments", 64)
     if args.mode == "client" and not args.traffic_mode:
@@ -1024,6 +1232,8 @@ def main(argv: list[str]) -> int:
     args = parse_args(argv)
     if args.mode == "probe":
         print(json.dumps(probe(args.role), sort_keys=True))
+    elif args.mode == "abort-unclaimed":
+        abort_unclaimed(args)
     elif args.mode == "prepare":
         prepare(args)
     elif args.mode == "apply":
