@@ -82,6 +82,11 @@ def recovery_names(args: argparse.Namespace) -> tuple[str, str, str, str]:
     return intake, root, f"{intake}/{name}", f"{root}/{name}"
 
 
+def recovery_state_dir(args: argparse.Namespace) -> str:
+    _, root = remote_layout(args.old_run_id, ROLE)
+    return f"{root}/recovery-state-{args.recovery_id}"
+
+
 def detach_argv(args: argparse.Namespace) -> list[str]:
     _, old_root, _, recovery_binary = recovery_names(args)
     pin_path = f"/sys/fs/bpf/wg-mix-ebpf-public-smoke-{args.old_run_id}-public"
@@ -102,7 +107,7 @@ def detach_argv(args: argparse.Namespace) -> list[str]:
         "--run-dir",
         f"{old_root}/runtime",
         "--state-dir",
-        f"{old_root}/state",
+        recovery_state_dir(args),
     ]
 
 
@@ -146,6 +151,11 @@ def contract(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]
                 "/var/lib/wg-mix-ebpf/pin-owners/<owned-resource-files>",
                 "/run/wg-mix-ebpf/pin-locks/<owned-resource-key>.lock",
             ],
+            "shared_lifecycle_and_lock": [
+                "/run/.wg-mix-ebpf-daemon.lease.maintenance",
+                "/run/wg-mix-ebpf/daemon.lease",
+                f"{root}/runtime/lock",
+            ],
             "preserved": [
                 root,
                 intake,
@@ -154,6 +164,8 @@ def contract(args: argparse.Namespace, paths: dict[str, Path]) -> dict[str, Any]
                 "firewall",
                 "offload",
                 "mtu",
+                f"{root}/state/attach-state.json",
+                f"absent:{recovery_state_dir(args)}",
             ],
         },
     }
@@ -254,6 +266,35 @@ def verify_classic_removed(remote: Remote, args: argparse.Namespace) -> None:
         stop("pin-remains", 79)
 
 
+def attach_state_snapshot(
+    remote: Remote, args: argparse.Namespace
+) -> tuple[str, str] | None:
+    _, root = remote_layout(args.old_run_id, ROLE)
+    state_dir = f"{root}/state"
+    entries = remote_directory_entries(remote, state_dir, privileged=True)
+    if entries not in ({}, {"attach-state.json": "f"}):
+        stop("attach-state-foreign", 79)
+    if not entries:
+        return None
+    path = f"{state_dir}/attach-state.json"
+    prefix = ("/usr/bin/sudo", "-S", "-p", "PUBLIC_SUDO_PASSWORD:")
+    shape = remote.ssh(*prefix, "/usr/bin/stat", "-c", "%u:%g:%a:%h:%s:%F", path)
+    parts = shape.split(":")
+    if (
+        len(parts) != 6
+        or parts[:4] != ["0", "0", "600", "1"]
+        or not parts[4].isdigit()
+        or parts[5] != "regular file"
+    ):
+        stop("attach-state-shape", 79)
+    digest = remote.ssh(*prefix, "/usr/bin/sha256sum", "--", path)
+    if not digest.endswith(f"  {path}") or not SHA256_RE.fullmatch(
+        digest.removesuffix(f"  {path}")
+    ):
+        stop("attach-state-sha256", 79)
+    return shape, digest
+
+
 def stage_recovery_binary(
     remote: Remote,
     args: argparse.Namespace,
@@ -346,8 +387,17 @@ def execute_recovery(args: argparse.Namespace, paths: dict[str, Path]) -> None:
         stop("contract-sha256", 66)
     remote = Remote(paths["transport"], ROLE)
     intake_binary, root_binary = stage_recovery_binary(remote, args, paths)
+    _, root = remote_layout(args.old_run_id, ROLE)
+    recovery_state_name = recovery_state_dir(args).rsplit("/", 1)[1]
+    if named_entry(remote, root, recovery_state_name, privileged=True):
+        stop("recovery-state-exists", 79)
+    before_state = attach_state_snapshot(remote, args)
     remote.ssh(*detach_argv(args))
     verify_classic_removed(remote, args)
+    if named_entry(remote, root, recovery_state_name, privileged=True):
+        stop("recovery-state-created", 79)
+    if attach_state_snapshot(remote, args) != before_state:
+        stop("attach-state-changed", 79)
     remove_recovery_binary(remote, args, intake_binary, root_binary)
     print(
         "PUBLIC_CLASSIC_JOURNAL_RECOVERED "
