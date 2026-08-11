@@ -484,6 +484,74 @@ class PublicSmokeTest(unittest.TestCase):
             command_calls[:3],
         )
 
+    def test_b82_applies_endpoint_in_a_separate_labeled_wg_step(self) -> None:
+        claim_sha256 = "c" * 64
+        args = SimpleNamespace(
+            run_id="0123456789ab",
+            role="b82",
+            commit="1" * 40,
+            claim_sha256=claim_sha256,
+            peer_public_key=base64.b64encode(b"q" * 32).decode("ascii"),
+        )
+        command_calls: list[tuple[list[str], dict[str, object]]] = []
+
+        def command(argv: list[str], **kwargs: object) -> bytes:
+            command_calls.append((argv, kwargs))
+            return b""
+
+        status = json.dumps(
+            {
+                "dataplane": {
+                    "underlays": [
+                        {
+                            "ingress_attached": True,
+                            "egress_attached": True,
+                            "filters": [{"backend": "tcx"}, {"backend": "tcx"}],
+                        }
+                    ]
+                }
+            }
+        ).encode()
+        with (
+            mock.patch.object(self.root, "require_root_directory"),
+            mock.patch.object(
+                self.root, "load_owner", return_value={"script_sha256": "d" * 64}
+            ),
+            mock.patch.object(self.root, "self_check"),
+            mock.patch.object(self.root, "artifact_check"),
+            mock.patch.object(self.root, "verify_host"),
+            mock.patch.object(Path, "exists", return_value=False),
+            mock.patch.object(self.root, "write_new"),
+            mock.patch.object(self.root, "command", side_effect=command),
+            mock.patch.object(
+                self.root, "config_bytes", return_value=(b"wg", b"agent")
+            ),
+            mock.patch.object(self.root, "binary_command", side_effect=(b"", status)),
+        ):
+            self.root.apply_endpoint(args)
+
+        wg_calls = [
+            item
+            for item in command_calls
+            if item[0][:2] == [self.root.TOOLS["wg"], "set"]
+        ]
+        self.assertEqual(2, len(wg_calls))
+        self.assertEqual("wg-base", wg_calls[0][1].get("stop_label"))
+        self.assertNotIn("endpoint", wg_calls[0][0])
+        self.assertEqual(
+            [
+                self.root.TOOLS["wg"],
+                "set",
+                "wgps82",
+                "peer",
+                args.peer_public_key,
+                "endpoint",
+                "47.116.202.155:31155",
+            ],
+            wg_calls[1][0],
+        )
+        self.assertEqual("wg-endpoint", wg_calls[1][1].get("stop_label"))
+
     def test_local_evidence_export_resumes_partial_and_linked_publish(self) -> None:
         payload = b"bounded-evidence-payload\n"
         document = {

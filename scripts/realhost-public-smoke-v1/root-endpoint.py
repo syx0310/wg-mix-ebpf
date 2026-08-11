@@ -89,7 +89,11 @@ def stop(reason: str, rc: int = 78) -> NoReturn:
 
 
 def command(
-    argv: list[str], *, input_bytes: bytes | None = None, timeout: int = 60
+    argv: list[str],
+    *,
+    input_bytes: bytes | None = None,
+    timeout: int = 60,
+    stop_label: str | None = None,
 ) -> bytes:
     try:
         completed = subprocess.run(
@@ -102,9 +106,11 @@ def command(
             env={"PATH": "/usr/sbin:/usr/bin:/sbin:/bin", "LC_ALL": "C"},
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        stop(f"command:{Path(argv[0]).name}:{type(error).__name__}")
+        label = stop_label or Path(argv[0]).name
+        stop(f"command:{label}:{type(error).__name__}")
     if completed.returncode != 0:
-        stop(f"command:{Path(argv[0]).name}:rc{completed.returncode}", 77)
+        label = stop_label or Path(argv[0]).name
+        stop(f"command:{label}:rc{completed.returncode}", 77)
     return completed.stdout
 
 
@@ -693,9 +699,20 @@ def apply_endpoint(args: argparse.Namespace) -> None:
         "persistent-keepalive",
         "15",
     ]
+    command(wg_argv, stop_label="wg-base")
     if args.role == "b82":
-        wg_argv.extend(["endpoint", "47.116.202.155:31155"])
-    command(wg_argv)
+        command(
+            [
+                TOOLS["wg"],
+                "set",
+                wg_name,
+                "peer",
+                args.peer_public_key,
+                "endpoint",
+                "47.116.202.155:31155",
+            ],
+            stop_label="wg-endpoint",
+        )
     command([TOOLS["ip"], "address", "add", spec["address"], "dev", wg_name])
     command([TOOLS["ip"], "link", "set", "dev", wg_name, "up"])
     wg_config, agent = config_bytes(root, args.role)
