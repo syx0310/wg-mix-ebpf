@@ -62,6 +62,46 @@ func TestReviewedSystemToolAcceptsRootControlledMulticallSymlink(t *testing.T) {
 	}
 }
 
+func TestReviewedSystemToolRetriesTransientOpenat2EAGAIN(t *testing.T) {
+	calls := 0
+	descriptor, err := openReviewedSystemToolNoMagicLinks(
+		41,
+		"usr/bin/env",
+		func(rootFD int, relativePath string, how *unix.OpenHow) (int, error) {
+			calls++
+			if rootFD != 41 || relativePath != "usr/bin/env" {
+				t.Fatalf("openat2 target = fd:%d path:%q", rootFD, relativePath)
+			}
+			if how.Flags != uint64(unix.O_PATH|unix.O_CLOEXEC) ||
+				how.Resolve != uint64(unix.RESOLVE_IN_ROOT|unix.RESOLVE_NO_MAGICLINKS) {
+				t.Fatalf("openat2 policy = %#v", how)
+			}
+			if calls < 3 {
+				return -1, unix.EAGAIN
+			}
+			return 73, nil
+		},
+	)
+	if err != nil || descriptor != 73 || calls != 3 {
+		t.Fatalf("transient openat2 = fd:%d calls:%d err:%v", descriptor, calls, err)
+	}
+}
+
+func TestReviewedSystemToolBoundsTransientOpenat2Retries(t *testing.T) {
+	calls := 0
+	_, err := openReviewedSystemToolNoMagicLinks(
+		41,
+		"usr/bin/env",
+		func(int, string, *unix.OpenHow) (int, error) {
+			calls++
+			return -1, unix.EAGAIN
+		},
+	)
+	if !errors.Is(err, unix.EAGAIN) || calls != reviewedOpenat2RetryLimit {
+		t.Fatalf("bounded openat2 retries = calls:%d err:%v", calls, err)
+	}
+}
+
 func TestReviewedSystemToolPreservesLogicalArgv0AndHeldFD(t *testing.T) {
 	fixture := newReviewedToolFixture(t)
 	wantEnvironment := []string{"PATH=/usr/bin", "LC_ALL=C"}

@@ -13,11 +13,12 @@ import (
 )
 
 const (
-	reviewedSystemRoot          = "/"
-	reviewedSystemUID    uint32 = 0
-	reviewedSystemGID    uint32 = 0
-	maximumSymlinkHops          = 40
-	maximumResolvedParts        = 1024
+	reviewedSystemRoot               = "/"
+	reviewedSystemUID         uint32 = 0
+	reviewedSystemGID         uint32 = 0
+	maximumSymlinkHops               = 40
+	maximumResolvedParts             = 1024
+	reviewedOpenat2RetryLimit        = 8
 )
 
 var reviewedSystemToolPaths = []string{
@@ -179,15 +180,10 @@ func openReviewedSystemTool(
 		!equalReviewedChains(first.chain, second.chain) {
 		return nil, errors.New("reviewed system tool path changed while being sealed")
 	}
-	openedFD, err := unix.Openat2(
+	openedFD, err := openReviewedSystemToolNoMagicLinks(
 		first.rootFD,
 		strings.TrimPrefix(logicalPath, "/"),
-		&unix.OpenHow{
-			Flags: uint64(unix.O_PATH | unix.O_CLOEXEC),
-			Resolve: uint64(
-				unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS,
-			),
-		},
+		unix.Openat2,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("open reviewed system tool without magic links: %w", err)
@@ -202,6 +198,36 @@ func openReviewedSystemTool(
 	}
 	keepFirst = true
 	return first, nil
+}
+
+type reviewedOpenat2Func func(int, string, *unix.OpenHow) (int, error)
+
+func openReviewedSystemToolNoMagicLinks(
+	rootFD int,
+	relativePath string,
+	openat2 reviewedOpenat2Func,
+) (int, error) {
+	if rootFD < 0 || relativePath == "" || openat2 == nil {
+		return -1, errors.New("reviewed openat2 contract is invalid")
+	}
+	how := &unix.OpenHow{
+		Flags: uint64(unix.O_PATH | unix.O_CLOEXEC),
+		Resolve: uint64(
+			unix.RESOLVE_IN_ROOT | unix.RESOLVE_NO_MAGICLINKS,
+		),
+	}
+	var err error
+	for attempt := 0; attempt < reviewedOpenat2RetryLimit; attempt++ {
+		var descriptor int
+		descriptor, err = openat2(rootFD, relativePath, how)
+		if err == nil {
+			return descriptor, nil
+		}
+		if !errors.Is(err, unix.EAGAIN) {
+			return -1, err
+		}
+	}
+	return -1, err
 }
 
 func validateReviewedLogicalPath(path string) error {

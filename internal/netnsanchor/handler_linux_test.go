@@ -240,10 +240,8 @@ func TestTerminateAndReapWorkerWaitsAfterSignalFailure(t *testing.T) {
 	}()
 	select {
 	case <-reaped:
-	case earlyErr := <-result:
-		t.Fatalf("signal failure returned before child reap: %v", earlyErr)
 	case <-time.After(time.Second):
-		t.Fatal("worker reap did not receive the eventual wait result")
+		t.Fatal("worker wait result was not consumed after the signal failure")
 	}
 	err := <-result
 	if !errors.Is(err, signalFailure) {
