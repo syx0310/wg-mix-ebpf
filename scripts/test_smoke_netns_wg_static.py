@@ -25,6 +25,9 @@ ANCHOR_PACKAGE = SCRIPT_PATH.parent.parent / "internal" / "netnsanchor"
 FAILED_RUN_RECOVERY_PATH = pathlib.Path(__file__).with_name(
     "recover-smoke-netns-wg-failed-run.py"
 )
+FAILED_RUN_RECOVERY_TEST_PATH = pathlib.Path(__file__).with_name(
+    "test_recover_smoke_netns_wg_failed_run.py"
+)
 
 
 class SmokeNetNSWGStaticTests(unittest.TestCase):
@@ -38,6 +41,9 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         cls.go_sum_source = GO_SUM_PATH.read_text(encoding="utf-8")
         cls.holder_source = HOLDER_PATH.read_text(encoding="utf-8")
         cls.failed_run_recovery = FAILED_RUN_RECOVERY_PATH.read_text(
+            encoding="utf-8"
+        )
+        cls.failed_run_recovery_test = FAILED_RUN_RECOVERY_TEST_PATH.read_text(
             encoding="utf-8"
         )
         cls.anchor_linux_source = (ANCHOR_PACKAGE / "run_linux.go").read_text(
@@ -2311,11 +2317,16 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         for required in (
             'parser.add_argument("mode", choices=("plan", "run"))',
             '"wg-mix-ebpf-failed-run-recovery-v1"',
-            "assert_no_live_mount(root)",
+            'assert_no_live_mount(root, manifest["bpffs_source"])',
+            "assert_no_live_netns(manifest)",
             "assert_no_run_network(args.run_id)",
-            'status.get("source_commit") != args.failed_source_commit',
+            'client_build.get("source_commit") != args.failed_source_commit',
             "fcntl.LOCK_EX | fcntl.LOCK_NB",
             "publish_receipt(receipt_payload, args.run_id)",
+            '"inventory": recorded_inventory',
+            "recorded_by_path = preflight_inventory(root, files, recorded_inventory)",
+            "recheck_recorded_path(root, path, recorded_by_path)",
+            '"xor-password"',
             'f"SMOKE_RECOVERY_COMPLETE run_id={args.run_id}',
         ):
             self.assertIn(required, recovery)
@@ -2333,6 +2344,15 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             "find -delete",
         ):
             self.assertNotIn(forbidden, recovery)
+        regression = self.failed_run_recovery_test
+        for required in (
+            "test_receipt_publish_recovers_partial_and_double_name_states",
+            "test_recorded_inventory_allows_only_missing_not_new_or_replaced",
+            "test_proc_wide_mount_and_netns_scans_reject_live_resources",
+            "test_main_plan_is_no_write_and_run_recovers_after_interruption",
+            "test_main_retry_rejects_new_allowed_name_before_another_write",
+        ):
+            self.assertIn(required, regression)
 
 
 if __name__ == "__main__":

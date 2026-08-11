@@ -40,12 +40,17 @@ def sha256_bytes(payload: bytes) -> str:
     return hashlib.sha256(payload).hexdigest()
 
 
-def read_regular(path: Path, *, maximum: int = 8 * 1024 * 1024) -> bytes:
+def read_regular(
+    path: Path,
+    *,
+    maximum: int = 8 * 1024 * 1024,
+    allowed_nlinks: tuple[int, ...] = (1,),
+) -> bytes:
     try:
         before = path.lstat()
     except OSError:
         stop("required-file")
-    if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+    if not stat.S_ISREG(before.st_mode) or before.st_nlink not in allowed_nlinks:
         stop("file-shape")
     if before.st_size > maximum:
         stop("file-size")
@@ -99,21 +104,96 @@ def parse_fields(payload: bytes, expected_format: str) -> dict[str, str]:
     return result
 
 
+def parse_json_object(payload: bytes, reason: str) -> dict[str, object]:
+    try:
+        value = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        stop(reason)
+    if not isinstance(value, dict):
+        stop(reason)
+    return value
+
+
 def unescape_mount(value: str) -> str:
     for encoded, plain in (("\\040", " "), ("\\011", "\t"), ("\\134", "\\")):
         value = value.replace(encoded, plain)
     return value
 
 
-def assert_no_live_mount(root: Path) -> None:
+def proc_text(path: Path, maximum: int = 4 * 1024 * 1024) -> str | None:
+    try:
+        with path.open("r", encoding="utf-8", errors="strict") as handle:
+            payload = handle.read(maximum + 1)
+    except (FileNotFoundError, ProcessLookupError):
+        return None
+    except (OSError, UnicodeError):
+        stop("proc-read")
+    if len(payload) > maximum:
+        stop("proc-size")
+    return payload
+
+
+def proc_processes(proc_root: Path) -> list[Path]:
+    try:
+        entries = list(proc_root.iterdir())
+    except OSError:
+        stop("proc-list")
+    return sorted(
+        (entry for entry in entries if entry.name.isdigit()),
+        key=lambda item: item.name,
+    )
+
+
+def assert_no_live_mount(
+    root: Path, source: str, proc_root: Path = Path("/proc")
+) -> None:
     prefix = f"{root}/"
-    for line in Path("/proc/self/mountinfo").read_text(encoding="utf-8").splitlines():
-        fields = line.split()
-        if len(fields) < 6:
-            stop("mountinfo")
-        target = unescape_mount(fields[4])
-        if target == str(root) or target.startswith(prefix):
-            stop("live-mount")
+    for process in proc_processes(proc_root):
+        payload = proc_text(process / "mountinfo")
+        if payload is None:
+            continue
+        for line in payload.splitlines():
+            fields = line.split()
+            if len(fields) < 10 or "-" not in fields:
+                stop("mountinfo")
+            separator = fields.index("-")
+            if separator + 2 >= len(fields):
+                stop("mountinfo")
+            target = unescape_mount(fields[4])
+            mounted_source = unescape_mount(fields[separator + 2])
+            if (
+                target == str(root)
+                or target.startswith(prefix)
+                or mounted_source == source
+            ):
+                stop("live-mount")
+
+
+def assert_no_live_netns(
+    manifest: dict[str, str], proc_root: Path = Path("/proc")
+) -> None:
+    expected = set()
+    for role in ("a", "r", "b"):
+        try:
+            expected.add(
+                (
+                    int(manifest[f"netns_{role}_dev"], 10),
+                    int(manifest[f"netns_{role}_ino"], 10),
+                )
+            )
+        except (KeyError, ValueError):
+            stop("manifest-netns")
+    if len(expected) != 3:
+        stop("manifest-netns")
+    for process in proc_processes(proc_root):
+        try:
+            info = (process / "ns" / "net").stat()
+        except (FileNotFoundError, ProcessLookupError):
+            continue
+        except OSError:
+            stop("proc-netns")
+        if (info.st_dev, info.st_ino) in expected:
+            stop("live-netns")
 
 
 def assert_no_run_network(run_id: str) -> None:
@@ -167,74 +247,120 @@ def receipt_paths(run_id: str) -> tuple[Path, Path]:
     return pending, final
 
 
+def validate_double_receipt(pending: Path, final: Path, payload: bytes) -> None:
+    pinfo = pending.lstat()
+    finfo = final.lstat()
+    if (
+        (pinfo.st_dev, pinfo.st_ino) != (finfo.st_dev, finfo.st_ino)
+        or pinfo.st_uid != 0
+        or pinfo.st_gid != 0
+        or stat.S_IMODE(pinfo.st_mode) != 0o600
+        or pinfo.st_nlink != 2
+        or finfo.st_nlink != 2
+        or read_regular(final, maximum=1024 * 1024, allowed_nlinks=(2,))
+        != payload
+        or read_regular(pending, maximum=1024 * 1024, allowed_nlinks=(2,))
+        != payload
+    ):
+        stop("receipt-double-name")
+
+
+def read_receipt(path: Path, *, double_name: bool) -> bytes:
+    try:
+        info = path.lstat()
+    except OSError:
+        stop("receipt-missing")
+    expected_nlink = 2 if double_name else 1
+    if (
+        not stat.S_ISREG(info.st_mode)
+        or info.st_uid != 0
+        or info.st_gid != 0
+        or stat.S_IMODE(info.st_mode) != 0o600
+        or info.st_nlink != expected_nlink
+    ):
+        stop("receipt-shape")
+    return read_regular(
+        path,
+        maximum=1024 * 1024,
+        allowed_nlinks=(expected_nlink,),
+    )
+
+
 def publish_receipt(payload: bytes, run_id: str) -> None:
     pending, final = receipt_paths(run_id)
-    if final.exists():
-        if read_regular(final, maximum=16384) != payload:
-            stop("receipt-drift")
-    else:
-        if pending.exists() and read_regular(pending, maximum=16384) != payload:
-            info = pending.lstat()
-            if (
-                info.st_uid != 0
-                or info.st_gid != 0
-                or stat.S_IMODE(info.st_mode) != 0o600
-                or info.st_nlink != 1
-            ):
-                stop("receipt-pending-shape")
-            os.unlink(pending)
-        if not pending.exists():
-            try:
-                fd = os.open(
-                    pending,
-                    os.O_WRONLY
-                    | os.O_CREAT
-                    | os.O_EXCL
-                    | os.O_CLOEXEC
-                    | os.O_NOFOLLOW,
-                    0o600,
-                )
-            except OSError:
-                stop("receipt-create")
-            try:
-                view = memoryview(payload)
-                while view:
-                    written = os.write(fd, view)
-                    if written <= 0:
-                        stop("receipt-write")
-                    view = view[written:]
-                os.fsync(fd)
-            finally:
-                os.close(fd)
-        if read_regular(pending, maximum=16384) != payload:
-            stop("receipt-pending-drift")
-        try:
-            os.link(pending, final, follow_symlinks=False)
-        except FileExistsError:
-            if read_regular(final, maximum=16384) != payload:
-                stop("receipt-race")
-        except OSError:
-            stop("receipt-publish")
+    maximum = 1024 * 1024
+
+    def sync_parent() -> None:
         parent_fd = os.open(TEST_PARENT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
             os.fsync(parent_fd)
         finally:
             os.close(parent_fd)
-    if pending.exists():
-        pinfo = pending.lstat()
-        finfo = final.lstat()
-        if (pinfo.st_dev, pinfo.st_ino, pinfo.st_nlink) != (
-            finfo.st_dev,
-            finfo.st_ino,
-            2,
-        ) or finfo.st_nlink != 2:
-            stop("receipt-double-name")
+
+    if final.exists() and pending.exists():
+        validate_double_receipt(pending, final, payload)
         os.unlink(pending)
-        parent_fd = os.open(TEST_PARENT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        sync_parent()
+    if final.exists():
+        if read_regular(final, maximum=maximum) != payload:
+            stop("receipt-drift")
+        return
+    if pending.exists() and read_regular(pending, maximum=maximum) != payload:
+        info = pending.lstat()
+        if (
+            info.st_uid != 0
+            or info.st_gid != 0
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_nlink != 1
+        ):
+            stop("receipt-pending-shape")
+        os.unlink(pending)
+        sync_parent()
+    if not pending.exists():
         try:
-            os.fsync(parent_fd)
+            fd = os.open(
+                pending,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | os.O_CLOEXEC
+                | os.O_NOFOLLOW,
+                0o600,
+            )
+        except OSError:
+            stop("receipt-create")
+        try:
+            view = memoryview(payload)
+            while view:
+                written = os.write(fd, view)
+                if written <= 0:
+                    stop("receipt-write")
+                view = view[written:]
+            os.fsync(fd)
         finally:
-            os.close(parent_fd)
+            os.close(fd)
+    if read_regular(pending, maximum=maximum) != payload:
+        stop("receipt-pending-drift")
+    try:
+        os.link(pending, final, follow_symlinks=False)
+    except FileExistsError:
+        pass
+    except OSError:
+        stop("receipt-publish")
+    pinfo = pending.lstat()
+    finfo = final.lstat()
+    if (
+        (pinfo.st_dev, pinfo.st_ino) != (finfo.st_dev, finfo.st_ino)
+        or pinfo.st_nlink != 2
+        or finfo.st_nlink != 2
+        or read_regular(final, maximum=maximum, allowed_nlinks=(2,)) != payload
+    ):
+        stop("receipt-publish-identity")
+    sync_parent()
+    os.unlink(pending)
+    sync_parent()
+    if read_regular(final, maximum=maximum) != payload:
+        stop("receipt-final")
 
 
 def validate_tree(root: Path, manifest: dict[str, str], *, initial: bool) -> list[Path]:
@@ -288,6 +414,7 @@ def validate_tree(root: Path, manifest: dict[str, str], *, initial: bool) -> lis
         "secrets": {
             ".wg-mix-ebpf-test-owner",
             "netns-anchor-token",
+            "xor-password",
             "a.key",
             "a.pub",
             "b.key",
@@ -357,6 +484,118 @@ def validate_tree(root: Path, manifest: dict[str, str], *, initial: bool) -> lis
     return files
 
 
+def inventory_entry(root: Path, path: Path) -> dict[str, object]:
+    info = path.lstat()
+    relative = "." if path == root else str(path.relative_to(root))
+    common: dict[str, object] = {
+        "path": relative,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "mode": stat.S_IMODE(info.st_mode),
+    }
+    if stat.S_ISDIR(info.st_mode):
+        common["type"] = "directory"
+        return common
+    if not stat.S_ISREG(info.st_mode):
+        stop("inventory-type")
+    common.update(
+        {
+            "type": "regular",
+            "nlink": info.st_nlink,
+            "size": info.st_size,
+            "sha256": sha256_bytes(read_regular(path)),
+        }
+    )
+    return common
+
+
+def tree_inventory(root: Path, files: list[Path]) -> list[dict[str, object]]:
+    paths = [root]
+    for entry in os.scandir(root):
+        if entry.is_dir(follow_symlinks=False):
+            paths.append(root / entry.name)
+    paths.extend(files)
+    return [inventory_entry(root, path) for path in sorted(paths, key=str)]
+
+
+def validated_inventory(value: object) -> list[dict[str, object]]:
+    if not isinstance(value, list):
+        stop("receipt-inventory")
+    result: list[dict[str, object]] = []
+    seen: set[str] = set()
+    directory_keys = {"path", "device", "inode", "uid", "gid", "mode", "type"}
+    regular_keys = directory_keys | {"nlink", "size", "sha256"}
+    for raw in value:
+        if not isinstance(raw, dict):
+            stop("inventory-record")
+        entry = dict(raw)
+        relative = entry.get("path")
+        entry_type = entry.get("type")
+        expected_keys = directory_keys if entry_type == "directory" else regular_keys
+        if set(entry) != expected_keys or not isinstance(relative, str):
+            stop("inventory-record")
+        if relative != ".":
+            parts = relative.split("/")
+            if (
+                not relative
+                or relative.startswith("/")
+                or any(part in ("", ".", "..") for part in parts)
+            ):
+                stop("inventory-path")
+        if relative in seen:
+            stop("inventory-record")
+        seen.add(relative)
+        for key in ("device", "inode", "uid", "gid", "mode"):
+            field = entry.get(key)
+            if isinstance(field, bool) or not isinstance(field, int) or field < 0:
+                stop("inventory-record")
+        if entry_type == "regular":
+            for key in ("nlink", "size"):
+                field = entry.get(key)
+                if isinstance(field, bool) or not isinstance(field, int) or field < 0:
+                    stop("inventory-record")
+            if not isinstance(entry.get("sha256"), str) or not SHA_RE.fullmatch(
+                str(entry["sha256"])
+            ):
+                stop("inventory-record")
+        elif entry_type != "directory":
+            stop("inventory-record")
+        result.append(entry)
+    if "." not in seen:
+        stop("inventory-record")
+    return result
+
+
+def preflight_inventory(
+    root: Path,
+    files: list[Path],
+    recorded: list[dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    recorded_by_path = {str(entry.get("path")): entry for entry in recorded}
+    if len(recorded_by_path) != len(recorded) or "." not in recorded_by_path:
+        stop("inventory-record")
+    current = tree_inventory(root, files)
+    current_by_path = {str(entry["path"]): entry for entry in current}
+    if not set(current_by_path).issubset(recorded_by_path):
+        stop("inventory-new-entry")
+    for relative, entry in current_by_path.items():
+        if entry != recorded_by_path[relative]:
+            stop("inventory-drift")
+    return recorded_by_path
+
+
+def recheck_recorded_path(
+    root: Path, path: Path, recorded_by_path: dict[str, dict[str, object]]
+) -> None:
+    relative = "." if path == root else str(path.relative_to(root))
+    if relative not in recorded_by_path:
+        stop("inventory-unrecorded")
+    if inventory_entry(root, path) != recorded_by_path[relative]:
+        stop("inventory-recheck")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", choices=("plan", "run"))
@@ -383,8 +622,14 @@ def main() -> None:
     manifest_path = root / "manifest"
     if not root.exists():
         if final_receipt.exists():
-            payload = read_regular(final_receipt, maximum=4096)
-            receipt = json.loads(payload)
+            payload = read_receipt(
+                final_receipt, double_name=pending_receipt.exists()
+            )
+            if pending_receipt.exists():
+                validate_double_receipt(pending_receipt, final_receipt, payload)
+            if pending_receipt.exists() and args.mode == "run":
+                publish_receipt(payload, args.run_id)
+            receipt = parse_json_object(payload, "completed-receipt-json")
             if (
                 receipt.get("format") != RECEIPT_FORMAT
                 or receipt.get("run_id") != args.run_id
@@ -400,14 +645,29 @@ def main() -> None:
                 )
                 return
             os.unlink(final_receipt)
+            parent_fd = os.open(
+                TEST_PARENT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC
+            )
+            try:
+                os.fsync(parent_fd)
+            finally:
+                os.close(parent_fd)
             print(f"SMOKE_RECOVERY_COMPLETE run_id={args.run_id} root=absent receipt=absent")
             return
         stop("run-root-missing")
     root_info = exact_directory(root, device=TEST_PARENT.stat().st_dev)
     receipt_exists = final_receipt.exists()
     if receipt_exists:
-        receipt_payload = read_regular(final_receipt, maximum=16384)
-        receipt = json.loads(receipt_payload)
+        receipt_payload = read_receipt(
+            final_receipt, double_name=pending_receipt.exists()
+        )
+        if pending_receipt.exists():
+            validate_double_receipt(
+                pending_receipt, final_receipt, receipt_payload
+            )
+        if pending_receipt.exists() and args.mode == "run":
+            publish_receipt(receipt_payload, args.run_id)
+        receipt = parse_json_object(receipt_payload, "receipt-json")
         if (
             receipt.get("format") != RECEIPT_FORMAT
             or receipt.get("run_id") != args.run_id
@@ -418,7 +678,19 @@ def main() -> None:
             or receipt.get("root_inode") != root_info.st_ino
         ):
             stop("receipt-contract")
-        manifest = receipt["manifest"]
+        manifest_value = receipt.get("manifest")
+        if not isinstance(manifest_value, dict) or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in manifest_value.items()
+        ):
+            stop("receipt-manifest")
+        manifest = manifest_value
+        recorded_inventory = validated_inventory(receipt.get("inventory"))
+        encoded_inventory = json.dumps(
+            recorded_inventory, sort_keys=True, separators=(",", ":")
+        ).encode()
+        if receipt.get("inventory_sha256") != sha256_bytes(encoded_inventory):
+            stop("receipt-inventory-sha256")
     else:
         manifest_payload = read_regular(manifest_path)
         if sha256_bytes(manifest_payload) != args.manifest_sha256:
@@ -442,11 +714,16 @@ def main() -> None:
             stop("host-identity")
         for role in ("a", "b"):
             status_path = root / "evidence" / f"status-{role}-before.json"
-            status = json.loads(read_regular(status_path))
-            if status.get("source_commit") != args.failed_source_commit:
+            status = parse_json_object(read_regular(status_path), "status-json")
+            client_build = status.get("client_build")
+            if (
+                not isinstance(client_build, dict)
+                or client_build.get("source_commit") != args.failed_source_commit
+            ):
                 stop("source-commit")
         validate_tree(root, manifest, initial=True)
-        assert_no_live_mount(root)
+        assert_no_live_mount(root, manifest["bpffs_source"])
+        assert_no_live_netns(manifest)
         assert_no_run_network(args.run_id)
         for role in ("a", "r", "b"):
             ready = parse_fields(
@@ -457,12 +734,12 @@ def main() -> None:
                 stop("anchor-contract")
             if Path("/proc").joinpath(ready.get("anchor_pid", "invalid")).exists():
                 stop("anchor-live")
-        inventory = []
-        for path in sorted(validate_tree(root, manifest, initial=True)):
-            info = path.lstat()
-            inventory.append(
-                [str(path.relative_to(root)), info.st_mode, info.st_uid, info.st_gid, info.st_size, sha256_bytes(read_regular(path))]
-            )
+        recorded_inventory = tree_inventory(
+            root, validate_tree(root, manifest, initial=True)
+        )
+        encoded_inventory = json.dumps(
+            recorded_inventory, sort_keys=True, separators=(",", ":")
+        ).encode()
         receipt = {
             "format": RECEIPT_FORMAT,
             "run_id": args.run_id,
@@ -472,15 +749,18 @@ def main() -> None:
             "root_device": root_info.st_dev,
             "root_inode": root_info.st_ino,
             "owner_token_sha256": sha256_bytes(manifest["owner_token"].encode()),
-            "inventory_sha256": sha256_bytes(json.dumps(inventory, separators=(",", ":")).encode()),
+            "inventory": recorded_inventory,
+            "inventory_sha256": sha256_bytes(encoded_inventory),
             "manifest": manifest,
         }
         receipt_payload = (json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n").encode()
         if args.mode == "run":
             publish_receipt(receipt_payload, args.run_id)
-    assert_no_live_mount(root)
+    assert_no_live_mount(root, manifest["bpffs_source"])
+    assert_no_live_netns(manifest)
     assert_no_run_network(args.run_id)
     files = validate_tree(root, manifest, initial=False)
+    recorded_by_path = preflight_inventory(root, files, recorded_inventory)
     if args.mode == "plan":
         print(
             f"SMOKE_RECOVERY_PLAN run_id={args.run_id} files={len(files)} "
@@ -504,13 +784,15 @@ def main() -> None:
     }
     try:
         for path in sorted((item for item in files if item not in protected), reverse=True):
-            read_regular(path)
+            recheck_recorded_path(root, path, recorded_by_path)
         for path in sorted((item for item in files if item not in protected), reverse=True):
             if path.exists():
+                recheck_recorded_path(root, path, recorded_by_path)
                 os.unlink(path)
         for dirname in ("evidence", "secrets", "state-a", "state-b", "run-a", "run-b", "pin-owners", "pin-locks", "bpffs"):
             path = root / dirname
             if path.exists():
+                recheck_recorded_path(root, path, recorded_by_path)
                 os.rmdir(path)
         for path in (
             root / "bpffs.creation.v1",
@@ -518,14 +800,15 @@ def main() -> None:
             root / ".wg-mix-ebpf-test-owner",
         ):
             if path.exists():
-                read_regular(path)
+                recheck_recorded_path(root, path, recorded_by_path)
                 os.unlink(path)
         if lease_fd is not None:
             os.close(lease_fd)
             lease_fd = None
         if lease_path.exists():
-            read_regular(lease_path)
+            recheck_recorded_path(root, lease_path, recorded_by_path)
             os.unlink(lease_path)
+        recheck_recorded_path(root, root, recorded_by_path)
         os.rmdir(root)
         parent_fd = os.open(TEST_PARENT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
         try:
@@ -536,6 +819,11 @@ def main() -> None:
             os.unlink(final_receipt)
         if pending_receipt.exists():
             os.unlink(pending_receipt)
+        parent_fd = os.open(TEST_PARENT, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        try:
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
     finally:
         if lease_fd is not None:
             os.close(lease_fd)
