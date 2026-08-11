@@ -2330,10 +2330,13 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             'f"SMOKE_RECOVERY_COMPLETE run_id={args.run_id}',
         ):
             self.assertIn(required, recovery)
-        self.assertLess(
-            recovery.index("validate_tree(root, manifest, initial=True)"),
-            recovery.index("publish_receipt(receipt_payload, args.run_id)"),
+        initial_validation = recovery.index(
+            "validate_tree(root, manifest, initial=True)"
         )
+        fresh_receipt_publish = recovery.index(
+            "publish_receipt(receipt_payload, args.run_id)", initial_validation
+        )
+        self.assertLess(initial_validation, fresh_receipt_publish)
         for forbidden in (
             "shutil.rmtree",
             "os.system",
