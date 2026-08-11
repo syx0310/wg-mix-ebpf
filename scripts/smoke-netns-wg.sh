@@ -1142,7 +1142,7 @@ validate_private_bpffs_mount() {
   local observed_device
   local observed_inode
 
-  observed_record="$(inspect_private_bpffs_mount_record)" || return 1
+  observed_record="$(inspect_private_bpffs_mount_record /proc/self/mountinfo)" || return 1
   read -r observed_mount_id observed_mount_device observed_parent_mount_id \
     observed_parent_device extra <<<"${observed_record}"
   if [[ -n "${extra}" ||
@@ -1866,7 +1866,7 @@ if mountpoint -q -- "${BPFFS_DIR}"; then
   echo "error: unexpected mount already exists at ${BPFFS_DIR}" >&2
   exit 1
 fi
-snapshot_private_bpffs_pre_mount
+snapshot_private_bpffs_pre_mount /proc/self/mountinfo
 PREEXISTING_MOUNT_IDS="$(awk '
   {
     if ($1 !~ /^[1-9][0-9]*$/) {
@@ -1881,7 +1881,7 @@ PREEXISTING_MOUNT_IDS="$(awk '
 ' /proc/self/mountinfo)"
 mount -t bpf -o nosuid,nodev,noexec,mode=0700 "${BPFFS_SOURCE}" "${BPFFS_DIR}"
 validate_private_mount_chain "${BPFFS_DIR}"
-BPFFS_MOUNT_RECORD="$(inspect_private_bpffs_mount_record)"
+BPFFS_MOUNT_RECORD="$(inspect_private_bpffs_mount_record /proc/self/mountinfo)"
 read -r BPFFS_MOUNT_ID BPFFS_MOUNT_DEVICE BPFFS_POST_PARENT_MOUNT_ID \
   BPFFS_POST_PARENT_DEVICE BPFFS_MOUNT_RECORD_EXTRA <<<"${BPFFS_MOUNT_RECORD}"
 if [[ -n "${BPFFS_MOUNT_RECORD_EXTRA}" ||
