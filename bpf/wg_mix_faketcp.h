@@ -1660,6 +1660,19 @@ struct faketcp_tc_ipv4_udp_snapshot {
 _Static_assert(sizeof(struct faketcp_tc_ipv4_udp_snapshot) == 28,
 	       "FakeTCP TC header snapshot layout drift");
 
+// The managed XDP gate admits only adjacent fixed IPv4/TCP headers. Keeping
+// them in one object lets modern kernels perform one fixed-size helper copy and
+// gives the legacy direct-copy backend the same contiguous destination.
+struct faketcp_xdp_ipv4_tcp_snapshot {
+	struct iphdr ip;
+	struct tcphdr tcp;
+};
+
+_Static_assert(offsetof(struct faketcp_xdp_ipv4_tcp_snapshot, tcp) == 20,
+	       "FakeTCP XDP transport snapshot offset drift");
+_Static_assert(sizeof(struct faketcp_xdp_ipv4_tcp_snapshot) == 40,
+	       "FakeTCP XDP header snapshot layout drift");
+
 static __always_inline int faketcp_tc_load_ipv4_udp_snapshot(
 	struct __sk_buff *skb, __u32 network_off, __u32 transport_off,
 	__u32 payload_off, struct faketcp_tc_ipv4_udp_snapshot *snapshot)
@@ -1733,8 +1746,7 @@ struct faketcp_runtime_scratch {
 			struct faketcp_session_snapshot session_snapshot;
 			struct packet_info xor_info;
 			struct faketcp_l3_info l3;
-			struct iphdr new_ip;
-			struct tcphdr old_tcp;
+			struct faketcp_xdp_ipv4_tcp_snapshot headers;
 			struct udphdr udp;
 			__u8 tail[FAKETCP_HEADER_DELTA];
 			struct faketcp_pseudo_tail old_pseudo;
@@ -2691,12 +2703,18 @@ static __noinline long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 {
 	struct faketcp_gso_loop_context *context = opaque;
 	__u8 chunk[FAKETCP_GSO_XOR_CHUNK_BYTES] = {};
+	__u32 old_word = 0;
+	__u32 new_word = 0;
 	__u32 segment_index;
 	__u32 segment_offset;
 	__u32 segment_length;
 	__u32 chunk_offset;
 	__u32 target_length;
 	__u32 chunk_length;
+	__u32 processed = 0;
+	__u32 tail_length;
+	__u32 packet_offset;
+	int rc;
 
 	if (!context->cipher || !context->xor_chunks_per_segment) {
 		context->error = -1;
@@ -2718,24 +2736,84 @@ static __noinline long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 	chunk_length = target_length - chunk_offset;
 	if (chunk_length > sizeof(chunk))
 		chunk_length = sizeof(chunk);
-	if (bpf_skb_load_bytes(context->skb,
-			       context->payload_offset + segment_offset +
-				       chunk_offset,
-			       chunk, chunk_length) < 0) {
+	// Older verifiers retain a zero lower bound for the subtraction above even
+	// after chunk_offset < target_length. Never pass that scalar as a helper
+	// size. Full chunks retain the one-load/one-store fast path; the sole short
+	// chunk in a segment is decomposed into fixed four-byte words plus an exact
+	// 1/2/3-byte dispatch.
+	if (chunk_length == 0 || chunk_length > FAKETCP_GSO_XOR_CHUNK_BYTES) {
 		context->error = -1;
 		return 1;
 	}
+	packet_offset = context->payload_offset + segment_offset + chunk_offset;
+	if (chunk_length == sizeof(chunk)) {
+		if (bpf_skb_load_bytes(context->skb, packet_offset, chunk,
+				       sizeof(chunk)) < 0) {
+			context->error = -1;
+			return 1;
+		}
 #pragma unroll
-	for (int byte = 0; byte < FAKETCP_GSO_XOR_CHUNK_BYTES; byte++) {
-		if (byte < chunk_length)
+		for (int byte = 0; byte < FAKETCP_GSO_XOR_CHUNK_BYTES; byte++)
 			chunk[byte] ^=
 				xor_key_byte(context->cipher, chunk_offset + byte);
+		if (bpf_skb_store_bytes(context->skb, packet_offset, chunk,
+					sizeof(chunk),
+					BPF_F_INVALIDATE_HASH) < 0) {
+			context->error = -1;
+			return 1;
+		}
+		return 0;
 	}
-	if (bpf_skb_store_bytes(context->skb,
-				context->payload_offset + segment_offset +
-					chunk_offset,
-				chunk, chunk_length,
-				BPF_F_INVALIDATE_HASH) < 0) {
+
+#pragma unroll
+	for (int word = 0; word < FAKETCP_GSO_XOR_CHUNK_BYTES / 4; word++) {
+		if (processed + sizeof(old_word) > chunk_length)
+			break;
+		old_word = 0;
+		if (bpf_skb_load_bytes(context->skb, packet_offset + processed,
+				       &old_word, sizeof(old_word)) < 0) {
+			context->error = -1;
+			return 1;
+		}
+		new_word = old_word;
+#pragma unroll
+		for (int byte = 0; byte < 4; byte++)
+			((__u8 *)&new_word)[byte] ^=
+				xor_key_byte(context->cipher,
+					     chunk_offset + processed + byte);
+		if (bpf_skb_store_bytes(context->skb, packet_offset + processed,
+					&new_word, sizeof(new_word),
+					BPF_F_INVALIDATE_HASH) < 0) {
+			context->error = -1;
+			return 1;
+		}
+		processed += sizeof(old_word);
+	}
+	if (processed < chunk_length) {
+		tail_length = chunk_length - processed;
+		if (tail_length == 0 || tail_length > 3) {
+			context->error = -1;
+			return 1;
+		}
+		old_word = 0;
+		rc = xor_load_partial_word(context->skb, packet_offset + processed,
+					   tail_length, &old_word);
+		if (rc < 0) {
+			context->error = -1;
+			return 1;
+		}
+		xor_partial_word(context->cipher, chunk_offset + processed,
+				 tail_length, old_word, &new_word);
+		rc = xor_store_partial_word(context->skb, packet_offset + processed,
+					    tail_length, &new_word,
+					    BPF_F_INVALIDATE_HASH);
+		if (rc < 0) {
+			context->error = -1;
+			return 1;
+		}
+		processed += tail_length;
+	}
+	if (processed != chunk_length) {
 		context->error = -1;
 		return 1;
 	}
@@ -3638,6 +3716,22 @@ static __always_inline int faketcp_legacy_515_xdp_store_ipv4(
 }
 #endif
 
+static __always_inline int faketcp_xdp_load_ipv4_tcp_snapshot(
+	struct xdp_md *xdp, __u32 network_off, __u32 transport_off,
+	struct faketcp_xdp_ipv4_tcp_snapshot *snapshot)
+{
+	if (!snapshot || transport_off < network_off ||
+	    transport_off - network_off != sizeof(struct iphdr))
+		return -1;
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	return faketcp_legacy_515_xdp_load_close_packet(
+		xdp, network_off, (__u8 *)snapshot);
+#else
+	return bpf_xdp_load_bytes(xdp, network_off, snapshot,
+				  sizeof(*snapshot));
+#endif
+}
+
 static __always_inline int
 faketcp_capture_close_packet(struct xdp_md *xdp, __u32 packet_off,
 			     __u16 packet_len,
@@ -3680,7 +3774,8 @@ faketcp_capture_close_packet(struct xdp_md *xdp, __u32 packet_off,
 	if (faketcp_legacy_515_xdp_load_close_packet(
 		    xdp, packet_off, record->packet) < 0)
 #else
-	if (bpf_xdp_load_bytes(xdp, packet_off, record->packet, packet_len) < 0)
+	if (bpf_xdp_load_bytes(xdp, packet_off, record->packet,
+			       sizeof(struct iphdr) + sizeof(struct tcphdr)) < 0)
 #endif
 		return -1;
 	if (faketcp_output_packet_event(record, packet_len) < 0)
@@ -3905,8 +4000,6 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 {
 	void *data;
 	void *data_end;
-	struct iphdr *iph;
-	struct tcphdr *tcp;
 	struct udphdr *wire_ports;
 	struct faketcp_l3_info *l3;
 	struct faketcp_managed_port_value *managed_listener = 0;
@@ -3917,6 +4010,7 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	struct faketcp_metadata *metadata;
 	struct faketcp_pseudo_tail *old_pseudo;
 	struct faketcp_pseudo_tail *new_pseudo;
+	struct faketcp_xdp_ipv4_tcp_snapshot *headers;
 	struct iphdr *new_ip;
 	struct tcphdr *old_tcp;
 	struct udphdr *udp;
@@ -3936,8 +4030,9 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 		return XDP_DROP;
 	admission = &scratch->ingress.admission;
 	l3 = &scratch->ingress.l3;
-	new_ip = &scratch->ingress.new_ip;
-	old_tcp = &scratch->ingress.old_tcp;
+	headers = &scratch->ingress.headers;
+	new_ip = &headers->ip;
+	old_tcp = &headers->tcp;
 	udp = &scratch->ingress.udp;
 	tail = scratch->ingress.tail;
 	old_pseudo = &scratch->ingress.old_pseudo;
@@ -3988,22 +4083,13 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	if (l3->transport_protocol == IPPROTO_UDP)
 		return faketcp_xdp_reject(
 			FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
-	// The managed-port lookup is a helper boundary. Reload both packet pointers
-	// and reconstruct the TCP pointer from the already validated L3 descriptor;
-	// never carry the pre-helper packet register into another dereference.
-	data = (void *)(long)xdp->data;
-	data_end = (void *)(long)xdp->data_end;
-	tcp = data + l3->l4_off;
-	if ((void *)(tcp + 1) > data_end)
+	// The managed-port lookup is a helper boundary. Copy the adjacent fixed
+	// IPv4/TCP envelope with one verifier-safe fixed-size operation instead of
+	// rebuilding a dynamic-offset packet pointer. All admission, checksum and
+	// close decisions below consume only this map-backed snapshot.
+	if (faketcp_xdp_load_ipv4_tcp_snapshot(
+		    xdp, l3->l3_off, l3->l4_off, headers) < 0)
 		return faketcp_xdp_reject(FAKETCP_STAT_BAD_PACKET);
-	iph = data + l3->l3_off;
-	if ((void *)(iph + 1) > data_end)
-		return faketcp_xdp_reject(FAKETCP_STAT_BAD_PACKET);
-	// Snapshot both fixed headers before the next helper. All admission,
-	// checksum and close decisions below use map-backed scratch, so helper calls
-	// and adjust_meta cannot invalidate a packet-pointer proof still in use.
-	*old_tcp = *tcp;
-	*new_ip = *iph;
 	policy_listener = lookup_ingress_listener(
 		xdp->ingress_ifindex, destination_port, FAMILY_IPV4,
 		generation);
@@ -4016,7 +4102,7 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	if (admission_decision == FAKETCP_ADMISSION_DROP)
 		return XDP_DROP;
 	total_len = admission->wire_total_len;
-	tcp_len = total_len - sizeof(*iph);
+	tcp_len = total_len - sizeof(*new_ip);
 	payload_len = admission->payload_len;
 	flags = admission->tcp_flags;
 	seq = admission->sequence;
@@ -4037,8 +4123,8 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 			inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 			return XDP_DROP;
 		}
-		if (total_len != sizeof(*iph) + sizeof(*tcp) || payload_len != 0 ||
-		    raw_tcp[12] != (sizeof(*tcp) / 4) << 4 ||
+		if (total_len != sizeof(*new_ip) + sizeof(*old_tcp) || payload_len != 0 ||
+		    raw_tcp[12] != (sizeof(*old_tcp) / 4) << 4 ||
 		    (flags != (FAKETCP_FLAG_RST | FAKETCP_FLAG_ACK) &&
 		     flags != (FAKETCP_FLAG_FIN | FAKETCP_FLAG_ACK)) ||
 		    seq != admission->decision.close.rx_sequence ||

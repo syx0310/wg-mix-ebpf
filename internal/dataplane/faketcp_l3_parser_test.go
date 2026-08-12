@@ -90,7 +90,8 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		"faketcp_managed_transform_status(l3, l3->transport_protocol)",
 		"sizeof(struct iphdr) + sizeof(struct udphdr)",
 		"l3->l4_off + sizeof(*udp)",
-		"struct iphdr new_ip;",
+		"struct faketcp_xdp_ipv4_tcp_snapshot *headers;",
+		"faketcp_xdp_load_ipv4_tcp_snapshot(",
 		"bpf_xdp_store_bytes(xdp, l3->l3_off, new_ip, sizeof(*new_ip))",
 	} {
 		if !strings.Contains(main, want) && !strings.Contains(tc, want) {

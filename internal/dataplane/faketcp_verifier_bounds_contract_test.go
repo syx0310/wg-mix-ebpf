@@ -53,37 +53,32 @@ func TestFakeTCPXDPPacketPointersDoNotCrossHelperBoundaries(t *testing.T) {
 	firstBounds := strings.Index(body, "if ((void *)(wire_ports + 1) > data_end)")
 	portSnapshot := strings.Index(body, "destination_port = bpf_ntohs(wire_ports->dest)")
 	managedLookup := strings.Index(body, "managed_listener = faketcp_xdp_managed_port(")
-	packetReload := -1
-	if managedLookup >= 0 {
-		if relative := strings.Index(body[managedLookup:], "data = (void *)(long)xdp->data"); relative >= 0 {
-			packetReload = managedLookup + relative
-		}
-	}
-	tcpSnapshot := strings.Index(body, "*old_tcp = *tcp")
-	ipSnapshot := strings.Index(body, "*new_ip = *iph")
+	headerSnapshot := strings.Index(body, "faketcp_xdp_load_ipv4_tcp_snapshot(")
 	policyLookup := strings.Index(body, "policy_listener = lookup_ingress_listener(")
 	checkpoint := strings.Index(body, "admission_decision = faketcp_xdp_admission_checkpoint(")
-	if firstBounds < 0 || portSnapshot < 0 || managedLookup < 0 || packetReload < 0 ||
-		tcpSnapshot < 0 || ipSnapshot < 0 || policyLookup < 0 || checkpoint < 0 ||
+	if firstBounds < 0 || portSnapshot < 0 || managedLookup < 0 ||
+		headerSnapshot < 0 || policyLookup < 0 || checkpoint < 0 ||
 		!(firstBounds < portSnapshot && portSnapshot < managedLookup &&
-			managedLookup < packetReload && packetReload < tcpSnapshot && tcpSnapshot < policyLookup &&
-			ipSnapshot < policyLookup && policyLookup < checkpoint) {
+			managedLookup < headerSnapshot && headerSnapshot < policyLookup &&
+			policyLookup < checkpoint) {
 		t.Fatal("XDP packet bounds, scalar/header snapshots and helper boundaries are out of order")
 	}
 
-	afterPolicy := body[policyLookup:]
+	afterManagedLookup := body[managedLookup:]
 	for _, forbidden := range []string{
 		"bpf_ntohs(tcp->dest)",
 		"bpf_ntohs(tcp->source)",
 		"bpf_ntohs(iph->tot_len)",
 		"*old_tcp = *tcp",
 		"*new_ip = *iph",
+		"tcp = data + l3->l4_off",
 		"iph = data + l3->l3_off",
 	} {
-		if strings.Contains(afterPolicy, forbidden) {
-			t.Fatalf("XDP direct packet access %q crossed the policy helper boundary", forbidden)
+		if strings.Contains(afterManagedLookup, forbidden) {
+			t.Fatalf("XDP direct packet access %q crossed the managed-port helper boundary", forbidden)
 		}
 	}
+	afterPolicy := body[policyLookup:]
 	for _, required := range []string{
 		"xdp, l3->l3_off, new_ip, old_tcp, l3, managed_listener",
 		"faketcp_close_checksums_valid(new_ip, old_tcp)",
@@ -104,6 +99,78 @@ func TestFakeTCPXDPPacketPointersDoNotCrossHelperBoundaries(t *testing.T) {
 	}
 	if !strings.Contains(checkpointBody, "admission->wire_total_len != l3->l3_len") {
 		t.Fatal("XDP checkpoint does not bind its header snapshot to the parsed L3 length")
+	}
+	snapshotLoader := sourceSection(t, fake,
+		"static __always_inline int faketcp_xdp_load_ipv4_tcp_snapshot(",
+		"static __always_inline int\nfaketcp_capture_close_packet(")
+	for _, required := range []string{
+		"transport_off - network_off != sizeof(struct iphdr)",
+		"faketcp_legacy_515_xdp_load_close_packet(",
+		"bpf_xdp_load_bytes(xdp, network_off, snapshot,",
+		"sizeof(*snapshot)",
+	} {
+		if !strings.Contains(snapshotLoader, required) {
+			t.Fatalf("fixed XDP header snapshot loader is missing %q", required)
+		}
+	}
+}
+
+func TestFakeTCPPacketHelperSizesCannotBeZero(t *testing.T) {
+	fakeBytes, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := string(fakeBytes)
+	gsoXOR := sourceSection(t, fake,
+		"static __noinline long faketcp_gso_xor_chunk(",
+		"#ifdef WG_MIX_FAKETCP_LEGACY_515\nstatic __always_inline int faketcp_legacy_515_rewrite_gso_types(")
+	for _, forbidden := range []string{
+		"chunk, chunk_length)",
+		"chunk, chunk_length,",
+	} {
+		if strings.Contains(gsoXOR, forbidden) {
+			t.Fatalf("GSO XOR passed verifier-ambiguous dynamic helper size through %q", forbidden)
+		}
+	}
+	for _, required := range []string{
+		"if (chunk_length == 0 || chunk_length > FAKETCP_GSO_XOR_CHUNK_BYTES)",
+		"if (chunk_length == sizeof(chunk))",
+		"chunk,\n\t\t\t\t       sizeof(chunk)",
+		"&old_word, sizeof(old_word)",
+		"new_word = old_word",
+		"for (int byte = 0; byte < 4; byte++)",
+		"&new_word, sizeof(new_word)",
+		"tail_length == 0 || tail_length > 3",
+		"xor_load_partial_word(",
+		"xor_store_partial_word(",
+		"processed != chunk_length",
+	} {
+		if !strings.Contains(gsoXOR, required) {
+			t.Fatalf("fixed-size GSO XOR helper dispatch is missing %q", required)
+		}
+	}
+
+	capture := sourceSection(t, fake,
+		"static __always_inline int faketcp_capture_first_packet(",
+		"static __always_inline struct faketcp_egress_admission *")
+	if !strings.Contains(capture, "packet_len < sizeof(struct iphdr) + sizeof(struct udphdr)") ||
+		!strings.Contains(capture, "record->packet, packet_len") {
+		t.Fatal("variable TC capture size lost its strict positive lower bound")
+	}
+	checksum := sourceSection(t, fake,
+		"static __always_inline int faketcp_materialize_tcp_checksum(",
+		"// faketcp_encode_established is the single encoder")
+	if !strings.Contains(checksum, "if (remaining == 0 || remaining > sizeof(chunk))") ||
+		!strings.Contains(checksum, "chunk,\n\t\t\t\t       remaining") {
+		t.Fatal("variable checksum tail load lost its explicit nonzero bound")
+	}
+	closeCapture := sourceSection(t, fake,
+		"static __always_inline int\nfaketcp_capture_close_packet(",
+		"// All managed FakeTCP wire packets reach this one bounded classifier")
+	if !strings.Contains(closeCapture, "packet_len != sizeof(struct iphdr) + sizeof(struct tcphdr)") ||
+		!strings.Contains(closeCapture, "sizeof(struct iphdr) + sizeof(struct tcphdr)") ||
+		strings.Contains(closeCapture, "record->packet, packet_len") {
+		t.Fatal("XDP close-capture helper size is not a fixed positive header length")
 	}
 }
 

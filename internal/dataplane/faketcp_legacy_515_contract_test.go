@@ -100,8 +100,8 @@ func TestFakeTCPLegacy515XDPUsesOnlyDirectPacketAccess(t *testing.T) {
 			t.Fatalf("legacy-5.15 preprocessor view retains %q", forbidden)
 		}
 	}
-	if count := strings.Count(modern, "bpf_xdp_load_bytes("); count != 3 {
-		t.Fatalf("modern XDP load helper calls=%d, want three unchanged calls", count)
+	if count := strings.Count(modern, "bpf_xdp_load_bytes("); count != 4 {
+		t.Fatalf("modern XDP load helper calls=%d, want four fixed-size calls", count)
 	}
 	if count := strings.Count(modern, "bpf_xdp_store_bytes("); count != 3 {
 		t.Fatalf("modern XDP store helper calls=%d, want three unchanged calls", count)
@@ -109,6 +109,7 @@ func TestFakeTCPLegacy515XDPUsesOnlyDirectPacketAccess(t *testing.T) {
 	for _, required := range []string{
 		"#define FAKETCP_LEGACY_515_XDP_MAX_OFFSET",
 		"faketcp_legacy_515_xdp_load_close_packet(",
+		"faketcp_xdp_load_ipv4_tcp_snapshot(",
 		"faketcp_legacy_515_xdp_load_word(",
 		"faketcp_legacy_515_xdp_load_tail(",
 		"faketcp_legacy_515_xdp_store_udp(",
