@@ -254,7 +254,7 @@ func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T
 
 	preflight := text[preflightStart : strings.Index(text[preflightStart:], "struct faketcp_gso_loop_context")+preflightStart]
 	gsoProjection := strings.Index(preflight, "faketcp_gso_build_projection(skb, info, profile, cipher")
-	flowLookup := strings.Index(preflight, "faketcp_tc_key(skb, info, l3, generation, rule->wg_id, key)")
+	flowLookup := strings.Index(preflight, "faketcp_tc_key(skb, info, l3, local_ipv4, remote_ipv4, generation,")
 	if gsoProjection < 0 || flowLookup < 0 || gsoProjection >= flowLookup {
 		t.Fatal("aggregate geometry and every segment contract must be proven before flow/session admission")
 	}
@@ -329,7 +329,7 @@ func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T
 		t.Fatal("legacy device-only MTU fallback remains reachable after unified prepare")
 	}
 	for _, want := range []string{
-		"old_total_len != sizeof(*iph) + udp_len",
+		"old_total_len != sizeof(struct iphdr) + udp_len",
 		"old_total_len > FAKETCP_MAX_IPV4_TOTAL_LEN",
 		"old_total_len != skb->len - info->ip_off",
 	} {

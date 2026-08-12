@@ -125,14 +125,15 @@ func TestFakeTCPEgressConsumersNeverReparseDescriptor(t *testing.T) {
 		"static __always_inline int faketcp_tc_current_admission_coherent(",
 		"static __always_inline void faketcp_tc_descriptor_from_admission(")
 	for _, want := range []string{
-		"iph->version != 4",
-		"iph->ihl != sizeof(*iph) / 4",
-		"iph->protocol != IPPROTO_UDP",
+		"faketcp_tc_load_ipv4_udp_snapshot(",
+		"headers.ip.version != 4",
+		"headers.ip.ihl != sizeof(headers.ip) / 4",
+		"headers.ip.protocol != IPPROTO_UDP",
 		"fragment & (IP_RESERVED | IP_MF | IP_OFFSET)",
-		"bpf_ntohs(iph->tot_len) != admission->ip_total_len",
-		"bpf_ntohs(udp->len) != admission->wire_len",
-		"bpf_ntohs(udp->source) != admission->key.local_port",
-		"bpf_ntohs(udp->dest) != admission->key.remote_port",
+		"bpf_ntohs(headers.ip.tot_len) != admission->ip_total_len",
+		"bpf_ntohs(headers.udp.len) != admission->wire_len",
+		"bpf_ntohs(headers.udp.source) != admission->key.local_port",
+		"bpf_ntohs(headers.udp.dest) != admission->key.remote_port",
 		"admission->xor_checksum_mode == XOR_CSUM_NONE",
 	} {
 		if !strings.Contains(coherence, want) {

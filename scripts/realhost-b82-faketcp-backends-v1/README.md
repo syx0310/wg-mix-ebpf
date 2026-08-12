@@ -112,5 +112,23 @@ backend. The capture and daemon PIDs are stopped only after executable,
 namespace, boot, and start identity checks. Evidence is retained after
 successful restore.
 
+After the kfunc module identity and lease are ready, every modern/kfunc cell
+runs the built binary's production verifier sweep:
+
+```text
+wg-mix-ebpf bpf-load-test --faketcp --object <modern-object> --json
+```
+
+The command loads every manifest-approved FakeTCP program independently, so a
+single invocation reports all verifier failures instead of stopping at the
+first program. Its exact argv, full stdout/stderr, and exit code are recorded
+through the normal evidence logger. A failure stops the cell and retains all
+evidence and owned resources for explicit review and restore. This gate runs
+before endpoint state creation and before any network namespace, WireGuard,
+link, address, route, qdisc/filter, XDP, or nftables mutation. Legacy/kprobe
+cells do not invoke it because the CLI verifier command currently accepts only
+the modern FakeTCP object; legacy loading is still exercised by the production
+daemon path.
+
 No file in this directory connects to a host, reads `credientials/`, invokes
 `sudo`, starts a local container, or performs work merely by being imported.

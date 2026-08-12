@@ -185,6 +185,48 @@ class StaticMatrixTest(unittest.TestCase):
             re.compile(r"printf.*(?:key_a|key_b|key_path).*operations\\.log"),
         )
 
+    def test_modern_kfunc_verifier_sweep_precedes_network_mutation(self) -> None:
+        sweep_command = (
+            'log_command faketcp-verifier-sweep /usr/bin/timeout --signal=TERM'
+        )
+        self.assertEqual(self.netns.count(sweep_command), 1)
+        self.assertIn(
+            '"${BIN}" bpf-load-test --faketcp \\\n'
+            '    --object "${SELECTED_OBJECT}" --json',
+            self.netns,
+        )
+
+        sweep = self.netns.index(sweep_command)
+        conditional = self.netns.rfind(
+            'if [[ "${CHECKSUM_BACKEND}" == kfunc ]]; then', 0, sweep
+        )
+        self.assertGreaterEqual(conditional, 0)
+        conditional_end = self.netns.index("\nfi", sweep)
+        self.assertLess(sweep, conditional_end)
+
+        # Both the newly-owned and pre-existing module identity paths finish
+        # before the sweep. Endpoint state and every network mutation begin
+        # only after it has passed.
+        self.assertLess(
+            self.netns.index('>"${ROOT}/module-preexisting.v1"'), sweep
+        )
+        for network_mutation in (
+            'mkdir --mode=0700 -- "${ENDPOINT_A}"',
+            'log_command netns-a ip netns add "${NSA}"',
+            'link add "wg${index}" type wireguard',
+            'log_command addr-a ip -n "${NSA}" address add',
+            'log_command route-a ip -n "${NSA}" route add',
+            'start_daemon a',
+        ):
+            self.assertLess(sweep, self.netns.index(network_mutation))
+
+        # The legacy/kprobe path is deliberately outside this modern-only
+        # preflight until the CLI has a legacy-object verifier command.
+        verifier_block = self.netns[conditional : conditional_end + len("\nfi")]
+        self.assertIn('CHECKSUM_BACKEND}" == kfunc', verifier_block)
+        self.assertNotIn("kprobe", verifier_block)
+        self.assertNotIn("LEGACY_OBJECT", verifier_block)
+
     def test_private_key_exec_boundary_uses_anonymous_pipe(self) -> None:
         functions = self.netns[
             self.netns.index("private_key_value_to_pipe() {") :
