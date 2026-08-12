@@ -119,15 +119,37 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 }
 
 func TestFakeTCPUsesKernelGSOSemanticsInsteadOfRawSegmentCount(t *testing.T) {
-	for _, path := range []string{"../../bpf/wg_mix_tc.c", "../../bpf/wg_mix_faketcp.h"} {
+	paths := []string{
+		"../../bpf/wg_mix_tc.c",
+		"../../bpf/wg_mix_faketcp.h",
+		"../../kernel/faketcp_checksum/wg_mix_faketcp_checksum.c",
+		"../../kernel/faketcp_checksum_kprobe/wg_mix_faketcp_checksum_kprobe.c",
+	}
+	for _, path := range paths {
 		source, err := os.ReadFile(path)
 		if err != nil {
 			t.Fatal(err)
 		}
 		text := string(source)
 		if strings.Contains(text, "skb->gso_segs || skb->gso_size") ||
-			strings.Contains(text, "skb->gso_size || skb->gso_segs") {
+			strings.Contains(text, "skb->gso_size || skb->gso_segs") ||
+			strings.Contains(text, "skb_is_gso(skb) || skb_shinfo(skb)->gso_type") ||
+			strings.Contains(text, "skb_is_gso(skb) ||\n\t    skb_shinfo(skb)->gso_type") {
 			t.Fatalf("%s treats the informational gso_segs field as proof of GSO", path)
+		}
+	}
+	for _, path := range paths[2:] {
+		source, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		checksumGate := sourceSection(t, string(source),
+			"static int wg_mix_faketcp_validate_udp_checksum(",
+			"static int wg_mix_faketcp_admit_pmtu(")
+		if strings.Count(checksumGate, "if (skb_is_gso(skb))") != 1 ||
+			strings.Contains(checksumGate, "skb_shinfo(skb)->gso_type") ||
+			strings.Contains(checksumGate, "skb_shinfo(skb)->gso_segs") {
+			t.Fatalf("%s non-GSO checksum gate must use only skb_is_gso", path)
 		}
 	}
 }

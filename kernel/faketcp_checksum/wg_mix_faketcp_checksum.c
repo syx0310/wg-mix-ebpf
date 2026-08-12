@@ -142,8 +142,13 @@ static int wg_mix_faketcp_validate_udp_checksum(
 {
 	int actual_transport_offset;
 
-	if (skb_is_gso(skb) || skb_shinfo(skb)->gso_type ||
-	    skb_shinfo(skb)->gso_segs)
+	/*
+	 * Match the kernel's skb_is_gso() contract exactly.  WireGuard can leave
+	 * informational gso_type/gso_segs metadata (notably gso_segs == 1) on a
+	 * non-GSO skb whose gso_size is zero.  Rejecting those advisory fields
+	 * drops ordinary encrypted TCP packets before they reach the wire.
+	 */
+	if (skb_is_gso(skb))
 		return WG_MIX_FAKETCP_PREPARE_REJECT_GSO_TYPE;
 
 	switch (skb->ip_summed) {
