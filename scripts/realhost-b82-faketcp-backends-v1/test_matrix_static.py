@@ -164,6 +164,16 @@ class StaticMatrixTest(unittest.TestCase):
             'unset key_a key_b; exit "${rc}"',
             'ping -I "wg${index}"',
             "iperf3 -c",
+            "tcp_server_listening()",
+            "run_iperf_for_wireguard()",
+            "--connect-timeout 3000",
+            "--snd-timeout 3000",
+            "capture_iperf_failure_state",
+            "configure_segmentation_profile()",
+            "tx off tso off gso off gro off",
+            "tx on tso on gso on gro on",
+            "segmentation profile mismatch",
+            "error: missing required command:",
             "same-tuple-router-test",
             "key_size=32",
             "reserved_zero=1",
@@ -175,6 +185,9 @@ class StaticMatrixTest(unittest.TestCase):
             self.assertIn(required, self.netns)
         self.assertEqual(self.netns.count("private-key /dev/stdin"), 2)
         self.assertNotIn('private-key "${key_', self.netns)
+        self.assertNotRegex(self.netns, re.compile(r"iperf3 .* -B "))
+        self.assertNotIn("IPERF_PID=$!; sleep 0.4", self.netns)
+        self.assertNotRegex(self.netns, re.compile(r"ethtool -K .* rx (?:on|off)"))
         self.assertNotIn("private-key ${key_", self.netns)
         self.assertNotIn('log_command "key-remove-', self.netns)
         self.assertNotIn('wg genkey >', self.netns)

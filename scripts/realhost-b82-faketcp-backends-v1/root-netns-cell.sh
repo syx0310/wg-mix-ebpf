@@ -212,6 +212,48 @@ log_command_private_key_stdin() {
   return "${rc}"
 }
 
+configure_segmentation_profile() {
+  local role="$1" netns="$2" device="$3" phase wanted
+  phase="offload-${role}-${device}"
+  wanted="${GSO_MODE}"
+  log_command "${phase}-before" ip netns exec "${netns}" ethtool -k "${device}"
+  if [[ "${wanted}" == on ]]; then
+    log_command "${phase}-set" ip netns exec "${netns}" ethtool -K "${device}" \
+      tx on tso on gso on gro on
+  else
+    log_command "${phase}-set" ip netns exec "${netns}" ethtool -K "${device}" \
+      tx off tso off gso off gro off
+  fi
+  log_command "${phase}-after" ip netns exec "${netns}" ethtool -k "${device}"
+  python3 - "${EVIDENCE}/${phase}-after.stdout.log" "${wanted}" \
+    >"${EVIDENCE}/${phase}-validation.log" <<'PY'
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+wanted = sys.argv[2]
+features = {}
+for raw in path.read_text(encoding="utf-8").splitlines():
+    if ":" not in raw:
+        continue
+    name, value = raw.strip().split(":", 1)
+    state = value.strip().split()[0] if value.strip() else ""
+    features[name] = state
+required = (
+    "tx-checksumming",
+    "tcp-segmentation-offload",
+    "generic-segmentation-offload",
+    "generic-receive-offload",
+)
+bad = {name: features.get(name) for name in required if features.get(name) != wanted}
+if wanted == "on" and features.get("tx-udp-segmentation") != "on":
+    bad["tx-udp-segmentation"] = features.get("tx-udp-segmentation")
+if bad:
+    raise SystemExit(f"segmentation profile mismatch wanted={wanted} actual={bad}")
+print(f"segmentation={wanted} " + " ".join(f"{name}={features[name]}" for name in required))
+PY
+}
+
 module_name() { [[ "${CHECKSUM_BACKEND}" == kfunc ]] && printf '%s' "${KFUNC_MODULE}" || printf '%s' "${KPROBE_MODULE}"; }
 module_object() {
   printf '%s' "${MODULE_OBJECT}"
@@ -515,6 +557,15 @@ for cache in "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}"; do
   [[ -d "${cache}" && ! -L "${cache}" &&
     "$(stat -Lc '%u:%g:%a:%F' -- "${cache}")" == '0:0:700:directory' ]] || exit 79
 done
+for command_name in ethtool ip iperf3 python3 ss tcpdump timeout wg; do
+  if command_path="$(command -v "${command_name}")" && [[ -n "${command_path}" ]]; then
+    printf '%s=%s\n' "${command_name}" "${command_path}" >>"${EVIDENCE}/tool-paths.log"
+  else
+    printf 'error: missing required command: %s\n' "${command_name}" >&2
+    exit 69
+  fi
+done
+unset command_name command_path
 
 printf 'hostname=%s\nkernel=%s\nboot_id=%s\ncommit=%s\n' "$(hostname)" "$(uname -r)" \
   "$(</proc/sys/kernel/random/boot_id)" "${COMMIT}" >"${EVIDENCE}/host.log"
@@ -658,6 +709,8 @@ log_command addr-rb ip -n "${NSR}" address add 198.19.82.254/24 dev right0
 log_command route-a ip -n "${NSA}" route add default via 198.18.82.254 dev under0
 log_command route-b ip -n "${NSB}" route add default via 198.19.82.254 dev under0
 log_command forward ip netns exec "${NSR}" sysctl -w net.ipv4.ip_forward=1
+configure_segmentation_profile a "${NSA}" under0
+configure_segmentation_profile b "${NSB}" under0
 
 for ((index=0; index<WG_COUNT; index++)); do
   key_a="$(wg genkey)"; key_b="$(wg genkey)"
@@ -686,6 +739,8 @@ for ((index=0; index<WG_COUNT; index++)); do
   log_command "wg-mtu-b-${index}" ip -n "${NSB}" link set "wg${index}" mtu 1420
   log_command "wg-up-a-${index}" ip -n "${NSA}" link set "wg${index}" up
   log_command "wg-up-b-${index}" ip -n "${NSB}" link set "wg${index}" up
+  configure_segmentation_profile a "${NSA}" "wg${index}"
+  configure_segmentation_profile b "${NSB}" "wg${index}"
 done
 
 start_daemon() {
@@ -786,6 +841,86 @@ PY
 validate_status "${EVIDENCE}/status-a-initial.stdout.log" >"${EVIDENCE}/status-a-validation.log"
 validate_status "${EVIDENCE}/status-b-initial.stdout.log" >"${EVIDENCE}/status-b-validation.log"
 
+tcp_server_listening() {
+  local port="$1"
+  ip netns exec "${NSB}" python3 - "${port}" <<'PY'
+import pathlib
+import sys
+
+port = f"{int(sys.argv[1]):04X}"
+for path in (pathlib.Path("/proc/net/tcp"), pathlib.Path("/proc/net/tcp6")):
+    try:
+        lines = path.read_text(encoding="ascii").splitlines()[1:]
+    except FileNotFoundError:
+        continue
+    for line in lines:
+        fields = line.split()
+        if len(fields) >= 4 and fields[1].rsplit(":", 1)[-1].upper() == port:
+            if fields[3] == "0A":
+                raise SystemExit(0)
+raise SystemExit(1)
+PY
+}
+
+capture_iperf_failure_state() {
+  local index="$1" target="$2" local_ip="$3" port="$4"
+  if log_command "iperf-failure-route-a-${index}" ip netns exec "${NSA}" \
+    ip route get "${target}" from "${local_ip}"; then :; else :; fi
+  if log_command "iperf-failure-link-a-${index}" ip netns exec "${NSA}" \
+    ip -s -details link show dev "wg${index}"; then :; else :; fi
+  if log_command "iperf-failure-link-b-${index}" ip netns exec "${NSB}" \
+    ip -s -details link show dev "wg${index}"; then :; else :; fi
+  if run_cli a status "iperf-failure-status-a-${index}"; then :; else :; fi
+  if run_cli b status "iperf-failure-status-b-${index}"; then :; else :; fi
+  if log_command "iperf-failure-listener-${index}" ip netns exec "${NSB}" \
+    ss -H -lnt "sport = :${port}"; then :; else :; fi
+}
+
+run_iperf_for_wireguard() {
+  local index="$1" target="$2" local_ip="$3" port="$4" streams="$5"
+  local server_json="${EVIDENCE}/iperf-${index}-server.json"
+  local server_stderr="${EVIDENCE}/iperf-${index}-server.stderr.log"
+  local ready=0 attempt client_rc=0 server_rc=0
+  ip netns exec "${NSB}" timeout --signal=TERM --kill-after=3s 15 \
+    iperf3 -s -1 -p "${port}" -J >"${server_json}" 2>"${server_stderr}" &
+  IPERF_PID=$!
+  printf 'timestamp=%s event=start phase=iperf-%s-server pid=%s argv=' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${index}" "${IPERF_PID}" \
+    >>"${EVIDENCE}/operations.log"
+  printf '%q ' ip netns exec "${NSB}" timeout --signal=TERM --kill-after=3s 15 \
+    iperf3 -s -1 -p "${port}" -J >>"${EVIDENCE}/operations.log"
+  printf '\nstdout=%s\nstderr=%s\n' "${server_json}" "${server_stderr}" \
+    >>"${EVIDENCE}/operations.log"
+  for ((attempt=1; attempt<=50; attempt++)); do
+    if tcp_server_listening "${port}"; then ready=1; break; fi
+    [[ -d "/proc/${IPERF_PID}" ]] || break
+    sleep 0.1
+  done
+  if ((ready == 0)); then
+    capture_iperf_failure_state "${index}" "${target}" "${local_ip}" "${port}"
+    if wait "${IPERF_PID}"; then server_rc=0; else server_rc=$?; fi
+    printf 'timestamp=%s event=finish phase=iperf-%s-server pid=%s rc=%s ready=0\n' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${index}" "${IPERF_PID}" "${server_rc}" \
+      >>"${EVIDENCE}/operations.log"
+    IPERF_PID=''
+    return 1
+  fi
+  if log_command "iperf-${index}-client" ip netns exec "${NSA}" \
+    timeout --signal=TERM --kill-after=3s 15 iperf3 -c "${target}" -p "${port}" \
+    --connect-timeout 3000 --snd-timeout 3000 -t 2 -P "${streams}" -J; then
+    client_rc=0
+  else
+    client_rc=$?
+    capture_iperf_failure_state "${index}" "${target}" "${local_ip}" "${port}"
+  fi
+  if wait "${IPERF_PID}"; then server_rc=0; else server_rc=$?; fi
+  printf 'timestamp=%s event=finish phase=iperf-%s-server pid=%s rc=%s ready=1\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${index}" "${IPERF_PID}" "${server_rc}" \
+    >>"${EVIDENCE}/operations.log"
+  IPERF_PID=''
+  ((client_rc == 0 && server_rc == 0))
+}
+
 ip netns exec "${NSR}" tcpdump -U -nn -i any -w "${EVIDENCE}/outer.pcap" \
   >"${EVIDENCE}/tcpdump.stdout.log" 2>"${EVIDENCE}/tcpdump.stderr.log" &
 TCPDUMP_PID=$!; printf '%s\n' "${TCPDUMP_PID}" >"${ROOT}/tcpdump.pid"
@@ -808,13 +943,8 @@ sleep 1
 for ((index=0; index<WG_COUNT; index++)); do
   third=$((10 + index)); target="10.82.${third}.2"; local_ip="10.82.${third}.1"; port=$((5201 + index))
   log_command "ping-wg-${index}" ip netns exec "${NSA}" ping -I "wg${index}" -c 3 -W 2 "${target}"
-  ip netns exec "${NSB}" timeout --signal=TERM --kill-after=3s 15 iperf3 -s -1 -B "${target}" -p "${port}" -J \
-    >"${EVIDENCE}/iperf-${index}-server.json" 2>"${EVIDENCE}/iperf-${index}-server.stderr.log" &
-  IPERF_PID=$!; sleep 0.4
   streams=1; [[ "${GSO_MODE}" == on ]] && streams=4
-  log_command "iperf-${index}-client" ip netns exec "${NSA}" timeout --signal=TERM --kill-after=3s 15 \
-    iperf3 -c "${target}" -B "${local_ip}" -p "${port}" -t 2 -P "${streams}" -J
-  wait "${IPERF_PID}"; IPERF_PID=''
+  run_iperf_for_wireguard "${index}" "${target}" "${local_ip}" "${port}" "${streams}"
 done
 
 concurrent_pids=()

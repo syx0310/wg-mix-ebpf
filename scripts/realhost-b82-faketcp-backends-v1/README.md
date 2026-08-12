@@ -67,7 +67,14 @@ Each WireGuard explicitly receives bounded policy values rather than aggregate-
 unsafe defaults: session 2048, half-open 256, source ledger 512, pending flows
 128, and pending bytes 131072. Even the 4-WG cell remains strictly below every
 shared implementation ceiling. Each WG gets independent ping and short iperf
-traffic, followed by simultaneous per-WG pings.
+traffic, followed by simultaneous per-WG pings. The driver waits for the exact
+iperf TCP listen socket before starting a client and lets the per-WG `/30`
+route select the source address instead of forcing an additional `-B` bind.
+`gso=off` and `gso=on` are real interface profiles: both endpoint underlays and
+every run-owned WireGuard device have TX checksum offload plus TSO/GSO/GRO
+explicitly disabled or enabled, and the resulting `ethtool -k` state is
+recorded and validated before traffic begins. RX checksum is not forced because
+WireGuard advertises it as fixed off on supported kernels.
 
 WireGuard private keys are generated into unexported shell variables, used to
 derive the public keys, and streamed through anonymous pipes. No private-key
