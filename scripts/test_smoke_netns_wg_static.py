@@ -2338,31 +2338,23 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         for fragment in (
             "PERFORMANCE_MATRIX_START",
             "PERFORMANCE_MATRIX_COMPLETE",
-            "cells=33 repetitions=3 duration_seconds=3",
-            "cells=33 samples=297",
-            "run_udp_cell wireguard-baseline wireguard auto off",
-            "run_udp_cell tcx-baseline ebpf tcx off",
-            "run_udp_cell classic_tc-baseline ebpf classic_tc off",
-            "for max_bytes in 4 16 64 128 256 512 1024 2048; do",
-            'run_udp_cell "tcx-prefix-${max_bytes}" ebpf tcx on',
-            'run_udp_cell "classic_tc-prefix-${max_bytes}" ebpf classic_tc on',
-            "run_udp_cell tcx-full-2048 ebpf tcx on wg-payload-full 2048",
-            "run_udp_cell classic_tc-full-2048 ebpf classic_tc on wg-payload-full 2048",
-            "run_production_cell icmp-tcx-baseline icmp tcx none 4",
-            "run_production_cell icmp-classic_tc-baseline icmp classic_tc none 4",
-            "run_production_cell faketcp-tcx-baseline faketcp tcx none 4",
-            'run_production_cell "faketcp-tcx-prefix-${max_bytes}" faketcp tcx prefix',
-            "run_production_cell faketcp-tcx-full-2048 faketcp tcx full 2048",
-            '"TCP_REPETITIONS=3"',
-            '"TCP_DURATION=3"',
-            '"TCP_DIRECTIONS=forward reverse bidir"',
-            '"TCP_MAX_RETRANSMITS=0"',
-            '"TCP_MTUS=1420"',
-            '!= "0:0:700:1"',
-            '/usr/bin/bash -p "${launcher}"',
+            "cells=63 samples=567 repetitions=3 duration_seconds=3",
+            "readonly CELL_COUNT=63 SAMPLE_COUNT=567 REPETITIONS=3 DURATION=3",
+            'readonly -a PREFIX_LENGTHS=(4 16 64 128 256 512 1024 2048)',
+            "wireguard-baseline wireguard none none none none 0",
+            '"udp-${backend}-none" udp "${backend}" none baseline none 0',
+            '"udp-${backend}-full-2048" udp "${backend}" none baseline full 2048',
+            '"icmp-${backend}-none" icmp "${backend}" none baseline none 0',
+            "for checksum in kfunc kprobe; do",
+            '"faketcp-${backend}-${checksum}-none"',
+            '"faketcp-${backend}-${checksum}-full-2048"',
+            "emit_cells run_cell",
+            "--checksum-backend \"${checksum}\"",
+            "samples=9",
+            "tmux_budget_seconds=9000",
         ):
             self.assertIn(fragment, matrix)
-        self.assertEqual(1, matrix.count("XOR_PASSWORD=\"${xor_secret}\""))
+        self.assertNotIn('XOR_PASSWORD="${xor_secret}"', matrix)
         self.assertNotIn("rm -rf", matrix)
         self.assertNotIn("find -delete", matrix)
 

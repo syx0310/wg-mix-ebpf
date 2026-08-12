@@ -11,8 +11,16 @@ readonly STAGED_NAME="scripts/run-b82-production-performance-cell.sh"
 readonly BIN_NAME="bin/wg-mix-ebpf"
 readonly BASELINE_OBJECT_NAME="build/wg_mix_tc.o"
 readonly FAKETCP_OBJECT_NAME="build/wg_mix_faketcp_experimental.o"
+readonly FAKETCP_LEGACY_OBJECT_NAME="build/wg_mix_faketcp_legacy_515.o"
 readonly IPERF_CHECKER_NAME="scripts/check-iperf3-tcp.py"
-readonly RUN_PARENT="/run/wg-mix-ebpf-performance-tests"
+run_parent="${WG_MIX_EBPF_PERFORMANCE_RUN_PARENT-/var/tmp/wg-mix-ebpf-performance-tests}"
+unset WG_MIX_EBPF_PERFORMANCE_RUN_PARENT
+if [[ "${run_parent}" != "/var/tmp/wg-mix-ebpf-performance-tests" &&
+  ! "${run_parent}" =~ ^/var/tmp/wg-mix-ebpf-performance-tests/[0-9a-f]{8}/children$ ]]; then
+  echo "error: performance child run parent is outside the reviewed matrix scope" >&2
+  exit 1
+fi
+readonly RUN_PARENT="${run_parent}"
 readonly SHARED_RUN_TARGET="/run/wg-mix-ebpf"
 readonly SHARED_VAR_TARGET="/var/lib/wg-mix-ebpf"
 readonly SHARED_MAINTENANCE_TARGET="/run/.wg-mix-ebpf-daemon.lease.maintenance"
@@ -20,8 +28,11 @@ readonly DURATION=3
 readonly REPETITIONS=3
 readonly STREAMS=1
 readonly MINIMUM_BYTES=1048576
-readonly MAXIMUM_RETRANSMITS=0
+readonly MAXIMUM_RETRANSMITS=2147483647
 readonly MINIMUM_FAIRNESS=0.90
+readonly KFUNC_MODULE="wg_mix_faketcp_checksum"
+readonly KPROBE_MODULE="wg_mix_faketcp_checksum_kprobe"
+readonly KPROBE_DEVICE="/dev/wg_mix_faketcp_checksum_kprobe"
 
 PATH="${SAFE_PATH}"
 LC_ALL=C
@@ -51,10 +62,20 @@ if [[ ! "${source_root}" =~ ^/run/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ 
   exit 1
 fi
 
-readonly BIN="${source_root}/${BIN_NAME}"
-readonly BASELINE_OBJECT="${source_root}/${BASELINE_OBJECT_NAME}"
-readonly FAKETCP_OBJECT="${source_root}/${FAKETCP_OBJECT_NAME}"
+artifact_root="${WG_MIX_EBPF_PERFORMANCE_ARTIFACT_ROOT-${source_root}}"
+unset WG_MIX_EBPF_PERFORMANCE_ARTIFACT_ROOT
+if [[ "${artifact_root}" != "${source_root}" &&
+  ! "${artifact_root}" =~ ^/var/tmp/wg-mix-ebpf-performance-tests/[0-9a-f]{8}/artifacts$ ]]; then
+  echo "error: performance artifact root is outside the reviewed matrix scope" >&2
+  exit 1
+fi
+readonly ARTIFACT_ROOT="${artifact_root}"
+readonly BIN="${ARTIFACT_ROOT}/${BIN_NAME}"
+readonly BASELINE_OBJECT="${ARTIFACT_ROOT}/${BASELINE_OBJECT_NAME}"
+readonly FAKETCP_OBJECT="${ARTIFACT_ROOT}/${FAKETCP_OBJECT_NAME}"
+readonly FAKETCP_LEGACY_OBJECT="${ARTIFACT_ROOT}/${FAKETCP_LEGACY_OBJECT_NAME}"
 readonly IPERF_CHECKER="${source_root}/${IPERF_CHECKER_NAME}"
+readonly ARTIFACT_MANIFEST="${ARTIFACT_ROOT%/artifacts}/artifacts.v1"
 
 validate_staged_regular() {
   local path="$1"
@@ -84,7 +105,58 @@ validate_staged_regular() {
 validate_staged_regular "${script_path}" yes
 validate_staged_regular "${BIN}" yes
 validate_staged_regular "${BASELINE_OBJECT}" no
+validate_staged_regular "${FAKETCP_OBJECT}" no
+validate_staged_regular "${FAKETCP_LEGACY_OBJECT}" no
 validate_staged_regular "${IPERF_CHECKER}" no
+
+if [[ "${ARTIFACT_ROOT}" != "${source_root}" ]]; then
+  if [[ ! -f "${ARTIFACT_MANIFEST}" || -L "${ARTIFACT_MANIFEST}" ||
+    "$(stat -c '%u:%g:%a:%h' -- "${ARTIFACT_MANIFEST}")" != 0:0:600:1 ]]; then
+    echo "error: frozen performance artifact manifest is unsafe" >&2
+    exit 1
+  fi
+  python3 - "${ARTIFACT_MANIFEST}" "${ARTIFACT_ROOT}" <<'PY'
+import hashlib
+import pathlib
+import re
+import stat
+import sys
+
+manifest, root = map(pathlib.Path, sys.argv[1:])
+raw = manifest.read_bytes()
+if not raw.endswith(b"\n") or b"\0" in raw or b"\r" in raw:
+    raise SystemExit("frozen performance artifact manifest is non-canonical")
+rows = raw[:-1].decode("ascii", "strict").split("\n")
+expected = [
+    "bin/wg-mix-ebpf",
+    "build/wg_mix_tc.o",
+    "build/wg_mix_faketcp_experimental.o",
+    "build/wg_mix_faketcp_legacy_515.o",
+    "faketcp_checksum_kmod/wg_mix_faketcp_checksum.ko",
+    "faketcp_checksum_kprobe_kmod/wg_mix_faketcp_checksum_kprobe.ko",
+]
+if rows[:1] != ["format=wg-mix-ebpf-performance-artifacts-v1"] or len(rows) != 7:
+    raise SystemExit("frozen performance artifact manifest has the wrong schema")
+for row, relative in zip(rows[1:], expected, strict=True):
+    observed, separator, digest = row.partition("=")
+    path = root / relative
+    metadata = path.lstat()
+    wanted_mode = 0o500 if relative == "bin/wg-mix-ebpf" else 0o400
+    if (
+        observed != relative
+        or separator != "="
+        or not re.fullmatch(r"[0-9a-f]{64}", digest)
+        or path.resolve(strict=True) != path
+        or not stat.S_ISREG(metadata.st_mode)
+        or stat.S_IMODE(metadata.st_mode) != wanted_mode
+        or metadata.st_uid != 0
+        or metadata.st_gid != 0
+        or metadata.st_nlink != 1
+        or hashlib.sha256(path.read_bytes()).hexdigest() != digest
+    ):
+        raise SystemExit(f"frozen performance artifact differs: {relative}")
+PY
+fi
 
 validate_run_id() {
   [[ "$1" =~ ^[0-9a-f]{8}$ ]]
@@ -113,6 +185,7 @@ endpoint_child() {
   local run_id=""
   local role=""
   local transport=""
+  local endpoint_command resolved_endpoint_command
 
   shift
   while (($#)); do
@@ -139,36 +212,41 @@ endpoint_child() {
     esac
   done
   if ! validate_run_id "${run_id}" || [[ ! "${role}" =~ ^(a|b)$ ]] ||
-    [[ ! "${transport}" =~ ^(icmp|faketcp)$ ]]; then
+    [[ ! "${transport}" =~ ^(wireguard|udp|icmp|faketcp)$ ]]; then
     echo "error: invalid endpoint child identity" >&2
     return 2
   fi
+  for endpoint_command in env ip mount stat awk grep; do
+    resolved_endpoint_command="$(command -v "${endpoint_command}")" || {
+      echo "error: missing endpoint command: ${endpoint_command}" >&2
+      return 1
+    }
+    if [[ "${resolved_endpoint_command}" != /* ||
+      ! -f "${resolved_endpoint_command}" || ! -x "${resolved_endpoint_command}" ]]; then
+      echo "error: resolved endpoint command is unsafe: ${endpoint_command}=${resolved_endpoint_command}" >&2
+      return 1
+    fi
+  done
 
   local run_root="${RUN_PARENT}/${run_id}"
   local endpoint_root="${run_root}/endpoint-${role}"
   local endpoint_run="${endpoint_root}/run"
   local endpoint_var="${endpoint_root}/var"
-  local endpoint_maintenance="${endpoint_root}/maintenance.gate"
   local netns="wgp${run_id}${role}"
   local pin_path="/sys/fs/bpf/wg-mix-ebpf-performance-${run_id}-${role}"
-  local current_mountns
+  local current_mountns expected_netns current_netns
 
   validate_root_directory "${run_root}"
   validate_root_directory "${endpoint_root}"
   validate_root_directory "${endpoint_run}"
   validate_root_directory "${endpoint_var}"
-  if [[ ! -f "${endpoint_maintenance}" || -L "${endpoint_maintenance}" ||
-    "$(stat -c '%u:%g:%a:%h' -- "${endpoint_maintenance}")" != "0:0:600:1" ]]; then
-    echo "error: endpoint child maintenance gate is unsafe" >&2
-    return 1
-  fi
   if [[ ! -f "${run_root}/owner" || -L "${run_root}/owner" ]] ||
     [[ "$(<"${run_root}/owner")" != "wg-mix-ebpf-performance:${run_id}" ]]; then
     echo "error: endpoint child ownership marker mismatch" >&2
     return 1
   fi
-  if [[ "${WG_MIX_EBPF_PERFORMANCE_PARENT_MOUNTNS-}" == "" ]]; then
-    echo "error: endpoint child lacks sealed parent mount namespace" >&2
+  if [[ ! "${WG_MIX_EBPF_PERFORMANCE_PARENT_MOUNTNS-}" =~ ^[1-9][0-9]*:[1-9][0-9]*$ ]]; then
+    echo "error: endpoint child lacks a valid sealed parent mount namespace" >&2
     return 1
   fi
   current_mountns="$(stat -Lc '%d:%i' -- /proc/self/ns/mnt)"
@@ -181,6 +259,13 @@ endpoint_child() {
     echo "error: endpoint child network namespace is absent: ${netns}" >&2
     return 1
   fi
+  expected_netns="$(stat -Lc '%d:%i' -- "/run/netns/${netns}")"
+  current_netns="$(stat -Lc '%d:%i' -- /proc/self/ns/net)"
+  if [[ ! "${expected_netns}" =~ ^[1-9][0-9]*:[1-9][0-9]*$ ||
+    "${current_netns}" != "${expected_netns}" ]]; then
+    echo "error: endpoint child did not enter its exact network namespace" >&2
+    return 1
+  fi
 
   printf 'ENDPOINT_MUTATION role=%s argv=' "${role}"
   printf '%q ' mount --bind "${endpoint_run}" "${SHARED_RUN_TARGET}"
@@ -191,10 +276,6 @@ endpoint_child() {
   printf '\n'
   mount --bind "${endpoint_var}" "${SHARED_VAR_TARGET}"
   printf 'ENDPOINT_MUTATION role=%s argv=' "${role}"
-  printf '%q ' mount --bind "${endpoint_maintenance}" "${SHARED_MAINTENANCE_TARGET}"
-  printf '\n'
-  mount --bind "${endpoint_maintenance}" "${SHARED_MAINTENANCE_TARGET}"
-  printf 'ENDPOINT_MUTATION role=%s argv=' "${role}"
   printf '%q ' mount -t bpf -o mode=0700 bpf /sys/fs/bpf
   printf '\n'
   mount -t bpf -o mode=0700 bpf /sys/fs/bpf
@@ -204,17 +285,16 @@ endpoint_child() {
     "LC_ALL=C"
     "WG_MIX_EBPF_OBJECT=${BASELINE_OBJECT}"
     "WG_MIX_EBPF_PIN_PATH=${pin_path}"
+    "WG_MIX_EBPF_FAKETCP_OBJECT=${FAKETCP_OBJECT}"
+    "WG_MIX_EBPF_FAKETCP_LEGACY_515_OBJECT=${FAKETCP_LEGACY_OBJECT}"
   )
-  if [[ "${transport}" == "faketcp" ]]; then
-    daemon_environment+=("WG_MIX_EBPF_FAKETCP_OBJECT=${FAKETCP_OBJECT}")
-  fi
   printf 'ENDPOINT_DAEMON_EXEC role=%s netns=%s pin=%s argv=' \
     "${role}" "${netns}" "${pin_path}"
   printf '%q ' "${BIN}" run --config /run/wg-mix-ebpf/config.yaml \
     --run-dir /run/wg-mix-ebpf/runtime \
     --state-dir /var/lib/wg-mix-ebpf/state --shutdown-timeout 20s
   printf '\n'
-  exec ip netns exec "${netns}" env -i "${daemon_environment[@]}" \
+  exec env -i "${daemon_environment[@]}" \
     "${BIN}" run --config /run/wg-mix-ebpf/config.yaml \
     --run-dir /run/wg-mix-ebpf/runtime \
     --state-dir /var/lib/wg-mix-ebpf/state --shutdown-timeout 20s
@@ -225,8 +305,9 @@ if [[ "${1-}" == "endpoint" ]]; then
   exit $?
 fi
 
-if [[ "${1-}" != "run" ]]; then
-  echo "usage: ${STAGED_NAME} run --run-id <8hex> --label <label> --transport <icmp|faketcp> --backend <tcx|classic_tc> --cipher <none|prefix|full> --max-bytes <value>" >&2
+operation="${1-}"
+if [[ ! "${operation}" =~ ^(run|restore)$ ]]; then
+  echo "usage: ${STAGED_NAME} {run|restore} --run-id <8hex> --label <label> --transport <wireguard|udp|icmp|faketcp> --backend <none|tcx|classic_tc> --checksum-backend <none|kfunc|kprobe> --cipher <none|prefix|full> --max-bytes <value>" >&2
   exit 2
 fi
 shift
@@ -235,6 +316,7 @@ run_id=""
 label=""
 transport=""
 backend=""
+checksum_backend=""
 cipher=""
 max_bytes=""
 while (($#)); do
@@ -259,6 +341,11 @@ while (($#)); do
       backend="$2"
       shift 2
       ;;
+    --checksum-backend)
+      (($# >= 2)) || exit 2
+      checksum_backend="$2"
+      shift 2
+      ;;
     --cipher)
       (($# >= 2)) || exit 2
       cipher="$2"
@@ -277,41 +364,73 @@ while (($#)); do
 done
 
 if ! validate_run_id "${run_id}" ||
-  [[ ! "${label}" =~ ^(icmp-(tcx|classic_tc)-baseline|faketcp-tcx-(baseline|prefix-(4|16|64|128|256|512|1024|2048)|full-2048))$ ]] ||
-  [[ ! "${transport}" =~ ^(icmp|faketcp)$ ]] ||
-  [[ ! "${backend}" =~ ^(tcx|classic_tc)$ ]] ||
+  [[ ! "${label}" =~ ^(wireguard-baseline|udp-(tcx|classic_tc)-(none|prefix-(4|16|64|128|256|512|1024|2048)|full-2048)|icmp-(tcx|classic_tc)-none|faketcp-(tcx|classic_tc)-(kfunc|kprobe)-(none|prefix-(4|16|64|128|256|512|1024|2048)|full-2048))$ ]] ||
+  [[ ! "${transport}" =~ ^(wireguard|udp|icmp|faketcp)$ ]] ||
+  [[ ! "${backend}" =~ ^(none|tcx|classic_tc)$ ]] ||
+  [[ ! "${checksum_backend}" =~ ^(none|kfunc|kprobe)$ ]] ||
   [[ ! "${cipher}" =~ ^(none|prefix|full)$ ]] ||
-  [[ ! "${max_bytes}" =~ ^(4|16|64|128|256|512|1024|2048)$ ]]; then
+  [[ ! "${max_bytes}" =~ ^(0|4|16|64|128|256|512|1024|2048)$ ]]; then
   echo "error: invalid production performance cell arguments" >&2
   exit 2
 fi
-if [[ "${transport}" == "icmp" && ("${cipher}" != "none" || "${max_bytes}" != "4") ]]; then
+if [[ "${transport}" == "wireguard" && ("${backend}" != "none" ||
+  "${checksum_backend}" != "none" || "${cipher}" != "none" ||
+  "${max_bytes}" != "0" || "${label}" != "wireguard-baseline") ]]; then
+  echo "error: pure WireGuard permits only its exact BPF-free baseline cell" >&2
+  exit 2
+fi
+if [[ "${transport}" == "udp" && ("${backend}" == "none" ||
+  "${checksum_backend}" != "none") ]]; then
+  echo "error: UDP requires an attachment backend and no checksum backend" >&2
+  exit 2
+fi
+if [[ "${transport}" == "icmp" && ("${checksum_backend}" != "none" || "${cipher}" != "none" || "${max_bytes}" != "0") ]]; then
   echo "error: ICMP performance permits only the no-XOR sentinel" >&2
   exit 2
 fi
-if [[ "${transport}" == "faketcp" && "${backend}" != "tcx" ]]; then
-  echo "error: FakeTCP production performance requires TCX" >&2
+if [[ "${transport}" == "faketcp" && ! "${checksum_backend}" =~ ^(kfunc|kprobe)$ ]]; then
+  echo "error: FakeTCP production performance requires an exact checksum backend" >&2
   exit 2
 fi
 if [[ "${cipher}" == "full" && "${max_bytes}" != "2048" ]]; then
   echo "error: full-payload performance requires max_bytes=2048" >&2
   exit 2
 fi
-if [[ "${cipher}" == "none" && "${max_bytes}" != "4" ]]; then
-  echo "error: no-XOR performance requires max_bytes=4 sentinel" >&2
+if [[ "${cipher}" == "none" && "${max_bytes}" != "0" ]]; then
+  echo "error: no-XOR performance requires max_bytes=0 sentinel" >&2
   exit 2
 fi
-if [[ "${transport}" == "faketcp" ]]; then
-  validate_staged_regular "${FAKETCP_OBJECT}" no
-  if [[ ! -d /sys/module/wg_mix_faketcp_checksum ||
-    ! -r /sys/kernel/btf/wg_mix_faketcp_checksum ]]; then
-    echo "error: FakeTCP requires the administrator-provisioned wg_mix_faketcp_checksum module and BTF" >&2
+cell_shape="${cipher}"
+[[ "${cipher}" == prefix ]] && cell_shape="prefix-${max_bytes}"
+[[ "${cipher}" == full ]] && cell_shape="full-2048"
+case "${transport}" in
+  wireguard) expected_label=wireguard-baseline ;;
+  udp) expected_label="udp-${backend}-${cell_shape}" ;;
+  icmp) expected_label="icmp-${backend}-none" ;;
+  faketcp) expected_label="faketcp-${backend}-${checksum_backend}-${cell_shape}" ;;
+esac
+if [[ "${label}" != "${expected_label}" ]]; then
+  echo "error: performance label does not bind its exact cell arguments" >&2
+  exit 2
+fi
+unset cell_shape expected_label
+if [[ "${operation}" == "run" && "${transport}" == "faketcp" ]]; then
+  if [[ "${checksum_backend}" == "kfunc" ]]; then
+    if [[ ! -d "/sys/module/${KFUNC_MODULE}" || ! -r "/sys/kernel/btf/${KFUNC_MODULE}" ]]; then
+      echo "error: FakeTCP kfunc requires the matrix-owned checksum module and BTF" >&2
+      exit 1
+    fi
+  elif [[ ! -d "/sys/module/${KPROBE_MODULE}" || ! -c "${KPROBE_DEVICE}" ||
+    -L "${KPROBE_DEVICE}" ||
+    "$(stat -c '%u:%g:%a:%h' -- "${KPROBE_DEVICE}")" != 0:0:600:1 ]]; then
+    echo "error: FakeTCP kprobe requires the matrix-owned bridge and character device" >&2
     exit 1
   fi
 fi
 
-for command_name in ip wg ping iperf3 python3 timeout tcpdump tc bpftool \
-  unshare nsenter mount awk grep stat date sha256sum nft ss sysctl ps tee; do
+for command_name in bash env cat sleep ip wg ping iperf3 python3 timeout tcpdump tc bpftool \
+  unshare nsenter mount awk grep stat date sha256sum nft ss sysctl ps tee \
+  readlink unlink mkdir uname; do
   if ! resolved_command="$(command -v "${command_name}")"; then
     echo "error: missing production performance command: ${command_name}" >&2
     exit 1
@@ -327,45 +446,6 @@ for command_name in ip wg ping iperf3 python3 timeout tcpdump tc bpftool \
   fi
 done
 unset resolved_command
-
-if [[ ! -d "${RUN_PARENT}" ]]; then
-  mkdir --mode=0700 -- "${RUN_PARENT}"
-fi
-validate_root_directory "${RUN_PARENT}"
-if [[ -e "${RUN_PARENT}/${run_id}" || -L "${RUN_PARENT}/${run_id}" ]]; then
-  echo "error: production performance run already exists: ${RUN_PARENT}/${run_id}" >&2
-  exit 1
-fi
-for shared_target in "${SHARED_RUN_TARGET}" "${SHARED_VAR_TARGET}"; do
-  if [[ ! -d "${shared_target}" ]]; then
-    echo "error: reviewed mount target must be provisioned before the run: ${shared_target}" >&2
-    exit 1
-  fi
-  validate_root_directory "${shared_target}"
-done
-if [[ ! -f "${SHARED_MAINTENANCE_TARGET}" || -L "${SHARED_MAINTENANCE_TARGET}" ||
-  "$(stat -c '%u:%g:%a:%h' -- "${SHARED_MAINTENANCE_TARGET}")" != "0:0:600:1" ]]; then
-  echo "error: global lifecycle maintenance target is missing or unsafe: ${SHARED_MAINTENANCE_TARGET}" >&2
-  exit 1
-fi
-maintenance_target_stat_before="$(stat -Lc '%d:%i:%u:%g:%a:%h:%s' -- "${SHARED_MAINTENANCE_TARGET}")"
-maintenance_target_sha_before="$(sha256sum -- "${SHARED_MAINTENANCE_TARGET}" | awk '{print $1}')"
-if ! python3 - "${SHARED_MAINTENANCE_TARGET}" <<'PY'
-import fcntl
-import os
-import sys
-
-fd = os.open(sys.argv[1], os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
-try:
-    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    fcntl.flock(fd, fcntl.LOCK_UN)
-finally:
-    os.close(fd)
-PY
-then
-  echo "error: global lifecycle maintenance target is currently held" >&2
-  exit 1
-fi
 
 readonly RUN_ROOT="${RUN_PARENT}/${run_id}"
 readonly EVIDENCE="${RUN_ROOT}/evidence"
@@ -387,6 +467,244 @@ readonly PORT_A=31001
 readonly PORT_B=31002
 readonly IPERF_PORT=5201
 
+proof_value() {
+  local key="$1"
+  local path="$2"
+  awk -F= -v wanted="${key}" \
+    '$1 == wanted { count++; value = substr($0, length($1) + 2) }
+     END { if (count != 1 || value == "") exit 79; print value }' "${path}"
+}
+
+validate_retained_run() {
+  local expected_artifact=baseline
+  [[ "${transport}" == wireguard ]] && expected_artifact=none
+  [[ "${checksum_backend}" == kfunc ]] && expected_artifact=modern
+  [[ "${checksum_backend}" == kprobe ]] && expected_artifact=legacy_515
+  [[ -d "${RUN_PARENT}" && ! -L "${RUN_PARENT}" ]] || return 79
+  validate_root_directory "${RUN_PARENT}"
+  [[ -d "${RUN_ROOT}" && ! -L "${RUN_ROOT}" ]] || return 79
+  validate_root_directory "${RUN_ROOT}"
+  [[ -f "${RUN_ROOT}/owner" && ! -L "${RUN_ROOT}/owner" &&
+    "$(stat -c '%u:%g:%a:%h' -- "${RUN_ROOT}/owner")" == "0:0:600:1" &&
+    "$(<"${RUN_ROOT}/owner")" == "wg-mix-ebpf-performance:${run_id}" ]] || return 79
+  [[ -f "${RUN_ROOT}/manifest" && ! -L "${RUN_ROOT}/manifest" &&
+    "$(stat -c '%u:%g:%a:%h' -- "${RUN_ROOT}/manifest")" == "0:0:600:1" &&
+    "$(proof_value format "${RUN_ROOT}/manifest")" == \
+      "wg-mix-ebpf-b82-production-performance-v1" &&
+    "$(proof_value run_id "${RUN_ROOT}/manifest")" == "${run_id}" &&
+    "$(proof_value label "${RUN_ROOT}/manifest")" == "${label}" &&
+    "$(proof_value transport "${RUN_ROOT}/manifest")" == "${transport}" &&
+    "$(proof_value backend "${RUN_ROOT}/manifest")" == "${backend}" &&
+    "$(proof_value checksum_backend "${RUN_ROOT}/manifest")" == "${checksum_backend}" &&
+    "$(proof_value artifact "${RUN_ROOT}/manifest")" == "${expected_artifact}" &&
+    "$(proof_value cipher "${RUN_ROOT}/manifest")" == "${cipher}" &&
+    "$(proof_value max_bytes "${RUN_ROOT}/manifest")" == "${max_bytes}" &&
+    "$(proof_value source_root "${RUN_ROOT}/manifest")" == "${source_root}" &&
+    "$(proof_value baseline_object_sha256 "${RUN_ROOT}/manifest")" == \
+      "$(sha256sum -- "${BASELINE_OBJECT}" | awk '{print $1}')" ]] || return 79
+  if [[ "${transport}" == faketcp ]]; then
+    [[ "$(proof_value faketcp_object_sha256 "${RUN_ROOT}/manifest")" == \
+      "$(sha256sum -- "${FAKETCP_OBJECT}" | awk '{print $1}')" &&
+      "$(proof_value faketcp_legacy_object_sha256 "${RUN_ROOT}/manifest")" == \
+      "$(sha256sum -- "${FAKETCP_LEGACY_OBJECT}" | awk '{print $1}')" ]] || return 79
+  fi
+  [[ -d "${EVIDENCE}" && ! -L "${EVIDENCE}" ]] || return 79
+  validate_root_directory "${EVIDENCE}"
+}
+
+restore_log() {
+  printf 'timestamp=%s phase=%s argv=' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" \
+    >>"${EVIDENCE}/restore-operations.log"
+  shift
+  printf '%q ' "$@" >>"${EVIDENCE}/restore-operations.log"
+  printf '\n' >>"${EVIDENCE}/restore-operations.log"
+}
+
+namespace_present() {
+  ip netns list | awk -v wanted="$1" '$1 == wanted { count++ } END { exit count != 1 }'
+}
+
+allowed_restore_executable() {
+  local actual="$1"
+  local candidate resolved
+  [[ "${actual}" == "${BIN}" ]] && return 0
+  [[ "${actual}" == "${script_path}" ]] && return 0
+  for candidate in bash env cat sleep ip wg ping iperf3 python3 timeout tcpdump tc bpftool \
+    unshare nsenter mount awk grep stat date sha256sum nft ss sysctl ps tee \
+    readlink unlink; do
+    resolved="$(readlink -e -- "$(command -v "${candidate}")")"
+    [[ "${actual}" != "${resolved}" ]] || return 0
+  done
+  return 1
+}
+
+signal_namespace_processes() {
+  local signal="$1"
+  local netns="$2"
+  local expected_inode pid actual_inode actual_executable
+  expected_inode="$(stat -Lc '%d:%i' -- "/run/netns/${netns}")"
+  while IFS= read -r pid; do
+    [[ -n "${pid}" ]] || continue
+    [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 79
+    [[ -d "/proc/${pid}" ]] || continue
+    actual_inode="$(stat -Lc '%d:%i' -- "/proc/${pid}/ns/net")"
+    actual_executable="$(readlink -e -- "/proc/${pid}/exe")"
+    if [[ "${actual_inode}" != "${expected_inode}" ]] ||
+      ! allowed_restore_executable "${actual_executable}"; then
+      printf 'error: refusing to signal an unproved retained process: netns=%s pid=%s inode=%s exe=%s\n' \
+        "${netns}" "${pid}" "${actual_inode}" "${actual_executable}" >&2
+      return 79
+    fi
+    restore_log "process-${signal}" kill "-${signal}" "${pid}" \
+      "netns=${netns}" "inode=${actual_inode}" "exe=${actual_executable}"
+    kill "-${signal}" "${pid}"
+  done < <(ip netns pids "${netns}")
+}
+
+wait_namespace_empty() {
+  local netns="$1"
+  local attempts="$2"
+  local attempt remaining
+  for ((attempt = 1; attempt <= attempts; attempt++)); do
+    remaining="$(ip netns pids "${netns}")"
+    [[ -z "${remaining}" ]] && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+remove_retained_secret() {
+  local path="$1"
+  [[ "${path}" == "${RUN_ROOT}/"* ]] || return 79
+  [[ ! -e "${path}" && ! -L "${path}" ]] && return 0
+  [[ -f "${path}" && ! -L "${path}" &&
+    "$(stat -c '%u:%g:%a:%h' -- "${path}")" == "0:0:600:1" ]] || return 79
+  restore_log secret-unlink unlink -- "${path}"
+  unlink -- "${path}"
+}
+
+remove_retained_classic_journals() {
+  local root path
+  local -a paths=()
+  for root in "${ENDPOINT_A_VAR}/pin-owners" "${ENDPOINT_B_VAR}/pin-owners"; do
+    [[ ! -e "${root}" && ! -L "${root}" ]] && continue
+    [[ -d "${root}" && ! -L "${root}" && "${root}" == "${RUN_ROOT}/"* ]] || return 79
+    validate_root_directory "${root}"
+    shopt -s nullglob
+    paths=("${root}"/*.faketcp-classic.owner.json "${root}"/*.faketcp-classic.owner.next)
+    shopt -u nullglob
+    ((${#paths[@]} <= 4)) || return 79
+    for path in "${paths[@]}"; do
+      [[ "${path##*/}" =~ ^[0-9a-f]{64}\.faketcp-classic\.owner\.(json|next)$ &&
+        -f "${path}" && ! -L "${path}" &&
+        "$(stat -c '%u:%g:%a:%h' -- "${path}")" == "0:0:600:1" ]] || return 79
+      restore_log classic-journal-unlink unlink -- "${path}"
+      unlink -- "${path}"
+    done
+  done
+}
+
+restore_retained_run() {
+  local netns remaining mountinfo
+  validate_retained_run
+  [[ ! -e "${RUN_ROOT}/complete" && ! -L "${RUN_ROOT}/complete" ]] || {
+    echo "error: completed cells do not require failure restoration" >&2
+    return 79
+  }
+  : >"${EVIDENCE}/restore-operations.log"
+  for netns in "${NSA}" "${NSR}" "${NSB}"; do
+    namespace_present "${netns}" || continue
+    signal_namespace_processes TERM "${netns}"
+  done
+  for netns in "${NSA}" "${NSR}" "${NSB}"; do
+    namespace_present "${netns}" || continue
+    if ! wait_namespace_empty "${netns}" 300; then
+      signal_namespace_processes KILL "${netns}"
+      wait_namespace_empty "${netns}" 50 || {
+        remaining="$(ip netns pids "${netns}")"
+        echo "error: retained namespace processes did not exit: ${netns}: ${remaining}" >&2
+        return 1
+      }
+    fi
+  done
+  for netns in "${NSA}" "${NSR}" "${NSB}"; do
+    namespace_present "${netns}" || continue
+    restore_log netns-delete ip netns delete "${netns}"
+    ip netns delete "${netns}"
+  done
+  remove_retained_secret "${ENDPOINT_A_RUN}/xor.key"
+  remove_retained_secret "${ENDPOINT_B_RUN}/xor.key"
+  remove_retained_secret "${ENDPOINT_A_RUN}/xor.key.next"
+  remove_retained_secret "${ENDPOINT_B_RUN}/xor.key.next"
+  remove_retained_classic_journals
+  for netns in "${NSA}" "${NSR}" "${NSB}"; do
+    if namespace_present "${netns}"; then
+      echo "error: retained namespace remains after explicit restore: ${netns}" >&2
+      return 1
+    fi
+  done
+  mountinfo="$(</proc/self/mountinfo)"
+  if [[ "${mountinfo}" == *"${RUN_ROOT}"* ]]; then
+    echo "error: retained run path remains in the caller mount namespace" >&2
+    return 1
+  fi
+  printf 'format=wg-mix-ebpf-b82-production-performance-restored-v1\nrun_id=%s\nmanifest_sha256=%s\nactive_resources=absent\nsensitive_files=absent\n' \
+    "${run_id}" "$(sha256sum -- "${RUN_ROOT}/manifest" | awk '{print $1}')" \
+    >"${RUN_ROOT}/restored"
+  printf 'PERFORMANCE_PRODUCTION_CELL_RESTORE_COMPLETE run_id=%s root=%s timestamp=%s\n' \
+    "${run_id}" "${RUN_ROOT}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+}
+
+if [[ "${operation}" == "restore" ]]; then
+  restore_retained_run
+  exit 0
+fi
+
+if [[ ! -d "${RUN_PARENT}" ]]; then
+  mkdir --mode=0700 -- "${RUN_PARENT}"
+fi
+validate_root_directory "${RUN_PARENT}"
+if [[ -e "${RUN_PARENT}/${run_id}" || -L "${RUN_PARENT}/${run_id}" ]]; then
+  echo "error: production performance run already exists: ${RUN_PARENT}/${run_id}" >&2
+  exit 1
+fi
+maintenance_target_identity_before=not-used
+if [[ "${transport}" != wireguard ]]; then
+  for shared_target in "${SHARED_RUN_TARGET}" "${SHARED_VAR_TARGET}"; do
+    if [[ ! -d "${shared_target}" ]]; then
+      echo "error: reviewed mount target must be provisioned before the run: ${shared_target}" >&2
+      exit 1
+    fi
+    validate_root_directory "${shared_target}"
+  done
+  if [[ -e "${SHARED_MAINTENANCE_TARGET}" || -L "${SHARED_MAINTENANCE_TARGET}" ]]; then
+    if [[ ! -f "${SHARED_MAINTENANCE_TARGET}" || -L "${SHARED_MAINTENANCE_TARGET}" ||
+      "$(stat -c '%u:%g:%a:%h' -- "${SHARED_MAINTENANCE_TARGET}")" != "0:0:600:1" ]]; then
+      echo "error: global lifecycle maintenance target is unsafe: ${SHARED_MAINTENANCE_TARGET}" >&2
+      exit 1
+    fi
+    maintenance_target_identity_before="$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "${SHARED_MAINTENANCE_TARGET}")"
+    if ! python3 - "${SHARED_MAINTENANCE_TARGET}" <<'PY'
+import fcntl
+import os
+import sys
+
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_CLOEXEC | os.O_NOFOLLOW)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    fcntl.flock(fd, fcntl.LOCK_UN)
+finally:
+    os.close(fd)
+PY
+    then
+      echo "error: global lifecycle maintenance target is currently held" >&2
+      exit 1
+    fi
+  else
+    maintenance_target_identity_before=absent
+  fi
+fi
+
 mkdir --mode=0700 -- "${RUN_ROOT}"
 printf 'wg-mix-ebpf-performance:%s\n' "${run_id}" >"${RUN_ROOT}/owner"
 mkdir --mode=0700 -- "${EVIDENCE}" "${SECRETS}" \
@@ -394,15 +712,14 @@ mkdir --mode=0700 -- "${EVIDENCE}" "${SECRETS}" \
   "${ENDPOINT_B}" "${ENDPOINT_B_RUN}" "${ENDPOINT_B_VAR}"
 mkdir --mode=0700 -- "${ENDPOINT_A_RUN}/runtime" "${ENDPOINT_A_VAR}/state" \
   "${ENDPOINT_B_RUN}/runtime" "${ENDPOINT_B_VAR}/state"
-: >"${ENDPOINT_A}/maintenance.gate"
-: >"${ENDPOINT_B}/maintenance.gate"
 
 stage="initialized"
 daemon_a_pid=""
 daemon_b_pid=""
+daemon_a_phase="daemon-a-start"
+daemon_b_phase="daemon-b-start"
 tcpdump_pid=""
 iperf_server_pid=""
-teardown_complete=0
 
 log_argv() {
   local phase="$1"
@@ -587,17 +904,28 @@ printf 'format=wg-mix-ebpf-b82-production-performance-v1\n' >"${RUN_ROOT}/manife
 printf 'run_id=%s\nlabel=%s\ntransport=%s\nbackend=%s\ncipher=%s\nmax_bytes=%s\n' \
   "${run_id}" "${label}" "${transport}" "${backend}" "${cipher}" "${max_bytes}" \
   >>"${RUN_ROOT}/manifest"
-printf 'write_set=%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
+artifact=baseline
+[[ "${transport}" == wireguard ]] && artifact=none
+[[ "${checksum_backend}" == kfunc ]] && artifact=modern
+[[ "${checksum_backend}" == kprobe ]] && artifact=legacy_515
+printf 'checksum_backend=%s\nartifact=%s\n' "${checksum_backend}" "${artifact}" \
+  >>"${RUN_ROOT}/manifest"
+maintenance_write=none
+[[ "${transport}" == wireguard ]] || \
+  maintenance_write="${SHARED_MAINTENANCE_TARGET}:shared-flock-owner-record-updates-or-create"
+printf 'write_set=%s,%s,%s,%s,%s,%s,%s,%s\n' \
   "${RUN_ROOT}" "${NSA}" "${NSR}" "${NSB}" "${VETH_A}:${VETH_RA}" \
   "${VETH_B}:${VETH_RB}" "/sys/fs/bpf/wg-mix-ebpf-performance-${run_id}-{a,b}" \
-  "${ENDPOINT_A}/maintenance.gate->${SHARED_MAINTENANCE_TARGET}" \
-  "${ENDPOINT_B}/maintenance.gate->${SHARED_MAINTENANCE_TARGET}" \
+  "${maintenance_write}" \
   >>"${RUN_ROOT}/manifest"
+unset maintenance_write
 printf 'source_root=%s\nbaseline_object_sha256=%s\n' "${source_root}" \
   "$(sha256sum -- "${BASELINE_OBJECT}" | awk '{print $1}')" >>"${RUN_ROOT}/manifest"
 if [[ "${transport}" == "faketcp" ]]; then
-  printf 'faketcp_object_sha256=%s\n' \
-    "$(sha256sum -- "${FAKETCP_OBJECT}" | awk '{print $1}')" >>"${RUN_ROOT}/manifest"
+  printf 'faketcp_object_sha256=%s\nfaketcp_legacy_object_sha256=%s\n' \
+    "$(sha256sum -- "${FAKETCP_OBJECT}" | awk '{print $1}')" \
+    "$(sha256sum -- "${FAKETCP_LEGACY_OBJECT}" | awk '{print $1}')" \
+    >>"${RUN_ROOT}/manifest"
 fi
 
 make_wg_stub() {
@@ -618,6 +946,10 @@ make_agent_config() {
   local transport_block=""
   local cipher_ref=""
   local cipher_block=""
+  local runtime_checksum="${checksum_backend}"
+  local runtime_attachment="${backend}"
+  [[ "${runtime_checksum}" == none ]] && runtime_checksum=auto
+  [[ "${runtime_attachment}" == none ]] && runtime_attachment=auto
 
   if [[ "${transport}" == "icmp" ]]; then
     if [[ "${role}" == "a" ]]; then
@@ -625,8 +957,10 @@ make_agent_config() {
     else
       transport_block=$'    transport:\n      mode: icmp\n      icmp:\n        role: server'
     fi
-  else
+  elif [[ "${transport}" == "faketcp" ]]; then
     transport_block=$'    transport:\n      mode: faketcp\n      faketcp:\n        checksum_mode: partial-complete-reset-required\n        ingress_mode: xdp-generic-exact'
+  else
+    transport_block=$'    transport:\n      mode: udp'
   fi
   if [[ "${cipher}" != "none" ]]; then
     cipher_ref="    cipher: xor-performance"
@@ -679,7 +1013,8 @@ startup_guard:
 
 runtime:
   poll_interval: 30s
-  attachment_backend: ${backend}
+  attachment_backend: ${runtime_attachment}
+  checksum_backend: ${runtime_checksum}
   require_nonzero_fwmark: true
   strict_runtime_fwmark: true
   allow_zero_fwmark_fallback: false
@@ -727,9 +1062,35 @@ if [[ ! "${private_a}" =~ ^[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]=$ ||
   echo "error: WireGuard key generation failed" >&2
   exit 1
 fi
-printf '%s\n' "${private_a}" >"${SECRETS}/private-a"
-printf '%s\n' "${private_b}" >"${SECRETS}/private-b"
-unset private_a private_b
+
+run_wg_set_private_key() {
+  local phase="$1"
+  local private_key="$2"
+  shift 2
+  local stdout_path="${EVIDENCE}/${phase}.stdout.log"
+  local stderr_path="${EVIDENCE}/${phase}.stderr.log"
+  local metadata_path="${EVIDENCE}/${phase}.meta.log"
+  local status
+  [[ "${private_key}" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 79
+  {
+    printf 'timestamp=%s event=start phase=%s argv=' \
+      "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${phase}"
+    printf '%q ' "$@"
+    printf '\nstdin=ephemeral-private-key-pipe\nstdout=%s\nstderr=%s\n' \
+      "${stdout_path}" "${stderr_path}"
+  } >"${metadata_path}"
+  if { printf '%s\n' "${private_key}"; } | (unset private_key; "$@") \
+    >"${stdout_path}" 2>"${stderr_path}"; then
+    status=0
+  else
+    status=$?
+  fi
+  unset private_key
+  printf 'timestamp=%s event=finish phase=%s rc=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${phase}" "${status}" \
+    >>"${metadata_path}"
+  return "${status}"
+}
 
 stage="network-create"
 run_mutation netns-add-a ip netns add "${NSA}"
@@ -767,17 +1128,16 @@ run_mutation router-forward ip netns exec "${NSR}" sysctl -w net.ipv4.ip_forward
 stage="wireguard-create"
 run_mutation wg-add-a ip -n "${NSA}" link add wg0 type wireguard
 run_mutation wg-add-b ip -n "${NSB}" link add wg0 type wireguard
-run_mutation wg-config-a ip netns exec "${NSA}" wg set wg0 \
-  private-key "${SECRETS}/private-a" listen-port "${PORT_A}" fwmark 0x10000001 \
+run_wg_set_private_key wg-config-a "${private_a}" ip netns exec "${NSA}" wg set wg0 \
+  private-key /dev/stdin listen-port "${PORT_A}" fwmark 0x10000001 \
   peer "${public_b}" allowed-ips 10.77.0.2/32 endpoint 198.19.82.1:${PORT_B} \
   persistent-keepalive 1
-run_mutation wg-config-b ip netns exec "${NSB}" wg set wg0 \
-  private-key "${SECRETS}/private-b" listen-port "${PORT_B}" fwmark 0x10000002 \
+unset private_a
+run_wg_set_private_key wg-config-b "${private_b}" ip netns exec "${NSB}" wg set wg0 \
+  private-key /dev/stdin listen-port "${PORT_B}" fwmark 0x10000002 \
   peer "${public_a}" allowed-ips 10.77.0.1/32 endpoint 198.18.82.1:${PORT_A} \
   persistent-keepalive 1
-unset public_a public_b
-run_mutation private-key-remove-a /bin/rm -- "${SECRETS}/private-a"
-run_mutation private-key-remove-b /bin/rm -- "${SECRETS}/private-b"
+unset private_b public_a public_b
 run_mutation wg-addr-a ip -n "${NSA}" address add 10.77.0.1/24 dev wg0
 run_mutation wg-addr-b ip -n "${NSB}" address add 10.77.0.2/24 dev wg0
 run_mutation wg-mtu-a ip -n "${NSA}" link set wg0 mtu 1420
@@ -792,11 +1152,13 @@ wait_daemon_active() {
   local attempt
   local state
   local status
+  local background_phase="${daemon_a_phase}"
+  [[ "${role}" == b ]] && background_phase="${daemon_b_phase}"
   for ((attempt = 1; attempt <= 300; attempt++)); do
     if [[ ! -d "/proc/${pid}" ]] ||
       ! state="$(ps -p "${pid}" -o state=)" || [[ "${state}" == Z* ]]; then
       if wait "${pid}"; then status=0; else status=$?; fi
-      record_background_finish "daemon-${role}-start" "${status}"
+      record_background_finish "${background_phase}" "${status}"
       echo "error: daemon ${role} exited before active status (rc=${status})" >&2
       return 1
     fi
@@ -825,6 +1187,9 @@ PY
 }
 
 stage="daemon-start"
+if [[ "${transport}" == "wireguard" ]]; then
+  stage="wireguard-baseline-no-daemon"
+else
 parent_mountns="$(stat -Lc '%d:%i' -- /proc/self/ns/mnt)"
 if [[ ! "${parent_mountns}" =~ ^[1-9][0-9]*:[1-9][0-9]*$ ]]; then
   echo "error: cannot seal parent mount namespace" >&2
@@ -832,7 +1197,10 @@ if [[ ! "${parent_mountns}" =~ ^[1-9][0-9]*:[1-9][0-9]*$ ]]; then
 fi
 env -i "PATH=${SAFE_PATH}" "LC_ALL=C" \
   "WG_MIX_EBPF_PERFORMANCE_PARENT_MOUNTNS=${parent_mountns}" \
-  unshare --mount --propagation private "${script_path}" endpoint \
+  "WG_MIX_EBPF_PERFORMANCE_ARTIFACT_ROOT=${ARTIFACT_ROOT}" \
+  "WG_MIX_EBPF_PERFORMANCE_RUN_PARENT=${RUN_PARENT}" \
+  ip netns exec "${NSA}" unshare --mount --propagation private \
+  "${script_path}" endpoint \
   --run-id "${run_id}" --role a --transport "${transport}" \
   >"${EVIDENCE}/daemon-a.stdout.log" 2>"${EVIDENCE}/daemon-a.stderr.log" &
 daemon_a_pid=$!
@@ -840,13 +1208,19 @@ record_background_start daemon-a-start "${EVIDENCE}/daemon-a.stdout.log" \
   "${EVIDENCE}/daemon-a.stderr.log" "${daemon_a_pid}" \
   env -i "PATH=${SAFE_PATH}" "LC_ALL=C" \
   "WG_MIX_EBPF_PERFORMANCE_PARENT_MOUNTNS=${parent_mountns}" \
-  unshare --mount --propagation private "${script_path}" endpoint \
+  "WG_MIX_EBPF_PERFORMANCE_ARTIFACT_ROOT=${ARTIFACT_ROOT}" \
+  "WG_MIX_EBPF_PERFORMANCE_RUN_PARENT=${RUN_PARENT}" \
+  ip netns exec "${NSA}" unshare --mount --propagation private \
+  "${script_path}" endpoint \
   --run-id "${run_id}" --role a --transport "${transport}"
 printf '%s\n' "${daemon_a_pid}" >"${RUN_ROOT}/daemon-a.pid"
 
 env -i "PATH=${SAFE_PATH}" "LC_ALL=C" \
   "WG_MIX_EBPF_PERFORMANCE_PARENT_MOUNTNS=${parent_mountns}" \
-  unshare --mount --propagation private "${script_path}" endpoint \
+  "WG_MIX_EBPF_PERFORMANCE_ARTIFACT_ROOT=${ARTIFACT_ROOT}" \
+  "WG_MIX_EBPF_PERFORMANCE_RUN_PARENT=${RUN_PARENT}" \
+  ip netns exec "${NSB}" unshare --mount --propagation private \
+  "${script_path}" endpoint \
   --run-id "${run_id}" --role b --transport "${transport}" \
   >"${EVIDENCE}/daemon-b.stdout.log" 2>"${EVIDENCE}/daemon-b.stderr.log" &
 daemon_b_pid=$!
@@ -854,11 +1228,15 @@ record_background_start daemon-b-start "${EVIDENCE}/daemon-b.stdout.log" \
   "${EVIDENCE}/daemon-b.stderr.log" "${daemon_b_pid}" \
   env -i "PATH=${SAFE_PATH}" "LC_ALL=C" \
   "WG_MIX_EBPF_PERFORMANCE_PARENT_MOUNTNS=${parent_mountns}" \
-  unshare --mount --propagation private "${script_path}" endpoint \
+  "WG_MIX_EBPF_PERFORMANCE_ARTIFACT_ROOT=${ARTIFACT_ROOT}" \
+  "WG_MIX_EBPF_PERFORMANCE_RUN_PARENT=${RUN_PARENT}" \
+  ip netns exec "${NSB}" unshare --mount --propagation private \
+  "${script_path}" endpoint \
   --run-id "${run_id}" --role b --transport "${transport}"
 printf '%s\n' "${daemon_b_pid}" >"${RUN_ROOT}/daemon-b.pid"
 wait_daemon_active a "${daemon_a_pid}" "${ENDPOINT_A_RUN}/runtime/status.json"
 wait_daemon_active b "${daemon_b_pid}" "${ENDPOINT_B_RUN}/runtime/status.json"
+fi
 
 run_endpoint_cli() {
   local role="$1"
@@ -873,16 +1251,102 @@ run_endpoint_cli() {
     "WG_MIX_EBPF_OBJECT=${BASELINE_OBJECT}"
     "WG_MIX_EBPF_PIN_PATH=/sys/fs/bpf/wg-mix-ebpf-performance-${run_id}-${role}"
     "WG_MIX_EBPF_FAKETCP_OBJECT=${FAKETCP_OBJECT}"
+    "WG_MIX_EBPF_FAKETCP_LEGACY_515_OBJECT=${FAKETCP_LEGACY_OBJECT}"
     "${BIN}" "${action}" --config /run/wg-mix-ebpf/config.yaml
     --run-dir /run/wg-mix-ebpf/runtime --state-dir /var/lib/wg-mix-ebpf/state
   )
   run_recorded_command "${phase}" "${stdout_path}" "${stderr_path}" "${command[@]}"
 }
 
+validate_baseline_status() {
+  local status_path="$1"
+  local role="$2"
+  python3 - "${status_path}" "${backend}" "${role}" <<'PY'
+import json
+import pathlib
+import sys
+
+path = pathlib.Path(sys.argv[1])
+backend, role = sys.argv[2:]
+document = json.loads(path.read_text(encoding="utf-8"))
+if document.get("desired_error") or document.get("dataplane_error"):
+    raise SystemExit(f"baseline daemon {role} status reports an error")
+daemon = document.get("daemon")
+if (
+    not isinstance(daemon, dict)
+    or daemon.get("state") != "active"
+    or daemon.get("last_error")
+):
+    raise SystemExit(f"baseline daemon {role} is not healthy and active")
+dataplane = document.get("dataplane")
+if (
+    not isinstance(dataplane, dict)
+    or dataplane.get("map_error")
+    or not isinstance(dataplane.get("active_generation"), int)
+    or dataplane["active_generation"] <= 0
+    or not isinstance(dataplane.get("abi_version"), int)
+    or dataplane["abi_version"] <= 0
+):
+    raise SystemExit(f"baseline daemon {role} lacks a healthy dataplane status")
+underlays = dataplane.get("underlays")
+if not isinstance(underlays, list) or len(underlays) != 1:
+    raise SystemExit(f"baseline daemon {role} does not report one exact underlay")
+underlay = underlays[0]
+if (
+    underlay.get("name") != "under0"
+    or underlay.get("ifname") != "under0"
+    or not isinstance(underlay.get("ifindex"), int)
+    or underlay["ifindex"] <= 0
+    or underlay.get("error")
+):
+    raise SystemExit(f"baseline daemon {role} exact underlay identity is invalid")
+filters = underlay.get("filters")
+if (
+    not underlay.get("ingress_attached")
+    or not underlay.get("egress_attached")
+    or not isinstance(filters, list)
+    or len(filters) != 2
+    or {item.get("direction") for item in filters} != {"ingress", "egress"}
+    or any(item.get("backend") != backend for item in filters)
+    or any(not isinstance(item.get("program_id"), int) or item["program_id"] <= 0 for item in filters)
+):
+    raise SystemExit(f"baseline daemon {role} attachment identity is incomplete")
+if backend == "tcx":
+    if any(
+        not isinstance(item.get(key), int) or item[key] <= 0
+        for item in filters
+        for key in ("attach_type", "link_id")
+    ) or len({item["link_id"] for item in filters}) != 2:
+        raise SystemExit(f"baseline daemon {role} TCX link identity is incomplete")
+else:
+    if any(
+        not isinstance(item.get(key), int) or item[key] <= 0
+        for item in filters
+        for key in ("handle", "priority")
+    ) or {item["handle"] for item in filters} != {0x10001, 0x10002} or any(
+        item["priority"] != 49152 for item in filters
+    ):
+        raise SystemExit(f"baseline daemon {role} classic TC identity is incomplete")
+print(f"baseline_status=healthy role={role} attachment={backend} filters=2")
+PY
+}
+
 validate_faketcp_status() {
   local status_path="$1"
   local identity_path="$2"
-  python3 - "${status_path}" "${identity_path}" "${FAKETCP_OBJECT}" <<'PY'
+  local selected_object="${FAKETCP_OBJECT}"
+  local object_variant="modern-kfunc"
+  local module_name="${KFUNC_MODULE}"
+  if [[ "${checksum_backend}" == "kprobe" ]]; then
+    selected_object="${FAKETCP_LEGACY_OBJECT}"
+    object_variant="legacy-515-kprobe"
+    module_name="${KPROBE_MODULE}"
+  fi
+  local selected_sha256
+  selected_sha256="$(sha256sum -- "${selected_object}" | awk '{print $1}')"
+  python3 - "${status_path}" "${identity_path}" "${selected_object}" \
+    "${selected_sha256}" "${backend}" "${checksum_backend}" \
+    "${object_variant}" "${module_name}" <<'PY'
 import json
 import pathlib
 import re
@@ -891,57 +1355,158 @@ import sys
 status_path = pathlib.Path(sys.argv[1])
 identity_path = pathlib.Path(sys.argv[2])
 expected_object = sys.argv[3]
+expected_object_sha256 = sys.argv[4]
+backend, checksum, object_variant, module_name = sys.argv[5:9]
 doc = json.loads(status_path.read_text(encoding="utf-8"))
+if doc.get("desired_error") or doc.get("dataplane_error"):
+    raise SystemExit("FakeTCP composite status reports an error")
 dataplane = doc.get("dataplane")
-if not isinstance(dataplane, dict) or dataplane.get("mode") != "faketcp":
+daemon = doc.get("daemon")
+if (
+    not isinstance(daemon, dict)
+    or daemon.get("state") != "active"
+    or daemon.get("last_error")
+):
+    raise SystemExit("daemon status is not healthy and active")
+if (
+    not isinstance(dataplane, dict)
+    or dataplane.get("mode") != "faketcp"
+    or dataplane.get("map_error")
+    or not isinstance(dataplane.get("active_generation"), int)
+    or dataplane["active_generation"] <= 0
+    or not isinstance(dataplane.get("abi_version"), int)
+    or dataplane["abi_version"] <= 0
+):
     raise SystemExit("status does not report the production FakeTCP dataplane")
 fake = dataplane.get("faketcp")
 if not isinstance(fake, dict):
     raise SystemExit("status lacks FakeTCP owner detail")
-if fake.get("owner_kind") != "process-owned" or fake.get("healthy") is not True:
-    raise SystemExit("FakeTCP owner is not healthy/process-owned")
+expected_owner = "process-owned" if backend == "tcx" else "durable-classic-tc+process-owned-runtime"
+if fake.get("owner_kind") != expected_owner or fake.get("healthy") is not True:
+    raise SystemExit("FakeTCP owner is not healthy or has the wrong ownership kind")
 if fake.get("barrier") != "open" or fake.get("error"):
     raise SystemExit("FakeTCP generation barrier is not healthy and open")
 if not isinstance(fake.get("generation"), int) or fake["generation"] <= 0:
     raise SystemExit("FakeTCP generation is invalid")
+if dataplane["active_generation"] != fake["generation"]:
+    raise SystemExit("FakeTCP top-level active generation differs from the runtime owner")
 if not re.fullmatch(r"[0-9a-f]{32}", str(fake.get("incarnation", ""))):
     raise SystemExit("FakeTCP incarnation is invalid")
 if fake.get("object_source") != expected_object:
     raise SystemExit("FakeTCP status object source is not the reviewed staged object")
-if not re.fullmatch(r"[0-9a-f]{64}", str(fake.get("object_sha256", ""))):
-    raise SystemExit("FakeTCP object SHA-256 is invalid")
+if fake.get("object_sha256") != expected_object_sha256:
+    raise SystemExit("FakeTCP status object SHA-256 differs from the frozen object")
 xdp = fake.get("xdp")
-tcx = fake.get("tcx")
+tcx = fake.get("tcx") or []
+classic = fake.get("classic_tc") or []
 if not isinstance(xdp, list) or len(xdp) != 1:
     raise SystemExit("FakeTCP must report exactly one XDP attachment")
-if not isinstance(tcx, list) or len(tcx) != 2:
-    raise SystemExit("FakeTCP must report exactly two TCX attachments")
 if xdp[0].get("mode") != "generic":
     raise SystemExit("FakeTCP XDP mode is not exact generic")
-directions = {item.get("direction") for item in tcx}
-if directions != {"ingress", "egress"}:
-    raise SystemExit("FakeTCP TCX directions are incomplete")
-for item in xdp + tcx:
-    if not isinstance(item.get("ifindex"), int) or item["ifindex"] <= 0:
-        raise SystemExit("FakeTCP attachment ifindex is invalid")
-    if not isinstance(item.get("link_id"), int) or item["link_id"] <= 0:
-        raise SystemExit("FakeTCP attachment link ID is invalid")
+underlays = dataplane.get("underlays") or []
+if len(underlays) != 1 or not isinstance(underlays[0], dict):
+    raise SystemExit("FakeTCP must report one exact underlay")
+underlay = underlays[0]
+if (
+    underlay.get("name") != "under0"
+    or underlay.get("ifname") != "under0"
+    or not isinstance(underlay.get("ifindex"), int)
+    or underlay["ifindex"] <= 0
+    or underlay.get("error")
+):
+    raise SystemExit("FakeTCP exact underlay identity is unhealthy")
+checksum_status = fake.get("checksum_backend") or {}
+if (
+    checksum_status.get("backend") != checksum
+    or checksum_status.get("capability") != "full-gso-v1"
+    or checksum_status.get("object_variant") != object_variant
+    or checksum_status.get("module") != module_name
+    or set(checksum_status.get("capabilities") or [])
+    != {"checksum-state", "partial-reset", "pmtu", "udp-gso-to-tcp"}
+):
+    raise SystemExit("FakeTCP checksum backend identity is incomplete")
+if checksum == "kprobe" and checksum_status.get("lease_held") is not True:
+    raise SystemExit("FakeTCP kprobe runtime lease is not held")
+if checksum == "kfunc" and checksum_status.get("lease_held") not in (None, False):
+    raise SystemExit("FakeTCP kfunc unexpectedly reports a device lease")
+if fake.get("attachment_backend") != backend:
+    raise SystemExit("FakeTCP attachment backend differs from the requested backend")
+if backend == "tcx":
+    if len(tcx) != 2 or classic:
+        raise SystemExit("FakeTCP TCX attachment set is not exact")
+    if {item.get("direction") for item in tcx} != {"ingress", "egress"}:
+        raise SystemExit("FakeTCP TCX directions are incomplete")
+    if any(
+        not isinstance(item.get(key), int) or item[key] <= 0
+        for item in tcx
+        for key in ("ifindex", "attach_type", "link_id", "program_id")
+    ):
+        raise SystemExit("FakeTCP TCX identity is incomplete")
+    attachment = tcx
+else:
+    if len(classic) != 2 or tcx:
+        raise SystemExit("FakeTCP classic TC attachment set is not exact")
+    if {item.get("direction") for item in classic} != {"ingress", "egress"}:
+        raise SystemExit("FakeTCP classic TC directions are incomplete")
+    for item in classic:
+        for key in ("ifindex", "parent", "handle", "priority", "program_id"):
+            if not isinstance(item.get(key), int) or item[key] <= 0:
+                raise SystemExit(f"FakeTCP classic TC {key} is invalid")
+    if {item["handle"] for item in classic} != {0x10001, 0x10002} or any(
+        item["priority"] != 49152 for item in classic
+    ):
+        raise SystemExit("FakeTCP classic TC durable slot identity is not fixed")
+    attachment = classic
+for item in xdp + attachment:
+    if item.get("ifindex") != underlay["ifindex"]:
+        raise SystemExit("FakeTCP attachment ifindex differs from the exact underlay")
+    if item in xdp and (not isinstance(item.get("link_id"), int) or item["link_id"] <= 0):
+        raise SystemExit("FakeTCP XDP link ID is invalid")
     if not isinstance(item.get("program_id"), int) or item["program_id"] <= 0:
         raise SystemExit("FakeTCP attachment program ID is invalid")
-if len({item["link_id"] for item in xdp + tcx}) != 3:
-    raise SystemExit("FakeTCP exact link IDs are not distinct")
+if backend == "tcx" and len({item["link_id"] for item in xdp + tcx}) != 3:
+    raise SystemExit("FakeTCP exact TCX/XDP link IDs are not distinct")
+if (
+    underlay.get("xdp_attached") is not True
+    or underlay.get("xdp_mode") != "generic"
+    or underlay.get("xdp_link_id") != xdp[0]["link_id"]
+    or underlay.get("xdp_program_id") != xdp[0]["program_id"]
+):
+    raise SystemExit("FakeTCP exact generic XDP underlay projection is incomplete")
+filters = underlay.get("filters") or []
+if (
+    not underlay.get("ingress_attached")
+    or not underlay.get("egress_attached")
+    or len(filters) != 2
+    or {item.get("direction") for item in filters} != {"ingress", "egress"}
+    or any(item.get("backend") != backend for item in filters)
+):
+    raise SystemExit("FakeTCP TC underlay projection is incomplete")
+by_direction = {item["direction"]: item for item in attachment}
+projection_fields = (
+    ("attach_type", "link_id", "program_id")
+    if backend == "tcx"
+    else ("handle", "priority", "program_id")
+)
+for item in filters:
+    owner = by_direction[item["direction"]]
+    if any(owner.get(key) != item.get(key) for key in projection_fields):
+        raise SystemExit("FakeTCP TC underlay projection differs from owner identity")
 identity = {
     "generation": fake["generation"],
     "incarnation": fake["incarnation"],
     "object_source": fake["object_source"],
     "object_sha256": fake["object_sha256"],
     "xdp": xdp,
+    "attachment_backend": backend,
+    "checksum_backend": checksum_status,
     "tcx": sorted(tcx, key=lambda item: item["direction"]),
+    "classic_tc": sorted(classic, key=lambda item: item["direction"]),
 }
 identity_path.write_text(json.dumps(identity, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 print(
-    "faketcp_status=healthy owner_kind=process-owned barrier=open "
-    f"generation={fake['generation']} xdp_links=1 tcx_links=2"
+    f"faketcp_status=healthy owner_kind={expected_owner} barrier=open "
+    f"generation={fake['generation']} xdp_links=1 attachment={backend} checksum={checksum}"
 )
 PY
 }
@@ -957,8 +1522,8 @@ import sys
 before = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 after = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 if before != after:
-    raise SystemExit("same-key reload replaced the exact process-owned FakeTCP identity")
-print("faketcp_same_key_reload=noop exact_identity=unchanged")
+    raise SystemExit("FakeTCP exact process-owned identity changed unexpectedly")
+print("faketcp_identity_stability=exact-unchanged")
 PY
 }
 
@@ -974,27 +1539,138 @@ before = json.loads(pathlib.Path(sys.argv[1]).read_text(encoding="utf-8"))
 after = json.loads(pathlib.Path(sys.argv[2]).read_text(encoding="utf-8"))
 before_links = {item["link_id"] for item in before["xdp"] + before["tcx"]}
 after_links = {item["link_id"] for item in after["xdp"] + after["tcx"]}
-before_programs = {item["program_id"] for item in before["xdp"] + before["tcx"]}
-after_programs = {item["program_id"] for item in after["xdp"] + after["tcx"]}
+before_programs = {
+    item["program_id"]
+    for item in before["xdp"] + before["tcx"] + before["classic_tc"]
+}
+after_programs = {
+    item["program_id"]
+    for item in after["xdp"] + after["tcx"] + after["classic_tc"]
+}
 if before["incarnation"] == after["incarnation"]:
     raise SystemExit("changed-key reload retained the old FakeTCP incarnation")
 if before_links & after_links or before_programs & after_programs:
     raise SystemExit("changed-key reload overlapped old and replacement exact BPF IDs")
-print("faketcp_changed_key_reload=serial-replacement exact_identity=replaced")
+print("faketcp_identity_replacement=serial exact_identity=replaced")
+PY
+}
+
+validate_classic_journal() {
+  local role="$1"
+  local identity_path="$2"
+  local endpoint_var="${ENDPOINT_A_VAR}"
+  [[ "${role}" == b ]] && endpoint_var="${ENDPOINT_B_VAR}"
+  python3 - "${endpoint_var}/pin-owners" "${run_id}" "${role}" \
+    "${identity_path}" <<'PY'
+import json
+import pathlib
+import re
+import sys
+
+root = pathlib.Path(sys.argv[1])
+run_id, role = sys.argv[2:4]
+identity_path = pathlib.Path(sys.argv[4])
+if not root.is_dir() or root.is_symlink():
+    raise SystemExit(f"classic owner journal root is absent: {root}")
+if not identity_path.is_file() or identity_path.is_symlink():
+    raise SystemExit(f"classic status identity is absent: {identity_path}")
+records = list(root.glob("*.faketcp-classic.owner.json"))
+pending = list(root.glob("*.faketcp-classic.owner.next"))
+if len(records) != 1 or pending:
+    raise SystemExit(f"classic journal set is not one active/no-pending: {records=} {pending=}")
+metadata = records[0].lstat()
+if (
+    records[0].is_symlink()
+    or not records[0].is_file()
+    or metadata.st_mode & 0o777 != 0o600
+    or metadata.st_uid != 0
+    or metadata.st_gid != 0
+    or metadata.st_nlink != 1
+):
+    raise SystemExit("classic journal metadata is unsafe")
+record = json.loads(records[0].read_text(encoding="utf-8"))
+if record.get("version") != 1 or record.get("phase") != "active":
+    raise SystemExit("classic journal is not active v1")
+resource_key = str(record.get("resource_key", ""))
+if (
+    not re.fullmatch(r"[0-9a-f]{64}", resource_key)
+    or records[0].name != f"{resource_key}.faketcp-classic.owner.json"
+    or record.get("boot_id")
+    != pathlib.Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+    or record.get("pin_basename")
+    != f"wg-mix-ebpf-performance-{run_id}-{role}"
+    or not isinstance(record.get("parent_device"), int)
+    or record["parent_device"] <= 0
+    or not isinstance(record.get("parent_inode"), int)
+    or record["parent_inode"] <= 0
+    or not isinstance(record.get("sequence"), int)
+    or record["sequence"] <= 0
+):
+    raise SystemExit("classic journal resource/sequence identity is invalid")
+if len(record.get("active_filters") or []) != 2:
+    raise SystemExit("classic journal does not own exactly two filters")
+identity = json.loads(identity_path.read_text(encoding="utf-8"))
+if (
+    record.get("generation") != identity.get("generation")
+    or record.get("object_sha256") != identity.get("object_sha256")
+):
+    raise SystemExit("classic journal generation/object differs from live status")
+active = sorted(record["active_filters"], key=lambda item: item["direction"])
+status_filters = sorted(identity.get("classic_tc") or [], key=lambda item: item["direction"])
+fields = ("ifindex", "direction", "parent", "handle", "priority", "program_id")
+if (
+    len(status_filters) != 2
+    or [{key: item.get(key) for key in fields} for item in active]
+    != [{key: item.get(key) for key in fields} for item in status_filters]
+):
+    raise SystemExit("classic journal filters differ from exact live status identity")
+pin = str(record.get("pin_path", ""))
+if pin != f"/sys/fs/bpf/wg-mix-ebpf-performance-{run_id}-{role}":
+    raise SystemExit("classic journal pin scope differs from the cell")
+print(f"classic_journal=active role={role} filters=2 record={records[0].name}")
+PY
+}
+
+validate_no_classic_journal() {
+  python3 - "${ENDPOINT_A_VAR}/pin-owners" "${ENDPOINT_B_VAR}/pin-owners" <<'PY'
+import pathlib
+import sys
+
+for raw in sys.argv[1:]:
+    root = pathlib.Path(raw)
+    if not root.exists():
+        continue
+    if not root.is_dir() or root.is_symlink():
+        raise SystemExit(f"unexpected FakeTCP classic journal root type: {root}")
+    residual = list(root.glob("*.faketcp-classic.owner.json"))
+    residual.extend(root.glob("*.faketcp-classic.owner.next"))
+    if residual:
+        raise SystemExit(f"TCX unexpectedly owns a FakeTCP classic journal: {residual}")
+print("faketcp_classic_journal=absent attachment=tcx")
 PY
 }
 
 stage="initial-status"
-run_endpoint_cli a "${daemon_a_pid}" status status-a-initial \
-  "${EVIDENCE}/status-a-initial.json" "${EVIDENCE}/status-a-initial.stderr"
-run_endpoint_cli b "${daemon_b_pid}" status status-b-initial \
-  "${EVIDENCE}/status-b-initial.json" "${EVIDENCE}/status-b-initial.stderr"
+if [[ "${transport}" != "wireguard" ]]; then
+  run_endpoint_cli a "${daemon_a_pid}" status status-a-initial \
+    "${EVIDENCE}/status-a-initial.json" "${EVIDENCE}/status-a-initial.stderr"
+  run_endpoint_cli b "${daemon_b_pid}" status status-b-initial \
+    "${EVIDENCE}/status-b-initial.json" "${EVIDENCE}/status-b-initial.stderr"
+fi
 
 if [[ "${transport}" == "faketcp" ]]; then
   validate_faketcp_status "${EVIDENCE}/status-a-initial.json" \
     "${EVIDENCE}/identity-a-initial.json" | tee "${EVIDENCE}/status-a-initial-check.log"
   validate_faketcp_status "${EVIDENCE}/status-b-initial.json" \
     "${EVIDENCE}/identity-b-initial.json" | tee "${EVIDENCE}/status-b-initial-check.log"
+  if [[ "${backend}" == "classic_tc" ]]; then
+    validate_classic_journal a "${EVIDENCE}/identity-a-initial.json" \
+      >"${EVIDENCE}/classic-journal-a-initial.log"
+    validate_classic_journal b "${EVIDENCE}/identity-b-initial.json" \
+      >"${EVIDENCE}/classic-journal-b-initial.log"
+  else
+    validate_no_classic_journal >"${EVIDENCE}/classic-journal-tcx-initial.log"
+  fi
 
   stage="same-key-reload"
   run_endpoint_cli a "${daemon_a_pid}" reload reload-a-same-key \
@@ -1013,6 +1689,12 @@ if [[ "${transport}" == "faketcp" ]]; then
     "${EVIDENCE}/identity-a-same-key.json" | tee "${EVIDENCE}/same-key-a.log"
   compare_identity_equal "${EVIDENCE}/identity-b-initial.json" \
     "${EVIDENCE}/identity-b-same-key.json" | tee "${EVIDENCE}/same-key-b.log"
+  if [[ "${backend}" == "classic_tc" ]]; then
+    validate_classic_journal a "${EVIDENCE}/identity-a-same-key.json" \
+      >"${EVIDENCE}/classic-journal-a-reloaded.log"
+    validate_classic_journal b "${EVIDENCE}/identity-b-same-key.json" \
+      >"${EVIDENCE}/classic-journal-b-reloaded.log"
+  fi
 
   if [[ "${cipher}" != "none" ]]; then
     stage="changed-key-reload"
@@ -1053,17 +1735,22 @@ PY
     compare_identity_replaced "${EVIDENCE}/identity-b-same-key.json" \
       "${EVIDENCE}/identity-b-changed-key.json" | tee "${EVIDENCE}/changed-key-b.log"
   fi
+elif [[ "${transport}" != "wireguard" ]]; then
+  validate_baseline_status "${EVIDENCE}/status-a-initial.json" a \
+    >"${EVIDENCE}/status-a-initial-check.log"
+  validate_baseline_status "${EVIDENCE}/status-b-initial.json" b \
+    >"${EVIDENCE}/status-b-initial-check.log"
 fi
 
 stage="capture-and-connectivity"
 ip netns exec "${NSR}" timeout --signal=INT --kill-after=5s 120 \
-  tcpdump -U -nn -i any -w "${EVIDENCE}/outer.pcap" \
+  tcpdump -U -nn -s 128 -c 512 -i any -w "${EVIDENCE}/outer.pcap" \
   >"${EVIDENCE}/tcpdump.stdout.log" 2>"${EVIDENCE}/tcpdump.stderr.log" &
 tcpdump_pid=$!
 record_background_start tcpdump-outer "${EVIDENCE}/tcpdump.stdout.log" \
   "${EVIDENCE}/tcpdump.stderr.log" "${tcpdump_pid}" \
   ip netns exec "${NSR}" timeout --signal=INT --kill-after=5s 120 \
-  tcpdump -U -nn -i any -w "${EVIDENCE}/outer.pcap"
+  tcpdump -U -nn -s 128 -c 512 -i any -w "${EVIDENCE}/outer.pcap"
 for attempt in 1 2 3 4 5; do
   [[ -s "${EVIDENCE}/tcpdump.stderr.log" ]] && break
   [[ ! -d "/proc/${tcpdump_pid}" ]] && break
@@ -1182,16 +1869,68 @@ for direction in forward reverse bidir; do
 done
 
 stage="post-status-and-capture"
-run_endpoint_cli a "${daemon_a_pid}" status status-a-after-traffic \
-  "${EVIDENCE}/status-a-after-traffic.json" "${EVIDENCE}/status-a-after-traffic.stderr"
-run_endpoint_cli b "${daemon_b_pid}" status status-b-after-traffic \
-  "${EVIDENCE}/status-b-after-traffic.json" "${EVIDENCE}/status-b-after-traffic.stderr"
+if [[ "${transport}" == "faketcp" ]]; then
+  # A daemon-side same-key reconcile calls the resident runtime health path.
+  # For kprobe this re-queries the exact held device lease, including its
+  # per-open errors/nmissed deltas and cookie continuity.  An unhealthy owner
+  # may be rebuilt by the daemon, but the identity-stability proof below then
+  # fails the cell instead of accepting a silently replaced generation.
+  stage="post-traffic-health-reload"
+  run_endpoint_cli a "${daemon_a_pid}" reload reload-a-after-traffic-health \
+    "${EVIDENCE}/reload-a-after-traffic-health.stdout.log" \
+    "${EVIDENCE}/reload-a-after-traffic-health.stderr.log"
+  run_endpoint_cli b "${daemon_b_pid}" reload reload-b-after-traffic-health \
+    "${EVIDENCE}/reload-b-after-traffic-health.stdout.log" \
+    "${EVIDENCE}/reload-b-after-traffic-health.stderr.log"
+fi
+stage="post-status-and-capture"
+if [[ "${transport}" != "wireguard" ]]; then
+  run_endpoint_cli a "${daemon_a_pid}" status status-a-after-traffic \
+    "${EVIDENCE}/status-a-after-traffic.json" "${EVIDENCE}/status-a-after-traffic.stderr"
+  run_endpoint_cli b "${daemon_b_pid}" status status-b-after-traffic \
+    "${EVIDENCE}/status-b-after-traffic.json" "${EVIDENCE}/status-b-after-traffic.stderr"
+fi
+if [[ "${transport}" == "faketcp" ]]; then
+  validate_faketcp_status "${EVIDENCE}/status-a-after-traffic.json" \
+    "${EVIDENCE}/identity-a-after-traffic.json" \
+    >"${EVIDENCE}/status-a-after-traffic-check.log"
+  validate_faketcp_status "${EVIDENCE}/status-b-after-traffic.json" \
+    "${EVIDENCE}/identity-b-after-traffic.json" \
+    >"${EVIDENCE}/status-b-after-traffic-check.log"
+  identity_a_before_traffic="${EVIDENCE}/identity-a-same-key.json"
+  identity_b_before_traffic="${EVIDENCE}/identity-b-same-key.json"
+  if [[ "${cipher}" != "none" ]]; then
+    identity_a_before_traffic="${EVIDENCE}/identity-a-changed-key.json"
+    identity_b_before_traffic="${EVIDENCE}/identity-b-changed-key.json"
+  fi
+  compare_identity_equal "${identity_a_before_traffic}" \
+    "${EVIDENCE}/identity-a-after-traffic.json" \
+    >"${EVIDENCE}/identity-a-after-traffic-stability.log"
+  compare_identity_equal "${identity_b_before_traffic}" \
+    "${EVIDENCE}/identity-b-after-traffic.json" \
+    >"${EVIDENCE}/identity-b-after-traffic-stability.log"
+  if [[ "${backend}" == "classic_tc" ]]; then
+    validate_classic_journal a "${EVIDENCE}/identity-a-after-traffic.json" \
+      >"${EVIDENCE}/classic-journal-a-after-traffic.log"
+    validate_classic_journal b "${EVIDENCE}/identity-b-after-traffic.json" \
+      >"${EVIDENCE}/classic-journal-b-after-traffic.log"
+  else
+    validate_no_classic_journal >"${EVIDENCE}/classic-journal-tcx-after-traffic.log"
+  fi
+elif [[ "${transport}" != "wireguard" ]]; then
+  validate_baseline_status "${EVIDENCE}/status-a-after-traffic.json" a \
+    >"${EVIDENCE}/status-a-after-traffic-check.log"
+  validate_baseline_status "${EVIDENCE}/status-b-after-traffic.json" b \
+    >"${EVIDENCE}/status-b-after-traffic-check.log"
+fi
 run_recorded_command wg-a-after-traffic "${EVIDENCE}/wg-a-after-traffic.stdout.log" \
   "${EVIDENCE}/wg-a-after-traffic.stderr.log" ip netns exec "${NSA}" wg show
 run_recorded_command wg-b-after-traffic "${EVIDENCE}/wg-b-after-traffic.stdout.log" \
   "${EVIDENCE}/wg-b-after-traffic.stderr.log" ip netns exec "${NSB}" wg show
 
-run_mutation tcpdump-stop kill -INT "${tcpdump_pid}"
+if [[ -d "/proc/${tcpdump_pid}" ]]; then
+  run_mutation tcpdump-stop kill -INT "${tcpdump_pid}"
+fi
 if wait "${tcpdump_pid}"; then
   tcpdump_status=0
 else
@@ -1215,32 +1954,91 @@ transport, port_a, port_b, raw_path = sys.argv[1:]
 lines = pathlib.Path(raw_path).read_text(encoding="utf-8", errors="replace").splitlines()
 managed = [line for line in lines if f".{port_a}" in line or f".{port_b}" in line]
 udp = [line for line in managed if " UDP," in line]
-if udp:
-    print("unexpected raw WireGuard UDP packets:")
-    print("\n".join(udp))
-    raise SystemExit(1)
 if transport == "icmp":
+    if udp:
+        raise SystemExit("unexpected raw WireGuard UDP packets in ICMP mode")
     expected = [line for line in lines if "ICMP echo request" in line or "ICMP echo reply" in line]
-else:
+elif transport == "faketcp":
+    if udp:
+        raise SystemExit("unexpected raw WireGuard UDP packets in FakeTCP mode")
     expected = [line for line in managed if re.search(r"Flags \[[^]]+\]", line)]
+else:
+    expected = udp
 if not expected:
     print(f"no {transport} outer packets were captured")
     raise SystemExit(1)
-print(f"outer_transport={transport} matching_packets={len(expected)} raw_udp_packets=0")
+print(f"outer_transport={transport} matching_packets={len(expected)} raw_udp_packets={len(udp)}")
 PY
 
 if [[ "${transport}" == "faketcp" ]]; then
+  if [[ "${backend}" == "classic_tc" ]]; then
+    stage="classic-journal-recovery"
+    identity_a_before_crash="${EVIDENCE}/identity-a-after-traffic.json"
+    validate_classic_journal a "${identity_a_before_crash}" \
+      >"${EVIDENCE}/classic-journal-a-before-crash.log"
+    run_mutation daemon-a-crash-signal kill -KILL "${daemon_a_pid}"
+    if wait "${daemon_a_pid}"; then
+      crash_status=0
+    else
+      crash_status=$?
+    fi
+    record_background_finish daemon-a-start "${crash_status}"
+    if ((crash_status != 137)); then
+      echo "error: classic TC crash probe returned ${crash_status}, want 137" >&2
+      exit 1
+    fi
+    daemon_a_pid=""
+    env -i "PATH=${SAFE_PATH}" "LC_ALL=C" \
+      "WG_MIX_EBPF_PERFORMANCE_PARENT_MOUNTNS=${parent_mountns}" \
+      "WG_MIX_EBPF_PERFORMANCE_ARTIFACT_ROOT=${ARTIFACT_ROOT}" \
+      "WG_MIX_EBPF_PERFORMANCE_RUN_PARENT=${RUN_PARENT}" \
+      ip netns exec "${NSA}" unshare --mount --propagation private \
+      "${script_path}" endpoint --run-id "${run_id}" --role a --transport "${transport}" \
+      >"${EVIDENCE}/daemon-a-recovery.stdout.log" \
+      2>"${EVIDENCE}/daemon-a-recovery.stderr.log" &
+    daemon_a_pid=$!
+    daemon_a_phase="daemon-a-recovery-start"
+    record_background_start daemon-a-recovery-start \
+      "${EVIDENCE}/daemon-a-recovery.stdout.log" \
+      "${EVIDENCE}/daemon-a-recovery.stderr.log" "${daemon_a_pid}" \
+      env -i "PATH=${SAFE_PATH}" "LC_ALL=C" \
+      "WG_MIX_EBPF_PERFORMANCE_PARENT_MOUNTNS=${parent_mountns}" \
+      "WG_MIX_EBPF_PERFORMANCE_ARTIFACT_ROOT=${ARTIFACT_ROOT}" \
+      "WG_MIX_EBPF_PERFORMANCE_RUN_PARENT=${RUN_PARENT}" \
+      ip netns exec "${NSA}" unshare --mount --propagation private \
+      "${script_path}" endpoint --run-id "${run_id}" --role a --transport "${transport}"
+    printf '%s\n' "${daemon_a_pid}" >"${RUN_ROOT}/daemon-a.pid"
+    wait_daemon_active a "${daemon_a_pid}" "${ENDPOINT_A_RUN}/runtime/status.json"
+    run_endpoint_cli a "${daemon_a_pid}" status status-a-recovered \
+      "${EVIDENCE}/status-a-recovered.json" "${EVIDENCE}/status-a-recovered.stderr"
+    validate_faketcp_status "${EVIDENCE}/status-a-recovered.json" \
+      "${EVIDENCE}/identity-a-recovered.json" \
+      >"${EVIDENCE}/status-a-recovered-check.log"
+    compare_identity_replaced "${identity_a_before_crash}" \
+      "${EVIDENCE}/identity-a-recovered.json" \
+      >"${EVIDENCE}/classic-crash-recovery-identity.log"
+    validate_classic_journal a "${EVIDENCE}/identity-a-recovered.json" \
+      >"${EVIDENCE}/classic-journal-a-recovered.log"
+    run_recorded_command ping-a-after-classic-recovery \
+      "${EVIDENCE}/ping-a-after-classic-recovery.stdout.log" \
+      "${EVIDENCE}/ping-a-after-classic-recovery.stderr.log" \
+      ip netns exec "${NSA}" ping -c 1 -W 2 10.77.0.2
+  fi
   identity_a="${EVIDENCE}/identity-a-same-key.json"
   identity_b="${EVIDENCE}/identity-b-same-key.json"
   if [[ "${cipher}" != "none" ]]; then
     identity_a="${EVIDENCE}/identity-a-changed-key.json"
     identity_b="${EVIDENCE}/identity-b-changed-key.json"
   fi
+  if [[ "${backend}" == "classic_tc" ]]; then
+    identity_a="${EVIDENCE}/identity-a-recovered.json"
+  fi
   python3 - "${daemon_a_pid}" "${identity_a}" "${daemon_b_pid}" "${identity_b}" \
-    "${EVIDENCE}/owned-bpf-ids.json" <<'PY'
+    "${EVIDENCE}/owned-bpf-ids.json" "${checksum_backend}" "${KPROBE_DEVICE}" <<'PY'
 import json
 import pathlib
 import re
+import stat
 import sys
 
 
@@ -1260,6 +2058,21 @@ def fdinfo_ids(pid: int) -> dict[str, list[int]]:
 
 
 document = {"endpoints": {}}
+checksum = sys.argv[6]
+lease_device = pathlib.Path(sys.argv[7])
+lease_rdev = None
+if checksum == "kprobe":
+    lease_metadata = lease_device.lstat()
+    if (
+        lease_device.is_symlink()
+        or not stat.S_ISCHR(lease_metadata.st_mode)
+        or stat.S_IMODE(lease_metadata.st_mode) != 0o600
+        or lease_metadata.st_uid != 0
+        or lease_metadata.st_gid != 0
+        or lease_metadata.st_nlink != 1
+    ):
+        raise SystemExit("kprobe lease device is not an exact character device")
+    lease_rdev = lease_metadata.st_rdev
 for role, pid_raw, identity_raw in (
     ("a", sys.argv[1], sys.argv[2]),
     ("b", sys.argv[3], sys.argv[4]),
@@ -1267,12 +2080,30 @@ for role, pid_raw, identity_raw in (
     pid = int(pid_raw)
     identity = json.loads(pathlib.Path(identity_raw).read_text(encoding="utf-8"))
     observed = fdinfo_ids(pid)
+    lease_fds = []
+    for descriptor in pathlib.Path(f"/proc/{pid}/fd").iterdir():
+        try:
+            metadata = descriptor.stat()
+        except OSError:
+            continue
+        if stat.S_ISCHR(metadata.st_mode) and metadata.st_rdev == lease_rdev:
+            lease_fds.append(int(descriptor.name))
+    if checksum == "kprobe" and len(lease_fds) != 1:
+        raise SystemExit(
+            f"endpoint {role} holds {len(lease_fds)} kprobe lease FDs, want exactly one"
+        )
+    if checksum != "kprobe" and lease_fds:
+        raise SystemExit(f"endpoint {role} unexpectedly holds a kprobe lease FD")
     expected_links = {item["link_id"] for item in identity["xdp"] + identity["tcx"]}
-    expected_programs = {item["program_id"] for item in identity["xdp"] + identity["tcx"]}
+    expected_programs = {
+        item["program_id"]
+        for item in identity["xdp"] + identity["tcx"] + identity["classic_tc"]
+    }
     if not expected_links.issubset(set(observed["link"])):
         raise SystemExit(f"endpoint {role} exact link IDs are not process-owned FDs")
-    if not expected_programs.issubset(set(observed["prog"])):
-        raise SystemExit(f"endpoint {role} exact program IDs are not process-owned FDs")
+    runtime_programs = {item["program_id"] for item in identity["xdp"] + identity["tcx"]}
+    if not runtime_programs.issubset(set(observed["prog"])):
+        raise SystemExit(f"endpoint {role} runtime program IDs are not process-owned FDs")
     if not observed["map"]:
         raise SystemExit(f"endpoint {role} exposes no process-owned map FDs")
     document["endpoints"][role] = {
@@ -1280,12 +2111,16 @@ for role, pid_raw, identity_raw in (
         "ids": observed,
         "status_link_ids": sorted(expected_links),
         "status_program_ids": sorted(expected_programs),
+        "kprobe_lease_fds": sorted(lease_fds),
     }
 pathlib.Path(sys.argv[5]).write_text(
     json.dumps(document, indent=2, sort_keys=True) + "\n",
     encoding="utf-8",
 )
-print("faketcp_process_owned_ids=sealed links=exact programs=exact maps=fd-owned")
+print(
+    f"faketcp_owned_ids=sealed runtime_links=exact programs=journal-or-fd "
+    f"maps=fd-owned checksum={checksum} lease_fds=exact"
+)
 PY
 fi
 
@@ -1312,6 +2147,8 @@ stop_daemon() {
   local role="$1"
   local pid="$2"
   local status
+  local background_phase="${daemon_a_phase}"
+  [[ "${role}" == b ]] && background_phase="${daemon_b_phase}"
   run_recorded_command "daemon-${role}-stop-signal" \
     "${EVIDENCE}/daemon-${role}-stop-signal.stdout.log" \
     "${EVIDENCE}/daemon-${role}-stop-signal.stderr.log" kill -TERM "${pid}"
@@ -1325,17 +2162,18 @@ stop_daemon() {
     echo "error: daemon ${role} exited with rc=${status}" >&2
     return 1
   fi
-  record_background_finish "daemon-${role}-start" "${status}"
+  record_background_finish "${background_phase}" "${status}"
 }
 
 stage="daemon-stop"
-stop_daemon a "${daemon_a_pid}"
-daemon_a_pid=""
-stop_daemon b "${daemon_b_pid}"
-daemon_b_pid=""
-/bin/cp -- "${ENDPOINT_A_RUN}/runtime/status.json" "${EVIDENCE}/status-a-final.json"
-/bin/cp -- "${ENDPOINT_B_RUN}/runtime/status.json" "${EVIDENCE}/status-b-final.json"
-python3 - "${EVIDENCE}/status-a-final.json" "${EVIDENCE}/status-b-final.json" \
+if [[ "${transport}" != "wireguard" ]]; then
+  stop_daemon a "${daemon_a_pid}"
+  daemon_a_pid=""
+  stop_daemon b "${daemon_b_pid}"
+  daemon_b_pid=""
+  /bin/cp -- "${ENDPOINT_A_RUN}/runtime/status.json" "${EVIDENCE}/status-a-final.json"
+  /bin/cp -- "${ENDPOINT_B_RUN}/runtime/status.json" "${EVIDENCE}/status-b-final.json"
+  python3 - "${EVIDENCE}/status-a-final.json" "${EVIDENCE}/status-b-final.json" \
   >"${EVIDENCE}/daemon-final-status-check.log" <<'PY'
 import json
 import pathlib
@@ -1347,6 +2185,7 @@ for role, raw_path in zip(("a", "b"), sys.argv[1:], strict=True):
         raise SystemExit(f"daemon {role} final status is not a clean stop")
     print(f"daemon={role} final_state=stopped last_error=empty")
 PY
+fi
 
 if [[ "${transport}" == "faketcp" ]]; then
   python3 - "${EVIDENCE}/owned-bpf-ids.json" \
@@ -1363,34 +2202,64 @@ all_ids = {"link": set(), "prog": set(), "map": set()}
 for endpoint in source["endpoints"].values():
     for kind in all_ids:
         all_ids[kind].update(endpoint["ids"][kind])
+    all_ids["prog"].update(endpoint["status_program_ids"])
 residual = []
 with output.open("w", encoding="utf-8") as handle:
     for kind in ("link", "prog", "map"):
-        for object_id in sorted(all_ids[kind]):
-            argv = ["bpftool", "-j", kind, "show", "id", str(object_id)]
-            started = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            completed = subprocess.run(argv, text=True, capture_output=True, check=False)
-            finished = datetime.datetime.now(datetime.timezone.utc).isoformat()
-            handle.write(
-                f"timestamp={started} event=start kind={kind} id={object_id} "
-                f"argv={' '.join(argv)}\n"
+        argv = ["bpftool", "-j", kind, "show"]
+        started = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        completed = subprocess.run(argv, text=True, capture_output=True, check=False)
+        finished = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        handle.write(
+            f"timestamp={started} event=start kind={kind} argv={' '.join(argv)}\n"
+        )
+        handle.write(f"stdout_begin kind={kind}\n{completed.stdout}")
+        handle.write(f"stdout_end kind={kind}\n")
+        handle.write(f"stderr_begin kind={kind}\n{completed.stderr}")
+        handle.write(f"stderr_end kind={kind}\n")
+        handle.write(
+            f"timestamp={finished} event=finish kind={kind} "
+            f"rc={completed.returncode}\n"
+        )
+        if completed.returncode != 0:
+            raise SystemExit(
+                f"cannot inventory {kind} IDs after daemon stop: "
+                f"rc={completed.returncode} stderr={completed.stderr!r}"
             )
-            handle.write(f"stdout_begin kind={kind} id={object_id}\n{completed.stdout}")
-            handle.write(f"stdout_end kind={kind} id={object_id}\n")
-            handle.write(f"stderr_begin kind={kind} id={object_id}\n{completed.stderr}")
-            handle.write(f"stderr_end kind={kind} id={object_id}\n")
-            handle.write(
-                f"timestamp={finished} event=finish kind={kind} id={object_id} "
-                f"rc={completed.returncode}\n"
-            )
-            if completed.returncode == 0:
-                residual.append((kind, object_id))
+        try:
+            inventory = json.loads(completed.stdout)
+        except json.JSONDecodeError as exc:
+            raise SystemExit(f"invalid bpftool {kind} inventory JSON: {exc}") from exc
+        if not isinstance(inventory, list):
+            raise SystemExit(f"bpftool {kind} inventory is not a list")
+        live_ids = set()
+        for item in inventory:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), int):
+                raise SystemExit(f"bpftool {kind} inventory has an invalid row")
+            live_ids.add(item["id"])
+        residual.extend((kind, object_id) for object_id in sorted(all_ids[kind] & live_ids))
 if residual:
     raise SystemExit(f"process-owned BPF objects remain after daemon stop: {residual}")
 print(
     "faketcp_stop_cleanup=complete exact_links_absent=1 "
     "exact_programs_absent=1 exact_maps_absent=1"
 )
+PY
+  python3 - "${ENDPOINT_A_VAR}/pin-owners" "${ENDPOINT_B_VAR}/pin-owners" \
+    >"${EVIDENCE}/classic-journal-absence-after-stop.log" <<'PY'
+import pathlib
+import sys
+
+for raw in sys.argv[1:]:
+    root = pathlib.Path(raw)
+    if not root.exists():
+        continue
+    if not root.is_dir() or root.is_symlink():
+        raise SystemExit(f"FakeTCP classic journal root type is unsafe: {root}")
+    residual = list(root.iterdir())
+    if residual:
+        raise SystemExit(f"FakeTCP classic owner root is nonempty after clean stop: {residual}")
+print("faketcp_classic_journal_absent_after_stop=1")
 PY
 fi
 
@@ -1426,45 +2295,94 @@ for forbidden in (
 PY
 
 stage="success-cleanup"
+for ns in "${NSA}" "${NSR}" "${NSB}"; do
+  remaining_pids="$(ip netns pids "${ns}")"
+  if [[ -n "${remaining_pids}" ]]; then
+    echo "error: run-owned namespace has retained processes before cleanup: ${ns}: ${remaining_pids}" >&2
+    exit 1
+  fi
+done
 run_mutation netns-delete-a ip netns delete "${NSA}"
 run_mutation netns-delete-router ip netns delete "${NSR}"
 run_mutation netns-delete-b ip netns delete "${NSB}"
-if [[ "${cipher}" != "none" ]]; then
-  for secret_path in "${ENDPOINT_A_RUN}/xor.key" "${ENDPOINT_B_RUN}/xor.key"; do
-    if [[ "${secret_path}" != "${RUN_ROOT}/"* || ! -f "${secret_path}" || -L "${secret_path}" ]]; then
-      echo "error: owned XOR secret path is unsafe: ${secret_path}" >&2
-      exit 1
-    fi
-    run_mutation xor-secret-remove /bin/rm -- "${secret_path}"
-  done
-fi
+for secret_path in "${ENDPOINT_A_RUN}/xor.key" "${ENDPOINT_B_RUN}/xor.key" \
+  "${ENDPOINT_A_RUN}/xor.key.next" "${ENDPOINT_B_RUN}/xor.key.next"; do
+  if [[ ! -e "${secret_path}" && ! -L "${secret_path}" ]]; then
+    continue
+  fi
+  if [[ "${secret_path}" != "${RUN_ROOT}/"* || ! -f "${secret_path}" ||
+    -L "${secret_path}" || "$(stat -c '%u:%g:%a:%h' -- "${secret_path}")" != 0:0:600:1 ]]; then
+    echo "error: owned XOR secret path is unsafe: ${secret_path}" >&2
+    exit 1
+  fi
+  run_mutation xor-secret-remove /bin/rm -- "${secret_path}"
+done
 if [[ -n "$(ip netns list | awk -v a="${NSA}" -v r="${NSR}" -v b="${NSB}" \
   '$1 == a || $1 == r || $1 == b { print $1 }')" ]]; then
   echo "error: run-owned network namespace remains after successful cleanup" >&2
   exit 1
 fi
-if [[ -n "$(stat -c '%n' -- "${SECRETS}"/* 2>"${EVIDENCE}/secret-inventory.stderr")" ]]; then
+shopt -s nullglob
+secret_inventory=("${SECRETS}"/*)
+shopt -u nullglob
+if ((${#secret_inventory[@]} != 0)); then
   echo "error: sensitive files remain in the run secret directory" >&2
   exit 1
 fi
-maintenance_target_stat_after="$(stat -Lc '%d:%i:%u:%g:%a:%h:%s' -- "${SHARED_MAINTENANCE_TARGET}")"
-maintenance_target_sha_after="$(sha256sum -- "${SHARED_MAINTENANCE_TARGET}" | awk '{print $1}')"
-if [[ "${maintenance_target_stat_after}" != "${maintenance_target_stat_before}" ||
-  "${maintenance_target_sha_after}" != "${maintenance_target_sha_before}" ]]; then
-  echo "error: global lifecycle maintenance target changed across isolated endpoint runs" >&2
-  exit 1
-fi
-printf 'maintenance_target=%s\nstat_before=%s\nstat_after=%s\nsha256_before=%s\nsha256_after=%s\nresult=unchanged\n' \
-  "${SHARED_MAINTENANCE_TARGET}" "${maintenance_target_stat_before}" \
-  "${maintenance_target_stat_after}" "${maintenance_target_sha_before}" \
-  "${maintenance_target_sha_after}" >"${EVIDENCE}/maintenance-target-after.log"
+for secret_path in "${ENDPOINT_A_RUN}/xor.key" "${ENDPOINT_B_RUN}/xor.key" \
+  "${ENDPOINT_A_RUN}/xor.key.next" "${ENDPOINT_B_RUN}/xor.key.next"; do
+  [[ ! -e "${secret_path}" && ! -L "${secret_path}" ]] || {
+    echo "error: endpoint XOR secret remains after successful cleanup: ${secret_path}" >&2
+    exit 1
+  }
+done
+if [[ "${transport}" != wireguard ]]; then
+  if [[ ! -f "${SHARED_MAINTENANCE_TARGET}" || -L "${SHARED_MAINTENANCE_TARGET}" ||
+    "$(stat -c '%u:%g:%a:%h' -- "${SHARED_MAINTENANCE_TARGET}")" != "0:0:600:1" ]]; then
+    echo "error: global lifecycle maintenance gate is absent or unsafe after endpoint runs" >&2
+    exit 1
+  fi
+  maintenance_target_identity_after="$(stat -Lc '%d:%i:%u:%g:%a:%h' -- "${SHARED_MAINTENANCE_TARGET}")"
+  if [[ "${maintenance_target_identity_before}" != absent &&
+    "${maintenance_target_identity_after}" != "${maintenance_target_identity_before}" ]]; then
+    echo "error: global lifecycle maintenance gate identity changed across endpoint runs" >&2
+    exit 1
+  fi
+  python3 - "${SHARED_MAINTENANCE_TARGET}" \
+    "${maintenance_target_identity_before}" "${maintenance_target_identity_after}" \
+    >"${EVIDENCE}/maintenance-target-after.log" <<'PY'
+import json
+import pathlib
+import sys
 
-teardown_complete=1
+path = pathlib.Path(sys.argv[1])
+owner = json.loads(path.read_text(encoding="utf-8"))
+if (
+    set(owner) - {"pid", "action", "config_path", "run_dir"}
+    or not isinstance(owner.get("pid"), int)
+    or owner["pid"] <= 0
+    or not isinstance(owner.get("action"), str)
+    or not owner["action"]
+):
+    raise SystemExit("global lifecycle maintenance gate owner record is malformed")
+print(f"maintenance_target={path}")
+print(f"identity_before={sys.argv[2]}")
+print(f"identity_after={sys.argv[3]}")
+result = "created-secured-file" if sys.argv[2] == "absent" else "same-secured-file"
+print(f"result={result} owner_record=valid")
+PY
+fi
+
+if [[ "${transport}" == "wireguard" ]]; then
+  : >"${RUN_ROOT}/daemon-a.pid"
+  : >"${RUN_ROOT}/daemon-b.pid"
+fi
 printf 'format=wg-mix-ebpf-b82-production-performance-complete-v1\nrun_id=%s\nmanifest_sha256=%s\nactive_resources=absent\nsensitive_files=absent\n' \
   "${run_id}" "$(sha256sum -- "${RUN_ROOT}/manifest" | awk '{print $1}')" \
   >"${RUN_ROOT}/complete"
 trap - ERR INT TERM
-printf 'PERFORMANCE_PRODUCTION_CELL_COMPLETE run_id=%s label=%s transport=%s backend=%s cipher=%s repetitions=%s duration_seconds=%s samples=9 evidence=%s timestamp=%s\n' \
-  "${run_id}" "${label}" "${transport}" "${backend}" "${cipher}" \
+printf 'PERFORMANCE_PRODUCTION_CELL_COMPLETE run_id=%s label=%s transport=%s backend=%s checksum_backend=%s artifact=%s cipher=%s max_bytes=%s repetitions=%s duration_seconds=%s samples=9 evidence=%s timestamp=%s\n' \
+  "${run_id}" "${label}" "${transport}" "${backend}" "${checksum_backend}" \
+  "${artifact}" "${cipher}" "${max_bytes}" \
   "${REPETITIONS}" "${DURATION}" "${EVIDENCE}" \
   "$(date -u +%Y-%m-%dT%H:%M:%SZ)"

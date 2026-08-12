@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 import re
 import stat
@@ -14,7 +15,7 @@ import tarfile
 from pathlib import Path
 
 
-RUN_PARENT = Path("/run/wg-mix-ebpf-performance-tests")
+RUN_PARENT = Path("/var/tmp/wg-mix-ebpf-performance-tests")
 RUN_ID_RE = re.compile(r"[0-9a-f]{8}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
@@ -127,6 +128,8 @@ def assert_no_live_resources(run_id: str, run_root: Path, kind: str) -> None:
             pid_path = run_root / f"daemon-{role}.pid"
             regular(pid_path, 0o600)
             raw = pid_path.read_text(encoding="ascii").strip()
+            if not raw:
+                continue
             if not raw.isdecimal() or int(raw) <= 0:
                 fail(f"invalid retained daemon PID: {pid_path}")
             if Path(f"/proc/{raw}").exists():
@@ -138,18 +141,76 @@ def assert_no_live_resources(run_id: str, run_root: Path, kind: str) -> None:
         fail("the exact run root is still present in current mountinfo")
 
 
+def matrix_child_runs(run_root: Path) -> list[tuple[str, Path]]:
+    index = run_root / "cells.v1.tsv"
+    regular(index, 0o600)
+    results_path = run_root / "results.v1.json"
+    regular(results_path, 0o600)
+    try:
+        results_document = json.loads(results_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise CleanupError("matrix result index is not valid JSON") from exc
+    result_rows = results_document.get("cell_results")
+    if (
+        results_document.get("format") != "wg-mix-ebpf-b82-performance-results-v1"
+        or results_document.get("matrix_id") != run_root.name
+        or results_document.get("cells") != 63
+        or results_document.get("samples") != 567
+        or not isinstance(result_rows, list)
+        or len(result_rows) != 63
+    ):
+        fail("matrix result index is not the exact bound 63/567 schema")
+    lines = index.read_text(encoding="utf-8", errors="strict").splitlines()
+    expected_header = (
+        "ordinal\tlabel\ttransport\tattachment_backend\tchecksum_backend\t"
+        "artifact\tcipher\tmax_bytes\trun_id\tevidence"
+    )
+    if not lines or lines[0] != expected_header or len(lines) != 64:
+        fail("matrix cell index is not the exact 63-cell schema")
+    result: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+    for ordinal, line in enumerate(lines[1:], start=1):
+        fields = line.split("\t")
+        if len(fields) != 10 or fields[0] != str(ordinal):
+            fail(f"matrix cell index row {ordinal} is malformed")
+        child_id = fields[8]
+        if not RUN_ID_RE.fullmatch(child_id) or child_id in seen:
+            fail(f"matrix cell index row {ordinal} has an invalid child ID")
+        child_root = run_root / "children" / child_id
+        expected_evidence = child_root / "evidence"
+        if fields[9] != str(expected_evidence):
+            fail(f"matrix cell index row {ordinal} has an unbound evidence path")
+        result_row = result_rows[ordinal - 1]
+        if (
+            not isinstance(result_row, dict)
+            or result_row.get("ordinal") != ordinal
+            or result_row.get("label") != fields[1]
+            or result_row.get("run_id") != child_id
+            or result_row.get("evidence") != fields[9]
+            or result_row.get("samples") != 9
+        ):
+            fail(f"matrix cell index row {ordinal} differs from bound results")
+        directory(child_root, 0o700)
+        seen.add(child_id)
+        result.append((child_id, child_root))
+    return result
+
+
 def inventory_tree(run_root: Path) -> tuple[list[Path], list[Path]]:
     files: list[Path] = []
     directories: list[Path] = []
     total_bytes = 0
+    root_device = directory(run_root, 0o700).st_dev
     for current_raw, dir_names, file_names in os.walk(
         run_root, topdown=True, followlinks=False
     ):
         current = Path(current_raw)
-        directory(current, (0o700, 0o755))
+        current_metadata = directory(current, (0o700, 0o755))
+        if current_metadata.st_dev != root_device:
+            fail(f"run tree crosses a filesystem boundary: {current}")
         directories.append(current)
-        if len(directories) > 4096:
-            fail("run tree directory count exceeds the 4096-entry cleanup bound")
+        if len(directories) > 16384:
+            fail("run tree directory count exceeds the 16384-entry cleanup bound")
         dir_names.sort()
         file_names.sort()
         for name in dir_names:
@@ -158,13 +219,15 @@ def inventory_tree(run_root: Path) -> tuple[list[Path], list[Path]]:
                 fail(f"symbolic link is forbidden in run tree: {candidate}")
         for name in file_names:
             candidate = current / name
-            metadata = regular(candidate, (0o600, 0o644))
+            metadata = regular(candidate, (0o400, 0o500, 0o600, 0o644))
+            if metadata.st_dev != root_device:
+                fail(f"run tree file crosses a filesystem boundary: {candidate}")
             files.append(candidate)
             total_bytes += metadata.st_size
-            if len(files) > 4096:
-                fail("run tree file count exceeds the 4096-entry cleanup bound")
-            if total_bytes > 1024 * 1024 * 1024:
-                fail("run tree exceeds the 1 GiB cleanup inventory bound")
+            if len(files) > 65536:
+                fail("run tree file count exceeds the 65536-entry cleanup bound")
+            if total_bytes > 4 * 1024 * 1024 * 1024:
+                fail("run tree exceeds the 4 GiB cleanup inventory bound")
     if not files or directories[0] != run_root:
         fail("run tree inventory is empty or unanchored")
     return files, directories
@@ -180,6 +243,8 @@ def cleanup(args: argparse.Namespace) -> None:
     archive = Path(args.export)
     if not archive.is_absolute() or archive == Path("/") or RUN_PARENT in archive.parents:
         fail("evidence export path must be absolute and outside the run parent")
+    if archive.resolve(strict=True) != archive:
+        fail("evidence export path is not canonical")
 
     directory(RUN_PARENT, 0o700)
     run_root = RUN_PARENT / args.run_id
@@ -194,13 +259,31 @@ def cleanup(args: argparse.Namespace) -> None:
     if owner.read_text(encoding="utf-8") != f"wg-mix-ebpf-performance:{args.run_id}\n":
         fail("run ownership marker mismatch")
     fields = parse_fields(complete)
+    manifest_fields = parse_fields(manifest)
+    kind = manifest_fields.get("kind", "cell")
+    if kind not in ("cell", "matrix"):
+        fail("run manifest kind is invalid")
     expected_fields = {
-        "format": "wg-mix-ebpf-b82-production-performance-complete-v1",
+        "format": (
+            "wg-mix-ebpf-b82-production-performance-complete-v2"
+            if kind == "matrix"
+            else "wg-mix-ebpf-b82-production-performance-complete-v1"
+        ),
         "run_id": args.run_id,
         "manifest_sha256": sha256_file(manifest),
         "active_resources": "absent",
         "sensitive_files": "absent",
     }
+    if kind == "matrix":
+        matrix_proofs = {
+            "artifacts_sha256": run_root / "artifacts.v1",
+            "results_sha256": run_root / "results.v1.json",
+            "report_sha256": run_root / "report.zh-CN.md",
+        }
+        for field, path in matrix_proofs.items():
+            regular(path, 0o600)
+            expected_fields[field] = sha256_file(path)
+        expected_fields.update({"cells": "63", "samples": "567"})
     if fields != expected_fields:
         fail("completed run proof mismatch")
 
@@ -220,11 +303,22 @@ def cleanup(args: argparse.Namespace) -> None:
         f"CLEANUP_HOST hostname={hostname} boot_id={boot_id} "
         f"run_id={args.run_id} root={run_root}"
     )
-    manifest_fields = parse_fields(manifest)
-    kind = manifest_fields.get("kind", "cell")
-    if kind not in ("cell", "matrix"):
-        fail("run manifest kind is invalid")
     assert_no_live_resources(args.run_id, run_root, kind)
+    if kind == "matrix":
+        for module in (
+            "wg_mix_faketcp_checksum",
+            "wg_mix_faketcp_checksum_kprobe",
+        ):
+            if (Path("/sys/module") / module).exists():
+                fail(f"matrix checksum module is live before evidence cleanup: {module}")
+        kprobe_device = Path("/dev/wg_mix_faketcp_checksum_kprobe")
+        if kprobe_device.exists() or kprobe_device.is_symlink():
+            fail("matrix kprobe lease device is live before evidence cleanup")
+        for child_id, child_root in matrix_child_runs(run_root):
+            # Child completion already binds a clean daemon stop.  Re-check
+            # only live namespace/mount identities here: historical numeric
+            # PIDs may legitimately have been reused before matrix export.
+            assert_no_live_resources(child_id, child_root, "matrix")
     files, directories = inventory_tree(run_root)
 
     print(

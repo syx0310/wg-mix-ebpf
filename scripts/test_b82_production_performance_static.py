@@ -1,19 +1,98 @@
 #!/usr/bin/env python3
-"""Static contract tests for the B82 complete production performance matrix."""
+"""Static and synthetic tests for the complete B82 performance matrix."""
 
 from __future__ import annotations
 
 import ast
+import hashlib
+import importlib.util
+import json
 import pathlib
 import re
+import statistics
+import subprocess
+import sys
+import tempfile
 import unittest
+
+sys.dont_write_bytecode = True
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MATRIX = ROOT / "scripts" / "run-b82-complete-performance-matrix.sh"
+TMUX_WRAPPER = ROOT / "scripts" / "run-b82-complete-performance-tmux.sh"
 RUNNER = ROOT / "scripts" / "run-b82-production-performance-cell.sh"
+REPORTER = ROOT / "scripts" / "generate-b82-performance-report.py"
 EXPORTER = ROOT / "scripts" / "export-b82-production-performance-evidence.sh"
 CLEANUP = ROOT / "scripts" / "cleanup-b82-production-performance-evidence.py"
+
+
+def load_reporter():
+    spec = importlib.util.spec_from_file_location("b82_reporter", REPORTER)
+    if spec is None or spec.loader is None:
+        raise AssertionError("cannot load report generator")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def iperf_document(
+    direction: str,
+    forward_bytes: int,
+    reverse_bytes: int = 0,
+    forward_retransmits: int = 0,
+    reverse_retransmits: int = 0,
+) -> dict[str, object]:
+    streams = [
+        {
+            "sender": {
+                "sender": direction != "reverse",
+                "bytes": forward_bytes,
+                "retransmits": forward_retransmits,
+            },
+            "receiver": {
+                "sender": direction != "reverse",
+                "bytes": forward_bytes,
+            },
+        }
+    ]
+    end: dict[str, object] = {
+        "streams": streams,
+        "sum_received": {"bytes": forward_bytes, "seconds": 1.0},
+        "sum_sent": {
+            "bytes": forward_bytes,
+            "retransmits": forward_retransmits,
+        },
+    }
+    if direction == "bidir":
+        streams.append(
+            {
+                "sender": {
+                    "sender": False,
+                    "bytes": reverse_bytes,
+                    "retransmits": reverse_retransmits,
+                },
+                "receiver": {"sender": False, "bytes": reverse_bytes},
+            }
+        )
+        end["sum_received_bidir_reverse"] = {
+            "bytes": reverse_bytes,
+            "seconds": 1.0,
+        }
+        end["sum_sent_bidir_reverse"] = {
+            "bytes": reverse_bytes,
+            "retransmits": reverse_retransmits,
+        }
+    return {
+        "start": {
+            "test_start": {
+                "num_streams": 1,
+                "reverse": int(direction == "reverse"),
+                "bidir": int(direction == "bidir"),
+            }
+        },
+        "end": end,
+    }
 
 
 class B82ProductionPerformanceStaticTests(unittest.TestCase):
@@ -21,172 +100,204 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.matrix = MATRIX.read_text(encoding="utf-8")
         cls.runner = RUNNER.read_text(encoding="utf-8")
+        cls.reporter = REPORTER.read_text(encoding="utf-8")
         cls.exporter = EXPORTER.read_text(encoding="utf-8")
         cls.cleanup = CLEANUP.read_text(encoding="utf-8")
 
-    def test_complete_matrix_is_33_cells_and_297_samples(self) -> None:
-        matrix = self.matrix
-        for fragment in (
-            "umask 077",
-            "cells=33 repetitions=3 duration_seconds=3",
-            "cells=33 samples=297",
-            "run_udp_cell wireguard-baseline wireguard auto off",
-            "run_udp_cell tcx-baseline ebpf tcx off",
-            "run_udp_cell classic_tc-baseline ebpf classic_tc off",
-            "run_production_cell icmp-tcx-baseline icmp tcx none 4",
-            "run_production_cell icmp-classic_tc-baseline icmp classic_tc none 4",
-            "run_production_cell faketcp-tcx-baseline faketcp tcx none 4",
-            'run_production_cell "faketcp-tcx-prefix-${max_bytes}" faketcp tcx prefix',
-            "run_production_cell faketcp-tcx-full-2048 faketcp tcx full 2048",
-            "for max_bytes in 4 16 64 128 256 512 1024 2048; do",
-            'readonly PRODUCTION_RUNNER_NAME="scripts/run-b82-production-performance-cell.sh"',
-        ):
-            self.assertIn(fragment, matrix)
-        self.assertEqual(2, matrix.count("for max_bytes in 4 16 64 128 256 512 1024 2048; do"))
-        self.assertNotIn("cells=21", matrix)
-        self.assertNotIn("samples=189", matrix)
-
-    def test_privileged_shell_entrypoints_use_a_real_effective_group_probe(self) -> None:
-        for source in (self.matrix, self.runner, self.exporter):
-            self.assertNotIn("${EGID}", source)
-            self.assertIn(
-                'if [[ "${EUID}" -ne 0 || "$(/usr/bin/id -g)" -ne 0 ]]; then',
-                source,
+    def test_exact_63_cell_567_sample_set(self) -> None:
+        reporter = load_reporter()
+        cells = reporter.expected_cells()
+        self.assertEqual(63, len(cells))
+        self.assertEqual(63, len({cell[0] for cell in cells}))
+        grouped: dict[str, int] = {}
+        for cell in cells:
+            grouped[cell[1]] = grouped.get(cell[1], 0) + 1
+        self.assertEqual(
+            {"wireguard": 1, "udp": 20, "icmp": 2, "faketcp": 40}, grouped
+        )
+        self.assertEqual(567, len(cells) * 3 * 3)
+        fake_pairs = {(cell[2], cell[3]) for cell in cells if cell[1] == "faketcp"}
+        self.assertEqual(
+            {
+                ("tcx", "kfunc"),
+                ("classic_tc", "kfunc"),
+                ("tcx", "kprobe"),
+                ("classic_tc", "kprobe"),
+            },
+            fake_pairs,
+        )
+        icmp = [cell for cell in cells if cell[1] == "icmp"]
+        self.assertTrue(all(cell[5:] == ("none", 0) for cell in icmp))
+        emit_start = self.matrix.index("emit_cells() {")
+        emit_end = self.matrix.index("\n}\n\ndeclare -A observed_cell_run_ids", emit_start) + 3
+        emitter = self.matrix[emit_start:emit_end]
+        harness = "\n".join(
+            (
+                "CELL_COUNT=63",
+                "PREFIX_LENGTHS=(4 16 64 128 256 512 1024 2048)",
+                emitter,
+                "record_cell() { printf '%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\t%s\\n' \"$@\"; }",
+                "emit_cells record_cell",
             )
-
-    def test_module_lease_wraps_the_entire_matrix_and_has_recovery(self) -> None:
-        matrix = self.matrix
+        )
+        completed = subprocess.run(
+            ["bash", "-c", harness],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        emitted = []
+        for line in completed.stdout.splitlines():
+            ordinal, label, transport, attachment, checksum, artifact, cipher, size = line.split("\t")
+            self.assertEqual(len(emitted) + 1, int(ordinal))
+            emitted.append(
+                (label, transport, attachment, checksum, artifact, cipher, int(size))
+            )
+        self.assertEqual(cells, emitted)
         for fragment in (
-            'readonly MODULE_LOCK="${RUN_PARENT}/checksum-module-lease.v1.lock"',
-            "wg-mix-ebpf-b82-performance-module-intent-v1",
-            "wg-mix-ebpf-b82-performance-module-owned-v1",
-            "wg-mix-ebpf-b82-performance-module-unloaded-v1",
-            '"source_stage_id=${source_stage_id}"',
-            '"boot_id=${boot_id}"',
-            '"commit=${commit}"',
-            '"ko_sha256=${module_sha256}"',
-            '"srcversion=${module_srcversion}"',
-            '"lease_id=${MODULE_LEASE_ID}"',
-            "matrix_logged module-load /usr/sbin/insmod",
-            "matrix_logged module-unload /usr/sbin/rmmod",
-            'expected_lease="${intent_stage}-${matrix_id}"',
-            'intent_source_root="/run/wg-mix-ebpf-source-stages/${intent_stage}/source"',
-            'reason="recovered-unreceipted-live-no-btf"',
-            'if ! module_identity="$(module_live_identity)"; then',
-            'if [[ "${operation}" == "cleanup-module" ]]; then',
-            "cleanup_owned_module",
-            '"${refcount}" != "0"',
-            "No automatic module unload or evidence cleanup was attempted.",
+            "readonly CELL_COUNT=63 SAMPLE_COUNT=567",
+            "cells=63 samples=567 repetitions=3 duration_seconds=3",
+            'readonly -a PREFIX_LENGTHS=(4 16 64 128 256 512 1024 2048)',
+            "for checksum in kfunc kprobe; do",
+            "for backend in tcx classic_tc; do",
+            '"icmp-${backend}-none" icmp',
+            "emit_cells run_cell",
+            "emit_cells validate_cell_run_id",
+            '"${#observed_cell_run_ids[@]}" -eq "${CELL_COUNT}"',
+        ):
+            self.assertIn(fragment, self.matrix)
+
+    def test_read_only_plan_has_exact_argv_write_set_restore_and_tmux_budget(self) -> None:
+        for fragment in (
+            "PERFORMANCE_MATRIX_PLAN",
+            "SOURCE_STATE source=",
+            "git_clean=1",
+            "tmux_budget_seconds=9000",
+            "TMUX_ARGV",
+            "WG_MIX_EBPF_PERFORMANCE_MATRIX_ID=${MATRIX_ID}",
+            '"${TMUX_WRAPPER}"',
+            "ARGV /usr/bin/env WG_MIX_EBPF_PERFORMANCE_ARTIFACT_ROOT=",
+            "/usr/bin/timeout --foreground --signal=TERM",
+            "--checksum-backend %q",
+            "WRITE_SET cell=",
+            "ARTIFACT_BUILD_SET",
+            "MODULE_LOAD_ARGV backend=kfunc",
+            "MODULE_UNLOAD_ARGV backend=kprobe",
+            "RESTORE_ARGV",
+            "MODULE_RESTORE_ARGV",
+            "readonly CELL_BUDGET_SECONDS=130 REPORT_RESERVE_SECONDS=60",
+        ):
+            self.assertIn(fragment, self.matrix)
+        plan_start = self.matrix.index('if [[ "${operation}" == plan ]]')
+        plan_end = self.matrix.index("  exit 0\nfi", plan_start) + len("  exit 0\nfi")
+        plan = self.matrix[plan_start:plan_end]
+        for forbidden in ("mkdir --mode", "matrix_logged ", "ip netns add", "mount --"):
+            self.assertNotIn(forbidden, plan)
+
+    def test_artifacts_are_built_once_frozen_and_revalidated(self) -> None:
+        matrix = self.matrix
+        self.assertEqual(1, matrix.count("matrix_logged bpf-build"))
+        self.assertEqual(1, matrix.count("matrix_logged go-build"))
+        self.assertEqual(1, matrix.count("matrix_logged module-kfunc-build"))
+        self.assertEqual(1, matrix.count("matrix_logged module-kprobe-build"))
+        for fragment in (
+            "format=wg-mix-ebpf-performance-artifacts-v1",
+            'chmod 0500 -- "${BUILD_BIN}"',
+            'chmod 0400 -- "${BUILD_BASELINE}"',
+            "metadata.st_nlink != 1",
+            "validate_artifacts >\"${MATRIX_EVIDENCE}/artifact-check-${ordinal}.log\"",
+            "GOCACHE=\"${GO_CACHE}\"",
+            "GOMODCACHE=\"${GO_MOD_CACHE}\"",
+            "GOTELEMETRY=off",
+            'readonly STAGE_GO_CACHE="/run/wg-mix-ebpf-source-stages/${STAGE_ID}/go-cache"',
+            "GOTMPDIR=\"${GO_TMP}\"",
+            "-Wno-unused-function -target bpf",
+            "binary-source-identity.log",
+            "matrix_logged go-overlay python3 -I -c",
+            'readonly GO_OVERLAY="${BUILD_CACHE_ROOT}/frozen-bpf-overlay.json"',
+            '"-overlay=${GO_OVERLAY}"',
+            "if not path.exists():",
+            'internal/buildinfo.sourceCommit=${COMMIT}',
+            'document.get(field) != expected',
+            "source stage is dirty before build",
+            "matrix_logged source-tree-before source_tree_digest",
+            "matrix_logged source-tree-after-build source_tree_digest",
+            "matrix_logged source-tree-final source_tree_digest",
+            "artifact build changed the root-owned source tree",
+            'FROZEN_BPF_CFLAGS="-O2 -g -Wall -Werror -Wno-unused-function -target bpf -I/usr/include/${bpf_multiarch}"',
         ):
             self.assertIn(fragment, matrix)
-        load = matrix.index("matrix_logged module-load /usr/sbin/insmod")
-        cells = matrix.index("PERFORMANCE_MATRIX_START")
-        unload = matrix.index("matrix_logged module-unload /usr/sbin/rmmod")
-        self.assertLess(load, cells)
-        self.assertLess(cells, unload)
+
+    def test_module_transitions_have_intent_owned_restore_and_no_failure_unload(self) -> None:
+        matrix = self.matrix
+        for fragment in (
+            'readonly MODULE_LOCK="${RUN_PARENT}/checksum-module-lease.v2.lock"',
+            "wg-mix-ebpf-performance-module-intent-v2",
+            "wg-mix-ebpf-performance-module-owned-v2",
+            "wg-mix-ebpf-performance-module-restored-v1",
+            "prepare_module_intent",
+            "seal_live_module_owned",
+            "validate_live_module_owned",
+            'matrix_logged "module-${backend}-load" insmod',
+            'matrix_logged "module-${backend}-unload" rmmod',
+            'refcount="$(awk -v name="${name}"',
+            '[[ "${refcount}" == 0 ]]',
+            "restore-module",
+            "validate_module_restored kfunc",
+            "validate_module_restored kprobe",
+            "No automatic cell restore, module unload, or evidence cleanup was attempted.",
+        ):
+            self.assertIn(fragment, matrix)
         failure = matrix[matrix.index("matrix_failure()") : matrix.index("receipt_value()")]
         self.assertNotIn("rmmod", failure)
 
-    def test_module_build_finalizes_exact_kernel_btf_before_load(self) -> None:
-        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
-        helper = (
-            ROOT / "scripts" / "finalize-faketcp-checksum-module-btf.sh"
-        ).read_text(encoding="utf-8")
-        for fragment in (
-            'VMLINUX_BTF ?= /sys/kernel/btf/vmlinux',
-            'FAKETCP_CHECKSUM_KMOD_BTF_HELPER ?=',
-            '--kernel-build "$(KERNEL_BUILD)"',
-            '--vmlinux-btf "$(VMLINUX_BTF)"',
-            '--module "$(FAKETCP_CHECKSUM_KMOD_OBJECT)"',
-        ):
-            self.assertIn(fragment, makefile)
-        for fragment in (
-            'gen_btf="$(readlink -e -- "${kernel_build}/scripts/gen-btf.sh")"',
-            'resolve_btfids="$(readlink -e --',
-            'readonly gen_btf resolve_btfids',
-            '^/usr/src/linux-headers-[A-Za-z0-9._+-]+/scripts/gen-btf\\.sh$',
-            '"${gen_btf}" --btf_base "${vmlinux_btf}" "${module}"',
-            '"1:1:1"',
-            'FAKETCP_CHECKSUM_MODULE_BTF state=%s',
-        ):
-            self.assertIn(fragment, helper)
-        for forbidden in ("insmod", "modprobe", "rmmod", "modules_install"):
-            self.assertNotIn(forbidden, helper)
-
-    def test_cleanup_dispatch_and_run_root_precede_mutating_work(self) -> None:
-        matrix = self.matrix
-        cleanup_dispatch = matrix.index(
-            'if [[ "${operation}" == "cleanup-module" ]]; then',
-            matrix.index("cleanup_owned_module()") + len("cleanup_owned_module()"),
-        )
-        run_root_create = matrix.index(
-            'mkdir --mode=0700 -- "${MATRIX_ROOT}" "${MATRIX_EVIDENCE}"'
-        )
-        first_run_lock = matrix.index("matrix_logged module-lock")
-        module_build = matrix.index("matrix_logged module-build")
-        matrix_start = matrix.index("PERFORMANCE_MATRIX_START")
-        self.assertLess(cleanup_dispatch, run_root_create)
-        self.assertLess(run_root_create, first_run_lock)
-        self.assertLess(first_run_lock, module_build)
-        self.assertLess(module_build, matrix_start)
-        cleanup_branch = matrix[cleanup_dispatch:run_root_create]
-        self.assertIn("cleanup_owned_module", cleanup_branch)
-        self.assertIn("exit 0", cleanup_branch)
-
-    def test_command_preflight_accepts_system_managed_symlinks(self) -> None:
+    def test_runner_uses_netns_then_private_mountns_then_bpffs_then_direct_daemon(self) -> None:
         runner = self.runner
-        preflight = runner[
-            runner.index("for command_name in ip wg ping") : runner.index(
-                "unset resolved_command"
-            )
-        ]
-        self.assertIn('! -f "${resolved_command}"', preflight)
-        self.assertNotIn('-L "${resolved_command}"', preflight)
+        netns = runner.index('ip netns exec "${NSA}" unshare --mount --propagation private')
+        verify = runner.index("endpoint child did not enter its exact network namespace")
+        binds = runner.index('mount --bind "${endpoint_run}"')
+        bpffs = runner.index("mount -t bpf -o mode=0700 bpf /sys/fs/bpf")
+        direct = runner.index('exec env -i "${daemon_environment[@]}"')
+        self.assertLess(verify, binds)
+        self.assertLess(binds, bpffs)
+        self.assertLess(bpffs, direct)
+        self.assertGreater(netns, direct)
+        endpoint = runner[runner.index("endpoint_child()") : runner.index('if [[ "${1-}" == "endpoint"')]
+        self.assertNotIn('exec ip netns exec "${netns}"', endpoint)
+        self.assertNotIn('mount --bind "${endpoint_maintenance}"', endpoint)
 
-    def test_runner_uses_two_real_resident_daemons(self) -> None:
+    def test_runner_supports_all_attachment_checksum_artifact_branches(self) -> None:
         runner = self.runner
-        self.assertGreaterEqual(runner.count("unshare --mount --propagation private"), 4)
         for fragment in (
-            '"${BIN}" run --config /run/wg-mix-ebpf/config.yaml',
-            "--run-dir /run/wg-mix-ebpf/runtime",
-            "--state-dir /var/lib/wg-mix-ebpf/state",
-            'mount --bind "${endpoint_run}" "${SHARED_RUN_TARGET}"',
-            'mount --bind "${endpoint_var}" "${SHARED_VAR_TARGET}"',
-            'mount --bind "${endpoint_maintenance}" "${SHARED_MAINTENANCE_TARGET}"',
-            "mount -t bpf -o mode=0700 bpf /sys/fs/bpf",
-            '"WG_MIX_EBPF_FAKETCP_OBJECT=${FAKETCP_OBJECT}"',
-            "wait_daemon_active a",
-            "wait_daemon_active b",
+            "wireguard|udp|icmp|faketcp",
+            "none|tcx|classic_tc",
+            "none|kfunc|kprobe",
+            'readonly FAKETCP_LEGACY_OBJECT_NAME="build/wg_mix_faketcp_legacy_515.o"',
+            "WG_MIX_EBPF_FAKETCP_LEGACY_515_OBJECT",
+            "legacy-515-kprobe",
+            "modern-kfunc",
+            'readonly ARTIFACT_MANIFEST="${ARTIFACT_ROOT%/artifacts}/artifacts.v1"',
+            "frozen performance artifact differs",
+            'expected_owner = "process-owned" if backend == "tcx" else "durable-classic-tc+process-owned-runtime"',
+            'xdp[0].get("mode") != "generic"',
+            'checksum_status.get("lease_held") is not True',
+            'daemon = doc.get("daemon")',
+            "validate_classic_journal",
+            "validate_no_classic_journal",
+            "kprobe_lease_fds",
+            "classic-journal-recovery",
+            "post-traffic-health-reload",
+            "reload-a-after-traffic-health",
+            "validate_baseline_status",
+            "performance label does not bind its exact cell arguments",
+            'fake.get("object_sha256") != expected_object_sha256',
+            "underlay projection differs from owner identity",
         ):
             self.assertIn(fragment, runner)
-        for forbidden in (
-            "--once",
-            "--isolated-netns-test",
-            "WG_MIX_FAKETCP_RUN_REALHOST_INTEGRATION",
-            "WG_MIX_FAKETCP_REALHOST_OBJECT",
-        ):
-            self.assertNotIn(forbidden, runner)
-        first_wait = runner.index("wait_daemon_active a", runner.index('stage="daemon-start"'))
-        second_start = runner.index("record_background_start daemon-b-start")
-        self.assertLess(second_start, first_wait)
+        self.assertNotIn("FakeTCP production performance requires TCX", runner)
 
-    def test_faketcp_contract_is_fixed_tcx_generic_xdp_and_fail_closed(self) -> None:
-        runner = self.runner
-        for fragment in (
-            '"${transport}" == "faketcp" && "${backend}" != "tcx"',
-            "checksum_mode: partial-complete-reset-required",
-            "ingress_mode: xdp-generic-exact",
-            "ListenPort = ${port}",
-            "mode: nft-temporary-drop",
-            "startup_fail_mode: fail_closed_for_managed_flows",
-            "/sys/module/wg_mix_faketcp_checksum",
-            "/sys/kernel/btf/wg_mix_faketcp_checksum",
-        ):
-            self.assertIn(fragment, runner)
-        self.assertNotIn("classic_tc faketcp", runner)
-
-    def test_each_cell_is_three_by_three_by_three(self) -> None:
-        runner = self.runner
+    def test_cell_sampling_and_aggregate_contract(self) -> None:
         for fragment in (
             "readonly DURATION=3",
             "readonly REPETITIONS=3",
@@ -194,131 +305,360 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
             "for ((repetition = 1; repetition <= REPETITIONS; repetition++)); do",
             "samples=9",
             "--aggregate",
+            "direction_args=(-R)",
+            "direction_args=(--bidir)",
+            "readonly MAXIMUM_RETRANSMITS=2147483647",
         ):
-            self.assertIn(fragment, runner)
-        self.assertIn("--bidir", runner)
-        self.assertIn("direction_args=(-R)", runner)
+            self.assertIn(fragment, self.runner)
 
-    def test_complete_evidence_is_recorded_without_secret_argv(self) -> None:
+    def test_failure_is_full_log_no_automatic_restore(self) -> None:
         runner = self.runner
-        for fragment in (
-            "run_recorded_command()",
-            "record_background_start()",
-            "record_background_finish()",
-            "event=start phase=%s argv=",
-            "event=finish phase=%s rc=%s",
-            "daemon-a.stdout.log",
-            "daemon-a.stderr.log",
-            "reload-a-same-key.stdout.log",
-            "iperf-${sample}-client",
-            "FULL_LOG_BEGIN",
-            "failure-diagnostics.log",
-            "No automatic cleanup was attempted after the unexpected failure.",
-        ):
-            self.assertIn(fragment, runner)
-        self.assertNotIn("XOR_PASSWORD=", runner)
-        self.assertNotIn('log_argv "${next_xor_secret}"', runner)
-        self.assertNotIn('log_argv "${xor_secret}"', runner)
-        self.assertNotIn("ps -eo", runner)
-        self.assertIn('ps -p "${exact_pid}"', runner)
-
-    def test_faketcp_acceptance_checks_lifecycle_and_exact_ids(self) -> None:
-        runner = self.runner
-        for fragment in (
-            'fake.get("owner_kind") != "process-owned"',
-            'fake.get("healthy") is not True',
-            'fake.get("barrier") != "open"',
-            'fake.get("object_source") != expected_object',
-            'len(xdp) != 1',
-            'len(tcx) != 2',
-            'directions != {"ingress", "egress"}',
-            "faketcp_same_key_reload=noop exact_identity=unchanged",
-            "faketcp_changed_key_reload=serial-replacement exact_identity=replaced",
-            "reload-a-same-key",
-            "reload-b-same-key",
-            "reload-a-changed-key",
-            "reload-b-changed-key",
-            "owned-bpf-ids.json",
-            "exact-bpf-absence-after-stop.log",
-            "exact_links_absent=1",
-            "exact_programs_absent=1",
-            "exact_maps_absent=1",
-        ):
-            self.assertIn(fragment, runner)
-
-    def test_lifecycle_maintenance_gate_is_isolated_and_host_gate_unchanged(self) -> None:
-        runner = self.runner
-        for fragment in (
-            'readonly SHARED_MAINTENANCE_TARGET="/run/.wg-mix-ebpf-daemon.lease.maintenance"',
-            '"$(stat -c \'%u:%g:%a:%h\' -- "${SHARED_MAINTENANCE_TARGET}")" != "0:0:600:1"',
-            "fcntl.LOCK_EX | fcntl.LOCK_NB",
-            'maintenance_target_stat_before="$(stat -Lc',
-            'maintenance_target_sha_before="$(sha256sum',
-            'maintenance_target_stat_after="$(stat -Lc',
-            'maintenance_target_sha_after="$(sha256sum',
-            "global lifecycle maintenance target changed across isolated endpoint runs",
-            "result=unchanged",
-        ):
-            self.assertIn(fragment, runner)
-
-    def test_success_cleanup_is_exact_and_failure_is_read_only(self) -> None:
-        runner = self.runner
+        matrix = self.matrix
+        for source in (runner, matrix):
+            self.assertIn("FULL_LOG_BEGIN", source)
+        self.assertIn("failure-diagnostics.log", runner)
+        self.assertIn("FAILURE_RESOURCES_RETAINED", runner)
+        self.assertIn("No automatic cleanup was attempted", runner)
+        self.assertIn("No automatic cell restore, module unload", matrix)
         failure = runner[runner.index("capture_failure_evidence()") : runner.index("dump_complete_logs()")]
-        self.assertNotIn("ip netns delete", failure)
-        self.assertNotIn("kill -", failure)
-        self.assertNotIn("/bin/rm", failure)
-        for fragment in (
-            'run_mutation netns-delete-a ip netns delete "${NSA}"',
-            'run_mutation netns-delete-router ip netns delete "${NSR}"',
-            'run_mutation netns-delete-b ip netns delete "${NSB}"',
-            'run_mutation xor-secret-remove /bin/rm -- "${secret_path}"',
-            "PERFORMANCE_PRODUCTION_CELL_COMPLETE",
-            "active_resources=absent",
-            "sensitive_files=absent",
-        ):
-            self.assertIn(fragment, runner)
+        for forbidden in ("ip netns delete", "kill -", "/bin/rm"):
+            self.assertNotIn(forbidden, failure)
         for forbidden in ("rm -rf", "find -delete", "xargs rm", "eval "):
-            self.assertNotIn(forbidden, runner)
+            self.assertNotIn(forbidden, runner + matrix)
 
-    def test_export_and_cleanup_are_versioned_and_bounded(self) -> None:
-        exporter = self.exporter
-        cleanup = self.cleanup
+    def test_explicit_restore_is_owner_bound_and_exact(self) -> None:
         for fragment in (
-            "wg-mix-ebpf-b82-production-performance-complete-v1",
-            "active_resources=absent",
-            "sensitive_files=absent",
-            "tar --create --format=posix --numeric-owner",
-            "EVIDENCE_EXPORT_COMPLETE",
+            "validate_retained_run",
+            "signal_namespace_processes TERM",
+            "signal_namespace_processes KILL",
+            "allowed_restore_executable",
+            "refusing to signal an unproved retained process",
+            "remove_retained_secret",
+            "remove_retained_classic_journals",
+            'ip netns delete "${netns}"',
+            "PERFORMANCE_PRODUCTION_CELL_RESTORE_COMPLETE",
+            'proof_value source_root "${RUN_ROOT}/manifest"',
         ):
-            self.assertIn(fragment, exporter)
+            self.assertIn(fragment, self.runner)
+
+    def test_export_cleanup_and_report_are_v2_bound(self) -> None:
         for fragment in (
-            'RUN_PARENT = Path("/run/wg-mix-ebpf-performance-tests")',
-            'if kind == "cell":',
-            'if kind not in ("cell", "matrix"):',
-            "run_root.resolve(strict=True) != run_root",
-            "run tree file count exceeds the 4096-entry cleanup bound",
-            "run tree exceeds the 1 GiB cleanup inventory bound",
-            "CLEANUP_INVENTORY",
-            "CLEANUP_TARGET",
-            "CLEANUP_RESULT",
-            "PERFORMANCE_EVIDENCE_CLEANUP_COMPLETE",
+            "wg-mix-ebpf-b82-production-performance-complete-v2",
+            "artifacts_sha256",
+            "results_sha256",
+            "report_sha256",
+        ):
+            self.assertIn(fragment, self.exporter)
+            self.assertIn(fragment, self.cleanup)
+        self.assertIn("expected_complete_lines=10", self.exporter)
+        self.assertIn('"$(proof_value samples)" != 567', self.exporter)
+        self.assertIn('^0:0:700:[1-9][0-9]*$', self.exporter)
+        self.assertNotIn('!= "0:0:700:1"', self.exporter)
+        for fragment in (
+            "65536-entry cleanup bound",
+            "4 GiB cleanup inventory bound",
+            "run tree crosses a filesystem boundary",
+            "evidence export path is not canonical",
+            "matrix checksum module is live before evidence cleanup",
+            "matrix cell index row {ordinal} differs from bound results",
             "os.unlink(path)",
             "os.rmdir(path)",
-            "CLEANUP_HOST hostname=",
-            "CLEANUP_PRESERVE kind=export",
-            "export_preserved=",
-            "preserved evidence export changed during cleanup",
+            "CLEANUP_PRESERVE",
+            'assert_no_live_resources(child_id, child_root, "matrix")',
         ):
-            self.assertIn(fragment, cleanup)
-        self.assertNotIn("os.unlink(archive)", cleanup)
-        self.assertNotIn("CLEANUP_TARGET kind=export", cleanup)
-        self.assertLess(
-            cleanup.index("CLEANUP_HOST hostname="),
-            cleanup.index("files, directories = inventory_tree(run_root)"),
-        )
+            self.assertIn(fragment, self.cleanup)
         for forbidden in ("shutil.rmtree", "rm -rf", "find -delete", "shell=True"):
-            self.assertNotIn(forbidden, cleanup)
-        ast.parse(cleanup, filename=str(CLEANUP))
+            self.assertNotIn(forbidden, self.cleanup)
+        self.assertIn('"${canonical_output_parent}" != "${output_parent}"', self.exporter)
+        self.assertIn('"${canonical_output}" != "${output}"', self.exporter)
+
+    def test_python_sources_parse_without_bytecode(self) -> None:
+        for path in (REPORTER, CLEANUP, pathlib.Path(__file__)):
+            ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for path in (MATRIX, RUNNER):
+            lines = path.read_text(encoding="utf-8").splitlines()
+            for start, line in enumerate(lines):
+                if "<<'PY'" not in line:
+                    continue
+                try:
+                    finish = lines.index("PY", start + 1)
+                except ValueError as error:
+                    raise AssertionError(f"unterminated Python heredoc in {path}:{start + 1}") from error
+                ast.parse(
+                    "\n".join(lines[start + 1 : finish]) + "\n",
+                    filename=f"{path}:heredoc:{start + 2}",
+                )
+        marker = "matrix_logged go-overlay python3 -I -c '\n"
+        start = self.matrix.index(marker) + len(marker)
+        finish = self.matrix.index("\n' \"${GO_OVERLAY}\"", start)
+        ast.parse(self.matrix[start:finish], filename=f"{MATRIX}:go-overlay")
+
+    def test_shell_sources_pass_bash_syntax(self) -> None:
+        completed = subprocess.run(
+            [
+                "bash",
+                "-n",
+                str(MATRIX),
+                str(TMUX_WRAPPER),
+                str(RUNNER),
+                str(EXPORTER),
+            ],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertEqual(0, completed.returncode, completed.stderr)
+        wrapper = TMUX_WRAPPER.read_text(encoding="utf-8")
+        self.assertIn("--foreground --signal=TERM --kill-after=180s 9000s", wrapper)
+        self.assertIn('exec /usr/bin/timeout', wrapper)
+        self.assertNotIn("eval ", wrapper)
+
+    def test_reporter_rejects_non_exact_cell_set(self) -> None:
+        reporter = load_reporter()
+        cells = reporter.expected_cells()
+        rows = []
+        for ordinal, cell in enumerate(cells, start=1):
+            label, transport, attachment, checksum, artifact, cipher, max_bytes = cell
+            rows.append(
+                {
+                    "ordinal": str(ordinal),
+                    "label": label,
+                    "transport": transport,
+                    "attachment_backend": attachment,
+                    "checksum_backend": checksum,
+                    "artifact": artifact,
+                    "cipher": cipher,
+                    "max_bytes": str(max_bytes),
+                    "run_id": f"{ordinal:08x}",
+                    "evidence": f"/var/tmp/wg-mix-ebpf-performance-tests/abcd1234/children/{ordinal:08x}/evidence",
+                }
+            )
+        reporter.validate_cell_set(rows)
+        for mutation in ("missing", "duplicate", "extra"):
+            changed = [dict(row) for row in rows]
+            if mutation == "missing":
+                changed.pop()
+            elif mutation == "duplicate":
+                changed[-1] = dict(changed[-2])
+            else:
+                changed.append(dict(changed[-1]))
+            with self.assertRaises((reporter.ReportError, ValueError)):
+                reporter.validate_cell_set(changed)
+
+    def test_report_statistics_use_pstdev_samplewise_bidir_and_no_double_retransmit(self) -> None:
+        reporter = load_reporter()
+
+        with tempfile.TemporaryDirectory() as raw:
+            raw_root = pathlib.Path(raw)
+            for direction in ("forward", "reverse", "bidir"):
+                for repetition in range(1, 4):
+                    base = (repetition + 1) * 1_000_000
+                    document = iperf_document(
+                        direction,
+                        base,
+                        reverse_bytes=(repetition + 3) * 1_000_000,
+                        forward_retransmits=repetition,
+                        reverse_retransmits=repetition + 3,
+                    )
+                    (raw_root / f"iperf-{direction}-r{repetition}.json").write_text(
+                        json.dumps(document), encoding="utf-8"
+                    )
+            checker = reporter.load_checker(ROOT)
+            measured, digests = reporter.aggregate_cell(checker, raw_root)
+            (raw_root / "unexpected.json").write_text("{}\n", encoding="utf-8")
+            with self.assertRaises(reporter.ReportError):
+                reporter.aggregate_cell(checker, raw_root)
+        measured_by_key = {
+            (item["requested_direction"], item["direction"]): item
+            for item in measured
+        }
+        forward = measured_by_key[("forward", "forward")]
+        bidir = measured_by_key[("bidir", "aggregate")]
+        self.assertEqual(9, len(digests))
+        self.assertAlmostEqual(24.0, forward["throughput_mean_mbps"])
+        self.assertAlmostEqual(
+            statistics.pstdev((16.0, 24.0, 32.0)),
+            forward["throughput_pstdev_mbps"],
+        )
+        self.assertAlmostEqual(64.0, bidir["throughput_mean_mbps"])
+        self.assertAlmostEqual(
+            statistics.pstdev((48.0, 64.0, 80.0)),
+            bidir["throughput_pstdev_mbps"],
+        )
+        self.assertEqual(21, bidir["retransmits_total"])
+
+        def item(requested: str, direction: str, throughput: float, retrans: int, fairness: float):
+            return {
+                "requested_direction": requested,
+                "direction": direction,
+                "samples": 3,
+                "throughput_mean_mbps": throughput,
+                "throughput_pstdev_mbps": 1.25,
+                "throughput_min_mbps": throughput - 2,
+                "throughput_max_mbps": throughput + 2,
+                "retransmits_total": retrans,
+                "fairness_mean": fairness,
+                "fairness_min": fairness - 0.01,
+            }
+
+        aggregates = [
+            item("forward", "forward", 10, 1, 0.99),
+            item("reverse", "reverse", 20, 2, 0.98),
+            item("bidir", "forward", 30, 4, 0.97),
+            item("bidir", "reverse", 40, 8, 0.96),
+            item("bidir", "aggregate", 70, 12, 0.96),
+        ]
+        document = {
+            "matrix_id": "abcd1234",
+            "commit": "a" * 40,
+            "kernel_release": "test",
+            "cell_results": [
+                {
+                    "ordinal": 1,
+                    "transport": "wireguard",
+                    "attachment_backend": "none",
+                    "checksum_backend": "none",
+                    "cipher": "none",
+                    "max_bytes": 0,
+                    "run_id": "00000001",
+                    "aggregates": aggregates,
+                }
+            ],
+        }
+        markdown = reporter.render_markdown(document)
+        self.assertIn("总重传：15", markdown)
+        self.assertNotIn("总重传：27", markdown)
+        self.assertIn("70.00 ± 1.25 (68.00–72.00)", markdown)
+        self.assertIn("总体标准差", markdown)
+
+    def test_complete_567_sample_fixture_generates_chinese_report(self) -> None:
+        reporter = load_reporter()
+        matrix_id = "abcd1234"
+        with tempfile.TemporaryDirectory() as temporary:
+            matrix_root = (pathlib.Path(temporary) / matrix_id).resolve(strict=False)
+            (matrix_root / "cells").mkdir(parents=True)
+            (matrix_root / "children").mkdir()
+            (matrix_root / "manifest").write_text(
+                "\n".join(
+                    (
+                        "format=wg-mix-ebpf-b82-performance-matrix-v2",
+                        "kind=matrix",
+                        f"run_id={matrix_id}",
+                        f"commit={'a' * 40}",
+                        "kernel_release=synthetic-7.0",
+                        "cells=63",
+                        "samples=567",
+                        "repetitions=3",
+                        "duration_seconds=3",
+                        "",
+                    )
+                ),
+                encoding="utf-8",
+            )
+            rows = []
+            for ordinal, cell in enumerate(reporter.expected_cells(), start=1):
+                label, transport, attachment, checksum, artifact, cipher, size = cell
+                run_id = hashlib.sha256(
+                    f"{matrix_id}:{ordinal}:{label}".encode("ascii")
+                ).hexdigest()[:8]
+                evidence = matrix_root / "children" / run_id / "evidence"
+                evidence.mkdir(parents=True)
+                row = {
+                    "ordinal": str(ordinal),
+                    "label": label,
+                    "transport": transport,
+                    "attachment_backend": attachment,
+                    "checksum_backend": checksum,
+                    "artifact": artifact,
+                    "cipher": cipher,
+                    "max_bytes": str(size),
+                    "run_id": run_id,
+                    "evidence": str(evidence),
+                }
+                rows.append(row)
+                cell_root = matrix_root / "cells" / f"{ordinal:02d}-{label}"
+                raw_root = cell_root / "raw"
+                raw_root.mkdir(parents=True)
+                (cell_root / "cell.v1").write_text(
+                    "".join(f"{key}={row[key]}\n" for key in reporter.CELL_HEADER)
+                    + "samples=9\nstate=complete\n",
+                    encoding="utf-8",
+                )
+                for direction in reporter.DIRECTIONS:
+                    for repetition in range(1, 4):
+                        received = 1_100_000 + ordinal * 10_000 + repetition * 1_000
+                        document = iperf_document(
+                            direction,
+                            received,
+                            reverse_bytes=received + 500_000,
+                        )
+                        (raw_root / f"iperf-{direction}-r{repetition}.json").write_text(
+                            json.dumps(document), encoding="utf-8"
+                        )
+            (matrix_root / "cells.v1.tsv").write_text(
+                "\t".join(reporter.CELL_HEADER)
+                + "\n"
+                + "".join(
+                    "\t".join(row[key] for key in reporter.CELL_HEADER) + "\n"
+                    for row in rows
+                ),
+                encoding="utf-8",
+            )
+            completed = subprocess.run(
+                [
+                    sys.executable,
+                    "-B",
+                    "-I",
+                    str(REPORTER),
+                    "--matrix-root",
+                    str(matrix_root),
+                    "--source-root",
+                    str(ROOT),
+                ],
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertEqual(0, completed.returncode, completed.stderr)
+            self.assertIn("cells=63 samples=567", completed.stdout)
+            results_path = matrix_root / "results.v1.json"
+            report_path = matrix_root / "report.zh-CN.md"
+            results = json.loads(results_path.read_text(encoding="utf-8"))
+            report = report_path.read_text(encoding="utf-8")
+            self.assertEqual(63, results["cells"])
+            self.assertEqual(567, results["samples"])
+            self.assertEqual(63, len(results["cell_results"]))
+            self.assertEqual(
+                567, sum(cell["samples"] for cell in results["cell_results"])
+            )
+            self.assertTrue(
+                all(
+                    len(cell["sample_sha256"]) == 9
+                    and len(cell["aggregates"]) == 5
+                    for cell in results["cell_results"]
+                )
+            )
+            self.assertIn("# B82 完整性能矩阵报告", report)
+            self.assertIn("完整配置 63/63，原始 iperf3 采样 567/567", report)
+            self.assertEqual(
+                63,
+                sum(
+                    bool(re.match(r"^\| [1-9][0-9]* \|", line))
+                    for line in report.splitlines()
+                ),
+            )
+            self.assertEqual(0o600, results_path.stat().st_mode & 0o777)
+            self.assertEqual(0o600, report_path.stat().st_mode & 0o777)
+
+    def test_report_output_is_exclusive_and_deterministic(self) -> None:
+        reporter = load_reporter()
+        with tempfile.TemporaryDirectory() as raw:
+            path = pathlib.Path(raw) / "report.md"
+            reporter.write_exclusive(path, "中文\n")
+            self.assertEqual("中文\n", path.read_text(encoding="utf-8"))
+            self.assertEqual(0o600, path.stat().st_mode & 0o777)
+            with self.assertRaises(reporter.ReportError):
+                reporter.write_exclusive(path, "changed\n")
 
 
 if __name__ == "__main__":
