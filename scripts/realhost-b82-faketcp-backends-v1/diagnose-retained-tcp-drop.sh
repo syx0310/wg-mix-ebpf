@@ -53,25 +53,36 @@ readonly SERVER_OUT="${EVIDENCE}/tcp-drop-server.stdout.log"
 readonly SERVER_ERR="${EVIDENCE}/tcp-drop-server.stderr.log"
 readonly PCAP_A="${EVIDENCE}/tcp-drop-wg-a.pcap"
 readonly PCAP_B="${EVIDENCE}/tcp-drop-wg-b.pcap"
+readonly PCAP_UNDERLAY_A="${EVIDENCE}/tcp-drop-underlay-a.pcap"
 readonly PCAP_A_LOG="${EVIDENCE}/tcp-drop-wg-a.read.log"
 readonly PCAP_B_LOG="${EVIDENCE}/tcp-drop-wg-b.read.log"
+readonly PCAP_UNDERLAY_A_LOG="${EVIDENCE}/tcp-drop-underlay-a.read.log"
 readonly PCAP_A_STDOUT="${EVIDENCE}/tcp-drop-wg-a.capture.stdout.log"
 readonly PCAP_A_STDERR="${EVIDENCE}/tcp-drop-wg-a.capture.stderr.log"
 readonly PCAP_B_STDOUT="${EVIDENCE}/tcp-drop-wg-b.capture.stdout.log"
 readonly PCAP_B_STDERR="${EVIDENCE}/tcp-drop-wg-b.capture.stderr.log"
+readonly PCAP_UNDERLAY_A_STDOUT="${EVIDENCE}/tcp-drop-underlay-a.capture.stdout.log"
+readonly PCAP_UNDERLAY_A_STDERR="${EVIDENCE}/tcp-drop-underlay-a.capture.stderr.log"
 readonly PRE_LINK_A_LOG="${EVIDENCE}/tcp-drop-pre-link-a.log"
 readonly PRE_LINK_B_LOG="${EVIDENCE}/tcp-drop-pre-link-b.log"
 readonly PRE_ROUTE_A_LOG="${EVIDENCE}/tcp-drop-pre-route-a.log"
 readonly POST_LINK_A_LOG="${EVIDENCE}/tcp-drop-post-link-a.log"
 readonly POST_LINK_B_LOG="${EVIDENCE}/tcp-drop-post-link-b.log"
+readonly MAPS_A_BEFORE="${EVIDENCE}/tcp-drop-maps-a-before.json"
+readonly MAPS_B_BEFORE="${EVIDENCE}/tcp-drop-maps-b-before.json"
+readonly MAPS_A_AFTER="${EVIDENCE}/tcp-drop-maps-a-after.json"
+readonly MAPS_B_AFTER="${EVIDENCE}/tcp-drop-maps-b-after.json"
 readonly OPERATIONS="${EVIDENCE}/tcp-drop-diagnostic.operations.log"
 readonly SUMMARY="${EVIDENCE}/tcp-drop-diagnostic.summary.v1"
 readonly -a OUTPUT_TARGETS=(
   "${TRACE_OUT}" "${TRACE_ERR}" "${CLIENT_OUT}" "${CLIENT_ERR}"
-  "${SERVER_OUT}" "${SERVER_ERR}" "${PCAP_A}" "${PCAP_B}"
-  "${PCAP_A_LOG}" "${PCAP_B_LOG}" "${PCAP_A_STDOUT}" "${PCAP_A_STDERR}"
+  "${SERVER_OUT}" "${SERVER_ERR}" "${PCAP_A}" "${PCAP_B}" "${PCAP_UNDERLAY_A}"
+  "${PCAP_A_LOG}" "${PCAP_B_LOG}" "${PCAP_UNDERLAY_A_LOG}"
+  "${PCAP_A_STDOUT}" "${PCAP_A_STDERR}"
   "${PCAP_B_STDOUT}" "${PCAP_B_STDERR}" "${PRE_LINK_A_LOG}" "${PRE_LINK_B_LOG}"
+  "${PCAP_UNDERLAY_A_STDOUT}" "${PCAP_UNDERLAY_A_STDERR}"
   "${PRE_ROUTE_A_LOG}" "${POST_LINK_A_LOG}" "${POST_LINK_B_LOG}"
+  "${MAPS_A_BEFORE}" "${MAPS_B_BEFORE}" "${MAPS_A_AFTER}" "${MAPS_B_AFTER}"
   "${OPERATIONS}" "${SUMMARY}"
 )
 
@@ -115,7 +126,7 @@ for target in "${OUTPUT_TARGETS[@]}"; do
 done
 unset target
 
-for command_name in bpftrace ip iperf3 ss tcpdump timeout; do
+for command_name in bpftrace bpftool ip iperf3 python3 ss tcpdump timeout; do
   if ! command -v "${command_name}" >/dev/null; then
     printf 'missing_command=%s\n' "${command_name}" >&2
     stop missing-command 69
@@ -153,7 +164,70 @@ log_readonly pre-link-a ip netns exec "${NSA}" ip -s -details link show dev wg0
 log_readonly pre-link-b ip netns exec "${NSB}" ip -s -details link show dev wg0
 log_readonly pre-route-a ip netns exec "${NSA}" ip route get "${TARGET}" from 10.82.10.1
 
-readonly BPFTRACE_PROGRAM='BEGIN { printf("TRACE_READY\\n"); } tracepoint:skb:kfree_skb /args->protocol == 8/ { printf("ts=%llu pid=%d comm=%s location=%s reason=%d\\n", nsecs, pid, comm, ksym(args->location), args->reason); } interval:s:8 { exit(); }'
+capture_runtime_maps() {
+  local role="$1" output="$2" pid_file="${ROOT}/daemon-${role}.pid" netns="${NSA}"
+  local pid expected_netns actual_netns
+  [[ "${role}" == b ]] && netns="${NSB}"
+  [[ -f "${pid_file}" && ! -L "${pid_file}" &&
+    "$(stat -Lc '%u:%g:%a:%h:%F' -- "${pid_file}")" == '0:0:600:1:regular file' ]] || stop daemon-pid-file
+  pid="$(<"${pid_file}")"
+  [[ "${pid}" =~ ^[1-9][0-9]*$ && -d "/proc/${pid}" &&
+    "$(readlink -e -- "/proc/${pid}/exe")" == "${ROOT}/artifacts/wg-mix-ebpf" ]] || stop daemon-process
+  expected_netns="$(stat -Lc '%d:%i' -- "/run/netns/${netns}")"
+  actual_netns="$(stat -Lc '%d:%i' -- "/proc/${pid}/ns/net")"
+  [[ "${actual_netns}" == "${expected_netns}" ]] || stop daemon-netns
+  timeout --signal=TERM --kill-after=2s 10s python3 - "${pid}" "${output}" <<'PY'
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+pid = int(sys.argv[1])
+output = pathlib.Path(sys.argv[2])
+map_ids = set()
+for entry in pathlib.Path(f"/proc/{pid}/fdinfo").iterdir():
+    try:
+        text = entry.read_text(encoding="ascii")
+    except OSError:
+        continue
+    match = re.search(r"^map_id:\s+([1-9][0-9]*)$", text, re.MULTILINE)
+    if match:
+        map_ids.add(int(match.group(1)))
+
+records = []
+for map_id in sorted(map_ids):
+    shown = subprocess.run(
+        ["bpftool", "-j", "map", "show", "id", str(map_id)],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=3,
+    )
+    info = json.loads(shown.stdout)
+    name = str(info.get("name", ""))
+    if name not in {"stats_map", "faketcp_stats_m", "faketcp_session", "faketcp_egress"}:
+        continue
+    dumped = subprocess.run(
+        ["bpftool", "-j", "map", "dump", "id", str(map_id)],
+        check=True,
+        text=True,
+        capture_output=True,
+        timeout=3,
+    )
+    records.append({"id": map_id, "info": info, "entries": json.loads(dumped.stdout)})
+
+names = {str(record["info"].get("name", "")) for record in records}
+if not {"stats_map", "faketcp_stats_m"}.issubset(names):
+    raise SystemExit(f"missing required stats maps: found={sorted(names)}")
+output.write_text(json.dumps(records, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+PY
+}
+
+capture_runtime_maps a "${MAPS_A_BEFORE}"
+capture_runtime_maps b "${MAPS_B_BEFORE}"
+
+readonly BPFTRACE_PROGRAM='BEGIN { printf("TRACE_READY\\n"); } tracepoint:skb:kfree_skb /args->protocol == 2048/ { printf("ts=%llu pid=%d comm=%s location=%s reason=%d\\n", nsecs, pid, comm, ksym(args->location), args->reason); } interval:s:8 { exit(); }'
 
 timeout --signal=TERM --kill-after=2s 10s bpftrace -q -e "${BPFTRACE_PROGRAM}" \
   >"${TRACE_OUT}" 2>"${TRACE_ERR}" &
@@ -182,6 +256,10 @@ timeout --signal=TERM --kill-after=1s 9s ip netns exec "${NSB}" \
   tcpdump -U -nn -i wg0 -w "${PCAP_B}" >"${PCAP_B_STDOUT}" \
   2>"${PCAP_B_STDERR}" &
 pcap_b_pid=$!
+timeout --signal=TERM --kill-after=1s 9s ip netns exec "${NSA}" \
+  tcpdump -U -nn -i under0 -w "${PCAP_UNDERLAY_A}" >"${PCAP_UNDERLAY_A_STDOUT}" \
+  2>"${PCAP_UNDERLAY_A_STDERR}" &
+pcap_underlay_a_pid=$!
 
 timeout --signal=TERM --kill-after=1s 9s ip netns exec "${NSB}" \
   iperf3 -s -1 -p "${PORT}" -J >"${SERVER_OUT}" 2>"${SERVER_ERR}" &
@@ -203,9 +281,11 @@ if ((server_ready != 1)); then
   if wait "${server_pid}"; then server_rc=0; else server_rc=$?; fi
   if wait "${pcap_a_pid}"; then pcap_a_rc=0; else pcap_a_rc=$?; fi
   if wait "${pcap_b_pid}"; then pcap_b_rc=0; else pcap_b_rc=$?; fi
+  if wait "${pcap_underlay_a_pid}"; then pcap_underlay_a_rc=0; else pcap_underlay_a_rc=$?; fi
   if wait "${trace_pid}"; then trace_rc=0; else trace_rc=$?; fi
-  printf 'server_rc=%s pcap_a_rc=%s pcap_b_rc=%s trace_rc=%s\n' \
-    "${server_rc}" "${pcap_a_rc}" "${pcap_b_rc}" "${trace_rc}" >>"${OPERATIONS}"
+  printf 'server_rc=%s pcap_a_rc=%s pcap_b_rc=%s pcap_underlay_a_rc=%s trace_rc=%s\n' \
+    "${server_rc}" "${pcap_a_rc}" "${pcap_b_rc}" "${pcap_underlay_a_rc}" \
+    "${trace_rc}" >>"${OPERATIONS}"
   stop server-not-ready 1
 fi
 
@@ -225,21 +305,27 @@ printf 'timestamp=%s event=finish phase=client rc=%s\n' \
 if wait "${server_pid}"; then server_rc=0; else server_rc=$?; fi
 if wait "${pcap_a_pid}"; then pcap_a_rc=0; else pcap_a_rc=$?; fi
 if wait "${pcap_b_pid}"; then pcap_b_rc=0; else pcap_b_rc=$?; fi
+if wait "${pcap_underlay_a_pid}"; then pcap_underlay_a_rc=0; else pcap_underlay_a_rc=$?; fi
 if wait "${trace_pid}"; then trace_rc=0; else trace_rc=$?; fi
 
 printf 'timestamp=%s event=finish phase=server rc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${server_rc}" >>"${OPERATIONS}"
 printf 'timestamp=%s event=finish phase=pcap-a rc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${pcap_a_rc}" >>"${OPERATIONS}"
 printf 'timestamp=%s event=finish phase=pcap-b rc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${pcap_b_rc}" >>"${OPERATIONS}"
+printf 'timestamp=%s event=finish phase=pcap-underlay-a rc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${pcap_underlay_a_rc}" >>"${OPERATIONS}"
 printf 'timestamp=%s event=finish phase=kfree-trace rc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${trace_rc}" >>"${OPERATIONS}"
 
-[[ "${pcap_a_rc}" -eq 124 && "${pcap_b_rc}" -eq 124 && "${trace_rc}" -eq 0 ]] || stop child-status 1
+[[ "${pcap_a_rc}" -eq 124 && "${pcap_b_rc}" -eq 124 &&
+  "${pcap_underlay_a_rc}" -eq 124 && "${trace_rc}" -eq 0 ]] || stop child-status 1
 tcpdump -nn -tttt -vvv -r "${PCAP_A}" >"${PCAP_A_LOG}" 2>&1
 tcpdump -nn -tttt -vvv -r "${PCAP_B}" >"${PCAP_B_LOG}" 2>&1
+tcpdump -nn -tttt -vvv -r "${PCAP_UNDERLAY_A}" >"${PCAP_UNDERLAY_A_LOG}" 2>&1
 log_readonly post-link-a ip netns exec "${NSA}" ip -s -details link show dev wg0
 log_readonly post-link-b ip netns exec "${NSB}" ip -s -details link show dev wg0
+capture_runtime_maps a "${MAPS_A_AFTER}"
+capture_runtime_maps b "${MAPS_B_AFTER}"
 
-printf 'format=wg-mix-ebpf-retained-tcp-drop-diagnostic-v1\nrun_id=%s\nclient_rc=%s\nserver_rc=%s\ntrace_rc=%s\npcap_a_rc=%s\npcap_b_rc=%s\ncompleted=%s\n' \
+printf 'format=wg-mix-ebpf-retained-tcp-drop-diagnostic-v1\nrun_id=%s\nclient_rc=%s\nserver_rc=%s\ntrace_rc=%s\npcap_a_rc=%s\npcap_b_rc=%s\npcap_underlay_a_rc=%s\ncompleted=%s\n' \
   "${RUN_ID}" "${client_rc}" "${server_rc}" "${trace_rc}" "${pcap_a_rc}" \
-  "${pcap_b_rc}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${SUMMARY}"
+  "${pcap_b_rc}" "${pcap_underlay_a_rc}" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >"${SUMMARY}"
 printf 'DIAGNOSTIC_COMPLETE run_id=%s client_rc=%s server_rc=%s\n' \
   "${RUN_ID}" "${client_rc}" "${server_rc}"

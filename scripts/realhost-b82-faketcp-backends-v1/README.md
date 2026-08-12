@@ -103,12 +103,13 @@ For a retained first-cell TCP-connect failure, the versioned
 `diagnose-retained-tcp-drop.sh` has separate `plan` and `run` modes. It is
 deliberately restricted to the exact one-WG/TCX/kfunc/no-XOR/GSO-off cell and
 requires both the diagnostic source commit and the retained run commit. The
-run captures both WireGuard interfaces plus the kernel `skb:kfree_skb`
-tracepoint while reproducing one bounded iperf TCP connection. Every child is
-wrapped by a 10-second-or-shorter timeout, BPF ownership is unpinned and
-process-scoped, and the only persistent writes are new `tcp-drop-*` files in
-the already-owned evidence directory. It performs no cleanup and never runs
-from an error or signal trap.
+run captures both WireGuard interfaces, the sending underlay, process-owned
+stats/session/admission maps before and after traffic, and the kernel
+`skb:kfree_skb` tracepoint while reproducing one bounded iperf TCP connection.
+Every child is wrapped by a 10-second-or-shorter timeout, BPF ownership is
+unpinned and process-scoped, and the only persistent writes are new
+`tcp-drop-*` files in the already-owned evidence directory. It performs no
+cleanup and never runs from an error or signal trap.
 
 Root writes are bounded to the matrix/cell evidence roots (including per-cell
 `artifacts/` and `build-cache/` directories on `/var/tmp`), the staged
