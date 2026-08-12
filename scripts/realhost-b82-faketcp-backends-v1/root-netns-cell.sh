@@ -7,6 +7,7 @@ set -Eeuo pipefail
 
 readonly SAFE_PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 readonly RUN_PARENT='/var/tmp/wg-mix-ebpf-faketcp-backends-v1'
+readonly NETNS_PARENT='/run/netns'
 readonly SHARED_RUN='/run/wg-mix-ebpf'
 readonly SHARED_VAR='/var/lib/wg-mix-ebpf'
 readonly SHARED_MAINTENANCE='/run/.wg-mix-ebpf-daemon.lease.maintenance'
@@ -53,18 +54,22 @@ endpoint_child() {
   local artifacts="${root}/artifacts"
   local run="${endpoint}/run" var="${endpoint}/var" gate="${endpoint}/maintenance.gate"
   local netns="f${run_id}${role}" pin="/sys/fs/bpf/wg-mix-ebpf-faketcp-${run_id}-${role}"
+  local netns_target="${NETNS_PARENT}/${netns}" expected_netns actual_netns
   [[ -d "${root}" && ! -L "${root}" && -f "${root}/owner.v1" &&
     "$(<"${root}/owner.v1")" == wg-mix-ebpf-faketcp-backends-v1:${run_id}:* ]] || return 79
   for path in "${endpoint}" "${run}" "${var}"; do
     [[ -d "${path}" && ! -L "${path}" && "$(stat -Lc '%u:%g:%a:%F' -- "${path}")" == '0:0:700:directory' ]] || return 79
   done
   [[ -f "${gate}" && ! -L "${gate}" && "$(stat -Lc '%u:%g:%a:%h' -- "${gate}")" == '0:0:600:1' ]] || return 79
-  ip netns list | awk '{print $1}' | grep -Fxq -- "${netns}" || return 79
+  [[ -e "${netns_target}" && ! -L "${netns_target}" ]] || return 79
+  expected_netns="$(stat -Lc '%d:%i' -- "${netns_target}")" || return 79
+  actual_netns="$(stat -Lc '%d:%i' -- /proc/self/ns/net)" || return 79
+  [[ "${actual_netns}" == "${expected_netns}" ]] || return 79
   mount --bind "${run}" "${SHARED_RUN}"
   mount --bind "${var}" "${SHARED_VAR}"
   mount --bind "${gate}" "${SHARED_MAINTENANCE}"
   mount -t bpf -o mode=0700 bpf /sys/fs/bpf
-  exec ip netns exec "${netns}" env -i PATH="${SAFE_PATH}" LC_ALL=C \
+  exec env -i PATH="${SAFE_PATH}" LC_ALL=C \
     WG_MIX_EBPF_OBJECT="${artifacts}/wg_mix_tc.o" \
     WG_MIX_EBPF_FAKETCP_OBJECT="${artifacts}/wg_mix_faketcp_experimental.o" \
     WG_MIX_EBPF_FAKETCP_LEGACY_515_OBJECT="${artifacts}/wg_mix_faketcp_legacy_515.o" \
@@ -666,10 +671,12 @@ for ((index=0; index<WG_COUNT; index++)); do
 done
 
 start_daemon() {
-  local role="$1" log_role pid
+  local role="$1" log_role pid netns
   log_role="${role}"
-  /usr/bin/env -i PATH="${SAFE_PATH}" LC_ALL=C unshare --mount --propagation private \
-    /bin/bash -p "$0" endpoint --source "${SOURCE}" --run-id "${RUN_ID}" --role "${role}" \
+  netns="${NSA}"; [[ "${role}" == b ]] && netns="${NSB}"
+  /usr/bin/env -i PATH="${SAFE_PATH}" LC_ALL=C ip netns exec "${netns}" \
+    unshare --mount --propagation private /bin/bash -p "$0" endpoint \
+    --source "${SOURCE}" --run-id "${RUN_ID}" --role "${role}" \
     >"${EVIDENCE}/daemon-${log_role}.stdout.log" 2>"${EVIDENCE}/daemon-${log_role}.stderr.log" &
   pid=$!
   printf '%s\n' "${pid}" >"${ROOT}/daemon-${role}.pid"

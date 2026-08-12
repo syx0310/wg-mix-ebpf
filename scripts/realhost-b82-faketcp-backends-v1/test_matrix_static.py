@@ -725,13 +725,262 @@ class StaticMatrixTest(unittest.TestCase):
         )
         self.assertFalse(run_root.exists(), "pre-root-gate execution mutated run root")
 
+    def test_endpoint_enters_netns_before_private_mount_namespace(self) -> None:
+        endpoint = self.netns[
+            self.netns.index("endpoint_child() {") :
+            self.netns.index('\n\nif [[ "${1-}" == endpoint')
+        ]
+        start = self.netns[
+            self.netns.index("start_daemon() {") :
+            self.netns.index("\n\nwait_active() {")
+        ]
+        ordered = start + "\n" + endpoint
+        tokens = (
+            'ip netns exec "${netns}"',
+            "unshare --mount --propagation private",
+            'mount --bind "${run}" "${SHARED_RUN}"',
+            'mount -t bpf -o mode=0700 bpf /sys/fs/bpf',
+            'exec env -i PATH="${SAFE_PATH}" LC_ALL=C',
+        )
+        positions = [ordered.index(token) for token in tokens]
+        self.assertEqual(positions, sorted(positions))
+        self.assertIn(
+            'expected_netns="$(stat -Lc \'%d:%i\' -- "${netns_target}")"',
+            endpoint,
+        )
+        self.assertIn(
+            'actual_netns="$(stat -Lc \'%d:%i\' -- /proc/self/ns/net)"',
+            endpoint,
+        )
+        self.assertIn(
+            '[[ "${actual_netns}" == "${expected_netns}" ]] || return 79',
+            endpoint,
+        )
+        self.assertNotIn("ip netns exec", endpoint)
+
+    def test_endpoint_launch_order_executes_unprivileged_with_stubs(self) -> None:
+        endpoint_function = self.netns[
+            self.netns.index("endpoint_child() {") :
+            self.netns.index('\n\nif [[ "${1-}" == endpoint')
+        ]
+        start_function = self.netns[
+            self.netns.index("start_daemon() {") :
+            self.netns.index("\n\nwait_active() {")
+        ]
+        run_id = "1234abcd"
+
+        with tempfile.TemporaryDirectory() as raw:
+            temporary = pathlib.Path(raw)
+            binary_dir = temporary / "bin"
+            binary_dir.mkdir()
+            events = temporary / "events.log"
+            run_parent = temporary / "runs"
+            root = run_parent / run_id
+            endpoint = root / "endpoint-a"
+            run = endpoint / "run"
+            var = endpoint / "var"
+            artifacts = root / "artifacts"
+            evidence = root / "evidence"
+            netns_parent = temporary / "netns"
+            shared_run = temporary / "shared-run"
+            shared_var = temporary / "shared-var"
+            shared_gate = temporary / "shared-gate"
+            for directory in (
+                run,
+                var,
+                artifacts,
+                evidence,
+                netns_parent,
+                shared_run,
+                shared_var,
+            ):
+                directory.mkdir(parents=True, exist_ok=True)
+                directory.chmod(0o700)
+            (root / "owner.v1").write_text(
+                f"wg-mix-ebpf-faketcp-backends-v1:{run_id}:test\n",
+                encoding="ascii",
+            )
+            gate = endpoint / "maintenance.gate"
+            gate.touch()
+            gate.chmod(0o600)
+            shared_gate.touch()
+            (netns_parent / f"f{run_id}a").touch()
+
+            def write_stub(name: str, body: str) -> pathlib.Path:
+                path = binary_dir / name
+                path.write_text(body, encoding="utf-8")
+                path.chmod(0o700)
+                return path
+
+            quoted_events = shlex.quote(str(events))
+            write_stub(
+                "ip",
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/sh
+                    set -eu
+                    [ "$1" = netns ] && [ "$2" = exec ] && [ "$3" = "f{run_id}a" ]
+                    printf '%s\n' netns-exec >>{quoted_events}
+                    shift 3
+                    exec "$@"
+                    """
+                ),
+            )
+            write_stub(
+                "unshare",
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/sh
+                    set -eu
+                    [ "$1" = --mount ] && [ "$2" = --propagation ] && [ "$3" = private ]
+                    printf '%s\n' unshare >>{quoted_events}
+                    shift 3
+                    exec "$@"
+                    """
+                ),
+            )
+            write_stub(
+                "stat",
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/sh
+                    set -eu
+                    format=$2
+                    target=$4
+                    case "$format:$target" in
+                      '%d:%i:/proc/self/ns/net')
+                        printf '%s\n' netns-verify >>{quoted_events}
+                        printf '%s\n' '101:202'
+                        ;;
+                      '%d:%i:'*) printf '%s\n' '101:202' ;;
+                      '%u:%g:%a:%F:'*) printf '%s\n' '0:0:700:directory' ;;
+                      '%u:%g:%a:%h:'*) printf '%s\n' '0:0:600:1' ;;
+                      *) exit 79 ;;
+                    esac
+                    """
+                ),
+            )
+            write_stub(
+                "mount",
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/sh
+                    set -eu
+                    if [ "$1" = --bind ]; then
+                      case "$2" in
+                        {shlex.quote(str(run))}) event=bind-run ;;
+                        {shlex.quote(str(var))}) event=bind-var ;;
+                        {shlex.quote(str(gate))}) event=bind-gate ;;
+                        *) exit 79 ;;
+                      esac
+                    elif [ "$*" = '-t bpf -o mode=0700 bpf /sys/fs/bpf' ]; then
+                      event=mount-bpffs
+                    else
+                      exit 79
+                    fi
+                    printf '%s\n' "$event" >>{quoted_events}
+                    """
+                ),
+            )
+            write_stub(
+                "env",
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/sh
+                    set -eu
+                    [ "$1" = -i ]
+                    shift
+                    while [ "$#" -gt 0 ]; do
+                      case "$1" in
+                        *=*) export "$1"; shift ;;
+                        *) break ;;
+                      esac
+                    done
+                    printf '%s\n' daemon-env >>{quoted_events}
+                    exec "$@"
+                    """
+                ),
+            )
+            daemon = artifacts / "wg-mix-ebpf"
+            daemon.write_text(
+                textwrap.dedent(
+                    f"""\
+                    #!/bin/sh
+                    printf 'daemon-exec pid=%s\n' "$$" >>{quoted_events}
+                    """
+                ),
+                encoding="utf-8",
+            )
+            daemon.chmod(0o700)
+
+            harness = temporary / "launch-harness.sh"
+            harness.write_text(
+                "\n".join(
+                    (
+                        "#!/bin/bash",
+                        "set -Eeuo pipefail",
+                        "validate_run_id() { [[ \"$1\" =~ ^[0-9a-f]{8}$ ]]; }",
+                        f"SAFE_PATH={shlex.quote(str(binary_dir))}:/usr/bin:/bin",
+                        f"RUN_PARENT={shlex.quote(str(run_parent))}",
+                        f"NETNS_PARENT={shlex.quote(str(netns_parent))}",
+                        f"SHARED_RUN={shlex.quote(str(shared_run))}",
+                        f"SHARED_VAR={shlex.quote(str(shared_var))}",
+                        f"SHARED_MAINTENANCE={shlex.quote(str(shared_gate))}",
+                        endpoint_function,
+                        'if [[ "${1-}" == endpoint ]]; then endpoint_child "$@"; exit $?; fi',
+                        start_function,
+                        f"SOURCE={shlex.quote(PLAN_SOURCE)}",
+                        f"RUN_ID={run_id}",
+                        f"ROOT={shlex.quote(str(root))}",
+                        f"EVIDENCE={shlex.quote(str(evidence))}",
+                        f"NSA=f{run_id}a",
+                        f"NSB=f{run_id}b",
+                        "DAEMON_A_PID=''",
+                        "DAEMON_B_PID=''",
+                        "start_daemon a",
+                        'wait "${DAEMON_A_PID}"',
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                ["/bin/bash", "-p", str(harness)],
+                text=True,
+                capture_output=True,
+                env={"PATH": "/usr/bin:/bin", "LC_ALL": "C"},
+            )
+            self.assertEqual(
+                completed.returncode,
+                0,
+                f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+            )
+            observed = events.read_text(encoding="ascii").splitlines()
+            self.assertEqual(
+                [event.split()[0] for event in observed],
+                [
+                    "netns-exec",
+                    "unshare",
+                    "netns-verify",
+                    "bind-run",
+                    "bind-var",
+                    "bind-gate",
+                    "mount-bpffs",
+                    "daemon-env",
+                    "daemon-exec",
+                ],
+            )
+            daemon_pid = (root / "daemon-a.pid").read_text(encoding="ascii").strip()
+            self.assertEqual(observed[-1], f"daemon-exec pid={daemon_pid}")
+
     def test_nounset_dependent_assignments_are_sequenced(self) -> None:
         for required in (
             'readonly ROOT="${RUN_PARENT}/${RUN_ID}"\nreadonly EVIDENCE="${ROOT}/evidence"',
             'local role="$1" pid_file pid netns expected_inode actual_inode status\n'
             '  local process_state wait_status\n'
             '  pid_file="${ROOT}/daemon-${role}.pid"',
-            'local role="$1" log_role pid\n  log_role="${role}"',
+            'local role="$1" log_role pid netns\n  log_role="${role}"',
         ):
             self.assertIn(required, self.netns)
         self.assertNotRegex(

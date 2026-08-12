@@ -26,6 +26,13 @@ creates and proves the topology, then returns `PASS_READY_FOR_RESTORE` without
 cleaning; `restore` removes exact run-owned resources. Keeping these roles
 separate avoids two cleanup owners or a hidden second execution path.
 
+Each daemon enters its exact endpoint network namespace before creating its
+private mount namespace. The endpoint child proves that `/proc/self/ns/net`
+matches the run-derived `/run/netns/<name>` mount, then bind-mounts its private
+run/state/gate paths, mounts its private bpffs, and directly execs the daemon.
+No second `ip netns exec` occurs after the bpffs mount, so the namespace helper
+cannot replace `/sys` and hide the daemon's private bpffs view.
+
 Reviewed entry argv (replace placeholders only with the staged commit and an
 eight-hex matrix ID):
 
