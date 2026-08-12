@@ -125,7 +125,9 @@ stats/session/admission maps before and after traffic, and the kernel
 `skb:kfree_skb`, `skb:consume_skb`, `net_dev_queue`, `net_dev_start_xmit`, and
 `net_dev_xmit` tracepoints while reproducing one bounded iperf TCP connection.
 The three capture processes must each report that they are listening before
-the client starts. Traffic, capture, map, and evidence-reading subprocesses
+the client starts. The trace is valid whether its in-program interval exits
+cleanly or the enclosing 10-second bound terminates it with status 124.
+Traffic, capture, map, and evidence-reading subprocesses
 have 10-second-or-shorter timeout bounds, BPF ownership is
 unpinned and process-scoped, and the only persistent writes are new
 `tcp-drop-*` files in the already-owned evidence directory. It performs no

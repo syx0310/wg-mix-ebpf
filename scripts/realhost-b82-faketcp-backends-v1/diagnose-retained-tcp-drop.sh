@@ -369,7 +369,8 @@ printf 'timestamp=%s event=finish phase=pcap-underlay-a rc=%s\n' "$(date -u +%Y-
 printf 'timestamp=%s event=finish phase=packet-trace rc=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${trace_rc}" >>"${OPERATIONS}"
 
 [[ "${pcap_a_rc}" -eq 124 && "${pcap_b_rc}" -eq 124 &&
-  "${pcap_underlay_a_rc}" -eq 124 && "${trace_rc}" -eq 0 ]] || stop child-status 1
+  "${pcap_underlay_a_rc}" -eq 124 &&
+  ( "${trace_rc}" -eq 0 || "${trace_rc}" -eq 124 ) ]] || stop child-status 1
 log_readonly wg-a.read tcpdump -nn -tttt -vvv -r "${PCAP_A}"
 log_readonly wg-b.read tcpdump -nn -tttt -vvv -r "${PCAP_B}"
 log_readonly underlay-a.read tcpdump -nn -tttt -vvv -r "${PCAP_UNDERLAY_A}"

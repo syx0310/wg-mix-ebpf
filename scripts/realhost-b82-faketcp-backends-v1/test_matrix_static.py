@@ -1272,6 +1272,7 @@ class StaticMatrixTest(unittest.TestCase):
             'phase=packet-trace',
             r'printf("TRACE_READY\n");',
             'END { clear(@tracked); }',
+            '( "${trace_rc}" -eq 0 || "${trace_rc}" -eq 124 )',
         ):
             self.assertIn(required, diagnostic)
         self.assertNotIn(r'TRACE_READY\\n', diagnostic)
