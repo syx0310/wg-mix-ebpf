@@ -281,6 +281,25 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
         self.assertLess(active_a, start_b)
         self.assertLess(start_b, active_b)
 
+    def test_failure_restore_stops_endpoint_namespaces_serially(self) -> None:
+        runner = self.runner
+        restore = runner[
+            runner.index("restore_retained_run()") : runner.index(
+                'if [[ "${operation}" == "restore" ]]'
+            )
+        ]
+        self.assertIn('for netns in "${NSA}" "${NSB}" "${NSR}"; do', restore)
+        first_loop = restore.index('for netns in "${NSA}" "${NSB}" "${NSR}"; do')
+        term = restore.index('signal_namespace_processes TERM "${netns}"', first_loop)
+        wait = restore.index('wait_namespace_empty "${netns}" 300', term)
+        self.assertLess(term, wait)
+        self.assertNotIn(
+            'for netns in "${NSA}" "${NSR}" "${NSB}"; do\n'
+            '    namespace_present "${netns}" || continue\n'
+            '    signal_namespace_processes TERM',
+            restore,
+        )
+
     def test_runner_supports_all_attachment_checksum_artifact_branches(self) -> None:
         runner = self.runner
         for fragment in (

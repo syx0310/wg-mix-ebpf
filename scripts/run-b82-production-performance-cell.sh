@@ -612,12 +612,12 @@ restore_retained_run() {
     return 79
   }
   : >"${EVIDENCE}/restore-operations.log"
-  for netns in "${NSA}" "${NSR}" "${NSB}"; do
+  # Endpoint daemons share the host lifecycle maintenance gate. Stop and reap
+  # them one at a time so graceful shutdown cannot contend for that gate.
+  # The router has no daemon and is stopped last.
+  for netns in "${NSA}" "${NSB}" "${NSR}"; do
     namespace_present "${netns}" || continue
     signal_namespace_processes TERM "${netns}"
-  done
-  for netns in "${NSA}" "${NSR}" "${NSB}"; do
-    namespace_present "${netns}" || continue
     if ! wait_namespace_empty "${netns}" 300; then
       signal_namespace_processes KILL "${netns}"
       wait_namespace_empty "${netns}" 50 || {
@@ -627,7 +627,7 @@ restore_retained_run() {
       }
     fi
   done
-  for netns in "${NSA}" "${NSR}" "${NSB}"; do
+  for netns in "${NSA}" "${NSB}" "${NSR}"; do
     namespace_present "${netns}" || continue
     restore_log netns-delete ip netns delete "${netns}"
     ip netns delete "${netns}"
