@@ -81,7 +81,7 @@ func TestFakeTCPXDPPacketPointersDoNotCrossHelperBoundaries(t *testing.T) {
 	afterPolicy := body[policyLookup:]
 	for _, required := range []string{
 		"xdp, l3->l3_off, new_ip, old_tcp, l3, managed_listener",
-		"faketcp_close_checksums_valid(new_ip, old_tcp)",
+		"faketcp_ipv4_tcp_control_checksums_valid(new_ip, old_tcp)",
 		"bpf_ntohs(old_tcp->window)",
 	} {
 		if !strings.Contains(afterPolicy, required) {

@@ -1157,7 +1157,7 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 	canonical := strings.Index(xdp, "flags != (FAKETCP_FLAG_RST | FAKETCP_FLAG_ACK)")
 	sequence := strings.Index(xdp, "seq != admission->decision.close.rx_sequence")
 	window := strings.Index(xdp, "bpf_ntohs(old_tcp->window) != admission->session_projection.window")
-	checksum := strings.Index(xdp, "faketcp_close_checksums_valid(new_ip, old_tcp)")
+	checksum := strings.Index(xdp, "faketcp_ipv4_tcp_control_checksums_valid(new_ip, old_tcp)")
 	capture := strings.Index(xdp, "faketcp_capture_close_packet(")
 	if snapshot < 0 || closeDecision < 0 || fixedIPv4Gate < 0 || checkpointCall < 0 ||
 		closePath < 0 || canonical < 0 || sequence < 0 || window < 0 || checksum < 0 || capture < 0 ||
@@ -1200,7 +1200,7 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 		t.Fatal("BPF close validation must never become session-deletion authority")
 	}
 
-	checksumStart := strings.Index(text, "faketcp_close_checksums_valid(const struct iphdr *iph")
+	checksumStart := strings.Index(text, "faketcp_ipv4_tcp_control_checksums_valid(const struct iphdr *iph")
 	captureStart := strings.Index(text, "faketcp_capture_close_packet(struct xdp_md *xdp")
 	if checksumStart < 0 || captureStart < 0 || checksumStart >= captureStart {
 		t.Fatal("canonical close checksum and capture helpers are missing")

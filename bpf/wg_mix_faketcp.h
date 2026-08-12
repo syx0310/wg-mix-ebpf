@@ -3590,14 +3590,16 @@ static __always_inline __u8 faketcp_event_type(__u8 flags)
 	return FAKETCP_EVENT_ACK;
 }
 
-// Close controls are deliberately canonical and payload-free. Validate both
-// checksums in XDP before spending control-event budget; userspace repeats the
-// validation against a fresh complete-value snapshot before teardown
-// authority is granted. A mathematically valid zero TCP checksum field is
-// accepted because only the complete one's-complement residual is authoritative.
+// FakeTCP controls are deliberately canonical and payload-free. Validate both
+// checksums before XDP spends control-event budget and before TC lets an exact
+// userspace-generated control packet bypass the managed UDP transform. A
+// mathematically valid zero TCP checksum field is accepted because only the
+// complete one's-complement residual is authoritative. Userspace independently
+// repeats this validation against a fresh complete-value snapshot before
+// teardown authority is granted.
 static __always_inline int
-faketcp_close_checksums_valid(const struct iphdr *iph,
-			      const struct tcphdr *tcp)
+faketcp_ipv4_tcp_control_checksums_valid(const struct iphdr *iph,
+					 const struct tcphdr *tcp)
 {
 	struct faketcp_ipv4_pseudo_header pseudo = {
 		.source = iph->saddr,
@@ -4163,7 +4165,7 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 			inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 			return XDP_DROP;
 		}
-		if (!faketcp_close_checksums_valid(new_ip, old_tcp)) {
+		if (!faketcp_ipv4_tcp_control_checksums_valid(new_ip, old_tcp)) {
 			inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
 			return XDP_DROP;
 		}

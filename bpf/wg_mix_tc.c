@@ -1775,6 +1775,132 @@ static __always_inline int prepare_xor_context_by_id(struct __sk_buff *skb,
 
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
 #include "wg_mix_faketcp.h"
+
+// Raw userspace FakeTCP controls deliberately reuse the WireGuard fwmark so
+// policy routing selects the exact underlay instead of recursing through the
+// tunnel. That mark also sends them through this managed TC hook. Authorize
+// only the canonical 40-byte packet emitted by MarshalIPv4TCPControl and bind
+// it to the current rule, generation, WireGuard and an event/session already
+// admitted by this exact collection. Every other managed TCP packet remains a
+// fail-closed miss; ordinary UDP continues through the normal transform.
+static __noinline int faketcp_authorize_userspace_control(
+	struct __sk_buff *skb, __u64 generation,
+	struct faketcp_runtime_scratch *scratch)
+{
+	struct faketcp_xdp_ipv4_tcp_snapshot *headers;
+	struct faketcp_control_flow_key flow_key = {};
+	struct faketcp_control_flow_value *flow;
+	struct faketcp_session_value *session;
+	struct faketcp_session_snapshot *session_snapshot;
+	struct faketcp_runtime_identity_value *identity;
+	struct egress_rule_key rule_key = {};
+	struct egress_rule_value *rule;
+	void *data = (void *)(long)skb->data;
+	void *data_end = (void *)(long)skb->data_end;
+	struct iphdr *iph;
+	__u64 network_off = 0;
+	__u16 link_protocol = 0;
+	__u16 fragment;
+	__u8 ip_protocol;
+	__u8 flags;
+	int rc;
+
+	if (!scratch)
+		return -1;
+	rc = parse_link(skb, data, data_end, &network_off, &link_protocol,
+			generation);
+	if (rc != PARSE_OK || link_protocol != bpf_htons(ETH_P_IP))
+		return 0;
+	iph = data + network_off;
+	if ((void *)(iph + 1) > data_end)
+		return 0;
+	ip_protocol = iph->protocol;
+	if (ip_protocol != IPPROTO_TCP)
+		return 0;
+	if (skb->gso_segs || skb->gso_size || network_off > skb->len ||
+	    sizeof(*headers) != skb->len - network_off)
+		return -1;
+
+	headers = &scratch->ingress.headers;
+	__builtin_memset(headers, 0, sizeof(*headers));
+	if (bpf_skb_load_bytes(skb, network_off, headers,
+			       sizeof(*headers)) < 0)
+		return -1;
+	fragment = bpf_ntohs(headers->ip.frag_off);
+	flags = faketcp_tcp_flags(&headers->tcp);
+	if (headers->ip.version != 4 ||
+	    headers->ip.ihl != sizeof(headers->ip) / 4 ||
+	    headers->ip.tos != 0 || headers->ip.id != 0 ||
+	    headers->ip.ttl != 64 || headers->ip.protocol != IPPROTO_TCP ||
+	    (fragment & (IP_RESERVED | IP_MF | IP_OFFSET)) ||
+	    bpf_ntohs(headers->ip.tot_len) != sizeof(*headers) ||
+	    headers->tcp.doff != sizeof(headers->tcp) / 4 ||
+	    headers->tcp.res1 != 0 || headers->tcp.urg_ptr != 0 ||
+	    headers->tcp.source == 0 || headers->tcp.dest == 0 ||
+	    headers->tcp.window == 0 ||
+	    (flags != FAKETCP_FLAG_SYN &&
+	     flags != (FAKETCP_FLAG_SYN | FAKETCP_FLAG_ACK) &&
+	     flags != FAKETCP_FLAG_ACK) ||
+	    !faketcp_ipv4_tcp_control_checksums_valid(&headers->ip,
+						 &headers->tcp))
+		return -1;
+
+	rule_key = (struct egress_rule_key){
+		.generation = generation,
+		.fwmark = skb->mark,
+		.underlay_index = skb->ifindex,
+		.source_port = bpf_ntohs(headers->tcp.source),
+		.family = FAMILY_IPV4,
+	};
+	rule = bpf_map_lookup_elem(&egress_rule_map, &rule_key);
+	if (!rule || rule->generation != generation) {
+		rule_key.underlay_index = UNDERLAY_WILDCARD;
+		rule = bpf_map_lookup_elem(&egress_rule_map, &rule_key);
+	}
+	if (!rule || rule->generation != generation ||
+	    rule->action != ACTION_REWRITE ||
+	    rule->transport_mode != TRANSPORT_FAKETCP || rule->wg_id == 0)
+		return -1;
+
+	flow_key.session = (struct faketcp_session_key){
+		.generation = generation,
+		.local_ipv4 = headers->ip.saddr,
+		.remote_ipv4 = headers->ip.daddr,
+		.underlay_index = skb->ifindex,
+		.local_port = bpf_ntohs(headers->tcp.source),
+		.remote_port = bpf_ntohs(headers->tcp.dest),
+		.wg_id = rule->wg_id,
+	};
+	flow_key.wg_id = rule->wg_id;
+	if (!faketcp_session_key_valid(&flow_key.session))
+		return -1;
+
+	// ACK controls (handshake completion and keepalive) require the exact
+	// established session, including this runtime incarnation. The header
+	// scratch may now be overwritten by the mutually exclusive TC snapshot.
+	if (flags == FAKETCP_FLAG_ACK) {
+		session = bpf_map_lookup_elem(&faketcp_session_map,
+					      &flow_key.session);
+		session_snapshot = &scratch->tc.session_snapshot;
+		if (!faketcp_session_snapshot_established(
+			    session, generation, session_snapshot))
+			return -1;
+		identity = faketcp_runtime_identity(generation);
+		return identity && faketcp_incarnations_equal(
+			identity->incarnation,
+			session_snapshot->authority.runtime_incarnation) ? 1 : -1;
+	}
+
+	// Initial/retry SYN is authorized by the captured WireGuard packet that
+	// created NEED_HANDSHAKE. SYN+ACK is authorized only by the admitted peer
+	// SYN. The LRU entry is a hint written solely after policy admission; its
+	// absence fails closed and never allocates packet-controlled state here.
+	flow_key.event_type = flags == FAKETCP_FLAG_SYN ?
+		FAKETCP_EVENT_NEED_HANDSHAKE : FAKETCP_EVENT_SYN;
+	flow = bpf_map_lookup_elem(&faketcp_control_flow_map, &flow_key);
+	return flow && flow->generation == generation &&
+	       flow->last_event_nanos != 0 ? 1 : -1;
+}
 #endif
 
 static __always_inline int run_xor_egress_segment(struct __sk_buff *skb, __u32 segment)
@@ -1980,6 +2106,14 @@ int wg_mix_egress(struct __sk_buff *skb)
 	if (gso_seen)
 		inc_stat(STAT_EGRESS_GSO_MANAGED_SEEN);
 #ifdef WG_MIX_EXPERIMENTAL_FAKETCP
+	rc = faketcp_authorize_userspace_control(
+		skb, generation, faketcp_scratch);
+	if (rc > 0)
+		return TC_ACT_OK;
+	if (rc < 0) {
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
+		return TC_ACT_SHOT;
+	}
 	rc = faketcp_parse_tc_egress_packet(skb, generation, faketcp_packet);
 #else
 	rc = parse_packet(skb, info, generation);
