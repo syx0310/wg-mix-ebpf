@@ -120,9 +120,48 @@ func TestLegacy515ManifestIsIndependentAndRejectsPost515Calls(t *testing.T) {
 		t.Fatalf("legacy-5.15 manifest accepted BPF-writable cookie map: %v", err)
 	}
 
+	missingIterator := canonicalLegacy515CollectionSpec()
+	delete(missingIterator.Maps, legacy515FakeTCPIterationMap)
+	if err := validateLegacy515ExtensionManifest(missingIterator); err == nil ||
+		!strings.Contains(err.Error(), legacy515FakeTCPIterationMap) {
+		t.Fatalf("legacy-5.15 manifest accepted missing iterator map: %v", err)
+	}
+
+	wrongIteratorBound := canonicalLegacy515CollectionSpec()
+	wrongIteratorBound.Maps[legacy515FakeTCPIterationMap].MaxEntries--
+	if err := validateLegacy515ExtensionManifest(wrongIteratorBound); err == nil ||
+		!strings.Contains(err.Error(), legacy515FakeTCPIterationMap) {
+		t.Fatalf("legacy-5.15 manifest accepted iterator bound drift: %v", err)
+	}
+
+	missingIteration := canonicalLegacy515CollectionSpec()
+	var withoutIteration asm.Instructions
+	removed := false
+	for _, instruction := range missingIteration.Programs["wg_mix_egress"].Instructions {
+		if !removed && instruction.IsBuiltinCall() &&
+			asm.BuiltinFunc(instruction.Constant) == asm.FnForEachMapElem {
+			removed = true
+			continue
+		}
+		withoutIteration = append(withoutIteration, instruction)
+	}
+	missingIteration.Programs["wg_mix_egress"].Instructions = withoutIteration
+	if err := validateLegacy515ExtensionManifest(missingIteration); err == nil ||
+		!strings.Contains(err.Error(), "want exactly 4") {
+		t.Fatalf("legacy-5.15 manifest accepted missing iterator call: %v", err)
+	}
+
+	wrongIteratorCaller := canonicalLegacy515CollectionSpec()
+	wrongIteratorCaller.Programs["wg_mix_faketcp_ingress"].Instructions =
+		asm.Instructions{asm.FnForEachMapElem.Call(), asm.Return()}
+	if err := validateLegacy515ExtensionManifest(wrongIteratorCaller); err == nil ||
+		!strings.Contains(err.Error(), "map iterator helper is called by unreviewed program") {
+		t.Fatalf("legacy-5.15 manifest accepted iterator on wrong program: %v", err)
+	}
+
 	missingPrepare := canonicalLegacy515CollectionSpec()
 	var withoutPrepare asm.Instructions
-	removed := false
+	removed = false
 	for _, instruction := range missingPrepare.Programs["wg_mix_egress"].Instructions {
 		if !removed && instruction.IsBuiltinCall() &&
 			asm.BuiltinFunc(instruction.Constant) == asm.FnSkbChangeType {
@@ -463,17 +502,24 @@ func canonicalExperimentalCollectionSpec() *ebpf.CollectionSpec {
 
 func canonicalLegacy515CollectionSpec() *ebpf.CollectionSpec {
 	spec := canonicalExperimentalCollectionSpec()
-	descriptor := legacy515FakeTCPKprobeRuntimeMapDescriptor()
-	spec.Maps[descriptor.name] = &ebpf.MapSpec{
-		Name:       descriptor.name,
-		Type:       descriptor.mapType,
-		KeySize:    descriptor.keySize,
-		ValueSize:  descriptor.valueSize,
-		MaxEntries: descriptor.maxEntries,
-		Flags:      descriptor.flags,
-		Pinning:    ebpf.PinNone,
+	for _, descriptor := range []pinnedMapDescriptor{
+		legacy515FakeTCPKprobeRuntimeMapDescriptor(),
+		legacy515FakeTCPIterationMapDescriptor(),
+	} {
+		spec.Maps[descriptor.name] = &ebpf.MapSpec{
+			Name:       descriptor.name,
+			Type:       descriptor.mapType,
+			KeySize:    descriptor.keySize,
+			ValueSize:  descriptor.valueSize,
+			MaxEntries: descriptor.maxEntries,
+			Flags:      descriptor.flags,
+			Pinning:    ebpf.PinNone,
+		}
 	}
 	var instructions asm.Instructions
+	for range legacy515FakeTCPIterationHelperCallCount {
+		instructions = append(instructions, asm.FnForEachMapElem.Call())
+	}
 	for helper, count := range legacy515FakeTCPTriggerHelperCounts {
 		for range count {
 			instructions = append(instructions, helper.Call())

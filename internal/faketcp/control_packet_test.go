@@ -22,7 +22,7 @@ func TestMarshalIPv4TCPControlGoldenLayout(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want, err := hex.DecodeString("4500002800000000400666ce0a0000010a000002791901bb01020304a0b0c0d050121234a9400000")
+	want, err := hex.DecodeString("450000285747000040060f870a0000010a000002791901bb01020304a0b0c0d050121234a9400000")
 	if err != nil {
 		t.Fatal(err)
 	}

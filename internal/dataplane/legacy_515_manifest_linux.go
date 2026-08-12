@@ -12,9 +12,12 @@ import (
 )
 
 const (
-	legacy515FakeTCPObjectKind          = "legacy-5.15 FakeTCP"
-	legacy515FakeTCPKprobeRuntimeMap    = "faketcp_kprobe_runtime_map"
-	legacy515FakeTCPKprobeRuntimeMapABI = 16
+	legacy515FakeTCPObjectKind               = "legacy-5.15 FakeTCP"
+	legacy515FakeTCPKprobeRuntimeMap         = "faketcp_kprobe_runtime_map"
+	legacy515FakeTCPKprobeRuntimeMapABI      = 16
+	legacy515FakeTCPIterationMap             = "faketcp_legacy_515_iteration_map"
+	legacy515FakeTCPIterationMapMaxEntries   = 4097
+	legacy515FakeTCPIterationHelperCallCount = 4
 )
 
 var legacy515FakeTCPTriggerHelperCounts = map[asm.BuiltinFunc]int{
@@ -37,11 +40,20 @@ func legacy515FakeTCPKprobeRuntimeMapDescriptor() pinnedMapDescriptor {
 	}
 }
 
+func legacy515FakeTCPIterationMapDescriptor() pinnedMapDescriptor {
+	return pinnedMapDescriptor{
+		name: legacy515FakeTCPIterationMap, mapType: ebpf.Array,
+		keySize: 4, valueSize: 4,
+		maxEntries: legacy515FakeTCPIterationMapMaxEntries,
+		flags:      unix.BPF_F_RDONLY_PROG,
+	}
+}
+
 // validateLegacy515ExtensionManifest accepts only the independently built
 // Linux-5.15 FakeTCP object. In particular, it rejects both modern kfunc
-// relocations and bpf_loop before any kernel resource is created. The kprobe
-// checksum bridge owns a separate helper-call contract layered onto this
-// manifest.
+// relocations and bpf_loop before any kernel resource is created. Its exact
+// 5.15-compatible map iterator and the kprobe checksum bridge own separate
+// helper-call contracts layered onto this manifest.
 func validateLegacy515ExtensionManifest(spec *ebpf.CollectionSpec) error {
 	if spec == nil {
 		return errors.New("legacy-5.15 FakeTCP BPF collection spec is nil")
@@ -49,34 +61,39 @@ func validateLegacy515ExtensionManifest(spec *ebpf.CollectionSpec) error {
 	if err := validateLegacy515InstructionSet(spec); err != nil {
 		return err
 	}
-	descriptor := legacy515FakeTCPKprobeRuntimeMapDescriptor()
-	mapSpec := spec.Maps[descriptor.name]
-	if mapSpec == nil {
-		return fmt.Errorf(
-			"%s BPF object missing required map %q",
-			legacy515FakeTCPObjectKind, descriptor.name,
-		)
-	}
-	if err := validateManifestMapSpec(descriptor, mapSpec); err != nil {
-		return fmt.Errorf("%s map manifest: %w", legacy515FakeTCPObjectKind, err)
-	}
-	if mapSpec.Pinning != ebpf.PinNone {
-		return fmt.Errorf(
-			"%s BPF map %q pinning is %d, want PinNone",
-			legacy515FakeTCPObjectKind, descriptor.name, mapSpec.Pinning,
-		)
+	common := spec.Copy()
+	for _, descriptor := range []pinnedMapDescriptor{
+		legacy515FakeTCPKprobeRuntimeMapDescriptor(),
+		legacy515FakeTCPIterationMapDescriptor(),
+	} {
+		mapSpec := spec.Maps[descriptor.name]
+		if mapSpec == nil {
+			return fmt.Errorf(
+				"%s BPF object missing required map %q",
+				legacy515FakeTCPObjectKind, descriptor.name,
+			)
+		}
+		if err := validateManifestMapSpec(descriptor, mapSpec); err != nil {
+			return fmt.Errorf("%s map manifest: %w", legacy515FakeTCPObjectKind, err)
+		}
+		if mapSpec.Pinning != ebpf.PinNone {
+			return fmt.Errorf(
+				"%s BPF map %q pinning is %d, want PinNone",
+				legacy515FakeTCPObjectKind, descriptor.name, mapSpec.Pinning,
+			)
+		}
+		delete(common.Maps, descriptor.name)
 	}
 
-	// The kprobe cookie map is legacy-only. Remove only its already validated
-	// identity from a copy before applying the exact common FakeTCP schema;
-	// every other extra/missing map remains a hard manifest failure.
-	common := spec.Copy()
-	delete(common.Maps, descriptor.name)
+	// Both maps are legacy-only. Remove only their already validated identities
+	// from the copy before applying the exact common FakeTCP schema; every other
+	// extra or missing map remains a hard manifest failure.
 	return validateFakeTCPExtensionSchema(common, legacy515FakeTCPObjectKind)
 }
 
 func validateLegacy515InstructionSet(spec *ebpf.CollectionSpec) error {
 	triggerCalls := make(map[asm.BuiltinFunc]int, len(legacy515FakeTCPTriggerHelperCounts))
+	iterationCalls := 0
 	for helper := range legacy515FakeTCPTriggerHelperCounts {
 		triggerCalls[helper] = 0
 	}
@@ -101,6 +118,16 @@ func validateLegacy515InstructionSet(spec *ebpf.CollectionSpec) error {
 					programName, helperName,
 				)
 			}
+			if helper == asm.FnForEachMapElem {
+				if programName != "wg_mix_egress" {
+					return fmt.Errorf(
+						"legacy-5.15 FakeTCP map iterator helper is called by unreviewed program %q",
+						programName,
+					)
+				}
+				iterationCalls++
+				continue
+			}
 			if _, ok := triggerCalls[helper]; !ok {
 				continue
 			}
@@ -112,6 +139,13 @@ func validateLegacy515InstructionSet(spec *ebpf.CollectionSpec) error {
 			}
 			triggerCalls[helper]++
 		}
+	}
+	if iterationCalls != legacy515FakeTCPIterationHelperCallCount {
+		return fmt.Errorf(
+			"legacy-5.15 FakeTCP object has %d %s calls, want exactly %d",
+			iterationCalls, asm.FnForEachMapElem,
+			legacy515FakeTCPIterationHelperCallCount,
+		)
 	}
 	for helper, expected := range legacy515FakeTCPTriggerHelperCounts {
 		if triggerCalls[helper] != expected {

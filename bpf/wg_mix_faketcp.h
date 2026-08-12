@@ -46,16 +46,20 @@
 	(0xffffU - sizeof(struct iphdr) - sizeof(struct udphdr) - \
 	 FAKETCP_HEADER_DELTA)
 #ifdef WG_MIX_FAKETCP_LEGACY_515
-// Linux 5.15 predates bpf_loop. Keep the full modern GSO contract by using
-// verifier-visible bounded loops in the independently built legacy object.
-// Every admitted logical segment is at least 32 bytes, so 2046 is the exact
-// segment ceiling for the maximum IPv4 aggregate. Across that same geometry,
-// the maximum number of 32-byte XOR chunks is 3968 (gso_size=33); 4096 leaves
-// a power-of-two verifier bound without reducing the accepted wire domain.
+// Linux 5.15 predates bpf_loop but supports bpf_for_each_map_elem. Keep the
+// full modern GSO contract with an exact legacy-only array iterator instead of
+// an open-coded loop whose 2046/4096 paths exceed the old verifier's 8192-jump
+// sequence ceiling. Every admitted logical segment is at least 32 bytes, so
+// 2046 is the exact segment ceiling for the maximum IPv4 aggregate. Across
+// that same geometry, the maximum number of 32-byte XOR chunks is 3968
+// (gso_size=33); 4096 leaves a power-of-two bound without reducing the accepted
+// wire domain. The extra array entry is the mandatory fail-closed stop sentinel.
 #define FAKETCP_LEGACY_515_FULL_GSO_CAPABILITY 1
 #define FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS \
 	(FAKETCP_GSO_MAX_PAYLOAD / 32U)
 #define FAKETCP_LEGACY_515_GSO_MAX_XOR_CHUNKS 4096U
+#define FAKETCP_LEGACY_515_ITERATION_MAP_ENTRIES \
+	(FAKETCP_LEGACY_515_GSO_MAX_XOR_CHUNKS + 1U)
 #endif
 #define FAKETCP_CHECKSUM_CHUNK_BYTES 32
 #define FAKETCP_CHECKSUM_CHUNK_COUNT \
@@ -1011,6 +1015,18 @@ struct {
 	__type(key, __u32);
 	__type(value, struct faketcp_kprobe_runtime_value);
 } faketcp_kprobe_runtime_map SEC(".maps");
+
+// Contents are deliberately irrelevant: Linux 5.15's
+// bpf_for_each_array_elem() supplies array keys in ascending order and counts
+// the stop element before returning. Entry 4096 is therefore a stop sentinel,
+// so every accepted limit has a representable limit+1 traversal proof.
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(map_flags, BPF_F_RDONLY_PROG);
+	__uint(max_entries, FAKETCP_LEGACY_515_ITERATION_MAP_ENTRIES);
+	__type(key, __u32);
+	__type(value, __u32);
+} faketcp_legacy_515_iteration_map SEC(".maps");
 #endif
 
 static __always_inline void inc_faketcp_stat(__u32 key)
@@ -1519,11 +1535,13 @@ faketcp_take_control_budget(struct faketcp_control_policy_value *policy,
 		__u64 base, candidate, limit = now + window;
 
 		if (old == 0) {
-			// The first packet establishes the zero-budget epoch. Exactly one
-			// token becomes available after one configured interval.
+			// A fresh generation starts with its explicitly configured burst.
+			// Charging the first token at now+interval preserves the GCRA
+			// ceiling while allowing the first WireGuard handshake immediately.
+			candidate = now + interval;
 			if (__sync_val_compare_and_swap(&policy->virtual_time_nanos,
-						old, limit) == old)
-				return 0;
+						old, candidate) == old)
+				return 1;
 			continue;
 		}
 		base = old > now ? old : now;
@@ -2557,7 +2575,12 @@ faketcp_gso_segment_length(const struct faketcp_gso_loop_context *context,
 	return remaining < context->gso_size ? remaining : context->gso_size;
 }
 
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+static __noinline long faketcp_gso_validate_segment(
+	void *map, const __u32 *key, void *value, void *opaque)
+#else
 static __noinline long faketcp_gso_validate_segment(__u32 index, void *opaque)
+#endif
 {
 	struct faketcp_gso_loop_context *context = opaque;
 	__u32 segment_offset;
@@ -2567,6 +2590,25 @@ static __noinline long faketcp_gso_validate_segment(__u32 index, void *opaque)
 	__u32 xor_target = 0;
 	int kind;
 
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	__u32 index;
+
+	(void)map;
+	(void)value;
+	if (!context || !key)
+		return 1;
+	index = *key;
+	// Stopping at the first key outside the work domain is success only when
+	// the helper reports exactly limit+1 visited entries to the caller.
+	if (index >= context->gso_segments)
+		return 1;
+	// Linux 5.15 does not derive a scalar range from the array iterator key.
+	// Make the compile-time geometry bound explicit before packet arithmetic.
+	if (index >= FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS) {
+		context->error = -1;
+		return 1;
+	}
+#endif
 	if (index >= context->gso_segments) {
 		context->error = -1;
 		return 1;
@@ -2618,15 +2660,11 @@ static __always_inline int faketcp_legacy_515_validate_gso_segments(
 	if (!context || context->gso_segments < 2 ||
 	    context->gso_segments > FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS)
 		return -1;
-#pragma clang loop unroll(disable)
-	for (__u32 index = 0;
-	     index < FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS; index++) {
-		if (index >= context->gso_segments)
-			break;
-		if (faketcp_gso_validate_segment(index, context) != 0)
-			return -1;
-	}
-	return context->error ? -1 : 0;
+	if (bpf_for_each_map_elem(&faketcp_legacy_515_iteration_map,
+				  faketcp_gso_validate_segment, context, 0) !=
+	    context->gso_segments + 1U || context->error)
+		return -1;
+	return 0;
 }
 #endif
 
@@ -2680,14 +2718,39 @@ static __always_inline int faketcp_gso_build_projection(
 	return 0;
 }
 
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+static __noinline long faketcp_gso_rewrite_type(
+	void *map, const __u32 *key, void *value, void *opaque)
+#else
 static __noinline long faketcp_gso_rewrite_type(__u32 index, void *opaque)
+#endif
 {
 	struct faketcp_gso_loop_context *context = opaque;
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	__u32 segment_offset;
+#else
 	__u32 segment_offset = index * context->gso_size;
+#endif
 	__u32 old_wire;
 	__u32 new_wire;
 	int kind;
 
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	__u32 index;
+
+	(void)map;
+	(void)value;
+	if (!context || !key)
+		return 1;
+	index = *key;
+	if (index >= context->gso_segments)
+		return 1;
+	if (index >= FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS) {
+		context->error = -1;
+		return 1;
+	}
+	segment_offset = index * context->gso_size;
+#endif
 	if (index >= context->gso_segments ||
 	    bpf_skb_load_bytes(context->skb,
 			       context->payload_offset + segment_offset,
@@ -2712,7 +2775,12 @@ static __noinline long faketcp_gso_rewrite_type(__u32 index, void *opaque)
 	return 0;
 }
 
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+static __noinline long faketcp_gso_xor_chunk(
+	void *map, const __u32 *key, void *value, void *opaque)
+#else
 static __noinline long faketcp_gso_xor_chunk(__u32 index, void *opaque)
+#endif
 {
 	struct faketcp_gso_loop_context *context = opaque;
 	struct faketcp_runtime_scratch *scratch;
@@ -2729,6 +2797,29 @@ static __noinline long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 	__u32 packet_offset;
 	int rc;
 
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	__u32 index;
+	__u32 xor_chunks;
+
+	(void)map;
+	(void)value;
+	if (!context || !key || !context->xor_chunks_per_segment ||
+	    context->gso_segments >
+		FAKETCP_LEGACY_515_GSO_MAX_XOR_CHUNKS /
+		context->xor_chunks_per_segment) {
+		if (context)
+			context->error = -1;
+		return 1;
+	}
+	xor_chunks = context->gso_segments * context->xor_chunks_per_segment;
+	index = *key;
+	if (index >= xor_chunks)
+		return 1;
+	if (index >= FAKETCP_LEGACY_515_GSO_MAX_XOR_CHUNKS) {
+		context->error = -1;
+		return 1;
+	}
+#endif
 	if (!context->cipher || !context->xor_chunks_per_segment) {
 		context->error = -1;
 		return 1;
@@ -2855,15 +2946,11 @@ static __always_inline int faketcp_legacy_515_rewrite_gso_types(
 	if (!context || context->gso_segments < 2 ||
 	    context->gso_segments > FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS)
 		return -1;
-#pragma clang loop unroll(disable)
-	for (__u32 index = 0;
-	     index < FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS; index++) {
-		if (index >= context->gso_segments)
-			break;
-		if (faketcp_gso_rewrite_type(index, context) != 0)
-			return -1;
-	}
-	return context->error ? -1 : 0;
+	if (bpf_for_each_map_elem(&faketcp_legacy_515_iteration_map,
+				  faketcp_gso_rewrite_type, context, 0) !=
+	    context->gso_segments + 1U || context->error)
+		return -1;
+	return 0;
 }
 
 static __always_inline int faketcp_legacy_515_xor_gso_chunks(
@@ -2872,15 +2959,11 @@ static __always_inline int faketcp_legacy_515_xor_gso_chunks(
 	if (!context || !xor_chunks ||
 	    xor_chunks > FAKETCP_LEGACY_515_GSO_MAX_XOR_CHUNKS)
 		return -1;
-#pragma clang loop unroll(disable)
-	for (__u32 index = 0;
-	     index < FAKETCP_LEGACY_515_GSO_MAX_XOR_CHUNKS; index++) {
-		if (index >= xor_chunks)
-			break;
-		if (faketcp_gso_xor_chunk(index, context) != 0)
-			return -1;
-	}
-	return context->error ? -1 : 0;
+	if (bpf_for_each_map_elem(&faketcp_legacy_515_iteration_map,
+				  faketcp_gso_xor_chunk, context, 0) !=
+	    xor_chunks + 1U || context->error)
+		return -1;
+	return 0;
 }
 #endif
 

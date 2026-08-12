@@ -1786,6 +1786,8 @@ static __always_inline int prepare_xor_context_by_id(struct __sk_buff *skb,
 // Keep this forced inline: a separate frame would be added above the already
 // large egress transform frame, even though authorization completes before the
 // UDP parser and the two phases can safely reuse stack slots.
+#define FAKETCP_USERSPACE_CONTROL_IPV4_ID 0x5747U
+
 static __always_inline int faketcp_authorize_userspace_control(
 	struct __sk_buff *skb, __u64 generation,
 	struct faketcp_runtime_scratch *scratch)
@@ -1833,7 +1835,8 @@ static __always_inline int faketcp_authorize_userspace_control(
 	flags = faketcp_tcp_flags(&headers->tcp);
 	if (headers->ip.version != 4 ||
 	    headers->ip.ihl != sizeof(headers->ip) / 4 ||
-	    headers->ip.tos != 0 || headers->ip.id != 0 ||
+	    headers->ip.tos != 0 ||
+	    headers->ip.id != bpf_htons(FAKETCP_USERSPACE_CONTROL_IPV4_ID) ||
 	    headers->ip.ttl != 64 || headers->ip.protocol != IPPROTO_TCP ||
 	    (fragment & (IP_RESERVED | IP_MF | IP_OFFSET)) ||
 	    bpf_ntohs(headers->ip.tot_len) != sizeof(*headers) ||

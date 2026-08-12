@@ -1021,24 +1021,32 @@ func TestFakeTCPBPFControlAdmissionIsPolicyScopedAndStrictlyBounded(t *testing.T
 	}
 }
 
-func TestFakeTCPControlAdmissionGCRAStartsEmptyAndCapsBurst(t *testing.T) {
+func TestFakeTCPControlAdmissionGCRAStartsWithConfiguredBurstAndCapsIt(t *testing.T) {
 	const (
 		interval = uint64(100_000_000)
 		burst    = uint32(4)
 		start    = uint64(1_000_000_000)
 	)
 	var cursor uint64
-	if takeFakeTCPControlBudgetModel(&cursor, start, interval, burst) {
-		t.Fatal("new policy minted an immediate control-event token")
+	if !takeFakeTCPControlBudgetModel(&cursor, start, interval, burst) {
+		t.Fatal("fresh policy did not admit the first WireGuard handshake")
 	}
-	if want := start + interval*uint64(burst); cursor != want {
-		t.Fatalf("zero-budget epoch cursor=%d, want %d", cursor, want)
+	if want := start + interval; cursor != want {
+		t.Fatalf("first-token cursor=%d, want %d", cursor, want)
+	}
+	for admitted := uint32(1); admitted < burst; admitted++ {
+		if !takeFakeTCPControlBudgetModel(&cursor, start, interval, burst) {
+			t.Fatalf("initial burst stopped after %d admissions", admitted)
+		}
+	}
+	if takeFakeTCPControlBudgetModel(&cursor, start, interval, burst) {
+		t.Fatalf("fresh policy admitted more than burst=%d events", burst)
 	}
 	if !takeFakeTCPControlBudgetModel(&cursor, start+interval, interval, burst) {
-		t.Fatal("one interval did not accrue exactly one event")
+		t.Fatal("one interval did not replenish exactly one event")
 	}
 	if takeFakeTCPControlBudgetModel(&cursor, start+interval, interval, burst) {
-		t.Fatal("one interval accrued more than one event")
+		t.Fatal("one interval replenished more than one event")
 	}
 
 	// After a long idle period, exactly Burst events may be emitted; the next
@@ -1083,13 +1091,14 @@ func TestFakeTCPControlAdmissionGCRARejectsInvalidAndOverflowingPolicy(t *testin
 
 	window := fakeTCPControlMinIntervalModel * uint64(fakeTCPControlMaxBurstModel)
 	cursor := uint64(0)
-	if takeFakeTCPControlBudgetModel(&cursor, maxUint64-window,
+	if !takeFakeTCPControlBudgetModel(&cursor, maxUint64-window,
 		fakeTCPControlMinIntervalModel, fakeTCPControlMaxBurstModel) {
-		t.Fatal("zero-budget boundary unexpectedly admitted")
+		t.Fatal("largest non-overflowing first token was rejected")
 	}
-	if cursor != maxUint64 {
-		t.Fatalf("largest non-overflowing boundary cursor=%d, want %d", cursor, maxUint64)
+	if want := maxUint64 - window + fakeTCPControlMinIntervalModel; cursor != want {
+		t.Fatalf("largest non-overflowing first cursor=%d, want %d", cursor, want)
 	}
+	cursor = maxUint64
 	if takeFakeTCPControlBudgetModel(&cursor, maxUint64-window+fakeTCPControlMinIntervalModel,
 		fakeTCPControlMinIntervalModel, fakeTCPControlMaxBurstModel) {
 		t.Fatal("candidate overflow boundary admitted")
@@ -1116,8 +1125,8 @@ func takeFakeTCPControlBudgetModel(cursor *uint64, now, interval uint64, burst u
 	}
 	limit := now + window
 	if *cursor == 0 {
-		*cursor = limit
-		return false
+		*cursor = now + interval
+		return true
 	}
 	base := *cursor
 	if base < now {

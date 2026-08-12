@@ -25,6 +25,10 @@ func TestFakeTCPUserspaceControlEgressIsNarrowAndFailClosed(t *testing.T) {
 		"static __noinline int faketcp_authorize_userspace_control(") {
 		t.Fatal("userspace control authorization regained a BPF-to-BPF call frame")
 	}
+	if !strings.Contains(tc,
+		"#define FAKETCP_USERSPACE_CONTROL_IPV4_ID 0x5747U") {
+		t.Fatal("userspace control lost its non-zero IP_HDRINCL-stable IPv4 identification")
+	}
 	for _, want := range []string{
 		"if (ip_protocol != IPPROTO_TCP)\n\t\treturn 0",
 		"sizeof(*headers) != skb->len - network_off",
@@ -32,7 +36,7 @@ func TestFakeTCPUserspaceControlEgressIsNarrowAndFailClosed(t *testing.T) {
 		"bpf_skb_load_bytes(skb, network_off, headers",
 		"headers->ip.version != 4",
 		"headers->ip.ihl != sizeof(headers->ip) / 4",
-		"headers->ip.tos != 0 || headers->ip.id != 0",
+		"headers->ip.id != bpf_htons(FAKETCP_USERSPACE_CONTROL_IPV4_ID)",
 		"headers->ip.ttl != 64",
 		"fragment & (IP_RESERVED | IP_MF | IP_OFFSET)",
 		"bpf_ntohs(headers->ip.tot_len) != sizeof(*headers)",
@@ -70,6 +74,8 @@ func TestFakeTCPUserspaceControlEgressIsNarrowAndFailClosed(t *testing.T) {
 		t.Fatalf("userspace control fixed-header loads=%d, want 1", got)
 	}
 	for _, flags := range []string{
+		"controlIPv4Identification = 0x5747",
+		"binary.BigEndian.PutUint16(packet[4:6], controlIPv4Identification)",
 		"case FlagSYN, FlagSYN | FlagACK, FlagACK:",
 		"unsupported TCP flags",
 	} {

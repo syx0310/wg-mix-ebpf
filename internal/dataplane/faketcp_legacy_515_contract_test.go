@@ -27,7 +27,14 @@ func TestFakeTCPLegacy515ObjectHasIndependentFullGSOBuildContract(t *testing.T) 
 		"#define FAKETCP_LEGACY_515_FULL_GSO_CAPABILITY 1",
 		"#define FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS",
 		"#define FAKETCP_LEGACY_515_GSO_MAX_XOR_CHUNKS 4096U",
-		"#pragma clang loop unroll(disable)",
+		"#define FAKETCP_LEGACY_515_ITERATION_MAP_ENTRIES",
+		"bpf_for_each_array_elem()",
+		"faketcp_legacy_515_iteration_map SEC(\".maps\")",
+		"bpf_for_each_map_elem(&faketcp_legacy_515_iteration_map",
+		"context->gso_segments + 1U || context->error",
+		"xor_chunks + 1U || context->error",
+		"index >= FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS",
+		"index >= FAKETCP_LEGACY_515_GSO_MAX_XOR_CHUNKS",
 		"faketcp_legacy_515_validate_gso_segments(&context)",
 		"faketcp_legacy_515_rewrite_gso_types(&context)",
 		"faketcp_legacy_515_xor_gso_chunks(&context, xor_chunks)",
@@ -73,6 +80,10 @@ func TestFakeTCPLegacy515ObjectHasIndependentFullGSOBuildContract(t *testing.T) 
 		`asm.FnXdpLoadBytes:  "bpf_xdp_load_bytes"`,
 		`asm.FnXdpStoreBytes: "bpf_xdp_store_bytes"`,
 		"legacy515FakeTCPKprobeRuntimeMap",
+		"legacy515FakeTCPIterationMap",
+		"legacy515FakeTCPIterationMapMaxEntries",
+		"legacy515FakeTCPIterationHelperCallCount = 4",
+		"asm.FnForEachMapElem",
 		"unix.BPF_F_RDONLY_PROG",
 		"asm.FnSkbChangeType:  2",
 		"asm.FnSkbChangeProto: 1",
@@ -81,6 +92,32 @@ func TestFakeTCPLegacy515ObjectHasIndependentFullGSOBuildContract(t *testing.T) 
 		if !strings.Contains(manifest, required) {
 			t.Fatalf("legacy object manifest is missing %q", required)
 		}
+	}
+
+	legacy := fakeTCPLegacy515PreprocessorView(t, bpf, true)
+	modern := fakeTCPLegacy515PreprocessorView(t, bpf, false)
+	if count := strings.Count(legacy,
+		"bpf_for_each_map_elem(&faketcp_legacy_515_iteration_map"); count != 3 {
+		t.Fatalf("legacy-5.15 source map iterator sites=%d, want exactly three", count)
+	}
+	for _, required := range []string{
+		"faketcp_gso_validate_segment, context, 0)",
+		"faketcp_gso_rewrite_type, context, 0)",
+		"faketcp_gso_xor_chunk, context, 0)",
+	} {
+		if !strings.Contains(legacy, required) {
+			t.Fatalf("legacy-5.15 map iterator path is missing %q", required)
+		}
+	}
+	if strings.Contains(legacy, "bpf_loop(") {
+		t.Fatal("legacy-5.15 preprocessor view retains forbidden bpf_loop")
+	}
+	if count := strings.Count(modern, "bpf_loop("); count != 3 {
+		t.Fatalf("modern bpf_loop calls=%d, want exactly three", count)
+	}
+	if strings.Contains(modern, "bpf_for_each_map_elem(") ||
+		strings.Contains(modern, "faketcp_legacy_515_iteration_map") {
+		t.Fatal("modern preprocessor view contains legacy map iteration path")
 	}
 }
 

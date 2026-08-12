@@ -12,6 +12,10 @@ const (
 	controlIPv4HeaderLength = 20
 	controlTCPHeaderLength  = 20
 	controlPacketLength     = controlIPv4HeaderLength + controlTCPHeaderLength
+	// IP_HDRINCL fills a zero IPv4 identification field before the packet
+	// reaches TC egress. Use one non-zero protocol marker so the bytes written
+	// by userspace remain identical to the canonical packet that BPF validates.
+	controlIPv4Identification = 0x5747
 )
 
 // MarshalIPv4TCPControl encodes one Engine control action as a payload-free,
@@ -31,6 +35,7 @@ func MarshalIPv4TCPControl(flow abi.FakeTCPSessionKey, control ControlPacket) ([
 	packet := make([]byte, controlPacketLength)
 	packet[0] = 4<<4 | controlIPv4HeaderLength/4
 	binary.BigEndian.PutUint16(packet[2:4], controlPacketLength)
+	binary.BigEndian.PutUint16(packet[4:6], controlIPv4Identification)
 	packet[8] = 64
 	packet[9] = 6
 	binary.NativeEndian.PutUint32(packet[12:16], flow.LocalIPv4)
