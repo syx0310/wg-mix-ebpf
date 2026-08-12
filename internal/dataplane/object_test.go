@@ -78,6 +78,23 @@ func TestEmbeddedFakeTCPObjectIdentityIsIndependent(t *testing.T) {
 	}
 }
 
+func TestEmbeddedFakeTCPLegacy515ObjectIdentityIsIndependent(t *testing.T) {
+	if EmbeddedFakeTCPLegacy515ObjectSource == EmbeddedObjectSource ||
+		EmbeddedFakeTCPLegacy515ObjectSource == EmbeddedFakeTCPObjectSource {
+		t.Fatal("legacy-5.15 FakeTCP and other embedded object sources are identical")
+	}
+	identity, err := EmbeddedFakeTCPLegacy515ObjectIdentity()
+	if err != nil {
+		if identity != (ObjectIdentity{}) {
+			t.Fatalf("unavailable embedded legacy object returned identity %#v", identity)
+		}
+		return
+	}
+	if identity.Source != EmbeddedFakeTCPLegacy515ObjectSource || !identity.Embedded {
+		t.Fatalf("embedded legacy-5.15 FakeTCP identity = %#v", identity)
+	}
+}
+
 func TestFakeTCPObjectSelectorIsIndependentFromBaseline(t *testing.T) {
 	t.Setenv(EnvObjectPath, "/objects/baseline.o")
 	t.Setenv(EnvFakeTCPObjectPath, "/objects/faketcp.o")
@@ -90,5 +107,21 @@ func TestFakeTCPObjectSelectorIsIndependentFromBaseline(t *testing.T) {
 	t.Setenv(EnvFakeTCPObjectPath, "")
 	if got := fakeTCPObjectPathFromEnv(""); got != "" {
 		t.Fatalf("FakeTCP object inherited baseline selector: %q", got)
+	}
+}
+
+func TestFakeTCPLegacy515ObjectSelectorIsIndependent(t *testing.T) {
+	t.Setenv(EnvObjectPath, "/objects/baseline.o")
+	t.Setenv(EnvFakeTCPObjectPath, "/objects/faketcp-modern.o")
+	t.Setenv(EnvFakeTCPLegacy515ObjectPath, "/objects/faketcp-legacy-515.o")
+	if got := fakeTCPLegacy515ObjectPathFromEnv(""); got != "/objects/faketcp-legacy-515.o" {
+		t.Fatalf("legacy-5.15 FakeTCP object = %q", got)
+	}
+	if got := fakeTCPLegacy515ObjectPathFromEnv("/explicit/legacy.o"); got != "/explicit/legacy.o" {
+		t.Fatalf("explicit legacy-5.15 FakeTCP object = %q", got)
+	}
+	t.Setenv(EnvFakeTCPLegacy515ObjectPath, "")
+	if got := fakeTCPLegacy515ObjectPathFromEnv(""); got != "" {
+		t.Fatalf("legacy selector inherited another object path: %q", got)
 	}
 }

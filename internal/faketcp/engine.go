@@ -345,7 +345,7 @@ func (e *Engine) Identity() RuntimeIdentity {
 // Outbound observes a UDP datagram before the BPF established path can encode
 // it. The packet copy is retained only within all three configured limits.
 func (e *Engine) Outbound(flow abi.FakeTCPSessionKey, packet []byte) ([]Action, error) {
-	return e.outbound(flow, PendingPacket{Data: packet}, false)
+	return e.outbound(flow, PendingPacket{Data: packet, WGID: flow.WGID}, false)
 }
 
 // HandlePacketEvent accepts the fixed upper-bound ABI form used by low-level
@@ -408,6 +408,9 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 	defer e.mu.Unlock()
 	if err := e.validateFlow(flow); err != nil {
 		return nil, err
+	}
+	if packet.WGID != flow.WGID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
 	}
 	s := e.sessions[flow]
 	if s != nil && s.state == abi.FakeTCPStateEstablished {
@@ -483,7 +486,7 @@ func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alre
 }
 
 func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, error) {
-	return e.inbound(flow, seg, 0)
+	return e.inbound(flow, seg, flow.WGID)
 }
 
 // InboundWithWGID preserves the listener identity carried by the BPF event so
@@ -504,6 +507,9 @@ func (e *Engine) InboundCapturedControl(event abi.FakeTCPEvent, packet []byte) (
 	flow := event.Key
 	if err := e.validateFlow(flow); err != nil {
 		return nil, err
+	}
+	if event.WGID != flow.WGID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
 	}
 	identity := runtimeIdentityFromEvent(event)
 	if identity != e.identity || event.EventABIVersion != abi.FakeTCPEventABIVersion {
@@ -562,6 +568,9 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) (
 	if err := e.validateFlow(flow); err != nil {
 		return nil, err
 	}
+	if wgID != flow.WGID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+	}
 	now := e.opts.Now()
 	s := e.sessions[flow]
 	checkpoint := e.checkpoint(s)
@@ -570,7 +579,11 @@ func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) (
 		return []Action{action}, err
 	}
 	var synSource synSourceKey
-	if seg.Flags&FlagSYN != 0 {
+	// Only a bare SYN enters inbound admission. A SYN+ACK completing an
+	// already-owned outbound handshake neither allocates inbound state nor
+	// consumes the global/source SYN budget; gating it here could strand every
+	// outbound session during the startup fail-safe refill interval.
+	if seg.Flags == FlagSYN {
 		var rejection string
 		synSource, rejection = e.observeSYN(flow, now)
 		if rejection != "" {
@@ -828,8 +841,9 @@ func (e *Engine) Snapshot(flow abi.FakeTCPSessionKey) (SessionSnapshot, bool, er
 
 func (e *Engine) validateFlow(flow abi.FakeTCPSessionKey) error {
 	if flow.Generation != e.opts.Generation || flow.LocalIPv4 == 0 || flow.RemoteIPv4 == 0 ||
-		flow.UnderlayIndex == 0 || flow.LocalPort == 0 || flow.RemotePort == 0 {
-		return errors.New("faketcp flow must use the active generation and non-zero IPv4/port/underlay fields")
+		flow.UnderlayIndex == 0 || flow.LocalPort == 0 || flow.RemotePort == 0 ||
+		flow.WGID == 0 || flow.Reserved != ([4]byte{}) {
+		return errors.New("faketcp flow must use the active generation, a non-zero WGID/IPv4/port/underlay identity, and zero reserved bytes")
 	}
 	return nil
 }

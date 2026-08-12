@@ -20,6 +20,7 @@ import (
 
 	"github.com/cilium/ebpf"
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/faketcp"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
@@ -38,8 +39,10 @@ type experimentalFakeTCPProductionRequest struct {
 	spec         *ebpf.CollectionSpec
 	source       string
 	object       ObjectIdentity
+	checksum     *FakeTCPChecksumSelection
 	dependencies experimentalCollectionAcquisitionDependencies
 	buildOptions experimentalFakeTCPRuntimeBuildOptions
+	prepare      func(context.Context) error
 	rollback     func() error
 }
 
@@ -130,6 +133,23 @@ func ProductionFakeTCPStatus(
 			underlay.EgressAttached = true
 		}
 	}
+	for _, attachment := range runtimeStatus.ClassicTC {
+		index, exists := underlays[attachment.IfIndex]
+		if !exists {
+			continue
+		}
+		underlay := &status.Underlays[index]
+		underlay.Filters = append(underlay.Filters, FilterStatus{
+			Direction: attachment.Direction, Name: "faketcp-" + attachment.Direction,
+			Backend: classicTCBackend, Handle: attachment.Handle,
+			Priority: attachment.Priority, ProgramID: attachment.ProgramID,
+		})
+		if attachment.Direction == "ingress" {
+			underlay.IngressAttached = true
+		} else if attachment.Direction == "egress" {
+			underlay.EgressAttached = true
+		}
+	}
 	for _, attachment := range runtimeStatus.XDP {
 		index, exists := underlays[attachment.IfIndex]
 		if !exists {
@@ -152,6 +172,8 @@ func newFakeTCPProductionLoader(baseline LinuxLoader) Loader {
 	baseline.objectPathFrozen = true
 	baseline.FakeTCPObjectPath = baseline.effectiveFakeTCPObjectPath()
 	baseline.fakeTCPObjectPathFrozen = true
+	baseline.FakeTCPLegacy515ObjectPath = baseline.effectiveFakeTCPLegacy515ObjectPath()
+	baseline.fakeTCPLegacy515ObjectPathFrozen = true
 	baseline.PinPath = pinPathFromEnv(baseline.PinPath)
 	return &fakeTCPProductionCoordinator{
 		baseline:           baseline,
@@ -159,6 +181,17 @@ func newFakeTCPProductionLoader(baseline LinuxLoader) Loader {
 		validateActivation: ValidateFakeTCPActivation,
 		resolveScope: func(ctx context.Context) (fakeTCPProductionScopeIdentity, error) {
 			return resolveLinuxFakeTCPProductionScope(ctx, baseline)
+		},
+		recoverClassic: func(
+			ctx context.Context,
+			scope fakeTCPProductionScopeIdentity,
+		) error {
+			runtime := baseline.pinRuntime(ctx)
+			_, _, recovery, err := inspectFakeTCPClassicOwnerEvidence(scope, runtime)
+			if err != nil || !recovery {
+				return err
+			}
+			return recoverFakeTCPProductionClassicOwner(ctx, scope, runtime)
 		},
 		planExperimental: composeExperimentalFakeTCPProductionPlanner(
 			baseline,
@@ -200,6 +233,17 @@ func resolveLinuxFakeTCPProductionScope(
 			return fakeTCPProductionScopeIdentity{}, err
 		}
 	}
+	fakeTCPLegacy515ObjectPath := baseline.effectiveFakeTCPLegacy515ObjectPath()
+	if fakeTCPLegacy515ObjectPath == "" {
+		fakeTCPLegacy515ObjectPath = EmbeddedFakeTCPLegacy515ObjectSource
+	} else {
+		fakeTCPLegacy515ObjectPath, err = canonicalFakeTCPProductionPath(
+			"legacy-5.15 FakeTCP object", fakeTCPLegacy515ObjectPath,
+		)
+		if err != nil {
+			return fakeTCPProductionScopeIdentity{}, err
+		}
+	}
 	pinPath, err := canonicalFakeTCPProductionPath(
 		"pin",
 		pinPathFromEnv(baseline.PinPath),
@@ -215,12 +259,13 @@ func resolveLinuxFakeTCPProductionScope(
 		return fakeTCPProductionScopeIdentity{}, err
 	}
 	return fakeTCPProductionScopeIdentity{
-		objectKind:        objectKind,
-		objectPath:        objectPath,
-		fakeTCPObjectPath: fakeTCPObjectPath,
-		pinPath:           pinPath,
-		lifecyclePath:     lifecyclePath,
-		adoptLegacyPins:   baseline.AdoptLegacyPins,
+		objectKind:                 objectKind,
+		objectPath:                 objectPath,
+		fakeTCPObjectPath:          fakeTCPObjectPath,
+		fakeTCPLegacy515ObjectPath: fakeTCPLegacy515ObjectPath,
+		pinPath:                    pinPath,
+		lifecyclePath:              lifecyclePath,
+		adoptLegacyPins:            baseline.AdoptLegacyPins,
 	}, nil
 }
 
@@ -254,6 +299,18 @@ func composeExperimentalFakeTCPProductionPlanner(
 		return &fakeTCPProductionPlan{
 			key: request.key,
 			build: func(buildCtx context.Context) (fakeTCPRuntimeService, error) {
+				if request.prepare != nil {
+					if err := request.prepare(buildCtx); err != nil {
+						buildErr := errors.Join(
+							fmt.Errorf("prepare production FakeTCP build: %w", err),
+							request.rollbackUnclaimed(),
+						)
+						if owner := request.takeFailedChecksumOwner(); owner != nil {
+							return owner, buildErr
+						}
+						return nil, buildErr
+					}
+				}
 				return factory(buildCtx, request)
 			},
 			rollback: request.rollbackUnclaimed,
@@ -280,11 +337,18 @@ func acquireExperimentalFakeTCPProductionRuntime(
 		request.buildOptions,
 	)
 	if runtime == nil {
-		return nil, err
+		checksumErr := request.closeChecksumSelection()
+		if owner := request.takeFailedChecksumOwner(); owner != nil {
+			return owner, errors.Join(err, checksumErr)
+		}
+		return nil, errors.Join(err, checksumErr)
 	}
+	checksum := request.checksum
+	request.checksum = nil
 	return &productionFakeTCPRuntime{
 		ExperimentalFakeTCPRuntime: runtime,
 		object:                     request.object,
+		checksum:                   checksum,
 	}, err
 }
 
@@ -293,14 +357,131 @@ func acquireExperimentalFakeTCPProductionRuntime(
 // lifecycle. A non-nil failed build is wrapped too, preserving the sole Close
 // capability for supervisor quarantine/retry.
 type productionFakeTCPRuntime struct {
+	mu sync.Mutex
+
 	*ExperimentalFakeTCPRuntime
-	object ObjectIdentity
+	object             ObjectIdentity
+	checksum           *FakeTCPChecksumSelection
+	experimentalClosed bool
+	checksumClosed     bool
+	closed             bool
+	closeErr           error
+}
+
+var _ fakeTCPRuntimeService = (*productionFakeTCPRuntime)(nil)
+
+// RequestStop is a no-op for a failed-build wrapper that owns only a checksum
+// lease. This lets supervisor quarantine retry Close without manufacturing a
+// userspace Run owner that never started.
+func (runtime *productionFakeTCPRuntime) RequestStop() error {
+	if runtime == nil {
+		return nil
+	}
+	runtime.mu.Lock()
+	if runtime.experimentalClosed || runtime.ExperimentalFakeTCPRuntime == nil {
+		runtime.mu.Unlock()
+		return nil
+	}
+	experimental := runtime.ExperimentalFakeTCPRuntime
+	runtime.mu.Unlock()
+	return experimental.RequestStop()
+}
+
+// Healthy proves both the complete collection/attachment graph and the
+// checksum implementation retained for that graph. The wrapper lock gives
+// this observation a single lifetime point: Close cannot release the module
+// lease between the BPF-owner and checksum checks.
+func (runtime *productionFakeTCPRuntime) Healthy(ctx context.Context) error {
+	if runtime == nil {
+		return ErrExperimentalFakeTCPRuntimeClosed
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.healthyLocked(ctx)
+}
+
+func (runtime *productionFakeTCPRuntime) healthyLocked(ctx context.Context) error {
+	if runtime.closed || runtime.experimentalClosed ||
+		runtime.ExperimentalFakeTCPRuntime == nil {
+		return ErrExperimentalFakeTCPRuntimeClosed
+	}
+	if err := runtime.ExperimentalFakeTCPRuntime.Healthy(ctx); err != nil {
+		return err
+	}
+	if runtime.checksum == nil || runtime.checksumClosed {
+		return errors.New("inspect production FakeTCP health: checksum owner is unavailable")
+	}
+	status := runtime.checksum.RuntimeStatus()
+	if status.Backend == "" || status.Capability == "" ||
+		status.ObjectVariant == "" || len(status.Capabilities) == 0 {
+		return errors.New("inspect production FakeTCP health: checksum status is incomplete")
+	}
+	if status.Backend != runtime.checksum.Backend ||
+		status.Capability != runtime.checksum.Capability ||
+		status.ObjectVariant != runtime.checksum.ObjectVariant ||
+		status.Module != runtime.checksum.Module {
+		return errors.New("inspect production FakeTCP health: checksum status identity changed")
+	}
+	if status.Backend == config.FakeTCPChecksumBackendKprobe && !status.LeaseHeld {
+		return errors.New("inspect production FakeTCP health: kprobe checksum lease is not held")
+	}
+	if err := runtime.checksum.Healthy(ctx); err != nil {
+		return fmt.Errorf("inspect production FakeTCP checksum health: %w", err)
+	}
+	return nil
+}
+
+// Close preserves the checksum owner until every BPF program that can call it
+// has been detached and the collection has been released. Both phases are
+// retryable: a failed experimental close is retried without touching the
+// checksum lease, while a failed checksum close never repeats the already
+// successful experimental teardown.
+func (runtime *productionFakeTCPRuntime) Close() error {
+	if runtime == nil {
+		return nil
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.closed {
+		return runtime.closeErr
+	}
+	if !runtime.experimentalClosed {
+		if runtime.ExperimentalFakeTCPRuntime != nil {
+			if err := runtime.ExperimentalFakeTCPRuntime.Close(); err != nil {
+				runtime.closeErr = fmt.Errorf(
+					"close production FakeTCP experimental owner: %w", err,
+				)
+				return runtime.closeErr
+			}
+		}
+		runtime.experimentalClosed = true
+	}
+	if !runtime.checksumClosed {
+		if runtime.checksum != nil {
+			if err := runtime.checksum.Close(); err != nil {
+				runtime.closeErr = fmt.Errorf(
+					"close production FakeTCP checksum owner: %w", err,
+				)
+				return runtime.closeErr
+			}
+		}
+		runtime.checksumClosed = true
+	}
+	runtime.closed = true
+	runtime.closeErr = nil
+	return nil
 }
 
 func (runtime *productionFakeTCPRuntime) ProductionStatus(
 	ctx context.Context,
 ) (*FakeTCPRuntimeStatus, error) {
-	if runtime == nil || runtime.ExperimentalFakeTCPRuntime == nil {
+	if runtime == nil {
+		return nil, ErrExperimentalFakeTCPRuntimeClosed
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.closed || runtime.experimentalClosed ||
+		runtime.ExperimentalFakeTCPRuntime == nil {
 		return nil, ErrExperimentalFakeTCPRuntimeClosed
 	}
 	identity := runtime.Identity()
@@ -312,7 +493,10 @@ func (runtime *productionFakeTCPRuntime) ProductionStatus(
 		ObjectSHA256: runtime.object.SHA256,
 		Barrier:      "unknown",
 	}
-	healthErr := runtime.Healthy(ctx)
+	if runtime.checksum != nil {
+		status.ChecksumBackend = runtime.checksum.RuntimeStatus()
+	}
+	healthErr := runtime.healthyLocked(ctx)
 	status.Healthy = healthErr == nil
 	if healthErr != nil {
 		status.Error = healthErr.Error()
@@ -330,9 +514,14 @@ func (runtime *productionFakeTCPRuntime) ProductionStatus(
 	}
 	state.mu.Unlock()
 	if productionTC, ok := tc.(*productionFakeTCPTCXStage); ok {
+		status.AttachmentBackend = exactTCXBackend
 		status.TCX = productionTC.status()
+	} else if productionTC, ok := tc.(*productionFakeTCPClassicStage); ok {
+		status.AttachmentBackend = classicTCBackend
+		status.OwnerKind = "durable-classic-tc+process-owned-runtime"
+		status.ClassicTC = productionTC.status()
 	} else if tc != nil {
-		healthErr = errors.Join(healthErr, errors.New("production FakeTCP TCX status owner is unavailable"))
+		healthErr = errors.Join(healthErr, errors.New("production FakeTCP TC status owner is unavailable"))
 	}
 	if xdp != nil {
 		status.XDP = xdp.productionStatus()
@@ -367,7 +556,36 @@ func (request *experimentalFakeTCPProductionRequest) rollbackUnclaimed() error {
 			),
 		)
 	}
+	rollbackErr = errors.Join(rollbackErr, request.closeChecksumSelection())
 	return rollbackErr
+}
+
+func (request *experimentalFakeTCPProductionRequest) closeChecksumSelection() error {
+	if request == nil || request.checksum == nil {
+		return nil
+	}
+	checksum := request.checksum
+	if err := checksum.Close(); err != nil {
+		// Close retains its lease on failure. Keep the exact selection in the
+		// request so coordinator rollback can retry instead of losing the sole
+		// module owner.
+		return fmt.Errorf("close unclaimed FakeTCP checksum selection: %w", err)
+	}
+	request.checksum = nil
+	return nil
+}
+
+func (request *experimentalFakeTCPProductionRequest) takeFailedChecksumOwner() fakeTCPRuntimeService {
+	if request == nil || request.checksum == nil {
+		return nil
+	}
+	checksum := request.checksum
+	request.checksum = nil
+	return &productionFakeTCPRuntime{
+		object:             request.object,
+		checksum:           checksum,
+		experimentalClosed: true,
+	}
 }
 
 // buildLiveExperimentalFakeTCPProductionRequest performs every fallible
@@ -378,7 +596,7 @@ func buildLiveExperimentalFakeTCPProductionRequest(
 	ctx context.Context,
 	state *control.State,
 	baseline LinuxLoader,
-) (*experimentalFakeTCPProductionRequest, error) {
+) (request *experimentalFakeTCPProductionRequest, returnErr error) {
 	if ctx == nil {
 		return nil, errors.New("plan live experimental FakeTCP runtime: context is nil")
 	}
@@ -398,7 +616,7 @@ func buildLiveExperimentalFakeTCPProductionRequest(
 		return nil, errors.New("plan live experimental FakeTCP runtime: object selectors are not frozen")
 	}
 	frozen := cloneFakeTCPProductionState(state)
-	wg, err := validateFakeTCPProductionReferences(frozen)
+	wireGuards, err := validateFakeTCPProductionReferences(frozen)
 	if err != nil {
 		return nil, err
 	}
@@ -417,37 +635,70 @@ func buildLiveExperimentalFakeTCPProductionRequest(
 			scope.lifecyclePath,
 		)
 	}
-	backend, err := resolveAttachmentBackend(frozen, baseline.pinRuntime(ctx).exactTCX)
+	pinRuntime := baseline.pinRuntime(ctx)
+	backend, recoverClassic, err := resolveFakeTCPProductionAttachmentBackend(
+		frozen, scope, pinRuntime,
+	)
 	if err != nil {
 		return nil, fmt.Errorf("plan live experimental FakeTCP runtime attachment backend: %w", err)
 	}
-	if backend != exactTCXBackend {
-		return nil, fmt.Errorf(
-			"plan live experimental FakeTCP runtime attachment backend %q; want %q",
-			backend, exactTCXBackend,
-		)
+	checksum, err := ResolveFakeTCPChecksumBackend(ctx, frozen.ChecksumBackend)
+	if err != nil {
+		return nil, fmt.Errorf("plan live experimental FakeTCP checksum backend: %w", err)
 	}
-	// The factory repeats this immediately before collection load. Keeping the
-	// same read-only module/kfunc probe here ensures an absent or incompatible
-	// administrator-provisioned dependency cannot detach a working baseline.
-	if err := probeExperimentalFakeTCPKernelDependency(); err != nil {
-		return nil, fmt.Errorf(
-			"plan live experimental FakeTCP runtime kernel dependency: %w", err,
-		)
+	defer func() {
+		if checksum != nil {
+			returnErr = errors.Join(
+				returnErr,
+				wrapNonNilError("close unclaimed FakeTCP checksum selection", checksum.Close()),
+			)
+		}
+	}()
+	checksumStageFactory, err := FakeTCPChecksumStageFactory(checksum)
+	if err != nil {
+		return nil, fmt.Errorf("plan live experimental FakeTCP checksum stage: %w", err)
 	}
-
-	spec, identity, err := loadFakeTCPCollectionSpecFromResolvedPath(
-		baseline.effectiveFakeTCPObjectPath(),
+	selectedObjectPath, selectedVariant, err := baseline.effectiveFakeTCPObjectPathForChecksumBackend(
+		checksum.Backend,
 	)
 	if err != nil {
 		return nil, err
 	}
-	if err := validateFakeTCPProductionObjectIdentity(scope, identity); err != nil {
+	if selectedVariant != checksum.ObjectVariant {
+		return nil, fmt.Errorf(
+			"resolved FakeTCP object variant %q differs from checksum selection %q",
+			selectedVariant, checksum.ObjectVariant,
+		)
+	}
+	var spec *ebpf.CollectionSpec
+	var identity ObjectIdentity
+	switch checksum.ObjectVariant {
+	case FakeTCPObjectVariantModernKfunc:
+		spec, identity, err = loadFakeTCPCollectionSpecFromResolvedPath(selectedObjectPath)
+	case FakeTCPObjectVariantLegacy515:
+		spec, identity, err = loadFakeTCPLegacy515CollectionSpecFromResolvedPath(selectedObjectPath)
+	default:
+		err = fmt.Errorf("unsupported FakeTCP object variant %q", checksum.ObjectVariant)
+	}
+	if err != nil {
 		return nil, err
 	}
-	if err := validateExperimentalExtensionManifest(spec); err != nil {
+	selectedScopePath := scope.fakeTCPObjectPath
+	if checksum.ObjectVariant == FakeTCPObjectVariantLegacy515 {
+		selectedScopePath = scope.fakeTCPLegacy515ObjectPath
+	}
+	if err := validateFakeTCPProductionObjectIdentity(scope, selectedScopePath, identity); err != nil {
+		return nil, err
+	}
+	var manifestErr error
+	if checksum.ObjectVariant == FakeTCPObjectVariantLegacy515 {
+		manifestErr = validateLegacy515ExtensionManifest(spec)
+	} else {
+		manifestErr = validateExperimentalExtensionManifest(spec)
+	}
+	if manifestErr != nil {
 		return nil, fmt.Errorf(
-			"validate production FakeTCP BPF object %s: %w", identity.Source, err,
+			"validate production FakeTCP BPF object %s: %w", identity.Source, manifestErr,
 		)
 	}
 
@@ -460,16 +711,16 @@ func buildLiveExperimentalFakeTCPProductionRequest(
 	if err != nil {
 		return nil, err
 	}
-	tcxRequests, err := fakeTCPProductionTCXRequests(frozen)
+	tcRequests, err := fakeTCPProductionTCXRequests(frozen)
 	if err != nil {
 		return nil, err
 	}
 	xdpRequests := fakeTCPProductionXDPRequests(policyPlan)
-	engineOptions, err := fakeTCPProductionEngineOptions(wg, generation)
+	enginePlans, err := fakeTCPProductionEnginePlans(wireGuards, policyPlan, generation)
 	if err != nil {
 		return nil, err
 	}
-	slowPathFactory, err := newLiveExperimentalFakeTCPSlowPathFactory(
+	routedSlowPathFactory, err := newLiveExperimentalFakeTCPRoutedSlowPathFactory(
 		frozen, policyPlan.snapshot(), scope,
 	)
 	if err != nil {
@@ -477,7 +728,7 @@ func buildLiveExperimentalFakeTCPProductionRequest(
 	}
 	desiredKey, err := fakeTCPProductionDesiredKey(
 		frozen, identity, scope, baselineSnapshot, policyPlan,
-		engineOptions, tcxRequests, xdpRequests,
+		enginePlans, backend, checksum, tcRequests, xdpRequests,
 	)
 	if err != nil {
 		return nil, err
@@ -492,23 +743,38 @@ func buildLiveExperimentalFakeTCPProductionRequest(
 	if err != nil {
 		return nil, err
 	}
-	tcxRuntime := baseline.pinRuntime(ctx).exactTCX
+	tcxRuntime := pinRuntime.exactTCX
+	var prepare func(context.Context) error
+	if recoverClassic {
+		prepare = func(buildCtx context.Context) error {
+			return recoverFakeTCPProductionClassicOwner(buildCtx, scope, pinRuntime)
+		}
+	}
+	dependencies := liveExperimentalCollectionAcquisitionDependencies()
+	// The generic acquisition path historically re-probed only the modern
+	// kfunc module. Production has already selected an immutable kfunc/kprobe
+	// owner, so repeat that exact owner's health proof immediately before the
+	// collection load without switching backend or object family.
+	dependencies.probeKernelDependency = fakeTCPProductionChecksumHealthProbe(ctx, checksum)
 
-	return &experimentalFakeTCPProductionRequest{
+	request = &experimentalFakeTCPProductionRequest{
 		key:          desiredKey,
 		spec:         spec,
 		source:       identity.Source,
 		object:       identity,
-		dependencies: liveExperimentalCollectionAcquisitionDependencies(),
+		checksum:     checksum,
+		dependencies: dependencies,
+		prepare:      prepare,
 		buildOptions: experimentalFakeTCPRuntimeBuildOptions{
-			transaction:      transaction,
-			baselineSnapshot: baselineSnapshot,
-			attachState:      frozen,
-			xdpRequests:      xdpRequests,
-			xdpRuntime:       liveFakeTCPXDPRuntime,
-			xdpRequirement:   fakeTCPXDPRequireExactSelectedMode,
-			engineOptions:    engineOptions,
-			slowPathFactory:  slowPathFactory,
+			transaction:           transaction,
+			baselineSnapshot:      baselineSnapshot,
+			attachState:           frozen,
+			checksumStageFactory:  checksumStageFactory,
+			xdpRequests:           xdpRequests,
+			xdpRuntime:            liveFakeTCPXDPRuntime,
+			xdpRequirement:        fakeTCPXDPRequireExactSelectedMode,
+			enginePlans:           enginePlans,
+			routedSlowPathFactory: routedSlowPathFactory,
 			tcStageFactory: func(
 				stageCtx context.Context,
 				attachState *control.State,
@@ -516,12 +782,39 @@ func buildLiveExperimentalFakeTCPProductionRequest(
 				egress experimentalProgramResource,
 				commit func() error,
 			) (experimentalTCStageOwner, error) {
-				return stageProductionFakeTCPTCX(
-					stageCtx, attachState, ingress, egress, commit, tcxRuntime,
-				)
+				switch backend {
+				case exactTCXBackend:
+					return stageProductionFakeTCPTCX(
+						stageCtx, attachState, ingress, egress, commit, tcxRuntime,
+					)
+				case classicTCBackend:
+					return stageProductionFakeTCPClassic(
+						stageCtx, attachState, ingress, egress, commit,
+						pinRuntime, scope, identity,
+					)
+				default:
+					return nil, fmt.Errorf(
+						"stage production FakeTCP: unsupported attachment backend %q", backend,
+					)
+				}
 			},
 		},
-	}, nil
+	}
+	checksum = nil
+	return request, nil
+}
+
+func fakeTCPProductionChecksumHealthProbe(
+	planningCtx context.Context,
+	selection *FakeTCPChecksumSelection,
+) func() error {
+	// Acquisition happens after the planner returns, so the selection health
+	// proof must not inherit cancellation from the completed planning call.
+	// The active build context is checked separately at each acquisition stage.
+	healthCtx := context.WithoutCancel(planningCtx)
+	return func() error {
+		return selection.Healthy(healthCtx)
+	}
 }
 
 func cloneFakeTCPProductionState(state *control.State) *control.State {
@@ -541,33 +834,38 @@ func cloneFakeTCPProductionState(state *control.State) *control.State {
 	return &frozen
 }
 
-func validateFakeTCPProductionReferences(state *control.State) (control.WireGuardState, error) {
+func validateFakeTCPProductionReferences(state *control.State) ([]control.WireGuardState, error) {
 	if state == nil || state.Generation == 0 {
-		return control.WireGuardState{}, errors.New(
+		return nil, errors.New(
 			"plan live experimental FakeTCP runtime: state generation is zero",
 		)
 	}
 	ids := make(map[uint32]control.WireGuardState, len(state.WireGuards))
-	var selected control.WireGuardState
-	count := 0
+	selected := make([]control.WireGuardState, 0, len(state.WireGuards))
 	for _, wg := range state.WireGuards {
 		if wg.ID == 0 {
-			return selected, fmt.Errorf("production WireGuard %q has zero ID", wg.Name)
+			return nil, fmt.Errorf("production WireGuard %q has zero ID", wg.Name)
 		}
 		if previous, exists := ids[wg.ID]; exists {
-			return selected, fmt.Errorf(
+			return nil, fmt.Errorf(
 				"production WireGuard ID %d is duplicated by %q and %q", wg.ID, previous.Name, wg.Name,
 			)
 		}
 		ids[wg.ID] = wg
 		if wg.TransportMode == "faketcp" {
-			selected = wg
-			count++
+			selected = append(selected, wg)
 		}
 	}
-	if count != 1 {
-		return selected, fmt.Errorf("production requires exactly one FakeTCP WireGuard; got %d", count)
+	if len(selected) == 0 {
+		return nil, errors.New("production requires at least one FakeTCP WireGuard")
 	}
+	if len(selected) > fakeTCPControlPoliciesPerGeneration {
+		return nil, fmt.Errorf(
+			"production FakeTCP WireGuards %d exceed per-generation policy capacity %d",
+			len(selected), fakeTCPControlPoliciesPerGeneration,
+		)
+	}
+	sort.Slice(selected, func(left, right int) bool { return selected[left].ID < selected[right].ID })
 	check := func(kind string, index int, wgID uint32, mode string) error {
 		wg, exists := ids[wgID]
 		if !exists {
@@ -579,44 +877,164 @@ func validateFakeTCPProductionReferences(state *control.State) (control.WireGuar
 				kind, index, mode, wgID, wg.TransportMode,
 			)
 		}
-		if mode == "faketcp" && wgID != selected.ID {
-			return fmt.Errorf(
-				"production %s[%d] FakeTCP WGID %d does not match sole FakeTCP WireGuard ID %d",
-				kind, index, wgID, selected.ID,
-			)
-		}
-		if wgID == selected.ID && mode != "faketcp" {
-			return fmt.Errorf(
-				"production %s[%d] references FakeTCP WireGuard ID %d with transport %q",
-				kind, index, wgID, mode,
-			)
-		}
 		return nil
 	}
 	for index, rule := range state.EgressRules {
 		if err := check("egress", index, rule.WGID, rule.TransportMode); err != nil {
-			return selected, err
+			return nil, err
 		}
 	}
 	for index, listener := range state.IngressListeners {
 		if err := check("ingress", index, listener.WGID, listener.TransportMode); err != nil {
-			return selected, err
+			return nil, err
 		}
 	}
 	return selected, nil
 }
 
-func validateFakeTCPProductionObjectIdentity(
-	scope fakeTCPProductionScopeIdentity,
-	identity ObjectIdentity,
-) error {
-	if identity.Source != scope.fakeTCPObjectPath {
-		return fmt.Errorf(
-			"production FakeTCP object source %q differs from scope %q",
-			identity.Source, scope.fakeTCPObjectPath,
+// fakeTCPProductionEnginePlans gives each FakeTCP WireGuard independent
+// admission, half-open and pending budgets while retaining one shared kernel
+// session map/runtime domain. Plans and routes are canonical by WGID then
+// underlay/port so desired-key identity cannot depend on config slice order.
+func fakeTCPProductionEnginePlans(
+	wireGuards []control.WireGuardState,
+	policyPlan *fakeTCPPolicyGenerationPlan,
+	generation uint64,
+) ([]faketcp.WGEnginePlan, error) {
+	if generation == 0 || len(wireGuards) == 0 || policyPlan == nil {
+		return nil, errors.New("build production FakeTCP Engine plans: inputs are incomplete")
+	}
+	if err := validateFakeTCPPolicyGenerationPlan(policyPlan); err != nil {
+		return nil, fmt.Errorf("build production FakeTCP Engine plans: %w", err)
+	}
+	if policyPlan.generation != generation {
+		return nil, fmt.Errorf(
+			"build production FakeTCP Engine plans: policy generation %d differs from %d",
+			policyPlan.generation, generation,
 		)
 	}
-	if identity.Embedded != (scope.fakeTCPObjectPath == EmbeddedFakeTCPObjectSource) {
+
+	ordered := append([]control.WireGuardState(nil), wireGuards...)
+	sort.Slice(ordered, func(left, right int) bool { return ordered[left].ID < ordered[right].ID })
+	referenced := make(map[uint32]struct{}, len(policyPlan.managedPorts))
+	for _, entry := range policyPlan.managedPorts {
+		referenced[entry.Value.WGID] = struct{}{}
+	}
+	if len(referenced) == 0 {
+		return nil, errors.New("build production FakeTCP Engine plans: policy has no managed route")
+	}
+	plans := make([]faketcp.WGEnginePlan, 0, len(referenced))
+	planIndex := make(map[uint32]int, len(referenced))
+	wireGuardByID := make(map[uint32]control.WireGuardState, len(ordered))
+	var aggregateSessions, aggregateHalfOpen, aggregateSourceLedger uint64
+	var aggregatePendingFlows, aggregatePendingBytes uint64
+	for index, wg := range ordered {
+		if wg.ID == 0 || wg.TransportMode != "faketcp" {
+			return nil, fmt.Errorf(
+				"build production FakeTCP Engine plans: WireGuard[%d] has invalid ID/mode",
+				index,
+			)
+		}
+		if index > 0 && ordered[index-1].ID == wg.ID {
+			return nil, fmt.Errorf(
+				"build production FakeTCP Engine plans: duplicate WireGuard ID %d", wg.ID,
+			)
+		}
+		wireGuardByID[wg.ID] = wg
+		if _, exists := referenced[wg.ID]; !exists {
+			continue
+		}
+		if !wg.RuntimeStateAvailable || wg.RuntimeFirewallMark == 0 {
+			return nil, fmt.Errorf(
+				"build production FakeTCP Engine plans: WireGuard %q has no live nonzero mark",
+				wg.Name,
+			)
+		}
+		options, err := fakeTCPProductionEngineOptions(wg, generation)
+		if err != nil {
+			return nil, fmt.Errorf(
+				"build production FakeTCP Engine plan for WireGuard %q: %w", wg.Name, err,
+			)
+		}
+		planIndex[wg.ID] = len(plans)
+		plans = append(plans, faketcp.WGEnginePlan{WGID: wg.ID, Options: options})
+		aggregateSessions += uint64(options.SessionCapacity)
+		aggregateHalfOpen += uint64(options.MaxHalfOpenSessions)
+		aggregateSourceLedger += uint64(options.SYNSourceLedgerCapacity)
+		aggregatePendingFlows += uint64(options.MaxPendingFlows)
+		aggregatePendingBytes += uint64(options.MaxPendingBytes)
+	}
+	for _, limit := range []struct {
+		name  string
+		value uint64
+		max   uint64
+	}{
+		{name: "session capacity", value: aggregateSessions, max: config.MaxFakeTCPSessions},
+		{name: "half-open capacity", value: aggregateHalfOpen, max: config.MaxFakeTCPHalfOpenSessions},
+		{name: "source-ledger capacity", value: aggregateSourceLedger, max: config.MaxFakeTCPSYNSourceLedger},
+		{name: "pending-flow capacity", value: aggregatePendingFlows, max: config.MaxFakeTCPPendingFlows},
+		{name: "pending-byte capacity", value: aggregatePendingBytes, max: config.MaxFakeTCPPendingBytes},
+	} {
+		if limit.value > limit.max {
+			return nil, fmt.Errorf(
+				"build production FakeTCP Engine plans: aggregate %s %d exceeds shared maximum %d",
+				limit.name, limit.value, limit.max,
+			)
+		}
+	}
+
+	for _, entry := range policyPlan.managedPorts {
+		index, exists := planIndex[entry.Value.WGID]
+		if !exists {
+			return nil, fmt.Errorf(
+				"build production FakeTCP Engine plans: managed port references unknown WGID %d",
+				entry.Value.WGID,
+			)
+		}
+		if entry.Key.Generation != generation || entry.Value.Generation != generation ||
+			entry.Key.UnderlayIndex == 0 || entry.Key.DestinationPort == 0 ||
+			entry.Value.Action != abi.ActionRewrite {
+			return nil, fmt.Errorf(
+				"build production FakeTCP Engine plans: managed route for WGID %d is invalid",
+				entry.Value.WGID,
+			)
+		}
+		wg := wireGuardByID[entry.Value.WGID]
+		plans[index].Routes = append(plans[index].Routes, faketcp.EngineRoute{
+			Generation: generation, UnderlayIndex: entry.Key.UnderlayIndex,
+			LocalPort: entry.Key.DestinationPort, WGID: entry.Value.WGID,
+			FWMark: wg.RuntimeFirewallMark, Action: entry.Value.Action,
+		})
+	}
+	for index := range plans {
+		if len(plans[index].Routes) == 0 {
+			return nil, fmt.Errorf(
+				"build production FakeTCP Engine plans: WGID %d has no managed route",
+				plans[index].WGID,
+			)
+		}
+	}
+	return plans, nil
+}
+
+func validateFakeTCPProductionObjectIdentity(
+	scope fakeTCPProductionScopeIdentity,
+	selectedScopePath string,
+	identity ObjectIdentity,
+) error {
+	if selectedScopePath != scope.fakeTCPObjectPath &&
+		selectedScopePath != scope.fakeTCPLegacy515ObjectPath {
+		return fmt.Errorf("production FakeTCP selected object scope %q is not retained", selectedScopePath)
+	}
+	if identity.Source != selectedScopePath {
+		return fmt.Errorf(
+			"production FakeTCP object source %q differs from scope %q",
+			identity.Source, selectedScopePath,
+		)
+	}
+	embedded := selectedScopePath == EmbeddedFakeTCPObjectSource ||
+		selectedScopePath == EmbeddedFakeTCPLegacy515ObjectSource
+	if identity.Embedded != embedded {
 		return errors.New("production FakeTCP object embedded identity differs from scope")
 	}
 	digest, err := hex.DecodeString(identity.SHA256)
@@ -753,18 +1171,29 @@ func fakeTCPProductionDesiredKey(
 	scope fakeTCPProductionScopeIdentity,
 	baseline *abi.Snapshot,
 	plan *fakeTCPPolicyGenerationPlan,
-	engine faketcp.Options,
+	enginePlans []faketcp.WGEnginePlan,
+	attachmentBackend string,
+	checksum *FakeTCPChecksumSelection,
 	tcx []fakeTCPProductionTCXAttachRequest,
 	xdp []fakeTCPXDPAttachRequest,
 ) (fakeTCPRuntimeDesiredKey, error) {
-	if state == nil || baseline == nil || plan == nil {
+	if state == nil || baseline == nil || plan == nil || checksum == nil || len(enginePlans) == 0 {
 		return fakeTCPRuntimeDesiredKey{}, errors.New("build production FakeTCP desired key: incomplete input")
 	}
-	engine.Generation = state.Generation
 	h := sha256.New()
 	fakeTCPDesiredKeyString(h, "wg-mix-ebpf/faketcp-production-key/v1")
-	fakeTCPDesiredKeyString(h, exactTCXBackend)
+	fakeTCPDesiredKeyString(h, attachmentBackend)
 	fakeTCPDesiredKeyString(h, fakeTCPXDPBackendDirect.String())
+	fakeTCPDesiredKeyString(h, checksum.Requested)
+	fakeTCPDesiredKeyString(h, checksum.Backend)
+	fakeTCPDesiredKeyString(h, checksum.Capability)
+	fakeTCPDesiredKeyString(h, checksum.ObjectVariant)
+	fakeTCPDesiredKeyString(h, checksum.Module)
+	checksumCapabilities := append([]string(nil), checksum.Capabilities...)
+	sort.Strings(checksumCapabilities)
+	for _, capability := range checksumCapabilities {
+		fakeTCPDesiredKeyString(h, capability)
+	}
 	fakeTCPDesiredKeyString(h, identity.Source)
 	fakeTCPDesiredKeyString(h, identity.SHA256)
 	if identity.Embedded {
@@ -804,18 +1233,36 @@ func fakeTCPProductionDesiredKey(
 			"build production FakeTCP desired key controller marks: %w", err,
 		)
 	}
-	for _, value := range []uint64{
-		engine.Generation, uint64(engine.SessionCapacity), uint64(engine.MaxHalfOpenSessions),
-		uint64(engine.MaxHalfOpenPerSource), uint64(engine.SYNRateInterval), uint64(engine.SYNBurst),
-		uint64(engine.SYNBurstPerSource), uint64(engine.SYNSourceLedgerCapacity),
-		uint64(engine.SYNSourceLedgerTTL), uint64(engine.MaxPendingFlows),
-		uint64(engine.MaxPendingPacketsPerFlow), uint64(engine.MaxPendingBytes),
-		uint64(engine.HandshakeTimeout), uint64(engine.HandshakeRetries),
-		uint64(engine.KeepaliveInterval), uint64(engine.IdleTimeout), uint64(engine.Window),
-		uint64(fakeTCPXDPRequireExactSelectedMode),
-	} {
-		fakeTCPDesiredKeyUint64(h, value)
+	fakeTCPDesiredKeyUint64(h, uint64(len(enginePlans)))
+	for index, enginePlan := range enginePlans {
+		if enginePlan.WGID == 0 || enginePlan.Options.Generation != state.Generation ||
+			len(enginePlan.Routes) == 0 ||
+			(index > 0 && enginePlans[index-1].WGID >= enginePlan.WGID) {
+			return fakeTCPRuntimeDesiredKey{}, fmt.Errorf(
+				"build production FakeTCP desired key: Engine plan[%d] is not canonical", index,
+			)
+		}
+		fakeTCPDesiredKeyUint64(h, uint64(enginePlan.WGID))
+		for _, value := range fakeTCPProductionEngineOptionIdentity(enginePlan.Options) {
+			fakeTCPDesiredKeyUint64(h, value)
+		}
+		fakeTCPDesiredKeyUint64(h, uint64(len(enginePlan.Routes)))
+		for routeIndex, route := range enginePlan.Routes {
+			if route.Generation != state.Generation || route.WGID != enginePlan.WGID {
+				return fakeTCPRuntimeDesiredKey{}, fmt.Errorf(
+					"build production FakeTCP desired key: Engine plan[%d] route[%d] identity differs",
+					index, routeIndex,
+				)
+			}
+			for _, value := range []uint64{
+				route.Generation, uint64(route.UnderlayIndex), uint64(route.LocalPort),
+				uint64(route.WGID), uint64(route.FWMark), uint64(route.Action),
+			} {
+				fakeTCPDesiredKeyUint64(h, value)
+			}
+		}
 	}
+	fakeTCPDesiredKeyUint64(h, uint64(fakeTCPXDPRequireExactSelectedMode))
 	for _, request := range tcx {
 		fakeTCPDesiredKeyUint64(h, uint64(request.ifIndex))
 		fakeTCPDesiredKeyUint64(h, uint64(request.attach))
@@ -830,6 +1277,18 @@ func fakeTCPProductionDesiredKey(
 		return key, errors.New("build production FakeTCP desired key: digest is zero")
 	}
 	return key, nil
+}
+
+func fakeTCPProductionEngineOptionIdentity(engine faketcp.Options) []uint64 {
+	return []uint64{
+		engine.Generation, uint64(engine.SessionCapacity), uint64(engine.MaxHalfOpenSessions),
+		uint64(engine.MaxHalfOpenPerSource), uint64(engine.SYNRateInterval), uint64(engine.SYNBurst),
+		uint64(engine.SYNBurstPerSource), uint64(engine.SYNSourceLedgerCapacity),
+		uint64(engine.SYNSourceLedgerTTL), uint64(engine.MaxPendingFlows),
+		uint64(engine.MaxPendingPacketsPerFlow), uint64(engine.MaxPendingBytes),
+		uint64(engine.HandshakeTimeout), uint64(engine.HandshakeRetries),
+		uint64(engine.KeepaliveInterval), uint64(engine.IdleTimeout), uint64(engine.Window),
+	}
 }
 
 func fakeTCPDesiredKeyBytes(h hash.Hash, value []byte) {

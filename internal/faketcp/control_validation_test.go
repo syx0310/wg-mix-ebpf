@@ -226,6 +226,7 @@ func TestCapturedCloseRequiresExistingFastSession(t *testing.T) {
 func TestCapturedCloseCannotTearDownAnotherFlow(t *testing.T) {
 	engine, store, flow, state := establishedControlTestSession(t)
 	otherFlow := testFlow(31002)
+	otherFlow.WGID = 8
 	if _, err := engine.outbound(otherFlow, PendingPacket{Data: []byte{2}, WGID: 8}, false); err != nil {
 		t.Fatal(err)
 	}

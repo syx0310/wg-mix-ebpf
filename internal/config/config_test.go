@@ -40,6 +40,9 @@ profiles:
 	if cfg.Runtime.AttachmentBackend != "auto" {
 		t.Fatalf("attachment backend default = %q", cfg.Runtime.AttachmentBackend)
 	}
+	if cfg.Runtime.ChecksumBackend != FakeTCPChecksumBackendAuto {
+		t.Fatalf("checksum backend default = %q", cfg.Runtime.ChecksumBackend)
+	}
 }
 
 func TestRuntimeAttachmentBackends(t *testing.T) {
@@ -54,6 +57,25 @@ func TestRuntimeAttachmentBackends(t *testing.T) {
 	}
 	if _, err := Load([]byte("version: 1\nunderlays: []\nwireguards: []\nprofiles: {}\nruntime:\n  attachment_backend: legacy\n")); err == nil {
 		t.Fatal("expected unsupported attachment backend rejection")
+	}
+}
+
+func TestRuntimeChecksumBackends(t *testing.T) {
+	for _, backend := range []string{
+		FakeTCPChecksumBackendAuto,
+		FakeTCPChecksumBackendKfunc,
+		FakeTCPChecksumBackendKprobe,
+	} {
+		cfg, err := Load([]byte("version: 1\nunderlays: []\nwireguards: []\nprofiles: {}\nruntime:\n  checksum_backend: " + backend + "\n"))
+		if err != nil {
+			t.Fatalf("load backend %s: %v", backend, err)
+		}
+		if cfg.Runtime.ChecksumBackend != backend {
+			t.Fatalf("checksum backend = %q, want %q", cfg.Runtime.ChecksumBackend, backend)
+		}
+	}
+	if _, err := Load([]byte("version: 1\nunderlays: []\nwireguards: []\nprofiles: {}\nruntime:\n  checksum_backend: magic\n")); err == nil {
+		t.Fatal("expected unsupported checksum backend rejection")
 	}
 }
 
@@ -523,8 +545,8 @@ profiles:
 	}
 }
 
-func TestRejectMultipleFakeTCPWireGuards(t *testing.T) {
-	_, err := Load([]byte(`
+func TestAcceptMultipleFakeTCPWireGuards(t *testing.T) {
+	cfg, err := Load([]byte(`
 version: 1
 underlays:
   - name: eth0
@@ -542,8 +564,11 @@ profiles:
   mix-default:
     preset: wireguard-mix-wire-values-v1
 `))
-	if err == nil || !strings.Contains(err.Error(), "at most one WireGuard") {
-		t.Fatalf("multiple FakeTCP error = %v", err)
+	if err != nil {
+		t.Fatalf("multiple FakeTCP rejected: %v", err)
+	}
+	if len(cfg.WireGuards) != 2 {
+		t.Fatalf("wireguards = %d, want 2", len(cfg.WireGuards))
 	}
 }
 
@@ -604,8 +629,8 @@ profiles:
 	}
 }
 
-func TestRejectFakeTCPWithClassicTCAttachmentBackend(t *testing.T) {
-	_, err := Load([]byte(`
+func TestAcceptFakeTCPWithClassicTCAttachmentBackend(t *testing.T) {
+	cfg, err := Load([]byte(`
 version: 1
 underlays:
   - name: eth0
@@ -621,8 +646,11 @@ profiles:
 runtime:
   attachment_backend: classic_tc
 `))
-	if err == nil || !strings.Contains(err.Error(), "classic_tc is unsupported for faketcp") {
-		t.Fatalf("FakeTCP classic_tc error = %v", err)
+	if err != nil {
+		t.Fatalf("FakeTCP classic_tc rejected: %v", err)
+	}
+	if cfg.Runtime.AttachmentBackend != "classic_tc" {
+		t.Fatalf("attachment backend = %q", cfg.Runtime.AttachmentBackend)
 	}
 }
 

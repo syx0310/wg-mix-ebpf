@@ -254,15 +254,17 @@ var xorTailCallBindings = []struct {
 }
 
 type LinuxLoader struct {
-	ObjectPath              string
-	FakeTCPObjectPath       string
-	PinPath                 string
-	AdoptLegacyPins         bool
-	LifecycleLease          *lockfile.LifecycleLease
-	ResidentRuntime         bool
-	runtime                 *pinPathRuntime
-	objectPathFrozen        bool
-	fakeTCPObjectPathFrozen bool
+	ObjectPath                       string
+	FakeTCPObjectPath                string
+	FakeTCPLegacy515ObjectPath       string
+	PinPath                          string
+	AdoptLegacyPins                  bool
+	LifecycleLease                   *lockfile.LifecycleLease
+	ResidentRuntime                  bool
+	runtime                          *pinPathRuntime
+	objectPathFrozen                 bool
+	fakeTCPObjectPathFrozen          bool
+	fakeTCPLegacy515ObjectPathFrozen bool
 }
 
 func NewLoader() Loader {
@@ -271,12 +273,13 @@ func NewLoader() Loader {
 
 func NewLoaderWithOptions(options LoaderOptions) Loader {
 	baseline := LinuxLoader{
-		ObjectPath:        objectPathFromEnv(""),
-		FakeTCPObjectPath: fakeTCPObjectPathFromEnv(options.FakeTCPObjectPath),
-		PinPath:           pinPathFromEnv(""),
-		AdoptLegacyPins:   options.AdoptLegacyPins,
-		LifecycleLease:    options.LifecycleLease,
-		ResidentRuntime:   options.ResidentRuntime,
+		ObjectPath:                 objectPathFromEnv(""),
+		FakeTCPObjectPath:          fakeTCPObjectPathFromEnv(options.FakeTCPObjectPath),
+		FakeTCPLegacy515ObjectPath: fakeTCPLegacy515ObjectPathFromEnv(options.FakeTCPLegacy515ObjectPath),
+		PinPath:                    pinPathFromEnv(""),
+		AdoptLegacyPins:            options.AdoptLegacyPins,
+		LifecycleLease:             options.LifecycleLease,
+		ResidentRuntime:            options.ResidentRuntime,
 	}
 	return newFakeTCPProductionLoader(baseline)
 }
@@ -1149,6 +1152,13 @@ func (l LinuxLoader) effectiveFakeTCPObjectPath() string {
 		return l.FakeTCPObjectPath
 	}
 	return fakeTCPObjectPathFromEnv(l.FakeTCPObjectPath)
+}
+
+func (l LinuxLoader) effectiveFakeTCPLegacy515ObjectPath() string {
+	if l.fakeTCPLegacy515ObjectPathFrozen {
+		return l.FakeTCPLegacy515ObjectPath
+	}
+	return fakeTCPLegacy515ObjectPathFromEnv(l.FakeTCPLegacy515ObjectPath)
 }
 
 func (l LinuxLoader) loadCollectionSpec() (*ebpf.CollectionSpec, ObjectIdentity, error) {

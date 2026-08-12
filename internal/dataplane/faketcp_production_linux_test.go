@@ -9,13 +9,18 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/cilium/ebpf"
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
+	"github.com/syx0310/wg-mix-ebpf/internal/faketcp"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
 
@@ -79,12 +84,13 @@ func TestResolveLinuxFakeTCPProductionScopeIncludesEveryOwnershipSelector(t *tes
 		t.Fatal(err)
 	}
 	want := fakeTCPProductionScopeIdentity{
-		objectKind:        fakeTCPProductionObjectScopeFilesystem,
-		objectPath:        objectPath,
-		fakeTCPObjectPath: EmbeddedFakeTCPObjectSource,
-		pinPath:           pinPath,
-		lifecyclePath:     lifecyclePath,
-		adoptLegacyPins:   true,
+		objectKind:                 fakeTCPProductionObjectScopeFilesystem,
+		objectPath:                 objectPath,
+		fakeTCPObjectPath:          EmbeddedFakeTCPObjectSource,
+		fakeTCPLegacy515ObjectPath: EmbeddedFakeTCPLegacy515ObjectSource,
+		pinPath:                    pinPath,
+		lifecyclePath:              lifecyclePath,
+		adoptLegacyPins:            true,
 	}
 	if got != want {
 		t.Fatalf("resolved scope = %#v, want %#v", got, want)
@@ -286,7 +292,7 @@ func TestLiveExperimentalProductionPlanningRequiresResidentRuntimeBeforeMutation
 	}
 }
 
-func TestLiveExperimentalProductionPlannerProbesKernelDependencyBeforeObjectAndLeasePlan(t *testing.T) {
+func TestLiveExperimentalProductionPlannerSelectsChecksumBeforeObjectAndLeasePlan(t *testing.T) {
 	files := token.NewFileSet()
 	parsed, err := parser.ParseFile(
 		files, "faketcp_production_linux.go", nil, parser.SkipObjectResolution,
@@ -316,7 +322,7 @@ func TestLiveExperimentalProductionPlannerProbesKernelDependencyBeforeObjectAndL
 			return true
 		}
 		switch identifier.Name {
-		case "probeExperimentalFakeTCPKernelDependency",
+		case "ResolveFakeTCPChecksumBackend",
 			"loadFakeTCPCollectionSpecFromResolvedPath",
 			"newFakeTCPPolicyGenerationTransaction":
 			if positions[identifier.Name] == token.NoPos {
@@ -325,19 +331,62 @@ func TestLiveExperimentalProductionPlannerProbesKernelDependencyBeforeObjectAndL
 		}
 		return true
 	})
-	probe := positions["probeExperimentalFakeTCPKernelDependency"]
+	selection := positions["ResolveFakeTCPChecksumBackend"]
 	load := positions["loadFakeTCPCollectionSpecFromResolvedPath"]
 	transaction := positions["newFakeTCPPolicyGenerationTransaction"]
-	if probe == token.NoPos || load == token.NoPos || transaction == token.NoPos ||
-		!(probe < load && load < transaction) {
+	if selection == token.NoPos || load == token.NoPos || transaction == token.NoPos ||
+		!(selection < load && load < transaction) {
 		t.Fatalf(
-			"planner order probe=%d load=%d transaction=%d; want dependency probe before object/lease plan",
-			probe, load, transaction,
+			"planner order selection=%d load=%d transaction=%d; want checksum selection before object/lease plan",
+			selection, load, transaction,
 		)
 	}
 }
 
-func TestFakeTCPProductionDesiredKeyBindsCipherAndObjectIdentity(t *testing.T) {
+func TestFakeTCPProductionChecksumHealthProbeOutlivesPlanningContext(t *testing.T) {
+	planningCtx, cancel := context.WithCancel(t.Context())
+	selection := fakeTCPProductionTestChecksumSelection(
+		config.FakeTCPChecksumBackendKfunc,
+		config.FakeTCPChecksumBackendKfunc,
+	)
+	var healthCtx context.Context
+	selection.health = func(ctx context.Context, _ uint64) error {
+		healthCtx = ctx
+		return ctx.Err()
+	}
+	probe := fakeTCPProductionChecksumHealthProbe(planningCtx, selection)
+	cancel()
+	if err := probe(); err != nil {
+		t.Fatalf("health probe inherited planning cancellation: %v", err)
+	}
+	if healthCtx == nil || healthCtx.Err() != nil {
+		t.Fatalf("health context = %#v, want retained uncancelled context", healthCtx)
+	}
+}
+
+func fakeTCPProductionTestChecksumSelection(requested, backend string) *FakeTCPChecksumSelection {
+	selection := &FakeTCPChecksumSelection{
+		Requested:    requested,
+		Backend:      backend,
+		Capability:   FakeTCPChecksumCapabilityFullGSOV1,
+		Capabilities: append([]string(nil), fullFakeTCPChecksumCapabilities...),
+		health:       func(context.Context, uint64) error { return nil },
+	}
+	switch backend {
+	case config.FakeTCPChecksumBackendKfunc:
+		selection.ObjectVariant = FakeTCPObjectVariantModernKfunc
+		selection.Module = DefaultFakeTCPKfuncModule
+	case config.FakeTCPChecksumBackendKprobe:
+		selection.ObjectVariant = FakeTCPObjectVariantLegacy515
+		selection.Module = DefaultFakeTCPKprobeModule
+		selection.LeaseHeld = true
+		selection.lease = io.NopCloser(strings.NewReader(""))
+		selection.cookie = 1
+	}
+	return selection
+}
+
+func TestFakeTCPProductionDesiredKeyBindsCipherObjectAndChecksumIdentity(t *testing.T) {
 	state := fakeTCPPolicyStateWithInterfaces(1)
 	state.WireGuards[0].RuntimeStateAvailable = true
 	state.WireGuards[0].RuntimeFirewallMark = 0x9001
@@ -362,15 +411,19 @@ func TestFakeTCPProductionDesiredKeyBindsCipherAndObjectIdentity(t *testing.T) {
 		Embedded: true,
 	}
 	scope := fakeTCPProductionTestScope()
-	engine := runtimeTestEngineOptions(state.Generation)
+	enginePlans := runtimeTestEnginePlans(state.Generation, 1)
+	checksum := fakeTCPProductionTestChecksumSelection(
+		config.FakeTCPChecksumBackendAuto,
+		config.FakeTCPChecksumBackendKfunc,
+	)
 	first, err := fakeTCPProductionDesiredKey(
-		state, identity, scope, baseline, plan, engine, tcx, xdp,
+		state, identity, scope, baseline, plan, enginePlans, exactTCXBackend, checksum, tcx, xdp,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
 	again, err := fakeTCPProductionDesiredKey(
-		state, identity, scope, baseline, plan, engine, tcx, xdp,
+		state, identity, scope, baseline, plan, enginePlans, exactTCXBackend, checksum, tcx, xdp,
 	)
 	if err != nil || again != first {
 		t.Fatalf("stable desired key changed: first=%x again=%x err=%v", first, again, err)
@@ -381,7 +434,7 @@ func TestFakeTCPProductionDesiredKeyBindsCipherAndObjectIdentity(t *testing.T) {
 		t.Fatal(err)
 	}
 	secretChanged, err := fakeTCPProductionDesiredKey(
-		state, identity, scope, secretBaseline, plan, engine, tcx, xdp,
+		state, identity, scope, secretBaseline, plan, enginePlans, exactTCXBackend, checksum, tcx, xdp,
 	)
 	if err != nil || secretChanged == first {
 		t.Fatalf("cipher-only change was not bound: key=%x err=%v", secretChanged, err)
@@ -389,10 +442,38 @@ func TestFakeTCPProductionDesiredKeyBindsCipherAndObjectIdentity(t *testing.T) {
 	state.Ciphers[0].Key[0] ^= 0xff
 	identity.SHA256 = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
 	objectChanged, err := fakeTCPProductionDesiredKey(
-		state, identity, scope, baseline, plan, engine, tcx, xdp,
+		state, identity, scope, baseline, plan, enginePlans, exactTCXBackend, checksum, tcx, xdp,
 	)
 	if err != nil || objectChanged == first {
 		t.Fatalf("object-only change was not bound: key=%x err=%v", objectChanged, err)
+	}
+
+	identity.SHA256 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	explicitKfunc := fakeTCPProductionTestChecksumSelection(
+		config.FakeTCPChecksumBackendKfunc,
+		config.FakeTCPChecksumBackendKfunc,
+	)
+	requestedChanged, err := fakeTCPProductionDesiredKey(
+		state, identity, scope, baseline, plan, enginePlans, exactTCXBackend, explicitKfunc, tcx, xdp,
+	)
+	if err != nil || requestedChanged == first {
+		t.Fatalf("checksum request-only change was not bound: key=%x err=%v", requestedChanged, err)
+	}
+
+	legacyScope := scope
+	legacyScope.fakeTCPLegacy515ObjectPath = EmbeddedFakeTCPLegacy515ObjectSource
+	legacyIdentity := identity
+	legacyIdentity.Source = EmbeddedFakeTCPLegacy515ObjectSource
+	legacyChecksum := fakeTCPProductionTestChecksumSelection(
+		config.FakeTCPChecksumBackendKprobe,
+		config.FakeTCPChecksumBackendKprobe,
+	)
+	legacyChanged, err := fakeTCPProductionDesiredKey(
+		state, legacyIdentity, legacyScope, baseline, plan, enginePlans,
+		classicTCBackend, legacyChecksum, tcx, xdp,
+	)
+	if err != nil || legacyChanged == first {
+		t.Fatalf("legacy checksum/object/backend change was not bound: key=%x err=%v", legacyChanged, err)
 	}
 }
 
@@ -416,8 +497,8 @@ func TestValidateFakeTCPProductionReferencesRejectsAmbiguousOwnership(t *testing
 		name   string
 		mutate func(*control.State)
 	}{
-		{name: "two FakeTCP WireGuards", mutate: func(state *control.State) {
-			state.WireGuards[1].TransportMode = "faketcp"
+		{name: "no FakeTCP WireGuard", mutate: func(state *control.State) {
+			state.WireGuards[0].TransportMode = "udp"
 		}},
 		{name: "egress FakeTCP wrong owner", mutate: func(state *control.State) {
 			state.EgressRules[0].WGID = 2
@@ -439,8 +520,102 @@ func TestValidateFakeTCPProductionReferencesRejectsAmbiguousOwnership(t *testing
 	}
 	state := base()
 	selected, err := validateFakeTCPProductionReferences(state)
-	if err != nil || selected.ID != 1 {
+	if err != nil || len(selected) != 1 || selected[0].ID != 1 {
 		t.Fatalf("valid sole-owner state rejected: selected=%#v err=%v", selected, err)
+	}
+	state.WireGuards[1].TransportMode = "faketcp"
+	state.IngressListeners = append(state.IngressListeners, control.IngressListener{
+		Generation: 7, WGID: 2, TransportMode: "faketcp",
+	})
+	selected, err = validateFakeTCPProductionReferences(state)
+	if err != nil || len(selected) != 2 || selected[0].ID != 1 || selected[1].ID != 2 {
+		t.Fatalf("valid multi-owner state rejected: selected=%#v err=%v", selected, err)
+	}
+}
+
+func TestFakeTCPProductionDesiredKeyBindsEveryEnginePlan(t *testing.T) {
+	state := fakeTCPPolicyStateWithInterfaces(1)
+	plan, err := buildFakeTCPPolicyGenerationPlan(state, state.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := abi.FromStateWithGeneration(state, state.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := ObjectIdentity{
+		Source:   EmbeddedFakeTCPObjectSource,
+		SHA256:   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Embedded: true,
+	}
+	checksum := fakeTCPProductionTestChecksumSelection(
+		config.FakeTCPChecksumBackendAuto, config.FakeTCPChecksumBackendKfunc,
+	)
+	attachments, err := fakeTCPProductionTCXRequests(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans := runtimeTestEnginePlans(state.Generation, 2)
+	first, err := fakeTCPProductionDesiredKey(
+		state, identity, fakeTCPProductionTestScope(), baseline, plan, plans,
+		exactTCXBackend, checksum, attachments, fakeTCPProductionXDPRequests(plan),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	changed := append([]faketcp.WGEnginePlan(nil), plans...)
+	changed[1].Options.MaxPendingBytes++
+	second, err := fakeTCPProductionDesiredKey(
+		state, identity, fakeTCPProductionTestScope(), baseline, plan, changed,
+		exactTCXBackend, checksum, attachments, fakeTCPProductionXDPRequests(plan),
+	)
+	if err != nil || second == first {
+		t.Fatalf("second Engine plan change was not bound: first=%x second=%x err=%v", first, second, err)
+	}
+}
+
+func TestFakeTCPProductionEnginePlansAreCanonicalPerWireGuard(t *testing.T) {
+	state := fakeTCPPolicyTestState()
+	for index := range state.WireGuards {
+		wg := &state.WireGuards[index]
+		wg.RuntimeStateAvailable = true
+		wg.RuntimeFirewallMark = 0x9000 + wg.ID
+		wg.FakeTCPSessionCapacity = 64
+		wg.FakeTCPMaxHalfOpenSessions = 16
+		wg.FakeTCPMaxHalfOpenPerSource = 4
+		wg.FakeTCPSYNBurstPerSource = 2
+		wg.FakeTCPSYNSourceLedgerCapacity = 32
+		wg.FakeTCPSYNSourceLedgerTTLNanos = int64(time.Second)
+		wg.FakeTCPMaxPendingFlows = 8
+		wg.FakeTCPMaxPendingPacketsPerFlow = 2
+		wg.FakeTCPMaxPendingBytes = 4096
+		wg.FakeTCPHandshakeTimeoutNanos = int64(time.Second)
+		wg.FakeTCPKeepaliveIntervalNanos = int64(time.Second)
+		wg.FakeTCPIdleTimeoutNanos = int64(5 * time.Second)
+	}
+	wireGuards, err := validateFakeTCPProductionReferences(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy, err := buildFakeTCPPolicyGenerationPlan(state, state.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans, err := fakeTCPProductionEnginePlans(wireGuards, policy, state.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(plans) != 2 || plans[0].WGID != 1 || plans[1].WGID != 2 ||
+		len(plans[0].Routes) != 1 || len(plans[1].Routes) != 1 {
+		t.Fatalf("production Engine plans = %#v", plans)
+	}
+	for _, enginePlan := range plans {
+		route := enginePlan.Routes[0]
+		if route.WGID != enginePlan.WGID || route.Generation != state.Generation ||
+			route.FWMark != 0x9000+enginePlan.WGID || route.Action != abi.ActionRewrite ||
+			enginePlan.Options.Store != nil {
+			t.Fatalf("production Engine plan is not isolated/canonical: %#v", enginePlan)
+		}
 	}
 }
 

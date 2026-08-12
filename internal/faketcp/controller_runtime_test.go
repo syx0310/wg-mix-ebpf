@@ -54,11 +54,11 @@ func TestControllerRuntimeFactoryFreezesMarksAndCopiesShareOneClaim(t *testing.T
 	}) {
 		t.Fatalf("binding=%#v", claim.binding)
 	}
-	mark, err := claim.controlMarks.ControlMark(context.Background(), testFlow(31001), 77)
+	mark, err := claim.controlMarks.ControlMark(context.Background(), testFlowWithWGID(31001, 77), 77)
 	if err != nil || mark != 0xa1230007 {
 		t.Fatalf("frozen mark=%#x err=%v", mark, err)
 	}
-	if _, err := claim.controlMarks.ControlMark(context.Background(), testFlow(31001), 88); err == nil {
+	if _, err := claim.controlMarks.ControlMark(context.Background(), testFlowWithWGID(31001, 88), 88); err == nil {
 		t.Fatal("post-construction mark mutation became visible")
 	}
 	if _, err := copyFactory.claim(identity, 103, 104, 8); !errors.Is(err, ErrControllerRuntimeFactoryConsumed) {
@@ -128,9 +128,9 @@ func TestFixedControlMarksFailClosedOutsideFrozenGeneration(t *testing.T) {
 		flow abi.FakeTCPSessionKey
 		wgID uint32
 	}{
-		{name: "nil context", flow: testFlow(31001), wgID: 77},
-		{name: "cancelled", ctx: cancelled, flow: testFlow(31001), wgID: 77},
-		{name: "generation", ctx: context.Background(), flow: wrongGeneration, wgID: 77},
+		{name: "nil context", flow: testFlowWithWGID(31001, 77), wgID: 77},
+		{name: "cancelled", ctx: cancelled, flow: testFlowWithWGID(31001, 77), wgID: 77},
+		{name: "generation", ctx: context.Background(), flow: wrongGeneration, wgID: wrongGeneration.WGID},
 		{name: "unknown WG", ctx: context.Background(), flow: testFlow(31001), wgID: 88},
 	} {
 		t.Run(test.name, func(t *testing.T) {
@@ -141,11 +141,11 @@ func TestFixedControlMarksFailClosedOutsideFrozenGeneration(t *testing.T) {
 	}
 }
 
-func TestControllerRuntimeModelCombinesV2CloseOrderingAndOnceOnlyReinjection(t *testing.T) {
+func TestControllerRuntimeModelCombinesV3CloseOrderingAndOnceOnlyReinjection(t *testing.T) {
 	store := newFakeSessionStore()
 	engine, _ := testEngine(t, func(options *Options) { options.Store = store })
 	identity := engine.Identity()
-	closeFlow := testFlow(31002)
+	closeFlow := testFlowWithWGID(31002, 77)
 	if _, err := engine.outbound(
 		closeFlow,
 		PendingPacket{Data: []byte{9}, WGID: 77},
@@ -177,13 +177,13 @@ func TestControllerRuntimeModelCombinesV2CloseOrderingAndOnceOnlyReinjection(t *
 		t.Fatal(err)
 	}
 	if len(closeSample) != abi.FakeTCPEventSize+len(closePacket) ||
-		decodedClose.Event.EventABIVersion != 2 ||
+		decodedClose.Event.EventABIVersion != abi.FakeTCPEventABIVersion ||
 		decodedClose.Event.SessionID != closeState.SessionID ||
 		decodedClose.Event.SessionRevision != closeState.Revision {
-		t.Fatalf("v2 close decode=%#v sample-size=%d", decodedClose.Event, len(closeSample))
+		t.Fatalf("v3 close decode=%#v sample-size=%d", decodedClose.Event, len(closeSample))
 	}
 
-	flow := testFlow(31001)
+	flow := testFlowWithWGID(31001, 77)
 	packet := testIPv4UDPPacket(t, flow, []byte{1, 2, 3})
 	packetEvent := abi.FakeTCPEvent{
 		Key: flow, PayloadLength: 3, FWMark: 0xa1230007, WGID: 77,
@@ -262,7 +262,7 @@ func TestControllerRuntimeModelCombinesV2CloseOrderingAndOnceOnlyReinjection(t *
 	}
 	if _, found := store.values[closeFlow]; found || store.deleteAttempts != 1 {
 		t.Fatalf(
-			"v2 close retained session=%t compare-delete attempts=%d",
+			"v3 close retained session=%t compare-delete attempts=%d",
 			found,
 			store.deleteAttempts,
 		)
@@ -299,6 +299,147 @@ func TestControllerRuntimeConstructionFailureClosesExactOwnedResources(t *testin
 	_, writerCloses := writer.snapshot()
 	if readerCloses != 1 || writerCloses != 1 {
 		t.Fatalf("construction cleanup reader=%d writer=%d", readerCloses, writerCloses)
+	}
+}
+
+func TestRoutedControllerRuntimeDispatchesSameTupleByWGIDWithOneBackend(t *testing.T) {
+	domain, err := NewRuntimeDomain(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const (
+		firstWGID  = uint32(77)
+		secondWGID = uint32(88)
+		firstMark  = uint32(0xa123004d)
+		secondMark = uint32(0xa1230058)
+	)
+	stores := map[uint32]*fakeSessionStore{}
+	plans := make([]WGEnginePlan, 0, 2)
+	for _, binding := range []struct {
+		wgID uint32
+		mark uint32
+	}{
+		{wgID: firstWGID, mark: firstMark},
+		{wgID: secondWGID, mark: secondMark},
+	} {
+		options := runtimeDomainTestOptions(t)
+		store := newFakeSessionStore()
+		options.Store = store
+		stores[binding.wgID] = store
+		plans = append(plans, WGEnginePlan{
+			WGID: binding.wgID, Options: options,
+			Routes: []EngineRoute{{
+				Generation: 1, UnderlayIndex: 2, LocalPort: 31001,
+				WGID: binding.wgID, FWMark: binding.mark, Action: abi.ActionRewrite,
+			}},
+		})
+	}
+	router, err := NewEngineRouterFromPlans(domain, plans)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	records := make([]EventRecord, 0, 5)
+	for index, binding := range []struct {
+		wgID uint32
+		mark uint32
+	}{
+		{wgID: firstWGID, mark: firstMark},
+		{wgID: secondWGID, mark: secondMark},
+	} {
+		flow := testFlowWithWGID(31001, binding.wgID)
+		packet := testIPv4UDPPacket(t, flow, []byte{byte(binding.wgID)})
+		event := abi.FakeTCPEvent{
+			Key: flow, PayloadLength: 1, FWMark: binding.mark, WGID: binding.wgID,
+			PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
+		}
+		bindTestEvent(&event, router.Identity(), uint64(index+1))
+		records = append(records, EventRecord{RawSample: testBoundEventSample(event, packet, false)})
+	}
+	for _, wgID := range []uint32{firstWGID, secondWGID} {
+		flow := testFlowWithWGID(31001, wgID)
+		event := abi.FakeTCPEvent{
+			Key: flow, WGID: wgID, Type: abi.FakeTCPEventSYNACK,
+			TCPFlags: FlagSYN | FlagACK, Sequence: 9000 + wgID, Acknowledgement: 1001,
+		}
+		bindTestEvent(&event, router.Identity(), 0)
+		records = append(records, EventRecord{RawSample: testBoundEventSample(event, nil, false)})
+	}
+	records = append(records, EventRecord{LostSamples: 1})
+	source := &fakeEventReader{records: records}
+	ordered, err := newProductionEventReader(
+		source,
+		router.Identity(),
+		4,
+		&memoryEventLossCounter{},
+		0,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	factory := testControllerRuntimeFactory(t, 1, map[uint32]uint32{
+		firstWGID: firstMark, secondWGID: secondMark,
+	})
+	claim, err := factory.claim(router.Identity(), 101, 102, 4)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := &memoryRawIPv4Writer{}
+	runtime, err := newOwnedRoutedControllerRuntime(router, ordered, writer, claim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := runtime.Run(context.Background()); !errors.Is(err, ErrEventSamplesLost) {
+		t.Fatalf("routed runtime Run error=%v", err)
+	}
+	for _, wgID := range []uint32{firstWGID, secondWGID} {
+		flow := testFlowWithWGID(31001, wgID)
+		if _, exists := stores[wgID].values[flow]; !exists {
+			t.Fatalf("WGID %d same-tuple event reached the wrong Engine", wgID)
+		}
+	}
+	if writes, closes := writer.snapshot(); len(writes) != 6 || closes != 0 {
+		t.Fatalf("shared raw backend writes=%d closes=%d", len(writes), closes)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+	source.mu.Lock()
+	readerCloses := source.closeCalls
+	source.mu.Unlock()
+	_, writerCloses := writer.snapshot()
+	if readerCloses != 1 || writerCloses != 1 {
+		t.Fatalf("shared routed resources reader closes=%d writer closes=%d", readerCloses, writerCloses)
+	}
+}
+
+func TestRoutedControllerRuntimeConstructionFailureClosesOneWriter(t *testing.T) {
+	domain, err := NewRuntimeDomain(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options := runtimeDomainTestOptions(t)
+	router, err := NewEngineRouterFromPlans(domain, []WGEnginePlan{{
+		WGID: 77, Options: options,
+		Routes: []EngineRoute{{
+			Generation: 1, UnderlayIndex: 2, LocalPort: 31001,
+			WGID: 77, FWMark: 9, Action: abi.ActionRewrite,
+		}},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	factory := testControllerRuntimeFactory(t, 1, map[uint32]uint32{77: 9})
+	claim, err := factory.claim(router.Identity(), 101, 102, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writer := &memoryRawIPv4Writer{}
+	if runtime, err := newOwnedRoutedControllerRuntime(router, nil, writer, claim); err == nil || runtime != nil {
+		t.Fatalf("nil routed event reader accepted: runtime=%#v err=%v", runtime, err)
+	}
+	if _, writerCloses := writer.snapshot(); writerCloses != 1 {
+		t.Fatalf("routed construction failure writer closes=%d", writerCloses)
 	}
 }
 

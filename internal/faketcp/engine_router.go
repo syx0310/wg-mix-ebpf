@@ -22,6 +22,15 @@ type WGEngineBinding struct {
 	Engine *Engine
 }
 
+// WGEnginePlan is the production-facing construction input for one
+// independently quota-owned WireGuard engine. Routes and Options are consumed
+// during construction; the resulting router retains neither caller slice.
+type WGEnginePlan struct {
+	WGID    uint32
+	Options Options
+	Routes  []EngineRoute
+}
+
 // EngineRoute is the complete userspace projection of one managed FakeTCP
 // listener. Action must be abi.ActionRewrite. FWMark is the exact captured
 // egress mark accepted for NEED_HANDSHAKE events on this route.
@@ -38,6 +47,7 @@ type engineRouteKey struct {
 	generation    uint64
 	underlayIndex uint32
 	localPort     uint16
+	wgID          uint32
 }
 
 type engineRouteTarget struct {
@@ -52,6 +62,70 @@ type EngineRouter struct {
 	engines  map[uint32]*Engine
 	routes   map[engineRouteKey]engineRouteTarget
 	wgIDs    []uint32
+}
+
+// NewEngineRouterFromPlans constructs every per-WireGuard Engine in one
+// RuntimeDomain and freezes their exact routes in a single operation. It keeps
+// production wiring from building parallel binding/route slices that can
+// drift before NewEngineRouter validates them.
+func NewEngineRouterFromPlans(
+	domain *RuntimeDomain,
+	plans []WGEnginePlan,
+) (*EngineRouter, error) {
+	if domain == nil || domain.state == nil {
+		return nil, fmt.Errorf("%w: runtime domain is nil", ErrEngineRouteInvalid)
+	}
+	if len(plans) == 0 {
+		return nil, fmt.Errorf("%w: engine plans must be non-empty", ErrEngineRouteInvalid)
+	}
+	identity := domain.Identity()
+	bindings := make([]WGEngineBinding, 0, len(plans))
+	routes := make([]EngineRoute, 0, len(plans))
+	for index, plan := range plans {
+		if plan.WGID == 0 || plan.Options.Generation != identity.Generation || len(plan.Routes) == 0 {
+			return nil, fmt.Errorf(
+				"%w: engine plan[%d] has incomplete identity or routes",
+				ErrEngineRouteInvalid,
+				index,
+			)
+		}
+		engine, err := domain.NewEngine(plan.Options)
+		if err != nil {
+			return nil, fmt.Errorf("construct faketcp Engine for WGID %d: %w", plan.WGID, err)
+		}
+		bindings = append(bindings, WGEngineBinding{WGID: plan.WGID, Engine: engine})
+		for routeIndex, route := range plan.Routes {
+			if route.WGID != plan.WGID || route.Generation != identity.Generation {
+				return nil, fmt.Errorf(
+					"%w: engine plan[%d] route[%d] does not match its WGID/generation",
+					ErrEngineRouteInvalid,
+					index,
+					routeIndex,
+				)
+			}
+			routes = append(routes, route)
+		}
+	}
+	return NewEngineRouter(domain, bindings, routes)
+}
+
+// Engine returns the independently owned Engine for wgID without exposing the
+// router's mutable map. Production runtime identity setup may use any returned
+// Engine because all engines share the RuntimeDomain commit capability.
+func (router *EngineRouter) Engine(wgID uint32) (*Engine, bool) {
+	if router == nil {
+		return nil, false
+	}
+	engine, exists := router.engines[wgID]
+	return engine, exists
+}
+
+// WGIDs returns the deterministic routing order as a defensive copy.
+func (router *EngineRouter) WGIDs() []uint32 {
+	if router == nil {
+		return nil
+	}
+	return append([]uint32(nil), router.wgIDs...)
 }
 
 // NewEngineRouter freezes a strict multi-WireGuard dispatch table. Duplicate
@@ -133,7 +207,8 @@ func NewEngineRouter(
 			)
 		}
 		key := engineRouteKey{
-			generation: route.Generation, underlayIndex: route.UnderlayIndex, localPort: route.LocalPort,
+			generation: route.Generation, underlayIndex: route.UnderlayIndex,
+			localPort: route.LocalPort, wgID: route.WGID,
 		}
 		if _, exists := frozenRoutes[key]; exists {
 			return nil, fmt.Errorf(
@@ -177,16 +252,18 @@ func (router *EngineRouter) selectEngine(event abi.FakeTCPEvent) (dispatchedEngi
 		return dispatchedEngine{}, fmt.Errorf("%w: router is unavailable", ErrEngineRouteRejected)
 	}
 	key := engineRouteKey{
-		generation: event.Key.Generation, underlayIndex: event.Key.UnderlayIndex, localPort: event.Key.LocalPort,
+		generation: event.Key.Generation, underlayIndex: event.Key.UnderlayIndex,
+		localPort: event.Key.LocalPort, wgID: event.Key.WGID,
 	}
 	target, exists := router.routes[key]
 	if !exists {
 		return dispatchedEngine{}, fmt.Errorf(
-			"%w: generation=%d underlay=%d local-port=%d is unknown",
+			"%w: generation=%d underlay=%d local-port=%d WGID=%d is unknown",
 			ErrEngineRouteRejected,
 			key.generation,
 			key.underlayIndex,
 			key.localPort,
+			key.wgID,
 		)
 	}
 	if event.WGID != target.wgID {
@@ -248,6 +325,7 @@ func (router *EngineRouter) validateActions(ownerWGID uint32, actions []Action) 
 			generation:    action.Flow.Generation,
 			underlayIndex: action.Flow.UnderlayIndex,
 			localPort:     action.Flow.LocalPort,
+			wgID:          action.Flow.WGID,
 		}
 		target, exists := router.routes[key]
 		if !exists {
@@ -315,8 +393,18 @@ func (dispatcher *singleEngineDispatcher) Identity() RuntimeIdentity {
 	return dispatcher.engine.Identity()
 }
 
-func (dispatcher *singleEngineDispatcher) selectEngine(abi.FakeTCPEvent) (dispatchedEngine, error) {
-	return dispatchedEngine{engine: dispatcher.engine}, nil
+func (dispatcher *singleEngineDispatcher) selectEngine(event abi.FakeTCPEvent) (dispatchedEngine, error) {
+	if dispatcher == nil || dispatcher.engine == nil {
+		return dispatchedEngine{}, errors.New("faketcp single-engine dispatcher is unavailable")
+	}
+	if event.WGID == 0 || event.WGID != event.Key.WGID {
+		return dispatchedEngine{}, fmt.Errorf(
+			"faketcp event WGID %d does not match session key WGID %d",
+			event.WGID,
+			event.Key.WGID,
+		)
+	}
+	return dispatchedEngine{engine: dispatcher.engine, wgID: event.Key.WGID}, nil
 }
 
 func (dispatcher *singleEngineDispatcher) Tick() ([]Action, error) {

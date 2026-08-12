@@ -6,6 +6,10 @@
 #ifndef WG_MIX_FAKETCP_H
 #define WG_MIX_FAKETCP_H
 
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+#include "../kernel/faketcp_checksum_kprobe/wg_mix_faketcp_checksum_kprobe_abi.h"
+#endif
+
 #define FAKETCP_STATE_IDLE        0
 #define FAKETCP_STATE_SYN_SENT    1
 #define FAKETCP_STATE_SYN_RECV    2
@@ -27,7 +31,7 @@
 #define FAKETCP_EVENT_ACK            4
 #define FAKETCP_EVENT_RST            5
 #define FAKETCP_EVENT_FIN            6
-#define FAKETCP_EVENT_ABI_VERSION    2
+#define FAKETCP_EVENT_ABI_VERSION    3
 
 #define FAKETCP_FLAG_FIN 0x01
 #define FAKETCP_FLAG_SYN 0x02
@@ -41,6 +45,18 @@
 #define FAKETCP_GSO_MAX_PAYLOAD \
 	(0xffffU - sizeof(struct iphdr) - sizeof(struct udphdr) - \
 	 FAKETCP_HEADER_DELTA)
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+// Linux 5.15 predates bpf_loop. Keep the full modern GSO contract by using
+// verifier-visible bounded loops in the independently built legacy object.
+// Every admitted logical segment is at least 32 bytes, so 2046 is the exact
+// segment ceiling for the maximum IPv4 aggregate. Across that same geometry,
+// the maximum number of 32-byte XOR chunks is 3968 (gso_size=33); 4096 leaves
+// a power-of-two verifier bound without reducing the accepted wire domain.
+#define FAKETCP_LEGACY_515_FULL_GSO_CAPABILITY 1
+#define FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS \
+	(FAKETCP_GSO_MAX_PAYLOAD / 32U)
+#define FAKETCP_LEGACY_515_GSO_MAX_XOR_CHUNKS 4096U
+#endif
 #define FAKETCP_CHECKSUM_CHUNK_BYTES 32
 #define FAKETCP_CHECKSUM_CHUNK_COUNT \
 	((FAKETCP_MAX_IPV4_TOTAL_LEN + FAKETCP_CHECKSUM_CHUNK_BYTES - 1) / \
@@ -70,9 +86,11 @@
 #define FAKETCP_GENERATION_RESULT_POISON    4
 #define FAKETCP_GENERATION_RESULT_MISMATCH  5
 
-// Required, non-weak module kfunc. The experimental object cannot be linked or
+// Required, non-weak module kfunc. The modern object cannot be linked or
 // verifier-loaded unless wg_mix_faketcp_checksum is loaded with this exact BTF
-// function. The baseline object never sees this declaration or relocation.
+// function. The baseline and legacy objects never see these declarations or
+// relocations.
+#ifndef WG_MIX_FAKETCP_LEGACY_515
 extern int wg_mix_faketcp_skb_prepare_udp(struct __sk_buff *skb,
 					   __u32 network_offset,
 					   __u32 transport_offset,
@@ -82,6 +100,7 @@ extern int wg_mix_faketcp_skb_commit_udp_gso(struct __sk_buff *skb,
 					      __u32 transport_offset,
 					      __u32 sequence,
 					      __u64 ack_window) __ksym;
+#endif
 
 // Stable result ABI shared with kernel/faketcp_checksum. Each accepted input
 // has one exact positive mode; every failure has one mutually exclusive class.
@@ -175,6 +194,8 @@ struct faketcp_session_key {
 	__u32 underlay_index;
 	__u16 local_port;
 	__u16 remote_port;
+	__u32 wg_id;
+	__u8 pad[4];
 };
 
 struct faketcp_session_value {
@@ -276,7 +297,7 @@ struct faketcp_ingress_close_projection {
 };
 
 // CLOSE terminates in XDP, while TRANSFORM is copied to TC metadata. Their
-// mutually exclusive projection keeps the hot-path admission ABI at 136 bytes.
+// mutually exclusive projection keeps the hot-path admission ABI at 144 bytes.
 union faketcp_ingress_decision_projection {
 	struct faketcp_ingress_transform_projection transform;
 	struct faketcp_ingress_close_projection close;
@@ -361,13 +382,13 @@ struct faketcp_ingress_admission {
 	__u8 pad[6];
 };
 
-_Static_assert(sizeof(struct faketcp_session_key) == 24,
+_Static_assert(sizeof(struct faketcp_session_key) == 32,
 	       "faketcp session key ABI drift");
 _Static_assert(sizeof(struct faketcp_session_value) == 80,
 	       "faketcp session value ABI drift");
 _Static_assert(sizeof(struct faketcp_session_expected_value) == 80,
 	       "faketcp expected session value ABI drift");
-_Static_assert(sizeof(struct faketcp_session_claim_request) == 104,
+_Static_assert(sizeof(struct faketcp_session_claim_request) == 112,
 	       "faketcp session claim request ABI drift");
 _Static_assert(sizeof(struct faketcp_session_mutation_result) == 12,
 	       "faketcp session mutation result drift");
@@ -393,7 +414,7 @@ _Static_assert(sizeof(struct faketcp_ingress_close_projection) == 16,
 _Static_assert(sizeof(union faketcp_ingress_decision_projection) == 16,
 	       "faketcp ingress decision projection drift");
 _Static_assert(__builtin_offsetof(struct faketcp_ingress_admission,
-				    decision) == 96,
+				    decision) == 104,
 	       "faketcp ingress decision projection offset drift");
 _Static_assert(sizeof(struct faketcp_gso_projection) == 24,
 	       "faketcp GSO projection drift");
@@ -423,20 +444,20 @@ struct faketcp_packet_event {
 	__u8 packet[FAKETCP_MAX_CAPTURED_PACKET];
 };
 
-_Static_assert(sizeof(struct faketcp_event) == 104, "faketcp event ABI drift");
-_Static_assert(__builtin_offsetof(struct faketcp_event, runtime_incarnation) == 32,
+_Static_assert(sizeof(struct faketcp_event) == 112, "faketcp event ABI drift");
+_Static_assert(__builtin_offsetof(struct faketcp_event, runtime_incarnation) == 40,
 	       "faketcp runtime incarnation ABI drift");
-_Static_assert(__builtin_offsetof(struct faketcp_event, capture_sequence) == 48,
+_Static_assert(__builtin_offsetof(struct faketcp_event, capture_sequence) == 56,
 	       "faketcp capture sequence ABI drift");
-_Static_assert(__builtin_offsetof(struct faketcp_event, session_revision) == 56,
+_Static_assert(__builtin_offsetof(struct faketcp_event, session_revision) == 64,
 	       "faketcp session revision ABI drift");
-_Static_assert(__builtin_offsetof(struct faketcp_event, session_id) == 64,
+_Static_assert(__builtin_offsetof(struct faketcp_event, session_id) == 72,
 	       "faketcp session ID ABI drift");
-_Static_assert(__builtin_offsetof(struct faketcp_event, capture_cpu) == 72,
+_Static_assert(__builtin_offsetof(struct faketcp_event, capture_cpu) == 80,
 	       "faketcp capture CPU ABI drift");
-_Static_assert(__builtin_offsetof(struct faketcp_event, event_abi_version) == 98,
+_Static_assert(__builtin_offsetof(struct faketcp_event, event_abi_version) == 106,
 	       "faketcp event version ABI drift");
-_Static_assert(sizeof(struct faketcp_packet_event) == 2408,
+_Static_assert(sizeof(struct faketcp_packet_event) == 2416,
 	       "faketcp packet event ABI drift");
 
 struct faketcp_runtime_identity_value {
@@ -488,13 +509,13 @@ struct faketcp_metadata {
 	struct faketcp_ingress_admission admission;
 };
 
-_Static_assert(sizeof(struct faketcp_egress_admission) == 176,
+_Static_assert(sizeof(struct faketcp_egress_admission) == 184,
 	       "faketcp egress admission ABI drift");
-_Static_assert(sizeof(struct faketcp_egress_admission_slot) == 184,
+_Static_assert(sizeof(struct faketcp_egress_admission_slot) == 192,
 	       "faketcp egress admission slot ABI drift");
-_Static_assert(sizeof(struct faketcp_ingress_admission) == 136,
+_Static_assert(sizeof(struct faketcp_ingress_admission) == 144,
 	       "faketcp ingress admission ABI drift");
-_Static_assert(sizeof(struct faketcp_metadata) == 144,
+_Static_assert(sizeof(struct faketcp_metadata) == 152,
 	       "faketcp metadata ABI drift");
 
 struct faketcp_pseudo_tail {
@@ -577,7 +598,7 @@ _Static_assert(sizeof(struct faketcp_control_policy_key) == 16,
 	       "faketcp control policy key ABI drift");
 _Static_assert(sizeof(struct faketcp_control_policy_value) == 32,
 	       "faketcp control policy value ABI drift");
-_Static_assert(sizeof(struct faketcp_control_flow_key) == 32,
+_Static_assert(sizeof(struct faketcp_control_flow_key) == 40,
 	       "faketcp control flow key ABI drift");
 _Static_assert(sizeof(struct faketcp_control_flow_value) == 16,
 	       "faketcp control flow value ABI drift");
@@ -602,6 +623,21 @@ static __always_inline int faketcp_nonzero_incarnation(const __u8 incarnation[16
 	for (int i = 0; i < 16; i++)
 		aggregate |= incarnation[i];
 	return aggregate != 0;
+}
+
+static __always_inline int
+faketcp_session_key_valid(const struct faketcp_session_key *key)
+{
+	__u8 pad = 0;
+
+	if (!key || key->generation == 0 || key->local_ipv4 == 0 ||
+	    key->remote_ipv4 == 0 || key->underlay_index == 0 ||
+	    key->local_port == 0 || key->remote_port == 0 || key->wg_id == 0)
+		return 0;
+#pragma unroll
+	for (int i = 0; i < 4; i++)
+		pad |= key->pad[i];
+	return pad == 0;
 }
 
 static __always_inline int faketcp_session_metadata_valid_locked(
@@ -783,7 +819,7 @@ static __always_inline int faketcp_claim_request_valid(
 #pragma unroll
 	for (int i = 0; i < 4; i++)
 		pad |= expected->pad[i];
-	return request->key.generation != 0 &&
+	return faketcp_session_key_valid(&request->key) &&
 	       request->key.generation == expected->generation &&
 	       expected->state == FAKETCP_STATE_ESTABLISHED &&
 	       expected->flags == 0 && pad == 0 && expected->kernel_lock == 0 &&
@@ -936,6 +972,47 @@ struct {
 	__type(value, __u64);
 } faketcp_mtu_audit_map SEC(".maps");
 
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+// Each legacy collection has one userspace-populated lease identity.  The
+// program may read but cannot modify it; a zero/malformed value fails closed
+// before either public helper trigger.  Separate collection maps allow
+// simultaneous resident runtimes to authenticate distinct module leases.
+struct faketcp_kprobe_runtime_value {
+	__u64 cookie;
+	__u32 abi_version;
+	__u32 reserved;
+};
+
+_Static_assert(sizeof(struct faketcp_kprobe_runtime_value) == 16,
+	       "FakeTCP kprobe runtime value ABI drift");
+_Static_assert(sizeof(struct faketcp_kprobe_runtime_value) ==
+	       WG_MIX_FAKETCP_KPROBE_RUNTIME_COOKIE_SIZE,
+	       "FakeTCP kprobe runtime shared size drift");
+_Static_assert(__builtin_offsetof(struct faketcp_kprobe_runtime_value,
+				    cookie) ==
+	       WG_MIX_FAKETCP_KPROBE_RUNTIME_COOKIE_COOKIE_OFFSET,
+	       "FakeTCP kprobe cookie offset drift");
+_Static_assert(__builtin_offsetof(struct faketcp_kprobe_runtime_value,
+				    abi_version) ==
+	       WG_MIX_FAKETCP_KPROBE_RUNTIME_COOKIE_ABI_OFFSET,
+	       "FakeTCP kprobe ABI offset drift");
+_Static_assert(__builtin_offsetof(struct faketcp_kprobe_runtime_value,
+				    reserved) ==
+	       WG_MIX_FAKETCP_KPROBE_RUNTIME_COOKIE_RESERVED_OFFSET,
+	       "FakeTCP kprobe reserved offset drift");
+_Static_assert(sizeof(((struct __sk_buff *)0)->cb) ==
+	       WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_SIZE,
+	       "FakeTCP kprobe skb descriptor size drift");
+
+struct {
+	__uint(type, BPF_MAP_TYPE_ARRAY);
+	__uint(map_flags, BPF_F_RDONLY_PROG);
+	__uint(max_entries, 1);
+	__type(key, __u32);
+	__type(value, struct faketcp_kprobe_runtime_value);
+} faketcp_kprobe_runtime_map SEC(".maps");
+#endif
+
 static __always_inline void inc_faketcp_stat(__u32 key)
 {
 	__u64 *value = bpf_map_lookup_elem(&faketcp_stats_map, &key);
@@ -966,8 +1043,53 @@ faketcp_prepare_udp(struct __sk_buff *skb, __u32 network_offset,
 {
 	int result;
 
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	__u32 zero = 0;
+	struct faketcp_kprobe_runtime_value *runtime;
+
+	runtime = bpf_map_lookup_elem(&faketcp_kprobe_runtime_map, &zero);
+	if (!runtime || runtime->cookie == 0 ||
+	    runtime->abi_version !=
+		WG_MIX_FAKETCP_CHECKSUM_KPROBE_ABI_VERSION ||
+	    runtime->reserved != 0)
+		result = FAKETCP_PREPARE_REJECT_STATE;
+	else {
+		skb->cb[WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_COOKIE_OFFSET /
+			sizeof(__u32)] =
+			(__u32)runtime->cookie;
+		skb->cb[WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_COOKIE_OFFSET /
+			sizeof(__u32) + 1] =
+			(__u32)(runtime->cookie >> 32);
+		skb->cb[WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_NETWORK_OFFSET /
+			sizeof(__u32)] =
+			network_offset;
+		skb->cb[WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_TRANSPORT_OFFSET /
+			sizeof(__u32)] =
+			transport_offset;
+		skb->cb[WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_VALUE_OFFSET /
+			sizeof(__u32)] =
+			udp_length;
+		result = bpf_skb_change_type(
+			skb, WG_MIX_FAKETCP_KPROBE_PREPARE_MAGIC);
+	}
+	// The descriptor is valid only during the synchronous helper/kretprobe
+	// call.  Clearing is unconditional so a miss or rejection cannot leak
+	// lease identity into the later XOR tail-call protocol.
+#pragma unroll
+	for (int index = 0;
+	     index < WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_SIZE / sizeof(__u32);
+	     index++)
+		skb->cb[index] = 0;
+	// The module may have linearized or COW-reallocated skb storage even though
+	// the verifier models change_type as a non-data-changing helper.  Refresh
+	// verifier packet-pointer state immediately after the synchronous trigger;
+	// callers retain only scalar/map-backed descriptors across this boundary.
+	if (bpf_skb_pull_data(skb, 0) < 0)
+		result = FAKETCP_PREPARE_REJECT_WRITABLE;
+#else
 	result = wg_mix_faketcp_skb_prepare_udp(
 		skb, network_offset, transport_offset, udp_length);
+#endif
 	if (expect_gso) {
 		if (result == FAKETCP_PREPARE_ACCEPT_GSO)
 			return 0;
@@ -1022,6 +1144,53 @@ faketcp_prepare_udp(struct __sk_buff *skb, __u32 network_offset,
 		inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
 		return -1;
 	}
+}
+
+static __always_inline int
+faketcp_commit_udp_gso(struct __sk_buff *skb, __u32 network_offset,
+		       __u32 transport_offset, __u32 sequence,
+		       __u64 ack_window)
+{
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	__u32 zero = 0;
+	struct faketcp_kprobe_runtime_value *runtime;
+	int result;
+
+	runtime = bpf_map_lookup_elem(&faketcp_kprobe_runtime_map, &zero);
+	if (!runtime || runtime->cookie == 0 ||
+	    runtime->abi_version !=
+		WG_MIX_FAKETCP_CHECKSUM_KPROBE_ABI_VERSION ||
+	    runtime->reserved != 0 || ack_window == 0)
+		result = FAKETCP_PREPARE_REJECT_STATE;
+	else {
+		skb->cb[WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_COOKIE_OFFSET /
+			sizeof(__u32)] =
+			(__u32)runtime->cookie;
+		skb->cb[WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_COOKIE_OFFSET /
+			sizeof(__u32) + 1] =
+			(__u32)(runtime->cookie >> 32);
+		skb->cb[WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_NETWORK_OFFSET /
+			sizeof(__u32)] =
+			network_offset;
+		skb->cb[WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_TRANSPORT_OFFSET /
+			sizeof(__u32)] =
+			transport_offset;
+		skb->cb[WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_VALUE_OFFSET /
+			sizeof(__u32)] = sequence;
+		result = bpf_skb_change_proto(
+			skb, WG_MIX_FAKETCP_KPROBE_COMMIT_PROTO_MAGIC,
+			ack_window);
+	}
+#pragma unroll
+	for (int index = 0;
+	     index < WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_SIZE / sizeof(__u32);
+	     index++)
+		skb->cb[index] = 0;
+	return result;
+#else
+	return wg_mix_faketcp_skb_commit_udp_gso(
+		skb, network_offset, transport_offset, sequence, ack_window);
+#endif
 }
 
 static __always_inline struct faketcp_runtime_identity_value *
@@ -1393,7 +1562,7 @@ faketcp_admit_control_event_inner(const struct faketcp_session_key *session,
 	// Policy identity validation and lookup are first and fail-closed. No
 	// packet can allocate its own policy budget, and generations/WireGuards
 	// never share a cursor.
-	if (session->generation == 0 || wg_id == 0 ||
+	if (!faketcp_session_key_valid(session) || session->wg_id != wg_id ||
 	    event_type < FAKETCP_EVENT_NEED_HANDSHAKE ||
 	    event_type > FAKETCP_EVENT_FIN) {
 		inc_faketcp_stat(FAKETCP_STAT_CONTROL_POLICY_MISS);
@@ -1481,6 +1650,7 @@ static __always_inline int faketcp_tc_key(struct __sk_buff *skb,
 					   const struct packet_info *info,
 					   const struct faketcp_l3_info *l3,
 					   __u64 generation,
+					   __u32 wg_id,
 					   struct faketcp_session_key *key)
 {
 	void *data = (void *)(long)skb->data;
@@ -1498,6 +1668,7 @@ static __always_inline int faketcp_tc_key(struct __sk_buff *skb,
 	key->underlay_index = skb->ifindex;
 	key->local_port = info->src_port;
 	key->remote_port = info->dst_port;
+	key->wg_id = wg_id;
 	return 0;
 }
 
@@ -1550,7 +1721,7 @@ struct faketcp_runtime_scratch {
 	};
 };
 
-_Static_assert(sizeof(struct faketcp_runtime_scratch) == 344,
+_Static_assert(sizeof(struct faketcp_runtime_scratch) == 360,
 	       "FakeTCP runtime scratch layout drift");
 
 struct {
@@ -2027,12 +2198,13 @@ static __always_inline int faketcp_egress_admission_matches(
 		generation,
 		admission->session_authority.runtime_incarnation))
 		return 0;
-	if (faketcp_tc_key(skb, info, l3, generation, key) < 0 ||
+	if (faketcp_tc_key(skb, info, l3, generation, rule->wg_id, key) < 0 ||
 	    key->local_ipv4 != admission->key.local_ipv4 ||
 	    key->remote_ipv4 != admission->key.remote_ipv4 ||
 	    key->underlay_index != admission->key.underlay_index ||
 	    key->local_port != admission->key.local_port ||
-	    key->remote_port != admission->key.remote_port)
+	    key->remote_port != admission->key.remote_port ||
+	    key->wg_id != admission->key.wg_id)
 		return 0;
 	if (rule->cipher_id != 0) {
 		cipher = lookup_cipher(rule->cipher_id, generation);
@@ -2142,7 +2314,7 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
 	}
-	if (!managed || !rule || !profile || generation == 0 ||
+	if (!managed || !rule || !profile || generation == 0 || rule->wg_id == 0 ||
 	    managed->generation != generation || rule->generation != generation ||
 	    profile->generation != generation || rule->action != ACTION_REWRITE ||
 	    rule->transport_mode != TRANSPORT_FAKETCP || type_kind < 0 ||
@@ -2192,7 +2364,7 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
 	}
-	if (faketcp_tc_key(skb, info, l3, generation, key) < 0) {
+	if (faketcp_tc_key(skb, info, l3, generation, rule->wg_id, key) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
 	}
@@ -2218,7 +2390,7 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 			return FAKETCP_ADMISSION_DROP;
 		}
 		// Populate the map-backed admission in place. A whole-struct compound
-		// literal makes Clang materialise a second 176-byte copy on the BPF
+		// literal makes Clang materialise a second 184-byte copy on the BPF
 		// stack even though the destination already lives in per-CPU scratch.
 		admission->key = *key;
 		admission->nonce = slot->next_nonce;
@@ -2295,7 +2467,7 @@ faketcp_gso_segment_length(const struct faketcp_gso_loop_context *context,
 	return remaining < context->gso_size ? remaining : context->gso_size;
 }
 
-static long faketcp_gso_validate_segment(__u32 index, void *opaque)
+static __noinline long faketcp_gso_validate_segment(__u32 index, void *opaque)
 {
 	struct faketcp_gso_loop_context *context = opaque;
 	__u32 segment_offset;
@@ -2348,6 +2520,25 @@ static long faketcp_gso_validate_segment(__u32 index, void *opaque)
 	return 0;
 }
 
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+static __always_inline int faketcp_legacy_515_validate_gso_segments(
+	struct faketcp_gso_loop_context *context)
+{
+	if (!context || context->gso_segments < 2 ||
+	    context->gso_segments > FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS)
+		return -1;
+#pragma clang loop unroll(disable)
+	for (__u32 index = 0;
+	     index < FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS; index++) {
+		if (index >= context->gso_segments)
+			break;
+		if (faketcp_gso_validate_segment(index, context) != 0)
+			return -1;
+	}
+	return context->error ? -1 : 0;
+}
+#endif
+
 static __always_inline int faketcp_gso_build_projection(
 	struct __sk_buff *skb, const struct packet_info *info,
 	const struct profile_value *profile, struct cipher_value *cipher,
@@ -2380,8 +2571,12 @@ static __always_inline int faketcp_gso_build_projection(
 #pragma unroll
 	for (int kind = 0; kind < 4; kind++)
 		context.mixed_type[kind] = profile->standard_to_mixed[kind];
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	if (faketcp_legacy_515_validate_gso_segments(&context) < 0)
+#else
 	if (bpf_loop(context.gso_segments, faketcp_gso_validate_segment,
 		     &context, 0) != context.gso_segments || context.error)
+#endif
 		return -1;
 	*projection = (struct faketcp_gso_projection){
 		.segment_contract = context.segment_contract,
@@ -2393,7 +2588,7 @@ static __always_inline int faketcp_gso_build_projection(
 	return 0;
 }
 
-static long faketcp_gso_rewrite_type(__u32 index, void *opaque)
+static __noinline long faketcp_gso_rewrite_type(__u32 index, void *opaque)
 {
 	struct faketcp_gso_loop_context *context = opaque;
 	__u32 segment_offset = index * context->gso_size;
@@ -2424,7 +2619,7 @@ static long faketcp_gso_rewrite_type(__u32 index, void *opaque)
 	return 0;
 }
 
-static long faketcp_gso_xor_chunk(__u32 index, void *opaque)
+static __noinline long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 {
 	struct faketcp_gso_loop_context *context = opaque;
 	__u8 chunk[FAKETCP_GSO_XOR_CHUNK_BYTES] = {};
@@ -2478,6 +2673,42 @@ static long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 	}
 	return 0;
 }
+
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+static __always_inline int faketcp_legacy_515_rewrite_gso_types(
+	struct faketcp_gso_loop_context *context)
+{
+	if (!context || context->gso_segments < 2 ||
+	    context->gso_segments > FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS)
+		return -1;
+#pragma clang loop unroll(disable)
+	for (__u32 index = 0;
+	     index < FAKETCP_LEGACY_515_GSO_MAX_SEGMENTS; index++) {
+		if (index >= context->gso_segments)
+			break;
+		if (faketcp_gso_rewrite_type(index, context) != 0)
+			return -1;
+	}
+	return context->error ? -1 : 0;
+}
+
+static __always_inline int faketcp_legacy_515_xor_gso_chunks(
+	struct faketcp_gso_loop_context *context, __u32 xor_chunks)
+{
+	if (!context || !xor_chunks ||
+	    xor_chunks > FAKETCP_LEGACY_515_GSO_MAX_XOR_CHUNKS)
+		return -1;
+#pragma clang loop unroll(disable)
+	for (__u32 index = 0;
+	     index < FAKETCP_LEGACY_515_GSO_MAX_XOR_CHUNKS; index++) {
+		if (index >= xor_chunks)
+			break;
+		if (faketcp_gso_xor_chunk(index, context) != 0)
+			return -1;
+	}
+	return context->error ? -1 : 0;
+}
+#endif
 
 // The only supported aggregate is the exact observable fixed-IHL IPv4
 // SKB_GSO_UDP_L4 shape. Non-fraglist aggregates are source-neutral because skb
@@ -2561,8 +2792,12 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 		}
 	}
 	context.error = 0;
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	if (faketcp_legacy_515_rewrite_gso_types(&context) < 0) {
+#else
 	if (bpf_loop(context.gso_segments, faketcp_gso_rewrite_type,
 		     &context, 0) != context.gso_segments || context.error) {
+#endif
 		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
 		return TC_ACT_SHOT;
 	}
@@ -2574,8 +2809,12 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 			FAKETCP_GSO_XOR_CHUNK_BYTES;
 		xor_chunks = context.xor_chunks_per_segment * context.gso_segments;
 		context.error = 0;
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+		if (faketcp_legacy_515_xor_gso_chunks(&context, xor_chunks) < 0) {
+#else
 		if (bpf_loop(xor_chunks, faketcp_gso_xor_chunk, &context, 0) !=
 			    xor_chunks || context.error) {
+#endif
 			inc_stat(STAT_XOR_STORE_ERROR);
 			return TC_ACT_SHOT;
 		}
@@ -2604,7 +2843,7 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 	inc_faketcp_stat(FAKETCP_STAT_ADMISSION_ACCEPT);
 	ack_window = mutation.acknowledgement |
 		     ((__u64)(mutation.window ? mutation.window : 65535) << 32);
-	result = wg_mix_faketcp_skb_commit_udp_gso(
+	result = faketcp_commit_udp_gso(
 		skb, info->ip_off, info->udp_off, mutation.sequence, ack_window);
 	if (result != FAKETCP_GSO_COMMIT_ACCEPT) {
 		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
@@ -3323,6 +3562,7 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 		.underlay_index = xdp->ingress_ifindex,
 		.local_port = bpf_ntohs(tcp->dest),
 		.remote_port = bpf_ntohs(tcp->source),
+		.wg_id = policy_listener->wg_id,
 	};
 	if (admission->key.local_port == 0 || admission->key.remote_port == 0 ||
 	    admission->key.underlay_index == 0) {

@@ -32,6 +32,7 @@ type WGConfigLoader func(path string) (*wgconfig.Interface, error)
 type State struct {
 	Generation        uint64              `json:"generation"`
 	AttachmentBackend string              `json:"attachment_backend"`
+	ChecksumBackend   string              `json:"checksum_backend"`
 	Profiles          []ProfileState      `json:"profiles"`
 	Ciphers           []CipherState       `json:"ciphers,omitempty"`
 	WireGuards        []WireGuardState    `json:"wireguards"`
@@ -222,6 +223,7 @@ func BuildState(ctx context.Context, cfg *config.Config, rt runtime.Provider, re
 	state := &State{
 		Generation:        1,
 		AttachmentBackend: cfg.Runtime.AttachmentBackend,
+		ChecksumBackend:   cfg.Runtime.ChecksumBackend,
 	}
 	profileIDs := assignProfileIDs(compiledProfiles)
 	for _, name := range sortedProfileNames(compiledProfiles) {

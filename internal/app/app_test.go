@@ -21,6 +21,70 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
 
+func TestFakeTCPChecksumDoctorChecksSelectsKfuncBeforeEquivalentKprobe(t *testing.T) {
+	checks := fakeTCPChecksumDoctorChecks("auto", []dataplane.FakeTCPChecksumBackendProbe{
+		{
+			Backend: "kfunc", Available: true, Equivalent: true,
+			Capability: dataplane.FakeTCPChecksumCapabilityFullGSOV1,
+			Module:     dataplane.DefaultFakeTCPKfuncModule,
+		},
+		{
+			Backend: "kprobe", Available: true, Equivalent: true,
+			Capability: dataplane.FakeTCPChecksumCapabilityFullGSOV1,
+			Module:     dataplane.DefaultFakeTCPKprobeModule,
+			Requirements: []dataplane.FakeTCPChecksumRequirement{
+				{Name: "CONFIG_KPROBES", Status: "PASS", Detail: "y"},
+			},
+		},
+	})
+	selection := checks[len(checks)-1]
+	if selection.Status != "PASS" || !strings.Contains(selection.Detail, "selected=kfunc") {
+		t.Fatalf("selection = %#v", selection)
+	}
+	seenRequirement := false
+	for _, check := range checks {
+		if check.Name == "faketcp.kprobe.CONFIG_KPROBES" && check.Status == "PASS" {
+			seenRequirement = true
+		}
+	}
+	if !seenRequirement {
+		t.Fatalf("doctor did not expand kprobe requirements: %#v", checks)
+	}
+}
+
+func TestFakeTCPChecksumDoctorChecksNeverFallsBackFromExplicitKfunc(t *testing.T) {
+	checks := fakeTCPChecksumDoctorChecks("kfunc", []dataplane.FakeTCPChecksumBackendProbe{
+		{Backend: "kfunc", Available: false, Equivalent: false, Error: "BTF unavailable"},
+		{Backend: "kprobe", Available: true, Equivalent: true},
+	})
+	selection := checks[len(checks)-1]
+	if selection.Status != "FAIL" || strings.Contains(selection.Detail, "selected=kprobe") {
+		t.Fatalf("explicit selection silently fell back: %#v", selection)
+	}
+}
+
+func TestFakeTCPChecksumDoctorChecksAutoFallsBackOnlyFromUnsupportedKfunc(t *testing.T) {
+	kprobe := dataplane.FakeTCPChecksumBackendProbe{
+		Backend: "kprobe", Available: true, Equivalent: true,
+	}
+	checks := fakeTCPChecksumDoctorChecks("auto", []dataplane.FakeTCPChecksumBackendProbe{
+		{Backend: "kfunc", Error: "permission denied"},
+		kprobe,
+	})
+	selection := checks[len(checks)-1]
+	if selection.Status != "FAIL" || !strings.Contains(selection.Message, "refusing automatic fallback") {
+		t.Fatalf("operational failure selection = %#v", selection)
+	}
+	checks = fakeTCPChecksumDoctorChecks("auto", []dataplane.FakeTCPChecksumBackendProbe{
+		{Backend: "kfunc", Unsupported: true, Error: "module not found"},
+		kprobe,
+	})
+	selection = checks[len(checks)-1]
+	if selection.Status != "PASS" || !strings.Contains(selection.Detail, "selected=kprobe") {
+		t.Fatalf("unsupported selection = %#v", selection)
+	}
+}
+
 func TestBPFLoadTestDefaultsToBaselineLoaderAndOutput(t *testing.T) {
 	var baselineCalls, experimentalCalls int
 	identity := dataplane.ObjectIdentity{

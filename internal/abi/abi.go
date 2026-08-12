@@ -52,8 +52,8 @@ const (
 	FakeTCPEventRST           uint8 = 5
 	FakeTCPEventFIN           uint8 = 6
 
-	FakeTCPEventABIVersion   uint16 = 2
-	FakeTCPEventSize                = 104
+	FakeTCPEventABIVersion   uint16 = 3
+	FakeTCPEventSize                = 112
 	FakeTCPMaxCapturedPacket        = 2304
 	FakeTCPPacketEventSize          = FakeTCPEventSize + FakeTCPMaxCapturedPacket
 
@@ -216,9 +216,11 @@ func (v IngressListenerValue) MapGeneration() uint64 { return v.Generation }
 
 // FakeTCPSessionKey is local-endpoint oriented in both directions: egress
 // fills Local from the IPv4 source, while XDP ingress fills Local from the
-// destination. IPv4 fields are raw __be32 bytes represented as native Go
-// uint32 values; callers must use faketcp.RawIPv4BE32 rather than numeric
-// big-endian parsing. This gives the daemon and both BPF hooks one stable key.
+// destination. WGID is part of the map identity so equal network tuples owned
+// by different WireGuard instances never alias. IPv4 fields are raw __be32
+// bytes represented as native Go uint32 values; callers must use
+// faketcp.RawIPv4BE32 rather than numeric big-endian parsing. Reserved is
+// explicit so all 32 key bytes have deterministic userspace and BPF contents.
 type FakeTCPSessionKey struct {
 	Generation    uint64
 	LocalIPv4     uint32
@@ -226,6 +228,8 @@ type FakeTCPSessionKey struct {
 	UnderlayIndex uint32
 	LocalPort     uint16
 	RemotePort    uint16
+	WGID          uint32
+	Reserved      [4]byte // Must stay zero; maps exactly to the C ABI pad bytes.
 }
 
 type FakeTCPSessionValue struct {

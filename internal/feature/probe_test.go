@@ -13,6 +13,9 @@ func TestRunProbe(t *testing.T) {
 	if _, ok := p.KernelModules["wg_mix_faketcp_checksum"]; !ok {
 		t.Fatal("FakeTCP checksum module probe is missing")
 	}
+	if _, ok := p.KernelModules["wg_mix_faketcp_checksum_kprobe"]; !ok {
+		t.Fatal("FakeTCP kprobe checksum module probe is missing")
+	}
 	if _, err := p.JSON(); err != nil {
 		t.Fatal(err)
 	}

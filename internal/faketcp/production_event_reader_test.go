@@ -31,7 +31,7 @@ func (counter *memoryEventLossCounter) set(count uint64) {
 
 func testProductionPacketSample(t testing.TB, cpu uint32, sequence uint64) []byte {
 	t.Helper()
-	flow := testFlow(31001)
+	flow := testFlowWithWGID(31001, 9)
 	packet := make([]byte, 20+8+3)
 	packet[0], packet[8], packet[9] = 0x45, 64, 17
 	binary.BigEndian.PutUint16(packet[2:4], uint16(len(packet)))
@@ -151,7 +151,7 @@ func TestProductionEventReaderReportsKernelLossOnIdleDeadline(t *testing.T) {
 
 func TestProductionEventReaderBindsRuntimeAndPossibleCPUs(t *testing.T) {
 	wrongIdentity := testProductionPacketSample(t, 1, 1)
-	wrongIdentity[32] ^= 0xff
+	wrongIdentity[40] ^= 0xff
 	outOfRangeCPU := testProductionPacketSample(t, 4, 1)
 	for _, test := range []struct {
 		name   string

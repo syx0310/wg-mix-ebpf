@@ -44,6 +44,11 @@ type fakeTCPProductionScopeResolver func(
 	context.Context,
 ) (fakeTCPProductionScopeIdentity, error)
 
+type fakeTCPProductionClassicRecovery func(
+	context.Context,
+	fakeTCPProductionScopeIdentity,
+) error
+
 type fakeTCPRuntimeLifecycle interface {
 	Ensure(context.Context, fakeTCPRuntimeDesiredKey, fakeTCPRuntimeBuild) error
 	Stop(context.Context) error
@@ -72,6 +77,7 @@ type fakeTCPProductionCoordinator struct {
 	validateActivation fakeTCPActivationValidator
 	resolveScope       fakeTCPProductionScopeResolver
 	planExperimental   fakeTCPProductionPlanner
+	recoverClassic     fakeTCPProductionClassicRecovery
 }
 
 var _ AttachStateLoader = (*fakeTCPProductionCoordinator)(nil)
@@ -201,6 +207,9 @@ func (coordinator *fakeTCPProductionCoordinator) applyBaselineLocked(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := coordinator.recoverStaleClassicLocked(ctx); err != nil {
+		return fmt.Errorf("recover stale FakeTCP classic owner before baseline apply: %w", err)
+	}
 	if err := coordinator.baseline.Apply(ctx, state); err != nil {
 		// Baseline Apply is transactional and may have restored a prior durable
 		// generation. Keep the conservative owner instead of claiming none.
@@ -209,6 +218,18 @@ func (coordinator *fakeTCPProductionCoordinator) applyBaselineLocked(
 	}
 	shared.owner = dataplaneCoreOwnerBaseline
 	return nil
+}
+
+func (coordinator *fakeTCPProductionCoordinator) recoverStaleClassicLocked(
+	ctx context.Context,
+) error {
+	if coordinator == nil || coordinator.recoverClassic == nil {
+		return nil
+	}
+	if coordinator.shared == nil || !coordinator.shared.scopeBound {
+		return errors.New("recover stale FakeTCP classic owner: production scope is unbound")
+	}
+	return coordinator.recoverClassic(ctx, coordinator.shared.scope)
 }
 
 func (coordinator *fakeTCPProductionCoordinator) applyExperimentalLocked(
@@ -250,12 +271,27 @@ func (coordinator *fakeTCPProductionCoordinator) applyExperimentalLocked(
 		return err
 	}
 
-	// A baseline owner may have been created by an earlier process, so this is
-	// deliberately unconditional instead of relying only on the in-memory
-	// owner enum. Detach is idempotent for an absent baseline owner.
-	if err := coordinator.baseline.Detach(ctx, state); err != nil {
-		coordinator.shared.owner = dataplaneCoreOwnerBaseline
-		return fmt.Errorf("detach baseline core before experimental start: %w", err)
+	// Unknown/baseline ownership may predate this process and therefore still
+	// requires a durable baseline detach. Once this coordinator already owns an
+	// experimental runtime, however, its supervisor is the sole replacement
+	// authority. In particular, baseline detach must not race or misclassify a
+	// live durable FakeTCP classic-TC owner before Ensure retires it.
+	if coordinator.shared.owner != dataplaneCoreOwnerExperimental {
+		// A crashed classic FakeTCP generation leaves durable filters but no
+		// resident supervisor entry. Retire that exact journaled owner before
+		// asking the baseline loader to inspect or mutate the same TC slots.
+		// The planner has already frozen its backend choice, so auto remains
+		// sticky to classic for this reconcile even after recovery succeeds.
+		if err := coordinator.recoverStaleClassicLocked(ctx); err != nil {
+			return fmt.Errorf(
+				"recover stale FakeTCP classic owner before experimental baseline detach: %w",
+				err,
+			)
+		}
+		if err := coordinator.baseline.Detach(ctx, state); err != nil {
+			coordinator.shared.owner = dataplaneCoreOwnerBaseline
+			return fmt.Errorf("detach baseline core before experimental start: %w", err)
+		}
 	}
 	coordinator.shared.owner = dataplaneCoreOwnerNone
 	if err := ctx.Err(); err != nil {
@@ -324,6 +360,9 @@ func (coordinator *fakeTCPProductionCoordinator) Detach(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := coordinator.recoverStaleClassicLocked(ctx); err != nil {
+		return fmt.Errorf("recover stale FakeTCP classic owner before baseline detach: %w", err)
+	}
 	if err := coordinator.baseline.Detach(ctx, state); err != nil {
 		shared.owner = dataplaneCoreOwnerBaseline
 		return err
@@ -389,6 +428,9 @@ func (coordinator *fakeTCPProductionCoordinator) DetachStale(
 	shared.owner = dataplaneCoreOwnerNone
 	if err := ctx.Err(); err != nil {
 		return err
+	}
+	if err := coordinator.recoverStaleClassicLocked(ctx); err != nil {
+		return fmt.Errorf("recover stale FakeTCP classic owner before baseline stale detach: %w", err)
 	}
 	if err := coordinator.baseline.DetachStale(ctx, previous, current); err != nil {
 		// The current baseline generation may still be active even when pruning a

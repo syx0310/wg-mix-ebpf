@@ -15,6 +15,7 @@ import (
 const (
 	baselineManifestObjectEnv     = "WG_MIX_BASELINE_MANIFEST_OBJECT"
 	experimentalManifestObjectEnv = "WG_MIX_FAKETCP_MANIFEST_OBJECT"
+	legacy515ManifestObjectEnv    = "WG_MIX_FAKETCP_LEGACY_515_MANIFEST_OBJECT"
 )
 
 // TestBuiltBPFObjectManifests is opt-in so ordinary unit tests do not require
@@ -22,11 +23,17 @@ const (
 func TestBuiltBPFObjectManifests(t *testing.T) {
 	baselinePath := os.Getenv(baselineManifestObjectEnv)
 	experimentalPath := os.Getenv(experimentalManifestObjectEnv)
-	if baselinePath == "" && experimentalPath == "" {
+	legacy515Path := os.Getenv(legacy515ManifestObjectEnv)
+	if baselinePath == "" && experimentalPath == "" && legacy515Path == "" {
 		t.Skip("compiled BPF object paths are not configured")
 	}
-	if baselinePath == "" || experimentalPath == "" {
-		t.Fatalf("both %s and %s are required", baselineManifestObjectEnv, experimentalManifestObjectEnv)
+	if baselinePath == "" || experimentalPath == "" || legacy515Path == "" {
+		t.Fatalf(
+			"%s, %s, and %s are required",
+			baselineManifestObjectEnv,
+			experimentalManifestObjectEnv,
+			legacy515ManifestObjectEnv,
+		)
 	}
 
 	baseline, _, err := loadCollectionSpec(baselinePath)
@@ -43,6 +50,97 @@ func TestBuiltBPFObjectManifests(t *testing.T) {
 	}
 	if err := validateExperimentalExtensionManifest(experimental); err != nil {
 		t.Fatalf("fresh experimental object violates exact extension manifest: %v", err)
+	}
+
+	legacy515, _, err := loadCollectionSpec(legacy515Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateLegacy515ExtensionManifest(legacy515); err != nil {
+		t.Fatalf("fresh legacy-5.15 object violates exact extension manifest: %v", err)
+	}
+}
+
+func TestLegacy515ManifestIsIndependentAndRejectsPost515Calls(t *testing.T) {
+	legacy515 := canonicalLegacy515CollectionSpec()
+	if err := validateLegacy515ExtensionManifest(legacy515); err != nil {
+		t.Fatalf("exact legacy-5.15 manifest rejected: %v", err)
+	}
+	if err := validateExperimentalExtensionManifest(legacy515); err == nil {
+		t.Fatal("modern FakeTCP manifest accepted the legacy-5.15 object")
+	}
+
+	modern := canonicalExperimentalCollectionSpec()
+	if err := validateLegacy515ExtensionManifest(modern); err == nil {
+		t.Fatal("legacy-5.15 manifest accepted modern kfunc relocations")
+	}
+
+	loop := canonicalLegacy515CollectionSpec()
+	loopCall := asm.FnLoop.Call()
+	loop.Programs["wg_mix_egress"].Instructions = asm.Instructions{
+		loopCall,
+		asm.Return(),
+	}
+	if err := validateLegacy515ExtensionManifest(loop); err == nil ||
+		!strings.Contains(err.Error(), "forbidden bpf_loop") {
+		t.Fatalf("legacy-5.15 manifest accepted bpf_loop: %v", err)
+	}
+
+	missingCookie := canonicalLegacy515CollectionSpec()
+	delete(missingCookie.Maps, legacy515FakeTCPKprobeRuntimeMap)
+	if err := validateLegacy515ExtensionManifest(missingCookie); err == nil ||
+		!strings.Contains(err.Error(), legacy515FakeTCPKprobeRuntimeMap) {
+		t.Fatalf("legacy-5.15 manifest accepted missing cookie map: %v", err)
+	}
+
+	mutableFromBPF := canonicalLegacy515CollectionSpec()
+	mutableFromBPF.Maps[legacy515FakeTCPKprobeRuntimeMap].Flags = 0
+	if err := validateLegacy515ExtensionManifest(mutableFromBPF); err == nil ||
+		!strings.Contains(err.Error(), legacy515FakeTCPKprobeRuntimeMap) {
+		t.Fatalf("legacy-5.15 manifest accepted BPF-writable cookie map: %v", err)
+	}
+
+	missingPrepare := canonicalLegacy515CollectionSpec()
+	var withoutPrepare asm.Instructions
+	removed := false
+	for _, instruction := range missingPrepare.Programs["wg_mix_egress"].Instructions {
+		if !removed && instruction.IsBuiltinCall() &&
+			asm.BuiltinFunc(instruction.Constant) == asm.FnSkbChangeType {
+			removed = true
+			continue
+		}
+		withoutPrepare = append(withoutPrepare, instruction)
+	}
+	missingPrepare.Programs["wg_mix_egress"].Instructions = withoutPrepare
+	if err := validateLegacy515ExtensionManifest(missingPrepare); err == nil ||
+		!strings.Contains(err.Error(), "want exactly 2") {
+		t.Fatalf("legacy-5.15 manifest accepted missing prepare trigger: %v", err)
+	}
+
+	missingRefresh := canonicalLegacy515CollectionSpec()
+	var withoutRefresh asm.Instructions
+	removed = false
+	for _, instruction := range missingRefresh.Programs["wg_mix_egress"].Instructions {
+		if !removed && instruction.IsBuiltinCall() &&
+			asm.BuiltinFunc(instruction.Constant) == asm.FnSkbPullData {
+			removed = true
+			continue
+		}
+		withoutRefresh = append(withoutRefresh, instruction)
+	}
+	missingRefresh.Programs["wg_mix_egress"].Instructions = withoutRefresh
+	if err := validateLegacy515ExtensionManifest(missingRefresh); err == nil ||
+		!strings.Contains(err.Error(), "want exactly 2") {
+		t.Fatalf("legacy-5.15 manifest accepted missing verifier refresh: %v", err)
+	}
+
+	wrongCaller := canonicalLegacy515CollectionSpec()
+	wrongCaller.Programs["wg_faketcp_egress"].Instructions = asm.Instructions{
+		asm.FnSkbChangeProto.Call(), asm.Return(),
+	}
+	if err := validateLegacy515ExtensionManifest(wrongCaller); err == nil ||
+		!strings.Contains(err.Error(), "unreviewed program") {
+		t.Fatalf("legacy-5.15 manifest accepted trigger on wrong program: %v", err)
 	}
 }
 
@@ -337,6 +435,28 @@ func canonicalExperimentalCollectionSpec() *ebpf.CollectionSpec {
 			call := asm.Call.Label(name)
 			call.Src = asm.PseudoKfuncCall
 			instructions = append(instructions, call)
+		}
+	}
+	spec.Programs["wg_mix_egress"].Instructions = append(instructions, asm.Return())
+	return spec
+}
+
+func canonicalLegacy515CollectionSpec() *ebpf.CollectionSpec {
+	spec := canonicalExperimentalCollectionSpec()
+	descriptor := legacy515FakeTCPKprobeRuntimeMapDescriptor()
+	spec.Maps[descriptor.name] = &ebpf.MapSpec{
+		Name:       descriptor.name,
+		Type:       descriptor.mapType,
+		KeySize:    descriptor.keySize,
+		ValueSize:  descriptor.valueSize,
+		MaxEntries: descriptor.maxEntries,
+		Flags:      descriptor.flags,
+		Pinning:    ebpf.PinNone,
+	}
+	var instructions asm.Instructions
+	for helper, count := range legacy515FakeTCPTriggerHelperCounts {
+		for range count {
+			instructions = append(instructions, helper.Call())
 		}
 	}
 	spec.Programs["wg_mix_egress"].Instructions = append(instructions, asm.Return())

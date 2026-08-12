@@ -615,7 +615,7 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 	consume := strings.Index(gso, "faketcp_consume_egress_admission(admission->nonce, admission)")
 	rewrite := strings.Index(gso, "bpf_loop(context.gso_segments, faketcp_gso_rewrite_type")
 	sessionMutation := strings.Index(gso, "faketcp_session_mutate(session, generation, now,")
-	commitCall := strings.Index(gso, "wg_mix_faketcp_skb_commit_udp_gso(")
+	commitCall := strings.Index(gso, "faketcp_commit_udp_gso(")
 	if prepare < 0 || checkpoint < 0 || consume < 0 || rewrite < 0 || sessionMutation < 0 || commitCall < 0 ||
 		strings.Contains(gso[:sessionMutation], "session->") ||
 		strings.Count(gso, "FAKETCP_SESSION_MUTATE_TX") != 1 ||
@@ -658,7 +658,7 @@ func TestFakeTCPGSODependencyManifestRetainsEstablishedStoreAndTwoKfuncs(t *test
 	}
 	manifest := string(source)
 	for _, required := range []string{
-		`{name: "faketcp_session_map", mapType: ebpf.Hash, keySize: 24, valueSize: 80, maxEntries: 16384}`,
+		`{name: "faketcp_session_map", mapType: ebpf.Hash, keySize: 32, valueSize: 80, maxEntries: 16384}`,
 		`name: "wg_faketcp_session_claim", sectionName: "classifier/faketcp_session_claim"`,
 		"experimentalFakeTCPMTUAuditKeyCount   = 15",
 	} {

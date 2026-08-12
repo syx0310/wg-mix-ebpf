@@ -27,18 +27,57 @@ func newLiveExperimentalFakeTCPSlowPathFactory(
 	snapshot *fakeTCPPolicySnapshot,
 	scope fakeTCPProductionScopeIdentity,
 ) (experimentalSlowPathFactory, error) {
+	factory, err := newLiveFakeTCPControllerRuntimeFactory(state, snapshot, scope)
+	if err != nil {
+		return nil, err
+	}
+	return func(
+		engine *faketcp.Engine,
+		events *ebpf.Map,
+		stats *ebpf.Map,
+	) (experimentalSlowPath, error) {
+		return factory.NewLinuxRuntime(engine, events, stats)
+	}, nil
+}
+
+// newLiveExperimentalFakeTCPRoutedSlowPathFactory owns the same single-use
+// controller capability as the single-Engine factory, but connects its one
+// ring reader and one raw backend to an immutable multi-WireGuard router.
+func newLiveExperimentalFakeTCPRoutedSlowPathFactory(
+	state *control.State,
+	snapshot *fakeTCPPolicySnapshot,
+	scope fakeTCPProductionScopeIdentity,
+) (experimentalRoutedSlowPathFactory, error) {
+	factory, err := newLiveFakeTCPControllerRuntimeFactory(state, snapshot, scope)
+	if err != nil {
+		return nil, err
+	}
+	return func(
+		router *faketcp.EngineRouter,
+		events *ebpf.Map,
+		stats *ebpf.Map,
+	) (experimentalSlowPath, error) {
+		return factory.NewLinuxRoutedRuntime(router, events, stats)
+	}, nil
+}
+
+func newLiveFakeTCPControllerRuntimeFactory(
+	state *control.State,
+	snapshot *fakeTCPPolicySnapshot,
+	scope fakeTCPProductionScopeIdentity,
+) (faketcp.ControllerRuntimeFactory, error) {
 	if state == nil {
-		return nil, errors.New("build live FakeTCP slow-path factory: state is nil")
+		return faketcp.ControllerRuntimeFactory{}, errors.New("build live FakeTCP slow-path factory: state is nil")
 	}
 	if err := validateFakeTCPPolicySnapshot(snapshot); err != nil {
-		return nil, fmt.Errorf("build live FakeTCP slow-path factory snapshot: %w", err)
+		return faketcp.ControllerRuntimeFactory{}, fmt.Errorf("build live FakeTCP slow-path factory snapshot: %w", err)
 	}
 	if err := scope.validate(); err != nil {
-		return nil, fmt.Errorf("build live FakeTCP slow-path factory scope: %w", err)
+		return faketcp.ControllerRuntimeFactory{}, fmt.Errorf("build live FakeTCP slow-path factory scope: %w", err)
 	}
 	marks, err := buildFakeTCPControllerMarks(state, snapshot)
 	if err != nil {
-		return nil, err
+		return faketcp.ControllerRuntimeFactory{}, err
 	}
 	factory, err := faketcp.NewControllerRuntimeFactory(
 		faketcp.ControllerRuntimeFactoryOptions{
@@ -53,13 +92,7 @@ func newLiveExperimentalFakeTCPSlowPathFactory(
 		},
 	)
 	if err != nil {
-		return nil, fmt.Errorf("build live FakeTCP controller runtime factory: %w", err)
+		return faketcp.ControllerRuntimeFactory{}, fmt.Errorf("build live FakeTCP controller runtime factory: %w", err)
 	}
-	return func(
-		engine *faketcp.Engine,
-		events *ebpf.Map,
-		stats *ebpf.Map,
-	) (experimentalSlowPath, error) {
-		return factory.NewLinuxRuntime(engine, events, stats)
-	}, nil
+	return factory, nil
 }

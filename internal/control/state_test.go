@@ -166,11 +166,36 @@ func TestBuildStateOfflineParsesConfigFwMark(t *testing.T) {
 	if state.AttachmentBackend != "classic_tc" {
 		t.Fatalf("attachment backend = %q", state.AttachmentBackend)
 	}
+	if state.ChecksumBackend != config.FakeTCPChecksumBackendAuto {
+		t.Fatalf("checksum backend = %q", state.ChecksumBackend)
+	}
 	if state.WireGuards[0].ConfigFwMark != 0x10000002 {
 		t.Fatalf("config fwmark = 0x%x", state.WireGuards[0].ConfigFwMark)
 	}
 	if len(state.EgressRules) != 0 {
 		t.Fatalf("offline egress rules = %d", len(state.EgressRules))
+	}
+}
+
+func TestBuildStateCarriesChecksumBackend(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Runtime.ChecksumBackend = config.FakeTCPChecksumBackendKprobe
+	mark := uint32(0x10000002)
+	state, err := BuildState(
+		context.Background(),
+		cfg,
+		runtime.StaticProvider{},
+		underlay.StaticResolver{},
+		func(string) (*wgconfig.Interface, error) {
+			return &wgconfig.Interface{FwMark: &mark}, nil
+		},
+		BuildOptions{Offline: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if state.ChecksumBackend != config.FakeTCPChecksumBackendKprobe {
+		t.Fatalf("checksum backend = %q", state.ChecksumBackend)
 	}
 }
 

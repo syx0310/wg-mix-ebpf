@@ -254,7 +254,7 @@ func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T
 
 	preflight := text[preflightStart : strings.Index(text[preflightStart:], "struct faketcp_gso_loop_context")+preflightStart]
 	gsoProjection := strings.Index(preflight, "faketcp_gso_build_projection(skb, info, profile, cipher")
-	flowLookup := strings.Index(preflight, "faketcp_tc_key(skb, info, l3, generation, key)")
+	flowLookup := strings.Index(preflight, "faketcp_tc_key(skb, info, l3, generation, rule->wg_id, key)")
 	if gsoProjection < 0 || flowLookup < 0 || gsoProjection >= flowLookup {
 		t.Fatal("aggregate geometry and every segment contract must be proven before flow/session admission")
 	}
@@ -294,7 +294,7 @@ func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T
 	gsoConsume := strings.Index(gso, "faketcp_consume_egress_admission(")
 	gsoRewrite := strings.Index(gso, "bpf_loop(context.gso_segments, faketcp_gso_rewrite_type")
 	gsoMutation := strings.Index(gso, "faketcp_session_mutate(session, generation, now,")
-	gsoCommit := strings.Index(gso, "wg_mix_faketcp_skb_commit_udp_gso(")
+	gsoCommit := strings.Index(gso, "faketcp_commit_udp_gso(")
 	if gsoPrepare < 0 || gsoCheckpoint < 0 || gsoConsume < 0 || gsoRewrite < 0 || gsoMutation < 0 || gsoCommit < 0 ||
 		!(gsoPrepare < gsoCheckpoint && gsoCheckpoint < gsoConsume && gsoConsume < gsoRewrite &&
 			gsoRewrite < gsoMutation && gsoMutation < gsoCommit) {
@@ -675,7 +675,7 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 	gsoConsume := strings.Index(gso, "faketcp_consume_egress_admission(")
 	gsoTypeRewrite := strings.Index(gso, "faketcp_gso_rewrite_type")
 	gsoXOR := strings.Index(gso, "faketcp_gso_xor_chunk")
-	gsoCommit := strings.Index(gso, "wg_mix_faketcp_skb_commit_udp_gso(")
+	gsoCommit := strings.Index(gso, "faketcp_commit_udp_gso(")
 	if gsoMutation < 0 || gsoPrepare < 0 || gsoCheckpoint < 0 || gsoConsume < 0 ||
 		gsoTypeRewrite < 0 || gsoXOR < 0 || gsoCommit < 0 ||
 		strings.Contains(gso[:gsoMutation], "session->") ||
@@ -1277,7 +1277,7 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 	for _, want := range []string{
 		"sizeof(struct faketcp_session_snapshot) == 56",
 		"sizeof(union faketcp_ingress_decision_projection) == 16",
-		"sizeof(struct faketcp_ingress_admission) == 136",
+		"sizeof(struct faketcp_ingress_admission) == 144",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("close/admission stack contract missing %q", want)

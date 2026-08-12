@@ -86,7 +86,7 @@ func TestControllerHandshakeSendsControlAndReinjectsFirstPacketOnce(t *testing.T
 		t.Fatal(err)
 	}
 	packetEvent := testBoundEventSample(abi.FakeTCPEvent{
-		Key: flow, TimestampNanos: 123456, PayloadLength: 5, FWMark: 0x1234, WGID: 77,
+		Key: flow, TimestampNanos: 123456, PayloadLength: 5, FWMark: 0x1234, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
 
@@ -94,7 +94,7 @@ func TestControllerHandshakeSendsControlAndReinjectsFirstPacketOnce(t *testing.T
 	if err != nil || len(actions) != 1 || actions[0].Kind != ActionSendControl {
 		t.Fatalf("first packet actions=%#v err=%v", actions, err)
 	}
-	if len(backend.sent) != 1 || backend.sent[0].wgID != 77 || backend.sent[0].control.Flags != FlagSYN {
+	if len(backend.sent) != 1 || backend.sent[0].wgID != flow.WGID || backend.sent[0].control.Flags != FlagSYN {
 		t.Fatalf("sent control=%#v", backend.sent)
 	}
 	if len(backend.packets) != 0 {
@@ -102,21 +102,21 @@ func TestControllerHandshakeSendsControlAndReinjectsFirstPacketOnce(t *testing.T
 	}
 
 	synACK := testBoundEventSample(abi.FakeTCPEvent{
-		Key: flow, Sequence: 9000, Acknowledgement: 1001, WGID: 77,
+		Key: flow, Sequence: 9000, Acknowledgement: 1001, WGID: 7,
 		Type: abi.FakeTCPEventSYNACK, TCPFlags: FlagSYN | FlagACK,
 	}, nil, false)
 	actions, err = controller.HandleSample(context.Background(), synACK)
 	if err != nil || len(actions) != 2 || actions[0].Kind != ActionSendControl || actions[1].Kind != ActionReleasePending {
 		t.Fatalf("synack actions=%#v err=%v", actions, err)
 	}
-	if len(backend.sent) != 2 || backend.sent[1].wgID != 77 || backend.sent[1].control.Flags != FlagACK {
+	if len(backend.sent) != 2 || backend.sent[1].wgID != flow.WGID || backend.sent[1].control.Flags != FlagACK {
 		t.Fatalf("sent control=%#v", backend.sent)
 	}
 	if len(backend.packets) != 1 {
 		t.Fatalf("reinjected packets=%#v", backend.packets)
 	}
 	got := backend.packets[0]
-	if got.flow != flow || got.packet.FWMark != 0x1234 || got.packet.WGID != 77 ||
+	if got.flow != flow || got.packet.FWMark != 0x1234 || got.packet.WGID != flow.WGID ||
 		got.packet.CaptureNanos != 123456 || got.packet.CaptureID.Runtime != engine.Identity() ||
 		got.packet.CaptureID.CPU != 3 || got.packet.CaptureID.Sequence != 1 ||
 		!bytes.Equal(got.packet.Data, wantPacket) {
@@ -154,7 +154,7 @@ func TestControllerCapturedOutboundRetriesPendingDeleteBeforeLookup(t *testing.T
 	packet := testIPv4UDPPacket(t, flow, []byte{1, 2, 3, 4})
 	event := abi.FakeTCPEvent{
 		Key: flow, Type: abi.FakeTCPEventNeedHandshake,
-		PacketLength: uint16(len(packet)), PayloadLength: 4, WGID: 77,
+		PacketLength: uint16(len(packet)), PayloadLength: 4, WGID: 7,
 	}
 	bindTestEvent(&event, engine.Identity(), 2)
 	actions, err := controller.HandleSample(
@@ -181,7 +181,7 @@ func TestDecodeEventSampleRejectsUnversionedOrAmbiguousIdentity(t *testing.T) {
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1})
 	base := abi.FakeTCPEvent{
-		Key: flow, PayloadLength: 1, PacketLength: uint16(len(packet)),
+		Key: flow, PayloadLength: 1, WGID: flow.WGID, PacketLength: uint16(len(packet)),
 		Type: abi.FakeTCPEventNeedHandshake,
 	}
 	if _, err := DecodeEventSample(testEventSample(base, packet, false)); err == nil {
@@ -195,6 +195,7 @@ func TestDecodeEventSampleRejectsUnversionedOrAmbiguousIdentity(t *testing.T) {
 		{name: "event ABI", mutate: func(event *abi.FakeTCPEvent) { event.EventABIVersion++ }},
 		{name: "zero incarnation", mutate: func(event *abi.FakeTCPEvent) { event.RuntimeIncarnation = [16]byte{} }},
 		{name: "zero sequence", mutate: func(event *abi.FakeTCPEvent) { event.CaptureSequence = 0 }},
+		{name: "WGID mismatch", mutate: func(event *abi.FakeTCPEvent) { event.WGID++ }},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			event := base
@@ -207,7 +208,7 @@ func TestDecodeEventSampleRejectsUnversionedOrAmbiguousIdentity(t *testing.T) {
 	if _, err := DecodeEventSample(make([]byte, 56)); err == nil {
 		t.Fatal("legacy unversioned event header was accepted")
 	}
-	control := abi.FakeTCPEvent{Key: flow, Type: abi.FakeTCPEventACK, TCPFlags: FlagACK}
+	control := abi.FakeTCPEvent{Key: flow, WGID: flow.WGID, Type: abi.FakeTCPEventACK, TCPFlags: FlagACK}
 	bindTestEvent(&control, testRuntimeIdentity(flow.Generation), 0)
 	control.CaptureCPU, control.CaptureSequence = 3, 1
 	if _, err := DecodeEventSample(testBoundEventSample(control, nil, false)); err == nil {
@@ -225,7 +226,7 @@ func TestControllerRejectsEventFromDifferentRuntimeIncarnationBeforeEngine(t *te
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1})
 	event := abi.FakeTCPEvent{
-		Key: flow, PayloadLength: 1, PacketLength: uint16(len(packet)),
+		Key: flow, PayloadLength: 1, WGID: flow.WGID, PacketLength: uint16(len(packet)),
 		Type: abi.FakeTCPEventNeedHandshake,
 	}
 	wrong := engine.Identity()
@@ -246,7 +247,7 @@ func TestDecodeEventSampleAcceptsCompactAndFixedPacketRecords(t *testing.T) {
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{9, 8, 7})
 	event := abi.FakeTCPEvent{
-		Key: flow, PayloadLength: 3, FWMark: 9, WGID: 5,
+		Key: flow, PayloadLength: 3, FWMark: 9, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}
 	bindTestEvent(&event, testRuntimeIdentity(flow.Generation), 1)
@@ -266,7 +267,7 @@ func TestDecodeEventSampleOwnsPacket(t *testing.T) {
 	packet := testIPv4UDPPacket(t, flow, []byte{9, 8, 7})
 	event := abi.FakeTCPEvent{
 		Key: flow, PayloadLength: 3, PacketLength: uint16(len(packet)),
-		Type: abi.FakeTCPEventNeedHandshake,
+		WGID: flow.WGID, Type: abi.FakeTCPEventNeedHandshake,
 	}
 	bindTestEvent(&event, testRuntimeIdentity(flow.Generation), 1)
 	sample := testBoundEventSample(event, packet, false)
@@ -350,7 +351,7 @@ func TestDecodeEventSampleRejectsMetadataOnlyAndMismatchedPackets(t *testing.T) 
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1})
 	base := abi.FakeTCPEvent{
-		Key: flow, PayloadLength: 1, WGID: 1,
+		Key: flow, PayloadLength: 1, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}
 	tests := []struct {
@@ -405,14 +406,14 @@ func TestControllerDoesNotRepeatFailedReinjection(t *testing.T) {
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1, 2})
 	first := testBoundEventSample(abi.FakeTCPEvent{
-		Key: flow, PayloadLength: 2, FWMark: 3, WGID: 4,
+		Key: flow, PayloadLength: 2, FWMark: 3, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
 	if _, err := controller.HandleSample(context.Background(), first); err != nil {
 		t.Fatal(err)
 	}
 	synACK := testBoundEventSample(abi.FakeTCPEvent{
-		Key: flow, Sequence: 99, Acknowledgement: 1001, WGID: 4,
+		Key: flow, Sequence: 99, Acknowledgement: 1001, WGID: 7,
 		Type: abi.FakeTCPEventSYNACK, TCPFlags: FlagSYN | FlagACK,
 	}, nil, false)
 	_, terminalErr := controller.HandleSample(context.Background(), synACK)
@@ -442,7 +443,7 @@ func TestControllerAttemptsEveryReleasedPacketOnce(t *testing.T) {
 	for index, payload := range [][]byte{{1}, {2}} {
 		packet := testIPv4UDPPacket(t, flow, payload)
 		sample := testBoundEventSample(abi.FakeTCPEvent{
-			Key: flow, PayloadLength: 1, FWMark: uint32(index + 1), WGID: 4,
+			Key: flow, PayloadLength: 1, FWMark: uint32(index + 1), WGID: 7,
 			PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 		}, packet, false)
 		if _, err := controller.HandleSample(context.Background(), sample); err != nil {
@@ -450,7 +451,7 @@ func TestControllerAttemptsEveryReleasedPacketOnce(t *testing.T) {
 		}
 	}
 	synACK := testBoundEventSample(abi.FakeTCPEvent{
-		Key: flow, Sequence: 99, Acknowledgement: 1001, WGID: 4,
+		Key: flow, Sequence: 99, Acknowledgement: 1001, WGID: 7,
 		Type: abi.FakeTCPEventSYNACK, TCPFlags: FlagSYN | FlagACK,
 	}, nil, false)
 	if _, err := controller.HandleSample(context.Background(), synACK); !errors.Is(err, ErrControllerFailed) || !errors.Is(err, reinjectFailure) {
@@ -471,7 +472,7 @@ func TestControllerStopsReleaseWhenControlSendFails(t *testing.T) {
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1})
 	first := testBoundEventSample(abi.FakeTCPEvent{
-		Key: flow, PayloadLength: 1, WGID: 4,
+		Key: flow, PayloadLength: 1, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
 	if _, err := controller.HandleSample(context.Background(), first); err != nil {
@@ -480,7 +481,7 @@ func TestControllerStopsReleaseWhenControlSendFails(t *testing.T) {
 	sendFailure := errors.New("send failure")
 	backend.sendErr = sendFailure
 	synACK := testBoundEventSample(abi.FakeTCPEvent{
-		Key: flow, Sequence: 99, Acknowledgement: 1001, WGID: 4,
+		Key: flow, Sequence: 99, Acknowledgement: 1001, WGID: 7,
 		Type: abi.FakeTCPEventSYNACK, TCPFlags: FlagSYN | FlagACK,
 	}, nil, false)
 	_, terminalErr := controller.HandleSample(context.Background(), synACK)
@@ -510,7 +511,7 @@ func TestControllerInitialSendFailurePreventsTickRetry(t *testing.T) {
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1})
 	sample := testBoundEventSample(abi.FakeTCPEvent{
-		Key: flow, PayloadLength: 1, WGID: 4,
+		Key: flow, PayloadLength: 1, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
 	_, terminalErr := controller.HandleSample(context.Background(), sample)
@@ -576,7 +577,7 @@ func TestControllerPartialReinjectionCancellationIsTerminal(t *testing.T) {
 	for index, payload := range [][]byte{{1}, {2}} {
 		packet := testIPv4UDPPacket(t, flow, payload)
 		sample := testBoundEventSample(abi.FakeTCPEvent{
-			Key: flow, PayloadLength: 1, FWMark: uint32(index + 1), WGID: 4,
+			Key: flow, PayloadLength: 1, FWMark: uint32(index + 1), WGID: 7,
 			PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 		}, packet, false)
 		if _, err := controller.HandleSample(context.Background(), sample); err != nil {
@@ -584,7 +585,7 @@ func TestControllerPartialReinjectionCancellationIsTerminal(t *testing.T) {
 		}
 	}
 	synACK := testBoundEventSample(abi.FakeTCPEvent{
-		Key: flow, Sequence: 99, Acknowledgement: 1001, WGID: 4,
+		Key: flow, Sequence: 99, Acknowledgement: 1001, WGID: 7,
 		Type: abi.FakeTCPEventSYNACK, TCPFlags: FlagSYN | FlagACK,
 	}, nil, false)
 	_, terminalErr := controller.HandleSample(ctx, synACK)
@@ -616,7 +617,7 @@ func TestControllerPreExecutionErrorsDoNotBecomeTerminal(t *testing.T) {
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1})
 	sample := testBoundEventSample(abi.FakeTCPEvent{
-		Key: flow, PayloadLength: 1, WGID: 4,
+		Key: flow, PayloadLength: 1, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
 	canceled, cancel := context.WithCancel(context.Background())
@@ -629,7 +630,7 @@ func TestControllerPreExecutionErrorsDoNotBecomeTerminal(t *testing.T) {
 	wrongGeneration.Generation++
 	wrongPacket := testIPv4UDPPacket(t, wrongGeneration, []byte{2})
 	wrongSample := testBoundEventSample(abi.FakeTCPEvent{
-		Key: wrongGeneration, PayloadLength: 1, WGID: 4,
+		Key: wrongGeneration, PayloadLength: 1, WGID: 7,
 		PacketLength: uint16(len(wrongPacket)), Type: abi.FakeTCPEventNeedHandshake,
 	}, wrongPacket, false)
 	if _, err := controller.HandleSample(context.Background(), wrongSample); err == nil || errors.Is(err, ErrControllerFailed) {
@@ -779,7 +780,7 @@ func TestControllerSerializesHandleSampleAndTickSideEffects(t *testing.T) {
 	handleFlow := testFlow(31002)
 	packet := testIPv4UDPPacket(t, handleFlow, []byte{2})
 	sample := testBoundEventSample(abi.FakeTCPEvent{
-		Key: handleFlow, PayloadLength: 1, WGID: 9,
+		Key: handleFlow, PayloadLength: 1, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
 	handleStarted := make(chan struct{})
@@ -830,7 +831,7 @@ func TestControllerAdmittedWaiterObservesPriorTerminalFailureBeforeEngine(t *tes
 		flow := testFlow(port)
 		packet := testIPv4UDPPacket(t, flow, []byte{1})
 		return testBoundEventSample(abi.FakeTCPEvent{
-			Key: flow, PayloadLength: 1, WGID: 3,
+			Key: flow, PayloadLength: 1, WGID: 7,
 			PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 		}, packet, false)
 	}
@@ -879,7 +880,7 @@ func TestControllerCloseWaitsForInFlightAndClosedOperationsDoNotTouchState(t *te
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1})
 	sample := testBoundEventSample(abi.FakeTCPEvent{
-		Key: flow, PayloadLength: 1, WGID: 3,
+		Key: flow, PayloadLength: 1, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
 	handleResult := make(chan error, 1)
@@ -929,7 +930,7 @@ func TestControllerCloseWaitsForInFlightAndClosedOperationsDoNotTouchState(t *te
 	closedFlow := testFlow(31002)
 	closedPacket := testIPv4UDPPacket(t, closedFlow, []byte{2})
 	closedSample := testBoundEventSample(abi.FakeTCPEvent{
-		Key: closedFlow, PayloadLength: 1, WGID: 4,
+		Key: closedFlow, PayloadLength: 1, WGID: 7,
 		PacketLength: uint16(len(closedPacket)), Type: abi.FakeTCPEventNeedHandshake,
 	}, closedPacket, false)
 	canceled, cancel := context.WithCancel(context.Background())
@@ -998,7 +999,7 @@ func TestControllerClosingRejectsCallbackFromInflightBackendWithoutDeadlock(t *t
 	flow := testFlow(31001)
 	packet := testIPv4UDPPacket(t, flow, []byte{1})
 	sample := testBoundEventSample(abi.FakeTCPEvent{
-		Key: flow, PayloadLength: 1, WGID: 3,
+		Key: flow, PayloadLength: 1, WGID: 7,
 		PacketLength: uint16(len(packet)), Type: abi.FakeTCPEventNeedHandshake,
 	}, packet, false)
 	handleResult := make(chan error, 1)
@@ -1228,21 +1229,23 @@ func testEventSample(event abi.FakeTCPEvent, packet []byte, fixed bool) []byte {
 	native.PutUint32(sample[16:20], event.Key.UnderlayIndex)
 	native.PutUint16(sample[20:22], event.Key.LocalPort)
 	native.PutUint16(sample[22:24], event.Key.RemotePort)
-	native.PutUint64(sample[24:32], event.TimestampNanos)
-	copy(sample[32:48], event.RuntimeIncarnation[:])
-	native.PutUint64(sample[48:56], event.CaptureSequence)
-	native.PutUint64(sample[56:64], event.SessionRevision)
-	native.PutUint64(sample[64:72], event.SessionID)
-	native.PutUint32(sample[72:76], event.CaptureCPU)
-	native.PutUint32(sample[76:80], event.Sequence)
-	native.PutUint32(sample[80:84], event.Acknowledgement)
-	native.PutUint32(sample[84:88], event.PayloadLength)
-	native.PutUint32(sample[88:92], event.FWMark)
-	native.PutUint32(sample[92:96], event.WGID)
-	native.PutUint16(sample[96:98], event.PacketLength)
-	native.PutUint16(sample[98:100], event.EventABIVersion)
-	sample[100] = event.Type
-	sample[101] = event.TCPFlags
+	native.PutUint32(sample[24:28], event.Key.WGID)
+	copy(sample[28:32], event.Key.Reserved[:])
+	native.PutUint64(sample[32:40], event.TimestampNanos)
+	copy(sample[40:56], event.RuntimeIncarnation[:])
+	native.PutUint64(sample[56:64], event.CaptureSequence)
+	native.PutUint64(sample[64:72], event.SessionRevision)
+	native.PutUint64(sample[72:80], event.SessionID)
+	native.PutUint32(sample[80:84], event.CaptureCPU)
+	native.PutUint32(sample[84:88], event.Sequence)
+	native.PutUint32(sample[88:92], event.Acknowledgement)
+	native.PutUint32(sample[92:96], event.PayloadLength)
+	native.PutUint32(sample[96:100], event.FWMark)
+	native.PutUint32(sample[100:104], event.WGID)
+	native.PutUint16(sample[104:106], event.PacketLength)
+	native.PutUint16(sample[106:108], event.EventABIVersion)
+	sample[108] = event.Type
+	sample[109] = event.TCPFlags
 	copy(sample[fakeTCPEventSize:], packet)
 	return sample
 }

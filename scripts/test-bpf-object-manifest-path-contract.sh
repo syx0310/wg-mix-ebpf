@@ -11,10 +11,12 @@ actual_cwd=$(pwd -P)
 expected_cwd=${WG_MIX_MANIFEST_CONTRACT_EXPECT_CWD-}
 expected_baseline=${WG_MIX_MANIFEST_CONTRACT_EXPECT_BASELINE-}
 expected_experimental=${WG_MIX_MANIFEST_CONTRACT_EXPECT_EXPERIMENTAL-}
+expected_legacy_515=${WG_MIX_MANIFEST_CONTRACT_EXPECT_LEGACY_515-}
 
 test -n "$expected_cwd" || fail "missing expected working directory"
 test -n "$expected_baseline" || fail "missing expected baseline path"
 test -n "$expected_experimental" || fail "missing expected experimental path"
+test -n "$expected_legacy_515" || fail "missing expected legacy-5.15 path"
 
 test "$actual_cwd" = "$expected_cwd" ||
 	fail "working directory mismatch: got '$actual_cwd', want '$expected_cwd'"
@@ -22,6 +24,8 @@ test "${WG_MIX_BASELINE_MANIFEST_OBJECT-}" = "$expected_baseline" ||
 	fail "baseline path mismatch: got '${WG_MIX_BASELINE_MANIFEST_OBJECT-}', want '$expected_baseline'"
 test "${WG_MIX_FAKETCP_MANIFEST_OBJECT-}" = "$expected_experimental" ||
 	fail "experimental path mismatch: got '${WG_MIX_FAKETCP_MANIFEST_OBJECT-}', want '$expected_experimental'"
+test "${WG_MIX_FAKETCP_LEGACY_515_MANIFEST_OBJECT-}" = "$expected_legacy_515" ||
+	fail "legacy-5.15 path mismatch: got '${WG_MIX_FAKETCP_LEGACY_515_MANIFEST_OBJECT-}', want '$expected_legacy_515'"
 
 case ${WG_MIX_BASELINE_MANIFEST_OBJECT-} in
 	/*) ;;
@@ -30,6 +34,10 @@ esac
 case ${WG_MIX_FAKETCP_MANIFEST_OBJECT-} in
 	/*) ;;
 	*) fail "experimental path is not absolute" ;;
+esac
+case ${WG_MIX_FAKETCP_LEGACY_515_MANIFEST_OBJECT-} in
+	/*) ;;
+	*) fail "legacy-5.15 path is not absolute" ;;
 esac
 
 test "${CGO_ENABLED-}" = 0 || fail "CGO_ENABLED is not zero"

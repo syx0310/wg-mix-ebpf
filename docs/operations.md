@@ -81,27 +81,39 @@ The daemon performs startup reconcile, poll reconcile, and reload-request handli
 sudo wg-mix-ebpf run --config /etc/wg-mix-ebpf/config.yaml
 ```
 
-FakeTCP is process-owned: its BPF collection, TCX links, direct generic XDP
-links, and slow path live for exactly the resident daemon lifetime. A FakeTCP
-configuration therefore rejects `run --once` and one-shot fallback `reload`
-before network mutation. Start the service first, then send reload requests to
-that daemon. Before activation, an administrator must provision and load the
-kernel-matched `wg_mix_faketcp_checksum` kfunc module. Check it with:
+FakeTCP uses a resident BPF collection, direct generic XDP links, selected TC
+backend, checksum bridge and slow path. A FakeTCP configuration therefore
+rejects `run --once` and one-shot fallback `reload` before network mutation.
+Start the service first, then send reload requests to that daemon. Before
+activation, an administrator must provision the kernel-matched kfunc or
+kprobe checksum module. Check the selected contract with:
 
 ```bash
 sudo wg-mix-ebpf doctor --config /etc/wg-mix-ebpf/config.yaml
 ```
 
-The service validates module BTF and required kfuncs before detaching a
-baseline runtime and again while acquiring the FakeTCP collection. It never
-loads or unloads the administrator-owned module. OpenWrt without a separately
-packaged matching kmod supports UDP/ICMP but not FakeTCP.
+For kfunc, the service validates module BTF and required kfuncs before
+detaching a baseline runtime and again while acquiring the FakeTCP collection.
+For kprobe, it validates both trigger symbols, opens a per-runtime FD lease,
+reads the versioned health record, and checks the cookie/capability contract.
+The module supports multiple simultaneous leases and cookies; each daemon
+retains its own FD and fixed cookie through detach and never switches backend
+after activation. It never installs or loads either administrator-owned module.
+OpenWrt without a separately packaged matching kmod supports UDP/ICMP but not
+FakeTCP.
 
 FakeTCP additionally requires a fixed non-zero `ListenPort` in its WireGuard
 config and the fail-closed nft startup guard. The daemon keeps that guard in
-place through object acquisition, map population, TCX/XDP attachment, and the
-final retained-owner health check. A failed initial health check returns the
-complete diagnostic and does not publish attach state or remove the guard.
+place through object acquisition, map population, selected TC/XDP attachment,
+checksum-backend lease, and the final retained-owner health check. A failed
+initial health check returns the complete diagnostic and does not publish
+attach state or remove the guard.
+
+For an active FakeTCP runtime, `status` reports the resolved attachment and
+checksum backends, object variant/digest, exact XDP and TC identities, and the
+checksum lease/capabilities. Cookie material is never reported. A kprobe
+`nmissed` increment or lease loss changes health to failed; it is never
+presented as a successful automatic fallback.
 
 A dataplane-mutating daemon holds an exclusive lifecycle lease at
 `/run/wg-mix-ebpf/daemon.lease` from before startup reconcile until shutdown

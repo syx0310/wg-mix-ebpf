@@ -177,6 +177,16 @@ func (backend *RawControllerBackend) SendControl(
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := validatePacketFlow(flow); err != nil {
+		return fmt.Errorf("send faketcp control: %w", err)
+	}
+	if wgID != flow.WGID {
+		return fmt.Errorf(
+			"send faketcp control: WireGuard ID %d does not match flow WGID %d",
+			wgID,
+			flow.WGID,
+		)
+	}
 	writer, controlMarks, _, err := backend.beginOperation()
 	if err != nil {
 		return err
@@ -395,6 +405,13 @@ func (reinjector *onceReinjector) Reinject(
 	}
 	if packet.CaptureFingerprint == ([32]byte{}) {
 		return errors.New("faketcp captured packet has zero capture fingerprint")
+	}
+	if packet.WGID != flow.WGID {
+		return fmt.Errorf(
+			"faketcp captured packet WGID %d does not match flow WGID %d",
+			packet.WGID,
+			flow.WGID,
+		)
 	}
 	if err := ValidateMaterializedIPv4UDP(packet.Data, flow); err != nil {
 		return err

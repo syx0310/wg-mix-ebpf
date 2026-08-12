@@ -88,7 +88,7 @@ func BenchmarkEngineRetainPendingPacket(b *testing.B) {
 }
 
 func BenchmarkOnceReinjectorExactDuplicate(b *testing.B) {
-	flow := testFlow(31001)
+	flow := testFlowWithWGID(31001, 77)
 	packet := testPendingPacket(b, flow, 1)
 	writer := &memoryRawIPv4Writer{}
 	reinjector, err := newOnceReinjector(writer, packet.CaptureID.Runtime, 4)
@@ -112,7 +112,7 @@ func BenchmarkOnceReinjectorExactDuplicate(b *testing.B) {
 func benchmarkEstablishedCaptureController(b *testing.B) (*Engine, *Controller, []byte) {
 	b.Helper()
 	engine, _ := testEngine(b, nil)
-	flow := testFlow(31001)
+	flow := testFlowWithWGID(31001, 77)
 	if _, err := engine.outbound(flow, PendingPacket{Data: []byte{9}, WGID: 77}, false); err != nil {
 		b.Fatal(err)
 	}

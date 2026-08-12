@@ -43,6 +43,7 @@ func Run() Probe {
 	}
 	for _, module := range []string{
 		"sched_cls", "cls_bpf", "sch_ingress", "act_bpf", "wg_mix_faketcp_checksum",
+		"wg_mix_faketcp_checksum_kprobe",
 	} {
 		p.KernelModules[module] = exists("/sys/module/" + module)
 	}

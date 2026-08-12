@@ -21,16 +21,31 @@ type KernelStatus struct {
 // generation. It intentionally contains identities and digests only; cipher
 // key material and userspace session contents are never exposed.
 type FakeTCPRuntimeStatus struct {
-	Generation   uint64             `json:"generation"`
-	Incarnation  string             `json:"incarnation"`
-	OwnerKind    string             `json:"owner_kind"`
-	ObjectSource string             `json:"object_source"`
-	ObjectSHA256 string             `json:"object_sha256"`
-	Barrier      string             `json:"barrier"`
-	Healthy      bool               `json:"healthy"`
-	Error        string             `json:"error,omitempty"`
-	XDP          []FakeTCPXDPStatus `json:"xdp"`
-	TCX          []FakeTCPTCXStatus `json:"tcx"`
+	Generation        uint64                       `json:"generation"`
+	Incarnation       string                       `json:"incarnation"`
+	OwnerKind         string                       `json:"owner_kind"`
+	AttachmentBackend string                       `json:"attachment_backend"`
+	ObjectSource      string                       `json:"object_source"`
+	ObjectSHA256      string                       `json:"object_sha256"`
+	ChecksumBackend   FakeTCPChecksumRuntimeStatus `json:"checksum_backend"`
+	Barrier           string                       `json:"barrier"`
+	Healthy           bool                         `json:"healthy"`
+	Error             string                       `json:"error,omitempty"`
+	XDP               []FakeTCPXDPStatus           `json:"xdp"`
+	TCX               []FakeTCPTCXStatus           `json:"tcx,omitempty"`
+	ClassicTC         []FakeTCPClassicTCStatus     `json:"classic_tc,omitempty"`
+}
+
+// FakeTCPChecksumRuntimeStatus contains only non-secret backend identity and
+// health-relevant capabilities. The kprobe module cookie/nonce is never part
+// of the status ABI.
+type FakeTCPChecksumRuntimeStatus struct {
+	Backend       string   `json:"backend,omitempty"`
+	Capability    string   `json:"capability,omitempty"`
+	Capabilities  []string `json:"capabilities,omitempty"`
+	ObjectVariant string   `json:"object_variant,omitempty"`
+	Module        string   `json:"module,omitempty"`
+	LeaseHeld     bool     `json:"lease_held,omitempty"`
 }
 
 type FakeTCPXDPStatus struct {
@@ -46,6 +61,18 @@ type FakeTCPTCXStatus struct {
 	AttachType uint32 `json:"attach_type"`
 	LinkID     uint32 `json:"link_id"`
 	ProgramID  uint32 `json:"program_id"`
+}
+
+// FakeTCPClassicTCStatus exposes the complete durable classic-TC identity.
+// ProgramID, handle and priority together prove that a persistent filter still
+// belongs to the resident FakeTCP generation.
+type FakeTCPClassicTCStatus struct {
+	IfIndex   int    `json:"ifindex"`
+	Direction string `json:"direction"`
+	Parent    uint32 `json:"parent"`
+	Handle    uint32 `json:"handle"`
+	Priority  uint16 `json:"priority"`
+	ProgramID uint32 `json:"program_id"`
 }
 
 type UnderlayKernelStatus struct {

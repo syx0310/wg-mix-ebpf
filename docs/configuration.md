@@ -275,19 +275,53 @@ wireguards:
         ingress_mode: xdp-generic-exact
 
 runtime:
-  attachment_backend: tcx
+  attachment_backend: auto
+  checksum_backend: auto
 ```
 
 FakeTCP keeps WireGuard packet boundaries and presents a TCP-shaped outer wire
-image; it is not a TCP stream. At most one WireGuard may select FakeTCP. It is
-IPv4-only and must run in the resident daemon. `auto` is accepted only when it
-resolves to TCX; `classic_tc` is rejected. Every attachable underlay must have
-no existing XDP owner because production uses direct generic XDP with exact
-selected-mode ownership and no replace, fallback, or libxdp chaining. The
-administrator must provision `wg_mix_faketcp_checksum`; activation probes its
-BTF/kfunc contract before detaching a baseline runtime. The deprecated
-`experimental` field is parsed and ignored, and legacy `xdp-required` is
-normalized to `xdp-generic-exact`.
+image; it is not a TCP stream. Multiple WireGuard entries may select FakeTCP;
+their policy, session, event and slow-path routing state is isolated by WGID.
+It is IPv4-only and must run in the resident daemon. The TC stage supports
+`tcx` and `classic_tc`, while every combination keeps direct generic XDP with
+exact selected-mode ownership and no replace, fallback, or libxdp chaining.
+The checksum bridge supports `kfunc` and the legacy-compatible `kprobe`
+backend. The deprecated `experimental` field is parsed and ignored, and legacy
+`xdp-required` is normalized to `xdp-generic-exact`.
+
+Backend selection is independent:
+
+```yaml
+runtime:
+  # auto | tcx | classic_tc
+  attachment_backend: auto
+  # auto | kfunc | kprobe
+  checksum_backend: auto
+```
+
+`attachment_backend: auto` prefers exact TCX when the kernel supports it and
+otherwise resolves to classic TC before any network mutation. A validated
+durable FakeTCP classic owner remains sticky during recovery. Probe errors
+other than an explicit unsupported result fail without falling back.
+
+`checksum_backend: auto` prefers the matching kfunc module/object. It may use
+kprobe only when kfunc is explicitly unsupported and the complete kprobe
+module lease, trigger, health and artifact contract is available. An explicit
+`kfunc` or `kprobe` value never falls back to the other backend. The resolved
+backend does not change while a resident generation is active.
+
+The released kprobe module currently targets Linux x86_64. On arm64, select
+`kfunc` (or let `auto` select it); `kprobe` remains unavailable until its
+architecture-specific kernel calling convention is separately validated.
+
+The kfunc path requires administrator-provisioned
+`wg_mix_faketcp_checksum`. The kprobe path requires
+`wg_mix_faketcp_checksum_kprobe` and a per-runtime FD lease. The module accepts
+multiple simultaneous leases and issues a distinct fixed cookie to each
+runtime; a runtime may use only the cookie bound to its retained FD and cannot
+fall back after activation. Both paths retain the complete checksum, PMTU and
+UDP-GSO-to-TCP-GSO contract; a reduced `faketcp-lite` path is not selected
+automatically.
 
 FakeTCP startup is always fail-closed. Its WireGuard file must configure a
 fixed non-zero `ListenPort`, `startup_guard.mode` must be
@@ -295,6 +329,11 @@ fixed non-zero `ListenPort`, `startup_guard.mode` must be
 `fail_closed_for_managed_flows`. These are validation errors rather than
 best-effort recommendations: the same fixed port is guarded as both UDP and
 TCP until the complete resident runtime passes its final health check.
+
+Multiple FakeTCP WireGuard entries use one shared set of TC and XDP programs
+per underlay. Every entry must have a distinct, fixed non-zero `ListenPort` in
+its WireGuard configuration. An ambiguous managed port, fwmark, or WGID route
+is rejected before attachment; the error identifies the conflicting entries.
 
 Regression entry points:
 
@@ -621,9 +660,10 @@ owner's schema-v3 classic or schema-v4 TCX backend across reloads and kernel
 upgrades. Select a different backend explicitly only after detaching the old
 owner.
 
-For FakeTCP, the effective backend must be TCX. A durable classic owner or an
-explicit `classic_tc` selection is rejected before network mutation. UDP and
-ICMP can use either TCX or classic TC.
+FakeTCP, UDP and ICMP can use either TCX or classic TC. FakeTCP additionally
+retains exact generic XDP regardless of which TC backend is selected. A
+validated durable FakeTCP classic owner keeps `auto` sticky to classic during
+recovery; an explicit backend never switches silently.
 
 This rejects duplicate underlay names. More advanced path-overlap detection is platform-specific and must be validated externally.
 

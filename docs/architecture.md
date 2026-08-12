@@ -94,7 +94,8 @@ internal/abi
 
 internal/dataplane
   Linux TC/eBPF loader, pinned-map handling, generation commit, status, detach,
-  and the resident process-owned FakeTCP TCX/XDP runtime.
+  and the resident FakeTCP exact-generic-XDP runtime with selectable
+  TCX/classic TC and kfunc/kprobe backends.
 
 internal/guard
   nft startup guard generation and execution.
@@ -166,18 +167,29 @@ network receives ICMP Echo packet
 FakeTCP production flow is IPv4-only and packet-oriented:
 
 ```text
-egress: WireGuard UDP -> TCX -> mixed/XOR payload -> TCP-shaped packet
+egress: WireGuard UDP -> TCX or classic TC -> mixed/XOR payload -> TCP-shaped packet
 ingress: TCP-shaped packet -> direct generic XDP -> session/control admission
-         -> TCX -> UDP WireGuard packet
+         -> TCX or classic TC -> UDP WireGuard packet
 ```
 
-The runtime owns an independent embedded BPF collection, exact TCX bpf_link
-FDs, exact direct-generic XDP bpf_link FDs, and a userspace slow path. It is
-therefore available only from the long-lived daemon. Process exit releases
-these unpinned owners and daemon startup rebuilds them. Production refuses an
-existing XDP owner, libxdp chaining, replacement/fallback, classic TC, more
-than one FakeTCP WireGuard, and a missing administrator-provisioned
-`wg_mix_faketcp_checksum` kfunc module.
+The runtime owns an independent embedded BPF collection, exact direct-generic
+XDP bpf_link FDs, the selected TC attachment stage, and a userspace slow path.
+TCX uses exact process-owned bpf_link FDs. Classic TC uses exact project-owned
+filters plus a durable recovery journal. Production refuses an existing XDP
+owner, libxdp chaining and replacement/fallback.
+
+Multiple FakeTCP WireGuard entries share the programs attached to an underlay.
+Managed port and policy maps select WGID; WGID is also part of the session key,
+events, control claims and EngineRouter routes. Consequently two WireGuard
+interfaces with an otherwise identical session tuple cannot share state.
+
+The checksum/GSO bridge is separate from the attachment backend. Modern
+kernels use typed kfunc calls to `wg_mix_faketcp_checksum`; legacy kernels may
+use fail-closed helper triggers intercepted by
+`wg_mix_faketcp_checksum_kprobe`. Each kprobe runtime holds its own FD lease
+and fixed cookie. The module supports multiple simultaneous runtime leases;
+each runtime validates only its cookie, trigger ABI and missed-probe count.
+Neither bridge selection changes the exact generic XDP contract.
 
 ICMP server listeners use an explicit wildcard-id flag for the `id=0` fallback entry. Exact-id listener hits still fail closed on bad mixed type words or invalid WireGuard lengths. Wildcard-id fallback hits pass packets that fail only the mixed type-word or WireGuard length checks, while still incrementing the ingress bad-type or bad-length counter, so ordinary Echo Request traffic is not dropped merely because its payload is not a managed WireGuard packet. Profile misses and generation mismatches still drop.
 

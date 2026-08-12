@@ -86,7 +86,7 @@ func testPendingPacket(t testing.TB, flow abi.FakeTCPSessionKey, capture uint64)
 		t.Fatal(err)
 	}
 	return PendingPacket{
-		Data: data, FWMark: 0xa1230007, WGID: 77, CaptureNanos: capture,
+		Data: data, FWMark: 0xa1230007, WGID: flow.WGID, CaptureNanos: capture,
 		CaptureID:          CaptureIdentity{Runtime: testRuntimeIdentity(flow.Generation), CPU: 3, Sequence: capture},
 		CaptureFingerprint: sha256.Sum256(data),
 	}
@@ -121,11 +121,11 @@ func TestRawControllerBackendSendsControlWithExplicitRouteMark(t *testing.T) {
 	control := ControlPacket{
 		Flags: FlagSYN | FlagACK, Sequence: 100, Acknowledgement: 200, Window: 4096,
 	}
-	if err := backend.SendControl(context.Background(), flow, 77, control); err != nil {
+	if err := backend.SendControl(context.Background(), flow, flow.WGID, control); err != nil {
 		t.Fatal(err)
 	}
 	writes, _ := writer.snapshot()
-	if resolvedFlow != flow || resolvedWGID != 77 {
+	if resolvedFlow != flow || resolvedWGID != flow.WGID {
 		t.Fatalf("resolved flow=%#v wgID=%d", resolvedFlow, resolvedWGID)
 	}
 	if len(writes) != 1 || writes[0].UnderlayIndex != flow.UnderlayIndex || writes[0].FWMark != 0xa1230009 {
@@ -494,7 +494,7 @@ func TestRawControllerBackendExternalCallsRunOutsideStateLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := backend.SendControl(context.Background(), testFlow(31001), 77, ControlPacket{Flags: FlagSYN}); err != nil {
+	if err := backend.SendControl(context.Background(), testFlow(31001), 7, ControlPacket{Flags: FlagSYN}); err != nil {
 		t.Fatal(err)
 	}
 	if err := backend.Reinject(context.Background(), testFlow(31001), testPendingPacket(t, testFlow(31001), 1)); err != nil {
@@ -519,7 +519,7 @@ func TestRawControllerBackendCloseFencesAdmittedResolver(t *testing.T) {
 	}
 	sendDone := make(chan error, 1)
 	go func() {
-		sendDone <- backend.SendControl(context.Background(), testFlow(31001), 77, ControlPacket{Flags: FlagSYN})
+		sendDone <- backend.SendControl(context.Background(), testFlow(31001), 7, ControlPacket{Flags: FlagSYN})
 	}()
 	select {
 	case <-resolverEntered:
@@ -546,7 +546,7 @@ func TestRawControllerBackendCloseFencesAdmittedResolver(t *testing.T) {
 		t.Fatalf("Close returned before resolver: %v", err)
 	case <-time.After(20 * time.Millisecond):
 	}
-	if err := backend.SendControl(context.Background(), testFlow(31002), 77, ControlPacket{Flags: FlagSYN}); !errors.Is(err, ErrRawBackendClosed) {
+	if err := backend.SendControl(context.Background(), testFlow(31002), 7, ControlPacket{Flags: FlagSYN}); !errors.Is(err, ErrRawBackendClosed) {
 		t.Fatalf("operation admitted while closing: %v", err)
 	}
 	close(resolverRelease)
@@ -571,7 +571,7 @@ func TestRawControllerBackendFailsBeforeWriterOnMarkError(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	err = backend.SendControl(context.Background(), testFlow(31001), 77, ControlPacket{Flags: FlagSYN})
+	err = backend.SendControl(context.Background(), testFlow(31001), 7, ControlPacket{Flags: FlagSYN})
 	if !errors.Is(err, wantErr) {
 		t.Fatalf("control error=%v", err)
 	}

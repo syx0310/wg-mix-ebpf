@@ -42,6 +42,61 @@ func (factory ControllerRuntimeFactory) NewLinuxRuntime(
 	if engine == nil {
 		return nil, errors.New("build Linux faketcp controller runtime: Engine is nil")
 	}
+	return factory.newLinuxRuntime(
+		engine.Identity(),
+		events,
+		stats,
+		func(
+			reader EventReader,
+			writer RawIPv4Writer,
+			claim controllerRuntimeClaim,
+		) (*ControllerRuntime, error) {
+			return newOwnedControllerRuntime(engine, reader, writer, claim)
+		},
+	)
+}
+
+// NewLinuxRoutedRuntime builds the one production ring/raw runtime shared by
+// every Engine in router. It deliberately does not construct one reader or
+// raw socket per WireGuard: the immutable router is the only per-event
+// dispatcher inside the single serialized Controller.
+func (factory ControllerRuntimeFactory) NewLinuxRoutedRuntime(
+	router *EngineRouter,
+	events *ebpf.Map,
+	stats *ebpf.Map,
+) (*ControllerRuntime, error) {
+	if router == nil {
+		return nil, errors.New("build Linux routed faketcp controller runtime: EngineRouter is nil")
+	}
+	return factory.newLinuxRuntime(
+		router.Identity(),
+		events,
+		stats,
+		func(
+			reader EventReader,
+			writer RawIPv4Writer,
+			claim controllerRuntimeClaim,
+		) (*ControllerRuntime, error) {
+			return newOwnedRoutedControllerRuntime(router, reader, writer, claim)
+		},
+	)
+}
+
+type linuxControllerRuntimeOwner func(
+	EventReader,
+	RawIPv4Writer,
+	controllerRuntimeClaim,
+) (*ControllerRuntime, error)
+
+func (factory ControllerRuntimeFactory) newLinuxRuntime(
+	identity RuntimeIdentity,
+	events *ebpf.Map,
+	stats *ebpf.Map,
+	owner linuxControllerRuntimeOwner,
+) (*ControllerRuntime, error) {
+	if owner == nil {
+		return nil, errors.New("build Linux faketcp controller runtime: owner constructor is nil")
+	}
 	eventMapID, err := inspectLinuxControllerMap(
 		events,
 		fakeTCPEventsKernelMapName,
@@ -82,7 +137,7 @@ func (factory ControllerRuntimeFactory) NewLinuxRuntime(
 		)
 	}
 	claim, err := factory.claim(
-		engine.Identity(),
+		identity,
 		eventMapID,
 		statsMapID,
 		possibleCPUs,
@@ -109,7 +164,7 @@ func (factory ControllerRuntimeFactory) NewLinuxRuntime(
 	if err != nil {
 		return nil, errors.Join(err, closeControllerRuntimeResource("event reader", ordered))
 	}
-	return newOwnedControllerRuntime(engine, ordered, writer, claim)
+	return owner(ordered, writer, claim)
 }
 
 func inspectLinuxControllerMap(

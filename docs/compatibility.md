@@ -93,17 +93,41 @@ checksum and offload behavior requires target validation; small WG packets use b
 Large ICMP packets use the UDP-checksum-derived fast path instead of a verifier-bounded full ICMP checksum recompute. This path depends on the original UDP checksum; an IPv4 UDP packet with checksum zero causes large ICMP checksum derivation to fail and is reported through `icmp_checksum_error`.
 
 `faketcp` is the production IPv4 TCP-shaped transport. It is packet-oriented,
-not a TCP byte stream, and supports exactly one FakeTCP WireGuard per daemon.
-The production attachment contract is TCX egress/ingress plus direct generic
-XDP ingress on every attachable underlay. Existing XDP programs, libxdp
-dispatcher chaining, XDP replacement/fallback, and `classic_tc` are rejected
-before mutation. The runtime is process-owned and therefore must run in the
-long-lived daemon; one-shot `reload` and `run --once` are rejected. The
-administrator must provision the matching `wg_mix_faketcp_checksum` kfunc
-module. A fixed non-zero WireGuard `ListenPort`, the nft temporary startup
-guard, and fail-closed managed-flow policy are mandatory; the guard is removed
-only after the process-owned maps and every TCX/XDP attachment pass their final
-health check. `faketcp-lite` remains unsupported.
+not a TCP byte stream, and supports multiple FakeTCP WireGuard entries per
+daemon. Policy and session state is isolated by WGID, including sessions whose
+underlay addresses and ports are otherwise identical.
+
+The ingress contract always includes direct exact generic XDP. The TC
+ingress/egress stage may use TCX or classic TC; checksum/GSO bridging may use
+kfunc or kprobe. These are independent dimensions:
+
+| Kernel profile | XDP | TC stage | checksum bridge |
+| --- | --- | --- | --- |
+| modern preferred | exact generic | TCX | kfunc |
+| modern compatible | exact generic | classic TC | kfunc |
+| legacy compatible | exact generic | classic TC | kprobe |
+
+Existing XDP programs, libxdp dispatcher chaining and XDP
+replacement/fallback are rejected before mutation for every combination.
+TCX links are process-owned. Classic TC filters use the durable project owner
+and journal so a daemon restart can recover exact filters without treating
+foreign filters as its own.
+
+The runtime must run in the long-lived daemon; one-shot `reload` and
+`run --once` are rejected. A fixed non-zero WireGuard `ListenPort` per entry,
+the nft temporary startup guard, and fail-closed managed-flow policy are
+mandatory. The guard is removed only after maps, XDP, the selected TC backend,
+and the selected checksum bridge pass their final health check.
+`faketcp-lite` remains unsupported.
+
+The kprobe backend is not module-free. It uses the separately packaged
+`wg_mix_faketcp_checksum_kprobe` module and a per-runtime FD lease. The module
+supports multiple simultaneous leases/cookies, allowing independent resident
+daemons on one host. Each runtime keeps its cookie fixed until detach. A missed
+trigger keeps the underlying helper failure and therefore drops the managed
+packet. A non-zero kretprobe missed count or a lost lease makes the runtime
+unhealthy. kfunc remains preferred when the matching BTF/kfunc module contract
+is available.
 
 Netns regression entry points:
 
@@ -242,6 +266,21 @@ wg command for runtime WireGuard state
 tc command for attach/status inspection
 nft command for startup-guard application and fixed-table cleanup
 ```
+
+FakeTCP additionally requires one matching checksum bridge module:
+
+```text
+modern kfunc: wg_mix_faketcp_checksum plus module BTF/kfunc registration
+legacy kprobe: wg_mix_faketcp_checksum_kprobe plus kprobe/kretprobe and symbols
+```
+
+The current legacy kprobe bridge is validated only for the Linux x86_64 kernel
+calling convention. Linux aarch64 remains supported by the ordinary dataplane
+and the modern kfunc FakeTCP path, but not by the kprobe checksum bridge yet.
+
+The legacy BPF object is a distinct manifest-bound artifact for Linux 5.15
+verifiers. A successful modern-kernel load does not prove Linux 5.15 support;
+the release gate requires a real 5.15 verifier and dataplane run.
 
 `startup_guard.mode: none` disables guard application for UDP/ICMP, but is
 rejected for FakeTCP. Stop/uninstall still use `nft` to check and remove the

@@ -602,6 +602,9 @@ func validateActionStep(step ActionStep) error {
 	}
 	switch step.Kind {
 	case ActionStepSendControl:
+		if step.WGID != step.Flow.WGID {
+			return errors.New("faketcp control action step WGID does not match its flow")
+		}
 		if len(step.Packet.Data) != 0 {
 			return errors.New("faketcp control action step contains packet data")
 		}
@@ -611,6 +614,9 @@ func validateActionStep(step ActionStep) error {
 			return fmt.Errorf("faketcp control action step has unsupported flags %#x", step.Control.Flags)
 		}
 	case ActionStepReinject:
+		if step.Packet.WGID != step.Flow.WGID {
+			return errors.New("faketcp reinjection action step WGID does not match its flow")
+		}
 		if len(step.Packet.Data) == 0 {
 			return errors.New("faketcp reinjection action step has no packet or capture identity")
 		}

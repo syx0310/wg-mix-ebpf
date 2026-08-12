@@ -63,6 +63,10 @@ func validatePacketFlow(flow abi.FakeTCPSessionKey) error {
 		return errors.New("flow local port must be non-zero")
 	case flow.RemotePort == 0:
 		return errors.New("flow remote port must be non-zero")
+	case flow.WGID == 0:
+		return errors.New("flow WGID must be non-zero")
+	case flow.Reserved != ([4]byte{}):
+		return errors.New("flow reserved bytes must be zero")
 	default:
 		return nil
 	}

@@ -150,11 +150,12 @@ func fakeTCPProductionTestState() *control.State {
 
 func fakeTCPProductionTestScope() fakeTCPProductionScopeIdentity {
 	return fakeTCPProductionScopeIdentity{
-		objectKind:        fakeTCPProductionObjectScopeFilesystem,
-		objectPath:        "/test/wg-mix-ebpf/object.o",
-		fakeTCPObjectPath: EmbeddedFakeTCPObjectSource,
-		pinPath:           "/test/wg-mix-ebpf/pins",
-		lifecyclePath:     "/test/wg-mix-ebpf/lifecycle.lease",
+		objectKind:                 fakeTCPProductionObjectScopeFilesystem,
+		objectPath:                 "/test/wg-mix-ebpf/object.o",
+		fakeTCPObjectPath:          EmbeddedFakeTCPObjectSource,
+		fakeTCPLegacy515ObjectPath: EmbeddedFakeTCPLegacy515ObjectSource,
+		pinPath:                    "/test/wg-mix-ebpf/pins",
+		lifecyclePath:              "/test/wg-mix-ebpf/lifecycle.lease",
 	}
 }
 

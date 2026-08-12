@@ -11,10 +11,14 @@ BPF_CFLAGS ?= -O2 -g -Wall -Werror -target bpf $(if $(BPF_MULTIARCH),-I/usr/incl
 BPF_BASELINE_CFLAGS ?= $(BPF_CFLAGS) -Wno-unused-function
 BPF_OBJECT ?= build/wg_mix_tc.o
 FAKETCP_EXPERIMENTAL_BPF_OBJECT ?= build/wg_mix_faketcp_experimental.o
+FAKETCP_LEGACY_515_BPF_OBJECT ?= build/wg_mix_faketcp_legacy_515.o
 FAKETCP_CHECKSUM_KMOD_SOURCE ?= $(CURDIR)/kernel/faketcp_checksum
 FAKETCP_CHECKSUM_KMOD_OUTPUT ?= $(CURDIR)/build/faketcp_checksum_kmod
 FAKETCP_CHECKSUM_KMOD_OBJECT ?= $(FAKETCP_CHECKSUM_KMOD_OUTPUT)/wg_mix_faketcp_checksum.ko
 FAKETCP_CHECKSUM_KMOD_BTF_HELPER ?= $(CURDIR)/scripts/finalize-faketcp-checksum-module-btf.sh
+FAKETCP_CHECKSUM_KPROBE_KMOD_SOURCE ?= $(CURDIR)/kernel/faketcp_checksum_kprobe
+FAKETCP_CHECKSUM_KPROBE_KMOD_OUTPUT ?= $(CURDIR)/build/faketcp_checksum_kprobe_kmod
+FAKETCP_CHECKSUM_KPROBE_KMOD_OBJECT ?= $(FAKETCP_CHECKSUM_KPROBE_KMOD_OUTPUT)/wg_mix_faketcp_checksum_kprobe.ko
 KERNEL_RELEASE ?= $(shell uname -r)
 KERNEL_BUILD ?= /lib/modules/$(KERNEL_RELEASE)/build
 VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
@@ -25,11 +29,12 @@ FAKETCP_VERIFIER_LAUNCHER_TEST_ARM64 ?= build/verifierlauncher-linux-arm64.test
 FAKETCP_DATAPLANE_TEST_AMD64 ?= build/dataplane-linux-amd64.test
 EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
 EMBEDDED_FAKETCP_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_faketcp.o
+EMBEDDED_FAKETCP_LEGACY_515_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_faketcp_legacy_515.o
 override BUILD_SOURCE_COMMIT := $(shell ./scripts/source-commit.sh)
 override BUILD_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/buildinfo.sourceCommit=$(BUILD_SOURCE_COMMIT)
 override NETNS_ANCHOR_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/netnsanchor.sourceCommit=$(BUILD_SOURCE_COMMIT)
 
-.PHONY: test-unit test-unit-race test-private-oss-history-replay test-lint test-live-guard-build-provenance test-faketcp-verifier-only test-faketcp-verifier-launcher test-b82-fresh-verifier-gate test-bpf-object-manifests test-bpf-object-manifest-path-contract _test-bpf-object-manifests test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-smoke-script-helper test-stage-source-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns-tcp-pmtu-positive test-netns-tcp-pmtu-ipv4 test-netns-tcp-pmtu-ipv6 test-netns-tcp-outer-gso-observe test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-netns-anchor build-linux-amd64 build-linux-arm64 build-faketcp-verifier-launcher build-faketcp-verifier-launcher-linux-amd64 build-faketcp-verifier-launcher-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf build-faketcp-checksum-kmod prepare-embedded-bpf bpf-load-test
+.PHONY: test-unit test-unit-race test-private-oss-history-replay test-lint test-live-guard-build-provenance test-faketcp-verifier-only test-faketcp-verifier-launcher test-b82-fresh-verifier-gate test-bpf-object-manifests test-bpf-object-manifest-path-contract test-faketcp-checksum-kprobe-source-contract _test-bpf-object-manifests test-config test-profile test-reconcile test-packet-helper test-pcap-helper test-smoke-script-helper test-stage-source-helper test-bpf-pkt test-netns-smoke test-netns-xor-smoke test-netns-xor-full-smoke test-netns-icmp-smoke test-netns-tcp test-netns-tcp-native test-netns-tcp-xor-prefix test-netns-tcp-xor-full test-netns-tcp-pmtu-positive test-netns-tcp-pmtu-ipv4 test-netns-tcp-pmtu-ipv6 test-netns-tcp-outer-gso-observe test-netns test-netns-full test-vm test-openwrt-vm test-hw bench soak build build-netns-anchor build-linux-amd64 build-linux-arm64 build-faketcp-verifier-launcher build-faketcp-verifier-launcher-linux-amd64 build-faketcp-verifier-launcher-linux-arm64 build-live-guard-test build-bpf build-faketcp-experimental-bpf build-faketcp-legacy-515-bpf build-faketcp-checksum-kmod build-faketcp-checksum-kprobe-kmod prepare-embedded-bpf bpf-load-test
 
 build: prepare-embedded-bpf
 	GOENV=off GOWORK=off GOFLAGS= GO111MODULE=on CGO_ENABLED=$(CGO_ENABLED) $(GO) build -trimpath -mod=readonly -buildvcs=false -ldflags=$(BUILD_IDENTITY_LDFLAG) -o $(BINARY) ./cmd/wg-mix-ebpf
@@ -104,6 +109,15 @@ build-faketcp-experimental-bpf:
 	$(CLANG) $(BPF_CFLAGS) -DWG_MIX_EXPERIMENTAL_FAKETCP=1 \
 		-c bpf/wg_mix_tc.c -o $(FAKETCP_EXPERIMENTAL_BPF_OBJECT)
 
+# Linux 5.15 gets an independently identified object. It retains the exact
+# FakeTCP maps/programs and full GSO/XOR contract, but replaces post-5.15 BPF
+# helpers and checksum calls behind an explicit legacy capability macro.
+build-faketcp-legacy-515-bpf:
+	@mkdir -p $(dir $(FAKETCP_LEGACY_515_BPF_OBJECT))
+	$(CLANG) $(BPF_CFLAGS) -DWG_MIX_EXPERIMENTAL_FAKETCP=1 \
+		-DWG_MIX_FAKETCP_LEGACY_515=1 \
+		-c bpf/wg_mix_tc.c -o $(FAKETCP_LEGACY_515_BPF_OBJECT)
+
 # This target only builds an out-of-tree module into build/. Installation,
 # loading, unloading and cleanup require a separately reviewed real-host step.
 build-faketcp-checksum-kmod:
@@ -120,9 +134,30 @@ build-faketcp-checksum-kmod:
 		--vmlinux-btf "$(VMLINUX_BTF)" \
 		--module "$(FAKETCP_CHECKSUM_KMOD_OBJECT)"
 
+# Legacy checksum/GSO bridge.  Copy the exact, small source set into the
+# module output directory before invoking Kbuild so this also works with 5.15
+# build trees that do not implement the newer external-module MO variable.
+build-faketcp-checksum-kprobe-kmod:
+	@test -d "$(KERNEL_BUILD)" || { echo "kernel build tree not found: $(KERNEL_BUILD)"; exit 2; }
+	@mkdir -p "$(FAKETCP_CHECKSUM_KPROBE_KMOD_OUTPUT)"
+	cp "$(FAKETCP_CHECKSUM_KPROBE_KMOD_SOURCE)/Kbuild" \
+		"$(FAKETCP_CHECKSUM_KPROBE_KMOD_SOURCE)/wg_mix_faketcp_checksum_kprobe.c" \
+		"$(FAKETCP_CHECKSUM_KPROBE_KMOD_SOURCE)/wg_mix_faketcp_checksum_kprobe_abi.h" \
+		"$(FAKETCP_CHECKSUM_KPROBE_KMOD_SOURCE)/wg_mix_faketcp_checksum_kprobe_uapi.h" \
+		"$(FAKETCP_CHECKSUM_KPROBE_KMOD_OUTPUT)/"
+	$(MAKE) -C "$(KERNEL_BUILD)" \
+		M="$(FAKETCP_CHECKSUM_KPROBE_KMOD_OUTPUT)" modules
+	@test -f "$(FAKETCP_CHECKSUM_KPROBE_KMOD_OBJECT)" || \
+		{ echo "expected module was not built: $(FAKETCP_CHECKSUM_KPROBE_KMOD_OBJECT)"; exit 2; }
+
+test-faketcp-checksum-kprobe-source-contract:
+	PYTHONDONTWRITEBYTECODE=1 /usr/bin/python3 -I \
+		kernel/faketcp_checksum_kprobe/test_source_contract.py
+
 define run_bpf_object_manifest_test
 	@baseline_object="$(BPF_OBJECT)"; \
 	experimental_object="$(FAKETCP_EXPERIMENTAL_BPF_OBJECT)"; \
+	legacy_515_object="$(FAKETCP_LEGACY_515_BPF_OBJECT)"; \
 	case "$$baseline_object" in \
 		/*) ;; \
 		*) baseline_object="$(CURDIR)/$$baseline_object" ;; \
@@ -131,16 +166,22 @@ define run_bpf_object_manifest_test
 		/*) ;; \
 		*) experimental_object="$(CURDIR)/$$experimental_object" ;; \
 	esac; \
+	case "$$legacy_515_object" in \
+		/*) ;; \
+		*) legacy_515_object="$(CURDIR)/$$legacy_515_object" ;; \
+	esac; \
 	WG_MIX_BASELINE_MANIFEST_OBJECT="$$baseline_object" \
 	WG_MIX_FAKETCP_MANIFEST_OBJECT="$$experimental_object" \
+	WG_MIX_FAKETCP_LEGACY_515_MANIFEST_OBJECT="$$legacy_515_object" \
 	WG_MIX_MANIFEST_CONTRACT_EXPECT_BASELINE="$(MANIFEST_CONTRACT_EXPECT_BASELINE)" \
 	WG_MIX_MANIFEST_CONTRACT_EXPECT_EXPERIMENTAL="$(MANIFEST_CONTRACT_EXPECT_EXPERIMENTAL)" \
+	WG_MIX_MANIFEST_CONTRACT_EXPECT_LEGACY_515="$(MANIFEST_CONTRACT_EXPECT_LEGACY_515)" \
 	WG_MIX_MANIFEST_CONTRACT_EXPECT_CWD="$(MANIFEST_CONTRACT_EXPECT_CWD)" \
 	CGO_ENABLED=0 "$(GO)" test ./internal/dataplane \
 		-run '^TestBuiltBPFObjectManifests$$' -count=1
 endef
 
-test-bpf-object-manifests: build-bpf build-faketcp-experimental-bpf
+test-bpf-object-manifests: build-bpf build-faketcp-experimental-bpf build-faketcp-legacy-515-bpf
 	$(run_bpf_object_manifest_test)
 
 # This internal entry point deliberately has no BPF build prerequisites. The
@@ -153,22 +194,27 @@ test-bpf-object-manifest-path-contract:
 	@$(MAKE) --no-print-directory -C "$(CURDIR)" _test-bpf-object-manifests \
 		BPF_OBJECT="manifest contract/relative baseline object.o" \
 		FAKETCP_EXPERIMENTAL_BPF_OBJECT="manifest contract/relative experimental object.o" \
+		FAKETCP_LEGACY_515_BPF_OBJECT="manifest contract/relative legacy 515 object.o" \
 		MANIFEST_CONTRACT_EXPECT_BASELINE="$(CURDIR)/manifest contract/relative baseline object.o" \
 		MANIFEST_CONTRACT_EXPECT_EXPERIMENTAL="$(CURDIR)/manifest contract/relative experimental object.o" \
+		MANIFEST_CONTRACT_EXPECT_LEGACY_515="$(CURDIR)/manifest contract/relative legacy 515 object.o" \
 		MANIFEST_CONTRACT_EXPECT_CWD="$(CURDIR)" \
 		GO="$(CURDIR)/scripts/test-bpf-object-manifest-path-contract.sh"
 	@$(MAKE) --no-print-directory -C "$(CURDIR)" _test-bpf-object-manifests \
 		BPF_OBJECT="$(CURDIR)/manifest contract/absolute baseline object.o" \
 		FAKETCP_EXPERIMENTAL_BPF_OBJECT="$(CURDIR)/manifest contract/absolute experimental object.o" \
+		FAKETCP_LEGACY_515_BPF_OBJECT="$(CURDIR)/manifest contract/absolute legacy 515 object.o" \
 		MANIFEST_CONTRACT_EXPECT_BASELINE="$(CURDIR)/manifest contract/absolute baseline object.o" \
 		MANIFEST_CONTRACT_EXPECT_EXPERIMENTAL="$(CURDIR)/manifest contract/absolute experimental object.o" \
+		MANIFEST_CONTRACT_EXPECT_LEGACY_515="$(CURDIR)/manifest contract/absolute legacy 515 object.o" \
 		MANIFEST_CONTRACT_EXPECT_CWD="$(CURDIR)" \
 		GO="$(CURDIR)/scripts/test-bpf-object-manifest-path-contract.sh"
 
-prepare-embedded-bpf: build-bpf build-faketcp-experimental-bpf
-	@mkdir -p $(dir $(EMBEDDED_BPF_OBJECT)) $(dir $(EMBEDDED_FAKETCP_BPF_OBJECT))
+prepare-embedded-bpf: build-bpf build-faketcp-experimental-bpf build-faketcp-legacy-515-bpf
+	@mkdir -p $(dir $(EMBEDDED_BPF_OBJECT)) $(dir $(EMBEDDED_FAKETCP_BPF_OBJECT)) $(dir $(EMBEDDED_FAKETCP_LEGACY_515_BPF_OBJECT))
 	cp $(BPF_OBJECT) $(EMBEDDED_BPF_OBJECT)
 	cp $(FAKETCP_EXPERIMENTAL_BPF_OBJECT) $(EMBEDDED_FAKETCP_BPF_OBJECT)
+	cp $(FAKETCP_LEGACY_515_BPF_OBJECT) $(EMBEDDED_FAKETCP_LEGACY_515_BPF_OBJECT)
 
 bpf-load-test: build
 	./$(BINARY) bpf-load-test
@@ -216,7 +262,7 @@ test-private-oss-history-replay:
 		echo "SKIP: private OSS history replay gate not present"; \
 	fi
 
-test-unit: test-pcap-helper test-smoke-script-helper test-stage-source-helper test-bpf-object-manifest-path-contract test-private-oss-history-replay test-b82-fresh-verifier-gate
+test-unit: test-pcap-helper test-smoke-script-helper test-stage-source-helper test-bpf-object-manifest-path-contract test-faketcp-checksum-kprobe-source-contract test-private-oss-history-replay test-b82-fresh-verifier-gate
 	CGO_ENABLED=$(CGO_ENABLED) $(GO) test ./...
 
 test-unit-race:

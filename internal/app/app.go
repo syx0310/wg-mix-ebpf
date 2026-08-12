@@ -124,24 +124,10 @@ func runDoctor(ctx context.Context, args []string, stdout io.Writer) error {
 			fakeTCP = fakeTCP || wg.TransportMode == "faketcp"
 		}
 		if fakeTCP {
-			checks = append(checks, statusCheck(
-				"faketcp.kmod",
-				probe.KernelModules["wg_mix_faketcp_checksum"],
-				"wg_mix_faketcp_checksum",
-				"FakeTCP requires an administrator-provisioned checksum kfunc module with kernel BTF; wg-mix-ebpf never auto-loads or unloads it",
-			))
-			if err := dataplane.ProbeFakeTCPKernelDependency(); err != nil {
-				checks = append(checks, doctorCheck{
-					Name: "faketcp.kfunc", Status: "FAIL",
-					Detail:  "wg_mix_faketcp_checksum",
-					Message: err.Error(),
-				})
-			} else {
-				checks = append(checks, doctorCheck{
-					Name: "faketcp.kfunc", Status: "PASS",
-					Detail: "module BTF contains every required checksum kfunc",
-				})
-			}
+			checks = append(checks, fakeTCPChecksumDoctorChecks(
+				state.ChecksumBackend,
+				dataplane.ProbeFakeTCPChecksumBackends(ctx),
+			)...)
 		}
 	}
 	if *jsonOut {
@@ -158,6 +144,70 @@ func runDoctor(ctx context.Context, args []string, stdout io.Writer) error {
 		fmt.Fprintln(stdout, line)
 	}
 	return nil
+}
+
+func fakeTCPChecksumDoctorChecks(
+	requested string,
+	probes []dataplane.FakeTCPChecksumBackendProbe,
+) []doctorCheck {
+	if requested == "" {
+		requested = config.FakeTCPChecksumBackendAuto
+	}
+	checks := make([]doctorCheck, 0, 2+len(probes)*4)
+	probeByBackend := make(map[string]dataplane.FakeTCPChecksumBackendProbe, len(probes))
+	for _, probe := range probes {
+		probeByBackend[probe.Backend] = probe
+		status := "FAIL"
+		message := probe.Error
+		if probe.Available && probe.Equivalent {
+			status = "PASS"
+			message = ""
+		}
+		detail := probe.Module
+		if probe.Capability != "" {
+			detail += " capability=" + probe.Capability
+		}
+		checks = append(checks, doctorCheck{
+			Name:   "faketcp.checksum." + probe.Backend,
+			Status: status, Detail: strings.TrimSpace(detail), Message: message,
+		})
+		for _, requirement := range probe.Requirements {
+			checks = append(checks, doctorCheck{
+				Name:   "faketcp." + probe.Backend + "." + requirement.Name,
+				Status: requirement.Status, Detail: requirement.Detail, Message: requirement.Message,
+			})
+		}
+	}
+	selected := ""
+	selectionMessage := "no requested full-GSO checksum backend is available"
+	if requested == config.FakeTCPChecksumBackendAuto {
+		kfunc := probeByBackend[config.FakeTCPChecksumBackendKfunc]
+		if kfunc.Available && kfunc.Equivalent {
+			selected = config.FakeTCPChecksumBackendKfunc
+		} else if kfunc.Unsupported {
+			kprobe := probeByBackend[config.FakeTCPChecksumBackendKprobe]
+			if kprobe.Available && kprobe.Equivalent {
+				selected = config.FakeTCPChecksumBackendKprobe
+			}
+		} else if kfunc.Error != "" {
+			selectionMessage = "kfunc probe failed without an explicit unsupported result; refusing automatic fallback"
+		}
+	} else if probe := probeByBackend[requested]; probe.Available && probe.Equivalent {
+		selected = requested
+	}
+	selection := doctorCheck{
+		Name:    "faketcp.checksum.selection",
+		Status:  "FAIL",
+		Detail:  "requested=" + requested,
+		Message: selectionMessage,
+	}
+	if selected != "" {
+		selection.Status = "PASS"
+		selection.Detail += " selected=" + selected
+		selection.Message = ""
+	}
+	checks = append(checks, selection)
+	return checks
 }
 
 type doctorCheck struct {

@@ -149,14 +149,18 @@ func TestNewProductionLoaderKeepsFakeTCPSelectorAndLifecycleLeaseSeparate(t *tes
 	baselineObject := filepath.Join(t.TempDir(), "baseline.o")
 	environmentFakeTCPObject := filepath.Join(t.TempDir(), "environment-faketcp.o")
 	explicitFakeTCPObject := filepath.Join(t.TempDir(), "explicit-faketcp.o")
+	environmentLegacyObject := filepath.Join(t.TempDir(), "environment-faketcp-legacy.o")
+	explicitLegacyObject := filepath.Join(t.TempDir(), "explicit-faketcp-legacy.o")
 	lease := &lockfile.LifecycleLease{}
 	t.Setenv(EnvObjectPath, baselineObject)
 	t.Setenv(EnvFakeTCPObjectPath, environmentFakeTCPObject)
+	t.Setenv(EnvFakeTCPLegacy515ObjectPath, environmentLegacyObject)
 
 	coordinator, ok := NewLoaderWithOptions(LoaderOptions{
-		FakeTCPObjectPath: explicitFakeTCPObject,
-		LifecycleLease:    lease,
-		ResidentRuntime:   true,
+		FakeTCPObjectPath:          explicitFakeTCPObject,
+		FakeTCPLegacy515ObjectPath: explicitLegacyObject,
+		LifecycleLease:             lease,
+		ResidentRuntime:            true,
 	}).(*fakeTCPProductionCoordinator)
 	if !ok {
 		t.Fatalf("NewLoaderWithOptions returned %T", coordinator)
@@ -170,6 +174,9 @@ func TestNewProductionLoaderKeepsFakeTCPSelectorAndLifecycleLeaseSeparate(t *tes
 	}
 	if loader.FakeTCPObjectPath != explicitFakeTCPObject {
 		t.Fatalf("FakeTCP object = %q, want explicit %q", loader.FakeTCPObjectPath, explicitFakeTCPObject)
+	}
+	if loader.FakeTCPLegacy515ObjectPath != explicitLegacyObject {
+		t.Fatalf("legacy-5.15 FakeTCP object = %q, want explicit %q", loader.FakeTCPLegacy515ObjectPath, explicitLegacyObject)
 	}
 	if loader.LifecycleLease != lease {
 		t.Fatal("production loader did not retain the exact held lifecycle lease")

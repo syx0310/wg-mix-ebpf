@@ -131,6 +131,8 @@ func TestValidateMaterializedIPv4UDPRejectsIncompleteFlowWithoutWriting(t *testi
 		{name: "interface-index", mutate: func(flow *abi.FakeTCPSessionKey) { flow.UnderlayIndex = 0 }},
 		{name: "local-port", mutate: func(flow *abi.FakeTCPSessionKey) { flow.LocalPort = 0 }},
 		{name: "remote-port", mutate: func(flow *abi.FakeTCPSessionKey) { flow.RemotePort = 0 }},
+		{name: "wg-id", mutate: func(flow *abi.FakeTCPSessionKey) { flow.WGID = 0 }},
+		{name: "reserved", mutate: func(flow *abi.FakeTCPSessionKey) { flow.Reserved[0] = 1 }},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {

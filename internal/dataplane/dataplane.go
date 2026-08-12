@@ -21,10 +21,11 @@ var ErrPinOwnershipLifecycleLeaseRequired = errors.New(
 )
 
 const (
-	DefaultObjectPath    = "build/wg_mix_tc.o"
-	EnvObjectPath        = "WG_MIX_EBPF_OBJECT"
-	EnvFakeTCPObjectPath = "WG_MIX_EBPF_FAKETCP_OBJECT"
-	FakeTCPObjectKind    = "faketcp"
+	DefaultObjectPath             = "build/wg_mix_tc.o"
+	EnvObjectPath                 = "WG_MIX_EBPF_OBJECT"
+	EnvFakeTCPObjectPath          = "WG_MIX_EBPF_FAKETCP_OBJECT"
+	EnvFakeTCPLegacy515ObjectPath = "WG_MIX_EBPF_FAKETCP_LEGACY_515_OBJECT"
+	FakeTCPObjectKind             = "faketcp"
 	// ExperimentalFakeTCPObjectKind is a deprecated source-compatibility alias.
 	ExperimentalFakeTCPObjectKind = FakeTCPObjectKind
 	DefaultPinPath                = "/sys/fs/bpf/wg-mix-ebpf"
@@ -49,6 +50,10 @@ type LoaderOptions struct {
 	// FakeTCPObjectPath selects the separate FakeTCP object. It must never
 	// inherit EnvObjectPath, which names the baseline collection.
 	FakeTCPObjectPath string
+	// FakeTCPLegacy515ObjectPath selects the independent legacy-kernel FakeTCP
+	// object. It must not inherit either baseline or modern FakeTCP selectors:
+	// their checksum relocations and verifier contracts are different.
+	FakeTCPLegacy515ObjectPath string
 	// LifecycleLease is the exact lease already held by the reconcile
 	// operation. FakeTCP generation transactions retain this existing owner;
 	// they must not acquire the global lifecycle lease a second time.

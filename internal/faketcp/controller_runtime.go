@@ -138,11 +138,21 @@ func (marks *fixedControlMarks) ControlMark(
 	if err := ctx.Err(); err != nil {
 		return 0, err
 	}
+	if err := validatePacketFlow(flow); err != nil {
+		return 0, fmt.Errorf("faketcp control flow is invalid: %w", err)
+	}
 	if flow.Generation != marks.generation {
 		return 0, fmt.Errorf(
 			"faketcp control flow generation %d does not match fixed generation %d",
 			flow.Generation,
 			marks.generation,
+		)
+	}
+	if wgID != flow.WGID {
+		return 0, fmt.Errorf(
+			"faketcp control WireGuard ID %d does not match flow WGID %d",
+			wgID,
+			flow.WGID,
 		)
 	}
 	mark, ok := marks.marks[wgID]
@@ -236,6 +246,56 @@ func newOwnedControllerRuntime(
 			closeControllerRuntimeResource("raw writer", writer),
 		)
 	}
+	return newOwnedControllerRuntimeWithDispatcher(
+		reader,
+		writer,
+		claim,
+		func(backend ControllerBackend) (*Controller, error) {
+			return NewController(engine, backend)
+		},
+	)
+}
+
+// newOwnedRoutedControllerRuntime is the multi-WireGuard counterpart of
+// newOwnedControllerRuntime. The EngineRouter retains every per-WG Engine,
+// while the surrounding ControllerRuntime still owns exactly one reader,
+// backend, raw writer, and event loop for the shared kernel collection.
+func newOwnedRoutedControllerRuntime(
+	router *EngineRouter,
+	reader EventReader,
+	writer RawIPv4Writer,
+	claim controllerRuntimeClaim,
+) (*ControllerRuntime, error) {
+	if router == nil || router.Identity() != claim.binding.RuntimeIdentity {
+		return nil, errors.Join(
+			errors.New("faketcp controller runtime EngineRouter identity does not match claimed binding"),
+			closeControllerRuntimeResource("event reader", reader),
+			closeControllerRuntimeResource("raw writer", writer),
+		)
+	}
+	return newOwnedControllerRuntimeWithDispatcher(
+		reader,
+		writer,
+		claim,
+		func(backend ControllerBackend) (*Controller, error) {
+			return NewRoutedController(router, backend)
+		},
+	)
+}
+
+func newOwnedControllerRuntimeWithDispatcher(
+	reader EventReader,
+	writer RawIPv4Writer,
+	claim controllerRuntimeClaim,
+	newController func(ControllerBackend) (*Controller, error),
+) (*ControllerRuntime, error) {
+	if newController == nil {
+		return nil, errors.Join(
+			errors.New("faketcp controller runtime dispatcher constructor is nil"),
+			closeControllerRuntimeResource("event reader", reader),
+			closeControllerRuntimeResource("raw writer", writer),
+		)
+	}
 	backend, err := NewRawControllerBackend(RawControllerBackendOptions{
 		Writer:             writer,
 		ControlMarks:       claim.controlMarks,
@@ -249,7 +309,7 @@ func newOwnedControllerRuntime(
 			closeControllerRuntimeResource("raw writer", writer),
 		)
 	}
-	controller, err := NewController(engine, backend)
+	controller, err := newController(backend)
 	if err != nil {
 		return nil, errors.Join(
 			err,

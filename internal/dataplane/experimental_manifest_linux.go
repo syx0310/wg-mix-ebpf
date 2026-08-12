@@ -34,19 +34,19 @@ var experimentalFakeTCPKfuncRelocationCounts = map[string]int{
 
 func experimentalMapDescriptors() []pinnedMapDescriptor {
 	return []pinnedMapDescriptor{
-		{name: "faketcp_session_map", mapType: ebpf.Hash, keySize: 24, valueSize: 80, maxEntries: 16384},
+		{name: "faketcp_session_map", mapType: ebpf.Hash, keySize: 32, valueSize: 80, maxEntries: 16384},
 		{name: "faketcp_managed_if_map", mapType: ebpf.Hash, keySize: 16, valueSize: 8, maxEntries: 512},
 		{name: "faketcp_managed_port_map", mapType: ebpf.Hash, keySize: 16, valueSize: 16, maxEntries: 2048},
 		{name: "faketcp_control_policy_map", mapType: ebpf.Hash, keySize: 16, valueSize: 32, maxEntries: 512},
-		{name: "faketcp_control_flow_map", mapType: ebpf.LRUHash, keySize: 32, valueSize: 16, maxEntries: 16384},
+		{name: "faketcp_control_flow_map", mapType: ebpf.LRUHash, keySize: 40, valueSize: 16, maxEntries: 16384},
 		{name: "faketcp_events", mapType: ebpf.RingBuf, maxEntries: 1 << 20},
-		{name: "faketcp_capture_scratch", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 2408, maxEntries: 1},
-		{name: "faketcp_runtime_scratch_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 344, maxEntries: 1},
+		{name: "faketcp_capture_scratch", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 2416, maxEntries: 1},
+		{name: "faketcp_runtime_scratch_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 360, maxEntries: 1},
 		{name: "faketcp_rt_id", mapType: ebpf.Array, keySize: 4, valueSize: 32, maxEntries: 1},
 		{name: "faketcp_gen_gt", mapType: ebpf.Array, keySize: 4, valueSize: 16, maxEntries: 1, flags: unix.BPF_F_RDONLY},
 		{name: "faketcp_gen_wk", mapType: ebpf.RingBuf, maxEntries: 4096},
 		{name: "faketcp_cap_seq", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 1},
-		{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 184, maxEntries: 1, flags: unix.BPF_F_RDONLY},
+		{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 192, maxEntries: 1, flags: unix.BPF_F_RDONLY},
 		{name: "faketcp_egress_programs", mapType: ebpf.ProgramArray, keySize: 4, valueSize: 4, maxEntries: 2},
 		{name: "faketcp_stats_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: 19},
 		{name: "faketcp_mtu_audit_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 8, maxEntries: experimentalFakeTCPMTUAuditKeyCount},
@@ -85,7 +85,16 @@ func validateExperimentalExtensionManifest(spec *ebpf.CollectionSpec) error {
 	if err := validateExperimentalKfuncManifest(spec); err != nil {
 		return err
 	}
+	return validateFakeTCPExtensionSchema(spec, "experimental")
+}
 
+// validateFakeTCPExtensionSchema validates the common FakeTCP map/program ABI
+// without conflating the modern kfunc and legacy-5.15 checksum contracts. Each
+// independently built object validates its checksum/helper identity first.
+func validateFakeTCPExtensionSchema(spec *ebpf.CollectionSpec, objectKind string) error {
+	if spec == nil {
+		return fmt.Errorf("%s BPF collection spec is nil", objectKind)
+	}
 	core := spec.Copy()
 	for _, descriptor := range experimentalMapDescriptors() {
 		delete(core.Maps, descriptor.name)
@@ -100,31 +109,31 @@ func validateExperimentalExtensionManifest(spec *ebpf.CollectionSpec) error {
 		program.License = "MIT"
 	}
 	if err := validateBaselineCollectionSpec(core); err != nil {
-		return fmt.Errorf("experimental object does not preserve the exact baseline core: %w", err)
+		return fmt.Errorf("%s object does not preserve the exact baseline core: %w", objectKind, err)
 	}
 
 	for _, descriptor := range experimentalMapDescriptors() {
 		mapSpec := spec.Maps[descriptor.name]
 		if mapSpec == nil {
-			return fmt.Errorf("experimental BPF object missing required map %q", descriptor.name)
+			return fmt.Errorf("%s BPF object missing required map %q", objectKind, descriptor.name)
 		}
 		if err := validateManifestMapSpec(descriptor, mapSpec); err != nil {
-			return fmt.Errorf("experimental map manifest: %w", err)
+			return fmt.Errorf("%s map manifest: %w", objectKind, err)
 		}
 		if mapSpec.Pinning != ebpf.PinNone {
 			return fmt.Errorf(
-				"experimental BPF map %q pinning is %d, want PinNone",
-				descriptor.name, mapSpec.Pinning,
+				"%s BPF map %q pinning is %d, want PinNone",
+				objectKind, descriptor.name, mapSpec.Pinning,
 			)
 		}
 	}
 	for _, descriptor := range experimentalProgramDescriptors() {
 		programSpec := spec.Programs[descriptor.name]
 		if programSpec == nil {
-			return fmt.Errorf("experimental BPF object missing required program %q", descriptor.name)
+			return fmt.Errorf("%s BPF object missing required program %q", objectKind, descriptor.name)
 		}
 		if err := validateProgramManifestSpec(descriptor, programSpec); err != nil {
-			return fmt.Errorf("experimental program manifest: %w", err)
+			return fmt.Errorf("%s program manifest: %w", objectKind, err)
 		}
 	}
 	return nil

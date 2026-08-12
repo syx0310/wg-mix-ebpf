@@ -61,6 +61,7 @@ type fakeExperimentalSlowPath struct {
 	mu sync.Mutex
 
 	engine         *faketcp.Engine
+	router         *faketcp.EngineRouter
 	runErr         error
 	stopErr        error
 	closeErr       error
@@ -440,6 +441,38 @@ func (fixture *runtimeTestFixture) slowPathFactory(
 	return fixture.slowPath, nil
 }
 
+func (fixture *runtimeTestFixture) routedSlowPathFactory(
+	router *faketcp.EngineRouter,
+	eventsMap *ebpf.Map,
+	statsMap *ebpf.Map,
+) (experimentalSlowPath, error) {
+	if eventsMap != fixture.eventSource.bpfMap {
+		return nil, errors.New("routed slow-path factory received unrelated events map")
+	}
+	if statsMap != fixture.mapResources[fakeTCPStatsMapName].bpfMap {
+		return nil, errors.New("routed slow-path factory received unrelated stats map")
+	}
+	fixture.slowPath.router = router
+	return fixture.slowPath, nil
+}
+
+func runtimeTestEnginePlans(generation uint64, count int) []faketcp.WGEnginePlan {
+	plans := make([]faketcp.WGEnginePlan, 0, count)
+	for index := 0; index < count; index++ {
+		wgID := uint32(index + 1)
+		options := runtimeTestEngineOptions(generation)
+		plans = append(plans, faketcp.WGEnginePlan{
+			WGID:    wgID,
+			Options: options,
+			Routes: []faketcp.EngineRoute{{
+				Generation: generation, UnderlayIndex: 3, LocalPort: 31001,
+				WGID: wgID, FWMark: 0xa1230000 + wgID, Action: abi.ActionRewrite,
+			}},
+		})
+	}
+	return plans
+}
+
 func (fixture *runtimeTestFixture) commitGeneration(
 	engine *faketcp.Engine,
 	claim faketcp.LinuxFreshCollectionClaim,
@@ -689,6 +722,121 @@ func TestExperimentalFakeTCPRuntimeBuildsPolicyTailCallsXDPAndHandles(t *testing
 	}
 	if err := handles.WithEventsMap(func(*ebpf.Map) error { return nil }); !errors.Is(err, ErrExperimentalFakeTCPRuntimeClosed) {
 		t.Fatalf("retained event constructor after close error = %v", err)
+	}
+}
+
+func TestExperimentalFakeTCPRuntimeBuildsTwoAndFourRoutedEngines(t *testing.T) {
+	for _, engineCount := range []int{2, 4} {
+		t.Run(fmt.Sprintf("engines-%d", engineCount), func(t *testing.T) {
+			fixture := newRuntimeTestFixture(t)
+			ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+			options := fixture.buildOptions(transaction)
+			options.enginePlans = runtimeTestEnginePlans(91, engineCount)
+			for index := range options.enginePlans {
+				options.enginePlans[index].Options.MaxPendingFlows = 1
+			}
+			options.slowPathFactory = nil
+			options.routedSlowPathFactory = fixture.routedSlowPathFactory
+
+			runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
+			if err != nil {
+				t.Fatal(err)
+			}
+			router := fixture.slowPath.router
+			if router == nil || runtime.state.router != router {
+				t.Fatalf("runtime router=%p slow-path router=%p", runtime.state.router, router)
+			}
+			wgIDs := router.WGIDs()
+			if len(wgIDs) != engineCount {
+				t.Fatalf("routed WGIDs=%v, want %d engines", wgIDs, engineCount)
+			}
+			representative, exists := router.Engine(wgIDs[0])
+			if !exists || representative != fixture.commitEngine || representative != runtime.state.engine {
+				t.Fatalf(
+					"deterministic commit Engine=%p representative=%p runtime=%p",
+					fixture.commitEngine, representative, runtime.state.engine,
+				)
+			}
+
+			for _, wgID := range wgIDs {
+				engine, exists := router.Engine(wgID)
+				if !exists || engine == nil || engine.Identity() != runtime.Identity() {
+					t.Fatalf("WGID %d Engine=%p identity=%#v", wgID, engine, engine.Identity())
+				}
+				flow := abi.FakeTCPSessionKey{
+					Generation: 91, LocalIPv4: 0x0100000a, RemoteIPv4: 0x0200000a,
+					UnderlayIndex: 3, LocalPort: 31001, RemotePort: 443, WGID: wgID,
+				}
+				if _, err := engine.Outbound(flow, []byte{byte(wgID)}); err != nil {
+					t.Fatalf("WGID %d outbound: %v", wgID, err)
+				}
+				if _, err := engine.InboundWithWGID(
+					flow,
+					faketcp.Segment{
+						Flags:    faketcp.FlagSYN | faketcp.FlagACK,
+						Sequence: 9000 + wgID, Acknowledgement: 1001,
+					},
+					wgID,
+				); err != nil {
+					t.Fatalf("WGID %d establish: %v", wgID, err)
+				}
+			}
+			fixture.sessionStore.mu.Lock()
+			storedSessions := len(fixture.sessionStore.entries)
+			fixture.sessionStore.mu.Unlock()
+			if storedSessions != engineCount {
+				t.Fatalf("shared collection session store entries=%d, want %d", storedSessions, engineCount)
+			}
+
+			if err := runtime.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if runtime.state.router != nil || fixture.sessionStore.closes != 1 {
+				t.Fatalf(
+					"closed runtime router=%p session closes=%d",
+					runtime.state.router, fixture.sessionStore.closes,
+				)
+			}
+		})
+	}
+}
+
+func TestExperimentalRoutedSlowPathFailureClosesTransferredOwnersOnce(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	ctx, transaction, _ := newTestFakeTCPPolicyGenerationTransaction(t, 91)
+	options := fixture.buildOptions(transaction)
+	options.enginePlans = runtimeTestEnginePlans(91, 2)
+	options.slowPathFactory = nil
+	factoryErr := errors.New("injected routed slow-path factory failure")
+	options.routedSlowPathFactory = func(
+		router *faketcp.EngineRouter,
+		events *ebpf.Map,
+		stats *ebpf.Map,
+	) (experimentalSlowPath, error) {
+		if router == nil || events != fixture.eventSource.bpfMap ||
+			stats != fixture.mapResources[fakeTCPStatsMapName].bpfMap {
+			return nil, errors.New("routed slow-path factory received incomplete ownership")
+		}
+		fixture.slowPath.router = router
+		return fixture.slowPath, factoryErr
+	}
+
+	runtime, err := buildExperimentalFakeTCPRuntime(ctx, options)
+	if runtime != nil || !errors.Is(err, factoryErr) {
+		t.Fatalf("routed construction result runtime=%#v err=%v", runtime, err)
+	}
+	_, _, slowCloses := fixture.slowPath.counts()
+	if slowCloses != 1 || fixture.sessionStore.closes != 1 {
+		t.Fatalf(
+			"routed construction cleanup slow-path=%d session=%d",
+			slowCloses, fixture.sessionStore.closes,
+		)
+	}
+	if !transaction.isClosed() || !fixture.collection.isClosed() {
+		t.Fatalf(
+			"routed construction cleanup transaction closed=%t collection closed=%t",
+			transaction.isClosed(), fixture.collection.isClosed(),
+		)
 	}
 }
 

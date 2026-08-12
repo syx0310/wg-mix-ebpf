@@ -32,12 +32,13 @@ const (
 // so the supervisor rejects an in-place content change as a live generation
 // replacement rather than confusing it with the current runtime.
 type fakeTCPProductionScopeIdentity struct {
-	objectKind        fakeTCPProductionObjectScopeKind
-	objectPath        string
-	fakeTCPObjectPath string
-	pinPath           string
-	lifecyclePath     string
-	adoptLegacyPins   bool
+	objectKind                 fakeTCPProductionObjectScopeKind
+	objectPath                 string
+	fakeTCPObjectPath          string
+	fakeTCPLegacy515ObjectPath string
+	pinPath                    string
+	lifecyclePath              string
+	adoptLegacyPins            bool
 }
 
 func (scope fakeTCPProductionScopeIdentity) validate() error {
@@ -63,6 +64,13 @@ func (scope fakeTCPProductionScopeIdentity) validate() error {
 			return err
 		}
 	}
+	if scope.fakeTCPLegacy515ObjectPath != EmbeddedFakeTCPLegacy515ObjectSource {
+		if err := validateCanonicalFakeTCPProductionPath(
+			"legacy-5.15 FakeTCP object", scope.fakeTCPLegacy515ObjectPath,
+		); err != nil {
+			return err
+		}
+	}
 	if err := validateCanonicalFakeTCPProductionPath("pin", scope.pinPath); err != nil {
 		return err
 	}
@@ -81,10 +89,11 @@ func (scope fakeTCPProductionScopeIdentity) String() string {
 		objectKind = "filesystem"
 	}
 	return fmt.Sprintf(
-		"object_kind=%q object_path=%q faketcp_object_path=%q pin=%q lifecycle=%q adopt_legacy_pins=%t",
+		"object_kind=%q object_path=%q faketcp_object_path=%q faketcp_legacy_515_object_path=%q pin=%q lifecycle=%q adopt_legacy_pins=%t",
 		objectKind,
 		scope.objectPath,
 		scope.fakeTCPObjectPath,
+		scope.fakeTCPLegacy515ObjectPath,
 		scope.pinPath,
 		scope.lifecyclePath,
 		scope.adoptLegacyPins,

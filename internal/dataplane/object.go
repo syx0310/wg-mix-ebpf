@@ -14,8 +14,9 @@ import (
 var embeddedObjects embed.FS
 
 const (
-	EmbeddedObjectSource        = "embedded:wg_mix_tc.o"
-	EmbeddedFakeTCPObjectSource = "embedded:wg_mix_faketcp.o"
+	EmbeddedObjectSource                 = "embedded:wg_mix_tc.o"
+	EmbeddedFakeTCPObjectSource          = "embedded:wg_mix_faketcp.o"
+	EmbeddedFakeTCPLegacy515ObjectSource = "embedded:wg_mix_faketcp_legacy_515.o"
 )
 
 type ObjectIdentity struct {
@@ -68,6 +69,29 @@ func loadFakeTCPCollectionSpecFromResolvedPath(path string) (*ebpf.CollectionSpe
 	return loadEmbeddedCollectionSpec("wg_mix_faketcp.o", EmbeddedFakeTCPObjectSource)
 }
 
+// loadFakeTCPLegacy515CollectionSpecFromResolvedPath is deliberately separate
+// from both baseline and modern FakeTCP loaders. The legacy object uses a
+// kprobe checksum bridge and a Linux 5.15-compatible verifier contract, so it
+// must never be selected through the modern object path or identity.
+func loadFakeTCPLegacy515CollectionSpecFromResolvedPath(path string) (*ebpf.CollectionSpec, ObjectIdentity, error) {
+	if path != "" {
+		object, err := os.ReadFile(path)
+		if err != nil {
+			return nil, ObjectIdentity{}, fmt.Errorf("read legacy-5.15 FakeTCP BPF object %s: %w", path, err)
+		}
+		identity := objectIdentity(path, false, object)
+		spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(object))
+		if err != nil {
+			return nil, identity, fmt.Errorf("load legacy-5.15 FakeTCP BPF object %s: %w", path, err)
+		}
+		return spec, identity, nil
+	}
+	return loadEmbeddedCollectionSpec(
+		"wg_mix_faketcp_legacy_515.o",
+		EmbeddedFakeTCPLegacy515ObjectSource,
+	)
+}
+
 func loadEmbeddedCollectionSpec(name, source string) (*ebpf.CollectionSpec, ObjectIdentity, error) {
 	embeddedObject, err := embeddedObjects.ReadFile("embedded/" + name)
 	if err != nil {
@@ -90,6 +114,13 @@ func EmbeddedObjectIdentity() (ObjectIdentity, error) {
 
 func EmbeddedFakeTCPObjectIdentity() (ObjectIdentity, error) {
 	return embeddedObjectIdentity("wg_mix_faketcp.o", EmbeddedFakeTCPObjectSource)
+}
+
+func EmbeddedFakeTCPLegacy515ObjectIdentity() (ObjectIdentity, error) {
+	return embeddedObjectIdentity(
+		"wg_mix_faketcp_legacy_515.o",
+		EmbeddedFakeTCPLegacy515ObjectSource,
+	)
 }
 
 func embeddedObjectIdentity(name, source string) (ObjectIdentity, error) {
@@ -127,6 +158,13 @@ func fakeTCPObjectPathFromEnv(explicit string) string {
 		return explicit
 	}
 	return os.Getenv(EnvFakeTCPObjectPath)
+}
+
+func fakeTCPLegacy515ObjectPathFromEnv(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return os.Getenv(EnvFakeTCPLegacy515ObjectPath)
 }
 
 func DisplayObjectPath(explicit string) string {

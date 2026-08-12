@@ -109,26 +109,38 @@ func decodeEventHeader(header []byte) abi.FakeTCPEvent {
 			UnderlayIndex: native.Uint32(header[16:20]),
 			LocalPort:     native.Uint16(header[20:22]),
 			RemotePort:    native.Uint16(header[22:24]),
+			WGID:          native.Uint32(header[24:28]),
+			Reserved:      [4]byte(header[28:32]),
 		},
-		TimestampNanos:     native.Uint64(header[24:32]),
-		RuntimeIncarnation: [16]byte(header[32:48]),
-		CaptureSequence:    native.Uint64(header[48:56]),
-		SessionRevision:    native.Uint64(header[56:64]),
-		SessionID:          native.Uint64(header[64:72]),
-		CaptureCPU:         native.Uint32(header[72:76]),
-		Sequence:           native.Uint32(header[76:80]),
-		Acknowledgement:    native.Uint32(header[80:84]),
-		PayloadLength:      native.Uint32(header[84:88]),
-		FWMark:             native.Uint32(header[88:92]),
-		WGID:               native.Uint32(header[92:96]),
-		PacketLength:       native.Uint16(header[96:98]),
-		EventABIVersion:    native.Uint16(header[98:100]),
-		Type:               header[100],
-		TCPFlags:           header[101],
+		TimestampNanos:     native.Uint64(header[32:40]),
+		RuntimeIncarnation: [16]byte(header[40:56]),
+		CaptureSequence:    native.Uint64(header[56:64]),
+		SessionRevision:    native.Uint64(header[64:72]),
+		SessionID:          native.Uint64(header[72:80]),
+		CaptureCPU:         native.Uint32(header[80:84]),
+		Sequence:           native.Uint32(header[84:88]),
+		Acknowledgement:    native.Uint32(header[88:92]),
+		PayloadLength:      native.Uint32(header[92:96]),
+		FWMark:             native.Uint32(header[96:100]),
+		WGID:               native.Uint32(header[100:104]),
+		PacketLength:       native.Uint16(header[104:106]),
+		EventABIVersion:    native.Uint16(header[106:108]),
+		Type:               header[108],
+		TCPFlags:           header[109],
 	}
 }
 
 func validateEventType(event abi.FakeTCPEvent) error {
+	if err := validatePacketFlow(event.Key); err != nil {
+		return fmt.Errorf("faketcp event session key is invalid: %w", err)
+	}
+	if event.WGID != event.Key.WGID {
+		return fmt.Errorf(
+			"faketcp event WGID %d does not match session key WGID %d",
+			event.WGID,
+			event.Key.WGID,
+		)
+	}
 	if event.EventABIVersion != abi.FakeTCPEventABIVersion {
 		return fmt.Errorf(
 			"faketcp event ABI version %d does not match %d",

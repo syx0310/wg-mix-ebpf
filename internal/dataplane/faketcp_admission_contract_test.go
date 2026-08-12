@@ -192,7 +192,7 @@ func TestFakeTCPSingleUsePacketAdmissionProofBindsStableLifetimeAndCapabilitySta
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(manifest), `{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 184, maxEntries: 1, flags: unix.BPF_F_RDONLY}`) {
+	if !strings.Contains(string(manifest), `{name: "faketcp_egress_admission_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 192, maxEntries: 1, flags: unix.BPF_F_RDONLY}`) {
 		t.Fatal("fresh admission map manifest does not lock PinNone-compatible type, size and syscall-side read-only flag")
 	}
 
@@ -228,7 +228,7 @@ func TestFakeTCPRuntimeScratchKeepsLargeProofsOffTheBPFStack(t *testing.T) {
 	for _, want := range []string{
 		"struct faketcp_runtime_scratch",
 		"faketcp_runtime_scratch_map SEC(\".maps\")",
-		"_Static_assert(sizeof(struct faketcp_runtime_scratch) == 344",
+		"_Static_assert(sizeof(struct faketcp_runtime_scratch) == 360",
 		"key = &scratch->tc.key",
 		"gso = &scratch->tc.gso",
 		"session_snapshot = &scratch->tc.session_snapshot",
@@ -258,7 +258,7 @@ func TestFakeTCPRuntimeScratchKeepsLargeProofsOffTheBPFStack(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(manifest),
-		`{name: "faketcp_runtime_scratch_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 344, maxEntries: 1}`,
+		`{name: "faketcp_runtime_scratch_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 360, maxEntries: 1}`,
 	) {
 		t.Fatal("experimental manifest does not bind the exact runtime scratch map ABI")
 	}

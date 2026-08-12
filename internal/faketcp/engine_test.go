@@ -46,8 +46,14 @@ func testFlow(port uint16) abi.FakeTCPSessionKey {
 	}
 	return abi.FakeTCPSessionKey{
 		Generation: 1, LocalIPv4: local, RemoteIPv4: remote,
-		UnderlayIndex: 2, LocalPort: port, RemotePort: 443,
+		UnderlayIndex: 2, LocalPort: port, RemotePort: 443, WGID: 7,
 	}
+}
+
+func testFlowWithWGID(port uint16, wgID uint32) abi.FakeTCPSessionKey {
+	flow := testFlow(port)
+	flow.WGID = wgID
+	return flow
 }
 
 type fakeSessionStore struct {
@@ -1382,6 +1388,34 @@ func TestWGIDMismatchCannotDriveOrCloseExistingSession(t *testing.T) {
 	state, ok, _ := engine.Snapshot(flow)
 	if !ok || state.State != abi.FakeTCPStateSynSent {
 		t.Fatalf("mismatched event changed state=%#v ok=%t", state, ok)
+	}
+}
+
+func TestEqualNetworkTuplesRemainIndependentAcrossWGIDs(t *testing.T) {
+	store := newFakeSessionStore()
+	engine, _ := testEngine(t, func(options *Options) { options.Store = store })
+	first := testFlow(31001)
+	second := first
+	second.WGID = 9
+
+	for _, flow := range []abi.FakeTCPSessionKey{first, second} {
+		initial, err := engine.Outbound(flow, []byte{byte(flow.WGID)})
+		if err != nil || len(initial) != 1 || initial[0].Kind != ActionSendControl ||
+			initial[0].WGID != flow.WGID {
+			t.Fatalf("WGID %d initial actions=%#v err=%v", flow.WGID, initial, err)
+		}
+		if actions, err := engine.InboundWithWGID(flow, Segment{
+			Flags: FlagSYN | FlagACK, Sequence: 9000,
+			Acknowledgement: initial[0].Control.Sequence + 1,
+		}, flow.WGID); err != nil || len(actions) != 2 || actions[1].WGID != flow.WGID {
+			t.Fatalf("WGID %d completion actions=%#v err=%v", flow.WGID, actions, err)
+		}
+	}
+	if len(engine.sessions) != 2 || len(store.values) != 2 {
+		t.Fatalf("equal tuples aliased: slow=%d fast=%d", len(engine.sessions), len(store.values))
+	}
+	if store.values[first].SessionID == store.values[second].SessionID {
+		t.Fatal("independent WGID sessions reused lifetime identity")
 	}
 }
 

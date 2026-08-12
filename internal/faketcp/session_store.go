@@ -14,7 +14,7 @@ const (
 	// BPF_OBJ_GET_INFO_BY_FD.
 	fakeTCPSessionKernelMapName = "faketcp_session"
 	fakeTCPSessionMapTypeHash   = uint32(1)
-	fakeTCPSessionMapKeySize    = uint32(24)
+	fakeTCPSessionMapKeySize    = uint32(32)
 	fakeTCPSessionMapValueSize  = uint32(80)
 	fakeTCPSessionMapMaxEntries = uint32(16384)
 )
@@ -423,8 +423,11 @@ func validateBoundSessionKey(key abi.FakeTCPSessionKey, generation uint64) error
 		)
 	}
 	if key.LocalIPv4 == 0 || key.RemoteIPv4 == 0 || key.UnderlayIndex == 0 ||
-		key.LocalPort == 0 || key.RemotePort == 0 {
-		return errors.New("faketcp session key has a zero address, interface, or port")
+		key.LocalPort == 0 || key.RemotePort == 0 || key.WGID == 0 {
+		return errors.New("faketcp session key has a zero address, interface, port, or WGID")
+	}
+	if key.Reserved != ([4]byte{}) {
+		return errors.New("faketcp session key has nonzero reserved bytes")
 	}
 	return nil
 }

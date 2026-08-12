@@ -55,6 +55,12 @@ type experimentalSlowPathFactory func(
 	*ebpf.Map,
 ) (experimentalSlowPath, error)
 
+type experimentalRoutedSlowPathFactory func(
+	*faketcp.EngineRouter,
+	*ebpf.Map,
+	*ebpf.Map,
+) (experimentalSlowPath, error)
+
 type experimentalLinuxGenerationCommit func(
 	*faketcp.Engine,
 	faketcp.LinuxFreshCollectionClaim,
@@ -76,6 +82,20 @@ type experimentalCoreStageFactory func(
 type experimentalTCStageOwner interface {
 	Close() error
 }
+
+// experimentalChecksumStageOwner retains checksum-backend state that lives
+// inside one collection (for example the legacy kprobe cookie map). It is
+// created before any program becomes reachable, checked with the runtime, and
+// closed only after TC/XDP are detached but before the collection is released.
+type experimentalChecksumStageOwner interface {
+	experimentalRuntimeHealthOwner
+	Close() error
+}
+
+type experimentalChecksumStageFactory func(
+	context.Context,
+	*experimentalCollectionOwner,
+) (experimentalChecksumStageOwner, error)
 
 // experimentalRuntimeHealthOwner is implemented by every production
 // process-owned attachment/isolation stage. Health checks are read-only and
@@ -299,6 +319,19 @@ func experimentalSlowPathIsNil(slowPath experimentalSlowPath) bool {
 	}
 }
 
+func experimentalChecksumStageOwnerIsNil(owner experimentalChecksumStageOwner) bool {
+	if owner == nil {
+		return true
+	}
+	value := reflect.ValueOf(owner)
+	switch value.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return value.IsNil()
+	default:
+		return false
+	}
+}
+
 func (store *generationFencedSessionStore) InsertEstablished(
 	key abi.FakeTCPSessionKey,
 	value abi.FakeTCPSessionValue,
@@ -438,11 +471,13 @@ type experimentalFakeTCPRuntimeState struct {
 	generation  uint64
 	identity    faketcp.RuntimeIdentity
 	engine      *faketcp.Engine
+	router      *faketcp.EngineRouter
 	collection  *experimentalCollectionOwner
 	isolation   fakeTCPPolicyGenerationIsolationBackend
 	core        experimentalCoreStageOwner
 	tc          experimentalTCStageOwner
 	xdp         *fakeTCPXDPStage
+	checksum    experimentalChecksumStageOwner
 	retained    *fakeTCPRetainedRuntimeHealth
 	slowPath    experimentalSlowPath
 	handles     ExperimentalFakeTCPRuntimeHandles
@@ -629,21 +664,24 @@ func (state *experimentalLinuxFreshCollectionClaimState) finishCallback() {
 }
 
 type experimentalFakeTCPRuntimeBuildOptions struct {
-	collection       *experimentalCollectionOwner
-	transaction      *fakeTCPPolicyGenerationTransaction
-	baselineSnapshot *abi.Snapshot
-	attachState      *control.State
-	xdpRequests      []fakeTCPXDPAttachRequest
-	xdpRuntime       fakeTCPXDPRuntime
-	xdpRequirement   fakeTCPXDPActivationRequirement
-	sessionFactory   experimentalSessionStoreFactory
-	eventSource      experimentalEventMapSource
-	programArray     fakeTCPProgramArray
-	engineOptions    faketcp.Options
-	slowPathFactory  experimentalSlowPathFactory
-	commitGeneration experimentalLinuxGenerationCommit
-	coreStageFactory experimentalCoreStageFactory
-	tcStageFactory   experimentalTCStageFactory
+	collection            *experimentalCollectionOwner
+	transaction           *fakeTCPPolicyGenerationTransaction
+	baselineSnapshot      *abi.Snapshot
+	attachState           *control.State
+	xdpRequests           []fakeTCPXDPAttachRequest
+	xdpRuntime            fakeTCPXDPRuntime
+	xdpRequirement        fakeTCPXDPActivationRequirement
+	sessionFactory        experimentalSessionStoreFactory
+	eventSource           experimentalEventMapSource
+	programArray          fakeTCPProgramArray
+	engineOptions         faketcp.Options
+	enginePlans           []faketcp.WGEnginePlan
+	slowPathFactory       experimentalSlowPathFactory
+	routedSlowPathFactory experimentalRoutedSlowPathFactory
+	commitGeneration      experimentalLinuxGenerationCommit
+	coreStageFactory      experimentalCoreStageFactory
+	tcStageFactory        experimentalTCStageFactory
+	checksumStageFactory  experimentalChecksumStageFactory
 }
 
 // buildExperimentalFakeTCPRuntime transfers ownership of both collection and
@@ -699,11 +737,13 @@ func (build *experimentalRuntimeBuild) runtimeOwner() *ExperimentalFakeTCPRuntim
 			generation: generation,
 			identity:   identity,
 			engine:     build.engine,
+			router:     build.router,
 			collection: build.options.collection,
 			isolation:  build.isolation,
 			core:       build.coreStage,
 			tc:         build.tcStage,
 			xdp:        build.xdpStage,
+			checksum:   build.checksumStage,
 			retained: retainFakeTCPRuntimeHealth(
 				build.policyPlan,
 				build.policyMaps,
@@ -752,6 +792,7 @@ type experimentalRuntimeBuild struct {
 	sessions           *generationFencedSessionStore
 	events             *generationFencedEventMap
 	engine             *faketcp.Engine
+	router             *faketcp.EngineRouter
 	isolation          fakeTCPPolicyGenerationIsolationBackend
 	slowPath           experimentalSlowPath
 	freshClaim         experimentalLinuxFreshCollectionClaim
@@ -765,6 +806,7 @@ type experimentalRuntimeBuild struct {
 	coreResources      experimentalCoreResources
 	coreStage          experimentalCoreStageOwner
 	tcStage            experimentalTCStageOwner
+	checksumStage      experimentalChecksumStageOwner
 	programStage       *fakeTCPProgramArrayStage
 	xdpStage           *fakeTCPXDPStage
 	policyStage        *fakeTCPPolicyStage
@@ -826,17 +868,43 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	); err != nil {
 		return fmt.Errorf("build experimental FakeTCP runtime: %w", err)
 	}
-	if options.engineOptions.Generation != generation {
-		return fmt.Errorf(
-			"build experimental FakeTCP runtime: Engine generation %d does not match policy plan generation %d",
-			options.engineOptions.Generation, generation,
-		)
-	}
 	if options.engineOptions.Store != nil {
 		return errors.New("build experimental FakeTCP runtime: Engine Store must come from the claimed collection")
 	}
-	if options.slowPathFactory == nil {
-		return errors.New("build experimental FakeTCP runtime: slow-path factory is nil")
+	if len(options.enginePlans) == 0 {
+		if options.engineOptions.Generation != generation {
+			return fmt.Errorf(
+				"build experimental FakeTCP runtime: Engine generation %d does not match policy plan generation %d",
+				options.engineOptions.Generation, generation,
+			)
+		}
+		if options.slowPathFactory == nil {
+			return errors.New("build experimental FakeTCP runtime: slow-path factory is nil")
+		}
+	} else {
+		if options.routedSlowPathFactory == nil {
+			return errors.New("build experimental FakeTCP runtime: routed slow-path factory is nil")
+		}
+		if options.engineOptions.Generation != 0 && options.engineOptions.Generation != generation {
+			return fmt.Errorf(
+				"build experimental FakeTCP runtime: compatibility Engine generation %d does not match policy plan generation %d",
+				options.engineOptions.Generation, generation,
+			)
+		}
+		for index, plan := range options.enginePlans {
+			if plan.Options.Generation != generation {
+				return fmt.Errorf(
+					"build experimental FakeTCP runtime: Engine plan[%d] generation %d does not match policy plan generation %d",
+					index, plan.Options.Generation, generation,
+				)
+			}
+			if plan.Options.Store != nil {
+				return fmt.Errorf(
+					"build experimental FakeTCP runtime: Engine plan[%d] Store must come from the claimed collection",
+					index,
+				)
+			}
+		}
 	}
 	if options.commitGeneration == nil {
 		options.commitGeneration = faketcp.CommitLinuxGenerationReachability
@@ -926,6 +994,30 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if err != nil {
 		return err
 	}
+	if options.checksumStageFactory != nil {
+		stage, stageErr := options.checksumStageFactory(build.activeCtx, options.collection)
+		if !experimentalChecksumStageOwnerIsNil(stage) {
+			// Record ownership before inspecting the constructor error. A
+			// partial seed/clone owner must remain available to failed-build
+			// cleanup instead of leaking alongside the collection.
+			build.checksumStage = stage
+		}
+		if stageErr != nil {
+			return build.prepareError(fmt.Errorf(
+				"build experimental FakeTCP checksum stage: %w", stageErr,
+			))
+		}
+		if experimentalChecksumStageOwnerIsNil(stage) {
+			return errors.New(
+				"build experimental FakeTCP checksum stage: factory returned nil",
+			)
+		}
+		if err := stage.Healthy(build.activeCtx); err != nil {
+			return build.prepareError(fmt.Errorf(
+				"build experimental FakeTCP checksum stage health: %w", err,
+			))
+		}
+	}
 
 	ownedStore, err := options.sessionFactory(
 		sessionMap, sessionClaimProgram, generation,
@@ -940,11 +1032,46 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		}
 		return errors.Join(err, ownedStore.Close())
 	}
-	engineOptions := options.engineOptions
-	engineOptions.Store = build.sessions
-	build.engine, err = faketcp.New(engineOptions)
-	if err != nil {
-		return fmt.Errorf("build experimental FakeTCP runtime Engine: %w", err)
+	if len(options.enginePlans) == 0 {
+		engineOptions := options.engineOptions
+		engineOptions.Store = build.sessions
+		build.engine, err = faketcp.New(engineOptions)
+		if err != nil {
+			return fmt.Errorf("build experimental FakeTCP runtime Engine: %w", err)
+		}
+	} else {
+		domain, domainErr := faketcp.NewRuntimeDomain(generation)
+		if domainErr != nil {
+			return fmt.Errorf("build experimental FakeTCP runtime domain: %w", domainErr)
+		}
+		plans := make([]faketcp.WGEnginePlan, len(options.enginePlans))
+		for index, plan := range options.enginePlans {
+			plans[index] = plan
+			plans[index].Options.Store = build.sessions
+			plans[index].Routes = append([]faketcp.EngineRoute(nil), plan.Routes...)
+		}
+		build.router, err = faketcp.NewEngineRouterFromPlans(domain, plans)
+		if err != nil {
+			return fmt.Errorf("build experimental FakeTCP routed Engines: %w", err)
+		}
+		wgIDs := build.router.WGIDs()
+		if len(wgIDs) == 0 {
+			return errors.New("build experimental FakeTCP routed Engines returned no WireGuard IDs")
+		}
+		for index, wgID := range wgIDs {
+			engine, exists := build.router.Engine(wgID)
+			if !exists || engine == nil || engine.Identity() != build.router.Identity() {
+				return fmt.Errorf(
+					"build experimental FakeTCP routed Engine[%d] WGID %d has inconsistent runtime identity",
+					index, wgID,
+				)
+			}
+			if index == 0 {
+				// WGIDs is sorted, so the representative used for the once-only
+				// kernel identity commit is deterministic across input ordering.
+				build.engine = engine
+			}
+		}
 	}
 	build.isolation, err = build.claim.bindIsolationCollection(
 		build.activeCtx,
@@ -967,7 +1094,13 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		return err
 	}
 	err = build.events.withMap(func(eventsMap *ebpf.Map) error {
-		constructed, constructErr := options.slowPathFactory(build.engine, eventsMap, statsMap)
+		var constructed experimentalSlowPath
+		var constructErr error
+		if build.router != nil {
+			constructed, constructErr = options.routedSlowPathFactory(build.router, eventsMap, statsMap)
+		} else {
+			constructed, constructErr = options.slowPathFactory(build.engine, eventsMap, statsMap)
+		}
 		if constructErr != nil {
 			if !experimentalSlowPathIsNil(constructed) {
 				if closeErr := constructed.Close(); closeErr != nil {
@@ -1249,9 +1382,20 @@ func (build *experimentalRuntimeBuild) cleanupUncommitted() (bool, error) {
 			}
 		}
 	}
-	internalClosed := externalDetached && build.policyStage == nil &&
+	internalHandlesClosed := externalDetached && build.policyStage == nil &&
 		build.programStage == nil && build.coreStage == nil &&
 		build.sessions == nil && build.events == nil
+	if internalHandlesClosed && !experimentalChecksumStageOwnerIsNil(build.checksumStage) {
+		if err := build.checksumStage.Close(); err != nil {
+			cleanupErrors = append(cleanupErrors, fmt.Errorf(
+				"close FakeTCP checksum stage: %w", err,
+			))
+		} else {
+			build.checksumStage = nil
+		}
+	}
+	internalClosed := internalHandlesClosed &&
+		experimentalChecksumStageOwnerIsNil(build.checksumStage)
 	if internalClosed && build.options.collection != nil {
 		if err := build.options.collection.Close(); err != nil {
 			cleanupErrors = append(cleanupErrors, fmt.Errorf("close experimental FakeTCP collection: %w", err))
@@ -1269,7 +1413,9 @@ func (build *experimentalRuntimeBuild) cleanupUncommitted() (bool, error) {
 	complete := internalClosed && build.options.collection == nil && build.claim == nil
 	if complete {
 		build.engine = nil
+		build.router = nil
 		build.isolation = nil
+		build.checksumStage = nil
 		build.freshClaim = experimentalLinuxFreshCollectionClaim{}
 	}
 	return complete, errors.Join(cleanupErrors...)
@@ -1492,6 +1638,12 @@ func (runtime *ExperimentalFakeTCPRuntime) Healthy(ctx context.Context) error {
 		{name: "TCX", owner: state.tc},
 		{name: "XDP", owner: state.xdp},
 	}
+	if !experimentalChecksumStageOwnerIsNil(state.checksum) {
+		checks = append(checks, struct {
+			name  string
+			owner any
+		}{name: "checksum stage", owner: state.checksum})
+	}
 	for _, check := range checks {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -1557,6 +1709,7 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 			state.failedBuild = nil
 			state.closed = true
 			state.engine = nil
+			state.router = nil
 			state.handles = ExperimentalFakeTCPRuntimeHandles{}
 		}
 		close(done)
@@ -1569,6 +1722,7 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 	events := state.handles.events
 	tc := state.tc
 	xdp := state.xdp
+	checksum := state.checksum
 	isolation := state.isolation
 	generation := state.generation
 	collection := state.collection
@@ -1615,7 +1769,7 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 		closeErrors = append(closeErrors, xdpErr, tcErr)
 	}
 
-	var coreErr, sessionErr, eventErr, collectionErr error
+	var coreErr, sessionErr, eventErr, checksumErr, collectionErr error
 	if quiesced && xdpErr == nil && tcErr == nil {
 		coreErr = wrapExperimentalRuntimeClose("baseline core", core)
 		closeErrors = append(closeErrors, coreErr)
@@ -1624,8 +1778,12 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 			eventErr = wrapExperimentalRuntimeClose("event-map constructors", events)
 			closeErrors = append(closeErrors, sessionErr, eventErr)
 			if sessionErr == nil && eventErr == nil {
-				collectionErr = wrapExperimentalRuntimeClose("collection", collection)
-				closeErrors = append(closeErrors, collectionErr)
+				checksumErr = wrapExperimentalRuntimeClose("checksum stage", checksum)
+				closeErrors = append(closeErrors, checksumErr)
+				if checksumErr == nil {
+					collectionErr = wrapExperimentalRuntimeClose("collection", collection)
+					closeErrors = append(closeErrors, collectionErr)
+				}
 			}
 		}
 	}
@@ -1649,15 +1807,21 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 		if eventErr == nil {
 			state.handles.events = nil
 		}
+		if sessionErr == nil && eventErr == nil && checksumErr == nil {
+			state.checksum = nil
+		}
 	}
 	complete := quiesced && xdpErr == nil && tcErr == nil &&
-		coreErr == nil && sessionErr == nil && eventErr == nil && collectionErr == nil
+		coreErr == nil && sessionErr == nil && eventErr == nil &&
+		checksumErr == nil && collectionErr == nil
 	if complete {
 		state.closed = true
 		state.handles = ExperimentalFakeTCPRuntimeHandles{}
 		state.engine = nil
+		state.router = nil
 		state.collection = nil
 		state.isolation = nil
+		state.checksum = nil
 		state.retained = nil
 	}
 	close(done)

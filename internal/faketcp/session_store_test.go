@@ -331,6 +331,7 @@ func sessionStoreTestKey(generation uint64) abi.FakeTCPSessionKey {
 		UnderlayIndex: 2,
 		LocalPort:     31001,
 		RemotePort:    443,
+		WGID:          7,
 	}
 }
 
@@ -565,6 +566,33 @@ func TestLinuxSessionStoreInsertsOnceAndReadsValidatedValue(t *testing.T) {
 	}
 }
 
+func TestLinuxSessionStoreIsolatesEqualNetworkTuplesByWGID(t *testing.T) {
+	store, _ := newTestLinuxSessionStore(t)
+	firstKey := sessionStoreTestKey(7)
+	secondKey := firstKey
+	secondKey.WGID = 9
+	firstValue := sessionStoreTestValue(7)
+	secondValue := firstValue
+	secondValue.SessionID++
+	secondValue.TXSequence++
+
+	if err := store.InsertEstablished(firstKey, firstValue); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.InsertEstablished(secondKey, secondValue); err != nil {
+		t.Fatal(err)
+	}
+	gotFirst, foundFirst, errFirst := store.LookupEstablished(firstKey)
+	gotSecond, foundSecond, errSecond := store.LookupEstablished(secondKey)
+	if errFirst != nil || errSecond != nil || !foundFirst || !foundSecond ||
+		gotFirst != firstValue || gotSecond != secondValue {
+		t.Fatalf(
+			"isolated lookups first=%#v/%t/%v second=%#v/%t/%v",
+			gotFirst, foundFirst, errFirst, gotSecond, foundSecond, errSecond,
+		)
+	}
+}
+
 func TestLinuxSessionStoreTransfersCompletedHandshakeToFastMap(t *testing.T) {
 	backend := newMemorySessionMap()
 	store, err := newLinuxSessionStore(backend, 1, backend.identity)
@@ -608,6 +636,8 @@ func TestLinuxSessionStoreRejectsInvalidInsertBeforeMapAccess(t *testing.T) {
 		{name: "interface", mutate: func(key *abi.FakeTCPSessionKey, _ *abi.FakeTCPSessionValue) { key.UnderlayIndex = 0 }},
 		{name: "local port", mutate: func(key *abi.FakeTCPSessionKey, _ *abi.FakeTCPSessionValue) { key.LocalPort = 0 }},
 		{name: "remote port", mutate: func(key *abi.FakeTCPSessionKey, _ *abi.FakeTCPSessionValue) { key.RemotePort = 0 }},
+		{name: "WGID", mutate: func(key *abi.FakeTCPSessionKey, _ *abi.FakeTCPSessionValue) { key.WGID = 0 }},
+		{name: "key reserved", mutate: func(key *abi.FakeTCPSessionKey, _ *abi.FakeTCPSessionValue) { key.Reserved[1] = 1 }},
 		{name: "value generation", mutate: func(_ *abi.FakeTCPSessionKey, value *abi.FakeTCPSessionValue) { value.Generation++ }},
 		{name: "state", mutate: func(_ *abi.FakeTCPSessionKey, value *abi.FakeTCPSessionValue) { value.State = abi.FakeTCPStateSynSent }},
 		{name: "flags", mutate: func(_ *abi.FakeTCPSessionKey, value *abi.FakeTCPSessionValue) { value.Flags = 1 }},

@@ -34,6 +34,9 @@ const (
 	MaxFakeTCPPendingBytes                  = 1 << 20
 	FakeTCPChecksumModePartialCompleteReset = "partial-complete-reset-required"
 	FakeTCPIngressModeXDPGenericExact       = "xdp-generic-exact"
+	FakeTCPChecksumBackendAuto              = "auto"
+	FakeTCPChecksumBackendKfunc             = "kfunc"
+	FakeTCPChecksumBackendKprobe            = "kprobe"
 	deprecatedFakeTCPIngressModeXDPRequired = "xdp-required"
 )
 
@@ -96,10 +99,9 @@ type ICMPTransport struct {
 }
 
 // FakeTCPTransport preserves UDP/QUIC packet semantics and only presents a
-// TCP-shaped wire image; it is not a TCP stream. The single FakeTCP WireGuard
-// owns its complete policy (timeouts, rate
-// limits, source ledger and pending queues). The one-WireGuard restriction is
-// enforced before a production runtime can be planned.
+// TCP-shaped wire image; it is not a TCP stream. Each FakeTCP WireGuard owns
+// its complete policy (timeouts, rate limits, source ledger and pending
+// queues). Runtime maps and session identities keep the policies isolated.
 type FakeTCPTransport struct {
 	// Experimental is a deprecated, ignored compatibility field. Older
 	// configurations may keep `experimental: true` while migrating.
@@ -141,6 +143,7 @@ type FwmarkPolicy struct {
 type Runtime struct {
 	PollInterval            Duration `yaml:"poll_interval"`
 	AttachmentBackend       string   `yaml:"attachment_backend"`
+	ChecksumBackend         string   `yaml:"checksum_backend"`
 	RequireNonzeroFwmark    bool     `yaml:"require_nonzero_fwmark"`
 	StrictRuntimeFwmark     bool     `yaml:"strict_runtime_fwmark"`
 	AllowZeroFwmarkFallback bool     `yaml:"allow_zero_fwmark_fallback"`
@@ -161,7 +164,7 @@ func (r *Runtime) UnmarshalYAML(value *yaml.Node) error {
 			out.requireNonzeroFwmarkSet = true
 		case "strict_runtime_fwmark":
 			out.strictRuntimeFwmarkSet = true
-		case "poll_interval", "attachment_backend", "allow_zero_fwmark_fallback":
+		case "poll_interval", "attachment_backend", "checksum_backend", "allow_zero_fwmark_fallback":
 		default:
 			return fmt.Errorf("field %q not found in type config.Runtime", value.Content[i].Value)
 		}
@@ -337,6 +340,7 @@ func SafeTemplate() *Config {
 		Runtime: Runtime{
 			PollInterval:            Duration{Duration: 5 * time.Second},
 			AttachmentBackend:       "auto",
+			ChecksumBackend:         FakeTCPChecksumBackendAuto,
 			RequireNonzeroFwmark:    true,
 			StrictRuntimeFwmark:     true,
 			AllowZeroFwmarkFallback: false,
@@ -374,6 +378,9 @@ func (c *Config) ApplyDefaults() {
 	}
 	if c.Runtime.AttachmentBackend == "" {
 		c.Runtime.AttachmentBackend = "auto"
+	}
+	if c.Runtime.ChecksumBackend == "" {
+		c.Runtime.ChecksumBackend = FakeTCPChecksumBackendAuto
 	}
 	if !c.Runtime.AllowZeroFwmarkFallback && !c.Runtime.requireNonzeroFwmarkSet {
 		c.Runtime.RequireNonzeroFwmark = true
@@ -545,6 +552,14 @@ func (c *Config) ValidateStatic() error {
 			c.Runtime.AttachmentBackend,
 		)
 	}
+	switch c.Runtime.ChecksumBackend {
+	case FakeTCPChecksumBackendAuto, FakeTCPChecksumBackendKfunc, FakeTCPChecksumBackendKprobe:
+	default:
+		return fmt.Errorf(
+			"runtime.checksum_backend %q is unsupported (want auto, kfunc, or kprobe)",
+			c.Runtime.ChecksumBackend,
+		)
+	}
 	if err := validateUniqueUnderlays(c.Underlays); err != nil {
 		return err
 	}
@@ -629,12 +644,6 @@ func (c *Config) ValidateStatic() error {
 		default:
 			return fmt.Errorf("wireguards[%d].transport.mode %q is unsupported", i, wg.Transport.Mode)
 		}
-	}
-	if fakeTCPWireGuards > 1 {
-		return fmt.Errorf("at most one WireGuard may use transport.mode faketcp; configured %d", fakeTCPWireGuards)
-	}
-	if fakeTCPWireGuards != 0 && c.Runtime.AttachmentBackend == "classic_tc" {
-		return errors.New("runtime.attachment_backend classic_tc is unsupported for faketcp; use tcx or auto on a TCX-capable kernel")
 	}
 	if fakeTCPWireGuards != 0 && c.StartupGuard.Mode != "nft-temporary-drop" {
 		return errors.New("faketcp requires startup_guard.mode nft-temporary-drop so the UDP and TCP wire ports remain fail-closed until the resident runtime is healthy")

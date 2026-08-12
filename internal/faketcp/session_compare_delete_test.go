@@ -477,8 +477,8 @@ func TestMarshalFakeTCPSessionClaimExactABI(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(request) != 104 {
-		t.Fatalf("claim request size=%d, want 104", len(request))
+	if len(request) != 112 {
+		t.Fatalf("claim request size=%d, want 112", len(request))
 	}
 	var decodedKey abi.FakeTCPSessionKey
 	var decodedValue abi.FakeTCPSessionValue

@@ -99,6 +99,7 @@ func routedFlow(route EngineRoute) abi.FakeTCPSessionKey {
 	flow := testFlow(route.LocalPort)
 	flow.Generation = route.Generation
 	flow.UnderlayIndex = route.UnderlayIndex
+	flow.WGID = route.WGID
 	return flow
 }
 
@@ -170,6 +171,82 @@ func TestEngineRouterKeepsEqualAndDifferentPoliciesIndependent(t *testing.T) {
 			t.Fatal("different per-WG policies were not retained")
 		}
 	})
+}
+
+func TestNewEngineRouterFromPlansBuildsExactPerWGEngines(t *testing.T) {
+	domain, err := NewRuntimeDomain(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plans := make([]WGEnginePlan, 0, 2)
+	for index, wgID := range []uint32{7, 9} {
+		options := runtimeDomainTestOptions(t)
+		options.Store = newFakeSessionStore()
+		plans = append(plans, WGEnginePlan{
+			WGID:    wgID,
+			Options: options,
+			Routes: []EngineRoute{{
+				Generation: 1, UnderlayIndex: 2, LocalPort: uint16(31001 + index),
+				WGID: wgID, FWMark: 0xa1230000 + wgID, Action: abi.ActionRewrite,
+			}},
+		})
+	}
+	router, err := NewEngineRouterFromPlans(domain, plans)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := router.WGIDs(); !slices.Equal(got, []uint32{7, 9}) {
+		t.Fatalf("WGID order=%v", got)
+	}
+	first, firstOK := router.Engine(7)
+	second, secondOK := router.Engine(9)
+	if !firstOK || !secondOK || first == nil || second == nil || first == second ||
+		first.Identity() != domain.Identity() || second.Identity() != domain.Identity() {
+		t.Fatalf("planned engines first=%p/%t second=%p/%t", first, firstOK, second, secondOK)
+	}
+	got := router.WGIDs()
+	got[0] = 99
+	if slices.Equal(router.WGIDs(), got) {
+		t.Fatal("router exposed its mutable WGID order")
+	}
+}
+
+func TestEngineRouterDispatchesEqualNetworkTupleBySessionWGID(t *testing.T) {
+	domain, bindings, routes, engines, _, _ := routerTestParts(t, []uint32{7, 9}, nil)
+	routes[1].LocalPort = routes[0].LocalPort
+	router, err := NewEngineRouter(domain, bindings, routes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base := routedFlow(routes[0])
+	for _, wgID := range []uint32{7, 9} {
+		flow := base
+		flow.WGID = wgID
+		selection, err := router.selectEngine(abi.FakeTCPEvent{
+			Key: flow, WGID: wgID, FWMark: 0xa1230000 + wgID,
+			Type: abi.FakeTCPEventNeedHandshake,
+		})
+		if err != nil || selection.engine != engines[wgID] || selection.wgID != wgID {
+			t.Fatalf("WGID %d selection=%#v err=%v", wgID, selection, err)
+		}
+	}
+}
+
+func TestSingleEngineDispatcherRejectsNonCanonicalWGID(t *testing.T) {
+	engine, _ := testEngine(t, nil)
+	dispatcher := &singleEngineDispatcher{engine: engine}
+	flow := testFlow(31001)
+	if selection, err := dispatcher.selectEngine(abi.FakeTCPEvent{
+		Key: flow, WGID: flow.WGID + 1,
+	}); err == nil || selection.engine != nil {
+		t.Fatalf("mismatched event selection=%#v err=%v", selection, err)
+	}
+	selection, err := dispatcher.selectEngine(abi.FakeTCPEvent{
+		Key: flow, WGID: flow.WGID,
+	})
+	if err != nil || selection.engine != engine || selection.wgID != flow.WGID {
+		t.Fatalf("canonical event selection=%#v err=%v", selection, err)
+	}
 }
 
 func TestEngineRouterRejectsAmbiguousConfiguration(t *testing.T) {
@@ -310,7 +387,11 @@ func TestRoutedControllerRejectsBeforeEngineStoreOrBackend(t *testing.T) {
 			flow.LocalPort = 39999
 			return flow
 		}(), wgID: 7, mark: route.FWMark},
-		{name: "wrong WGID", flow: baseFlow, wgID: 9, mark: route.FWMark},
+		{name: "wrong WGID", flow: func() abi.FakeTCPSessionKey {
+			flow := baseFlow
+			flow.WGID = 9
+			return flow
+		}(), wgID: 9, mark: route.FWMark},
 		{name: "wrong mark", flow: baseFlow, wgID: 7, mark: route.FWMark + 1},
 	}
 	for index, test := range tests {
@@ -393,17 +474,19 @@ func TestRoutedWrongWGCloseAndPendingDoNotLookup(t *testing.T) {
 	store := fixture.stores[7]
 	state := store.values[flow]
 	lookups, deletes, operations := store.lookups, store.deleteAttempts, len(fixture.backend.operations)
+	wrongWGFlow := flow
+	wrongWGFlow.WGID = 9
 
 	if actions, err := fixture.controller.HandleSample(
 		context.Background(),
 		routedNeedHandshakeSample(
-			t, fixture.domain.Identity(), flow, 9, fixture.routes[7].FWMark, 2,
+			t, fixture.domain.Identity(), wrongWGFlow, 9, fixture.routes[7].FWMark, 2,
 		),
 	); len(actions) != 0 || !errors.Is(err, ErrEngineRouteRejected) {
 		t.Fatalf("wrong-WG pending actions=%#v err=%v", actions, err)
 	}
-	closeEvent := closeValidationEvent(flow, state, FlagRST|FlagACK, 9, fixture.domain.Identity())
-	closePacket := buildIPv4TCPControl(flow, state, FlagRST|FlagACK)
+	closeEvent := closeValidationEvent(wrongWGFlow, state, FlagRST|FlagACK, 9, fixture.domain.Identity())
+	closePacket := buildIPv4TCPControl(wrongWGFlow, state, FlagRST|FlagACK)
 	if actions, err := fixture.controller.HandleSample(
 		context.Background(), testEventSample(closeEvent, closePacket, false),
 	); len(actions) != 0 || !errors.Is(err, ErrEngineRouteRejected) {
@@ -462,8 +545,10 @@ func TestEngineRouterRejectsWrongActionProvenanceBeforeBackend(t *testing.T) {
 	); err != nil {
 		t.Fatal(err)
 	}
+	wrongOwnerFlow := wrongFlow
+	wrongOwnerFlow.WGID = 9
 	if _, err := fixture.engines[9].outbound(
-		wrongFlow,
+		wrongOwnerFlow,
 		PendingPacket{Data: []byte{1}, WGID: 9, FWMark: fixture.routes[9].FWMark},
 		false,
 	); err != nil {
