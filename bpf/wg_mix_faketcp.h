@@ -3206,7 +3206,10 @@ static __always_inline int faketcp_materialize_tcp_checksum(
 	}
 	if (processed != payload_len)
 		return -1;
-	tcp->check = bpf_htons(fold_csum(sum));
+	/* bpf_csum_diff returns a checksum-native __wsum. fold_csum therefore
+	 * already has the __be16 representation expected by the wire field; an
+	 * extra bpf_htons would byte-swap every materialized TCP checksum. */
+	tcp->check = fold_csum(sum);
 	if (tcp->check == 0)
 		tcp->check = bpf_htons(0xffff);
 	return 0;
@@ -4298,7 +4301,10 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 		.protocol = IPPROTO_UDP,
 		.length = udp->len,
 	};
-	sum = (~bpf_ntohs(old_tcp->check)) & 0xffff;
+	/* Keep the complete TCP checksum seed and every bpf_csum_diff result in
+	 * checksum-native order. Converting the seed to host order would make it
+	 * incompatible with the helper's __wsum accumulator. */
+	sum = (~old_tcp->check) & 0xffff;
 	old_tcp->check = 0;
 	sum = bpf_csum_diff((__be32 *)old_pseudo, sizeof(*old_pseudo),
 			     (__be32 *)new_pseudo, sizeof(*new_pseudo), sum);
@@ -4313,7 +4319,7 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 		if (sum < 0)
 			return XDP_DROP;
 	}
-	udp->check = bpf_htons(fold_csum(sum));
+	udp->check = fold_csum(sum);
 	if (udp->check == 0)
 		udp->check = bpf_htons(0xffff);
 
@@ -4349,7 +4355,7 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	sum = bpf_csum_diff(0, 0, (__be32 *)new_ip, sizeof(*new_ip), 0);
 	if (sum < 0)
 		return XDP_DROP;
-	new_ip->check = bpf_htons(fold_csum(sum));
+	new_ip->check = fold_csum(sum);
 #ifdef WG_MIX_FAKETCP_LEGACY_515
 	if (faketcp_legacy_515_xdp_store_ipv4(xdp, l3->l3_off, new_ip) < 0 ||
 	    bpf_xdp_adjust_tail(xdp, -FAKETCP_HEADER_DELTA) < 0)

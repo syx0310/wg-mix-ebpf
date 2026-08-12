@@ -3,6 +3,7 @@ package dataplane
 import (
 	"bytes"
 	"encoding/binary"
+	"math/bits"
 	"os"
 	"strconv"
 	"strings"
@@ -77,6 +78,31 @@ func testTransportChecksum(protocol byte, header, payload []byte) uint16 {
 		return 0xffff
 	}
 	return checksum
+}
+
+func TestFakeTCPChecksumNativeBPFELWireBytes(t *testing.T) {
+	// This independent two-byte fixture has the Internet checksum 0x277f,
+	// matching the checksum value observed in the B82 packet oracle. A BPFEL
+	// __sum16 scalar carries that network-order word as 0x7f27 so a direct
+	// native store emits the correct wire bytes 27 7f.
+	const wantChecksum uint16 = 0x277f
+	if got := internetChecksum([]byte{0xd8, 0x80}); got != wantChecksum {
+		t.Fatalf("fixture checksum = %#04x, want %#04x", got, wantChecksum)
+	}
+
+	checksumNative := bits.ReverseBytes16(wantChecksum)
+	stored := make([]byte, 2)
+	binary.LittleEndian.PutUint16(stored, checksumNative)
+	if want := []byte{0x27, 0x7f}; !bytes.Equal(stored, want) {
+		t.Fatalf("checksum-native BPFEL store = % x, want wire bytes % x", stored, want)
+	}
+
+	// Applying bpf_htons to an already checksum-native value is precisely the
+	// former bug: the native scalar becomes 0x277f and the wire sees 7f 27.
+	binary.LittleEndian.PutUint16(stored, bits.ReverseBytes16(checksumNative))
+	if wrong := []byte{0x7f, 0x27}; !bytes.Equal(stored, wrong) {
+		t.Fatalf("double-swapped BPFEL store = % x, want known bad bytes % x", stored, wrong)
+	}
 }
 
 func alignedRotationHead(head []byte) []byte {
@@ -318,6 +344,10 @@ func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T
 	if strings.Contains(materialize, "old_udp") {
 		t.Fatal("full TCP checksum materialization must not consume the old UDP checksum or seed")
 	}
+	if !strings.Contains(materialize, "tcp->check = fold_csum(sum)") ||
+		strings.Contains(materialize, "tcp->check = bpf_htons(fold_csum(sum))") {
+		t.Fatal("bpf_csum_diff/fold_csum output must be stored as checksum-native __be16 without a second byte swap")
+	}
 
 	encoder := text[encoderStart:continuationStart]
 	normalize := strings.Index(encoder, "bpf_skb_change_tail(skb, skb->len + FAKETCP_HEADER_DELTA, 0)")
@@ -336,6 +366,69 @@ func TestFakeTCPChecksumNormalizationMTUAndGSODispatchStayHardGated(t *testing.T
 		if !strings.Contains(encoder, want) {
 			t.Fatalf("bounded checksum read precondition missing %q", want)
 		}
+	}
+}
+
+func TestFakeTCPIngressChecksumInverseStaysChecksumNative(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	xdp := sourceSection(t, text,
+		"faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)",
+		"SEC(\"xdp\")")
+
+	for _, want := range []string{
+		"sum = (~old_tcp->check) & 0xffff",
+		"udp->check = fold_csum(sum)",
+		"new_ip->check = fold_csum(sum)",
+	} {
+		if !strings.Contains(xdp, want) {
+			t.Fatalf("checksum-native FakeTCP ingress inverse missing %q", want)
+		}
+	}
+	for _, forbidden := range []string{
+		"(~bpf_ntohs(old_tcp->check))",
+		"udp->check = bpf_htons(fold_csum(sum))",
+		"new_ip->check = bpf_htons(fold_csum(sum))",
+	} {
+		if strings.Contains(xdp, forbidden) {
+			t.Fatalf("FakeTCP ingress inverse byte-swaps checksum-native state through %q", forbidden)
+		}
+	}
+}
+
+func TestFakeTCPFoldedChecksumWriteSitesStayChecksumNative(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+
+	for _, write := range []string{
+		"tcp->check = fold_csum(sum)",
+		"udp->check = fold_csum(sum)",
+		"new_ip->check = fold_csum(sum)",
+	} {
+		if got := strings.Count(text, write); got != 1 {
+			t.Fatalf("FakeTCP checksum-native write %q count = %d, want 1", write, got)
+		}
+	}
+	if got := strings.Count(text, "= fold_csum(sum)"); got != 3 {
+		t.Fatalf("FakeTCP folded checksum write count = %d, want 3", got)
+	}
+	if strings.Contains(text, "= bpf_htons(fold_csum(sum))") {
+		t.Fatal("FakeTCP folded checksum output regained a second byte-order conversion")
+	}
+
+	control := sourceSection(t, text,
+		"faketcp_ipv4_tcp_control_checksums_valid(const struct iphdr *iph",
+		"#ifdef WG_MIX_FAKETCP_LEGACY_515")
+	if strings.Count(control, "fold_csum(sum)") != 2 ||
+		!strings.Contains(control, "fold_csum(sum) != 0") ||
+		!strings.Contains(control, "fold_csum(sum) == 0") {
+		t.Fatal("control checksum validation must remain a residual-zero check, not a wire-field writer")
 	}
 }
 
