@@ -59,6 +59,10 @@ func LoadExperimentalFakeTCPObjectTestIdentity(context.Context, string) (ObjectI
 	return ObjectIdentity{}, ErrUnsupported
 }
 
+func LoadLegacy515FakeTCPObjectTestIdentity(context.Context, string) (ObjectIdentity, error) {
+	return ObjectIdentity{}, ErrUnsupported
+}
+
 func ProbeFakeTCPKernelDependency() error {
 	return ErrUnsupported
 }

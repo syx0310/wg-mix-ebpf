@@ -117,6 +117,7 @@ runs the built binary's production verifier sweep:
 
 ```text
 wg-mix-ebpf bpf-load-test --faketcp --object <modern-object> --json
+wg-mix-ebpf bpf-load-test --faketcp-legacy-515 --object <legacy-object> --json
 ```
 
 The command loads every manifest-approved FakeTCP program independently, so a

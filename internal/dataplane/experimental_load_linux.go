@@ -48,6 +48,45 @@ func LoadExperimentalFakeTCPObjectTestIdentity(
 	return identity, nil
 }
 
+// LoadLegacy515FakeTCPObjectTestIdentity verifier-loads every program in an
+// explicitly supplied legacy-5.15 FakeTCP object. Unlike the modern path it
+// validates the kprobe bridge manifest and deliberately does not probe the
+// modern kfunc dependency. It never attaches, pins, or seeds the collection.
+func LoadLegacy515FakeTCPObjectTestIdentity(
+	ctx context.Context,
+	objectPath string,
+) (ObjectIdentity, error) {
+	if ctx == nil {
+		return ObjectIdentity{}, errors.New("legacy-5.15 FakeTCP BPF load: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return ObjectIdentity{}, err
+	}
+	if strings.TrimSpace(objectPath) == "" {
+		return ObjectIdentity{}, fmt.Errorf("legacy-5.15 FakeTCP BPF load requires an explicit non-empty object path")
+	}
+	spec, identity, err := loadFakeTCPLegacy515CollectionSpecFromResolvedPath(objectPath)
+	if err != nil {
+		return ObjectIdentity{}, err
+	}
+	if err := ctx.Err(); err != nil {
+		return ObjectIdentity{}, err
+	}
+	dependencies := liveExperimentalCollectionAcquisitionDependencies()
+	dependencies.probeKernelDependency = func() error { return nil }
+	if err := verifierLoadEveryFakeTCPProgram(
+		ctx,
+		spec,
+		identity.Source,
+		"legacy-5.15 FakeTCP",
+		validateLegacy515ExtensionManifest,
+		dependencies,
+	); err != nil {
+		return ObjectIdentity{}, err
+	}
+	return identity, nil
+}
+
 // verifierLoadEveryExperimentalFakeTCPProgram loads each manifest-approved
 // program in an otherwise complete isolated collection. A rejected program
 // doesn't hide verifier errors in later programs, so one diagnostic run
@@ -59,23 +98,44 @@ func verifierLoadEveryExperimentalFakeTCPProgram(
 	source string,
 	dependencies experimentalCollectionAcquisitionDependencies,
 ) error {
+	return verifierLoadEveryFakeTCPProgram(
+		ctx,
+		spec,
+		source,
+		"experimental FakeTCP",
+		validateExperimentalExtensionManifest,
+		dependencies,
+	)
+}
+
+func verifierLoadEveryFakeTCPProgram(
+	ctx context.Context,
+	spec *ebpf.CollectionSpec,
+	source string,
+	kind string,
+	validateManifest func(*ebpf.CollectionSpec) error,
+	dependencies experimentalCollectionAcquisitionDependencies,
+) error {
 	if ctx == nil {
-		return errors.New("verifier-load experimental FakeTCP BPF collection: context is nil")
+		return fmt.Errorf("verifier-load %s BPF collection: context is nil", kind)
 	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := validateExperimentalExtensionManifest(spec); err != nil {
-		return fmt.Errorf("validate experimental FakeTCP BPF object %s: %w", source, err)
+	if validateManifest == nil {
+		return fmt.Errorf("validate %s BPF object %s: no manifest validator", kind, source)
+	}
+	if err := validateManifest(spec); err != nil {
+		return fmt.Errorf("validate %s BPF object %s: %w", kind, source, err)
 	}
 	if err := validateExperimentalCollectionAcquisitionDependencies(dependencies); err != nil {
 		return err
 	}
 	if err := dependencies.probeKernelDependency(); err != nil {
-		return fmt.Errorf("probe experimental FakeTCP kernel dependency: %w", err)
+		return fmt.Errorf("probe %s kernel dependency: %w", kind, err)
 	}
 	if err := dependencies.removeMemlock(); err != nil {
-		return fmt.Errorf("remove experimental FakeTCP memlock limit: %w", err)
+		return fmt.Errorf("remove %s memlock limit: %w", kind, err)
 	}
 
 	names := make([]string, 0, len(spec.Programs))
@@ -98,7 +158,8 @@ func verifierLoadEveryExperimentalFakeTCPProgram(
 		collection, err := dependencies.newCollection(isolated)
 		if err != nil {
 			failure := fmt.Errorf(
-				"verifier-load experimental FakeTCP program %q from %s: %w",
+				"verifier-load %s program %q from %s: %w",
+				kind,
 				name,
 				source,
 				err,
@@ -114,7 +175,8 @@ func verifierLoadEveryExperimentalFakeTCPProgram(
 		}
 		if collection == nil {
 			failures = append(failures, fmt.Errorf(
-				"verifier-load experimental FakeTCP program %q from %s: loader returned nil collection",
+				"verifier-load %s program %q from %s: loader returned nil collection",
+				kind,
 				name,
 				source,
 			))
@@ -122,7 +184,8 @@ func verifierLoadEveryExperimentalFakeTCPProgram(
 		}
 		if err := closeUnownedExperimentalCollection(collection, source, dependencies); err != nil {
 			failures = append(failures, fmt.Errorf(
-				"verifier-load experimental FakeTCP program %q: %w",
+				"verifier-load %s program %q: %w",
+				kind,
 				name,
 				err,
 			))

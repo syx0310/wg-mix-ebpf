@@ -724,6 +724,7 @@ func runBPFLoadTest(ctx context.Context, args []string, stdout io.Writer) error 
 		stdout,
 		dataplane.LoadObjectTestIdentity,
 		dataplane.LoadExperimentalFakeTCPObjectTestIdentity,
+		dataplane.LoadLegacy515FakeTCPObjectTestIdentity,
 	)
 }
 
@@ -735,13 +736,16 @@ func runBPFLoadTestWithLoaders(
 	stdout io.Writer,
 	loadBaseline bpfObjectIdentityLoader,
 	loadExperimental bpfObjectIdentityLoader,
+	loadLegacy515 bpfObjectIdentityLoader,
 ) error {
 	fs := flag.NewFlagSet("bpf-load-test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	objectPath := fs.String("object", "", "path to TC/eBPF object")
 	var fakeTCP bool
+	var fakeTCPLegacy515 bool
 	fs.BoolVar(&fakeTCP, "faketcp", false, "verifier-load a separate FakeTCP object")
 	fs.BoolVar(&fakeTCP, "experimental-faketcp", false, "deprecated alias for --faketcp")
+	fs.BoolVar(&fakeTCPLegacy515, "faketcp-legacy-515", false, "verifier-load a legacy-5.15 FakeTCP object")
 	jsonOut := fs.Bool("json", false, "print load and artifact identity as JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -749,8 +753,11 @@ func runBPFLoadTestWithLoaders(
 	if fs.NArg() != 0 {
 		return fmt.Errorf("bpf-load-test does not accept positional arguments")
 	}
-	if fakeTCP && strings.TrimSpace(*objectPath) == "" {
-		return fmt.Errorf("--faketcp requires an explicit non-empty --object path")
+	if fakeTCP && fakeTCPLegacy515 {
+		return fmt.Errorf("--faketcp and --faketcp-legacy-515 are mutually exclusive")
+	}
+	if (fakeTCP || fakeTCPLegacy515) && strings.TrimSpace(*objectPath) == "" {
+		return fmt.Errorf("FakeTCP verifier mode requires an explicit non-empty --object path")
 	}
 
 	kind := ""
@@ -758,6 +765,9 @@ func runBPFLoadTestWithLoaders(
 	if fakeTCP {
 		kind = dataplane.FakeTCPObjectKind
 		loader = loadExperimental
+	} else if fakeTCPLegacy515 {
+		kind = dataplane.FakeTCPLegacy515ObjectKind
+		loader = loadLegacy515
 	}
 	identity, err := loader(ctx, *objectPath)
 	if err != nil {
@@ -776,7 +786,7 @@ func runBPFLoadTestWithLoaders(
 			Object: identity,
 		})
 	}
-	if fakeTCP {
+	if fakeTCP || fakeTCPLegacy515 {
 		fmt.Fprintf(
 			stdout,
 			"FakeTCP BPF object verifier-loaded successfully: kind=%s source=%s sha256=%s\n",
@@ -1092,8 +1102,8 @@ Commands:
   guard-plan  print nft startup guard script
   guard-apply apply nft startup guard
   guard-cleanup remove nft startup guard table
-  bpf-load-test load the baseline BPF object; FakeTCP requires --faketcp and
-                an explicit --object path (legacy --experimental-faketcp is accepted)
+  bpf-load-test load the baseline BPF object; modern FakeTCP uses --faketcp,
+                legacy-5.15 uses --faketcp-legacy-515, and both require --object
   features    print raw local feature probe JSON
   version     print version; use --json for source/object/ABI identity
 

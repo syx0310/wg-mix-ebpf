@@ -563,6 +563,7 @@ else
 fi
 
 # The production verifier-only command loads every manifest-approved modern
+# or legacy-5.15
 # FakeTCP program independently and joins every failure.  Run it only after
 # the kfunc module generation/lease has been established, but before creating
 # endpoint state or mutating any network namespace, WireGuard device, link,
@@ -570,11 +571,13 @@ fi
 # preserves the complete stdout, stderr, argv, and exit status; set -e then
 # returns failure to root-cell, whose failure handler retains and prints the
 # complete evidence set for explicit review and restore.
-if [[ "${CHECKSUM_BACKEND}" == kfunc ]]; then
-  log_command faketcp-verifier-sweep /usr/bin/timeout --signal=TERM \
-    --kill-after=10s 3m "${BIN}" bpf-load-test --faketcp \
-    --object "${SELECTED_OBJECT}" --json
+verifier_mode='--faketcp'
+if [[ "${CHECKSUM_BACKEND}" == kprobe ]]; then
+  verifier_mode='--faketcp-legacy-515'
 fi
+log_command faketcp-verifier-sweep /usr/bin/timeout --signal=TERM \
+  --kill-after=10s 3m "${BIN}" bpf-load-test "${verifier_mode}" \
+  --object "${SELECTED_OBJECT}" --json
 
 mkdir --mode=0700 -- "${ENDPOINT_A}" "${ENDPOINT_B}" "${RUN_A}" "${RUN_B}" \
   "${ENDPOINT_A}/var" "${ENDPOINT_B}/var" "${RUN_A}/runtime" "${RUN_B}/runtime"

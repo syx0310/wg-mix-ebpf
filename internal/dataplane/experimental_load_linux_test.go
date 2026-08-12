@@ -661,6 +661,16 @@ func TestExperimentalVerifierLoaderRejectsEmptyPathBeforeEnvironmentFallback(t *
 	}
 }
 
+func TestLegacy515VerifierLoaderRejectsEmptyPathBeforeEnvironmentFallback(t *testing.T) {
+	t.Setenv(EnvFakeTCPLegacy515ObjectPath, "/must/not/be/used.o")
+	for _, path := range []string{"", "\t\n"} {
+		_, err := LoadLegacy515FakeTCPObjectTestIdentity(t.Context(), path)
+		if err == nil || !strings.Contains(err.Error(), "explicit non-empty object path") {
+			t.Fatalf("path=%q error=%v", path, err)
+		}
+	}
+}
+
 func TestExperimentalVerifierLoaderSourceHasNoAttachPinOrMapMutationCalls(t *testing.T) {
 	newCollectionCalls := 0
 	for _, source := range []string{

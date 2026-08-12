@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -106,7 +107,7 @@ func TestBPFLoadTestDefaultsToBaselineLoaderAndOutput(t *testing.T) {
 
 	var stdout bytes.Buffer
 	if err := runBPFLoadTestWithLoaders(
-		t.Context(), nil, &stdout, baseline, experimental,
+		t.Context(), nil, &stdout, baseline, experimental, experimental,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -120,7 +121,7 @@ func TestBPFLoadTestDefaultsToBaselineLoaderAndOutput(t *testing.T) {
 
 	stdout.Reset()
 	if err := runBPFLoadTestWithLoaders(
-		t.Context(), []string{"--json"}, &stdout, baseline, experimental,
+		t.Context(), []string{"--json"}, &stdout, baseline, experimental, experimental,
 	); err != nil {
 		t.Fatal(err)
 	}
@@ -147,9 +148,10 @@ func TestBPFLoadTestFakeTCPFlagsRequireExplicitObject(t *testing.T) {
 		{"--faketcp", "--object="},
 		{"--faketcp", "--object", "   "},
 		{"--experimental-faketcp"},
+		{"--faketcp-legacy-515"},
 	} {
 		var stdout bytes.Buffer
-		err := runBPFLoadTestWithLoaders(t.Context(), args, &stdout, loader, loader)
+		err := runBPFLoadTestWithLoaders(t.Context(), args, &stdout, loader, loader, loader)
 		if err == nil || !strings.Contains(err.Error(), "requires an explicit non-empty --object path") {
 			t.Fatalf("args=%q error=%v", args, err)
 		}
@@ -189,6 +191,7 @@ func TestBPFLoadTestFakeTCPDispatchIdentityAndDeprecatedAlias(t *testing.T) {
 		&textOut,
 		baseline,
 		experimental,
+		experimental,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -210,6 +213,7 @@ func TestBPFLoadTestFakeTCPDispatchIdentityAndDeprecatedAlias(t *testing.T) {
 		&jsonOut,
 		baseline,
 		experimental,
+		experimental,
 	)
 	if err != nil {
 		t.Fatal(err)
@@ -230,6 +234,69 @@ func TestBPFLoadTestFakeTCPDispatchIdentityAndDeprecatedAlias(t *testing.T) {
 	}
 }
 
+func TestBPFLoadTestLegacy515DispatchesIndependentLoader(t *testing.T) {
+	const objectPath = "/reviewed/wg_mix_faketcp_legacy_515.o"
+	identity := dataplane.ObjectIdentity{
+		Source: objectPath,
+		SHA256: strings.Repeat("c", 64),
+	}
+	unexpected := func(context.Context, string) (dataplane.ObjectIdentity, error) {
+		return dataplane.ObjectIdentity{}, errors.New("unexpected loader")
+	}
+	legacyCalls := 0
+	legacy := func(_ context.Context, gotPath string) (dataplane.ObjectIdentity, error) {
+		legacyCalls++
+		if gotPath != objectPath {
+			t.Fatalf("legacy object path = %q, want %q", gotPath, objectPath)
+		}
+		return identity, nil
+	}
+
+	var stdout bytes.Buffer
+	err := runBPFLoadTestWithLoaders(
+		t.Context(),
+		[]string{"--faketcp-legacy-515", "--object", objectPath, "--json"},
+		&stdout,
+		unexpected,
+		unexpected,
+		legacy,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got struct {
+		Status string                   `json:"status"`
+		Kind   string                   `json:"kind"`
+		Object dataplane.ObjectIdentity `json:"object"`
+	}
+	if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+		t.Fatalf("decode output: %v\n%s", err, stdout.String())
+	}
+	if got.Status != "loaded" || got.Kind != dataplane.FakeTCPLegacy515ObjectKind || got.Object != identity {
+		t.Fatalf("legacy JSON identity = %#v", got)
+	}
+	if legacyCalls != 1 {
+		t.Fatalf("legacy loader calls = %d, want 1", legacyCalls)
+	}
+}
+
+func TestBPFLoadTestRejectsConflictingFakeTCPModes(t *testing.T) {
+	loader := func(context.Context, string) (dataplane.ObjectIdentity, error) {
+		return dataplane.ObjectIdentity{}, errors.New("loader must not run")
+	}
+	err := runBPFLoadTestWithLoaders(
+		t.Context(),
+		[]string{"--faketcp", "--faketcp-legacy-515", "--object", "/object.o"},
+		io.Discard,
+		loader,
+		loader,
+		loader,
+	)
+	if err == nil || !strings.Contains(err.Error(), "mutually exclusive") {
+		t.Fatalf("conflicting mode error = %v", err)
+	}
+}
+
 func TestBPFLoadTestExplicitObjectWithoutOptInRemainsBaseline(t *testing.T) {
 	const objectPath = "/candidate/object.o"
 	baselineCalls := 0
@@ -247,7 +314,7 @@ func TestBPFLoadTestExplicitObjectWithoutOptInRemainsBaseline(t *testing.T) {
 	}
 	var stdout bytes.Buffer
 	if err := runBPFLoadTestWithLoaders(
-		t.Context(), []string{"--object", objectPath}, &stdout, baseline, experimental,
+		t.Context(), []string{"--object", objectPath}, &stdout, baseline, experimental, experimental,
 	); err != nil {
 		t.Fatal(err)
 	}

@@ -26,6 +26,7 @@ const (
 	EnvFakeTCPObjectPath          = "WG_MIX_EBPF_FAKETCP_OBJECT"
 	EnvFakeTCPLegacy515ObjectPath = "WG_MIX_EBPF_FAKETCP_LEGACY_515_OBJECT"
 	FakeTCPObjectKind             = "faketcp"
+	FakeTCPLegacy515ObjectKind    = "faketcp-legacy-515"
 	// ExperimentalFakeTCPObjectKind is a deprecated source-compatibility alias.
 	ExperimentalFakeTCPObjectKind = FakeTCPObjectKind
 	DefaultPinPath                = "/sys/fs/bpf/wg-mix-ebpf"
