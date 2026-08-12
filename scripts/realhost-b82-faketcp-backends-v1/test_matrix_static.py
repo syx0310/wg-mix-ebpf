@@ -128,6 +128,14 @@ class StaticMatrixTest(unittest.TestCase):
         for required in (
             'for ((index=0; index<WG_COUNT; index++))',
             'link add "wg${index}" type wireguard',
+            "log_command_private_key_stdin()",
+            "private-key /dev/stdin",
+            "stdin=run-owned-private-key-fd",
+            'exec {key_fd}<"${key_path}"',
+            '<&"${key_fd}"',
+            'exec {key_fd}<&-',
+            'log_command "key-remove-a-${index}" /bin/rm -- "${key_a}"',
+            'log_command "key-remove-b-${index}" /bin/rm -- "${key_b}"',
             'ping -I "wg${index}"',
             "iperf3 -c",
             "same-tuple-router-test",
@@ -139,6 +147,13 @@ class StaticMatrixTest(unittest.TestCase):
             "kill -KILL",
         ):
             self.assertIn(required, self.netns)
+        self.assertEqual(self.netns.count("private-key /dev/stdin"), 2)
+        self.assertNotIn('private-key "${key_', self.netns)
+        self.assertNotIn("private-key ${key_", self.netns)
+        self.assertNotRegex(
+            self.netns,
+            re.compile(r"printf.*(?:key_a|key_b|key_path).*operations\\.log"),
+        )
 
     def test_multi_wg_quotas_are_explicit_and_below_shared_limits(self) -> None:
         shell_names = {

@@ -62,6 +62,13 @@ unsafe defaults: session 2048, half-open 256, source ledger 512, pending flows
 shared implementation ceiling. Each WG gets independent ping and short iperf
 traffic, followed by simultaneous per-WG pings.
 
+WireGuard private keys remain run-owned mode-0600 files only long enough to
+derive the public keys and configure their matching interface. The driver opens
+each private key on a held file descriptor, passes it to `wg set` through
+`private-key /dev/stdin`, records only that redacted stdin contract, and removes
+the exact key file immediately after the matching command succeeds. Neither the
+private-key value nor its backing path enters the child command argv.
+
 On a Linux 5.15 boot, TCX cells are recorded as `SKIP_UNSUPPORTED` before the
 cell runner is invoked. Explicit kfunc cells are recorded as
 `REJECT_UNSUPPORTED`; classic TC + kprobe + legacy artifact remains the

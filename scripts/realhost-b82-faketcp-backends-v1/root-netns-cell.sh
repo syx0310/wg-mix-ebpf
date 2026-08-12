@@ -167,6 +167,33 @@ log_command() {
   return "${rc}"
 }
 
+log_command_private_key_stdin() {
+  local phase="$1" key_path="$2"; shift 2
+  local out="${EVIDENCE}/${phase}.stdout.log" err="${EVIDENCE}/${phase}.stderr.log"
+  local rc key_fd=''
+  {
+    printf 'timestamp=%s event=start phase=%s argv=' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${phase}"
+    printf '%q ' "$@"
+    printf '\nstdin=run-owned-private-key-fd\nstdout=%s\nstderr=%s\n' "${out}" "${err}"
+  } >>"${EVIDENCE}/operations.log"
+  : >"${out}"
+  : >"${err}"
+  if [[ ! -f "${key_path}" || -L "${key_path}" ||
+    "$(stat -Lc '%u:%g:%a:%h' -- "${key_path}")" != '0:0:600:1' ]]; then
+    printf 'private key input is not an exact root-owned regular file: %s\n' \
+      "${key_path}" >>"${err}"
+    rc=79
+  elif { exec {key_fd}<"${key_path}"; } 2>>"${err}"; then
+    if "$@" <&"${key_fd}" >"${out}" 2>>"${err}"; then rc=0; else rc=$?; fi
+    exec {key_fd}<&-
+  else
+    rc=$?
+  fi
+  printf 'timestamp=%s event=finish phase=%s rc=%s\n' \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${phase}" "${rc}" >>"${EVIDENCE}/operations.log"
+  return "${rc}"
+}
+
 module_name() { [[ "${CHECKSUM_BACKEND}" == kfunc ]] && printf '%s' "${KFUNC_MODULE}" || printf '%s' "${KPROBE_MODULE}"; }
 module_object() {
   printf '%s' "${MODULE_OBJECT}"
@@ -438,9 +465,10 @@ for ((index=0; index<WG_COUNT; index++)); do
   third=$((10 + index)); tunnel_a="10.82.${third}.1"; tunnel_b="10.82.${third}.2"
   log_command "wg-add-a-${index}" ip -n "${NSA}" link add "wg${index}" type wireguard
   log_command "wg-add-b-${index}" ip -n "${NSB}" link add "wg${index}" type wireguard
-  log_command "wg-set-a-${index}" ip netns exec "${NSA}" wg set "wg${index}" private-key "${key_a}" listen-port "${port_a}" fwmark "${mark_a}" peer "${pub_b}" allowed-ips "${tunnel_b}/32" endpoint "198.19.82.1:${port_b}" persistent-keepalive 1
-  log_command "wg-set-b-${index}" ip netns exec "${NSB}" wg set "wg${index}" private-key "${key_b}" listen-port "${port_b}" fwmark "${mark_b}" peer "${pub_a}" allowed-ips "${tunnel_a}/32" endpoint "198.18.82.1:${port_a}" persistent-keepalive 1
-  log_command "key-remove-${index}" /bin/rm -- "${key_a}" "${key_b}"
+  log_command_private_key_stdin "wg-set-a-${index}" "${key_a}" ip netns exec "${NSA}" wg set "wg${index}" private-key /dev/stdin listen-port "${port_a}" fwmark "${mark_a}" peer "${pub_b}" allowed-ips "${tunnel_b}/32" endpoint "198.19.82.1:${port_b}" persistent-keepalive 1
+  log_command "key-remove-a-${index}" /bin/rm -- "${key_a}"
+  log_command_private_key_stdin "wg-set-b-${index}" "${key_b}" ip netns exec "${NSB}" wg set "wg${index}" private-key /dev/stdin listen-port "${port_b}" fwmark "${mark_b}" peer "${pub_a}" allowed-ips "${tunnel_a}/32" endpoint "198.18.82.1:${port_a}" persistent-keepalive 1
+  log_command "key-remove-b-${index}" /bin/rm -- "${key_b}"
   log_command "wg-addr-a-${index}" ip -n "${NSA}" address add "${tunnel_a}/30" dev "wg${index}"
   log_command "wg-addr-b-${index}" ip -n "${NSB}" address add "${tunnel_b}/30" dev "wg${index}"
   log_command "wg-mtu-a-${index}" ip -n "${NSA}" link set "wg${index}" mtu 1420
