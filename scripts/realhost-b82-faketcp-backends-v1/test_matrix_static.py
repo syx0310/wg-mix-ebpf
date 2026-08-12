@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import ast
+import hashlib
 import json
 import pathlib
 import re
@@ -10,6 +11,7 @@ import shlex
 import subprocess
 import sys
 import tempfile
+import textwrap
 import unittest
 
 
@@ -130,13 +132,13 @@ class StaticMatrixTest(unittest.TestCase):
             'for ((index=0; index<WG_COUNT; index++))',
             'link add "wg${index}" type wireguard',
             "log_command_private_key_stdin()",
+            "private_key_value_to_pipe()",
             "private-key /dev/stdin",
-            "stdin=run-owned-private-key-fd",
-            'exec {key_fd}<"${key_path}"',
-            '/usr/bin/unlink -- "${key_path}"',
-            "private_key_path_unlinked=1",
-            '<&"${key_fd}"',
-            'exec {key_fd}<&-',
+            "stdin=ephemeral-private-key-pipe",
+            '(private_key_value_to_pipe "${private_key}") |',
+            '(unset private_key; "$@")',
+            'key_a="$(wg genkey)"; key_b="$(wg genkey)"',
+            'unset key_a key_b; exit "${rc}"',
             'ping -I "wg${index}"',
             "iperf3 -c",
             "same-tuple-router-test",
@@ -152,10 +154,349 @@ class StaticMatrixTest(unittest.TestCase):
         self.assertNotIn('private-key "${key_', self.netns)
         self.assertNotIn("private-key ${key_", self.netns)
         self.assertNotIn('log_command "key-remove-', self.netns)
+        self.assertNotIn('wg genkey >', self.netns)
+        self.assertNotIn('${ROOT}/key-a-', self.netns)
+        self.assertNotIn('${ROOT}/key-b-', self.netns)
         self.assertNotRegex(
             self.netns,
             re.compile(r"printf.*(?:key_a|key_b|key_path).*operations\\.log"),
         )
+
+    def test_private_key_exec_boundary_uses_anonymous_pipe(self) -> None:
+        functions = self.netns[
+            self.netns.index("private_key_value_to_pipe() {") :
+            self.netns.index("\nmodule_name() {")
+        ]
+        private_key_a = b"A" * 43 + b"="
+        private_key_b = b"B" * 43 + b"="
+
+        with tempfile.TemporaryDirectory() as raw:
+            temporary = pathlib.Path(raw)
+            evidence = temporary / "evidence"
+            evidence.mkdir()
+            old_key_a_path = temporary / "key-a-0"
+            old_key_b_path = temporary / "key-b-0"
+            capture_path = temporary / "capture.json"
+            status_path = temporary / "status"
+
+            consumer = temporary / "consumer.py"
+            consumer.write_text(
+                textwrap.dedent(
+                    """\
+                    import hashlib
+                    import json
+                    import os
+                    import pathlib
+                    import stat
+                    import sys
+
+                    source = sys.argv[sys.argv.index("private-key") + 1]
+                    with open(source, "rb") as stream:
+                        stdin_is_fifo = stat.S_ISFIFO(os.fstat(stream.fileno()).st_mode)
+                        payload = stream.read()
+                    descriptors = []
+                    for name in os.listdir("/dev/fd"):
+                        if not name.isdigit():
+                            continue
+                        try:
+                            metadata = os.fstat(int(name))
+                        except OSError:
+                            continue
+                        descriptors.append({
+                            "device": metadata.st_dev,
+                            "inode": metadata.st_ino,
+                            "regular": stat.S_ISREG(metadata.st_mode),
+                        })
+                    record = {
+                        "argv": sys.argv,
+                        "stdin_is_fifo": stdin_is_fifo,
+                        "payload_sha256": hashlib.sha256(payload).hexdigest(),
+                        "payload_size": len(payload),
+                        "descriptors": descriptors,
+                    }
+                    pathlib.Path(os.environ["CAPTURE_PATH"]).write_text(
+                        json.dumps(record, sort_keys=True), encoding="utf-8"
+                    )
+                    raise SystemExit(23)
+                    """
+                ),
+                encoding="utf-8",
+            )
+
+            harness = "\n".join(
+                (
+                    "set -Eeuo pipefail",
+                    functions,
+                    f"EVIDENCE={shlex.quote(str(evidence))}",
+                    f"key_a={shlex.quote(private_key_a.decode())}",
+                    f"key_b={shlex.quote(private_key_b.decode())}",
+                    "status=0",
+                    "if log_command_private_key_stdin wg-set-test "
+                    '"${key_a}" '
+                    f"{shlex.quote(sys.executable)} "
+                    f"{shlex.quote(str(consumer))} set wg0 private-key /dev/stdin; then",
+                    "  status=0",
+                    "else",
+                    "  status=$?",
+                    "  unset key_a key_b",
+                    "fi",
+                    f"printf '%s\\n' \"${{status}}\" >{shlex.quote(str(status_path))}",
+                )
+            )
+            completed = subprocess.run(
+                ["/bin/bash", "-c", harness],
+                text=True,
+                capture_output=True,
+                env={
+                    "PATH": f"{temporary}:/usr/bin:/bin",
+                    "LC_ALL": "C",
+                    "CAPTURE_PATH": str(capture_path),
+                    "PYTHONDONTWRITEBYTECODE": "1",
+                },
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(status_path.read_text(encoding="ascii").strip(), "23")
+            self.assertFalse(old_key_a_path.exists())
+            self.assertFalse(old_key_b_path.exists())
+            record = json.loads(capture_path.read_text(encoding="utf-8"))
+            self.assertTrue(record["stdin_is_fifo"])
+            expected_payload = private_key_a + b"\n"
+            self.assertEqual(record["payload_size"], len(expected_payload))
+            self.assertEqual(
+                record["payload_sha256"], hashlib.sha256(expected_payload).hexdigest()
+            )
+            logs = b"".join(path.read_bytes() for path in evidence.iterdir())
+            for private_key in (private_key_a, private_key_b):
+                self.assertNotIn(private_key, logs)
+                self.assertNotIn(private_key, completed.stdout.encode())
+                self.assertNotIn(private_key, completed.stderr.encode())
+
+    def test_legacy_key_restore_preflights_all_entries_before_exact_unlink(
+        self,
+    ) -> None:
+        cleanup_function = self.netns[
+            self.netns.index("remove_legacy_private_key_residue() {") :
+            self.netns.index("\nrestore_resources() {")
+        ]
+        valid_key = "C" * 43 + "=\n"
+
+        with tempfile.TemporaryDirectory() as raw:
+            temporary = pathlib.Path(raw)
+            root = temporary / "run"
+            evidence = root / "evidence"
+            evidence.mkdir(parents=True)
+
+            stat_stub = temporary / "stat"
+            stat_stub.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import os
+                    import stat
+                    import sys
+                    metadata = os.lstat(sys.argv[-1])
+                    if sys.argv[1:3] == ["-Lc", "%d"]:
+                        print(metadata.st_dev)
+                        raise SystemExit(0)
+                    kind = "regular file" if stat.S_ISREG(metadata.st_mode) else "other"
+                    print(f"0:0:{stat.S_IMODE(metadata.st_mode):o}:{metadata.st_nlink}:{metadata.st_size}:{kind}")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            stat_stub.chmod(0o700)
+            readlink_stub = temporary / "readlink"
+            readlink_stub.write_text(
+                "#!/bin/sh\neval 'last=${'$#'}'\nprintf '%s\\n' \"${last}\"\n",
+                encoding="ascii",
+            )
+            readlink_stub.chmod(0o700)
+            find_stub = temporary / "find"
+            find_stub.write_text(
+                "#!/usr/bin/env python3\n"
+                "import pathlib, sys\n"
+                "for path in sorted(pathlib.Path(sys.argv[1]).iterdir()):\n"
+                "    if path.name.startswith('key-'):\n"
+                "        print(path.name)\n",
+                encoding="ascii",
+            )
+            find_stub.chmod(0o700)
+
+            def run_cleanup() -> subprocess.CompletedProcess[str]:
+                harness = "\n".join(
+                    (
+                        "set -Eeuo pipefail",
+                        cleanup_function,
+                        f"ROOT={shlex.quote(str(root))}",
+                        f"EVIDENCE={shlex.quote(str(evidence))}",
+                        "WG_COUNT=1",
+                        "log_command() {",
+                        "  local phase=$1; shift",
+                        "  printf 'phase=%s\\n' \"${phase}\" >>\"${EVIDENCE}/operations.log\"",
+                        "  [[ $1 == /usr/bin/unlink && $2 == -- && $# -eq 3 ]] || return 79",
+                        "  /bin/rm -- \"$3\"",
+                        "}",
+                        "status=0",
+                        "if remove_legacy_private_key_residue; then :; else status=$?; fi",
+                        "printf 'status=%s\\n' \"${status}\"",
+                    )
+                )
+                return subprocess.run(
+                    ["/bin/bash", "-c", harness],
+                    text=True,
+                    capture_output=True,
+                    env={
+                        "PATH": f"{temporary}:/usr/bin:/bin",
+                        "LC_ALL": "C",
+                    },
+                )
+
+            legacy_b = root / "key-b-0"
+            legacy_b.write_text(valid_key, encoding="ascii")
+            legacy_b.chmod(0o600)
+            completed = run_cleanup()
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "status=0")
+            self.assertFalse(legacy_b.exists())
+
+            legacy_a = root / "key-a-0"
+            unexpected = root / "key-c-0"
+            legacy_a.write_text(valid_key, encoding="ascii")
+            legacy_a.chmod(0o600)
+            unexpected.write_text(valid_key, encoding="ascii")
+            unexpected.chmod(0o600)
+            completed = run_cleanup()
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "status=79")
+            self.assertTrue(legacy_a.exists(), "preflight failure removed allowed key")
+            self.assertTrue(unexpected.exists(), "preflight failure removed foreign key")
+
+            unexpected.unlink()
+            wrong_size_b = root / "key-b-0"
+            wrong_size_b.write_text("D" * 43 + "\n", encoding="ascii")
+            wrong_size_b.chmod(0o600)
+            completed = run_cleanup()
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "status=79")
+            self.assertTrue(legacy_a.exists(), "full preflight was not atomic")
+            self.assertTrue(wrong_size_b.exists(), "wrong-size residue was removed")
+
+            audit = (evidence / "operations.log").read_bytes()
+            self.assertNotIn(valid_key.strip().encode(), audit)
+            self.assertNotIn(("D" * 43).encode(), audit)
+            self.assertIn(b"phase=restore-legacy-key-b-0", audit)
+            self.assertIn(b"unexpected-key-entry", audit)
+            self.assertIn(b"metadata-failed label=key-b-0", audit)
+            self.assertNotIn('$(<"${path}")', cleanup_function)
+            self.assertNotIn('for path in "${ROOT}"/key-*', cleanup_function)
+
+    def test_xor_secret_restore_preflights_both_before_exact_unlink(self) -> None:
+        cleanup_function = self.netns[
+            self.netns.index("remove_xor_secret_residue() {") :
+            self.netns.index("\nrestore_resources() {")
+        ]
+        secret_a = b"xor-a-secret-not-for-logs-" + b"A" * 38 + b"\n"
+        secret_b = b"xor-b-secret-not-for-logs-" + b"B" * 38 + b"\n"
+        self.assertEqual(len(secret_a), 65)
+        self.assertEqual(len(secret_b), 65)
+
+        with tempfile.TemporaryDirectory() as raw:
+            temporary = pathlib.Path(raw)
+            root = temporary / "run"
+            evidence = root / "evidence"
+            run_a = root / "endpoint-a" / "run"
+            run_b = root / "endpoint-b" / "run"
+            for directory in (evidence, run_a, run_b):
+                directory.mkdir(parents=True, exist_ok=True)
+                directory.chmod(0o700)
+
+            stat_stub = temporary / "stat"
+            stat_stub.write_text(
+                textwrap.dedent(
+                    """\
+                    #!/usr/bin/env python3
+                    import os
+                    import stat
+                    import sys
+                    metadata = os.lstat(sys.argv[-1])
+                    fmt = sys.argv[2]
+                    if fmt == "%d":
+                        print(metadata.st_dev)
+                    elif fmt == "%u:%g:%a:%F":
+                        kind = "directory" if stat.S_ISDIR(metadata.st_mode) else "regular file"
+                        print(f"0:0:{stat.S_IMODE(metadata.st_mode):o}:{kind}")
+                    else:
+                        kind = "regular file" if stat.S_ISREG(metadata.st_mode) else "other"
+                        print(f"0:0:{stat.S_IMODE(metadata.st_mode):o}:{metadata.st_nlink}:{metadata.st_size}:{kind}")
+                    """
+                ),
+                encoding="utf-8",
+            )
+            stat_stub.chmod(0o700)
+            readlink_stub = temporary / "readlink"
+            readlink_stub.write_text(
+                "#!/bin/sh\neval 'last=${'$#'}'\nprintf '%s\\n' \"${last}\"\n",
+                encoding="ascii",
+            )
+            readlink_stub.chmod(0o700)
+
+            def run_cleanup() -> subprocess.CompletedProcess[str]:
+                harness = "\n".join(
+                    (
+                        "set -Eeuo pipefail",
+                        cleanup_function,
+                        f"EVIDENCE={shlex.quote(str(evidence))}",
+                        f"RUN_A={shlex.quote(str(run_a))}",
+                        f"RUN_B={shlex.quote(str(run_b))}",
+                        "XOR_MODE=full",
+                        "log_command() {",
+                        "  local phase=$1; shift",
+                        "  printf 'phase=%s\\n' \"${phase}\" >>\"${EVIDENCE}/operations.log\"",
+                        "  [[ $1 == /usr/bin/unlink && $2 == -- && $# -eq 3 ]] || return 79",
+                        "  /bin/rm -- \"$3\"",
+                        "}",
+                        "status=0",
+                        "if remove_xor_secret_residue; then :; else status=$?; fi",
+                        "printf 'status=%s\\n' \"${status}\"",
+                    )
+                )
+                return subprocess.run(
+                    ["/bin/bash", "-c", harness],
+                    text=True,
+                    capture_output=True,
+                    env={"PATH": f"{temporary}:/usr/bin:/bin", "LC_ALL": "C"},
+                )
+
+            path_a = run_a / "xor.key"
+            path_b = run_b / "xor.key"
+            path_a.write_bytes(secret_a)
+            path_b.write_bytes(secret_b)
+            path_a.chmod(0o600)
+            path_b.chmod(0o600)
+            completed = run_cleanup()
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "status=0")
+            self.assertFalse(path_a.exists())
+            self.assertFalse(path_b.exists())
+
+            path_a.write_bytes(secret_a)
+            path_b.write_bytes(secret_b[:-1])
+            path_a.chmod(0o600)
+            path_b.chmod(0o600)
+            completed = run_cleanup()
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(completed.stdout.strip(), "status=79")
+            self.assertTrue(path_a.exists(), "full preflight removed endpoint A")
+            self.assertTrue(path_b.exists(), "wrong-size endpoint B was removed")
+
+            audit = (evidence / "operations.log").read_bytes()
+            self.assertNotIn(secret_a.rstrip(), audit)
+            self.assertNotIn(secret_b.rstrip(), audit)
+            self.assertIn(b"phase=restore-xor-secret-endpoint-a", audit)
+            self.assertIn(b"phase=restore-xor-secret-endpoint-b", audit)
+            self.assertIn(b"metadata-failed label=endpoint-b", audit)
+            self.assertNotIn('$(<"${path}")', cleanup_function)
 
     def test_multi_wg_quotas_are_explicit_and_below_shared_limits(self) -> None:
         shell_names = {

@@ -125,6 +125,7 @@ readonly STAGE_ROOT="/run/wg-mix-ebpf-source-stages/${STAGE_ID}"
 readonly ROOT="${RUN_PARENT}/${RUN_ID}"
 readonly EVIDENCE="${ROOT}/evidence"
 readonly ARTIFACT_ROOT="${ROOT}/artifacts"
+readonly MANIFEST="${ROOT}/manifest.v1"
 readonly OWNER="${ROOT}/owner.v1" NSA="f${RUN_ID}a" NSR="f${RUN_ID}r" NSB="f${RUN_ID}b"
 readonly VA="va${RUN_ID:0:6}" VRA="ra${RUN_ID:0:6}"
 readonly VB="vb${RUN_ID:0:6}" VRB="rb${RUN_ID:0:6}"
@@ -168,33 +169,38 @@ log_command() {
   return "${rc}"
 }
 
+private_key_value_to_pipe() {
+  local private_key="$1"
+  [[ $# -eq 1 && "${private_key}" =~ ^[A-Za-z0-9+/]{43}=$ ]] || return 79
+  printf '%s\n' "${private_key}"
+}
+
 log_command_private_key_stdin() {
-  local phase="$1" key_path="$2"; shift 2
+  local phase="$1" private_key="$2"; shift 2
   local out="${EVIDENCE}/${phase}.stdout.log" err="${EVIDENCE}/${phase}.stderr.log"
-  local rc key_fd=''
+  local rc
   {
     printf 'timestamp=%s event=start phase=%s argv=' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${phase}"
     printf '%q ' "$@"
-    printf '\nstdin=run-owned-private-key-fd\nstdout=%s\nstderr=%s\n' "${out}" "${err}"
+    printf '\nstdin=ephemeral-private-key-pipe\nstdout=%s\nstderr=%s\n' "${out}" "${err}"
   } >>"${EVIDENCE}/operations.log"
   : >"${out}"
   : >"${err}"
-  if [[ ! -f "${key_path}" || -L "${key_path}" ||
-    "$(stat -Lc '%u:%g:%a:%h' -- "${key_path}")" != '0:0:600:1' ]]; then
-    printf 'private key input is not an exact root-owned regular file: %s\n' \
-      "${key_path}" >>"${err}"
+  if [[ ! "${private_key}" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+    printf 'private key input failed the WireGuard key-shape gate\n' >>"${err}"
     rc=79
-  elif { exec {key_fd}<"${key_path}"; } 2>>"${err}"; then
-    if /usr/bin/unlink -- "${key_path}" 2>>"${err}"; then
-      printf 'private_key_path_unlinked=1\n' >>"${EVIDENCE}/operations.log"
-      if "$@" <&"${key_fd}" >"${out}" 2>>"${err}"; then rc=0; else rc=$?; fi
-    else
-      rc=$?
-    fi
-    exec {key_fd}<&-
+  # An exec-triggered AppArmor/LSM transition can deny wg when it reopens
+  # /dev/stdin backed by a regular key file. Generate keys only in shell memory
+  # and let only an anonymous pipe cross into ip/wg.
+  elif {
+    (private_key_value_to_pipe "${private_key}") |
+      (unset private_key; "$@")
+  } >"${out}" 2>>"${err}"; then
+    rc=0
   else
     rc=$?
   fi
+  unset private_key
   printf 'timestamp=%s event=finish phase=%s rc=%s\n' \
     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${phase}" "${rc}" >>"${EVIDENCE}/operations.log"
   return "${rc}"
@@ -211,6 +217,34 @@ receipt_value() {
     $1 == wanted { count++; value=substr($0, length($1)+2) }
     END { if (count != 1 || value == "") exit 1; print value }
   ' "${path}"
+}
+
+validate_restore_identity() {
+  [[ "${EUID}" -eq 0 && "$(id -g)" -eq 0 &&
+    -d "${RUN_PARENT}" && ! -L "${RUN_PARENT}" &&
+    "$(readlink -e -- "${RUN_PARENT}")" == "${RUN_PARENT}" &&
+    "$(stat -Lc '%u:%g:%a:%F' -- "${RUN_PARENT}")" == '0:0:700:directory' &&
+    -d "${ROOT}" && ! -L "${ROOT}" &&
+    "$(readlink -e -- "${ROOT}")" == "${ROOT}" &&
+    "$(stat -Lc '%u:%g:%a:%F' -- "${ROOT}")" == '0:0:700:directory' &&
+    -d "${EVIDENCE}" && ! -L "${EVIDENCE}" &&
+    "$(readlink -e -- "${EVIDENCE}")" == "${EVIDENCE}" &&
+    "$(stat -Lc '%u:%g:%a:%F' -- "${EVIDENCE}")" == '0:0:700:directory' &&
+    -f "${OWNER}" && ! -L "${OWNER}" &&
+    "$(stat -Lc '%u:%g:%a:%h:%F' -- "${OWNER}")" == '0:0:600:1:regular file' &&
+    "$(<"${OWNER}")" == "wg-mix-ebpf-faketcp-backends-v1:${RUN_ID}:${COMMIT}" &&
+    -f "${MANIFEST}" && ! -L "${MANIFEST}" &&
+    "$(stat -Lc '%u:%g:%a:%h:%F' -- "${MANIFEST}")" == '0:0:600:1:regular file' &&
+    "$(receipt_value format "${MANIFEST}")" == 'wg-mix-ebpf-b82-faketcp-backends-v1' &&
+    "$(receipt_value run_id "${MANIFEST}")" == "${RUN_ID}" &&
+    "$(receipt_value commit "${MANIFEST}")" == "${COMMIT}" &&
+    "$(receipt_value stage_id "${MANIFEST}")" == "${STAGE_ID}" &&
+    "$(receipt_value wg_count "${MANIFEST}")" == "${WG_COUNT}" &&
+    "$(receipt_value attachment "${MANIFEST}")" == "${ATTACHMENT_BACKEND}" &&
+    "$(receipt_value checksum "${MANIFEST}")" == "${CHECKSUM_BACKEND}" &&
+    "$(receipt_value xor "${MANIFEST}")" == "${XOR_MODE}" &&
+    "$(receipt_value gso "${MANIFEST}")" == "${GSO_MODE}" &&
+    "$(receipt_value module_lease_id "${MANIFEST}")" == "${MODULE_LEASE_ID}" ]] || return 79
 }
 
 stop_exact_pid() {
@@ -270,11 +304,134 @@ capture_identity_matches() {
     "${expected_exe}" == "${actual_exe}" ]]
 }
 
+remove_legacy_private_key_residue() {
+  local path name role index entry root_device path_device inventory
+  local -a allowed_names=() residue_paths=() residue_labels=()
+  root_device="$(stat -Lc '%d' -- "${ROOT}")" || return 79
+  for ((index=0; index<WG_COUNT; index++)); do
+    allowed_names+=("key-a-${index}" "key-b-${index}")
+  done
+
+  # A bounded read-only inventory rejects names outside the fixed allowlist.
+  if inventory="$(find "${ROOT}" -xdev -mindepth 1 -maxdepth 1 \
+    -name 'key-*' -printf '%f\n')"; then
+    :
+  else
+    printf 'legacy_private_key_residue_preflight=inventory-failed\n' \
+      >>"${EVIDENCE}/operations.log"
+    return 79
+  fi
+  while IFS= read -r name; do
+    [[ -n "${name}" ]] || continue
+    case " ${allowed_names[*]} " in
+      *" ${name} "*) ;;
+      *)
+        printf 'legacy_private_key_residue_preflight=unexpected-key-entry\n' \
+          >>"${EVIDENCE}/operations.log"
+        return 79
+        ;;
+    esac
+  done <<<"${inventory}"
+  unset inventory
+
+  # Construct every possible delete target exactly and preflight all present
+  # candidates before removing any of them.  No glob contributes a target.
+  for ((index=0; index<WG_COUNT; index++)); do
+    for role in a b; do
+      name="key-${role}-${index}"
+      path="${ROOT}/${name}"
+      [[ -e "${path}" || -L "${path}" ]] || continue
+      if [[ ! -f "${path}" || -L "${path}" ||
+        "$(readlink -e -- "${path}")" != "${path}" ]]; then
+        printf 'legacy_private_key_residue_preflight=identity-failed label=%s\n' \
+          "${name}" >>"${EVIDENCE}/operations.log"
+        return 79
+      fi
+      if entry="$(stat -Lc '%u:%g:%a:%h:%s:%F' -- "${path}")"; then
+        :
+      else
+        printf 'legacy_private_key_residue_preflight=stat-failed label=%s\n' \
+          "${name}" >>"${EVIDENCE}/operations.log"
+        return 79
+      fi
+      if [[ "${entry}" != '0:0:600:1:45:regular file' ]]; then
+        printf 'legacy_private_key_residue_preflight=metadata-failed label=%s\n' \
+          "${name}" >>"${EVIDENCE}/operations.log"
+        return 79
+      fi
+      path_device="$(stat -Lc '%d' -- "${path}")" || return 79
+      if [[ "${path_device}" != "${root_device}" ]]; then
+        printf 'legacy_private_key_residue_preflight=filesystem-failed label=%s\n' \
+          "${name}" >>"${EVIDENCE}/operations.log"
+        return 79
+      fi
+      residue_paths+=("${path}")
+      residue_labels+=("${name}")
+    done
+  done
+
+  for ((index=0; index<${#residue_paths[@]}; index++)); do
+    log_command "restore-legacy-${residue_labels[index]}" \
+      /usr/bin/unlink -- "${residue_paths[index]}"
+  done
+  for path in "${residue_paths[@]}"; do
+    [[ ! -e "${path}" && ! -L "${path}" ]] || return 1
+  done
+}
+
+remove_xor_secret_residue() {
+  local role path parent entry parent_device path_device index
+  local -a residue_paths=() residue_labels=()
+  for role in a b; do
+    if [[ "${role}" == a ]]; then parent="${RUN_A}"; else parent="${RUN_B}"; fi
+    path="${parent}/xor.key"
+    [[ -e "${path}" || -L "${path}" ]] || continue
+    if [[ "${XOR_MODE}" == none ]]; then
+      printf 'xor_secret_residue_preflight=unexpected-for-none label=endpoint-%s\n' \
+        "${role}" >>"${EVIDENCE}/operations.log"
+      return 79
+    fi
+    if [[ ! -d "${parent}" || -L "${parent}" ||
+      "$(readlink -e -- "${parent}")" != "${parent}" ||
+      "$(stat -Lc '%u:%g:%a:%F' -- "${parent}")" != '0:0:700:directory' ||
+      ! -f "${path}" || -L "${path}" ||
+      "$(readlink -e -- "${path}")" != "${path}" ]]; then
+      printf 'xor_secret_residue_preflight=identity-failed label=endpoint-%s\n' \
+        "${role}" >>"${EVIDENCE}/operations.log"
+      return 79
+    fi
+    entry="$(stat -Lc '%u:%g:%a:%h:%s:%F' -- "${path}")" || return 79
+    if [[ "${entry}" != '0:0:600:1:65:regular file' ]]; then
+      printf 'xor_secret_residue_preflight=metadata-failed label=endpoint-%s\n' \
+        "${role}" >>"${EVIDENCE}/operations.log"
+      return 79
+    fi
+    parent_device="$(stat -Lc '%d' -- "${parent}")" || return 79
+    path_device="$(stat -Lc '%d' -- "${path}")" || return 79
+    if [[ "${path_device}" != "${parent_device}" ]]; then
+      printf 'xor_secret_residue_preflight=filesystem-failed label=endpoint-%s\n' \
+        "${role}" >>"${EVIDENCE}/operations.log"
+      return 79
+    fi
+    residue_paths+=("${path}")
+    residue_labels+=("endpoint-${role}")
+  done
+
+  for ((index=0; index<${#residue_paths[@]}; index++)); do
+    log_command "restore-xor-secret-${residue_labels[index]}" \
+      /usr/bin/unlink -- "${residue_paths[index]}"
+  done
+  for path in "${residue_paths[@]}"; do
+    [[ ! -e "${path}" && ! -L "${path}" ]] || return 1
+  done
+}
+
 restore_resources() {
-  [[ -d "${ROOT}" && ! -L "${ROOT}" && -f "${OWNER}" && ! -L "${OWNER}" &&
-    "$(<"${OWNER}")" == "wg-mix-ebpf-faketcp-backends-v1:${RUN_ID}:${COMMIT}" ]] || return 79
+  validate_restore_identity
+  remove_legacy_private_key_residue
   stop_exact_pid a
   stop_exact_pid b
+  remove_xor_secret_residue
   if [[ -f "${ROOT}/tcpdump.pid" && ! -L "${ROOT}/tcpdump.pid" ]]; then
     local capture_pid
     capture_pid="$(<"${ROOT}/tcpdump.pid")"
@@ -480,16 +637,26 @@ log_command route-b ip -n "${NSB}" route add default via 198.19.82.254 dev under
 log_command forward ip netns exec "${NSR}" sysctl -w net.ipv4.ip_forward=1
 
 for ((index=0; index<WG_COUNT; index++)); do
-  key_a="${ROOT}/key-a-${index}"; key_b="${ROOT}/key-b-${index}"
-  wg genkey >"${key_a}"; wg genkey >"${key_b}"
-  pub_a="$(wg pubkey <"${key_a}")"; pub_b="$(wg pubkey <"${key_b}")"
+  key_a="$(wg genkey)"; key_b="$(wg genkey)"
+  pub_a="$(private_key_value_to_pipe "${key_a}" | wg pubkey)"
+  pub_b="$(private_key_value_to_pipe "${key_b}" | wg pubkey)"
   port_a="$(wg_listen_port a "${index}")"; port_b="$(wg_listen_port b "${index}")"
   mark_a="$(wg_fwmark a "${index}")"; mark_b="$(wg_fwmark b "${index}")"
   third=$((10 + index)); tunnel_a="10.82.${third}.1"; tunnel_b="10.82.${third}.2"
   log_command "wg-add-a-${index}" ip -n "${NSA}" link add "wg${index}" type wireguard
   log_command "wg-add-b-${index}" ip -n "${NSB}" link add "wg${index}" type wireguard
-  log_command_private_key_stdin "wg-set-a-${index}" "${key_a}" ip netns exec "${NSA}" wg set "wg${index}" private-key /dev/stdin listen-port "${port_a}" fwmark "${mark_a}" peer "${pub_b}" allowed-ips "${tunnel_b}/32" endpoint "198.19.82.1:${port_b}" persistent-keepalive 1
-  log_command_private_key_stdin "wg-set-b-${index}" "${key_b}" ip netns exec "${NSB}" wg set "wg${index}" private-key /dev/stdin listen-port "${port_b}" fwmark "${mark_b}" peer "${pub_a}" allowed-ips "${tunnel_a}/32" endpoint "198.18.82.1:${port_a}" persistent-keepalive 1
+  if log_command_private_key_stdin "wg-set-a-${index}" "${key_a}" ip netns exec "${NSA}" wg set "wg${index}" private-key /dev/stdin listen-port "${port_a}" fwmark "${mark_a}" peer "${pub_b}" allowed-ips "${tunnel_b}/32" endpoint "198.19.82.1:${port_b}" persistent-keepalive 1; then
+    :
+  else
+    rc=$?; unset key_a key_b; exit "${rc}"
+  fi
+  unset key_a
+  if log_command_private_key_stdin "wg-set-b-${index}" "${key_b}" ip netns exec "${NSB}" wg set "wg${index}" private-key /dev/stdin listen-port "${port_b}" fwmark "${mark_b}" peer "${pub_a}" allowed-ips "${tunnel_a}/32" endpoint "198.18.82.1:${port_a}" persistent-keepalive 1; then
+    :
+  else
+    rc=$?; unset key_b; exit "${rc}"
+  fi
+  unset key_b
   log_command "wg-addr-a-${index}" ip -n "${NSA}" address add "${tunnel_a}/30" dev "wg${index}"
   log_command "wg-addr-b-${index}" ip -n "${NSB}" address add "${tunnel_b}/30" dev "wg${index}"
   log_command "wg-mtu-a-${index}" ip -n "${NSA}" link set "wg${index}" mtu 1420

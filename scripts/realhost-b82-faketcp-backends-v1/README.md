@@ -62,12 +62,15 @@ unsafe defaults: session 2048, half-open 256, source ledger 512, pending flows
 shared implementation ceiling. Each WG gets independent ping and short iperf
 traffic, followed by simultaneous per-WG pings.
 
-WireGuard private keys remain run-owned mode-0600 files only long enough to
-derive the public keys. The driver opens each private key on a held file
-descriptor, unlinks its exact path, and then passes the still-open descriptor to
-`wg set` through `private-key /dev/stdin`. It records only that redacted stdin
-contract. Neither the private-key value nor its backing path enters the child
-command argv, and a failed `wg set` cannot leave a named key file behind.
+WireGuard private keys are generated into unexported shell variables, used to
+derive the public keys, and streamed through anonymous pipes. No private-key
+path is created. Only the pipe crosses the `ip`/`wg` exec boundary, where `wg
+set` consumes it through `private-key /dev/stdin`. This avoids the Ubuntu
+AppArmor/LSM path recheck that can reject reopening `/dev/stdin` when it is
+backed directly by a regular file. The driver records only the redacted stdin
+contract. Neither private-key value enters a child command argv or logs; both
+values are unset before an observed `wg set` failure exits, so the other peer
+cannot leave an unconsumed named key behind.
 
 On a Linux 5.15 boot, TCX cells are recorded as `SKIP_UNSUPPORTED` before the
 cell runner is invoked. Explicit kfunc cells are recorded as
