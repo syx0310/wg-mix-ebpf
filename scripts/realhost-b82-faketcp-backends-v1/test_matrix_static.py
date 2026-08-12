@@ -5,6 +5,7 @@ import ast
 import json
 import pathlib
 import re
+import secrets
 import shlex
 import subprocess
 import sys
@@ -132,10 +133,10 @@ class StaticMatrixTest(unittest.TestCase):
             "private-key /dev/stdin",
             "stdin=run-owned-private-key-fd",
             'exec {key_fd}<"${key_path}"',
+            '/usr/bin/unlink -- "${key_path}"',
+            "private_key_path_unlinked=1",
             '<&"${key_fd}"',
             'exec {key_fd}<&-',
-            'log_command "key-remove-a-${index}" /bin/rm -- "${key_a}"',
-            'log_command "key-remove-b-${index}" /bin/rm -- "${key_b}"',
             'ping -I "wg${index}"',
             "iperf3 -c",
             "same-tuple-router-test",
@@ -150,6 +151,7 @@ class StaticMatrixTest(unittest.TestCase):
         self.assertEqual(self.netns.count("private-key /dev/stdin"), 2)
         self.assertNotIn('private-key "${key_', self.netns)
         self.assertNotIn("private-key ${key_", self.netns)
+        self.assertNotIn('log_command "key-remove-', self.netns)
         self.assertNotRegex(
             self.netns,
             re.compile(r"printf.*(?:key_a|key_b|key_path).*operations\\.log"),
@@ -309,6 +311,97 @@ class StaticMatrixTest(unittest.TestCase):
         self.assertIn('"${CELL_DRIVER}" restore', self.root_cell)
         self.assertIn("args.mode,", self.matrix)
 
+    def test_netns_run_initialization_reaches_first_root_gate_unprivileged(self) -> None:
+        # Execute the real driver, not an extracted/synthetic shell fragment.  A
+        # fresh absent run root makes the first ownership gate fail closed with
+        # rc=79 before any privileged or mutating command can run, even when
+        # this test itself happens to be launched by root.
+        for _ in range(32):
+            run_id = secrets.token_hex(4)
+            run_root = pathlib.Path(RUN_PARENT) / run_id
+            if not run_root.exists():
+                break
+        else:
+            self.fail("could not select an absent FakeTCP matrix run root")
+
+        artifact_root = run_root / "artifacts"
+        completed = subprocess.run(
+            [
+                "/bin/bash",
+                "-p",
+                str(NETNS_CELL),
+                "run",
+                "--source",
+                PLAN_SOURCE,
+                "--commit",
+                PLAN_COMMIT,
+                "--run-id",
+                run_id,
+                "--label",
+                "dynamic-init-gate",
+                "--wg-count",
+                "1",
+                "--attachment-backend",
+                "tcx",
+                "--checksum-backend",
+                "kfunc",
+                "--binary",
+                str(artifact_root / "wg-mix-ebpf"),
+                "--baseline-object",
+                str(artifact_root / "wg_mix_tc.o"),
+                "--modern-object",
+                str(artifact_root / "wg_mix_faketcp_experimental.o"),
+                "--legacy-object",
+                str(artifact_root / "wg_mix_faketcp_legacy_515.o"),
+                "--selected-object",
+                str(artifact_root / "wg_mix_faketcp_experimental.o"),
+                "--module-object",
+                str(
+                    artifact_root
+                    / "faketcp_checksum_kmod"
+                    / "wg_mix_faketcp_checksum.ko"
+                ),
+                "--module-lease-id",
+                f"abcdef12-{run_id}",
+                "--xor",
+                "none",
+                "--gso",
+                "off",
+            ],
+            text=True,
+            capture_output=True,
+            cwd=ROOT,
+            env={
+                "PATH": "/usr/bin:/bin",
+                "LC_ALL": "C",
+                "PYTHONDONTWRITEBYTECODE": "1",
+            },
+        )
+        self.assertEqual(
+            completed.returncode,
+            79,
+            f"stdout:\n{completed.stdout}\nstderr:\n{completed.stderr}",
+        )
+        self.assertFalse(run_root.exists(), "pre-root-gate execution mutated run root")
+
+    def test_nounset_dependent_assignments_are_sequenced(self) -> None:
+        for required in (
+            'readonly ROOT="${RUN_PARENT}/${RUN_ID}"\nreadonly EVIDENCE="${ROOT}/evidence"',
+            'local role="$1" pid_file pid netns expected_inode actual_inode status\n'
+            '  local process_state wait_status\n'
+            '  pid_file="${ROOT}/daemon-${role}.pid"',
+            'local role="$1" log_role pid\n  log_role="${role}"',
+        ):
+            self.assertIn(required, self.netns)
+        self.assertNotRegex(
+            self.netns,
+            re.compile(r'readonly ROOT=.*\s+EVIDENCE="\$\{ROOT\}'),
+        )
+        self.assertNotRegex(
+            self.netns,
+            re.compile(r'local role="\$1"[^\n]*(?:pid_file|log_role)="[^\n]*\$\{role\}'),
+        )
+
     def test_frozen_source_is_never_an_artifact_target(self) -> None:
         self.assertNotIn('make --no-print-directory -C "${SOURCE}" build\n', self.root_cell)
         self.assertNotIn('"${SOURCE}/bin/wg-mix-ebpf"', self.root_cell + self.netns)
@@ -337,6 +430,20 @@ class StaticMatrixTest(unittest.TestCase):
         self.assertIn('"lease_id=${MODULE_LEASE_ID}"', self.netns)
         self.assertNotIn('"lease_id=${RUN_ID}"', self.netns)
         self.assertIn('lease_id=%s\\n', self.netns)
+        self.assertIn('MOD_BUILT_SRCVERSION="$(modinfo -F srcversion -- "${MOD_OBJECT}")"', self.netns)
+        self.assertIn('"${MOD_SRCVERSION}" == "${MOD_BUILT_SRCVERSION}"', self.netns)
+        self.assertIn("wg-mix-ebpf-faketcp-backends-preexisting-module-v1", self.netns)
+
+    def test_tcpdump_owner_is_the_capture_process_not_a_timeout_wrapper(self) -> None:
+        self.assertIn(
+            'ip netns exec "${NSR}" tcpdump -U -nn -i any', self.netns
+        )
+        self.assertEqual(
+            self.netns.count('$(readlink -e -- "$(command -v tcpdump)")'), 2
+        )
+        self.assertNotIn(
+            'timeout --signal=INT --kill-after=5s 90 tcpdump', self.netns
+        )
 
     def test_exact_generic_xdp_and_backend_fields_are_fixed(self) -> None:
         combined = self.root_cell + self.netns + self.readme

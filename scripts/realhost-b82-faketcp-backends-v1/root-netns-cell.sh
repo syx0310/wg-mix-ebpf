@@ -6,13 +6,13 @@ fi
 set -Eeuo pipefail
 
 readonly SAFE_PATH='/usr/sbin:/usr/bin:/sbin:/bin'
-readonly SELF_REL='scripts/realhost-b82-faketcp-backends-v1/root-netns-cell.sh'
 readonly RUN_PARENT='/var/tmp/wg-mix-ebpf-faketcp-backends-v1'
 readonly SHARED_RUN='/run/wg-mix-ebpf'
 readonly SHARED_VAR='/var/lib/wg-mix-ebpf'
 readonly SHARED_MAINTENANCE='/run/.wg-mix-ebpf-daemon.lease.maintenance'
 readonly KFUNC_MODULE='wg_mix_faketcp_checksum'
 readonly KPROBE_MODULE='wg_mix_faketcp_checksum_kprobe'
+readonly KPROBE_DEVICE='/dev/wg_mix_faketcp_checksum_kprobe'
 readonly FAKETCP_SESSION_CAPACITY=2048
 readonly FAKETCP_MAX_HALF_OPEN_SESSIONS=256
 readonly FAKETCP_MAX_HALF_OPEN_PER_SOURCE=32
@@ -122,7 +122,8 @@ stage_id_value="${SOURCE#'/run/wg-mix-ebpf-source-stages/'}"
 stage_id_value="${stage_id_value%'/source'}"
 readonly STAGE_ID="${stage_id_value}"
 readonly STAGE_ROOT="/run/wg-mix-ebpf-source-stages/${STAGE_ID}"
-readonly ROOT="${RUN_PARENT}/${RUN_ID}" EVIDENCE="${ROOT}/evidence"
+readonly ROOT="${RUN_PARENT}/${RUN_ID}"
+readonly EVIDENCE="${ROOT}/evidence"
 readonly ARTIFACT_ROOT="${ROOT}/artifacts"
 readonly OWNER="${ROOT}/owner.v1" NSA="f${RUN_ID}a" NSR="f${RUN_ID}r" NSB="f${RUN_ID}b"
 readonly VA="va${RUN_ID:0:6}" VRA="ra${RUN_ID:0:6}"
@@ -184,7 +185,12 @@ log_command_private_key_stdin() {
       "${key_path}" >>"${err}"
     rc=79
   elif { exec {key_fd}<"${key_path}"; } 2>>"${err}"; then
-    if "$@" <&"${key_fd}" >"${out}" 2>>"${err}"; then rc=0; else rc=$?; fi
+    if /usr/bin/unlink -- "${key_path}" 2>>"${err}"; then
+      printf 'private_key_path_unlinked=1\n' >>"${EVIDENCE}/operations.log"
+      if "$@" <&"${key_fd}" >"${out}" 2>>"${err}"; then rc=0; else rc=$?; fi
+    else
+      rc=$?
+    fi
     exec {key_fd}<&-
   else
     rc=$?
@@ -208,7 +214,9 @@ receipt_value() {
 }
 
 stop_exact_pid() {
-  local role="$1" pid_file="${ROOT}/daemon-${role}.pid" pid netns expected_inode actual_inode status
+  local role="$1" pid_file pid netns expected_inode actual_inode status
+  local process_state wait_status
+  pid_file="${ROOT}/daemon-${role}.pid"
   [[ -f "${pid_file}" && ! -L "${pid_file}" ]] || return 0
   pid="$(<"${pid_file}")"
   [[ "${pid}" =~ ^[1-9][0-9]*$ ]] || return 79
@@ -268,7 +276,8 @@ restore_resources() {
   stop_exact_pid a
   stop_exact_pid b
   if [[ -f "${ROOT}/tcpdump.pid" && ! -L "${ROOT}/tcpdump.pid" ]]; then
-    local capture_pid="$(<"${ROOT}/tcpdump.pid")"
+    local capture_pid
+    capture_pid="$(<"${ROOT}/tcpdump.pid")"
     [[ "${capture_pid}" =~ ^[1-9][0-9]*$ ]] || return 79
     if [[ -d "/proc/${capture_pid}" ]]; then
       if capture_identity_matches "${capture_pid}"; then
@@ -352,6 +361,8 @@ log_command same-tuple-router-test "${GO_OFFLINE_ENV[@]}" /usr/bin/go -C "${SOUR
 
 MOD_NAME="$(module_name)"; MOD_OBJECT="$(module_object)"
 [[ -f "${MOD_OBJECT}" && ! -L "${MOD_OBJECT}" ]] || exit 1
+MOD_BUILT_SRCVERSION="$(modinfo -F srcversion -- "${MOD_OBJECT}")"
+[[ -n "${MOD_BUILT_SRCVERSION}" ]] || exit 1
 if [[ ! -d "/sys/module/${MOD_NAME}" ]]; then
   if [[ "${CHECKSUM_BACKEND}" == kfunc ]]; then
     log_command module-load insmod "${MOD_OBJECT}" "lease_id=${MODULE_LEASE_ID}"
@@ -373,7 +384,19 @@ if [[ ! -d "/sys/module/${MOD_NAME}" ]]; then
     "${MODULE_LEASE_ID}" \
     >"${ROOT}/module-owned.v1"
 else
-  printf '%s\n' "${MOD_NAME}" >"${ROOT}/module-preexisting.v1"
+  [[ -r "/sys/module/${MOD_NAME}/srcversion" &&
+    -r "/sys/module/${MOD_NAME}/sections/.text" ]] || exit 1
+  MOD_SRCVERSION="$(<"/sys/module/${MOD_NAME}/srcversion")"
+  MOD_TEXT="$(<"/sys/module/${MOD_NAME}/sections/.text")"
+  [[ "${MOD_SRCVERSION}" == "${MOD_BUILT_SRCVERSION}" &&
+    "${MOD_TEXT}" =~ ^0x[0-9a-fA-F]+$ ]] || exit 1
+  if [[ "${CHECKSUM_BACKEND}" == kprobe ]]; then
+    [[ -c "${KPROBE_DEVICE}" && ! -L "${KPROBE_DEVICE}" ]] || exit 1
+  fi
+  printf 'format=wg-mix-ebpf-faketcp-backends-preexisting-module-v1\nmodule=%s\nboot_id=%s\nobject=%s\nobject_sha256=%s\nsrcversion=%s\ntext_address=%s\n' \
+    "${MOD_NAME}" "$(</proc/sys/kernel/random/boot_id)" "${MOD_OBJECT}" \
+    "$(sha256sum -- "${MOD_OBJECT}" | awk '{print $1}')" "${MOD_SRCVERSION}" \
+    "${MOD_TEXT}" >"${ROOT}/module-preexisting.v1"
 fi
 
 mkdir --mode=0700 -- "${ENDPOINT_A}" "${ENDPOINT_B}" "${RUN_A}" "${RUN_B}" \
@@ -466,9 +489,7 @@ for ((index=0; index<WG_COUNT; index++)); do
   log_command "wg-add-a-${index}" ip -n "${NSA}" link add "wg${index}" type wireguard
   log_command "wg-add-b-${index}" ip -n "${NSB}" link add "wg${index}" type wireguard
   log_command_private_key_stdin "wg-set-a-${index}" "${key_a}" ip netns exec "${NSA}" wg set "wg${index}" private-key /dev/stdin listen-port "${port_a}" fwmark "${mark_a}" peer "${pub_b}" allowed-ips "${tunnel_b}/32" endpoint "198.19.82.1:${port_b}" persistent-keepalive 1
-  log_command "key-remove-a-${index}" /bin/rm -- "${key_a}"
   log_command_private_key_stdin "wg-set-b-${index}" "${key_b}" ip netns exec "${NSB}" wg set "wg${index}" private-key /dev/stdin listen-port "${port_b}" fwmark "${mark_b}" peer "${pub_a}" allowed-ips "${tunnel_a}/32" endpoint "198.18.82.1:${port_a}" persistent-keepalive 1
-  log_command "key-remove-b-${index}" /bin/rm -- "${key_b}"
   log_command "wg-addr-a-${index}" ip -n "${NSA}" address add "${tunnel_a}/30" dev "wg${index}"
   log_command "wg-addr-b-${index}" ip -n "${NSB}" address add "${tunnel_b}/30" dev "wg${index}"
   log_command "wg-mtu-a-${index}" ip -n "${NSA}" link set "wg${index}" mtu 1420
@@ -478,7 +499,8 @@ for ((index=0; index<WG_COUNT; index++)); do
 done
 
 start_daemon() {
-  local role="$1" log_role="${role}" pid
+  local role="$1" log_role pid
+  log_role="${role}"
   /usr/bin/env -i PATH="${SAFE_PATH}" LC_ALL=C unshare --mount --propagation private \
     /bin/bash -p "$0" endpoint --source "${SOURCE}" --run-id "${RUN_ID}" --role "${role}" \
     >"${EVIDENCE}/daemon-${log_role}.stdout.log" 2>"${EVIDENCE}/daemon-${log_role}.stderr.log" &
@@ -489,7 +511,7 @@ start_daemon() {
 }
 
 wait_active() {
-  local role="$1" pid="$2" run="${RUN_A}" status_path state
+  local role="$1" pid="$2" run="${RUN_A}" status_path daemon_status
   [[ "${role}" == b ]] && run="${RUN_B}"
   status_path="${run}/runtime/status.json"
   for _ in {1..300}; do
@@ -572,7 +594,7 @@ PY
 validate_status "${EVIDENCE}/status-a-initial.stdout.log" >"${EVIDENCE}/status-a-validation.log"
 validate_status "${EVIDENCE}/status-b-initial.stdout.log" >"${EVIDENCE}/status-b-validation.log"
 
-ip netns exec "${NSR}" timeout --signal=INT --kill-after=5s 90 tcpdump -U -nn -i any -w "${EVIDENCE}/outer.pcap" \
+ip netns exec "${NSR}" tcpdump -U -nn -i any -w "${EVIDENCE}/outer.pcap" \
   >"${EVIDENCE}/tcpdump.stdout.log" 2>"${EVIDENCE}/tcpdump.stderr.log" &
 TCPDUMP_PID=$!; printf '%s\n' "${TCPDUMP_PID}" >"${ROOT}/tcpdump.pid"
 for _ in {1..50}; do
@@ -580,11 +602,11 @@ for _ in {1..50}; do
   capture_exe="$(readlink -e -- "/proc/${TCPDUMP_PID}/exe")"
   capture_netns="$(stat -Lc '%d:%i' -- "/proc/${TCPDUMP_PID}/ns/net")"
   router_netns="$(stat -Lc '%d:%i' -- "/run/netns/${NSR}")"
-  [[ "${capture_exe}" == "$(readlink -e -- "$(command -v timeout)")" &&
+  [[ "${capture_exe}" == "$(readlink -e -- "$(command -v tcpdump)")" &&
     "${capture_netns}" == "${router_netns}" ]] && break
   sleep 0.02
 done
-[[ "${capture_exe:-}" == "$(readlink -e -- "$(command -v timeout)")" &&
+[[ "${capture_exe:-}" == "$(readlink -e -- "$(command -v tcpdump)")" &&
   "${capture_netns:-}" == "${router_netns:-unset}" ]] || exit 1
 printf 'format=wg-mix-ebpf-faketcp-tcpdump-owner-v1\npid=%s\nboot_id=%s\nstart_ticks=%s\nnetns_inode=%s\nexecutable=%s\n' \
   "${TCPDUMP_PID}" "$(</proc/sys/kernel/random/boot_id)" \
