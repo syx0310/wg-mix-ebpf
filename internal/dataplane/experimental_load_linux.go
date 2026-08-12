@@ -106,6 +106,113 @@ func probeExperimentalFakeTCPKernelDependencyWith(
 				experimentalFakeTCPKfuncModule, name,
 			)
 		}
+		if err := validateExperimentalFakeTCPKfuncPrototype(name, function); err != nil {
+			return fmt.Errorf(
+				"required module %q kfunc BTF %q has an incompatible prototype: %w",
+				experimentalFakeTCPKfuncModule, name, err,
+			)
+		}
+	}
+	return nil
+}
+
+type experimentalFakeTCPKfuncParameterKind uint8
+
+const (
+	experimentalFakeTCPSKBPointerParameter experimentalFakeTCPKfuncParameterKind = iota + 1
+	experimentalFakeTCPUnsigned32Parameter
+	experimentalFakeTCPUnsigned64Parameter
+)
+
+var experimentalFakeTCPKfuncPrototypes = map[string][]experimentalFakeTCPKfuncParameterKind{
+	experimentalFakeTCPPrepareKfuncName: {
+		experimentalFakeTCPSKBPointerParameter,
+		experimentalFakeTCPUnsigned32Parameter,
+		experimentalFakeTCPUnsigned32Parameter,
+		experimentalFakeTCPUnsigned32Parameter,
+	},
+	experimentalFakeTCPGSOCommitKfuncName: {
+		experimentalFakeTCPSKBPointerParameter,
+		experimentalFakeTCPUnsigned32Parameter,
+		experimentalFakeTCPUnsigned32Parameter,
+		experimentalFakeTCPUnsigned32Parameter,
+		experimentalFakeTCPUnsigned64Parameter,
+	},
+}
+
+func validateExperimentalFakeTCPKfuncPrototype(name string, function *btf.Func) error {
+	wantParams, ok := experimentalFakeTCPKfuncPrototypes[name]
+	if !ok {
+		return fmt.Errorf("no reviewed prototype")
+	}
+	prototype, ok := btf.As[*btf.FuncProto](function.Type)
+	if !ok || prototype == nil {
+		return fmt.Errorf("type is %T, want FuncProto", function.Type)
+	}
+	if err := validateExperimentalFakeTCPIntegerType(prototype.Return, 4, btf.Signed); err != nil {
+		return fmt.Errorf("return type: %w", err)
+	}
+	if len(prototype.Params) != len(wantParams) {
+		return fmt.Errorf("parameter count is %d, want %d", len(prototype.Params), len(wantParams))
+	}
+	for index, want := range wantParams {
+		if err := validateExperimentalFakeTCPKfuncParameter(prototype.Params[index].Type, want); err != nil {
+			return fmt.Errorf("parameter %d: %w", index, err)
+		}
+	}
+	return nil
+}
+
+func validateExperimentalFakeTCPKfuncParameter(
+	typeValue btf.Type,
+	want experimentalFakeTCPKfuncParameterKind,
+) error {
+	switch want {
+	case experimentalFakeTCPSKBPointerParameter:
+		pointer, ok := btf.As[*btf.Pointer](typeValue)
+		if !ok || pointer == nil {
+			return fmt.Errorf("type is %T, want pointer to struct __sk_buff", typeValue)
+		}
+		target := btf.UnderlyingType(pointer.Target)
+		switch value := target.(type) {
+		case *btf.Struct:
+			if value.Name != "__sk_buff" {
+				return fmt.Errorf("pointer target struct is %q, want %q", value.Name, "__sk_buff")
+			}
+		case *btf.Fwd:
+			if value.Kind != btf.FwdStruct || value.Name != "__sk_buff" {
+				return fmt.Errorf("pointer target forward declaration is %s %q, want struct %q", value.Kind, value.Name, "__sk_buff")
+			}
+		default:
+			return fmt.Errorf("pointer target is %T, want struct __sk_buff", target)
+		}
+		return nil
+	case experimentalFakeTCPUnsigned32Parameter:
+		return validateExperimentalFakeTCPIntegerType(typeValue, 4, btf.Unsigned)
+	case experimentalFakeTCPUnsigned64Parameter:
+		return validateExperimentalFakeTCPIntegerType(typeValue, 8, btf.Unsigned)
+	default:
+		return fmt.Errorf("unreviewed expected parameter kind %d", want)
+	}
+}
+
+func validateExperimentalFakeTCPIntegerType(
+	typeValue btf.Type,
+	wantSize uint32,
+	wantEncoding btf.IntEncoding,
+) error {
+	integer, ok := btf.As[*btf.Int](typeValue)
+	if !ok || integer == nil {
+		return fmt.Errorf("type is %T, want %s %d-bit integer", typeValue, wantEncoding, wantSize*8)
+	}
+	if integer.Size != wantSize || integer.Encoding != wantEncoding {
+		return fmt.Errorf(
+			"integer is %s %d-bit, want %s %d-bit",
+			integer.Encoding,
+			integer.Size*8,
+			wantEncoding,
+			wantSize*8,
+		)
 	}
 	return nil
 }

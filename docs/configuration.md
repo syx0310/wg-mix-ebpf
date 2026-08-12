@@ -426,15 +426,20 @@ The `PostUp` form is useful for launch modes where the config parser can see the
 
 For UDP and ICMP, `ListenPort` may be present or omitted in the WireGuard
 config and the dataplane uses the runtime value. FakeTCP is stricter: it
-requires the static config value to be present and non-zero so the startup
-guard can cover the exact UDP and TCP wire port before runtime discovery:
+requires the static config value to be present and non-zero, and the live
+WireGuard interface must report that exact same port. The daemon rejects a
+mismatch before the dataplane loader can detach or attach anything, so the
+startup guard always covers the exact UDP and TCP wire port:
 
 ```ini
 [Interface]
 ListenPort = 52000
 ```
 
-If WireGuard chooses a random listen port, run `wg-mix-ebpf reload` after the interface is up so the agent can read the runtime value.
+For UDP and ICMP only, if WireGuard chooses a random listen port, run
+`wg-mix-ebpf reload` after the interface is up so the agent can read the
+runtime value. FakeTCP does not permit a random or externally changed live
+port; update the WireGuard interface to the configured fixed port first.
 
 For NAT-side peers, configure WireGuard persistent keepalive in the WireGuard config or with your WireGuard management tool. `wg-mix-ebpf` does not modify peer settings, but a NAT-side peer normally needs keepalive to keep its endpoint reachable:
 

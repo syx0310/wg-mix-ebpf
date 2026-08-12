@@ -106,6 +106,16 @@ func TestValidateFakeTCPStartupIsolationRequiresFixedListenPortBeforeMutation(t 
 	if err := validateFakeTCPStartupIsolation(cfg, state); err != nil {
 		t.Fatalf("fixed FakeTCP listen port rejected: %v", err)
 	}
+	state.WireGuards[0].RuntimeStateAvailable = true
+	state.WireGuards[0].RuntimeListenPort = 31002
+	if err := validateFakeTCPStartupIsolation(cfg, state); err == nil ||
+		!strings.Contains(err.Error(), "does not equal configured ListenPort") {
+		t.Fatalf("mismatched live FakeTCP listen port error = %v", err)
+	}
+	state.WireGuards[0].RuntimeListenPort = state.WireGuards[0].ConfigListenPort
+	if err := validateFakeTCPStartupIsolation(cfg, state); err != nil {
+		t.Fatalf("matching live FakeTCP listen port rejected: %v", err)
+	}
 	cfg.StartupGuard.Mode = "none"
 	if err := validateFakeTCPStartupIsolation(cfg, state); err == nil ||
 		!strings.Contains(err.Error(), "nft-temporary-drop") {

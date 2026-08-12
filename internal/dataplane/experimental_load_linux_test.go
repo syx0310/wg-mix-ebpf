@@ -521,11 +521,24 @@ func TestExperimentalKernelDependencyProbeRequiresExactModuleAndKfuncBTF(t *test
 	}
 
 	intType := &btf.Int{Name: "int", Size: 4, Encoding: btf.Signed}
+	u32Type := &btf.Int{Name: "unsigned int", Size: 4, Encoding: btf.Unsigned}
+	u64Type := &btf.Int{Name: "long unsigned int", Size: 8, Encoding: btf.Unsigned}
+	skbType := &btf.Struct{Name: "__sk_buff", Size: 192}
 	types := make([]btf.Type, 0, len(experimentalFakeTCPKfuncNames))
 	for _, name := range experimentalFakeTCPKfuncNames {
+		params := []btf.FuncParam{
+			{Name: "ctx", Type: &btf.Pointer{Target: skbType}},
+			{Name: "network_offset", Type: u32Type},
+			{Name: "transport_offset", Type: u32Type},
+			{Name: "udp_length", Type: u32Type},
+		}
+		if name == experimentalFakeTCPGSOCommitKfuncName {
+			params[3].Name = "sequence"
+			params = append(params, btf.FuncParam{Name: "ack_window", Type: u64Type})
+		}
 		types = append(types, &btf.Func{
 			Name: name,
-			Type: &btf.FuncProto{Return: intType},
+			Type: &btf.FuncProto{Return: intType, Params: params},
 		})
 	}
 	builder, err := btf.NewBuilder(types, nil)
@@ -540,6 +553,42 @@ func TestExperimentalKernelDependencyProbeRequiresExactModuleAndKfuncBTF(t *test
 		func(string) (*btf.Spec, error) { return spec, nil },
 	); err != nil {
 		t.Fatalf("exact module/kfunc BTF probe failed: %v", err)
+	}
+
+	wrongTypes := []btf.Type{
+		&btf.Func{
+			Name: experimentalFakeTCPPrepareKfuncName,
+			Type: &btf.FuncProto{Return: intType, Params: []btf.FuncParam{
+				{Name: "ctx", Type: &btf.Pointer{Target: skbType}},
+				{Name: "network_offset", Type: u32Type},
+				{Name: "transport_offset", Type: u32Type},
+				{Name: "udp_length", Type: u64Type},
+			}},
+		},
+		&btf.Func{
+			Name: experimentalFakeTCPGSOCommitKfuncName,
+			Type: &btf.FuncProto{Return: intType, Params: []btf.FuncParam{
+				{Name: "ctx", Type: &btf.Pointer{Target: skbType}},
+				{Name: "network_offset", Type: u32Type},
+				{Name: "transport_offset", Type: u32Type},
+				{Name: "sequence", Type: u32Type},
+				{Name: "ack_window", Type: u64Type},
+			}},
+		},
+	}
+	wrongBuilder, err := btf.NewBuilder(wrongTypes, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongSpec, err := wrongBuilder.Spec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = probeExperimentalFakeTCPKernelDependencyWith(
+		func(string) (*btf.Spec, error) { return wrongSpec, nil },
+	)
+	if err == nil || !strings.Contains(err.Error(), "parameter 3") {
+		t.Fatalf("incompatible kfunc prototype error=%v", err)
 	}
 }
 

@@ -397,6 +397,13 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	// The startup guard is built from the configured WireGuard listen port,
+	// while the live FakeTCP policy uses the kernel-observed listen port. Keep
+	// those two views identical before the loader can detach the baseline or
+	// attach any process-owned FakeTCP program.
+	if err := validateFakeTCPStartupIsolation(cfg, state); err != nil {
+		return nil, err
+	}
 	result := &Result{ConfigPath: configPath(opts), Time: time.Now(), Action: "reload", State: state, DryRun: opts.DryRun, AttachStatePath: attachstate.Path(opts.StateDir)}
 	if opts.DryRun {
 		if shouldApplyStartupGuard(cfg) {
@@ -641,6 +648,14 @@ func validateFakeTCPStartupIsolation(cfg *config.Config, state *control.State) e
 			return fmt.Errorf(
 				"faketcp WireGuard %q requires a fixed non-zero ListenPort in its WireGuard config so the startup guard covers both UDP and TCP wire traffic",
 				wg.Name,
+			)
+		}
+		if wg.RuntimeStateAvailable && wg.RuntimeListenPort != wg.ConfigListenPort {
+			return fmt.Errorf(
+				"faketcp WireGuard %q runtime ListenPort %d does not equal configured ListenPort %d protected by the startup guard",
+				wg.Name,
+				wg.RuntimeListenPort,
+				wg.ConfigListenPort,
 			)
 		}
 	}
