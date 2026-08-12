@@ -33,6 +33,8 @@ const (
 	MaxFakeTCPPendingPacketsPerFlow         = 4
 	MaxFakeTCPPendingBytes                  = 1 << 20
 	FakeTCPChecksumModePartialCompleteReset = "partial-complete-reset-required"
+	FakeTCPIngressModeXDPGenericExact       = "xdp-generic-exact"
+	deprecatedFakeTCPIngressModeXDPRequired = "xdp-required"
 )
 
 type Config struct {
@@ -93,14 +95,14 @@ type ICMPTransport struct {
 	ID   uint16 `yaml:"id"`
 }
 
-// FakeTCPTransport is deliberately explicit while the transport is
-// experimental. The data path preserves UDP/QUIC reliability semantics and
-// only presents a TCP-shaped wire image; it is not a TCP stream. Each
-// WireGuard's controller/engine owns its complete FakeTCP policy independently
-// (timeouts, rate limits, source ledger and pending queues); no "first WG wins"
-// process-global parameter is permitted. Only shared BPF/daemon resource
-// ceilings are aggregated by validateDataplaneCapacity.
+// FakeTCPTransport preserves UDP/QUIC packet semantics and only presents a
+// TCP-shaped wire image; it is not a TCP stream. The single FakeTCP WireGuard
+// owns its complete policy (timeouts, rate
+// limits, source ledger and pending queues). The one-WireGuard restriction is
+// enforced before a production runtime can be planned.
 type FakeTCPTransport struct {
+	// Experimental is a deprecated, ignored compatibility field. Older
+	// configurations may keep `experimental: true` while migrating.
 	Experimental             bool     `yaml:"experimental"`
 	ChecksumMode             string   `yaml:"checksum_mode"`
 	IngressMode              string   `yaml:"ingress_mode"`
@@ -408,7 +410,10 @@ func (c *Config) ApplyDefaults() {
 		if c.WireGuards[i].Transport.Mode == "faketcp" {
 			fake := &c.WireGuards[i].Transport.FakeTCP
 			defaultString(&fake.ChecksumMode, FakeTCPChecksumModePartialCompleteReset)
-			defaultString(&fake.IngressMode, "xdp-required")
+			defaultString(&fake.IngressMode, FakeTCPIngressModeXDPGenericExact)
+			if fake.IngressMode == deprecatedFakeTCPIngressModeXDPRequired {
+				fake.IngressMode = FakeTCPIngressModeXDPGenericExact
+			}
 			if fake.SessionCapacity == 0 {
 				fake.SessionCapacity = 4096
 			}
@@ -572,6 +577,7 @@ func (c *Config) ValidateStatic() error {
 		}
 	}
 	seenWireGuards := make(map[string]struct{}, len(c.WireGuards))
+	fakeTCPWireGuards := 0
 	for i, wg := range c.WireGuards {
 		if wg.Name == "" {
 			return fmt.Errorf("wireguards[%d].name is required", i)
@@ -614,27 +620,37 @@ func (c *Config) ValidateStatic() error {
 				return fmt.Errorf("wireguards[%d].transport.icmp.role must be client or server", i)
 			}
 		case "faketcp":
+			fakeTCPWireGuards++
 			if err := validateFakeTCPTransport(fmt.Sprintf("wireguards[%d].transport.faketcp", i), wg.Transport.FakeTCP); err != nil {
 				return err
 			}
 		case "faketcp-lite":
-			return fmt.Errorf("wireguards[%d].transport.mode %q is unsupported; use experimental faketcp with its handshake state machine", i, wg.Transport.Mode)
+			return fmt.Errorf("wireguards[%d].transport.mode %q is unsupported; use faketcp with its handshake state machine", i, wg.Transport.Mode)
 		default:
 			return fmt.Errorf("wireguards[%d].transport.mode %q is unsupported", i, wg.Transport.Mode)
 		}
+	}
+	if fakeTCPWireGuards > 1 {
+		return fmt.Errorf("at most one WireGuard may use transport.mode faketcp; configured %d", fakeTCPWireGuards)
+	}
+	if fakeTCPWireGuards != 0 && c.Runtime.AttachmentBackend == "classic_tc" {
+		return errors.New("runtime.attachment_backend classic_tc is unsupported for faketcp; use tcx or auto on a TCX-capable kernel")
+	}
+	if fakeTCPWireGuards != 0 && c.StartupGuard.Mode != "nft-temporary-drop" {
+		return errors.New("faketcp requires startup_guard.mode nft-temporary-drop so the UDP and TCP wire ports remain fail-closed until the resident runtime is healthy")
+	}
+	if fakeTCPWireGuards != 0 && c.Policy.StartupFailMode != "fail_closed_for_managed_flows" {
+		return errors.New("faketcp requires policy.startup_fail_mode fail_closed_for_managed_flows")
 	}
 	return validateDataplaneCapacity(c)
 }
 
 func validateFakeTCPTransport(prefix string, f FakeTCPTransport) error {
-	if !f.Experimental {
-		return fmt.Errorf("%s.experimental must be true to acknowledge the incomplete kernel compatibility matrix", prefix)
-	}
 	if f.ChecksumMode != FakeTCPChecksumModePartialCompleteReset {
 		return fmt.Errorf("%s.checksum_mode %q is unsupported; only %s requires ip_summed identification, CHECKSUM_PARTIAL materialize/complete, and checksum offset/metadata reset", prefix, f.ChecksumMode, FakeTCPChecksumModePartialCompleteReset)
 	}
-	if f.IngressMode != "xdp-required" {
-		return fmt.Errorf("%s.ingress_mode %q is unsupported; XDP is required before GRO", prefix, f.IngressMode)
+	if f.IngressMode != FakeTCPIngressModeXDPGenericExact {
+		return fmt.Errorf("%s.ingress_mode %q is unsupported; only %s provides exact selected-mode generic XDP ownership before GRO", prefix, f.IngressMode, FakeTCPIngressModeXDPGenericExact)
 	}
 	if f.SessionCapacity < 2 || f.SessionCapacity > MaxFakeTCPSessions {
 		return fmt.Errorf("%s.session_capacity must be between 2 and %d", prefix, MaxFakeTCPSessions)

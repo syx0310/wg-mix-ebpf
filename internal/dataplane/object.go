@@ -13,7 +13,10 @@ import (
 //go:embed embedded/*
 var embeddedObjects embed.FS
 
-const EmbeddedObjectSource = "embedded:wg_mix_tc.o"
+const (
+	EmbeddedObjectSource        = "embedded:wg_mix_tc.o"
+	EmbeddedFakeTCPObjectSource = "embedded:wg_mix_faketcp.o"
+)
 
 type ObjectIdentity struct {
 	Source   string `json:"source"`
@@ -43,30 +46,61 @@ func loadCollectionSpecFromResolvedPath(path string) (*ebpf.CollectionSpec, Obje
 		}
 		return spec, identity, nil
 	}
-	embeddedObject, err := embeddedObjects.ReadFile("embedded/wg_mix_tc.o")
+	return loadEmbeddedCollectionSpec("wg_mix_tc.o", EmbeddedObjectSource)
+}
+
+// loadFakeTCPCollectionSpecFromResolvedPath is deliberately separate from the
+// baseline loader. An empty selector chooses the independently embedded
+// FakeTCP object and can never fall back to wg_mix_tc.o.
+func loadFakeTCPCollectionSpecFromResolvedPath(path string) (*ebpf.CollectionSpec, ObjectIdentity, error) {
+	if path != "" {
+		object, err := os.ReadFile(path)
+		if err != nil {
+			return nil, ObjectIdentity{}, fmt.Errorf("read FakeTCP BPF object %s: %w", path, err)
+		}
+		identity := objectIdentity(path, false, object)
+		spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(object))
+		if err != nil {
+			return nil, identity, fmt.Errorf("load FakeTCP BPF object %s: %w", path, err)
+		}
+		return spec, identity, nil
+	}
+	return loadEmbeddedCollectionSpec("wg_mix_faketcp.o", EmbeddedFakeTCPObjectSource)
+}
+
+func loadEmbeddedCollectionSpec(name, source string) (*ebpf.CollectionSpec, ObjectIdentity, error) {
+	embeddedObject, err := embeddedObjects.ReadFile("embedded/" + name)
 	if err != nil {
-		return nil, ObjectIdentity{}, fmt.Errorf("embedded BPF object is unavailable; run make build to package it into the Go binary: %w", err)
+		return nil, ObjectIdentity{}, fmt.Errorf("embedded BPF object %s is unavailable; run make build to package it into the Go binary: %w", name, err)
 	}
 	if len(embeddedObject) == 0 {
-		return nil, ObjectIdentity{}, fmt.Errorf("embedded BPF object is empty; run make build to package it into the Go binary")
+		return nil, ObjectIdentity{}, fmt.Errorf("embedded BPF object %s is empty; run make build to package it into the Go binary", name)
 	}
-	identity := objectIdentity(EmbeddedObjectSource, true, embeddedObject)
+	identity := objectIdentity(source, true, embeddedObject)
 	spec, err := ebpf.LoadCollectionSpecFromReader(bytes.NewReader(embeddedObject))
 	if err != nil {
-		return nil, identity, fmt.Errorf("load embedded BPF object: %w", err)
+		return nil, identity, fmt.Errorf("load embedded BPF object %s: %w", name, err)
 	}
 	return spec, identity, nil
 }
 
 func EmbeddedObjectIdentity() (ObjectIdentity, error) {
-	object, err := embeddedObjects.ReadFile("embedded/wg_mix_tc.o")
+	return embeddedObjectIdentity("wg_mix_tc.o", EmbeddedObjectSource)
+}
+
+func EmbeddedFakeTCPObjectIdentity() (ObjectIdentity, error) {
+	return embeddedObjectIdentity("wg_mix_faketcp.o", EmbeddedFakeTCPObjectSource)
+}
+
+func embeddedObjectIdentity(name, source string) (ObjectIdentity, error) {
+	object, err := embeddedObjects.ReadFile("embedded/" + name)
 	if err != nil {
-		return ObjectIdentity{}, fmt.Errorf("read embedded BPF object identity: %w", err)
+		return ObjectIdentity{}, fmt.Errorf("read embedded BPF object %s identity: %w", name, err)
 	}
 	if len(object) == 0 {
-		return ObjectIdentity{}, fmt.Errorf("read embedded BPF object identity: object is empty")
+		return ObjectIdentity{}, fmt.Errorf("read embedded BPF object %s identity: object is empty", name)
 	}
-	return objectIdentity(EmbeddedObjectSource, true, object), nil
+	return objectIdentity(source, true, object), nil
 }
 
 func objectIdentity(source string, embedded bool, object []byte) ObjectIdentity {
@@ -86,6 +120,13 @@ func objectPathFromEnv(explicit string) string {
 		return path
 	}
 	return ""
+}
+
+func fakeTCPObjectPathFromEnv(explicit string) string {
+	if explicit != "" {
+		return explicit
+	}
+	return os.Getenv(EnvFakeTCPObjectPath)
 }
 
 func DisplayObjectPath(explicit string) string {

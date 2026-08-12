@@ -5,10 +5,16 @@ package dataplane
 import (
 	"context"
 	"errors"
+	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"path/filepath"
 	"testing"
 
+	"github.com/cilium/ebpf"
+	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 )
@@ -34,12 +40,13 @@ func TestNewLoaderReturnsSharedFakeTCPProductionCoordinator(t *testing.T) {
 	}
 }
 
-func TestNewLoaderCoordinatorGatesBeforeInvalidBaselinePinPath(t *testing.T) {
-	t.Setenv(EnvPinPath, "relative-path-must-not-be-touched")
-	t.Setenv(EnvObjectPath, "object-must-not-be-opened")
+func TestNewLoaderCoordinatorRequiresResidentRuntimeBeforePlanning(t *testing.T) {
+	t.Setenv(EnvPinPath, filepath.Join(t.TempDir(), "pins"))
+	t.Setenv(EnvObjectPath, "")
+	t.Setenv(EnvFakeTCPObjectPath, "")
 	err := NewLoader().Apply(t.Context(), fakeTCPProductionTestState())
-	if !errors.Is(err, ErrFakeTCPKernelGate) {
-		t.Fatalf("production coordinator did not fail at the pre-mutation gate: %v", err)
+	if !errors.Is(err, ErrFakeTCPResidentRuntimeRequired) {
+		t.Fatalf("production coordinator did not fail at the resident gate: %v", err)
 	}
 }
 
@@ -72,11 +79,12 @@ func TestResolveLinuxFakeTCPProductionScopeIncludesEveryOwnershipSelector(t *tes
 		t.Fatal(err)
 	}
 	want := fakeTCPProductionScopeIdentity{
-		objectKind:      fakeTCPProductionObjectScopeFilesystem,
-		objectPath:      objectPath,
-		pinPath:         pinPath,
-		lifecyclePath:   lifecyclePath,
-		adoptLegacyPins: true,
+		objectKind:        fakeTCPProductionObjectScopeFilesystem,
+		objectPath:        objectPath,
+		fakeTCPObjectPath: EmbeddedFakeTCPObjectSource,
+		pinPath:           pinPath,
+		lifecyclePath:     lifecyclePath,
+		adoptLegacyPins:   true,
 	}
 	if got != want {
 		t.Fatalf("resolved scope = %#v, want %#v", got, want)
@@ -117,7 +125,8 @@ func TestResolveLinuxFakeTCPProductionScopeRepresentsEmbeddedObjectExplicitly(t 
 		t.Fatal(err)
 	}
 	if got.objectKind != fakeTCPProductionObjectScopeEmbedded ||
-		got.objectPath != EmbeddedObjectSource || got.pinPath != pinPath ||
+		got.objectPath != EmbeddedObjectSource ||
+		got.fakeTCPObjectPath != EmbeddedFakeTCPObjectSource || got.pinPath != pinPath ||
 		got.lifecyclePath != lifecyclePath {
 		t.Fatalf("embedded production scope = %#v", got)
 	}
@@ -127,6 +136,8 @@ func TestNewProductionLoaderFreezesEnvironmentBackedScopeSelectors(t *testing.T)
 	root := fakeTCPProductionRealTempDir(t)
 	objectA := filepath.Join(root, "object-a.o")
 	objectB := filepath.Join(root, "object-b.o")
+	fakeObjectA := filepath.Join(root, "faketcp-object-a.o")
+	fakeObjectB := filepath.Join(root, "faketcp-object-b.o")
 	pinA := filepath.Join(root, "pins-a")
 	pinB := filepath.Join(root, "pins-b")
 	lifecyclePath := filepath.Join(root, "daemon.lease")
@@ -138,23 +149,26 @@ func TestNewProductionLoaderFreezesEnvironmentBackedScopeSelectors(t *testing.T)
 
 	t.Run("explicit environment selection", func(t *testing.T) {
 		t.Setenv(EnvObjectPath, objectA)
+		t.Setenv(EnvFakeTCPObjectPath, fakeObjectA)
 		t.Setenv(EnvPinPath, pinA)
 		coordinator, ok := NewLoaderWithOptions(LoaderOptions{AdoptLegacyPins: true}).(*fakeTCPProductionCoordinator)
 		if !ok {
 			t.Fatalf("NewLoaderWithOptions returned %T", NewLoaderWithOptions(LoaderOptions{}))
 		}
 		baseline, ok := coordinator.baseline.(LinuxLoader)
-		if !ok || !baseline.objectPathFrozen {
+		if !ok || !baseline.objectPathFrozen || !baseline.fakeTCPObjectPathFrozen {
 			t.Fatalf("production baseline is not frozen: %#v", coordinator.baseline)
 		}
 
 		t.Setenv(EnvObjectPath, objectB)
+		t.Setenv(EnvFakeTCPObjectPath, fakeObjectB)
 		t.Setenv(EnvPinPath, pinB)
 		scope, err := coordinator.resolveScope(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if scope.objectPath != objectA || scope.pinPath != pinA ||
+		if scope.objectPath != objectA || scope.fakeTCPObjectPath != fakeObjectA ||
+			scope.pinPath != pinA ||
 			!scope.adoptLegacyPins {
 			t.Fatalf("environment changed frozen scope: %#v", scope)
 		}
@@ -162,19 +176,22 @@ func TestNewProductionLoaderFreezesEnvironmentBackedScopeSelectors(t *testing.T)
 
 	t.Run("embedded selection", func(t *testing.T) {
 		t.Setenv(EnvObjectPath, "")
+		t.Setenv(EnvFakeTCPObjectPath, "")
 		t.Setenv(EnvPinPath, pinA)
 		coordinator, ok := NewLoader().(*fakeTCPProductionCoordinator)
 		if !ok {
 			t.Fatalf("NewLoader returned %T", NewLoader())
 		}
 		t.Setenv(EnvObjectPath, objectB)
+		t.Setenv(EnvFakeTCPObjectPath, fakeObjectB)
 		t.Setenv(EnvPinPath, pinB)
 		scope, err := coordinator.resolveScope(ctx)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if scope.objectKind != fakeTCPProductionObjectScopeEmbedded ||
-			scope.objectPath != EmbeddedObjectSource || scope.pinPath != pinA {
+			scope.objectPath != EmbeddedObjectSource ||
+			scope.fakeTCPObjectPath != EmbeddedFakeTCPObjectSource || scope.pinPath != pinA {
 			t.Fatalf("environment changed frozen embedded scope: %#v", scope)
 		}
 	})
@@ -230,7 +247,7 @@ func TestExperimentalProductionPlannerInjectsRequestAndFactory(t *testing.T) {
 	}
 }
 
-func TestLiveExperimentalProductionPlanningRemainsPreMutationFailClosed(t *testing.T) {
+func TestLiveExperimentalProductionPlanningRequiresResidentRuntimeBeforeMutation(t *testing.T) {
 	baseline := &fakeTCPProductionTestBaseline{}
 	coordinator := &fakeTCPProductionCoordinator{
 		baseline: baseline,
@@ -238,31 +255,437 @@ func TestLiveExperimentalProductionPlanningRemainsPreMutationFailClosed(t *testi
 			supervisor: &fakeTCPRuntimeSupervisor{},
 			owner:      dataplaneCoreOwnerUnknown,
 		},
-		// Model a future gate opening without silently making the incomplete
-		// request planner attachable.
 		validateActivation: func(*control.State) error { return nil },
 		resolveScope: func(context.Context) (fakeTCPProductionScopeIdentity, error) {
 			return fakeTCPProductionTestScope(), nil
 		},
 		planExperimental: composeExperimentalFakeTCPProductionPlanner(
-			LinuxLoader{ObjectPath: "/experimental-planning-test.o"},
+			LinuxLoader{
+				ObjectPath:              "/experimental-planning-test.o",
+				objectPathFrozen:        true,
+				fakeTCPObjectPathFrozen: true,
+			},
 			buildLiveExperimentalFakeTCPProductionRequest,
 			func(
 				context.Context,
 				*experimentalFakeTCPProductionRequest,
 			) (fakeTCPRuntimeService, error) {
-				t.Fatal("live factory ran without lifecycle/isolation request planning")
+				t.Fatal("live factory ran without resident runtime ownership")
 				return nil, nil
 			},
 		),
 	}
 
 	err := coordinator.Apply(t.Context(), fakeTCPProductionTestState())
-	if !errors.Is(err, errExperimentalFakeTCPProductionRequestUnavailable) {
-		t.Fatalf("Apply error = %v, want incomplete live planning error", err)
+	if !errors.Is(err, ErrFakeTCPResidentRuntimeRequired) {
+		t.Fatalf("Apply error = %v, want resident runtime error", err)
 	}
 	apply, detach, stale := baseline.counts()
 	if apply != 0 || detach != 0 || stale != 0 {
 		t.Fatalf("live planning failure mutated baseline: apply=%d detach=%d stale=%d", apply, detach, stale)
+	}
+}
+
+func TestLiveExperimentalProductionPlannerProbesKernelDependencyBeforeObjectAndLeasePlan(t *testing.T) {
+	files := token.NewFileSet()
+	parsed, err := parser.ParseFile(
+		files, "faketcp_production_linux.go", nil, parser.SkipObjectResolution,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var target *ast.FuncDecl
+	for _, declaration := range parsed.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if ok && function.Name.Name == "buildLiveExperimentalFakeTCPProductionRequest" {
+			target = function
+			break
+		}
+	}
+	if target == nil {
+		t.Fatal("live production request builder is absent")
+	}
+	positions := map[string]token.Pos{}
+	ast.Inspect(target.Body, func(node ast.Node) bool {
+		call, ok := node.(*ast.CallExpr)
+		if !ok {
+			return true
+		}
+		identifier, ok := call.Fun.(*ast.Ident)
+		if !ok {
+			return true
+		}
+		switch identifier.Name {
+		case "probeExperimentalFakeTCPKernelDependency",
+			"loadFakeTCPCollectionSpecFromResolvedPath",
+			"newFakeTCPPolicyGenerationTransaction":
+			if positions[identifier.Name] == token.NoPos {
+				positions[identifier.Name] = identifier.Pos()
+			}
+		}
+		return true
+	})
+	probe := positions["probeExperimentalFakeTCPKernelDependency"]
+	load := positions["loadFakeTCPCollectionSpecFromResolvedPath"]
+	transaction := positions["newFakeTCPPolicyGenerationTransaction"]
+	if probe == token.NoPos || load == token.NoPos || transaction == token.NoPos ||
+		!(probe < load && load < transaction) {
+		t.Fatalf(
+			"planner order probe=%d load=%d transaction=%d; want dependency probe before object/lease plan",
+			probe, load, transaction,
+		)
+	}
+}
+
+func TestFakeTCPProductionDesiredKeyBindsCipherAndObjectIdentity(t *testing.T) {
+	state := fakeTCPPolicyStateWithInterfaces(1)
+	state.WireGuards[0].RuntimeStateAvailable = true
+	state.WireGuards[0].RuntimeFirewallMark = 0x9001
+	state.Ciphers = []control.CipherState{{ID: 1, Name: "secret", KeyLen: 16, KeyMask: 15}}
+	state.Ciphers[0].Key[0] = 0x11
+	plan, err := buildFakeTCPPolicyGenerationPlan(state, state.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	baseline, err := abi.FromStateWithGeneration(state, state.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcx, err := fakeTCPProductionTCXRequests(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	xdp := fakeTCPProductionXDPRequests(plan)
+	identity := ObjectIdentity{
+		Source:   EmbeddedFakeTCPObjectSource,
+		SHA256:   "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+		Embedded: true,
+	}
+	scope := fakeTCPProductionTestScope()
+	engine := runtimeTestEngineOptions(state.Generation)
+	first, err := fakeTCPProductionDesiredKey(
+		state, identity, scope, baseline, plan, engine, tcx, xdp,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := fakeTCPProductionDesiredKey(
+		state, identity, scope, baseline, plan, engine, tcx, xdp,
+	)
+	if err != nil || again != first {
+		t.Fatalf("stable desired key changed: first=%x again=%x err=%v", first, again, err)
+	}
+	state.Ciphers[0].Key[0] ^= 0xff
+	secretBaseline, err := abi.FromStateWithGeneration(state, state.Generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secretChanged, err := fakeTCPProductionDesiredKey(
+		state, identity, scope, secretBaseline, plan, engine, tcx, xdp,
+	)
+	if err != nil || secretChanged == first {
+		t.Fatalf("cipher-only change was not bound: key=%x err=%v", secretChanged, err)
+	}
+	state.Ciphers[0].Key[0] ^= 0xff
+	identity.SHA256 = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+	objectChanged, err := fakeTCPProductionDesiredKey(
+		state, identity, scope, baseline, plan, engine, tcx, xdp,
+	)
+	if err != nil || objectChanged == first {
+		t.Fatalf("object-only change was not bound: key=%x err=%v", objectChanged, err)
+	}
+}
+
+func TestValidateFakeTCPProductionReferencesRejectsAmbiguousOwnership(t *testing.T) {
+	base := func() *control.State {
+		return &control.State{
+			Generation: 7,
+			WireGuards: []control.WireGuardState{
+				{ID: 1, Name: "fake", TransportMode: "faketcp"},
+				{ID: 2, Name: "udp", TransportMode: "udp"},
+			},
+			EgressRules: []control.EgressRule{{
+				Generation: 7, WGID: 1, TransportMode: "faketcp",
+			}},
+			IngressListeners: []control.IngressListener{{
+				Generation: 7, WGID: 1, TransportMode: "faketcp",
+			}},
+		}
+	}
+	for _, test := range []struct {
+		name   string
+		mutate func(*control.State)
+	}{
+		{name: "two FakeTCP WireGuards", mutate: func(state *control.State) {
+			state.WireGuards[1].TransportMode = "faketcp"
+		}},
+		{name: "egress FakeTCP wrong owner", mutate: func(state *control.State) {
+			state.EgressRules[0].WGID = 2
+		}},
+		{name: "ingress selected owner wrong mode", mutate: func(state *control.State) {
+			state.IngressListeners[0].TransportMode = "udp"
+		}},
+		{name: "duplicate WireGuard ID", mutate: func(state *control.State) {
+			state.WireGuards[1].ID = 1
+		}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state := base()
+			test.mutate(state)
+			if _, err := validateFakeTCPProductionReferences(state); err == nil {
+				t.Fatalf("ambiguous state was accepted: %#v", state)
+			}
+		})
+	}
+	state := base()
+	selected, err := validateFakeTCPProductionReferences(state)
+	if err != nil || selected.ID != 1 {
+		t.Fatalf("valid sole-owner state rejected: selected=%#v err=%v", selected, err)
+	}
+}
+
+func TestCloneFakeTCPProductionStateOwnsEverySlice(t *testing.T) {
+	state := &control.State{
+		Profiles:         []control.ProfileState{{ID: 1}},
+		Ciphers:          []control.CipherState{{ID: 2}},
+		WireGuards:       []control.WireGuardState{{ID: 3}},
+		Underlays:        []control.UnderlayState{{ID: 4}},
+		ManagedFwmarks:   []control.ManagedFwmarkRule{{FwMark: 5}},
+		EgressRules:      []control.EgressRule{{WGID: 6}},
+		IngressListeners: []control.IngressListener{{WGID: 7}},
+		ICMPListeners:    []control.ICMPListener{{WGID: 8}},
+		Warnings:         []string{"nine"},
+	}
+	frozen := cloneFakeTCPProductionState(state)
+	state.Profiles[0].ID = 11
+	state.Ciphers[0].ID = 12
+	state.WireGuards[0].ID = 13
+	state.Underlays[0].ID = 14
+	state.ManagedFwmarks[0].FwMark = 15
+	state.EgressRules[0].WGID = 16
+	state.IngressListeners[0].WGID = 17
+	state.ICMPListeners[0].WGID = 18
+	state.Warnings[0] = "changed"
+	if frozen.Profiles[0].ID != 1 || frozen.Ciphers[0].ID != 2 ||
+		frozen.WireGuards[0].ID != 3 || frozen.Underlays[0].ID != 4 ||
+		frozen.ManagedFwmarks[0].FwMark != 5 || frozen.EgressRules[0].WGID != 6 ||
+		frozen.IngressListeners[0].WGID != 7 || frozen.ICMPListeners[0].WGID != 8 ||
+		frozen.Warnings[0] != "nine" {
+		t.Fatalf("frozen state aliases caller slices: %#v", frozen)
+	}
+}
+
+func TestProductionFakeTCPTCXStageUsesEmptyRevisionFencedAggregates(t *testing.T) {
+	state := &control.State{Underlays: []control.UnderlayState{{
+		Name: "underlay", Parser: "ethernet", IfIndex: 7, Role: "transform", Resolved: true,
+	}}}
+	kernel := newFakeExactTCXKernel()
+	commits := 0
+	stage, err := stageProductionFakeTCPTCX(
+		t.Context(), state,
+		&fakeExperimentalOwnedProgram{id: 101},
+		&fakeExperimentalOwnedProgram{id: 102},
+		func() error { commits++; return nil },
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stage == nil {
+		t.Fatal("stage is nil")
+	}
+	if len(stage.attachments) != 2 || commits != 1 {
+		t.Fatalf("attachments=%d commits=%d", len(stage.attachments), commits)
+	}
+	if len(kernel.events) < 4 || kernel.events[0] != "query" ||
+		kernel.events[1] != "query" || kernel.events[2] != "attach" {
+		t.Fatalf("TCX stage did not preflight every hook before first attach: %v", kernel.events)
+	}
+	for _, attachment := range stage.attachments {
+		if attachment.identity.LinkID == 0 || attachment.identity.ProgramID == 0 {
+			t.Fatalf("incomplete exact TCX identity: %+v", attachment.identity)
+		}
+	}
+	if err := stage.Healthy(t.Context()); err != nil {
+		t.Fatalf("new exact TCX owner is unhealthy: %v", err)
+	}
+	eventsBeforeClose := len(kernel.events)
+	wantFirstClose := stage.attachments[1].identity.LinkID
+	wantSecondClose := stage.attachments[0].identity.LinkID
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	closeEvents := kernel.events[eventsBeforeClose:]
+	if len(closeEvents) != 2 || closeEvents[0] != fmt.Sprintf("close:%d", wantFirstClose) ||
+		closeEvents[1] != fmt.Sprintf("close:%d", wantSecondClose) {
+		t.Fatalf("TCX owners were not closed in reverse order: %v", closeEvents)
+	}
+	if err := stage.Healthy(t.Context()); err == nil {
+		t.Fatal("closed exact TCX owner reported healthy")
+	}
+	for _, attach := range []ebpf.AttachType{ebpf.AttachTCXIngress, ebpf.AttachTCXEgress} {
+		query, err := kernel.runtime().query(7, attach)
+		if err != nil || len(query.Programs) != 0 {
+			t.Fatalf("TCX owner remained after close: attach=%s query=%+v err=%v", attach, query, err)
+		}
+	}
+}
+
+type mismatchedProductionTCXIdentityLink struct {
+	exactTCXKernelLink
+}
+
+func (link mismatchedProductionTCXIdentityLink) Identity() (exactTCXLinkIdentity, error) {
+	identity, err := link.exactTCXKernelLink.Identity()
+	identity.ProgramID++
+	return identity, err
+}
+
+func TestProductionFakeTCPTCXStageIdentityMismatchReturnsExactRollbackOwner(t *testing.T) {
+	state := &control.State{Underlays: []control.UnderlayState{{
+		Name: "underlay", Parser: "ethernet", IfIndex: 7, Role: "transform", Resolved: true,
+	}}}
+	kernel := newFakeExactTCXKernel()
+	runtime := kernel.runtime()
+	liveAttach := runtime.attach
+	runtime.attach = func(
+		ifindex int,
+		attach ebpf.AttachType,
+		revision uint64,
+		program exactTCXProgram,
+	) (exactTCXKernelLink, error) {
+		owner, err := liveAttach(ifindex, attach, revision, program)
+		if owner == nil {
+			return nil, err
+		}
+		return mismatchedProductionTCXIdentityLink{exactTCXKernelLink: owner}, err
+	}
+	stage, err := stageProductionFakeTCPTCX(
+		t.Context(), state,
+		&fakeExperimentalOwnedProgram{id: 101},
+		&fakeExperimentalOwnedProgram{id: 102},
+		func() error { t.Fatal("commit ran after identity mismatch"); return nil },
+		runtime,
+	)
+	if err == nil || stage == nil || len(stage.attachments) != 1 {
+		t.Fatalf("identity mismatch lost exact rollback owner: stage=%#v err=%v", stage, err)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	query, err := kernel.runtime().query(7, ebpf.AttachTCXIngress)
+	if err != nil || len(query.Programs) != 0 {
+		t.Fatalf("identity mismatch rollback left attachment: query=%+v err=%v", query, err)
+	}
+}
+
+func TestProductionFakeTCPTCXStageRefusesExistingAggregateBeforeAttach(t *testing.T) {
+	state := &control.State{Underlays: []control.UnderlayState{{
+		Name: "underlay", Parser: "ethernet", IfIndex: 7, Role: "transform", Resolved: true,
+	}}}
+	kernel := newFakeExactTCXKernel()
+	kernel.addLink(7, ebpf.AttachTCXIngress, 99)
+	stage, err := stageProductionFakeTCPTCX(
+		t.Context(), state,
+		&fakeExperimentalOwnedProgram{id: 101},
+		&fakeExperimentalOwnedProgram{id: 102},
+		func() error { t.Fatal("commit ran for occupied aggregate"); return nil },
+		kernel.runtime(),
+	)
+	if err == nil || stage != nil {
+		t.Fatalf("occupied aggregate was accepted: stage=%#v err=%v", stage, err)
+	}
+	if got := len(kernel.events); got != 1 {
+		t.Fatalf("occupied aggregate caused later queries or writes: events=%v", kernel.events)
+	}
+}
+
+func TestProductionFakeTCPTCXStageFinalRecheckCatchesEarlierHookRace(t *testing.T) {
+	state := &control.State{Underlays: []control.UnderlayState{{
+		Name: "underlay", Parser: "ethernet", IfIndex: 7, Role: "transform", Resolved: true,
+	}}}
+	kernel := newFakeExactTCXKernel()
+	queries := 0
+	kernel.beforeQuery = func(kernel *fakeExactTCXKernel, slot fakeExactTCXSlot) {
+		queries++
+		// Two preflight queries and two immediate post-attach queries precede
+		// the final all-hooks pass. Race a foreign program into the first hook
+		// exactly as that final pass begins.
+		if queries == 5 && slot.attach == ebpf.AttachTCXIngress {
+			kernel.addLink(slot.ifindex, slot.attach, 999)
+		}
+	}
+	commits := 0
+	stage, err := stageProductionFakeTCPTCX(
+		t.Context(), state,
+		&fakeExperimentalOwnedProgram{id: 101},
+		&fakeExperimentalOwnedProgram{id: 102},
+		func() error { commits++; return nil },
+		kernel.runtime(),
+	)
+	if err == nil || stage == nil {
+		t.Fatalf("final aggregate race was accepted: stage=%#v err=%v", stage, err)
+	}
+	if commits != 0 {
+		t.Fatalf("commit ran after final aggregate race: %d", commits)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	query, err := kernel.runtime().query(7, ebpf.AttachTCXIngress)
+	if err != nil || len(query.Programs) != 1 || query.Programs[0].ProgramID != 999 {
+		t.Fatalf("rollback did not preserve only foreign owner: query=%+v err=%v", query, err)
+	}
+}
+
+func TestProductionFakeTCPTCXStageRevisionRaceCreatesNoOwner(t *testing.T) {
+	state := &control.State{Underlays: []control.UnderlayState{{
+		Name: "underlay", Parser: "ethernet", IfIndex: 7, Role: "transform", Resolved: true,
+	}}}
+	kernel := newFakeExactTCXKernel()
+	kernel.beforeAttach = func(kernel *fakeExactTCXKernel, slot fakeExactTCXSlot) {
+		kernel.revs[slot] = kernel.revision(slot) + 1
+		kernel.beforeAttach = nil
+	}
+	stage, err := stageProductionFakeTCPTCX(
+		t.Context(), state,
+		&fakeExperimentalOwnedProgram{id: 101},
+		&fakeExperimentalOwnedProgram{id: 102},
+		func() error { t.Fatal("commit ran after revision race"); return nil },
+		kernel.runtime(),
+	)
+	if err == nil || stage != nil {
+		t.Fatalf("revision race was accepted: stage=%#v err=%v", stage, err)
+	}
+	for _, link := range kernel.links {
+		if link.attached {
+			t.Fatalf("revision race created a TCX owner: %#v", link)
+		}
+	}
+}
+
+func TestProductionFakeTCPTCXStageCloseRetainsFailedOwnerForRetry(t *testing.T) {
+	state := &control.State{Underlays: []control.UnderlayState{{
+		Name: "underlay", Parser: "ethernet", IfIndex: 7, Role: "transform", Resolved: true,
+	}}}
+	kernel := newFakeExactTCXKernel()
+	stage, err := stageProductionFakeTCPTCX(
+		t.Context(), state,
+		&fakeExperimentalOwnedProgram{id: 101},
+		&fakeExperimentalOwnedProgram{id: 102},
+		func() error { return nil },
+		kernel.runtime(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	failedID := stage.attachments[1].identity.LinkID
+	kernel.closeErrs[failedID] = []error{errors.New("injected close failure")}
+	if err := stage.Close(); err == nil || len(stage.attachments) != 1 ||
+		stage.attachments[0].identity.LinkID != failedID {
+		t.Fatalf("failed close owner was not retained exactly: attachments=%#v err=%v", stage.attachments, err)
+	}
+	if err := stage.Close(); err != nil || len(stage.attachments) != 0 {
+		t.Fatalf("retry did not close retained owner: attachments=%#v err=%v", stage.attachments, err)
 	}
 }

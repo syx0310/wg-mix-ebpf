@@ -54,20 +54,12 @@ func TestReloadFakeTCPGatePrecedesGuardAndLoaderInApplyAndDryRun(t *testing.T) {
 					dataplaneLoader: loader,
 				},
 			})
-			if !errors.Is(err, dataplane.ErrFakeTCPKernelGate) {
-				t.Fatalf("expected FakeTCP activation gate, got %v", err)
-			}
-			if strings.Contains(err.Error(), "BPF control-event admission/coalescing under SYN flood") {
-				t.Fatalf("gate still reports implemented BPF control-event admission as missing: %v", err)
-			}
-			for _, want := range []string{
-				"RST/FIN full IPv4/TCP checksum and receive-window validation",
-				"parser:l3 FakeTCP policy and attachment support",
-				"real-NIC GSO/GRO/checksum-offload acceptance",
-			} {
-				if !strings.Contains(err.Error(), want) {
-					t.Fatalf("gate error missing %q: %v", want, err)
+			if dryRun {
+				if err != nil {
+					t.Fatalf("production FakeTCP dry-run rejected: %v", err)
 				}
+			} else if !errors.Is(err, dataplane.ErrFakeTCPResidentRuntimeRequired) {
+				t.Fatalf("expected resident FakeTCP runtime gate, got %v", err)
 			}
 			if len(guardExec.plans) != 0 || guardExec.cleanupCalls != 0 || loader.applyCalls != 0 {
 				t.Fatalf("gate ran after mutation: guard apply=%d cleanup=%d loader=%d", len(guardExec.plans), guardExec.cleanupCalls, loader.applyCalls)
@@ -99,6 +91,26 @@ profiles:
 		t.Fatal(err)
 	}
 	return cfg
+}
+
+func TestValidateFakeTCPStartupIsolationRequiresFixedListenPortBeforeMutation(t *testing.T) {
+	cfg := mustFakeTCPReconcileConfig(t)
+	state := &control.State{WireGuards: []control.WireGuardState{{
+		Name: "wg0", TransportMode: "faketcp",
+	}}}
+	if err := validateFakeTCPStartupIsolation(cfg, state); err == nil ||
+		!strings.Contains(err.Error(), "fixed non-zero ListenPort") {
+		t.Fatalf("missing fixed FakeTCP listen port error = %v", err)
+	}
+	state.WireGuards[0].ConfigListenPort = 31001
+	if err := validateFakeTCPStartupIsolation(cfg, state); err != nil {
+		t.Fatalf("fixed FakeTCP listen port rejected: %v", err)
+	}
+	cfg.StartupGuard.Mode = "none"
+	if err := validateFakeTCPStartupIsolation(cfg, state); err == nil ||
+		!strings.Contains(err.Error(), "nft-temporary-drop") {
+		t.Fatalf("disabled FakeTCP guard error = %v", err)
+	}
 }
 
 func TestStopCleansFixedGuardTableWhenCurrentConfigDisablesGuard(t *testing.T) {
@@ -350,6 +362,114 @@ func TestReloadUsesSingleConfigSnapshotAndExpandsGuardForRuntimeMark(t *testing.
 	}
 	if guardExec.cleanupCalls != 1 || !result.GuardApplied || !result.GuardCleaned {
 		t.Fatalf("unexpected guard completion: cleanup=%d result=%#v", guardExec.cleanupCalls, result)
+	}
+}
+
+func TestReloadPassesExactHeldLifecycleLeaseToConstructedLoader(t *testing.T) {
+	const mark = uint32(0x10000002)
+	cfgPath := writeReconcileConfig(t, "[Interface]\nListenPort = 31001\nFwMark = 0x10000002\n")
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+	lease, err := lockfile.AcquireLifecycle(ctx, lockfile.LifecycleOwner{
+		PID: os.Getpid(), Action: "daemon", ConfigPath: cfgPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer lease.Close()
+
+	loader := &recordingDataplaneLoader{}
+	var constructed dataplane.LoaderOptions
+	_, err = Reload(ctx, Options{
+		ConfigPath:      cfgPath,
+		RunDir:          t.TempDir(),
+		StateDir:        t.TempDir(),
+		LifecycleLease:  lease,
+		ResidentRuntime: true,
+		deps: &dependencies{
+			runtimeProvider: runtime.StaticProvider{Devices: map[string]*runtime.Device{
+				"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: mark, Up: true},
+			}},
+			underlayResolver: underlay.StaticResolver{Underlays: map[string]*underlay.Resolved{
+				"eth0": {Name: "eth0", IfName: "eth0", IfIndex: 2, LinkType: "ethernet", Role: "transform"},
+			}},
+			guardExecutor: &recordingGuardExecutor{},
+			newDataplaneLoader: func(options dataplane.LoaderOptions) dataplane.Loader {
+				constructed = options
+				return loader
+			},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if constructed.LifecycleLease != lease {
+		t.Fatal("reload constructor did not receive the exact already-held lifecycle lease")
+	}
+	if !constructed.ResidentRuntime {
+		t.Fatal("reload constructor did not receive the resident-runtime capability")
+	}
+	if loader.applyCalls != 1 {
+		t.Fatalf("dataplane apply calls = %d, want 1", loader.applyCalls)
+	}
+}
+
+func TestReloadKeepsFakeTCPStartupGuardWhenInitialRuntimeHealthFails(t *testing.T) {
+	const mark = uint32(0x10000002)
+	healthErr := errors.New("initial FakeTCP XDP aggregate identity drifted")
+	guardExec := &recordingGuardExecutor{}
+	loader := &recordingDataplaneLoader{}
+	stateDir := t.TempDir()
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+
+	result, err := Reload(ctx, Options{
+		ConfigPath:      "/ignored/by-test-loader.yaml",
+		RunDir:          t.TempDir(),
+		StateDir:        stateDir,
+		ResidentRuntime: true,
+		deps: &dependencies{
+			loadConfigFile: func(string) (*config.Config, error) {
+				return mustFakeTCPReconcileConfig(t), nil
+			},
+			loadWGConfig: func(string) (*wgconfig.Interface, error) {
+				port := uint16(31001)
+				value := mark
+				return &wgconfig.Interface{FwMark: &value, ListenPort: &port}, nil
+			},
+			runtimeProvider: runtime.StaticProvider{Devices: map[string]*runtime.Device{
+				"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: mark, Up: true},
+			}},
+			underlayResolver: underlay.StaticResolver{Underlays: map[string]*underlay.Resolved{
+				"eth0": {Name: "eth0", IfName: "eth0", IfIndex: 2, LinkType: "ethernet", Role: "transform"},
+			}},
+			guardExecutor:   guardExec,
+			dataplaneLoader: loader,
+			productionFakeTCPStatus: func(context.Context, *control.State) (bool, *dataplane.KernelStatus, error) {
+				return true, &dataplane.KernelStatus{Mode: "faketcp"}, healthErr
+			},
+		},
+	})
+	if result != nil || !errors.Is(err, healthErr) ||
+		!strings.Contains(err.Error(), "verify production FakeTCP runtime health after apply") {
+		t.Fatalf("result=%#v error=%v, want complete initial health failure", result, err)
+	}
+	if loader.applyCalls != 1 || guardExec.cleanupCalls != 0 || len(guardExec.plans) == 0 {
+		t.Fatalf(
+			"initial health failure boundary: apply=%d guard-plans=%d cleanup=%d",
+			loader.applyCalls, len(guardExec.plans), guardExec.cleanupCalls,
+		)
+	}
+	if _, loadErr := attachstate.Load(stateDir); !errors.Is(loadErr, os.ErrNotExist) {
+		t.Fatalf("initial health failure published attach-state: %v", loadErr)
 	}
 }
 

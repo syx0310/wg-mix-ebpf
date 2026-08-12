@@ -145,6 +145,40 @@ func TestAutoBackendFreshIdleStateIsNoOp(t *testing.T) {
 	}
 }
 
+func TestNewProductionLoaderKeepsFakeTCPSelectorAndLifecycleLeaseSeparate(t *testing.T) {
+	baselineObject := filepath.Join(t.TempDir(), "baseline.o")
+	environmentFakeTCPObject := filepath.Join(t.TempDir(), "environment-faketcp.o")
+	explicitFakeTCPObject := filepath.Join(t.TempDir(), "explicit-faketcp.o")
+	lease := &lockfile.LifecycleLease{}
+	t.Setenv(EnvObjectPath, baselineObject)
+	t.Setenv(EnvFakeTCPObjectPath, environmentFakeTCPObject)
+
+	coordinator, ok := NewLoaderWithOptions(LoaderOptions{
+		FakeTCPObjectPath: explicitFakeTCPObject,
+		LifecycleLease:    lease,
+		ResidentRuntime:   true,
+	}).(*fakeTCPProductionCoordinator)
+	if !ok {
+		t.Fatalf("NewLoaderWithOptions returned %T", coordinator)
+	}
+	loader, ok := coordinator.baseline.(LinuxLoader)
+	if !ok {
+		t.Fatalf("production baseline = %T, want LinuxLoader", coordinator.baseline)
+	}
+	if loader.ObjectPath != baselineObject {
+		t.Fatalf("baseline object = %q, want %q", loader.ObjectPath, baselineObject)
+	}
+	if loader.FakeTCPObjectPath != explicitFakeTCPObject {
+		t.Fatalf("FakeTCP object = %q, want explicit %q", loader.FakeTCPObjectPath, explicitFakeTCPObject)
+	}
+	if loader.LifecycleLease != lease {
+		t.Fatal("production loader did not retain the exact held lifecycle lease")
+	}
+	if !loader.ResidentRuntime {
+		t.Fatal("production loader did not retain the resident-runtime capability")
+	}
+}
+
 func TestDurableAutoBackendKeepsClassicOwner(t *testing.T) {
 	bpffsRoot, validator := newTestBPFFS(t)
 	pinPath := filepath.Join(bpffsRoot, pinPathPrefix)

@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/faketcp"
@@ -252,12 +253,26 @@ type fakeExperimentalCoreStage struct {
 	commitErr         error
 	deactivateErr     error
 	closeErr          error
+	healthErr         error
 	commits           int
 	deactivates       int
 	closes            int
 	active            bool
 	deactivateStarted chan struct{}
 	deactivateOnce    sync.Once
+}
+
+func (stage *fakeExperimentalCoreStage) Healthy(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if stage.healthErr != nil {
+		return stage.healthErr
+	}
+	if !stage.active {
+		return errors.New("core selector is inactive")
+	}
+	return nil
 }
 
 func (stage *fakeExperimentalCoreStage) Deactivate() error {
@@ -291,9 +306,17 @@ func (stage *fakeExperimentalCoreStage) Close() error {
 }
 
 type fakeExperimentalTCStage struct {
-	trace    *[]string
-	closeErr error
-	closes   int
+	trace     *[]string
+	closeErr  error
+	healthErr error
+	closes    int
+}
+
+func (stage *fakeExperimentalTCStage) Healthy(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return stage.healthErr
 }
 
 func (stage *fakeExperimentalTCStage) Close() error {
@@ -431,6 +454,16 @@ func (fixture *runtimeTestFixture) commitGeneration(
 		if identityMap != fixture.mapResources[fakeTCPRuntimeIDMapName].bpfMap ||
 			sequenceMap != fixture.mapResources[fakeTCPCaptureSeqMapName].bpfMap {
 			return errors.New("fresh collection exposed unrelated runtime maps")
+		}
+		identityBackend, ok := fixture.mapResources[fakeTCPRuntimeIDMapName].fakeTCPPolicyMap.(*memoryFakeTCPPolicyMap)
+		if !ok {
+			return errors.New("runtime identity fixture map has an unexpected backend")
+		}
+		identity := engine.Identity()
+		identityBackend.entries[uint32(0)] = abi.FakeTCPRuntimeIdentityValue{
+			Generation:      identity.Generation,
+			Incarnation:     [16]byte(identity.Incarnation),
+			EventABIVersion: abi.FakeTCPEventABIVersion,
 		}
 		fixture.retainedRelease = release
 		fixture.activationTrace = append(fixture.activationTrace, "seed")
@@ -656,6 +689,54 @@ func TestExperimentalFakeTCPRuntimeBuildsPolicyTailCallsXDPAndHandles(t *testing
 	}
 	if err := handles.WithEventsMap(func(*ebpf.Map) error { return nil }); !errors.Is(err, ErrExperimentalFakeTCPRuntimeClosed) {
 		t.Fatalf("retained event constructor after close error = %v", err)
+	}
+}
+
+func TestExperimentalFakeTCPRuntimeHealthRechecksEveryKernelOwner(t *testing.T) {
+	fixture := newRuntimeTestFixture(t)
+	runtime, _, err := fixture.build(t, 91)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.xdpRuntime.mu.Lock()
+	for _, request := range []fakeTCPXDPAttachRequest{
+		{IfIndex: 3, Mode: fakeTCPXDPAttachNative},
+		{IfIndex: 9, Mode: fakeTCPXDPAttachGeneric},
+	} {
+		identity := fixture.xdpRuntime.links[request.IfIndex].identity
+		attachMode := uint32(link.XDPDriverMode)
+		if request.Mode == fakeTCPXDPAttachGeneric {
+			attachMode = uint32(link.XDPGenericMode)
+		}
+		fixture.xdpRuntime.probes[request.IfIndex] = fakeTCPXDPProbe{
+			IfIndex: request.IfIndex, Attached: true,
+			ProgramID: identity.ProgramID, AttachMode: attachMode,
+		}
+	}
+	fixture.xdpRuntime.mu.Unlock()
+	if err := runtime.Healthy(t.Context()); err != nil {
+		t.Fatalf("healthy runtime: %v", err)
+	}
+	fixture.lastTCStage.healthErr = errors.New("TCX owner disappeared")
+	if err := runtime.Healthy(t.Context()); err == nil ||
+		!strings.Contains(err.Error(), "TCX owner disappeared") {
+		t.Fatalf("unhealthy TCX runtime result: %v", err)
+	}
+	fixture.lastTCStage.healthErr = nil
+	fixture.lastCoreStage.healthErr = errors.New("control selector drifted")
+	if err := runtime.Healthy(t.Context()); err == nil ||
+		!strings.Contains(err.Error(), "control selector drifted") {
+		t.Fatalf("unhealthy core runtime result: %v", err)
+	}
+	fixture.lastCoreStage.healthErr = nil
+	fixture.isolation.healthErr = errors.New("generation gate closed")
+	if err := runtime.Healthy(t.Context()); err == nil ||
+		!strings.Contains(err.Error(), "generation gate closed") {
+		t.Fatalf("unhealthy generation runtime result: %v", err)
+	}
+	fixture.isolation.healthErr = nil
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

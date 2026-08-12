@@ -5,6 +5,8 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -79,7 +81,6 @@ type WireGuardState struct {
 	TransportMode                   string `json:"transport_mode"`
 	ICMPRole                        string `json:"icmp_role,omitempty"`
 	ICMPID                          uint16 `json:"icmp_id,omitempty"`
-	FakeTCPExperimental             bool   `json:"faketcp_experimental,omitempty"`
 	FakeTCPChecksumMode             string `json:"faketcp_checksum_mode,omitempty"`
 	FakeTCPIngressMode              string `json:"faketcp_ingress_mode,omitempty"`
 	FakeTCPSessionCapacity          uint32 `json:"faketcp_session_capacity,omitempty"`
@@ -180,6 +181,33 @@ const (
 
 func (s *State) JSON() ([]byte, error) {
 	return json.MarshalIndent(s, "", "  ")
+}
+
+// Fingerprint returns a non-reversible digest of every control-state input,
+// including cipher bytes deliberately omitted from JSON/status output. It is
+// safe to persist in daemon bookkeeping and ensures a secret-only rotation
+// triggers reconciliation without ever rendering the key itself.
+func (s *State) Fingerprint() (string, error) {
+	if s == nil {
+		return "", errors.New("fingerprint control state: state is nil")
+	}
+	public, err := json.Marshal(s)
+	if err != nil {
+		return "", fmt.Errorf("fingerprint control state: marshal projection: %w", err)
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("wg-mix-ebpf/control-state-fingerprint/v1\x00"))
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(public)))
+	_, _ = hash.Write(size[:])
+	_, _ = hash.Write(public)
+	for _, cipher := range s.Ciphers {
+		var identity [4]byte
+		binary.BigEndian.PutUint32(identity[:], cipher.ID)
+		_, _ = hash.Write(identity[:])
+		_, _ = hash.Write(cipher.Key[:])
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
 }
 
 func BuildState(ctx context.Context, cfg *config.Config, rt runtime.Provider, resolver underlay.Resolver, loadWG WGConfigLoader, opts BuildOptions) (*State, error) {
@@ -351,7 +379,6 @@ func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.Wire
 		TransportMode:                   wg.Transport.Mode,
 		ICMPRole:                        wg.Transport.ICMP.Role,
 		ICMPID:                          wg.Transport.ICMP.ID,
-		FakeTCPExperimental:             wg.Transport.FakeTCP.Experimental,
 		FakeTCPChecksumMode:             wg.Transport.FakeTCP.ChecksumMode,
 		FakeTCPIngressMode:              wg.Transport.FakeTCP.IngressMode,
 		FakeTCPSessionCapacity:          wg.Transport.FakeTCP.SessionCapacity,

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
+	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/reconcile"
 	"golang.org/x/sys/unix"
@@ -1353,6 +1354,77 @@ func TestRunOnceReturnsCriticalStatusWriteFailure(t *testing.T) {
 	err := Run(t.Context(), opts)
 	if err == nil || !strings.Contains(err.Error(), "status write failed") {
 		t.Fatalf("run-once status error = %v", err)
+	}
+}
+
+func TestRunOnlyMarksLongRunningDaemonAsResidentRuntime(t *testing.T) {
+	t.Run("once", func(t *testing.T) {
+		runDir := t.TempDir()
+		leasePath := filepath.Join(t.TempDir(), "daemon.lease")
+		maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+		hooks := successfulRunHooks(leasePath, maintenancePath)
+		var got reconcile.Options
+		hooks.reload = func(_ context.Context, opts reconcile.Options) (*reconcile.Result, error) {
+			got = opts
+			return &reconcile.Result{State: &control.State{}}, nil
+		}
+		opts := testOptions(runDir, leasePath, maintenancePath, hooks)
+		opts.Once = true
+		if err := Run(t.Context(), opts); err != nil {
+			t.Fatal(err)
+		}
+		if got.ResidentRuntime {
+			t.Fatal("run --once advertised a resident runtime")
+		}
+	})
+
+	t.Run("daemon", func(t *testing.T) {
+		runDir := t.TempDir()
+		leasePath := filepath.Join(t.TempDir(), "daemon.lease")
+		maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+		hooks := successfulRunHooks(leasePath, maintenancePath)
+		resident := make(chan bool, 1)
+		hooks.reload = func(_ context.Context, opts reconcile.Options) (*reconcile.Result, error) {
+			resident <- opts.ResidentRuntime
+			return &reconcile.Result{State: &control.State{}}, nil
+		}
+		opts := testOptions(runDir, leasePath, maintenancePath, hooks)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- Run(ctx, opts) }()
+		if got := <-resident; !got {
+			t.Fatal("long-running daemon did not advertise a resident runtime")
+		}
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestPollNoopPreservesResidentFakeTCPSnapshot(t *testing.T) {
+	snapshot := &dataplane.KernelStatus{
+		Mode: "faketcp",
+		FakeTCP: &dataplane.FakeTCPRuntimeStatus{
+			Generation: 9,
+			Healthy:    true,
+		},
+	}
+	previous := &reconcile.Result{
+		Dataplane:      snapshot,
+		DataplaneError: "prior diagnostic",
+	}
+	current := &reconcile.Result{State: &control.State{}}
+	preserveResidentDataplaneSnapshot(current, previous)
+	if current.Dataplane != snapshot || current.DataplaneError != "prior diagnostic" {
+		t.Fatalf("preserved snapshot = %#v / %q", current.Dataplane, current.DataplaneError)
+	}
+
+	baseline := &reconcile.Result{Dataplane: &dataplane.KernelStatus{Mode: "baseline"}}
+	current = &reconcile.Result{}
+	preserveResidentDataplaneSnapshot(current, baseline)
+	if current.Dataplane != nil || current.DataplaneError != "" {
+		t.Fatalf("baseline snapshot leaked into poll result: %#v", current)
 	}
 }
 

@@ -69,6 +69,13 @@ func probeExperimentalFakeTCPKernelDependency() error {
 	return probeExperimentalFakeTCPKernelDependencyWith(btf.LoadKernelModuleSpec)
 }
 
+// ProbeFakeTCPKernelDependency performs the same read-only module BTF and
+// exact-kfunc contract check used immediately before production activation.
+// It never loads or unloads the administrator-owned module.
+func ProbeFakeTCPKernelDependency() error {
+	return probeExperimentalFakeTCPKernelDependency()
+}
+
 func probeExperimentalFakeTCPKernelDependencyWith(
 	loadModule func(string) (*btf.Spec, error),
 ) error {

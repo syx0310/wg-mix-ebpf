@@ -58,3 +58,37 @@ func TestEmbeddedObjectIdentityIsExplicitWhenUnavailable(t *testing.T) {
 		t.Fatalf("embedded SHA-256 = %q", identity.SHA256)
 	}
 }
+
+func TestEmbeddedFakeTCPObjectIdentityIsIndependent(t *testing.T) {
+	if EmbeddedFakeTCPObjectSource == EmbeddedObjectSource {
+		t.Fatal("FakeTCP and baseline embedded object sources are identical")
+	}
+	identity, err := EmbeddedFakeTCPObjectIdentity()
+	if err != nil {
+		if identity != (ObjectIdentity{}) {
+			t.Fatalf("identity on error = %#v, want zero value", identity)
+		}
+		return
+	}
+	if identity.Source != EmbeddedFakeTCPObjectSource || !identity.Embedded {
+		t.Fatalf("embedded FakeTCP identity = %#v", identity)
+	}
+	if len(identity.SHA256) != 64 {
+		t.Fatalf("embedded FakeTCP SHA-256 = %q", identity.SHA256)
+	}
+}
+
+func TestFakeTCPObjectSelectorIsIndependentFromBaseline(t *testing.T) {
+	t.Setenv(EnvObjectPath, "/objects/baseline.o")
+	t.Setenv(EnvFakeTCPObjectPath, "/objects/faketcp.o")
+	if got := fakeTCPObjectPathFromEnv(""); got != "/objects/faketcp.o" {
+		t.Fatalf("FakeTCP object = %q, want independent environment selection", got)
+	}
+	if got := fakeTCPObjectPathFromEnv("/explicit/faketcp.o"); got != "/explicit/faketcp.o" {
+		t.Fatalf("explicit FakeTCP object = %q", got)
+	}
+	t.Setenv(EnvFakeTCPObjectPath, "")
+	if got := fakeTCPObjectPathFromEnv(""); got != "" {
+		t.Fatalf("FakeTCP object inherited baseline selector: %q", got)
+	}
+}

@@ -248,6 +248,7 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 					if !opts.Offline && !opts.DryRun && !hooks.healthy(ctx, result.State) {
 						goto forceReload
 					}
+					preserveResidentDataplaneSnapshot(result, status.LastResult)
 					status.PID = os.Getpid()
 					status.ConfigPath = configPath(opts.ConfigPath)
 					status.State = "active"
@@ -264,12 +265,13 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 		}
 	forceReload:
 		result, err := hooks.reload(ctx, reconcile.Options{
-			ConfigPath:     opts.ConfigPath,
-			RunDir:         runDir,
-			StateDir:       opts.StateDir,
-			Offline:        opts.Offline,
-			DryRun:         opts.DryRun,
-			LifecycleLease: lease,
+			ConfigPath:      opts.ConfigPath,
+			RunDir:          runDir,
+			StateDir:        opts.StateDir,
+			Offline:         opts.Offline,
+			DryRun:          opts.DryRun,
+			LifecycleLease:  lease,
+			ResidentRuntime: !opts.Once,
 		})
 		status.PID = os.Getpid()
 		status.ConfigPath = configPath(opts.ConfigPath)
@@ -493,6 +495,9 @@ func runStopBounded(
 func dataplaneHealthy(ctx context.Context, state *control.State) bool {
 	if state == nil {
 		return false
+	}
+	if handled, healthy := dataplane.ProductionFakeTCPHealthy(ctx, state); handled {
+		return healthy
 	}
 	status, err := dataplane.Inspect(ctx, state)
 	if err != nil || status == nil || status.MapError != "" || status.ActiveGeneration == 0 {
@@ -788,11 +793,20 @@ func stateFingerprint(result *reconcile.Result) string {
 	if result == nil || result.State == nil {
 		return ""
 	}
-	data, err := result.State.JSON()
+	fingerprint, err := result.State.Fingerprint()
 	if err != nil {
 		return ""
 	}
-	return string(data)
+	return fingerprint
+}
+
+func preserveResidentDataplaneSnapshot(current, previous *reconcile.Result) {
+	if current == nil || previous == nil || previous.Dataplane == nil ||
+		previous.Dataplane.Mode != "faketcp" {
+		return
+	}
+	current.Dataplane = previous.Dataplane
+	current.DataplaneError = previous.DataplaneError
 }
 
 func fileHash(path string) string {

@@ -316,7 +316,7 @@ profiles:
 	}
 }
 
-func TestAcceptExplicitExperimentalFakeTCPTransportWithXOR(t *testing.T) {
+func TestAcceptProductionFakeTCPTransportWithXOR(t *testing.T) {
 	cfg, err := Load([]byte(`
 version: 1
 underlays:
@@ -328,8 +328,6 @@ wireguards:
     cipher: xor-home
     transport:
       mode: faketcp
-      faketcp:
-        experimental: true
 profiles:
   mix-default:
     preset: wireguard-mix-wire-values-v1
@@ -342,7 +340,7 @@ ciphers:
 		t.Fatal(err)
 	}
 	fake := cfg.WireGuards[0].Transport.FakeTCP
-	if fake.ChecksumMode != FakeTCPChecksumModePartialCompleteReset || fake.IngressMode != "xdp-required" {
+	if fake.ChecksumMode != FakeTCPChecksumModePartialCompleteReset || fake.IngressMode != FakeTCPIngressModeXDPGenericExact {
 		t.Fatalf("faketcp capability defaults = checksum %q ingress %q", fake.ChecksumMode, fake.IngressMode)
 	}
 	if fake.SessionCapacity != 4096 || fake.MaxHalfOpenSessions != 1024 ||
@@ -351,6 +349,34 @@ ciphers:
 		fake.SYNSourceLedgerCapacity != 4096 || fake.SYNSourceLedgerTTL.Duration != 5*time.Minute ||
 		fake.MaxPendingPacketsPerFlow != 1 {
 		t.Fatalf("faketcp bounds = %#v", fake)
+	}
+}
+
+func TestRejectProductionFakeTCPWithoutFailClosedStartupIsolation(t *testing.T) {
+	base := `
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: faketcp
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`
+	for name, extra := range map[string]string{
+		"guard disabled": "startup_guard:\n  mode: none\n",
+		"best effort":    "policy:\n  startup_fail_mode: best_effort\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := Load([]byte(base + extra))
+			if err == nil || !strings.Contains(err.Error(), "faketcp requires") {
+				t.Fatalf("expected FakeTCP startup isolation rejection, got %v", err)
+			}
+		})
 	}
 }
 
@@ -379,7 +405,56 @@ profiles:
 	}
 }
 
-func TestRejectFakeTCPWithoutExperimentalAcknowledgement(t *testing.T) {
+func TestDeprecatedFakeTCPExperimentalFieldIsIgnored(t *testing.T) {
+	for _, value := range []string{"true", "false"} {
+		_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: faketcp
+      faketcp:
+        experimental: ` + value + `
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+		if err != nil {
+			t.Fatalf("deprecated experimental=%s was not accepted: %v", value, err)
+		}
+	}
+}
+
+func TestDeprecatedFakeTCPIngressModeIsNormalized(t *testing.T) {
+	cfg, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: faketcp
+      faketcp:
+        ingress_mode: xdp-required
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.WireGuards[0].Transport.FakeTCP.IngressMode; got != FakeTCPIngressModeXDPGenericExact {
+		t.Fatalf("normalized ingress mode = %q, want %q", got, FakeTCPIngressModeXDPGenericExact)
+	}
+}
+
+func TestRejectUnsupportedFakeTCPIngressMode(t *testing.T) {
 	_, err := Load([]byte(`
 version: 1
 underlays:
@@ -390,12 +465,14 @@ wireguards:
     profile: mix-default
     transport:
       mode: faketcp
+      faketcp:
+        ingress_mode: xdp-native
 profiles:
   mix-default:
     preset: wireguard-mix-wire-values-v1
 `))
-	if err == nil || !strings.Contains(err.Error(), "experimental must be true") {
-		t.Fatalf("expected experimental gate error, got %v", err)
+	if err == nil || !strings.Contains(err.Error(), FakeTCPIngressModeXDPGenericExact) {
+		t.Fatalf("unsupported FakeTCP ingress error = %v", err)
 	}
 }
 
@@ -446,35 +523,8 @@ profiles:
 	}
 }
 
-func TestRejectAggregateFakeTCPBudgetsForSharedMapAndDaemon(t *testing.T) {
-	tests := []struct {
-		name     string
-		settings string
-		want     string
-	}{
-		{
-			name: "shared established map",
-			settings: `
-        session_capacity: 9000
-        max_half_open_sessions: 1000`,
-			want: "aggregate faketcp session_capacity",
-		},
-		{
-			name: "source ledgers",
-			settings: `
-        syn_source_ledger_capacity: 9000`,
-			want: "aggregate faketcp syn_source_ledger_capacity",
-		},
-		{
-			name: "pending bytes",
-			settings: `
-        max_pending_bytes: 700000`,
-			want: "aggregate faketcp max_pending_bytes",
-		},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			yaml := `
+func TestRejectMultipleFakeTCPWireGuards(t *testing.T) {
+	_, err := Load([]byte(`
 version: 1
 underlays:
   - name: eth0
@@ -484,27 +534,46 @@ wireguards:
     profile: mix-default
     transport:
       mode: faketcp
-      faketcp:
-        experimental: true` + test.settings + `
   - name: wg1
     profile: mix-default
     transport:
       mode: faketcp
-      faketcp:
-        experimental: true` + test.settings + `
 profiles:
   mix-default:
     preset: wireguard-mix-wire-values-v1
-`
-			_, err := Load([]byte(yaml))
-			if err == nil || !strings.Contains(err.Error(), test.want) {
-				t.Fatalf("aggregate budget error=%v, want %q", err, test.want)
-			}
-		})
+`))
+	if err == nil || !strings.Contains(err.Error(), "at most one WireGuard") {
+		t.Fatalf("multiple FakeTCP error = %v", err)
 	}
 }
 
-func TestFakeTCPPolicyParametersAreOwnedPerWireGuard(t *testing.T) {
+func TestAllowOneFakeTCPAlongsideUDPWireGuard(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg-faketcp
+    profile: mix-default
+    transport:
+      mode: faketcp
+  - name: wg-udp
+    profile: mix-default
+    transport:
+      mode: udp
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+runtime:
+  attachment_backend: tcx
+`))
+	if err != nil {
+		t.Fatalf("one FakeTCP plus UDP rejected: %v", err)
+	}
+}
+
+func TestFakeTCPPolicyParametersApplyToSingleWireGuard(t *testing.T) {
 	cfg, err := Load([]byte(`
 version: 1
 underlays:
@@ -520,15 +589,6 @@ wireguards:
         syn_rate_interval: 100ms
         syn_source_ledger_ttl: 1m
         handshake_timeout: 2s
-  - name: wg1
-    profile: mix-default
-    transport:
-      mode: faketcp
-      faketcp:
-        experimental: true
-        syn_rate_interval: 250ms
-        syn_source_ledger_ttl: 2m
-        handshake_timeout: 3s
 profiles:
   mix-default:
     preset: wireguard-mix-wire-values-v1
@@ -536,15 +596,33 @@ profiles:
 	if err != nil {
 		t.Fatal(err)
 	}
-	first := cfg.WireGuards[0].Transport.FakeTCP
-	second := cfg.WireGuards[1].Transport.FakeTCP
-	if first.SYNRateInterval.Duration != 100*time.Millisecond ||
-		first.SYNSourceLedgerTTL.Duration != time.Minute ||
-		first.HandshakeTimeout.Duration != 2*time.Second ||
-		second.SYNRateInterval.Duration != 250*time.Millisecond ||
-		second.SYNSourceLedgerTTL.Duration != 2*time.Minute ||
-		second.HandshakeTimeout.Duration != 3*time.Second {
-		t.Fatalf("per-WG FakeTCP policies collapsed: first=%#v second=%#v", first, second)
+	fake := cfg.WireGuards[0].Transport.FakeTCP
+	if fake.SYNRateInterval.Duration != 100*time.Millisecond ||
+		fake.SYNSourceLedgerTTL.Duration != time.Minute ||
+		fake.HandshakeTimeout.Duration != 2*time.Second {
+		t.Fatalf("FakeTCP policy = %#v", fake)
+	}
+}
+
+func TestRejectFakeTCPWithClassicTCAttachmentBackend(t *testing.T) {
+	_, err := Load([]byte(`
+version: 1
+underlays:
+  - name: eth0
+    type: netdev
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: faketcp
+profiles:
+  mix-default:
+    preset: wireguard-mix-wire-values-v1
+runtime:
+  attachment_backend: classic_tc
+`))
+	if err == nil || !strings.Contains(err.Error(), "classic_tc is unsupported for faketcp") {
+		t.Fatalf("FakeTCP classic_tc error = %v", err)
 	}
 }
 

@@ -425,7 +425,7 @@ class VerifierGateTest(unittest.TestCase):
             (
                 "/proc/self/fd/100",
                 "bpf-load-test",
-                "--experimental-faketcp",
+                "--faketcp",
                 "--object",
                 "/proc/self/fd/101",
             ),
@@ -446,7 +446,7 @@ class VerifierGateTest(unittest.TestCase):
         original_binary = b"""#!/bin/sh
 test "$#" -eq 4 || exit 71
 test "$1" = bpf-load-test || exit 72
-test "$2" = --experimental-faketcp || exit 73
+test "$2" = --faketcp || exit 73
 test "$3" = --object || exit 74
 IFS= read -r payload < "$4" || exit 75
 test "$payload" = verified-object || exit 76

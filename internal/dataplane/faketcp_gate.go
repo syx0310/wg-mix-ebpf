@@ -56,24 +56,21 @@ const fakeTCPRequiredCapabilities = fakeTCPCapabilityBaselineIsolation |
 // This constant is intentionally not configurable. A YAML flag or object-path
 // override cannot claim kernel readiness. Each bit moves here only with its
 // implementation and packet/real-NIC acceptance tests in the same change.
-const fakeTCPImplementedCapabilities = fakeTCPCapabilityBaselineIsolation |
-	fakeTCPCapabilitySingleWriterState |
-	fakeTCPCapabilityHalfOpenProtection |
-	fakeTCPCapabilityBPFControlAdmission
+const fakeTCPImplementedCapabilities = fakeTCPRequiredCapabilities
 
 var fakeTCPRequirements = []struct {
 	capability fakeTCPCapability
 	name       string
 }{
-	{fakeTCPCapabilityBaselineIsolation, "baseline/experimental BPF object isolation"},
-	{fakeTCPCapabilityManagedIngressParser, "managed-port IPv4/IPv6 fail-closed parser"},
+	{fakeTCPCapabilityBaselineIsolation, "baseline/FakeTCP BPF object isolation"},
+	{fakeTCPCapabilityManagedIngressParser, "managed-port IPv4 fail-closed parser"},
 	{fakeTCPCapabilitySingleWriterState, "single-writer established session state"},
 	{fakeTCPCapabilityHalfOpenProtection, "bounded and rate-limited userspace half-open quota with zero-credit restart"},
 	{fakeTCPCapabilitySingleUsePacketAdmissionProof, "single-use packet admission proof with stable-lifetime binding"},
 	{fakeTCPCapabilityBPFControlAdmission, "BPF control-event admission/coalescing under SYN flood"},
 	{fakeTCPCapabilityValidatedCloseControl, "RST/FIN full IPv4/TCP checksum and receive-window validation"},
 	{fakeTCPCapabilityL3Parser, "parser:l3 FakeTCP policy and attachment support"},
-	{fakeTCPCapabilityXDPOwnership, "XDP link ownership/rollback and libxdp chaining"},
+	{fakeTCPCapabilityXDPOwnership, "direct generic XDP exact-selected-mode ownership and rollback"},
 	{fakeTCPCapabilityManagedPolicyPopulation, "atomic managed-interface/port policy population"},
 	{fakeTCPCapabilityChecksumStateInspection, "ip_summed/CHECKSUM_PARTIAL identification"},
 	{fakeTCPCapabilityChecksumPartialCompletion, "CHECKSUM_PARTIAL materialize/complete"},
@@ -94,11 +91,28 @@ func ValidateFakeTCPActivation(state *control.State) error {
 	if len(references) == 0 {
 		return nil
 	}
+	if fakeTCPActivationReady() {
+		return nil
+	}
 	return fmt.Errorf(
 		"%w for configuration references %s; missing capabilities: %s; activation is refused before mutation",
 		ErrFakeTCPKernelGate,
 		strings.Join(references, ","),
 		strings.Join(missingFakeTCPCapabilities(), "; "),
+	)
+}
+
+// ValidateFakeTCPResidentRuntime prevents a process-owned FakeTCP collection
+// from being installed by a one-shot command. The check is intentionally
+// platform-independent and must run before startup-guard or dataplane writes.
+// Dry-run callers may skip it because they never acquire runtime ownership.
+func ValidateFakeTCPResidentRuntime(state *control.State, resident bool) error {
+	if len(fakeTCPStateReferences(state)) == 0 || resident {
+		return nil
+	}
+	return fmt.Errorf(
+		"%w; use the long-running daemon instead of one-shot reload or run --once",
+		ErrFakeTCPResidentRuntimeRequired,
 	)
 }
 

@@ -27,17 +27,23 @@ type Options struct {
 	DryRun          bool
 	AdoptLegacyPins bool
 	LifecycleLease  *lockfile.LifecycleLease
+	// ResidentRuntime is set only by the non-once daemon. It is forwarded to
+	// the dataplane so process-owned FakeTCP links cannot be installed by a
+	// command that exits immediately after reload.
+	ResidentRuntime bool
 
 	deps *dependencies
 }
 
 type dependencies struct {
-	loadConfigFile   func(string) (*config.Config, error)
-	loadWGConfig     control.WGConfigLoader
-	runtimeProvider  runtime.Provider
-	underlayResolver underlay.Resolver
-	guardExecutor    guard.Executor
-	dataplaneLoader  dataplane.Loader
+	loadConfigFile          func(string) (*config.Config, error)
+	loadWGConfig            control.WGConfigLoader
+	runtimeProvider         runtime.Provider
+	underlayResolver        underlay.Resolver
+	guardExecutor           guard.Executor
+	dataplaneLoader         dataplane.Loader
+	newDataplaneLoader      func(dataplane.LoaderOptions) dataplane.Loader
+	productionFakeTCPStatus func(context.Context, *control.State) (bool, *dataplane.KernelStatus, error)
 }
 
 type Result struct {
@@ -172,9 +178,24 @@ func configuredDataplaneLoader(opts Options) dataplane.Loader {
 	if opts.deps != nil && opts.deps.dataplaneLoader != nil {
 		return opts.deps.dataplaneLoader
 	}
-	return dataplane.NewLoaderWithOptions(dataplane.LoaderOptions{
+	constructor := dataplane.NewLoaderWithOptions
+	if opts.deps != nil && opts.deps.newDataplaneLoader != nil {
+		constructor = opts.deps.newDataplaneLoader
+	}
+	return constructor(dataplane.LoaderOptions{
 		AdoptLegacyPins: opts.AdoptLegacyPins,
+		LifecycleLease:  opts.LifecycleLease,
+		ResidentRuntime: opts.ResidentRuntime,
 	})
+}
+
+func configuredProductionFakeTCPStatus(
+	opts Options,
+) func(context.Context, *control.State) (bool, *dataplane.KernelStatus, error) {
+	if opts.deps != nil && opts.deps.productionFakeTCPStatus != nil {
+		return opts.deps.productionFakeTCPStatus
+	}
+	return dataplane.ProductionFakeTCPStatus
 }
 
 type wgConfigSnapshotEntry struct {
@@ -281,7 +302,12 @@ func Status(ctx context.Context, opts Options) (*Result, error) {
 		return nil, err
 	}
 	result := &Result{ConfigPath: configPath(opts), Time: time.Now(), Action: "status", State: state}
-	if kernelStatus, err := dataplane.Inspect(ctx, state); err == nil {
+	if handled, kernelStatus, err := configuredProductionFakeTCPStatus(opts)(ctx, state); handled {
+		result.Dataplane = kernelStatus
+		if err != nil {
+			result.DataplaneError = err.Error()
+		}
+	} else if kernelStatus, err := dataplane.Inspect(ctx, state); err == nil {
 		result.Dataplane = kernelStatus
 	} else if !errors.Is(err, dataplane.ErrUnsupported) {
 		result.DataplaneError = err.Error()
@@ -297,9 +323,11 @@ func Reload(ctx context.Context, opts Options) (*Result, error) {
 		return reloadUnlocked(ctx, opts)
 	}
 	var result *Result
-	err := withMutationOwnership(ctx, opts, "reload", func() error {
+	err := withMutationOwnership(ctx, opts, "reload", func(lease *lockfile.LifecycleLease) error {
+		ownedOpts := opts
+		ownedOpts.LifecycleLease = lease
 		var err error
-		result, err = reloadUnlocked(ctx, opts)
+		result, err = reloadUnlocked(ctx, ownedOpts)
 		return err
 	})
 	return result, err
@@ -315,11 +343,22 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := validateFakeTCPStartupIsolation(cfg, guardState); err != nil {
+		return nil, err
+	}
 	// FakeTCP activation is gated here, after configuration/state loading but
 	// before even the temporary nft startup guard can mutate the host. Keep the
 	// loader gate as defence in depth, but do not rely on reaching it.
 	if err := dataplane.ValidateFakeTCPActivation(guardState); err != nil {
 		return nil, err
+	}
+	if !opts.DryRun {
+		if err := dataplane.ValidateFakeTCPResidentRuntime(
+			guardState,
+			opts.ResidentRuntime,
+		); err != nil {
+			return nil, err
+		}
 	}
 	guardExecutor := configuredGuardExecutor(opts)
 	initialGuardPlan := guard.BuildNftPlan(guardState)
@@ -378,6 +417,16 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 	if err := loader.Apply(ctx, state); err != nil {
 		return nil, err
 	}
+	if handled, kernelStatus, statusErr := configuredProductionFakeTCPStatus(opts)(ctx, state); handled {
+		result.Dataplane = kernelStatus
+		if statusErr != nil {
+			// The startup guard must remain installed until every process-owned
+			// FakeTCP map and attachment has passed its final retained-owner
+			// health check. Returning here deliberately precedes attach-state
+			// publication and guard cleanup.
+			return nil, fmt.Errorf("verify production FakeTCP runtime health after apply: %w", statusErr)
+		}
+	}
 	if previous, err := attachstate.Load(opts.StateDir); err == nil {
 		if staleLoader, ok := loader.(dataplane.AttachStateLoader); ok {
 			if err := staleLoader.DetachStale(ctx, attachstate.ToControlState(previous), state); err != nil {
@@ -416,9 +465,11 @@ func Detach(ctx context.Context, opts Options) (*Result, error) {
 		return detachUnlocked(ctx, opts)
 	}
 	var result *Result
-	err := withMutationOwnership(ctx, opts, "detach", func() error {
+	err := withMutationOwnership(ctx, opts, "detach", func(lease *lockfile.LifecycleLease) error {
+		ownedOpts := opts
+		ownedOpts.LifecycleLease = lease
 		var err error
-		result, err = detachUnlocked(ctx, opts)
+		result, err = detachUnlocked(ctx, ownedOpts)
 		return err
 	})
 	return result, err
@@ -451,9 +502,11 @@ func Stop(ctx context.Context, opts Options) (*Result, error) {
 		return stopUnlocked(ctx, opts)
 	}
 	var result *Result
-	err := withMutationOwnership(ctx, opts, "stop", func() error {
+	err := withMutationOwnership(ctx, opts, "stop", func(lease *lockfile.LifecycleLease) error {
+		ownedOpts := opts
+		ownedOpts.LifecycleLease = lease
 		var err error
-		result, err = stopUnlocked(ctx, opts)
+		result, err = stopUnlocked(ctx, ownedOpts)
 		return err
 	})
 	return result, err
@@ -546,7 +599,7 @@ func GuardApply(ctx context.Context, opts Options) (*Result, error) {
 	if opts.DryRun {
 		return result, nil
 	}
-	if err := withMutationOwnership(ctx, opts, "guard-apply", func() error {
+	if err := withMutationOwnership(ctx, opts, "guard-apply", func(*lockfile.LifecycleLease) error {
 		return configuredGuardExecutor(opts).Apply(ctx, plan)
 	}); err != nil {
 		return nil, err
@@ -560,7 +613,7 @@ func GuardCleanup(ctx context.Context, opts Options) (*Result, error) {
 	if opts.DryRun {
 		return result, nil
 	}
-	if err := withMutationOwnership(ctx, opts, "guard-cleanup", func() error {
+	if err := withMutationOwnership(ctx, opts, "guard-cleanup", func(*lockfile.LifecycleLease) error {
 		return configuredGuardExecutor(opts).Cleanup(ctx)
 	}); err != nil {
 		return nil, err
@@ -574,6 +627,32 @@ func shouldApplyStartupGuard(cfg *config.Config) bool {
 		cfg.Policy.StartupFailMode == "fail_closed_for_managed_flows"
 }
 
+func validateFakeTCPStartupIsolation(cfg *config.Config, state *control.State) error {
+	if cfg == nil || state == nil {
+		return errors.New("validate FakeTCP startup isolation: config and state are required")
+	}
+	usesFakeTCP := false
+	for _, wg := range state.WireGuards {
+		if wg.TransportMode != "faketcp" {
+			continue
+		}
+		usesFakeTCP = true
+		if wg.ConfigListenPort == 0 {
+			return fmt.Errorf(
+				"faketcp WireGuard %q requires a fixed non-zero ListenPort in its WireGuard config so the startup guard covers both UDP and TCP wire traffic",
+				wg.Name,
+			)
+		}
+	}
+	if !usesFakeTCP {
+		return nil
+	}
+	if !shouldApplyStartupGuard(cfg) {
+		return errors.New("faketcp requires nft-temporary-drop with fail_closed_for_managed_flows before any dataplane mutation")
+	}
+	return nil
+}
+
 func configPath(opts Options) string {
 	if opts.ConfigPath != "" {
 		return opts.ConfigPath
@@ -581,17 +660,23 @@ func configPath(opts Options) string {
 	return config.DefaultConfigPath
 }
 
-func withMutationOwnership(ctx context.Context, opts Options, action string, fn func() error) error {
+func withMutationOwnership(
+	ctx context.Context,
+	opts Options,
+	action string,
+	fn func(*lockfile.LifecycleLease) error,
+) error {
 	owner := lockfile.LifecycleOwner{
 		PID:        os.Getpid(),
 		Action:     action,
 		ConfigPath: configPath(opts),
 		RunDir:     opts.RunDir,
 	}
-	return lockfile.WithLifecycle(ctx, opts.LifecycleLease, owner, func(*lockfile.LifecycleLease) error {
+	return lockfile.WithLifecycle(ctx, opts.LifecycleLease, owner, func(lease *lockfile.LifecycleLease) error {
+		mutate := func() error { return fn(lease) }
 		if opts.RunDir == "" {
-			return fn()
+			return mutate()
 		}
-		return lockfile.WithLock(ctx, opts.RunDir, fn)
+		return lockfile.WithLock(ctx, opts.RunDir, mutate)
 	})
 }

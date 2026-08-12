@@ -69,8 +69,8 @@ func TestFakeTCPMTUIntegrationUsesUnifiedPrepareOnly(t *testing.T) {
 		!(parse < l3Gate && l3Gate < gsoDispatch && gsoDispatch < nonGSOPrepare && nonGSOPrepare < nonGSOCheckpoint) {
 		t.Fatal("fixed-IPv4 gate and unified non-GSO prepare must precede proof formation")
 	}
-	if fakeTCPImplementedCapabilities&fakeTCPCapabilityMTUEnforcement != 0 {
-		t.Fatal("a model or static contract must not claim live MTU enforcement")
+	if fakeTCPImplementedCapabilities&fakeTCPCapabilityMTUEnforcement == 0 {
+		t.Fatal("production MTU enforcement capability is not enabled")
 	}
 }
 

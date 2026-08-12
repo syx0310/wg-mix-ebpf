@@ -380,6 +380,44 @@ func (stage *experimentalCoreStage) Deactivate() error {
 	return stage.deactivateLocked()
 }
 
+// Healthy re-proves the exact active selector and every staged core map/tail
+// entry. The resource interfaces perform reads through the retained map FDs,
+// so a closed collection or any selector/data drift fails the runtime health
+// check without mutating kernel state.
+func (stage *experimentalCoreStage) Healthy(ctx context.Context) error {
+	if stage == nil || ctx == nil {
+		return errors.New("inspect experimental baseline core: incomplete input")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stage.mu.Lock()
+	defer stage.mu.Unlock()
+	if stage.closed || !stage.controlCommitted || stage.control == nil {
+		return errors.New("inspect experimental baseline core: active owner is incomplete")
+	}
+	var control abi.ControlValue
+	if err := stage.control.Lookup(abi.ControlKeyGlobal, &control); err != nil {
+		return fmt.Errorf("inspect experimental baseline control map: %w", err)
+	}
+	if control != stage.controlValue {
+		return fmt.Errorf("inspect experimental baseline control map: value %#v differs from owner %#v", control, stage.controlValue)
+	}
+	for _, change := range stage.changes {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		observed := reflect.New(reflect.TypeOf(change.expected))
+		if err := change.resource.Lookup(change.key, observed.Interface()); err != nil {
+			return fmt.Errorf("inspect experimental core map %s: %w", change.name, err)
+		}
+		if !reflect.DeepEqual(observed.Elem().Interface(), change.expected) {
+			return fmt.Errorf("inspect experimental core map %s: owned value changed", change.name)
+		}
+	}
+	return nil
+}
+
 func (stage *experimentalCoreStage) deactivateLocked() error {
 	if !stage.controlCommitted {
 		return nil

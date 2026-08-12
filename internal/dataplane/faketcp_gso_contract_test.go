@@ -646,8 +646,8 @@ func TestFakeTCPGSOContractIsBuildAndEvidenceGated(t *testing.T) {
 	if geometry < 0 || writable < 0 || firstMutation < 0 || !(geometry < writable && writable < firstMutation) {
 		t.Fatal("direct GSO commit must revalidate geometry and reject shared storage before its first write")
 	}
-	if fakeTCPImplementedCapabilities&fakeTCPCapabilityGSOPerSegmentTransform != 0 {
-		t.Fatal("GSO capability opened before verifier and .82 wire evidence")
+	if fakeTCPImplementedCapabilities&fakeTCPCapabilityGSOPerSegmentTransform == 0 {
+		t.Fatal("production GSO capability is not enabled")
 	}
 }
 

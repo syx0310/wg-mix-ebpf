@@ -16,6 +16,8 @@ type controlledFakeTCPRuntime struct {
 	runErr       error
 	stopErr      error
 	closeErr     error
+	healthErr    error
+	healthCalls  int
 	stopCalls    int
 	closeCalls   int
 	closeEarly   bool
@@ -95,6 +97,19 @@ func (runtime *controlledFakeTCPRuntime) Close() error {
 	return runtime.closeErr
 }
 
+func (runtime *controlledFakeTCPRuntime) Healthy(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("health context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	runtime.healthCalls++
+	return runtime.healthErr
+}
+
 func (runtime *controlledFakeTCPRuntime) counts() (int, int, bool) {
 	runtime.mu.Lock()
 	defer runtime.mu.Unlock()
@@ -104,6 +119,12 @@ func (runtime *controlledFakeTCPRuntime) counts() (int, int, bool) {
 func (runtime *controlledFakeTCPRuntime) setCloseError(err error) {
 	runtime.mu.Lock()
 	runtime.closeErr = err
+	runtime.mu.Unlock()
+}
+
+func (runtime *controlledFakeTCPRuntime) setHealthError(err error) {
+	runtime.mu.Lock()
+	runtime.healthErr = err
 	runtime.mu.Unlock()
 }
 
@@ -138,29 +159,77 @@ func TestFakeTCPRuntimeSupervisorRepeatedEnsureOwnsOneRuntime(t *testing.T) {
 	}
 }
 
-func TestFakeTCPRuntimeSupervisorRejectsChangedLiveGeneration(t *testing.T) {
+func TestFakeTCPRuntimeSupervisorSeriallyReplacesChangedLiveGeneration(t *testing.T) {
 	supervisor := &fakeTCPRuntimeSupervisor{}
-	runtime := newControlledFakeTCPRuntime()
+	firstRuntime := newControlledFakeTCPRuntime()
 	if err := supervisor.Ensure(
 		t.Context(), fakeTCPRuntimeDesiredKey{1},
-		func(context.Context) (fakeTCPRuntimeService, error) { return runtime, nil },
+		func(context.Context) (fakeTCPRuntimeService, error) { return firstRuntime, nil },
 	); err != nil {
 		t.Fatalf("Ensure: %v", err)
 	}
-	<-runtime.runStarted
+	<-firstRuntime.runStarted
+	secondRuntime := newControlledFakeTCPRuntime()
 	replacementBuilds := 0
 	err := supervisor.Ensure(
 		t.Context(), fakeTCPRuntimeDesiredKey{2},
 		func(context.Context) (fakeTCPRuntimeService, error) {
 			replacementBuilds++
-			return newControlledFakeTCPRuntime(), nil
+			return secondRuntime, nil
 		},
 	)
-	if !errors.Is(err, errFakeTCPRuntimeReplacementUnsafe) {
-		t.Fatalf("changed generation error = %v", err)
+	if err != nil {
+		t.Fatalf("changed generation replacement: %v", err)
 	}
-	if replacementBuilds != 0 || !supervisor.Healthy(fakeTCPRuntimeDesiredKey{1}) {
-		t.Fatalf("replacement builds = %d, old generation healthy = %t", replacementBuilds, supervisor.Healthy(fakeTCPRuntimeDesiredKey{1}))
+	<-secondRuntime.runStarted
+	if replacementBuilds != 1 || supervisor.Healthy(fakeTCPRuntimeDesiredKey{1}) ||
+		!supervisor.Healthy(fakeTCPRuntimeDesiredKey{2}) {
+		t.Fatalf(
+			"replacement builds = %d, old healthy = %t, new healthy = %t",
+			replacementBuilds,
+			supervisor.Healthy(fakeTCPRuntimeDesiredKey{1}),
+			supervisor.Healthy(fakeTCPRuntimeDesiredKey{2}),
+		)
+	}
+	stopCalls, closeCalls, closeEarly := firstRuntime.counts()
+	if stopCalls != 1 || closeCalls != 1 || closeEarly {
+		t.Fatalf("old runtime lifecycle = stop %d close %d early %t", stopCalls, closeCalls, closeEarly)
+	}
+	if err := supervisor.Stop(t.Context()); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+}
+
+func TestFakeTCPRuntimeSupervisorRebuildsUnhealthySameGeneration(t *testing.T) {
+	supervisor := &fakeTCPRuntimeSupervisor{}
+	key := fakeTCPRuntimeDesiredKey{1}
+	firstRuntime := newControlledFakeTCPRuntime()
+	if err := supervisor.Ensure(
+		t.Context(), key,
+		func(context.Context) (fakeTCPRuntimeService, error) { return firstRuntime, nil },
+	); err != nil {
+		t.Fatalf("first Ensure: %v", err)
+	}
+	<-firstRuntime.runStarted
+	firstRuntime.setHealthError(errors.New("owned link disappeared"))
+	secondRuntime := newControlledFakeTCPRuntime()
+	builds := 0
+	if err := supervisor.Ensure(
+		t.Context(), key,
+		func(context.Context) (fakeTCPRuntimeService, error) {
+			builds++
+			return secondRuntime, nil
+		},
+	); err != nil {
+		t.Fatalf("unhealthy same-key Ensure: %v", err)
+	}
+	<-secondRuntime.runStarted
+	if builds != 1 || !supervisor.Healthy(key) {
+		t.Fatalf("replacement builds=%d healthy=%t", builds, supervisor.Healthy(key))
+	}
+	stopCalls, closeCalls, closeEarly := firstRuntime.counts()
+	if stopCalls != 1 || closeCalls != 1 || closeEarly {
+		t.Fatalf("old runtime lifecycle = stop %d close %d early %t", stopCalls, closeCalls, closeEarly)
 	}
 	if err := supervisor.Stop(t.Context()); err != nil {
 		t.Fatalf("Stop: %v", err)

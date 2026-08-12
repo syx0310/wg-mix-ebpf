@@ -2,7 +2,7 @@
 
 Transparent WireGuard `type_word` transform using eBPF.
 
-Current status: control-plane foundation, daemon reconcile loop, profile management, generation-scoped map ABI, startup guard tooling, attach-state cleanup, embedded BPF packaging, Linux TC/eBPF dataplane loading, UDP type-word mode, optional UDP XOR payload obfuscation, and experimental IPv4 ICMP mode are implemented. Live BPF load, TC attach, WireGuard, offload, OpenWrt, and public-network tests must run on controlled external Linux machines.
+Current status: control-plane foundation, daemon reconcile loop, profile management, generation-scoped map ABI, startup guard tooling, attach-state cleanup, dual embedded BPF packaging, Linux TC/eBPF dataplane loading, UDP type-word mode, optional XOR payload obfuscation, IPv4 ICMP mode, and production IPv4 FakeTCP mode are implemented. Live BPF load, TC/XDP attach, WireGuard, offload, and performance tests must run on controlled external Linux machines.
 
 ## Commands
 
@@ -41,14 +41,28 @@ Supported transport modes:
 
 ```text
 udp    original transparent UDP type-word transform
-icmp   experimental IPv4 ICMP Echo transport, no fakeTCP
+icmp   IPv4 ICMP Echo transport
+faketcp IPv4 TCP-shaped packet transport (one WireGuard, resident daemon)
 ```
 
 Optional cipher mode:
 
 ```text
-xor    UDP-only WireGuard payload XOR obfuscation, auth=none
+xor    UDP or FakeTCP WireGuard payload XOR obfuscation, auth=none
 ```
+
+Implemented combinations:
+
+| Transport | IP | Attachment | XOR | Operational contract |
+| --- | --- | --- | --- | --- |
+| UDP | IPv4/IPv6 | `auto`, `tcx`, `classic_tc` | none, prefix, full | normal daemon or one-shot reload |
+| ICMP Echo | IPv4 | `auto`, `tcx`, `classic_tc` | unsupported | client/server roles |
+| FakeTCP | IPv4 | `tcx`, or `auto` resolving to TCX; plus exact generic XDP | none, prefix, full | one WG, resident daemon, fixed ListenPort, checksum kmod |
+
+Pure kernel WireGuard without this dataplane remains the performance and
+interoperability baseline; it is not a fourth transform mode. FakeTCP does not
+support `classic_tc`, libxdp chaining, existing XDP ownership, or one-shot
+execution.
 
 Operational behavior is documented in:
 
@@ -71,7 +85,7 @@ The default Makefile build and test targets use `CGO_ENABLED=0` for reproducible
 
 ## Linux Dataplane
 
-The Go binary does not require cgo. The TC/eBPF program is compiled during packaging and embedded into the binary:
+The Go binary does not require cgo. Separate baseline and FakeTCP BPF objects are compiled during packaging and embedded into the binary:
 
 ```bash
 make build-bpf
@@ -84,6 +98,17 @@ Packaged binaries do not need clang, kernel headers, or a separate `.o` file on 
 ```text
 WG_MIX_EBPF_OBJECT=/path/to/wg_mix_tc.o
 ```
+
+FakeTCP uses the independent `WG_MIX_EBPF_FAKETCP_OBJECT` override and never
+falls back to the baseline object. It additionally requires the administrator
+to provision and load the matching `wg_mix_faketcp_checksum` kfunc module.
+`wg-mix-ebpf doctor --config ...` checks this dependency before activation;
+the service never loads or unloads an administrator-owned module.
+FakeTCP also requires a fixed non-zero `ListenPort` in the WireGuard config,
+`startup_guard.mode: nft-temporary-drop`, and
+`policy.startup_fail_mode: fail_closed_for_managed_flows`. The guard remains
+installed until the resident runtime passes its final map and attachment
+health check.
 
 or `--object /path/to/wg_mix_tc.o`.
 

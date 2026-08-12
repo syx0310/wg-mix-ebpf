@@ -357,19 +357,16 @@ func buildFakeTCPPolicySnapshot(
 }
 
 func validateFakeTCPPolicyWireGuard(wg control.WireGuardState) error {
-	if !wg.FakeTCPExperimental {
-		return fmt.Errorf("build FakeTCP policy: WireGuard %q has not acknowledged the experiment", wg.Name)
-	}
 	if wg.FakeTCPChecksumMode != config.FakeTCPChecksumModePartialCompleteReset {
 		return fmt.Errorf(
 			"build FakeTCP policy: WireGuard %q checksum mode is %q",
 			wg.Name, wg.FakeTCPChecksumMode,
 		)
 	}
-	if wg.FakeTCPIngressMode != "xdp-required" {
+	if wg.FakeTCPIngressMode != config.FakeTCPIngressModeXDPGenericExact {
 		return fmt.Errorf(
-			"build FakeTCP policy: WireGuard %q ingress mode is %q; want xdp-required",
-			wg.Name, wg.FakeTCPIngressMode,
+			"build FakeTCP policy: WireGuard %q ingress mode is %q; want %s",
+			wg.Name, wg.FakeTCPIngressMode, config.FakeTCPIngressModeXDPGenericExact,
 		)
 	}
 	interval := time.Duration(wg.FakeTCPSYNRateIntervalNanos)

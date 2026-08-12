@@ -126,7 +126,7 @@ func TestFakeTCPRealHostManagedIngressAcceptance(t *testing.T) {
 	closed = true
 	assertFakeTCPRealHostKernelEmpty(t, prepared.contract)
 	t.Logf(
-		"FAKETCP_MANAGED_INGRESS_COMPLETE run_id=%s cells=%d fake_stats=19 core_stats=36 restored=1 capability_opened=0",
+		"FAKETCP_MANAGED_INGRESS_COMPLETE run_id=%s cells=%d fake_stats=19 core_stats=36 restored=1 capability_opened=1",
 		prepared.contract.runID, len(cells),
 	)
 }

@@ -11,7 +11,8 @@ egress: standard type_word -> mixed type_word
 ingress: mixed type_word -> standard type_word
 ```
 
-With optional UDP XOR enabled, the UDP payload pipeline is:
+With optional UDP or FakeTCP XOR enabled, the payload pipeline includes the
+same bounded XOR transform around the mixed type word.
 
 ```text
 egress: standard type_word -> mixed type_word -> XOR WireGuard payload
@@ -92,7 +93,8 @@ internal/abi
   Stable Go-side ABI snapshot for BPF maps.
 
 internal/dataplane
-  Linux TC/eBPF loader, pinned-map handling, generation commit, status, and detach.
+  Linux TC/eBPF loader, pinned-map handling, generation commit, status, detach,
+  and the resident process-owned FakeTCP TCX/XDP runtime.
 
 internal/guard
   nft startup guard generation and execution.
@@ -161,6 +163,22 @@ network receives ICMP Echo packet
   -> standard kernel WireGuard receives packet
 ```
 
+FakeTCP production flow is IPv4-only and packet-oriented:
+
+```text
+egress: WireGuard UDP -> TCX -> mixed/XOR payload -> TCP-shaped packet
+ingress: TCP-shaped packet -> direct generic XDP -> session/control admission
+         -> TCX -> UDP WireGuard packet
+```
+
+The runtime owns an independent embedded BPF collection, exact TCX bpf_link
+FDs, exact direct-generic XDP bpf_link FDs, and a userspace slow path. It is
+therefore available only from the long-lived daemon. Process exit releases
+these unpinned owners and daemon startup rebuilds them. Production refuses an
+existing XDP owner, libxdp chaining, replacement/fallback, classic TC, more
+than one FakeTCP WireGuard, and a missing administrator-provisioned
+`wg_mix_faketcp_checksum` kfunc module.
+
 ICMP server listeners use an explicit wildcard-id flag for the `id=0` fallback entry. Exact-id listener hits still fail closed on bad mixed type words or invalid WireGuard lengths. Wildcard-id fallback hits pass packets that fail only the mixed type-word or WireGuard length checks, while still incrementing the ingress bad-type or bad-length counter, so ordinary Echo Request traffic is not dropped merely because its payload is not a managed WireGuard packet. Profile misses and generation mismatches still drop.
 
 For ICMP server mode, ingress uses the observed Echo `id` as the synthetic UDP source port. WireGuard then naturally carries that value in the return packet destination port, allowing egress to emit an Echo Reply with the same `id`.
@@ -211,9 +229,8 @@ payload obfuscation but costs one chunked load/store and checksum-diff sequence
 per processed chunk.
 
 The current XOR layer is not a mux/multiplex implementation. It does not merge
-multiple WireGuard interfaces or peer flows, does not change the outer UDP
-tuple, and is only valid with UDP transport. Config validation rejects
-ICMP+XOR and fakeTCP+XOR in the MVP.
+multiple WireGuard interfaces or peer flows. It is valid with UDP and FakeTCP;
+config validation rejects ICMP+XOR.
 
 Status exposes load/store/checksum errors and direction-specific GSO counters:
 

@@ -1,5 +1,5 @@
 // Package faketcp contains the userspace slow-path state machine for the
-// experimental FakeTCP transport. It intentionally implements TCP-shaped
+// production FakeTCP transport. It intentionally implements TCP-shaped
 // signalling, not TCP reliability or byte-stream semantics: the UDP payload
 // remains independently recoverable by WireGuard or QUIC.
 package faketcp

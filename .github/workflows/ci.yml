@@ -65,12 +65,19 @@ jobs:
           embedded = hashlib.sha256(
               Path("internal/dataplane/embedded/wg_mix_tc.o").read_bytes()
           ).hexdigest()
+          embedded_faketcp = hashlib.sha256(
+              Path("internal/dataplane/embedded/wg_mix_faketcp.o").read_bytes()
+          ).hexdigest()
           if identity["source_commit"] != head:
               raise SystemExit(f"source commit {identity['source_commit']} != {head}")
           if identity["embedded_bpf_object_sha256"] != embedded:
               raise SystemExit("embedded BPF object SHA-256 mismatch")
+          if identity["embedded_faketcp_object_sha256"] != embedded_faketcp:
+              raise SystemExit("embedded FakeTCP BPF object SHA-256 mismatch")
           if not re.fullmatch(r"[0-9a-f]{64}", embedded):
               raise SystemExit(f"invalid BPF SHA-256 {embedded}")
+          if not re.fullmatch(r"[0-9a-f]{64}", embedded_faketcp):
+              raise SystemExit(f"invalid FakeTCP BPF SHA-256 {embedded_faketcp}")
           PY
 
       - name: Build Linux arm64 package binary

@@ -285,6 +285,33 @@ func TestExperimentalCoreStageKeepsControlInactiveUntilCommitAndRollsBack(t *tes
 	}
 }
 
+func TestExperimentalCoreStageHealthRejectsSelectorAndDataDrift(t *testing.T) {
+	fixture := newCoreStageFixture(t)
+	stage := fixture.stage(t, 91)
+	if err := stage.CommitControl(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stage.Healthy(t.Context()); err != nil {
+		t.Fatalf("healthy core: %v", err)
+	}
+	wantControl := fixture.maps["control_map"].entries[abi.ControlKeyGlobal]
+	fixture.maps["control_map"].entries[abi.ControlKeyGlobal] = abi.ControlValue{}
+	if err := stage.Healthy(t.Context()); err == nil {
+		t.Fatal("inactive control selector reported healthy")
+	}
+	fixture.maps["control_map"].entries[abi.ControlKeyGlobal] = wantControl
+	profileKey := abi.ProfileKey{Generation: 91, ProfileID: 1}
+	wantProfile := fixture.maps["profile_map"].entries[profileKey]
+	fixture.maps["profile_map"].entries[profileKey] = abi.ProfileValue{Generation: 92}
+	if err := stage.Healthy(t.Context()); err == nil {
+		t.Fatal("changed core map value reported healthy")
+	}
+	fixture.maps["profile_map"].entries[profileKey] = wantProfile
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestExperimentalCoreStageReadbackFailureRollsBackOwnedPrefix(t *testing.T) {
 	fixture := newCoreStageFixture(t)
 	readErr := errors.New("injected profile readback failure")

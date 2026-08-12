@@ -259,7 +259,7 @@ type FakeTCPSessionValue struct {
 
 func (v FakeTCPSessionValue) MapGeneration() uint64 { return v.Generation }
 
-// FakeTCPManagedIfKey and FakeTCPManagedIfValue are the experimental XDP
+// FakeTCPManagedIfKey and FakeTCPManagedIfValue are the FakeTCP XDP
 // reachability latch. They intentionally remain outside Snapshot and the
 // canonical ABI-v10 pinned map set: the experimental collection owns their
 // unpinned maps independently.
@@ -276,7 +276,7 @@ type FakeTCPManagedIfValue struct {
 func (v FakeTCPManagedIfValue) MapGeneration() uint64 { return v.Generation }
 
 // FakeTCPManagedPortKey and FakeTCPManagedPortValue are an exact per-interface
-// projection of managed FakeTCP listeners for the experimental XDP parser.
+// projection of managed FakeTCP listeners for the FakeTCP XDP parser.
 type FakeTCPManagedPortKey struct {
 	Generation      uint64
 	UnderlayIndex   uint32
@@ -329,7 +329,7 @@ type FakeTCPControlFlowValue struct {
 
 func (v FakeTCPControlFlowValue) MapGeneration() uint64 { return v.Generation }
 
-// FakeTCPRuntimeIdentityValue must be written before the experimental BPF
+// FakeTCPRuntimeIdentityValue must be written before the FakeTCP BPF
 // programs become reachable. Incarnation is unique for one Engine lifetime;
 // a zero/mismatched value makes every event fail closed.
 type FakeTCPRuntimeIdentityValue struct {

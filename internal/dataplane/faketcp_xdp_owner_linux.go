@@ -75,8 +75,16 @@ const (
 type fakeTCPXDPActivationRequirement uint8
 
 const (
-	// Zero is deliberately strict so an omitted production option fails closed.
+	// Zero remains the strongest contract so an omitted option fails closed.
 	fakeTCPXDPRequireAllHooksExclusive fakeTCPXDPActivationRequirement = iota
+	// Production may explicitly select the direct bpf_link backend. The
+	// planner must first prove that the interface has no aggregate XDP owner,
+	// must choose one fixed mode without fallback, and retains the exact link
+	// identity for rollback. This contract deliberately does not claim libxdp
+	// dispatcher chaining or coexistence with another XDP mode.
+	fakeTCPXDPRequireExactSelectedMode
+	// Tests which exercise lifecycle mechanics with an injected selected-mode
+	// backend use a separate value so production cannot opt in accidentally.
 	fakeTCPXDPAllowSelectedModeTestOnly
 )
 
@@ -214,6 +222,15 @@ func validateFakeTCPXDPActivationRequirement(
 		if capabilities.Scope != fakeTCPXDPOwnershipAllHooks {
 			return fmt.Errorf(
 				"FakeTCP XDP backend %s owns only the selected mode; all-hooks exclusive activation is unavailable",
+				capabilities.Family,
+			)
+		}
+	case fakeTCPXDPRequireExactSelectedMode:
+		if capabilities.Family != fakeTCPXDPBackendDirect ||
+			capabilities.Guarantee != fakeTCPXDPExactSelectedModeLink ||
+			capabilities.Scope != fakeTCPXDPOwnershipSelectedMode {
+			return fmt.Errorf(
+				"FakeTCP XDP backend %s does not provide exact selected-mode bpf_link ownership",
 				capabilities.Family,
 			)
 		}
@@ -370,11 +387,15 @@ func mustLiveFakeTCPXDPRuntime() fakeTCPXDPRuntime {
 		probeLiveFakeTCPXDP,
 		func(
 			request fakeTCPXDPAttachRequest,
-			_ fakeTCPXDPProbe,
+			expected fakeTCPXDPProbe,
 			program experimentalProgramResource,
 		) (fakeTCPXDPLink, error) {
 			if program == nil || program.kernelProgram() == nil {
 				return nil, errors.New("live XDP attach requires a kernel program")
+			}
+			if expected.IfIndex != request.IfIndex || expected.Attached ||
+				expected.ProgramID != 0 || expected.Dispatcher || expected.DispatcherID != 0 {
+				return nil, errors.New("live XDP attach requires an exact absent preflight observation")
 			}
 			var flags link.XDPAttachFlags
 			switch request.Mode {
@@ -391,7 +412,13 @@ func mustLiveFakeTCPXDPRuntime() fakeTCPXDPRuntime {
 			if err != nil {
 				return nil, err
 			}
-			return newLiveFakeTCPXDPLink(request.Mode, attached), nil
+			owned := newLiveFakeTCPXDPLink(request.Mode, attached)
+			identity, identityErr := owned.Identity()
+			post, postErr := probeLiveFakeTCPXDP(request.IfIndex)
+			return owned, errors.Join(
+				identityErr,
+				validateLiveFakeTCPXDPPostAttach(request, identity, post, postErr),
+			)
 		},
 	)
 	if err != nil {
@@ -401,6 +428,39 @@ func mustLiveFakeTCPXDPRuntime() fakeTCPXDPRuntime {
 }
 
 var liveFakeTCPXDPRuntime = mustLiveFakeTCPXDPRuntime()
+
+func validateLiveFakeTCPXDPPostAttach(
+	request fakeTCPXDPAttachRequest,
+	identity fakeTCPXDPLinkIdentity,
+	probe fakeTCPXDPProbe,
+	probeErr error,
+) error {
+	if probeErr != nil {
+		return fmt.Errorf("post-attach aggregate XDP probe: %w", probeErr)
+	}
+	wantMode := uint32(0)
+	switch request.Mode {
+	case fakeTCPXDPAttachNative:
+		wantMode = uint32(link.XDPDriverMode)
+	case fakeTCPXDPAttachGeneric:
+		wantMode = uint32(link.XDPGenericMode)
+	default:
+		return fmt.Errorf("post-attach aggregate XDP probe has unsupported mode %s", request.Mode)
+	}
+	if identity.Family != fakeTCPXDPBackendDirect || identity.Mode != request.Mode ||
+		identity.IfIndex != request.IfIndex || identity.ProgramID == 0 || identity.OwnerID == 0 {
+		return fmt.Errorf("post-attach direct XDP owner identity is incomplete: %+v", identity)
+	}
+	if probe.IfIndex != request.IfIndex || !probe.Attached ||
+		probe.ProgramID != identity.ProgramID || probe.AttachMode != wantMode ||
+		probe.Dispatcher || probe.DispatcherID != 0 {
+		return fmt.Errorf(
+			"post-attach aggregate XDP identity %+v does not match exact owner %+v mode=%d",
+			probe, identity, wantMode,
+		)
+	}
+	return nil
+}
 
 func probeLiveFakeTCPXDP(ifindex int) (fakeTCPXDPProbe, error) {
 	if ifindex <= 0 {
@@ -439,17 +499,21 @@ const (
 )
 
 type fakeTCPXDPAttachment struct {
-	request  fakeTCPXDPAttachRequest
-	probe    fakeTCPXDPProbe
-	identity fakeTCPXDPLinkIdentity
-	link     fakeTCPXDPLink
-	state    fakeTCPXDPOwnershipState
+	request   fakeTCPXDPAttachRequest
+	probe     fakeTCPXDPProbe
+	family    fakeTCPXDPBackendFamily
+	programID uint32
+	identity  fakeTCPXDPLinkIdentity
+	link      fakeTCPXDPLink
+	state     fakeTCPXDPOwnershipState
 }
 
 func (attachment *fakeTCPXDPAttachment) adopt(
 	family fakeTCPXDPBackendFamily,
 	programID uint32,
 ) error {
+	attachment.family = family
+	attachment.programID = programID
 	identity, err := attachment.link.Identity()
 	if err != nil {
 		return fmt.Errorf("inspect new owner identity: %w", err)
@@ -467,7 +531,13 @@ func (attachment *fakeTCPXDPAttachment) adopt(
 func (attachment *fakeTCPXDPAttachment) release() (bool, error) {
 	switch attachment.state {
 	case fakeTCPXDPOwnershipUnverified:
-		return false, errors.New("release refused: XDP owner identity was never verified")
+		// Identity inspection can fail after a successful direct bpf_link
+		// attach. Retry the exact FD identity before release so a transient
+		// inspection error does not quarantine the process-owned link forever.
+		// A mismatch remains fail-closed and never reaches Release.
+		if err := attachment.adopt(attachment.family, attachment.programID); err != nil {
+			return false, fmt.Errorf("release refused: XDP owner identity is still unverified: %w", err)
+		}
 	case fakeTCPXDPOwnershipStale:
 		return false, errors.New("release refused: XDP owner identity is stale")
 	case fakeTCPXDPOwnershipAdopted:
@@ -506,6 +576,7 @@ func (attachment *fakeTCPXDPAttachment) release() (bool, error) {
 type fakeTCPXDPStage struct {
 	mu          sync.Mutex
 	attachments []fakeTCPXDPAttachment
+	runtime     fakeTCPXDPRuntime
 }
 
 type fakeTCPXDPPlannedAttachment struct {
@@ -567,7 +638,7 @@ func stageFakeTCPXDPAttachments(
 		planned = append(planned, fakeTCPXDPPlannedAttachment{request: request, probe: probe})
 	}
 
-	stage := &fakeTCPXDPStage{}
+	stage := &fakeTCPXDPStage{runtime: runtime}
 	for _, plan := range planned {
 		if err := ctx.Err(); err != nil {
 			return stageOrNil(stage), err
@@ -583,10 +654,12 @@ func stageFakeTCPXDPAttachments(
 			)
 		}
 		attachment := fakeTCPXDPAttachment{
-			request: plan.request,
-			probe:   plan.probe,
-			link:    ownedLink,
-			state:   fakeTCPXDPOwnershipUnverified,
+			request:   plan.request,
+			probe:     plan.probe,
+			family:    runtime.capabilities.Family,
+			programID: programID,
+			link:      ownedLink,
+			state:     fakeTCPXDPOwnershipUnverified,
 		}
 		stage.attachments = append(stage.attachments, attachment)
 		current := &stage.attachments[len(stage.attachments)-1]
@@ -604,7 +677,128 @@ func stageFakeTCPXDPAttachments(
 			)
 		}
 	}
+	// Re-prove the complete owner set after the last attach. Per-attachment
+	// adoption proves each link FD at one point in time, but a foreign writer
+	// can still replace an earlier interface's aggregate XDP owner while a
+	// later interface is being attached. Returning the populated stage keeps
+	// every exact process-owned link available to the caller's rollback path.
+	if err := validateFakeTCPXDPAttachments(ctx, stage.runtime, stage.attachments); err != nil {
+		return stage, fmt.Errorf("stage FakeTCP XDP final owner recheck: %w", err)
+	}
 	return stage, nil
+}
+
+func validateFakeTCPXDPAttachments(
+	ctx context.Context,
+	runtime fakeTCPXDPRuntime,
+	attachments []fakeTCPXDPAttachment,
+) error {
+	if ctx == nil {
+		return errors.New("inspect FakeTCP XDP owners: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if len(attachments) == 0 || runtime.probe == nil {
+		return errors.New("inspect FakeTCP XDP owners: owner set is incomplete")
+	}
+	for index := range attachments {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attachment := &attachments[index]
+		if attachment.state != fakeTCPXDPOwnershipAdopted {
+			return fmt.Errorf(
+				"ifindex %d ownership state %d is not adopted",
+				attachment.request.IfIndex,
+				attachment.state,
+			)
+		}
+		if attachment.link == nil {
+			return fmt.Errorf("ifindex %d owner link is nil", attachment.request.IfIndex)
+		}
+		identity, err := attachment.link.Identity()
+		if err != nil {
+			return fmt.Errorf("inspect link ifindex %d: %w", attachment.request.IfIndex, err)
+		}
+		if identity != attachment.identity {
+			return fmt.Errorf(
+				"inspect link ifindex %d: identity %+v differs from owner %+v",
+				attachment.request.IfIndex,
+				identity,
+				attachment.identity,
+			)
+		}
+		probe, err := runtime.probe(attachment.request.IfIndex)
+		if err != nil {
+			return fmt.Errorf("probe aggregate owner ifindex %d: %w", attachment.request.IfIndex, err)
+		}
+		switch attachment.family {
+		case fakeTCPXDPBackendDirect:
+			if err := validateLiveFakeTCPXDPPostAttach(
+				attachment.request,
+				attachment.identity,
+				probe,
+				nil,
+			); err != nil {
+				return fmt.Errorf("ifindex %d: %w", attachment.request.IfIndex, err)
+			}
+		case fakeTCPXDPBackendLibXDP:
+			if !probe.Attached || !probe.Dispatcher ||
+				probe.ProgramID != attachment.identity.DispatcherProgramID ||
+				probe.DispatcherID != attachment.identity.DispatcherID {
+				return fmt.Errorf(
+					"inspect libxdp ifindex %d: aggregate identity %+v differs from owner %+v",
+					attachment.request.IfIndex,
+					probe,
+					attachment.identity,
+				)
+			}
+		default:
+			return fmt.Errorf("unsupported backend %s", attachment.family)
+		}
+	}
+	return nil
+}
+
+// Healthy re-proves every process-owned XDP link through both the held link
+// FD identity and an aggregate per-interface observation. Production uses a
+// direct generic exact-selected-mode backend, so disappearance or replacement
+// of either identity makes the runtime unhealthy and triggers serial rebuild.
+func (stage *fakeTCPXDPStage) Healthy(ctx context.Context) error {
+	if stage == nil {
+		return errors.New("FakeTCP XDP stage is nil")
+	}
+	if ctx == nil {
+		return errors.New("inspect FakeTCP XDP health: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	stage.mu.Lock()
+	defer stage.mu.Unlock()
+	if err := validateFakeTCPXDPAttachments(ctx, stage.runtime, stage.attachments); err != nil {
+		return fmt.Errorf("inspect FakeTCP XDP health: %w", err)
+	}
+	return nil
+}
+
+func (stage *fakeTCPXDPStage) productionStatus() []FakeTCPXDPStatus {
+	if stage == nil {
+		return nil
+	}
+	stage.mu.Lock()
+	defer stage.mu.Unlock()
+	result := make([]FakeTCPXDPStatus, 0, len(stage.attachments))
+	for _, attachment := range stage.attachments {
+		result = append(result, FakeTCPXDPStatus{
+			IfIndex:   attachment.identity.IfIndex,
+			Mode:      attachment.identity.Mode.String(),
+			LinkID:    attachment.identity.OwnerID,
+			ProgramID: attachment.identity.ProgramID,
+		})
+	}
+	return result
 }
 
 func canonicalFakeTCPXDPRequests(

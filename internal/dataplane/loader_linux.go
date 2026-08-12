@@ -254,11 +254,15 @@ var xorTailCallBindings = []struct {
 }
 
 type LinuxLoader struct {
-	ObjectPath       string
-	PinPath          string
-	AdoptLegacyPins  bool
-	runtime          *pinPathRuntime
-	objectPathFrozen bool
+	ObjectPath              string
+	FakeTCPObjectPath       string
+	PinPath                 string
+	AdoptLegacyPins         bool
+	LifecycleLease          *lockfile.LifecycleLease
+	ResidentRuntime         bool
+	runtime                 *pinPathRuntime
+	objectPathFrozen        bool
+	fakeTCPObjectPathFrozen bool
 }
 
 func NewLoader() Loader {
@@ -267,9 +271,12 @@ func NewLoader() Loader {
 
 func NewLoaderWithOptions(options LoaderOptions) Loader {
 	baseline := LinuxLoader{
-		ObjectPath:      objectPathFromEnv(""),
-		PinPath:         pinPathFromEnv(""),
-		AdoptLegacyPins: options.AdoptLegacyPins,
+		ObjectPath:        objectPathFromEnv(""),
+		FakeTCPObjectPath: fakeTCPObjectPathFromEnv(options.FakeTCPObjectPath),
+		PinPath:           pinPathFromEnv(""),
+		AdoptLegacyPins:   options.AdoptLegacyPins,
+		LifecycleLease:    options.LifecycleLease,
+		ResidentRuntime:   options.ResidentRuntime,
 	}
 	return newFakeTCPProductionLoader(baseline)
 }
@@ -347,6 +354,9 @@ func (l LinuxLoader) Apply(ctx context.Context, state *control.State) error {
 	}
 	if err := preflightFakeTCPKernelRequirements(state); err != nil {
 		return err
+	}
+	if len(fakeTCPStateReferences(state)) != 0 {
+		return ErrFakeTCPProductionCoordinatorRequired
 	}
 
 	runtime := l.pinRuntime(ctx)
@@ -1132,6 +1142,13 @@ func (l LinuxLoader) effectiveObjectPath() string {
 		return l.ObjectPath
 	}
 	return objectPathFromEnv(l.ObjectPath)
+}
+
+func (l LinuxLoader) effectiveFakeTCPObjectPath() string {
+	if l.fakeTCPObjectPathFrozen {
+		return l.FakeTCPObjectPath
+	}
+	return fakeTCPObjectPathFromEnv(l.FakeTCPObjectPath)
 }
 
 func (l LinuxLoader) loadCollectionSpec() (*ebpf.CollectionSpec, ObjectIdentity, error) {

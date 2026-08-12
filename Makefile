@@ -22,6 +22,7 @@ FAKETCP_VERIFIER_LAUNCHER_TEST_AMD64 ?= build/verifierlauncher-linux-amd64.test
 FAKETCP_VERIFIER_LAUNCHER_TEST_ARM64 ?= build/verifierlauncher-linux-arm64.test
 FAKETCP_DATAPLANE_TEST_AMD64 ?= build/dataplane-linux-amd64.test
 EMBEDDED_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_tc.o
+EMBEDDED_FAKETCP_BPF_OBJECT ?= internal/dataplane/embedded/wg_mix_faketcp.o
 override BUILD_SOURCE_COMMIT := $(shell ./scripts/source-commit.sh)
 override BUILD_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/buildinfo.sourceCommit=$(BUILD_SOURCE_COMMIT)
 override NETNS_ANCHOR_IDENTITY_LDFLAG := -X=github.com/syx0310/wg-mix-ebpf/internal/netnsanchor.sourceCommit=$(BUILD_SOURCE_COMMIT)
@@ -93,8 +94,9 @@ build-bpf:
 	@mkdir -p $(dir $(BPF_OBJECT))
 	$(CLANG) $(BPF_BASELINE_CFLAGS) -c bpf/wg_mix_tc.c -o $(BPF_OBJECT)
 
-# The Mimic-style FakeTCP wire path is a separate, deliberately unembedded
-# experiment. The ordinary loader only accepts the baseline object above.
+# FakeTCP uses a separate object and manifest from the baseline TC dataplane.
+# The historical target/output name stays compatible with reviewed runners;
+# release builds embed both objects and each loader validates its own manifest.
 build-faketcp-experimental-bpf:
 	@mkdir -p $(dir $(FAKETCP_EXPERIMENTAL_BPF_OBJECT))
 	$(CLANG) $(BPF_CFLAGS) -DWG_MIX_EXPERIMENTAL_FAKETCP=1 \
@@ -156,9 +158,10 @@ test-bpf-object-manifest-path-contract:
 		MANIFEST_CONTRACT_EXPECT_CWD="$(CURDIR)" \
 		GO="$(CURDIR)/scripts/test-bpf-object-manifest-path-contract.sh"
 
-prepare-embedded-bpf: build-bpf
-	@mkdir -p $(dir $(EMBEDDED_BPF_OBJECT))
+prepare-embedded-bpf: build-bpf build-faketcp-experimental-bpf
+	@mkdir -p $(dir $(EMBEDDED_BPF_OBJECT)) $(dir $(EMBEDDED_FAKETCP_BPF_OBJECT))
 	cp $(BPF_OBJECT) $(EMBEDDED_BPF_OBJECT)
+	cp $(FAKETCP_EXPERIMENTAL_BPF_OBJECT) $(EMBEDDED_FAKETCP_BPF_OBJECT)
 
 bpf-load-test: build
 	./$(BINARY) bpf-load-test

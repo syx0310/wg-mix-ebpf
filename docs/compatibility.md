@@ -38,19 +38,20 @@ Supported transport modes:
 ```text
 udp
 icmp
+faketcp
 ```
 
 `udp` is the default and is the original transparent type-word mode.
 
-UDP transport can optionally enable the experimental XOR cipher layer. XOR runs after type-word mixing on egress and before type-word unmixing on ingress. It obfuscates the WireGuard UDP payload but does not add authentication, replay protection, length hiding, or udp2raw wire compatibility.
+UDP and FakeTCP transports can optionally enable the XOR cipher layer. XOR runs after type-word mixing on egress and before type-word unmixing on ingress. It obfuscates the WireGuard payload but does not add authentication, replay protection, length hiding, or udp2raw wire compatibility.
 
 XOR compatibility requirements:
 
 ```text
 both endpoints must enable the same cipher definition
 the same XOR key material must be configured on both endpoints
-only UDP transport is supported in the MVP
-ICMP + XOR and fakeTCP + XOR are rejected
+UDP and FakeTCP transports are supported
+ICMP + XOR is rejected
 current XOR is not mux/multiplex and does not merge multiple flows
 ```
 
@@ -82,7 +83,6 @@ MVP ICMP limitations:
 experimental
 IPv4 only
 single client profile per server listener unless ids are made unique
-no fakeTCP
 no udp2raw wire compatibility
 no extra encryption/auth/anti-replay beyond WireGuard itself
 no ICMPv6
@@ -92,7 +92,18 @@ checksum and offload behavior requires target validation; small WG packets use b
 
 Large ICMP packets use the UDP-checksum-derived fast path instead of a verifier-bounded full ICMP checksum recompute. This path depends on the original UDP checksum; an IPv4 UDP packet with checksum zero causes large ICMP checksum derivation to fail and is reported through `icmp_checksum_error`.
 
-`faketcp` and `faketcp-lite` are reserved names and are rejected by config validation in this version.
+`faketcp` is the production IPv4 TCP-shaped transport. It is packet-oriented,
+not a TCP byte stream, and supports exactly one FakeTCP WireGuard per daemon.
+The production attachment contract is TCX egress/ingress plus direct generic
+XDP ingress on every attachable underlay. Existing XDP programs, libxdp
+dispatcher chaining, XDP replacement/fallback, and `classic_tc` are rejected
+before mutation. The runtime is process-owned and therefore must run in the
+long-lived daemon; one-shot `reload` and `run --once` are rejected. The
+administrator must provision the matching `wg_mix_faketcp_checksum` kfunc
+module. A fixed non-zero WireGuard `ListenPort`, the nft temporary startup
+guard, and fail-closed managed-flow policy are mandatory; the guard is removed
+only after the process-owned maps and every TCX/XDP attachment pass their final
+health check. `faketcp-lite` remains unsupported.
 
 Netns regression entry points:
 
@@ -232,7 +243,9 @@ tc command for attach/status inspection
 nft command for startup-guard application and fixed-table cleanup
 ```
 
-`startup_guard.mode: none` disables guard application, but stop/uninstall still use `nft` to check and remove the fixed owned table in case an earlier configuration left it behind.
+`startup_guard.mode: none` disables guard application for UDP/ICMP, but is
+rejected for FakeTCP. Stop/uninstall still use `nft` to check and remove the
+fixed owned table in case an earlier configuration left it behind.
 
 ## OpenWrt
 

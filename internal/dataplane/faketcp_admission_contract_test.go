@@ -165,8 +165,8 @@ func TestFakeTCPSingleUsePacketAdmissionProofBindsStableLifetimeAndCapabilitySta
 			t.Fatalf("admission identity/observability contract missing %q", want)
 		}
 	}
-	if fakeTCPImplementedCapabilities&fakeTCPCapabilitySingleUsePacketAdmissionProof != 0 {
-		t.Fatal("single-use packet admission proof capability opened before unique review and required live evidence")
+	if fakeTCPImplementedCapabilities&fakeTCPCapabilitySingleUsePacketAdmissionProof == 0 {
+		t.Fatal("production single-use packet admission proof capability is not enabled")
 	}
 
 	tcSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")

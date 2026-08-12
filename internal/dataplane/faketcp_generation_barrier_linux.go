@@ -168,6 +168,39 @@ func (barrier *liveFakeTCPGenerationBarrier) Activate(
 		abi.FakeTCPGenerationResultOpen)
 }
 
+// Healthy proves that the exact generation barrier remains bound and open.
+// It is read-only and does not run the control program, so health polling
+// cannot change the generation state or inflight counter.
+func (barrier *liveFakeTCPGenerationBarrier) Healthy(ctx context.Context) error {
+	if barrier == nil || ctx == nil {
+		return errors.New("inspect FakeTCP generation barrier: incomplete input")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	barrier.mu.Lock()
+	defer barrier.mu.Unlock()
+	if barrier.generation == 0 || barrier.gate == nil || barrier.wake == nil ||
+		barrier.control == nil || barrier.identity.Generation != barrier.generation ||
+		barrier.identity.Incarnation == (faketcp.RuntimeIncarnation{}) {
+		return errors.New("inspect FakeTCP generation barrier: exact owner is incomplete")
+	}
+	var gate abi.FakeTCPGenerationGateValue
+	if err := barrier.gate.Lookup(uint32(0), &gate); err != nil {
+		return fmt.Errorf("inspect FakeTCP generation barrier gate: %w", err)
+	}
+	if gate.Generation != barrier.generation ||
+		gate.State&abi.FakeTCPGenerationStateOpen == 0 ||
+		gate.State&(abi.FakeTCPGenerationStateSealed|abi.FakeTCPGenerationStatePoison) != 0 {
+		return fmt.Errorf(
+			"inspect FakeTCP generation barrier: gate is %#v, want generation %d open",
+			gate,
+			barrier.generation,
+		)
+	}
+	return nil
+}
+
 func (barrier *liveFakeTCPGenerationBarrier) Quiesce(
 	ctx context.Context,
 	generation uint64,

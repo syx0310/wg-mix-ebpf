@@ -115,10 +115,34 @@ func runDoctor(ctx context.Context, args []string, stdout io.Writer) error {
 	}
 	if _, err := os.Stat(*configPath); err != nil {
 		checks = append(checks, doctorCheck{Name: "config", Status: "WARN", Detail: *configPath, Message: err.Error()})
-	} else if _, _, err := reconcile.BuildState(ctx, reconcile.Options{ConfigPath: *configPath}); err != nil {
+	} else if _, state, err := reconcile.BuildState(ctx, reconcile.Options{ConfigPath: *configPath}); err != nil {
 		checks = append(checks, doctorCheck{Name: "config/runtime", Status: "FAIL", Detail: *configPath, Message: err.Error()})
 	} else {
 		checks = append(checks, doctorCheck{Name: "config/runtime", Status: "PASS", Detail: *configPath})
+		fakeTCP := false
+		for _, wg := range state.WireGuards {
+			fakeTCP = fakeTCP || wg.TransportMode == "faketcp"
+		}
+		if fakeTCP {
+			checks = append(checks, statusCheck(
+				"faketcp.kmod",
+				probe.KernelModules["wg_mix_faketcp_checksum"],
+				"wg_mix_faketcp_checksum",
+				"FakeTCP requires an administrator-provisioned checksum kfunc module with kernel BTF; wg-mix-ebpf never auto-loads or unloads it",
+			))
+			if err := dataplane.ProbeFakeTCPKernelDependency(); err != nil {
+				checks = append(checks, doctorCheck{
+					Name: "faketcp.kfunc", Status: "FAIL",
+					Detail:  "wg_mix_faketcp_checksum",
+					Message: err.Error(),
+				})
+			} else {
+				checks = append(checks, doctorCheck{
+					Name: "faketcp.kfunc", Status: "PASS",
+					Detail: "module BTF contains every required checksum kfunc",
+				})
+			}
+		}
 	}
 	if *jsonOut {
 		return writeJSON(stdout, struct {
@@ -665,11 +689,9 @@ func runBPFLoadTestWithLoaders(
 	fs := flag.NewFlagSet("bpf-load-test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	objectPath := fs.String("object", "", "path to TC/eBPF object")
-	experimentalFakeTCP := fs.Bool(
-		"experimental-faketcp",
-		false,
-		"explicitly verifier-load an unembedded experimental FakeTCP object",
-	)
+	var fakeTCP bool
+	fs.BoolVar(&fakeTCP, "faketcp", false, "verifier-load a separate FakeTCP object")
+	fs.BoolVar(&fakeTCP, "experimental-faketcp", false, "deprecated alias for --faketcp")
 	jsonOut := fs.Bool("json", false, "print load and artifact identity as JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -677,14 +699,14 @@ func runBPFLoadTestWithLoaders(
 	if fs.NArg() != 0 {
 		return fmt.Errorf("bpf-load-test does not accept positional arguments")
 	}
-	if *experimentalFakeTCP && strings.TrimSpace(*objectPath) == "" {
-		return fmt.Errorf("--experimental-faketcp requires an explicit non-empty --object path")
+	if fakeTCP && strings.TrimSpace(*objectPath) == "" {
+		return fmt.Errorf("--faketcp requires an explicit non-empty --object path")
 	}
 
 	kind := ""
 	loader := loadBaseline
-	if *experimentalFakeTCP {
-		kind = dataplane.ExperimentalFakeTCPObjectKind
+	if fakeTCP {
+		kind = dataplane.FakeTCPObjectKind
 		loader = loadExperimental
 	}
 	identity, err := loader(ctx, *objectPath)
@@ -704,10 +726,10 @@ func runBPFLoadTestWithLoaders(
 			Object: identity,
 		})
 	}
-	if *experimentalFakeTCP {
+	if fakeTCP {
 		fmt.Fprintf(
 			stdout,
-			"Experimental FakeTCP BPF object verifier-loaded successfully: kind=%s source=%s sha256=%s\n",
+			"FakeTCP BPF object verifier-loaded successfully: kind=%s source=%s sha256=%s\n",
 			kind,
 			identity.Source,
 			identity.SHA256,
@@ -806,6 +828,13 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 			view.Desired = result.State
 			view.Dataplane = result.Dataplane
 			view.Error = result.DataplaneError
+			if view.Daemon != nil && daemon.IsRunning(view.Daemon) &&
+				view.Daemon.LastResult != nil && view.Daemon.LastResult.Dataplane != nil &&
+				view.Daemon.LastResult.Dataplane.Mode == "faketcp" {
+				view.Dataplane = view.Daemon.LastResult.Dataplane
+				view.Error = view.Daemon.LastResult.DataplaneError
+				view.DataplaneNote = "showing resident daemon FakeTCP runtime snapshot"
+			}
 			return writeJSON(stdout, view)
 		}
 		result, err := reconcile.Validate(ctx, opts)
@@ -1013,8 +1042,8 @@ Commands:
   guard-plan  print nft startup guard script
   guard-apply apply nft startup guard
   guard-cleanup remove nft startup guard table
-  bpf-load-test load the baseline BPF object; experimental FakeTCP requires
-                --experimental-faketcp and an explicit --object path
+  bpf-load-test load the baseline BPF object; FakeTCP requires --faketcp and
+                an explicit --object path (legacy --experimental-faketcp is accepted)
   features    print raw local feature probe JSON
   version     print version; use --json for source/object/ABI identity
 

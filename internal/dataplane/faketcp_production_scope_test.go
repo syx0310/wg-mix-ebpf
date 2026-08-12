@@ -108,6 +108,16 @@ func TestFakeTCPProductionScopeIdentityValidatesObjectSourceKind(t *testing.T) {
 			scope.objectPath = "object.o"
 			return scope
 		}()},
+		{name: "relative-faketcp-object", scope: func() fakeTCPProductionScopeIdentity {
+			scope := filesystem
+			scope.fakeTCPObjectPath = "faketcp.o"
+			return scope
+		}()},
+		{name: "empty-faketcp-object", scope: func() fakeTCPProductionScopeIdentity {
+			scope := filesystem
+			scope.fakeTCPObjectPath = ""
+			return scope
+		}()},
 		{name: "relative-pin", scope: func() fakeTCPProductionScopeIdentity {
 			scope := filesystem
 			scope.pinPath = "pins"

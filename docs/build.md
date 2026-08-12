@@ -1,6 +1,8 @@
 # Build
 
-This project ships one userspace Go binary with an embedded TC/eBPF object. Target machines do not need clang or kernel headers at runtime when using the packaged binary.
+This project ships one userspace Go binary with separate embedded baseline and
+FakeTCP eBPF objects. Target machines do not need clang or kernel headers at
+runtime when using the packaged binary.
 
 ## Requirements
 
@@ -25,6 +27,7 @@ TC clsact / sched_cls support
 bpffs mounted at /sys/fs/bpf
 nft, when startup_guard.mode is nft-temporary-drop
 wg, when reading live WireGuard runtime state
+administrator-provisioned wg_mix_faketcp_checksum kfunc module, for FakeTCP only
 ```
 
 ## Local Build
@@ -57,15 +60,20 @@ Both Linux binary targets run `prepare-embedded-bpf` first. That compiles:
 
 ```text
 bpf/wg_mix_tc.c -> build/wg_mix_tc.o
+bpf/wg_mix_tc.c + WG_MIX_EXPERIMENTAL_FAKETCP -> build/wg_mix_faketcp_experimental.o
 ```
 
 and copies the object to:
 
 ```text
 internal/dataplane/embedded/wg_mix_tc.o
+internal/dataplane/embedded/wg_mix_faketcp.o
 ```
 
-The Go compiler embeds that object into the final binary. The runtime loader uses the embedded object unless an override is provided.
+The Go compiler embeds both objects into the final binary. The baseline and
+FakeTCP loaders validate distinct manifests and never substitute one object
+for the other. The historical build macro/output name is retained for runner
+compatibility; it does not make the packaged FakeTCP runtime experimental.
 
 ## Artifact Identity
 
@@ -77,7 +85,8 @@ wg-mix-ebpf version --json
 ```
 
 The JSON contains the userspace version, source commit, BPF ABI version, and
-SHA-256 of the exact `wg_mix_tc.o` bytes embedded in that executable. `status`
+SHA-256 values of the exact baseline and FakeTCP object bytes embedded in that
+executable. `status`
 reports the querying executable under `client_build`. A running daemon records
 its own immutable startup identity under `daemon.build`, so replacing the
 on-disk CLI cannot make an older daemon appear to run the newer artifact.
@@ -99,6 +108,7 @@ available:
 ```bash
 wg-mix-ebpf bpf-load-test --json
 wg-mix-ebpf bpf-load-test --object /path/to/wg_mix_tc.o --json
+wg-mix-ebpf bpf-load-test --faketcp --object /path/to/wg_mix_faketcp_experimental.o --json
 ```
 
 The `object.sha256` value is calculated from the same byte slice passed to the
@@ -118,6 +128,10 @@ or:
 ```bash
 wg-mix-ebpf bpf-load-test --object /path/to/wg_mix_tc.o
 ```
+
+Production FakeTCP may override only its own embedded artifact with the
+absolute `WG_MIX_EBPF_FAKETCP_OBJECT` path. It never inherits
+`WG_MIX_EBPF_OBJECT`.
 
 `bpf-load-test` loads and closes the BPF collection. It does not attach TC filters, create network namespaces, read WireGuard runtime state, or send WireGuard traffic.
 
@@ -156,4 +170,11 @@ README.md
 configs/
 ```
 
-The binary already includes the BPF object. There is no separate `.o` file required on target machines for normal use.
+The binary already includes both BPF objects. There is no separate `.o` file
+required on target machines for normal use. The checksum kfunc kernel module
+is intentionally not installed or managed by the binary: an administrator
+must build/provision a module matching the running kernel, load it before
+starting FakeTCP, and own its later removal. `doctor` and the FakeTCP planner
+verify the module/BTF/kfunc dependency before network mutation. OpenWrt builds
+without a matching packaged kmod do not support FakeTCP; UDP/ICMP remain
+available.

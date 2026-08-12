@@ -150,10 +150,11 @@ func fakeTCPProductionTestState() *control.State {
 
 func fakeTCPProductionTestScope() fakeTCPProductionScopeIdentity {
 	return fakeTCPProductionScopeIdentity{
-		objectKind:    fakeTCPProductionObjectScopeFilesystem,
-		objectPath:    "/test/wg-mix-ebpf/object.o",
-		pinPath:       "/test/wg-mix-ebpf/pins",
-		lifecyclePath: "/test/wg-mix-ebpf/lifecycle.lease",
+		objectKind:        fakeTCPProductionObjectScopeFilesystem,
+		objectPath:        "/test/wg-mix-ebpf/object.o",
+		fakeTCPObjectPath: EmbeddedFakeTCPObjectSource,
+		pinPath:           "/test/wg-mix-ebpf/pins",
+		lifecyclePath:     "/test/wg-mix-ebpf/lifecycle.lease",
 	}
 }
 
@@ -1414,6 +1415,7 @@ func TestFakeTCPProductionCoordinatorSameObjectPathContentChangeUsesDesiredKey(t
 		},
 	)
 	secondBuilds := 0
+	secondRuntime := newControlledFakeTCPRuntime()
 	second := newFakeTCPProductionTestCoordinatorWithScope(
 		&fakeTCPProductionTestBaseline{},
 		shared,
@@ -1425,7 +1427,7 @@ func TestFakeTCPProductionCoordinatorSameObjectPathContentChangeUsesDesiredKey(t
 				key: fakeTCPRuntimeDesiredKey{2},
 				build: func(context.Context) (fakeTCPRuntimeService, error) {
 					secondBuilds++
-					return newControlledFakeTCPRuntime(), nil
+					return secondRuntime, nil
 				},
 			}, nil
 		},
@@ -1435,11 +1437,11 @@ func TestFakeTCPProductionCoordinatorSameObjectPathContentChangeUsesDesiredKey(t
 		t.Fatal(err)
 	}
 	<-firstRuntime.runStarted
-	err := second.Apply(t.Context(), state)
-	if !errors.Is(err, errFakeTCPRuntimeReplacementUnsafe) {
-		t.Fatalf("same-path content replacement error = %v", err)
+	if err := second.Apply(t.Context(), state); err != nil {
+		t.Fatalf("same-path content replacement: %v", err)
 	}
-	if secondBuilds != 0 || !shared.scopeBound || shared.scope != scope ||
+	<-secondRuntime.runStarted
+	if secondBuilds != 1 || !shared.scopeBound || shared.scope != scope ||
 		shared.owner != dataplaneCoreOwnerExperimental {
 		t.Fatalf(
 			"same-path desired-key fence: builds=%d bound=%t scope=%#v owner=%d",
@@ -1447,8 +1449,8 @@ func TestFakeTCPProductionCoordinatorSameObjectPathContentChangeUsesDesiredKey(t
 		)
 	}
 	stopCalls, closeCalls, _ := firstRuntime.counts()
-	if stopCalls != 0 || closeCalls != 0 {
-		t.Fatal("same-path desired-key rejection stopped the active runtime")
+	if stopCalls != 1 || closeCalls != 1 {
+		t.Fatal("same-path desired-key replacement did not retire the active runtime")
 	}
 	if err := first.Detach(t.Context(), state); err != nil {
 		t.Fatal(err)

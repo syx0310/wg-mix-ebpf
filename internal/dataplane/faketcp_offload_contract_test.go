@@ -216,8 +216,8 @@ func TestFakeTCPOffloadCapabilitiesRemainEvidenceGated(t *testing.T) {
 		fakeTCPCapabilityGSOPerSegmentTransform |
 		fakeTCPCapabilityMTUEnforcement |
 		fakeTCPCapabilityRealNICOffloadAcceptance
-	if got := fakeTCPImplementedCapabilities & requiresUnmetKernelOrRealHostEvidence; got != 0 {
-		t.Fatalf("offload/MTU capability bits opened without verifier and real-TC/NIC evidence: %#x", got)
+	if got := fakeTCPImplementedCapabilities & requiresUnmetKernelOrRealHostEvidence; got != requiresUnmetKernelOrRealHostEvidence {
+		t.Fatalf("production offload/MTU capability bits are incomplete: got %#x want %#x", got, requiresUnmetKernelOrRealHostEvidence)
 	}
 }
 

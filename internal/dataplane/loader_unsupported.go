@@ -8,6 +8,23 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 )
 
+func ProductionFakeTCPHealthy(_ context.Context, state *control.State) (handled bool, healthy bool) {
+	if len(fakeTCPStateReferences(state)) == 0 {
+		return false, false
+	}
+	return true, false
+}
+
+func ProductionFakeTCPStatus(
+	_ context.Context,
+	state *control.State,
+) (handled bool, status *KernelStatus, err error) {
+	if len(fakeTCPStateReferences(state)) == 0 {
+		return false, nil, nil
+	}
+	return true, &KernelStatus{Mode: "faketcp"}, ErrUnsupported
+}
+
 type UnsupportedLoader struct{}
 
 func NewLoader() Loader {
@@ -40,4 +57,8 @@ func LoadObjectTestIdentity(context.Context, string) (ObjectIdentity, error) {
 
 func LoadExperimentalFakeTCPObjectTestIdentity(context.Context, string) (ObjectIdentity, error) {
 	return ObjectIdentity{}, ErrUnsupported
+}
+
+func ProbeFakeTCPKernelDependency() error {
+	return ErrUnsupported
 }

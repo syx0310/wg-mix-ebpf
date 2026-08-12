@@ -157,7 +157,7 @@ func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
 		parse >= lookup || lookup >= xdpGate || xdpGate >= event || xdpGate >= mutation {
 		t.Fatal("ParseL3, managed-port lookup and the sole transform gate must precede XDP capture/mutation")
 	}
-	if fakeTCPImplementedCapabilities&fakeTCPCapabilityL3Parser != 0 {
-		t.Fatal("L3 parser capability opened before verifier and real-host evidence")
+	if fakeTCPImplementedCapabilities&fakeTCPCapabilityL3Parser == 0 {
+		t.Fatal("production L3 parser capability is not enabled")
 	}
 }

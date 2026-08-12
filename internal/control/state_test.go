@@ -2,6 +2,7 @@ package control
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"strings"
 	"testing"
@@ -91,6 +92,39 @@ func TestDeriveCipherKeyExpandsConfiguredPeriod(t *testing.T) {
 				}
 			}
 		}
+	}
+}
+
+func TestStateFingerprintIncludesRedactedCipherBytes(t *testing.T) {
+	state := &State{
+		Generation: 1,
+		Ciphers:    []CipherState{{ID: 7, Name: "secret", KeyLen: 4, Key: [256]byte{1, 2, 3, 4}}},
+	}
+	first, err := state.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	public, err := state.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	state.Ciphers[0].Key[0] = 9
+	second, err := state.Fingerprint()
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicAfter, err := state.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first == second {
+		t.Fatal("secret-only cipher rotation did not change state fingerprint")
+	}
+	if string(public) != string(publicAfter) {
+		t.Fatal("redacted public state changed after secret-only cipher rotation")
+	}
+	if len(first) != sha256.Size*2 || strings.Contains(first, "01020304") {
+		t.Fatalf("unsafe or malformed fingerprint %q", first)
 	}
 }
 
@@ -335,7 +369,7 @@ profiles:
 	}
 }
 
-func TestBuildStateFakeTCPIsIPv4OnlyAndKeepsCipher(t *testing.T) {
+func TestBuildStateFakeTCPIsIPv4OnlyKeepsCipherAndUsesCanonicalIngress(t *testing.T) {
 	cfg, err := config.Load([]byte(`
 version: 1
 underlays:
@@ -350,6 +384,7 @@ wireguards:
       mode: faketcp
       faketcp:
         experimental: true
+        ingress_mode: xdp-required
 profiles:
   mix-default:
     preset: wireguard-mix-wire-values-v1
@@ -392,14 +427,24 @@ ciphers:
 		t.Fatalf("faketcp cipher IDs = egress %d ingress %d", egress.CipherID, ingress.CipherID)
 	}
 	wg := state.WireGuards[0]
-	if !wg.FakeTCPExperimental || wg.FakeTCPChecksumMode != config.FakeTCPChecksumModePartialCompleteReset ||
-		wg.FakeTCPIngressMode != "xdp-required" || wg.FakeTCPSessionCapacity != 4096 ||
+	if wg.FakeTCPChecksumMode != config.FakeTCPChecksumModePartialCompleteReset ||
+		wg.FakeTCPIngressMode != config.FakeTCPIngressModeXDPGenericExact || wg.FakeTCPSessionCapacity != 4096 ||
 		wg.FakeTCPMaxHalfOpenSessions != 1024 || wg.FakeTCPMaxHalfOpenPerSource != 16 ||
 		wg.FakeTCPSYNRateIntervalNanos != int64(100*time.Millisecond) ||
 		wg.FakeTCPSYNBurst != 256 || wg.FakeTCPSYNBurstPerSource != 8 ||
 		wg.FakeTCPSYNSourceLedgerCapacity != 4096 ||
 		wg.FakeTCPSYNSourceLedgerTTLNanos != int64(5*time.Minute) {
 		t.Fatalf("faketcp state = %#v", wg)
+	}
+	encoded, err := state.JSON()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "faketcp_experimental") {
+		t.Fatalf("deprecated experimental acknowledgement leaked into state: %s", encoded)
+	}
+	if !strings.Contains(string(encoded), `"faketcp_ingress_mode": "xdp-generic-exact"`) {
+		t.Fatalf("state lacks canonical FakeTCP ingress mode: %s", encoded)
 	}
 }
 

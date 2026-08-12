@@ -456,13 +456,6 @@ func TestBuildFakeTCPPolicySnapshotRejectsInvalidSourceState(t *testing.T) {
 			wantErr: "with transport",
 		},
 		{
-			name: "experiment not acknowledged",
-			mutate: func(state *control.State) {
-				state.WireGuards[0].FakeTCPExperimental = false
-			},
-			wantErr: "has not acknowledged",
-		},
-		{
 			name: "wrong checksum mode",
 			mutate: func(state *control.State) {
 				state.WireGuards[0].FakeTCPChecksumMode = "legacy"
@@ -474,7 +467,7 @@ func TestBuildFakeTCPPolicySnapshotRejectsInvalidSourceState(t *testing.T) {
 			mutate: func(state *control.State) {
 				state.WireGuards[0].FakeTCPIngressMode = "tc"
 			},
-			wantErr: "want xdp-required",
+			wantErr: "want xdp-generic-exact",
 		},
 		{
 			name: "interval below minimum",
@@ -693,9 +686,8 @@ func fakeTCPPolicyTestWireGuard(
 		ID:                          id,
 		Name:                        name,
 		TransportMode:               "faketcp",
-		FakeTCPExperimental:         true,
 		FakeTCPChecksumMode:         config.FakeTCPChecksumModePartialCompleteReset,
-		FakeTCPIngressMode:          "xdp-required",
+		FakeTCPIngressMode:          config.FakeTCPIngressModeXDPGenericExact,
 		FakeTCPSYNRateIntervalNanos: int64(interval),
 		FakeTCPSYNBurst:             burst,
 	}

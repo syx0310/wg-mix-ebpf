@@ -32,11 +32,12 @@ const (
 // so the supervisor rejects an in-place content change as a live generation
 // replacement rather than confusing it with the current runtime.
 type fakeTCPProductionScopeIdentity struct {
-	objectKind      fakeTCPProductionObjectScopeKind
-	objectPath      string
-	pinPath         string
-	lifecyclePath   string
-	adoptLegacyPins bool
+	objectKind        fakeTCPProductionObjectScopeKind
+	objectPath        string
+	fakeTCPObjectPath string
+	pinPath           string
+	lifecyclePath     string
+	adoptLegacyPins   bool
 }
 
 func (scope fakeTCPProductionScopeIdentity) validate() error {
@@ -51,6 +52,16 @@ func (scope fakeTCPProductionScopeIdentity) validate() error {
 		}
 	default:
 		return errors.New("production object scope kind is invalid")
+	}
+	// FakeTCP always has an independent object source. The packaged default is
+	// a second embedded object; an override must use the same canonical,
+	// symlink-free spelling as every other production scope path.
+	if scope.fakeTCPObjectPath != EmbeddedFakeTCPObjectSource {
+		if err := validateCanonicalFakeTCPProductionPath(
+			"FakeTCP object", scope.fakeTCPObjectPath,
+		); err != nil {
+			return err
+		}
 	}
 	if err := validateCanonicalFakeTCPProductionPath("pin", scope.pinPath); err != nil {
 		return err
@@ -70,9 +81,10 @@ func (scope fakeTCPProductionScopeIdentity) String() string {
 		objectKind = "filesystem"
 	}
 	return fmt.Sprintf(
-		"object_kind=%q object_path=%q pin=%q lifecycle=%q adopt_legacy_pins=%t",
+		"object_kind=%q object_path=%q faketcp_object_path=%q pin=%q lifecycle=%q adopt_legacy_pins=%t",
 		objectKind,
 		scope.objectPath,
+		scope.fakeTCPObjectPath,
 		scope.pinPath,
 		scope.lifecyclePath,
 		scope.adoptLegacyPins,

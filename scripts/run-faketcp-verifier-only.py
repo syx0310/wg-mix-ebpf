@@ -1,4 +1,4 @@
-"""Run the experimental FakeTCP verifier gate from immutable file descriptors."""
+"""Run the separate FakeTCP verifier gate from immutable file descriptors."""
 
 from __future__ import annotations
 
@@ -118,7 +118,7 @@ class VerifiedArtifacts:
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="verifier-load one reviewed experimental FakeTCP BPF object",
+        description="verifier-load one reviewed FakeTCP BPF object",
         allow_abbrev=False,
     )
     parser.add_argument("--runner-sha256", required=True, action=StoreOnce)
@@ -523,7 +523,7 @@ def child_argv(binary_path: str, object_path: str) -> Tuple[str, ...]:
     return (
         binary_path,
         "bpf-load-test",
-        "--experimental-faketcp",
+        "--faketcp",
         "--object",
         object_path,
     )

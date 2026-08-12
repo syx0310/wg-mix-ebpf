@@ -10,6 +10,9 @@ func TestRunProbe(t *testing.T) {
 	if p.Commands == nil {
 		t.Fatal("commands map is nil")
 	}
+	if _, ok := p.KernelModules["wg_mix_faketcp_checksum"]; !ok {
+		t.Fatal("FakeTCP checksum module probe is missing")
+	}
 	if _, err := p.JSON(); err != nil {
 		t.Fatal(err)
 	}

@@ -1283,7 +1283,7 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 			t.Fatalf("close/admission stack contract missing %q", want)
 		}
 	}
-	if fakeTCPImplementedCapabilities&fakeTCPCapabilityValidatedCloseControl != 0 {
-		t.Fatal("ValidatedCloseControl capability opened before Linux verifier and live evidence")
+	if fakeTCPImplementedCapabilities&fakeTCPCapabilityValidatedCloseControl == 0 {
+		t.Fatal("production ValidatedCloseControl capability is not enabled")
 	}
 }

@@ -72,16 +72,17 @@ func TestBPFLoadTestDefaultsToBaselineLoaderAndOutput(t *testing.T) {
 	}
 }
 
-func TestBPFLoadTestExperimentalFlagRequiresExplicitObject(t *testing.T) {
+func TestBPFLoadTestFakeTCPFlagsRequireExplicitObject(t *testing.T) {
 	loaderCalls := 0
 	loader := func(context.Context, string) (dataplane.ObjectIdentity, error) {
 		loaderCalls++
 		return dataplane.ObjectIdentity{}, errors.New("loader must not run")
 	}
 	for _, args := range [][]string{
+		{"--faketcp"},
+		{"--faketcp", "--object="},
+		{"--faketcp", "--object", "   "},
 		{"--experimental-faketcp"},
-		{"--experimental-faketcp", "--object="},
-		{"--experimental-faketcp", "--object", "   "},
 	} {
 		var stdout bytes.Buffer
 		err := runBPFLoadTestWithLoaders(t.Context(), args, &stdout, loader, loader)
@@ -97,7 +98,7 @@ func TestBPFLoadTestExperimentalFlagRequiresExplicitObject(t *testing.T) {
 	}
 }
 
-func TestBPFLoadTestExperimentalDispatchAndIdentityOutput(t *testing.T) {
+func TestBPFLoadTestFakeTCPDispatchIdentityAndDeprecatedAlias(t *testing.T) {
 	const objectPath = "/reviewed/wg_mix_faketcp_experimental.o"
 	identity := dataplane.ObjectIdentity{
 		Source: objectPath,
@@ -120,7 +121,7 @@ func TestBPFLoadTestExperimentalDispatchAndIdentityOutput(t *testing.T) {
 	var textOut bytes.Buffer
 	err := runBPFLoadTestWithLoaders(
 		t.Context(),
-		[]string{"--experimental-faketcp", "--object", objectPath},
+		[]string{"--faketcp", "--object", objectPath},
 		&textOut,
 		baseline,
 		experimental,
@@ -129,7 +130,7 @@ func TestBPFLoadTestExperimentalDispatchAndIdentityOutput(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"kind=" + dataplane.ExperimentalFakeTCPObjectKind,
+		"kind=" + dataplane.FakeTCPObjectKind,
 		"source=" + objectPath,
 		"sha256=" + identity.SHA256,
 	} {
@@ -157,7 +158,7 @@ func TestBPFLoadTestExperimentalDispatchAndIdentityOutput(t *testing.T) {
 	if err := json.Unmarshal(jsonOut.Bytes(), &got); err != nil {
 		t.Fatalf("decode output: %v\n%s", err, jsonOut.String())
 	}
-	if got.Status != "loaded" || got.Kind != dataplane.ExperimentalFakeTCPObjectKind || got.Object != identity {
+	if got.Status != "loaded" || got.Kind != dataplane.FakeTCPObjectKind || got.Object != identity {
 		t.Fatalf("experimental JSON identity = %#v", got)
 	}
 	if baselineCalls != 0 || experimentalCalls != 2 {

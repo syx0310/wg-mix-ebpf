@@ -81,6 +81,28 @@ The daemon performs startup reconcile, poll reconcile, and reload-request handli
 sudo wg-mix-ebpf run --config /etc/wg-mix-ebpf/config.yaml
 ```
 
+FakeTCP is process-owned: its BPF collection, TCX links, direct generic XDP
+links, and slow path live for exactly the resident daemon lifetime. A FakeTCP
+configuration therefore rejects `run --once` and one-shot fallback `reload`
+before network mutation. Start the service first, then send reload requests to
+that daemon. Before activation, an administrator must provision and load the
+kernel-matched `wg_mix_faketcp_checksum` kfunc module. Check it with:
+
+```bash
+sudo wg-mix-ebpf doctor --config /etc/wg-mix-ebpf/config.yaml
+```
+
+The service validates module BTF and required kfuncs before detaching a
+baseline runtime and again while acquiring the FakeTCP collection. It never
+loads or unloads the administrator-owned module. OpenWrt without a separately
+packaged matching kmod supports UDP/ICMP but not FakeTCP.
+
+FakeTCP additionally requires a fixed non-zero `ListenPort` in its WireGuard
+config and the fail-closed nft startup guard. The daemon keeps that guard in
+place through object acquisition, map population, TCX/XDP attachment, and the
+final retained-owner health check. A failed initial health check returns the
+complete diagnostic and does not publish attach state or remove the guard.
+
 A dataplane-mutating daemon holds an exclusive lifecycle lease at
 `/run/wg-mix-ebpf/daemon.lease` from before startup reconcile until shutdown
 cleanup and the final status write have completed. This lease is deliberately
@@ -199,6 +221,14 @@ request_protocol / instance_id / last_request_id / last_request_kind
 ```
 
 `status` reads desired state and pinned dataplane state. It does not currently inspect the nft startup guard table directly; if a guard table is suspected to be left behind, run `guard-cleanup` or inspect nftables manually.
+
+For an active FakeTCP daemon, `status` prefers the resident daemon snapshot
+instead of baseline pins. It reports owner kind `process-owned`, object source
+and SHA-256, generation/incarnation, generation-barrier state, health, and the
+exact XDP/TCX link and program IDs. Cipher keys, desired-key digests, and
+session contents are never included. A separate one-shot status process cannot
+claim ownership of another process's unpinned runtime; it uses the live daemon
+snapshot when that daemon is present.
 
 ## Stop And Detach
 

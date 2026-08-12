@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/cilium/ebpf/link"
 )
 
 type fakeOwnedXDPLink struct {
@@ -76,6 +78,12 @@ func (owned *fakeOwnedXDPLink) setIdentity(identity fakeTCPXDPLinkIdentity) {
 	owned.mu.Unlock()
 }
 
+func (owned *fakeOwnedXDPLink) setIdentityError(err error) {
+	owned.mu.Lock()
+	owned.identityErr = err
+	owned.mu.Unlock()
+}
+
 func (owned *fakeOwnedXDPLink) markAutoDetached() {
 	owned.mu.Lock()
 	owned.identity.IfIndex = 0
@@ -98,6 +106,7 @@ type memoryFakeTCPXDPRuntime struct {
 	attachCalls  []fakeTCPXDPAttachRequest
 	attachProbes []fakeTCPXDPProbe
 	events       *[]string
+	afterAttach  func(*memoryFakeTCPXDPRuntime, fakeTCPXDPAttachRequest)
 }
 
 func (runtime *memoryFakeTCPXDPRuntime) backend() fakeTCPXDPRuntime {
@@ -155,6 +164,19 @@ func (runtime *memoryFakeTCPXDPRuntime) backend() fakeTCPXDPRuntime {
 					identity: identity, closeEvents: runtime.events,
 				}
 				runtime.links[request.IfIndex] = owned
+			}
+			if runtime.family == fakeTCPXDPBackendDirect {
+				attachMode := uint32(link.XDPDriverMode)
+				if request.Mode == fakeTCPXDPAttachGeneric {
+					attachMode = uint32(link.XDPGenericMode)
+				}
+				runtime.probes[request.IfIndex] = fakeTCPXDPProbe{
+					IfIndex: request.IfIndex, Attached: true,
+					ProgramID: owned.identity.ProgramID, AttachMode: attachMode,
+				}
+			}
+			if runtime.afterAttach != nil {
+				runtime.afterAttach(runtime, request)
 			}
 			return owned, runtime.attachErrs[request.IfIndex]
 		},
@@ -247,7 +269,7 @@ func TestFakeTCPXDPStageProbesThenOwnsSortedDirectLinks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !slices.Equal(runtime.probeCalls, []int{7, 11}) {
+	if !slices.Equal(runtime.probeCalls, []int{7, 11, 7, 11}) {
 		t.Fatalf("probe order = %v", runtime.probeCalls)
 	}
 	if got := []int{runtime.attachCalls[0].IfIndex, runtime.attachCalls[1].IfIndex}; !slices.Equal(got, []int{7, 11}) {
@@ -303,6 +325,60 @@ func TestFakeTCPXDPStageCompletesSingleProbePassBeforeMutation(t *testing.T) {
 	}
 }
 
+func TestFakeTCPXDPStageFinalRecheckRollsBackLateForeignEarlierInterface(t *testing.T) {
+	runtime := newMemoryFakeTCPXDPRuntime()
+	var closeLog []int
+	runtime.afterAttach = func(
+		runtime *memoryFakeTCPXDPRuntime,
+		request fakeTCPXDPAttachRequest,
+	) {
+		if request.IfIndex != 11 {
+			return
+		}
+		// Model a non-cooperating writer replacing the earlier interface after
+		// its link FD was adopted while the later interface was attached.
+		runtime.probes[7] = fakeTCPXDPProbe{
+			IfIndex: 7, Attached: true, ProgramID: 7007,
+			AttachMode: uint32(link.XDPDriverMode),
+		}
+	}
+	for _, ifindex := range []int{7, 11} {
+		runtime.links[ifindex] = &fakeOwnedXDPLink{
+			identity: directXDPIdentity(ifindex, map[int]fakeTCPXDPAttachMode{
+				7: fakeTCPXDPAttachNative, 11: fakeTCPXDPAttachGeneric,
+			}[ifindex]),
+			closeLog: &closeLog,
+		}
+	}
+
+	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
+		[]fakeTCPXDPAttachRequest{
+			{IfIndex: 7, Mode: fakeTCPXDPAttachNative},
+			{IfIndex: 11, Mode: fakeTCPXDPAttachGeneric},
+		},
+		&fakeExperimentalOwnedProgram{id: 8001}, runtime.backend(),
+	)
+	if stage == nil || err == nil ||
+		!strings.Contains(err.Error(), "final owner recheck") ||
+		!strings.Contains(err.Error(), "ifindex 7") {
+		t.Fatalf("stage=%#v error=%v", stage, err)
+	}
+	if !slices.Equal(runtime.probeCalls, []int{7, 11, 7}) {
+		t.Fatalf("probe order = %v", runtime.probeCalls)
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(closeLog, []int{11, 7}) ||
+		runtime.links[7].closes != 1 || runtime.links[11].closes != 1 {
+		t.Fatalf(
+			"rollback order=%v closes: 7=%d 11=%d",
+			closeLog, runtime.links[7].closes, runtime.links[11].closes,
+		)
+	}
+}
+
 func TestFakeTCPXDPRuntimeDetectsCapabilitiesOnlyAtConstruction(t *testing.T) {
 	runtime := newMemoryFakeTCPXDPRuntime()
 	backend := runtime.backend()
@@ -349,6 +425,52 @@ func TestFakeTCPXDPDirectCapabilityIsSelectedModeOnly(t *testing.T) {
 		if err == nil || !strings.Contains(err.Error(), "selected-mode bpf_link") {
 			t.Fatalf("constructor error = %v", err)
 		}
+	}
+}
+
+func TestFakeTCPXDPActivationRequirementAcceptsExplicitProductionSelectedMode(t *testing.T) {
+	direct := newMemoryFakeTCPXDPRuntimeFor(fakeTCPXDPBackendDirect).backend()
+	if err := validateFakeTCPXDPActivationRequirement(
+		direct.capabilities,
+		fakeTCPXDPRequireExactSelectedMode,
+	); err != nil {
+		t.Fatalf("exact production selected-mode backend rejected: %v", err)
+	}
+	libxdp := newMemoryFakeTCPXDPRuntimeFor(fakeTCPXDPBackendLibXDP).backend()
+	if err := validateFakeTCPXDPActivationRequirement(
+		libxdp.capabilities,
+		fakeTCPXDPRequireExactSelectedMode,
+	); err == nil {
+		t.Fatal("libxdp backend accepted as exact direct selected-mode backend")
+	}
+}
+
+func TestLiveFakeTCPXDPPostAttachRequiresExactAggregateOwner(t *testing.T) {
+	request := fakeTCPXDPAttachRequest{IfIndex: 7, Mode: fakeTCPXDPAttachGeneric}
+	identity := directXDPIdentity(7, fakeTCPXDPAttachGeneric)
+	probe := fakeTCPXDPProbe{
+		IfIndex: 7, Attached: true, ProgramID: identity.ProgramID,
+		AttachMode: uint32(link.XDPGenericMode),
+	}
+	if err := validateLiveFakeTCPXDPPostAttach(request, identity, probe, nil); err != nil {
+		t.Fatalf("exact post-attach identity rejected: %v", err)
+	}
+	for _, mutate := range []func(*fakeTCPXDPProbe){
+		func(value *fakeTCPXDPProbe) { value.Attached = false },
+		func(value *fakeTCPXDPProbe) { value.ProgramID++ },
+		func(value *fakeTCPXDPProbe) { value.AttachMode = uint32(link.XDPDriverMode) },
+		func(value *fakeTCPXDPProbe) { value.Dispatcher = true },
+	} {
+		changed := probe
+		mutate(&changed)
+		if err := validateLiveFakeTCPXDPPostAttach(request, identity, changed, nil); err == nil {
+			t.Fatalf("mismatched post-attach probe accepted: %+v", changed)
+		}
+	}
+	if err := validateLiveFakeTCPXDPPostAttach(
+		request, identity, probe, errors.New("injected probe failure"),
+	); err == nil {
+		t.Fatal("post-attach probe failure accepted")
 	}
 }
 
@@ -475,7 +597,7 @@ func TestFakeTCPXDPStageQuarantinesChangedLibXDPDispatcher(t *testing.T) {
 		t.Fatalf("stage=%#v error=%v", stage, err)
 	}
 	if closeErr := stage.Close(); closeErr == nil ||
-		!strings.Contains(closeErr.Error(), "never verified") {
+		!strings.Contains(closeErr.Error(), "still unverified") {
 		t.Fatalf("changed-dispatcher Close error=%v", closeErr)
 	}
 	if runtime.links[7].releaseCalls != 0 || runtime.links[7].closes != 0 {
@@ -703,12 +825,72 @@ func TestFakeTCPXDPStageIdentityFailureQuarantinesWithoutRelease(t *testing.T) {
 		t.Fatalf("stage=%#v error=%v", stage, err)
 	}
 	if closeErr := stage.Close(); closeErr == nil ||
-		!strings.Contains(closeErr.Error(), "never verified") {
+		!strings.Contains(closeErr.Error(), "still unverified") {
 		t.Fatalf("unverified Close error=%v", closeErr)
 	}
 	if runtime.links[7].releaseCalls != 0 || runtime.links[7].closes != 0 {
 		t.Fatalf("unverified owner reached release: calls=%d closes=%d",
 			runtime.links[7].releaseCalls, runtime.links[7].closes)
+	}
+}
+
+func TestFakeTCPXDPStageRetriesTransientIdentityBeforeRelease(t *testing.T) {
+	runtime := newMemoryFakeTCPXDPRuntime()
+	wantErr := errors.New("transient identity inspection")
+	runtime.links[7] = &fakeOwnedXDPLink{
+		identity: fakeTCPXDPLinkIdentity{
+			Family: fakeTCPXDPBackendDirect, Mode: fakeTCPXDPAttachGeneric,
+			IfIndex: 7, ProgramID: 8001, OwnerID: 100007,
+		},
+		identityErr: wantErr,
+	}
+	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
+		[]fakeTCPXDPAttachRequest{{IfIndex: 7, Mode: fakeTCPXDPAttachGeneric}},
+		&fakeExperimentalOwnedProgram{id: 8001}, runtime.backend(),
+	)
+	if stage == nil || !errors.Is(err, wantErr) {
+		t.Fatalf("stage=%#v error=%v", stage, err)
+	}
+	runtime.links[7].setIdentityError(nil)
+	if err := stage.Close(); err != nil {
+		t.Fatalf("retry Close: %v", err)
+	}
+	if runtime.links[7].releaseCalls != 1 || runtime.links[7].closes != 1 {
+		t.Fatalf("release calls=%d closes=%d", runtime.links[7].releaseCalls, runtime.links[7].closes)
+	}
+}
+
+func TestFakeTCPXDPStageHealthRechecksLinkAndAggregateIdentity(t *testing.T) {
+	runtime := newMemoryFakeTCPXDPRuntime()
+	stage, err := stageFakeTCPXDPAttachments(
+		t.Context(),
+		[]fakeTCPXDPAttachRequest{{IfIndex: 7, Mode: fakeTCPXDPAttachGeneric}},
+		&fakeExperimentalOwnedProgram{id: 8001}, runtime.backend(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runtime.mu.Lock()
+	runtime.probes[7] = fakeTCPXDPProbe{
+		IfIndex: 7, Attached: true, ProgramID: 8001,
+		AttachMode: uint32(link.XDPGenericMode),
+	}
+	runtime.mu.Unlock()
+	if err := stage.Healthy(t.Context()); err != nil {
+		t.Fatalf("healthy XDP owner: %v", err)
+	}
+	runtime.mu.Lock()
+	runtime.probes[7] = fakeTCPXDPProbe{
+		IfIndex: 7, Attached: true, ProgramID: 9001,
+		AttachMode: uint32(link.XDPGenericMode),
+	}
+	runtime.mu.Unlock()
+	if err := stage.Healthy(t.Context()); err == nil {
+		t.Fatal("foreign aggregate XDP identity reported healthy")
+	}
+	if err := stage.Close(); err != nil {
+		t.Fatal(err)
 	}
 }
 

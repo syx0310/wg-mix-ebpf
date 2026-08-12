@@ -195,7 +195,7 @@ func (coordinator *fakeTCPProductionCoordinator) applyBaselineLocked(
 		// Stop retains the runtime on every failed Close, so no baseline mutation
 		// may begin until a later retry releases that exact owner.
 		shared.owner = dataplaneCoreOwnerExperimental
-		return fmt.Errorf("stop experimental core before baseline apply: %w", err)
+		return fmt.Errorf("stop FakeTCP core before baseline apply: %w", err)
 	}
 	shared.owner = dataplaneCoreOwnerNone
 	if err := ctx.Err(); err != nil {
@@ -216,14 +216,14 @@ func (coordinator *fakeTCPProductionCoordinator) applyExperimentalLocked(
 	state *control.State,
 ) (returnErr error) {
 	if coordinator.planExperimental == nil {
-		return errors.New("production experimental FakeTCP planner is nil")
+		return errors.New("production FakeTCP planner is nil")
 	}
 	plan, err := coordinator.planExperimental(ctx, state)
 	if err != nil {
-		return fmt.Errorf("plan experimental FakeTCP runtime: %w", err)
+		return fmt.Errorf("plan FakeTCP runtime: %w", err)
 	}
 	if plan == nil {
-		return errors.New("plan experimental FakeTCP runtime: planner returned nil")
+		return errors.New("plan FakeTCP runtime: planner returned nil")
 	}
 	buildClaimed := false
 	defer func() {
@@ -235,16 +235,16 @@ func (coordinator *fakeTCPProductionCoordinator) applyExperimentalLocked(
 		if err := rollback(); err != nil {
 			returnErr = errors.Join(
 				returnErr,
-				fmt.Errorf("rollback unclaimed experimental FakeTCP production plan: %w", err),
+				fmt.Errorf("rollback unclaimed FakeTCP production plan: %w", err),
 			)
 		}
 	}()
 
 	if plan.key == (fakeTCPRuntimeDesiredKey{}) {
-		return errors.New("plan experimental FakeTCP runtime: desired key is empty")
+		return errors.New("plan FakeTCP runtime: desired key is empty")
 	}
 	if plan.build == nil {
-		return errors.New("plan experimental FakeTCP runtime: builder is nil")
+		return errors.New("plan FakeTCP runtime: builder is nil")
 	}
 	if err := ctx.Err(); err != nil {
 		return err

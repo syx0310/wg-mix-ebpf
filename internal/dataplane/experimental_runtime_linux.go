@@ -77,6 +77,14 @@ type experimentalTCStageOwner interface {
 	Close() error
 }
 
+// experimentalRuntimeHealthOwner is implemented by every production
+// process-owned attachment/isolation stage. Health checks are read-only and
+// must re-prove the exact held kernel identity; a stage that doesn't implement
+// this contract is not production-health-capable.
+type experimentalRuntimeHealthOwner interface {
+	Healthy(context.Context) error
+}
+
 type experimentalTCStageFactory func(
 	context.Context,
 	*control.State,
@@ -435,6 +443,7 @@ type experimentalFakeTCPRuntimeState struct {
 	core        experimentalCoreStageOwner
 	tc          experimentalTCStageOwner
 	xdp         *fakeTCPXDPStage
+	retained    *fakeTCPRetainedRuntimeHealth
 	slowPath    experimentalSlowPath
 	handles     ExperimentalFakeTCPRuntimeHandles
 	closing     bool
@@ -684,20 +693,29 @@ func buildExperimentalFakeTCPRuntime(
 
 func (build *experimentalRuntimeBuild) runtimeOwner() *ExperimentalFakeTCPRuntime {
 	generation := build.policyPlan.generation
+	identity := build.engine.Identity()
 	return &ExperimentalFakeTCPRuntime{
 		state: &experimentalFakeTCPRuntimeState{
 			generation: generation,
-			identity:   build.engine.Identity(),
+			identity:   identity,
 			engine:     build.engine,
 			collection: build.options.collection,
 			isolation:  build.isolation,
 			core:       build.coreStage,
 			tc:         build.tcStage,
 			xdp:        build.xdpStage,
-			slowPath:   build.slowPath,
+			retained: retainFakeTCPRuntimeHealth(
+				build.policyPlan,
+				build.policyMaps,
+				build.programStage,
+				build.egressProgram,
+				build.runtimeIdentityMap,
+				identity,
+			),
+			slowPath: build.slowPath,
 			handles: ExperimentalFakeTCPRuntimeHandles{
 				generation: generation,
-				identity:   build.engine.Identity(),
+				identity:   identity,
 				sessions:   build.sessions,
 				events:     build.events,
 			},
@@ -731,25 +749,26 @@ type experimentalRuntimeBuild struct {
 	cleanupCtx context.Context
 	policyPlan *fakeTCPPolicyGenerationPlan
 
-	sessions          *generationFencedSessionStore
-	events            *generationFencedEventMap
-	engine            *faketcp.Engine
-	isolation         fakeTCPPolicyGenerationIsolationBackend
-	slowPath          experimentalSlowPath
-	freshClaim        experimentalLinuxFreshCollectionClaim
-	policyMaps        fakeTCPPolicyMaps
-	programArray      fakeTCPProgramArray
-	egressProgram     experimentalProgramResource
-	xdpProgram        experimentalProgramResource
-	ingressProgram    experimentalProgramResource
-	coreEgressProgram experimentalProgramResource
-	coreResources     experimentalCoreResources
-	coreStage         experimentalCoreStageOwner
-	tcStage           experimentalTCStageOwner
-	programStage      *fakeTCPProgramArrayStage
-	xdpStage          *fakeTCPXDPStage
-	policyStage       *fakeTCPPolicyStage
-	committed         atomic.Bool
+	sessions           *generationFencedSessionStore
+	events             *generationFencedEventMap
+	engine             *faketcp.Engine
+	isolation          fakeTCPPolicyGenerationIsolationBackend
+	slowPath           experimentalSlowPath
+	freshClaim         experimentalLinuxFreshCollectionClaim
+	policyMaps         fakeTCPPolicyMaps
+	programArray       fakeTCPProgramArray
+	runtimeIdentityMap experimentalMapResource
+	egressProgram      experimentalProgramResource
+	xdpProgram         experimentalProgramResource
+	ingressProgram     experimentalProgramResource
+	coreEgressProgram  experimentalProgramResource
+	coreResources      experimentalCoreResources
+	coreStage          experimentalCoreStageOwner
+	tcStage            experimentalTCStageOwner
+	programStage       *fakeTCPProgramArrayStage
+	xdpStage           *fakeTCPXDPStage
+	policyStage        *fakeTCPPolicyStage
+	committed          atomic.Bool
 }
 
 func (build *experimentalRuntimeBuild) prepare() error {
@@ -883,6 +902,10 @@ func (build *experimentalRuntimeBuild) prepare() error {
 	if err != nil {
 		return err
 	}
+	runtimeIdentityMap, err := options.collection.mapResource(fakeTCPRuntimeIDMapName)
+	if err != nil {
+		return err
+	}
 	egressProgram, err := options.collection.programResource(fakeTCPEgressProgramName)
 	if err != nil {
 		return err
@@ -980,6 +1003,7 @@ func (build *experimentalRuntimeBuild) prepare() error {
 		ManagedInterfaces: managedInterfaces,
 	}
 	build.programArray = programArray
+	build.runtimeIdentityMap = runtimeIdentityMap
 	build.egressProgram = egressProgram
 	build.xdpProgram = xdpProgram
 	build.ingressProgram = ingressProgram
@@ -1437,6 +1461,52 @@ func (runtime *ExperimentalFakeTCPRuntime) Run(ctx context.Context) error {
 	return slowPath.Run(ctx)
 }
 
+// Healthy re-proves the complete process-owned production graph while the
+// runtime state lock prevents Close from retiring any stage underneath the
+// observations. The slow path's liveness is tracked by the supervisor's Run
+// goroutine; this method verifies the kernel owners and generation barrier.
+func (runtime *ExperimentalFakeTCPRuntime) Healthy(ctx context.Context) error {
+	if runtime == nil || runtime.state == nil {
+		return ErrExperimentalFakeTCPRuntimeClosed
+	}
+	if ctx == nil {
+		return errors.New("inspect FakeTCP runtime health: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	state := runtime.state
+	state.mu.Lock()
+	defer state.mu.Unlock()
+	if state.shutdown || state.closing || state.closed ||
+		experimentalSlowPathIsNil(state.slowPath) {
+		return ErrExperimentalFakeTCPRuntimeClosed
+	}
+	checks := []struct {
+		name  string
+		owner any
+	}{
+		{name: "retained maps and programs", owner: state.retained},
+		{name: "generation barrier", owner: state.isolation},
+		{name: "baseline core", owner: state.core},
+		{name: "TCX", owner: state.tc},
+		{name: "XDP", owner: state.xdp},
+	}
+	for _, check := range checks {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		health, ok := check.owner.(experimentalRuntimeHealthOwner)
+		if !ok || health == nil {
+			return fmt.Errorf("inspect FakeTCP runtime health: %s owner has no exact health contract", check.name)
+		}
+		if err := health.Healthy(ctx); err != nil {
+			return fmt.Errorf("inspect FakeTCP runtime health: %s: %w", check.name, err)
+		}
+	}
+	return nil
+}
+
 func (runtime *ExperimentalFakeTCPRuntime) RequestStop() error {
 	if runtime == nil || runtime.state == nil {
 		return ErrExperimentalFakeTCPRuntimeClosed
@@ -1588,6 +1658,7 @@ func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 		state.engine = nil
 		state.collection = nil
 		state.isolation = nil
+		state.retained = nil
 	}
 	close(done)
 	state.mu.Unlock()

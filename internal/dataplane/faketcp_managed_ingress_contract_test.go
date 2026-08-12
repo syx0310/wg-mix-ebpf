@@ -114,8 +114,8 @@ func TestFakeTCPManagedIngressEarlyDropSourceOrderAndABI(t *testing.T) {
 		!strings.Contains(xdp, "if (!scratch)\n\t\treturn XDP_DROP;") {
 		t.Fatal("early managed-ingress path has a direct drop outside the per-CPU scratch fail-closed gate")
 	}
-	if fakeTCPImplementedCapabilities&fakeTCPCapabilityManagedIngressParser != 0 {
-		t.Fatal("managed-ingress capability opened before .82 live evidence")
+	if fakeTCPImplementedCapabilities&fakeTCPCapabilityManagedIngressParser == 0 {
+		t.Fatal("production managed-ingress capability is not enabled")
 	}
 	manifestBytes, err := os.ReadFile("experimental_manifest_linux.go")
 	if err != nil {

@@ -9,15 +9,24 @@ import (
 )
 
 var ErrUnsupported = errors.New("dataplane is unsupported on this platform")
-var ErrFakeTCPKernelGate = errors.New("experimental faketcp kernel gate is not satisfied")
+var ErrFakeTCPKernelGate = errors.New("faketcp production capability gate is not satisfied")
+var ErrFakeTCPResidentRuntimeRequired = errors.New(
+	"faketcp requires a resident daemon runtime",
+)
+var ErrFakeTCPProductionCoordinatorRequired = errors.New(
+	"faketcp must be applied through the production runtime coordinator",
+)
 var ErrPinOwnershipLifecycleLeaseRequired = errors.New(
 	"pin ownership mutation requires the held global lifecycle lease",
 )
 
 const (
-	DefaultObjectPath             = "build/wg_mix_tc.o"
-	EnvObjectPath                 = "WG_MIX_EBPF_OBJECT"
-	ExperimentalFakeTCPObjectKind = "experimental-faketcp"
+	DefaultObjectPath    = "build/wg_mix_tc.o"
+	EnvObjectPath        = "WG_MIX_EBPF_OBJECT"
+	EnvFakeTCPObjectPath = "WG_MIX_EBPF_FAKETCP_OBJECT"
+	FakeTCPObjectKind    = "faketcp"
+	// ExperimentalFakeTCPObjectKind is a deprecated source-compatibility alias.
+	ExperimentalFakeTCPObjectKind = FakeTCPObjectKind
 	DefaultPinPath                = "/sys/fs/bpf/wg-mix-ebpf"
 	EnvPinPath                    = "WG_MIX_EBPF_PIN_PATH"
 )
@@ -37,6 +46,17 @@ type LoaderOptions struct {
 	// map/filter set into the persistent schema-v3 owner journal. TCX never
 	// adopts classic filters because they do not carry exact bpf_link identity.
 	AdoptLegacyPins bool
+	// FakeTCPObjectPath selects the separate FakeTCP object. It must never
+	// inherit EnvObjectPath, which names the baseline collection.
+	FakeTCPObjectPath string
+	// LifecycleLease is the exact lease already held by the reconcile
+	// operation. FakeTCP generation transactions retain this existing owner;
+	// they must not acquire the global lifecycle lease a second time.
+	LifecycleLease *lockfile.LifecycleLease
+	// ResidentRuntime proves that the loader is owned by a long-running
+	// daemon. FakeTCP owns its unpinned collection and links through process
+	// file descriptors, so one-shot reloads must reject it before mutation.
+	ResidentRuntime bool
 }
 
 type PinOwnershipStatus struct {

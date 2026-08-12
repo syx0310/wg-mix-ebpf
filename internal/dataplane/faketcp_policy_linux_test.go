@@ -945,13 +945,13 @@ func TestFakeTCPPolicyGenerationPlanRejectsMalformedProjectionBeforeTransaction(
 	}
 }
 
-func TestFakeTCPManagedPolicyCapabilityRemainsClosedPendingAcceptance(t *testing.T) {
-	if fakeTCPImplementedCapabilities&fakeTCPCapabilityManagedPolicyPopulation != 0 {
-		t.Fatal("managed policy capability opened before review and live Linux acceptance")
+func TestFakeTCPManagedPolicyCapabilityIsProductionEnabled(t *testing.T) {
+	if fakeTCPImplementedCapabilities&fakeTCPCapabilityManagedPolicyPopulation == 0 {
+		t.Fatal("managed policy capability is not production enabled")
 	}
-	if !strings.Contains(strings.Join(missingFakeTCPCapabilities(), "\n"),
+	if strings.Contains(strings.Join(missingFakeTCPCapabilities(), "\n"),
 		"atomic managed-interface/port policy population") {
-		t.Fatal("activation gate stopped reporting managed policy population as incomplete")
+		t.Fatal("activation gate still reports managed policy population as incomplete")
 	}
 }
 
@@ -991,6 +991,20 @@ type memoryFakeTCPPolicyQuiescer struct {
 	bpfMutationAttempts     int
 	bpfMutationBlocked      int
 	bpfMutationUnexpectedly int
+	healthErr               error
+}
+
+func (quiescer *memoryFakeTCPPolicyQuiescer) Healthy(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if quiescer.healthErr != nil {
+		return quiescer.healthErr
+	}
+	if quiescer.inactive || quiescer.quiesced {
+		return errors.New("generation barrier is not open")
+	}
+	return nil
 }
 
 func (quiescer *memoryFakeTCPPolicyQuiescer) AssertInactive(

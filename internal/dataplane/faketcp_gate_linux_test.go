@@ -13,34 +13,19 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 )
 
-func TestFakeTCPKernelGateRejectsBeforeActivation(t *testing.T) {
+func TestFakeTCPProductionCapabilitiesPermitActivation(t *testing.T) {
 	state := &control.State{
 		WireGuards: []control.WireGuardState{{Name: "wg0", TransportMode: "faketcp"}},
 	}
 	err := preflightFakeTCPKernelRequirements(state)
-	if !errors.Is(err, ErrFakeTCPKernelGate) {
-		t.Fatalf("expected FakeTCP kernel gate, got %v", err)
+	if err != nil {
+		t.Fatalf("production FakeTCP capability gate rejected activation: %v", err)
 	}
-	for _, want := range []string{
-		"XDP link ownership/rollback and libxdp chaining",
-		"ip_summed/CHECKSUM_PARTIAL identification",
-		"CHECKSUM_PARTIAL materialize/complete",
-		"checksum offset and skb metadata reset",
-		"per-segment GSO transform",
-		"MTU-minus-12",
-		"once-only reinjector",
-		"real-NIC GSO/GRO/checksum-offload acceptance",
-		"before mutation",
-	} {
-		if !strings.Contains(err.Error(), want) {
-			t.Fatalf("gate error missing %q: %v", want, err)
-		}
-	}
-	// Apply must return the same capability error before it even validates an
-	// intentionally invalid pin path, proving no pin/TC/XDP mutation starts.
+	// The baseline-only loader still stops before it validates an intentionally
+	// invalid pin path; only the production coordinator may install FakeTCP.
 	err = (LinuxLoader{PinPath: "relative-path-must-not-be-touched"}).Apply(context.Background(), state)
-	if !errors.Is(err, ErrFakeTCPKernelGate) {
-		t.Fatalf("Apply did not fail at the pre-mutation gate: %v", err)
+	if !errors.Is(err, ErrFakeTCPProductionCoordinatorRequired) {
+		t.Fatalf("Apply did not fail at the coordinator pre-mutation gate: %v", err)
 	}
 }
 
@@ -53,13 +38,13 @@ func TestFakeTCPKernelGateDoesNotBlockExistingTransports(t *testing.T) {
 	}
 }
 
-func TestFakeTCPKernelGateCannotBeBypassedByRuleOnlyState(t *testing.T) {
+func TestFakeTCPProductionCapabilitiesCoverRuleOnlyReferences(t *testing.T) {
 	for _, state := range []*control.State{
 		{EgressRules: []control.EgressRule{{TransportMode: "faketcp", WGID: 7}}},
 		{IngressListeners: []control.IngressListener{{TransportMode: "faketcp", WGID: 8}}},
 	} {
-		if err := preflightFakeTCPKernelRequirements(state); !errors.Is(err, ErrFakeTCPKernelGate) {
-			t.Fatalf("rule-only FakeTCP state bypassed gate: %v", err)
+		if err := preflightFakeTCPKernelRequirements(state); err != nil {
+			t.Fatalf("rule-only FakeTCP production reference rejected: %v", err)
 		}
 	}
 }

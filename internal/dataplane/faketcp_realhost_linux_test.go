@@ -491,7 +491,7 @@ func TestFakeTCPRealHostXORTypewordHeaderCompositionIntegration(t *testing.T) {
 
 // TestBaselineExperimentalRealHostMutualExclusionIntegration proves that an
 // active experimental owner cannot be competed with through the production
-// baseline loader. The baseline loader must reject FakeTCP at its hard gate
+// baseline loader. The baseline loader must reject FakeTCP at its coordinator gate
 // before it opens an object, validates a pin path, or changes the exact XDP and
 // TCX identities already owned by the experimental runtime.
 func TestBaselineExperimentalRealHostMutualExclusionIntegration(t *testing.T) {
@@ -529,7 +529,7 @@ func TestBaselineExperimentalRealHostMutualExclusionIntegration(t *testing.T) {
 		ObjectPath: prepared.contract.baselineObject,
 		PinPath:    forbiddenPin,
 	}).Apply(ctx, state)
-	if !errors.Is(err, ErrFakeTCPKernelGate) {
+	if !errors.Is(err, ErrFakeTCPProductionCoordinatorRequired) {
 		t.Fatalf("baseline loader did not reject FakeTCP before mutation: %v", err)
 	}
 	if _, err := os.Lstat(forbiddenPin); !errors.Is(err, os.ErrNotExist) {
@@ -834,9 +834,9 @@ func fakeTCPRealHostState(
 		}},
 		WireGuards: []control.WireGuardState{{
 			ID: wgID, Name: "realhost", ProfileID: profileID,
-			TransportMode: "faketcp", FakeTCPExperimental: true,
+			TransportMode:       "faketcp",
 			FakeTCPChecksumMode: config.FakeTCPChecksumModePartialCompleteReset,
-			FakeTCPIngressMode:  "xdp-required", FakeTCPSYNRateIntervalNanos: int64(20 * time.Millisecond),
+			FakeTCPIngressMode:  config.FakeTCPIngressModeXDPGenericExact, FakeTCPSYNRateIntervalNanos: int64(20 * time.Millisecond),
 			FakeTCPSYNBurst: 4,
 		}},
 		Underlays: []control.UnderlayState{

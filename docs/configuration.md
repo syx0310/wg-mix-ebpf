@@ -204,7 +204,8 @@ wireguards:
       mode: udp
 ```
 
-The MVP implements `cipher` only with `transport.mode: udp`. ICMP + XOR and fakeTCP + XOR are rejected until those paths have independent checksum and wildcard-listener validation.
+The XOR cipher is implemented with `transport.mode: udp` and
+`transport.mode: faketcp`. ICMP + XOR is rejected.
 
 ### `transport`
 
@@ -257,10 +258,43 @@ server wildcard matching is intended for mixed WireGuard Echo payloads, not ordi
 server wildcard-id listener passes only bad type-word or bad length misses; valid managed ICMP WireGuard packets are still rewritten
 server preserves NAT-rewritten Echo sequence values with runtime kernel state
 raw UDP WireGuard packets to an ICMP-managed ListenPort are not a fallback path and should be dropped
-fakeTCP is intentionally not implemented
 outer IP fragmentation is unsupported; keep WireGuard MTU below the underlay fragmentation threshold
 large-packet ICMP checksum handling depends on the current skb checksum/offload shape and needs target validation
 ```
+
+Production IPv4 FakeTCP mode:
+
+```yaml
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: faketcp
+      faketcp:
+        checksum_mode: partial-complete-reset-required
+        ingress_mode: xdp-generic-exact
+
+runtime:
+  attachment_backend: tcx
+```
+
+FakeTCP keeps WireGuard packet boundaries and presents a TCP-shaped outer wire
+image; it is not a TCP stream. At most one WireGuard may select FakeTCP. It is
+IPv4-only and must run in the resident daemon. `auto` is accepted only when it
+resolves to TCX; `classic_tc` is rejected. Every attachable underlay must have
+no existing XDP owner because production uses direct generic XDP with exact
+selected-mode ownership and no replace, fallback, or libxdp chaining. The
+administrator must provision `wg_mix_faketcp_checksum`; activation probes its
+BTF/kfunc contract before detaching a baseline runtime. The deprecated
+`experimental` field is parsed and ignored, and legacy `xdp-required` is
+normalized to `xdp-generic-exact`.
+
+FakeTCP startup is always fail-closed. Its WireGuard file must configure a
+fixed non-zero `ListenPort`, `startup_guard.mode` must be
+`nft-temporary-drop`, and `policy.startup_fail_mode` must be
+`fail_closed_for_managed_flows`. These are validation errors rather than
+best-effort recommendations: the same fixed port is guarded as both UDP and
+TCP until the complete resident runtime passes its final health check.
 
 Regression entry points:
 
@@ -300,8 +334,7 @@ ingress:
 Current XOR is not multiplexing. It does not combine multiple WireGuard
 interfaces or flows into one outer flow, and it does not implement udp2raw
 framing. It is a UDP-only payload transform layered on top of the type-word
-rewrite. Config validation rejects ICMP + XOR and any future fakeTCP + XOR
-combination in the MVP.
+rewrite. Config validation rejects ICMP + XOR; UDP and FakeTCP accept XOR.
 
 Supported fields:
 
@@ -391,7 +424,10 @@ PostUp = wg set %i fwmark 0x10000001
 
 The `PostUp` form is useful for launch modes where the config parser can see the expected mark but another tool applies it at interface startup.
 
-`ListenPort` may be present or omitted in the WireGuard config. The dataplane uses the runtime listen port, not the static config value:
+For UDP and ICMP, `ListenPort` may be present or omitted in the WireGuard
+config and the dataplane uses the runtime value. FakeTCP is stricter: it
+requires the static config value to be present and non-zero so the startup
+guard can cover the exact UDP and TCP wire port before runtime discovery:
 
 ```ini
 [Interface]
@@ -580,6 +616,10 @@ owner's schema-v3 classic or schema-v4 TCX backend across reloads and kernel
 upgrades. Select a different backend explicitly only after detaching the old
 owner.
 
+For FakeTCP, the effective backend must be TCX. A durable classic owner or an
+explicit `classic_tc` selection is rejected before network mutation. UDP and
+ICMP can use either TCX or classic TC.
+
 This rejects duplicate underlay names. More advanced path-overlap detection is platform-specific and must be validated externally.
 
 ## `policy`
@@ -607,6 +647,10 @@ policy:
 ```
 
 The MVP only implements the shown values. Other values are rejected by static validation.
+
+`best_effort` remains accepted for UDP/ICMP compatibility, but it is rejected
+when any WireGuard selects FakeTCP. FakeTCP likewise rejects
+`startup_guard.mode: none`.
 
 Egress is fail-closed for managed WireGuard packets. Ingress only drops packets that match a managed listener or a managed fragment policy.
 
