@@ -535,6 +535,8 @@ func TestValidateFakeTCPProductionReferencesRejectsAmbiguousOwnership(t *testing
 
 func TestFakeTCPProductionDesiredKeyBindsEveryEnginePlan(t *testing.T) {
 	state := fakeTCPPolicyStateWithInterfaces(1)
+	state.WireGuards[0].RuntimeStateAvailable = true
+	state.WireGuards[0].RuntimeFirewallMark = 0x9001
 	plan, err := buildFakeTCPPolicyGenerationPlan(state, state.Generation)
 	if err != nil {
 		t.Fatal(err)

@@ -153,7 +153,9 @@ func TestFakeTCPChecksumStageFactoryRejectsMissingLegacyRuntimeMapBeforeAttach(t
 	owner, err := factory(t.Context(), &experimentalCollectionOwner{
 		maps: map[string]experimentalMapResource{},
 	})
-	if owner != nil || err == nil || !strings.Contains(err.Error(), fakeTCPKprobeRuntimeMapName) {
+	wantError := `seed FakeTCP kprobe checksum stage: experimental FakeTCP collection is missing map "` +
+		fakeTCPKprobeRuntimeMapName + `"`
+	if !experimentalChecksumStageOwnerIsNil(owner) || err == nil || err.Error() != wantError {
 		t.Fatalf("owner=%#v error=%v", owner, err)
 	}
 	if !selection.RuntimeStatus().LeaseHeld {

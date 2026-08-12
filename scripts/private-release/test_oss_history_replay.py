@@ -881,6 +881,7 @@ class OssHistoryReplayTests(unittest.TestCase):
         self.assertIn(
             "test-unit: test-pcap-helper test-smoke-script-helper "
             "test-stage-source-helper test-bpf-object-manifest-path-contract "
+            "test-faketcp-checksum-kprobe-source-contract "
             "test-private-oss-history-replay test-b82-fresh-verifier-gate\n",
             contents,
         )
