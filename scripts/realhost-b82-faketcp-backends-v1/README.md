@@ -75,6 +75,10 @@ every run-owned WireGuard device have TX checksum offload plus TSO/GSO/GRO
 explicitly disabled or enabled, and the resulting `ethtool -k` state is
 recorded and validated before traffic begins. RX checksum is not forced because
 WireGuard advertises it as fixed off on supported kernels.
+The short functional cell also records whether the kernel actually emitted a
+managed outer GSO skb, but does not fail when this opportunistic aggregation
+does not occur. Verifier coverage and the dedicated GSO tests remain the hard
+GSO-path gates; a two-second functional transfer is not an aggregation oracle.
 
 The functional harness uses a short but valid FakeTCP timing profile
 (`1s` handshake retry, `2s` keepalive, `6s` idle timeout) so single-endpoint

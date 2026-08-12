@@ -994,9 +994,9 @@ before=json.loads(pathlib.Path(sys.argv[1]).read_text()).get("dataplane",{}).get
 after=json.loads(pathlib.Path(sys.argv[2]).read_text()).get("dataplane",{}).get("stats",{})
 keys=("egress_gso_managed_seen","egress_gso_rewrite_ok")
 deltas={key:int(after.get(key,0))-int(before.get(key,0)) for key in keys}
-if any(value <= 0 for value in deltas.values()):
-    raise SystemExit(f"outer GSO was requested but not proven: {deltas}")
-print("gso=proven " + " ".join(f"{key}_delta={value}" for key,value in deltas.items()))
+observed=all(value > 0 for value in deltas.values())
+print("gso=requested observed=" + ("yes" if observed else "no") + " " +
+      " ".join(f"{key}_delta={value}" for key,value in deltas.items()))
 PY
 fi
 
