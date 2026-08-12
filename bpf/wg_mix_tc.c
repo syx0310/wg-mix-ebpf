@@ -881,47 +881,49 @@ static __always_inline int derive_icmp_checksum_from_udp(struct __sk_buff *skb,
 							 __u32 new_wire,
 							 __u16 *out)
 {
-	__be32 ipv4_address = 0;
-	__be16 wire_word = 0;
-	__u16 udp_check;
-	__u16 udp_len;
-	__u64 sum;
+	__u16 wire_word = 0;
+	__u64 sum = 0;
+
+	/* Consume caller scalars before the packet helpers so they do not extend
+	 * the verifier-visible stack lifetime across every helper call.  One's
+	 * complement accumulation is commutative; the packet-derived terms can be
+	 * added after these fixed terms without changing the folded checksum.
+	 */
+	csum_sub_word(&sum, IPPROTO_UDP);
+	csum_sub_word(&sum, info->src_port);
+	csum_sub_word(&sum, info->dst_port);
+	csum_sub_type_word(&sum, old_wire);
+	csum_add_word(&sum, ((__u16)icmp_type) << 8);
+	csum_add_word(&sum, icmp_id);
+	csum_add_word(&sum, icmp_sequence);
+	csum_add_type_word(&sum, new_wire);
 
 	if (bpf_skb_load_bytes(skb,
 			       info->udp_off + offsetof(struct udphdr, check),
 			       &wire_word, sizeof(wire_word)) < 0)
 		return -1;
-	udp_check = bpf_ntohs(wire_word);
-	if (udp_check == 0)
+	wire_word = bpf_ntohs(wire_word);
+	if (wire_word == 0)
 		return -1;
+	sum += (~wire_word) & 0xffff;
 	if (bpf_skb_load_bytes(skb,
 			       info->udp_off + offsetof(struct udphdr, len),
 			       &wire_word, sizeof(wire_word)) < 0)
 		return -1;
-	udp_len = bpf_ntohs(wire_word);
-	sum = (~udp_check) & 0xffff;
+	wire_word = bpf_ntohs(wire_word);
+	csum_sub_word(&sum, wire_word);
+	csum_sub_word(&sum, wire_word);
 
 	if (bpf_skb_load_bytes(skb,
 			       info->ip_off + offsetof(struct iphdr, saddr),
-			       &ipv4_address, sizeof(ipv4_address)) < 0)
+			       &old_wire, sizeof(old_wire)) < 0)
 		return -1;
-	csum_sub_ipv4(&sum, ipv4_address);
+	csum_sub_ipv4(&sum, old_wire);
 	if (bpf_skb_load_bytes(skb,
 			       info->ip_off + offsetof(struct iphdr, daddr),
-			       &ipv4_address, sizeof(ipv4_address)) < 0)
+			       &old_wire, sizeof(old_wire)) < 0)
 		return -1;
-	csum_sub_ipv4(&sum, ipv4_address);
-	csum_sub_word(&sum, IPPROTO_UDP);
-	csum_sub_word(&sum, udp_len);
-	csum_sub_word(&sum, info->src_port);
-	csum_sub_word(&sum, info->dst_port);
-	csum_sub_word(&sum, udp_len);
-	csum_sub_type_word(&sum, old_wire);
-
-	csum_add_word(&sum, ((__u16)icmp_type) << 8);
-	csum_add_word(&sum, icmp_id);
-	csum_add_word(&sum, icmp_sequence);
-	csum_add_type_word(&sum, new_wire);
+	csum_sub_ipv4(&sum, old_wire);
 
 	*out = bpf_htons(fold_csum(sum));
 	return 0;
@@ -932,7 +934,6 @@ static __always_inline __u16 lookup_icmp_sequence(struct __sk_buff *skb,
 						  struct egress_rule_value *rule,
 						  __u16 icmp_id)
 {
-	__be32 remote_ipv4 = 0;
 	struct icmp_seq_key key = {
 		.generation = rule->generation,
 		.underlay_index = skb->ifindex,
@@ -943,9 +944,8 @@ static __always_inline __u16 lookup_icmp_sequence(struct __sk_buff *skb,
 
 	if (bpf_skb_load_bytes(skb,
 			       info->ip_off + offsetof(struct iphdr, daddr),
-			       &remote_ipv4, sizeof(remote_ipv4)) < 0)
+			       &key.remote_ipv4, sizeof(key.remote_ipv4)) < 0)
 		return 0;
-	key.remote_ipv4 = remote_ipv4;
 	value = bpf_map_lookup_elem(&icmp_seq_map, &key);
 	if (!value || value->generation != rule->generation)
 		return 0;

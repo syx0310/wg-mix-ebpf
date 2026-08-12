@@ -36,7 +36,8 @@ func TestTCICMPPostParserReadsUseFixedSKBHelpers(t *testing.T) {
 		"offsetof(struct iphdr, saddr)",
 		"offsetof(struct iphdr, daddr)",
 		"&wire_word, sizeof(wire_word)",
-		"&ipv4_address, sizeof(ipv4_address)",
+		"&old_wire, sizeof(old_wire)",
+		"csum_sub_type_word(&sum, old_wire)",
 	} {
 		if !strings.Contains(checksum, required) {
 			t.Fatalf("derived ICMP checksum lost fixed helper read %q", required)
@@ -45,10 +46,31 @@ func TestTCICMPPostParserReadsUseFixedSKBHelpers(t *testing.T) {
 	if got := strings.Count(checksum, "bpf_skb_load_bytes("); got != 4 {
 		t.Fatalf("derived ICMP checksum helper read count = %d, want 4", got)
 	}
+	firstPacketRead := strings.Index(checksum, "bpf_skb_load_bytes(")
+	for _, consumedBeforePacketRead := range []string{
+		"csum_sub_type_word(&sum, old_wire)",
+		"csum_add_word(&sum, ((__u16)icmp_type) << 8)",
+		"csum_add_word(&sum, icmp_id)",
+		"csum_add_word(&sum, icmp_sequence)",
+		"csum_add_type_word(&sum, new_wire)",
+	} {
+		position := strings.Index(checksum, consumedBeforePacketRead)
+		if position < 0 || firstPacketRead < 0 || position > firstPacketRead {
+			t.Fatalf("caller scalar %q is not consumed before packet helper reads", consumedBeforePacketRead)
+		}
+	}
+	for _, forbiddenStackSlot := range []string{
+		"ipv4_address",
+		"udp_check",
+		"udp_len",
+	} {
+		if strings.Contains(checksum, forbiddenStackSlot) {
+			t.Fatalf("derived ICMP checksum regained stack slot %q", forbiddenStackSlot)
+		}
+	}
 	for _, required := range []string{
 		"offsetof(struct iphdr, daddr)",
-		"&remote_ipv4, sizeof(remote_ipv4)",
-		"key.remote_ipv4 = remote_ipv4",
+		"&key.remote_ipv4, sizeof(key.remote_ipv4)",
 	} {
 		if !strings.Contains(sequence, required) {
 			t.Fatalf("ICMP sequence lookup lost fixed helper read %q", required)
@@ -56,5 +78,8 @@ func TestTCICMPPostParserReadsUseFixedSKBHelpers(t *testing.T) {
 	}
 	if got := strings.Count(sequence, "bpf_skb_load_bytes("); got != 1 {
 		t.Fatalf("ICMP sequence helper read count = %d, want 1", got)
+	}
+	if strings.Contains(sequence, "remote_ipv4 =") {
+		t.Fatal("ICMP sequence lookup regained a separate remote IPv4 stack slot")
 	}
 }
