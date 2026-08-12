@@ -20,6 +20,7 @@ DIR = ROOT / "scripts" / "realhost-b82-faketcp-backends-v1"
 MATRIX = DIR / "matrix.py"
 ROOT_CELL = DIR / "root-cell.sh"
 NETNS_CELL = DIR / "root-netns-cell.sh"
+TCP_DROP_DIAGNOSTIC = DIR / "diagnose-retained-tcp-drop.sh"
 README = DIR / "README.md"
 CONFIG_GO = ROOT / "internal" / "config" / "config.go"
 PLAN_SOURCE = "/var/tmp/wg-mix-ebpf-source-stages/abcdef12/source"
@@ -34,12 +35,13 @@ class StaticMatrixTest(unittest.TestCase):
         cls.matrix = MATRIX.read_text(encoding="utf-8")
         cls.root_cell = ROOT_CELL.read_text(encoding="utf-8")
         cls.netns = NETNS_CELL.read_text(encoding="utf-8")
+        cls.tcp_drop_diagnostic = TCP_DROP_DIAGNOSTIC.read_text(encoding="utf-8")
         cls.readme = README.read_text(encoding="utf-8")
         cls.config_go = CONFIG_GO.read_text(encoding="utf-8")
 
     def test_sources_parse(self) -> None:
         ast.parse(self.matrix, filename=str(MATRIX))
-        for path in (ROOT_CELL, NETNS_CELL):
+        for path in (ROOT_CELL, NETNS_CELL, TCP_DROP_DIAGNOSTIC):
             completed = subprocess.run(
                 ["/bin/bash", "-n", str(path)], text=True, capture_output=True
             )
@@ -1207,6 +1209,37 @@ class StaticMatrixTest(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
         self.assertFalse(any(DIR.rglob("*.pyc")))
         self.assertFalse(any(path.name == "__pycache__" for path in DIR.rglob("*")))
+
+    def test_retained_tcp_drop_diagnostic_is_retry_safe(self) -> None:
+        diagnostic = self.tcp_drop_diagnostic
+        for required in (
+            '--attempt-id) ATTEMPT_ID="$2"',
+            '"${ATTEMPT_ID}" =~ ^[0-9a-f]{8}$',
+            'readonly OUTPUT_PREFIX="${EVIDENCE}/tcp-drop-${ATTEMPT_ID}"',
+            'readonly SUMMARY="${OUTPUT_PREFIX}-diagnostic.summary.v2"',
+            'local role="$1" output="$2"\n  local pid_file="${ROOT}/daemon-${role}.pid"',
+            'timeout --signal=TERM --kill-after=2s 10s python3',
+            'timeout=3,',
+            'timeout --signal=TERM --kill-after=1s 5s "$@"',
+            'wait_capture_ready pcap-a',
+            'wait_capture_ready pcap-b',
+            'wait_capture_ready pcap-underlay-a',
+            "grep -Fq -- 'listening on '",
+            'timeout --signal=TERM --kill-after=1s 1s ip netns exec',
+            'tracepoint:skb:kfree_skb',
+            'tracepoint:skb:consume_skb',
+            'tracepoint:net:net_dev_queue',
+            'tracepoint:net:net_dev_start_xmit',
+            'tracepoint:net:net_dev_xmit',
+            'phase=packet-trace',
+        ):
+            self.assertIn(required, diagnostic)
+        self.assertNotRegex(
+            diagnostic,
+            re.compile(r'local role="\$1"[^\n]*pid_file="[^\n]*\$\{role\}'),
+        )
+        self.assertNotIn('${EVIDENCE}/tcp-drop-${phase}.log', diagnostic)
+        self.assertIn("fresh eight-hex `--attempt-id`", self.readme)
 
 
 if __name__ == "__main__":
