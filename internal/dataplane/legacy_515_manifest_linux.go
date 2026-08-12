@@ -23,6 +23,12 @@ var legacy515FakeTCPTriggerHelperCounts = map[asm.BuiltinFunc]int{
 	asm.FnSkbPullData:    2,
 }
 
+var legacy515FakeTCPForbiddenHelpers = map[asm.BuiltinFunc]string{
+	asm.FnLoop:          "bpf_loop",
+	asm.FnXdpLoadBytes:  "bpf_xdp_load_bytes",
+	asm.FnXdpStoreBytes: "bpf_xdp_store_bytes",
+}
+
 func legacy515FakeTCPKprobeRuntimeMapDescriptor() pinnedMapDescriptor {
 	return pinnedMapDescriptor{
 		name: legacy515FakeTCPKprobeRuntimeMap, mapType: ebpf.Array,
@@ -85,17 +91,16 @@ func validateLegacy515InstructionSet(spec *ebpf.CollectionSpec) error {
 					programName, instruction.Reference(),
 				)
 			}
-			if instruction.IsBuiltinCall() &&
-				asm.BuiltinFunc(instruction.Constant) == asm.FnLoop {
-				return fmt.Errorf(
-					"legacy-5.15 FakeTCP program %q depends on forbidden bpf_loop",
-					programName,
-				)
-			}
 			if !instruction.IsBuiltinCall() {
 				continue
 			}
 			helper := asm.BuiltinFunc(instruction.Constant)
+			if helperName, forbidden := legacy515FakeTCPForbiddenHelpers[helper]; forbidden {
+				return fmt.Errorf(
+					"legacy-5.15 FakeTCP program %q depends on forbidden %s",
+					programName, helperName,
+				)
+			}
 			if _, ok := triggerCalls[helper]; !ok {
 				continue
 			}

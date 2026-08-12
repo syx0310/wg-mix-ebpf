@@ -54,6 +54,10 @@ func TestCurrentHasDeterministicDefaults(t *testing.T) {
 		!regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(info.EmbeddedFakeTCPObjectSHA256) {
 		t.Fatalf("embedded FakeTCP BPF SHA-256 = %q", info.EmbeddedFakeTCPObjectSHA256)
 	}
+	if info.EmbeddedFakeTCPLegacy515ObjectSHA256 != UnknownSHA256 &&
+		!regexp.MustCompile(`^[0-9a-f]{64}$`).MatchString(info.EmbeddedFakeTCPLegacy515ObjectSHA256) {
+		t.Fatalf("embedded legacy 5.15 FakeTCP BPF SHA-256 = %q", info.EmbeddedFakeTCPLegacy515ObjectSHA256)
+	}
 }
 
 func TestSourceCommitScriptRejectsRepositoryEnvironmentRedirects(t *testing.T) {

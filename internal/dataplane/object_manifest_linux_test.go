@@ -85,6 +85,26 @@ func TestLegacy515ManifestIsIndependentAndRejectsPost515Calls(t *testing.T) {
 		!strings.Contains(err.Error(), "forbidden bpf_loop") {
 		t.Fatalf("legacy-5.15 manifest accepted bpf_loop: %v", err)
 	}
+	for _, test := range []struct {
+		name       string
+		helper     asm.BuiltinFunc
+		helperName string
+	}{
+		{name: "XDP load bytes", helper: asm.FnXdpLoadBytes, helperName: "bpf_xdp_load_bytes"},
+		{name: "XDP store bytes", helper: asm.FnXdpStoreBytes, helperName: "bpf_xdp_store_bytes"},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			spec := canonicalLegacy515CollectionSpec()
+			spec.Programs["wg_mix_faketcp_ingress"].Instructions = asm.Instructions{
+				test.helper.Call(),
+				asm.Return(),
+			}
+			err := validateLegacy515ExtensionManifest(spec)
+			if err == nil || !strings.Contains(err.Error(), "forbidden "+test.helperName) {
+				t.Fatalf("legacy-5.15 manifest accepted %s: %v", test.helperName, err)
+			}
+		})
+	}
 
 	missingCookie := canonicalLegacy515CollectionSpec()
 	delete(missingCookie.Maps, legacy515FakeTCPKprobeRuntimeMap)

@@ -3420,6 +3420,133 @@ faketcp_close_checksums_valid(const struct iphdr *iph,
 	return sum >= 0 && fold_csum(sum) == 0;
 }
 
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+// bpf_xdp_load_bytes/store_bytes were added after Linux 5.15. The legacy
+// object uses fixed-size direct packet access instead. The parser admits only
+// L3 mode or Ethernet with at most two VLAN headers, and the FakeTCP gate caps
+// the IPv4 wire length before any helper below is reached. Keeping that exact
+// scalar bound visible avoids turning a packet-derived offset into an
+// unbounded packet pointer on the 5.15 verifier.
+#define FAKETCP_LEGACY_515_XDP_MAX_OFFSET \
+	(sizeof(struct ethhdr) + 2U * sizeof(struct wg_vlan_hdr) + \
+	 FAKETCP_MAX_IPV4_TOTAL_LEN + FAKETCP_HEADER_DELTA)
+
+static __always_inline int faketcp_legacy_515_xdp_load_close_packet(
+	struct xdp_md *xdp, __u32 offset,
+	__u8 destination[sizeof(struct iphdr) + sizeof(struct tcphdr)])
+{
+	void *data = (void *)(long)xdp->data;
+	void *data_end = (void *)(long)xdp->data_end;
+	__u8 *source;
+
+	if (offset > FAKETCP_LEGACY_515_XDP_MAX_OFFSET)
+		return -1;
+	source = data + offset;
+	if ((void *)(source + sizeof(struct iphdr) + sizeof(struct tcphdr)) >
+	    data_end)
+		return -1;
+#pragma unroll
+	for (__u32 i = 0; i < sizeof(struct iphdr) + sizeof(struct tcphdr); i++)
+		destination[i] = source[i];
+	return 0;
+}
+
+static __always_inline int faketcp_legacy_515_xdp_load_word(
+	struct xdp_md *xdp, __u32 offset, __u32 *destination)
+{
+	void *data = (void *)(long)xdp->data;
+	void *data_end = (void *)(long)xdp->data_end;
+	__u8 *source;
+	__u8 *output = (__u8 *)destination;
+
+	if (offset > FAKETCP_LEGACY_515_XDP_MAX_OFFSET)
+		return -1;
+	source = data + offset;
+	if ((void *)(source + sizeof(*destination)) > data_end)
+		return -1;
+#pragma unroll
+	for (__u32 i = 0; i < sizeof(*destination); i++)
+		output[i] = source[i];
+	return 0;
+}
+
+static __always_inline int faketcp_legacy_515_xdp_load_tail(
+	struct xdp_md *xdp, __u32 offset,
+	__u8 destination[FAKETCP_HEADER_DELTA])
+{
+	void *data = (void *)(long)xdp->data;
+	void *data_end = (void *)(long)xdp->data_end;
+	__u8 *source;
+
+	if (offset > FAKETCP_LEGACY_515_XDP_MAX_OFFSET)
+		return -1;
+	source = data + offset;
+	if ((void *)(source + FAKETCP_HEADER_DELTA) > data_end)
+		return -1;
+#pragma unroll
+	for (__u32 i = 0; i < FAKETCP_HEADER_DELTA; i++)
+		destination[i] = source[i];
+	return 0;
+}
+
+static __always_inline int faketcp_legacy_515_xdp_store_udp(
+	struct xdp_md *xdp, __u32 offset, const struct udphdr *source)
+{
+	void *data = (void *)(long)xdp->data;
+	void *data_end = (void *)(long)xdp->data_end;
+	__u8 *destination;
+	const __u8 *input = (const __u8 *)source;
+
+	if (offset > FAKETCP_LEGACY_515_XDP_MAX_OFFSET)
+		return -1;
+	destination = data + offset;
+	if ((void *)(destination + sizeof(*source)) > data_end)
+		return -1;
+#pragma unroll
+	for (__u32 i = 0; i < sizeof(*source); i++)
+		destination[i] = input[i];
+	return 0;
+}
+
+static __always_inline int faketcp_legacy_515_xdp_store_tail(
+	struct xdp_md *xdp, __u32 offset,
+	const __u8 source[FAKETCP_HEADER_DELTA])
+{
+	void *data = (void *)(long)xdp->data;
+	void *data_end = (void *)(long)xdp->data_end;
+	__u8 *destination;
+
+	if (offset > FAKETCP_LEGACY_515_XDP_MAX_OFFSET)
+		return -1;
+	destination = data + offset;
+	if ((void *)(destination + FAKETCP_HEADER_DELTA) > data_end)
+		return -1;
+#pragma unroll
+	for (__u32 i = 0; i < FAKETCP_HEADER_DELTA; i++)
+		destination[i] = source[i];
+	return 0;
+}
+
+static __always_inline int faketcp_legacy_515_xdp_store_ipv4(
+	struct xdp_md *xdp, __u32 offset, const struct iphdr *source)
+{
+	void *data = (void *)(long)xdp->data;
+	void *data_end = (void *)(long)xdp->data_end;
+	__u8 *destination;
+	const __u8 *input = (const __u8 *)source;
+
+	if (offset > FAKETCP_LEGACY_515_XDP_MAX_OFFSET)
+		return -1;
+	destination = data + offset;
+	if ((void *)(destination + sizeof(*source)) > data_end)
+		return -1;
+#pragma unroll
+	for (__u32 i = 0; i < sizeof(*source); i++)
+		destination[i] = input[i];
+	return 0;
+}
+#endif
+
 static __always_inline int
 faketcp_capture_close_packet(struct xdp_md *xdp, __u32 packet_off,
 			     __u16 packet_len,
@@ -3458,7 +3585,12 @@ faketcp_capture_close_packet(struct xdp_md *xdp, __u32 packet_off,
 	for (int i = 0; i < 16; i++)
 		record->event.runtime_incarnation[i] =
 			admission->session_authority.runtime_incarnation[i];
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	if (faketcp_legacy_515_xdp_load_close_packet(
+		    xdp, packet_off, record->packet) < 0)
+#else
 	if (bpf_xdp_load_bytes(xdp, packet_off, record->packet, packet_len) < 0)
+#endif
 		return -1;
 	if (faketcp_output_packet_event(record, packet_len) < 0)
 		return -1;
@@ -3623,10 +3755,17 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 	}
 	// The encoder moves the first 12 UDP payload bytes to the TCP wire tail.
 	// Bind the word that inverse rotation restores at the UDP payload start.
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	if (faketcp_legacy_515_xdp_load_word(
+		    xdp,
+		    ip_off + admission->wire_total_len - FAKETCP_HEADER_DELTA,
+		    &input_wire) < 0) {
+#else
 	if (bpf_xdp_load_bytes(xdp,
 			       ip_off + admission->wire_total_len -
 				       FAKETCP_HEADER_DELTA,
 			       &input_wire, sizeof(input_wire)) < 0) {
+#endif
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
 	}
@@ -3832,9 +3971,15 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 		return XDP_DROP;
 	}
 	*old_tcp = *tcp;
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	if (faketcp_legacy_515_xdp_load_tail(
+		    xdp, l3->l3_off + total_len - FAKETCP_HEADER_DELTA,
+		    tail) < 0) {
+#else
 	if (bpf_xdp_load_bytes(xdp,
 			       l3->l3_off + total_len - FAKETCP_HEADER_DELTA,
 			       tail, FAKETCP_HEADER_DELTA) < 0) {
+#endif
 		inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
 		return XDP_DROP;
 	}
@@ -3883,9 +4028,15 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	metadata->pad[1] = 0;
 	metadata->pad[2] = 0;
 	metadata->admission = *admission;
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	if (faketcp_legacy_515_xdp_store_udp(xdp, l3->l4_off, udp) < 0 ||
+	    faketcp_legacy_515_xdp_store_tail(
+		    xdp, l3->l4_off + sizeof(*udp), tail) < 0)
+#else
 	if (bpf_xdp_store_bytes(xdp, l3->l4_off, udp, sizeof(*udp)) < 0 ||
 	    bpf_xdp_store_bytes(xdp, l3->l4_off + sizeof(*udp), tail,
 			       FAKETCP_HEADER_DELTA) < 0)
+#endif
 		return XDP_DROP;
 
 	// The integration gate accepts only a fixed 20-byte IPv4 header, so one
@@ -3901,8 +4052,13 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	if (sum < 0)
 		return XDP_DROP;
 	new_ip->check = bpf_htons(fold_csum(sum));
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+	if (faketcp_legacy_515_xdp_store_ipv4(xdp, l3->l3_off, new_ip) < 0 ||
+	    bpf_xdp_adjust_tail(xdp, -FAKETCP_HEADER_DELTA) < 0)
+#else
 	if (bpf_xdp_store_bytes(xdp, l3->l3_off, new_ip, sizeof(*new_ip)) < 0 ||
 	    bpf_xdp_adjust_tail(xdp, -FAKETCP_HEADER_DELTA) < 0)
+#endif
 		return XDP_DROP;
 
 	next_seq = seq + payload_len;

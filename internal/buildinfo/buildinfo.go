@@ -20,11 +20,12 @@ var sourceCommit = UnknownCommit
 // Info identifies the userspace source and the exact BPF bytes embedded in the
 // same executable.
 type Info struct {
-	Version                     string `json:"version"`
-	SourceCommit                string `json:"source_commit"`
-	EmbeddedBPFObjectSHA256     string `json:"embedded_bpf_object_sha256"`
-	EmbeddedFakeTCPObjectSHA256 string `json:"embedded_faketcp_object_sha256"`
-	BPFABIVersion               uint32 `json:"bpf_abi_version"`
+	Version                              string `json:"version"`
+	SourceCommit                         string `json:"source_commit"`
+	EmbeddedBPFObjectSHA256              string `json:"embedded_bpf_object_sha256"`
+	EmbeddedFakeTCPObjectSHA256          string `json:"embedded_faketcp_object_sha256"`
+	EmbeddedFakeTCPLegacy515ObjectSHA256 string `json:"embedded_faketcp_legacy_515_object_sha256"`
+	BPFABIVersion                        uint32 `json:"bpf_abi_version"`
 }
 
 func Current() Info {
@@ -36,12 +37,17 @@ func Current() Info {
 	if object, err := dataplane.EmbeddedFakeTCPObjectIdentity(); err == nil {
 		fakeTCPObjectSHA256 = object.SHA256
 	}
+	fakeTCPLegacy515ObjectSHA256 := UnknownSHA256
+	if object, err := dataplane.EmbeddedFakeTCPLegacy515ObjectIdentity(); err == nil {
+		fakeTCPLegacy515ObjectSHA256 = object.SHA256
+	}
 	return Info{
-		Version:                     Version,
-		SourceCommit:                SourceCommit(),
-		EmbeddedBPFObjectSHA256:     objectSHA256,
-		EmbeddedFakeTCPObjectSHA256: fakeTCPObjectSHA256,
-		BPFABIVersion:               abi.Version,
+		Version:                              Version,
+		SourceCommit:                         SourceCommit(),
+		EmbeddedBPFObjectSHA256:              objectSHA256,
+		EmbeddedFakeTCPObjectSHA256:          fakeTCPObjectSHA256,
+		EmbeddedFakeTCPLegacy515ObjectSHA256: fakeTCPLegacy515ObjectSHA256,
+		BPFABIVersion:                        abi.Version,
 	}
 }
 
