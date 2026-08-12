@@ -1214,6 +1214,7 @@ record_background_start daemon-a-start "${EVIDENCE}/daemon-a.stdout.log" \
   "${script_path}" endpoint \
   --run-id "${run_id}" --role a --transport "${transport}"
 printf '%s\n' "${daemon_a_pid}" >"${RUN_ROOT}/daemon-a.pid"
+wait_daemon_active a "${daemon_a_pid}" "${ENDPOINT_A_RUN}/runtime/status.json"
 
 env -i "PATH=${SAFE_PATH}" "LC_ALL=C" \
   "WG_MIX_EBPF_PERFORMANCE_PARENT_MOUNTNS=${parent_mountns}" \
@@ -1234,7 +1235,6 @@ record_background_start daemon-b-start "${EVIDENCE}/daemon-b.stdout.log" \
   "${script_path}" endpoint \
   --run-id "${run_id}" --role b --transport "${transport}"
 printf '%s\n' "${daemon_b_pid}" >"${RUN_ROOT}/daemon-b.pid"
-wait_daemon_active a "${daemon_a_pid}" "${ENDPOINT_A_RUN}/runtime/status.json"
 wait_daemon_active b "${daemon_b_pid}" "${ENDPOINT_B_RUN}/runtime/status.json"
 fi
 

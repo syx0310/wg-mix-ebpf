@@ -267,6 +267,20 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
         self.assertNotIn('exec ip netns exec "${netns}"', endpoint)
         self.assertNotIn('mount --bind "${endpoint_maintenance}"', endpoint)
 
+    def test_endpoint_daemon_startup_is_serialized_across_the_shared_maintenance_gate(self) -> None:
+        runner = self.runner
+        start_a = runner.index("record_background_start daemon-a-start")
+        active_a = runner.index(
+            'wait_daemon_active a "${daemon_a_pid}" "${ENDPOINT_A_RUN}/runtime/status.json"'
+        )
+        start_b = runner.index("record_background_start daemon-b-start")
+        active_b = runner.index(
+            'wait_daemon_active b "${daemon_b_pid}" "${ENDPOINT_B_RUN}/runtime/status.json"'
+        )
+        self.assertLess(start_a, active_a)
+        self.assertLess(active_a, start_b)
+        self.assertLess(start_b, active_b)
+
     def test_runner_supports_all_attachment_checksum_artifact_branches(self) -> None:
         runner = self.runner
         for fragment in (
