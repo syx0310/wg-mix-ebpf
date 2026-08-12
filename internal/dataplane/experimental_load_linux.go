@@ -149,7 +149,7 @@ func validateExperimentalFakeTCPKfuncPrototype(name string, function *btf.Func) 
 	if !ok || prototype == nil {
 		return fmt.Errorf("type is %T, want FuncProto", function.Type)
 	}
-	if err := validateExperimentalFakeTCPIntegerType(prototype.Return, 4, btf.Signed); err != nil {
+	if err := validateExperimentalFakeTCPScalarType(prototype.Return, 4, btf.Signed); err != nil {
 		return fmt.Errorf("return type: %w", err)
 	}
 	if len(prototype.Params) != len(wantParams) {
@@ -188,15 +188,15 @@ func validateExperimentalFakeTCPKfuncParameter(
 		}
 		return nil
 	case experimentalFakeTCPUnsigned32Parameter:
-		return validateExperimentalFakeTCPIntegerType(typeValue, 4, btf.Unsigned)
+		return validateExperimentalFakeTCPScalarType(typeValue, 4, btf.Unsigned)
 	case experimentalFakeTCPUnsigned64Parameter:
-		return validateExperimentalFakeTCPIntegerType(typeValue, 8, btf.Unsigned)
+		return validateExperimentalFakeTCPScalarType(typeValue, 8, btf.Unsigned)
 	default:
 		return fmt.Errorf("unreviewed expected parameter kind %d", want)
 	}
 }
 
-func validateExperimentalFakeTCPIntegerType(
+func validateExperimentalFakeTCPScalarType(
 	typeValue btf.Type,
 	wantSize uint32,
 	wantEncoding btf.IntEncoding,
