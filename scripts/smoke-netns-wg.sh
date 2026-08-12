@@ -841,8 +841,6 @@ manifest_payload() {
   printf 'format=wg-mix-ebpf-test-manifest-v2\n'
   printf 'run_id=%s\nowner_token=%s\nboot_id=%s\nhost=%s\n' \
     "${RUN_ID}" "${OWNER_TOKEN}" "${BOOT_ID}" "${HOST_ID}"
-  printf 'dataplane_mode=%s\nattachment_backend=%s\n' \
-    "${DATAPLANE_MODE}" "${ATTACHMENT_BACKEND}"
   printf 'run_base=%s\nbpffs=%s\nbpffs_source=%s\nbpffs_mount_id=%s\n' \
     "${RUN_BASE}" "${BPFFS_DIR}" "${BPFFS_SOURCE}" "${BPFFS_MOUNT_ID}"
   printf 'pin_parent_dev=%s\npin_parent_ino=%s\n' \

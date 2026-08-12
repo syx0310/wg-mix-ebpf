@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import pathlib
+import re
 import shlex
 import stat
 import subprocess
@@ -21,6 +22,9 @@ PERFORMANCE_MATRIX_PATH = pathlib.Path(__file__).with_name(
 MAKEFILE_PATH = SCRIPT_PATH.parent.parent / "Makefile"
 GO_MOD_PATH = SCRIPT_PATH.parent.parent / "go.mod"
 GO_SUM_PATH = SCRIPT_PATH.parent.parent / "go.sum"
+ISOLATED_MANIFEST_READER_PATH = (
+    SCRIPT_PATH.parent.parent / "internal" / "app" / "isolated_netns.go"
+)
 HOLDER_PATH = pathlib.Path(__file__).with_name(
     "hold-isolated-lifecycle-lease.py"
 )
@@ -45,6 +49,9 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         cls.makefile_source = MAKEFILE_PATH.read_text(encoding="utf-8")
         cls.go_mod_source = GO_MOD_PATH.read_text(encoding="utf-8")
         cls.go_sum_source = GO_SUM_PATH.read_text(encoding="utf-8")
+        cls.isolated_manifest_reader = ISOLATED_MANIFEST_READER_PATH.read_text(
+            encoding="utf-8"
+        )
         cls.holder_source = HOLDER_PATH.read_text(encoding="utf-8")
         cls.failed_run_recovery = FAILED_RUN_RECOVERY_PATH.read_text(
             encoding="utf-8"
@@ -1413,6 +1420,35 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             seal,
         )
         self.assertLess(seal, first_reload)
+
+    def test_manifest_writer_exactly_matches_production_reader_schema(self) -> None:
+        writer_start = self.source.index("manifest_payload() {")
+        writer_end = self.source.index(
+            "\nbpffs_creation_ledger_payload() {", writer_start
+        )
+        writer = self.source[writer_start:writer_end]
+        writer_keys: list[str] = []
+        for literal in re.findall(r"printf '([^']*)'", writer):
+            writer_keys.extend(
+                re.findall(r"(?:^|\\n)([a-z][a-z0-9_]*)=", literal)
+            )
+
+        reader_start = self.isolated_manifest_reader.index(
+            "allowed := []string{",
+            self.isolated_manifest_reader.index(
+                "func parseIsolatedNetNSTestManifest"
+            ),
+        )
+        reader_end = self.isolated_manifest_reader.index("\n\t}", reader_start)
+        reader_keys = re.findall(
+            r'"([a-z][a-z0-9_]*)"',
+            self.isolated_manifest_reader[reader_start:reader_end],
+        )
+
+        self.assertEqual(writer_keys, reader_keys)
+        self.assertEqual(len(writer_keys), len(set(writer_keys)))
+        self.assertNotIn("dataplane_mode", writer_keys)
+        self.assertNotIn("attachment_backend", writer_keys)
 
     def test_lifecycle_lease_is_explicitly_created_before_consumers(self) -> None:
         function_start = self.source.index("create_lifecycle_lease() {")
