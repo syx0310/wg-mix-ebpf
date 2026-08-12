@@ -200,6 +200,34 @@ class StaticMatrixTest(unittest.TestCase):
             re.compile(r"printf.*(?:key_a|key_b|key_path).*operations\\.log"),
         )
 
+    def test_single_endpoint_crash_waits_for_peer_idle_rehandshake(self) -> None:
+        for required in (
+            "readonly FAKETCP_HANDSHAKE_TIMEOUT='1s'",
+            "readonly FAKETCP_KEEPALIVE_INTERVAL='2s'",
+            "readonly FAKETCP_IDLE_TIMEOUT='6s'",
+            "readonly FAKETCP_RECOVERY_ATTEMPTS=15",
+            "for ((attempt=1; attempt<=FAKETCP_RECOVERY_ATTEMPTS; attempt++))",
+            '"ping-after-recovery-${index}-attempt-${attempt}"',
+            "((recovered == 1)) || exit 1",
+            '"ping-after-recovery-${index}"',
+        ):
+            self.assertIn(required, self.netns)
+        crash = self.netns.index('kill -KILL "${DAEMON_A_PID}"')
+        restart = self.netns.index('start_daemon a; wait_active a "${DAEMON_A_PID}"')
+        bounded_probe = self.netns.index(
+            "for ((attempt=1; attempt<=FAKETCP_RECOVERY_ATTEMPTS; attempt++))"
+        )
+        stable_probe = self.netns.index(
+            'log_command "ping-after-recovery-${index}"', bounded_probe
+        )
+        session_proof = self.netns.index('>"${EVIDENCE}/session-key-validation.log"')
+        self.assertLess(crash, restart)
+        self.assertLess(restart, bounded_probe)
+        self.assertLess(bounded_probe, stable_probe)
+        self.assertLess(stable_probe, session_proof)
+        self.assertIn("never\nevicts an established tuple", self.readme)
+        self.assertIn("successful new handshake", self.readme)
+
     def test_both_checksum_backends_verifier_sweep_before_network_mutation(self) -> None:
         sweep_command = (
             'log_command faketcp-verifier-sweep /usr/bin/timeout --signal=TERM'

@@ -76,6 +76,16 @@ explicitly disabled or enabled, and the resulting `ethtool -k` state is
 recorded and validated before traffic begins. RX checksum is not forced because
 WireGuard advertises it as fixed off on supported kernels.
 
+The functional harness uses a short but valid FakeTCP timing profile
+(`1s` handshake retry, `2s` keepalive, `6s` idle timeout) so single-endpoint
+crash recovery is testable without a two-minute cell delay. A live peer never
+evicts an established tuple merely on a new unauthenticated SYN. After endpoint
+A is killed and restarted, the harness therefore records every bounded probe
+while waiting for B's old fast session to expire, then requires both a
+successful new handshake and a stable three-packet ping. This preserves the
+production anti-SYN-eviction contract while proving recovery of a fresh runtime
+incarnation.
+
 WireGuard private keys are generated into unexported shell variables, used to
 derive the public keys, and streamed through anonymous pipes. No private-key
 path is created. Only the pipe crosses the `ip`/`wg` exec boundary, where `wg

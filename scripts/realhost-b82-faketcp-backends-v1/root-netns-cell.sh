@@ -25,9 +25,10 @@ readonly FAKETCP_SYN_SOURCE_LEDGER_TTL='5m'
 readonly FAKETCP_MAX_PENDING_FLOWS=128
 readonly FAKETCP_MAX_PENDING_PACKETS_PER_FLOW=2
 readonly FAKETCP_MAX_PENDING_BYTES=131072
-readonly FAKETCP_HANDSHAKE_TIMEOUT='5s'
-readonly FAKETCP_KEEPALIVE_INTERVAL='20s'
-readonly FAKETCP_IDLE_TIMEOUT='2m'
+readonly FAKETCP_HANDSHAKE_TIMEOUT='1s'
+readonly FAKETCP_KEEPALIVE_INTERVAL='2s'
+readonly FAKETCP_IDLE_TIMEOUT='6s'
+readonly FAKETCP_RECOVERY_ATTEMPTS=15
 PATH="${SAFE_PATH}"; LC_ALL=C; export PATH LC_ALL
 IFS=$' \t\n'; umask 077
 unset BASH_ENV CDPATH ENV GLOBIGNORE LD_LIBRARY_PATH LD_PRELOAD PYTHONHOME PYTHONPATH
@@ -1029,7 +1030,23 @@ start_daemon a; wait_active a "${DAEMON_A_PID}"
 run_cli a status status-a-recovered
 validate_status "${EVIDENCE}/status-a-recovered.stdout.log" >"${EVIDENCE}/status-a-recovered-validation.log"
 for ((index=0; index<WG_COUNT; index++)); do
+  recovered=0
   third=$((10 + index))
+  # The live peer deliberately refuses to evict an established tuple merely
+  # because it receives a new SYN: otherwise an unauthenticated SYN could
+  # tear down active WireGuard transport.  After one endpoint crashes, wait
+  # for that peer-owned fast session to reach the configured idle timeout and
+  # for the replacement daemon's bounded handshake retry to establish a new
+  # incarnation.  Every failed probe is retained instead of being hidden.
+  for ((attempt=1; attempt<=FAKETCP_RECOVERY_ATTEMPTS; attempt++)); do
+    if log_command "ping-after-recovery-${index}-attempt-${attempt}" \
+      ip netns exec "${NSA}" ping -I "wg${index}" -c 1 -W 1 "10.82.${third}.2"; then
+      recovered=1
+      break
+    fi
+    sleep 1
+  done
+  ((recovered == 1)) || exit 1
   log_command "ping-after-recovery-${index}" ip netns exec "${NSA}" \
     ping -I "wg${index}" -c 3 -W 2 "10.82.${third}.2"
 done
