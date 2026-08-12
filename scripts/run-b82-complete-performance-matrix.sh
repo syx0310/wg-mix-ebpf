@@ -190,13 +190,11 @@ cleanup_owned_module() {
     echo "error: matrix cleanup ownership root is invalid" >&2
     return 1
   fi
-  for receipt in "${MODULE_INTENT}"; do
-    if [[ ! -f "${receipt}" || -L "${receipt}" ||
-      "$(stat -c '%u:%g:%a:%h' -- "${receipt}")" != "0:0:600:1" ]]; then
-      echo "error: matrix cleanup receipt is unsafe: ${receipt}" >&2
-      return 1
-    fi
-  done
+  if [[ ! -f "${MODULE_INTENT}" || -L "${MODULE_INTENT}" ||
+    "$(stat -c '%u:%g:%a:%h' -- "${MODULE_INTENT}")" != "0:0:600:1" ]]; then
+    echo "error: matrix cleanup receipt is unsafe: ${MODULE_INTENT}" >&2
+    return 1
+  fi
   intent_stage="$(receipt_value source_stage_id "${MODULE_INTENT}")"
   intent_boot="$(receipt_value boot_id "${MODULE_INTENT}")"
   intent_commit="$(receipt_value commit "${MODULE_INTENT}")"
@@ -209,7 +207,7 @@ cleanup_owned_module() {
     "$(receipt_value run_id "${MODULE_INTENT}")" != "${matrix_id}" ||
     "${intent_stage}" != "${source_stage_id}" ||
     "${intent_boot}" != "$(</proc/sys/kernel/random/boot_id)" ||
-    "${intent_commit}" != "$(/usr/bin/git -C "${source_root}" rev-parse --verify HEAD^{commit})" ||
+    "${intent_commit}" != "$(/usr/bin/git -C "${source_root}" rev-parse --verify 'HEAD^{commit}')" ||
     "${intent_module}" != "${MODULE_NAME}" ||
     "${intent_lease}" != "${MODULE_LEASE_ID}" ||
     ! "${intent_sha}" =~ ^[0-9a-f]{64}$ ||
@@ -352,7 +350,7 @@ module_sha256="$(sha256sum -- "${module_object}" | awk '{print $1}')"
 module_srcversion="$(/usr/sbin/modinfo -F srcversion -- "${module_object}")"
 module_srcversion="${module_srcversion^^}"
 boot_id="$(</proc/sys/kernel/random/boot_id)"
-commit="$(/usr/bin/git -C "${source_root}" rev-parse --verify HEAD^{commit})"
+commit="$(/usr/bin/git -C "${source_root}" rev-parse --verify 'HEAD^{commit}')"
 if [[ ! "${module_sha256}" =~ ^[0-9a-f]{64}$ ||
   ! "${module_srcversion}" =~ ^[0-9A-F]{8,64}$ ||
   ! "${boot_id}" =~ ^[0-9a-f-]{36}$ || ! "${commit}" =~ ^[0-9a-f]{40}$ ]]; then
