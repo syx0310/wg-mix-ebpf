@@ -23,6 +23,47 @@ type experimentalCollectionAcquisitionDependencies struct {
 	closeUnownedCollection func(*ebpf.Collection) error
 }
 
+// fakeTCPCollectionManifest binds an object family to the exact manifest it
+// must satisfy before collection creation. Keeping this as data carried into
+// acquisition prevents a production-selected legacy object from being
+// reinterpreted as a modern object at the later verifier-load boundary.
+type fakeTCPCollectionManifest struct {
+	objectVariant string
+	kind          string
+	validate      func(*ebpf.CollectionSpec) error
+}
+
+func experimentalFakeTCPCollectionManifest() fakeTCPCollectionManifest {
+	return fakeTCPCollectionManifest{
+		objectVariant: FakeTCPObjectVariantModernKfunc,
+		kind:          "experimental FakeTCP",
+		validate:      validateExperimentalExtensionManifest,
+	}
+}
+
+func legacy515FakeTCPCollectionManifest() fakeTCPCollectionManifest {
+	return fakeTCPCollectionManifest{
+		objectVariant: FakeTCPObjectVariantLegacy515,
+		kind:          legacy515FakeTCPObjectKind,
+		validate:      validateLegacy515ExtensionManifest,
+	}
+}
+
+func fakeTCPCollectionManifestForObjectVariant(
+	variant string,
+) (fakeTCPCollectionManifest, error) {
+	switch variant {
+	case FakeTCPObjectVariantModernKfunc:
+		return experimentalFakeTCPCollectionManifest(), nil
+	case FakeTCPObjectVariantLegacy515:
+		return legacy515FakeTCPCollectionManifest(), nil
+	default:
+		return fakeTCPCollectionManifest{}, fmt.Errorf(
+			"unsupported FakeTCP object variant %q", variant,
+		)
+	}
+}
+
 func liveExperimentalCollectionAcquisitionDependencies() experimentalCollectionAcquisitionDependencies {
 	return experimentalCollectionAcquisitionDependencies{
 		probeKernelDependency: probeExperimentalFakeTCPKernelDependency,
@@ -54,14 +95,36 @@ func acquireExperimentalFakeTCPCollection(
 	source string,
 	dependencies experimentalCollectionAcquisitionDependencies,
 ) (*experimentalCollectionOwner, error) {
+	return acquireFakeTCPCollection(
+		ctx,
+		spec,
+		source,
+		experimentalFakeTCPCollectionManifest(),
+		dependencies,
+	)
+}
+
+// acquireFakeTCPCollection validates and verifier-loads an unpinned FakeTCP
+// collection with the manifest selected by its caller. The caller must bind
+// that manifest to the immutable object variant before this boundary.
+func acquireFakeTCPCollection(
+	ctx context.Context,
+	spec *ebpf.CollectionSpec,
+	source string,
+	manifest fakeTCPCollectionManifest,
+	dependencies experimentalCollectionAcquisitionDependencies,
+) (*experimentalCollectionOwner, error) {
 	if ctx == nil {
-		return nil, errors.New("acquire experimental FakeTCP BPF collection: context is nil")
+		return nil, fmt.Errorf("acquire %s BPF collection: context is nil", manifest.kind)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if err := validateExperimentalExtensionManifest(spec); err != nil {
-		return nil, fmt.Errorf("validate experimental FakeTCP BPF object %s: %w", source, err)
+	if manifest.kind == "" || manifest.validate == nil {
+		return nil, errors.New("acquire FakeTCP BPF collection: no manifest validator")
+	}
+	if err := manifest.validate(spec); err != nil {
+		return nil, fmt.Errorf("validate %s BPF object %s: %w", manifest.kind, source, err)
 	}
 	if err := ctx.Err(); err != nil {
 		return nil, err

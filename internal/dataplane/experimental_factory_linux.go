@@ -31,10 +31,32 @@ func acquireAndBuildExperimentalFakeTCPRuntime(
 	dependencies experimentalCollectionAcquisitionDependencies,
 	buildOptions experimentalFakeTCPRuntimeBuildOptions,
 ) (*ExperimentalFakeTCPRuntime, error) {
-	return acquireAndBuildExperimentalFakeTCPRuntimeWithBuilder(
+	return acquireAndBuildFakeTCPRuntimeWithManifest(
 		ctx,
 		spec,
 		source,
+		experimentalFakeTCPCollectionManifest(),
+		dependencies,
+		buildOptions,
+	)
+}
+
+// acquireAndBuildFakeTCPRuntimeWithManifest preserves the object-family
+// choice through the final collection acquisition. Production must use this
+// entrypoint after resolving its checksum backend and object variant.
+func acquireAndBuildFakeTCPRuntimeWithManifest(
+	ctx context.Context,
+	spec *ebpf.CollectionSpec,
+	source string,
+	manifest fakeTCPCollectionManifest,
+	dependencies experimentalCollectionAcquisitionDependencies,
+	buildOptions experimentalFakeTCPRuntimeBuildOptions,
+) (*ExperimentalFakeTCPRuntime, error) {
+	return acquireAndBuildFakeTCPRuntimeWithManifestAndBuilder(
+		ctx,
+		spec,
+		source,
+		manifest,
 		dependencies,
 		buildOptions,
 		buildExperimentalFakeTCPRuntime,
@@ -47,12 +69,32 @@ type experimentalFakeTCPRuntimeBuilder func(
 ) (*ExperimentalFakeTCPRuntime, error)
 
 // acquireAndBuildExperimentalFakeTCPRuntimeWithBuilder exposes only the final
-// builder call as a package-local test seam. The production entrypoint above
-// always supplies buildExperimentalFakeTCPRuntime.
+// builder call as a package-local test seam for the modern object family.
+// Production uses the variant-bound entrypoint above instead.
 func acquireAndBuildExperimentalFakeTCPRuntimeWithBuilder(
 	ctx context.Context,
 	spec *ebpf.CollectionSpec,
 	source string,
+	dependencies experimentalCollectionAcquisitionDependencies,
+	buildOptions experimentalFakeTCPRuntimeBuildOptions,
+	builder experimentalFakeTCPRuntimeBuilder,
+) (*ExperimentalFakeTCPRuntime, error) {
+	return acquireAndBuildFakeTCPRuntimeWithManifestAndBuilder(
+		ctx,
+		spec,
+		source,
+		experimentalFakeTCPCollectionManifest(),
+		dependencies,
+		buildOptions,
+		builder,
+	)
+}
+
+func acquireAndBuildFakeTCPRuntimeWithManifestAndBuilder(
+	ctx context.Context,
+	spec *ebpf.CollectionSpec,
+	source string,
+	manifest fakeTCPCollectionManifest,
 	dependencies experimentalCollectionAcquisitionDependencies,
 	buildOptions experimentalFakeTCPRuntimeBuildOptions,
 	builder experimentalFakeTCPRuntimeBuilder,
@@ -129,7 +171,7 @@ func acquireAndBuildExperimentalFakeTCPRuntimeWithBuilder(
 	}
 
 	var err error
-	owner, err = acquireExperimentalFakeTCPCollection(ctx, spec, source, dependencies)
+	owner, err = acquireFakeTCPCollection(ctx, spec, source, manifest, dependencies)
 	if err != nil {
 		return nil, err
 	}

@@ -120,6 +120,51 @@ func TestExperimentalCollectionAcquisitionTransfersSoleOwnership(t *testing.T) {
 	}
 }
 
+func TestFakeTCPCollectionAcquisitionUsesVariantBoundManifest(t *testing.T) {
+	legacyManifest, err := fakeTCPCollectionManifestForObjectVariant(
+		FakeTCPObjectVariantLegacy515,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture := newExperimentalAcquisitionFixture()
+	owner, err := acquireFakeTCPCollection(
+		t.Context(),
+		canonicalLegacy515CollectionSpec(),
+		"/reviewed/legacy-515.o",
+		legacyManifest,
+		fixture.dependencies(t),
+	)
+	if err != nil {
+		t.Fatalf("legacy acquisition rejected its selected object family: %v", err)
+	}
+	if err := owner.Close(); err != nil {
+		t.Fatalf("close acquired legacy collection owner: %v", err)
+	}
+
+	modernManifest, err := fakeTCPCollectionManifestForObjectVariant(
+		FakeTCPObjectVariantModernKfunc,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = acquireFakeTCPCollection(
+		t.Context(),
+		canonicalLegacy515CollectionSpec(),
+		"/reviewed/legacy-515.o",
+		modernManifest,
+		newExperimentalAcquisitionFixture().dependencies(t),
+	)
+	if err == nil || !strings.Contains(err.Error(), "validate experimental FakeTCP BPF object") {
+		t.Fatalf("modern manifest accepted legacy object or lost exact diagnostic: %v", err)
+	}
+
+	if _, err := fakeTCPCollectionManifestForObjectVariant("unreviewed"); err == nil ||
+		!strings.Contains(err.Error(), "unsupported FakeTCP object variant") {
+		t.Fatalf("unknown object variant did not fail closed: %v", err)
+	}
+}
+
 func TestExperimentalVerifierLoadReusesAcquisitionThenExplicitlyCloses(t *testing.T) {
 	spec := canonicalExperimentalCollectionSpec()
 	fixture := newExperimentalAcquisitionFixture()

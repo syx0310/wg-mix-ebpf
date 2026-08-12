@@ -204,7 +204,10 @@ func TestNewProductionLoaderFreezesEnvironmentBackedScopeSelectors(t *testing.T)
 }
 
 func TestExperimentalProductionPlannerInjectsRequestAndFactory(t *testing.T) {
-	request := &experimentalFakeTCPProductionRequest{key: fakeTCPRuntimeDesiredKey{7}}
+	request := &experimentalFakeTCPProductionRequest{
+		key:      fakeTCPRuntimeDesiredKey{7},
+		manifest: experimentalFakeTCPCollectionManifest(),
+	}
 	runtime := newControlledFakeTCPRuntime()
 	baseline := LinuxLoader{ObjectPath: "/baseline-test.o", PinPath: "/baseline-test"}
 	requestCalls := 0
@@ -250,6 +253,39 @@ func TestExperimentalProductionPlannerInjectsRequestAndFactory(t *testing.T) {
 			"injected production path: runtime=%T request calls=%d factory calls=%d",
 			gotRuntime, requestCalls, factoryCalls,
 		)
+	}
+}
+
+func TestProductionRuntimeAcquisitionBindsLegacySelectionToLegacyManifest(t *testing.T) {
+	selection := fakeTCPProductionTestChecksumSelection(
+		config.FakeTCPChecksumBackendKprobe,
+		config.FakeTCPChecksumBackendKprobe,
+	)
+	mismatched := &experimentalFakeTCPProductionRequest{
+		checksum: selection,
+		manifest: experimentalFakeTCPCollectionManifest(),
+	}
+	if runtime, err := acquireExperimentalFakeTCPProductionRuntime(t.Context(), mismatched); runtime != nil ||
+		err == nil || !strings.Contains(err.Error(), "request manifest does not match checksum object variant") {
+		t.Fatalf("legacy selection accepted modern request manifest: runtime=%#v err=%v", runtime, err)
+	}
+
+	fixture := newExperimentalAcquisitionFixture()
+	request := &experimentalFakeTCPProductionRequest{
+		spec:         canonicalLegacy515CollectionSpec(),
+		source:       "/reviewed/legacy-515.o",
+		checksum:     selection,
+		manifest:     legacy515FakeTCPCollectionManifest(),
+		dependencies: fixture.dependencies(t),
+	}
+	runtime, err := acquireExperimentalFakeTCPProductionRuntime(t.Context(), request)
+	if runtime != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
+		t.Fatalf("legacy selection did not reach its own acquisition path: runtime=%#v err=%v", runtime, err)
+	}
+	if got := fixture.order; len(got) < 5 || got[0] != "kernel-dependency" ||
+		got[1] != "remove-memlock" || got[2] != "new-collection" ||
+		got[3] != "new-owner" || got[4] != "owned" {
+		t.Fatalf("legacy acquisition order = %v, want verifier load then owned cleanup", got)
 	}
 }
 

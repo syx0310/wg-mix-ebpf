@@ -40,6 +40,7 @@ type experimentalFakeTCPProductionRequest struct {
 	source       string
 	object       ObjectIdentity
 	checksum     *FakeTCPChecksumSelection
+	manifest     fakeTCPCollectionManifest
 	dependencies experimentalCollectionAcquisitionDependencies
 	buildOptions experimentalFakeTCPRuntimeBuildOptions
 	prepare      func(context.Context) error
@@ -329,10 +330,24 @@ func acquireExperimentalFakeTCPProductionRuntime(
 	if request == nil {
 		return nil, errors.New("acquire production experimental FakeTCP runtime: request is nil")
 	}
-	runtime, err := acquireAndBuildExperimentalFakeTCPRuntime(
+	if request.checksum == nil {
+		return nil, errors.New("acquire production experimental FakeTCP runtime: checksum selection is nil")
+	}
+	manifest, err := fakeTCPCollectionManifestForObjectVariant(request.checksum.ObjectVariant)
+	if err != nil {
+		return nil, fmt.Errorf("acquire production experimental FakeTCP runtime: %w", err)
+	}
+	if request.manifest.objectVariant != manifest.objectVariant ||
+		request.manifest.kind != manifest.kind || request.manifest.validate == nil {
+		return nil, errors.New(
+			"acquire production experimental FakeTCP runtime: request manifest does not match checksum object variant",
+		)
+	}
+	runtime, err := acquireAndBuildFakeTCPRuntimeWithManifest(
 		ctx,
 		request.spec,
 		request.source,
+		manifest,
 		request.dependencies,
 		request.buildOptions,
 	)
@@ -670,6 +685,10 @@ func buildLiveExperimentalFakeTCPProductionRequest(
 			selectedVariant, checksum.ObjectVariant,
 		)
 	}
+	manifest, err := fakeTCPCollectionManifestForObjectVariant(checksum.ObjectVariant)
+	if err != nil {
+		return nil, err
+	}
 	var spec *ebpf.CollectionSpec
 	var identity ObjectIdentity
 	switch checksum.ObjectVariant {
@@ -763,6 +782,7 @@ func buildLiveExperimentalFakeTCPProductionRequest(
 		source:       identity.Source,
 		object:       identity,
 		checksum:     checksum,
+		manifest:     manifest,
 		dependencies: dependencies,
 		prepare:      prepare,
 		buildOptions: experimentalFakeTCPRuntimeBuildOptions{
