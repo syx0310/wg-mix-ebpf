@@ -110,11 +110,25 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 		"static __always_inline int faketcp_xdp_managed_interface(")
 	copyProof := strings.Index(ingressConsume, "consumed = *metadata")
 	clearMagic := strings.Index(ingressConsume, "metadata->magic = 0")
-	gsoReject := strings.Index(ingressConsume, "if (skb->gso_segs || skb->gso_size)")
+	gsoReject := strings.Index(ingressConsume, "if (skb->gso_size)")
 	compare := strings.Index(ingressConsume, "admission->key.generation != generation")
 	if copyProof < 0 || clearMagic < 0 || gsoReject < 0 || compare < 0 ||
 		!(copyProof < clearMagic && clearMagic < gsoReject && gsoReject < compare) {
 		t.Fatal("TC ingress must copy and invalidate metadata before the exclusive GSO gate and proof comparison")
+	}
+}
+
+func TestFakeTCPUsesKernelGSOSemanticsInsteadOfRawSegmentCount(t *testing.T) {
+	for _, path := range []string{"../../bpf/wg_mix_tc.c", "../../bpf/wg_mix_faketcp.h"} {
+		source, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		text := string(source)
+		if strings.Contains(text, "skb->gso_segs || skb->gso_size") ||
+			strings.Contains(text, "skb->gso_size || skb->gso_segs") {
+			t.Fatalf("%s treats the informational gso_segs field as proof of GSO", path)
+		}
 	}
 }
 

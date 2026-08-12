@@ -1822,7 +1822,7 @@ static __always_inline int faketcp_authorize_userspace_control(
 	ip_protocol = iph->protocol;
 	if (ip_protocol != IPPROTO_TCP)
 		return 0;
-	if (skb->gso_segs || skb->gso_size || network_off > skb->len ||
+	if (skb->gso_size || network_off > skb->len ||
 	    sizeof(*headers) != skb->len - network_off)
 		return -1;
 
@@ -1988,7 +1988,7 @@ static __always_inline int run_xor_egress_segment(struct __sk_buff *skb, __u32 s
 #endif
 	clear_xor_context(skb);
 	inc_stat(STAT_EGRESS_REWRITE_OK);
-	if (skb->gso_segs || skb->gso_size)
+	if (skb->gso_size)
 		inc_stat(STAT_EGRESS_GSO_REWRITE_OK);
 	return TC_ACT_OK;
 }
@@ -2027,7 +2027,7 @@ static __always_inline int run_xor_ingress_segment(struct __sk_buff *skb, __u32 
 	clear_xor_context(skb);
 	inc_stat(STAT_INGRESS_REWRITE_OK);
 	inc_stat(STAT_XOR_INGRESS_OK);
-	if (skb->gso_segs || skb->gso_size)
+	if (skb->gso_size)
 		inc_stat(STAT_INGRESS_GSO_REWRITE_OK);
 	return TC_ACT_OK;
 }
@@ -2101,7 +2101,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 	info = &faketcp_packet->info;
 	__builtin_memset(faketcp_packet, 0, sizeof(*faketcp_packet));
 #endif
-	if (skb->gso_segs || skb->gso_size) {
+	if (skb->gso_size) {
 		gso_seen = 1;
 		inc_stat(STAT_EGRESS_GSO_SEEN);
 	}
@@ -2336,7 +2336,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 
 	if (!active_generation(&generation))
 		return TC_ACT_OK;
-	if (skb->gso_segs || skb->gso_size) {
+	if (skb->gso_size) {
 		gso_seen = 1;
 		inc_stat(STAT_INGRESS_GSO_SEEN);
 	}

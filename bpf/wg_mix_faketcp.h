@@ -2202,7 +2202,7 @@ static __always_inline int faketcp_egress_admission_matches(
 	__be32 local_ipv4;
 	__be32 remote_ipv4;
 	__u8 expected_xor_checksum_mode = XOR_CSUM_NONE;
-	int is_gso = skb->gso_segs || skb->gso_size;
+	int is_gso = skb->gso_size != 0;
 
 	if (!info || !l3 || faketcp_managed_transform_status(l3, IPPROTO_UDP) !=
 				   FAKETCP_L3_OK ||
@@ -2363,7 +2363,7 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 	__u16 udp_len;
 	__be32 local_ipv4;
 	__be32 remote_ipv4;
-	int is_gso = skb->gso_segs || skb->gso_size;
+	int is_gso = skb->gso_size != 0;
 
 	if (!scratch || !info || parser_classification != PARSE_OK || !l3 ||
 	    l3->l3_off != info->ip_off || l3->l4_off != info->udp_off ||
@@ -3474,7 +3474,7 @@ static __always_inline int faketcp_consume_ingress_admission(
 	}
 	// Until a separately reviewed per-segment path exists, both GSO and GRO
 	// coalescing are one capability failure with one counter classification.
-	if (skb->gso_segs || skb->gso_size) {
+	if (skb->gso_size) {
 		inc_faketcp_stat(FAKETCP_STAT_GSO_REJECT);
 		return -1;
 	}
