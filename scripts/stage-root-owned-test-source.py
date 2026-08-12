@@ -15,7 +15,7 @@ from collections.abc import Callable, Sequence
 from typing import BinaryIO, TypeVar
 
 
-STAGE_PREFIX = "/run/wg-mix-ebpf-source-stages"
+STAGE_PREFIX = "/var/tmp/wg-mix-ebpf-source-stages"
 BOOTSTRAP_PREFIX = "/run/wg-mix-ebpf-source-bootstrap"
 MAX_BUNDLE_BYTES = 1024 * 1024 * 1024
 FIXED_PATH = "/usr/bin:/bin"
@@ -657,13 +657,14 @@ def stage_source(
     run_parent = os.path.dirname(STAGE_PREFIX)
     run_parent_metadata = os.lstat(run_parent)
     if (
-        not stat.S_ISDIR(run_parent_metadata.st_mode)
+        run_parent != "/var/tmp"
+        or not stat.S_ISDIR(run_parent_metadata.st_mode)
         or run_parent_metadata.st_uid != 0
         or run_parent_metadata.st_gid != 0
-        or stat.S_IMODE(run_parent_metadata.st_mode) & 0o022
+        or stat.S_IMODE(run_parent_metadata.st_mode) != 0o1777
         or os.path.realpath(run_parent) != run_parent
     ):
-        raise StageError("fixed /run parent is unsafe")
+        raise StageError("fixed /var/tmp parent is unsafe")
 
     source_fd, source_metadata = open_verified_bundle(bundle, bundle_sha256)
     audit = Audit()

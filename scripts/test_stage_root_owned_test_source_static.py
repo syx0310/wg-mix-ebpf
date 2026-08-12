@@ -117,7 +117,7 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
         ):
             self.assertLess(cleanup.index(preflight), first_delete)
         filesystem_preflight = cleanup[
-            cleanup.index('readonly run_device=') : first_delete
+            cleanup.index('readonly stage_device=') : first_delete
         ]
         self.assertNotIn("-type d", filesystem_preflight)
 
@@ -422,7 +422,7 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
 
     def test_production_scope_is_fixed_and_root_only(self) -> None:
         self.assertIn(
-            'STAGE_PREFIX = "/run/wg-mix-ebpf-source-stages"',
+            'STAGE_PREFIX = "/var/tmp/wg-mix-ebpf-source-stages"',
             self.helper,
         )
         self.assertIn('if os.geteuid() != 0:', self.helper)
@@ -449,7 +449,8 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
             "metadata.st_uid != 0 or metadata.st_gid != 0",
             "digest, metadata = open_hashed_file(path, 0, 0)",
             "run_parent_metadata.st_gid != 0",
-            "stat.S_IMODE(run_parent_metadata.st_mode) & 0o022",
+            'run_parent != "/var/tmp"',
+            "stat.S_IMODE(run_parent_metadata.st_mode) != 0o1777",
             "permission_bits & 0o6000",
         )
         for fragment in required:

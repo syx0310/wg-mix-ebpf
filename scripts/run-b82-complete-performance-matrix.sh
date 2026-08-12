@@ -41,7 +41,7 @@ else
   exit 1
 fi
 source_root="${script_path%/"${STAGED_NAME}"}"
-if [[ ! "${source_root}" =~ ^/run/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ ]]; then
+if [[ ! "${source_root}" =~ ^/var/tmp/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ ]]; then
   echo 'error: matrix must run from a root-owned source stage' >&2
   exit 1
 fi
@@ -93,13 +93,13 @@ readonly CHILD_PARENT="${MATRIX_ROOT}/children"
 readonly CELL_INDEX="${MATRIX_ROOT}/cells.v1.tsv"
 readonly PLAN_INDEX="${MATRIX_ROOT}/plan.v1.tsv"
 readonly ARTIFACT_MANIFEST="${MATRIX_ROOT}/artifacts.v1"
-stage_id="${SOURCE_ROOT#'/run/wg-mix-ebpf-source-stages/'}"
+stage_id="${SOURCE_ROOT#'/var/tmp/wg-mix-ebpf-source-stages/'}"
 stage_id="${stage_id%'/source'}"
 readonly STAGE_ID="${stage_id}"
 readonly BUILD_CACHE_ROOT="${MATRIX_ROOT}/build-cache"
-readonly STAGE_GO_CACHE="/run/wg-mix-ebpf-source-stages/${STAGE_ID}/go-cache"
+readonly STAGE_GO_CACHE="/var/tmp/wg-mix-ebpf-source-stages/${STAGE_ID}/go-cache"
 readonly GO_CACHE="${STAGE_GO_CACHE}"
-readonly GO_MOD_CACHE="/run/wg-mix-ebpf-source-stages/${STAGE_ID}/go-mod-cache"
+readonly GO_MOD_CACHE="/var/tmp/wg-mix-ebpf-source-stages/${STAGE_ID}/go-mod-cache"
 readonly GO_PATH="${BUILD_CACHE_ROOT}/go-path"
 readonly GO_TMP="${BUILD_CACHE_ROOT}/go-tmp"
 readonly GO_OVERLAY="${BUILD_CACHE_ROOT}/frozen-bpf-overlay.json"

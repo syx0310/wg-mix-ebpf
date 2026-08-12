@@ -22,7 +22,7 @@ ATTACHMENT_BACKEND='' CHECKSUM_BACKEND='' ARTIFACT='' XOR_MODE='' GSO_MODE=''
 
 usage() {
   printf '%s\n' \
-    "usage: ${SELF_REL} {plan|run|restore} --source /run/wg-mix-ebpf-source-stages/<8hex>/source --commit <40hex> --run-id <8hex> --label <label> --wg-count <1|2|4> --attachment-backend <tcx|classic_tc> --checksum-backend <kfunc|kprobe> --artifact <modern|legacy_515> --xor <none|prefix|full> --gso <off|on>" >&2
+    "usage: ${SELF_REL} {plan|run|restore} --source /var/tmp/wg-mix-ebpf-source-stages/<8hex>/source --commit <40hex> --run-id <8hex> --label <label> --wg-count <1|2|4> --attachment-backend <tcx|classic_tc> --checksum-backend <kfunc|kprobe> --artifact <modern|legacy_515> --xor <none|prefix|full> --gso <off|on>" >&2
 }
 
 fail() {
@@ -53,7 +53,7 @@ parse_args() {
     esac
     shift 2
   done
-  [[ "${SOURCE}" =~ ^/run/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ &&
+  [[ "${SOURCE}" =~ ^/var/tmp/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ &&
     "${COMMIT}" =~ ^[0-9a-f]{40}$ && "${COMMIT}" != 0000000000000000000000000000000000000000 &&
     "${RUN_ID}" =~ ^[0-9a-f]{8}$ && "${LABEL}" =~ ^[a-z0-9_-]{1,96}$ &&
     "${WG_COUNT}" =~ ^(1|2|4)$ && "${ATTACHMENT_BACKEND}" =~ ^(tcx|classic_tc)$ &&
@@ -66,10 +66,10 @@ parse_args() {
 parse_rc=0
 parse_args "$@" || parse_rc=$?
 if ((parse_rc != 0)); then usage; exit "${parse_rc}"; fi
-stage_id_value="${SOURCE#'/run/wg-mix-ebpf-source-stages/'}"
+stage_id_value="${SOURCE#'/var/tmp/wg-mix-ebpf-source-stages/'}"
 stage_id_value="${stage_id_value%'/source'}"
 readonly STAGE_ID="${stage_id_value}"
-readonly STAGE_ROOT="/run/wg-mix-ebpf-source-stages/${STAGE_ID}"
+readonly STAGE_ROOT="/var/tmp/wg-mix-ebpf-source-stages/${STAGE_ID}"
 readonly EVIDENCE_ROOT="${RUN_PARENT}/${RUN_ID}"
 readonly EVIDENCE="${EVIDENCE_ROOT}/evidence"
 readonly OWNER="${EVIDENCE_ROOT}/owner.v1"

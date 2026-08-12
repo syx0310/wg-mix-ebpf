@@ -47,7 +47,7 @@ endpoint_child() {
     esac
     shift 2
   done
-  [[ "${source}" =~ ^/run/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ ]] || return 65
+  [[ "${source}" =~ ^/var/tmp/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ ]] || return 65
   validate_run_id "${run_id}" || return 65
   [[ "${role}" =~ ^(a|b)$ ]] || return 65
   local root="${RUN_PARENT}/${run_id}" endpoint="${RUN_PARENT}/${run_id}/endpoint-${role}"
@@ -111,7 +111,7 @@ parse_args() {
     esac
     shift 2
   done
-  [[ "${SOURCE}" =~ ^/run/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ &&
+  [[ "${SOURCE}" =~ ^/var/tmp/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ &&
     "${COMMIT}" =~ ^[0-9a-f]{40}$ && "${RUN_ID}" =~ ^[0-9a-f]{8}$ &&
     "${LABEL}" =~ ^[a-z0-9_-]{1,96}$ && "${WG_COUNT}" =~ ^(1|2|4)$ &&
     "${ATTACHMENT_BACKEND}" =~ ^(tcx|classic_tc)$ &&
@@ -123,10 +123,10 @@ parse_rc=0
 parse_args "$@" || parse_rc=$?
 if ((parse_rc != 0)); then exit "${parse_rc}"; fi
 
-stage_id_value="${SOURCE#'/run/wg-mix-ebpf-source-stages/'}"
+stage_id_value="${SOURCE#'/var/tmp/wg-mix-ebpf-source-stages/'}"
 stage_id_value="${stage_id_value%'/source'}"
 readonly STAGE_ID="${stage_id_value}"
-readonly STAGE_ROOT="/run/wg-mix-ebpf-source-stages/${STAGE_ID}"
+readonly STAGE_ROOT="/var/tmp/wg-mix-ebpf-source-stages/${STAGE_ID}"
 readonly ROOT="${RUN_PARENT}/${RUN_ID}"
 readonly EVIDENCE="${ROOT}/evidence"
 readonly ARTIFACT_ROOT="${ROOT}/artifacts"

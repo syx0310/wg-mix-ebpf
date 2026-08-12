@@ -176,7 +176,7 @@ validate_private_mountns_launch() {
     ! "${expected_script_ino}" =~ ^[1-9][0-9]*$ ||
     ! "${expected_script_sha256}" =~ ^[0-9a-f]{64}$ ||
     ! "${expected_source_commit}" =~ ^[0-9a-f]{40}$ ||
-    ! "${ROOT}" =~ ^/run/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ ||
+    ! "${ROOT}" =~ ^/var/tmp/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ ||
     -L "${ROOT}" || ! -d "${ROOT}" ||
     "$(/usr/bin/realpath -e -- "${ROOT}")" != "${ROOT}" ||
     "${BASH_SOURCE[0]}" != "/proc/self/fd/${script_fd}" ]]; then

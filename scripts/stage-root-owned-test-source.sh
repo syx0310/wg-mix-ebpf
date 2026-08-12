@@ -20,7 +20,7 @@ readonly BOOTSTRAP_PREFIX="/run/wg-mix-ebpf-source-bootstrap"
 readonly LAUNCHER_BASENAME="stage-root-owned-test-source.sh"
 readonly HELPER_BASENAME="stage-root-owned-test-source.py"
 readonly MANIFEST_BASENAME="stage-root-owned-test-source.bootstrap"
-readonly EXPECTED_HELPER_SHA256="b4b435b1a4d26f32b93e459585ed090e4a6838e076e88c7dc339c3ad39f53067"
+readonly EXPECTED_HELPER_SHA256="3b5a7f552868e570b3987aafa309521ba2f77b48ec4d88a0d7aff00e878ba1df"
 export PATH LC_ALL
 unset CDPATH
 umask 077

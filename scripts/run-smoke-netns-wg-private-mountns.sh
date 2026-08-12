@@ -68,7 +68,7 @@ else
   exit 1
 fi
 source_root="${launcher_path%/"${STAGED_LAUNCHER_NAME}"}"
-if [[ ! "${source_root}" =~ ^/run/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ ]]; then
+if [[ ! "${source_root}" =~ ^/var/tmp/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source$ ]]; then
   echo "error: WG smoke must run from a run-bound root-owned source stage" >&2
   exit 1
 fi

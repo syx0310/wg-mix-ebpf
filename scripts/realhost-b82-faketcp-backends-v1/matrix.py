@@ -18,7 +18,7 @@ import sys
 from dataclasses import asdict, dataclass
 
 
-STAGE_RE = re.compile(r"/run/wg-mix-ebpf-source-stages/([0-9a-f]{8})/source")
+STAGE_RE = re.compile(r"/var/tmp/wg-mix-ebpf-source-stages/([0-9a-f]{8})/source")
 HEX40_RE = re.compile(r"[0-9a-f]{40}")
 RUN_RE = re.compile(r"[0-9a-f]{8}")
 RUN_PARENT = pathlib.Path("/var/tmp/wg-mix-ebpf-faketcp-backends-v1")

@@ -4,7 +4,7 @@ set -euo pipefail
 
 readonly PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 readonly LC_ALL='C'
-readonly STAGE_PREFIX='/run/wg-mix-ebpf-source-stages'
+readonly STAGE_PREFIX='/var/tmp/wg-mix-ebpf-source-stages'
 readonly BOOTSTRAP_PREFIX='/run/wg-mix-ebpf-source-bootstrap'
 
 export PATH LC_ALL
@@ -184,14 +184,17 @@ if [[ -n "${legacy_inspect_sha256}" ]]; then
   }
 fi
 
-readonly run_device="$(/usr/bin/stat -c '%d' -- /run)"
-for target in "${stage}" "${bootstrap}"; do
-  [[ "$(/usr/bin/stat -c '%d' -- "${target}")" == "${run_device}" ]] || {
-    printf 'error: cleanup target is outside the /run filesystem: %s\n' "${target}" >&2
+readonly stage_device="$(/usr/bin/stat -c '%d' -- /var/tmp)"
+readonly bootstrap_device="$(/usr/bin/stat -c '%d' -- /run)"
+for target_and_device in "${stage}:${stage_device}" "${bootstrap}:${bootstrap_device}"; do
+  target="${target_and_device%:*}"
+  expected_device="${target_and_device##*:}"
+  [[ "$(/usr/bin/stat -c '%d' -- "${target}")" == "${expected_device}" ]] || {
+    printf 'error: cleanup target is outside its fixed filesystem: %s\n' "${target}" >&2
     exit 66
   }
   if /usr/bin/find "${target}" -xdev -mindepth 1 -exec /usr/bin/stat -c '%d' -- '{}' + |
-      /usr/bin/grep -Fvxq "${run_device}"; then
+      /usr/bin/grep -Fvxq "${expected_device}"; then
     printf 'error: cleanup target crosses a filesystem boundary: %s\n' "${target}" >&2
     exit 66
   fi

@@ -5,7 +5,7 @@ controlled `192.168.10.82` host. It does not contain SSH or credentials and
 must be executed from an exact root-owned source stage:
 
 ```text
-/run/wg-mix-ebpf-source-stages/<8hex>/source
+/var/tmp/wg-mix-ebpf-source-stages/<8hex>/source
 ```
 
 Entry points:
@@ -38,17 +38,17 @@ eight-hex matrix ID):
 
 ```bash
 /usr/bin/python3 -B -I \
-  "/run/wg-mix-ebpf-source-stages/<stage-id>/source/scripts/realhost-b82-faketcp-backends-v1/matrix.py" \
+  "/var/tmp/wg-mix-ebpf-source-stages/<stage-id>/source/scripts/realhost-b82-faketcp-backends-v1/matrix.py" \
   plan \
-  --source "/run/wg-mix-ebpf-source-stages/<stage-id>/source" \
+  --source "/var/tmp/wg-mix-ebpf-source-stages/<stage-id>/source" \
   --commit "<40-lowercase-hex>" \
   --kernel-release "$(uname -r)" \
   --matrix-id "<8-lowercase-hex>"
 
 /usr/bin/python3 -B -I \
-  "/run/wg-mix-ebpf-source-stages/<stage-id>/source/scripts/realhost-b82-faketcp-backends-v1/matrix.py" \
+  "/var/tmp/wg-mix-ebpf-source-stages/<stage-id>/source/scripts/realhost-b82-faketcp-backends-v1/matrix.py" \
   run \
-  --source "/run/wg-mix-ebpf-source-stages/<stage-id>/source" \
+  --source "/var/tmp/wg-mix-ebpf-source-stages/<stage-id>/source" \
   --commit "<40-lowercase-hex>" \
   --kernel-release "$(uname -r)" \
   --matrix-id "<8-lowercase-hex>"

@@ -210,7 +210,7 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
             "GOCACHE=\"${GO_CACHE}\"",
             "GOMODCACHE=\"${GO_MOD_CACHE}\"",
             "GOTELEMETRY=off",
-            'readonly STAGE_GO_CACHE="/run/wg-mix-ebpf-source-stages/${STAGE_ID}/go-cache"',
+            'readonly STAGE_GO_CACHE="/var/tmp/wg-mix-ebpf-source-stages/${STAGE_ID}/go-cache"',
             "GOTMPDIR=\"${GO_TMP}\"",
             "-Wno-unused-function -target bpf",
             "binary-source-identity.log",

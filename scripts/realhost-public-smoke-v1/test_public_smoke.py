@@ -711,7 +711,7 @@ class PublicSmokeTest(unittest.TestCase):
         self.assertIn("match_max -i $child_id $capture_limit", transport)
         self.assertIn("set timeout 1900", transport)
         self.assertIn(
-            r"^/run/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source/scripts/run-b82-complete-performance-matrix\.sh$",
+            r"^/var/tmp/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source/scripts/run-b82-complete-performance-matrix\.sh$",
             transport,
         )
         self.assertIn("set timeout 4000", transport)
