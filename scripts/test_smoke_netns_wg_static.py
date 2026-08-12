@@ -15,6 +15,9 @@ SCRIPT_PATH = pathlib.Path(__file__).with_name("smoke-netns-wg.sh")
 MOUNTNS_LAUNCHER_PATH = pathlib.Path(__file__).with_name(
     "run-smoke-netns-wg-private-mountns.sh"
 )
+PERFORMANCE_MATRIX_PATH = pathlib.Path(__file__).with_name(
+    "run-b82-complete-performance-matrix.sh"
+)
 MAKEFILE_PATH = SCRIPT_PATH.parent.parent / "Makefile"
 GO_MOD_PATH = SCRIPT_PATH.parent.parent / "go.mod"
 GO_SUM_PATH = SCRIPT_PATH.parent.parent / "go.sum"
@@ -35,6 +38,9 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.source = SCRIPT_PATH.read_text(encoding="utf-8")
         cls.mountns_launcher = MOUNTNS_LAUNCHER_PATH.read_text(encoding="utf-8")
+        cls.performance_matrix = PERFORMANCE_MATRIX_PATH.read_text(
+            encoding="utf-8"
+        )
         cls.lines = cls.source.splitlines()
         cls.makefile_source = MAKEFILE_PATH.read_text(encoding="utf-8")
         cls.go_mod_source = GO_MOD_PATH.read_text(encoding="utf-8")
@@ -125,10 +131,22 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertNotIn("XOR_PASSWORD", child_environment)
         self.assertIn("WG_MIX_EBPF_SMOKE_MOUNTNS_XOR_SECRET_FD", child_environment)
         self.assertIn("ATTACHMENT_BACKEND", child_environment)
+        self.assertIn("DATAPLANE_MODE", child_environment)
+        self.assertIn("TCP_REPETITIONS", child_environment)
+        self.assertIn("INITIAL_CAPTURE_TIMEOUT", child_environment)
         self.assertIn(
             '"ATTACHMENT_BACKEND",',
             self.anchor_staged_launch_source,
         )
+        for environment_name in (
+            "DATAPLANE_MODE",
+            "TCP_REPETITIONS",
+            "INITIAL_CAPTURE_TIMEOUT",
+        ):
+            self.assertIn(
+                f'"{environment_name}",',
+                self.anchor_staged_launch_source,
+            )
 
         reviewed = self.anchor_reviewed_tool_source
         for path in (
@@ -2031,6 +2049,11 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         )
         self.assertIn('TCP_MTUS="${TCP_MTUS:-1419 1420 1421 1422}"', self.source)
         self.assertIn('UNDERLAY_MTU="${UNDERLAY_MTU:-2200}"', self.source)
+        self.assertIn('TCP_REPETITIONS="${TCP_REPETITIONS:-1}"', self.source)
+        self.assertIn(
+            "TCP_REPETITIONS must be an integer in [1, 20]",
+            self.source,
+        )
         self.assertIn("TCP_MTUS contains duplicate value", self.source)
         self.assertIn("UNDERLAY_MTU must be an integer", self.source)
         self.assertIn("WG_MTU must be an integer", self.source)
@@ -2063,6 +2086,10 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
         self.assertIn("forward) ;;", run)
         self.assertIn("reverse) client_direction_args=(-R) ;;", run)
         self.assertIn("bidir) client_direction_args=(--bidir) ;;", run)
+        self.assertIn(
+            'local label="tcp-mtu${mtu}-p${streams}-r${repetition}-${direction}"',
+            run,
+        )
         self.assertIn('"${IPERF_CHECKER_HELPER}"', run)
         self.assertIn(
             'local capture_timeout="$((TCP_DURATION + 5))"',
@@ -2099,6 +2126,12 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             'for direction in "${TCP_DIRECTION_VALUES[@]}"; do',
             matrix,
         )
+        self.assertIn(
+            "for ((repetition = 1; repetition <= TCP_REPETITIONS; repetition++)); do",
+            matrix,
+        )
+        self.assertIn('--aggregate >"${summary_path}"', matrix)
+        self.assertIn('direction_paths+=("${TCP_LAST_CLIENT_PATH}")', matrix)
         failure = matrix.index("run_status=$?")
         after_status = matrix.index('status-a-tcp-${mtu}-after.json')
         failure_return = matrix.index('return "${run_status}"')
@@ -2241,6 +2274,54 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             matrix.index("assert_wg_transfer_increased"),
             matrix.index("assert_stat_increased"),
         )
+
+    def test_wireguard_baseline_and_b82_matrix_are_exact_and_bpf_free(self) -> None:
+        for fragment in (
+            'DATAPLANE_MODE="${DATAPLANE_MODE:-ebpf}"',
+            "DATAPLANE_MODE must be ebpf or wireguard",
+            "XOR_PASSWORD cannot be set in pure WireGuard mode",
+            'dataplane mode=wireguard bpf_loaded=0 attachment_backend=none',
+            '--require-standard "initiation,response,transport"',
+            '--require-standard transport',
+            'if [[ "${DATAPLANE_MODE}" == "ebpf" ]]; then',
+            'netns WireGuard ${OUTER_FAMILY} baseline smoke passed (bpf_loaded=0)',
+        ):
+            self.assertIn(fragment, self.source)
+        pure_branch = self.source[
+            self.source.index(
+                'if [[ "${DATAPLANE_MODE}" == "ebpf" ]]; then\n  '
+                'run_agent_in_netns "${NSA}" "${PINA}" reload'
+            ) : self.source.index(
+                'run_bounded_in_owned_netns "${NSR}" INT '
+                '"${INITIAL_CAPTURE_TIMEOUT}"'
+            )
+        ]
+        self.assertIn("bpf_loaded=0", pure_branch)
+
+        matrix = self.performance_matrix
+        for fragment in (
+            "PERFORMANCE_MATRIX_START",
+            "PERFORMANCE_MATRIX_COMPLETE",
+            "cells=21 repetitions=3 duration_seconds=3",
+            "run_cell wireguard-baseline wireguard auto off",
+            "run_cell tcx-baseline ebpf tcx off",
+            "run_cell classic_tc-baseline ebpf classic_tc off",
+            "for max_bytes in 4 16 64 128 256 512 1024 2048; do",
+            'run_cell "tcx-prefix-${max_bytes}" ebpf tcx on',
+            'run_cell "classic_tc-prefix-${max_bytes}" ebpf classic_tc on',
+            "run_cell tcx-full-2048 ebpf tcx on wg-payload-full 2048",
+            "run_cell classic_tc-full-2048 ebpf classic_tc on wg-payload-full 2048",
+            '"TCP_REPETITIONS=3"',
+            '"TCP_DURATION=3"',
+            '"TCP_DIRECTIONS=forward reverse bidir"',
+            '"TCP_MAX_RETRANSMITS=0"',
+            '"TCP_MTUS=1420"',
+            '/usr/bin/bash -p "${launcher}"',
+        ):
+            self.assertIn(fragment, matrix)
+        self.assertEqual(1, matrix.count("XOR_PASSWORD=\"${xor_secret}\""))
+        self.assertNotIn("rm -rf", matrix)
+        self.assertNotIn("find -delete", matrix)
 
         for target in (
             "test-netns-tcp-native",

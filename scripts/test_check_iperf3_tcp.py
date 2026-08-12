@@ -131,6 +131,40 @@ class Iperf3TCPValidatorTests(unittest.TestCase):
         )
         self.assertEqual([250, 290], [item["received_bytes"] for item in result])
 
+    def test_aggregate_reports_mean_spread_and_bidir_total(self) -> None:
+        samples = [
+            self.validate(
+                document(
+                    "bidir",
+                    [stream(120)],
+                    [stream(180, forward=False)],
+                ),
+                "bidir",
+                1,
+            ),
+            self.validate(
+                document(
+                    "bidir",
+                    [stream(160)],
+                    [stream(200, forward=False)],
+                ),
+                "bidir",
+                1,
+            ),
+        ]
+        result = CHECKER.aggregate_iperf_results(
+            samples,
+            requested_direction="bidir",
+        )
+        self.assertEqual(
+            ["forward", "reverse", "aggregate"],
+            [item["direction"] for item in result],
+        )
+        self.assertEqual(2, result[2]["samples"])
+        self.assertAlmostEqual(1.32e-3, result[2]["throughput_mean_mbps"])
+        self.assertGreater(result[2]["throughput_pstdev_mbps"], 0)
+        self.assertEqual(0, result[2]["retransmits_total"])
+
     def test_zero_or_short_stream_is_rejected(self) -> None:
         with self.assertRaisesRegex(ValueError, "below 100 bytes"):
             self.validate(

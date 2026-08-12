@@ -58,6 +58,8 @@ var requiredPrivateMountNSChildEnvironment = []string{
 
 var optionalPrivateMountNSChildEnvironment = []string{
 	"ATTACHMENT_BACKEND",
+	"DATAPLANE_MODE",
+	"INITIAL_CAPTURE_TIMEOUT",
 	"NETNS_ANCHOR_TTL_SECONDS",
 	"OUTER_FAMILY",
 	"RUN_ID",
@@ -73,6 +75,7 @@ var optionalPrivateMountNSChildEnvironment = []string{
 	"TCP_MTUS",
 	"TCP_OUTER_GSO_CHECKS",
 	"TCP_PORT",
+	"TCP_REPETITIONS",
 	"TCP_STREAMS",
 	"UDP_ZERO_CHECKSUM_CHECKS",
 	"UNDERLAY_MTU",

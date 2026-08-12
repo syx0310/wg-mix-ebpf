@@ -642,6 +642,7 @@ def main() -> int:
     parser.add_argument("--forbid-standard", action="store_true")
     parser.add_argument("--forbid-plain-mixed", action="store_true")
     parser.add_argument("--forbid-plain-standard", action="store_true")
+    parser.add_argument("--require-standard", action="append", help="Comma-separated standard WG kinds to require")
     parser.add_argument("--require-mixed", action="append", help="Comma-separated WG kinds to require")
     parser.add_argument("--require-xor-mixed", action="append", help="Comma-separated WG kinds to require after XOR decoding first 4 bytes")
     parser.add_argument("--xor-key", help="XOR key as base64:<key>, hex:<key>, or raw text")
@@ -690,6 +691,7 @@ def main() -> int:
         apply_xor_decode(records, xor_key)
 
     summary = summarize(records, args.max_examples)
+    required_standard = parse_required_kinds(args.require_standard)
     required_mixed = parse_required_kinds(args.require_mixed)
     required_xor_mixed = parse_required_kinds(args.require_xor_mixed)
     required_icmp_types = parse_required_icmp_types(args.require_icmp_types)
@@ -700,6 +702,13 @@ def main() -> int:
     if args.forbid_plain_mixed and summary["mixed_type_words"]:
         failures.append(f"plain mixed WireGuard type_word leaked: {summary['mixed_type_words']}")
 
+    missing_standard = sorted(
+        kind for kind in required_standard if summary["standard_by_kind"][kind] == 0
+    )
+    if missing_standard:
+        failures.append(
+            "missing required standard kinds: " + ",".join(missing_standard)
+        )
     missing = sorted(kind for kind in required_mixed if summary["mixed_by_kind"][kind] == 0)
     if missing:
         failures.append("missing required mixed kinds: " + ",".join(missing))

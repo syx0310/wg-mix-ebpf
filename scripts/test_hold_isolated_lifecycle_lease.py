@@ -220,7 +220,36 @@ class IsolatedLifecycleLeaseHolderTests(unittest.TestCase):
             check=False,
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(b"does not match final detach", result.stderr)
+        self.assertIn(b"does not match expected teardown", result.stderr)
+
+    def test_wireguard_teardown_owner_is_explicitly_accepted(self) -> None:
+        self.lease.write_text(
+            json.dumps(
+                {
+                    "pid": os.getpid(),
+                    "action": "wireguard-teardown",
+                    "config_path": str(self.config),
+                    "run_dir": str(self.run_dir),
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        status = self.evidence / (
+            "lifecycle-holder-" + "6" * 32 + ".status"
+        )
+        command = self.command(status)
+        command.extend(("--expected-action", "wireguard-teardown"))
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        self.addCleanup(self.close_process, process)
+        self.wait_for_status(process, status, "READY")
+        self.release_holder(process, status)
 
     def test_status_outside_manifest_evidence_is_rejected(self) -> None:
         result = subprocess.run(

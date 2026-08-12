@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import statistics
 from pathlib import Path
 from typing import Any
 
@@ -257,9 +258,69 @@ def validate_iperf(
     return results
 
 
+def aggregate_iperf_results(
+    samples: list[list[dict[str, Any]]],
+    *,
+    requested_direction: str,
+) -> list[dict[str, Any]]:
+    if not samples:
+        raise ValueError("aggregate requires at least one sample")
+    expected_directions = {
+        "forward": ("forward",),
+        "reverse": ("reverse",),
+        "bidir": ("forward", "reverse"),
+    }.get(requested_direction)
+    if expected_directions is None:
+        raise ValueError(f"unsupported direction: {requested_direction}")
+    for index, sample in enumerate(samples):
+        observed = tuple(item.get("direction") for item in sample)
+        if observed != expected_directions:
+            raise ValueError(
+                f"sample {index} directions={observed!r}, "
+                f"want {expected_directions!r}"
+            )
+
+    def summarize(label: str, values: list[dict[str, Any]]) -> dict[str, Any]:
+        throughputs = [float(value["throughput_mbps"]) for value in values]
+        fairness = [float(value["fairness"]) for value in values]
+        retransmits = [int(value["retransmits"]) for value in values]
+        return {
+            "requested_direction": requested_direction,
+            "direction": label,
+            "samples": len(values),
+            "throughput_mean_mbps": statistics.fmean(throughputs),
+            "throughput_pstdev_mbps": statistics.pstdev(throughputs),
+            "throughput_min_mbps": min(throughputs),
+            "throughput_max_mbps": max(throughputs),
+            "retransmits_total": sum(retransmits),
+            "fairness_mean": statistics.fmean(fairness),
+            "fairness_min": min(fairness),
+        }
+
+    result = []
+    for direction_index, direction in enumerate(expected_directions):
+        result.append(
+            summarize(direction, [sample[direction_index] for sample in samples])
+        )
+    if requested_direction == "bidir":
+        totals = []
+        for sample in samples:
+            totals.append(
+                {
+                    "throughput_mbps": sum(
+                        float(item["throughput_mbps"]) for item in sample
+                    ),
+                    "retransmits": sum(int(item["retransmits"]) for item in sample),
+                    "fairness": min(float(item["fairness"]) for item in sample),
+                }
+            )
+        result.append(summarize("aggregate", totals))
+    return result
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("json_path", type=Path)
+    parser.add_argument("json_paths", nargs="+", type=Path)
     parser.add_argument(
         "--direction",
         choices=("forward", "reverse", "bidir"),
@@ -269,21 +330,38 @@ def main() -> int:
     parser.add_argument("--minimum-bytes", type=int, required=True)
     parser.add_argument("--maximum-retransmits", type=int, default=0)
     parser.add_argument("--minimum-fairness", type=float, default=0.0)
+    parser.add_argument("--aggregate", action="store_true")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     try:
-        with args.json_path.open("r", encoding="utf-8") as handle:
-            document = json.load(handle)
-        if not isinstance(document, dict):
-            raise ValueError("top-level iperf3 JSON must be an object")
-        results = validate_iperf(
-            document,
-            direction=args.direction,
-            expected_streams=args.streams,
-            minimum_bytes=args.minimum_bytes,
-            maximum_retransmits=args.maximum_retransmits,
-            minimum_fairness=args.minimum_fairness,
+        if len(args.json_paths) != 1 and not args.aggregate:
+            raise ValueError("multiple JSON inputs require --aggregate")
+        samples = []
+        for json_path in args.json_paths:
+            with json_path.open("r", encoding="utf-8") as handle:
+                document = json.load(handle)
+            if not isinstance(document, dict):
+                raise ValueError(
+                    f"{json_path}: top-level iperf3 JSON must be an object"
+                )
+            samples.append(
+                validate_iperf(
+                    document,
+                    direction=args.direction,
+                    expected_streams=args.streams,
+                    minimum_bytes=args.minimum_bytes,
+                    maximum_retransmits=args.maximum_retransmits,
+                    minimum_fairness=args.minimum_fairness,
+                )
+            )
+        results = (
+            aggregate_iperf_results(
+                samples,
+                requested_direction=args.direction,
+            )
+            if args.aggregate
+            else samples[0]
         )
     except (OSError, json.JSONDecodeError, ValueError) as exc:
         parser.error(str(exc))
@@ -292,13 +370,26 @@ def main() -> int:
         print(json.dumps(results, sort_keys=True))
     else:
         for result in results:
-            print(
-                "tcp direction={direction} streams={streams} "
-                "received={received_bytes} throughput={throughput_mbps:.2f}Mbps "
-                "retransmits={retransmits} fairness={fairness:.6f}".format(
-                    **result
+            if args.aggregate:
+                print(
+                    "tcp aggregate requested_direction={requested_direction} "
+                    "direction={direction} samples={samples} "
+                    "throughput_mean={throughput_mean_mbps:.2f}Mbps "
+                    "throughput_pstdev={throughput_pstdev_mbps:.2f}Mbps "
+                    "throughput_min={throughput_min_mbps:.2f}Mbps "
+                    "throughput_max={throughput_max_mbps:.2f}Mbps "
+                    "retransmits_total={retransmits_total} "
+                    "fairness_mean={fairness_mean:.6f} "
+                    "fairness_min={fairness_min:.6f}".format(**result)
                 )
-            )
+            else:
+                print(
+                    "tcp direction={direction} streams={streams} "
+                    "received={received_bytes} throughput={throughput_mbps:.2f}Mbps "
+                    "retransmits={retransmits} fairness={fairness:.6f}".format(
+                        **result
+                    )
+                )
     return 0
 
 

@@ -285,6 +285,7 @@ validate_private_mountns_launch "$@"
 shift
 
 OUTER_FAMILY="${OUTER_FAMILY:-ipv4}"
+DATAPLANE_MODE="${DATAPLANE_MODE:-ebpf}"
 ATTACHMENT_BACKEND="${ATTACHMENT_BACKEND:-auto}"
 XOR_SCOPE="${XOR_SCOPE:-wg-payload-full}"
 XOR_MAX_BYTES="${XOR_MAX_BYTES:-2048}"
@@ -296,6 +297,7 @@ TCP_MTUS="${TCP_MTUS:-1419 1420 1421 1422}"
 TCP_STREAMS="${TCP_STREAMS:-1 4 16}"
 TCP_DIRECTIONS="${TCP_DIRECTIONS:-forward reverse bidir}"
 TCP_DURATION="${TCP_DURATION:-2}"
+TCP_REPETITIONS="${TCP_REPETITIONS:-1}"
 TCP_MIN_BYTES="${TCP_MIN_BYTES:-1048576}"
 TCP_MAX_RETRANSMITS="${TCP_MAX_RETRANSMITS:-0}"
 TCP_MIN_FAIRNESS="${TCP_MIN_FAIRNESS:-0.90}"
@@ -306,9 +308,14 @@ TCP_PORT="${TCP_PORT:-5201}"
 UNDERLAY_MTU="${UNDERLAY_MTU:-2200}"
 WG_MTU="${WG_MTU:-2000}"
 NETNS_ANCHOR_TTL_SECONDS="${NETNS_ANCHOR_TTL_SECONDS:-28800}"
+INITIAL_CAPTURE_TIMEOUT="${INITIAL_CAPTURE_TIMEOUT:-30}"
 
 if [[ "${OUTER_FAMILY}" != "ipv4" && "${OUTER_FAMILY}" != "ipv6" ]]; then
   echo "error: OUTER_FAMILY must be ipv4 or ipv6" >&2
+  exit 1
+fi
+if [[ "${DATAPLANE_MODE}" != "ebpf" && "${DATAPLANE_MODE}" != "wireguard" ]]; then
+  echo "error: DATAPLANE_MODE must be ebpf or wireguard" >&2
   exit 1
 fi
 if [[ "${ATTACHMENT_BACKEND}" != "auto" &&
@@ -319,6 +326,17 @@ if [[ "${ATTACHMENT_BACKEND}" != "auto" &&
 fi
 if [[ "${XOR_SCOPE}" != "wg-payload-prefix" && "${XOR_SCOPE}" != "wg-payload-full" ]]; then
   echo "error: XOR_SCOPE must be wg-payload-prefix or wg-payload-full" >&2
+  exit 1
+fi
+if [[ "${DATAPLANE_MODE}" == "wireguard" && "${XOR_ENABLED}" -eq 1 ]]; then
+  echo "error: XOR_PASSWORD cannot be set in pure WireGuard mode" >&2
+  exit 1
+fi
+if [[ "${DATAPLANE_MODE}" == "wireguard" &&
+  ( "${XOR_GENERATION_CHECKS}" != "off" ||
+    "${XOR_DISPATCH_FAILURE_CHECKS}" != "off" ||
+    "${UDP_ZERO_CHECKSUM_CHECKS}" != "off" ) ]]; then
+  echo "error: pure WireGuard mode cannot run eBPF-only optional checks" >&2
   exit 1
 fi
 if ((XOR_ENABLED)); then
@@ -357,6 +375,11 @@ fi
 if [[ ! "${NETNS_ANCHOR_TTL_SECONDS}" =~ ^[0-9]+$ ]] ||
   ((NETNS_ANCHOR_TTL_SECONDS < 60 || NETNS_ANCHOR_TTL_SECONDS > 86400)); then
   echo "error: NETNS_ANCHOR_TTL_SECONDS must be an integer in [60, 86400]" >&2
+  exit 1
+fi
+if [[ ! "${INITIAL_CAPTURE_TIMEOUT}" =~ ^[0-9]+$ ]] ||
+  ((INITIAL_CAPTURE_TIMEOUT < 5 || INITIAL_CAPTURE_TIMEOUT > 60)); then
+  echo "error: INITIAL_CAPTURE_TIMEOUT must be an integer in [5, 60]" >&2
   exit 1
 fi
 if [[ ! "${UNDERLAY_MTU}" =~ ^[0-9]+$ ]] ||
@@ -447,6 +470,11 @@ if [[ "${TCP_CHECKS}" == "enforce" ]]; then
   if [[ ! "${TCP_DURATION}" =~ ^[0-9]+$ ]] ||
     ((TCP_DURATION < 1 || TCP_DURATION > 600)); then
     echo "error: TCP_DURATION must be an integer in [1, 600]" >&2
+    exit 1
+  fi
+  if [[ ! "${TCP_REPETITIONS}" =~ ^[0-9]+$ ]] ||
+    ((TCP_REPETITIONS < 1 || TCP_REPETITIONS > 20)); then
+    echo "error: TCP_REPETITIONS must be an integer in [1, 20]" >&2
     exit 1
   fi
   if [[ ! "${TCP_MIN_BYTES}" =~ ^[0-9]+$ ]] || ((TCP_MIN_BYTES < 1)); then
@@ -648,6 +676,7 @@ UDP_ZERO_CHECKSUM_RECEIVER_PID=""
 AGENT_PID=""
 TCP_SERVER_PID=""
 TCP_CLIENT_PID=""
+TCP_LAST_CLIENT_PATH=""
 PCAP_CHECKER_PID=""
 LIFECYCLE_HOLDER_PID=""
 TCPDUMP_RA=""
@@ -812,6 +841,8 @@ manifest_payload() {
   printf 'format=wg-mix-ebpf-test-manifest-v2\n'
   printf 'run_id=%s\nowner_token=%s\nboot_id=%s\nhost=%s\n' \
     "${RUN_ID}" "${OWNER_TOKEN}" "${BOOT_ID}" "${HOST_ID}"
+  printf 'dataplane_mode=%s\nattachment_backend=%s\n' \
+    "${DATAPLANE_MODE}" "${ATTACHMENT_BACKEND}"
   printf 'run_base=%s\nbpffs=%s\nbpffs_source=%s\nbpffs_mount_id=%s\n' \
     "${RUN_BASE}" "${BPFFS_DIR}" "${BPFFS_SOURCE}" "${BPFFS_MOUNT_ID}"
   printf 'pin_parent_dev=%s\npin_parent_ino=%s\n' \
@@ -2262,9 +2293,67 @@ validate_lifecycle_holder_status() {
   fi
 }
 
+seal_wireguard_lifecycle_owner() {
+  validate_owned_path "${LIFECYCLE_LEASE}" || return 1
+  env -u XOR_PASSWORD python3 - \
+    "${LIFECYCLE_LEASE}" "$$" "${SECRET_DIR}/agent-b.yaml" "${RUN_DIR_B}" <<'PY'
+import json
+import os
+import stat
+import sys
+
+path, pid_raw, config_path, run_dir = sys.argv[1:]
+before = os.lstat(path)
+if (
+    not stat.S_ISREG(before.st_mode)
+    or before.st_uid != 0
+    or before.st_gid != 0
+    or stat.S_IMODE(before.st_mode) != 0o600
+    or before.st_nlink != 1
+    or before.st_size != 0
+):
+    raise SystemExit("wireguard lifecycle lease is not pristine")
+descriptor = os.open(path, os.O_WRONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+try:
+    held = os.fstat(descriptor)
+    if (held.st_dev, held.st_ino) != (before.st_dev, before.st_ino):
+        raise SystemExit("wireguard lifecycle lease identity changed")
+    payload = (
+        json.dumps(
+            {
+                "action": "wireguard-teardown",
+                "config_path": config_path,
+                "pid": int(pid_raw),
+                "run_dir": run_dir,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    ).encode("utf-8")
+    written = os.write(descriptor, payload)
+    if written != len(payload):
+        raise SystemExit("wireguard lifecycle lease short write")
+    os.fsync(descriptor)
+    after = os.fstat(descriptor)
+    if (
+        (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+        or after.st_size != len(payload)
+    ):
+        raise SystemExit("wireguard lifecycle lease changed while sealing")
+finally:
+    os.close(descriptor)
+PY
+}
+
 start_lifecycle_hold() {
   local attempt
   local holder_status=0
+  local expected_action="detach"
+
+  if [[ "${DATAPLANE_MODE}" == "wireguard" ]]; then
+    expected_action="wireguard-teardown"
+  fi
 
   if [[ -n "${LIFECYCLE_HOLDER_PID}" ||
     -e "${LIFECYCLE_HOLDER_STATUS}" ||
@@ -2284,6 +2373,7 @@ start_lifecycle_hold() {
     --boot-id "${BOOT_ID}" \
     --expected-config "${SECRET_DIR}/agent-b.yaml" \
     --expected-run-dir "${RUN_DIR_B}" \
+    --expected-action "${expected_action}" \
     --expected-uid "${EUID}" \
     --status-path "${LIFECYCLE_HOLDER_STATUS}" \
     --parent-pid "$$" &
@@ -2367,21 +2457,27 @@ explicit_teardown() {
   find "${BPFFS_DIR}" -xdev -mindepth 1 -maxdepth 3 -printf '%y %p\n' |
     sed -n '1,200p' || return 1
 
-  teardown_step "detach agent A pin=${PINA}" \
-    run_agent_in_netns "${NSA}" "${PINA}" detach \
-    --config "${SECRET_DIR}/agent-a.yaml" || return 1
-  teardown_step "detach agent B pin=${PINB}" \
-    run_agent_in_netns "${NSB}" "${PINB}" detach \
-    --config "${SECRET_DIR}/agent-b.yaml" || return 1
+  if [[ "${DATAPLANE_MODE}" == "ebpf" ]]; then
+    teardown_step "detach agent A pin=${PINA}" \
+      run_agent_in_netns "${NSA}" "${PINA}" detach \
+      --config "${SECRET_DIR}/agent-a.yaml" || return 1
+    teardown_step "detach agent B pin=${PINB}" \
+      run_agent_in_netns "${NSB}" "${PINB}" detach \
+      --config "${SECRET_DIR}/agent-b.yaml" || return 1
+  else
+    seal_wireguard_lifecycle_owner || return 1
+  fi
   start_lifecycle_hold || return 1
-  validate_pin_owner_absent "${PIN_OWNER_A}" "${PIN_RESOURCE_KEY_A}" || return 1
-  validate_pin_owner_absent "${PIN_OWNER_B}" "${PIN_RESOURCE_KEY_B}" || return 1
-  validate_released_pin_lock \
-    "${PIN_LOCK_A}" "${PINA}" "${PIN_RESOURCE_KEY_A}" || return 1
-  validate_released_pin_lock \
-    "${PIN_LOCK_B}" "${PINB}" "${PIN_RESOURCE_KEY_B}" || return 1
-  remove_owned_file "${PIN_LOCK_A}" || return 1
-  remove_owned_file "${PIN_LOCK_B}" || return 1
+  if [[ "${DATAPLANE_MODE}" == "ebpf" ]]; then
+    validate_pin_owner_absent "${PIN_OWNER_A}" "${PIN_RESOURCE_KEY_A}" || return 1
+    validate_pin_owner_absent "${PIN_OWNER_B}" "${PIN_RESOURCE_KEY_B}" || return 1
+    validate_released_pin_lock \
+      "${PIN_LOCK_A}" "${PINA}" "${PIN_RESOURCE_KEY_A}" || return 1
+    validate_released_pin_lock \
+      "${PIN_LOCK_B}" "${PINB}" "${PIN_RESOURCE_KEY_B}" || return 1
+    remove_owned_file "${PIN_LOCK_A}" || return 1
+    remove_owned_file "${PIN_LOCK_B}" || return 1
+  fi
   validate_directory_only_has_owner_marker "${PIN_LOCK_ROOT}" pin-locks || return 1
   remove_owned_file "${PIN_LOCK_ROOT}/${OWNER_MARKER}" || return 1
   teardown_step "remove empty isolated pin lock root ${PIN_LOCK_ROOT}" \
@@ -2936,7 +3032,7 @@ start_tcp_capture() {
   local label="$1"
   local capture_timeout="$2"
 
-  if [[ ! "${label}" =~ ^tcp-mtu[0-9]+-p[0-9]+-(forward|reverse|bidir)$ ||
+  if [[ ! "${label}" =~ ^tcp-mtu[0-9]+-p[0-9]+-r[0-9]+-(forward|reverse|bidir)$ ||
     ! "${capture_timeout}" =~ ^[1-9][0-9]*$ ]]; then
     echo "error: invalid per-cell TCP capture identity: ${label} timeout=${capture_timeout}" >&2
     return 1
@@ -2973,7 +3069,7 @@ finish_tcp_capture() {
   local rb_status=0
   local result=0
 
-  if [[ ! "${label}" =~ ^tcp-mtu[0-9]+-p[0-9]+-(forward|reverse|bidir)$ ]]; then
+  if [[ ! "${label}" =~ ^tcp-mtu[0-9]+-p[0-9]+-r[0-9]+-(forward|reverse|bidir)$ ]]; then
     echo "error: invalid per-cell TCP capture finish identity: ${label}" >&2
     return 1
   fi
@@ -3018,7 +3114,7 @@ check_tcp_capture_file() {
   local checker_status=0
   local checker_args=()
 
-  if [[ ! "${label}" =~ ^tcp-mtu[0-9]+-p[0-9]+-(forward|reverse|bidir)$ ]]; then
+  if [[ ! "${label}" =~ ^tcp-mtu[0-9]+-p[0-9]+-r[0-9]+-(forward|reverse|bidir)$ ]]; then
     echo "error: invalid per-cell TCP pcap identity: ${label}" >&2
     return 1
   fi
@@ -3050,7 +3146,12 @@ check_tcp_capture_file() {
   pcap_path="${TMPDIR}/${label}-${interface}.pcap"
   output_path="${TMPDIR}/${label}-${interface}-${flow}-pcap-check.out"
   log_path="${TMPDIR}/${label}-${interface}-${flow}-pcap-check.log"
-  if ((XOR_ENABLED)); then
+  if [[ "${DATAPLANE_MODE}" == "wireguard" ]]; then
+    checker_args+=(
+      --forbid-plain-mixed
+      --require-standard transport
+    )
+  elif ((XOR_ENABLED)); then
     checker_args+=(
       --forbid-plain-standard
       --forbid-plain-mixed
@@ -3145,7 +3246,8 @@ exercise_tcp_run() {
   local mtu="$1"
   local streams="$2"
   local direction="$3"
-  local label="tcp-mtu${mtu}-p${streams}-${direction}"
+  local repetition="$4"
+  local label="tcp-mtu${mtu}-p${streams}-r${repetition}-${direction}"
   local client_path="${TMPDIR}/${label}-client.json"
   local client_log="${TMPDIR}/${label}-client.log"
   local server_path="${TMPDIR}/${label}-server.json"
@@ -3257,20 +3359,31 @@ exercise_tcp_run() {
     --minimum-bytes "${TCP_MIN_BYTES}" \
     --maximum-retransmits "${TCP_MAX_RETRANSMITS}" \
     --minimum-fairness "${TCP_MIN_FAIRNESS}"
+  TCP_LAST_CLIENT_PATH="${client_path}"
 }
 
 exercise_tcp_matrix() {
   local mtu
   local streams
   local direction
+  local repetition
   local side
   local stat
   local before_path
   local after_path
   local run_status
   local evidence_status
+  local summary_path
+  local direction_paths=()
 
-  classify_tcp_gso_capabilities
+  if [[ "${DATAPLANE_MODE}" == "ebpf" ]]; then
+    classify_tcp_gso_capabilities
+  else
+    TCP_INNER_GSO_CAPABILITY="wireguard-baseline"
+    TCP_OUTER_GSO_CAPABILITY="wireguard-baseline"
+    TCP_OUTER_GSO_OBSERVED_ALL=0
+    printf 'tcp evidence=dataplane mode=wireguard bpf_loaded=0\n'
+  fi
   capture_tcp_netns_evidence before
   for mtu in "${TCP_MTU_VALUES[@]}"; do
     validate_all_netns_identities
@@ -3279,10 +3392,12 @@ exercise_tcp_matrix() {
     wait_ping "${NSA}" 10.77.0.2
     wait_ping "${NSB}" 10.77.0.1
 
-    run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" \
-      >"${TMPDIR}/status-a-tcp-${mtu}-before.json"
-    run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" \
-      >"${TMPDIR}/status-b-tcp-${mtu}-before.json"
+    if [[ "${DATAPLANE_MODE}" == "ebpf" ]]; then
+      run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" \
+        >"${TMPDIR}/status-a-tcp-${mtu}-before.json"
+      run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" \
+        >"${TMPDIR}/status-b-tcp-${mtu}-before.json"
+    fi
     run_in_owned_netns "${NSA}" wg show wg0 transfer \
       >"${TMPDIR}/wg-transfer-a-tcp-${mtu}-before.txt"
     run_in_owned_netns "${NSB}" wg show wg0 transfer \
@@ -3291,19 +3406,53 @@ exercise_tcp_matrix() {
     run_status=0
     for streams in "${TCP_STREAM_VALUES[@]}"; do
       for direction in "${TCP_DIRECTION_VALUES[@]}"; do
-        if exercise_tcp_run "${mtu}" "${streams}" "${direction}"; then
+        direction_paths=()
+        for ((repetition = 1; repetition <= TCP_REPETITIONS; repetition++)); do
+          TCP_LAST_CLIENT_PATH=""
+          if exercise_tcp_run \
+            "${mtu}" "${streams}" "${direction}" "${repetition}"; then
+            if [[ "${TCP_LAST_CLIENT_PATH}" != "${TMPDIR}/"* ||
+              ! -f "${TCP_LAST_CLIENT_PATH}" ]]; then
+              echo "error: TCP result path was not sealed for repetition ${repetition}" >&2
+              run_status=1
+              break 3
+            fi
+            direction_paths+=("${TCP_LAST_CLIENT_PATH}")
+          else
+            run_status=$?
+            break 3
+          fi
+        done
+        if ((${#direction_paths[@]} != TCP_REPETITIONS)); then
+          echo "error: TCP sample count=${#direction_paths[@]}, want ${TCP_REPETITIONS}" >&2
+          run_status=1
+          break 2
+        fi
+        summary_path="${TMPDIR}/tcp-mtu${mtu}-p${streams}-${direction}-summary.txt"
+        if env -u XOR_PASSWORD python3 "${IPERF_CHECKER_HELPER}" \
+          "${direction_paths[@]}" \
+          --direction "${direction}" \
+          --streams "${streams}" \
+          --minimum-bytes "${TCP_MIN_BYTES}" \
+          --maximum-retransmits "${TCP_MAX_RETRANSMITS}" \
+          --minimum-fairness "${TCP_MIN_FAIRNESS}" \
+          --aggregate >"${summary_path}"; then
           :
         else
           run_status=$?
+          echo "error: TCP aggregate failed for mtu=${mtu} streams=${streams} direction=${direction}" >&2
           break 2
         fi
+        cat "${summary_path}"
       done
     done
 
-    run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" \
-      >"${TMPDIR}/status-a-tcp-${mtu}-after.json"
-    run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" \
-      >"${TMPDIR}/status-b-tcp-${mtu}-after.json"
+    if [[ "${DATAPLANE_MODE}" == "ebpf" ]]; then
+      run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" \
+        >"${TMPDIR}/status-a-tcp-${mtu}-after.json"
+      run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" \
+        >"${TMPDIR}/status-b-tcp-${mtu}-after.json"
+    fi
     run_in_owned_netns "${NSA}" wg show wg0 transfer \
       >"${TMPDIR}/wg-transfer-a-tcp-${mtu}-after.txt"
     run_in_owned_netns "${NSB}" wg show wg0 transfer \
@@ -3312,6 +3461,15 @@ exercise_tcp_matrix() {
     for side in a b; do
       before_path="${TMPDIR}/status-${side}-tcp-${mtu}-before.json"
       after_path="${TMPDIR}/status-${side}-tcp-${mtu}-after.json"
+      if [[ "${DATAPLANE_MODE}" == "wireguard" ]]; then
+        if ((run_status == 0)); then
+          assert_wg_transfer_increased \
+            "${TMPDIR}/wg-transfer-${side}-tcp-${mtu}-before.txt" \
+            "${TMPDIR}/wg-transfer-${side}-tcp-${mtu}-after.txt" \
+            "${side}" "${mtu}"
+        fi
+        continue
+      fi
       for stat in \
         egress_bad_type ingress_bad_type \
         egress_bad_length ingress_bad_length \
@@ -3358,7 +3516,14 @@ exercise_tcp_matrix() {
     fi
   done
   capture_tcp_netns_evidence after
-  finalize_tcp_gso_evidence
+  if [[ "${DATAPLANE_MODE}" == "ebpf" ]]; then
+    finalize_tcp_gso_evidence
+  else
+    printf 'tcp summary=inner-tcp-gso status=wireguard-baseline mode=%s\n' \
+      "${TCP_INNER_GSO_CHECKS}"
+    printf 'tcp summary=outer-udp-gso status=wireguard-baseline mode=%s correctness_gate=false\n' \
+      "${TCP_OUTER_GSO_CHECKS}"
+  fi
   printf 'tcp summary=correctness status=passed\n'
 }
 
@@ -3709,23 +3874,27 @@ validate_manifest
 validate_private_bpffs_mount
 
 PHASE="test-execution"
-run_agent_in_netns "${NSA}" "${PINA}" reload --config "${SECRET_DIR}/agent-a.yaml"
-run_agent_in_netns "${NSB}" "${PINB}" reload --config "${SECRET_DIR}/agent-b.yaml"
-run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" >"${TMPDIR}/status-a-before.json"
-run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" >"${TMPDIR}/status-b-before.json"
-assert_generation "${TMPDIR}/status-a-before.json" 1
-assert_generation "${TMPDIR}/status-b-before.json" 1
-if ((XOR_ENABLED)); then
-  assert_tail_bank "${PINA}" "${TMPDIR}/status-a-before.json"
-  assert_tail_bank "${PINB}" "${TMPDIR}/status-b-before.json"
+if [[ "${DATAPLANE_MODE}" == "ebpf" ]]; then
+  run_agent_in_netns "${NSA}" "${PINA}" reload --config "${SECRET_DIR}/agent-a.yaml"
+  run_agent_in_netns "${NSB}" "${PINB}" reload --config "${SECRET_DIR}/agent-b.yaml"
+  run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" >"${TMPDIR}/status-a-before.json"
+  run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" >"${TMPDIR}/status-b-before.json"
+  assert_generation "${TMPDIR}/status-a-before.json" 1
+  assert_generation "${TMPDIR}/status-b-before.json" 1
+  if ((XOR_ENABLED)); then
+    assert_tail_bank "${PINA}" "${TMPDIR}/status-a-before.json"
+    assert_tail_bank "${PINB}" "${TMPDIR}/status-b-before.json"
+  fi
+else
+  printf 'dataplane mode=wireguard bpf_loaded=0 attachment_backend=none\n'
 fi
 
-run_bounded_in_owned_netns "${NSR}" INT 30 \
+run_bounded_in_owned_netns "${NSR}" INT "${INITIAL_CAPTURE_TIMEOUT}" \
   tcpdump -i ra0 -w "${TMPDIR}/ra.pcap" udp \
   >/dev/null 2>"${TMPDIR}/tcpdump-ra.log" &
 TCPDUMP_RA=$!
 assert_process_environment_secret_free "${TCPDUMP_RA}" "tcpdump-ra"
-run_bounded_in_owned_netns "${NSR}" INT 30 \
+run_bounded_in_owned_netns "${NSR}" INT "${INITIAL_CAPTURE_TIMEOUT}" \
   tcpdump -i rb0 -w "${TMPDIR}/rb.pcap" udp \
   >/dev/null 2>"${TMPDIR}/tcpdump-rb.log" &
 TCPDUMP_RB=$!
@@ -3772,7 +3941,12 @@ if ((tcpdump_rb_status != 0 && tcpdump_rb_status != 124)); then
   exit "${tcpdump_rb_status}"
 fi
 
-if ((XOR_ENABLED)); then
+if [[ "${DATAPLANE_MODE}" == "wireguard" ]]; then
+  PCAP_CHECKER_ARGS=(
+    --forbid-plain-mixed
+    --require-standard "initiation,response,transport"
+  )
+elif ((XOR_ENABLED)); then
   PCAP_CHECKER_ARGS=(
     --forbid-plain-standard
     --forbid-plain-mixed
@@ -3807,12 +3981,13 @@ if [[ "${UDP_ZERO_CHECKSUM_CHECKS}" == "enforce" ]]; then
   exercise_udp_zero_checksum
 fi
 
-run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" >"${TMPDIR}/status-a-after.json"
-run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" >"${TMPDIR}/status-b-after.json"
+if [[ "${DATAPLANE_MODE}" == "ebpf" ]]; then
+  run_agent_in_netns "${NSA}" "${PINA}" status --config "${SECRET_DIR}/agent-a.yaml" >"${TMPDIR}/status-a-after.json"
+  run_agent_in_netns "${NSB}" "${PINB}" status --config "${SECRET_DIR}/agent-b.yaml" >"${TMPDIR}/status-b-after.json"
 
-env -u XOR_PASSWORD python3 - \
-  "$TMPDIR/status-a-after.json" "$TMPDIR/status-b-after.json" \
-  "${XOR_ENABLED}" <<'PY'
+  env -u XOR_PASSWORD python3 - \
+    "$TMPDIR/status-a-after.json" "$TMPDIR/status-b-after.json" \
+    "${XOR_ENABLED}" <<'PY'
 import json
 import sys
 
@@ -3855,7 +4030,10 @@ for path in sys.argv[1:3]:
             raise SystemExit(f"{path}: {key}={stats.get(key)}")
 PY
 
-if [[ "${XOR_DISPATCH_FAILURE_CHECKS}" == "enforce" ]]; then
+fi
+
+if [[ "${DATAPLANE_MODE}" == "ebpf" &&
+  "${XOR_DISPATCH_FAILURE_CHECKS}" == "enforce" ]]; then
   status_a="${TMPDIR}/status-a-after.json"
   status_b="${TMPDIR}/status-b-after.json"
   generation_a="$(active_generation "${status_a}")"
@@ -3902,7 +4080,9 @@ fi
 
 explicit_teardown
 
-if ((XOR_ENABLED)); then
+if [[ "${DATAPLANE_MODE}" == "wireguard" ]]; then
+  echo "netns WireGuard ${OUTER_FAMILY} baseline smoke passed (bpf_loaded=0)"
+elif ((XOR_ENABLED)); then
   echo "netns WireGuard + eBPF ${OUTER_FAMILY} xor smoke passed (backend=${ATTACHMENT_BACKEND}, ${XOR_SCOPE}, max_bytes=${XOR_MAX_BYTES})"
 else
   echo "netns WireGuard + eBPF ${OUTER_FAMILY} smoke passed (backend=${ATTACHMENT_BACKEND})"

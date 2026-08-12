@@ -176,6 +176,7 @@ def validate_lease_owner(
     data: bytes,
     expected_config: pathlib.Path,
     expected_run_dir: pathlib.Path,
+    expected_action: str,
 ) -> None:
     if (
         not data.endswith(b"\n")
@@ -193,11 +194,13 @@ def validate_lease_owner(
     if (
         type(owner["pid"]) is not int
         or owner["pid"] <= 0
-        or owner["action"] != "detach"
+        or owner["action"] != expected_action
         or owner["config_path"] != str(expected_config)
         or owner["run_dir"] != str(expected_run_dir)
     ):
-        raise ContractError(f"lifecycle owner does not match final detach: {owner!r}")
+        raise ContractError(
+            f"lifecycle owner does not match expected teardown: {owner!r}"
+        )
 
 
 def hold(args: argparse.Namespace) -> None:
@@ -304,6 +307,7 @@ def hold(args: argparse.Namespace) -> None:
             read_exact_file(lease_fd, current_lease_metadata, 16 * 1024),
             expected_config,
             expected_run_dir,
+            args.expected_action,
         )
         recheck_verified_file(
             lease_path,
@@ -390,6 +394,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--boot-id", required=True)
     parser.add_argument("--expected-config", required=True)
     parser.add_argument("--expected-run-dir", required=True)
+    parser.add_argument(
+        "--expected-action",
+        choices=("detach", "wireguard-teardown"),
+        default="detach",
+    )
     parser.add_argument("--expected-uid", type=int, required=True)
     parser.add_argument("--status-path", required=True)
     parser.add_argument("--parent-pid", type=int, required=True)
