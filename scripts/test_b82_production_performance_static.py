@@ -46,6 +46,14 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
         self.assertNotIn("cells=21", matrix)
         self.assertNotIn("samples=189", matrix)
 
+    def test_privileged_shell_entrypoints_use_a_real_effective_group_probe(self) -> None:
+        for source in (self.matrix, self.runner, self.exporter):
+            self.assertNotIn("${EGID}", source)
+            self.assertIn(
+                'if [[ "${EUID}" -ne 0 || "$(/usr/bin/id -g)" -ne 0 ]]; then',
+                source,
+            )
+
     def test_module_lease_wraps_the_entire_matrix_and_has_recovery(self) -> None:
         matrix = self.matrix
         for fragment in (

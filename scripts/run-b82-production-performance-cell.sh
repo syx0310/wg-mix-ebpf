@@ -31,7 +31,7 @@ umask 077
 unset BASH_ENV CDPATH ENV GLOBIGNORE LD_LIBRARY_PATH LD_PRELOAD \
   PERL5LIB PYTHONHOME PYTHONPATH RUBYLIB XOR_PASSWORD
 
-if [[ "${EUID}" -ne 0 || "${EGID}" -ne 0 ]]; then
+if [[ "${EUID}" -ne 0 || "$(/usr/bin/id -g)" -ne 0 ]]; then
   echo "error: run the B82 production performance runner as root" >&2
   exit 1
 fi
