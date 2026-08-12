@@ -1783,7 +1783,10 @@ static __always_inline int prepare_xor_context_by_id(struct __sk_buff *skb,
 // it to the current rule, generation, WireGuard and an event/session already
 // admitted by this exact collection. Every other managed TCP packet remains a
 // fail-closed miss; ordinary UDP continues through the normal transform.
-static __noinline int faketcp_authorize_userspace_control(
+// Keep this forced inline: a separate frame would be added above the already
+// large egress transform frame, even though authorization completes before the
+// UDP parser and the two phases can safely reuse stack slots.
+static __always_inline int faketcp_authorize_userspace_control(
 	struct __sk_buff *skb, __u64 generation,
 	struct faketcp_runtime_scratch *scratch)
 {

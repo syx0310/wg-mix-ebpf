@@ -19,8 +19,12 @@ func TestFakeTCPUserspaceControlEgressIsNarrowAndFailClosed(t *testing.T) {
 	control := string(controlBytes)
 
 	authorize := sourceSection(t, tc,
-		"static __noinline int faketcp_authorize_userspace_control(",
+		"static __always_inline int faketcp_authorize_userspace_control(",
 		"#endif\n\nstatic __always_inline int run_xor_egress_segment(")
+	if strings.Contains(tc,
+		"static __noinline int faketcp_authorize_userspace_control(") {
+		t.Fatal("userspace control authorization regained a BPF-to-BPF call frame")
+	}
 	for _, want := range []string{
 		"if (ip_protocol != IPPROTO_TCP)\n\t\treturn 0",
 		"sizeof(*headers) != skb->len - network_off",
