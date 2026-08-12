@@ -137,8 +137,9 @@ readonly VB="vb${RUN_ID:0:6}" VRB="rb${RUN_ID:0:6}"
 readonly ENDPOINT_A="${ROOT}/endpoint-a" ENDPOINT_B="${ROOT}/endpoint-b"
 readonly RUN_A="${ENDPOINT_A}/run" RUN_B="${ENDPOINT_B}/run"
 readonly BIN="${BINARY}"
-readonly GO_CACHE="${STAGE_ROOT}/go-cache" GO_MOD_CACHE="${STAGE_ROOT}/go-mod-cache"
-readonly GO_PATH="${STAGE_ROOT}/go-path" GO_TMP="${STAGE_ROOT}/go-tmp"
+readonly BUILD_CACHE_ROOT="${ROOT}/build-cache"
+readonly GO_CACHE="${BUILD_CACHE_ROOT}/go-cache" GO_MOD_CACHE="${STAGE_ROOT}/go-mod-cache"
+readonly GO_PATH="${BUILD_CACHE_ROOT}/go-path" GO_TMP="${BUILD_CACHE_ROOT}/go-tmp"
 readonly -a GO_OFFLINE_ENV=(
   /usr/bin/env -i PATH="${SAFE_PATH}" LC_ALL=C CGO_ENABLED=0 GOENV=off
   GOFLAGS=-mod=readonly GOTOOLCHAIN=local 'GOVCS=*:off'

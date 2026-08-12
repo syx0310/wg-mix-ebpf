@@ -92,10 +92,12 @@ evidence after success or failure. An unexpected failure stops the matrix,
 captures all stdout/stderr and read-only state in one pass, and leaves the
 failed cell resources for an explicit, reviewed recovery invocation.
 
-Root writes are bounded to the matrix/cell evidence roots (including a
-per-cell `artifacts/` directory), stage-owned Go caches, three run-derived
-network namespaces, two private bpffs mounts/pin roots, and the selected module
-only when this cell loaded it and recorded its boot/object/module identity.
+Root writes are bounded to the matrix/cell evidence roots (including per-cell
+`artifacts/` and `build-cache/` directories on `/var/tmp`), the staged
+read-only Go module cache, three run-derived network namespaces, two private
+bpffs mounts/pin roots, and the selected module only when this cell loaded it
+and recorded its boot/object/module identity. Writable Go build, path, and
+temporary caches never consume the `/run` source-stage tmpfs.
 The root-owned source checkout is frozen: three BPF objects, the Go binary and
 the selected module are all redirected to the cell artifact directory, and a
 full non-`.git` tree digest plus Git clean/commit identity is checked before

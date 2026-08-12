@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"strings"
 
 	"github.com/cilium/ebpf"
@@ -35,7 +36,7 @@ func LoadExperimentalFakeTCPObjectTestIdentity(
 	if err := ctx.Err(); err != nil {
 		return ObjectIdentity{}, err
 	}
-	err = loadExperimentalFakeTCPCollection(
+	err = verifierLoadEveryExperimentalFakeTCPProgram(
 		ctx,
 		spec,
 		identity.Source,
@@ -45,6 +46,89 @@ func LoadExperimentalFakeTCPObjectTestIdentity(
 		return ObjectIdentity{}, err
 	}
 	return identity, nil
+}
+
+// verifierLoadEveryExperimentalFakeTCPProgram loads each manifest-approved
+// program in an otherwise complete isolated collection. A rejected program
+// doesn't hide verifier errors in later programs, so one diagnostic run
+// reports the complete failing set. Every partial or successful collection is
+// closed before the next program and nothing is attached, pinned, or seeded.
+func verifierLoadEveryExperimentalFakeTCPProgram(
+	ctx context.Context,
+	spec *ebpf.CollectionSpec,
+	source string,
+	dependencies experimentalCollectionAcquisitionDependencies,
+) error {
+	if ctx == nil {
+		return errors.New("verifier-load experimental FakeTCP BPF collection: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := validateExperimentalExtensionManifest(spec); err != nil {
+		return fmt.Errorf("validate experimental FakeTCP BPF object %s: %w", source, err)
+	}
+	if err := validateExperimentalCollectionAcquisitionDependencies(dependencies); err != nil {
+		return err
+	}
+	if err := dependencies.probeKernelDependency(); err != nil {
+		return fmt.Errorf("probe experimental FakeTCP kernel dependency: %w", err)
+	}
+	if err := dependencies.removeMemlock(); err != nil {
+		return fmt.Errorf("remove experimental FakeTCP memlock limit: %w", err)
+	}
+
+	names := make([]string, 0, len(spec.Programs))
+	for name := range spec.Programs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var failures []error
+	for _, name := range names {
+		if err := ctx.Err(); err != nil {
+			failures = append(failures, err)
+			break
+		}
+		isolated := spec.Copy()
+		for other := range isolated.Programs {
+			if other != name {
+				delete(isolated.Programs, other)
+			}
+		}
+		collection, err := dependencies.newCollection(isolated)
+		if err != nil {
+			failure := fmt.Errorf(
+				"verifier-load experimental FakeTCP program %q from %s: %w",
+				name,
+				source,
+				err,
+			)
+			if collection != nil {
+				failure = errors.Join(
+					failure,
+					closeUnownedExperimentalCollection(collection, source, dependencies),
+				)
+			}
+			failures = append(failures, failure)
+			continue
+		}
+		if collection == nil {
+			failures = append(failures, fmt.Errorf(
+				"verifier-load experimental FakeTCP program %q from %s: loader returned nil collection",
+				name,
+				source,
+			))
+			continue
+		}
+		if err := closeUnownedExperimentalCollection(collection, source, dependencies); err != nil {
+			failures = append(failures, fmt.Errorf(
+				"verifier-load experimental FakeTCP program %q: %w",
+				name,
+				err,
+			))
+		}
+	}
+	return errors.Join(failures...)
 }
 
 func loadExperimentalFakeTCPCollection(

@@ -2133,6 +2133,7 @@ static __always_inline int faketcp_egress_admission_matches(
 	__u32 xor_target = 0;
 	__u32 required_features;
 	__u32 current_wire = 0;
+	__u32 expected_mixed;
 	__u32 expected_standard;
 	__u32 ip_total_len;
 	__u32 wire_len;
@@ -2187,10 +2188,12 @@ static __always_inline int faketcp_egress_admission_matches(
 	    admission->profile_policy_flags != profile->policy_flags ||
 	    admission->type_kind >= 4)
 		return 0;
+	if (profile_mixed_from_kind(profile, admission->type_kind,
+				    &expected_mixed) < 0)
+		return 0;
 	expected_standard = wg_cpu_to_le32((__u32)admission->type_kind + 1);
 	if (admission->standard_wire != expected_standard ||
-	    admission->mixed_wire !=
-		wg_cpu_to_le32(profile->standard_to_mixed[admission->type_kind]) ||
+	    admission->mixed_wire != wg_cpu_to_le32(expected_mixed) ||
 	    managed->generation != generation || rule->generation != generation ||
 	    profile->generation != generation || rule->action != ACTION_REWRITE ||
 	    rule->transport_mode != TRANSPORT_FAKETCP ||
@@ -2291,6 +2294,7 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 	__u32 feature_mask = FAKETCP_ADMISSION_REQUIRED_FEATURES;
 	__u32 xor_target = 0;
 	__u32 old_total_len;
+	__u32 expected_mixed;
 	__u16 udp_len;
 	int is_gso = skb->gso_segs || skb->gso_size;
 
@@ -2320,7 +2324,8 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 	    rule->transport_mode != TRANSPORT_FAKETCP || type_kind < 0 ||
 	    type_kind >= 4 ||
 	    standard_wire != wg_cpu_to_le32((__u32)type_kind + 1) ||
-	    mixed_wire != wg_cpu_to_le32(profile->standard_to_mixed[type_kind])) {
+	    profile_mixed_from_kind(profile, type_kind, &expected_mixed) < 0 ||
+	    mixed_wire != wg_cpu_to_le32(expected_mixed)) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 		return FAKETCP_ADMISSION_DROP;
 	}
@@ -2451,6 +2456,29 @@ struct faketcp_gso_loop_context {
 	int error;
 };
 
+static __always_inline int faketcp_gso_mixed_from_kind(
+	const struct faketcp_gso_loop_context *context, int kind, __u32 *mixed)
+{
+	if (!context || !mixed)
+		return -1;
+	switch (kind) {
+	case 0:
+		*mixed = context->mixed_type[0];
+		return 0;
+	case 1:
+		*mixed = context->mixed_type[1];
+		return 0;
+	case 2:
+		*mixed = context->mixed_type[2];
+		return 0;
+	case 3:
+		*mixed = context->mixed_type[3];
+		return 0;
+	default:
+		return -1;
+	}
+}
+
 static __always_inline __u64 faketcp_gso_contract_word(__u64 contract,
 							__u32 word)
 {
@@ -2491,7 +2519,8 @@ static __noinline long faketcp_gso_validate_segment(__u32 index, void *opaque)
 		return 1;
 	}
 	kind = kind_from_standard(wg_le32_to_cpu(wire_type));
-	if (kind < 0 || !validate_len(kind, segment_length)) {
+	if (kind < 0 || !validate_len(kind, segment_length) ||
+	    faketcp_gso_mixed_from_kind(context, kind, &mixed_wire) < 0) {
 		context->error = -1;
 		return 1;
 	}
@@ -2506,7 +2535,7 @@ static __noinline long faketcp_gso_validate_segment(__u32 index, void *opaque)
 		if (xor_target > context->max_xor_target)
 			context->max_xor_target = xor_target;
 	}
-	mixed_wire = wg_cpu_to_le32(context->mixed_type[kind]);
+	mixed_wire = wg_cpu_to_le32(mixed_wire);
 	context->segment_contract = faketcp_gso_contract_word(
 		context->segment_contract, index);
 	context->segment_contract = faketcp_gso_contract_word(
@@ -2568,9 +2597,10 @@ static __always_inline int faketcp_gso_build_projection(
 	    info->payload_len - (expected_segments - 1) * skb->gso_size < 32)
 		return -1;
 	context.gso_segments = expected_segments;
-#pragma unroll
-	for (int kind = 0; kind < 4; kind++)
-		context.mixed_type[kind] = profile->standard_to_mixed[kind];
+	context.mixed_type[0] = profile->standard_to_mixed[0];
+	context.mixed_type[1] = profile->standard_to_mixed[1];
+	context.mixed_type[2] = profile->standard_to_mixed[2];
+	context.mixed_type[3] = profile->standard_to_mixed[3];
 #ifdef WG_MIX_FAKETCP_LEGACY_515
 	if (faketcp_legacy_515_validate_gso_segments(&context) < 0)
 #else
@@ -2604,11 +2634,12 @@ static __noinline long faketcp_gso_rewrite_type(__u32 index, void *opaque)
 		return 1;
 	}
 	kind = kind_from_standard(wg_le32_to_cpu(old_wire));
-	if (kind < 0) {
+	if (kind < 0 ||
+	    faketcp_gso_mixed_from_kind(context, kind, &new_wire) < 0) {
 		context->error = -1;
 		return 1;
 	}
-	new_wire = wg_cpu_to_le32(context->mixed_type[kind]);
+	new_wire = wg_cpu_to_le32(new_wire);
 	if (bpf_skb_store_bytes(context->skb,
 				context->payload_offset + segment_offset,
 				&new_wire, sizeof(new_wire),
@@ -2776,9 +2807,10 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 	}
 	context.gso_size = admission->gso.gso_size;
 	context.gso_segments = admission->gso.logical_segments;
-#pragma unroll
-	for (int kind = 0; kind < 4; kind++)
-		context.mixed_type[kind] = profile->standard_to_mixed[kind];
+	context.mixed_type[0] = profile->standard_to_mixed[0];
+	context.mixed_type[1] = profile->standard_to_mixed[1];
+	context.mixed_type[2] = profile->standard_to_mixed[2];
+	context.mixed_type[3] = profile->standard_to_mixed[3];
 	if (rule->cipher_id) {
 		context.cipher = lookup_cipher(rule->cipher_id, generation);
 		if (!context.cipher) {
@@ -3176,6 +3208,7 @@ static __always_inline int faketcp_consume_ingress_admission(
 	__u32 decoded_total_len;
 	__u32 input_wire = 0;
 	__u32 mixed_wire;
+	__u32 expected_mixed;
 	__u32 standard_wire;
 
 	if (meta + sizeof(*metadata) > data) {
@@ -3265,11 +3298,15 @@ static __always_inline int faketcp_consume_ingress_admission(
 	mixed_wire = input_wire;
 	if (cipher)
 		mixed_wire = xor_type_word_copy(mixed_wire, cipher);
+	if (profile_mixed_from_kind(profile, admission->type_kind,
+				    &expected_mixed) < 0) {
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
+		return -1;
+	}
 	standard_wire = wg_cpu_to_le32((__u32)admission->type_kind + 1);
 	if (admission->decision.transform.mixed_wire != mixed_wire ||
 	    admission->decision.transform.standard_wire != standard_wire ||
-	    profile->standard_to_mixed[admission->type_kind] !=
-		wg_le32_to_cpu(mixed_wire) ||
+	    expected_mixed != wg_le32_to_cpu(mixed_wire) ||
 	    !validate_len(admission->type_kind, admission->payload_len)) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return -1;
@@ -3603,11 +3640,9 @@ faketcp_capture_close_packet(struct xdp_md *xdp, __u32 packet_off,
 // a managed-port match is an explicit XDP_DROP.
 static __always_inline int faketcp_xdp_admission_checkpoint(
 	struct xdp_md *xdp,
-	void *data,
-	void *data_end,
 	__u64 ip_off,
-	struct iphdr *iph,
-	struct tcphdr *tcp,
+	const struct iphdr *iph,
+	const struct tcphdr *tcp,
 	const struct faketcp_l3_info *l3,
 	const struct faketcp_managed_port_value *managed_listener,
 	const struct ingress_listener_value *policy_listener,
@@ -3628,6 +3663,7 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 	__u32 xor_target = 0;
 	__u32 input_wire = 0;
 	__u32 mixed_wire = 0;
+	__u32 decoded_standard = 0;
 	__u16 tcp_len;
 	__u8 flags;
 	__u8 close_control;
@@ -3660,10 +3696,9 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 		return FAKETCP_ADMISSION_DROP;
 	}
-	if (!l3 ||
+	if (!l3 || !iph || !tcp ||
 	    faketcp_managed_transform_status(l3, IPPROTO_TCP) != FAKETCP_L3_OK ||
-	    l3->l3_off != ip_off || l3->l4_off != ip_off + sizeof(*iph) ||
-	    (void *)(iph + 1) > data_end || (void *)(tcp + 1) > data_end) {
+	    l3->l3_off != ip_off || l3->l4_off != ip_off + sizeof(*iph)) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
 	}
@@ -3671,7 +3706,7 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 	if (admission->wire_total_len < sizeof(*iph) + sizeof(*tcp) ||
 	    admission->wire_total_len > FAKETCP_MAX_IPV4_TOTAL_LEN +
 				   FAKETCP_HEADER_DELTA ||
-	    data + ip_off + admission->wire_total_len > data_end) {
+	    admission->wire_total_len != l3->l3_len) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
 	}
@@ -3772,14 +3807,10 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 	mixed_wire = input_wire;
 	if (cipher)
 		mixed_wire = xor_type_word_copy(mixed_wire, cipher);
-#pragma unroll
-	for (int i = 0; i < 4; i++) {
-		if (profile->standard_to_mixed[i] == wg_le32_to_cpu(mixed_wire)) {
-			type_kind = i;
-			break;
-		}
-	}
-	if (type_kind < 0 || !validate_len(type_kind, admission->payload_len)) {
+	if (profile_decode_mixed(profile, wg_le32_to_cpu(mixed_wire),
+				 &type_kind, &decoded_standard) < 0 ||
+	    decoded_standard != (__u32)type_kind + 1 ||
+	    !validate_len(type_kind, admission->payload_len)) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
 	}
@@ -3818,8 +3849,8 @@ static __always_inline int faketcp_xdp_reject(__u32 stat)
 static __always_inline int
 faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 {
-	void *data = (void *)(long)xdp->data;
-	void *data_end = (void *)(long)xdp->data_end;
+	void *data;
+	void *data_end;
 	struct iphdr *iph;
 	struct tcphdr *tcp;
 	struct udphdr *wire_ports;
@@ -3840,6 +3871,7 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	__u8 family = 0;
 	__u8 parser_mode;
 	__u16 total_len, tcp_len, payload_len, new_total_len;
+	__u16 destination_port;
 	__u32 frame_len, l3_off = 0, seq, next_seq;
 	__u64 now;
 	__s64 sum;
@@ -3861,8 +3893,13 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	__builtin_memset(tail, 0, FAKETCP_HEADER_DELTA);
 	managed_interface = faketcp_xdp_managed_interface(xdp->ingress_ifindex,
 							 generation);
-	frame_len = (__u32)((long)data_end - (long)data);
 	parser_mode = lookup_parser_mode(xdp->ingress_ifindex, generation);
+	// Establish packet pointers only after the initial map helpers. Every later
+	// helper boundary either consumes a scalar/header snapshot or is followed by
+	// a fresh data/data_end load before direct packet access resumes.
+	data = (void *)(long)xdp->data;
+	data_end = (void *)(long)xdp->data_end;
+	frame_len = (__u32)((long)data_end - (long)data);
 	parse_rc = faketcp_xdp_l3_start(data, data_end, parser_mode, &l3_off,
 					       &family);
 	parse_action = faketcp_xdp_l3_action(parse_rc, managed_interface);
@@ -3876,8 +3913,12 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	if ((void *)(wire_ports + 1) > data_end)
 		return managed_interface ?
 		       faketcp_xdp_reject(FAKETCP_STAT_BAD_PACKET) : XDP_PASS;
+	// Read the common source/destination prefix while the immediately preceding
+	// packet bound is still the verifier's active proof. Do not dereference this
+	// packet pointer again after the first map helper.
+	destination_port = bpf_ntohs(wire_ports->dest);
 	managed_listener = faketcp_xdp_managed_port(
-		xdp->ingress_ifindex, bpf_ntohs(wire_ports->dest), generation);
+		xdp->ingress_ifindex, destination_port, generation);
 	if (!managed_listener)
 		return XDP_PASS;
 	// ParseL3 can classify IPv4 options, IPv6 and TCP options, but the current
@@ -3893,19 +3934,29 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	if (l3->transport_protocol == IPPROTO_UDP)
 		return faketcp_xdp_reject(
 			FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
-	tcp = (struct tcphdr *)wire_ports;
+	// The managed-port lookup is a helper boundary. Reload both packet pointers
+	// and reconstruct the TCP pointer from the already validated L3 descriptor;
+	// never carry the pre-helper packet register into another dereference.
+	data = (void *)(long)xdp->data;
+	data_end = (void *)(long)xdp->data_end;
+	tcp = data + l3->l4_off;
 	if ((void *)(tcp + 1) > data_end)
 		return faketcp_xdp_reject(FAKETCP_STAT_BAD_PACKET);
 	iph = data + l3->l3_off;
 	if ((void *)(iph + 1) > data_end)
 		return faketcp_xdp_reject(FAKETCP_STAT_BAD_PACKET);
+	// Snapshot both fixed headers before the next helper. All admission,
+	// checksum and close decisions below use map-backed scratch, so helper calls
+	// and adjust_meta cannot invalidate a packet-pointer proof still in use.
+	*old_tcp = *tcp;
+	*new_ip = *iph;
 	policy_listener = lookup_ingress_listener(
-		xdp->ingress_ifindex, bpf_ntohs(tcp->dest), FAMILY_IPV4,
+		xdp->ingress_ifindex, destination_port, FAMILY_IPV4,
 		generation);
 	// The policy lookup deliberately precedes the single admission checkpoint.
 	// A managed packet can only PASS after that checkpoint and full decoding.
 	admission_decision = faketcp_xdp_admission_checkpoint(
-		xdp, data, data_end, l3->l3_off, iph, tcp, l3, managed_listener,
+		xdp, l3->l3_off, new_ip, old_tcp, l3, managed_listener,
 		policy_listener, managed_interface, generation, admission,
 		&session);
 	if (admission_decision == FAKETCP_ADMISSION_DROP)
@@ -3926,7 +3977,7 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 		return XDP_DROP;
 	}
 	if (admission_decision == FAKETCP_ADMISSION_CLOSE) {
-		const __u8 *raw_tcp = (const __u8 *)tcp;
+		const __u8 *raw_tcp = (const __u8 *)old_tcp;
 
 		if (admission->session_projection.window == 0) {
 			inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
@@ -3939,12 +3990,12 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 		    seq != admission->decision.close.rx_sequence ||
 		    admission->acknowledgement !=
 			admission->decision.close.tx_sequence ||
-		    bpf_ntohs(tcp->window) != admission->session_projection.window ||
-		    tcp->urg_ptr != 0) {
+		    bpf_ntohs(old_tcp->window) != admission->session_projection.window ||
+		    old_tcp->urg_ptr != 0) {
 			inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 			return XDP_DROP;
 		}
-		if (!faketcp_close_checksums_valid(iph, tcp)) {
+		if (!faketcp_close_checksums_valid(new_ip, old_tcp)) {
 			inc_faketcp_stat(FAKETCP_STAT_CHECKSUM_ERROR);
 			return XDP_DROP;
 		}
@@ -3970,7 +4021,6 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return XDP_DROP;
 	}
-	*old_tcp = *tcp;
 #ifdef WG_MIX_FAKETCP_LEGACY_515
 	if (faketcp_legacy_515_xdp_load_tail(
 		    xdp, l3->l3_off + total_len - FAKETCP_HEADER_DELTA,
@@ -4018,7 +4068,6 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 	if (bpf_xdp_adjust_meta(xdp, -(int)sizeof(struct faketcp_metadata)) < 0)
 		return XDP_DROP;
 	data = (void *)(long)xdp->data;
-	data_end = (void *)(long)xdp->data_end;
 	metadata = (void *)(long)xdp->data_meta;
 	if ((void *)(metadata + 1) > data)
 		return XDP_DROP;
@@ -4041,10 +4090,6 @@ faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)
 
 	// The integration gate accepts only a fixed 20-byte IPv4 header, so one
 	// bounded full-header checksum recomputation covers every transformed byte.
-	iph = data + l3->l3_off;
-	if ((void *)(iph + 1) > data_end)
-		return XDP_DROP;
-	*new_ip = *iph;
 	new_ip->protocol = IPPROTO_UDP;
 	new_ip->tot_len = bpf_htons(new_total_len);
 	new_ip->check = 0;

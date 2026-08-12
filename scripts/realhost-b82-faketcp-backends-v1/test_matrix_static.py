@@ -61,6 +61,29 @@ class StaticMatrixTest(unittest.TestCase):
         self.assertIn("'0:0:700:directory'", self.root_cell)
         self.assertIn(f"`{RUN_PARENT}/<run-id>`", self.readme)
 
+    def test_writable_go_build_state_is_outside_run_tmpfs(self) -> None:
+        combined = self.root_cell + self.netns
+        self.assertIn(
+            'readonly BUILD_CACHE_ROOT="${EVIDENCE_ROOT}/build-cache"',
+            self.root_cell,
+        )
+        self.assertIn(
+            'readonly BUILD_CACHE_ROOT="${ROOT}/build-cache"', self.netns
+        )
+        self.assertIn('readonly GO_MOD_CACHE="${STAGE_ROOT}/go-mod-cache"', combined)
+        for forbidden in (
+            'GO_CACHE="${STAGE_ROOT}/go-cache"',
+            'GO_PATH="${STAGE_ROOT}/go-path"',
+            'GO_TMP="${STAGE_ROOT}/go-tmp"',
+            "stage_caches=",
+        ):
+            self.assertNotIn(forbidden, combined)
+        self.assertIn("build_caches=%s,%s,%s stage_module_cache=%s", self.root_cell)
+        self.assertIn(
+            'mkdir --mode=0700 -- "${GO_CACHE}" "${GO_PATH}" "${GO_TMP}"',
+            self.root_cell,
+        )
+
     def run_plan(self, release: str) -> dict[str, object]:
         completed = subprocess.run(
             [

@@ -89,10 +89,11 @@ readonly PREFIX="f${RUN_ID}"
 readonly NSA="${PREFIX}a" NSR="${PREFIX}r" NSB="${PREFIX}b"
 readonly PIN_A="/sys/fs/bpf/wg-mix-ebpf-faketcp-${RUN_ID}-a"
 readonly PIN_B="/sys/fs/bpf/wg-mix-ebpf-faketcp-${RUN_ID}-b"
-readonly GO_CACHE="${STAGE_ROOT}/go-cache"
+readonly BUILD_CACHE_ROOT="${EVIDENCE_ROOT}/build-cache"
+readonly GO_CACHE="${BUILD_CACHE_ROOT}/go-cache"
 readonly GO_MOD_CACHE="${STAGE_ROOT}/go-mod-cache"
-readonly GO_PATH="${STAGE_ROOT}/go-path"
-readonly GO_TMP="${STAGE_ROOT}/go-tmp"
+readonly GO_PATH="${BUILD_CACHE_ROOT}/go-path"
+readonly GO_TMP="${BUILD_CACHE_ROOT}/go-tmp"
 readonly -a BUILD_ENV=(
   /usr/bin/env -i PATH="${SAFE_PATH}" LC_ALL=C CGO_ENABLED=0 GOENV=off
   GOFLAGS=-mod=readonly GOTOOLCHAIN=local 'GOVCS=*:off'
@@ -121,9 +122,9 @@ plan() {
   printf 'B82_FAKETCP_CELL_PLAN run_id=%s label=%s source=%s commit=%s xdp=exact-generic attachment=%s checksum=%s artifact=%s wg_count=%s xor=%s gso=%s\n' \
     "${RUN_ID}" "${LABEL}" "${SOURCE}" "${COMMIT}" "${ATTACHMENT_BACKEND}" \
     "${CHECKSUM_BACKEND}" "${ARTIFACT}" "${WG_COUNT}" "${XOR_MODE}" "${GSO_MODE}"
-  printf 'WRITE_SET evidence=%s artifacts=%s stage_caches=%s,%s,%s,%s netns=%s,%s,%s pins=%s,%s module=%s module_object=%s module_lease_id=%s source=frozen-read-only\n' \
+  printf 'WRITE_SET evidence=%s artifacts=%s build_caches=%s,%s,%s stage_module_cache=%s netns=%s,%s,%s pins=%s,%s module=%s module_object=%s module_lease_id=%s source=frozen-read-only\n' \
     "${EVIDENCE_ROOT}" "${ARTIFACT_ROOT}" \
-    "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}" \
+    "${GO_CACHE}" "${GO_PATH}" "${GO_TMP}" "${GO_MOD_CACHE}" \
     "${NSA}" "${NSR}" "${NSB}" "${PIN_A}" "${PIN_B}" \
     "${module_name}" "${module_object}" "${MODULE_LEASE_ID}"
   printf 'BPF_BUILD argv='; quote_argv "${BUILD_ENV[@]}" /usr/bin/timeout \
@@ -205,11 +206,9 @@ verify_source_immutable() {
   actual="$(source_tree_digest)"
   [[ "${actual}" == "${SOURCE_DIGEST_BEFORE}" ]] || fail frozen-source-mutated 79
 }
-for cache in "${GO_CACHE}" "${GO_MOD_CACHE}" "${GO_PATH}" "${GO_TMP}"; do
-  [[ -d "${cache}" && ! -L "${cache}" &&
-    "$(stat -Lc '%u:%g:%a:%F' -- "${cache}")" == '0:0:700:directory' ]] ||
-    fail "stage-cache:${cache}" 79
-done
+[[ -d "${GO_MOD_CACHE}" && ! -L "${GO_MOD_CACHE}" &&
+  "$(stat -Lc '%u:%g:%a:%F' -- "${GO_MOD_CACHE}")" == '0:0:700:directory' ]] ||
+  fail "stage-module-cache:${GO_MOD_CACHE}" 79
 
 validate_regular() {
   local path="$1" execute="$2" shape mode
@@ -326,6 +325,8 @@ if [[ "${MODE}" == restore ]]; then restore_exact; exit 0; fi
 mkdir --mode=0700 -- "${EVIDENCE_ROOT}"
 mkdir --mode=0700 -- "${EVIDENCE}"
 mkdir --mode=0700 -- "${ARTIFACT_ROOT}"
+mkdir --mode=0700 -- "${BUILD_CACHE_ROOT}"
+mkdir --mode=0700 -- "${GO_CACHE}" "${GO_PATH}" "${GO_TMP}"
 printf 'wg-mix-ebpf-faketcp-backends-v1:%s:%s\n' "${RUN_ID}" "${COMMIT}" >"${OWNER}"
 trap 'on_error $? $LINENO' ERR
 trap 'on_error 130 $LINENO' INT TERM

@@ -975,6 +975,64 @@ static __always_inline int kind_from_standard(__u32 type_word)
 	}
 }
 
+// Keep every profile-map access at a compile-time constant offset. Some
+// verifiers do not retain the 0..3 range after a value has crossed an inlined
+// admission path, especially when the discriminator was copied through
+// metadata. A switch also makes the fail-closed default explicit instead of
+// relying on a dynamic array index into a 48-byte map value.
+static __always_inline int
+profile_mixed_from_kind(const struct profile_value *profile, int kind,
+			__u32 *mixed)
+{
+	if (!profile || !mixed)
+		return -1;
+	switch (kind) {
+	case 0:
+		*mixed = profile->standard_to_mixed[0];
+		return 0;
+	case 1:
+		*mixed = profile->standard_to_mixed[1];
+		return 0;
+	case 2:
+		*mixed = profile->standard_to_mixed[2];
+		return 0;
+	case 3:
+		*mixed = profile->standard_to_mixed[3];
+		return 0;
+	default:
+		return -1;
+	}
+}
+
+static __always_inline int
+profile_decode_mixed(const struct profile_value *profile, __u32 mixed,
+		     int *kind, __u32 *standard)
+{
+	if (!profile || !kind || !standard)
+		return -1;
+	if (profile->standard_to_mixed[0] == mixed) {
+		*kind = 0;
+		*standard = profile->mixed_to_standard[0];
+		return 0;
+	}
+	if (profile->standard_to_mixed[1] == mixed) {
+		*kind = 1;
+		*standard = profile->mixed_to_standard[1];
+		return 0;
+	}
+	if (profile->standard_to_mixed[2] == mixed) {
+		*kind = 2;
+		*standard = profile->mixed_to_standard[2];
+		return 0;
+	}
+	if (profile->standard_to_mixed[3] == mixed) {
+		*kind = 3;
+		*standard = profile->mixed_to_standard[3];
+		return 0;
+	}
+	return -1;
+}
+
 static __always_inline int validate_len(int kind, __u32 payload_len)
 {
 	if (kind == 0)
@@ -1975,7 +2033,11 @@ int wg_mix_egress(struct __sk_buff *skb)
 			return TC_ACT_SHOT;
 		}
 	}
-	new_wire = wg_cpu_to_le32(profile->standard_to_mixed[kind]);
+	if (profile_mixed_from_kind(profile, kind, &new_wire) < 0) {
+		inc_stat(STAT_EGRESS_BAD_TYPE);
+		return TC_ACT_SHOT;
+	}
+	new_wire = wg_cpu_to_le32(new_wire);
 	if (cipher_id != 0) {
 		if (info->family == FAMILY_IPV4) {
 			if (!info->ipv4_udp_csum_zero)
@@ -2155,15 +2217,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 			return TC_ACT_SHOT;
 		}
 		old_type = wg_le32_to_cpu(old_wire);
-		kind = -1;
-#pragma unroll
-		for (int i = 0; i < 4; i++) {
-			if (profile->standard_to_mixed[i] == old_type) {
-				kind = i;
-				break;
-			}
-		}
-		if (kind < 0) {
+		if (profile_decode_mixed(profile, old_type, &kind, &new_wire) < 0) {
 			return icmp_bad_ingress_action(STAT_INGRESS_BAD_TYPE,
 						       icmp_wildcard_id);
 		}
@@ -2171,7 +2225,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 			return icmp_bad_ingress_action(STAT_INGRESS_BAD_LENGTH,
 						       icmp_wildcard_id);
 		}
-		new_wire = wg_cpu_to_le32(profile->mixed_to_standard[kind]);
+		new_wire = wg_cpu_to_le32(new_wire);
 		rc = rewrite_icmp_to_udp(skb, &icmp_info, icmp_listener, new_wire);
 		if (rc < 0) {
 			if (rc == -2)
@@ -2263,14 +2317,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 	}
 	old_type = wg_le32_to_cpu(old_wire);
 
-#pragma unroll
-	for (int i = 0; i < 4; i++) {
-		if (profile->standard_to_mixed[i] == old_type) {
-			kind = i;
-			break;
-		}
-	}
-	if (kind < 0) {
+	if (profile_decode_mixed(profile, old_type, &kind, &new_wire) < 0) {
 		inc_stat(cipher_id != 0 ? STAT_XOR_BAD_TYPE_AFTER_DECRYPT :
 			 STAT_INGRESS_BAD_TYPE);
 		return TC_ACT_SHOT;
@@ -2279,7 +2326,7 @@ int wg_mix_ingress(struct __sk_buff *skb)
 		inc_stat(STAT_INGRESS_BAD_LENGTH);
 		return TC_ACT_SHOT;
 	}
-	new_wire = wg_cpu_to_le32(profile->mixed_to_standard[kind]);
+	new_wire = wg_cpu_to_le32(new_wire);
 	if (cipher_id != 0) {
 		if (!(info.family == FAMILY_IPV4 && info.ipv4_udp_csum_zero))
 			xor_checksum_mode = XOR_CSUM_MANUAL;

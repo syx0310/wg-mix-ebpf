@@ -8,6 +8,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"sort"
 	"strings"
 	"testing"
 
@@ -194,6 +195,64 @@ func TestExperimentalVerifierLoadAggregatesOwnerCloseFailures(t *testing.T) {
 	}
 	if ownedMap.closes != 1 || ownedProgram.closes != 1 {
 		t.Fatalf("owner closes: map=%d program=%d, want exactly 1 each", ownedMap.closes, ownedProgram.closes)
+	}
+}
+
+func TestExperimentalVerifierSweepAttemptsEveryProgramAndAggregatesFailures(t *testing.T) {
+	spec := canonicalExperimentalCollectionSpec()
+	firstErr := errors.New("first injected verifier failure")
+	secondErr := errors.New("second injected verifier failure")
+	failing := map[string]error{
+		"wg_mix_faketcp_ingress": firstErr,
+		"wg_mix_ingress":         secondErr,
+	}
+	var loaded []string
+	probeCalls := 0
+	memlockCalls := 0
+	closeCalls := 0
+	dependencies := experimentalCollectionAcquisitionDependencies{
+		probeKernelDependency: func() error { probeCalls++; return nil },
+		removeMemlock:         func() error { memlockCalls++; return nil },
+		newCollection: func(isolated *ebpf.CollectionSpec) (*ebpf.Collection, error) {
+			if len(isolated.Programs) != 1 {
+				t.Fatalf("isolated program count = %d, want 1", len(isolated.Programs))
+			}
+			for name := range isolated.Programs {
+				loaded = append(loaded, name)
+				if err := failing[name]; err != nil {
+					return nil, err
+				}
+			}
+			return &ebpf.Collection{}, nil
+		},
+		newOwner: func(*ebpf.Collection) (*experimentalCollectionOwner, error) {
+			return nil, errors.New("verifier sweep must not construct an owner")
+		},
+		closeUnownedCollection: func(*ebpf.Collection) error {
+			closeCalls++
+			return nil
+		},
+	}
+
+	err := verifierLoadEveryExperimentalFakeTCPProgram(
+		t.Context(), spec, "/reviewed/experimental.o", dependencies,
+	)
+	if !errors.Is(err, firstErr) || !errors.Is(err, secondErr) {
+		t.Fatalf("sweep error = %v, want both verifier failures", err)
+	}
+	want := make([]string, 0, len(spec.Programs))
+	for name := range spec.Programs {
+		want = append(want, name)
+	}
+	sort.Strings(want)
+	if strings.Join(loaded, ",") != strings.Join(want, ",") {
+		t.Fatalf("loaded programs = %q, want sorted complete set %q", loaded, want)
+	}
+	if probeCalls != 1 || memlockCalls != 1 {
+		t.Fatalf("preflight calls: probe=%d memlock=%d, want 1 each", probeCalls, memlockCalls)
+	}
+	if closeCalls != len(spec.Programs)-len(failing) {
+		t.Fatalf("successful collection closes = %d, want %d", closeCalls, len(spec.Programs)-len(failing))
 	}
 }
 

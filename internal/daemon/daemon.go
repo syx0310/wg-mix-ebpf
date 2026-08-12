@@ -19,6 +19,7 @@ import (
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
+	"github.com/syx0310/wg-mix-ebpf/internal/diagnostic"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/reconcile"
 )
@@ -192,7 +193,7 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 		finalErr := errors.Join(triggerErr, cleanupErr)
 		if finalErr != nil {
 			status.State = "degraded"
-			status.LastError = finalErr.Error()
+			status.LastError = diagnostic.ErrorText(finalErr)
 			status.LastErrorTime = time.Now()
 		} else {
 			status.State = "stopped"
@@ -278,7 +279,7 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 		status.LastReason = reason
 		if err != nil {
 			status.State = "degraded"
-			status.LastError = err.Error()
+			status.LastError = diagnostic.ErrorText(err)
 			status.LastErrorTime = time.Now()
 		} else {
 			status.State = "active"

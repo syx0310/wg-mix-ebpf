@@ -1156,8 +1156,8 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 	closePath := strings.Index(xdp, "if (admission_decision == FAKETCP_ADMISSION_CLOSE)")
 	canonical := strings.Index(xdp, "flags != (FAKETCP_FLAG_RST | FAKETCP_FLAG_ACK)")
 	sequence := strings.Index(xdp, "seq != admission->decision.close.rx_sequence")
-	window := strings.Index(xdp, "bpf_ntohs(tcp->window) != admission->session_projection.window")
-	checksum := strings.Index(xdp, "faketcp_close_checksums_valid(iph, tcp)")
+	window := strings.Index(xdp, "bpf_ntohs(old_tcp->window) != admission->session_projection.window")
+	checksum := strings.Index(xdp, "faketcp_close_checksums_valid(new_ip, old_tcp)")
 	capture := strings.Index(xdp, "faketcp_capture_close_packet(")
 	if snapshot < 0 || closeDecision < 0 || fixedIPv4Gate < 0 || checkpointCall < 0 ||
 		closePath < 0 || canonical < 0 || sequence < 0 || window < 0 || checksum < 0 || capture < 0 ||
