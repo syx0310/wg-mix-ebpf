@@ -881,24 +881,36 @@ static __always_inline int derive_icmp_checksum_from_udp(struct __sk_buff *skb,
 							 __u32 new_wire,
 							 __u16 *out)
 {
-	void *data = (void *)(long)skb->data;
-	void *data_end = (void *)(long)skb->data_end;
-	struct iphdr *iph = data + info->ip_off;
-	struct udphdr *udp = data + info->udp_off;
+	__be32 ipv4_address = 0;
+	__be16 wire_word = 0;
 	__u16 udp_check;
 	__u16 udp_len;
 	__u64 sum;
 
-	if ((void *)(iph + 1) > data_end || (void *)(udp + 1) > data_end)
+	if (bpf_skb_load_bytes(skb,
+			       info->udp_off + offsetof(struct udphdr, check),
+			       &wire_word, sizeof(wire_word)) < 0)
 		return -1;
-	udp_check = bpf_ntohs(udp->check);
+	udp_check = bpf_ntohs(wire_word);
 	if (udp_check == 0)
 		return -1;
-	udp_len = bpf_ntohs(udp->len);
+	if (bpf_skb_load_bytes(skb,
+			       info->udp_off + offsetof(struct udphdr, len),
+			       &wire_word, sizeof(wire_word)) < 0)
+		return -1;
+	udp_len = bpf_ntohs(wire_word);
 	sum = (~udp_check) & 0xffff;
 
-	csum_sub_ipv4(&sum, iph->saddr);
-	csum_sub_ipv4(&sum, iph->daddr);
+	if (bpf_skb_load_bytes(skb,
+			       info->ip_off + offsetof(struct iphdr, saddr),
+			       &ipv4_address, sizeof(ipv4_address)) < 0)
+		return -1;
+	csum_sub_ipv4(&sum, ipv4_address);
+	if (bpf_skb_load_bytes(skb,
+			       info->ip_off + offsetof(struct iphdr, daddr),
+			       &ipv4_address, sizeof(ipv4_address)) < 0)
+		return -1;
+	csum_sub_ipv4(&sum, ipv4_address);
 	csum_sub_word(&sum, IPPROTO_UDP);
 	csum_sub_word(&sum, udp_len);
 	csum_sub_word(&sum, info->src_port);
@@ -920,9 +932,7 @@ static __always_inline __u16 lookup_icmp_sequence(struct __sk_buff *skb,
 						  struct egress_rule_value *rule,
 						  __u16 icmp_id)
 {
-	void *data = (void *)(long)skb->data;
-	void *data_end = (void *)(long)skb->data_end;
-	struct iphdr *iph = data + info->ip_off;
+	__be32 remote_ipv4 = 0;
 	struct icmp_seq_key key = {
 		.generation = rule->generation,
 		.underlay_index = skb->ifindex,
@@ -931,9 +941,11 @@ static __always_inline __u16 lookup_icmp_sequence(struct __sk_buff *skb,
 	};
 	struct icmp_seq_value *value;
 
-	if ((void *)(iph + 1) > data_end)
+	if (bpf_skb_load_bytes(skb,
+			       info->ip_off + offsetof(struct iphdr, daddr),
+			       &remote_ipv4, sizeof(remote_ipv4)) < 0)
 		return 0;
-	key.remote_ipv4 = iph->daddr;
+	key.remote_ipv4 = remote_ipv4;
 	value = bpf_map_lookup_elem(&icmp_seq_map, &key);
 	if (!value || value->generation != rule->generation)
 		return 0;
