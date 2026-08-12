@@ -30,15 +30,20 @@ kernel_build="$(readlink -e -- "${kernel_build}")"
 vmlinux_btf="$(readlink -e -- "${vmlinux_btf}")"
 module="$(readlink -e -- "${module}")"
 readonly kernel_build vmlinux_btf module
-readonly gen_btf="${kernel_build}/scripts/gen-btf.sh"
-readonly resolve_btfids="${kernel_build}/tools/bpf/resolve_btfids/resolve_btfids"
+gen_btf="$(readlink -e -- "${kernel_build}/scripts/gen-btf.sh")"
+resolve_btfids="$(readlink -e -- \
+  "${kernel_build}/tools/bpf/resolve_btfids/resolve_btfids")"
+readonly gen_btf resolve_btfids
 
 if [[ ! -d "${kernel_build}" || -L "${kernel_build}" ||
+  ! "${kernel_build}" =~ ^/usr/src/linux-headers-[A-Za-z0-9._+-]+$ ||
   ! -f "${vmlinux_btf}" || -L "${vmlinux_btf}" || ! -r "${vmlinux_btf}" ||
   ! -f "${module}" || -L "${module}" || ! -w "${module}" ||
   "$(stat -Lc '%h:%F' -- "${vmlinux_btf}")" != "1:regular file" ||
   "$(stat -Lc '%h:%F' -- "${module}")" != "1:regular file" ||
+  ! "${gen_btf}" =~ ^/usr/src/linux-headers-[A-Za-z0-9._+-]+/scripts/gen-btf\.sh$ ||
   ! -f "${gen_btf}" || -L "${gen_btf}" || ! -x "${gen_btf}" ||
+  ! "${resolve_btfids}" =~ ^/usr/src/linux-headers-[A-Za-z0-9._+-]+/tools/bpf/resolve_btfids/resolve_btfids$ ||
   ! -f "${resolve_btfids}" || -L "${resolve_btfids}" || ! -x "${resolve_btfids}" ||
   ! -x /usr/bin/pahole || ! -x /usr/bin/objcopy || ! -x /usr/bin/readelf ]]; then
   echo "error: FakeTCP module BTF inputs or tools are unsafe" >&2

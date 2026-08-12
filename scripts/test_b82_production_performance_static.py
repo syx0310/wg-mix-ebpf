@@ -101,8 +101,10 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
         ):
             self.assertIn(fragment, makefile)
         for fragment in (
-            'readonly gen_btf="${kernel_build}/scripts/gen-btf.sh"',
-            'readonly resolve_btfids="${kernel_build}/tools/bpf/resolve_btfids/resolve_btfids"',
+            'gen_btf="$(readlink -e -- "${kernel_build}/scripts/gen-btf.sh")"',
+            'resolve_btfids="$(readlink -e --',
+            'readonly gen_btf resolve_btfids',
+            '^/usr/src/linux-headers-[A-Za-z0-9._+-]+/scripts/gen-btf\\.sh$',
             '"${gen_btf}" --btf_base "${vmlinux_btf}" "${module}"',
             '"1:1:1"',
             'FAKETCP_CHECKSUM_MODULE_BTF state=%s',
