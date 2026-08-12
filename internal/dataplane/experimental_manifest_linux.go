@@ -41,7 +41,7 @@ func experimentalMapDescriptors() []pinnedMapDescriptor {
 		{name: "faketcp_control_flow_map", mapType: ebpf.LRUHash, keySize: 40, valueSize: 16, maxEntries: 16384},
 		{name: "faketcp_events", mapType: ebpf.RingBuf, maxEntries: 1 << 20},
 		{name: "faketcp_capture_scratch", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 2416, maxEntries: 1},
-		{name: "faketcp_runtime_scratch_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 360, maxEntries: 1},
+		{name: "faketcp_runtime_scratch_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 392, maxEntries: 1},
 		{name: "faketcp_rt_id", mapType: ebpf.Array, keySize: 4, valueSize: 32, maxEntries: 1},
 		{name: "faketcp_gen_gt", mapType: ebpf.Array, keySize: 4, valueSize: 16, maxEntries: 1, flags: unix.BPF_F_RDONLY},
 		{name: "faketcp_gen_wk", mapType: ebpf.RingBuf, maxEntries: 4096},

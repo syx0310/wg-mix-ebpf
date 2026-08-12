@@ -1648,10 +1648,10 @@ static __always_inline int faketcp_emit_event(const struct faketcp_session_key *
 
 // TC helpers can invalidate the verifier's direct packet-pointer range even
 // when they do not change packet bytes. Load the complete fixed IPv4/UDP
-// envelope through one helper into ordinary stack memory. Consumers immediately
-// project the fields they need into scalars, so the 28-byte temporary does not
-// stay live across later map, checksum or skb helpers. The fixed-header
-// admission gate makes both headers contiguous.
+// envelope through one helper into the runtime's per-CPU scratch. Consumers
+// immediately project the fields they need into scalars, so no 28-byte local
+// compounds into the inlined BPF stack. The fixed-header admission gate makes
+// both headers contiguous.
 struct faketcp_tc_ipv4_udp_snapshot {
 	struct iphdr ip;
 	struct udphdr udp;
@@ -1742,9 +1742,16 @@ struct faketcp_runtime_scratch {
 		} ingress;
 		struct faketcp_metadata metadata;
 	};
+	// A dedicated slot outside the variant union keeps the fixed TC envelope
+	// off the 512-byte BPF stack without aliasing packet/admission or ingress
+	// metadata that remains live while a consumer validates the snapshot.
+	struct faketcp_tc_ipv4_udp_snapshot tc_headers;
+	__u32 tc_headers_pad;
 };
 
-_Static_assert(sizeof(struct faketcp_runtime_scratch) == 360,
+_Static_assert(offsetof(struct faketcp_runtime_scratch, tc_headers) == 360,
+	       "FakeTCP runtime header scratch offset drift");
+_Static_assert(sizeof(struct faketcp_runtime_scratch) == 392,
 	       "FakeTCP runtime scratch layout drift");
 
 struct {
@@ -1871,12 +1878,13 @@ static __always_inline int faketcp_tc_fixed_udp_status(
 // admitted fixed IPv4/UDP envelope. Re-read only those fixed header scalars
 // before trusting the projection; this is deliberately not an L3 parser.
 static __always_inline int faketcp_tc_current_admission_coherent(
-	struct __sk_buff *skb, const struct faketcp_egress_admission *admission)
+	struct __sk_buff *skb, struct faketcp_runtime_scratch *scratch,
+	const struct faketcp_egress_admission *admission)
 {
-	struct faketcp_tc_ipv4_udp_snapshot headers = {};
+	struct faketcp_tc_ipv4_udp_snapshot *headers;
 	__u16 fragment;
 
-	if (!admission || admission->network_off > skb->len ||
+	if (!scratch || !admission || admission->network_off > skb->len ||
 	    admission->transport_off < admission->network_off ||
 	    admission->payload_off < admission->transport_off ||
 	    admission->transport_off - admission->network_off !=
@@ -1888,25 +1896,27 @@ static __always_inline int faketcp_tc_current_admission_coherent(
 		    admission->payload_len ||
 	    admission->ip_total_len < sizeof(struct iphdr) ||
 	    admission->ip_total_len - sizeof(struct iphdr) !=
-		    admission->wire_len ||
+			admission->wire_len ||
 	    admission->skb_len != skb->len ||
 	    admission->ip_total_len != skb->len - admission->network_off ||
 	    admission->cipher_id == 0 ||
-	    admission->xor_checksum_mode > XOR_CSUM_RECOMPUTE ||
-	    faketcp_tc_load_ipv4_udp_snapshot(
-		    skb, admission->network_off, admission->transport_off,
-		    admission->payload_off, &headers) < 0)
+	    admission->xor_checksum_mode > XOR_CSUM_RECOMPUTE)
 		return -1;
-	fragment = bpf_ntohs(headers.ip.frag_off);
-	if (headers.ip.version != 4 ||
-	    headers.ip.ihl != sizeof(headers.ip) / 4 ||
-	    headers.ip.protocol != IPPROTO_UDP ||
+	headers = &scratch->tc_headers;
+	if (faketcp_tc_load_ipv4_udp_snapshot(
+		    skb, admission->network_off, admission->transport_off,
+		    admission->payload_off, headers) < 0)
+		return -1;
+	fragment = bpf_ntohs(headers->ip.frag_off);
+	if (headers->ip.version != 4 ||
+	    headers->ip.ihl != sizeof(headers->ip) / 4 ||
+	    headers->ip.protocol != IPPROTO_UDP ||
 	    (fragment & (IP_RESERVED | IP_MF | IP_OFFSET)) ||
-	    bpf_ntohs(headers.ip.tot_len) != admission->ip_total_len ||
-	    bpf_ntohs(headers.udp.len) != admission->wire_len ||
-	    bpf_ntohs(headers.udp.source) != admission->key.local_port ||
-	    bpf_ntohs(headers.udp.dest) != admission->key.remote_port ||
-	    ((headers.udp.check == 0) !=
+	    bpf_ntohs(headers->ip.tot_len) != admission->ip_total_len ||
+	    bpf_ntohs(headers->udp.len) != admission->wire_len ||
+	    bpf_ntohs(headers->udp.source) != admission->key.local_port ||
+	    bpf_ntohs(headers->udp.dest) != admission->key.remote_port ||
+	    ((headers->udp.check == 0) !=
 	     (admission->xor_checksum_mode == XOR_CSUM_NONE)))
 		return -1;
 	return 0;
@@ -2140,10 +2150,10 @@ static __always_inline int faketcp_egress_admission_matches(
 	const struct profile_value *profile,
 	__u64 generation,
 	__u32 required_state,
+	struct faketcp_runtime_scratch *scratch,
 	const struct faketcp_egress_admission *admission)
 {
-	struct faketcp_tc_ipv4_udp_snapshot headers = {};
-	struct faketcp_runtime_scratch *scratch;
+	struct faketcp_tc_ipv4_udp_snapshot *headers;
 	struct faketcp_session_key *key;
 	struct faketcp_gso_projection *observed_gso;
 	struct cipher_value *cipher = 0;
@@ -2164,18 +2174,17 @@ static __always_inline int faketcp_egress_admission_matches(
 	    l3->l3_off != info->ip_off || l3->l4_off != info->udp_off ||
 	    l3->l4_len != sizeof(struct udphdr) + info->payload_len ||
 	    !admission || !managed || !rule || !profile ||
-	    required_state == FAKETCP_TOKEN_FREE ||
-	    faketcp_tc_load_ipv4_udp_snapshot(
+	    !scratch || required_state == FAKETCP_TOKEN_FREE)
+		return 0;
+	headers = &scratch->tc_headers;
+	if (faketcp_tc_load_ipv4_udp_snapshot(
 		    skb, info->ip_off, info->udp_off, info->payload_off,
-		    &headers) < 0)
+		    headers) < 0)
 		return 0;
-	ip_total_len = bpf_ntohs(headers.ip.tot_len);
-	wire_len = bpf_ntohs(headers.udp.len);
-	local_ipv4 = headers.ip.saddr;
-	remote_ipv4 = headers.ip.daddr;
-	scratch = faketcp_runtime_scratch();
-	if (!scratch)
-		return 0;
+	ip_total_len = bpf_ntohs(headers->ip.tot_len);
+	wire_len = bpf_ntohs(headers->udp.len);
+	local_ipv4 = headers->ip.saddr;
+	remote_ipv4 = headers->ip.daddr;
 	key = &scratch->tc.key;
 	observed_gso = &scratch->tc.gso;
 	__builtin_memset(key, 0, sizeof(*key));
@@ -2299,10 +2308,10 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 	__u32 standard_wire,
 	__u32 mixed_wire,
 	__u8 xor_checksum_mode,
+	struct faketcp_runtime_scratch *scratch,
 	struct faketcp_egress_admission *admission)
 {
-	struct faketcp_tc_ipv4_udp_snapshot headers = {};
-	struct faketcp_runtime_scratch *scratch;
+	struct faketcp_tc_ipv4_udp_snapshot *headers;
 	struct faketcp_session_key *key;
 	struct faketcp_gso_projection *gso;
 	struct faketcp_session_value *session;
@@ -2321,16 +2330,11 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 	__be32 remote_ipv4;
 	int is_gso = skb->gso_segs || skb->gso_size;
 
-	if (!info || parser_classification != PARSE_OK || !l3 ||
+	if (!scratch || !info || parser_classification != PARSE_OK || !l3 ||
 	    l3->l3_off != info->ip_off || l3->l4_off != info->udp_off ||
 	    l3->l4_len != sizeof(struct udphdr) + info->payload_len ||
 	    info->family != FAMILY_IPV4) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
-		return FAKETCP_ADMISSION_DROP;
-	}
-	scratch = faketcp_runtime_scratch();
-	if (!scratch) {
-		inc_faketcp_stat(FAKETCP_STAT_BAD_STATE);
 		return FAKETCP_ADMISSION_DROP;
 	}
 	key = &scratch->tc.key;
@@ -2340,16 +2344,17 @@ static __always_inline int faketcp_egress_admission_checkpoint(
 	__builtin_memset(gso, 0, sizeof(*gso));
 	__builtin_memset(session_snapshot, 0, sizeof(*session_snapshot));
 	__builtin_memset(admission, 0, sizeof(*admission));
+	headers = &scratch->tc_headers;
 	if (faketcp_tc_load_ipv4_udp_snapshot(
 		    skb, info->ip_off, info->udp_off, info->payload_off,
-		    &headers) < 0) {
+		    headers) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
 	}
-	observed_total_len = bpf_ntohs(headers.ip.tot_len);
-	udp_len = bpf_ntohs(headers.udp.len);
-	local_ipv4 = headers.ip.saddr;
-	remote_ipv4 = headers.ip.daddr;
+	observed_total_len = bpf_ntohs(headers->ip.tot_len);
+	udp_len = bpf_ntohs(headers->udp.len);
+	local_ipv4 = headers->ip.saddr;
+	remote_ipv4 = headers->ip.daddr;
 	if (!managed || !rule || !profile || generation == 0 || rule->wg_id == 0 ||
 	    managed->generation != generation || rule->generation != generation ||
 	    profile->generation != generation || rule->action != ACTION_REWRITE ||
@@ -2828,12 +2833,13 @@ faketcp_encode_gso_segments(struct __sk_buff *skb,
 	if (faketcp_egress_admission_checkpoint(
 		    skb, info, l3, managed, rule, profile, generation,
 		    parser_classification, type_kind, standard_wire, mixed_wire,
-		    XOR_CSUM_NONE, admission) != FAKETCP_ADMISSION_TRANSFORM)
+		    XOR_CSUM_NONE, scratch, admission) !=
+	    FAKETCP_ADMISSION_TRANSFORM)
 		return TC_ACT_SHOT;
 	if (faketcp_consume_egress_admission(admission->nonce, admission) < 0 ||
 	    !faketcp_egress_admission_matches(
 		    skb, info, l3, managed, rule, profile, generation,
-		    FAKETCP_TOKEN_ARMED, admission)) {
+		    FAKETCP_TOKEN_ARMED, scratch, admission)) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
 	}
@@ -3023,9 +3029,10 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 						       struct packet_info *info,
 						       struct egress_rule_value *rule,
 						       __u64 generation,
+						       struct faketcp_runtime_scratch *scratch,
 						       const struct faketcp_egress_admission *admission)
 {
-	struct faketcp_tc_ipv4_udp_snapshot headers = {};
+	struct faketcp_tc_ipv4_udp_snapshot *headers;
 	struct faketcp_session_value *session;
 	struct udphdr old_udp;
 	struct tcphdr tcp = {};
@@ -3035,24 +3042,28 @@ static __always_inline int faketcp_encode_established(struct __sk_buff *skb,
 	__u64 now;
 	struct faketcp_session_mutation_result mutation = {};
 
-	if (!admission || admission->key.generation != generation ||
+	if (!scratch || !admission || admission->key.generation != generation ||
 	    admission->direction != FAKETCP_DIRECTION_EGRESS ||
 	    admission->cipher_id != rule->cipher_id ||
 	    admission->payload_len != info->payload_len ||
 	    admission->feature_mask !=
 		(FAKETCP_ADMISSION_REQUIRED_FEATURES |
-		 (admission->cipher_id ? FAKETCP_ADMISSION_F_XOR : 0)) ||
-	    faketcp_tc_load_ipv4_udp_snapshot(
-		    skb, info->ip_off, info->udp_off, info->payload_off,
-		    &headers) < 0) {
+		 (admission->cipher_id ? FAKETCP_ADMISSION_F_XOR : 0))) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
 	}
-	old_udp = headers.udp;
+	headers = &scratch->tc_headers;
+	if (faketcp_tc_load_ipv4_udp_snapshot(
+		    skb, info->ip_off, info->udp_off, info->payload_off,
+		    headers) < 0) {
+		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
+		return TC_ACT_SHOT;
+	}
+	old_udp = headers->udp;
 	udp_len = bpf_ntohs(old_udp.len);
-	old_total_len = bpf_ntohs(headers.ip.tot_len);
-	source_ipv4 = headers.ip.saddr;
-	destination_ipv4 = headers.ip.daddr;
+	old_total_len = bpf_ntohs(headers->ip.tot_len);
+	source_ipv4 = headers->ip.saddr;
+	destination_ipv4 = headers->ip.daddr;
 	session = bpf_map_lookup_elem(&faketcp_session_map, &admission->key);
 	if (!session) {
 		// The checkpoint is the only place allowed to emit the handshake request
@@ -3177,7 +3188,7 @@ static __always_inline int faketcp_continue_egress(struct __sk_buff *skb)
 		return TC_ACT_SHOT;
 	}
 	if (!active_generation(&generation) ||
-	    faketcp_tc_current_admission_coherent(skb, admission) < 0) {
+	    faketcp_tc_current_admission_coherent(skb, scratch, admission) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
 	}
@@ -3203,11 +3214,11 @@ static __always_inline int faketcp_continue_egress(struct __sk_buff *skb)
 	if (!profile ||
 	    !faketcp_egress_admission_matches(
 		    skb, info, &packet->shape.l3, managed, rule, profile, generation,
-		    FAKETCP_TOKEN_XOR_COMPLETE, admission)) {
+		    FAKETCP_TOKEN_XOR_COMPLETE, scratch, admission)) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return TC_ACT_SHOT;
 	}
-	return faketcp_encode_established(skb, info, rule, generation,
+	return faketcp_encode_established(skb, info, rule, generation, scratch,
 					  admission);
 }
 
@@ -3227,7 +3238,7 @@ static __always_inline int faketcp_consume_ingress_admission(
 	void *data;
 	void *meta;
 	struct faketcp_metadata *metadata;
-	struct faketcp_tc_ipv4_udp_snapshot headers = {};
+	struct faketcp_tc_ipv4_udp_snapshot *headers;
 	struct faketcp_runtime_scratch *scratch;
 	struct faketcp_metadata *consumed;
 	const struct faketcp_ingress_admission *admission;
@@ -3256,6 +3267,7 @@ static __always_inline int faketcp_consume_ingress_admission(
 		return -1;
 	}
 	consumed = &scratch->metadata;
+	headers = &scratch->tc_headers;
 	admission = &consumed->admission;
 	// The metadata is single-use even when malformed: copy every field needed by
 	// this consumer, then clear magic before the first policy/GSO comparison.
@@ -3281,15 +3293,15 @@ static __always_inline int faketcp_consume_ingress_admission(
 	    profile->generation != generation ||
 	    faketcp_tc_load_ipv4_udp_snapshot(
 		    skb, info->ip_off, info->udp_off, info->payload_off,
-		    &headers) < 0) {
+		    headers) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 		return -1;
 	}
 	feature_mask = FAKETCP_ADMISSION_XDP_FEATURES |
 		       (listener->cipher_id ? FAKETCP_ADMISSION_F_XOR : 0);
-	decoded_total_len = bpf_ntohs(headers.ip.tot_len);
-	local_ipv4 = headers.ip.daddr;
-	remote_ipv4 = headers.ip.saddr;
+	decoded_total_len = bpf_ntohs(headers->ip.tot_len);
+	local_ipv4 = headers->ip.daddr;
+	remote_ipv4 = headers->ip.saddr;
 	if (bpf_skb_load_bytes(skb, info->payload_off, &input_wire,
 			       sizeof(input_wire)) < 0) {
 		inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);

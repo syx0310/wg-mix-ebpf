@@ -2067,7 +2067,8 @@ int wg_mix_egress(struct __sk_buff *skb)
 			    skb, info, &faketcp_packet->shape.l3, managed, rule, profile,
 			    generation, rc,
 			    kind, old_wire, new_wire, xor_checksum_mode,
-			    faketcp_admission) != FAKETCP_ADMISSION_TRANSFORM)
+			    faketcp_scratch, faketcp_admission) !=
+		    FAKETCP_ADMISSION_TRANSFORM)
 			return TC_ACT_SHOT;
 		if (cipher_id != 0) {
 			set_faketcp_xor_context(skb, faketcp_admission->nonce);
@@ -2092,7 +2093,8 @@ int wg_mix_egress(struct __sk_buff *skb)
 		    !faketcp_egress_admission_matches(
 			    skb, info, &faketcp_packet->shape.l3, managed, rule, profile,
 			    generation,
-			    FAKETCP_TOKEN_ARMED, faketcp_admission)) {
+			    FAKETCP_TOKEN_ARMED, faketcp_scratch,
+			    faketcp_admission)) {
 			inc_faketcp_stat(FAKETCP_STAT_ADMISSION_BYPASS_REJECT);
 			return TC_ACT_SHOT;
 		}
@@ -2103,6 +2105,7 @@ int wg_mix_egress(struct __sk_buff *skb)
 			return TC_ACT_SHOT;
 		}
 		return faketcp_encode_established(skb, info, rule, generation,
+						  faketcp_scratch,
 						  faketcp_admission);
 	}
 #endif

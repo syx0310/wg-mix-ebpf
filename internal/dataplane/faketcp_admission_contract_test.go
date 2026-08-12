@@ -20,7 +20,7 @@ func TestFakeTCPAdmissionCheckpointDominatesEveryTransform(t *testing.T) {
 
 	egress := sourceSection(t, tc, "int wg_mix_egress(struct __sk_buff *skb)", "SEC(\"classifier/ingress\")")
 	if !strings.Contains(egress, "if (!managed)\n\t\treturn TC_ACT_OK;") ||
-		!strings.Contains(egress, "!= FAKETCP_ADMISSION_TRANSFORM)\n\t\t\treturn TC_ACT_SHOT;") {
+		!strings.Contains(egress, "FAKETCP_ADMISSION_TRANSFORM)\n\t\t\treturn TC_ACT_SHOT;") {
 		t.Fatal("TC egress does not state explicit unmanaged-pass and managed-reject-drop policy")
 	}
 	if got := strings.Count(egress, "faketcp_egress_admission_checkpoint("); got != 1 {
@@ -228,7 +228,9 @@ func TestFakeTCPRuntimeScratchKeepsLargeProofsOffTheBPFStack(t *testing.T) {
 	for _, want := range []string{
 		"struct faketcp_runtime_scratch",
 		"faketcp_runtime_scratch_map SEC(\".maps\")",
-		"_Static_assert(sizeof(struct faketcp_runtime_scratch) == 360",
+		"_Static_assert(offsetof(struct faketcp_runtime_scratch, tc_headers) == 360",
+		"_Static_assert(sizeof(struct faketcp_runtime_scratch) == 392",
+		"struct faketcp_tc_ipv4_udp_snapshot tc_headers",
 		"key = &scratch->tc.key",
 		"gso = &scratch->tc.gso",
 		"session_snapshot = &scratch->tc.session_snapshot",
@@ -244,6 +246,7 @@ func TestFakeTCPRuntimeScratchKeepsLargeProofsOffTheBPFStack(t *testing.T) {
 		"static __always_inline int faketcp_egress_admission_checkpoint(",
 		"struct faketcp_gso_loop_context {")
 	for _, forbidden := range []string{
+		"struct faketcp_tc_ipv4_udp_snapshot headers = {}",
 		"struct faketcp_session_key key = {}",
 		"struct faketcp_gso_projection gso = {}",
 		"struct faketcp_session_snapshot session_snapshot = {}",
@@ -258,7 +261,7 @@ func TestFakeTCPRuntimeScratchKeepsLargeProofsOffTheBPFStack(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(string(manifest),
-		`{name: "faketcp_runtime_scratch_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 360, maxEntries: 1}`,
+		`{name: "faketcp_runtime_scratch_map", mapType: ebpf.PerCPUArray, keySize: 4, valueSize: 392, maxEntries: 1}`,
 	) {
 		t.Fatal("experimental manifest does not bind the exact runtime scratch map ABI")
 	}

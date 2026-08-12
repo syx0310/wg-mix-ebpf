@@ -119,6 +119,9 @@ func TestFakeTCPTCHeaderConsumersUseHelperSnapshots(t *testing.T) {
 	for _, required := range []string{
 		"struct faketcp_tc_ipv4_udp_snapshot",
 		"_Static_assert(sizeof(struct faketcp_tc_ipv4_udp_snapshot) == 28",
+		"struct faketcp_tc_ipv4_udp_snapshot tc_headers",
+		"_Static_assert(offsetof(struct faketcp_runtime_scratch, tc_headers) == 360",
+		"_Static_assert(sizeof(struct faketcp_runtime_scratch) == 392",
 		"transport_off - network_off != sizeof(struct iphdr)",
 		"payload_off - transport_off != sizeof(struct udphdr)",
 		"bpf_skb_load_bytes(skb, network_off, snapshot, sizeof(*snapshot))",
@@ -156,6 +159,9 @@ func TestFakeTCPTCHeaderConsumersUseHelperSnapshots(t *testing.T) {
 		if match := directHeader.FindString(section); match != "" {
 			t.Fatalf("%s regained direct IP/UDP packet dereference %q", name, match)
 		}
+		if strings.Contains(section, "struct faketcp_tc_ipv4_udp_snapshot headers = {}") {
+			t.Fatalf("%s rematerialized the 28-byte header snapshot on the BPF stack", name)
+		}
 	}
 
 	flowKey := sections["flow key"]
@@ -176,16 +182,16 @@ func TestFakeTCPTCHeaderConsumersUseHelperSnapshots(t *testing.T) {
 
 	matcher := sections["admission matcher"]
 	matcherLoad := strings.Index(matcher, "faketcp_tc_load_ipv4_udp_snapshot(")
-	matcherLastHeader := strings.LastIndex(matcher, "headers.")
-	matcherScratch := strings.Index(matcher, "scratch = faketcp_runtime_scratch()")
+	matcherLastHeader := strings.LastIndex(matcher, "headers->")
+	matcherScratch := strings.Index(matcher, "headers = &scratch->tc_headers")
 	matcherPayload := strings.Index(matcher, "&current_wire")
 	if matcherLoad < 0 || matcherLastHeader < 0 || matcherScratch < 0 || matcherPayload < 0 ||
-		!(matcherLoad < matcherLastHeader && matcherLastHeader < matcherScratch && matcherScratch < matcherPayload) {
+		!(matcherScratch < matcherLoad && matcherLoad < matcherLastHeader && matcherLastHeader < matcherPayload) {
 		t.Fatal("admission matcher keeps its header snapshot live across a later helper boundary")
 	}
 	checkpoint := sections["admission checkpoint"]
 	checkpointLoad := strings.Index(checkpoint, "faketcp_tc_load_ipv4_udp_snapshot(")
-	checkpointLastHeader := strings.LastIndex(checkpoint, "headers.")
+	checkpointLastHeader := strings.LastIndex(checkpoint, "headers->")
 	checkpointCipher := strings.Index(checkpoint, "cipher = lookup_cipher(")
 	checkpointGSO := strings.Index(checkpoint, "faketcp_gso_build_projection(")
 	checkpointSession := strings.Index(checkpoint, "bpf_map_lookup_elem(&faketcp_session_map")
@@ -196,13 +202,13 @@ func TestFakeTCPTCHeaderConsumersUseHelperSnapshots(t *testing.T) {
 	}
 	encoder := sections["established encoder"]
 	if load, lastHeader, session := strings.Index(encoder, "faketcp_tc_load_ipv4_udp_snapshot("),
-		strings.LastIndex(encoder, "headers."),
+		strings.LastIndex(encoder, "headers->"),
 		strings.Index(encoder, "bpf_map_lookup_elem(&faketcp_session_map"); load < 0 || lastHeader < 0 || session < 0 || !(load < lastHeader && lastHeader < session) {
 		t.Fatal("established encoder keeps its header snapshot live across session lookup")
 	}
 	ingress := sections["ingress proof"]
 	if load, lastHeader, payload := strings.Index(ingress, "faketcp_tc_load_ipv4_udp_snapshot("),
-		strings.LastIndex(ingress, "headers."), strings.Index(ingress, "&input_wire"); load < 0 || lastHeader < 0 || payload < 0 || !(load < lastHeader && lastHeader < payload) {
+		strings.LastIndex(ingress, "headers->"), strings.Index(ingress, "&input_wire"); load < 0 || lastHeader < 0 || payload < 0 || !(load < lastHeader && lastHeader < payload) {
 		t.Fatal("ingress proof keeps its header snapshot live across its next skb helper")
 	}
 }
