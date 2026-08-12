@@ -143,7 +143,9 @@ class StaticMatrixTest(unittest.TestCase):
             "verify_source_immutable",
             "module_sha256=",
             "capture_diagnostics",
-            "FULL_LOG_BEGIN",
+            "capture_failure_inventory",
+            "failure-inventory.log",
+            "FULL_ERROR_LOG_BEGIN",
             "FAILURE_RESOURCES_RETAINED",
             '"${CELL_DRIVER}" run',
             '"${CELL_DRIVER}" restore',
@@ -151,6 +153,10 @@ class StaticMatrixTest(unittest.TestCase):
             self.assertIn(required, self.root_cell)
         self.assertNotIn("ip netns add", self.root_cell)
         self.assertNotIn("wg genkey", self.root_cell)
+        self.assertNotIn(
+            'for path in "${EVIDENCE}"/*.log "${EVIDENCE}"/*.json',
+            self.root_cell,
+        )
 
     def test_netns_driver_is_real_multi_wg_and_isolation_gate(self) -> None:
         for required in (

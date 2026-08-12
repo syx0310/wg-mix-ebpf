@@ -108,6 +108,11 @@ matrix root, and each cell root are root-owned mode `0700`. It does not delete
 evidence after success or failure. An unexpected failure stops the matrix,
 captures all stdout/stderr and read-only state in one pass, and leaves the
 failed cell resources for an explicit, reviewed recovery invocation.
+The transport console mirrors the complete failure summary, command index,
+root diagnostics, and a SHA-256 inventory of every retained evidence file. It
+does not concatenate large successful-output artifacts such as decoded pcaps;
+their complete bytes remain in the run-owned evidence root and can be read by
+exact path after the failure inventory identifies them.
 
 For a retained first-cell TCP-connect failure, the versioned
 `diagnose-retained-tcp-drop.sh` has separate `plan` and `run` modes. It is

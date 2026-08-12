@@ -235,24 +235,105 @@ capture_diagnostics() {
   local output="${EVIDENCE}/failure-diagnostics.log" ns
   : >"${output}"
   printf 'COMMAND uname -a\n' >>"${output}"
-  uname -a >>"${output}" 2>&1; printf 'RC %s\n' "$?" >>"${output}"
+  timeout --signal=TERM --kill-after=2s 10s uname -a >>"${output}" 2>&1
+  printf 'RC %s\n' "$?" >>"${output}"
   printf 'COMMAND ip netns list\n' >>"${output}"
-  ip netns list >>"${output}" 2>&1; printf 'RC %s\n' "$?" >>"${output}"
+  timeout --signal=TERM --kill-after=2s 10s ip netns list >>"${output}" 2>&1
+  printf 'RC %s\n' "$?" >>"${output}"
   printf 'COMMAND bpftool -j link show\n' >>"${output}"
-  bpftool -j link show >>"${output}" 2>&1; printf 'RC %s\n' "$?" >>"${output}"
+  timeout --signal=TERM --kill-after=2s 10s bpftool -j link show >>"${output}" 2>&1
+  printf 'RC %s\n' "$?" >>"${output}"
   printf 'COMMAND bpftool -j prog show\n' >>"${output}"
-  bpftool -j prog show >>"${output}" 2>&1; printf 'RC %s\n' "$?" >>"${output}"
+  timeout --signal=TERM --kill-after=2s 10s bpftool -j prog show >>"${output}" 2>&1
+  printf 'RC %s\n' "$?" >>"${output}"
   for ns in "${NSA}" "${NSR}" "${NSB}"; do
-    if ip netns list | awk '{print $1}' | grep -Fxq -- "${ns}"; then
+    if timeout --signal=TERM --kill-after=2s 10s ip netns list |
+      awk '{print $1}' | grep -Fxq -- "${ns}"; then
       printf 'NETNS %s\n' "${ns}" >>"${output}"
-      ip -details -statistics -n "${ns}" link show >>"${output}" 2>&1
-      ip -n "${ns}" address show >>"${output}" 2>&1
-      ip netns exec "${ns}" tc qdisc show >>"${output}" 2>&1
-      ip netns exec "${ns}" tc filter show dev under0 ingress >>"${output}" 2>&1
-      ip netns exec "${ns}" tc filter show dev under0 egress >>"${output}" 2>&1
-      ip netns exec "${ns}" bpftool net >>"${output}" 2>&1
+      timeout --signal=TERM --kill-after=2s 10s ip -details -statistics -n "${ns}" link show >>"${output}" 2>&1
+      timeout --signal=TERM --kill-after=2s 10s ip -n "${ns}" address show >>"${output}" 2>&1
+      timeout --signal=TERM --kill-after=2s 10s ip netns exec "${ns}" tc qdisc show >>"${output}" 2>&1
+      timeout --signal=TERM --kill-after=2s 10s ip netns exec "${ns}" tc filter show dev under0 ingress >>"${output}" 2>&1
+      timeout --signal=TERM --kill-after=2s 10s ip netns exec "${ns}" tc filter show dev under0 egress >>"${output}" 2>&1
+      timeout --signal=TERM --kill-after=2s 10s ip netns exec "${ns}" bpftool net >>"${output}" 2>&1
     fi
   done
+}
+
+capture_failure_inventory() {
+  local pending="${EVIDENCE}/failure-inventory.pending"
+  local output="${EVIDENCE}/failure-inventory.log"
+  /usr/bin/python3 -B -I - "${EVIDENCE}" >"${pending}" <<'PY'
+import hashlib, json, os, pathlib, socket, stat, sys, time
+
+root = pathlib.Path(sys.argv[1])
+entries = []
+for path in sorted(root.iterdir(), key=lambda item: item.name):
+    if path.name in {"failure-inventory.pending", "failure-inventory.log"}:
+        continue
+    meta = path.lstat()
+    if stat.S_ISLNK(meta.st_mode):
+        raise SystemExit(f"symlink evidence entry: {path.name}")
+    if not stat.S_ISREG(meta.st_mode):
+        continue
+    entries.append((path, meta))
+if len(entries) > 4096:
+    raise SystemExit(f"evidence inventory exceeds 4096 files: {len(entries)}")
+total_bytes = sum(meta.st_size for _, meta in entries)
+if total_bytes > 1024 * 1024 * 1024:
+    raise SystemExit(f"evidence inventory exceeds 1 GiB: {total_bytes}")
+print(json.dumps({
+    "format": "wg-mix-ebpf-failure-inventory-v1",
+    "hostname": socket.gethostname(),
+    "boot_id": pathlib.Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+    "timestamp_unix": int(time.time()),
+    "evidence": str(root),
+    "entries": len(entries),
+    "bytes": total_bytes,
+}, sort_keys=True))
+for path, meta in entries:
+    digest = hashlib.sha256()
+    descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+    try:
+        opened = os.fstat(descriptor)
+        if (opened.st_dev, opened.st_ino, stat.S_IFMT(opened.st_mode)) != (
+            meta.st_dev, meta.st_ino, stat.S_IFMT(meta.st_mode)
+        ):
+            raise SystemExit(f"evidence identity changed before read: {path.name}")
+        remaining = opened.st_size
+        while remaining:
+            chunk = os.read(descriptor, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    stable = (
+        opened.st_dev == after.st_dev and opened.st_ino == after.st_ino and
+        opened.st_size == after.st_size and opened.st_mtime_ns == after.st_mtime_ns
+    )
+    print(json.dumps({
+        "name": path.name,
+        "uid": opened.st_uid,
+        "gid": opened.st_gid,
+        "mode": stat.S_IMODE(opened.st_mode),
+        "nlink": opened.st_nlink,
+        "size": opened.st_size,
+        "hashed_bytes": opened.st_size - remaining,
+        "stable": stable,
+        "post_size": after.st_size,
+        "sha256": digest.hexdigest(),
+    }, sort_keys=True))
+PY
+  local rc=$?
+  if ((rc == 0)); then
+    mv -- "${pending}" "${output}"
+  else
+    printf 'failure-inventory rc=%s pending=%s\n' "${rc}" "${pending}" >&2
+  fi
+  return "${rc}"
 }
 
 on_error() {
@@ -262,11 +343,23 @@ on_error() {
   printf 'FAIL run_id=%s label=%s stage=%s rc=%s line=%s\n' \
     "${RUN_ID}" "${LABEL}" "${STAGE}" "${rc}" "${line}" >"${EVIDENCE}/failure-summary.log"
   capture_diagnostics
-  for path in "${EVIDENCE}"/*.log "${EVIDENCE}"/*.json; do
+  capture_failure_inventory
+  # Complete command stdout/stderr, packet captures, JSON snapshots, and their
+  # hashes remain in the run-owned evidence directory.  Only the bounded error
+  # index below is mirrored to the transport console; replaying every evidence
+  # file here can turn a large decoded pcap into tens of MiB of terminal text
+  # and hide the actual failure for minutes.
+  for path in \
+    "${EVIDENCE}/failure-summary.log" \
+    "${EVIDENCE}/cell.stderr.log" \
+    "${EVIDENCE}/operations.log" \
+    "${EVIDENCE}/root-operations.log" \
+    "${EVIDENCE}/failure-diagnostics.log" \
+    "${EVIDENCE}/failure-inventory.log"; do
     [[ -f "${path}" && ! -L "${path}" ]] || continue
-    printf 'FULL_LOG_BEGIN path=%s\n' "${path}" >&2
+    printf 'FULL_ERROR_LOG_BEGIN path=%s\n' "${path}" >&2
     /bin/cat -- "${path}" >&2
-    printf 'FULL_LOG_END path=%s\n' "${path}" >&2
+    printf 'FULL_ERROR_LOG_END path=%s\n' "${path}" >&2
   done
   printf 'FAILURE_RESOURCES_RETAINED run_id=%s evidence=%s; invoke exact restore after review\n' \
     "${RUN_ID}" "${EVIDENCE_ROOT}" >&2

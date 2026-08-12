@@ -204,6 +204,8 @@ struct faketcp_session_key {
 
 struct faketcp_session_value {
 	__u64 generation;
+	// Peer-liveness clock. Local egress, including WireGuard PersistentKeepalive,
+	// must not refresh it; only admitted peer data or a peer FakeTCP keepalive may.
 	__u64 last_seen_nanos;
 	__u32 tx_sequence;
 	__u32 rx_sequence;
@@ -772,7 +774,11 @@ static __always_inline int faketcp_session_mutate(
 			   (__s32)(argument - session->rx_sequence) > 0) {
 			session->rx_sequence = argument;
 		}
-		if (now > session->last_seen_nanos)
+		// TX proves only that this host produced traffic. Treating it as peer
+		// activity would let a local WireGuard PersistentKeepalive keep a dead
+		// peer's session alive forever and prevent a fresh SYN from reconnecting.
+		if (operation != FAKETCP_SESSION_MUTATE_TX &&
+		    now > session->last_seen_nanos)
 			session->last_seen_nanos = now;
 		session->revision++;
 	}

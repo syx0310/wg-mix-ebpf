@@ -233,7 +233,9 @@ type FakeTCPSessionKey struct {
 }
 
 type FakeTCPSessionValue struct {
-	Generation    uint64
+	Generation uint64
+	// LastSeenNanos is peer activity only. Local egress must not refresh it;
+	// admitted peer data and received FakeTCP keepalives do.
 	LastSeenNanos uint64
 	TXSequence    uint32
 	RXSequence    uint32

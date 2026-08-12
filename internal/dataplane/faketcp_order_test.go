@@ -11,6 +11,101 @@ import (
 	"testing"
 )
 
+const (
+	fakeTCPLivenessTX uint32 = iota + 1
+	fakeTCPLivenessRX
+	fakeTCPLivenessTouch
+)
+
+type fakeTCPLivenessModel struct {
+	lastSeen uint64
+	tx       uint32
+	rx       uint32
+	revision uint64
+}
+
+func (session *fakeTCPLivenessModel) mutate(operation uint32, now uint64, argument uint32) {
+	if operation == fakeTCPLivenessTX {
+		session.tx += argument
+	} else if operation == fakeTCPLivenessRX && int32(argument-session.rx) > 0 {
+		session.rx = argument
+	}
+	if operation != fakeTCPLivenessTX && now > session.lastSeen {
+		session.lastSeen = now
+	}
+	session.revision++
+}
+
+func (session fakeTCPLivenessModel) idle(now, timeout uint64) bool {
+	return now >= session.lastSeen && now-session.lastSeen >= timeout
+}
+
+func TestFakeTCPLastSeenTracksPeerActivityOnly(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mutation := sourceSection(t, string(source),
+		"static __always_inline int faketcp_session_mutate(",
+		"static __always_inline int faketcp_session_matches_expected_locked(")
+	for _, want := range []string{
+		"operation != FAKETCP_SESSION_MUTATE_TX &&",
+		"now > session->last_seen_nanos",
+		"session->last_seen_nanos = now",
+	} {
+		if !strings.Contains(mutation, want) {
+			t.Fatalf("FakeTCP peer-liveness mutation contract missing %q", want)
+		}
+	}
+	if strings.Count(mutation, "session->last_seen_nanos = now") != 1 {
+		t.Fatal("FakeTCP session mutation must have one peer-only last_seen writer")
+	}
+
+	const (
+		establishedAt = uint64(100)
+		idleTimeout   = uint64(6)
+	)
+	t.Run("local WireGuard PersistentKeepalive cannot prevent peer expiry", func(t *testing.T) {
+		session := fakeTCPLivenessModel{lastSeen: establishedAt, tx: 1001, rx: 9001, revision: 1}
+		for now := establishedAt + 1; now <= establishedAt+idleTimeout; now++ {
+			// Model the harness/production case where WireGuard emits one local
+			// PersistentKeepalive every second while the peer is dead.
+			session.mutate(fakeTCPLivenessTX, now, 32)
+		}
+		if session.lastSeen != establishedAt || !session.idle(establishedAt+idleTimeout, idleTimeout) {
+			t.Fatalf("local egress refreshed peer liveness: session=%+v", session)
+		}
+		if session.tx != 1001+uint32(idleTimeout)*32 || session.revision != 1+idleTimeout {
+			t.Fatalf("TX sequence/revision stopped advancing: session=%+v", session)
+		}
+	})
+
+	t.Run("received FakeTCP keepalive keeps peer session alive", func(t *testing.T) {
+		session := fakeTCPLivenessModel{lastSeen: establishedAt, tx: 1001, rx: 9001, revision: 1}
+		for now := establishedAt + 1; now <= establishedAt+15; now++ {
+			session.mutate(fakeTCPLivenessTX, now, 32)
+			if (now-establishedAt)%2 == 0 {
+				session.mutate(fakeTCPLivenessTouch, now, 0)
+			}
+			if session.idle(now, idleTimeout) {
+				t.Fatalf("peer keepalive failed to refresh liveness at %d: session=%+v", now, session)
+			}
+		}
+		if session.lastSeen != establishedAt+14 {
+			t.Fatalf("last peer keepalive was not retained: session=%+v", session)
+		}
+	})
+
+	t.Run("admitted peer data refreshes peer session", func(t *testing.T) {
+		session := fakeTCPLivenessModel{lastSeen: establishedAt, rx: 9001, revision: 1}
+		session.mutate(fakeTCPLivenessRX, establishedAt+5, 9100)
+		if session.lastSeen != establishedAt+5 || session.rx != 9100 ||
+			session.idle(establishedAt+idleTimeout, idleTimeout) {
+			t.Fatalf("peer RX did not refresh liveness: session=%+v", session)
+		}
+	})
+}
+
 func TestFakeTCPFullTransportChecksumAndIngressInverseMatch(t *testing.T) {
 	for _, payloadLen := range []int{12, 13, 32, 33, 1419, 1420, 1421, 1451, 1452} {
 		t.Run(strconv.Itoa(payloadLen), func(t *testing.T) {
@@ -696,7 +791,8 @@ func TestFakeTCPEstablishedClaimUsesEveryPacketPathValueLock(t *testing.T) {
 		"expected->session_id != 0",
 		"expected->runtime_incarnation",
 		"session->revision != ~0ULL",
-		"if (now > session->last_seen_nanos)",
+		"operation != FAKETCP_SESSION_MUTATE_TX &&",
+		"now > session->last_seen_nanos",
 	} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("established compare-claim source contract missing %q", want)
