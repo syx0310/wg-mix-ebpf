@@ -266,8 +266,18 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
             "PERFORMANCE_EVIDENCE_CLEANUP_COMPLETE",
             "os.unlink(path)",
             "os.rmdir(path)",
+            "CLEANUP_HOST hostname=",
+            "CLEANUP_PRESERVE kind=export",
+            "export_preserved=",
+            "preserved evidence export changed during cleanup",
         ):
             self.assertIn(fragment, cleanup)
+        self.assertNotIn("os.unlink(archive)", cleanup)
+        self.assertNotIn("CLEANUP_TARGET kind=export", cleanup)
+        self.assertLess(
+            cleanup.index("CLEANUP_HOST hostname="),
+            cleanup.index("files, directories = inventory_tree(run_root)"),
+        )
         for forbidden in ("shutil.rmtree", "rm -rf", "find -delete", "shell=True"):
             self.assertNotIn(forbidden, cleanup)
         ast.parse(cleanup, filename=str(CLEANUP))

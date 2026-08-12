@@ -205,6 +205,21 @@ def cleanup(args: argparse.Namespace) -> None:
         fail("completed run proof mismatch")
 
     validate_archive(archive, args.export_sha256, args.run_id)
+    hostname = os.uname().nodename
+    boot_id = Path("/proc/sys/kernel/random/boot_id").read_text(
+        encoding="ascii", errors="strict"
+    ).strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.-]{1,255}", hostname):
+        fail("host identity is malformed")
+    if not re.fullmatch(
+        r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",
+        boot_id,
+    ):
+        fail("boot identity is malformed")
+    print(
+        f"CLEANUP_HOST hostname={hostname} boot_id={boot_id} "
+        f"run_id={args.run_id} root={run_root}"
+    )
     manifest_fields = parse_fields(manifest)
     kind = manifest_fields.get("kind", "cell")
     if kind not in ("cell", "matrix"):
@@ -220,7 +235,7 @@ def cleanup(args: argparse.Namespace) -> None:
         print(f"CLEANUP_TARGET kind=file path={path}")
     for path in reversed(directories):
         print(f"CLEANUP_TARGET kind=directory path={path}")
-    print(f"CLEANUP_TARGET kind=export path={archive}")
+    print(f"CLEANUP_PRESERVE kind=export path={archive}")
 
     for path in files:
         os.unlink(path)
@@ -228,13 +243,14 @@ def cleanup(args: argparse.Namespace) -> None:
     for path in reversed(directories):
         os.rmdir(path)
         print(f"CLEANUP_RESULT kind=directory path={path} rc=0")
-    os.unlink(archive)
-    print(f"CLEANUP_RESULT kind=export path={archive} rc=0")
-    if run_root.exists() or archive.exists():
+    if run_root.exists():
         fail("exact cleanup verification failed")
+    regular(archive, 0o600)
+    if sha256_file(archive) != args.export_sha256:
+        fail("preserved evidence export changed during cleanup")
     print(
         f"PERFORMANCE_EVIDENCE_CLEANUP_COMPLETE run_id={args.run_id} "
-        f"root={run_root} export={archive}"
+        f"root={run_root} export_preserved={archive}"
     )
 
 
