@@ -87,6 +87,23 @@ require_order(
     "dynamic maxactive configuration before probe registration",
 )
 
+# Keep the module warning-clean across the supported 5.15 and 7.x headers.
+require(
+    "(struct wg_mix_faketcp_change_type_parameters *)ri->data;",
+    "typed change_type kretprobe private data",
+)
+require(
+    "(struct wg_mix_faketcp_change_proto_parameters *)ri->data;",
+    "typed change_proto kretprobe private data",
+)
+require(
+    "wg_mix_faketcp_counter_delta(u64 current_value, u64 baseline)",
+    "counter parameter that cannot collide with the kernel current macro",
+)
+require(".llseek = noop_llseek,", "portable non-mutating ioctl-device llseek")
+if "u64 current," in SOURCE or ".llseek = no_llseek," in SOURCE:
+    FAILURES.append("removed Linux 7.x-incompatible identifiers are forbidden")
+
 # Keep known syntax/comment regressions from returning during concurrent edits.
 if re.search(r"return\s+0;\s*return\s+0;", SOURCE):
     FAILURES.append("duplicate consecutive return 0 statements")

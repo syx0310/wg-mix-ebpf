@@ -523,7 +523,8 @@ struct wg_mix_faketcp_change_type_parameters {
 static int wg_mix_faketcp_change_type_entry(struct kretprobe_instance *ri,
 					     struct pt_regs *regs)
 {
-	struct wg_mix_faketcp_change_type_parameters *parameters = ri->data;
+	struct wg_mix_faketcp_change_type_parameters *parameters =
+		(struct wg_mix_faketcp_change_type_parameters *)ri->data;
 
 	parameters->skb = (struct sk_buff *)regs_get_kernel_argument(regs, 0);
 	parameters->type = (u32)regs_get_kernel_argument(regs, 1);
@@ -545,7 +546,8 @@ NOKPROBE_SYMBOL(wg_mix_faketcp_change_type_entry);
 static int wg_mix_faketcp_change_type_return(struct kretprobe_instance *ri,
 					      struct pt_regs *regs)
 {
-	struct wg_mix_faketcp_change_type_parameters *parameters = ri->data;
+	struct wg_mix_faketcp_change_type_parameters *parameters =
+		(struct wg_mix_faketcp_change_type_parameters *)ri->data;
 	int result;
 
 	/* Linux 5.15 bpf_skb_change_type rejects an invalid pkt_type with
@@ -586,7 +588,8 @@ struct wg_mix_faketcp_change_proto_parameters {
 static int wg_mix_faketcp_change_proto_entry(struct kretprobe_instance *ri,
 					      struct pt_regs *regs)
 {
-	struct wg_mix_faketcp_change_proto_parameters *parameters = ri->data;
+	struct wg_mix_faketcp_change_proto_parameters *parameters =
+		(struct wg_mix_faketcp_change_proto_parameters *)ri->data;
 
 	parameters->skb = (struct sk_buff *)regs_get_kernel_argument(regs, 0);
 	parameters->proto = (__be16)regs_get_kernel_argument(regs, 1);
@@ -607,7 +610,8 @@ NOKPROBE_SYMBOL(wg_mix_faketcp_change_proto_entry);
 static int wg_mix_faketcp_change_proto_return(struct kretprobe_instance *ri,
 					       struct pt_regs *regs)
 {
-	struct wg_mix_faketcp_change_proto_parameters *parameters = ri->data;
+	struct wg_mix_faketcp_change_proto_parameters *parameters =
+		(struct wg_mix_faketcp_change_proto_parameters *)ri->data;
 	int result;
 
 	/* Linux 5.15 bpf_skb_change_proto checks non-zero flags first and returns
@@ -662,15 +666,15 @@ static u64 wg_mix_faketcp_nmissed(void)
 	       (u64)READ_ONCE(wg_mix_faketcp_change_proto_probe.nmissed);
 }
 
-static u64 wg_mix_faketcp_counter_delta(u64 current, u64 baseline)
+static u64 wg_mix_faketcp_counter_delta(u64 current_value, u64 baseline)
 {
 	/* The counters are monotonic for the complete module lifetime.  Report an
 	 * impossible regression as maximally unhealthy instead of wrapping to a
 	 * deceptively small delta.
 	 */
-	if (current < baseline)
+	if (current_value < baseline)
 		return U64_MAX;
-	return current - baseline;
+	return current_value - baseline;
 }
 
 static int wg_mix_faketcp_configure_maxactive(void)
@@ -836,7 +840,7 @@ static const struct file_operations wg_mix_faketcp_device_operations = {
 #ifdef CONFIG_COMPAT
 	.compat_ioctl = wg_mix_faketcp_device_compat_ioctl,
 #endif
-	.llseek = no_llseek,
+	.llseek = noop_llseek,
 };
 
 static struct miscdevice wg_mix_faketcp_device = {
