@@ -1068,7 +1068,10 @@ for mid in sorted(set(ids)):
     info=subprocess.run(["bpftool","-j","map","show","id",str(mid)],text=True,capture_output=True)
     if info.returncode: continue
     doc=json.loads(info.stdout)
-    if doc.get("key") == 32 and doc.get("value") == 80 and str(doc.get("name","")).startswith("faketcp_session"):
+    # bpftool's JSON ABI names these numeric fields bytes_key/bytes_value.
+    # Using the human table headings (key/value) silently misses the exact map
+    # even when the process still owns it.
+    if doc.get("bytes_key") == 32 and doc.get("bytes_value") == 80 and str(doc.get("name","")).startswith("faketcp_session"):
         session=mid; break
 if session is None: raise SystemExit("cannot find exact process-owned session map")
 dump=subprocess.run(["bpftool","-j","map","dump","id",str(session)],text=True,capture_output=True)

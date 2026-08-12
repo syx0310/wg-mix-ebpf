@@ -184,6 +184,8 @@ class StaticMatrixTest(unittest.TestCase):
             "error: missing required command:",
             "same-tuple-router-test",
             "key_size=32",
+            'doc.get("bytes_key") == 32',
+            'doc.get("bytes_value") == 80',
             "reserved_zero=1",
             "expected=set(range(1,count+1))",
             "raw_wireguard_udp=0",
@@ -198,6 +200,8 @@ class StaticMatrixTest(unittest.TestCase):
         self.assertNotRegex(self.netns, re.compile(r"ethtool -K .* rx (?:on|off)"))
         self.assertNotIn("private-key ${key_", self.netns)
         self.assertNotIn('log_command "key-remove-', self.netns)
+        self.assertNotIn('doc.get("key") == 32', self.netns)
+        self.assertNotIn('doc.get("value") == 80', self.netns)
         self.assertNotIn('wg genkey >', self.netns)
         self.assertNotIn('${ROOT}/key-a-', self.netns)
         self.assertNotIn('${ROOT}/key-b-', self.netns)
