@@ -133,6 +133,7 @@ func TestFakeTCPPacketHelperSizesCannotBeZero(t *testing.T) {
 		"__u8 chunk[FAKETCP_GSO_XOR_CHUNK_BYTES]",
 		"old_word",
 		"new_word",
+		"for (int byte = 0; byte < 3; byte++)",
 	} {
 		if strings.Contains(gsoXOR, forbidden) {
 			t.Fatalf("GSO XOR passed verifier-ambiguous dynamic helper size through %q", forbidden)
@@ -147,7 +148,8 @@ func TestFakeTCPPacketHelperSizesCannotBeZero(t *testing.T) {
 		"*word_buffer = 0",
 		"word_buffer, sizeof(*word_buffer)",
 		"for (int byte = 0; byte < 4; byte++)",
-		"for (int byte = 0; byte < 3; byte++)",
+		"if (tail_length >= 2)",
+		"if (tail_length == 3)",
 		"tail_length == 0 || tail_length > 3",
 		"xor_load_partial_word(",
 		"xor_store_partial_word(",

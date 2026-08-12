@@ -2822,14 +2822,16 @@ static __noinline long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 			context->error = -1;
 			return 1;
 		}
-#pragma unroll
-		for (int byte = 0; byte < 3; byte++) {
-			if (byte >= tail_length)
-				break;
-			chunk[byte] ^=
+		chunk[0] ^=
+			xor_key_byte(context->cipher, chunk_offset + processed);
+		if (tail_length >= 2)
+			chunk[1] ^=
 				xor_key_byte(context->cipher,
-					     chunk_offset + processed + byte);
-		}
+					     chunk_offset + processed + 1);
+		if (tail_length == 3)
+			chunk[2] ^=
+				xor_key_byte(context->cipher,
+					     chunk_offset + processed + 2);
 		rc = xor_store_partial_word(context->skb, packet_offset + processed,
 					    tail_length, word_buffer,
 					    BPF_F_INVALIDATE_HASH);
