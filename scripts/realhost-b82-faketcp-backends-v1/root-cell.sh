@@ -80,6 +80,7 @@ readonly BASELINE_OBJECT="${ARTIFACT_ROOT}/wg_mix_tc.o"
 readonly MODERN_OBJECT="${ARTIFACT_ROOT}/wg_mix_faketcp_experimental.o"
 readonly LEGACY_OBJECT="${ARTIFACT_ROOT}/wg_mix_faketcp_legacy_515.o"
 readonly CELL_DRIVER="${SOURCE}/scripts/realhost-b82-faketcp-backends-v1/root-netns-cell.sh"
+readonly TCP_DROP_DIAGNOSTIC="${SOURCE}/scripts/realhost-b82-faketcp-backends-v1/diagnose-retained-tcp-drop.sh"
 readonly KFUNC_OUTPUT="${ARTIFACT_ROOT}/faketcp_checksum_kmod"
 readonly KPROBE_OUTPUT="${ARTIFACT_ROOT}/faketcp_checksum_kprobe_kmod"
 readonly KFUNC_OBJECT="${KFUNC_OUTPUT}/${KFUNC_MODULE}.ko"
@@ -159,6 +160,13 @@ plan() {
     --legacy-object "${LEGACY_OBJECT}" --selected-object "${selected_object}" \
     --module-object "${module_object}" --module-lease-id "${MODULE_LEASE_ID}" \
     --xor "${XOR_MODE}" --gso "${GSO_MODE}"; printf '\n'
+  if [[ "${WG_COUNT}:${ATTACHMENT_BACKEND}:${CHECKSUM_BACKEND}:${XOR_MODE}:${GSO_MODE}" == \
+    '1:tcx:kfunc:none:off' ]]; then
+    printf 'PRETRAFFIC_DIAGNOSTIC argv='; quote_argv /bin/bash -p \
+      "${TCP_DROP_DIAGNOSTIC}" run --source "${SOURCE}" \
+      --source-commit "${COMMIT}" --run-commit "${COMMIT}" \
+      --run-id "${RUN_ID}" --attempt-id "${RUN_ID}"; printf '\n'
+  fi
   printf 'RESTORE argv='; quote_argv /bin/bash -p "$0" restore \
     --source "${SOURCE}" --commit "${COMMIT}" --run-id "${RUN_ID}" --label "${LABEL}" \
     --wg-count "${WG_COUNT}" --attachment-backend "${ATTACHMENT_BACKEND}" \

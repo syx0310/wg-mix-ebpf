@@ -1240,6 +1240,14 @@ class StaticMatrixTest(unittest.TestCase):
         )
         self.assertNotIn('${EVIDENCE}/tcp-drop-${phase}.log', diagnostic)
         self.assertIn("fresh eight-hex `--attempt-id`", self.readme)
+        for required in (
+            'readonly TCP_DROP_DIAGNOSTIC="${SOURCE}/scripts/realhost-b82-faketcp-backends-v1/diagnose-retained-tcp-drop.sh"',
+            "'1:tcx:kfunc:none:off'",
+            '--run-id "${RUN_ID}" --attempt-id "${RUN_ID}"',
+            'log_command retained-tcp-drop-diagnostic',
+            'PRETRAFFIC_DIAGNOSTIC argv=',
+        ):
+            self.assertIn(required, self.root_cell + self.netns)
 
 
 if __name__ == "__main__":

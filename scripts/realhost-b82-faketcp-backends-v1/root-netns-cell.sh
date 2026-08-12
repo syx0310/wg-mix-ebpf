@@ -137,6 +137,7 @@ readonly VB="vb${RUN_ID:0:6}" VRB="rb${RUN_ID:0:6}"
 readonly ENDPOINT_A="${ROOT}/endpoint-a" ENDPOINT_B="${ROOT}/endpoint-b"
 readonly RUN_A="${ENDPOINT_A}/run" RUN_B="${ENDPOINT_B}/run"
 readonly BIN="${BINARY}"
+readonly TCP_DROP_DIAGNOSTIC="${SOURCE}/scripts/realhost-b82-faketcp-backends-v1/diagnose-retained-tcp-drop.sh"
 readonly BUILD_CACHE_ROOT="${ROOT}/build-cache"
 readonly GO_CACHE="${BUILD_CACHE_ROOT}/go-cache" GO_MOD_CACHE="${STAGE_ROOT}/go-mod-cache"
 readonly GO_PATH="${BUILD_CACHE_ROOT}/go-path" GO_TMP="${BUILD_CACHE_ROOT}/go-tmp"
@@ -840,6 +841,18 @@ PY
 }
 validate_status "${EVIDENCE}/status-a-initial.stdout.log" >"${EVIDENCE}/status-a-validation.log"
 validate_status "${EVIDENCE}/status-b-initial.stdout.log" >"${EVIDENCE}/status-b-validation.log"
+
+# The first functional cell is the narrow reproduction point for failures that
+# occur after healthy activation but before TCP traffic crosses the tunnel.
+# Capture the full bounded trace/map/pcap bundle while both process-owned
+# runtimes are still alive; post-failure diagnosis cannot recover their FDs.
+if [[ "${WG_COUNT}:${ATTACHMENT_BACKEND}:${CHECKSUM_BACKEND}:${XOR_MODE}:${GSO_MODE}" == \
+  '1:tcx:kfunc:none:off' ]]; then
+  [[ -f "${TCP_DROP_DIAGNOSTIC}" && ! -L "${TCP_DROP_DIAGNOSTIC}" ]] || exit 1
+  log_command retained-tcp-drop-diagnostic /bin/bash -p "${TCP_DROP_DIAGNOSTIC}" run \
+    --source "${SOURCE}" --source-commit "${COMMIT}" --run-commit "${COMMIT}" \
+    --run-id "${RUN_ID}" --attempt-id "${RUN_ID}"
+fi
 
 tcp_server_listening() {
   local port="$1"

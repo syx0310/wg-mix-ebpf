@@ -116,6 +116,12 @@ unpinned and process-scoped, and the only persistent writes are new
 `tcp-drop-*` files in the already-owned evidence directory. It performs no
 cleanup and never runs from an error or signal trap.
 
+The one-WG/TCX/kfunc/no-XOR/GSO-off functional cell invokes this diagnostic
+before its normal ping/iperf phase, using the cell run ID as the attempt ID.
+This guarantees that process-owned map/link FDs are still live when a failing
+first TCP connection is captured; diagnosis is not deferred until after the
+cell shell and resident daemons have exited.
+
 Root writes are bounded to the matrix/cell evidence roots (including per-cell
 `artifacts/` and `build-cache/` directories on `/var/tmp`), the staged
 read-only Go module cache, three run-derived network namespaces, two private
