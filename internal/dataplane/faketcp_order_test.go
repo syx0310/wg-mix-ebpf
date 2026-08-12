@@ -1366,7 +1366,8 @@ func TestFakeTCPCloseControlsUseOneCanonicalFailClosedPath(t *testing.T) {
 	}
 	for _, want := range []string{
 		"close_control = flags & (FAKETCP_FLAG_RST | FAKETCP_FLAG_FIN)",
-		"if (!close_control && policy_listener->cipher_id != 0)",
+		"if (!close_control && admission->payload_len != 0 &&",
+		"policy_listener->cipher_id != 0)",
 		"return close_control ? FAKETCP_ADMISSION_DROP :",
 		"admission->decision.close.session_revision = session_snapshot->revision",
 		"admission->decision.close.tx_sequence = session_snapshot->tx_sequence",

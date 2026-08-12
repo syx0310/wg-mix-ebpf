@@ -4019,7 +4019,14 @@ static __always_inline int faketcp_xdp_admission_checkpoint(
 		inc_faketcp_stat(FAKETCP_STAT_BAD_PACKET);
 		return FAKETCP_ADMISSION_DROP;
 	}
-	if (!close_control && policy_listener->cipher_id != 0) {
+	// Payload-free SYN/SYN+ACK/ACK controls never carry WireGuard bytes and
+	// therefore have no XOR target.  Classify them through the session/control
+	// state machine below before asking xor_payload_target(), whose data-plane
+	// contract deliberately rejects a zero-length payload.  Otherwise enabling
+	// any cipher drops the handshake controls before userspace can establish the
+	// first session.
+	if (!close_control && admission->payload_len != 0 &&
+	    policy_listener->cipher_id != 0) {
 		xor_info->payload_off = admission->payload_off;
 		xor_info->payload_len = admission->payload_len;
 		cipher = lookup_cipher(policy_listener->cipher_id, generation);
