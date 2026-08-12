@@ -17,7 +17,7 @@ const (
 	legacy515FakeTCPKprobeRuntimeMapABI      = 16
 	legacy515FakeTCPIterationMap             = "faketcp_legacy_515_iteration_map"
 	legacy515FakeTCPIterationMapMaxEntries   = 4097
-	legacy515FakeTCPIterationHelperCallCount = 4
+	legacy515FakeTCPIterationHelperCallCount = 6
 )
 
 var legacy515FakeTCPTriggerHelperCounts = map[asm.BuiltinFunc]int{

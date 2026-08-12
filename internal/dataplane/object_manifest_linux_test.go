@@ -147,7 +147,7 @@ func TestLegacy515ManifestIsIndependentAndRejectsPost515Calls(t *testing.T) {
 	}
 	missingIteration.Programs["wg_mix_egress"].Instructions = withoutIteration
 	if err := validateLegacy515ExtensionManifest(missingIteration); err == nil ||
-		!strings.Contains(err.Error(), "want exactly 4") {
+		!strings.Contains(err.Error(), "want exactly 6") {
 		t.Fatalf("legacy-5.15 manifest accepted missing iterator call: %v", err)
 	}
 

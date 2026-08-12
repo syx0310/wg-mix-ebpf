@@ -82,7 +82,7 @@ func TestFakeTCPLegacy515ObjectHasIndependentFullGSOBuildContract(t *testing.T) 
 		"legacy515FakeTCPKprobeRuntimeMap",
 		"legacy515FakeTCPIterationMap",
 		"legacy515FakeTCPIterationMapMaxEntries",
-		"legacy515FakeTCPIterationHelperCallCount = 4",
+		"legacy515FakeTCPIterationHelperCallCount = 6",
 		"asm.FnForEachMapElem",
 		"unix.BPF_F_RDONLY_PROG",
 		"asm.FnSkbChangeType:  2",
