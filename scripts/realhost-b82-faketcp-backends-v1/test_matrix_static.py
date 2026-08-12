@@ -1232,8 +1232,11 @@ class StaticMatrixTest(unittest.TestCase):
             'tracepoint:net:net_dev_start_xmit',
             'tracepoint:net:net_dev_xmit',
             'phase=packet-trace',
+            r'printf("TRACE_READY\n");',
+            'END { clear(@tracked); }',
         ):
             self.assertIn(required, diagnostic)
+        self.assertNotIn(r'TRACE_READY\\n', diagnostic)
         self.assertNotRegex(
             diagnostic,
             re.compile(r'local role="\$1"[^\n]*pid_file="[^\n]*\$\{role\}'),

@@ -230,26 +230,27 @@ PY
 capture_runtime_maps a "${MAPS_A_BEFORE}"
 capture_runtime_maps b "${MAPS_B_BEFORE}"
 
-readonly BPFTRACE_PROGRAM='BEGIN { printf("TRACE_READY\\n"); }
+readonly BPFTRACE_PROGRAM='BEGIN { printf("TRACE_READY\n"); }
 tracepoint:net:net_dev_queue /str(args->name) == "wg0" || str(args->name) == "under0"/ {
   @tracked[args->skbaddr] = 1;
-  printf("ts=%llu event=queue skb=%p dev=%s len=%u net_cookie=%llu\\n", nsecs, args->skbaddr, str(args->name), args->len, args->net_cookie);
+  printf("ts=%llu event=queue skb=%p dev=%s len=%u net_cookie=%llu\n", nsecs, args->skbaddr, str(args->name), args->len, args->net_cookie);
 }
 tracepoint:net:net_dev_start_xmit /str(args->name) == "wg0" || str(args->name) == "under0"/ {
   @tracked[args->skbaddr] = 1;
-  printf("ts=%llu event=start_xmit skb=%p dev=%s protocol=%u ip_summed=%u len=%u data_len=%u network_offset=%d transport_offset_valid=%u transport_offset=%d gso_size=%u gso_segs=%u gso_type=%u net_cookie=%llu\\n", nsecs, args->skbaddr, str(args->name), args->protocol, args->ip_summed, args->len, args->data_len, args->network_offset, args->transport_offset_valid, args->transport_offset, args->gso_size, args->gso_segs, args->gso_type, args->net_cookie);
+  printf("ts=%llu event=start_xmit skb=%p dev=%s protocol=%u ip_summed=%u len=%u data_len=%u network_offset=%d transport_offset_valid=%u transport_offset=%d gso_size=%u gso_segs=%u gso_type=%u net_cookie=%llu\n", nsecs, args->skbaddr, str(args->name), args->protocol, args->ip_summed, args->len, args->data_len, args->network_offset, args->transport_offset_valid, args->transport_offset, args->gso_size, args->gso_segs, args->gso_type, args->net_cookie);
 }
 tracepoint:net:net_dev_xmit /str(args->name) == "wg0" || str(args->name) == "under0"/ {
   @tracked[args->skbaddr] = 1;
-  printf("ts=%llu event=xmit skb=%p dev=%s len=%u rc=%d net_cookie=%llu\\n", nsecs, args->skbaddr, str(args->name), args->len, args->rc, args->net_cookie);
+  printf("ts=%llu event=xmit skb=%p dev=%s len=%u rc=%d net_cookie=%llu\n", nsecs, args->skbaddr, str(args->name), args->len, args->rc, args->net_cookie);
 }
 tracepoint:skb:kfree_skb /args->protocol == 2048 || @tracked[args->skbaddr]/ {
-  printf("ts=%llu event=kfree skb=%p pid=%d comm=%s protocol=%u location=%s reason=%d\\n", nsecs, args->skbaddr, pid, comm, args->protocol, ksym(args->location), args->reason);
+  printf("ts=%llu event=kfree skb=%p pid=%d comm=%s protocol=%u location=%s reason=%d\n", nsecs, args->skbaddr, pid, comm, args->protocol, ksym(args->location), args->reason);
 }
 tracepoint:skb:consume_skb /@tracked[args->skbaddr]/ {
-  printf("ts=%llu event=consume skb=%p pid=%d comm=%s location=%s\\n", nsecs, args->skbaddr, pid, comm, ksym(args->location));
+  printf("ts=%llu event=consume skb=%p pid=%d comm=%s location=%s\n", nsecs, args->skbaddr, pid, comm, ksym(args->location));
 }
-interval:s:8 { exit(); }'
+interval:s:8 { exit(); }
+END { clear(@tracked); }'
 
 timeout --signal=TERM --kill-after=2s 10s bpftrace -q -e "${BPFTRACE_PROGRAM}" \
   >"${TRACE_OUT}" 2>"${TRACE_ERR}" &
