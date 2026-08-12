@@ -500,5 +500,5 @@ static void __exit wg_mix_faketcp_checksum_exit(void)
 module_init(wg_mix_faketcp_checksum_init);
 module_exit(wg_mix_faketcp_checksum_exit);
 
-MODULE_DESCRIPTION("wg-mix-ebpf experimental FakeTCP checksum, PMTU and GSO bridge");
+MODULE_DESCRIPTION("wg-mix-ebpf FakeTCP checksum, PMTU and GSO bridge");
 MODULE_LICENSE("GPL");

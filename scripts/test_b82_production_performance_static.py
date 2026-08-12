@@ -69,6 +69,10 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
             '"lease_id=${MODULE_LEASE_ID}"',
             "matrix_logged module-load /usr/sbin/insmod",
             "matrix_logged module-unload /usr/sbin/rmmod",
+            'expected_lease="${intent_stage}-${matrix_id}"',
+            'intent_source_root="/run/wg-mix-ebpf-source-stages/${intent_stage}/source"',
+            'reason="recovered-unreceipted-live-no-btf"',
+            'if ! module_identity="$(module_live_identity)"; then',
             'if [[ "${operation}" == "cleanup-module" ]]; then',
             "cleanup_owned_module",
             '"${refcount}" != "0"',
@@ -82,6 +86,30 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
         self.assertLess(cells, unload)
         failure = matrix[matrix.index("matrix_failure()") : matrix.index("receipt_value()")]
         self.assertNotIn("rmmod", failure)
+
+    def test_module_build_finalizes_exact_kernel_btf_before_load(self) -> None:
+        makefile = (ROOT / "Makefile").read_text(encoding="utf-8")
+        helper = (
+            ROOT / "scripts" / "finalize-faketcp-checksum-module-btf.sh"
+        ).read_text(encoding="utf-8")
+        for fragment in (
+            'VMLINUX_BTF ?= /sys/kernel/btf/vmlinux',
+            'FAKETCP_CHECKSUM_KMOD_BTF_HELPER ?=',
+            '--kernel-build "$(KERNEL_BUILD)"',
+            '--vmlinux-btf "$(VMLINUX_BTF)"',
+            '--module "$(FAKETCP_CHECKSUM_KMOD_OBJECT)"',
+        ):
+            self.assertIn(fragment, makefile)
+        for fragment in (
+            'readonly gen_btf="${kernel_build}/scripts/gen-btf.sh"',
+            'readonly resolve_btfids="${kernel_build}/tools/bpf/resolve_btfids/resolve_btfids"',
+            '"${gen_btf}" --btf_base "${vmlinux_btf}" "${module}"',
+            '"1:1:1"',
+            'FAKETCP_CHECKSUM_MODULE_BTF state=%s',
+        ):
+            self.assertIn(fragment, helper)
+        for forbidden in ("insmod", "modprobe", "rmmod", "modules_install"):
+            self.assertNotIn(forbidden, helper)
 
     def test_cleanup_dispatch_and_run_root_precede_mutating_work(self) -> None:
         matrix = self.matrix

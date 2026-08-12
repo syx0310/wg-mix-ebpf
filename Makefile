@@ -14,8 +14,10 @@ FAKETCP_EXPERIMENTAL_BPF_OBJECT ?= build/wg_mix_faketcp_experimental.o
 FAKETCP_CHECKSUM_KMOD_SOURCE ?= $(CURDIR)/kernel/faketcp_checksum
 FAKETCP_CHECKSUM_KMOD_OUTPUT ?= $(CURDIR)/build/faketcp_checksum_kmod
 FAKETCP_CHECKSUM_KMOD_OBJECT ?= $(FAKETCP_CHECKSUM_KMOD_OUTPUT)/wg_mix_faketcp_checksum.ko
+FAKETCP_CHECKSUM_KMOD_BTF_HELPER ?= $(CURDIR)/scripts/finalize-faketcp-checksum-module-btf.sh
 KERNEL_RELEASE ?= $(shell uname -r)
 KERNEL_BUILD ?= /lib/modules/$(KERNEL_RELEASE)/build
+VMLINUX_BTF ?= /sys/kernel/btf/vmlinux
 FAKETCP_VERIFIER_LAUNCHER_AMD64 ?= bin/faketcp-verifier-launcher-linux-amd64
 FAKETCP_VERIFIER_LAUNCHER_ARM64 ?= bin/faketcp-verifier-launcher-linux-arm64
 FAKETCP_VERIFIER_LAUNCHER_TEST_AMD64 ?= build/verifierlauncher-linux-amd64.test
@@ -106,12 +108,17 @@ build-faketcp-experimental-bpf:
 # loading, unloading and cleanup require a separately reviewed real-host step.
 build-faketcp-checksum-kmod:
 	@test -d "$(KERNEL_BUILD)" || { echo "kernel build tree not found: $(KERNEL_BUILD)"; exit 2; }
+	@test -r "$(VMLINUX_BTF)" || { echo "kernel BTF base not found: $(VMLINUX_BTF)"; exit 2; }
 	@mkdir -p "$(FAKETCP_CHECKSUM_KMOD_OUTPUT)"
 	$(MAKE) -C "$(KERNEL_BUILD)" \
 		M="$(FAKETCP_CHECKSUM_KMOD_SOURCE)" \
 		MO="$(FAKETCP_CHECKSUM_KMOD_OUTPUT)" modules
 	@test -f "$(FAKETCP_CHECKSUM_KMOD_OBJECT)" || \
 		{ echo "expected module was not built: $(FAKETCP_CHECKSUM_KMOD_OBJECT)"; exit 2; }
+	/usr/bin/bash "$(FAKETCP_CHECKSUM_KMOD_BTF_HELPER)" \
+		--kernel-build "$(KERNEL_BUILD)" \
+		--vmlinux-btf "$(VMLINUX_BTF)" \
+		--module "$(FAKETCP_CHECKSUM_KMOD_OBJECT)"
 
 define run_bpf_object_manifest_test
 	@baseline_object="$(BPF_OBJECT)"; \

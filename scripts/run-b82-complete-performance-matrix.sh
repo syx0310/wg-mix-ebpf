@@ -179,6 +179,7 @@ receipt_value() {
 cleanup_owned_module() {
   local intent_stage intent_boot intent_commit intent_module intent_sha
   local intent_srcversion intent_lease live_btf live_btf_sha owned_btf owned_btf_sha
+  local intent_source_root intent_module_object expected_lease
   local refcount owned_sha reason
 
   if [[ ! -d "${RUN_PARENT}" || -L "${RUN_PARENT}" ||
@@ -202,19 +203,23 @@ cleanup_owned_module() {
   intent_sha="$(receipt_value ko_sha256 "${MODULE_INTENT}")"
   intent_srcversion="$(receipt_value srcversion "${MODULE_INTENT}")"
   intent_lease="$(receipt_value lease_id "${MODULE_INTENT}")"
+  intent_source_root="/run/wg-mix-ebpf-source-stages/${intent_stage}/source"
+  intent_module_object="${intent_source_root}/build/faketcp_checksum_kmod/${MODULE_NAME}.ko"
+  expected_lease="${intent_stage}-${matrix_id}"
   if [[ "$(receipt_value format "${MODULE_INTENT}")" != \
       "wg-mix-ebpf-b82-performance-module-intent-v1" ||
     "$(receipt_value run_id "${MODULE_INTENT}")" != "${matrix_id}" ||
-    "${intent_stage}" != "${source_stage_id}" ||
+    ! "${intent_stage}" =~ ^[0-9a-f]{8}$ ||
     "${intent_boot}" != "$(</proc/sys/kernel/random/boot_id)" ||
-    "${intent_commit}" != "$(/usr/bin/git -C "${source_root}" rev-parse --verify 'HEAD^{commit}')" ||
+    ! -d "${intent_source_root}" || -L "${intent_source_root}" ||
+    "${intent_commit}" != "$(/usr/bin/git -C "${intent_source_root}" rev-parse --verify 'HEAD^{commit}')" ||
     "${intent_module}" != "${MODULE_NAME}" ||
-    "${intent_lease}" != "${MODULE_LEASE_ID}" ||
+    "${intent_lease}" != "${expected_lease}" ||
     ! "${intent_sha}" =~ ^[0-9a-f]{64}$ ||
     ! "${intent_srcversion}" =~ ^[0-9A-F]{8,64}$ ||
-    ! -f "${module_object}" || -L "${module_object}" ||
-    "$(sha256sum -- "${module_object}" | awk '{print $1}')" != "${intent_sha}" ||
-    "$(/usr/sbin/modinfo -F srcversion -- "${module_object}" | tr '[:lower:]' '[:upper:]')" != "${intent_srcversion}" ]]; then
+    ! -f "${intent_module_object}" || -L "${intent_module_object}" ||
+    "$(sha256sum -- "${intent_module_object}" | awk '{print $1}')" != "${intent_sha}" ||
+    "$(/usr/sbin/modinfo -F srcversion -- "${intent_module_object}" | tr '[:lower:]' '[:upper:]')" != "${intent_srcversion}" ]]; then
     echo "error: matrix cleanup intent identity mismatch" >&2
     return 1
   fi
@@ -232,7 +237,7 @@ cleanup_owned_module() {
       "$(receipt_value format "${MODULE_UNLOADED}")" != \
         "wg-mix-ebpf-b82-performance-module-unloaded-v1" ||
       "$(receipt_value run_id "${MODULE_UNLOADED}")" != "${matrix_id}" ||
-      "$(receipt_value lease_id "${MODULE_UNLOADED}")" != "${MODULE_LEASE_ID}" ||
+      "$(receipt_value lease_id "${MODULE_UNLOADED}")" != "${expected_lease}" ||
       "$(receipt_value intent_sha256 "${MODULE_UNLOADED}")" != \
         "$(sha256sum -- "${MODULE_INTENT}" | awk '{print $1}')" ]]; then
       echo "error: reentrant module cleanup receipt mismatch" >&2
@@ -246,10 +251,8 @@ cleanup_owned_module() {
   owned_sha="absent"
   reason="intent-no-live"
   if [[ -d "${MODULE_SYSFS}" ]]; then
-    live_btf="$(stat -Lc '%d:%i' -- "${MODULE_BTF}")"
-    live_btf_sha="$(sha256sum -- "${MODULE_BTF}" | awk '{print $1}')"
     refcount="$(awk -v name="${MODULE_NAME}" '$1 == name {print $3}' /proc/modules)"
-    if [[ "$(<"${MODULE_SYSFS}/parameters/lease_id")" != "${MODULE_LEASE_ID}" ||
+    if [[ "$(<"${MODULE_SYSFS}/parameters/lease_id")" != "${expected_lease}" ||
       "$(tr '[:lower:]' '[:upper:]' <"${MODULE_SYSFS}/srcversion")" != "${intent_srcversion}" ||
       "${refcount}" != "0" ]]; then
       echo "error: live module identity/refcount no longer matches its owned receipt" >&2
@@ -263,10 +266,13 @@ cleanup_owned_module() {
         "$(receipt_value intent_sha256 "${MODULE_OWNED}")" != \
           "$(sha256sum -- "${MODULE_INTENT}" | awk '{print $1}')" ||
         "$(receipt_value ko_sha256 "${MODULE_OWNED}")" != "${intent_sha}" ||
-        "$(receipt_value lease_id "${MODULE_OWNED}")" != "${MODULE_LEASE_ID}" ]]; then
+        "$(receipt_value lease_id "${MODULE_OWNED}")" != "${expected_lease}" ||
+        ! -f "${MODULE_BTF}" || -L "${MODULE_BTF}" ]]; then
         echo "error: live module owned receipt is invalid" >&2
         return 1
       fi
+      live_btf="$(stat -Lc '%d:%i' -- "${MODULE_BTF}")"
+      live_btf_sha="$(sha256sum -- "${MODULE_BTF}" | awk '{print $1}')"
       owned_btf="$(receipt_value btf "${MODULE_OWNED}")"
       owned_btf_sha="$(receipt_value btf_sha256 "${MODULE_OWNED}")"
       if [[ "${live_btf}" != "${owned_btf}" || "${live_btf_sha}" != "${owned_btf_sha}" ]]; then
@@ -276,7 +282,11 @@ cleanup_owned_module() {
       owned_sha="$(sha256sum -- "${MODULE_OWNED}" | awk '{print $1}')"
       reason="owned-live-unloaded"
     else
-      reason="recovered-unreceipted-live"
+      if [[ -f "${MODULE_BTF}" && ! -L "${MODULE_BTF}" ]]; then
+        reason="recovered-unreceipted-live"
+      else
+        reason="recovered-unreceipted-live-no-btf"
+      fi
     fi
     matrix_logged cleanup-module-unload /usr/sbin/rmmod "${MODULE_NAME}"
     [[ ! -e "${MODULE_SYSFS}" && ! -e "${MODULE_BTF}" ]]
@@ -286,7 +296,7 @@ cleanup_owned_module() {
   fi
   printf '%s\n' \
     'format=wg-mix-ebpf-b82-performance-module-unloaded-v1' \
-    "run_id=${matrix_id}" "lease_id=${MODULE_LEASE_ID}" \
+    "run_id=${matrix_id}" "lease_id=${expected_lease}" \
     "intent_sha256=$(sha256sum -- "${MODULE_INTENT}" | awk '{print $1}')" \
     "owned_receipt_sha256=${owned_sha}" "reason=${reason}" 'state=unloaded' \
     >"${MODULE_UNLOADED}"
@@ -369,7 +379,10 @@ if [[ -e "${MODULE_SYSFS}" || -L "${MODULE_SYSFS}" ||
   exit 1
 fi
 matrix_logged module-load /usr/sbin/insmod "${module_object}" "lease_id=${MODULE_LEASE_ID}"
-module_identity="$(module_live_identity)"
+if ! module_identity="$(module_live_identity)"; then
+  echo "error: loaded checksum module lacks its exact lease/srcversion/BTF identity" >&2
+  matrix_failure 1 "${LINENO}"
+fi
 printf '%s\n' \
   'format=wg-mix-ebpf-b82-performance-module-owned-v1' \
   "run_id=${matrix_id}" "intent_sha256=$(sha256sum -- "${MODULE_INTENT}" | awk '{print $1}')" \
