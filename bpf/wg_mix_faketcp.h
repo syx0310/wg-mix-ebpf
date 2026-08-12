@@ -1059,6 +1059,23 @@ static __always_inline int faketcp_mtu_reject(__u32 reason, __u32 boundary)
 	return -1;
 }
 
+#ifdef WG_MIX_FAKETCP_LEGACY_515
+// bpf_skb_change_proto() marks the caller's ctx register as modified on
+// Linux 5.15.  Keep descriptor cleanup in a separate subprogram so its ctx
+// argument is verified afresh instead of dereferencing that modified caller
+// register.  This is deliberately fixed-size and stackless: cb is exactly
+// the kprobe descriptor, and cleanup must still run after a rejected trigger.
+static __noinline void
+faketcp_clear_kprobe_descriptor(struct __sk_buff *skb)
+{
+	skb->cb[0] = 0;
+	skb->cb[1] = 0;
+	skb->cb[2] = 0;
+	skb->cb[3] = 0;
+	skb->cb[4] = 0;
+}
+#endif
+
 static __always_inline int
 faketcp_prepare_udp(struct __sk_buff *skb, __u32 network_offset,
 		    __u32 transport_offset, __u32 udp_length, int expect_gso)
@@ -1097,11 +1114,7 @@ faketcp_prepare_udp(struct __sk_buff *skb, __u32 network_offset,
 	// The descriptor is valid only during the synchronous helper/kretprobe
 	// call.  Clearing is unconditional so a miss or rejection cannot leak
 	// lease identity into the later XOR tail-call protocol.
-#pragma unroll
-	for (int index = 0;
-	     index < WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_SIZE / sizeof(__u32);
-	     index++)
-		skb->cb[index] = 0;
+	faketcp_clear_kprobe_descriptor(skb);
 	// The module may have linearized or COW-reallocated skb storage even though
 	// the verifier models change_type as a non-data-changing helper.  Refresh
 	// verifier packet-pointer state immediately after the synchronous trigger;
@@ -1203,11 +1216,10 @@ faketcp_commit_udp_gso(struct __sk_buff *skb, __u32 network_offset,
 			skb, WG_MIX_FAKETCP_KPROBE_COMMIT_PROTO_MAGIC,
 			ack_window);
 	}
-#pragma unroll
-	for (int index = 0;
-	     index < WG_MIX_FAKETCP_KPROBE_DESCRIPTOR_SIZE / sizeof(__u32);
-	     index++)
-		skb->cb[index] = 0;
+	// This must stay unconditional: failed helper dispatches must not leave a
+	// stale descriptor for the later XOR tail-call protocol.  The noinline
+	// subprogram is also the verifier boundary required after change_proto.
+	faketcp_clear_kprobe_descriptor(skb);
 	return result;
 #else
 	return wg_mix_faketcp_skb_commit_udp_gso(
