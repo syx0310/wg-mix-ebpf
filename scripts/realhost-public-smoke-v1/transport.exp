@@ -122,6 +122,14 @@ if {$operation eq "ssh"} {
 }
 
 set timeout 1900
+# The reviewed B82 complete-performance matrix contains 33 cells and can
+# legitimately exceed the normal transport bound.  Extend only that exact
+# versioned runner; all other SSH and SCP operations retain the shorter cap.
+if {$operation eq "ssh" &&
+    [lsearch -regexp $operation_args \
+        {^/run/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source/scripts/run-b82-complete-performance-matrix\.sh$}] >= 0} {
+    set timeout 4000
+}
 set capture_limit 16777216
 set captured ""
 set credential_sends 0

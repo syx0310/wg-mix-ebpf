@@ -709,6 +709,13 @@ class PublicSmokeTest(unittest.TestCase):
         self.assertIn("PUBLIC_TRANSPORT_CHILD_WAIT result=$wait_result", transport)
         self.assertIn("set capture_limit 16777216", transport)
         self.assertIn("match_max -i $child_id $capture_limit", transport)
+        self.assertIn("set timeout 1900", transport)
+        self.assertIn(
+            r"^/run/wg-mix-ebpf-source-stages/[0-9a-f]{8}/source/scripts/run-b82-complete-performance-matrix\.sh$",
+            transport,
+        )
+        self.assertIn("set timeout 4000", transport)
+        self.assertEqual(transport.count("set timeout 4000"), 1)
         self.assertIn("-i $child_id full_buffer", transport)
         self.assertIn("stop child-output-limit 77", transport)
         self.assertLess(
