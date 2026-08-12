@@ -42,7 +42,7 @@ fi
 launcher="${source_root}/${LAUNCHER_NAME}"
 for executable in "${script_path}" "${launcher}"; do
   if [[ ! -f "${executable}" || -L "${executable}" || ! -x "${executable}" ||
-    "$(stat -c '%u:%g:%a:%h' -- "${executable}")" != "0:0:755:1" ]]; then
+    "$(stat -c '%u:%g:%a:%h' -- "${executable}")" != "0:0:700:1" ]]; then
     echo "error: staged performance executable is unsafe: ${executable}" >&2
     exit 1
   fi

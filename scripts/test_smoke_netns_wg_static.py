@@ -2316,6 +2316,7 @@ class SmokeNetNSWGStaticTests(unittest.TestCase):
             '"TCP_DIRECTIONS=forward reverse bidir"',
             '"TCP_MAX_RETRANSMITS=0"',
             '"TCP_MTUS=1420"',
+            '!= "0:0:700:1"',
             '/usr/bin/bash -p "${launcher}"',
         ):
             self.assertIn(fragment, matrix)
