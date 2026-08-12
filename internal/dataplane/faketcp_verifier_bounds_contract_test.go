@@ -124,9 +124,15 @@ func TestFakeTCPPacketHelperSizesCannotBeZero(t *testing.T) {
 	gsoXOR := sourceSection(t, fake,
 		"static __noinline long faketcp_gso_xor_chunk(",
 		"#ifdef WG_MIX_FAKETCP_LEGACY_515\nstatic __always_inline int faketcp_legacy_515_rewrite_gso_types(")
+	if !strings.Contains(fake, "_Static_assert(sizeof(struct faketcp_gso_loop_context) == 64") {
+		t.Fatal("FakeTCP GSO loop context regained the 72-byte caller stack layout")
+	}
 	for _, forbidden := range []string{
 		"chunk, chunk_length)",
 		"chunk, chunk_length,",
+		"__u8 chunk[FAKETCP_GSO_XOR_CHUNK_BYTES]",
+		"old_word",
+		"new_word",
 	} {
 		if strings.Contains(gsoXOR, forbidden) {
 			t.Fatalf("GSO XOR passed verifier-ambiguous dynamic helper size through %q", forbidden)
@@ -134,12 +140,14 @@ func TestFakeTCPPacketHelperSizesCannotBeZero(t *testing.T) {
 	}
 	for _, required := range []string{
 		"if (chunk_length == 0 || chunk_length > FAKETCP_GSO_XOR_CHUNK_BYTES)",
-		"if (chunk_length == sizeof(chunk))",
-		"chunk,\n\t\t\t\t       sizeof(chunk)",
-		"&old_word, sizeof(old_word)",
-		"new_word = old_word",
+		"struct faketcp_runtime_scratch *scratch",
+		"chunk = scratch->gso_xor_chunk",
+		"if (chunk_length == FAKETCP_GSO_XOR_CHUNK_BYTES)",
+		"chunk,\n\t\t\t\t       FAKETCP_GSO_XOR_CHUNK_BYTES",
+		"*word_buffer = 0",
+		"word_buffer, sizeof(*word_buffer)",
 		"for (int byte = 0; byte < 4; byte++)",
-		"&new_word, sizeof(new_word)",
+		"for (int byte = 0; byte < 3; byte++)",
 		"tail_length == 0 || tail_length > 3",
 		"xor_load_partial_word(",
 		"xor_store_partial_word(",
@@ -188,6 +196,7 @@ func TestFakeTCPTCHeaderConsumersUseHelperSnapshots(t *testing.T) {
 		"_Static_assert(sizeof(struct faketcp_tc_ipv4_udp_snapshot) == 28",
 		"struct faketcp_tc_ipv4_udp_snapshot tc_headers",
 		"_Static_assert(offsetof(struct faketcp_runtime_scratch, tc_headers) == 360",
+		"_Static_assert(offsetof(struct faketcp_runtime_scratch, gso_xor_chunk) == 360",
 		"_Static_assert(sizeof(struct faketcp_runtime_scratch) == 392",
 		"transport_off - network_off != sizeof(struct iphdr)",
 		"payload_off - transport_off != sizeof(struct udphdr)",

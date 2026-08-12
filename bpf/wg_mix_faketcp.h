@@ -1754,15 +1754,20 @@ struct faketcp_runtime_scratch {
 		} ingress;
 		struct faketcp_metadata metadata;
 	};
-	// A dedicated slot outside the variant union keeps the fixed TC envelope
-	// off the 512-byte BPF stack without aliasing packet/admission or ingress
-	// metadata that remains live while a consumer validates the snapshot.
-	struct faketcp_tc_ipv4_udp_snapshot tc_headers;
-	__u32 tc_headers_pad;
+	// A dedicated slot outside the variant union keeps fixed helper buffers off
+	// the 512-byte BPF stack without aliasing packet/admission or ingress
+	// metadata. TC header validation and GSO XOR execute in disjoint phases, so
+	// they may safely share these final 32 bytes.
+	union {
+		struct faketcp_tc_ipv4_udp_snapshot tc_headers;
+		__u8 gso_xor_chunk[FAKETCP_GSO_XOR_CHUNK_BYTES];
+	};
 };
 
 _Static_assert(offsetof(struct faketcp_runtime_scratch, tc_headers) == 360,
 	       "FakeTCP runtime header scratch offset drift");
+_Static_assert(offsetof(struct faketcp_runtime_scratch, gso_xor_chunk) == 360,
+	       "FakeTCP runtime GSO XOR scratch offset drift");
 _Static_assert(sizeof(struct faketcp_runtime_scratch) == 392,
 	       "FakeTCP runtime scratch layout drift");
 
@@ -2500,10 +2505,18 @@ struct faketcp_gso_loop_context {
 	__u32 payload_length;
 	__u32 gso_size;
 	__u32 gso_segments;
-	__u32 xor_chunks_per_segment;
-	__u32 max_xor_target;
+	// Admission validation records the maximum XOR target; the later encoder
+	// records chunks per segment. Those phases never overlap, so one stack slot
+	// keeps the bpf_loop caller frame below the aggregate 512-byte limit.
+	union {
+		__u32 xor_chunks_per_segment;
+		__u32 max_xor_target;
+	};
 	int error;
 };
+
+_Static_assert(sizeof(struct faketcp_gso_loop_context) == 64,
+	       "FakeTCP GSO loop context stack layout drift");
 
 static __always_inline int faketcp_gso_mixed_from_kind(
 	const struct faketcp_gso_loop_context *context, int kind, __u32 *mixed)
@@ -2702,9 +2715,9 @@ static __noinline long faketcp_gso_rewrite_type(__u32 index, void *opaque)
 static __noinline long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 {
 	struct faketcp_gso_loop_context *context = opaque;
-	__u8 chunk[FAKETCP_GSO_XOR_CHUNK_BYTES] = {};
-	__u32 old_word = 0;
-	__u32 new_word = 0;
+	struct faketcp_runtime_scratch *scratch;
+	__u8 *chunk;
+	__u32 *word_buffer;
 	__u32 segment_index;
 	__u32 segment_offset;
 	__u32 segment_length;
@@ -2734,8 +2747,8 @@ static __noinline long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 	if (chunk_offset >= target_length)
 		return 0;
 	chunk_length = target_length - chunk_offset;
-	if (chunk_length > sizeof(chunk))
-		chunk_length = sizeof(chunk);
+	if (chunk_length > FAKETCP_GSO_XOR_CHUNK_BYTES)
+		chunk_length = FAKETCP_GSO_XOR_CHUNK_BYTES;
 	// Older verifiers retain a zero lower bound for the subtraction above even
 	// after chunk_offset < target_length. Never pass that scalar as a helper
 	// size. Full chunks retain the one-load/one-store fast path; the sole short
@@ -2745,10 +2758,17 @@ static __noinline long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 		context->error = -1;
 		return 1;
 	}
+	scratch = faketcp_runtime_scratch();
+	if (!scratch) {
+		context->error = -1;
+		return 1;
+	}
+	chunk = scratch->gso_xor_chunk;
+	word_buffer = (__u32 *)chunk;
 	packet_offset = context->payload_offset + segment_offset + chunk_offset;
-	if (chunk_length == sizeof(chunk)) {
+	if (chunk_length == FAKETCP_GSO_XOR_CHUNK_BYTES) {
 		if (bpf_skb_load_bytes(context->skb, packet_offset, chunk,
-				       sizeof(chunk)) < 0) {
+				       FAKETCP_GSO_XOR_CHUNK_BYTES) < 0) {
 			context->error = -1;
 			return 1;
 		}
@@ -2757,7 +2777,7 @@ static __noinline long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 			chunk[byte] ^=
 				xor_key_byte(context->cipher, chunk_offset + byte);
 		if (bpf_skb_store_bytes(context->skb, packet_offset, chunk,
-					sizeof(chunk),
+					FAKETCP_GSO_XOR_CHUNK_BYTES,
 					BPF_F_INVALIDATE_HASH) < 0) {
 			context->error = -1;
 			return 1;
@@ -2766,28 +2786,28 @@ static __noinline long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 	}
 
 #pragma unroll
-	for (int word = 0; word < FAKETCP_GSO_XOR_CHUNK_BYTES / 4; word++) {
-		if (processed + sizeof(old_word) > chunk_length)
+	for (int word_index = 0;
+	     word_index < FAKETCP_GSO_XOR_CHUNK_BYTES / 4; word_index++) {
+		if (processed + sizeof(__u32) > chunk_length)
 			break;
-		old_word = 0;
+		*word_buffer = 0;
 		if (bpf_skb_load_bytes(context->skb, packet_offset + processed,
-				       &old_word, sizeof(old_word)) < 0) {
+				       word_buffer, sizeof(*word_buffer)) < 0) {
 			context->error = -1;
 			return 1;
 		}
-		new_word = old_word;
 #pragma unroll
 		for (int byte = 0; byte < 4; byte++)
-			((__u8 *)&new_word)[byte] ^=
+			chunk[byte] ^=
 				xor_key_byte(context->cipher,
 					     chunk_offset + processed + byte);
 		if (bpf_skb_store_bytes(context->skb, packet_offset + processed,
-					&new_word, sizeof(new_word),
+					word_buffer, sizeof(*word_buffer),
 					BPF_F_INVALIDATE_HASH) < 0) {
 			context->error = -1;
 			return 1;
 		}
-		processed += sizeof(old_word);
+		processed += sizeof(__u32);
 	}
 	if (processed < chunk_length) {
 		tail_length = chunk_length - processed;
@@ -2795,17 +2815,23 @@ static __noinline long faketcp_gso_xor_chunk(__u32 index, void *opaque)
 			context->error = -1;
 			return 1;
 		}
-		old_word = 0;
+		*word_buffer = 0;
 		rc = xor_load_partial_word(context->skb, packet_offset + processed,
-					   tail_length, &old_word);
+					   tail_length, word_buffer);
 		if (rc < 0) {
 			context->error = -1;
 			return 1;
 		}
-		xor_partial_word(context->cipher, chunk_offset + processed,
-				 tail_length, old_word, &new_word);
+#pragma unroll
+		for (int byte = 0; byte < 3; byte++) {
+			if (byte >= tail_length)
+				break;
+			chunk[byte] ^=
+				xor_key_byte(context->cipher,
+					     chunk_offset + processed + byte);
+		}
 		rc = xor_store_partial_word(context->skb, packet_offset + processed,
-					    tail_length, &new_word,
+					    tail_length, word_buffer,
 					    BPF_F_INVALIDATE_HASH);
 		if (rc < 0) {
 			context->error = -1;
