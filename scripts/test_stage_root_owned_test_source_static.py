@@ -46,6 +46,81 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
         self.assertLess(identity_check, first_delete)
         self.assertNotIn("rm -rf", cleanup)
 
+    def test_cleanup_stage_entry_subset_is_retryable_but_fail_closed(self) -> None:
+        start = self.cleanup.index("validate_stage_entry_set() {")
+        end = self.cleanup.index("\n}\n", start) + len("\n}\n")
+        validator = self.cleanup[start:end]
+
+        expected = (
+            "candidate.bundle",
+            "git-template",
+            "go-cache",
+            "go-mod-cache",
+            "go-path",
+            "go-tmp",
+            "source",
+            "staging.log",
+        )
+
+        def validate(entries: tuple[str, ...]) -> subprocess.CompletedProcess[str]:
+            return subprocess.run(
+                [
+                    "/bin/bash",
+                    "-c",
+                    validator + '\nvalidate_stage_entry_set "$@"\n',
+                    "stage-entry-fixture",
+                    *entries,
+                ],
+                cwd="/",
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+        self.assertEqual(validate(expected).returncode, 0)
+        without_go_mod_cache = tuple(
+            entry for entry in expected if entry != "go-mod-cache"
+        )
+        self.assertEqual(validate(without_go_mod_cache).returncode, 0)
+        identity_only = ("candidate.bundle", "source", "staging.log")
+        self.assertEqual(validate(identity_only).returncode, 0)
+
+        foreign = validate((*expected, "foreign-entry"))
+        self.assertEqual(foreign.returncode, 66)
+        self.assertIn("foreign stage top-level entry", foreign.stderr)
+        for required in ("candidate.bundle", "source", "staging.log"):
+            missing = validate(tuple(entry for entry in expected if entry != required))
+            self.assertEqual(missing.returncode, 66)
+            self.assertIn(
+                f"required stage top-level entry is missing: {required}",
+                missing.stderr,
+            )
+
+        cleanup = self.cleanup
+        for fragment in (
+            "-printf '%f\\0' | /usr/bin/sort -z",
+            'validate_stage_entry_set "${actual_stage_entries[@]}"',
+            "staged bundle metadata is unsafe",
+            "staged source metadata is unsafe",
+            "staging log metadata is unsafe",
+            "optional stage directory metadata is unsafe",
+            "bootstrap runner metadata is unsafe",
+        ):
+            self.assertIn(fragment, cleanup)
+        first_delete = cleanup.index('/usr/bin/find "${stage}" -xdev -depth -delete')
+        for preflight in (
+            'validate_stage_entry_set "${actual_stage_entries[@]}"',
+            "staged source commit mismatch",
+            "staged bundle digest mismatch",
+            "bootstrap runner digest mismatch",
+            "cleanup target crosses a filesystem boundary",
+        ):
+            self.assertLess(cleanup.index(preflight), first_delete)
+        filesystem_preflight = cleanup[
+            cleanup.index('readonly run_device=') : first_delete
+        ]
+        self.assertNotIn("-type d", filesystem_preflight)
+
     def test_launcher_pins_the_exact_helper_content(self) -> None:
         match = re.search(
             r'^readonly EXPECTED_HELPER_SHA256="([0-9a-f]{64})"$',

@@ -68,7 +68,6 @@ for target in "${stage}" "${bootstrap}"; do
   }
 done
 
-readonly expected_stage_entries=$'candidate.bundle\ngit-template\ngo-cache\ngo-mod-cache\ngo-path\ngo-tmp\nsource\nstaging.log'
 readonly standard_bootstrap_entries=$'root-stage-runner.audit\nrun-root-owned-test-source-stage.sh\nstage-root-owned-test-source.bootstrap\nstage-root-owned-test-source.py\nstage-root-owned-test-source.sh'
 readonly legacy_bootstrap_entries=$'inspect-linux-test-host.sh\nroot-stage-runner.audit\nrun-root-owned-test-source-stage.sh\nstage-root-owned-test-source.bootstrap\nstage-root-owned-test-source.py\nstage-root-owned-test-source.sh'
 if [[ -n "${legacy_inspect_sha256}" ]]; then
@@ -76,16 +75,85 @@ if [[ -n "${legacy_inspect_sha256}" ]]; then
 else
   readonly expected_bootstrap_entries="${standard_bootstrap_entries}"
 fi
-actual_stage_entries="$(/usr/bin/find "${stage}" -mindepth 1 -maxdepth 1 -printf '%f\n' | /usr/bin/sort)"
-actual_bootstrap_entries="$(/usr/bin/find "${bootstrap}" -mindepth 1 -maxdepth 1 -printf '%f\n' | /usr/bin/sort)"
-[[ "${actual_stage_entries}" == "${expected_stage_entries}" ]] || {
-  printf 'error: stage top-level entries drifted: %s\n' "${stage}" >&2
-  exit 66
+
+validate_stage_entry_set() {
+  local entry=''
+  local candidate_bundle_seen=0
+  local source_seen=0
+  local staging_log_seen=0
+
+  for entry in "$@"; do
+    case "${entry}" in
+      candidate.bundle) candidate_bundle_seen=1 ;;
+      source) source_seen=1 ;;
+      staging.log) staging_log_seen=1 ;;
+      git-template | go-cache | go-mod-cache | go-path | go-tmp) ;;
+      *)
+        printf 'error: foreign stage top-level entry: %s\n' "${entry}" >&2
+        return 66
+        ;;
+    esac
+  done
+
+  ((candidate_bundle_seen == 1)) || {
+    printf 'error: required stage top-level entry is missing: candidate.bundle\n' >&2
+    return 66
+  }
+  ((source_seen == 1)) || {
+    printf 'error: required stage top-level entry is missing: source\n' >&2
+    return 66
+  }
+  ((staging_log_seen == 1)) || {
+    printf 'error: required stage top-level entry is missing: staging.log\n' >&2
+    return 66
+  }
 }
+
+actual_stage_entries=()
+while IFS= read -r -d '' entry; do
+  actual_stage_entries+=("${entry}")
+done < <(/usr/bin/find "${stage}" -mindepth 1 -maxdepth 1 -printf '%f\0' | /usr/bin/sort -z)
+readonly -a actual_stage_entries
+actual_bootstrap_entries="$(/usr/bin/find "${bootstrap}" -mindepth 1 -maxdepth 1 -printf '%f\n' | /usr/bin/sort)"
+validate_stage_entry_set "${actual_stage_entries[@]}" || exit $?
 [[ "${actual_bootstrap_entries}" == "${expected_bootstrap_entries}" ]] || {
   printf 'error: bootstrap top-level entries drifted: %s\n' "${bootstrap}" >&2
   exit 66
 }
+
+[[ ! -L "${bundle}" && -f "${bundle}" &&
+  "$(/usr/bin/stat -c '%U:%G:%a:%h:%F' -- "${bundle}")" == \
+    'root:root:400:1:regular file' ]] || {
+  printf 'error: staged bundle metadata is unsafe: %s\n' "${bundle}" >&2
+  exit 66
+}
+[[ ! -L "${source}" && -d "${source}" &&
+  "$(/usr/bin/readlink -e -- "${source}")" == "${source}" &&
+  "$(/usr/bin/stat -c '%U:%G:%a:%F' -- "${source}")" == \
+    'root:root:700:directory' ]] || {
+  printf 'error: staged source metadata is unsafe: %s\n' "${source}" >&2
+  exit 66
+}
+readonly staging_log="${stage}/staging.log"
+[[ ! -L "${staging_log}" && -f "${staging_log}" &&
+  "$(/usr/bin/stat -c '%U:%G:%a:%h:%F' -- "${staging_log}")" == \
+    'root:root:600:1:regular file' ]] || {
+  printf 'error: staging log metadata is unsafe: %s\n' "${staging_log}" >&2
+  exit 66
+}
+for optional_directory in git-template go-cache go-mod-cache go-path go-tmp; do
+  optional_path="${stage}/${optional_directory}"
+  if [[ -e "${optional_path}" || -L "${optional_path}" ]]; then
+    [[ ! -L "${optional_path}" && -d "${optional_path}" &&
+      "$(/usr/bin/readlink -e -- "${optional_path}")" == "${optional_path}" &&
+      "$(/usr/bin/stat -c '%U:%G:%a:%F' -- "${optional_path}")" == \
+        'root:root:700:directory' ]] || {
+      printf 'error: optional stage directory metadata is unsafe: %s\n' \
+        "${optional_path}" >&2
+      exit 66
+    }
+  fi
+done
 
 [[ "$(/usr/bin/git -C "${source}" rev-parse HEAD)" == "${commit}" ]] || {
   printf 'error: staged source commit mismatch: %s\n' "${source}" >&2
@@ -97,6 +165,12 @@ actual_bootstrap_entries="$(/usr/bin/find "${bootstrap}" -mindepth 1 -maxdepth 1
 }
 [[ "$(/usr/bin/sha256sum -- "${runner}")" == "${runner_sha256}  ${runner}" ]] || {
   printf 'error: bootstrap runner digest mismatch: %s\n' "${runner}" >&2
+  exit 66
+}
+[[ ! -L "${runner}" && -f "${runner}" &&
+  "$(/usr/bin/stat -c '%U:%G:%a:%h:%F' -- "${runner}")" == \
+    'root:root:500:1:regular file' ]] || {
+  printf 'error: bootstrap runner metadata is unsafe: %s\n' "${runner}" >&2
   exit 66
 }
 if [[ -n "${legacy_inspect_sha256}" ]]; then
@@ -116,7 +190,7 @@ for target in "${stage}" "${bootstrap}"; do
     printf 'error: cleanup target is outside the /run filesystem: %s\n' "${target}" >&2
     exit 66
   }
-  if /usr/bin/find "${target}" -xdev -mindepth 1 -type d -exec /usr/bin/stat -c '%d' -- '{}' + |
+  if /usr/bin/find "${target}" -xdev -mindepth 1 -exec /usr/bin/stat -c '%d' -- '{}' + |
       /usr/bin/grep -Fvxq "${run_device}"; then
     printf 'error: cleanup target crosses a filesystem boundary: %s\n' "${target}" >&2
     exit 66
