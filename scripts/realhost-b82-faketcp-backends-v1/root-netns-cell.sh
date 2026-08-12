@@ -7,7 +7,7 @@ set -Eeuo pipefail
 
 readonly SAFE_PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 readonly SELF_REL='scripts/realhost-b82-faketcp-backends-v1/root-netns-cell.sh'
-readonly RUN_PARENT='/run/wg-mix-ebpf-faketcp-backends-v1'
+readonly RUN_PARENT='/var/tmp/wg-mix-ebpf-faketcp-backends-v1'
 readonly SHARED_RUN='/run/wg-mix-ebpf'
 readonly SHARED_VAR='/var/lib/wg-mix-ebpf'
 readonly SHARED_MAINTENANCE='/run/.wg-mix-ebpf-daemon.lease.maintenance'

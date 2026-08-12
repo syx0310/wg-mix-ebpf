@@ -12,6 +12,7 @@ import pathlib
 import platform
 import re
 import secrets
+import stat
 import subprocess
 import sys
 from dataclasses import asdict, dataclass
@@ -20,6 +21,7 @@ from dataclasses import asdict, dataclass
 STAGE_RE = re.compile(r"/run/wg-mix-ebpf-source-stages/([0-9a-f]{8})/source")
 HEX40_RE = re.compile(r"[0-9a-f]{40}")
 RUN_RE = re.compile(r"[0-9a-f]{8}")
+RUN_PARENT = pathlib.Path("/var/tmp/wg-mix-ebpf-faketcp-backends-v1")
 SAFE_ENV = {
     "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
     "LC_ALL": "C",
@@ -109,13 +111,25 @@ def iso_now() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat()
 
 
+def ensure_run_parent() -> None:
+    if not RUN_PARENT.exists():
+        RUN_PARENT.mkdir(mode=0o700, parents=False, exist_ok=False)
+    if (
+        not RUN_PARENT.is_dir()
+        or RUN_PARENT.is_symlink()
+        or RUN_PARENT.resolve() != RUN_PARENT
+    ):
+        raise SystemExit("persistent run parent identity is unsafe")
+    shape = RUN_PARENT.stat()
+    if shape.st_uid != 0 or shape.st_gid != 0 or stat.S_IMODE(shape.st_mode) != 0o700:
+        raise SystemExit("persistent run parent must be root:root mode 0700")
+
+
 def main() -> int:
     args = parse_args()
     source, stage_id, matrix_id = validate(args)
     runner = source / "scripts/realhost-b82-faketcp-backends-v1/root-cell.sh"
-    matrix_root = pathlib.Path(
-        f"/run/wg-mix-ebpf-faketcp-backends-v1/{stage_id}-{matrix_id}"
-    )
+    matrix_root = RUN_PARENT / f"{stage_id}-{matrix_id}"
     document = {
         "format": "wg-mix-ebpf-b82-faketcp-backends-v1",
         "mode": args.mode,
@@ -186,7 +200,8 @@ def main() -> int:
         sys.stderr.write(actual.stdout)
         sys.stderr.write(actual.stderr)
         raise SystemExit("staged source commit mismatch")
-    matrix_root.mkdir(mode=0o700, parents=True, exist_ok=False)
+    ensure_run_parent()
+    matrix_root.mkdir(mode=0o700, parents=False, exist_ok=False)
     (matrix_root / "manifest.json").write_text(
         json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8"
     )

@@ -7,7 +7,7 @@ set -Eeuo pipefail
 
 readonly SAFE_PATH='/usr/sbin:/usr/bin:/sbin:/bin'
 readonly SELF_REL='scripts/realhost-b82-faketcp-backends-v1/root-cell.sh'
-readonly RUN_PARENT='/run/wg-mix-ebpf-faketcp-backends-v1'
+readonly RUN_PARENT='/var/tmp/wg-mix-ebpf-faketcp-backends-v1'
 readonly KFUNC_MODULE='wg_mix_faketcp_checksum'
 readonly KPROBE_MODULE='wg_mix_faketcp_checksum_kprobe'
 PATH="${SAFE_PATH}"
@@ -104,6 +104,12 @@ STAGE='preflight'
 
 quote_argv() { printf '%q ' "$@"; }
 
+validate_run_parent() {
+  [[ -d "${RUN_PARENT}" && ! -L "${RUN_PARENT}" &&
+    "$(readlink -e -- "${RUN_PARENT}")" == "${RUN_PARENT}" &&
+    "$(stat -Lc '%u:%g:%a:%F' -- "${RUN_PARENT}")" == '0:0:700:directory' ]]
+}
+
 plan() {
   local selected_object module_object module_name
   if [[ "${ARTIFACT}" == modern ]]; then selected_object="${MODERN_OBJECT}"; else selected_object="${LEGACY_OBJECT}"; fi
@@ -161,6 +167,7 @@ plan() {
 
 if [[ "${MODE}" == plan ]]; then plan; exit 0; fi
 [[ "${EUID}" -eq 0 && "$(id -g)" -eq 0 ]] || fail root-required 77
+validate_run_parent || fail run-parent-identity 79
 [[ -d "${SOURCE}" && ! -L "${SOURCE}" && "$(readlink -e -- "${SOURCE}")" == "${SOURCE}" ]] || fail source-path 79
 [[ "$(stat -Lc '%u:%g:%a:%F' -- "${SOURCE}")" == '0:0:700:directory' ]] || fail source-identity 79
 source_clean() {

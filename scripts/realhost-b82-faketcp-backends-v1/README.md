@@ -68,10 +68,12 @@ cell runner is invoked. Explicit kfunc cells are recorded as
 required 5.15 execution path. A kernel 7.x B82 run cannot be used as evidence
 that the legacy verifier accepts the object on 5.15.
 
-The harness intentionally retains the complete evidence root. It does not
-delete evidence after success or failure. An unexpected failure stops the
-matrix, captures all stdout/stderr and read-only state in one pass, and leaves
-the failed cell resources for an explicit, reviewed recovery invocation.
+The harness intentionally retains the complete evidence root under
+`/var/tmp/wg-mix-ebpf-faketcp-backends-v1/<run-id>`. The persistent parent,
+matrix root, and each cell root are root-owned mode `0700`. It does not delete
+evidence after success or failure. An unexpected failure stops the matrix,
+captures all stdout/stderr and read-only state in one pass, and leaves the
+failed cell resources for an explicit, reviewed recovery invocation.
 
 Root writes are bounded to the matrix/cell evidence roots (including a
 per-cell `artifacts/` directory), stage-owned Go caches, three run-derived

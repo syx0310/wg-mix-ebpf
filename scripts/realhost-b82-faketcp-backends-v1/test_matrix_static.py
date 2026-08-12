@@ -21,6 +21,8 @@ README = DIR / "README.md"
 CONFIG_GO = ROOT / "internal" / "config" / "config.go"
 PLAN_SOURCE = "/run/wg-mix-ebpf-source-stages/abcdef12/source"
 PLAN_COMMIT = "1" * 40
+RUN_PARENT = "/var/tmp/wg-mix-ebpf-faketcp-backends-v1"
+OLD_RUN_PARENT = "/run/wg-mix-ebpf-faketcp-backends-v1"
 
 
 class StaticMatrixTest(unittest.TestCase):
@@ -39,6 +41,22 @@ class StaticMatrixTest(unittest.TestCase):
                 ["/bin/bash", "-n", str(path)], text=True, capture_output=True
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
+        combined = self.matrix + self.root_cell + self.netns + self.readme
+        self.assertNotIn(OLD_RUN_PARENT, combined)
+        self.assertIn(f'RUN_PARENT = pathlib.Path("{RUN_PARENT}")', self.matrix)
+        self.assertEqual(
+            self.root_cell.count(f"readonly RUN_PARENT='{RUN_PARENT}'"), 1
+        )
+        self.assertEqual(self.netns.count(f"readonly RUN_PARENT='{RUN_PARENT}'"), 1)
+        for required in (
+            "RUN_PARENT.mkdir(mode=0o700, parents=False, exist_ok=False)",
+            "persistent run parent must be root:root mode 0700",
+            "matrix_root.mkdir(mode=0o700, parents=False, exist_ok=False)",
+        ):
+            self.assertIn(required, self.matrix)
+        self.assertIn("validate_run_parent || fail run-parent-identity 79", self.root_cell)
+        self.assertIn("'0:0:700:directory'", self.root_cell)
+        self.assertIn(f"`{RUN_PARENT}/<run-id>`", self.readme)
 
     def run_plan(self, release: str) -> dict[str, object]:
         completed = subprocess.run(
@@ -240,9 +258,7 @@ class StaticMatrixTest(unittest.TestCase):
                 if cell["artifact"] == "modern"
                 else "wg_mix_faketcp_legacy_515.o"
             )
-            artifact_root = (
-                f"/run/wg-mix-ebpf-faketcp-backends-v1/{cell['run_id']}/artifacts"
-            )
+            artifact_root = f"{RUN_PARENT}/{cell['run_id']}/artifacts"
             self.assertEqual(pairs["--binary"], f"{artifact_root}/wg-mix-ebpf")
             self.assertEqual(
                 pairs["--baseline-object"], f"{artifact_root}/wg_mix_tc.o"

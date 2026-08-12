@@ -60,7 +60,7 @@ process-owned link 重建。
 
 单 cell 允许的主机写集为：
 
-* `/run/wg-mix-ebpf-faketcp-backends-v1/<run-id>` 下的 evidence、endpoint runtime 和 receipt；
+* `/var/tmp/wg-mix-ebpf-faketcp-backends-v1/<run-id>` 下的 evidence、endpoint runtime 和 receipt；
 * 本 cell evidence 下的 `artifacts/`（三个 BPF objects、Go binary、所选 module）与 stage
   专属 Go caches；source stage 保持只读并以 Git identity + 全树 digest 前后证明；
 * 本 run 的 `f<run-id>{a,r,b}` 三个 netns 及其内部接口；
