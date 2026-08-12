@@ -17,7 +17,7 @@ umask 077
 
 usage() {
   printf '%s\n' \
-    'usage: cleanup-root-owned-test-source-stage.sh --run-id <8hex> --commit <40hex> --bundle-sha256 <64hex> --runner-sha256 <64hex>' >&2
+    'usage: cleanup-root-owned-test-source-stage.sh --run-id <8hex> --commit <40hex> --bundle-sha256 <64hex> --runner-sha256 <64hex> [--legacy-inspect-sha256 <64hex>]' >&2
   exit 64
 }
 
@@ -25,6 +25,7 @@ run_id=''
 commit=''
 bundle_sha256=''
 runner_sha256=''
+legacy_inspect_sha256=''
 while (($#)); do
   (($# >= 2)) || usage
   case "$1" in
@@ -32,6 +33,7 @@ while (($#)); do
     --commit) commit="$2" ;;
     --bundle-sha256) bundle_sha256="$2" ;;
     --runner-sha256) runner_sha256="$2" ;;
+    --legacy-inspect-sha256) legacy_inspect_sha256="$2" ;;
     *) usage ;;
   esac
   shift 2
@@ -41,12 +43,15 @@ done
 [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] || usage
 [[ "${bundle_sha256}" =~ ^[0-9a-f]{64}$ ]] || usage
 [[ "${runner_sha256}" =~ ^[0-9a-f]{64}$ ]] || usage
+[[ -z "${legacy_inspect_sha256}" ||
+  "${legacy_inspect_sha256}" =~ ^[0-9a-f]{64}$ ]] || usage
 
 readonly stage="${STAGE_PREFIX}/${run_id}"
 readonly bootstrap="${BOOTSTRAP_PREFIX}/${run_id}"
 readonly source="${stage}/source"
 readonly bundle="${stage}/candidate.bundle"
 readonly runner="${bootstrap}/run-root-owned-test-source-stage.sh"
+readonly legacy_inspect="${bootstrap}/inspect-linux-test-host.sh"
 
 for target in "${stage}" "${bootstrap}"; do
   [[ -d "${target}" && ! -L "${target}" ]] || {
@@ -64,7 +69,13 @@ for target in "${stage}" "${bootstrap}"; do
 done
 
 readonly expected_stage_entries=$'candidate.bundle\ngit-template\ngo-cache\ngo-mod-cache\ngo-path\ngo-tmp\nsource\nstaging.log'
-readonly expected_bootstrap_entries=$'root-stage-runner.audit\nrun-root-owned-test-source-stage.sh\nstage-root-owned-test-source.bootstrap\nstage-root-owned-test-source.py\nstage-root-owned-test-source.sh'
+readonly standard_bootstrap_entries=$'root-stage-runner.audit\nrun-root-owned-test-source-stage.sh\nstage-root-owned-test-source.bootstrap\nstage-root-owned-test-source.py\nstage-root-owned-test-source.sh'
+readonly legacy_bootstrap_entries=$'inspect-linux-test-host.sh\nroot-stage-runner.audit\nrun-root-owned-test-source-stage.sh\nstage-root-owned-test-source.bootstrap\nstage-root-owned-test-source.py\nstage-root-owned-test-source.sh'
+if [[ -n "${legacy_inspect_sha256}" ]]; then
+  readonly expected_bootstrap_entries="${legacy_bootstrap_entries}"
+else
+  readonly expected_bootstrap_entries="${standard_bootstrap_entries}"
+fi
 actual_stage_entries="$(/usr/bin/find "${stage}" -mindepth 1 -maxdepth 1 -printf '%f\n' | /usr/bin/sort)"
 actual_bootstrap_entries="$(/usr/bin/find "${bootstrap}" -mindepth 1 -maxdepth 1 -printf '%f\n' | /usr/bin/sort)"
 [[ "${actual_stage_entries}" == "${expected_stage_entries}" ]] || {
@@ -88,6 +99,16 @@ actual_bootstrap_entries="$(/usr/bin/find "${bootstrap}" -mindepth 1 -maxdepth 1
   printf 'error: bootstrap runner digest mismatch: %s\n' "${runner}" >&2
   exit 66
 }
+if [[ -n "${legacy_inspect_sha256}" ]]; then
+  [[ "$(/usr/bin/stat -c '%U:%G:%a:%h:%F' -- "${legacy_inspect}")" == \
+      'root:root:500:1:regular file' &&
+    "$(/usr/bin/sha256sum -- "${legacy_inspect}")" == \
+      "${legacy_inspect_sha256}  ${legacy_inspect}" ]] || {
+    printf 'error: legacy inspect helper identity mismatch: %s\n' \
+      "${legacy_inspect}" >&2
+    exit 66
+  }
+fi
 
 readonly run_device="$(/usr/bin/stat -c '%d' -- /run)"
 for target in "${stage}" "${bootstrap}"; do
@@ -102,8 +123,9 @@ for target in "${stage}" "${bootstrap}"; do
   fi
 done
 
-printf 'SOURCE_STAGE_CLEANUP_PREFLIGHT run_id=%s commit=%s stage=%s bootstrap=%s\n' \
-  "${run_id}" "${commit}" "${stage}" "${bootstrap}"
+printf 'SOURCE_STAGE_CLEANUP_PREFLIGHT run_id=%s commit=%s stage=%s bootstrap=%s legacy_inspect=%s\n' \
+  "${run_id}" "${commit}" "${stage}" "${bootstrap}" \
+  "$([[ -n "${legacy_inspect_sha256}" ]] && printf 1 || printf 0)"
 
 /usr/bin/find "${stage}" -xdev -depth -delete
 [[ ! -e "${stage}" && ! -L "${stage}" ]] || {

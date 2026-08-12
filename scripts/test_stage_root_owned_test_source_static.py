@@ -13,6 +13,7 @@ LAUNCHER = SCRIPTS / "stage-root-owned-test-source.sh"
 HELPER = SCRIPTS / "stage-root-owned-test-source.py"
 MANIFEST = SCRIPTS / "stage-root-owned-test-source.bootstrap"
 RUNNER = SCRIPTS / "run-root-owned-test-source-stage.sh"
+CLEANUP = SCRIPTS / "cleanup-root-owned-test-source-stage.sh"
 BASH_ENV_FIXTURE = SCRIPTS / "testdata" / "root-stage-bash-env-injection.sh"
 MAKEFILE = SCRIPTS.parent / "Makefile"
 
@@ -24,8 +25,26 @@ class RootOwnedSourceStageContractTests(unittest.TestCase):
         cls.helper = HELPER.read_text(encoding="utf-8")
         cls.manifest = MANIFEST.read_text(encoding="utf-8")
         cls.runner = RUNNER.read_text(encoding="utf-8")
+        cls.cleanup = CLEANUP.read_text(encoding="utf-8")
         cls.makefile = MAKEFILE.read_text(encoding="utf-8")
         cls.helper_tree = ast.parse(cls.helper, filename=str(HELPER))
+
+    def test_cleanup_explicitly_binds_legacy_inspect_helper(self) -> None:
+        cleanup = self.cleanup
+        for fragment in (
+            "--legacy-inspect-sha256",
+            'readonly legacy_inspect="${bootstrap}/inspect-linux-test-host.sh"',
+            "inspect-linux-test-host.sh\\nroot-stage-runner.audit",
+            "'root:root:500:1:regular file'",
+            '"${legacy_inspect_sha256}  ${legacy_inspect}"',
+            "legacy inspect helper identity mismatch",
+            "legacy_inspect=%s",
+        ):
+            self.assertIn(fragment, cleanup)
+        identity_check = cleanup.index("legacy inspect helper identity mismatch")
+        first_delete = cleanup.index('/usr/bin/find "${stage}" -xdev -depth -delete')
+        self.assertLess(identity_check, first_delete)
+        self.assertNotIn("rm -rf", cleanup)
 
     def test_launcher_pins_the_exact_helper_content(self) -> None:
         match = re.search(
