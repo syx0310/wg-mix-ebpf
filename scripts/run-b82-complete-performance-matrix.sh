@@ -309,6 +309,7 @@ def add_record(path: pathlib.Path, kind: str, payload: bytes = b"") -> None:
     global total_bytes
     metadata = path.lstat()
     relative = "." if path == root else path.relative_to(root).as_posix()
+    stable_nlink = 0 if kind == "directory" else metadata.st_nlink
     stable_size = 0 if kind == "directory" else metadata.st_size
     record = b"\0".join(
         (
@@ -317,7 +318,7 @@ def add_record(path: pathlib.Path, kind: str, payload: bytes = b"") -> None:
             f"{stat.S_IMODE(metadata.st_mode):04o}".encode("ascii"),
             str(metadata.st_uid).encode("ascii"),
             str(metadata.st_gid).encode("ascii"),
-            str(metadata.st_nlink).encode("ascii"),
+            str(stable_nlink).encode("ascii"),
             str(stable_size).encode("ascii"),
             hashlib.sha256(payload).hexdigest().encode("ascii"),
         )

@@ -232,6 +232,7 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
             self.assertIn(fragment, matrix)
         digest = matrix[matrix.index("source_tree_digest()") : matrix.index("dump_complete_logs()")]
         self.assertNotIn("st_mtime", digest)
+        self.assertIn('stable_nlink = 0 if kind == "directory" else metadata.st_nlink', digest)
         self.assertIn('stable_size = 0 if kind == "directory" else metadata.st_size', digest)
         for identity_field in (
             "st_mode",
