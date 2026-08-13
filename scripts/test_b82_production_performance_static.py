@@ -225,6 +225,8 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
             "matrix_logged source-tree-after-build source_tree_digest",
             "matrix_logged source-tree-final source_tree_digest",
             "artifact build changed the root-owned source tree",
+            'name not in {".git", "bin", "build"}',
+            '"wg_mix_faketcp_legacy_515.o",',
             'FROZEN_BPF_CFLAGS="-O2 -g -Wall -Werror -Wno-unused-function -target bpf -I/usr/include/${bpf_multiarch}"',
         ):
             self.assertIn(fragment, matrix)
