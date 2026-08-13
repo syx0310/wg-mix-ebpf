@@ -375,6 +375,44 @@ func TestReloadUsesSingleConfigSnapshotAndExpandsGuardForRuntimeMark(t *testing.
 	}
 }
 
+func TestReloadFencesResidentRuntimeAcrossStartupGuard(t *testing.T) {
+	const mark = uint32(0x10000002)
+	cfgPath := writeReconcileConfig(t, "[Interface]\nListenPort = 31001\nFwMark = 0x10000002\n")
+	events := make([]string, 0, 5)
+	loader := &guardAwareRecordingDataplaneLoader{events: &events}
+	guardExec := &orderedGuardExecutor{events: &events}
+	lifecycleRoot := t.TempDir()
+	ctx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		filepath.Join(lifecycleRoot, "daemon.lease"),
+		filepath.Join(lifecycleRoot, "maintenance.gate"),
+	)
+	result, err := Reload(ctx, Options{
+		ConfigPath: cfgPath,
+		StateDir:   t.TempDir(),
+		deps: &dependencies{
+			runtimeProvider: runtime.StaticProvider{Devices: map[string]*runtime.Device{
+				"wg0": {Name: "wg0", ListenPort: 31001, FirewallMark: mark, Up: true},
+			}},
+			underlayResolver: underlay.StaticResolver{Underlays: map[string]*underlay.Resolved{
+				"eth0": {Name: "eth0", IfName: "eth0", IfIndex: 2, LinkType: "ethernet", Role: "transform"},
+			}},
+			guardExecutor:   guardExec,
+			dataplaneLoader: loader,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"quiesce", "guard-apply", "loader-apply", "guard-cleanup", "resume"}
+	if fmt.Sprint(events) != fmt.Sprint(want) {
+		t.Fatalf("startup guard/runtime order = %v, want %v", events, want)
+	}
+	if !result.GuardApplied || !result.GuardCleaned {
+		t.Fatalf("guard result = %#v", result)
+	}
+}
+
 func TestReloadPassesExactHeldLifecycleLeaseToConstructedLoader(t *testing.T) {
 	const mark = uint32(0x10000002)
 	cfgPath := writeReconcileConfig(t, "[Interface]\nListenPort = 31001\nFwMark = 0x10000002\n")
@@ -594,6 +632,43 @@ func (e *recordingGuardExecutor) Cleanup(context.Context) error {
 type recordingDataplaneLoader struct {
 	applyCalls  int
 	detachCalls int
+}
+
+type orderedGuardExecutor struct {
+	events *[]string
+}
+
+func (e *orderedGuardExecutor) Apply(context.Context, guard.NftPlan) error {
+	*e.events = append(*e.events, "guard-apply")
+	return nil
+}
+
+func (e *orderedGuardExecutor) Cleanup(context.Context) error {
+	*e.events = append(*e.events, "guard-cleanup")
+	return nil
+}
+
+type guardAwareRecordingDataplaneLoader struct {
+	events *[]string
+}
+
+func (l *guardAwareRecordingDataplaneLoader) QuiesceForStartupGuard(context.Context) error {
+	*l.events = append(*l.events, "quiesce")
+	return nil
+}
+
+func (l *guardAwareRecordingDataplaneLoader) ResumeAfterStartupGuard(context.Context) error {
+	*l.events = append(*l.events, "resume")
+	return nil
+}
+
+func (l *guardAwareRecordingDataplaneLoader) Apply(context.Context, *control.State) error {
+	*l.events = append(*l.events, "loader-apply")
+	return nil
+}
+
+func (l *guardAwareRecordingDataplaneLoader) Detach(context.Context, *control.State) error {
+	return nil
 }
 
 func (l *recordingDataplaneLoader) Apply(context.Context, *control.State) error {

@@ -43,6 +43,16 @@ type AttachStateLoader interface {
 	DetachStale(ctx context.Context, previous *control.State, current *control.State) error
 }
 
+// StartupGuardRuntime coordinates a resident userspace dataplane with the
+// temporary nft startup guard. Quiesce must drain the current userspace event
+// loop while retaining its kernel hooks; Resume may start the replacement
+// event loop only after the guard has been removed. Loaders without a resident
+// userspace runtime do not need to implement this interface.
+type StartupGuardRuntime interface {
+	QuiesceForStartupGuard(context.Context) error
+	ResumeAfterStartupGuard(context.Context) error
+}
+
 type LoaderOptions struct {
 	// AdoptLegacyPins permits the classic_tc backend to adopt a complete legacy
 	// map/filter set into the persistent schema-v3 owner journal. TCX never

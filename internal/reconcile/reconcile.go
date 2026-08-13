@@ -360,11 +360,19 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 			return nil, err
 		}
 	}
+	loader := configuredDataplaneLoader(opts)
 	guardExecutor := configuredGuardExecutor(opts)
 	initialGuardPlan := guard.BuildNftPlan(guardState)
 	activeGuardPlan := initialGuardPlan
 	guardApplied := false
+	var guardRuntime dataplane.StartupGuardRuntime
 	if !opts.DryRun && shouldApplyStartupGuard(cfg) {
+		if runtime, ok := loader.(dataplane.StartupGuardRuntime); ok {
+			if err := runtime.QuiesceForStartupGuard(ctx); err != nil {
+				return nil, fmt.Errorf("quiesce resident dataplane before startup guard: %w", err)
+			}
+			guardRuntime = runtime
+		}
 		if err := guardExecutor.Apply(ctx, initialGuardPlan); err != nil {
 			return nil, fmt.Errorf("apply startup guard: %w", err)
 		}
@@ -420,7 +428,6 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 			}
 		}
 	}
-	loader := configuredDataplaneLoader(opts)
 	if err := loader.Apply(ctx, state); err != nil {
 		return nil, err
 	}
@@ -451,6 +458,11 @@ func reloadUnlocked(ctx context.Context, opts Options) (*Result, error) {
 			return nil, fmt.Errorf("cleanup startup guard after reload: %w", err)
 		}
 		result.GuardCleaned = true
+		if guardRuntime != nil {
+			if err := guardRuntime.ResumeAfterStartupGuard(ctx); err != nil {
+				return nil, fmt.Errorf("resume resident dataplane after startup guard: %w", err)
+			}
+		}
 	}
 	return result, nil
 }

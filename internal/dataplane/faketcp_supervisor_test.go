@@ -159,6 +159,103 @@ func TestFakeTCPRuntimeSupervisorRepeatedEnsureOwnsOneRuntime(t *testing.T) {
 	}
 }
 
+func TestFakeTCPRuntimeSupervisorStartupGuardDrainsOldAndStagesReplacement(t *testing.T) {
+	supervisor := &fakeTCPRuntimeSupervisor{}
+	first := newControlledFakeTCPRuntime()
+	if err := supervisor.Ensure(
+		t.Context(), fakeTCPRuntimeDesiredKey{1},
+		func(context.Context) (fakeTCPRuntimeService, error) { return first, nil },
+	); err != nil {
+		t.Fatalf("start first runtime: %v", err)
+	}
+	<-first.runStarted
+
+	if err := supervisor.QuiesceForStartupGuard(t.Context()); err != nil {
+		t.Fatalf("quiesce for startup guard: %v", err)
+	}
+	stopCalls, closeCalls, closeEarly := first.counts()
+	if stopCalls != 1 || closeCalls != 0 || closeEarly {
+		t.Fatalf("quiesced runtime lifecycle = stop %d close %d early %t", stopCalls, closeCalls, closeEarly)
+	}
+
+	second := newControlledFakeTCPRuntime()
+	if err := supervisor.Ensure(
+		t.Context(), fakeTCPRuntimeDesiredKey{2},
+		func(context.Context) (fakeTCPRuntimeService, error) { return second, nil },
+	); err != nil {
+		t.Fatalf("stage replacement runtime: %v", err)
+	}
+	select {
+	case <-second.runStarted:
+		t.Fatal("replacement userspace runtime started while startup guard was held")
+	default:
+	}
+	_, closeCalls, closeEarly = first.counts()
+	if closeCalls != 1 || closeEarly {
+		t.Fatalf("retired runtime close = %d early %t", closeCalls, closeEarly)
+	}
+	if !supervisor.Healthy(fakeTCPRuntimeDesiredKey{2}) {
+		t.Fatal("staged replacement did not retain a healthy kernel owner")
+	}
+
+	if err := supervisor.ResumeAfterStartupGuard(t.Context()); err != nil {
+		t.Fatalf("resume after startup guard: %v", err)
+	}
+	select {
+	case <-second.runStarted:
+	case <-time.After(time.Second):
+		t.Fatal("replacement runtime did not start after startup guard cleanup")
+	}
+	if err := supervisor.Stop(t.Context()); err != nil {
+		t.Fatalf("stop replacement: %v", err)
+	}
+}
+
+func TestFakeTCPRuntimeSupervisorStartupGuardRetryAndPendingStopAreBounded(t *testing.T) {
+	supervisor := &fakeTCPRuntimeSupervisor{}
+	if err := supervisor.QuiesceForStartupGuard(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	runtime := newControlledFakeTCPRuntime()
+	builds := 0
+	build := func(context.Context) (fakeTCPRuntimeService, error) {
+		builds++
+		return runtime, nil
+	}
+	key := fakeTCPRuntimeDesiredKey{1}
+	if err := supervisor.Ensure(t.Context(), key, build); err != nil {
+		t.Fatal(err)
+	}
+	// A failed reload leaves the barrier held. Its lifecycle-serialised retry
+	// reuses the same staged owner instead of building an overlapping runtime.
+	if err := supervisor.QuiesceForStartupGuard(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.Ensure(t.Context(), key, build); err != nil {
+		t.Fatal(err)
+	}
+	if builds != 1 {
+		t.Fatalf("staged retry builds = %d, want 1", builds)
+	}
+	select {
+	case <-runtime.runStarted:
+		t.Fatal("staged retry started before guard cleanup")
+	default:
+	}
+
+	// Stop must not wait forever for a Run goroutine that was deliberately not
+	// started while the guard barrier was held.
+	if err := supervisor.Stop(t.Context()); err != nil {
+		t.Fatalf("stop staged runtime: %v", err)
+	}
+	if supervisor.loadCurrent() != nil {
+		t.Fatal("stop retained a staged runtime after successful close")
+	}
+	if err := supervisor.ResumeAfterStartupGuard(t.Context()); err != nil {
+		t.Fatalf("release empty startup guard barrier: %v", err)
+	}
+}
+
 func TestFakeTCPRuntimeSupervisorSeriallyReplacesChangedLiveGeneration(t *testing.T) {
 	supervisor := &fakeTCPRuntimeSupervisor{}
 	firstRuntime := newControlledFakeTCPRuntime()

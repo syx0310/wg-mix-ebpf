@@ -46,16 +46,23 @@ type fakeTCPRuntimeSupervisor struct {
 	operationMu sync.Mutex
 	mu          sync.Mutex
 	current     *supervisedFakeTCPRuntime
+	// startupGuardHeld prevents a newly built runtime from starting its raw
+	// reinjection loop while the temporary nft output guard is installed.
+	// operationMu serialises every transition of this bit with Ensure/Stop.
+	startupGuardHeld bool
 }
 
 type supervisedFakeTCPRuntime struct {
-	key     fakeTCPRuntimeDesiredKey
-	runtime fakeTCPRuntimeService
-	cancel  context.CancelFunc
-	done    chan struct{}
+	key      fakeTCPRuntimeDesiredKey
+	runtime  fakeTCPRuntimeService
+	runCtx   context.Context
+	cancel   context.CancelFunc
+	done     chan struct{}
+	doneOnce sync.Once
 
 	mu            sync.Mutex
 	runErr        error
+	runStarted    bool
 	stopRequested bool
 }
 
@@ -152,11 +159,95 @@ func (supervisor *fakeTCPRuntimeSupervisor) Ensure(
 	entry := &supervisedFakeTCPRuntime{
 		key:     key,
 		runtime: runtime,
+		runCtx:  runCtx,
 		cancel:  cancel,
 		done:    make(chan struct{}),
 	}
 	supervisor.storeCurrent(entry)
-	go entry.run(runCtx)
+	if !supervisor.startupGuardHeld {
+		if err := entry.start(); err != nil {
+			return fmt.Errorf("start FakeTCP runtime: %w", err)
+		}
+	}
+	return nil
+}
+
+// QuiesceForStartupGuard drains the sole userspace event loop before nft can
+// reject its raw reinjection packets. It deliberately retains the runtime's
+// TC/XDP/map owner so managed traffic remains fail-closed. Ensure may replace
+// that owner while the barrier is held, but it will stage the replacement
+// without starting Run.
+func (supervisor *fakeTCPRuntimeSupervisor) QuiesceForStartupGuard(ctx context.Context) error {
+	if supervisor == nil {
+		return errors.New("quiesce FakeTCP runtime for startup guard: supervisor is nil")
+	}
+	if ctx == nil {
+		return errors.New("quiesce FakeTCP runtime for startup guard: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	supervisor.operationMu.Lock()
+	defer supervisor.operationMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	supervisor.startupGuardHeld = true
+	current := supervisor.loadCurrent()
+	if current == nil || !current.wasStarted() || current.finished() {
+		return nil
+	}
+	stopErr := current.requestStop()
+	select {
+	case <-current.done:
+	case <-ctx.Done():
+		return errors.Join(wrapFakeTCPStopError(stopErr), ctx.Err())
+	}
+	return errors.Join(
+		wrapFakeTCPRunError(current.terminalError()),
+		wrapFakeTCPStopError(stopErr),
+	)
+}
+
+// ResumeAfterStartupGuard starts the staged runtime only after nft cleanup has
+// completed. A failed reload intentionally leaves this barrier held: a later
+// lifecycle-serialised retry can reuse or replace the staged exact owner and
+// then release it after its own guard cleanup.
+func (supervisor *fakeTCPRuntimeSupervisor) ResumeAfterStartupGuard(ctx context.Context) error {
+	if supervisor == nil {
+		return errors.New("resume FakeTCP runtime after startup guard: supervisor is nil")
+	}
+	if ctx == nil {
+		return errors.New("resume FakeTCP runtime after startup guard: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	supervisor.operationMu.Lock()
+	defer supervisor.operationMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !supervisor.startupGuardHeld {
+		return nil
+	}
+	current := supervisor.loadCurrent()
+	if current != nil {
+		if current.finished() || current.stopWasRequested() {
+			return errors.Join(
+				errors.New("resume FakeTCP runtime after startup guard: runtime is not startable"),
+				wrapFakeTCPRunError(current.terminalError()),
+			)
+		}
+		if !current.wasStarted() {
+			if err := current.start(); err != nil {
+				return fmt.Errorf("resume FakeTCP runtime after startup guard: %w", err)
+			}
+		}
+	}
+	supervisor.startupGuardHeld = false
 	return nil
 }
 
@@ -360,8 +451,41 @@ func (runtime *supervisedFakeTCPRuntime) run(ctx context.Context) {
 		err = errFakeTCPRuntimeExited
 	}
 	runtime.runErr = err
-	close(runtime.done)
 	runtime.mu.Unlock()
+	runtime.doneOnce.Do(func() { close(runtime.done) })
+}
+
+func (runtime *supervisedFakeTCPRuntime) start() error {
+	if runtime == nil {
+		return errors.New("runtime is nil")
+	}
+	runtime.mu.Lock()
+	if runtime.runStarted {
+		runtime.mu.Unlock()
+		return nil
+	}
+	if runtime.stopRequested {
+		runtime.mu.Unlock()
+		return errFakeTCPRuntimeStopping
+	}
+	if runtime.runCtx == nil {
+		runtime.mu.Unlock()
+		return errors.New("runtime context is nil")
+	}
+	runtime.runStarted = true
+	ctx := runtime.runCtx
+	runtime.mu.Unlock()
+	go runtime.run(ctx)
+	return nil
+}
+
+func (runtime *supervisedFakeTCPRuntime) wasStarted() bool {
+	if runtime == nil {
+		return false
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	return runtime.runStarted
 }
 
 func (runtime *supervisedFakeTCPRuntime) requestStop() error {
@@ -373,10 +497,14 @@ func (runtime *supervisedFakeTCPRuntime) requestStop() error {
 	runtime.stopRequested = true
 	stopper := runtime.runtime
 	cancel := runtime.cancel
+	started := runtime.runStarted
 	runtime.mu.Unlock()
 
 	err := stopper.RequestStop()
 	cancel()
+	if !started {
+		runtime.doneOnce.Do(func() { close(runtime.done) })
+	}
 	return err
 }
 

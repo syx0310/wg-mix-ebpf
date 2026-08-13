@@ -81,6 +81,38 @@ type fakeTCPProductionCoordinator struct {
 }
 
 var _ AttachStateLoader = (*fakeTCPProductionCoordinator)(nil)
+var _ StartupGuardRuntime = (*fakeTCPProductionCoordinator)(nil)
+
+type fakeTCPStartupGuardLifecycle interface {
+	QuiesceForStartupGuard(context.Context) error
+	ResumeAfterStartupGuard(context.Context) error
+}
+
+func (coordinator *fakeTCPProductionCoordinator) QuiesceForStartupGuard(ctx context.Context) error {
+	if coordinator == nil || coordinator.shared == nil || coordinator.shared.supervisor == nil {
+		return errors.New("quiesce production FakeTCP runtime for startup guard: coordinator is incomplete")
+	}
+	coordinator.shared.operationMu.Lock()
+	defer coordinator.shared.operationMu.Unlock()
+	lifecycle, ok := coordinator.shared.supervisor.(fakeTCPStartupGuardLifecycle)
+	if !ok {
+		return errors.New("quiesce production FakeTCP runtime for startup guard: supervisor has no guard barrier")
+	}
+	return lifecycle.QuiesceForStartupGuard(ctx)
+}
+
+func (coordinator *fakeTCPProductionCoordinator) ResumeAfterStartupGuard(ctx context.Context) error {
+	if coordinator == nil || coordinator.shared == nil || coordinator.shared.supervisor == nil {
+		return errors.New("resume production FakeTCP runtime after startup guard: coordinator is incomplete")
+	}
+	coordinator.shared.operationMu.Lock()
+	defer coordinator.shared.operationMu.Unlock()
+	lifecycle, ok := coordinator.shared.supervisor.(fakeTCPStartupGuardLifecycle)
+	if !ok {
+		return errors.New("resume production FakeTCP runtime after startup guard: supervisor has no guard barrier")
+	}
+	return lifecycle.ResumeAfterStartupGuard(ctx)
+}
 
 func (coordinator *fakeTCPProductionCoordinator) Apply(
 	ctx context.Context,
