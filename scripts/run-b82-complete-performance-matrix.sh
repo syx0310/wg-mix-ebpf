@@ -732,13 +732,13 @@ trap 'matrix_failure 130 $LINENO' INT TERM
 [[ "$(git -C "${SOURCE_ROOT}" rev-parse --verify 'HEAD^{commit}')" == "${COMMIT}" &&
   -z "$(git -C "${SOURCE_ROOT}" status --porcelain=v1 --untracked-files=all)" ]] || {
   echo 'error: source stage is dirty before build' >&2
-  exit 1
+  matrix_failure 1 "${LINENO}"
 }
 for stage_cache in "${GO_CACHE}" "${GO_MOD_CACHE}"; do
   [[ -d "${stage_cache}" && ! -L "${stage_cache}" &&
     "$(stat -c '%u:%g:%a' -- "${stage_cache}")" == 0:0:700 ]] || {
     echo "error: immutable source stage Go cache is missing or unsafe: ${stage_cache}" >&2
-    exit 1
+    matrix_failure 1 "${LINENO}"
   }
 done
 unset stage_cache
@@ -830,7 +830,8 @@ print(f"go_overlay={target} replacements={replace_count}")
   "${SOURCE_ROOT}/internal/dataplane/embedded/wg_mix_faketcp.o" \
   "${SOURCE_ROOT}/internal/dataplane/embedded/wg_mix_faketcp_legacy_515.o" \
   "${BUILD_BASELINE}" "${BUILD_MODERN}" "${BUILD_LEGACY}"
-[[ "$(stat -c '%u:%g:%a:%h' -- "${GO_OVERLAY}")" == 0:0:600:1 ]] || exit 79
+[[ "$(stat -c '%u:%g:%a:%h' -- "${GO_OVERLAY}")" == 0:0:600:1 ]] ||
+  matrix_failure 79 "${LINENO}"
 matrix_logged go-build "${BUILD_ENV[@]}" timeout --signal=TERM --kill-after=30s 20m \
   /usr/bin/go build -C "${SOURCE_ROOT}" -trimpath -mod=readonly -buildvcs=false \
   "-overlay=${GO_OVERLAY}" \
@@ -882,7 +883,8 @@ for relative in bin/wg-mix-ebpf build/wg_mix_tc.o build/wg_mix_faketcp_experimen
   "faketcp_checksum_kmod/${KFUNC_MODULE}.ko" \
   "faketcp_checksum_kprobe_kmod/${KPROBE_MODULE}.ko"; do
   artifact="${ARTIFACT_ROOT}/${relative}"
-  [[ -f "${artifact}" && ! -L "${artifact}" && "$(readlink -e -- "${artifact}")" == "${artifact}" ]] || exit 79
+  [[ -f "${artifact}" && ! -L "${artifact}" && "$(readlink -e -- "${artifact}")" == "${artifact}" ]] ||
+    matrix_failure 79 "${LINENO}"
   printf '%s=%s\n' "${relative}" "$(sha256sum -- "${artifact}" | awk '{print $1}')" >>"${ARTIFACT_MANIFEST}"
 done
 chmod 0500 -- "${BUILD_BIN}"
@@ -894,10 +896,11 @@ source_tree_before="$(<"${MATRIX_EVIDENCE}/source-tree-before.stdout.log")"
 source_tree_after_build="$(<"${MATRIX_EVIDENCE}/source-tree-after-build.stdout.log")"
 [[ "${source_tree_before}" == "${source_tree_after_build}" ]] || {
   echo 'error: artifact build changed the root-owned source tree' >&2
-  exit 79
+  matrix_failure 79 "${LINENO}"
 }
 [[ "$(git -C "${SOURCE_ROOT}" rev-parse --verify 'HEAD^{commit}')" == "${COMMIT}" &&
-  -z "$(git -C "${SOURCE_ROOT}" status --porcelain=v1 --untracked-files=all)" ]] || exit 79
+  -z "$(git -C "${SOURCE_ROOT}" status --porcelain=v1 --untracked-files=all)" ]] ||
+  matrix_failure 79 "${LINENO}"
 
 if [[ ! -e "${MODULE_LOCK}" && ! -L "${MODULE_LOCK}" ]]; then
   (set -o noclobber; : >"${MODULE_LOCK}"); chmod 0600 -- "${MODULE_LOCK}"
@@ -908,7 +911,7 @@ matrix_logged module-lock flock --exclusive --nonblock "${module_lock_fd}"
 [[ ! -d "/sys/module/${KFUNC_MODULE}" && ! -d "/sys/module/${KPROBE_MODULE}" &&
   ! -e "${KPROBE_DEVICE}" && ! -L "${KPROBE_DEVICE}" ]] || {
   echo 'error: a performance checksum module or kprobe lease device preexists' >&2
-  exit 1
+  matrix_failure 1 "${LINENO}"
 }
 
 printf '%s\n' $'ordinal\tlabel\ttransport\tattachment_backend\tchecksum_backend\tartifact\tcipher\tmax_bytes\trun_id\tevidence' >"${CELL_INDEX}"
@@ -1018,12 +1021,12 @@ matrix_logged source-tree-final source_tree_digest
 source_tree_final="$(<"${MATRIX_EVIDENCE}/source-tree-final.stdout.log")"
 [[ "${source_tree_before}" == "${source_tree_final}" ]] || {
   echo 'error: performance cells changed the root-owned source tree' >&2
-  exit 79
+  matrix_failure 79 "${LINENO}"
 }
 [[ "$(git -C "${SOURCE_ROOT}" rev-parse --verify 'HEAD^{commit}')" == "${COMMIT}" &&
   -z "$(git -C "${SOURCE_ROOT}" status --porcelain=v1 --untracked-files=all)" ]] || {
   echo 'error: source stage changed during the performance matrix' >&2
-  exit 79
+  matrix_failure 79 "${LINENO}"
 }
 matrix_logged report-generate python3 -B -I "${REPORTER}" --matrix-root "${MATRIX_ROOT}" --source-root "${SOURCE_ROOT}"
 results_sha="$(sha256sum -- "${MATRIX_ROOT}/results.v1.json" | awk '{print $1}')"

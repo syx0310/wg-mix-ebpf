@@ -359,6 +359,13 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
         self.assertIn("FAILURE_RESOURCES_RETAINED", runner)
         self.assertIn("No automatic cleanup was attempted", runner)
         self.assertIn("No automatic cell restore, module unload", matrix)
+        run_body = matrix[
+            matrix.index("trap 'matrix_failure $? $LINENO' ERR", matrix.index("emit_cells plan_tsv_cell")) :
+            matrix.index("trap - ERR INT TERM", matrix.index("emit_cells plan_tsv_cell"))
+        ]
+        self.assertNotRegex(run_body, r"\bexit\s+(?:1|79)\b")
+        self.assertIn('matrix_failure 1 "${LINENO}"', run_body)
+        self.assertIn('matrix_failure 79 "${LINENO}"', run_body)
         failure = runner[runner.index("capture_failure_evidence()") : runner.index("dump_complete_logs()")]
         for forbidden in ("ip netns delete", "kill -", "/bin/rm"):
             self.assertNotIn(forbidden, failure)
