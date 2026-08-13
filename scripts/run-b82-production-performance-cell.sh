@@ -26,6 +26,10 @@ readonly SHARED_VAR_TARGET="/var/lib/wg-mix-ebpf"
 readonly SHARED_MAINTENANCE_TARGET="/run/.wg-mix-ebpf-daemon.lease.maintenance"
 readonly DURATION=3
 readonly REPETITIONS=3
+readonly FAKETCP_HANDSHAKE_TIMEOUT='1s'
+readonly FAKETCP_KEEPALIVE_INTERVAL='2s'
+readonly FAKETCP_IDLE_TIMEOUT='6s'
+readonly FAKETCP_RECOVERY_ATTEMPTS=15
 readonly STREAMS=1
 readonly MINIMUM_BYTES=1048576
 readonly MAXIMUM_RETRANSMITS=2147483647
@@ -958,7 +962,14 @@ make_agent_config() {
       transport_block=$'    transport:\n      mode: icmp\n      icmp:\n        role: server'
     fi
   elif [[ "${transport}" == "faketcp" ]]; then
-    transport_block=$'    transport:\n      mode: faketcp\n      faketcp:\n        checksum_mode: partial-complete-reset-required\n        ingress_mode: xdp-generic-exact'
+    transport_block="    transport:
+      mode: faketcp
+      faketcp:
+        checksum_mode: partial-complete-reset-required
+        ingress_mode: xdp-generic-exact
+        handshake_timeout: ${FAKETCP_HANDSHAKE_TIMEOUT}
+        keepalive_interval: ${FAKETCP_KEEPALIVE_INTERVAL}
+        idle_timeout: ${FAKETCP_IDLE_TIMEOUT}"
   else
     transport_block=$'    transport:\n      mode: udp'
   fi
@@ -2019,10 +2030,25 @@ if [[ "${transport}" == "faketcp" ]]; then
       >"${EVIDENCE}/classic-crash-recovery-identity.log"
     validate_classic_journal a "${EVIDENCE}/identity-a-recovered.json" \
       >"${EVIDENCE}/classic-journal-a-recovered.log"
+    recovered=0
+    for ((attempt = 1; attempt <= FAKETCP_RECOVERY_ATTEMPTS; attempt++)); do
+      if run_recorded_command "ping-a-after-classic-recovery-attempt-${attempt}" \
+        "${EVIDENCE}/ping-a-after-classic-recovery-attempt-${attempt}.stdout.log" \
+        "${EVIDENCE}/ping-a-after-classic-recovery-attempt-${attempt}.stderr.log" \
+        ip netns exec "${NSA}" ping -c 1 -W 1 10.77.0.2; then
+        recovered=1
+        break
+      fi
+      sleep 1
+    done
+    ((recovered == 1)) || {
+      echo "error: FakeTCP classic peer session did not recover within ${FAKETCP_RECOVERY_ATTEMPTS} attempts" >&2
+      exit 1
+    }
     run_recorded_command ping-a-after-classic-recovery \
       "${EVIDENCE}/ping-a-after-classic-recovery.stdout.log" \
       "${EVIDENCE}/ping-a-after-classic-recovery.stderr.log" \
-      ip netns exec "${NSA}" ping -c 1 -W 2 10.77.0.2
+      ip netns exec "${NSA}" ping -c 3 -W 2 10.77.0.2
   fi
   identity_a="${EVIDENCE}/identity-a-same-key.json"
   identity_b="${EVIDENCE}/identity-b-same-key.json"

@@ -1173,6 +1173,133 @@ func TestEstablishedStateReadsBPFAdvanceAndNeverOverwritesOrRacyDeletes(t *testi
 	}
 }
 
+func TestPeerCrashRecoveryUsesPeerIdleWithoutSYNTakeover(t *testing.T) {
+	store := newFakeSessionStore()
+	engine, clock := testEngine(t, func(o *Options) {
+		o.Store = store
+		o.SYNBurst = 32
+		o.SYNBurstPerSource = 32
+	})
+	flow := testFlow(31001)
+	if _, err := engine.Outbound(flow, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Inbound(flow, Segment{
+		Flags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	established := store.values[flow]
+
+	// Model a dead peer while local WireGuard PersistentKeepalive keeps using
+	// the established transmit path once per second. BPF advances TX/revision,
+	// but peer-liveness LastSeenNanos must remain at the last admitted peer
+	// packet. A new unauthenticated SYN cannot evict the healthy tuple before
+	// that peer-idle deadline.
+	for elapsed := time.Second; elapsed < engine.opts.IdleTimeout; elapsed += time.Second {
+		clock.Add(time.Second)
+		current := store.values[flow]
+		current.TXSequence += 32
+		current.Revision++
+		store.values[flow] = current
+	}
+	actions, err := engine.Inbound(flow, Segment{Flags: FlagSYN, Sequence: 17000})
+	if err != nil || len(actions) != 1 || actions[0].Reason != "syn-on-established" {
+		t.Fatalf("pre-idle replacement SYN actions=%#v err=%v", actions, err)
+	}
+	current := store.values[flow]
+	if current.LastSeenNanos != established.LastSeenNanos || store.deleteAttempts != 0 {
+		t.Fatalf("local TX or SYN refreshed/evicted peer session: value=%#v attempts=%d",
+			current, store.deleteAttempts)
+	}
+
+	clock.Add(time.Second)
+	current.TXSequence += 32
+	current.Revision++
+	store.values[flow] = current
+	// One simultaneous local TX mutation may make the exact compare-delete
+	// lose its race. It still cannot refresh peer liveness, and the next tick
+	// re-reads and removes the same idle session without accepting a SYN as an
+	// eviction authority.
+	store.beforeDelete = func(key abi.FakeTCPSessionKey) {
+		advanced := store.values[key]
+		advanced.TXSequence += 32
+		advanced.Revision++
+		store.values[key] = advanced
+		store.beforeDelete = nil
+	}
+	actions, err = engine.Tick()
+	if err != nil || len(actions) != 0 || store.deleteAttempts != 1 {
+		t.Fatalf("raced peer-idle Tick actions=%#v err=%v attempts=%d",
+			actions, err, store.deleteAttempts)
+	}
+	actions, err = engine.Tick()
+	if err != nil || len(actions) != 1 || actions[0].Kind != ActionClose ||
+		actions[0].Reason != "idle-timeout" || store.deleteAttempts != 2 {
+		t.Fatalf("bounded peer-idle Tick actions=%#v err=%v attempts=%d",
+			actions, err, store.deleteAttempts)
+	}
+	if _, found := store.values[flow]; found || engine.sessions[flow] != nil {
+		t.Fatal("peer-idle expiry retained the old established session")
+	}
+
+	actions, err = engine.Inbound(flow, Segment{Flags: FlagSYN, Sequence: 17000})
+	if err != nil || len(actions) != 1 || actions[0].Kind != ActionSendControl ||
+		actions[0].Reason != "accept-syn" || actions[0].Control.Flags != FlagSYN|FlagACK {
+		t.Fatalf("post-expiry replacement SYN actions=%#v err=%v", actions, err)
+	}
+}
+
+func TestPeerKeepalivePreventsIdleExpiryAndSYNReplacement(t *testing.T) {
+	store := newFakeSessionStore()
+	engine, clock := testEngine(t, func(o *Options) {
+		o.Store = store
+		o.SYNBurst = 32
+		o.SYNBurstPerSource = 32
+	})
+	flow := testFlow(31001)
+	if _, err := engine.Outbound(flow, []byte{1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := engine.Inbound(flow, Segment{
+		Flags: FlagSYN | FlagACK, Sequence: 9000, Acknowledgement: 1001,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	for elapsed := time.Second; elapsed <= 2*engine.opts.IdleTimeout; elapsed += time.Second {
+		clock.Add(time.Second)
+		current := store.values[flow]
+		current.TXSequence += 32
+		current.Revision++
+		if elapsed%(2*time.Second) == 0 {
+			// Model an admitted peer FakeTCP ACK keepalive (TOUCH): this is
+			// authenticated peer activity and therefore renews LastSeenNanos.
+			current.LastSeenNanos = clock.monotonic
+			current.Revision++
+		}
+		store.values[flow] = current
+		actions, err := engine.Tick()
+		if err != nil {
+			t.Fatalf("live-peer Tick at %s: %v", elapsed, err)
+		}
+		for _, action := range actions {
+			if action.Kind == ActionClose {
+				t.Fatalf("live peer expired at %s: %#v", elapsed, actions)
+			}
+		}
+	}
+	want := store.values[flow]
+	actions, err := engine.Inbound(flow, Segment{Flags: FlagSYN, Sequence: 17000})
+	if err != nil || len(actions) != 1 || actions[0].Reason != "syn-on-established" {
+		t.Fatalf("live-session replacement SYN actions=%#v err=%v", actions, err)
+	}
+	if store.deleteAttempts != 0 || store.values[flow] != want {
+		t.Fatalf("replacement SYN changed live fast session: attempts=%d value=%#v want=%#v",
+			store.deleteAttempts, store.values[flow], want)
+	}
+}
+
 func TestSYNFloodCannotEnterOrEvictEstablishedFastState(t *testing.T) {
 	store := newFakeSessionStore()
 	engine, clock := testEngine(t, func(o *Options) {
