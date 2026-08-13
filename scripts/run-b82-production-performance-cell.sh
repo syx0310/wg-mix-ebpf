@@ -1427,13 +1427,21 @@ if (
 ):
     raise SystemExit("FakeTCP exact underlay identity is unhealthy")
 checksum_status = fake.get("checksum_backend") or {}
+checksum_capabilities = checksum_status.get("capabilities")
+required_checksum_capabilities = {
+    "checksum-state",
+    "partial-reset",
+    "pmtu",
+    "udp-gso-to-tcp",
+}
 if (
     checksum_status.get("backend") != checksum
     or checksum_status.get("capability") != "full-gso-v1"
     or checksum_status.get("object_variant") != object_variant
     or checksum_status.get("module") != module_name
-    or set(checksum_status.get("capabilities") or [])
-    != {"checksum-state", "partial-reset", "pmtu", "udp-gso-to-tcp"}
+    or not isinstance(checksum_capabilities, list)
+    or any(not isinstance(item, str) for item in checksum_capabilities)
+    or not required_checksum_capabilities.issubset(set(checksum_capabilities))
 ):
     raise SystemExit("FakeTCP checksum backend identity is incomplete")
 if checksum == "kprobe" and checksum_status.get("lease_held") is not True:

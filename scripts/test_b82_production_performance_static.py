@@ -328,6 +328,7 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
             "FAKETCP_RECOVERY_ATTEMPTS=15",
             "ping-a-after-classic-recovery-attempt-${attempt}",
             "FakeTCP classic peer session did not recover within",
+            "required_checksum_capabilities.issubset(set(checksum_capabilities))",
             "validate_baseline_status",
             "performance label does not bind its exact cell arguments",
             'fake.get("object_sha256") != expected_object_sha256',
