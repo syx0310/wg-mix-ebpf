@@ -317,7 +317,6 @@ def add_record(path: pathlib.Path, kind: str, payload: bytes = b"") -> None:
             str(metadata.st_uid).encode("ascii"),
             str(metadata.st_gid).encode("ascii"),
             str(metadata.st_nlink).encode("ascii"),
-            str(metadata.st_mtime_ns).encode("ascii"),
             str(metadata.st_size).encode("ascii"),
             hashlib.sha256(payload).hexdigest().encode("ascii"),
         )

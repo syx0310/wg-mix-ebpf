@@ -230,6 +230,17 @@ class B82ProductionPerformanceStaticTests(unittest.TestCase):
             'FROZEN_BPF_CFLAGS="-O2 -g -Wall -Werror -Wno-unused-function -target bpf -I/usr/include/${bpf_multiarch}"',
         ):
             self.assertIn(fragment, matrix)
+        digest = matrix[matrix.index("source_tree_digest()") : matrix.index("dump_complete_logs()")]
+        self.assertNotIn("st_mtime", digest)
+        for identity_field in (
+            "st_mode",
+            "st_uid",
+            "st_gid",
+            "st_nlink",
+            "st_size",
+            "sha256(payload)",
+        ):
+            self.assertIn(identity_field, digest)
 
     def test_module_transitions_have_intent_owned_restore_and_no_failure_unload(self) -> None:
         matrix = self.matrix
