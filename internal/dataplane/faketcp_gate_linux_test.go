@@ -86,8 +86,10 @@ func TestFakeTCPBPFSourceRequiresExplicitExperimentalBuild(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(source)
-	guardedInclude := "#ifdef WG_MIX_EXPERIMENTAL_FAKETCP\n#include \"wg_mix_faketcp.h\"\n#endif"
-	if !strings.Contains(text, guardedInclude) {
+	guard := strings.Index(text, "#ifdef WG_MIX_EXPERIMENTAL_FAKETCP")
+	include := strings.Index(text, "#include \"wg_mix_faketcp.h\"")
+	if guard < 0 || include < 0 || include <= guard ||
+		strings.Contains(text[:guard], "#include \"wg_mix_faketcp.h\"") {
 		t.Fatal("FakeTCP BPF include is not behind the explicit experimental build guard")
 	}
 }

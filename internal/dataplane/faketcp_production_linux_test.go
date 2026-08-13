@@ -282,10 +282,8 @@ func TestProductionRuntimeAcquisitionBindsLegacySelectionToLegacyManifest(t *tes
 	if runtime != nil || !errors.Is(err, errFakeTCPPolicyGenerationLeaseRequired) {
 		t.Fatalf("legacy selection did not reach its own acquisition path: runtime=%#v err=%v", runtime, err)
 	}
-	if got := fixture.order; len(got) < 5 || got[0] != "kernel-dependency" ||
-		got[1] != "remove-memlock" || got[2] != "new-collection" ||
-		got[3] != "new-owner" || got[4] != "owned" {
-		t.Fatalf("legacy acquisition order = %v, want verifier load then owned cleanup", got)
+	if got := fixture.order; len(got) != 0 {
+		t.Fatalf("legacy acquisition ran before transaction validation: %v", got)
 	}
 }
 

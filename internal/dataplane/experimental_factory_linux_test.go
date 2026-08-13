@@ -719,7 +719,7 @@ func TestExperimentalRuntimeFactoryHasOnlyCoordinatorProductionCaller(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	const call = "acquireAndBuildExperimentalFakeTCPRuntime("
+	const call = "acquireAndBuildFakeTCPRuntimeWithManifest("
 	productionCalls := 0
 	for _, candidate := range candidates {
 		if strings.HasSuffix(candidate, "_test.go") || candidate == "experimental_factory_linux.go" {
