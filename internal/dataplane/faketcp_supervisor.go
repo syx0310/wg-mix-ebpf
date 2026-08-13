@@ -198,16 +198,11 @@ func (supervisor *fakeTCPRuntimeSupervisor) QuiesceForStartupGuard(ctx context.C
 	if current == nil || !current.wasStarted() || current.finished() {
 		return nil
 	}
-	stopErr := current.requestStop()
-	select {
-	case <-current.done:
-	case <-ctx.Done():
-		return errors.Join(wrapFakeTCPStopError(stopErr), ctx.Err())
+	pauser, ok := current.runtime.(faketcp.RuntimeStartupGuardPauser)
+	if !ok {
+		return errors.New("quiesce FakeTCP runtime for startup guard: runtime has no pause contract")
 	}
-	return errors.Join(
-		wrapFakeTCPRunError(current.terminalError()),
-		wrapFakeTCPStopError(stopErr),
-	)
+	return pauser.PauseForStartupGuard(ctx)
 }
 
 // ResumeAfterStartupGuard starts the staged runtime only after nft cleanup has
@@ -241,7 +236,15 @@ func (supervisor *fakeTCPRuntimeSupervisor) ResumeAfterStartupGuard(ctx context.
 				wrapFakeTCPRunError(current.terminalError()),
 			)
 		}
-		if !current.wasStarted() {
+		if current.wasStarted() {
+			pauser, ok := current.runtime.(faketcp.RuntimeStartupGuardPauser)
+			if !ok {
+				return errors.New("resume FakeTCP runtime after startup guard: runtime has no pause contract")
+			}
+			if err := pauser.ResumeAfterStartupGuard(ctx); err != nil {
+				return fmt.Errorf("resume FakeTCP runtime after startup guard: %w", err)
+			}
+		} else {
 			if err := current.start(); err != nil {
 				return fmt.Errorf("resume FakeTCP runtime after startup guard: %w", err)
 			}

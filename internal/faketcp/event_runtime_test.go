@@ -240,6 +240,80 @@ func TestEventRuntimeServicesTickAfterReadDeadline(t *testing.T) {
 	}
 }
 
+func TestEventRuntimeStartupGuardPauseDrainsAndBlocksDeliveryUntilResume(t *testing.T) {
+	reader := &fakeEventReader{records: []EventRecord{
+		{RawSample: []byte{1}},
+		{RawSample: []byte{2}},
+	}}
+	firstStarted := make(chan struct{})
+	firstRelease := make(chan struct{})
+	secondStarted := make(chan struct{})
+	var firstOnce sync.Once
+	var secondOnce sync.Once
+	controller := &fakeEventController{}
+	controller.handleHook = func() {
+		controller.mu.Lock()
+		count := len(controller.samples)
+		controller.mu.Unlock()
+		switch count {
+		case 1:
+			firstOnce.Do(func() { close(firstStarted) })
+			<-firstRelease
+		case 2:
+			secondOnce.Do(func() { close(secondStarted) })
+		}
+	}
+	runtime := newTestEventRuntime(t, reader, controller, EventRuntimeOptions{})
+	runDone := make(chan error, 1)
+	go func() { runDone <- runtime.Run(context.Background()) }()
+	<-firstStarted
+	pauseDone := make(chan error, 1)
+	go func() { pauseDone <- runtime.PauseForStartupGuard(t.Context()) }()
+	deadline := time.After(time.Second)
+	for {
+		runtime.mu.Lock()
+		paused := runtime.guardPaused
+		runtime.mu.Unlock()
+		if paused {
+			break
+		}
+		select {
+		case err := <-pauseDone:
+			t.Fatalf("pause returned before admitted event drained: %v", err)
+		case <-deadline:
+			t.Fatal("pause did not close event admission")
+		default:
+		}
+	}
+	close(firstRelease)
+	if err := <-pauseDone; err != nil {
+		t.Fatal(err)
+	}
+	controller.mu.Lock()
+	samplesWhilePaused := len(controller.samples)
+	controller.mu.Unlock()
+	if samplesWhilePaused != 1 {
+		t.Fatalf("samples while paused = %d, want 1", samplesWhilePaused)
+	}
+	if err := runtime.ResumeAfterStartupGuard(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondStarted:
+	case <-time.After(time.Second):
+		t.Fatal("queued event was not delivered after resume")
+	}
+	if err := runtime.RequestStop(); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-runDone; err != nil {
+		t.Fatalf("Run after guard pause = %v", err)
+	}
+	if err := runtime.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestEventRuntimePropagatesReaderAndControllerErrors(t *testing.T) {
 	readErr := errors.New("reader failure")
 	runtime := newTestEventRuntime(t,

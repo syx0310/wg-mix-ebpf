@@ -66,6 +66,15 @@ type RuntimeStopRequester interface {
 	RequestStop() error
 }
 
+// RuntimeStartupGuardPauser temporarily fences event delivery without ending
+// the one-shot Run lifecycle. Reconcile uses it to drain raw reinjection before
+// installing the temporary nft startup guard, then resumes the identical
+// runtime after that guard has been removed.
+type RuntimeStartupGuardPauser interface {
+	PauseForStartupGuard(context.Context) error
+	ResumeAfterStartupGuard(context.Context) error
+}
+
 type EventRuntimeOptions struct {
 	// PollInterval bounds cancellation latency while Read is idle.
 	PollInterval time.Duration
@@ -97,10 +106,14 @@ type EventRuntime struct {
 	readerClosing bool
 	readerErr     error
 	closeErr      error
+	guardPaused   bool
+	activeWork    int
+	stateChanged  chan struct{}
 }
 
 var _ RuntimeService = (*EventRuntime)(nil)
 var _ RuntimeStopRequester = (*EventRuntime)(nil)
+var _ RuntimeStartupGuardPauser = (*EventRuntime)(nil)
 
 func NewEventRuntime(
 	reader EventReader,
@@ -169,6 +182,7 @@ func newEventRuntime(
 		runDone:      make(chan struct{}),
 		closeDone:    make(chan struct{}),
 		readerDone:   make(chan struct{}),
+		stateChanged: make(chan struct{}),
 	}, nil
 }
 
@@ -217,8 +231,16 @@ func (runtime *EventRuntime) Run(ctx context.Context) error {
 				if record.LostSamples != 0 {
 					return fmt.Errorf("%w: %d", ErrEventSamplesLost, record.LostSamples)
 				}
-				if _, err := handleRecord(ctx, record); err != nil {
-					return fmt.Errorf("handle faketcp event sample: %w", err)
+				if err := runtime.beginGuardableWork(ctx); err != nil {
+					if runtime.stopRequested() && errors.Is(err, ErrEventRuntimeClosed) {
+						return nil
+					}
+					return err
+				}
+				_, handleErr := handleRecord(ctx, record)
+				runtime.finishGuardableWork()
+				if handleErr != nil {
+					return fmt.Errorf("handle faketcp event sample: %w", handleErr)
 				}
 			case errors.Is(err, os.ErrDeadlineExceeded):
 				// Deadline wakeups exist only to service ctx and Tick below.
@@ -239,13 +261,123 @@ func (runtime *EventRuntime) Run(ctx context.Context) error {
 
 			now = runtime.opts.Now()
 			if !now.Before(nextTick) {
-				if _, err := controller.Tick(ctx); err != nil {
-					return fmt.Errorf("tick faketcp controller: %w", err)
+				if err := runtime.beginGuardableWork(ctx); err != nil {
+					if runtime.stopRequested() && errors.Is(err, ErrEventRuntimeClosed) {
+						return nil
+					}
+					return err
+				}
+				_, tickErr := controller.Tick(ctx)
+				runtime.finishGuardableWork()
+				if tickErr != nil {
+					return fmt.Errorf("tick faketcp controller: %w", tickErr)
 				}
 				nextTick = now.Add(runtime.opts.TickInterval)
 			}
 		}
 	}
+}
+
+// PauseForStartupGuard closes event admission and waits for every already
+// admitted HandleSample/Tick operation (including raw reinjection) to finish.
+// The reader and Run goroutine stay owned and can resume with the same Engine,
+// session map, links, and generation identity.
+func (runtime *EventRuntime) PauseForStartupGuard(ctx context.Context) error {
+	if runtime == nil {
+		return ErrEventRuntimeClosed
+	}
+	if ctx == nil {
+		return errors.New("pause faketcp event runtime: context is nil")
+	}
+	runtime.mu.Lock()
+	if runtime.shutdown || runtime.closing || runtime.closed || runtime.stopAsked {
+		runtime.mu.Unlock()
+		return ErrEventRuntimeClosed
+	}
+	runtime.guardPaused = true
+	runtime.signalStateChangedLocked()
+	for runtime.activeWork != 0 {
+		changed := runtime.stateChanged
+		runtime.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		runtime.mu.Lock()
+		if runtime.shutdown || runtime.closing || runtime.closed || runtime.stopAsked {
+			runtime.mu.Unlock()
+			return ErrEventRuntimeClosed
+		}
+	}
+	runtime.mu.Unlock()
+	return nil
+}
+
+func (runtime *EventRuntime) ResumeAfterStartupGuard(ctx context.Context) error {
+	if runtime == nil {
+		return ErrEventRuntimeClosed
+	}
+	if ctx == nil {
+		return errors.New("resume faketcp event runtime: context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	runtime.mu.Lock()
+	defer runtime.mu.Unlock()
+	if runtime.shutdown || runtime.closing || runtime.closed || runtime.stopAsked {
+		return ErrEventRuntimeClosed
+	}
+	runtime.guardPaused = false
+	runtime.signalStateChangedLocked()
+	return nil
+}
+
+func (runtime *EventRuntime) beginGuardableWork(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		runtime.mu.Lock()
+		if runtime.shutdown || runtime.closing || runtime.closed || runtime.stopAsked {
+			runtime.mu.Unlock()
+			return ErrEventRuntimeClosed
+		}
+		if !runtime.guardPaused {
+			runtime.activeWork++
+			runtime.mu.Unlock()
+			return nil
+		}
+		changed := runtime.stateChanged
+		runtime.mu.Unlock()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-changed:
+		}
+	}
+}
+
+func (runtime *EventRuntime) finishGuardableWork() {
+	runtime.mu.Lock()
+	if runtime.activeWork > 0 {
+		runtime.activeWork--
+	}
+	runtime.signalStateChangedLocked()
+	runtime.mu.Unlock()
+}
+
+func (runtime *EventRuntime) signalStateChangedLocked() {
+	if runtime.stateChanged == nil {
+		runtime.stateChanged = make(chan struct{})
+		return
+	}
+	close(runtime.stateChanged)
+	runtime.stateChanged = make(chan struct{})
 }
 
 // RequestStop is safe from HandleSample and Tick callbacks. It interrupts the
@@ -261,6 +393,7 @@ func (runtime *EventRuntime) RequestStop() error {
 		return ErrEventRuntimeClosed
 	}
 	runtime.stopAsked = true
+	runtime.signalStateChangedLocked()
 	runtime.mu.Unlock()
 	return runtime.closeReader()
 }
@@ -278,6 +411,7 @@ func (runtime *EventRuntime) finishRun() {
 		runtime.running = false
 		close(runtime.runDone)
 	}
+	runtime.signalStateChangedLocked()
 	runtime.mu.Unlock()
 }
 
@@ -306,6 +440,7 @@ func (runtime *EventRuntime) Close() error {
 	runtime.shutdown = true
 	runtime.stopAsked = true
 	runtime.closing = true
+	runtime.signalStateChangedLocked()
 	runtime.closeDone = make(chan struct{})
 	running := runtime.running
 	runDone := runtime.runDone

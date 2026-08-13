@@ -1674,6 +1674,42 @@ func (runtime *ExperimentalFakeTCPRuntime) RequestStop() error {
 	return slowPath.RequestStop()
 }
 
+func (runtime *ExperimentalFakeTCPRuntime) PauseForStartupGuard(ctx context.Context) error {
+	if runtime == nil || runtime.state == nil {
+		return ErrExperimentalFakeTCPRuntimeClosed
+	}
+	state := runtime.state
+	state.mu.Lock()
+	if state.shutdown || state.closing || state.closed || experimentalSlowPathIsNil(state.slowPath) {
+		state.mu.Unlock()
+		return ErrExperimentalFakeTCPRuntimeClosed
+	}
+	pauser, ok := state.slowPath.(faketcp.RuntimeStartupGuardPauser)
+	state.mu.Unlock()
+	if !ok {
+		return errors.New("pause FakeTCP runtime for startup guard: slow path has no pause contract")
+	}
+	return pauser.PauseForStartupGuard(ctx)
+}
+
+func (runtime *ExperimentalFakeTCPRuntime) ResumeAfterStartupGuard(ctx context.Context) error {
+	if runtime == nil || runtime.state == nil {
+		return ErrExperimentalFakeTCPRuntimeClosed
+	}
+	state := runtime.state
+	state.mu.Lock()
+	if state.shutdown || state.closing || state.closed || experimentalSlowPathIsNil(state.slowPath) {
+		state.mu.Unlock()
+		return ErrExperimentalFakeTCPRuntimeClosed
+	}
+	pauser, ok := state.slowPath.(faketcp.RuntimeStartupGuardPauser)
+	state.mu.Unlock()
+	if !ok {
+		return errors.New("resume FakeTCP runtime after startup guard: slow path has no pause contract")
+	}
+	return pauser.ResumeAfterStartupGuard(ctx)
+}
+
 func (runtime *ExperimentalFakeTCPRuntime) Close() error {
 	if runtime == nil || runtime.state == nil {
 		return nil

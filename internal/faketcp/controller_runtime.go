@@ -232,6 +232,7 @@ type ControllerRuntime struct {
 
 var _ RuntimeService = (*ControllerRuntime)(nil)
 var _ RuntimeStopRequester = (*ControllerRuntime)(nil)
+var _ RuntimeStartupGuardPauser = (*ControllerRuntime)(nil)
 
 func newOwnedControllerRuntime(
 	engine *Engine,
@@ -360,6 +361,20 @@ func (runtime *ControllerRuntime) RequestStop() error {
 		return ErrEventRuntimeClosed
 	}
 	return runtime.events.RequestStop()
+}
+
+func (runtime *ControllerRuntime) PauseForStartupGuard(ctx context.Context) error {
+	if runtime == nil || runtime.events == nil {
+		return ErrEventRuntimeClosed
+	}
+	return runtime.events.PauseForStartupGuard(ctx)
+}
+
+func (runtime *ControllerRuntime) ResumeAfterStartupGuard(ctx context.Context) error {
+	if runtime == nil || runtime.events == nil {
+		return ErrEventRuntimeClosed
+	}
+	return runtime.events.ResumeAfterStartupGuard(ctx)
 }
 
 func (runtime *ControllerRuntime) Close() error {

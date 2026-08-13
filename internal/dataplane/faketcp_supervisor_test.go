@@ -20,6 +20,9 @@ type controlledFakeTCPRuntime struct {
 	healthCalls  int
 	stopCalls    int
 	closeCalls   int
+	pauseCalls   int
+	resumeCalls  int
+	paused       bool
 	closeEarly   bool
 	wakeOnStop   bool
 	ignoreCancel bool
@@ -95,6 +98,34 @@ func (runtime *controlledFakeTCPRuntime) Close() error {
 	}
 	runtime.closeCalls++
 	return runtime.closeErr
+}
+
+func (runtime *controlledFakeTCPRuntime) PauseForStartupGuard(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("pause context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	runtime.mu.Lock()
+	runtime.pauseCalls++
+	runtime.paused = true
+	runtime.mu.Unlock()
+	return nil
+}
+
+func (runtime *controlledFakeTCPRuntime) ResumeAfterStartupGuard(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("resume context is nil")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	runtime.mu.Lock()
+	runtime.resumeCalls++
+	runtime.paused = false
+	runtime.mu.Unlock()
+	return nil
 }
 
 func (runtime *controlledFakeTCPRuntime) Healthy(ctx context.Context) error {
@@ -174,7 +205,7 @@ func TestFakeTCPRuntimeSupervisorStartupGuardDrainsOldAndStagesReplacement(t *te
 		t.Fatalf("quiesce for startup guard: %v", err)
 	}
 	stopCalls, closeCalls, closeEarly := first.counts()
-	if stopCalls != 1 || closeCalls != 0 || closeEarly {
+	if stopCalls != 0 || closeCalls != 0 || closeEarly {
 		t.Fatalf("quiesced runtime lifecycle = stop %d close %d early %t", stopCalls, closeCalls, closeEarly)
 	}
 
@@ -208,6 +239,42 @@ func TestFakeTCPRuntimeSupervisorStartupGuardDrainsOldAndStagesReplacement(t *te
 	}
 	if err := supervisor.Stop(t.Context()); err != nil {
 		t.Fatalf("stop replacement: %v", err)
+	}
+}
+
+func TestFakeTCPRuntimeSupervisorStartupGuardReusesHealthySameKeyRuntime(t *testing.T) {
+	supervisor := &fakeTCPRuntimeSupervisor{}
+	runtime := newControlledFakeTCPRuntime()
+	key := fakeTCPRuntimeDesiredKey{1}
+	builds := 0
+	build := func(context.Context) (fakeTCPRuntimeService, error) {
+		builds++
+		return runtime, nil
+	}
+	if err := supervisor.Ensure(t.Context(), key, build); err != nil {
+		t.Fatal(err)
+	}
+	<-runtime.runStarted
+	if err := supervisor.QuiesceForStartupGuard(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.Ensure(t.Context(), key, build); err != nil {
+		t.Fatal(err)
+	}
+	if err := supervisor.ResumeAfterStartupGuard(t.Context()); err != nil {
+		t.Fatal(err)
+	}
+	if builds != 1 || supervisor.loadCurrent().runtime != runtime {
+		t.Fatalf("same-key reload replaced runtime: builds=%d current=%T", builds, supervisor.loadCurrent().runtime)
+	}
+	runtime.mu.Lock()
+	pauseCalls, resumeCalls, paused := runtime.pauseCalls, runtime.resumeCalls, runtime.paused
+	runtime.mu.Unlock()
+	if pauseCalls != 1 || resumeCalls != 1 || paused {
+		t.Fatalf("guard pause lifecycle = pause %d resume %d paused %t", pauseCalls, resumeCalls, paused)
+	}
+	if err := supervisor.Stop(t.Context()); err != nil {
+		t.Fatal(err)
 	}
 }
 
