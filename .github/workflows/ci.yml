@@ -13,13 +13,59 @@ permissions:
   contents: read
 
 jobs:
-  linux-amd64:
-    name: Linux amd64
+  unit:
+    name: Unit and race tests
     runs-on: ubuntu-24.04
 
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Unit tests
+        run: make test-unit
+
+      - name: Race tests
+        run: make test-unit-race
+
+  static:
+    name: Static checks
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Lint and vet
+        run: make test-lint
+
+  linux-build:
+    name: Linux BPF and release builds
+    runs-on: ubuntu-24.04
+    needs: [unit, static]
+    env:
+      CLANG: clang-18
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
 
       - name: Set up Go
         uses: actions/setup-go@v6
@@ -30,41 +76,64 @@ jobs:
       - name: Install BPF build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends clang llvm gcc linux-libc-dev libbpf-dev
+          sudo apt-get install -y --no-install-recommends clang-18 llvm-18 gcc linux-libc-dev libbpf-dev
+          clang-18 --version
 
-      - name: Unit tests
-        run: make test-unit
-
-      - name: Static checks
-        run: make test-lint
-
-      - name: Race tests
-        run: CGO_ENABLED=1 make test-unit-race
-
-      - name: Build Linux amd64 package binary
-        run: make build-linux-amd64
-
-      - name: Build Linux arm64 package binary
-        run: make build-linux-arm64
-
-      - name: Offline config validation
+      - name: Build Linux binaries and embedded BPF objects
         run: |
+          make build-linux-amd64 build-linux-arm64
+          make _test-bpf-object-manifests
+
+      - name: Verify build identity and offline configuration
+        run: |
+          ./bin/wg-mix-ebpf-linux-amd64 version --json > /tmp/wg-mix-ebpf-version.json
           ./bin/wg-mix-ebpf-linux-amd64 validate --config configs/example.yaml --offline
-          ./bin/wg-mix-ebpf-linux-amd64 dump-abi --config configs/example.yaml --offline >/tmp/wg-mix-ebpf-abi.json
+          ./bin/wg-mix-ebpf-linux-amd64 dump-abi --config configs/example.yaml --offline > /tmp/wg-mix-ebpf-abi.json
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import subprocess
+          from pathlib import Path
 
-      - name: Package artifact
+          identity = json.loads(Path("/tmp/wg-mix-ebpf-version.json").read_text())
+          expected = {
+              "source_commit": subprocess.check_output(
+                  ["git", "rev-parse", "HEAD"], text=True
+              ).strip(),
+              "embedded_bpf_object_sha256": hashlib.sha256(
+                  Path("internal/dataplane/embedded/wg_mix_tc.o").read_bytes()
+              ).hexdigest(),
+              "embedded_faketcp_object_sha256": hashlib.sha256(
+                  Path("internal/dataplane/embedded/wg_mix_faketcp.o").read_bytes()
+              ).hexdigest(),
+              "embedded_faketcp_legacy_515_object_sha256": hashlib.sha256(
+                  Path("internal/dataplane/embedded/wg_mix_faketcp_legacy_515.o").read_bytes()
+              ).hexdigest(),
+          }
+          for key, value in expected.items():
+              if identity.get(key) != value:
+                  raise SystemExit(f"{key}: {identity.get(key)!r} != {value!r}")
+          PY
+
+      - name: Package artifacts
         run: |
-          mkdir -p dist/wg-mix-ebpf_linux_amd64
+          mkdir -p dist/wg-mix-ebpf_linux_amd64 dist/wg-mix-ebpf_linux_arm64
           cp bin/wg-mix-ebpf-linux-amd64 dist/wg-mix-ebpf_linux_amd64/wg-mix-ebpf
+          cp bin/wg-mix-ebpf-linux-arm64 dist/wg-mix-ebpf_linux_arm64/wg-mix-ebpf
           cp README.md dist/wg-mix-ebpf_linux_amd64/
-          cp -R configs dist/wg-mix-ebpf_linux_amd64/
+          cp README.md dist/wg-mix-ebpf_linux_arm64/
+          cp -R configs docs dist/wg-mix-ebpf_linux_amd64/
+          cp -R configs docs dist/wg-mix-ebpf_linux_arm64/
           tar -C dist -czf dist/wg-mix-ebpf_linux_amd64.tar.gz wg-mix-ebpf_linux_amd64
-          sha256sum dist/wg-mix-ebpf_linux_amd64.tar.gz > dist/checksums.txt
+          tar -C dist -czf dist/wg-mix-ebpf_linux_arm64.tar.gz wg-mix-ebpf_linux_arm64
+          cd dist
+          sha256sum wg-mix-ebpf_linux_amd64.tar.gz wg-mix-ebpf_linux_arm64.tar.gz > checksums.txt
 
-      - name: Upload artifact
+      - name: Upload artifacts
         uses: actions/upload-artifact@v5
         with:
-          name: wg-mix-ebpf_linux_amd64
+          name: wg-mix-ebpf-linux
           path: |
             dist/wg-mix-ebpf_linux_amd64.tar.gz
+            dist/wg-mix-ebpf_linux_arm64.tar.gz
             dist/checksums.txt

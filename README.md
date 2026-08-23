@@ -2,7 +2,7 @@
 
 Transparent WireGuard `type_word` transform using eBPF.
 
-Current status: control-plane foundation, daemon reconcile loop, profile management, generation-scoped map ABI, startup guard tooling, attach-state cleanup, embedded BPF packaging, Linux TC/eBPF dataplane loading, UDP type-word mode, optional UDP XOR payload obfuscation, and experimental IPv4 ICMP mode are implemented. Live BPF load, TC attach, WireGuard, offload, OpenWrt, and public-network tests must run on controlled external Linux machines.
+Current status: control-plane foundation, daemon reconcile loop, profile management, generation-scoped map ABI, startup guard tooling, attach-state cleanup, baseline plus modern/legacy FakeTCP embedded BPF packaging, Linux TC/eBPF dataplane loading, UDP type-word mode, optional XOR payload obfuscation, IPv4 ICMP mode, and production IPv4 FakeTCP mode are implemented. Live BPF load, TC/XDP attach, WireGuard, offload, and performance tests must run on controlled external Linux machines.
 
 ## Commands
 
@@ -41,14 +41,36 @@ Supported transport modes:
 
 ```text
 udp    original transparent UDP type-word transform
-icmp   experimental IPv4 ICMP Echo transport, no fakeTCP
+icmp   IPv4 ICMP Echo transport
+faketcp IPv4 TCP-shaped packet transport (one or more WireGuards, resident daemon)
 ```
 
 Optional cipher mode:
 
 ```text
-xor    UDP-only WireGuard payload XOR obfuscation, auth=none
+xor    UDP or FakeTCP WireGuard payload XOR obfuscation, auth=none
 ```
+
+Implemented combinations:
+
+| Transport | IP | Attachment | XOR | Operational contract |
+| --- | --- | --- | --- | --- |
+| UDP | IPv4/IPv6 | `auto`, `tcx`, `classic_tc` | none, prefix, full | normal daemon or one-shot reload |
+| ICMP Echo | IPv4 | `auto`, `tcx`, `classic_tc` | unsupported | client/server roles |
+| FakeTCP | IPv4 | `auto`, `tcx`, `classic_tc`; always exact generic XDP | none, prefix, full | one or more WGs, resident daemon, fixed distinct ListenPorts, `auto`/`kfunc`/`kprobe` checksum backend |
+
+Pure kernel WireGuard without this dataplane remains the performance and
+interoperability baseline; it is not a fourth transform mode. FakeTCP does not
+support libxdp chaining, existing XDP ownership, XDP replacement/fallback, or
+one-shot execution. TC attachment and checksum bridging are independent:
+modern kernels prefer TCX plus kfunc. Classic TC plus the legacy kprobe bridge
+is a Linux 5.15 candidate path until a real 5.15 verifier and traffic gate
+passes. Exact generic XDP remains required in every FakeTCP combination.
+
+Runtime links, exact generic XDP and production TCX are process/FD-owned.
+Classic-TC filters are the durable installation-owned backend with a recovery
+journal; the baseline exact-TCX pinned journal is not the production FakeTCP
+TCX stage.
 
 Operational behavior is documented in:
 
@@ -60,21 +82,42 @@ docs/configuration.md
 docs/operations.md
 ```
 
+Start with [docs/configuration.md](docs/configuration.md) and
+[docs/operations.md](docs/operations.md). Support claims are graded as
+`validated`, `build-supported`, `candidate`, or `unsupported`; a cross-build
+is not a live-kernel validation.
+
+Verify the downloaded archive, then run preflight from a fresh extraction
+directory:
+
+```bash
+sha256sum -c checksums.txt
+tar -xzf wg-mix-ebpf_linux_amd64.tar.gz
+cd wg-mix-ebpf_linux_amd64
+./wg-mix-ebpf version --json
+./wg-mix-ebpf validate --config configs/example.yaml --offline
+./wg-mix-ebpf install --system systemd --dry-run
+```
+
 ## Development
 
 ```bash
 make test-unit
-CGO_ENABLED=0 go build -o /tmp/wg-mix-ebpf ./cmd/wg-mix-ebpf
+make test-lint
+make build
 ```
 
 The default Makefile build and test targets use `CGO_ENABLED=0` for reproducible cross-platform builds.
 
 ## Linux Dataplane
 
-The Go binary does not require cgo. The TC/eBPF program is compiled during packaging and embedded into the binary:
+The Go binary does not require cgo. Baseline, modern FakeTCP, and legacy Linux
+5.15 FakeTCP BPF objects are compiled during packaging and embedded into the
+binary:
 
 ```bash
 make build-bpf
+make build-faketcp-legacy-515-bpf
 make build-linux-amd64
 sudo ./bin/wg-mix-ebpf-linux-amd64 bpf-load-test
 ```
@@ -86,6 +129,41 @@ WG_MIX_EBPF_OBJECT=/path/to/wg_mix_tc.o
 ```
 
 or `--object /path/to/wg_mix_tc.o`.
+
+FakeTCP uses independent object overrides and never falls back to the baseline
+object:
+
+```text
+WG_MIX_EBPF_FAKETCP_OBJECT=/path/to/wg_mix_faketcp_experimental.o
+WG_MIX_EBPF_FAKETCP_LEGACY_515_OBJECT=/path/to/wg_mix_faketcp_legacy_515.o
+```
+
+The selected `runtime.checksum_backend` additionally requires the administrator
+to provision and load either the matching `wg_mix_faketcp_checksum` kfunc
+module or `wg_mix_faketcp_checksum_kprobe` legacy module. The kprobe module
+supports multiple per-runtime FD leases/cookies; each daemon retains its own
+fixed cookie and never falls back after activation. The currently validated
+kprobe bridge target is Linux x86_64; arm64 FakeTCP requires the kfunc backend
+until a separate kprobe calling-convention implementation is validated.
+`wg-mix-ebpf doctor
+--config ...` checks the selected module, artifact, bridge ABI, trigger, and
+health contract before activation. The service never loads or unloads an
+administrator-owned module.
+
+Every FakeTCP WireGuard requires a fixed, distinct, non-zero `ListenPort` and
+`policy.startup_fail_mode: fail_closed_for_managed_flows`. The production
+default `startup_guard.mode: nft-temporary-drop` remains installed until the
+resident runtime passes its final map and attachment health check.
+
+`startup_guard.mode: none` is an explicit high-risk opt-in for UDP, ICMP, and
+FakeTCP. It is never selected automatically when nft is unavailable. It does
+not prevent standard UDP leakage or FakeTCP host-stack RST/interference during
+startup/reload windows; status must identify the guard as `disabled` and show
+the risk. In this profile the daemon does not execute the nft binary, but it
+still performs a fresh read-only `NETLINK_NETFILTER`/`NFT_MSG_GETTABLE` kernel
+inventory with a five-second upper bound; no-nft means binary-less, not
+inspection-free. Review the startup-guard contract in
+[docs/configuration.md](docs/configuration.md) before using it.
 
 Do not run BPF load, TC attach, netns, OpenWrt, offload, or performance tests on non-Linux development machines.
 
@@ -99,15 +177,29 @@ On a controlled Linux test host, the full isolated namespace gate is:
 sudo make test-netns-full
 ```
 
-To run only the TCP single-flow, multi-flow, and WireGuard MTU boundary
-matrix (type-word-only, XOR prefix, and XOR full), use:
+To run only the TCP 1/4/16-flow, forward/reverse/bidirectional, and WireGuard
+MTU 1419-1422 tail-alignment matrix (type-word-only, XOR prefix, and XOR full),
+use:
 
 ```bash
 sudo make test-netns-tcp
 ```
 
+The positive 1500-byte underlay PMTU boundaries are a separate IPv4/IPv6 gate:
+
+```bash
+sudo make test-netns-tcp-pmtu-positive
+```
+
 The TCP matrix requires `iperf3`; the default lightweight namespace smoke
-targets do not.
+targets do not. It treats TCP delivery, retransmits, packet captures, and
+dataplane error counters as correctness gates. Inner TCP GSO capability and
+outer UDP GSO/GRO observations are reported separately, because kernel
+WireGuard may segment an inner GSO skb before producing the outer UDP packets.
+Use `sudo make test-netns-tcp-outer-gso-observe` for a focused 16-flow,
+simultaneous-bidirectional outer-GSO observation run; a missing observation is
+reported as `not-covered`, not as a pass. This is still TCP-over-WireGuard and
+does not replace a dedicated outer-UDP `UDP_SEGMENT`/GRO workload.
 
 Run `bpf-load-test` on every supported kernel baseline as well as the build
 kernel; verifier acceptance can differ even when the embedded object is

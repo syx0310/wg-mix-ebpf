@@ -66,7 +66,7 @@
 /*
  * Every managed load carries the frozen <8 lowercase hex>-<8 lowercase hex>
  * generation lease.  Empty remains compatible with existing administrator
- * preload and legacy harnesses, but managed review-v2 loaders require and
+ * preload and legacy harnesses, but managed deployment tooling requires and
  * verify the exact non-empty value.  The parameter is the crash-recovery
  * identity for the interval between successful insmod and the durable owner
  * receipt.  Read-only sysfs exposure makes that generation observable without
