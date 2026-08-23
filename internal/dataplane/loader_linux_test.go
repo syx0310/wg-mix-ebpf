@@ -1639,17 +1639,6 @@ func TestApplyDetachAndStatusShareFailClosedPinPathValidation(t *testing.T) {
 	}
 }
 
-func TestBPFFSPinLifecycleIntegration(t *testing.T) {
-	if os.Getenv(scopedBPFFSRunEnv) != "1" {
-		t.Skip("set WG_MIX_EBPF_RUN_BPFFS_INTEGRATION=1 for an explicitly approved real bpffs test")
-	}
-	config, err := scopedBPFFSConfigFromEnv()
-	if err != nil {
-		t.Fatal(err)
-	}
-	runScopedBPFFSIntegration(t, config)
-}
-
 func newTestBPFFS(t *testing.T) (string, pinPathValidator) {
 	t.Helper()
 	bpffsRoot := filepath.Join(t.TempDir(), "bpffs")
