@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
+	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/reconcile"
 	"golang.org/x/sys/unix"
@@ -597,7 +598,8 @@ func TestNewInstanceScanToleratesOldClientWithdrawalAfterEnumeration(t *testing.
 func TestQueuedStopBeforeStartupIsAcknowledged(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	opts := testOptions(runDir, leasePath, nil)
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	opts := testOptions(runDir, leasePath, maintenancePath, nil)
 	request, err := enqueueRequest(t.Context(), runDir, "stop", opts.ConfigPath, opts.hooks.instanceID)
 	if err != nil {
 		t.Fatal(err)
@@ -624,7 +626,8 @@ func TestQueuedStopBeforeStartupIsAcknowledged(t *testing.T) {
 func TestStaleStopRequestCannotStopNewDaemonInstance(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	opts := testOptions(runDir, leasePath, nil)
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	opts := testOptions(runDir, leasePath, maintenancePath, nil)
 	staleInstanceID := "fedcba9876543210fedcba9876543210"
 	request, err := enqueueRequest(t.Context(), runDir, "stop", opts.ConfigPath, staleInstanceID)
 	if err != nil {
@@ -786,7 +789,8 @@ func TestRequestRejectsDaemonWithoutAckProtocol(t *testing.T) {
 func TestConcurrentStopSupersedesReloadWithPerRequestAcks(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	opts := testOptions(runDir, leasePath, nil)
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	opts := testOptions(runDir, leasePath, maintenancePath, nil)
 	reloadRequest, err := enqueueRequest(t.Context(), runDir, "reload", opts.ConfigPath, opts.hooks.instanceID)
 	if err != nil {
 		t.Fatal(err)
@@ -823,7 +827,8 @@ func TestConcurrentStopSupersedesReloadWithPerRequestAcks(t *testing.T) {
 func TestDelayedLegacyStopIsRecordedAndIgnored(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	opts := testOptions(runDir, leasePath, nil)
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	opts := testOptions(runDir, leasePath, maintenancePath, nil)
 	runCtx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
@@ -858,7 +863,8 @@ func TestDelayedLegacyStopIsRecordedAndIgnored(t *testing.T) {
 func TestUnsafeLegacyNotificationIsRecordedAndIgnored(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	opts := testOptions(runDir, leasePath, nil)
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	opts := testOptions(runDir, leasePath, maintenancePath, nil)
 	runCtx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
 	go func() {
@@ -965,20 +971,41 @@ func TestLifecycleLeasePathIsGlobalForMutatingDaemon(t *testing.T) {
 	if got := lifecycleLeasePath(Options{DryRun: true}, "/tmp/dry-run", ""); got != "/tmp/dry-run/daemon.lease" {
 		t.Fatalf("dry-run lease path = %q", got)
 	}
+	if got := lifecycleMaintenancePath(
+		Options{RunDir: "/tmp/first"},
+		"/tmp/first",
+		"",
+	); got != DefaultLifecycleMaintenancePath {
+		t.Fatalf("mutating daemon maintenance path = %q", got)
+	}
+	if got := lifecycleMaintenancePath(
+		Options{DryRun: true},
+		"/tmp/dry-run",
+		"",
+	); got != "/tmp/dry-run/.daemon-maintenance.gate" {
+		t.Fatalf("dry-run maintenance path = %q", got)
+	}
 }
 
 func TestRunRejectsConcurrentDaemonAcrossRunDirs(t *testing.T) {
 	leasePath := filepath.Join(t.TempDir(), "global", "daemon.lease")
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
 	firstRunDir := filepath.Join(t.TempDir(), "first")
 	secondRunDir := filepath.Join(t.TempDir(), "second")
 	firstCtx, cancelFirst := context.WithCancel(t.Context())
 	firstDone := make(chan error, 1)
 	go func() {
-		firstDone <- Run(firstCtx, testOptions(firstRunDir, leasePath, nil))
+		firstDone <- Run(
+			firstCtx,
+			testOptions(firstRunDir, leasePath, maintenancePath, nil),
+		)
 	}()
 	waitForDaemonState(t, firstRunDir, "active")
 
-	err := Run(t.Context(), testOptions(secondRunDir, leasePath, nil))
+	err := Run(
+		t.Context(),
+		testOptions(secondRunDir, leasePath, maintenancePath, nil),
+	)
 	if !errors.Is(err, ErrAlreadyRunning) {
 		t.Fatalf("second daemon error = %v, want ErrAlreadyRunning", err)
 	}
@@ -996,7 +1023,11 @@ func TestRunRejectsConcurrentDaemonAcrossRunDirs(t *testing.T) {
 
 func TestLifecycleLeaseDoesNotConflictWithOperationLock(t *testing.T) {
 	runDir := t.TempDir()
-	lease, err := acquireLifecycleLease(filepath.Join(runDir, "daemon.lease"), leaseOwner{PID: os.Getpid(), RunDir: runDir})
+	lease, err := acquireLifecycleLease(
+		filepath.Join(runDir, "daemon.lease"),
+		filepath.Join(runDir, "maintenance.gate"),
+		leaseOwner{PID: os.Getpid(), RunDir: runDir},
+	)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1009,34 +1040,69 @@ func TestLifecycleLeaseDoesNotConflictWithOperationLock(t *testing.T) {
 	}
 }
 
+func TestMaintenanceContentionPreservesErrAlreadyRunning(t *testing.T) {
+	root := t.TempDir()
+	leasePath := filepath.Join(root, "daemon.lease")
+	maintenancePath := filepath.Join(root, "maintenance.gate")
+	maintenance, err := lockfile.BeginLifecycleMaintenanceAt(
+		leasePath,
+		maintenancePath,
+		lockfile.LifecycleOwner{PID: os.Getpid(), Action: "maintenance"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer maintenance.Close()
+
+	lease, err := acquireLifecycleLease(
+		leasePath,
+		maintenancePath,
+		leaseOwner{PID: os.Getpid(), Action: "daemon-contender"},
+	)
+	if lease != nil {
+		_ = lease.Close()
+		t.Fatal("daemon contender unexpectedly acquired lifecycle lease")
+	}
+	if !errors.Is(err, ErrAlreadyRunning) ||
+		!errors.Is(err, lockfile.ErrLifecycleMaintenanceHeld) {
+		t.Fatalf("daemon maintenance contention error = %v", err)
+	}
+}
+
 func TestDaemonCleanupReusesHeldLeaseWithoutSelfLock(t *testing.T) {
 	root := t.TempDir()
+	root, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	runDir := filepath.Join(root, "run")
 	leasePath := filepath.Join(root, "daemon.lease")
-	configPath := filepath.Join(root, "config.yaml")
-	fakeBin := filepath.Join(root, "bin")
-	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
-		t.Fatal(err)
+	maintenancePath := filepath.Join(root, "maintenance.gate")
+	hooks := successfulRunHooks(leasePath, maintenancePath)
+	reusedHeldLease := false
+	hooks.stop = func(
+		ctx context.Context,
+		stopOpts Options,
+		_ string,
+	) (*reconcile.Result, error) {
+		err := lockfile.WithLifecycle(
+			ctx,
+			stopOpts.lifecycleLease,
+			lockfile.LifecycleOwner{PID: os.Getpid(), Action: "daemon-stop-test"},
+			func(lease *lockfile.LifecycleLease) error {
+				reusedHeldLease = lease == stopOpts.lifecycleLease
+				return nil
+			},
+		)
+		return &reconcile.Result{Action: "stop"}, err
 	}
-	if err := os.WriteFile(filepath.Join(fakeBin, "nft"), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
-		t.Fatal(err)
-	}
-	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
-	if err := os.WriteFile(configPath, []byte(`version: 1
-underlays: []
-wireguards: []
-profiles: {}
-startup_guard:
-  mode: none
-`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	hooks := successfulRunHooks(leasePath)
-	hooks.stop = nil
-	opts := testOptions(runDir, leasePath, hooks)
-	opts.ConfigPath = configPath
+	opts := testOptions(runDir, leasePath, maintenancePath, hooks)
 
-	baseCtx := lockfile.WithLifecyclePathForTest(t.Context(), leasePath)
+	baseCtx := lockfile.WithLifecyclePathsForTest(
+		t.Context(),
+		leasePath,
+		maintenancePath,
+	)
 	runCtx, cancel := context.WithCancel(baseCtx)
 	done := make(chan error, 1)
 	go func() {
@@ -1049,6 +1115,9 @@ startup_guard:
 		if err != nil {
 			t.Fatalf("daemon cleanup self-locked or failed: %v", err)
 		}
+		if !reusedHeldLease {
+			t.Fatal("daemon cleanup did not reuse its retained lifecycle lease")
+		}
 	case <-time.After(8 * time.Second):
 		t.Fatal("daemon cleanup self-locked on its lifecycle lease")
 	}
@@ -1057,12 +1126,13 @@ startup_guard:
 func TestRunReturnsErrorWhenCleanupTimesOut(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	hooks := successfulRunHooks(leasePath)
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	hooks := successfulRunHooks(leasePath, maintenancePath)
 	hooks.stop = func(ctx context.Context, _ Options, _ string) (*reconcile.Result, error) {
 		<-ctx.Done()
 		return nil, ctx.Err()
 	}
-	opts := testOptions(runDir, leasePath, hooks)
+	opts := testOptions(runDir, leasePath, maintenancePath, hooks)
 	opts.ShutdownTimeout = 25 * time.Millisecond
 
 	runCtx, cancel := context.WithCancel(t.Context())
@@ -1090,19 +1160,20 @@ func TestRunReturnsErrorWhenCleanupTimesOut(t *testing.T) {
 func TestCleanupHardTimeoutRetainsLeaseUntilWorkerFinishes(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
 	cleanupStarted := make(chan struct{})
 	releaseCleanup := make(chan struct{})
 	var releaseOnce sync.Once
 	release := func() { releaseOnce.Do(func() { close(releaseCleanup) }) }
 	defer release()
 
-	hooks := successfulRunHooks(leasePath)
+	hooks := successfulRunHooks(leasePath, maintenancePath)
 	hooks.stop = func(context.Context, Options, string) (*reconcile.Result, error) {
 		close(cleanupStarted)
 		<-releaseCleanup
 		return &reconcile.Result{State: &control.State{}, Action: "stop"}, nil
 	}
-	opts := testOptions(runDir, leasePath, hooks)
+	opts := testOptions(runDir, leasePath, maintenancePath, hooks)
 	opts.ShutdownTimeout = 25 * time.Millisecond
 
 	runCtx, cancel := context.WithCancel(t.Context())
@@ -1130,7 +1201,11 @@ func TestCleanupHardTimeoutRetainsLeaseUntilWorkerFinishes(t *testing.T) {
 		t.Fatal("Run remained blocked on context-ignoring cleanup")
 	}
 
-	if second, err := acquireLifecycleLease(leasePath, leaseOwner{PID: os.Getpid(), Action: "second"}); !errors.Is(err, ErrAlreadyRunning) {
+	if second, err := acquireLifecycleLease(
+		leasePath,
+		maintenancePath,
+		leaseOwner{PID: os.Getpid(), Action: "second"},
+	); !errors.Is(err, ErrAlreadyRunning) {
 		if err == nil {
 			_ = second.Close()
 		}
@@ -1140,7 +1215,11 @@ func TestCleanupHardTimeoutRetainsLeaseUntilWorkerFinishes(t *testing.T) {
 	release()
 	deadline := time.Now().Add(time.Second)
 	for {
-		second, err := acquireLifecycleLease(leasePath, leaseOwner{PID: os.Getpid(), Action: "second"})
+		second, err := acquireLifecycleLease(
+			leasePath,
+			maintenancePath,
+			leaseOwner{PID: os.Getpid(), Action: "second"},
+		)
 		if err == nil {
 			_ = second.Close()
 			break
@@ -1155,12 +1234,13 @@ func TestCleanupHardTimeoutRetainsLeaseUntilWorkerFinishes(t *testing.T) {
 func TestCleanupErrorIsJoinedWithConcurrentDeadline(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	hooks := successfulRunHooks(leasePath)
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	hooks := successfulRunHooks(leasePath, maintenancePath)
 	hooks.stop = func(ctx context.Context, _ Options, _ string) (*reconcile.Result, error) {
 		<-ctx.Done()
 		return nil, errors.New("cleanup returned after cancellation")
 	}
-	opts := testOptions(runDir, leasePath, hooks)
+	opts := testOptions(runDir, leasePath, maintenancePath, hooks)
 	opts.ShutdownTimeout = 25 * time.Millisecond
 
 	runCtx, cancel := context.WithCancel(t.Context())
@@ -1184,11 +1264,12 @@ func TestCleanupErrorIsJoinedWithConcurrentDeadline(t *testing.T) {
 func TestStopRequestCleanupFailureReturnsError(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	hooks := successfulRunHooks(leasePath)
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	hooks := successfulRunHooks(leasePath, maintenancePath)
 	hooks.stop = func(context.Context, Options, string) (*reconcile.Result, error) {
 		return nil, errors.New("detach failed")
 	}
-	opts := testOptions(runDir, leasePath, hooks)
+	opts := testOptions(runDir, leasePath, maintenancePath, hooks)
 
 	done := make(chan error, 1)
 	go func() {
@@ -1216,7 +1297,8 @@ func TestStopRequestCleanupFailureReturnsError(t *testing.T) {
 func TestShutdownAggregatesCleanupAndFinalStatusFailures(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	hooks := successfulRunHooks(leasePath)
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	hooks := successfulRunHooks(leasePath, maintenancePath)
 	hooks.stop = func(context.Context, Options, string) (*reconcile.Result, error) {
 		return nil, errors.New("cleanup failed")
 	}
@@ -1226,7 +1308,7 @@ func TestShutdownAggregatesCleanupAndFinalStatusFailures(t *testing.T) {
 		}
 		return writeStatus(dir, status)
 	}
-	opts := testOptions(runDir, leasePath, hooks)
+	opts := testOptions(runDir, leasePath, maintenancePath, hooks)
 
 	runCtx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
@@ -1249,7 +1331,8 @@ func TestShutdownAggregatesCleanupAndFinalStatusFailures(t *testing.T) {
 func TestRunOnceReturnsCriticalStatusWriteFailure(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	hooks := successfulRunHooks(leasePath)
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	hooks := successfulRunHooks(leasePath, maintenancePath)
 	var writes atomic.Int32
 	hooks.writeStatus = func(dir string, status Status) error {
 		if writes.Add(1) == 2 {
@@ -1257,7 +1340,7 @@ func TestRunOnceReturnsCriticalStatusWriteFailure(t *testing.T) {
 		}
 		return writeStatus(dir, status)
 	}
-	opts := testOptions(runDir, leasePath, hooks)
+	opts := testOptions(runDir, leasePath, maintenancePath, hooks)
 	opts.Once = true
 
 	err := Run(t.Context(), opts)
@@ -1266,10 +1349,247 @@ func TestRunOnceReturnsCriticalStatusWriteFailure(t *testing.T) {
 	}
 }
 
+func TestRunOnlyMarksLongRunningDaemonAsResidentRuntime(t *testing.T) {
+	t.Run("once", func(t *testing.T) {
+		runDir := t.TempDir()
+		leasePath := filepath.Join(t.TempDir(), "daemon.lease")
+		maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+		hooks := successfulRunHooks(leasePath, maintenancePath)
+		var got reconcile.Options
+		hooks.reload = func(_ context.Context, opts reconcile.Options) (*reconcile.Result, error) {
+			got = opts
+			return &reconcile.Result{State: &control.State{}}, nil
+		}
+		opts := testOptions(runDir, leasePath, maintenancePath, hooks)
+		opts.Once = true
+		if err := Run(t.Context(), opts); err != nil {
+			t.Fatal(err)
+		}
+		if got.ResidentRuntime {
+			t.Fatal("run --once advertised a resident runtime")
+		}
+	})
+
+	t.Run("daemon", func(t *testing.T) {
+		runDir := t.TempDir()
+		leasePath := filepath.Join(t.TempDir(), "daemon.lease")
+		maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+		hooks := successfulRunHooks(leasePath, maintenancePath)
+		resident := make(chan bool, 1)
+		hooks.reload = func(_ context.Context, opts reconcile.Options) (*reconcile.Result, error) {
+			resident <- opts.ResidentRuntime
+			return &reconcile.Result{State: &control.State{}}, nil
+		}
+		opts := testOptions(runDir, leasePath, maintenancePath, hooks)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- Run(ctx, opts) }()
+		if got := <-resident; !got {
+			t.Fatal("long-running daemon did not advertise a resident runtime")
+		}
+		cancel()
+		if err := <-done; err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func TestPollNoopPreservesResidentFakeTCPSnapshot(t *testing.T) {
+	snapshot := &dataplane.KernelStatus{
+		Mode: "faketcp",
+		FakeTCP: &dataplane.FakeTCPRuntimeStatus{
+			Generation: 9,
+			Healthy:    true,
+		},
+	}
+	previous := &reconcile.Result{
+		Dataplane:      snapshot,
+		DataplaneError: "prior diagnostic",
+	}
+	current := &reconcile.Result{State: &control.State{}}
+	preserveResidentDataplaneSnapshot(current, previous)
+	if current.Dataplane != snapshot || current.DataplaneError != "prior diagnostic" {
+		t.Fatalf("preserved snapshot = %#v / %q", current.Dataplane, current.DataplaneError)
+	}
+
+	baseline := &reconcile.Result{Dataplane: &dataplane.KernelStatus{Mode: "baseline"}}
+	current = &reconcile.Result{}
+	preserveResidentDataplaneSnapshot(current, baseline)
+	if current.Dataplane != nil || current.DataplaneError != "" {
+		t.Fatalf("baseline snapshot leaked into poll result: %#v", current)
+	}
+}
+
+func TestDaemonPublishesReloadFailureAndRecoveryLiveObservations(t *testing.T) {
+	runDir := t.TempDir()
+	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	hooks := successfulRunHooks(leasePath, maintenancePath)
+	firstProgress := make(chan struct{})
+	releaseFirst := make(chan struct{})
+	var reloadCalls atomic.Int32
+	var observedState atomic.Int32
+	hooks.reload = func(_ context.Context, opts reconcile.Options) (*reconcile.Result, error) {
+		call := reloadCalls.Add(1)
+		if call == 1 {
+			opts.Progress(testLiveObservation(
+				reconcile.ReconcilePhaseGuarded,
+				reconcile.StartupGuardKernelActive,
+				"held",
+			))
+			close(firstProgress)
+			<-releaseFirst
+			observedState.Store(1)
+			return nil, errors.New("simulated loader failure")
+		}
+		final := testLiveObservation(
+			reconcile.ReconcilePhaseActive,
+			reconcile.StartupGuardKernelAbsent,
+			"open",
+		)
+		opts.Progress(final)
+		observedState.Store(2)
+		return &reconcile.Result{
+			State: &control.State{}, Action: "reload", Observation: &final,
+		}, nil
+	}
+	hooks.observe = func(context.Context, reconcile.Options) (*reconcile.Result, error) {
+		state := observedState.Load()
+		observation := testLiveObservation(
+			reconcile.ReconcilePhaseIdle,
+			reconcile.StartupGuardKernelAbsent,
+			"open",
+		)
+		if state == 1 {
+			observation.StartupGuard.KernelState = reconcile.StartupGuardKernelActive
+			observation.StartupGuard.RuntimePause.Phase = "held"
+			observation.StartupGuard.RuntimePause.Reason = "startup_guard"
+		}
+		return &reconcile.Result{Observation: &observation}, nil
+	}
+	opts := testOptions(runDir, leasePath, maintenancePath, hooks)
+	runCtx, cancelRun := context.WithCancel(t.Context())
+	done := make(chan error, 1)
+	go func() { done <- Run(runCtx, opts) }()
+
+	select {
+	case <-firstProgress:
+	case <-time.After(time.Second):
+		t.Fatal("reload did not publish guarded progress")
+	}
+	reloading := waitForDaemonState(t, runDir, "reloading")
+	if reloading.Current == nil ||
+		reloading.Current.Reconcile.Phase != reconcile.ReconcilePhaseGuarded ||
+		reloading.Current.StartupGuard.KernelState != reconcile.StartupGuardKernelActive ||
+		reloading.Current.StartupGuard.RuntimePause == nil ||
+		reloading.Current.StartupGuard.RuntimePause.Phase != "held" {
+		t.Fatalf("in-flight daemon status = %#v", reloading.Current)
+	}
+	close(releaseFirst)
+	failed := waitForDaemonState(t, runDir, "degraded")
+	if failed.Current == nil ||
+		failed.Current.Reconcile.Phase != reconcile.ReconcilePhaseFailed ||
+		!strings.Contains(failed.Current.Reconcile.Error, "simulated loader failure") ||
+		failed.Current.StartupGuard.KernelState != reconcile.StartupGuardKernelActive ||
+		failed.Current.StartupGuard.RuntimePause.Phase != "held" {
+		t.Fatalf("failed daemon status = %#v", failed.Current)
+	}
+
+	recovered, err := RequestReload(t.Context(), runDir, opts.ConfigPath, 2*time.Second)
+	if err != nil {
+		t.Fatalf("recovery reload request: %v", err)
+	}
+	if recovered.Current == nil || recovered.State != "active" ||
+		recovered.Current.Reconcile.Phase != reconcile.ReconcilePhaseActive ||
+		recovered.Current.StartupGuard.KernelState != reconcile.StartupGuardKernelAbsent ||
+		recovered.Current.StartupGuard.RuntimePause.Phase != "open" {
+		t.Fatalf("recovered daemon status = %#v", recovered)
+	}
+
+	cancelRun()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestDaemonProgressStatusMode(t *testing.T) {
+	enabled := true
+	disabled := false
+	for _, test := range []struct {
+		name         string
+		setting      *bool
+		wantProgress bool
+	}{
+		{name: "default", wantProgress: true},
+		{name: "explicit-enabled", setting: &enabled, wantProgress: true},
+		{name: "explicit-disabled", setting: &disabled, wantProgress: false},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			runDir := t.TempDir()
+			leasePath := filepath.Join(t.TempDir(), "daemon.lease")
+			maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+			hooks := successfulRunHooks(leasePath, maintenancePath)
+			var gotProgress bool
+			hooks.reload = func(_ context.Context, opts reconcile.Options) (*reconcile.Result, error) {
+				gotProgress = opts.Progress != nil
+				observation := testLiveObservation(
+					reconcile.ReconcilePhaseActive,
+					reconcile.StartupGuardKernelAbsent,
+					"open",
+				)
+				if opts.Progress != nil {
+					opts.Progress(observation)
+				}
+				return &reconcile.Result{
+					State: &control.State{}, Action: "reload", Observation: &observation,
+				}, nil
+			}
+			opts := testOptions(runDir, leasePath, maintenancePath, hooks)
+			opts.Once = true
+			opts.ProgressStatus = test.setting
+			if err := Run(t.Context(), opts); err != nil {
+				t.Fatal(err)
+			}
+			if gotProgress != test.wantProgress {
+				t.Fatalf("Progress present = %t, want %t", gotProgress, test.wantProgress)
+			}
+			status, err := ReadStatus(runDir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if status.State != "active" || status.LastResult == nil ||
+				status.LastResult.Action != "reload" || status.Current == nil {
+				t.Fatalf("final status was not published normally: %#v", status)
+			}
+		})
+	}
+}
+
+func testLiveObservation(
+	phase string,
+	guardState string,
+	pausePhase string,
+) reconcile.Observation {
+	now := time.Now()
+	return reconcile.Observation{
+		ObservationTime: now,
+		Reconcile: reconcile.ReconcileStatus{
+			Phase: phase, Since: now, ObservationTime: now,
+		},
+		StartupGuard: reconcile.StartupGuardStatus{
+			Mode: "nft-temporary-drop", KernelState: guardState, ObservationTime: now,
+			RuntimePause: &dataplane.StartupGuardPauseStatus{
+				Phase: pausePhase, Reason: "startup_guard", Since: now, ObservationTime: now,
+			},
+		},
+	}
+}
+
 func TestReloadStatusWriteFailureIsPersistedAndReturned(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
-	hooks := successfulRunHooks(leasePath)
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
+	hooks := successfulRunHooks(leasePath, maintenancePath)
 	var writes atomic.Int32
 	hooks.writeStatus = func(dir string, status Status) error {
 		if writes.Add(1) == 3 {
@@ -1277,7 +1597,7 @@ func TestReloadStatusWriteFailureIsPersistedAndReturned(t *testing.T) {
 		}
 		return writeStatus(dir, status)
 	}
-	opts := testOptions(runDir, leasePath, hooks)
+	opts := testOptions(runDir, leasePath, maintenancePath, hooks)
 
 	done := make(chan error, 1)
 	go func() {
@@ -1305,12 +1625,14 @@ func TestReloadStatusWriteFailureIsPersistedAndReturned(t *testing.T) {
 func TestSecondSignalRestoresDefaultBehavior(t *testing.T) {
 	runDir := t.TempDir()
 	leasePath := filepath.Join(t.TempDir(), "daemon.lease")
+	maintenancePath := filepath.Join(filepath.Dir(leasePath), "maintenance.gate")
 	cleanupStarted := filepath.Join(t.TempDir(), "cleanup-started")
 	cmd := exec.Command(os.Args[0], "-test.run=^TestDaemonSecondSignalHelper$")
 	cmd.Env = append(os.Environ(),
 		"WG_MIX_EBPF_SECOND_SIGNAL_HELPER=1",
 		"WG_MIX_EBPF_TEST_RUN_DIR="+runDir,
 		"WG_MIX_EBPF_TEST_LEASE_PATH="+leasePath,
+		"WG_MIX_EBPF_TEST_MAINTENANCE_PATH="+maintenancePath,
 		"WG_MIX_EBPF_TEST_CLEANUP_STARTED="+cleanupStarted,
 	)
 	if err := cmd.Start(); err != nil {
@@ -1356,24 +1678,30 @@ func TestDaemonSecondSignalHelper(t *testing.T) {
 	}
 	runDir := os.Getenv("WG_MIX_EBPF_TEST_RUN_DIR")
 	leasePath := os.Getenv("WG_MIX_EBPF_TEST_LEASE_PATH")
+	maintenancePath := os.Getenv("WG_MIX_EBPF_TEST_MAINTENANCE_PATH")
 	cleanupStarted := os.Getenv("WG_MIX_EBPF_TEST_CLEANUP_STARTED")
-	hooks := successfulRunHooks(leasePath)
+	hooks := successfulRunHooks(leasePath, maintenancePath)
 	hooks.stop = func(context.Context, Options, string) (*reconcile.Result, error) {
 		if err := os.WriteFile(cleanupStarted, []byte("started\n"), 0o600); err != nil {
 			return nil, err
 		}
 		select {}
 	}
-	opts := testOptions(runDir, leasePath, hooks)
+	opts := testOptions(runDir, leasePath, maintenancePath, hooks)
 	opts.ShutdownTimeout = time.Hour
 	if err := Run(context.Background(), opts); err != nil {
 		t.Fatalf("helper daemon returned before second signal: %v", err)
 	}
 }
 
-func testOptions(runDir string, leasePath string, hooks *runHooks) Options {
+func testOptions(
+	runDir string,
+	leasePath string,
+	maintenancePath string,
+	hooks *runHooks,
+) Options {
 	if hooks == nil {
-		hooks = successfulRunHooks(leasePath)
+		hooks = successfulRunHooks(leasePath, maintenancePath)
 	}
 	return Options{
 		ConfigPath:   filepath.Join(runDir, "config.yaml"),
@@ -1384,12 +1712,21 @@ func testOptions(runDir string, leasePath string, hooks *runHooks) Options {
 	}
 }
 
-func successfulRunHooks(leasePath string) *runHooks {
+func successfulRunHooks(leasePath string, maintenancePath string) *runHooks {
 	return &runHooks{
-		lifecycleLeasePath: leasePath,
-		instanceID:         testDaemonInstanceID,
+		lifecycleLeasePath:       leasePath,
+		lifecycleMaintenancePath: maintenancePath,
+		instanceID:               testDaemonInstanceID,
 		reload: func(context.Context, reconcile.Options) (*reconcile.Result, error) {
 			return &reconcile.Result{State: &control.State{}}, nil
+		},
+		observe: func(context.Context, reconcile.Options) (*reconcile.Result, error) {
+			observation := testLiveObservation(
+				reconcile.ReconcilePhaseIdle,
+				reconcile.StartupGuardKernelAbsent,
+				"open",
+			)
+			return &reconcile.Result{Observation: &observation}, nil
 		},
 		stop: func(context.Context, Options, string) (*reconcile.Result, error) {
 			return &reconcile.Result{State: &control.State{}, Action: "stop"}, nil

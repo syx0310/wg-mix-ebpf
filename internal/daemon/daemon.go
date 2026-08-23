@@ -15,9 +15,11 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/syx0310/wg-mix-ebpf/internal/buildinfo"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
+	"github.com/syx0310/wg-mix-ebpf/internal/diagnostic"
 	"github.com/syx0310/wg-mix-ebpf/internal/lockfile"
 	"github.com/syx0310/wg-mix-ebpf/internal/reconcile"
 )
@@ -41,36 +43,44 @@ type Options struct {
 	Once            bool
 	Offline         bool
 	DryRun          bool
+	// ProgressStatus controls whether reload phase observations are published
+	// to status.json. Nil preserves the production default (enabled); callers
+	// may pass an explicit false only for diagnostics and controlled benchmarks.
+	ProgressStatus *bool
 
 	hooks          *runHooks
 	lifecycleLease *lockfile.LifecycleLease
 }
 
 type Status struct {
-	PID             int               `json:"pid"`
-	ConfigPath      string            `json:"config_path"`
-	State           string            `json:"state"`
-	LastReason      string            `json:"last_reason,omitempty"`
-	LastSuccess     time.Time         `json:"last_success,omitempty"`
-	LastErrorTime   time.Time         `json:"last_error_time,omitempty"`
-	LastError       string            `json:"last_error,omitempty"`
-	LastResult      *reconcile.Result `json:"last_result,omitempty"`
-	NeedReload      bool              `json:"need_reload,omitempty"`
-	RequestProtocol int               `json:"request_protocol"`
-	InstanceID      string            `json:"instance_id"`
-	LastRequestID   string            `json:"last_request_id,omitempty"`
-	LastRequestKind string            `json:"last_request_kind,omitempty"`
+	PID             int                    `json:"pid"`
+	ConfigPath      string                 `json:"config_path"`
+	State           string                 `json:"state"`
+	Build           *buildinfo.Info        `json:"build,omitempty"`
+	LastReason      string                 `json:"last_reason,omitempty"`
+	LastSuccess     time.Time              `json:"last_success,omitempty"`
+	LastErrorTime   time.Time              `json:"last_error_time,omitempty"`
+	LastError       string                 `json:"last_error,omitempty"`
+	LastResult      *reconcile.Result      `json:"last_result,omitempty"`
+	Current         *reconcile.Observation `json:"current,omitempty"`
+	NeedReload      bool                   `json:"need_reload,omitempty"`
+	RequestProtocol int                    `json:"request_protocol"`
+	InstanceID      string                 `json:"instance_id"`
+	LastRequestID   string                 `json:"last_request_id,omitempty"`
+	LastRequestKind string                 `json:"last_request_kind,omitempty"`
 }
 
 type runHooks struct {
-	lifecycleLeasePath string
-	instanceID         string
-	acquireLease       func(string, leaseOwner) (*lifecycleLeaseHandle, error)
-	reload             func(context.Context, reconcile.Options) (*reconcile.Result, error)
-	validate           func(context.Context, reconcile.Options) (*reconcile.Result, error)
-	healthy            func(context.Context, *control.State) bool
-	stop               func(context.Context, Options, string) (*reconcile.Result, error)
-	writeStatus        func(string, Status) error
+	lifecycleLeasePath       string
+	lifecycleMaintenancePath string
+	instanceID               string
+	acquireLease             func(string, string, leaseOwner) (*lifecycleLeaseHandle, error)
+	reload                   func(context.Context, reconcile.Options) (*reconcile.Result, error)
+	validate                 func(context.Context, reconcile.Options) (*reconcile.Result, error)
+	observe                  func(context.Context, reconcile.Options) (*reconcile.Result, error)
+	healthy                  func(context.Context, *control.State) bool
+	stop                     func(context.Context, Options, string) (*reconcile.Result, error)
+	writeStatus              func(string, Status) error
 }
 
 func Run(parentCtx context.Context, opts Options) (retErr error) {
@@ -90,7 +100,12 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 	runDir := runDir(opts.RunDir)
 	hooks := hooksFor(opts)
 	leasePath := lifecycleLeasePath(opts, runDir, hooks.lifecycleLeasePath)
-	lease, err := hooks.acquireLease(leasePath, leaseOwner{
+	maintenancePath := lifecycleMaintenancePath(
+		opts,
+		runDir,
+		hooks.lifecycleMaintenancePath,
+	)
+	lease, err := hooks.acquireLease(leasePath, maintenancePath, leaseOwner{
 		PID:        os.Getpid(),
 		Action:     "daemon",
 		ConfigPath: configPath(opts.ConfigPath),
@@ -130,10 +145,12 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 		return fmt.Errorf("invalid daemon instance id %q", instanceID)
 	}
 	lastLegacyRequest := requestStamp(runDir)
+	identity := buildinfo.Current()
 	status := Status{
 		PID:             os.Getpid(),
 		ConfigPath:      configPath(opts.ConfigPath),
 		State:           "starting",
+		Build:           &identity,
 		RequestProtocol: requestProtocolVersion,
 		InstanceID:      instanceID,
 	}
@@ -182,7 +199,7 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 		finalErr := errors.Join(triggerErr, cleanupErr)
 		if finalErr != nil {
 			status.State = "degraded"
-			status.LastError = finalErr.Error()
+			status.LastError = diagnostic.ErrorText(finalErr)
 			status.LastErrorTime = time.Now()
 		} else {
 			status.State = "stopped"
@@ -214,6 +231,25 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 		}
 		return nil
 	}
+	observeCurrent := func(observeCtx context.Context) *reconcile.Observation {
+		result, err := hooks.observe(observeCtx, reconcile.Options{
+			ConfigPath:      opts.ConfigPath,
+			RunDir:          runDir,
+			StateDir:        opts.StateDir,
+			Offline:         opts.Offline,
+			DryRun:          opts.DryRun,
+			LifecycleLease:  lease,
+			ResidentRuntime: !opts.Once,
+		})
+		if result == nil || result.Observation == nil {
+			return nil
+		}
+		observation := *result.Observation
+		if err != nil {
+			observation.Reconcile.Error = diagnostic.ErrorText(err)
+		}
+		return &observation
+	}
 
 	runOnce := func(reason string) error {
 		currentConfigHash := fileHash(configPath(opts.ConfigPath))
@@ -225,6 +261,7 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 			status.LastReason = reason
 			status.LastError = "config file changed; run wg-mix-ebpf reload or systemctl reload wg-mix-ebpf to apply"
 			status.LastErrorTime = time.Now()
+			status.Current = observeCurrent(ctx)
 			if err := hooks.writeStatus(runDir, status); err != nil {
 				return fmt.Errorf("write config-changed daemon status: %w", err)
 			}
@@ -237,6 +274,10 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 				if fp == lastFingerprint {
 					if !opts.Offline && !opts.DryRun && !hooks.healthy(ctx, result.State) {
 						goto forceReload
+					}
+					preserveResidentDataplaneSnapshot(result, status.LastResult)
+					if current := observeCurrent(ctx); current != nil {
+						status.Current = current
 					}
 					status.PID = os.Getpid()
 					status.ConfigPath = configPath(opts.ConfigPath)
@@ -253,34 +294,72 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 			}
 		}
 	forceReload:
-		result, err := hooks.reload(ctx, reconcile.Options{
-			ConfigPath:     opts.ConfigPath,
-			RunDir:         runDir,
-			StateDir:       opts.StateDir,
-			Offline:        opts.Offline,
-			DryRun:         opts.DryRun,
-			LifecycleLease: lease,
-		})
+		var progressStatusErr error
+		reloadOpts := reconcile.Options{
+			ConfigPath:      opts.ConfigPath,
+			RunDir:          runDir,
+			StateDir:        opts.StateDir,
+			Offline:         opts.Offline,
+			DryRun:          opts.DryRun,
+			LifecycleLease:  lease,
+			ResidentRuntime: !opts.Once,
+		}
+		if progressStatusEnabled(opts) {
+			reloadOpts.Progress = func(observation reconcile.Observation) {
+				status.PID = os.Getpid()
+				status.ConfigPath = configPath(opts.ConfigPath)
+				status.State = "reloading"
+				status.LastReason = reason
+				status.LastError = ""
+				status.NeedReload = false
+				current := observation
+				status.Current = &current
+				if writeErr := hooks.writeStatus(runDir, status); writeErr != nil {
+					progressStatusErr = errors.Join(
+						progressStatusErr,
+						fmt.Errorf("write %s progress status: %w", reason, writeErr),
+					)
+				}
+			}
+		}
+		result, err := hooks.reload(ctx, reloadOpts)
 		status.PID = os.Getpid()
 		status.ConfigPath = configPath(opts.ConfigPath)
 		status.LastReason = reason
 		if err != nil {
 			status.State = "degraded"
-			status.LastError = err.Error()
+			status.LastError = diagnostic.ErrorText(err)
 			status.LastErrorTime = time.Now()
+			if status.Current == nil || status.Current.Reconcile.Phase != reconcile.ReconcilePhaseFailed {
+				status.Current = observeCurrent(ctx)
+				if status.Current != nil {
+					status.Current.Reconcile.Phase = reconcile.ReconcilePhaseFailed
+					status.Current.Reconcile.Since = time.Now()
+					status.Current.Reconcile.ObservationTime = time.Now()
+					status.Current.Reconcile.Error = status.LastError
+				}
+			}
 		} else {
 			status.State = "active"
 			status.LastError = ""
 			status.NeedReload = false
 			status.LastSuccess = time.Now()
 			status.LastResult = result
+			if result != nil && result.Observation != nil {
+				status.Current = result.Observation
+			} else if current := observeCurrent(ctx); current != nil {
+				status.Current = current
+			}
 			lastFingerprint = stateFingerprint(result)
 			lastConfigHash = currentConfigHash
 		}
-		if err := hooks.writeStatus(runDir, status); err != nil {
-			return fmt.Errorf("write %s daemon status: %w", reason, err)
+		if statusErr := hooks.writeStatus(runDir, status); statusErr != nil {
+			progressStatusErr = errors.Join(
+				progressStatusErr,
+				fmt.Errorf("write %s daemon status: %w", reason, statusErr),
+			)
 		}
-		return nil
+		return progressStatusErr
 	}
 
 	startupStatusErr := runOnce("startup")
@@ -438,6 +517,10 @@ func Run(parentCtx context.Context, opts Options) (retErr error) {
 	}
 }
 
+func progressStatusEnabled(opts Options) bool {
+	return opts.ProgressStatus == nil || *opts.ProgressStatus
+}
+
 type stopOutcome struct {
 	result *reconcile.Result
 	err    error
@@ -483,6 +566,9 @@ func runStopBounded(
 func dataplaneHealthy(ctx context.Context, state *control.State) bool {
 	if state == nil {
 		return false
+	}
+	if handled, healthy := dataplane.ProductionFakeTCPHealthy(ctx, state); handled {
+		return healthy
 	}
 	status, err := dataplane.Inspect(ctx, state)
 	if err != nil || status == nil || status.MapError != "" || status.ActiveGeneration == 0 {
@@ -642,6 +728,7 @@ func hooksFor(opts Options) runHooks {
 		acquireLease: acquireLifecycleLease,
 		reload:       reconcile.Reload,
 		validate:     reconcile.Validate,
+		observe:      reconcile.Status,
 		healthy:      dataplaneHealthy,
 		stop:         detachForStop,
 		writeStatus:  writeStatus,
@@ -651,6 +738,9 @@ func hooksFor(opts Options) runHooks {
 	}
 	if opts.hooks.lifecycleLeasePath != "" {
 		hooks.lifecycleLeasePath = opts.hooks.lifecycleLeasePath
+	}
+	if opts.hooks.lifecycleMaintenancePath != "" {
+		hooks.lifecycleMaintenancePath = opts.hooks.lifecycleMaintenancePath
 	}
 	if opts.hooks.instanceID != "" {
 		hooks.instanceID = opts.hooks.instanceID
@@ -663,6 +753,9 @@ func hooksFor(opts Options) runHooks {
 	}
 	if opts.hooks.validate != nil {
 		hooks.validate = opts.hooks.validate
+	}
+	if opts.hooks.observe != nil {
+		hooks.observe = opts.hooks.observe
 	}
 	if opts.hooks.healthy != nil {
 		hooks.healthy = opts.hooks.healthy
@@ -684,6 +777,16 @@ func lifecycleLeasePath(opts Options, runDir string, override string) string {
 		return filepath.Join(runDir, "daemon.lease")
 	}
 	return DefaultLifecycleLeasePath
+}
+
+func lifecycleMaintenancePath(opts Options, runDir string, override string) string {
+	if override != "" {
+		return override
+	}
+	if opts.DryRun {
+		return filepath.Join(runDir, ".daemon-maintenance.gate")
+	}
+	return DefaultLifecycleMaintenancePath
 }
 
 func ReadStatus(runDir string) (*Status, error) {
@@ -765,11 +868,20 @@ func stateFingerprint(result *reconcile.Result) string {
 	if result == nil || result.State == nil {
 		return ""
 	}
-	data, err := result.State.JSON()
+	fingerprint, err := result.State.Fingerprint()
 	if err != nil {
 		return ""
 	}
-	return string(data)
+	return fingerprint
+}
+
+func preserveResidentDataplaneSnapshot(current, previous *reconcile.Result) {
+	if current == nil || previous == nil || previous.Dataplane == nil ||
+		previous.Dataplane.Mode != "faketcp" {
+		return
+	}
+	current.Dataplane = previous.Dataplane
+	current.DataplaneError = previous.DataplaneError
 }
 
 func fileHash(path string) string {
