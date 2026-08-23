@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016
 set -euo pipefail
 
 if [[ "${EUID}" -ne 0 ]]; then
@@ -277,7 +278,7 @@ large_ping() {
   local ns="$1"
   local target="$2"
 
-  ip netns exec "${ns}" ping -c 2 -W 2 -M do -s 1900 "${target}" >/dev/null
+  ip netns exec "${ns}" ping -c 2 -W 2 -M "do" -s 1900 "${target}" >/dev/null
 }
 
 exercise_tunnel() {
