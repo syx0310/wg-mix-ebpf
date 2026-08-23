@@ -25,6 +25,10 @@ Thumbs.db
 coverage.out
 coverage.html
 
+# Python bytecode caches
+__pycache__/
+*.py[cod]
+
 # eBPF generated/build artifacts
 *.o
 *.elf

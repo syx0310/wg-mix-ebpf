@@ -35,6 +35,9 @@ fwmark_policy:
 
 runtime:
   poll_interval: 5s
+  # auto prefers TCX and falls back to classic TC on older kernels.
+  # Use tcx or classic_tc to require one backend explicitly.
+  attachment_backend: auto
   require_nonzero_fwmark: true
   strict_runtime_fwmark: true
   allow_zero_fwmark_fallback: false

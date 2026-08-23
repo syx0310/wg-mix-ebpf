@@ -64,6 +64,7 @@ fwmark_policy:
 
 runtime:
   poll_interval: 5s
+  attachment_backend: auto
   require_nonzero_fwmark: true
   strict_runtime_fwmark: true
   allow_zero_fwmark_fallback: false
@@ -161,7 +162,11 @@ ethernet
 l3
 ```
 
-Default behavior is equivalent to `auto`. Use explicit parser settings only when validating a known platform path.
+The YAML default remains `auto` for offline parsing and diagnostics. A resolved,
+online production attachment must settle on `ethernet` or `l3` before the first
+mutation; an ambiguous live path is rejected rather than guessed from packet
+bytes. Use an explicit parser for known netdev, PPPoE, VLAN, bridge and OpenWrt
+paths and validate it on the target.
 
 ## `wireguards`
 
@@ -203,7 +208,8 @@ wireguards:
       mode: udp
 ```
 
-The MVP implements `cipher` only with `transport.mode: udp`. ICMP + XOR and fakeTCP + XOR are rejected until those paths have independent checksum and wildcard-listener validation.
+The XOR cipher is implemented with `transport.mode: udp` and
+`transport.mode: faketcp`. ICMP + XOR is rejected.
 
 ### `transport`
 
@@ -256,10 +262,83 @@ server wildcard matching is intended for mixed WireGuard Echo payloads, not ordi
 server wildcard-id listener passes only bad type-word or bad length misses; valid managed ICMP WireGuard packets are still rewritten
 server preserves NAT-rewritten Echo sequence values with runtime kernel state
 raw UDP WireGuard packets to an ICMP-managed ListenPort are not a fallback path and should be dropped
-fakeTCP is intentionally not implemented
 outer IP fragmentation is unsupported; keep WireGuard MTU below the underlay fragmentation threshold
 large-packet ICMP checksum handling depends on the current skb checksum/offload shape and needs target validation
 ```
+
+Production IPv4 FakeTCP mode:
+
+```yaml
+wireguards:
+  - name: wg0
+    profile: mix-default
+    transport:
+      mode: faketcp
+      faketcp:
+        checksum_mode: partial-complete-reset-required
+        ingress_mode: xdp-generic-exact
+
+runtime:
+  attachment_backend: auto
+  checksum_backend: auto
+```
+
+FakeTCP keeps WireGuard packet boundaries and presents a TCP-shaped outer wire
+image; it is not a TCP stream. Multiple WireGuard entries may select FakeTCP;
+their policy, session, event and slow-path routing state is isolated by WGID.
+It is IPv4-only and must run in the resident daemon. The TC stage supports
+`tcx` and `classic_tc`, while every combination keeps direct generic XDP with
+exact selected-mode ownership and no replace, fallback, or libxdp chaining.
+The checksum bridge supports `kfunc` and the legacy-compatible `kprobe`
+backend. The deprecated `experimental` field is parsed and ignored, and legacy
+`xdp-required` is normalized to `xdp-generic-exact`.
+
+Backend selection is independent:
+
+```yaml
+runtime:
+  # auto | tcx | classic_tc
+  attachment_backend: auto
+  # auto | kfunc | kprobe
+  checksum_backend: auto
+```
+
+`attachment_backend: auto` prefers exact TCX when the kernel supports it and
+otherwise resolves to classic TC before any network mutation. A validated
+durable FakeTCP classic owner remains sticky during recovery. Probe errors
+other than an explicit unsupported result fail without falling back.
+
+`checksum_backend: auto` prefers the matching kfunc module/object. It may use
+kprobe only when kfunc is explicitly unsupported and the complete kprobe
+module lease, trigger, health and artifact contract is available. An explicit
+`kfunc` or `kprobe` value never falls back to the other backend. The resolved
+backend does not change while a resident generation is active.
+
+The released kprobe module currently targets Linux x86_64. On arm64, select
+`kfunc` (or let `auto` select it); `kprobe` remains unavailable until its
+architecture-specific kernel calling convention is separately validated.
+
+The kfunc path requires administrator-provisioned
+`wg_mix_faketcp_checksum`. The kprobe path requires
+`wg_mix_faketcp_checksum_kprobe` and a per-runtime FD lease. The module accepts
+multiple simultaneous leases and issues a distinct fixed cookie to each
+runtime; a runtime may use only the cookie bound to its retained FD and cannot
+fall back after activation. Both paths retain the complete checksum, PMTU and
+UDP-GSO-to-TCP-GSO contract; a reduced `faketcp-lite` path is not selected
+automatically.
+
+FakeTCP requires a fixed non-zero `ListenPort` and
+`policy.startup_fail_mode: fail_closed_for_managed_flows`. The default guarded
+profile uses `startup_guard.mode: nft-temporary-drop`; the same fixed port is
+guarded as UDP and TCP until the complete resident runtime passes its final
+health check. An administrator may explicitly choose
+`startup_guard.mode: none`, but that high-risk profile has no startup/reload
+leak or host-stack RST guarantee and is never selected automatically.
+
+Multiple FakeTCP WireGuard entries use one shared set of TC and XDP programs
+per underlay. Every entry must have a distinct, fixed non-zero `ListenPort` in
+its WireGuard configuration. An ambiguous managed port, fwmark, or WGID route
+is rejected before attachment; the error identifies the conflicting entries.
 
 Regression entry points:
 
@@ -299,8 +378,7 @@ ingress:
 Current XOR is not multiplexing. It does not combine multiple WireGuard
 interfaces or flows into one outer flow, and it does not implement udp2raw
 framing. It is a UDP-only payload transform layered on top of the type-word
-rewrite. Config validation rejects ICMP + XOR and any future fakeTCP + XOR
-combination in the MVP.
+rewrite. Config validation rejects ICMP + XOR; UDP and FakeTCP accept XOR.
 
 Supported fields:
 
@@ -390,14 +468,22 @@ PostUp = wg set %i fwmark 0x10000001
 
 The `PostUp` form is useful for launch modes where the config parser can see the expected mark but another tool applies it at interface startup.
 
-`ListenPort` may be present or omitted in the WireGuard config. The dataplane uses the runtime listen port, not the static config value:
+For UDP and ICMP, `ListenPort` may be present or omitted in the WireGuard
+config and the dataplane uses the runtime value. FakeTCP is stricter: it
+requires the static config value to be present and non-zero, and the live
+WireGuard interface must report that exact same port. The daemon rejects a
+mismatch before the dataplane loader can detach or attach anything, so the
+startup guard always covers the exact UDP and TCP wire port:
 
 ```ini
 [Interface]
 ListenPort = 52000
 ```
 
-If WireGuard chooses a random listen port, run `wg-mix-ebpf reload` after the interface is up so the agent can read the runtime value.
+For UDP and ICMP only, if WireGuard chooses a random listen port, run
+`wg-mix-ebpf reload` after the interface is up so the agent can read the
+runtime value. FakeTCP does not permit a random or externally changed live
+port; update the WireGuard interface to the configured fixed port first.
 
 For NAT-side peers, configure WireGuard persistent keepalive in the WireGuard config or with your WireGuard management tool. `wg-mix-ebpf` does not modify peer settings, but a NAT-side peer normally needs keepalive to keep its endpoint reachable:
 
@@ -549,17 +635,54 @@ nft-temporary-drop
 none
 ```
 
-`nft-temporary-drop` installs temporary nft rules before dataplane reload and removes them after successful reload. If reload fails after the guard is applied, the guard remains in place.
+`nft-temporary-drop` installs temporary nft rules before dataplane reload and
+removes them after successful reload. Each installation owns a random
+`wg_mix_ebpf_guard_<installation-id>` table, an owner record and exact table
+handle; there is no fixed global table-name ownership shortcut. Before a
+mutation, the complete project-table inventory must be unambiguous.
 
-`wg-mix-ebpf stop`, service stop, and uninstall remove the nft guard table as part of network-impact cleanup. `guard-cleanup` can be used to remove a leftover guard explicitly.
+`wg-mix-ebpf stop`, service stop, and uninstall remove the exactly owned guard
+table as part of network-impact cleanup. `guard-cleanup` is the explicit stale
+owner recovery entrypoint and validates owner, marker, handle and inventory;
+it does not delete a table merely because its name matches the project prefix.
 
-When a guard table already exists, reload submits its deletion and the complete replacement table in one nft batch. nft validates and commits that batch atomically, so an invalid replacement leaves the previous guard in place. If the batch reports that the old table is absent, reload retries with a create-only script. Other replacement errors do not trigger that fallback.
+Guard results are typed as `unchanged`, `active`, `absent` or `unknown`.
+Preflight failures proven not to have mutated nft release only the barrier
+acquired by that attempt. `active` or `unknown` remains fail-closed. A cleanup
+command error accompanied by a complete owner/project inventory proving
+`absent` is retained as a warning, but does not leave the runtime paused.
 
 The first guard plan uses the configured fwmarks, before runtime state is required. Reload then samples every configured WireGuard runtime device and atomically expands the plan to the union of configured and observed runtime fwmarks before full state validation or dataplane apply. The same runtime snapshot is used for validation. If strict fwmark validation rejects a mismatch, all runtime marks observed during that reload remain guarded.
 
-Stop cleanup always attempts to delete the fixed `inet wg_mix_ebpf_guard` table, even when the current config says `startup_guard.mode: none` or the config file is unavailable but attach-state exists. A missing table is idempotent; a missing `nft` binary or any other cleanup error is reported, and cleanup is not reported as successful.
+External nft JSON is strict for duplicate keys and security-critical
+family/name/handle/comment identity, while unknown non-critical metadata is
+ignored. The program uses a trusted absolute nft path, a minimal PATH and the C
+locale. The program-owned guard owner JSON remains strict-schema.
 
-`none` disables startup guard and is intended for development, controlled tests, or minimal systems without nft. In this mode, egress fail-closed behavior only starts after the TC/eBPF dataplane is attached and maps are populated.
+`none` is an explicit high-risk opt-in for UDP, ICMP and FakeTCP. It is intended
+for controlled tests or deliberately accepted minimal deployments and is never
+an automatic fallback. The daemon does not execute the nft binary in this mode,
+but it still performs a fresh read-only `NETLINK_NETFILTER`
+`NFT_MSG_GETTABLE` kernel inventory with a five-second upper bound; it does not
+skip ownership inspection. Egress fail-closed behavior begins only after TC/eBPF
+maps and attachments are authoritative; FakeTCP additionally lacks protection
+against host-stack TCP interference until its TC/XDP/checksum runtime is
+healthy. Status reports `startup_guard.mode=none`,
+`startup_guard.kernel_state=disabled`, `startup_guard.observation_time` and
+`startup_guard.risk`. If a resident pause snapshot exists it is nested as
+`startup_guard.runtime_pause={phase,reason,since?,observation_time}`; the
+phase/reason enums are documented in [operations.md](operations.md).
+
+Before switching to `none`, use a working nft inspection path to prove there is
+no owned, legacy or extra project guard table. A securely validated final v2
+owner record may remain after normal `guard-cleanup`; it is the installation's
+stable identity and is accepted only when the fresh kernel inventory is empty.
+Legacy v1, pending publication, malformed or identity-mismatched v2 ownership
+state remains a recovery error. If no-nft preflight observes any project table,
+startup fails before dataplane mutation and requires explicit recovery.
+For explicit mode `none`, `doctor` treats `cmd.nft` as non-required/non-failing
+but requires `startup_guard.inventory=PASS`; guarded mode continues to require
+the trusted nft binary.
 
 ## `underlay_overlap_policy`
 
@@ -568,6 +691,23 @@ Supported value:
 ```yaml
 underlay_overlap_policy: reject
 ```
+
+`runtime.attachment_backend` accepts `auto`, `tcx`, or `classic_tc`. `auto`
+performs a read-only TCX query on every attachable underlay and falls back to
+classic TC only when the kernel reports that TCX is unsupported. Permission,
+malformed-query, or ownership errors do not trigger fallback. With no
+attachable underlay and no durable classic-TC owner, `auto` is an idle no-op
+and does not persist an unprobed owner schema. A validated durable classic-TC
+owner keeps `auto` sticky across recovery and upgrades. Production TCX is
+instead process/FD-owned, as are the runtime and exact generic-XDP links; the
+pinned journal used by baseline exact TCX is not the production FakeTCP TCX
+stage. Select a different backend explicitly only after detaching the current
+backend.
+
+FakeTCP, UDP and ICMP can use either TCX or classic TC. FakeTCP additionally
+retains exact generic XDP regardless of which TC backend is selected. A
+validated durable FakeTCP classic owner keeps `auto` sticky to classic during
+recovery; an explicit backend never switches silently.
 
 This rejects duplicate underlay names. More advanced path-overlap detection is platform-specific and must be validated externally.
 
@@ -596,6 +736,13 @@ policy:
 ```
 
 The MVP only implements the shown values. Other values are rejected by static validation.
+
+`best_effort` remains accepted for UDP/ICMP compatibility, but it is rejected
+when any WireGuard selects FakeTCP. This policy decision is independent of the
+explicit startup guard mode: FakeTCP still requires
+`fail_closed_for_managed_flows` even when the administrator opts into
+`startup_guard.mode: none` and accepts that the pre-attachment window is not
+guarded.
 
 Egress is fail-closed for managed WireGuard packets. Ingress only drops packets that match a managed listener or a managed fragment policy.
 

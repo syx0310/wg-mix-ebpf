@@ -11,7 +11,8 @@ egress: standard type_word -> mixed type_word
 ingress: mixed type_word -> standard type_word
 ```
 
-With optional UDP XOR enabled, the UDP payload pipeline is:
+With optional UDP or FakeTCP XOR enabled, the payload pipeline includes the
+same bounded XOR transform around the mixed type word.
 
 ```text
 egress: standard type_word -> mixed type_word -> XOR WireGuard payload
@@ -92,7 +93,9 @@ internal/abi
   Stable Go-side ABI snapshot for BPF maps.
 
 internal/dataplane
-  Linux TC/eBPF loader, pinned-map handling, generation commit, status, and detach.
+  Linux TC/eBPF loader, pinned-map handling, generation commit, status, detach,
+  and the resident FakeTCP exact-generic-XDP runtime with selectable
+  TCX/classic TC and kfunc/kprobe backends.
 
 internal/guard
   nft startup guard generation and execution.
@@ -161,6 +164,33 @@ network receives ICMP Echo packet
   -> standard kernel WireGuard receives packet
 ```
 
+FakeTCP production flow is IPv4-only and packet-oriented:
+
+```text
+egress: WireGuard UDP -> TCX or classic TC -> mixed/XOR payload -> TCP-shaped packet
+ingress: TCP-shaped packet -> direct generic XDP -> session/control admission
+         -> TCX or classic TC -> UDP WireGuard packet
+```
+
+The runtime owns an independent embedded BPF collection, exact direct-generic
+XDP bpf_link FDs, the selected TC attachment stage, and a userspace slow path.
+TCX uses exact process-owned bpf_link FDs. Classic TC uses exact project-owned
+filters plus a durable recovery journal. Production refuses an existing XDP
+owner, libxdp chaining and replacement/fallback.
+
+Multiple FakeTCP WireGuard entries share the programs attached to an underlay.
+Managed port and policy maps select WGID; WGID is also part of the session key,
+events, control claims and EngineRouter routes. Consequently two WireGuard
+interfaces with an otherwise identical session tuple cannot share state.
+
+The checksum/GSO bridge is separate from the attachment backend. Modern
+kernels use typed kfunc calls to `wg_mix_faketcp_checksum`; legacy kernels may
+use fail-closed helper triggers intercepted by
+`wg_mix_faketcp_checksum_kprobe`. Each kprobe runtime holds its own FD lease
+and fixed cookie. The module supports multiple simultaneous runtime leases;
+each runtime validates only its cookie, trigger ABI and missed-probe count.
+Neither bridge selection changes the exact generic XDP contract.
+
 ICMP server listeners use an explicit wildcard-id flag for the `id=0` fallback entry. Exact-id listener hits still fail closed on bad mixed type words or invalid WireGuard lengths. Wildcard-id fallback hits pass packets that fail only the mixed type-word or WireGuard length checks, while still incrementing the ingress bad-type or bad-length counter, so ordinary Echo Request traffic is not dropped merely because its payload is not a managed WireGuard packet. Profile misses and generation mismatches still drop.
 
 For ICMP server mode, ingress uses the observed Echo `id` as the synthetic UDP source port. WireGuard then naturally carries that value in the return packet destination port, allowing egress to emit an Echo Reply with the same `id`.
@@ -211,9 +241,8 @@ payload obfuscation but costs one chunked load/store and checksum-diff sequence
 per processed chunk.
 
 The current XOR layer is not a mux/multiplex implementation. It does not merge
-multiple WireGuard interfaces or peer flows, does not change the outer UDP
-tuple, and is only valid with UDP transport. Config validation rejects
-ICMP+XOR and fakeTCP+XOR in the MVP.
+multiple WireGuard interfaces or peer flows. It is valid with UDP and FakeTCP;
+config validation rejects ICMP+XOR.
 
 Status exposes load/store/checksum errors and direction-specific GSO counters:
 
@@ -304,7 +333,17 @@ random ListenPort ingress: best-effort only
 
 If dataplane reload fails after the guard is applied, the guard is intentionally left in place for fail-closed behavior.
 
-Replacing an existing guard uses one nft batch containing `delete table` followed by the complete replacement table. nft commits the batch atomically; a validation or rule-creation failure therefore rolls back the delete and preserves the old guard. A missing-table error is the only condition that triggers a second, create-only batch.
+Replacing an existing guard uses one nft batch containing `delete table` followed by the complete replacement table. nft commits the batch atomically; a validation or rule-creation failure therefore rolls back the delete and preserves the old guard. A create-only batch is allowed only after a complete read-only project-table inventory proves that the exact owned table is absent. A failed exact-table query is not classified from stderr text alone: inventory proves `Absent` or a conflicting/active table, and an inventory failure remains `Unknown` and fail-closed.
+
+Explicit `startup_guard.mode: none` still performs a bounded read-only
+nf_tables inventory and repeats that inventory immediately before
+`loader.Apply`. It executes no nft binary and cannot close the remaining race
+between the last inventory and the first dataplane mutation, so it remains an
+operator-selected high-risk profile rather than an automatic fallback.
+A normal guard cleanup preserves the securely bound final v2 owner record as a
+stable installation identity. Mode `none` accepts that valid record only when
+the fresh inventory proves all project tables absent; legacy, pending,
+malformed or identity-mismatched ownership evidence remains fail-closed.
 
 Each reload reads the main configuration once and memoizes each parsed WireGuard configuration for both guard and runtime state construction. The startup guard is first generated from this config-only snapshot, which allows it to be installed before the WireGuard interface appears. Reload then samples every configured runtime device, atomically expands the guard to cover the union of configured and observed runtime fwmarks, and uses that same runtime snapshot for full state validation. A strict fwmark mismatch on any interface therefore leaves all marks observed during the reload guarded while reload returns an error.
 
@@ -428,7 +467,7 @@ The Go binary is built with cgo disabled by default.
 The TC/eBPF object is compiled separately with:
 
 ```text
-clang -target bpf
+clang -target bpfel
 ```
 
 and embedded into the Go binary by the standard build targets. Runtime machines do not need clang or kernel headers when using packaged binaries.

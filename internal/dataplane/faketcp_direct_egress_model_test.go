@@ -176,8 +176,8 @@ func TestFakeTCPDirectProjectionModelSizes(t *testing.T) {
 	}
 }
 
-// This benchmark compares only the modeled projection mechanics. B82 packet
-// profiling remains the authority for BPF cycles/instructions and acceptance.
+// This benchmark compares only the modeled projection mechanics. Controlled
+// target-host profiling remains authoritative for BPF cycles and acceptance.
 func BenchmarkFakeTCPDirectVsTokenProjectionModel(b *testing.B) {
 	var directSource fakeTCPDirectProjectionBytes
 	var fullSource fakeTCPFullProjectionBytes
