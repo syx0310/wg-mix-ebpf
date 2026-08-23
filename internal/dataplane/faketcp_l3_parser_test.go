@@ -1,0 +1,172 @@
+package dataplane
+
+import (
+	"fmt"
+	"os"
+	"strings"
+	"testing"
+
+	faketcpmodel "github.com/syx0310/wg-mix-ebpf/internal/faketcp"
+)
+
+func TestFakeTCPL3CAndGoResultContractsStaySynchronized(t *testing.T) {
+	source, err := os.ReadFile("../../bpf/wg_mix_faketcp_l3.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(source)
+	statuses := []struct {
+		name  string
+		value faketcpmodel.L3ParseStatus
+	}{
+		{"FAKETCP_L3_OK", faketcpmodel.L3ParseOK},
+		{"FAKETCP_L3_SAFE_BYPASS", faketcpmodel.L3ParseSafeBypass},
+		{"FAKETCP_L3_TRUNCATED", faketcpmodel.L3ParseTruncated},
+		{"FAKETCP_L3_MALFORMED", faketcpmodel.L3ParseMalformed},
+		{"FAKETCP_L3_UNSUPPORTED", faketcpmodel.L3ParseUnsupported},
+		{"FAKETCP_L3_FIRST_FRAGMENT", faketcpmodel.L3ParseFirstFragment},
+		{"FAKETCP_L3_NONINITIAL_FRAGMENT", faketcpmodel.L3ParseNonInitialFragment},
+		{"FAKETCP_L3_EXTENSION_TOO_DEEP", faketcpmodel.L3ParseExtensionTooDeep},
+	}
+	for _, status := range statuses {
+		want := fmt.Sprintf("#define %s %d", status.name, status.value)
+		if !strings.Contains(text, want) {
+			t.Fatalf("C/Go L3 result ABI missing %q", want)
+		}
+	}
+	for _, want := range []string{
+		"struct faketcp_l3_info",
+		"__u32 l3_len;",
+		"__u32 l4_off;",
+		"__u32 l4_len;",
+		"__u16 l3_header_len;",
+		"__u16 l4_header_len;",
+		"__u16 fragment_offset_bytes;",
+		"FAKETCP_L3_MAX_EXTENSION_HEADERS 8",
+		"FAKETCP_L3_MAX_EXTENSION_BYTES 512",
+		"iph->version != 4",
+		"ihl = (__u32)iph->ihl * 4",
+		"fragment & IP_RESERVED",
+		"ip6->version != 6",
+		"next_header == NEXTHDR_FRAGMENT",
+		"next_header == NEXTHDR_AUTH",
+		"depth <= FAKETCP_L3_MAX_EXTENSION_HEADERS",
+		"faketcp_managed_transform_status",
+		"info->l3_header_len != sizeof(struct iphdr)",
+	} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("bounded L3 parser contract missing %q", want)
+		}
+	}
+}
+
+func TestFakeTCPL3ParserIsSingleSharedTCAndXDPContract(t *testing.T) {
+	mainSource, err := os.ReadFile("../../bpf/wg_mix_faketcp.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	parserSource, err := os.ReadFile("../../bpf/wg_mix_faketcp_l3.h")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tcSource, err := os.ReadFile("../../bpf/wg_mix_tc.c")
+	if err != nil {
+		t.Fatal(err)
+	}
+	main := string(mainSource)
+	parser := string(parserSource)
+	tc := string(tcSource)
+
+	if strings.Count(parser, "faketcp_parse_l3(void *data") != 1 {
+		t.Fatal("FakeTCP must expose exactly one shared L3 parser entry point")
+	}
+	for _, want := range []string{
+		"#include \"wg_mix_faketcp_l3.h\"",
+		"rc = faketcp_parse_l3(data, data_end, skb->len, info->ip_off",
+		"parse_rc = faketcp_parse_l3(data, data_end, frame_len, l3_off, family, l3)",
+		"parser_mode == PARSER_L3",
+		"parser_mode != PARSER_ETHERNET",
+		"rc = faketcp_managed_transform_status(l3, IPPROTO_UDP)",
+		"faketcp_managed_transform_status(l3, l3->transport_protocol)",
+		"sizeof(struct iphdr) + sizeof(struct udphdr)",
+		"l3->l4_off + sizeof(*udp)",
+		"struct faketcp_xdp_ipv4_tcp_snapshot *headers;",
+		"faketcp_xdp_load_ipv4_tcp_snapshot(",
+		"bpf_xdp_store_bytes(xdp, l3->l3_off, new_ip, sizeof(*new_ip))",
+	} {
+		if !strings.Contains(main, want) && !strings.Contains(tc, want) {
+			t.Fatalf("TC/XDP shared parser integration missing %q", want)
+		}
+	}
+	for _, removed := range []string{
+		"faketcp_xdp_ipv6_policy",
+		"struct faketcp_ipv6_extension",
+		"struct faketcp_ipv6_fragment",
+		"iph->ihl != 5",
+		"struct faketcp_ipv4_checksum_delta",
+		"faketcp_xdp_update_ipv4_header",
+		"l3->l3_header_len + sizeof(struct udphdr)",
+	} {
+		if strings.Contains(main, removed) {
+			t.Fatalf("obsolete independent parser path remains: %q", removed)
+		}
+	}
+	if !strings.Contains(tc, "faketcp_revalidate_tc_ingress_l3(skb, &info, &faketcp_l3) !=") {
+		t.Fatal("TC ingress did not revalidate the XDP-decoded packet with the shared L3 contract")
+	}
+
+	egressStart := strings.Index(tc, "int wg_mix_egress(struct __sk_buff *skb)")
+	egressEnd := strings.Index(tc, "SEC(\"classifier/ingress\")")
+	if egressStart < 0 || egressEnd <= egressStart {
+		t.Fatal("FakeTCP egress boundaries are missing")
+	}
+	egress := tc[egressStart:egressEnd]
+	tcParse := strings.Index(egress, "faketcp_parse_tc_egress_packet(skb, generation, faketcp_packet)")
+	tcGate := strings.Index(egress, "faketcp_tc_fixed_udp_status(faketcp_packet)")
+	prepare := strings.Index(egress, "if (faketcp_prepare_udp(")
+	xorCheckpoint := strings.Index(egress, "faketcp_egress_admission_checkpoint(")
+	directCheckpoint := strings.Index(egress, "faketcp_direct_egress_admission_checkpoint(")
+	if tcParse < 0 || tcGate < 0 || prepare < 0 || xorCheckpoint < 0 || directCheckpoint < 0 ||
+		!(tcParse < tcGate && tcGate < prepare && prepare < xorCheckpoint && prepare < directCheckpoint) {
+		t.Fatal("fixed-header transform gate must precede both admission checkpoints")
+	}
+	checkpointBodies := []string{
+		sourceSection(t, main,
+			"static __always_inline int faketcp_direct_egress_admission_checkpoint(",
+			"// Cross-program XOR and aggregate GSO use this complete checkpoint."),
+		sourceSection(t, main,
+			"static __always_inline int faketcp_egress_admission_checkpoint(",
+			"struct faketcp_gso_loop_context {"),
+	}
+	for _, checkpointBody := range checkpointBodies {
+		if !strings.Contains(checkpointBody, "faketcp_capture_first_packet(skb, info, l3") {
+			t.Fatal("first-packet capture escaped an L3-gated admission checkpoint")
+		}
+	}
+	tcIngressStart := strings.Index(tc, "int wg_mix_ingress(struct __sk_buff *skb)")
+	if tcIngressStart < 0 {
+		t.Fatal("TC ingress entry point is missing")
+	}
+	tcIngress := tc[tcIngressStart:]
+	tcIngressGate := strings.Index(tcIngress, "faketcp_revalidate_tc_ingress_l3(skb, &info, &faketcp_l3)")
+	tcMutation := strings.Index(tcIngress, "update_type_word(skb, &info")
+	if tcIngressGate < 0 || tcMutation < 0 || tcIngressGate >= tcMutation {
+		t.Fatal("fixed-header transform gate must precede TC ingress mutation")
+	}
+
+	xdp := sourceSection(t, main,
+		"faketcp_xdp_ingress_body(struct xdp_md *xdp, __u64 generation)",
+		"SEC(\"xdp\")")
+	parse := strings.Index(xdp, "parse_rc = faketcp_parse_l3")
+	lookup := strings.Index(xdp, "managed_listener = faketcp_xdp_managed_port")
+	xdpGate := strings.Index(xdp, "faketcp_managed_transform_status(l3, l3->transport_protocol)")
+	event := strings.Index(xdp, "faketcp_emit_event(&admission->key")
+	mutation := strings.Index(xdp, "bpf_xdp_store_bytes(xdp, l3->l4_off")
+	if parse < 0 || lookup < 0 || xdpGate < 0 || event < 0 || mutation < 0 ||
+		parse >= lookup || lookup >= xdpGate || xdpGate >= event || xdpGate >= mutation {
+		t.Fatal("ParseL3, managed-port lookup and the sole transform gate must precede XDP capture/mutation")
+	}
+	if fakeTCPImplementedCapabilities&fakeTCPCapabilityL3Parser == 0 {
+		t.Fatal("production L3 parser capability is not enabled")
+	}
+}
