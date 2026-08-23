@@ -11,22 +11,25 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
 	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+	"github.com/syx0310/wg-mix-ebpf/internal/buildinfo"
 	"github.com/syx0310/wg-mix-ebpf/internal/config"
 	"github.com/syx0310/wg-mix-ebpf/internal/control"
 	"github.com/syx0310/wg-mix-ebpf/internal/daemon"
 	"github.com/syx0310/wg-mix-ebpf/internal/dataplane"
 	"github.com/syx0310/wg-mix-ebpf/internal/feature"
+	"github.com/syx0310/wg-mix-ebpf/internal/guard"
 	"github.com/syx0310/wg-mix-ebpf/internal/install"
 	"github.com/syx0310/wg-mix-ebpf/internal/profile"
 	"github.com/syx0310/wg-mix-ebpf/internal/reconcile"
 	"github.com/syx0310/wg-mix-ebpf/internal/wgconfig"
 )
 
-const Version = "dev"
+const Version = buildinfo.Version
 
 func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
 	return RunWithIO(ctx, args, os.Stdin, stdout, stderr)
@@ -43,8 +46,7 @@ func RunWithIO(ctx context.Context, args []string, stdin io.Reader, stdout io.Wr
 		printUsage(stdout)
 		return nil
 	case "version":
-		fmt.Fprintln(stdout, Version)
-		return nil
+		return runVersion(args[1:], stdout)
 	case "doctor":
 		return runDoctor(ctx, args[1:], stdout)
 	case "features":
@@ -76,7 +78,52 @@ func RunWithIO(ctx context.Context, args []string, stdin io.Reader, stdout io.Wr
 	}
 }
 
+func runVersion(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("version", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	jsonOut := fs.Bool("json", false, "print build identity as JSON")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("version does not accept positional arguments")
+	}
+	if *jsonOut {
+		return writeJSON(stdout, buildinfo.Current())
+	}
+	fmt.Fprintln(stdout, Version)
+	return nil
+}
+
 func runDoctor(ctx context.Context, args []string, stdout io.Writer) error {
+	return runDoctorWithDependencies(ctx, args, stdout, doctorDependencies{
+		probe: feature.Run,
+		statConfig: func(path string) error {
+			_, err := os.Stat(path)
+			return err
+		},
+		loadConfig: config.LoadFile,
+		buildState: reconcile.BuildState,
+		inspectNoNFT: func(ctx context.Context) (guard.Outcome, error) {
+			return guard.NewProjectTablePreflight().Check(ctx)
+		},
+	})
+}
+
+type doctorDependencies struct {
+	probe        func() feature.Probe
+	statConfig   func(string) error
+	loadConfig   func(string) (*config.Config, error)
+	buildState   func(context.Context, reconcile.Options) (*config.Config, *control.State, error)
+	inspectNoNFT func(context.Context) (guard.Outcome, error)
+}
+
+func runDoctorWithDependencies(
+	ctx context.Context,
+	args []string,
+	stdout io.Writer,
+	deps doctorDependencies,
+) error {
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	configPath := fs.String("config", config.DefaultConfigPath, "path to wg-mix-ebpf config")
@@ -84,22 +131,54 @@ func runDoctor(ctx context.Context, args []string, stdout io.Writer) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	probe := feature.Run()
+	probe := deps.probe()
+	guardMode := ""
+	configChecks := make([]doctorCheck, 0, 4)
+	var state *control.State
+	if err := deps.statConfig(*configPath); err != nil {
+		configChecks = append(configChecks, doctorCheck{Name: "config", Status: "WARN", Detail: *configPath, Message: err.Error()})
+	} else if cfg, builtState, err := deps.buildState(ctx, reconcile.Options{ConfigPath: *configPath}); err != nil {
+		configChecks = append(configChecks, doctorCheck{Name: "config/runtime", Status: "FAIL", Detail: *configPath, Message: err.Error()})
+		// BuildState intentionally returns no config after a runtime-state
+		// failure. Load the already validated configuration separately so an
+		// explicit mode=none profile remains distinguishable from an unknown
+		// or invalid configuration.
+		if loaded, loadErr := deps.loadConfig(*configPath); loadErr == nil {
+			guardMode = loaded.StartupGuard.Mode
+		}
+	} else {
+		guardMode = cfg.StartupGuard.Mode
+		state = builtState
+		configChecks = append(configChecks, doctorCheck{Name: "config/runtime", Status: "PASS", Detail: *configPath})
+	}
+
 	checks := []doctorCheck{
 		statusCheck("arch", probe.SupportedArch, fmt.Sprintf("%s/%s", probe.GOOS, probe.GOARCH), "unsupported architecture outside MVP matrix"),
 		statusCheck("proc", probe.ProcAvailable, "/proc", "missing /proc"),
 		statusCheck("sysfs", probe.SysFSAvailable, "/sys/fs", "missing /sys/fs"),
 		statusCheck("bpffs", probe.BPFFSAvailable && probe.BPFFSMounted, "/sys/fs/bpf", "bpffs is not mounted on /sys/fs/bpf"),
 		commandCheck("tc", probe.Commands["tc"]),
-		commandCheck("nft", probe.Commands["nft"]),
-		commandCheck("wg", probe.Commands["wg"]),
 	}
-	if _, err := os.Stat(*configPath); err != nil {
-		checks = append(checks, doctorCheck{Name: "config", Status: "WARN", Detail: *configPath, Message: err.Error()})
-	} else if _, _, err := reconcile.BuildState(ctx, reconcile.Options{ConfigPath: *configPath}); err != nil {
-		checks = append(checks, doctorCheck{Name: "config/runtime", Status: "FAIL", Detail: *configPath, Message: err.Error()})
+	if guardMode == config.StartupGuardModeNone {
+		checks = append(checks, noNFTInventoryDoctorCheck(ctx, deps.inspectNoNFT))
 	} else {
-		checks = append(checks, doctorCheck{Name: "config/runtime", Status: "PASS", Detail: *configPath})
+		// A missing, unreadable, invalid, or otherwise unknown configuration
+		// must retain the guarded default and therefore still requires nft.
+		checks = append(checks, commandCheck("nft", probe.Commands["nft"]))
+	}
+	checks = append(checks, commandCheck("wg", probe.Commands["wg"]))
+	checks = append(checks, configChecks...)
+	if state != nil {
+		fakeTCP := false
+		for _, wg := range state.WireGuards {
+			fakeTCP = fakeTCP || wg.TransportMode == "faketcp"
+		}
+		if fakeTCP {
+			checks = append(checks, fakeTCPChecksumDoctorChecks(
+				state.ChecksumBackend,
+				dataplane.ProbeFakeTCPChecksumBackends(ctx),
+			)...)
+		}
 	}
 	if *jsonOut {
 		return writeJSON(stdout, struct {
@@ -115,6 +194,101 @@ func runDoctor(ctx context.Context, args []string, stdout io.Writer) error {
 		fmt.Fprintln(stdout, line)
 	}
 	return nil
+}
+
+func noNFTInventoryDoctorCheck(
+	ctx context.Context,
+	inspect func(context.Context) (guard.Outcome, error),
+) doctorCheck {
+	check := doctorCheck{
+		Name:   "startup_guard.no_nft_inventory",
+		Status: "FAIL",
+		Detail: "read-only NETLINK_NETFILTER project-table inventory",
+	}
+	if inspect == nil {
+		check.Message = "no read-only nf_tables inventory implementation is configured"
+		return check
+	}
+	outcome, err := inspect(ctx)
+	if err != nil {
+		check.Message = err.Error()
+		return check
+	}
+	if outcome.Observation != guard.ObservationAbsent {
+		check.Message = fmt.Sprintf(
+			"inventory observation = %q; complete project-table absence proof is required",
+			outcome.Observation,
+		)
+		return check
+	}
+	check.Status = "PASS"
+	check.Detail = "no inet wg-mix-ebpf guard tables"
+	check.Message = "HIGH RISK: startup_guard.mode=none disables the nft traffic-leak guard"
+	return check
+}
+
+func fakeTCPChecksumDoctorChecks(
+	requested string,
+	probes []dataplane.FakeTCPChecksumBackendProbe,
+) []doctorCheck {
+	if requested == "" {
+		requested = config.FakeTCPChecksumBackendAuto
+	}
+	checks := make([]doctorCheck, 0, 2+len(probes)*4)
+	probeByBackend := make(map[string]dataplane.FakeTCPChecksumBackendProbe, len(probes))
+	for _, probe := range probes {
+		probeByBackend[probe.Backend] = probe
+		status := "FAIL"
+		message := probe.Error
+		if probe.Available && probe.Equivalent {
+			status = "PASS"
+			message = ""
+		}
+		detail := probe.Module
+		if probe.Capability != "" {
+			detail += " capability=" + probe.Capability
+		}
+		checks = append(checks, doctorCheck{
+			Name:   "faketcp.checksum." + probe.Backend,
+			Status: status, Detail: strings.TrimSpace(detail), Message: message,
+		})
+		for _, requirement := range probe.Requirements {
+			checks = append(checks, doctorCheck{
+				Name:   "faketcp." + probe.Backend + "." + requirement.Name,
+				Status: requirement.Status, Detail: requirement.Detail, Message: requirement.Message,
+			})
+		}
+	}
+	selected := ""
+	selectionMessage := "no requested full-GSO checksum backend is available"
+	if requested == config.FakeTCPChecksumBackendAuto {
+		kfunc := probeByBackend[config.FakeTCPChecksumBackendKfunc]
+		if kfunc.Available && kfunc.Equivalent {
+			selected = config.FakeTCPChecksumBackendKfunc
+		} else if kfunc.Unsupported {
+			kprobe := probeByBackend[config.FakeTCPChecksumBackendKprobe]
+			if kprobe.Available && kprobe.Equivalent {
+				selected = config.FakeTCPChecksumBackendKprobe
+			}
+		} else if kfunc.Error != "" {
+			selectionMessage = "kfunc probe failed without an explicit unsupported result; refusing automatic fallback"
+		}
+	} else if probe := probeByBackend[requested]; probe.Available && probe.Equivalent {
+		selected = requested
+	}
+	selection := doctorCheck{
+		Name:    "faketcp.checksum.selection",
+		Status:  "FAIL",
+		Detail:  "requested=" + requested,
+		Message: selectionMessage,
+	}
+	if selected != "" {
+		selection.Status = "PASS"
+		selection.Detail += " selected=" + selected
+		selection.Message = ""
+	}
+	checks = append(checks, selection)
+	return checks
 }
 
 type doctorCheck struct {
@@ -145,10 +319,21 @@ func runInstall(ctx context.Context, args []string, stdout io.Writer) error {
 	system := fs.String("system", "", "init system override: systemd, openwrt, unknown")
 	enable := fs.Bool("enable", false, "enable service without starting it")
 	dryRun := fs.Bool("dry-run", false, "print actions instead of applying them")
+	adoptExisting := fs.Bool(
+		"adopt-existing",
+		false,
+		"adopt strictly validated unmarked installation resources",
+	)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	plan, err := install.Install(ctx, install.Options{ConfigPath: *configPath, System: *system, Enable: *enable, DryRun: *dryRun})
+	plan, err := install.Install(ctx, install.Options{
+		ConfigPath:    *configPath,
+		System:        *system,
+		Enable:        *enable,
+		DryRun:        *dryRun,
+		AdoptExisting: *adoptExisting,
+	})
 	if err != nil {
 		return err
 	}
@@ -563,6 +748,14 @@ func extractBoolFlag(args []string, name string) (bool, []string, error) {
 }
 
 func runDaemon(ctx context.Context, args []string) error {
+	opts, err := parseDaemonOptions(args)
+	if err != nil {
+		return err
+	}
+	return daemon.Run(ctx, opts)
+}
+
+func parseDaemonOptions(args []string) (daemon.Options, error) {
 	fs := flag.NewFlagSet("run", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	configPath := fs.String("config", config.DefaultConfigPath, "path to wg-mix-ebpf config")
@@ -572,12 +765,20 @@ func runDaemon(ctx context.Context, args []string) error {
 	once := fs.Bool("once", false, "run one reconcile and exit")
 	offline := fs.Bool("offline", false, "skip runtime and underlay reads")
 	dryRun := fs.Bool("dry-run", false, "validate/reconcile without applying dataplane")
+	progressStatus := fs.Bool(
+		"progress-status",
+		true,
+		"publish in-flight reload phase observations to daemon status",
+	)
 	openwrt := fs.Bool("openwrt", false, "OpenWrt service mode marker")
 	_ = openwrt
 	if err := fs.Parse(args); err != nil {
-		return err
+		return daemon.Options{}, err
 	}
-	return daemon.Run(ctx, daemon.Options{
+	if fs.NArg() != 0 {
+		return daemon.Options{}, fmt.Errorf("run does not accept positional arguments: %q", fs.Args())
+	}
+	return daemon.Options{
 		ConfigPath:      *configPath,
 		RunDir:          *runDir,
 		StateDir:        *stateDir,
@@ -585,7 +786,8 @@ func runDaemon(ctx context.Context, args []string) error {
 		Once:            *once,
 		Offline:         *offline,
 		DryRun:          *dryRun,
-	})
+		ProgressStatus:  progressStatus,
+	}, nil
 }
 
 func runStop(ctx context.Context, args []string, stdout io.Writer) error {
@@ -614,20 +816,176 @@ func runStop(ctx context.Context, args []string, stdout io.Writer) error {
 }
 
 func runBPFLoadTest(ctx context.Context, args []string, stdout io.Writer) error {
+	return runBPFLoadTestWithVerifierLoaders(
+		ctx,
+		args,
+		stdout,
+		dataplane.LoadObjectTestIdentity,
+		dataplane.LoadExperimentalFakeTCPObjectTestIdentity,
+		dataplane.LoadLegacy515FakeTCPObjectTestIdentity,
+		dataplane.InspectExperimentalFakeTCPObjectTestPrograms,
+		dataplane.InspectLegacy515FakeTCPObjectTestPrograms,
+		dataplane.LoadExperimentalFakeTCPObjectProgramTestIdentity,
+		dataplane.LoadLegacy515FakeTCPObjectProgramTestIdentity,
+	)
+}
+
+type bpfObjectIdentityLoader func(context.Context, string) (dataplane.ObjectIdentity, error)
+type bpfObjectProgramInspector func(context.Context, string) (dataplane.ObjectIdentity, []string, error)
+type bpfObjectProgramLoader func(context.Context, string, string) (dataplane.ObjectIdentity, error)
+
+func runBPFLoadTestWithLoaders(
+	ctx context.Context,
+	args []string,
+	stdout io.Writer,
+	loadBaseline bpfObjectIdentityLoader,
+	loadExperimental bpfObjectIdentityLoader,
+	loadLegacy515 bpfObjectIdentityLoader,
+) error {
+	return runBPFLoadTestWithVerifierLoaders(
+		ctx,
+		args,
+		stdout,
+		loadBaseline,
+		loadExperimental,
+		loadLegacy515,
+		dataplane.InspectExperimentalFakeTCPObjectTestPrograms,
+		dataplane.InspectLegacy515FakeTCPObjectTestPrograms,
+		dataplane.LoadExperimentalFakeTCPObjectProgramTestIdentity,
+		dataplane.LoadLegacy515FakeTCPObjectProgramTestIdentity,
+	)
+}
+
+func runBPFLoadTestWithVerifierLoaders(
+	ctx context.Context,
+	args []string,
+	stdout io.Writer,
+	loadBaseline bpfObjectIdentityLoader,
+	loadExperimental bpfObjectIdentityLoader,
+	loadLegacy515 bpfObjectIdentityLoader,
+	inspectExperimental bpfObjectProgramInspector,
+	inspectLegacy515 bpfObjectProgramInspector,
+	loadExperimentalProgram bpfObjectProgramLoader,
+	loadLegacy515Program bpfObjectProgramLoader,
+) error {
 	fs := flag.NewFlagSet("bpf-load-test", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	objectPath := fs.String("object", "", "path to TC/eBPF object")
+	programName := fs.String("program", "", "verifier-load one exact FakeTCP program")
+	var fakeTCP bool
+	var fakeTCPLegacy515 bool
+	fs.BoolVar(&fakeTCP, "faketcp", false, "verifier-load a separate FakeTCP object")
+	fs.BoolVar(&fakeTCP, "experimental-faketcp", false, "deprecated alias for --faketcp")
+	fs.BoolVar(&fakeTCPLegacy515, "faketcp-legacy-515", false, "verifier-load a legacy-5.15 FakeTCP object")
+	listPrograms := fs.Bool("list-programs", false, "list the validated FakeTCP object's real programs")
+	jsonOut := fs.Bool("json", false, "print load and artifact identity as JSON")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if err := dataplane.LoadObjectTest(ctx, *objectPath); err != nil {
+	if fs.NArg() != 0 {
+		return fmt.Errorf("bpf-load-test does not accept positional arguments")
+	}
+	if fakeTCP && fakeTCPLegacy515 {
+		return fmt.Errorf("--faketcp and --faketcp-legacy-515 are mutually exclusive")
+	}
+	if *listPrograms && strings.TrimSpace(*programName) != "" {
+		return fmt.Errorf("--list-programs and --program are mutually exclusive")
+	}
+	if (*listPrograms || strings.TrimSpace(*programName) != "") && !fakeTCP && !fakeTCPLegacy515 {
+		return fmt.Errorf("--list-programs and --program require a FakeTCP object mode")
+	}
+	if (fakeTCP || fakeTCPLegacy515) && strings.TrimSpace(*objectPath) == "" {
+		return fmt.Errorf("FakeTCP verifier mode requires an explicit non-empty --object path")
+	}
+
+	kind := ""
+	loader := loadBaseline
+	var inspector bpfObjectProgramInspector
+	var programLoader bpfObjectProgramLoader
+	if fakeTCP {
+		kind = dataplane.FakeTCPObjectKind
+		loader = loadExperimental
+		inspector = inspectExperimental
+		programLoader = loadExperimentalProgram
+	} else if fakeTCPLegacy515 {
+		kind = dataplane.FakeTCPLegacy515ObjectKind
+		loader = loadLegacy515
+		inspector = inspectLegacy515
+		programLoader = loadLegacy515Program
+	}
+	if *listPrograms {
+		identity, programs, err := inspector(ctx, *objectPath)
+		if err != nil {
+			return err
+		}
+		if *jsonOut {
+			return writeJSON(stdout, struct {
+				Status   string                   `json:"status"`
+				Kind     string                   `json:"kind"`
+				Build    buildinfo.Info           `json:"build"`
+				Object   dataplane.ObjectIdentity `json:"object"`
+				Programs []string                 `json:"programs"`
+			}{"inspected", kind, buildinfo.Current(), identity, programs})
+		}
+		for _, program := range programs {
+			fmt.Fprintln(stdout, program)
+		}
+		return nil
+	}
+	if strings.TrimSpace(*programName) != "" {
+		identity, err := programLoader(ctx, *objectPath, *programName)
+		if err != nil {
+			return err
+		}
+		if *jsonOut {
+			return writeJSON(stdout, struct {
+				Status  string                   `json:"status"`
+				Kind    string                   `json:"kind"`
+				Build   buildinfo.Info           `json:"build"`
+				Object  dataplane.ObjectIdentity `json:"object"`
+				Program string                   `json:"program"`
+			}{"loaded", kind, buildinfo.Current(), identity, *programName})
+		}
+		fmt.Fprintf(
+			stdout,
+			"FakeTCP BPF program verifier-loaded successfully: kind=%s program=%s source=%s sha256=%s\n",
+			kind, *programName, identity.Source, identity.SHA256,
+		)
+		return nil
+	}
+	identity, err := loader(ctx, *objectPath)
+	if err != nil {
 		return err
 	}
-	path := *objectPath
-	if path == "" {
-		path = dataplane.DisplayObjectPath("")
+	if *jsonOut {
+		return writeJSON(stdout, struct {
+			Status string                   `json:"status"`
+			Kind   string                   `json:"kind,omitempty"`
+			Build  buildinfo.Info           `json:"build"`
+			Object dataplane.ObjectIdentity `json:"object"`
+		}{
+			Status: "loaded",
+			Kind:   kind,
+			Build:  buildinfo.Current(),
+			Object: identity,
+		})
 	}
-	fmt.Fprintf(stdout, "BPF object loaded successfully: %s\n", path)
+	if fakeTCP || fakeTCPLegacy515 {
+		fmt.Fprintf(
+			stdout,
+			"FakeTCP BPF object verifier-loaded successfully: kind=%s source=%s sha256=%s\n",
+			kind,
+			identity.Source,
+			identity.SHA256,
+		)
+		return nil
+	}
+	fmt.Fprintf(
+		stdout,
+		"BPF object loaded successfully: %s (sha256=%s)\n",
+		identity.Source,
+		identity.SHA256,
+	)
 	return nil
 }
 
@@ -640,11 +998,26 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 	runDir := fs.String("run-dir", "", "daemon runtime directory")
 	stateDir := fs.String("state-dir", "", "persistent attach-state directory")
 	reason := fs.String("reason", "manual", "operation reason")
+	adoptLegacyPins := fs.Bool(
+		"adopt-legacy-pins",
+		false,
+		"explicitly adopt a validated pre-owner 11-map dataplane (reload only)",
+	)
 	_ = reason
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	opts := reconcile.Options{ConfigPath: *configPath, RunDir: daemonRunDir(*runDir), StateDir: *stateDir, Offline: *offline, DryRun: *dryRun}
+	if *adoptLegacyPins && cmd != "reload" {
+		return errors.New("--adopt-legacy-pins is only valid with reload")
+	}
+	opts := reconcile.Options{
+		ConfigPath:      *configPath,
+		RunDir:          daemonRunDir(*runDir),
+		StateDir:        *stateDir,
+		Offline:         *offline,
+		DryRun:          *dryRun,
+		AdoptLegacyPins: *adoptLegacyPins,
+	}
 
 	switch cmd {
 	case "validate":
@@ -655,28 +1028,74 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 	case "status", "dump":
 		if cmd == "status" {
 			view := struct {
-				Daemon        *daemon.Status `json:"daemon,omitempty"`
-				Desired       *control.State `json:"desired,omitempty"`
-				Dataplane     any            `json:"dataplane,omitempty"`
-				Error         string         `json:"dataplane_error,omitempty"`
-				DesiredError  string         `json:"desired_error,omitempty"`
-				DataplaneNote string         `json:"dataplane_note,omitempty"`
-			}{}
+				ClientBuild     buildinfo.Info                `json:"client_build"`
+				Daemon          *daemon.Status                `json:"daemon,omitempty"`
+				Desired         *control.State                `json:"desired,omitempty"`
+				ObservationTime time.Time                     `json:"observation_time,omitempty"`
+				Reconcile       *reconcile.ReconcileStatus    `json:"reconcile,omitempty"`
+				StartupGuard    *reconcile.StartupGuardStatus `json:"startup_guard,omitempty"`
+				Dataplane       any                           `json:"dataplane,omitempty"`
+				Error           string                        `json:"dataplane_error,omitempty"`
+				DesiredError    string                        `json:"desired_error,omitempty"`
+				DataplaneNote   string                        `json:"dataplane_note,omitempty"`
+			}{
+				ClientBuild: buildinfo.Current(),
+			}
 			if status, err := daemon.ReadStatus(*runDir); err == nil {
 				view.Daemon = status
 			}
 			result, err := reconcile.Status(ctx, opts)
+			if result != nil {
+				view.Desired = result.State
+				view.DesiredError = result.StateError
+				view.Dataplane = result.Dataplane
+				view.Error = result.DataplaneError
+				if result.Observation != nil {
+					view.ObservationTime = result.Observation.ObservationTime
+					reconcileStatus := result.Observation.Reconcile
+					guardStatus := result.Observation.StartupGuard
+					view.Reconcile = &reconcileStatus
+					view.StartupGuard = &guardStatus
+				}
+			}
 			if err != nil {
-				if view.Daemon == nil {
+				if view.Daemon == nil && result == nil {
 					return err
 				}
 				view.DesiredError = err.Error()
-				view.DataplaneNote = "desired state unavailable; showing daemon status only"
-				return writeJSON(stdout, view)
 			}
-			view.Desired = result.State
-			view.Dataplane = result.Dataplane
-			view.Error = result.DataplaneError
+			if view.Daemon != nil && daemon.IsRunning(view.Daemon) {
+				if current := view.Daemon.Current; current != nil {
+					view.ObservationTime = current.ObservationTime
+					reconcileStatus := current.Reconcile
+					view.Reconcile = &reconcileStatus
+					if view.StartupGuard == nil {
+						guardStatus := current.StartupGuard
+						view.StartupGuard = &guardStatus
+					} else {
+						// Kernel guard state is read freshly by this status client;
+						// only the owning daemon can sample the resident pause.
+						view.StartupGuard.RuntimePause = current.StartupGuard.RuntimePause
+					}
+					if current.Dataplane != nil {
+						view.Dataplane = current.Dataplane
+						view.DataplaneNote = "showing live resident daemon ownership snapshot"
+					}
+					if current.DataplaneError != "" {
+						view.Error = current.DataplaneError
+						if current.Dataplane == nil {
+							view.DataplaneNote = "resident daemon dataplane observation failed"
+						}
+					}
+				} else if view.Daemon.LastResult != nil && view.Daemon.LastResult.Dataplane != nil {
+					// Compatibility with a daemon predating live observations. It
+					// is deliberately labelled stale and never replaces the fresh
+					// guard kernel observation above.
+					view.Dataplane = view.Daemon.LastResult.Dataplane
+					view.Error = view.Daemon.LastResult.DataplaneError
+					view.DataplaneNote = "legacy daemon has no live observation; showing stale last_result dataplane snapshot"
+				}
+			}
 			return writeJSON(stdout, view)
 		}
 		result, err := reconcile.Validate(ctx, opts)
@@ -701,6 +1120,11 @@ func runStateCommand(ctx context.Context, cmd string, args []string, stdout io.W
 	case "reload":
 		if !*dryRun && !*offline {
 			if status, err := daemon.ReadStatus(*runDir); err == nil && daemon.IsRunning(status) {
+				if *adoptLegacyPins {
+					return errors.New(
+						"--adopt-legacy-pins requires a one-shot reload while the daemon is stopped",
+					)
+				}
 				if _, err := daemon.RequestReload(ctx, *runDir, *configPath, daemon.DefaultRequestTimeout); err == nil {
 					fmt.Fprintln(stdout, "daemon reload requested")
 					return nil
@@ -879,13 +1303,16 @@ Commands:
   guard-plan  print nft startup guard script
   guard-apply apply nft startup guard
   guard-cleanup remove nft startup guard table
-  bpf-load-test load BPF object and exit without TC attach or WireGuard reads
+  bpf-load-test load the baseline BPF object; modern FakeTCP uses --faketcp,
+                legacy-5.15 uses --faketcp-legacy-515, and both require --object
   features    print raw local feature probe JSON
-  version     print version
+  version     print version; use --json for source/object/ABI identity
 
 Common flags:
   --config PATH   config path (default /etc/wg-mix-ebpf/config.yaml)
   --offline       skip runtime and underlay reads where supported
   --dry-run       print external actions instead of applying them
+  --adopt-legacy-pins
+                  explicitly adopt validated pre-owner pins (reload only; daemon stopped)
 `))
 }

@@ -35,10 +35,10 @@ func TestNftScript(t *testing.T) {
 	}
 	script := plan.Script()
 	for _, want := range []string{
-		"add table inet wg_mix_ebpf_guard",
-		"add chain inet wg_mix_ebpf_guard output",
-		"add chain inet wg_mix_ebpf_guard input",
-		"add rule inet wg_mix_ebpf_guard output counter drop",
+		"create table inet " + planTablePlaceholder,
+		"add chain inet " + planTablePlaceholder + " output",
+		"add chain inet " + planTablePlaceholder + " input",
+		"add rule inet " + planTablePlaceholder + " output counter drop",
 	} {
 		if !strings.Contains(script, want) {
 			t.Fatalf("script missing %q:\n%s", want, script)
@@ -46,16 +46,16 @@ func TestNftScript(t *testing.T) {
 	}
 }
 
-func TestReplacementScriptDeletesAndAddsInOneBatch(t *testing.T) {
+func TestReplacementScriptIsNonExecutableOwnershipTemplate(t *testing.T) {
 	plan := NftPlan{
 		Table: TableName,
 		Rules: []string{"add rule inet wg_mix_ebpf_guard output counter drop"},
 	}
 	script := plan.ReplacementScript()
-	deleteAt := strings.Index(script, "delete table inet wg_mix_ebpf_guard")
-	addAt := strings.Index(script, "add table inet wg_mix_ebpf_guard")
-	if deleteAt < 0 || addAt < 0 || deleteAt > addAt {
-		t.Fatalf("replacement must delete then add in one script:\n%s", script)
+	if strings.Contains(script, "delete table inet "+TableName) ||
+		!strings.Contains(script, planTablePlaceholder) ||
+		!strings.Contains(script, "validated table handle") {
+		t.Fatalf("replacement dry-run must require runtime ownership validation:\n%s", script)
 	}
 }
 
@@ -68,5 +68,22 @@ func TestBuildNftPlanDoesNotEmbedWireGuardNameInComment(t *testing.T) {
 	})
 	if strings.Contains(plan.Script(), untrustedName) {
 		t.Fatalf("script contains untrusted WireGuard name:\n%s", plan.Script())
+	}
+}
+
+func TestBuildNftPlanFakeTCPBlocksTCPAndOriginalUDP(t *testing.T) {
+	plan := BuildNftPlan(&control.State{
+		WireGuards: []control.WireGuardState{{
+			Name:             "wg0",
+			ConfigFwMark:     0x10000002,
+			ConfigListenPort: 443,
+			TransportMode:    "faketcp",
+		}},
+	})
+	joined := strings.Join(plan.Rules, "\n")
+	for _, want := range []string{"input udp dport 443", "input tcp dport 443"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("missing %q in FakeTCP guard:\n%s", want, joined)
+		}
 	}
 }
