@@ -5,6 +5,8 @@ import (
 	"crypto/md5"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/binary"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -28,16 +30,18 @@ type BuildOptions struct {
 type WGConfigLoader func(path string) (*wgconfig.Interface, error)
 
 type State struct {
-	Generation       uint64              `json:"generation"`
-	Profiles         []ProfileState      `json:"profiles"`
-	Ciphers          []CipherState       `json:"ciphers,omitempty"`
-	WireGuards       []WireGuardState    `json:"wireguards"`
-	Underlays        []UnderlayState     `json:"underlays"`
-	ManagedFwmarks   []ManagedFwmarkRule `json:"managed_fwmarks"`
-	EgressRules      []EgressRule        `json:"egress_rules"`
-	IngressListeners []IngressListener   `json:"ingress_listeners"`
-	ICMPListeners    []ICMPListener      `json:"icmp_listeners,omitempty"`
-	Warnings         []string            `json:"warnings,omitempty"`
+	Generation        uint64              `json:"generation"`
+	AttachmentBackend string              `json:"attachment_backend"`
+	ChecksumBackend   string              `json:"checksum_backend"`
+	Profiles          []ProfileState      `json:"profiles"`
+	Ciphers           []CipherState       `json:"ciphers,omitempty"`
+	WireGuards        []WireGuardState    `json:"wireguards"`
+	Underlays         []UnderlayState     `json:"underlays"`
+	ManagedFwmarks    []ManagedFwmarkRule `json:"managed_fwmarks"`
+	EgressRules       []EgressRule        `json:"egress_rules"`
+	IngressListeners  []IngressListener   `json:"ingress_listeners"`
+	ICMPListeners     []ICMPListener      `json:"icmp_listeners,omitempty"`
+	Warnings          []string            `json:"warnings,omitempty"`
 }
 
 type ProfileState struct {
@@ -62,22 +66,38 @@ type CipherState struct {
 }
 
 type WireGuardState struct {
-	ID                    uint32 `json:"id"`
-	Name                  string `json:"name"`
-	ConfigPath            string `json:"config_path"`
-	Profile               string `json:"profile"`
-	ProfileID             uint32 `json:"profile_id"`
-	Cipher                string `json:"cipher,omitempty"`
-	CipherID              uint32 `json:"cipher_id,omitempty"`
-	ConfigFwMark          uint32 `json:"config_fwmark"`
-	ConfigListenPort      uint16 `json:"config_listen_port,omitempty"`
-	RuntimeFirewallMark   uint32 `json:"runtime_firewall_mark,omitempty"`
-	RuntimeListenPort     uint16 `json:"runtime_listen_port,omitempty"`
-	RuntimeIfIndex        int    `json:"runtime_ifindex,omitempty"`
-	RuntimeStateAvailable bool   `json:"runtime_state_available"`
-	TransportMode         string `json:"transport_mode"`
-	ICMPRole              string `json:"icmp_role,omitempty"`
-	ICMPID                uint16 `json:"icmp_id,omitempty"`
+	ID                              uint32 `json:"id"`
+	Name                            string `json:"name"`
+	ConfigPath                      string `json:"config_path"`
+	Profile                         string `json:"profile"`
+	ProfileID                       uint32 `json:"profile_id"`
+	Cipher                          string `json:"cipher,omitempty"`
+	CipherID                        uint32 `json:"cipher_id,omitempty"`
+	ConfigFwMark                    uint32 `json:"config_fwmark"`
+	ConfigListenPort                uint16 `json:"config_listen_port,omitempty"`
+	RuntimeFirewallMark             uint32 `json:"runtime_firewall_mark,omitempty"`
+	RuntimeListenPort               uint16 `json:"runtime_listen_port,omitempty"`
+	RuntimeIfIndex                  int    `json:"runtime_ifindex,omitempty"`
+	RuntimeStateAvailable           bool   `json:"runtime_state_available"`
+	TransportMode                   string `json:"transport_mode"`
+	ICMPRole                        string `json:"icmp_role,omitempty"`
+	ICMPID                          uint16 `json:"icmp_id,omitempty"`
+	FakeTCPChecksumMode             string `json:"faketcp_checksum_mode,omitempty"`
+	FakeTCPIngressMode              string `json:"faketcp_ingress_mode,omitempty"`
+	FakeTCPSessionCapacity          uint32 `json:"faketcp_session_capacity,omitempty"`
+	FakeTCPMaxHalfOpenSessions      uint32 `json:"faketcp_max_half_open_sessions,omitempty"`
+	FakeTCPMaxHalfOpenPerSource     uint32 `json:"faketcp_max_half_open_per_source,omitempty"`
+	FakeTCPSYNRateIntervalNanos     int64  `json:"faketcp_syn_rate_interval_nanos,omitempty"`
+	FakeTCPSYNBurst                 uint32 `json:"faketcp_syn_burst,omitempty"`
+	FakeTCPSYNBurstPerSource        uint32 `json:"faketcp_syn_burst_per_source,omitempty"`
+	FakeTCPSYNSourceLedgerCapacity  uint32 `json:"faketcp_syn_source_ledger_capacity,omitempty"`
+	FakeTCPSYNSourceLedgerTTLNanos  int64  `json:"faketcp_syn_source_ledger_ttl_nanos,omitempty"`
+	FakeTCPMaxPendingFlows          uint32 `json:"faketcp_max_pending_flows,omitempty"`
+	FakeTCPMaxPendingPacketsPerFlow uint32 `json:"faketcp_max_pending_packets_per_flow,omitempty"`
+	FakeTCPMaxPendingBytes          uint32 `json:"faketcp_max_pending_bytes,omitempty"`
+	FakeTCPHandshakeTimeoutNanos    int64  `json:"faketcp_handshake_timeout_nanos,omitempty"`
+	FakeTCPKeepaliveIntervalNanos   int64  `json:"faketcp_keepalive_interval_nanos,omitempty"`
+	FakeTCPIdleTimeoutNanos         int64  `json:"faketcp_idle_timeout_nanos,omitempty"`
 }
 
 type FwmarkMismatchError struct {
@@ -138,6 +158,7 @@ type IngressListener struct {
 	CipherID        uint32 `json:"cipher_id,omitempty"`
 	WGID            uint32 `json:"wg_id"`
 	Action          string `json:"action"`
+	TransportMode   string `json:"transport_mode,omitempty"`
 }
 
 type ICMPListener struct {
@@ -163,6 +184,33 @@ func (s *State) JSON() ([]byte, error) {
 	return json.MarshalIndent(s, "", "  ")
 }
 
+// Fingerprint returns a non-reversible digest of every control-state input,
+// including cipher bytes deliberately omitted from JSON/status output. It is
+// safe to persist in daemon bookkeeping and ensures a secret-only rotation
+// triggers reconciliation without ever rendering the key itself.
+func (s *State) Fingerprint() (string, error) {
+	if s == nil {
+		return "", errors.New("fingerprint control state: state is nil")
+	}
+	public, err := json.Marshal(s)
+	if err != nil {
+		return "", fmt.Errorf("fingerprint control state: marshal projection: %w", err)
+	}
+	hash := sha256.New()
+	_, _ = hash.Write([]byte("wg-mix-ebpf/control-state-fingerprint/v1\x00"))
+	var size [8]byte
+	binary.BigEndian.PutUint64(size[:], uint64(len(public)))
+	_, _ = hash.Write(size[:])
+	_, _ = hash.Write(public)
+	for _, cipher := range s.Ciphers {
+		var identity [4]byte
+		binary.BigEndian.PutUint32(identity[:], cipher.ID)
+		_, _ = hash.Write(identity[:])
+		_, _ = hash.Write(cipher.Key[:])
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
 func BuildState(ctx context.Context, cfg *config.Config, rt runtime.Provider, resolver underlay.Resolver, loadWG WGConfigLoader, opts BuildOptions) (*State, error) {
 	if loadWG == nil {
 		loadWG = wgconfig.ParseFile
@@ -172,7 +220,11 @@ func BuildState(ctx context.Context, cfg *config.Config, rt runtime.Provider, re
 		return nil, err
 	}
 
-	state := &State{Generation: 1}
+	state := &State{
+		Generation:        1,
+		AttachmentBackend: cfg.Runtime.AttachmentBackend,
+		ChecksumBackend:   cfg.Runtime.ChecksumBackend,
+	}
 	profileIDs := assignProfileIDs(compiledProfiles)
 	for _, name := range sortedProfileNames(compiledProfiles) {
 		compiled := compiledProfiles[name]
@@ -208,6 +260,9 @@ func BuildState(ctx context.Context, cfg *config.Config, rt runtime.Provider, re
 		}
 		state.WireGuards = append(state.WireGuards, *wgState)
 	}
+	if err := validateFakeTCPUnderlayParsers(state); err != nil {
+		return nil, err
+	}
 	if !opts.Offline {
 		state.buildRules(cfg)
 		if err := state.validateRuleUniqueness(); err != nil {
@@ -215,6 +270,28 @@ func BuildState(ctx context.Context, cfg *config.Config, rt runtime.Provider, re
 		}
 	}
 	return state, nil
+}
+
+func validateFakeTCPUnderlayParsers(state *State) error {
+	hasFakeTCP := false
+	for _, wg := range state.WireGuards {
+		if wg.TransportMode == "faketcp" {
+			hasFakeTCP = true
+			break
+		}
+	}
+	if !hasFakeTCP {
+		return nil
+	}
+	for _, candidate := range state.Underlays {
+		if candidate.Role == "parse_only" || candidate.Role == "disabled" {
+			continue
+		}
+		if candidate.Resolved && candidate.Parser != "ethernet" && candidate.Parser != "l3" {
+			return fmt.Errorf("faketcp underlay %q must select parser:ethernet or parser:l3; parser %q is ambiguous", candidate.Name, candidate.Parser)
+		}
+	}
+	return nil
 }
 
 func buildUnderlayStates(ctx context.Context, cfg *config.Config, resolver underlay.Resolver, opts BuildOptions) ([]UnderlayState, error) {
@@ -293,17 +370,33 @@ func buildWireGuardState(ctx context.Context, cfg *config.Config, wg config.Wire
 	}
 
 	state := &WireGuardState{
-		ID:            wgID,
-		Name:          wg.Name,
-		ConfigPath:    wg.Config,
-		Profile:       wg.Profile,
-		ProfileID:     profileID,
-		Cipher:        wg.Cipher,
-		CipherID:      cipherID,
-		ConfigFwMark:  *parsed.FwMark,
-		TransportMode: wg.Transport.Mode,
-		ICMPRole:      wg.Transport.ICMP.Role,
-		ICMPID:        wg.Transport.ICMP.ID,
+		ID:                              wgID,
+		Name:                            wg.Name,
+		ConfigPath:                      wg.Config,
+		Profile:                         wg.Profile,
+		ProfileID:                       profileID,
+		Cipher:                          wg.Cipher,
+		CipherID:                        cipherID,
+		ConfigFwMark:                    *parsed.FwMark,
+		TransportMode:                   wg.Transport.Mode,
+		ICMPRole:                        wg.Transport.ICMP.Role,
+		ICMPID:                          wg.Transport.ICMP.ID,
+		FakeTCPChecksumMode:             wg.Transport.FakeTCP.ChecksumMode,
+		FakeTCPIngressMode:              wg.Transport.FakeTCP.IngressMode,
+		FakeTCPSessionCapacity:          wg.Transport.FakeTCP.SessionCapacity,
+		FakeTCPMaxHalfOpenSessions:      wg.Transport.FakeTCP.MaxHalfOpenSessions,
+		FakeTCPMaxHalfOpenPerSource:     wg.Transport.FakeTCP.MaxHalfOpenPerSource,
+		FakeTCPSYNRateIntervalNanos:     wg.Transport.FakeTCP.SYNRateInterval.Duration.Nanoseconds(),
+		FakeTCPSYNBurst:                 wg.Transport.FakeTCP.SYNBurst,
+		FakeTCPSYNBurstPerSource:        wg.Transport.FakeTCP.SYNBurstPerSource,
+		FakeTCPSYNSourceLedgerCapacity:  wg.Transport.FakeTCP.SYNSourceLedgerCapacity,
+		FakeTCPSYNSourceLedgerTTLNanos:  wg.Transport.FakeTCP.SYNSourceLedgerTTL.Duration.Nanoseconds(),
+		FakeTCPMaxPendingFlows:          wg.Transport.FakeTCP.MaxPendingFlows,
+		FakeTCPMaxPendingPacketsPerFlow: wg.Transport.FakeTCP.MaxPendingPacketsPerFlow,
+		FakeTCPMaxPendingBytes:          wg.Transport.FakeTCP.MaxPendingBytes,
+		FakeTCPHandshakeTimeoutNanos:    wg.Transport.FakeTCP.HandshakeTimeout.Duration.Nanoseconds(),
+		FakeTCPKeepaliveIntervalNanos:   wg.Transport.FakeTCP.KeepaliveInterval.Duration.Nanoseconds(),
+		FakeTCPIdleTimeoutNanos:         wg.Transport.FakeTCP.IdleTimeout.Duration.Nanoseconds(),
 	}
 	if parsed.ListenPort != nil {
 		state.ConfigListenPort = *parsed.ListenPort
@@ -351,7 +444,14 @@ func (s *State) buildRules(cfg *config.Config) {
 				UnderlayIfIndex: u.IfIndex,
 				ActionOnMiss:    cfg.Policy.ManagedEgressMapMiss,
 			})
-			for _, family := range []string{"ipv4", "ipv6"} {
+			families := []string{"ipv4", "ipv6"}
+			if wg.TransportMode == "faketcp" {
+				// The first FakeTCP slice is deliberately IPv4-only. Managed
+				// IPv6 WireGuard packets still hit the fwmark miss policy and
+				// fail closed instead of leaking as UDP.
+				families = []string{"ipv4"}
+			}
+			for _, family := range families {
 				if wg.TransportMode == "icmp" {
 					s.IngressListeners = append(s.IngressListeners, IngressListener{
 						Generation:      s.Generation,
@@ -362,6 +462,7 @@ func (s *State) buildRules(cfg *config.Config) {
 						CipherID:        wg.CipherID,
 						WGID:            wg.ID,
 						Action:          "drop",
+						TransportMode:   wg.TransportMode,
 					})
 					if family == "ipv6" {
 						continue
@@ -428,6 +529,7 @@ func (s *State) buildRules(cfg *config.Config) {
 					CipherID:        wg.CipherID,
 					WGID:            wg.ID,
 					Action:          "rewrite",
+					TransportMode:   wg.TransportMode,
 				})
 			}
 		}

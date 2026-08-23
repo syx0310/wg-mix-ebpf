@@ -1,0 +1,1180 @@
+// Package faketcp contains the userspace slow-path state machine for the
+// production FakeTCP transport. It intentionally implements TCP-shaped
+// signalling, not TCP reliability or byte-stream semantics: the UDP payload
+// remains independently recoverable by WireGuard or QUIC.
+package faketcp
+
+import (
+	"container/list"
+	"crypto/sha256"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	"github.com/syx0310/wg-mix-ebpf/internal/abi"
+)
+
+const (
+	FlagFIN uint8 = 1 << 0
+	FlagSYN uint8 = 1 << 1
+	FlagRST uint8 = 1 << 2
+	FlagPSH uint8 = 1 << 3
+	FlagACK uint8 = 1 << 4
+
+	// Each admitted SYN performs at most this many expiry visits. This keeps
+	// attacker-controlled ingress work independent of the 16K ledger size.
+	synSourcePruneBudget = 4
+)
+
+var ErrEngineGenerationImmutable = errors.New("faketcp Engine generation is immutable; create a new Engine")
+
+type Options struct {
+	Generation               uint64
+	SessionCapacity          int
+	MaxHalfOpenSessions      int
+	MaxHalfOpenPerSource     int
+	SYNRateInterval          time.Duration
+	SYNBurst                 int
+	SYNBurstPerSource        int
+	SYNSourceLedgerCapacity  int
+	SYNSourceLedgerTTL       time.Duration
+	MaxPendingFlows          int
+	MaxPendingPacketsPerFlow int
+	MaxPendingBytes          int
+	HandshakeTimeout         time.Duration
+	HandshakeRetries         int
+	KeepaliveInterval        time.Duration
+	IdleTimeout              time.Duration
+	Window                   uint16
+	Now                      func() time.Time
+	MonotonicClock           MonotonicClock
+	InitialSequence          func() uint32
+	Store                    SessionStore
+}
+
+// SessionStore exposes the established fast-path state without granting the
+// userspace engine an overwrite operation. InsertEstablished is used exactly
+// once at handshake completion. From that point BPF owns sequence/activity
+// fields; userspace may only read them or request a compare-and-delete.
+type SessionStore interface {
+	InsertEstablished(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) error
+	LookupEstablished(abi.FakeTCPSessionKey) (abi.FakeTCPSessionValue, bool, error)
+	DeleteEstablishedIfUnchanged(abi.FakeTCPSessionKey, abi.FakeTCPSessionValue) (SessionDeleteResult, error)
+}
+
+// SessionDeleteResult distinguishes a completed exact removal from the only
+// two harmless compare misses. Absent is completion when retrying an uncertain
+// exact delete: production has one userspace owner, BPF cannot insert, and a
+// fresh runtime receives a fresh map identity and incarnation.
+type SessionDeleteResult uint8
+
+const (
+	SessionDeleteDifferent SessionDeleteResult = iota
+	SessionDeleteAbsent
+	SessionDeleteRemoved
+)
+
+type Segment struct {
+	Flags           uint8
+	Sequence        uint32
+	Acknowledgement uint32
+	PayloadLength   uint32
+}
+
+type ControlPacket struct {
+	Flags           uint8
+	Sequence        uint32
+	Acknowledgement uint32
+	Window          uint16
+}
+
+type ActionKind uint8
+
+const (
+	ActionDrop ActionKind = iota
+	ActionForward
+	ActionSendControl
+	ActionReleasePending
+	ActionClose
+)
+
+type Action struct {
+	Kind    ActionKind
+	Flow    abi.FakeTCPSessionKey
+	WGID    uint32
+	Control ControlPacket
+	Packets []PendingPacket
+	Reason  string
+}
+
+// PendingPacket is a pre-transform IPv4 packet captured by BPF, with complete
+// checksums materialized by Controller. A raw sender must re-inject it with
+// FWMark on Flow.UnderlayIndex so it traverses the ordinary
+// type-word/XOR/FakeTCP egress pipeline exactly once. CaptureID, not
+// CaptureNanos, is the once-only identity; the timestamp is diagnostic.
+// CaptureFingerprint is the SHA-256 digest of the exact event sample before
+// Controller materializes packet checksums. Captured packets must carry the
+// non-zero digest unchanged into every durable action checkpoint; it cannot be
+// reconstructed from Data after checksum materialization.
+type PendingPacket struct {
+	Data               []byte
+	FWMark             uint32
+	WGID               uint32
+	CaptureNanos       uint64
+	CaptureID          CaptureIdentity
+	CaptureFingerprint [32]byte
+	dataOwned          bool
+}
+
+// capturedPacketBinding is the complete immutable value associated with one
+// CaptureID. It stays comparable so both durable checkpoint validation and the
+// in-process reinjection ledger use the same conflict definition.
+type capturedPacketBinding struct {
+	flow               abi.FakeTCPSessionKey
+	fwmark             uint32
+	wgID               uint32
+	captureNanos       uint64
+	captureFingerprint [32]byte
+	dataFingerprint    [32]byte
+}
+
+func bindCapturedPacket(flow abi.FakeTCPSessionKey, packet PendingPacket) capturedPacketBinding {
+	return capturedPacketBinding{
+		flow:               flow,
+		fwmark:             packet.FWMark,
+		wgID:               packet.WGID,
+		captureNanos:       packet.CaptureNanos,
+		captureFingerprint: packet.CaptureFingerprint,
+		dataFingerprint:    sha256.Sum256(packet.Data),
+	}
+}
+
+func observeCapturedPacket(
+	bindings map[CaptureIdentity]capturedPacketBinding,
+	flow abi.FakeTCPSessionKey,
+	packet PendingPacket,
+) (bool, error) {
+	binding := bindCapturedPacket(flow, packet)
+	previous, found := bindings[packet.CaptureID]
+	if !found {
+		bindings[packet.CaptureID] = binding
+		return false, nil
+	}
+	if previous != binding {
+		return false, ErrCaptureIdentityConflict
+	}
+	return true, nil
+}
+
+type SessionSnapshot struct {
+	State          uint8
+	TXSequence     uint32
+	RXSequence     uint32
+	LastSeenNanos  uint64
+	PendingDelete  bool
+	PendingPackets int
+	PendingBytes   int
+	LastActivity   time.Time
+}
+
+type session struct {
+	state         uint8
+	wgID          uint32
+	localISN      uint32
+	remoteISN     uint32
+	txSequence    uint32
+	rxSequence    uint32
+	lastActivity  time.Time
+	nextRetry     time.Time
+	nextKeepalive time.Time
+	retries       int
+	pending       []PendingPacket
+	pendingBytes  int
+	halfOpenHeld  bool
+	synSource     synSourceKey
+	sessionID     uint64
+	pendingDelete *pendingSessionDelete
+}
+
+type pendingSessionDelete struct {
+	expected abi.FakeTCPSessionValue
+	reason   string
+}
+
+type synSourceKey struct {
+	remoteIPv4    uint32
+	underlayIndex uint32
+}
+
+type synSourceState struct {
+	bucket       tokenBucket
+	halfOpen     int
+	lastActivity time.Time
+	lruElement   *list.Element
+}
+
+type tokenBucket struct {
+	tokens      int
+	lastRefill  time.Time
+	initialized bool
+}
+
+// engineInstanceToken identifies the mutable state allocated by one Engine
+// construction. It is deliberately non-zero-sized so distinct allocations
+// have distinct addresses; copying an Engine value preserves the pointer.
+type engineInstanceToken struct {
+	marker byte
+}
+
+type Engine struct {
+	mu       sync.Mutex
+	opts     Options
+	identity RuntimeIdentity
+	domain   *runtimeDomainState
+	instance *engineInstanceToken
+	// One RuntimeIdentity may seed exactly one kernel collection. Reusing the
+	// domain with fresh maps would restart every per-CPU capture sequence and
+	// collide with identities emitted by its first collection. Every Engine in
+	// one RuntimeDomain therefore shares this capability.
+	runtimeIdentityCommit *runtimeIdentityCommitState
+	sessionIDs            *sessionIDAllocator
+	sessions              map[abi.FakeTCPSessionKey]*session
+	pendingFlows          int
+	pendingBytes          int
+	halfOpen              int
+	globalSYNs            tokenBucket
+	// admissionEpoch is local to one Engine quota-owner lifetime. New engines
+	// begin with zero tokens at this epoch; recreation can only discard
+	// accumulated budget and can never mint a fresh burst. Production runtime
+	// supervision fences owner lifetimes so two such quotas cannot overlap.
+	admissionEpoch time.Time
+	synSources     map[synSourceKey]*synSourceState
+	synSourceLRU   *list.List
+	// Counted under mu and used by complexity-contract tests. It also makes
+	// accidental replacement of bounded pruning with a full scan observable.
+	synSourcePruneVisits uint64
+}
+
+type engineCheckpoint struct {
+	existed      bool
+	session      *session
+	pendingFlows int
+	pendingBytes int
+}
+
+func New(options Options) (*Engine, error) {
+	if options.Generation == 0 {
+		return nil, errors.New("faketcp generation must be non-zero")
+	}
+	domain, err := NewRuntimeDomain(options.Generation)
+	if err != nil {
+		return nil, err
+	}
+	return domain.NewEngine(options)
+}
+
+func newEngine(options Options, domain *runtimeDomainState) (*Engine, error) {
+	if options.Generation == 0 {
+		return nil, errors.New("faketcp generation must be non-zero")
+	}
+	if domain == nil || domain.identity.Generation != options.Generation ||
+		domain.runtimeIdentityCommit == nil || domain.sessionIDs == nil {
+		return nil, errors.New("faketcp Engine options do not match a complete runtime domain")
+	}
+	if options.SessionCapacity <= 0 || options.MaxPendingFlows <= 0 ||
+		options.MaxPendingFlows > options.SessionCapacity ||
+		options.MaxPendingPacketsPerFlow <= 0 || options.MaxPendingBytes <= 0 {
+		return nil, errors.New("faketcp session and pending limits must be positive and bounded")
+	}
+	if options.MaxHalfOpenSessions <= 0 || options.MaxHalfOpenSessions >= options.SessionCapacity ||
+		options.MaxHalfOpenPerSource <= 0 || options.MaxHalfOpenPerSource > options.MaxHalfOpenSessions ||
+		options.SYNRateInterval <= 0 || options.SYNBurst <= 0 ||
+		options.SYNBurstPerSource <= 0 || options.SYNBurstPerSource > options.SYNBurst ||
+		options.SYNSourceLedgerCapacity < options.MaxHalfOpenSessions ||
+		options.SYNSourceLedgerTTL < options.SYNRateInterval {
+		return nil, errors.New("faketcp half-open and SYN-rate limits are invalid")
+	}
+	if options.HandshakeTimeout <= 0 || options.HandshakeRetries <= 0 ||
+		options.KeepaliveInterval <= 0 || options.IdleTimeout <= options.KeepaliveInterval {
+		return nil, errors.New("faketcp timeouts and retry limit are invalid")
+	}
+	if options.Now == nil {
+		options.Now = time.Now
+	}
+	if options.InitialSequence == nil {
+		return nil, errors.New("faketcp initial sequence source is required")
+	}
+	if options.MonotonicClock == nil {
+		return nil, errors.New("faketcp CLOCK_MONOTONIC source is required")
+	}
+	if domain := options.MonotonicClock.Domain(); domain != BPFMonotonicClockDomain {
+		return nil, fmt.Errorf("faketcp monotonic clock domain %q does not match BPF domain %q", domain, BPFMonotonicClockDomain)
+	}
+	if options.Store == nil {
+		return nil, errors.New("faketcp established session store is required")
+	}
+	if options.Window == 0 {
+		options.Window = 65535
+	}
+	admissionEpoch := options.Now()
+	return &Engine{
+		opts:                  options,
+		identity:              domain.identity,
+		domain:                domain,
+		instance:              &engineInstanceToken{},
+		runtimeIdentityCommit: domain.runtimeIdentityCommit,
+		sessionIDs:            domain.sessionIDs,
+		sessions:              make(map[abi.FakeTCPSessionKey]*session),
+		globalSYNs:            tokenBucket{lastRefill: admissionEpoch, initialized: true},
+		admissionEpoch:        admissionEpoch,
+		synSources:            make(map[synSourceKey]*synSourceState),
+		synSourceLRU:          list.New(),
+	}, nil
+}
+
+// Identity returns the immutable generation/incarnation pair for this exact
+// Engine lifetime. A nil Engine has no provable identity.
+func (e *Engine) Identity() RuntimeIdentity {
+	if e == nil {
+		return RuntimeIdentity{}
+	}
+	return e.identity
+}
+
+// Outbound observes a UDP datagram before the BPF established path can encode
+// it. The packet copy is retained only within all three configured limits.
+func (e *Engine) Outbound(flow abi.FakeTCPSessionKey, packet []byte) ([]Action, error) {
+	return e.outbound(flow, PendingPacket{Data: packet, WGID: flow.WGID}, false)
+}
+
+// HandlePacketEvent accepts the fixed upper-bound ABI form used by low-level
+// tests. Production ring-buffer input goes through Controller so packet shape
+// and offload checksums are validated before reaching the state machine.
+func (e *Engine) HandlePacketEvent(event abi.FakeTCPPacketEvent) ([]Action, error) {
+	length := int(event.Event.PacketLength)
+	if length <= 0 || length > len(event.Packet) {
+		return nil, fmt.Errorf("faketcp captured packet length %d is invalid", length)
+	}
+	// The fixed ABI value is caller-owned test input, unlike the production
+	// ring sample. Copy only its declared packet before transferring ownership.
+	packet := append([]byte(nil), event.Packet[:length]...)
+	return e.handleOwnedCapturedPacket(event.Event, packet, sha256.Sum256(packet))
+}
+
+// handleOwnedCapturedPacket accepts an owned packet view from the production
+// decoder. CaptureFingerprint was computed over the exact original sample
+// before Controller materialized its checksums.
+func (e *Engine) handleOwnedCapturedPacket(
+	event abi.FakeTCPEvent,
+	packet []byte,
+	fingerprint [sha256.Size]byte,
+) ([]Action, error) {
+	if event.Type != abi.FakeTCPEventNeedHandshake {
+		return nil, fmt.Errorf("faketcp packet event type %d is not NEED_HANDSHAKE", event.Type)
+	}
+	if len(packet) == 0 || len(packet) != int(event.PacketLength) || len(packet) > abi.FakeTCPMaxCapturedPacket {
+		return nil, fmt.Errorf("faketcp captured packet body has %d bytes for declared length %d", len(packet), event.PacketLength)
+	}
+	if event.EventABIVersion != abi.FakeTCPEventABIVersion {
+		return nil, fmt.Errorf(
+			"faketcp event ABI version %d does not match %d",
+			event.EventABIVersion, abi.FakeTCPEventABIVersion,
+		)
+	}
+	if identity := runtimeIdentityFromEvent(event); identity != e.identity {
+		return nil, fmt.Errorf(
+			"faketcp packet event identity does not match Engine: event=%x engine=%x",
+			identity.Incarnation, e.identity.Incarnation,
+		)
+	}
+	captureID := captureIdentityFromEvent(event)
+	if err := validateCaptureIdentity(captureID, event.Key.Generation); err != nil {
+		return nil, err
+	}
+	return e.outbound(event.Key, PendingPacket{
+		Data:               packet,
+		FWMark:             event.FWMark,
+		WGID:               event.WGID,
+		CaptureNanos:       event.TimestampNanos,
+		CaptureID:          captureID,
+		CaptureFingerprint: fingerprint,
+		dataOwned:          true,
+	}, true)
+}
+
+func (e *Engine) outbound(flow abi.FakeTCPSessionKey, packet PendingPacket, alreadyDropped bool) ([]Action, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.validateFlow(flow); err != nil {
+		return nil, err
+	}
+	if packet.WGID != flow.WGID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+	}
+	s := e.sessions[flow]
+	if s != nil && s.state == abi.FakeTCPStateEstablished {
+		if s.pendingDelete != nil {
+			action, err := e.retryPendingDelete(flow, s)
+			// ActionClose authorizes neither forwarding nor reinjection. A
+			// captured packet therefore remains BPF-dropped, while a direct
+			// outbound packet is likewise terminal for this Engine turn.
+			return []Action{action}, err
+		}
+		now := e.opts.Now()
+		if packet.WGID != 0 && s.wgID != 0 && packet.WGID != s.wgID {
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+		}
+		if s.wgID == 0 {
+			s.wgID = packet.WGID
+		}
+		_, found, err := e.lookupEstablished(flow, s)
+		if err != nil {
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+		}
+		if !found {
+			e.remove(flow, s)
+			return []Action{{Kind: ActionClose, Flow: flow, Reason: "fast-session-missing"}}, nil
+		}
+		s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
+		if alreadyDropped {
+			return []Action{{
+				Kind: ActionReleasePending, Flow: flow, WGID: s.wgID,
+				Packets: []PendingPacket{ownPendingPacket(packet)},
+			}}, nil
+		}
+		return []Action{{Kind: ActionForward, Flow: flow}}, nil
+	}
+	now := e.opts.Now()
+	created := false
+	if s == nil {
+		if len(e.sessions) >= e.opts.SessionCapacity {
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-capacity"}}, nil
+		}
+		if e.halfOpen >= e.opts.MaxHalfOpenSessions {
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "half-open-capacity"}}, nil
+		}
+		isn := e.opts.InitialSequence()
+		s = &session{
+			state:        abi.FakeTCPStateSynSent,
+			wgID:         packet.WGID,
+			localISN:     isn,
+			txSequence:   isn + 1,
+			lastActivity: now,
+			nextRetry:    now.Add(e.opts.HandshakeTimeout),
+			retries:      1,
+			halfOpenHeld: true,
+		}
+		e.halfOpen++
+		e.sessions[flow] = s
+		created = true
+	}
+	if s.wgID == 0 {
+		s.wgID = packet.WGID
+	} else if packet.WGID != 0 && packet.WGID != s.wgID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+	}
+	queued := e.enqueue(s, packet)
+	actions := make([]Action, 0, 2)
+	if created {
+		actions = append(actions, e.control(flow, s, FlagSYN, s.localISN, 0, "initial-handshake"))
+	}
+	if !queued {
+		actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "pending-capacity"})
+	}
+	return actions, nil
+}
+
+func (e *Engine) Inbound(flow abi.FakeTCPSessionKey, seg Segment) ([]Action, error) {
+	return e.inbound(flow, seg, flow.WGID)
+}
+
+// InboundWithWGID preserves the listener identity carried by the BPF event so
+// retries and replies are sent through the same configured WireGuard path.
+func (e *Engine) InboundWithWGID(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) ([]Action, error) {
+	return e.inbound(flow, seg, wgID)
+}
+
+// InboundCapturedControl is the production close-control boundary. It binds a
+// packet-bearing BPF event to this Engine incarnation, re-reads the current
+// established value, validates the complete packet independently of BPF, and
+// only then requests an atomic compare-delete. Malformed peer input is an
+// ordinary fail-closed drop rather than a runtime-fatal error.
+func (e *Engine) InboundCapturedControl(event abi.FakeTCPEvent, packet []byte) ([]Action, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	flow := event.Key
+	if err := e.validateFlow(flow); err != nil {
+		return nil, err
+	}
+	if event.WGID != flow.WGID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+	}
+	identity := runtimeIdentityFromEvent(event)
+	if identity != e.identity || event.EventABIVersion != abi.FakeTCPEventABIVersion {
+		return nil, errors.New("faketcp close event does not match the active runtime identity")
+	}
+	if event.Type != abi.FakeTCPEventRST && event.Type != abi.FakeTCPEventFIN {
+		return nil, errors.New("faketcp captured control event is not RST or FIN")
+	}
+	if event.PacketLength != uint16(len(packet)) || len(packet) != controlPacketLength ||
+		event.PayloadLength != 0 || event.CaptureSequence != 0 || event.CaptureCPU != 0 ||
+		event.FWMark != 0 {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "invalid-close-envelope"}}, nil
+	}
+
+	s := e.sessions[flow]
+	if s == nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-close"}}, nil
+	}
+	if event.WGID == 0 || s.wgID == 0 || event.WGID != s.wgID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+	}
+	if s.pendingDelete != nil {
+		action, err := e.retryPendingDelete(flow, s)
+		return []Action{action}, err
+	}
+	if s.state != abi.FakeTCPStateEstablished {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
+	}
+	value, found, err := e.lookupEstablished(flow, s)
+	if err != nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+	}
+	if !found {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-missing"}}, nil
+	}
+	if validationErr := validateIPv4TCPControl(packet, event, value); validationErr != nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "invalid-close-control"}}, nil
+	}
+	result, err := e.compareDeleteEstablished(flow, s, pendingSessionDelete{
+		expected: value,
+		reason:   "peer-close",
+	})
+	if err != nil {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+	}
+	if result == SessionDeleteDifferent {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}}, nil
+	}
+	e.remove(flow, s)
+	return []Action{{Kind: ActionClose, Flow: flow, Reason: "peer-close"}}, nil
+}
+
+func (e *Engine) inbound(flow abi.FakeTCPSessionKey, seg Segment, wgID uint32) ([]Action, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if err := e.validateFlow(flow); err != nil {
+		return nil, err
+	}
+	if wgID != flow.WGID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+	}
+	now := e.opts.Now()
+	s := e.sessions[flow]
+	checkpoint := e.checkpoint(s)
+	if s != nil && s.pendingDelete != nil {
+		action, err := e.retryPendingDelete(flow, s)
+		return []Action{action}, err
+	}
+	var synSource synSourceKey
+	// Only a bare SYN enters inbound admission. A SYN+ACK completing an
+	// already-owned outbound handshake neither allocates inbound state nor
+	// consumes the global/source SYN budget; gating it here could strand every
+	// outbound session during the startup fail-safe refill interval.
+	if seg.Flags == FlagSYN {
+		var rejection string
+		synSource, rejection = e.observeSYN(flow, now)
+		if rejection != "" {
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: rejection}}, nil
+		}
+	}
+	if s != nil && wgID != 0 && s.wgID != 0 && wgID != s.wgID {
+		return []Action{{Kind: ActionDrop, Flow: flow, Reason: "wg-id-mismatch"}}, nil
+	}
+	if seg.Flags&(FlagRST|FlagFIN) != 0 {
+		if s == nil {
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-close"}}, nil
+		}
+		if s.state == abi.FakeTCPStateEstablished {
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unvalidated-close"}}, nil
+		}
+		e.remove(flow, s)
+		return []Action{{Kind: ActionClose, Flow: flow, Reason: "peer-close"}}, nil
+	}
+	if s == nil {
+		if seg.Flags != FlagSYN {
+			// Silent drop resists unauthenticated active probes and avoids
+			// allocating state for arbitrary ACK/data packets.
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "unknown-flow"}}, nil
+		}
+		if len(e.sessions) >= e.opts.SessionCapacity {
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-capacity"}}, nil
+		}
+		rejection := e.reserveInboundHalfOpen(synSource)
+		if rejection != "" {
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: rejection}}, nil
+		}
+		isn := e.opts.InitialSequence()
+		s = &session{
+			state:        abi.FakeTCPStateSynReceived,
+			wgID:         wgID,
+			localISN:     isn,
+			remoteISN:    seg.Sequence,
+			txSequence:   isn + 1,
+			rxSequence:   seg.Sequence + 1,
+			lastActivity: now,
+			nextRetry:    now.Add(e.opts.HandshakeTimeout),
+			retries:      1,
+			halfOpenHeld: true,
+			synSource:    synSource,
+		}
+		e.sessions[flow] = s
+		return []Action{e.control(flow, s, FlagSYN|FlagACK, s.localISN, s.rxSequence, "accept-syn")}, nil
+	}
+	if s.wgID == 0 {
+		s.wgID = wgID
+	}
+
+	s.lastActivity = now
+	s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
+	var actions []Action
+	becameEstablished := false
+	switch s.state {
+	case abi.FakeTCPStateSynSent:
+		switch {
+		case seg.Flags&(FlagSYN|FlagACK) == FlagSYN|FlagACK && seg.Acknowledgement == s.txSequence:
+			s.remoteISN = seg.Sequence
+			s.rxSequence = seg.Sequence + 1
+			s.state = abi.FakeTCPStateEstablished
+			becameEstablished = true
+			actions = append(actions, e.control(flow, s, FlagACK, s.txSequence, s.rxSequence, "complete-handshake"))
+			actions = append(actions, e.release(flow, s)...)
+		case seg.Flags == FlagSYN:
+			// Simultaneous open: retain our ISN and acknowledge the peer.
+			s.remoteISN = seg.Sequence
+			s.rxSequence = seg.Sequence + 1
+			s.state = abi.FakeTCPStateSynReceived
+			actions = append(actions, e.control(flow, s, FlagSYN|FlagACK, s.localISN, s.rxSequence, "simultaneous-open"))
+		default:
+			actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "invalid-syn-sent-segment"})
+		}
+	case abi.FakeTCPStateSynReceived:
+		switch {
+		case seg.Flags == FlagSYN && seg.Sequence == s.remoteISN:
+			actions = append(actions, e.control(flow, s, FlagSYN|FlagACK, s.localISN, s.rxSequence, "duplicate-syn"))
+		case seg.Flags&FlagACK != 0 && seg.Acknowledgement == s.txSequence:
+			s.state = abi.FakeTCPStateEstablished
+			becameEstablished = true
+			actions = append(actions, e.release(flow, s)...)
+		default:
+			actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "invalid-syn-received-segment"})
+		}
+	case abi.FakeTCPStateEstablished:
+		if seg.Flags&FlagSYN != 0 {
+			actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "syn-on-established"})
+		} else {
+			_, found, err := e.lookupEstablished(flow, s)
+			if err != nil {
+				e.restore(flow, checkpoint)
+				return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+			}
+			if !found {
+				e.remove(flow, s)
+				return []Action{{Kind: ActionClose, Flow: flow, Reason: "fast-session-missing"}}, nil
+			}
+			actions = append(actions, Action{Kind: ActionForward, Flow: flow})
+		}
+	default:
+		actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "invalid-state"})
+	}
+	if becameEstablished {
+		if err := e.insertEstablished(flow, s); err != nil {
+			e.restore(flow, checkpoint)
+			return []Action{{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}}, err
+		}
+		e.releaseHalfOpen(s)
+	}
+	return actions, nil
+}
+
+func (e *Engine) Tick() ([]Action, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	now := e.opts.Now()
+	nowMonotonic, err := e.opts.MonotonicClock.NowNanos()
+	if err != nil {
+		return nil, fmt.Errorf("read faketcp %s clock: %w", BPFMonotonicClockDomain, err)
+	}
+	var actions []Action
+	var errs []error
+	for flow, s := range e.sessions {
+		switch s.state {
+		case abi.FakeTCPStateSynSent, abi.FakeTCPStateSynReceived:
+			if now.Before(s.nextRetry) {
+				continue
+			}
+			if s.retries >= e.opts.HandshakeRetries {
+				e.remove(flow, s)
+				actions = append(actions, Action{Kind: ActionClose, Flow: flow, Reason: "handshake-timeout"})
+				continue
+			}
+			s.retries++
+			s.nextRetry = now.Add(e.opts.HandshakeTimeout)
+			flags, ack := uint8(FlagSYN), uint32(0)
+			if s.state == abi.FakeTCPStateSynReceived {
+				flags, ack = FlagSYN|FlagACK, s.rxSequence
+			}
+			actions = append(actions, e.control(flow, s, flags, s.localISN, ack, "handshake-retry"))
+		case abi.FakeTCPStateEstablished:
+			if s.pendingDelete != nil {
+				action, err := e.retryPendingDelete(flow, s)
+				if err != nil {
+					errs = append(errs, err)
+				}
+				actions = append(actions, action)
+				continue
+			}
+			value, found, err := e.lookupEstablished(flow, s)
+			if err != nil {
+				errs = append(errs, err)
+				actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"})
+				continue
+			}
+			if !found {
+				e.remove(flow, s)
+				actions = append(actions, Action{Kind: ActionClose, Flow: flow, Reason: "fast-session-missing"})
+				continue
+			}
+			idle := nowMonotonic >= value.LastSeenNanos &&
+				nowMonotonic-value.LastSeenNanos >= uint64(e.opts.IdleTimeout)
+			if idle {
+				result, err := e.compareDeleteEstablished(flow, s, pendingSessionDelete{
+					expected: value,
+					reason:   "idle-timeout",
+				})
+				if err != nil {
+					errs = append(errs, err)
+					actions = append(actions, Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"})
+					continue
+				}
+				if result == SessionDeleteDifferent {
+					// BPF advanced the fast state after our lookup. A later tick
+					// re-reads LastSeenNanos; this session is demonstrably active.
+					continue
+				}
+				e.remove(flow, s)
+				actions = append(actions, Action{Kind: ActionClose, Flow: flow, Reason: "idle-timeout"})
+				continue
+			}
+			if !now.Before(s.nextKeepalive) {
+				s.nextKeepalive = now.Add(e.opts.KeepaliveInterval)
+				actions = append(actions, e.controlEstablished(flow, s, value,
+					FlagACK, value.TXSequence-1, value.RXSequence, "keepalive"))
+			}
+		}
+	}
+	return actions, errors.Join(errs...)
+}
+
+// AdvanceGeneration is retained as a fail-closed compatibility boundary.
+// RuntimeIdentity, capture sequences, action recovery, and kernel collection
+// commit state all belong to exactly one immutable Engine generation. A
+// generation transition therefore requires constructing a new Engine.
+func (e *Engine) AdvanceGeneration(generation uint64) ([]Action, error) {
+	if e == nil {
+		return nil, fmt.Errorf("%w: Engine is nil", ErrEngineGenerationImmutable)
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return nil, fmt.Errorf(
+		"%w: current generation=%d runtime identity generation=%d requested generation=%d",
+		ErrEngineGenerationImmutable,
+		e.opts.Generation,
+		e.identity.Generation,
+		generation,
+	)
+}
+
+func (e *Engine) Snapshot(flow abi.FakeTCPSessionKey) (SessionSnapshot, bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	s := e.sessions[flow]
+	if s == nil {
+		return SessionSnapshot{}, false, nil
+	}
+	lastSeenNanos := uint64(0)
+	txSequence, rxSequence := s.txSequence, s.rxSequence
+	pendingDelete := s.pendingDelete != nil
+	if s.state == abi.FakeTCPStateEstablished {
+		if pendingDelete {
+			// Snapshot is observability-only: report the complete cached delete
+			// candidate without looking up its possible kernel tombstone or
+			// creating another retry/delete entry point.
+			value := s.pendingDelete.expected
+			lastSeenNanos = value.LastSeenNanos
+			txSequence, rxSequence = value.TXSequence, value.RXSequence
+		} else {
+			value, found, err := e.lookupEstablished(flow, s)
+			if err != nil {
+				return SessionSnapshot{}, true, err
+			}
+			if !found {
+				return SessionSnapshot{}, false, nil
+			}
+			lastSeenNanos = value.LastSeenNanos
+			txSequence, rxSequence = value.TXSequence, value.RXSequence
+		}
+	}
+	return SessionSnapshot{
+		State:          s.state,
+		TXSequence:     txSequence,
+		RXSequence:     rxSequence,
+		LastSeenNanos:  lastSeenNanos,
+		PendingDelete:  pendingDelete,
+		PendingPackets: len(s.pending),
+		PendingBytes:   s.pendingBytes,
+		LastActivity:   s.lastActivity,
+	}, true, nil
+}
+
+func (e *Engine) validateFlow(flow abi.FakeTCPSessionKey) error {
+	if flow.Generation != e.opts.Generation || flow.LocalIPv4 == 0 || flow.RemoteIPv4 == 0 ||
+		flow.UnderlayIndex == 0 || flow.LocalPort == 0 || flow.RemotePort == 0 ||
+		flow.WGID == 0 || flow.Reserved != ([4]byte{}) {
+		return errors.New("faketcp flow must use the active generation, a non-zero WGID/IPv4/port/underlay identity, and zero reserved bytes")
+	}
+	return nil
+}
+
+func (e *Engine) checkpoint(s *session) engineCheckpoint {
+	checkpoint := engineCheckpoint{
+		existed:      s != nil,
+		pendingFlows: e.pendingFlows,
+		pendingBytes: e.pendingBytes,
+	}
+	if s != nil {
+		copySession := *s
+		copySession.pending = append([]PendingPacket(nil), s.pending...)
+		checkpoint.session = &copySession
+	}
+	return checkpoint
+}
+
+func (e *Engine) restore(flow abi.FakeTCPSessionKey, checkpoint engineCheckpoint) {
+	e.pendingFlows = checkpoint.pendingFlows
+	e.pendingBytes = checkpoint.pendingBytes
+	if !checkpoint.existed {
+		delete(e.sessions, flow)
+		return
+	}
+	e.sessions[flow] = checkpoint.session
+}
+
+func (e *Engine) enqueue(s *session, packet PendingPacket) bool {
+	if len(packet.Data) == 0 || len(s.pending) >= e.opts.MaxPendingPacketsPerFlow ||
+		e.pendingBytes+len(packet.Data) > e.opts.MaxPendingBytes {
+		return false
+	}
+	if len(s.pending) == 0 {
+		if e.pendingFlows >= e.opts.MaxPendingFlows {
+			return false
+		}
+		e.pendingFlows++
+	}
+	packet = ownPendingPacket(packet)
+	s.pending = append(s.pending, packet)
+	s.pendingBytes += len(packet.Data)
+	e.pendingBytes += len(packet.Data)
+	return true
+}
+
+func ownPendingPacket(packet PendingPacket) PendingPacket {
+	if !packet.dataOwned {
+		packet.Data = append([]byte(nil), packet.Data...)
+		packet.dataOwned = true
+	}
+	return packet
+}
+
+// observeSYN applies the O(1) global limiter before any source-ledger lookup,
+// expiry work or allocation. A globally rejected flood therefore cannot
+// consume source memory or turn the bounded ledger into a CPU multiplier.
+func (e *Engine) observeSYN(flow abi.FakeTCPSessionKey, now time.Time) (synSourceKey, string) {
+	refillTokenBucket(&e.globalSYNs, now, e.opts.SYNRateInterval, e.opts.SYNBurst)
+	if e.globalSYNs.tokens == 0 {
+		return synSourceKey{}, "syn-rate-global"
+	}
+	// Never refund this token after a per-source, ledger or half-open failure.
+	e.globalSYNs.tokens--
+
+	key := synSourceKey{remoteIPv4: flow.RemoteIPv4, underlayIndex: flow.UnderlayIndex}
+	source, rejection := e.lookupOrCreateSYNSource(key, now)
+	if rejection != "" {
+		return synSourceKey{}, rejection
+	}
+	refillTokenBucket(&source.bucket, now, e.opts.SYNRateInterval, e.opts.SYNBurstPerSource)
+	if source.bucket.tokens == 0 {
+		return synSourceKey{}, "syn-rate-source"
+	}
+	source.bucket.tokens--
+	return key, ""
+}
+
+func (e *Engine) reserveInboundHalfOpen(key synSourceKey) string {
+	if e.halfOpen >= e.opts.MaxHalfOpenSessions {
+		return "half-open-capacity"
+	}
+	source := e.synSources[key]
+	if source == nil {
+		return "syn-source-ledger-missing"
+	}
+	if source.halfOpen >= e.opts.MaxHalfOpenPerSource {
+		return "half-open-source-capacity"
+	}
+	source.halfOpen++
+	e.halfOpen++
+	return ""
+}
+
+func (e *Engine) lookupOrCreateSYNSource(key synSourceKey, now time.Time) (*synSourceState, string) {
+	e.pruneExpiredSYNSources(now, synSourcePruneBudget)
+	if source := e.synSources[key]; source != nil {
+		e.touchSYNSource(source, now)
+		return source, ""
+	}
+	if len(e.synSources) >= e.opts.SYNSourceLedgerCapacity {
+		return nil, "syn-source-ledger-capacity"
+	}
+	// New sources share the engine admission epoch. A source first observed
+	// after sufficient uptime may use accrued budget, but recreating Engine
+	// resets that epoch and never grants an immediate burst.
+	source := &synSourceState{
+		bucket:       tokenBucket{lastRefill: e.admissionEpoch, initialized: true},
+		lastActivity: now,
+	}
+	source.lruElement = e.synSourceLRU.PushFront(key)
+	e.synSources[key] = source
+	return source, ""
+}
+
+func (e *Engine) touchSYNSource(source *synSourceState, now time.Time) {
+	source.lastActivity = now
+	if source.lruElement != nil {
+		e.synSourceLRU.MoveToFront(source.lruElement)
+	}
+}
+
+func (e *Engine) pruneExpiredSYNSources(now time.Time, budget int) {
+	for visited := 0; visited < budget; visited++ {
+		element := e.synSourceLRU.Back()
+		if element == nil {
+			return
+		}
+		e.synSourcePruneVisits++
+		key := element.Value.(synSourceKey)
+		source := e.synSources[key]
+		if source == nil {
+			e.synSourceLRU.Remove(element)
+			continue
+		}
+		if now.Before(source.lastActivity.Add(e.opts.SYNSourceLedgerTTL)) {
+			// LRU order is also last-activity order, so every newer entry is
+			// necessarily unexpired.
+			return
+		}
+		if source.halfOpen == 0 {
+			delete(e.synSources, key)
+			e.synSourceLRU.Remove(element)
+			continue
+		}
+		// Active state cannot be evicted. Refresh/move it so one expired active
+		// tail cannot permanently obstruct amortized cleanup behind it.
+		e.touchSYNSource(source, now)
+	}
+}
+
+func refillTokenBucket(bucket *tokenBucket, now time.Time, interval time.Duration, burst int) {
+	if !bucket.initialized {
+		// Fail safe for zero-value buckets restored without a checkpoint. The
+		// first observation starts time accounting at zero budget.
+		bucket.initialized = true
+		bucket.lastRefill = now
+		return
+	}
+	if now.Before(bucket.lastRefill.Add(interval)) {
+		return
+	}
+	steps := int(now.Sub(bucket.lastRefill) / interval)
+	if steps >= burst {
+		bucket.tokens = burst
+		bucket.lastRefill = now
+		return
+	}
+	bucket.tokens = min(burst, bucket.tokens+steps)
+	bucket.lastRefill = bucket.lastRefill.Add(time.Duration(steps) * interval)
+}
+
+func (e *Engine) releaseHalfOpen(s *session) {
+	if !s.halfOpenHeld {
+		return
+	}
+	s.halfOpenHeld = false
+	if e.halfOpen > 0 {
+		e.halfOpen--
+	}
+	if s.synSource.remoteIPv4 == 0 {
+		return
+	}
+	source := e.synSources[s.synSource]
+	if source == nil {
+		return
+	}
+	if source.halfOpen > 0 {
+		source.halfOpen--
+	}
+	// Releasing half-open state never returns tokens or deletes history. Keep
+	// the ledger entry for a full TTL from release so SYN->RST/success loops
+	// cannot reset the source bucket.
+	e.touchSYNSource(source, e.opts.Now())
+}
+
+func (e *Engine) release(flow abi.FakeTCPSessionKey, s *session) []Action {
+	if len(s.pending) == 0 {
+		return nil
+	}
+	packets := s.pending
+	e.pendingFlows--
+	e.pendingBytes -= s.pendingBytes
+	s.pending = nil
+	s.pendingBytes = 0
+	return []Action{{Kind: ActionReleasePending, Flow: flow, WGID: s.wgID, Packets: packets}}
+}
+
+func (e *Engine) remove(flow abi.FakeTCPSessionKey, s *session) {
+	e.releaseHalfOpen(s)
+	if len(s.pending) != 0 {
+		e.pendingFlows--
+		e.pendingBytes -= s.pendingBytes
+	}
+	delete(e.sessions, flow)
+}
+
+func (e *Engine) control(flow abi.FakeTCPSessionKey, s *session, flags uint8, seq, ack uint32, reason string) Action {
+	return Action{
+		Kind:    ActionSendControl,
+		Flow:    flow,
+		WGID:    s.wgID,
+		Control: ControlPacket{Flags: flags, Sequence: seq, Acknowledgement: ack, Window: e.opts.Window},
+		Reason:  reason,
+	}
+}
+
+func (e *Engine) controlEstablished(flow abi.FakeTCPSessionKey, s *session,
+	value abi.FakeTCPSessionValue, flags uint8, seq, ack uint32, reason string) Action {
+	window := value.Window
+	if window == 0 {
+		window = e.opts.Window
+	}
+	return Action{
+		Kind:    ActionSendControl,
+		Flow:    flow,
+		WGID:    s.wgID,
+		Control: ControlPacket{Flags: flags, Sequence: seq, Acknowledgement: ack, Window: window},
+		Reason:  reason,
+	}
+}
+
+func (e *Engine) insertEstablished(flow abi.FakeTCPSessionKey, s *session) error {
+	nowMonotonic, err := e.opts.MonotonicClock.NowNanos()
+	if err != nil {
+		return fmt.Errorf("read faketcp %s clock for established insert: %w", BPFMonotonicClockDomain, err)
+	}
+	if s.sessionID == 0 {
+		s.sessionID, err = e.sessionIDs.allocate()
+		if err != nil {
+			return err
+		}
+	}
+	return e.opts.Store.InsertEstablished(flow, abi.FakeTCPSessionValue{
+		Generation:         flow.Generation,
+		LastSeenNanos:      nowMonotonic,
+		TXSequence:         s.txSequence,
+		RXSequence:         s.rxSequence,
+		LocalISN:           s.localISN,
+		RemoteISN:          s.remoteISN,
+		Window:             e.opts.Window,
+		State:              s.state,
+		Revision:           1,
+		SessionID:          s.sessionID,
+		RuntimeIncarnation: [16]byte(e.identity.Incarnation),
+	})
+}
+
+func (e *Engine) lookupEstablished(flow abi.FakeTCPSessionKey, s *session) (abi.FakeTCPSessionValue, bool, error) {
+	value, found, err := e.opts.Store.LookupEstablished(flow)
+	if err != nil || !found {
+		return value, found, err
+	}
+	if value.Generation != flow.Generation || value.State != abi.FakeTCPStateEstablished {
+		return abi.FakeTCPSessionValue{}, false, errors.New("faketcp fast session has invalid generation or state")
+	}
+	if value.LocalISN != s.localISN || value.RemoteISN != s.remoteISN {
+		return abi.FakeTCPSessionValue{}, false, errors.New("faketcp fast session identity changed")
+	}
+	if value.SessionID != s.sessionID ||
+		value.RuntimeIncarnation != [16]byte(e.identity.Incarnation) {
+		return abi.FakeTCPSessionValue{}, false, errors.New("faketcp fast session incarnation changed")
+	}
+	// BPF is the sole writer after insertion. These assignments only refresh
+	// the userspace snapshot used for observability; no whole-value write API
+	// exists on SessionStore.
+	s.txSequence = value.TXSequence
+	s.rxSequence = value.RXSequence
+	return value, true, nil
+}
+
+// compareDeleteEstablished is the only transition into pending-delete. The
+// complete expected value is retained on every error because the kernel claim
+// may already have linearised even when userspace cannot observe the final
+// delete. The request remains immutable across retries.
+func (e *Engine) compareDeleteEstablished(
+	flow abi.FakeTCPSessionKey,
+	s *session,
+	request pendingSessionDelete,
+) (SessionDeleteResult, error) {
+	result, err := e.opts.Store.DeleteEstablishedIfUnchanged(flow, request.expected)
+	if err == nil && result > SessionDeleteRemoved {
+		err = fmt.Errorf("faketcp session store returned invalid delete result %d", result)
+	}
+	if err != nil {
+		pending := request
+		s.pendingDelete = &pending
+		return SessionDeleteDifferent, err
+	}
+	s.pendingDelete = nil
+	return result, nil
+}
+
+// retryPendingDelete runs before any ordinary established lookup. Removed and
+// absent are the same terminal state: under the production single-owner
+// lifecycle no same-key Insert can pass the store mutex, BPF never inserts,
+// and a fresh process receives a fresh map identity and runtime incarnation.
+// Different therefore identifies a foreign/new value, clears the stale claim
+// authority, preserves that value, and fails this packet/tick closed.
+func (e *Engine) retryPendingDelete(
+	flow abi.FakeTCPSessionKey,
+	s *session,
+) (Action, error) {
+	request := *s.pendingDelete
+	result, err := e.compareDeleteEstablished(flow, s, request)
+	if err != nil {
+		return Action{Kind: ActionDrop, Flow: flow, Reason: "session-store-unavailable"}, err
+	}
+	if result == SessionDeleteDifferent {
+		return Action{Kind: ActionDrop, Flow: flow, Reason: "fast-session-raced"}, nil
+	}
+	e.remove(flow, s)
+	return Action{Kind: ActionClose, Flow: flow, Reason: request.reason}, nil
+}

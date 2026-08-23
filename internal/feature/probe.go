@@ -41,7 +41,10 @@ func Run() Probe {
 	if data, err := os.ReadFile("/proc/sys/kernel/unprivileged_bpf_disabled"); err == nil {
 		p.UnprivilegedBPFDisabled = string(bytesTrimSpace(data))
 	}
-	for _, module := range []string{"sched_cls", "cls_bpf", "sch_ingress", "act_bpf"} {
+	for _, module := range []string{
+		"sched_cls", "cls_bpf", "sch_ingress", "act_bpf", "wg_mix_faketcp_checksum",
+		"wg_mix_faketcp_checksum_kprobe",
+	} {
 		p.KernelModules[module] = exists("/sys/module/" + module)
 	}
 	for _, name := range []string{"tc", "nft", "wg"} {

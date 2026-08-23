@@ -19,11 +19,29 @@ const (
 
 	// Reload stages a second generation before deleting the active one. These
 	// limits are therefore half of the corresponding BPF map capacities.
-	MaxProfilesPerGeneration         = 64
-	MaxCiphersPerGeneration          = 64
-	MaxUnderlaysPerGeneration        = 256
-	MaxManagedRulesPerGeneration     = 256
-	MaxDirectionalRulesPerGeneration = 1024
+	MaxProfilesPerGeneration                = 64
+	MaxCiphersPerGeneration                 = 64
+	MaxUnderlaysPerGeneration               = 256
+	MaxManagedRulesPerGeneration            = 256
+	MaxDirectionalRulesPerGeneration        = 1024
+	MaxFakeTCPSessions                      = 16384
+	MaxFakeTCPHalfOpenSessions              = 4096
+	MaxFakeTCPHalfOpenPerSource             = 256
+	MaxFakeTCPSYNBurst                      = 4096
+	MaxFakeTCPSYNSourceLedger               = 16384
+	MaxFakeTCPPendingFlows                  = 4096
+	MaxFakeTCPPendingPacketsPerFlow         = 4
+	MaxFakeTCPPendingBytes                  = 1 << 20
+	FakeTCPChecksumModePartialCompleteReset = "partial-complete-reset-required"
+	FakeTCPIngressModeXDPGenericExact       = "xdp-generic-exact"
+	FakeTCPChecksumBackendAuto              = "auto"
+	FakeTCPChecksumBackendKfunc             = "kfunc"
+	FakeTCPChecksumBackendKprobe            = "kprobe"
+	StartupGuardModeNFTTemporaryDrop        = "nft-temporary-drop"
+	// StartupGuardModeNone is an explicit high-risk opt-in for systems without
+	// nft. Runtime code must never select it as a fallback from a guard error.
+	StartupGuardModeNone                    = "none"
+	deprecatedFakeTCPIngressModeXDPRequired = "xdp-required"
 )
 
 type Config struct {
@@ -74,13 +92,40 @@ type IndexProfile struct {
 }
 
 type Transport struct {
-	Mode string        `yaml:"mode"`
-	ICMP ICMPTransport `yaml:"icmp"`
+	Mode    string           `yaml:"mode"`
+	ICMP    ICMPTransport    `yaml:"icmp"`
+	FakeTCP FakeTCPTransport `yaml:"faketcp"`
 }
 
 type ICMPTransport struct {
 	Role string `yaml:"role"`
 	ID   uint16 `yaml:"id"`
+}
+
+// FakeTCPTransport preserves UDP/QUIC packet semantics and only presents a
+// TCP-shaped wire image; it is not a TCP stream. Each FakeTCP WireGuard owns
+// its complete policy (timeouts, rate limits, source ledger and pending
+// queues). Runtime maps and session identities keep the policies isolated.
+type FakeTCPTransport struct {
+	// Experimental is a deprecated, ignored compatibility field. Older
+	// configurations may keep `experimental: true` while migrating.
+	Experimental             bool     `yaml:"experimental"`
+	ChecksumMode             string   `yaml:"checksum_mode"`
+	IngressMode              string   `yaml:"ingress_mode"`
+	SessionCapacity          uint32   `yaml:"session_capacity"`
+	MaxHalfOpenSessions      uint32   `yaml:"max_half_open_sessions"`
+	MaxHalfOpenPerSource     uint32   `yaml:"max_half_open_per_source"`
+	SYNRateInterval          Duration `yaml:"syn_rate_interval"`
+	SYNBurst                 uint32   `yaml:"syn_burst"`
+	SYNBurstPerSource        uint32   `yaml:"syn_burst_per_source"`
+	SYNSourceLedgerCapacity  uint32   `yaml:"syn_source_ledger_capacity"`
+	SYNSourceLedgerTTL       Duration `yaml:"syn_source_ledger_ttl"`
+	MaxPendingFlows          uint32   `yaml:"max_pending_flows"`
+	MaxPendingPacketsPerFlow uint32   `yaml:"max_pending_packets_per_flow"`
+	MaxPendingBytes          uint32   `yaml:"max_pending_bytes"`
+	HandshakeTimeout         Duration `yaml:"handshake_timeout"`
+	KeepaliveInterval        Duration `yaml:"keepalive_interval"`
+	IdleTimeout              Duration `yaml:"idle_timeout"`
 }
 
 type Cipher struct {
@@ -101,6 +146,8 @@ type FwmarkPolicy struct {
 
 type Runtime struct {
 	PollInterval            Duration `yaml:"poll_interval"`
+	AttachmentBackend       string   `yaml:"attachment_backend"`
+	ChecksumBackend         string   `yaml:"checksum_backend"`
 	RequireNonzeroFwmark    bool     `yaml:"require_nonzero_fwmark"`
 	StrictRuntimeFwmark     bool     `yaml:"strict_runtime_fwmark"`
 	AllowZeroFwmarkFallback bool     `yaml:"allow_zero_fwmark_fallback"`
@@ -121,7 +168,7 @@ func (r *Runtime) UnmarshalYAML(value *yaml.Node) error {
 			out.requireNonzeroFwmarkSet = true
 		case "strict_runtime_fwmark":
 			out.strictRuntimeFwmarkSet = true
-		case "poll_interval", "allow_zero_fwmark_fallback":
+		case "poll_interval", "attachment_backend", "checksum_backend", "allow_zero_fwmark_fallback":
 		default:
 			return fmt.Errorf("field %q not found in type config.Runtime", value.Content[i].Value)
 		}
@@ -296,6 +343,8 @@ func SafeTemplate() *Config {
 		FwmarkPolicy: FwmarkPolicy{Mode: "config-required"},
 		Runtime: Runtime{
 			PollInterval:            Duration{Duration: 5 * time.Second},
+			AttachmentBackend:       "auto",
+			ChecksumBackend:         FakeTCPChecksumBackendAuto,
 			RequireNonzeroFwmark:    true,
 			StrictRuntimeFwmark:     true,
 			AllowZeroFwmarkFallback: false,
@@ -303,7 +352,7 @@ func SafeTemplate() *Config {
 			strictRuntimeFwmarkSet:  true,
 		},
 		StartupGuard: StartupGuard{
-			Mode: "nft-temporary-drop",
+			Mode: StartupGuardModeNFTTemporaryDrop,
 			Egress: GuardEgress{
 				Match: "fwmark",
 			},
@@ -331,6 +380,12 @@ func (c *Config) ApplyDefaults() {
 	if c.Runtime.PollInterval.Duration == 0 {
 		c.Runtime.PollInterval.Duration = 5 * time.Second
 	}
+	if c.Runtime.AttachmentBackend == "" {
+		c.Runtime.AttachmentBackend = "auto"
+	}
+	if c.Runtime.ChecksumBackend == "" {
+		c.Runtime.ChecksumBackend = FakeTCPChecksumBackendAuto
+	}
 	if !c.Runtime.AllowZeroFwmarkFallback && !c.Runtime.requireNonzeroFwmarkSet {
 		c.Runtime.RequireNonzeroFwmark = true
 	}
@@ -338,7 +393,7 @@ func (c *Config) ApplyDefaults() {
 		c.Runtime.StrictRuntimeFwmark = true
 	}
 	if c.StartupGuard.Mode == "" {
-		c.StartupGuard.Mode = "nft-temporary-drop"
+		c.StartupGuard.Mode = StartupGuardModeNFTTemporaryDrop
 	}
 	if c.StartupGuard.Egress.Match == "" {
 		c.StartupGuard.Egress.Match = "fwmark"
@@ -362,6 +417,56 @@ func (c *Config) ApplyDefaults() {
 		}
 		if c.WireGuards[i].Transport.Mode == "" {
 			c.WireGuards[i].Transport.Mode = "udp"
+		}
+		if c.WireGuards[i].Transport.Mode == "faketcp" {
+			fake := &c.WireGuards[i].Transport.FakeTCP
+			defaultString(&fake.ChecksumMode, FakeTCPChecksumModePartialCompleteReset)
+			defaultString(&fake.IngressMode, FakeTCPIngressModeXDPGenericExact)
+			if fake.IngressMode == deprecatedFakeTCPIngressModeXDPRequired {
+				fake.IngressMode = FakeTCPIngressModeXDPGenericExact
+			}
+			if fake.SessionCapacity == 0 {
+				fake.SessionCapacity = 4096
+			}
+			if fake.MaxHalfOpenSessions == 0 {
+				fake.MaxHalfOpenSessions = max(1, fake.SessionCapacity/4)
+			}
+			if fake.MaxHalfOpenPerSource == 0 {
+				fake.MaxHalfOpenPerSource = min(16, fake.MaxHalfOpenSessions)
+			}
+			if fake.SYNRateInterval.Duration == 0 {
+				fake.SYNRateInterval.Duration = 100 * time.Millisecond
+			}
+			if fake.SYNBurst == 0 {
+				fake.SYNBurst = min(256, fake.MaxHalfOpenSessions)
+			}
+			if fake.SYNBurstPerSource == 0 {
+				fake.SYNBurstPerSource = min(8, fake.SYNBurst)
+			}
+			if fake.SYNSourceLedgerCapacity == 0 {
+				fake.SYNSourceLedgerCapacity = max(fake.MaxHalfOpenSessions, 4096)
+			}
+			if fake.SYNSourceLedgerTTL.Duration == 0 {
+				fake.SYNSourceLedgerTTL.Duration = 5 * time.Minute
+			}
+			if fake.MaxPendingFlows == 0 {
+				fake.MaxPendingFlows = min(1024, fake.MaxHalfOpenSessions)
+			}
+			if fake.MaxPendingPacketsPerFlow == 0 {
+				fake.MaxPendingPacketsPerFlow = 1
+			}
+			if fake.MaxPendingBytes == 0 {
+				fake.MaxPendingBytes = 256 << 10
+			}
+			if fake.HandshakeTimeout.Duration == 0 {
+				fake.HandshakeTimeout.Duration = 5 * time.Second
+			}
+			if fake.KeepaliveInterval.Duration == 0 {
+				fake.KeepaliveInterval.Duration = 20 * time.Second
+			}
+			if fake.IdleTimeout.Duration == 0 {
+				fake.IdleTimeout.Duration = 2 * time.Minute
+			}
 		}
 	}
 	for name, cipher := range c.Ciphers {
@@ -443,6 +548,22 @@ func (c *Config) ValidateStatic() error {
 	if c.Runtime.PollInterval.Duration < MinimumPollInterval {
 		return fmt.Errorf("runtime.poll_interval must be at least %s", MinimumPollInterval)
 	}
+	switch c.Runtime.AttachmentBackend {
+	case "auto", "tcx", "classic_tc":
+	default:
+		return fmt.Errorf(
+			"runtime.attachment_backend %q is unsupported (want auto, tcx, or classic_tc)",
+			c.Runtime.AttachmentBackend,
+		)
+	}
+	switch c.Runtime.ChecksumBackend {
+	case FakeTCPChecksumBackendAuto, FakeTCPChecksumBackendKfunc, FakeTCPChecksumBackendKprobe:
+	default:
+		return fmt.Errorf(
+			"runtime.checksum_backend %q is unsupported (want auto, kfunc, or kprobe)",
+			c.Runtime.ChecksumBackend,
+		)
+	}
 	if err := validateUniqueUnderlays(c.Underlays); err != nil {
 		return err
 	}
@@ -453,7 +574,7 @@ func (c *Config) ValidateStatic() error {
 		return err
 	}
 	switch c.StartupGuard.Mode {
-	case "nft-temporary-drop", "none":
+	case StartupGuardModeNFTTemporaryDrop, StartupGuardModeNone:
 	default:
 		return fmt.Errorf("startup_guard.mode %q is unsupported", c.StartupGuard.Mode)
 	}
@@ -475,6 +596,7 @@ func (c *Config) ValidateStatic() error {
 		}
 	}
 	seenWireGuards := make(map[string]struct{}, len(c.WireGuards))
+	fakeTCPWireGuards := 0
 	for i, wg := range c.WireGuards {
 		if wg.Name == "" {
 			return fmt.Errorf("wireguards[%d].name is required", i)
@@ -497,8 +619,8 @@ func (c *Config) ValidateStatic() error {
 			if !ok {
 				return fmt.Errorf("wireguards[%d].cipher %q is not defined", i, wg.Cipher)
 			}
-			if wg.Transport.Mode != "" && wg.Transport.Mode != "udp" {
-				return fmt.Errorf("wireguards[%d].cipher is only implemented for udp transport in MVP", i)
+			if wg.Transport.Mode != "" && wg.Transport.Mode != "udp" && wg.Transport.Mode != "faketcp" {
+				return fmt.Errorf("wireguards[%d].cipher is only implemented for udp and faketcp transports", i)
 			}
 		}
 		switch wg.Transport.Mode {
@@ -516,13 +638,75 @@ func (c *Config) ValidateStatic() error {
 			default:
 				return fmt.Errorf("wireguards[%d].transport.icmp.role must be client or server", i)
 			}
-		case "faketcp", "faketcp-lite":
-			return fmt.Errorf("wireguards[%d].transport.mode %q is reserved but not implemented", i, wg.Transport.Mode)
+		case "faketcp":
+			fakeTCPWireGuards++
+			if err := validateFakeTCPTransport(fmt.Sprintf("wireguards[%d].transport.faketcp", i), wg.Transport.FakeTCP); err != nil {
+				return err
+			}
+		case "faketcp-lite":
+			return fmt.Errorf("wireguards[%d].transport.mode %q is unsupported; use faketcp with its handshake state machine", i, wg.Transport.Mode)
 		default:
 			return fmt.Errorf("wireguards[%d].transport.mode %q is unsupported", i, wg.Transport.Mode)
 		}
 	}
+	if fakeTCPWireGuards != 0 && c.Policy.StartupFailMode != "fail_closed_for_managed_flows" {
+		return errors.New("faketcp requires policy.startup_fail_mode fail_closed_for_managed_flows")
+	}
 	return validateDataplaneCapacity(c)
+}
+
+func validateFakeTCPTransport(prefix string, f FakeTCPTransport) error {
+	if f.ChecksumMode != FakeTCPChecksumModePartialCompleteReset {
+		return fmt.Errorf("%s.checksum_mode %q is unsupported; only %s requires ip_summed identification, CHECKSUM_PARTIAL materialize/complete, and checksum offset/metadata reset", prefix, f.ChecksumMode, FakeTCPChecksumModePartialCompleteReset)
+	}
+	if f.IngressMode != FakeTCPIngressModeXDPGenericExact {
+		return fmt.Errorf("%s.ingress_mode %q is unsupported; only %s provides exact selected-mode generic XDP ownership before GRO", prefix, f.IngressMode, FakeTCPIngressModeXDPGenericExact)
+	}
+	if f.SessionCapacity < 2 || f.SessionCapacity > MaxFakeTCPSessions {
+		return fmt.Errorf("%s.session_capacity must be between 2 and %d", prefix, MaxFakeTCPSessions)
+	}
+	if f.MaxHalfOpenSessions == 0 || f.MaxHalfOpenSessions >= f.SessionCapacity ||
+		f.MaxHalfOpenSessions > MaxFakeTCPHalfOpenSessions {
+		return fmt.Errorf("%s.max_half_open_sessions must be between 1 and min(session_capacity-1, %d)", prefix, MaxFakeTCPHalfOpenSessions)
+	}
+	if f.MaxHalfOpenPerSource == 0 || f.MaxHalfOpenPerSource > f.MaxHalfOpenSessions ||
+		f.MaxHalfOpenPerSource > MaxFakeTCPHalfOpenPerSource {
+		return fmt.Errorf("%s.max_half_open_per_source must be between 1 and min(max_half_open_sessions, %d)", prefix, MaxFakeTCPHalfOpenPerSource)
+	}
+	if f.SYNRateInterval.Duration < 10*time.Millisecond || f.SYNRateInterval.Duration > 10*time.Second {
+		return fmt.Errorf("%s.syn_rate_interval must be between 10ms and 10s", prefix)
+	}
+	if f.SYNBurst == 0 || f.SYNBurst > f.MaxHalfOpenSessions || f.SYNBurst > MaxFakeTCPSYNBurst {
+		return fmt.Errorf("%s.syn_burst must be between 1 and min(max_half_open_sessions, %d)", prefix, MaxFakeTCPSYNBurst)
+	}
+	if f.SYNBurstPerSource == 0 || f.SYNBurstPerSource > f.SYNBurst {
+		return fmt.Errorf("%s.syn_burst_per_source must be between 1 and syn_burst", prefix)
+	}
+	if f.SYNSourceLedgerCapacity < f.MaxHalfOpenSessions || f.SYNSourceLedgerCapacity > MaxFakeTCPSYNSourceLedger {
+		return fmt.Errorf("%s.syn_source_ledger_capacity must be between max_half_open_sessions and %d", prefix, MaxFakeTCPSYNSourceLedger)
+	}
+	if f.SYNSourceLedgerTTL.Duration < f.SYNRateInterval.Duration || f.SYNSourceLedgerTTL.Duration > time.Hour {
+		return fmt.Errorf("%s.syn_source_ledger_ttl must be between syn_rate_interval and 1h", prefix)
+	}
+	if f.MaxPendingFlows == 0 || f.MaxPendingFlows > MaxFakeTCPPendingFlows || f.MaxPendingFlows > f.MaxHalfOpenSessions {
+		return fmt.Errorf("%s.max_pending_flows must be between 1 and min(max_half_open_sessions, %d)", prefix, MaxFakeTCPPendingFlows)
+	}
+	if f.MaxPendingPacketsPerFlow == 0 || f.MaxPendingPacketsPerFlow > MaxFakeTCPPendingPacketsPerFlow {
+		return fmt.Errorf("%s.max_pending_packets_per_flow must be between 1 and %d", prefix, MaxFakeTCPPendingPacketsPerFlow)
+	}
+	if f.MaxPendingBytes == 0 || f.MaxPendingBytes > MaxFakeTCPPendingBytes {
+		return fmt.Errorf("%s.max_pending_bytes must be between 1 and %d", prefix, MaxFakeTCPPendingBytes)
+	}
+	if f.HandshakeTimeout.Duration < 100*time.Millisecond || f.HandshakeTimeout.Duration > 30*time.Second {
+		return fmt.Errorf("%s.handshake_timeout must be between 100ms and 30s", prefix)
+	}
+	if f.KeepaliveInterval.Duration < time.Second || f.KeepaliveInterval.Duration > 10*time.Minute {
+		return fmt.Errorf("%s.keepalive_interval must be between 1s and 10m", prefix)
+	}
+	if f.IdleTimeout.Duration <= f.KeepaliveInterval.Duration || f.IdleTimeout.Duration > 24*time.Hour {
+		return fmt.Errorf("%s.idle_timeout must be greater than keepalive_interval and at most 24h", prefix)
+	}
+	return nil
 }
 
 func validateCipher(prefix string, c Cipher) error {
@@ -610,6 +794,37 @@ func validateDataplaneCapacity(c *Config) error {
 	}
 	if icmp := underlays * icmpWireGuards; icmp > MaxDirectionalRulesPerGeneration {
 		return fmt.Errorf("configuration may create %d ICMP listeners, maximum is %d per generation", icmp, MaxDirectionalRulesPerGeneration)
+	}
+	// FakeTCP engines own admission/pending budgets per WireGuard, but all of
+	// them share one 16K established BPF map and one daemon address space. Sum
+	// per-WG quotas here so adding another WG cannot silently overcommit either
+	// the shared map or the process-wide bounded-state budgets.
+	var fakeSessions, fakeHalfOpen, fakeSourceLedger, fakePendingFlows, fakePendingBytes uint64
+	for _, wg := range c.WireGuards {
+		if wg.Transport.Mode != "faketcp" {
+			continue
+		}
+		fake := wg.Transport.FakeTCP
+		fakeSessions += uint64(fake.SessionCapacity)
+		fakeHalfOpen += uint64(fake.MaxHalfOpenSessions)
+		fakeSourceLedger += uint64(fake.SYNSourceLedgerCapacity)
+		fakePendingFlows += uint64(fake.MaxPendingFlows)
+		fakePendingBytes += uint64(fake.MaxPendingBytes)
+	}
+	for _, aggregate := range []struct {
+		name  string
+		value uint64
+		limit uint64
+	}{
+		{"session_capacity", fakeSessions, MaxFakeTCPSessions},
+		{"max_half_open_sessions", fakeHalfOpen, MaxFakeTCPHalfOpenSessions},
+		{"syn_source_ledger_capacity", fakeSourceLedger, MaxFakeTCPSYNSourceLedger},
+		{"max_pending_flows", fakePendingFlows, MaxFakeTCPPendingFlows},
+		{"max_pending_bytes", fakePendingBytes, MaxFakeTCPPendingBytes},
+	} {
+		if aggregate.value > aggregate.limit {
+			return fmt.Errorf("aggregate faketcp %s is %d across all WireGuards, maximum shared budget is %d", aggregate.name, aggregate.value, aggregate.limit)
+		}
 	}
 	return nil
 }
