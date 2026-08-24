@@ -103,14 +103,3 @@ func fakeTCPRoutedTransportChecksumResidual(
 	binary.BigEndian.PutUint16(pseudo[10:12], uint16(len(transport)))
 	return internetChecksum(append(pseudo, transport...))
 }
-
-func testTransportChecksum(protocol byte, header, payload []byte) uint16 {
-	pseudo := []byte{10, 0, 0, 1, 10, 0, 0, 2, 0, protocol, 0, 0}
-	binary.BigEndian.PutUint16(pseudo[10:12], uint16(len(header)+len(payload)))
-	data := append(append(append([]byte(nil), pseudo...), header...), payload...)
-	checksum := internetChecksum(data)
-	if checksum == 0 {
-		return 0xffff
-	}
-	return checksum
-}
